@@ -1,0 +1,4 @@
+{
+    @import("circular.relon")
+    "self": "oops"
+}

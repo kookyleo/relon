@@ -1,0 +1,65 @@
+{
+  "6": {
+    "inputs": {
+      @value(stat.user_input.face.rotate_pitch)
+      "rotate_pitch": 0,
+      @value(stat.user_input.face.rotate_yaw)
+      "rotate_yaw": 0,
+      @value(stat.user_input.face.rotate_roll)
+      "rotate_roll": 0,
+      @value(stat.user_input.face.blink)
+      "blink": 0,
+      @value(stat.user_input.face.eyebrow)
+      "eyebrow": 0,
+      @value(stat.user_input.face.wink)
+      "wink": 0,
+      @value(stat.user_input.face.pupil_x)
+      "pupil_x": 0,
+      @value(stat.user_input.face.pupil_y)
+      "pupil_y": 0,
+      @value(stat.user_input.face.aaa)
+      "aaa": 0,
+      @value(stat.user_input.face.eee)
+      "eee": 0,
+      @value(stat.user_input.face.woo)
+      "woo": 0,
+      @value(stat.user_input.face.smile)
+      "smile": 0,
+      "src_ratio": 0,
+      "sample_ratio": 0,
+      "sample_parts": "OnlyExpression",
+      "crop_factor": 1.5,
+      "src_image": [
+        "12",
+        0
+      ]
+    },
+    "class_type": "ExpressionEditor",
+    "_meta": {
+      "title": "Expression Editor (PHM)"
+    }
+  },
+  "11": {
+    "inputs": {
+      "filename_prefix": "ComfyUI",
+      "images": [
+        "6",
+        0
+      ]
+    },
+    "class_type": "SaveImage",
+    "_meta": {
+      "title": "Save Image"
+    }
+  },
+  "12": {
+    "inputs": {
+      @value(stat.user_input.face.base64)
+      "image": "base64（无前缀）"
+    },
+    "class_type": "ETN_LoadImageBase64",
+    "_meta": {
+      "title": "Load Image (Base64)"
+    }
+  }
+}

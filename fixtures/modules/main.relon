@@ -1,0 +1,19 @@
+{
+    // Namespace import (default)
+    @import("lib.relon")
+    "ns": {
+        "result": lib.shout("hello")
+    },
+
+    // Explicit alias
+    @import("lib.relon", as="u")
+    "aliased": {
+        "result": u.sum(10, 20)
+    },
+
+    // Spread import (unpack contents)
+    @import("lib.relon", spread=true)
+    "flat": {
+        "result": shout("direct usage")
+    }
+}

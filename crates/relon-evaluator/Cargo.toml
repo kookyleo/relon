@@ -1,0 +1,17 @@
+[package]
+name = "relon-evaluator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The evaluation engine for the relon language"
+
+[dependencies]
+relon-parser = { path = "../relon-parser" }
+ordered-float.workspace = true
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "1.0"
+miette = { version = "7.6.0", features = ["derive"] }
+
+[dev-dependencies]
+tokio = { version = "1.0", features = ["full"] }

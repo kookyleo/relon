@@ -1,0 +1,217 @@
+{
+  "3": {
+    "inputs": {
+      "ckpt_name": "turbovisionxlSuperFastXLBasedOnNew_tvxlV32Bakedvae.safetensors"
+    },
+    "class_type": "CheckpointLoaderSimple",
+    "_meta": {
+      "title": "Load Checkpoint"
+    }
+  },
+  "4": {
+    "inputs": {
+      @prompt_factory(stat.user_input.brush_sketch.prompt, stat.current_style, stat.operationNormal, stat.rolePrompt)
+      "text": "xxxxxx",
+      "speak_and_recognation": true,
+      "clip": [
+        "13",
+        1
+      ]
+    },
+    "class_type": "CLIPTextEncode",
+    "_meta": {
+      "title": "CLIP Text Encode (Prompt)"
+    }
+  },
+  "5": {
+    "inputs": {
+      @negative_prompt_factory(stat.current_style)
+      "text": "xxxxxx",
+      "speak_and_recognation": true,
+      "clip": [
+        "13",
+        1
+      ]
+    },
+    "class_type": "CLIPTextEncode",
+    "_meta": {
+      "title": "CLIP Text Encode (Prompt)"
+    }
+  },
+  "10": {
+    "inputs": {
+      "vae_name": "sdxl_vae_fp16_fix.safetensors"
+    },
+    "class_type": "VAELoader",
+    "_meta": {
+      "title": "Load VAE"
+    }
+  },
+  "13": {
+    "inputs": {
+      "lora_name": "sdxl_LCM_lora_rank1.safetensors",
+      "strength_model": 1,
+      "strength_clip": 1,
+      "model": [
+        "98",
+        0
+      ],
+      "clip": [
+        "98",
+        1
+      ]
+    },
+    "class_type": "LoraLoader",
+    "_meta": {
+      "title": "Load LoRA"
+    }
+  },
+  "21": {
+    "inputs": {
+      "pixels": [
+        "28",
+        0
+      ],
+      "vae": [
+        "10",
+        0
+      ]
+    },
+    "class_type": "VAEEncode",
+    "_meta": {
+      "title": "VAE Encode"
+    }
+  },
+  "28": {
+    "inputs": {
+      "upscale_method": "nearest-exact",
+      @value(stat.user_input.current_frame.width)
+      "width": 768,
+      @value(stat.user_input.current_frame.height)
+      "height": 768,
+      "crop": "disabled",
+      "image": [
+        "86",
+        0
+      ]
+    },
+    "class_type": "ImageScale",
+    "_meta": {
+      "title": "Upscale Image"
+    }
+  },
+  "82": {
+    "inputs": {
+      "sampling": "lcm",
+      "zsnr": false,
+      "model": [
+        "13",
+        0
+      ]
+    },
+    "class_type": "ModelSamplingDiscrete",
+    "_meta": {
+      "title": "ModelSamplingDiscrete"
+    }
+  },
+  "86": {
+    "inputs": {
+      "image": [
+        "99",
+        0
+      ],
+      "mask": [
+        "99",
+        1
+      ]
+    },
+    "class_type": "InpaintPreprocessor",
+    "_meta": {
+      "title": "Inpaint Preprocessor"
+    }
+  },
+  "89": {
+    "inputs": {
+      @random_seed(1000000, 999999999)
+      "seed": 1095734804502085,
+      @get_steps(stat.current_style)
+      "steps": 4,
+      @get_cfg(stat.current_style)
+      "cfg": 1.5,
+      "sampler_name": "lcm",
+      "scheduler": "sgm_uniform",
+      @value(0.7000000000000001)
+      "denoise": 0.7000000000000001,
+      "preview_method": "auto",
+      "vae_decode": "true",
+      "model": [
+        "82",
+        0
+      ],
+      "positive": [
+        "4",
+        0
+      ],
+      "negative": [
+        "5",
+        0
+      ],
+      "latent_image": [
+        "21",
+        0
+      ],
+      "optional_vae": [
+        "10",
+        0
+      ]
+    },
+    "class_type": "KSampler (Efficient)",
+    "_meta": {
+      "title": "KSampler (Efficient)"
+    }
+  },
+  "98": {
+    "inputs": {
+      @get_lora_name(stat.current_style)
+      "lora_name": "CHL.safetensors",
+      "strength_model": 1,
+      "strength_clip": 1,
+      "model": [
+        "3",
+        0
+      ],
+      "clip": [
+        "3",
+        1
+      ]
+    },
+    "class_type": "LoraLoader",
+    "_meta": {
+      "title": "Load LoRA"
+    }
+  },
+  "99": {
+    "inputs": {
+      @value(stat.user_input.brush_sketch.base64)
+      "image": "base64（无前缀）"
+    },
+    "class_type": "ETN_LoadImageBase64",
+    "_meta": {
+      "title": "Load Image (Base64)brush_pic"
+    }
+  },
+  @output_node
+  "100": {
+    "inputs": {
+      "filename_prefix": "ComfyUI",
+      "images": [
+        "89",
+        5
+      ]
+    },
+    "class_type": "SaveImage",
+    "_meta": {
+      "title": "Save Image"
+    }
+  }
+}

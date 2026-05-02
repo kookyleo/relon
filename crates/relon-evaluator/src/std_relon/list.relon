@@ -1,0 +1,7 @@
+{
+    @fn(l, f)
+    map: [f(x) for x in l],
+
+    @fn(l, f)
+    filter: [x for x in l if f(x)]
+}

@@ -1,0 +1,12 @@
+[package]
+name = "original-evaluator"
+edition = "2021"
+version.workspace = true
+repository.workspace = true
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+tokenizer = { path = "../tokenizer" }
+ordered-float = "4.2.0"
+thiserror = "1.0.60"

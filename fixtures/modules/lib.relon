@@ -1,0 +1,7 @@
+{
+    @fn(val)
+    shout: val + "!!!",
+
+    @fn(a, b)
+    sum: a + b
+}

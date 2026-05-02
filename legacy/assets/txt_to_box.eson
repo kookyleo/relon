@@ -1,0 +1,43 @@
+{
+  "20": {
+    "inputs": {
+      @split_text_to_json(stat.user_input.text, stat.current_frame.width, stat.current_frame.height)
+      "Text": "你好",
+      "Agent_OpenAi": [
+        "24",
+        0
+      ]
+    },
+    "class_type": "OpenAiChat",
+    "_meta": {
+      "title": "OpenAiChat"
+    }
+  },
+  "23": {
+    "inputs": {
+      "text": [
+        "20",
+        0
+      ],
+      "PreviewTextNode_0": "你好！很高兴为你服务。有什么可以帮助你的吗？"
+    },
+    "class_type": "PreviewTextNode",
+    "_meta": {
+      "title": "Preview Text Node"
+    }
+  },
+  "24": {
+    "inputs": {
+      "model": "",
+      "api_key": "",
+      "api_type": "openai",
+      "api_base": "",
+      "api_version": "",
+      "api_proxy": ""
+    },
+    "class_type": "OpenAiConfig",
+    "_meta": {
+      "title": "OpenAiConfig"
+    }
+  }
+}

@@ -1,0 +1,215 @@
+{
+  "11": {
+    "inputs": {
+      "ckpt_name": "turbovisionxlSuperFastXLBasedOnNew_tvxlV32Bakedvae.safetensors"
+    },
+    "class_type": "CheckpointLoaderSimple",
+    "_meta": {
+      "title": "Load Checkpoint"
+    }
+  },
+  "12": {
+    "inputs": {
+      @prompt_factory(stat.user_input.regional2pic.background, stat.current_style, stat.operationNormal, stat.rolePrompt)
+      "text": "xxxxxx",
+      "speak_and_recognation": true,
+      "clip": [
+        "71",
+        1
+      ]
+    },
+    "class_type": "CLIPTextEncode",
+    "_meta": {
+      "title": "CLIP Text Encode (Prompt)"
+    }
+  },
+  "14": {
+    "inputs": {
+      "add_noise": true,
+      @random_seed(1000000, 999999999)
+      "noise_seed": 2150928256198,
+      @get_cfg(stat.current_style)
+      "cfg": 1.5,
+      "model": [
+        "71",
+        0
+      ],
+      "positive": [
+        "12",
+        0
+      ],
+      "negative": [
+        "18",
+        0
+      ],
+      "sampler": [
+        "15",
+        0
+      ],
+      "sigmas": [
+        "45",
+        0
+      ],
+      "latent_image": [
+        "16",
+        0
+      ]
+    },
+    "class_type": "SamplerCustom",
+    "_meta": {
+      "title": "SamplerCustom"
+    }
+  },
+  "15": {
+    "inputs": {
+      @get_sampler_name(stat.current_style)
+      "sampler_name": "dpmpp_sde"
+    },
+    "class_type": "KSamplerSelect",
+    "_meta": {
+      "title": "KSamplerSelect"
+    }
+  },
+  "16": {
+    "inputs": {
+      @value(stat.current_width)
+      "width": 1024,
+      @value(stat.current_height)
+      "height": 768,
+      "batch_size": 1
+    },
+    "class_type": "EmptyLatentImage",
+    "_meta": {
+      "title": "Empty Latent Image"
+    }
+  },
+  "18": {
+    "inputs": {
+      @negative_prompt_factory(stat.current_style)
+      "text": "xxxxxx",
+      "speak_and_recognation": true,
+      "clip": [
+        "11",
+        1
+      ]
+    },
+    "class_type": "CLIPTextEncode",
+    "_meta": {
+      "title": "CLIP Text Encode (Prompt)"
+    }
+  },
+  "19": {
+    "inputs": {
+      "samples": [
+        "14",
+        1
+      ],
+      "vae": [
+        "11",
+        2
+      ]
+    },
+    "class_type": "VAEDecode",
+    "_meta": {
+      "title": "VAE Decode"
+    }
+  },
+  "45": {
+    "inputs": {
+      "scheduler": "normal",
+      @get_steps(stat.current_style)
+      "steps": 4,
+      @value(1)
+      "denoise": 1,
+      "model": [
+        "71",
+        0
+      ]
+    },
+    "class_type": "BasicScheduler",
+    "_meta": {
+      "title": "BasicScheduler"
+    }
+  },
+  "66": {
+    "inputs": {
+      @compose_prompt_factory(stat.user_input.regional2pic.texts, stat.current_style)
+      "texts": "back ground image,clouds,master piece,\\nback ground image,sun raise, wave,master piece\\nback ground image,on the sea,sky, master piece",
+      "speak_and_recognation": true,
+      "clip": [
+        "11",
+        1
+      ]
+    },
+    "class_type": "CLIPTextEncodeList|cgem156",
+    "_meta": {
+      "title": "CLIP Text Encode List 🍌"
+    }
+  },
+  "68": {
+    "inputs": {
+      @value(stat.user_input.regional2pic.masks)
+      "masks_b64": "/9j/4QAYRXhpZgAD/4QMyaBPxD+wAD/2Q==\\n/9j/4QAYRXhpZgAD/4QMyaBPxD+wAD/2Q==\\n/9j/4QAYRXhpZgAD/4QMyaBPxD+wAD/2Q==",
+      "channel": "green",
+      "speak_and_recognation": true
+    },
+    "class_type": "LoadMaskListBase64|cgem156",
+    "_meta": {
+      "title": "Load Mask Base64 List 🍌"
+    }
+  },
+  "70": {
+    "inputs": {
+      "model": [
+        "11",
+        0
+      ],
+      "conds": [
+        "66",
+        0
+      ],
+      "masks": [
+        "68",
+        0
+      ]
+    },
+    "class_type": "AttentionCoupleOne|cgem156",
+    "_meta": {
+      "title": "Attention Couple One🍌"
+    }
+  },
+  "71": {
+    "inputs": {
+      @get_lora_name(stat.current_style)
+      "lora_name": "CHL.safetensors",
+      "strength_model": 1,
+      "strength_clip": 1,
+      "model": [
+        "70",
+        0
+      ],
+      "clip": [
+        "11",
+        1
+      ]
+    },
+    "class_type": "LoraLoader",
+    "_meta": {
+      "title": "Load LoRA"
+    }
+  },
+  @output_node
+  "72": {
+    "inputs": {
+      "filename_prefix": "ComfyUI",
+      "images": [
+        "19",
+        0
+      ]
+    },
+    "class_type": "SaveImage",
+    "_meta": {
+      "title": "Save Image"
+    }
+  }
+}

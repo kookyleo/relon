@@ -1,0 +1,15 @@
+{
+    @int
+    @min(1024)
+    @max(65535)
+    "port": 80,
+
+    @string
+    @one_of(["TCP", "UDP"])
+    "protocol": "TCP",
+
+    "nested": {
+        @bool
+        "is_active": true
+    }
+}

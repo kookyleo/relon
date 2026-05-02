@@ -1,0 +1,64 @@
+{
+  "31": {
+    "inputs": {
+      "threshold": 32,
+      "resolution": 512,
+      "image": [
+        "40",
+        0
+      ]
+    },
+    "class_type": "Scribble_XDoG_Preprocessor",
+    "_meta": {
+      "title": "Scribble XDoG Lines"
+    }
+  },
+  "32": {
+    "inputs": {
+      "images": [
+        "31",
+        0
+      ]
+    },
+    "class_type": "PreviewImage",
+    "_meta": {
+      "title": "Preview Image"
+    }
+  },
+  "37": {
+    "inputs": {
+      "image": [
+        "31",
+        0
+      ]
+    },
+    "class_type": "ImageInvert",
+    "_meta": {
+      "title": "Invert Image"
+    }
+  },
+  @output_node
+  "38": {
+    "inputs": {
+      "filename_prefix": "ComfyUI",
+      "images": [
+        "37",
+        0
+      ]
+    },
+    "class_type": "SaveImage",
+    "_meta": {
+      "title": "Save Image"
+    }
+  },
+  "40": {
+    "inputs": {
+      @value(stat.user_input.pic2sketch.base64)
+      "image": "base64（无前缀）"
+    },
+    "class_type": "ETN_LoadImageBase64",
+    "_meta": {
+      "title": "Load Image (Base64)pic"
+    }
+  }
+}

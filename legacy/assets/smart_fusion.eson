@@ -1,0 +1,225 @@
+{
+  "119": {
+    "inputs": {
+      @random_seed(1000000, 999999999)
+      "seed": 512293807064946,
+      @value(20)
+      "steps": 20,
+      @value(7)
+      "cfg": 7,
+      "sampler_name": "euler_ancestral",
+      "scheduler": "beta",
+      @value(0.1)
+      "denoise": 0.1,
+      "model": [
+        "200",
+        0
+      ],
+      "positive": [
+        "193",
+        0
+      ],
+      "negative": [
+        "193",
+        1
+      ],
+      "latent_image": [
+        "126",
+        0
+      ]
+    },
+    "class_type": "KSampler",
+    "_meta": {
+      "title": "KSampler"
+    }
+  },
+  "120": {
+    "inputs": {
+      "ckpt_name": "turbovisionxlSuperFastXLBasedOnNew_tvxlV32Bakedvae.safetensors"
+    },
+    "class_type": "CheckpointLoaderSimple",
+    "_meta": {
+      "title": "Load Checkpoint"
+    }
+  },
+  "122": {
+    "inputs": {
+      @prompt_factory(stat.user_input.fusion.prompt, stat.current_style, stat.operationNormal, stat.rolePrompt)
+      "text": "xxxxxx",
+      "speak_and_recognation": true,
+      "clip": [
+        "200",
+        1
+      ]
+    },
+    "class_type": "CLIPTextEncode",
+    "_meta": {
+      "title": "CLIP Text Encode (Prompt)"
+    }
+  },
+  "123": {
+    "inputs": {
+      @negative_prompt_factory(stat.current_style)
+      "text": "xxxxxx",
+      "speak_and_recognation": true,
+      "clip": [
+        "120",
+        1
+      ]
+    },
+    "class_type": "CLIPTextEncode",
+    "_meta": {
+      "title": "CLIP Text Encode (Prompt)"
+    }
+  },
+  "124": {
+    "inputs": {
+      "samples": [
+        "119",
+        0
+      ],
+      "vae": [
+        "120",
+        2
+      ]
+    },
+    "class_type": "VAEDecode",
+    "_meta": {
+      "title": "VAE Decode"
+    }
+  },
+  "126": {
+    "inputs": {
+      "pixels": [
+        "201",
+        0
+      ],
+      "vae": [
+        "120",
+        2
+      ]
+    },
+    "class_type": "VAEEncode",
+    "_meta": {
+      "title": "VAE Encode"
+    }
+  },
+  "184": {
+    "inputs": {
+      "images": [
+        "124",
+        0
+      ]
+    },
+    "class_type": "PreviewImage",
+    "_meta": {
+      "title": "Preview Image"
+    }
+  },
+  "193": {
+    "inputs": {
+      "strength": 1,
+      "start_percent": 0,
+      "end_percent": 1,
+      "positive": [
+        "122",
+        0
+      ],
+      "negative": [
+        "123",
+        0
+      ],
+      "control_net": [
+        "194",
+        0
+      ],
+      "image": [
+        "197",
+        0
+      ]
+    },
+    "class_type": "ControlNetApplyAdvanced",
+    "_meta": {
+      "title": "Apply ControlNet"
+    }
+  },
+  "194": {
+    "inputs": {
+      "control_net_name": "controlnet-union-sdxl-1.0.safetensors"
+    },
+    "class_type": "ControlNetLoader",
+    "_meta": {
+      "title": "Load ControlNet Model"
+    }
+  },
+  "197": {
+    "inputs": {
+      "preprocessor": "DepthAnythingV2Preprocessor",
+      "resolution": 512,
+      "image": [
+        "201",
+        0
+      ]
+    },
+    "class_type": "AIO_Preprocessor",
+    "_meta": {
+      "title": "AIO Aux Preprocessor"
+    }
+  },
+  "198": {
+    "inputs": {
+      "images": [
+        "197",
+        0
+      ]
+    },
+    "class_type": "PreviewImage",
+    "_meta": {
+      "title": "Preview Image"
+    }
+  },
+  "200": {
+    "inputs": {
+      @get_lora_name(stat.current_style)
+      "lora_name": "CHL.safetensors",
+      "strength_model": 1,
+      "strength_clip": 1,
+      "model": [
+        "120",
+        0
+      ],
+      "clip": [
+        "120",
+        1
+      ]
+    },
+    "class_type": "LoraLoader",
+    "_meta": {
+      "title": "Load LoRA"
+    }
+  },
+  "201": {
+    "inputs": {
+      @value(stat.user_input.fusion.base64)
+      "image": "base64（无前缀）"
+    },
+    "class_type": "ETN_LoadImageBase64",
+    "_meta": {
+      "title": "Load Image (Base64)pic"
+    }
+  },
+  @output_node
+  "202": {
+    "inputs": {
+      "filename_prefix": "ComfyUI",
+      "images": [
+        "124",
+        0
+      ]
+    },
+    "class_type": "SaveImage",
+    "_meta": {
+      "title": "Save Image"
+    }
+  }
+}

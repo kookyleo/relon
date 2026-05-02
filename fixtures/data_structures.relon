@@ -1,0 +1,18 @@
+{
+    "base": { "version": 1, "owner": "Relon" },
+    
+    // Spread operator for inheritance
+    "config": {
+        ...&sibling.base,
+        "debug": true
+    },
+
+    // List comprehension with filtering
+    "evens": [x for x in range(10) if x % 2 == 0],
+
+    // Piped operations
+    "pipe_demo": range(5) | len(), // 5
+
+    // Multi-spread
+    "merged_list": [...[1, 2], ...[3, 4], 5]
+}

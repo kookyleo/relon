@@ -1,0 +1,12 @@
+{
+    "null_val": null,
+    "bool_true": true,
+    "bool_false": false,
+    "int_dec": 123,
+    "int_hex": 0xFF,
+    "int_bin": 0b1010,
+    "float_val": 3.14159,
+    "string_normal": "Hello World",
+    "string_raw": r##"No \escape \here"##,
+    "f_string": f"Seven is ${3 + 4}"
+}

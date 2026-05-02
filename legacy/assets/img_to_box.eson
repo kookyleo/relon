@@ -1,0 +1,40 @@
+{
+  "10": {
+    "inputs": {
+      "preprocessor": "OneFormer-ADE20K-SemSegPreprocessor",
+      "resolution": 1024,
+      "image": [
+        "13",
+        0
+      ]
+    },
+    "class_type": "AIO_Preprocessor",
+    "_meta": {
+      "title": "AIO Aux Preprocessor"
+    }
+  },
+  @output_node
+  "11": {
+    "inputs": {
+      "filename_prefix": "ComfyUI",
+      "images": [
+        "10",
+        0
+      ]
+    },
+    "class_type": "SaveImage",
+    "_meta": {
+      "title": "Save Image"
+    }
+  },
+  "13": {
+    "inputs": {
+      @value(stat.user_input.pic2regional.base64)
+      "image": "base64（无前缀）"
+    },
+    "class_type": "ETN_LoadImageBase64",
+    "_meta": {
+      "title": "Load Image (Base64)pic"
+    }
+  }
+}

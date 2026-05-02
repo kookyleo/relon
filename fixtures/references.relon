@@ -1,0 +1,12 @@
+{
+    "nested": {
+        "deep": {
+            "val": 42,
+            "ref_sibling": &sibling.val,     // 42
+            "ref_uncle": &uncle.external,    // "I am here"
+            "ref_root": &root.top_level      // 100
+        },
+        "external": "I am here"
+    },
+    "top_level": 100
+}

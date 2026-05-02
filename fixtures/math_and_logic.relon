@@ -1,0 +1,24 @@
+{
+    "arithmetic": {
+        "precedence": 1 + 2 * 3, // 7
+        "grouping": (1 + 2) * 3,  // 9
+        "float_mix": 10 / 4.0,   // 2.5
+        "modulo": 10 % 3         // 1
+    },
+    "comparison": {
+        "eq": 1 == 1,
+        "ne": 1 != 2,
+        "lt": 5 < 10,
+        "ge": 10 >= 10
+    },
+    "logical": {
+        "and": true && false,
+        "or": false || true,
+        "not": !false,
+        "short_circuit": false && (1 / 0 == 0) // Should not panic
+    },
+    "ternary": {
+        "basic": true ? "yes" : "no",
+        "nested": false ? "a" : (true ? "b" : "c")
+    }
+}

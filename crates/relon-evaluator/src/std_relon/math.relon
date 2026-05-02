@@ -1,0 +1,10 @@
+{
+    @fn(x)
+    abs: x < 0 ? -x : x,
+
+    @fn(a, b)
+    max: a > b ? a : b,
+
+    @fn(a, b)
+    min: a < b ? a : b
+}
