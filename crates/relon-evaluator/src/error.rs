@@ -17,6 +17,10 @@ pub enum RuntimeError {
         range: TokenRange,
     },
 
+    #[error("Validation failed: {0}")]
+    #[diagnostic(code(relon::eval::validation_failed))]
+    ValidationError(String, #[label("here")] TokenRange),
+
     #[error("Division by zero")]
     #[diagnostic(code(relon::eval::division_by_zero))]
     DivisionByZero(#[label("here")] TokenRange),

@@ -1,0 +1,11 @@
+[package]
+name = "relon-fmt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Formatter and syntax checker for Relon files"
+
+[dependencies]
+clap = { version = "4.4", features = ["derive"] }
+relon-parser = { path = "../relon-parser" }
+thiserror = "1.0"

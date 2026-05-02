@@ -20,11 +20,11 @@
     - [x] Add high-frequency utility functions for strings (`split`, `join`, `replace`, `to_upper/lower`).
     - [x] Add dictionary utilities (`merge`, `keys`, `values`, `contains`).
     - [x] Expose deterministic native Rust helpers as built-in functions.
-- [ ] **Advanced Validation System**:
-    - Refine decorator-based schema enforcement.
-    - Support custom validation error messages and multi-field cross-validation.
+- [x] **Advanced Validation System**:
+    - [x] Refine decorator-based schema enforcement.
+    - [x] Support custom validation error messages and multi-field cross-validation.
 
 ## Phase 4: Tooling (Future)
 
 - [ ] **LSP (Language Server Protocol)**: Implementation for IDE support (syntax highlighting, auto-completion, ref-navigation).
-- [ ] **Formatter/Linter**: A dedicated `relon-fmt` tool.
+- [x] **Formatter/Linter**: A dedicated `relon-fmt` tool.

@@ -157,6 +157,77 @@ mod tests {
     }
 
     #[test]
+    fn test_validation_custom_messages() {
+        let mut input = Span::new(
+            r#"{
+            @min(1024, "port must be >= 1024")
+            "port": 80
+        }"#,
+        );
+
+        let node = parse_base(&mut input).unwrap();
+        let ctx = Context::new().with_root(node.clone());
+        let result = Evaluator::new(&ctx).eval(&node, &std::sync::Arc::new(Scope::default()));
+
+        assert!(matches!(
+            result,
+            Err(RuntimeError::ValidationError(message, _)) if message == "port must be >= 1024"
+        ));
+    }
+
+    #[test]
+    fn test_cross_field_validation() {
+        let mut input = Span::new(
+            r#"@required_fields(["host", "port"])
+            @requires("tls", "cert")
+            @field_eq("password", "confirm")
+            {
+                "host": "localhost",
+                "port": 8080,
+                "tls": true,
+                "cert": "cert.pem",
+                "password": "secret",
+                "confirm": "secret"
+            }"#,
+        );
+
+        let node = parse_base(&mut input).unwrap();
+        let ctx = Context::new().with_root(node.clone());
+        let result = Evaluator::new(&ctx)
+            .eval(&node, &std::sync::Arc::new(Scope::default()))
+            .unwrap();
+
+        if let Value::Dict(map) = result {
+            assert_eq!(
+                map.get("host").unwrap(),
+                &Value::String("localhost".to_string())
+            );
+        } else {
+            panic!("Expected Dict");
+        }
+    }
+
+    #[test]
+    fn test_cross_field_validation_custom_message() {
+        let mut input = Span::new(
+            r#"@requires("tls", "cert", "cert is required when tls is enabled")
+            {
+                "tls": true
+            }"#,
+        );
+
+        let node = parse_base(&mut input).unwrap();
+        let ctx = Context::new().with_root(node.clone());
+        let result = Evaluator::new(&ctx).eval(&node, &std::sync::Arc::new(Scope::default()));
+
+        assert!(matches!(
+            result,
+            Err(RuntimeError::ValidationError(message, _))
+                if message == "cert is required when tls is enabled"
+        ));
+    }
+
+    #[test]
     fn test_spread_operator() {
         let mut input = Span::new(
             r#"{ 
