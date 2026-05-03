@@ -1,0 +1,12 @@
+{
+  "bool_false": false,
+  "bool_true": true,
+  "f_string": "Seven is 7",
+  "float_val": 3.14159,
+  "int_bin": 10,
+  "int_dec": 123,
+  "int_hex": 255,
+  "null_val": null,
+  "string_normal": "Hello World",
+  "string_raw": "No \\escape \\here"
+}

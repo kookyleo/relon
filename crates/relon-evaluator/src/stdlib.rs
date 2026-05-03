@@ -7,27 +7,33 @@ pub fn register_to(ctx: &mut Context) {
     ctx.register_fn("len", Arc::new(Len));
     ctx.register_fn("range", Arc::new(Range));
     ctx.register_fn("type", Arc::new(Type));
-    ctx.register_fn("int", Arc::new(ValidatorInt));
-    ctx.register_fn("string", Arc::new(ValidatorString));
-    ctx.register_fn("bool", Arc::new(ValidatorBool));
-    ctx.register_fn("float", Arc::new(ValidatorFloat));
-    ctx.register_fn("list", Arc::new(ValidatorList));
-    ctx.register_fn("dict", Arc::new(ValidatorDict));
-    ctx.register_fn("min", Arc::new(ValidatorMin));
-    ctx.register_fn("max", Arc::new(ValidatorMax));
-    ctx.register_fn("one_of", Arc::new(ValidatorOneOf));
-    ctx.register_fn("required_fields", Arc::new(RequiredFields));
-    ctx.register_fn("requires", Arc::new(Requires));
-    ctx.register_fn("field_eq", Arc::new(FieldEq));
-    ctx.register_fn("split", Arc::new(Split));
-    ctx.register_fn("join", Arc::new(Join));
-    ctx.register_fn("replace", Arc::new(Replace));
-    ctx.register_fn("to_upper", Arc::new(ToUpper));
-    ctx.register_fn("to_lower", Arc::new(ToLower));
-    ctx.register_fn("merge", Arc::new(Merge));
-    ctx.register_fn("keys", Arc::new(Keys));
-    ctx.register_fn("values", Arc::new(Values));
-    ctx.register_fn("contains", Arc::new(Contains));
+
+    ctx.register_fn("ensure.int", Arc::new(ValidatorInt));
+    ctx.register_fn("ensure.string", Arc::new(ValidatorString));
+    ctx.register_fn("ensure.bool", Arc::new(ValidatorBool));
+    ctx.register_fn("ensure.float", Arc::new(ValidatorFloat));
+    ctx.register_fn("ensure.list", Arc::new(ValidatorList));
+    ctx.register_fn("ensure.dict", Arc::new(ValidatorDict));
+    ctx.register_fn("ensure.at_least", Arc::new(ValidatorMin));
+    ctx.register_fn("ensure.at_most", Arc::new(ValidatorMax));
+    ctx.register_fn("ensure.one_of", Arc::new(ValidatorOneOf));
+    ctx.register_fn("ensure.required_fields", Arc::new(RequiredFields));
+    ctx.register_fn("ensure.requires", Arc::new(Requires));
+    ctx.register_fn("ensure.fields_equal", Arc::new(FieldEq));
+
+    ctx.register_fn("string.split", Arc::new(StringSplit));
+    ctx.register_fn("string.join", Arc::new(StringJoin));
+    ctx.register_fn("string.replace", Arc::new(StringReplace));
+    ctx.register_fn("string.upper", Arc::new(StringUpper));
+    ctx.register_fn("string.lower", Arc::new(StringLower));
+    ctx.register_fn("string.contains", Arc::new(StringContains));
+
+    ctx.register_fn("dict.merge", Arc::new(DictMerge));
+    ctx.register_fn("dict.keys", Arc::new(DictKeys));
+    ctx.register_fn("dict.values", Arc::new(DictValues));
+    ctx.register_fn("dict.has_key", Arc::new(DictHasKey));
+
+    ctx.register_fn("list.contains", Arc::new(ListContains));
 }
 
 struct Len;
@@ -65,23 +71,8 @@ impl RelonFunction for Range {
         range: relon_parser::TokenRange,
     ) -> Result<Value, RuntimeError> {
         let (start, end) = match args.len() {
-            1 => (
-                0,
-                match &args[0] {
-                    Value::Int(i) => *i,
-                    _ => 0,
-                },
-            ),
-            2 => (
-                match &args[0] {
-                    Value::Int(i) => *i,
-                    _ => 0,
-                },
-                match &args[1] {
-                    Value::Int(i) => *i,
-                    _ => 0,
-                },
-            ),
+            1 => (0, expect_int(&args[0], range)?),
+            2 => (expect_int(&args[0], range)?, expect_int(&args[1], range)?),
             _ => {
                 return Err(RuntimeError::TypeMismatch {
                     expected: "1 or 2 arguments".to_string(),
@@ -91,6 +82,17 @@ impl RelonFunction for Range {
             }
         };
         Ok(Value::List((start..end).map(Value::Int).collect()))
+    }
+}
+
+fn expect_int(value: &Value, range: relon_parser::TokenRange) -> Result<i64, RuntimeError> {
+    match value {
+        Value::Int(value) => Ok(*value),
+        other => Err(RuntimeError::TypeMismatch {
+            expected: "Int".to_string(),
+            found: other.type_name().to_string(),
+            range,
+        }),
     }
 }
 
@@ -297,7 +299,7 @@ impl RelonFunction for RequiredFields {
         let fields = expect_string_list(&args[1], range)?;
         if let Some(field) = fields
             .iter()
-            .find(|field| !dict.get(field.as_str()).is_some_and(Value::is_truthy))
+            .find(|field| !dict.contains_key(field.as_str()))
         {
             return validation_failure(
                 &args,
@@ -379,8 +381,8 @@ impl RelonFunction for FieldEq {
     }
 }
 
-struct Split;
-impl RelonFunction for Split {
+struct StringSplit;
+impl RelonFunction for StringSplit {
     fn call(
         &self,
         args: Vec<Value>,
@@ -404,8 +406,8 @@ impl RelonFunction for Split {
     }
 }
 
-struct Join;
-impl RelonFunction for Join {
+struct StringJoin;
+impl RelonFunction for StringJoin {
     fn call(
         &self,
         args: Vec<Value>,
@@ -422,8 +424,8 @@ impl RelonFunction for Join {
     }
 }
 
-struct Replace;
-impl RelonFunction for Replace {
+struct StringReplace;
+impl RelonFunction for StringReplace {
     fn call(
         &self,
         args: Vec<Value>,
@@ -437,8 +439,8 @@ impl RelonFunction for Replace {
     }
 }
 
-struct ToUpper;
-impl RelonFunction for ToUpper {
+struct StringUpper;
+impl RelonFunction for StringUpper {
     fn call(
         &self,
         args: Vec<Value>,
@@ -451,8 +453,8 @@ impl RelonFunction for ToUpper {
     }
 }
 
-struct ToLower;
-impl RelonFunction for ToLower {
+struct StringLower;
+impl RelonFunction for StringLower {
     fn call(
         &self,
         args: Vec<Value>,
@@ -465,8 +467,22 @@ impl RelonFunction for ToLower {
     }
 }
 
-struct Merge;
-impl RelonFunction for Merge {
+struct StringContains;
+impl RelonFunction for StringContains {
+    fn call(
+        &self,
+        args: Vec<Value>,
+        range: relon_parser::TokenRange,
+    ) -> Result<Value, RuntimeError> {
+        expect_arg_count(&args, 2, range)?;
+        Ok(Value::Bool(
+            expect_string(&args[0], range)?.contains(expect_string(&args[1], range)?),
+        ))
+    }
+}
+
+struct DictMerge;
+impl RelonFunction for DictMerge {
     fn call(
         &self,
         args: Vec<Value>,
@@ -479,7 +495,7 @@ impl RelonFunction for Merge {
                 range,
             });
         }
-        let mut merged = std::collections::HashMap::new();
+        let mut merged = std::collections::BTreeMap::new();
         for value in &args {
             merged.extend(expect_dict(value, range)?.clone());
         }
@@ -487,8 +503,8 @@ impl RelonFunction for Merge {
     }
 }
 
-struct Keys;
-impl RelonFunction for Keys {
+struct DictKeys;
+impl RelonFunction for DictKeys {
     fn call(
         &self,
         args: Vec<Value>,
@@ -504,8 +520,8 @@ impl RelonFunction for Keys {
     }
 }
 
-struct Values;
-impl RelonFunction for Values {
+struct DictValues;
+impl RelonFunction for DictValues {
     fn call(
         &self,
         args: Vec<Value>,
@@ -523,28 +539,31 @@ impl RelonFunction for Values {
     }
 }
 
-struct Contains;
-impl RelonFunction for Contains {
+struct DictHasKey;
+impl RelonFunction for DictHasKey {
     fn call(
         &self,
         args: Vec<Value>,
         range: relon_parser::TokenRange,
     ) -> Result<Value, RuntimeError> {
         expect_arg_count(&args, 2, range)?;
-        match &args[0] {
-            Value::Dict(dict) => Ok(Value::Bool(
-                dict.contains_key(expect_string(&args[1], range)?),
-            )),
-            Value::List(values) => Ok(Value::Bool(values.contains(&args[1]))),
-            Value::String(input) => {
-                Ok(Value::Bool(input.contains(expect_string(&args[1], range)?)))
-            }
-            other => Err(RuntimeError::TypeMismatch {
-                expected: "Dict/List/String".to_string(),
-                found: other.type_name().to_string(),
-                range,
-            }),
-        }
+        Ok(Value::Bool(
+            expect_dict(&args[0], range)?.contains_key(expect_string(&args[1], range)?),
+        ))
+    }
+}
+
+struct ListContains;
+impl RelonFunction for ListContains {
+    fn call(
+        &self,
+        args: Vec<Value>,
+        range: relon_parser::TokenRange,
+    ) -> Result<Value, RuntimeError> {
+        expect_arg_count(&args, 2, range)?;
+        Ok(Value::Bool(
+            expect_list(&args[0], range)?.contains(&args[1]),
+        ))
     }
 }
 
@@ -601,7 +620,7 @@ fn expect_string_list(
 fn expect_dict(
     value: &Value,
     range: relon_parser::TokenRange,
-) -> Result<&std::collections::HashMap<String, Value>, RuntimeError> {
+) -> Result<&std::collections::BTreeMap<String, Value>, RuntimeError> {
     match value {
         Value::Dict(value) => Ok(value),
         other => Err(RuntimeError::TypeMismatch {

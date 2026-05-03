@@ -1,0 +1,14 @@
+{
+    @fn(value, separator)
+    split: string.split(value, separator),
+    @fn(values, separator)
+    join: string.join(values, separator),
+    @fn(value, from, to)
+    replace: string.replace(value, from, to),
+    @fn(value)
+    upper: string.upper(value),
+    @fn(value)
+    lower: string.lower(value),
+    @fn(value, needle)
+    contains: string.contains(value, needle)
+}

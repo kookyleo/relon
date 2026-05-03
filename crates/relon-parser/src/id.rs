@@ -1,11 +1,11 @@
 use crate::{create_range, Span, TokenId};
 use winnow::prelude::*;
-use winnow::stream::{Offset, Stream};
+use winnow::stream::Location;
 use winnow::token::take_while;
 
 /// Parse a valid identifier.
 pub fn id<'a>(input: &mut Span<'a>) -> ModalResult<TokenId> {
-    let start = input.checkpoint();
+    let start_offset = input.location();
 
     // Identifiers start with a letter or underscore, followed by letters, digits, or underscores.
     let head = winnow::token::one_of(('_', 'a'..='z', 'A'..='Z')).parse_next(input)?;
@@ -14,11 +14,8 @@ pub fn id<'a>(input: &mut Span<'a>) -> ModalResult<TokenId> {
     let mut name = String::from(head);
     name.push_str(tail);
 
-    let end = input.checkpoint();
-    Ok(TokenId(
-        name,
-        create_range(input.offset_from(&start), input.offset_from(&end)),
-    ))
+    let end_offset = input.location();
+    Ok(TokenId(name, create_range(input, start_offset, end_offset)))
 }
 
 #[cfg(test)]

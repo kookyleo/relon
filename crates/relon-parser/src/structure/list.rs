@@ -3,10 +3,10 @@ use crate::{
 };
 use winnow::combinator::{delimited, opt, preceded, separated};
 use winnow::prelude::*;
-use winnow::stream::{Offset, Stream};
+use winnow::stream::{Location, Stream};
 
 pub fn parse_list<'a>(input: &mut Span<'a>) -> ModalResult<Node> {
-    let start = input.checkpoint();
+    let start_offset = input.location();
 
     // Try comprehension first
     let checkpoint = input.checkpoint();
@@ -22,10 +22,10 @@ pub fn parse_list<'a>(input: &mut Span<'a>) -> ModalResult<Node> {
     )
     .parse_next(input)?;
 
-    let end = input.checkpoint();
+    let end_offset = input.location();
     Ok(Node::new(
         Expr::List(elements),
-        create_range(input.offset_from(&start), input.offset_from(&end)),
+        create_range(input, start_offset, end_offset),
     ))
 }
 
@@ -33,14 +33,18 @@ fn parse_element<'a>(input: &mut Span<'a>) -> ModalResult<Node> {
     let decorators = parse_decorators.parse_next(input)?;
 
     // Check for spread operator
-    let start = input.checkpoint();
     let checkpoint = input.checkpoint();
-    if (soc0, "...").parse_next(input).is_ok() {
+    soc0.parse_next(input)?;
+    let start_offset = input.location();
+    if winnow::token::literal::<_, _, winnow::error::ContextError>("...")
+        .parse_next(input)
+        .is_ok()
+    {
         let inner = parse_expr.parse_next(input)?;
-        let end = input.checkpoint();
+        let end_offset = input.location();
         Ok(Node::new(
             Expr::Spread(inner),
-            create_range(input.offset_from(&start), input.offset_from(&end)),
+            create_range(input, start_offset, end_offset),
         ))
     } else {
         input.reset(&checkpoint);
@@ -51,7 +55,7 @@ fn parse_element<'a>(input: &mut Span<'a>) -> ModalResult<Node> {
 }
 
 fn parse_comprehension<'a>(input: &mut Span<'a>) -> ModalResult<Node> {
-    let start = input.checkpoint();
+    let start_offset = input.location();
 
     let (element, _, target_id, _, iterable, condition) = delimited(
         ("[", soc0),
@@ -67,7 +71,7 @@ fn parse_comprehension<'a>(input: &mut Span<'a>) -> ModalResult<Node> {
     )
     .parse_next(input)?;
 
-    let end = input.checkpoint();
+    let end_offset = input.location();
     Ok(Node::new(
         Expr::Comprehension {
             element,
@@ -75,7 +79,7 @@ fn parse_comprehension<'a>(input: &mut Span<'a>) -> ModalResult<Node> {
             iterable,
             condition,
         },
-        create_range(input.offset_from(&start), input.offset_from(&end)),
+        create_range(input, start_offset, end_offset),
     ))
 }
 

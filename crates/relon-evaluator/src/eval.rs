@@ -1,8 +1,10 @@
 use crate::error::RuntimeError;
 use crate::value::Value;
 use ordered_float::OrderedFloat;
-use relon_parser::{Expr, FStringPart, Node, Operator, RefBase, TokenKey, TokenRange};
-use std::collections::{HashMap, HashSet};
+use relon_parser::{
+    parse_document, Expr, FStringPart, Node, Operator, RefBase, TokenKey, TokenRange,
+};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -41,6 +43,15 @@ impl Context {
         ctx
     }
 
+    pub fn enter_loading_module<S: Into<String>>(&self, path: S) -> LoadingModuleGuard<'_> {
+        let path = path.into();
+        self.loading_modules.lock().unwrap().push(path.clone());
+        LoadingModuleGuard {
+            loading_modules: &self.loading_modules,
+            path,
+        }
+    }
+
     pub fn with_root(mut self, root: Node) -> Self {
         self.root_node = Some(root);
         self
@@ -58,6 +69,8 @@ pub struct Scope {
     pub locals: std::sync::Mutex<std::collections::HashMap<String, crate::value::Value>>,
     pub current_dir: String,
     pub cache_namespace: String,
+    pub reference_root: Option<Arc<Node>>,
+    pub reference_root_parent: Option<Arc<Scope>>,
     pub(crate) thunks: Mutex<HashMap<String, Arc<Thunk>>>,
 }
 
@@ -67,6 +80,7 @@ impl std::fmt::Debug for Scope {
             .field("path_node", &self.path_node)
             .field("current_dir", &self.current_dir)
             .field("cache_namespace", &self.cache_namespace)
+            .field("has_reference_root", &self.reference_root.is_some())
             .finish()
     }
 }
@@ -79,6 +93,8 @@ impl Clone for Scope {
             locals: Mutex::new(self.locals.lock().unwrap().clone()),
             current_dir: self.current_dir.clone(),
             cache_namespace: self.cache_namespace.clone(),
+            reference_root: self.reference_root.clone(),
+            reference_root_parent: self.reference_root_parent.clone(),
             thunks: Mutex::new(self.thunks.lock().unwrap().clone()),
         }
     }
@@ -144,6 +160,8 @@ impl Scope {
             locals: Mutex::new(locals),
             current_dir: self.current_dir.clone(),
             cache_namespace: self.cache_namespace.clone(),
+            reference_root: self.reference_root.clone(),
+            reference_root_parent: self.reference_root_parent.clone(),
             thunks: Mutex::new(HashMap::new()),
         })
     }
@@ -155,6 +173,8 @@ impl Scope {
             locals: Mutex::new(new_locals),
             current_dir: self.current_dir.clone(),
             cache_namespace: self.cache_namespace.clone(),
+            reference_root: self.reference_root.clone(),
+            reference_root_parent: self.reference_root_parent.clone(),
             thunks: Mutex::new(HashMap::new()),
         })
     }
@@ -166,6 +186,8 @@ impl Scope {
             locals: Mutex::new(HashMap::new()),
             current_dir: self.current_dir.clone(),
             cache_namespace: self.cache_namespace.clone(),
+            reference_root: self.reference_root.clone(),
+            reference_root_parent: self.reference_root_parent.clone(),
             thunks: Mutex::new(HashMap::new()),
         })
     }
@@ -191,6 +213,38 @@ pub(crate) struct Thunk {
 enum ReferenceStep {
     Thunk(Arc<Thunk>),
     Value(Value),
+}
+
+#[derive(Clone, Copy)]
+enum NumericValue {
+    Int(i64),
+    Float(OrderedFloat<f64>),
+}
+
+impl NumericValue {
+    fn as_f64(self) -> f64 {
+        match self {
+            Self::Int(value) => value as f64,
+            Self::Float(value) => value.into_inner(),
+        }
+    }
+}
+
+pub struct LoadingModuleGuard<'a> {
+    loading_modules: &'a Mutex<Vec<String>>,
+    path: String,
+}
+
+impl Drop for LoadingModuleGuard<'_> {
+    fn drop(&mut self) {
+        let mut loading_modules = self.loading_modules.lock().unwrap();
+        if let Some(index) = loading_modules
+            .iter()
+            .rposition(|module| module == &self.path)
+        {
+            loading_modules.remove(index);
+        }
+    }
 }
 
 impl<'a> Evaluator<'a> {
@@ -276,6 +330,8 @@ impl<'a> Evaluator<'a> {
                     locals: Mutex::new(HashMap::new()),
                     current_dir: current_scope.current_dir.clone(),
                     cache_namespace: current_scope.cache_namespace.clone(),
+                    reference_root: current_scope.reference_root.clone(),
+                    reference_root_parent: current_scope.reference_root_parent.clone(),
                     thunks: Mutex::new(HashMap::new()),
                 });
 
@@ -294,7 +350,7 @@ impl<'a> Evaluator<'a> {
                 }
 
                 // Phase 2: Force fields in source order for the final materialized value.
-                let mut map = HashMap::new();
+                let mut map = BTreeMap::new();
                 for (key, val_node) in pairs {
                     if let TokenKey::Spread(_) = key {
                         let val = self.eval(val_node, &dict_scope)?;
@@ -565,7 +621,10 @@ impl<'a> Evaluator<'a> {
             return self.load_virtual_module(path_str, range);
         }
         let target_path = Path::new(&scope.current_dir).join(path_str);
-        let canonical_path = target_path.to_string_lossy().to_string();
+        let canonical_target = std::fs::canonicalize(&target_path).map_err(|e| {
+            RuntimeError::IoError(format!("{}: {e}", target_path.to_string_lossy()))
+        })?;
+        let canonical_path = canonical_target.to_string_lossy().to_string();
         if let Some(cached) = self
             .context
             .module_cache
@@ -587,28 +646,25 @@ impl<'a> Evaluator<'a> {
                 range.into(),
             ));
         }
-        self.context
-            .loading_modules
-            .lock()
-            .unwrap()
-            .push(canonical_path.clone());
-        let content = std::fs::read_to_string(&target_path)
+        let _loading_guard = self.context.enter_loading_module(canonical_path.clone());
+        let content = std::fs::read_to_string(&canonical_target)
             .map_err(|e| RuntimeError::IoError(e.to_string()))?;
-        let mut input = relon_parser::Span::new(&content);
-        let node = relon_parser::parse_base(&mut input)
-            .map_err(|_| RuntimeError::ModuleNotFound(canonical_path.clone(), range.into()))?;
+        let node = parse_document(&content).map_err(|error| RuntimeError::ModuleParseError {
+            path: canonical_path.clone(),
+            message: error.to_string(),
+            range: range.into(),
+        })?;
         let module_scope = Arc::new(Scope {
-            current_dir: target_path
+            current_dir: canonical_target
                 .parent()
                 .unwrap_or(Path::new("."))
                 .to_string_lossy()
                 .to_string(),
             cache_namespace: canonical_path.clone(),
+            reference_root: Some(Arc::new(node.clone())),
             ..Default::default()
         });
-        let evaluated = self.eval(&node, &module_scope);
-        self.context.loading_modules.lock().unwrap().pop();
-        let evaluated = evaluated?;
+        let evaluated = self.eval(&node, &module_scope)?;
         self.context
             .module_cache
             .lock()
@@ -619,17 +675,24 @@ impl<'a> Evaluator<'a> {
 
     fn load_virtual_module(&self, path: &str, range: TokenRange) -> Result<Value, RuntimeError> {
         let content = match path {
+            "std/dict" => include_str!("std_relon/dict.relon"),
+            "std/is" => include_str!("std_relon/is.relon"),
             "std/math" => include_str!("std_relon/math.relon"),
             "std/list" => include_str!("std_relon/list.relon"),
+            "std/string" => include_str!("std_relon/string.relon"),
+            "std/value" => include_str!("std_relon/value.relon"),
             _ => return Err(RuntimeError::ModuleNotFound(path.to_string(), range.into())),
         };
-        let mut input = relon_parser::Span::new(content);
-        let node = relon_parser::parse_base(&mut input)
-            .map_err(|_| RuntimeError::ModuleNotFound(path.to_string(), range.into()))?;
+        let node = parse_document(content).map_err(|error| RuntimeError::ModuleParseError {
+            path: path.to_string(),
+            message: error.to_string(),
+            range: range.into(),
+        })?;
         self.eval(
             &node,
             &Arc::new(Scope {
                 cache_namespace: path.to_string(),
+                reference_root: Some(Arc::new(node.clone())),
                 ..Default::default()
             }),
         )
@@ -665,10 +728,16 @@ impl<'a> Evaluator<'a> {
         if let Some(pos) = body.decorators.iter().position(|d| d.range == dec.range) {
             body.decorators.remove(pos);
         }
+        let captured_env = if scope.path_node.is_some() {
+            scope.parent.clone().unwrap_or_else(|| Arc::clone(scope))
+        } else {
+            Arc::clone(scope)
+        };
+
         Ok(Value::Closure {
             params,
             body,
-            captured_env: Arc::clone(scope),
+            captured_env,
         })
     }
 
@@ -687,8 +756,7 @@ impl<'a> Evaluator<'a> {
         {
             return self.eval_closure(&params, &body, args, &captured_env, range);
         }
-        if path.len() == 1 {
-            let name = path[0].to_string_key();
+        if let Some(name) = Self::native_function_name(path) {
             if let Some(func) = self.context.functions.get(&name) {
                 let positional: Vec<Value> = args.into_iter().map(|a| a.value).collect();
                 return func.call(positional, range);
@@ -721,8 +789,7 @@ impl<'a> Evaluator<'a> {
             combined.extend(args);
             return self.eval_closure(&params, &body, combined, &captured_env, range);
         }
-        if path.len() == 1 {
-            let name = path[0].to_string_key();
+        if let Some(name) = Self::native_function_name(path) {
             if let Some(func) = self.context.functions.get(&name) {
                 let mut positional = vec![value.clone()];
                 positional.extend(args.into_iter().map(|a| a.value));
@@ -746,6 +813,17 @@ impl<'a> Evaluator<'a> {
             ),
             range,
         ))
+    }
+
+    fn native_function_name(path: &[TokenKey]) -> Option<String> {
+        let mut parts = Vec::with_capacity(path.len());
+        for part in path {
+            match part {
+                TokenKey::String(name, _) => parts.push(name.as_str()),
+                _ => return None,
+            }
+        }
+        Some(parts.join("."))
     }
 
     fn eval_closure(
@@ -793,15 +871,27 @@ impl<'a> Evaluator<'a> {
                 range,
             });
         }
-        let closure_scope = Arc::new(Scope {
+        let bindings_scope = Arc::new(Scope {
             parent: Some(Arc::clone(captured_env)),
             path_node: None,
             locals: Mutex::new(bindings),
             current_dir: captured_env.current_dir.clone(),
             cache_namespace: captured_env.cache_namespace.clone(),
+            reference_root: captured_env.reference_root.clone(),
+            reference_root_parent: captured_env.reference_root_parent.clone(),
             thunks: Mutex::new(HashMap::new()),
         });
-        self.eval(body, &closure_scope)
+        let body_scope = Arc::new(Scope {
+            parent: Some(Arc::clone(&bindings_scope)),
+            path_node: None,
+            locals: Mutex::new(HashMap::new()),
+            current_dir: bindings_scope.current_dir.clone(),
+            cache_namespace: bindings_scope.cache_namespace.clone(),
+            reference_root: Some(Arc::new(body.clone())),
+            reference_root_parent: Some(bindings_scope),
+            thunks: Mutex::new(HashMap::new()),
+        });
+        self.eval(body, &body_scope)
     }
 
     fn resolve_variable(
@@ -882,84 +972,17 @@ impl<'a> Evaluator<'a> {
         match (op, &l, &r) {
             (Operator::Add, Value::String(a), b) => Ok(Value::String(format!("{}{}", a, b))),
             (Operator::Add, a, Value::String(b)) => Ok(Value::String(format!("{}{}", a, b))),
-            (Operator::Add, Value::Int(a), Value::Int(b)) => Ok(Value::Int(a + b)),
-            (Operator::Add, Value::Float(a), Value::Float(b)) => Ok(Value::Float(*a + *b)),
-            (Operator::Add, Value::Int(a), Value::Float(b)) => {
-                Ok(Value::Float(OrderedFloat(*a as f64) + *b))
+            (Operator::Add | Operator::Sub | Operator::Mul, _, _) => {
+                Self::eval_numeric_arithmetic(op, &l, left.range, &r, right.range)
             }
-            (Operator::Add, Value::Float(a), Value::Int(b)) => {
-                Ok(Value::Float(*a + OrderedFloat(*b as f64)))
-            }
-            (Operator::Sub, Value::Int(a), Value::Int(b)) => Ok(Value::Int(a - b)),
-            (Operator::Sub, Value::Float(a), Value::Float(b)) => Ok(Value::Float(*a - *b)),
-            (Operator::Sub, Value::Int(a), Value::Float(b)) => {
-                Ok(Value::Float(OrderedFloat(*a as f64) - *b))
-            }
-            (Operator::Sub, Value::Float(a), Value::Int(b)) => {
-                Ok(Value::Float(*a - OrderedFloat(*b as f64)))
-            }
-            (Operator::Mul, Value::Int(a), Value::Int(b)) => Ok(Value::Int(a * b)),
-            (Operator::Mul, Value::Float(a), Value::Float(b)) => Ok(Value::Float(*a * *b)),
-            (Operator::Mul, Value::Int(a), Value::Float(b)) => {
-                Ok(Value::Float(OrderedFloat(*a as f64) * *b))
-            }
-            (Operator::Mul, Value::Float(a), Value::Int(b)) => {
-                Ok(Value::Float(*a * OrderedFloat(*b as f64)))
-            }
-            (Operator::Div, Value::Int(a), Value::Int(b)) => {
-                if *b == 0 {
-                    Err(RuntimeError::DivisionByZero(right.range))
-                } else {
-                    Ok(Value::Int(a / b))
-                }
-            }
-            (Operator::Div, a, b) => {
-                let fa = match a {
-                    Value::Int(i) => *i as f64,
-                    Value::Float(f) => f.into_inner(),
-                    _ => 0.0,
-                };
-                let fb = match b {
-                    Value::Int(i) => *i as f64,
-                    Value::Float(f) => f.into_inner(),
-                    _ => 0.0,
-                };
-                if fb == 0.0 {
-                    Err(RuntimeError::DivisionByZero(right.range))
-                } else {
-                    Ok(Value::Float(OrderedFloat(fa / fb)))
-                }
-            }
-            (Operator::Mod, Value::Int(a), Value::Int(b)) => {
-                if *b == 0 {
-                    Err(RuntimeError::DivisionByZero(right.range))
-                } else {
-                    Ok(Value::Int(a % b))
-                }
-            }
-            (Operator::Mod, a, b) => {
-                let fa = match a {
-                    Value::Int(i) => *i as f64,
-                    Value::Float(f) => f.into_inner(),
-                    _ => 0.0,
-                };
-                let fb = match b {
-                    Value::Int(i) => *i as f64,
-                    Value::Float(f) => f.into_inner(),
-                    _ => 0.0,
-                };
-                if fb == 0.0 {
-                    Err(RuntimeError::DivisionByZero(right.range))
-                } else {
-                    Ok(Value::Float(OrderedFloat(fa % fb)))
-                }
+            (Operator::Div | Operator::Mod, _, _) => {
+                Self::eval_numeric_division(op, &l, left.range, &r, right.range)
             }
             (Operator::Eq, a, b) => Ok(Value::Bool(a == b)),
             (Operator::Ne, a, b) => Ok(Value::Bool(a != b)),
-            (Operator::Lt, Value::Int(a), Value::Int(b)) => Ok(Value::Bool(a < b)),
-            (Operator::Gt, Value::Int(a), Value::Int(b)) => Ok(Value::Bool(a > b)),
-            (Operator::Le, Value::Int(a), Value::Int(b)) => Ok(Value::Bool(a <= b)),
-            (Operator::Ge, Value::Int(a), Value::Int(b)) => Ok(Value::Bool(a >= b)),
+            (Operator::Lt | Operator::Gt | Operator::Le | Operator::Ge, _, _) => {
+                Self::eval_numeric_comparison(op, &l, left.range, &r, right.range)
+            }
             _ => Err(RuntimeError::UnsupportedOperator(
                 format!("{:?}", op),
                 left.range,
@@ -977,10 +1000,88 @@ impl<'a> Evaluator<'a> {
         match (op, val) {
             (Operator::Not, v) => Ok(Value::Bool(!v.is_truthy())),
             (Operator::Sub, Value::Int(i)) => Ok(Value::Int(-i)),
+            (Operator::Sub, Value::Float(f)) => Ok(Value::Float(-f)),
+            (Operator::Sub, v) => Err(RuntimeError::TypeMismatch {
+                expected: "Number".to_string(),
+                found: v.type_name().to_string(),
+                range: node.range,
+            }),
             _ => Err(RuntimeError::UnsupportedOperator(
                 format!("{:?}", op),
                 node.range,
             )),
+        }
+    }
+
+    fn eval_numeric_arithmetic(
+        op: Operator,
+        left: &Value,
+        left_range: TokenRange,
+        right: &Value,
+        right_range: TokenRange,
+    ) -> Result<Value, RuntimeError> {
+        let left = Self::expect_number(left, left_range)?;
+        let right = Self::expect_number(right, right_range)?;
+        match (op, left, right) {
+            (Operator::Add, NumericValue::Int(a), NumericValue::Int(b)) => Ok(Value::Int(a + b)),
+            (Operator::Sub, NumericValue::Int(a), NumericValue::Int(b)) => Ok(Value::Int(a - b)),
+            (Operator::Mul, NumericValue::Int(a), NumericValue::Int(b)) => Ok(Value::Int(a * b)),
+            (Operator::Add, a, b) => Ok(Value::Float(OrderedFloat(a.as_f64() + b.as_f64()))),
+            (Operator::Sub, a, b) => Ok(Value::Float(OrderedFloat(a.as_f64() - b.as_f64()))),
+            (Operator::Mul, a, b) => Ok(Value::Float(OrderedFloat(a.as_f64() * b.as_f64()))),
+            _ => unreachable!("non-arithmetic operator passed to eval_numeric_arithmetic"),
+        }
+    }
+
+    fn eval_numeric_division(
+        op: Operator,
+        left: &Value,
+        left_range: TokenRange,
+        right: &Value,
+        right_range: TokenRange,
+    ) -> Result<Value, RuntimeError> {
+        let left = Self::expect_number(left, left_range)?;
+        let right = Self::expect_number(right, right_range)?;
+        if right.as_f64() == 0.0 {
+            return Err(RuntimeError::DivisionByZero(right_range));
+        }
+        match (op, left, right) {
+            (Operator::Div, NumericValue::Int(a), NumericValue::Int(b)) => Ok(Value::Int(a / b)),
+            (Operator::Mod, NumericValue::Int(a), NumericValue::Int(b)) => Ok(Value::Int(a % b)),
+            (Operator::Div, a, b) => Ok(Value::Float(OrderedFloat(a.as_f64() / b.as_f64()))),
+            (Operator::Mod, a, b) => Ok(Value::Float(OrderedFloat(a.as_f64() % b.as_f64()))),
+            _ => unreachable!("non-division operator passed to eval_numeric_division"),
+        }
+    }
+
+    fn eval_numeric_comparison(
+        op: Operator,
+        left: &Value,
+        left_range: TokenRange,
+        right: &Value,
+        right_range: TokenRange,
+    ) -> Result<Value, RuntimeError> {
+        let left = Self::expect_number(left, left_range)?.as_f64();
+        let right = Self::expect_number(right, right_range)?.as_f64();
+        let result = match op {
+            Operator::Lt => left < right,
+            Operator::Gt => left > right,
+            Operator::Le => left <= right,
+            Operator::Ge => left >= right,
+            _ => unreachable!("non-comparison operator passed to eval_numeric_comparison"),
+        };
+        Ok(Value::Bool(result))
+    }
+
+    fn expect_number(value: &Value, range: TokenRange) -> Result<NumericValue, RuntimeError> {
+        match value {
+            Value::Int(value) => Ok(NumericValue::Int(*value)),
+            Value::Float(value) => Ok(NumericValue::Float(*value)),
+            _ => Err(RuntimeError::TypeMismatch {
+                expected: "Number".to_string(),
+                found: value.type_name().to_string(),
+                range,
+            }),
         }
     }
 
@@ -991,10 +1092,10 @@ impl<'a> Evaluator<'a> {
         scope: &Arc<Scope>,
         range: TokenRange,
     ) -> Result<Value, RuntimeError> {
-        let root = self
-            .context
-            .root_node
-            .as_ref()
+        let root = scope
+            .reference_root
+            .as_deref()
+            .or(self.context.root_node.as_ref())
             .ok_or(RuntimeError::VariableNotFound("No root".to_string(), range))?;
         let mut target_path = match base {
             RefBase::Root => Vec::new(),
@@ -1043,11 +1144,13 @@ impl<'a> Evaluator<'a> {
         range: TokenRange,
     ) -> Result<Value, RuntimeError> {
         let root_scope = Arc::new(Scope {
-            parent: None,
+            parent: original_scope.reference_root_parent.clone(),
             path_node: None,
             locals: Mutex::new(HashMap::new()),
             current_dir: original_scope.current_dir.clone(),
             cache_namespace: original_scope.cache_namespace.clone(),
+            reference_root: original_scope.reference_root.clone(),
+            reference_root_parent: original_scope.reference_root_parent.clone(),
             thunks: Mutex::new(HashMap::new()),
         });
         self.eval_reference_path_from(root, &root_scope, path, display_path, range)
@@ -1310,9 +1413,6 @@ impl<'a> Evaluator<'a> {
                 continue;
             }
             let key_str = key.to_string_key();
-            if thunks.contains_key(&key_str) {
-                continue;
-            }
             let item_scope = scope.with_path(key_str.clone());
             let path = item_scope.full_path();
             let path_str = path.join(".");

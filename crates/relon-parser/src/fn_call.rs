@@ -1,7 +1,7 @@
 use crate::{create_range, id::id, soc0, CallArg, Expr, Node, Span};
 use winnow::combinator::{delimited, opt, separated};
 use winnow::prelude::*;
-use winnow::stream::{Offset, Stream};
+use winnow::stream::{Location, Stream};
 
 pub fn parse_call_arg<'a>(
     input: &mut Span<'a>,
@@ -28,7 +28,7 @@ pub fn parse_fn_call<'a>(
     input: &mut Span<'a>,
     parse_expr: fn(&mut Span<'a>) -> ModalResult<Node>,
 ) -> ModalResult<Node> {
-    let start = input.checkpoint();
+    let start_offset = input.location();
 
     // 🚨 Support paths like math.abs
     let path = crate::var::parse_path.parse_next(input)?;
@@ -55,11 +55,11 @@ pub fn parse_fn_call<'a>(
     )
     .parse_next(input)?;
 
-    let end = input.checkpoint();
+    let end_offset = input.location();
 
     Ok(Node::new(
         Expr::FnCall { path, args },
-        create_range(input.offset_from(&start), input.offset_from(&end)),
+        create_range(input, start_offset, end_offset),
     ))
 }
 

@@ -1,0 +1,20 @@
+{
+    @fn(value)
+    "null": type(value) == "Null",
+    @fn(value)
+    bool: type(value) == "Bool",
+    @fn(value)
+    int: type(value) == "Int",
+    @fn(value)
+    float: type(value) == "Float",
+    @fn(value)
+    number: type(value) == "Int" || type(value) == "Float",
+    @fn(value)
+    string: type(value) == "String",
+    @fn(value)
+    list: type(value) == "List",
+    @fn(value)
+    dict: type(value) == "Dict",
+    @fn(value)
+    empty: len(value) == 0
+}

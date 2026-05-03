@@ -3,18 +3,18 @@ use crate::prim::string::{parse_escaped_char, parse_escaped_whitespace};
 use crate::{create_range, Expr, FStringPart, Node, Span};
 use winnow::combinator::{alt, delimited, preceded, repeat};
 use winnow::prelude::*;
-use winnow::stream::{Offset, Stream};
+use winnow::stream::{Location, Stream};
 use winnow::token::{any, literal, take_till, take_while};
 
 pub fn parse_fmt_string<'a>(input: &mut Span<'a>) -> ModalResult<Node> {
-    let start = input.checkpoint();
+    let start_offset = input.location();
 
     let parts = preceded('f', alt((normal_fmt_string, raw_fmt_string))).parse_next(input)?;
 
-    let end = input.checkpoint();
+    let end_offset = input.location();
     Ok(Node::new(
         Expr::FString(parts),
-        create_range(input.offset_from(&start), input.offset_from(&end)),
+        create_range(input, start_offset, end_offset),
     ))
 }
 

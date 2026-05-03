@@ -1,0 +1,8 @@
+{
+    @fn(value, fallback)
+    default: value == null ? fallback: value,
+    @fn(a, b)
+    equals: a == b,
+    @fn(value)
+    clone: value
+}

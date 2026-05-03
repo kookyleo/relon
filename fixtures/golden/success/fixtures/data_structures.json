@@ -1,0 +1,26 @@
+{
+  "base": {
+    "owner": "Relon",
+    "version": 1
+  },
+  "config": {
+    "debug": true,
+    "owner": "Relon",
+    "version": 1
+  },
+  "evens": [
+    0,
+    2,
+    4,
+    6,
+    8
+  ],
+  "merged_list": [
+    1,
+    2,
+    3,
+    4,
+    5
+  ],
+  "pipe_demo": 5
+}

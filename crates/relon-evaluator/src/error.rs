@@ -49,6 +49,15 @@ pub enum RuntimeError {
     #[diagnostic(code(relon::eval::module_not_found))]
     ModuleNotFound(String, #[label("here")] miette::SourceSpan),
 
+    #[error("Parse error in module {path}: {message}")]
+    #[diagnostic(code(relon::eval::module_parse_error))]
+    ModuleParseError {
+        path: String,
+        message: String,
+        #[label("imported here")]
+        range: miette::SourceSpan,
+    },
+
     #[error("Circular import detected: {0:?}")]
     #[diagnostic(code(relon::eval::circular_import))]
     CircularImport(Vec<String>, #[label("here")] miette::SourceSpan),

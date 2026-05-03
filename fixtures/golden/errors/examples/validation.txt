@@ -1,0 +1,4 @@
+TypeMismatch
+expected: >= 1024
+found: 80
+range: 3:5-3:27

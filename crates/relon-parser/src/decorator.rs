@@ -3,14 +3,14 @@ use crate::fn_call::parse_call_arg;
 use crate::{create_range, soc0, CallArg, Decorator, Span};
 use winnow::combinator::{delimited, opt, preceded, repeat, separated};
 use winnow::prelude::*;
-use winnow::stream::{Offset, Stream};
+use winnow::stream::Location;
 
 pub fn parse_decorators<'a>(input: &mut Span<'a>) -> ModalResult<Vec<Decorator>> {
     repeat(0.., preceded(soc0, decorator)).parse_next(input)
 }
 
 fn decorator<'a>(input: &mut Span<'a>) -> ModalResult<Decorator> {
-    let start = input.checkpoint();
+    let start_offset = input.location();
     let (path, args) = preceded(
         '@',
         (
@@ -39,11 +39,11 @@ fn decorator<'a>(input: &mut Span<'a>) -> ModalResult<Decorator> {
     )
     .parse_next(input)?;
 
-    let end = input.checkpoint();
+    let end_offset = input.location();
     Ok(Decorator {
         path,
         args: args.unwrap_or_default(),
-        range: create_range(input.offset_from(&start), input.offset_from(&end)),
+        range: create_range(input, start_offset, end_offset),
     })
 }
 

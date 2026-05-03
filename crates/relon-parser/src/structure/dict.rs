@@ -4,10 +4,10 @@ use crate::{
 };
 use winnow::combinator::{alt, delimited, opt, separated};
 use winnow::prelude::*;
-use winnow::stream::{Offset, Stream};
+use winnow::stream::{Location, Stream};
 
 pub fn parse_dict<'a>(input: &mut Span<'a>) -> ModalResult<Node> {
-    let start = input.checkpoint();
+    let start_offset = input.location();
 
     let pairs = delimited(
         ("{", soc0),
@@ -16,25 +16,26 @@ pub fn parse_dict<'a>(input: &mut Span<'a>) -> ModalResult<Node> {
     )
     .parse_next(input)?;
 
-    let end = input.checkpoint();
+    let end_offset = input.location();
     Ok(Node::new(
         Expr::Dict(pairs),
-        create_range(input.offset_from(&start), input.offset_from(&end)),
+        create_range(input, start_offset, end_offset),
     ))
 }
 
 pub(crate) fn parse_pair<'a>(input: &mut Span<'a>) -> ModalResult<(TokenKey, Node)> {
-    let start = input.checkpoint();
-
     // Check for spread operator first: { ...base }
     let checkpoint = input.checkpoint();
-    if (soc0, "...").parse_next(input).is_ok() {
+    soc0.parse_next(input)?;
+    let spread_start_offset = input.location();
+    if winnow::token::literal::<_, _, winnow::error::ContextError>("...")
+        .parse_next(input)
+        .is_ok()
+    {
+        let spread_end_offset = input.location();
         let base = parse_expr.parse_next(input)?;
         return Ok((
-            TokenKey::Spread(create_range(
-                input.offset_from(&start),
-                input.offset_from(&start) + 3,
-            )),
+            TokenKey::Spread(create_range(input, spread_start_offset, spread_end_offset)),
             base,
         ));
     }

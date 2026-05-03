@@ -1,0 +1,11 @@
+{
+  "aliased": {
+    "result": 30
+  },
+  "flat": {
+    "result": "direct usage!!!"
+  },
+  "ns": {
+    "result": "hello!!!"
+  }
+}

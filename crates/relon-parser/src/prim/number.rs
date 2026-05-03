@@ -3,11 +3,11 @@ use ordered_float::OrderedFloat;
 use winnow::ascii::{dec_int, float, hex_uint};
 use winnow::combinator::{alt, opt, preceded};
 use winnow::prelude::*;
-use winnow::stream::{Offset, Stream};
+use winnow::stream::{Location, Stream};
 use winnow::token::{literal, take_while};
 
 pub fn parse_number<'a>(input: &mut Span<'a>) -> ModalResult<Node> {
-    let start = input.checkpoint();
+    let start_offset = input.location();
 
     let sign = opt(alt((literal('+').value(1i64), literal('-').value(-1i64))))
         .parse_next(input)?
@@ -27,10 +27,10 @@ pub fn parse_number<'a>(input: &mut Span<'a>) -> ModalResult<Node> {
     ))
     .parse_next(input)?;
 
-    let end = input.checkpoint();
+    let end_offset = input.location();
     Ok(Node::new(
         expr,
-        create_range(input.offset_from(&start), input.offset_from(&end)),
+        create_range(input, start_offset, end_offset),
     ))
 }
 

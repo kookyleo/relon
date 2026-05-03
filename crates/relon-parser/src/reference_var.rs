@@ -4,12 +4,12 @@ use crate::{
 use winnow::ascii::dec_uint;
 use winnow::combinator::{alt, delimited, preceded, repeat};
 use winnow::prelude::*;
-use winnow::stream::{Offset, Stream};
+use winnow::stream::Location;
 use winnow::token::literal;
 
 /// Parse a reference variable like &root.a.b
 pub fn parse_ref_var<'a>(input: &mut Span<'a>) -> ModalResult<Node> {
-    let start = input.checkpoint();
+    let start_offset = input.location();
 
     let base = preceded(
         '&',
@@ -50,10 +50,10 @@ pub fn parse_ref_var<'a>(input: &mut Span<'a>) -> ModalResult<Node> {
     )
     .parse_next(input)?;
 
-    let end = input.checkpoint();
+    let end_offset = input.location();
     Ok(Node::new(
         Expr::Reference { base, path },
-        create_range(input.offset_from(&start), input.offset_from(&end)),
+        create_range(input, start_offset, end_offset),
     ))
 }
 

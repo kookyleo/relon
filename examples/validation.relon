@@ -1,15 +1,16 @@
 {
-    @int
-    @min(1024)
-    @max(65535)
+    @ensure.int
+    @ensure.at_least(1024)
+    @ensure.at_most(65535)
     "port": 80,
-
-    @string
-    @one_of(["TCP", "UDP"])
+    @ensure.string
+    @ensure.one_of([
+        "TCP",
+        "UDP"
+    ])
     "protocol": "TCP",
-
     "nested": {
-        @bool
+        @ensure.bool
         "is_active": true
     }
 }

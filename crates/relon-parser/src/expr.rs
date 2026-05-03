@@ -4,10 +4,10 @@ use crate::reference_var::parse_ref_var;
 use crate::structure::dict::parse_dict;
 use crate::structure::list::parse_list;
 use crate::var::parse_var;
-use crate::{create_range, soc0, Expr, Node, Operator, Span};
+use crate::{combine_ranges, create_range, soc0, Expr, Node, Operator, Span};
 use winnow::combinator::{alt, delimited, preceded, repeat};
 use winnow::prelude::*;
-use winnow::stream::{Offset, Stream};
+use winnow::stream::{Location, Stream};
 use winnow::token::literal;
 
 pub fn parse_expr<'a>(input: &mut Span<'a>) -> ModalResult<Node> {
@@ -16,7 +16,7 @@ pub fn parse_expr<'a>(input: &mut Span<'a>) -> ModalResult<Node> {
 
 // Level 9: Ternary (cond ? then : else)
 fn parse_ternary<'a>(input: &mut Span<'a>) -> ModalResult<Node> {
-    let start = input.checkpoint();
+    let start_offset = input.location();
     let cond = parse_pipe.parse_next(input)?;
 
     let checkpoint = input.checkpoint();
@@ -24,10 +24,10 @@ fn parse_ternary<'a>(input: &mut Span<'a>) -> ModalResult<Node> {
         let then = parse_expr.parse_next(input)?;
         let _ = (soc0, ':', soc0).parse_next(input)?;
         let els = parse_expr.parse_next(input)?;
-        let end = input.checkpoint();
+        let end_offset = input.location();
         Ok(Node::new(
             Expr::Ternary { cond, then, els },
-            create_range(input.offset_from(&start), input.offset_from(&end)),
+            create_range(input, start_offset, end_offset),
         ))
     } else {
         input.reset(&checkpoint);
@@ -141,7 +141,7 @@ fn parse_multiplicative<'a>(input: &mut Span<'a>) -> ModalResult<Node> {
 
 // Level 2: Unary (!, -)
 fn parse_unary<'a>(input: &mut Span<'a>) -> ModalResult<Node> {
-    let start = input.checkpoint();
+    let start_offset = input.location();
     let checkpoint = input.checkpoint();
 
     fn parse_unary_op<'a>(i: &mut Span<'a>) -> ModalResult<Operator> {
@@ -154,10 +154,10 @@ fn parse_unary<'a>(input: &mut Span<'a>) -> ModalResult<Node> {
 
     if let Ok(op) = parse_unary_op.parse_next(input) {
         let node = parse_unary.parse_next(input)?;
-        let end = input.checkpoint();
+        let end_offset = input.location();
         Ok(Node::new(
             Expr::Unary(op, node),
-            create_range(input.offset_from(&start), input.offset_from(&end)),
+            create_range(input, start_offset, end_offset),
         ))
     } else {
         input.reset(&checkpoint);
@@ -188,12 +188,8 @@ fn parse_atomic<'a>(input: &mut Span<'a>) -> ModalResult<Node> {
 
 fn fold_binary(mut left: Node, rest: Vec<(Operator, Node)>) -> Node {
     for (op, right) in rest {
-        let start_offset = left.range.start.offset;
-        let end_offset = right.range.end.offset;
-        left = Node::new(
-            Expr::Binary(op, left, right),
-            create_range(start_offset, end_offset),
-        );
+        let range = combine_ranges(left.range, right.range);
+        left = Node::new(Expr::Binary(op, left, right), range);
     }
     left
 }

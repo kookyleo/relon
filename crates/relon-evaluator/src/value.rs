@@ -2,8 +2,10 @@ use crate::eval::Scope;
 use ordered_float::OrderedFloat;
 use relon_parser::Node;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::sync::Arc;
+
+pub type Dict = BTreeMap<String, Value>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -14,7 +16,7 @@ pub enum Value {
     Float(OrderedFloat<f64>),
     String(String),
     List(Vec<Value>),
-    Dict(HashMap<String, Value>),
+    Dict(Dict),
     /// A unified closure (can be used as a function or a decorator)
     #[serde(skip)]
     Closure {

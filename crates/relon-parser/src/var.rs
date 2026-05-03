@@ -2,16 +2,16 @@ use crate::{create_range, id::id, prim::string::parse_string, Expr, Node, Span, 
 use winnow::ascii::dec_uint;
 use winnow::combinator::{alt, delimited, preceded, repeat};
 use winnow::prelude::*;
-use winnow::stream::{Offset, Stream};
+use winnow::stream::Location;
 
 /// Parse a variable or path access.
 pub fn parse_var<'a>(input: &mut Span<'a>) -> ModalResult<Node> {
-    let start = input.checkpoint();
+    let start_offset = input.location();
     let path = parse_path.parse_next(input)?;
-    let end = input.checkpoint();
+    let end_offset = input.location();
     Ok(Node::new(
         Expr::Variable(path),
-        create_range(input.offset_from(&start), input.offset_from(&end)),
+        create_range(input, start_offset, end_offset),
     ))
 }
 

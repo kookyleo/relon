@@ -5,6 +5,7 @@ pub mod fn_call;
 pub mod id;
 pub mod prim;
 pub mod reference_var;
+pub mod source;
 pub mod structure;
 pub mod token;
 pub mod var;
@@ -14,7 +15,7 @@ pub use token::*;
 use winnow::ascii::multispace1;
 use winnow::combinator::{alt, repeat};
 use winnow::prelude::*;
-use winnow::stream::{Offset, Stream};
+use winnow::stream::Location;
 
 use crate::prim::boolean::parse_bool;
 use crate::prim::null::parse_null;
@@ -22,6 +23,58 @@ use crate::prim::number::parse_number;
 use crate::prim::string::parse_string;
 
 pub type Span<'a> = winnow::LocatingSlice<&'a str>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ParseDocumentError {
+    Parse { offset: usize, message: String },
+    TrailingInput { offset: usize, remaining: String },
+}
+
+impl std::fmt::Display for ParseDocumentError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Parse { message, .. } => write!(f, "parse error: {message}"),
+            Self::TrailingInput { offset, remaining } => {
+                write!(f, "trailing input at byte {offset}: {remaining:?}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ParseDocumentError {}
+
+impl ParseDocumentError {
+    pub fn source_span(&self) -> Option<miette::SourceSpan> {
+        match self {
+            Self::Parse { offset, .. } => Some((*offset, 1).into()),
+            Self::TrailingInput { offset, remaining } => {
+                Some((*offset, remaining.len().max(1)).into())
+            }
+        }
+    }
+}
+
+pub fn parse_document(source: &str) -> Result<Node, ParseDocumentError> {
+    let mut input = Span::new(source);
+    let node = parse_base(&mut input).map_err(|error| ParseDocumentError::Parse {
+        offset: input.location(),
+        message: format!("{error:?}"),
+    })?;
+    soc0(&mut input).map_err(|error| ParseDocumentError::Parse {
+        offset: input.location(),
+        message: format!("{error:?}"),
+    })?;
+    if input.is_empty() {
+        Ok(node)
+    } else {
+        let remaining = input.to_string();
+        let remaining = remaining.chars().take(64).collect();
+        Err(ParseDocumentError::TrailingInput {
+            offset: input.location(),
+            remaining,
+        })
+    }
+}
 
 /// Parse zero or more spaces or comments.
 pub fn soc0<'a>(input: &mut Span<'a>) -> ModalResult<Vec<&'a str>> {
@@ -49,16 +102,63 @@ fn block_comment<'a>(input: &mut Span<'a>) -> ModalResult<&'a str> {
         .parse_next(input)
 }
 
-pub fn create_range(start_offset: usize, end_offset: usize) -> TokenRange {
+pub fn create_range(input: &Span<'_>, start_offset: usize, end_offset: usize) -> TokenRange {
     TokenRange {
-        start: TokenPosition {
-            offset: start_offset,
-            ..Default::default()
-        },
-        end: TokenPosition {
-            offset: end_offset,
-            ..Default::default()
-        },
+        start: position_at(input, start_offset),
+        end: position_at(input, end_offset),
+    }
+}
+
+pub fn combine_ranges(start: TokenRange, end: TokenRange) -> TokenRange {
+    TokenRange {
+        start: start.start,
+        end: end.end,
+    }
+}
+
+fn position_at(input: &Span<'_>, offset: usize) -> TokenPosition {
+    let mut full_input = *input;
+    full_input.reset_to_start();
+    let source = *full_input.as_ref();
+    position_at_source(source, offset)
+}
+
+fn position_at_source(source: &str, offset: usize) -> TokenPosition {
+    let offset = offset.min(source.len());
+    let end = if source.is_char_boundary(offset) {
+        offset
+    } else {
+        let mut boundary = offset;
+        while boundary > 0 && !source.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        boundary
+    };
+
+    let mut line = 1u32;
+    let mut column = 1usize;
+    let mut chars = source[..end].chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\r' => {
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+                line += 1;
+                column = 1;
+            }
+            '\n' => {
+                line += 1;
+                column = 1;
+            }
+            _ => column += 1,
+        }
+    }
+
+    TokenPosition {
+        line,
+        column,
+        offset,
     }
 }
 
@@ -68,14 +168,17 @@ pub fn parse_prim<'a>(input: &mut Span<'a>) -> ModalResult<Node> {
 
 /// Parse the root base which consists of optional decorators and a root List or Dict.
 pub fn parse_base<'a>(input: &mut Span<'a>) -> ModalResult<Node> {
-    let start = input.checkpoint();
     let decorators = decorator::parse_decorators(input)?;
     soc0(input)?;
+    let start_offset = decorators
+        .first()
+        .map(|decorator| decorator.range.start.offset)
+        .unwrap_or_else(|| input.location());
 
     let root = alt((structure::dict::parse_dict, structure::list::parse_list)).parse_next(input)?;
 
-    let end = input.checkpoint();
-    let range = create_range(input.offset_from(&start), input.offset_from(&end));
+    let end_offset = input.location();
+    let range = create_range(input, start_offset, end_offset);
 
     Ok(Node {
         expr: root.expr,
@@ -96,6 +199,52 @@ mod tests {
         );
         let node = parse_base(&mut s).unwrap();
         assert!(matches!(*node.expr, Expr::Dict(_)));
+    }
+
+    #[test]
+    fn test_parse_document_accepts_trailing_trivia() {
+        assert!(parse_document("{ a: 1 } // trailing\n /* ok */").is_ok());
+    }
+
+    #[test]
+    fn test_parse_document_rejects_trailing_tokens() {
+        let err = parse_document("{ a: 1 } true").unwrap_err();
+        assert!(matches!(
+            err,
+            ParseDocumentError::TrailingInput {
+                offset: 9,
+                ref remaining
+            } if remaining == "true"
+        ));
+        assert_eq!(err.source_span(), Some((9, 4).into()));
+    }
+
+    #[test]
+    fn test_parse_document_reports_parse_error_span() {
+        let err = parse_document("{ a: }").unwrap_err();
+        assert!(matches!(err, ParseDocumentError::Parse { .. }));
+        assert!(err.source_span().is_some());
+    }
+
+    #[test]
+    fn test_token_range_has_line_and_column() {
+        let node = parse_document("// leading\n{\n  answer: 42\n}\n").unwrap();
+        assert_eq!(node.range.start.line, 2);
+        assert_eq!(node.range.start.column, 1);
+        assert_eq!(node.range.end.line, 4);
+        assert_eq!(node.range.end.column, 2);
+
+        if let Expr::Dict(pairs) = *node.expr {
+            let TokenKey::String(_, key_range) = &pairs[0].0 else {
+                panic!("Expected string key")
+            };
+            assert_eq!(key_range.start.line, 3);
+            assert_eq!(key_range.start.column, 3);
+            assert_eq!(pairs[0].1.range.start.line, 3);
+            assert_eq!(pairs[0].1.range.start.column, 11);
+        } else {
+            panic!("Expected dict")
+        }
     }
 
     #[test]

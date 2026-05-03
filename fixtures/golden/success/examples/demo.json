@@ -1,0 +1,16 @@
+{
+  "currency": "<closure>",
+  "meta": {
+    "summary": "Active project: Relon Modern",
+    "tags_count": 3
+  },
+  "multiply": "<closure>",
+  "project": {
+    "details": {
+      "base_price": 1500,
+      "display": "1800 GBP",
+      "total": 1800.0
+    },
+    "name": "Relon Modern"
+  }
+}

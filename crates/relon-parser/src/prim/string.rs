@@ -2,19 +2,19 @@ use crate::{create_range, Expr, Node, Span};
 use winnow::ascii::{hex_digit1, multispace1};
 use winnow::combinator::{alt, delimited, preceded, repeat};
 use winnow::prelude::*;
-use winnow::stream::{Offset, Stream};
+use winnow::stream::Location;
 use winnow::token::{any, literal, take_until, take_while};
 
 /// Parse double-quoted strings and raw strings.
 pub fn parse_string<'a>(input: &mut Span<'a>) -> ModalResult<Node> {
-    let start = input.checkpoint();
+    let start_offset = input.location();
 
     let s = alt((normal_string, raw_string)).parse_next(input)?;
 
-    let end = input.checkpoint();
+    let end_offset = input.location();
     Ok(Node::new(
         Expr::String(s),
-        create_range(input.offset_from(&start), input.offset_from(&end)),
+        create_range(input, start_offset, end_offset),
     ))
 }
 

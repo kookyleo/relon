@@ -1,7 +1,18 @@
 {
+    @fn(l)
+    first: l[0],
+    @fn(l)
+    compact: [
+        x for x in l if x != null
+    ],
+    @fn(l, value)
+    contains: list.contains(l, value),
     @fn(l, f)
-    map: [f(x) for x in l],
-
+    map: [
+        f(x) for x in l
+    ],
     @fn(l, f)
-    filter: [x for x in l if f(x)]
+    filter: [
+        x for x in l if f(x)
+    ]
 }
