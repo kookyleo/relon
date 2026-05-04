@@ -1,0 +1,17 @@
+{
+    @schema Image: { name: String, url: String },
+    @schema Text: { name: String, content: String },
+
+    items: [
+        { name: "a", url: "http://a.png" },
+        { name: "b", content: "hello world" }
+    ],
+
+    render_item(item): item match {
+        Image: "IMG(" + item.url + ")",
+        Text: "TXT(" + item.content + ")",
+        *: "UNKNOWN"
+    },
+
+    display: [render_item(x) for x in &sibling.items]
+}

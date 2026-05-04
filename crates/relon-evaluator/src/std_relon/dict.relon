@@ -1,10 +1,6 @@
 {
-    @fn(a, b)
-    merge: dict.merge(a, b),
-    @fn(value)
-    keys: dict.keys(value),
-    @fn(value)
-    values: dict.values(value),
-    @fn(value, key)
-    has_key: dict.has_key(value, key)
+    merge(a, b): dict.merge(a, b),
+    keys(value): dict.keys(value),
+    values(value): dict.values(value),
+    has_key(value, key): dict.has_key(value, key)
 }

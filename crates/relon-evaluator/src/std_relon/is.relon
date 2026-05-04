@@ -1,20 +1,11 @@
 {
-    @fn(value)
-    "null": type(value) == "Null",
-    @fn(value)
-    bool: type(value) == "Bool",
-    @fn(value)
-    int: type(value) == "Int",
-    @fn(value)
-    float: type(value) == "Float",
-    @fn(value)
-    number: type(value) == "Int" || type(value) == "Float",
-    @fn(value)
-    string: type(value) == "String",
-    @fn(value)
-    list: type(value) == "List",
-    @fn(value)
-    dict: type(value) == "Dict",
-    @fn(value)
-    empty: len(value) == 0
+    "null"(value): type(value) == "Null",
+    bool(value): type(value) == "Bool",
+    int(value): type(value) == "Int",
+    float(value): type(value) == "Float",
+    number(value): type(value) == "Int" || type(value) == "Float",
+    string(value): type(value) == "String",
+    list(value): type(value) == "List",
+    dict(value): type(value) == "Dict",
+    empty(value): len(value) == 0
 }

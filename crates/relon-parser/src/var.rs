@@ -1,8 +1,10 @@
-use crate::{create_range, id::id, prim::string::parse_string, Expr, Node, Span, TokenKey};
+use crate::expr::parse_expr;
+use crate::{create_range, id::id, Expr, Node, Span, TokenKey};
 use winnow::ascii::dec_uint;
-use winnow::combinator::{alt, delimited, preceded, repeat};
+use winnow::combinator::{alt, repeat};
 use winnow::prelude::*;
 use winnow::stream::Location;
+use winnow::token::literal;
 
 /// Parse a variable or path access.
 pub fn parse_var<'a>(input: &mut Span<'a>) -> ModalResult<Node> {
@@ -17,32 +19,34 @@ pub fn parse_var<'a>(input: &mut Span<'a>) -> ModalResult<Node> {
 
 pub fn parse_path<'a>(input: &mut Span<'a>) -> ModalResult<Vec<TokenKey>> {
     let head = id.parse_next(input)?;
-    let mut path = vec![TokenKey::String(head.0, head.1)];
+    let mut path = vec![TokenKey::String(head.0, head.1, false)];
 
     let rest: Vec<TokenKey> = repeat(
         0..,
         alt((
-            preceded(
-                ".",
+            // Dot access: .a or ?.a
+            (
+                alt((literal("?.").value(true), literal(".").value(false))),
                 alt((
-                    dec_uint.map(TokenKey::Index),
-                    id.map(|i| TokenKey::String(i.0, i.1)),
+                    dec_uint.map(|i| (Some(i), None)),
+                    id.map(|i| (None, Some(i))),
                 )),
-            ),
-            delimited(
-                "[",
-                alt((
-                    dec_uint.map(TokenKey::Index),
-                    parse_string.map(|node| {
-                        if let Expr::String(s) = *node.expr {
-                            TokenKey::String(s, node.range)
-                        } else {
-                            unreachable!()
-                        }
-                    }),
-                )),
+            )
+                .map(|(opt, (idx, name))| {
+                    if let Some(i) = idx {
+                        TokenKey::Index(i, opt)
+                    } else {
+                        let n = name.unwrap();
+                        TokenKey::String(n.0, n.1, opt)
+                    }
+                }),
+            // Bracket access: [expr] or ?[expr]
+            (
+                alt((literal("?[").value(true), literal("[").value(false))),
+                parse_expr,
                 "]",
-            ),
+            )
+                .map(|(opt, expr, _)| TokenKey::Dynamic(expr, opt)),
         )),
     )
     .parse_next(input)?;
@@ -62,16 +66,22 @@ mod tests {
         if let Expr::Variable(path) = *node.expr {
             assert_eq!(path.len(), 3);
             match &path[0] {
-                TokenKey::String(s, _) => assert_eq!(s, "a"),
+                TokenKey::String(s, _, _) => assert_eq!(s, "a"),
                 _ => panic!(),
             }
             match &path[1] {
-                TokenKey::String(s, _) => assert_eq!(s, "b"),
+                TokenKey::String(s, _, _) => assert_eq!(s, "b"),
                 _ => panic!(),
             }
             match &path[2] {
-                TokenKey::Index(i) => assert_eq!(*i, 0),
-                _ => panic!(),
+                TokenKey::Dynamic(expr_node, _) => {
+                    if let Expr::Int(i) = *expr_node.expr {
+                        assert_eq!(i, 0);
+                    } else {
+                        panic!("Expected Int(0) in dynamic key");
+                    }
+                }
+                _ => panic!("Expected dynamic key"),
             }
         } else {
             panic!()

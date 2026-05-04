@@ -1,8 +1,7 @@
-use crate::{
-    create_range, id::id, prim::string::parse_string, Expr, Node, RefBase, Span, TokenKey,
-};
+use crate::expr::parse_expr;
+use crate::{create_range, id::id, Expr, Node, RefBase, Span, TokenKey};
 use winnow::ascii::dec_uint;
-use winnow::combinator::{alt, delimited, preceded, repeat};
+use winnow::combinator::{alt, repeat};
 use winnow::prelude::*;
 use winnow::stream::Location;
 use winnow::token::literal;
@@ -11,12 +10,16 @@ use winnow::token::literal;
 pub fn parse_ref_var<'a>(input: &mut Span<'a>) -> ModalResult<Node> {
     let start_offset = input.location();
 
-    let base = preceded(
+    let base = winnow::combinator::preceded(
         '&',
         alt((
             literal("root").value(RefBase::Root),
             literal("sibling").value(RefBase::Sibling),
             literal("uncle").value(RefBase::Uncle),
+            literal("prev").value(RefBase::Prev),
+            literal("next").value(RefBase::Next),
+            literal("index").value(RefBase::Index),
+            literal("this").value(RefBase::This),
         )),
     )
     .parse_next(input)?;
@@ -25,27 +28,29 @@ pub fn parse_ref_var<'a>(input: &mut Span<'a>) -> ModalResult<Node> {
     let path: Vec<TokenKey> = repeat(
         0..,
         alt((
-            preceded(
-                ".",
+            // Dot access: .a or ?.a
+            (
+                alt((literal("?.").value(true), literal(".").value(false))),
                 alt((
-                    dec_uint.map(TokenKey::Index),
-                    id.map(|i| TokenKey::String(i.0, i.1)),
+                    dec_uint.map(|i| (Some(i), None)),
+                    id.map(|i| (None, Some(i))),
                 )),
-            ),
-            delimited(
-                "[",
-                alt((
-                    dec_uint.map(TokenKey::Index),
-                    parse_string.map(|node| {
-                        if let Expr::String(s) = *node.expr {
-                            TokenKey::String(s, node.range)
-                        } else {
-                            unreachable!()
-                        }
-                    }),
-                )),
+            )
+                .map(|(opt, (idx, name))| {
+                    if let Some(i) = idx {
+                        TokenKey::Index(i, opt)
+                    } else {
+                        let n = name.unwrap();
+                        TokenKey::String(n.0, n.1, opt)
+                    }
+                }),
+            // Bracket access: [expr] or ?[expr]
+            (
+                alt((literal("?[").value(true), literal("[").value(false))),
+                parse_expr,
                 "]",
-            ),
+            )
+                .map(|(opt, expr, _)| TokenKey::Dynamic(expr, opt)),
         )),
     )
     .parse_next(input)?;

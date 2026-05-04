@@ -28,6 +28,12 @@ pub enum Error {
 
     #[error("failed to convert Relon value to JSON: non-finite float {0}")]
     NonFiniteFloat(f64),
+
+    #[error("failed to convert Relon value to JSON: closures are not supported in JSON output")]
+    UnsupportedClosure,
+
+    #[error("failed to convert Relon value to JSON: schemas are not supported in JSON output")]
+    UnsupportedSchema,
 }
 
 pub fn from_str<T>(source: &str) -> Result<T>
@@ -99,14 +105,23 @@ pub fn to_json_value(value: Value) -> Result<serde_json::Value> {
             .map(serde_json::Value::Array),
         Value::Dict(values) => {
             let mut map = serde_json::Map::new();
-            for (key, value) in values {
-                if !key.starts_with('_') {
-                    map.insert(key, to_json_value(value)?);
+            for (key, value) in values.map {
+                match value {
+                    Value::Closure { .. } => continue, // Skip closures in dicts
+                    Value::Schema(_) => continue,      // Skip schemas in dicts
+                    Value::Type(_) => continue,        // Skip types in dicts
+                    Value::Wildcard => continue,       // Skip wildcards in dicts
+                    _ => {
+                        map.insert(key, to_json_value(value)?);
+                    }
                 }
             }
             Ok(serde_json::Value::Object(map))
         }
-        Value::Closure { .. } => Ok(serde_json::Value::String("<closure>".to_string())),
+        Value::Closure { .. } => Err(Error::UnsupportedClosure),
+        Value::Schema(_) => Err(Error::UnsupportedSchema),
+        Value::Type(_) => Err(Error::UnsupportedSchema),
+        Value::Wildcard => Err(Error::UnsupportedSchema),
     }
 }
 
@@ -149,7 +164,7 @@ mod tests {
     fn deserializes_from_str() {
         let config: ServerConfig = from_str(
             r#"{
-            _format: @fn(v) "port=" + v,
+            _format(v): "port=" + v,
             host: "localhost",
             base: { port: 8080 },
             port: &sibling.base.port,

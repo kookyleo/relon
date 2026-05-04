@@ -1,10 +1,6 @@
 {
-    @fn(x)
-    abs: x < 0 ? -x: x,
-    @fn(a, b)
-    max: a > b ? a: b,
-    @fn(a, b)
-    min: a < b ? a: b,
-    @fn(value, min_value, max_value)
-    clamp: value < min_value ? min_value: (value > max_value ? max_value: value)
+    abs(x): x < 0 ? -x: x,
+    max(a, b): a > b ? a: b,
+    min(a, b): a < b ? a: b,
+    clamp(value, min_value, max_value): value < min_value ? min_value: (value > max_value ? max_value: value)
 }

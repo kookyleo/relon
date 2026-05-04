@@ -1,0 +1,15 @@
+[
+  {
+    "active": true,
+    "title": "Start"
+  },
+  {
+    "enabled": true,
+    "title": "Middle"
+  },
+  {
+    "enabled": true,
+    "index": 2,
+    "title": "End"
+  }
+]

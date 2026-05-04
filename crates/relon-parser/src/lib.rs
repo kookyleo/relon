@@ -183,6 +183,7 @@ pub fn parse_base<'a>(input: &mut Span<'a>) -> ModalResult<Node> {
     Ok(Node {
         expr: root.expr,
         decorators,
+        type_hint: None,
         range,
     })
 }
@@ -235,7 +236,7 @@ mod tests {
         assert_eq!(node.range.end.column, 2);
 
         if let Expr::Dict(pairs) = *node.expr {
-            let TokenKey::String(_, key_range) = &pairs[0].0 else {
+            let TokenKey::String(_, key_range, _) = &pairs[0].0 else {
                 panic!("Expected string key")
             };
             assert_eq!(key_range.start.line, 3);

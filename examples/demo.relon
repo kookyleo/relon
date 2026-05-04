@@ -6,11 +6,9 @@
 {
     // --- 1. LOGIC DEFINITIONS ---
     // Define a formatter as a decorator-compatible function
-    @fn(val, symbol)
-    currency: val + " " + symbol,
+    currency(val, symbol): val + " " + symbol,
     // Define a simple math function
-    @fn(a, b)
-    multiply: a * b,
+    multiply(a, b): a * b,
     // --- 2. DATA STRUCTURE ---
     project: {
         name: "Relon Modern",

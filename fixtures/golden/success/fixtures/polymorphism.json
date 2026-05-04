@@ -1,0 +1,16 @@
+{
+  "display": [
+    "IMG(http://a.png)",
+    "TXT(hello world)"
+  ],
+  "items": [
+    {
+      "name": "a",
+      "url": "http://a.png"
+    },
+    {
+      "content": "hello world",
+      "name": "b"
+    }
+  ]
+}

@@ -1,0 +1,1 @@
+{ _secret: "hidden", public: &sibling._secret + " info" }

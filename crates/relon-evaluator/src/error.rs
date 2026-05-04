@@ -61,4 +61,8 @@ pub enum RuntimeError {
     #[error("Circular import detected: {0:?}")]
     #[diagnostic(code(relon::eval::circular_import))]
     CircularImport(Vec<String>, #[label("here")] miette::SourceSpan),
+
+    #[error("Numeric overflow")]
+    #[diagnostic(code(relon::eval::numeric_overflow))]
+    NumericOverflow(#[label("here")] TokenRange),
 }

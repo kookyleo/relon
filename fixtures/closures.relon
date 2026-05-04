@@ -1,13 +1,11 @@
 {
     // High-order function definition
-    @fn(x)
-    "make_adder": @fn(y) x + y,
+    make_adder(x): (y) => x + y,
     // Partial application
-    "add_10": make_adder(10),
+    add_10: make_adder(10),
     // Execution showing captured environment 'x'
-    "result": add_10(5), // 15
+    result: add_10(5), // 15
     // Recursive closure
-    @fn(n)
-    "factorial": n <= 1 ? 1: n * factorial(n - 1),
-    "fact_5": factorial(5) // 120
+    factorial(n): n <= 1 ? 1: n * factorial(n - 1),
+    fact_5: factorial(5) // 120
 }

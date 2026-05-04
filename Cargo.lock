@@ -462,6 +462,7 @@ dependencies = [
  "ariadne",
  "clap",
  "miette",
+ "relon",
  "relon-evaluator",
  "relon-parser",
  "serde_json",

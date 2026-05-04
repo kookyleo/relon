@@ -1,6 +1,4 @@
 {
-    @fn(val)
-    shout: val + "!!!",
-    @fn(a, b)
-    sum: a + b
+    shout(val): val + "!!!",
+    sum(a, b): a + b
 }

@@ -1,0 +1,5 @@
+@import("lib_with_private.relon", as="lib")
+{ 
+  check_public: lib.public,
+  check_private: lib._secret 
+}

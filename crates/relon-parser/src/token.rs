@@ -21,21 +21,36 @@ impl From<TokenRange> for miette::SourceSpan {
     }
 }
 
-#[derive(Debug, PartialEq, Clone, Eq, Hash)]
+#[derive(Debug, PartialEq, Clone)]
 pub enum TokenKey {
     Dummy,
-    Index(usize),
-    String(String, TokenRange),
+    Index(usize, bool),               // index, is_optional
+    String(String, TokenRange, bool), // name, range, is_optional
+    Dynamic(Node, bool),              // expr, is_optional
     Spread(TokenRange),
 }
 
 impl TokenKey {
-    pub fn to_string_key(&self) -> String {
+    pub fn name(&self) -> String {
         match self {
             TokenKey::Dummy => "_".to_string(),
-            TokenKey::Index(i) => i.to_string(),
-            TokenKey::String(s, _) => s.clone(),
+            TokenKey::Index(i, _) => i.to_string(),
+            TokenKey::String(s, _, _) => s.clone(),
+            TokenKey::Dynamic(_, _) => "<dynamic>".to_string(),
             TokenKey::Spread(_) => "...".to_string(),
+        }
+    }
+
+    pub fn to_string_key(&self) -> String {
+        self.name()
+    }
+
+    pub fn is_optional(&self) -> bool {
+        match self {
+            TokenKey::Index(_, opt) => *opt,
+            TokenKey::String(_, _, opt) => *opt,
+            TokenKey::Dynamic(_, opt) => *opt,
+            _ => false,
         }
     }
 }
@@ -65,9 +80,25 @@ pub struct Decorator {
 }
 
 #[derive(Debug, PartialEq, Clone)]
+pub struct TypeNode {
+    pub path: Vec<String>,
+    pub generics: Vec<TypeNode>,
+    pub is_optional: bool,
+    pub range: TokenRange,
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub struct ClosureParam {
+    pub name: String,
+    pub type_hint: Option<TypeNode>,
+    pub range: TokenRange,
+}
+
+#[derive(Debug, PartialEq, Clone)]
 pub struct Node {
     pub expr: Box<Expr>,
     pub decorators: Vec<Decorator>,
+    pub type_hint: Option<TypeNode>,
     pub range: TokenRange,
 }
 
@@ -76,12 +107,18 @@ impl Node {
         Self {
             expr: Box::new(expr),
             decorators: Vec::new(),
+            type_hint: None,
             range,
         }
     }
 
     pub fn with_decorators(mut self, decorators: Vec<Decorator>) -> Self {
         self.decorators = decorators;
+        self
+    }
+
+    pub fn with_type_hint(mut self, type_hint: Option<TypeNode>) -> Self {
+        self.type_hint = type_hint;
         self
     }
 }
@@ -126,12 +163,36 @@ pub enum Expr {
     },
 
     FString(Vec<FStringPart>),
+
+    Type(TypeNode),
+
+    Wildcard,
+
+    Where {
+        expr: Node,
+        bindings: Node,
+    },
+
+    Match {
+        expr: Node,
+        arms: Vec<(Node, Node)>,
+    },
+
+    Closure {
+        params: Vec<ClosureParam>,
+        return_type: Option<TypeNode>,
+        body: Node,
+    },
 }
 #[derive(Debug, PartialEq, Clone, Copy, Eq, Hash)]
 pub enum RefBase {
     Root,
     Sibling,
     Uncle,
+    Prev,
+    Next,
+    Index,
+    This,
 }
 
 #[derive(Debug, PartialEq, Clone)]

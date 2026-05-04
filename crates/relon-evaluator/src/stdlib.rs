@@ -1,6 +1,6 @@
 use crate::error::RuntimeError;
 use crate::eval::{Context, RelonFunction};
-use crate::value::Value;
+use crate::value::{Value, ValueDict};
 use std::sync::Arc;
 
 pub fn register_to(ctx: &mut Context) {
@@ -53,7 +53,7 @@ impl RelonFunction for Len {
         match &args[0] {
             Value::String(s) => Ok(Value::Int(s.len() as i64)),
             Value::List(l) => Ok(Value::Int(l.len() as i64)),
-            Value::Dict(d) => Ok(Value::Int(d.len() as i64)),
+            Value::Dict(d) => Ok(Value::Int(d.map.len() as i64)),
             _ => Err(RuntimeError::TypeMismatch {
                 expected: "String/List/Dict".to_string(),
                 found: args[0].type_name().to_string(),
@@ -299,7 +299,7 @@ impl RelonFunction for RequiredFields {
         let fields = expect_string_list(&args[1], range)?;
         if let Some(field) = fields
             .iter()
-            .find(|field| !dict.contains_key(field.as_str()))
+            .find(|field| !dict.map.contains_key(field.as_str()))
         {
             return validation_failure(
                 &args,
@@ -332,8 +332,8 @@ impl RelonFunction for Requires {
         let dict = expect_dict(&args[0], range)?;
         let field = expect_string(&args[1], range)?;
         let required = expect_string(&args[2], range)?;
-        let needs_required = dict.get(field).is_some_and(Value::is_truthy);
-        let has_required = dict.get(required).is_some_and(Value::is_truthy);
+        let needs_required = dict.map.get(field).is_some_and(Value::is_truthy);
+        let has_required = dict.map.get(required).is_some_and(Value::is_truthy);
         if needs_required && !has_required {
             return validation_failure(
                 &args,
@@ -366,7 +366,7 @@ impl RelonFunction for FieldEq {
         let dict = expect_dict(&args[0], range)?;
         let left = expect_string(&args[1], range)?;
         let right = expect_string(&args[2], range)?;
-        if dict.get(left) != dict.get(right) {
+        if dict.map.get(left) != dict.map.get(right) {
             return validation_failure(
                 &args,
                 3,
@@ -495,11 +495,19 @@ impl RelonFunction for DictMerge {
                 range,
             });
         }
-        let mut merged = std::collections::BTreeMap::new();
-        for value in &args {
-            merged.extend(expect_dict(value, range)?.clone());
+        let mut result = args[0].clone();
+        for patch in args.iter().skip(1) {
+            result.deep_merge(patch);
         }
-        Ok(Value::Dict(merged))
+        if matches!(result, Value::Dict(_)) {
+            Ok(result)
+        } else {
+            Err(RuntimeError::TypeMismatch {
+                expected: "Dict".to_string(),
+                found: result.type_name().to_string(),
+                range,
+            })
+        }
     }
 }
 
@@ -512,6 +520,7 @@ impl RelonFunction for DictKeys {
     ) -> Result<Value, RuntimeError> {
         expect_arg_count(&args, 1, range)?;
         let mut keys = expect_dict(&args[0], range)?
+            .map
             .keys()
             .cloned()
             .collect::<Vec<_>>();
@@ -529,11 +538,11 @@ impl RelonFunction for DictValues {
     ) -> Result<Value, RuntimeError> {
         expect_arg_count(&args, 1, range)?;
         let dict = expect_dict(&args[0], range)?;
-        let mut keys = dict.keys().cloned().collect::<Vec<_>>();
+        let mut keys = dict.map.keys().cloned().collect::<Vec<_>>();
         keys.sort();
         Ok(Value::List(
             keys.into_iter()
-                .filter_map(|key| dict.get(&key).cloned())
+                .filter_map(|key| dict.map.get(&key).cloned())
                 .collect(),
         ))
     }
@@ -548,7 +557,9 @@ impl RelonFunction for DictHasKey {
     ) -> Result<Value, RuntimeError> {
         expect_arg_count(&args, 2, range)?;
         Ok(Value::Bool(
-            expect_dict(&args[0], range)?.contains_key(expect_string(&args[1], range)?),
+            expect_dict(&args[0], range)?
+                .map
+                .contains_key(expect_string(&args[1], range)?),
         ))
     }
 }
@@ -617,10 +628,7 @@ fn expect_string_list(
     Ok(strings)
 }
 
-fn expect_dict(
-    value: &Value,
-    range: relon_parser::TokenRange,
-) -> Result<&std::collections::BTreeMap<String, Value>, RuntimeError> {
+fn expect_dict(value: &Value, range: relon_parser::TokenRange) -> Result<&ValueDict, RuntimeError> {
     match value {
         Value::Dict(value) => Ok(value),
         other => Err(RuntimeError::TypeMismatch {

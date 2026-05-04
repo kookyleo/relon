@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand};
 use miette::{IntoDiagnostic, LabeledSpan, NamedSource, Report};
-use relon_evaluator::{Context, Evaluator, Scope, Value};
+use relon_evaluator::{Context, Evaluator, Scope};
 use relon_parser::{parse_document, ParseDocumentError};
 use std::path::PathBuf;
 
@@ -73,8 +73,10 @@ fn main() -> miette::Result<()> {
                     .with_source_code(NamedSource::new(file.to_string_lossy(), content.clone()))
             })?;
 
-            // Filter out private fields (starting with _) before JSON output
-            let final_val = filter_private_fields(result)?;
+            let final_val = relon::to_json_value(result).map_err(|e| {
+                miette::miette!("{}", e)
+                    .with_source_code(NamedSource::new(file.to_string_lossy(), content))
+            })?;
 
             let output = if pretty {
                 serde_json::to_string_pretty(&final_val).into_diagnostic()?
@@ -87,36 +89,4 @@ fn main() -> miette::Result<()> {
     }
 
     Ok(())
-}
-
-fn filter_private_fields(val: Value) -> miette::Result<serde_json::Value> {
-    match val {
-        Value::Null => Ok(serde_json::Value::Null),
-        Value::Bool(b) => Ok(serde_json::Value::Bool(b)),
-        Value::Int(i) => Ok(serde_json::Value::Number(i.into())),
-        Value::Float(f) => {
-            let value = f.into_inner();
-            serde_json::Number::from_f64(value)
-                .map(serde_json::Value::Number)
-                .ok_or_else(|| {
-                    miette::miette!("non-finite float {value} cannot be represented in JSON")
-                })
-        }
-        Value::String(s) => Ok(serde_json::Value::String(s)),
-        Value::List(l) => l
-            .into_iter()
-            .map(filter_private_fields)
-            .collect::<miette::Result<Vec<_>>>()
-            .map(serde_json::Value::Array),
-        Value::Dict(m) => {
-            let mut map = serde_json::Map::new();
-            for (k, v) in m {
-                if !k.starts_with('_') {
-                    map.insert(k, filter_private_fields(v)?);
-                }
-            }
-            Ok(serde_json::Value::Object(map))
-        }
-        Value::Closure { .. } => Ok(serde_json::Value::String("<closure>".to_string())),
-    }
 }

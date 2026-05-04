@@ -1,7 +1,4 @@
 {
-  "add_10": "<closure>",
   "fact_5": 120,
-  "factorial": "<closure>",
-  "make_adder": "<closure>",
   "result": 15
 }
