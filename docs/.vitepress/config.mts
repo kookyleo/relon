@@ -7,33 +7,38 @@ export default defineConfig({
   
   locales: {
     root: {
+      label: 'Language',
+      lang: 'en', // default for root is just redirect, but VitePress requires a root locale fallback
+    },
+    zh: {
       label: '简体中文',
       lang: 'zh',
+      link: '/zh/',
       themeConfig: {
         nav: [
-          { text: '首页', link: '/' },
-          { text: '指南', link: '/guide/introduction' }
+          { text: '首页', link: '/zh/' },
+          { text: '指南', link: '/zh/guide/introduction' }
         ],
         sidebar: [
           {
             text: '入门',
             items: [
-              { text: '什么是 Relon？', link: '/guide/introduction' },
-              { text: '基础语法', link: '/guide/syntax' },
+              { text: '什么是 Relon？', link: '/zh/guide/introduction' },
+              { text: '基础语法', link: '/zh/guide/syntax' },
             ]
           },
           {
             text: '核心特性',
             items: [
-              { text: '函数与闭包', link: '/guide/functions' },
-              { text: '类型与契约 (Schema)', link: '/guide/types' },
-              { text: '模块与作用域', link: '/guide/modules' },
+              { text: '函数与闭包', link: '/zh/guide/functions' },
+              { text: '类型与契约 (Schema)', link: '/zh/guide/types' },
+              { text: '模块与作用域', link: '/zh/guide/modules' },
             ]
           },
           {
             text: '参考',
             items: [
-              { text: '标准库', link: '/guide/stdlib' },
+              { text: '标准库', link: '/zh/guide/stdlib' },
             ]
           }
         ],
