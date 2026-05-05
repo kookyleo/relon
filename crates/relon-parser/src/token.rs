@@ -294,6 +294,38 @@ pub enum Operator {
     Concat,
 }
 
+impl Expr {
+    /// Stable, allocation-free name for the variant — used by diagnostics
+    /// (`SchemaBodyNotDict { found }`) and any walker that wants a cheap
+    /// dispatch tag without matching the full enum.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Expr::Null => "Null",
+            Expr::Bool(_) => "Bool",
+            Expr::Int(_) => "Int",
+            Expr::Float(_) => "Float",
+            Expr::String(_) => "String",
+            Expr::List(_) => "List",
+            Expr::Dict(_) => "Dict",
+            Expr::Spread(_) => "Spread",
+            Expr::Comprehension { .. } => "Comprehension",
+            Expr::Variable(_) => "Variable",
+            Expr::Reference { .. } => "Reference",
+            Expr::Binary(_, _, _) => "Binary",
+            Expr::Unary(_, _) => "Unary",
+            Expr::Ternary { .. } => "Ternary",
+            Expr::FnCall { .. } => "FnCall",
+            Expr::FString(_) => "FString",
+            Expr::Type(_) => "Type",
+            Expr::Wildcard => "Wildcard",
+            Expr::Where { .. } => "Where",
+            Expr::Match { .. } => "Match",
+            Expr::Closure { .. } => "Closure",
+            Expr::VariantCtor { .. } => "VariantCtor",
+        }
+    }
+}
+
 impl Display for Expr {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -305,4 +337,24 @@ impl Display for Expr {
             _ => write!(f, "<expr>"),
         }
     }
+}
+
+/// Cheap predicate over the canonical builtin-type identifier set used by
+/// the type system (`Int`, `String`, ..., `Enum`). Centralized here so the
+/// analyzer, evaluator, and runtime checker all agree on one list.
+pub fn is_builtin_type_name(name: &str) -> bool {
+    matches!(
+        name,
+        "Int" | "Float"
+            | "Number"
+            | "String"
+            | "Bool"
+            | "Any"
+            | "Null"
+            | "List"
+            | "Dict"
+            | "Closure"
+            | "Fn"
+            | "Enum"
+    )
 }

@@ -5,7 +5,8 @@
 //! original source string (`source`) to translate byte offsets back to
 //! line/column pairs the LSP client can render.
 
-use lsp_types::{Diagnostic as LspDiagnostic, DiagnosticSeverity, NumberOrString, Position, Range};
+use crate::position::offset_to_position;
+use lsp_types::{Diagnostic as LspDiagnostic, DiagnosticSeverity, NumberOrString, Range};
 // Bring the miette `Diagnostic` trait into scope so we can call
 // `.code()` / `.labels()` on the analyzer's `Diagnostic` enum, which
 // derives the trait. The `as _` alias avoids a name clash with our
@@ -70,36 +71,6 @@ fn span_to_range(span: SourceSpan, source: &str) -> Range {
         start: offset_to_position(source, start),
         end: offset_to_position(source, end),
     }
-}
-
-/// Map a UTF-8 byte offset to an LSP `Position`. LSP defaults to
-/// UTF-16 code units; we approximate using UTF-16 length of each char
-/// so multibyte content (CJK, emoji) still produces valid positions.
-fn offset_to_position(source: &str, offset: usize) -> Position {
-    let offset = offset.min(source.len());
-    let mut line = 0u32;
-    let mut character = 0u32;
-    let mut byte = 0;
-
-    for ch in source.chars() {
-        if byte >= offset {
-            break;
-        }
-        let len = ch.len_utf8();
-        if byte + len > offset {
-            // Offset lands inside a multi-byte char — clamp to char start.
-            break;
-        }
-        if ch == '\n' {
-            line += 1;
-            character = 0;
-        } else {
-            character += ch.len_utf16() as u32;
-        }
-        byte += len;
-    }
-
-    Position { line, character }
 }
 
 #[cfg(test)]

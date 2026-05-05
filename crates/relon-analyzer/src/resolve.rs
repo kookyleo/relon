@@ -18,7 +18,7 @@
 //! references in the data sense.
 
 use crate::tree::AnalyzedTree;
-use relon_parser::{Expr, Node, NodeId, RefBase, TokenKey, TokenRange};
+use relon_parser::{child_nodes, Expr, Node, NodeId, RefBase, TokenKey, TokenRange};
 use std::collections::HashMap;
 
 /// Result of resolving a reference expression to a known dict field.
@@ -71,7 +71,7 @@ impl<'a> NodeIndexer<'a> {
                 .node_index
                 .insert(node.id, std::sync::Arc::new(node.clone()));
         }
-        for child in iter_children(node) {
+        for child in child_nodes(node) {
             self.visit(child);
         }
     }
@@ -106,8 +106,7 @@ impl ScopeFrame {
     /// True when this frame can plausibly bind `name` even if we can't
     /// see it in `fields` — i.e. there's a spread of unknown shape, or
     /// the name matches a closure param. Used by the typecheck pass
-    /// (next task) to suppress false-positive `UnresolvedReference`.
-    #[allow(dead_code)]
+    /// to suppress false-positive `UnresolvedReference`.
     pub(crate) fn might_dynamically_bind(&self, name: &str) -> bool {
         self.has_dynamic_spread || self.closure_params.contains_key(name)
     }
@@ -120,28 +119,22 @@ struct Walker<'a> {
 
 impl<'a> Walker<'a> {
     fn visit_root(&mut self, root: &Node) {
-        self.visit(root, /*is_root=*/ true);
+        self.visit(root);
     }
 
-    fn visit(&mut self, node: &Node, is_root_dict: bool) {
+    fn visit(&mut self, node: &Node) {
         match &*node.expr {
             Expr::Dict(pairs) => {
                 let frame = build_frame(pairs);
                 self.scope_stack.push(frame);
-
                 for (_, value) in pairs {
-                    // Fields whose value is itself a dict (or any other
-                    // non-reference shape) recurse with their own frame
-                    // pushed.
-                    self.visit(value, false);
+                    self.visit(value);
                 }
-
                 self.scope_stack.pop();
-                let _ = is_root_dict; // reserved for future per-root analyses
             }
             Expr::List(items) => {
                 for item in items {
-                    self.visit(item, false);
+                    self.visit(item);
                 }
             }
             Expr::Closure { params, body, .. } => {
@@ -159,14 +152,13 @@ impl<'a> Walker<'a> {
                     frame.closure_params.insert(param.name.clone(), body.id);
                 }
                 self.scope_stack.push(frame);
-                self.visit(body, false);
+                self.visit(body);
                 self.scope_stack.pop();
             }
             Expr::Reference { base, path } => {
                 if let Some(resolved) = self.resolve(base, path, node.range) {
                     self.tree.references.insert(node.id, resolved);
                 }
-                let _ = (base, path);
             }
             Expr::Variable(path) => {
                 // Bare identifiers behave like sibling lookups, with
@@ -177,8 +169,8 @@ impl<'a> Walker<'a> {
                 }
             }
             _ => {
-                for child in iter_children(node) {
-                    self.visit(child, false);
+                for child in child_nodes(node) {
+                    self.visit(child);
                 }
             }
         }
@@ -247,7 +239,7 @@ impl<'a> Walker<'a> {
     }
 }
 
-fn build_frame(pairs: &[(TokenKey, Node)]) -> ScopeFrame {
+pub(crate) fn build_frame(pairs: &[(TokenKey, Node)]) -> ScopeFrame {
     let mut frame = ScopeFrame::default();
     for (key, value) in pairs {
         match key {
@@ -270,87 +262,11 @@ fn build_frame(pairs: &[(TokenKey, Node)]) -> ScopeFrame {
     frame
 }
 
-fn path_head(path: &[TokenKey]) -> Option<String> {
+pub(crate) fn path_head(path: &[TokenKey]) -> Option<String> {
     match path.first()? {
         TokenKey::String(s, _, _) => Some(s.clone()),
         _ => None,
     }
-}
-
-/// Iterate over expression-shaped children of `node`. Decorators and
-/// type hints aren't traversed: they live in their own analyzer passes.
-fn iter_children(node: &Node) -> Vec<&Node> {
-    let mut out = Vec::new();
-    match &*node.expr {
-        Expr::Dict(pairs) => {
-            for (_, value) in pairs {
-                out.push(value);
-            }
-        }
-        Expr::List(items) => {
-            for item in items {
-                out.push(item);
-            }
-        }
-        Expr::Spread(inner) => out.push(inner),
-        Expr::Comprehension {
-            element,
-            iterable,
-            condition,
-            ..
-        } => {
-            out.push(element);
-            out.push(iterable);
-            if let Some(cond) = condition {
-                out.push(cond);
-            }
-        }
-        Expr::Binary(_, l, r) => {
-            out.push(l);
-            out.push(r);
-        }
-        Expr::Unary(_, inner) => out.push(inner),
-        Expr::Ternary { cond, then, els } => {
-            out.push(cond);
-            out.push(then);
-            out.push(els);
-        }
-        Expr::FnCall { args, .. } => {
-            for arg in args {
-                out.push(&arg.value);
-            }
-        }
-        Expr::FString(parts) => {
-            for part in parts {
-                if let relon_parser::FStringPart::Interpolation(n) = part {
-                    out.push(n);
-                }
-            }
-        }
-        Expr::Where { expr, bindings } => {
-            out.push(expr);
-            out.push(bindings);
-        }
-        Expr::Match { expr, arms } => {
-            out.push(expr);
-            for (pat, body) in arms {
-                out.push(pat);
-                out.push(body);
-            }
-        }
-        Expr::Closure { body, .. } => out.push(body),
-        Expr::VariantCtor { body, .. } => out.push(body),
-        Expr::Reference { .. }
-        | Expr::Variable(_)
-        | Expr::Type(_)
-        | Expr::Wildcard
-        | Expr::Null
-        | Expr::Bool(_)
-        | Expr::Int(_)
-        | Expr::Float(_)
-        | Expr::String(_) => {}
-    }
-    out
 }
 
 #[cfg(test)]

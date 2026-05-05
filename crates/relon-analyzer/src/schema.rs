@@ -20,6 +20,7 @@
 //! recorded with placeholders; this is a structural skeleton meant to
 //! support diagnostics + future passes, not full type-checking.
 
+use crate::decorator_names::{DEFAULT, ERROR, EXPECT, MSG, SCHEMA, VALUE};
 use crate::diagnostic::{span_of, Diagnostic};
 use crate::tree::AnalyzedTree;
 use relon_parser::{Decorator, Expr, Node, NodeId, Operator, TokenKey, TokenRange, TypeNode};
@@ -119,23 +120,22 @@ pub fn collect_schemas(root: &Node, tree: &mut AnalyzedTree) {
     };
 
     for (key, value) in pairs {
-        let Some(schema_decorator) = find_schema_decorator(&value.decorators) else {
+        if !has_schema_decorator(&value.decorators) {
             continue;
-        };
+        }
         let name = match key {
             TokenKey::String(s, _, _) => Some(s.clone()),
             _ => None,
         };
-        let _ = schema_decorator; // reserved for future per-decorator args
         if let Some(def) = lower_schema(name, value, tree) {
             tree.schemas.insert(value.id, def);
         }
     }
 }
 
-fn find_schema_decorator(decorators: &[Decorator]) -> Option<&Decorator> {
-    decorators.iter().find(|dec| {
-        dec.path.len() == 1 && matches!(&dec.path[0], TokenKey::String(s, _, _) if s == "schema")
+fn has_schema_decorator(decorators: &[Decorator]) -> bool {
+    decorators.iter().any(|dec| {
+        dec.path.len() == 1 && matches!(&dec.path[0], TokenKey::String(s, _, _) if s == SCHEMA)
     })
 }
 
@@ -210,7 +210,7 @@ fn walk_schema_body(node: &Node, def: &mut SchemaDef, tree: &mut AnalyzedTree) -
         }
         _ => {
             tree.diagnostics.push(Diagnostic::SchemaBodyNotDict {
-                found: expr_kind(&node.expr),
+                found: node.expr.kind().to_string(),
                 range: span_of(node.range),
             });
             false
@@ -328,7 +328,7 @@ fn is_field_skippable(value: &Node) -> bool {
                 TokenKey::String(name, _, _) => Some(name.as_str()),
                 _ => None,
             })
-            .map(|name| matches!(name, "expect" | "default" | "msg" | "error" | "value"))
+            .map(|name| matches!(name, EXPECT | DEFAULT | MSG | ERROR | VALUE))
             .unwrap_or(false)
     })
 }
@@ -347,34 +347,6 @@ fn base_ref(node: &Node) -> Option<BaseRef> {
         name,
         node: Arc::new(node.clone()),
     })
-}
-
-fn expr_kind(expr: &Expr) -> String {
-    match expr {
-        Expr::Null => "Null",
-        Expr::Bool(_) => "Bool",
-        Expr::Int(_) => "Int",
-        Expr::Float(_) => "Float",
-        Expr::String(_) => "String",
-        Expr::List(_) => "List",
-        Expr::Dict(_) => "Dict",
-        Expr::Spread(_) => "Spread",
-        Expr::Comprehension { .. } => "Comprehension",
-        Expr::Variable(_) => "Variable",
-        Expr::Reference { .. } => "Reference",
-        Expr::Binary(_, _, _) => "Binary",
-        Expr::Unary(_, _) => "Unary",
-        Expr::Ternary { .. } => "Ternary",
-        Expr::FnCall { .. } => "FnCall",
-        Expr::FString(_) => "FString",
-        Expr::Type(_) => "Type",
-        Expr::Wildcard => "Wildcard",
-        Expr::Where { .. } => "Where",
-        Expr::Match { .. } => "Match",
-        Expr::Closure { .. } => "Closure",
-        Expr::VariantCtor { .. } => "VariantCtor",
-    }
-    .to_string()
 }
 
 #[cfg(test)]

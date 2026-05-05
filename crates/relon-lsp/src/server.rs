@@ -321,33 +321,10 @@ fn parse_error_to_diagnostic(
     }
 }
 
-/// Translate a miette span to an LSP range. Duplicates the small
-/// offset→position helper from `diagnostics` to avoid widening that
-/// module's public API for one caller.
+/// Translate a miette span to an LSP range using the shared
+/// position-translation helpers.
 fn miette_span_to_lsp_range(span: miette::SourceSpan, source: &str) -> lsp_types::Range {
-    fn offset_to_position(source: &str, offset: usize) -> lsp_types::Position {
-        let offset = offset.min(source.len());
-        let mut line = 0u32;
-        let mut character = 0u32;
-        let mut byte = 0;
-        for ch in source.chars() {
-            if byte >= offset {
-                break;
-            }
-            let len = ch.len_utf8();
-            if byte + len > offset {
-                break;
-            }
-            if ch == '\n' {
-                line += 1;
-                character = 0;
-            } else {
-                character += ch.len_utf16() as u32;
-            }
-            byte += len;
-        }
-        lsp_types::Position { line, character }
-    }
+    use crate::position::offset_to_position;
     lsp_types::Range {
         start: offset_to_position(source, span.offset()),
         end: offset_to_position(source, span.offset() + span.len()),

@@ -18,6 +18,15 @@ pub struct EvaluatedArg {
     pub value: Value,
 }
 
+impl EvaluatedArg {
+    /// Construct an unnamed (positional) argument. Saves the
+    /// `EvaluatedArg { name: None, value: ... }` boilerplate at call sites
+    /// that synthesize implicit-self / single-arg invocations.
+    pub fn positional(value: Value) -> Self {
+        Self { name: None, value }
+    }
+}
+
 /// Argument bundle handed to a [`RelonFunction`]. Positional and named
 /// arguments are split apart up front so each host function only inspects
 /// what it cares about.

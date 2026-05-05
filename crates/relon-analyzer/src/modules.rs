@@ -6,6 +6,7 @@
 //! and CI tooling a static view of "what does this file import" without
 //! invoking I/O.
 
+use crate::decorator_names::{IMPORT, LIBRARY};
 use crate::tree::AnalyzedTree;
 use relon_parser::{Decorator, Expr, Node, TokenKey, TokenRange};
 
@@ -55,11 +56,11 @@ fn visit(node: &Node, tree: &mut AnalyzedTree) {
 }
 
 fn is_import(dec: &Decorator) -> bool {
-    dec.path.len() == 1 && matches!(&dec.path[0], TokenKey::String(name, _, _) if name == "import")
+    dec.path.len() == 1 && matches!(&dec.path[0], TokenKey::String(name, _, _) if name == IMPORT)
 }
 
 fn is_library(dec: &Decorator) -> bool {
-    dec.path.len() == 1 && matches!(&dec.path[0], TokenKey::String(name, _, _) if name == "library")
+    dec.path.len() == 1 && matches!(&dec.path[0], TokenKey::String(name, _, _) if name == LIBRARY)
 }
 
 fn lower_import(dec: &Decorator) -> ModuleImport {

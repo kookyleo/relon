@@ -105,11 +105,6 @@ pub struct FilesystemModuleResolver {
 }
 
 impl FilesystemModuleResolver {
-    /// Default-rejecting resolver. Equivalent to `FilesystemModuleResolver::default()`.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     /// Permit reads under `root`. The path is canonicalized eagerly so the
     /// allowlist check is just a prefix comparison at resolve time.
     pub fn with_root_dir(path: impl Into<PathBuf>) -> Self {

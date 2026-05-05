@@ -9,7 +9,8 @@
 //! doesn't yet — so this handler always returns the active document's
 //! URI. Out-of-document targets simply don't resolve.
 
-use crate::features::cursor::{covers, position_to_offset, smallest_node_at, token_range};
+use crate::features::cursor::{covers, smallest_node_at};
+use crate::position::{position_to_offset, token_range};
 use crate::server::DocumentEntry;
 use lsp_types::{Location, Position, Range, Url};
 use relon_parser::Expr;

@@ -161,7 +161,7 @@ ctx.capabilities.allow_native_fn.insert("secret.read".to_string());
 1. **`StdModuleResolver`** — 解析 `std/list`、`std/string` 这些虚拟模块（嵌在 binary 里，零 IO）。
 2. **`FilesystemModuleResolver`** — 从文件系统读：
    - `Context::trusted()` 下使用 `FilesystemModuleResolver::trusted()`，无 root 限制；
-   - `Context::sandboxed()` 下使用 `FilesystemModuleResolver::new()`，**默认拒绝一切**——必须替换或追加一个 `with_root_dir(...)` 实例。
+   - `Context::sandboxed()` 下使用 `FilesystemModuleResolver::default()`，**默认拒绝一切**——必须替换或追加一个 `with_root_dir(...)` 实例。
 
 替换示例：
 
@@ -181,8 +181,9 @@ ctx.module_resolvers = vec![
 要插入自定义 resolver（比如「从内存读」「从 OCI registry 读」），实现 `ModuleResolver` trait 然后：
 
 ```rust
-ctx.prepend_module_resolver(Arc::new(MyResolver));   // 走最前
-ctx.append_module_resolver(Arc::new(FallbackResolver)); // 走最后
+ctx.prepend_module_resolver(Arc::new(MyResolver)); // 走最前
+// 想做 fallback：直接 push 到 ctx.module_resolvers 末尾即可
+ctx.module_resolvers.push(Arc::new(FallbackResolver));
 ```
 
 ## 装饰器插件

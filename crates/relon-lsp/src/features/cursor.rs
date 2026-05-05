@@ -1,48 +1,11 @@
 //! Map LSP cursor positions to AST nodes.
 //!
-//! Two helpers:
-//!
-//! * [`position_to_offset`] — invert the LSP `(line, character)` pair
-//!   back to a UTF-8 byte offset against the document source.
-//! * [`smallest_node_at`] — walk the AST and return the deepest node
-//!   whose range covers the offset. Used by every feature handler to
-//!   answer "what is the user pointing at?".
+//! [`smallest_node_at`] walks the AST and returns the deepest node whose
+//! range covers a given byte offset — used by every feature handler to
+//! answer "what is the user pointing at?". Position translation lives
+//! one module up in [`crate::position`].
 
-use lsp_types::Position;
-use relon_parser::{
-    CallArg, Decorator, Expr, FStringPart, Node, TokenKey, TokenPosition, TokenRange,
-};
-
-/// Convert an LSP position (line + UTF-16 character) into a UTF-8 byte
-/// offset against `source`. Mirrors the inverse helper in
-/// `crate::diagnostics`. Tolerant of out-of-range positions: clamps to
-/// the source length so we never produce a panic from bad client input.
-pub fn position_to_offset(source: &str, position: Position) -> usize {
-    let target_line = position.line;
-    let target_char = position.character;
-    let mut line = 0u32;
-    let mut character = 0u32;
-    let mut byte = 0;
-    for ch in source.chars() {
-        if line == target_line && character >= target_char {
-            return byte;
-        }
-        let len = ch.len_utf8();
-        if ch == '\n' {
-            // If the cursor is past the end of `target_line`, snap to
-            // the line break.
-            if line == target_line {
-                return byte;
-            }
-            line += 1;
-            character = 0;
-        } else {
-            character += ch.len_utf16() as u32;
-        }
-        byte += len;
-    }
-    source.len()
-}
+use relon_parser::{CallArg, Decorator, Expr, FStringPart, Node, TokenKey, TokenRange};
 
 /// True iff `offset` falls inside `range` (start inclusive, end
 /// inclusive — so cursors right at the closing brace still bind to
@@ -166,24 +129,5 @@ fn children(node: &Node) -> Vec<&Node> {
 fn push_decorator_children<'a>(dec: &'a Decorator, out: &mut Vec<&'a Node>) {
     for CallArg { value, .. } in &dec.args {
         out.push(value);
-    }
-}
-
-/// Convert a parser `TokenPosition` to an LSP `Position`.
-pub fn token_position(pos: TokenPosition) -> Position {
-    // Parser uses 1-based lines/columns; LSP uses 0-based. `column`
-    // is byte-aligned in the parser; we approximate by treating it as
-    // a character index, which matches our `Position` math elsewhere.
-    Position {
-        line: pos.line.saturating_sub(1),
-        character: (pos.column.saturating_sub(1)) as u32,
-    }
-}
-
-/// Convert a parser `TokenRange` to an LSP `Range`.
-pub fn token_range(range: TokenRange) -> lsp_types::Range {
-    lsp_types::Range {
-        start: token_position(range.start),
-        end: token_position(range.end),
     }
 }

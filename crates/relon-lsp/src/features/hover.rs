@@ -12,7 +12,8 @@
 //! Anything else returns `None` (no hover) so the client can fall
 //! through to other servers.
 
-use crate::features::cursor::{position_to_offset, smallest_node_at, token_range};
+use crate::features::cursor::smallest_node_at;
+use crate::position::{position_to_offset, token_range};
 use crate::server::DocumentEntry;
 use lsp_types::{Hover, HoverContents, MarkupContent, MarkupKind, Position};
 use relon_analyzer::SchemaFieldDef;

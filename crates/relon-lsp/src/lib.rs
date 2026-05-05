@@ -14,4 +14,5 @@
 
 pub mod diagnostics;
 pub mod features;
+pub(crate) mod position;
 pub mod server;

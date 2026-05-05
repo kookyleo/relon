@@ -1,6 +1,7 @@
 pub mod arithmetic;
 pub mod builtin_decorators;
 pub mod decorator;
+pub mod decorator_names;
 pub mod error;
 pub mod eval;
 pub mod module;

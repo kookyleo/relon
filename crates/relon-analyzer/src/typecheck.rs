@@ -15,9 +15,11 @@
 //! [`StaticTypeMismatch`]: crate::Diagnostic::StaticTypeMismatch
 
 use crate::diagnostic::{span_of, Diagnostic};
-use crate::resolve::ScopeFrame;
+use crate::resolve::{build_frame, path_head, ScopeFrame};
 use crate::tree::AnalyzedTree;
-use relon_parser::{Expr, Node, RefBase, TokenKey, TypeNode};
+use relon_parser::{
+    child_nodes, is_builtin_type_name, Expr, Node, RefBase, TokenKey, TokenRange, TypeNode,
+};
 use std::collections::{HashMap, HashSet};
 
 /// Run the type-check walker over `root` and append diagnostics to
@@ -133,7 +135,7 @@ impl<'a> Walker<'a> {
                 self.check_unresolved_var(node, path);
             }
             Expr::Match { expr, arms } => {
-                self.check_match_exhaustiveness(node, expr, arms);
+                self.check_match_exhaustiveness(node.range, expr, arms);
                 self.visit(expr);
                 for (pat, body) in arms {
                     self.visit(pat);
@@ -141,7 +143,7 @@ impl<'a> Walker<'a> {
                 }
             }
             _ => {
-                for child in iter_children(node) {
+                for child in child_nodes(node) {
                     self.visit(child);
                 }
             }
@@ -151,16 +153,20 @@ impl<'a> Walker<'a> {
     /// Conservative exhaustiveness check: only fires when we can statically
     /// determine the matched expression's type to be a sum-type Enum.
     /// Otherwise we silently fall through to the runtime mismatch path.
-    fn check_match_exhaustiveness(&mut self, match_node: &Node, expr: &Node, arms: &[(Node, Node)]) {
+    fn check_match_exhaustiveness(&mut self, match_range: TokenRange, expr: &Node, arms: &[(Node, Node)]) {
         let Some(enum_name) = self.infer_enum_type(expr) else {
             return;
         };
-        let Some(variants) = self.enum_index.get(&enum_name).cloned() else {
+        // Borrow the variant list for the whole arm walk; we route diagnostic
+        // pushes through a local buffer so the read-only borrow of
+        // `enum_index` doesn't collide with `&mut self.tree.diagnostics`.
+        let Some(variants) = self.enum_index.get(&enum_name) else {
             return;
         };
 
         let mut seen = HashSet::new();
         let mut has_wildcard = false;
+        let mut diags: Vec<Diagnostic> = Vec::new();
         for (pat, _) in arms {
             match pat.expr.as_ref() {
                 Expr::Wildcard => {
@@ -169,8 +175,8 @@ impl<'a> Walker<'a> {
                 Expr::Type(t) if t.path.len() == 1 => {
                     let arm_name = &t.path[0];
                     if !variants.contains(arm_name) {
-                        let suggestion = closest_variant(arm_name, &variants);
-                        self.tree.diagnostics.push(Diagnostic::UnknownVariant {
+                        let suggestion = closest_variant(arm_name, variants);
+                        diags.push(Diagnostic::UnknownVariant {
                             enum_name: enum_name.clone(),
                             variant_name: arm_name.clone(),
                             suggestion,
@@ -179,7 +185,7 @@ impl<'a> Walker<'a> {
                         continue;
                     }
                     if !seen.insert(arm_name.clone()) {
-                        self.tree.diagnostics.push(Diagnostic::DuplicateMatchArm {
+                        diags.push(Diagnostic::DuplicateMatchArm {
                             enum_name: enum_name.clone(),
                             variant_name: arm_name.clone(),
                             range: span_of(pat.range),
@@ -189,21 +195,21 @@ impl<'a> Walker<'a> {
                 _ => {}
             }
         }
-        if has_wildcard {
-            return;
+        if !has_wildcard {
+            let missing: Vec<String> = variants
+                .iter()
+                .filter(|v| !seen.contains(*v))
+                .cloned()
+                .collect();
+            if !missing.is_empty() {
+                diags.push(Diagnostic::NonExhaustiveMatch {
+                    enum_name,
+                    missing_variants: missing,
+                    range: span_of(match_range),
+                });
+            }
         }
-        let missing: Vec<String> = variants
-            .iter()
-            .filter(|v| !seen.contains(*v))
-            .cloned()
-            .collect();
-        if !missing.is_empty() {
-            self.tree.diagnostics.push(Diagnostic::NonExhaustiveMatch {
-                enum_name,
-                missing_variants: missing,
-                range: span_of(match_node.range),
-            });
-        }
+        self.tree.diagnostics.extend(diags);
     }
 
     /// Try to determine the static enum-name of `node`. We only handle
@@ -306,20 +312,26 @@ impl<'a> Walker<'a> {
             return;
         }
         let schema_name = &expected.path[0];
-        let Some(field_types) = self.schema_index.get(schema_name).cloned() else {
-            return;
-        };
         let Expr::Dict(pairs) = &*value.expr else {
             return;
         };
-        for (key, inner) in pairs {
-            let TokenKey::String(field_name, _, _) = key else {
-                continue;
-            };
-            let Some(field_type) = field_types.get(field_name) else {
-                continue;
-            };
-            self.check_typed_binding(field_type, inner, field_name);
+        // Collect the (field_name, expected_type) lookups up front so
+        // `check_typed_binding`'s `&mut self.tree` borrow doesn't conflict
+        // with the read of `self.schema_index`. Stay lazy: only clone the
+        // TypeNode for fields we'll actually check, instead of cloning the
+        // whole `field_types` HashMap once per Dict.
+        let mut to_check: Vec<(String, TypeNode, &Node)> = Vec::new();
+        if let Some(field_types) = self.schema_index.get(schema_name) {
+            for (key, inner) in pairs {
+                if let TokenKey::String(field_name, _, _) = key {
+                    if let Some(field_type) = field_types.get(field_name) {
+                        to_check.push((field_name.clone(), field_type.clone(), inner));
+                    }
+                }
+            }
+        }
+        for (field_name, field_type, inner) in to_check {
+            self.check_typed_binding(&field_type, inner, &field_name);
         }
     }
 }
@@ -363,8 +375,7 @@ fn matches_expected(expected: &TypeNode, found: &str) -> bool {
         "Any" => true,
         "Number" => matches!(found, "Int" | "Float"),
         // Built-in primitives must match exactly.
-        "Int" | "Float" | "Bool" | "String" | "Null" | "List" | "Dict" | "Closure" | "Fn"
-        | "Enum" => exp == found || (exp == "Fn" && found == "Closure"),
+        _ if is_builtin_type_name(exp) => exp == found || (exp == "Fn" && found == "Closure"),
         // Custom schema name: defer to `check_against_custom_schema`.
         _ => true,
     }
@@ -378,29 +389,6 @@ fn format_type(t: &TypeNode) -> String {
     } else {
         let inner: Vec<String> = t.generics.iter().map(format_type).collect();
         format!("{path}<{}>{suffix}", inner.join(", "))
-    }
-}
-
-fn build_frame(pairs: &[(TokenKey, Node)]) -> ScopeFrame {
-    let mut frame = ScopeFrame::default();
-    for (key, value) in pairs {
-        match key {
-            TokenKey::String(name, _, _) => {
-                frame.fields.insert(name.clone(), value.id);
-            }
-            TokenKey::Spread(_) => {
-                frame.has_dynamic_spread = true;
-            }
-            _ => {}
-        }
-    }
-    frame
-}
-
-fn path_head(path: &[TokenKey]) -> Option<String> {
-    match path.first()? {
-        TokenKey::String(s, _, _) => Some(s.clone()),
-        _ => None,
     }
 }
 
@@ -458,74 +446,6 @@ fn is_likely_stdlib(name: &str) -> bool {
             | "format"
             | "type_of"
     )
-}
-
-/// Same shape as `crate::resolve::iter_children`, copied to avoid
-/// crossing module boundaries on a private helper.
-fn iter_children(node: &Node) -> Vec<&Node> {
-    let mut out = Vec::new();
-    match &*node.expr {
-        Expr::Dict(pairs) => {
-            for (_, value) in pairs {
-                out.push(value);
-            }
-        }
-        Expr::List(items) => {
-            for item in items {
-                out.push(item);
-            }
-        }
-        Expr::Spread(inner) => out.push(inner),
-        Expr::Comprehension {
-            element,
-            iterable,
-            condition,
-            ..
-        } => {
-            out.push(element);
-            out.push(iterable);
-            if let Some(cond) = condition {
-                out.push(cond);
-            }
-        }
-        Expr::Binary(_, l, r) => {
-            out.push(l);
-            out.push(r);
-        }
-        Expr::Unary(_, inner) => out.push(inner),
-        Expr::Ternary { cond, then, els } => {
-            out.push(cond);
-            out.push(then);
-            out.push(els);
-        }
-        Expr::FnCall { args, .. } => {
-            for arg in args {
-                out.push(&arg.value);
-            }
-        }
-        Expr::FString(parts) => {
-            for part in parts {
-                if let relon_parser::FStringPart::Interpolation(n) = part {
-                    out.push(n);
-                }
-            }
-        }
-        Expr::Where { expr, bindings } => {
-            out.push(expr);
-            out.push(bindings);
-        }
-        Expr::Match { expr, arms } => {
-            out.push(expr);
-            for (pat, body) in arms {
-                out.push(pat);
-                out.push(body);
-            }
-        }
-        Expr::Closure { body, .. } => out.push(body),
-        Expr::VariantCtor { body, .. } => out.push(body),
-        _ => {}
-    }
-    out
 }
 
 #[cfg(test)]

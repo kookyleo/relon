@@ -8,6 +8,7 @@
 //! own plugin under the same name first.
 
 use crate::decorator::{DecoratorPlugin, PreEvalOutcome};
+use crate::decorator_names::{DEFAULT, ERROR, EXPECT, IMPORT, LIBRARY, MSG, SCHEMA, VALUE};
 use crate::error::RuntimeError;
 use crate::eval::{Context, Evaluator};
 use crate::native_fn::EvaluatedArg;
@@ -17,18 +18,18 @@ use relon_parser::{CallArg, Node, TokenRange};
 use std::sync::Arc;
 
 pub(crate) fn register_to(ctx: &mut Context) {
-    ctx.register_decorator("import", Arc::new(ImportDecorator));
-    ctx.register_decorator("schema", Arc::new(SchemaDecorator));
-    ctx.register_decorator("expect", Arc::new(MessageDecorator));
-    ctx.register_decorator("msg", Arc::new(MessageDecorator));
-    ctx.register_decorator("error", Arc::new(MessageDecorator));
-    ctx.register_decorator("default", Arc::new(DefaultDecorator));
-    ctx.register_decorator("value", Arc::new(ValueDecorator));
+    ctx.register_decorator(IMPORT, Arc::new(ImportDecorator));
+    ctx.register_decorator(SCHEMA, Arc::new(SchemaDecorator));
+    ctx.register_decorator(EXPECT, Arc::new(MessageDecorator));
+    ctx.register_decorator(MSG, Arc::new(MessageDecorator));
+    ctx.register_decorator(ERROR, Arc::new(MessageDecorator));
+    ctx.register_decorator(DEFAULT, Arc::new(DefaultDecorator));
+    ctx.register_decorator(VALUE, Arc::new(ValueDecorator));
     // `@library` is a file-role marker consumed by the analyzer; the
     // evaluator only sees it when a library file is loaded as a module,
     // where it must behave as identity instead of tripping the
     // unknown-decorator fallback.
-    ctx.register_decorator("library", Arc::new(LibraryDecorator));
+    ctx.register_decorator(LIBRARY, Arc::new(LibraryDecorator));
 }
 
 /// `@import("path", as="alias", spread=false)` — injects module bindings into

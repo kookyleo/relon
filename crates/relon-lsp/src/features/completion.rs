@@ -12,11 +12,13 @@
 //! No fancy ranking, no filtering by prefix — the LSP client does
 //! the prefix match. We just offer the candidates.
 
-use crate::features::cursor::{position_to_offset, smallest_node_at};
+use crate::features::cursor::smallest_node_at;
+use crate::position::position_to_offset;
 use crate::server::DocumentEntry;
 use lsp_types::{CompletionItem, CompletionItemKind, Position};
-use relon_parser::{Expr, Node, TokenKey};
+use relon_parser::{child_nodes, Expr, Node, TokenKey};
 use std::collections::BTreeSet;
+
 
 pub fn items_for(entry: &DocumentEntry, position: Position) -> Vec<CompletionItem> {
     let mut out = BTreeSet::new();
@@ -91,7 +93,7 @@ fn walk<'a>(node: &'a Node, target: &'a Node, found: &mut Option<&'a [(TokenKey,
             *found = Some(pairs.as_slice());
         }
     }
-    for child in expr_children(node) {
+    for child in child_nodes(node) {
         walk(child, target, found);
     }
 }
@@ -113,67 +115,6 @@ fn pairs_size(pairs: &[(TokenKey, Node)]) -> usize {
         .iter()
         .map(|(_, v)| v.range.end.offset.saturating_sub(v.range.start.offset))
         .sum()
-}
-
-fn expr_children(node: &Node) -> Vec<&Node> {
-    let mut out = Vec::new();
-    match &*node.expr {
-        Expr::Dict(pairs) => {
-            for (_, v) in pairs {
-                out.push(v);
-            }
-        }
-        Expr::List(items) => out.extend(items.iter()),
-        Expr::Spread(inner) => out.push(inner),
-        Expr::Comprehension {
-            element,
-            iterable,
-            condition,
-            ..
-        } => {
-            out.push(element);
-            out.push(iterable);
-            if let Some(c) = condition {
-                out.push(c);
-            }
-        }
-        Expr::Binary(_, l, r) => {
-            out.push(l);
-            out.push(r);
-        }
-        Expr::Unary(_, inner) => out.push(inner),
-        Expr::Ternary { cond, then, els } => {
-            out.push(cond);
-            out.push(then);
-            out.push(els);
-        }
-        Expr::FnCall { args, .. } => {
-            for a in args {
-                out.push(&a.value);
-            }
-        }
-        Expr::FString(parts) => {
-            for p in parts {
-                if let relon_parser::FStringPart::Interpolation(n) = p {
-                    out.push(n);
-                }
-            }
-        }
-        Expr::Where { expr, bindings } => {
-            out.push(expr);
-            out.push(bindings);
-        }
-        Expr::Match { expr, arms } => {
-            out.push(expr);
-            for (p, b) in arms {
-                out.push(p);
-                out.push(b);
-            }
-        }
-        Expr::Closure { body, .. } => out.push(body),
-        _ => {}
-    }
-    out
 }
 
 #[cfg(test)]

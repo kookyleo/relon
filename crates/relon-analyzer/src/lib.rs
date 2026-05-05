@@ -15,6 +15,7 @@
 //! the AST itself stays immutable and consumers (evaluator, LSP, lint)
 //! pick up just the side-tables they need.
 
+pub(crate) mod decorator_names;
 pub mod diagnostic;
 pub mod modules;
 pub mod resolve;

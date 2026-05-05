@@ -10,6 +10,7 @@ pub mod structure;
 pub mod token;
 pub mod var;
 
+pub use expr::child_nodes;
 pub use token::*;
 
 use winnow::ascii::multispace1;

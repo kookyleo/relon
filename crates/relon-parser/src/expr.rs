@@ -268,6 +268,20 @@ fn parse_variant_ctor<'a>(input: &mut Span<'a>) -> ModalResult<Node> {
             return Err(e);
         }
     };
+    // Peek for the mandatory `.Identifier` continuation before allocating
+    // the `path` Vec — this fast-fails the common "bare identifier" case
+    // without an extra allocation.
+    let after_head = input.checkpoint();
+    if winnow::token::literal::<_, _, winnow::error::ContextError>(".")
+        .parse_next(input)
+        .is_err()
+    {
+        input.reset(&checkpoint);
+        return Err(winnow::error::ErrMode::Backtrack(
+            winnow::error::ContextError::default(),
+        ));
+    }
+    input.reset(&after_head);
     let mut path = vec![head];
     loop {
         let seg_checkpoint = input.checkpoint();
@@ -669,6 +683,80 @@ fn fold_binary(mut left: Node, rest: Vec<(Operator, Node)>) -> Node {
 
 pub fn parse_expr_zone<'a>(input: &mut Span<'a>) -> ModalResult<Node> {
     delimited(("${", soc0), parse_expr, (soc0, "}")).parse_next(input)
+}
+
+/// Yield the expression-shaped child nodes of `node` for AST walkers
+/// (analyzer passes, LSP enclosing-scope lookups, ...). Decorators and
+/// type hints are intentionally *not* included — those have their own
+/// dedicated walkers that need different semantics.
+pub fn child_nodes(node: &Node) -> Vec<&Node> {
+    let mut out = Vec::new();
+    match &*node.expr {
+        Expr::Dict(pairs) => {
+            for (_, value) in pairs {
+                out.push(value);
+            }
+        }
+        Expr::List(items) => out.extend(items.iter()),
+        Expr::Spread(inner) => out.push(inner),
+        Expr::Comprehension {
+            element,
+            iterable,
+            condition,
+            ..
+        } => {
+            out.push(element);
+            out.push(iterable);
+            if let Some(cond) = condition {
+                out.push(cond);
+            }
+        }
+        Expr::Binary(_, l, r) => {
+            out.push(l);
+            out.push(r);
+        }
+        Expr::Unary(_, inner) => out.push(inner),
+        Expr::Ternary { cond, then, els } => {
+            out.push(cond);
+            out.push(then);
+            out.push(els);
+        }
+        Expr::FnCall { args, .. } => {
+            for arg in args {
+                out.push(&arg.value);
+            }
+        }
+        Expr::FString(parts) => {
+            for part in parts {
+                if let crate::FStringPart::Interpolation(n) = part {
+                    out.push(n);
+                }
+            }
+        }
+        Expr::Where { expr, bindings } => {
+            out.push(expr);
+            out.push(bindings);
+        }
+        Expr::Match { expr, arms } => {
+            out.push(expr);
+            for (pat, body) in arms {
+                out.push(pat);
+                out.push(body);
+            }
+        }
+        Expr::Closure { body, .. } => out.push(body),
+        Expr::VariantCtor { body, .. } => out.push(body),
+        Expr::Reference { .. }
+        | Expr::Variable(_)
+        | Expr::Type(_)
+        | Expr::Wildcard
+        | Expr::Null
+        | Expr::Bool(_)
+        | Expr::Int(_)
+        | Expr::Float(_)
+        | Expr::String(_) => {}
+    }
+    out
 }
 
 #[cfg(test)]

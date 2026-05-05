@@ -25,7 +25,7 @@ use crate::native_fn::EvaluatedArg;
 use crate::scope::Scope;
 use crate::value::{SchemaField, Value};
 use relon_analyzer::{SchemaDef, SchemaFieldDef};
-use relon_parser::{Expr, Node, TokenKey, TokenRange, TypeNode};
+use relon_parser::{is_builtin_type_name, Expr, Node, TokenKey, TokenRange, TypeNode};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -80,7 +80,7 @@ impl<'a> Evaluator<'a> {
         // Recursion guard for custom schemas: stop if we'd re-check the same
         // (Schema name, value pointer) pair.
         let tname = expected.path.join(".");
-        if !is_builtin_type(&tname) {
+        if !is_builtin_type_name(&tname) {
             let ptr = value as *const Value;
             if !visited.insert((tname.clone(), ptr)) {
                 return Ok(());
@@ -240,7 +240,7 @@ impl<'a> Evaluator<'a> {
             return Ok(false);
         };
         let d = Arc::make_mut(d);
-        let mut deferred_closures: Vec<String> = Vec::new();
+        let mut deferred_closures: Vec<(String, Value)> = Vec::new();
         for (field_name, field) in fields.iter() {
             if let Some(field_val) = d.map.get_mut(field_name) {
                 self.check_type_internal(
@@ -261,10 +261,7 @@ impl<'a> Evaluator<'a> {
                     }
                     let result = self.call_function_by_value(
                         predicate.clone(),
-                        vec![EvaluatedArg {
-                            name: None,
-                            value: field_val.clone(),
-                        }],
+                        vec![EvaluatedArg::positional(field_val.clone())],
                         scope,
                         range,
                     )?;
@@ -286,7 +283,7 @@ impl<'a> Evaluator<'a> {
                     // sees explicit + literal-default fields via `self`.
                     // Closure defaults do not observe each other — semantics
                     // stay independent of HashMap iteration order.
-                    deferred_closures.push(field_name.clone());
+                    deferred_closures.push((field_name.clone(), def.clone()));
                 } else {
                     d.map.insert(field_name.clone(), def.clone());
                 }
@@ -302,18 +299,10 @@ impl<'a> Evaluator<'a> {
         }
         if !deferred_closures.is_empty() {
             let self_snapshot = Value::Dict(Arc::new(d.clone()));
-            for field_name in deferred_closures {
-                let field = fields.get(&field_name).expect("collected from fields");
-                let def = field
-                    .default_value
-                    .as_ref()
-                    .expect("deferred only when default_value set");
+            for (field_name, def) in deferred_closures {
                 let computed = self.call_function_by_value(
-                    def.clone(),
-                    vec![EvaluatedArg {
-                        name: None,
-                        value: self_snapshot.clone(),
-                    }],
+                    def,
+                    vec![EvaluatedArg::positional(self_snapshot.clone())],
                     scope,
                     range,
                 )?;
@@ -578,9 +567,3 @@ pub(crate) fn merge_schema_fields(
     }
 }
 
-fn is_builtin_type(name: &str) -> bool {
-    matches!(
-        name,
-        "Int" | "String" | "Bool" | "Any" | "Null" | "List" | "Dict" | "Enum"
-    )
-}

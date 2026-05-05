@@ -5,25 +5,24 @@ use crate::native_fn::{EvaluatedArg, NativeArgs, RelonFunction};
 use crate::scope::{Scope, Thunk};
 use crate::value::Value;
 use relon_parser::{
-    parse_document, CallArg, Decorator as DecoratorNode, Expr, FStringPart, Node, Operator,
-    TokenKey, TokenRange,
+    is_builtin_type_name, parse_document, CallArg, Decorator as DecoratorNode, Expr, FStringPart,
+    Node, Operator, TokenKey, TokenRange,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// Capability gates wired into `Context`. Defaults to **fully sandboxed**:
-/// no filesystem reads, no native fns, zero-budget step counter, zero-size
-/// values. Hosts opt in by either populating the fields directly or by
-/// constructing a `Context` via [`Context::trusted`] (which flips
-/// `allow_all_native_fn` on and leaves the limits unbounded).
+/// no native fns, zero-budget step counter, zero-size values. Hosts opt in
+/// by either populating the fields directly or by constructing a `Context`
+/// via [`Context::trusted`] (which flips `allow_all_native_fn` on and
+/// leaves the limits unbounded).
+///
+/// Filesystem read policy lives on the [`FilesystemModuleResolver`]
+/// (configured via `with_root_dir` / `trusted`), not here.
 #[derive(Debug, Clone, Default)]
 pub struct Capabilities {
-    /// Filesystem roots a sandboxed [`FilesystemModuleResolver`] may read
-    /// from. The resolver is owned separately from this struct (it sits in
-    /// `module_resolvers`); this field is documentation/host-side metadata.
-    pub fs_read_allowlist: Vec<PathBuf>,
     /// Hard cap on `eval_internal` invocations. `None` = unbounded.
     pub max_steps: Option<u64>,
     /// Hard cap on the *element count* of any single `Value::List` /
@@ -137,7 +136,7 @@ impl Context {
                 // Default-rejecting filesystem resolver. Swap or augment
                 // via `prepend_module_resolver` once the host knows what
                 // root to expose.
-                Arc::new(FilesystemModuleResolver::new()),
+                Arc::new(FilesystemModuleResolver::default()),
             ],
         )
     }
@@ -177,12 +176,6 @@ impl Context {
     /// `std/...` and filesystem lookups.
     pub fn prepend_module_resolver(&mut self, resolver: Arc<dyn ModuleResolver>) {
         self.module_resolvers.insert(0, resolver);
-    }
-
-    /// Append a [`ModuleResolver`] to the back of the resolver chain. Useful
-    /// for adding fallbacks that run only after the built-ins.
-    pub fn append_module_resolver(&mut self, resolver: Arc<dyn ModuleResolver>) {
-        self.module_resolvers.push(resolver);
     }
 
     pub fn enter_loading_module<S: Into<String>>(&self, path: S) -> LoadingModuleGuard<'_> {
@@ -377,9 +370,8 @@ impl<'a> Evaluator<'a> {
         scope: &Arc<Scope>,
         is_schema_pred: bool,
     ) -> Result<Value, RuntimeError> {
-        // Step budget. Cheap bump on every dispatch; only consults
-        // `max_steps` once a limit has actually been set so the unlimited
-        // path stays a single atomic increment.
+        // Step budget. Skip the atomic entirely on the unlimited path —
+        // hosts that don't set `max_steps` should pay zero cost here.
         if let Some(limit) = self.context.capabilities.max_steps {
             // Relaxed is fine: we never need cross-thread visibility ordering
             // here, only that the counter increases monotonically.
@@ -390,8 +382,6 @@ impl<'a> Evaluator<'a> {
                     range: node.range,
                 });
             }
-        } else {
-            self.context.step_counter.fetch_add(1, Ordering::Relaxed);
         }
 
         let mut current_scope = Arc::clone(scope);
@@ -618,10 +608,7 @@ impl<'a> Evaluator<'a> {
                 let left_val = self.eval(left, &current_scope)?;
                 match right.expr.as_ref() {
                     Expr::FnCall { path, args } => {
-                        let mut evaluated_args = vec![EvaluatedArg {
-                            name: None,
-                            value: left_val,
-                        }];
+                        let mut evaluated_args = vec![EvaluatedArg::positional(left_val)];
                         for arg in args {
                             evaluated_args.push(EvaluatedArg {
                                 name: arg.name.clone(),
@@ -641,10 +628,7 @@ impl<'a> Evaluator<'a> {
                             self.eval_closure(
                                 &params,
                                 &body,
-                                vec![EvaluatedArg {
-                                    name: None,
-                                    value: left_val,
-                                }],
+                                vec![EvaluatedArg::positional(left_val)],
                                 &captured_env,
                                 right.range,
                             )
@@ -711,17 +695,7 @@ impl<'a> Evaluator<'a> {
                                         return self.eval(result_node, &current_scope);
                                     }
                                     let tname = &type_node.path[0];
-                                    if !matches!(
-                                        tname.as_str(),
-                                        "Int"
-                                            | "String"
-                                            | "Bool"
-                                            | "Any"
-                                            | "Null"
-                                            | "List"
-                                            | "Dict"
-                                            | "Enum"
-                                    ) {
+                                    if !is_builtin_type_name(tname) {
                                         continue;
                                     }
                                 }
@@ -801,10 +775,7 @@ impl<'a> Evaluator<'a> {
                     let d = Arc::make_mut(d);
                     if type_hint.path.len() == 1 {
                         let tname = &type_hint.path[0];
-                        if !matches!(
-                            tname.as_str(),
-                            "Int" | "String" | "Bool" | "Any" | "Null" | "List" | "Dict" | "Enum"
-                        ) {
+                        if !is_builtin_type_name(tname) {
                             d.brand = Some(tname.clone());
                         }
                     } else {
@@ -1045,7 +1016,13 @@ impl<'a> Evaluator<'a> {
                 range,
             });
         };
-        let mut map = body_dict.map.clone();
+        // Try to take ownership of the body dict to skip cloning the
+        // BTreeMap; falls back to cloning when the Arc is shared (rare,
+        // only when the body expression is reachable elsewhere).
+        let mut map = match Arc::try_unwrap(body_dict) {
+            Ok(d) => d.map,
+            Err(arc) => arc.map.clone(),
+        };
         for (fname, field_def) in variant_fields.iter() {
             if let Some(fval) = map.get_mut(fname) {
                 self.check_type(fval, &field_def.type_hint, scope, range)?;
@@ -1176,7 +1153,7 @@ impl<'a> Evaluator<'a> {
             captured_env,
         }) = self.resolve_variable(path, scope, range)
         {
-            let mut combined = vec![EvaluatedArg { name: None, value }];
+            let mut combined = vec![EvaluatedArg::positional(value)];
             combined.extend(args);
             return self.eval_closure(&params, &body, combined, &captured_env, range);
         }
