@@ -1,21 +1,89 @@
+use crate::decorator::{DecoratorPlugin, PreEvalOutcome};
 use crate::error::RuntimeError;
-use crate::value::{Value, ValueDict};
-use ordered_float::OrderedFloat;
+use crate::module::{FilesystemModuleResolver, ModuleResolver, ModuleSource, StdModuleResolver};
+use crate::native_fn::{EvaluatedArg, NativeArgs, RelonFunction};
+use crate::scope::{Scope, Thunk};
+use crate::value::Value;
 use relon_parser::{
-    parse_document, Expr, FStringPart, Node, Operator, RefBase, TokenKey, TokenRange,
+    parse_document, CallArg, Decorator as DecoratorNode, Expr, FStringPart, Node, Operator,
+    TokenKey, TokenRange,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-pub trait RelonFunction: Send + Sync {
-    fn call(&self, args: Vec<Value>, range: TokenRange) -> Result<Value, RuntimeError>;
+/// Capability gates wired into `Context`. Defaults to **fully sandboxed**:
+/// no filesystem reads, no native fns, zero-budget step counter, zero-size
+/// values. Hosts opt in by either populating the fields directly or by
+/// constructing a `Context` via [`Context::trusted`] (which flips
+/// `allow_all_native_fn` on and leaves the limits unbounded).
+#[derive(Debug, Clone, Default)]
+pub struct Capabilities {
+    /// Filesystem roots a sandboxed [`FilesystemModuleResolver`] may read
+    /// from. The resolver is owned separately from this struct (it sits in
+    /// `module_resolvers`); this field is documentation/host-side metadata.
+    pub fs_read_allowlist: Vec<PathBuf>,
+    /// Hard cap on `eval_internal` invocations. `None` = unbounded.
+    pub max_steps: Option<u64>,
+    /// Hard cap on the *element count* of any single `Value::List` /
+    /// `Value::Dict` produced by the evaluator. The field is named
+    /// `_bytes` for forward compatibility with a future byte-accurate
+    /// metric, but today we measure element count (per the spec).
+    pub max_value_bytes: Option<usize>,
+    /// Names allowed for native-function calls under sandbox. Functions
+    /// registered via the legacy [`Context::register_fn`] are treated as
+    /// trusted — the gate fires only for functions registered via
+    /// [`Context::register_fn_with_caps`]. Empty = no gated functions
+    /// allowed.
+    pub allow_native_fn: HashSet<String>,
+    /// Trusted-mode escape hatch: when `true`, every native function
+    /// registered via [`Context::register_fn_with_caps`] is accepted
+    /// regardless of `allow_native_fn`. Set by [`Context::trusted`].
+    pub allow_all_native_fn: bool,
+}
+
+/// Capability declaration for a host-registered native function. Used by
+/// the registry to decide whether a sandboxed call is allowed; left wide
+/// open so we can grow the surface (`writes_fs`, `network`, `env`, …)
+/// without breaking the existing API.
+#[derive(Debug, Clone, Default)]
+pub struct NativeFnCaps {
+    pub reads_fs: bool,
+}
+
+/// Internal record for a host-registered function, pairing the callable
+/// with the caps it declared at registration time.
+pub(crate) struct GatedNativeFn {
+    pub(crate) func: Arc<dyn RelonFunction>,
+    pub(crate) caps: NativeFnCaps,
+    /// Only legacy `register_fn` produces records with `gated == false`.
+    /// Those bypass the sandbox check entirely (matches the spec: "treats
+    /// fn as fully-trusted, equivalent to all caps true").
+    pub(crate) gated: bool,
 }
 
 pub struct Context {
     pub globals: HashMap<String, Value>,
-    pub functions: HashMap<String, Arc<dyn RelonFunction>>,
+    pub(crate) functions: HashMap<String, GatedNativeFn>,
+    pub decorators: HashMap<String, Arc<dyn DecoratorPlugin>>,
+    /// Ordered chain of module resolvers consulted by `@import`. The first
+    /// resolver returning `Some(ModuleSource)` wins. Default chain: built-in
+    /// `std/...` virtual modules, then the local filesystem.
+    pub module_resolvers: Vec<Arc<dyn ModuleResolver>>,
     pub root_node: Option<Arc<Node>>,
+    /// Output of the `relon-analyzer` semantic pass over `root_node`, if
+    /// the host opted in via [`Context::with_analyzed`]. Decorator plugins
+    /// and the type checker can use it as a fast-path side-table; the
+    /// evaluator never *requires* it (and falls back to its own
+    /// extraction logic when absent).
+    pub analyzed: Option<Arc<relon_analyzer::AnalyzedTree>>,
+    /// Sandbox / capability gates. See [`Capabilities`].
+    pub capabilities: Capabilities,
+    /// Number of times `eval_internal` has been entered for this context.
+    /// Atomic so the counter survives without coarsening evaluator borrows;
+    /// the evaluator is single-threaded but `Context` is `Send + Sync`.
+    pub(crate) step_counter: AtomicU64,
     pub module_cache: Mutex<HashMap<String, Value>>,
     pub(crate) path_cache: Mutex<HashMap<String, Value>>,
     pub(crate) evaluating_paths: Mutex<HashSet<String>>,
@@ -29,18 +97,92 @@ impl Default for Context {
 }
 
 impl Context {
+    /// Trusted constructor. Equivalent to [`Context::trusted`]; preserved
+    /// for backwards compatibility with the ~163 tests and host call sites
+    /// that predate the sandbox model. **Use [`Context::sandboxed`] as the
+    /// starting point for any untrusted script.**
     pub fn new() -> Self {
+        Self::trusted()
+    }
+
+    /// Wide-open context: filesystem reads enabled with no root, unbounded
+    /// step / value budgets, every native function callable. This is what
+    /// the legacy [`Context::new`] returns; spell it explicitly when the
+    /// caller wants to make the trust level visible.
+    pub fn trusted() -> Self {
+        let caps = Capabilities {
+            allow_all_native_fn: true,
+            ..Capabilities::default()
+        };
+        Self::with_capabilities_and_resolvers(
+            caps,
+            vec![
+                Arc::new(StdModuleResolver),
+                Arc::new(FilesystemModuleResolver::trusted()),
+            ],
+        )
+    }
+
+    /// Fully sandboxed context: filesystem reads default-rejected (no
+    /// root), capabilities at their restrictive defaults, only the
+    /// virtual `std/...` resolver wired up. Hosts grant capabilities by
+    /// mutating `capabilities`, swapping in a rooted
+    /// [`FilesystemModuleResolver`], and registering native functions
+    /// with [`Context::register_fn_with_caps`].
+    pub fn sandboxed() -> Self {
+        Self::with_capabilities_and_resolvers(
+            Capabilities::default(),
+            vec![
+                Arc::new(StdModuleResolver),
+                // Default-rejecting filesystem resolver. Swap or augment
+                // via `prepend_module_resolver` once the host knows what
+                // root to expose.
+                Arc::new(FilesystemModuleResolver::new()),
+            ],
+        )
+    }
+
+    fn with_capabilities_and_resolvers(
+        capabilities: Capabilities,
+        module_resolvers: Vec<Arc<dyn ModuleResolver>>,
+    ) -> Self {
         let mut ctx = Self {
             globals: HashMap::new(),
             functions: HashMap::new(),
+            decorators: HashMap::new(),
+            module_resolvers,
             root_node: None,
+            analyzed: None,
+            capabilities,
+            step_counter: AtomicU64::new(0),
             module_cache: Mutex::new(HashMap::new()),
             path_cache: Mutex::new(HashMap::new()),
             evaluating_paths: Mutex::new(HashSet::new()),
             loading_modules: Mutex::new(Vec::new()),
         };
         crate::stdlib::register_to(&mut ctx);
+        crate::builtin_decorators::register_to(&mut ctx);
         ctx
+    }
+
+    /// Replace the current capability set wholesale. Builder-style so
+    /// hosts can chain it onto `Context::sandboxed()`.
+    pub fn with_capabilities(mut self, caps: Capabilities) -> Self {
+        self.capabilities = caps;
+        self
+    }
+
+    /// Insert a [`ModuleResolver`] at the front of the resolver chain. Use
+    /// this when the host wants to intercept imports before built-in
+    /// `std/...` and filesystem lookups.
+    pub fn prepend_module_resolver(&mut self, resolver: Arc<dyn ModuleResolver>) {
+        self.module_resolvers.insert(0, resolver);
+    }
+
+    /// Append a [`ModuleResolver`] to the back of the resolver chain. Useful
+    /// for adding fallbacks that run only after the built-ins.
+    pub fn append_module_resolver(&mut self, resolver: Arc<dyn ModuleResolver>) {
+        self.module_resolvers.push(resolver);
     }
 
     pub fn enter_loading_module<S: Into<String>>(&self, path: S) -> LoadingModuleGuard<'_> {
@@ -57,217 +199,80 @@ impl Context {
         self
     }
 
+    /// Attach a pre-computed [`relon_analyzer::AnalyzedTree`] so decorator
+    /// plugins and the type checker can fast-path through it. Pass the
+    /// same root node to `analyze` first, then forward both into the
+    /// evaluator.
+    pub fn with_analyzed(mut self, analyzed: Arc<relon_analyzer::AnalyzedTree>) -> Self {
+        self.analyzed = Some(analyzed);
+        self
+    }
+
+    /// Resolve a reference site (`Reference { ... }` or `Variable(...)`
+    /// node id) to the target value-node the analyzer bound it to.
+    ///
+    /// Returns `None` when the analyzer wasn't attached, didn't visit
+    /// the node, or couldn't statically determine a target. Hosts and
+    /// tooling (LSP go-to-definition, type checkers, debuggers) call
+    /// this so they share the evaluator's view of "what does this
+    /// reference point to". The evaluator itself doesn't use this on
+    /// its hot path — its thunk + cache machinery is already doing the
+    /// equivalent walk with the cycle protection a fast-path would
+    /// have to re-implement.
+    pub fn analyzer_target(&self, site_id: relon_parser::NodeId) -> Option<Arc<Node>> {
+        let tree = self.analyzed.as_ref()?;
+        let resolved = tree.references.get(&site_id)?;
+        tree.node_index.get(&resolved.target).cloned()
+    }
+
+    /// Register a fully-trusted native function. Calls bypass the sandbox
+    /// gate — use [`Context::register_fn_with_caps`] for anything that
+    /// needs to be guarded.
     pub fn register_fn<S: Into<String>>(&mut self, name: S, f: Arc<dyn RelonFunction>) {
-        self.functions.insert(name.into(), f);
-    }
-}
-
-pub struct ListContext {
-    pub index: usize,
-    pub elements: Vec<Arc<Thunk>>,
-}
-
-#[derive(Default)]
-pub struct Scope {
-    pub parent: Option<std::sync::Arc<Scope>>,
-    pub path_node: Option<String>,
-    pub locals: std::sync::Mutex<std::collections::HashMap<String, crate::value::Value>>,
-    pub current_dir: String,
-    pub cache_namespace: String,
-    pub reference_root: Option<Arc<Node>>,
-    pub reference_root_parent: Option<Arc<Scope>>,
-    pub reference_root_scope: Option<Arc<Scope>>,
-    pub list_context: Option<Arc<ListContext>>,
-    pub(crate) thunks: Mutex<HashMap<String, Arc<Thunk>>>,
-}
-
-impl std::fmt::Debug for Scope {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Scope")
-            .field("path_node", &self.path_node)
-            .field("current_dir", &self.current_dir)
-            .field("cache_namespace", &self.cache_namespace)
-            .field("has_reference_root", &self.reference_root.is_some())
-            .field("index", &self.list_context.as_ref().map(|c| c.index))
-            .finish()
-    }
-}
-
-impl Clone for Scope {
-    fn clone(&self) -> Self {
-        Self {
-            parent: self.parent.clone(),
-            path_node: self.path_node.clone(),
-            locals: Mutex::new(self.locals.lock().unwrap().clone()),
-            current_dir: self.current_dir.clone(),
-            cache_namespace: self.cache_namespace.clone(),
-            reference_root: self.reference_root.clone(),
-            reference_root_parent: self.reference_root_parent.clone(),
-            reference_root_scope: self.reference_root_scope.clone(),
-            list_context: self.list_context.clone(),
-            thunks: Mutex::new(self.thunks.lock().unwrap().clone()),
-        }
-    }
-}
-
-impl Scope {
-    pub fn get_local(&self, name: &str) -> Option<Value> {
-        if let Some(v) = self.locals.lock().unwrap().get(name) {
-            Some(v.clone())
-        } else if let Some(parent) = &self.parent {
-            parent.get_local(name)
-        } else {
-            None
-        }
+        self.functions.insert(
+            name.into(),
+            GatedNativeFn {
+                func: f,
+                caps: NativeFnCaps::default(),
+                gated: false,
+            },
+        );
     }
 
-    fn get_thunk(&self, name: &str) -> Option<Arc<Thunk>> {
-        if let Some(thunk) = self.thunks.lock().unwrap().get(name) {
-            Some(Arc::clone(thunk))
-        } else if let Some(parent) = &self.parent {
-            parent.get_thunk(name)
-        } else {
-            None
-        }
+    /// Register a native function whose calls are gated by the current
+    /// capability set. In sandbox mode the call is rejected unless either
+    /// `Capabilities::allow_all_native_fn` is on or `name` appears in
+    /// `Capabilities::allow_native_fn`.
+    pub fn register_fn_with_caps<S: Into<String>>(
+        &mut self,
+        name: S,
+        caps: NativeFnCaps,
+        f: Arc<dyn RelonFunction>,
+    ) {
+        self.functions.insert(
+            name.into(),
+            GatedNativeFn {
+                func: f,
+                caps,
+                gated: true,
+            },
+        );
     }
 
-    fn get_own_thunk(&self, name: &str) -> Option<Arc<Thunk>> {
-        self.thunks.lock().unwrap().get(name).map(Arc::clone)
-    }
-
-    pub fn full_path(&self) -> Vec<String> {
-        let mut path = Vec::new();
-        let mut current = Some(self);
-        while let Some(scope) = current {
-            if let Some(node) = &scope.path_node {
-                path.push(node.clone());
-            }
-            if let Some(parent) = &scope.parent {
-                current = Some(parent.as_ref());
-            } else {
-                current = None;
-            }
-        }
-        path.reverse();
-        path
-    }
-
-    pub(crate) fn path_cache_key(&self, path: &[String]) -> String {
-        let namespace = if self.cache_namespace.is_empty() {
-            &self.current_dir
-        } else {
-            &self.cache_namespace
-        };
-        let encoded_path = path
-            .iter()
-            .map(|s| format!("{}:{}", s.len(), s))
-            .collect::<Vec<_>>()
-            .join("/");
-        format!("{namespace}::{encoded_path}")
-    }
-
-    pub fn with_local(self: &Arc<Self>, name: String, val: Value) -> Arc<Self> {
-        let mut locals = HashMap::new();
-        locals.insert(name, val);
-        Arc::new(Self {
-            parent: Some(Arc::clone(self)),
-            path_node: None,
-            locals: Mutex::new(locals),
-            current_dir: self.current_dir.clone(),
-            cache_namespace: self.cache_namespace.clone(),
-            reference_root: self.reference_root.clone(),
-            reference_root_parent: self.reference_root_parent.clone(),
-            reference_root_scope: self.reference_root_scope.clone(),
-            list_context: self.list_context.clone(),
-            thunks: Mutex::new(HashMap::new()),
-        })
-    }
-
-    pub fn with_locals(self: &Arc<Self>, new_locals: HashMap<String, Value>) -> Arc<Self> {
-        Arc::new(Self {
-            parent: Some(Arc::clone(self)),
-            path_node: None,
-            locals: Mutex::new(new_locals),
-            current_dir: self.current_dir.clone(),
-            cache_namespace: self.cache_namespace.clone(),
-            reference_root: self.reference_root.clone(),
-            reference_root_parent: self.reference_root_parent.clone(),
-            reference_root_scope: self.reference_root_scope.clone(),
-            list_context: self.list_context.clone(),
-            thunks: Mutex::new(HashMap::new()),
-        })
-    }
-
-    pub fn with_path(self: &Arc<Self>, node: String) -> Arc<Self> {
-        Arc::new(Self {
-            parent: Some(Arc::clone(self)),
-            path_node: Some(node),
-            locals: Mutex::new(HashMap::new()),
-            current_dir: self.current_dir.clone(),
-            cache_namespace: self.cache_namespace.clone(),
-            reference_root: self.reference_root.clone(),
-            reference_root_parent: self.reference_root_parent.clone(),
-            reference_root_scope: self.reference_root_scope.clone(),
-            list_context: self.list_context.clone(),
-            thunks: Mutex::new(HashMap::new()),
-        })
-    }
-
-    pub fn with_list_context(
-        self: &Arc<Self>,
-        index: usize,
-        elements: Vec<Arc<Thunk>>,
-    ) -> Arc<Self> {
-        Arc::new(Self {
-            parent: Some(Arc::clone(self)),
-            path_node: Some(index.to_string()),
-            locals: Mutex::new(HashMap::new()),
-            current_dir: self.current_dir.clone(),
-            cache_namespace: self.cache_namespace.clone(),
-            reference_root: self.reference_root.clone(),
-            reference_root_parent: self.reference_root_parent.clone(),
-            reference_root_scope: self.reference_root_scope.clone(),
-            list_context: Some(Arc::new(ListContext { index, elements })),
-            thunks: Mutex::new(HashMap::new()),
-        })
+    /// Register a decorator plugin under `name` (the full dotted path,
+    /// e.g. `"ensure.int"`). Replaces any previously registered plugin with
+    /// the same name, which is how hosts override built-ins.
+    pub fn register_decorator<S: Into<String>>(
+        &mut self,
+        name: S,
+        plugin: Arc<dyn DecoratorPlugin>,
+    ) {
+        self.decorators.insert(name.into(), plugin);
     }
 }
 
 pub struct Evaluator<'a> {
     pub context: &'a Context,
-}
-
-pub struct EvaluatedArg {
-    pub name: Option<String>,
-    pub value: Value,
-}
-
-pub struct Thunk {
-    node: Node,
-    scope: Arc<Scope>,
-    path: Vec<String>,
-    cache_key: String,
-    value: Mutex<Option<Value>>,
-}
-
-enum ReferenceStep {
-    Thunk(Arc<Thunk>),
-    Value(Box<Value>),
-}
-
-#[derive(Clone, Copy)]
-enum NumericValue {
-    Int(i64),
-    Float(OrderedFloat<f64>),
-}
-
-impl NumericValue {
-    fn as_f64(self) -> f64 {
-        match self {
-            Self::Int(value) => value as f64,
-            Self::Float(value) => value.into_inner(),
-        }
-    }
 }
 
 pub struct LoadingModuleGuard<'a> {
@@ -312,35 +317,97 @@ impl<'a> Evaluator<'a> {
         self.eval_internal(node, scope, false)
     }
 
-    fn eval_internal(
+    /// Reject values whose top-level element count exceeds the configured
+    /// `max_value_bytes` limit. Called from the construction sites where
+    /// lists/dicts grow (literal evaluation, arithmetic merge, spread, etc.):
+    /// threading `&Context` into `Value::list_mut`/`dict_mut` would balloon
+    /// the API for what's effectively a single bounds check, so we keep the
+    /// gate at the evaluator boundary instead.
+    pub(crate) fn check_value_size(
+        &self,
+        value: &Value,
+        range: TokenRange,
+    ) -> Result<(), RuntimeError> {
+        let Some(limit) = self.context.capabilities.max_value_bytes else {
+            return Ok(());
+        };
+        let actual = match value {
+            Value::List(l) => l.len(),
+            Value::Dict(d) => d.map.len(),
+            _ => return Ok(()),
+        };
+        if actual > limit {
+            Err(RuntimeError::ValueTooLarge {
+                limit,
+                actual,
+                range,
+            })
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Entry point for evaluating the `Context`'s root document.
+    ///
+    /// This is the single, supported way to start evaluation: it pins
+    /// `scope.reference_root` to the same `Arc<Node>` we hand to
+    /// [`Self::eval`], so the `is_root` pointer-equality check inside
+    /// `eval_internal` actually triggers and `&sibling`/`&root` references
+    /// don't have to fall through the lazy-thunk safety net.
+    pub fn eval_root(&self, scope: &Arc<Scope>) -> Result<Value, RuntimeError> {
+        let root = self.context.root_node.clone().ok_or_else(|| {
+            RuntimeError::VariableNotFound(
+                "Context has no root node — call `Context::with_root` first".to_string(),
+                TokenRange::default(),
+            )
+        })?;
+        let scope = if scope.reference_root.is_none() {
+            let mut overlay = (**scope).clone();
+            overlay.reference_root = Some(Arc::clone(&root));
+            Arc::new(overlay)
+        } else {
+            Arc::clone(scope)
+        };
+        self.eval(&root, &scope)
+    }
+
+    pub(crate) fn eval_internal(
         &self,
         node: &Node,
         scope: &Arc<Scope>,
         is_schema_pred: bool,
     ) -> Result<Value, RuntimeError> {
+        // Step budget. Cheap bump on every dispatch; only consults
+        // `max_steps` once a limit has actually been set so the unlimited
+        // path stays a single atomic increment.
+        if let Some(limit) = self.context.capabilities.max_steps {
+            // Relaxed is fine: we never need cross-thread visibility ordering
+            // here, only that the counter increases monotonically.
+            let prev = self.context.step_counter.fetch_add(1, Ordering::Relaxed);
+            if prev >= limit {
+                return Err(RuntimeError::StepLimitExceeded {
+                    limit,
+                    range: node.range,
+                });
+            }
+        } else {
+            self.context.step_counter.fetch_add(1, Ordering::Relaxed);
+        }
+
         let mut current_scope = Arc::clone(scope);
 
+        // Pre-eval pass: every decorator gets a chance to mutate the scope or
+        // take over the value. Built-in keywords (`@import`, `@schema`) and
+        // host-registered plugins go through the same dispatch.
         for dec in &node.decorators {
-            let name = dec
-                .path
-                .iter()
-                .map(|k| k.to_string_key())
-                .collect::<Vec<_>>()
-                .join(".");
-            if name == "import" {
-                current_scope = self.apply_import_decorator(dec, &current_scope)?;
-            } else if name == "schema" {
-                match node.expr.as_ref() {
-                    Expr::Dict(pairs) => {
-                        let fields = self.extract_schema_fields_from_dict(pairs, &current_scope)?;
-                        return Ok(Value::Schema(fields));
-                    }
-                    Expr::Binary(Operator::Add, _, _) => {
-                        let fields = self.extract_schema_for_node(node, &current_scope)?;
-                        return Ok(Value::Schema(fields));
-                    }
-                    _ => {}
-                }
+            let name = decorator_name(dec);
+            let Some(plugin) = self.context.decorators.get(&name).cloned() else {
+                continue;
+            };
+            match plugin.pre_eval(self, node, &current_scope, &dec.args, dec.range)? {
+                PreEvalOutcome::Pass => {}
+                PreEvalOutcome::Rescope(new_scope) => current_scope = new_scope,
+                PreEvalOutcome::Override(value) => return Ok(*value),
             }
         }
 
@@ -355,13 +422,15 @@ impl<'a> Evaluator<'a> {
                 let mut thunks = Vec::new();
                 for (i, el) in elements.iter().enumerate() {
                     let item_scope = current_scope.with_path(i.to_string());
-                    thunks.push(Arc::new(Thunk {
-                        node: el.clone(),
-                        scope: item_scope,
-                        path: Vec::new(),
-                        cache_key: String::new(),
-                        value: Mutex::new(None),
-                    }));
+                    // List elements are forced through `force_thunk_with_scope`
+                    // which doesn't consult `path` / `cache_key`, so they stay
+                    // empty here.
+                    thunks.push(Arc::new(Thunk::new(
+                        el.clone(),
+                        item_scope,
+                        Vec::new(),
+                        String::new(),
+                    )));
                 }
 
                 let mut values = Vec::new();
@@ -371,7 +440,7 @@ impl<'a> Evaluator<'a> {
 
                     if let Expr::Spread(_) = thunk.node.expr.as_ref() {
                         if let Value::List(l) = element_val {
-                            values.extend(l);
+                            values.extend(l.iter().cloned());
                         } else {
                             return Err(RuntimeError::TypeMismatch {
                                 expected: "List".to_string(),
@@ -383,7 +452,9 @@ impl<'a> Evaluator<'a> {
                         values.push(element_val);
                     }
                 }
-                Ok(Value::List(values))
+                let result = Value::list(values);
+                self.check_value_size(&result, node.range)?;
+                Ok(result)
             }
 
             Expr::Dict(pairs) => {
@@ -420,9 +491,13 @@ impl<'a> Evaluator<'a> {
                             let val = self.eval(value_node, &dict_scope)?;
                             if let Value::Dict(d) = val {
                                 // Important: overrides existing keys in map
-                                for (k, v) in d.map {
+                                for (k, v) in d.map.iter() {
                                     map.insert(k.clone(), v.clone());
-                                    dict_scope.locals.lock().unwrap().insert(k, v);
+                                    dict_scope
+                                        .locals
+                                        .lock()
+                                        .unwrap()
+                                        .insert(k.clone(), v.clone());
                                 }
                             } else {
                                 return Err(RuntimeError::TypeMismatch {
@@ -465,7 +540,9 @@ impl<'a> Evaluator<'a> {
                         }
                     }
                 }
-                Ok(Value::Dict(ValueDict { map, brand: None }))
+                let result = Value::dict(map);
+                self.check_value_size(&result, node.range)?;
+                Ok(result)
             }
 
             Expr::Spread(inner) => self.eval(inner, &current_scope),
@@ -487,9 +564,9 @@ impl<'a> Evaluator<'a> {
                     }
                 };
                 let mut result = Vec::new();
-                for item in items {
+                for item in items.iter() {
                     let mut iter_scope_map = HashMap::new();
-                    iter_scope_map.insert(id.clone(), item);
+                    iter_scope_map.insert(id.clone(), item.clone());
                     let iter_scope = current_scope.with_locals(iter_scope_map);
 
                     let should_include = if let Some(cond) = condition {
@@ -501,7 +578,9 @@ impl<'a> Evaluator<'a> {
                         result.push(self.eval(element, &iter_scope)?);
                     }
                 }
-                Ok(Value::List(result))
+                let result = Value::list(result);
+                self.check_value_size(&result, node.range)?;
+                Ok(result)
             }
             Expr::Reference { base, path } => {
                 self.resolve_reference(base, path, &current_scope, node.range)
@@ -607,7 +686,7 @@ impl<'a> Evaluator<'a> {
                 let bindings_val = self.eval(bindings, &current_scope)?;
                 if let Value::Dict(d) = bindings_val {
                     let map_as_hashmap: std::collections::HashMap<String, Value> =
-                        d.map.into_iter().collect();
+                        d.map.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
                     let local_scope = current_scope.with_locals(map_as_hashmap);
                     self.eval(expr, &local_scope)
                 } else {
@@ -688,24 +767,24 @@ impl<'a> Evaluator<'a> {
         }?;
 
         if !is_schema_pred {
+            // Wrap pass: each decorator either runs through its registered
+            // [`DecoratorPlugin::wrap`] (built-ins, host-registered plugins)
+            // or falls back to the closure / native-function lookup below
+            // for user-defined decorators that share a dict with their data.
             for dec in &node.decorators {
-                let name = dec
-                    .path
-                    .iter()
-                    .map(|k| k.to_string_key())
-                    .collect::<Vec<_>>()
-                    .join(".");
-                if name == "import" || name == "schema" {
-                    continue;
+                let name = decorator_name(dec);
+                let dec_args = self.evaluate_call_args(&dec.args, &current_scope)?;
+                if let Some(plugin) = self.context.decorators.get(&name).cloned() {
+                    val = plugin.wrap(self, val, &current_scope, &dec_args, dec.range)?;
+                } else {
+                    val = self.fallback_decorator(
+                        &dec.path,
+                        val,
+                        dec_args,
+                        &current_scope,
+                        dec.range,
+                    )?;
                 }
-                let mut dec_args = Vec::new();
-                for arg in &dec.args {
-                    dec_args.push(EvaluatedArg {
-                        name: arg.name.clone(),
-                        value: self.eval_internal(&arg.value, &current_scope, is_schema_pred)?,
-                    });
-                }
-                val = self.apply_decorator(&dec.path, val, dec_args, &current_scope, dec.range)?;
             }
         }
 
@@ -714,6 +793,7 @@ impl<'a> Evaluator<'a> {
                 self.check_type(&mut val, type_hint, &current_scope, node.range)?;
 
                 if let Value::Dict(ref mut d) = val {
+                    let d = Arc::make_mut(d);
                     if type_hint.path.len() == 1 {
                         let tname = &type_hint.path[0];
                         if !matches!(
@@ -732,388 +812,21 @@ impl<'a> Evaluator<'a> {
         Ok(val)
     }
 
-    fn check_type(
-        &self,
-        value: &mut Value,
-        expected: &relon_parser::TypeNode,
-        scope: &Arc<Scope>,
-        range: TokenRange,
-    ) -> Result<(), RuntimeError> {
-        self.check_type_internal(value, expected, scope, range, &mut HashSet::new(), 0)
-    }
-
-    fn check_type_internal(
-        &self,
-        value: &mut Value,
-        expected: &relon_parser::TypeNode,
-        scope: &Arc<Scope>,
-        range: TokenRange,
-        visited: &mut HashSet<(String, *const Value)>,
-        depth: usize,
-    ) -> Result<(), RuntimeError> {
-        if depth > 20 {
-            return Err(RuntimeError::UnsupportedOperator(
-                "Type recursion depth exceeded".to_string(),
-                range,
-            ));
-        }
-
-        if expected.is_optional && matches!(value, Value::Null) {
-            return Ok(());
-        }
-
-        let expected_str = Self::format_type_node(expected);
-
-        // Recursion guard for custom schemas
-        let tname = expected.path.join(".");
-        if !matches!(
-            tname.as_str(),
-            "Int" | "String" | "Bool" | "Any" | "Null" | "List" | "Dict" | "Enum"
-        ) {
-            let ptr = value as *const Value;
-            if !visited.insert((tname.clone(), ptr)) {
-                return Ok(());
-            }
-        }
-
-        let matches = if expected.path.len() == 1 {
-            match expected.path[0].as_str() {
-                "Any" => true,
-                "Int" => matches!(value, Value::Int(_)),
-                "Float" => matches!(value, Value::Float(_)),
-                "Number" => matches!(value, Value::Int(_) | Value::Float(_)),
-                "String" => matches!(value, Value::String(_)),
-                "Bool" => matches!(value, Value::Bool(_)),
-                "Null" => matches!(value, Value::Null),
-                "List" => {
-                    if let Value::List(l) = value {
-                        if let Some(generic) = expected.generics.first() {
-                            for item in l.iter_mut() {
-                                self.check_type_internal(
-                                    item,
-                                    generic,
-                                    scope,
-                                    range,
-                                    visited,
-                                    depth + 1,
-                                )?;
-                            }
-                        }
-                        true
-                    } else {
-                        false
-                    }
-                }
-                "Dict" => {
-                    if let Value::Dict(d) = value {
-                        if expected.generics.len() == 2 {
-                            let val_type = &expected.generics[1];
-                            for val in d.map.values_mut() {
-                                self.check_type_internal(
-                                    val,
-                                    val_type,
-                                    scope,
-                                    range,
-                                    visited,
-                                    depth + 1,
-                                )?;
-                            }
-                        }
-                        true
-                    } else {
-                        false
-                    }
-                }
-                "Closure" | "Fn" => matches!(value, Value::Closure { .. }),
-                "Enum" => {
-                    let mut matched = false;
-                    for choice in &expected.generics {
-                        let mut temp = value.clone();
-                        if self
-                            .check_type_internal(
-                                &mut temp,
-                                choice,
-                                scope,
-                                range,
-                                visited,
-                                depth + 1,
-                            )
-                            .is_ok()
-                        {
-                            matched = true;
-                            break;
-                        }
-                        if let Value::String(s) = value {
-                            if choice.path.len() == 1 && choice.path[0] == *s {
-                                matched = true;
-                                break;
-                            }
-                        }
-                    }
-                    matched
-                }
-                _ => self.check_custom_schema(
-                    value,
-                    &expected.path,
-                    scope,
-                    range,
-                    visited,
-                    depth + 1,
-                )?,
-            }
-        } else {
-            self.check_custom_schema(value, &expected.path, scope, range, visited, depth + 1)?
-        };
-
-        if !matches {
-            return Err(RuntimeError::TypeMismatch {
-                expected: expected_str,
-                found: value.type_name().to_string(),
-                range,
-            });
-        }
-        Ok(())
-    }
-
-    fn check_custom_schema(
-        &self,
-        value: &mut Value,
-        path: &[String],
-        scope: &Arc<Scope>,
-        range: TokenRange,
-        visited: &mut HashSet<(String, *const Value)>,
-        depth: usize,
-    ) -> Result<bool, RuntimeError> {
-        let mut current_val = scope
-            .get_local(&path[0])
-            .ok_or_else(|| RuntimeError::VariableNotFound(path[0].clone(), range))?;
-
-        for part in &path[1..] {
-            match current_val {
-                Value::Dict(d) => {
-                    current_val = d.map.get(part).cloned().ok_or_else(|| {
-                        RuntimeError::VariableNotFound(format!("{}.{}", path[0], part), range)
-                    })?;
-                }
-                _ => return Ok(false),
-            }
-        }
-
-        match current_val {
-            Value::Schema(fields) => {
-                if let Value::Dict(ref mut d) = value {
-                    for (field_name, field) in fields.iter() {
-                        if let Some(field_val) = d.map.get_mut(field_name) {
-                            self.check_type_internal(
-                                field_val,
-                                &field.type_hint,
-                                scope,
-                                range,
-                                visited,
-                                depth,
-                            )?;
-                            match &field.predicate {
-                                Value::Wildcard => {}
-                                Value::Closure { .. } => {
-                                    let result = self.call_function_by_value(
-                                        field.predicate.clone(),
-                                        vec![EvaluatedArg {
-                                            name: None,
-                                            value: field_val.clone(),
-                                        }],
-                                        scope,
-                                        range,
-                                    )?;
-                                    if !result.is_truthy() {
-                                        let err_msg =
-                                            field.custom_error.clone().unwrap_or_else(|| {
-                                                format!("predicate constraint for '{}'", field_name)
-                                            });
-                                        return Err(RuntimeError::TypeMismatch {
-                                            expected: err_msg,
-                                            found: field_val.to_string(),
-                                            range,
-                                        });
-                                    }
-                                }
-                                _ => {}
-                            }
-                        } else if let Some(ref def) = field.default_value {
-                            d.map.insert(field_name.clone(), def.clone());
-                        } else if field.type_hint.is_optional {
-                            continue;
-                        } else {
-                            return Err(RuntimeError::TypeMismatch {
-                                expected: format!("field '{}'", field_name),
-                                found: "missing".to_string(),
-                                range,
-                            });
-                        }
-                    }
-                    Ok(true)
-                } else {
-                    Ok(false)
-                }
-            }
-            Value::Type(t) => {
-                // Prevent self-recursion for Type alias
-                if t.path == path {
-                    return Ok(false);
-                }
-                self.check_type_internal(value, &t, scope, range, visited, depth)
-                    .map(|_| true)
-            }
-            _ => Ok(false),
-        }
-    }
-
-    fn extract_schema_fields_from_dict(
-        &self,
-        pairs: &[(TokenKey, Node)],
-        scope: &Arc<Scope>,
-    ) -> Result<HashMap<String, crate::value::SchemaField>, RuntimeError> {
-        let mut schema_fields = HashMap::new();
-        for (key, value_node) in pairs {
-            if let TokenKey::String(key_name, _, _) = key {
-                let (type_node, predicate) = if let Some(t) = &value_node.type_hint {
-                    let pred = self.eval_internal(value_node, scope, true)?;
-                    (t.clone(), pred)
-                } else {
-                    match value_node.expr.as_ref() {
-                        Expr::Variable(vpath) => {
-                            let path: Vec<String> = vpath.iter().map(|k| k.name()).collect();
-                            (
-                                relon_parser::TypeNode {
-                                    path,
-                                    generics: Vec::new(),
-                                    is_optional: false,
-                                    range: value_node.range,
-                                },
-                                Value::Wildcard,
-                            )
-                        }
-                        _ => {
-                            let val = self.eval_internal(value_node, scope, true)?;
-                            match val {
-                                Value::Type(t) => (t, Value::Wildcard),
-                                other => {
-                                    return Err(RuntimeError::TypeMismatch {
-                                        expected: "Type or Type Prefix".to_string(),
-                                        found: other.type_name().to_string(),
-                                        range: value_node.range,
-                                    });
-                                }
-                            }
-                        }
-                    }
-                };
-
-                let mut custom_error = None;
-                let mut default_value = None;
-                for v_dec in &value_node.decorators {
-                    let d_name = v_dec
-                        .path
-                        .iter()
-                        .map(|k| k.to_string_key())
-                        .collect::<Vec<_>>()
-                        .join(".");
-                    if d_name == "expect" || d_name == "error" || d_name == "msg" {
-                        if let Some(arg) = v_dec.args.first() {
-                            let msg_val = self.eval_internal(&arg.value, scope, false)?;
-                            custom_error = Some(msg_val.to_string());
-                        }
-                    } else if d_name == "default" {
-                        if let Some(arg) = v_dec.args.first() {
-                            let def_val = self.eval_internal(&arg.value, scope, false)?;
-                            default_value = Some(def_val);
-                        }
-                    }
-                }
-
-                schema_fields.insert(
-                    key_name.clone(),
-                    crate::value::SchemaField {
-                        type_hint: type_node,
-                        predicate,
-                        custom_error,
-                        default_value,
-                    },
-                );
-            }
-        }
-        Ok(schema_fields)
-    }
-
-    /// Walk a schema-position expression and produce its field map.
+    /// Apply an `@import(path, as=, spread=)` decorator's effect on the scope.
     ///
-    /// Used by both the top-level `@schema` handler (Binary case) and recursive
-    /// composition. We traverse the expression tree directly so siblings on
-    /// either side of `+` are interpreted as schema definitions, not as data
-    /// dicts that would lose their `Type field: pred` annotations through
-    /// regular dict evaluation.
-    fn extract_schema_for_node(
+    /// Exposed so the [`crate::builtin_decorators::ImportDecorator`] plugin can
+    /// reuse the implementation without copy-pasting filesystem and module-cache
+    /// logic.
+    pub fn apply_import(
         &self,
-        node: &Node,
+        args: &[CallArg],
         scope: &Arc<Scope>,
-    ) -> Result<HashMap<String, crate::value::SchemaField>, RuntimeError> {
-        match node.expr.as_ref() {
-            Expr::Dict(pairs) => self.extract_schema_fields_from_dict(pairs, scope),
-            Expr::Binary(Operator::Add, left, right) => {
-                let mut left_fields = self.extract_schema_for_node(left, scope)?;
-                let right_fields = self.extract_schema_for_node(right, scope)?;
-                for (k, patch) in right_fields {
-                    if let Some(base) = left_fields.get_mut(&k) {
-                        base.type_hint = patch.type_hint;
-                        if !matches!(patch.predicate, Value::Wildcard) {
-                            base.predicate = patch.predicate;
-                        }
-                        if patch.custom_error.is_some() {
-                            base.custom_error = patch.custom_error;
-                        }
-                        if patch.default_value.is_some() {
-                            base.default_value = patch.default_value;
-                        }
-                    } else {
-                        left_fields.insert(k, patch);
-                    }
-                }
-                Ok(left_fields)
-            }
-            _ => {
-                // Reference / Variable / Type / etc. — must already evaluate to a Schema.
-                let val = self.eval_internal(node, scope, false)?;
-                match val {
-                    Value::Schema(fields) => Ok(fields),
-                    other => Err(RuntimeError::TypeMismatch {
-                        expected: "Schema".to_string(),
-                        found: other.type_name().to_string(),
-                        range: node.range,
-                    }),
-                }
-            }
-        }
-    }
-
-    fn format_type_node(node: &relon_parser::TypeNode) -> String {
-        let suffix = if node.is_optional { "?" } else { "" };
-        let path_str = node.path.join(".");
-        if node.generics.is_empty() {
-            format!("{}{}", path_str, suffix)
-        } else {
-            let generics: Vec<String> = node.generics.iter().map(Self::format_type_node).collect();
-            format!("{}<{}>{}", path_str, generics.join(", "), suffix)
-        }
-    }
-
-    fn apply_import_decorator(
-        &self,
-        dec: &relon_parser::Decorator,
-        scope: &Arc<Scope>,
+        range: TokenRange,
     ) -> Result<Arc<Scope>, RuntimeError> {
         let mut path_str = String::new();
         let mut alias: Option<String> = None;
         let mut should_spread = false;
-        for arg in &dec.args {
+        for arg in args {
             let val = self.eval(&arg.value, scope)?;
             match arg.name.as_deref() {
                 Some("path") | None if path_str.is_empty() => {
@@ -1134,7 +847,7 @@ impl<'a> Evaluator<'a> {
                 _ => {}
             }
         }
-        let evaluated_module = self.load_module(&path_str, scope, dec.range)?;
+        let evaluated_module = self.load_module(&path_str, scope, range)?;
         let final_alias = if let Some(a) = alias {
             Some(a)
         } else if !should_spread {
@@ -1150,42 +863,81 @@ impl<'a> Evaluator<'a> {
         }
         if should_spread {
             if let Value::Dict(d) = evaluated_module {
-                for (k, v) in d.map {
+                for (k, v) in d.map.iter() {
                     if !k.starts_with('_') {
-                        new_locals.insert(k, v);
+                        new_locals.insert(k.clone(), v.clone());
                     }
                 }
             } else {
                 return Err(RuntimeError::TypeMismatch {
                     expected: "Dict".to_string(),
                     found: evaluated_module.type_name().to_string(),
-                    range: dec.range,
+                    range,
                 });
             }
         }
         Ok(scope.with_locals(new_locals))
     }
 
-    fn load_module(
+    /// Evaluate a decorator/function-call argument list against `scope`,
+    /// preserving positional order and named bindings.
+    pub fn evaluate_call_args(
+        &self,
+        args: &[CallArg],
+        scope: &Arc<Scope>,
+    ) -> Result<Vec<EvaluatedArg>, RuntimeError> {
+        let mut out = Vec::with_capacity(args.len());
+        for arg in args {
+            out.push(EvaluatedArg {
+                name: arg.name.clone(),
+                value: self.eval(&arg.value, scope)?,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Resolve and evaluate the module identified by `path_str`, threading it
+    /// through the registered [`ModuleResolver`] chain. The first resolver
+    /// returning `Some(ModuleSource)` wins; the resulting source is parsed and
+    /// evaluated once, then cached by `canonical_id`.
+    pub fn load_module(
         &self,
         path_str: &str,
         scope: &Arc<Scope>,
         range: TokenRange,
     ) -> Result<Value, RuntimeError> {
-        if path_str.starts_with("std/") {
-            return self.load_virtual_module(path_str, range);
+        let source = self.resolve_module_source(path_str, scope, range)?;
+        self.evaluate_module_source(source, range)
+    }
+
+    fn resolve_module_source(
+        &self,
+        path_str: &str,
+        scope: &Arc<Scope>,
+        range: TokenRange,
+    ) -> Result<ModuleSource, RuntimeError> {
+        for resolver in &self.context.module_resolvers {
+            if let Some(source) = resolver.resolve(path_str, scope, range)? {
+                return Ok(source);
+            }
         }
-        let target_path = Path::new(&scope.current_dir).join(path_str);
-        let canonical_target = std::fs::canonicalize(&target_path).map_err(|e| {
-            RuntimeError::IoError(format!("{}: {e}", target_path.to_string_lossy()))
-        })?;
-        let canonical_path = canonical_target.to_string_lossy().to_string();
+        Err(RuntimeError::ModuleNotFound(
+            path_str.to_string(),
+            range.into(),
+        ))
+    }
+
+    fn evaluate_module_source(
+        &self,
+        source: ModuleSource,
+        range: TokenRange,
+    ) -> Result<Value, RuntimeError> {
         if let Some(cached) = self
             .context
             .module_cache
             .lock()
             .unwrap()
-            .get(&canonical_path)
+            .get(&source.canonical_id)
         {
             return Ok(cached.clone());
         }
@@ -1194,28 +946,25 @@ impl<'a> Evaluator<'a> {
             .loading_modules
             .lock()
             .unwrap()
-            .contains(&canonical_path)
+            .contains(&source.canonical_id)
         {
             return Err(RuntimeError::CircularImport(
                 self.context.loading_modules.lock().unwrap().clone(),
                 range.into(),
             ));
         }
-        let _loading_guard = self.context.enter_loading_module(canonical_path.clone());
-        let content = std::fs::read_to_string(&canonical_target)
-            .map_err(|e| RuntimeError::IoError(e.to_string()))?;
-        let node = parse_document(&content).map_err(|error| RuntimeError::ModuleParseError {
-            path: canonical_path.clone(),
-            message: error.to_string(),
-            range: range.into(),
-        })?;
+        let _loading_guard = self
+            .context
+            .enter_loading_module(source.canonical_id.clone());
+        let node =
+            parse_document(&source.source).map_err(|error| RuntimeError::ModuleParseError {
+                path: source.canonical_id.clone(),
+                message: error.to_string(),
+                range: range.into(),
+            })?;
         let module_scope = Arc::new(Scope {
-            current_dir: canonical_target
-                .parent()
-                .unwrap_or(Path::new("."))
-                .to_string_lossy()
-                .to_string(),
-            cache_namespace: canonical_path.clone(),
+            current_dir: source.current_dir,
+            cache_namespace: source.canonical_id.clone(),
             reference_root: Some(Arc::new(node.clone())),
             ..Default::default()
         });
@@ -1224,36 +973,11 @@ impl<'a> Evaluator<'a> {
             .module_cache
             .lock()
             .unwrap()
-            .insert(canonical_path, evaluated.clone());
+            .insert(source.canonical_id, evaluated.clone());
         Ok(evaluated)
     }
 
-    fn load_virtual_module(&self, path: &str, range: TokenRange) -> Result<Value, RuntimeError> {
-        let content = match path {
-            "std/dict" => include_str!("std_relon/dict.relon"),
-            "std/is" => include_str!("std_relon/is.relon"),
-            "std/math" => include_str!("std_relon/math.relon"),
-            "std/list" => include_str!("std_relon/list.relon"),
-            "std/string" => include_str!("std_relon/string.relon"),
-            "std/value" => include_str!("std_relon/value.relon"),
-            _ => return Err(RuntimeError::ModuleNotFound(path.to_string(), range.into())),
-        };
-        let node = parse_document(content).map_err(|error| RuntimeError::ModuleParseError {
-            path: path.to_string(),
-            message: error.to_string(),
-            range: range.into(),
-        })?;
-        self.eval(
-            &node,
-            &Arc::new(Scope {
-                cache_namespace: path.to_string(),
-                reference_root: Some(Arc::new(node.clone())),
-                ..Default::default()
-            }),
-        )
-    }
-
-    fn call_function_by_value(
+    pub(crate) fn call_function_by_value(
         &self,
         func: Value,
         args: Vec<EvaluatedArg>,
@@ -1305,9 +1029,9 @@ impl<'a> Evaluator<'a> {
             return self.eval_closure(&params, &body, args, &captured_env, range);
         }
         if let Some(name) = Self::native_function_name(path) {
-            if let Some(func) = self.context.functions.get(&name) {
-                let positional: Vec<Value> = args.into_iter().map(|a| a.value).collect();
-                return func.call(positional, range);
+            if let Some(entry) = self.context.functions.get(&name) {
+                self.check_native_fn_capability(&name, entry, range)?;
+                return entry.func.call(NativeArgs::from_evaluated(args), range);
             }
         }
         Err(RuntimeError::FunctionNotFound(
@@ -1319,7 +1043,39 @@ impl<'a> Evaluator<'a> {
         ))
     }
 
-    fn apply_decorator(
+    /// Sandbox gate for native fns. Legacy `register_fn` entries (`gated == false`)
+    /// always pass; gated entries pass when `allow_all_native_fn` is on or the
+    /// name is in `allow_native_fn`.
+    fn check_native_fn_capability(
+        &self,
+        name: &str,
+        entry: &GatedNativeFn,
+        range: TokenRange,
+    ) -> Result<(), RuntimeError> {
+        if !entry.gated {
+            return Ok(());
+        }
+        let caps = &self.context.capabilities;
+        if caps.allow_all_native_fn || caps.allow_native_fn.contains(name) {
+            return Ok(());
+        }
+        Err(RuntimeError::CapabilityDenied {
+            name: name.to_string(),
+            reason: if entry.caps.reads_fs {
+                "function declared `reads_fs` but is not in the sandbox allowlist".to_string()
+            } else {
+                "function not in sandbox allowlist".to_string()
+            },
+            range,
+        })
+    }
+
+    /// Fallback path for decorators that aren't registered as
+    /// [`DecoratorPlugin`]s. Tries (in order) a user-defined closure, then a
+    /// registered native function. Built-in keywords (`@import`, `@schema`,
+    /// `@expect`, `@default`, `@value`) are handled via the plugin registry,
+    /// not here.
+    fn fallback_decorator(
         &self,
         path: &[TokenKey],
         value: Value,
@@ -1338,20 +1094,11 @@ impl<'a> Evaluator<'a> {
             return self.eval_closure(&params, &body, combined, &captured_env, range);
         }
         if let Some(name) = Self::native_function_name(path) {
-            if let Some(func) = self.context.functions.get(&name) {
-                let mut positional = vec![value.clone()];
-                positional.extend(args.into_iter().map(|a| a.value));
-                return func.call(positional, range);
-            }
-            if name == "value" {
-                if let Some(a) = args.first() {
-                    return Ok(a.value.clone());
-                } else {
-                    return Ok(value);
-                }
-            }
-            if name == "expect" || name == "msg" || name == "error" {
-                return Ok(value);
+            if let Some(entry) = self.context.functions.get(&name) {
+                self.check_native_fn_capability(&name, entry, range)?;
+                let mut native = NativeArgs::from_evaluated(args);
+                native.positional.insert(0, value);
+                return entry.func.call(native, range);
             }
         }
         Err(RuntimeError::UnsupportedOperator(
@@ -1434,713 +1181,39 @@ impl<'a> Evaluator<'a> {
             list_context: None,
             thunks: Mutex::new(HashMap::new()),
         });
+        // Pin the body inside a single Arc so the scope's `reference_root`
+        // and the `&Node` we pass to `self.eval` have identical pointer
+        // identity. Without this, `is_root` would never trigger for closure
+        // bodies and `&sibling` lookups inside the body would silently fall
+        // back through the parent chain — which is fine when the parent has
+        // the same fields, but incorrect when (for instance) the closure is
+        // declared at file root: the outer dict's reference_root_scope would
+        // leak in and we'd resolve siblings against the *call site*'s root
+        // instead of the body's.
+        let body_arc = Arc::new(body.clone());
         let body_scope = Arc::new(Scope {
             parent: Some(Arc::clone(&bindings_scope)),
             path_node: None,
             locals: Mutex::new(HashMap::new()),
             current_dir: bindings_scope.current_dir.clone(),
             cache_namespace: bindings_scope.cache_namespace.clone(),
-            reference_root: Some(Arc::new(body.clone())),
+            reference_root: Some(Arc::clone(&body_arc)),
             reference_root_parent: Some(bindings_scope.clone()),
-            reference_root_scope: bindings_scope.reference_root_scope.clone(),
+            // Reset: a fresh `reference_root` invalidates the inherited
+            // `reference_root_scope`. The Dict branch in `eval_internal`
+            // re-installs it via the (now-honest) `is_root` check.
+            reference_root_scope: None,
             list_context: None,
             thunks: Mutex::new(HashMap::new()),
         });
-        self.eval(body, &body_scope)
+        self.eval(&body_arc, &body_scope)
     }
 
-    fn resolve_variable(
-        &self,
-        path: &[TokenKey],
-        scope: &Arc<Scope>,
-        range: TokenRange,
-    ) -> Result<Value, RuntimeError> {
-        if path.is_empty() {
-            return Err(RuntimeError::VariableNotFound(
-                "Empty path".to_string(),
-                range,
-            ));
-        }
-        let first = &path[0];
-        let first_name = first.to_string_key();
-        let mut current_val = if let Some(val) = scope.get_local(&first_name) {
-            val
-        } else if let Some(thunk) = scope.get_thunk(&first_name) {
-            self.force_thunk(&thunk)?
-        } else if let Some(val) = self.context.globals.get(&first_name) {
-            val.clone()
-        } else {
-            return Err(RuntimeError::VariableNotFound(first_name, range));
-        };
-        let mut parts = vec![first_name.clone()];
-        for part in &path[1..] {
-            let is_optional = part.is_optional();
-            let key = match part {
-                TokenKey::Dynamic(expr_node, _) => {
-                    let val = self.eval(expr_node, scope)?;
-                    match val {
-                        Value::String(s) => s,
-                        Value::Int(i) => i.to_string(),
-                        other => {
-                            return Err(RuntimeError::TypeMismatch {
-                                expected: "String or Int for dynamic key".to_string(),
-                                found: other.type_name().to_string(),
-                                range: expr_node.range,
-                            })
-                        }
-                    }
-                }
-                _ => part.to_string_key(),
-            };
-            parts.push(key.clone());
-            let display_name = parts.join(".");
-
-            match current_val {
-                Value::Dict(ref d) => {
-                    if let Some(val) = d.map.get(&key) {
-                        current_val = val.clone();
-                    } else if is_optional {
-                        return Ok(Value::Null);
-                    } else {
-                        return Err(RuntimeError::VariableNotFound(display_name, range));
-                    }
-                }
-                Value::List(ref list) => {
-                    let idx = key
-                        .parse::<usize>()
-                        .map_err(|_| RuntimeError::TypeMismatch {
-                            expected: "Index".to_string(),
-                            found: "String".to_string(),
-                            range,
-                        })?;
-                    if let Some(val) = list.get(idx) {
-                        current_val = val.clone();
-                    } else if is_optional {
-                        return Ok(Value::Null);
-                    } else {
-                        return Err(RuntimeError::VariableNotFound(display_name, range));
-                    }
-                }
-                Value::Null if is_optional => return Ok(Value::Null),
-                _ => {
-                    if is_optional {
-                        return Ok(Value::Null);
-                    }
-                    return Err(RuntimeError::TypeMismatch {
-                        expected: "Dict/List".to_string(),
-                        found: current_val.type_name().to_string(),
-                        range,
-                    });
-                }
-            }
-        }
-        Ok(current_val)
-    }
-
-    fn eval_binary(
-        &self,
-        op: Operator,
-        left: &Node,
-        right: &Node,
-        scope: &Arc<Scope>,
-    ) -> Result<Value, RuntimeError> {
-        let l = self.eval(left, scope)?;
-        let r = self.eval(right, scope)?;
-        match (op, &l, &r) {
-            (Operator::Add, Value::Dict(_), Value::Dict(_)) => {
-                let mut merged = l.clone();
-                merged.deep_merge(&r);
-
-                if let Value::Dict(ref d) = merged {
-                    if let Some(ref brand_name) = d.brand {
-                        if let Some(Value::Schema(_)) = scope.get_local(brand_name) {
-                            let mut to_check = merged.clone();
-                            let type_node = relon_parser::TypeNode {
-                                path: vec![brand_name.clone()],
-                                generics: Vec::new(),
-                                is_optional: false,
-                                range: left.range,
-                            };
-                            self.check_type(&mut to_check, &type_node, scope, left.range)?;
-                            return Ok(to_check);
-                        }
-                    }
-                }
-                Ok(merged)
-            }
-            (Operator::Add, Value::Schema(_), Value::Schema(_))
-            | (Operator::Add, Value::Schema(_), Value::Dict(_)) => {
-                let mut merged = l.clone();
-                merged.deep_merge(&r);
-                Ok(merged)
-            }
-            (Operator::Add, Value::String(a), b) => Ok(Value::String(format!("{}{}", a, b))),
-            (Operator::Add, a, Value::String(b)) => Ok(Value::String(format!("{}{}", a, b))),
-            (Operator::Add | Operator::Sub | Operator::Mul, _, _) => {
-                Self::eval_numeric_arithmetic(op, &l, left.range, &r, right.range)
-            }
-            (Operator::Div | Operator::Mod, _, _) => {
-                Self::eval_numeric_division(op, &l, left.range, &r, right.range)
-            }
-            (Operator::Eq, a, b) => Ok(Value::Bool(a == b)),
-            (Operator::Ne, a, b) => Ok(Value::Bool(a != b)),
-            (Operator::Lt | Operator::Gt | Operator::Le | Operator::Ge, _, _) => {
-                Self::eval_numeric_comparison(op, &l, left.range, &r, right.range)
-            }
-            _ => Err(RuntimeError::UnsupportedOperator(
-                format!("{:?}", op),
-                left.range,
-            )),
-        }
-    }
-
-    fn eval_unary(
-        &self,
-        op: Operator,
-        node: &Node,
-        scope: &Arc<Scope>,
-    ) -> Result<Value, RuntimeError> {
-        let val = self.eval(node, scope)?;
-        match (op, val) {
-            (Operator::Not, v) => Ok(Value::Bool(!v.is_truthy())),
-            (Operator::Sub, Value::Int(i)) => Ok(Value::Int(-i)),
-            (Operator::Sub, Value::Float(f)) => Ok(Value::Float(-f)),
-            (Operator::Sub, v) => Err(RuntimeError::TypeMismatch {
-                expected: "Number".to_string(),
-                found: v.type_name().to_string(),
-                range: node.range,
-            }),
-            _ => Err(RuntimeError::UnsupportedOperator(
-                format!("{:?}", op),
-                node.range,
-            )),
-        }
-    }
-
-    fn eval_numeric_arithmetic(
-        op: Operator,
-        left: &Value,
-        left_range: TokenRange,
-        right: &Value,
-        right_range: TokenRange,
-    ) -> Result<Value, RuntimeError> {
-        let left = Self::expect_number(left, left_range)?;
-        let right = Self::expect_number(right, right_range)?;
-        match (op, left, right) {
-            (Operator::Add, NumericValue::Int(a), NumericValue::Int(b)) => Ok(Value::Int(a + b)),
-            (Operator::Sub, NumericValue::Int(a), NumericValue::Int(b)) => Ok(Value::Int(a - b)),
-            (Operator::Mul, NumericValue::Int(a), NumericValue::Int(b)) => Ok(Value::Int(a * b)),
-            (Operator::Add, a, b) => Ok(Value::Float(OrderedFloat(a.as_f64() + b.as_f64()))),
-            (Operator::Sub, a, b) => Ok(Value::Float(OrderedFloat(a.as_f64() - b.as_f64()))),
-            (Operator::Mul, a, b) => Ok(Value::Float(OrderedFloat(a.as_f64() * b.as_f64()))),
-            _ => unreachable!("non-arithmetic operator passed to eval_numeric_arithmetic"),
-        }
-    }
-
-    fn eval_numeric_division(
-        op: Operator,
-        left: &Value,
-        left_range: TokenRange,
-        right: &Value,
-        right_range: TokenRange,
-    ) -> Result<Value, RuntimeError> {
-        let left = Self::expect_number(left, left_range)?;
-        let right = Self::expect_number(right, right_range)?;
-        if right.as_f64() == 0.0 {
-            return Err(RuntimeError::DivisionByZero(right_range));
-        }
-        match (op, left, right) {
-            (Operator::Div, NumericValue::Int(a), NumericValue::Int(b)) => Ok(Value::Int(a / b)),
-            (Operator::Mod, NumericValue::Int(a), NumericValue::Int(b)) => Ok(Value::Int(a % b)),
-            (Operator::Div, a, b) => Ok(Value::Float(OrderedFloat(a.as_f64() / b.as_f64()))),
-            (Operator::Mod, a, b) => Ok(Value::Float(OrderedFloat(a.as_f64() % b.as_f64()))),
-            _ => unreachable!("non-division operator passed to eval_numeric_division"),
-        }
-    }
-
-    fn eval_numeric_comparison(
-        op: Operator,
-        left: &Value,
-        left_range: TokenRange,
-        right: &Value,
-        right_range: TokenRange,
-    ) -> Result<Value, RuntimeError> {
-        let left = Self::expect_number(left, left_range)?.as_f64();
-        let right = Self::expect_number(right, right_range)?.as_f64();
-        let result = match op {
-            Operator::Lt => left < right,
-            Operator::Gt => left > right,
-            Operator::Le => left <= right,
-            Operator::Ge => left >= right,
-            _ => unreachable!("non-comparison operator passed to eval_numeric_comparison"),
-        };
-        Ok(Value::Bool(result))
-    }
-
-    fn expect_number(value: &Value, range: TokenRange) -> Result<NumericValue, RuntimeError> {
-        match value {
-            Value::Int(value) => Ok(NumericValue::Int(*value)),
-            Value::Float(value) => Ok(NumericValue::Float(*value)),
-            _ => Err(RuntimeError::TypeMismatch {
-                expected: "Number".to_string(),
-                found: value.type_name().to_string(),
-                range,
-            }),
-        }
-    }
-
-    fn resolve_reference(
-        &self,
-        base: &RefBase,
-        path: &[TokenKey],
-        scope: &Arc<Scope>,
-        range: TokenRange,
-    ) -> Result<Value, RuntimeError> {
-        match base {
-            RefBase::Index => {
-                let context = scope.list_context.as_ref().ok_or_else(|| {
-                    RuntimeError::VariableNotFound(
-                        "&index can only be used inside a list".to_string(),
-                        range,
-                    )
-                })?;
-                return Ok(Value::Int(context.index as i64));
-            }
-            RefBase::Prev => {
-                let context = scope.list_context.as_ref().ok_or_else(|| {
-                    RuntimeError::VariableNotFound(
-                        "&prev can only be used inside a list".to_string(),
-                        range,
-                    )
-                })?;
-                if context.index == 0 {
-                    return Ok(Value::Null);
-                }
-                let thunk = context.elements.get(context.index - 1).unwrap();
-                let val = self.force_thunk(thunk)?;
-                return self.lookup_value_path(val, path, "&prev", range);
-            }
-            RefBase::Next => {
-                let context = scope.list_context.as_ref().ok_or_else(|| {
-                    RuntimeError::VariableNotFound(
-                        "&next can only be used inside a list".to_string(),
-                        range,
-                    )
-                })?;
-                if context.index + 1 >= context.elements.len() {
-                    return Ok(Value::Null);
-                }
-                let thunk = context.elements.get(context.index + 1).unwrap();
-                let val = self.force_thunk(thunk)?;
-                return self.lookup_value_path(val, path, "&next", range);
-            }
-            RefBase::This => {
-                let root = scope
-                    .reference_root
-                    .as_deref()
-                    .or(self.context.root_node.as_deref())
-                    .ok_or_else(|| {
-                        RuntimeError::VariableNotFound("No root for &this".to_string(), range)
-                    })?;
-                return self.eval_reference_path(root, path, scope, "&this", range);
-            }
-            _ => {}
-        }
-
-        let root = scope
-            .reference_root
-            .as_deref()
-            .or(self.context.root_node.as_deref())
-            .ok_or(RuntimeError::VariableNotFound("No root".to_string(), range))?;
-        let mut target_path: Vec<TokenKey> = match base {
-            RefBase::Root => Vec::new(),
-            RefBase::Sibling => {
-                let mut p = scope.full_path();
-                p.pop();
-                p.into_iter()
-                    .map(|s| TokenKey::String(s, range, false))
-                    .collect()
-            }
-            RefBase::Uncle => {
-                let mut p = scope.full_path();
-                p.pop();
-                p.pop();
-                p.into_iter()
-                    .map(|s| TokenKey::String(s, range, false))
-                    .collect()
-            }
-            _ => unreachable!(),
-        };
-        target_path.extend_from_slice(path);
-
-        let path_str_vec: Vec<String> = target_path.iter().map(|k| k.name()).collect();
-        let path_str = path_str_vec.join(".");
-
-        if !target_path.is_empty() {
-            let cache_key = scope.path_cache_key(&path_str_vec);
-            if let Some(cached) = self.context.path_cache.lock().unwrap().get(&cache_key) {
-                return Ok(cached.clone());
-            }
-        }
-        let result = self.eval_reference_path(root, &target_path, scope, &path_str, range);
-        if let Ok(value) = &result {
-            if !target_path.is_empty() {
-                let cache_key = scope.path_cache_key(&path_str_vec);
-                self.context
-                    .path_cache
-                    .lock()
-                    .unwrap()
-                    .insert(cache_key, value.clone());
-            }
-        }
-        result
-    }
-
-    fn eval_reference_path(
-        &self,
-        root: &Node,
-        path: &[TokenKey],
-        original_scope: &Arc<Scope>,
-        display_path: &str,
-        range: TokenRange,
-    ) -> Result<Value, RuntimeError> {
-        let mut target_scope = None;
-        let mut current = Some(original_scope.clone());
-        while let Some(scope) = current {
-            if let Some(ref_root) = &scope.reference_root {
-                if std::ptr::eq(ref_root.as_ref() as *const _, root as *const _) {
-                    if let Some(root_scope) = &scope.reference_root_scope {
-                        target_scope = Some(root_scope.clone());
-                        break;
-                    }
-                }
-            }
-            current = scope.parent.clone();
-        }
-
-        let root_scope = target_scope.unwrap_or_else(|| {
-            Arc::new(Scope {
-                parent: original_scope.reference_root_parent.clone(),
-                path_node: None,
-                locals: Mutex::new(HashMap::new()),
-                current_dir: original_scope.current_dir.clone(),
-                cache_namespace: original_scope.cache_namespace.clone(),
-                reference_root: original_scope.reference_root.clone(),
-                reference_root_parent: original_scope.reference_root_parent.clone(),
-                reference_root_scope: original_scope.reference_root_scope.clone(),
-                list_context: None,
-                thunks: Mutex::new(HashMap::new()),
-            })
-        });
-
-        self.eval_reference_path_from(root, &root_scope, path, display_path, range)
-    }
-
-    fn eval_reference_path_from(
+    pub(crate) fn prepare_dict_scope(
         &self,
         node: &Node,
         scope: &Arc<Scope>,
-        path: &[TokenKey],
-        display_path: &str,
-        range: TokenRange,
-    ) -> Result<Value, RuntimeError> {
-        if path.is_empty() {
-            return self.eval_node_with_path_cache(node, scope, display_path);
-        }
-
-        match node.expr.as_ref() {
-            Expr::Dict(pairs) => {
-                self.prepare_dict_scope(node, scope)?;
-                let part = &path[0];
-                let is_optional = part.is_optional();
-                let key = match part {
-                    TokenKey::Dynamic(expr_node, _) => {
-                        let val = self.eval(expr_node, scope)?;
-                        match val {
-                            Value::String(s) => s,
-                            Value::Int(i) => i.to_string(),
-                            other => {
-                                return Err(RuntimeError::TypeMismatch {
-                                    expected: "String or Int for dynamic key".to_string(),
-                                    found: other.type_name().to_string(),
-                                    range: expr_node.range,
-                                })
-                            }
-                        }
-                    }
-                    _ => part.name(),
-                };
-                let remaining_path = &path[1..];
-                match self.resolve_dict_reference_step(pairs, &key, scope)? {
-                    Some(ReferenceStep::Thunk(thunk)) => {
-                        if remaining_path.is_empty() {
-                            self.force_thunk(&thunk)
-                        } else if matches!(thunk.node.expr.as_ref(), Expr::Dict(_) | Expr::List(_))
-                        {
-                            self.eval_reference_path_from(
-                                &thunk.node,
-                                &thunk.scope,
-                                remaining_path,
-                                display_path,
-                                range,
-                            )
-                        } else {
-                            let value = self.force_thunk(&thunk)?;
-                            self.lookup_value_path(value, remaining_path, display_path, range)
-                        }
-                    }
-                    Some(ReferenceStep::Value(value)) => {
-                        self.lookup_value_path(*value, remaining_path, display_path, range)
-                    }
-                    None => {
-                        if is_optional {
-                            Ok(Value::Null)
-                        } else {
-                            Err(RuntimeError::VariableNotFound(
-                                display_path.to_string(),
-                                range,
-                            ))
-                        }
-                    }
-                }
-            }
-            Expr::List(elements) => {
-                let part = &path[0];
-                let is_optional = part.is_optional();
-                let key = match part {
-                    TokenKey::Dynamic(expr_node, _) => {
-                        let val = self.eval(expr_node, scope)?;
-                        match val {
-                            Value::String(s) => s,
-                            Value::Int(i) => i.to_string(),
-                            other => {
-                                return Err(RuntimeError::TypeMismatch {
-                                    expected: "String or Int for dynamic key".to_string(),
-                                    found: other.type_name().to_string(),
-                                    range: expr_node.range,
-                                })
-                            }
-                        }
-                    }
-                    _ => part.name(),
-                };
-                let index = key
-                    .parse::<usize>()
-                    .map_err(|_| RuntimeError::VariableNotFound(display_path.to_string(), range))?;
-                let item_scope = scope.with_path(key.clone());
-                let item = elements.get(index);
-                if let Some(it) = item {
-                    self.eval_reference_path_from(it, &item_scope, &path[1..], display_path, range)
-                } else if is_optional {
-                    Ok(Value::Null)
-                } else {
-                    Err(RuntimeError::VariableNotFound(
-                        display_path.to_string(),
-                        range,
-                    ))
-                }
-            }
-            _ => {
-                let part = &path[0];
-                if part.is_optional() {
-                    Ok(Value::Null)
-                } else {
-                    let value = self.eval_node_with_path_cache(node, scope, display_path)?;
-                    self.lookup_value_path(value, path, display_path, range)
-                }
-            }
-        }
-    }
-
-    fn resolve_dict_reference_step(
-        &self,
-        pairs: &[(TokenKey, Node)],
-        part: &str,
-        scope: &Arc<Scope>,
-    ) -> Result<Option<ReferenceStep>, RuntimeError> {
-        for (key, value_node) in pairs.iter().rev() {
-            match key {
-                TokenKey::Spread(_) => {
-                    let spread_value = self.eval(value_node, scope)?;
-                    if let Value::Dict(d) = spread_value {
-                        if let Some(value) = d.map.get(part) {
-                            return Ok(Some(ReferenceStep::Value(Box::new(value.clone()))));
-                        }
-                    }
-                }
-                _ => {
-                    let key_str = match key {
-                        TokenKey::String(s, _, _) => s.clone(),
-                        TokenKey::Dynamic(expr_node, _) => match self.eval(expr_node, scope)? {
-                            Value::String(s) => s,
-                            Value::Int(i) => i.to_string(),
-                            _ => continue,
-                        },
-                        _ => key.to_string_key(),
-                    };
-                    if key_str == part {
-                        if let Some(thunk) = scope.get_own_thunk(part) {
-                            return Ok(Some(ReferenceStep::Thunk(thunk)));
-                        }
-                    }
-                }
-            }
-        }
-        Ok(None)
-    }
-
-    fn eval_node_with_path_cache(
-        &self,
-        node: &Node,
-        scope: &Arc<Scope>,
-        _display_path: &str,
-    ) -> Result<Value, RuntimeError> {
-        let full_path = scope.full_path();
-
-        let cache_key = scope.path_cache_key(&full_path);
-        if self
-            .context
-            .evaluating_paths
-            .lock()
-            .unwrap()
-            .contains(&cache_key)
-        {
-            return Err(RuntimeError::CircularReference(full_path));
-        }
-        if let Some(cached) = self.context.path_cache.lock().unwrap().get(&cache_key) {
-            return Ok(cached.clone());
-        }
-
-        self.context
-            .evaluating_paths
-            .lock()
-            .unwrap()
-            .insert(cache_key.clone());
-        let result = self.eval(node, scope);
-        self.context
-            .evaluating_paths
-            .lock()
-            .unwrap()
-            .remove(&cache_key);
-        if let Ok(value) = &result {
-            self.context
-                .path_cache
-                .lock()
-                .unwrap()
-                .insert(cache_key, value.clone());
-        }
-        result
-    }
-
-    fn force_thunk(&self, thunk: &Arc<Thunk>) -> Result<Value, RuntimeError> {
-        if let Some(value) = thunk.value.lock().unwrap().clone() {
-            return Ok(value);
-        }
-
-        if self
-            .context
-            .evaluating_paths
-            .lock()
-            .unwrap()
-            .contains(&thunk.cache_key)
-        {
-            return Err(RuntimeError::CircularReference(thunk.path.clone()));
-        }
-
-        self.context
-            .evaluating_paths
-            .lock()
-            .unwrap()
-            .insert(thunk.cache_key.clone());
-        let result = self.eval(&thunk.node, &thunk.scope);
-        self.context
-            .evaluating_paths
-            .lock()
-            .unwrap()
-            .remove(&thunk.cache_key);
-        if let Ok(value) = &result {
-            thunk.value.lock().unwrap().replace(value.clone());
-        }
-        result
-    }
-
-    fn force_thunk_with_scope(
-        &self,
-        thunk: &Arc<Thunk>,
-        scope: &Arc<Scope>,
-    ) -> Result<Value, RuntimeError> {
-        if let Some(value) = thunk.value.lock().unwrap().clone() {
-            return Ok(value);
-        }
-
-        let result = self.eval(&thunk.node, scope);
-        if let Ok(value) = &result {
-            thunk.value.lock().unwrap().replace(value.clone());
-        }
-        result
-    }
-
-    fn lookup_value_path(
-        &self,
-        mut current_val: Value,
-        path: &[TokenKey],
-        display_path: &str,
-        range: TokenRange,
-    ) -> Result<Value, RuntimeError> {
-        for part in path {
-            let key = part.name();
-            let is_optional = part.is_optional();
-
-            current_val = match current_val {
-                Value::Dict(ref d) => {
-                    if let Some(v) = d.map.get(&key) {
-                        v.clone()
-                    } else if is_optional {
-                        Value::Null
-                    } else {
-                        return Err(RuntimeError::VariableNotFound(
-                            display_path.to_string(),
-                            range,
-                        ));
-                    }
-                }
-                Value::List(list) => {
-                    let index = key.parse::<usize>().map_err(|_| {
-                        RuntimeError::VariableNotFound(display_path.to_string(), range)
-                    })?;
-                    if let Some(v) = list.get(index) {
-                        v.clone()
-                    } else if is_optional {
-                        Value::Null
-                    } else {
-                        return Err(RuntimeError::VariableNotFound(
-                            display_path.to_string(),
-                            range,
-                        ));
-                    }
-                }
-                Value::Null if is_optional => Value::Null,
-                other => {
-                    if is_optional {
-                        Value::Null
-                    } else {
-                        return Err(RuntimeError::TypeMismatch {
-                            expected: "Dict/List".to_string(),
-                            found: other.type_name().to_string(),
-                            range,
-                        });
-                    }
-                }
-            };
-            if current_val == Value::Null && is_optional {
-                return Ok(Value::Null);
-            }
-        }
-
-        Ok(current_val)
-    }
-
-    fn prepare_dict_scope(&self, node: &Node, scope: &Arc<Scope>) -> Result<(), RuntimeError> {
+    ) -> Result<(), RuntimeError> {
         if let Expr::Dict(pairs) = node.expr.as_ref() {
             self.register_dict_thunks(pairs, scope);
             for (key, value_node) in pairs {
@@ -2216,18 +1289,23 @@ impl<'a> Evaluator<'a> {
             };
             let item_scope = scope.with_path(key_str.clone());
             let path = item_scope.full_path();
+            let cache_key = item_scope.path_cache_key(&path);
             thunks.insert(
                 key_str,
-                Arc::new(Thunk {
-                    node: value_node.clone(),
-                    scope: item_scope.clone(),
-                    path: path.clone(),
-                    cache_key: item_scope.path_cache_key(&path),
-                    value: Mutex::new(None),
-                }),
+                Arc::new(Thunk::new(value_node.clone(), item_scope, path, cache_key)),
             );
         }
     }
+}
+
+/// Module-level helper because both [`Evaluator`] methods and the
+/// schema-extraction path need to compute a decorator's lookup key.
+pub(crate) fn decorator_name(dec: &DecoratorNode) -> String {
+    dec.path
+        .iter()
+        .map(|k| k.to_string_key())
+        .collect::<Vec<_>>()
+        .join(".")
 }
 
 impl std::fmt::Display for Value {
@@ -2242,7 +1320,7 @@ impl std::fmt::Display for Value {
             Value::Dict(d) => write!(f, "{:?}", d.map),
             Value::Closure { .. } => write!(f, "<closure>"),
             Value::Schema(_) => write!(f, "<schema>"),
-            Value::Type(t) => write!(f, "Type<{}>", Evaluator::format_type_node(t)),
+            Value::Type(t) => write!(f, "Type<{}>", crate::schema::format_type_node(t)),
             Value::Wildcard => write!(f, "*"),
         }
     }

@@ -1,17 +1,30 @@
+pub mod arithmetic;
+pub mod builtin_decorators;
+pub mod decorator;
 pub mod error;
 pub mod eval;
+pub mod module;
+pub mod native_fn;
+pub mod reference;
+pub mod schema;
+pub mod scope;
 pub mod stdlib;
 pub mod value;
 
+pub use decorator::{DecoratorPlugin, PreEvalOutcome};
 pub use error::RuntimeError;
-pub use eval::{Context, Evaluator, RelonFunction, Scope};
-pub use value::Value;
+pub use eval::{Capabilities, Context, Evaluator, NativeFnCaps};
+pub use module::{FilesystemModuleResolver, ModuleResolver, ModuleSource, StdModuleResolver};
+pub use native_fn::{EvaluatedArg, NativeArgs, RelonFunction};
+pub use scope::{ListContext, Scope, Thunk};
+pub use value::{SchemaField, Value, ValueDict};
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use relon_parser::expr::parse_expr;
     use relon_parser::parse_document;
+    use relon_parser::Expr;
     use relon_parser::Span;
 
     fn parse_doc(source: &str) -> relon_parser::Node {
@@ -20,12 +33,8 @@ mod tests {
 
     fn eval_doc(source: &str) -> Result<Value, RuntimeError> {
         let node = parse_doc(source);
-        let ctx = Context::new().with_root(node.clone());
-        let scope = std::sync::Arc::new(Scope {
-            reference_root: ctx.root_node.clone(),
-            ..Default::default()
-        });
-        Evaluator::new(&ctx).eval(&node, &scope)
+        let ctx = Context::new().with_root(node);
+        Evaluator::new(&ctx).eval_root(&std::sync::Arc::new(Scope::default()))
     }
 
     fn assert_number_type_mismatch(source: &str, found_type: &str) {
@@ -260,7 +269,7 @@ mod tests {
         if let Value::Dict(map) = result {
             assert_eq!(
                 map.map.get("keys").unwrap(),
-                &Value::List(vec![
+                &Value::list(vec![
                     Value::String("a".to_string()),
                     Value::String("b".to_string()),
                     Value::String("c".to_string()),
@@ -268,7 +277,7 @@ mod tests {
             );
             assert_eq!(
                 map.map.get("values").unwrap(),
-                &Value::List(vec![Value::Int(1), Value::Int(3), Value::Int(4)])
+                &Value::list(vec![Value::Int(1), Value::Int(3), Value::Int(4)])
             );
             assert_eq!(map.map.get("has_b").unwrap(), &Value::Bool(true));
             assert_eq!(map.map.get("has_z").unwrap(), &Value::Bool(false));
@@ -305,7 +314,7 @@ mod tests {
             assert_eq!(map.map.get("first").unwrap(), &Value::Int(10));
             assert_eq!(
                 map.map.get("compact").unwrap(),
-                &Value::List(vec![Value::Int(1), Value::Int(2)])
+                &Value::list(vec![Value::Int(1), Value::Int(2)])
             );
             assert_eq!(map.map.get("clamped").unwrap(), &Value::Int(10));
             assert_eq!(
@@ -531,7 +540,10 @@ mod tests {
         let ctx = Context::new().with_root(node.clone());
         let result = Evaluator::new(&ctx).eval(&node, &std::sync::Arc::new(Scope::default()));
 
-        assert!(matches!(result, Err(RuntimeError::CircularReference(_))));
+        assert!(matches!(
+            result,
+            Err(RuntimeError::CircularReference { .. })
+        ));
     }
 
     #[test]
@@ -544,7 +556,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             result,
-            Value::List(vec![Value::Int(0), Value::Int(4), Value::Int(8)])
+            Value::list(vec![Value::Int(0), Value::Int(4), Value::Int(8)])
         );
     }
 
@@ -928,7 +940,6 @@ mod tests {
         }
     }
 
-    /*
     #[test]
     fn test_schema_composition_defaults() {
         let result = eval_doc(
@@ -938,16 +949,60 @@ mod tests {
 
             Error e: {}
         }"#,
-        ).unwrap();
+        )
+        .unwrap();
 
         if let Value::Dict(map) = result {
             let e = map.map.get("e").unwrap();
             if let Value::Dict(ed) = e {
-                assert_eq!(ed.map.get("level").unwrap(), &Value::String("error".to_string()));
-            } else { panic!(); }
-        } else { panic!(); }
+                assert_eq!(
+                    ed.map.get("level").unwrap(),
+                    &Value::String("error".to_string())
+                );
+            } else {
+                panic!();
+            }
+        } else {
+            panic!();
+        }
     }
-    */
+
+    #[test]
+    fn test_schema_plus_dict_adds_typed_fields() {
+        // `Schema + Dict_AST` should treat typed entries on the RHS as new
+        // schema fields, not just defaults — so missing required fields fail
+        // validation.
+        let ok = eval_doc(
+            r#"{
+            @schema Base: { String name: * },
+            @schema User: &sibling.Base + { Int age: * },
+
+            User alice: { name: "Alice", age: 30 }
+        }"#,
+        )
+        .unwrap();
+        assert!(matches!(ok, Value::Dict(_)));
+
+        let missing = eval_doc(
+            r#"{
+            @schema Base: { String name: * },
+            @schema User: &sibling.Base + { Int age: * },
+
+            User alice: { name: "Alice" }
+        }"#,
+        );
+        assert!(matches!(missing, Err(RuntimeError::TypeMismatch { .. })));
+
+        let wrong_type = eval_doc(
+            r#"{
+            @schema Base: { String name: * },
+            @schema User: &sibling.Base + { Int age: * },
+
+            User alice: { name: "Alice", age: "thirty" }
+        }"#,
+        );
+        assert!(matches!(wrong_type, Err(RuntimeError::TypeMismatch { .. })));
+    }
 
     #[test]
     fn test_deep_merge() {
@@ -998,6 +1053,46 @@ mod tests {
         } else {
             panic!("Expected Dict");
         }
+    }
+
+    #[test]
+    fn test_schema_composition_and_combines_predicates() {
+        // Base requires `port > 0`; Derived adds `port < 100`.
+        // Both constraints must hold after composition.
+        let ok = eval_doc(
+            r#"{
+            @schema Base: { Int port: (p) => p > 0 },
+            @schema Derived: &sibling.Base + { Int port: (p) => p < 100 },
+
+            Derived in_range: { port: 50 }
+        }"#,
+        )
+        .unwrap();
+        assert!(matches!(ok, Value::Dict(_)));
+
+        // Violates the Derived constraint (port < 100): must fail because
+        // composition is now AND, not "right side wins".
+        let too_high = eval_doc(
+            r#"{
+            @schema Base: { Int port: (p) => p > 0 },
+            @schema Derived: &sibling.Base + { Int port: (p) => p < 100 },
+
+            Derived too_high: { port: 200 }
+        }"#,
+        );
+        assert!(matches!(too_high, Err(RuntimeError::TypeMismatch { .. })));
+
+        // Violates the Base constraint (port > 0): must still fail under
+        // composition — the right-hand `< 100` predicate doesn't shadow it.
+        let negative = eval_doc(
+            r#"{
+            @schema Base: { Int port: (p) => p > 0 },
+            @schema Derived: &sibling.Base + { Int port: (p) => p < 100 },
+
+            Derived negative: { port: -5 }
+        }"#,
+        );
+        assert!(matches!(negative, Err(RuntimeError::TypeMismatch { .. })));
     }
 
     #[test]
@@ -1166,6 +1261,50 @@ mod tests {
     }
 
     #[test]
+    fn test_analyzer_target_agrees_with_evaluator_resolution() {
+        // For a sibling reference, the evaluator's runtime resolution
+        // must produce a value that originates from the very node the
+        // analyzer's `references` table points to. We check this by
+        // comparing the resolved target's evaluation against the
+        // reference site's evaluation — they should be equal.
+        let source = r#"{ a: 10 + 5, b: &sibling.a }"#;
+        let node = parse_doc(source);
+        let analyzed = std::sync::Arc::new(relon_analyzer::analyze(&node));
+
+        // Find the reference site `&sibling.a`'s NodeId.
+        let Expr::Dict(pairs) = &*node.expr else {
+            panic!()
+        };
+        let (_, b_value) = pairs
+            .iter()
+            .find(|(k, _)| k.to_string_key() == "b")
+            .expect("field b");
+        let ref_site_id = b_value.id;
+
+        // Evaluate normally.
+        let ctx = Context::new()
+            .with_root(node.clone())
+            .with_analyzed(analyzed.clone());
+        let eval = Evaluator::new(&ctx);
+        let result = eval
+            .eval_root(&std::sync::Arc::new(Scope::default()))
+            .unwrap();
+        let Value::Dict(d) = result else { panic!() };
+        let b_val = d.map.get("b").unwrap().clone();
+
+        // Pull the analyzer's bound target and evaluate it directly;
+        // the two values must agree.
+        let target_node = eval
+            .context
+            .analyzer_target(ref_site_id)
+            .expect("analyzer should bind &sibling.a");
+        let target_val = eval
+            .eval(&target_node, &std::sync::Arc::new(Scope::default()))
+            .unwrap();
+        assert_eq!(b_val, target_val);
+    }
+
+    #[test]
     fn test_forward_lookahead_next() {
         let result = eval_doc(
             r#"[
@@ -1184,5 +1323,331 @@ mod tests {
         } else {
             panic!("Expected List");
         }
+    }
+}
+
+#[cfg(test)]
+mod sandbox_tests {
+    //! Capability / sandbox layer (Capabilities + FilesystemModuleResolver
+    //! root + step counter + value-size watermark + register_fn_with_caps).
+    //!
+    //! Each test pins one knob; together they pin down the spec from
+    //! `tmp/critical-analysis-round2.md`.
+
+    use super::*;
+    use std::sync::Arc;
+
+    fn parse(source: &str) -> relon_parser::Node {
+        relon_parser::parse_document(source).expect("parse")
+    }
+
+    fn eval_with(ctx: Context, source: &str) -> Result<Value, RuntimeError> {
+        let node = parse(source);
+        let ctx = ctx.with_root(node);
+        Evaluator::new(&ctx).eval_root(&Arc::new(Scope::default()))
+    }
+
+    #[test]
+    fn sandboxed_context_rejects_default_filesystem_imports() {
+        // Sandboxed `Context` ships a default-rejecting filesystem
+        // resolver, so any non-`std/` import must fail with
+        // `CapabilityDenied` before the OS is touched.
+        let dir = std::env::temp_dir().join(format!("relon-sbox-default-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("lib.relon"), r#"{ secret: "leak" }"#).unwrap();
+
+        let node = parse(r#"@import("lib.relon", as="lib") { x: lib.secret }"#);
+        let ctx = Context::sandboxed().with_root(node);
+        let scope = Arc::new(Scope {
+            current_dir: dir.to_string_lossy().to_string(),
+            ..Default::default()
+        });
+        let result = Evaluator::new(&ctx).eval_root(&scope);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            matches!(&result, Err(RuntimeError::CapabilityDenied { name, .. }) if name.contains("@import")),
+            "expected CapabilityDenied, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn filesystem_resolver_with_root_dir_allows_paths_under_root() {
+        let dir = std::env::temp_dir().join(format!("relon-sbox-root-ok-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("lib.relon"), r#"{ value: 42 }"#).unwrap();
+
+        let mut ctx = Context::sandboxed();
+        // Replace the default-rejecting resolver with one rooted at `dir`.
+        ctx.module_resolvers = vec![
+            Arc::new(StdModuleResolver),
+            Arc::new(FilesystemModuleResolver::with_root_dir(&dir)),
+        ];
+        let node = parse(r#"@import("lib.relon", as="lib") { v: lib.value }"#);
+        let ctx = ctx.with_root(node);
+        let scope = Arc::new(Scope {
+            current_dir: dir.to_string_lossy().to_string(),
+            ..Default::default()
+        });
+
+        let result = Evaluator::new(&ctx).eval_root(&scope).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let Value::Dict(d) = result else {
+            panic!("expected dict");
+        };
+        assert_eq!(d.map.get("v").unwrap(), &Value::Int(42));
+    }
+
+    #[test]
+    fn filesystem_resolver_rejects_traversal_outside_root() {
+        // `../escape.relon` resolves outside the configured root after
+        // canonicalization → `CapabilityDenied`, not `IoError`.
+        let outer = std::env::temp_dir().join(format!("relon-sbox-out-{}", std::process::id()));
+        let inner = outer.join("inside");
+        std::fs::create_dir_all(&inner).unwrap();
+        std::fs::write(outer.join("escape.relon"), r#"{ leak: 1 }"#).unwrap();
+
+        let mut ctx = Context::sandboxed();
+        ctx.module_resolvers = vec![
+            Arc::new(StdModuleResolver),
+            Arc::new(FilesystemModuleResolver::with_root_dir(&inner)),
+        ];
+        let node = parse(r#"@import("../escape.relon", as="x") { y: x.leak }"#);
+        let ctx = ctx.with_root(node);
+        let scope = Arc::new(Scope {
+            current_dir: inner.to_string_lossy().to_string(),
+            ..Default::default()
+        });
+        let result = Evaluator::new(&ctx).eval_root(&scope);
+        let _ = std::fs::remove_dir_all(&outer);
+
+        assert!(
+            matches!(&result, Err(RuntimeError::CapabilityDenied { reason, .. }) if reason.contains("escapes")),
+            "expected CapabilityDenied, got {result:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn filesystem_resolver_rejects_symlink_escape() {
+        // A symlink inside the root that points outside it must be rejected
+        // (canonicalization resolves symlinks before the prefix check).
+        let outer = std::env::temp_dir().join(format!("relon-sbox-sym-{}", std::process::id()));
+        let inner = outer.join("inside");
+        std::fs::create_dir_all(&inner).unwrap();
+        std::fs::write(outer.join("target.relon"), r#"{ leak: 1 }"#).unwrap();
+        let link = inner.join("link.relon");
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(outer.join("target.relon"), &link).unwrap();
+
+        let mut ctx = Context::sandboxed();
+        ctx.module_resolvers = vec![
+            Arc::new(StdModuleResolver),
+            Arc::new(FilesystemModuleResolver::with_root_dir(&inner)),
+        ];
+        let node = parse(r#"@import("link.relon", as="x") { y: x.leak }"#);
+        let ctx = ctx.with_root(node);
+        let scope = Arc::new(Scope {
+            current_dir: inner.to_string_lossy().to_string(),
+            ..Default::default()
+        });
+        let result = Evaluator::new(&ctx).eval_root(&scope);
+        let _ = std::fs::remove_dir_all(&outer);
+
+        assert!(
+            matches!(&result, Err(RuntimeError::CapabilityDenied { reason, .. }) if reason.contains("escapes")),
+            "expected CapabilityDenied for symlink escape, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn max_steps_aborts_runaway_recursion() {
+        // Spawn on a thread with a deliberately generous stack so the
+        // step-budget gate has room to fire before debug-build frames
+        // exhaust the platform default (~512KB on macOS test threads).
+        let handle = std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let mut ctx = Context::sandboxed();
+                ctx.capabilities.max_steps = Some(100);
+                eval_with(ctx, r#"{ loop(): loop(), "go": loop() }"#)
+            })
+            .unwrap();
+        let result = handle.join().unwrap();
+        assert!(
+            matches!(result, Err(RuntimeError::StepLimitExceeded { limit: 100, .. })),
+            "expected StepLimitExceeded, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn max_steps_does_not_fire_under_limit() {
+        // Sanity check: a small program well under the budget completes
+        // normally — proves the counter isn't hair-trigger.
+        let mut ctx = Context::sandboxed();
+        ctx.capabilities.max_steps = Some(10_000);
+        let result = eval_with(ctx, r#"{ a: 1, b: 2, c: a + b }"#).unwrap();
+        let Value::Dict(d) = result else {
+            panic!("expected dict")
+        };
+        assert_eq!(d.map.get("c").unwrap(), &Value::Int(3));
+    }
+
+    #[test]
+    fn max_value_bytes_rejects_oversized_list() {
+        // The watermark fires at evaluator-side construction sites
+        // (literal lists, dict-merge, list-comprehension). Stdlib-built
+        // values like `range(...)` aren't gated — by design, since the
+        // host owns those caps. Cover the literal-list path here.
+        let mut ctx = Context::sandboxed();
+        ctx.capabilities.max_value_bytes = Some(3);
+        let result = eval_with(ctx, r#"{ "big": [1, 2, 3, 4, 5] }"#);
+        assert!(
+            matches!(
+                result,
+                Err(RuntimeError::ValueTooLarge {
+                    limit: 3,
+                    actual: 5,
+                    ..
+                })
+            ),
+            "expected ValueTooLarge, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn max_value_bytes_rejects_oversized_dict() {
+        let mut ctx = Context::sandboxed();
+        ctx.capabilities.max_value_bytes = Some(2);
+        let result = eval_with(ctx, r#"{ a: 1, b: 2, c: 3, d: 4 }"#);
+        assert!(
+            matches!(
+                result,
+                Err(RuntimeError::ValueTooLarge {
+                    limit: 2,
+                    actual: 4,
+                    ..
+                })
+            ),
+            "expected ValueTooLarge, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn legacy_register_fn_callable_under_sandbox() {
+        // `register_fn` (no caps) is treated as fully trusted — a
+        // sandboxed Context with an empty `allow_native_fn` set must
+        // still let it through.
+        struct Echo;
+        impl crate::native_fn::RelonFunction for Echo {
+            fn call(
+                &self,
+                args: crate::native_fn::NativeArgs,
+                _range: relon_parser::TokenRange,
+            ) -> Result<Value, RuntimeError> {
+                Ok(args.get(0).cloned().unwrap_or(Value::Null))
+            }
+        }
+
+        let mut ctx = Context::sandboxed();
+        ctx.register_fn("echo", Arc::new(Echo));
+        let result = eval_with(ctx, r#"{ "x": echo(7) }"#).unwrap();
+        let Value::Dict(d) = result else {
+            panic!("expected dict")
+        };
+        assert_eq!(d.map.get("x").unwrap(), &Value::Int(7));
+    }
+
+    #[test]
+    fn register_fn_with_caps_rejected_in_sandbox_without_allowlist() {
+        struct ReadFs;
+        impl crate::native_fn::RelonFunction for ReadFs {
+            fn call(
+                &self,
+                _args: crate::native_fn::NativeArgs,
+                _range: relon_parser::TokenRange,
+            ) -> Result<Value, RuntimeError> {
+                Ok(Value::String("contents".to_string()))
+            }
+        }
+
+        let mut ctx = Context::sandboxed();
+        ctx.register_fn_with_caps("fs.read", NativeFnCaps { reads_fs: true }, Arc::new(ReadFs));
+        let result = eval_with(ctx, r#"{ "data": fs.read() }"#);
+        assert!(
+            matches!(&result, Err(RuntimeError::CapabilityDenied { name, .. }) if name == "fs.read"),
+            "expected CapabilityDenied, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn register_fn_with_caps_permitted_when_in_allowlist() {
+        struct ReadFs;
+        impl crate::native_fn::RelonFunction for ReadFs {
+            fn call(
+                &self,
+                _args: crate::native_fn::NativeArgs,
+                _range: relon_parser::TokenRange,
+            ) -> Result<Value, RuntimeError> {
+                Ok(Value::String("contents".to_string()))
+            }
+        }
+
+        let mut ctx = Context::sandboxed();
+        ctx.capabilities
+            .allow_native_fn
+            .insert("fs.read".to_string());
+        ctx.register_fn_with_caps("fs.read", NativeFnCaps { reads_fs: true }, Arc::new(ReadFs));
+        let result = eval_with(ctx, r#"{ "data": fs.read() }"#).unwrap();
+        let Value::Dict(d) = result else {
+            panic!("expected dict")
+        };
+        assert_eq!(
+            d.map.get("data").unwrap(),
+            &Value::String("contents".to_string())
+        );
+    }
+
+    #[test]
+    fn trusted_context_allows_gated_fns() {
+        // `Context::trusted()` flips `allow_all_native_fn`, so even
+        // `register_fn_with_caps` calls go through without an explicit
+        // allowlist entry.
+        struct ReadFs;
+        impl crate::native_fn::RelonFunction for ReadFs {
+            fn call(
+                &self,
+                _args: crate::native_fn::NativeArgs,
+                _range: relon_parser::TokenRange,
+            ) -> Result<Value, RuntimeError> {
+                Ok(Value::Int(1))
+            }
+        }
+
+        let mut ctx = Context::trusted();
+        ctx.register_fn_with_caps("fs.read", NativeFnCaps { reads_fs: true }, Arc::new(ReadFs));
+        let result = eval_with(ctx, r#"{ "n": fs.read() }"#).unwrap();
+        let Value::Dict(d) = result else {
+            panic!("expected dict")
+        };
+        assert_eq!(d.map.get("n").unwrap(), &Value::Int(1));
+    }
+
+    #[test]
+    fn std_module_resolver_works_under_full_sandbox() {
+        // `std/...` modules are virtual + zero-IO, so they must keep
+        // working even under the strictest sandbox (no fs root, no
+        // native-fn allowlist, etc.).
+        let result = eval_with(
+            Context::sandboxed(),
+            r#"@import("std/list", as="list")
+            { "first": list.first([10, 20, 30]) }"#,
+        )
+        .unwrap();
+        let Value::Dict(d) = result else {
+            panic!("expected dict")
+        };
+        assert_eq!(d.map.get("first").unwrap(), &Value::Int(10));
     }
 }
