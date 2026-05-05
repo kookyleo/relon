@@ -27,7 +27,4 @@ features:
     details: "From JSON-like, to JSON, for JSON——输入语法贴近 JSON，输出永远是普通 JSON。`Projector` trait 让你微调输出形态（如 sum-type 编码风格），但永远落在 JSON 上。"
 ---
 
-<figure style="margin: 3rem auto; max-width: 760px; text-align: center;">
-  <img src="/positioning.svg" alt="Relon two-tier authoring: Platform Team writes schemas/fns/decorators, Business Team imports them and authors entry configs that the relon-evaluator turns into plain JSON for downstream services." style="width: 100%; height: auto;" />
-  <figcaption style="margin-top: 0.75rem; font-size: 0.9rem; color: #64748b; font-style: italic;">双层作者模型：平台团队产出词表，业务团队组合词表，evaluator 输出 JSON。</figcaption>
-</figure>
+<RelonGallery />

@@ -1,0 +1,90 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 640" font-family="ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif">
+<style>
+  .panel { fill: #ffffff; stroke: #cbd5e1; stroke-width: 1; }
+  .head-text { font: 600 13px ui-sans-serif, system-ui, sans-serif; fill: #475569; }
+  .head-tag { font: 600 10.5px ui-sans-serif, system-ui, sans-serif; fill: #7c3aed; letter-spacing: 0.06em; }
+  .divider { stroke: #e2e8f0; stroke-width: 1; }
+  .code { font: 13px ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace; fill: #334155; }
+  .kw { fill: #7c3aed; font-weight: 600; }
+  .str { fill: #16a34a; }
+  .num { fill: #ea580c; }
+  .com { fill: #94a3b8; font-style: italic; }
+  .key { fill: #0369a1; }
+  .arrow { stroke: #94a3b8; stroke-width: 1.6; fill: none; stroke-linecap: round; stroke-linejoin: round; }
+  .arrow-head { fill: #94a3b8; }
+  .arrow-label { font: 600 11px ui-sans-serif, system-ui, sans-serif; fill: #64748b; letter-spacing: 0.06em; }
+  .arrow-sub { font: 10px ui-sans-serif, system-ui, sans-serif; fill: #94a3b8; }
+  .pill { fill: #eff6ff; stroke: #93c5fd; stroke-width: 1; }
+  .pill-text { font: 600 11.5px ui-sans-serif, system-ui, sans-serif; fill: #1e40af; }
+  .consumer-label { font: 600 11px ui-sans-serif, system-ui, sans-serif; fill: #64748b; letter-spacing: 0.04em; }
+  .branch { stroke: #93c5fd; stroke-width: 1.2; fill: none; }
+
+  @media (prefers-color-scheme: dark) {
+    .panel { fill: #1e293b; stroke: #334155; }
+    .head-text { fill: #cbd5e1; }
+    .head-tag { fill: #c4b5fd; }
+    .divider { stroke: #334155; }
+    .code { fill: #cbd5e1; }
+    .kw { fill: #c4b5fd; }
+    .str { fill: #86efac; }
+    .num { fill: #fdba74; }
+    .com { fill: #64748b; }
+    .key { fill: #7dd3fc; }
+    .arrow { stroke: #64748b; }
+    .arrow-head { fill: #64748b; }
+    .arrow-label { fill: #94a3b8; }
+    .arrow-sub { fill: #64748b; }
+    .pill { fill: #1e3a8a; stroke: #3b82f6; }
+    .pill-text { fill: #bfdbfe; }
+    .consumer-label { fill: #94a3b8; }
+    .branch { stroke: #3b82f6; }
+  }
+</style>
+
+<g transform="translate(24, 24)">
+  <rect width="380" height="520" rx="10" class="panel"/>
+  <text x="20" y="28" class="head-text">infra/caddy.relon</text>
+  <text x="360" y="28" text-anchor="end" class="head-tag">LIBRARY</text>
+  <line x1="14" y1="42" x2="366" y2="42" class="divider"/>
+  <text x="20" y="74" class="code" xml:space="preserve"><tspan x="20" dy="0"><tspan class="kw">@library</tspan></tspan><tspan x="20" dy="1.5em">{</tspan><tspan x="20" dy="1.5em">  <tspan class="kw">@schema</tspan> Route: <tspan class="kw">Enum</tspan>&lt;</tspan><tspan x="20" dy="1.5em">    Reverse {</tspan><tspan x="20" dy="1.5em">      String upstream: <tspan class="kw">*</tspan>,</tspan><tspan x="20" dy="1.5em">    },</tspan><tspan x="20" dy="1.5em">    Redirect {</tspan><tspan x="20" dy="1.5em">      String to: <tspan class="kw">*</tspan>,</tspan><tspan x="20" dy="1.5em">      Int code: <tspan class="num">302</tspan>,</tspan><tspan x="20" dy="1.5em">    },</tspan><tspan x="20" dy="1.5em">  &gt;,</tspan><tspan x="20" dy="1.5em">  <tspan class="kw">@schema</tspan> Site: {</tspan><tspan x="20" dy="1.5em">    String host: <tspan class="kw">*</tspan>,</tspan><tspan x="20" dy="1.5em">    [Route] routes: <tspan class="kw">*</tspan>,</tspan><tspan x="20" dy="1.5em">  }</tspan><tspan x="20" dy="1.5em">}</tspan></text>
+</g>
+
+<g transform="translate(450, 24)">
+  <rect width="380" height="520" rx="10" class="panel"/>
+  <text x="20" y="28" class="head-text">sites/main.relon</text>
+  <text x="360" y="28" text-anchor="end" class="head-tag">ENTRY</text>
+  <line x1="14" y1="42" x2="366" y2="42" class="divider"/>
+  <text x="20" y="74" class="code" xml:space="preserve"><tspan x="20" dy="0"><tspan class="kw">@import</tspan> <tspan class="str">"../infra/caddy.relon"</tspan></tspan><tspan x="20" dy="3em">Site api: {</tspan><tspan x="20" dy="1.5em">  host: <tspan class="str">"api.acme.com"</tspan>,</tspan><tspan x="20" dy="1.5em">  routes: [</tspan><tspan x="20" dy="1.5em">    Route.Reverse {</tspan><tspan x="20" dy="1.5em">      upstream:</tspan><tspan x="20" dy="1.5em">        <tspan class="str">"127.0.0.1:8080"</tspan>,</tspan><tspan x="20" dy="1.5em">    },</tspan><tspan x="20" dy="1.5em">  ]</tspan><tspan x="20" dy="1.5em">}</tspan></text>
+</g>
+
+<g transform="translate(876, 24)">
+  <rect width="380" height="520" rx="10" class="panel"/>
+  <text x="20" y="28" class="head-text">caddy.json</text>
+  <text x="360" y="28" text-anchor="end" class="head-tag">JSON</text>
+  <line x1="14" y1="42" x2="366" y2="42" class="divider"/>
+  <text x="20" y="74" class="code" xml:space="preserve"><tspan x="20" dy="0">{</tspan><tspan x="20" dy="1.5em">  <tspan class="key">"api"</tspan>: {</tspan><tspan x="20" dy="1.5em">    <tspan class="key">"host"</tspan>:</tspan><tspan x="20" dy="1.5em">      <tspan class="str">"api.acme.com"</tspan>,</tspan><tspan x="20" dy="1.5em">    <tspan class="key">"routes"</tspan>: [</tspan><tspan x="20" dy="1.5em">      { <tspan class="key">"Reverse"</tspan>: {</tspan><tspan x="20" dy="1.5em">        <tspan class="key">"upstream"</tspan>:</tspan><tspan x="20" dy="1.5em">          <tspan class="str">"127.0.0.1:8080"</tspan></tspan><tspan x="20" dy="1.5em">      }}</tspan><tspan x="20" dy="1.5em">    ]</tspan><tspan x="20" dy="1.5em">  }</tspan><tspan x="20" dy="1.5em">}</tspan></text>
+</g>
+
+<g>
+  <path d="M 410 284 L 444 284" class="arrow"/>
+  <path d="M 450 284 L 442 280 L 442 288 Z" class="arrow-head"/>
+  <text x="427" y="276" text-anchor="middle" class="arrow-label">@import</text>
+</g>
+
+<g>
+  <path d="M 836 284 L 870 284" class="arrow"/>
+  <path d="M 876 284 L 868 280 L 868 288 Z" class="arrow-head"/>
+  <text x="853" y="276" text-anchor="middle" class="arrow-label">EVAL</text>
+  <text x="853" y="300" text-anchor="middle" class="arrow-sub">type-check + sandbox</text>
+</g>
+
+<g>
+  <text x="876" y="582" class="consumer-label">CONSUMED BY</text>
+  <path d="M 1066 544 L 1066 596" class="branch"/>
+  <g transform="translate(1010, 596)">
+    <rect width="112" height="28" rx="14" class="pill"/>
+    <text x="56" y="18" text-anchor="middle" class="pill-text">Caddy POST /load</text>
+  </g>
+</g>
+
+</svg>

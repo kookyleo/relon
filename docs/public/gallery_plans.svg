@@ -1,0 +1,110 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 640" font-family="ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif">
+<style>
+  .panel { fill: #ffffff; stroke: #cbd5e1; stroke-width: 1; }
+  .head-text { font: 600 13px ui-sans-serif, system-ui, sans-serif; fill: #475569; }
+  .head-tag { font: 600 10.5px ui-sans-serif, system-ui, sans-serif; fill: #7c3aed; letter-spacing: 0.06em; }
+  .divider { stroke: #e2e8f0; stroke-width: 1; }
+  .code { font: 13px ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace; fill: #334155; }
+  .kw { fill: #7c3aed; font-weight: 600; }
+  .str { fill: #16a34a; }
+  .num { fill: #ea580c; }
+  .com { fill: #94a3b8; font-style: italic; }
+  .key { fill: #0369a1; }
+  .arrow { stroke: #94a3b8; stroke-width: 1.6; fill: none; stroke-linecap: round; stroke-linejoin: round; }
+  .arrow-head { fill: #94a3b8; }
+  .arrow-label { font: 600 11px ui-sans-serif, system-ui, sans-serif; fill: #64748b; letter-spacing: 0.06em; }
+  .arrow-sub { font: 10px ui-sans-serif, system-ui, sans-serif; fill: #94a3b8; }
+  .pill { fill: #eff6ff; stroke: #93c5fd; stroke-width: 1; }
+  .pill-text { font: 600 11.5px ui-sans-serif, system-ui, sans-serif; fill: #1e40af; }
+  .consumer-label { font: 600 11px ui-sans-serif, system-ui, sans-serif; fill: #64748b; letter-spacing: 0.04em; }
+  .branch { stroke: #93c5fd; stroke-width: 1.2; fill: none; }
+
+  @media (prefers-color-scheme: dark) {
+    .panel { fill: #1e293b; stroke: #334155; }
+    .head-text { fill: #cbd5e1; }
+    .head-tag { fill: #c4b5fd; }
+    .divider { stroke: #334155; }
+    .code { fill: #cbd5e1; }
+    .kw { fill: #c4b5fd; }
+    .str { fill: #86efac; }
+    .num { fill: #fdba74; }
+    .com { fill: #64748b; }
+    .key { fill: #7dd3fc; }
+    .arrow { stroke: #64748b; }
+    .arrow-head { fill: #64748b; }
+    .arrow-label { fill: #94a3b8; }
+    .arrow-sub { fill: #64748b; }
+    .pill { fill: #1e3a8a; stroke: #3b82f6; }
+    .pill-text { fill: #bfdbfe; }
+    .consumer-label { fill: #94a3b8; }
+    .branch { stroke: #3b82f6; }
+  }
+</style>
+
+<!-- LIB panel -->
+<g transform="translate(24, 24)">
+  <rect width="380" height="520" rx="10" class="panel"/>
+  <text x="20" y="28" class="head-text">platform/saas.relon</text>
+  <text x="360" y="28" text-anchor="end" class="head-tag">LIBRARY</text>
+  <line x1="14" y1="42" x2="366" y2="42" class="divider"/>
+  <text x="20" y="74" class="code" xml:space="preserve"><tspan x="20" dy="0"><tspan class="kw">@library</tspan></tspan><tspan x="20" dy="1.5em">{</tspan><tspan x="20" dy="1.5em">  <tspan class="kw">@schema</tspan> Plan: <tspan class="kw">Enum</tspan>&lt;</tspan><tspan x="20" dy="1.5em">    Free,</tspan><tspan x="20" dy="1.5em">    Pro { Int seats: <tspan class="kw">*</tspan> },</tspan><tspan x="20" dy="1.5em">    Enterprise {</tspan><tspan x="20" dy="1.5em">      Int seats: <tspan class="kw">*</tspan>,</tspan><tspan x="20" dy="1.5em">      Bool sso: <tspan class="kw">*</tspan>,</tspan><tspan x="20" dy="1.5em">    },</tspan><tspan x="20" dy="1.5em">  &gt;,</tspan><tspan x="20" dy="1.5em">  <tspan class="kw">@schema</tspan> Tenant: {</tspan><tspan x="20" dy="1.5em">    Plan plan: <tspan class="kw">*</tspan></tspan><tspan x="20" dy="1.5em">  }</tspan><tspan x="20" dy="1.5em">}</tspan></text>
+</g>
+
+<!-- BIZ panel -->
+<g transform="translate(450, 24)">
+  <rect width="380" height="520" rx="10" class="panel"/>
+  <text x="20" y="28" class="head-text">tenants/acme.relon</text>
+  <text x="360" y="28" text-anchor="end" class="head-tag">ENTRY</text>
+  <line x1="14" y1="42" x2="366" y2="42" class="divider"/>
+  <text x="20" y="74" class="code" xml:space="preserve"><tspan x="20" dy="0"><tspan class="kw">@import</tspan> <tspan class="str">"../platform/saas.relon"</tspan></tspan><tspan x="20" dy="3em">Tenant acme: {</tspan><tspan x="20" dy="1.5em">  plan: Plan.Enterprise {</tspan><tspan x="20" dy="1.5em">    seats: <tspan class="num">200</tspan>,</tspan><tspan x="20" dy="1.5em">    sso: <tspan class="num">true</tspan>,</tspan><tspan x="20" dy="1.5em">  }</tspan><tspan x="20" dy="1.5em">}</tspan></text>
+</g>
+
+<!-- OUT panel -->
+<g transform="translate(876, 24)">
+  <rect width="380" height="520" rx="10" class="panel"/>
+  <text x="20" y="28" class="head-text">acme_runtime.json</text>
+  <text x="360" y="28" text-anchor="end" class="head-tag">JSON</text>
+  <line x1="14" y1="42" x2="366" y2="42" class="divider"/>
+  <text x="20" y="74" class="code" xml:space="preserve"><tspan x="20" dy="0">{</tspan><tspan x="20" dy="1.5em">  <tspan class="key">"acme"</tspan>: {</tspan><tspan x="20" dy="1.5em">    <tspan class="key">"plan"</tspan>: {</tspan><tspan x="20" dy="1.5em">      <tspan class="key">"Enterprise"</tspan>: {</tspan><tspan x="20" dy="1.5em">        <tspan class="key">"seats"</tspan>: <tspan class="num">200</tspan>,</tspan><tspan x="20" dy="1.5em">        <tspan class="key">"sso"</tspan>: <tspan class="num">true</tspan></tspan><tspan x="20" dy="1.5em">      }</tspan><tspan x="20" dy="1.5em">    }</tspan><tspan x="20" dy="1.5em">  }</tspan><tspan x="20" dy="1.5em">}</tspan></text>
+</g>
+
+<!-- Arrow LIB → BIZ -->
+<g>
+  <path d="M 410 284 L 444 284" class="arrow"/>
+  <path d="M 450 284 L 442 280 L 442 288 Z" class="arrow-head"/>
+  <text x="427" y="276" text-anchor="middle" class="arrow-label">@import</text>
+</g>
+
+<!-- Arrow BIZ → OUT -->
+<g>
+  <path d="M 836 284 L 870 284" class="arrow"/>
+  <path d="M 876 284 L 868 280 L 868 288 Z" class="arrow-head"/>
+  <text x="853" y="276" text-anchor="middle" class="arrow-label">EVAL</text>
+  <text x="853" y="300" text-anchor="middle" class="arrow-sub">type-check + sandbox</text>
+</g>
+
+<!-- Consumer band under OUT -->
+<g>
+  <text x="876" y="582" class="consumer-label">CONSUMED BY</text>
+  <!-- Branches from OUT bottom-center down to pills -->
+  <path d="M 1066 544 L 1066 558" class="branch"/>
+  <path d="M 922 558 L 1210 558" class="branch"/>
+  <path d="M 922 558 L 922 596" class="branch"/>
+  <path d="M 1066 558 L 1066 596" class="branch"/>
+  <path d="M 1210 558 L 1210 596" class="branch"/>
+  <!-- Pills -->
+  <g transform="translate(880, 596)">
+    <rect width="84" height="28" rx="14" class="pill"/>
+    <text x="42" y="18" text-anchor="middle" class="pill-text">Auth</text>
+  </g>
+  <g transform="translate(1024, 596)">
+    <rect width="84" height="28" rx="14" class="pill"/>
+    <text x="42" y="18" text-anchor="middle" class="pill-text">Billing</text>
+  </g>
+  <g transform="translate(1168, 596)">
+    <rect width="84" height="28" rx="14" class="pill"/>
+    <text x="42" y="18" text-anchor="middle" class="pill-text">Webhook</text>
+  </g>
+</g>
+
+</svg>
