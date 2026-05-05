@@ -1,4 +1,4 @@
-use crate::eval::Scope;
+use crate::scope::Scope;
 use ordered_float::OrderedFloat;
 use relon_parser::Node;
 use serde::{Deserialize, Serialize};
@@ -9,6 +9,16 @@ use std::sync::Arc;
 pub struct ValueDict {
     pub map: BTreeMap<String, Value>,
     pub brand: Option<String>,
+}
+
+impl ValueDict {
+    pub fn new(map: BTreeMap<String, Value>) -> Self {
+        Self { map, brand: None }
+    }
+
+    pub fn with_brand(map: BTreeMap<String, Value>, brand: Option<String>) -> Self {
+        Self { map, brand }
+    }
 }
 
 impl Serialize for ValueDict {
@@ -39,11 +49,28 @@ impl PartialEq for ValueDict {
 #[derive(Debug, PartialEq, Clone)]
 pub struct SchemaField {
     pub type_hint: relon_parser::TypeNode,
-    pub predicate: Value,
+    /// Predicates that the field's value must satisfy.
+    ///
+    /// Multiple predicates are AND-combined at validation time. `Wildcard`
+    /// entries are skipped. Stored as a `Vec` (rather than a single `Value`)
+    /// so `Schema + Schema` composition can accumulate constraints from both
+    /// sides instead of letting the right-hand operand silently overwrite the
+    /// left.
+    pub predicates: Vec<Value>,
     pub custom_error: Option<String>,
     pub default_value: Option<Value>,
 }
 
+/// Aggregate value type produced by the evaluator.
+///
+/// `List` and `Dict` payloads are reference-counted: cloning a `Value::List`
+/// or `Value::Dict` only bumps an `Arc` and does not copy the underlying
+/// collection. Mutations go through `Arc::make_mut` (see [`Value::list_mut`]
+/// and [`Value::dict_mut`]), which clones the inner value lazily on first
+/// write — so existing aliases keep their snapshot semantics. This matters
+/// because the evaluator caches resolved paths and module results in shared
+/// `path_cache`/`module_cache` maps; without `Arc`-sharing every cache hit
+/// would deep-clone the cached structure.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum Value {
@@ -52,8 +79,8 @@ pub enum Value {
     Int(i64),
     Float(OrderedFloat<f64>),
     String(String),
-    List(Vec<Value>),
-    Dict(ValueDict),
+    List(Arc<Vec<Value>>),
+    Dict(Arc<ValueDict>),
     /// A unified closure (can be used as a function or a decorator)
     #[serde(skip)]
     Closure {
@@ -102,6 +129,43 @@ impl PartialEq for Value {
 }
 
 impl Value {
+    /// Build a `Value::List` from a `Vec`, taking ownership and wrapping it
+    /// in `Arc` so subsequent clones are O(1).
+    pub fn list(items: Vec<Value>) -> Self {
+        Self::List(Arc::new(items))
+    }
+
+    /// Build a `Value::Dict` from a `BTreeMap`. Use [`Value::branded_dict`]
+    /// when the dict carries a nominal-type brand.
+    pub fn dict(map: BTreeMap<String, Value>) -> Self {
+        Self::Dict(Arc::new(ValueDict { map, brand: None }))
+    }
+
+    /// Build a `Value::Dict` with an explicit brand (the typed-dict tag set
+    /// after a successful `User x: { ... }` validation, etc.).
+    pub fn branded_dict(map: BTreeMap<String, Value>, brand: Option<String>) -> Self {
+        Self::Dict(Arc::new(ValueDict { map, brand }))
+    }
+
+    /// In-place mutable handle to a `Value::List`'s inner `Vec`. Clones the
+    /// inner allocation only if the `Arc` is shared with another holder.
+    /// Returns `None` for non-list values.
+    pub fn list_mut(&mut self) -> Option<&mut Vec<Value>> {
+        match self {
+            Value::List(arc) => Some(Arc::make_mut(arc)),
+            _ => None,
+        }
+    }
+
+    /// In-place mutable handle to a `Value::Dict`'s inner [`ValueDict`].
+    /// CoW semantics — see [`Value::list_mut`].
+    pub fn dict_mut(&mut self) -> Option<&mut ValueDict> {
+        match self {
+            Value::Dict(arc) => Some(Arc::make_mut(arc)),
+            _ => None,
+        }
+    }
+
     pub fn is_truthy(&self) -> bool {
         match self {
             Value::Null => false,
@@ -137,6 +201,7 @@ impl Value {
     pub fn deep_merge(&mut self, patch: &Value) {
         match (self, patch) {
             (Value::Dict(base), Value::Dict(patch)) => {
+                let base = Arc::make_mut(base);
                 for (k, v) in &patch.map {
                     if v == &Value::Null {
                         base.map.remove(k);
@@ -151,7 +216,13 @@ impl Value {
                 for (k, v) in patch_fields {
                     if let Some(base_field) = base_fields.get_mut(k) {
                         base_field.type_hint = v.type_hint.clone();
-                        base_field.predicate = v.predicate.clone();
+                        // AND-merge predicates rather than overwrite, mirroring
+                        // the static `extract_schema_for_node` composition path.
+                        for pred in &v.predicates {
+                            if !matches!(pred, Value::Wildcard) {
+                                base_field.predicates.push(pred.clone());
+                            }
+                        }
                         if v.custom_error.is_some() {
                             base_field.custom_error = v.custom_error.clone();
                         }

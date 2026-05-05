@@ -1,0 +1,219 @@
+//! Lexical and runtime context shared across evaluation steps.
+//!
+//! `Scope` is the single carrier of evaluator state: it walks down through the
+//! AST, threads imported bindings, anchors `&root`/`&sibling` lookups, and
+//! holds the lazy-evaluation thunk table. It is wrapped in `Arc` everywhere so
+//! children can be derived cheaply via [`Scope::child`] and friends.
+
+use crate::value::Value;
+use relon_parser::Node;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
+/// Iteration context for `&prev` / `&next` / `&index` references inside a list.
+pub struct ListContext {
+    pub index: usize,
+    pub elements: Vec<Arc<Thunk>>,
+}
+
+/// Single environment frame. Cheap to derive (every field is either `Clone` or
+/// already wrapped in `Arc` / `Mutex`); deliberately wrapped in `Arc<Scope>` at
+/// every call site so backtracking through `parent` doesn't require copies.
+#[derive(Default)]
+pub struct Scope {
+    /// Enclosing scope. `None` only at the document root.
+    pub parent: Option<Arc<Scope>>,
+    /// Most-recent path segment opened by [`Scope::with_path`] /
+    /// [`Scope::with_list_context`]; `&sibling` / `&uncle` peel these off when
+    /// rebuilding the relative target path.
+    pub path_node: Option<String>,
+    /// Bindings introduced inside this frame (closure params, comprehension
+    /// loop vars, `where` clauses, imported aliases).
+    pub locals: Mutex<HashMap<String, Value>>,
+    /// Working directory used when resolving relative `@import` paths.
+    pub current_dir: String,
+    /// Stable namespace for the path cache; usually the canonical id of the
+    /// surrounding module so different modules can't collide on identical
+    /// paths.
+    pub cache_namespace: String,
+    /// AST node that `&root` should resolve against.
+    pub reference_root: Option<Arc<Node>>,
+    /// Fallback `parent` to use when [`crate::eval::Evaluator`] has to
+    /// synthesize a root scope on the fly (e.g. inside a closure body that
+    /// hasn't entered its dict yet).
+    pub reference_root_parent: Option<Arc<Scope>>,
+    /// Pre-built scope already pinned at `reference_root`; set by the dict
+    /// branch of `eval_internal` once `is_root` triggers.
+    pub reference_root_scope: Option<Arc<Scope>>,
+    /// Active list iteration, if any.
+    pub list_context: Option<Arc<ListContext>>,
+    /// Lazily-resolved bindings for the dict that owns this scope. Kept
+    /// `pub(crate)` so the evaluator can register and force them, but hidden
+    /// from host code.
+    pub(crate) thunks: Mutex<HashMap<String, Arc<Thunk>>>,
+}
+
+impl std::fmt::Debug for Scope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Scope")
+            .field("path_node", &self.path_node)
+            .field("current_dir", &self.current_dir)
+            .field("cache_namespace", &self.cache_namespace)
+            .field("has_reference_root", &self.reference_root.is_some())
+            .field("index", &self.list_context.as_ref().map(|c| c.index))
+            .finish()
+    }
+}
+
+impl Clone for Scope {
+    fn clone(&self) -> Self {
+        Self {
+            parent: self.parent.clone(),
+            path_node: self.path_node.clone(),
+            locals: Mutex::new(self.locals.lock().unwrap().clone()),
+            current_dir: self.current_dir.clone(),
+            cache_namespace: self.cache_namespace.clone(),
+            reference_root: self.reference_root.clone(),
+            reference_root_parent: self.reference_root_parent.clone(),
+            reference_root_scope: self.reference_root_scope.clone(),
+            list_context: self.list_context.clone(),
+            thunks: Mutex::new(self.thunks.lock().unwrap().clone()),
+        }
+    }
+}
+
+impl Scope {
+    /// Look up `name` in this scope's locals, walking up `parent` chain.
+    pub fn get_local(&self, name: &str) -> Option<Value> {
+        if let Some(v) = self.locals.lock().unwrap().get(name) {
+            Some(v.clone())
+        } else if let Some(parent) = &self.parent {
+            parent.get_local(name)
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn get_thunk(&self, name: &str) -> Option<Arc<Thunk>> {
+        if let Some(thunk) = self.thunks.lock().unwrap().get(name) {
+            Some(Arc::clone(thunk))
+        } else if let Some(parent) = &self.parent {
+            parent.get_thunk(name)
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn get_own_thunk(&self, name: &str) -> Option<Arc<Thunk>> {
+        self.thunks.lock().unwrap().get(name).map(Arc::clone)
+    }
+
+    /// Reconstruct the path from the document root to the current scope by
+    /// walking `parent` pointers and collecting `path_node` segments.
+    pub fn full_path(&self) -> Vec<String> {
+        let mut path = Vec::new();
+        let mut current = Some(self);
+        while let Some(scope) = current {
+            if let Some(node) = &scope.path_node {
+                path.push(node.clone());
+            }
+            current = scope.parent.as_deref();
+        }
+        path.reverse();
+        path
+    }
+
+    /// Build a stable cache key for `path` under this scope's namespace.
+    pub(crate) fn path_cache_key(&self, path: &[String]) -> String {
+        let namespace = if self.cache_namespace.is_empty() {
+            &self.current_dir
+        } else {
+            &self.cache_namespace
+        };
+        let encoded_path = path
+            .iter()
+            .map(|s| format!("{}:{}", s.len(), s))
+            .collect::<Vec<_>>()
+            .join("/");
+        format!("{namespace}::{encoded_path}")
+    }
+
+    /// Open a fresh child frame inheriting flow-state fields (`current_dir`,
+    /// `cache_namespace`, `reference_root*`, `list_context`) from `self` but
+    /// with empty `locals`/`thunks` and no `path_node`.
+    ///
+    /// This is the workhorse for every new lexical block — Dict body,
+    /// comprehension iteration, closure body. The `with_*` methods below all
+    /// build on top of it and only differ by which field they override.
+    pub fn child(self: &Arc<Self>) -> Arc<Self> {
+        Arc::new(Self {
+            parent: Some(Arc::clone(self)),
+            path_node: None,
+            locals: Mutex::new(HashMap::new()),
+            current_dir: self.current_dir.clone(),
+            cache_namespace: self.cache_namespace.clone(),
+            reference_root: self.reference_root.clone(),
+            reference_root_parent: self.reference_root_parent.clone(),
+            reference_root_scope: self.reference_root_scope.clone(),
+            list_context: self.list_context.clone(),
+            thunks: Mutex::new(HashMap::new()),
+        })
+    }
+
+    pub fn with_local(self: &Arc<Self>, name: String, val: Value) -> Arc<Self> {
+        let child = self.child();
+        child.locals.lock().unwrap().insert(name, val);
+        child
+    }
+
+    pub fn with_locals(self: &Arc<Self>, new_locals: HashMap<String, Value>) -> Arc<Self> {
+        let child = self.child();
+        *child.locals.lock().unwrap() = new_locals;
+        child
+    }
+
+    pub fn with_path(self: &Arc<Self>, node: String) -> Arc<Self> {
+        let mut child = self.child();
+        // `child()` returns Arc with no other strong references yet, so this
+        // get_mut is safe.
+        Arc::get_mut(&mut child)
+            .expect("freshly built child has no aliases")
+            .path_node = Some(node);
+        child
+    }
+
+    pub fn with_list_context(
+        self: &Arc<Self>,
+        index: usize,
+        elements: Vec<Arc<Thunk>>,
+    ) -> Arc<Self> {
+        let mut child = self.child();
+        let unique = Arc::get_mut(&mut child).expect("freshly built child has no aliases");
+        unique.path_node = Some(index.to_string());
+        unique.list_context = Some(Arc::new(ListContext { index, elements }));
+        child
+    }
+}
+
+/// A lazily-evaluated dict entry. The first access through
+/// `Evaluator::force_thunk` parses + evaluates `node` against `scope` and
+/// caches the result in `value`; later accesses return the cached value.
+pub struct Thunk {
+    pub(crate) node: Node,
+    pub(crate) scope: Arc<Scope>,
+    pub(crate) path: Vec<String>,
+    pub(crate) cache_key: String,
+    pub(crate) value: Mutex<Option<Value>>,
+}
+
+impl Thunk {
+    pub(crate) fn new(node: Node, scope: Arc<Scope>, path: Vec<String>, cache_key: String) -> Self {
+        Self {
+            node,
+            scope,
+            path,
+            cache_key,
+            value: Mutex::new(None),
+        }
+    }
+}

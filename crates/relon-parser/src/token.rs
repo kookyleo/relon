@@ -1,5 +1,32 @@
 use ordered_float::OrderedFloat;
 use std::fmt::{Display, Formatter};
+use std::sync::atomic::{AtomicU32, Ordering};
+
+/// Stable identifier assigned to every `Node` at parse time.
+///
+/// Used as the key in side-tables maintained by `relon-analyzer` (resolved
+/// references, desugar caches, diagnostics) so analyzer passes can attach
+/// information without mutating the AST itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct NodeId(pub u32);
+
+impl NodeId {
+    /// Sentinel id for synthetic nodes built outside the parser (e.g. by
+    /// the evaluator when fabricating a `Type` node mid-flight). Analyzer
+    /// side-tables must not key on this value.
+    pub const SYNTHETIC: NodeId = NodeId(0);
+
+    /// Allocate a fresh, process-wide-unique id.
+    ///
+    /// Public so AST rewriters outside the parser (analyzer, evaluator
+    /// fabricated nodes, host transforms) can mint ids that won't collide
+    /// with parser-emitted ones.
+    pub fn alloc() -> NodeId {
+        // Start at 1 so `SYNTHETIC` (0) stays distinct from any real node.
+        static COUNTER: AtomicU32 = AtomicU32::new(1);
+        NodeId(COUNTER.fetch_add(1, Ordering::Relaxed))
+    }
+}
 
 #[derive(Debug, PartialEq, Clone, Eq, Copy, Default, Hash)]
 pub struct TokenPosition {
@@ -94,17 +121,47 @@ pub struct ClosureParam {
     pub range: TokenRange,
 }
 
-#[derive(Debug, PartialEq, Clone)]
+#[derive(Debug, Clone)]
 pub struct Node {
+    /// Stable identity assigned at construction. Analyzer side-tables key
+    /// off this; not part of structural equality.
+    pub id: NodeId,
     pub expr: Box<Expr>,
     pub decorators: Vec<Decorator>,
     pub type_hint: Option<TypeNode>,
     pub range: TokenRange,
 }
 
+/// Structural equality only — `id` is intentionally excluded so two
+/// independently-parsed-but-identical AST fragments still compare equal.
+/// This matters for `Value::Closure` PartialEq (compares `body: Node`) and
+/// for parser tests that round-trip syntactic shape.
+impl PartialEq for Node {
+    fn eq(&self, other: &Self) -> bool {
+        self.expr == other.expr
+            && self.decorators == other.decorators
+            && self.type_hint == other.type_hint
+            && self.range == other.range
+    }
+}
+
 impl Node {
     pub fn new(expr: Expr, range: TokenRange) -> Self {
         Self {
+            id: NodeId::alloc(),
+            expr: Box::new(expr),
+            decorators: Vec::new(),
+            type_hint: None,
+            range,
+        }
+    }
+
+    /// Construct a `Node` with a caller-supplied `NodeId`. Used by tests
+    /// and (rarely) by AST rewriters that want to preserve the original
+    /// node's identity after a structural transform.
+    pub fn with_id(id: NodeId, expr: Expr, range: TokenRange) -> Self {
+        Self {
+            id,
             expr: Box::new(expr),
             decorators: Vec::new(),
             type_hint: None,

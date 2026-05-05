@@ -5,6 +5,9 @@ hero:
   name: "Relon"
   text: "The Next-Gen Configuration Language"
   tagline: "A production-grade, strongly-typed configuration language and UI template engine with dynamic pathing, nominal polymorphism, and recursive computational constraints."
+  image:
+    src: /logo.svg
+    alt: Relon
   actions:
     - theme: brand
       text: Get Started

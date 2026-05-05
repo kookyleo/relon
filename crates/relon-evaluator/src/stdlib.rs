@@ -1,5 +1,6 @@
 use crate::error::RuntimeError;
-use crate::eval::{Context, RelonFunction};
+use crate::eval::Context;
+use crate::native_fn::{NativeArgs, RelonFunction};
 use crate::value::{Value, ValueDict};
 use std::sync::Arc;
 
@@ -40,9 +41,10 @@ struct Len;
 impl RelonFunction for Len {
     fn call(
         &self,
-        args: Vec<Value>,
+        args: NativeArgs,
         range: relon_parser::TokenRange,
     ) -> Result<Value, RuntimeError> {
+        let args = args.into_positional();
         if args.len() != 1 {
             return Err(RuntimeError::TypeMismatch {
                 expected: "1 argument".to_string(),
@@ -67,9 +69,10 @@ struct Range;
 impl RelonFunction for Range {
     fn call(
         &self,
-        args: Vec<Value>,
+        args: NativeArgs,
         range: relon_parser::TokenRange,
     ) -> Result<Value, RuntimeError> {
+        let args = args.into_positional();
         let (start, end) = match args.len() {
             1 => (0, expect_int(&args[0], range)?),
             2 => (expect_int(&args[0], range)?, expect_int(&args[1], range)?),
@@ -81,7 +84,7 @@ impl RelonFunction for Range {
                 })
             }
         };
-        Ok(Value::List((start..end).map(Value::Int).collect()))
+        Ok(Value::list((start..end).map(Value::Int).collect()))
     }
 }
 
@@ -100,9 +103,10 @@ struct Type;
 impl RelonFunction for Type {
     fn call(
         &self,
-        args: Vec<Value>,
+        args: NativeArgs,
         range: relon_parser::TokenRange,
     ) -> Result<Value, RuntimeError> {
+        let args = args.into_positional();
         if args.len() != 1 {
             return Err(RuntimeError::TypeMismatch {
                 expected: "1 arg".to_string(),
@@ -120,9 +124,10 @@ macro_rules! type_validator {
         impl RelonFunction for $struct_name {
             fn call(
                 &self,
-                args: Vec<Value>,
+                args: NativeArgs,
                 range: relon_parser::TokenRange,
             ) -> Result<Value, RuntimeError> {
+                let args = args.into_positional();
                 if !(1..=2).contains(&args.len()) {
                     return Err(RuntimeError::TypeMismatch {
                         expected: "1 or 2 args (value, message?)".to_string(),
@@ -160,9 +165,10 @@ struct ValidatorMin;
 impl RelonFunction for ValidatorMin {
     fn call(
         &self,
-        args: Vec<Value>,
+        args: NativeArgs,
         range: relon_parser::TokenRange,
     ) -> Result<Value, RuntimeError> {
+        let args = args.into_positional();
         if !(2..=3).contains(&args.len()) {
             return Err(RuntimeError::TypeMismatch {
                 expected: "2 or 3 args (value, min, message?)".to_string(),
@@ -204,9 +210,10 @@ struct ValidatorMax;
 impl RelonFunction for ValidatorMax {
     fn call(
         &self,
-        args: Vec<Value>,
+        args: NativeArgs,
         range: relon_parser::TokenRange,
     ) -> Result<Value, RuntimeError> {
+        let args = args.into_positional();
         if !(2..=3).contains(&args.len()) {
             return Err(RuntimeError::TypeMismatch {
                 expected: "2 or 3 args (value, max, message?)".to_string(),
@@ -248,9 +255,10 @@ struct ValidatorOneOf;
 impl RelonFunction for ValidatorOneOf {
     fn call(
         &self,
-        args: Vec<Value>,
+        args: NativeArgs,
         range: relon_parser::TokenRange,
     ) -> Result<Value, RuntimeError> {
+        let args = args.into_positional();
         if !(2..=3).contains(&args.len()) {
             return Err(RuntimeError::TypeMismatch {
                 expected: "2 or 3 args (value, list, message?)".to_string(),
@@ -285,9 +293,10 @@ struct RequiredFields;
 impl RelonFunction for RequiredFields {
     fn call(
         &self,
-        args: Vec<Value>,
+        args: NativeArgs,
         range: relon_parser::TokenRange,
     ) -> Result<Value, RuntimeError> {
+        let args = args.into_positional();
         if !(2..=3).contains(&args.len()) {
             return Err(RuntimeError::TypeMismatch {
                 expected: "2 or 3 args (dict, fields, message?)".to_string(),
@@ -319,9 +328,10 @@ struct Requires;
 impl RelonFunction for Requires {
     fn call(
         &self,
-        args: Vec<Value>,
+        args: NativeArgs,
         range: relon_parser::TokenRange,
     ) -> Result<Value, RuntimeError> {
+        let args = args.into_positional();
         if !(3..=4).contains(&args.len()) {
             return Err(RuntimeError::TypeMismatch {
                 expected: "3 or 4 args (dict, field, required_field, message?)".to_string(),
@@ -353,9 +363,10 @@ struct FieldEq;
 impl RelonFunction for FieldEq {
     fn call(
         &self,
-        args: Vec<Value>,
+        args: NativeArgs,
         range: relon_parser::TokenRange,
     ) -> Result<Value, RuntimeError> {
+        let args = args.into_positional();
         if !(3..=4).contains(&args.len()) {
             return Err(RuntimeError::TypeMismatch {
                 expected: "3 or 4 args (dict, left_field, right_field, message?)".to_string(),
@@ -385,9 +396,10 @@ struct StringSplit;
 impl RelonFunction for StringSplit {
     fn call(
         &self,
-        args: Vec<Value>,
+        args: NativeArgs,
         range: relon_parser::TokenRange,
     ) -> Result<Value, RuntimeError> {
+        let args = args.into_positional();
         expect_arg_count(&args, 2, range)?;
         let input = expect_string(&args[0], range)?;
         let separator = expect_string(&args[1], range)?;
@@ -397,7 +409,7 @@ impl RelonFunction for StringSplit {
                 range,
             ));
         }
-        Ok(Value::List(
+        Ok(Value::list(
             input
                 .split(separator)
                 .map(|part| Value::String(part.to_string()))
@@ -410,9 +422,10 @@ struct StringJoin;
 impl RelonFunction for StringJoin {
     fn call(
         &self,
-        args: Vec<Value>,
+        args: NativeArgs,
         range: relon_parser::TokenRange,
     ) -> Result<Value, RuntimeError> {
+        let args = args.into_positional();
         expect_arg_count(&args, 2, range)?;
         let values = expect_list(&args[0], range)?;
         let separator = expect_string(&args[1], range)?;
@@ -428,9 +441,10 @@ struct StringReplace;
 impl RelonFunction for StringReplace {
     fn call(
         &self,
-        args: Vec<Value>,
+        args: NativeArgs,
         range: relon_parser::TokenRange,
     ) -> Result<Value, RuntimeError> {
+        let args = args.into_positional();
         expect_arg_count(&args, 3, range)?;
         Ok(Value::String(expect_string(&args[0], range)?.replace(
             expect_string(&args[1], range)?,
@@ -443,9 +457,10 @@ struct StringUpper;
 impl RelonFunction for StringUpper {
     fn call(
         &self,
-        args: Vec<Value>,
+        args: NativeArgs,
         range: relon_parser::TokenRange,
     ) -> Result<Value, RuntimeError> {
+        let args = args.into_positional();
         expect_arg_count(&args, 1, range)?;
         Ok(Value::String(
             expect_string(&args[0], range)?.to_uppercase(),
@@ -457,9 +472,10 @@ struct StringLower;
 impl RelonFunction for StringLower {
     fn call(
         &self,
-        args: Vec<Value>,
+        args: NativeArgs,
         range: relon_parser::TokenRange,
     ) -> Result<Value, RuntimeError> {
+        let args = args.into_positional();
         expect_arg_count(&args, 1, range)?;
         Ok(Value::String(
             expect_string(&args[0], range)?.to_lowercase(),
@@ -471,9 +487,10 @@ struct StringContains;
 impl RelonFunction for StringContains {
     fn call(
         &self,
-        args: Vec<Value>,
+        args: NativeArgs,
         range: relon_parser::TokenRange,
     ) -> Result<Value, RuntimeError> {
+        let args = args.into_positional();
         expect_arg_count(&args, 2, range)?;
         Ok(Value::Bool(
             expect_string(&args[0], range)?.contains(expect_string(&args[1], range)?),
@@ -485,9 +502,10 @@ struct DictMerge;
 impl RelonFunction for DictMerge {
     fn call(
         &self,
-        args: Vec<Value>,
+        args: NativeArgs,
         range: relon_parser::TokenRange,
     ) -> Result<Value, RuntimeError> {
+        let args = args.into_positional();
         if args.is_empty() {
             return Err(RuntimeError::TypeMismatch {
                 expected: "at least 1 argument".to_string(),
@@ -515,9 +533,10 @@ struct DictKeys;
 impl RelonFunction for DictKeys {
     fn call(
         &self,
-        args: Vec<Value>,
+        args: NativeArgs,
         range: relon_parser::TokenRange,
     ) -> Result<Value, RuntimeError> {
+        let args = args.into_positional();
         expect_arg_count(&args, 1, range)?;
         let mut keys = expect_dict(&args[0], range)?
             .map
@@ -525,7 +544,7 @@ impl RelonFunction for DictKeys {
             .cloned()
             .collect::<Vec<_>>();
         keys.sort();
-        Ok(Value::List(keys.into_iter().map(Value::String).collect()))
+        Ok(Value::list(keys.into_iter().map(Value::String).collect()))
     }
 }
 
@@ -533,14 +552,15 @@ struct DictValues;
 impl RelonFunction for DictValues {
     fn call(
         &self,
-        args: Vec<Value>,
+        args: NativeArgs,
         range: relon_parser::TokenRange,
     ) -> Result<Value, RuntimeError> {
+        let args = args.into_positional();
         expect_arg_count(&args, 1, range)?;
         let dict = expect_dict(&args[0], range)?;
         let mut keys = dict.map.keys().cloned().collect::<Vec<_>>();
         keys.sort();
-        Ok(Value::List(
+        Ok(Value::list(
             keys.into_iter()
                 .filter_map(|key| dict.map.get(&key).cloned())
                 .collect(),
@@ -552,9 +572,10 @@ struct DictHasKey;
 impl RelonFunction for DictHasKey {
     fn call(
         &self,
-        args: Vec<Value>,
+        args: NativeArgs,
         range: relon_parser::TokenRange,
     ) -> Result<Value, RuntimeError> {
+        let args = args.into_positional();
         expect_arg_count(&args, 2, range)?;
         Ok(Value::Bool(
             expect_dict(&args[0], range)?
@@ -568,9 +589,10 @@ struct ListContains;
 impl RelonFunction for ListContains {
     fn call(
         &self,
-        args: Vec<Value>,
+        args: NativeArgs,
         range: relon_parser::TokenRange,
     ) -> Result<Value, RuntimeError> {
+        let args = args.into_positional();
         expect_arg_count(&args, 2, range)?;
         Ok(Value::Bool(
             expect_list(&args[0], range)?.contains(&args[1]),

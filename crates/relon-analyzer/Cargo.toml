@@ -1,0 +1,11 @@
+[package]
+name = "relon-analyzer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Semantic analysis layer for the relon language: name resolution, schema desugar, diagnostics"
+
+[dependencies]
+relon-parser = { path = "../relon-parser" }
+miette = { version = "7.6.0", features = ["derive"] }
+thiserror = "1.0"

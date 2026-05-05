@@ -5,6 +5,9 @@ hero:
   name: "Relon"
   text: "下一代强类型配置语言"
   tagline: "一个专为现代 Web 和工业级应用设计的配置语言与 UI 模板引擎。它融合了 JSON 的极简美学、完备的表达式能力，以及名义类型系统（Nominal Types）。"
+  image:
+    src: /logo.svg
+    alt: Relon
   actions:
     - theme: brand
       text: 快速开始

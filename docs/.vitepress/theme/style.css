@@ -1,0 +1,8 @@
+:root {
+  --vp-nav-logo-height: 20px;
+}
+
+.VPNavBarTitle .title {
+  font-size: 20px;
+  font-weight: 700;
+}

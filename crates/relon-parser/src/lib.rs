@@ -181,6 +181,7 @@ pub fn parse_base<'a>(input: &mut Span<'a>) -> ModalResult<Node> {
     let range = create_range(input, start_offset, end_offset);
 
     Ok(Node {
+        id: NodeId::alloc(),
         expr: root.expr,
         decorators,
         type_hint: None,

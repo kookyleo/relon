@@ -1,14 +1,20 @@
 [package]
-name = "relon"
+name = "relon-lsp"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Public API facade for the Relon language"
+description = "Language Server Protocol implementation for Relon (parse + analyze + diagnostics)"
+
+[[bin]]
+name = "relon-lsp"
+path = "src/main.rs"
 
 [dependencies]
-relon-evaluator = { path = "../relon-evaluator" }
 relon-parser = { path = "../relon-parser" }
 relon-analyzer = { path = "../relon-analyzer" }
+lsp-server = "0.7"
+lsp-types = "0.95"
+miette = "7.6.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-thiserror = "1.0"
+anyhow = "1.0"

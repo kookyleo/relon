@@ -4,7 +4,12 @@ export default defineConfig({
   title: "Relon",
   description: "A production-grade, strongly-typed configuration language.",
   base: "/relon/",
-  
+
+  head: [
+    ['link', { rel: 'icon', type: 'image/svg+xml', href: '/relon/favicon.svg' }],
+    ['link', { rel: 'icon', type: 'image/x-icon', href: '/relon/favicon.ico' }]
+  ],
+
   locales: {
     root: {
       label: 'Language',
@@ -81,6 +86,8 @@ export default defineConfig({
   },
 
   themeConfig: {
+    logo: '/logo-mini.svg',
+    siteTitle: 'Relon',
     socialLinks: [
       { icon: 'github', link: 'https://github.com/kookyleo/relon' }
     ],

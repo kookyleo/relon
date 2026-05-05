@@ -7,8 +7,9 @@ description = "The evaluation engine for the relon language"
 
 [dependencies]
 relon-parser = { path = "../relon-parser" }
+relon-analyzer = { path = "../relon-analyzer" }
 ordered-float.workspace = true
-serde = { version = "1.0", features = ["derive"] }
+serde = { version = "1.0", features = ["derive", "rc"] }
 serde_json = "1.0"
 thiserror = "1.0"
 miette = { version = "7.6.0", features = ["derive"] }

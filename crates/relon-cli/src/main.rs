@@ -53,7 +53,7 @@ fn main() -> miette::Result<()> {
                 report.with_source_code(NamedSource::new(file.to_string_lossy(), content.clone()))
             })?;
 
-            let ctx = Context::new().with_root(node.clone());
+            let ctx = Context::new().with_root(node);
             let cache_namespace = canonical_file.to_string_lossy().to_string();
             let _root_loading_guard = ctx.enter_loading_module(cache_namespace.clone());
             let evaluator = Evaluator::new(&ctx);
@@ -65,10 +65,9 @@ fn main() -> miette::Result<()> {
                 .to_string_lossy()
                 .to_string();
             root_scope.cache_namespace = cache_namespace;
-            root_scope.reference_root = Some(std::sync::Arc::new(node.clone()));
             let scope = std::sync::Arc::new(root_scope);
 
-            let result = evaluator.eval(&node, &scope).map_err(|e| {
+            let result = evaluator.eval_root(&scope).map_err(|e| {
                 Report::new(e)
                     .with_source_code(NamedSource::new(file.to_string_lossy(), content.clone()))
             })?;

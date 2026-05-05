@@ -32,8 +32,30 @@ Button ok_btn: { type: "btn", label: "OK" }
 
 **测试结果**：`cargo test --workspace` 全绿（含 `relon-evaluator` 48 项、`relon-parser` 63 项等共 122 项）。
 
-## 后续可选优化
-1. **`is_root` 指针比较脆弱**：`Context::with_root(node.clone())` 与调用 `eval(&node, …)` 的双 Arc 让指针不一致，`is_root` 永远 false。当前依赖懒求值 + path_cache 也能跑通，但留着隐患。建议让 `eval_doc` / CLI 统一传 `&*ctx.root_node`。
-2. **谓词组合**：`extract_schema_for_node` 中 Binary 合并时，对 predicate 采用「右侧非 Wildcard 即覆盖」的简单策略；按设计文档应改为逻辑 AND 合并（需要把 `SchemaField.predicate` 从单值改为列表或合成新闭包）。
-3. **`dict.merge(Schema, …)` 对齐**：当前 `Operator::Add` 对 `(Schema, Schema)` / `(Schema, Dict)` 走 `deep_merge`，未走 `extract_schema_for_node` 那条更精细的路径。`@schema` 上下文外的 `Schema + Dict` 仍只能设默认值、不能新增字段；如要打通就把这条路径也接到 `extract_schema_for_node` 上。
-4. **抽象契约 (Parameterized Schemas)**：`@schema Page<T>: …` 暂未实现，待泛型语法落地后再做。
+## Relon 2.x 架构改造（详见 `docs/zh/architecture-review.md`）
+
+### ✅ 阶段 A — 宿主扩展骨架（已落地）
+- **A1 ✅ `DecoratorPlugin` trait + 注册表**：`name == "import" / "schema" / "expect" / "msg" / "error" / "default" / "value"` 等字面量分支已改为查表；7 个内置 plugin 在 `Context::new` 预注册；新增文件 `decorator.rs` + `builtin_decorators.rs`。
+- **A2 ✅ `ModuleResolver` trait + 链表**：默认链 `StdModuleResolver + FilesystemModuleResolver`；`Context::prepend_module_resolver` / `append_module_resolver` 暴露给宿主；新增文件 `module.rs`。
+- **A3 ✅ `RelonFunction` 升级到 `NativeArgs`**：含 `positional` / `named` 双视图；stdlib 28 个函数一次性迁移完毕。
+
+### ✅ 阶段 B — 实现层稳定化（已落地）
+- **B4 ✅ `is_root` 指针比较**：新增 `Evaluator::eval_root` 入口；`facade`、CLI、test helper 全部迁移；同步修了 closure body 的 `reference_root_scope` 泄漏 bug。
+- **B5 ✅ 拆分 `eval.rs`**：从单文件 2350 行降到 ~880 行。抽出的子模块：`scope.rs`（`Scope/Thunk/ListContext` + `child` 工厂）、`schema.rs`（`check_type` + schema 抽取 + `merge_schema_with_dict_pairs`）、`reference.rs`（`&root/&sibling/&prev/...` 解析、Thunk forcing、path cache）、`arithmetic.rs`（Binary / Unary / 数值 op）、外加阶段 A 已抽的 `decorator.rs / module.rs / native_fn.rs / builtin_decorators.rs`。每个子模块用「跨文件 `impl Evaluator`」组织，无额外 trait 间接层。
+- **B6 ✅ Predicate AND 合成**：`SchemaField.predicate: Value` → `predicates: Vec<Value>`；`extract_schema_for_node` 与 `Value::deep_merge` 在 `Schema + Schema` 路径上 AND 累积；`check_custom_schema` 顺序短路；新增 `test_schema_composition_and_combines_predicates` 锁定行为。
+- **B7 ✅ `Schema + Dict` 添加字段**：新增 `merge_schema_with_dict_pairs`，按 AST 而非求值后合并。每对字段 hybrid 派发：`Type field: pred` → schema 字段定义；裸字面量值 → 默认值 patch（覆盖既有字段或新建 `Any` 默认字段）。`extract_schema_for_node` Binary 分支同步路由。原 `test_schema_composition_defaults` 从注释状态恢复，新加 `test_schema_plus_dict_adds_typed_fields`。
+
+### ✅ 阶段 C — 可观测与性能（已落地）
+- **C8 错误聚合（待迭代）**：当前未实现，`@schema` / `@ensure.*` 仍是 fail-fast。
+- **C9 ✅ 结构化诊断**：`RuntimeError::CircularReference` 升级为 struct variant `{ cycle, range }`，`Display` 用 `→` 渲染；所有 variant 的 miette label 文本结构化（`expected X, got Y` / `divisor is zero` / `triggers the cycle` / ...），`VariableNotFound` / `DivisionByZero` / `InvalidIdentifier` / `ModuleNotFound` / `CircularImport` 补 `help(...)`。
+- **C10 ✅ `Value` clone 优化**：`Value::List(Arc<Vec<Value>>)` + `Value::Dict(Arc<ValueDict>)`；clone 退化为 Arc bump，mutation 走 `Arc::make_mut` (CoW)。新增 `Value::list / dict / list_mut / dict_mut` 收敛构造与就地修改。serde 通过 `features = ["rc"]` 透传。
+
+### ✅ 阶段 D — 投影与扩展（已落地）
+- **D11 ✅ `Projector` trait**：`relon::projector::Projector { type Output; type Error; fn project(&self, value: &Value) -> Result<...>; }`；默认 `JsonProjector` 复用旧 `to_json_value` 语义；`relon::project_with(&projector, &value)` / `relon::project_from_str(source, &projector)` 入口。新增 `custom_projector_extracts_typed_field_set` 测试演示宿主接入。
+- **D12 `BrandRegistry`（待迭代）**：当前 `@schema` 已能覆盖大多数名义类型用法，独立注册表延后到有具体宿主需求时再加。
+
+### 阶段 E — 暂缓
+- **抽象契约 (Parameterized Schemas)**：`@schema Page<T>: …`，等泛型语法落地后再做。
+
+### 测试基线
+parser 63 + evaluator 51 + relon 7 + fmt 5 = **126 项全绿**。clippy `--all-targets -- -D warnings` 通过；`cargo fmt --check` 通过。

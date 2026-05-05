@@ -1,9 +1,14 @@
+pub mod projector;
+
+use relon_analyzer::{analyze, AnalyzedTree, Diagnostic};
 use relon_evaluator::{Context, Evaluator, RuntimeError, Scope, Value};
 use relon_parser::parse_document;
 use serde::de::DeserializeOwned;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+pub use projector::{JsonProjector, Projector};
+pub use relon_analyzer;
 pub use relon_evaluator;
 pub use relon_parser;
 
@@ -19,6 +24,12 @@ pub enum Error {
 
     #[error("failed to parse Relon source: {0}")]
     Parse(String),
+
+    /// One or more analyzer diagnostics at `Error` severity. Reported as a
+    /// batch (the whole point of having an analyzer pass) rather than
+    /// fail-fast like [`Error::Eval`].
+    #[error("analyzer reported {} error(s)", .0.len())]
+    Analyze(Vec<Diagnostic>),
 
     #[error(transparent)]
     Eval(#[from] RuntimeError),
@@ -86,43 +97,46 @@ pub fn value_from_file(path: impl AsRef<Path>) -> Result<Value> {
     )
 }
 
+/// Project an evaluated [`Value`] to `serde_json::Value` using the default
+/// [`JsonProjector`]. See [`project_with`] when you need to plug in a
+/// custom [`Projector`].
 pub fn to_json_value(value: Value) -> Result<serde_json::Value> {
-    match value {
-        Value::Null => Ok(serde_json::Value::Null),
-        Value::Bool(value) => Ok(serde_json::Value::Bool(value)),
-        Value::Int(value) => Ok(serde_json::Value::Number(value.into())),
-        Value::Float(value) => {
-            let value = value.into_inner();
-            serde_json::Number::from_f64(value)
-                .map(serde_json::Value::Number)
-                .ok_or(Error::NonFiniteFloat(value))
-        }
-        Value::String(value) => Ok(serde_json::Value::String(value)),
-        Value::List(values) => values
-            .into_iter()
-            .map(to_json_value)
-            .collect::<Result<Vec<_>>>()
-            .map(serde_json::Value::Array),
-        Value::Dict(values) => {
-            let mut map = serde_json::Map::new();
-            for (key, value) in values.map {
-                match value {
-                    Value::Closure { .. } => continue, // Skip closures in dicts
-                    Value::Schema(_) => continue,      // Skip schemas in dicts
-                    Value::Type(_) => continue,        // Skip types in dicts
-                    Value::Wildcard => continue,       // Skip wildcards in dicts
-                    _ => {
-                        map.insert(key, to_json_value(value)?);
-                    }
-                }
-            }
-            Ok(serde_json::Value::Object(map))
-        }
-        Value::Closure { .. } => Err(Error::UnsupportedClosure),
-        Value::Schema(_) => Err(Error::UnsupportedSchema),
-        Value::Type(_) => Err(Error::UnsupportedSchema),
-        Value::Wildcard => Err(Error::UnsupportedSchema),
-    }
+    JsonProjector.project(&value)
+}
+
+/// Project a [`Value`] using a caller-supplied [`Projector`]. Lifts the
+/// projector's error into a `Result<P::Output, P::Error>`, so the host
+/// keeps full control over the error type — no detour through
+/// [`crate::Error`] required.
+pub fn project_with<P: Projector>(
+    projector: &P,
+    value: &Value,
+) -> std::result::Result<P::Output, P::Error> {
+    projector.project(value)
+}
+
+/// Convenience: parse `source`, evaluate, and project with the supplied
+/// projector. Parse / evaluation errors are returned unchanged via
+/// [`crate::Error`]; projection errors are surfaced through `P::Error` and
+/// must be combinable with [`crate::Error`] by the caller (or use the
+/// fixed-format [`from_str`] / [`json_from_str`] helpers).
+pub fn project_from_str<P: Projector>(
+    source: &str,
+    projector: &P,
+) -> std::result::Result<P::Output, ProjectError<P::Error>> {
+    let value = value_from_str(source).map_err(ProjectError::Eval)?;
+    projector.project(&value).map_err(ProjectError::Project)
+}
+
+/// Combined error type returned by [`project_from_str`]: separates
+/// evaluation failures (already typed) from projection failures (whichever
+/// error type the projector chose).
+#[derive(Debug, thiserror::Error)]
+pub enum ProjectError<P> {
+    #[error(transparent)]
+    Eval(crate::Error),
+    #[error("projection failed")]
+    Project(#[source] P),
 }
 
 fn evaluate_source(
@@ -131,8 +145,22 @@ fn evaluate_source(
     cache_namespace: impl Into<String>,
 ) -> Result<Value> {
     let node = parse_document(source).map_err(|err| Error::Parse(err.to_string()))?;
+
+    // Run the analyzer first so any structural problems (malformed
+    // `@schema`, untyped schema fields, ...) surface as a batched
+    // `Error::Analyze` before we touch the evaluator. Diagnostics at
+    // `Error` severity short-circuit; warnings are silently attached to
+    // the evaluator context for runtime fast-paths.
+    let mut analyzed = analyze(&node);
+    if analyzed.has_errors() {
+        return Err(Error::Analyze(analyzed.take_diagnostics()));
+    }
+    let analyzed = Arc::new(analyzed);
+
     let cache_namespace = cache_namespace.into();
-    let ctx = Context::new().with_root(node.clone());
+    let ctx = Context::new()
+        .with_root(node)
+        .with_analyzed(Arc::clone(&analyzed));
     let _root_loading_guard = if cache_namespace == "<memory>" {
         None
     } else {
@@ -143,8 +171,16 @@ fn evaluate_source(
     let mut root_scope = Scope::default();
     root_scope.current_dir = current_dir.into();
     root_scope.cache_namespace = cache_namespace;
-    root_scope.reference_root = Some(Arc::new(node.clone()));
-    Ok(evaluator.eval(&node, &Arc::new(root_scope))?)
+    Ok(evaluator.eval_root(&Arc::new(root_scope))?)
+}
+
+/// Parse `source` and run the analyzer, returning the side-table tree
+/// without ever touching the evaluator. Use this from a host/LSP that
+/// wants static diagnostics (schema shape, untyped fields) without
+/// paying for evaluation.
+pub fn analyze_from_str(source: &str) -> Result<AnalyzedTree> {
+    let node = parse_document(source).map_err(|err| Error::Parse(err.to_string()))?;
+    Ok(analyze(&node))
 }
 
 #[cfg(test)]
@@ -211,6 +247,83 @@ mod tests {
                 display: "port=3000".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn custom_projector_extracts_typed_field_set() {
+        // Demonstrates the Projector trait: a host can swap the default
+        // JSON projection for any custom representation. Here we project
+        // a Dict into a sorted `Vec<String>` of its top-level keys.
+        struct KeysProjector;
+
+        #[derive(Debug, thiserror::Error)]
+        #[error("expected top-level Dict, got {0}")]
+        struct NotADict(&'static str);
+
+        impl Projector for KeysProjector {
+            type Output = Vec<String>;
+            type Error = NotADict;
+
+            fn project(&self, value: &Value) -> std::result::Result<Self::Output, Self::Error> {
+                match value {
+                    Value::Dict(d) => {
+                        let mut keys: Vec<String> = d.map.keys().cloned().collect();
+                        keys.sort();
+                        Ok(keys)
+                    }
+                    other => Err(NotADict(other.type_name())),
+                }
+            }
+        }
+
+        let value = value_from_str(r#"{ host: "x", port: 80, tag: "p" }"#).unwrap();
+        let keys = project_with(&KeysProjector, &value).unwrap();
+        assert_eq!(
+            keys,
+            vec!["host".to_string(), "port".to_string(), "tag".to_string()]
+        );
+    }
+
+    #[test]
+    fn analyzer_aggregates_multiple_schema_errors() {
+        // Two independent structural problems in one source: one body that
+        // isn't a dict, and one field without a type annotation. The
+        // analyzer should report both in a single batch instead of
+        // bailing out on the first.
+        let result = value_from_str(
+            r#"{
+                @schema BadBody: 42,
+                @schema BadField: { name: * }
+            }"#,
+        );
+
+        let diags = match result {
+            Err(Error::Analyze(diags)) => diags,
+            other => panic!("expected Error::Analyze, got {other:?}"),
+        };
+        assert_eq!(diags.len(), 2, "{diags:?}");
+        assert!(diags
+            .iter()
+            .any(|d| matches!(d, Diagnostic::SchemaBodyNotDict { .. })));
+        assert!(diags
+            .iter()
+            .any(|d| matches!(d, Diagnostic::SchemaFieldUntyped { field, .. } if field == "name")));
+    }
+
+    #[test]
+    fn analyze_from_str_returns_tree_without_evaluating() {
+        // `analyze_from_str` must not run the evaluator — it should
+        // succeed even on programs that would crash at runtime, as long
+        // as the static structure is sound.
+        let tree = analyze_from_str(
+            r#"{
+                @schema User: { String name: * },
+                missing: &sibling.does_not_exist
+            }"#,
+        )
+        .expect("analyze");
+        assert!(!tree.has_errors(), "{:?}", tree.diagnostics);
+        assert_eq!(tree.schemas.len(), 1);
     }
 
     #[test]
