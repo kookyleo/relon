@@ -3,8 +3,8 @@ layout: home
 
 hero:
   name: "Relon"
-  text: "下一代强类型配置语言"
-  tagline: "一个专为现代 Web 和工业级应用设计的配置语言与 UI 模板引擎。它融合了 JSON 的极简美学、完备的表达式能力，以及名义类型系统（Nominal Types）。"
+  text: "Build typed business-config DSLs on top of JSON"
+  tagline: "可嵌入 Rust 的工具集，用来搭建「类型化业务配置 DSL」。平台团队定义 schema、装饰器与原生函数；业务团队用 JSON 形态的配置组合它们，最终编译为纯净 JSON。From JSON-like, to JSON, for JSON。"
   image:
     src: /logo.svg
     alt: Relon
@@ -17,12 +17,17 @@ hero:
       link: https://github.com/kookyleo/relon
 
 features:
-  - title: 面向表达式 (Expression-Oriented)
-    details: 没有语句，没有 return 关键字。从简单的算术运算到复杂的列表推导式，代码中的一切最终都会求值为一个数据。
-  - title: 强类型契约 (Type Contracts)
-    details: 原生支持前缀类型标记、泛型与身份守卫（Identity Guard）。使用 @schema 定义契约，确保数据在历经复杂的合并后依然合法。
-  - title: 动态寻址与上下文 (Dynamic Pathing)
-    details: 内置了强大的相对引用（&sibling, &root, &prev, &next），支持动态键名解析，为高度复用的配置模板提供了无限可能。
-  - title: Schema 混入组合 (Mixins)
-    details: 像处理普通数据一样对 Schema 进行加法组合，轻而易举地实现 UI 组件属性的继承与覆盖。
+  - title: 双层作者模型
+    details: 平台团队提供 schema、装饰器、原生函数与 .relon 库；业务团队写薄薄一层 entry 配置去拼装。语言级 `@library` 标记区分「库」与「入口」，杜绝错把库当 entry 跑。
+  - title: 类型化业务 schema
+    details: 内建 sum-type tagged enum、递归 schema、`@expect` 自定义校验消息、必填/可选/默认值/计算默认值并存——业务领域的契约不必再退化成松散字典。
+  - title: 沙箱默认安全
+    details: `Capabilities` 控制文件读白名单、求值步数、Value 元素水位、原生函数白名单。`Context::sandboxed()` 默认拒绝一切，宿主显式授权后再放行。
+  - title: JSON 闭环
+    details: From JSON-like, to JSON, for JSON——输入语法贴近 JSON，输出永远是普通 JSON。`Projector` trait 让你微调输出形态（如 sum-type 编码风格），但永远落在 JSON 上。
 ---
+
+<figure style="margin: 3rem auto; max-width: 760px; text-align: center;">
+  <img src="/relon/positioning.svg" alt="Relon two-tier authoring: Platform Team writes schemas/fns/decorators, Business Team imports them and authors entry configs that the relon-evaluator turns into plain JSON for downstream services." style="width: 100%; height: auto;" />
+  <figcaption style="margin-top: 0.75rem; font-size: 0.9rem; color: #64748b; font-style: italic;">双层作者模型：平台团队产出词表，业务团队组合词表，evaluator 输出 JSON。</figcaption>
+</figure>

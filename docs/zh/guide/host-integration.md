@@ -1,0 +1,266 @@
+# 嵌入宿主
+
+Relon 不是「装好就跑」的独立程序——它是一个 **Rust 可嵌入的 toolkit**。这一页讲怎么把它接进你自己的进程：解析、求值、注册原生函数、定制模块解析、控制 JSON 输出形态。
+
+> 想要不可信脚本的安全策略？看完这页之后跳到 [沙箱与权限](./sandbox.md)。
+
+## 最小例子
+
+最常见的需求是「读一个 `.relon` 文件，拿一个 JSON 出来」。三行：
+
+```rust
+use relon;
+
+let json = relon::json_from_file("config/app.relon")?;
+println!("{}", serde_json::to_string_pretty(&json)?);
+```
+
+如果 source 已经在内存里：
+
+```rust
+let json = relon::json_from_str(r#"{ host: "localhost", port: 8080 }"#)?;
+```
+
+想直接拿到一个反序列化好的强类型结构？走 serde：
+
+```rust
+use serde::Deserialize;
+
+#[derive(Debug, Deserialize)]
+struct ServerConfig {
+    host: String,
+    port: u16,
+}
+
+let cfg: ServerConfig = relon::from_file("config/app.relon")?;
+```
+
+`relon::from_str` / `from_file` 内部就是 `json_from_*` + `serde_json::from_value`。
+
+## 顶层 API 一览
+
+| 函数 | 行为 |
+| --- | --- |
+| `value_from_str(src) -> Value` | 解析 + 求值，返回 Relon 内存值（含 closure / schema 等不能直接 JSON 化的形态） |
+| `value_from_file(path) -> Value` | 同上，从文件读 |
+| `json_from_str(src) -> serde_json::Value` | 求值 + 走默认 `JsonProjector` 投影到 JSON |
+| `json_from_file(path) -> serde_json::Value` | 同上，从文件读 |
+| `from_str::<T>(src) -> T` | 求值 + 投影 + serde 反序列化到自定义类型 |
+| `from_file::<T>(path) -> T` | 同上，从文件读 |
+| `analyze_from_str(src) -> AnalyzedTree` | **只**跑 parser + analyzer，不求值——用来给 LSP / CI 拿静态诊断 |
+| `project_with(&projector, &value) -> P::Output` | 用自定义 `Projector` 处理已经求值的 `Value` |
+| `project_from_str(src, &projector) -> P::Output` | parse + eval + 投影一气呵成 |
+
+## `Context` 是什么
+
+走 `relon::*` 顶层 API 时，`Context` 在内部被构造好。如果你需要注册原生函数、装饰器、自定义模块解析或 capability，就要直接构造 `Context`：
+
+```rust
+use relon_evaluator::{Context, Evaluator, Scope};
+use relon_parser::parse_document;
+use std::sync::Arc;
+
+let node = parse_document(source).unwrap();
+let mut ctx = Context::new()  // 等价于 Context::trusted()
+    .with_root(node);
+
+// （在这里注册函数 / 装饰器 / 替换 module resolver）
+
+let value = Evaluator::new(&ctx).eval_root(&Arc::new(Scope::default()))?;
+```
+
+`Context` 持有：
+
+- **`globals: HashMap<String, Value>`** — 顶层全局绑定，`@import` 之外的注入点。
+- **`functions`** — 通过 `register_fn` / `register_fn_with_caps` 注册的原生函数表。
+- **`decorators`** — 通过 `register_decorator` 注册的装饰器插件。
+- **`module_resolvers`** — `@import` 走的解析器链；默认是 `[StdModuleResolver, FilesystemModuleResolver]`。
+- **`capabilities`** — 沙箱 / 资源预算（[沙箱与权限](./sandbox.md) 详解）。
+- **`root_node`** + **`analyzed`** — 根 AST 与 analyzer side-table。
+- **多份 cache**（path / module / loading）——避免重复求值。
+
+构造方式有两条主线：
+
+| 构造器 | 默认安全等级 |
+| --- | --- |
+| `Context::new()` / `Context::trusted()` | 完全可信：filesystem 全开、native fn 全放、无步数 / 大小预算 |
+| `Context::sandboxed()` | 完全沙箱：filesystem 默认拒绝、capability 全空、只剩 `std/...` 虚拟模块 |
+
+## 注册一个原生函数
+
+最常见的需求：暴露一个由 Rust 算的常量或纯函数给 `.relon` 用。
+
+```rust
+use relon_evaluator::{Context, NativeArgs, RelonFunction, Value, RuntimeError};
+use relon_parser::TokenRange;
+use std::sync::Arc;
+
+struct AppVersion;
+
+impl RelonFunction for AppVersion {
+    fn call(&self, _args: NativeArgs, _range: TokenRange) -> Result<Value, RuntimeError> {
+        Ok(Value::String(env!("CARGO_PKG_VERSION").to_string()))
+    }
+}
+
+let mut ctx = Context::new();
+ctx.register_fn("app_version", Arc::new(AppVersion));
+```
+
+之后在 `.relon` 里：
+
+```relon
+{
+    version: app_version()
+}
+```
+
+要点：
+
+- `register_fn` 注册的函数被视作**完全可信**——即使在沙箱模式下也直接放行（绕过 `allow_native_fn` 列表）。
+- `NativeArgs` 同时拆好了 positional 和 named 参数：`args.get(0)` 拿位置参数，`args.get_named("name")` 拿命名参数。
+- 函数返回 `Value`——Relon 的内存值类型；想构造 dict / list 用 `Value::Dict` / `Value::List`。
+
+## 受 capability 门控的注册
+
+读文件、调网络、读环境这类**有副作用**的函数，应该用 `register_fn_with_caps` 注册：
+
+```rust
+use relon_evaluator::{Context, NativeFnCaps, NativeArgs, RelonFunction, Value, RuntimeError};
+use relon_parser::TokenRange;
+use std::sync::Arc;
+
+struct ReadSecret;
+
+impl RelonFunction for ReadSecret {
+    fn call(&self, _args: NativeArgs, _range: TokenRange) -> Result<Value, RuntimeError> {
+        let secret = std::fs::read_to_string("/etc/myapp/secret").unwrap_or_default();
+        Ok(Value::String(secret))
+    }
+}
+
+let mut ctx = Context::sandboxed();
+ctx.register_fn_with_caps(
+    "secret.read",
+    NativeFnCaps { reads_fs: true },
+    Arc::new(ReadSecret),
+);
+
+// 在沙箱模式下，必须显式加白名单才能调
+ctx.capabilities.allow_native_fn.insert("secret.read".to_string());
+```
+
+行为差异一句话：**`register_fn` 默认放行；`register_fn_with_caps` 默认拦截**。后者在 `Context::trusted()` 下也能跑（因为 `allow_all_native_fn = true`），但语义上明确传达「我是有副作用的」。详见 [沙箱与权限](./sandbox.md)。
+
+## 模块解析（Module Resolvers）
+
+`@import("path", as="...")` 不是直接读文件——它问 `Context::module_resolvers` 链上的每个 resolver 「你能解析这个路径吗？」第一个返回 `Some(ModuleSource)` 的赢，错误（`Err`）会立刻中断。
+
+默认链：
+
+1. **`StdModuleResolver`** — 解析 `std/list`、`std/string` 这些虚拟模块（嵌在 binary 里，零 IO）。
+2. **`FilesystemModuleResolver`** — 从文件系统读：
+   - `Context::trusted()` 下使用 `FilesystemModuleResolver::trusted()`，无 root 限制；
+   - `Context::sandboxed()` 下使用 `FilesystemModuleResolver::new()`，**默认拒绝一切**——必须替换或追加一个 `with_root_dir(...)` 实例。
+
+替换示例：
+
+```rust
+use relon_evaluator::{Context, FilesystemModuleResolver, StdModuleResolver};
+use std::sync::Arc;
+
+let mut ctx = Context::sandboxed();
+ctx.module_resolvers = vec![
+    Arc::new(StdModuleResolver),
+    Arc::new(FilesystemModuleResolver::with_root_dir("/var/relon-configs")),
+];
+```
+
+`with_root_dir` 会把 root 路径 canonicalize，并在每次 import 时确认目标路径在 root 下面（包括防止符号链接逃逸）——细节见 [沙箱与权限](./sandbox.md#filesystemmoduleresolverwith_root_dir-的行为)。
+
+要插入自定义 resolver（比如「从内存读」「从 OCI registry 读」），实现 `ModuleResolver` trait 然后：
+
+```rust
+ctx.prepend_module_resolver(Arc::new(MyResolver));   // 走最前
+ctx.append_module_resolver(Arc::new(FallbackResolver)); // 走最后
+```
+
+## 装饰器插件
+
+`@some_name(...)` 装饰器除了 Relon 内置（`@import`、`@schema`、`@library`、`@default`、`@expect`、`@ensure.*`）之外，可以由宿主注册。实现 `DecoratorPlugin` trait：
+
+```rust
+use relon_evaluator::{Context, DecoratorPlugin};
+// 实现 trait 的细节略——3 个钩子全是 default no-op
+ctx.register_decorator("my_org.audit", Arc::new(MyAuditPlugin));
+```
+
+`DecoratorPlugin` 提供三个钩子，全部默认 no-op，按需要 override：
+
+| 钩子 | 触发时机 | 典型用途 |
+| --- | --- | --- |
+| `pre_eval` | 在被装饰节点求值**之前** | 注入 scope（`@import` 用这个）/ 直接覆盖结果（`@schema` 用这个） |
+| `wrap` | 在被装饰节点求值**之后** | 校验、转换（`@ensure.int`、`@currency("USD")`） |
+| `schema_field_meta` | 从 `@schema` 字典提取字段时 | 给字段挂元数据，比如默认值、自定义错误（`@default`、`@expect`） |
+
+trait 完整签名见 `crates/relon-evaluator/src/decorator.rs`，这里不抄一遍——大多数宿主只需要 `wrap`。
+
+## `Projector`：定制 JSON 输出形态
+
+默认的 `JsonProjector` 把 `Value` 投影成 `serde_json::Value`，处理细节：
+
+- 闭包、schema、type、wildcard 在 dict 里**静默丢弃**（保留运行时元素，不污染 JSON）；
+- 出现在顶层时**报错**（没法投影成 JSON）；
+- 非有限浮点（`Infinity`/`NaN`）报错；
+- sum-type 变体输出**外部标签**形式：`{ "Email": { ... } }`；
+- 普通 branded dict 保持**扁平**——`@schema User` 标过的 dict 不会被包一层。
+
+想换一种输出形态——比如 sum-type 用 `{ "type": "Email", "address": "..." }` 内部标签风格，或者直接 BSON、Protobuf——实现 `Projector` trait：
+
+```rust
+use relon::Projector;
+use relon_evaluator::Value;
+
+struct InternallyTaggedJson;
+
+#[derive(Debug, thiserror::Error)]
+#[error("projection failed: {0}")]
+struct ProjErr(String);
+
+impl Projector for InternallyTaggedJson {
+    type Output = serde_json::Value;
+    type Error = ProjErr;
+
+    fn project(&self, value: &Value) -> Result<Self::Output, Self::Error> {
+        // 自己控制遍历，对 Value::Dict 看 brand/variant_of 改写形状……
+        todo!()
+    }
+}
+
+let json = relon::project_from_str(source, &InternallyTaggedJson)?;
+```
+
+> **注意范围**：`Projector` 是「JSON 形状的微调旋钮」，不是「跳出 JSON 的逃生通道」。Relon 的输出永远要落到 JSON 上——这是它的硬约束。如果你想生成 YAML/TOML/XML，那是另一种工具的领域（比如 Pkl）。
+
+## 错误类型
+
+`relon::Error` 是 facade crate 的统一错误：
+
+| 变体 | 来源 |
+| --- | --- |
+| `Error::Parse(String)` | 词法 / 语法错误 |
+| `Error::Analyze(Vec<Diagnostic>)` | analyzer 错误**批量**返回（4 个 pass 一起跑完） |
+| `Error::Eval(RuntimeError)` | 求值期错误：类型不匹配、未定义引用、capability 拒绝、step 超限等 |
+| `Error::LibraryAsEntry { name }` | 文件标了 `@library`，不能当 host entry 跑（[详情](./library-vs-entry.md)） |
+| `Error::Io { path, source }` | 读文件失败 |
+| `Error::Deserialize(serde_json::Error)` | `from_str::<T>` 类 API 反序列化失败 |
+| `Error::NonFiniteFloat(f64)` | JSON 投影时遇到 `Infinity` / `NaN` |
+| `Error::UnsupportedClosure` / `UnsupportedSchema` | 顶层就是一个 closure 或 schema，没法投影 |
+
+`RuntimeError` 在沙箱模式下还会出现 `CapabilityDenied`、`StepLimitExceeded`、`ValueTooLarge`——这些归属 [沙箱与权限](./sandbox.md)。
+
+## 接下来
+
+- 不可信脚本的安全策略：[沙箱与权限](./sandbox.md)
+- 让 `.relon` 端能用上你注册的函数：在 schema / library 里包装它们，参考 [类型与契约](./types.md) 与 [库与入口](./library-vs-entry.md)
+- 错误的 miette 友好格式：直接把 `RuntimeError` / `Diagnostic` 喂给 `miette::Report`

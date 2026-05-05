@@ -38,6 +38,14 @@ export default defineConfig({
               { text: '函数与闭包', link: '/zh/guide/functions' },
               { text: '类型与契约 (Schema)', link: '/zh/guide/types' },
               { text: '模块与作用域', link: '/zh/guide/modules' },
+              { text: '库与入口 (@library)', link: '/zh/guide/library-vs-entry' },
+            ]
+          },
+          {
+            text: '嵌入与安全',
+            items: [
+              { text: '嵌入宿主', link: '/zh/guide/host-integration' },
+              { text: '沙箱与权限', link: '/zh/guide/sandbox' },
             ]
           },
           {
