@@ -566,4 +566,3 @@ pub(crate) fn merge_schema_fields(
         }
     }
 }
-

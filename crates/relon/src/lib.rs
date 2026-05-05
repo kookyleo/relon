@@ -483,7 +483,10 @@ mod tests {
         let as_entry = json_from_file(dir.join("shared.relon")).unwrap();
         let as_imported = json_from_file(dir.join("entry.relon")).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
-        assert_eq!(as_entry.get("greeting").and_then(|v| v.as_str()), Some("hi"));
+        assert_eq!(
+            as_entry.get("greeting").and_then(|v| v.as_str()),
+            Some("hi")
+        );
         assert_eq!(as_imported.get("msg").and_then(|v| v.as_str()), Some("hi"));
     }
 

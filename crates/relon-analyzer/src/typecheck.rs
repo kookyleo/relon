@@ -153,7 +153,12 @@ impl<'a> Walker<'a> {
     /// Conservative exhaustiveness check: only fires when we can statically
     /// determine the matched expression's type to be a sum-type Enum.
     /// Otherwise we silently fall through to the runtime mismatch path.
-    fn check_match_exhaustiveness(&mut self, match_range: TokenRange, expr: &Node, arms: &[(Node, Node)]) {
+    fn check_match_exhaustiveness(
+        &mut self,
+        match_range: TokenRange,
+        expr: &Node,
+        arms: &[(Node, Node)],
+    ) {
         let Some(enum_name) = self.infer_enum_type(expr) else {
             return;
         };

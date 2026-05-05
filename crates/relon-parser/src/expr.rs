@@ -323,12 +323,9 @@ fn parse_variant_ctor<'a>(input: &mut Span<'a>) -> ModalResult<Node> {
     // We already consumed `{`; reconstruct the dict by parsing the inner
     // pairs ourselves, mirroring what `parse_dict` does after its own `{`.
     let body_start = input.location() - 1;
-    let pairs: Vec<(crate::TokenKey, Node)> = winnow::combinator::separated(
-        0..,
-        crate::structure::dict::parse_pair,
-        (soc0, ",", soc0),
-    )
-    .parse_next(input)?;
+    let pairs: Vec<(crate::TokenKey, Node)> =
+        winnow::combinator::separated(0.., crate::structure::dict::parse_pair, (soc0, ",", soc0))
+            .parse_next(input)?;
     let _ = (soc0, opt(","), soc0, "}").parse_next(input)?;
     let body_end = input.location();
     let body = Node::new(Expr::Dict(pairs), create_range(input, body_start, body_end));
@@ -513,8 +510,7 @@ pub fn parse_type_node<'a>(input: &mut Span<'a>) -> ModalResult<crate::TypeNode>
             winnow::combinator::separated(1.., parse_enum_alternative, (soc0, ",", soc0))
                 .parse_next(input)
         } else {
-            winnow::combinator::separated(1.., parse_type_node, (soc0, ",", soc0))
-                .parse_next(input)
+            winnow::combinator::separated(1.., parse_type_node, (soc0, ",", soc0)).parse_next(input)
         };
         match params_result {
             Ok(params) => {

@@ -116,13 +116,16 @@ fn build_enum_schema(
     for variant in &def.variants {
         let mut fields = HashMap::new();
         for f in &variant.fields {
-            let type_node = f.type_hint.clone().unwrap_or_else(|| relon_parser::TypeNode {
-                path: vec!["Any".into()],
-                generics: Vec::new(),
-                is_optional: false,
-                range: f.value_range,
-                variant_fields: None,
-            });
+            let type_node = f
+                .type_hint
+                .clone()
+                .unwrap_or_else(|| relon_parser::TypeNode {
+                    path: vec!["Any".into()],
+                    generics: Vec::new(),
+                    is_optional: false,
+                    range: f.value_range,
+                    variant_fields: None,
+                });
             fields.insert(
                 f.name.clone(),
                 SchemaField {

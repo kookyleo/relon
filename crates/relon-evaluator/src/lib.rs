@@ -1427,9 +1427,7 @@ mod tests {
             }"#,
         )
         .unwrap();
-        let Value::Dict(outer) = result else {
-            panic!()
-        };
+        let Value::Dict(outer) = result else { panic!() };
         let Value::Dict(msg) = outer.map.get("msg").unwrap() else {
             panic!()
         };
@@ -1676,7 +1674,10 @@ mod sandbox_tests {
             .unwrap();
         let result = handle.join().unwrap();
         assert!(
-            matches!(result, Err(RuntimeError::StepLimitExceeded { limit: 100, .. })),
+            matches!(
+                result,
+                Err(RuntimeError::StepLimitExceeded { limit: 100, .. })
+            ),
             "expected StepLimitExceeded, got {result:?}"
         );
     }
@@ -1850,5 +1851,4 @@ mod sandbox_tests {
         };
         assert_eq!(d.map.get("first").unwrap(), &Value::Int(10));
     }
-
 }

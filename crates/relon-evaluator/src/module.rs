@@ -154,10 +154,7 @@ impl ModuleResolver for FilesystemModuleResolver {
             if !canonical_target.starts_with(root) {
                 return Err(RuntimeError::CapabilityDenied {
                     name: format!("@import({path:?})"),
-                    reason: format!(
-                        "path escapes filesystem root {}",
-                        root.to_string_lossy()
-                    ),
+                    reason: format!("path escapes filesystem root {}", root.to_string_lossy()),
                     range,
                 });
             }

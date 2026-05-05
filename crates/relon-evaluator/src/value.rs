@@ -185,11 +185,7 @@ impl Value {
     /// Build a `Value::Dict` representing a tagged-enum variant: carries a
     /// `brand` (the variant name) plus `variant_of` (the parent enum name).
     /// The JSON projector uses `variant_of` to externally tag the output.
-    pub fn variant_dict(
-        map: BTreeMap<String, Value>,
-        variant: String,
-        enum_name: String,
-    ) -> Self {
+    pub fn variant_dict(map: BTreeMap<String, Value>, variant: String, enum_name: String) -> Self {
         Self::Dict(Arc::new(ValueDict {
             map,
             brand: Some(variant),

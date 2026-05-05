@@ -180,9 +180,7 @@ fn walk_schema_body(node: &Node, def: &mut SchemaDef, tree: &mut AnalyzedTree) -
         // `@schema X: Enum<...>` body — a Type whose head is `Enum`. Detect
         // tagged-enum form (alternatives carrying `variant_fields`) here so
         // the analyzer can expose `def.variants` to downstream passes.
-        Expr::Type(t) if t.path.len() == 1 && t.path[0] == "Enum" => {
-            lower_enum_body(t, def, tree)
-        }
+        Expr::Type(t) if t.path.len() == 1 && t.path[0] == "Enum" => lower_enum_body(t, def, tree),
         Expr::Dict(pairs) => {
             collect_fields(pairs, def, tree);
             true

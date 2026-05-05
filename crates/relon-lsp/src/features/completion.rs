@@ -19,7 +19,6 @@ use lsp_types::{CompletionItem, CompletionItemKind, Position};
 use relon_parser::{child_nodes, Expr, Node, TokenKey};
 use std::collections::BTreeSet;
 
-
 pub fn items_for(entry: &DocumentEntry, position: Position) -> Vec<CompletionItem> {
     let mut out = BTreeSet::new();
 

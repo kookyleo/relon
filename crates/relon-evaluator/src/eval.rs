@@ -998,7 +998,11 @@ impl<'a> Evaluator<'a> {
         };
         // Slow-path schema lowering doesn't know the binding name; fall
         // back to the enum_path so the brand metadata is non-empty.
-        let name = if name.is_empty() { enum_name.clone() } else { name };
+        let name = if name.is_empty() {
+            enum_name.clone()
+        } else {
+            name
+        };
         let Some(variant_fields) = variants.get(variant) else {
             return Err(RuntimeError::TypeMismatch {
                 expected: format!("a variant of `{name}`"),

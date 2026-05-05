@@ -345,7 +345,8 @@ impl Display for Expr {
 pub fn is_builtin_type_name(name: &str) -> bool {
     matches!(
         name,
-        "Int" | "Float"
+        "Int"
+            | "Float"
             | "Number"
             | "String"
             | "Bool"
