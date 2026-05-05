@@ -240,6 +240,7 @@ impl<'a> Evaluator<'a> {
             return Ok(false);
         };
         let d = Arc::make_mut(d);
+        let mut deferred_closures: Vec<String> = Vec::new();
         for (field_name, field) in fields.iter() {
             if let Some(field_val) = d.map.get_mut(field_name) {
                 self.check_type_internal(
@@ -280,7 +281,15 @@ impl<'a> Evaluator<'a> {
                     }
                 }
             } else if let Some(ref def) = field.default_value {
-                d.map.insert(field_name.clone(), def.clone());
+                if matches!(def, Value::Closure { .. }) {
+                    // Computed default: defer to a second pass so the closure
+                    // sees explicit + literal-default fields via `self`.
+                    // Closure defaults do not observe each other — semantics
+                    // stay independent of HashMap iteration order.
+                    deferred_closures.push(field_name.clone());
+                } else {
+                    d.map.insert(field_name.clone(), def.clone());
+                }
             } else if field.type_hint.is_optional {
                 continue;
             } else {
@@ -289,6 +298,26 @@ impl<'a> Evaluator<'a> {
                     found: "missing".to_string(),
                     range,
                 });
+            }
+        }
+        if !deferred_closures.is_empty() {
+            let self_snapshot = Value::Dict(Arc::new(d.clone()));
+            for field_name in deferred_closures {
+                let field = fields.get(&field_name).expect("collected from fields");
+                let def = field
+                    .default_value
+                    .as_ref()
+                    .expect("deferred only when default_value set");
+                let computed = self.call_function_by_value(
+                    def.clone(),
+                    vec![EvaluatedArg {
+                        name: None,
+                        value: self_snapshot.clone(),
+                    }],
+                    scope,
+                    range,
+                )?;
+                d.map.insert(field_name, computed);
             }
         }
         Ok(true)

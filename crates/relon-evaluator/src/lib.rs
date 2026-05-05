@@ -1261,6 +1261,67 @@ mod tests {
     }
 
     #[test]
+    fn test_schema_computed_default_from_siblings() {
+        // A closure passed to @default fires at validation time with the
+        // partially-populated instance bound to `self`, computing the field
+        // from sibling values.
+        let result = eval_doc(
+            r#"{
+            @schema User: {
+                String first: *,
+                String last: *,
+                @default((self) => self.first + " " + self.last)
+                String full: *
+            },
+
+            User u: { first: "Ada", last: "Lovelace" }
+        }"#,
+        )
+        .unwrap();
+
+        let Value::Dict(d) = result else {
+            panic!("Expected Dict");
+        };
+        let Value::Dict(u) = d.map.get("u").unwrap() else {
+            panic!("Expected Dict for u");
+        };
+        assert_eq!(
+            u.map.get("full").unwrap(),
+            &Value::String("Ada Lovelace".to_string())
+        );
+    }
+
+    #[test]
+    fn test_schema_computed_default_does_not_override_explicit_value() {
+        // When the field is explicitly provided, the closure default must
+        // not fire — explicit value wins, same as literal defaults.
+        let result = eval_doc(
+            r#"{
+            @schema User: {
+                String first: *,
+                String last: *,
+                @default((self) => self.first + " " + self.last)
+                String full: *
+            },
+
+            User u: { first: "Ada", last: "Lovelace", full: "Countess" }
+        }"#,
+        )
+        .unwrap();
+
+        let Value::Dict(d) = result else {
+            panic!("Expected Dict");
+        };
+        let Value::Dict(u) = d.map.get("u").unwrap() else {
+            panic!("Expected Dict for u");
+        };
+        assert_eq!(
+            u.map.get("full").unwrap(),
+            &Value::String("Countess".to_string())
+        );
+    }
+
+    #[test]
     fn test_analyzer_target_agrees_with_evaluator_resolution() {
         // For a sibling reference, the evaluator's runtime resolution
         // must produce a value that originates from the very node the
