@@ -362,6 +362,7 @@ impl<'a> Evaluator<'a> {
                                     generics: Vec::new(),
                                     is_optional: false,
                                     range: value_node.range,
+                                    variant_fields: None,
                                 },
                                 predicates: vec![Value::Wildcard],
                                 custom_error: None,
@@ -470,6 +471,7 @@ impl<'a> Evaluator<'a> {
                                 generics: Vec::new(),
                                 is_optional: false,
                                 range: value_node.range,
+                                variant_fields: None,
                             },
                             predicates: vec![Value::Wildcard],
                             custom_error: None,
@@ -500,6 +502,7 @@ impl<'a> Evaluator<'a> {
                         generics: Vec::new(),
                         is_optional: false,
                         range: value_node.range,
+                        variant_fields: None,
                     },
                     Value::Wildcard,
                 ))

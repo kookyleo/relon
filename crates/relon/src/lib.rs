@@ -333,6 +333,44 @@ mod tests {
     }
 
     #[test]
+    fn json_externally_tags_sum_type_variant() {
+        let value = json_from_str(
+            r#"{
+                @schema Notification: Enum<
+                    Email { address: String, subject: String },
+                    Push,
+                >,
+                msg: Notification.Email { address: "a@b.c", subject: "hi" }
+            }"#,
+        )
+        .unwrap();
+        // The variant payload must be wrapped as `{ "Email": { ... } }`.
+        let msg = value.get("msg").expect("msg key");
+        let email = msg.get("Email").expect("externally-tagged Email");
+        assert_eq!(email.get("address").unwrap(), "a@b.c");
+        assert_eq!(email.get("subject").unwrap(), "hi");
+        // The schema definition itself is dropped from JSON output.
+        assert!(value.get("Notification").is_none());
+    }
+
+    #[test]
+    fn json_keeps_plain_branded_dict_flat() {
+        // Non-variant branded dicts (`@schema Email { ... }` standalone)
+        // serialize flat — only the sum-type variants get wrapped.
+        let value = json_from_str(
+            r#"{
+                @schema Email: { String address: * },
+                Email e: { address: "x@y.z" }
+            }"#,
+        )
+        .unwrap();
+        let e = value.get("e").expect("e key");
+        // Flat: address sits at the top of `e`, no wrapper key.
+        assert_eq!(e.get("address").unwrap(), "x@y.z");
+        assert!(e.get("Email").is_none());
+    }
+
+    #[test]
     fn rejects_non_finite_floats_at_json_boundary() {
         let value = value_from_str("{ x: Infinity }").unwrap();
         assert!(matches!(value, Value::Dict(_)));

@@ -149,6 +149,7 @@ fn children(node: &Node) -> Vec<&Node> {
             }
         }
         Expr::Closure { body, .. } => out.push(body),
+        Expr::VariantCtor { body, .. } => out.push(body),
         Expr::Reference { .. }
         | Expr::Variable(_)
         | Expr::Type(_)

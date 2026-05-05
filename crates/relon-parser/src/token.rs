@@ -112,6 +112,12 @@ pub struct TypeNode {
     pub generics: Vec<TypeNode>,
     pub is_optional: bool,
     pub range: TokenRange,
+    /// `Some(_)` only when this node is an alternative inside a tagged
+    /// `Enum<...>` (sum type). `Some(vec![])` is a unit variant; `Some(non-empty)`
+    /// carries the variant's struct-shape payload as `(field_name, field_type)`
+    /// pairs. Stays `None` for every non-variant type expression so the rest
+    /// of the type system continues to ignore it.
+    pub variant_fields: Option<Vec<(String, TypeNode)>>,
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -238,6 +244,16 @@ pub enum Expr {
     Closure {
         params: Vec<ClosureParam>,
         return_type: Option<TypeNode>,
+        body: Node,
+    },
+
+    /// Tagged-enum variant constructor: `EnumName.VariantName { field: value, ... }`.
+    /// Unit variants share the bare-identifier-path form parsed as `Variable`
+    /// — the evaluator promotes them to a variant when the head resolves to
+    /// a sum-type schema.
+    VariantCtor {
+        enum_path: Vec<String>,
+        variant: String,
         body: Node,
     },
 }

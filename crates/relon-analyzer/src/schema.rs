@@ -22,7 +22,7 @@
 
 use crate::diagnostic::{span_of, Diagnostic};
 use crate::tree::AnalyzedTree;
-use relon_parser::{Decorator, Expr, Node, Operator, TokenKey, TokenRange, TypeNode};
+use relon_parser::{Decorator, Expr, Node, NodeId, Operator, TokenKey, TokenRange, TypeNode};
 use std::sync::Arc;
 
 /// Static skeleton of a `@schema` definition. The evaluator owns the
@@ -43,6 +43,20 @@ pub struct SchemaDef {
     /// validation time to fetch the base's runtime `Value::Schema`.
     pub bases: Vec<BaseRef>,
     /// Source range of the schema body (for diagnostics / LSP hover).
+    pub range: TokenRange,
+    /// Tagged-enum variants, populated for sum-type schemas
+    /// (`@schema X: Enum<A { ... }, B>`). When non-empty, `fields` and
+    /// `bases` are unused — the schema is consumed via variant
+    /// construction and pattern matching instead of dict validation.
+    pub variants: Vec<EnumVariant>,
+}
+
+/// One alternative inside a sum-type Enum schema. `fields` is empty for
+/// unit variants like `Push`.
+#[derive(Debug, Clone)]
+pub struct EnumVariant {
+    pub name: String,
+    pub fields: Vec<SchemaFieldDef>,
     pub range: TokenRange,
 }
 
@@ -146,6 +160,7 @@ pub fn lower_schema_pure(
         fields: Vec::new(),
         bases: Vec::new(),
         range: value.range,
+        variants: Vec::new(),
     };
     let ok = walk_schema_body(value, &mut def, &mut tmp);
     let diags = std::mem::take(&mut tmp.diagnostics);
@@ -162,6 +177,12 @@ pub fn lower_schema_pure(
 /// pass refuses to interpret (and a diagnostic was emitted).
 fn walk_schema_body(node: &Node, def: &mut SchemaDef, tree: &mut AnalyzedTree) -> bool {
     match &*node.expr {
+        // `@schema X: Enum<...>` body — a Type whose head is `Enum`. Detect
+        // tagged-enum form (alternatives carrying `variant_fields`) here so
+        // the analyzer can expose `def.variants` to downstream passes.
+        Expr::Type(t) if t.path.len() == 1 && t.path[0] == "Enum" => {
+            lower_enum_body(t, def, tree)
+        }
         Expr::Dict(pairs) => {
             collect_fields(pairs, def, tree);
             true
@@ -195,6 +216,54 @@ fn walk_schema_body(node: &Node, def: &mut SchemaDef, tree: &mut AnalyzedTree) -
             false
         }
     }
+}
+
+/// Lower an `Enum<...>` schema body. If any alternative carries
+/// `variant_fields`, the schema is treated as a tagged sum type and every
+/// alternative must be a named variant — otherwise we emit
+/// `HeterogeneousEnum`. Untagged enums (no `variant_fields` anywhere) are
+/// left intact for runtime check (`def.variants` stays empty).
+fn lower_enum_body(t: &TypeNode, def: &mut SchemaDef, tree: &mut AnalyzedTree) -> bool {
+    let any_variant = t.generics.iter().any(|g| g.variant_fields.is_some());
+    if !any_variant {
+        // Plain untagged enum — runtime owns it. We still mark the schema
+        // valid so the host has a `SchemaDef` keyed at this node id.
+        return true;
+    }
+    let all_variants = t.generics.iter().all(|g| g.variant_fields.is_some());
+    if !all_variants {
+        tree.diagnostics.push(Diagnostic::HeterogeneousEnum {
+            range: span_of(t.range),
+        });
+        return false;
+    }
+    for alt in &t.generics {
+        let Some(fields_spec) = &alt.variant_fields else {
+            continue;
+        };
+        let variant_name = alt.path.first().cloned().unwrap_or_default();
+        let mut fields = Vec::new();
+        for (fname, ftype) in fields_spec {
+            fields.push(SchemaFieldDef {
+                name: fname.clone(),
+                type_hint: Some(ftype.clone()),
+                value_range: ftype.range,
+                is_wildcard: true,
+                value_node: Arc::new(Node::with_id(
+                    NodeId::SYNTHETIC,
+                    Expr::Wildcard,
+                    ftype.range,
+                )),
+                meta_decorators: Vec::new(),
+            });
+        }
+        def.variants.push(EnumVariant {
+            name: variant_name,
+            fields,
+            range: alt.range,
+        });
+    }
+    true
 }
 
 fn collect_fields(pairs: &[(TokenKey, Node)], def: &mut SchemaDef, tree: &mut AnalyzedTree) {
@@ -303,6 +372,7 @@ fn expr_kind(expr: &Expr) -> String {
         Expr::Where { .. } => "Where",
         Expr::Match { .. } => "Match",
         Expr::Closure { .. } => "Closure",
+        Expr::VariantCtor { .. } => "VariantCtor",
     }
     .to_string()
 }
@@ -394,5 +464,62 @@ mod tests {
             }"#,
         );
         assert!(!tree.has_errors(), "{:?}", tree.diagnostics);
+    }
+
+    #[test]
+    fn lowers_sum_type_enum_schema() {
+        let tree = analyze_str(
+            r#"{
+                @schema Notification: Enum<
+                    Email { address: String, subject: String },
+                    SMS { phone: String },
+                    Push,
+                >
+            }"#,
+        );
+        assert!(!tree.has_errors(), "{:?}", tree.diagnostics);
+        let def = tree
+            .schemas
+            .values()
+            .find(|d| d.name.as_deref() == Some("Notification"))
+            .expect("schema present");
+        assert_eq!(def.variants.len(), 3);
+        assert_eq!(def.variants[0].name, "Email");
+        assert_eq!(def.variants[0].fields.len(), 2);
+        assert_eq!(def.variants[2].name, "Push");
+        assert_eq!(def.variants[2].fields.len(), 0);
+    }
+
+    #[test]
+    fn lowers_single_variant_enum_schema() {
+        let tree = analyze_str(
+            r#"{
+                @schema Wrap: Enum<Only { v: Int }>
+            }"#,
+        );
+        assert!(!tree.has_errors(), "{:?}", tree.diagnostics);
+        let def = tree
+            .schemas
+            .values()
+            .find(|d| d.name.as_deref() == Some("Wrap"))
+            .expect("schema present");
+        assert_eq!(def.variants.len(), 1);
+        assert_eq!(def.variants[0].name, "Only");
+    }
+
+    #[test]
+    fn diagnoses_heterogeneous_enum() {
+        // Mixing a literal `"hot"` and a struct variant `Email { ... }`
+        // is the classic heterogeneous-enum mistake.
+        let tree = analyze_str(
+            r#"{
+                @schema Mixed: Enum<"hot", Email { address: String }>
+            }"#,
+        );
+        assert!(tree.has_errors(), "{:?}", tree.diagnostics);
+        assert!(tree
+            .diagnostics
+            .iter()
+            .any(|d| matches!(d, Diagnostic::HeterogeneousEnum { .. })));
     }
 }

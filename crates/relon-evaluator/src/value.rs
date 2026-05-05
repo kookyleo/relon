@@ -9,15 +9,29 @@ use std::sync::Arc;
 pub struct ValueDict {
     pub map: BTreeMap<String, Value>,
     pub brand: Option<String>,
+    /// Name of the parent sum-type Enum when this dict is a tagged-enum
+    /// variant. `Some("Notification")` distinguishes a `Notification.Email`
+    /// payload from a plain `@schema Email { ... }` value (both have
+    /// `brand = Some("Email")`); the JSON serializer uses it to wrap the
+    /// payload as `{ Email: { ... } }` only for the variant case.
+    pub variant_of: Option<String>,
 }
 
 impl ValueDict {
     pub fn new(map: BTreeMap<String, Value>) -> Self {
-        Self { map, brand: None }
+        Self {
+            map,
+            brand: None,
+            variant_of: None,
+        }
     }
 
     pub fn with_brand(map: BTreeMap<String, Value>, brand: Option<String>) -> Self {
-        Self { map, brand }
+        Self {
+            map,
+            brand,
+            variant_of: None,
+        }
     }
 }
 
@@ -36,13 +50,17 @@ impl<'de> Deserialize<'de> for ValueDict {
         D: serde::Deserializer<'de>,
     {
         let map = BTreeMap::deserialize(deserializer)?;
-        Ok(ValueDict { map, brand: None })
+        Ok(ValueDict {
+            map,
+            brand: None,
+            variant_of: None,
+        })
     }
 }
 
 impl PartialEq for ValueDict {
     fn eq(&self, other: &Self) -> bool {
-        self.map == other.map && self.brand == other.brand
+        self.map == other.map && self.brand == other.brand && self.variant_of == other.variant_of
     }
 }
 
@@ -91,6 +109,14 @@ pub enum Value {
     /// A user-defined type schema: Key -> SchemaField
     #[serde(skip)]
     Schema(std::collections::HashMap<String, SchemaField>),
+    /// A tagged-enum (sum-type) schema: variants by name, each with its
+    /// own field set. Built from `@schema Name: Enum<Var1 { ... }, ...>`.
+    /// Construction with `Name.Var1 { ... }` is dispatched via this value.
+    #[serde(skip)]
+    EnumSchema {
+        name: String,
+        variants: std::collections::HashMap<String, std::collections::HashMap<String, SchemaField>>,
+    },
     /// A single type description
     #[serde(skip)]
     Type(relon_parser::TypeNode),
@@ -109,6 +135,7 @@ impl PartialEq for Value {
             (Self::List(l), Self::List(r)) => l == r,
             (Self::Dict(l), Self::Dict(r)) => l == r,
             (Self::Schema(_), Self::Schema(_)) => false,
+            (Self::EnumSchema { .. }, Self::EnumSchema { .. }) => false,
             (Self::Type(l), Self::Type(r)) => l == r,
             (Self::Wildcard, Self::Wildcard) => true,
             (
@@ -138,13 +165,36 @@ impl Value {
     /// Build a `Value::Dict` from a `BTreeMap`. Use [`Value::branded_dict`]
     /// when the dict carries a nominal-type brand.
     pub fn dict(map: BTreeMap<String, Value>) -> Self {
-        Self::Dict(Arc::new(ValueDict { map, brand: None }))
+        Self::Dict(Arc::new(ValueDict {
+            map,
+            brand: None,
+            variant_of: None,
+        }))
     }
 
     /// Build a `Value::Dict` with an explicit brand (the typed-dict tag set
     /// after a successful `User x: { ... }` validation, etc.).
     pub fn branded_dict(map: BTreeMap<String, Value>, brand: Option<String>) -> Self {
-        Self::Dict(Arc::new(ValueDict { map, brand }))
+        Self::Dict(Arc::new(ValueDict {
+            map,
+            brand,
+            variant_of: None,
+        }))
+    }
+
+    /// Build a `Value::Dict` representing a tagged-enum variant: carries a
+    /// `brand` (the variant name) plus `variant_of` (the parent enum name).
+    /// The JSON projector uses `variant_of` to externally tag the output.
+    pub fn variant_dict(
+        map: BTreeMap<String, Value>,
+        variant: String,
+        enum_name: String,
+    ) -> Self {
+        Self::Dict(Arc::new(ValueDict {
+            map,
+            brand: Some(variant),
+            variant_of: Some(enum_name),
+        }))
     }
 
     /// In-place mutable handle to a `Value::List`'s inner `Vec`. Clones the
@@ -177,6 +227,7 @@ impl Value {
             Value::Dict(d) => !d.map.is_empty(),
             Value::Closure { .. } => true,
             Value::Schema(_) => true,
+            Value::EnumSchema { .. } => true,
             Value::Type(_) => true,
             Value::Wildcard => true,
         }
@@ -193,6 +244,7 @@ impl Value {
             Value::Dict(_) => "Dict",
             Value::Closure { .. } => "Closure",
             Value::Schema(_) => "Schema",
+            Value::EnumSchema { .. } => "EnumSchema",
             Value::Type(_) => "Type",
             Value::Wildcard => "Wildcard",
         }

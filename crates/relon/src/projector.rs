@@ -59,7 +59,11 @@ impl Projector for JsonProjector {
                 for (key, val) in d.map.iter() {
                     if matches!(
                         val,
-                        Value::Closure { .. } | Value::Schema(_) | Value::Type(_) | Value::Wildcard
+                        Value::Closure { .. }
+                            | Value::Schema(_)
+                            | Value::EnumSchema { .. }
+                            | Value::Type(_)
+                            | Value::Wildcard
                     ) {
                         // These variants have no JSON analogue; silently
                         // dropping them keeps internal helpers (closures
@@ -69,10 +73,22 @@ impl Projector for JsonProjector {
                     }
                     map.insert(key.clone(), self.project(val)?);
                 }
-                Ok(serde_json::Value::Object(map))
+                let inner = serde_json::Value::Object(map);
+                // Externally-tagged sum-type variant: wrap as
+                // `{ VariantName: { ...fields... } }` only when the dict
+                // originated from a tagged-enum constructor. Plain
+                // branded dicts (`User x: { ... }`) keep their flat
+                // shape — the brand is purely a runtime tag.
+                if let (Some(_), Some(brand)) = (d.variant_of.as_ref(), d.brand.as_ref()) {
+                    let mut wrapper = serde_json::Map::new();
+                    wrapper.insert(brand.clone(), inner);
+                    Ok(serde_json::Value::Object(wrapper))
+                } else {
+                    Ok(inner)
+                }
             }
             Value::Closure { .. } => Err(crate::Error::UnsupportedClosure),
-            Value::Schema(_) | Value::Type(_) | Value::Wildcard => {
+            Value::Schema(_) | Value::EnumSchema { .. } | Value::Type(_) | Value::Wildcard => {
                 Err(crate::Error::UnsupportedSchema)
             }
         }

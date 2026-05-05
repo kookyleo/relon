@@ -71,15 +71,65 @@ pub enum Diagnostic {
         #[label("type doesn't match `{expected}`")]
         range: SourceSpan,
     },
+
+    #[error("non-exhaustive match on `{enum_name}`: missing variant(s) `{}`", missing_variants.join("`, `"))]
+    #[diagnostic(
+        code(relon::analyze::non_exhaustive_match),
+        help("Cover every variant of the matched enum, or add a `_` wildcard arm.")
+    )]
+    NonExhaustiveMatch {
+        enum_name: String,
+        missing_variants: Vec<String>,
+        #[label("missing variants")]
+        range: SourceSpan,
+    },
+
+    #[error("unknown variant `{variant_name}` of `{enum_name}`")]
+    #[diagnostic(
+        code(relon::analyze::unknown_variant),
+        help("{}", suggestion.as_deref().map(|s| format!("did you mean `{s}`?")).unwrap_or_else(|| format!("the variants of `{enum_name}` are listed in its @schema definition.")))
+    )]
+    UnknownVariant {
+        enum_name: String,
+        variant_name: String,
+        suggestion: Option<String>,
+        #[label("not a variant of `{enum_name}`")]
+        range: SourceSpan,
+    },
+
+    #[error("duplicate match arm for variant `{variant_name}` of `{enum_name}`")]
+    #[diagnostic(
+        code(relon::analyze::duplicate_match_arm),
+        help("Each variant should appear at most once in a match expression.")
+    )]
+    DuplicateMatchArm {
+        enum_name: String,
+        variant_name: String,
+        #[label("duplicate arm")]
+        range: SourceSpan,
+    },
+
+    #[error("Enum<...> mixes named variants with literal/type alternatives")]
+    #[diagnostic(
+        code(relon::analyze::heterogeneous_enum),
+        help("A tagged Enum's alternatives must all be named variants. Either remove the literal/type members or split into separate Enums.")
+    )]
+    HeterogeneousEnum {
+        #[label("inconsistent enum form")]
+        range: SourceSpan,
+    },
 }
 
 impl Diagnostic {
     pub fn severity(&self) -> Severity {
         match self {
             // Structurally broken: the program can't proceed.
-            Diagnostic::SchemaBodyNotDict { .. } | Diagnostic::SchemaFieldUntyped { .. } => {
-                Severity::Error
-            }
+            Diagnostic::SchemaBodyNotDict { .. }
+            | Diagnostic::SchemaFieldUntyped { .. }
+            | Diagnostic::NonExhaustiveMatch { .. }
+            | Diagnostic::UnknownVariant { .. }
+            | Diagnostic::DuplicateMatchArm { .. }
+            | Diagnostic::HeterogeneousEnum { .. } => Severity::Error,
             // Informational: the analyzer's view is conservative — a
             // spread, closure binding, or runtime-computed field may
             // still resolve, so we don't gate evaluation on it.

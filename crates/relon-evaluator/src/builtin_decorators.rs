@@ -63,6 +63,11 @@ impl DecoratorPlugin for SchemaDecorator {
         // work that genuinely requires the live scope.
         if let Some(tree) = eval.context.analyzed.as_ref() {
             if let Some(def) = tree.schema(node.id) {
+                if !def.variants.is_empty() {
+                    return Ok(PreEvalOutcome::Override(Box::new(build_enum_schema(
+                        eval, def, scope,
+                    )?)));
+                }
                 let fields = eval.build_schema_from_def(def, scope)?;
                 return Ok(PreEvalOutcome::Override(Box::new(Value::Schema(fields))));
             }
@@ -74,6 +79,11 @@ impl DecoratorPlugin for SchemaDecorator {
         // and there's no host channel to surface them on.
         let (lowered, _diags) = relon_analyzer::lower_schema_pure(None, node);
         if let Some(def) = lowered {
+            if !def.variants.is_empty() {
+                return Ok(PreEvalOutcome::Override(Box::new(build_enum_schema(
+                    eval, &def, scope,
+                )?)));
+            }
             let fields = eval.build_schema_from_def(&def, scope)?;
             Ok(PreEvalOutcome::Override(Box::new(Value::Schema(fields))))
         } else {
@@ -84,6 +94,43 @@ impl DecoratorPlugin for SchemaDecorator {
             Ok(PreEvalOutcome::Pass)
         }
     }
+}
+
+/// Build a runtime `Value::EnumSchema` from a sum-type `SchemaDef`. Each
+/// variant becomes its own `HashMap<String, SchemaField>` so the variant
+/// constructor path can validate body shapes the same way `apply_schema`
+/// does for plain dicts.
+fn build_enum_schema(
+    _eval: &Evaluator<'_>,
+    def: &relon_analyzer::SchemaDef,
+    _scope: &Arc<Scope>,
+) -> Result<Value, RuntimeError> {
+    use std::collections::HashMap;
+    let mut variants = HashMap::new();
+    for variant in &def.variants {
+        let mut fields = HashMap::new();
+        for f in &variant.fields {
+            let type_node = f.type_hint.clone().unwrap_or_else(|| relon_parser::TypeNode {
+                path: vec!["Any".into()],
+                generics: Vec::new(),
+                is_optional: false,
+                range: f.value_range,
+                variant_fields: None,
+            });
+            fields.insert(
+                f.name.clone(),
+                SchemaField {
+                    type_hint: type_node,
+                    predicates: vec![Value::Wildcard],
+                    custom_error: None,
+                    default_value: None,
+                },
+            );
+        }
+        variants.insert(variant.name.clone(), fields);
+    }
+    let name = def.name.clone().unwrap_or_default();
+    Ok(Value::EnumSchema { name, variants })
 }
 
 /// `@expect("message")` / `@msg(...)` / `@error(...)` — attaches a custom error

@@ -764,6 +764,11 @@ impl<'a> Evaluator<'a> {
             }
             Expr::Type(t) => Ok(Value::Type(t.clone())),
             Expr::Wildcard => Ok(Value::Wildcard),
+            Expr::VariantCtor {
+                enum_path,
+                variant,
+                body,
+            } => self.eval_variant_ctor(enum_path, variant, body, &current_scope, node.range),
         }?;
 
         if !is_schema_pred {
@@ -975,6 +980,88 @@ impl<'a> Evaluator<'a> {
             .unwrap()
             .insert(source.canonical_id, evaluated.clone());
         Ok(evaluated)
+    }
+
+    /// Construct a tagged-enum variant value: `EnumName.Variant { fields }`.
+    /// Looks up the parent enum schema in scope, validates the body against
+    /// the variant's field set (if the schema is a sum type), and emits a
+    /// `Value::Dict` branded with `variant` and `variant_of = enum_name`.
+    pub(crate) fn eval_variant_ctor(
+        &self,
+        enum_path: &[String],
+        variant: &str,
+        body: &Node,
+        scope: &Arc<Scope>,
+        range: TokenRange,
+    ) -> Result<Value, RuntimeError> {
+        // Resolve the head identifier; everything else is path access.
+        let head = enum_path.first().ok_or_else(|| {
+            RuntimeError::UnsupportedOperator("variant constructor without enum".into(), range)
+        })?;
+        let mut current = scope
+            .get_local(head)
+            .ok_or_else(|| RuntimeError::VariableNotFound(head.clone(), range))?;
+        for seg in &enum_path[1..] {
+            match current {
+                Value::Dict(d) => {
+                    current = d.map.get(seg).cloned().ok_or_else(|| {
+                        RuntimeError::VariableNotFound(format!("{head}.{seg}"), range)
+                    })?;
+                }
+                _ => {
+                    return Err(RuntimeError::TypeMismatch {
+                        expected: "Dict or EnumSchema".into(),
+                        found: current.type_name().to_string(),
+                        range,
+                    })
+                }
+            }
+        }
+        let enum_name = enum_path.join(".");
+        let Value::EnumSchema { name, variants } = current else {
+            return Err(RuntimeError::TypeMismatch {
+                expected: format!("EnumSchema `{enum_name}`"),
+                found: current.type_name().to_string(),
+                range,
+            });
+        };
+        // Slow-path schema lowering doesn't know the binding name; fall
+        // back to the enum_path so the brand metadata is non-empty.
+        let name = if name.is_empty() { enum_name.clone() } else { name };
+        let Some(variant_fields) = variants.get(variant) else {
+            return Err(RuntimeError::TypeMismatch {
+                expected: format!("a variant of `{name}`"),
+                found: format!("`{variant}`"),
+                range,
+            });
+        };
+        // Build the body dict, then validate field-by-field against the
+        // variant's spec. Empty body is fine for unit variants.
+        let body_val = self.eval(body, scope)?;
+        let Value::Dict(body_dict) = body_val else {
+            return Err(RuntimeError::TypeMismatch {
+                expected: "Dict variant body".into(),
+                found: "non-Dict".into(),
+                range,
+            });
+        };
+        let mut map = body_dict.map.clone();
+        for (fname, field_def) in variant_fields.iter() {
+            if let Some(fval) = map.get_mut(fname) {
+                self.check_type(fval, &field_def.type_hint, scope, range)?;
+            } else if field_def.type_hint.is_optional {
+                continue;
+            } else if let Some(default) = &field_def.default_value {
+                map.insert(fname.clone(), default.clone());
+            } else {
+                return Err(RuntimeError::TypeMismatch {
+                    expected: format!("field `{fname}` for variant `{variant}`"),
+                    found: "missing".into(),
+                    range,
+                });
+            }
+        }
+        Ok(Value::variant_dict(map, variant.to_string(), name))
     }
 
     pub(crate) fn call_function_by_value(
@@ -1236,8 +1323,14 @@ impl<'a> Evaluator<'a> {
                 // being evaluated, which would re-enter `prepare_dict_scope` on the
                 // same dict and recurse forever. Defer those to lazy thunk eval.
                 let is_dict_schema = is_schema && matches!(value_node.expr.as_ref(), Expr::Dict(_));
+                // Sum-type Enum schemas (`@schema X: Enum<A {...}, B>`) live in a
+                // Type-bodied node. Same eager-eval rationale as the Dict case:
+                // sibling refs to `X` need a value before lazy thunks can resolve.
+                let is_enum_schema = is_schema
+                    && matches!(value_node.expr.as_ref(),
+                        Expr::Type(t) if t.path.len() == 1 && t.path[0] == "Enum");
 
-                if Self::is_logic_definition(value_node) || is_dict_schema {
+                if Self::is_logic_definition(value_node) || is_dict_schema || is_enum_schema {
                     let key_str = match key {
                         TokenKey::String(s, _, _) => s.clone(),
                         TokenKey::Dynamic(expr_node, _) => match self.eval(expr_node, scope)? {
@@ -1320,6 +1413,7 @@ impl std::fmt::Display for Value {
             Value::Dict(d) => write!(f, "{:?}", d.map),
             Value::Closure { .. } => write!(f, "<closure>"),
             Value::Schema(_) => write!(f, "<schema>"),
+            Value::EnumSchema { name, .. } => write!(f, "<enum {name}>"),
             Value::Type(t) => write!(f, "Type<{}>", crate::schema::format_type_node(t)),
             Value::Wildcard => write!(f, "*"),
         }

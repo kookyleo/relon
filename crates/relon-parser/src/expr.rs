@@ -242,6 +242,7 @@ fn parse_atomic<'a>(input: &mut Span<'a>) -> ModalResult<Node> {
             parse_wildcard,
             parse_ref_var,
             |i: &mut Span<'a>| parse_fn_call(i, parse_expr),
+            parse_variant_ctor,
             parse_var,
             parse_list,
             parse_dict,
@@ -249,6 +250,85 @@ fn parse_atomic<'a>(input: &mut Span<'a>) -> ModalResult<Node> {
         )),
     )
     .parse_next(input)
+}
+
+/// Parse a tagged-enum variant constructor expression of the shape
+/// `Identifier (.Identifier)+ { ... }`. Only matches when at least two
+/// dotted segments precede a literal `{` — that's enough to disambiguate
+/// from member access followed by a dict literal in an unrelated position
+/// (which the grammar doesn't otherwise allow as an atom).
+fn parse_variant_ctor<'a>(input: &mut Span<'a>) -> ModalResult<Node> {
+    let checkpoint = input.checkpoint();
+    let start_offset = input.location();
+
+    let head = match crate::id::id.parse_next(input) {
+        Ok(t) => t.0,
+        Err(e) => {
+            input.reset(&checkpoint);
+            return Err(e);
+        }
+    };
+    let mut path = vec![head];
+    loop {
+        let seg_checkpoint = input.checkpoint();
+        if winnow::token::literal::<_, _, winnow::error::ContextError>(".")
+            .parse_next(input)
+            .is_err()
+        {
+            input.reset(&seg_checkpoint);
+            break;
+        }
+        match crate::id::id.parse_next(input) {
+            Ok(t) => path.push(t.0),
+            Err(_) => {
+                input.reset(&checkpoint);
+                return Err(winnow::error::ErrMode::Backtrack(
+                    winnow::error::ContextError::default(),
+                ));
+            }
+        }
+    }
+    if path.len() < 2 {
+        input.reset(&checkpoint);
+        return Err(winnow::error::ErrMode::Backtrack(
+            winnow::error::ContextError::default(),
+        ));
+    }
+    // Require an opening brace right here (whitespace permitted) — that's
+    // what tells us "constructor", not "field access".
+    let _ = soc0.parse_next(input)?;
+    if winnow::token::literal::<_, _, winnow::error::ContextError>("{")
+        .parse_next(input)
+        .is_err()
+    {
+        input.reset(&checkpoint);
+        return Err(winnow::error::ErrMode::Backtrack(
+            winnow::error::ContextError::default(),
+        ));
+    }
+    // We already consumed `{`; reconstruct the dict by parsing the inner
+    // pairs ourselves, mirroring what `parse_dict` does after its own `{`.
+    let body_start = input.location() - 1;
+    let pairs: Vec<(crate::TokenKey, Node)> = winnow::combinator::separated(
+        0..,
+        crate::structure::dict::parse_pair,
+        (soc0, ",", soc0),
+    )
+    .parse_next(input)?;
+    let _ = (soc0, opt(","), soc0, "}").parse_next(input)?;
+    let body_end = input.location();
+    let body = Node::new(Expr::Dict(pairs), create_range(input, body_start, body_end));
+
+    let variant = path.pop().unwrap();
+    let end_offset = input.location();
+    Ok(Node::new(
+        Expr::VariantCtor {
+            enum_path: path,
+            variant,
+            body,
+        },
+        create_range(input, start_offset, end_offset),
+    ))
 }
 
 fn parse_wildcard<'a>(input: &mut Span<'a>) -> ModalResult<Node> {
@@ -299,6 +379,77 @@ fn parse_type_expr<'a>(input: &mut Span<'a>) -> ModalResult<Node> {
     }
 }
 
+/// Parser for one alternative inside `Enum<...>`. Tries the variant form
+/// (named single-segment identifier optionally followed by a `{ field: Type, ... }`
+/// body) before falling back to `parse_type_node`. The variant form sets
+/// `variant_fields = Some(...)` so the analyzer can detect tagged-enum shapes
+/// downstream.
+pub fn parse_enum_alternative<'a>(input: &mut Span<'a>) -> ModalResult<crate::TypeNode> {
+    let checkpoint = input.checkpoint();
+    let start_offset = input.location();
+
+    // Variant form requires a single identifier (no dots, no `<...>` generics,
+    // no `?`) followed by either `{ ... }` or a separator (`,` / `>`).
+    let _ = soc0.parse_next(input)?;
+    let id_start = input.location();
+    let Ok(name) = crate::id::id.parse_next(input).map(|t| t.0) else {
+        input.reset(&checkpoint);
+        return parse_type_node.parse_next(input);
+    };
+    let id_end = input.location();
+
+    // Look ahead: does a `{` come next (after whitespace)?
+    let _ = soc0.parse_next(input)?;
+    let peek = input.as_ref().chars().next();
+    if peek == Some('{') {
+        let _ = "{".parse_next(input)?;
+        let fields_result: ModalResult<Vec<(String, crate::TypeNode)>> =
+            winnow::combinator::separated(0.., parse_variant_field, (soc0, ",", soc0))
+                .parse_next(input);
+        match fields_result {
+            Ok(fields) => {
+                let _ = (soc0, opt(","), soc0, "}").parse_next(input)?;
+                let end_offset = input.location();
+                return Ok(crate::TypeNode {
+                    path: vec![name],
+                    generics: Vec::new(),
+                    is_optional: false,
+                    range: create_range(input, start_offset, end_offset),
+                    variant_fields: Some(fields),
+                });
+            }
+            Err(_) => {
+                input.reset(&checkpoint);
+                return parse_type_node.parse_next(input);
+            }
+        }
+    }
+
+    // Bare identifier — only a unit variant if the next non-space char is
+    // `,` (more arms follow) or `>` (end of Enum<>). Otherwise fall back so
+    // path-shaped types like `Foo.Bar` and `Some<T>` still parse.
+    if peek == Some(',') || peek == Some('>') {
+        return Ok(crate::TypeNode {
+            path: vec![name],
+            generics: Vec::new(),
+            is_optional: false,
+            range: create_range(input, id_start, id_end),
+            variant_fields: Some(Vec::new()),
+        });
+    }
+
+    input.reset(&checkpoint);
+    parse_type_node.parse_next(input)
+}
+
+fn parse_variant_field<'a>(input: &mut Span<'a>) -> ModalResult<(String, crate::TypeNode)> {
+    let _ = soc0.parse_next(input)?;
+    let name = crate::id::id.parse_next(input)?.0;
+    let _ = (soc0, ":", soc0).parse_next(input)?;
+    let ty = parse_type_node.parse_next(input)?;
+    Ok((name, ty))
+}
+
 pub fn parse_type_node<'a>(input: &mut Span<'a>) -> ModalResult<crate::TypeNode> {
     let start_offset = input.location();
 
@@ -339,12 +490,30 @@ pub fn parse_type_node<'a>(input: &mut Span<'a>) -> ModalResult<crate::TypeNode>
     path.extend(rest);
 
     let generics_checkpoint = input.checkpoint();
-    let generics = if opt(preceded(soc0, "<")).parse_next(input)?.is_some() {
-        let params_result = winnow::combinator::separated(1.., parse_type_node, (soc0, ",", soc0))
-            .parse_next(input);
+    // Enum<...> alternatives may carry variant-struct bodies (`Email { ... }`)
+    // — switch parsers when the head identifier is `Enum`. Everything else
+    // sticks with `parse_type_node` so generic params elsewhere stay strict.
+    let is_enum_head = path.len() == 1 && path[0] == "Enum";
+    let mut generics = if opt(preceded(soc0, "<")).parse_next(input)?.is_some() {
+        let params_result: ModalResult<Vec<crate::TypeNode>> = if is_enum_head {
+            winnow::combinator::separated(1.., parse_enum_alternative, (soc0, ",", soc0))
+                .parse_next(input)
+        } else {
+            winnow::combinator::separated(1.., parse_type_node, (soc0, ",", soc0))
+                .parse_next(input)
+        };
         match params_result {
             Ok(params) => {
-                if (soc0, ">").parse_next(input).is_ok() {
+                // Allow trailing comma inside `Enum<..., Variant,>`.
+                if is_enum_head {
+                    let _ = (soc0, opt(","), soc0).parse_next(input)?;
+                } else {
+                    let _ = soc0.parse_next(input)?;
+                }
+                if winnow::token::literal::<_, _, winnow::error::ContextError>(">")
+                    .parse_next(input)
+                    .is_ok()
+                {
                     params
                 } else {
                     input.reset(&generics_checkpoint);
@@ -359,6 +528,21 @@ pub fn parse_type_node<'a>(input: &mut Span<'a>) -> ModalResult<crate::TypeNode>
     } else {
         Vec::new()
     };
+    // Disambiguate `Enum<Int, String>` (untagged) from `Enum<Push>`: a
+    // sum-type Enum requires at least one alternative with a `{ ... }`
+    // body. If no alternative carries struct-shape fields, clear the
+    // tentative unit-variant markers so the rest of the pipeline treats
+    // this as the classic untagged form.
+    if is_enum_head {
+        let any_struct_form = generics
+            .iter()
+            .any(|g| g.variant_fields.as_ref().is_some_and(|f| !f.is_empty()));
+        if !any_struct_form {
+            for g in &mut generics {
+                g.variant_fields = None;
+            }
+        }
+    }
 
     let is_optional = opt("?").parse_next(input)?.is_some();
 
@@ -368,6 +552,7 @@ pub fn parse_type_node<'a>(input: &mut Span<'a>) -> ModalResult<crate::TypeNode>
         generics,
         is_optional,
         range: create_range(input, start_offset, end_offset),
+        variant_fields: None,
     })
 }
 
@@ -580,5 +765,65 @@ mod tests {
         let mut s = Span::new("${ /* comment */ 1 // line comment\n }");
         let node = parse_expr_zone(&mut s).unwrap();
         assert!(matches!(*node.expr, Expr::Int(1)));
+    }
+
+    #[test]
+    fn test_parse_enum_variant_struct_form() {
+        // `Enum<Email { address: String }>` — single struct-shape variant.
+        let mut s = Span::new("Enum<Email { address: String, subject: String }>");
+        let t = parse_type_node(&mut s).unwrap();
+        assert_eq!(t.path, vec!["Enum".to_string()]);
+        assert_eq!(t.generics.len(), 1);
+        let alt = &t.generics[0];
+        assert_eq!(alt.path, vec!["Email".to_string()]);
+        let fields = alt.variant_fields.as_ref().expect("variant_fields set");
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields[0].0, "address");
+        assert_eq!(fields[1].0, "subject");
+    }
+
+    #[test]
+    fn test_parse_enum_variant_unit_form() {
+        // Mix struct + unit variants.
+        let mut s = Span::new("Enum<Email { address: String }, Push>");
+        let t = parse_type_node(&mut s).unwrap();
+        assert_eq!(t.generics.len(), 2);
+        assert_eq!(t.generics[1].path, vec!["Push".to_string()]);
+        // Unit variant carries an empty variant_fields, NOT None.
+        assert_eq!(
+            t.generics[1].variant_fields.as_ref().map(|v| v.len()),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn test_parse_enum_untagged_form_unchanged() {
+        // The classic `Enum<"a", "b">` and `Enum<Int, String>` must keep
+        // working with `variant_fields = None` on every alternative.
+        let mut s = Span::new(r#"Enum<"a", "b">"#);
+        let t = parse_type_node(&mut s).unwrap();
+        assert_eq!(t.generics.len(), 2);
+        assert!(t.generics.iter().all(|g| g.variant_fields.is_none()));
+
+        let mut s = Span::new("Enum<Int, String>");
+        let t = parse_type_node(&mut s).unwrap();
+        assert_eq!(t.generics.len(), 2);
+        assert!(t.generics.iter().all(|g| g.variant_fields.is_none()));
+    }
+
+    #[test]
+    fn test_parse_variant_ctor_expr() {
+        // `Notification.Email { address: "x" }` parses as a VariantCtor.
+        let mut s = Span::new(r#"Notification.Email { address: "x" }"#);
+        let node = parse_expr(&mut s).unwrap();
+        match &*node.expr {
+            Expr::VariantCtor {
+                enum_path, variant, ..
+            } => {
+                assert_eq!(enum_path, &vec!["Notification".to_string()]);
+                assert_eq!(variant, "Email");
+            }
+            other => panic!("expected VariantCtor, got {other:?}"),
+        }
     }
 }

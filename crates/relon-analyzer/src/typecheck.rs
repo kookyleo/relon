@@ -18,7 +18,7 @@ use crate::diagnostic::{span_of, Diagnostic};
 use crate::resolve::ScopeFrame;
 use crate::tree::AnalyzedTree;
 use relon_parser::{Expr, Node, RefBase, TokenKey, TypeNode};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Run the type-check walker over `root` and append diagnostics to
 /// `tree`. Must be called after [`crate::resolve::resolve_references`]
@@ -28,11 +28,13 @@ pub fn typecheck(root: &Node, tree: &mut AnalyzedTree) {
     // Collect static type info and field bindings for each declared
     // schema so the value-type pass can look fields up by name.
     let schema_index = build_schema_index(tree);
+    let enum_index = build_enum_index(tree);
 
     let mut walker = Walker {
         tree,
         scope_stack: Vec::new(),
         schema_index,
+        enum_index,
     };
     walker.visit(root);
 }
@@ -57,10 +59,29 @@ fn build_schema_index(tree: &AnalyzedTree) -> SchemaIndex {
     index
 }
 
+/// Map from sum-type Enum schema name → ordered set of its variant names.
+/// Used by the exhaustiveness pass to compare match arms against the
+/// declared variant list.
+type EnumIndex = HashMap<String, Vec<String>>;
+
+fn build_enum_index(tree: &AnalyzedTree) -> EnumIndex {
+    let mut index = EnumIndex::new();
+    for def in tree.schemas.values() {
+        let Some(name) = &def.name else { continue };
+        if def.variants.is_empty() {
+            continue;
+        }
+        let variants: Vec<String> = def.variants.iter().map(|v| v.name.clone()).collect();
+        index.insert(name.clone(), variants);
+    }
+    index
+}
+
 struct Walker<'a> {
     tree: &'a mut AnalyzedTree,
     scope_stack: Vec<ScopeFrame>,
     schema_index: SchemaIndex,
+    enum_index: EnumIndex,
 }
 
 impl<'a> Walker<'a> {
@@ -111,12 +132,102 @@ impl<'a> Walker<'a> {
             Expr::Variable(path) => {
                 self.check_unresolved_var(node, path);
             }
+            Expr::Match { expr, arms } => {
+                self.check_match_exhaustiveness(node, expr, arms);
+                self.visit(expr);
+                for (pat, body) in arms {
+                    self.visit(pat);
+                    self.visit(body);
+                }
+            }
             _ => {
                 for child in iter_children(node) {
                     self.visit(child);
                 }
             }
         }
+    }
+
+    /// Conservative exhaustiveness check: only fires when we can statically
+    /// determine the matched expression's type to be a sum-type Enum.
+    /// Otherwise we silently fall through to the runtime mismatch path.
+    fn check_match_exhaustiveness(&mut self, match_node: &Node, expr: &Node, arms: &[(Node, Node)]) {
+        let Some(enum_name) = self.infer_enum_type(expr) else {
+            return;
+        };
+        let Some(variants) = self.enum_index.get(&enum_name).cloned() else {
+            return;
+        };
+
+        let mut seen = HashSet::new();
+        let mut has_wildcard = false;
+        for (pat, _) in arms {
+            match pat.expr.as_ref() {
+                Expr::Wildcard => {
+                    has_wildcard = true;
+                }
+                Expr::Type(t) if t.path.len() == 1 => {
+                    let arm_name = &t.path[0];
+                    if !variants.contains(arm_name) {
+                        let suggestion = closest_variant(arm_name, &variants);
+                        self.tree.diagnostics.push(Diagnostic::UnknownVariant {
+                            enum_name: enum_name.clone(),
+                            variant_name: arm_name.clone(),
+                            suggestion,
+                            range: span_of(pat.range),
+                        });
+                        continue;
+                    }
+                    if !seen.insert(arm_name.clone()) {
+                        self.tree.diagnostics.push(Diagnostic::DuplicateMatchArm {
+                            enum_name: enum_name.clone(),
+                            variant_name: arm_name.clone(),
+                            range: span_of(pat.range),
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+        if has_wildcard {
+            return;
+        }
+        let missing: Vec<String> = variants
+            .iter()
+            .filter(|v| !seen.contains(*v))
+            .cloned()
+            .collect();
+        if !missing.is_empty() {
+            self.tree.diagnostics.push(Diagnostic::NonExhaustiveMatch {
+                enum_name,
+                missing_variants: missing,
+                range: span_of(match_node.range),
+            });
+        }
+    }
+
+    /// Try to determine the static enum-name of `node`. We only handle
+    /// the cases where the analyzer's resolution table already gave us a
+    /// stable target NodeId — anything else would require re-walking the
+    /// AST, which is exactly what we want to avoid here.
+    fn infer_enum_type(&self, node: &Node) -> Option<String> {
+        let resolved = self.tree.references.get(&node.id)?;
+        let target_node = self.tree.node_index.get(&resolved.target)?.clone();
+        // Direct hint on the binding: `Notification x: ...` declared a
+        // type that names a sum-type Enum schema.
+        if let Some(t) = &target_node.type_hint {
+            if t.path.len() == 1 && self.enum_index.contains_key(&t.path[0]) {
+                return Some(t.path[0].clone());
+            }
+        }
+        // Fallback: the binding's value is itself a `VariantCtor` —
+        // its enum_path[0] is the enum schema head.
+        if let Expr::VariantCtor { enum_path, .. } = target_node.expr.as_ref() {
+            if !enum_path.is_empty() && self.enum_index.contains_key(&enum_path[0]) {
+                return Some(enum_path[0].clone());
+            }
+        }
+        None
     }
 
     fn check_unresolved_ref(&mut self, node: &Node, base: &RefBase, path: &[TokenKey]) {
@@ -293,6 +404,37 @@ fn path_head(path: &[TokenKey]) -> Option<String> {
     }
 }
 
+/// Find the closest variant name (case-insensitive Levenshtein distance
+/// up to 2) for a did-you-mean hint. Returns `None` when nothing's close
+/// enough to suggest.
+fn closest_variant(target: &str, candidates: &[String]) -> Option<String> {
+    let mut best: Option<(usize, &String)> = None;
+    let target_lower = target.to_lowercase();
+    for cand in candidates {
+        let dist = levenshtein(&target_lower, &cand.to_lowercase());
+        if dist <= 2 && best.is_none_or(|(d, _)| dist < d) {
+            best = Some((dist, cand));
+        }
+    }
+    best.map(|(_, s)| s.clone())
+}
+
+fn levenshtein(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur = vec![0; b.len() + 1];
+    for (i, ca) in a.iter().enumerate() {
+        cur[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let cost = if ca == cb { 0 } else { 1 };
+            cur[j + 1] = (prev[j + 1] + 1).min(cur[j] + 1).min(prev[j] + cost);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()]
+}
+
 /// Names registered by the evaluator's stdlib + commonly-used
 /// host-supplied helpers. Conservative — we'd rather miss a real
 /// unresolved warning than spam the user with false positives on
@@ -380,6 +522,7 @@ fn iter_children(node: &Node) -> Vec<&Node> {
             }
         }
         Expr::Closure { body, .. } => out.push(body),
+        Expr::VariantCtor { body, .. } => out.push(body),
         _ => {}
     }
     out
@@ -477,5 +620,129 @@ mod tests {
             "{:?}",
             tree.diagnostics
         );
+    }
+
+    #[test]
+    fn flags_non_exhaustive_match_on_sum_enum() {
+        let tree = analyze_str(
+            r#"{
+                @schema N: Enum<A { x: Int }, B { y: Int }, C>,
+                N v: N.A { x: 1 },
+                out: v match {
+                    A: 1,
+                    B: 2
+                }
+            }"#,
+        );
+        let nx: Vec<_> = tree
+            .diagnostics
+            .iter()
+            .filter(|d| matches!(d, Diagnostic::NonExhaustiveMatch { .. }))
+            .collect();
+        assert_eq!(nx.len(), 1, "{:?}", tree.diagnostics);
+        if let Diagnostic::NonExhaustiveMatch {
+            enum_name,
+            missing_variants,
+            ..
+        } = nx[0]
+        {
+            assert_eq!(enum_name, "N");
+            assert_eq!(missing_variants, &vec!["C".to_string()]);
+        } else {
+            panic!()
+        }
+    }
+
+    #[test]
+    fn flags_unknown_variant_with_did_you_mean() {
+        let tree = analyze_str(
+            r#"{
+                @schema N: Enum<Email { x: Int }, SMS { y: Int }>,
+                N v: N.Email { x: 1 },
+                out: v match {
+                    EMail: 1,
+                    SMS: 2
+                }
+            }"#,
+        );
+        let unknown: Vec<_> = tree
+            .diagnostics
+            .iter()
+            .filter_map(|d| match d {
+                Diagnostic::UnknownVariant {
+                    variant_name,
+                    suggestion,
+                    ..
+                } => Some((variant_name.clone(), suggestion.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(unknown.len(), 1, "{:?}", tree.diagnostics);
+        assert_eq!(unknown[0].0, "EMail");
+        assert_eq!(unknown[0].1.as_deref(), Some("Email"));
+    }
+
+    #[test]
+    fn flags_duplicate_match_arm() {
+        let tree = analyze_str(
+            r#"{
+                @schema N: Enum<A { x: Int }, B { y: Int }>,
+                N v: N.A { x: 1 },
+                out: v match {
+                    A: 1,
+                    A: 2,
+                    B: 3
+                }
+            }"#,
+        );
+        assert!(
+            tree.diagnostics
+                .iter()
+                .any(|d| matches!(d, Diagnostic::DuplicateMatchArm { variant_name, .. } if variant_name == "A")),
+            "{:?}",
+            tree.diagnostics
+        );
+    }
+
+    #[test]
+    fn wildcard_arm_satisfies_exhaustiveness() {
+        let tree = analyze_str(
+            r#"{
+                @schema N: Enum<A { x: Int }, B { y: Int }, C>,
+                N v: N.A { x: 1 },
+                out: v match {
+                    A: 1,
+                    *: 9
+                }
+            }"#,
+        );
+        let nx: Vec<_> = tree
+            .diagnostics
+            .iter()
+            .filter(|d| matches!(d, Diagnostic::NonExhaustiveMatch { .. }))
+            .collect();
+        assert!(nx.is_empty(), "{:?}", tree.diagnostics);
+    }
+
+    #[test]
+    fn skips_exhaustiveness_when_type_uninferrable() {
+        // `mystery` has no type hint and isn't a variant constructor
+        // — the analyzer can't statically determine its enum, so no
+        // exhaustiveness diagnostic should fire.
+        let tree = analyze_str(
+            r#"{
+                @schema N: Enum<A { x: Int }, B { y: Int }>,
+                mystery: 42,
+                out: mystery match {
+                    A: 1
+                }
+            }"#,
+        );
+        let nx: Vec<_> = tree
+            .diagnostics
+            .iter()
+            .filter(|d| matches!(d, Diagnostic::NonExhaustiveMatch { .. }))
+            .collect();
+        assert!(nx.is_empty(), "{:?}", tree.diagnostics);
     }
 }

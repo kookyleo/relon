@@ -1324,6 +1324,144 @@ mod tests {
             panic!("Expected List");
         }
     }
+
+    // ---------- Tagged-enum (sum-type) tests ----------
+
+    #[test]
+    fn variant_ctor_constructs_branded_dict() {
+        let result = eval_doc(
+            r#"{
+                @schema Notification: Enum<
+                    Email { address: String, subject: String },
+                    Push,
+                >,
+                msg: Notification.Email { address: "a@b.c", subject: "hi" }
+            }"#,
+        )
+        .unwrap();
+        let Value::Dict(outer) = result else {
+            panic!("dict")
+        };
+        let Value::Dict(msg) = outer.map.get("msg").unwrap() else {
+            panic!("msg dict")
+        };
+        assert_eq!(msg.brand.as_deref(), Some("Email"));
+        assert_eq!(msg.variant_of.as_deref(), Some("Notification"));
+        assert_eq!(
+            msg.map.get("address").unwrap(),
+            &Value::String("a@b.c".to_string())
+        );
+    }
+
+    #[test]
+    fn variant_ctor_unit_variant_works() {
+        let result = eval_doc(
+            r#"{
+                @schema Notification: Enum<
+                    Email { address: String },
+                    Push,
+                >,
+                msg: Notification.Push {}
+            }"#,
+        )
+        .unwrap();
+        let Value::Dict(outer) = result else {
+            panic!()
+        };
+        let Value::Dict(msg) = outer.map.get("msg").unwrap() else {
+            panic!()
+        };
+        assert_eq!(msg.brand.as_deref(), Some("Push"));
+        assert_eq!(msg.variant_of.as_deref(), Some("Notification"));
+        assert!(msg.map.is_empty());
+    }
+
+    #[test]
+    fn variant_ctor_unknown_variant_runtime_error() {
+        let result = eval_doc(
+            r#"{
+                @schema N: Enum<A { x: Int }>,
+                msg: N.Bogus { x: 1 }
+            }"#,
+        );
+        assert!(matches!(result, Err(RuntimeError::TypeMismatch { .. })));
+    }
+
+    #[test]
+    fn variant_ctor_missing_required_field_errors() {
+        let result = eval_doc(
+            r#"{
+                @schema N: Enum<Email { address: String, subject: String }>,
+                msg: N.Email { address: "a@b" }
+            }"#,
+        );
+        assert!(matches!(result, Err(RuntimeError::TypeMismatch { .. })));
+    }
+
+    #[test]
+    fn variant_value_field_access_is_flat() {
+        // `msg.address` reads the variant's payload field directly with
+        // no `.Email.` indirection — same access path as a plain dict.
+        let result = eval_doc(
+            r#"{
+                @schema N: Enum<Email { address: String }>,
+                msg: N.Email { address: "a@b.c" },
+                got: &sibling.msg.address
+            }"#,
+        )
+        .unwrap();
+        let Value::Dict(d) = result else { panic!() };
+        assert_eq!(
+            d.map.get("got").unwrap(),
+            &Value::String("a@b.c".to_string())
+        );
+    }
+
+    #[test]
+    fn match_on_variant_dispatches_via_brand() {
+        let result = eval_doc(
+            r#"{
+                @schema N: Enum<
+                    Email { address: String },
+                    Push,
+                >,
+                msg: N.Email { address: "a@b.c" },
+                out: msg match {
+                    Email: f"emailed ${msg.address}",
+                    Push:  "push"
+                }
+            }"#,
+        )
+        .unwrap();
+        let Value::Dict(d) = result else { panic!() };
+        assert_eq!(
+            d.map.get("out").unwrap(),
+            &Value::String("emailed a@b.c".to_string())
+        );
+    }
+
+    #[test]
+    fn untagged_enum_string_literal_still_validates() {
+        // Regression: classic `Enum<"up", "down">` must keep working.
+        let result = eval_doc(
+            r#"{
+                @schema Status: { String mode: Enum<"up", "down"> },
+                Status s: { mode: "up" }
+            }"#,
+        );
+        assert!(result.is_ok(), "{:?}", result);
+    }
+
+    #[test]
+    fn untagged_enum_type_set_still_validates() {
+        let result = eval_doc(
+            r#"{
+                @schema Theme: { id: Enum<Int, String> },
+                Theme t: { id: 7 }
+            }"#,
+        );
+        assert!(result.is_ok(), "{:?}", result);
+    }
 }
 
 #[cfg(test)]
@@ -1650,4 +1788,5 @@ mod sandbox_tests {
         };
         assert_eq!(d.map.get("first").unwrap(), &Value::Int(10));
     }
+
 }
