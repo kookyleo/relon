@@ -45,6 +45,12 @@ pub enum Error {
 
     #[error("failed to convert Relon value to JSON: schemas are not supported in JSON output")]
     UnsupportedSchema,
+
+    /// A file marked `@library` was used as the host evaluation entry.
+    /// Library files are import-only — the host should evaluate the
+    /// business-team file that imports them instead.
+    #[error("Relon file{} is marked @library and cannot be evaluated as an entry", match .name { Some(n) => format!(" {n}"), None => String::new() })]
+    LibraryAsEntry { name: Option<String> },
 }
 
 pub fn from_str<T>(source: &str) -> Result<T>
@@ -155,9 +161,15 @@ fn evaluate_source(
     if analyzed.has_errors() {
         return Err(Error::Analyze(analyzed.take_diagnostics()));
     }
+    let cache_namespace = cache_namespace.into();
+    // Host-entry safety: `@library` files are import-only. Lower-level
+    // callers (`Evaluator::eval` directly) deliberately bypass this check.
+    if analyzed.is_library {
+        let name = (cache_namespace != "<memory>").then(|| cache_namespace.clone());
+        return Err(Error::LibraryAsEntry { name });
+    }
     let analyzed = Arc::new(analyzed);
 
-    let cache_namespace = cache_namespace.into();
     let ctx = Context::new()
         .with_root(node)
         .with_analyzed(Arc::clone(&analyzed));
@@ -424,6 +436,55 @@ mod tests {
 
             assert_eq!(actual, expected, "diagnostic mismatch for {rel_path}");
         }
+    }
+
+    #[test]
+    fn library_marker_blocks_entry_evaluation() {
+        // Direct in-memory entry: no path is known, so `name` is None
+        // and the gate fires before any evaluation work happens.
+        let result = value_from_str(r#"@library { x: 1 }"#);
+        assert!(matches!(result, Err(Error::LibraryAsEntry { name: None })));
+    }
+
+    #[test]
+    fn library_marker_allows_use_as_import() {
+        // Library file is import-only: when another file `@import`s it,
+        // evaluation must succeed and the imported bindings must flow
+        // through.
+        let dir = std::env::temp_dir().join(format!("relon-library-import-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("lib.relon"), r#"@library { greeting: "hi" }"#).unwrap();
+        std::fs::write(
+            dir.join("main.relon"),
+            r#"@import("./lib.relon", as="lib")
+            { msg: lib.greeting }"#,
+        )
+        .unwrap();
+
+        let value = json_from_file(dir.join("main.relon")).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(value.get("msg").and_then(|v| v.as_str()), Some("hi"));
+    }
+
+    #[test]
+    fn unmarked_file_works_as_entry_and_as_import() {
+        // The default file role is double-purpose: entry-evaluatable
+        // AND importable. Sanity-check both directions on one file.
+        let dir = std::env::temp_dir().join(format!("relon-unmarked-dual-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("shared.relon"), r#"{ greeting: "hi" }"#).unwrap();
+        std::fs::write(
+            dir.join("entry.relon"),
+            r#"@import("./shared.relon", as="s")
+            { msg: s.greeting }"#,
+        )
+        .unwrap();
+
+        let as_entry = json_from_file(dir.join("shared.relon")).unwrap();
+        let as_imported = json_from_file(dir.join("entry.relon")).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(as_entry.get("greeting").and_then(|v| v.as_str()), Some("hi"));
+        assert_eq!(as_imported.get("msg").and_then(|v| v.as_str()), Some("hi"));
     }
 
     fn workspace_root() -> PathBuf {

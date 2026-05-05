@@ -28,6 +28,8 @@ pub struct ModuleImport {
 /// record them. Nested imports (decorators on inner dict entries) are
 /// also captured so a host can see every import site.
 pub fn collect_imports(root: &Node, tree: &mut AnalyzedTree) {
+    // Only the root-level `@library` marker counts; nested ones are data.
+    tree.is_library = root.decorators.iter().any(is_library);
     visit(root, tree);
 }
 
@@ -54,6 +56,10 @@ fn visit(node: &Node, tree: &mut AnalyzedTree) {
 
 fn is_import(dec: &Decorator) -> bool {
     dec.path.len() == 1 && matches!(&dec.path[0], TokenKey::String(name, _, _) if name == "import")
+}
+
+fn is_library(dec: &Decorator) -> bool {
+    dec.path.len() == 1 && matches!(&dec.path[0], TokenKey::String(name, _, _) if name == "library")
 }
 
 fn lower_import(dec: &Decorator) -> ModuleImport {

@@ -30,6 +30,10 @@ pub struct AnalyzedTree {
     pub node_index: HashMap<NodeId, Arc<Node>>,
     /// Module imports discovered by the module-graph pass.
     pub imports: Vec<crate::modules::ModuleImport>,
+    /// `true` when the root node carries a `@library` decorator. Hosts
+    /// gate "evaluate as entry" on this flag — `@library` files are
+    /// import-only, never the final config.
+    pub is_library: bool,
     /// Errors and warnings from every pass, in source order.
     pub diagnostics: Vec<Diagnostic>,
 }

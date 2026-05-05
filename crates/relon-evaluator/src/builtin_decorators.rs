@@ -24,6 +24,11 @@ pub(crate) fn register_to(ctx: &mut Context) {
     ctx.register_decorator("error", Arc::new(MessageDecorator));
     ctx.register_decorator("default", Arc::new(DefaultDecorator));
     ctx.register_decorator("value", Arc::new(ValueDecorator));
+    // `@library` is a file-role marker consumed by the analyzer; the
+    // evaluator only sees it when a library file is loaded as a module,
+    // where it must behave as identity instead of tripping the
+    // unknown-decorator fallback.
+    ctx.register_decorator("library", Arc::new(LibraryDecorator));
 }
 
 /// `@import("path", as="alias", spread=false)` — injects module bindings into
@@ -172,6 +177,13 @@ impl DecoratorPlugin for DefaultDecorator {
         Ok(())
     }
 }
+
+/// `@library` — file-role marker. All hooks are identity; the real effect
+/// lives in `relon-analyzer` (sets `AnalyzedTree::is_library`) and the
+/// `relon` facade (refuses library files as evaluation entries).
+struct LibraryDecorator;
+
+impl DecoratorPlugin for LibraryDecorator {}
 
 /// `@value(replacement)` — substitutes the decorated value with the first
 /// argument (or returns the original when called bare).
