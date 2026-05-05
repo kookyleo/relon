@@ -18,13 +18,13 @@ hero:
 
 features:
   - title: 双层作者模型
-    details: 平台团队提供 schema、装饰器、原生函数与 .relon 库；业务团队写薄薄一层 entry 配置去拼装。语言级 `@library` 标记区分「库」与「入口」，杜绝错把库当 entry 跑。
+    details: "平台团队提供 schema、装饰器、原生函数与 .relon 库；业务团队写薄薄一层 entry 配置去拼装。语言级 `@library` 标记区分「库」与「入口」，杜绝错把库当 entry 跑。"
   - title: 类型化业务 schema
-    details: 内建 sum-type tagged enum、递归 schema、`@expect` 自定义校验消息、必填/可选/默认值/计算默认值并存——业务领域的契约不必再退化成松散字典。
+    details: "内建 sum-type tagged enum、递归 schema、`@expect` 自定义校验消息、必填/可选/默认值/计算默认值并存——业务领域的契约不必再退化成松散字典。"
   - title: 沙箱默认安全
-    details: `Capabilities` 控制文件读白名单、求值步数、Value 元素水位、原生函数白名单。`Context::sandboxed()` 默认拒绝一切，宿主显式授权后再放行。
+    details: "`Capabilities` 控制文件读白名单、求值步数、Value 元素水位、原生函数白名单。`Context::sandboxed()` 默认拒绝一切，宿主显式授权后再放行。"
   - title: JSON 闭环
-    details: From JSON-like, to JSON, for JSON——输入语法贴近 JSON，输出永远是普通 JSON。`Projector` trait 让你微调输出形态（如 sum-type 编码风格），但永远落在 JSON 上。
+    details: "From JSON-like, to JSON, for JSON——输入语法贴近 JSON，输出永远是普通 JSON。`Projector` trait 让你微调输出形态（如 sum-type 编码风格），但永远落在 JSON 上。"
 ---
 
 <figure style="margin: 3rem auto; max-width: 760px; text-align: center;">

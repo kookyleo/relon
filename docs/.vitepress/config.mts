@@ -52,11 +52,12 @@ export default defineConfig({
             text: '参考',
             items: [
               { text: '标准库', link: '/zh/guide/stdlib' },
+              { text: '架构概览', link: '/zh/guide/architecture' },
             ]
           }
         ],
         footer: {
-          message: '在 MIT 许可下发布。',
+          message: '在 Apache 2.0 许可下发布。',
           copyright: 'Copyright © 2026 kookyleo'
         },
         docFooter: {
@@ -86,7 +87,7 @@ export default defineConfig({
           }
         ],
         footer: {
-          message: 'Released under the MIT License.',
+          message: 'Released under the Apache 2.0 License.',
           copyright: 'Copyright © 2026 kookyleo'
         }
       }

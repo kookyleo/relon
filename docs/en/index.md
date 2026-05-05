@@ -18,13 +18,13 @@ hero:
 
 features:
   - title: Two-tier authoring
-    details: Platform teams ship schemas, decorators, native functions, and `.relon` libraries. Business teams write thin entry configs that compose them. The `@library` marker enforces the split at the language level — library files refuse to be evaluated as entries.
+    details: "Platform teams ship schemas, decorators, native functions, and `.relon` libraries. Business teams write thin entry configs that compose them. The `@library` marker enforces the split at the language level — library files refuse to be evaluated as entries."
   - title: Typed business schemas
-    details: Sum-type tagged enums, recursive schemas, `@expect` for custom validation messages, and required / optional / literal-default / computed-default fields all coexist. Domain contracts no longer have to decay into loose dicts.
+    details: "Sum-type tagged enums, recursive schemas, `@expect` for custom validation messages, and required / optional / literal-default / computed-default fields all coexist. Domain contracts no longer have to decay into loose dicts."
   - title: Sandboxed by default
-    details: `Capabilities` gate filesystem reads, evaluation step budgets, value-size watermarks, and native-function allowlists. `Context::sandboxed()` rejects everything until the host opts in — safe defaults for untrusted scripts.
+    details: "`Capabilities` gate filesystem reads, evaluation step budgets, value-size watermarks, and native-function allowlists. `Context::sandboxed()` rejects everything until the host opts in — safe defaults for untrusted scripts."
   - title: A JSON closed loop
-    details: From JSON-like, to JSON, for JSON. Input syntax sits next to JSON; output is always plain JSON. The `Projector` trait lets you tune the output shape (e.g. sum-type encoding) but the destination is always JSON.
+    details: "From JSON-like, to JSON, for JSON. Input syntax sits next to JSON; output is always plain JSON. The `Projector` trait lets you tune the output shape (e.g. sum-type encoding) but the destination is always JSON."
 ---
 
 <figure style="margin: 3rem auto; max-width: 760px; text-align: center;">

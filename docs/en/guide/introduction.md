@@ -15,7 +15,6 @@ Relon is a **Rust-embeddable toolkit for building typed business-config DSLs**. 
 
 Treat Relon as a small toolkit purpose-built for business configuration:
 
-- **Three-tier architecture**: `relon-parser` → `relon-analyzer` (4 passes) → `relon-evaluator`, with a facade crate `relon` and an IDE story in `relon-lsp`.
 - **JSON-like syntax**: it reads like JSON with expressions, decorators, and references. People who already know JSON pick it up in minutes.
 - **Typed schemas**: `@schema` defines contracts, with sum-type tagged enums, recursive schemas, custom validation messages, and computed defaults.
 - **Host extensions**: register native functions and decorator plugins from Rust; ship shared schemas / helpers in `.relon`; tie the two sides together with `@import`.
@@ -93,7 +92,7 @@ Output (note that the `Email` layer is the externally-tagged sum-type form):
 
 To prevent misreadings, here's what's deliberately out of scope:
 
-- ❌ **Multi-format output**: no YAML/TOML/XML — that's [Pkl](https://pkl-lang.org/)'s territory.
+- ❌ **Multi-format output**: no YAML/TOML/XML — [Pkl](https://pkl-lang.org/) handles that.
 - ❌ **General-purpose scripting**: no IO, no statement-style loops, no side effects — don't reach for Relon as a Lua/Starlark replacement.
 - ❌ **Constraint-only validation**: Relon both describes and evaluates; if you only need constraints, [CUE](https://cuelang.org/) fits better.
 - ❌ **Total / pure-functional purism**: evaluation can fail and closures aren't required to be total — Relon isn't [Dhall](https://dhall-lang.org/).
