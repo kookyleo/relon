@@ -7,7 +7,7 @@ Relon is a **Rust-embeddable toolkit for building typed business-config DSLs**. 
 > **From JSON-like, to JSON, for JSON.**
 
 <figure style="margin: 2rem auto; max-width: 720px; text-align: center;">
-  <img src="/relon/positioning.svg" alt="Relon two-tier authoring diagram" style="width: 100%; height: auto;" />
+  <img src="/positioning.svg" alt="Relon two-tier authoring diagram" style="width: 100%; height: auto;" />
   <figcaption style="margin-top: 0.75rem; font-size: 0.9rem; color: #64748b; font-style: italic;">Two-tier authoring: platform team ships the vocabulary, business team composes it.</figcaption>
 </figure>
 
@@ -29,7 +29,7 @@ Relon assumes two kinds of authors:
 | **Platform / framework team** | Rust extensions (native fns, decorator plugins) + `.relon` libraries marked with `@library` | Expose a stable business vocabulary; encode domain rules into schemas and decorators |
 | **Business / product team** | `.relon` entry files (no `@library` marker) | `@import` platform libraries; write JSON-shaped configs; have errors caught early by types and validation |
 
-When a platform-team file is marked `@library`, the runtime refuses to evaluate it as a host entry — it can only be consumed via `@import`. Business-team entry files stay double-purpose: directly evaluable AND importable. See [Library vs Entry](./library-vs-entry.md) for details.
+When a platform-team file is marked `@library`, the runtime refuses to evaluate it as a host entry — it can only be consumed via `@import`. Business-team entry files stay double-purpose: directly evaluable AND importable.
 
 ## A complete tour in 30 lines
 

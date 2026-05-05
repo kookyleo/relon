@@ -28,6 +28,6 @@ features:
 ---
 
 <figure style="margin: 3rem auto; max-width: 760px; text-align: center;">
-  <img src="/relon/positioning.svg" alt="Relon two-tier authoring: Platform Team writes schemas/fns/decorators, Business Team imports them and authors entry configs that the relon-evaluator turns into plain JSON for downstream services." style="width: 100%; height: auto;" />
+  <img src="/positioning.svg" alt="Relon two-tier authoring: Platform Team writes schemas/fns/decorators, Business Team imports them and authors entry configs that the relon-evaluator turns into plain JSON for downstream services." style="width: 100%; height: auto;" />
   <figcaption style="margin-top: 0.75rem; font-size: 0.9rem; color: #64748b; font-style: italic;">Two-tier authoring: platform team ships the vocabulary, business team composes it, the evaluator emits JSON.</figcaption>
 </figure>
