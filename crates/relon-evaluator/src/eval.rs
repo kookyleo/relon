@@ -64,6 +64,9 @@ pub(crate) struct GatedNativeFn {
 
 pub struct Context {
     pub globals: HashMap<String, Value>,
+    /// Global registry for named schemas (BrandRegistry). Host apps can
+    /// populate this to provide standard types across all evaluations.
+    pub schemas: HashMap<String, Value>,
     pub(crate) functions: HashMap<String, GatedNativeFn>,
     pub decorators: HashMap<String, Arc<dyn DecoratorPlugin>>,
     /// Ordered chain of module resolvers consulted by `@import`. The first
@@ -147,6 +150,7 @@ impl Context {
     ) -> Self {
         let mut ctx = Self {
             globals: HashMap::new(),
+            schemas: HashMap::new(),
             functions: HashMap::new(),
             decorators: HashMap::new(),
             module_resolvers,
@@ -176,6 +180,11 @@ impl Context {
     /// `std/...` and filesystem lookups.
     pub fn prepend_module_resolver(&mut self, resolver: Arc<dyn ModuleResolver>) {
         self.module_resolvers.insert(0, resolver);
+    }
+
+    /// Register a named schema globally in the BrandRegistry.
+    pub fn register_schema(&mut self, name: impl Into<String>, schema: Value) {
+        self.schemas.insert(name.into(), schema);
     }
 
     pub fn enter_loading_module<S: Into<String>>(&self, path: S) -> LoadingModuleGuard<'_> {

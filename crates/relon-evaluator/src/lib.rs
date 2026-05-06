@@ -2452,4 +2452,51 @@ mod sandbox_tests {
             assert_eq!(found, "Int");
         }
     }
+
+    #[test]
+    fn test_brand_registry() {
+        let mut ctx = Context::default();
+        // Register a schema 'Email' globally
+        let email_schema = Value::Schema {
+            generics: Vec::new(),
+            fields: {
+                let mut fields = std::collections::HashMap::new();
+                fields.insert(
+                    "address".to_string(),
+                    crate::value::SchemaField {
+                        type_hint: relon_parser::TypeNode {
+                            path: vec!["String".to_string()],
+                            generics: Vec::new(),
+                            is_optional: false,
+                            range: relon_parser::TokenRange::default(),
+                            variant_fields: None,
+                            doc_comment: None,
+                        },
+                        predicates: vec![Value::Wildcard],
+                        custom_error: None,
+                        default_value: None,
+                    },
+                );
+                fields
+            },
+        };
+        ctx.register_schema("Email", email_schema);
+
+        // Usage site doesn't define 'Email', but uses it via @brand
+        let src = r#"{
+            @brand(Email)
+            "me": { "address": "test@example.com" }
+        }"#;
+
+        let result = eval_with(ctx, src).unwrap();
+        let Value::Dict(d) = result else {
+            panic!()
+        };
+        let me = d.map.get("me").unwrap();
+        if let Value::Dict(inner) = me {
+            assert_eq!(inner.brand.as_deref(), Some("Email"));
+        } else {
+            panic!()
+        }
+    }
 }

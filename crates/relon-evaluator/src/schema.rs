@@ -202,10 +202,8 @@ impl<'a> Evaluator<'a> {
         let path = &expected.path;
         let mut current_val = scope
             .get_local(&path[0])
-            .ok_or_else(|| {
-                println!("VariableNotFound generated for {}", path[0]);
-                RuntimeError::VariableNotFound(path[0].clone(), range)
-            })?;
+            .or_else(|| self.context.schemas.get(&path[0]).cloned())
+            .ok_or_else(|| RuntimeError::VariableNotFound(path[0].clone(), range))?;
 
         for part in &path[1..] {
             match current_val {
