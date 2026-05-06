@@ -106,7 +106,7 @@ fn scan_token(source: &str, index: usize) -> Result<(SourceTokenKind, usize), To
     if starts_with_at(source, index, "...") {
         return Ok((SourceTokenKind::Ellipsis, index + 3));
     }
-    for op in ["==", "!=", "<=", ">=", "&&", "||", "++"] {
+    for op in ["==", "!=", "<=", ">=", "&&", "||", "++", "=>"] {
         if starts_with_at(source, index, op) {
             return Ok((SourceTokenKind::Operator, index + op.len()));
         }
