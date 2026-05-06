@@ -1331,42 +1331,45 @@ mod tests {
         let ctx = Context::new().with_root(node);
         // Synthesize a `Weather` schema and seed it into the surrounding
         // scope so the root-level `@brand` can resolve it.
-        let weather_schema = Value::Schema({
-            let mut fields = HashMap::new();
-            fields.insert(
-                "location".to_string(),
-                SchemaField {
-                    type_hint: relon_parser::TypeNode {
-                        path: vec!["String".to_string()],
-                        generics: Vec::new(),
-                        is_optional: false,
-                        range: relon_parser::TokenRange::default(),
-                        variant_fields: None,
-                        doc_comment: None,
+        let weather_schema = Value::Schema {
+            generics: Vec::new(),
+            fields: {
+                let mut fields = HashMap::new();
+                fields.insert(
+                    "location".to_string(),
+                    SchemaField {
+                        type_hint: relon_parser::TypeNode {
+                            path: vec!["String".to_string()],
+                            generics: Vec::new(),
+                            is_optional: false,
+                            range: relon_parser::TokenRange::default(),
+                            variant_fields: None,
+                            doc_comment: None,
+                        },
+                        predicates: vec![Value::Wildcard],
+                        custom_error: None,
+                        default_value: None,
                     },
-                    predicates: vec![Value::Wildcard],
-                    custom_error: None,
-                    default_value: None,
-                },
-            );
-            fields.insert(
-                "temperature".to_string(),
-                SchemaField {
-                    type_hint: relon_parser::TypeNode {
-                        path: vec!["Int".to_string()],
-                        generics: Vec::new(),
-                        is_optional: false,
-                        range: relon_parser::TokenRange::default(),
-                        variant_fields: None,
-                        doc_comment: None,
+                );
+                fields.insert(
+                    "temperature".to_string(),
+                    SchemaField {
+                        type_hint: relon_parser::TypeNode {
+                            path: vec!["Int".to_string()],
+                            generics: Vec::new(),
+                            is_optional: false,
+                            range: relon_parser::TokenRange::default(),
+                            variant_fields: None,
+                            doc_comment: None,
+                        },
+                        predicates: vec![Value::Wildcard],
+                        custom_error: None,
+                        default_value: None,
                     },
-                    predicates: vec![Value::Wildcard],
-                    custom_error: None,
-                    default_value: None,
-                },
-            );
-            fields
-        });
+                );
+                fields
+            },
+        };
         let outer_scope = std::sync::Arc::new(Scope::default());
         outer_scope
             .locals

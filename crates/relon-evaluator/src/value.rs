@@ -106,9 +106,12 @@ pub enum Value {
         body: Node,
         captured_env: Arc<Scope>,
     },
-    /// A user-defined type schema: Key -> SchemaField
+    /// A user-defined type schema: generic params and Key -> SchemaField map
     #[serde(skip)]
-    Schema(std::collections::HashMap<String, SchemaField>),
+    Schema {
+        generics: Vec<String>,
+        fields: std::collections::HashMap<String, SchemaField>,
+    },
     /// A tagged-enum (sum-type) schema: variants by name, each with its
     /// own field set. Built from `@schema Name: Enum<Var1 { ... }, ...>`.
     /// Construction with `Name.Var1 { ... }` is dispatched via this value.
@@ -134,7 +137,7 @@ impl PartialEq for Value {
             (Self::String(l), Self::String(r)) => l == r,
             (Self::List(l), Self::List(r)) => l == r,
             (Self::Dict(l), Self::Dict(r)) => l == r,
-            (Self::Schema(_), Self::Schema(_)) => false,
+            (Self::Schema { .. }, Self::Schema { .. }) => false,
             (Self::EnumSchema { .. }, Self::EnumSchema { .. }) => false,
             (Self::Type(l), Self::Type(r)) => l == r,
             (Self::Wildcard, Self::Wildcard) => true,
@@ -222,7 +225,7 @@ impl Value {
             Value::List(l) => !l.is_empty(),
             Value::Dict(d) => !d.map.is_empty(),
             Value::Closure { .. } => true,
-            Value::Schema(_) => true,
+            Value::Schema { .. } => true,
             Value::EnumSchema { .. } => true,
             Value::Type(_) => true,
             Value::Wildcard => true,
@@ -239,7 +242,7 @@ impl Value {
             Value::List(_) => "List",
             Value::Dict(_) => "Dict",
             Value::Closure { .. } => "Closure",
-            Value::Schema(_) => "Schema",
+            Value::Schema { .. } => "Schema",
             Value::EnumSchema { .. } => "EnumSchema",
             Value::Type(_) => "Type",
             Value::Wildcard => "Wildcard",
@@ -260,7 +263,7 @@ impl Value {
                     }
                 }
             }
-            (Value::Schema(base_fields), Value::Schema(patch_fields)) => {
+            (Value::Schema { fields: base_fields, .. }, Value::Schema { fields: patch_fields, .. }) => {
                 for (k, v) in patch_fields {
                     if let Some(base_field) = base_fields.get_mut(k) {
                         base_field.type_hint = v.type_hint.clone();
@@ -282,7 +285,7 @@ impl Value {
                     }
                 }
             }
-            (Value::Schema(base_fields), Value::Dict(patch_data)) => {
+            (Value::Schema { fields: base_fields, .. }, Value::Dict(patch_data)) => {
                 for (k, v) in &patch_data.map {
                     if let Some(base_field) = base_fields.get_mut(k) {
                         base_field.default_value = Some(v.clone());

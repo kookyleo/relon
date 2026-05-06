@@ -79,7 +79,7 @@ impl DecoratorPlugin for SchemaDecorator {
                     )?)));
                 }
                 let fields = eval.build_schema_from_def(def, scope)?;
-                return Ok(PreEvalOutcome::Override(Box::new(Value::Schema(fields))));
+                return Ok(PreEvalOutcome::Override(Box::new(Value::Schema { generics: Vec::new(), fields })));
             }
         }
 
@@ -87,7 +87,7 @@ impl DecoratorPlugin for SchemaDecorator {
         // on-demand using the same pure function the analyzer uses.
         // Diagnostics are dropped here — they're a host-facing feature
         // and there's no host channel to surface them on.
-        let (lowered, _diags) = relon_analyzer::lower_schema_pure(None, node);
+        let (lowered, _diags) = relon_analyzer::lower_schema_pure(None, Vec::new(), node);
         if let Some(def) = lowered {
             if !def.variants.is_empty() {
                 return Ok(PreEvalOutcome::Override(Box::new(build_enum_schema(
@@ -95,7 +95,7 @@ impl DecoratorPlugin for SchemaDecorator {
                 )?)));
             }
             let fields = eval.build_schema_from_def(&def, scope)?;
-            Ok(PreEvalOutcome::Override(Box::new(Value::Schema(fields))))
+            Ok(PreEvalOutcome::Override(Box::new(Value::Schema { generics: Vec::new(), fields })))
         } else {
             // The lowering rejected the body shape; let default
             // evaluation take over (typical case: `@schema` placed on

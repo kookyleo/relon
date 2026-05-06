@@ -60,7 +60,7 @@ impl Projector for JsonProjector {
                     if matches!(
                         val,
                         Value::Closure { .. }
-                            | Value::Schema(_)
+                            | Value::Schema { .. }
                             | Value::EnumSchema { .. }
                             | Value::Type(_)
                             | Value::Wildcard
@@ -88,7 +88,7 @@ impl Projector for JsonProjector {
                 }
             }
             Value::Closure { .. } => Err(crate::Error::UnsupportedClosure),
-            Value::Schema(_) | Value::EnumSchema { .. } | Value::Type(_) | Value::Wildcard => {
+            Value::Schema { .. } | Value::EnumSchema { .. } | Value::Type(_) | Value::Wildcard => {
                 Err(crate::Error::UnsupportedSchema)
             }
         }

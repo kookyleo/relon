@@ -1350,7 +1350,7 @@ impl<'a> Evaluator<'a> {
                             .locals
                             .lock()
                             .unwrap()
-                            .insert(key_str.clone(), Value::Schema(HashMap::new()));
+                            .insert(key_str.clone(), Value::Schema { generics: Vec::new(), fields: HashMap::new() });
                     }
 
                     let val = self.eval(value_node, scope)?;
@@ -1407,7 +1407,7 @@ impl std::fmt::Display for Value {
             Value::List(l) => write!(f, "{:?}", l),
             Value::Dict(d) => write!(f, "{:?}", d.map),
             Value::Closure { .. } => write!(f, "<closure>"),
-            Value::Schema(_) => write!(f, "<schema>"),
+            Value::Schema { .. } => write!(f, "<schema>"),
             Value::EnumSchema { name, .. } => write!(f, "<enum {name}>"),
             Value::Type(t) => write!(f, "Type<{}>", crate::schema::format_type_node(t)),
             Value::Wildcard => write!(f, "*"),

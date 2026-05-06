@@ -38,6 +38,8 @@ pub struct SchemaDef {
     /// Identifier the schema was bound to (`@schema User: {...}` →
     /// `"User"`). `None` for anonymous `@schema` annotations on data.
     pub name: Option<String>,
+    /// Generic type parameters declared by this schema (e.g. `Page<T>`).
+    pub generics: Vec<String>,
     /// Field declarations in source order.
     pub fields: Vec<SchemaFieldDef>,
     /// Base schemas this one extends (left operands of `Base + { ... }`).
@@ -118,12 +120,16 @@ pub struct BaseRef {
     pub node: Arc<Node>,
 }
 
+fn has_schema_decorator(decorators: &[Decorator]) -> bool {
+    decorators.iter().any(|dec| {
+        dec.path.len() == 1 && matches!(&dec.path[0], TokenKey::String(s, _, _) if s == SCHEMA)
+    })
+}
+
 /// Walk `root` and populate `tree.schemas` with every statically-classifiable
 /// `@schema` definition.
 pub fn collect_schemas(root: &Node, tree: &mut AnalyzedTree) {
     let Expr::Dict(pairs) = &*root.expr else {
-        // Top-level Lists can't host `@schema` definitions — only Dicts
-        // carry decorated fields. Nothing to collect.
         return;
     };
 
@@ -131,40 +137,47 @@ pub fn collect_schemas(root: &Node, tree: &mut AnalyzedTree) {
         if !has_schema_decorator(&value.decorators) {
             continue;
         }
-        let name = match key {
-            TokenKey::String(s, _, _) => Some(s.clone()),
-            _ => None,
-        };
-        if let Some(def) = lower_schema(name, value, tree) {
+        
+        let mut name = None;
+        let mut generics = Vec::new();
+        
+        match key {
+            TokenKey::String(s, _, _) => name = Some(s.clone()),
+            TokenKey::Dynamic(node, _) => {
+                // Handle dynamic key that might be a Type representation (e.g. `[Page<T>]`)
+                // Alternatively, we can let relon-parser treat `Page<T>` as a valid dict key.
+                // Wait, in standard JSON, keys must be strings. In relon, keys can be identifiers.
+                // But `Page<T>` is not an identifier, it's a type expression.
+                // If it's parsed as `[Page<T>]` (Dynamic key), the inner node will be an Expr::Type.
+                if let Expr::Type(t) = &*node.expr {
+                    name = t.path.first().cloned();
+                    generics = t.generics.iter().filter_map(|g| g.path.first().cloned()).collect();
+                }
+            }
+            _ => {}
+        }
+        
+        if let Some(def) = lower_schema(name, generics, value, tree) {
             tree.schemas.insert(value.id, def);
         }
     }
 }
 
-fn has_schema_decorator(decorators: &[Decorator]) -> bool {
-    decorators.iter().any(|dec| {
-        dec.path.len() == 1 && matches!(&dec.path[0], TokenKey::String(s, _, _) if s == SCHEMA)
-    })
-}
-
-fn lower_schema(name: Option<String>, value: &Node, tree: &mut AnalyzedTree) -> Option<SchemaDef> {
-    let (def, diags) = lower_schema_pure(name, value);
+fn lower_schema(name: Option<String>, generics: Vec<String>, value: &Node, tree: &mut AnalyzedTree) -> Option<SchemaDef> {
+    let (def, diags) = lower_schema_pure(name, generics, value);
     tree.diagnostics.extend(diags);
     def
 }
 
-/// Pure (no-tree-mutation) version of [`lower_schema`]. Used by hosts
-/// that need to lower a schema body on-demand — typically the
-/// evaluator's `SchemaDecorator` when `Context::analyzed` wasn't
-/// attached. Returns the desugar'd [`SchemaDef`] together with any
-/// diagnostics that would have been emitted.
 pub fn lower_schema_pure(
     name: Option<String>,
+    generics: Vec<String>,
     value: &Node,
 ) -> (Option<SchemaDef>, Vec<Diagnostic>) {
     let mut tmp = AnalyzedTree::new();
     let mut def = SchemaDef {
         name,
+        generics,
         fields: Vec::new(),
         bases: Vec::new(),
         range: value.range,

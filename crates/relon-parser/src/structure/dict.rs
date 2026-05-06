@@ -57,12 +57,21 @@ pub(crate) fn parse_pair<'a>(input: &mut Span<'a>) -> ModalResult<(TokenKey, Nod
     fn parse_key<'a>(i: &mut Span<'a>) -> ModalResult<TokenKey> {
         soc0.parse_next(i)?;
         alt((
-            id.map(|i| TokenKey::String(i.0, i.1, false)),
             parse_string.map(|node| {
                 if let Expr::String(s) = *node.expr {
                     TokenKey::String(s, node.range, false)
                 } else {
                     unreachable!()
+                }
+            }),
+            crate::expr::parse_type_node.map(|t| {
+                // If the type node is just a simple identifier without generics or optional marker,
+                // treat it as a standard string key.
+                if t.generics.is_empty() && t.path.len() == 1 && !t.is_optional {
+                    TokenKey::String(t.path[0].clone(), t.range, false)
+                } else {
+                    let range = t.range;
+                    TokenKey::Dynamic(Node::new(Expr::Type(t), range), false)
                 }
             }),
             delimited("[", parse_expr, "]").map(|node| TokenKey::Dynamic(node, false)),

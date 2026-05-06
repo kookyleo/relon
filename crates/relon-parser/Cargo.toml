@@ -13,3 +13,7 @@ miette = "7.6.0"
 
 [dev-dependencies]
 rand = "0.8"
+
+[[bin]]
+name = "debug_parse"
+path = "src/bin/debug_parse.rs"

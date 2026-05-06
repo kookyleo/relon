@@ -49,13 +49,13 @@ impl Evaluator<'_> {
         // `lower_schema_pure` so the same desugar logic that powers
         // `@schema X: Base + { ... }` applies here too.
         if matches!(op, Operator::Add)
-            && matches!(&l, Value::Schema(_))
+            && matches!(&l, Value::Schema { .. })
             && matches!(
                 right.expr.as_ref(),
                 Expr::Dict(_) | Expr::Binary(Operator::Add, _, _)
             )
         {
-            let Value::Schema(base_fields) = l else {
+            let Value::Schema { fields: base_fields, .. } = l else {
                 unreachable!()
             };
             let merged_fields = match right.expr.as_ref() {
@@ -65,7 +65,7 @@ impl Evaluator<'_> {
                 _ => {
                     // Lower the nested RHS as a schema, then build it
                     // with the live scope and merge into the base.
-                    let (lowered, _diags) = relon_analyzer::lower_schema_pure(None, right);
+                    let (lowered, _diags) = relon_analyzer::lower_schema_pure(None, Vec::new(), right);
                     let r_fields = match lowered {
                         Some(def) => self.build_schema_from_def(&def, scope)?,
                         None => {
@@ -81,7 +81,7 @@ impl Evaluator<'_> {
                     merged
                 }
             };
-            return Ok(Value::Schema(merged_fields));
+            return Ok(Value::Schema { generics: Vec::new(), fields: merged_fields });
         }
 
         let r = self.eval(right, scope)?;
@@ -93,7 +93,7 @@ impl Evaluator<'_> {
 
                 if let Value::Dict(ref d) = merged {
                     if let Some(ref brand_name) = d.brand {
-                        if let Some(Value::Schema(_)) = scope.get_local(brand_name) {
+                        if let Some(Value::Schema { .. }) = scope.get_local(brand_name) {
                             let mut to_check = merged.clone();
                             let type_node = TypeNode {
                                 path: vec![brand_name.clone()],
@@ -110,7 +110,7 @@ impl Evaluator<'_> {
                 }
                 Ok(merged)
             }
-            (Operator::Add, Value::Schema(_), Value::Schema(_)) => {
+            (Operator::Add, Value::Schema { .. }, Value::Schema { .. }) => {
                 let mut merged = l.clone();
                 merged.deep_merge(&r);
                 Ok(merged)

@@ -215,7 +215,7 @@ impl<'a> Evaluator<'a> {
         }
 
         match current_val {
-            Value::Schema(fields) => self.apply_schema(fields, value, scope, range, visited, depth),
+            Value::Schema { fields, .. } => self.apply_schema(fields, value, scope, range, visited, depth),
             Value::Type(t) => {
                 if t.path == path {
                     return Ok(false);
@@ -410,7 +410,7 @@ impl<'a> Evaluator<'a> {
         let mut fields: HashMap<String, SchemaField> = HashMap::new();
         for base in &def.bases {
             let base_value = self.eval_internal(&base.node, scope, false)?;
-            let Value::Schema(base_fields) = base_value else {
+            let Value::Schema { fields: base_fields, .. } = base_value else {
                 return Err(RuntimeError::TypeMismatch {
                     expected: "Schema".to_string(),
                     found: base_value.type_name().to_string(),
