@@ -2425,4 +2425,31 @@ mod sandbox_tests {
         };
         assert_eq!(d.map.get("first").unwrap(), &Value::Int(10));
     }
+
+    #[test]
+    fn test_parameterized_schema() {
+        let src = r#"{
+            @schema Page<T>: {
+                List<T> items: *
+            },
+            Page<Int> ok_page: {
+                items: [1, 2, 3]
+            },
+            // This should fail validation because the item is a String
+            Page<String> bad_page: {
+                items: [1, 2, 3]
+            }
+        }"#;
+
+        let node = relon_parser::parse_document(src).unwrap();
+        let analyzed = relon_analyzer::analyze(&node);
+        let ctx = Context::default().with_root(node).with_analyzed(Arc::new(analyzed));
+        let evaluator = Evaluator::new(&ctx);
+        let err = evaluator.eval_root(&Arc::new(Scope::default())).unwrap_err();
+        assert!(matches!(err, RuntimeError::TypeMismatch { .. }));
+        if let RuntimeError::TypeMismatch { expected, found, .. } = err {
+            assert_eq!(expected, "String");
+            assert_eq!(found, "Int");
+        }
+    }
 }

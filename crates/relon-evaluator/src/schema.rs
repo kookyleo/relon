@@ -102,7 +102,7 @@ impl<'a> Evaluator<'a> {
                 "Enum" => self.check_enum(value, expected, scope, range, visited, depth)?,
                 _ => self.check_custom_schema(
                     value,
-                    &expected.path,
+                    expected,
                     scope,
                     range,
                     visited,
@@ -110,7 +110,7 @@ impl<'a> Evaluator<'a> {
                 )?,
             }
         } else {
-            self.check_custom_schema(value, &expected.path, scope, range, visited, depth + 1)?
+            self.check_custom_schema(value, expected, scope, range, visited, depth + 1)?
         };
 
         if !matches {
@@ -193,15 +193,19 @@ impl<'a> Evaluator<'a> {
     pub(crate) fn check_custom_schema(
         &self,
         value: &mut Value,
-        path: &[String],
+        expected: &TypeNode,
         scope: &Arc<Scope>,
         range: TokenRange,
         visited: &mut HashSet<(String, *const Value)>,
         depth: usize,
     ) -> Result<bool, RuntimeError> {
+        let path = &expected.path;
         let mut current_val = scope
             .get_local(&path[0])
-            .ok_or_else(|| RuntimeError::VariableNotFound(path[0].clone(), range))?;
+            .ok_or_else(|| {
+                println!("VariableNotFound generated for {}", path[0]);
+                RuntimeError::VariableNotFound(path[0].clone(), range)
+            })?;
 
         for part in &path[1..] {
             match current_val {
@@ -215,15 +219,68 @@ impl<'a> Evaluator<'a> {
         }
 
         match current_val {
-            Value::Schema { fields, .. } => self.apply_schema(fields, value, scope, range, visited, depth),
+            Value::Schema { generics, fields } => {
+                // Instantiate the schema with the provided generic arguments.
+                let mut instantiated_fields = fields;
+                if !generics.is_empty() && !expected.generics.is_empty() {
+                    if generics.len() != expected.generics.len() {
+                        return Err(RuntimeError::TypeMismatch {
+                            expected: format!("{} type arguments", generics.len()),
+                            found: format!("{} type arguments", expected.generics.len()),
+                            range,
+                        });
+                    }
+                    // Simple substitution: build a mapping from generic param name to the provided type arg
+                    let subst_map: HashMap<String, TypeNode> = generics
+                        .iter()
+                        .cloned()
+                        .zip(expected.generics.iter().cloned())
+                        .collect();
+
+                    instantiated_fields =
+                        self.substitute_generics_in_schema(instantiated_fields, &subst_map);
+                }
+
+                self.apply_schema(instantiated_fields, value, scope, range, visited, depth)
+            }
             Value::Type(t) => {
-                if t.path == path {
+                if t.path == *path {
                     return Ok(false);
                 }
                 self.check_type_internal(value, &t, scope, range, visited, depth)
                     .map(|_| true)
             }
             _ => Ok(false),
+        }
+    }
+
+    fn substitute_generics_in_schema(
+        &self,
+        mut fields: HashMap<String, SchemaField>,
+        subst_map: &HashMap<String, TypeNode>,
+    ) -> HashMap<String, SchemaField> {
+        for field in fields.values_mut() {
+            self.substitute_generics_in_type(&mut field.type_hint, subst_map);
+        }
+        fields
+    }
+
+    fn substitute_generics_in_type(
+        &self,
+        t: &mut TypeNode,
+        subst_map: &HashMap<String, TypeNode>,
+    ) {
+        if t.path.len() == 1 && t.generics.is_empty() {
+            if let Some(replacement) = subst_map.get(&t.path[0]) {
+                // Replace the type node entirely, but keep the optional flag if it was set
+                let is_optional = t.is_optional || replacement.is_optional;
+                *t = replacement.clone();
+                t.is_optional = is_optional;
+                return;
+            }
+        }
+        for generic in &mut t.generics {
+            self.substitute_generics_in_type(generic, subst_map);
         }
     }
 

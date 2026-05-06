@@ -1,5 +1,0 @@
-{
-    @schema Page<T>: {
-        List<T> items: *
-    }
-}

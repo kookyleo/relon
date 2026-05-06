@@ -79,7 +79,7 @@ impl DecoratorPlugin for SchemaDecorator {
                     )?)));
                 }
                 let fields = eval.build_schema_from_def(def, scope)?;
-                return Ok(PreEvalOutcome::Override(Box::new(Value::Schema { generics: Vec::new(), fields })));
+                return Ok(PreEvalOutcome::Override(Box::new(Value::Schema { generics: def.generics.clone(), fields })));
             }
         }
 
@@ -95,7 +95,7 @@ impl DecoratorPlugin for SchemaDecorator {
                 )?)));
             }
             let fields = eval.build_schema_from_def(&def, scope)?;
-            Ok(PreEvalOutcome::Override(Box::new(Value::Schema { generics: Vec::new(), fields })))
+            Ok(PreEvalOutcome::Override(Box::new(Value::Schema { generics: def.generics.clone(), fields })))
         } else {
             // The lowering rejected the body shape; let default
             // evaluation take over (typical case: `@schema` placed on

@@ -504,6 +504,7 @@ impl<'a> Evaluator<'a> {
                                     match self.eval(expr_node, &dict_scope)? {
                                         Value::String(s) => s,
                                         Value::Int(i) => i.to_string(),
+                                        Value::Type(t) => t.path.first().cloned().unwrap_or_default(),
                                         other => {
                                             return Err(RuntimeError::TypeMismatch {
                                                 expected: "String or Int".to_string(),
@@ -1331,6 +1332,7 @@ impl<'a> Evaluator<'a> {
                         TokenKey::Dynamic(expr_node, _) => match self.eval(expr_node, scope)? {
                             Value::String(s) => s,
                             Value::Int(i) => i.to_string(),
+                            Value::Type(t) => t.path.first().cloned().unwrap_or_default(),
                             other => {
                                 return Err(RuntimeError::TypeMismatch {
                                     expected: "String or Int for key".to_string(),
@@ -1346,11 +1348,17 @@ impl<'a> Evaluator<'a> {
                     }
 
                     if is_dict_schema {
+                        let mut generics = Vec::new();
+                        if let TokenKey::Dynamic(expr_node, _) = key {
+                            if let Expr::Type(t) = expr_node.expr.as_ref() {
+                                generics = t.generics.iter().filter_map(|g| g.path.first().cloned()).collect();
+                            }
+                        }
                         scope
                             .locals
                             .lock()
                             .unwrap()
-                            .insert(key_str.clone(), Value::Schema { generics: Vec::new(), fields: HashMap::new() });
+                            .insert(key_str.clone(), Value::Schema { generics, fields: HashMap::new() });
                     }
 
                     let val = self.eval(value_node, scope)?;
@@ -1372,6 +1380,7 @@ impl<'a> Evaluator<'a> {
                 TokenKey::Dynamic(expr_node, _) => match self.eval(expr_node, scope) {
                     Ok(Value::String(s)) => s,
                     Ok(Value::Int(i)) => i.to_string(),
+                    Ok(Value::Type(t)) => t.path.first().cloned().unwrap_or_default(),
                     _ => continue,
                 },
             };
