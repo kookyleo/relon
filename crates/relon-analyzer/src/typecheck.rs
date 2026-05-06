@@ -88,10 +88,18 @@ struct Walker<'a> {
 
 impl<'a> Walker<'a> {
     fn visit(&mut self, node: &Node) {
+        self.visit_internal(node, None);
+    }
+
+    fn visit_internal(&mut self, node: &Node, field_name: Option<&str>) {
         // Type binding check first — `Type field: value` carries info
         // that lets us validate `value` immediately, before recursing.
         if let Some(t) = &node.type_hint {
-            self.check_typed_binding(t, node, /*field_name=*/ "_");
+            self.check_typed_binding(t, node, field_name.unwrap_or("_"));
+
+            // If the type-hint is a custom schema, also walk the value's
+            // dict fields against the schema's expected types.
+            self.check_against_custom_schema(t, node);
         }
 
         match &*node.expr {
@@ -99,18 +107,12 @@ impl<'a> Walker<'a> {
                 let frame = build_frame(pairs);
                 self.scope_stack.push(frame);
                 for (key, value) in pairs {
-                    if let TokenKey::String(field_name, _, _) = key {
-                        if let Some(t) = &value.type_hint {
-                            self.check_typed_binding(t, value, field_name);
-                        }
-                        // If the value's type-hint is a custom schema,
-                        // also walk the value's dict fields against
-                        // the schema's expected types.
-                        if let Some(t) = &value.type_hint {
-                            self.check_against_custom_schema(t, value);
-                        }
-                    }
-                    self.visit(value);
+                    let field_name = if let TokenKey::String(name, _, _) = key {
+                        Some(name.as_str())
+                    } else {
+                        None
+                    };
+                    self.visit_internal(value, field_name);
                 }
                 self.scope_stack.pop();
             }
@@ -120,12 +122,12 @@ impl<'a> Walker<'a> {
                     frame.closure_params.insert(param.name.clone(), body.id);
                 }
                 self.scope_stack.push(frame);
-                self.visit(body);
+                self.visit_internal(body, None);
                 self.scope_stack.pop();
             }
             Expr::List(items) => {
                 for item in items {
-                    self.visit(item);
+                    self.visit_internal(item, None);
                 }
             }
             Expr::Reference { base, path } => {
@@ -136,15 +138,15 @@ impl<'a> Walker<'a> {
             }
             Expr::Match { expr, arms } => {
                 self.check_match_exhaustiveness(node.range, expr, arms);
-                self.visit(expr);
+                self.visit_internal(expr, None);
                 for (pat, body) in arms {
-                    self.visit(pat);
-                    self.visit(body);
+                    self.visit_internal(pat, None);
+                    self.visit_internal(body, None);
                 }
             }
             _ => {
                 for child in child_nodes(node) {
-                    self.visit(child);
+                    self.visit_internal(child, None);
                 }
             }
         }
@@ -295,18 +297,71 @@ impl<'a> Walker<'a> {
     /// to functions, references, etc. are deferred to the runtime
     /// check.
     fn check_typed_binding(&mut self, expected: &TypeNode, value: &Node, field_name: &str) {
-        let Some(found) = static_type_of(value) else {
-            return;
-        };
-        if matches_expected(expected, &found) {
+        if let Some(found) = static_type_of(value) {
+            if matches_expected(expected, &found) {
+                // Basic type matches. If this is a literal with generics (List<T>,
+                // Dict<K, V>), also check its contents.
+                self.check_generics(expected, value, field_name);
+                return;
+            }
+            self.tree.diagnostics.push(Diagnostic::StaticTypeMismatch {
+                field: field_name.to_string(),
+                expected: format_type(expected),
+                found,
+                range: span_of(value.range),
+            });
             return;
         }
-        self.tree.diagnostics.push(Diagnostic::StaticTypeMismatch {
-            field: field_name.to_string(),
-            expected: format_type(expected),
-            found,
-            range: span_of(value.range),
-        });
+
+        // If we couldn't infer a single static type, check if it's a
+        // structured expression whose branches we can partially validate.
+        match &*value.expr {
+            Expr::Ternary { then, els, .. } => {
+                self.check_typed_binding(expected, then, field_name);
+                self.check_typed_binding(expected, els, field_name);
+            }
+            _ => {}
+        }
+    }
+
+    /// Recursively check the contents of List and Dict literals against
+    /// expected generic parameters.
+    fn check_generics(&mut self, expected: &TypeNode, value: &Node, field_name: &str) {
+        if expected.generics.is_empty() {
+            return;
+        }
+        match &*value.expr {
+            Expr::List(items) => {
+                if expected.path == vec!["List"] && expected.generics.len() == 1 {
+                    let inner_expected = &expected.generics[0];
+                    for (i, item) in items.iter().enumerate() {
+                        self.check_typed_binding(
+                            inner_expected,
+                            item,
+                            &format!("{}[{}]", field_name, i),
+                        );
+                    }
+                }
+            }
+            Expr::Dict(pairs) => {
+                if expected.path == vec!["Dict"] && expected.generics.len() == 2 {
+                    // We only check if Key is String for now (common case)
+                    if expected.generics[0].path == vec!["String"] {
+                        let inner_expected = &expected.generics[1];
+                        for (key, val) in pairs {
+                            if let TokenKey::String(k, _, _) = key {
+                                self.check_typed_binding(
+                                    inner_expected,
+                                    val,
+                                    &format!("{}.{}", field_name, k),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 
     /// When `expected` names a custom schema and `value` is a literal
@@ -343,9 +398,9 @@ impl<'a> Walker<'a> {
 
 /// Return the static type-name of `node` if it can be classified
 /// without evaluating. Returns `None` for any expression whose value
-/// depends on runtime computation (FnCall, Reference, Binary on
-/// non-trivial operands, ...).
+/// depends on runtime computation (FnCall, Reference, ...).
 fn static_type_of(node: &Node) -> Option<String> {
+    use relon_parser::Operator;
     match &*node.expr {
         Expr::Null => Some("Null".to_string()),
         Expr::Bool(_) => Some("Bool".to_string()),
@@ -355,6 +410,61 @@ fn static_type_of(node: &Node) -> Option<String> {
         Expr::List(_) => Some("List".to_string()),
         Expr::Dict(_) => Some("Dict".to_string()),
         Expr::Closure { .. } => Some("Closure".to_string()),
+        Expr::Binary(op, left, right) => {
+            let lt = static_type_of(left)?;
+            let rt = static_type_of(right)?;
+            match op {
+                Operator::Add | Operator::Sub | Operator::Mul | Operator::Div | Operator::Mod => {
+                    if lt == "Int" && rt == "Int" {
+                        Some("Int".to_string())
+                    } else if (lt == "Int" || lt == "Float") && (rt == "Int" || rt == "Float") {
+                        Some("Float".to_string())
+                    } else if *op == Operator::Add && lt == "String" && rt == "String" {
+                        Some("String".to_string())
+                    } else if *op == Operator::Add && lt == "Dict" && rt == "Dict" {
+                        Some("Dict".to_string())
+                    } else if *op == Operator::Add && lt == "List" && rt == "List" {
+                        Some("List".to_string())
+                    } else {
+                        None
+                    }
+                }
+                Operator::And | Operator::Or => {
+                    if lt == "Bool" && rt == "Bool" {
+                        Some("Bool".to_string())
+                    } else {
+                        None
+                    }
+                }
+                Operator::Eq
+                | Operator::Ne
+                | Operator::Lt
+                | Operator::Gt
+                | Operator::Le
+                | Operator::Ge => Some("Bool".to_string()),
+                _ => None,
+            }
+        }
+        Expr::Unary(op, inner) => {
+            let t = static_type_of(inner)?;
+            match op {
+                Operator::Not if t == "Bool" => Some("Bool".to_string()),
+                Operator::Sub if t == "Int" || t == "Float" => Some(t),
+                _ => None,
+            }
+        }
+        Expr::Ternary { then, els, .. } => {
+            let tt = static_type_of(then)?;
+            let et = static_type_of(els)?;
+            if tt == et {
+                Some(tt)
+            } else if (tt == "Int" || tt == "Float") && (et == "Int" || et == "Float") {
+                Some("Float".to_string())
+            } else {
+                None
+            }
+        }
+        Expr::FString(_) => Some("String".to_string()),
         _ => None,
     }
 }
@@ -669,5 +779,108 @@ mod tests {
             .filter(|d| matches!(d, Diagnostic::NonExhaustiveMatch { .. }))
             .collect();
         assert!(nx.is_empty(), "{:?}", tree.diagnostics);
+    }
+
+    #[test]
+    fn flags_nested_list_mismatch() {
+        let tree = analyze_str(r#"{ List<Int> items: [1, "two", 3] }"#);
+        assert!(
+            tree.diagnostics.iter().any(|d| matches!(
+                d,
+                Diagnostic::StaticTypeMismatch {
+                    field,
+                    expected,
+                    found,
+                    ..
+                } if field == "items[1]" && expected == "Int" && found == "String"
+            )),
+            "{:?}",
+            tree.diagnostics
+        );
+    }
+
+    #[test]
+    fn flags_nested_dict_mismatch() {
+        let tree = analyze_str(r#"{ Dict<String, Int> scores: { math: 100, art: "A" } }"#);
+        assert!(
+            tree.diagnostics.iter().any(|d| matches!(
+                d,
+                Diagnostic::StaticTypeMismatch {
+                    field,
+                    expected,
+                    found,
+                    ..
+                } if field == "scores.art" && expected == "Int" && found == "String"
+            )),
+            "{:?}",
+            tree.diagnostics
+        );
+    }
+
+    #[test]
+    fn infers_binary_expression_types() {
+        let tree = analyze_str(
+            r#"{
+                Int a: 1 + 2,
+                Float b: 1 + 2.0,
+                String c: "a" + "b",
+                Bool d: 1 == 1,
+                // These should fail
+                Int e: 1.0 + 2.0,
+                String f: 1 + 2
+            }"#,
+        );
+        let mismatches: Vec<_> = tree
+            .diagnostics
+            .iter()
+            .filter(|d| matches!(d, Diagnostic::StaticTypeMismatch { .. }))
+            .collect();
+        // e and f should mismatch
+        assert_eq!(mismatches.len(), 2, "{:?}", mismatches);
+        assert!(mismatches
+            .iter()
+            .any(|d| matches!(d, Diagnostic::StaticTypeMismatch { field, .. } if field == "e")));
+        assert!(mismatches
+            .iter()
+            .any(|d| matches!(d, Diagnostic::StaticTypeMismatch { field, .. } if field == "f")));
+    }
+
+    #[test]
+    fn handles_ternary_type_inference() {
+        let tree = analyze_str(
+            r#"{
+                Int a: true ? 1 : 2,
+                Float b: true ? 1 : 2.2,
+                // This should fail (heterogeneous)
+                Int c: true ? 1 : "2"
+            }"#,
+        );
+        let mismatches: Vec<_> = tree
+            .diagnostics
+            .iter()
+            .filter(|d| matches!(d, Diagnostic::StaticTypeMismatch { .. }))
+            .collect();
+        assert_eq!(mismatches.len(), 1, "{:?}", mismatches);
+        assert!(mismatches
+            .iter()
+            .any(|d| matches!(d, Diagnostic::StaticTypeMismatch { field, .. } if field == "c")));
+    }
+
+    #[test]
+    fn recursive_list_check() {
+        let tree = analyze_str(r#"{ List<List<Int>> matrix: [[1], ["two"]] }"#);
+        assert!(
+            tree.diagnostics.iter().any(|d| matches!(
+                d,
+                Diagnostic::StaticTypeMismatch {
+                    field,
+                    expected,
+                    found,
+                    ..
+                } if field == "matrix[1][0]" && expected == "Int" && found == "String"
+            )),
+            "{:?}",
+            tree.diagnostics
+        );
     }
 }
