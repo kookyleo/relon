@@ -101,6 +101,7 @@ impl Evaluator<'_> {
                                 is_optional: false,
                                 range: left.range,
                                 variant_fields: None,
+                                doc_comment: None,
                             };
                             self.check_type(&mut to_check, &type_node, scope, left.range)?;
                             return Ok(to_check);

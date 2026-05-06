@@ -305,12 +305,11 @@ fn collect_fields(pairs: &[(TokenKey, Node)], def: &mut SchemaDef, tree: &mut An
                     type_hint = Some(brand_type);
                 }
                 Some(existing) => {
-                    tree.diagnostics
-                        .push(Diagnostic::SchemaFieldBrandConflict {
-                            field: field_name.clone(),
-                            type_prefix: format_type_node_simple(existing),
-                            range: span_of(dec.range),
-                        });
+                    tree.diagnostics.push(Diagnostic::SchemaFieldBrandConflict {
+                        field: field_name.clone(),
+                        type_prefix: format_type_node_simple(existing),
+                        range: span_of(dec.range),
+                    });
                 }
             }
         }

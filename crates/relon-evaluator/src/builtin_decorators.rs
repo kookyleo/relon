@@ -8,15 +8,13 @@
 //! own plugin under the same name first.
 
 use crate::decorator::{DecoratorPlugin, PreEvalOutcome};
-use crate::decorator_names::{
-    BRAND, DEFAULT, ERROR, EXPECT, IMPORT, LIBRARY, MSG, SCHEMA, VALUE,
-};
+use crate::decorator_names::{BRAND, DEFAULT, ERROR, EXPECT, IMPORT, LIBRARY, MSG, SCHEMA, VALUE};
 use crate::error::RuntimeError;
 use crate::eval::{Context, Evaluator};
 use crate::native_fn::EvaluatedArg;
+use crate::schema::format_type_node;
 use crate::scope::Scope;
 use crate::value::{SchemaField, Value};
-use crate::schema::format_type_node;
 use relon_parser::{
     is_builtin_type_name, type_node_from_brand_arg, CallArg, Node, TokenRange, TypeNode,
 };
@@ -131,6 +129,7 @@ fn build_enum_schema(
                     is_optional: false,
                     range: f.value_range,
                     variant_fields: None,
+                    doc_comment: None,
                 });
             fields.insert(
                 f.name.clone(),
@@ -306,10 +305,7 @@ impl DecoratorPlugin for BrandDecorator {
 /// * Anything else → `format_type_node`-serialized string
 ///   (`Some("Map<String, Int>")`, `Some("Weather?")`, `Some("geo.Location")`).
 pub(crate) fn brand_string_for(type_node: &TypeNode) -> Option<String> {
-    if type_node.generics.is_empty()
-        && !type_node.is_optional
-        && type_node.path.len() == 1
-    {
+    if type_node.generics.is_empty() && !type_node.is_optional && type_node.path.len() == 1 {
         let tname = &type_node.path[0];
         if is_builtin_type_name(tname) {
             return None;
@@ -318,4 +314,3 @@ pub(crate) fn brand_string_for(type_node: &TypeNode) -> Option<String> {
     }
     Some(format_type_node(type_node))
 }
-

@@ -381,6 +381,7 @@ impl<'a> Evaluator<'a> {
                                     is_optional: false,
                                     range: value_node.range,
                                     variant_fields: None,
+                                    doc_comment: None,
                                 },
                                 predicates: vec![Value::Wildcard],
                                 custom_error: None,
@@ -502,6 +503,7 @@ impl<'a> Evaluator<'a> {
                                 is_optional: false,
                                 range: value_node.range,
                                 variant_fields: None,
+                                doc_comment: None,
                             },
                             predicates: vec![Value::Wildcard],
                             custom_error: None,
@@ -533,6 +535,7 @@ impl<'a> Evaluator<'a> {
                         is_optional: false,
                         range: value_node.range,
                         variant_fields: None,
+                        doc_comment: None,
                     },
                     Value::Wildcard,
                 ))

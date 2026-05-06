@@ -1342,6 +1342,7 @@ mod tests {
                         is_optional: false,
                         range: relon_parser::TokenRange::default(),
                         variant_fields: None,
+                        doc_comment: None,
                     },
                     predicates: vec![Value::Wildcard],
                     custom_error: None,
@@ -1357,6 +1358,7 @@ mod tests {
                         is_optional: false,
                         range: relon_parser::TokenRange::default(),
                         variant_fields: None,
+                        doc_comment: None,
                     },
                     predicates: vec![Value::Wildcard],
                     custom_error: None,
@@ -1418,8 +1420,7 @@ mod tests {
 
         let node = parse_doc(&src);
         let ctx = Context::trusted().with_root(node);
-        let result = Evaluator::new(&ctx)
-            .eval_root(&std::sync::Arc::new(Scope::default()));
+        let result = Evaluator::new(&ctx).eval_root(&std::sync::Arc::new(Scope::default()));
         let _ = std::fs::remove_dir_all(&dir);
         let result = result.unwrap();
 
@@ -1761,10 +1762,10 @@ mod tests {
         );
         let tree = relon_analyzer::analyze(&node);
         assert!(
-            !tree.diagnostics.iter().any(|d| matches!(
-                d,
-                relon_analyzer::Diagnostic::SchemaFieldUntyped { .. }
-            )),
+            !tree
+                .diagnostics
+                .iter()
+                .any(|d| matches!(d, relon_analyzer::Diagnostic::SchemaFieldUntyped { .. })),
             "should not emit SchemaFieldUntyped for `@brand`-typed field, got {:?}",
             tree.diagnostics
         );
@@ -2422,5 +2423,3 @@ mod sandbox_tests {
         assert_eq!(d.map.get("first").unwrap(), &Value::Int(10));
     }
 }
-
-

@@ -22,6 +22,7 @@ pub mod resolve;
 pub mod schema;
 pub mod tree;
 pub mod typecheck;
+pub mod workspace;
 
 pub use diagnostic::{Diagnostic, Severity};
 pub use modules::ModuleImport;
@@ -30,6 +31,7 @@ pub use schema::{
     lower_schema_pure, BaseRef, EnumVariant, MetaDecoratorRef, SchemaDef, SchemaFieldDef,
 };
 pub use tree::AnalyzedTree;
+pub use workspace::Workspace;
 
 use relon_parser::Node;
 
