@@ -1,5 +1,15 @@
 [
-    { title: "Start", active: true },
-    { title: "Middle", enabled: &prev.active },
-    { title: "End", enabled: &prev.enabled, index: &index }
+    {
+        title: "Start",
+        active: true
+    },
+    {
+        title: "Middle",
+        enabled: &prev.active
+    },
+    {
+        title: "End",
+        enabled: &prev.enabled,
+        index: &index
+    }
 ]
