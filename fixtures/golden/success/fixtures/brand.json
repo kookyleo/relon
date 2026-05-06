@@ -1,0 +1,37 @@
+{
+  "by_string": {
+    "location": "Berlin",
+    "temperature": 15
+  },
+  "cities": [
+    {
+      "location": "Paris",
+      "temperature": 20
+    },
+    {
+      "location": "Sydney",
+      "temperature": 24
+    }
+  ],
+  "counters": {
+    "hits": 1,
+    "misses": 7
+  },
+  "decorated": {
+    "location": "Tokyo",
+    "temperature": 18
+  },
+  "decorated_kind": "is_weather",
+  "origin": {
+    "name": "HQ",
+    "tags": {
+      "dev": 12,
+      "ops": 4
+    }
+  },
+  "typed_field": {
+    "location": "Shanghai",
+    "temperature": 22
+  },
+  "typed_kind": "is_weather"
+}

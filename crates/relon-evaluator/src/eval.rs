@@ -750,12 +750,28 @@ impl<'a> Evaluator<'a> {
             // [`DecoratorPlugin::wrap`] (built-ins, host-registered plugins)
             // or falls back to the closure / native-function lookup below
             // for user-defined decorators that share a dict with their data.
+            //
+            // Plugins may also override [`DecoratorPlugin::wrap_with_ast`]
+            // to consume the raw AST args before evaluation; if that hook
+            // returns `Some`, regular `wrap` is skipped for that decorator.
             for dec in &node.decorators {
                 let name = decorator_name(dec);
-                let dec_args = self.evaluate_call_args(&dec.args, &current_scope)?;
                 if let Some(plugin) = self.context.decorators.get(&name).cloned() {
+                    if let Some(new_val) = plugin.wrap_with_ast(
+                        self,
+                        node,
+                        &val,
+                        &current_scope,
+                        &dec.args,
+                        dec.range,
+                    )? {
+                        val = new_val;
+                        continue;
+                    }
+                    let dec_args = self.evaluate_call_args(&dec.args, &current_scope)?;
                     val = plugin.wrap(self, val, &current_scope, &dec_args, dec.range)?;
                 } else {
+                    let dec_args = self.evaluate_call_args(&dec.args, &current_scope)?;
                     val = self.fallback_decorator(
                         &dec.path,
                         val,
@@ -773,14 +789,12 @@ impl<'a> Evaluator<'a> {
 
                 if let Value::Dict(ref mut d) = val {
                     let d = Arc::make_mut(d);
-                    if type_hint.path.len() == 1 {
-                        let tname = &type_hint.path[0];
-                        if !is_builtin_type_name(tname) {
-                            d.brand = Some(tname.clone());
-                        }
-                    } else {
-                        d.brand = Some(type_hint.path.join("."));
-                    }
+                    // Delegate to the shared `brand_string_for` so the
+                    // field-level type hint (`Type field: ...`) and the
+                    // decorator form (`@brand(Type)`) produce identical
+                    // brand strings — generics and `?` are preserved on
+                    // both sides.
+                    d.brand = crate::builtin_decorators::brand_string_for(type_hint);
                 }
             }
         }

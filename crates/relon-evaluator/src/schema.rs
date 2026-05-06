@@ -448,8 +448,20 @@ impl<'a> Evaluator<'a> {
             || matches!(value_node.expr.as_ref(), relon_parser::Expr::Variable(_));
 
         if is_field_shape {
-            let (type_node, predicate) =
-                self.extract_field_type_and_predicate(value_node, scope)?;
+            // Fast path: a `SchemaFieldDef::type_hint` synthesized by the
+            // analyzer (e.g. lifted from `@brand(X)`) won't be reflected on
+            // the underlying `value_node.type_hint`, so a `Wildcard` value
+            // would fail the `Type or Type Prefix` check inside
+            // `extract_field_type_and_predicate`. Short-circuit here: if
+            // we already have an authoritative type hint and the value is
+            // just `*`, the predicate is trivially a wildcard.
+            let (type_node, predicate) = if def.type_hint.is_some()
+                && matches!(value_node.expr.as_ref(), relon_parser::Expr::Wildcard)
+            {
+                (def.type_hint.clone().unwrap(), Value::Wildcard)
+            } else {
+                self.extract_field_type_and_predicate(value_node, scope)?
+            };
             let mut field = SchemaField {
                 type_hint: def.type_hint.clone().unwrap_or(type_node),
                 predicates: vec![predicate],

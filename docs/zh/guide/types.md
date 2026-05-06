@@ -191,6 +191,95 @@ Relon 在内存里把变体存成一个普通的 dict，并附带两个隐含标
 }
 ```
 
+### 3. 装饰器位置的 Brand：`@brand(Type)`
+
+字段级类型标记 `Type field: { ... }` 只能写在「键的左侧」。但有些位置写不出键——列表元素、文档根、被其他装饰器（比如 `@import(spread=true)`）包裹的 dict ——这时候就用 `@brand(Type)`：
+
+```relon
+{
+    @schema Weather: {
+        String location: *,
+        Int temperature: *
+    },
+
+    // 等价于 `Weather typed: { ... }`，只是改写在装饰器位置
+    decorated: @brand(Weather) {
+        location: "Tokyo",
+        temperature: 18
+    },
+
+    // 列表元素无法写字段级 hint，只能用 @brand
+    cities: [
+        @brand(Weather) { location: "Paris",  temperature: 20 },
+        @brand(Weather) { location: "Sydney", temperature: 24 }
+    ],
+
+    // 与 @import 配合：先把 schema 注入作用域，再 brand
+    @import("ui/weather.relon", spread=true)
+    @brand(Weather)
+    payload: {
+        location: "Shanghai",
+        temperature: 22
+    }
+}
+```
+
+`@brand` 严格镜像字段级 hint 的运行时行为——同一个 `check_type` 校验、同一份 brand 写入逻辑，所以 `Weather typed: { ... }` 与 `decorated: @brand(Weather) { ... }` 在身份守卫、`match` 分发、JSON 输出上完全等价。
+
+参数支持以下形态——基本上和字段级 type prefix 写得出的写法一一对应：
+
+- **bareword**：`@brand(Weather)`、`@brand(geo.Location)`（路径用 `.` 分段）。
+- **字符串字面量**：`@brand("Weather")`，与 bareword 解析为同一个类型名。
+- **泛型形态**：`@brand(Dict<String, Int>)`、`@brand(List<Weather>)`、`@brand(Foo<T>)`、`@brand(Enum<"a", "b">)`。
+- **可选修饰符**：`@brand(Weather?)`——和字段级 `Weather? w: ...` 行为一致，`null` 值放行，其它走原类型校验。
+
+> 关于泛型 brand 字符串：写入 `dict.brand` 的字符串和 `format_type_node` 输出一致。
+> - 单段非内置类型：`Weather`。
+> - 多段路径：`geo.Location`。
+> - 泛型：`Dict<String, Int>`、`Foo<T>`。
+> - 可选：`Weather?`。
+>
+> 在 `match` 分支里用 bareword 形式（`Weather: ...`）只能匹配单段非内置 brand；要在 brand 字符串完全相等的语义下匹配泛型，请用 `&self.brand == "Dict<String, Int>"` 这种字符串比较，或重新设计 schema 使其包一层命名类型（`@schema Counters: Dict<String, Int>`）。
+
+**校验侧的边界**：
+
+- 应用到 dict：`check_type` 通过后写入 `dict.brand`；内置类型名（`Int`/`String`/...）的「**单段无泛型无 `?`**」形态只校验，不写 brand——和字段级 hint 完全一致。
+- 内置容器的泛型形态（`Dict<K, V>`、`List<T>`、`Enum<...>`）按照 `check_type` 既有规则递归校验，校验通过后 brand 字符串使用完整泛型表达式（如 `"Dict<String, Int>"`）。
+- 自定义类型 + 泛型参数（如 `Foo<T>`）：runtime 当前仅按 `Foo` 走 `check_custom_schema`，泛型参数在 brand 字符串里保留但**不参与运行时校验**。这一点和字段级 type prefix 完全一致。
+- 应用到非 dict：仅校验，brand 无处可写。
+- 同一处既写了字段级 hint 又写了 `@brand`（如 `Foo x: @brand(Bar) { ... }`）会被拒绝——同一个意图写两遍，去掉一个再说。
+- `@brand(Unknown)` 在 `Unknown` 不在作用域时报 `VariableNotFound`，与 `Unknown x: { ... }` 一致。
+- ⚠️ `@brand(Map<...>)` **不工作**：Relon 的内置容器命名是 `Dict`/`List`，没有 `Map`。`Map<...>` 会走 `check_custom_schema` 查找名为 `Map` 的 schema，找不到则报 `VariableNotFound`。
+
+#### 在 schema 字段中使用
+
+`@brand(X)` 也能写在 `@schema` body 内的字段上——此时它是字段级 type prefix `X` 的同义形式：
+
+```relon
+{
+    // 这两个 schema 完全等价：
+    @schema A: {
+        String name: *,
+        Dict<String, Int> counters: *
+    },
+
+    @schema B: {
+        @brand(String) name: *,
+        @brand(Dict<String, Int>) counters: *
+    },
+
+    // 实例校验走的是同一条路径
+    A inst1: { name: "x", counters: { hits: 1 } },
+    B inst2: { name: "y", counters: { misses: 2 } }
+}
+```
+
+放在 schema 字段上时的额外规则：
+
+- 字段同时写了 type prefix 和 `@brand` 会被分析器拒绝：`@schema S: { @brand(Bar) Foo x: * }` 报 `SchemaFieldBrandConflict`。同一个意图不要写两遍。
+- `@brand` 与 `@expect`/`@default`/`@msg`/`@error`/`@value` 等元装饰器可以叠用：`@default(0) @brand(Int) age: *` 工作良好。
+- 字段位置的 `@brand` 只影响 schema 字段的类型声明本身，**不会**给实例上的内嵌 dict 自动写 brand——和 `Type field: *` 形式一致。如果你希望实例上的内嵌 dict 也带 brand，请在实例那一侧再写一次 `@brand` 或 type prefix。
+
 ## Schema 混入与组合 (Mixins)
 
 在组件库中，你常常需要通过基础配置扩展出高级配置。由于 Schema 也是头等值，你可以使用 `+` 直接将它们合并起来！

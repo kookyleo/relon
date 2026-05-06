@@ -8,13 +8,18 @@
 //! own plugin under the same name first.
 
 use crate::decorator::{DecoratorPlugin, PreEvalOutcome};
-use crate::decorator_names::{DEFAULT, ERROR, EXPECT, IMPORT, LIBRARY, MSG, SCHEMA, VALUE};
+use crate::decorator_names::{
+    BRAND, DEFAULT, ERROR, EXPECT, IMPORT, LIBRARY, MSG, SCHEMA, VALUE,
+};
 use crate::error::RuntimeError;
 use crate::eval::{Context, Evaluator};
 use crate::native_fn::EvaluatedArg;
 use crate::scope::Scope;
 use crate::value::{SchemaField, Value};
-use relon_parser::{CallArg, Node, TokenRange};
+use crate::schema::format_type_node;
+use relon_parser::{
+    is_builtin_type_name, type_node_from_brand_arg, CallArg, Node, TokenRange, TypeNode,
+};
 use std::sync::Arc;
 
 pub(crate) fn register_to(ctx: &mut Context) {
@@ -25,6 +30,7 @@ pub(crate) fn register_to(ctx: &mut Context) {
     ctx.register_decorator(ERROR, Arc::new(MessageDecorator));
     ctx.register_decorator(DEFAULT, Arc::new(DefaultDecorator));
     ctx.register_decorator(VALUE, Arc::new(ValueDecorator));
+    ctx.register_decorator(BRAND, Arc::new(BrandDecorator));
     // `@library` is a file-role marker consumed by the analyzer; the
     // evaluator only sees it when a library file is loaded as a module,
     // where it must behave as identity instead of tripping the
@@ -209,3 +215,107 @@ impl DecoratorPlugin for ValueDecorator {
         }
     }
 }
+
+/// `@brand(Type)` — decorator-position mirror of the field-level type hint
+/// (`Type field: { ... }`). The first positional argument is parsed as a
+/// **type expression**, not an ordinary value: a bareword (`@brand(Weather)`)
+/// or a string literal (`@brand("Weather")`) both resolve to the type name
+/// `"Weather"`. Dotted paths (`@brand(geo.Location)`) are also accepted.
+///
+/// Apply rules (kept in lockstep with the field-level path in
+/// `Evaluator::eval_internal`):
+///
+/// * On a `Dict`: runs `check_type` against the named schema (if registered)
+///   and writes `dict.brand = Some(name)`. Built-in type names (`Int`,
+///   `String`, ...) only validate; brand is not stored — same as the field
+///   form.
+/// * On a non-`Dict`: runs `check_type` only. Brand has nowhere to live.
+/// * Conflict: if the host node also carries a field-level type hint, the
+///   user has expressed the same intent twice; refuse with a clear error.
+struct BrandDecorator;
+
+impl DecoratorPlugin for BrandDecorator {
+    fn wrap_with_ast(
+        &self,
+        eval: &Evaluator<'_>,
+        node: &Node,
+        value: &Value,
+        scope: &Arc<Scope>,
+        ast_args: &[CallArg],
+        range: TokenRange,
+    ) -> Result<Option<Value>, RuntimeError> {
+        // Reject the ambiguous `Foo x: @brand(Bar) {...}` form up front. The
+        // outer `Foo` hint and the inner `@brand` would both try to write
+        // `dict.brand` (and run their own `check_type`); it's almost never
+        // what the author meant.
+        if node.type_hint.is_some() {
+            return Err(RuntimeError::UnsupportedOperator(
+                "@brand cannot be combined with a field-level type hint on the same value; pick one"
+                    .to_string(),
+                range,
+            ));
+        }
+
+        let arg = ast_args.first().ok_or_else(|| {
+            RuntimeError::UnsupportedOperator(
+                "@brand requires a type argument, e.g. @brand(Weather)".to_string(),
+                range,
+            )
+        })?;
+        if arg.name.is_some() {
+            return Err(RuntimeError::UnsupportedOperator(
+                "@brand does not accept named arguments; use @brand(Type)".to_string(),
+                range,
+            ));
+        }
+
+        let type_node = type_node_from_brand_arg(&arg.value.expr, range).ok_or_else(|| {
+            RuntimeError::UnsupportedOperator(
+                "@brand argument must be a type name (bareword, string, dotted path, or generic type)"
+                    .to_string(),
+                range,
+            )
+        })?;
+
+        let mut new_val = value.clone();
+        // Wildcard short-circuits in the field path; preserve that here so
+        // the two entry points stay observationally equivalent.
+        if !matches!(new_val, Value::Wildcard) {
+            eval.check_type(&mut new_val, &type_node, scope, range)?;
+
+            if let Value::Dict(ref mut d) = new_val {
+                let d = Arc::make_mut(d);
+                d.brand = brand_string_for(&type_node);
+            }
+        }
+
+        Ok(Some(new_val))
+    }
+}
+
+/// Compute the brand string written into `dict.brand` for a given type
+/// reference. Mirrors the field-form rule (`type_hint` path) and extends it
+/// to cover generic / optional shapes so `@brand(Map<String, Int>)`,
+/// `@brand(Foo<T>)`, and `@brand(Weather?)` all produce a brand that round-
+/// trips through `Type` match arms and JSON output.
+///
+/// * Single segment built-in (`Int`, `String`, …) without generics or `?` →
+///   `None` (built-ins never carry an identity brand, same as the field form).
+/// * Single segment custom type without generics or `?` → just the name
+///   (`Some("Weather")`).
+/// * Anything else → `format_type_node`-serialized string
+///   (`Some("Map<String, Int>")`, `Some("Weather?")`, `Some("geo.Location")`).
+pub(crate) fn brand_string_for(type_node: &TypeNode) -> Option<String> {
+    if type_node.generics.is_empty()
+        && !type_node.is_optional
+        && type_node.path.len() == 1
+    {
+        let tname = &type_node.path[0];
+        if is_builtin_type_name(tname) {
+            return None;
+        }
+        return Some(tname.clone());
+    }
+    Some(format_type_node(type_node))
+}
+

@@ -67,6 +67,29 @@ pub trait DecoratorPlugin: Send + Sync {
         Ok(value)
     }
 
+    /// AST-level wrap hook. Called *before* [`Self::wrap`]: receives the
+    /// decorator's raw [`CallArg`] AST nodes (un-evaluated) along with the
+    /// host [`Node`] so plugins that need to inspect type expressions,
+    /// paths, or sibling decorators / type hints can do so without losing
+    /// them to evaluation.
+    ///
+    /// Returns `Ok(None)` to fall through to the standard `wrap` path.
+    /// Returning `Ok(Some(val))` short-circuits: `wrap` is not called and
+    /// `val` becomes the decorator's output. `@brand(Type)` uses this to
+    /// extract the type name from the un-evaluated AST so a bareword like
+    /// `Weather` doesn't get resolved to a `Value::Schema` first.
+    fn wrap_with_ast(
+        &self,
+        _eval: &Evaluator<'_>,
+        _node: &Node,
+        _value: &Value,
+        _scope: &Arc<Scope>,
+        _ast_args: &[CallArg],
+        _range: TokenRange,
+    ) -> Result<Option<Value>, RuntimeError> {
+        Ok(None)
+    }
+
     fn schema_field_meta(
         &self,
         _eval: &Evaluator<'_>,

@@ -12,3 +12,4 @@ pub(crate) const DEFAULT: &str = "default";
 pub(crate) const VALUE: &str = "value";
 pub(crate) const MSG: &str = "msg";
 pub(crate) const ERROR: &str = "error";
+pub(crate) const BRAND: &str = "brand";

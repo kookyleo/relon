@@ -118,6 +118,33 @@ pub enum Diagnostic {
         #[label("inconsistent enum form")]
         range: SourceSpan,
     },
+
+    #[error(
+        "schema field `{field}`: cannot combine an explicit type prefix `{type_prefix}` with `@brand(...)`"
+    )]
+    #[diagnostic(
+        code(relon::analyze::schema_field_brand_conflict),
+        help("Both forms declare the field's type — pick one. Either drop the type prefix and keep `@brand(...)`, or drop `@brand(...)` and keep the prefix.")
+    )]
+    SchemaFieldBrandConflict {
+        field: String,
+        type_prefix: String,
+        #[label("conflicting `@brand` here")]
+        range: SourceSpan,
+    },
+
+    #[error("schema field `{field}`: `@brand(...)` argument must be a type")]
+    #[diagnostic(
+        code(relon::analyze::schema_field_brand_invalid_arg),
+        help(
+            "Pass a type expression: `@brand(Weather)`, `@brand(geo.Location)`, `@brand(\"Weather\")`, or a generic like `@brand(Map<String, Int>)`."
+        )
+    )]
+    SchemaFieldBrandInvalidArg {
+        field: String,
+        #[label("not a type")]
+        range: SourceSpan,
+    },
 }
 
 impl Diagnostic {
@@ -129,7 +156,9 @@ impl Diagnostic {
             | Diagnostic::NonExhaustiveMatch { .. }
             | Diagnostic::UnknownVariant { .. }
             | Diagnostic::DuplicateMatchArm { .. }
-            | Diagnostic::HeterogeneousEnum { .. } => Severity::Error,
+            | Diagnostic::HeterogeneousEnum { .. }
+            | Diagnostic::SchemaFieldBrandConflict { .. }
+            | Diagnostic::SchemaFieldBrandInvalidArg { .. } => Severity::Error,
             // Informational: the analyzer's view is conservative — a
             // spread, closure binding, or runtime-computed field may
             // still resolve, so we don't gate evaluation on it.

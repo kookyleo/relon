@@ -359,3 +359,68 @@ pub fn is_builtin_type_name(name: &str) -> bool {
             | "Enum"
     )
 }
+
+/// Lift a decorator-argument [`Expr`] back into a [`TypeNode`].
+///
+/// Used by every site that consumes a `@brand(Type)` argument — the
+/// evaluator's `BrandDecorator::wrap_with_ast` runs this on the live
+/// argument, and the analyzer's schema-field lowering runs it to lift
+/// `@brand(X)` placed on a typeless schema field into an implicit type
+/// prefix.
+///
+/// Accepted shapes:
+///
+/// * Full type expression (`Map<String, Int>`, `Foo<T>`, `Weather?`,
+///   `Int`, `Enum<...>`) — produced by [`crate::expr::parse_type_expr`]
+///   and surfaced as `Expr::Type`. The contained `TypeNode` is returned
+///   verbatim so generics and `is_optional` survive.
+/// * Bareword / dotted path (`Weather`, `geo.Location`) — surfaced as
+///   `Expr::Variable` because the parser only commits to `Expr::Type`
+///   when it sees generics, `?`, or a known builtin head. Each path
+///   segment must be a simple identifier (no `?.`, `[i]`, or spread).
+/// * String literal (`"Weather"`, `"geo.Location"`) — split on `.` for
+///   parity with the bareword form.
+///
+/// Returns `None` when `expr` is none of the above; callers turn that
+/// into a user-facing "argument must be a type" error.
+pub fn type_node_from_brand_arg(expr: &Expr, range: TokenRange) -> Option<TypeNode> {
+    match expr {
+        Expr::Type(t) => Some(t.clone()),
+        Expr::Variable(path) => {
+            let mut segs = Vec::with_capacity(path.len());
+            for tk in path {
+                match tk {
+                    TokenKey::String(s, _, false) => segs.push(s.clone()),
+                    _ => return None,
+                }
+            }
+            if segs.is_empty() {
+                return None;
+            }
+            Some(TypeNode {
+                path: segs,
+                generics: Vec::new(),
+                is_optional: false,
+                range,
+                variant_fields: None,
+            })
+        }
+        Expr::String(s) => {
+            if s.is_empty() {
+                return None;
+            }
+            let segs: Vec<String> = s.split('.').map(|p| p.to_string()).collect();
+            if segs.iter().any(|p| p.is_empty()) {
+                return None;
+            }
+            Some(TypeNode {
+                path: segs,
+                generics: Vec::new(),
+                is_optional: false,
+                range,
+                variant_fields: None,
+            })
+        }
+        _ => None,
+    }
+}

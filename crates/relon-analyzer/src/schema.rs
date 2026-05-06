@@ -20,10 +20,13 @@
 //! recorded with placeholders; this is a structural skeleton meant to
 //! support diagnostics + future passes, not full type-checking.
 
-use crate::decorator_names::{DEFAULT, ERROR, EXPECT, MSG, SCHEMA, VALUE};
+use crate::decorator_names::{BRAND, DEFAULT, ERROR, EXPECT, MSG, SCHEMA, VALUE};
 use crate::diagnostic::{span_of, Diagnostic};
 use crate::tree::AnalyzedTree;
-use relon_parser::{Decorator, Expr, Node, NodeId, Operator, TokenKey, TokenRange, TypeNode};
+use relon_parser::{
+    type_node_from_brand_arg, Decorator, Expr, Node, NodeId, Operator, TokenKey, TokenRange,
+    TypeNode,
+};
 use std::sync::Arc;
 
 /// Static skeleton of a `@schema` definition. The evaluator owns the
@@ -282,7 +285,28 @@ fn collect_fields(pairs: &[(TokenKey, Node)], def: &mut SchemaDef, tree: &mut An
         } else {
             None
         };
-        let type_hint = value.type_hint.clone().or_else(|| value_as_type.clone());
+        let mut type_hint = value.type_hint.clone().or_else(|| value_as_type.clone());
+
+        // Schema-field-position `@brand(X) y: *` is the decorator-form
+        // mirror of `X y: *`: lift the brand argument into the field's
+        // type hint when no explicit prefix is present, and emit a
+        // conflict diagnostic when both are.
+        if let Some((dec, brand_type)) = brand_decorator_type(value, field_name, tree) {
+            match type_hint.as_ref() {
+                None => {
+                    type_hint = Some(brand_type);
+                }
+                Some(existing) => {
+                    tree.diagnostics
+                        .push(Diagnostic::SchemaFieldBrandConflict {
+                            field: field_name.clone(),
+                            type_prefix: format_type_node_simple(existing),
+                            range: span_of(dec.range),
+                        });
+                }
+            }
+        }
+
         if type_hint.is_none() && !is_field_skippable(value) {
             tree.diagnostics.push(Diagnostic::SchemaFieldUntyped {
                 field: field_name.clone(),
@@ -315,9 +339,11 @@ fn collect_fields(pairs: &[(TokenKey, Node)], def: &mut SchemaDef, tree: &mut An
     }
 }
 
-/// `@expect("...")`-decorated entries inside a schema body don't need
-/// their own type prefix; they're meta-decorators consumed by the
-/// evaluator. Skip the untyped-field diagnostic for them.
+/// `@expect("...")` / `@brand(X)`-decorated entries inside a schema body
+/// don't need their own type prefix. `@expect` & friends are pure
+/// meta-decorators consumed by the evaluator; `@brand(X)` doubles as an
+/// implicit type prefix (lifted into `type_hint` by `collect_fields`).
+/// Skip the untyped-field diagnostic for both.
 fn is_field_skippable(value: &Node) -> bool {
     value.decorators.iter().any(|dec| {
         dec.path
@@ -326,9 +352,65 @@ fn is_field_skippable(value: &Node) -> bool {
                 TokenKey::String(name, _, _) => Some(name.as_str()),
                 _ => None,
             })
-            .map(|name| matches!(name, EXPECT | DEFAULT | MSG | ERROR | VALUE))
+            .map(|name| matches!(name, EXPECT | DEFAULT | MSG | ERROR | VALUE | BRAND))
             .unwrap_or(false)
     })
+}
+
+/// Look for a `@brand(...)` decorator on a schema field. Returns the first
+/// hit (decorator metadata + extracted [`TypeNode`]); pushes a diagnostic
+/// and returns `None` when the argument shape isn't a type. Multiple
+/// `@brand` on one field doesn't compose, so we only honor the first;
+/// later ones are silently ignored at this layer (the evaluator will
+/// either re-reject them or treat them as a no-op via the conflict path).
+fn brand_decorator_type<'a>(
+    value: &'a Node,
+    field_name: &str,
+    tree: &mut AnalyzedTree,
+) -> Option<(&'a Decorator, TypeNode)> {
+    for dec in &value.decorators {
+        match dec.path.first() {
+            Some(TokenKey::String(s, _, _)) if s == BRAND => {}
+            _ => continue,
+        }
+        let arg = match dec.args.first() {
+            Some(a) if a.name.is_none() => a,
+            _ => {
+                tree.diagnostics
+                    .push(Diagnostic::SchemaFieldBrandInvalidArg {
+                        field: field_name.to_string(),
+                        range: span_of(dec.range),
+                    });
+                return None;
+            }
+        };
+        match type_node_from_brand_arg(&arg.value.expr, dec.range) {
+            Some(t) => return Some((dec, t)),
+            None => {
+                tree.diagnostics
+                    .push(Diagnostic::SchemaFieldBrandInvalidArg {
+                        field: field_name.to_string(),
+                        range: span_of(dec.range),
+                    });
+                return None;
+            }
+        }
+    }
+    None
+}
+
+/// Compact `TypeNode` formatter for diagnostic messages. Mirrors the
+/// evaluator's `format_type_node`, kept private here so the analyzer
+/// doesn't need a dependency on the evaluator.
+fn format_type_node_simple(t: &TypeNode) -> String {
+    let suffix = if t.is_optional { "?" } else { "" };
+    let path_str = t.path.join(".");
+    if t.generics.is_empty() {
+        format!("{path_str}{suffix}")
+    } else {
+        let generics: Vec<String> = t.generics.iter().map(format_type_node_simple).collect();
+        format!("{path_str}<{}>{suffix}", generics.join(", "))
+    }
 }
 
 fn base_ref(node: &Node) -> Option<BaseRef> {

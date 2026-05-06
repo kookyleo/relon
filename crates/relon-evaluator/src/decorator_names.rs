@@ -13,3 +13,4 @@ pub const DEFAULT: &str = "default";
 pub const VALUE: &str = "value";
 pub const MSG: &str = "msg";
 pub const ERROR: &str = "error";
+pub const BRAND: &str = "brand";

@@ -1231,6 +1231,576 @@ mod tests {
     }
 
     #[test]
+    fn test_brand_decorator_validates_and_brands_dict() {
+        // `@brand(Weather)` at field-value position is the decorator-form
+        // analogue of `Weather w: {...}`: it runs `check_type` against the
+        // schema and writes `dict.brand`. Verify both effects on a value
+        // that satisfies the schema.
+        let result = eval_doc(
+            r#"{
+            @schema Weather: { String location: *, Int temperature: * },
+
+            w: @brand(Weather) {
+                location: "Shanghai",
+                temperature: 22
+            },
+
+            kind: &sibling.w match {
+                Weather: "is_weather",
+                *: "other"
+            }
+        }"#,
+        )
+        .unwrap();
+
+        let Value::Dict(d) = result else {
+            panic!("Expected Dict");
+        };
+        let Value::Dict(w) = d.map.get("w").unwrap() else {
+            panic!("Expected Dict for w");
+        };
+        assert_eq!(w.brand.as_deref(), Some("Weather"));
+        assert_eq!(
+            w.map.get("location").unwrap(),
+            &Value::String("Shanghai".to_string())
+        );
+        assert_eq!(w.map.get("temperature").unwrap(), &Value::Int(22));
+        assert_eq!(
+            d.map.get("kind").unwrap(),
+            &Value::String("is_weather".to_string())
+        );
+    }
+
+    #[test]
+    fn test_brand_decorator_validation_failure() {
+        // Field-level hint rejects ill-typed payloads with `TypeMismatch`;
+        // `@brand` must reach the same outcome through the same `check_type`
+        // call.
+        let result = eval_doc(
+            r#"{
+            @schema Weather: { String location: *, Int temperature: * },
+
+            w: @brand(Weather) {
+                location: "Shanghai",
+                temperature: "hot"
+            }
+        }"#,
+        );
+        assert!(matches!(result, Err(RuntimeError::TypeMismatch { .. })));
+    }
+
+    #[test]
+    fn test_brand_decorator_string_form_equivalent() {
+        // `@brand("Weather")` and `@brand(Weather)` resolve to the same
+        // type name; the brand written into the dict must be identical.
+        let result = eval_doc(
+            r#"{
+            @schema Weather: { String location: *, Int temperature: * },
+
+            w: @brand("Weather") {
+                location: "Tokyo",
+                temperature: 18
+            }
+        }"#,
+        )
+        .unwrap();
+
+        let Value::Dict(d) = result else {
+            panic!("Expected Dict");
+        };
+        let Value::Dict(w) = d.map.get("w").unwrap() else {
+            panic!("Expected Dict for w");
+        };
+        assert_eq!(w.brand.as_deref(), Some("Weather"));
+    }
+
+    #[test]
+    fn test_brand_decorator_at_document_root() {
+        // The whole point of `@brand` is reaching positions where a
+        // `Type field:` hint can't be written — the document root being
+        // the canonical example. The schema lives in an outer scope
+        // injected by the host (the parser doesn't allow a root-node
+        // type hint, so this is the only way to brand a root dict).
+        use std::collections::HashMap;
+        let node = parse_doc(
+            r#"@brand(Weather) {
+            location: "Berlin",
+            temperature: 15
+        }"#,
+        );
+        let ctx = Context::new().with_root(node);
+        // Synthesize a `Weather` schema and seed it into the surrounding
+        // scope so the root-level `@brand` can resolve it.
+        let weather_schema = Value::Schema({
+            let mut fields = HashMap::new();
+            fields.insert(
+                "location".to_string(),
+                SchemaField {
+                    type_hint: relon_parser::TypeNode {
+                        path: vec!["String".to_string()],
+                        generics: Vec::new(),
+                        is_optional: false,
+                        range: relon_parser::TokenRange::default(),
+                        variant_fields: None,
+                    },
+                    predicates: vec![Value::Wildcard],
+                    custom_error: None,
+                    default_value: None,
+                },
+            );
+            fields.insert(
+                "temperature".to_string(),
+                SchemaField {
+                    type_hint: relon_parser::TypeNode {
+                        path: vec!["Int".to_string()],
+                        generics: Vec::new(),
+                        is_optional: false,
+                        range: relon_parser::TokenRange::default(),
+                        variant_fields: None,
+                    },
+                    predicates: vec![Value::Wildcard],
+                    custom_error: None,
+                    default_value: None,
+                },
+            );
+            fields
+        });
+        let outer_scope = std::sync::Arc::new(Scope::default());
+        outer_scope
+            .locals
+            .lock()
+            .unwrap()
+            .insert("Weather".to_string(), weather_schema);
+
+        let result = Evaluator::new(&ctx).eval_root(&outer_scope).unwrap();
+        let Value::Dict(d) = result else {
+            panic!("Expected Dict");
+        };
+        assert_eq!(d.brand.as_deref(), Some("Weather"));
+        assert_eq!(
+            d.map.get("location").unwrap(),
+            &Value::String("Berlin".to_string())
+        );
+        assert_eq!(d.map.get("temperature").unwrap(), &Value::Int(15));
+    }
+
+    #[test]
+    fn test_brand_decorator_stacks_with_import_spread() {
+        // `@import(spread=true)` injects locals (here: a schema) into the
+        // surrounding scope; `@brand` then validates the dict against that
+        // newly-visible schema. Order matters — `@import`'s `pre_eval`
+        // runs first so the schema is in scope by the time `@brand`'s
+        // wrap pass calls `check_type`.
+        let dir = std::env::temp_dir().join(format!(
+            "relon-brand-import-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let lib_path = dir.join("weather_schema.relon");
+        std::fs::write(
+            &lib_path,
+            r#"{
+                @schema Weather: { String location: *, Int temperature: * }
+            }"#,
+        )
+        .unwrap();
+
+        let src = format!(
+            r#"{{
+                w: @import("{}", spread=true) @brand(Weather) {{
+                    location: "Paris",
+                    temperature: 20
+                }}
+            }}"#,
+            lib_path.to_string_lossy()
+        );
+
+        let node = parse_doc(&src);
+        let ctx = Context::trusted().with_root(node);
+        let result = Evaluator::new(&ctx)
+            .eval_root(&std::sync::Arc::new(Scope::default()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let result = result.unwrap();
+
+        let Value::Dict(d) = result else {
+            panic!("Expected Dict");
+        };
+        let Value::Dict(w) = d.map.get("w").unwrap() else {
+            panic!("Expected Dict for w");
+        };
+        assert_eq!(w.brand.as_deref(), Some("Weather"));
+        assert_eq!(w.map.get("temperature").unwrap(), &Value::Int(20));
+    }
+
+    #[test]
+    fn test_brand_decorator_conflicts_with_field_type_hint() {
+        // `Weather w: @brand(Weather) {...}` expresses the same intent
+        // twice. Refuse the combination so the user picks one form.
+        let result = eval_doc(
+            r#"{
+            @schema Weather: { String location: *, Int temperature: * },
+
+            Weather w: @brand(Weather) {
+                location: "Shanghai",
+                temperature: 22
+            }
+        }"#,
+        );
+        assert!(matches!(
+            result,
+            Err(RuntimeError::UnsupportedOperator(msg, _)) if msg.contains("@brand")
+        ));
+    }
+
+    #[test]
+    fn test_brand_decorator_unknown_schema_matches_field_form() {
+        // The field-form `NotDeclared x: {...}` produces `VariableNotFound`
+        // when `NotDeclared` isn't in scope (see `check_custom_schema`).
+        // `@brand(NotDeclared) {...}` must produce the same error so the
+        // two entry points stay observationally identical.
+        let result = eval_doc(
+            r#"{
+            w: @brand(NotDeclared) { a: 1 }
+        }"#,
+        );
+        assert!(matches!(result, Err(RuntimeError::VariableNotFound(_, _))));
+
+        let field_form = eval_doc(
+            r#"{
+            NotDeclared w: { a: 1 }
+        }"#,
+        );
+        assert!(matches!(
+            field_form,
+            Err(RuntimeError::VariableNotFound(_, _))
+        ));
+    }
+
+    // -------- Task A: generic / optional types in `@brand(...)` --------
+
+    #[test]
+    fn test_brand_decorator_generic_dict_validates_and_brands() {
+        // `@brand(Dict<String, Int>)` runs `check_dict` against the value
+        // (every entry's value must be `Int`) and stamps the dict with a
+        // brand string that round-trips through type matches and JSON.
+        // `Dict` is the canonical builtin — `Map<...>` would fall through
+        // to `check_custom_schema` and fail with `VariableNotFound("Map")`
+        // unless the host registers a `Map` alias schema.
+        let result = eval_doc(
+            r#"{
+            counters: @brand(Dict<String, Int>) {
+                hits: 1,
+                misses: 7
+            }
+        }"#,
+        )
+        .unwrap();
+        let Value::Dict(d) = result else {
+            panic!("Expected Dict");
+        };
+        let Value::Dict(c) = d.map.get("counters").unwrap() else {
+            panic!("Expected Dict for counters");
+        };
+        // `Dict` is a builtin, so the brand string is the full
+        // generic shape rather than the empty single-builtin case.
+        assert_eq!(c.brand.as_deref(), Some("Dict<String, Int>"));
+        assert_eq!(c.map.get("hits").unwrap(), &Value::Int(1));
+        assert_eq!(c.map.get("misses").unwrap(), &Value::Int(7));
+    }
+
+    #[test]
+    fn test_brand_decorator_generic_dict_validation_failure() {
+        // Same as the field-form `Dict<String, Int> m: { ... }` —
+        // a non-Int value for any entry must reject with `TypeMismatch`.
+        let result = eval_doc(
+            r#"{
+            counters: @brand(Dict<String, Int>) {
+                hits: 1,
+                misses: "lots"
+            }
+        }"#,
+        );
+        assert!(matches!(result, Err(RuntimeError::TypeMismatch { .. })));
+    }
+
+    #[test]
+    fn test_brand_decorator_generic_single_param_brand_string() {
+        // `@brand(Foo<T>)` with no host-supplied `Foo` schema falls back to
+        // `check_custom_schema` — the lookup fails on `Foo`, mirroring the
+        // field form. Brand serialization for the generic shape, however,
+        // is still well-defined: verify it through the lookup error path
+        // by introducing `Foo` as an alias to a permissive schema first.
+        let result = eval_doc(
+            r#"{
+            @schema Foo: { Any value: * },
+
+            wrapped: @brand(Foo<T>) {
+                value: 42
+            }
+        }"#,
+        )
+        .unwrap();
+        let Value::Dict(d) = result else {
+            panic!("Expected Dict");
+        };
+        let Value::Dict(w) = d.map.get("wrapped").unwrap() else {
+            panic!("Expected Dict for wrapped");
+        };
+        // `Foo<T>` serializes with its generic params for parity with the
+        // field-form's `format_type_node` output.
+        assert_eq!(w.brand.as_deref(), Some("Foo<T>"));
+    }
+
+    #[test]
+    fn test_brand_decorator_field_form_generic_brand_parity() {
+        // The field-level type hint must produce the same brand string
+        // as the decorator form for generic types. Both arrive at
+        // `brand_string_for(type_node)` so a regression on either side
+        // shows up here.
+        let result = eval_doc(
+            r#"{
+            Dict<String, Int> field: { a: 1, b: 2 },
+            decorated: @brand(Dict<String, Int>) { a: 1, b: 2 }
+        }"#,
+        )
+        .unwrap();
+        let Value::Dict(d) = result else {
+            panic!("Expected Dict");
+        };
+        let Value::Dict(f) = d.map.get("field").unwrap() else {
+            panic!("Expected Dict for field");
+        };
+        let Value::Dict(g) = d.map.get("decorated").unwrap() else {
+            panic!("Expected Dict for decorated");
+        };
+        assert_eq!(f.brand, g.brand);
+        assert_eq!(f.brand.as_deref(), Some("Dict<String, Int>"));
+    }
+
+    #[test]
+    fn test_brand_decorator_optional_brand_string() {
+        // `@brand(Weather?)` — the `?` suffix flows into the brand string
+        // so type guards see the optionality marker. The schema validation
+        // proceeds against the underlying `Weather` schema.
+        let result = eval_doc(
+            r#"{
+            @schema Weather: { String location: *, Int temperature: * },
+
+            w: @brand(Weather?) {
+                location: "Tokyo",
+                temperature: 18
+            }
+        }"#,
+        )
+        .unwrap();
+        let Value::Dict(d) = result else {
+            panic!("Expected Dict");
+        };
+        let Value::Dict(w) = d.map.get("w").unwrap() else {
+            panic!("Expected Dict for w");
+        };
+        assert_eq!(w.brand.as_deref(), Some("Weather?"));
+    }
+
+    // -------- Task B: `@brand(X)` at schema-field position --------
+
+    #[test]
+    fn test_brand_decorator_in_schema_field_equivalent_to_type_prefix() {
+        // `@schema S: { @brand(String) name: * }` is the decorator-form
+        // mirror of `@schema S: { String name: * }`. A non-`String` value
+        // on the schema instance must reject with `TypeMismatch`, and a
+        // `String` value must validate cleanly.
+        let ok = eval_doc(
+            r#"{
+            @schema S: { @brand(String) name: * },
+
+            S inst: { name: "Ada" }
+        }"#,
+        )
+        .unwrap();
+        let Value::Dict(d) = ok else {
+            panic!("Expected Dict");
+        };
+        let Value::Dict(inst) = d.map.get("inst").unwrap() else {
+            panic!("Expected Dict for inst");
+        };
+        assert_eq!(
+            inst.map.get("name").unwrap(),
+            &Value::String("Ada".to_string())
+        );
+
+        let bad = eval_doc(
+            r#"{
+            @schema S: { @brand(String) name: * },
+
+            S inst: { name: 42 }
+        }"#,
+        );
+        assert!(matches!(bad, Err(RuntimeError::TypeMismatch { .. })));
+    }
+
+    #[test]
+    fn test_brand_decorator_in_schema_field_dotted_path() {
+        // `@brand(geo.Location) loc: *` — dotted-path arg form. The schema
+        // must validate against the resolved `geo.Location` binding (here
+        // re-bound in the same dict so static lookup works). Same as the
+        // type-prefix form `geo.Location loc: *` — neither auto-brands
+        // the nested instance; the user is expected to apply `@brand` at
+        // the instance position when an explicit brand is desired.
+        let result = eval_doc(
+            r#"{
+            geo: { Location: @schema { Number lat: *, Number lon: * } },
+            @schema Place: {
+                @brand(geo.Location) loc: *,
+                String name: *
+            },
+
+            Place p: {
+                loc: { lat: 1.0, lon: 2.0 },
+                name: "Origin"
+            }
+        }"#,
+        )
+        .unwrap();
+        let Value::Dict(d) = result else {
+            panic!("Expected Dict");
+        };
+        let Value::Dict(p) = d.map.get("p").unwrap() else {
+            panic!("Expected Dict for p");
+        };
+        let Value::Dict(loc) = p.map.get("loc").unwrap() else {
+            panic!("Expected Dict for loc");
+        };
+        assert_eq!(loc.map.get("lat").unwrap(), &Value::Float(1.0.into()));
+
+        // The validation rejects an instance whose `loc` shape doesn't
+        // satisfy `geo.Location` — proving the `@brand`-derived type hint
+        // really drove `check_type`.
+        let bad = eval_doc(
+            r#"{
+            geo: { Location: @schema { Number lat: *, Number lon: * } },
+            @schema Place: {
+                @brand(geo.Location) loc: *,
+                String name: *
+            },
+
+            Place p: {
+                loc: { lat: "north" },
+                name: "Origin"
+            }
+        }"#,
+        );
+        assert!(bad.is_err(), "expected validation failure, got {:?}", bad);
+    }
+
+    #[test]
+    fn test_brand_decorator_in_schema_field_generic_dict() {
+        // `@brand(Dict<String, Int>) m: *` lifts the generic type into the
+        // field's type hint; instances with non-Int values must reject.
+        let ok = eval_doc(
+            r#"{
+            @schema Counters: {
+                @brand(Dict<String, Int>) m: *
+            },
+
+            Counters c: { m: { a: 1, b: 2 } }
+        }"#,
+        )
+        .unwrap();
+        let Value::Dict(d) = ok else {
+            panic!("Expected Dict");
+        };
+        let Value::Dict(c) = d.map.get("c").unwrap() else {
+            panic!("Expected Dict for c");
+        };
+        assert!(c.map.contains_key("m"));
+
+        let bad = eval_doc(
+            r#"{
+            @schema Counters: {
+                @brand(Dict<String, Int>) m: *
+            },
+
+            Counters c: { m: { a: 1, b: "two" } }
+        }"#,
+        );
+        assert!(matches!(bad, Err(RuntimeError::TypeMismatch { .. })));
+    }
+
+    #[test]
+    fn test_brand_decorator_in_schema_field_conflict_with_explicit_type() {
+        // When a schema field carries BOTH an explicit type prefix AND a
+        // `@brand(...)` decorator, the analyzer flags it as a conflict.
+        // Source: `@brand(Bar) Foo x: *` — both forms try to declare `x`'s
+        // type. Verify the diagnostic shape directly via `relon_analyzer`.
+        let node = parse_doc(
+            r#"{
+            @schema S: { @brand(Bar) Foo x: * }
+        }"#,
+        );
+        let tree = relon_analyzer::analyze(&node);
+        assert!(
+            tree.diagnostics.iter().any(|d| matches!(
+                d,
+                relon_analyzer::Diagnostic::SchemaFieldBrandConflict { field, .. } if field == "x"
+            )),
+            "expected SchemaFieldBrandConflict diagnostic, got {:?}",
+            tree.diagnostics
+        );
+    }
+
+    #[test]
+    fn test_brand_decorator_in_schema_field_does_not_emit_untyped_warning() {
+        // `@brand(X) y: *` is a complete field declaration — the schema
+        // pass must NOT emit `SchemaFieldUntyped` for it.
+        let node = parse_doc(
+            r#"{
+            @schema S: { @brand(String) name: * }
+        }"#,
+        );
+        let tree = relon_analyzer::analyze(&node);
+        assert!(
+            !tree.diagnostics.iter().any(|d| matches!(
+                d,
+                relon_analyzer::Diagnostic::SchemaFieldUntyped { .. }
+            )),
+            "should not emit SchemaFieldUntyped for `@brand`-typed field, got {:?}",
+            tree.diagnostics
+        );
+    }
+
+    #[test]
+    fn test_brand_decorator_in_schema_field_end_to_end_with_meta() {
+        // End-to-end: a `@brand(...)`-typed field still composes with the
+        // other schema-field meta decorators (`@expect`, `@default`).
+        // The custom error must surface on a missing field; the default
+        // must populate a missing field in the instance.
+        let result = eval_doc(
+            r#"{
+            @schema User: {
+                @brand(String) name: *,
+                @default(0) @brand(Int) age: *
+            },
+
+            User alice: { name: "Alice" }
+        }"#,
+        )
+        .unwrap();
+        let Value::Dict(d) = result else {
+            panic!("Expected Dict");
+        };
+        let Value::Dict(alice) = d.map.get("alice").unwrap() else {
+            panic!("Expected Dict for alice");
+        };
+        assert_eq!(
+            alice.map.get("name").unwrap(),
+            &Value::String("Alice".to_string())
+        );
+        assert_eq!(alice.map.get("age").unwrap(), &Value::Int(0));
+    }
+
+    #[test]
     fn test_schema_defaulting() {
         let result = eval_doc(
             r#"{
@@ -1852,3 +2422,5 @@ mod sandbox_tests {
         assert_eq!(d.map.get("first").unwrap(), &Value::Int(10));
     }
 }
+
+
