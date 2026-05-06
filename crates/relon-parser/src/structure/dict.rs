@@ -1,6 +1,6 @@
 use crate::{
     create_range, decorator::parse_decorators, expr::parse_expr, id::id,
-    prim::string::parse_string, soc0, Expr, Node, Span, TokenKey,
+    parse_leading_comments, prim::string::parse_string, soc0, ws0, Expr, Node, Span, TokenKey,
 };
 use winnow::combinator::{alt, delimited, opt, separated};
 use winnow::prelude::*;
@@ -10,8 +10,8 @@ pub fn parse_dict<'a>(input: &mut Span<'a>) -> ModalResult<Node> {
     let start_offset = input.location();
 
     let pairs = delimited(
-        ("{", soc0),
-        separated(0.., parse_pair, (soc0, ",", soc0)),
+        ("{", ws0),
+        separated(0.., parse_pair, (ws0, ",", ws0)),
         (soc0, opt(","), soc0, "}"),
     )
     .parse_next(input)?;
@@ -41,6 +41,7 @@ pub(crate) fn parse_pair<'a>(input: &mut Span<'a>) -> ModalResult<(TokenKey, Nod
     }
     input.reset(&checkpoint);
 
+    let doc_comment = parse_leading_comments(input)?;
     let decs_before_key = parse_decorators.parse_next(input)?;
     soc0.parse_next(input)?;
 
@@ -131,7 +132,9 @@ pub(crate) fn parse_pair<'a>(input: &mut Span<'a>) -> ModalResult<(TokenKey, Nod
 
     let mut all_decs = decs_before_key;
     all_decs.extend(decs_after_colon);
-    value = value.with_decorators(all_decs);
+    value = value
+        .with_decorators(all_decs)
+        .with_doc_comment(doc_comment);
 
     Ok((key, value))
 }

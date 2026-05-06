@@ -396,15 +396,16 @@ fn parse_type_expr<'a>(input: &mut Span<'a>) -> ModalResult<Node> {
 /// `variant_fields = Some(...)` so the analyzer can detect tagged-enum shapes
 /// downstream.
 pub fn parse_enum_alternative<'a>(input: &mut Span<'a>) -> ModalResult<crate::TypeNode> {
-    let checkpoint = input.checkpoint();
+    let pre_doc_checkpoint = input.checkpoint();
+    let doc_comment = crate::parse_leading_comments(input)?;
+    let _checkpoint = input.checkpoint();
     let start_offset = input.location();
 
     // Variant form requires a single identifier (no dots, no `<...>` generics,
     // no `?`) followed by either `{ ... }` or a separator (`,` / `>`).
-    let _ = soc0.parse_next(input)?;
     let id_start = input.location();
     let Ok(name) = crate::id::id.parse_next(input).map(|t| t.0) else {
-        input.reset(&checkpoint);
+        input.reset(&pre_doc_checkpoint);
         return parse_type_node.parse_next(input);
     };
     let id_end = input.location();
@@ -427,10 +428,11 @@ pub fn parse_enum_alternative<'a>(input: &mut Span<'a>) -> ModalResult<crate::Ty
                     is_optional: false,
                     range: create_range(input, start_offset, end_offset),
                     variant_fields: Some(fields),
+                    doc_comment,
                 });
             }
             Err(_) => {
-                input.reset(&checkpoint);
+                input.reset(&pre_doc_checkpoint);
                 return parse_type_node.parse_next(input);
             }
         }
@@ -446,10 +448,11 @@ pub fn parse_enum_alternative<'a>(input: &mut Span<'a>) -> ModalResult<crate::Ty
             is_optional: false,
             range: create_range(input, id_start, id_end),
             variant_fields: Some(Vec::new()),
+            doc_comment,
         });
     }
 
-    input.reset(&checkpoint);
+    input.reset(&pre_doc_checkpoint);
     parse_type_node.parse_next(input)
 }
 
@@ -462,21 +465,19 @@ fn parse_variant_field<'a>(input: &mut Span<'a>) -> ModalResult<(String, crate::
 }
 
 pub fn parse_type_node<'a>(input: &mut Span<'a>) -> ModalResult<crate::TypeNode> {
+    let doc_comment = crate::parse_leading_comments(input)?;
     let start_offset = input.location();
 
-    let first_part = preceded(
-        soc0,
-        alt((
-            crate::id::id.map(|i| i.0),
-            crate::prim::string::parse_string.map(|node| {
-                if let Expr::String(s) = *node.expr {
-                    s
-                } else {
-                    unreachable!()
-                }
-            }),
-        )),
-    )
+    let first_part = alt((
+        crate::id::id.map(|i| i.0),
+        crate::prim::string::parse_string.map(|node| {
+            if let Expr::String(s) = *node.expr {
+                s
+            } else {
+                unreachable!()
+            }
+        }),
+    ))
     .parse_next(input)?;
 
     let mut path = vec![first_part];
@@ -563,6 +564,7 @@ pub fn parse_type_node<'a>(input: &mut Span<'a>) -> ModalResult<crate::TypeNode>
         is_optional,
         range: create_range(input, start_offset, end_offset),
         variant_fields: None,
+        doc_comment,
     })
 }
 

@@ -118,6 +118,8 @@ pub struct TypeNode {
     /// pairs. Stays `None` for every non-variant type expression so the rest
     /// of the type system continues to ignore it.
     pub variant_fields: Option<Vec<(String, TypeNode)>>,
+    /// Documentation extracted from leading comments.
+    pub doc_comment: Option<String>,
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -136,6 +138,9 @@ pub struct Node {
     pub decorators: Vec<Decorator>,
     pub type_hint: Option<TypeNode>,
     pub range: TokenRange,
+    /// Documentation extracted from leading comments immediately preceding
+    /// the node.
+    pub doc_comment: Option<String>,
 }
 
 /// Structural equality only — `id` is intentionally excluded so two
@@ -148,6 +153,7 @@ impl PartialEq for Node {
             && self.decorators == other.decorators
             && self.type_hint == other.type_hint
             && self.range == other.range
+            && self.doc_comment == other.doc_comment
     }
 }
 
@@ -159,6 +165,7 @@ impl Node {
             decorators: Vec::new(),
             type_hint: None,
             range,
+            doc_comment: None,
         }
     }
 
@@ -172,6 +179,7 @@ impl Node {
             decorators: Vec::new(),
             type_hint: None,
             range,
+            doc_comment: None,
         }
     }
 
@@ -182,6 +190,11 @@ impl Node {
 
     pub fn with_type_hint(mut self, type_hint: Option<TypeNode>) -> Self {
         self.type_hint = type_hint;
+        self
+    }
+
+    pub fn with_doc_comment(mut self, doc_comment: Option<String>) -> Self {
+        self.doc_comment = doc_comment;
         self
     }
 }
@@ -403,6 +416,7 @@ pub fn type_node_from_brand_arg(expr: &Expr, range: TokenRange) -> Option<TypeNo
                 is_optional: false,
                 range,
                 variant_fields: None,
+                doc_comment: None,
             })
         }
         Expr::String(s) => {
@@ -419,6 +433,7 @@ pub fn type_node_from_brand_arg(expr: &Expr, range: TokenRange) -> Option<TypeNo
                 is_optional: false,
                 range,
                 variant_fields: None,
+                doc_comment: None,
             })
         }
         _ => None,

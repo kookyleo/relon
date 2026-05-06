@@ -53,6 +53,8 @@ pub struct SchemaDef {
     /// `bases` are unused — the schema is consumed via variant
     /// construction and pattern matching instead of dict validation.
     pub variants: Vec<EnumVariant>,
+    /// Documentation extracted from leading comments.
+    pub doc_comment: Option<String>,
 }
 
 /// One alternative inside a sum-type Enum schema. `fields` is empty for
@@ -62,6 +64,7 @@ pub struct EnumVariant {
     pub name: String,
     pub fields: Vec<SchemaFieldDef>,
     pub range: TokenRange,
+    pub doc_comment: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -89,6 +92,8 @@ pub struct SchemaFieldDef {
     /// by name through `schema_field_meta`, so the analyzer only needs
     /// to record the dispatch shape — not run the hooks itself.
     pub meta_decorators: Vec<MetaDecoratorRef>,
+    /// Documentation extracted from leading comments.
+    pub doc_comment: Option<String>,
 }
 
 /// Static reference to a `@meta(...)` decorator attached to a schema
@@ -164,6 +169,7 @@ pub fn lower_schema_pure(
         bases: Vec::new(),
         range: value.range,
         variants: Vec::new(),
+        doc_comment: value.doc_comment.clone(),
     };
     let ok = walk_schema_body(value, &mut def, &mut tmp);
     let diags = std::mem::take(&mut tmp.diagnostics);
@@ -256,12 +262,14 @@ fn lower_enum_body(t: &TypeNode, def: &mut SchemaDef, tree: &mut AnalyzedTree) -
                     ftype.range,
                 )),
                 meta_decorators: Vec::new(),
+                doc_comment: ftype.doc_comment.clone(),
             });
         }
         def.variants.push(EnumVariant {
             name: variant_name,
             fields,
             range: alt.range,
+            doc_comment: alt.doc_comment.clone(),
         });
     }
     true
@@ -335,6 +343,7 @@ fn collect_fields(pairs: &[(TokenKey, Node)], def: &mut SchemaDef, tree: &mut An
             is_wildcard,
             value_node: Arc::new(value.clone()),
             meta_decorators,
+            doc_comment: value.doc_comment.clone(),
         });
     }
 }

@@ -13,10 +13,10 @@ pub mod var;
 pub use expr::child_nodes;
 pub use token::*;
 
-use winnow::ascii::multispace1;
+use winnow::ascii::{multispace0, multispace1};
 use winnow::combinator::{alt, repeat};
 use winnow::prelude::*;
-use winnow::stream::Location;
+use winnow::stream::{Location, Stream};
 
 use crate::prim::boolean::parse_bool;
 use crate::prim::null::parse_null;
@@ -84,6 +84,32 @@ pub fn soc0<'a>(input: &mut Span<'a>) -> ModalResult<Vec<&'a str>> {
         alt((multispace1.map(|s: &str| s), comment.map(|s: &str| s))),
     )
     .parse_next(input)
+}
+
+/// Parse zero or more spaces (no comments).
+pub fn ws0<'a>(input: &mut Span<'a>) -> ModalResult<Vec<&'a str>> {
+    repeat(0.., multispace1.map(|s: &str| s)).parse_next(input)
+}
+
+/// Extract leading comments as a single doc string. Consumes all preceding
+/// spaces and comments up to the next non-trivia token.
+pub fn parse_leading_comments<'a>(input: &mut Span<'a>) -> ModalResult<Option<String>> {
+    let mut comments = Vec::new();
+    loop {
+        let _ = multispace0.parse_next(input)?;
+        let checkpoint = input.checkpoint();
+        if let Ok(c) = comment.parse_next(input) {
+            comments.push(c.trim().to_string());
+        } else {
+            input.reset(&checkpoint);
+            break;
+        }
+    }
+    if comments.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(comments.join("\n")))
+    }
 }
 
 /// Parse single-line or multi-line comments.
@@ -169,6 +195,7 @@ pub fn parse_prim<'a>(input: &mut Span<'a>) -> ModalResult<Node> {
 
 /// Parse the root base which consists of optional decorators and a root List or Dict.
 pub fn parse_base<'a>(input: &mut Span<'a>) -> ModalResult<Node> {
+    let doc_comment = parse_leading_comments(input)?;
     let decorators = decorator::parse_decorators(input)?;
     soc0(input)?;
     let start_offset = decorators
@@ -187,6 +214,7 @@ pub fn parse_base<'a>(input: &mut Span<'a>) -> ModalResult<Node> {
         decorators,
         type_hint: None,
         range,
+        doc_comment,
     })
 }
 
@@ -399,6 +427,24 @@ mod tests {
         let mut s = Span::new("  // comment\n  /* block */  ");
         let res = soc0(&mut s).unwrap();
         assert_eq!(res.len(), 5); // space, comment, space, block, space
+    }
+
+    #[test]
+    fn test_doc_comment_extraction() {
+        let src = r#"{
+            // line 1
+            // line 2
+            a: 1,
+            /* block */
+            b: 2
+        }"#;
+        let node = parse_document(src).unwrap();
+        if let Expr::Dict(pairs) = *node.expr {
+            assert_eq!(pairs[0].1.doc_comment.as_deref(), Some("line 1\nline 2"));
+            assert_eq!(pairs[1].1.doc_comment.as_deref(), Some("block"));
+        } else {
+            panic!()
+        }
     }
 
     #[test]

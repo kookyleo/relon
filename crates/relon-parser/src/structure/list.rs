@@ -1,5 +1,6 @@
 use crate::{
-    create_range, decorator::parse_decorators, expr::parse_expr, id::id, soc0, Expr, Node, Span,
+    create_range, decorator::parse_decorators, expr::parse_expr, id::id, parse_leading_comments,
+    soc0, ws0, Expr, Node, Span,
 };
 use winnow::combinator::{delimited, opt, preceded, separated};
 use winnow::prelude::*;
@@ -16,8 +17,8 @@ pub fn parse_list<'a>(input: &mut Span<'a>) -> ModalResult<Node> {
     input.reset(&checkpoint);
 
     let elements = delimited(
-        ("[", soc0),
-        separated(0.., parse_element, (soc0, ",", soc0)),
+        ("[", ws0),
+        separated(0.., parse_element, (ws0, ",", ws0)),
         (soc0, opt(","), soc0, "]"),
     )
     .parse_next(input)?;
@@ -30,6 +31,7 @@ pub fn parse_list<'a>(input: &mut Span<'a>) -> ModalResult<Node> {
 }
 
 fn parse_element<'a>(input: &mut Span<'a>) -> ModalResult<Node> {
+    let doc_comment = parse_leading_comments(input)?;
     let decorators = parse_decorators.parse_next(input)?;
 
     // Check for spread operator
@@ -50,7 +52,9 @@ fn parse_element<'a>(input: &mut Span<'a>) -> ModalResult<Node> {
         input.reset(&checkpoint);
         soc0.parse_next(input)?;
         let node = parse_expr.parse_next(input)?;
-        Ok(node.with_decorators(decorators))
+        Ok(node
+            .with_decorators(decorators)
+            .with_doc_comment(doc_comment))
     }
 }
 

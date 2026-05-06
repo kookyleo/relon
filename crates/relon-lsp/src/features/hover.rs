@@ -50,11 +50,14 @@ fn hover_for_reference(entry: &DocumentEntry, node: &Node) -> Option<MarkupConte
         target.range.start.offset,
         target.range.end.offset,
     );
-    let body = format!(
+    let mut body = format!(
         "**Resolves to** _(via `{:?}`)_\n\n```relon\n{}\n```",
         resolved.via,
         snippet.trim_end()
     );
+    if let Some(doc) = &target.doc_comment {
+        body = format!("{}\n\n---\n\n{}", body, doc);
+    }
     Some(MarkupContent {
         kind: MarkupKind::Markdown,
         value: body,
@@ -83,9 +86,13 @@ fn hover_for_schema_field(entry: &DocumentEntry, node: &Node) -> Option<MarkupCo
             } else {
                 "value: predicate / literal"
             };
+            let mut body = format!("{header}\n\n{footer}");
+            if let Some(doc) = &field.doc_comment {
+                body = format!("{}\n\n---\n\n{}", body, doc);
+            }
             return Some(MarkupContent {
                 kind: MarkupKind::Markdown,
-                value: format!("{header}\n\n{footer}"),
+                value: body,
             });
         }
     }
@@ -186,5 +193,59 @@ mod tests {
         };
         assert!(content.value.contains("name"));
         assert!(content.value.contains("schema `User`"));
+    }
+
+    #[test]
+    fn hovers_with_doc_comment() {
+        let src = r#"{
+                // The user schema.
+                @schema User: {
+                  // The name of the person.
+                  String name: *
+                },
+                // The primary user.
+                User u: { name: "x" },
+                ref: &sibling.u
+            }"#;
+        let entry = entry(src);
+
+        // Hover over `u` in `&sibling.u`
+        let offset = src.find("&sibling.u").unwrap() + 9;
+        let pos = offset_to_pos(src, offset);
+        let hover = compute(&entry, pos).expect("hover reference");
+        let HoverContents::Markup(content) = hover.contents else {
+            panic!()
+        };
+        // This is a reference hover (case 1)
+        assert!(content.value.contains("The primary user."));
+
+        // Hover over `*` in schema
+        let offset = src.find('*').unwrap();
+        let pos = offset_to_pos(src, offset);
+        let hover = compute(&entry, pos).expect("hover schema field");
+        let HoverContents::Markup(content) = hover.contents else {
+            panic!()
+        };
+        assert!(content.value.contains("The name of the person."));
+    }
+
+    fn offset_to_pos(src: &str, offset: usize) -> Position {
+        let mut line = 0u32;
+        let mut col = 0u32;
+        for (i, ch) in src.chars().enumerate() {
+            if i == offset {
+                break;
+            }
+            if ch == '\n' {
+                line += 1;
+                col = 0;
+            } else {
+                col += 1;
+            }
+        }
+        Position {
+            line,
+            character: col,
+        }
     }
 }
