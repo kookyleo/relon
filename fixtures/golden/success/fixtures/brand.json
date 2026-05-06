@@ -22,6 +22,10 @@
     "temperature": 18
   },
   "decorated_kind": "is_weather",
+  "optional_weather": {
+    "location": "Reykjavik",
+    "temperature": 5
+  },
   "origin": {
     "name": "HQ",
     "tags": {

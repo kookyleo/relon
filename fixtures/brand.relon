@@ -48,6 +48,12 @@
         hits: 1,
         misses: 7
     },
+    // Optional suffix `?` is preserved in the brand string; the underlying
+    // `Weather` schema still validates the body.
+    optional_weather: @brand(Weather?) {
+        location: "Reykjavik",
+        temperature: 5
+    },
     // Schema-field position: `@brand(X) field: *` is the decorator-form
     // mirror of `X field: *`. Both declare the field's type; the analyzer
     // flags using both at once on the same field.
