@@ -283,8 +283,8 @@ impl<'a> SourceFormatter<'a> {
         let Some(prev) = self.previous else {
             return false;
         };
-        let prev_closes_type = prev.kind == TokenKind::Word
-            || (prev.kind == TokenKind::Operator && prev.text == ">");
+        let prev_closes_type =
+            prev.kind == TokenKind::Word || (prev.kind == TokenKind::Operator && prev.text == ">");
         if !prev_closes_type {
             return false;
         }
