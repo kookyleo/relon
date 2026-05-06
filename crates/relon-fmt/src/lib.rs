@@ -61,6 +61,7 @@ struct SourceFormatter<'a> {
     line_start: bool,
     frames: Vec<Frame>,
     previous: Option<Token<'a>>,
+    type_generic_depth: usize,
 }
 
 impl<'a> SourceFormatter<'a> {
@@ -73,6 +74,7 @@ impl<'a> SourceFormatter<'a> {
             line_start: true,
             frames: Vec::new(),
             previous: None,
+            type_generic_depth: 0,
         }
     }
 
@@ -165,7 +167,12 @@ impl<'a> SourceFormatter<'a> {
                         Some(TokenKind::Amp)
                     }
                     TokenKind::Question => {
-                        self.write_binary_operator("?");
+                        if self.is_type_optional(token) {
+                            self.write_plain("?");
+                            self.space_if_next_starts_value();
+                        } else {
+                            self.write_binary_operator("?");
+                        }
                         Some(TokenKind::Question)
                     }
                     TokenKind::Ellipsis => {
@@ -174,7 +181,16 @@ impl<'a> SourceFormatter<'a> {
                         Some(TokenKind::Ellipsis)
                     }
                     TokenKind::Operator => {
-                        self.format_operator(token.text);
+                        if token.text == "<" && self.is_type_generic_open(token) {
+                            self.write_plain("<");
+                            self.type_generic_depth += 1;
+                        } else if token.text == ">" && self.type_generic_depth > 0 {
+                            self.write_plain(">");
+                            self.type_generic_depth -= 1;
+                            self.space_if_next_starts_value();
+                        } else {
+                            self.format_operator(token.text);
+                        }
                         Some(TokenKind::Operator)
                     }
                     TokenKind::Equal => {
@@ -229,13 +245,83 @@ impl<'a> SourceFormatter<'a> {
 
     fn format_comma(&mut self) {
         self.write_plain(",");
-        if self.next_is_inline_line_comment()
+        if self.type_generic_depth > 0
+            || self.next_is_inline_line_comment()
             || self.top_frame() == Some(Frame::Paren)
             || self.top_frame() == Some(Frame::Index)
         {
             self.space();
         } else {
             self.newline();
+        }
+    }
+
+    /// `<` opens a type-generic (e.g. `Map<String, Int>`) when it directly
+    /// follows an identifier token with no source whitespace, and is itself
+    /// followed by another identifier. The heuristic intentionally rejects
+    /// comparison forms like `a < b` (whitespace separates the tokens) and
+    /// `a<10` (next token is a number, not an identifier).
+    fn is_type_generic_open(&self, current: Token<'a>) -> bool {
+        let Some(prev) = self.previous else {
+            return false;
+        };
+        if prev.kind != TokenKind::Word {
+            return false;
+        }
+        if current.start != prev.end {
+            return false;
+        }
+        self.peek_next_non_trivia()
+            .is_some_and(|t| t.kind == TokenKind::Word)
+    }
+
+    /// `?` marks a type as optional (e.g. `Foo?`, `Foo<X>?`) when it sits
+    /// flush against the closing token of a type expression — an identifier
+    /// or the `>` of a generic. With any whitespace before it the `?`
+    /// belongs to a ternary and gets full binary spacing.
+    fn is_type_optional(&self, current: Token<'a>) -> bool {
+        let Some(prev) = self.previous else {
+            return false;
+        };
+        let prev_closes_type = prev.kind == TokenKind::Word
+            || (prev.kind == TokenKind::Operator && prev.text == ">");
+        if !prev_closes_type {
+            return false;
+        }
+        current.start == prev.end
+    }
+
+    fn peek_next_non_trivia(&self) -> Option<Token<'a>> {
+        let mut i = self.index + 1;
+        while i < self.tokens.len() {
+            match self.tokens[i].kind {
+                TokenKind::LineComment | TokenKind::BlockComment => i += 1,
+                _ => return Some(self.tokens[i]),
+            }
+        }
+        None
+    }
+
+    /// Emit a space if the next non-trivia token starts a value-shaped
+    /// construct. Used to bridge `>` and `?` of a type expression to
+    /// whatever follows (e.g. `Foo<X> field`, `Foo? field`); skips when
+    /// the next token already includes its own leading layout (`,`,
+    /// closing bracket, another `?`, etc.).
+    fn space_if_next_starts_value(&mut self) {
+        if let Some(next) = self.peek_next_non_trivia() {
+            if matches!(
+                next.kind,
+                TokenKind::Word
+                    | TokenKind::Number
+                    | TokenKind::String
+                    | TokenKind::OpenBrace
+                    | TokenKind::OpenBracket
+                    | TokenKind::At
+                    | TokenKind::Amp
+                    | TokenKind::Ellipsis
+            ) {
+                self.space();
+            }
         }
     }
 
@@ -474,5 +560,58 @@ mod tests {
             format_source("{} true"),
             Err(Error::Parse(message)) if message.contains("trailing input")
         ));
+    }
+
+    #[test]
+    fn keeps_type_generics_compact() {
+        // `<...>` adjacent to an identifier opens a type-generic; the
+        // formatter must not pad the angle brackets like comparison
+        // operators. Nested generics and dotted heads stay flush.
+        for source in [
+            "{\n    Dict<String, Int> m: {\n        a: 1\n    }\n}\n",
+            "{\n    Dict<String, List<Int>> m: {\n        a: [\n            1\n        ]\n    }\n}\n",
+            "{\n    x: @brand(Dict<String, Int>) {\n        a: 1\n    }\n}\n",
+        ] {
+            let formatted = format_source(source).unwrap();
+            assert_eq!(formatted, source, "input did not round-trip");
+            assert_eq!(format_source(&formatted).unwrap(), formatted);
+        }
+    }
+
+    #[test]
+    fn keeps_type_optional_compact() {
+        // `?` flush against an identifier or `>` is the optional-type
+        // marker, not the start of a ternary — no surrounding spaces.
+        for source in [
+            "{\n    Weather? w: {\n        a: 1\n    }\n}\n",
+            "{\n    x: @brand(Weather?) {\n        a: 1\n    }\n}\n",
+            "{\n    x: @brand(Dict<String, Int>?) {\n        a: 1\n    }\n}\n",
+        ] {
+            let formatted = format_source(source).unwrap();
+            assert_eq!(formatted, source, "input did not round-trip");
+            assert_eq!(format_source(&formatted).unwrap(), formatted);
+        }
+    }
+
+    #[test]
+    fn ternary_question_keeps_binary_spacing() {
+        // The `?` of a ternary sits between values with whitespace, so
+        // the type-optional heuristic must back off and keep the
+        // operator-style spacing intact.
+        let source = "{\n    abs(x): x < 0 ? -x: x\n}\n";
+        let formatted = format_source(source).unwrap();
+        assert_eq!(formatted, source);
+        assert_eq!(format_source(&formatted).unwrap(), formatted);
+    }
+
+    #[test]
+    fn comparison_lt_gt_unchanged() {
+        // `a < b` (with whitespace) must remain a comparison — adjacent
+        // numbers/expressions should not get reinterpreted as type
+        // generics.
+        let source = "{\n    cmp(a, b): a < b ? a: b\n}\n";
+        let formatted = format_source(source).unwrap();
+        assert_eq!(formatted, source);
+        assert_eq!(format_source(&formatted).unwrap(), formatted);
     }
 }

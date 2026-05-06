@@ -44,7 +44,7 @@
     // Generic argument: `Dict<String, Int>` drives `check_dict` so every
     // entry's value must be `Int`. Note `Dict` is the canonical builtin —
     // `Map<...>` would fall through to `check_custom_schema` and fail.
-    counters: @brand(Dict < String, Int > ) {
+    counters: @brand(Dict<String, Int>) {
         hits: 1,
         misses: 7
     },
@@ -53,7 +53,7 @@
     // flags using both at once on the same field.
     @schema Place: {
         @brand(String) name: * ,
-        @brand(Dict < String, Int > ) tags: *
+        @brand(Dict<String, Int>) tags: *
     },
     Place origin: {
         name: "HQ",
