@@ -1,11 +1,51 @@
 # Relon Design Document (V2.0)
 
-Relon is a programmable configuration language designed to be a functional super-set of JSON. It enables dynamic data generation through a tagged type system, first-class arrow functions, and deep-path references.
+Relon's payload IS executable logic. The language exists so business
+rules — validation, pricing, workflow, policy — can be **serialized like
+JSON, distributed like JSON, and evaluated identically on any conformant
+runtime**. Same source + same input → byte-identical result, whether the
+runtime is Rust, Go, TypeScript, Swift, or WASM-in-the-browser.
+
+The reference runtime in this repo is Rust. The *spec* is runtime-agnostic.
 
 ## 1. Core Philosophy
-- **Everything is a Value**: Every file and expression evaluates to a `Value`.
-- **Expression-Oriented**: No statements, no `return` keywords. Every function body is a single expression.
-- **Tagged Type System**: Types are optional, prefix-based metadata that provide contracts without muddying the JSON structure.
+
+### 1.1 Logic-as-Portable-Data (the load-bearing axiom)
+Everything else in this document follows from one decision: **logic is
+data**. Rules don't compile into binary; they live in databases, config
+files, RPC payloads, message queues. Any conformant Relon VM that
+parses the same source and is fed the same input must produce the same
+output.
+
+This rules out, by design:
+- Implicit ambient state (env vars, locale, time-of-day, RNG, FS — all
+  must be capabilities the script declares and the host explicitly
+  grants).
+- Iteration-order leaks (Dict iteration is `BTreeMap`-deterministic, not
+  hash-randomized).
+- Per-runtime "magic" globals (every name a script references must be
+  reachable through the spec — language builtins, `@import`-ed std
+  modules, or host-registered functions in the program-declared
+  capability set).
+- Floating-point ambiguity (IEEE-754 `f64`, no fast-math).
+
+### 1.2 Sandboxed by Default
+A Relon script has zero ambient privileges. Capabilities (`reads_fs`,
+allow-listed native fns, step / value-size budgets) are granted by the
+host at `Context` construction. There is no "trusted" mode the script
+can fall back into without the host's explicit consent — that would
+break the portability axiom.
+
+### 1.3 Tagged & Self-Describing
+Types travel with the payload via `@schema`, sum-type tagged enums,
+branded dicts, and computed defaults. A receiver of a Relon document
+has everything they need to validate it without out-of-band
+documentation.
+
+### 1.4 Expression-Oriented, Pure
+No statements, no `return`, no IO primitives, no mutable globals. Every
+function body is a single expression; every evaluation is a pure
+function from `(source, input, capabilities)` to `Value`.
 
 ## 2. Language Features
 

@@ -1,6 +1,6 @@
 {
-    merge(a, b): dict.merge(a, b),
-    keys(value): dict.keys(value),
-    values(value): dict.values(value),
-    has_key(value, key): dict.has_key(value, key)
+    merge(a, b): _dict_merge(a, b),
+    keys(d): _dict_keys(d),
+    values(d): _dict_values(d),
+    has_key(d, k): _dict_has_key(d, k)
 }

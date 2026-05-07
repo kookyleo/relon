@@ -1,13 +1,13 @@
 {
+    map(l, f): _list_map(l, f),
+    filter(l, f): _list_filter(l, f),
+    reduce(l, i, f): _list_reduce(l, i, f),
+    contains(l, i): _list_contains(l, i),
+    sum(l): l | _list_reduce(0, (acc, x) => acc + x),
+    avg(l): sum(l) / _len(l),
+    len(l): _len(l),
     first(l): l[0],
-    compact(l): [
-        x for x in l if x != null
-    ],
-    contains(l, value): list.contains(l, value),
-    map(l, f): [
-        f(x) for x in l
-    ],
-    filter(l, f): [
-        x for x in l if f(x)
-    ]
+    last(l): l[_len(l) - 1],
+    compact(l): l | _list_filter((x) => x != null),
+    flatten(l): l | _list_reduce([], (acc, x) => acc + x)
 }

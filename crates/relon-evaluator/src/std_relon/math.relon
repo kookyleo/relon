@@ -1,6 +1,6 @@
 {
-    abs(x): x < 0 ? -x: x,
-    max(a, b): a > b ? a: b,
-    min(a, b): a < b ? a: b,
-    clamp(value, min_value, max_value): value < min_value ? min_value: (value > max_value ? max_value: value)
+    abs(x): _math_abs(x),
+    max(a, b): _math_max(a, b),
+    min(a, b): _math_min(a, b),
+    clamp(v, min, max): _math_clamp(v, min, max)
 }

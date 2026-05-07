@@ -1,10 +1,30 @@
 # What is Relon?
 
-Relon is a **Rust-embeddable toolkit for building typed business-config DSLs**. It's not a general-purpose scripting language, and it's not trying to replace JSON. Its goal is to give you real type contracts, composition, and host extension points on top of JSON — and to emit plain JSON that downstream services can consume directly.
+Relon is an **executable data format**: its payload is business logic.
+Write a validation rule, a pricing formula, a workflow, a risk policy
+once as a Relon document; store it like JSON; **any conformant runtime
+(Rust, Go, TypeScript, Swift, browser-WASM…) parsing the same source
+with the same input produces a byte-identical result.**
 
-> **One-liner**: Build typed business-config DSLs on top of JSON.
->
-> **From JSON-like, to JSON, for JSON.**
+The Rust implementation in this repo is the reference runtime. The
+language spec itself is runtime-agnostic.
+
+> **One-liner**: Logic as portable data — write the rule once, store
+> it like JSON, evaluate it identically anywhere.
+
+## What this commits us to (the hard constraints)
+
+* **Same source + same input → same output.** Dict iteration is
+  `BTreeMap`-ordered; floats are IEEE-754 `f64`; the script reads no
+  environment variables, system clock, or RNG.
+* **Sandboxed by default, no escape hatch.** Scripts have zero ambient
+  privileges. Filesystem, network, native functions are all gated by
+  `Capabilities` and granted explicitly by the host. There is no
+  "trusted mode" that lets a script bypass that consent.
+* **The std library is part of the spec.** `std/list`, `std/string`,
+  `std/math`, … are not per-runtime extensions; every conformant
+  runtime ships the same set with the same semantics. Scripts depend
+  only on names reachable through the spec.
 
 <figure style="margin: 2rem auto; max-width: 720px; text-align: center;">
   <img src="/positioning.svg" alt="Relon two-tier authoring diagram" style="width: 100%; height: auto;" />

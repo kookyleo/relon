@@ -263,7 +263,16 @@ impl Value {
                     }
                 }
             }
-            (Value::Schema { fields: base_fields, .. }, Value::Schema { fields: patch_fields, .. }) => {
+            (
+                Value::Schema {
+                    fields: base_fields,
+                    ..
+                },
+                Value::Schema {
+                    fields: patch_fields,
+                    ..
+                },
+            ) => {
                 for (k, v) in patch_fields {
                     if let Some(base_field) = base_fields.get_mut(k) {
                         base_field.type_hint = v.type_hint.clone();
@@ -285,7 +294,13 @@ impl Value {
                     }
                 }
             }
-            (Value::Schema { fields: base_fields, .. }, Value::Dict(patch_data)) => {
+            (
+                Value::Schema {
+                    fields: base_fields,
+                    ..
+                },
+                Value::Dict(patch_data),
+            ) => {
                 for (k, v) in &patch_data.map {
                     if let Some(base_field) = base_fields.get_mut(k) {
                         base_field.default_value = Some(v.clone());

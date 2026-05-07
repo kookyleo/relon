@@ -51,6 +51,7 @@ export default defineConfig({
           {
             text: '参考',
             items: [
+              { text: '语言规范 (SPEC)', link: '/zh/guide/spec' },
               { text: '标准库', link: '/zh/guide/stdlib' },
               { text: '架构概览', link: '/zh/guide/architecture' },
             ]
@@ -83,6 +84,12 @@ export default defineConfig({
             text: 'Introduction',
             items: [
               { text: 'What is Relon?', link: '/en/guide/introduction' },
+            ]
+          },
+          {
+            text: 'Reference',
+            items: [
+              { text: 'Language Spec', link: '/en/guide/spec' },
             ]
           }
         ],

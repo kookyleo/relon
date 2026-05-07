@@ -9,6 +9,7 @@ use crate::error::RuntimeError;
 use crate::value::Value;
 use relon_parser::TokenRange;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// A single evaluated argument from a Relon call site, preserving its name if
 /// it was passed as `name=value`.
@@ -27,23 +28,39 @@ impl EvaluatedArg {
     }
 }
 
+/// A handle to the evaluator's internal execution capabilities, allowing native
+/// functions to call back into Relon logic (closures).
+pub trait NativeFnCaps: Send + Sync {
+    fn call_relon(
+        &self,
+        func: &Value,
+        args: Vec<Value>,
+        range: TokenRange,
+    ) -> Result<Value, RuntimeError>;
+}
+
 /// Argument bundle handed to a [`RelonFunction`]. Positional and named
 /// arguments are split apart up front so each host function only inspects
 /// what it cares about.
-#[derive(Debug, Default, Clone)]
+#[derive(Clone)]
 pub struct NativeArgs {
     pub positional: Vec<Value>,
     pub named: HashMap<String, Value>,
+    caps: Arc<dyn NativeFnCaps>,
 }
 
 impl NativeArgs {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(caps: Arc<dyn NativeFnCaps>) -> Self {
+        Self {
+            positional: Vec::new(),
+            named: HashMap::new(),
+            caps,
+        }
     }
 
     /// Split a list of evaluated args into positional + named buckets.
-    pub fn from_evaluated(args: Vec<EvaluatedArg>) -> Self {
-        let mut out = Self::default();
+    pub fn from_evaluated(args: Vec<EvaluatedArg>, caps: Arc<dyn NativeFnCaps>) -> Self {
+        let mut out = Self::new(caps);
         for arg in args {
             match arg.name {
                 Some(name) => {
@@ -55,11 +72,16 @@ impl NativeArgs {
         out
     }
 
-    pub fn from_positional(positional: Vec<Value>) -> Self {
+    pub fn from_positional(positional: Vec<Value>, caps: Arc<dyn NativeFnCaps>) -> Self {
         Self {
             positional,
             named: HashMap::new(),
+            caps,
         }
+    }
+
+    pub fn caps(&self) -> &dyn NativeFnCaps {
+        self.caps.as_ref()
     }
 
     /// Drop the named-argument map and yield the positional `Vec<Value>` —

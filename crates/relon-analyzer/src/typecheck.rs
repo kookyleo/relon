@@ -315,12 +315,9 @@ impl<'a> Walker<'a> {
 
         // If we couldn't infer a single static type, check if it's a
         // structured expression whose branches we can partially validate.
-        match &*value.expr {
-            Expr::Ternary { then, els, .. } => {
-                self.check_typed_binding(expected, then, field_name);
-                self.check_typed_binding(expected, els, field_name);
-            }
-            _ => {}
+        if let Expr::Ternary { then, els, .. } = &*value.expr {
+            self.check_typed_binding(expected, then, field_name);
+            self.check_typed_binding(expected, els, field_name);
         }
     }
 

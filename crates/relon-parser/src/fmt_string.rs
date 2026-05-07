@@ -24,7 +24,7 @@ fn normal_fmt_string<'a>(input: &mut Span<'a>) -> ModalResult<Vec<FStringPart>> 
         repeat(
             0..,
             alt((
-                parse_expr_zone.map(FStringPart::Interpolation),
+                parse_expr_zone.map(|node| FStringPart::Interpolation(Box::new(node))),
                 parse_escaped_char.map(|c| FStringPart::Literal(c.to_string())),
                 parse_escaped_whitespace.value(FStringPart::Literal("".to_string())),
                 take_till(1.., ('"', '\\', '$')).map(|s: &str| FStringPart::Literal(s.to_string())),
@@ -62,7 +62,7 @@ fn raw_fmt_string<'a>(input: &mut Span<'a>) -> ModalResult<Vec<FStringPart>> {
         if input.starts_with("${") {
             let checkpoint = input.checkpoint();
             if let Ok(node) = parse_expr_zone.parse_next(input) {
-                parts.push(FStringPart::Interpolation(node));
+                parts.push(FStringPart::Interpolation(Box::new(node)));
                 continue;
             } else {
                 input.reset(&checkpoint);

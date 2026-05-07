@@ -14,8 +14,9 @@ pub mod value;
 
 pub use decorator::{DecoratorPlugin, PreEvalOutcome};
 pub use error::RuntimeError;
-pub use eval::{Capabilities, Context, Evaluator, NativeFnCaps};
+pub use eval::{Capabilities, Context, Evaluator, NativeFnGate};
 pub use module::{FilesystemModuleResolver, ModuleResolver, ModuleSource, StdModuleResolver};
+pub use native_fn::NativeFnCaps;
 pub use native_fn::{EvaluatedArg, NativeArgs, RelonFunction};
 pub use scope::{ListContext, Scope, Thunk};
 pub use value::{SchemaField, Value, ValueDict};
@@ -36,6 +37,19 @@ mod tests {
         let node = parse_doc(source);
         let ctx = Context::new().with_root(node);
         Evaluator::new(&ctx).eval_root(&std::sync::Arc::new(Scope::default()))
+    }
+
+    /// Test scaffolding: build a Context with full grants + trusted FS
+    /// resolver. Equivalent to what the CLI / facade do when running
+    /// host-owned files. Production code should spell the grants out
+    /// inline so the trust scope is visible at the call site.
+    fn fully_granted_ctx() -> Context {
+        let mut ctx = Context::sandboxed();
+        ctx.capabilities = Capabilities::all_granted();
+        ctx.prepend_module_resolver(std::sync::Arc::new(
+            crate::module::FilesystemModuleResolver::trusted(),
+        ));
+        ctx
     }
 
     fn assert_number_type_mismatch(source: &str, found_type: &str) {
@@ -208,8 +222,9 @@ mod tests {
 
     #[test]
     fn test_string_stdlib() {
-        let node = parse_doc(
-            r#"{
+        let result = eval_doc(
+            r#"@import("std/string", as="string")
+            {
             "words": string.split("rust,config,dsl", ","),
             "joined": string.join(&sibling.words, "-"),
             "replaced": string.replace("hello world", "world", "relon"),
@@ -217,12 +232,8 @@ mod tests {
             "lower": string.lower("Relon"),
             "has_config": string.contains("rust config dsl", "config")
         }"#,
-        );
-
-        let ctx = Context::new().with_root(node.clone());
-        let result = Evaluator::new(&ctx)
-            .eval(&node, &std::sync::Arc::new(Scope::default()))
-            .unwrap();
+        )
+        .unwrap();
 
         if let Value::Dict(map) = result {
             assert_eq!(
@@ -249,8 +260,10 @@ mod tests {
 
     #[test]
     fn test_dict_stdlib() {
-        let node = parse_doc(
-            r#"{
+        let result = eval_doc(
+            r#"@import("std/dict", as="dict")
+            @import("std/list", as="list")
+            {
             "base": { "a": 1, "b": 2 },
             "override": { "b": 3, "c": 4 },
             "merged": dict.merge(&sibling.base, &sibling.override),
@@ -260,12 +273,8 @@ mod tests {
             "has_z": dict.has_key(&sibling.merged, "z"),
             "list_has_b": list.contains(&sibling.keys, "b")
         }"#,
-        );
-
-        let ctx = Context::new().with_root(node.clone());
-        let result = Evaluator::new(&ctx)
-            .eval(&node, &std::sync::Arc::new(Scope::default()))
-            .unwrap();
+        )
+        .unwrap();
 
         if let Value::Dict(map) = result {
             assert_eq!(
@@ -596,7 +605,7 @@ mod tests {
     #[test]
     fn test_circular_import() {
         let node = parse_doc(r#"@import("tests_assets/a.relon") {}"#);
-        let ctx = Context::new().with_root(node.clone());
+        let ctx = fully_granted_ctx().with_root(node.clone());
         let eval = Evaluator::new(&ctx);
         let scope = std::sync::Arc::new(Scope {
             current_dir: env!("CARGO_MANIFEST_DIR").to_string(),
@@ -625,7 +634,7 @@ mod tests {
             @import("lib.relon", as="b")
             {}"#,
         );
-        let ctx = Context::new().with_root(node.clone());
+        let ctx = fully_granted_ctx().with_root(node.clone());
         let eval = Evaluator::new(&ctx);
         let scope = std::sync::Arc::new(Scope {
             current_dir: dir.to_string_lossy().to_string(),
@@ -660,7 +669,7 @@ mod tests {
                 "b": lib.b
             }"#,
         );
-        let ctx = Context::new().with_root(node.clone());
+        let ctx = fully_granted_ctx().with_root(node.clone());
         let eval = Evaluator::new(&ctx);
         let scope = std::sync::Arc::new(Scope {
             current_dir: dir.to_string_lossy().to_string(),
@@ -685,7 +694,7 @@ mod tests {
         std::fs::write(dir.join("bad.relon"), "{} trailing").unwrap();
 
         let node = parse_doc(r#"@import("bad.relon") {}"#);
-        let ctx = Context::new().with_root(node.clone());
+        let ctx = fully_granted_ctx().with_root(node.clone());
         let eval = Evaluator::new(&ctx);
         let scope = std::sync::Arc::new(Scope {
             current_dir: dir.to_string_lossy().to_string(),
@@ -1008,12 +1017,13 @@ mod tests {
     #[test]
     fn test_deep_merge() {
         let result = eval_doc(
-            r#"{
+            r#"@import("std/dict", as="dict")
+            {
             base: { style: { color: "blue", size: 14 }, active: false },
-            
+
             // Using + operator
             button1: &sibling.base + { style: { color: "red" }, active: true },
-            
+
             // Using dict.merge
             button2: dict.merge(&sibling.base, { style: { size: 20 } })
         }"#,
@@ -1422,7 +1432,7 @@ mod tests {
         );
 
         let node = parse_doc(&src);
-        let ctx = Context::trusted().with_root(node);
+        let ctx = fully_granted_ctx().with_root(node);
         let result = Evaluator::new(&ctx).eval_root(&std::sync::Arc::new(Scope::default()));
         let _ = std::fs::remove_dir_all(&dir);
         let result = result.unwrap();
@@ -2348,7 +2358,11 @@ mod sandbox_tests {
         }
 
         let mut ctx = Context::sandboxed();
-        ctx.register_fn_with_caps("fs.read", NativeFnCaps { reads_fs: true }, Arc::new(ReadFs));
+        ctx.register_fn_with_caps(
+            "fs.read",
+            NativeFnGate { reads_fs: true },
+            Arc::new(ReadFs),
+        );
         let result = eval_with(ctx, r#"{ "data": fs.read() }"#);
         assert!(
             matches!(&result, Err(RuntimeError::CapabilityDenied { name, .. }) if name == "fs.read"),
@@ -2373,7 +2387,11 @@ mod sandbox_tests {
         ctx.capabilities
             .allow_native_fn
             .insert("fs.read".to_string());
-        ctx.register_fn_with_caps("fs.read", NativeFnCaps { reads_fs: true }, Arc::new(ReadFs));
+        ctx.register_fn_with_caps(
+            "fs.read",
+            NativeFnGate { reads_fs: true },
+            Arc::new(ReadFs),
+        );
         let result = eval_with(ctx, r#"{ "data": fs.read() }"#).unwrap();
         let Value::Dict(d) = result else {
             panic!("expected dict")
@@ -2385,10 +2403,10 @@ mod sandbox_tests {
     }
 
     #[test]
-    fn trusted_context_allows_gated_fns() {
-        // `Context::trusted()` flips `allow_all_native_fn`, so even
-        // `register_fn_with_caps` calls go through without an explicit
-        // allowlist entry.
+    fn fully_granted_caps_let_gated_fns_through() {
+        // `Capabilities::all_granted()` flips `allow_all_native_fn`,
+        // so even `register_fn_with_caps`-registered fns go through
+        // without an explicit allowlist entry.
         struct ReadFs;
         impl crate::native_fn::RelonFunction for ReadFs {
             fn call(
@@ -2400,8 +2418,13 @@ mod sandbox_tests {
             }
         }
 
-        let mut ctx = Context::trusted();
-        ctx.register_fn_with_caps("fs.read", NativeFnCaps { reads_fs: true }, Arc::new(ReadFs));
+        let mut ctx = Context::sandboxed();
+        ctx.capabilities = Capabilities::all_granted();
+        ctx.register_fn_with_caps(
+            "fs.read",
+            NativeFnGate { reads_fs: true },
+            Arc::new(ReadFs),
+        );
         let result = eval_with(ctx, r#"{ "n": fs.read() }"#).unwrap();
         let Value::Dict(d) = result else {
             panic!("expected dict")
@@ -2443,11 +2466,18 @@ mod sandbox_tests {
 
         let node = relon_parser::parse_document(src).unwrap();
         let analyzed = relon_analyzer::analyze(&node);
-        let ctx = Context::default().with_root(node).with_analyzed(Arc::new(analyzed));
+        let ctx = Context::default()
+            .with_root(node)
+            .with_analyzed(Arc::new(analyzed));
         let evaluator = Evaluator::new(&ctx);
-        let err = evaluator.eval_root(&Arc::new(Scope::default())).unwrap_err();
+        let err = evaluator
+            .eval_root(&Arc::new(Scope::default()))
+            .unwrap_err();
         assert!(matches!(err, RuntimeError::TypeMismatch { .. }));
-        if let RuntimeError::TypeMismatch { expected, found, .. } = err {
+        if let RuntimeError::TypeMismatch {
+            expected, found, ..
+        } = err
+        {
             assert_eq!(expected, "String");
             assert_eq!(found, "Int");
         }
@@ -2489,9 +2519,7 @@ mod sandbox_tests {
         }"#;
 
         let result = eval_with(ctx, src).unwrap();
-        let Value::Dict(d) = result else {
-            panic!()
-        };
+        let Value::Dict(d) = result else { panic!() };
         let me = d.map.get("me").unwrap();
         if let Value::Dict(inner) = me {
             assert_eq!(inner.brand.as_deref(), Some("Email"));

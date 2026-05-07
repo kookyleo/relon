@@ -1,7 +1,7 @@
 use crate::decorator::{DecoratorPlugin, PreEvalOutcome};
 use crate::error::RuntimeError;
 use crate::module::{FilesystemModuleResolver, ModuleResolver, ModuleSource, StdModuleResolver};
-use crate::native_fn::{EvaluatedArg, NativeArgs, RelonFunction};
+use crate::native_fn::{EvaluatedArg, NativeArgs, RelonFunction, NativeFnCaps};
 use crate::scope::{Scope, Thunk};
 use crate::value::Value;
 use relon_parser::{
@@ -13,83 +13,93 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-/// Capability gates wired into `Context`. Defaults to **fully sandboxed**:
-/// no native fns, zero-budget step counter, zero-size values. Hosts opt in
-/// by either populating the fields directly or by constructing a `Context`
-/// via [`Context::trusted`] (which flips `allow_all_native_fn` on and
-/// leaves the limits unbounded).
+/// Context-wide sandbox policy. Holds both the resource budgets the
+/// evaluator enforces (`max_steps`, `max_value_bytes`) and the
+/// allow-lists used to gate calls to host-registered native functions.
 ///
-/// Filesystem read policy lives on the [`FilesystemModuleResolver`]
-/// (configured via `with_root_dir` / `trusted`), not here.
+/// Per-function capability *requirements* (e.g. "this fn needs fs read")
+/// live on [`NativeFnGate`]; this struct is what the host *grants*.
 #[derive(Debug, Clone, Default)]
 pub struct Capabilities {
-    /// Hard cap on `eval_internal` invocations. `None` = unbounded.
-    pub max_steps: Option<u64>,
-    /// Hard cap on the *element count* of any single `Value::List` /
-    /// `Value::Dict` produced by the evaluator. The field is named
-    /// `_bytes` for forward compatibility with a future byte-accurate
-    /// metric, but today we measure element count (per the spec).
-    pub max_value_bytes: Option<usize>,
-    /// Names allowed for native-function calls under sandbox. Functions
-    /// registered via the legacy [`Context::register_fn`] are treated as
-    /// trusted — the gate fires only for functions registered via
-    /// [`Context::register_fn_with_caps`]. Empty = no gated functions
-    /// allowed.
-    pub allow_native_fn: HashSet<String>,
-    /// Trusted-mode escape hatch: when `true`, every native function
-    /// registered via [`Context::register_fn_with_caps`] is accepted
-    /// regardless of `allow_native_fn`. Set by [`Context::trusted`].
+    /// If true, all registered native functions can be called.
     pub allow_all_native_fn: bool,
+    /// Set of specifically allowed native function names (e.g. `["math.sum"]`).
+    pub allow_native_fn: HashSet<String>,
+    /// If true, filesystem-based module resolution is permitted.
+    pub reads_fs: bool,
+    /// Maximum number of AST nodes to process before aborting.
+    pub max_steps: Option<u64>,
+    /// Maximum number of elements in a single List or Dict.
+    pub max_value_bytes: Option<usize>,
 }
 
-/// Capability declaration for a host-registered native function. Used by
-/// the registry to decide whether a sandboxed call is allowed; left wide
-/// open so we can grow the surface (`writes_fs`, `network`, `env`, …)
-/// without breaking the existing API.
+impl Capabilities {
+    /// Audit-visible "grant everything" preset: all native functions
+    /// allowed, filesystem reads permitted, no step / value-size
+    /// budget. The spec forbids an implicit `Context::trusted()`-style
+    /// shortcut; hosts that need full grant must call this and read
+    /// the resulting `Capabilities` *as data*. See `docs/zh/guide/spec.md`
+    /// §4.2.
+    ///
+    /// Note: opening filesystem reads also requires installing a
+    /// non-rejecting [`crate::module::FilesystemModuleResolver`] (e.g.
+    /// `FilesystemModuleResolver::trusted()` or
+    /// `FilesystemModuleResolver::with_root_dir(...)`). The
+    /// `reads_fs` flag is the policy bit; the resolver is the
+    /// machinery that enforces it.
+    pub fn all_granted() -> Self {
+        Self {
+            allow_all_native_fn: true,
+            allow_native_fn: HashSet::new(),
+            reads_fs: true,
+            max_steps: None,
+            max_value_bytes: None,
+        }
+    }
+}
+
+/// Capability requirements declared *per native function* at registration
+/// time. The gate compares these against the context-wide
+/// [`Capabilities`] grant when the function is invoked under sandbox.
+///
+/// Kept distinct from `Capabilities` so the per-fn record can grow
+/// independently (future: `network`, `env`, `writes_fs`, …) without
+/// dragging context-only fields like `max_steps` into per-fn metadata.
 #[derive(Debug, Clone, Default)]
-pub struct NativeFnCaps {
+pub struct NativeFnGate {
+    /// The function reads from the filesystem (callers must hold
+    /// `Capabilities::reads_fs` to invoke it under sandbox).
     pub reads_fs: bool,
 }
 
-/// Internal record for a host-registered function, pairing the callable
-/// with the caps it declared at registration time.
 pub(crate) struct GatedNativeFn {
     pub(crate) func: Arc<dyn RelonFunction>,
-    pub(crate) caps: NativeFnCaps,
-    /// Only legacy `register_fn` produces records with `gated == false`.
-    /// Those bypass the sandbox check entirely (matches the spec: "treats
-    /// fn as fully-trusted, equivalent to all caps true").
     pub(crate) gated: bool,
+    pub(crate) gate: NativeFnGate,
 }
 
+/// Shared execution environment for one or more evaluations.
+///
+/// Holds the document root, registered plugins, cached modules, and
+/// sandbox [`Capabilities`]. Thread-safe.
 pub struct Context {
-    pub globals: HashMap<String, Value>,
-    /// Global registry for named schemas (BrandRegistry). Host apps can
-    /// populate this to provide standard types across all evaluations.
-    pub schemas: HashMap<String, Value>,
+    pub(crate) root_node: Option<Arc<Node>>,
+    pub(crate) decorators: HashMap<String, Arc<dyn DecoratorPlugin>>,
     pub(crate) functions: HashMap<String, GatedNativeFn>,
-    pub decorators: HashMap<String, Arc<dyn DecoratorPlugin>>,
-    /// Ordered chain of module resolvers consulted by `@import`. The first
-    /// resolver returning `Some(ModuleSource)` wins. Default chain: built-in
-    /// `std/...` virtual modules, then the local filesystem.
-    pub module_resolvers: Vec<Arc<dyn ModuleResolver>>,
-    pub root_node: Option<Arc<Node>>,
-    /// Output of the `relon-analyzer` semantic pass over `root_node`, if
-    /// the host opted in via [`Context::with_analyzed`]. Decorator plugins
-    /// and the type checker can use it as a fast-path side-table; the
-    /// evaluator never *requires* it (and falls back to its own
-    /// extraction logic when absent).
-    pub analyzed: Option<Arc<relon_analyzer::AnalyzedTree>>,
-    /// Sandbox / capability gates. See [`Capabilities`].
-    pub capabilities: Capabilities,
-    /// Number of times `eval_internal` has been entered for this context.
-    /// Atomic so the counter survives without coarsening evaluator borrows;
-    /// the evaluator is single-threaded but `Context` is `Send + Sync`.
-    pub(crate) step_counter: AtomicU64,
-    pub module_cache: Mutex<HashMap<String, Value>>,
+    pub globals: HashMap<String, Value>,
+    pub schemas: HashMap<String, Value>,
+    pub(crate) module_resolvers: Vec<Arc<dyn ModuleResolver>>,
     pub(crate) path_cache: Mutex<HashMap<String, Value>>,
+    pub(crate) module_cache: Mutex<HashMap<String, Value>>,
+    /// Modules currently on the load stack, with a re-entry counter so
+    /// the same canonical id can appear multiple times (e.g. via `as=`
+    /// vs `spread=true`) without the inner guard's `Drop` clearing the
+    /// outer frame's record. Decrement on drop, remove when zero.
+    pub(crate) loading_modules: Mutex<HashMap<String, usize>>,
     pub(crate) evaluating_paths: Mutex<HashSet<String>>,
-    pub(crate) loading_modules: Mutex<Vec<String>>,
+    pub(crate) step_counter: AtomicU64,
+    pub analyzed: Option<Arc<relon_analyzer::AnalyzedTree>>,
+    pub capabilities: Capabilities,
 }
 
 impl Default for Context {
@@ -99,171 +109,107 @@ impl Default for Context {
 }
 
 impl Context {
-    /// Trusted constructor. Equivalent to [`Context::trusted`]; preserved
-    /// for backwards compatibility with the ~163 tests and host call sites
-    /// that predate the sandbox model. **Use [`Context::sandboxed`] as the
-    /// starting point for any untrusted script.**
+    /// Minimal context: virtual `std/...` resolver, builtin decorators,
+    /// and the pure-functional stdlib (`len`, `range`, `string.*`,
+    /// `math.*`, …) registered via [`Self::register_fn`] (i.e. ungated —
+    /// they're considered trusted infrastructure regardless of sandbox
+    /// state). No filesystem resolver is mounted; `@import("./x.relon")`
+    /// will fall through to a `ModuleNotFound`. Use [`Self::sandboxed`]
+    /// or [`Self::trusted`] for context shapes intended for real workloads.
     pub fn new() -> Self {
-        Self::trusted()
-    }
-
-    /// Wide-open context: filesystem reads enabled with no root, unbounded
-    /// step / value budgets, every native function callable. This is what
-    /// the legacy [`Context::new`] returns; spell it explicitly when the
-    /// caller wants to make the trust level visible.
-    pub fn trusted() -> Self {
-        let caps = Capabilities {
-            allow_all_native_fn: true,
-            ..Capabilities::default()
-        };
-        Self::with_capabilities_and_resolvers(
-            caps,
-            vec![
-                Arc::new(StdModuleResolver),
-                Arc::new(FilesystemModuleResolver::trusted()),
-            ],
-        )
-    }
-
-    /// Fully sandboxed context: filesystem reads default-rejected (no
-    /// root), capabilities at their restrictive defaults, only the
-    /// virtual `std/...` resolver wired up. Hosts grant capabilities by
-    /// mutating `capabilities`, swapping in a rooted
-    /// [`FilesystemModuleResolver`], and registering native functions
-    /// with [`Context::register_fn_with_caps`].
-    pub fn sandboxed() -> Self {
-        Self::with_capabilities_and_resolvers(
-            Capabilities::default(),
-            vec![
-                Arc::new(StdModuleResolver),
-                // Default-rejecting filesystem resolver. Swap or augment
-                // via `prepend_module_resolver` once the host knows what
-                // root to expose.
-                Arc::new(FilesystemModuleResolver::default()),
-            ],
-        )
-    }
-
-    fn with_capabilities_and_resolvers(
-        capabilities: Capabilities,
-        module_resolvers: Vec<Arc<dyn ModuleResolver>>,
-    ) -> Self {
-        let mut ctx = Self {
+        let mut this = Self {
+            root_node: None,
+            decorators: HashMap::new(),
+            functions: HashMap::new(),
             globals: HashMap::new(),
             schemas: HashMap::new(),
-            functions: HashMap::new(),
-            decorators: HashMap::new(),
-            module_resolvers,
-            root_node: None,
-            analyzed: None,
-            capabilities,
-            step_counter: AtomicU64::new(0),
-            module_cache: Mutex::new(HashMap::new()),
+            module_resolvers: Vec::new(),
             path_cache: Mutex::new(HashMap::new()),
+            module_cache: Mutex::new(HashMap::new()),
+            loading_modules: Mutex::new(HashMap::new()),
             evaluating_paths: Mutex::new(HashSet::new()),
-            loading_modules: Mutex::new(Vec::new()),
+            step_counter: AtomicU64::new(0),
+            analyzed: None,
+            capabilities: Capabilities::default(),
         };
-        crate::stdlib::register_to(&mut ctx);
-        crate::builtin_decorators::register_to(&mut ctx);
-        ctx
+        crate::builtin_decorators::register_to(&mut this);
+        crate::stdlib::register_to(&mut this);
+        // Virtual Stdlib is checked first
+        this.module_resolvers.push(Arc::new(StdModuleResolver));
+        this
     }
 
-    /// Replace the current capability set wholesale. Builder-style so
-    /// hosts can chain it onto `Context::sandboxed()`.
-    pub fn with_capabilities(mut self, caps: Capabilities) -> Self {
-        self.capabilities = caps;
+    /// Sandboxed context for untrusted scripts. Adds a default-rejecting
+    /// [`FilesystemModuleResolver`] after the virtual `std/...` resolver
+    /// so `@import("std/list")` works while `@import("./local.relon")`
+    /// returns `CapabilityDenied`. `Capabilities` defaults are
+    /// restrictive: no fs grant, no native-fn allowlist.
+    ///
+    /// **Sandbox scope:** this only constrains filesystem `@import` and
+    /// host-registered functions added via [`Self::register_fn_with_caps`].
+    /// The pure-functional stdlib (registered via [`Self::register_fn`])
+    /// is intentionally ungated — those functions perform no I/O and
+    /// have no side-effects beyond their return value. Hosts that need
+    /// to forbid even the stdlib should re-register the relevant entries
+    /// via `register_fn_with_caps` after construction.
+    pub fn sandboxed() -> Self {
+        let mut this = Self::new();
+        this.module_resolvers
+            .push(Arc::new(FilesystemModuleResolver::default()));
+        this
+    }
+
+    pub fn with_root(mut self, node: Node) -> Self {
+        self.root_node = Some(Arc::new(node));
         self
     }
 
-    /// Insert a [`ModuleResolver`] at the front of the resolver chain. Use
-    /// this when the host wants to intercept imports before built-in
-    /// `std/...` and filesystem lookups.
+    pub fn with_analyzed(mut self, tree: Arc<relon_analyzer::AnalyzedTree>) -> Self {
+        self.analyzed = Some(tree);
+        self
+    }
+
     pub fn prepend_module_resolver(&mut self, resolver: Arc<dyn ModuleResolver>) {
         self.module_resolvers.insert(0, resolver);
     }
 
-    /// Register a named schema globally in the BrandRegistry.
-    pub fn register_schema(&mut self, name: impl Into<String>, schema: Value) {
-        self.schemas.insert(name.into(), schema);
-    }
-
-    pub fn enter_loading_module<S: Into<String>>(&self, path: S) -> LoadingModuleGuard<'_> {
-        let path = path.into();
-        self.loading_modules.lock().unwrap().push(path.clone());
-        LoadingModuleGuard {
-            loading_modules: &self.loading_modules,
-            path,
-        }
-    }
-
-    pub fn with_root(mut self, root: Node) -> Self {
-        self.root_node = Some(Arc::new(root));
-        self
-    }
-
-    /// Attach a pre-computed [`relon_analyzer::AnalyzedTree`] so decorator
-    /// plugins and the type checker can fast-path through it. Pass the
-    /// same root node to `analyze` first, then forward both into the
-    /// evaluator.
-    pub fn with_analyzed(mut self, analyzed: Arc<relon_analyzer::AnalyzedTree>) -> Self {
-        self.analyzed = Some(analyzed);
-        self
-    }
-
-    /// Resolve a reference site (`Reference { ... }` or `Variable(...)`
-    /// node id) to the target value-node the analyzer bound it to.
-    ///
-    /// Returns `None` when the analyzer wasn't attached, didn't visit
-    /// the node, or couldn't statically determine a target. Hosts and
-    /// tooling (LSP go-to-definition, type checkers, debuggers) call
-    /// this so they share the evaluator's view of "what does this
-    /// reference point to". The evaluator itself doesn't use this on
-    /// its hot path — its thunk + cache machinery is already doing the
-    /// equivalent walk with the cycle protection a fast-path would
-    /// have to re-implement.
-    pub fn analyzer_target(&self, site_id: relon_parser::NodeId) -> Option<Arc<Node>> {
-        let tree = self.analyzed.as_ref()?;
-        let resolved = tree.references.get(&site_id)?;
-        tree.node_index.get(&resolved.target).cloned()
-    }
-
     /// Register a fully-trusted native function. Calls bypass the sandbox
-    /// gate — use [`Context::register_fn_with_caps`] for anything that
-    /// needs to be guarded.
-    pub fn register_fn<S: Into<String>>(&mut self, name: S, f: Arc<dyn RelonFunction>) {
+    /// gate entirely — equivalent to "all caps true". Use
+    /// [`Self::register_fn_with_caps`] for anything that needs to be
+    /// guarded by host policy.
+    pub fn register_fn<S: Into<String>>(&mut self, name: S, func: Arc<dyn RelonFunction>) {
         self.functions.insert(
             name.into(),
             GatedNativeFn {
-                func: f,
-                caps: NativeFnCaps::default(),
+                func,
                 gated: false,
+                gate: NativeFnGate::default(),
             },
         );
     }
 
-    /// Register a native function whose calls are gated by the current
-    /// capability set. In sandbox mode the call is rejected unless either
+    /// Register a native function whose calls are gated by the
+    /// context-wide [`Capabilities`]. The function declares what it
+    /// *requires* via [`NativeFnGate`] (e.g. `reads_fs: true`); under
+    /// sandbox the call is rejected unless either
     /// `Capabilities::allow_all_native_fn` is on or `name` appears in
     /// `Capabilities::allow_native_fn`.
     pub fn register_fn_with_caps<S: Into<String>>(
         &mut self,
         name: S,
-        caps: NativeFnCaps,
-        f: Arc<dyn RelonFunction>,
+        gate: NativeFnGate,
+        func: Arc<dyn RelonFunction>,
     ) {
         self.functions.insert(
             name.into(),
             GatedNativeFn {
-                func: f,
-                caps,
+                func,
                 gated: true,
+                gate,
             },
         );
     }
 
-    /// Register a decorator plugin under `name` (the full dotted path,
-    /// e.g. `"ensure.int"`). Replaces any previously registered plugin with
-    /// the same name, which is how hosts override built-ins.
     pub fn register_decorator<S: Into<String>>(
         &mut self,
         name: S,
@@ -271,32 +217,81 @@ impl Context {
     ) {
         self.decorators.insert(name.into(), plugin);
     }
-}
 
-pub struct Evaluator<'a> {
-    pub context: &'a Context,
+    pub fn register_schema<S: Into<String>>(&mut self, name: S, schema: Value) {
+        self.schemas.insert(name.into(), schema);
+    }
+
+    pub fn enter_loading_module(&self, id: String) -> LoadingModuleGuard<'_> {
+        *self
+            .loading_modules
+            .lock()
+            .unwrap()
+            .entry(id.clone())
+            .or_insert(0) += 1;
+        LoadingModuleGuard {
+            context: self,
+            module_id: id,
+        }
+    }
+
+    pub fn analyzer_target(&self, id: relon_parser::NodeId) -> Option<Node> {
+        self.analyzed
+            .as_ref()
+            .and_then(|tree| tree.node(id).map(|arc| (**arc).clone()))
+    }
 }
 
 pub struct LoadingModuleGuard<'a> {
-    loading_modules: &'a Mutex<Vec<String>>,
-    path: String,
+    context: &'a Context,
+    module_id: String,
 }
 
 impl Drop for LoadingModuleGuard<'_> {
     fn drop(&mut self) {
-        let mut loading_modules = self.loading_modules.lock().unwrap();
-        if let Some(index) = loading_modules
-            .iter()
-            .rposition(|module| module == &self.path)
-        {
-            loading_modules.remove(index);
+        let mut loading = self.context.loading_modules.lock().unwrap();
+        if let Some(count) = loading.get_mut(&self.module_id) {
+            *count -= 1;
+            if *count == 0 {
+                loading.remove(&self.module_id);
+            }
         }
     }
 }
 
+pub struct Evaluator<'a> {
+    pub context: &'a Context,
+    /// Lazy cache for the `Arc<dyn NativeFnCaps>` handed to native fns so
+    /// closures can call back into Relon. Allocating one per call shows up
+    /// in the per-element hot path of `_list_map`/`_list_filter` etc.
+    caps: std::sync::OnceLock<Arc<EvaluatorCaps>>,
+    /// Cached empty scope used as the parent of native-fn closure
+    /// callbacks. Avoids one `Arc::new(Scope::default())` per element.
+    empty_scope: std::sync::OnceLock<Arc<Scope>>,
+}
+
 impl<'a> Evaluator<'a> {
     pub fn new(context: &'a Context) -> Self {
-        Self { context }
+        Self {
+            context,
+            caps: std::sync::OnceLock::new(),
+            empty_scope: std::sync::OnceLock::new(),
+        }
+    }
+
+    fn caps(&self) -> Arc<dyn NativeFnCaps> {
+        self.caps
+            .get_or_init(|| {
+                Arc::new(EvaluatorCaps {
+                    evaluator: self as *const Evaluator as usize,
+                })
+            })
+            .clone()
+    }
+
+    fn empty_scope(&self) -> &Arc<Scope> {
+        self.empty_scope
+            .get_or_init(|| Arc::new(Scope::default()))
     }
 
     fn is_valid_identifier(s: &str) -> bool {
@@ -308,7 +303,7 @@ impl<'a> Evaluator<'a> {
         if !first.is_ascii_alphabetic() && first != '_' {
             return false;
         }
-        chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+        chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
     }
 
     fn is_logic_definition(node: &Node) -> bool {
@@ -319,12 +314,10 @@ impl<'a> Evaluator<'a> {
         self.eval_internal(node, scope, false)
     }
 
-    /// Reject values whose top-level element count exceeds the configured
-    /// `max_value_bytes` limit. Called from the construction sites where
-    /// lists/dicts grow (literal evaluation, arithmetic merge, spread, etc.):
-    /// threading `&Context` into `Value::list_mut`/`dict_mut` would balloon
-    /// the API for what's effectively a single bounds check, so we keep the
-    /// gate at the evaluator boundary instead.
+    /// Enforce `Capabilities::max_value_bytes`. The field name is for
+    /// forward compatibility with a future byte-accurate metric; today
+    /// we measure element count for `List` / `Dict` and skip primitive
+    /// values entirely (their size is bounded by the source).
     pub(crate) fn check_value_size(
         &self,
         value: &Value,
@@ -349,13 +342,12 @@ impl<'a> Evaluator<'a> {
         }
     }
 
-    /// Entry point for evaluating the `Context`'s root document.
-    ///
-    /// This is the single, supported way to start evaluation: it pins
-    /// `scope.reference_root` to the same `Arc<Node>` we hand to
-    /// [`Self::eval`], so the `is_root` pointer-equality check inside
-    /// `eval_internal` actually triggers and `&sibling`/`&root` references
-    /// don't have to fall through the lazy-thunk safety net.
+    /// Evaluate the document attached to `Context::with_root`. Stamps
+    /// `scope.reference_root` with the root node so `&root` references
+    /// resolve correctly during the walk; the reference-equality check
+    /// against the existing `reference_root` lets nested modules
+    /// preserve their own root binding when re-entering this from
+    /// `load_module`.
     pub fn eval_root(&self, scope: &Arc<Scope>) -> Result<Value, RuntimeError> {
         let root = self.context.root_node.clone().ok_or_else(|| {
             RuntimeError::VariableNotFound(
@@ -379,11 +371,7 @@ impl<'a> Evaluator<'a> {
         scope: &Arc<Scope>,
         is_schema_pred: bool,
     ) -> Result<Value, RuntimeError> {
-        // Step budget. Skip the atomic entirely on the unlimited path —
-        // hosts that don't set `max_steps` should pay zero cost here.
         if let Some(limit) = self.context.capabilities.max_steps {
-            // Relaxed is fine: we never need cross-thread visibility ordering
-            // here, only that the counter increases monotonically.
             let prev = self.context.step_counter.fetch_add(1, Ordering::Relaxed);
             if prev >= limit {
                 return Err(RuntimeError::StepLimitExceeded {
@@ -395,9 +383,6 @@ impl<'a> Evaluator<'a> {
 
         let mut current_scope = Arc::clone(scope);
 
-        // Pre-eval pass: every decorator gets a chance to mutate the scope or
-        // take over the value. Built-in keywords (`@import`, `@schema`) and
-        // host-registered plugins go through the same dispatch.
         for dec in &node.decorators {
             let name = decorator_name(dec);
             let Some(plugin) = self.context.decorators.get(&name).cloned() else {
@@ -421,9 +406,6 @@ impl<'a> Evaluator<'a> {
                 let mut thunks = Vec::new();
                 for (i, el) in elements.iter().enumerate() {
                     let item_scope = current_scope.with_path(i.to_string());
-                    // List elements are forced through `force_thunk_with_scope`
-                    // which doesn't consult `path` / `cache_key`, so they stay
-                    // empty here.
                     thunks.push(Arc::new(Thunk::new(
                         el.clone(),
                         item_scope,
@@ -489,7 +471,6 @@ impl<'a> Evaluator<'a> {
                         TokenKey::Spread(_) => {
                             let val = self.eval(value_node, &dict_scope)?;
                             if let Value::Dict(d) = val {
-                                // Important: overrides existing keys in map
                                 for (k, v) in d.map.iter() {
                                     map.insert(k.clone(), v.clone());
                                     dict_scope
@@ -756,14 +737,6 @@ impl<'a> Evaluator<'a> {
         }?;
 
         if !is_schema_pred {
-            // Wrap pass: each decorator either runs through its registered
-            // [`DecoratorPlugin::wrap`] (built-ins, host-registered plugins)
-            // or falls back to the closure / native-function lookup below
-            // for user-defined decorators that share a dict with their data.
-            //
-            // Plugins may also override [`DecoratorPlugin::wrap_with_ast`]
-            // to consume the raw AST args before evaluation; if that hook
-            // returns `Some`, regular `wrap` is skipped for that decorator.
             for dec in &node.decorators {
                 let name = decorator_name(dec);
                 if let Some(plugin) = self.context.decorators.get(&name).cloned() {
@@ -799,11 +772,6 @@ impl<'a> Evaluator<'a> {
 
                 if let Value::Dict(ref mut d) = val {
                     let d = Arc::make_mut(d);
-                    // Delegate to the shared `brand_string_for` so the
-                    // field-level type hint (`Type field: ...`) and the
-                    // decorator form (`@brand(Type)`) produce identical
-                    // brand strings — generics and `?` are preserved on
-                    // both sides.
                     d.brand = crate::builtin_decorators::brand_string_for(type_hint);
                 }
             }
@@ -812,11 +780,6 @@ impl<'a> Evaluator<'a> {
         Ok(val)
     }
 
-    /// Apply an `@import(path, as=, spread=)` decorator's effect on the scope.
-    ///
-    /// Exposed so the [`crate::builtin_decorators::ImportDecorator`] plugin can
-    /// reuse the implementation without copy-pasting filesystem and module-cache
-    /// logic.
     pub fn apply_import(
         &self,
         args: &[CallArg],
@@ -879,8 +842,6 @@ impl<'a> Evaluator<'a> {
         Ok(scope.with_locals(new_locals))
     }
 
-    /// Evaluate a decorator/function-call argument list against `scope`,
-    /// preserving positional order and named bindings.
     pub fn evaluate_call_args(
         &self,
         args: &[CallArg],
@@ -896,10 +857,12 @@ impl<'a> Evaluator<'a> {
         Ok(out)
     }
 
-    /// Resolve and evaluate the module identified by `path_str`, threading it
-    /// through the registered [`ModuleResolver`] chain. The first resolver
-    /// returning `Some(ModuleSource)` wins; the resulting source is parsed and
-    /// evaluated once, then cached by `canonical_id`.
+    /// Resolve `@import("path")` against the registered resolver chain
+    /// and evaluate the resulting source. Resolvers are tried in order;
+    /// the first one returning `Some(ModuleSource)` wins. Resolved
+    /// modules are evaluated with their own `current_dir` so nested
+    /// imports inside the module are anchored to the module's location,
+    /// not the host's.
     pub fn load_module(
         &self,
         path_str: &str,
@@ -941,17 +904,14 @@ impl<'a> Evaluator<'a> {
         {
             return Ok(cached.clone());
         }
-        if self
-            .context
-            .loading_modules
-            .lock()
-            .unwrap()
-            .contains(&source.canonical_id)
         {
-            return Err(RuntimeError::CircularImport(
-                self.context.loading_modules.lock().unwrap().clone(),
-                range.into(),
-            ));
+            let loading = self.context.loading_modules.lock().unwrap();
+            if loading.contains_key(&source.canonical_id) {
+                return Err(RuntimeError::CircularImport(
+                    loading.keys().cloned().collect(),
+                    range.into(),
+                ));
+            }
         }
         let _loading_guard = self
             .context
@@ -977,10 +937,6 @@ impl<'a> Evaluator<'a> {
         Ok(evaluated)
     }
 
-    /// Construct a tagged-enum variant value: `EnumName.Variant { fields }`.
-    /// Looks up the parent enum schema in scope, validates the body against
-    /// the variant's field set (if the schema is a sum type), and emits a
-    /// `Value::Dict` branded with `variant` and `variant_of = enum_name`.
     pub(crate) fn eval_variant_ctor(
         &self,
         enum_path: &[String],
@@ -989,7 +945,6 @@ impl<'a> Evaluator<'a> {
         scope: &Arc<Scope>,
         range: TokenRange,
     ) -> Result<Value, RuntimeError> {
-        // Resolve the head identifier; everything else is path access.
         let head = enum_path.first().ok_or_else(|| {
             RuntimeError::UnsupportedOperator("variant constructor without enum".into(), range)
         })?;
@@ -1020,8 +975,6 @@ impl<'a> Evaluator<'a> {
                 range,
             });
         };
-        // Slow-path schema lowering doesn't know the binding name; fall
-        // back to the enum_path so the brand metadata is non-empty.
         let name = if name.is_empty() {
             enum_name.clone()
         } else {
@@ -1034,8 +987,6 @@ impl<'a> Evaluator<'a> {
                 range,
             });
         };
-        // Build the body dict, then validate field-by-field against the
-        // variant's spec. Empty body is fine for unit variants.
         let body_val = self.eval(body, scope)?;
         let Value::Dict(body_dict) = body_val else {
             return Err(RuntimeError::TypeMismatch {
@@ -1044,9 +995,6 @@ impl<'a> Evaluator<'a> {
                 range,
             });
         };
-        // Try to take ownership of the body dict to skip cloning the
-        // BTreeMap; falls back to cloning when the Arc is shared (rare,
-        // only when the body expression is reachable elsewhere).
         let mut map = match Arc::try_unwrap(body_dict) {
             Ok(d) => d.map,
             Err(arc) => arc.map.clone(),
@@ -1123,7 +1071,9 @@ impl<'a> Evaluator<'a> {
         if let Some(name) = Self::native_function_name(path) {
             if let Some(entry) = self.context.functions.get(&name) {
                 self.check_native_fn_capability(&name, entry, range)?;
-                return entry.func.call(NativeArgs::from_evaluated(args), range);
+                return entry
+                    .func
+                    .call(NativeArgs::from_evaluated(args, self.caps()), range);
             }
         }
         Err(RuntimeError::FunctionNotFound(
@@ -1135,9 +1085,6 @@ impl<'a> Evaluator<'a> {
         ))
     }
 
-    /// Sandbox gate for native fns. Legacy `register_fn` entries (`gated == false`)
-    /// always pass; gated entries pass when `allow_all_native_fn` is on or the
-    /// name is in `allow_native_fn`.
     fn check_native_fn_capability(
         &self,
         name: &str,
@@ -1153,7 +1100,7 @@ impl<'a> Evaluator<'a> {
         }
         Err(RuntimeError::CapabilityDenied {
             name: name.to_string(),
-            reason: if entry.caps.reads_fs {
+            reason: if entry.gate.reads_fs {
                 "function declared `reads_fs` but is not in the sandbox allowlist".to_string()
             } else {
                 "function not in sandbox allowlist".to_string()
@@ -1162,11 +1109,6 @@ impl<'a> Evaluator<'a> {
         })
     }
 
-    /// Fallback path for decorators that aren't registered as
-    /// [`DecoratorPlugin`]s. Tries (in order) a user-defined closure, then a
-    /// registered native function. Built-in keywords (`@import`, `@schema`,
-    /// `@expect`, `@default`, `@value`) are handled via the plugin registry,
-    /// not here.
     fn fallback_decorator(
         &self,
         path: &[TokenKey],
@@ -1188,7 +1130,7 @@ impl<'a> Evaluator<'a> {
         if let Some(name) = Self::native_function_name(path) {
             if let Some(entry) = self.context.functions.get(&name) {
                 self.check_native_fn_capability(&name, entry, range)?;
-                let mut native = NativeArgs::from_evaluated(args);
+                let mut native = NativeArgs::from_evaluated(args, self.caps());
                 native.positional.insert(0, value);
                 return entry.func.call(native, range);
             }
@@ -1273,15 +1215,6 @@ impl<'a> Evaluator<'a> {
             list_context: None,
             thunks: Mutex::new(HashMap::new()),
         });
-        // Pin the body inside a single Arc so the scope's `reference_root`
-        // and the `&Node` we pass to `self.eval` have identical pointer
-        // identity. Without this, `is_root` would never trigger for closure
-        // bodies and `&sibling` lookups inside the body would silently fall
-        // back through the parent chain — which is fine when the parent has
-        // the same fields, but incorrect when (for instance) the closure is
-        // declared at file root: the outer dict's reference_root_scope would
-        // leak in and we'd resolve siblings against the *call site*'s root
-        // instead of the body's.
         let body_arc = Arc::new(body.clone());
         let body_scope = Arc::new(Scope {
             parent: Some(Arc::clone(&bindings_scope)),
@@ -1291,9 +1224,6 @@ impl<'a> Evaluator<'a> {
             cache_namespace: bindings_scope.cache_namespace.clone(),
             reference_root: Some(Arc::clone(&body_arc)),
             reference_root_parent: Some(bindings_scope.clone()),
-            // Reset: a fresh `reference_root` invalidates the inherited
-            // `reference_root_scope`. The Dict branch in `eval_internal`
-            // re-installs it via the (now-honest) `is_root` check.
             reference_root_scope: None,
             list_context: None,
             thunks: Mutex::new(HashMap::new()),
@@ -1322,15 +1252,7 @@ impl<'a> Evaluator<'a> {
                     name == "schema"
                 });
 
-                // Only eager-eval `@schema` whose body is a literal Dict — that
-                // form has a fixed, side-effect-free extraction path. Compositional
-                // forms (e.g. `&sibling.Base + { ... }`) reference siblings while
-                // being evaluated, which would re-enter `prepare_dict_scope` on the
-                // same dict and recurse forever. Defer those to lazy thunk eval.
                 let is_dict_schema = is_schema && matches!(value_node.expr.as_ref(), Expr::Dict(_));
-                // Sum-type Enum schemas (`@schema X: Enum<A {...}, B>`) live in a
-                // Type-bodied node. Same eager-eval rationale as the Dict case:
-                // sibling refs to `X` need a value before lazy thunks can resolve.
                 let is_enum_schema = is_schema
                     && matches!(value_node.expr.as_ref(),
                         Expr::Type(t) if t.path.len() == 1 && t.path[0] == "Enum");
@@ -1360,14 +1282,20 @@ impl<'a> Evaluator<'a> {
                         let mut generics = Vec::new();
                         if let TokenKey::Dynamic(expr_node, _) = key {
                             if let Expr::Type(t) = expr_node.expr.as_ref() {
-                                generics = t.generics.iter().filter_map(|g| g.path.first().cloned()).collect();
+                                generics = t
+                                    .generics
+                                    .iter()
+                                    .filter_map(|g| g.path.first().cloned())
+                                    .collect();
                             }
                         }
-                        scope
-                            .locals
-                            .lock()
-                            .unwrap()
-                            .insert(key_str.clone(), Value::Schema { generics, fields: HashMap::new() });
+                        scope.locals.lock().unwrap().insert(
+                            key_str.clone(),
+                            Value::Schema {
+                                generics,
+                                fields: HashMap::new(),
+                            },
+                        );
                     }
 
                     let val = self.eval(value_node, scope)?;
@@ -1404,8 +1332,43 @@ impl<'a> Evaluator<'a> {
     }
 }
 
-/// Module-level helper because both [`Evaluator`] methods and the
-/// schema-extraction path need to compute a decorator's lookup key.
+/// Caps handle handed to native functions so they can call back into
+/// Relon. Holds a raw pointer to the `Evaluator` because the trait object
+/// needs to be `'static` while `Evaluator<'a>` is not.
+///
+/// SAFETY contract: the caps handle is created lazily by `Evaluator::caps`
+/// and stored in a `OnceLock` on the same `Evaluator`. The pointer is
+/// dereferenced only inside `call_relon`, which the host invokes
+/// synchronously from a `RelonFunction::call`. Callers must not store the
+/// `Arc<dyn NativeFnCaps>` past the lifetime of the originating
+/// `Evaluator` — `RelonFunction` impls in this crate do not, and host
+/// impls are required to follow the same rule.
+struct EvaluatorCaps {
+    /// Type-erased `*const Evaluator<'_>`. Stored as `usize` because the
+    /// trait object handed to native functions must be `'static` while
+    /// `Evaluator<'a>` is not. Reconstituted in `call_relon`.
+    evaluator: usize,
+}
+
+impl NativeFnCaps for EvaluatorCaps {
+    fn call_relon(
+        &self,
+        func: &Value,
+        args: Vec<Value>,
+        range: TokenRange,
+    ) -> Result<Value, RuntimeError> {
+        // SAFETY: see struct-level contract.
+        let evaluator = unsafe { &*(self.evaluator as *const Evaluator) };
+        let evaluated_args = args.into_iter().map(EvaluatedArg::positional).collect();
+        evaluator.call_function_by_value(
+            func.clone(),
+            evaluated_args,
+            evaluator.empty_scope(),
+            range,
+        )
+    }
+}
+
 pub(crate) fn decorator_name(dec: &DecoratorNode) -> String {
     dec.path
         .iter()

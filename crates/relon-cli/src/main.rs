@@ -1,8 +1,10 @@
 use clap::{Parser, Subcommand};
 use miette::{IntoDiagnostic, LabeledSpan, NamedSource, Report};
-use relon_evaluator::{Context, Evaluator, Scope};
+use relon_evaluator::module::FilesystemModuleResolver;
+use relon_evaluator::{Capabilities, Context, Evaluator, Scope};
 use relon_parser::{parse_document, ParseDocumentError};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 #[derive(Parser)]
 #[command(name = "relon")]
@@ -53,7 +55,13 @@ fn main() -> miette::Result<()> {
                 report.with_source_code(NamedSource::new(file.to_string_lossy(), content.clone()))
             })?;
 
-            let ctx = Context::new().with_root(node);
+            // The CLI is the host's own trusted entry point: it runs
+            // files the operator explicitly hands it, so it grants
+            // every capability. The grant is written out so a code
+            // reviewer can see what's being trusted.
+            let mut ctx = Context::sandboxed().with_root(node);
+            ctx.capabilities = Capabilities::all_granted();
+            ctx.prepend_module_resolver(Arc::new(FilesystemModuleResolver::trusted()));
             let cache_namespace = canonical_file.to_string_lossy().to_string();
             let _root_loading_guard = ctx.enter_loading_module(cache_namespace.clone());
             let evaluator = Evaluator::new(&ctx);

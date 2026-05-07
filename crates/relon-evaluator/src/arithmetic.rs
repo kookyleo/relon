@@ -55,7 +55,11 @@ impl Evaluator<'_> {
                 Expr::Dict(_) | Expr::Binary(Operator::Add, _, _)
             )
         {
-            let Value::Schema { fields: base_fields, .. } = l else {
+            let Value::Schema {
+                fields: base_fields,
+                ..
+            } = l
+            else {
                 unreachable!()
             };
             let merged_fields = match right.expr.as_ref() {
@@ -65,7 +69,8 @@ impl Evaluator<'_> {
                 _ => {
                     // Lower the nested RHS as a schema, then build it
                     // with the live scope and merge into the base.
-                    let (lowered, _diags) = relon_analyzer::lower_schema_pure(None, Vec::new(), right);
+                    let (lowered, _diags) =
+                        relon_analyzer::lower_schema_pure(None, Vec::new(), right);
                     let r_fields = match lowered {
                         Some(def) => self.build_schema_from_def(&def, scope)?,
                         None => {
@@ -81,7 +86,10 @@ impl Evaluator<'_> {
                     merged
                 }
             };
-            return Ok(Value::Schema { generics: Vec::new(), fields: merged_fields });
+            return Ok(Value::Schema {
+                generics: Vec::new(),
+                fields: merged_fields,
+            });
         }
 
         let r = self.eval(right, scope)?;

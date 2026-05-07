@@ -1,8 +1,8 @@
 {
-    split(value, separator): string.split(value, separator),
-    join(values, separator): string.join(values, separator),
-    replace(value, from, to): string.replace(value, from, to),
-    upper(value): string.upper(value),
-    lower(value): string.lower(value),
-    contains(value, needle): string.contains(value, needle)
+    split(s, sep): _string_split(s, sep),
+    join(l, sep): _string_join(l, sep),
+    replace(s, old, new): _string_replace(s, old, new),
+    upper(s): _string_upper(s),
+    lower(s): _string_lower(s),
+    contains(s, sub): _string_contains(s, sub)
 }

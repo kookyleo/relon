@@ -1,10 +1,25 @@
 # 简介：什么是 Relon？
 
-Relon 是一个**可嵌入 Rust 的工具集**，用来搭建「类型化的业务配置 DSL」。它不是一门通用脚本语言，也不是为了取代 JSON——它的目标是让你在 JSON 之上获得真正的类型契约、组合能力和宿主扩展点，最终输出的依然是「下游服务能直接吃」的纯 JSON。
+Relon 是一种**可执行的数据格式**：它的载荷就是业务逻辑本身。把校验
+规则、计费公式、工作流、风控策略写成 Relon 文档，存进数据库或配置文
+件，**任何符合规范的运行时（Rust、Go、TS、Swift、浏览器 WASM…）拿到
+同一份源码 + 同一份输入，都会给出字节级一致的结果。**
 
-> **一句话定位**：Build typed business-config DSLs on top of JSON.
->
-> **From JSON-like, to JSON, for JSON.**
+仓库里的 Rust 实现是参考运行时；语言规范本身和具体 runtime 无关。
+
+> **一句话定位**：Logic as portable data — 把逻辑像 JSON 一样写一次、
+> 存一次、传一次，跨端执行结果完全确定。
+
+## 这意味着什么（设计上的硬约束）
+
+* **同源 + 同输入 → 同输出**：Dict 迭代序由 `BTreeMap` 保序、浮点
+  走 IEEE-754 `f64`、不读环境变量、不依赖系统时间或 RNG。
+* **沙箱默认，无逃生口**：脚本零环境特权；FS、网络、原生函数都需
+  要由 `Capabilities` 显式授权——没有「trusted 模式」让脚本绕过宿
+  主的允诺。
+* **标准库是规范**：`std/list`、`std/string`、`std/math`… 是规范
+  的一部分，所有 conformant 运行时必须按相同语义实现。脚本不依赖
+  任何 runtime-private 的全局名。
 
 <figure style="margin: 2rem auto; max-width: 720px; text-align: center;">
   <img src="/positioning.svg" alt="Relon 的双层作者模型示意图" style="width: 100%; height: auto;" />

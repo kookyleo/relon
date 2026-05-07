@@ -284,7 +284,7 @@ pub enum RefBase {
 #[derive(Debug, PartialEq, Clone)]
 pub enum FStringPart {
     Literal(String),
-    Interpolation(Node),
+    Interpolation(Box<Node>),
 }
 
 #[derive(Debug, PartialEq, Clone, Copy, Eq, Hash)]

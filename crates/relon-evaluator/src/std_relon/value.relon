@@ -1,5 +1,3 @@
 {
-    default(value, fallback): value == null ? fallback: value,
-    equals(a, b): a == b,
-    clone(value): value
+    default(v, fallback): v == null ? fallback: v
 }

@@ -3,8 +3,8 @@ layout: home
 
 hero:
   name: "Relon"
-  text: "Build typed business-config DSLs on top of JSON"
-  tagline: "可嵌入 Rust 的工具集，用来搭建「类型化业务配置 DSL」。平台团队定义 schema、装饰器与原生函数；业务团队用 JSON 形态的配置组合它们，最终编译为纯净 JSON。From JSON-like, to JSON, for JSON。"
+  text: "Logic as portable data"
+  tagline: "把业务逻辑像 JSON 一样写一次、存一次、传一次。任何符合规范的 Relon 运行时都给出相同的执行结果——Go、TS、Swift、浏览器、Rust、WASM 之间不再有「逻辑漂移」。仓库里这一份是参考运行时（Rust），语言规范与运行时无关。"
   image:
     src: /logo.svg
     alt: Relon
@@ -17,14 +17,14 @@ hero:
       link: https://github.com/kookyleo/relon
 
 features:
-  - title: 双层作者模型
-    details: "平台团队提供 schema、装饰器、原生函数与 .relon 库；业务团队写薄薄一层 entry 配置去拼装。语言级 `@library` 标记区分「库」与「入口」，杜绝错把库当 entry 跑。"
-  - title: 类型化业务 schema
-    details: "内建 sum-type tagged enum、递归 schema、`@expect` 自定义校验消息、必填/可选/默认值/计算默认值并存——业务领域的契约不必再退化成松散字典。"
-  - title: 沙箱默认安全
-    details: "`Capabilities` 控制文件读白名单、求值步数、Value 元素水位、原生函数白名单。`Context::sandboxed()` 默认拒绝一切，宿主显式授权后再放行。"
-  - title: JSON 闭环
-    details: "From JSON-like, to JSON, for JSON——输入语法贴近 JSON，输出永远是普通 JSON。`Projector` trait 让你微调输出形态（如 sum-type 编码风格），但永远落在 JSON 上。"
+  - title: 跨端确定一致
+    details: "同源 + 同输入 → 字节级相同的输出。Dict 走 BTreeMap 保序、IEEE-754 f64 无歧义、不读环境变量、不依赖隐式上下文。逻辑写在数据库里、跑在哪个 runtime 上，结果都一样。"
+  - title: 默认沙箱，无逃生口
+    details: "脚本零环境特权。`Capabilities` 显式控制文件读、求值步数、value 元素水位、原生函数白名单——没有「trusted 模式」让脚本绕过宿主授权。安全审计的边界明确。"
+  - title: 自描述类型契约
+    details: "`@schema`、sum-type tagged enum、递归 schema、品牌标记、计算默认值——契约信息和载荷一起传输，下游不需要带外文档就能校验。"
+  - title: 上下文感知引用
+    details: "`&root`、`&sibling`、`&prev`、`&next` 让逻辑声明式地引用周围数据，无硬编码路径。引用是声明式的，跨端执行结果仍然确定。"
 ---
 
 <RelonGallery />

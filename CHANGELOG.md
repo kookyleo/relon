@@ -1,0 +1,152 @@
+# Changelog
+
+## [Unreleased] — Spec v1 candidate freeze
+
+This release fixes the project's load-bearing positioning to
+**Logic-as-Portable-Data**: the Relon source IS the executable
+artifact, evaluated identically by any conformant runtime regardless
+of host language. The reference runtime in this repo is Rust; the
+spec itself is runtime-agnostic.
+
+The full specification lives at [`docs/zh/guide/spec.md`](docs/zh/guide/spec.md)
+([English](docs/en/guide/spec.md)). Anything not covered by that
+document is runtime-private and not part of the cross-runtime
+contract.
+
+### Breaking changes (driven by the new positioning)
+
+#### 1. `Context::trusted()` removed
+
+A "trusted-mode constructor" undermined the spec's core invariant
+that capability grants must be explicit and audit-visible. The escape
+hatch is gone.
+
+**Migration**:
+
+```rust
+// Before:
+let ctx = Context::trusted().with_root(node);
+
+// After:
+let mut ctx = Context::sandboxed().with_root(node);
+ctx.capabilities = Capabilities::all_granted();
+ctx.prepend_module_resolver(Arc::new(FilesystemModuleResolver::trusted()));
+```
+
+The new helper `Capabilities::all_granted()` makes the "I want
+everything" intent explicit. Code reviewers see exactly what is
+granted at the call site.
+
+#### 2. Top-level dotted std names no longer registered
+
+`string.split`, `dict.merge`, `list.contains`, `math.clamp`, etc.
+were silently registered as runtime-private globals. Scripts that
+called them implicitly depended on "this Rust runtime registered
+string.split" — a per-runtime detail the spec cannot guarantee
+across implementations.
+
+**Migration**:
+
+```relon
+// Before:
+{ "parts": string.split("a,b,c", ",") }
+
+// After:
+@import("std/string", as="string")
+{ "parts": string.split("a,b,c", ",") }
+```
+
+Every spec-mandated module (`std/list`, `std/string`, `std/dict`,
+`std/math`, `std/is`, `std/value`) must be imported explicitly. See
+[stdlib.md](docs/zh/guide/stdlib.md).
+
+#### 3. Language-level builtins clearly delineated
+
+Three names remain ambient (no `@import` required), pinned in spec
+§6.1: `len`, `range`, `type`. They are metadata operations on data
+structures themselves, available unconditionally on every conformant
+runtime.
+
+#### 4. `NativeFnGate` replaces `Capabilities` for per-fn metadata
+
+`register_fn_with_caps` now takes `NativeFnGate` (per-function
+capability *requirements* — currently `reads_fs: bool`) rather than
+`Capabilities` (context-level *grants*). Restoring the distinction
+lets each grow independently without dragging context-only fields
+like `max_steps` into per-fn metadata.
+
+```rust
+// Before:
+ctx.register_fn_with_caps(
+    "fs.read",
+    Capabilities { reads_fs: true, ..Default::default() },
+    Arc::new(ReadFs),
+);
+
+// After:
+ctx.register_fn_with_caps(
+    "fs.read",
+    NativeFnGate { reads_fs: true },
+    Arc::new(ReadFs),
+);
+```
+
+### Non-breaking improvements
+
+* **Determinism contract written down** (spec §2): `BTreeMap` dict
+  iteration, IEEE-754 floats with `OrderedFloat` total ordering, no
+  ambient environment access (clock, locale, env vars, RNG).
+* **Stable error taxonomy** (spec §5): every `RuntimeError` variant
+  has a documented kind label that all conformant runtimes must use.
+* **Std module catalog** (spec §6): the canonical list of std modules
+  + functions, with each function's reference behavior anchored in
+  `crates/relon-evaluator/src/std_relon/<module>.relon`.
+* **Implementer guide outline** (spec §9): the path for bringing up
+  a Go / TS / Swift / etc. conformant runtime, including reusing the
+  reference `.relon` std sources.
+
+### Code-side simplifications (from the parallel `/simplify` rounds)
+
+* `EvaluatorCaps` dedup — cached `Arc<dyn NativeFnCaps>` on the
+  evaluator instead of one allocation per native dispatch; removes
+  the per-element `Arc<Scope::default()>` allocation in
+  `_list_map`/`_list_filter`/`_list_reduce`.
+* `is_valid_identifier` operator-precedence bug fixed (used to accept
+  `"!!.bad"` because `chars.all(...) || s.contains('.')` short-circuited
+  on any dot).
+* Heterogeneous `Enum` analyzer: now `return false` after pushing the
+  `HeterogeneousEnum` diagnostic so a half-tagged enum doesn't
+  pollute `tree.schemas`.
+* TOCTOU double-lock on `loading_modules` collapsed into a single
+  guard.
+* `loading_modules: Mutex<HashSet<String>>` → `Mutex<HashMap<String, usize>>`
+  with reference counting, fixing a re-entrant-import edge case
+  where the inner `LoadingModuleGuard::drop` would clear the outer
+  frame's cycle-detection record.
+* `step_counter` reverted from `AtomicUsize` to `AtomicU64` (the
+  former silently truncated `Option<u64> max_steps` on 32-bit
+  targets, including WASM).
+* Cargo `[profile.release]` retuned: fat LTO + `codegen-units = 1`
+  for whole-program optimization, with `opt-level = 3` and `unwind`
+  panics so downstream embedders get throughput and `Drop`
+  semantics. The size-tuned `opt-level = "z"` + `panic = "abort"`
+  lives in `[profile.release-small]` for WASM / minimal CLI.
+* Workspace test fallback in `FilesystemModuleResolver` is now
+  `#[cfg(test)]` instead of leaking into production binaries;
+  `canonicalize` errors outside `NotFound` are propagated as
+  `IoError` rather than silently masked.
+
+### Counts
+
+* 237 / 237 tests passing.
+* 0 clippy warnings.
+* `release` CLI: 1.5 MB. `release-small` CLI: 898 KB.
+
+### Deferred to future spec drafts
+
+* `std/time`, `std/regex`, `std/path`, `std/base64` modules.
+* LSP cross-runtime story (virtual URIs for std module sources).
+* Conformance test corpus split out from `fixtures/` so other-language
+  ports can consume it directly.
+* Formal grammar in BNF (currently the reference parser IS the
+  grammar).

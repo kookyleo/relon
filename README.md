@@ -1,6 +1,14 @@
 # Relon
 
-A programmable configuration language that extends JSON with functional logic, references, and a self-describing meta-system.
+**Logic as portable data.** Relon is an executable data format: business
+logic — validation rules, pricing formulas, workflow steps — is written
+once, stored like JSON, and evaluated identically by any conformant
+runtime. The reference runtime is Rust; the language spec is
+runtime-agnostic and deterministic by construction.
+
+> Write the rule once. Store it in your database, your config file, your
+> RPC payload. Run it from Go, TypeScript, Swift, the browser. Get the
+> same answer everywhere.
 
 ## 🚀 Quick Start
 
@@ -25,12 +33,22 @@ cargo run -q -p relon-fmt -- --check fixtures/*.relon fixtures/modules/*.relon f
 
 ## 🛠 Features
 
-- **Unified Closures**: Use `@fn` to define logic that works as both functions and decorators.
-- **Deep References**: Access data via `&root`, `&sibling`, or `&uncle`.
-- **List Comprehensions**: Python-style iteration: `[x for x in list if cond]`.
-- **Piped Processing**: Chain operations with `|`.
-- **Modular**: Structured code organization with `@import`.
-- **Embedded Stdlib**: Built-in logic and readable namespaces such as `ensure.*`, `string.*`, `dict.*`, and `list.*`.
+- **Deterministic by spec**: same source + same input → byte-identical
+  output, regardless of host language. No floating-point quirks, no
+  iteration-order leaks, no implicit ambient state.
+- **Sandboxed by default**: a script declares the capabilities it needs
+  (`reads_fs`, `network`, allow-listed native fns); the host grants
+  them. There is no "trusted mode" the script can fall back to.
+- **Self-describing schemas**: `@schema`, sum-type tagged enums,
+  recursive contracts, branded values — type information travels with
+  the payload.
+- **Context-aware references**: `&root`, `&sibling`, `&prev`, `&next`
+  let logic reference its surrounding data without hard-coded paths.
+- **Functional core**: unified closures (`@fn`), comprehensions, pipes,
+  pattern match — pure expressions, no IO or side effects.
+- **Canonical std**: `@import("std/list", as="list")` ships with every
+  conformant runtime; the std module set is part of the spec, not a
+  per-runtime extension.
 
 ## 📖 Example
 

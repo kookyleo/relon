@@ -1,7 +1,8 @@
 pub mod projector;
 
 use relon_analyzer::{analyze, AnalyzedTree, Diagnostic};
-use relon_evaluator::{Context, Evaluator, RuntimeError, Scope, Value};
+use relon_evaluator::module::FilesystemModuleResolver;
+use relon_evaluator::{Capabilities, Context, Evaluator, RuntimeError, Scope, Value};
 use relon_parser::parse_document;
 use serde::de::DeserializeOwned;
 use std::path::{Path, PathBuf};
@@ -170,9 +171,16 @@ fn evaluate_source(
     }
     let analyzed = Arc::new(analyzed);
 
-    let ctx = Context::new()
+    // `value_from_str` / `value_from_file` are the host's "evaluate
+    // this Relon document and give me the JSON" entry points — by
+    // construction the file is host-owned, so every capability is
+    // granted. Spelled out so a code reviewer sees the trust scope.
+    let mut ctx = Context::sandboxed()
         .with_root(node)
         .with_analyzed(Arc::clone(&analyzed));
+    ctx.capabilities = Capabilities::all_granted();
+    ctx.prepend_module_resolver(Arc::new(FilesystemModuleResolver::trusted()));
+
     let _root_loading_guard = if cache_namespace == "<memory>" {
         None
     } else {

@@ -1,24 +1,3 @@
-//! Runtime schema construction and type checking.
-//!
-//! Schema *desugar* (`@schema Name: { ... }` → `SchemaDef`) lives in
-//! [`relon_analyzer::schema`]. This module owns the runtime side:
-//!
-//! * [`Evaluator::build_schema_from_def`] — turn an analyzer-produced
-//!   `SchemaDef` into a `HashMap<String, SchemaField>` by instantiating
-//!   predicate closures, resolving base schemas via reference, and
-//!   running per-decorator `schema_field_meta` hooks.
-//! * [`Evaluator::merge_schema_with_dict_pairs`] — handle the inline
-//!   `Schema + Dict_AST` arithmetic case where a literal dict is folded
-//!   into an existing schema (typed entries refine fields, untyped
-//!   entries set defaults).
-//! * [`Evaluator::check_type`] — runtime type validation against a
-//!   `Value::Schema` or built-in type name.
-//!
-//! Hosts that don't attach an `AnalyzedTree` get on-demand desugar
-//! through [`relon_analyzer::lower_schema_pure`] (called from the
-//! `SchemaDecorator` plugin), so this module never needs an
-//! evaluator-internal AST walker.
-
 use crate::error::RuntimeError;
 use crate::eval::{decorator_name, Evaluator};
 use crate::native_fn::EvaluatedArg;
@@ -29,248 +8,281 @@ use relon_parser::{is_builtin_type_name, Expr, Node, TokenKey, TokenRange, TypeN
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-/// Pretty-print a [`TypeNode`] for use in error messages.
-pub(crate) fn format_type_node(node: &TypeNode) -> String {
-    let suffix = if node.is_optional { "?" } else { "" };
-    let path_str = node.path.join(".");
-    if node.generics.is_empty() {
-        format!("{path_str}{suffix}")
-    } else {
-        let generics: Vec<String> = node.generics.iter().map(format_type_node).collect();
-        format!("{path_str}<{}>{suffix}", generics.join(", "))
-    }
-}
-
-impl<'a> Evaluator<'a> {
-    /// Validate `value` against `expected`. Mutates `value` in place when
-    /// recursing through `List<T>` / `Dict<K, V>` so per-element checks see
-    /// the same allocation.
+impl Evaluator<'_> {
     pub(crate) fn check_type(
         &self,
         value: &mut Value,
-        expected: &TypeNode,
+        type_hint: &TypeNode,
         scope: &Arc<Scope>,
         range: TokenRange,
     ) -> Result<(), RuntimeError> {
-        self.check_type_internal(value, expected, scope, range, &mut HashSet::new(), 0)
+        self.check_type_internal(value, type_hint, scope, range, &mut HashSet::new(), 0)
     }
 
-    pub(crate) fn check_type_internal(
+    fn check_type_internal(
         &self,
         value: &mut Value,
-        expected: &TypeNode,
+        type_hint: &TypeNode,
         scope: &Arc<Scope>,
         range: TokenRange,
         visited: &mut HashSet<(String, *const Value)>,
         depth: usize,
     ) -> Result<(), RuntimeError> {
-        if depth > 20 {
-            return Err(RuntimeError::UnsupportedOperator(
-                "Type recursion depth exceeded".to_string(),
-                range,
-            ));
+        if depth > 100 {
+            return Err(RuntimeError::StepLimitExceeded { limit: 100, range });
         }
 
-        if expected.is_optional && matches!(value, Value::Null) {
+        if type_hint.is_optional && matches!(value, Value::Null) {
             return Ok(());
         }
 
-        let expected_str = format_type_node(expected);
-
-        // Recursion guard for custom schemas: stop if we'd re-check the same
-        // (Schema name, value pointer) pair.
-        let tname = expected.path.join(".");
-        if !is_builtin_type_name(&tname) {
-            let ptr = value as *const Value;
-            if !visited.insert((tname.clone(), ptr)) {
-                return Ok(());
-            }
-        }
-
-        let matches = if expected.path.len() == 1 {
-            match expected.path[0].as_str() {
-                "Any" => true,
-                "Int" => matches!(value, Value::Int(_)),
-                "Float" => matches!(value, Value::Float(_)),
-                "Number" => matches!(value, Value::Int(_) | Value::Float(_)),
-                "String" => matches!(value, Value::String(_)),
-                "Bool" => matches!(value, Value::Bool(_)),
-                "Null" => matches!(value, Value::Null),
-                "List" => self.check_list(value, expected, scope, range, visited, depth)?,
-                "Dict" => self.check_dict(value, expected, scope, range, visited, depth)?,
-                "Closure" | "Fn" => matches!(value, Value::Closure { .. }),
-                "Enum" => self.check_enum(value, expected, scope, range, visited, depth)?,
-                _ => self.check_custom_schema(
-                    value,
-                    expected,
-                    scope,
-                    range,
-                    visited,
-                    depth + 1,
-                )?,
-            }
-        } else {
-            self.check_custom_schema(value, expected, scope, range, visited, depth + 1)?
-        };
-
-        if !matches {
-            return Err(RuntimeError::TypeMismatch {
-                expected: expected_str,
-                found: value.type_name().to_string(),
-                range,
-            });
-        }
-        Ok(())
-    }
-
-    fn check_list(
-        &self,
-        value: &mut Value,
-        expected: &TypeNode,
-        scope: &Arc<Scope>,
-        range: TokenRange,
-        visited: &mut HashSet<(String, *const Value)>,
-        depth: usize,
-    ) -> Result<bool, RuntimeError> {
-        let Value::List(l) = value else {
-            return Ok(false);
-        };
-        if let Some(generic) = expected.generics.first() {
-            for item in Arc::make_mut(l).iter_mut() {
-                self.check_type_internal(item, generic, scope, range, visited, depth + 1)?;
-            }
-        }
-        Ok(true)
-    }
-
-    fn check_dict(
-        &self,
-        value: &mut Value,
-        expected: &TypeNode,
-        scope: &Arc<Scope>,
-        range: TokenRange,
-        visited: &mut HashSet<(String, *const Value)>,
-        depth: usize,
-    ) -> Result<bool, RuntimeError> {
-        let Value::Dict(d) = value else {
-            return Ok(false);
-        };
-        if expected.generics.len() == 2 {
-            let val_type = &expected.generics[1];
-            for val in Arc::make_mut(d).map.values_mut() {
-                self.check_type_internal(val, val_type, scope, range, visited, depth + 1)?;
-            }
-        }
-        Ok(true)
-    }
-
-    fn check_enum(
-        &self,
-        value: &mut Value,
-        expected: &TypeNode,
-        scope: &Arc<Scope>,
-        range: TokenRange,
-        visited: &mut HashSet<(String, *const Value)>,
-        depth: usize,
-    ) -> Result<bool, RuntimeError> {
-        for choice in &expected.generics {
-            let mut temp = value.clone();
-            if self
-                .check_type_internal(&mut temp, choice, scope, range, visited, depth + 1)
-                .is_ok()
-            {
-                return Ok(true);
-            }
-            if let Value::String(s) = value {
-                if choice.path.len() == 1 && choice.path[0] == *s {
-                    return Ok(true);
+        let type_name = type_hint.path.join(".");
+        if is_builtin_type_name(&type_name) {
+            match (type_name.as_str(), value) {
+                ("Any", _) => Ok(()),
+                ("Int", Value::Int(_)) => Ok(()),
+                ("Float", Value::Float(_)) => Ok(()),
+                ("Number", Value::Int(_)) | ("Number", Value::Float(_)) => Ok(()),
+                ("String", Value::String(_)) => Ok(()),
+                ("Bool", Value::Bool(_)) => Ok(()),
+                ("List", Value::List(l)) => {
+                    if let Some(item_type) = type_hint.generics.first() {
+                        let l_mut = Arc::make_mut(l);
+                        for item in l_mut.iter_mut() {
+                            self.check_type_internal(
+                                item,
+                                item_type,
+                                scope,
+                                range,
+                                visited,
+                                depth + 1,
+                            )?;
+                        }
+                    }
+                    Ok(())
                 }
-            }
+                ("Dict", Value::Dict(d)) => {
+                    if type_hint.generics.len() == 2 {
+                        let val_type = &type_hint.generics[1];
+                        let d_mut = Arc::make_mut(d);
+                        for val in d_mut.map.values_mut() {
+                            self.check_type_internal(
+                                val,
+                                val_type,
+                                scope,
+                                range,
+                                visited,
+                                depth + 1,
+                            )?;
+                        }
+                    }
+                    Ok(())
+                }
+                ("Enum", val) => {
+                    // Two-pass match: cheap literal/primitive matchers
+                    // first (no clone), then structural alternatives
+                    // (clone-and-recurse).
+                    let mut matched = false;
+                    for alt in &type_hint.generics {
+                        if Self::enum_alt_matches_cheaply(alt, val) {
+                            matched = true;
+                            break;
+                        }
+                    }
+                    if !matched {
+                        for alt in &type_hint.generics {
+                            // Skip alts already ruled out by the cheap pass.
+                            if Self::is_cheap_enum_alt(alt) {
+                                continue;
+                            }
+                            let mut temp_val = val.clone();
+                            if self
+                                .check_type_internal(
+                                    &mut temp_val,
+                                    alt,
+                                    scope,
+                                    range,
+                                    visited,
+                                    depth + 1,
+                                )
+                                .is_ok()
+                            {
+                                matched = true;
+                                break;
+                            }
+                        }
+                    }
+                    if matched {
+                        Ok(())
+                    } else {
+                        let alts: Vec<String> =
+                            type_hint.generics.iter().map(format_type_node).collect();
+                        Err(RuntimeError::TypeMismatch {
+                            expected: format!("one of [{}]", alts.join(", ")),
+                            found: val.to_string(),
+                            range,
+                        })
+                    }
+                }
+                (expected, found_val) => Err(RuntimeError::TypeMismatch {
+                    expected: expected.to_string(),
+                    found: found_val.type_name().to_string(),
+                    range,
+                }),
+            }?;
+            return Ok(());
         }
-        Ok(false)
-    }
 
-    pub(crate) fn check_custom_schema(
-        &self,
-        value: &mut Value,
-        expected: &TypeNode,
-        scope: &Arc<Scope>,
-        range: TokenRange,
-        visited: &mut HashSet<(String, *const Value)>,
-        depth: usize,
-    ) -> Result<bool, RuntimeError> {
-        let path = &expected.path;
-        let mut current_val = scope
+        // Custom Schema lookup. The first path segment is resolved against
+        // local scope or BrandRegistry; subsequent segments dive into nested
+        // dicts (e.g. `geo.Location` → `scope.geo.Location`).
+        let path = &type_hint.path;
+        let mut schema_val = scope
             .get_local(&path[0])
             .or_else(|| self.context.schemas.get(&path[0]).cloned())
             .ok_or_else(|| RuntimeError::VariableNotFound(path[0].clone(), range))?;
-
         for part in &path[1..] {
-            match current_val {
-                Value::Dict(d) => {
-                    current_val = d.map.get(part).cloned().ok_or_else(|| {
-                        RuntimeError::VariableNotFound(format!("{}.{part}", path[0]), range)
-                    })?;
+            schema_val = match schema_val {
+                Value::Dict(d) => d.map.get(part).cloned().ok_or_else(|| {
+                    RuntimeError::VariableNotFound(type_name.clone(), range)
+                })?,
+                _ => {
+                    return Err(RuntimeError::VariableNotFound(type_name.clone(), range));
                 }
-                _ => return Ok(false),
-            }
+            };
         }
 
-        match current_val {
+        match schema_val {
             Value::Schema { generics, fields } => {
-                // Instantiate the schema with the provided generic arguments.
-                let mut instantiated_fields = fields;
-                if !generics.is_empty() && !expected.generics.is_empty() {
-                    if generics.len() != expected.generics.len() {
-                        return Err(RuntimeError::TypeMismatch {
-                            expected: format!("{} type arguments", generics.len()),
-                            found: format!("{} type arguments", expected.generics.len()),
-                            range,
-                        });
+                let mut subst_map = HashMap::new();
+                for (i, gname) in generics.iter().enumerate() {
+                    if let Some(gtype) = type_hint.generics.get(i) {
+                        subst_map.insert(gname.clone(), gtype.clone());
                     }
-                    // Simple substitution: build a mapping from generic param name to the provided type arg
-                    let subst_map: HashMap<String, TypeNode> = generics
-                        .iter()
-                        .cloned()
-                        .zip(expected.generics.iter().cloned())
-                        .collect();
+                }
+                let resolved_fields = if subst_map.is_empty() {
+                    fields
+                } else {
+                    Self::substitute_generics_in_schema(fields, &subst_map)
+                };
 
-                    instantiated_fields =
-                        self.substitute_generics_in_schema(instantiated_fields, &subst_map);
+                let ptr = value as *const Value;
+                if !visited.insert((type_name, ptr)) {
+                    return Ok(());
                 }
 
-                self.apply_schema(instantiated_fields, value, scope, range, visited, depth)
+                self.apply_schema(resolved_fields, value, scope, range, visited, depth + 1)?;
+                Ok(())
             }
-            Value::Type(t) => {
-                if t.path == *path {
-                    return Ok(false);
+            Value::EnumSchema { variants, .. } => {
+                let variant_name = match value {
+                    Value::Dict(d) => d.brand.clone(),
+                    _ => {
+                        return Err(RuntimeError::TypeMismatch {
+                            expected: format!("a variant of enum {type_name}"),
+                            found: value.type_name().to_string(),
+                            range,
+                        })
+                    }
+                };
+                let variant_name = variant_name.ok_or_else(|| RuntimeError::TypeMismatch {
+                    expected: format!("branded variant of {type_name}"),
+                    found: "plain dict".to_string(),
+                    range,
+                })?;
+                let fields = variants.get(&variant_name).ok_or_else(|| {
+                    RuntimeError::TypeMismatch {
+                        expected: format!("valid variant of {type_name}"),
+                        found: variant_name.clone(),
+                        range,
+                    }
+                })?;
+
+                let ptr = value as *const Value;
+                if !visited.insert((type_name, ptr)) {
+                    return Ok(());
                 }
-                self.check_type_internal(value, &t, scope, range, visited, depth)
-                    .map(|_| true)
+
+                let mut fields_map = HashMap::new();
+                for (name, field_def) in fields {
+                    fields_map.insert(name.clone(), field_def.clone());
+                }
+                self.apply_schema(fields_map, value, scope, range, visited, depth + 1)?;
+                Ok(())
             }
-            _ => Ok(false),
+            _ => Err(RuntimeError::TypeMismatch {
+                expected: "Schema".to_string(),
+                found: schema_val.type_name().to_string(),
+                range,
+            }),
         }
     }
 
+    /// True if `alt` is matchable without cloning: a string-literal
+    /// alternative (quoted or bareword) or a single-segment built-in
+    /// type name with no generics. Bareword non-builtins are treated as
+    /// candidate string literals — they could still resolve to a custom
+    /// schema in a later pass, but the cheap pre-check is allowed to
+    /// pre-empt that with a `Value::String` match.
+    fn is_cheap_enum_alt(alt: &TypeNode) -> bool {
+        alt.path.len() == 1 && alt.generics.is_empty() && !alt.is_optional
+    }
+
+    /// Cheap, no-clone match for an enum alternative against `val`.
+    /// Returns `true` only if the alt definitively matches; complex
+    /// alts (custom schemas, generics, optionals) fall through to the
+    /// structural pass.
+    fn enum_alt_matches_cheaply(alt: &TypeNode, val: &Value) -> bool {
+        if !Self::is_cheap_enum_alt(alt) {
+            return false;
+        }
+        let p = &alt.path[0];
+        // Built-in primitive / collection check.
+        let prim_match = match (p.as_str(), val) {
+            ("Any", _) => Some(true),
+            ("Null", Value::Null) => Some(true),
+            ("Int", Value::Int(_)) => Some(true),
+            ("Float", Value::Float(_)) => Some(true),
+            ("Number", Value::Int(_) | Value::Float(_)) => Some(true),
+            ("String", Value::String(_)) => Some(true),
+            ("Bool", Value::Bool(_)) => Some(true),
+            ("List", Value::List(_)) => Some(true),
+            ("Dict", Value::Dict(_)) => Some(true),
+            ("Closure" | "Fn", Value::Closure { .. }) => Some(true),
+            _ if is_builtin_type_name(p) => Some(false),
+            _ => None,
+        };
+        if let Some(m) = prim_match {
+            return m;
+        }
+        // Bareword or quoted string literal alternative — match the
+        // cleaned form against the string value.
+        let clean = if Self::is_quoted_string_literal(p) {
+            &p[1..p.len() - 1]
+        } else {
+            p.as_str()
+        };
+        matches!(val, Value::String(s) if s == clean)
+    }
+
+    fn is_quoted_string_literal(p: &str) -> bool {
+        (p.starts_with('"') && p.ends_with('"') && p.len() >= 2)
+            || (p.starts_with('\'') && p.ends_with('\'') && p.len() >= 2)
+    }
+
     fn substitute_generics_in_schema(
-        &self,
         mut fields: HashMap<String, SchemaField>,
         subst_map: &HashMap<String, TypeNode>,
     ) -> HashMap<String, SchemaField> {
         for field in fields.values_mut() {
-            self.substitute_generics_in_type(&mut field.type_hint, subst_map);
+            Self::substitute_generics_in_type(&mut field.type_hint, subst_map);
         }
         fields
     }
 
-    fn substitute_generics_in_type(
-        &self,
-        t: &mut TypeNode,
-        subst_map: &HashMap<String, TypeNode>,
-    ) {
+    fn substitute_generics_in_type(t: &mut TypeNode, subst_map: &HashMap<String, TypeNode>) {
         if t.path.len() == 1 && t.generics.is_empty() {
             if let Some(replacement) = subst_map.get(&t.path[0]) {
-                // Replace the type node entirely, but keep the optional flag if it was set
                 let is_optional = t.is_optional || replacement.is_optional;
                 *t = replacement.clone();
                 t.is_optional = is_optional;
@@ -278,7 +290,7 @@ impl<'a> Evaluator<'a> {
             }
         }
         for generic in &mut t.generics {
-            self.substitute_generics_in_type(generic, subst_map);
+            Self::substitute_generics_in_type(generic, subst_map);
         }
     }
 
@@ -306,10 +318,6 @@ impl<'a> Evaluator<'a> {
                     visited,
                     depth,
                 )?;
-                // AND-evaluate every closure predicate; the first failing one
-                // short-circuits with `custom_error` (or a generic message).
-                // Non-closure predicates (e.g. `Wildcard` from `Type field: *`)
-                // are skipped.
                 for predicate in &field.predicates {
                     if !matches!(predicate, Value::Closure { .. }) {
                         continue;
@@ -334,10 +342,6 @@ impl<'a> Evaluator<'a> {
                 }
             } else if let Some(ref def) = field.default_value {
                 if matches!(def, Value::Closure { .. }) {
-                    // Computed default: defer to a second pass so the closure
-                    // sees explicit + literal-default fields via `self`.
-                    // Closure defaults do not observe each other — semantics
-                    // stay independent of HashMap iteration order.
                     deferred_closures.push((field_name.clone(), def.clone()));
                 } else {
                     d.map.insert(field_name.clone(), def.clone());
@@ -367,17 +371,6 @@ impl<'a> Evaluator<'a> {
         Ok(true)
     }
 
-    /// Fold a literal-dict AST into an existing schema as the RHS of
-    /// `Schema + Dict`.
-    ///
-    /// Each pair contributes either a typed-field definition (when its
-    /// `value_node` carries a `type_hint` or a closure predicate) or a
-    /// default-value patch (literal value with no type info). Pure-default
-    /// patches preserve the LHS's type/predicate info; typed entries
-    /// AND-merge predicates and replace the type hint via
-    /// [`merge_schema_fields`]. New keys not in the LHS are added either way:
-    /// typed entries become full schema fields, literal entries become
-    /// `Any`-typed fields whose `default_value` carries the literal.
     pub(crate) fn merge_schema_with_dict_pairs(
         &self,
         mut base_fields: HashMap<String, SchemaField>,
@@ -389,9 +382,6 @@ impl<'a> Evaluator<'a> {
                 continue;
             };
 
-            // Decide which shape this pair is. Type hint or predicate-shaped
-            // body → schema definition. Anything else (string, int, dict
-            // literal, reference, ...) → default-value patch.
             let is_field_shape = value_node.type_hint.is_some()
                 || matches!(value_node.expr.as_ref(), Expr::Closure { .. });
 
@@ -450,13 +440,6 @@ impl<'a> Evaluator<'a> {
         Ok(base_fields)
     }
 
-    /// Convert an analyzer-produced [`SchemaDef`] into the runtime
-    /// `HashMap<String, SchemaField>` form. This is the fast-path used
-    /// when `Context::analyzed.schema(node.id)` hits — the analyzer has
-    /// already split the body into typed fields, so we only do what
-    /// genuinely requires the live scope: instantiate predicate
-    /// closures, resolve base schemas via reference, and run
-    /// per-decorator `schema_field_meta` hooks.
     pub fn build_schema_from_def(
         &self,
         def: &SchemaDef,
@@ -465,7 +448,11 @@ impl<'a> Evaluator<'a> {
         let mut fields: HashMap<String, SchemaField> = HashMap::new();
         for base in &def.bases {
             let base_value = self.eval_internal(&base.node, scope, false)?;
-            let Value::Schema { fields: base_fields, .. } = base_value else {
+            let Value::Schema {
+                fields: base_fields,
+                ..
+            } = base_value
+            else {
                 return Err(RuntimeError::TypeMismatch {
                     expected: "Schema".to_string(),
                     found: base_value.type_name().to_string(),
@@ -480,17 +467,6 @@ impl<'a> Evaluator<'a> {
         Ok(fields)
     }
 
-    /// Apply a single `SchemaFieldDef` to the in-progress field map.
-    ///
-    /// Two shapes are supported:
-    ///
-    /// * **Field definition** — has a static type hint or a closure
-    ///   predicate. AND-merges into any existing field of the same
-    ///   name and overrides type_hint / decorator-supplied metadata.
-    /// * **Default-only patch** — a plain literal value with no type
-    ///   prefix and no closure predicate. Used in `Base + { x: "v" }`
-    ///   to override the default of `x` (or, if `x` doesn't exist,
-    ///   add a permissive `Any`-typed default-only field).
     fn apply_field_def(
         &self,
         def: &SchemaFieldDef,
@@ -504,13 +480,6 @@ impl<'a> Evaluator<'a> {
             || matches!(value_node.expr.as_ref(), relon_parser::Expr::Variable(_));
 
         if is_field_shape {
-            // Fast path: a `SchemaFieldDef::type_hint` synthesized by the
-            // analyzer (e.g. lifted from `@brand(X)`) won't be reflected on
-            // the underlying `value_node.type_hint`, so a `Wildcard` value
-            // would fail the `Type or Type Prefix` check inside
-            // `extract_field_type_and_predicate`. Short-circuit here: if
-            // we already have an authoritative type hint and the value is
-            // just `*`, the predicate is trivially a wildcard.
             let (type_node, predicate) = if def.type_hint.is_some()
                 && matches!(value_node.expr.as_ref(), relon_parser::Expr::Wildcard)
             {
@@ -540,9 +509,6 @@ impl<'a> Evaluator<'a> {
             single.insert(def.name.clone(), field);
             merge_schema_fields(fields, single);
         } else {
-            // Default-only patch: literal value, no type info. Evaluate
-            // and either fold into an existing field or create a new
-            // `Any`-typed default-only field.
             let val = self.eval_internal(value_node, scope, false)?;
             match fields.get_mut(&def.name) {
                 Some(existing) => {
@@ -607,9 +573,6 @@ impl<'a> Evaluator<'a> {
     }
 }
 
-/// AND-merge `patch` into `base`: predicates accumulate (Wildcards skipped),
-/// type hints get replaced, and `custom_error` / `default_value` are
-/// overridden only when the patch supplies them.
 pub(crate) fn merge_schema_fields(
     base: &mut HashMap<String, SchemaField>,
     patch: HashMap<String, SchemaField>,
@@ -635,4 +598,23 @@ pub(crate) fn merge_schema_fields(
             }
         }
     }
+}
+
+pub fn format_type_node(t: &TypeNode) -> String {
+    let mut s = t.path.join(".");
+    if !t.generics.is_empty() {
+        s.push('<');
+        s.push_str(
+            &t.generics
+                .iter()
+                .map(format_type_node)
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+        s.push('>');
+    }
+    if t.is_optional {
+        s.push('?');
+    }
+    s
 }

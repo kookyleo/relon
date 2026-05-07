@@ -5,10 +5,46 @@ use crate::value::{Value, ValueDict};
 use std::sync::Arc;
 
 pub fn register_to(ctx: &mut Context) {
-    ctx.register_fn("len", Arc::new(Len));
+    // Language-level builtins — always in scope, no `@import` required.
+    // See `docs/zh/guide/spec.md` §6.1: these are metadata operations
+    // on data structures themselves, not std-module members.
+    let len: Arc<dyn RelonFunction> = Arc::new(Len);
+    ctx.register_fn("len", Arc::clone(&len));
+    ctx.register_fn("_len", len);
     ctx.register_fn("range", Arc::new(Range));
     ctx.register_fn("type", Arc::new(Type));
 
+    // Underscore intrinsics — the only Rust-side names in the
+    // `std/<module>` namespace. `crates/relon-evaluator/src/std_relon/*.relon`
+    // wraps them as the user-facing API; scripts reach the wrappers
+    // via `@import("std/<module>", as=...)`. There is no top-level
+    // `string.split` / `dict.merge` / ... — that would be a
+    // runtime-private global, which the spec forbids (§1.1, §6).
+    ctx.register_fn("_list_map", Arc::new(ListMap));
+    ctx.register_fn("_list_filter", Arc::new(ListFilter));
+    ctx.register_fn("_list_reduce", Arc::new(ListReduce));
+    ctx.register_fn("_list_contains", Arc::new(ListContains));
+
+    ctx.register_fn("_string_split", Arc::new(StringSplit));
+    ctx.register_fn("_string_join", Arc::new(StringJoin));
+    ctx.register_fn("_string_replace", Arc::new(StringReplace));
+    ctx.register_fn("_string_upper", Arc::new(StringUpper));
+    ctx.register_fn("_string_lower", Arc::new(StringLower));
+    ctx.register_fn("_string_contains", Arc::new(StringContains));
+
+    ctx.register_fn("_dict_merge", Arc::new(DictMerge));
+    ctx.register_fn("_dict_keys", Arc::new(DictKeys));
+    ctx.register_fn("_dict_values", Arc::new(DictValues));
+    ctx.register_fn("_dict_has_key", Arc::new(DictHasKey));
+
+    ctx.register_fn("_math_abs", Arc::new(MathAbs));
+    ctx.register_fn("_math_max", Arc::new(MathMax));
+    ctx.register_fn("_math_min", Arc::new(MathMin));
+    ctx.register_fn("_math_clamp", Arc::new(MathClamp));
+
+    // Schema-machinery validators. Spec §6.3 mandates these exist with
+    // the documented semantics; they're consumed by the `@schema`
+    // decorator, not by user-facing scripts directly.
     ctx.register_fn("ensure.int", Arc::new(ValidatorInt));
     ctx.register_fn("ensure.string", Arc::new(ValidatorString));
     ctx.register_fn("ensure.bool", Arc::new(ValidatorBool));
@@ -21,20 +57,104 @@ pub fn register_to(ctx: &mut Context) {
     ctx.register_fn("ensure.required_fields", Arc::new(RequiredFields));
     ctx.register_fn("ensure.requires", Arc::new(Requires));
     ctx.register_fn("ensure.fields_equal", Arc::new(FieldEq));
+}
 
-    ctx.register_fn("string.split", Arc::new(StringSplit));
-    ctx.register_fn("string.join", Arc::new(StringJoin));
-    ctx.register_fn("string.replace", Arc::new(StringReplace));
-    ctx.register_fn("string.upper", Arc::new(StringUpper));
-    ctx.register_fn("string.lower", Arc::new(StringLower));
-    ctx.register_fn("string.contains", Arc::new(StringContains));
+struct ListMap;
+impl RelonFunction for ListMap {
+    fn call(&self, args: NativeArgs, range: relon_parser::TokenRange) -> Result<Value, RuntimeError> {
+        expect_arg_count(&args.positional, 2, range)?;
+        let list = expect_list(&args.positional[0], range)?;
+        let func = &args.positional[1];
+        let caps = args.caps();
+        let mut results = Vec::with_capacity(list.len());
+        for item in list {
+            results.push(caps.call_relon(func, vec![item.clone()], range)?);
+        }
+        Ok(Value::list(results))
+    }
+}
 
-    ctx.register_fn("dict.merge", Arc::new(DictMerge));
-    ctx.register_fn("dict.keys", Arc::new(DictKeys));
-    ctx.register_fn("dict.values", Arc::new(DictValues));
-    ctx.register_fn("dict.has_key", Arc::new(DictHasKey));
+struct ListFilter;
+impl RelonFunction for ListFilter {
+    fn call(&self, args: NativeArgs, range: relon_parser::TokenRange) -> Result<Value, RuntimeError> {
+        expect_arg_count(&args.positional, 2, range)?;
+        let list = expect_list(&args.positional[0], range)?;
+        let func = &args.positional[1];
+        let caps = args.caps();
+        let mut results = Vec::new();
+        for item in list {
+            if caps.call_relon(func, vec![item.clone()], range)?.is_truthy() {
+                results.push(item.clone());
+            }
+        }
+        Ok(Value::list(results))
+    }
+}
 
-    ctx.register_fn("list.contains", Arc::new(ListContains));
+struct ListReduce;
+impl RelonFunction for ListReduce {
+    fn call(&self, args: NativeArgs, range: relon_parser::TokenRange) -> Result<Value, RuntimeError> {
+        expect_arg_count(&args.positional, 3, range)?;
+        let list = expect_list(&args.positional[0], range)?;
+        let mut acc = args.positional[1].clone();
+        let func = &args.positional[2];
+        let caps = args.caps();
+        for item in list {
+            acc = caps.call_relon(func, vec![acc, item.clone()], range)?;
+        }
+        Ok(acc)
+    }
+}
+
+struct MathAbs;
+impl RelonFunction for MathAbs {
+    fn call(&self, args: NativeArgs, range: relon_parser::TokenRange) -> Result<Value, RuntimeError> {
+        let args = args.into_positional();
+        expect_arg_count(&args, 1, range)?;
+        match &args[0] {
+            Value::Int(n) => Ok(Value::Int(n.abs())),
+            Value::Float(f) => Ok(Value::Float(f.abs().into())),
+            other => Err(RuntimeError::TypeMismatch { expected: "Number".to_string(), found: other.type_name().to_string(), range }),
+        }
+    }
+}
+
+fn to_f64_val(v: &Value) -> f64 {
+    match v {
+        Value::Int(n) => *n as f64,
+        Value::Float(f) => f.0,
+        _ => 0.0,
+    }
+}
+
+struct MathMax;
+impl RelonFunction for MathMax {
+    fn call(&self, args: NativeArgs, range: relon_parser::TokenRange) -> Result<Value, RuntimeError> {
+        let args = args.into_positional();
+        expect_arg_count(&args, 2, range)?;
+        Ok(if to_f64_val(&args[0]) > to_f64_val(&args[1]) { args[0].clone() } else { args[1].clone() })
+    }
+}
+
+struct MathMin;
+impl RelonFunction for MathMin {
+    fn call(&self, args: NativeArgs, range: relon_parser::TokenRange) -> Result<Value, RuntimeError> {
+        let args = args.into_positional();
+        expect_arg_count(&args, 2, range)?;
+        Ok(if to_f64_val(&args[0]) < to_f64_val(&args[1]) { args[0].clone() } else { args[1].clone() })
+    }
+}
+
+struct MathClamp;
+impl RelonFunction for MathClamp {
+    fn call(&self, args: NativeArgs, range: relon_parser::TokenRange) -> Result<Value, RuntimeError> {
+        let args = args.into_positional();
+        expect_arg_count(&args, 3, range)?;
+        let val = to_f64_val(&args[0]);
+        let min = to_f64_val(&args[1]);
+        let max = to_f64_val(&args[2]);
+        Ok(if val < min { args[1].clone() } else if val > max { args[2].clone() } else { args[0].clone() })
+    }
 }
 
 struct Len;
@@ -45,13 +165,7 @@ impl RelonFunction for Len {
         range: relon_parser::TokenRange,
     ) -> Result<Value, RuntimeError> {
         let args = args.into_positional();
-        if args.len() != 1 {
-            return Err(RuntimeError::TypeMismatch {
-                expected: "1 argument".to_string(),
-                found: format!("{}", args.len()),
-                range,
-            });
-        }
+        expect_arg_count(&args, 1, range)?;
         match &args[0] {
             Value::String(s) => Ok(Value::Int(s.len() as i64)),
             Value::List(l) => Ok(Value::Int(l.len() as i64)),
@@ -107,13 +221,7 @@ impl RelonFunction for Type {
         range: relon_parser::TokenRange,
     ) -> Result<Value, RuntimeError> {
         let args = args.into_positional();
-        if args.len() != 1 {
-            return Err(RuntimeError::TypeMismatch {
-                expected: "1 arg".to_string(),
-                found: args.len().to_string(),
-                range,
-            });
-        }
+        expect_arg_count(&args, 1, range)?;
         Ok(Value::String(args[0].type_name().to_string()))
     }
 }
@@ -431,7 +539,7 @@ impl RelonFunction for StringJoin {
         let separator = expect_string(&args[1], range)?;
         let mut parts = Vec::with_capacity(values.len());
         for value in values {
-            parts.push(expect_string(value, range)?.to_string());
+            parts.push(format!("{}", value));
         }
         Ok(Value::String(parts.join(separator)))
     }

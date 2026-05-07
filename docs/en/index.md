@@ -3,8 +3,8 @@ layout: home
 
 hero:
   name: "Relon"
-  text: "Build typed business-config DSLs on top of JSON"
-  tagline: "A Rust-embeddable toolkit for typed business-config DSLs. Platform teams define schemas, decorators, and native functions; business teams compose them in JSON-shaped configs that compile to plain JSON. From JSON-like, to JSON, for JSON."
+  text: "Logic as portable data"
+  tagline: "Write the business rule once. Store it like JSON, ship it like JSON, evaluate it identically on any conformant runtime — Go, TypeScript, Swift, browser-WASM, Rust. The reference runtime in this repo is Rust; the spec is runtime-agnostic and deterministic by construction."
   image:
     src: /logo.svg
     alt: Relon
@@ -17,14 +17,14 @@ hero:
       link: https://github.com/kookyleo/relon
 
 features:
-  - title: Two-tier authoring
-    details: "Platform teams ship schemas, decorators, native functions, and `.relon` libraries. Business teams write thin entry configs that compose them. The `@library` marker enforces the split at the language level — library files refuse to be evaluated as entries."
-  - title: Typed business schemas
-    details: "Sum-type tagged enums, recursive schemas, `@expect` for custom validation messages, and required / optional / literal-default / computed-default fields all coexist. Domain contracts no longer have to decay into loose dicts."
-  - title: Sandboxed by default
-    details: "`Capabilities` gate filesystem reads, evaluation step budgets, value-size watermarks, and native-function allowlists. `Context::sandboxed()` rejects everything until the host opts in — safe defaults for untrusted scripts."
-  - title: A JSON closed loop
-    details: "From JSON-like, to JSON, for JSON. Input syntax sits next to JSON; output is always plain JSON. The `Projector` trait lets you tune the output shape (e.g. sum-type encoding) but the destination is always JSON."
+  - title: Deterministic across runtimes
+    details: "Same source + same input → byte-identical output. Dict iteration is `BTreeMap`-ordered, floats are IEEE-754 `f64`, environment is opaque to the script. Logic stored in your database evaluates the same in every runtime that consumes it."
+  - title: Sandboxed by default — no escape hatch
+    details: "Scripts hold zero ambient privileges. `Capabilities` explicitly grant filesystem reads, step budgets, value-size watermarks, and per-function allowlists. There is no \"trusted mode\" the script can fall back to without the host's consent."
+  - title: Self-describing type contracts
+    details: "`@schema`, sum-type tagged enums, recursive schemas, branded values, computed defaults — type information travels with the payload. Receivers validate without out-of-band documentation."
+  - title: Context-aware references
+    details: "`&root`, `&sibling`, `&prev`, `&next` let logic reference its surrounding data declaratively, no hard-coded paths. Declarative references stay deterministic across runtimes."
 ---
 
 <RelonGallery />
