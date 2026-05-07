@@ -59,12 +59,35 @@ fn main() -> miette::Result<()> {
             // files the operator explicitly hands it, so it grants
             // every capability. The grant is written out so a code
             // reviewer can see what's being trusted.
-            let mut ctx = Context::sandboxed().with_root(node);
-            ctx.capabilities = Capabilities::all_granted();
-            ctx.prepend_module_resolver(Arc::new(FilesystemModuleResolver::trusted()));
+            //
+            // We also attach the analyzer side-table so root-level
+            // contracts (`@input(...)` slot list, `@library` flag,
+            // schema desugar fast-paths) reach the evaluator the same
+            // way they do through the high-level `relon::*` facade.
+            let analyzed = relon_analyzer::analyze(&node);
+            if analyzed.has_errors() {
+                let diags = analyzed
+                    .diagnostics
+                    .iter()
+                    .filter(|d| d.severity() == relon_analyzer::Severity::Error)
+                    .map(|d| d.to_string())
+                    .collect::<Vec<_>>()
+                    .join("\n  - ");
+                return Err(miette::miette!("Analyzer reported errors:\n  - {diags}")
+                    .with_source_code(NamedSource::new(file.to_string_lossy(), content)));
+            }
+            let analyzed = Arc::new(analyzed);
+            let ctx = {
+                let mut ctx = Context::sandboxed()
+                    .with_root(node)
+                    .with_analyzed(Arc::clone(&analyzed));
+                ctx.capabilities = Capabilities::all_granted();
+                ctx.prepend_module_resolver(Arc::new(FilesystemModuleResolver::trusted()));
+                Arc::new(ctx)
+            };
             let cache_namespace = canonical_file.to_string_lossy().to_string();
             let _root_loading_guard = ctx.enter_loading_module(cache_namespace.clone());
-            let evaluator = Evaluator::new(&ctx);
+            let evaluator = Evaluator::new(Arc::clone(&ctx));
 
             let mut root_scope = Scope::default();
             root_scope.current_dir = canonical_file

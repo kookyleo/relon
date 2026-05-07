@@ -26,7 +26,7 @@ pub(crate) enum ReferenceStep {
     Value(Box<Value>),
 }
 
-impl Evaluator<'_> {
+impl Evaluator {
     pub(crate) fn resolve_variable(
         &self,
         path: &[TokenKey],
@@ -45,8 +45,22 @@ impl Evaluator<'_> {
             val
         } else if let Some(thunk) = scope.get_thunk(&first_name) {
             self.force_thunk(&thunk)?
-        } else if let Some(val) = self.context.globals.get(&first_name) {
-            val.clone()
+        } else if first_name == crate::reserved::INPUT {
+            // Reserved root-level name: `eval_root` is responsible for
+            // validating `Context::input` and seeding it into the root
+            // scope's locals before walking the document. Reaching this
+            // branch means either (a) the host didn't push anything via
+            // `Context::with_input`, or (b) the script entered a scope
+            // that lost the seeding (only possible if a host bypasses
+            // `eval_root` and calls `eval` directly). Either way it's a
+            // hard error rather than a silent `null` so missing-input
+            // bugs surface immediately.
+            return Err(RuntimeError::VariableNotFound(
+                "input (no input value provided to Context — call \
+                 `Context::with_input(...)` before evaluating)"
+                    .to_string(),
+                range,
+            ));
         } else {
             return Err(RuntimeError::VariableNotFound(first_name, range));
         };
@@ -162,8 +176,9 @@ impl Evaluator<'_> {
             }
             RefBase::This => {
                 let root = scope
-                    .reference_root
-                    .as_deref()
+                    .root_ref
+                    .as_ref()
+                    .map(|r| r.node.as_ref())
                     .or(self.context.root_node.as_deref())
                     .ok_or_else(|| {
                         RuntimeError::VariableNotFound("No root for &this".to_string(), range)
@@ -174,8 +189,9 @@ impl Evaluator<'_> {
         }
 
         let root = scope
-            .reference_root
-            .as_deref()
+            .root_ref
+            .as_ref()
+            .map(|r| r.node.as_ref())
             .or(self.context.root_node.as_deref())
             .ok_or(RuntimeError::VariableNotFound("No root".to_string(), range))?;
         let mut target_path: Vec<TokenKey> = match base {
@@ -233,9 +249,9 @@ impl Evaluator<'_> {
         let mut target_scope = None;
         let mut current = Some(original_scope.clone());
         while let Some(scope) = current {
-            if let Some(ref_root) = &scope.reference_root {
-                if std::ptr::eq(ref_root.as_ref() as *const _, root as *const _) {
-                    if let Some(root_scope) = &scope.reference_root_scope {
+            if let Some(rr) = &scope.root_ref {
+                if std::ptr::eq(rr.node.as_ref() as *const _, root as *const _) {
+                    if let Some(root_scope) = &rr.scope {
                         target_scope = Some(root_scope.clone());
                         break;
                     }
@@ -245,15 +261,17 @@ impl Evaluator<'_> {
         }
 
         let root_scope = target_scope.unwrap_or_else(|| {
+            let parent = original_scope
+                .root_ref
+                .as_ref()
+                .and_then(|r| r.parent_fallback.clone());
             Arc::new(Scope {
-                parent: original_scope.reference_root_parent.clone(),
+                parent,
                 path_node: None,
                 locals: Mutex::new(HashMap::new()),
                 current_dir: original_scope.current_dir.clone(),
                 cache_namespace: original_scope.cache_namespace.clone(),
-                reference_root: original_scope.reference_root.clone(),
-                reference_root_parent: original_scope.reference_root_parent.clone(),
-                reference_root_scope: original_scope.reference_root_scope.clone(),
+                root_ref: original_scope.root_ref.clone(),
                 list_context: None,
                 thunks: Mutex::new(HashMap::new()),
             })

@@ -61,7 +61,11 @@ pub fn register_to(ctx: &mut Context) {
 
 struct ListMap;
 impl RelonFunction for ListMap {
-    fn call(&self, args: NativeArgs, range: relon_parser::TokenRange) -> Result<Value, RuntimeError> {
+    fn call(
+        &self,
+        args: NativeArgs,
+        range: relon_parser::TokenRange,
+    ) -> Result<Value, RuntimeError> {
         expect_arg_count(&args.positional, 2, range)?;
         let list = expect_list(&args.positional[0], range)?;
         let func = &args.positional[1];
@@ -76,14 +80,21 @@ impl RelonFunction for ListMap {
 
 struct ListFilter;
 impl RelonFunction for ListFilter {
-    fn call(&self, args: NativeArgs, range: relon_parser::TokenRange) -> Result<Value, RuntimeError> {
+    fn call(
+        &self,
+        args: NativeArgs,
+        range: relon_parser::TokenRange,
+    ) -> Result<Value, RuntimeError> {
         expect_arg_count(&args.positional, 2, range)?;
         let list = expect_list(&args.positional[0], range)?;
         let func = &args.positional[1];
         let caps = args.caps();
         let mut results = Vec::new();
         for item in list {
-            if caps.call_relon(func, vec![item.clone()], range)?.is_truthy() {
+            if caps
+                .call_relon(func, vec![item.clone()], range)?
+                .is_truthy()
+            {
                 results.push(item.clone());
             }
         }
@@ -93,7 +104,11 @@ impl RelonFunction for ListFilter {
 
 struct ListReduce;
 impl RelonFunction for ListReduce {
-    fn call(&self, args: NativeArgs, range: relon_parser::TokenRange) -> Result<Value, RuntimeError> {
+    fn call(
+        &self,
+        args: NativeArgs,
+        range: relon_parser::TokenRange,
+    ) -> Result<Value, RuntimeError> {
         expect_arg_count(&args.positional, 3, range)?;
         let list = expect_list(&args.positional[0], range)?;
         let mut acc = args.positional[1].clone();
@@ -108,13 +123,21 @@ impl RelonFunction for ListReduce {
 
 struct MathAbs;
 impl RelonFunction for MathAbs {
-    fn call(&self, args: NativeArgs, range: relon_parser::TokenRange) -> Result<Value, RuntimeError> {
+    fn call(
+        &self,
+        args: NativeArgs,
+        range: relon_parser::TokenRange,
+    ) -> Result<Value, RuntimeError> {
         let args = args.into_positional();
         expect_arg_count(&args, 1, range)?;
         match &args[0] {
             Value::Int(n) => Ok(Value::Int(n.abs())),
             Value::Float(f) => Ok(Value::Float(f.abs().into())),
-            other => Err(RuntimeError::TypeMismatch { expected: "Number".to_string(), found: other.type_name().to_string(), range }),
+            other => Err(RuntimeError::TypeMismatch {
+                expected: "Number".to_string(),
+                found: other.type_name().to_string(),
+                range,
+            }),
         }
     }
 }
@@ -129,31 +152,57 @@ fn to_f64_val(v: &Value) -> f64 {
 
 struct MathMax;
 impl RelonFunction for MathMax {
-    fn call(&self, args: NativeArgs, range: relon_parser::TokenRange) -> Result<Value, RuntimeError> {
+    fn call(
+        &self,
+        args: NativeArgs,
+        range: relon_parser::TokenRange,
+    ) -> Result<Value, RuntimeError> {
         let args = args.into_positional();
         expect_arg_count(&args, 2, range)?;
-        Ok(if to_f64_val(&args[0]) > to_f64_val(&args[1]) { args[0].clone() } else { args[1].clone() })
+        Ok(if to_f64_val(&args[0]) > to_f64_val(&args[1]) {
+            args[0].clone()
+        } else {
+            args[1].clone()
+        })
     }
 }
 
 struct MathMin;
 impl RelonFunction for MathMin {
-    fn call(&self, args: NativeArgs, range: relon_parser::TokenRange) -> Result<Value, RuntimeError> {
+    fn call(
+        &self,
+        args: NativeArgs,
+        range: relon_parser::TokenRange,
+    ) -> Result<Value, RuntimeError> {
         let args = args.into_positional();
         expect_arg_count(&args, 2, range)?;
-        Ok(if to_f64_val(&args[0]) < to_f64_val(&args[1]) { args[0].clone() } else { args[1].clone() })
+        Ok(if to_f64_val(&args[0]) < to_f64_val(&args[1]) {
+            args[0].clone()
+        } else {
+            args[1].clone()
+        })
     }
 }
 
 struct MathClamp;
 impl RelonFunction for MathClamp {
-    fn call(&self, args: NativeArgs, range: relon_parser::TokenRange) -> Result<Value, RuntimeError> {
+    fn call(
+        &self,
+        args: NativeArgs,
+        range: relon_parser::TokenRange,
+    ) -> Result<Value, RuntimeError> {
         let args = args.into_positional();
         expect_arg_count(&args, 3, range)?;
         let val = to_f64_val(&args[0]);
         let min = to_f64_val(&args[1]);
         let max = to_f64_val(&args[2]);
-        Ok(if val < min { args[1].clone() } else if val > max { args[2].clone() } else { args[0].clone() })
+        Ok(if val < min {
+            args[1].clone()
+        } else if val > max {
+            args[2].clone()
+        } else {
+            args[0].clone()
+        })
     }
 }
 

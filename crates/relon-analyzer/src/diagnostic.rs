@@ -145,6 +145,45 @@ pub enum Diagnostic {
         #[label("not a type")]
         range: SourceSpan,
     },
+
+    #[error("duplicate `@input(...)` slot name `{name}`")]
+    #[diagnostic(
+        code(relon::analyze::duplicate_input_name),
+        help(
+            "Each `@input(name=SchemaRef)` slot must have a unique name. Pick distinct names so the merged input wrapper has unambiguous fields."
+        )
+    )]
+    DuplicateInputName {
+        name: String,
+        #[label("first declared here")]
+        first: SourceSpan,
+        #[label("redeclared with the same name")]
+        second: SourceSpan,
+    },
+
+    #[error("`@input(...)` argument is missing a slot name")]
+    #[diagnostic(
+        code(relon::analyze::input_decorator_missing_name),
+        help(
+            "Use the `name=SchemaRef` form so each input slot has an explicit identifier in the merged wrapper, e.g. `@input(user=User)`."
+        )
+    )]
+    InputDecoratorMissingName {
+        #[label("expected `<name>=SchemaRef`")]
+        range: SourceSpan,
+    },
+
+    #[error("`@input` decorator declares no slots")]
+    #[diagnostic(
+        code(relon::analyze::input_decorator_empty),
+        help(
+            "Pass at least one `name=SchemaRef` argument, e.g. `@input(user=User)`. A bare `@input` has no effect."
+        )
+    )]
+    InputDecoratorEmpty {
+        #[label("no slots declared")]
+        range: SourceSpan,
+    },
 }
 
 impl Diagnostic {
@@ -158,7 +197,10 @@ impl Diagnostic {
             | Diagnostic::DuplicateMatchArm { .. }
             | Diagnostic::HeterogeneousEnum { .. }
             | Diagnostic::SchemaFieldBrandConflict { .. }
-            | Diagnostic::SchemaFieldBrandInvalidArg { .. } => Severity::Error,
+            | Diagnostic::SchemaFieldBrandInvalidArg { .. }
+            | Diagnostic::DuplicateInputName { .. }
+            | Diagnostic::InputDecoratorMissingName { .. }
+            | Diagnostic::InputDecoratorEmpty { .. } => Severity::Error,
             // Informational: the analyzer's view is conservative — a
             // spread, closure binding, or runtime-computed field may
             // still resolve, so we don't gate evaluation on it.

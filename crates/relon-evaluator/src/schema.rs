@@ -8,7 +8,7 @@ use relon_parser::{is_builtin_type_name, Expr, Node, TokenKey, TokenRange, TypeN
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-impl Evaluator<'_> {
+impl Evaluator {
     pub(crate) fn check_type(
         &self,
         value: &mut Value,
@@ -28,8 +28,16 @@ impl Evaluator<'_> {
         visited: &mut HashSet<(String, *const Value)>,
         depth: usize,
     ) -> Result<(), RuntimeError> {
-        if depth > 100 {
-            return Err(RuntimeError::StepLimitExceeded { limit: 100, range });
+        // Bail out before blowing the stack on a self-referential schema.
+        // This is a *recursion-depth* bound, distinct from the
+        // step-counter budget that gates overall evaluator work — see
+        // `RuntimeError::RecursionLimitExceeded` vs `StepLimitExceeded`.
+        const MAX_TYPE_CHECK_DEPTH: usize = 100;
+        if depth > MAX_TYPE_CHECK_DEPTH {
+            return Err(RuntimeError::RecursionLimitExceeded {
+                limit: MAX_TYPE_CHECK_DEPTH,
+                range,
+            });
         }
 
         if type_hint.is_optional && matches!(value, Value::Null) {
@@ -143,9 +151,11 @@ impl Evaluator<'_> {
             .ok_or_else(|| RuntimeError::VariableNotFound(path[0].clone(), range))?;
         for part in &path[1..] {
             schema_val = match schema_val {
-                Value::Dict(d) => d.map.get(part).cloned().ok_or_else(|| {
-                    RuntimeError::VariableNotFound(type_name.clone(), range)
-                })?,
+                Value::Dict(d) => d
+                    .map
+                    .get(part)
+                    .cloned()
+                    .ok_or_else(|| RuntimeError::VariableNotFound(type_name.clone(), range))?,
                 _ => {
                     return Err(RuntimeError::VariableNotFound(type_name.clone(), range));
                 }
@@ -190,13 +200,14 @@ impl Evaluator<'_> {
                     found: "plain dict".to_string(),
                     range,
                 })?;
-                let fields = variants.get(&variant_name).ok_or_else(|| {
-                    RuntimeError::TypeMismatch {
-                        expected: format!("valid variant of {type_name}"),
-                        found: variant_name.clone(),
-                        range,
-                    }
-                })?;
+                let fields =
+                    variants
+                        .get(&variant_name)
+                        .ok_or_else(|| RuntimeError::TypeMismatch {
+                            expected: format!("valid variant of {type_name}"),
+                            found: variant_name.clone(),
+                            range,
+                        })?;
 
                 let ptr = value as *const Value;
                 if !visited.insert((type_name, ptr)) {
@@ -294,7 +305,7 @@ impl Evaluator<'_> {
         }
     }
 
-    fn apply_schema(
+    pub(crate) fn apply_schema(
         &self,
         fields: HashMap<String, SchemaField>,
         value: &mut Value,

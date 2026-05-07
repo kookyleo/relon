@@ -27,6 +27,34 @@ input 组合：
 未明确指定的实现细节（比如内部缓存、线程模型、构建产物大小）由各
 runtime 自行决定，不影响 conformance。
 
+### 1.2 跨 runtime 一致性的兑现条件
+
+「同源 + 同输入 → 字节级一致」中的「输入」**特指显式 `Value` 树**
+——host 在求值前通过 `Context::with_input(value)` 注入的数据，脚本
+通过保留名 `input` 读取。
+
+Host 通过 `register_fn` 注入的 native fn 的**调用结果**不属于「输
+入」。因此：
+
+- **Push 形态**（host 求值前完成 I/O，把数据 materialize 成 `Value`
+  通过 `with_input` 注入；脚本可选地用 `@input` 装饰器声明契约）：
+  跨 runtime 一致性在本规范保障范围内。
+- **Pull 形态**（脚本求值期通过 native fn 拉外部数据）：脚本作者
+  **主动放弃**了跨 runtime 一致性——不同 host / 不同 runtime / 不同
+  时刻的网络与外部状态本就不同，spec 不要求也无法保证一致。
+
+详见 [host-integration.md §推荐范式：Push-by-default](./host-integration.md#推荐范式push-by-default)。
+
+### 1.3 保留根级名
+
+下列标识符是**保留根级名**，conformant runtime 在这些名字上必须实
+现 spec 规定的语义；脚本不得将它们用作 dict 字段名、闭包参数名、
+或 `where` 子句名：
+
+| 名字 | 语义 |
+|---|---|
+| `input` | 当前文件的 push-style 外部输入（见 §1.2）。引用形态 `input.foo.bar`。host 未推数据且文件无 `@input` 时读 `input.foo` 失败 (`VariableNotFound`)。 |
+
 ## 2. 决定性契约（Determinism Contract）
 
 为了保证 §1 的承重轴成立，所有 conformant runtime 必须遵守：
@@ -144,7 +172,8 @@ host 信任决策。
 | `ModuleParseError` | 模块文件解析失败 |
 | `IoError` | 真实 I/O 错误（被允许的 `reads_fs` 操作中发生）|
 | `CapabilityDenied` | 受 §4 拦截 |
-| `StepLimitExceeded` | 触发 `max_steps` |
+| `StepLimitExceeded` | 触发 `max_steps`（求值步数预算耗尽）|
+| `RecursionLimitExceeded` | 类型检查 / schema 验证递归深度超过运行时安全上限（与 `max_steps` 是不同维度的预算，hosts 不能通过调高 `max_steps` 缓解）|
 | `ValueTooLarge` | 触发 `max_value_bytes` |
 | `LibraryAsEntry` | 试图把 `@library` 文件当 host entry |
 | `UnsupportedOperator` | 无效操作或类型组合 |
@@ -185,6 +214,69 @@ host 信任决策。
 `ensure.string` 等）。这些是 schema 系统的实现细节，不暴露给脚本
 直接调用——但 conformant runtime 必须确保它们存在且按规范工作，
 否则 `@schema` 行为会发散。
+
+### 6.4 `@input(name=SchemaRef)` —— 程序输入契约
+
+`@input(...)` 是**根级装饰器**（装饰文件的根 dict），声明 host-pushed
+input 中的一个**命名 slot**。每个 slot 用 `name=SchemaRef` 形式给出：
+slot 名是 input wrapper 中的字段名，SchemaRef 是已声明的 `@schema`
+（本文件或 imported 的）。形态：
+
+```relon
+@input(req=Req)
+{
+    @schema Req: {
+        String name: *,
+        @default(0)
+        Int retries: *
+    },
+    greeting: f"hello ${input.req.name}, retries=${input.req.retries}"
+}
+```
+
+多个 slot 可以并列声明，runtime 自动合并成一个 wrapper schema
+`{ <slot1>: <schema1>, <slot2>: <schema2>, ... }`：
+
+```relon
+@input(user=User)
+@input(cart=Cart)
+{
+    @schema User: { String name: * },
+    @schema Cart: { Int total: * },
+    summary: f"${input.user.name} - ${input.cart.total}"
+}
+```
+
+**语义要求**（每个 conformant runtime 必须按此实现）：
+
+1. `@input(...)` 必须是**根级装饰器**（写在文件根 dict 之前）；装饰
+   字段或非根 dict 时无意义。
+2. 每个参数必须是 `name=SchemaRef` 形式：
+   - 缺 name（位置参数）→ `Analyze` 错误 `InputDecoratorMissingName`。
+   - 同一 slot name 被多次声明 → `Analyze` 错误 `DuplicateInputName`。
+   - 完全没参数（`@input`）→ `Analyze` 错误 `InputDecoratorEmpty`。
+3. 求值 `Context::with_input(value)` 注入的数据**前**，必须按合并后
+   的 wrapper schema 校验：
+   - host-pushed value 必须是 `Value::Dict`；否则 `TypeMismatch`。
+   - 每个声明的 slot 必须出现在 pushed dict 中；否则
+     `TypeMismatch`（`expected: input slot '<name>'`，`found: missing`）。
+   - 每个 slot 的值按对应 SchemaRef 求值出的 `Value::Schema` 校验：
+     字段类型不匹配 / 缺必填字段 → `TypeMismatch`；带 `@default(...)`
+     的字段 host 未推时用默认值填充。
+4. 校验后的 input 树绑定到保留根级名 `input`（§1.3），脚本通过
+   `input.<slot>.<field>` 访问。
+5. 文件**没有 `@input(...)`** 时，`with_input` 推入的数据按原样绑定
+   到 `input`，不做 schema 校验；脚本读 `input.foo` 时若数据缺字段
+   则退化为运行时 `VariableNotFound`。
+6. **跨文件 `@input` 聚合**（即 lib 中的 `@input(...)` 也参与 entry
+   的总契约）暂不在 v1 范围内——v1 只校验 entry 文件的
+   `@input(...)`。lib 中的 `@input(...)` 当前由 evaluator 视作识别
+   到的根装饰器但不参与 host input 校验；建议 lib 只导出 `@schema`，
+   由 entry 通过 `@input(slot=lib.Schema)` 引用。
+
+`@input(...)` 把「外部数据契约」写进 .relon 源码而非 host 端，使任何
+conformant runtime 看同一份脚本都按相同 schema 校验——这是 §1.2 跨
+runtime 一致性兑现的关键拼图。
 
 ## 7. Host 可注册扩展的边界
 

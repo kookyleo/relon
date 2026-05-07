@@ -13,3 +13,4 @@ pub(crate) const VALUE: &str = "value";
 pub(crate) const MSG: &str = "msg";
 pub(crate) const ERROR: &str = "error";
 pub(crate) const BRAND: &str = "brand";
+pub(crate) const INPUT: &str = "input";

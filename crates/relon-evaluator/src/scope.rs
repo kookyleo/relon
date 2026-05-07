@@ -16,6 +16,43 @@ pub struct ListContext {
     pub elements: Vec<Arc<Thunk>>,
 }
 
+/// Anchor for `&root` lookups in a [`Scope`].
+///
+/// The three fields move as a unit because they all describe one root —
+/// previously they lived as three loose `Option<Arc<…>>` fields on `Scope`
+/// (`reference_root` / `reference_root_scope` / `reference_root_parent`)
+/// whose relationship was only documented in prose. Bundling them here
+/// makes the invariant structural: `node` is always present once a root
+/// is set, and the synthesized-vs-pinned distinction is encoded in
+/// `scope` being `Some` or `None`.
+#[derive(Clone)]
+pub struct RootRef {
+    /// AST node that `&root` resolves against.
+    pub node: Arc<Node>,
+    /// Pre-built scope already pinned at `node` — set by the dict branch
+    /// of `Evaluator::eval_internal` once the dict being evaluated *is*
+    /// `node`. When `None`, reference resolution synthesizes a transient
+    /// root scope on demand whose parent is `parent_fallback`.
+    pub scope: Option<Arc<Scope>>,
+    /// Parent fallback used when synthesizing the transient root scope.
+    /// Today this is the closure-body bindings scope so `&root` inside a
+    /// closure body still sees the caller's bindings.
+    pub parent_fallback: Option<Arc<Scope>>,
+}
+
+impl RootRef {
+    /// Build a root anchor that has only the AST identity — no pinned
+    /// scope, no parent fallback. The dict branch of `eval_internal`
+    /// will fill `scope` later if/when it enters the matching dict.
+    pub fn new(node: Arc<Node>) -> Self {
+        Self {
+            node,
+            scope: None,
+            parent_fallback: None,
+        }
+    }
+}
+
 /// Single environment frame. Cheap to derive (every field is either `Clone` or
 /// already wrapped in `Arc` / `Mutex`); deliberately wrapped in `Arc<Scope>` at
 /// every call site so backtracking through `parent` doesn't require copies.
@@ -36,15 +73,10 @@ pub struct Scope {
     /// surrounding module so different modules can't collide on identical
     /// paths.
     pub cache_namespace: String,
-    /// AST node that `&root` should resolve against.
-    pub reference_root: Option<Arc<Node>>,
-    /// Fallback `parent` to use when [`crate::eval::Evaluator`] has to
-    /// synthesize a root scope on the fly (e.g. inside a closure body that
-    /// hasn't entered its dict yet).
-    pub reference_root_parent: Option<Arc<Scope>>,
-    /// Pre-built scope already pinned at `reference_root`; set by the dict
-    /// branch of `eval_internal` once `is_root` triggers.
-    pub reference_root_scope: Option<Arc<Scope>>,
+    /// `&root` anchor. `None` only at scopes that haven't yet acquired one
+    /// (typically just the pre-eval root scope before
+    /// [`Evaluator::eval_root`] stamps it). See [`RootRef`] for invariants.
+    pub root_ref: Option<RootRef>,
     /// Active list iteration, if any.
     pub list_context: Option<Arc<ListContext>>,
     /// Lazily-resolved bindings for the dict that owns this scope. Kept
@@ -59,7 +91,7 @@ impl std::fmt::Debug for Scope {
             .field("path_node", &self.path_node)
             .field("current_dir", &self.current_dir)
             .field("cache_namespace", &self.cache_namespace)
-            .field("has_reference_root", &self.reference_root.is_some())
+            .field("has_root_ref", &self.root_ref.is_some())
             .field("index", &self.list_context.as_ref().map(|c| c.index))
             .finish()
     }
@@ -73,9 +105,7 @@ impl Clone for Scope {
             locals: Mutex::new(self.locals.lock().unwrap().clone()),
             current_dir: self.current_dir.clone(),
             cache_namespace: self.cache_namespace.clone(),
-            reference_root: self.reference_root.clone(),
-            reference_root_parent: self.reference_root_parent.clone(),
-            reference_root_scope: self.reference_root_scope.clone(),
+            root_ref: self.root_ref.clone(),
             list_context: self.list_context.clone(),
             thunks: Mutex::new(self.thunks.lock().unwrap().clone()),
         }
@@ -139,7 +169,7 @@ impl Scope {
     }
 
     /// Open a fresh child frame inheriting flow-state fields (`current_dir`,
-    /// `cache_namespace`, `reference_root*`, `list_context`) from `self` but
+    /// `cache_namespace`, `root_ref`, `list_context`) from `self` but
     /// with empty `locals`/`thunks` and no `path_node`.
     ///
     /// This is the workhorse for every new lexical block — Dict body,
@@ -152,9 +182,7 @@ impl Scope {
             locals: Mutex::new(HashMap::new()),
             current_dir: self.current_dir.clone(),
             cache_namespace: self.cache_namespace.clone(),
-            reference_root: self.reference_root.clone(),
-            reference_root_parent: self.reference_root_parent.clone(),
-            reference_root_scope: self.reference_root_scope.clone(),
+            root_ref: self.root_ref.clone(),
             list_context: self.list_context.clone(),
             thunks: Mutex::new(HashMap::new()),
         })

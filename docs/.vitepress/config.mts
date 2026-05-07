@@ -29,6 +29,7 @@ export default defineConfig({
             text: '入门',
             items: [
               { text: '什么是 Relon？', link: '/zh/guide/introduction' },
+              { text: '业务场景与定位', link: '/zh/guide/use-cases' },
               { text: '基础语法', link: '/zh/guide/syntax' },
             ]
           },

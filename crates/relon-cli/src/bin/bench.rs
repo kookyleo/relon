@@ -46,9 +46,12 @@ fn bench_once(source: &str) -> (Duration, Duration) {
     let parse_time = start_parse.elapsed();
 
     let start_eval = Instant::now();
-    let mut ctx = Context::new().with_root(ast.clone());
-    ctx.prepend_module_resolver(Arc::new(relon_evaluator::StdModuleResolver));
-    let eval = Evaluator::new(&ctx);
+    let ctx = {
+        let mut ctx = Context::new().with_root(ast.clone());
+        ctx.prepend_module_resolver(Arc::new(relon_evaluator::StdModuleResolver));
+        Arc::new(ctx)
+    };
+    let eval = Evaluator::new(Arc::clone(&ctx));
     let _result = eval
         .eval(&ast, &Arc::new(Scope::default()))
         .expect("Eval failed");

@@ -28,7 +28,7 @@ impl NumericValue {
     }
 }
 
-impl Evaluator<'_> {
+impl Evaluator {
     pub(crate) fn eval_binary(
         &self,
         op: Operator,

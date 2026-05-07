@@ -110,6 +110,17 @@ pub enum RuntimeError {
         range: TokenRange,
     },
 
+    #[error("Recursion limit exceeded ({limit} levels)")]
+    #[diagnostic(
+        code(relon::eval::recursion_limit_exceeded),
+        help("A type-check or schema-validation pass nested deeper than the runtime's safety bound. Restructure the recursive type or value so it doesn't self-reference past this depth.")
+    )]
+    RecursionLimitExceeded {
+        limit: usize,
+        #[label("depth limit reached here")]
+        range: TokenRange,
+    },
+
     #[error("Value too large: {actual} elements exceeds limit of {limit}")]
     #[diagnostic(
         code(relon::eval::value_too_large),

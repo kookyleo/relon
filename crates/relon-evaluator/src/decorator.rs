@@ -47,7 +47,7 @@ pub enum PreEvalOutcome {
 pub trait DecoratorPlugin: Send + Sync {
     fn pre_eval(
         &self,
-        _eval: &Evaluator<'_>,
+        _eval: &Evaluator,
         _node: &Node,
         _scope: &Arc<Scope>,
         _args: &[CallArg],
@@ -58,7 +58,7 @@ pub trait DecoratorPlugin: Send + Sync {
 
     fn wrap(
         &self,
-        _eval: &Evaluator<'_>,
+        _eval: &Evaluator,
         value: Value,
         _scope: &Arc<Scope>,
         _args: &[EvaluatedArg],
@@ -80,7 +80,7 @@ pub trait DecoratorPlugin: Send + Sync {
     /// `Weather` doesn't get resolved to a `Value::Schema` first.
     fn wrap_with_ast(
         &self,
-        _eval: &Evaluator<'_>,
+        _eval: &Evaluator,
         _node: &Node,
         _value: &Value,
         _scope: &Arc<Scope>,
@@ -92,7 +92,7 @@ pub trait DecoratorPlugin: Send + Sync {
 
     fn schema_field_meta(
         &self,
-        _eval: &Evaluator<'_>,
+        _eval: &Evaluator,
         _field: &mut SchemaField,
         _scope: &Arc<Scope>,
         _args: &[EvaluatedArg],

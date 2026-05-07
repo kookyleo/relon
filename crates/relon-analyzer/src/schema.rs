@@ -120,10 +120,14 @@ pub struct BaseRef {
     pub node: Arc<Node>,
 }
 
-fn has_schema_decorator(decorators: &[Decorator]) -> bool {
+fn has_decorator_named(decorators: &[Decorator], target: &str) -> bool {
     decorators.iter().any(|dec| {
-        dec.path.len() == 1 && matches!(&dec.path[0], TokenKey::String(s, _, _) if s == SCHEMA)
+        dec.path.len() == 1 && matches!(&dec.path[0], TokenKey::String(s, _, _) if s == target)
     })
+}
+
+fn has_schema_decorator(decorators: &[Decorator]) -> bool {
+    has_decorator_named(decorators, SCHEMA)
 }
 
 /// Walk `root` and populate `tree.schemas` with every statically-classifiable
@@ -301,7 +305,7 @@ fn lower_enum_body(t: &TypeNode, def: &mut SchemaDef, tree: &mut AnalyzedTree) -
         }
         return true;
     }
-    
+
     true
 }
 

@@ -175,18 +175,21 @@ fn evaluate_source(
     // this Relon document and give me the JSON" entry points — by
     // construction the file is host-owned, so every capability is
     // granted. Spelled out so a code reviewer sees the trust scope.
-    let mut ctx = Context::sandboxed()
-        .with_root(node)
-        .with_analyzed(Arc::clone(&analyzed));
-    ctx.capabilities = Capabilities::all_granted();
-    ctx.prepend_module_resolver(Arc::new(FilesystemModuleResolver::trusted()));
+    let ctx = {
+        let mut ctx = Context::sandboxed()
+            .with_root(node)
+            .with_analyzed(Arc::clone(&analyzed));
+        ctx.capabilities = Capabilities::all_granted();
+        ctx.prepend_module_resolver(Arc::new(FilesystemModuleResolver::trusted()));
+        Arc::new(ctx)
+    };
 
     let _root_loading_guard = if cache_namespace == "<memory>" {
         None
     } else {
         Some(ctx.enter_loading_module(cache_namespace.clone()))
     };
-    let evaluator = Evaluator::new(&ctx);
+    let evaluator = Evaluator::new(Arc::clone(&ctx));
 
     let mut root_scope = Scope::default();
     root_scope.current_dir = current_dir.into();
@@ -220,11 +223,12 @@ mod tests {
     fn deserializes_from_str() {
         let config: ServerConfig = from_str(
             r#"{
-            _format(v): "port=" + v,
+            @private
+            format(v): "port=" + v,
             host: "localhost",
             base: { port: 8080 },
             port: &sibling.base.port,
-            display: _format(&sibling.port)
+            display: format(&sibling.port)
         }"#,
         )
         .unwrap();

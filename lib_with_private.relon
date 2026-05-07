@@ -1,1 +1,5 @@
-{ _secret: "hidden", public: &sibling._secret + " info" }
+{
+    @private
+    secret: "hidden",
+    public: &sibling.secret + " info"
+}

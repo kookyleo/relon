@@ -64,8 +64,23 @@ cargo run -q -p relon-fmt -- --check fixtures/*.relon fixtures/modules/*.relon f
 }
 ```
 
+## 📚 Documentation
+
+- **Language spec** (the cross-runtime contract):
+  [`docs/zh/guide/spec.md`](docs/zh/guide/spec.md) ·
+  [English](docs/en/guide/spec.md)
+- **Use cases & positioning**:
+  [`docs/zh/guide/use-cases.md`](docs/zh/guide/use-cases.md)
+- **Architecture overview** (for contributors / deep host integrations):
+  [`docs/zh/guide/architecture.md`](docs/zh/guide/architecture.md)
+- **Local docs site**: `cd docs && npx vitepress dev`
+
 ## 🏗 Project Structure
 - `crates/relon-parser`: The core parser built with `winnow`.
+- `crates/relon-analyzer`: Semantic-analysis layer (schema desugar, name resolution, diagnostics).
 - `crates/relon-evaluator`: The execution engine and standard library.
+- `crates/relon`: Public API facade (`evaluate_source`, `json_from_*`, `Projector`).
 - `crates/relon-cli`: Command-line tool.
-- `examples/`: Demo files.
+- `crates/relon-fmt`: Formatter / syntax checker.
+- `crates/relon-lsp`: Language Server (parse + analyze + diagnostics).
+- `examples/`, `fixtures/`: Demo / golden files.

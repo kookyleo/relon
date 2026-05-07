@@ -1,5 +1,6 @@
 @import("lib_with_private.relon", as="lib")
-{ 
-  check_public: lib.public,
-  check_private: lib._secret 
+{
+  check_public: lib.public
+  // `lib.secret` is unreachable: the private field never enters
+  // `lib`'s exported map, so this would fail with `VariableNotFound`.
 }

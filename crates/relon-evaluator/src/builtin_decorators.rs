@@ -8,7 +8,9 @@
 //! own plugin under the same name first.
 
 use crate::decorator::{DecoratorPlugin, PreEvalOutcome};
-use crate::decorator_names::{BRAND, DEFAULT, ERROR, EXPECT, IMPORT, LIBRARY, MSG, SCHEMA, VALUE};
+use crate::decorator_names::{
+    BRAND, DEFAULT, ERROR, EXPECT, IMPORT, INPUT, LIBRARY, MSG, PRIVATE, SCHEMA, VALUE,
+};
 use crate::error::RuntimeError;
 use crate::eval::{Context, Evaluator};
 use crate::native_fn::EvaluatedArg;
@@ -23,6 +25,14 @@ use std::sync::Arc;
 pub(crate) fn register_to(ctx: &mut Context) {
     ctx.register_decorator(IMPORT, Arc::new(ImportDecorator));
     ctx.register_decorator(SCHEMA, Arc::new(SchemaDecorator));
+    // `@input(name=SchemaRef)` is a root-level marker. The analyzer
+    // collects every decoration into `AnalyzedTree::input_decls`; the
+    // evaluator's `prepare_input` step then evaluates each `SchemaRef`,
+    // builds a wrapper schema `{ <name>: <schema> }`, and validates the
+    // host-pushed `Context::with_input(...)` value against it before
+    // walking the document body. The plugin slot here is identity —
+    // the real work happens in those two passes.
+    ctx.register_decorator(INPUT, Arc::new(InputDecorator));
     ctx.register_decorator(EXPECT, Arc::new(MessageDecorator));
     ctx.register_decorator(MSG, Arc::new(MessageDecorator));
     ctx.register_decorator(ERROR, Arc::new(MessageDecorator));
@@ -34,6 +44,11 @@ pub(crate) fn register_to(ctx: &mut Context) {
     // where it must behave as identity instead of tripping the
     // unknown-decorator fallback.
     ctx.register_decorator(LIBRARY, Arc::new(LibraryDecorator));
+    // `@private` is a visibility marker. The dict-literal evaluator
+    // checks for it directly (drops the field from the produced
+    // `Value::Dict::map`); the plugin slot here exists only so the
+    // unknown-decorator fallback doesn't fire.
+    ctx.register_decorator(PRIVATE, Arc::new(PrivateDecorator));
 }
 
 /// `@import("path", as="alias", spread=false)` — injects module bindings into
@@ -43,7 +58,7 @@ struct ImportDecorator;
 impl DecoratorPlugin for ImportDecorator {
     fn pre_eval(
         &self,
-        eval: &Evaluator<'_>,
+        eval: &Evaluator,
         _node: &Node,
         scope: &Arc<Scope>,
         args: &[CallArg],
@@ -61,7 +76,7 @@ struct SchemaDecorator;
 impl DecoratorPlugin for SchemaDecorator {
     fn pre_eval(
         &self,
-        eval: &Evaluator<'_>,
+        eval: &Evaluator,
         node: &Node,
         scope: &Arc<Scope>,
         _args: &[CallArg],
@@ -117,7 +132,7 @@ impl DecoratorPlugin for SchemaDecorator {
 /// constructor path can validate body shapes the same way `apply_schema`
 /// does for plain dicts.
 fn build_enum_schema(
-    _eval: &Evaluator<'_>,
+    _eval: &Evaluator,
     def: &relon_analyzer::SchemaDef,
     _scope: &Arc<Scope>,
 ) -> Result<Value, RuntimeError> {
@@ -160,7 +175,7 @@ struct MessageDecorator;
 impl DecoratorPlugin for MessageDecorator {
     fn schema_field_meta(
         &self,
-        _eval: &Evaluator<'_>,
+        _eval: &Evaluator,
         field: &mut SchemaField,
         _scope: &Arc<Scope>,
         args: &[EvaluatedArg],
@@ -180,7 +195,7 @@ struct DefaultDecorator;
 impl DecoratorPlugin for DefaultDecorator {
     fn schema_field_meta(
         &self,
-        _eval: &Evaluator<'_>,
+        _eval: &Evaluator,
         field: &mut SchemaField,
         _scope: &Arc<Scope>,
         args: &[EvaluatedArg],
@@ -200,6 +215,25 @@ struct LibraryDecorator;
 
 impl DecoratorPlugin for LibraryDecorator {}
 
+/// `@private` — dict-field visibility marker. All plugin hooks are
+/// identity; the real effect (dropping the field from the produced
+/// `Value::Dict::map`) is implemented inline in the dict-literal
+/// evaluator. Registered here so the unknown-decorator fallback
+/// doesn't fire when the user writes `@private` on a field.
+struct PrivateDecorator;
+
+impl DecoratorPlugin for PrivateDecorator {}
+
+/// `@input(name=SchemaRef)` — root-level marker for input slots. The
+/// effect lives in `relon-analyzer::inputs::collect_inputs` (records
+/// the slot) and `Evaluator::prepare_input` (builds the wrapper schema
+/// and validates the host-pushed value). Registered here so the
+/// unknown-decorator fallback doesn't fire when the user writes
+/// `@input(user=User)` on the root dict.
+struct InputDecorator;
+
+impl DecoratorPlugin for InputDecorator {}
+
 /// `@value(replacement)` — substitutes the decorated value with the first
 /// argument (or returns the original when called bare).
 struct ValueDecorator;
@@ -207,7 +241,7 @@ struct ValueDecorator;
 impl DecoratorPlugin for ValueDecorator {
     fn wrap(
         &self,
-        _eval: &Evaluator<'_>,
+        _eval: &Evaluator,
         value: Value,
         _scope: &Arc<Scope>,
         args: &[EvaluatedArg],
@@ -242,7 +276,7 @@ struct BrandDecorator;
 impl DecoratorPlugin for BrandDecorator {
     fn wrap_with_ast(
         &self,
-        eval: &Evaluator<'_>,
+        eval: &Evaluator,
         node: &Node,
         value: &Value,
         scope: &Arc<Scope>,

@@ -5,6 +5,7 @@
 //! ignore the rest. Adding a new pass means adding a new table here.
 
 use crate::diagnostic::Diagnostic;
+use crate::inputs::InputDecl;
 use crate::resolve::ResolvedRef;
 use crate::schema::SchemaDef;
 use relon_parser::{Node, NodeId};
@@ -34,6 +35,15 @@ pub struct AnalyzedTree {
     /// gate "evaluate as entry" on this flag — `@library` files are
     /// import-only, never the final config.
     pub is_library: bool,
+    /// `@input(name=SchemaRef)` declarations on the root node, in
+    /// source order. Each entry adds one named slot to the program's
+    /// input contract; the runtime evaluates each `SchemaRef` and
+    /// merges the resulting schemas into a virtual wrapper schema
+    /// `{ <name1>: <schema1>, <name2>: <schema2>, ... }` against which
+    /// the host-pushed input is validated before evaluation begins.
+    /// Multiple decorators with the same `name` produce
+    /// `Diagnostic::DuplicateInputName`.
+    pub input_decls: Vec<InputDecl>,
     /// Errors and warnings from every pass, in source order.
     pub diagnostics: Vec<Diagnostic>,
 }

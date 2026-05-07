@@ -4,6 +4,110 @@ Relon 不是「装好就跑」的独立程序——它是一个 **Rust 可嵌入
 
 > 想要不可信脚本的安全策略？看完这页之后跳到 [沙箱与权限](./sandbox.md)。
 
+## 推荐范式：Push-by-default
+
+在动手集成之前，先确定一件**架构决策**：外部数据怎么进 Relon？
+
+Relon 推荐的范式是 **push**——宿主在求值**之前**完成所有 I/O，把数
+据净化成 `Value` 注入 `Context::with_input(...)`；脚本通过预设保留
+名 `input` 读取它，整体保持纯函数 `(source, input) → output`：
+
+```rust
+// ✅ 推荐：push-style
+let user_data = http_client.get(&format!("/api/user/{user_id}")).await?;
+let posts_data = db.query_user_posts(user_id).await?;
+
+let input = serde_json::json!({
+    "user": user_data,
+    "posts": posts_data,
+});
+// serde_json::Value → Relon Value
+let input_value: relon_evaluator::Value = serde_json::from_value(input)?;
+
+let ctx = Context::sandboxed()
+    .with_root(parse_document(rule_source)?)
+    .with_input(input_value);
+
+let result = Evaluator::new(std::sync::Arc::new(ctx))
+    .eval_root(&std::sync::Arc::new(Scope::default()))?;
+```
+
+脚本配上一个 `@input(...)` 契约（描述 host 必须推进来的形状）：
+
+```relon
+@input(user=User)
+@input(posts=PostList)
+{
+    @schema User: { String name: *, String tier: * },
+    @schema Post: { String title: * },
+    @schema PostList: List<Post>,
+    summary: f"${input.user.name} has ${len(input.posts)} posts",
+    eligible: len(input.posts) > 10 && input.user.tier == "gold"
+}
+```
+
+`@input(name=SchemaRef)` 是根级装饰器，每个声明一个 input slot，
+runtime 自动把所有 slot 合并成一个 wrapper schema 校验 host 推的数
+据。slot 名是脚本里 `input.<slot>` 的访问路径，SchemaRef 是已声明
+的 `@schema`（本文件或 import 的）。
+
+这样写有几个一致好处：
+- 「外部数据契约」写在 .relon 文件里，任何 conformant runtime 按相
+  同 schema 校验
+- host 推数据缺字段 / 类型不匹配 → 求值开始前就报错
+- 多个 schema 自然组合成 input wrapper（每个 slot 命名空间隔离）
+
+对应的反面（**不推荐**作为默认）：
+
+```rust
+// ⚠️ pull-style：把 I/O 搬进求值过程
+ctx.register_fn_with_caps("http.get",
+    NativeFnGate { network: true, ..Default::default() },
+    Arc::new(HttpGet),
+);
+ctx.register_fn_with_caps("db.query",
+    NativeFnGate { network: true, ..Default::default() },
+    Arc::new(DbQuery),
+);
+```
+
+```relon
+// 脚本内主动拉数据
+{
+    user: http.get("/api/user/" + user_id),
+    posts: db.query("SELECT * FROM posts WHERE author = " + user.id)
+}
+```
+
+### 为什么 push 优先
+
+| 维度 | push | pull |
+|---|---|---|
+| 「同源 + 同输入 → 字节级一致」可兑现？ | ✅ input 是显式 `Value` 树，可重放 / diff / hash | ❌ input 隐式包含 `http.get` 当时的网络状态 |
+| 测试 | 构造 input dict 即可 | 要 mock http / db client |
+| 缓存 / 预编译 / fuzz | 真·纯函数，可 memoize | 任何缓存都跟时间和外部状态绑死 |
+| 审计「这段逻辑会读到什么」 | 看一眼注入的 input + `@input` schema | 要 trace 所有 host fn reachability |
+| 跨 runtime 一致性（spec §1.1） | ✅ 只要 input 一致，结果一致 | ❌ 不同 runtime 的 http / 网络环境本就不同 |
+| 心智分工 | host 负责跨界 I/O，脚本负责数据组合，边界清晰 | 两者交织 |
+
+### pull 不是禁，是「主动放弃跨 runtime 一致性」
+
+下面这些场景里 pull 仍合理：
+
+- **延迟加载**：数据集大到全 push 不现实（「从 1M 用户里 filter」）
+- **动态查询**：query 条件依赖脚本中间计算结果
+- **副作用动作**：规则引擎判断后触发邮件 / 日志 / webhook —— 本来就要 side effect
+- **观察性**：调试用 `@log("...")`，不影响结果
+
+这些场景下 host fn 用 [`register_fn_with_caps`](#受-capability-门控的注册)
+注册，按需声明 `NativeFnGate { reads_clock: true, network: true, ... }`。
+**这是有意识的取舍**：脚本作者主动放弃了「换一个 conformant runtime
+跑同一份脚本得到同样结果」的承诺，换取了「能动态拉数据」。spec §1.1
+的跨端一致只覆盖 push 形态。
+
+> **一句话总结**：能 push 就 push。只在 push 实在不可行时（数据量、
+> 动态性、副作用）才用 pull，并且清楚知道这部分逻辑不再 portable。
+
 ## 最小例子
 
 最常见的需求是「读一个 `.relon` 文件，拿一个 JSON 出来」。三行：
@@ -61,23 +165,29 @@ use relon_parser::parse_document;
 use std::sync::Arc;
 
 let node = parse_document(source).unwrap();
-let mut ctx = Context::new()  // 等价于 Context::trusted()
+let ctx = Context::new()  // 等价于 Context::trusted()
     .with_root(node);
 
-// （在这里注册函数 / 装饰器 / 替换 module resolver）
+// （在这里注册函数 / 装饰器 / 替换 module resolver / with_input(...)）
 
-let value = Evaluator::new(&ctx).eval_root(&Arc::new(Scope::default()))?;
+let value = Evaluator::new(Arc::new(ctx)).eval_root(&Arc::new(Scope::default()))?;
 ```
 
 `Context` 持有：
 
-- **`globals: HashMap<String, Value>`** — 顶层全局绑定，`@import` 之外的注入点。
+- **`input: Option<Value>`** — push-style 外部数据通道（[推荐范式](#推荐范式push-by-default)）。通过 `with_input(value)` 设置；脚本通过保留名 `input.foo` 读取。**唯一**对外认可的数据注入入口。
 - **`functions`** — 通过 `register_fn` / `register_fn_with_caps` 注册的原生函数表。
 - **`decorators`** — 通过 `register_decorator` 注册的装饰器插件。
 - **`module_resolvers`** — `@import` 走的解析器链；默认是 `[StdModuleResolver, FilesystemModuleResolver]`。
 - **`capabilities`** — 沙箱 / 资源预算（[沙箱与权限](./sandbox.md) 详解）。
 - **`root_node`** + **`analyzed`** — 根 AST 与 analyzer side-table。
 - **多份 cache**（path / module / loading）——避免重复求值。
+
+> 历史说明：早期版本提供 `Context.globals: HashMap<String, Value>`
+> 作为通用注入点，已**移除**。多种语义（业务输入 / host helper /
+> runtime 配置）混在一个 map 里会让破壳点散布；现在改为单一入口
+> `with_input` + `@input` 契约，host helper 写进 `input.config.*`
+> 等命名空间。
 
 构造方式有两条主线：
 

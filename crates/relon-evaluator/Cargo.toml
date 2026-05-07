@@ -9,10 +9,11 @@ description = "The evaluation engine for the relon language"
 relon-parser = { path = "../relon-parser" }
 relon-analyzer = { path = "../relon-analyzer" }
 ordered-float.workspace = true
+# `rc` enables `serde::Serialize`/`Deserialize` for `Arc<T>` so that
+# `Value::List(Arc<Vec<Value>>)` and `Value::Dict(Arc<ValueDict>)` can
+# auto-derive the trait. Removing it requires hand-rolled impls — keep
+# the feature on as long as Value carries Arc'd payloads.
 serde = { version = "1.0", features = ["derive", "rc"] }
 serde_json = "1.0"
 thiserror = "1.0"
 miette = { version = "7.6.0", features = ["derive"] }
-
-[dev-dependencies]
-tokio = { version = "1.0", features = ["full"] }

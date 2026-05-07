@@ -1,7 +1,7 @@
 use crate::decorator::{DecoratorPlugin, PreEvalOutcome};
 use crate::error::RuntimeError;
 use crate::module::{FilesystemModuleResolver, ModuleResolver, ModuleSource, StdModuleResolver};
-use crate::native_fn::{EvaluatedArg, NativeArgs, RelonFunction, NativeFnCaps};
+use crate::native_fn::{EvaluatedArg, NativeArgs, NativeFnCaps, RelonFunction};
 use crate::scope::{Scope, Thunk};
 use crate::value::Value;
 use relon_parser::{
@@ -86,7 +86,17 @@ pub struct Context {
     pub(crate) root_node: Option<Arc<Node>>,
     pub(crate) decorators: HashMap<String, Arc<dyn DecoratorPlugin>>,
     pub(crate) functions: HashMap<String, GatedNativeFn>,
-    pub globals: HashMap<String, Value>,
+    /// Push-style external input. Reachable from scripts as the
+    /// reserved root-level name `input` (e.g. `input.user.name`).
+    /// Set via [`Self::with_input`]; `None` means "no input was
+    /// provided" (script reads of `input.foo` then fail with
+    /// `VariableNotFound`).
+    ///
+    /// This is the **only** sanctioned channel for host-pushed data.
+    /// There is intentionally no general-purpose `globals` map — that
+    /// would re-introduce the ambient-state escape hatch the spec
+    /// forbids. See `docs/zh/guide/host-integration.md`.
+    pub input: Option<Value>,
     pub schemas: HashMap<String, Value>,
     pub(crate) module_resolvers: Vec<Arc<dyn ModuleResolver>>,
     pub(crate) path_cache: Mutex<HashMap<String, Value>>,
@@ -121,7 +131,7 @@ impl Context {
             root_node: None,
             decorators: HashMap::new(),
             functions: HashMap::new(),
-            globals: HashMap::new(),
+            input: None,
             schemas: HashMap::new(),
             module_resolvers: Vec::new(),
             path_cache: Mutex::new(HashMap::new()),
@@ -166,6 +176,30 @@ impl Context {
 
     pub fn with_analyzed(mut self, tree: Arc<relon_analyzer::AnalyzedTree>) -> Self {
         self.analyzed = Some(tree);
+        self
+    }
+
+    /// Push-by-default input channel. Host materializes external data
+    /// (HTTP responses, DB rows, request body, …) into a [`Value`] tree
+    /// before evaluation; the script reads it as the reserved root
+    /// name `input` (e.g. `input.user.name`).
+    ///
+    /// Reasons to push instead of pulling via host fns inside the
+    /// script — see `docs/zh/guide/host-integration.md`:
+    /// * Cross-runtime determinism is contingent on input being an
+    ///   explicit [`Value`] tree; pull-style host fn calls put the
+    ///   "input" outside the spec's reach.
+    /// * Caching, replay, fuzz, and diff all work because the function
+    ///   is genuinely `(source, input) → output`.
+    /// * Audit "what does this script see" by reading one Value tree.
+    ///
+    /// Anything that can't be expressed as pre-fetched data (lazy
+    /// loading, side-effect actions, observability) goes through
+    /// [`Self::register_fn_with_caps`] instead — capability gating is
+    /// the right tool for those, with the explicit understanding that
+    /// portable determinism stops applying.
+    pub fn with_input(mut self, value: Value) -> Self {
+        self.input = Some(value);
         self
     }
 
@@ -259,8 +293,8 @@ impl Drop for LoadingModuleGuard<'_> {
     }
 }
 
-pub struct Evaluator<'a> {
-    pub context: &'a Context,
+pub struct Evaluator {
+    pub context: Arc<Context>,
     /// Lazy cache for the `Arc<dyn NativeFnCaps>` handed to native fns so
     /// closures can call back into Relon. Allocating one per call shows up
     /// in the per-element hot path of `_list_map`/`_list_filter` etc.
@@ -270,8 +304,8 @@ pub struct Evaluator<'a> {
     empty_scope: std::sync::OnceLock<Arc<Scope>>,
 }
 
-impl<'a> Evaluator<'a> {
-    pub fn new(context: &'a Context) -> Self {
+impl Evaluator {
+    pub fn new(context: Arc<Context>) -> Self {
         Self {
             context,
             caps: std::sync::OnceLock::new(),
@@ -283,15 +317,14 @@ impl<'a> Evaluator<'a> {
         self.caps
             .get_or_init(|| {
                 Arc::new(EvaluatorCaps {
-                    evaluator: self as *const Evaluator as usize,
+                    context: Arc::clone(&self.context),
                 })
             })
             .clone()
     }
 
     fn empty_scope(&self) -> &Arc<Scope> {
-        self.empty_scope
-            .get_or_init(|| Arc::new(Scope::default()))
+        self.empty_scope.get_or_init(|| Arc::new(Scope::default()))
     }
 
     fn is_valid_identifier(s: &str) -> bool {
@@ -343,11 +376,10 @@ impl<'a> Evaluator<'a> {
     }
 
     /// Evaluate the document attached to `Context::with_root`. Stamps
-    /// `scope.reference_root` with the root node so `&root` references
-    /// resolve correctly during the walk; the reference-equality check
-    /// against the existing `reference_root` lets nested modules
-    /// preserve their own root binding when re-entering this from
-    /// `load_module`.
+    /// `scope.root_ref` with the root node so `&root` references resolve
+    /// correctly during the walk; the existence check against an existing
+    /// `root_ref` lets nested modules preserve their own root binding when
+    /// re-entering this from `load_module`.
     pub fn eval_root(&self, scope: &Arc<Scope>) -> Result<Value, RuntimeError> {
         let root = self.context.root_node.clone().ok_or_else(|| {
             RuntimeError::VariableNotFound(
@@ -355,14 +387,168 @@ impl<'a> Evaluator<'a> {
                 TokenRange::default(),
             )
         })?;
-        let scope = if scope.reference_root.is_none() {
+        let scope = if scope.root_ref.is_none() {
             let mut overlay = (**scope).clone();
-            overlay.reference_root = Some(Arc::clone(&root));
+            overlay.root_ref = Some(crate::scope::RootRef::new(Arc::clone(&root)));
             Arc::new(overlay)
         } else {
             Arc::clone(scope)
         };
+
+        // Seed the reserved `input` name into the root scope. If the
+        // file declared an `@input` schema (via `AnalyzedTree`), validate
+        // the host-pushed value against it first — defaults are filled
+        // in here, so the script reads the post-default tree. When no
+        // schema is declared the value is seeded as-is; reads of
+        // `input.foo` against missing input fall through to the runtime
+        // `VariableNotFound` path in `resolve_variable`.
+        if let Some(input_value) = self.prepare_input(&scope)? {
+            scope
+                .locals
+                .lock()
+                .unwrap()
+                .insert(crate::reserved::INPUT.to_string(), input_value);
+        }
+
         self.eval(&root, &scope)
+    }
+
+    /// Validate `Context::input` against every `@input(name=SchemaRef)`
+    /// declaration on the root and return the (possibly default-filled)
+    /// value to seed under the reserved `input` name.
+    ///
+    /// The merged contract is a virtual wrapper schema
+    /// `{ <name1>: <schema1>, <name2>: <schema2>, ... }`. Each
+    /// `SchemaRef` is evaluated against the root scope (so the
+    /// referenced `@schema` field has already been seeded into
+    /// `scope.locals` by an earlier `prepare_dict_scope` walk). The
+    /// resulting `Value::Schema`s are wrapped in `SchemaField`s and
+    /// applied to the host-pushed `Value::Dict` via the existing
+    /// `apply_schema` machinery — which means `@default(...)` and
+    /// optional fields work the same way they do for ordinary schemas.
+    ///
+    /// Returns `Ok(None)` when the document declares no `@input(...)`
+    /// slots and the host hasn't pushed anything; the reserved `input`
+    /// name then resolves to a runtime `VariableNotFound` if the script
+    /// dereferences it.
+    fn prepare_input(&self, scope: &Arc<Scope>) -> Result<Option<Value>, RuntimeError> {
+        let decls: Vec<crate::InputDecl> = self
+            .context
+            .analyzed
+            .as_ref()
+            .map(|tree| tree.input_decls.clone())
+            .unwrap_or_default();
+
+        if decls.is_empty() {
+            // No `@input(...)` declarations: pass the pushed value
+            // through as-is (or return None if nothing was pushed).
+            return Ok(self.context.input.clone());
+        }
+
+        let pushed = self.context.input.clone().ok_or_else(|| {
+            // The script declared an input contract but the host
+            // forgot to call `with_input` — surface that as a TypeMismatch
+            // pointing at the first declaration.
+            let range = decls[0].decorator_range;
+            RuntimeError::TypeMismatch {
+                expected: "input dict matching @input(...) declarations".to_string(),
+                found: "no input provided (call Context::with_input)".to_string(),
+                range,
+            }
+        })?;
+
+        // Pre-seed root-dict schemas into `scope.locals` so the
+        // SchemaRef expressions (typically bare identifiers like `User`)
+        // resolve. This mirrors what `eval_internal`'s Dict branch
+        // would do once it enters the body — we just do it eagerly so
+        // input validation can run *before* the body walk.
+        if let Some(root) = self.context.root_node.clone() {
+            self.prepare_dict_scope(&root, scope)?;
+        }
+
+        // Build a per-slot SchemaField from each (name, SchemaRef).
+        let mut fields: HashMap<String, crate::value::SchemaField> = HashMap::new();
+        for decl in &decls {
+            let schema_value = self.eval(&decl.schema_ref, scope)?;
+            if !matches!(schema_value, Value::Schema { .. }) {
+                return Err(RuntimeError::TypeMismatch {
+                    expected: format!("@input({}=...) argument to evaluate to a Schema", decl.name),
+                    found: schema_value.type_name().to_string(),
+                    range: decl.schema_ref.range,
+                });
+            }
+            // Synthesize a type hint that points at this slot's schema.
+            // We can't always recover a clean source-level identifier
+            // (the SchemaRef might be `lib.X` or a more complex
+            // expression), so anchor the hint to the slot name and use
+            // the stored predicate to enforce the actual schema match.
+            let type_hint = relon_parser::TypeNode {
+                path: vec![decl.name.clone()],
+                generics: Vec::new(),
+                is_optional: false,
+                range: decl.schema_ref.range,
+                variant_fields: None,
+                doc_comment: None,
+            };
+            fields.insert(
+                decl.name.clone(),
+                crate::value::SchemaField {
+                    type_hint,
+                    predicates: vec![schema_value],
+                    custom_error: None,
+                    default_value: None,
+                },
+            );
+        }
+
+        // The wrapper applies one slot per declaration. We bypass
+        // `apply_schema` because its `check_type_internal` step would
+        // try to look up the slot's `type_hint.path` in the scope's
+        // schemas — but `<slot-name>` is *not* a registered schema name
+        // (it's a wrapper identifier we just synthesized). Instead,
+        // apply each slot inline: pull the field from the pushed dict,
+        // validate it against the slot's schema by re-using the
+        // schema-as-predicate path, and fill defaults the same way
+        // `apply_schema` does.
+        let Value::Dict(d) = pushed else {
+            return Err(RuntimeError::TypeMismatch {
+                expected: "input dict matching @input(...) declarations".to_string(),
+                found: pushed.type_name().to_string(),
+                range: decls[0].decorator_range,
+            });
+        };
+        let mut working = (*d).clone();
+        let mut visited: HashSet<(String, *const Value)> = HashSet::new();
+        for decl in &decls {
+            let field = fields.get(&decl.name).expect("just inserted");
+            let Value::Schema {
+                fields: slot_fields,
+                ..
+            } = &field.predicates[0]
+            else {
+                unreachable!("we type-checked Schema above");
+            };
+            if let Some(slot_value) = working.map.get_mut(&decl.name) {
+                self.apply_schema(
+                    slot_fields.clone(),
+                    slot_value,
+                    scope,
+                    decl.decorator_range,
+                    &mut visited,
+                    0,
+                )?;
+            } else {
+                // Missing slot — same diagnostic shape as a missing
+                // required schema field.
+                return Err(RuntimeError::TypeMismatch {
+                    expected: format!("input slot '{}'", decl.name),
+                    found: "missing".to_string(),
+                    range: decl.decorator_range,
+                });
+            }
+        }
+
+        Ok(Some(Value::Dict(Arc::new(working))))
     }
 
     pub(crate) fn eval_internal(
@@ -440,9 +626,9 @@ impl<'a> Evaluator<'a> {
 
             Expr::Dict(pairs) => {
                 let is_root = current_scope
-                    .reference_root
+                    .root_ref
                     .as_ref()
-                    .is_some_and(|r| std::ptr::eq(r.as_ref() as *const _, node as *const _));
+                    .is_some_and(|r| std::ptr::eq(r.node.as_ref() as *const _, node as *const _));
 
                 let mut dict_scope = Arc::new(Scope {
                     parent: Some(Arc::clone(&current_scope)),
@@ -450,16 +636,16 @@ impl<'a> Evaluator<'a> {
                     locals: Mutex::new(HashMap::new()),
                     current_dir: current_scope.current_dir.clone(),
                     cache_namespace: current_scope.cache_namespace.clone(),
-                    reference_root: current_scope.reference_root.clone(),
-                    reference_root_parent: current_scope.reference_root_parent.clone(),
-                    reference_root_scope: current_scope.reference_root_scope.clone(),
+                    root_ref: current_scope.root_ref.clone(),
                     list_context: current_scope.list_context.clone(),
                     thunks: Mutex::new(HashMap::new()),
                 });
 
                 if is_root {
                     let mut modified = (*dict_scope).clone();
-                    modified.reference_root_scope = Some(dict_scope.clone());
+                    if let Some(rr) = modified.root_ref.as_mut() {
+                        rr.scope = Some(dict_scope.clone());
+                    }
                     dict_scope = Arc::new(modified);
                 }
 
@@ -494,7 +680,9 @@ impl<'a> Evaluator<'a> {
                                     match self.eval(expr_node, &dict_scope)? {
                                         Value::String(s) => s,
                                         Value::Int(i) => i.to_string(),
-                                        Value::Type(t) => t.path.first().cloned().unwrap_or_default(),
+                                        Value::Type(t) => {
+                                            t.path.first().cloned().unwrap_or_default()
+                                        }
                                         other => {
                                             return Err(RuntimeError::TypeMismatch {
                                                 expected: "String or Int".to_string(),
@@ -514,7 +702,12 @@ impl<'a> Evaluator<'a> {
                                 self.eval(value_node, &item_scope)?
                             };
 
-                            if !key_str.starts_with('_') || !matches!(val, Value::Closure { .. }) {
+                            // `@private` keeps the binding in the owning
+                            // dict's locals (so siblings can reference it)
+                            // but excludes it from the produced `Value::Dict`
+                            // — making it invisible to imports, projectors,
+                            // and any cross-dict `&root` lookup.
+                            if !is_private_field(value_node) {
                                 map.insert(key_str.clone(), val.clone());
                             }
                             dict_scope.locals.lock().unwrap().insert(key_str, val);
@@ -826,10 +1019,11 @@ impl<'a> Evaluator<'a> {
         }
         if should_spread {
             if let Value::Dict(d) = evaluated_module {
+                // Private fields are absent from `d.map` by construction
+                // (the dict literal evaluator drops them), so spread can
+                // copy everything that's left without an extra filter.
                 for (k, v) in d.map.iter() {
-                    if !k.starts_with('_') {
-                        new_locals.insert(k.clone(), v.clone());
-                    }
+                    new_locals.insert(k.clone(), v.clone());
                 }
             } else {
                 return Err(RuntimeError::TypeMismatch {
@@ -925,7 +1119,7 @@ impl<'a> Evaluator<'a> {
         let module_scope = Arc::new(Scope {
             current_dir: source.current_dir,
             cache_namespace: source.canonical_id.clone(),
-            reference_root: Some(Arc::new(node.clone())),
+            root_ref: Some(crate::scope::RootRef::new(Arc::new(node.clone()))),
             ..Default::default()
         });
         let evaluated = self.eval(&node, &module_scope)?;
@@ -1209,9 +1403,7 @@ impl<'a> Evaluator<'a> {
             locals: Mutex::new(bindings),
             current_dir: captured_env.current_dir.clone(),
             cache_namespace: captured_env.cache_namespace.clone(),
-            reference_root: captured_env.reference_root.clone(),
-            reference_root_parent: captured_env.reference_root_parent.clone(),
-            reference_root_scope: captured_env.reference_root_scope.clone(),
+            root_ref: captured_env.root_ref.clone(),
             list_context: None,
             thunks: Mutex::new(HashMap::new()),
         });
@@ -1222,9 +1414,11 @@ impl<'a> Evaluator<'a> {
             locals: Mutex::new(HashMap::new()),
             current_dir: bindings_scope.current_dir.clone(),
             cache_namespace: bindings_scope.cache_namespace.clone(),
-            reference_root: Some(Arc::clone(&body_arc)),
-            reference_root_parent: Some(bindings_scope.clone()),
-            reference_root_scope: None,
+            root_ref: Some(crate::scope::RootRef {
+                node: Arc::clone(&body_arc),
+                scope: None,
+                parent_fallback: Some(bindings_scope.clone()),
+            }),
             list_context: None,
             thunks: Mutex::new(HashMap::new()),
         });
@@ -1237,7 +1431,7 @@ impl<'a> Evaluator<'a> {
         scope: &Arc<Scope>,
     ) -> Result<(), RuntimeError> {
         if let Expr::Dict(pairs) = node.expr.as_ref() {
-            self.register_dict_thunks(pairs, scope);
+            self.register_dict_thunks(pairs, scope)?;
             for (key, value_node) in pairs {
                 if matches!(key, TokenKey::Spread(_)) {
                     continue;
@@ -1306,48 +1500,67 @@ impl<'a> Evaluator<'a> {
         Ok(())
     }
 
-    fn register_dict_thunks(&self, pairs: &[(TokenKey, Node)], scope: &Arc<Scope>) {
-        let mut thunks = scope.thunks.lock().unwrap();
+    fn register_dict_thunks(
+        &self,
+        pairs: &[(TokenKey, Node)],
+        scope: &Arc<Scope>,
+    ) -> Result<(), RuntimeError> {
+        // Resolve every dynamic key in a separate pass *before* taking
+        // the thunks lock. Two reasons:
+        //   1. `self.eval(expr_node, scope)` can recursively re-enter
+        //      this scope (variable lookups, sub-dict preparation, …),
+        //      and the resulting `scope.get_thunk(...)` would dead-lock
+        //      on the same `Mutex`.
+        //   2. Errors from dynamic-key evaluation must surface here —
+        //      previously the code did `_ => continue`, silently
+        //      dropping the thunk and forcing the caller to re-evaluate
+        //      the same expression later (and re-encounter the same
+        //      error). Fail-fast keeps the prepare-phase invariant
+        //      "thunks table covers every declared key" honest.
+        let mut entries: Vec<(String, Node)> = Vec::with_capacity(pairs.len());
         for (key, value_node) in pairs {
             let key_str = match key {
                 TokenKey::String(s, _, _) => s.clone(),
                 TokenKey::Dummy => "_".to_string(),
                 TokenKey::Index(i, _) => i.to_string(),
                 TokenKey::Spread(_) => continue,
-                TokenKey::Dynamic(expr_node, _) => match self.eval(expr_node, scope) {
-                    Ok(Value::String(s)) => s,
-                    Ok(Value::Int(i)) => i.to_string(),
-                    Ok(Value::Type(t)) => t.path.first().cloned().unwrap_or_default(),
-                    _ => continue,
+                TokenKey::Dynamic(expr_node, _) => match self.eval(expr_node, scope)? {
+                    Value::String(s) => s,
+                    Value::Int(i) => i.to_string(),
+                    Value::Type(t) => t.path.first().cloned().unwrap_or_default(),
+                    other => {
+                        return Err(RuntimeError::TypeMismatch {
+                            expected: "String or Int for key".to_string(),
+                            found: other.type_name().to_string(),
+                            range: expr_node.range,
+                        });
+                    }
                 },
             };
+            entries.push((key_str, value_node.clone()));
+        }
+
+        let mut thunks = scope.thunks.lock().unwrap();
+        for (key_str, value_node) in entries {
             let item_scope = scope.with_path(key_str.clone());
             let path = item_scope.full_path();
             let cache_key = item_scope.path_cache_key(&path);
             thunks.insert(
                 key_str,
-                Arc::new(Thunk::new(value_node.clone(), item_scope, path, cache_key)),
+                Arc::new(Thunk::new(value_node, item_scope, path, cache_key)),
             );
         }
+        Ok(())
     }
 }
 
-/// Caps handle handed to native functions so they can call back into
-/// Relon. Holds a raw pointer to the `Evaluator` because the trait object
-/// needs to be `'static` while `Evaluator<'a>` is not.
+/// Caps handle handed to native functions so they can call back into Relon.
 ///
-/// SAFETY contract: the caps handle is created lazily by `Evaluator::caps`
-/// and stored in a `OnceLock` on the same `Evaluator`. The pointer is
-/// dereferenced only inside `call_relon`, which the host invokes
-/// synchronously from a `RelonFunction::call`. Callers must not store the
-/// `Arc<dyn NativeFnCaps>` past the lifetime of the originating
-/// `Evaluator` — `RelonFunction` impls in this crate do not, and host
-/// impls are required to follow the same rule.
+/// Holds an `Arc<Context>` so the trait object is `'static` and the call-back
+/// path can run a fresh [`Evaluator`] over the same shared context. Cheap to
+/// keep around — every clone is just an Arc bump.
 struct EvaluatorCaps {
-    /// Type-erased `*const Evaluator<'_>`. Stored as `usize` because the
-    /// trait object handed to native functions must be `'static` while
-    /// `Evaluator<'a>` is not. Reconstituted in `call_relon`.
-    evaluator: usize,
+    context: Arc<Context>,
 }
 
 impl NativeFnCaps for EvaluatorCaps {
@@ -1357,15 +1570,10 @@ impl NativeFnCaps for EvaluatorCaps {
         args: Vec<Value>,
         range: TokenRange,
     ) -> Result<Value, RuntimeError> {
-        // SAFETY: see struct-level contract.
-        let evaluator = unsafe { &*(self.evaluator as *const Evaluator) };
+        let evaluator = Evaluator::new(Arc::clone(&self.context));
         let evaluated_args = args.into_iter().map(EvaluatedArg::positional).collect();
-        evaluator.call_function_by_value(
-            func.clone(),
-            evaluated_args,
-            evaluator.empty_scope(),
-            range,
-        )
+        let scope = Arc::clone(evaluator.empty_scope());
+        evaluator.call_function_by_value(func.clone(), evaluated_args, &scope, range)
     }
 }
 
@@ -1375,6 +1583,14 @@ pub(crate) fn decorator_name(dec: &DecoratorNode) -> String {
         .map(|k| k.to_string_key())
         .collect::<Vec<_>>()
         .join(".")
+}
+
+/// True when `node` carries the `@private` decorator. See
+/// [`crate::decorator_names::PRIVATE`] for the field-level semantics.
+fn is_private_field(node: &Node) -> bool {
+    node.decorators
+        .iter()
+        .any(|dec| decorator_name(dec) == crate::decorator_names::PRIVATE)
 }
 
 impl std::fmt::Display for Value {

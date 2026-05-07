@@ -32,6 +32,39 @@ covered by this spec it:
 Implementation details outside this scope (internal caches, threading,
 binary size) are runtime-private and don't affect conformance.
 
+### 1.2 Cross-runtime determinism — what counts as "input"
+
+In "same source + same input → byte-identical output", **input** means
+an explicit `Value` tree pushed by the host before evaluation via
+`Context::with_input(value)` and read by the script through the
+reserved root name `input`.
+
+The return values of host-registered native fns are **not** input.
+Therefore:
+
+- **Push** (host completes I/O before evaluation, materializes data
+  into a `Value`, pushes via `with_input`; optionally enforces the
+  shape via an `@input` schema in the script): cross-runtime
+  determinism is in scope of this spec.
+- **Pull** (script invokes host fns to fetch external data during
+  evaluation): the script author **opts out** of cross-runtime
+  determinism — different hosts / runtimes / moments see different
+  external state, and the spec neither requires nor can guarantee
+  agreement.
+
+See `host-integration.md` for the recommended push-by-default pattern.
+
+### 1.3 Reserved root names
+
+The following identifiers are **reserved root names**; conformant
+runtimes MUST implement the spec'd semantics, and scripts MUST NOT
+shadow them with dict fields, closure parameters, or `where`-clause
+binders:
+
+| Name | Semantics |
+|---|---|
+| `input` | The file's push-style external input (§1.2). Reference form `input.foo.bar`. When the host hasn't pushed and there's no `@input`, reading `input.foo` fails with `VariableNotFound`. |
+
 ## 2. Determinism Contract
 
 To make §1's axiom hold, every conformant runtime MUST:
@@ -101,7 +134,9 @@ A conformant runtime MUST accept every source the reference parser
 accepts and reject every source it rejects. The grammar corpus is
 defined by `fixtures/` + `examples/` + the parser's own test suite.
 
-> See [Syntax](./syntax.md) for the friendly tour.
+> A friendly syntax tour lives in the Chinese guide:
+> [`/zh/guide/syntax`](../../zh/guide/syntax.md). The English version is
+> on the roadmap.
 
 ## 4. Capability Model
 
@@ -153,7 +188,8 @@ spec, not something the host audits.
 | `ModuleParseError` | imported file failed to parse |
 | `IoError` | real I/O error during a permitted FS op |
 | `CapabilityDenied` | §4 rejection |
-| `StepLimitExceeded` | `max_steps` exhausted |
+| `StepLimitExceeded` | `max_steps` exhausted (evaluator step budget) |
+| `RecursionLimitExceeded` | type-check / schema-validation recursion depth exceeded the runtime's safety bound — a separate axis from `max_steps`; hosts can't relax it by raising the step budget |
 | `ValueTooLarge` | `max_value_bytes` exceeded |
 | `LibraryAsEntry` | `@library` file evaluated as host entry |
 | `UnsupportedOperator` | invalid operation or type combination |
@@ -196,6 +232,77 @@ source at `crates/relon-evaluator/src/std_relon/<name>.relon`; **those
 are implementation details of the schema system and are not part of
 the user-facing API — but a conformant runtime MUST still register
 them with the spec'd semantics, otherwise `@schema` will diverge.
+
+### 6.4 `@input(name=SchemaRef)` — program input contract
+
+`@input(...)` is a **root-level decorator** (placed before the file's
+root dict). It declares one **named slot** of the host-pushed input,
+addressed in `name=SchemaRef` form: `name` is the slot's identifier
+inside the merged wrapper, `SchemaRef` is a previously declared
+`@schema` (in the same file or imported). Form:
+
+```relon
+@input(req=Req)
+{
+    @schema Req: {
+        String name: *,
+        @default(0)
+        Int retries: *
+    },
+    greeting: f"hello ${input.req.name}, retries=${input.req.retries}"
+}
+```
+
+Multiple `@input(...)` decorations are merged into one virtual
+wrapper schema `{ <slot1>: <schema1>, <slot2>: <schema2>, ... }`:
+
+```relon
+@input(user=User)
+@input(cart=Cart)
+{
+    @schema User: { String name: * },
+    @schema Cart: { Int total: * },
+    summary: f"${input.user.name} - ${input.cart.total}"
+}
+```
+
+**Required semantics** (every conformant runtime MUST):
+
+1. `@input(...)` must be a **root-level decorator**; placing it on a
+   field or a nested dict has no effect.
+2. Each arg must be `name=SchemaRef`:
+   - Missing slot name (positional arg) → `Analyze` error
+     `InputDecoratorMissingName`.
+   - Same slot name declared twice → `Analyze` error
+     `DuplicateInputName`.
+   - Bare `@input` (no args) → `Analyze` error
+     `InputDecoratorEmpty`.
+3. **Before** evaluating the document body, validate
+   `Context::with_input(value)` against the merged wrapper:
+   - The pushed value must be a `Value::Dict`; otherwise
+     `TypeMismatch`.
+   - Every declared slot must be present in the pushed dict;
+     otherwise `TypeMismatch` (`expected: input slot '<name>'`,
+     `found: missing`).
+   - Each slot value is validated against the `Value::Schema`
+     produced by its `SchemaRef`: field type mismatches and missing
+     required fields produce `TypeMismatch`; fields with
+     `@default(...)` are filled when not pushed.
+4. The validated tree is bound to the reserved root name `input`
+   (§1.3); scripts read `input.<slot>.<field>`.
+5. **No `@input(...)`** in the file: `with_input` data binds to
+   `input` as-is without schema validation; missing-field reads
+   downgrade to runtime `VariableNotFound`.
+6. **Cross-file `@input` aggregation** (i.e. `@input(...)` in
+   imported library files contributing to the entry's contract) is
+   **not in v1**. v1 validates only the entry file's
+   `@input(...)`; libraries should export plain `@schema`s and let
+   the entry reference them via `@input(slot=lib.Schema)`.
+
+`@input(...)` writes the external-data contract into the .relon source
+rather than the host: every conformant runtime sees the same script
+and validates pushed data the same way — the missing piece §1.2
+needed to make cross-runtime determinism actually hold.
 
 ## 7. Host-Registered Extensions
 
@@ -248,8 +355,10 @@ To bring up a Go / TS / Swift / your-language conformant runtime:
    produce identical JSON.
 4. **Align error kinds**: see §5.
 
-> Detailed implementer guide is in [host-integration](./host-integration.md);
-> read it side-by-side with this spec.
+> Detailed implementer guide currently lives in the Chinese docs:
+> [`/zh/guide/host-integration`](../../zh/guide/host-integration.md).
+> Read it side-by-side with this spec; the English version is on the
+> roadmap.
 
 ## Appendix A: Departing from the "configuration language" framing
 
