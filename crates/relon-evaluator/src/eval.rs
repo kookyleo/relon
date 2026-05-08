@@ -365,6 +365,15 @@ impl Evaluator {
         // counts from prior runs. Module loads happen *inside* this
         // top-level walk and intentionally do not reset.
         self.context.step_counter.store(0, Ordering::Relaxed);
+        // Also clear `path_cache`: cache keys are derived from
+        // `scope.path_cache_key(keys)` and don't include `#main` args
+        // or any other per-invocation state, so reusing a Context across
+        // top-level runs would otherwise hand back a stale value for an
+        // identical reference path. `module_cache` is intentionally left
+        // alone — module loads are genuinely cross-run shareable.
+        // `evaluating_paths` is per single eval cycle and is already
+        // managed by the resolver; don't touch it here.
+        self.context.path_cache.lock().unwrap().clear();
         let root = self.context.root_node.clone().ok_or_else(|| {
             RuntimeError::VariableNotFound(
                 "Context has no root node — call `Context::with_root` first".to_string(),
@@ -397,6 +406,11 @@ impl Evaluator {
     ) -> Result<Value, RuntimeError> {
         // Reset the step budget — see `eval_root` for rationale.
         self.context.step_counter.store(0, Ordering::Relaxed);
+        // Same rationale as `eval_root`: path_cache keys don't include
+        // host-pushed `#main` args, so without a clear here a second
+        // invocation with different args would return cached values
+        // from the first run.
+        self.context.path_cache.lock().unwrap().clear();
         let root = self.context.root_node.clone().ok_or_else(|| {
             RuntimeError::VariableNotFound(
                 "Context has no root node — call `Context::with_root` first".to_string(),

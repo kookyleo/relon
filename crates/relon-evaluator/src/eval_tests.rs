@@ -3085,3 +3085,136 @@ fn user_can_override_prelude_option_schema() {
     };
     assert_eq!(many.brand.as_deref(), Some("Many"));
 }
+
+// =====================================================================
+// Bug regressions found during second-round review.
+// =====================================================================
+
+/// Bug 1: `path_cache` lives on `Context` but its keys don't include
+/// `#main` arguments, so reusing one Evaluator across multiple
+/// `run_main` invocations used to hand back the previous run's cached
+/// reference-path values. Both `eval_root` and `run_main` now clear the
+/// cache on entry; verify by running the same program twice with
+/// different args and asserting the second run sees fresh values.
+#[test]
+fn run_main_path_cache_isolated_across_invocations() {
+    use std::collections::HashMap;
+    let source = r#"#main(Int n) -> Dict
+{ a: n, b: &sibling.a }"#;
+    let node = parse_doc(source);
+    let analyzed = std::sync::Arc::new(relon_analyzer::analyze(&node));
+    let ctx = Context::new()
+        .with_root(node.clone())
+        .with_analyzed(std::sync::Arc::clone(&analyzed));
+    let evaluator = Evaluator::new(std::sync::Arc::new(ctx));
+
+    let mut args1: HashMap<String, Value> = HashMap::new();
+    args1.insert("n".to_string(), Value::Int(1));
+    let r1 = evaluator
+        .run_main(&std::sync::Arc::new(Scope::default()), args1)
+        .unwrap();
+    let Value::Dict(d1) = r1 else { panic!() };
+    assert_eq!(d1.map.get("b"), Some(&Value::Int(1)));
+
+    let mut args2: HashMap<String, Value> = HashMap::new();
+    args2.insert("n".to_string(), Value::Int(2));
+    let r2 = evaluator
+        .run_main(&std::sync::Arc::new(Scope::default()), args2)
+        .unwrap();
+    let Value::Dict(d2) = r2 else { panic!() };
+    assert_eq!(
+        d2.map.get("b"),
+        Some(&Value::Int(2)),
+        "second run must not hit first run's cached b"
+    );
+}
+
+/// Bug 2: a `#private` field is invisible from `Value::Dict::map`, but
+/// dict evaluation also seeds the value into `dict_scope.locals` so
+/// same-dict siblings can reach it. A previous fix already taught
+/// `resolve_dict_reference_step` to hide private fields when the
+/// access crosses a dict boundary, but the caller's `scope.locals`
+/// fallback then re-discovered the value and leaked it. The dict-step
+/// resolver now distinguishes "private blocked" from "not found" and
+/// the `PrivateBlocked` arm refuses to consult locals.
+#[test]
+fn private_field_does_not_leak_via_locals_fallback() {
+    let result = eval_doc(
+        r#"{
+            #private
+            secret: "shhh",
+            alias: &sibling.secret,
+            child: { leak: &root.secret }
+        }"#,
+    );
+    assert!(
+        matches!(&result, Err(RuntimeError::VariableNotFound(name, _)) if name.contains("secret")),
+        "expected VariableNotFound for cross-dict private access, got {result:?}"
+    );
+}
+
+/// Bug 3: AST-level path navigation through `Expr::List` only set
+/// `path_node` on the per-element scope, never `list_context`, so
+/// referenced elements that used `&index` would error with
+/// "&index can only be used inside a list". The list step now mirrors
+/// `eval.rs` by building per-element thunks and installing
+/// `with_list_context` on the scope used to resolve into the chosen
+/// element.
+#[test]
+fn ast_path_into_list_element_carries_list_context() {
+    let result = eval_doc(
+        r#"{
+            list: [{ y: &index }],
+            x: &sibling.list[0].y
+        }"#,
+    )
+    .unwrap();
+    let Value::Dict(d) = result else { panic!() };
+    assert_eq!(d.map.get("x"), Some(&Value::Int(0)));
+}
+
+/// Bug 4: paths containing a dynamic segment must not be cached, and
+/// the dynamic expression must be evaluated exactly once. The previous
+/// implementation evaluated dynamics up-front to mint a cache key, then
+/// the actual lookup re-evaluated them — doubling host-side side
+/// effects. We now bypass the cache entirely for dynamic paths and let
+/// `eval_reference_path_from` perform the single evaluation.
+#[test]
+fn dynamic_path_segment_is_evaluated_only_once() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    static CALLS: AtomicUsize = AtomicUsize::new(0);
+    CALLS.store(0, Ordering::SeqCst);
+
+    struct CountingKey;
+    impl crate::native_fn::RelonFunction for CountingKey {
+        fn call(
+            &self,
+            _args: crate::native_fn::NativeArgs,
+            _range: relon_parser::TokenRange,
+        ) -> Result<Value, RuntimeError> {
+            CALLS.fetch_add(1, Ordering::SeqCst);
+            Ok(Value::String("a".to_string()))
+        }
+    }
+
+    let node = parse_doc(
+        r#"{
+            obj: { a: 1, b: 2 },
+            v: &sibling.obj[counting_key()]
+        }"#,
+    );
+    let mut ctx = Context::new().with_root(node);
+    ctx.register_fn("counting_key", Arc::new(CountingKey));
+    let result = Evaluator::new(Arc::new(ctx))
+        .eval_root(&Arc::new(Scope::default()))
+        .unwrap();
+    let Value::Dict(d) = result else { panic!() };
+    assert_eq!(d.map.get("v"), Some(&Value::Int(1)));
+    assert_eq!(
+        CALLS.load(Ordering::SeqCst),
+        1,
+        "dynamic key expression should evaluate exactly once"
+    );
+}

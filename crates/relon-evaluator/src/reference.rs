@@ -26,6 +26,21 @@ pub(crate) enum ReferenceStep {
     Value(Box<Value>),
 }
 
+/// Outcome of `resolve_dict_reference_step`. We need to distinguish
+/// "field genuinely doesn't exist" from "field exists but `#private`
+/// hides it across a dict boundary": in the latter case the caller
+/// must NOT fall back to `scope.locals`, since `#private` values are
+/// kept in the owning dict's locals (so same-dict siblings can see
+/// them) and would otherwise leak through cross-dict references.
+pub(crate) enum DictStepResult {
+    Found(ReferenceStep),
+    /// The named field exists on the dict but is `#private` and the
+    /// access crossed a dict boundary; treat as invisible without
+    /// consulting `locals` fallback.
+    PrivateBlocked,
+    NotFound,
+}
+
 /// Decrement `owning_depth` for the next step, or convert it to `None`
 /// once we've descended past the owning dict. See the docstring on
 /// `Evaluator::resolve_reference` for the meaning of the counter.
@@ -181,10 +196,16 @@ impl Evaluator {
                     .ok_or_else(|| {
                         RuntimeError::VariableNotFound("No root for &this".to_string(), range)
                     })?;
-                let display = self
-                    .cache_path_keys(path, scope)
-                    .map(|keys| keys.join("."))
-                    .unwrap_or_else(|| "&this".to_string());
+                // Build a display string from static segment names only.
+                // Bug 4: never evaluate dynamic segments solely to mint
+                // a display — the real lookup in `eval_reference_path_from`
+                // already evaluates them, and host fns with side effects
+                // would otherwise fire twice.
+                let display = if path.is_empty() {
+                    "&this".to_string()
+                } else {
+                    path.iter().map(|k| k.name()).collect::<Vec<_>>().join(".")
+                };
                 // `&this` has no owning-dict relationship — every step is
                 // a cross-dict access from the perspective of `#private`.
                 return self.eval_reference_path(root, path, scope, &display, range, None);
@@ -234,24 +255,46 @@ impl Evaluator {
         };
         target_path.extend_from_slice(path);
 
-        // Fix 1: build cache keys by *evaluating* dynamic segments so that
-        // `&sibling.obj[&sibling.k1]` and `&sibling.obj[&sibling.k2]` get
-        // distinct cache entries. Static-only paths still use `name()`.
-        let resolved_keys = self.cache_path_keys(&target_path, scope);
-        let path_str = resolved_keys
-            .as_ref()
-            .map(|v| v.join("."))
-            .unwrap_or_else(|| {
-                target_path
-                    .iter()
-                    .map(|k| k.name())
-                    .collect::<Vec<_>>()
-                    .join(".")
-            });
+        // Bug 4: paths containing a `TokenKey::Dynamic` segment skip the
+        // path_cache entirely. A previous attempt evaluated the dynamic
+        // expression up-front to mint a cache key, but the actual lookup
+        // in `eval_reference_path_from` re-evaluates it — doubling any
+        // host-side side effects (and leaking a discrepancy if the
+        // expression isn't pure). Static-only paths keep the cache.
+        let has_dynamic = target_path
+            .iter()
+            .any(|k| matches!(k, TokenKey::Dynamic(_, _)));
 
+        let static_keys: Option<Vec<String>> = if has_dynamic {
+            None
+        } else {
+            Some(target_path.iter().map(|k| k.name()).collect())
+        };
+        let path_str = match &static_keys {
+            Some(v) => v.join("."),
+            None => target_path
+                .iter()
+                .map(|k| k.name())
+                .collect::<Vec<_>>()
+                .join("."),
+        };
+
+        // Bug 2: include `owning_depth` in the cache key. Otherwise
+        // `&sibling.<priv>` (which is allowed within the owning dict)
+        // and `&root.<priv>` (which must be blocked) share the same
+        // path tuple at the top level and thus the same cache slot —
+        // the second lookup would hand back the first's value and
+        // bypass the privacy check entirely. Encoding `owning_depth`
+        // (None = always cross-dict, Some(n) = at most n owning steps)
+        // partitions the cache so the two reference styles can't
+        // collide.
+        let owning_tag = match owning_depth {
+            None => "x".to_string(),
+            Some(n) => format!("o{n}"),
+        };
         if !target_path.is_empty() {
-            if let Some(keys) = resolved_keys.as_ref() {
-                let cache_key = scope.path_cache_key(keys);
+            if let Some(keys) = static_keys.as_ref() {
+                let cache_key = format!("{owning_tag}|{}", scope.path_cache_key(keys));
                 if let Some(cached) = self.context.path_cache.lock().unwrap().get(&cache_key) {
                     return Ok(cached.clone());
                 }
@@ -261,8 +304,8 @@ impl Evaluator {
             self.eval_reference_path(root, &target_path, scope, &path_str, range, owning_depth);
         if let Ok(value) = &result {
             if !target_path.is_empty() {
-                if let Some(keys) = resolved_keys.as_ref() {
-                    let cache_key = scope.path_cache_key(keys);
+                if let Some(keys) = static_keys.as_ref() {
+                    let cache_key = format!("{owning_tag}|{}", scope.path_cache_key(keys));
                     self.context
                         .path_cache
                         .lock()
@@ -272,26 +315,6 @@ impl Evaluator {
             }
         }
         result
-    }
-
-    /// Resolve every `TokenKey::Dynamic` segment of `path` against `scope`
-    /// so the resulting `Vec<String>` can be used as a cache key. Returns
-    /// `None` if any dynamic segment fails to evaluate or yields a
-    /// non-key-typed value — in that case the caller bypasses the cache
-    /// rather than risk a key collision on `<dynamic>`.
-    fn cache_path_keys(&self, path: &[TokenKey], scope: &Arc<Scope>) -> Option<Vec<String>> {
-        let mut out = Vec::with_capacity(path.len());
-        for p in path {
-            match p {
-                TokenKey::Dynamic(expr, _) => match self.eval(expr, scope).ok()? {
-                    Value::String(s) => out.push(s),
-                    Value::Int(i) => out.push(i.to_string()),
-                    _ => return None,
-                },
-                _ => out.push(p.name()),
-            }
-        }
-        Some(out)
     }
 
     /// Build the scope used to force a sibling list element on `&prev` /
@@ -408,7 +431,7 @@ impl Evaluator {
                 // or an exhausted counter (block private).
                 let block_private = owning_depth != Some(0);
                 match self.resolve_dict_reference_step(pairs, &key, scope, block_private)? {
-                    Some(ReferenceStep::Thunk(thunk)) => {
+                    DictStepResult::Found(ReferenceStep::Thunk(thunk)) => {
                         if remaining_path.is_empty() {
                             self.force_thunk(&thunk)
                         } else if matches!(thunk.node.expr.as_ref(), Expr::Dict(_) | Expr::List(_))
@@ -435,10 +458,26 @@ impl Evaluator {
                             )
                         }
                     }
-                    Some(ReferenceStep::Value(value)) => {
+                    DictStepResult::Found(ReferenceStep::Value(value)) => {
                         self.lookup_value_path(*value, remaining_path, display_path, scope, range)
                     }
-                    None => {
+                    DictStepResult::PrivateBlocked => {
+                        // Field exists but is `#private` and we crossed
+                        // a dict boundary. Treat as invisible — and
+                        // critically, do NOT fall through to the
+                        // `locals` lookup below, since `#private` keeps
+                        // the value in the owning dict's locals and
+                        // that fallback would silently leak it.
+                        if is_optional {
+                            Ok(Value::Null)
+                        } else {
+                            Err(RuntimeError::VariableNotFound(
+                                display_path.to_string(),
+                                range,
+                            ))
+                        }
+                    }
+                    DictStepResult::NotFound => {
                         // Not a dict-field — fall back to scope locals
                         // so standalone `#schema X Body` directives
                         // (whose names live in `scope.locals` rather
@@ -487,7 +526,28 @@ impl Evaluator {
                 let index = key
                     .parse::<usize>()
                     .map_err(|_| RuntimeError::VariableNotFound(display_path.to_string(), range))?;
-                let item_scope = scope.with_path(key.clone());
+                // Bug 3: an AST path stepping *into* a list element
+                // (e.g. `&sibling.list[0].y`) must arrive there with a
+                // proper `list_context` so the element body can use
+                // `&index` / `&prev` / `&next`. Mirror the way `Expr::List`
+                // evaluation in `eval.rs` builds per-element thunks +
+                // `with_list_context`, so all list-context references
+                // resolve identically whether the element is being
+                // forced for materialization or via a reference path.
+                let element_thunks: Vec<Arc<Thunk>> = elements
+                    .iter()
+                    .enumerate()
+                    .map(|(i, el)| {
+                        let thunk_scope = scope.with_path(i.to_string());
+                        Arc::new(Thunk::new(
+                            el.clone(),
+                            thunk_scope,
+                            Vec::new(),
+                            String::new(),
+                        ))
+                    })
+                    .collect();
+                let item_scope = scope.with_list_context(index, element_thunks);
                 let item = elements.get(index);
                 if let Some(it) = item {
                     self.eval_reference_path_from(
@@ -525,7 +585,7 @@ impl Evaluator {
         part: &str,
         scope: &Arc<Scope>,
         block_private: bool,
-    ) -> Result<Option<ReferenceStep>, RuntimeError> {
+    ) -> Result<DictStepResult, RuntimeError> {
         for (key, value_node) in pairs.iter().rev() {
             match key {
                 TokenKey::Spread(_) => {
@@ -535,7 +595,9 @@ impl Evaluator {
                     let spread_value = self.eval(value_node, scope)?;
                     if let Value::Dict(d) = spread_value {
                         if let Some(value) = d.map.get(part) {
-                            return Ok(Some(ReferenceStep::Value(Box::new(value.clone()))));
+                            return Ok(DictStepResult::Found(ReferenceStep::Value(Box::new(
+                                value.clone(),
+                            ))));
                         }
                     }
                 }
@@ -555,17 +617,26 @@ impl Evaluator {
                         // Same-dict sibling access goes through
                         // `resolve_variable`, which reads the thunk table
                         // directly without coming through here.
+                        //
+                        // Bug 2: must report this as `PrivateBlocked`
+                        // rather than `NotFound`, so the caller doesn't
+                        // fall back to `scope.locals` — `#private`
+                        // values are deliberately seeded into the
+                        // owning dict's locals (eval.rs:767) so
+                        // same-dict siblings can see them, and a naive
+                        // locals fallback would leak that across the
+                        // boundary.
                         if block_private && is_private_field(value_node) {
-                            return Ok(None);
+                            return Ok(DictStepResult::PrivateBlocked);
                         }
                         if let Some(thunk) = scope.get_own_thunk(part) {
-                            return Ok(Some(ReferenceStep::Thunk(thunk)));
+                            return Ok(DictStepResult::Found(ReferenceStep::Thunk(thunk)));
                         }
                     }
                 }
             }
         }
-        Ok(None)
+        Ok(DictStepResult::NotFound)
     }
 
     fn eval_node_with_path_cache(
