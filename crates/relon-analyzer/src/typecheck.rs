@@ -227,8 +227,28 @@ impl<'a> Walker<'a> {
             }
             Expr::Binary(op, left, right) => {
                 self.check_binary_mismatch(node, *op, left, right, field_name);
-                self.visit_internal(left, None);
-                self.visit_internal(right, None);
+                // Stage 5: literal-only arithmetic — divide-by-zero
+                // and i64 overflow get surfaced statically. When the
+                // outer node folds to an error we *don't* recurse,
+                // because the same diagnostic would re-fire on every
+                // failing intermediate sub-node (`(1+2)*(3+4)/0` →
+                // both `0/0`'s parent and the outer node would
+                // double-report). Successful or non-foldable nodes
+                // still walk their children so we don't drop any
+                // sibling-arithmetic errors hidden under a non-
+                // arithmetic head.
+                if !self.check_const_fold(node) {
+                    self.visit_internal(left, None);
+                    self.visit_internal(right, None);
+                }
+            }
+            Expr::Unary(_, inner) => {
+                // Stage 5: same treatment as Binary — `-i64::MIN`
+                // overflows at fold time and we shouldn't continue
+                // down into the literal child once we've reported.
+                if !self.check_const_fold(node) {
+                    self.visit_internal(inner, None);
+                }
             }
             Expr::FnCall { path, args } => {
                 self.check_unresolved_fn_call(node, path);
@@ -446,6 +466,34 @@ impl<'a> Walker<'a> {
             found: format!("{} {op:?} {}", lt.name(), rt.name()),
             range: span_of(node.range),
         });
+    }
+
+    /// Stage 5: try to fold `node` as a literal arithmetic expression.
+    /// Pushes `ConstDivisionByZero` or `ConstNumericOverflow` when the
+    /// fold trips, and returns `true` so the caller can stop recursing
+    /// (avoiding duplicate diagnostics on overlapping subtrees).
+    fn check_const_fold(&mut self, node: &Node) -> bool {
+        match crate::const_fold::try_fold(node) {
+            Err(crate::const_fold::FoldError::DivByZero(range)) => {
+                self.tree.diagnostics.push(Diagnostic::ConstDivisionByZero {
+                    range: span_of(range),
+                });
+                true
+            }
+            Err(crate::const_fold::FoldError::Overflow { op, range }) => {
+                self.tree
+                    .diagnostics
+                    .push(Diagnostic::ConstNumericOverflow {
+                        op: format!("{op:?}"),
+                        range: span_of(range),
+                    });
+                true
+            }
+            // Whole subtree folds cleanly to a constant — nothing to
+            // diagnose. Fully-folded nodes still get walked normally
+            // (caller decides) so any sibling diagnostics stay live.
+            Ok(_) => false,
+        }
     }
 
     /// Build a type-scope reflecting the active dict / closure stack so
@@ -2255,6 +2303,145 @@ mod tests {
         assert!(
             missing.is_empty(),
             "stdlib functions without analyzer signatures: {missing:?}"
+        );
+    }
+
+    // ----- Stage 5: const-folding diagnostics -----------------------
+
+    fn const_div_zero_count(tree: &AnalyzedTree) -> usize {
+        tree.diagnostics
+            .iter()
+            .filter(|d| matches!(d, Diagnostic::ConstDivisionByZero { .. }))
+            .count()
+    }
+
+    fn const_overflow_count(tree: &AnalyzedTree) -> usize {
+        tree.diagnostics
+            .iter()
+            .filter(|d| matches!(d, Diagnostic::ConstNumericOverflow { .. }))
+            .count()
+    }
+
+    #[test]
+    fn stage5_div_by_zero_literal() {
+        let tree = analyze_str(r#"{ x: 1 / 0 }"#);
+        assert_eq!(const_div_zero_count(&tree), 1, "{:?}", tree.diagnostics);
+        assert!(tree.has_errors());
+    }
+
+    #[test]
+    fn stage5_mod_by_zero_literal() {
+        let tree = analyze_str(r#"{ x: 100 % 0 }"#);
+        assert_eq!(const_div_zero_count(&tree), 1, "{:?}", tree.diagnostics);
+    }
+
+    #[test]
+    fn stage5_overflow_add_at_max_plus_one() {
+        let tree = analyze_str(r#"{ x: 9223372036854775807 + 1 }"#);
+        assert_eq!(const_overflow_count(&tree), 1, "{:?}", tree.diagnostics);
+        assert!(tree.has_errors());
+    }
+
+    #[test]
+    fn stage5_overflow_chained_mul() {
+        // 1_000_000^4 = 1e24 > i64::MAX, traps on the third multiply.
+        let tree = analyze_str(r#"{ x: 1000000 * 1000000 * 1000000 * 1000000 }"#);
+        assert_eq!(const_overflow_count(&tree), 1, "{:?}", tree.diagnostics);
+    }
+
+    #[test]
+    fn stage5_subtree_folds_then_div_zero() {
+        // (1+2)*(3+4)/0 → fold collapses to 21/0, single diagnostic.
+        let tree = analyze_str(r#"{ x: (1 + 2) * (3 + 4) / 0 }"#);
+        assert_eq!(const_div_zero_count(&tree), 1, "{:?}", tree.diagnostics);
+        // No overflow false-positive on the inner sub-expressions.
+        assert_eq!(const_overflow_count(&tree), 0);
+    }
+
+    #[test]
+    fn stage5_unary_neg_i64_min_overflows() {
+        // i64::MIN = -9223372036854775808 — the `-` unary on
+        // `9223372036854775807 + 1` would itself overflow first; we use
+        // the canonical hex form via `(-9223372036854775807 - 1)` to
+        // construct i64::MIN as an Int and then unary-negate it.
+        let tree = analyze_str(r#"{ x: -(-9223372036854775807 - 1) }"#);
+        assert_eq!(const_overflow_count(&tree), 1, "{:?}", tree.diagnostics);
+    }
+
+    #[test]
+    fn stage5_variable_in_subtree_silent() {
+        // `a + 1` references a sibling, so the fold pass returns None
+        // and runtime keeps the verdict.
+        let tree = analyze_str(r#"{ a: 1, x: a + 1 }"#);
+        assert_eq!(const_div_zero_count(&tree), 0);
+        assert_eq!(const_overflow_count(&tree), 0);
+    }
+
+    #[test]
+    fn stage5_float_div_zero_silent() {
+        // 1.0 / 0.0 is +Inf in IEEE-754 — never errors.
+        let tree = analyze_str(r#"{ x: 1.0 / 0.0 }"#);
+        assert_eq!(const_div_zero_count(&tree), 0, "{:?}", tree.diagnostics);
+        assert_eq!(const_overflow_count(&tree), 0);
+    }
+
+    #[test]
+    fn stage5_fn_call_in_subtree_silent() {
+        // `len([1,2,3])` is non-foldable (FnCall); whole expression
+        // defers to runtime.
+        let tree = analyze_str(r#"{ x: 1 / len([1, 2, 3]) }"#);
+        assert_eq!(const_div_zero_count(&tree), 0, "{:?}", tree.diagnostics);
+    }
+
+    #[test]
+    fn stage5_ternary_node_itself_does_not_fold() {
+        // The Ternary expression is *not* foldable as a whole — even if
+        // both branches look literal, branch selection is data-driven.
+        // BUT the walker still descends into each branch, and a `1 / 0`
+        // Binary inside the `then` arm is a real sub-node that the
+        // walker hands to `check_const_fold`. Mirroring the List case
+        // below, we *do* expect the inner literal to fire.
+        let tree = analyze_str(r#"{ cond: true, x: cond ? 1 / 0 : 0 }"#);
+        assert_eq!(const_div_zero_count(&tree), 1, "{:?}", tree.diagnostics);
+    }
+
+    #[test]
+    fn stage5_ternary_with_runtime_in_branch_silent() {
+        // Variant where the branch contains a non-literal — the inner
+        // `a / 0` walker visit still folds, but the divisor is a literal
+        // 0 so it *should* still fire. To test the "no-fire when
+        // operand isn't literal" path we put the data-dependence on the
+        // dividend side and divide by a non-zero constant: `cond ? a /
+        // 1 : 0` should be silent because the inner Binary's left is a
+        // Variable head (no fold) and the divisor isn't zero.
+        let tree = analyze_str(r#"{ a: 1, cond: true, x: cond ? a / 1 : 0 }"#);
+        assert_eq!(const_div_zero_count(&tree), 0, "{:?}", tree.diagnostics);
+        assert_eq!(const_overflow_count(&tree), 0);
+    }
+
+    #[test]
+    fn stage5_div_zero_inside_list_still_fires() {
+        // The list itself isn't foldable but the walker descends into
+        // every list element — the inner `1 / 0` is still a Binary
+        // node visited by the walker, so the diagnostic still fires.
+        let tree = analyze_str(r#"{ x: [1 / 0] }"#);
+        assert_eq!(const_div_zero_count(&tree), 1, "{:?}", tree.diagnostics);
+    }
+
+    #[test]
+    fn stage5_diagnostic_blocks_evaluation_via_has_errors() {
+        // Stage 5 promotes ConstDivisionByZero / ConstNumericOverflow
+        // to Severity::Error so `has_errors()` returns true and hosts
+        // following the documented "skip eval on errors" pattern keep
+        // the runtime out.
+        let tree = analyze_str(r#"{ x: 9223372036854775807 + 1 }"#);
+        assert!(tree.has_errors(), "{:?}", tree.diagnostics);
+        assert_eq!(
+            tree.diagnostics
+                .iter()
+                .find(|d| matches!(d, Diagnostic::ConstNumericOverflow { .. }))
+                .map(|d| d.severity()),
+            Some(crate::Severity::Error)
         );
     }
 }

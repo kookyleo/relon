@@ -18,6 +18,7 @@
 
 pub mod cap;
 pub(crate) mod capability_check;
+pub(crate) mod const_fold;
 pub(crate) mod decorator_names;
 pub mod diagnostic;
 pub(crate) mod directive_names;

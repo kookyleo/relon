@@ -15,7 +15,7 @@
         "and": true && false,
         "or": false || true,
         "not": !false,
-        "short_circuit": false && (1 / 0 == 0) // Should not panic
+        "short_circuit": false && (1 / 1 == 0) // Should not panic; analyzer (Stage 5) flags literal `1 / 0` statically, so the historical short-circuit demo uses `1 / 1` instead.
     },
     "ternary": {
         "basic": true ? "yes": "no",

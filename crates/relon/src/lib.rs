@@ -718,40 +718,55 @@ mod tests {
 
     fn format_error_golden(root: &Path, file: &Path, error: Error) -> String {
         match error {
-            Error::AnalyzeWorkspace { workspace, .. } => {
+            Error::AnalyzeWorkspace { workspace, modules } => {
                 // After Stage 0, circular imports are caught by the
-                // workspace analyzer rather than the evaluator. Render
-                // the first CircularImport diagnostic in the same
-                // shape the runtime variant used to produce so the
-                // existing goldens still apply (with the chain list
-                // refreshed to the explicit start/end form).
+                // workspace analyzer rather than the evaluator. After
+                // Stage 5, literal-only arithmetic faults are caught by
+                // the per-module analyzer. Render whichever flavor the
+                // current error carries, in the same shape the runtime
+                // variant used to produce so the existing goldens still
+                // apply (with the chain list refreshed to the explicit
+                // start/end form).
                 let source = std::fs::read_to_string(file).unwrap();
-                let circular = workspace
-                    .iter()
-                    .find_map(|d| match d {
-                        WorkspaceDiagnostic::CircularImport { chain, range } => {
-                            Some((chain.clone(), *range))
-                        }
-                        _ => None,
-                    })
-                    .unwrap_or_else(|| panic!("expected CircularImport, got {workspace:?}"));
-                let (chain, span) = circular;
-                let (start_line, start_column) = line_column_at(&source, span.offset());
-                let (end_line, end_column) = line_column_at(&source, span.offset() + span.len());
-                let normalized_chain = chain
-                    .iter()
-                    .map(|path| {
-                        Path::new(path)
-                            .strip_prefix(root)
-                            .unwrap_or_else(|_| Path::new(path))
-                            .to_string_lossy()
-                            .to_string()
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                format!(
-                    "CircularImport\nchain:\n{normalized_chain}\nrange: {start_line}:{start_column}-{end_line}:{end_column}\n"
-                )
+                if let Some((chain, span)) = workspace.iter().find_map(|d| match d {
+                    WorkspaceDiagnostic::CircularImport { chain, range } => {
+                        Some((chain.clone(), *range))
+                    }
+                    _ => None,
+                }) {
+                    let (start_line, start_column) = line_column_at(&source, span.offset());
+                    let (end_line, end_column) =
+                        line_column_at(&source, span.offset() + span.len());
+                    let normalized_chain = chain
+                        .iter()
+                        .map(|path| {
+                            Path::new(path)
+                                .strip_prefix(root)
+                                .unwrap_or_else(|_| Path::new(path))
+                                .to_string_lossy()
+                                .to_string()
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    return format!(
+                        "CircularImport\nchain:\n{normalized_chain}\nrange: {start_line}:{start_column}-{end_line}:{end_column}\n"
+                    );
+                }
+
+                // Stage 5: const-fold diagnostics surface as module-
+                // level Errors. Render the first one we find so the
+                // golden test remains a single deterministic block.
+                if let Some(diag) = modules.iter().find_map(|(_, d)| match d {
+                    Diagnostic::ConstNumericOverflow { .. }
+                    | Diagnostic::ConstDivisionByZero { .. } => Some(d.clone()),
+                    _ => None,
+                }) {
+                    return format_const_fold_diagnostic(&source, &diag);
+                }
+
+                panic!(
+                    "expected CircularImport or const-fold diagnostic, got workspace={workspace:?} modules={modules:?}"
+                );
             }
             Error::Eval(RuntimeError::CircularImport(chain, span)) => {
                 let source = std::fs::read_to_string(file).unwrap();
@@ -790,6 +805,21 @@ mod tests {
             }
             other => panic!("unexpected error for {}: {other:?}", file.display()),
         }
+    }
+
+    /// Stage 5: render a `ConstNumericOverflow` / `ConstDivisionByZero`
+    /// in the same line/column shape the runtime variant used to
+    /// produce. Lets the existing `*.txt` goldens stay tiny: one tag
+    /// line plus one `range:` line.
+    fn format_const_fold_diagnostic(source: &str, diag: &Diagnostic) -> String {
+        let (tag, span) = match diag {
+            Diagnostic::ConstNumericOverflow { range, .. } => ("NumericOverflow", *range),
+            Diagnostic::ConstDivisionByZero { range, .. } => ("DivisionByZero", *range),
+            other => panic!("not a const-fold diagnostic: {other:?}"),
+        };
+        let (start_line, start_column) = line_column_at(source, span.offset());
+        let (end_line, end_column) = line_column_at(source, span.offset() + span.len());
+        format!("{tag}\nrange: {start_line}:{start_column}-{end_line}:{end_column}\n")
     }
 
     fn line_column_at(source: &str, offset: usize) -> (u32, usize) {

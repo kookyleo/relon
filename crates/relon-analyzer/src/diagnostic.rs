@@ -296,6 +296,31 @@ pub enum Diagnostic {
         #[label("would be denied at runtime")]
         range: SourceSpan,
     },
+
+    #[error("division by zero in constant expression")]
+    #[diagnostic(
+        code(relon::analyze::const_div_zero),
+        help(
+            "The right-hand operand of `/` or `%` folds to a literal `0`; the same expression would raise DivisionByZero at runtime."
+        )
+    )]
+    ConstDivisionByZero {
+        #[label("divisor evaluates to 0 here")]
+        range: SourceSpan,
+    },
+
+    #[error("numeric overflow in constant expression ({op})")]
+    #[diagnostic(
+        code(relon::analyze::const_numeric_overflow),
+        help(
+            "This arithmetic on integer literals exceeds i64 range; the same expression would raise NumericOverflow at runtime."
+        )
+    )]
+    ConstNumericOverflow {
+        op: String,
+        #[label("overflows here")]
+        range: SourceSpan,
+    },
 }
 
 impl Diagnostic {
@@ -327,7 +352,13 @@ impl Diagnostic {
             // Stage 4: capability errors are derivable from source +
             // host_fn_gates + caps alone — surface as Error so the
             // evaluator never reaches the gated call.
-            | Diagnostic::CapabilityRequired { .. } => Severity::Error,
+            | Diagnostic::CapabilityRequired { .. }
+            // Stage 5: literal-only arithmetic that would explode at
+            // runtime (div-by-zero / i64 overflow) is fully derivable
+            // from source — promote to Error so the evaluator never
+            // re-discovers the same problem.
+            | Diagnostic::ConstDivisionByZero { .. }
+            | Diagnostic::ConstNumericOverflow { .. } => Severity::Error,
             // Informational: the analyzer's view is conservative — a
             // spread, closure binding, or runtime-computed field may
             // still resolve, so we don't gate evaluation on it.
