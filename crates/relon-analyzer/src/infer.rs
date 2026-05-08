@@ -32,6 +32,37 @@ use crate::tree::AnalyzedTree;
 /// two passes share one shape.
 pub(crate) type SchemaIndex = HashMap<String, HashMap<String, TypeNode>>;
 
+/// Map from schema-name → list of direct base schema names. Drives the
+/// Stage 2.3 brand / inheritance check inside [`InferredType::subsumes_with`].
+/// `schema A {}; schema B A + { ... };` would store `bases["B"] = ["A"]`.
+pub(crate) type SchemaBaseIndex = HashMap<String, Vec<String>>;
+
+/// Walk the base-schema chain looking for `target` reachable from
+/// `child`. Treats unknown intermediate names as a soft stop (returns
+/// false) — the caller already handles the `name == head` exact-match
+/// case before delegating here.
+fn schema_extends(idx: &SchemaBaseIndex, child: &str, target: &str) -> bool {
+    use std::collections::HashSet;
+    let mut visited: HashSet<String> = HashSet::new();
+    let mut stack: Vec<String> = vec![child.to_string()];
+    while let Some(name) = stack.pop() {
+        if !visited.insert(name.clone()) {
+            continue;
+        }
+        if name == target {
+            return true;
+        }
+        if let Some(parents) = idx.get(&name) {
+            for parent in parents {
+                if !visited.contains(parent) {
+                    stack.push(parent.clone());
+                }
+            }
+        }
+    }
+    false
+}
+
 /// A type derived from a source expression by static inference. Compared
 /// to the older string-based representation, this carries enough
 /// information to validate generics, joins, and schema references
@@ -91,9 +122,24 @@ impl InferredType {
     }
 
     /// True if a value of `self` is assignable to a slot declared as
-    /// `expected`. Conservative: anything we can't classify returns
-    /// `true` (the runtime check still owns the authoritative call).
+    /// `expected`. Consults `bases` (when provided) so that a value
+    /// typed as a derived schema satisfies a slot expecting one of its
+    /// bases (Stage 2.3). Conservative: anything we can't classify
+    /// returns `true` (the runtime check still owns the authoritative
+    /// call).
+    #[cfg(test)]
     pub(crate) fn subsumes(&self, expected: &TypeNode) -> bool {
+        self.subsumes_with(expected, None)
+    }
+
+    /// Same as [`subsumes`] but consults a [`SchemaBaseIndex`] when
+    /// comparing custom-schema heads, so a value typed as a derived
+    /// schema satisfies a slot expecting one of its bases (Stage 2.3).
+    pub(crate) fn subsumes_with(
+        &self,
+        expected: &TypeNode,
+        bases: Option<&SchemaBaseIndex>,
+    ) -> bool {
         // Shorthand: `Any` accepts anything; `T?` accepts `Null` or
         // recursively-stripped `T`.
         if let InferredType::Any = self {
@@ -102,7 +148,13 @@ impl InferredType {
         if expected.is_optional && matches!(self, InferredType::Null) {
             return true;
         }
-        // Multi-segment custom types (`module.Name`): defer to runtime.
+        // Multi-segment custom types (`module.Name`): conservative path
+        // — without a workspace import index visible here we can't tell
+        // whether `path[0]` is a module alias or a nested-dict scope
+        // path. The downstream `re_check_unknown_types` pass already
+        // catches the `pkg.Wrong` case at the param/return level. For
+        // typed-binding subsumption we stay conservative and let
+        // runtime own the verdict.
         if expected.path.len() != 1 {
             return true;
         }
@@ -128,7 +180,12 @@ impl InferredType {
             // sub-walks of dict literals against schemas; we accept here
             // and let runtime own deeper validation.
             _ => match self {
-                InferredType::Schema(name) => name == head,
+                InferredType::Schema(name) => {
+                    name == head
+                        || bases
+                            .map(|idx| schema_extends(idx, name, head))
+                            .unwrap_or(false)
+                }
                 InferredType::Variant(enum_name, _) => enum_name == head,
                 _ => true,
             },

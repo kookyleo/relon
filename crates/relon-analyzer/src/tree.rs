@@ -10,7 +10,7 @@ use crate::resolve::ResolvedRef;
 use crate::root_schemas::RootSchemaDecl;
 use crate::schema::SchemaDef;
 use relon_parser::{Node, NodeId};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 /// Aggregated output of `analyze`. Cheap to construct, cheap to share via
@@ -46,6 +46,12 @@ pub struct AnalyzedTree {
     pub root_schemas: Vec<RootSchemaDecl>,
     /// Errors and warnings from every pass, in source order.
     pub diagnostics: Vec<Diagnostic>,
+    /// Stage 2.4: the host-registered native fn names known when this
+    /// tree was analyzed. Used by `typecheck` to avoid flagging
+    /// `host_fn(...)` calls as `UnresolvedReference`. Empty for the
+    /// legacy single-file `analyze` entry; populated when the caller
+    /// drives analysis through `analyze_with_options`.
+    pub host_fn_names: HashSet<String>,
 }
 
 impl AnalyzedTree {

@@ -29,11 +29,12 @@ pub(crate) fn check_main_return(root: &Node, tree: &mut AnalyzedTree) {
     // Build a scope rooted at the document so `Variable(x)` heads in
     // the body can find their typed siblings.
     let schemas = crate::typecheck::build_schema_index(tree);
+    let bases = crate::typecheck::build_base_index(tree);
     let scope = TypeScope::new(tree, &schemas);
     let Some(body_ty) = infer_type(root, &scope) else {
         return;
     };
-    if body_ty.subsumes(return_type) {
+    if body_ty.subsumes_with(return_type, Some(&bases)) {
         return;
     }
     // Avoid double-reporting when the body's inference already

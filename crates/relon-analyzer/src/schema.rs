@@ -120,6 +120,46 @@ pub struct BaseRef {
     pub node: Arc<Node>,
 }
 
+/// Stage 2.8: walk every collected schema's field type hints and emit
+/// `UnknownTypeName` for heads that aren't builtins, prelude names, or
+/// declared schemas. Multi-segment heads (`pkg.Type`) are handled by the
+/// workspace-level `re_check_unknown_types` post-pass.
+pub fn check_schema_field_types(tree: &mut AnalyzedTree) {
+    use crate::diagnostic::Diagnostic;
+    let mut diagnostics: Vec<Diagnostic> = Vec::new();
+    // Snapshot the set of declared schema names so we don't borrow
+    // `tree.schemas` while iterating.
+    let known_names: std::collections::HashSet<String> = tree
+        .schemas
+        .values()
+        .filter_map(|d| d.name.clone())
+        .chain(tree.root_schemas.iter().map(|d| d.name.clone()))
+        .collect();
+    for def in tree.schemas.values() {
+        for field in &def.fields {
+            let Some(t) = &field.type_hint else { continue };
+            if t.path.len() != 1 {
+                continue;
+            }
+            let head = &t.path[0];
+            if relon_parser::is_builtin_type_name(head) {
+                continue;
+            }
+            if matches!(head.as_str(), "Result" | "Option") {
+                continue;
+            }
+            if known_names.contains(head) {
+                continue;
+            }
+            diagnostics.push(Diagnostic::UnknownTypeName {
+                name: head.clone(),
+                range: span_of(t.range),
+            });
+        }
+    }
+    tree.diagnostics.extend(diagnostics);
+}
+
 /// Walk `root` and populate `tree.schemas` with every statically-classifiable
 /// `#schema` definition. Root-level name-body directives are owned by
 /// [`crate::root_schemas::collect_root_schemas`] (which keeps a separate

@@ -254,17 +254,51 @@ pub(crate) fn build_frame(pairs: &[(TokenKey, Node)]) -> ScopeFrame {
                 frame.fields.insert(name.clone(), value.id);
             }
             TokenKey::Spread(_) => {
-                // We don't try to chase the spread source here — the
-                // common shapes (`...&base`, `...module.X`) need
-                // runtime evaluation to know what keys land. Mark the
-                // frame as dynamically open so type-checker doesn't
-                // false-positive on names that may come from the spread.
-                frame.has_dynamic_spread = true;
+                // Stage 2.5: when the spread inner is a dict literal we
+                // can statically merge its String-keyed pairs into the
+                // current frame's `fields` so a sibling reference to
+                // one of the spread keys resolves without falling back
+                // to the dynamic-spread escape hatch. Anything else
+                // (FnCall, Variable / Reference, complex expressions)
+                // stays dynamic — we'd need full evaluation semantics
+                // to chase those.
+                if let Expr::Dict(inner_pairs) = &*value.expr {
+                    merge_dict_into_frame(inner_pairs, &mut frame);
+                } else {
+                    frame.has_dynamic_spread = true;
+                }
             }
             _ => {}
         }
     }
     frame
+}
+
+/// Merge the String-keyed pairs of a dict literal into `frame.fields`
+/// for the Stage 2.5 spread-literal static-merge. Nested spreads inside
+/// the inner dict are also followed when their inner is itself a dict
+/// literal, but only one level — preventing recursion blow-ups on
+/// pathological inputs while still covering the common
+/// `{ ...{ ...{a: 1} } }` shape.
+fn merge_dict_into_frame(pairs: &[(TokenKey, Node)], frame: &mut ScopeFrame) {
+    for (key, value) in pairs {
+        match key {
+            TokenKey::String(name, _, _) => {
+                frame.fields.insert(name.clone(), value.id);
+            }
+            TokenKey::Spread(_) => {
+                if let Expr::Dict(inner_pairs) = &*value.expr {
+                    // One-level recursion guard via direct call (no
+                    // shared visited set needed: dict literals are tree-
+                    // shaped, not graph-shaped).
+                    merge_dict_into_frame(inner_pairs, frame);
+                } else {
+                    frame.has_dynamic_spread = true;
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 pub(crate) fn path_head(path: &[TokenKey]) -> Option<String> {

@@ -296,7 +296,27 @@ pub fn analyze_entry<L: ModuleLoader>(
     entry_current_dir: std::path::PathBuf,
     loader: &mut L,
 ) -> WorkspaceTree {
-    crate::workspace_build::build(entry_id, entry_source, entry_current_dir, loader)
+    crate::workspace_build::build(
+        entry_id,
+        entry_source,
+        entry_current_dir,
+        loader,
+        &crate::AnalyzeOptions::default(),
+    )
+}
+
+/// Same as [`analyze_entry`] but threads caller-supplied
+/// [`crate::AnalyzeOptions`] (currently the host-registered fn name
+/// allowlist) through to every per-module `analyze` call so closure
+/// free-var diagnostics align with the host's actual capability grant.
+pub fn analyze_entry_with_options<L: ModuleLoader>(
+    entry_id: String,
+    entry_source: &str,
+    entry_current_dir: std::path::PathBuf,
+    loader: &mut L,
+    options: &crate::AnalyzeOptions,
+) -> WorkspaceTree {
+    crate::workspace_build::build(entry_id, entry_source, entry_current_dir, loader, options)
 }
 
 #[cfg(test)]

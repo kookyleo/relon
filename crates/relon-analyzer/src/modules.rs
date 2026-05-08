@@ -24,6 +24,10 @@ pub struct ModuleImport {
     /// `true` when the bindspec is `*` — every exported binding from
     /// the module is brought into scope.
     pub spread: bool,
+    /// Destructure entries `[(upstream_name, Some(local_alias) | None)]`
+    /// for `#import { a, b as c } from "...";`. Empty for alias / spread
+    /// imports. Stage 2.1 uses this to seed cross-module type names.
+    pub destructure: Vec<(String, Option<String>)>,
     /// Source range of the `#import ...` directive.
     pub range: TokenRange,
 }
@@ -59,19 +63,19 @@ fn visit(node: &Node, tree: &mut AnalyzedTree) {
 }
 
 fn lower_import(spec: &DirectiveImportSpec, path: &str, range: TokenRange) -> ModuleImport {
-    let (alias, spread) = match spec {
-        DirectiveImportSpec::Alias(name) => (Some(name.clone()), false),
-        DirectiveImportSpec::Spread => (None, true),
+    let (alias, spread, destructure) = match spec {
+        DirectiveImportSpec::Alias(name) => (Some(name.clone()), false, Vec::new()),
+        DirectiveImportSpec::Spread => (None, true, Vec::new()),
         // Destructure list lives only on the AST today — it's lowered
-        // to per-binding scope inserts by the evaluator. Surface "no
-        // alias, not a spread" so existing consumers (LSP) still get a
-        // meaningful module-import record.
-        DirectiveImportSpec::Destructure(_) => (None, false),
+        // to per-binding scope inserts by the evaluator. Surface the
+        // entries so cross-module type resolution can pick them up.
+        DirectiveImportSpec::Destructure(entries) => (None, false, entries.clone()),
     };
     ModuleImport {
         path: Some(path.to_string()),
         alias,
         spread,
+        destructure,
         range,
     }
 }

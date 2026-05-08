@@ -4,6 +4,7 @@
 //! (which LSP and the evaluator pin against) separate from the BFS /
 //! cycle-detection machinery, which is implementation-detail-heavy.
 
+use crate::diagnostic::Diagnostic;
 use crate::tree::AnalyzedTree;
 use crate::workspace::{LoadError, ModuleLoader, WorkspaceDiagnostic, WorkspaceTree};
 use miette::SourceSpan;
@@ -33,6 +34,7 @@ pub(crate) fn build<L: ModuleLoader>(
     entry_source: &str,
     entry_current_dir: PathBuf,
     loader: &mut L,
+    options: &crate::AnalyzeOptions,
 ) -> WorkspaceTree {
     let mut ws = WorkspaceTree::new();
     ws.entry_id = entry_id.clone();
@@ -49,7 +51,7 @@ pub(crate) fn build<L: ModuleLoader>(
     match parse_document(entry_source) {
         Ok(node) => {
             let arc_node = Arc::new(node);
-            let tree = crate::analyze(&arc_node);
+            let tree = crate::analyze_with_options(&arc_node, options);
             let imports = collect_import_targets(&tree, &entry_id, &entry_current_dir);
             ws.import_graph.insert(
                 entry_id.clone(),
@@ -77,7 +79,7 @@ pub(crate) fn build<L: ModuleLoader>(
                 if !seen_raw.insert(key) {
                     continue;
                 }
-                process_import(item, loader, &mut ws, &mut queue, &mut module_dirs);
+                process_import(item, loader, &mut ws, &mut queue, &mut module_dirs, options);
             }
         }
         Err(parse_err) => {
@@ -106,6 +108,17 @@ pub(crate) fn build<L: ModuleLoader>(
     //    Done after the BFS so every reachable module is in `modules`.
     detect_cross_module_schema_collisions(&mut ws);
 
+    // 4. Stage 2.1: with all reachable modules analyzed, build a
+    //    workspace-wide import index keyed by canonical id and walk
+    //    each module's diagnostics to *remove* `UnknownTypeName`
+    //    warnings whose head is actually visible through a cross-module
+    //    `#import`. This is a pure post-pass over `modules` — it never
+    //    re-runs analyzer state, only filters already-emitted
+    //    diagnostics. The single-file `analyze` call has no idea what
+    //    modules `#import * from "..."` brings in, so the false-positive
+    //    correction has to happen here.
+    re_check_unknown_types(&mut ws);
+
     ws
 }
 
@@ -115,6 +128,7 @@ fn process_import<L: ModuleLoader>(
     ws: &mut WorkspaceTree,
     queue: &mut VecDeque<PendingImport>,
     module_dirs: &mut HashMap<String, PathBuf>,
+    options: &crate::AnalyzeOptions,
 ) {
     let span = SourceSpan::from(item.range);
     match loader.load(&item.raw_path, &item.importer_dir) {
@@ -140,7 +154,7 @@ fn process_import<L: ModuleLoader>(
             match parse_document(&loaded.source) {
                 Ok(node) => {
                     let arc_node = Arc::new(node);
-                    let tree = crate::analyze(&arc_node);
+                    let tree = crate::analyze_with_options(&arc_node, options);
                     let imports =
                         collect_import_targets(&tree, &loaded.canonical_id, &loaded.current_dir);
                     ws.import_graph.insert(
@@ -319,6 +333,138 @@ fn locate_import_range(ws: &WorkspaceTree, importer: &str, target: &str) -> Opti
     None
 }
 
+/// Names from cross-module `#import` directives that *one specific
+/// importer* can see, organized by binding kind.
+///
+/// Built per-module by [`build_import_index`] using the workspace's
+/// module graph + already-analyzed `root_schemas` lists. Stage 2 uses
+/// it for two purposes: (a) re-checking `UnknownTypeName` (this file)
+/// and (b) `pkg.Type` multi-segment subsumption (`infer.rs`).
+#[derive(Debug, Default, Clone)]
+pub(crate) struct WorkspaceImportIndex {
+    /// `alias → set of root-level schema names exposed by the imported
+    /// module`. Drives `pkg.Type` resolution.
+    pub aliased: HashMap<String, HashSet<String>>,
+    /// Names brought in via `#import * from "..."` — the union of every
+    /// spread target's root-level schema names. Drives bare `Type`
+    /// resolution for the importer.
+    pub spread: HashSet<String>,
+    /// Names brought in via `#import { a, b as c } from "..."`. Map
+    /// keys are the *local* names (alias when present, else upstream).
+    /// Values are the upstream schema names — currently unused by
+    /// downstream passes but kept for future "go to definition" tooling.
+    pub destructured: HashMap<String, String>,
+}
+
+impl WorkspaceImportIndex {
+    /// True when `name` is visible to the importer through some
+    /// cross-module form (spread or destructure). Alias-form imports
+    /// don't expose schema names directly — they go through `pkg.Type`.
+    pub(crate) fn knows(&self, name: &str) -> bool {
+        self.spread.contains(name) || self.destructured.contains_key(name)
+    }
+}
+
+/// Build a [`WorkspaceImportIndex`] for one module, using its already-analyzed
+/// `tree.imports` plus the workspace's module graph + per-module
+/// `root_schemas` lists. The function is read-only over `ws` and safe to
+/// call after `build()`'s BFS has populated every reachable module.
+pub(crate) fn build_import_index(ws: &WorkspaceTree, importer_id: &str) -> WorkspaceImportIndex {
+    let mut index = WorkspaceImportIndex::default();
+    let Some(tree) = ws.modules.get(importer_id) else {
+        return index;
+    };
+    let edges = ws
+        .import_graph
+        .get(importer_id)
+        .cloned()
+        .unwrap_or_default();
+    // `tree.imports` and `edges` are walked in lockstep — the workspace
+    // build pass rewrote each `import_graph[importer]` entry to the
+    // canonical id of the resolved module, in source order, so the i-th
+    // import's resolved target is `edges[i]`. Imports that failed to
+    // resolve still occupy the slot (with the raw path), but their
+    // module won't be in `ws.modules`.
+    for (idx, imp) in tree.imports.iter().enumerate() {
+        let Some(target_id) = edges.get(idx) else {
+            continue;
+        };
+        let Some(target_tree) = ws.modules.get(target_id) else {
+            continue;
+        };
+        let exported_names: HashSet<String> = target_tree
+            .root_schemas
+            .iter()
+            .map(|d| d.name.clone())
+            .collect();
+        if let Some(alias) = &imp.alias {
+            index
+                .aliased
+                .entry(alias.clone())
+                .or_default()
+                .extend(exported_names.iter().cloned());
+            continue;
+        }
+        if imp.spread {
+            index.spread.extend(exported_names);
+            continue;
+        }
+        if !imp.destructure.is_empty() {
+            for (upstream, alias) in &imp.destructure {
+                // Only expose names actually exported by the target.
+                if !exported_names.contains(upstream) {
+                    continue;
+                }
+                let local = alias.clone().unwrap_or_else(|| upstream.clone());
+                index.destructured.insert(local, upstream.clone());
+            }
+        }
+    }
+    index
+}
+
+/// Stage 2.1 post-pass: walk every module's diagnostics and drop
+/// `UnknownTypeName` entries whose head is now resolvable through the
+/// workspace-level import index. Handles the cross-module variants of
+/// the Stage 1.8 check (`#main(LibType x)` after `#import * from "lib"`,
+/// `#main(lib.Type x)` after `#import lib from "lib"`, ...).
+fn re_check_unknown_types(ws: &mut WorkspaceTree) {
+    // Pre-build every module's index so the inner loop doesn't
+    // recompute on each diagnostic. Borrow `ws` immutably here, then
+    // drop the borrow before mutating per-module trees below.
+    let mut indexes: HashMap<String, WorkspaceImportIndex> = HashMap::new();
+    let module_ids: Vec<String> = ws.modules.keys().cloned().collect();
+    for id in &module_ids {
+        indexes.insert(id.clone(), build_import_index(ws, id));
+    }
+    for id in &module_ids {
+        let Some(index) = indexes.get(id) else {
+            continue;
+        };
+        let Some(arc_tree) = ws.modules.get_mut(id) else {
+            continue;
+        };
+        // `Arc::get_mut` works because `build()` is the only caller and
+        // we still hold the unique reference. If a future caller starts
+        // sharing the Arc earlier, swap to `Arc::make_mut` (clone-on-
+        // write); the compiler will surface the missing `Clone` impl.
+        let Some(tree) = Arc::get_mut(arc_tree) else {
+            continue;
+        };
+        tree.diagnostics.retain(|d| !is_now_known_type(d, index));
+    }
+}
+
+/// Decide whether `d` is an `UnknownTypeName` whose head is visible
+/// through `index`. Anything else (any other diagnostic, or an
+/// `UnknownTypeName` head that's still unknown) is kept as-is.
+fn is_now_known_type(d: &Diagnostic, index: &WorkspaceImportIndex) -> bool {
+    let Diagnostic::UnknownTypeName { name, .. } = d else {
+        return false;
+    };
+    index.knows(name)
+}
+
 /// Detect schemas with the same name that surface from two different
 /// spread imports of the entry file. Only top-level schemas (entries
 /// in `tree.root_schemas`) participate — a schema that's nested inside
@@ -388,6 +534,24 @@ mod tests {
     use crate::workspace::{LoadError, LoadedModule, ModuleLoader, WorkspaceDiagnostic};
     use std::collections::HashMap;
     use std::path::Path;
+
+    /// Test wrapper — calls the production `build` with default
+    /// `AnalyzeOptions`, matching the pre-Stage-2.4 signature used by
+    /// every existing test in this module.
+    fn build<L: ModuleLoader>(
+        entry_id: String,
+        entry_source: &str,
+        entry_current_dir: PathBuf,
+        loader: &mut L,
+    ) -> WorkspaceTree {
+        super::build(
+            entry_id,
+            entry_source,
+            entry_current_dir,
+            loader,
+            &crate::AnalyzeOptions::default(),
+        )
+    }
 
     /// In-memory test loader: maps raw paths to (canonical_id, source).
     /// `current_dir` is ignored — every entry is "absolute" in the
@@ -757,5 +921,97 @@ mod tests {
         // A cycle chain is `[v0, v1, ..., vk, v0]` — same id at both
         // ends, length >= 2.
         chain.len() >= 2 && chain.first() == chain.last()
+    }
+
+    // === Stage 2.1: cross-module type resolution ===
+
+    /// Helper: count `UnknownTypeName` diagnostics for a specific name
+    /// across every module's per-tree diagnostics.
+    fn unknown_type_count(ws: &WorkspaceTree, name: &str) -> usize {
+        ws.modules
+            .values()
+            .flat_map(|t| t.diagnostics.iter())
+            .filter(|d| matches!(d, Diagnostic::UnknownTypeName { name: n, .. } if n == name))
+            .count()
+    }
+
+    #[test]
+    fn spread_import_clears_unknown_type_for_main_param() {
+        // Stage 2.1 forward: `#import * from "./lib"` exposes `LibType`
+        // at the entry, so the entry's `#main(LibType x)` no longer
+        // reports `UnknownTypeName`.
+        let mut loader = MapLoader::new();
+        loader.add(
+            "./lib",
+            "/abs/lib",
+            r#"#schema LibType { Int id: * }
+            { ok: 1 }"#,
+        );
+        let ws = build(
+            "/abs/entry".to_string(),
+            r#"#import * from "./lib"
+            #main(LibType x)
+            { ok: 1 }"#,
+            PathBuf::from("/abs"),
+            &mut loader,
+        );
+        assert_eq!(
+            unknown_type_count(&ws, "LibType"),
+            0,
+            "{:?}",
+            ws.modules
+                .get("/abs/entry")
+                .map(|t| t.diagnostics.clone())
+                .unwrap_or_default()
+        );
+    }
+
+    #[test]
+    fn destructure_import_clears_unknown_type_for_main_param() {
+        // Stage 2.1: `#import { LibType } from "./lib"` should also expose
+        // the name; alias-form `as LocalName` should expose under the alias.
+        let mut loader = MapLoader::new();
+        loader.add(
+            "./lib",
+            "/abs/lib",
+            r#"#schema LibType { Int id: * }
+            #schema OtherType { Int j: * }
+            { ok: 1 }"#,
+        );
+        let ws = build(
+            "/abs/entry".to_string(),
+            r#"#import { LibType, OtherType as Local } from "./lib"
+            #main(LibType x, Local y)
+            { ok: 1 }"#,
+            PathBuf::from("/abs"),
+            &mut loader,
+        );
+        assert_eq!(unknown_type_count(&ws, "LibType"), 0);
+        assert_eq!(unknown_type_count(&ws, "Local"), 0);
+    }
+
+    #[test]
+    fn unknown_type_still_flags_when_no_import_exposes_it() {
+        // Stage 2.1 reverse: a name that genuinely isn't anywhere stays
+        // flagged after the post-pass.
+        let mut loader = MapLoader::new();
+        loader.add(
+            "./lib",
+            "/abs/lib",
+            r#"#schema LibType { Int id: * }
+            { ok: 1 }"#,
+        );
+        let ws = build(
+            "/abs/entry".to_string(),
+            r#"#import * from "./lib"
+            #main(NotExist x)
+            { ok: 1 }"#,
+            PathBuf::from("/abs"),
+            &mut loader,
+        );
+        assert!(
+            unknown_type_count(&ws, "NotExist") >= 1,
+            "expected NotExist to remain unresolved"
+        );
     }
 }
