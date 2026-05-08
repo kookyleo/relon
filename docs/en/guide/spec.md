@@ -1,80 +1,91 @@
 # Relon Language Specification
 
-> **Status**: v1 candidate. This document is the executable expression
-> of the Logic-as-Portable-Data promise. Any runtime claiming
-> conformance (the reference implementation is Rust) MUST behave as
-> described here; scripts MAY only depend on names and contracts
-> declared here.
+> **Status**: v1 candidate. This document is the executable
+> formulation of Relon's Logic-as-Portable-Data promise — any conformant
+> runtime (the reference implementation is in Rust) MUST behave per the
+> semantics described here; scripts may rely only on the names and
+> contracts the spec declares.
 
-## 1. Design Commitment
+## 1. Design commitment
 
 > **Same source + same input → byte-identical output.**
 
-This is the load-bearing axiom. Every constraint below exists so that
-sentence holds across runtimes, machines, and time.
+This is the load-bearing axis of the spec. Every constraint below
+exists to make that single sentence remain true across runtimes,
+machines, and time.
 
-### 1.1 What "Conformant Runtime" Means
+### 1.1 Conformant runtime
 
-An implementation is **conformant** iff for every source + input pair
-covered by this spec it:
+An implementation is **conformant** if and only if, for every
+source + input combination covered by this spec:
 
-1. **Parses**: accepts every source the reference parser accepts;
-   rejects every source the reference parser rejects.
-2. **Evaluates**: produces a `Value` byte-identical to the reference
-   implementation.
-3. **Capabilities**: implements the §4 `Capabilities` model with no
-   side door letting scripts bypass it.
-4. **Standard library**: ships every std module listed in §6 with the
-   semantics defined there.
-5. **Error kinds**: uses the stable taxonomy in §5 (human-readable
-   messages MAY be localized).
+1. **Parse**: it accepts every source the reference parser accepts and
+   rejects every source it rejects.
+2. **Evaluate**: it produces a `Value` byte-identical to the reference.
+3. **Capability model**: it implements the `Capabilities` defined in
+   §4 with no escape hatch that lets a script bypass them.
+4. **Standard library**: it implements every std module listed in §6
+   with the documented semantics.
+5. **Error codes**: error kind tags use the stable list in §5 (the
+   human-readable text may be localized).
 
-Implementation details outside this scope (internal caches, threading,
-binary size) are runtime-private and don't affect conformance.
+Implementation details left unspecified (internal caches, threading,
+build-artifact size) are up to each runtime and don't affect
+conformance.
 
-### 1.2 Cross-runtime determinism — what counts as "input"
+### 1.2 Conditions for cross-runtime determinism
 
 In "same source + same input → byte-identical output", **input** means
-an explicit `Value` tree pushed by the host before evaluation via
-`Context::with_input(value)` and read by the script through the
-reserved root name `input`.
+the explicit `Value` tree the host pushes via
+`Evaluator::run_main(scope, args)` before evaluation; the script
+declares the expected shape via a `#main(...)` signature and accesses
+the bindings by parameter name.
 
-The return values of host-registered native fns are **not** input.
-Therefore:
+Results returned from native functions registered via `register_fn`
+are **not** input. Therefore:
 
-- **Push** (host completes I/O before evaluation, materializes data
-  into a `Value`, pushes via `with_input`; optionally enforces the
-  shape via an `@input` schema in the script): cross-runtime
-  determinism is in scope of this spec.
-- **Pull** (script invokes host fns to fetch external data during
-  evaluation): the script author **opts out** of cross-runtime
-  determinism — different hosts / runtimes / moments see different
-  external state, and the spec neither requires nor can guarantee
-  agreement.
+- **Push form** (host completes I/O before evaluation, materializes
+  the data into a `Value`, and pushes it via `run_main(args)`; the
+  script declares the contract with `#main(...)`): cross-runtime
+  determinism is in scope.
+- **Pull form** (the script pulls external data through native
+  functions during evaluation): the author has **deliberately
+  given up** cross-runtime determinism — different host /
+  runtime / time inherently sees different network and external
+  state, and the spec neither requires nor can guarantee parity.
 
-See `host-integration.md` for the recommended push-by-default pattern.
+See `docs/zh/guide/host-integration.md` for the implementer guide
+(the comprehensive guide is currently Chinese-first).
 
-### 1.3 Reserved root names
+### 1.3 sigil split: `@` vs `#`
 
-The following identifiers are **reserved root names**; conformant
-runtimes MUST implement the spec'd semantics, and scripts MUST NOT
-shadow them with dict fields, closure parameters, or `where`-clause
-binders:
+Relon separates "metadata stacked on a node" into two disjoint
+namespaces. This is a hard spec requirement — a conformant runtime
+MUST NOT allow a single name to exist in both `@`-form and `#`-form.
 
-| Name | Semantics |
-|---|---|
-| `input` | The file's push-style external input (§1.2). Reference form `input.foo.bar`. When the host hasn't pushed and there's no `@input`, reading `input.foo` fails with `VariableNotFound`. |
+| sigil | Purpose | Who can register |
+| --- | --- | --- |
+| `@name(...)` | **Decorator** — value transform | Built-in + host + user (any callable binding) |
+| `#name ...` | **Directive** — declaration / structure / metadata | Built-in only; fixed set; not user-extensible |
 
-## 2. Determinism Contract
+The complete v1 directive set: `#main(...)`, `#schema X Body`,
+`#import ... from "..."`, `#private`, `#default`, `#expect`,
+`#msg`, `#error`, `#brand X`.
 
-To make §1's axiom hold, every conformant runtime MUST:
+The complete v1 built-in decorator set: `@value(...)`. Any other
+`@name(...)` is parsed as "look up `name` in the current scope; pass
+the value below as the last positional argument".
+
+## 2. Determinism contract
+
+To honor §1, every conformant runtime MUST:
 
 ### 2.1 Dict iteration order
 
-`Value::Dict` iterates in **Unicode-codepoint key order** (the
-reference implementation uses `BTreeMap`). Hash randomization,
-insertion-order preservation, and locale-dependent collation are all
-forbidden.
+`Value::Dict` iterates in **Unicode codepoint lexicographic order of
+the keys** (the reference implementation uses `BTreeMap`). Hash
+randomization, insertion-order preservation, and locale-dependent
+sorting are forbidden.
 
 ```relon
 { "b": 1, "a": 2 } | dict.keys()  // always ["a", "b"]
@@ -82,355 +93,314 @@ forbidden.
 
 ### 2.2 List iteration order
 
-`Value::List` iterates in insertion order.
+`Value::List` iterates in insertion order. No surprises.
 
-### 2.3 Floating point
+### 2.3 Floats
 
-* The numeric kinds are `Int` (i64) and `Float` (IEEE-754 binary64 /
-  `f64`).
-* Float comparison uses IEEE-754 total ordering (`OrderedFloat<f64>`):
-  * `NaN == NaN` is `true` (different from Rust's `PartialEq`; this
-    is a deliberate spec choice so `Dict<String, Float>` keys remain
-    equality-comparable).
+* Numeric types: `Int` (i64) and `Float` (IEEE-754 binary64 / `f64`).
+* Float comparison uses the IEEE-754 total order
+  (`OrderedFloat<f64>`):
+  * `NaN == NaN` is `true` (a deliberate spec choice that lets
+    `Dict<String, Float>` etc. round-trip).
   * `-0.0 == 0.0` is `true`.
-  * Sort order treats `NaN` as greater than every non-NaN.
-* Float arithmetic follows IEEE-754; fast-math, automatic FMA fusion,
-  and constant-folding that yields different rounding are forbidden.
-* Integer arithmetic on `i64` follows Rust release semantics: overflow
-  wraps. Saturating or panicking strategies are forbidden by the spec.
+  * In sorts, `NaN` is greater than every non-NaN.
+* Float arithmetic obeys IEEE-754; fast-math, automatic FMA fusing,
+  and compile-time constant folding that changes rounding are
+  forbidden.
+* Integer arithmetic on `i64` follows Rust semantics: overflow wraps
+  in release. The spec mandates this wrap behavior — saturating /
+  panicking implementations are non-conformant.
 
 ### 2.4 Strings
 
-* All strings are UTF-8 and compared by Unicode code point.
-* `string.split` etc. operate at the **byte** level (the reference
-  implementation's `String::split`); grapheme-cluster operations must
-  be supplied by the host as native fns when needed.
+* All strings are UTF-8 encoded; comparison and ordering are by
+  Unicode codepoint.
+* String operations like `string.split` are **byte-based** (matching
+  Rust's `String::split`). For grapheme-cluster operations the host
+  must expose a native function explicitly.
 
-### 2.5 The unobservable environment
+### 2.5 Invisible environment
 
-Scripts MAY NOT read:
+Scripts CANNOT read:
 
-* System clock (`now()`, `SystemTime::now()` …). Pass time through
-  input.
-* System timezone, locale.
+* The system clock (`now()`, `SystemTime::now()`, …). If you need
+  time, push it via `#main`.
+* System timezone or locale.
 * Environment variables.
-* Random sources (`rand`, `/dev/urandom`).
-* Process metadata (PID, CPU count).
-* HashMap hash seeds. Internal data-structure usage is fine; nothing
-  may surface to the script.
+* Random numbers (`rand`, `/dev/urandom`).
+* Process ID, CPU count, etc.
+* HashMap hash seeds (allowed for runtime-internal data structures
+  but never exposed to scripts).
 
 ### 2.6 Error determinism
 
-Error **kind labels** (`TypeMismatch`, `ModuleNotFound`,
-`CapabilityDenied`, …) and trigger locations (`TokenRange`) MUST be
-identical across runtimes; only human-readable messages MAY be
+The error **kind tag** (`TypeMismatch`, `ModuleNotFound`,
+`CapabilityDenied`, …) and the trigger location (`TokenRange`)
+MUST be identical across runtimes; only the human-readable text may be
 localized.
 
-## 3. Lexical / Syntactic Layer
+## 3. Lexical / syntax
 
 Reference implementation: `crates/relon-parser`.
 
 A conformant runtime MUST accept every source the reference parser
 accepts and reject every source it rejects. The grammar corpus is
-defined by `fixtures/` + `examples/` + the parser's own test suite.
+defined by `fixtures/`, `examples/`, and `crates/relon-parser/tests/`.
 
-> A friendly syntax tour lives in the Chinese guide:
-> [`/zh/guide/syntax`](../../zh/guide/syntax.md). The English version is
-> on the roadmap.
+### 3.1 The five directive shapes
 
-## 4. Capability Model
+Every `#name ...` directive matches one of five fixed shapes. The
+shape is determined by the directive name (looked up in a parser
+table) and is not user-extensible:
 
-### 4.1 Zero ambient privileges by default
+| Shape | Form | Example | Used for |
+| --- | --- | --- | --- |
+| Bare | `#name` | `#private` | Field flag |
+| Value | `#name <expr>` | `#default 0`, `#expect "must be ≥0"`, `#brand Color` | Metadata / value transform |
+| NameBody | `#name <ident> <body>` | `#schema User { String name: * }` | Named declaration (no colon) |
+| Import | `#import <bindspec> from "<path>"` | `#import * from "std/list"` | Import |
+| Main | `#main(name: Type, ...)` | `#main(u: User, cart: Cart)` | Entry signature |
 
-A freshly-constructed `Context` grants nothing. Scripts cannot:
+`<bindspec>` is one of: a single ident (namespace), `*` (spread), or
+`{ a, b as c }` (destructuring).
 
-* Read the filesystem (`@import("./local.relon")` →
-  `CapabilityDenied`).
-* Call any host fn registered via `register_fn_with_caps`.
-* Run unbounded (the host SHOULD set `max_steps` /
-  `max_value_bytes`).
+`#schema X: Body` is dict-field-position sugar — the `:` belongs to
+the dict-field grammar, not the directive grammar; semantically it's
+equivalent to `#schema X Body`.
 
-### 4.2 Explicit grant or nothing
+## 4. Capability model
 
-Hosts grant capabilities by mutating `Capabilities` fields
-explicitly:
+### 4.1 Default-zero
+
+A freshly constructed `Context` has **no capabilities**. Scripts:
+
+* Cannot read the filesystem
+  (`#import x from "./local.relon"` → `CapabilityDenied`).
+* Cannot call any native function registered via
+  `register_fn_with_caps`.
+* Have no step / value-size budget (`None` means "unenforced", but
+  hosts SHOULD set both based on trust level).
+
+### 4.2 Explicit grants
+
+The host grants via `Capabilities` fields:
 
 ```rust
 let mut ctx = Context::sandboxed();
-ctx.capabilities.reads_fs = true;                          // permit @import on real FS
-ctx.capabilities.allow_native_fn.insert("fs.read".into());  // permit a specific native fn
-ctx.capabilities.max_steps = Some(1_000_000);               // bound step count
+ctx.capabilities.reads_fs = true;                          // permit #import on real FS
+ctx.capabilities.allow_native_fn.insert("fs.read".into());  // permit calls to a named host fn
+ctx.capabilities.max_steps = Some(1_000_000);               // step budget
 ```
 
-Or all at once via `Capabilities::all_granted()` — but this is an
-explicit, audit-visible grant, not an implicit "trusted mode". **The
-spec forbids any `trusted()`-style shortcut constructor**: scripts
-must be able to observe what the host did and didn't grant on every
-runtime.
+Or grant everything at once via `Capabilities::all_granted()` — but
+that's an explicit, auditable grant rather than an implicit "trusted"
+mode. **The spec forbids any `trusted()`-style shortcut constructor**:
+scripts must be able to observe what the host did and didn't grant on
+any conformant runtime.
 
-### 4.3 Std virtual modules are exempt from `reads_fs`
+### 4.3 std modules' special status
 
-`@import("std/list")` etc. resolve through a virtual `StdModuleResolver`
-and do not consume `reads_fs`. This is deliberate: std is part of the
-spec, not something the host audits.
+`#import * from "std/list"`, `#import string from "std/string"`, etc.
+resolve through a virtual `StdModuleResolver` and **do not consume**
+the `reads_fs` capability. This is intentional — std is part of the
+spec, not a trust decision.
 
-## 5. Error Kinds (Stable Taxonomy)
+## 5. Error kinds
+
+Conformant runtimes MUST use these stable tags:
 
 | Kind | Trigger |
 |---|---|
-| `Parse` | lexical / syntactic error |
-| `Analyze` | aggregated semantic-analysis errors |
-| `TypeMismatch` | runtime value violates declared type |
-| `VariableNotFound` | reference to an undeclared name |
-| `FunctionNotFound` | call to an unregistered native fn / closure |
-| `CircularImport` | `@import` cycle |
-| `ModuleNotFound` | no resolver returned the module |
-| `ModuleParseError` | imported file failed to parse |
-| `IoError` | real I/O error during a permitted FS op |
-| `CapabilityDenied` | §4 rejection |
-| `StepLimitExceeded` | `max_steps` exhausted (evaluator step budget) |
-| `RecursionLimitExceeded` | type-check / schema-validation recursion depth exceeded the runtime's safety bound — a separate axis from `max_steps`; hosts can't relax it by raising the step budget |
+| `Parse` | Lexical / syntactic error |
+| `Analyze` | Semantic-analysis error aggregate (`#schema` heterogeneity, untyped fields, …) |
+| `TypeMismatch` | Runtime value violates declared type |
+| `VariableNotFound` | Reference to undefined name (schema, alias, function) |
+| `FunctionNotFound` | Call to unregistered native fn or closure |
+| `CircularImport` | `#import` cycle |
+| `ModuleNotFound` | No resolver returned the module |
+| `ModuleParseError` | Module file failed to parse |
+| `IoError` | Genuine I/O error (within an allowed `reads_fs` op) |
+| `CapabilityDenied` | Blocked by §4 |
+| `StepLimitExceeded` | `max_steps` budget exhausted |
+| `RecursionLimitExceeded` | Type-check / schema-validate recursion exceeds the runtime's safety cap (separate budget from `max_steps`) |
 | `ValueTooLarge` | `max_value_bytes` exceeded |
-| `LibraryAsEntry` | `@library` file evaluated as host entry |
-| `UnsupportedOperator` | invalid operation or type combination |
+| `NoMainSignature` | File lacks `#main(...)` but `run_main` was called |
+| `MissingMainArg` | Host did not push a value for a declared `#main` parameter |
+| `UnexpectedMainArg` | Host pushed an arg name not in the `#main` signature |
+| `MainArgTypeMismatch` | Pushed value doesn't match the declared parameter type |
+| `UnsupportedOperator` | Invalid operation or type combination |
 
-## 6. Standard Library Catalog (Spec-mandated)
+## 6. Standard library (spec-mandated)
 
-A conformant runtime MUST implement these. Scripts access them via
-`@import("std/<name>", as="<alias>")`.
+Every conformant runtime MUST implement these std modules. Scripts
+import them via `#import <bindspec> from "std/<name>"`.
 
-### 6.1 Language-level builtins (no import required)
+### 6.1 Language-level builtins (no import needed)
 
-Three names belong to the **language**, not to a std module — they are
-metadata operations on data structures themselves and are
-unconditionally available:
+Three names belong to the **language**, not std modules — they are
+metadata operations on the data structures themselves and every
+runtime ships them unconditionally:
 
 * `len(value)` — element count of a `String` / `List` / `Dict`
   (`Int`).
 * `range(end)` / `range(start, end)` — half-open `Int` list.
-* `type(value)` — type name as `String`: `"Int"`, `"Float"`,
-  `"String"`, `"Bool"`, `"List"`, `"Dict"`, `"Closure"`, `"Null"`.
+* `type(value)` — the value's type name (`"Int"`, `"Float"`,
+  `"String"`, `"Bool"`, `"List"`, `"Dict"`, `"Closure"`, `"Null"`).
 
-### 6.2 Std module catalog
+### 6.2 std module catalog
 
 | Module | Functions | Notes |
 |---|---|---|
-| `std/list` | `map`, `filter`, `reduce`, `contains`, `sum`, `avg`, `len`, `first`, `last`, `compact`, `flatten` | functional list ops |
-| `std/dict` | `merge`, `keys`, `values`, `has_key` | dict meta-ops |
-| `std/string` | `split`, `join`, `replace`, `upper`, `lower`, `contains` | string ops |
-| `std/math` | `abs`, `max`, `min`, `clamp` | numeric ops |
-| `std/is` | `int`, `string`, `bool`, `float`, `list`, `dict`, `number`, `empty` | type predicates |
-| `std/value` | `default` | value guards (null-coalesce, etc.) |
+| `std/list` | `map`, `filter`, `reduce`, `contains`, `sum`, `avg`, `len`, `first`, `last`, `compact`, `flatten` | Functional list ops |
+| `std/dict` | `merge`, `keys`, `values`, `has_key` | Dict meta ops |
+| `std/string` | `split`, `join`, `replace`, `upper`, `lower`, `contains` | String ops |
+| `std/math` | `abs`, `max`, `min`, `clamp` | Numeric ops |
+| `std/is` | `int`, `string`, `bool`, `float`, `list`, `dict`, `number`, `empty` | Type predicates |
+| `std/value` | `default` | Value guards (null-coalesce, …) |
 
-Each function's precise contract is defined by the reference Relon
-source at `crates/relon-evaluator/src/std_relon/<name>.relon`; **those
-`.relon` files are part of the spec**.
+Each function's exact contract is defined by the reference
+implementation's `crates/relon-evaluator/src/std_relon/<name>.relon`
+sources; those `.relon` files are themselves part of the spec
+(reference behavior of the std modules).
 
-### 6.3 The `ensure.*` validators
+### 6.3 `ensure.*` validators
 
-`@schema` machinery depends internally on `ensure.*` functions. These
-are implementation details of the schema system and are not part of
-the user-facing API — but a conformant runtime MUST still register
-them with the spec'd semantics, otherwise `@schema` will diverge.
+The `#schema` machinery depends internally on `ensure.*` functions
+(`ensure.int`, `ensure.string`, etc.). They are an implementation
+detail and not part of the user-facing API — but conformant runtimes
+MUST provide them with the spec'd semantics, otherwise `#schema`
+will diverge.
 
-### 6.4 `@input(name=SchemaRef)` — program input contract
+### 6.4 `#main(name: Type, ...)` — entry signature
 
-`@input(...)` is a **root-level decorator** (placed before the file's
-root dict). It declares one **named slot** of the host-pushed input,
-addressed in `name=SchemaRef` form: `name` is the slot's identifier
-inside the merged wrapper, `SchemaRef` is a previously declared
-`@schema` (in the same file or imported). Form:
+`#main(...)` is a **root-level directive** (placed before the file's
+root dict). It declares the file as an **entry program**: the host
+must push named arguments matching the signature via
+`Evaluator::run_main(scope, args)`, and the runtime validates them
+before the body walk. Form:
 
 ```relon
-@input(req=Req)
+#main(req: Req)
 {
-    @schema Req: {
+    #schema Req {
         String name: *,
-        @default(0)
+        #default 0
         Int retries: *
     },
-    greeting: f"hello ${input.req.name}, retries=${input.req.retries}"
+    greeting: f"hello ${req.name}, retries=${req.retries}"
 }
 ```
 
-Multiple `@input(...)` decorations are merged into one virtual
-wrapper schema `{ <slot1>: <schema1>, <slot2>: <schema2>, ... }`:
+Multiple parameters are listed side-by-side:
 
 ```relon
-@input(user=User)
-@input(cart=Cart)
+#main(user: User, cart: Cart)
 {
-    @schema User: { String name: * },
-    @schema Cart: { Int total: * },
-    summary: f"${input.user.name} - ${input.cart.total}"
+    #schema User { String name: * },
+    #schema Cart { Int total: * },
+    summary: f"${user.name} - ${cart.total}"
 }
 ```
 
-**Required semantics** (every conformant runtime MUST):
+**Semantic requirements** (every conformant runtime MUST implement):
 
-1. `@input(...)` must be a **root-level decorator**; placing it on a
-   field or a nested dict has no effect.
-2. Each arg must be `name=SchemaRef`:
-   - Missing slot name (positional arg) → `Analyze` error
-     `InputDecoratorMissingName`.
-   - Same slot name declared twice → `Analyze` error
-     `DuplicateInputName`.
-   - Bare `@input` (no args) → `Analyze` error
-     `InputDecoratorEmpty`.
-3. **Before** evaluating the document body, validate
-   `Context::with_input(value)` against the merged wrapper:
-   - The pushed value must be a `Value::Dict`; otherwise
-     `TypeMismatch`.
-   - Every declared slot must be present in the pushed dict;
-     otherwise `TypeMismatch` (`expected: input slot '<name>'`,
-     `found: missing`).
-   - Each slot value is validated against the `Value::Schema`
-     produced by its `SchemaRef`: field type mismatches and missing
-     required fields produce `TypeMismatch`; fields with
-     `@default(...)` are filled when not pushed.
-4. The validated tree is bound to the reserved root name `input`
-   (§1.3); scripts read `input.<slot>.<field>`.
-5. **No `@input(...)`** in the file: `with_input` data binds to
-   `input` as-is without schema validation; missing-field reads
-   downgrade to runtime `VariableNotFound`.
-6. **Cross-file `@input` aggregation** (i.e. `@input(...)` in
-   imported library files contributing to the entry's contract) is
-   **not in v1**. v1 validates only the entry file's
-   `@input(...)`; libraries should export plain `@schema`s and let
-   the entry reference them via `@input(slot=lib.Schema)`.
+1. `#main(...)` MUST be a **root-level directive** (placed before the
+   file's root dict); writing it on a nested dict is meaningless.
+2. Each parameter MUST be `name: Type`:
+   - The same parameter name declared twice → `Analyze` error
+     `DuplicateMainParam`.
+   - The type MUST resolve to a declared `#schema` or a built-in
+     type.
+3. Before the body walk, the data pushed via
+   `Evaluator::run_main(scope, args)` MUST be validated against the
+   signature:
+   - Missing arg → `MissingMainArg`.
+   - Extra arg → `UnexpectedMainArg`.
+   - Type mismatch → `MainArgTypeMismatch`.
+4. After validation, each parameter is bound **directly into the
+   root scope's locals by parameter name** — scripts access them
+   directly as `req`, `user`, etc., not via an `input.` prefix.
+5. **No `#main(...)`** in the file: calling `run_main` raises
+   `NoMainSignature`. Conversely, calling `eval_root` on a `#main`
+   file (treating it as a library) also raises `NoMainSignature`
+   — edge cases are caught at the boundary.
+6. **Cross-file `#main` aggregation** (i.e., `#main(...)` in
+   imported libraries also affects the entry's contract) is out of
+   scope for v1 — only the entry file's `#main(...)` is validated.
+   Library files typically don't declare `#main`, and the entry
+   references them via `#import`.
 
-`@input(...)` writes the external-data contract into the .relon source
-rather than the host: every conformant runtime sees the same script
-and validates pushed data the same way — the missing piece §1.2
-needed to make cross-runtime determinism actually hold.
+`#main(...)` writes the entry contract into the `.relon` source
+rather than the host, so any conformant runtime sees the same
+script and validates against the same schema — the keystone of §1.2's
+cross-runtime determinism guarantee.
 
-#### 6.4.1 `@schema(Name={...})` — root-decorator schema sugar
+## 7. Boundary of host-registered extensions
 
-Co-locate schema declarations with `@input(...)` in the root-decorator
-stack instead of stuffing them inside the root dict body. Pure
-**layout sugar** — semantically equivalent to declaring `Name` as a
-`@private @schema Name: { ... }` field of the root dict.
-
-```relon
-// Old: schema lives inside the dict body, referenced by @input from outside
-@input(req=Req)
-{
-    @schema Req: { String name: *, Int retries: * },
-    greeting: f"hello ${input.req.name}"
-}
-
-// New: schema and @input sit side-by-side in the same decorator stack
-@schema(Req={ String name: *, Int retries: * })
-@input(req=Req)
-{
-    greeting: f"hello ${input.req.name}"
-}
-```
-
-Multiple schemas at once:
-
-```relon
-@schema(User={ String name: * })
-@schema(Cart={ Int total: * })
-@input(user=User)
-@input(cart=Cart)
-{
-    summary: f"${input.user.name} - ${input.cart.total}"
-}
-```
-
-**Rules:**
-
-1. `@schema(...)` only carries this sugar at the **root-decorator**
-   level; the same form on a nested dict has no special meaning.
-2. Each arg must be `Name=Body`:
-   - Missing `Name` (positional arg) → `Analyze` error
-     `RootSchemaDecoratorMissingName`.
-   - `Body` must be a dict literal `{ ... }` or an `Enum<...>` type
-     expression; anything else → `RootSchemaInvalidValue`.
-   - Same schema name declared twice in this stack →
-     `DuplicateRootSchemaName`.
-   - Same name declared *both* at the root-decorator level and as a
-     dict-field `@schema X: ...` → `RootSchemaCollidesWithField`
-     (pick one form).
-   - Bare `@schema()` (no args) → `RootSchemaDecoratorEmpty`.
-3. The registered schema is visible **both** from the root dict body
-   and from `@input(...)` SchemaRefs; resolution path is identical to
-   the field-form `@schema`.
-4. This is pure layout sugar — no new semantics. Every conformant
-   runtime MUST treat it as equivalent to a `@private @schema Name:
-   Body` field, otherwise it diverges from §1.2 cross-runtime
-   determinism.
-
-## 7. Host-Registered Extensions
-
-Hosts MAY inject through `register_fn` / `register_fn_with_caps` /
+The host can inject via `register_fn` / `register_fn_with_caps` /
 `register_decorator`:
 
 * Native functions (data in, data out).
-* Decorator plugins (`@expect`, custom `@brand` behaviors, …).
+* Decorator plugins (custom `@value` replacements, domain-specific
+  transformers).
 
-But **the spec does not require other runtimes to provide
-same-named extensions** — a script that depends on host-injected
-names has stepped outside the portability promise; behavior is
-guaranteed only on that host.
+But **the spec does not require other runtimes to provide these
+host-injected names**. A script that depends on a host-injected name
+forfeits cross-runtime portability for that scope and only works on
+that host.
 
 Best practice:
 
-* Ship business libraries as `.relon` files (mark with `@library`)
-  distributed via `@import`. They are portable across runtimes by
-  construction.
-* Reach for native fns only when host capabilities are required (FS,
-  database, HTTP), and declare them with `register_fn_with_caps` +
-  `NativeFnGate`.
+* Ship business libraries as `.relon` files (libraries without
+  `#main`) and distribute them via `#import`. They are portable
+  across runtimes by construction.
+* Register native functions only when "needs host capability"
+  applies (FS, DB, HTTP), and tag them via `register_fn_with_caps`
+  with the appropriate `NativeFnGate`.
 
 ## 8. Versioning
 
-* This document is **spec v1**.
-* Std modules version under semver: a function-semantic change is a
-  major bump; new functions are minor.
-* `@import("std/<name>")` binds to the runtime's latest compatible
-  version by default. Future revisions may add
-  `@import("std/<name>", version="1.x")` for explicit pinning.
-* Runtimes MUST publish (via `relon --version` or equivalent) the
-  spec version they implement.
+* This document tracks **spec v1**.
+* std modules evolve via semver: behavior changes bump major;
+  additions bump minor.
+* `#import * from "std/<name>"` binds to the runtime's latest
+  compatible version. A future direction is
+  `#import * from "std/<name>@1.x"` for explicit pinning.
+* Runtimes MUST report the spec version they implement in metadata
+  (`relon --version` or equivalent API).
 
-## 9. Implementing a New Runtime
+## 9. Building a new runtime
 
-To bring up a Go / TS / Swift / your-language conformant runtime:
+If you want to write a Go / TS / Swift / your-language conformant
+runtime:
 
-1. **Start from the syntax corpus**: ensure your parser accepts every
-   `.relon` under `fixtures/` and `examples/` and produces an AST
-   isomorphic to the reference's.
-2. **Reuse the std `.relon` sources**: the files under
-   `crates/relon-evaluator/src/std_relon/` ARE the std module's
-   reference behavior. You only need to implement the `_*`
-   intrinsics (`_list_map`, `_string_split`, …) as natives; the rest
-   of the std functions are pure relon and are shared across
-   runtimes.
-3. **Pass the conformance suite**: `fixtures/golden/` holds reference
-   outputs. Any conformant runtime running the same source MUST
-   produce identical JSON.
-4. **Align error kinds**: see §5.
+1. **Start from the grammar corpus**: ensure your parser accepts every
+   `.relon` in `fixtures/` and `examples/` and produces an AST
+   isomorphic to the reference.
+2. **Reuse the std `.relon` sources**:
+   `crates/relon-evaluator/src/std_relon/*.relon` files are the
+   reference behavior of std modules; you only need to implement the
+   `_*` intrinsics (`_list_map`, …) as native; the rest is plain
+   Relon and shared across runtimes.
+3. **Pass conformance tests**: `fixtures/golden/` lists reference
+   outputs; any conformant runtime running the same source MUST
+   produce the same JSON.
+4. **Align error codes** per §5.
 
-> Detailed implementer guide currently lives in the Chinese docs:
-> [`/zh/guide/host-integration`](../../zh/guide/host-integration.md).
-> Read it side-by-side with this spec; the English version is on the
-> roadmap.
+## Appendix A: Saying goodbye to the "configuration language" framing
 
-## Appendix A: Departing from the "configuration language" framing
+Historically Relon docs framed it as a "typed business-config DSL".
+That framing was **inaccurate**: with each host extending freely and
+scripts depending on ambient state, cross-runtime parity has nothing
+to stand on.
 
-Earlier docs described Relon as a "typed business-config DSL". That
-framing is **incorrect** in retrospect: under it, each host extends
-freely, scripts depend on ambient state, and cross-host consistency
-is unknowable.
+Logic-as-Portable-Data replaces that framing. It means:
 
-Logic-as-Portable-Data replaces it. The implication is:
-
-* No "trusted mode" letting scripts bypass the sandbox.
-* No runtime-private global names letting scripts depend implicitly.
+* No "trusted mode" lets scripts bypass the sandbox.
+* No runtime-private global names for scripts to depend on
+  implicitly.
 * No unspecified float / iteration-order behavior.
-* The std library is part of the spec, not an optional extension.
+* std is part of the spec, not an optional extension.
 
-These choices all serve one goal: **logic flows between systems like
-JSON does, with byte-identical results.**
+Each choice serves the same goal: **logic flows between systems like
+JSON, with completely deterministic results.**

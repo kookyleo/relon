@@ -39,7 +39,6 @@ export default defineConfig({
               { text: '函数与闭包', link: '/zh/guide/functions' },
               { text: '类型与契约 (Schema)', link: '/zh/guide/types' },
               { text: '模块与作用域', link: '/zh/guide/modules' },
-              { text: '库与入口 (@library)', link: '/zh/guide/library-vs-entry' },
             ]
           },
           {

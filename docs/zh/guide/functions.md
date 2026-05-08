@@ -26,7 +26,7 @@
 当你需要将一个快速的小逻辑传递给类似 `map` 或 `filter` 这样的高阶函数时，内联的箭头函数是最佳选择：
 
 ```relon
-@import("std/list", as="list")
+#import list from "std/list"
 {
     numbers: [1, 2, 3, 4, 5],
     // 使用标准库的高阶函数
@@ -42,7 +42,7 @@
 在处理数据流时，嵌套的函数调用 `a(b(c(x)))` 往往难以阅读。Relon 支持使用 `|` 管道运算符将前一个表达式的求值结果，隐式地作为第一个参数传递给下一个函数调用。
 
 ```relon
-@import("std/string", as="string")
+#import string from "std/string"
 {
     words: "apple,banana,cherry",
 

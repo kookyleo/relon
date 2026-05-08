@@ -13,8 +13,8 @@ runtime 上观察到宿主授予了什么、没授予什么。
 
 不可信脚本能干什么坏事？
 
-- **读文件**：`@import("/etc/passwd", as="...")` 把宿主进程能读的
-  文件吸出来。
+- **读文件**：`#import x from "/etc/passwd"` 把宿主进程能读的文件吸
+  出来。
 - **求值爆炸**：写一个无限递归 / 指数递归的 closure 把进程吃光。
 - **超大 value**：构造一个百万元素的 list / dict 把内存吃光。
 - **调宿主注册的危险函数**：宿主注册了 `secret.read`、`db.query`，
@@ -35,7 +35,7 @@ use std::sync::Arc;
 
 let mut ctx = Context::sandboxed();
 
-// 1. 给一个文件读 root（如果脚本需要 @import 别的 .relon）
+// 1. 给一个文件读 root（如果脚本需要 #import 别的 .relon）
 ctx.capabilities.reads_fs = true;
 ctx.prepend_module_resolver(Arc::new(
     FilesystemModuleResolver::with_root_dir("/var/relon-userscripts"),
@@ -84,10 +84,10 @@ pub struct Capabilities {
 
 ### `reads_fs: bool`
 
-宏观开关：脚本是否允许通过 `@import("./local.relon")`、
-`@import("/abs/path/x.relon")` 触发文件读。**只是开关，不是路径限
-制**——具体允许哪些路径由 `FilesystemModuleResolver` 的 root 决定
-（见下文）。
+宏观开关：脚本是否允许通过 `#import lib from "./local.relon"`、
+`#import lib from "/abs/path/x.relon"` 触发文件读。**只是开关，不
+是路径限制**——具体允许哪些路径由 `FilesystemModuleResolver` 的
+root 决定（见下文）。
 
 `std/...` 虚拟模块**不**消耗 `reads_fs`——它们走 `StdModuleResolver`
 而非文件系统，是规范的一部分。
@@ -166,7 +166,7 @@ flag 也设成 `true`。
 
 1. 构造时，把 root 路径走 `std::fs::canonicalize` 解析掉所有 `..`
    和 symlink，得到一个干净的绝对路径。
-2. 每次 `@import` 进来：
+2. 每次 `#import` 进来：
    - 把目标路径 join 到当前 scope 的 `current_dir`，再
      canonicalize 一次（同样会消解 symlink）。
    - 检查 canonical target 是否以 root 为前缀；不是则返回
@@ -174,7 +174,7 @@ flag 也设成 `true`。
 
 这意味着两类常见攻击都会被挡：
 
-- **`../` 路径逃逸**：`@import("../../etc/passwd")` 的 canonical
+- **`../` 路径逃逸**：`#import x from "../../etc/passwd"` 的 canonical
   形态显然不在 root 下面。
 - **symlink 逃逸**：在 root 里放一个 symlink 指向外面，canonicalize
   也会解析掉，仍然检查得到。
@@ -207,7 +207,7 @@ fn run_user_rule(
 ) -> Result<serde_json::Value, RuntimeError> {
     let mut ctx = Context::sandboxed();
 
-    // 文件读关掉（用户脚本不允许 @import 文件，只能用 std/）
+    // 文件读关掉（用户脚本不允许 #import 文件，只能用 std/）
     ctx.module_resolvers = vec![Arc::new(StdModuleResolver)];
 
     // 求值预算
@@ -240,7 +240,7 @@ fn run_user_rule(
 
 - ✅ 能用 `std/list` / `std/string` / `std/dict` 这些纯计算模块
 - ✅ 能调 `user.current_id()` 拿当前用户 ID
-- ❌ 不能 `@import` 文件
+- ❌ 不能 `#import` 文件
 - ❌ 不能调 `currency.format` 这种宿主**没**加进白名单的函数
 - ❌ 跑超 10 万步 → `StepLimitExceeded`
 - ❌ 构造超 10000 元素的 list/dict → `ValueTooLarge`
@@ -251,7 +251,7 @@ fn run_user_rule(
 
 | 错误 | 触发条件 |
 | --- | --- |
-| `CapabilityDenied { name, reason, range }` | `@import` 走到 default-reject 的 resolver；或 `@import` 路径逃出 root；或调一个未在 `allow_native_fn` 里的门控函数 |
+| `CapabilityDenied { name, reason, range }` | `#import` 走到 default-reject 的 resolver；或 `#import` 路径逃出 root；或调一个未在 `allow_native_fn` 里的门控函数 |
 | `StepLimitExceeded { limit, range }` | `eval_internal` 调用次数超过 `max_steps` |
 | `ValueTooLarge { limit, actual, range }` | 单个 list/dict 元素数超过 `max_value_bytes` |
 

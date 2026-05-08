@@ -57,19 +57,20 @@ plain JSON
 
 执行顺序固定，下一 pass 可读上一 pass 的产物：
 
-1. **`schema`**：识别 `@schema Name: { ... }` 与 `@schema Name: Enum<...>`，降级为 `SchemaDef`。tagged-enum sum type 的 variant 列表也在这里抽取。
+1. **`schema`**：识别 `#schema Name { ... }` / `#schema Name: { ... }` / `#schema Name Enum<...>`，降级为 `SchemaDef`。tagged-enum sum type 的 variant 列表也在这里抽取。
 2. **`resolve`**：把 `Reference` / `Variable` 节点绑定到目标字段的 `NodeId`。保守策略：闭包参数和 dict spread 标记 frame 为 dynamic，引用不强行报错。
-3. **`modules`**：扫描 `@import(...)` 与 `@library` 顶层装饰器，收集 import 边和 library 标记。
-4. **`typecheck`**：聚合诊断 —— `UnresolvedReference`、`StaticTypeMismatch`、`NonExhaustiveMatch`、`UnknownVariant`（带 did-you-mean）、`DuplicateMatchArm`、`HeterogeneousEnum`、`SchemaBodyNotDict` 等。
+3. **`modules`**：扫描 `#import ... from "..."` 顶层指令，收集 import 边。
+4. **`main_sig`**：识别根级 `#main(name: Type, ...)` 指令，构建 `MainSignature`。
+5. **`typecheck`**：聚合诊断 —— `UnresolvedReference`、`StaticTypeMismatch`、`NonExhaustiveMatch`、`UnknownVariant`（带 did-you-mean）、`DuplicateMatchArm`、`HeterogeneousEnum`、`SchemaBodyNotDict` 等。
 
 诊断分两级：`Severity::Error` 阻断求值，`Severity::Warning` 仅提示，evaluator 仍会执行。
 
 ## 关键不变量
 
 - **`NodeId` 进程内唯一**：`AtomicU32::fetch_add` 分配，作为 side-table 的 key。AST clone 不重新分配 id（`Node::PartialEq` 跳过 id 比较）。
-- **`Value::Dict` 携带 `brand: Option<String>`**：通过 `@schema` 类型检查后会盖上品牌。重新合并时再次校验，业务侧无法绕过 schema。
+- **`Value::Dict` 携带 `brand: Option<String>`**：通过 `#schema` 类型检查后会盖上品牌。重新合并时再次校验，业务侧无法绕过 schema。
 - **`Value::Dict` 携带 `variant_of: Option<String>`**：仅 sum-type variant 携带，标记父 enum 名。`Projector` 据此决定是否按 externally-tagged 形态输出。
-- **JSON 输出闭环**：默认 `JsonProjector` 在 Dict 内对 closure / Schema / EnumSchema / Type / Wildcard 这类运行时-only 的 Value **静默丢弃**；`@private` 字段更进一步——它们根本不进入 `Value::Dict::map`，所以 projector 见不到它们。但在 **List** 或文档**顶层**遇到 closure 会触发 `UnsupportedClosure` 错误而非静默：列表是「数据序列」语义，悄悄丢一个元素会让索引和长度撒谎。`@private` / closure-filtering / `UnsupportedClosure` 是三道层叠防线：前两个把「不该出现的东西」按位置悄悄藏起来，最后一个在「悄悄藏会改变结构」时显式报错。
+- **JSON 输出闭环**：默认 `JsonProjector` 在 Dict 内对 closure / Schema / EnumSchema / Type / Wildcard 这类运行时-only 的 Value **静默丢弃**；`#private` 字段更进一步——它们根本不进入 `Value::Dict::map`，所以 projector 见不到它们。但在 **List** 或文档**顶层**遇到 closure 会触发 `UnsupportedClosure` 错误而非静默：列表是「数据序列」语义，悄悄丢一个元素会让索引和长度撒谎。`#private` / closure-filtering / `UnsupportedClosure` 是三道层叠防线：前两个把「不该出现的东西」按位置悄悄藏起来，最后一个在「悄悄藏会改变结构」时显式报错。
 
 ## 扩展点
 
@@ -79,7 +80,7 @@ plain JSON
 | --- | --- | --- |
 | **Native fn** | 让 .relon 调宿主侧函数 | `RelonFunction` + `Context::register_fn` / `register_fn_with_caps` |
 | **Decorator plugin** | 编写新装饰器，参与 `pre_eval` / `wrap` / `schema_field_meta` 三个钩子 | `DecoratorPlugin` + `Context::register_decorator` |
-| **Module resolver** | 控制 `@import("...")` 的解析（沙箱、虚拟文件系统、注册表） | `ModuleResolver` + `Context::prepend_module_resolver` |
+| **Module resolver** | 控制 `#import ... from "..."` 的解析（沙箱、虚拟文件系统、注册表） | `ModuleResolver` + `Context::prepend_module_resolver` |
 | **Projector** | 调整 JSON 输出形态（默认 `JsonProjector`） | `Projector` trait |
 
 详见[嵌入宿主](./host-integration.md)。
@@ -103,7 +104,7 @@ plain JSON
 - **保守 reference 解析**：closure 参数 / dict spread 出现时不强行报错，避免对动态特性误报。代价是部分错误推迟到 runtime。
 - **Match 穷尽性是错误而非警告**：sum type 上漏 variant 直接 `NonExhaustiveMatch` Error，错误尽早抛。
 - **JSON externally tagged 而非 internally tagged**：内存中 dict 仍是扁平 + brand，序列化时由 projector 包外层。这样业务作者写 `notification.address` 直接能用，不需要 `notification.Email.address`。
-- **`@library` 仅做负向标签**：library 文件不能当 entry 跑；正向不做语法限制（library 内可放任何东西）。
+- **入口 / 库的二分以 `#main(...)` 标记**：带 `#main` 的文件是入口程序，必须由宿主 `run_main(args)` 推参数；不带 `#main` 的文件可以被宿主直接 `eval_root` 求值，也可以被其它文件 `#import`。两种用法不会互相串扰——把库文件当 entry 跑会立即报 `NoMainSignature`。
 
 ## 当前还在演进的部分
 

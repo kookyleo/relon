@@ -30,30 +30,39 @@ runtime 自行决定，不影响 conformance。
 ### 1.2 跨 runtime 一致性的兑现条件
 
 「同源 + 同输入 → 字节级一致」中的「输入」**特指显式 `Value` 树**
-——host 在求值前通过 `Context::with_input(value)` 注入的数据，脚本
-通过保留名 `input` 读取。
+——host 在求值前通过 `Evaluator::run_main(scope, args)` 推入的
+named arguments；脚本通过 `#main(...)` 签名声明它期望的形状，并以
+参数名直接访问绑定。
 
 Host 通过 `register_fn` 注入的 native fn 的**调用结果**不属于「输
 入」。因此：
 
-- **Push 形态**（host 求值前完成 I/O，把数据 materialize 成 `Value`
-  通过 `with_input` 注入；脚本可选地用 `@input` 装饰器声明契约）：
-  跨 runtime 一致性在本规范保障范围内。
+- **Push 形态**（host 求值前完成 I/O，把数据 materialize 成
+  `Value`，通过 `run_main(args)` 推入；脚本用 `#main(...)` 声明契
+  约）：跨 runtime 一致性在本规范保障范围内。
 - **Pull 形态**（脚本求值期通过 native fn 拉外部数据）：脚本作者
   **主动放弃**了跨 runtime 一致性——不同 host / 不同 runtime / 不同
   时刻的网络与外部状态本就不同，spec 不要求也无法保证一致。
 
 详见 [host-integration.md §推荐范式：Push-by-default](./host-integration.md#推荐范式push-by-default)。
 
-### 1.3 保留根级名
+### 1.3 sigil 划分：`@` 与 `#`
 
-下列标识符是**保留根级名**，conformant runtime 在这些名字上必须实
-现 spec 规定的语义；脚本不得将它们用作 dict 字段名、闭包参数名、
-或 `where` 子句名：
+Relon 把「附加在节点之上的元信息」分进两个互不重叠的命名空间。这
+是规范的硬约束：conformant runtime 不得允许某个名字同时以 `@` 和
+`#` 形式存在。
 
-| 名字 | 语义 |
-|---|---|
-| `input` | 当前文件的 push-style 外部输入（见 §1.2）。引用形态 `input.foo.bar`。host 未推数据且文件无 `@input` 时读 `input.foo` 失败 (`VariableNotFound`)。 |
+| sigil | 用途 | 谁可以注册 |
+| --- | --- | --- |
+| `@name(...)` | **装饰器**——值变换（value transform） | 内置 + host + 用户（任何可调用绑定都行） |
+| `#name ...` | **指令**——声明 / 结构 / 元数据 | 仅由内置注册，固定集合，用户不可扩展 |
+
+完整指令集合（v1）：`#main(...)`、`#schema X Body`、`#import ... from "..."`、
+`#private`、`#default`、`#expect`、`#msg`、`#error`、`#brand X`。
+
+完整内置装饰器集合（v1）：`@value(...)`。其它任何 `@name(...)` 都
+解析为「在当前作用域查找 `name`、把下方值作为最后一个位置参数传
+入」。
 
 ## 2. 决定性契约（Determinism Contract）
 
@@ -98,7 +107,7 @@ Host 通过 `register_fn` 注入的 native fn 的**调用结果**不属于「输
 脚本**不可读**：
 
 * 系统时钟（`now()`、`SystemTime::now()` 等）。如果需要时间，host
-  传入 input。
+  通过 `#main` 推入。
 * 系统时区、locale。
 * 环境变量。
 * 随机数（`rand`、`/dev/urandom`）。
@@ -122,13 +131,33 @@ source、拒绝它拒绝的所有 source。语法 corpus 由
 
 > 详细语法见 [基础语法](./syntax.md)。
 
+### 3.1 五种指令形态
+
+每个 `#name ...` 指令必须满足下列五种 shape 之一。shape 由名字决
+定（在 parser 内查表），不可由用户扩展：
+
+| shape | 形态 | 例 | 用于 |
+| --- | --- | --- | --- |
+| Bare | `#name` | `#private` | 标记字段属性 |
+| Value | `#name <expr>` | `#default 0`、`#expect "must be ≥0"`、`#brand Color` | 元数据 / 值变换 |
+| NameBody | `#name <ident> <body>` | `#schema User { String name: * }` | 命名声明（无冒号） |
+| Import | `#import <bindspec> from "<path>"` | `#import * from "std/list"` | 导入 |
+| Main | `#main(name: Type, ...)` | `#main(u: User, cart: Cart)` | 入口签名 |
+
+`<bindspec>` 是以下三者之一：单个 ident（命名空间）、`*`（spread）、
+`{ a, b as c }`（析构）。
+
+`#schema X: Body` 这种形态是**字段位置**（dict-field 形）的语法
+糖——`:` 属于 dict 字段语法而非指令语法；语义上等价于
+`#schema X Body`。
+
 ## 4. 能力模型（Capabilities）
 
 ### 4.1 默认零特权
 
 新构造的 `Context` 默认**没有任何能力**。脚本：
 
-* 无法读文件系统（`@import("./local.relon")` → `CapabilityDenied`）
+* 无法读文件系统（`#import x from "./local.relon"` → `CapabilityDenied`）
 * 无法调用任何 `register_fn_with_caps` 注册的 host 原生函数
 * 没有执行步数 / value 体积上限（`None` 表示「不强制」，但 host 应
   根据信任程度显式设置）
@@ -139,7 +168,7 @@ Host 通过 `Capabilities` 字段显式授权：
 
 ```rust
 let mut ctx = Context::sandboxed();
-ctx.capabilities.reads_fs = true;                          // 允许 @import 真实文件
+ctx.capabilities.reads_fs = true;                          // 允许 #import 真实文件
 ctx.capabilities.allow_native_fn.insert("fs.read".into());  // 允许调用具名 host fn
 ctx.capabilities.max_steps = Some(1_000_000);               // 限制求值步数
 ```
@@ -151,10 +180,10 @@ host 授予了什么、没授予什么。
 
 ### 4.3 std 虚拟模块的特殊位置
 
-`@import("std/list")`、`@import("std/string")` 等 std 模块通过
-**虚拟解析器**（`StdModuleResolver`）服务，**不消耗** `reads_fs`
-能力。这是规范的有意设计：std 是规范的一部分，对它的访问不属于
-host 信任决策。
+`#import * from "std/list"`、`#import string from "std/string"` 等
+std 模块通过**虚拟解析器**（`StdModuleResolver`）服务，**不消耗**
+`reads_fs` 能力。这是规范的有意设计：std 是规范的一部分，对它的访
+问不属于 host 信任决策。
 
 ## 5. 错误种类（Error Kinds）
 
@@ -163,11 +192,11 @@ host 信任决策。
 | Kind | 触发条件 |
 |---|---|
 | `Parse` | 词法 / 语法错误 |
-| `Analyze` | 语义分析阶段聚合错误（`@schema` 异构、未类型化字段等）|
+| `Analyze` | 语义分析阶段聚合错误（`#schema` 异构、未类型化字段等）|
 | `TypeMismatch` | 运行时值不符合声明类型 |
 | `VariableNotFound` | 引用未定义的名字（含 schema 名、模块 alias、函数名）|
 | `FunctionNotFound` | 调用未注册的原生函数或闭包 |
-| `CircularImport` | `@import` 形成环 |
+| `CircularImport` | `#import` 形成环 |
 | `ModuleNotFound` | 没有 resolver 返回该模块 |
 | `ModuleParseError` | 模块文件解析失败 |
 | `IoError` | 真实 I/O 错误（被允许的 `reads_fs` 操作中发生）|
@@ -175,13 +204,16 @@ host 信任决策。
 | `StepLimitExceeded` | 触发 `max_steps`（求值步数预算耗尽）|
 | `RecursionLimitExceeded` | 类型检查 / schema 验证递归深度超过运行时安全上限（与 `max_steps` 是不同维度的预算，hosts 不能通过调高 `max_steps` 缓解）|
 | `ValueTooLarge` | 触发 `max_value_bytes` |
-| `LibraryAsEntry` | 试图把 `@library` 文件当 host entry |
+| `NoMainSignature` | 文件没有 `#main(...)` 但被 `run_main` 调用 |
+| `MissingMainArg` | host 没有为 `#main` 声明的某个参数推入值 |
+| `UnexpectedMainArg` | host 推入了 `#main` 签名中没有的参数名 |
+| `MainArgTypeMismatch` | 推入值不匹配 `#main` 参数类型 |
 | `UnsupportedOperator` | 无效操作或类型组合 |
 
 ## 6. 标准库目录（Spec-mandated）
 
 每个 conformant runtime 必须实现以下 std 模块。脚本通过
-`@import("std/<name>", as="<alias>")` 引入。
+`#import <bindspec> from "std/<name>"` 引入。
 
 ### 6.1 语言级 builtins（无需 import）
 
@@ -210,125 +242,65 @@ host 信任决策。
 
 ### 6.3 「ensure.\*」校验器
 
-`@schema` 装饰器内部依赖一组 `ensure.*` 函数（`ensure.int`、
+`#schema` 内部依赖一组 `ensure.*` 函数（`ensure.int`、
 `ensure.string` 等）。这些是 schema 系统的实现细节，不暴露给脚本
 直接调用——但 conformant runtime 必须确保它们存在且按规范工作，
-否则 `@schema` 行为会发散。
+否则 `#schema` 行为会发散。
 
-### 6.4 `@input(name=SchemaRef)` —— 程序输入契约
+### 6.4 `#main(name: Type, ...)` —— 入口签名
 
-`@input(...)` 是**根级装饰器**（装饰文件的根 dict），声明 host-pushed
-input 中的一个**命名 slot**。每个 slot 用 `name=SchemaRef` 形式给出：
-slot 名是 input wrapper 中的字段名，SchemaRef 是已声明的 `@schema`
-（本文件或 imported 的）。形态：
+`#main(...)` 是**根级指令**（写在文件根 dict 之前），声明这个文件
+是一个**入口程序**：宿主必须通过 `Evaluator::run_main(scope, args)`
+推入与签名匹配的 named arguments，runtime 在跑 body 之前完成校验。
+形态：
 
 ```relon
-@input(req=Req)
+#main(req: Req)
 {
-    @schema Req: {
+    #schema Req {
         String name: *,
-        @default(0)
+        #default 0
         Int retries: *
     },
-    greeting: f"hello ${input.req.name}, retries=${input.req.retries}"
+    greeting: f"hello ${req.name}, retries=${req.retries}"
 }
 ```
 
-多个 slot 可以并列声明，runtime 自动合并成一个 wrapper schema
-`{ <slot1>: <schema1>, <slot2>: <schema2>, ... }`：
+多个参数并列声明：
 
 ```relon
-@input(user=User)
-@input(cart=Cart)
+#main(user: User, cart: Cart)
 {
-    @schema User: { String name: * },
-    @schema Cart: { Int total: * },
-    summary: f"${input.user.name} - ${input.cart.total}"
+    #schema User { String name: * },
+    #schema Cart { Int total: * },
+    summary: f"${user.name} - ${cart.total}"
 }
 ```
 
 **语义要求**（每个 conformant runtime 必须按此实现）：
 
-1. `@input(...)` 必须是**根级装饰器**（写在文件根 dict 之前）；装饰
-   字段或非根 dict 时无意义。
-2. 每个参数必须是 `name=SchemaRef` 形式：
-   - 缺 name（位置参数）→ `Analyze` 错误 `InputDecoratorMissingName`。
-   - 同一 slot name 被多次声明 → `Analyze` 错误 `DuplicateInputName`。
-   - 完全没参数（`@input`）→ `Analyze` 错误 `InputDecoratorEmpty`。
-3. 求值 `Context::with_input(value)` 注入的数据**前**，必须按合并后
-   的 wrapper schema 校验：
-   - host-pushed value 必须是 `Value::Dict`；否则 `TypeMismatch`。
-   - 每个声明的 slot 必须出现在 pushed dict 中；否则
-     `TypeMismatch`（`expected: input slot '<name>'`，`found: missing`）。
-   - 每个 slot 的值按对应 SchemaRef 求值出的 `Value::Schema` 校验：
-     字段类型不匹配 / 缺必填字段 → `TypeMismatch`；带 `@default(...)`
-     的字段 host 未推时用默认值填充。
-4. 校验后的 input 树绑定到保留根级名 `input`（§1.3），脚本通过
-   `input.<slot>.<field>` 访问。
-5. 文件**没有 `@input(...)`** 时，`with_input` 推入的数据按原样绑定
-   到 `input`，不做 schema 校验；脚本读 `input.foo` 时若数据缺字段
-   则退化为运行时 `VariableNotFound`。
-6. **跨文件 `@input` 聚合**（即 lib 中的 `@input(...)` 也参与 entry
-   的总契约）暂不在 v1 范围内——v1 只校验 entry 文件的
-   `@input(...)`。lib 中的 `@input(...)` 当前由 evaluator 视作识别
-   到的根装饰器但不参与 host input 校验；建议 lib 只导出 `@schema`，
-   由 entry 通过 `@input(slot=lib.Schema)` 引用。
+1. `#main(...)` 必须是**根级指令**（写在文件根 dict 之前）；写在
+   嵌套 dict 上无意义。
+2. 每个参数必须是 `name: Type` 形式：
+   - 同一参数名被多次声明 → `Analyze` 错误 `DuplicateMainParam`。
+   - 类型必须解析到一个已声明的 `#schema` 或基础类型。
+3. 求值前 `Evaluator::run_main(scope, args)` 推入的数据必须按签名校
+   验：
+   - 缺参数 → `MissingMainArg`；
+   - 多参数 → `UnexpectedMainArg`；
+   - 类型不匹配 → `MainArgTypeMismatch`。
+4. 校验通过后，每个参数按 **参数名直接绑定到根作用域 locals**——脚
+   本里直接以 `req`、`user` 等名字访问，不需要 `input.` 前缀。
+5. 文件**没有 `#main(...)`** 时调用 `run_main` 报 `NoMainSignature`。
+   反之，`#main` 文件被 `eval_root` 当库求值时也报 `NoMainSignature`
+   ——edge case 立即在边界截住。
+6. **跨文件 `#main` 聚合**（lib 中的 `#main(...)` 也参与 entry 总契
+   约）不在 v1 范围内——只校验 entry 文件的 `#main(...)`。lib 文件
+   通常不写 `#main`，由 entry 通过 `#import` 引用。
 
-`@input(...)` 把「外部数据契约」写进 .relon 源码而非 host 端，使任何
+`#main(...)` 把「入口契约」写进 .relon 源码而非 host 端，使任何
 conformant runtime 看同一份脚本都按相同 schema 校验——这是 §1.2 跨
 runtime 一致性兑现的关键拼图。
-
-#### 6.4.1 `@schema(Name={...})` —— 根级 schema 装饰器糖
-
-把 schema 声明从根 dict 体内挪到根装饰器栈里，与 `@input(...)` 并
-排，纯粹是**布局糖**——语义等价于在根 dict 里写一个
-`@private @schema Name: { ... }` 字段。
-
-```relon
-// 老写法：schema 在 dict 体内，被 @input 从 dict 外引用
-@input(req=Req)
-{
-    @schema Req: { String name: *, Int retries: * },
-    greeting: f"hello ${input.req.name}"
-}
-
-// 新写法：schema 与 @input 同处装饰器栈，视觉上同一处
-@schema(Req={ String name: *, Int retries: * })
-@input(req=Req)
-{
-    greeting: f"hello ${input.req.name}"
-}
-```
-
-可以一次声明多个：
-
-```relon
-@schema(User={ String name: * })
-@schema(Cart={ Int total: * })
-@input(user=User)
-@input(cart=Cart)
-{
-    summary: f"${input.user.name} - ${input.cart.total}"
-}
-```
-
-**规则**：
-
-1. `@schema(...)` 只在**根级**装饰器栈里有此语义；嵌套 dict 上写
-   `@schema(Name=...)` 不会触发糖。
-2. 每个参数必须是 `Name=Body`：
-   - 缺 name（位置参数）→ `Analyze` 错误 `RootSchemaDecoratorMissingName`。
-   - `Body` 必须是 dict 字面量 `{ ... }` 或 `Enum<...>` 类型表达式；
-     其它形态 → `RootSchemaInvalidValue`。
-   - 同一文件内重复声明同名 schema → `DuplicateRootSchemaName`。
-   - 同名 schema 同时以根装饰器形与字段形（`@schema X: ...`）声明 →
-     `RootSchemaCollidesWithField`（必须二选一）。
-   - 完全没参数（`@schema()`）→ `RootSchemaDecoratorEmpty`。
-3. 注册的 schema 同时对**根 dict 体内**与 `@input(...)` 引用可见，
-   解析路径与字段形 `@schema` 完全一致。
-4. 这是纯布局糖，不引入新语义；任何 conformant runtime 必须把它视作
-   `@private @schema Name: Body` 字段的等价处理，否则会偏离 §1.2 的
-   跨 runtime 一致性。
 
 ## 7. Host 可注册扩展的边界
 
@@ -336,7 +308,7 @@ Host 可以通过 `register_fn` / `register_fn_with_caps` /
 `register_decorator` 注入：
 
 * 原生函数（数据进、数据出）
-* 装饰器插件（`@expect`、自定义 `@brand` 行为等）
+* 装饰器插件（自定义 `@value` 替代品、领域专属变换器）
 
 但 **conformant 规范不要求其它 runtime 提供同名扩展**——脚本如果
 依赖了 host 注入的名字，它就脱离了「跨 runtime 可移植」的承诺，
@@ -344,7 +316,7 @@ Host 可以通过 `register_fn` / `register_fn_with_caps` /
 
 最佳实践：
 
-* 业务库写在 `.relon` 中（用 `@library` 标记），通过 `@import`
+* 业务库写在 `.relon` 中（不带 `#main` 的纯库），通过 `#import`
   分发；这样的库自动跨 runtime 可移植。
 * 只在「必须用宿主能力」的场景注册原生函数（FS、数据库、HTTP），
   并用 `register_fn_with_caps` 标记所需 `NativeFnGate`。
@@ -354,8 +326,8 @@ Host 可以通过 `register_fn` / `register_fn_with_caps` /
 * 本文档对应 **spec v1**。
 * std 模块按 semver 演进：函数语义变更必须升 major；新增函数升
   minor。
-* `@import("std/<name>")` 默认绑定到 runtime 实现的最新兼容版本。
-  未来可能引入 `@import("std/<name>", version="1.x")` 显式绑定。
+* `#import * from "std/<name>"` 默认绑定到 runtime 实现的最新兼容
+  版本。未来可能引入 `#import * from "std/<name>@1.x"` 显式绑定。
 * runtime 必须在元数据（`relon --version` 或等价 API）中声明它
   实现的 spec 版本。
 

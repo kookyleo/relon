@@ -1,10 +1,22 @@
 # 模块与作用域 (Modules & Scopes)
 
-如果配置变得庞大，我们自然需要将其切分到多个文件中。Relon 提供了基于 `@import` 装饰器的模块化系统。由于 Relon 是一门没有全局变量的声明式语言，模块就是组织复用逻辑的最佳边界。
+如果配置变得庞大，我们自然需要将其切分到多个文件中。Relon 提供了基于 `#import` 指令的模块化系统。由于 Relon 是一门没有全局变量的声明式语言，模块就是组织复用逻辑的最佳边界。
 
 ## 导入 (Importing)
 
-在字典或文件的顶级作用域，你可以使用 `@import` 来引入其他的 `.relon` 文件。
+在字典或文件的顶级作用域，你可以使用 `#import` 来引入其他的 `.relon` 文件。统一的语法：
+
+```text
+#import <bindspec> from "<path>"
+```
+
+`<bindspec>` 有三种形态：
+
+| 形态 | 写法 | 含义 |
+| --- | --- | --- |
+| 命名空间 | `lib` | 将整个模块绑定到名字 `lib` |
+| 平铺 | `*` | 把模块导出的全部字段并入当前作用域 |
+| 析构 | `{ a, b as c }` | 只取 `a`、`b`，并把 `b` 重命名为 `c` |
 
 ### 命名空间导入
 
@@ -12,7 +24,7 @@
 
 ```relon
 // main.relon
-@import("./lib.relon", as="theme")
+#import theme from "./lib.relon",
 {
     // 调用 theme 模块内定义的工具函数或颜色变量
     button_color: theme.colors.primary,
@@ -24,22 +36,34 @@
 
 ### 平铺导入 (Spread Import)
 
-如果你有一堆通用的 Schema 或者常用的纯函数，每次都通过命名空间来调用可能会显得累赘。这时可以启用 `spread=true`，它会将目标文件顶层抛出的所有变量「解构」合并进当前作用域。
+如果你有一堆通用的 Schema 或者常用的纯函数，每次都通过命名空间来调用可能会显得累赘。这时可以用 `*`，它会将目标文件顶层抛出的所有变量「解构」合并进当前作用域。
 
 ```relon
-@import("./helpers.relon", spread=true)
+#import * from "./helpers.relon",
 {
     // 如果 helpers.relon 导出了 shout 函数，你可以直接在这里使用
     msg: shout("hello")
 }
 ```
 
+### 析构导入 (Destructuring Import)
+
+只想引入若干个名字、可能伴随重命名时使用：
+
+```relon
+#import { upper, lower as lo } from "std/string",
+{
+    a: upper("hello"),
+    b: lo("WORLD")
+}
+```
+
 #### 导入保护 (Import Protection)
 
 如果在平铺导入时发生了名称冲突，**覆盖行为会发生**。为了保护命名空
-间，把不希望被平铺导入的字段标上 `@private` 装饰器：私有字段不会写
-入模块的导出 map，所以 `spread=true` 自然跳过它们，`alias` 形式也
-访问不到（`lib.private_field` → `VariableNotFound`）。
+间，把不希望被平铺导入的字段标上 `#private` 指令：私有字段不会写
+入模块的导出 map，所以平铺导入会自然跳过它们，命名空间形式也访问
+不到（`lib.private_field` → `VariableNotFound`）。
 
 ```relon
 // helpers.relon
@@ -47,99 +71,68 @@
     // 将被平铺导入
     shout(v): v + "!!!",
 
-    // 私有助手函数：不会被任何 @import 形式带出去
-    @private
+    // 私有助手函数：不会被任何 #import 形式带出去
+    #private
     add(a, b): a + b
 }
 ```
 
-> 历史说明：早期版本用 `_` 前缀做隐式约定。该约定已**完全取消**，
-> 请改用 `@private`。详见 [`syntax.md`](./syntax.md#字段可见性-private)。
+> 历史说明：早期版本用 `_` 前缀做隐式约定，并使用 `@private` 装
+> 饰器形式。两者都已**完全取消**，请改用 `#private` 指令。详见
+> [`syntax.md`](./syntax.md#字段可见性-private)。
 
-## `@library` 库标记
+## 入口程序与库
 
-`@import` 解决了「拆文件」的问题，`@library` 解决的是「这个文件该不该被宿主当 entry 跑」的问题。
+Relon 没有「文件级别 library/entry 标记」这一概念。是否有 `#main(...)`
+签名决定了文件**怎么用**：
 
-### 它是什么
+- 文件**有** `#main(...)`：是入口程序。宿主必须通过
+  `Evaluator::run_main(scope, args)` 推入参数才能跑出结果。直接当
+  库 `#import` 也允许（参数不会被使用，只取它的导出）。
+- 文件**没有** `#main(...)`：是「无契约」的纯数据 / 库文件。既可以
+  被 `#import` 当模块用，也可以被宿主直接 `eval_root` 求值得到一份
+  纯 JSON。
 
-`@library` 是一个**根级别**装饰器，写在文件最外层的字典前面：
+完整示例：
 
 ```relon
-@library
+// app/main.relon —— 入口程序
+#import * from "../platform/notify.relon",
+#main(notice: Notification)
 {
-    @schema User: { String name: * },
-    greet(User u): "Hello, " + u.name
+    delivered: notice.title + " (via " + notice.via + ")"
 }
 ```
 
-效果：
-
-- 这个文件**不能**作为 host entry 被求值（`relon::value_from_str` / `value_from_file` 等会直接返回 `Error::LibraryAsEntry`）。
-- 这个文件**仍然**可以被其他文件 `@import`——`@import` 完全不在意目标是否标了 `@library`。
-- 嵌套字典里的 `@library` 是普通数据，不算数；只有根节点上的才生效。
-
-### 不标的文件——双用
-
-不加 `@library` 标记的文件是**双用**的：
-
-- 既能被宿主直接求值（拿到 JSON 输出）；
-- 也能被 `@import` 进来当模块用。
-
-这是默认行为；新手不需要知道 `@library` 的存在也能正常工作。
-
-### 三个场景对照
-
-| 场景 | 文件加 `@library`？ | 行为 |
-| --- | --- | --- |
-| 平台团队的共享库（schema、纯函数、装饰器配置） | ✅ 加 | 防止被错误地当 entry 跑；只能 `@import` |
-| 业务团队的应用入口（被宿主求值） | ❌ 不加 | 默认双用，宿主调用 `value_from_file` 拿 JSON |
-| 开发期的一次性 demo / fixture | ❌ 不加 | 直接跑、直接看输出 |
-
-### 一个完整的 platform/business 配对
-
-**`platform/notify.relon`**（库，标 `@library`）：
-
 ```relon
-@library
+// platform/notify.relon —— 共享库（无 #main）
 {
-    @schema Channel: Enum<
+    #schema Channel Enum<
         Email { String address: *, String subject: * },
         SMS   { String phone: * },
-        Push,
+        Push
     >,
-
-    @schema Notification: {
+    #schema Notification {
         Channel via: *,
         String title: *
     }
 }
 ```
 
-**`app/main.relon`**（业务 entry，**不标** `@library`）：
+宿主侧：
 
-```relon
-@import("../platform/notify.relon", spread=true)
-{
-    Notification welcome: {
-        via: Channel.Email { address: "u@x.com", subject: "Hi" },
-        title: "Welcome"
-    }
-}
+```rust
+let mut args = HashMap::new();
+args.insert(
+    "notice".to_string(),
+    /* host 推入的 Value::Dict */ notice_value,
+);
+let result = evaluator.run_main(&scope, args)?;
 ```
 
-宿主直接 `relon::json_from_file("app/main.relon")` 拿到 JSON。如果有人不小心把 `notify.relon` 当 entry 喂进来：
-
-```text
-Error: LibraryAsEntry { name: Some("...") }
-```
-
-错误立即在边界被截住，根本不会进入求值流程。
-
-### 何时该标、何时不标
-
-- **该标**：你的文件**只**为别人提供 schema/函数/常量，自己不打算被宿主跑——比如平台团队的标准库、共享业务术语库、第三方扩展包的入口。
-- **不标**：你的文件**会**被宿主当 entry 跑——业务应用、CLI 入口、生成 JSON 的脚本。
-- **可标可不标**：纯粹给开发自己用的本地脚本——不必纠结，默认（不标）就够。
+宿主试图把入口程序当库直接 `eval_root`，会得到 `NoMainSignature` 错
+误——错误立即在边界截住，绝不会进入求值流程。反之，库文件没有
+`#main` 时调用 `run_main` 也是同样的错误。
 
 ## 相对引用 (Relative References)
 

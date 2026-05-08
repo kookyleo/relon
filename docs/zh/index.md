@@ -22,7 +22,7 @@ features:
   - title: 默认沙箱，无逃生口
     details: "脚本零环境特权。`Capabilities` 显式控制文件读、求值步数、value 元素水位、原生函数白名单——没有「trusted 模式」让脚本绕过宿主授权。安全审计的边界明确。"
   - title: 自描述类型契约
-    details: "`@schema`、sum-type tagged enum、递归 schema、品牌标记、计算默认值——契约信息和载荷一起传输，下游不需要带外文档就能校验。"
+    details: "`#schema`、sum-type tagged enum、递归 schema、品牌标记、计算默认值——契约信息和载荷一起传输，下游不需要带外文档就能校验。"
   - title: 上下文感知引用
     details: "`&root`、`&sibling`、`&prev`、`&next` 让逻辑声明式地引用周围数据，无硬编码路径。引用是声明式的，跨端执行结果仍然确定。"
 ---

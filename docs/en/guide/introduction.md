@@ -35,9 +35,9 @@ language spec itself is runtime-agnostic.
 
 Treat Relon as a small toolkit purpose-built for business configuration:
 
-- **JSON-like syntax**: it reads like JSON with expressions, decorators, and references. People who already know JSON pick it up in minutes.
-- **Typed schemas**: `@schema` defines contracts, with sum-type tagged enums, recursive schemas, custom validation messages, and computed defaults.
-- **Host extensions**: register native functions and decorator plugins from Rust; ship shared schemas / helpers in `.relon`; tie the two sides together with `@import`.
+- **JSON-like syntax**: it reads like JSON with expressions, directives, decorators, and references. People who already know JSON pick it up in minutes.
+- **Typed schemas**: `#schema` defines contracts, with sum-type tagged enums, recursive schemas, custom validation messages, and computed defaults.
+- **Host extensions**: register native functions and decorator plugins from Rust; ship shared schemas / helpers in `.relon`; tie the two sides together with `#import`.
 - **Sandboxed by default**: `Capabilities` control filesystem reads, evaluation budgets, value sizes, and native-fn allowlists.
 
 ## Who writes what — the two-tier model
@@ -46,32 +46,31 @@ Relon assumes two kinds of authors:
 
 | Role | Deliverables | Concerns |
 | --- | --- | --- |
-| **Platform / framework team** | Rust extensions (native fns, decorator plugins) + `.relon` libraries marked with `@library` | Expose a stable business vocabulary; encode domain rules into schemas and decorators |
-| **Business / product team** | `.relon` entry files (no `@library` marker) | `@import` platform libraries; write JSON-shaped configs; have errors caught early by types and validation |
+| **Platform / framework team** | Rust extensions (native fns, decorator plugins) + `.relon` libraries (no `#main`) | Expose a stable business vocabulary; encode domain rules into schemas and decorators |
+| **Business / product team** | `.relon` entry files declaring `#main(...)` | `#import` platform libraries; write JSON-shaped configs; have errors caught early by types and validation |
 
-When a platform-team file is marked `@library`, the runtime refuses to evaluate it as a host entry — it can only be consumed via `@import`. Business-team entry files stay double-purpose: directly evaluable AND importable.
+Whether a file declares `#main(...)` decides how it's used: a `#main` file is an **entry program** (the host must push args via `run_main`); a file without `#main` can be evaluated directly as data, and it can also be `#import`ed by other files. That's the typical shape of a platform library.
 
 ## A complete tour in 30 lines
 
-The example below uses `@library`, sum-type tagged enums, computed defaults, and host integration.
+The example below uses `#schema`, sum-type tagged enums, computed defaults, and host integration.
 
-**`platform/notify.relon`** (platform-team library):
+**`platform/notify.relon`** (platform-team library, no `#main`):
 
 ```relon
-@library
 {
     // Notification channel: sum-type tagged enum
-    @schema Channel: Enum<
+    #schema Channel Enum<
         Email { String address: *, String subject: * },
         SMS   { String phone: * },
-        Push,
+        Push
     >,
 
     // A general "notification with body" contract + computed default
-    @schema Notification: {
+    #schema Notification {
         Channel via: *,
         String title: *,
-        @default((self) => "[" + self.title + "]")
+        #default (self) => "[" + self.title + "]"
         String summary: *
     }
 }
@@ -80,7 +79,7 @@ The example below uses `@library`, sum-type tagged enums, computed defaults, and
 **`app/main.relon`** (business-team entry):
 
 ```relon
-@import("../platform/notify.relon", spread=true)
+#import * from "../platform/notify.relon"
 {
     Notification welcome: {
         via: Channel.Email { address: "user@x.com", subject: "Hi" },

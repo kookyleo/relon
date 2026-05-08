@@ -1,6 +1,96 @@
 # Changelog
 
-## [Unreleased] — Spec v1 candidate freeze, batch 2
+## [Unreleased] — Spec v1 candidate freeze, batch 3
+
+This batch makes the sigil split a hard contract and replaces the
+`@input` / `@library` pair from batch 2 with a single unified
+`#main(...)` entry-program signature. It is **a breaking change**
+across every layer (parser, analyzer, evaluator, fmt, lsp, fixtures,
+docs); pre-release semver lets us land it in one go rather than
+shipping ten incremental migrations.
+
+### Sigil split: `@` is decorators, `#` is directives
+
+Relon now enforces a hard naming-space division:
+
+| sigil | Purpose | Who can register |
+| --- | --- | --- |
+| `@name(...)` | **Decorator** — value transform | Built-in (just `@value`) + host + user (any callable binding) |
+| `#name ...` | **Directive** — declaration / structure / metadata | Built-in only; fixed set; not user-extensible |
+
+The complete v1 directive set: `#main(...)`, `#schema X Body`,
+`#import ... from "..."`, `#private`, `#default`, `#expect`, `#msg`,
+`#error`, `#brand X`. Every system attribute that used to be `@name`
+is now `#name`. User-defined `@my_fn(arg)` decorators continue to
+work — `my_fn` is looked up in the live scope and the value below is
+threaded as the last positional arg. Decorator stacks now apply
+**bottom-up**: `@a @b v ≡ a(b(v))`.
+
+Five fixed directive shapes: `Bare` (`#private`),
+`Value` (`#default 0`, `#brand X`), `NameBody`
+(`#schema User { ... }`, no colon), `Import`
+(`#import * | name | { a, b as c } from "..."`), `Main`
+(`#main(name: Type, ...)`). The shape is keyed off the directive
+name — the parser's directive table is closed.
+
+### `#main(...)` replaces `@input(...)` and `@library`
+
+Whether a file declares `#main(...)` decides how it's used:
+
+- **`#main(name: Type, ...)`**: the file is an **entry program**.
+  Hosts must push named arguments via `Evaluator::run_main(scope,
+  args)`; the runtime validates each arg against the signature
+  before walking the body. New runtime errors:
+  `NoMainSignature`, `MissingMainArg`, `UnexpectedMainArg`,
+  `MainArgTypeMismatch`.
+- **No `#main`**: the file is a plain library / data file. It can be
+  evaluated directly via `eval_root` and also `#import`-ed by other
+  files.
+
+The `@input(slot=Schema)` push contract and the `@library`
+file-level marker are both **gone**. Calling `eval_root` on a
+`#main` file raises `NoMainSignature`; calling `run_main` on a no-
+`#main` file likewise — edge cases caught at the boundary.
+
+### Spec changes
+
+- §1.3 sigil split documented as a hard requirement; conformant
+  runtimes MUST NOT allow a single name to coexist as both `@`-form
+  and `#`-form.
+- §3.1 documents the five directive shapes.
+- §6.4 rewritten around `#main(...)`.
+- §5 error kinds: `LibraryAsEntry` removed; `NoMainSignature`,
+  `MissingMainArg`, `UnexpectedMainArg`, `MainArgTypeMismatch`
+  added.
+
+### Migration
+
+Every `@`-form system attribute → `#`-form directive, e.g.:
+
+```relon
+// Before
+@library
+{
+    @schema Order: Enum<Pending, Paid>,
+    @import("./helpers.relon", spread=true)
+    @input(req=Req)
+    handler: ...
+}
+
+// After
+#import * from "./helpers.relon"
+#schema Order Enum<Pending, Paid>
+#main(req: Req)
+{
+    handler: ...
+}
+```
+
+Hosts: replace `Context::with_input(value)` /
+`Evaluator::eval_root(scope)` with
+`Evaluator::run_main(scope, args_map)`.
+
+## [Earlier draft] — Spec v1 candidate freeze, batch 2
 
 This batch fixes a cluster of "structural debt" items called out in the
 2026-05-07 critical review (`tmp/critical-review-2026-05-07.md`),

@@ -22,7 +22,7 @@ features:
   - title: Sandboxed by default — no escape hatch
     details: "Scripts hold zero ambient privileges. `Capabilities` explicitly grant filesystem reads, step budgets, value-size watermarks, and per-function allowlists. There is no \"trusted mode\" the script can fall back to without the host's consent."
   - title: Self-describing type contracts
-    details: "`@schema`, sum-type tagged enums, recursive schemas, branded values, computed defaults — type information travels with the payload. Receivers validate without out-of-band documentation."
+    details: "`#schema`, sum-type tagged enums, recursive schemas, branded values, computed defaults — type information travels with the payload. Receivers validate without out-of-band documentation."
   - title: Context-aware references
     details: "`&root`, `&sibling`, `&prev`, `&next` let logic reference its surrounding data declaratively, no hard-coded paths. Declarative references stay deterministic across runtimes."
 ---
