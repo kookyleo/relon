@@ -1,17 +1,11 @@
 //! Canonical directive-name string constants.
 //!
-//! Mirrors `relon-evaluator`'s copy. We keep a private duplicate here to
-//! avoid a parser/evaluator dep direction conflict; both lists must stay
-//! in sync — a typo in either side silently breaks dispatch.
+//! Re-exports from `relon-parser::directive` so dispatch by name uses
+//! one source of truth. Adding a new directive means adding it once in
+//! the parser; analyzer and evaluator pick it up automatically.
 
 #![allow(dead_code)]
 
-pub(crate) const SCHEMA: &str = "schema";
-pub(crate) const IMPORT: &str = "import";
-pub(crate) const EXPECT: &str = "expect";
-pub(crate) const DEFAULT: &str = "default";
-pub(crate) const MSG: &str = "msg";
-pub(crate) const ERROR: &str = "error";
-pub(crate) const BRAND: &str = "brand";
-pub(crate) const PRIVATE: &str = "private";
-pub(crate) const MAIN: &str = "main";
+pub(crate) use relon_parser::directive::{
+    BRAND, DEFAULT, ERROR, EXPECT, IMPORT, MAIN, MSG, SCHEMA,
+};

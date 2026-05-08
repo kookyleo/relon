@@ -120,11 +120,6 @@ pub struct BaseRef {
     pub node: Arc<Node>,
 }
 
-#[allow(dead_code)]
-fn has_directive_named(directives: &[Directive], target: &str) -> bool {
-    directives.iter().any(|dir| dir.name == target)
-}
-
 /// Walk `root` and populate `tree.schemas` with every statically-classifiable
 /// `#schema` definition. Root-level name-body directives are owned by
 /// [`crate::root_schemas::collect_root_schemas`] (which keeps a separate

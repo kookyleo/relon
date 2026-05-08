@@ -30,18 +30,31 @@ use winnow::combinator::{opt, preceded, repeat, separated};
 use winnow::prelude::*;
 use winnow::stream::{Location, Stream};
 
+/// Canonical directive names. Centralizing the strings here lets
+/// downstream crates (`relon-analyzer`, `relon-evaluator`) refer to the
+/// same identifiers without maintaining their own private mirrors.
+pub const PRIVATE: &str = "private";
+pub const DEFAULT: &str = "default";
+pub const EXPECT: &str = "expect";
+pub const MSG: &str = "msg";
+pub const ERROR: &str = "error";
+pub const BRAND: &str = "brand";
+pub const SCHEMA: &str = "schema";
+pub const IMPORT: &str = "import";
+pub const MAIN: &str = "main";
+
 /// Directive name → expected shape. Dispatch happens by name; unknown
 /// `#name` produces a parse error.
 pub const DIRECTIVE_SHAPES: &[(&str, DirectiveShape)] = &[
-    ("private", DirectiveShape::Bare),
-    ("default", DirectiveShape::Value),
-    ("expect", DirectiveShape::Value),
-    ("msg", DirectiveShape::Value),
-    ("error", DirectiveShape::Value),
-    ("brand", DirectiveShape::Value),
-    ("schema", DirectiveShape::NameBody),
-    ("import", DirectiveShape::Import),
-    ("main", DirectiveShape::Main),
+    (PRIVATE, DirectiveShape::Bare),
+    (DEFAULT, DirectiveShape::Value),
+    (EXPECT, DirectiveShape::Value),
+    (MSG, DirectiveShape::Value),
+    (ERROR, DirectiveShape::Value),
+    (BRAND, DirectiveShape::Value),
+    (SCHEMA, DirectiveShape::NameBody),
+    (IMPORT, DirectiveShape::Import),
+    (MAIN, DirectiveShape::Main),
 ];
 
 /// Look up a directive's expected shape by name. Returns `None` for

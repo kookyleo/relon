@@ -9,7 +9,6 @@ use relon_parser::{
     Node, Operator, TokenKey, TokenRange,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -395,6 +394,18 @@ impl Evaluator {
             .ok_or_else(|| RuntimeError::NoMainSignature { range: root.range })?;
         let scope = self.prepare_root_scope(scope, &root)?;
 
+        // Schema scope: root-level `#schema A Body` declarations must be
+        // visible before we type-check arguments referring to them, and
+        // dict-field `#schema X: {...}` schemas likewise. Both seedings
+        // are idempotent so doing them once up-front (instead of per
+        // param) is enough.
+        if let Some(tree) = self.context.analyzed.as_ref() {
+            if !tree.root_schemas.is_empty() {
+                self.seed_root_schemas(&tree.root_schemas, &scope)?;
+            }
+        }
+        self.prepare_dict_scope(&root, &scope)?;
+
         // Each parameter: pop the matching arg, type-check, bind into
         // scope locals. Keep a "consumed" set so we can detect extras.
         for param in &signature.params {
@@ -404,22 +415,6 @@ impl Evaluator {
                     range: param.range,
                 });
             };
-            // Schema scope: root-level `#schema A Body` declarations
-            // must be visible before we type-check arguments referring
-            // to them. The full prepare_dict_scope walk happens once
-            // we descend into the body; here we eagerly seed root-level
-            // schemas so a `User` parameter type can resolve.
-            let root_schemas: Vec<relon_analyzer::RootSchemaDecl> = self
-                .context
-                .analyzed
-                .as_ref()
-                .map(|tree| tree.root_schemas.clone())
-                .unwrap_or_default();
-            if !root_schemas.is_empty() {
-                self.seed_root_schemas(&root_schemas, &scope)?;
-            }
-            self.prepare_dict_scope(&root, &scope)?;
-
             self.check_type(&mut value, &param.type_node, &scope, param.range)
                 .map_err(|err| match err {
                     RuntimeError::TypeMismatch {
@@ -529,11 +524,7 @@ impl Evaluator {
         Ok(())
     }
 
-    /// Build a `Value::EnumSchema` from a sum-type `SchemaDef`. Mirrors
-    /// the body of `builtin_decorators::build_enum_schema` but kept
-    /// crate-local so we don't pull a private helper across module
-    /// boundaries; the variant-shape conversion is small enough that
-    /// duplicating it here keeps the dependency direction one-way.
+    /// Build a `Value::EnumSchema` from a sum-type `SchemaDef`.
     fn build_root_enum_schema(&self, def: &relon_analyzer::SchemaDef) -> Value {
         use crate::value::SchemaField;
         let mut variants: HashMap<String, HashMap<String, SchemaField>> = HashMap::new();
@@ -1095,17 +1086,13 @@ impl Evaluator {
                     *current_scope = new_scope;
                 }
             }
+            // `NameBody` is intentionally skipped here: schema bindings
+            // are seeded into the dict's own scope by `prepare_dict_scope`
+            // once the body opens. Doing it here too would double-bind
+            // and `&sibling` would resolve in the outer scope by mistake.
             SCHEMA => match &directive.body {
-                DirectiveBody::NameBody { .. } => {
-                    // Name-body schema bindings are seeded into the
-                    // dict's own scope by `prepare_dict_scope` once the
-                    // dict body opens. Doing it here too would
-                    // double-bind and a body's `&sibling` references
-                    // would resolve in the wrong scope (outer vs dict).
-                }
+                DirectiveBody::NameBody { .. } => {}
                 DirectiveBody::Bare => {
-                    // Dict-field form: `#schema X: Body`. Interpret the
-                    // body as a schema definition rather than data.
                     if let Some(tree) = self.context.analyzed.as_ref() {
                         if let Some(def) = tree.schema(node.id) {
                             if !def.variants.is_empty() {
@@ -1190,8 +1177,7 @@ impl Evaluator {
     }
 
     /// Lower a `#import <spec> from "path"` directive into a scope with
-    /// the imported bindings. Mirrors the old `apply_import` flow for
-    /// the `@import("path", as=..., spread=...)` decorator.
+    /// the imported bindings.
     pub fn apply_directive_import(
         &self,
         spec: &relon_parser::DirectiveImportSpec,
@@ -1237,69 +1223,6 @@ impl Evaluator {
                     };
                     new_locals.insert(local_name, v.clone());
                 }
-            }
-        }
-        Ok(scope.with_locals(new_locals))
-    }
-
-    pub fn apply_import(
-        &self,
-        args: &[CallArg],
-        scope: &Arc<Scope>,
-        range: TokenRange,
-    ) -> Result<Arc<Scope>, RuntimeError> {
-        let mut path_str = String::new();
-        let mut alias: Option<String> = None;
-        let mut should_spread = false;
-        for arg in args {
-            let val = self.eval(&arg.value, scope)?;
-            match arg.name.as_deref() {
-                Some("path") | None if path_str.is_empty() => {
-                    if let Value::String(s) = val {
-                        path_str = s;
-                    }
-                }
-                Some("as") => {
-                    if let Value::String(s) = val {
-                        alias = Some(s);
-                    }
-                }
-                Some("spread") => {
-                    if let Value::Bool(b) = val {
-                        should_spread = b;
-                    }
-                }
-                _ => {}
-            }
-        }
-        let evaluated_module = self.load_module(&path_str, scope, range)?;
-        let final_alias = if let Some(a) = alias {
-            Some(a)
-        } else if !should_spread {
-            Path::new(&path_str)
-                .file_stem()
-                .map(|s| s.to_string_lossy().to_string())
-        } else {
-            None
-        };
-        let mut new_locals = HashMap::new();
-        if let Some(a) = final_alias {
-            new_locals.insert(a, evaluated_module.clone());
-        }
-        if should_spread {
-            if let Value::Dict(d) = evaluated_module {
-                // Private fields are absent from `d.map` by construction
-                // (the dict literal evaluator drops them), so spread can
-                // copy everything that's left without an extra filter.
-                for (k, v) in d.map.iter() {
-                    new_locals.insert(k.clone(), v.clone());
-                }
-            } else {
-                return Err(RuntimeError::TypeMismatch {
-                    expected: "Dict".to_string(),
-                    found: evaluated_module.type_name().to_string(),
-                    range,
-                });
             }
         }
         Ok(scope.with_locals(new_locals))
@@ -1516,22 +1439,7 @@ impl Evaluator {
                 params,
                 body,
                 captured_env,
-            } => {
-                let mut local_vars = HashMap::new();
-                for (i, param_name) in params.iter().enumerate() {
-                    if let Some(arg) = args.get(i) {
-                        local_vars.insert(param_name.clone(), arg.value.clone());
-                    } else {
-                        return Err(RuntimeError::TypeMismatch {
-                            expected: format!("at least {} arguments", params.len()),
-                            found: format!("{}", args.len()),
-                            range,
-                        });
-                    }
-                }
-                let call_scope = captured_env.with_locals(local_vars);
-                self.eval(&body, &call_scope)
-            }
+            } => self.eval_closure(&params, &body, args, &captured_env, range),
             _ => Err(RuntimeError::TypeMismatch {
                 expected: "Closure".to_string(),
                 found: func.type_name().to_string(),
@@ -1739,25 +1647,28 @@ impl Evaluator {
             // already-bound (placeholder), preventing infinite
             // recursion through this same prepare-phase. Then walk
             // again to actually build each schema's value.
-            let mut seeded: Vec<&str> = Vec::new();
-            for dir in &node.directives {
-                if dir.name != crate::decorator_names::SCHEMA {
-                    continue;
+            let mut seeded: HashSet<&str> = HashSet::new();
+            {
+                let mut locals = scope.locals.lock().unwrap();
+                for dir in &node.directives {
+                    if dir.name != crate::decorator_names::SCHEMA {
+                        continue;
+                    }
+                    let relon_parser::DirectiveBody::NameBody { name, .. } = &dir.body else {
+                        continue;
+                    };
+                    if locals.contains_key(name) {
+                        continue;
+                    }
+                    locals.insert(
+                        name.clone(),
+                        Value::Schema {
+                            generics: Vec::new(),
+                            fields: HashMap::new(),
+                        },
+                    );
+                    seeded.insert(name);
                 }
-                let relon_parser::DirectiveBody::NameBody { name, .. } = &dir.body else {
-                    continue;
-                };
-                if scope.locals.lock().unwrap().contains_key(name) {
-                    continue;
-                }
-                scope.locals.lock().unwrap().insert(
-                    name.clone(),
-                    Value::Schema {
-                        generics: Vec::new(),
-                        fields: HashMap::new(),
-                    },
-                );
-                seeded.push(name);
             }
             for dir in &node.directives {
                 if dir.name != crate::decorator_names::SCHEMA {
@@ -1766,7 +1677,7 @@ impl Evaluator {
                 let relon_parser::DirectiveBody::NameBody { name, body, .. } = &dir.body else {
                     continue;
                 };
-                if !seeded.contains(&name.as_str()) {
+                if !seeded.contains(name.as_str()) {
                     continue;
                 }
                 let val = self.lower_schema_binding(name, body, scope)?;

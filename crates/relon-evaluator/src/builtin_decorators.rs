@@ -1,6 +1,6 @@
 //! Built-in [`DecoratorPlugin`] implementations.
 //!
-//! After batch 3's sigil split, the registry holds two kinds of entries:
+//! The registry holds two kinds of entries:
 //!
 //! * The single `@`-decorator: `@value` (host-registered value transform).
 //! * Schema-field meta directives — `#default`, `#expect`, `#msg`,

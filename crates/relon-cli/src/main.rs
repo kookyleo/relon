@@ -130,27 +130,13 @@ fn main() -> miette::Result<()> {
                         .with_source_code(NamedSource::new(file.to_string_lossy(), content)));
                     }
                 };
-                let parsed: serde_json::Value = serde_json::from_str(&args_json).map_err(|e| {
-                    miette::miette!("--args must be a JSON object: {e}")
+                let args_map: HashMap<String, Value> =
+                    serde_json::from_str(&args_json).map_err(|e| {
+                        miette::miette!(
+                            "--args must be a JSON object keyed by `#main(...)` parameter names: {e}"
+                        )
                         .with_source_code(NamedSource::new(file.to_string_lossy(), content.clone()))
-                })?;
-                let serde_json::Value::Object(map) = parsed else {
-                    return Err(miette::miette!(
-                        "--args must be a JSON object whose keys are `#main(...)` parameter names"
-                    )
-                    .with_source_code(NamedSource::new(file.to_string_lossy(), content)));
-                };
-                let mut args_map: HashMap<String, Value> = HashMap::new();
-                for (k, v) in map {
-                    let val: Value = serde_json::from_value(v).map_err(|e| {
-                        miette::miette!("--args[{k}] could not be deserialized into Value: {e}")
-                            .with_source_code(NamedSource::new(
-                                file.to_string_lossy(),
-                                content.clone(),
-                            ))
                     })?;
-                    args_map.insert(k, val);
-                }
                 evaluator.run_main(&scope, args_map).map_err(|e| {
                     Report::new(e)
                         .with_source_code(NamedSource::new(file.to_string_lossy(), content.clone()))
