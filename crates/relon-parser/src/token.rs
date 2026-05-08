@@ -144,10 +144,13 @@ pub enum DirectiveShape {
 pub enum DirectiveBody {
     Bare,
     Value(Box<Node>),
-    /// Single named declaration: `<ident> <body-expr>` (no colon).
+    /// Single named declaration: `<ident>[<T, ...>] <body-expr>` (no colon).
+    /// `generics` carries the optional type-parameter list declared after
+    /// the name (e.g. `Result<T, E>` → `["T", "E"]`); empty when absent.
     NameBody {
         name: String,
         name_range: TokenRange,
+        generics: Vec<String>,
         body: Box<Node>,
     },
     Import {

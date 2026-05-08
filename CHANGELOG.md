@@ -1,5 +1,51 @@
 # Changelog
 
+## [Unreleased] — Generic schemas + built-in Result / Option
+
+Schema definitions now accept type parameters, and `Result<T, E>` /
+`Option<T>` are seeded into every Context as built-in tagged-enum
+schemas — no explicit declaration needed.
+
+### Generic type parameters on `#schema`
+
+```relon
+#schema Box<T> { T value: * }
+#schema Result<T, E>: Enum<Ok { T value: * }, Err { E error: * }>
+```
+
+The parser now accepts an optional `<T, U, ...>` form-parameter list
+between the schema name and its body. `DirectiveBody::NameBody`
+carries the new `generics: Vec<String>`; the analyzer threads it
+through `lower_schema_pure`; `Value::EnumSchema` carries it
+alongside the existing `Value::Schema`. The evaluator's `check_type`
+performs name-substitution on instantiation
+(`Result<Int, String>` → `{T -> Int, E -> String}`), so payload
+fields are validated against the actual instantiated type.
+
+Both root-level (`#schema X<T> Body`) and dict-embedded
+(`#schema X<T> Body,`) forms are wired through.
+
+### `Result<T, E>` and `Option<T>` in the prelude
+
+```relon
+#main(Int n) -> Dict
+{ ok: Result.Ok { value: n } }     // works without a `#schema Result ...`
+```
+
+`Context::new` seeds `Result` and `Option` into the per-context
+schema table. They behave like any user-defined enum schema —
+`Result.Ok { value: 1 }` constructs a branded variant; type-hinted
+fields like `Result<Int, String> r: Result.Ok { value: 1 }` enforce
+the payload type. Hosts that want a custom `Result` / `Option` can
+still call `Context::register_schema` to override the prelude entry.
+
+Limitation: the field-level type hint (`Result<Int, String> r: ...`)
+is what triggers the generics substitution today; using
+`Result<Int, String>` as a `#main(...) -> ReturnType` clause requires
+the body to be a dict/list (root-shape limitation), so end-to-end
+return-type validation against a *variant constructor* hasn't been
+exercised yet — coverage is via field-level usage.
+
 ## [Unreleased] — Review pass (post-batch-3)
 
 A targeted review pass closing nine evaluator/parser bugs uncovered

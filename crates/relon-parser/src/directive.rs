@@ -133,6 +133,24 @@ fn parse_name_body<'a>(input: &mut Span<'a>) -> ModalResult<crate::DirectiveBody
     };
     let name_end = input.location();
     let name_range = create_range(input, name_start, name_end);
+
+    // Optional `<T, U, ...>` type-parameter list. Form params are bare
+    // identifiers — nested types are not allowed in *declarations*. We
+    // try-parse and rewind on failure so anything that doesn't look like
+    // a generic clause is left for the surrounding grammar.
+    let pre_generics = input.checkpoint();
+    let generics: Vec<String> = if input.as_ref().starts_with('<') {
+        match parse_generic_param_list(input) {
+            Ok(list) => list,
+            Err(_) => {
+                input.reset(&pre_generics);
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
+
     let _ = soc0.parse_next(input)?;
     let peek = input.as_ref().chars().next();
     if peek == Some(':') {
@@ -153,8 +171,21 @@ fn parse_name_body<'a>(input: &mut Span<'a>) -> ModalResult<crate::DirectiveBody
     Ok(crate::DirectiveBody::NameBody {
         name: name_token.0,
         name_range,
+        generics,
         body: Box::new(body),
     })
+}
+
+/// Parse `<T, U, ...>` — a comma-separated list of bare identifiers.
+/// Used by `parse_name_body` to capture schema type parameters such as
+/// `#schema Result<T, E> ...`.
+fn parse_generic_param_list<'a>(input: &mut Span<'a>) -> ModalResult<Vec<String>> {
+    let _ = '<'.parse_next(input)?;
+    let _ = soc0.parse_next(input)?;
+    let names: Vec<String> =
+        separated(1.., id.map(|t: crate::TokenId| t.0), (soc0, ',', soc0)).parse_next(input)?;
+    let _ = (soc0, opt(','), soc0, '>').parse_next(input)?;
+    Ok(names)
 }
 
 fn parse_import_body<'a>(input: &mut Span<'a>) -> ModalResult<crate::DirectiveBody> {
@@ -298,8 +329,35 @@ mod tests {
         let dirs = parse_directives(&mut s).unwrap();
         assert_eq!(dirs.len(), 1);
         match &dirs[0].body {
-            crate::DirectiveBody::NameBody { name, .. } => {
+            crate::DirectiveBody::NameBody { name, generics, .. } => {
                 assert_eq!(name, "User");
+                assert!(generics.is_empty());
+            }
+            _ => panic!("expected NameBody"),
+        }
+    }
+
+    #[test]
+    fn parses_name_body_with_generics() {
+        let mut s = Span::new("#schema Result<T, E> Enum<Ok, Err>");
+        let dirs = parse_directives(&mut s).unwrap();
+        match &dirs[0].body {
+            crate::DirectiveBody::NameBody { name, generics, .. } => {
+                assert_eq!(name, "Result");
+                assert_eq!(generics, &vec!["T".to_string(), "E".to_string()]);
+            }
+            _ => panic!("expected NameBody"),
+        }
+    }
+
+    #[test]
+    fn parses_name_body_single_generic() {
+        let mut s = Span::new("#schema Box<T> { T value: * }");
+        let dirs = parse_directives(&mut s).unwrap();
+        match &dirs[0].body {
+            crate::DirectiveBody::NameBody { name, generics, .. } => {
+                assert_eq!(name, "Box");
+                assert_eq!(generics, &vec!["T".to_string()]);
             }
             _ => panic!("expected NameBody"),
         }

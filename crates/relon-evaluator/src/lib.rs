@@ -6,6 +6,7 @@ pub mod error;
 pub mod eval;
 pub mod module;
 pub mod native_fn;
+pub mod prelude;
 pub mod reference;
 pub mod schema;
 pub mod scope;

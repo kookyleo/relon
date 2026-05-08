@@ -138,6 +138,9 @@ impl Context {
         };
         crate::builtin_decorators::register_to(&mut this);
         crate::stdlib::register_to(&mut this);
+        // Seed prelude (`Result`, `Option`) before user schemas land via
+        // `register_schema` so user definitions can override.
+        crate::prelude::seed_prelude_schemas(&mut this.schemas);
         // Virtual Stdlib is checked first
         this.module_resolvers.push(Arc::new(StdModuleResolver));
         this
@@ -584,6 +587,7 @@ impl Evaluator {
         }
         Value::EnumSchema {
             name: def.name.clone().unwrap_or_default(),
+            generics: def.generics.clone(),
             variants,
         }
     }
@@ -1046,6 +1050,7 @@ impl Evaluator {
     pub fn lower_schema_binding(
         &self,
         name: &str,
+        generics: &[String],
         body: &Node,
         scope: &Arc<Scope>,
     ) -> Result<Value, RuntimeError> {
@@ -1065,7 +1070,7 @@ impl Evaluator {
             }
         }
         let (lowered, _diags) =
-            relon_analyzer::lower_schema_pure(Some(name.to_string()), Vec::new(), body);
+            relon_analyzer::lower_schema_pure(Some(name.to_string()), generics.to_vec(), body);
         let Some(def) = lowered else {
             return Err(RuntimeError::TypeMismatch {
                 expected: "schema body (Dict or Enum<...>)".to_string(),
@@ -1411,8 +1416,13 @@ impl Evaluator {
         let head = enum_path.first().ok_or_else(|| {
             RuntimeError::UnsupportedOperator("variant constructor without enum".into(), range)
         })?;
+        // Resolve the head identifier through the local scope first, then
+        // fall back to the context's schema table. The latter is what
+        // makes prelude entries (`Result`, `Option`) reachable as
+        // `Result.Ok { ... }` without a user-side `#schema` declaration.
         let mut current = scope
             .get_local(head)
+            .or_else(|| self.context.schemas.get(head).cloned())
             .ok_or_else(|| RuntimeError::VariableNotFound(head.clone(), range))?;
         for seg in &enum_path[1..] {
             match current {
@@ -1431,7 +1441,12 @@ impl Evaluator {
             }
         }
         let enum_name = enum_path.join(".");
-        let Value::EnumSchema { name, variants } = current else {
+        let Value::EnumSchema {
+            name,
+            generics,
+            variants,
+        } = current
+        else {
             return Err(RuntimeError::TypeMismatch {
                 expected: format!("EnumSchema `{enum_name}`"),
                 found: current.type_name().to_string(),
@@ -1464,7 +1479,17 @@ impl Evaluator {
         };
         for (fname, field_def) in variant_fields.iter() {
             if let Some(fval) = map.get_mut(fname) {
-                self.check_type(fval, &field_def.type_hint, scope, range)?;
+                // Skip the type check when the declared field type is
+                // a bare reference to one of the enum's generic
+                // parameters (e.g. `value: T` inside `Result<T, E>`).
+                // The substitution is supplied at the use site by the
+                // surrounding `check_type` (via `Result<Int, String>`
+                // → `T -> Int`), so demanding the bare `T` resolve in
+                // *this* scope would always fail. Concrete (non-type-
+                // variable) field types are still validated here.
+                if !is_type_variable(&field_def.type_hint, &generics) {
+                    self.check_type(fval, &field_def.type_hint, scope, range)?;
+                }
             } else if field_def.type_hint.is_optional {
                 continue;
             } else if let Some(default) = &field_def.default_value {
@@ -1721,7 +1746,8 @@ impl Evaluator {
                     if dir.name != crate::decorator_names::SCHEMA {
                         continue;
                     }
-                    let relon_parser::DirectiveBody::NameBody { name, .. } = &dir.body else {
+                    let relon_parser::DirectiveBody::NameBody { name, generics, .. } = &dir.body
+                    else {
                         continue;
                     };
                     if locals.contains_key(name) {
@@ -1730,7 +1756,7 @@ impl Evaluator {
                     locals.insert(
                         name.clone(),
                         Value::Schema {
-                            generics: Vec::new(),
+                            generics: generics.clone(),
                             fields: HashMap::new(),
                         },
                     );
@@ -1741,13 +1767,19 @@ impl Evaluator {
                 if dir.name != crate::decorator_names::SCHEMA {
                     continue;
                 }
-                let relon_parser::DirectiveBody::NameBody { name, body, .. } = &dir.body else {
+                let relon_parser::DirectiveBody::NameBody {
+                    name,
+                    generics,
+                    body,
+                    ..
+                } = &dir.body
+                else {
                     continue;
                 };
                 if !seeded.contains(name.as_str()) {
                     continue;
                 }
-                let val = self.lower_schema_binding(name, body, scope)?;
+                let val = self.lower_schema_binding(name, generics, body, scope)?;
                 scope.locals.lock().unwrap().insert(name.clone(), val);
             }
 
@@ -1895,6 +1927,15 @@ pub(crate) fn decorator_name(dec: &DecoratorNode) -> String {
         .map(|k| k.to_string_key())
         .collect::<Vec<_>>()
         .join(".")
+}
+
+/// True if `t` is a bare reference to one of `generics` — a
+/// single-segment path with no nested generics whose name appears in
+/// the generic-parameter list. Used by `eval_variant_ctor` to skip
+/// validation of fields whose type is still an unresolved type
+/// variable (the substitution arrives at the use site).
+fn is_type_variable(t: &relon_parser::TypeNode, generics: &[String]) -> bool {
+    t.path.len() == 1 && t.generics.is_empty() && generics.iter().any(|g| g == &t.path[0])
 }
 
 /// True when `node` carries the `#private` directive. See

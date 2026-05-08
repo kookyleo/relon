@@ -2923,3 +2923,165 @@ fn run_main_return_type_match_passes() {
     let Value::Dict(d) = result else { panic!() };
     assert_eq!(d.map.get("result"), Some(&Value::Int(8)));
 }
+
+// ---------- Generic schema tests (Phase 7) ----------
+
+#[test]
+fn user_defined_generic_enum_schema_lowers_with_generics() {
+    // `#schema Box<T> Enum<Wrap { value: T }>` lowers to a
+    // `Value::EnumSchema` whose `generics` vector carries the
+    // declared parameter names. The variant's payload type still
+    // mentions the bare `T` (substitution happens at the use site).
+    let result = eval_doc(
+        r#"{
+            #schema Box<T> Enum<Wrap { value: T }>,
+            value: Box.Wrap { value: 42 }
+        }"#,
+    )
+    .unwrap();
+    let Value::Dict(outer) = result else {
+        panic!("dict")
+    };
+    let Value::Dict(b) = outer.map.get("value").unwrap() else {
+        panic!("variant dict")
+    };
+    assert_eq!(b.brand.as_deref(), Some("Wrap"));
+    assert_eq!(b.variant_of.as_deref(), Some("Box"));
+    assert_eq!(b.map.get("value"), Some(&Value::Int(42)));
+}
+
+#[test]
+fn builtin_result_schema_is_seeded_at_startup() {
+    // `Result.Ok { ... }` is reachable without any user-side
+    // `#schema Result<...>` declaration — the prelude seeds it into
+    // `Context.schemas` at construction time.
+    use std::collections::HashMap;
+    let source = r#"#main(Int n) -> Dict
+{ ok: Result.Ok { value: n } }"#;
+    let node = parse_doc(source);
+    let analyzed = std::sync::Arc::new(relon_analyzer::analyze(&node));
+    let mut args: HashMap<String, Value> = HashMap::new();
+    args.insert("n".to_string(), Value::Int(42));
+    let ctx = Context::new()
+        .with_root(node.clone())
+        .with_analyzed(std::sync::Arc::clone(&analyzed));
+    let result = Evaluator::new(std::sync::Arc::new(ctx))
+        .run_main(&std::sync::Arc::new(Scope::default()), args)
+        .unwrap();
+    let Value::Dict(d) = result else { panic!() };
+    let Value::Dict(ok) = d.map.get("ok").unwrap() else {
+        panic!()
+    };
+    assert_eq!(ok.brand.as_deref(), Some("Ok"));
+    assert_eq!(ok.variant_of.as_deref(), Some("Result"));
+    assert_eq!(ok.map.get("value"), Some(&Value::Int(42)));
+}
+
+#[test]
+fn builtin_option_some_seeds_at_startup() {
+    // Option<T> is the second prelude entry. Same pre-seeded path —
+    // `Option.Some { value: x }` works without any declaration.
+    let result = eval_doc(
+        r#"{
+            v: Option.Some { value: 7 }
+        }"#,
+    )
+    .unwrap();
+    let Value::Dict(outer) = result else { panic!() };
+    let Value::Dict(some) = outer.map.get("v").unwrap() else {
+        panic!()
+    };
+    assert_eq!(some.brand.as_deref(), Some("Some"));
+    assert_eq!(some.variant_of.as_deref(), Some("Option"));
+    assert_eq!(some.map.get("value"), Some(&Value::Int(7)));
+}
+
+#[test]
+fn builtin_option_none_unit_variant_works() {
+    // `Option.None {}` is a unit variant — empty body, no payload.
+    let result = eval_doc(
+        r#"{
+            v: Option.None {}
+        }"#,
+    )
+    .unwrap();
+    let Value::Dict(outer) = result else { panic!() };
+    let Value::Dict(none) = outer.map.get("v").unwrap() else {
+        panic!()
+    };
+    assert_eq!(none.brand.as_deref(), Some("None"));
+    assert_eq!(none.variant_of.as_deref(), Some("Option"));
+    assert!(none.map.is_empty());
+}
+
+#[test]
+fn generic_result_payload_type_is_checked_via_schema_field() {
+    // Field-level type hint `Result<Int, String> r: *` substitutes
+    // `T -> Int` when validating the variant payload. A `String`
+    // value where `T == Int` must be rejected.
+    let result = eval_doc(
+        r#"{
+            Result<Int, String> r: Result.Ok { value: "oops" }
+        }"#,
+    );
+    assert!(
+        matches!(&result, Err(RuntimeError::TypeMismatch { .. })),
+        "expected TypeMismatch on String payload for T=Int, got {result:?}"
+    );
+}
+
+#[test]
+fn generic_result_payload_type_accepts_matching_type() {
+    // Counterpart: `Ok { value: Int }` matches `Result<Int, String>`'s
+    // `T -> Int` substitution and the field-level check passes.
+    // (The outer field's type hint also rebrands `r` with the generic
+    // type's stringified form — that's standard `Type field: value`
+    // behavior and not specific to this feature.)
+    let result = eval_doc(
+        r#"{
+            Result<Int, String> r: Result.Ok { value: 99 }
+        }"#,
+    )
+    .unwrap();
+    let Value::Dict(d) = result else { panic!() };
+    let Value::Dict(ok) = d.map.get("r").unwrap() else {
+        panic!("expected dict for r")
+    };
+    // Payload value made it through unchanged. The variant_of marker
+    // is preserved even after the outer brand override.
+    assert_eq!(ok.variant_of.as_deref(), Some("Result"));
+    assert_eq!(ok.map.get("value"), Some(&Value::Int(99)));
+}
+
+#[test]
+fn generic_option_field_type_substitutes_payload() {
+    // Same pattern with the prelude `Option<T>` schema — `T -> Int`
+    // substitution, a `String` payload must error out.
+    let result = eval_doc(
+        r#"{
+            Option<Int> v: Option.Some { value: "no" }
+        }"#,
+    );
+    assert!(
+        matches!(&result, Err(RuntimeError::TypeMismatch { .. })),
+        "expected TypeMismatch for String value where T=Int, got {result:?}"
+    );
+}
+
+#[test]
+fn user_can_override_prelude_option_schema() {
+    // A user-defined `#schema Option ...` should shadow the prelude's
+    // entry. Prove it by giving Option a non-prelude variant `Many`.
+    let result = eval_doc(
+        r#"{
+            #schema Option Enum<Many { items: List }>,
+            v: Option.Many { items: [1, 2] }
+        }"#,
+    )
+    .unwrap();
+    let Value::Dict(outer) = result else { panic!() };
+    let Value::Dict(many) = outer.map.get("v").unwrap() else {
+        panic!()
+    };
+    assert_eq!(many.brand.as_deref(), Some("Many"));
+}

@@ -184,7 +184,9 @@ impl Evaluator {
                 self.apply_schema(resolved_fields, value, scope, range, visited, depth + 1)?;
                 Ok(())
             }
-            Value::EnumSchema { variants, .. } => {
+            Value::EnumSchema {
+                generics, variants, ..
+            } => {
                 let variant_name = match value {
                     Value::Dict(d) => d.brand.clone(),
                     _ => {
@@ -209,16 +211,34 @@ impl Evaluator {
                             range,
                         })?;
 
-                let ptr = value as *const Value;
-                if !visited.insert((type_name, ptr)) {
-                    return Ok(());
+                // Pair up declared generic param names with the
+                // concrete types passed at the use-site (`Result<Int,
+                // String>` → `{T -> Int, E -> String}`). Missing trailing
+                // generics are simply not substituted; downstream type
+                // checks will catch obvious mismatches.
+                let mut subst_map = HashMap::new();
+                for (i, gname) in generics.iter().enumerate() {
+                    if let Some(gtype) = type_hint.generics.get(i) {
+                        subst_map.insert(gname.clone(), gtype.clone());
+                    }
                 }
 
                 let mut fields_map = HashMap::new();
                 for (name, field_def) in fields {
                     fields_map.insert(name.clone(), field_def.clone());
                 }
-                self.apply_schema(fields_map, value, scope, range, visited, depth + 1)?;
+                let resolved_fields = if subst_map.is_empty() {
+                    fields_map
+                } else {
+                    Self::substitute_generics_in_schema(fields_map, &subst_map)
+                };
+
+                let ptr = value as *const Value;
+                if !visited.insert((type_name, ptr)) {
+                    return Ok(());
+                }
+
+                self.apply_schema(resolved_fields, value, scope, range, visited, depth + 1)?;
                 Ok(())
             }
             _ => Err(RuntimeError::TypeMismatch {

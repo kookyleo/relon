@@ -118,6 +118,7 @@ pub enum Value {
     #[serde(skip)]
     EnumSchema {
         name: String,
+        generics: Vec<String>,
         variants: std::collections::HashMap<String, std::collections::HashMap<String, SchemaField>>,
     },
     /// A single type description

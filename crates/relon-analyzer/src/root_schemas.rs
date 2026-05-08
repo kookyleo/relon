@@ -56,6 +56,7 @@ pub fn collect_root_schemas(root: &Node, tree: &mut AnalyzedTree) {
         let DirectiveBody::NameBody {
             name,
             name_range,
+            generics,
             body,
         } = &dir.body
         else {
@@ -108,7 +109,7 @@ pub fn collect_root_schemas(root: &Node, tree: &mut AnalyzedTree) {
         // ones. The lowering result also lands in `tree.schemas` —
         // keyed by the body node id — so downstream consumers can
         // treat root-form and dict-field-form uniformly.
-        let (def, diags) = lower_schema_pure(Some(name.clone()), Vec::new(), body);
+        let (def, diags) = lower_schema_pure(Some(name.clone()), generics.clone(), body);
         tree.diagnostics.extend(diags);
         if let Some(def) = def {
             tree.schemas.insert(body.id, def);
