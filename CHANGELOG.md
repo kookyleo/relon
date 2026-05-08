@@ -121,6 +121,22 @@ Identifiers may still start with `_` (used by intrinsics like
 
 ### Non-breaking
 
+* **Root-level `@schema(Name={...})` decorator**: textual layout sugar
+  for co-locating schema declarations with `@input(...)`. Lets users
+  write
+  ```relon
+  @schema(Req={ String name: *, Int retries: * })
+  @input(req=Req)
+  { greeting: f"hello ${input.req.name}" }
+  ```
+  instead of the previous awkward layout where the `@schema Req: {...}`
+  body lived inside the root dict but was referenced from a decorator
+  outside it. Semantics are identical to declaring `Req` as a
+  `@private @schema` field; the registered schema is visible to both
+  the dict body and `@input(...)` SchemaRefs. Spec §6.4.1; new
+  diagnostics `RootSchemaDecoratorMissingName`,
+  `RootSchemaDecoratorEmpty`, `DuplicateRootSchemaName`,
+  `RootSchemaCollidesWithField`, `RootSchemaInvalidValue`.
 * **`RecursionLimitExceeded` error kind**: split out from
   `StepLimitExceeded` so `Capabilities::max_steps`-bound semantics
   stop being conflated with type-check / schema-validation recursion
@@ -144,7 +160,7 @@ Identifiers may still start with `_` (used by intrinsics like
 
 ### Code counts
 
-* 254 / 254 tests passing.
+* 263 / 263 tests passing.
 * 0 clippy warnings (`-D warnings`).
 * 0 `unsafe` blocks across the workspace.
 

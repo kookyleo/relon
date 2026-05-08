@@ -184,6 +184,76 @@ pub enum Diagnostic {
         #[label("no slots declared")]
         range: SourceSpan,
     },
+
+    #[error("root-level `@schema(...)` argument is missing a schema name")]
+    #[diagnostic(
+        code(relon::analyze::root_schema_decorator_missing_name),
+        help(
+            "Use the `Name=Body` form so each root-level schema has an explicit identifier, e.g. `@schema(User={{ String name: * }})`."
+        )
+    )]
+    RootSchemaDecoratorMissingName {
+        #[label("expected `Name=<schema body>`")]
+        range: SourceSpan,
+    },
+
+    #[error("root-level `@schema(...)` declares no schemas")]
+    #[diagnostic(
+        code(relon::analyze::root_schema_decorator_empty),
+        help(
+            "Pass at least one `Name=<schema body>` argument, e.g. `@schema(User={{ String name: * }})`. A bare `@schema()` has no effect at the root level."
+        )
+    )]
+    RootSchemaDecoratorEmpty {
+        #[label("no schemas declared")]
+        range: SourceSpan,
+    },
+
+    #[error("duplicate root-level `@schema(...)` name `{name}`")]
+    #[diagnostic(
+        code(relon::analyze::duplicate_root_schema_name),
+        help(
+            "Each root-level `@schema(Name=...)` entry must have a unique name. Pick distinct names so the merged schema scope is unambiguous."
+        )
+    )]
+    DuplicateRootSchemaName {
+        name: String,
+        #[label("first declared here")]
+        first: SourceSpan,
+        #[label("redeclared with the same name")]
+        second: SourceSpan,
+    },
+
+    #[error("root-level `@schema({name}=...)` collides with dict-field `@schema {name}: ...`")]
+    #[diagnostic(
+        code(relon::analyze::root_schema_collides_with_field),
+        help(
+            "Pick one form: either declare the schema in the root-decorator stack as `@schema({name}=...)`, or as a `@private @schema {name}: ...` field inside the root dict — not both."
+        )
+    )]
+    RootSchemaCollidesWithField {
+        name: String,
+        #[label("declared at the root-decorator level")]
+        root_range: SourceSpan,
+        #[label("also declared as a dict field")]
+        field_range: SourceSpan,
+    },
+
+    #[error(
+        "root-level `@schema({name}=...)` value must be a Dict or `Enum<...>`, got {found_type}"
+    )]
+    #[diagnostic(
+        code(relon::analyze::root_schema_invalid_value),
+        help(
+            "The right-hand side of a root-level `@schema(Name=...)` argument must be the schema body itself — either a dict literal `{{ ... }}` or an `Enum<...>` type."
+        )
+    )]
+    RootSchemaInvalidValue {
+        name: String,
+        found_type: String,
+        #[label("not a schema body")]
+        range: SourceSpan,
+    },
 }
 
 impl Diagnostic {
@@ -200,7 +270,12 @@ impl Diagnostic {
             | Diagnostic::SchemaFieldBrandInvalidArg { .. }
             | Diagnostic::DuplicateInputName { .. }
             | Diagnostic::InputDecoratorMissingName { .. }
-            | Diagnostic::InputDecoratorEmpty { .. } => Severity::Error,
+            | Diagnostic::InputDecoratorEmpty { .. }
+            | Diagnostic::RootSchemaDecoratorMissingName { .. }
+            | Diagnostic::RootSchemaDecoratorEmpty { .. }
+            | Diagnostic::DuplicateRootSchemaName { .. }
+            | Diagnostic::RootSchemaCollidesWithField { .. }
+            | Diagnostic::RootSchemaInvalidValue { .. } => Severity::Error,
             // Informational: the analyzer's view is conservative — a
             // spread, closure binding, or runtime-computed field may
             // still resolve, so we don't gate evaluation on it.

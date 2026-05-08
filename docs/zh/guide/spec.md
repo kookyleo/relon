@@ -278,6 +278,58 @@ slot 名是 input wrapper 中的字段名，SchemaRef 是已声明的 `@schema`
 conformant runtime 看同一份脚本都按相同 schema 校验——这是 §1.2 跨
 runtime 一致性兑现的关键拼图。
 
+#### 6.4.1 `@schema(Name={...})` —— 根级 schema 装饰器糖
+
+把 schema 声明从根 dict 体内挪到根装饰器栈里，与 `@input(...)` 并
+排，纯粹是**布局糖**——语义等价于在根 dict 里写一个
+`@private @schema Name: { ... }` 字段。
+
+```relon
+// 老写法：schema 在 dict 体内，被 @input 从 dict 外引用
+@input(req=Req)
+{
+    @schema Req: { String name: *, Int retries: * },
+    greeting: f"hello ${input.req.name}"
+}
+
+// 新写法：schema 与 @input 同处装饰器栈，视觉上同一处
+@schema(Req={ String name: *, Int retries: * })
+@input(req=Req)
+{
+    greeting: f"hello ${input.req.name}"
+}
+```
+
+可以一次声明多个：
+
+```relon
+@schema(User={ String name: * })
+@schema(Cart={ Int total: * })
+@input(user=User)
+@input(cart=Cart)
+{
+    summary: f"${input.user.name} - ${input.cart.total}"
+}
+```
+
+**规则**：
+
+1. `@schema(...)` 只在**根级**装饰器栈里有此语义；嵌套 dict 上写
+   `@schema(Name=...)` 不会触发糖。
+2. 每个参数必须是 `Name=Body`：
+   - 缺 name（位置参数）→ `Analyze` 错误 `RootSchemaDecoratorMissingName`。
+   - `Body` 必须是 dict 字面量 `{ ... }` 或 `Enum<...>` 类型表达式；
+     其它形态 → `RootSchemaInvalidValue`。
+   - 同一文件内重复声明同名 schema → `DuplicateRootSchemaName`。
+   - 同名 schema 同时以根装饰器形与字段形（`@schema X: ...`）声明 →
+     `RootSchemaCollidesWithField`（必须二选一）。
+   - 完全没参数（`@schema()`）→ `RootSchemaDecoratorEmpty`。
+3. 注册的 schema 同时对**根 dict 体内**与 `@input(...)` 引用可见，
+   解析路径与字段形 `@schema` 完全一致。
+4. 这是纯布局糖，不引入新语义；任何 conformant runtime 必须把它视作
+   `@private @schema Name: Body` 字段的等价处理，否则会偏离 §1.2 的
+   跨 runtime 一致性。
+
 ## 7. Host 可注册扩展的边界
 
 Host 可以通过 `register_fn` / `register_fn_with_caps` /

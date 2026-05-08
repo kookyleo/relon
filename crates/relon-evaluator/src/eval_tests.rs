@@ -2603,3 +2603,251 @@ fn underscore_prefix_no_longer_implies_private() {
         &Value::String("still here".to_string())
     );
 }
+
+#[test]
+fn root_schema_decorator_sugar_validates_input() {
+    // Happy path: `@schema(User=...)` declares a schema in the
+    // root-decorator stack; `@input(req=User)` references it the same
+    // way it would reference a dict-field `@schema User: ...`. The
+    // pushed input is validated against the inline schema.
+    use std::collections::BTreeMap;
+    let source = r#"@schema(User={ String name: *, Int age: * })
+@input(req=User)
+{
+    greeting: f"hello ${input.req.name}, age=${input.req.age}"
+}"#;
+    let node = parse_doc(source);
+    let analyzed = std::sync::Arc::new(relon_analyzer::analyze(&node));
+    assert_eq!(analyzed.root_schemas.len(), 1);
+    assert_eq!(analyzed.root_schemas[0].name, "User");
+    assert_eq!(analyzed.input_decls.len(), 1);
+
+    let mut req = BTreeMap::new();
+    req.insert("name".to_string(), Value::String("Alice".to_string()));
+    req.insert("age".to_string(), Value::Int(30));
+    let mut pushed = BTreeMap::new();
+    pushed.insert("req".to_string(), Value::dict(req));
+
+    let ctx = Context::new()
+        .with_root(node.clone())
+        .with_analyzed(std::sync::Arc::clone(&analyzed))
+        .with_input(Value::dict(pushed));
+    let result = Evaluator::new(std::sync::Arc::new(ctx))
+        .eval_root(&std::sync::Arc::new(Scope::default()))
+        .unwrap();
+    let Value::Dict(d) = result else { panic!() };
+    assert_eq!(
+        d.map.get("greeting").unwrap(),
+        &Value::String("hello Alice, age=30".to_string())
+    );
+}
+
+#[test]
+fn root_schema_decorator_supports_multiple_named_args() {
+    // `@schema(User=..., Cart=...)` registers two schemas at once;
+    // each `@input(slot=Name)` resolves through the same scope.
+    use std::collections::BTreeMap;
+    let source = r#"@schema(User={ String name: * })
+@schema(Cart={ Int total: * })
+@input(user=User)
+@input(cart=Cart)
+{
+    summary: f"${input.user.name} - ${input.cart.total}"
+}"#;
+    let node = parse_doc(source);
+    let analyzed = std::sync::Arc::new(relon_analyzer::analyze(&node));
+    assert_eq!(analyzed.root_schemas.len(), 2);
+    assert_eq!(analyzed.input_decls.len(), 2);
+
+    let mut user = BTreeMap::new();
+    user.insert("name".to_string(), Value::String("Alice".to_string()));
+    let mut cart = BTreeMap::new();
+    cart.insert("total".to_string(), Value::Int(100));
+    let mut pushed = BTreeMap::new();
+    pushed.insert("user".to_string(), Value::dict(user));
+    pushed.insert("cart".to_string(), Value::dict(cart));
+
+    let ctx = Context::new()
+        .with_root(node.clone())
+        .with_analyzed(std::sync::Arc::clone(&analyzed))
+        .with_input(Value::dict(pushed));
+    let result = Evaluator::new(std::sync::Arc::new(ctx))
+        .eval_root(&std::sync::Arc::new(Scope::default()))
+        .unwrap();
+    let Value::Dict(d) = result else { panic!() };
+    assert_eq!(
+        d.map.get("summary").unwrap(),
+        &Value::String("Alice - 100".to_string())
+    );
+}
+
+#[test]
+fn root_schema_decorator_visible_inside_dict_body() {
+    // Schemas declared via `@schema(Name=...)` at the root must also
+    // resolve from inside the dict body — `Name { ... }` should bind
+    // to the same `Value::Schema` the input pass uses.
+    let source = r#"@schema(User={ String name: *, Int age: * })
+{
+    User alice: { name: "Alice", age: 30 }
+}"#;
+    let node = parse_doc(source);
+    let analyzed = std::sync::Arc::new(relon_analyzer::analyze(&node));
+    let ctx = Context::new()
+        .with_root(node.clone())
+        .with_analyzed(std::sync::Arc::clone(&analyzed));
+    let result = Evaluator::new(std::sync::Arc::new(ctx))
+        .eval_root(&std::sync::Arc::new(Scope::default()))
+        .unwrap();
+    let Value::Dict(d) = result else { panic!() };
+    let Value::Dict(alice) = d.map.get("alice").unwrap() else {
+        panic!("expected dict");
+    };
+    assert_eq!(
+        alice.map.get("name").unwrap(),
+        &Value::String("Alice".to_string())
+    );
+    assert_eq!(alice.map.get("age").unwrap(), &Value::Int(30));
+}
+
+#[test]
+fn root_schema_decorator_mixes_with_field_form() {
+    // `@schema(User=...)` at root + `@schema Cart: {...}` as a field
+    // both compose into the same scope. `@input(...)` references each
+    // by name without caring which form declared it.
+    use std::collections::BTreeMap;
+    let source = r#"@schema(User={ String name: * })
+@input(user=User)
+@input(cart=Cart)
+{
+    @schema Cart: { Int total: * },
+    summary: f"${input.user.name} - ${input.cart.total}"
+}"#;
+    let node = parse_doc(source);
+    let analyzed = std::sync::Arc::new(relon_analyzer::analyze(&node));
+    assert_eq!(analyzed.root_schemas.len(), 1);
+    assert_eq!(analyzed.input_decls.len(), 2);
+    assert!(!analyzed.has_errors(), "{:?}", analyzed.diagnostics);
+
+    let mut user = BTreeMap::new();
+    user.insert("name".to_string(), Value::String("Alice".to_string()));
+    let mut cart = BTreeMap::new();
+    cart.insert("total".to_string(), Value::Int(100));
+    let mut pushed = BTreeMap::new();
+    pushed.insert("user".to_string(), Value::dict(user));
+    pushed.insert("cart".to_string(), Value::dict(cart));
+
+    let ctx = Context::new()
+        .with_root(node.clone())
+        .with_analyzed(std::sync::Arc::clone(&analyzed))
+        .with_input(Value::dict(pushed));
+    let result = Evaluator::new(std::sync::Arc::new(ctx))
+        .eval_root(&std::sync::Arc::new(Scope::default()))
+        .unwrap();
+    let Value::Dict(d) = result else { panic!() };
+    assert_eq!(
+        d.map.get("summary").unwrap(),
+        &Value::String("Alice - 100".to_string())
+    );
+}
+
+#[test]
+fn root_schema_positional_arg_is_an_analyzer_error() {
+    // `@schema({...})` (positional, no name) cannot be desugared into a
+    // named schema declaration. Analyzer rejects it.
+    let node = parse_doc(
+        r#"@schema({ String name: * })
+{ greeting: "hi" }"#,
+    );
+    let analyzed = relon_analyzer::analyze(&node);
+    assert!(analyzed.has_errors());
+    assert!(
+        analyzed.diagnostics.iter().any(|d| matches!(
+            d,
+            relon_analyzer::Diagnostic::RootSchemaDecoratorMissingName { .. }
+        )),
+        "expected RootSchemaDecoratorMissingName, got {:?}",
+        analyzed.diagnostics
+    );
+}
+
+#[test]
+fn empty_root_schema_decorator_is_an_analyzer_error() {
+    // `@schema()` with no args has no effect; flag as a typo trap.
+    let node = parse_doc(
+        r#"@schema()
+{ greeting: "hi" }"#,
+    );
+    let analyzed = relon_analyzer::analyze(&node);
+    assert!(analyzed.has_errors());
+    assert!(
+        analyzed.diagnostics.iter().any(|d| matches!(
+            d,
+            relon_analyzer::Diagnostic::RootSchemaDecoratorEmpty { .. }
+        )),
+        "expected RootSchemaDecoratorEmpty, got {:?}",
+        analyzed.diagnostics
+    );
+}
+
+#[test]
+fn duplicate_root_schema_name_is_an_analyzer_error() {
+    // Two `@schema(...)` decorations claiming the same schema name
+    // would shadow each other; reject up front.
+    let node = parse_doc(
+        r#"@schema(User={ String name: * })
+@schema(User={ Int age: * })
+{ greeting: "hi" }"#,
+    );
+    let analyzed = relon_analyzer::analyze(&node);
+    assert!(analyzed.has_errors());
+    assert!(
+        analyzed
+            .diagnostics
+            .iter()
+            .any(|d| matches!(d, relon_analyzer::Diagnostic::DuplicateRootSchemaName { name, .. } if name == "User")),
+        "expected DuplicateRootSchemaName(User), got {:?}",
+        analyzed.diagnostics
+    );
+}
+
+#[test]
+fn root_schema_collides_with_field_schema() {
+    // Same name declared in both forms is ambiguous about which body
+    // wins; analyzer reports it instead of silently picking one.
+    let node = parse_doc(
+        r#"@schema(User={ String name: * })
+{
+    @schema User: { Int age: * },
+    greeting: "hi"
+}"#,
+    );
+    let analyzed = relon_analyzer::analyze(&node);
+    assert!(analyzed.has_errors());
+    assert!(
+        analyzed
+            .diagnostics
+            .iter()
+            .any(|d| matches!(d, relon_analyzer::Diagnostic::RootSchemaCollidesWithField { name, .. } if name == "User")),
+        "expected RootSchemaCollidesWithField(User), got {:?}",
+        analyzed.diagnostics
+    );
+}
+
+#[test]
+fn root_schema_invalid_value_type_is_an_analyzer_error() {
+    // `@schema(Name=42)` — the RHS isn't a schema body. Static reject.
+    let node = parse_doc(
+        r#"@schema(Foo=42)
+{ greeting: "hi" }"#,
+    );
+    let analyzed = relon_analyzer::analyze(&node);
+    assert!(analyzed.has_errors());
+    assert!(
+        analyzed
+            .diagnostics
+            .iter()
+            .any(|d| matches!(d, relon_analyzer::Diagnostic::RootSchemaInvalidValue { name, .. } if name == "Foo")),
+        "expected RootSchemaInvalidValue(Foo), got {:?}",
+        analyzed.diagnostics
+    );
+}

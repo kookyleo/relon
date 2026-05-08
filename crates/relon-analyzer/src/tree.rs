@@ -7,6 +7,7 @@
 use crate::diagnostic::Diagnostic;
 use crate::inputs::InputDecl;
 use crate::resolve::ResolvedRef;
+use crate::root_schemas::RootSchemaDecl;
 use crate::schema::SchemaDef;
 use relon_parser::{Node, NodeId};
 use std::collections::HashMap;
@@ -44,6 +45,16 @@ pub struct AnalyzedTree {
     /// Multiple decorators with the same `name` produce
     /// `Diagnostic::DuplicateInputName`.
     pub input_decls: Vec<InputDecl>,
+    /// `@schema(Name={...})` declarations on the root node, in source
+    /// order. Each entry is layout sugar for declaring `Name` as a
+    /// `@private @schema` field of the root dict — once seeded into the
+    /// root scope, `@input(slot=Name)` and dict-body `Name { ... }`
+    /// references resolve identically to the field-form path. Multiple
+    /// decorations naming the same schema produce
+    /// `Diagnostic::DuplicateRootSchemaName`; same name as a dict-field
+    /// `@schema X: ...` produces
+    /// `Diagnostic::RootSchemaCollidesWithField`.
+    pub root_schemas: Vec<RootSchemaDecl>,
     /// Errors and warnings from every pass, in source order.
     pub diagnostics: Vec<Diagnostic>,
 }

@@ -79,9 +79,21 @@ impl DecoratorPlugin for SchemaDecorator {
         eval: &Evaluator,
         node: &Node,
         scope: &Arc<Scope>,
-        _args: &[CallArg],
+        args: &[CallArg],
         _range: TokenRange,
     ) -> Result<PreEvalOutcome, RuntimeError> {
+        // Root-decorator form `@schema(Name={...})` is layout sugar for
+        // co-locating schema declarations with `@input(...)`. The
+        // analyzer's `collect_root_schemas` pass collects each named arg
+        // into `tree.root_schemas`, and `Evaluator::seed_root_schemas`
+        // registers them into the outer scope before the body walk.
+        // Here on the decorator runtime side we are a no-op: the
+        // decorated node (the root dict) is *not* a schema body — it's
+        // ordinary data. Falling through to the schema-lowering path
+        // would try to interpret the whole document as a schema.
+        if !args.is_empty() {
+            return Ok(PreEvalOutcome::Pass);
+        }
         // Fast path: an attached `AnalyzedTree` already split this
         // body into typed fields. Build the runtime `Value::Schema`
         // directly from the pre-computed `SchemaDef`, doing only the

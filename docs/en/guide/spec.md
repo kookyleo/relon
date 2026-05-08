@@ -304,6 +304,64 @@ rather than the host: every conformant runtime sees the same script
 and validates pushed data the same way — the missing piece §1.2
 needed to make cross-runtime determinism actually hold.
 
+#### 6.4.1 `@schema(Name={...})` — root-decorator schema sugar
+
+Co-locate schema declarations with `@input(...)` in the root-decorator
+stack instead of stuffing them inside the root dict body. Pure
+**layout sugar** — semantically equivalent to declaring `Name` as a
+`@private @schema Name: { ... }` field of the root dict.
+
+```relon
+// Old: schema lives inside the dict body, referenced by @input from outside
+@input(req=Req)
+{
+    @schema Req: { String name: *, Int retries: * },
+    greeting: f"hello ${input.req.name}"
+}
+
+// New: schema and @input sit side-by-side in the same decorator stack
+@schema(Req={ String name: *, Int retries: * })
+@input(req=Req)
+{
+    greeting: f"hello ${input.req.name}"
+}
+```
+
+Multiple schemas at once:
+
+```relon
+@schema(User={ String name: * })
+@schema(Cart={ Int total: * })
+@input(user=User)
+@input(cart=Cart)
+{
+    summary: f"${input.user.name} - ${input.cart.total}"
+}
+```
+
+**Rules:**
+
+1. `@schema(...)` only carries this sugar at the **root-decorator**
+   level; the same form on a nested dict has no special meaning.
+2. Each arg must be `Name=Body`:
+   - Missing `Name` (positional arg) → `Analyze` error
+     `RootSchemaDecoratorMissingName`.
+   - `Body` must be a dict literal `{ ... }` or an `Enum<...>` type
+     expression; anything else → `RootSchemaInvalidValue`.
+   - Same schema name declared twice in this stack →
+     `DuplicateRootSchemaName`.
+   - Same name declared *both* at the root-decorator level and as a
+     dict-field `@schema X: ...` → `RootSchemaCollidesWithField`
+     (pick one form).
+   - Bare `@schema()` (no args) → `RootSchemaDecoratorEmpty`.
+3. The registered schema is visible **both** from the root dict body
+   and from `@input(...)` SchemaRefs; resolution path is identical to
+   the field-form `@schema`.
+4. This is pure layout sugar — no new semantics. Every conformant
+   runtime MUST treat it as equivalent to a `@private @schema Name:
+   Body` field, otherwise it diverges from §1.2 cross-runtime
+   determinism.
+
 ## 7. Host-Registered Extensions
 
 Hosts MAY inject through `register_fn` / `register_fn_with_caps` /

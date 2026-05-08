@@ -20,6 +20,7 @@ pub mod diagnostic;
 pub mod inputs;
 pub mod modules;
 pub mod resolve;
+pub mod root_schemas;
 pub mod schema;
 pub mod tree;
 pub mod typecheck;
@@ -29,6 +30,7 @@ pub use diagnostic::{Diagnostic, Severity};
 pub use inputs::InputDecl;
 pub use modules::ModuleImport;
 pub use resolve::ResolvedRef;
+pub use root_schemas::RootSchemaDecl;
 pub use schema::{
     lower_schema_pure, BaseRef, EnumVariant, MetaDecoratorRef, SchemaDef, SchemaFieldDef,
 };
@@ -45,6 +47,11 @@ use relon_parser::Node;
 pub fn analyze(root: &Node) -> AnalyzedTree {
     let mut tree = AnalyzedTree::new();
     schema::collect_schemas(root, &mut tree);
+    // Root-level `@schema(Name=...)` sugar: must run after
+    // `collect_schemas` (so the dual-declaration collision check has the
+    // field-form table to consult) and before `collect_inputs` (so the
+    // input pass sees a populated `root_schemas` table).
+    root_schemas::collect_root_schemas(root, &mut tree);
     inputs::collect_inputs(root, &mut tree);
     resolve::resolve_references(root, &mut tree);
     modules::collect_imports(root, &mut tree);

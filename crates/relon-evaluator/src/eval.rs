@@ -438,6 +438,22 @@ impl Evaluator {
             .as_ref()
             .map(|tree| tree.input_decls.clone())
             .unwrap_or_default();
+        let root_schemas: Vec<relon_analyzer::RootSchemaDecl> = self
+            .context
+            .analyzed
+            .as_ref()
+            .map(|tree| tree.root_schemas.clone())
+            .unwrap_or_default();
+
+        // Seed root-decorator schemas into the outer scope so the dict
+        // body — and the input-validation step below — see them through
+        // the normal parent-chain lookup. This is the runtime side of
+        // the `@schema(Name=...)` layout sugar; the analyzer side-table
+        // already validated the shape, so failures here are
+        // schema-construction errors rather than syntax errors.
+        if !root_schemas.is_empty() {
+            self.seed_root_schemas(&root_schemas, scope)?;
+        }
 
         if decls.is_empty() {
             // No `@input(...)` declarations: pass the pushed value
@@ -549,6 +565,108 @@ impl Evaluator {
         }
 
         Ok(Some(Value::Dict(Arc::new(working))))
+    }
+
+    /// Seed every `@schema(Name=...)` root-decorator declaration into
+    /// `scope.locals` as a `Value::Schema`. Mirrors the dict-field
+    /// `@schema X: {...}` path's runtime behavior so a `Name { ... }`
+    /// reference inside the dict body — or in an `@input(slot=Name)`
+    /// SchemaRef — resolves identically through the scope chain.
+    ///
+    /// The body node carried by each `RootSchemaDecl` is a plain dict
+    /// literal (or `Enum<...>` type) with no `@schema` decorator of its
+    /// own; we lower it on demand using the same pure-fn the analyzer
+    /// uses (`relon_analyzer::lower_schema_pure`) and then build the
+    /// runtime `Value::Schema` via `build_schema_from_def`. This keeps
+    /// the field-form and decorator-form on a single lowering path.
+    fn seed_root_schemas(
+        &self,
+        decls: &[relon_analyzer::RootSchemaDecl],
+        scope: &Arc<Scope>,
+    ) -> Result<(), RuntimeError> {
+        for decl in decls {
+            // Pre-bind the name to an empty placeholder so a recursive
+            // schema body (`@schema(Tree={ children: List<Tree> })`)
+            // can resolve the in-flight name during predicate building.
+            // Same trick `prepare_dict_scope` uses for the field-form.
+            scope.locals.lock().unwrap().insert(
+                decl.name.clone(),
+                Value::Schema {
+                    generics: Vec::new(),
+                    fields: HashMap::new(),
+                },
+            );
+            let (lowered, _diags) = relon_analyzer::lower_schema_pure(
+                Some(decl.name.clone()),
+                Vec::new(),
+                decl.schema_node.as_ref(),
+            );
+            let Some(def) = lowered else {
+                // Analyzer pass already emitted the structural error;
+                // bail with a runtime mirror so the host gets a
+                // consistent shape.
+                return Err(RuntimeError::TypeMismatch {
+                    expected: "schema body (Dict or Enum<...>)".to_string(),
+                    found: decl.schema_node.expr.kind().to_string(),
+                    range: decl.decorator_range,
+                });
+            };
+            let value = if !def.variants.is_empty() {
+                self.build_root_enum_schema(&def)
+            } else {
+                let fields = self.build_schema_from_def(&def, scope)?;
+                Value::Schema {
+                    generics: def.generics.clone(),
+                    fields,
+                }
+            };
+            scope
+                .locals
+                .lock()
+                .unwrap()
+                .insert(decl.name.clone(), value);
+        }
+        Ok(())
+    }
+
+    /// Build a `Value::EnumSchema` from a sum-type `SchemaDef`. Mirrors
+    /// the body of `builtin_decorators::build_enum_schema` but kept
+    /// crate-local so we don't pull a private helper across module
+    /// boundaries; the variant-shape conversion is small enough that
+    /// duplicating it here keeps the dependency direction one-way.
+    fn build_root_enum_schema(&self, def: &relon_analyzer::SchemaDef) -> Value {
+        use crate::value::SchemaField;
+        let mut variants: HashMap<String, HashMap<String, SchemaField>> = HashMap::new();
+        for variant in &def.variants {
+            let mut fields: HashMap<String, SchemaField> = HashMap::new();
+            for f in &variant.fields {
+                let type_node = f
+                    .type_hint
+                    .clone()
+                    .unwrap_or_else(|| relon_parser::TypeNode {
+                        path: vec!["Any".into()],
+                        generics: Vec::new(),
+                        is_optional: false,
+                        range: f.value_range,
+                        variant_fields: None,
+                        doc_comment: None,
+                    });
+                fields.insert(
+                    f.name.clone(),
+                    SchemaField {
+                        type_hint: type_node,
+                        predicates: vec![Value::Wildcard],
+                        custom_error: None,
+                        default_value: None,
+                    },
+                );
+            }
+            variants.insert(variant.name.clone(), fields);
+        }
+        Value::EnumSchema {
+            name: def.name.clone().unwrap_or_default(),
+            variants,
+        }
     }
 
     pub(crate) fn eval_internal(
