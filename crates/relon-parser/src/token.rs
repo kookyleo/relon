@@ -106,6 +106,88 @@ pub struct Decorator {
     pub range: TokenRange,
 }
 
+/// One of the five fixed shapes a `#name` directive can take. The shape
+/// is determined by the directive's name (looked up at parse time) and
+/// drives parser dispatch + analyzer / evaluator interpretation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirectiveShape {
+    /// `#name` — no body. Example: `#private`.
+    Bare,
+    /// `#name <expr>` — single value. Example: `#default 0`,
+    /// `#expect "msg"`, `#brand Color`.
+    Value,
+    /// `#name <ident> : <expr> [, ...]*` — one or more named bindings.
+    /// Example: `#schema User : { ... }`.
+    Binding,
+    /// `#import <bindspec> from <string>`. Example:
+    /// `#import string from "std/string"`,
+    /// `#import * from "std/list"`,
+    /// `#import { upper, lower as lo } from "std/string"`.
+    Import,
+    /// `#main(<ident> : <type> [, ...]*)`. Example:
+    /// `#main(u: User, cart: Cart)`.
+    Main,
+}
+
+/// The body of a parsed `#name ...` directive, dispatched per
+/// [`DirectiveShape`].
+#[derive(Debug, PartialEq, Clone)]
+pub enum DirectiveBody {
+    Bare,
+    Value(Box<Node>),
+    Bindings(Vec<DirectiveBinding>),
+    Import {
+        spec: DirectiveImportSpec,
+        path: String,
+        path_range: TokenRange,
+    },
+    Main {
+        params: Vec<DirectiveMainParam>,
+    },
+}
+
+/// One `<ident> : <expr>` entry inside a binding-shape directive (e.g.
+/// each comma-separated `Name : Body` of `#schema`).
+#[derive(Debug, PartialEq, Clone)]
+pub struct DirectiveBinding {
+    pub name: String,
+    pub name_range: TokenRange,
+    pub value: Box<Node>,
+}
+
+/// Bindspec for `#import <spec> from "path"`.
+#[derive(Debug, PartialEq, Clone)]
+pub enum DirectiveImportSpec {
+    /// `#import name from "path"` — bind module under `name`.
+    Alias(String),
+    /// `#import * from "path"` — spread module's exported bindings.
+    Spread,
+    /// `#import { a, b as c } from "path"` — bind each entry; `Some(_)`
+    /// is the rebinding alias.
+    Destructure(Vec<(String, Option<String>)>),
+}
+
+/// One `<ident> : <type>` parameter of a `#main(...)` signature.
+#[derive(Debug, PartialEq, Clone)]
+pub struct DirectiveMainParam {
+    pub name: String,
+    pub name_range: TokenRange,
+    pub type_node: TypeNode,
+}
+
+/// Parsed `#name ...` directive — a structural / declarative attribute
+/// stacked above a node. Parallel to [`Decorator`] but with one of five
+/// fixed [`DirectiveShape`]s rather than free-form `args`.
+#[derive(Debug, PartialEq, Clone)]
+pub struct Directive {
+    /// Single-segment directive name (e.g. `"main"`, `"schema"`).
+    pub name: String,
+    /// Parsed body matching the shape registered for `name`.
+    pub body: DirectiveBody,
+    /// Source range of the entire `#name ...` form.
+    pub range: TokenRange,
+}
+
 #[derive(Debug, PartialEq, Clone)]
 pub struct TypeNode {
     pub path: Vec<String>,
@@ -135,7 +217,13 @@ pub struct Node {
     /// off this; not part of structural equality.
     pub id: NodeId,
     pub expr: Box<Expr>,
+    /// `@name(...)` decorators stacked above this node — value-transform
+    /// hooks (host-registered + user-definable).
     pub decorators: Vec<Decorator>,
+    /// `#name ...` directives stacked above this node — structural /
+    /// declarative attributes (host-registered only). Parsed in source
+    /// order; the analyzer interprets them by name + shape.
+    pub directives: Vec<Directive>,
     pub type_hint: Option<TypeNode>,
     pub range: TokenRange,
     /// Documentation extracted from leading comments immediately preceding
@@ -151,6 +239,7 @@ impl PartialEq for Node {
     fn eq(&self, other: &Self) -> bool {
         self.expr == other.expr
             && self.decorators == other.decorators
+            && self.directives == other.directives
             && self.type_hint == other.type_hint
             && self.range == other.range
             && self.doc_comment == other.doc_comment
@@ -163,6 +252,7 @@ impl Node {
             id: NodeId::alloc(),
             expr: Box::new(expr),
             decorators: Vec::new(),
+            directives: Vec::new(),
             type_hint: None,
             range,
             doc_comment: None,
@@ -177,6 +267,7 @@ impl Node {
             id,
             expr: Box::new(expr),
             decorators: Vec::new(),
+            directives: Vec::new(),
             type_hint: None,
             range,
             doc_comment: None,
@@ -185,6 +276,11 @@ impl Node {
 
     pub fn with_decorators(mut self, decorators: Vec<Decorator>) -> Self {
         self.decorators = decorators;
+        self
+    }
+
+    pub fn with_directives(mut self, directives: Vec<Directive>) -> Self {
+        self.directives = directives;
         self
     }
 

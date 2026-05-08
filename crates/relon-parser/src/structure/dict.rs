@@ -1,5 +1,5 @@
 use crate::{
-    create_range, decorator::parse_decorators, expr::parse_expr, parse_leading_comments,
+    create_range, expr::parse_expr, parse_attributes, parse_leading_comments,
     prim::string::parse_string, soc0, ws0, Expr, Node, Span, TokenKey,
 };
 use winnow::combinator::{alt, delimited, opt, separated};
@@ -42,7 +42,7 @@ pub(crate) fn parse_pair<'a>(input: &mut Span<'a>) -> ModalResult<(TokenKey, Nod
     input.reset(&checkpoint);
 
     let doc_comment = parse_leading_comments(input)?;
-    let decs_before_key = parse_decorators.parse_next(input)?;
+    let (decs_before_key, dirs_before_key) = parse_attributes(input)?;
     soc0.parse_next(input)?;
 
     // Try parsing type hint (optional)
@@ -117,7 +117,7 @@ pub(crate) fn parse_pair<'a>(input: &mut Span<'a>) -> ModalResult<(TokenKey, Nod
 
     (soc0, ":", soc0).parse_next(input)?;
 
-    let decs_after_colon = parse_decorators.parse_next(input)?;
+    let (decs_after_colon, dirs_after_colon) = parse_attributes(input)?;
     soc0.parse_next(input)?;
 
     let value_start = input.location();
@@ -141,8 +141,11 @@ pub(crate) fn parse_pair<'a>(input: &mut Span<'a>) -> ModalResult<(TokenKey, Nod
 
     let mut all_decs = decs_before_key;
     all_decs.extend(decs_after_colon);
+    let mut all_dirs = dirs_before_key;
+    all_dirs.extend(dirs_after_colon);
     value = value
         .with_decorators(all_decs)
+        .with_directives(all_dirs)
         .with_doc_comment(doc_comment);
 
     Ok((key, value))

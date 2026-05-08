@@ -684,9 +684,9 @@ pub fn parse_expr_zone<'a>(input: &mut Span<'a>) -> ModalResult<Node> {
 }
 
 /// Yield the expression-shaped child nodes of `node` for AST walkers
-/// (analyzer passes, LSP enclosing-scope lookups, ...). Decorators and
-/// type hints are intentionally *not* included — those have their own
-/// dedicated walkers that need different semantics.
+/// (analyzer passes, LSP enclosing-scope lookups, ...). Decorators,
+/// directives, and type hints are intentionally *not* included — those
+/// have their own dedicated walkers that need different semantics.
 pub fn child_nodes(node: &Node) -> Vec<&Node> {
     let mut out = Vec::new();
     match &*node.expr {

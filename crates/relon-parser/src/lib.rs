@@ -1,4 +1,5 @@
 pub mod decorator;
+pub mod directive;
 pub mod expr;
 pub mod fmt_string;
 pub mod fn_call;
@@ -193,14 +194,18 @@ pub fn parse_prim<'a>(input: &mut Span<'a>) -> ModalResult<Node> {
     alt((parse_null, parse_bool, parse_number, parse_string)).parse_next(input)
 }
 
-/// Parse the root base which consists of optional decorators and a root List or Dict.
+/// Parse the root base which consists of optional decorators / directives
+/// and a root List or Dict. `@decorator` and `#directive` lines may
+/// interleave above the body in any order; both lists are kept in source
+/// order on the produced [`Node`].
 pub fn parse_base<'a>(input: &mut Span<'a>) -> ModalResult<Node> {
     let doc_comment = parse_leading_comments(input)?;
-    let decorators = decorator::parse_decorators(input)?;
+    let (decorators, directives) = parse_attributes(input)?;
     soc0(input)?;
     let start_offset = decorators
         .first()
-        .map(|decorator| decorator.range.start.offset)
+        .map(|d| d.range.start.offset)
+        .or_else(|| directives.first().map(|d| d.range.start.offset))
         .unwrap_or_else(|| input.location());
 
     let root = alt((structure::dict::parse_dict, structure::list::parse_list)).parse_next(input)?;
@@ -212,10 +217,50 @@ pub fn parse_base<'a>(input: &mut Span<'a>) -> ModalResult<Node> {
         id: NodeId::alloc(),
         expr: root.expr,
         decorators,
+        directives,
         type_hint: None,
         range,
         doc_comment,
     })
+}
+
+/// Parse zero or more interleaved `@decorator` / `#directive` lines and
+/// return them split into the two ordered lists. Used wherever a stack
+/// of attributes can precede a node (root, dict field, etc.).
+pub fn parse_attributes<'a>(input: &mut Span<'a>) -> ModalResult<(Vec<Decorator>, Vec<Directive>)> {
+    let mut decorators = Vec::new();
+    let mut directives = Vec::new();
+    loop {
+        soc0(input)?;
+        let checkpoint = input.checkpoint();
+        let peek = input.as_ref().chars().next();
+        match peek {
+            Some('@') => {
+                let dec = match decorator::parse_decorators(input) {
+                    Ok(mut v) if !v.is_empty() => v.remove(0),
+                    Ok(_) => {
+                        input.reset(&checkpoint);
+                        break;
+                    }
+                    Err(e) => return Err(e),
+                };
+                decorators.push(dec);
+            }
+            Some('#') => {
+                let dir = match directive::parse_directives(input) {
+                    Ok(mut v) if !v.is_empty() => v.remove(0),
+                    Ok(_) => {
+                        input.reset(&checkpoint);
+                        break;
+                    }
+                    Err(e) => return Err(e),
+                };
+                directives.push(dir);
+            }
+            _ => break,
+        }
+    }
+    Ok((decorators, directives))
 }
 
 #[cfg(test)]
