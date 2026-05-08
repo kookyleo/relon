@@ -28,4 +28,6 @@ pub use value::{SchemaField, Value, ValueDict};
 #[cfg(test)]
 mod eval_tests;
 #[cfg(test)]
+mod host_boundary_tests;
+#[cfg(test)]
 mod sandbox_tests;
