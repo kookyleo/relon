@@ -67,7 +67,7 @@ pub struct Scope {
     /// Bindings introduced inside this frame (closure params, comprehension
     /// loop vars, `where` clauses, imported aliases).
     pub locals: Mutex<HashMap<String, Value>>,
-    /// Working directory used when resolving relative `@import` paths.
+    /// Working directory used when resolving relative `#import` paths.
     pub current_dir: String,
     /// Stable namespace for the path cache; usually the canonical id of the
     /// surrounding module so different modules can't collide on identical

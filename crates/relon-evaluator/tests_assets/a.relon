@@ -1,2 +1,2 @@
-@import("b.relon")
+#import b from "b.relon"
 {}

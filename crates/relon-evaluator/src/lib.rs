@@ -7,7 +7,6 @@ pub mod eval;
 pub mod module;
 pub mod native_fn;
 pub mod reference;
-pub mod reserved;
 pub mod schema;
 pub mod scope;
 pub mod stdlib;
@@ -19,7 +18,7 @@ pub use eval::{Capabilities, Context, Evaluator, NativeFnGate};
 pub use module::{FilesystemModuleResolver, ModuleResolver, ModuleSource, StdModuleResolver};
 pub use native_fn::NativeFnCaps;
 pub use native_fn::{EvaluatedArg, NativeArgs, RelonFunction};
-pub use relon_analyzer::InputDecl;
+pub use relon_analyzer::{MainParam, MainSignature};
 pub use scope::{ListContext, Scope, Thunk};
 pub use value::{SchemaField, Value, ValueDict};
 

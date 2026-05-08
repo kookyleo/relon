@@ -5,7 +5,7 @@
 //! 1. **Sibling field names** — when the cursor sits inside a dict
 //!    body, suggest the names of its already-declared keys (useful
 //!    for typing references like `&sibling.X`).
-//! 2. **Schema names** — every `@schema` declaration in the document
+//! 2. **Schema names** — every `#schema` declaration in the document
 //!    contributes a suggestion. Helpful when typing a typed field
 //!    binding such as `User alice: { ... }`.
 //!
@@ -137,7 +137,7 @@ mod tests {
     #[test]
     fn suggests_sibling_fields_and_schema_names() {
         let src = r#"{
-                @schema User: { String name: * },
+                #schema User { String name: * },
                 a: 1,
                 b: 2
             }"#;
@@ -163,7 +163,7 @@ mod tests {
         // Cursor before any dict (line 0, character 0). The root dict
         // still encloses it, but the test mostly confirms we don't
         // panic and the schema names always make it through.
-        let src = r#"{ @schema A: { String x: * } }"#;
+        let src = r#"{ #schema A { String x: * } }"#;
         let entry = entry(src);
         let items = items_for(
             &entry,

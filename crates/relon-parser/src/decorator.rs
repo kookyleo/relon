@@ -9,6 +9,13 @@ pub fn parse_decorators<'a>(input: &mut Span<'a>) -> ModalResult<Vec<Decorator>>
     repeat(0.., preceded(soc0, decorator)).parse_next(input)
 }
 
+/// Parse a single `@name(...)` decorator. Used by `parse_attributes`
+/// when it needs to consume one decorator at a time (to interleave with
+/// `#` directives).
+pub fn parse_decorator<'a>(input: &mut Span<'a>) -> ModalResult<Decorator> {
+    decorator(input)
+}
+
 fn decorator<'a>(input: &mut Span<'a>) -> ModalResult<Decorator> {
     let start_offset = input.location();
     let (path, args) = preceded(

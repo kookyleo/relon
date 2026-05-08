@@ -4,12 +4,13 @@
 //! tree-walk). Responsibilities that this crate gradually absorbs from the
 //! evaluator:
 //!
-//! * Schema desugar — `@schema` annotated dicts lowered to a `SchemaDef` IR.
+//! * Schema desugar — `#schema Name Body` directives lowered to a
+//!   `SchemaDef` IR.
 //! * Diagnostic aggregation — collect every structural issue in one pass
 //!   instead of fail-fast.
 //! * (Future) Name resolution — bind `Reference { base, path }` to a
 //!   stable target id.
-//! * (Future) Module graph — pre-resolve `@import` paths.
+//! * (Future) Module graph — pre-resolve `#import` paths.
 //!
 //! The output is an [`AnalyzedTree`] keyed by [`relon_parser::NodeId`], so
 //! the AST itself stays immutable and consumers (evaluator, LSP, lint)
@@ -17,7 +18,8 @@
 
 pub(crate) mod decorator_names;
 pub mod diagnostic;
-pub mod inputs;
+pub(crate) mod directive_names;
+pub mod main_sig;
 pub mod modules;
 pub mod resolve;
 pub mod root_schemas;
@@ -27,7 +29,7 @@ pub mod typecheck;
 pub mod workspace;
 
 pub use diagnostic::{Diagnostic, Severity};
-pub use inputs::InputDecl;
+pub use main_sig::{MainParam, MainSignature};
 pub use modules::ModuleImport;
 pub use resolve::ResolvedRef;
 pub use root_schemas::RootSchemaDecl;
@@ -47,12 +49,11 @@ use relon_parser::Node;
 pub fn analyze(root: &Node) -> AnalyzedTree {
     let mut tree = AnalyzedTree::new();
     schema::collect_schemas(root, &mut tree);
-    // Root-level `@schema(Name=...)` sugar: must run after
-    // `collect_schemas` (so the dual-declaration collision check has the
-    // field-form table to consult) and before `collect_inputs` (so the
-    // input pass sees a populated `root_schemas` table).
+    // Root-level `#schema A Body` directives must run after
+    // `collect_schemas` so the dual-declaration collision check has the
+    // field-form table to consult.
     root_schemas::collect_root_schemas(root, &mut tree);
-    inputs::collect_inputs(root, &mut tree);
+    main_sig::collect_main(root, &mut tree);
     resolve::resolve_references(root, &mut tree);
     modules::collect_imports(root, &mut tree);
     typecheck::typecheck(root, &mut tree);

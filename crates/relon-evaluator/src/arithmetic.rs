@@ -47,7 +47,7 @@ impl Evaluator {
         // (it has hybrid "field def vs default value" dispatch). Nested
         // `Schema + ... + Dict` shapes are lowered through the analyzer's
         // `lower_schema_pure` so the same desugar logic that powers
-        // `@schema X: Base + { ... }` applies here too.
+        // `#schema X: Base + { ... }` applies here too.
         if matches!(op, Operator::Add)
             && matches!(&l, Value::Schema { .. })
             && matches!(

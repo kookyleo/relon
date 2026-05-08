@@ -45,22 +45,6 @@ impl Evaluator {
             val
         } else if let Some(thunk) = scope.get_thunk(&first_name) {
             self.force_thunk(&thunk)?
-        } else if first_name == crate::reserved::INPUT {
-            // Reserved root-level name: `eval_root` is responsible for
-            // validating `Context::input` and seeding it into the root
-            // scope's locals before walking the document. Reaching this
-            // branch means either (a) the host didn't push anything via
-            // `Context::with_input`, or (b) the script entered a scope
-            // that lost the seeding (only possible if a host bypasses
-            // `eval_root` and calls `eval` directly). Either way it's a
-            // hard error rather than a silent `null` so missing-input
-            // bugs surface immediately.
-            return Err(RuntimeError::VariableNotFound(
-                "input (no input value provided to Context — call \
-                 `Context::with_input(...)` before evaluating)"
-                    .to_string(),
-                range,
-            ));
         } else {
             return Err(RuntimeError::VariableNotFound(first_name, range));
         };
@@ -337,6 +321,19 @@ impl Evaluator {
                         self.lookup_value_path(*value, remaining_path, display_path, range)
                     }
                     None => {
+                        // Not a dict-field — fall back to scope locals
+                        // so standalone `#schema X Body` directives
+                        // (whose names live in `scope.locals` rather
+                        // than as dict pairs) are still reachable
+                        // through `&root`/`&sibling.X`.
+                        if let Some(local_val) = scope.get_local(&key) {
+                            return self.lookup_value_path(
+                                local_val,
+                                remaining_path,
+                                display_path,
+                                range,
+                            );
+                        }
                         if is_optional {
                             Ok(Value::Null)
                         } else {

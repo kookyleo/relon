@@ -23,8 +23,8 @@ use crate::id::id;
 use crate::prim::string::parse_string;
 use crate::var::parse_path;
 use crate::{
-    create_range, soc0, Directive, DirectiveBinding, DirectiveImportSpec, DirectiveMainParam,
-    DirectiveShape, Expr, Span, TokenKey,
+    create_range, soc0, Directive, DirectiveImportSpec, DirectiveMainParam, DirectiveShape, Expr,
+    Span, TokenKey,
 };
 use winnow::combinator::{opt, preceded, repeat, separated};
 use winnow::prelude::*;
@@ -39,7 +39,7 @@ pub const DIRECTIVE_SHAPES: &[(&str, DirectiveShape)] = &[
     ("msg", DirectiveShape::Value),
     ("error", DirectiveShape::Value),
     ("brand", DirectiveShape::Value),
-    ("schema", DirectiveShape::Binding),
+    ("schema", DirectiveShape::NameBody),
     ("import", DirectiveShape::Import),
     ("main", DirectiveShape::Main),
 ];
@@ -57,6 +57,12 @@ pub fn parse_directives<'a>(input: &mut Span<'a>) -> ModalResult<Vec<Directive>>
     repeat(0.., preceded(soc0, directive)).parse_next(input)
 }
 
+/// Parse a single `#name ...` directive. Used by callers that want to
+/// interleave `@`-decorators and `#`-directives explicitly.
+pub fn parse_directive<'a>(input: &mut Span<'a>) -> ModalResult<Directive> {
+    directive(input)
+}
+
 fn directive<'a>(input: &mut Span<'a>) -> ModalResult<Directive> {
     let start_offset = input.location();
     let _ = '#'.parse_next(input)?;
@@ -71,7 +77,7 @@ fn directive<'a>(input: &mut Span<'a>) -> ModalResult<Directive> {
     let body = match shape {
         DirectiveShape::Bare => parse_bare_body(input)?,
         DirectiveShape::Value => parse_value_body(input)?,
-        DirectiveShape::Binding => parse_binding_body(input)?,
+        DirectiveShape::NameBody => parse_name_body(input)?,
         DirectiveShape::Import => parse_import_body(input)?,
         DirectiveShape::Main => parse_main_body(input)?,
     };
@@ -94,24 +100,47 @@ fn parse_value_body<'a>(input: &mut Span<'a>) -> ModalResult<crate::DirectiveBod
     Ok(crate::DirectiveBody::Value(Box::new(value)))
 }
 
-fn parse_binding_body<'a>(input: &mut Span<'a>) -> ModalResult<crate::DirectiveBody> {
-    soc0.parse_next(input)?;
-    let bindings: Vec<DirectiveBinding> =
-        separated(1.., parse_binding, (soc0, ',', soc0)).parse_next(input)?;
-    Ok(crate::DirectiveBody::Bindings(bindings))
-}
-
-fn parse_binding<'a>(input: &mut Span<'a>) -> ModalResult<DirectiveBinding> {
-    soc0.parse_next(input)?;
-    let start_offset = input.location();
-    let name_token = id.parse_next(input)?;
-    let name_range = create_range(input, start_offset, input.location());
-    let _ = (soc0, ':', soc0).parse_next(input)?;
-    let value = parse_expr.parse_next(input)?;
-    Ok(DirectiveBinding {
+/// Parse a name-body directive body: `<ident> <body-expr>` (no colon).
+///
+/// Special-case: when the would-be ident is followed by `:` (after
+/// optional whitespace) the directive is interpreted as **bare** —
+/// the `<ident> :` is left for the surrounding dict-field grammar.
+/// This is what enables `#schema User: { ... }` inside a dict to
+/// decorate the `User: { ... }` field, while a standalone
+/// `#schema User { ... }` (no colon) parses as a name-body declaration.
+fn parse_name_body<'a>(input: &mut Span<'a>) -> ModalResult<crate::DirectiveBody> {
+    let pre_body_checkpoint = input.checkpoint();
+    let _ = soc0.parse_next(input)?;
+    let after_ws = input.checkpoint();
+    let name_start = input.location();
+    let Ok(name_token) = id.parse_next(input) else {
+        // No identifier — treat as bare directive and rewind.
+        input.reset(&pre_body_checkpoint);
+        return Ok(crate::DirectiveBody::Bare);
+    };
+    let name_end = input.location();
+    let name_range = create_range(input, name_start, name_end);
+    let _ = soc0.parse_next(input)?;
+    let peek = input.as_ref().chars().next();
+    if peek == Some(':') {
+        // Surrounding context is `<ident>: <value>` — leave it for
+        // the dict-field parser. Bare-directive form.
+        input.reset(&after_ws);
+        return Ok(crate::DirectiveBody::Bare);
+    }
+    let body = match parse_expr.parse_next(input) {
+        Ok(b) => b,
+        Err(_) => {
+            // No body — bare directive, rewind so the surrounding
+            // grammar sees the ident again (e.g. as a key).
+            input.reset(&after_ws);
+            return Ok(crate::DirectiveBody::Bare);
+        }
+    };
+    Ok(crate::DirectiveBody::NameBody {
         name: name_token.0,
         name_range,
-        value: Box::new(value),
+        body: Box::new(body),
     })
 }
 
@@ -171,10 +200,7 @@ fn parse_destruct_entry<'a>(input: &mut Span<'a>) -> ModalResult<(String, Option
     soc0.parse_next(input)?;
     let name = id.parse_next(input)?.0;
     let alias_checkpoint = input.checkpoint();
-    let alias = if (soc0, "as", soc0)
-        .parse_next(input)
-        .is_ok()
-    {
+    let alias = if (soc0, "as", soc0).parse_next(input).is_ok() {
         match id.parse_next(input) {
             Ok(t) => Some(t.0),
             Err(e) => {
@@ -234,17 +260,28 @@ mod tests {
     }
 
     #[test]
-    fn parses_binding_directive_single() {
-        let mut s = Span::new("#schema User : { String name: * }");
+    fn parses_name_body_directive() {
+        let mut s = Span::new("#schema User { String name: * }");
         let dirs = parse_directives(&mut s).unwrap();
         assert_eq!(dirs.len(), 1);
         match &dirs[0].body {
-            crate::DirectiveBody::Bindings(b) => {
-                assert_eq!(b.len(), 1);
-                assert_eq!(b[0].name, "User");
+            crate::DirectiveBody::NameBody { name, .. } => {
+                assert_eq!(name, "User");
             }
-            _ => panic!("expected Bindings"),
+            _ => panic!("expected NameBody"),
         }
+    }
+
+    #[test]
+    fn schema_bare_form_for_dict_field() {
+        // Inside a dict literal, `#schema User: { ... }` decorates the
+        // `User: { ... }` field — the directive is bare and the `User:`
+        // is a dict-field key. Our parser rewinds the ident so the
+        // dict-pair parser can see it.
+        let mut s = Span::new("#schema User: { x: 1 }");
+        let dirs = parse_directives(&mut s).unwrap();
+        assert_eq!(dirs.len(), 1);
+        assert!(matches!(dirs[0].body, crate::DirectiveBody::Bare));
     }
 
     #[test]
@@ -279,7 +316,10 @@ mod tests {
         let mut s = Span::new(r#"#import { upper, lower as lo } from "std/string""#);
         let dirs = parse_directives(&mut s).unwrap();
         match &dirs[0].body {
-            crate::DirectiveBody::Import { spec: DirectiveImportSpec::Destructure(entries), .. } => {
+            crate::DirectiveBody::Import {
+                spec: DirectiveImportSpec::Destructure(entries),
+                ..
+            } => {
                 assert_eq!(entries.len(), 2);
                 assert_eq!(entries[0], ("upper".to_string(), None));
                 assert_eq!(entries[1], ("lower".to_string(), Some("lo".to_string())));

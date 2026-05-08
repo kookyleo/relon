@@ -29,7 +29,7 @@ fn sandboxed_context_rejects_default_filesystem_imports() {
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("lib.relon"), r#"{ secret: "leak" }"#).unwrap();
 
-    let node = parse(r#"@import("lib.relon", as="lib") { x: lib.secret }"#);
+    let node = parse(r#"#import lib from "lib.relon" { x: lib.secret }"#);
     let ctx = Context::sandboxed().with_root(node);
     let ctx = std::sync::Arc::new(ctx);
     let scope = Arc::new(Scope {
@@ -40,7 +40,7 @@ fn sandboxed_context_rejects_default_filesystem_imports() {
     let _ = std::fs::remove_dir_all(&dir);
 
     assert!(
-        matches!(&result, Err(RuntimeError::CapabilityDenied { name, .. }) if name.contains("@import")),
+        matches!(&result, Err(RuntimeError::CapabilityDenied { name, .. }) if name.contains("#import")),
         "expected CapabilityDenied, got {result:?}"
     );
 }
@@ -57,7 +57,7 @@ fn filesystem_resolver_with_root_dir_allows_paths_under_root() {
         Arc::new(StdModuleResolver),
         Arc::new(FilesystemModuleResolver::with_root_dir(&dir)),
     ];
-    let node = parse(r#"@import("lib.relon", as="lib") { v: lib.value }"#);
+    let node = parse(r#"#import lib from "lib.relon" { v: lib.value }"#);
     let ctx = ctx.with_root(node);
     let ctx = std::sync::Arc::new(ctx);
     let scope = Arc::new(Scope {
@@ -90,7 +90,7 @@ fn filesystem_resolver_rejects_traversal_outside_root() {
         Arc::new(StdModuleResolver),
         Arc::new(FilesystemModuleResolver::with_root_dir(&inner)),
     ];
-    let node = parse(r#"@import("../escape.relon", as="x") { y: x.leak }"#);
+    let node = parse(r#"#import x from "../escape.relon" { y: x.leak }"#);
     let ctx = ctx.with_root(node);
     let ctx = std::sync::Arc::new(ctx);
     let scope = Arc::new(Scope {
@@ -124,7 +124,7 @@ fn filesystem_resolver_rejects_symlink_escape() {
         Arc::new(StdModuleResolver),
         Arc::new(FilesystemModuleResolver::with_root_dir(&inner)),
     ];
-    let node = parse(r#"@import("link.relon", as="x") { y: x.leak }"#);
+    let node = parse(r#"#import x from "link.relon" { y: x.leak }"#);
     let ctx = ctx.with_root(node);
     let ctx = std::sync::Arc::new(ctx);
     let scope = Arc::new(Scope {
@@ -324,7 +324,7 @@ fn std_module_resolver_works_under_full_sandbox() {
     // native-fn allowlist, etc.).
     let result = eval_with(
         Context::sandboxed(),
-        r#"@import("std/list", as="list")
+        r#"#import list from "std/list"
         { "first": list.first([10, 20, 30]) }"#,
     )
     .unwrap();
@@ -337,7 +337,7 @@ fn std_module_resolver_works_under_full_sandbox() {
 #[test]
 fn test_parameterized_schema() {
     let src = r#"{
-        @schema Page<T>: {
+        #schema Page<T>: {
             List<T> items: *
         },
         Page<Int> ok_page: {
@@ -398,9 +398,9 @@ fn test_brand_registry() {
     };
     ctx.register_schema("Email", email_schema);
 
-    // Usage site doesn't define 'Email', but uses it via @brand
+    // Usage site doesn't define 'Email', but uses it via #brand
     let src = r#"{
-        @brand(Email)
+        #brand Email
         "me": { "address": "test@example.com" }
     }"#;
 

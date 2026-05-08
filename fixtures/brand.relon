@@ -1,9 +1,9 @@
 {
-    // `@brand(Type)` is the decorator-position twin of `Type field: { ... }`.
+    // `#brand Type` is the decorator-position twin of `Type field: { ... }`.
     // Use it where the field-level type-hint syntax can't reach: list elements,
     // values built up by other decorators, or wherever a bareword key isn't
     // already declaring a type.
-    @schema Weather: {
+    #schema Weather {
         String location: * ,
         Int temperature: *
     },
@@ -13,22 +13,22 @@
         temperature: 22
     },
     // Decorator form — same effect, different position.
-    decorated: @brand(Weather) {
+    decorated: #brand Weather {
         location: "Tokyo",
         temperature: 18
     },
     // String-form argument is equivalent to the bareword form.
-    by_string: @brand("Weather") {
+    by_string: #brand "Weather" {
         location: "Berlin",
         temperature: 15
     },
     // Inside a list element, where a field-level hint can't be written.
     cities: [
-        @brand(Weather) {
+        #brand Weather {
             location: "Paris",
             temperature: 20
         },
-        @brand(Weather) {
+        #brand Weather {
             location: "Sydney",
             temperature: 24
         }
@@ -44,22 +44,22 @@
     // Generic argument: `Dict<String, Int>` drives `check_dict` so every
     // entry's value must be `Int`. Note `Dict` is the canonical builtin —
     // `Map<...>` would fall through to `check_custom_schema` and fail.
-    counters: @brand(Dict<String, Int>) {
+    counters: #brand Dict<String, Int> {
         hits: 1,
         misses: 7
     },
     // Optional suffix `?` is preserved in the brand string; the underlying
     // `Weather` schema still validates the body.
-    optional_weather: @brand(Weather?) {
+    optional_weather: #brand Weather? {
         location: "Reykjavik",
         temperature: 5
     },
-    // Schema-field position: `@brand(X) field: *` is the decorator-form
+    // Schema-field position: `#brand X field: *` is the decorator-form
     // mirror of `X field: *`. Both declare the field's type; the analyzer
     // flags using both at once on the same field.
-    @schema Place: {
-        @brand(String) name: * ,
-        @brand(Dict<String, Int>) tags: *
+    #schema Place {
+        #brand String name: * ,
+        #brand Dict<String, Int> tags: *
     },
     Place origin: {
         name: "HQ",

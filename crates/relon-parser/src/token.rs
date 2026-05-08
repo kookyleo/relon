@@ -49,6 +49,11 @@ impl From<TokenRange> for miette::SourceSpan {
 }
 
 #[derive(Debug, PartialEq, Clone)]
+// `Dynamic` carries a full `Node` so this variant is significantly
+// larger than the others. The values are parser/AST-internal and
+// always wrapped in tuples or larger AST types in practice; the size
+// disparity isn't worth boxing every key access for.
+#[allow(clippy::large_enum_variant)]
 pub enum TokenKey {
     Dummy,
     Index(usize, bool),               // index, is_optional
@@ -116,9 +121,13 @@ pub enum DirectiveShape {
     /// `#name <expr>` — single value. Example: `#default 0`,
     /// `#expect "msg"`, `#brand Color`.
     Value,
-    /// `#name <ident> : <expr> [, ...]*` — one or more named bindings.
-    /// Example: `#schema User : { ... }`.
-    Binding,
+    /// `#name <ident> <body-expr>` — one named declaration with a
+    /// single body expression (no colon). Example:
+    /// `#schema User { String name: * }`,
+    /// `#schema Color Enum<"r", "g", "b">`. Inside a dict literal,
+    /// `#schema X: { ... }` retains the dict-field grammar — the `:`
+    /// belongs to the field separator, not the directive.
+    NameBody,
     /// `#import <bindspec> from <string>`. Example:
     /// `#import string from "std/string"`,
     /// `#import * from "std/list"`,
@@ -135,7 +144,12 @@ pub enum DirectiveShape {
 pub enum DirectiveBody {
     Bare,
     Value(Box<Node>),
-    Bindings(Vec<DirectiveBinding>),
+    /// Single named declaration: `<ident> <body-expr>` (no colon).
+    NameBody {
+        name: String,
+        name_range: TokenRange,
+        body: Box<Node>,
+    },
     Import {
         spec: DirectiveImportSpec,
         path: String,
@@ -144,15 +158,6 @@ pub enum DirectiveBody {
     Main {
         params: Vec<DirectiveMainParam>,
     },
-}
-
-/// One `<ident> : <expr>` entry inside a binding-shape directive (e.g.
-/// each comma-separated `Name : Body` of `#schema`).
-#[derive(Debug, PartialEq, Clone)]
-pub struct DirectiveBinding {
-    pub name: String,
-    pub name_range: TokenRange,
-    pub value: Box<Node>,
 }
 
 /// Bindspec for `#import <spec> from "path"`.

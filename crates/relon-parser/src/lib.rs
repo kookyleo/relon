@@ -197,10 +197,14 @@ pub fn parse_prim<'a>(input: &mut Span<'a>) -> ModalResult<Node> {
 /// Parse the root base which consists of optional decorators / directives
 /// and a root List or Dict. `@decorator` and `#directive` lines may
 /// interleave above the body in any order; both lists are kept in source
-/// order on the produced [`Node`].
+/// order on the produced [`Node`]. Standalone `#directive` lines that
+/// appear *inside* the root dict's `{...}` are also collected and
+/// merged onto the node's `directives` list — that way root-level
+/// schemas / imports may live either above the dict or among its
+/// entries.
 pub fn parse_base<'a>(input: &mut Span<'a>) -> ModalResult<Node> {
     let doc_comment = parse_leading_comments(input)?;
-    let (decorators, directives) = parse_attributes(input)?;
+    let (decorators, mut directives) = parse_attributes(input)?;
     soc0(input)?;
     let start_offset = decorators
         .first()
@@ -209,6 +213,11 @@ pub fn parse_base<'a>(input: &mut Span<'a>) -> ModalResult<Node> {
         .unwrap_or_else(|| input.location());
 
     let root = alt((structure::dict::parse_dict, structure::list::parse_list)).parse_next(input)?;
+
+    // Merge any standalone directives the dict parser collected onto
+    // the root node so the analyzer's root-directive passes see one
+    // unified list.
+    directives.extend(root.directives);
 
     let end_offset = input.location();
     let range = create_range(input, start_offset, end_offset);
@@ -232,29 +241,14 @@ pub fn parse_attributes<'a>(input: &mut Span<'a>) -> ModalResult<(Vec<Decorator>
     let mut directives = Vec::new();
     loop {
         soc0(input)?;
-        let checkpoint = input.checkpoint();
         let peek = input.as_ref().chars().next();
         match peek {
             Some('@') => {
-                let dec = match decorator::parse_decorators(input) {
-                    Ok(mut v) if !v.is_empty() => v.remove(0),
-                    Ok(_) => {
-                        input.reset(&checkpoint);
-                        break;
-                    }
-                    Err(e) => return Err(e),
-                };
+                let dec = decorator::parse_decorator(input)?;
                 decorators.push(dec);
             }
             Some('#') => {
-                let dir = match directive::parse_directives(input) {
-                    Ok(mut v) if !v.is_empty() => v.remove(0),
-                    Ok(_) => {
-                        input.reset(&checkpoint);
-                        break;
-                    }
-                    Err(e) => return Err(e),
-                };
+                let dir = directive::parse_directive(input)?;
                 directives.push(dir);
             }
             _ => break,

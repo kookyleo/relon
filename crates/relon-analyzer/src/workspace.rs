@@ -34,7 +34,7 @@ impl Workspace {
     }
 
     /// Find all references to a symbol exported from `from_path`.
-    /// This follows `@import` chains.
+    /// This follows `#import` chains.
     pub fn find_symbol_references(
         &self,
         _from_path: &str,

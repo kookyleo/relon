@@ -208,7 +208,7 @@ fn test_required_fields_checks_presence_not_truthiness() {
 #[test]
 fn test_string_stdlib() {
     let result = eval_doc(
-        r#"@import("std/string", as="string")
+        r#"#import string from "std/string"
         {
         "words": string.split("rust,config,dsl", ","),
         "joined": string.join(&sibling.words, "-"),
@@ -246,8 +246,8 @@ fn test_string_stdlib() {
 #[test]
 fn test_dict_stdlib() {
     let result = eval_doc(
-        r#"@import("std/dict", as="dict")
-        @import("std/list", as="list")
+        r#"#import dict from "std/dict"
+        #import list from "std/list"
         {
         "base": { "a": 1, "b": 2 },
         "override": { "b": 3, "c": 4 },
@@ -285,12 +285,12 @@ fn test_dict_stdlib() {
 #[test]
 fn test_virtual_stdlib_modules() {
     let result = eval_doc(
-        r#"@import("std/list", as="list")
-        @import("std/math", as="math")
-        @import("std/value", as="value")
-        @import("std/is", as="is")
-        @import("std/string", as="string")
-        @import("std/dict", as="dict")
+        r#"#import list from "std/list"
+        #import math from "std/math"
+        #import value from "std/value"
+        #import is from "std/is"
+        #import string from "std/string"
+        #import dict from "std/dict"
         {
             "first": list.first([10, 20, 30]),
             "compact": list.compact([1, null, 2]),
@@ -601,7 +601,7 @@ fn test_reference_resolution() {
 
 #[test]
 fn test_circular_import() {
-    let node = parse_doc(r#"@import("tests_assets/a.relon") {}"#);
+    let node = parse_doc(r#"#import a from "tests_assets/a.relon" {}"#);
     let ctx = fully_granted_ctx().with_root(node.clone());
     let ctx = std::sync::Arc::new(ctx);
     let eval = Evaluator::new(std::sync::Arc::clone(&ctx));
@@ -627,8 +627,8 @@ fn test_import_cache_uses_canonical_paths() {
     std::fs::write(dir.join("lib.relon"), r#"{ value: 1 }"#).unwrap();
 
     let node = parse_doc(
-        r#"@import("sub/../lib.relon", as="a")
-        @import("lib.relon", as="b")
+        r#"#import a from "sub/../lib.relon"
+        #import b from "lib.relon"
         {}"#,
     );
     let ctx = fully_granted_ctx().with_root(node.clone());
@@ -662,7 +662,7 @@ fn test_imported_module_references_use_module_root() {
     .unwrap();
 
     let node = parse_doc(
-        r#"@import("lib.relon", as="lib")
+        r#"#import lib from "lib.relon"
         {
             "b": lib.b
         }"#,
@@ -691,7 +691,7 @@ fn test_loading_modules_restored_after_module_parse_error() {
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("bad.relon"), "{} trailing").unwrap();
 
-    let node = parse_doc(r#"@import("bad.relon") {}"#);
+    let node = parse_doc(r#"#import bad from "bad.relon" {}"#);
     let ctx = fully_granted_ctx().with_root(node.clone());
     let ctx = std::sync::Arc::new(ctx);
     let eval = Evaluator::new(std::sync::Arc::clone(&ctx));
@@ -759,7 +759,7 @@ fn test_runtime_type_checker_failure_generic_dict() {
 fn test_custom_schema_validation() {
     let result = eval_doc(
         r#"{
-        @schema
+        #schema
         UserSchema: {
             String name: *,
             Int age: *
@@ -793,7 +793,7 @@ fn test_custom_schema_validation() {
 fn test_custom_schema_validation_failure() {
     let result = eval_doc(
         r#"{
-        @schema
+        #schema
         UserSchema: {
             String name: *,
             Int age: *
@@ -812,7 +812,7 @@ fn test_custom_schema_validation_failure() {
 fn test_schema_predicates() {
     let result = eval_doc(
         r#"{
-        @schema
+        #schema
         Server: {
             Int port: (p) => p > 0 && p < 65536,
             String status: Enum<"up", "down">
@@ -829,7 +829,7 @@ fn test_schema_predicates() {
 fn test_schema_predicate_failure() {
     let result = eval_doc(
         r#"{
-        @schema
+        #schema
         Server: {
             Int port: (p) => p > 0 && p < 65536
         },
@@ -871,7 +871,7 @@ fn test_optional_chaining() {
 fn test_enum_type() {
     let result = eval_doc(
         r#"{
-        @schema
+        #schema
         Theme: {
             mode: Enum<"light", "dark", "system">,
             id: Enum<Int, String>
@@ -889,7 +889,7 @@ fn test_enum_type() {
 fn test_enum_type_failure() {
     let result = eval_doc(
         r#"{
-        @schema
+        #schema
         Theme: { mode: Enum<"light", "dark"> },
         Theme t: { mode: "other" }
     }"#,
@@ -901,9 +901,9 @@ fn test_enum_type_failure() {
 fn test_identity_guard_revalidation() {
     let result = eval_doc(
         r#"{
-        @schema User: { 
+        #schema User: { 
             String name: *,
-            @expect("Age must be positive")
+            #expect "Age must be positive"
             Int age: (a) => a > 0
         },
 
@@ -925,8 +925,8 @@ fn test_identity_guard_revalidation() {
 fn test_schema_composition_mixins() {
     let result = eval_doc(
         r#"{
-        @schema Base: { String type: * },
-        @schema Button: &sibling.Base + { String label: * },
+        #schema Base: { String type: * },
+        #schema Button: &sibling.Base + { String label: * },
 
         Button ok_btn: { type: "btn", label: "OK" },
 
@@ -953,8 +953,8 @@ fn test_schema_composition_mixins() {
 fn test_schema_composition_defaults() {
     let result = eval_doc(
         r#"{
-        @schema Base: { @default("info") String level: * },
-        @schema Error: &sibling.Base + { level: "error" },
+        #schema Base: { #default "info" String level: * },
+        #schema Error: &sibling.Base + { level: "error" },
 
         Error e: {}
     }"#,
@@ -983,8 +983,8 @@ fn test_schema_plus_dict_adds_typed_fields() {
     // validation.
     let ok = eval_doc(
         r#"{
-        @schema Base: { String name: * },
-        @schema User: &sibling.Base + { Int age: * },
+        #schema Base: { String name: * },
+        #schema User: &sibling.Base + { Int age: * },
 
         User alice: { name: "Alice", age: 30 }
     }"#,
@@ -994,8 +994,8 @@ fn test_schema_plus_dict_adds_typed_fields() {
 
     let missing = eval_doc(
         r#"{
-        @schema Base: { String name: * },
-        @schema User: &sibling.Base + { Int age: * },
+        #schema Base: { String name: * },
+        #schema User: &sibling.Base + { Int age: * },
 
         User alice: { name: "Alice" }
     }"#,
@@ -1004,8 +1004,8 @@ fn test_schema_plus_dict_adds_typed_fields() {
 
     let wrong_type = eval_doc(
         r#"{
-        @schema Base: { String name: * },
-        @schema User: &sibling.Base + { Int age: * },
+        #schema Base: { String name: * },
+        #schema User: &sibling.Base + { Int age: * },
 
         User alice: { name: "Alice", age: "thirty" }
     }"#,
@@ -1016,7 +1016,7 @@ fn test_schema_plus_dict_adds_typed_fields() {
 #[test]
 fn test_deep_merge() {
     let result = eval_doc(
-        r#"@import("std/dict", as="dict")
+        r#"#import dict from "std/dict"
         {
         base: { style: { color: "blue", size: 14 }, active: false },
 
@@ -1071,8 +1071,8 @@ fn test_schema_composition_and_combines_predicates() {
     // Both constraints must hold after composition.
     let ok = eval_doc(
         r#"{
-        @schema Base: { Int port: (p) => p > 0 },
-        @schema Derived: &sibling.Base + { Int port: (p) => p < 100 },
+        #schema Base: { Int port: (p) => p > 0 },
+        #schema Derived: &sibling.Base + { Int port: (p) => p < 100 },
 
         Derived in_range: { port: 50 }
     }"#,
@@ -1084,8 +1084,8 @@ fn test_schema_composition_and_combines_predicates() {
     // composition is now AND, not "right side wins".
     let too_high = eval_doc(
         r#"{
-        @schema Base: { Int port: (p) => p > 0 },
-        @schema Derived: &sibling.Base + { Int port: (p) => p < 100 },
+        #schema Base: { Int port: (p) => p > 0 },
+        #schema Derived: &sibling.Base + { Int port: (p) => p < 100 },
 
         Derived too_high: { port: 200 }
     }"#,
@@ -1096,8 +1096,8 @@ fn test_schema_composition_and_combines_predicates() {
     // composition — the right-hand `< 100` predicate doesn't shadow it.
     let negative = eval_doc(
         r#"{
-        @schema Base: { Int port: (p) => p > 0 },
-        @schema Derived: &sibling.Base + { Int port: (p) => p < 100 },
+        #schema Base: { Int port: (p) => p > 0 },
+        #schema Derived: &sibling.Base + { Int port: (p) => p < 100 },
 
         Derived negative: { port: -5 }
     }"#,
@@ -1130,7 +1130,7 @@ fn recursion_limit_uses_dedicated_error_kind() {
             }
             let source = format!(
                 r#"{{
-                    @schema
+                    #schema
                     Cell: {{
                         Cell? next: *
                     }},
@@ -1151,7 +1151,7 @@ fn recursion_limit_uses_dedicated_error_kind() {
 fn test_recursive_schema() {
     let result = eval_doc(
         r#"{
-        @schema
+        #schema
         Menu: {
             String title: *,
             List<Menu>? children: *
@@ -1174,9 +1174,9 @@ fn test_recursive_schema() {
 fn test_custom_error_message() {
     let result = eval_doc(
         r#"{
-        @schema
+        #schema
         Server: {
-            @expect("Port must be between 0 and 65535")
+            #expect "Port must be between 0 and 65535"
             Int port: (p) => p > 0 && p < 65536
         },
 
@@ -1195,8 +1195,8 @@ fn test_custom_error_message() {
 fn test_match_expression() {
     let result = eval_doc(
         r#"{
-        @schema Image: { name: String, url: String },
-        @schema Text: { name: String, content: String },
+        #schema Image: { name: String, url: String },
+        #schema Text: { name: String, content: String },
         
         data: { name: "img", url: "http://example.com/a.png" },
         
@@ -1249,8 +1249,8 @@ fn test_list_relative_references() {
 fn test_nominal_branding() {
     let result = eval_doc(
         r#"{
-        @schema Button: { String label: * },
-        @schema Link:   { String label: * },
+        #schema Button: { String label: * },
+        #schema Link: { String label: * },
         
         Button b: { label: "Ok" },
         Link l:   { label: "Home" },
@@ -1283,15 +1283,15 @@ fn test_nominal_branding() {
 
 #[test]
 fn test_brand_decorator_validates_and_brands_dict() {
-    // `@brand(Weather)` at field-value position is the decorator-form
+    // `#brand Weather` at field-value position is the decorator-form
     // analogue of `Weather w: {...}`: it runs `check_type` against the
     // schema and writes `dict.brand`. Verify both effects on a value
     // that satisfies the schema.
     let result = eval_doc(
         r#"{
-        @schema Weather: { String location: *, Int temperature: * },
+        #schema Weather: { String location: *, Int temperature: * },
 
-        w: @brand(Weather) {
+        w: #brand Weather {
             location: "Shanghai",
             temperature: 22
         },
@@ -1325,13 +1325,13 @@ fn test_brand_decorator_validates_and_brands_dict() {
 #[test]
 fn test_brand_decorator_validation_failure() {
     // Field-level hint rejects ill-typed payloads with `TypeMismatch`;
-    // `@brand` must reach the same outcome through the same `check_type`
+    // `#brand` must reach the same outcome through the same `check_type`
     // call.
     let result = eval_doc(
         r#"{
-        @schema Weather: { String location: *, Int temperature: * },
+        #schema Weather: { String location: *, Int temperature: * },
 
-        w: @brand(Weather) {
+        w: #brand Weather {
             location: "Shanghai",
             temperature: "hot"
         }
@@ -1342,13 +1342,13 @@ fn test_brand_decorator_validation_failure() {
 
 #[test]
 fn test_brand_decorator_string_form_equivalent() {
-    // `@brand("Weather")` and `@brand(Weather)` resolve to the same
+    // `#brand "Weather"` and `#brand Weather` resolve to the same
     // type name; the brand written into the dict must be identical.
     let result = eval_doc(
         r#"{
-        @schema Weather: { String location: *, Int temperature: * },
+        #schema Weather: { String location: *, Int temperature: * },
 
-        w: @brand("Weather") {
+        w: #brand "Weather" {
             location: "Tokyo",
             temperature: 18
         }
@@ -1367,14 +1367,14 @@ fn test_brand_decorator_string_form_equivalent() {
 
 #[test]
 fn test_brand_decorator_at_document_root() {
-    // The whole point of `@brand` is reaching positions where a
+    // The whole point of `#brand` is reaching positions where a
     // `Type field:` hint can't be written — the document root being
     // the canonical example. The schema lives in an outer scope
     // injected by the host (the parser doesn't allow a root-node
     // type hint, so this is the only way to brand a root dict).
     use std::collections::HashMap;
     let node = parse_doc(
-        r#"@brand(Weather) {
+        r#"#brand Weather {
         location: "Berlin",
         temperature: 15
     }"#,
@@ -1382,7 +1382,7 @@ fn test_brand_decorator_at_document_root() {
     let ctx = Context::new().with_root(node);
     let ctx = std::sync::Arc::new(ctx);
     // Synthesize a `Weather` schema and seed it into the surrounding
-    // scope so the root-level `@brand` can resolve it.
+    // scope so the root-level `#brand` can resolve it.
     let weather_schema = Value::Schema {
         generics: Vec::new(),
         fields: {
@@ -1444,45 +1444,24 @@ fn test_brand_decorator_at_document_root() {
 }
 
 #[test]
-fn test_brand_decorator_stacks_with_import_spread() {
-    // `@import(spread=true)` injects locals (here: a schema) into the
-    // surrounding scope; `@brand` then validates the dict against that
-    // newly-visible schema. Order matters — `@import`'s `pre_eval`
-    // runs first so the schema is in scope by the time `@brand`'s
-    // wrap pass calls `check_type`.
-    let dir = std::env::temp_dir().join(format!(
-        "relon-brand-import-{}-{}",
-        std::process::id(),
-        line!()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    let lib_path = dir.join("weather_schema.relon");
-    std::fs::write(
-        &lib_path,
-        r#"{
-            @schema Weather: { String location: *, Int temperature: * }
-        }"#,
-    )
-    .unwrap();
-
-    let src = format!(
-        r#"{{
-            w: @import("{}", spread=true) @brand(Weather) {{
-                location: "Paris",
-                temperature: 20
-            }}
-        }}"#,
-        lib_path.to_string_lossy()
-    );
-
-    let node = parse_doc(&src);
+fn test_brand_directive_stacks_with_inline_schema() {
+    // Stacking `#brand` on top of an inline schema declaration: the
+    // schema directive seeds `Weather` into scope before the body
+    // walks, so `#brand Weather { ... }` validates and brands the
+    // dict in one go.
+    let src = r#"{
+        #schema Weather { String location: *, Int temperature: * },
+        w: #brand Weather {
+            location: "Paris",
+            temperature: 20
+        }
+    }"#;
+    let node = parse_doc(src);
     let ctx = fully_granted_ctx().with_root(node);
     let ctx = std::sync::Arc::new(ctx);
     let result = Evaluator::new(std::sync::Arc::clone(&ctx))
-        .eval_root(&std::sync::Arc::new(Scope::default()));
-    let _ = std::fs::remove_dir_all(&dir);
-    let result = result.unwrap();
-
+        .eval_root(&std::sync::Arc::new(Scope::default()))
+        .unwrap();
     let Value::Dict(d) = result else {
         panic!("Expected Dict");
     };
@@ -1495,13 +1474,13 @@ fn test_brand_decorator_stacks_with_import_spread() {
 
 #[test]
 fn test_brand_decorator_conflicts_with_field_type_hint() {
-    // `Weather w: @brand(Weather) {...}` expresses the same intent
+    // `Weather w: #brand Weather {...}` expresses the same intent
     // twice. Refuse the combination so the user picks one form.
     let result = eval_doc(
         r#"{
-        @schema Weather: { String location: *, Int temperature: * },
+        #schema Weather: { String location: *, Int temperature: * },
 
-        Weather w: @brand(Weather) {
+        Weather w: #brand Weather {
             location: "Shanghai",
             temperature: 22
         }
@@ -1509,7 +1488,7 @@ fn test_brand_decorator_conflicts_with_field_type_hint() {
     );
     assert!(matches!(
         result,
-        Err(RuntimeError::UnsupportedOperator(msg, _)) if msg.contains("@brand")
+        Err(RuntimeError::UnsupportedOperator(msg, _)) if msg.contains("#brand")
     ));
 }
 
@@ -1517,11 +1496,11 @@ fn test_brand_decorator_conflicts_with_field_type_hint() {
 fn test_brand_decorator_unknown_schema_matches_field_form() {
     // The field-form `NotDeclared x: {...}` produces `VariableNotFound`
     // when `NotDeclared` isn't in scope (see `check_custom_schema`).
-    // `@brand(NotDeclared) {...}` must produce the same error so the
+    // `#brand NotDeclared {...}` must produce the same error so the
     // two entry points stay observationally identical.
     let result = eval_doc(
         r#"{
-        w: @brand(NotDeclared) { a: 1 }
+        w: #brand NotDeclared { a: 1 }
     }"#,
     );
     assert!(matches!(result, Err(RuntimeError::VariableNotFound(_, _))));
@@ -1537,11 +1516,11 @@ fn test_brand_decorator_unknown_schema_matches_field_form() {
     ));
 }
 
-// -------- Task A: generic / optional types in `@brand(...)` --------
+// -------- Task A: generic / optional types in `#brand ...` --------
 
 #[test]
 fn test_brand_decorator_generic_dict_validates_and_brands() {
-    // `@brand(Dict<String, Int>)` runs `check_dict` against the value
+    // `#brand Dict<String, Int>` runs `check_dict` against the value
     // (every entry's value must be `Int`) and stamps the dict with a
     // brand string that round-trips through type matches and JSON.
     // `Dict` is the canonical builtin — `Map<...>` would fall through
@@ -1549,7 +1528,7 @@ fn test_brand_decorator_generic_dict_validates_and_brands() {
     // unless the host registers a `Map` alias schema.
     let result = eval_doc(
         r#"{
-        counters: @brand(Dict<String, Int>) {
+        counters: #brand Dict<String, Int> {
             hits: 1,
             misses: 7
         }
@@ -1575,7 +1554,7 @@ fn test_brand_decorator_generic_dict_validation_failure() {
     // a non-Int value for any entry must reject with `TypeMismatch`.
     let result = eval_doc(
         r#"{
-        counters: @brand(Dict<String, Int>) {
+        counters: #brand Dict<String, Int> {
             hits: 1,
             misses: "lots"
         }
@@ -1586,16 +1565,16 @@ fn test_brand_decorator_generic_dict_validation_failure() {
 
 #[test]
 fn test_brand_decorator_generic_single_param_brand_string() {
-    // `@brand(Foo<T>)` with no host-supplied `Foo` schema falls back to
+    // `#brand Foo<T>` with no host-supplied `Foo` schema falls back to
     // `check_custom_schema` — the lookup fails on `Foo`, mirroring the
     // field form. Brand serialization for the generic shape, however,
     // is still well-defined: verify it through the lookup error path
     // by introducing `Foo` as an alias to a permissive schema first.
     let result = eval_doc(
         r#"{
-        @schema Foo: { Any value: * },
+        #schema Foo: { Any value: * },
 
-        wrapped: @brand(Foo<T>) {
+        wrapped: #brand Foo<T> {
             value: 42
         }
     }"#,
@@ -1621,7 +1600,7 @@ fn test_brand_decorator_field_form_generic_brand_parity() {
     let result = eval_doc(
         r#"{
         Dict<String, Int> field: { a: 1, b: 2 },
-        decorated: @brand(Dict<String, Int>) { a: 1, b: 2 }
+        decorated: #brand Dict<String, Int> { a: 1, b: 2 }
     }"#,
     )
     .unwrap();
@@ -1640,14 +1619,14 @@ fn test_brand_decorator_field_form_generic_brand_parity() {
 
 #[test]
 fn test_brand_decorator_optional_brand_string() {
-    // `@brand(Weather?)` — the `?` suffix flows into the brand string
+    // `#brand Weather?` — the `?` suffix flows into the brand string
     // so type guards see the optionality marker. The schema validation
     // proceeds against the underlying `Weather` schema.
     let result = eval_doc(
         r#"{
-        @schema Weather: { String location: *, Int temperature: * },
+        #schema Weather: { String location: *, Int temperature: * },
 
-        w: @brand(Weather?) {
+        w: #brand Weather? {
             location: "Tokyo",
             temperature: 18
         }
@@ -1663,17 +1642,17 @@ fn test_brand_decorator_optional_brand_string() {
     assert_eq!(w.brand.as_deref(), Some("Weather?"));
 }
 
-// -------- Task B: `@brand(X)` at schema-field position --------
+// -------- Task B: `#brand X` at schema-field position --------
 
 #[test]
 fn test_brand_decorator_in_schema_field_equivalent_to_type_prefix() {
-    // `@schema S: { @brand(String) name: * }` is the decorator-form
-    // mirror of `@schema S: { String name: * }`. A non-`String` value
+    // `#schema S: { #brand String name: * }` is the decorator-form
+    // mirror of `#schema S: { String name: * }`. A non-`String` value
     // on the schema instance must reject with `TypeMismatch`, and a
     // `String` value must validate cleanly.
     let ok = eval_doc(
         r#"{
-        @schema S: { @brand(String) name: * },
+        #schema S: { #brand String name: * },
 
         S inst: { name: "Ada" }
     }"#,
@@ -1692,7 +1671,7 @@ fn test_brand_decorator_in_schema_field_equivalent_to_type_prefix() {
 
     let bad = eval_doc(
         r#"{
-        @schema S: { @brand(String) name: * },
+        #schema S: { #brand String name: * },
 
         S inst: { name: 42 }
     }"#,
@@ -1702,17 +1681,17 @@ fn test_brand_decorator_in_schema_field_equivalent_to_type_prefix() {
 
 #[test]
 fn test_brand_decorator_in_schema_field_dotted_path() {
-    // `@brand(geo.Location) loc: *` — dotted-path arg form. The schema
+    // `#brand geo.Location loc: *` — dotted-path arg form. The schema
     // must validate against the resolved `geo.Location` binding (here
     // re-bound in the same dict so static lookup works). Same as the
     // type-prefix form `geo.Location loc: *` — neither auto-brands
-    // the nested instance; the user is expected to apply `@brand` at
+    // the nested instance; the user is expected to apply `#brand` at
     // the instance position when an explicit brand is desired.
     let result = eval_doc(
         r#"{
-        geo: { Location: @schema { Number lat: *, Number lon: * } },
-        @schema Place: {
-            @brand(geo.Location) loc: *,
+        geo: { Location: #schema { Number lat: *, Number lon: * } },
+        #schema Place: {
+            #brand geo.Location loc: *,
             String name: *
         },
 
@@ -1735,13 +1714,13 @@ fn test_brand_decorator_in_schema_field_dotted_path() {
     assert_eq!(loc.map.get("lat").unwrap(), &Value::Float(1.0.into()));
 
     // The validation rejects an instance whose `loc` shape doesn't
-    // satisfy `geo.Location` — proving the `@brand`-derived type hint
+    // satisfy `geo.Location` — proving the `#brand`-derived type hint
     // really drove `check_type`.
     let bad = eval_doc(
         r#"{
-        geo: { Location: @schema { Number lat: *, Number lon: * } },
-        @schema Place: {
-            @brand(geo.Location) loc: *,
+        geo: { Location: #schema { Number lat: *, Number lon: * } },
+        #schema Place: {
+            #brand geo.Location loc: *,
             String name: *
         },
 
@@ -1756,12 +1735,12 @@ fn test_brand_decorator_in_schema_field_dotted_path() {
 
 #[test]
 fn test_brand_decorator_in_schema_field_generic_dict() {
-    // `@brand(Dict<String, Int>) m: *` lifts the generic type into the
+    // `#brand Dict<String, Int> m: *` lifts the generic type into the
     // field's type hint; instances with non-Int values must reject.
     let ok = eval_doc(
         r#"{
-        @schema Counters: {
-            @brand(Dict<String, Int>) m: *
+        #schema Counters: {
+            #brand Dict<String, Int> m: *
         },
 
         Counters c: { m: { a: 1, b: 2 } }
@@ -1778,8 +1757,8 @@ fn test_brand_decorator_in_schema_field_generic_dict() {
 
     let bad = eval_doc(
         r#"{
-        @schema Counters: {
-            @brand(Dict<String, Int>) m: *
+        #schema Counters: {
+            #brand Dict<String, Int> m: *
         },
 
         Counters c: { m: { a: 1, b: "two" } }
@@ -1791,12 +1770,12 @@ fn test_brand_decorator_in_schema_field_generic_dict() {
 #[test]
 fn test_brand_decorator_in_schema_field_conflict_with_explicit_type() {
     // When a schema field carries BOTH an explicit type prefix AND a
-    // `@brand(...)` decorator, the analyzer flags it as a conflict.
-    // Source: `@brand(Bar) Foo x: *` — both forms try to declare `x`'s
+    // `#brand ...` decorator, the analyzer flags it as a conflict.
+    // Source: `#brand Bar Foo x: *` — both forms try to declare `x`'s
     // type. Verify the diagnostic shape directly via `relon_analyzer`.
     let node = parse_doc(
         r#"{
-        @schema S: { @brand(Bar) Foo x: * }
+        #schema S: { #brand Bar Foo x: * }
     }"#,
     );
     let tree = relon_analyzer::analyze(&node);
@@ -1812,11 +1791,11 @@ fn test_brand_decorator_in_schema_field_conflict_with_explicit_type() {
 
 #[test]
 fn test_brand_decorator_in_schema_field_does_not_emit_untyped_warning() {
-    // `@brand(X) y: *` is a complete field declaration — the schema
+    // `#brand X y: *` is a complete field declaration — the schema
     // pass must NOT emit `SchemaFieldUntyped` for it.
     let node = parse_doc(
         r#"{
-        @schema S: { @brand(String) name: * }
+        #schema S: { #brand String name: * }
     }"#,
     );
     let tree = relon_analyzer::analyze(&node);
@@ -1825,22 +1804,22 @@ fn test_brand_decorator_in_schema_field_does_not_emit_untyped_warning() {
             .diagnostics
             .iter()
             .any(|d| matches!(d, relon_analyzer::Diagnostic::SchemaFieldUntyped { .. })),
-        "should not emit SchemaFieldUntyped for `@brand`-typed field, got {:?}",
+        "should not emit SchemaFieldUntyped for `#brand`-typed field, got {:?}",
         tree.diagnostics
     );
 }
 
 #[test]
 fn test_brand_decorator_in_schema_field_end_to_end_with_meta() {
-    // End-to-end: a `@brand(...)`-typed field still composes with the
-    // other schema-field meta decorators (`@expect`, `@default`).
+    // End-to-end: a `#brand ...`-typed field still composes with the
+    // other schema-field meta decorators (`#expect`, `#default`).
     // The custom error must surface on a missing field; the default
     // must populate a missing field in the instance.
     let result = eval_doc(
         r#"{
-        @schema User: {
-            @brand(String) name: *,
-            @default(0) @brand(Int) age: *
+        #schema User: {
+            #brand String name: *,
+            #default 0 #brand Int age: *
         },
 
         User alice: { name: "Alice" }
@@ -1864,8 +1843,8 @@ fn test_brand_decorator_in_schema_field_end_to_end_with_meta() {
 fn test_schema_defaulting() {
     let result = eval_doc(
         r#"{
-        @schema User: {
-            @default("guest")
+        #schema User: {
+            #default "guest"
             String role: *,
             Int age: *
         },
@@ -1893,15 +1872,15 @@ fn test_schema_defaulting() {
 
 #[test]
 fn test_schema_computed_default_from_siblings() {
-    // A closure passed to @default fires at validation time with the
+    // A closure passed to #default fires at validation time with the
     // partially-populated instance bound to `self`, computing the field
     // from sibling values.
     let result = eval_doc(
         r#"{
-        @schema User: {
+        #schema User: {
             String first: *,
             String last: *,
-            @default((self) => self.first + " " + self.last)
+            #default (self) => self.first + " " + self.last
             String full: *
         },
 
@@ -1928,10 +1907,10 @@ fn test_schema_computed_default_does_not_override_explicit_value() {
     // not fire — explicit value wins, same as literal defaults.
     let result = eval_doc(
         r#"{
-        @schema User: {
+        #schema User: {
             String first: *,
             String last: *,
-            @default((self) => self.first + " " + self.last)
+            #default (self) => self.first + " " + self.last
             String full: *
         },
 
@@ -2024,7 +2003,7 @@ fn test_forward_lookahead_next() {
 fn variant_ctor_constructs_branded_dict() {
     let result = eval_doc(
         r#"{
-            @schema Notification: Enum<
+            #schema Notification Enum<
                 Email { address: String, subject: String },
                 Push,
             >,
@@ -2050,7 +2029,7 @@ fn variant_ctor_constructs_branded_dict() {
 fn variant_ctor_unit_variant_works() {
     let result = eval_doc(
         r#"{
-            @schema Notification: Enum<
+            #schema Notification Enum<
                 Email { address: String },
                 Push,
             >,
@@ -2071,7 +2050,7 @@ fn variant_ctor_unit_variant_works() {
 fn variant_ctor_unknown_variant_runtime_error() {
     let result = eval_doc(
         r#"{
-            @schema N: Enum<A { x: Int }>,
+            #schema N Enum<A { x: Int }>,
             msg: N.Bogus { x: 1 }
         }"#,
     );
@@ -2082,7 +2061,7 @@ fn variant_ctor_unknown_variant_runtime_error() {
 fn variant_ctor_missing_required_field_errors() {
     let result = eval_doc(
         r#"{
-            @schema N: Enum<Email { address: String, subject: String }>,
+            #schema N Enum<Email { address: String, subject: String }>,
             msg: N.Email { address: "a@b" }
         }"#,
     );
@@ -2095,7 +2074,7 @@ fn variant_value_field_access_is_flat() {
     // no `.Email.` indirection — same access path as a plain dict.
     let result = eval_doc(
         r#"{
-            @schema N: Enum<Email { address: String }>,
+            #schema N Enum<Email { address: String }>,
             msg: N.Email { address: "a@b.c" },
             got: &sibling.msg.address
         }"#,
@@ -2112,7 +2091,7 @@ fn variant_value_field_access_is_flat() {
 fn match_on_variant_dispatches_via_brand() {
     let result = eval_doc(
         r#"{
-            @schema N: Enum<
+            #schema N Enum<
                 Email { address: String },
                 Push,
             >,
@@ -2136,7 +2115,7 @@ fn untagged_enum_string_literal_still_validates() {
     // Regression: classic `Enum<"up", "down">` must keep working.
     let result = eval_doc(
         r#"{
-            @schema Status: { String mode: Enum<"up", "down"> },
+            #schema Status: { String mode: Enum<"up", "down"> },
             Status s: { mode: "up" }
         }"#,
     );
@@ -2147,7 +2126,7 @@ fn untagged_enum_string_literal_still_validates() {
 fn untagged_enum_type_set_still_validates() {
     let result = eval_doc(
         r#"{
-            @schema Theme: { id: Enum<Int, String> },
+            #schema Theme: { id: Enum<Int, String> },
             Theme t: { id: 7 }
         }"#,
     );
@@ -2155,36 +2134,34 @@ fn untagged_enum_type_set_still_validates() {
 }
 
 #[test]
-fn single_input_slot_validates_and_fills_defaults() {
-    // `@input(name=SchemaRef)` declares one named slot of the program's
-    // input contract. Host pushes a dict whose `req` slot is missing
-    // the `retries` field; the field carries `@default(...)` so
-    // validation accepts the input and materializes the default.
-    use std::collections::BTreeMap;
-    let source = r#"@input(req=Req)
-{
-    @schema Req: {
-        String name: *,
-        @default(0)
-        Int retries: *
-    },
-    greeting: f"hello ${input.req.name}, retries=${input.req.retries}"
-}"#;
+fn run_main_validates_args_and_fills_defaults() {
+    // `#main(req: Req)` declares the file as an entry program with one
+    // named parameter. Host pushes the matching arg as a HashMap; the
+    // missing schema field carries `#default 0` so validation accepts
+    // the input and materializes the default.
+    use std::collections::{BTreeMap, HashMap};
+    let source = r#"#schema Req {
+    String name: *,
+    #default 0
+    Int retries: *
+}
+#main(req: Req)
+{ greeting: f"hello ${req.name}, retries=${req.retries}" }"#;
     let node = parse_doc(source);
     let analyzed = std::sync::Arc::new(relon_analyzer::analyze(&node));
-    assert_eq!(analyzed.input_decls.len(), 1);
+    assert!(analyzed.main_signature.is_some());
+    assert_eq!(analyzed.main_signature.as_ref().unwrap().params.len(), 1);
 
     let mut req = BTreeMap::new();
     req.insert("name".to_string(), Value::String("Alice".to_string()));
-    let mut pushed = BTreeMap::new();
-    pushed.insert("req".to_string(), Value::dict(req));
+    let mut args: HashMap<String, Value> = HashMap::new();
+    args.insert("req".to_string(), Value::dict(req));
 
     let ctx = Context::new()
         .with_root(node.clone())
-        .with_analyzed(std::sync::Arc::clone(&analyzed))
-        .with_input(Value::dict(pushed));
+        .with_analyzed(std::sync::Arc::clone(&analyzed));
     let result = Evaluator::new(std::sync::Arc::new(ctx))
-        .eval_root(&std::sync::Arc::new(Scope::default()))
+        .run_main(&std::sync::Arc::new(Scope::default()), args)
         .unwrap();
     let Value::Dict(d) = result else { panic!() };
     assert_eq!(
@@ -2194,36 +2171,32 @@ fn single_input_slot_validates_and_fills_defaults() {
 }
 
 #[test]
-fn multi_input_slots_merge_into_wrapper() {
-    // Two `@input(...)` decorators each declare their own slot; the
-    // runtime merges them into a virtual wrapper schema and validates
-    // each slot against its own SchemaRef.
-    use std::collections::BTreeMap;
-    let source = r#"@input(user=User)
-@input(cart=Cart)
-{
-    @schema User: { String name: * },
-    @schema Cart: { Int total: * },
-    summary: f"${input.user.name} - ${input.cart.total}"
-}"#;
+fn run_main_with_multiple_params() {
+    // Multi-parameter `#main(...)` binds each arg into the root scope's
+    // locals — no `input.` prefix. References to each parameter from
+    // the body resolve directly through scope.
+    use std::collections::{BTreeMap, HashMap};
+    let source = r#"#schema User { String name: * }
+#schema Cart { Int total: * }
+#main(user: User, cart: Cart)
+{ summary: f"${user.name} - ${cart.total}" }"#;
     let node = parse_doc(source);
     let analyzed = std::sync::Arc::new(relon_analyzer::analyze(&node));
-    assert_eq!(analyzed.input_decls.len(), 2);
+    assert!(analyzed.main_signature.is_some());
 
     let mut user = BTreeMap::new();
     user.insert("name".to_string(), Value::String("Alice".to_string()));
     let mut cart = BTreeMap::new();
     cart.insert("total".to_string(), Value::Int(100));
-    let mut pushed = BTreeMap::new();
-    pushed.insert("user".to_string(), Value::dict(user));
-    pushed.insert("cart".to_string(), Value::dict(cart));
+    let mut args: HashMap<String, Value> = HashMap::new();
+    args.insert("user".to_string(), Value::dict(user));
+    args.insert("cart".to_string(), Value::dict(cart));
 
     let ctx = Context::new()
         .with_root(node.clone())
-        .with_analyzed(std::sync::Arc::clone(&analyzed))
-        .with_input(Value::dict(pushed));
+        .with_analyzed(std::sync::Arc::clone(&analyzed));
     let result = Evaluator::new(std::sync::Arc::new(ctx))
-        .eval_root(&std::sync::Arc::new(Scope::default()))
+        .run_main(&std::sync::Arc::new(Scope::default()), args)
         .unwrap();
     let Value::Dict(d) = result else { panic!() };
     assert_eq!(
@@ -2233,220 +2206,125 @@ fn multi_input_slots_merge_into_wrapper() {
 }
 
 #[test]
-fn input_slot_rejects_value_missing_required_field() {
-    // Host pushes a dict whose slot lacks a required schema field.
-    // Evaluation fails before the body walks.
-    use std::collections::BTreeMap;
-    let source = r#"@input(req=Req)
-{
-    @schema Req: {
-        String name: *,
-        Int retries: *
-    },
-    greeting: input.req.name
-}"#;
+fn run_main_missing_arg_errors() {
+    // Host fails to push a value for a declared parameter — surface a
+    // `MissingMainArg` immediately.
+    use std::collections::HashMap;
+    let source = r#"#schema Req { String name: * }
+#main(req: Req)
+{ greeting: req.name }"#;
     let node = parse_doc(source);
     let analyzed = std::sync::Arc::new(relon_analyzer::analyze(&node));
-
-    let mut req = BTreeMap::new();
-    req.insert("name".to_string(), Value::String("Alice".to_string()));
-    let mut pushed = BTreeMap::new();
-    pushed.insert("req".to_string(), Value::dict(req));
-
     let ctx = Context::new()
         .with_root(node.clone())
-        .with_analyzed(std::sync::Arc::clone(&analyzed))
-        .with_input(Value::dict(pushed));
-    let result =
-        Evaluator::new(std::sync::Arc::new(ctx)).eval_root(&std::sync::Arc::new(Scope::default()));
-    assert!(
-        matches!(
-            &result,
-            Err(RuntimeError::TypeMismatch { expected, found, .. })
-                if expected == "field 'retries'" && found == "missing"
-        ),
-        "expected TypeMismatch about missing `retries`, got {result:?}"
-    );
-}
-
-#[test]
-fn input_decl_without_with_input_call_errors_clearly() {
-    // File declares `@input(...)` but host forgot to call
-    // `with_input`. Evaluation surfaces a contract violation
-    // immediately with a clear error.
-    let source = r#"@input(req=Req)
-{
-    @schema Req: { String name: * },
-    greeting: input.req.name
-}"#;
-    let node = parse_doc(source);
-    let analyzed = std::sync::Arc::new(relon_analyzer::analyze(&node));
-
-    let ctx = Context::new()
-        .with_root(node.clone())
-        .with_analyzed(analyzed);
-    let result =
-        Evaluator::new(std::sync::Arc::new(ctx)).eval_root(&std::sync::Arc::new(Scope::default()));
-    assert!(
-        matches!(&result, Err(RuntimeError::TypeMismatch { found, .. }) if found.contains("no input")),
-        "expected TypeMismatch about missing input, got {result:?}"
-    );
-}
-
-#[test]
-fn input_slot_missing_in_pushed_dict_fails() {
-    // Host pushes a dict that doesn't include all declared slots —
-    // each missing slot is a contract violation.
-    use std::collections::BTreeMap;
-    let source = r#"@input(user=User)
-@input(cart=Cart)
-{
-    @schema User: { String name: * },
-    @schema Cart: { Int total: * },
-    summary: input.user.name
-}"#;
-    let node = parse_doc(source);
-    let analyzed = std::sync::Arc::new(relon_analyzer::analyze(&node));
-
-    let mut user = BTreeMap::new();
-    user.insert("name".to_string(), Value::String("Alice".to_string()));
-    let mut pushed = BTreeMap::new();
-    pushed.insert("user".to_string(), Value::dict(user));
-    // `cart` slot intentionally omitted.
-
-    let ctx = Context::new()
-        .with_root(node.clone())
-        .with_analyzed(std::sync::Arc::clone(&analyzed))
-        .with_input(Value::dict(pushed));
-    let result =
-        Evaluator::new(std::sync::Arc::new(ctx)).eval_root(&std::sync::Arc::new(Scope::default()));
-    assert!(
-        matches!(
-            &result,
-            Err(RuntimeError::TypeMismatch { expected, found, .. })
-                if expected == "input slot 'cart'" && found == "missing"
-        ),
-        "expected TypeMismatch about missing slot 'cart', got {result:?}"
-    );
-}
-
-#[test]
-fn duplicate_input_slot_name_is_an_analyzer_error() {
-    // Two `@input(...)` decorations claiming the same slot name make
-    // the merged wrapper ambiguous; the analyzer rejects this so the
-    // host can short-circuit before evaluation.
-    let node = parse_doc(
-        r#"@input(req=A)
-@input(req=B)
-{
-    @schema A: { String x: * },
-    @schema B: { String y: * }
-}"#,
-    );
-    let analyzed = relon_analyzer::analyze(&node);
-    assert!(analyzed.has_errors());
-    assert!(
-        analyzed
-            .diagnostics
-            .iter()
-            .any(|d| matches!(d, relon_analyzer::Diagnostic::DuplicateInputName { name, .. } if name == "req")),
-        "expected DuplicateInputName(req), got {:?}",
-        analyzed.diagnostics
-    );
-}
-
-#[test]
-fn input_decorator_missing_name_is_an_analyzer_error() {
-    // `@input(SchemaRef)` (positional) — slot name missing — must be
-    // rejected. Each slot must carry an explicit identifier so the
-    // merged wrapper has unambiguous fields.
-    let node = parse_doc(
-        r#"@input(Req)
-{
-    @schema Req: { String name: * },
-    out: input.req.name
-}"#,
-    );
-    let analyzed = relon_analyzer::analyze(&node);
-    assert!(analyzed.has_errors());
-    assert!(
-        analyzed.diagnostics.iter().any(|d| matches!(
-            d,
-            relon_analyzer::Diagnostic::InputDecoratorMissingName { .. }
-        )),
-        "expected InputDecoratorMissingName, got {:?}",
-        analyzed.diagnostics
-    );
-}
-
-#[test]
-fn empty_input_decorator_is_an_analyzer_error() {
-    // `@input` with zero args has no effect on the contract; flagging
-    // it as an error catches typos like a forgotten parameter list.
-    let node = parse_doc(
-        r#"@input
-{
-    @schema A: { String x: * },
-    out: 1
-}"#,
-    );
-    let analyzed = relon_analyzer::analyze(&node);
-    assert!(analyzed.has_errors());
-    assert!(
-        analyzed
-            .diagnostics
-            .iter()
-            .any(|d| matches!(d, relon_analyzer::Diagnostic::InputDecoratorEmpty { .. })),
-        "expected InputDecoratorEmpty, got {:?}",
-        analyzed.diagnostics
-    );
-}
-
-#[test]
-fn input_reserved_name_resolves_to_pushed_value() {
-    // The push-by-default channel: host calls `with_input(...)` and the
-    // script reaches the data through the reserved root name `input`.
-    use std::collections::BTreeMap;
-    let node = parse_doc(r#"{ greeting: "hi " + input.name }"#);
-    let mut user = BTreeMap::new();
-    user.insert("name".to_string(), Value::String("Alice".to_string()));
-    let ctx = Context::new()
-        .with_root(node.clone())
-        .with_input(Value::dict(user));
+        .with_analyzed(std::sync::Arc::clone(&analyzed));
     let result = Evaluator::new(std::sync::Arc::new(ctx))
-        .eval_root(&std::sync::Arc::new(Scope::default()))
-        .unwrap();
-    let Value::Dict(d) = result else { panic!() };
-    assert_eq!(
-        d.map.get("greeting").unwrap(),
-        &Value::String("hi Alice".to_string())
+        .run_main(&std::sync::Arc::new(Scope::default()), HashMap::new());
+    assert!(
+        matches!(&result, Err(RuntimeError::MissingMainArg { name, .. }) if name == "req"),
+        "expected MissingMainArg(req), got {result:?}"
     );
 }
 
 #[test]
-fn input_without_with_input_call_fails_with_variable_not_found() {
-    // Reading `input.foo` when no host pushed any input must surface a
-    // hard error — not a silent `null`. Missing input is a host bug
-    // and the error message points back at it.
-    let node = parse_doc(r#"{ greeting: "hi " + input.name }"#);
-    let ctx = Context::new().with_root(node.clone());
-    let result =
-        Evaluator::new(std::sync::Arc::new(ctx)).eval_root(&std::sync::Arc::new(Scope::default()));
+fn run_main_unexpected_arg_errors() {
+    // Host pushes a name not declared by `#main(...)`. The signature is
+    // strict — extras are rejected so the host catches typos early.
+    use std::collections::HashMap;
+    let source = r#"#schema Req { String name: * }
+#main(req: Req)
+{ ok: 1 }"#;
+    let node = parse_doc(source);
+    let analyzed = std::sync::Arc::new(relon_analyzer::analyze(&node));
+    let mut args: HashMap<String, Value> = HashMap::new();
+    let mut req = std::collections::BTreeMap::new();
+    req.insert("name".to_string(), Value::String("A".to_string()));
+    args.insert("req".to_string(), Value::dict(req));
+    args.insert("bogus".to_string(), Value::Int(0));
+    let ctx = Context::new()
+        .with_root(node.clone())
+        .with_analyzed(std::sync::Arc::clone(&analyzed));
+    let result = Evaluator::new(std::sync::Arc::new(ctx))
+        .run_main(&std::sync::Arc::new(Scope::default()), args);
     assert!(
-        matches!(&result, Err(RuntimeError::VariableNotFound(name, _)) if name.starts_with("input")),
-        "expected VariableNotFound about input, got {result:?}"
+        matches!(&result, Err(RuntimeError::UnexpectedMainArg { name, .. }) if name == "bogus"),
+        "expected UnexpectedMainArg(bogus), got {result:?}"
+    );
+}
+
+#[test]
+fn run_main_arg_type_mismatch_errors() {
+    // Pushed value's type doesn't match the declared parameter type.
+    // Surface `MainArgTypeMismatch` rather than letting the body
+    // explode mid-evaluation.
+    use std::collections::HashMap;
+    let source = r#"#main(n: Int)
+{ ok: n + 1 }"#;
+    let node = parse_doc(source);
+    let analyzed = std::sync::Arc::new(relon_analyzer::analyze(&node));
+    let mut args: HashMap<String, Value> = HashMap::new();
+    args.insert("n".to_string(), Value::String("not an int".to_string()));
+    let ctx = Context::new()
+        .with_root(node.clone())
+        .with_analyzed(std::sync::Arc::clone(&analyzed));
+    let result = Evaluator::new(std::sync::Arc::new(ctx))
+        .run_main(&std::sync::Arc::new(Scope::default()), args);
+    assert!(
+        matches!(&result, Err(RuntimeError::MainArgTypeMismatch { name, .. }) if name == "n"),
+        "expected MainArgTypeMismatch(n), got {result:?}"
+    );
+}
+
+#[test]
+fn run_main_without_signature_errors() {
+    // File without `#main(...)` cannot be `run_main`-ed; libraries /
+    // static configs use `eval_root` instead.
+    use std::collections::HashMap;
+    let source = r#"{ ok: 1 }"#;
+    let node = parse_doc(source);
+    let analyzed = std::sync::Arc::new(relon_analyzer::analyze(&node));
+    assert!(analyzed.main_signature.is_none());
+    let ctx = Context::new()
+        .with_root(node.clone())
+        .with_analyzed(std::sync::Arc::clone(&analyzed));
+    let result = Evaluator::new(std::sync::Arc::new(ctx))
+        .run_main(&std::sync::Arc::new(Scope::default()), HashMap::new());
+    assert!(
+        matches!(&result, Err(RuntimeError::NoMainSignature { .. })),
+        "expected NoMainSignature, got {result:?}"
+    );
+}
+
+#[test]
+fn duplicate_main_directive_is_an_analyzer_error() {
+    // A file may declare at most one `#main(...)`; later declarations
+    // are flagged as `DuplicateMainDirective`.
+    let node = parse_doc(
+        r#"#main(a: Int)
+#main(b: Int)
+{ ok: 1 }"#,
+    );
+    let analyzed = relon_analyzer::analyze(&node);
+    assert!(analyzed.has_errors());
+    assert!(
+        analyzed
+            .diagnostics
+            .iter()
+            .any(|d| matches!(d, relon_analyzer::Diagnostic::DuplicateMainDirective { .. })),
+        "expected DuplicateMainDirective, got {:?}",
+        analyzed.diagnostics
     );
 }
 
 #[test]
 fn private_field_is_dropped_from_dict_map_but_visible_to_siblings() {
-    // `@private` keeps a binding alive in the owning dict's locals so
+    // `#private` keeps a binding alive in the owning dict's locals so
     // siblings can reference it, while excluding it from the produced
     // `Value::Dict::map`. Net effect: `display` resolves correctly,
     // but the consumer never sees `helper` in the output.
     let result = eval_doc(
         r#"{
-            @private
+            #private
             helper(v): "<" + v + ">",
             display: helper("hi")
         }"#,
@@ -2467,10 +2345,10 @@ fn private_field_is_dropped_from_dict_map_but_visible_to_siblings() {
 #[test]
 fn private_value_field_is_also_dropped_from_dict_map() {
     // The marker isn't closure-specific: any field type — including
-    // plain strings — disappears from the map when `@private`.
+    // plain strings — disappears from the map when `#private`.
     let result = eval_doc(
         r#"{
-            @private
+            #private
             secret: "shhh",
             public: &sibling.secret + " (declassified)"
         }"#,
@@ -2486,7 +2364,7 @@ fn private_value_field_is_also_dropped_from_dict_map() {
 
 #[test]
 fn private_field_is_not_visible_through_alias_import() {
-    // After `@import("lib", as="lib")`, only fields present in the
+    // After `#import lib from "lib"`, only fields present in the
     // module's exported `Value::Dict::map` are reachable. Private
     // fields aren't, so `lib.secret` fails with `VariableNotFound`.
     let dir = std::env::temp_dir().join(format!("relon-private-alias-{}", std::process::id()));
@@ -2494,7 +2372,7 @@ fn private_field_is_not_visible_through_alias_import() {
     std::fs::write(
         dir.join("lib.relon"),
         r#"{
-            @private
+            #private
             secret: "shhh",
             public: "ok"
         }"#,
@@ -2502,7 +2380,7 @@ fn private_field_is_not_visible_through_alias_import() {
     .unwrap();
 
     let node = parse_doc(
-        r#"@import("./lib.relon", as="lib")
+        r#"#import lib from "./lib.relon"
             { leak: lib.secret }"#,
     );
     let ctx = fully_granted_ctx().with_root(node.clone());
@@ -2530,7 +2408,7 @@ fn private_field_is_skipped_by_import_spread() {
     std::fs::write(
         dir.join("lib.relon"),
         r#"{
-            @private
+            #private
             internal: "kept inside",
             exported: "out"
         }"#,
@@ -2538,7 +2416,7 @@ fn private_field_is_skipped_by_import_spread() {
     .unwrap();
 
     let node = parse_doc(
-        r#"@import("./lib.relon", spread=true)
+        r#"#import * from "./lib.relon"
             { has_exported: exported, has_internal: internal }"#,
     );
     let ctx = fully_granted_ctx().with_root(node.clone());
@@ -2605,35 +2483,31 @@ fn underscore_prefix_no_longer_implies_private() {
 }
 
 #[test]
-fn root_schema_decorator_sugar_validates_input() {
-    // Happy path: `@schema(User=...)` declares a schema in the
-    // root-decorator stack; `@input(req=User)` references it the same
-    // way it would reference a dict-field `@schema User: ...`. The
-    // pushed input is validated against the inline schema.
-    use std::collections::BTreeMap;
-    let source = r#"@schema(User={ String name: *, Int age: * })
-@input(req=User)
-{
-    greeting: f"hello ${input.req.name}, age=${input.req.age}"
-}"#;
+fn root_schema_directive_validates_main_arg() {
+    // `#schema User ...` at root level seeds `User` into scope; the
+    // following `#main(req: User)` references it the same way as a
+    // dict-field `#schema User ...` would.
+    use std::collections::{BTreeMap, HashMap};
+    let source = r#"#schema User { String name: *, Int age: * }
+#main(req: User)
+{ greeting: f"hello ${req.name}, age=${req.age}" }"#;
     let node = parse_doc(source);
     let analyzed = std::sync::Arc::new(relon_analyzer::analyze(&node));
     assert_eq!(analyzed.root_schemas.len(), 1);
     assert_eq!(analyzed.root_schemas[0].name, "User");
-    assert_eq!(analyzed.input_decls.len(), 1);
+    assert!(analyzed.main_signature.is_some());
 
     let mut req = BTreeMap::new();
     req.insert("name".to_string(), Value::String("Alice".to_string()));
     req.insert("age".to_string(), Value::Int(30));
-    let mut pushed = BTreeMap::new();
-    pushed.insert("req".to_string(), Value::dict(req));
+    let mut args: HashMap<String, Value> = HashMap::new();
+    args.insert("req".to_string(), Value::dict(req));
 
     let ctx = Context::new()
         .with_root(node.clone())
-        .with_analyzed(std::sync::Arc::clone(&analyzed))
-        .with_input(Value::dict(pushed));
+        .with_analyzed(std::sync::Arc::clone(&analyzed));
     let result = Evaluator::new(std::sync::Arc::new(ctx))
-        .eval_root(&std::sync::Arc::new(Scope::default()))
+        .run_main(&std::sync::Arc::new(Scope::default()), args)
         .unwrap();
     let Value::Dict(d) = result else { panic!() };
     assert_eq!(
@@ -2643,36 +2517,31 @@ fn root_schema_decorator_sugar_validates_input() {
 }
 
 #[test]
-fn root_schema_decorator_supports_multiple_named_args() {
-    // `@schema(User=..., Cart=...)` registers two schemas at once;
-    // each `@input(slot=Name)` resolves through the same scope.
-    use std::collections::BTreeMap;
-    let source = r#"@schema(User={ String name: * })
-@schema(Cart={ Int total: * })
-@input(user=User)
-@input(cart=Cart)
-{
-    summary: f"${input.user.name} - ${input.cart.total}"
-}"#;
+fn root_schema_directive_supports_multiple_declarations() {
+    // Stack two `#schema A ...` directives at the root level — each
+    // `#main(...)` parameter resolves through the merged scope.
+    use std::collections::{BTreeMap, HashMap};
+    let source = r#"#schema User { String name: * }
+#schema Cart { Int total: * }
+#main(user: User, cart: Cart)
+{ summary: f"${user.name} - ${cart.total}" }"#;
     let node = parse_doc(source);
     let analyzed = std::sync::Arc::new(relon_analyzer::analyze(&node));
     assert_eq!(analyzed.root_schemas.len(), 2);
-    assert_eq!(analyzed.input_decls.len(), 2);
 
     let mut user = BTreeMap::new();
     user.insert("name".to_string(), Value::String("Alice".to_string()));
     let mut cart = BTreeMap::new();
     cart.insert("total".to_string(), Value::Int(100));
-    let mut pushed = BTreeMap::new();
-    pushed.insert("user".to_string(), Value::dict(user));
-    pushed.insert("cart".to_string(), Value::dict(cart));
+    let mut args: HashMap<String, Value> = HashMap::new();
+    args.insert("user".to_string(), Value::dict(user));
+    args.insert("cart".to_string(), Value::dict(cart));
 
     let ctx = Context::new()
         .with_root(node.clone())
-        .with_analyzed(std::sync::Arc::clone(&analyzed))
-        .with_input(Value::dict(pushed));
+        .with_analyzed(std::sync::Arc::clone(&analyzed));
     let result = Evaluator::new(std::sync::Arc::new(ctx))
-        .eval_root(&std::sync::Arc::new(Scope::default()))
+        .run_main(&std::sync::Arc::new(Scope::default()), args)
         .unwrap();
     let Value::Dict(d) = result else { panic!() };
     assert_eq!(
@@ -2682,11 +2551,11 @@ fn root_schema_decorator_supports_multiple_named_args() {
 }
 
 #[test]
-fn root_schema_decorator_visible_inside_dict_body() {
-    // Schemas declared via `@schema(Name=...)` at the root must also
+fn root_schema_directive_visible_inside_dict_body() {
+    // Schemas declared via `#schema Name ...` at the root must also
     // resolve from inside the dict body — `Name { ... }` should bind
-    // to the same `Value::Schema` the input pass uses.
-    let source = r#"@schema(User={ String name: *, Int age: * })
+    // to the same `Value::Schema` the analyzer registers.
+    let source = r#"#schema User { String name: *, Int age: * }
 {
     User alice: { name: "Alice", age: 30 }
 }"#;
@@ -2710,92 +2579,12 @@ fn root_schema_decorator_visible_inside_dict_body() {
 }
 
 #[test]
-fn root_schema_decorator_mixes_with_field_form() {
-    // `@schema(User=...)` at root + `@schema Cart: {...}` as a field
-    // both compose into the same scope. `@input(...)` references each
-    // by name without caring which form declared it.
-    use std::collections::BTreeMap;
-    let source = r#"@schema(User={ String name: * })
-@input(user=User)
-@input(cart=Cart)
-{
-    @schema Cart: { Int total: * },
-    summary: f"${input.user.name} - ${input.cart.total}"
-}"#;
-    let node = parse_doc(source);
-    let analyzed = std::sync::Arc::new(relon_analyzer::analyze(&node));
-    assert_eq!(analyzed.root_schemas.len(), 1);
-    assert_eq!(analyzed.input_decls.len(), 2);
-    assert!(!analyzed.has_errors(), "{:?}", analyzed.diagnostics);
-
-    let mut user = BTreeMap::new();
-    user.insert("name".to_string(), Value::String("Alice".to_string()));
-    let mut cart = BTreeMap::new();
-    cart.insert("total".to_string(), Value::Int(100));
-    let mut pushed = BTreeMap::new();
-    pushed.insert("user".to_string(), Value::dict(user));
-    pushed.insert("cart".to_string(), Value::dict(cart));
-
-    let ctx = Context::new()
-        .with_root(node.clone())
-        .with_analyzed(std::sync::Arc::clone(&analyzed))
-        .with_input(Value::dict(pushed));
-    let result = Evaluator::new(std::sync::Arc::new(ctx))
-        .eval_root(&std::sync::Arc::new(Scope::default()))
-        .unwrap();
-    let Value::Dict(d) = result else { panic!() };
-    assert_eq!(
-        d.map.get("summary").unwrap(),
-        &Value::String("Alice - 100".to_string())
-    );
-}
-
-#[test]
-fn root_schema_positional_arg_is_an_analyzer_error() {
-    // `@schema({...})` (positional, no name) cannot be desugared into a
-    // named schema declaration. Analyzer rejects it.
-    let node = parse_doc(
-        r#"@schema({ String name: * })
-{ greeting: "hi" }"#,
-    );
-    let analyzed = relon_analyzer::analyze(&node);
-    assert!(analyzed.has_errors());
-    assert!(
-        analyzed.diagnostics.iter().any(|d| matches!(
-            d,
-            relon_analyzer::Diagnostic::RootSchemaDecoratorMissingName { .. }
-        )),
-        "expected RootSchemaDecoratorMissingName, got {:?}",
-        analyzed.diagnostics
-    );
-}
-
-#[test]
-fn empty_root_schema_decorator_is_an_analyzer_error() {
-    // `@schema()` with no args has no effect; flag as a typo trap.
-    let node = parse_doc(
-        r#"@schema()
-{ greeting: "hi" }"#,
-    );
-    let analyzed = relon_analyzer::analyze(&node);
-    assert!(analyzed.has_errors());
-    assert!(
-        analyzed.diagnostics.iter().any(|d| matches!(
-            d,
-            relon_analyzer::Diagnostic::RootSchemaDecoratorEmpty { .. }
-        )),
-        "expected RootSchemaDecoratorEmpty, got {:?}",
-        analyzed.diagnostics
-    );
-}
-
-#[test]
 fn duplicate_root_schema_name_is_an_analyzer_error() {
-    // Two `@schema(...)` decorations claiming the same schema name
+    // Two `#schema A ...` directives claiming the same schema name
     // would shadow each other; reject up front.
     let node = parse_doc(
-        r#"@schema(User={ String name: * })
-@schema(User={ Int age: * })
+        r#"#schema User { String name: * }
+#schema User { Int age: * }
 { greeting: "hi" }"#,
     );
     let analyzed = relon_analyzer::analyze(&node);
@@ -2811,33 +2600,10 @@ fn duplicate_root_schema_name_is_an_analyzer_error() {
 }
 
 #[test]
-fn root_schema_collides_with_field_schema() {
-    // Same name declared in both forms is ambiguous about which body
-    // wins; analyzer reports it instead of silently picking one.
-    let node = parse_doc(
-        r#"@schema(User={ String name: * })
-{
-    @schema User: { Int age: * },
-    greeting: "hi"
-}"#,
-    );
-    let analyzed = relon_analyzer::analyze(&node);
-    assert!(analyzed.has_errors());
-    assert!(
-        analyzed
-            .diagnostics
-            .iter()
-            .any(|d| matches!(d, relon_analyzer::Diagnostic::RootSchemaCollidesWithField { name, .. } if name == "User")),
-        "expected RootSchemaCollidesWithField(User), got {:?}",
-        analyzed.diagnostics
-    );
-}
-
-#[test]
 fn root_schema_invalid_value_type_is_an_analyzer_error() {
-    // `@schema(Name=42)` — the RHS isn't a schema body. Static reject.
+    // `#schema Foo 42` — the body isn't a schema body. Static reject.
     let node = parse_doc(
-        r#"@schema(Foo=42)
+        r#"#schema Foo 42
 { greeting: "hi" }"#,
     );
     let analyzed = relon_analyzer::analyze(&node);
@@ -2849,5 +2615,65 @@ fn root_schema_invalid_value_type_is_an_analyzer_error() {
             .any(|d| matches!(d, relon_analyzer::Diagnostic::RootSchemaInvalidValue { name, .. } if name == "Foo")),
         "expected RootSchemaInvalidValue(Foo), got {:?}",
         analyzed.diagnostics
+    );
+}
+
+#[test]
+fn user_defined_decorator_applies_closure_to_value() {
+    // `@f` looks up `f` as a callable in scope when no built-in plugin
+    // matches. `@upper "hello"` ≡ `upper("hello")`, where `upper` is a
+    // closure defined as a sibling.
+    let result = eval_doc(
+        r#"{
+            #private
+            shout(s): s + "!",
+            greeting: @shout "hello"
+        }"#,
+    )
+    .unwrap();
+    let Value::Dict(d) = result else { panic!() };
+    assert_eq!(
+        d.map.get("greeting").unwrap(),
+        &Value::String("hello!".to_string())
+    );
+}
+
+#[test]
+fn user_defined_decorator_with_extra_args() {
+    // `@f(a, b)` on `v` ≡ `f(v, a, b)`. Args after the decorated value
+    // are appended to the call.
+    let result = eval_doc(
+        r#"{
+            #private
+            wrap(s, l, r): l + s + r,
+            display: @wrap("[", "]") "core"
+        }"#,
+    )
+    .unwrap();
+    let Value::Dict(d) = result else { panic!() };
+    assert_eq!(
+        d.map.get("display").unwrap(),
+        &Value::String("[core]".to_string())
+    );
+}
+
+#[test]
+fn user_defined_decorator_stack_is_innermost_first() {
+    // `@a @b v` ≡ `a(b(v))` — bottom-up, nearest-to-value first.
+    let result = eval_doc(
+        r#"{
+            #private
+            paren(s): "(" + s + ")",
+            #private
+            star(s): "*" + s + "*",
+            display: @star @paren "x"
+        }"#,
+    )
+    .unwrap();
+    let Value::Dict(d) = result else { panic!() };
+    // bottom-up: paren("x") = "(x)", star("(x)") = "*(x)*"
+    assert_eq!(
+        d.map.get("display").unwrap(),
+        &Value::String("*(x)*".to_string())
     );
 }

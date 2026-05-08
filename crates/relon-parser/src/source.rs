@@ -45,6 +45,8 @@ pub enum SourceTokenKind {
     Colon,
     Dot,
     At,
+    /// `#` directive sigil (introduced in batch 3).
+    Hash,
     Amp,
     Question,
     Ellipsis,
@@ -133,6 +135,7 @@ fn scan_token(source: &str, index: usize) -> Result<(SourceTokenKind, usize), To
         ':' => SourceTokenKind::Colon,
         '.' => SourceTokenKind::Dot,
         '@' => SourceTokenKind::At,
+        '#' => SourceTokenKind::Hash,
         '&' => SourceTokenKind::Amp,
         '?' => SourceTokenKind::Question,
         '=' => SourceTokenKind::Equal,

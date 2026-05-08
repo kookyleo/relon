@@ -46,12 +46,6 @@ pub enum Error {
 
     #[error("failed to convert Relon value to JSON: schemas are not supported in JSON output")]
     UnsupportedSchema,
-
-    /// A file marked `@library` was used as the host evaluation entry.
-    /// Library files are import-only — the host should evaluate the
-    /// business-team file that imports them instead.
-    #[error("Relon file{} is marked @library and cannot be evaluated as an entry", match .name { Some(n) => format!(" {n}"), None => String::new() })]
-    LibraryAsEntry { name: Option<String> },
 }
 
 pub fn from_str<T>(source: &str) -> Result<T>
@@ -154,7 +148,7 @@ fn evaluate_source(
     let node = parse_document(source).map_err(|err| Error::Parse(err.to_string()))?;
 
     // Run the analyzer first so any structural problems (malformed
-    // `@schema`, untyped schema fields, ...) surface as a batched
+    // `#schema`, untyped schema fields, ...) surface as a batched
     // `Error::Analyze` before we touch the evaluator. Diagnostics at
     // `Error` severity short-circuit; warnings are silently attached to
     // the evaluator context for runtime fast-paths.
@@ -163,12 +157,6 @@ fn evaluate_source(
         return Err(Error::Analyze(analyzed.take_diagnostics()));
     }
     let cache_namespace = cache_namespace.into();
-    // Host-entry safety: `@library` files are import-only. Lower-level
-    // callers (`Evaluator::eval` directly) deliberately bypass this check.
-    if analyzed.is_library {
-        let name = (cache_namespace != "<memory>").then(|| cache_namespace.clone());
-        return Err(Error::LibraryAsEntry { name });
-    }
     let analyzed = Arc::new(analyzed);
 
     // `value_from_str` / `value_from_file` are the host's "evaluate
@@ -223,7 +211,7 @@ mod tests {
     fn deserializes_from_str() {
         let config: ServerConfig = from_str(
             r#"{
-            @private
+            #private
             format(v): "port=" + v,
             host: "localhost",
             base: { port: 8080 },
@@ -315,20 +303,21 @@ mod tests {
         // analyzer should report both in a single batch instead of
         // bailing out on the first.
         let result = value_from_str(
-            r#"{
-                @schema BadBody: 42,
-                @schema BadField: { name: * }
-            }"#,
+            r#"#schema BadBody 42
+#schema BadField { name: * }
+{}"#,
         );
 
         let diags = match result {
             Err(Error::Analyze(diags)) => diags,
             other => panic!("expected Error::Analyze, got {other:?}"),
         };
-        assert_eq!(diags.len(), 2, "{diags:?}");
-        assert!(diags
-            .iter()
-            .any(|d| matches!(d, Diagnostic::SchemaBodyNotDict { .. })));
+        assert!(
+            diags
+                .iter()
+                .any(|d| matches!(d, Diagnostic::RootSchemaInvalidValue { name, .. } if name == "BadBody")),
+            "{diags:?}"
+        );
         assert!(diags
             .iter()
             .any(|d| matches!(d, Diagnostic::SchemaFieldUntyped { field, .. } if field == "name")));
@@ -340,10 +329,8 @@ mod tests {
         // succeed even on programs that would crash at runtime, as long
         // as the static structure is sound.
         let tree = analyze_from_str(
-            r#"{
-                @schema User: { String name: * },
-                missing: &sibling.does_not_exist
-            }"#,
+            r#"#schema User { String name: * }
+{ missing: &sibling.does_not_exist }"#,
         )
         .expect("analyze");
         assert!(!tree.has_errors(), "{:?}", tree.diagnostics);
@@ -359,13 +346,11 @@ mod tests {
     #[test]
     fn json_externally_tags_sum_type_variant() {
         let value = json_from_str(
-            r#"{
-                @schema Notification: Enum<
-                    Email { address: String, subject: String },
-                    Push,
-                >,
-                msg: Notification.Email { address: "a@b.c", subject: "hi" }
-            }"#,
+            r#"#schema Notification Enum<
+    Email { address: String, subject: String },
+    Push,
+>
+{ msg: Notification.Email { address: "a@b.c", subject: "hi" } }"#,
         )
         .unwrap();
         // The variant payload must be wrapped as `{ "Email": { ... } }`.
@@ -379,13 +364,11 @@ mod tests {
 
     #[test]
     fn json_keeps_plain_branded_dict_flat() {
-        // Non-variant branded dicts (`@schema Email { ... }` standalone)
+        // Non-variant branded dicts (`#schema Email { ... }` standalone)
         // serialize flat — only the sum-type variants get wrapped.
         let value = json_from_str(
-            r#"{
-                @schema Email: { String address: * },
-                Email e: { address: "x@y.z" }
-            }"#,
+            r#"#schema Email { String address: * }
+{ Email e: { address: "x@y.z" } }"#,
         )
         .unwrap();
         let e = value.get("e").expect("e key");
@@ -451,24 +434,17 @@ mod tests {
     }
 
     #[test]
-    fn library_marker_blocks_entry_evaluation() {
-        // Direct in-memory entry: no path is known, so `name` is None
-        // and the gate fires before any evaluation work happens.
-        let result = value_from_str(r#"@library { x: 1 }"#);
-        assert!(matches!(result, Err(Error::LibraryAsEntry { name: None })));
-    }
-
-    #[test]
-    fn library_marker_allows_use_as_import() {
-        // Library file is import-only: when another file `@import`s it,
+    fn library_file_imports_into_entry() {
+        // Library file is import-only: when another file `#import`s it,
         // evaluation must succeed and the imported bindings must flow
-        // through.
+        // through. The library has no `#main(...)` and is evaluated
+        // statically when used as an import.
         let dir = std::env::temp_dir().join(format!("relon-library-import-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("lib.relon"), r#"@library { greeting: "hi" }"#).unwrap();
+        std::fs::write(dir.join("lib.relon"), r#"{ greeting: "hi" }"#).unwrap();
         std::fs::write(
             dir.join("main.relon"),
-            r#"@import("./lib.relon", as="lib")
+            r#"#import lib from "./lib.relon"
             { msg: lib.greeting }"#,
         )
         .unwrap();
@@ -487,7 +463,7 @@ mod tests {
         std::fs::write(dir.join("shared.relon"), r#"{ greeting: "hi" }"#).unwrap();
         std::fs::write(
             dir.join("entry.relon"),
-            r#"@import("./shared.relon", as="s")
+            r#"#import s from "./shared.relon"
             { msg: s.greeting }"#,
         )
         .unwrap();

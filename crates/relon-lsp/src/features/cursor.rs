@@ -5,7 +5,9 @@
 //! answer "what is the user pointing at?". Position translation lives
 //! one module up in [`crate::position`].
 
-use relon_parser::{CallArg, Decorator, Expr, FStringPart, Node, TokenKey, TokenRange};
+use relon_parser::{
+    CallArg, Decorator, Directive, DirectiveBody, Expr, FStringPart, Node, TokenKey, TokenRange,
+};
 
 /// True iff `offset` falls inside `range` (start inclusive, end
 /// inclusive — so cursors right at the closing brace still bind to
@@ -48,12 +50,15 @@ fn range_size(range: TokenRange) -> usize {
 
 /// Yield expression-shaped children plus decorator argument values.
 /// Mirrors the analyzer's walker, with the addition of decorator
-/// args (so the cursor inside `@import("path")` lands on the path
+/// args (so the cursor inside `#import path from "path"` lands on the path
 /// literal node).
 fn children(node: &Node) -> Vec<&Node> {
     let mut out = Vec::new();
     for dec in &node.decorators {
         push_decorator_children(dec, &mut out);
+    }
+    for dir in &node.directives {
+        push_directive_children(dir, &mut out);
     }
     match &*node.expr {
         Expr::Dict(pairs) => {
@@ -129,5 +134,13 @@ fn children(node: &Node) -> Vec<&Node> {
 fn push_decorator_children<'a>(dec: &'a Decorator, out: &mut Vec<&'a Node>) {
     for CallArg { value, .. } in &dec.args {
         out.push(value);
+    }
+}
+
+fn push_directive_children<'a>(dir: &'a Directive, out: &mut Vec<&'a Node>) {
+    match &dir.body {
+        DirectiveBody::Value(body) => out.push(body),
+        DirectiveBody::NameBody { body, .. } => out.push(body),
+        DirectiveBody::Bare | DirectiveBody::Import { .. } | DirectiveBody::Main { .. } => {}
     }
 }

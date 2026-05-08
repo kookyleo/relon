@@ -5,7 +5,7 @@ use crate::value::{Value, ValueDict};
 use std::sync::Arc;
 
 pub fn register_to(ctx: &mut Context) {
-    // Language-level builtins — always in scope, no `@import` required.
+    // Language-level builtins — always in scope, no `#import` required.
     // See `docs/zh/guide/spec.md` §6.1: these are metadata operations
     // on data structures themselves, not std-module members.
     let len: Arc<dyn RelonFunction> = Arc::new(Len);
@@ -43,7 +43,7 @@ pub fn register_to(ctx: &mut Context) {
     ctx.register_fn("_math_clamp", Arc::new(MathClamp));
 
     // Schema-machinery validators. Spec §6.3 mandates these exist with
-    // the documented semantics; they're consumed by the `@schema`
+    // the documented semantics; they're consumed by the `#schema`
     // decorator, not by user-facing scripts directly.
     ctx.register_fn("ensure.int", Arc::new(ValidatorInt));
     ctx.register_fn("ensure.string", Arc::new(ValidatorString));

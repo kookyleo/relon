@@ -144,4 +144,48 @@ pub enum RuntimeError {
         #[label("call rejected by sandbox")]
         range: TokenRange,
     },
+
+    #[error("file has no `#main(...)` signature; cannot run as entry program")]
+    #[diagnostic(
+        code(relon::eval::no_main_signature),
+        help(
+            "Add `#main(arg: Type, ...)` to declare the file as an entry program, or evaluate it as a static config via `eval_root` instead of `run_main`."
+        )
+    )]
+    NoMainSignature {
+        #[label("no #main here")]
+        range: TokenRange,
+    },
+
+    #[error("missing argument `{name}` for `#main(...)`")]
+    #[diagnostic(
+        code(relon::eval::missing_main_arg),
+        help("The host must push a value for every parameter declared by `#main(...)`.")
+    )]
+    MissingMainArg {
+        name: String,
+        #[label("expected here")]
+        range: TokenRange,
+    },
+
+    #[error("unexpected argument `{name}`: not declared by `#main(...)`")]
+    #[diagnostic(
+        code(relon::eval::unexpected_main_arg),
+        help("Only parameters listed in `#main(...)` may be pushed; remove the extra entry or add it to the signature.")
+    )]
+    UnexpectedMainArg {
+        name: String,
+        #[label("not in signature")]
+        range: TokenRange,
+    },
+
+    #[error("type mismatch for `#main` arg `{name}`: expected {expected}, found {found}")]
+    #[diagnostic(code(relon::eval::main_arg_type_mismatch))]
+    MainArgTypeMismatch {
+        name: String,
+        expected: String,
+        found: String,
+        #[label("type mismatch")]
+        range: TokenRange,
+    },
 }

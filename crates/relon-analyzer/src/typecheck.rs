@@ -641,7 +641,7 @@ mod tests {
     fn flags_mismatch_inside_custom_schema_binding() {
         let tree = analyze_str(
             r#"{
-                @schema User: { String name: *, Int age: * },
+                #schema User { String name: *, Int age: * },
                 User alice: { name: "A", age: "thirty" }
             }"#,
         );
@@ -658,7 +658,7 @@ mod tests {
     fn flags_non_exhaustive_match_on_sum_enum() {
         let tree = analyze_str(
             r#"{
-                @schema N: Enum<A { x: Int }, B { y: Int }, C>,
+                #schema N Enum<A { x: Int }, B { y: Int }, C>,
                 N v: N.A { x: 1 },
                 out: v match {
                     A: 1,
@@ -689,7 +689,7 @@ mod tests {
     fn flags_unknown_variant_with_did_you_mean() {
         let tree = analyze_str(
             r#"{
-                @schema N: Enum<Email { x: Int }, SMS { y: Int }>,
+                #schema N Enum<Email { x: Int }, SMS { y: Int }>,
                 N v: N.Email { x: 1 },
                 out: v match {
                     EMail: 1,
@@ -718,7 +718,7 @@ mod tests {
     fn flags_duplicate_match_arm() {
         let tree = analyze_str(
             r#"{
-                @schema N: Enum<A { x: Int }, B { y: Int }>,
+                #schema N Enum<A { x: Int }, B { y: Int }>,
                 N v: N.A { x: 1 },
                 out: v match {
                     A: 1,
@@ -740,7 +740,7 @@ mod tests {
     fn wildcard_arm_satisfies_exhaustiveness() {
         let tree = analyze_str(
             r#"{
-                @schema N: Enum<A { x: Int }, B { y: Int }, C>,
+                #schema N Enum<A { x: Int }, B { y: Int }, C>,
                 N v: N.A { x: 1 },
                 out: v match {
                     A: 1,
@@ -763,7 +763,7 @@ mod tests {
         // exhaustiveness diagnostic should fire.
         let tree = analyze_str(
             r#"{
-                @schema N: Enum<A { x: Int }, B { y: Int }>,
+                #schema N Enum<A { x: Int }, B { y: Int }>,
                 mystery: 42,
                 out: mystery match {
                     A: 1

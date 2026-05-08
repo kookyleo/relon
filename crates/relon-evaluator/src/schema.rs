@@ -506,7 +506,8 @@ impl Evaluator {
             };
             for meta in &def.meta_decorators {
                 if let Some(plugin) = self.context.decorators.get(&meta.name).cloned() {
-                    let evaluated_args = self.evaluate_call_args(&meta.decorator.args, scope)?;
+                    let evaluated_args =
+                        self.evaluate_directive_meta_args(&meta.directive, scope)?;
                     plugin.schema_field_meta(
                         self,
                         &mut field,

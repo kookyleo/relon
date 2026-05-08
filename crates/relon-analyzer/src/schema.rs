@@ -1,6 +1,6 @@
 //! Schema desugar pass.
 //!
-//! Walks the root AST and, for every dict entry annotated with `@schema`,
+//! Walks the root AST and, for every dict entry annotated with `#schema`,
 //! lowers the right-hand side to a [`SchemaDef`] keyed by the value
 //! node's [`NodeId`]. The evaluator can then skip its own schema
 //! extraction for these nodes and just look up the pre-computed result.
@@ -11,8 +11,8 @@
 //! to resolve at runtime. Only the "obvious" static cases are handled
 //! here:
 //!
-//! * `@schema Name: { Type field: predicate, ... }`
-//! * `@schema Name: Base + { Type field: predicate, ... }` where `Base`
+//! * `#schema Name { Type field: predicate, ... }`
+//! * `#schema Name Base + { Type field: predicate, ... }` where `Base`
 //!   is a sibling identifier we can record by name (the evaluator still
 //!   composes the predicates at runtime).
 //!
@@ -20,23 +20,24 @@
 //! recorded with placeholders; this is a structural skeleton meant to
 //! support diagnostics + future passes, not full type-checking.
 
-use crate::decorator_names::{BRAND, DEFAULT, ERROR, EXPECT, MSG, SCHEMA, VALUE};
+use crate::decorator_names::VALUE;
 use crate::diagnostic::{span_of, Diagnostic};
+use crate::directive_names::{BRAND, DEFAULT, ERROR, EXPECT, MSG, SCHEMA};
 use crate::tree::AnalyzedTree;
 use relon_parser::{
-    type_node_from_brand_arg, Decorator, Expr, Node, NodeId, Operator, TokenKey, TokenRange,
-    TypeNode,
+    type_node_from_brand_arg, Directive, DirectiveBody, Expr, Node, NodeId, Operator, TokenKey,
+    TokenRange, TypeNode,
 };
 use std::sync::Arc;
 
-/// Static skeleton of a `@schema` definition. The evaluator owns the
+/// Static skeleton of a `#schema` definition. The evaluator owns the
 /// authoritative runtime form (`Value::Schema` with closure predicates);
 /// this is the AST-level shape that LSP and lint passes can reason
 /// about without running the program.
 #[derive(Debug, Clone)]
 pub struct SchemaDef {
-    /// Identifier the schema was bound to (`@schema User: {...}` →
-    /// `"User"`). `None` for anonymous `@schema` annotations on data.
+    /// Identifier the schema was bound to (`#schema User {...}` →
+    /// `"User"`). `None` for anonymous `#schema` annotations on data.
     pub name: Option<String>,
     /// Generic type parameters declared by this schema (e.g. `Page<T>`).
     pub generics: Vec<String>,
@@ -51,7 +52,7 @@ pub struct SchemaDef {
     /// Source range of the schema body (for diagnostics / LSP hover).
     pub range: TokenRange,
     /// Tagged-enum variants, populated for sum-type schemas
-    /// (`@schema X: Enum<A { ... }, B>`). When non-empty, `fields` and
+    /// (`#schema X Enum<A { ... }, B>`). When non-empty, `fields` and
     /// `bases` are unused — the schema is consumed via variant
     /// construction and pattern matching instead of dict validation.
     pub variants: Vec<EnumVariant>,
@@ -83,13 +84,13 @@ pub struct SchemaFieldDef {
     /// hover docs and "predicate vs. wildcard" lint rules.
     pub is_wildcard: bool,
     /// Cheap pointer back to the original AST value node. The evaluator
-    /// uses this to instantiate predicate closures and run `@expect /
-    /// @default` decorator hooks without re-walking the body. Stored as
+    /// uses this to instantiate predicate closures and run `#expect /
+    /// #default` decorator hooks without re-walking the body. Stored as
     /// `Arc<Node>` so `SchemaDef` can be shared cheaply between analyzer
     /// passes, evaluator, and LSP consumers.
     pub value_node: Arc<Node>,
-    /// Names of decorators attached to the field (`@expect`, `@default`,
-    /// `@msg`, ...) in source order, paired with `Arc<Node>` references
+    /// Names of decorators attached to the field (`#expect`, `#default`,
+    /// `#msg`, ...) in source order, paired with `Arc<Node>` references
     /// to each decorator's argument list. The evaluator dispatches them
     /// by name through `schema_field_meta`, so the analyzer only needs
     /// to record the dispatch shape — not run the hooks itself.
@@ -98,15 +99,14 @@ pub struct SchemaFieldDef {
     pub doc_comment: Option<String>,
 }
 
-/// Static reference to a `@meta(...)` decorator attached to a schema
-/// field. The evaluator looks up the matching `DecoratorPlugin` by
-/// `name` and re-evaluates `args` at validation time (host-supplied
-/// plugins may want fresh arg values per call).
+/// Static reference to a `#meta ...` directive attached to a schema
+/// field. The evaluator looks up the matching directive plugin by `name`
+/// and re-evaluates the body at validation time.
 #[derive(Debug, Clone)]
 pub struct MetaDecoratorRef {
     pub name: String,
     pub range: TokenRange,
-    pub decorator: Arc<Decorator>,
+    pub directive: Arc<Directive>,
 }
 
 /// Static reference to a base schema in `Base + { ... }` composition.
@@ -120,53 +120,64 @@ pub struct BaseRef {
     pub node: Arc<Node>,
 }
 
-fn has_decorator_named(decorators: &[Decorator], target: &str) -> bool {
-    decorators.iter().any(|dec| {
-        dec.path.len() == 1 && matches!(&dec.path[0], TokenKey::String(s, _, _) if s == target)
-    })
-}
-
-fn has_schema_decorator(decorators: &[Decorator]) -> bool {
-    has_decorator_named(decorators, SCHEMA)
+#[allow(dead_code)]
+fn has_directive_named(directives: &[Directive], target: &str) -> bool {
+    directives.iter().any(|dir| dir.name == target)
 }
 
 /// Walk `root` and populate `tree.schemas` with every statically-classifiable
-/// `@schema` definition.
+/// `#schema` definition. Root-level name-body directives are owned by
+/// [`crate::root_schemas::collect_root_schemas`] (which keeps a separate
+/// list and reports its own diagnostics); this pass walks dict fields
+/// looking for the bare `#schema` directive on a `key: value` field —
+/// that's the dict-field form, equivalent to old batch-2 `#schema X: ...`.
 pub fn collect_schemas(root: &Node, tree: &mut AnalyzedTree) {
-    let Expr::Dict(pairs) = &*root.expr else {
+    if let Expr::Dict(pairs) = &*root.expr {
+        for (key, value) in pairs {
+            visit_field(key, value, tree);
+            visit_for_schemas(value, tree);
+        }
+    }
+}
+
+fn visit_field(key: &TokenKey, value: &Node, tree: &mut AnalyzedTree) {
+    let has_schema_directive = value
+        .directives
+        .iter()
+        .any(|dir| dir.name == SCHEMA && matches!(dir.body, DirectiveBody::Bare));
+    if !has_schema_directive {
         return;
-    };
+    }
 
-    for (key, value) in pairs {
-        if !has_schema_decorator(&value.decorators) {
-            continue;
-        }
-
-        let mut name = None;
-        let mut generics = Vec::new();
-
-        match key {
-            TokenKey::String(s, _, _) => name = Some(s.clone()),
-            TokenKey::Dynamic(node, _) => {
-                // Handle dynamic key that might be a Type representation (e.g. `[Page<T>]`)
-                // Alternatively, we can let relon-parser treat `Page<T>` as a valid dict key.
-                // Wait, in standard JSON, keys must be strings. In relon, keys can be identifiers.
-                // But `Page<T>` is not an identifier, it's a type expression.
-                // If it's parsed as `[Page<T>]` (Dynamic key), the inner node will be an Expr::Type.
-                if let Expr::Type(t) = &*node.expr {
-                    name = t.path.first().cloned();
-                    generics = t
-                        .generics
-                        .iter()
-                        .filter_map(|g| g.path.first().cloned())
-                        .collect();
-                }
+    let mut name = None;
+    let mut generics = Vec::new();
+    match key {
+        TokenKey::String(s, _, _) => name = Some(s.clone()),
+        TokenKey::Dynamic(node, _) => {
+            if let Expr::Type(t) = &*node.expr {
+                name = t.path.first().cloned();
+                generics = t
+                    .generics
+                    .iter()
+                    .filter_map(|g| g.path.first().cloned())
+                    .collect();
             }
-            _ => {}
         }
+        _ => {}
+    }
+    if let Some(def) = lower_schema(name, generics, value, tree) {
+        tree.schemas.insert(value.id, def);
+    }
+}
 
-        if let Some(def) = lower_schema(name, generics, value, tree) {
-            tree.schemas.insert(value.id, def);
+/// Recursively walk nested dict bodies looking for dict-field `#schema`
+/// directives. Each match is lowered into a [`SchemaDef`] keyed at the
+/// value node's id (analogous to batch 2's `#schema`-decorated fields).
+fn visit_for_schemas(node: &Node, tree: &mut AnalyzedTree) {
+    if let Expr::Dict(pairs) = &*node.expr {
+        for (key, value) in pairs {
+            visit_field(key, value, tree);
+            visit_for_schemas(value, tree);
         }
     }
 }
@@ -212,7 +223,7 @@ pub fn lower_schema_pure(
 /// pass refuses to interpret (and a diagnostic was emitted).
 fn walk_schema_body(node: &Node, def: &mut SchemaDef, tree: &mut AnalyzedTree) -> bool {
     match &*node.expr {
-        // `@schema X: Enum<...>` body — a Type whose head is `Enum`. Detect
+        // `#schema X Enum<...>` body — a Type whose head is `Enum`. Detect
         // tagged-enum form (alternatives carrying `variant_fields`) here so
         // the analyzer can expose `def.variants` to downstream passes.
         Expr::Type(t) if t.path.len() == 1 && t.path[0] == "Enum" => lower_enum_body(t, def, tree),
@@ -329,11 +340,11 @@ fn collect_fields(pairs: &[(TokenKey, Node)], def: &mut SchemaDef, tree: &mut An
         };
         let mut type_hint = value.type_hint.clone().or_else(|| value_as_type.clone());
 
-        // Schema-field-position `@brand(X) y: *` is the decorator-form
+        // Schema-field-position `#brand X y: *` is the directive-form
         // mirror of `X y: *`: lift the brand argument into the field's
         // type hint when no explicit prefix is present, and emit a
         // conflict diagnostic when both are.
-        if let Some((dec, brand_type)) = brand_decorator_type(value, field_name, tree) {
+        if let Some((dir, brand_type)) = brand_directive_type(value, field_name, tree) {
             match type_hint.as_ref() {
                 None => {
                     type_hint = Some(brand_type);
@@ -342,7 +353,7 @@ fn collect_fields(pairs: &[(TokenKey, Node)], def: &mut SchemaDef, tree: &mut An
                     tree.diagnostics.push(Diagnostic::SchemaFieldBrandConflict {
                         field: field_name.clone(),
                         type_prefix: format_type_node_simple(existing),
-                        range: span_of(dec.range),
+                        range: span_of(dir.range),
                     });
                 }
             }
@@ -355,18 +366,12 @@ fn collect_fields(pairs: &[(TokenKey, Node)], def: &mut SchemaDef, tree: &mut An
             });
         }
         let meta_decorators = value
-            .decorators
+            .directives
             .iter()
-            .filter_map(|dec| {
-                let name = match dec.path.first()? {
-                    TokenKey::String(s, _, _) => s.clone(),
-                    _ => return None,
-                };
-                Some(MetaDecoratorRef {
-                    name,
-                    range: dec.range,
-                    decorator: Arc::new(dec.clone()),
-                })
+            .map(|dir| MetaDecoratorRef {
+                name: dir.name.clone(),
+                range: dir.range,
+                directive: Arc::new(dir.clone()),
             })
             .collect();
         def.fields.push(SchemaFieldDef {
@@ -381,12 +386,20 @@ fn collect_fields(pairs: &[(TokenKey, Node)], def: &mut SchemaDef, tree: &mut An
     }
 }
 
-/// `@expect("...")` / `@brand(X)`-decorated entries inside a schema body
-/// don't need their own type prefix. `@expect` & friends are pure
-/// meta-decorators consumed by the evaluator; `@brand(X)` doubles as an
+/// `#expect ...` / `#brand X`-directive-marked entries inside a schema
+/// body don't need their own type prefix. `#expect` & friends are pure
+/// meta directives consumed by the evaluator; `#brand X` doubles as an
 /// implicit type prefix (lifted into `type_hint` by `collect_fields`).
-/// Skip the untyped-field diagnostic for both.
+/// `@value` (the only surviving `@`-decorator) is also accepted for
+/// historical parity. Skip the untyped-field diagnostic for any of these.
 fn is_field_skippable(value: &Node) -> bool {
+    let any_meta_directive = value
+        .directives
+        .iter()
+        .any(|dir| matches!(dir.name.as_str(), EXPECT | DEFAULT | MSG | ERROR | BRAND));
+    if any_meta_directive {
+        return true;
+    }
     value.decorators.iter().any(|dec| {
         dec.path
             .first()
@@ -394,45 +407,40 @@ fn is_field_skippable(value: &Node) -> bool {
                 TokenKey::String(name, _, _) => Some(name.as_str()),
                 _ => None,
             })
-            .map(|name| matches!(name, EXPECT | DEFAULT | MSG | ERROR | VALUE | BRAND))
+            .map(|name| name == VALUE)
             .unwrap_or(false)
     })
 }
 
-/// Look for a `@brand(...)` decorator on a schema field. Returns the first
-/// hit (decorator metadata + extracted [`TypeNode`]); pushes a diagnostic
-/// and returns `None` when the argument shape isn't a type. Multiple
-/// `@brand` on one field doesn't compose, so we only honor the first;
-/// later ones are silently ignored at this layer (the evaluator will
-/// either re-reject them or treat them as a no-op via the conflict path).
-fn brand_decorator_type<'a>(
+/// Look for a `#brand X` directive on a schema field. Returns the first
+/// hit (directive metadata + extracted [`TypeNode`]); pushes a
+/// diagnostic and returns `None` when the body isn't a type expression.
+/// Multiple `#brand` on one field doesn't compose, so we only honor the
+/// first.
+fn brand_directive_type<'a>(
     value: &'a Node,
     field_name: &str,
     tree: &mut AnalyzedTree,
-) -> Option<(&'a Decorator, TypeNode)> {
-    for dec in &value.decorators {
-        match dec.path.first() {
-            Some(TokenKey::String(s, _, _)) if s == BRAND => {}
-            _ => continue,
+) -> Option<(&'a Directive, TypeNode)> {
+    for dir in &value.directives {
+        if dir.name != BRAND {
+            continue;
         }
-        let arg = match dec.args.first() {
-            Some(a) if a.name.is_none() => a,
-            _ => {
-                tree.diagnostics
-                    .push(Diagnostic::SchemaFieldBrandInvalidArg {
-                        field: field_name.to_string(),
-                        range: span_of(dec.range),
-                    });
-                return None;
-            }
+        let DirectiveBody::Value(body) = &dir.body else {
+            tree.diagnostics
+                .push(Diagnostic::SchemaFieldBrandInvalidArg {
+                    field: field_name.to_string(),
+                    range: span_of(dir.range),
+                });
+            return None;
         };
-        match type_node_from_brand_arg(&arg.value.expr, dec.range) {
-            Some(t) => return Some((dec, t)),
+        match type_node_from_brand_arg(&body.expr, dir.range) {
+            Some(t) => return Some((dir, t)),
             None => {
                 tree.diagnostics
                     .push(Diagnostic::SchemaFieldBrandInvalidArg {
                         field: field_name.to_string(),
-                        range: span_of(dec.range),
+                        range: span_of(dir.range),
                     });
                 return None;
             }
@@ -485,7 +493,7 @@ mod tests {
     fn collects_simple_schema() {
         let tree = analyze_str(
             r#"{
-                @schema User: {
+                #schema User {
                     String name: *,
                     Int age: *
                 },
@@ -506,8 +514,8 @@ mod tests {
     fn records_base_for_composition() {
         let tree = analyze_str(
             r#"{
-                @schema Base: { String name: * },
-                @schema Derived: &sibling.Base + { Int age: * }
+                #schema Base { String name: * },
+                #schema Derived &sibling.Base + { Int age: * }
             }"#,
         );
         assert!(!tree.has_errors(), "{:?}", tree.diagnostics);
@@ -524,11 +532,14 @@ mod tests {
 
     #[test]
     fn diagnoses_non_dict_schema_body() {
-        let tree = analyze_str(r#"{ @schema Bad: 42 }"#);
+        // Root-level `#schema Bad 42` body is `42`, not a Dict / Enum
+        // / composition / alias. The root-schemas pass surfaces this
+        // as `RootSchemaInvalidValue` instead of `SchemaBodyNotDict`
+        // (the latter only fires for nested dict-field schemas).
+        let tree = analyze_str(r#"{ #schema Bad 42 }"#);
         assert!(tree.has_errors());
-        assert!(matches!(
-            tree.diagnostics.first(),
-            Some(Diagnostic::SchemaBodyNotDict { .. })
+        assert!(tree.diagnostics.iter().any(
+            |d| matches!(d, Diagnostic::RootSchemaInvalidValue { name, .. } if name == "Bad")
         ));
     }
 
@@ -536,7 +547,7 @@ mod tests {
     fn diagnoses_untyped_schema_field() {
         let tree = analyze_str(
             r#"{
-                @schema Bad: {
+                #schema Bad {
                     name: *
                 }
             }"#,
@@ -552,8 +563,8 @@ mod tests {
     fn skips_decorated_meta_fields_for_untyped_diagnostic() {
         let tree = analyze_str(
             r#"{
-                @schema OK: {
-                    @expect("required") String name: *
+                #schema OK {
+                    #expect "required" String name: *
                 }
             }"#,
         );
@@ -564,7 +575,7 @@ mod tests {
     fn lowers_sum_type_enum_schema() {
         let tree = analyze_str(
             r#"{
-                @schema Notification: Enum<
+                #schema Notification Enum<
                     Email { address: String, subject: String },
                     SMS { phone: String },
                     Push,
@@ -588,7 +599,7 @@ mod tests {
     fn lowers_single_variant_enum_schema() {
         let tree = analyze_str(
             r#"{
-                @schema Wrap: Enum<Only { v: Int }>
+                #schema Wrap Enum<Only { v: Int }>
             }"#,
         );
         assert!(!tree.has_errors(), "{:?}", tree.diagnostics);
@@ -607,7 +618,7 @@ mod tests {
         // is the classic heterogeneous-enum mistake.
         let tree = analyze_str(
             r#"{
-                @schema Mixed: Enum<"hot", Email { address: String }>
+                #schema Mixed Enum<"hot", Email { address: String }>
             }"#,
         );
         assert!(tree.has_errors(), "{:?}", tree.diagnostics);

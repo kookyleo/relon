@@ -88,7 +88,7 @@ mod tests {
 
     #[test]
     fn converts_schema_body_not_dict_to_lsp_error() {
-        let (diag, source) = first_diag("{ @schema Bad: 42 }");
+        let (diag, source) = first_diag("{ #schema Bad 42 }");
         let lsp = to_lsp(&diag, &source);
         assert_eq!(lsp.severity, Some(DiagnosticSeverity::ERROR));
         assert_eq!(lsp.source.as_deref(), Some("relon"));

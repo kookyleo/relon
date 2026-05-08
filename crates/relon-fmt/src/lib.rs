@@ -161,6 +161,11 @@ impl<'a> SourceFormatter<'a> {
                         self.write_plain("@");
                         Some(TokenKind::At)
                     }
+                    TokenKind::Hash => {
+                        self.write_value_prefix();
+                        self.write_plain("#");
+                        Some(TokenKind::Hash)
+                    }
                     TokenKind::Amp => {
                         self.write_value_prefix();
                         self.write_plain("&");
@@ -317,6 +322,7 @@ impl<'a> SourceFormatter<'a> {
                     | TokenKind::OpenBrace
                     | TokenKind::OpenBracket
                     | TokenKind::At
+                    | TokenKind::Hash
                     | TokenKind::Amp
                     | TokenKind::Ellipsis
             ) {
@@ -570,7 +576,7 @@ mod tests {
         for source in [
             "{\n    Dict<String, Int> m: {\n        a: 1\n    }\n}\n",
             "{\n    Dict<String, List<Int>> m: {\n        a: [\n            1\n        ]\n    }\n}\n",
-            "{\n    x: @brand(Dict<String, Int>) {\n        a: 1\n    }\n}\n",
+            "{\n    x: #brand Dict<String, Int> {\n        a: 1\n    }\n}\n",
         ] {
             let formatted = format_source(source).unwrap();
             assert_eq!(formatted, source, "input did not round-trip");
@@ -584,8 +590,8 @@ mod tests {
         // marker, not the start of a ternary — no surrounding spaces.
         for source in [
             "{\n    Weather? w: {\n        a: 1\n    }\n}\n",
-            "{\n    x: @brand(Weather?) {\n        a: 1\n    }\n}\n",
-            "{\n    x: @brand(Dict<String, Int>?) {\n        a: 1\n    }\n}\n",
+            "{\n    x: #brand Weather? {\n        a: 1\n    }\n}\n",
+            "{\n    x: #brand Dict<String, Int>? {\n        a: 1\n    }\n}\n",
         ] {
             let formatted = format_source(source).unwrap();
             assert_eq!(formatted, source, "input did not round-trip");

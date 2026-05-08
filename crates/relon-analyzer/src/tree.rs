@@ -5,7 +5,7 @@
 //! ignore the rest. Adding a new pass means adding a new table here.
 
 use crate::diagnostic::Diagnostic;
-use crate::inputs::InputDecl;
+use crate::main_sig::MainSignature;
 use crate::resolve::ResolvedRef;
 use crate::root_schemas::RootSchemaDecl;
 use crate::schema::SchemaDef;
@@ -18,7 +18,7 @@ use std::sync::Arc;
 #[derive(Debug, Default)]
 pub struct AnalyzedTree {
     /// Schema definitions discovered by the schema pass, keyed by the
-    /// `NodeId` of the dict-value that carries the `@schema` decorator.
+    /// `NodeId` of the schema body node carried by `#schema A Body`.
     pub schemas: HashMap<NodeId, SchemaDef>,
     /// Statically resolvable references, keyed by the reference
     /// expression's `NodeId`. Populated by `resolve_references`. Hosts
@@ -32,27 +32,16 @@ pub struct AnalyzedTree {
     pub node_index: HashMap<NodeId, Arc<Node>>,
     /// Module imports discovered by the module-graph pass.
     pub imports: Vec<crate::modules::ModuleImport>,
-    /// `true` when the root node carries a `@library` decorator. Hosts
-    /// gate "evaluate as entry" on this flag — `@library` files are
-    /// import-only, never the final config.
-    pub is_library: bool,
-    /// `@input(name=SchemaRef)` declarations on the root node, in
-    /// source order. Each entry adds one named slot to the program's
-    /// input contract; the runtime evaluates each `SchemaRef` and
-    /// merges the resulting schemas into a virtual wrapper schema
-    /// `{ <name1>: <schema1>, <name2>: <schema2>, ... }` against which
-    /// the host-pushed input is validated before evaluation begins.
-    /// Multiple decorators with the same `name` produce
-    /// `Diagnostic::DuplicateInputName`.
-    pub input_decls: Vec<InputDecl>,
-    /// `@schema(Name={...})` declarations on the root node, in source
-    /// order. Each entry is layout sugar for declaring `Name` as a
-    /// `@private @schema` field of the root dict — once seeded into the
-    /// root scope, `@input(slot=Name)` and dict-body `Name { ... }`
-    /// references resolve identically to the field-form path. Multiple
-    /// decorations naming the same schema produce
+    /// `#main(...)` signature on the root node, when the file is an
+    /// entry program. Files without `#main` are libraries / static
+    /// configs; the host evaluates them through `eval_root` rather than
+    /// `run_main`.
+    pub main_signature: Option<MainSignature>,
+    /// Root-level `#schema Name Body` declarations in source order.
+    /// Each entry seeds `Name` into the root scope before evaluation
+    /// begins. Multiple decorations naming the same schema produce
     /// `Diagnostic::DuplicateRootSchemaName`; same name as a dict-field
-    /// `@schema X: ...` produces
+    /// `#schema X ...` produces
     /// `Diagnostic::RootSchemaCollidesWithField`.
     pub root_schemas: Vec<RootSchemaDecl>,
     /// Errors and warnings from every pass, in source order.
@@ -77,7 +66,7 @@ impl AnalyzedTree {
         std::mem::take(&mut self.diagnostics)
     }
 
-    /// Look up a desugar'd schema by the `@schema`-decorated node's id.
+    /// Look up a desugar'd schema by the `#schema`-body node's id.
     pub fn schema(&self, node_id: NodeId) -> Option<&SchemaDef> {
         self.schemas.get(&node_id)
     }

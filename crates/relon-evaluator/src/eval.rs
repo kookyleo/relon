@@ -86,17 +86,6 @@ pub struct Context {
     pub(crate) root_node: Option<Arc<Node>>,
     pub(crate) decorators: HashMap<String, Arc<dyn DecoratorPlugin>>,
     pub(crate) functions: HashMap<String, GatedNativeFn>,
-    /// Push-style external input. Reachable from scripts as the
-    /// reserved root-level name `input` (e.g. `input.user.name`).
-    /// Set via [`Self::with_input`]; `None` means "no input was
-    /// provided" (script reads of `input.foo` then fail with
-    /// `VariableNotFound`).
-    ///
-    /// This is the **only** sanctioned channel for host-pushed data.
-    /// There is intentionally no general-purpose `globals` map — that
-    /// would re-introduce the ambient-state escape hatch the spec
-    /// forbids. See `docs/zh/guide/host-integration.md`.
-    pub input: Option<Value>,
     pub schemas: HashMap<String, Value>,
     pub(crate) module_resolvers: Vec<Arc<dyn ModuleResolver>>,
     pub(crate) path_cache: Mutex<HashMap<String, Value>>,
@@ -131,7 +120,6 @@ impl Context {
             root_node: None,
             decorators: HashMap::new(),
             functions: HashMap::new(),
-            input: None,
             schemas: HashMap::new(),
             module_resolvers: Vec::new(),
             path_cache: Mutex::new(HashMap::new()),
@@ -155,7 +143,7 @@ impl Context {
     /// returns `CapabilityDenied`. `Capabilities` defaults are
     /// restrictive: no fs grant, no native-fn allowlist.
     ///
-    /// **Sandbox scope:** this only constrains filesystem `@import` and
+    /// **Sandbox scope:** this only constrains filesystem `#import` and
     /// host-registered functions added via [`Self::register_fn_with_caps`].
     /// The pure-functional stdlib (registered via [`Self::register_fn`])
     /// is intentionally ungated — those functions perform no I/O and
@@ -176,30 +164,6 @@ impl Context {
 
     pub fn with_analyzed(mut self, tree: Arc<relon_analyzer::AnalyzedTree>) -> Self {
         self.analyzed = Some(tree);
-        self
-    }
-
-    /// Push-by-default input channel. Host materializes external data
-    /// (HTTP responses, DB rows, request body, …) into a [`Value`] tree
-    /// before evaluation; the script reads it as the reserved root
-    /// name `input` (e.g. `input.user.name`).
-    ///
-    /// Reasons to push instead of pulling via host fns inside the
-    /// script — see `docs/zh/guide/host-integration.md`:
-    /// * Cross-runtime determinism is contingent on input being an
-    ///   explicit [`Value`] tree; pull-style host fn calls put the
-    ///   "input" outside the spec's reach.
-    /// * Caching, replay, fuzz, and diff all work because the function
-    ///   is genuinely `(source, input) → output`.
-    /// * Audit "what does this script see" by reading one Value tree.
-    ///
-    /// Anything that can't be expressed as pre-fetched data (lazy
-    /// loading, side-effect actions, observability) goes through
-    /// [`Self::register_fn_with_caps`] instead — capability gating is
-    /// the right tool for those, with the explicit understanding that
-    /// portable determinism stops applying.
-    pub fn with_input(mut self, value: Value) -> Self {
-        self.input = Some(value);
         self
     }
 
@@ -375,11 +339,17 @@ impl Evaluator {
         }
     }
 
-    /// Evaluate the document attached to `Context::with_root`. Stamps
+    /// Evaluate the document attached to `Context::with_root` as a
+    /// **library / static config** — i.e. without consulting any
+    /// `#main(...)` signature or pushing host args. Stamps
     /// `scope.root_ref` with the root node so `&root` references resolve
     /// correctly during the walk; the existence check against an existing
     /// `root_ref` lets nested modules preserve their own root binding when
     /// re-entering this from `load_module`.
+    ///
+    /// For files that declare `#main(...)` use [`Self::run_main`]
+    /// instead — it validates and binds the host-pushed args before the
+    /// body walk.
     pub fn eval_root(&self, scope: &Arc<Scope>) -> Result<Value, RuntimeError> {
         let root = self.context.root_node.clone().ok_or_else(|| {
             RuntimeError::VariableNotFound(
@@ -387,194 +357,124 @@ impl Evaluator {
                 TokenRange::default(),
             )
         })?;
-        let scope = if scope.root_ref.is_none() {
-            let mut overlay = (**scope).clone();
-            overlay.root_ref = Some(crate::scope::RootRef::new(Arc::clone(&root)));
-            Arc::new(overlay)
-        } else {
-            Arc::clone(scope)
-        };
+        let scope = self.prepare_root_scope(scope, &root)?;
+        self.eval(&root, &scope)
+    }
 
-        // Seed the reserved `input` name into the root scope. If the
-        // file declared an `@input` schema (via `AnalyzedTree`), validate
-        // the host-pushed value against it first — defaults are filled
-        // in here, so the script reads the post-default tree. When no
-        // schema is declared the value is seeded as-is; reads of
-        // `input.foo` against missing input fall through to the runtime
-        // `VariableNotFound` path in `resolve_variable`.
-        if let Some(input_value) = self.prepare_input(&scope)? {
+    /// Evaluate the document as an entry program: validate `args`
+    /// against the file's `#main(...)` signature (each declared
+    /// parameter must appear with a value of the declared type), bind
+    /// every parameter into the root scope's locals, then evaluate the
+    /// body.
+    ///
+    /// Errors:
+    /// * [`RuntimeError::NoMainSignature`] — the file lacks a
+    ///   `#main(...)` directive.
+    /// * [`RuntimeError::MissingMainArg`] — host didn't push a value for
+    ///   a declared parameter.
+    /// * [`RuntimeError::UnexpectedMainArg`] — host pushed an arg name
+    ///   not in the signature.
+    /// * [`RuntimeError::MainArgTypeMismatch`] — pushed value doesn't
+    ///   match the parameter's declared type.
+    pub fn run_main(
+        &self,
+        scope: &Arc<Scope>,
+        mut args: HashMap<String, Value>,
+    ) -> Result<Value, RuntimeError> {
+        let root = self.context.root_node.clone().ok_or_else(|| {
+            RuntimeError::VariableNotFound(
+                "Context has no root node — call `Context::with_root` first".to_string(),
+                TokenRange::default(),
+            )
+        })?;
+        let signature = self
+            .context
+            .analyzed
+            .as_ref()
+            .and_then(|tree| tree.main_signature.clone())
+            .ok_or_else(|| RuntimeError::NoMainSignature { range: root.range })?;
+        let scope = self.prepare_root_scope(scope, &root)?;
+
+        // Each parameter: pop the matching arg, type-check, bind into
+        // scope locals. Keep a "consumed" set so we can detect extras.
+        for param in &signature.params {
+            let Some(mut value) = args.remove(&param.name) else {
+                return Err(RuntimeError::MissingMainArg {
+                    name: param.name.clone(),
+                    range: param.range,
+                });
+            };
+            // Schema scope: root-level `#schema A Body` declarations
+            // must be visible before we type-check arguments referring
+            // to them. The full prepare_dict_scope walk happens once
+            // we descend into the body; here we eagerly seed root-level
+            // schemas so a `User` parameter type can resolve.
+            let root_schemas: Vec<relon_analyzer::RootSchemaDecl> = self
+                .context
+                .analyzed
+                .as_ref()
+                .map(|tree| tree.root_schemas.clone())
+                .unwrap_or_default();
+            if !root_schemas.is_empty() {
+                self.seed_root_schemas(&root_schemas, &scope)?;
+            }
+            self.prepare_dict_scope(&root, &scope)?;
+
+            self.check_type(&mut value, &param.type_node, &scope, param.range)
+                .map_err(|err| match err {
+                    RuntimeError::TypeMismatch {
+                        expected, found, ..
+                    } => RuntimeError::MainArgTypeMismatch {
+                        name: param.name.clone(),
+                        expected,
+                        found,
+                        range: param.range,
+                    },
+                    other => other,
+                })?;
             scope
                 .locals
                 .lock()
                 .unwrap()
-                .insert(crate::reserved::INPUT.to_string(), input_value);
+                .insert(param.name.clone(), value);
+        }
+        if let Some((extra_name, _)) = args.into_iter().next() {
+            return Err(RuntimeError::UnexpectedMainArg {
+                name: extra_name,
+                range: signature.range,
+            });
         }
 
         self.eval(&root, &scope)
     }
 
-    /// Validate `Context::input` against every `@input(name=SchemaRef)`
-    /// declaration on the root and return the (possibly default-filled)
-    /// value to seed under the reserved `input` name.
-    ///
-    /// The merged contract is a virtual wrapper schema
-    /// `{ <name1>: <schema1>, <name2>: <schema2>, ... }`. Each
-    /// `SchemaRef` is evaluated against the root scope (so the
-    /// referenced `@schema` field has already been seeded into
-    /// `scope.locals` by an earlier `prepare_dict_scope` walk). The
-    /// resulting `Value::Schema`s are wrapped in `SchemaField`s and
-    /// applied to the host-pushed `Value::Dict` via the existing
-    /// `apply_schema` machinery — which means `@default(...)` and
-    /// optional fields work the same way they do for ordinary schemas.
-    ///
-    /// Returns `Ok(None)` when the document declares no `@input(...)`
-    /// slots and the host hasn't pushed anything; the reserved `input`
-    /// name then resolves to a runtime `VariableNotFound` if the script
-    /// dereferences it.
-    fn prepare_input(&self, scope: &Arc<Scope>) -> Result<Option<Value>, RuntimeError> {
-        let decls: Vec<crate::InputDecl> = self
-            .context
-            .analyzed
-            .as_ref()
-            .map(|tree| tree.input_decls.clone())
-            .unwrap_or_default();
-        let root_schemas: Vec<relon_analyzer::RootSchemaDecl> = self
-            .context
-            .analyzed
-            .as_ref()
-            .map(|tree| tree.root_schemas.clone())
-            .unwrap_or_default();
-
-        // Seed root-decorator schemas into the outer scope so the dict
-        // body — and the input-validation step below — see them through
-        // the normal parent-chain lookup. This is the runtime side of
-        // the `@schema(Name=...)` layout sugar; the analyzer side-table
-        // already validated the shape, so failures here are
-        // schema-construction errors rather than syntax errors.
-        if !root_schemas.is_empty() {
-            self.seed_root_schemas(&root_schemas, scope)?;
-        }
-
-        if decls.is_empty() {
-            // No `@input(...)` declarations: pass the pushed value
-            // through as-is (or return None if nothing was pushed).
-            return Ok(self.context.input.clone());
-        }
-
-        let pushed = self.context.input.clone().ok_or_else(|| {
-            // The script declared an input contract but the host
-            // forgot to call `with_input` — surface that as a TypeMismatch
-            // pointing at the first declaration.
-            let range = decls[0].decorator_range;
-            RuntimeError::TypeMismatch {
-                expected: "input dict matching @input(...) declarations".to_string(),
-                found: "no input provided (call Context::with_input)".to_string(),
-                range,
-            }
-        })?;
-
-        // Pre-seed root-dict schemas into `scope.locals` so the
-        // SchemaRef expressions (typically bare identifiers like `User`)
-        // resolve. This mirrors what `eval_internal`'s Dict branch
-        // would do once it enters the body — we just do it eagerly so
-        // input validation can run *before* the body walk.
-        if let Some(root) = self.context.root_node.clone() {
-            self.prepare_dict_scope(&root, scope)?;
-        }
-
-        // Build a per-slot SchemaField from each (name, SchemaRef).
-        let mut fields: HashMap<String, crate::value::SchemaField> = HashMap::new();
-        for decl in &decls {
-            let schema_value = self.eval(&decl.schema_ref, scope)?;
-            if !matches!(schema_value, Value::Schema { .. }) {
-                return Err(RuntimeError::TypeMismatch {
-                    expected: format!("@input({}=...) argument to evaluate to a Schema", decl.name),
-                    found: schema_value.type_name().to_string(),
-                    range: decl.schema_ref.range,
-                });
-            }
-            // Synthesize a type hint that points at this slot's schema.
-            // We can't always recover a clean source-level identifier
-            // (the SchemaRef might be `lib.X` or a more complex
-            // expression), so anchor the hint to the slot name and use
-            // the stored predicate to enforce the actual schema match.
-            let type_hint = relon_parser::TypeNode {
-                path: vec![decl.name.clone()],
-                generics: Vec::new(),
-                is_optional: false,
-                range: decl.schema_ref.range,
-                variant_fields: None,
-                doc_comment: None,
-            };
-            fields.insert(
-                decl.name.clone(),
-                crate::value::SchemaField {
-                    type_hint,
-                    predicates: vec![schema_value],
-                    custom_error: None,
-                    default_value: None,
-                },
-            );
-        }
-
-        // The wrapper applies one slot per declaration. We bypass
-        // `apply_schema` because its `check_type_internal` step would
-        // try to look up the slot's `type_hint.path` in the scope's
-        // schemas — but `<slot-name>` is *not* a registered schema name
-        // (it's a wrapper identifier we just synthesized). Instead,
-        // apply each slot inline: pull the field from the pushed dict,
-        // validate it against the slot's schema by re-using the
-        // schema-as-predicate path, and fill defaults the same way
-        // `apply_schema` does.
-        let Value::Dict(d) = pushed else {
-            return Err(RuntimeError::TypeMismatch {
-                expected: "input dict matching @input(...) declarations".to_string(),
-                found: pushed.type_name().to_string(),
-                range: decls[0].decorator_range,
-            });
+    /// Construct the root scope used by both `eval_root` and `run_main`,
+    /// stamping `scope.root_ref` if needed. Both entry points share this
+    /// step because the only thing that varies is whether main args
+    /// flow into `scope.locals`.
+    fn prepare_root_scope(
+        &self,
+        scope: &Arc<Scope>,
+        root: &Arc<Node>,
+    ) -> Result<Arc<Scope>, RuntimeError> {
+        let scope = if scope.root_ref.is_none() {
+            let mut overlay = (**scope).clone();
+            overlay.root_ref = Some(crate::scope::RootRef::new(Arc::clone(root)));
+            Arc::new(overlay)
+        } else {
+            Arc::clone(scope)
         };
-        let mut working = (*d).clone();
-        let mut visited: HashSet<(String, *const Value)> = HashSet::new();
-        for decl in &decls {
-            let field = fields.get(&decl.name).expect("just inserted");
-            let Value::Schema {
-                fields: slot_fields,
-                ..
-            } = &field.predicates[0]
-            else {
-                unreachable!("we type-checked Schema above");
-            };
-            if let Some(slot_value) = working.map.get_mut(&decl.name) {
-                self.apply_schema(
-                    slot_fields.clone(),
-                    slot_value,
-                    scope,
-                    decl.decorator_range,
-                    &mut visited,
-                    0,
-                )?;
-            } else {
-                // Missing slot — same diagnostic shape as a missing
-                // required schema field.
-                return Err(RuntimeError::TypeMismatch {
-                    expected: format!("input slot '{}'", decl.name),
-                    found: "missing".to_string(),
-                    range: decl.decorator_range,
-                });
-            }
-        }
-
-        Ok(Some(Value::Dict(Arc::new(working))))
+        Ok(scope)
     }
 
-    /// Seed every `@schema(Name=...)` root-decorator declaration into
+    /// Seed every root-level `#schema X Body` declaration into
     /// `scope.locals` as a `Value::Schema`. Mirrors the dict-field
-    /// `@schema X: {...}` path's runtime behavior so a `Name { ... }`
-    /// reference inside the dict body — or in an `@input(slot=Name)`
-    /// SchemaRef — resolves identically through the scope chain.
+    /// `#schema X: {...}` path's runtime behavior so a `Name { ... }`
+    /// reference inside the dict body — or a `#main(u: Name)` parameter
+    /// type — resolves identically through the scope chain.
     ///
     /// The body node carried by each `RootSchemaDecl` is a plain dict
-    /// literal (or `Enum<...>` type) with no `@schema` decorator of its
+    /// literal (or `Enum<...>` type) with no `#schema` decorator of its
     /// own; we lower it on demand using the same pure-fn the analyzer
     /// uses (`relon_analyzer::lower_schema_pure`) and then build the
     /// runtime `Value::Schema` via `build_schema_from_def`. This keeps
@@ -608,7 +508,7 @@ impl Evaluator {
                 return Err(RuntimeError::TypeMismatch {
                     expected: "schema body (Dict or Enum<...>)".to_string(),
                     found: decl.schema_node.expr.kind().to_string(),
-                    range: decl.decorator_range,
+                    range: decl.directive_range,
                 });
             };
             let value = if !def.variants.is_empty() {
@@ -686,6 +586,19 @@ impl Evaluator {
         }
 
         let mut current_scope = Arc::clone(scope);
+
+        // Directives in source order: `#import` rescopes; `#schema A B`
+        // seeds bindings into the current scope so the body can reference
+        // them before evaluation. Bare `#schema` on a dict-field overrides
+        // evaluation: the body is interpreted as a schema definition
+        // rather than ordinary data. Other directives are no-ops here
+        // and either land elsewhere (`#main`, `#default`, `#expect`, ...)
+        // or run as a post-eval transform (`#brand X` on a value).
+        for dir in &node.directives {
+            if let Some(override_val) = self.apply_directive_pre(dir, node, &mut current_scope)? {
+                return Ok(override_val);
+            }
+        }
 
         for dec in &node.decorators {
             let name = decorator_name(dec);
@@ -820,7 +733,7 @@ impl Evaluator {
                                 self.eval(value_node, &item_scope)?
                             };
 
-                            // `@private` keeps the binding in the owning
+                            // `#private` keeps the binding in the owning
                             // dict's locals (so siblings can reference it)
                             // but excludes it from the produced `Value::Dict`
                             // — making it invisible to imports, projectors,
@@ -1048,7 +961,19 @@ impl Evaluator {
         }?;
 
         if !is_schema_pred {
-            for dec in &node.decorators {
+            // Post-eval directive transforms (currently `#brand X` on a
+            // dict/value). Run before decorators so `@f #brand X v`
+            // applies the brand first then `@f`, matching the bottom-up
+            // stack order users see for decorators alone.
+            for dir in node.directives.iter().rev() {
+                if let Some(new_val) = self.apply_directive_post(dir, node, &val, &current_scope)? {
+                    val = new_val;
+                }
+            }
+            // Decorators apply bottom-up: `@a @b v ≡ a(b(v))`. The
+            // decorator nearest the value wraps first; the outermost
+            // wraps last.
+            for dec in node.decorators.iter().rev() {
                 let name = decorator_name(dec);
                 if let Some(plugin) = self.context.decorators.get(&name).cloned() {
                     if let Some(new_val) = plugin.wrap_with_ast(
@@ -1089,6 +1014,232 @@ impl Evaluator {
         }
 
         Ok(val)
+    }
+
+    /// Lower a single `#schema A Body` binding into a `Value::Schema`
+    /// (or `Value::EnumSchema` for `Enum<...>` bodies). Mirrors the
+    /// path the field-form `#schema X: { ... }` used to take in batch 2:
+    /// invoke the analyzer's pure schema lowering, then call
+    /// `build_schema_from_def` to bind predicates against the live
+    /// scope.
+    pub fn lower_schema_binding(
+        &self,
+        name: &str,
+        body: &Node,
+        scope: &Arc<Scope>,
+    ) -> Result<Value, RuntimeError> {
+        // Fast path: an attached `AnalyzedTree` already split this body
+        // into typed fields. Build the runtime `Value::Schema` directly
+        // from the pre-computed `SchemaDef`.
+        if let Some(tree) = self.context.analyzed.as_ref() {
+            if let Some(def) = tree.schema(body.id) {
+                if !def.variants.is_empty() {
+                    return Ok(self.build_root_enum_schema(def));
+                }
+                let fields = self.build_schema_from_def(def, scope)?;
+                return Ok(Value::Schema {
+                    generics: def.generics.clone(),
+                    fields,
+                });
+            }
+        }
+        let (lowered, _diags) =
+            relon_analyzer::lower_schema_pure(Some(name.to_string()), Vec::new(), body);
+        let Some(def) = lowered else {
+            return Err(RuntimeError::TypeMismatch {
+                expected: "schema body (Dict or Enum<...>)".to_string(),
+                found: body.expr.kind().to_string(),
+                range: body.range,
+            });
+        };
+        if !def.variants.is_empty() {
+            return Ok(self.build_root_enum_schema(&def));
+        }
+        let fields = self.build_schema_from_def(&def, scope)?;
+        Ok(Value::Schema {
+            generics: def.generics.clone(),
+            fields,
+        })
+    }
+
+    /// Pre-evaluation directive dispatch.
+    ///
+    /// Currently:
+    /// * `#import <spec> from "path"` → loads the module and rescopes
+    ///   `current_scope` to expose the imported bindings.
+    /// * `#schema A B` (name-body) → seeds the schema name into the
+    ///   current scope's locals so the body can reference it before
+    ///   walking. At the root level this is also handled by
+    ///   `seed_root_schemas`, but doing it here lets nested `#schema`
+    ///   directives work too.
+    /// * `#schema` (bare, on a dict-field) → interprets the decorated
+    ///   value as a schema body instead of data, returning a
+    ///   [`Value::Schema`] / [`Value::EnumSchema`] override.
+    /// * Everything else → no-op (handled elsewhere).
+    ///
+    /// Returns `Some(value)` to short-circuit the body evaluation —
+    /// only used by the bare `#schema` override path.
+    fn apply_directive_pre(
+        &self,
+        directive: &relon_parser::Directive,
+        node: &Node,
+        current_scope: &mut Arc<Scope>,
+    ) -> Result<Option<Value>, RuntimeError> {
+        use crate::decorator_names::{IMPORT, SCHEMA};
+        use relon_parser::DirectiveBody;
+        match directive.name.as_str() {
+            IMPORT => {
+                if let DirectiveBody::Import { spec, path, .. } = &directive.body {
+                    let new_scope =
+                        self.apply_directive_import(spec, path, current_scope, directive.range)?;
+                    *current_scope = new_scope;
+                }
+            }
+            SCHEMA => match &directive.body {
+                DirectiveBody::NameBody { .. } => {
+                    // Name-body schema bindings are seeded into the
+                    // dict's own scope by `prepare_dict_scope` once the
+                    // dict body opens. Doing it here too would
+                    // double-bind and a body's `&sibling` references
+                    // would resolve in the wrong scope (outer vs dict).
+                }
+                DirectiveBody::Bare => {
+                    // Dict-field form: `#schema X: Body`. Interpret the
+                    // body as a schema definition rather than data.
+                    if let Some(tree) = self.context.analyzed.as_ref() {
+                        if let Some(def) = tree.schema(node.id) {
+                            if !def.variants.is_empty() {
+                                return Ok(Some(self.build_root_enum_schema(def)));
+                            }
+                            let fields = self.build_schema_from_def(def, current_scope)?;
+                            return Ok(Some(Value::Schema {
+                                generics: def.generics.clone(),
+                                fields,
+                            }));
+                        }
+                    }
+                    let (lowered, _diags) =
+                        relon_analyzer::lower_schema_pure(None, Vec::new(), node);
+                    if let Some(def) = lowered {
+                        if !def.variants.is_empty() {
+                            return Ok(Some(self.build_root_enum_schema(&def)));
+                        }
+                        let fields = self.build_schema_from_def(&def, current_scope)?;
+                        return Ok(Some(Value::Schema {
+                            generics: def.generics.clone(),
+                            fields,
+                        }));
+                    }
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+        Ok(None)
+    }
+
+    /// Post-evaluation directive dispatch — value transforms only.
+    ///
+    /// Currently the only post-eval directive transform is `#brand X`,
+    /// which mirrors the decorator-form `@brand(X)` from batches 1/2.
+    /// Returns `Some(new_val)` to replace the value, or `None` for
+    /// pass-through.
+    fn apply_directive_post(
+        &self,
+        directive: &relon_parser::Directive,
+        node: &Node,
+        value: &Value,
+        scope: &Arc<Scope>,
+    ) -> Result<Option<Value>, RuntimeError> {
+        use crate::decorator_names::BRAND;
+        use relon_parser::DirectiveBody;
+        if directive.name == BRAND {
+            let DirectiveBody::Value(body) = &directive.body else {
+                return Ok(None);
+            };
+            // Reject the ambiguous `Foo x: #brand Bar { ... }` form up
+            // front. The outer `Foo` hint and the inner `#brand` would
+            // both try to write `dict.brand` (and run their own
+            // `check_type`); it's almost never what the author meant.
+            if node.type_hint.is_some() {
+                return Err(RuntimeError::UnsupportedOperator(
+                    "#brand cannot be combined with a field-level type hint on the same value; pick one"
+                        .to_string(),
+                    directive.range,
+                ));
+            }
+            let type_node = relon_parser::type_node_from_brand_arg(&body.expr, directive.range)
+                .ok_or_else(|| {
+                    RuntimeError::UnsupportedOperator(
+                        "#brand body must be a type name (bareword, string, dotted path, or generic type)"
+                            .to_string(),
+                        directive.range,
+                    )
+                })?;
+            let mut new_val = value.clone();
+            if !matches!(new_val, Value::Wildcard) {
+                self.check_type(&mut new_val, &type_node, scope, directive.range)?;
+                if let Value::Dict(ref mut d) = new_val {
+                    let d = Arc::make_mut(d);
+                    d.brand = crate::builtin_decorators::brand_string_for(&type_node);
+                }
+            }
+            return Ok(Some(new_val));
+        }
+        Ok(None)
+    }
+
+    /// Lower a `#import <spec> from "path"` directive into a scope with
+    /// the imported bindings. Mirrors the old `apply_import` flow for
+    /// the `@import("path", as=..., spread=...)` decorator.
+    pub fn apply_directive_import(
+        &self,
+        spec: &relon_parser::DirectiveImportSpec,
+        path: &str,
+        scope: &Arc<Scope>,
+        range: TokenRange,
+    ) -> Result<Arc<Scope>, RuntimeError> {
+        use relon_parser::DirectiveImportSpec;
+        let evaluated_module = self.load_module(path, scope, range)?;
+        let mut new_locals = HashMap::new();
+        match spec {
+            DirectiveImportSpec::Alias(name) => {
+                new_locals.insert(name.clone(), evaluated_module);
+            }
+            DirectiveImportSpec::Spread => {
+                if let Value::Dict(d) = evaluated_module {
+                    for (k, v) in d.map.iter() {
+                        new_locals.insert(k.clone(), v.clone());
+                    }
+                } else {
+                    return Err(RuntimeError::TypeMismatch {
+                        expected: "Dict".to_string(),
+                        found: evaluated_module.type_name().to_string(),
+                        range,
+                    });
+                }
+            }
+            DirectiveImportSpec::Destructure(entries) => {
+                let Value::Dict(d) = evaluated_module else {
+                    return Err(RuntimeError::TypeMismatch {
+                        expected: "Dict".to_string(),
+                        found: evaluated_module.type_name().to_string(),
+                        range,
+                    });
+                };
+                for (name, alias) in entries {
+                    let local_name = alias.clone().unwrap_or_else(|| name.clone());
+                    let Some(v) = d.map.get(name) else {
+                        return Err(RuntimeError::VariableNotFound(
+                            format!("`{name}` not exported by `{path}`"),
+                            range,
+                        ));
+                    };
+                    new_locals.insert(local_name, v.clone());
+                }
+            }
+        }
+        Ok(scope.with_locals(new_locals))
     }
 
     pub fn apply_import(
@@ -1167,6 +1318,30 @@ impl Evaluator {
             });
         }
         Ok(out)
+    }
+
+    /// Lower a `#meta ...` directive's body into the positional-args
+    /// vector a [`DecoratorPlugin::schema_field_meta`] hook expects.
+    ///
+    /// * `Bare` → no args.
+    /// * `Value(body)` → one positional `EvaluatedArg` carrying the
+    ///   eval'd body.
+    /// * Other shapes → no args (unsupported here; the analyzer
+    ///   guarantees only value/bare shapes reach this path for the meta
+    ///   names — `#default`, `#expect`, `#msg`, `#error`, `#brand`).
+    pub fn evaluate_directive_meta_args(
+        &self,
+        directive: &relon_parser::Directive,
+        scope: &Arc<Scope>,
+    ) -> Result<Vec<EvaluatedArg>, RuntimeError> {
+        use relon_parser::DirectiveBody;
+        match &directive.body {
+            DirectiveBody::Bare => Ok(Vec::new()),
+            DirectiveBody::Value(body) => {
+                Ok(vec![EvaluatedArg::positional(self.eval(body, scope)?)])
+            }
+            _ => Ok(Vec::new()),
+        }
     }
 
     /// Resolve `@import("path")` against the registered resolver chain
@@ -1550,22 +1725,65 @@ impl Evaluator {
     ) -> Result<(), RuntimeError> {
         if let Expr::Dict(pairs) = node.expr.as_ref() {
             self.register_dict_thunks(pairs, scope)?;
+
+            // Run any `#schema A Body` directives stacked above this
+            // dict so the bindings land in `scope.locals` before the
+            // body — siblings should be able to reference them by name.
+            // (Root-level schema directives are also handled by
+            // `seed_root_schemas`; that's intentional duplication: this
+            // pass also covers nested dicts.)
+            // Two-phase schema directive binding: first seed every
+            // declared name with a placeholder so cross-references
+            // (`#schema A ...; #schema B &sibling.A + ...`) and
+            // re-entry from `&sibling`/`&root` walks see the name as
+            // already-bound (placeholder), preventing infinite
+            // recursion through this same prepare-phase. Then walk
+            // again to actually build each schema's value.
+            let mut seeded: Vec<&str> = Vec::new();
+            for dir in &node.directives {
+                if dir.name != crate::decorator_names::SCHEMA {
+                    continue;
+                }
+                let relon_parser::DirectiveBody::NameBody { name, .. } = &dir.body else {
+                    continue;
+                };
+                if scope.locals.lock().unwrap().contains_key(name) {
+                    continue;
+                }
+                scope.locals.lock().unwrap().insert(
+                    name.clone(),
+                    Value::Schema {
+                        generics: Vec::new(),
+                        fields: HashMap::new(),
+                    },
+                );
+                seeded.push(name);
+            }
+            for dir in &node.directives {
+                if dir.name != crate::decorator_names::SCHEMA {
+                    continue;
+                }
+                let relon_parser::DirectiveBody::NameBody { name, body, .. } = &dir.body else {
+                    continue;
+                };
+                if !seeded.contains(&name.as_str()) {
+                    continue;
+                }
+                let val = self.lower_schema_binding(name, body, scope)?;
+                scope.locals.lock().unwrap().insert(name.clone(), val);
+            }
+
             for (key, value_node) in pairs {
                 if matches!(key, TokenKey::Spread(_)) {
                     continue;
                 }
-                let is_schema = value_node.decorators.iter().any(|d| {
-                    let name = d
-                        .path
-                        .iter()
-                        .map(|k| k.to_string_key())
-                        .collect::<Vec<_>>()
-                        .join(".");
-                    name == "schema"
+                let has_schema_directive = value_node.directives.iter().any(|d| {
+                    d.name == crate::decorator_names::SCHEMA
+                        && matches!(d.body, relon_parser::DirectiveBody::Bare)
                 });
-
-                let is_dict_schema = is_schema && matches!(value_node.expr.as_ref(), Expr::Dict(_));
-                let is_enum_schema = is_schema
+                let is_dict_schema =
+                    has_schema_directive && matches!(value_node.expr.as_ref(), Expr::Dict(_));
+                let is_enum_schema = has_schema_directive
                     && matches!(value_node.expr.as_ref(),
                         Expr::Type(t) if t.path.len() == 1 && t.path[0] == "Enum");
 
@@ -1589,7 +1807,6 @@ impl Evaluator {
                     if !Self::is_valid_identifier(&key_str) {
                         return Err(RuntimeError::InvalidIdentifier(key_str, value_node.range));
                     }
-
                     if is_dict_schema {
                         let mut generics = Vec::new();
                         if let TokenKey::Dynamic(expr_node, _) = key {
@@ -1609,7 +1826,6 @@ impl Evaluator {
                             },
                         );
                     }
-
                     let val = self.eval(value_node, scope)?;
                     scope.locals.lock().unwrap().insert(key_str, val);
                 }
@@ -1703,12 +1919,12 @@ pub(crate) fn decorator_name(dec: &DecoratorNode) -> String {
         .join(".")
 }
 
-/// True when `node` carries the `@private` decorator. See
+/// True when `node` carries the `#private` directive. See
 /// [`crate::decorator_names::PRIVATE`] for the field-level semantics.
 fn is_private_field(node: &Node) -> bool {
-    node.decorators
+    node.directives
         .iter()
-        .any(|dec| decorator_name(dec) == crate::decorator_names::PRIVATE)
+        .any(|dir| dir.name == crate::decorator_names::PRIVATE)
 }
 
 impl std::fmt::Display for Value {

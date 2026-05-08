@@ -1,4 +1,4 @@
 {
-    @import("circular.relon")
+    #import circular from "circular.relon",
     "self": "oops"
 }

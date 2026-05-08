@@ -24,10 +24,10 @@ pub enum Severity {
 
 #[derive(Debug, Clone, Error, MietteDiagnostic)]
 pub enum Diagnostic {
-    #[error("@schema body must be a Dict (or Schema composition), got {found}")]
+    #[error("#schema body must be a Dict (or Schema composition), got {found}")]
     #[diagnostic(
         code(relon::analyze::schema_body_not_dict),
-        help("@schema expects `@schema Name: {{ ... }}` or `@schema Name: Base + {{ ... }}`.")
+        help("#schema expects `#schema Name {{ ... }}` or `#schema Name Base + {{ ... }}`.")
     )]
     SchemaBodyNotDict {
         found: String,
@@ -35,7 +35,7 @@ pub enum Diagnostic {
         range: SourceSpan,
     },
 
-    #[error("@schema field `{field}` is missing a type annotation")]
+    #[error("#schema field `{field}` is missing a type annotation")]
     #[diagnostic(
         code(relon::analyze::schema_field_untyped),
         help("Each schema field needs a type prefix, e.g. `String name: *` or `Int port: (p) => p > 0`.")
@@ -87,7 +87,7 @@ pub enum Diagnostic {
     #[error("unknown variant `{variant_name}` of `{enum_name}`")]
     #[diagnostic(
         code(relon::analyze::unknown_variant),
-        help("{}", suggestion.as_deref().map(|s| format!("did you mean `{s}`?")).unwrap_or_else(|| format!("the variants of `{enum_name}` are listed in its @schema definition.")))
+        help("{}", suggestion.as_deref().map(|s| format!("did you mean `{s}`?")).unwrap_or_else(|| format!("the variants of `{enum_name}` are listed in its #schema definition.")))
     )]
     UnknownVariant {
         enum_name: String,
@@ -120,24 +120,24 @@ pub enum Diagnostic {
     },
 
     #[error(
-        "schema field `{field}`: cannot combine an explicit type prefix `{type_prefix}` with `@brand(...)`"
+        "schema field `{field}`: cannot combine an explicit type prefix `{type_prefix}` with `#brand`"
     )]
     #[diagnostic(
         code(relon::analyze::schema_field_brand_conflict),
-        help("Both forms declare the field's type — pick one. Either drop the type prefix and keep `@brand(...)`, or drop `@brand(...)` and keep the prefix.")
+        help("Both forms declare the field's type — pick one. Either drop the type prefix and keep `#brand`, or drop `#brand` and keep the prefix.")
     )]
     SchemaFieldBrandConflict {
         field: String,
         type_prefix: String,
-        #[label("conflicting `@brand` here")]
+        #[label("conflicting `#brand` here")]
         range: SourceSpan,
     },
 
-    #[error("schema field `{field}`: `@brand(...)` argument must be a type")]
+    #[error("schema field `{field}`: `#brand` body must be a type")]
     #[diagnostic(
         code(relon::analyze::schema_field_brand_invalid_arg),
         help(
-            "Pass a type expression: `@brand(Weather)`, `@brand(geo.Location)`, `@brand(\"Weather\")`, or a generic like `@brand(Map<String, Int>)`."
+            "Pass a type expression: `#brand Weather`, `#brand geo.Location`, `#brand \"Weather\"`, or a generic like `#brand Map<String, Int>`."
         )
     )]
     SchemaFieldBrandInvalidArg {
@@ -146,74 +146,25 @@ pub enum Diagnostic {
         range: SourceSpan,
     },
 
-    #[error("duplicate `@input(...)` slot name `{name}`")]
+    #[error("duplicate `#main(...)` directive")]
     #[diagnostic(
-        code(relon::analyze::duplicate_input_name),
+        code(relon::analyze::duplicate_main_directive),
         help(
-            "Each `@input(name=SchemaRef)` slot must have a unique name. Pick distinct names so the merged input wrapper has unambiguous fields."
+            "A file may declare at most one `#main(...)` entry signature. Combine the parameter lists into a single `#main(a: A, b: B, ...)`."
         )
     )]
-    DuplicateInputName {
-        name: String,
+    DuplicateMainDirective {
         #[label("first declared here")]
         first: SourceSpan,
-        #[label("redeclared with the same name")]
+        #[label("redeclared")]
         second: SourceSpan,
     },
 
-    #[error("`@input(...)` argument is missing a slot name")]
-    #[diagnostic(
-        code(relon::analyze::input_decorator_missing_name),
-        help(
-            "Use the `name=SchemaRef` form so each input slot has an explicit identifier in the merged wrapper, e.g. `@input(user=User)`."
-        )
-    )]
-    InputDecoratorMissingName {
-        #[label("expected `<name>=SchemaRef`")]
-        range: SourceSpan,
-    },
-
-    #[error("`@input` decorator declares no slots")]
-    #[diagnostic(
-        code(relon::analyze::input_decorator_empty),
-        help(
-            "Pass at least one `name=SchemaRef` argument, e.g. `@input(user=User)`. A bare `@input` has no effect."
-        )
-    )]
-    InputDecoratorEmpty {
-        #[label("no slots declared")]
-        range: SourceSpan,
-    },
-
-    #[error("root-level `@schema(...)` argument is missing a schema name")]
-    #[diagnostic(
-        code(relon::analyze::root_schema_decorator_missing_name),
-        help(
-            "Use the `Name=Body` form so each root-level schema has an explicit identifier, e.g. `@schema(User={{ String name: * }})`."
-        )
-    )]
-    RootSchemaDecoratorMissingName {
-        #[label("expected `Name=<schema body>`")]
-        range: SourceSpan,
-    },
-
-    #[error("root-level `@schema(...)` declares no schemas")]
-    #[diagnostic(
-        code(relon::analyze::root_schema_decorator_empty),
-        help(
-            "Pass at least one `Name=<schema body>` argument, e.g. `@schema(User={{ String name: * }})`. A bare `@schema()` has no effect at the root level."
-        )
-    )]
-    RootSchemaDecoratorEmpty {
-        #[label("no schemas declared")]
-        range: SourceSpan,
-    },
-
-    #[error("duplicate root-level `@schema(...)` name `{name}`")]
+    #[error("duplicate root-level `#schema` name `{name}`")]
     #[diagnostic(
         code(relon::analyze::duplicate_root_schema_name),
         help(
-            "Each root-level `@schema(Name=...)` entry must have a unique name. Pick distinct names so the merged schema scope is unambiguous."
+            "Each root-level `#schema Name Body` entry must have a unique name. Pick distinct names so the merged schema scope is unambiguous."
         )
     )]
     DuplicateRootSchemaName {
@@ -224,28 +175,28 @@ pub enum Diagnostic {
         second: SourceSpan,
     },
 
-    #[error("root-level `@schema({name}=...)` collides with dict-field `@schema {name}: ...`")]
+    #[error("root-level `#schema {name} : ...` collides with dict-field `#schema {name} : ...`")]
     #[diagnostic(
         code(relon::analyze::root_schema_collides_with_field),
         help(
-            "Pick one form: either declare the schema in the root-decorator stack as `@schema({name}=...)`, or as a `@private @schema {name}: ...` field inside the root dict — not both."
+            "Pick one form: either declare the schema in the root-directive stack as `#schema {name} : ...`, or as a dict-field directive inside the root dict — not both."
         )
     )]
     RootSchemaCollidesWithField {
         name: String,
-        #[label("declared at the root-decorator level")]
+        #[label("declared at the root-directive level")]
         root_range: SourceSpan,
         #[label("also declared as a dict field")]
         field_range: SourceSpan,
     },
 
     #[error(
-        "root-level `@schema({name}=...)` value must be a Dict or `Enum<...>`, got {found_type}"
+        "root-level `#schema {name} : ...` body must be a Dict or `Enum<...>`, got {found_type}"
     )]
     #[diagnostic(
         code(relon::analyze::root_schema_invalid_value),
         help(
-            "The right-hand side of a root-level `@schema(Name=...)` argument must be the schema body itself — either a dict literal `{{ ... }}` or an `Enum<...>` type."
+            "The body of a root-level `#schema Name Body` directive must be the schema body itself — either a dict literal `{{ ... }}` or an `Enum<...>` type."
         )
     )]
     RootSchemaInvalidValue {
@@ -268,11 +219,7 @@ impl Diagnostic {
             | Diagnostic::HeterogeneousEnum { .. }
             | Diagnostic::SchemaFieldBrandConflict { .. }
             | Diagnostic::SchemaFieldBrandInvalidArg { .. }
-            | Diagnostic::DuplicateInputName { .. }
-            | Diagnostic::InputDecoratorMissingName { .. }
-            | Diagnostic::InputDecoratorEmpty { .. }
-            | Diagnostic::RootSchemaDecoratorMissingName { .. }
-            | Diagnostic::RootSchemaDecoratorEmpty { .. }
+            | Diagnostic::DuplicateMainDirective { .. }
             | Diagnostic::DuplicateRootSchemaName { .. }
             | Diagnostic::RootSchemaCollidesWithField { .. }
             | Diagnostic::RootSchemaInvalidValue { .. } => Severity::Error,

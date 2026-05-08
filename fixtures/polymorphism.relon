@@ -1,9 +1,9 @@
 {
-    @schema Image: {
+    #schema Image {
         name: String,
         url: String
     },
-    @schema Text: {
+    #schema Text {
         name: String,
         content: String
     },

@@ -339,7 +339,7 @@ mod tests {
     fn compute_diagnostics_returns_empty_for_clean_source() {
         let diags = compute_diagnostics(
             r#"{
-                @schema User: { String name: * },
+                #schema User { String name: * },
                 User alice: { name: "A" }
             }"#,
         );
@@ -348,7 +348,7 @@ mod tests {
 
     #[test]
     fn compute_diagnostics_reports_schema_errors() {
-        let diags = compute_diagnostics(r#"{ @schema Bad: 42 }"#);
+        let diags = compute_diagnostics(r#"{ #schema Bad 42 }"#);
         assert_eq!(diags.len(), 1);
         assert_eq!(
             diags[0].severity,

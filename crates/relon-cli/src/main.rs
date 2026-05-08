@@ -61,9 +61,10 @@ fn main() -> miette::Result<()> {
             // reviewer can see what's being trusted.
             //
             // We also attach the analyzer side-table so root-level
-            // contracts (`@input(...)` slot list, `@library` flag,
-            // schema desugar fast-paths) reach the evaluator the same
-            // way they do through the high-level `relon::*` facade.
+            // contracts (`#main(...)` signature, root `#schema X Body`
+            // declarations, schema desugar fast-paths) reach the
+            // evaluator the same way they do through the high-level
+            // `relon::*` facade.
             let analyzed = relon_analyzer::analyze(&node);
             if analyzed.has_errors() {
                 let diags = analyzed

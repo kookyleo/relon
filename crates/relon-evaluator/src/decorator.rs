@@ -18,11 +18,11 @@ pub enum PreEvalOutcome {
     Pass,
 
     /// Run the default evaluation path, but swap in this scope first.
-    /// Used by `@import` to inject the imported module's bindings.
+    /// Used by `#import` to inject the imported module's bindings.
     Rescope(Arc<Scope>),
 
     /// Skip the default evaluation path; use this value as the result.
-    /// Used by `@schema` to interpret the body as a schema definition
+    /// Used by `#schema` to interpret the body as a schema definition
     /// rather than as data.
     Override(Box<Value>),
 }
@@ -34,13 +34,13 @@ pub enum PreEvalOutcome {
 /// Three independent hooks are exposed:
 ///
 /// * [`pre_eval`](Self::pre_eval) runs before the decorated node is evaluated.
-///   Use it to inject locals into scope (`@import`) or take over the value
-///   entirely (`@schema`).
+///   Use it to inject locals into scope (`#import`) or take over the value
+///   entirely (`#schema`).
 /// * [`wrap`](Self::wrap) runs after the node is evaluated. Use it to validate
 ///   or transform the value (`@ensure.int`, `@currency("USD")`).
 /// * [`schema_field_meta`](Self::schema_field_meta) runs while extracting
-///   fields from a `@schema`-annotated dict. Use it to attach per-field
-///   metadata such as defaults or custom error messages (`@expect`, `@default`).
+///   fields from a `#schema`-annotated dict. Use it to attach per-field
+///   metadata such as defaults or custom error messages (`#expect`, `#default`).
 ///
 /// All hooks default to no-op / identity, so plugins only override what they
 /// actually need.

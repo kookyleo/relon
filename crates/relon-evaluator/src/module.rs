@@ -142,7 +142,7 @@ impl ModuleResolver for FilesystemModuleResolver {
             }
             // Default-reject: no root configured and not trusted.
             return Err(RuntimeError::CapabilityDenied {
-                name: format!("@import({path:?})"),
+                name: format!("#import {path:?}"),
                 reason: "filesystem reads disabled (no root configured)".to_string(),
                 range,
             });
@@ -185,7 +185,7 @@ impl ModuleResolver for FilesystemModuleResolver {
         if let Some(root) = &self.root {
             if !canonical_target.starts_with(root) {
                 return Err(RuntimeError::CapabilityDenied {
-                    name: format!("@import({path:?})"),
+                    name: format!("#import {path:?}"),
                     reason: format!("path escapes filesystem root {}", root.to_string_lossy()),
                     range,
                 });

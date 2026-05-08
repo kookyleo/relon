@@ -4,7 +4,7 @@
 //! `AnalyzedTree.references`, and return the target value-node's
 //! source range as a `Location` in the *same* document URI.
 //!
-//! Cross-file definitions (jumping into an `@import`ed module) need
+//! Cross-file definitions (jumping into an `#import`ed module) need
 //! the analyzer's module graph to track URIs per module, which it
 //! doesn't yet — so this handler always returns the active document's
 //! URI. Out-of-document targets simply don't resolve.
@@ -21,7 +21,7 @@ use relon_parser::Expr;
 ///
 /// Three cases are checked, in order:
 ///
-/// 1. Cursor on an `@import("path")` path string — jump to the start
+/// 1. Cursor on an `#import path from "path"` path string — jump to the start
 ///    of the imported file (URI computed relative to `uri`).
 /// 2. Cursor on a `Reference { ... }` / `Variable(...)` whose
 ///    analyzer binding hits — return the target field's range.
@@ -132,8 +132,8 @@ mod tests {
 
     #[test]
     fn jumps_from_import_path_to_target_file() {
-        // Cursor on the `lib.relon` literal inside `@import("lib.relon")`.
-        let src = r#"@import("lib.relon", as="lib") { x: lib.x }"#;
+        // Cursor on the `lib.relon` literal inside `#import lib from "lib.relon"`.
+        let src = r#"#import lib from "lib.relon" { x: lib.x }"#;
         let entry = entry(src);
         // Find the offset of the first 'l' inside the import path.
         let offset = src.find("lib.relon").unwrap();
@@ -156,7 +156,7 @@ mod tests {
 
     #[test]
     fn skips_std_module_imports() {
-        let src = r#"@import("std/list", as="list") { ok: list.first([1]) }"#;
+        let src = r#"#import list from "std/list" { ok: list.first([1]) }"#;
         let entry = entry(src);
         let offset = src.find("std/list").unwrap();
         let mut col = 0u32;

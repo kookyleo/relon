@@ -11,7 +11,7 @@ pub struct ValueDict {
     pub brand: Option<String>,
     /// Name of the parent sum-type Enum when this dict is a tagged-enum
     /// variant. `Some("Notification")` distinguishes a `Notification.Email`
-    /// payload from a plain `@schema Email { ... }` value (both have
+    /// payload from a plain `#schema Email { ... }` value (both have
     /// `brand = Some("Email")`); the JSON serializer uses it to wrap the
     /// payload as `{ Email: { ... } }` only for the variant case.
     pub variant_of: Option<String>,
@@ -113,7 +113,7 @@ pub enum Value {
         fields: std::collections::HashMap<String, SchemaField>,
     },
     /// A tagged-enum (sum-type) schema: variants by name, each with its
-    /// own field set. Built from `@schema Name: Enum<Var1 { ... }, ...>`.
+    /// own field set. Built from `#schema Name: Enum<Var1 { ... }, ...>`.
     /// Construction with `Name.Var1 { ... }` is dispatched via this value.
     #[serde(skip)]
     EnumSchema {

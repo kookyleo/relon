@@ -159,7 +159,7 @@ mod tests {
     #[test]
     fn hovers_schema_field_with_type_signature() {
         let src = r#"{
-                @schema User: { String name: * },
+                #schema User { String name: * },
                 User u: { name: "x" }
             }"#;
         let entry = entry(src);
@@ -199,7 +199,7 @@ mod tests {
     fn hovers_with_doc_comment() {
         let src = r#"{
                 // The user schema.
-                @schema User: {
+                #schema User {
                   // The name of the person.
                   String name: *
                 },
