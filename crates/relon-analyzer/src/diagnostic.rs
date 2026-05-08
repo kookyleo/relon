@@ -249,6 +249,37 @@ pub enum Diagnostic {
         #[label("body produces {found}")]
         range: SourceSpan,
     },
+
+    #[error("function `{fn_name}` expects {expected} arg(s), found {found}")]
+    #[diagnostic(
+        code(relon::analyze::fn_call_arg_count),
+        help(
+            "Stage 3 — the analyzer has a static signature for this function and the call's arity disagrees. Add or remove arguments so the count matches."
+        )
+    )]
+    FnCallArgCountMismatch {
+        fn_name: String,
+        expected: String,
+        found: usize,
+        #[label("wrong arity")]
+        range: SourceSpan,
+    },
+
+    #[error("argument `{param_name}` of `{fn_name}` expects {expected}, got {found}")]
+    #[diagnostic(
+        code(relon::analyze::fn_call_arg_type),
+        help(
+            "Stage 3 — the analyzer has a static signature for this function and one of the arguments disagrees with the parameter's declared type."
+        )
+    )]
+    FnCallArgTypeMismatch {
+        fn_name: String,
+        param_name: String,
+        expected: String,
+        found: String,
+        #[label("type mismatch")]
+        range: SourceSpan,
+    },
 }
 
 impl Diagnostic {
@@ -274,7 +305,9 @@ impl Diagnostic {
             | Diagnostic::StaticTypeMismatch { .. }
             | Diagnostic::MatchArmTypeMismatch { .. }
             | Diagnostic::UnknownTypeName { .. }
-            | Diagnostic::MainReturnTypeMismatch { .. } => Severity::Error,
+            | Diagnostic::MainReturnTypeMismatch { .. }
+            | Diagnostic::FnCallArgCountMismatch { .. }
+            | Diagnostic::FnCallArgTypeMismatch { .. } => Severity::Error,
             // Informational: the analyzer's view is conservative — a
             // spread, closure binding, or runtime-computed field may
             // still resolve, so we don't gate evaluation on it.

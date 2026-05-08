@@ -17,8 +17,11 @@
 use crate::diagnostic::{span_of, Diagnostic};
 use crate::infer::{self, infer_type, InferredType, SchemaBaseIndex, TypeScope};
 use crate::resolve::{build_frame, path_head, ScopeFrame};
+use crate::sig::{lookup_signature, type_node_simple, FnParam, FnSignature};
 use crate::tree::AnalyzedTree;
-use relon_parser::{child_nodes, Expr, Node, RefBase, TokenKey, TokenRange, TypeNode};
+use relon_parser::{
+    child_nodes, ClosureParam, Expr, Node, RefBase, TokenKey, TokenRange, TypeNode,
+};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -33,14 +36,34 @@ pub fn typecheck(root: &Node, tree: &mut AnalyzedTree) {
     let enum_index = build_enum_index(tree);
     let base_index = build_base_index(tree);
 
+    let mut pipe_target_calls = HashSet::new();
+    collect_pipe_target_calls(root, &mut pipe_target_calls);
+
     let mut walker = Walker {
         tree,
         scope_stack: Vec::new(),
         schema_index,
         enum_index,
         base_index,
+        pipe_target_calls,
     };
     walker.visit(root);
+}
+
+/// Pre-walk `root` and collect every FnCall NodeId that lives on the
+/// RHS of a `|` pipe. The Stage 3.5 FnCall checker uses this set to
+/// avoid flagging those calls — the pipe implicitly contributes the
+/// LHS as their first positional argument, so the source-level arity
+/// is intentionally one short.
+fn collect_pipe_target_calls(node: &Node, out: &mut HashSet<relon_parser::NodeId>) {
+    if let Expr::Binary(relon_parser::Operator::Pipe, _left, right) = &*node.expr {
+        if let Expr::FnCall { .. } = &*right.expr {
+            out.insert(right.id);
+        }
+    }
+    for child in child_nodes(node) {
+        collect_pipe_target_calls(child, out);
+    }
 }
 
 /// Map from schema-name → field-name → declared type. Lets the
@@ -103,6 +126,14 @@ struct Walker<'a> {
     schema_index: SchemaIndex,
     enum_index: EnumIndex,
     base_index: SchemaBaseIndex,
+    /// Stage 3.5: NodeIds of FnCall expressions that appear on the RHS
+    /// of a `|` pipe operator. The pipe implicitly supplies the LHS as
+    /// the call's first positional argument, so the static arity /
+    /// type check would false-flag (`range(5) | len()` would otherwise
+    /// flag `len()` as missing its 1 arg). The walker pre-collects
+    /// these ids before recursing so the FnCall arm can suppress the
+    /// signature check on them.
+    pipe_target_calls: HashSet<relon_parser::NodeId>,
 }
 
 impl<'a> Walker<'a> {
@@ -131,6 +162,15 @@ impl<'a> Walker<'a> {
                     } else {
                         None
                     };
+                    // Stage 3.3: when a dict field's value is itself a
+                    // closure, index the field name → closure NodeId so
+                    // sibling-callable lookups (`{ f(x): x, y: f(1) }`)
+                    // can find the static signature without re-walking.
+                    if let (Some(name), Expr::Closure { .. }) = (field_name, &*value.expr) {
+                        self.tree
+                            .field_closure_index
+                            .insert(name.to_string(), value.id);
+                    }
                     self.visit_internal(value, field_name);
                 }
                 self.scope_stack.pop();
@@ -149,6 +189,15 @@ impl<'a> Walker<'a> {
                             .insert(param.name.clone(), t.clone());
                     }
                 }
+                // Stage 3.3: extract the closure's signature *before*
+                // walking the body so any nested FnCall to a sibling-
+                // bound recursive closure resolves against the same
+                // signature. The walker doesn't carry the closure's own
+                // NodeId (it's the parent node's id), so we record it
+                // against the field-value node id supplied by the dict
+                // arm via `field_closure_index`.
+                let sig = extract_closure_signature(node, params, return_type, body);
+                self.tree.closure_signatures.insert(node.id, sig);
                 self.scope_stack.push(frame);
                 if let Some(declared_return) = return_type {
                     self.check_closure_return(params, body, declared_return, field_name);
@@ -183,6 +232,7 @@ impl<'a> Walker<'a> {
             }
             Expr::FnCall { path, args } => {
                 self.check_unresolved_fn_call(node, path);
+                self.check_fn_call(node, path, args);
                 for arg in args {
                     self.visit_internal(&arg.value, None);
                 }
@@ -223,6 +273,149 @@ impl<'a> Walker<'a> {
             name: name.clone(),
             range: span_of(node.range),
         });
+    }
+
+    /// Stage 3.5 / 3.6: validate a `FnCall` against its static
+    /// signature when one is reachable. Three sources, in order:
+    ///
+    /// 1. A multi-segment path whose head resolves to a sibling dict
+    ///    field whose value is a closure (Stage 3.6 dict-literal
+    ///    sibling form).
+    /// 2. A single-segment name resolved through
+    ///    [`lookup_signature`] (closure index → host fns → stdlib).
+    ///
+    /// Anything not in those tables silently passes — runtime keeps
+    /// owning the verdict for cross-module fns, dynamic refs, etc.
+    fn check_fn_call(&mut self, node: &Node, path: &[TokenKey], args: &[relon_parser::CallArg]) {
+        // Pipe RHS: the LHS supplies the implicit first arg, so the
+        // source-level arity is intentionally one short. Skipping
+        // here keeps the analyzer in lock-step with the runtime's
+        // pipe semantics (`call_function` prepends the LHS value).
+        if self.pipe_target_calls.contains(&node.id) {
+            return;
+        }
+        let Some(sig) = self.resolve_call_signature(path) else {
+            return;
+        };
+        let display_name = sig.name.clone();
+        let positional_count = args.iter().filter(|a| a.name.is_none()).count();
+        // v1 only validates positional args; named args silently pass
+        // (they would just shadow positions or be redundant). Bail out
+        // early when any named arg is present so we don't false-flag.
+        if positional_count != args.len() {
+            return;
+        }
+        // Arity check honoring optional tail params and variadic_tail.
+        let (required, max_fixed) = required_and_max(&sig);
+        let in_range = if sig.variadic_tail.is_some() {
+            args.len() >= required
+        } else {
+            args.len() >= required && args.len() <= max_fixed
+        };
+        if !in_range {
+            let expected = if sig.variadic_tail.is_some() {
+                format!("at least {required}")
+            } else if required == max_fixed {
+                format!("{required}")
+            } else {
+                format!("{required} to {max_fixed}")
+            };
+            self.tree
+                .diagnostics
+                .push(Diagnostic::FnCallArgCountMismatch {
+                    fn_name: display_name,
+                    expected,
+                    found: args.len(),
+                    range: span_of(node.range),
+                });
+            return;
+        }
+
+        // Per-arg type check. Arguments past the fixed list are
+        // validated against `variadic_tail`. Arguments mapped to
+        // optional params still check, but a missing optional is fine
+        // (already accepted above by `required <= len`).
+        //
+        // We collect diagnostics into a local Vec so the inference
+        // scope's read-only borrow of `self.tree` doesn't collide with
+        // the diagnostic push's mutable borrow.
+        let mut to_emit: Vec<Diagnostic> = Vec::new();
+        {
+            let scope = self.build_type_scope();
+            for (idx, arg) in args.iter().enumerate() {
+                let (param_name, expected_ty) = if idx < sig.params.len() {
+                    (sig.params[idx].name.clone(), sig.params[idx].ty.clone())
+                } else if let Some(tail_ty) = &sig.variadic_tail {
+                    (format!("rest[{}]", idx - sig.params.len()), tail_ty.clone())
+                } else {
+                    continue;
+                };
+                let Some(arg_ty) = infer_type(&arg.value, &scope) else {
+                    continue;
+                };
+                if arg_ty.subsumes_with(&expected_ty, Some(&self.base_index)) {
+                    continue;
+                }
+                to_emit.push(Diagnostic::FnCallArgTypeMismatch {
+                    fn_name: display_name.clone(),
+                    param_name,
+                    expected: format_type(&expected_ty),
+                    found: arg_ty.name(),
+                    range: span_of(arg.value.range),
+                });
+            }
+        }
+        self.tree.diagnostics.extend(to_emit);
+    }
+
+    /// Stage 3.5: resolve a call path to its static signature.
+    /// Single-segment paths go through the global lookup
+    /// (closure-index → host fns → stdlib). Multi-segment paths fall
+    /// back to the Stage 3.6 dict-literal sibling form: the head must
+    /// name a sibling whose value is a Dict literal, and the second
+    /// segment must name a key in that dict whose value is a closure.
+    /// Anything else returns `None` (silent fall-through).
+    fn resolve_call_signature(&self, path: &[TokenKey]) -> Option<FnSignature> {
+        if path.is_empty() {
+            return None;
+        }
+        // Head must be a String key — Spread / synthetic keys can never
+        // produce a callable.
+        let TokenKey::String(head, _, _) = &path[0] else {
+            return None;
+        };
+        if path.len() == 1 {
+            return lookup_signature(head, self.tree, &self.tree.host_fn_signatures);
+        }
+        // Multi-segment v1: limit to dict-literal sibling closure.
+        if path.len() != 2 {
+            return None;
+        }
+        let TokenKey::String(method, _, _) = &path[1] else {
+            return None;
+        };
+        let target = self.lookup_field_node(head)?;
+        // Only walk literal dicts — abstract types (FnCall / Reference
+        // / typed schema bindings) silently fall through to runtime.
+        if target.type_hint.is_some() {
+            return None;
+        }
+        let Expr::Dict(inner_pairs) = &*target.expr else {
+            return None;
+        };
+        for (k, v) in inner_pairs {
+            if let TokenKey::String(name, _, _) = k {
+                if name == method {
+                    if matches!(&*v.expr, Expr::Closure { .. }) {
+                        let mut sig = self.tree.closure_signatures.get(&v.id).cloned()?;
+                        sig.name = format!("{head}.{method}");
+                        return Some(sig);
+                    }
+                    return None;
+                }
+            }
+        }
+        None
     }
 
     /// Push a `StaticTypeMismatch` when a binary operator is applied to
@@ -735,6 +928,66 @@ impl<'a> Walker<'a> {
 // removed here; consumers that need the old name-string view can
 // build it from `InferredType::name`.
 
+/// Return `(required_count, max_fixed_count)` for the given signature.
+/// `required_count` is the number of leading non-optional params;
+/// `max_fixed_count` is the total fixed-param count (including
+/// trailing optionals). Variadic tail handling is layered on top by
+/// the caller.
+fn required_and_max(sig: &FnSignature) -> (usize, usize) {
+    let max = sig.params.len();
+    // Optional params are tail-only by convention (validators), but we
+    // count from the back to be safe — the first non-optional encountered
+    // anchors `required`.
+    let mut required = max;
+    for p in sig.params.iter().rev() {
+        if p.optional {
+            required -= 1;
+        } else {
+            break;
+        }
+    }
+    (required, max)
+}
+
+/// Stage 3.3: derive a [`FnSignature`] from the closure AST. Each
+/// `ClosureParam` becomes an `FnParam` with `optional: false` (v1
+/// doesn't model defaulted params); the return type comes from the
+/// explicit `-> T` annotation when present, otherwise defaults to `Any`
+/// because the body's inferred type may depend on values we don't see
+/// during the closure-collection phase. The returned signature is
+/// stored on `AnalyzedTree::closure_signatures` and consulted by
+/// [`crate::sig::lookup_signature`] when a sibling callable is invoked.
+fn extract_closure_signature(
+    closure_node: &Node,
+    params: &[ClosureParam],
+    return_type: &Option<TypeNode>,
+    _body: &Node,
+) -> FnSignature {
+    let fn_params: Vec<FnParam> = params
+        .iter()
+        .map(|p| FnParam {
+            name: p.name.clone(),
+            ty: p
+                .type_hint
+                .clone()
+                .unwrap_or_else(|| type_node_simple("Any")),
+            optional: false,
+        })
+        .collect();
+    let return_ty = return_type
+        .clone()
+        .unwrap_or_else(|| type_node_simple("Any"));
+    FnSignature {
+        // Closures are anonymous at the language level; the analyzer
+        // names them by their `NodeId` so diagnostics referring back to
+        // the original site still have an unambiguous handle.
+        name: format!("<closure#{:?}>", closure_node.id),
+        params: fn_params,
+        return_type: return_ty,
+        variadic_tail: None,
+    }
+}
+
 fn format_type(t: &TypeNode) -> String {
     let suffix = if t.is_optional { "?" } else { "" };
     let path = t.path.join(".");
@@ -785,40 +1038,52 @@ fn levenshtein(a: &str, b: &str) -> usize {
 /// fn names but the typecheck pass can't tell whether a `Variable("string")`
 /// was bound by an in-scope `#import` we haven't statically modeled, so
 /// we keep them silent rather than spam the user.
+/// Names actually registered with [`Context::register_fn`] in the
+/// evaluator. Mirrors `crates/relon-evaluator/src/stdlib.rs::register_to`
+/// — kept lockstep via the drift-defense test.
+pub(crate) fn stdlib_registered_names() -> &'static [&'static str] {
+    &[
+        "len",
+        "_len",
+        "range",
+        "type",
+        "_list_map",
+        "_list_filter",
+        "_list_reduce",
+        "_list_contains",
+        "_string_split",
+        "_string_join",
+        "_string_replace",
+        "_string_upper",
+        "_string_lower",
+        "_string_contains",
+        "_dict_merge",
+        "_dict_keys",
+        "_dict_values",
+        "_dict_has_key",
+        "_math_abs",
+        "_math_max",
+        "_math_min",
+        "_math_clamp",
+        "ensure.int",
+        "ensure.string",
+        "ensure.bool",
+        "ensure.float",
+        "ensure.list",
+        "ensure.dict",
+        "ensure.at_least",
+        "ensure.at_most",
+        "ensure.one_of",
+        "ensure.required_fields",
+        "ensure.requires",
+        "ensure.fields_equal",
+    ]
+}
+
 fn stdlib_names() -> &'static std::collections::HashSet<&'static str> {
     use std::sync::OnceLock;
     static NAMES: OnceLock<std::collections::HashSet<&'static str>> = OnceLock::new();
     NAMES.get_or_init(|| {
-        // Real registrations from `relon-evaluator/src/stdlib.rs`.
-        let registered = [
-            "len",
-            "_len",
-            "range",
-            "type",
-            "_list_map",
-            "_list_filter",
-            "_list_reduce",
-            "_list_contains",
-            "_string_split",
-            "_string_join",
-            "_string_replace",
-            "_string_upper",
-            "_string_lower",
-            "_string_contains",
-            "_dict_merge",
-            "_dict_keys",
-            "_dict_values",
-            "_dict_has_key",
-            "_math_abs",
-            "_math_max",
-            "_math_min",
-            "_math_clamp",
-            // `ensure.*` validators are dotted names; the analyzer only
-            // sees the head when `ensure` appears as a Variable head, so
-            // we whitelist `ensure` itself here. The dotted path is then
-            // a `Reference` whose tail is resolved at runtime.
-            "ensure",
-        ];
         // Module aliases conventionally introduced by `#import std/<name>`.
         // The user's source might use them as bare variables before the
         // import directive lands in `tree.imports`; we keep them silent
@@ -828,7 +1093,13 @@ fn stdlib_names() -> &'static std::collections::HashSet<&'static str> {
             "type_of",
         ];
         let mut set = std::collections::HashSet::new();
-        for n in registered.iter().chain(import_aliases.iter()) {
+        // `ensure` itself is the head of dotted paths like `ensure.int`;
+        // the analyzer only sees the head when it appears as a Variable.
+        set.insert("ensure");
+        for n in stdlib_registered_names()
+            .iter()
+            .chain(import_aliases.iter())
+        {
             set.insert(*n);
         }
         set
@@ -1224,13 +1495,16 @@ mod tests {
     }
 
     /// Stage 1.4 reverse: when the referenced sibling is itself a fn
-    /// call (not statically classifiable), the analyzer must stay
-    /// silent — runtime keeps owning the verdict.
+    /// call to a name the analyzer can't resolve to a static signature,
+    /// stay silent — runtime keeps owning the verdict. (Stage 3 added
+    /// signature lookup for stdlib fns like `range`, so we use an
+    /// unknown name here to preserve the original silent-on-fncall
+    /// invariant.)
     #[test]
     fn does_not_flag_fncall_sibling_reference() {
         let tree = analyze_str(
             r#"{
-                xs: range(0, 10),
+                xs: dynamic_unknown_fn(),
                 Int y: xs
             }"#,
         );
@@ -1604,7 +1878,10 @@ mod tests {
         use std::collections::HashSet;
         let mut host_fn_names = HashSet::new();
         host_fn_names.insert("my_native".to_string());
-        let opts = crate::AnalyzeOptions { host_fn_names };
+        let opts = crate::AnalyzeOptions {
+            host_fn_names,
+            ..Default::default()
+        };
         let node = parse_document(r#"{ x: my_native() }"#).unwrap();
         let tree = crate::analyze_with_options(&node, &opts);
         let unresolved: Vec<_> = tree
@@ -1681,5 +1958,303 @@ mod tests {
                 assert_eq!(field, "use_as_a");
             }
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Stage 3 — closure / user fn / stdlib signature lookup + FnCall
+    //          arity / arg-type checks. Tests numbered to match the
+    //          design doc's §10 coverage list.
+    // ------------------------------------------------------------------
+
+    /// Stage 3.7 #1: `range()` with zero args flags `FnCallArgCountMismatch`
+    /// (signature requires at least 1 Int).
+    #[test]
+    fn stage3_range_zero_args_arg_count() {
+        let tree = analyze_str(r#"{ x: range() }"#);
+        let mismatches: Vec<_> = tree
+            .diagnostics
+            .iter()
+            .filter(|d| matches!(d, Diagnostic::FnCallArgCountMismatch { fn_name, .. } if fn_name == "range"))
+            .collect();
+        assert_eq!(mismatches.len(), 1, "{:?}", tree.diagnostics);
+    }
+
+    /// Stage 3.7 #2: `range(0, "ten")` — the second arg is a String
+    /// where the variadic_tail is Int.
+    #[test]
+    fn stage3_range_string_arg_arg_type() {
+        let tree = analyze_str(r#"{ x: range(0, "ten") }"#);
+        let mismatches: Vec<_> = tree
+            .diagnostics
+            .iter()
+            .filter(|d| matches!(d, Diagnostic::FnCallArgTypeMismatch { fn_name, .. } if fn_name == "range"))
+            .collect();
+        assert_eq!(mismatches.len(), 1, "{:?}", tree.diagnostics);
+    }
+
+    /// Stage 3.7 #3: `len(123)` — the analyzer signature accepts `Any`
+    /// for `len`'s param so this stays silent (v1 doesn't model the
+    /// String∣List∣Dict union). Documents the v1 trade-off.
+    #[test]
+    fn stage3_len_int_silent_v1() {
+        let tree = analyze_str(r#"{ x: len(123) }"#);
+        let mismatches: Vec<_> = tree
+            .diagnostics
+            .iter()
+            .filter(|d| matches!(d, Diagnostic::FnCallArgTypeMismatch { .. }))
+            .collect();
+        assert!(mismatches.is_empty(), "{:?}", tree.diagnostics);
+    }
+
+    /// Stage 3.7 #4 forward: `len([1,2])` returns Int — `Int n: len(...)`
+    /// is happy.
+    #[test]
+    fn stage3_len_returns_int() {
+        let tree = analyze_str(r#"{ Int n: len([1, 2]) }"#);
+        let mismatches: Vec<_> = tree
+            .diagnostics
+            .iter()
+            .filter(|d| matches!(d, Diagnostic::StaticTypeMismatch { field, .. } if field == "n"))
+            .collect();
+        assert!(mismatches.is_empty(), "{:?}", tree.diagnostics);
+    }
+
+    /// Stage 3.7 #4 reverse: a `String s: len([1,2])` slot mismatches.
+    #[test]
+    fn stage3_len_returns_int_string_slot_mismatches() {
+        let tree = analyze_str(r#"{ String s: len([1, 2]) }"#);
+        let mismatches: Vec<_> = tree
+            .diagnostics
+            .iter()
+            .filter(|d| matches!(d, Diagnostic::StaticTypeMismatch { field, .. } if field == "s"))
+            .collect();
+        assert_eq!(mismatches.len(), 1, "{:?}", tree.diagnostics);
+    }
+
+    /// Stage 3.7 #5: user closure `f(Int x) -> Int: x+1` called with
+    /// a String arg flags `FnCallArgTypeMismatch`.
+    #[test]
+    fn stage3_user_closure_arg_type_mismatch() {
+        let tree = analyze_str(r#"{ Int f(Int x): x + 1, y: f("str") }"#);
+        let mismatches: Vec<_> = tree
+            .diagnostics
+            .iter()
+            .filter(|d| matches!(d, Diagnostic::FnCallArgTypeMismatch { fn_name, .. } if fn_name == "f"))
+            .collect();
+        assert_eq!(mismatches.len(), 1, "{:?}", tree.diagnostics);
+    }
+
+    /// Stage 3.7 #6: user closure return type drives slot inference —
+    /// `String y: f(1)` mismatches because `f` returns Int.
+    #[test]
+    fn stage3_user_closure_return_drives_slot() {
+        let tree = analyze_str(r#"{ Int f(Int x): x + 1, String y: f(1) }"#);
+        let mismatches: Vec<_> = tree
+            .diagnostics
+            .iter()
+            .filter(|d| matches!(d, Diagnostic::StaticTypeMismatch { field, .. } if field == "y"))
+            .collect();
+        assert_eq!(mismatches.len(), 1, "{:?}", tree.diagnostics);
+    }
+
+    /// Stage 3.7 #7: `_math_abs()` — zero args.
+    #[test]
+    fn stage3_math_abs_no_args() {
+        let tree = analyze_str(r#"{ x: _math_abs() }"#);
+        let mismatches: Vec<_> = tree
+            .diagnostics
+            .iter()
+            .filter(|d| matches!(d, Diagnostic::FnCallArgCountMismatch { fn_name, .. } if fn_name == "_math_abs"))
+            .collect();
+        assert_eq!(mismatches.len(), 1, "{:?}", tree.diagnostics);
+    }
+
+    /// Stage 3.7 #8: `_string_upper(123)` — wrong type.
+    #[test]
+    fn stage3_string_upper_int_arg() {
+        let tree = analyze_str(r#"{ x: _string_upper(123) }"#);
+        let mismatches: Vec<_> = tree
+            .diagnostics
+            .iter()
+            .filter(|d| matches!(d, Diagnostic::FnCallArgTypeMismatch { fn_name, .. } if fn_name == "_string_upper"))
+            .collect();
+        assert_eq!(mismatches.len(), 1, "{:?}", tree.diagnostics);
+    }
+
+    /// Stage 3.7 #9 reverse: `range(0, 10)` is legal (uses variadic_tail).
+    #[test]
+    fn stage3_range_two_args_legal() {
+        let tree = analyze_str(r#"{ x: range(0, 10) }"#);
+        let mismatches: Vec<_> = tree
+            .diagnostics
+            .iter()
+            .filter(|d| {
+                matches!(
+                    d,
+                    Diagnostic::FnCallArgCountMismatch { .. }
+                        | Diagnostic::FnCallArgTypeMismatch { .. }
+                )
+            })
+            .collect();
+        assert!(mismatches.is_empty(), "{:?}", tree.diagnostics);
+    }
+
+    /// Stage 3.7 #10 reverse: undefined fn name silently falls through
+    /// the FnCall checker (still emits `UnresolvedReference`, but no
+    /// FnCall diagnostic).
+    #[test]
+    fn stage3_undefined_fn_silent_on_signature_check() {
+        let tree = analyze_str(r#"{ f(): undefined() }"#);
+        let fn_call_diags: Vec<_> = tree
+            .diagnostics
+            .iter()
+            .filter(|d| {
+                matches!(
+                    d,
+                    Diagnostic::FnCallArgCountMismatch { .. }
+                        | Diagnostic::FnCallArgTypeMismatch { .. }
+                )
+            })
+            .collect();
+        assert!(fn_call_diags.is_empty(), "{:?}", tree.diagnostics);
+    }
+
+    /// Stage 3.7 #11 reverse: a host fn registered without a signature
+    /// silently passes the FnCall check.
+    #[test]
+    fn stage3_host_fn_without_sig_silent() {
+        use std::collections::HashSet;
+        let mut host_fn_names = HashSet::new();
+        host_fn_names.insert("my_native".to_string());
+        let opts = crate::AnalyzeOptions {
+            host_fn_names,
+            ..Default::default()
+        };
+        let node = parse_document(r#"{ x: my_native(1, 2, 3) }"#).unwrap();
+        let tree = crate::analyze_with_options(&node, &opts);
+        let fn_call_diags: Vec<_> = tree
+            .diagnostics
+            .iter()
+            .filter(|d| {
+                matches!(
+                    d,
+                    Diagnostic::FnCallArgCountMismatch { .. }
+                        | Diagnostic::FnCallArgTypeMismatch { .. }
+                )
+            })
+            .collect();
+        assert!(fn_call_diags.is_empty(), "{:?}", tree.diagnostics);
+    }
+
+    /// Stage 3.7 #12 reverse: an arg whose type is dynamic (`Any`)
+    /// silently passes the per-arg check.
+    #[test]
+    fn stage3_dynamic_arg_silent() {
+        // The `_string_upper` param is String. Pass an unresolvable
+        // identifier (silent on inference) → arg infer returns None →
+        // the per-arg check `continue`s.
+        let tree = analyze_str(r#"{ f(x): _string_upper(x) }"#);
+        let mismatches: Vec<_> = tree
+            .diagnostics
+            .iter()
+            .filter(|d| matches!(d, Diagnostic::FnCallArgTypeMismatch { .. }))
+            .collect();
+        assert!(mismatches.is_empty(), "{:?}", tree.diagnostics);
+    }
+
+    /// Stage 3.7 #13 (consistency): when the analyzer reports an
+    /// `FnCallArgTypeMismatch`, `tree.has_errors()` is true so the
+    /// evaluator's facade refuses to run before reaching the runtime
+    /// path. Pins the contract that analyzer-reported errors gate
+    /// evaluation.
+    #[test]
+    fn stage3_arg_type_mismatch_marks_tree_errored() {
+        let tree = analyze_str(r#"{ Int f(Int x): x + 1, y: f("str") }"#);
+        assert!(tree.has_errors(), "{:?}", tree.diagnostics);
+    }
+
+    /// Stage 3.7 #14 (known short-fall): cross-module fn imports v1
+    /// silent. The signature lookup only sees stdlib + host + same-
+    /// file closures; an `#import`ed user closure has no signature
+    /// reachable here, so the call goes unchecked. This test pins the
+    /// v1 limitation explicitly so a later v1.1 stage can flip it.
+    #[test]
+    fn stage3_cross_module_fn_import_silent_v1() {
+        // A bare-`Variable("module_alias")` head doesn't even reach
+        // FnCall handling — but a `module.fn(arg)` form does. We verify
+        // it stays silent against the FnCall checker. Modeling cross-
+        // module signatures is deferred to v1.1.
+        let tree = analyze_str(r#"{ x: imported.fn(1, 2, 3) }"#);
+        let fn_call_diags: Vec<_> = tree
+            .diagnostics
+            .iter()
+            .filter(|d| {
+                matches!(
+                    d,
+                    Diagnostic::FnCallArgCountMismatch { .. }
+                        | Diagnostic::FnCallArgTypeMismatch { .. }
+                )
+            })
+            .collect();
+        assert!(fn_call_diags.is_empty(), "{:?}", tree.diagnostics);
+    }
+
+    /// Stage 3.7 #15: dict-literal sibling closure call (`utils.greet`)
+    /// resolves to the closure's signature and accepts a legal arg.
+    #[test]
+    fn stage3_sibling_closure_dict_literal_call_silent() {
+        let tree = analyze_str(
+            r#"{
+                utils: { greet(s): "hi" + s },
+                x: utils.greet("a")
+            }"#,
+        );
+        let fn_call_diags: Vec<_> = tree
+            .diagnostics
+            .iter()
+            .filter(|d| {
+                matches!(
+                    d,
+                    Diagnostic::FnCallArgCountMismatch { .. }
+                        | Diagnostic::FnCallArgTypeMismatch { .. }
+                )
+            })
+            .collect();
+        assert!(fn_call_diags.is_empty(), "{:?}", tree.diagnostics);
+    }
+
+    /// Stage 3.7 #16: same dict-literal sibling form, but the closure
+    /// declares `String s` and the call passes an Int — the analyzer
+    /// flags `FnCallArgTypeMismatch`.
+    #[test]
+    fn stage3_sibling_closure_dict_literal_arg_type_mismatch() {
+        let tree = analyze_str(
+            r#"{
+                utils: { greet(String s): "hi" + s },
+                x: utils.greet(123)
+            }"#,
+        );
+        let mismatches: Vec<_> = tree
+            .diagnostics
+            .iter()
+            .filter(|d| matches!(d, Diagnostic::FnCallArgTypeMismatch { .. }))
+            .collect();
+        assert_eq!(mismatches.len(), 1, "{:?}", tree.diagnostics);
+    }
+
+    /// Stage 3.2 drift defense: every name registered by the
+    /// evaluator's `stdlib::register_to` must have a signature in
+    /// `stdlib_signatures`. If a maintainer adds a new fn to the
+    /// evaluator without updating the analyzer table, this test
+    /// fails — keeping the two views in lockstep.
+    #[test]
+    fn stage3_stdlib_signatures_cover_all_register_fn_names() {
+        let sigs = crate::stdlib_signatures::stdlib_signatures();
+        let names = stdlib_registered_names();
+        let missing: Vec<&&str> = names.iter().filter(|n| !sigs.contains_key(**n)).collect();
+        assert!(
+            missing.is_empty(),
+            "stdlib functions without analyzer signatures: {missing:?}"
+        );
     }
 }

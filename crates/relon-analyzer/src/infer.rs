@@ -24,6 +24,7 @@ use relon_parser::{Expr, Node, Operator, TokenKey, TypeNode};
 use std::collections::HashMap;
 
 use crate::resolve::ScopeFrame;
+use crate::sig::lookup_signature;
 use crate::tree::AnalyzedTree;
 
 /// Map from schema-name → field-name → declared type. Lets the inference
@@ -499,9 +500,23 @@ pub(crate) fn infer_type(node: &Node, scope: &TypeScope) -> Option<InferredType>
             }
             acc
         }
-        // FnCall / Comprehension / Where / Spread fall through to None
-        // — Stage 1 explicitly leaves them for later phases. Returning
-        // None here means callers won't try to validate them.
+        // Stage 3.5: when the call's head resolves to a known
+        // signature (closure-index → host fns → stdlib), surface its
+        // return type. Multi-segment / unknown calls still return
+        // `None` so runtime keeps the verdict.
+        Expr::FnCall { path, .. } => {
+            if path.len() != 1 {
+                return None;
+            }
+            let TokenKey::String(name, _, _) = path.first()? else {
+                return None;
+            };
+            let tree = scope.tree?;
+            let sig = lookup_signature(name, tree, &tree.host_fn_signatures)?;
+            Some(infer_from_type_node(&sig.return_type))
+        }
+        // Comprehension / Where / Spread fall through to None — Stage 1
+        // explicitly leaves them for later phases.
         _ => None,
     }
 }

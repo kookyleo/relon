@@ -26,6 +26,8 @@ pub mod modules;
 pub mod resolve;
 pub mod root_schemas;
 pub mod schema;
+pub mod sig;
+pub(crate) mod stdlib_signatures;
 pub mod tree;
 pub mod typecheck;
 pub mod workspace;
@@ -39,6 +41,7 @@ pub use root_schemas::RootSchemaDecl;
 pub use schema::{
     lower_schema_pure, BaseRef, EnumVariant, MetaDecoratorRef, SchemaDef, SchemaFieldDef,
 };
+pub use sig::{lookup_signature, type_node_generic, type_node_simple, FnParam, FnSignature};
 pub use tree::AnalyzedTree;
 pub use workspace::{
     analyze_entry, analyze_entry_with_options, LoadError, LoadedModule, ModuleLoader, Workspace,
@@ -46,7 +49,7 @@ pub use workspace::{
 };
 
 use relon_parser::Node;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// Run every analyzer pass over `root` and return the aggregated tree.
 ///
@@ -71,6 +74,7 @@ pub fn analyze(root: &Node) -> AnalyzedTree {
 pub fn analyze_with_options(root: &Node, options: &AnalyzeOptions) -> AnalyzedTree {
     let mut tree = AnalyzedTree::new();
     tree.host_fn_names = options.host_fn_names.clone();
+    tree.host_fn_signatures = options.host_fn_signatures.clone();
     schema::collect_schemas(root, &mut tree);
     // Root-level `#schema A Body` directives must run after
     // `collect_schemas` so the dual-declaration collision check has the
@@ -106,4 +110,10 @@ pub struct AnalyzeOptions {
     /// populate this from their `Capabilities::allow_native_fn` set or
     /// from the keys of `Context::functions` directly.
     pub host_fn_names: HashSet<String>,
+    /// Stage 3.4: signatures the host has declared for its native fns.
+    /// When supplied, the FnCall checker validates arity / arg types
+    /// against these signatures (same machinery the stdlib table
+    /// drives). Names without a signature continue to participate only
+    /// in the `host_fn_names` allowlist (silent on FnCall checking).
+    pub host_fn_signatures: HashMap<String, FnSignature>,
 }

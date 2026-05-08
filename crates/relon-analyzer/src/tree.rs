@@ -9,6 +9,7 @@ use crate::main_sig::MainSignature;
 use crate::resolve::ResolvedRef;
 use crate::root_schemas::RootSchemaDecl;
 use crate::schema::SchemaDef;
+use crate::sig::FnSignature;
 use relon_parser::{Node, NodeId};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -52,6 +53,20 @@ pub struct AnalyzedTree {
     /// legacy single-file `analyze` entry; populated when the caller
     /// drives analysis through `analyze_with_options`.
     pub host_fn_names: HashSet<String>,
+    /// Stage 3: signatures the host has supplied for its native fns
+    /// (via `AnalyzeOptions::host_fn_signatures`). Looked up by
+    /// `lookup_signature` to drive `FnCall` arity / type checks for
+    /// custom fns, in the same way the stdlib table covers builtins.
+    pub host_fn_signatures: HashMap<String, FnSignature>,
+    /// Stage 3.3: signatures of every user closure encountered in
+    /// source. Keyed by the closure's `Expr::Closure` AST `NodeId`.
+    /// Populated by the type-check walker when it enters each closure.
+    pub closure_signatures: HashMap<NodeId, FnSignature>,
+    /// Stage 3.3: index from a dict-field name to the `NodeId` of the
+    /// closure value bound to it. Lets `lookup_signature` find the
+    /// signature for a sibling closure call without re-walking the
+    /// scope chain.
+    pub field_closure_index: HashMap<String, NodeId>,
 }
 
 impl AnalyzedTree {
