@@ -1,8 +1,9 @@
 use clap::{Parser, Subcommand};
 use miette::{IntoDiagnostic, LabeledSpan, NamedSource, Report};
 use relon_evaluator::module::FilesystemModuleResolver;
-use relon_evaluator::{Capabilities, Context, Evaluator, Scope};
+use relon_evaluator::{Capabilities, Context, Evaluator, Scope, Value};
 use relon_parser::{parse_document, ParseDocumentError};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -23,6 +24,13 @@ enum Commands {
         /// Pretty-print the output JSON
         #[arg(short, long, default_value_t = true)]
         pretty: bool,
+        /// JSON object whose keys are `#main(...)` parameter names and
+        /// whose values are the host-pushed args. Required if the
+        /// target file declares a `#main(...)` signature; ignored
+        /// otherwise. Either pass JSON inline (`--args '{"u": ...}'`)
+        /// or via stdin redirect (`--args -` reads from stdin).
+        #[arg(long)]
+        args: Option<String>,
     },
 }
 
@@ -30,7 +38,7 @@ fn main() -> miette::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Run { file, pretty } => {
+        Commands::Run { file, pretty, args } => {
             let canonical_file = std::fs::canonicalize(&file)
                 .into_diagnostic()
                 .map_err(|e| e.wrap_err(format!("Failed to resolve file {:?}", file)))?;
@@ -99,10 +107,66 @@ fn main() -> miette::Result<()> {
             root_scope.cache_namespace = cache_namespace;
             let scope = std::sync::Arc::new(root_scope);
 
-            let result = evaluator.eval_root(&scope).map_err(|e| {
-                Report::new(e)
-                    .with_source_code(NamedSource::new(file.to_string_lossy(), content.clone()))
-            })?;
+            // Branch on whether the file declares `#main(...)`. With a
+            // signature, hosts push args; without one, we walk the body
+            // as plain data. Both shapes share the same root scope.
+            let has_main = analyzed.main_signature.is_some();
+            let result = if has_main {
+                let args_json = match args.as_deref() {
+                    Some("-") => {
+                        use std::io::Read;
+                        let mut buf = String::new();
+                        std::io::stdin()
+                            .read_to_string(&mut buf)
+                            .into_diagnostic()
+                            .map_err(|e| e.wrap_err("Failed to read --args from stdin"))?;
+                        buf
+                    }
+                    Some(other) => other.to_string(),
+                    None => {
+                        return Err(miette::miette!(
+                            "File declares `#main(...)`; pass --args '<json>' (or --args -) to provide host arguments"
+                        )
+                        .with_source_code(NamedSource::new(file.to_string_lossy(), content)));
+                    }
+                };
+                let parsed: serde_json::Value = serde_json::from_str(&args_json).map_err(|e| {
+                    miette::miette!("--args must be a JSON object: {e}")
+                        .with_source_code(NamedSource::new(file.to_string_lossy(), content.clone()))
+                })?;
+                let serde_json::Value::Object(map) = parsed else {
+                    return Err(miette::miette!(
+                        "--args must be a JSON object whose keys are `#main(...)` parameter names"
+                    )
+                    .with_source_code(NamedSource::new(file.to_string_lossy(), content)));
+                };
+                let mut args_map: HashMap<String, Value> = HashMap::new();
+                for (k, v) in map {
+                    let val: Value = serde_json::from_value(v).map_err(|e| {
+                        miette::miette!("--args[{k}] could not be deserialized into Value: {e}")
+                            .with_source_code(NamedSource::new(
+                                file.to_string_lossy(),
+                                content.clone(),
+                            ))
+                    })?;
+                    args_map.insert(k, val);
+                }
+                evaluator.run_main(&scope, args_map).map_err(|e| {
+                    Report::new(e)
+                        .with_source_code(NamedSource::new(file.to_string_lossy(), content.clone()))
+                })?
+            } else {
+                if args.is_some() {
+                    return Err(miette::miette!(
+                        "--args was provided but the file has no `#main(...)` signature"
+                    )
+                    .with_source_code(NamedSource::new(file.to_string_lossy(), content)));
+                }
+                evaluator.eval_root(&scope).map_err(|e| {
+                    Report::new(e)
+                        .with_source_code(NamedSource::new(file.to_string_lossy(), content.clone()))
+                })?
+            };
 
             let final_val = relon::to_json_value(result).map_err(|e| {
                 miette::miette!("{}", e)
