@@ -76,6 +76,39 @@ The complete v1 built-in decorator set: `@value(...)`. Any other
 `@name(...)` is parsed as "look up `name` in the current scope; pass
 the value below as the last positional argument".
 
+### 1.4 Static-analysis-first principle
+
+Relon's baseline error-handling rule:
+
+> **Any error whose detection only depends on source / module graph
+> / schema / stdlib signatures MUST be reported at the analyzer
+> stage; only errors that depend on host-pushed values, native-fn
+> return values, or data-driven branch outcomes are permitted to
+> remain runtime errors.**
+
+This is the same design tilt as Rust: catch what you can before the
+program runs. In Relon, "compile time" concretely means the
+`parser → analyzer` static pipeline; "runtime" is the evaluator's
+walk.
+
+Every `RuntimeError` variant — when added or modified — must be
+audited against this rule:
+
+- If the question "why didn't analyzer catch this?" has an answer
+  (the check needs runtime data), it stays runtime.
+- If it doesn't, the check must be moved into analyzer as a new
+  diagnostic.
+- Errors analyzer already covers (e.g. `UnresolvedReference`,
+  `StaticTypeMismatch`, `NonExhaustiveMatch`) MUST NOT be
+  re-reported as a separate runtime error; analyzer is the
+  authority.
+
+Known v1 gaps (tracked under the staging roadmap): expression-level
+type inference covers only literals; closure-body reference
+resolution still leans runtime; there's no static reachability
+analysis for capabilities. These gaps are scheduled for staged
+hardening.
+
 ## 2. Determinism contract
 
 To honor §1, every conformant runtime MUST:
