@@ -4,6 +4,7 @@
 //! not modified — consumers (evaluator, LSP) read the tables they need and
 //! ignore the rest. Adding a new pass means adding a new table here.
 
+use crate::cap::{Capabilities, NativeFnGate};
 use crate::diagnostic::Diagnostic;
 use crate::main_sig::MainSignature;
 use crate::resolve::ResolvedRef;
@@ -67,6 +68,16 @@ pub struct AnalyzedTree {
     /// signature for a sibling closure call without re-walking the
     /// scope chain.
     pub field_closure_index: HashMap<String, NodeId>,
+    /// Stage 4: per-fn capability requirements supplied by the host
+    /// (mirror of `relon_evaluator::eval::NativeFnGate`). Drives the
+    /// static reachability check — a gated fn called from a reachable
+    /// site whose required cap isn't in `caps` produces
+    /// `Diagnostic::CapabilityRequired`.
+    pub host_fn_gates: HashMap<String, NativeFnGate>,
+    /// Stage 4: the context-wide capability grant the host plans to
+    /// hand the evaluator. Compared against `host_fn_gates` during the
+    /// reachability check.
+    pub caps: Capabilities,
 }
 
 impl AnalyzedTree {

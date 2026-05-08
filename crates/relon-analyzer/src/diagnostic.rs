@@ -280,6 +280,22 @@ pub enum Diagnostic {
         #[label("type mismatch")]
         range: SourceSpan,
     },
+
+    #[error(
+        "native function `{fn_name}` requires capability `{capability}`, but it isn't granted"
+    )]
+    #[diagnostic(
+        code(relon::analyze::capability_required),
+        help(
+            "This native fn was registered with `register_fn_with_caps` requiring `{capability}`, but the host's `Capabilities` doesn't grant it. Either grant the capability (e.g. `caps.reads_fs = true` / add the fn name to `allow_native_fn`) or stop calling this fn from a script-reachable path."
+        )
+    )]
+    CapabilityRequired {
+        fn_name: String,
+        capability: String,
+        #[label("would be denied at runtime")]
+        range: SourceSpan,
+    },
 }
 
 impl Diagnostic {
@@ -307,7 +323,11 @@ impl Diagnostic {
             | Diagnostic::UnknownTypeName { .. }
             | Diagnostic::MainReturnTypeMismatch { .. }
             | Diagnostic::FnCallArgCountMismatch { .. }
-            | Diagnostic::FnCallArgTypeMismatch { .. } => Severity::Error,
+            | Diagnostic::FnCallArgTypeMismatch { .. }
+            // Stage 4: capability errors are derivable from source +
+            // host_fn_gates + caps alone — surface as Error so the
+            // evaluator never reaches the gated call.
+            | Diagnostic::CapabilityRequired { .. } => Severity::Error,
             // Informational: the analyzer's view is conservative — a
             // spread, closure binding, or runtime-computed field may
             // still resolve, so we don't gate evaluation on it.

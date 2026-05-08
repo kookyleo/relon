@@ -16,6 +16,8 @@
 //! the AST itself stays immutable and consumers (evaluator, LSP, lint)
 //! pick up just the side-tables they need.
 
+pub mod cap;
+pub(crate) mod capability_check;
 pub(crate) mod decorator_names;
 pub mod diagnostic;
 pub(crate) mod directive_names;
@@ -33,6 +35,7 @@ pub mod typecheck;
 pub mod workspace;
 mod workspace_build;
 
+pub use cap::{Capabilities, NativeFnGate};
 pub use diagnostic::{Diagnostic, Severity};
 pub use main_sig::{MainParam, MainSignature};
 pub use modules::ModuleImport;
@@ -75,6 +78,8 @@ pub fn analyze_with_options(root: &Node, options: &AnalyzeOptions) -> AnalyzedTr
     let mut tree = AnalyzedTree::new();
     tree.host_fn_names = options.host_fn_names.clone();
     tree.host_fn_signatures = options.host_fn_signatures.clone();
+    tree.host_fn_gates = options.host_fn_gates.clone();
+    tree.caps = options.caps.clone();
     schema::collect_schemas(root, &mut tree);
     // Root-level `#schema A Body` directives must run after
     // `collect_schemas` so the dual-declaration collision check has the
@@ -116,4 +121,16 @@ pub struct AnalyzeOptions {
     /// drives). Names without a signature continue to participate only
     /// in the `host_fn_names` allowlist (silent on FnCall checking).
     pub host_fn_signatures: HashMap<String, FnSignature>,
+    /// Stage 4: capability requirements declared by each registered
+    /// native fn (mirror of the evaluator's `NativeFnGate` table). A
+    /// missing entry means the fn was registered ungated (i.e. via
+    /// `register_fn` not `register_fn_with_caps`) — the static check
+    /// stays silent on it. Hosts populate this from the `gate` argument
+    /// they passed to `register_fn_with_caps`.
+    pub host_fn_gates: HashMap<String, cap::NativeFnGate>,
+    /// Stage 4: the host's actual capability grant (mirror of the
+    /// evaluator's `Capabilities`). Used by the static reachability
+    /// check to decide whether a gated fn would be denied at runtime.
+    /// Defaults to zero-trust — same as the evaluator default.
+    pub caps: cap::Capabilities,
 }

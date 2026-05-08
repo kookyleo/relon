@@ -119,6 +119,12 @@ pub(crate) fn build<L: ModuleLoader>(
     //    correction has to happen here.
     re_check_unknown_types(&mut ws);
 
+    // 5. Stage 4: cross-module capability reachability. Runs after the
+    //    import index is settled because the walker needs every
+    //    reachable module's `node_index` populated. Diagnostics land
+    //    on the entry tree.
+    crate::capability_check::run(&mut ws);
+
     ws
 }
 
