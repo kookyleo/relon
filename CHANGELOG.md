@@ -10,41 +10,76 @@ schemas — no explicit declaration needed.
 
 ```relon
 #schema Box<T> { T value: * }
-#schema Result<T, E>: Enum<Ok { T value: * }, Err { E error: * }>
+#schema Pair<A, B> { A first: *, B second: * }
 ```
 
-The parser now accepts an optional `<T, U, ...>` form-parameter list
+The parser accepts an optional `<T, U, ...>` form-parameter list
 between the schema name and its body. `DirectiveBody::NameBody`
 carries the new `generics: Vec<String>`; the analyzer threads it
 through `lower_schema_pure`; `Value::EnumSchema` carries it
 alongside the existing `Value::Schema`. The evaluator's `check_type`
-performs name-substitution on instantiation
-(`Result<Int, String>` → `{T -> Int, E -> String}`), so payload
-fields are validated against the actual instantiated type.
-
-Both root-level (`#schema X<T> Body`) and dict-embedded
-(`#schema X<T> Body,`) forms are wired through.
+performs name-substitution on instantiation (`Box<Int>` →
+`{T -> Int}`), so payload fields are validated against the actual
+instantiated type. Both root-level (`#schema X<T> Body`) and
+dict-embedded (`#schema X<T> Body,`) forms are wired through.
 
 ### `Result<T, E>` and `Option<T>` in the prelude
 
+`Context::new` seeds `Result` and `Option` into the per-context
+schema table:
+
 ```relon
-#main(Int n) -> Dict
-{ ok: Result.Ok { value: n } }     // works without a `#schema Result ...`
+// definitions live in the prelude — users don't write them
+#schema Result<T, E>: Enum<Ok { T value: * }, Err { E error: * }>
+#schema Option<T>: Enum<Some { T value: * }, None>
 ```
 
-`Context::new` seeds `Result` and `Option` into the per-context
-schema table. They behave like any user-defined enum schema —
-`Result.Ok { value: 1 }` constructs a branded variant; type-hinted
-fields like `Result<Int, String> r: Result.Ok { value: 1 }` enforce
-the payload type. Hosts that want a custom `Result` / `Option` can
-still call `Context::register_schema` to override the prelude entry.
+These are **value-level** types — used inside data, not as the
+program's overall return shape. Examples of intended use:
 
-Limitation: the field-level type hint (`Result<Int, String> r: ...`)
-is what triggers the generics substitution today; using
-`Result<Int, String>` as a `#main(...) -> ReturnType` clause requires
-the body to be a dict/list (root-shape limitation), so end-to-end
-return-type validation against a *variant constructor* hasn't been
-exercised yet — coverage is via field-level usage.
+```relon
+// As a field type, with payload type-checked
+{
+    Option<String> nickname: *,
+    Result<Int, String> parsed: Result.Ok { value: 42 },
+}
+
+// As a return type for a user-defined function/closure
+parse(s):
+    s == "" ? Result.Err { error: "empty" }
+            : Result.Ok { value: 0 + s }
+```
+
+Hosts that want a custom `Result` / `Option` can call
+`Context::register_schema` to override the prelude entry.
+
+### Result is *not* the entry program's return shape
+
+`#main(...) -> ReturnType` declares the **Json shape** the program
+produces, not a Rust-style `Result<T, E>` wrapper. The success-vs-
+failure distinction lives at the **host boundary** —
+`Evaluator::run_main` already returns `Result<Value, RuntimeError>`
+in Rust. So the right pattern is:
+
+```relon
+// Good: ReturnType describes the Json the body produces
+#main(Order order) -> Order
+{ id: order.id, total: order.total * 1.1 }
+```
+
+```relon
+// Avoid: writing Result at the entry boundary
+// — the host already gets Result<Value, RuntimeError> from Rust;
+//   wrapping it again in Relon is double-bookkeeping.
+#main(Order order) -> Result<Order, String>
+...
+```
+
+Root bodies remain restricted to dict / list literals (an entry
+program returns a Json tree). Variant constructors like
+`Result.Ok { ... }` can appear inside dict / list values but not as
+the root expression — which falls out cleanly from the layering:
+the root *is* the Json, never an `Ok` / `Err` wrapper around it.
 
 ## [Unreleased] — Review pass (post-batch-3)
 

@@ -143,7 +143,7 @@ source、拒绝它拒绝的所有 source。语法 corpus 由
 | Value | `#name <expr>` | `#default 0`、`#expect "must be ≥0"`、`#brand Color` | 元数据 / 值变换 |
 | NameBody | `#name <ident> <body>` | `#schema User { String name: * }` | 命名声明（无冒号） |
 | Import | `#import <bindspec> from "<path>"` | `#import * from "std/list"` | 导入 |
-| Main | `#main(Type name, ...) [-> ReturnType]` | `#main(User u, Cart cart) -> Result<Order>` | 入口签名 |
+| Main | `#main(Type name, ...) [-> ReturnType]` | `#main(User u, Cart cart) -> Order` | 入口签名 |
 
 `<bindspec>` 是以下三者之一：单个 ident（命名空间）、`*`（spread）、
 `{ a, b as c }`（析构）。
@@ -279,7 +279,25 @@ std 模块通过**虚拟解析器**（`StdModuleResolver`）服务，**不消耗
 }
 ```
 
-可选的 `-> ReturnType` 子句声明返回值的类型；省略时不校验返回值。
+可选的 `-> ReturnType` 子句声明 body 产生的 **Json 形态**——一个
+原子值、dict 或 list 的 schema/类型。省略时不校验返回值。
+
+**`ReturnType` 不该写成 `Result<T, E>`**：成功 vs 失败的区分发生
+在**宿主边界**——`Evaluator::run_main` 在 Rust 一侧已经返回
+`Result<Value, RuntimeError>`，在 Relon 文件里再包一层 Result 是
+重复记账。Relon 内置的 `Result<T, E>` / `Option<T>`（见 §X 内置
+schema）是**值层**概念，用于建模数据里某个字段「可能没有」/「可能
+失败」，不该出现在入口签名的返回位置。
+
+```relon
+// 正确：ReturnType 描述 body 产生的 Json
+#main(Order order) -> Order
+{ id: order.id, total: order.total * 1.1 }
+
+// 应避免：在入口边界写 Result —— 与宿主侧的 Rust Result 重复
+#main(Order order) -> Result<Order, String>
+...
+```
 
 **语义要求**（每个 conformant runtime 必须按此实现）：
 

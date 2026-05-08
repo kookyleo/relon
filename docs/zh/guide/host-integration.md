@@ -61,6 +61,38 @@ host-pushed slot：
   `MissingMainArg`；多字段 → `UnexpectedMainArg`；类型不匹配 →
   `MainArgTypeMismatch`。
 
+### 入口边界 Result 与 Relon 值层 Result
+
+宿主调用 `run_main` 拿到的是 Rust 一侧的
+`Result<Value, RuntimeError>`：成功时 `Ok(json_value)`，失败时
+`Err(...)`（schema 校验未过、运行时溢出、capability 拒绝等）。这条
+**边界 Result 由 Rust 端承担**——脚本作者不感知。
+
+`#main(...) -> ReturnType` 中的 `ReturnType` 描述的是 **body 产生
+的 Json 形态**（一个原子值、dict 或 list），不是 Result 包装。
+Relon 内置的 `Result<T, E>` / `Option<T>` 是**值层**概念（建模数据
+里某个字段「可能没有」/「可能失败」），不该出现在入口签名的返回
+位置。
+
+```relon
+// 正确：ReturnType 描述 body 产生的 Json
+#main(Order order) -> Order
+{ id: order.id, total: order.total * 1.1 }
+
+// 应避免：在入口边界写 Result —— 与 Rust 侧的 Result 重复记账
+#main(Order order) -> Result<Order, String>
+...
+```
+
+宿主代码侧：
+
+```rust
+match evaluator.run_main(&scope, args) {
+    Ok(value) => /* value 是 ReturnType 描述的 Json */,
+    Err(e)    => /* 校验/求值/能力错误 */,
+}
+```
+
 这样写有几个一致好处：
 - 「外部数据契约」写在 .relon 文件里，任何 conformant runtime 按相
   同 schema 校验

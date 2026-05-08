@@ -159,7 +159,7 @@ table) and is not user-extensible:
 | Value | `#name <expr>` | `#default 0`, `#expect "must be ≥0"`, `#brand Color` | Metadata / value transform |
 | NameBody | `#name <ident> <body>` | `#schema User { String name: * }` | Named declaration (no colon) |
 | Import | `#import <bindspec> from "<path>"` | `#import * from "std/list"` | Import |
-| Main | `#main(Type name, ...) [-> ReturnType]` | `#main(User u, Cart cart) -> Result<Order>` | Entry signature |
+| Main | `#main(Type name, ...) [-> ReturnType]` | `#main(User u, Cart cart) -> Order` | Entry signature |
 
 `<bindspec>` is one of: a single ident (namespace), `*` (spread), or
 `{ a, b as c }` (destructuring).
@@ -302,8 +302,29 @@ Multiple parameters are listed side-by-side:
 }
 ```
 
-The optional `-> ReturnType` clause declares the entry's return
-type; omitting it leaves the return value unchecked.
+The optional `-> ReturnType` clause declares the **Json shape** the
+body produces — an atom, dict, or list schema/type. Omitting it
+leaves the return value unchecked.
+
+**Don't write `ReturnType` as `Result<T, E>`.** The success-vs-
+failure distinction lives at the **host boundary** —
+`Evaluator::run_main` already returns `Result<Value, RuntimeError>`
+on the Rust side, so wrapping that again in Relon is double
+bookkeeping. The built-in `Result<T, E>` / `Option<T>` (see §X on
+prelude schemas) are **value-level** concepts for modelling
+"this field may be missing / may have failed" inside data — not for
+the entry's overall return position.
+
+```relon
+// Good: ReturnType describes the Json the body produces
+#main(Order order) -> Order
+{ id: order.id, total: order.total * 1.1 }
+
+// Avoid: writing Result at the entry boundary — the host already
+// gets Result<Value, RuntimeError> from Rust.
+#main(Order order) -> Result<Order, String>
+...
+```
 
 **Semantic requirements** (every conformant runtime MUST implement):
 
