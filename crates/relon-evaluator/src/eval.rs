@@ -103,6 +103,15 @@ pub struct Context {
     /// with different bound parameters.
     pub(crate) closure_call_counter: AtomicU64,
     pub analyzed: Option<Arc<relon_analyzer::AnalyzedTree>>,
+    /// Pre-computed workspace tree (entry + every reachable module),
+    /// produced by `relon_analyzer::analyze_entry`. When present, the
+    /// evaluator's `evaluate_module_source` skips the per-module
+    /// parse-plus-analyze pass and looks up the cached node and
+    /// analyzed tree directly. The field is independent of
+    /// `analyzed`; the latter remains the side-table for the entry
+    /// file specifically, so existing callers that don't drive
+    /// workspace analysis keep working unchanged.
+    pub workspace: Option<Arc<relon_analyzer::WorkspaceTree>>,
     pub capabilities: Capabilities,
 }
 
@@ -134,6 +143,7 @@ impl Context {
             step_counter: AtomicU64::new(0),
             closure_call_counter: AtomicU64::new(0),
             analyzed: None,
+            workspace: None,
             capabilities: Capabilities::default(),
         };
         crate::builtin_decorators::register_to(&mut this);
@@ -173,6 +183,20 @@ impl Context {
 
     pub fn with_analyzed(mut self, tree: Arc<relon_analyzer::AnalyzedTree>) -> Self {
         self.analyzed = Some(tree);
+        self
+    }
+
+    /// Wire a pre-computed workspace tree into the context. The
+    /// workspace's entry tree (if present) is also installed as
+    /// `analyzed` so callers that read either field see consistent
+    /// data — gives single-file consumers the same view they had
+    /// before, and gives module-loading code a fast path to skip
+    /// per-module parse + analyze.
+    pub fn with_workspace(mut self, workspace: Arc<relon_analyzer::WorkspaceTree>) -> Self {
+        if let Some(entry) = workspace.modules.get(&workspace.entry_id) {
+            self.analyzed = Some(Arc::clone(entry));
+        }
+        self.workspace = Some(workspace);
         self
     }
 
@@ -1375,42 +1399,33 @@ impl Evaluator {
         let _loading_guard = self
             .context
             .enter_loading_module(source.canonical_id.clone());
-        let node =
-            parse_document(&source.source).map_err(|error| RuntimeError::ModuleParseError {
-                path: source.canonical_id.clone(),
-                message: error.to_string(),
-                range: range.into(),
-            })?;
-        // Run the analyzer on the imported module so structural errors
-        // (missing schema field types, malformed `#main` signatures,
-        // duplicate root schemas, etc.) surface at load time rather than
-        // being silently accepted. The resulting `AnalyzedTree` is *not*
-        // wired into the evaluator yet — the active `Context::analyzed`
-        // belongs to the entry file and its `NodeId` keys won't match
-        // module-local nodes anyway, so the runtime falls back to
-        // `lower_schema_pure` for the module body. That's a known
-        // optimization gap; the correctness gain (raising errors instead
-        // of swallowing them) is what this pass delivers today.
-        let analyzed = relon_analyzer::analyze(&node);
-        if analyzed.has_errors() {
-            let first_error = analyzed
-                .diagnostics
-                .iter()
-                .find(|d| d.severity() == relon_analyzer::Severity::Error)
-                .expect("has_errors() implies at least one Error diagnostic");
-            return Err(RuntimeError::ModuleParseError {
-                path: source.canonical_id.clone(),
-                message: format!("module analyzer reported errors: {first_error}"),
-                range: range.into(),
-            });
-        }
+
+        // Fast path: workspace pre-analyzed this module, so we can
+        // pull both the parsed root node and the analyzer's verdict
+        // out of the workspace tree directly. The workspace pass is
+        // also where structural / cycle / not-found errors are now
+        // raised — by the time we reach the evaluator, the entry has
+        // already passed `WorkspaceTree::has_errors`. So an unexpected
+        // missing-from-workspace module here is a bug in the host
+        // (workspace was assembled from a different entry) rather
+        // than a user-reachable error; we fall back to parse+analyze
+        // on the spot to keep behavior conservative.
+        let node_arc: Arc<Node> = if let Some(ws) = &self.context.workspace {
+            if let Some(arc) = ws.nodes.get(&source.canonical_id) {
+                Arc::clone(arc)
+            } else {
+                fallback_parse_analyze(&source, range)?
+            }
+        } else {
+            fallback_parse_analyze(&source, range)?
+        };
         let module_scope = Arc::new(Scope {
             current_dir: source.current_dir,
             cache_namespace: source.canonical_id.clone(),
-            root_ref: Some(crate::scope::RootRef::new(Arc::new(node.clone()))),
+            root_ref: Some(crate::scope::RootRef::new(Arc::clone(&node_arc))),
             ..Default::default()
         });
-        let evaluated = self.eval(&node, &module_scope)?;
+        let evaluated = self.eval(&node_arc, &module_scope)?;
         self.context
             .module_cache
             .lock()
@@ -1910,6 +1925,37 @@ impl Evaluator {
         }
         Ok(())
     }
+}
+
+/// Slow path used by `evaluate_module_source` when no workspace tree
+/// is wired into the context (or the workspace is missing the module
+/// the resolver returned). Parses + analyzes on the spot, mirroring
+/// the pre-Stage-0 behavior so single-file consumers (tests that
+/// build a `Context` directly without a workspace, ad-hoc embeddings)
+/// keep working.
+fn fallback_parse_analyze(
+    source: &ModuleSource,
+    range: TokenRange,
+) -> Result<Arc<Node>, RuntimeError> {
+    let node = parse_document(&source.source).map_err(|error| RuntimeError::ModuleParseError {
+        path: source.canonical_id.clone(),
+        message: error.to_string(),
+        range: range.into(),
+    })?;
+    let analyzed = relon_analyzer::analyze(&node);
+    if analyzed.has_errors() {
+        let first_error = analyzed
+            .diagnostics
+            .iter()
+            .find(|d| d.severity() == relon_analyzer::Severity::Error)
+            .expect("has_errors() implies at least one Error diagnostic");
+        return Err(RuntimeError::ModuleParseError {
+            path: source.canonical_id.clone(),
+            message: format!("module analyzer reported errors: {first_error}"),
+            range: range.into(),
+        });
+    }
+    Ok(Arc::new(node))
 }
 
 /// Caps handle handed to native functions so they can call back into Relon.

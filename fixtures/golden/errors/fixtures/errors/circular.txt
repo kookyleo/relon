@@ -1,4 +1,5 @@
 CircularImport
 chain:
 fixtures/errors/circular.relon
+fixtures/errors/circular.relon
 range: 2:5-2:43

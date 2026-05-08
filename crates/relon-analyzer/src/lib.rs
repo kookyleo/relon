@@ -27,6 +27,7 @@ pub mod schema;
 pub mod tree;
 pub mod typecheck;
 pub mod workspace;
+mod workspace_build;
 
 pub use diagnostic::{Diagnostic, Severity};
 pub use main_sig::{MainParam, MainSignature};
@@ -37,7 +38,10 @@ pub use schema::{
     lower_schema_pure, BaseRef, EnumVariant, MetaDecoratorRef, SchemaDef, SchemaFieldDef,
 };
 pub use tree::AnalyzedTree;
-pub use workspace::Workspace;
+pub use workspace::{
+    analyze_entry, LoadError, LoadedModule, ModuleLoader, Workspace, WorkspaceDiagnostic,
+    WorkspaceDiagnosticItem, WorkspaceTree,
+};
 
 use relon_parser::Node;
 

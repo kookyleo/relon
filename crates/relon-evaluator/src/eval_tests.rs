@@ -3218,3 +3218,99 @@ fn dynamic_path_segment_is_evaluated_only_once() {
         "dynamic key expression should evaluate exactly once"
     );
 }
+
+#[test]
+fn with_workspace_wires_entry_tree_into_analyzed_field() {
+    use std::sync::Arc;
+    // `Context::with_workspace` is a sugar that mounts the workspace
+    // tree *and* surfaces the entry's per-file analyzed tree on the
+    // legacy `analyzed` field, so single-file code paths that read
+    // `Context::analyzed` keep working.
+    let node = parse_doc("{ a: 1 }");
+    let arc_node = Arc::new(node.clone());
+    let mut ws = relon_analyzer::WorkspaceTree::new();
+    ws.entry_id = "memory:entry".to_string();
+    ws.modules.insert(
+        "memory:entry".to_string(),
+        Arc::new(relon_analyzer::analyze(&node)),
+    );
+    ws.nodes.insert("memory:entry".to_string(), arc_node);
+
+    let ctx = Context::new().with_root(node).with_workspace(Arc::new(ws));
+    assert!(
+        ctx.analyzed.is_some(),
+        "with_workspace should wire entry analyzed tree"
+    );
+    assert!(ctx.workspace.is_some());
+}
+
+#[test]
+fn workspace_module_lookup_skips_reparse_during_evaluate_module_source() {
+    // Set up a module the workspace pre-analyzed. The evaluator's
+    // module-load path should pull both the parsed Node and the
+    // AnalyzedTree out of the workspace rather than re-running the
+    // parser. We verify by feeding the loader a *deliberately broken*
+    // source string but a *valid* pre-parsed Node — if the evaluator
+    // ever parses, it would fail; if it uses the workspace fast path,
+    // it succeeds.
+    use crate::module::{ModuleResolver, ModuleSource};
+    use relon_parser::TokenRange;
+    use std::sync::Arc;
+
+    struct StubResolver;
+    impl ModuleResolver for StubResolver {
+        fn resolve(
+            &self,
+            path: &str,
+            _scope: &Arc<Scope>,
+            _range: TokenRange,
+        ) -> Result<Option<ModuleSource>, RuntimeError> {
+            if path != "stub/module" {
+                return Ok(None);
+            }
+            Ok(Some(ModuleSource {
+                canonical_id: "stub/module".to_string(),
+                // Intentionally invalid Relon — only the workspace
+                // fast path can succeed against this module.
+                source: "<<<this would fail to parse>>>".to_string(),
+                current_dir: String::new(),
+            }))
+        }
+    }
+
+    // Pre-parse a valid module body and stash it in the workspace.
+    let module_node = parse_doc("{ greeting: \"hi\" }");
+    let module_arc = Arc::new(module_node.clone());
+    let mut ws = relon_analyzer::WorkspaceTree::new();
+    ws.entry_id = "memory:entry".to_string();
+    ws.modules.insert(
+        "stub/module".to_string(),
+        Arc::new(relon_analyzer::analyze(&module_node)),
+    );
+    ws.nodes
+        .insert("stub/module".to_string(), Arc::clone(&module_arc));
+    // Entry: imports the stub module by alias and reads `greeting`.
+    let entry_node = parse_doc(
+        r#"#import m from "stub/module"
+        { msg: m.greeting }"#,
+    );
+    let entry_arc = Arc::new(entry_node.clone());
+    ws.modules.insert(
+        "memory:entry".to_string(),
+        Arc::new(relon_analyzer::analyze(&entry_node)),
+    );
+    ws.nodes.insert("memory:entry".to_string(), entry_arc);
+
+    let mut ctx = Context::new()
+        .with_root(entry_node)
+        .with_workspace(Arc::new(ws));
+    ctx.prepend_module_resolver(Arc::new(StubResolver));
+    let ctx = Arc::new(ctx);
+    let result = Evaluator::new(Arc::clone(&ctx))
+        .eval_root(&Arc::new(Scope::default()))
+        .expect("workspace fast path should bypass the broken source string");
+    let Value::Dict(d) = result else {
+        panic!("expected dict, got {result:?}")
+    };
+    assert_eq!(d.map.get("msg"), Some(&Value::String("hi".to_string())));
+}

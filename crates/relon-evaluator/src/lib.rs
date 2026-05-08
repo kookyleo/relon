@@ -19,7 +19,7 @@ pub use eval::{Capabilities, Context, Evaluator, NativeFnGate};
 pub use module::{FilesystemModuleResolver, ModuleResolver, ModuleSource, StdModuleResolver};
 pub use native_fn::NativeFnCaps;
 pub use native_fn::{EvaluatedArg, NativeArgs, RelonFunction};
-pub use relon_analyzer::{MainParam, MainSignature};
+pub use relon_analyzer::{MainParam, MainSignature, WorkspaceDiagnostic, WorkspaceTree};
 pub use scope::{ListContext, Scope, Thunk};
 pub use value::{SchemaField, Value, ValueDict};
 

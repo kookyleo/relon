@@ -1,9 +1,13 @@
 pub mod projector;
 
-use relon_analyzer::{analyze, AnalyzedTree, Diagnostic};
-use relon_evaluator::module::FilesystemModuleResolver;
+use relon_analyzer::{
+    analyze, analyze_entry, AnalyzedTree, Diagnostic, LoadError, LoadedModule, ModuleLoader,
+    WorkspaceDiagnostic,
+};
+use relon_evaluator::module::{FilesystemModuleResolver, ModuleResolver, StdModuleResolver};
 use relon_evaluator::{Capabilities, Context, Evaluator, RuntimeError, Scope, Value};
 use relon_parser::parse_document;
+use relon_parser::TokenRange;
 use serde::de::DeserializeOwned;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -31,6 +35,22 @@ pub enum Error {
     /// fail-fast like [`Error::Eval`].
     #[error("analyzer reported {} error(s)", .0.len())]
     Analyze(Vec<Diagnostic>),
+
+    /// Workspace-level analyzer findings (cycles, missing imports,
+    /// cross-module schema collisions, parse errors in imported
+    /// modules) plus any per-module analyzer errors discovered while
+    /// walking the import graph. Distinct from [`Error::Analyze`] so
+    /// hosts can decide to render the import-graph errors with a
+    /// different layout (e.g. "imported here" labels).
+    #[error(
+        "workspace analyzer reported {} workspace-level and {} module-level error(s)",
+        workspace.len(),
+        modules.len()
+    )]
+    AnalyzeWorkspace {
+        workspace: Vec<WorkspaceDiagnostic>,
+        modules: Vec<(String, Diagnostic)>,
+    },
 
     #[error(transparent)]
     Eval(#[from] RuntimeError),
@@ -140,24 +160,147 @@ pub enum ProjectError<P> {
     Project(#[source] P),
 }
 
+/// Adapter that bridges the analyzer's `ModuleLoader` trait to the
+/// evaluator's existing `ModuleResolver` chain. Lets the workspace
+/// pass reuse exactly the same lookup rules (std/* virtual modules,
+/// trusted filesystem) as runtime imports, without the analyzer crate
+/// having to depend on `std::fs` directly.
+struct FacadeLoader {
+    resolvers: Vec<Arc<dyn ModuleResolver>>,
+}
+
+impl FacadeLoader {
+    fn new_trusted() -> Self {
+        // Mirror the resolver chain that `evaluate_source` mounts on
+        // the `Context` below: `std/*` first, then trusted filesystem
+        // fallback. Any host change to one chain has to be made to the
+        // other; centralized here so future refactors can collapse the
+        // two assemblies.
+        Self {
+            resolvers: vec![
+                Arc::new(StdModuleResolver),
+                Arc::new(FilesystemModuleResolver::trusted()),
+            ],
+        }
+    }
+}
+
+impl ModuleLoader for FacadeLoader {
+    fn load(
+        &mut self,
+        path: &str,
+        current_dir: &Path,
+    ) -> std::result::Result<LoadedModule, LoadError> {
+        // The analyzer-side trait is independent of `Scope` — the
+        // evaluator-side resolvers want a `Scope` so they can read
+        // `current_dir`. Build a synthetic scope that carries just
+        // that field, since none of the resolvers we mount in the
+        // facade consult any of the others.
+        let mut scope = Scope::default();
+        scope.current_dir = current_dir.to_string_lossy().to_string();
+        let scope = Arc::new(scope);
+        for resolver in &self.resolvers {
+            match resolver.resolve(path, &scope, TokenRange::default()) {
+                Ok(Some(source)) => {
+                    let dir = if source.current_dir.is_empty() {
+                        current_dir.to_path_buf()
+                    } else {
+                        PathBuf::from(&source.current_dir)
+                    };
+                    return Ok(LoadedModule {
+                        canonical_id: source.canonical_id,
+                        source: source.source,
+                        current_dir: dir,
+                    });
+                }
+                Ok(None) => continue,
+                Err(RuntimeError::CapabilityDenied { reason, .. }) => {
+                    return Err(LoadError::AccessDenied(reason));
+                }
+                Err(RuntimeError::ModuleNotFound(_, _)) => {
+                    return Err(LoadError::NotFound);
+                }
+                Err(other) => {
+                    return Err(LoadError::Other(other.to_string()));
+                }
+            }
+        }
+        Err(LoadError::NotFound)
+    }
+}
+
+/// Reduce a workspace-level error set into the format required by
+/// `Error::AnalyzeWorkspace`: workspace-only diagnostics in one bucket,
+/// per-module errors in another.
+fn workspace_error_payload(
+    workspace: &relon_analyzer::WorkspaceTree,
+) -> (Vec<WorkspaceDiagnostic>, Vec<(String, Diagnostic)>) {
+    let ws_errs: Vec<_> = workspace
+        .workspace_diagnostics
+        .iter()
+        .filter(|d| d.severity() == relon_analyzer::Severity::Error)
+        .cloned()
+        .collect();
+    let mut module_errs: Vec<(String, Diagnostic)> = Vec::new();
+    for (id, tree) in &workspace.modules {
+        for d in &tree.diagnostics {
+            if d.severity() == relon_analyzer::Severity::Error {
+                module_errs.push((id.clone(), d.clone()));
+            }
+        }
+    }
+    (ws_errs, module_errs)
+}
+
 fn evaluate_source(
     source: &str,
     current_dir: impl Into<String>,
     cache_namespace: impl Into<String>,
 ) -> Result<Value> {
-    let node = parse_document(source).map_err(|err| Error::Parse(err.to_string()))?;
-
-    // Run the analyzer first so any structural problems (malformed
-    // `#schema`, untyped schema fields, ...) surface as a batched
-    // `Error::Analyze` before we touch the evaluator. Diagnostics at
-    // `Error` severity short-circuit; warnings are silently attached to
-    // the evaluator context for runtime fast-paths.
-    let mut analyzed = analyze(&node);
-    if analyzed.has_errors() {
-        return Err(Error::Analyze(analyzed.take_diagnostics()));
-    }
+    let current_dir = current_dir.into();
     let cache_namespace = cache_namespace.into();
-    let analyzed = Arc::new(analyzed);
+
+    // Surface entry-level parse failures as `Error::Parse` so callers
+    // that want to distinguish "host gave us garbage" from "import
+    // graph problem" still can. The workspace pass also catches this,
+    // but its `ModuleParseError` shape is targeted at imported modules
+    // and includes an "imported here" span that doesn't exist for the
+    // entry. We pay the cost of one extra parse on success; cheap.
+    parse_document(source).map_err(|err| Error::Parse(err.to_string()))?;
+
+    // Stage 0: drive the analyzer in workspace mode. This pulls the
+    // entry plus every transitive `#import`'d module through one BFS,
+    // running the per-file analyzer pass on each. Cycles, missing
+    // modules, parse / structural errors anywhere in the graph all
+    // surface here — before we touch the evaluator.
+    let mut loader = FacadeLoader::new_trusted();
+    let entry_dir_path = PathBuf::from(&current_dir);
+    let workspace = analyze_entry(cache_namespace.clone(), source, entry_dir_path, &mut loader);
+
+    if workspace.has_errors() {
+        let (ws_errs, module_errs) = workspace_error_payload(&workspace);
+        return Err(Error::AnalyzeWorkspace {
+            workspace: ws_errs,
+            modules: module_errs,
+        });
+    }
+
+    // Pull the entry's parsed root out of the workspace so we don't
+    // re-parse here. `analyze_entry` already wired the entry into
+    // `nodes`; on a successful workspace it's always present.
+    let entry_node = workspace
+        .nodes
+        .get(&cache_namespace)
+        .map(|arc| (**arc).clone())
+        .unwrap_or_else(|| {
+            // Defensive: if the workspace pass reported success but
+            // didn't seed the entry node (shouldn't happen), fall
+            // back to a fresh parse so the rest of the pipeline still
+            // gets a Node.
+            parse_document(source).expect("workspace passed but entry no longer parseable")
+        });
+
+    let workspace = Arc::new(workspace);
 
     // `value_from_str` / `value_from_file` are the host's "evaluate
     // this Relon document and give me the JSON" entry points — by
@@ -165,8 +308,8 @@ fn evaluate_source(
     // granted. Spelled out so a code reviewer sees the trust scope.
     let ctx = {
         let mut ctx = Context::sandboxed()
-            .with_root(node)
-            .with_analyzed(Arc::clone(&analyzed));
+            .with_root(entry_node)
+            .with_workspace(Arc::clone(&workspace));
         ctx.capabilities = Capabilities::all_granted();
         ctx.prepend_module_resolver(Arc::new(FilesystemModuleResolver::trusted()));
         Arc::new(ctx)
@@ -180,7 +323,7 @@ fn evaluate_source(
     let evaluator = Evaluator::new(Arc::clone(&ctx));
 
     let mut root_scope = Scope::default();
-    root_scope.current_dir = current_dir.into();
+    root_scope.current_dir = current_dir;
     root_scope.cache_namespace = cache_namespace;
     Ok(evaluator.eval_root(&Arc::new(root_scope))?)
 }
@@ -300,17 +443,19 @@ mod tests {
     fn analyzer_aggregates_multiple_schema_errors() {
         // Two independent structural problems in one source: one body that
         // isn't a dict, and one field without a type annotation. The
-        // analyzer should report both in a single batch instead of
-        // bailing out on the first.
+        // workspace analyzer should report both in a single batch
+        // instead of bailing out on the first.
         let result = value_from_str(
             r#"#schema BadBody 42
 #schema BadField { name: * }
 {}"#,
         );
 
-        let diags = match result {
-            Err(Error::Analyze(diags)) => diags,
-            other => panic!("expected Error::Analyze, got {other:?}"),
+        let diags: Vec<Diagnostic> = match result {
+            Err(Error::AnalyzeWorkspace { modules, .. }) => {
+                modules.into_iter().map(|(_, d)| d).collect()
+            }
+            other => panic!("expected Error::AnalyzeWorkspace, got {other:?}"),
         };
         assert!(
             diags
@@ -456,6 +601,65 @@ mod tests {
     }
 
     #[test]
+    fn workspace_catches_cycle_before_evaluator() {
+        // Stage 0 promise: a cycle in the import graph surfaces as
+        // `Error::AnalyzeWorkspace` (not `Error::Eval(...)`), meaning
+        // the evaluator never starts. The fixture file imports itself,
+        // which is the simplest cycle to trigger.
+        let dir = std::env::temp_dir().join(format!("relon-cycle-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let entry_path = dir.join("self.relon");
+        std::fs::write(
+            &entry_path,
+            r#"{
+                #import self_alias from "./self.relon",
+                msg: "hi"
+            }"#,
+        )
+        .unwrap();
+
+        let result = value_from_file(&entry_path);
+        let _ = std::fs::remove_dir_all(&dir);
+        match result {
+            Err(Error::AnalyzeWorkspace { workspace, .. }) => {
+                assert!(
+                    workspace
+                        .iter()
+                        .any(|d| matches!(d, WorkspaceDiagnostic::CircularImport { .. })),
+                    "{workspace:?}"
+                );
+            }
+            other => panic!("expected AnalyzeWorkspace(CircularImport), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn workspace_catches_missing_import_before_evaluator() {
+        let dir = std::env::temp_dir().join(format!("relon-missing-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let entry_path = dir.join("entry.relon");
+        std::fs::write(
+            &entry_path,
+            r#"#import x from "./does_not_exist.relon"
+            { v: 1 }"#,
+        )
+        .unwrap();
+        let result = value_from_file(&entry_path);
+        let _ = std::fs::remove_dir_all(&dir);
+        match result {
+            Err(Error::AnalyzeWorkspace { workspace, .. }) => {
+                assert!(
+                    workspace
+                        .iter()
+                        .any(|d| matches!(d, WorkspaceDiagnostic::ModuleNotFound { .. })),
+                    "{workspace:?}"
+                );
+            }
+            other => panic!("expected AnalyzeWorkspace(ModuleNotFound), got {other:?}"),
+        }
+    }
+
+    #[test]
     fn unmarked_file_works_as_entry_and_as_import() {
         // The default file role is double-purpose: entry-evaluatable
         // AND importable. Sanity-check both directions on one file.
@@ -514,6 +718,41 @@ mod tests {
 
     fn format_error_golden(root: &Path, file: &Path, error: Error) -> String {
         match error {
+            Error::AnalyzeWorkspace { workspace, .. } => {
+                // After Stage 0, circular imports are caught by the
+                // workspace analyzer rather than the evaluator. Render
+                // the first CircularImport diagnostic in the same
+                // shape the runtime variant used to produce so the
+                // existing goldens still apply (with the chain list
+                // refreshed to the explicit start/end form).
+                let source = std::fs::read_to_string(file).unwrap();
+                let circular = workspace
+                    .iter()
+                    .find_map(|d| match d {
+                        WorkspaceDiagnostic::CircularImport { chain, range } => {
+                            Some((chain.clone(), *range))
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| panic!("expected CircularImport, got {workspace:?}"));
+                let (chain, span) = circular;
+                let (start_line, start_column) = line_column_at(&source, span.offset());
+                let (end_line, end_column) = line_column_at(&source, span.offset() + span.len());
+                let normalized_chain = chain
+                    .iter()
+                    .map(|path| {
+                        Path::new(path)
+                            .strip_prefix(root)
+                            .unwrap_or_else(|_| Path::new(path))
+                            .to_string_lossy()
+                            .to_string()
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                format!(
+                    "CircularImport\nchain:\n{normalized_chain}\nrange: {start_line}:{start_column}-{end_line}:{end_column}\n"
+                )
+            }
             Error::Eval(RuntimeError::CircularImport(chain, span)) => {
                 let source = std::fs::read_to_string(file).unwrap();
                 let (start_line, start_column) = line_column_at(&source, span.offset());
