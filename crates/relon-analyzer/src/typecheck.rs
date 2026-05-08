@@ -15,11 +15,10 @@
 //! [`StaticTypeMismatch`]: crate::Diagnostic::StaticTypeMismatch
 
 use crate::diagnostic::{span_of, Diagnostic};
+use crate::infer::{self, infer_type, InferredType, TypeScope};
 use crate::resolve::{build_frame, path_head, ScopeFrame};
 use crate::tree::AnalyzedTree;
-use relon_parser::{
-    child_nodes, is_builtin_type_name, Expr, Node, RefBase, TokenKey, TokenRange, TypeNode,
-};
+use relon_parser::{child_nodes, Expr, Node, RefBase, TokenKey, TokenRange, TypeNode};
 use std::collections::{HashMap, HashSet};
 
 /// Run the type-check walker over `root` and append diagnostics to
@@ -43,10 +42,11 @@ pub fn typecheck(root: &Node, tree: &mut AnalyzedTree) {
 
 /// Map from schema-name → field-name → declared type. Lets the
 /// value-type check look up `User alice: { ... }` and validate each
-/// inner field against `User`'s schema in one pass.
-type SchemaIndex = HashMap<String, HashMap<String, TypeNode>>;
+/// inner field against `User`'s schema in one pass. Re-uses the
+/// inference module's alias so both passes share the same shape.
+pub(crate) type SchemaIndex = infer::SchemaIndex;
 
-fn build_schema_index(tree: &AnalyzedTree) -> SchemaIndex {
+pub(crate) fn build_schema_index(tree: &AnalyzedTree) -> SchemaIndex {
     let mut index = SchemaIndex::new();
     for def in tree.schemas.values() {
         let Some(name) = &def.name else { continue };
@@ -116,12 +116,24 @@ impl<'a> Walker<'a> {
                 }
                 self.scope_stack.pop();
             }
-            Expr::Closure { params, body, .. } => {
+            Expr::Closure {
+                params,
+                body,
+                return_type,
+            } => {
                 let mut frame = ScopeFrame::default();
                 for param in params {
                     frame.closure_params.insert(param.name.clone(), body.id);
+                    if let Some(t) = &param.type_hint {
+                        frame
+                            .closure_param_types
+                            .insert(param.name.clone(), t.clone());
+                    }
                 }
                 self.scope_stack.push(frame);
+                if let Some(declared_return) = return_type {
+                    self.check_closure_return(params, body, declared_return, field_name);
+                }
                 self.visit_internal(body, None);
                 self.scope_stack.pop();
             }
@@ -138,11 +150,17 @@ impl<'a> Walker<'a> {
             }
             Expr::Match { expr, arms } => {
                 self.check_match_exhaustiveness(node.range, expr, arms);
+                self.check_match_arm_types(node.range, expr, arms);
                 self.visit_internal(expr, None);
                 for (pat, body) in arms {
                     self.visit_internal(pat, None);
                     self.visit_internal(body, None);
                 }
+            }
+            Expr::Binary(op, left, right) => {
+                self.check_binary_mismatch(node, *op, left, right, field_name);
+                self.visit_internal(left, None);
+                self.visit_internal(right, None);
             }
             _ => {
                 for child in child_nodes(node) {
@@ -150,6 +168,139 @@ impl<'a> Walker<'a> {
                 }
             }
         }
+    }
+
+    /// Push a `StaticTypeMismatch` when a binary operator is applied to
+    /// statically-incompatible operand types (`1 + "hello"`, `true * 3`,
+    /// …). Unknown operands (`Any`, `None`) silently pass — runtime
+    /// keeps owning the authoritative call.
+    fn check_binary_mismatch(
+        &mut self,
+        node: &Node,
+        op: relon_parser::Operator,
+        left: &Node,
+        right: &Node,
+        field_name: Option<&str>,
+    ) {
+        let scope = self.build_type_scope();
+        let Some(lt) = infer_type(left, &scope) else {
+            return;
+        };
+        let Some(rt) = infer_type(right, &scope) else {
+            return;
+        };
+        if !infer::binary_known_invalid(op, &lt, &rt) {
+            return;
+        }
+        self.tree.diagnostics.push(Diagnostic::StaticTypeMismatch {
+            field: field_name.unwrap_or("_").to_string(),
+            expected: format!("{op:?} operands compatible"),
+            found: format!("{} {op:?} {}", lt.name(), rt.name()),
+            range: span_of(node.range),
+        });
+    }
+
+    /// Build a type-scope reflecting the active dict / closure stack so
+    /// inference can resolve `Variable(x)` / `&sibling.y` heads to their
+    /// static type-hints.
+    fn build_type_scope(&self) -> TypeScope<'_> {
+        TypeScope {
+            locals: HashMap::new(),
+            schemas: Some(&self.schema_index),
+            frames: self.scope_stack.iter().collect(),
+            tree: Some(self.tree),
+        }
+    }
+
+    /// Stage 1.6: report `MatchArmTypeMismatch` when arm bodies
+    /// produce statically-incompatible types. We only fire when *every*
+    /// non-wildcard arm body is inferrable; if any arm relies on a
+    /// runtime-only computation, we punt (runtime keeps owning the
+    /// verdict). Wildcard arms are excluded from the join because their
+    /// body type is unconstrained by exhaustiveness rules.
+    fn check_match_arm_types(
+        &mut self,
+        match_range: TokenRange,
+        scrutinee: &Node,
+        arms: &[(Node, Node)],
+    ) {
+        let scope = self.build_type_scope();
+        let mut arm_types: Vec<InferredType> = Vec::new();
+        for (pat, body) in arms {
+            if matches!(pat.expr.as_ref(), Expr::Wildcard) {
+                continue;
+            }
+            // If any non-wildcard arm body is uninferrable, defer to
+            // runtime — we'd be guessing.
+            let Some(t) = infer_type(body, &scope) else {
+                return;
+            };
+            arm_types.push(t);
+        }
+        if arm_types.len() < 2 {
+            return;
+        }
+        // Reduce-by-join across all arm types; if the result collapses
+        // to `Any` while none of the inputs were `Any`, the arms are
+        // statically heterogeneous.
+        let any_input_was_any = arm_types.iter().any(|t| matches!(t, InferredType::Any));
+        let mut joined = arm_types[0].clone();
+        for t in &arm_types[1..] {
+            joined = InferredType::join(&joined, t);
+        }
+        if matches!(joined, InferredType::Any) && !any_input_was_any {
+            let enum_name = self.infer_enum_type(scrutinee);
+            self.tree
+                .diagnostics
+                .push(Diagnostic::MatchArmTypeMismatch {
+                    enum_name,
+                    arm_types: arm_types.iter().map(|t| t.name()).collect(),
+                    range: span_of(match_range),
+                });
+        }
+    }
+
+    /// Push a `StaticTypeMismatch` when a closure's body inference
+    /// disagrees with its declared `-> Type`. Closures whose body
+    /// remains uninferrable (FnCall, dynamic refs) silently pass.
+    fn check_closure_return(
+        &mut self,
+        params: &[relon_parser::ClosureParam],
+        body: &Node,
+        declared_return: &TypeNode,
+        field_name: Option<&str>,
+    ) {
+        // Build a fresh inference scope: dict frames inherited from
+        // the active stack, locals seeded with the closure's typed
+        // params (untyped params default to `Any` so they don't gate
+        // analysis).
+        let mut locals = HashMap::new();
+        for param in params {
+            let ty = param
+                .type_hint
+                .as_ref()
+                .map(infer::infer_from_type_node)
+                .unwrap_or(InferredType::Any);
+            locals.insert(param.name.clone(), ty);
+        }
+        let scope = TypeScope {
+            locals,
+            schemas: Some(&self.schema_index),
+            frames: self.scope_stack.iter().collect(),
+            tree: Some(self.tree),
+        };
+        let Some(body_ty) = infer_type(body, &scope) else {
+            return;
+        };
+        if body_ty.subsumes(declared_return) {
+            return;
+        }
+        self.tree.diagnostics.push(Diagnostic::StaticTypeMismatch {
+            field: field_name.unwrap_or("_").to_string(),
+            expected: format_type(declared_return),
+            found: body_ty.name(),
+            range: span_of(body.range),
+        });
     }
 
     /// Conservative exhaustiveness check: only fires when we can statically
@@ -297,17 +448,21 @@ impl<'a> Walker<'a> {
     /// to functions, references, etc. are deferred to the runtime
     /// check.
     fn check_typed_binding(&mut self, expected: &TypeNode, value: &Node, field_name: &str) {
-        if let Some(found) = static_type_of(value) {
-            if matches_expected(expected, &found) {
-                // Basic type matches. If this is a literal with generics (List<T>,
-                // Dict<K, V>), also check its contents.
+        // Run the inference engine against the active scope so
+        // `Variable`/`Reference` heads reach back to their dict
+        // siblings and pick up the declared type-hint. Falls back to
+        // the legacy name-string path for the diagnostic shape.
+        let scope = self.build_type_scope();
+        let inferred = infer_type(value, &scope);
+        if let Some(t) = &inferred {
+            if t.subsumes(expected) {
                 self.check_generics(expected, value, field_name);
                 return;
             }
             self.tree.diagnostics.push(Diagnostic::StaticTypeMismatch {
                 field: field_name.to_string(),
                 expected: format_type(expected),
-                found,
+                found: t.name(),
                 range: span_of(value.range),
             });
             return;
@@ -393,105 +548,12 @@ impl<'a> Walker<'a> {
     }
 }
 
-/// Return the static type-name of `node` if it can be classified
-/// without evaluating. Returns `None` for any expression whose value
-/// depends on runtime computation (FnCall, Reference, ...).
-fn static_type_of(node: &Node) -> Option<String> {
-    use relon_parser::Operator;
-    match &*node.expr {
-        Expr::Null => Some("Null".to_string()),
-        Expr::Bool(_) => Some("Bool".to_string()),
-        Expr::Int(_) => Some("Int".to_string()),
-        Expr::Float(_) => Some("Float".to_string()),
-        Expr::String(_) => Some("String".to_string()),
-        Expr::List(_) => Some("List".to_string()),
-        Expr::Dict(_) => Some("Dict".to_string()),
-        Expr::Closure { .. } => Some("Closure".to_string()),
-        Expr::Binary(op, left, right) => {
-            let lt = static_type_of(left)?;
-            let rt = static_type_of(right)?;
-            match op {
-                Operator::Add | Operator::Sub | Operator::Mul | Operator::Div | Operator::Mod => {
-                    if lt == "Int" && rt == "Int" {
-                        Some("Int".to_string())
-                    } else if (lt == "Int" || lt == "Float") && (rt == "Int" || rt == "Float") {
-                        Some("Float".to_string())
-                    } else if *op == Operator::Add && lt == "String" && rt == "String" {
-                        Some("String".to_string())
-                    } else if *op == Operator::Add && lt == "Dict" && rt == "Dict" {
-                        Some("Dict".to_string())
-                    } else if *op == Operator::Add && lt == "List" && rt == "List" {
-                        Some("List".to_string())
-                    } else {
-                        None
-                    }
-                }
-                Operator::And | Operator::Or => {
-                    if lt == "Bool" && rt == "Bool" {
-                        Some("Bool".to_string())
-                    } else {
-                        None
-                    }
-                }
-                Operator::Eq
-                | Operator::Ne
-                | Operator::Lt
-                | Operator::Gt
-                | Operator::Le
-                | Operator::Ge => Some("Bool".to_string()),
-                _ => None,
-            }
-        }
-        Expr::Unary(op, inner) => {
-            let t = static_type_of(inner)?;
-            match op {
-                Operator::Not if t == "Bool" => Some("Bool".to_string()),
-                Operator::Sub if t == "Int" || t == "Float" => Some(t),
-                _ => None,
-            }
-        }
-        Expr::Ternary { then, els, .. } => {
-            let tt = static_type_of(then)?;
-            let et = static_type_of(els)?;
-            if tt == et {
-                Some(tt)
-            } else if (tt == "Int" || tt == "Float") && (et == "Int" || et == "Float") {
-                Some("Float".to_string())
-            } else {
-                None
-            }
-        }
-        Expr::FString(_) => Some("String".to_string()),
-        _ => None,
-    }
-}
-
-/// Cheap structural match of a static `found` type-name against the
-/// declared `expected` `TypeNode`. Doesn't try to be exhaustive — only
-/// catches the obvious "I declared `Int` but you wrote a String"
-/// kinds of mistakes. Generic parameters (`List<Int>`) and union
-/// types (`Enum<...>`) are intentionally skipped because verifying
-/// them right requires walking the value's interior, which the
-/// runtime already does well.
-fn matches_expected(expected: &TypeNode, found: &str) -> bool {
-    if expected.path.len() != 1 {
-        // Multi-segment custom types — defer to runtime / the
-        // dedicated `check_against_custom_schema` walk.
-        return true;
-    }
-    let exp = expected.path[0].as_str();
-    if expected.is_optional && found == "Null" {
-        return true;
-    }
-    match exp {
-        "Any" => true,
-        "Number" => matches!(found, "Int" | "Float"),
-        // Built-in primitives must match exactly.
-        _ if is_builtin_type_name(exp) => exp == found || (exp == "Fn" && found == "Closure"),
-        // Custom schema name: defer to `check_against_custom_schema`.
-        _ => true,
-    }
-}
+// `static_type_of` / `matches_expected` were the pre-Stage-1.2
+// String-name inference helpers. They've been fully replaced by the
+// `infer::infer_type` engine and `InferredType::subsumes`, and the
+// last in-tree caller migrated in Stage 1.4. The legacy helpers are
+// removed here; consumers that need the old name-string view can
+// build it from `InferredType::name`.
 
 fn format_type(t: &TypeNode) -> String {
     let suffix = if t.is_optional { "?" } else { "" };
@@ -879,5 +941,229 @@ mod tests {
             "{:?}",
             tree.diagnostics
         );
+    }
+
+    /// Stage 1.3: a binary operator applied to incompatible operands
+    /// (Int + String) is reported even when no type hint is in play —
+    /// the slot is `Int x:` so the binding line forces an explicit
+    /// classification of the value expression.
+    #[test]
+    fn flags_binary_int_plus_string() {
+        let tree = analyze_str(r#"{ Int x: 1 + "hello" }"#);
+        let mismatches: Vec<_> = tree
+            .diagnostics
+            .iter()
+            .filter(|d| matches!(d, Diagnostic::StaticTypeMismatch { .. }))
+            .collect();
+        // Should have at least one diagnostic — possibly two (one for
+        // the binary itself, one for the slot binding).
+        assert!(!mismatches.is_empty(), "{:?}", tree.diagnostics);
+    }
+
+    /// Stage 1.3 reverse: `Any` slot tolerates the same expression
+    /// without producing the binary mismatch (the binding side accepts
+    /// it, but the binary itself remains a known-bad combination —
+    /// so we still expect the binary diagnostic). Encodes the rule
+    /// "the typed binding is happy, but the binary is still wrong".
+    #[test]
+    fn binary_mismatch_independent_of_slot_type() {
+        let tree = analyze_str(r#"{ Any x: 1 + "hello" }"#);
+        // The slot accepts Any, so no slot-level mismatch — but the
+        // binary itself is still ill-typed.
+        let mismatches: Vec<_> = tree
+            .diagnostics
+            .iter()
+            .filter(|d| matches!(d, Diagnostic::StaticTypeMismatch { .. }))
+            .collect();
+        assert!(!mismatches.is_empty(), "{:?}", tree.diagnostics);
+    }
+
+    /// Stage 1.3: untyped slots over a known-bad binary still report —
+    /// the binary itself is the offender, regardless of the field.
+    #[test]
+    fn flags_bare_bool_arithmetic() {
+        let tree = analyze_str(r#"{ x: true + 1 }"#);
+        let mismatches: Vec<_> = tree
+            .diagnostics
+            .iter()
+            .filter(|d| matches!(d, Diagnostic::StaticTypeMismatch { .. }))
+            .collect();
+        assert_eq!(mismatches.len(), 1, "{:?}", tree.diagnostics);
+    }
+
+    /// Stage 1.4 forward: a sibling reference to a typed field carries
+    /// the field's declared type back to the binding site. Slots
+    /// declaring `Int y` over a `String x` reference should mismatch.
+    #[test]
+    fn flags_reference_to_typed_sibling() {
+        let tree = analyze_str(
+            r#"{
+                String x: "hello",
+                Int y: x
+            }"#,
+        );
+        let mismatches: Vec<_> = tree
+            .diagnostics
+            .iter()
+            .filter(|d| matches!(d, Diagnostic::StaticTypeMismatch { field, .. } if field == "y"))
+            .collect();
+        assert_eq!(mismatches.len(), 1, "{:?}", tree.diagnostics);
+    }
+
+    /// Stage 1.4 reverse: when the referenced sibling is itself a fn
+    /// call (not statically classifiable), the analyzer must stay
+    /// silent — runtime keeps owning the verdict.
+    #[test]
+    fn does_not_flag_fncall_sibling_reference() {
+        let tree = analyze_str(
+            r#"{
+                xs: range(0, 10),
+                Int y: xs
+            }"#,
+        );
+        let mismatches: Vec<_> = tree
+            .diagnostics
+            .iter()
+            .filter(|d| matches!(d, Diagnostic::StaticTypeMismatch { field, .. } if field == "y"))
+            .collect();
+        assert!(mismatches.is_empty(), "{:?}", tree.diagnostics);
+    }
+
+    /// Stage 1.5 forward: closure body type disagrees with the
+    /// declared `-> Type`. The dict-method shorthand `Type key(params): body`
+    /// desugars to a closure with `return_type = Type`.
+    #[test]
+    fn flags_closure_return_type_mismatch() {
+        let tree = analyze_str(r#"{ Int helper(Int x): x + "y" }"#);
+        let mismatches: Vec<_> = tree
+            .diagnostics
+            .iter()
+            .filter(|d| matches!(d, Diagnostic::StaticTypeMismatch { .. }))
+            .collect();
+        assert!(!mismatches.is_empty(), "{:?}", tree.diagnostics);
+    }
+
+    /// Stage 1.5 reverse: untyped param + no return annotation =
+    /// silent. Body type inference defaults to `Any` because of the
+    /// untyped param, so we have nothing to compare against.
+    #[test]
+    fn does_not_flag_untyped_closure() {
+        let tree = analyze_str(r#"{ f(x): x + 1 }"#);
+        let mismatches: Vec<_> = tree
+            .diagnostics
+            .iter()
+            .filter(|d| matches!(d, Diagnostic::StaticTypeMismatch { .. }))
+            .collect();
+        assert!(mismatches.is_empty(), "{:?}", tree.diagnostics);
+    }
+
+    /// Stage 1.6 forward: match arms returning unrelated types
+    /// (`Int` vs `String`) collapse to `Any` — flag.
+    #[test]
+    fn flags_match_arm_type_mismatch() {
+        let tree = analyze_str(
+            r#"{
+                #schema N Enum<A { x: Int }, B { y: Int }>,
+                N v: N.A { x: 1 },
+                out: v match {
+                    A: 1,
+                    B: "two"
+                }
+            }"#,
+        );
+        let mm: Vec<_> = tree
+            .diagnostics
+            .iter()
+            .filter(|d| matches!(d, Diagnostic::MatchArmTypeMismatch { .. }))
+            .collect();
+        assert_eq!(mm.len(), 1, "{:?}", tree.diagnostics);
+    }
+
+    /// Stage 1.6 reverse: arms returning the same type don't trip the
+    /// join collapse — silent.
+    #[test]
+    fn does_not_flag_homogeneous_match_arms() {
+        let tree = analyze_str(
+            r#"{
+                #schema N Enum<A { x: Int }, B { y: Int }>,
+                N v: N.A { x: 1 },
+                out: v match {
+                    A: 1,
+                    B: 2
+                }
+            }"#,
+        );
+        let mm: Vec<_> = tree
+            .diagnostics
+            .iter()
+            .filter(|d| matches!(d, Diagnostic::MatchArmTypeMismatch { .. }))
+            .collect();
+        assert!(mm.is_empty(), "{:?}", tree.diagnostics);
+    }
+
+    /// Stage 1.9 #9: stdlib FnCalls don't carry a static signature in
+    /// the analyzer, so a bare assignment from `range(...)` must stay
+    /// silent — no spurious mismatch even though the slot is untyped.
+    #[test]
+    fn fncall_assignment_is_silent() {
+        let tree = analyze_str(r#"{ x: range(0, 10) }"#);
+        let mismatches: Vec<_> = tree
+            .diagnostics
+            .iter()
+            .filter(|d| matches!(d, Diagnostic::StaticTypeMismatch { .. }))
+            .collect();
+        assert!(mismatches.is_empty(), "{:?}", tree.diagnostics);
+    }
+
+    /// Stage 1.9 #11: `Any` declared slot is silent on the slot side.
+    /// The binary itself is still ill-typed, so we expect exactly one
+    /// diagnostic (from the binary check), never one from the slot.
+    #[test]
+    fn any_slot_does_not_add_slot_level_mismatch() {
+        let tree = analyze_str(r#"{ Any x: 1 + "y" }"#);
+        let slot_mm: Vec<_> = tree
+            .diagnostics
+            .iter()
+            .filter(|d| {
+                matches!(
+                    d,
+                    Diagnostic::StaticTypeMismatch { field, expected, .. }
+                        if field == "x" && expected == "Any"
+                )
+            })
+            .collect();
+        assert!(slot_mm.is_empty(), "{:?}", tree.diagnostics);
+        // There IS one diagnostic — for the binary itself.
+        let binary_mm: Vec<_> = tree
+            .diagnostics
+            .iter()
+            .filter(|d| matches!(d, Diagnostic::StaticTypeMismatch { .. }))
+            .collect();
+        assert!(!binary_mm.is_empty(), "{:?}", tree.diagnostics);
+    }
+
+    /// Stage 1.9 #12 (consistency): when the analyzer reports a
+    /// `StaticTypeMismatch`, `tree.has_errors()` flips to true so the
+    /// evaluator's facade refuses to run. This pins the gating
+    /// contract that Stage 1.1 enabled.
+    #[test]
+    fn static_type_mismatch_marks_tree_as_errored() {
+        let tree = analyze_str(r#"{ Int x: "hello" }"#);
+        assert!(tree.has_errors(), "{:?}", tree.diagnostics);
+    }
+
+    /// Stage 1.9 #10: a sibling reference to an unknown name flags
+    /// `UnresolvedReference` (a warning) but never a spurious
+    /// `StaticTypeMismatch` — runtime owns whether it eventually
+    /// resolves through a dynamic frame.
+    #[test]
+    fn unresolved_sibling_does_not_static_mismatch() {
+        let tree = analyze_str(r#"{ x: &sibling.unknown }"#);
+        let typ: Vec<_> = tree
+            .diagnostics
+            .iter()
+            .filter(|d| matches!(d, Diagnostic::StaticTypeMismatch { .. }))
+            .collect();
+        assert!(typ.is_empty(), "{:?}", tree.diagnostics);
     }
 }

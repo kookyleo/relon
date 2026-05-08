@@ -96,6 +96,11 @@ pub(crate) struct ScopeFrame {
     /// body }`). Stored separately from `fields` because they're
     /// looked up by `Variable(path)` rather than `&sibling.X`.
     pub(crate) closure_params: HashMap<String, NodeId>,
+    /// Closure-param type hints, indexed by name. Populated when the
+    /// type-check walker enters a closure so the inference engine can
+    /// resolve `Variable(x)` heads to the param's declared type
+    /// (Stage 1.5). Empty for resolution-only frames.
+    pub(crate) closure_param_types: HashMap<String, relon_parser::TypeNode>,
 }
 
 impl ScopeFrame {

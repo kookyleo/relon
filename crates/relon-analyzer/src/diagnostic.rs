@@ -205,6 +205,50 @@ pub enum Diagnostic {
         #[label("not a schema body")]
         range: SourceSpan,
     },
+
+    #[error("match arms produce incompatible types: {}", arm_types.join(" vs "))]
+    #[diagnostic(
+        code(relon::analyze::match_arm_type_mismatch),
+        help(
+            "Every non-wildcard arm should evaluate to a value of the same shape (or share a common Optional supertype). Either align the arm bodies or wrap the result in a sum-type schema."
+        )
+    )]
+    MatchArmTypeMismatch {
+        /// Enum being matched, if statically known. Lets the message
+        /// read "match on `Notification` arms produce …".
+        enum_name: Option<String>,
+        /// Names of the inferred arm-body types in source order.
+        arm_types: Vec<String>,
+        #[label("arms diverge here")]
+        range: SourceSpan,
+    },
+
+    #[error("unknown type name `{name}`")]
+    #[diagnostic(
+        code(relon::analyze::unknown_type_name),
+        help(
+            "The analyzer couldn't resolve this name to a builtin or user-declared schema. Check spelling, or add an `#import` / `#schema` for it."
+        )
+    )]
+    UnknownTypeName {
+        name: String,
+        #[label("not a builtin or declared schema")]
+        range: SourceSpan,
+    },
+
+    #[error("`#main` return type mismatch: expected {expected}, got {found}")]
+    #[diagnostic(
+        code(relon::analyze::main_return_type_mismatch),
+        help(
+            "The body of an entry program must produce a value matching the `#main(...) -> Type` declaration."
+        )
+    )]
+    MainReturnTypeMismatch {
+        expected: String,
+        found: String,
+        #[label("body produces {found}")]
+        range: SourceSpan,
+    },
 }
 
 impl Diagnostic {
@@ -222,16 +266,19 @@ impl Diagnostic {
             | Diagnostic::DuplicateMainDirective { .. }
             | Diagnostic::DuplicateRootSchemaName { .. }
             | Diagnostic::RootSchemaCollidesWithField { .. }
-            | Diagnostic::RootSchemaInvalidValue { .. } => Severity::Error,
+            | Diagnostic::RootSchemaInvalidValue { .. }
+            // Static type mismatches are derivable from source + schema
+            // alone — the workhorse of Stage 1 hardening. Surface them
+            // as errors so the evaluator never reaches a code path that
+            // would re-discover the same problem at runtime.
+            | Diagnostic::StaticTypeMismatch { .. }
+            | Diagnostic::MatchArmTypeMismatch { .. }
+            | Diagnostic::UnknownTypeName { .. }
+            | Diagnostic::MainReturnTypeMismatch { .. } => Severity::Error,
             // Informational: the analyzer's view is conservative — a
             // spread, closure binding, or runtime-computed field may
             // still resolve, so we don't gate evaluation on it.
             Diagnostic::UnresolvedReference { .. } => Severity::Warning,
-            // Static type mismatches are warnings (not errors) so the
-            // host can still try to evaluate. Runtime type-checking
-            // produces the authoritative error if the binding actually
-            // executes.
-            Diagnostic::StaticTypeMismatch { .. } => Severity::Warning,
         }
     }
 }

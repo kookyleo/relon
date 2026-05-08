@@ -19,6 +19,8 @@
 pub(crate) mod decorator_names;
 pub mod diagnostic;
 pub(crate) mod directive_names;
+pub(crate) mod infer;
+pub(crate) mod main_return;
 pub mod main_sig;
 pub mod modules;
 pub mod resolve;
@@ -61,5 +63,11 @@ pub fn analyze(root: &Node) -> AnalyzedTree {
     resolve::resolve_references(root, &mut tree);
     modules::collect_imports(root, &mut tree);
     typecheck::typecheck(root, &mut tree);
+    // Stage 1.7: pre-flight check the entry's `#main(...) -> Type`
+    // return annotation against the body's inferred type. Runs after
+    // `typecheck` so the schema_index it relies on is fully populated
+    // and any node-level `StaticTypeMismatch` already lives in
+    // `tree.diagnostics`.
+    main_return::check_main_return(root, &mut tree);
     tree
 }
