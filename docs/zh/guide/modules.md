@@ -98,7 +98,7 @@ Relon 没有「文件级别 library/entry 标记」这一概念。是否有 `#ma
 ```relon
 // app/main.relon —— 入口程序
 #import * from "../platform/notify.relon",
-#main(notice: Notification)
+#main(Notification notice)
 {
     delivered: notice.title + " (via " + notice.via + ")"
 }

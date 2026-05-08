@@ -96,6 +96,12 @@ pub struct Context {
     pub(crate) loading_modules: Mutex<HashMap<String, usize>>,
     pub(crate) evaluating_paths: Mutex<HashSet<String>>,
     pub(crate) step_counter: AtomicU64,
+    /// Monotonic counter incremented once per closure invocation. Used
+    /// by `eval_closure` to derive a fresh `cache_namespace` for each
+    /// call so that path-cache entries computed inside the closure body
+    /// (e.g. `&sibling.x`) are not shared across distinct invocations
+    /// with different bound parameters.
+    pub(crate) closure_call_counter: AtomicU64,
     pub analyzed: Option<Arc<relon_analyzer::AnalyzedTree>>,
     pub capabilities: Capabilities,
 }
@@ -113,7 +119,7 @@ impl Context {
     /// they're considered trusted infrastructure regardless of sandbox
     /// state). No filesystem resolver is mounted; `@import("./x.relon")`
     /// will fall through to a `ModuleNotFound`. Use [`Self::sandboxed`]
-    /// or [`Self::trusted`] for context shapes intended for real workloads.
+    /// for real workloads and then grant capabilities explicitly.
     pub fn new() -> Self {
         let mut this = Self {
             root_node: None,
@@ -126,6 +132,7 @@ impl Context {
             loading_modules: Mutex::new(HashMap::new()),
             evaluating_paths: Mutex::new(HashSet::new()),
             step_counter: AtomicU64::new(0),
+            closure_call_counter: AtomicU64::new(0),
             analyzed: None,
             capabilities: Capabilities::default(),
         };
@@ -350,6 +357,11 @@ impl Evaluator {
     /// instead — it validates and binds the host-pushed args before the
     /// body walk.
     pub fn eval_root(&self, scope: &Arc<Scope>) -> Result<Value, RuntimeError> {
+        // Reset the step budget so hosts that reuse one `Evaluator` for
+        // multiple independent top-level evaluations don't carry over
+        // counts from prior runs. Module loads happen *inside* this
+        // top-level walk and intentionally do not reset.
+        self.context.step_counter.store(0, Ordering::Relaxed);
         let root = self.context.root_node.clone().ok_or_else(|| {
             RuntimeError::VariableNotFound(
                 "Context has no root node — call `Context::with_root` first".to_string(),
@@ -380,6 +392,8 @@ impl Evaluator {
         scope: &Arc<Scope>,
         mut args: HashMap<String, Value>,
     ) -> Result<Value, RuntimeError> {
+        // Reset the step budget — see `eval_root` for rationale.
+        self.context.step_counter.store(0, Ordering::Relaxed);
         let root = self.context.root_node.clone().ok_or_else(|| {
             RuntimeError::VariableNotFound(
                 "Context has no root node — call `Context::with_root` first".to_string(),
@@ -440,7 +454,21 @@ impl Evaluator {
             });
         }
 
-        self.eval(&root, &scope)
+        let mut result = self.eval(&root, &scope)?;
+        if let Some(return_type) = &signature.return_type {
+            self.check_type(&mut result, return_type, &scope, signature.range)
+                .map_err(|err| match err {
+                    RuntimeError::TypeMismatch {
+                        expected, found, ..
+                    } => RuntimeError::MainReturnTypeMismatch {
+                        expected,
+                        found,
+                        range: signature.range,
+                    },
+                    other => other,
+                })?;
+        }
+        Ok(result)
     }
 
     /// Construct the root scope used by both `eval_root` and `run_main`,
@@ -863,8 +891,10 @@ impl Evaluator {
                     self.eval(right, &current_scope)
                 }
             }
-            Expr::Binary(op, left, right) => self.eval_binary(*op, left, right, &current_scope),
-            Expr::Unary(op, node) => self.eval_unary(*op, node, &current_scope),
+            Expr::Binary(op, left, right) => {
+                self.eval_binary(*op, node.range, left, right, &current_scope)
+            }
+            Expr::Unary(op, inner) => self.eval_unary(*op, node.range, inner, &current_scope),
             Expr::Ternary { cond, then, els } => {
                 if self.eval(cond, &current_scope)?.is_truthy() {
                     self.eval(then, &current_scope)
@@ -1332,6 +1362,29 @@ impl Evaluator {
                 message: error.to_string(),
                 range: range.into(),
             })?;
+        // Run the analyzer on the imported module so structural errors
+        // (missing schema field types, malformed `#main` signatures,
+        // duplicate root schemas, etc.) surface at load time rather than
+        // being silently accepted. The resulting `AnalyzedTree` is *not*
+        // wired into the evaluator yet — the active `Context::analyzed`
+        // belongs to the entry file and its `NodeId` keys won't match
+        // module-local nodes anyway, so the runtime falls back to
+        // `lower_schema_pure` for the module body. That's a known
+        // optimization gap; the correctness gain (raising errors instead
+        // of swallowing them) is what this pass delivers today.
+        let analyzed = relon_analyzer::analyze(&node);
+        if analyzed.has_errors() {
+            let first_error = analyzed
+                .diagnostics
+                .iter()
+                .find(|d| d.severity() == relon_analyzer::Severity::Error)
+                .expect("has_errors() implies at least one Error diagnostic");
+            return Err(RuntimeError::ModuleParseError {
+                path: source.canonical_id.clone(),
+                message: format!("module analyzer reported errors: {first_error}"),
+                range: range.into(),
+            });
+        }
         let module_scope = Arc::new(Scope {
             current_dir: source.current_dir,
             cache_namespace: source.canonical_id.clone(),
@@ -1598,12 +1651,26 @@ impl Evaluator {
                 range,
             });
         }
+        // Each closure invocation gets a fresh cache namespace so that
+        // path-cache entries built while evaluating the body (notably
+        // `&sibling.<x>` lookups, which key off `cache_namespace`) are
+        // not shared across calls with different bound parameters. See
+        // `Context::closure_call_counter`.
+        let call_id = self
+            .context
+            .closure_call_counter
+            .fetch_add(1, Ordering::Relaxed);
+        let call_namespace = if captured_env.cache_namespace.is_empty() {
+            format!("closure#{call_id}")
+        } else {
+            format!("{}#call{}", captured_env.cache_namespace, call_id)
+        };
         let bindings_scope = Arc::new(Scope {
             parent: Some(Arc::clone(captured_env)),
             path_node: None,
             locals: Mutex::new(bindings),
             current_dir: captured_env.current_dir.clone(),
-            cache_namespace: captured_env.cache_namespace.clone(),
+            cache_namespace: call_namespace,
             root_ref: captured_env.root_ref.clone(),
             list_context: None,
             thunks: Mutex::new(HashMap::new()),
@@ -1832,7 +1899,7 @@ pub(crate) fn decorator_name(dec: &DecoratorNode) -> String {
 
 /// True when `node` carries the `#private` directive. See
 /// [`crate::decorator_names::PRIVATE`] for the field-level semantics.
-fn is_private_field(node: &Node) -> bool {
+pub(crate) fn is_private_field(node: &Node) -> bool {
     node.directives
         .iter()
         .any(|dir| dir.name == crate::decorator_names::PRIVATE)

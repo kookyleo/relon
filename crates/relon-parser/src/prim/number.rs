@@ -1,7 +1,7 @@
 use crate::{create_range, Expr, Node, Span};
 use ordered_float::OrderedFloat;
 use winnow::ascii::{dec_int, float, hex_uint};
-use winnow::combinator::{alt, opt, preceded};
+use winnow::combinator::{alt, cut_err, opt, preceded};
 use winnow::prelude::*;
 use winnow::stream::{Location, Stream};
 use winnow::token::{literal, take_while};
@@ -34,11 +34,37 @@ pub fn parse_number<'a>(input: &mut Span<'a>) -> ModalResult<Node> {
     ))
 }
 
+#[derive(Debug)]
+struct HexOverflow;
+
+impl std::fmt::Display for HexOverflow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("hex literal overflows i64")
+    }
+}
+
+impl std::error::Error for HexOverflow {}
+
 fn parse_hex<'a>(sign: i64) -> impl FnMut(&mut Span<'a>) -> ModalResult<Expr> {
     move |input: &mut Span<'a>| {
-        preceded("0x", hex_uint::<_, u64, _>)
-            .map(|v: u64| Expr::Int(v as i64 * sign))
-            .parse_next(input)
+        preceded(
+            "0x",
+            cut_err(
+                hex_uint::<_, u64, _>.try_map(|v: u64| -> Result<Expr, HexOverflow> {
+                    let signed = if sign >= 0 {
+                        i64::try_from(v).map_err(|_| HexOverflow)?
+                    } else if v > (i64::MAX as u64) + 1 {
+                        return Err(HexOverflow);
+                    } else if v == (i64::MAX as u64) + 1 {
+                        i64::MIN
+                    } else {
+                        -(v as i64)
+                    };
+                    Ok(Expr::Int(signed))
+                }),
+            ),
+        )
+        .parse_next(input)
     }
 }
 
@@ -372,6 +398,35 @@ mod tests {
         match *node.expr {
             Expr::Float(f) => assert_eq!(f.into_inner(), -1.0),
             _ => panic!("Expected float"),
+        }
+    }
+
+    #[test]
+    fn rejects_hex_overflow() {
+        // > i64::MAX and not the special -i64::MIN case.
+        let mut s = Span::new("0x8000000000000001");
+        assert!(parse_number(&mut s).is_err());
+    }
+
+    #[test]
+    fn allows_i64_min_via_hex() {
+        // -0x8000000000000000 == i64::MIN — the one negative value whose
+        // magnitude is i64::MAX + 1 and therefore can't be negated as i64.
+        let mut s = Span::new("-0x8000000000000000");
+        let node = parse_number(&mut s).unwrap();
+        match *node.expr {
+            Expr::Int(v) => assert_eq!(v, i64::MIN),
+            _ => panic!("expected int"),
+        }
+    }
+
+    #[test]
+    fn allows_i64_max_via_hex() {
+        let mut s = Span::new("0x7fffffffffffffff");
+        let node = parse_number(&mut s).unwrap();
+        match *node.expr {
+            Expr::Int(v) => assert_eq!(v, i64::MAX),
+            _ => panic!("expected int"),
         }
     }
 }

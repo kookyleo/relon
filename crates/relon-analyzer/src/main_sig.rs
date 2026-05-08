@@ -1,11 +1,13 @@
-//! `#main(<ident> : <type>, ...)` collection pass.
+//! `#main(<type> <ident>, ...) [-> <type>]` collection pass.
 //!
 //! The `#main(...)` directive declares the file as an **entry program**
 //! whose host-pushed arguments must validate against the listed
 //! parameters. Every parameter becomes a root-scope local available
 //! directly by name (no `input.` prefix). A file without `#main` is a
 //! library / static config — importable, evaluable as a `Value`, but
-//! not a host-entry.
+//! not a host-entry. The optional `-> Type` clause declares the
+//! expected return type; when absent the entry's return value is left
+//! unchecked.
 //!
 //! This pass walks the root document's directives, picks up at most
 //! one `#main(...)` declaration, and stores it in
@@ -17,7 +19,7 @@ use crate::directive_names::MAIN;
 use crate::tree::AnalyzedTree;
 use relon_parser::{DirectiveBody, Node, TokenRange, TypeNode};
 
-/// One `<ident> : <type>` parameter declared on `#main(...)`.
+/// One `<type> <ident>` parameter declared on `#main(...)`.
 #[derive(Debug, Clone)]
 pub struct MainParam {
     /// Parameter name as used in the body (e.g. `${u.name}`).
@@ -35,6 +37,9 @@ pub struct MainSignature {
     /// Parameters in declaration order; the host may push them in any
     /// order (lookup is by name).
     pub params: Vec<MainParam>,
+    /// Optional return type declared via `-> Type` after the parameter
+    /// list. `None` means the entry's return value is left unchecked.
+    pub return_type: Option<TypeNode>,
     /// Source range of the entire `#main(...)` directive.
     pub range: TokenRange,
 }
@@ -51,7 +56,11 @@ pub fn collect_main(root: &Node, tree: &mut AnalyzedTree) {
         if dir.name != MAIN {
             continue;
         }
-        let DirectiveBody::Main { params: dir_params } = &dir.body else {
+        let DirectiveBody::Main {
+            params: dir_params,
+            return_type,
+        } = &dir.body
+        else {
             continue;
         };
         if let Some(first_range) = first {
@@ -73,6 +82,7 @@ pub fn collect_main(root: &Node, tree: &mut AnalyzedTree) {
             .collect();
         tree.main_signature = Some(MainSignature {
             params,
+            return_type: return_type.clone(),
             range: dir.range,
         });
     }

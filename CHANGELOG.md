@@ -1,5 +1,78 @@
 # Changelog
 
+## [Unreleased] — Review pass (post-batch-3)
+
+A targeted review pass closing nine evaluator/parser bugs uncovered
+after batch 3 landed, plus a `#main` syntax overhaul to align with
+the rest of the language.
+
+### Bug fixes
+
+- **Closure path-cache isolation** — A closure body referencing a
+  sibling binding (`make(x): { a: x, b: &sibling.a }`) used to
+  produce stale results when called more than once: the second call
+  reused the first call's `path_cache` namespace and returned the
+  earlier `a`. Each closure invocation now gets its own
+  `cache_namespace` derived from a per-context call counter.
+- **Dynamic-segment reference cache key collision** —
+  `&sibling.obj[&sibling.k1]` and `&sibling.obj[&sibling.k2]`
+  previously hashed identically because both dynamic key slots
+  stringified to `"<dynamic>"`. The cache key now embeds the
+  evaluated dynamic key (or skips caching when the key fails to
+  evaluate cleanly).
+- **`lookup_value_path` resolves dynamic segments** — When a
+  reference path crossed into an already-materialized `Dict`/`List`
+  (e.g. the result of a function call), trailing `[expr]` segments
+  were looked up as the literal string `"<dynamic>"`. They now
+  evaluate against the carried scope.
+- **`&next` / `&prev` carry their own list scope** — Forcing the
+  adjacent element re-used the thunk's stored scope, which lacked
+  the target index's `list_context`; legitimate look-aheads like
+  `[{ x: &next.y }, { y: &index }]` would fail. The forcing path
+  now wraps a child scope with the right `ListContext`.
+- **`#private` is invisible across dict boundaries** — Cross-dict
+  `&root.secret` reference walks could still find `#private`
+  bindings, contradicting the documented "local to owning dict"
+  visibility. Reference-path resolution now blocks private hits
+  unless the lookup lands on the owning dict's siblings.
+- **Hex literals overflowing `i64` are rejected** —
+  `0x8000000000000000` previously silently wrapped to a negative
+  value via `as i64`. Hex parsing now bounds-checks against the
+  signed range and returns a parse error on overflow (with `i64::MIN`
+  preserved for `-0x8000000000000000`).
+- **Imported modules run the analyzer** — `#import` previously
+  parsed module sources but skipped analysis, so structural errors
+  (e.g. `#schema Bad { name: * }` missing a type annotation) were
+  silently accepted in modules while the same code would fail at
+  the entry. Module loading now runs `relon_analyzer::analyze` and
+  surfaces error diagnostics through `ModuleParseError`.
+- **`step_counter` resets between top-level evaluations** — Hosts
+  reusing a single `Evaluator`/`Context` for multiple independent
+  runs would inherit the prior run's step count, tripping the
+  budget on small follow-up scripts. Both `eval_root` and
+  `run_main` now zero the counter on entry.
+
+### `#main` syntax overhaul
+
+- **Parameter style: `Type name`** to align with schema fields
+  (`String name: *`). The earlier `name: Type` form is removed.
+- **Optional `-> ReturnType` clause** declares the entry's return
+  shape. The new `MainReturnTypeMismatch` runtime error fires when
+  the body's value doesn't satisfy the declared type.
+
+```relon
+// Before
+#main(req: Req)
+{ greeting: req.name }
+
+// After
+#main(Req req) -> Dict
+{ greeting: req.name }
+```
+
+`MainSignature` now carries `return_type: Option<TypeNode>`; the CLI
+and host integration paths are unchanged.
+
 ## [Unreleased] — Spec v1 candidate freeze, batch 3
 
 This batch makes the sigil split a hard contract and replaces the
@@ -30,19 +103,20 @@ Five fixed directive shapes: `Bare` (`#private`),
 `Value` (`#default 0`, `#brand X`), `NameBody`
 (`#schema User { ... }`, no colon), `Import`
 (`#import * | name | { a, b as c } from "..."`), `Main`
-(`#main(name: Type, ...)`). The shape is keyed off the directive
-name — the parser's directive table is closed.
+(`#main(Type name, ...) [-> ReturnType]`). The shape is keyed off
+the directive name — the parser's directive table is closed.
 
 ### `#main(...)` replaces `@input(...)` and `@library`
 
 Whether a file declares `#main(...)` decides how it's used:
 
-- **`#main(name: Type, ...)`**: the file is an **entry program**.
-  Hosts must push named arguments via `Evaluator::run_main(scope,
-  args)`; the runtime validates each arg against the signature
-  before walking the body. New runtime errors:
-  `NoMainSignature`, `MissingMainArg`, `UnexpectedMainArg`,
-  `MainArgTypeMismatch`.
+- **`#main(Type name, ...) [-> ReturnType]`**: the file is an
+  **entry program**. Hosts must push named arguments via
+  `Evaluator::run_main(scope, args)`; the runtime validates each
+  arg against the signature before walking the body. The optional
+  `-> ReturnType` clause declares the entry's return shape. New
+  runtime errors: `NoMainSignature`, `MissingMainArg`,
+  `UnexpectedMainArg`, `MainArgTypeMismatch`.
 - **No `#main`**: the file is a plain library / data file. It can be
   evaluated directly via `eval_root` and also `#import`-ed by other
   files.
@@ -80,7 +154,7 @@ Every `@`-form system attribute → `#`-form directive, e.g.:
 // After
 #import * from "./helpers.relon"
 #schema Order Enum<Pending, Paid>
-#main(req: Req)
+#main(Req req)
 {
     handler: ...
 }

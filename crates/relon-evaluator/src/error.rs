@@ -149,7 +149,7 @@ pub enum RuntimeError {
     #[diagnostic(
         code(relon::eval::no_main_signature),
         help(
-            "Add `#main(arg: Type, ...)` to declare the file as an entry program, or evaluate it as a static config via `eval_root` instead of `run_main`."
+            "Add `#main(Type arg, ...)` to declare the file as an entry program, or evaluate it as a static config via `eval_root` instead of `run_main`."
         )
     )]
     NoMainSignature {
@@ -186,6 +186,15 @@ pub enum RuntimeError {
         expected: String,
         found: String,
         #[label("type mismatch")]
+        range: TokenRange,
+    },
+
+    #[error("type mismatch for `#main` return value: expected {expected}, found {found}")]
+    #[diagnostic(code(relon::eval::main_return_type_mismatch))]
+    MainReturnTypeMismatch {
+        expected: String,
+        found: String,
+        #[label("declared here")]
         range: TokenRange,
     },
 }

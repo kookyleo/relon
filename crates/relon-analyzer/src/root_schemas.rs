@@ -10,7 +10,7 @@
 //!
 //! ```relon
 //! #schema Req { String name: *, Int retries: * }
-//! #main(req: Req)
+//! #main(Req req)
 //! { greeting: f"hello ${req.name}" }
 //! ```
 //!

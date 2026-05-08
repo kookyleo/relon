@@ -41,7 +41,7 @@ let result = Evaluator::new(Arc::new(ctx))
 脚本端配上一个 `#main(...)` 签名，描述 host 必须推进来的形状：
 
 ```relon
-#main(user: User, posts: PostList)
+#main(User user, PostList posts)
 {
     #schema User { String name: *, String tier: * },
     #schema Post { String title: * },
@@ -51,7 +51,7 @@ let result = Evaluator::new(Arc::new(ctx))
 }
 ```
 
-`#main(name: Type, ...)` 是文件的**入口签名**，每个参数声明一个
+`#main(Type name, ...) [-> ReturnType]` 是文件的**入口签名**，每个参数声明一个
 host-pushed slot：
 
 - 参数名是脚本里直接可见的根级绑定（注意：**不是** `input.user`，
@@ -189,8 +189,7 @@ use relon_parser::parse_document;
 use std::sync::Arc;
 
 let node = parse_document(source).unwrap();
-let ctx = Context::new()  // 等价于 Context::trusted()
-    .with_root(node);
+let mut ctx = Context::sandboxed().with_root(node);
 
 // （在这里注册函数 / 装饰器 / 替换 module resolver）
 
@@ -201,7 +200,7 @@ let value = Evaluator::new(Arc::new(ctx)).eval_root(&Arc::new(Scope::default()))
 
 - **`functions`** — 通过 `register_fn` / `register_fn_with_caps` 注册的原生函数表。
 - **`decorators`** — 通过 `register_decorator` 注册的装饰器插件。
-- **`module_resolvers`** — `#import` 走的解析器链；默认是 `[StdModuleResolver, FilesystemModuleResolver]`。
+- **`module_resolvers`** — `#import` 走的解析器链；`Context::sandboxed()` 默认是 `[StdModuleResolver, FilesystemModuleResolver::default()]`。
 - **`capabilities`** — 沙箱 / 资源预算（[沙箱与权限](./sandbox.md) 详解）。
 - **`root_node`** + **`analyzed`** — 根 AST 与 analyzer side-table（含 `#main` 签名）。
 - **多份 cache**（path / module / loading）——避免重复求值。
@@ -216,8 +215,9 @@ let value = Evaluator::new(Arc::new(ctx)).eval_root(&Arc::new(Scope::default()))
 
 | 构造器 | 默认安全等级 |
 | --- | --- |
-| `Context::new()` / `Context::trusted()` | 完全可信：filesystem 全开、native fn 全放、无步数 / 大小预算 |
 | `Context::sandboxed()` | 完全沙箱：filesystem 默认拒绝、capability 全空、只剩 `std/...` 虚拟模块 |
+| `Context::new()` | 轻量基础构造器：只挂载虚拟 std 模块与内置纯函数；需要真实 workloads 时优先用 `Context::sandboxed()` 并显式授权 |
+| `Capabilities::all_granted()` + `FilesystemModuleResolver::trusted()` | 宿主自有脚本的显式全开形态：filesystem 全开、门控 native fn 全放、无步数 / 大小预算 |
 
 ## 注册一个原生函数
 
@@ -283,7 +283,7 @@ ctx.register_fn_with_caps(
 ctx.capabilities.allow_native_fn.insert("secret.read".to_string());
 ```
 
-行为差异一句话：**`register_fn` 默认放行；`register_fn_with_caps` 默认拦截**。后者在 `Context::trusted()` 下也能跑（因为 `allow_all_native_fn = true`），但语义上明确传达「我是有副作用的」。详见 [沙箱与权限](./sandbox.md)。
+行为差异一句话：**`register_fn` 默认放行；`register_fn_with_caps` 默认拦截**。后者在显式设置 `Capabilities::all_granted()` 后也能跑（因为 `allow_all_native_fn = true`），但语义上明确传达「我是有副作用的」。详见 [沙箱与权限](./sandbox.md)。
 
 ## 模块解析（Module Resolvers）
 
@@ -293,7 +293,7 @@ ctx.capabilities.allow_native_fn.insert("secret.read".to_string());
 
 1. **`StdModuleResolver`** — 解析 `std/list`、`std/string` 这些虚拟模块（嵌在 binary 里，零 IO）。
 2. **`FilesystemModuleResolver`** — 从文件系统读：
-   - `Context::trusted()` 下使用 `FilesystemModuleResolver::trusted()`，无 root 限制；
+   - host-owned 脚本可显式安装 `FilesystemModuleResolver::trusted()`，无 root 限制；
    - `Context::sandboxed()` 下使用 `FilesystemModuleResolver::default()`，**默认拒绝一切**——必须替换或追加一个 `with_root_dir(...)` 实例。
 
 替换示例：

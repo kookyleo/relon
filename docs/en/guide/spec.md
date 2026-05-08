@@ -159,7 +159,7 @@ table) and is not user-extensible:
 | Value | `#name <expr>` | `#default 0`, `#expect "must be ≥0"`, `#brand Color` | Metadata / value transform |
 | NameBody | `#name <ident> <body>` | `#schema User { String name: * }` | Named declaration (no colon) |
 | Import | `#import <bindspec> from "<path>"` | `#import * from "std/list"` | Import |
-| Main | `#main(name: Type, ...)` | `#main(u: User, cart: Cart)` | Entry signature |
+| Main | `#main(Type name, ...) [-> ReturnType]` | `#main(User u, Cart cart) -> Result<Order>` | Entry signature |
 
 `<bindspec>` is one of: a single ident (namespace), `*` (spread), or
 `{ a, b as c }` (destructuring).
@@ -271,7 +271,7 @@ detail and not part of the user-facing API — but conformant runtimes
 MUST provide them with the spec'd semantics, otherwise `#schema`
 will diverge.
 
-### 6.4 `#main(name: Type, ...)` — entry signature
+### 6.4 `#main(Type name, ...) [-> ReturnType]` — entry signature
 
 `#main(...)` is a **root-level directive** (placed before the file's
 root dict). It declares the file as an **entry program**: the host
@@ -280,7 +280,7 @@ must push named arguments matching the signature via
 before the body walk. Form:
 
 ```relon
-#main(req: Req)
+#main(Req req)
 {
     #schema Req {
         String name: *,
@@ -294,7 +294,7 @@ before the body walk. Form:
 Multiple parameters are listed side-by-side:
 
 ```relon
-#main(user: User, cart: Cart)
+#main(User user, Cart cart)
 {
     #schema User { String name: * },
     #schema Cart { Int total: * },
@@ -302,11 +302,15 @@ Multiple parameters are listed side-by-side:
 }
 ```
 
+The optional `-> ReturnType` clause declares the entry's return
+type; omitting it leaves the return value unchecked.
+
 **Semantic requirements** (every conformant runtime MUST implement):
 
 1. `#main(...)` MUST be a **root-level directive** (placed before the
    file's root dict); writing it on a nested dict is meaningless.
-2. Each parameter MUST be `name: Type`:
+2. Each parameter MUST be `Type name` (matching the `#schema` field
+   convention):
    - The same parameter name declared twice → `Analyze` error
      `DuplicateMainParam`.
    - The type MUST resolve to a declared `#schema` or a built-in

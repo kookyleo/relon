@@ -233,16 +233,36 @@ fn parse_main_body<'a>(input: &mut Span<'a>) -> ModalResult<crate::DirectiveBody
     let params: Vec<DirectiveMainParam> =
         separated(0.., parse_main_param, (soc0, ',', soc0)).parse_next(input)?;
     let _ = (soc0, opt(','), soc0, ')').parse_next(input)?;
-    Ok(crate::DirectiveBody::Main { params })
+
+    // Optional `-> ReturnType` after the parameter list. When absent
+    // the evaluator leaves the entry's return value unchecked.
+    let rt_checkpoint = input.checkpoint();
+    let return_type = if (soc0, "->", soc0).parse_next(input).is_ok() {
+        match crate::expr::parse_type_node.parse_next(input) {
+            Ok(t) => Some(t),
+            Err(_) => {
+                input.reset(&rt_checkpoint);
+                None
+            }
+        }
+    } else {
+        input.reset(&rt_checkpoint);
+        None
+    };
+
+    Ok(crate::DirectiveBody::Main {
+        params,
+        return_type,
+    })
 }
 
 fn parse_main_param<'a>(input: &mut Span<'a>) -> ModalResult<DirectiveMainParam> {
     soc0.parse_next(input)?;
+    let type_node = crate::expr::parse_type_node.parse_next(input)?;
+    let _ = soc0.parse_next(input)?;
     let start_offset = input.location();
     let name_token = id.parse_next(input)?;
     let name_range = create_range(input, start_offset, input.location());
-    let _ = (soc0, ':', soc0).parse_next(input)?;
-    let type_node = crate::expr::parse_type_node.parse_next(input)?;
     Ok(DirectiveMainParam {
         name: name_token.0,
         name_range,
@@ -343,13 +363,39 @@ mod tests {
 
     #[test]
     fn parses_main_directive() {
-        let mut s = Span::new("#main(u: User, cart: Cart)");
+        let mut s = Span::new("#main(User u, Cart cart)");
         let dirs = parse_directives(&mut s).unwrap();
         match &dirs[0].body {
-            crate::DirectiveBody::Main { params } => {
+            crate::DirectiveBody::Main {
+                params,
+                return_type,
+            } => {
                 assert_eq!(params.len(), 2);
                 assert_eq!(params[0].name, "u");
+                assert_eq!(params[0].type_node.path, vec!["User".to_string()]);
                 assert_eq!(params[1].name, "cart");
+                assert_eq!(params[1].type_node.path, vec!["Cart".to_string()]);
+                assert!(return_type.is_none());
+            }
+            _ => panic!("expected Main"),
+        }
+    }
+
+    #[test]
+    fn parses_main_with_return_type() {
+        let mut s = Span::new("#main(User u) -> Result<Order>");
+        let dirs = parse_directives(&mut s).unwrap();
+        match &dirs[0].body {
+            crate::DirectiveBody::Main {
+                params,
+                return_type,
+            } => {
+                assert_eq!(params.len(), 1);
+                assert_eq!(params[0].name, "u");
+                let rt = return_type.as_ref().expect("return_type present");
+                assert_eq!(rt.path, vec!["Result".to_string()]);
+                assert_eq!(rt.generics.len(), 1);
+                assert_eq!(rt.generics[0].path, vec!["Order".to_string()]);
             }
             _ => panic!("expected Main"),
         }

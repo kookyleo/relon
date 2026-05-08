@@ -32,6 +32,7 @@ impl Evaluator {
     pub(crate) fn eval_binary(
         &self,
         op: Operator,
+        range: TokenRange,
         left: &Node,
         right: &Node,
         scope: &Arc<Scope>,
@@ -126,10 +127,10 @@ impl Evaluator {
             (Operator::Add, Value::String(a), b) => Ok(Value::String(format!("{}{}", a, b))),
             (Operator::Add, a, Value::String(b)) => Ok(Value::String(format!("{}{}", a, b))),
             (Operator::Add | Operator::Sub | Operator::Mul, _, _) => {
-                eval_numeric_arithmetic(op, &l, left.range, &r, right.range)
+                eval_numeric_arithmetic(op, range, &l, left.range, &r, right.range)
             }
             (Operator::Div | Operator::Mod, _, _) => {
-                eval_numeric_division(op, &l, left.range, &r, right.range)
+                eval_numeric_division(op, range, &l, left.range, &r, right.range)
             }
             (Operator::Eq, a, b) => Ok(Value::Bool(a == b)),
             (Operator::Ne, a, b) => Ok(Value::Bool(a != b)),
@@ -146,13 +147,17 @@ impl Evaluator {
     pub(crate) fn eval_unary(
         &self,
         op: Operator,
+        range: TokenRange,
         node: &Node,
         scope: &Arc<Scope>,
     ) -> Result<Value, RuntimeError> {
         let val = self.eval(node, scope)?;
         match (op, val) {
             (Operator::Not, v) => Ok(Value::Bool(!v.is_truthy())),
-            (Operator::Sub, Value::Int(i)) => Ok(Value::Int(-i)),
+            (Operator::Sub, Value::Int(i)) => i
+                .checked_neg()
+                .map(Value::Int)
+                .ok_or(RuntimeError::NumericOverflow(range)),
             (Operator::Sub, Value::Float(f)) => Ok(Value::Float(-f)),
             (Operator::Sub, v) => Err(RuntimeError::TypeMismatch {
                 expected: "Number".to_string(),
@@ -169,6 +174,7 @@ impl Evaluator {
 
 fn eval_numeric_arithmetic(
     op: Operator,
+    range: TokenRange,
     left: &Value,
     left_range: TokenRange,
     right: &Value,
@@ -177,9 +183,18 @@ fn eval_numeric_arithmetic(
     let left = expect_number(left, left_range)?;
     let right = expect_number(right, right_range)?;
     match (op, left, right) {
-        (Operator::Add, NumericValue::Int(a), NumericValue::Int(b)) => Ok(Value::Int(a + b)),
-        (Operator::Sub, NumericValue::Int(a), NumericValue::Int(b)) => Ok(Value::Int(a - b)),
-        (Operator::Mul, NumericValue::Int(a), NumericValue::Int(b)) => Ok(Value::Int(a * b)),
+        (Operator::Add, NumericValue::Int(a), NumericValue::Int(b)) => a
+            .checked_add(b)
+            .map(Value::Int)
+            .ok_or(RuntimeError::NumericOverflow(range)),
+        (Operator::Sub, NumericValue::Int(a), NumericValue::Int(b)) => a
+            .checked_sub(b)
+            .map(Value::Int)
+            .ok_or(RuntimeError::NumericOverflow(range)),
+        (Operator::Mul, NumericValue::Int(a), NumericValue::Int(b)) => a
+            .checked_mul(b)
+            .map(Value::Int)
+            .ok_or(RuntimeError::NumericOverflow(range)),
         (Operator::Add, a, b) => Ok(Value::Float(OrderedFloat(a.as_f64() + b.as_f64()))),
         (Operator::Sub, a, b) => Ok(Value::Float(OrderedFloat(a.as_f64() - b.as_f64()))),
         (Operator::Mul, a, b) => Ok(Value::Float(OrderedFloat(a.as_f64() * b.as_f64()))),
@@ -189,6 +204,7 @@ fn eval_numeric_arithmetic(
 
 fn eval_numeric_division(
     op: Operator,
+    range: TokenRange,
     left: &Value,
     left_range: TokenRange,
     right: &Value,
@@ -200,8 +216,14 @@ fn eval_numeric_division(
         return Err(RuntimeError::DivisionByZero(right_range));
     }
     match (op, left, right) {
-        (Operator::Div, NumericValue::Int(a), NumericValue::Int(b)) => Ok(Value::Int(a / b)),
-        (Operator::Mod, NumericValue::Int(a), NumericValue::Int(b)) => Ok(Value::Int(a % b)),
+        (Operator::Div, NumericValue::Int(a), NumericValue::Int(b)) => a
+            .checked_div(b)
+            .map(Value::Int)
+            .ok_or(RuntimeError::NumericOverflow(range)),
+        (Operator::Mod, NumericValue::Int(a), NumericValue::Int(b)) => a
+            .checked_rem(b)
+            .map(Value::Int)
+            .ok_or(RuntimeError::NumericOverflow(range)),
         (Operator::Div, a, b) => Ok(Value::Float(OrderedFloat(a.as_f64() / b.as_f64()))),
         (Operator::Mod, a, b) => Ok(Value::Float(OrderedFloat(a.as_f64() % b.as_f64()))),
         _ => unreachable!("non-division operator passed to eval_numeric_division"),

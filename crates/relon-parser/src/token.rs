@@ -133,8 +133,8 @@ pub enum DirectiveShape {
     /// `#import * from "std/list"`,
     /// `#import { upper, lower as lo } from "std/string"`.
     Import,
-    /// `#main(<ident> : <type> [, ...]*)`. Example:
-    /// `#main(u: User, cart: Cart)`.
+    /// `#main(<type> <ident> [, ...]*) [-> <type>]`. Example:
+    /// `#main(User u, Cart cart) -> Result<Order>`.
     Main,
 }
 
@@ -157,6 +157,9 @@ pub enum DirectiveBody {
     },
     Main {
         params: Vec<DirectiveMainParam>,
+        /// Optional `-> Type` declared after the parameter list. When
+        /// `None`, the entry's return value is left unchecked.
+        return_type: Option<TypeNode>,
     },
 }
 
@@ -172,7 +175,7 @@ pub enum DirectiveImportSpec {
     Destructure(Vec<(String, Option<String>)>),
 }
 
-/// One `<ident> : <type>` parameter of a `#main(...)` signature.
+/// One `<type> <ident>` parameter of a `#main(...)` signature.
 #[derive(Debug, PartialEq, Clone)]
 pub struct DirectiveMainParam {
     pub name: String,

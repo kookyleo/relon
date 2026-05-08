@@ -416,6 +416,7 @@ mod tests {
         let root = workspace_root();
         for rel_path in [
             "fixtures/errors/circular.relon",
+            "fixtures/errors/integer_overflow.relon",
             "examples/validation.relon",
         ] {
             let path = root.join(rel_path);
@@ -539,6 +540,12 @@ mod tests {
             }) => {
                 format!(
                     "TypeMismatch\nexpected: {expected}\nfound: {found}\nrange: {}:{}-{}:{}\n",
+                    range.start.line, range.start.column, range.end.line, range.end.column
+                )
+            }
+            Error::Eval(RuntimeError::NumericOverflow(range)) => {
+                format!(
+                    "NumericOverflow\nrange: {}:{}-{}:{}\n",
                     range.start.line, range.start.column, range.end.line, range.end.column
                 )
             }

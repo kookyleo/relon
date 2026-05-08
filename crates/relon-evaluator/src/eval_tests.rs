@@ -43,6 +43,14 @@ fn assert_number_type_mismatch(source: &str, found_type: &str) {
     ));
 }
 
+fn assert_numeric_overflow(source: &str) {
+    let result = eval_doc(source);
+    assert!(
+        matches!(result, Err(RuntimeError::NumericOverflow(_))),
+        "expected NumericOverflow, got {result:?}"
+    );
+}
+
 #[test]
 fn test_user_defined_meta_logic() {
     let node = parse_doc(
@@ -155,6 +163,16 @@ fn test_invalid_numeric_operands_are_rejected() {
     assert_number_type_mismatch(r#"{ "value": null % 2 }"#, "Null");
     assert_number_type_mismatch(r#"{ "value": "x" < 2 }"#, "String");
     assert_number_type_mismatch(r#"{ "value": -false }"#, "Bool");
+}
+
+#[test]
+fn test_integer_overflow_is_deterministic_error() {
+    assert_numeric_overflow(r#"{ "value": 9223372036854775807 + 1 }"#);
+    assert_numeric_overflow(r#"{ "value": -9223372036854775807 - 2 }"#);
+    assert_numeric_overflow(r#"{ "value": 3037000500 * 3037000500 }"#);
+    assert_numeric_overflow(r#"{ "value": (-9223372036854775807 - 1) / -1 }"#);
+    assert_numeric_overflow(r#"{ "value": (-9223372036854775807 - 1) % -1 }"#);
+    assert_numeric_overflow(r#"{ "value": -(-9223372036854775807 - 1) }"#);
 }
 
 #[test]
@@ -2135,7 +2153,7 @@ fn untagged_enum_type_set_still_validates() {
 
 #[test]
 fn run_main_validates_args_and_fills_defaults() {
-    // `#main(req: Req)` declares the file as an entry program with one
+    // `#main(Req req)` declares the file as an entry program with one
     // named parameter. Host pushes the matching arg as a HashMap; the
     // missing schema field carries `#default 0` so validation accepts
     // the input and materializes the default.
@@ -2145,7 +2163,7 @@ fn run_main_validates_args_and_fills_defaults() {
     #default 0
     Int retries: *
 }
-#main(req: Req)
+#main(Req req)
 { greeting: f"hello ${req.name}, retries=${req.retries}" }"#;
     let node = parse_doc(source);
     let analyzed = std::sync::Arc::new(relon_analyzer::analyze(&node));
@@ -2178,7 +2196,7 @@ fn run_main_with_multiple_params() {
     use std::collections::{BTreeMap, HashMap};
     let source = r#"#schema User { String name: * }
 #schema Cart { Int total: * }
-#main(user: User, cart: Cart)
+#main(User user, Cart cart)
 { summary: f"${user.name} - ${cart.total}" }"#;
     let node = parse_doc(source);
     let analyzed = std::sync::Arc::new(relon_analyzer::analyze(&node));
@@ -2211,7 +2229,7 @@ fn run_main_missing_arg_errors() {
     // `MissingMainArg` immediately.
     use std::collections::HashMap;
     let source = r#"#schema Req { String name: * }
-#main(req: Req)
+#main(Req req)
 { greeting: req.name }"#;
     let node = parse_doc(source);
     let analyzed = std::sync::Arc::new(relon_analyzer::analyze(&node));
@@ -2232,7 +2250,7 @@ fn run_main_unexpected_arg_errors() {
     // strict — extras are rejected so the host catches typos early.
     use std::collections::HashMap;
     let source = r#"#schema Req { String name: * }
-#main(req: Req)
+#main(Req req)
 { ok: 1 }"#;
     let node = parse_doc(source);
     let analyzed = std::sync::Arc::new(relon_analyzer::analyze(&node));
@@ -2258,7 +2276,7 @@ fn run_main_arg_type_mismatch_errors() {
     // Surface `MainArgTypeMismatch` rather than letting the body
     // explode mid-evaluation.
     use std::collections::HashMap;
-    let source = r#"#main(n: Int)
+    let source = r#"#main(Int n)
 { ok: n + 1 }"#;
     let node = parse_doc(source);
     let analyzed = std::sync::Arc::new(relon_analyzer::analyze(&node));
@@ -2300,8 +2318,8 @@ fn duplicate_main_directive_is_an_analyzer_error() {
     // A file may declare at most one `#main(...)`; later declarations
     // are flagged as `DuplicateMainDirective`.
     let node = parse_doc(
-        r#"#main(a: Int)
-#main(b: Int)
+        r#"#main(Int a)
+#main(Int b)
 { ok: 1 }"#,
     );
     let analyzed = relon_analyzer::analyze(&node);
@@ -2485,11 +2503,11 @@ fn underscore_prefix_no_longer_implies_private() {
 #[test]
 fn root_schema_directive_validates_main_arg() {
     // `#schema User ...` at root level seeds `User` into scope; the
-    // following `#main(req: User)` references it the same way as a
+    // following `#main(User req)` references it the same way as a
     // dict-field `#schema User ...` would.
     use std::collections::{BTreeMap, HashMap};
     let source = r#"#schema User { String name: *, Int age: * }
-#main(req: User)
+#main(User req)
 { greeting: f"hello ${req.name}, age=${req.age}" }"#;
     let node = parse_doc(source);
     let analyzed = std::sync::Arc::new(relon_analyzer::analyze(&node));
@@ -2523,7 +2541,7 @@ fn root_schema_directive_supports_multiple_declarations() {
     use std::collections::{BTreeMap, HashMap};
     let source = r#"#schema User { String name: * }
 #schema Cart { Int total: * }
-#main(user: User, cart: Cart)
+#main(User user, Cart cart)
 { summary: f"${user.name} - ${cart.total}" }"#;
     let node = parse_doc(source);
     let analyzed = std::sync::Arc::new(relon_analyzer::analyze(&node));
@@ -2676,4 +2694,232 @@ fn user_defined_decorator_stack_is_innermost_first() {
         d.map.get("display").unwrap(),
         &Value::String("*(x)*".to_string())
     );
+}
+
+// ----- Review-fix regressions ---------------------------------------------
+
+#[test]
+fn closure_call_does_not_share_path_cache_across_invocations() {
+    // P1-A regression: a closure body references a sibling binding
+    // (`&sibling.a`). When the closure is called twice with different
+    // arguments, the per-invocation `cache_namespace` must isolate path
+    // caching so the second call doesn't reuse the first call's `a`.
+    let result = eval_doc(
+        r#"{
+            make(x): { a: x, b: &sibling.a },
+            d1: make(1),
+            d2: make(2)
+        }"#,
+    )
+    .unwrap();
+    let Value::Dict(d) = result else { panic!() };
+    let Some(Value::Dict(d1)) = d.map.get("d1") else {
+        panic!("d1 not dict")
+    };
+    let Some(Value::Dict(d2)) = d.map.get("d2") else {
+        panic!("d2 not dict")
+    };
+    assert_eq!(d1.map.get("b"), Some(&Value::Int(1)), "d1.b should be 1");
+    assert_eq!(
+        d2.map.get("b"),
+        Some(&Value::Int(2)),
+        "d2.b should be 2 (path cache must not bleed across closure calls)"
+    );
+}
+
+#[test]
+fn dynamic_segment_reference_cache_keys_do_not_collide() {
+    // P1-B regression: `&sibling.obj[&sibling.k1]` and
+    // `&sibling.obj[&sibling.k2]` previously hashed identically because
+    // both dynamic segments stringified to "<dynamic>". The fix evaluates
+    // the dynamic key when forming the cache key, so each lookup hits
+    // (or misses) under its own real key.
+    let result = eval_doc(
+        r#"{
+            obj: { a: 1, b: 2 },
+            k1: "a",
+            k2: "b",
+            v1: &sibling.obj[&sibling.k1],
+            v2: &sibling.obj[&sibling.k2]
+        }"#,
+    )
+    .unwrap();
+    let Value::Dict(d) = result else { panic!() };
+    assert_eq!(d.map.get("v1"), Some(&Value::Int(1)));
+    assert_eq!(d.map.get("v2"), Some(&Value::Int(2)));
+}
+
+#[test]
+fn dynamic_segment_resolves_against_materialized_dict() {
+    // P2-A regression: when a reference passes through a value that has
+    // already been materialized (e.g. the result of a function call), the
+    // remaining dynamic segments must be evaluated against the call's
+    // scope, not looked up as the literal string "<dynamic>".
+    let result = eval_doc(
+        r#"{
+            id(v): v,
+            obj: id({ x: 10, y: 20 }),
+            k: "y",
+            val: &sibling.obj[&sibling.k]
+        }"#,
+    )
+    .unwrap();
+    let Value::Dict(d) = result else { panic!() };
+    assert_eq!(d.map.get("val"), Some(&Value::Int(20)));
+}
+
+#[test]
+fn next_reference_target_carries_its_own_list_context() {
+    // P2-B regression: `&next.y` forces the adjacent list element. The
+    // forced element's body uses `&index`, which only resolves inside a
+    // list scope. The fix builds a list scope for the target index when
+    // forcing, so `&index` in the second element is reachable.
+    let result = eval_doc(
+        r#"[
+            { x: &next.y },
+            { y: &index }
+        ]"#,
+    )
+    .unwrap();
+    let Value::List(items) = result else { panic!() };
+    assert_eq!(items.len(), 2);
+    let Value::Dict(first) = &items[0] else {
+        panic!()
+    };
+    assert_eq!(first.map.get("x"), Some(&Value::Int(1)));
+    let Value::Dict(second) = &items[1] else {
+        panic!()
+    };
+    assert_eq!(second.map.get("y"), Some(&Value::Int(1)));
+}
+
+#[test]
+fn private_field_is_not_visible_through_root_reference() {
+    // P2-C regression: a `#private` field on the root dict must not be
+    // reachable via `&root.<name>` from a nested dict — the field's
+    // visibility is local to its owning dict's siblings.
+    let result = eval_doc(
+        r#"{
+            #private
+            secret: "shhh",
+            child: { leak: &root.secret }
+        }"#,
+    );
+    assert!(
+        matches!(&result, Err(RuntimeError::VariableNotFound(name, _)) if name.contains("secret")),
+        "expected VariableNotFound for cross-dict private access, got {result:?}"
+    );
+}
+
+#[test]
+fn imported_module_runs_analyzer_and_surfaces_errors() {
+    // P2-E regression: a module with a structural analyzer error
+    // (here a schema field missing its type annotation) used to be
+    // silently accepted by `load_module` because only `parse_document`
+    // ran. The fix runs the analyzer and refuses to evaluate when any
+    // diagnostic has Error severity.
+    let dir = std::env::temp_dir().join(format!("relon-mod-analyze-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("bad.relon"),
+        // `name: *` without a type annotation — analyzer flags it.
+        r#"#schema Bad { name: * }
+{ exported: 1 }"#,
+    )
+    .unwrap();
+
+    let node = parse_doc(
+        r#"#import bad from "./bad.relon"
+            { x: bad.exported }"#,
+    );
+    let ctx = fully_granted_ctx().with_root(node.clone());
+    let scope = std::sync::Arc::new(Scope {
+        current_dir: dir.to_string_lossy().to_string(),
+        ..Default::default()
+    });
+    let result = Evaluator::new(std::sync::Arc::new(ctx)).eval_root(&scope);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(
+        matches!(&result, Err(RuntimeError::ModuleParseError { .. })),
+        "expected ModuleParseError for a module with analyzer errors, got {result:?}"
+    );
+}
+
+#[test]
+fn step_counter_resets_between_top_level_runs() {
+    // P2-F regression: `Context::step_counter` is monotonic. Reusing the
+    // same Evaluator/Context across two top-level evaluations used to
+    // accumulate the prior step count — the second run could trip the
+    // budget even though it's small. `eval_root` and `run_main` now
+    // reset the counter on entry.
+    let node = parse_doc(r#"{ a: 1, b: 2, c: 3 }"#);
+    let mut ctx = Context::new().with_root(node.clone());
+    // Tight budget that fits one such evaluation but would overflow on
+    // accumulated steps from two back-to-back runs.
+    ctx.capabilities.max_steps = Some(50);
+    let ctx = std::sync::Arc::new(ctx);
+    let eval = Evaluator::new(std::sync::Arc::clone(&ctx));
+    let scope = std::sync::Arc::new(Scope::default());
+
+    let r1 = eval.eval_root(&scope);
+    assert!(r1.is_ok(), "first run should fit in budget: {r1:?}");
+    let r2 = eval.eval_root(&scope);
+    assert!(
+        r2.is_ok(),
+        "second run should also fit (counter reset): {r2:?}"
+    );
+}
+
+#[test]
+fn run_main_return_type_mismatch_errors() {
+    // `#main(...) -> Type` regression: when the body's value doesn't
+    // satisfy the declared return type, surface `MainReturnTypeMismatch`
+    // rather than letting the host see an untyped value.
+    use std::collections::HashMap;
+    let source = r#"#main(Int n) -> String
+{ result: n + 1 }"#;
+    let node = parse_doc(source);
+    let analyzed = std::sync::Arc::new(relon_analyzer::analyze(&node));
+    assert!(analyzed.main_signature.is_some());
+    assert!(analyzed
+        .main_signature
+        .as_ref()
+        .unwrap()
+        .return_type
+        .is_some());
+
+    let mut args: HashMap<String, Value> = HashMap::new();
+    args.insert("n".to_string(), Value::Int(7));
+    let ctx = Context::new()
+        .with_root(node.clone())
+        .with_analyzed(std::sync::Arc::clone(&analyzed));
+    let result = Evaluator::new(std::sync::Arc::new(ctx))
+        .run_main(&std::sync::Arc::new(Scope::default()), args);
+    assert!(
+        matches!(&result, Err(RuntimeError::MainReturnTypeMismatch { expected, .. }) if expected == "String"),
+        "expected MainReturnTypeMismatch(String), got {result:?}"
+    );
+}
+
+#[test]
+fn run_main_return_type_match_passes() {
+    // Counterpart to the mismatch case: when the body satisfies the
+    // declared return type, `run_main` returns the value as usual.
+    use std::collections::HashMap;
+    let source = r#"#main(Int n) -> Dict
+{ result: n + 1 }"#;
+    let node = parse_doc(source);
+    let analyzed = std::sync::Arc::new(relon_analyzer::analyze(&node));
+
+    let mut args: HashMap<String, Value> = HashMap::new();
+    args.insert("n".to_string(), Value::Int(7));
+    let ctx = Context::new()
+        .with_root(node.clone())
+        .with_analyzed(std::sync::Arc::clone(&analyzed));
+    let result = Evaluator::new(std::sync::Arc::new(ctx))
+        .run_main(&std::sync::Arc::new(Scope::default()), args)
+        .unwrap();
+    let Value::Dict(d) = result else { panic!() };
+    assert_eq!(d.map.get("result"), Some(&Value::Int(8)));
 }

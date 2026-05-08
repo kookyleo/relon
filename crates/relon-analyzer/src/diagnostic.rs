@@ -150,7 +150,7 @@ pub enum Diagnostic {
     #[diagnostic(
         code(relon::analyze::duplicate_main_directive),
         help(
-            "A file may declare at most one `#main(...)` entry signature. Combine the parameter lists into a single `#main(a: A, b: B, ...)`."
+            "A file may declare at most one `#main(...)` entry signature. Combine the parameter lists into a single `#main(A a, B b, ...)`."
         )
     )]
     DuplicateMainDirective {

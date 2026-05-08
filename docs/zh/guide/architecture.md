@@ -60,7 +60,7 @@ plain JSON
 1. **`schema`**：识别 `#schema Name { ... }` / `#schema Name: { ... }` / `#schema Name Enum<...>`，降级为 `SchemaDef`。tagged-enum sum type 的 variant 列表也在这里抽取。
 2. **`resolve`**：把 `Reference` / `Variable` 节点绑定到目标字段的 `NodeId`。保守策略：闭包参数和 dict spread 标记 frame 为 dynamic，引用不强行报错。
 3. **`modules`**：扫描 `#import ... from "..."` 顶层指令，收集 import 边。
-4. **`main_sig`**：识别根级 `#main(name: Type, ...)` 指令，构建 `MainSignature`。
+4. **`main_sig`**：识别根级 `#main(Type name, ...) [-> ReturnType]` 指令，构建 `MainSignature`。
 5. **`typecheck`**：聚合诊断 —— `UnresolvedReference`、`StaticTypeMismatch`、`NonExhaustiveMatch`、`UnknownVariant`（带 did-you-mean）、`DuplicateMatchArm`、`HeterogeneousEnum`、`SchemaBodyNotDict` 等。
 
 诊断分两级：`Severity::Error` 阻断求值，`Severity::Warning` 仅提示，evaluator 仍会执行。
@@ -94,7 +94,7 @@ plain JSON
 - `allow_native_fn` + `allow_all_native_fn` —— 受 cap 门控的 native fn 白名单
 - `FilesystemModuleResolver` 默认拒绝；`with_root_dir` 才启用
 
-`Context::sandboxed()` 默认拒绝一切；`Context::trusted()` 全开；`Context::new()` 等价于 `trusted()`（保留向后兼容）。
+`Context::sandboxed()` 默认拒绝文件系统与门控原生函数；需要全开时显式设置 `Capabilities::all_granted()`，并安装 `FilesystemModuleResolver::trusted()`。`Context::new()` 是轻量基础构造器：只挂载虚拟 std 模块与内置纯函数，不代表全开信任模式。
 
 详见[沙箱与权限](./sandbox.md)。
 
