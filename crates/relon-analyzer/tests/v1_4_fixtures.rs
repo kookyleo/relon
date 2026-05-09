@@ -1,4 +1,4 @@
-//! Integration tests over `tests/fixtures/v1_4/`.
+//! Integration tests over `tests/fixtures/`.
 //!
 //! Each fixture's leading comment declares the expected outcome. We
 //! parse + analyze the file and assert on the diagnostic shape. Same
@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 fn load_fixture(rel: &str) -> String {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/v1_4")
+        .join("tests/fixtures")
         .join(rel);
     std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read fixture {rel}: {e}"))
 }

@@ -1,4 +1,4 @@
-//! Integration tests over `tests/fixtures/v1_7/`.
+//! Integration tests over `tests/fixtures/`.
 //!
 //! v1.7 introduces structured tuple types (replacing the
 //! `List`-as-tuple overload) and bans the bare-generic shorthand
@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 fn load_fixture(rel: &str) -> String {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/v1_7")
+        .join("tests/fixtures")
         .join(rel);
     std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read fixture {rel}: {e}"))
 }

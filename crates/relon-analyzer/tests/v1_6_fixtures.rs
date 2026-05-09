@@ -1,4 +1,4 @@
-//! Integration tests over `tests/fixtures/v1_6/`.
+//! Integration tests over `tests/fixtures/`.
 //!
 //! v1.6 retires `Any` from the user-facing surface (every mode) and
 //! replaces every stdlib-signature `Any` with an unbound generic
@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 fn load_fixture(rel: &str) -> String {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/v1_6")
+        .join("tests/fixtures")
         .join(rel);
     std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read fixture {rel}: {e}"))
 }

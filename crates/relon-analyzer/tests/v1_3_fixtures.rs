@@ -1,4 +1,4 @@
-//! Integration tests over `tests/fixtures/v1_3/`.
+//! Integration tests over `tests/fixtures/`.
 //!
 //! Each fixture's leading comment declares the expected outcome. We
 //! parse + analyze the file (or run the workspace pass for multi-file
@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 fn load_fixture(rel: &str) -> String {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/v1_3")
+        .join("tests/fixtures")
         .join(rel);
     std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read fixture {rel}: {e}"))
 }
@@ -342,7 +342,7 @@ struct DiskLoader {
 impl DiskLoader {
     fn new(rel_dir: &str) -> Self {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/v1_3")
+            .join("tests/fixtures")
             .join(rel_dir);
         Self {
             root,
@@ -370,7 +370,7 @@ impl ModuleLoader for DiskLoader {
 fn fixture_strict_propagation_one_hop() {
     let mut loader = DiskLoader::new("strict_propagation");
     let entry_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/v1_3/strict_propagation/entry.relon");
+        .join("tests/fixtures/strict_propagation/entry.relon");
     let src = std::fs::read_to_string(&entry_path).unwrap();
     let ws = analyze_entry(
         entry_path.to_string_lossy().to_string(),
@@ -400,7 +400,7 @@ fn fixture_strict_propagation_one_hop() {
 fn fixture_strict_propagation_two_hops() {
     let mut loader = DiskLoader::new("strict_propagation");
     let entry_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/v1_3/strict_propagation/chain_entry.relon");
+        .join("tests/fixtures/strict_propagation/chain_entry.relon");
     let src = std::fs::read_to_string(&entry_path).unwrap();
     let ws = analyze_entry(
         entry_path.to_string_lossy().to_string(),
@@ -419,7 +419,7 @@ fn fixture_strict_propagation_two_hops() {
 fn fixture_strict_propagation_diamond() {
     let mut loader = DiskLoader::new("strict_propagation");
     let entry_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/v1_3/strict_propagation/diamond_entry.relon");
+        .join("tests/fixtures/strict_propagation/diamond_entry.relon");
     let src = std::fs::read_to_string(&entry_path).unwrap();
     let ws = analyze_entry(
         entry_path.to_string_lossy().to_string(),

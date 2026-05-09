@@ -1,4 +1,4 @@
-//! Integration tests over `tests/fixtures/v1_5/`.
+//! Integration tests over `tests/fixtures/`.
 //!
 //! v1.5 closes the remaining strict-mode silent fallbacks: comprehension
 //! / where / spread expressions are now inferable; closure params and
@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 fn load_fixture(rel: &str) -> String {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/v1_5")
+        .join("tests/fixtures")
         .join(rel);
     std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read fixture {rel}: {e}"))
 }

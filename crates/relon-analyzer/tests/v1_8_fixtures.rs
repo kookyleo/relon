@@ -1,4 +1,4 @@
-//! Integration tests over `tests/fixtures/v1_8/`.
+//! Integration tests over `tests/fixtures/`.
 //!
 //! v1.8 turns `Enum<...>` into a first-class slot for static
 //! subsumption: instead of unconditionally accepting any value, the
@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 fn load_fixture(rel: &str) -> String {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/v1_8")
+        .join("tests/fixtures")
         .join(rel);
     std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read fixture {rel}: {e}"))
 }
@@ -145,7 +145,7 @@ struct DiskLoader {
 impl DiskLoader {
     fn new(rel_dir: &str) -> Self {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/v1_8")
+            .join("tests/fixtures")
             .join(rel_dir);
         Self {
             root,
@@ -172,7 +172,7 @@ impl ModuleLoader for DiskLoader {
 fn analyze_cross_module_fixture(sub_dir: &str, entry_rel: &str) -> relon_analyzer::WorkspaceTree {
     let mut loader = DiskLoader::new(sub_dir);
     let entry_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/v1_8")
+        .join("tests/fixtures")
         .join(sub_dir)
         .join(entry_rel);
     let src = std::fs::read_to_string(&entry_path).unwrap();
