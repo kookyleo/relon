@@ -29,7 +29,7 @@ pub struct NativeFnGate {
 
 /// Context-wide grant the host hands the evaluator. Mirrors the
 /// allow-list-shaped fields of `relon_evaluator::eval::Capabilities`.
-/// Resource budgets (`max_steps`, `max_value_bytes`) are deliberately
+/// Resource budgets (`max_steps`, `max_value_elements`) are deliberately
 /// excluded — they affect runtime evaluation, not static reachability.
 #[derive(Debug, Clone)]
 pub struct Capabilities {

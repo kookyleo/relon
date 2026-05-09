@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// Context-wide sandbox policy. Holds both the resource budgets the
-/// evaluator enforces (`max_steps`, `max_value_bytes`) and the
+/// evaluator enforces (`max_steps`, `max_value_elements`) and the
 /// allow-lists used to gate calls to host-registered native functions.
 ///
 /// Per-function capability *requirements* (e.g. "this fn needs fs read")
@@ -29,7 +29,7 @@ pub struct Capabilities {
     /// Maximum number of AST nodes to process before aborting.
     pub max_steps: Option<u64>,
     /// Maximum number of elements in a single List or Dict.
-    pub max_value_bytes: Option<usize>,
+    pub max_value_elements: Option<usize>,
 }
 
 impl Capabilities {
@@ -52,7 +52,7 @@ impl Capabilities {
             allow_native_fn: HashSet::new(),
             reads_fs: true,
             max_steps: None,
-            max_value_bytes: None,
+            max_value_elements: None,
         }
     }
 }
@@ -344,16 +344,15 @@ impl Evaluator {
         self.eval_internal(node, scope, false)
     }
 
-    /// Enforce `Capabilities::max_value_bytes`. The field name is for
-    /// forward compatibility with a future byte-accurate metric; today
-    /// we measure element count for `List` / `Dict` and skip primitive
-    /// values entirely (their size is bounded by the source).
+    /// Enforce `Capabilities::max_value_elements`. We count elements in
+    /// `List` / `Dict` and skip primitive values entirely (their size is
+    /// bounded by the source).
     pub(crate) fn check_value_size(
         &self,
         value: &Value,
         range: TokenRange,
     ) -> Result<(), RuntimeError> {
-        let Some(limit) = self.context.capabilities.max_value_bytes else {
+        let Some(limit) = self.context.capabilities.max_value_elements else {
             return Ok(());
         };
         let actual = match value {

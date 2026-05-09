@@ -177,13 +177,13 @@ fn max_steps_does_not_fire_under_limit() {
 }
 
 #[test]
-fn max_value_bytes_rejects_oversized_list() {
+fn max_value_elements_rejects_oversized_list() {
     // The watermark fires at evaluator-side construction sites
     // (literal lists, dict-merge, list-comprehension). Stdlib-built
     // values like `range(...)` aren't gated — by design, since the
     // host owns those caps. Cover the literal-list path here.
     let mut ctx = Context::sandboxed();
-    ctx.capabilities.max_value_bytes = Some(3);
+    ctx.capabilities.max_value_elements = Some(3);
     let result = eval_with(ctx, r#"{ "big": [1, 2, 3, 4, 5] }"#);
     assert!(
         matches!(
@@ -199,9 +199,9 @@ fn max_value_bytes_rejects_oversized_list() {
 }
 
 #[test]
-fn max_value_bytes_rejects_oversized_dict() {
+fn max_value_elements_rejects_oversized_dict() {
     let mut ctx = Context::sandboxed();
-    ctx.capabilities.max_value_bytes = Some(2);
+    ctx.capabilities.max_value_elements = Some(2);
     let result = eval_with(ctx, r#"{ a: 1, b: 2, c: 3, d: 4 }"#);
     assert!(
         matches!(

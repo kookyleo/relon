@@ -45,7 +45,7 @@ ctx.prepend_module_resolver(Arc::new(
 ctx.capabilities.max_steps = Some(1_000_000);
 
 // 3. 设 value 元素水位（防止巨型 list/dict）
-ctx.capabilities.max_value_bytes = Some(10_000);
+ctx.capabilities.max_value_elements = Some(10_000);
 
 // 4. 把允许调用的「门控」原生函数加白名单（如果有）
 ctx.capabilities.allow_native_fn.insert("currency.format".to_string());
@@ -76,7 +76,7 @@ pub struct Capabilities {
     pub allow_native_fn: HashSet<String>,
     pub reads_fs: bool,
     pub max_steps: Option<u64>,
-    pub max_value_bytes: Option<usize>,
+    pub max_value_elements: Option<usize>,
 }
 ```
 
@@ -109,14 +109,14 @@ CPU 时间——一次 dispatch 内部如果调了一个慢的内置算子（比
 格的 CPU 控制，请在宿主侧加 wall-clock timer（详见
 [不在沙箱设计内的事](#不在沙箱设计内的事)）。
 
-### `max_value_bytes: Option<usize>`
+### `max_value_elements: Option<usize>`
 
 字段名带 `_bytes` 是为了未来扩展，**当前的实测维度是「Value 的元素
 数」**——一个 list 的元素个数，或一个 dict 的键值对数。检查点在求
 值器构造 list/dict 的边界（字面量、`+` 合并、推导式）。
 
 ```rust
-ctx.capabilities.max_value_bytes = Some(3);
+ctx.capabilities.max_value_elements = Some(3);
 // `[1, 2, 3, 4, 5]` 触发 ValueTooLarge { limit: 3, actual: 5 }
 ```
 
@@ -212,7 +212,7 @@ fn run_user_rule(
 
     // 求值预算
     ctx.capabilities.max_steps = Some(100_000);
-    ctx.capabilities.max_value_bytes = Some(10_000);
+    ctx.capabilities.max_value_elements = Some(10_000);
 
     // 暴露一个门控的、只读的函数
     ctx.register_fn_with_caps(
@@ -253,7 +253,7 @@ fn run_user_rule(
 | --- | --- |
 | `CapabilityDenied { name, reason, range }` | `#import` 走到 default-reject 的 resolver；或 `#import` 路径逃出 root；或调一个未在 `allow_native_fn` 里的门控函数 |
 | `StepLimitExceeded { limit, range }` | `eval_internal` 调用次数超过 `max_steps` |
-| `ValueTooLarge { limit, actual, range }` | 单个 list/dict 元素数超过 `max_value_bytes` |
+| `ValueTooLarge { limit, actual, range }` | 单个 list/dict 元素数超过 `max_value_elements` |
 
 每一种都带 `TokenRange`——可以直接喂给 miette 拿到带源码上下文的可
 读输出。
@@ -265,7 +265,7 @@ fn run_user_rule(
 - ❌ **CPU 挂钟时间限制**：Relon 没有内建 wall-clock budget。如果你
   需要「这个脚本最多跑 100ms」的语义，请在宿主侧用
   `tokio::time::timeout` / 单独线程 + 超时通道实现。
-- ❌ **堆字节精确计量**：`max_value_bytes` 只查 list/dict 的元素
+- ❌ **堆字节精确计量**：`max_value_elements` 只查 list/dict 的元素
   数，不算 String 的字节数、不算闭包捕获的引用计数。如果你想要严
   格的进程内存上限，加 OS 层 `setrlimit` / cgroup。
 - ❌ **跨进程隔离**：Relon 跑在你的进程里，挂了会带翻你的进程（不

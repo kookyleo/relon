@@ -258,7 +258,7 @@ Implementations MUST use these stable tags:
 | `CapabilityDenied` | Blocked by §4 |
 | `StepLimitExceeded` | `max_steps` budget exhausted |
 | `RecursionLimitExceeded` | Type-check / schema-validate recursion exceeds the runtime's safety cap (separate budget from `max_steps`) |
-| `ValueTooLarge` | `max_value_bytes` exceeded |
+| `ValueTooLarge` | `max_value_elements` exceeded |
 | `NoMainSignature` | File lacks `#main(...)` but `run_main` was called |
 | `MissingMainArg` | Host did not push a value for a declared `#main` parameter |
 | `UnexpectedMainArg` | Host pushed an arg name not in the `#main` signature |

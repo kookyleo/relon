@@ -231,7 +231,7 @@ std 模块通过**虚拟解析器**（`StdModuleResolver`）服务，**不消耗
 | `NumericOverflow` | 整数算术超出 `i64` 可表示范围 |
 | `StepLimitExceeded` | 触发 `max_steps`（求值步数预算耗尽）|
 | `RecursionLimitExceeded` | 类型检查 / schema 验证递归深度超过运行时安全上限（与 `max_steps` 是不同维度的预算，hosts 不能通过调高 `max_steps` 缓解）|
-| `ValueTooLarge` | 触发 `max_value_bytes` |
+| `ValueTooLarge` | 触发 `max_value_elements` |
 | `NoMainSignature` | 文件没有 `#main(...)` 但被 `run_main` 调用 |
 | `MissingMainArg` | host 没有为 `#main` 声明的某个参数推入值 |
 | `UnexpectedMainArg` | host 推入了 `#main` 签名中没有的参数名 |

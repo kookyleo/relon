@@ -239,7 +239,7 @@ fn host_receives_step_limit_exceeded() {
 fn host_receives_value_too_large() {
     // Build a list whose element count exceeds the bound.
     let mut caps = Capabilities::all_granted();
-    caps.max_value_bytes = Some(2);
+    caps.max_value_elements = Some(2);
     let result = run_with_caps(r#"[1, 2, 3, 4, 5]"#, caps);
     let err = result.expect_err("should error");
     let RuntimeError::ValueTooLarge {

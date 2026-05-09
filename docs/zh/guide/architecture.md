@@ -90,7 +90,7 @@ plain JSON
 `Capabilities` 五个字段决定 evaluator 的边界：
 
 - `max_steps` —— eval_internal 进入计数，超阈值 → `StepLimitExceeded`
-- `max_value_bytes` —— list/dict 构造点检测元素总数（**字段名遗留，实际是元素数**）
+- `max_value_elements` —— list/dict 构造点检测的元素总数上限
 - `allow_native_fn` + `allow_all_native_fn` —— 受 cap 门控的 native fn 白名单
 - `FilesystemModuleResolver` 默认拒绝；`with_root_dir` 才启用
 

@@ -124,7 +124,7 @@ pub enum RuntimeError {
     #[error("Value too large: {actual} elements exceeds limit of {limit}")]
     #[diagnostic(
         code(relon::eval::value_too_large),
-        help("A list/dict grew past `Capabilities::max_value_bytes`. Raise the limit or shrink the value.")
+        help("A list/dict grew past `Capabilities::max_value_elements`. Raise the limit or shrink the value.")
     )]
     ValueTooLarge {
         limit: usize,
