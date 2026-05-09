@@ -608,6 +608,8 @@ dependencies = [
  "relon",
  "relon-analyzer",
  "relon-evaluator",
+ "relon-fmt",
+ "relon-lsp",
  "relon-parser",
  "serde_json",
 ]

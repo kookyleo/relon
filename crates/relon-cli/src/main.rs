@@ -44,6 +44,25 @@ enum Commands {
         #[arg(long)]
         trust: bool,
     },
+
+    /// Format or check Relon files. Equivalent to the standalone
+    /// `relon-fmt` binary, exposed here so a single `relon` install
+    /// covers the toolchain.
+    Fmt {
+        /// Check whether files are formatted without writing changes.
+        #[arg(long)]
+        check: bool,
+        /// Print formatted output to stdout instead of writing files.
+        #[arg(long)]
+        stdout: bool,
+        /// Relon files to format.
+        files: Vec<PathBuf>,
+    },
+
+    /// Run the Language Server (stdio transport). Equivalent to the
+    /// standalone `relon-lsp` binary; editors that want a single
+    /// `relon lsp` command can wire to this.
+    Lsp,
 }
 
 fn main() -> miette::Result<()> {
@@ -248,7 +267,59 @@ fn main() -> miette::Result<()> {
 
             println!("{}", output);
         }
+        Commands::Fmt {
+            check,
+            stdout,
+            files,
+        } => {
+            run_fmt(check, stdout, files)?;
+        }
+        Commands::Lsp => {
+            relon_lsp::server::run_stdio()
+                .map_err(|e| miette::miette!("language server exited with error: {e}"))?;
+        }
     }
 
     Ok(())
+}
+
+/// Same logic as the standalone `relon-fmt` binary. Kept here so a
+/// single `relon` install covers fmt without an extra crate
+/// dependency on the operator's side; the standalone binary stays
+/// available for scripts that already wire to it.
+fn run_fmt(check: bool, stdout: bool, files: Vec<PathBuf>) -> miette::Result<()> {
+    if files.is_empty() {
+        return Err(miette::miette!("expected at least one file"));
+    }
+
+    let mut failed_check = false;
+    for file in &files {
+        let source = std::fs::read_to_string(file)
+            .into_diagnostic()
+            .map_err(|e| e.wrap_err(format!("failed to read {}", file.display())))?;
+        let formatted = relon_fmt::format_source(&source)
+            .map_err(|e| miette::miette!("{}: {e}", file.display()))?;
+
+        if check {
+            if formatted != source {
+                eprintln!("{} is not formatted", file.display());
+                failed_check = true;
+            }
+            continue;
+        }
+
+        if stdout {
+            print!("{formatted}");
+        } else if formatted != source {
+            std::fs::write(file, formatted)
+                .into_diagnostic()
+                .map_err(|e| e.wrap_err(format!("failed to write {}", file.display())))?;
+        }
+    }
+
+    if failed_check {
+        Err(miette::miette!("one or more files were not formatted"))
+    } else {
+        Ok(())
+    }
 }
