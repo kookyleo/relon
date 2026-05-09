@@ -17,6 +17,7 @@
 
 use crate::diagnostics::batch_to_lsp;
 use crate::features;
+use crate::workspace::compute_workspace_diagnostics;
 use anyhow::{Context, Result};
 use lsp_server::{Connection, Message, Notification, Request, Response};
 use lsp_types::notification::{
@@ -31,7 +32,8 @@ use lsp_types::{
 };
 use relon_analyzer::{analyze, AnalyzedTree};
 use relon_parser::{parse_document, Node};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 /// Run the server over stdio. Returns when the client sends `exit`.
@@ -55,10 +57,13 @@ pub fn run_with_connection(connection: Connection) -> Result<()> {
         ..ServerCapabilities::default()
     })?;
     let initialize_params = connection.initialize(server_capabilities)?;
-    let _params: InitializeParams =
+    let params: InitializeParams =
         serde_json::from_value(initialize_params).context("deserialize InitializeParams")?;
 
-    let mut state = ServerState::default();
+    let mut state = ServerState {
+        workspace_root: workspace_root_from(&params),
+        ..ServerState::default()
+    };
     for msg in &connection.receiver {
         match msg {
             Message::Request(req) => {
@@ -82,6 +87,38 @@ pub fn run_with_connection(connection: Connection) -> Result<()> {
 #[derive(Default)]
 struct ServerState {
     docs: DocumentStore,
+    /// Workspace root resolved from `InitializeParams`. `None` means
+    /// the client opened a detached file (no workspace folder, no
+    /// `rootUri`); diagnostics fall back to single-file analyze.
+    workspace_root: Option<PathBuf>,
+    /// URIs we've published non-empty diagnostics to in the most recent
+    /// workspace pass. Tracked so that when the next pass clears
+    /// errors in a previously-erroring file, we can publish an empty
+    /// list to that URI explicitly (LSP requires the server to clear).
+    published_uris: HashSet<Url>,
+}
+
+/// Best-effort workspace root extraction. Prefers `workspace_folders`
+/// (multi-root not supported — pick the first), falls back to
+/// `root_uri`, then `root_path`. Returns `None` when nothing is set;
+/// the server then degrades to single-file diagnostics.
+fn workspace_root_from(params: &InitializeParams) -> Option<PathBuf> {
+    if let Some(folders) = params.workspace_folders.as_ref().filter(|f| !f.is_empty()) {
+        if let Ok(p) = folders[0].uri.to_file_path() {
+            return Some(p);
+        }
+    }
+    #[allow(deprecated)]
+    if let Some(uri) = params.root_uri.as_ref() {
+        if let Ok(p) = uri.to_file_path() {
+            return Some(p);
+        }
+    }
+    #[allow(deprecated)]
+    if let Some(path) = params.root_path.as_ref() {
+        return Some(PathBuf::from(path));
+    }
+    None
 }
 
 /// One document's cached state. We pay parse + analyze on every edit
@@ -227,7 +264,7 @@ fn handle_notification(
             state
                 .docs
                 .upsert(uri.clone(), params.text_document.text.clone());
-            publish_diagnostics(conn, &state.docs, &uri)?;
+            publish_diagnostics(conn, state, &uri)?;
         }
         DidChangeTextDocument::METHOD => {
             let params: lsp_types::DidChangeTextDocumentParams =
@@ -237,15 +274,21 @@ fn handle_notification(
             if let Some(change) = params.content_changes.into_iter().next() {
                 let uri = params.text_document.uri.clone();
                 state.docs.upsert(uri.clone(), change.text);
-                publish_diagnostics(conn, &state.docs, &uri)?;
+                publish_diagnostics(conn, state, &uri)?;
             }
         }
         DidCloseTextDocument::METHOD => {
             let params: lsp_types::DidCloseTextDocumentParams =
                 serde_json::from_value(notif.params)?;
             state.docs.remove(&params.text_document.uri);
-            // Clear diagnostics on close.
-            send_diagnostics(conn, params.text_document.uri, vec![])?;
+            // Clear diagnostics on close — both the closed file and
+            // any other URIs the previous workspace pass had marked
+            // (so the editor doesn't show stale "imported error"
+            // squiggles after the importer is closed).
+            send_diagnostics(conn, params.text_document.uri.clone(), vec![])?;
+            for uri in std::mem::take(&mut state.published_uris) {
+                send_diagnostics(conn, uri, vec![])?;
+            }
         }
         _ => {
             // Unknown notification — silently ignore (per LSP spec).
@@ -254,16 +297,74 @@ fn handle_notification(
     Ok(())
 }
 
-fn publish_diagnostics(conn: &Connection, docs: &DocumentStore, uri: &Url) -> Result<()> {
-    let Some(entry) = docs.get(uri) else {
+fn publish_diagnostics(conn: &Connection, state: &mut ServerState, uri: &Url) -> Result<()> {
+    let Some(entry) = state.docs.get(uri) else {
         return Ok(());
     };
-    // Diagnostics combine analyzer findings with parser failures; the
-    // latter only show up if `build_entry` swapped in the empty
-    // document. Reuse the streaming `compute_diagnostics` helper so
-    // both paths stay in lockstep.
+
+    // Decide between workspace mode and the single-file fallback. We
+    // need: (a) a workspace root, (b) a `file://` URI we can resolve
+    // to a real on-disk path, (c) a successful canonicalize. Anything
+    // shy of that — detached scratch buffer, untitled doc, virtual
+    // schemes — drops to the single-file path, which still surfaces
+    // analyzer + parser diagnostics for the active document.
+    let workspace_diags = state
+        .workspace_root
+        .clone()
+        .and_then(|root| try_workspace_diagnostics(uri, &entry.source, &root));
+
+    if let Some(by_uri) = workspace_diags {
+        // Clear any URI that previously had non-empty diagnostics but
+        // no longer appears in the new pass — the editor needs an
+        // explicit empty publish to drop the squiggles.
+        let new_uris: HashSet<Url> = by_uri.keys().cloned().collect();
+        for stale in state.published_uris.difference(&new_uris) {
+            send_diagnostics(conn, stale.clone(), vec![])?;
+        }
+        for (target_uri, diags) in by_uri {
+            send_diagnostics(conn, target_uri, diags)?;
+        }
+        state.published_uris = new_uris;
+        return Ok(());
+    }
+
+    // Single-file fallback. Combines analyzer findings with parser
+    // failures; the latter only show up if `build_entry` swapped in
+    // the empty document. Reuse the streaming `compute_diagnostics`
+    // helper so both paths stay in lockstep.
     let diags = compute_diagnostics(&entry.source);
+    // Whatever the workspace pass had marked previously is now stale.
+    for stale in std::mem::take(&mut state.published_uris) {
+        if &stale != uri {
+            send_diagnostics(conn, stale, vec![])?;
+        }
+    }
+    state.published_uris.insert(uri.clone());
     send_diagnostics(conn, uri.clone(), diags)
+}
+
+/// Attempt the workspace pass. Returns `None` (so the caller can fall
+/// back to single-file) when:
+///
+/// * The URI isn't `file://`.
+/// * `to_file_path` / canonicalize fails (scratch buffer, deleted
+///   on-disk twin, etc.).
+fn try_workspace_diagnostics(
+    uri: &Url,
+    source: &str,
+    workspace_root: &std::path::Path,
+) -> Option<HashMap<Url, Vec<lsp_types::Diagnostic>>> {
+    let path = uri.to_file_path().ok()?;
+    let canonical = std::fs::canonicalize(&path).ok()?;
+    let entry_dir = canonical.parent()?.to_path_buf();
+    let entry_canonical = canonical.to_string_lossy().to_string();
+    Some(compute_workspace_diagnostics(
+        uri,
+        &entry_canonical,
+        source,
+        entry_dir,
+        workspace_root.to_path_buf(),
+    ))
 }
 
 fn send_diagnostics(

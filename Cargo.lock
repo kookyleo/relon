@@ -643,6 +643,7 @@ dependencies = [
  "lsp-types",
  "miette",
  "relon-analyzer",
+ "relon-evaluator",
  "relon-parser",
  "serde",
  "serde_json",
