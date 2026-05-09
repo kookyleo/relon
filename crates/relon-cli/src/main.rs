@@ -1,70 +1,13 @@
 use clap::{Parser, Subcommand};
 use miette::{IntoDiagnostic, LabeledSpan, NamedSource, Report};
-use relon_analyzer::{
-    analyze_entry, LoadError, LoadedModule, ModuleLoader as AnalyzerModuleLoader,
-};
-use relon_evaluator::module::{FilesystemModuleResolver, ModuleResolver, StdModuleResolver};
-use relon_evaluator::{Capabilities, Context, Evaluator, RuntimeError, Scope, Value};
-use relon_parser::{parse_document, ParseDocumentError, TokenRange};
+use relon::ResolverChainLoader;
+use relon_analyzer::analyze_entry;
+use relon_evaluator::module::FilesystemModuleResolver;
+use relon_evaluator::{Capabilities, Context, Evaluator, Scope, Value};
+use relon_parser::{parse_document, ParseDocumentError};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-
-/// Same shape as `relon::FacadeLoader` — kept inline in the CLI so the
-/// binary doesn't have to depend on the facade's `pub(crate)` types.
-struct CliLoader {
-    resolvers: Vec<Arc<dyn ModuleResolver>>,
-}
-
-impl CliLoader {
-    fn new_sandboxed() -> Self {
-        Self {
-            resolvers: vec![Arc::new(StdModuleResolver)],
-        }
-    }
-
-    fn new_trusted() -> Self {
-        Self {
-            resolvers: vec![
-                Arc::new(StdModuleResolver),
-                Arc::new(FilesystemModuleResolver::trusted()),
-            ],
-        }
-    }
-}
-
-impl AnalyzerModuleLoader for CliLoader {
-    fn load(&mut self, path: &str, current_dir: &Path) -> Result<LoadedModule, LoadError> {
-        let mut scope = Scope::default();
-        scope.current_dir = current_dir.to_string_lossy().to_string();
-        let scope = Arc::new(scope);
-        for resolver in &self.resolvers {
-            match resolver.resolve(path, &scope, TokenRange::default()) {
-                Ok(Some(source)) => {
-                    let dir = if source.current_dir.is_empty() {
-                        current_dir.to_path_buf()
-                    } else {
-                        PathBuf::from(&source.current_dir)
-                    };
-                    return Ok(LoadedModule {
-                        canonical_id: source.canonical_id,
-                        source: source.source,
-                        current_dir: dir,
-                    });
-                }
-                Ok(None) => continue,
-                Err(RuntimeError::CapabilityDenied { reason, .. }) => {
-                    return Err(LoadError::AccessDenied(reason));
-                }
-                Err(RuntimeError::ModuleNotFound(_, _)) => {
-                    return Err(LoadError::NotFound);
-                }
-                Err(other) => return Err(LoadError::Other(other.to_string())),
-            }
-        }
-        Err(LoadError::NotFound)
-    }
-}
 
 #[derive(Parser)]
 #[command(name = "relon")]
@@ -136,9 +79,9 @@ fn main() -> miette::Result<()> {
                 .unwrap_or(Path::new("."))
                 .to_path_buf();
             let mut loader = if trust {
-                CliLoader::new_trusted()
+                ResolverChainLoader::trusted()
             } else {
-                CliLoader::new_sandboxed()
+                ResolverChainLoader::sandboxed()
             };
             let workspace =
                 analyze_entry(cache_namespace.clone(), &content, entry_dir, &mut loader);

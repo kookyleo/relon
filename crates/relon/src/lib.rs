@@ -229,25 +229,32 @@ pub enum ProjectError<P> {
 /// pass reuse exactly the same lookup rules (std/* virtual modules,
 /// trusted filesystem) as runtime imports, without the analyzer crate
 /// having to depend on `std::fs` directly.
-struct FacadeLoader {
+///
+/// Binaries that drive the analyzer directly (e.g. `relon-cli`) reuse
+/// this through the public [`sandboxed`] / [`trusted`] constructors,
+/// so the `ModuleResolver` chain stays defined in one place.
+///
+/// [`sandboxed`]: ResolverChainLoader::sandboxed
+/// [`trusted`]: ResolverChainLoader::trusted
+pub struct ResolverChainLoader {
     resolvers: Vec<Arc<dyn ModuleResolver>>,
 }
 
-impl FacadeLoader {
-    fn new_sandboxed() -> Self {
-        // Sandboxed posture: only `std/*` virtual modules resolve.
-        // Local `#import "./foo.relon"` paths get no resolver and
-        // surface as `ModuleNotFound`, mirroring the default
-        // `Capabilities` (no `reads_fs`).
+impl ResolverChainLoader {
+    /// Sandboxed posture: only `std/*` virtual modules resolve. Local
+    /// `#import "./foo.relon"` paths get no resolver and surface as
+    /// `ModuleNotFound`, mirroring the default `Capabilities` (no
+    /// `reads_fs`).
+    pub fn sandboxed() -> Self {
         Self {
             resolvers: vec![Arc::new(StdModuleResolver)],
         }
     }
 
-    fn new_trusted() -> Self {
-        // Trusted posture: `std/*` + trusted filesystem fallback. Any
-        // host change to one chain has to mirror the `Context`
-        // assembly below in `evaluate_source`.
+    /// Trusted posture: `std/*` + trusted filesystem fallback. Any
+    /// host change to this chain has to mirror the `Context` assembly
+    /// in [`evaluate_source`].
+    pub fn trusted() -> Self {
         Self {
             resolvers: vec![
                 Arc::new(StdModuleResolver),
@@ -255,9 +262,15 @@ impl FacadeLoader {
             ],
         }
     }
+
+    /// Custom posture: pass your own resolver chain (for hosts that
+    /// install virtual file systems, registry resolvers, etc.).
+    pub fn from_resolvers(resolvers: Vec<Arc<dyn ModuleResolver>>) -> Self {
+        Self { resolvers }
+    }
 }
 
-impl ModuleLoader for FacadeLoader {
+impl ModuleLoader for ResolverChainLoader {
     fn load(
         &mut self,
         path: &str,
@@ -348,8 +361,8 @@ fn evaluate_source(
     // surface here — before we touch the evaluator. Loader trust
     // posture mirrors the eval-side `Context` assembly below.
     let mut loader = match trust {
-        TrustMode::Sandboxed => FacadeLoader::new_sandboxed(),
-        TrustMode::Trusted => FacadeLoader::new_trusted(),
+        TrustMode::Sandboxed => ResolverChainLoader::sandboxed(),
+        TrustMode::Trusted => ResolverChainLoader::trusted(),
     };
     let entry_dir_path = PathBuf::from(&current_dir);
     let workspace = analyze_entry(cache_namespace.clone(), source, entry_dir_path, &mut loader);
