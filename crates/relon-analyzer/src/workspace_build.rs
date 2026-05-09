@@ -5,10 +5,11 @@
 //! cycle-detection machinery, which is implementation-detail-heavy.
 
 use crate::diagnostic::Diagnostic;
+use crate::sig::FnSignature;
 use crate::tree::AnalyzedTree;
 use crate::workspace::{LoadError, ModuleLoader, WorkspaceDiagnostic, WorkspaceTree};
 use miette::SourceSpan;
-use relon_parser::{parse_document, Node, TokenRange};
+use relon_parser::{parse_document, Expr, Node, TokenKey, TokenRange};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -118,6 +119,17 @@ pub(crate) fn build<L: ModuleLoader>(
     //    modules `#import * from "..."` brings in, so the false-positive
     //    correction has to happen here.
     re_check_unknown_types(&mut ws);
+
+    // 4.5 v1.1: populate each module's `workspace_import_index` and
+    //    re-run typecheck so calls that resolve only through cross-
+    //    module closures (`map(...)` after `#import * from "list"`)
+    //    pick up their static signature, and `is_known_fn` correctly
+    //    sees imported names. The recheck strips every prior
+    //    typecheck-owned diagnostic before the second run, so non-
+    //    typecheck findings (schema, resolve, root_schemas, main_*)
+    //    stay put and typecheck's own findings are regenerated cleanly
+    //    without duplicates.
+    recheck_cross_module_calls(&mut ws);
 
     // 5. Stage 4: cross-module capability reachability. Runs after the
     //    import index is settled because the walker needs every
@@ -347,7 +359,7 @@ fn locate_import_range(ws: &WorkspaceTree, importer: &str, target: &str) -> Opti
 /// it for two purposes: (a) re-checking `UnknownTypeName` (this file)
 /// and (b) `pkg.Type` multi-segment subsumption (`infer.rs`).
 #[derive(Debug, Default, Clone)]
-pub(crate) struct WorkspaceImportIndex {
+pub struct WorkspaceImportIndex {
     /// `alias → set of root-level schema names exposed by the imported
     /// module`. Drives `pkg.Type` resolution.
     pub aliased: HashMap<String, HashSet<String>>,
@@ -360,6 +372,21 @@ pub(crate) struct WorkspaceImportIndex {
     /// Values are the upstream schema names — currently unused by
     /// downstream passes but kept for future "go to definition" tooling.
     pub destructured: HashMap<String, String>,
+    /// v1.1: closure signatures exposed via `#import alias from "..."`,
+    /// keyed by `alias → method_name → FnSignature`. Lets the importer
+    /// resolve `alias.method(...)` against the imported module's
+    /// top-level closure fields.
+    pub aliased_closures: HashMap<String, HashMap<String, FnSignature>>,
+    /// v1.1: closure signatures brought in via `#import * from "..."`,
+    /// keyed by closure field name. Lets the importer resolve a bare
+    /// `method(...)` call against any spread-imported module's top-level
+    /// closures. Last-spread-wins on name collisions (v1 simple).
+    pub spread_closures: HashMap<String, FnSignature>,
+    /// v1.1: closure signatures brought in via `#import { a, b as c }
+    /// from "..."`, keyed by the *local* name (alias when present, else
+    /// upstream). The signature itself is a clone of the upstream
+    /// closure's signature.
+    pub destructured_closures: HashMap<String, FnSignature>,
 }
 
 impl WorkspaceImportIndex {
@@ -403,30 +430,186 @@ pub(crate) fn build_import_index(ws: &WorkspaceTree, importer_id: &str) -> Works
             .iter()
             .map(|d| d.name.clone())
             .collect();
+        // v1.1: pick up the imported module's *root-level* closure
+        // signatures. We re-walk the module's parsed root node here
+        // (rather than using `field_closure_index`, which is
+        // last-write-wins across all dict depths) so cross-module
+        // imports only see top-level closures — the only ones the
+        // importer can call directly.
+        let exported_closures: HashMap<String, FnSignature> = ws
+            .nodes
+            .get(target_id)
+            .map(|root| collect_root_closure_signatures(root, target_tree))
+            .unwrap_or_default();
         if let Some(alias) = &imp.alias {
             index
                 .aliased
                 .entry(alias.clone())
                 .or_default()
                 .extend(exported_names.iter().cloned());
+            // Aliased import: methods accessible via `alias.method(...)`.
+            index
+                .aliased_closures
+                .entry(alias.clone())
+                .or_default()
+                .extend(
+                    exported_closures
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.clone())),
+                );
             continue;
         }
         if imp.spread {
             index.spread.extend(exported_names);
+            // Spread import: closures land in the importer's flat
+            // namespace under their original field names.
+            for (k, v) in &exported_closures {
+                index.spread_closures.insert(k.clone(), v.clone());
+            }
             continue;
         }
         if !imp.destructure.is_empty() {
             for (upstream, alias) in &imp.destructure {
-                // Only expose names actually exported by the target.
-                if !exported_names.contains(upstream) {
-                    continue;
-                }
                 let local = alias.clone().unwrap_or_else(|| upstream.clone());
-                index.destructured.insert(local, upstream.clone());
+                if exported_names.contains(upstream) {
+                    index.destructured.insert(local.clone(), upstream.clone());
+                }
+                // Closure destructure: expose only names actually
+                // implemented as a closure by the target module.
+                if let Some(sig) = exported_closures.get(upstream) {
+                    let mut renamed = sig.clone();
+                    renamed.name = local.clone();
+                    index.destructured_closures.insert(local, renamed);
+                }
             }
         }
     }
     index
+}
+
+/// Walk `root_node`'s top-level dict and return `field_name →
+/// FnSignature` for every field whose value is a `Closure` AST node.
+/// Used by [`build_import_index`] to seed cross-module closure
+/// signatures for the v1.1 lookup chain. The closure's signature is
+/// pulled from `tree.closure_signatures` (populated by the type-check
+/// walker during `analyze_with_options`); the field name overrides the
+/// synthetic `<closure#...>` name so diagnostics read naturally.
+fn collect_root_closure_signatures(
+    root_node: &Node,
+    tree: &AnalyzedTree,
+) -> HashMap<String, FnSignature> {
+    let mut out = HashMap::new();
+    let Expr::Dict(pairs) = &*root_node.expr else {
+        return out;
+    };
+    for (key, value) in pairs {
+        let TokenKey::String(name, _, _) = key else {
+            continue;
+        };
+        if !matches!(&*value.expr, Expr::Closure { .. }) {
+            continue;
+        }
+        let Some(sig) = tree.closure_signatures.get(&value.id) else {
+            continue;
+        };
+        let mut renamed = sig.clone();
+        renamed.name = name.clone();
+        out.insert(name.clone(), renamed);
+    }
+    out
+}
+
+/// v1.1 post-pass: stamp each module's `workspace_import_index` and
+/// re-run [`crate::typecheck::typecheck`] so FnCalls that previously
+/// went unresolved (their callee lived in another module) now pick up
+/// the imported closure's static signature, and `Variable` /
+/// `Reference` heads pointing at imported names stop false-flagging.
+///
+/// Implementation: drop every typecheck-produced diagnostic from the
+/// prior pass (it's about to be regenerated with the import index in
+/// scope), set `tree.workspace_import_index`, then run typecheck
+/// again. Other passes' diagnostics (schema, root_schemas, resolve,
+/// modules, main_sig, main_return) don't depend on the import index
+/// and are preserved verbatim.
+///
+/// We re-run the full typecheck pass rather than crafting a focused
+/// FnCall-only walker because the FnCall return-type also flows
+/// through `infer::infer_type` into `check_typed_binding` —
+/// e.g. `Int x: lib.add(1, 2)` only flags a mismatch once the FnCall's
+/// return type is statically known. Reusing the existing walker keeps
+/// the v1.1 cross-module path on exactly the same code path as the
+/// single-file path.
+fn recheck_cross_module_calls(ws: &mut WorkspaceTree) {
+    let mut indexes: HashMap<String, WorkspaceImportIndex> = HashMap::new();
+    let module_ids: Vec<String> = ws.modules.keys().cloned().collect();
+    for id in &module_ids {
+        indexes.insert(id.clone(), build_import_index(ws, id));
+    }
+    for id in &module_ids {
+        let Some(index) = indexes.remove(id) else {
+            continue;
+        };
+        // Skip modules that don't import anything — there's nothing
+        // the index could change. Single-file workspaces (entry only,
+        // no imports anywhere) take this branch and pay zero overhead
+        // beyond stamping the (empty) index.
+        let has_closures = !index.aliased_closures.is_empty()
+            || !index.spread_closures.is_empty()
+            || !index.destructured_closures.is_empty();
+        if !has_closures {
+            if let Some(arc_tree) = ws.modules.get_mut(id) {
+                if let Some(tree) = Arc::get_mut(arc_tree) {
+                    tree.workspace_import_index = Some(index);
+                }
+            }
+            continue;
+        }
+        let Some(arc_node) = ws.nodes.get(id).cloned() else {
+            continue;
+        };
+        let Some(arc_tree) = ws.modules.get_mut(id) else {
+            continue;
+        };
+        let Some(tree) = Arc::get_mut(arc_tree) else {
+            continue;
+        };
+        // Drop every typecheck-produced diagnostic; the rerun will
+        // re-emit the still-valid ones. Any diagnostic kind owned by a
+        // *different* pass (schema, resolve, root_schemas, main_*) is
+        // kept as-is.
+        tree.diagnostics
+            .retain(|d| !is_typecheck_owned_diagnostic(d));
+        // Closure signatures populated by the first typecheck walk
+        // get overwritten in place by the rerun; clearing the table
+        // first avoids leaking stale entries when (theoretically) a
+        // closure node id were absent from the rerun. In practice the
+        // walker visits the same nodes both times, so the clear is
+        // belt-and-suspenders.
+        tree.closure_signatures.clear();
+        tree.field_closure_index.clear();
+        tree.workspace_import_index = Some(index);
+        crate::typecheck::typecheck(&arc_node, tree);
+    }
+}
+
+/// True when `d` is a diagnostic kind emitted exclusively by
+/// [`crate::typecheck::typecheck`]. Used by [`recheck_cross_module_calls`]
+/// to clear those entries before a second typecheck run; other passes'
+/// diagnostics stay put.
+fn is_typecheck_owned_diagnostic(d: &Diagnostic) -> bool {
+    matches!(
+        d,
+        Diagnostic::UnresolvedReference { .. }
+            | Diagnostic::StaticTypeMismatch { .. }
+            | Diagnostic::FnCallArgCountMismatch { .. }
+            | Diagnostic::FnCallArgTypeMismatch { .. }
+            | Diagnostic::ConstDivisionByZero { .. }
+            | Diagnostic::ConstNumericOverflow { .. }
+            | Diagnostic::MatchArmTypeMismatch { .. }
+            | Diagnostic::UnknownVariant { .. }
+            | Diagnostic::DuplicateMatchArm { .. }
+            | Diagnostic::NonExhaustiveMatch { .. }
+    )
 }
 
 /// Stage 2.1 post-pass: walk every module's diagnostics and drop
@@ -1018,6 +1201,242 @@ mod tests {
         assert!(
             unknown_type_count(&ws, "NotExist") >= 1,
             "expected NotExist to remain unresolved"
+        );
+    }
+
+    // === v1.1: cross-module closure signatures ===
+
+    /// Helper: count `FnCallArgTypeMismatch` diagnostics across every
+    /// module's per-tree diagnostics.
+    fn fn_call_arg_mismatch_count(ws: &WorkspaceTree) -> usize {
+        ws.modules
+            .values()
+            .flat_map(|t| t.diagnostics.iter())
+            .filter(|d| matches!(d, Diagnostic::FnCallArgTypeMismatch { .. }))
+            .count()
+    }
+
+    #[test]
+    fn v1_1_spread_import_exposes_closure_signature_to_typed_slot() {
+        // Forward: `#import * from "lib"` brings `add` into the
+        // entry's flat namespace. Closure declares `Int a, Int b`
+        // params; calling `add(1, "x")` flags arg 1 against the
+        // imported signature.
+        let mut loader = MapLoader::new();
+        loader.add(
+            "./lib",
+            "/abs/lib",
+            r#"{
+                add(Int a, Int b): a + b
+            }"#,
+        );
+        let ws = build(
+            "/abs/entry".to_string(),
+            r#"#import * from "./lib"
+            { v: add(1, "x") }"#,
+            PathBuf::from("/abs"),
+            &mut loader,
+        );
+        let count_for_add: usize = ws
+            .modules
+            .values()
+            .flat_map(|t| t.diagnostics.iter())
+            .filter(|d| matches!(d, Diagnostic::FnCallArgTypeMismatch { fn_name, .. } if fn_name == "add"))
+            .count();
+        assert!(
+            count_for_add >= 1,
+            "{:?}",
+            ws.modules.get("/abs/entry").map(|t| t.diagnostics.clone())
+        );
+    }
+
+    #[test]
+    fn v1_1_alias_import_resolves_method_arg_type_mismatch() {
+        // `#import lib from "..."` exposes the imported root dict's
+        // top-level closures under `lib.<name>`. Calling
+        // `lib.map([1,2], "not_a_closure")` should flag arg 1 because
+        // the closure declares a `Closure`-typed second parameter
+        // (inherited from `_list_map`'s signature via the body).
+        //
+        // Note: the user closure `map(l, f): _list_map(l, f)` doesn't
+        // type-annotate its params, so they default to `Any`. We
+        // therefore check via arg-count or arity instead, by passing
+        // too many args.
+        let mut loader = MapLoader::new();
+        loader.add(
+            "./lib",
+            "/abs/lib",
+            r#"{
+                map(l, f): _list_map(l, f)
+            }"#,
+        );
+        let ws = build(
+            "/abs/entry".to_string(),
+            r#"#import lib from "./lib"
+            { v: lib.map([1, 2], (n) => n + 1, 99) }"#,
+            PathBuf::from("/abs"),
+            &mut loader,
+        );
+        let arity_mismatches: usize = ws
+            .modules
+            .values()
+            .flat_map(|t| t.diagnostics.iter())
+            .filter(|d| matches!(d, Diagnostic::FnCallArgCountMismatch { fn_name, .. } if fn_name == "lib.map" || fn_name == "map"))
+            .count();
+        assert!(
+            arity_mismatches >= 1,
+            "expected arity diag for lib.map with 3 args, got: {:?}",
+            ws.modules.get("/abs/entry").map(|t| t.diagnostics.clone())
+        );
+    }
+
+    #[test]
+    fn v1_1_destructure_import_resolves_call_arg_type_mismatch() {
+        // `#import { add } from "lib"` brings `add` into the entry's
+        // flat namespace. The closure `add(Int a, Int b): a + b`
+        // declares typed params, so calling `add(1, "x")` flags arg 1.
+        let mut loader = MapLoader::new();
+        loader.add(
+            "./lib",
+            "/abs/lib",
+            r#"{
+                add(Int a, Int b): a + b
+            }"#,
+        );
+        let ws = build(
+            "/abs/entry".to_string(),
+            r#"#import { add } from "./lib"
+            { v: add(1, "x") }"#,
+            PathBuf::from("/abs"),
+            &mut loader,
+        );
+        assert!(
+            fn_call_arg_mismatch_count(&ws) >= 1,
+            "expected arg-type diag for add(1, \"x\"), got: {:?}",
+            ws.modules.get("/abs/entry").map(|t| t.diagnostics.clone())
+        );
+    }
+
+    #[test]
+    fn v1_1_closure_not_exported_stays_unresolved() {
+        // Reverse: a closure defined *inside a nested dict* (not at
+        // the module's root) is not exported; cross-module callers
+        // can't see it, so calls that mismatch silently pass.
+        let mut loader = MapLoader::new();
+        loader.add(
+            "./lib",
+            "/abs/lib",
+            r#"{
+                inner: {
+                    add(Int a, Int b): a + b
+                }
+            }"#,
+        );
+        let ws = build(
+            "/abs/entry".to_string(),
+            r#"#import * from "./lib"
+            { v: add(1, "x") }"#,
+            PathBuf::from("/abs"),
+            &mut loader,
+        );
+        // The arg type would mismatch *if* `add` were resolvable
+        // through the spread import. Since it lives in a nested dict
+        // (not the lib's root), no signature is exposed and the
+        // FnCall silently passes.
+        assert_eq!(
+            fn_call_arg_mismatch_count(&ws),
+            0,
+            "{:?}",
+            ws.modules.get("/abs/entry").map(|t| t.diagnostics.clone())
+        );
+    }
+
+    #[test]
+    fn v1_1_unimported_module_closure_invisible() {
+        // Reverse: a sibling module with a closure named `add` that
+        // is *not* imported by the entry must not contribute its
+        // signature.
+        let mut loader = MapLoader::new();
+        loader.add(
+            "./lib",
+            "/abs/lib",
+            r#"{
+                add(Int a, Int b): a + b
+            }"#,
+        );
+        let ws = build(
+            "/abs/entry".to_string(),
+            r#"{ v: add(1, "x") }"#,
+            PathBuf::from("/abs"),
+            &mut loader,
+        );
+        // `lib` isn't reachable from entry; it isn't even part of
+        // the workspace, so nothing should pull its closure into the
+        // entry's lookup chain.
+        assert_eq!(fn_call_arg_mismatch_count(&ws), 0);
+    }
+
+    #[test]
+    fn v1_1_destructure_alias_renames_closure() {
+        // `#import { add as plus } from "lib"` should expose the
+        // closure under the local alias `plus`. The closure declares
+        // `Int a, Int b`; calling `plus(1, "x")` flags arg 1.
+        let mut loader = MapLoader::new();
+        loader.add(
+            "./lib",
+            "/abs/lib",
+            r#"{
+                add(Int a, Int b): a + b
+            }"#,
+        );
+        let ws = build(
+            "/abs/entry".to_string(),
+            r#"#import { add as plus } from "./lib"
+            { v: plus(1, "x") }"#,
+            PathBuf::from("/abs"),
+            &mut loader,
+        );
+        let count_for_plus: usize = ws
+            .modules
+            .values()
+            .flat_map(|t| t.diagnostics.iter())
+            .filter(|d| matches!(d, Diagnostic::FnCallArgTypeMismatch { fn_name, .. } if fn_name == "plus"))
+            .count();
+        assert!(
+            count_for_plus >= 1,
+            "{:?}",
+            ws.modules.get("/abs/entry").map(|t| t.diagnostics.clone())
+        );
+    }
+
+    #[test]
+    fn v1_1_workspace_import_index_is_attached_to_caller_tree() {
+        // Sanity: `tree.workspace_import_index` is `Some(_)` after the
+        // workspace post-pass for any module that imports closures.
+        let mut loader = MapLoader::new();
+        loader.add(
+            "./lib",
+            "/abs/lib",
+            r#"{
+                add(Int a, Int b): a + b
+            }"#,
+        );
+        let ws = build(
+            "/abs/entry".to_string(),
+            r#"#import { add } from "./lib"
+            { v: add(1, 2) }"#,
+            PathBuf::from("/abs"),
+            &mut loader,
+        );
+        let entry = ws.modules.get("/abs/entry").expect("entry analyzed");
+        let idx = entry
+            .workspace_import_index
+            .as_ref()
+            .expect("entry should carry a workspace_import_index");
+        assert!(
+            idx.destructured_closures.contains_key("add"),
+            "destructured_closures should expose `add`: {:?}",
+            idx
         );
     }
 }

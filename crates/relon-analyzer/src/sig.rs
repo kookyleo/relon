@@ -16,6 +16,7 @@
 
 use crate::stdlib_signatures::stdlib_signatures;
 use crate::tree::AnalyzedTree;
+use crate::workspace_build::WorkspaceImportIndex;
 use relon_parser::TypeNode;
 use std::collections::HashMap;
 
@@ -144,31 +145,92 @@ pub fn type_node_generic(name: &str, args: Vec<TypeNode>) -> TypeNode {
     }
 }
 
-/// Resolve `name` against the closure-signature side-table on `tree`,
-/// the host-supplied signature map, and finally the stdlib table.
-/// Returns `None` when nothing matches — callers treat that as "defer to
-/// runtime", not as an error.
+/// Resolve `name` against (in order) the closure-signature side-table
+/// on `tree`, the host-supplied signature map, the stdlib table, and
+/// finally any cross-module closure signatures exposed via the
+/// importer's `WorkspaceImportIndex` (v1.1). Returns `None` when
+/// nothing matches — callers treat that as "defer to runtime", not as
+/// an error.
+///
+/// The v1.1 cross-module hop uses `tree.workspace_import_index` when
+/// the tree was produced by the workspace build pass; single-file
+/// `analyze` calls have no import index and skip the hop.
 pub fn lookup_signature<'a>(
     name: &str,
     tree: &'a AnalyzedTree,
     host_sigs: &'a HashMap<String, FnSignature>,
 ) -> Option<FnSignature> {
-    // 1. User closure declared as a dict field. Indexed by field name
-    //    so a `FnCall` whose head matches a sibling closure picks up the
-    //    declared param / return types. We override the synthetic
-    //    `<closure#...>` name with the source-level field name so
-    //    diagnostics read naturally.
-    if let Some(node_id) = tree.field_closure_index.get(name).copied() {
-        if let Some(sig) = tree.closure_signatures.get(&node_id) {
-            let mut renamed = sig.clone();
-            renamed.name = name.to_string();
-            return Some(renamed);
+    lookup_signature_path(&[name.to_string()], tree, host_sigs)
+}
+
+/// Path-aware variant of [`lookup_signature`]. Single-segment paths
+/// behave identically to the legacy entry point. Multi-segment paths
+/// only resolve through the v1.1 cross-module index — `alias.method`
+/// lookups against `aliased_closures`. Other multi-segment forms
+/// (dict-literal sibling closures) stay handled by the type-check
+/// walker's bespoke resolver because they need scope-stack context this
+/// lookup doesn't carry.
+pub fn lookup_signature_path<'a>(
+    path: &[String],
+    tree: &'a AnalyzedTree,
+    host_sigs: &'a HashMap<String, FnSignature>,
+) -> Option<FnSignature> {
+    if path.is_empty() {
+        return None;
+    }
+    if path.len() == 1 {
+        let name = &path[0];
+        // 1. User closure declared as a dict field. Indexed by field
+        //    name so a `FnCall` whose head matches a sibling closure
+        //    picks up the declared param / return types. We override
+        //    the synthetic `<closure#...>` name with the source-level
+        //    field name so diagnostics read naturally.
+        if let Some(node_id) = tree.field_closure_index.get(name).copied() {
+            if let Some(sig) = tree.closure_signatures.get(&node_id) {
+                let mut renamed = sig.clone();
+                renamed.name = name.to_string();
+                return Some(renamed);
+            }
+        }
+        // 2. Host fn signatures — populated from `AnalyzeOptions`.
+        if let Some(sig) = host_sigs.get(name) {
+            return Some(sig.clone());
+        }
+        // 3. Stdlib hardcoded table.
+        if let Some(sig) = stdlib_signatures().get(name).cloned() {
+            return Some(sig);
+        }
+        // 4. v1.1: cross-module imports (spread / destructure forms).
+        if let Some(idx) = tree.workspace_import_index.as_ref() {
+            return lookup_in_import_index_single(name, idx);
+        }
+        return None;
+    }
+    if path.len() == 2 {
+        // Multi-segment: only the v1.1 alias.method form lives here.
+        // Dict-literal sibling closures are resolved by the type-check
+        // walker (it has the scope stack we don't).
+        if let Some(idx) = tree.workspace_import_index.as_ref() {
+            if let Some(methods) = idx.aliased_closures.get(&path[0]) {
+                if let Some(sig) = methods.get(&path[1]) {
+                    return Some(sig.clone());
+                }
+            }
         }
     }
-    // 2. Host fn signatures — populated from `AnalyzeOptions`.
-    if let Some(sig) = host_sigs.get(name) {
+    None
+}
+
+/// Single-segment v1.1 cross-module lookup: spread imports first, then
+/// destructured imports. Spread wins on collision (last spread wins
+/// internally, then beats destructured) — v1 keeps the rule simple;
+/// shadowing diagnostics are explicitly out of scope for v1.1.
+fn lookup_in_import_index_single(name: &str, idx: &WorkspaceImportIndex) -> Option<FnSignature> {
+    if let Some(sig) = idx.spread_closures.get(name) {
         return Some(sig.clone());
     }
-    // 3. Stdlib hardcoded table.
-    stdlib_signatures().get(name).cloned()
+    if let Some(sig) = idx.destructured_closures.get(name) {
+        return Some(sig.clone());
+    }
+    None
 }

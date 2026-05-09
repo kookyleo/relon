@@ -11,6 +11,7 @@ use crate::resolve::ResolvedRef;
 use crate::root_schemas::RootSchemaDecl;
 use crate::schema::SchemaDef;
 use crate::sig::FnSignature;
+use crate::workspace_build::WorkspaceImportIndex;
 use relon_parser::{Node, NodeId};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -78,6 +79,13 @@ pub struct AnalyzedTree {
     /// hand the evaluator. Compared against `host_fn_gates` during the
     /// reachability check.
     pub caps: Capabilities,
+    /// v1.1: cross-module import index, populated by the workspace
+    /// build pass after every reachable module is analyzed. `None` for
+    /// trees produced by the single-file `analyze` entry point — that
+    /// path has no module graph to consult. Consumed by
+    /// [`crate::sig::lookup_signature`] to resolve calls to closure
+    /// signatures from `#import`ed modules.
+    pub workspace_import_index: Option<WorkspaceImportIndex>,
 }
 
 impl AnalyzedTree {

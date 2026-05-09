@@ -435,24 +435,38 @@ impl<'a> Walker<'a> {
         let TokenKey::String(method, _, _) = &path[1] else {
             return None;
         };
-        let target = self.lookup_field_node(head)?;
-        // Only walk literal dicts — abstract types (FnCall / Reference
-        // / typed schema bindings) silently fall through to runtime.
-        if target.type_hint.is_some() {
-            return None;
-        }
-        let Expr::Dict(inner_pairs) = &*target.expr else {
-            return None;
-        };
-        for (k, v) in inner_pairs {
-            if let TokenKey::String(name, _, _) = k {
-                if name == method {
-                    if matches!(&*v.expr, Expr::Closure { .. }) {
-                        let mut sig = self.tree.closure_signatures.get(&v.id).cloned()?;
-                        sig.name = format!("{head}.{method}");
-                        return Some(sig);
+        // Try sibling-field dict-literal first (Stage 3.6). Falls
+        // through to the v1.1 cross-module index when there's no
+        // sibling field with that name.
+        if let Some(target) = self.lookup_field_node(head) {
+            // Only walk literal dicts — abstract types (FnCall /
+            // Reference / typed schema bindings) silently fall through
+            // to runtime.
+            if target.type_hint.is_none() {
+                if let Expr::Dict(inner_pairs) = &*target.expr {
+                    for (k, v) in inner_pairs {
+                        if let TokenKey::String(name, _, _) = k {
+                            if name == method {
+                                if matches!(&*v.expr, Expr::Closure { .. }) {
+                                    let mut sig =
+                                        self.tree.closure_signatures.get(&v.id).cloned()?;
+                                    sig.name = format!("{head}.{method}");
+                                    return Some(sig);
+                                }
+                                return None;
+                            }
+                        }
                     }
-                    return None;
+                }
+            }
+        }
+        // v1.1: cross-module alias.method — `#import alias from "lib"`
+        // exposes the imported module's top-level closures under
+        // `alias.method`.
+        if let Some(idx) = self.tree.workspace_import_index.as_ref() {
+            if let Some(methods) = idx.aliased_closures.get(head) {
+                if let Some(sig) = methods.get(method) {
+                    return Some(sig.clone());
                 }
             }
         }
@@ -855,13 +869,34 @@ impl<'a> Walker<'a> {
 
     /// True when `name` is a name the host or evaluator has registered
     /// as a callable / value — either the hardcoded stdlib set
-    /// (`range`, `len`, …) or a host-registered native fn whose name
-    /// reached the analyzer via [`crate::AnalyzeOptions::host_fn_names`].
+    /// (`range`, `len`, …), a host-registered native fn whose name
+    /// reached the analyzer via [`crate::AnalyzeOptions::host_fn_names`],
+    /// or (v1.1) a closure exposed by a cross-module `#import` (spread +
+    /// destructure forms; alias forms only contribute `alias.method`
+    /// paths which `check_unresolved_*` doesn't see as a single name).
     fn is_known_fn(&self, name: &str) -> bool {
         if stdlib_names().contains(name) {
             return true;
         }
-        self.tree.host_fn_names.contains(name)
+        if self.tree.host_fn_names.contains(name) {
+            return true;
+        }
+        if let Some(idx) = self.tree.workspace_import_index.as_ref() {
+            if idx.spread_closures.contains_key(name)
+                || idx.destructured_closures.contains_key(name)
+                // Spread / destructure schema names also live on the
+                // import index as type names; surface them through the
+                // same allowlist so a `User` reference (alias form)
+                // doesn't false-flag.
+                || idx.spread.contains(name)
+                || idx.destructured.contains_key(name)
+                || idx.aliased.contains_key(name)
+                || idx.aliased_closures.contains_key(name)
+            {
+                return true;
+            }
+        }
+        false
     }
 
     /// Look up `name` against the active scope chain and return the
