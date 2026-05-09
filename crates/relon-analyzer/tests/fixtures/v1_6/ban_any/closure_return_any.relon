@@ -1,0 +1,3 @@
+// v1.6 forward: closure declared `-> Any` is banned.
+// EXPECTED: ≥ 1 × ExplicitAnyForbidden (closure return type).
+{ helper: (Int n) -> Any => n }

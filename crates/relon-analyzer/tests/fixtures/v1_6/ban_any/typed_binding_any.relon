@@ -1,0 +1,3 @@
+// v1.6 forward: `Any field: ...` is banned in every mode.
+// EXPECTED: ≥ 1 × ExplicitAnyForbidden (typed binding `payload`).
+{ Any payload: 42 }

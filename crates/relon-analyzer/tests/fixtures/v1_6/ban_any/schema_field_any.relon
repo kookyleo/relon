@@ -1,0 +1,5 @@
+// v1.6 forward: `#schema` field typed `Any` is banned. Use a
+// concrete type / generic / nested schema instead.
+// EXPECTED: ≥ 1 × ExplicitAnyForbidden (schema field `payload`).
+#schema Outer { Any payload: * }
+{ x: 1 }

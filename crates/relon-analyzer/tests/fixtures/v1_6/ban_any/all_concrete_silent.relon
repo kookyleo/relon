@@ -1,0 +1,11 @@
+// v1.6 reverse: a fully concrete file — schema fields, #main params,
+// closure params/returns, typed bindings — uses no `Any`.
+// EXPECTED: 0 × ExplicitAnyForbidden.
+#strict
+#schema Order { Int id: *, String name: * }
+#main(Order o) -> Int
+{
+  Int id: o.id,
+  bump: (Int n) -> Int => n + 1,
+  Int doubled: bump(o.id) + bump(o.id)
+}

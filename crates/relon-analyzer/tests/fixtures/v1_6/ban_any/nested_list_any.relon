@@ -1,0 +1,4 @@
+// v1.6 forward: nested `Any` inside generics is also banned.
+// `List<Any>` is exactly the laundering pattern v1.6 closes.
+// EXPECTED: ≥ 1 × ExplicitAnyForbidden.
+{ List<Any> xs: [1, 2, 3] }

@@ -1,0 +1,6 @@
+// v1.6 forward: `ensure.int<T>(value, message?) -> T`. The validator
+// now returns the original value's type, so a typed `Int` slot stays
+// sharp instead of collapsing to `Any`.
+// EXPECTED: 0 × StaticTypeMismatch.
+#main(Int x) -> Int
+n + 1 where { Int n: ensure.int(x) }

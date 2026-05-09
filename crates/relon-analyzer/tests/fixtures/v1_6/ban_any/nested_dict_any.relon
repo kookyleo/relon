@@ -1,0 +1,3 @@
+// v1.6 forward: `Dict<String, Any>` value slot is banned too.
+// EXPECTED: ≥ 1 × ExplicitAnyForbidden.
+{ Dict<String, Any> kv: { a: 1, b: 2 } }

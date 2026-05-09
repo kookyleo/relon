@@ -1,0 +1,3 @@
+// v1.6 forward: closure parameter typed `Any` is banned.
+// EXPECTED: ≥ 1 × ExplicitAnyForbidden (closure parameter `n`).
+{ helper: (Any n) -> Int => 1 }

@@ -1,0 +1,5 @@
+// v1.6 forward: `#main(...) -> Any` declares an `Any` return type
+// and is banned.
+// EXPECTED: ≥ 1 × ExplicitAnyForbidden (#main return type).
+#main(Int n) -> Any
+n + 1
