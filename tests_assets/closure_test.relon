@@ -1,5 +1,0 @@
-{
-  "make_adder": @fn(x) @fn(y) x + y,
-  "add_5": make_adder(5),
-  "result": add_5(10)
-}

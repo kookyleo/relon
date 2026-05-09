@@ -1,5 +1,0 @@
-{
-    @private
-    secret: "hidden",
-    public: &sibling.secret + " info"
-}
