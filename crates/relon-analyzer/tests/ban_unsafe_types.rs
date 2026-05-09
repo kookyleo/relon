@@ -1,32 +1,11 @@
-//! Integration tests over `tests/fixtures/`.
-//!
-//! v1.6 retires `Any` from the user-facing surface (every mode) and
-//! replaces every stdlib-signature `Any` with an unbound generic
-//! placeholder so the language surface no longer mentions it.
-//!
-//! Each fixture's leading comment declares the expected outcome.
+//! Integration tests for the bans on user-facing `Any` (v1.6) and on
+//! the bare-generic shorthand `List` / `Dict` / `Closure` / `Fn` / `Enum`
+//! without explicit generic arguments (v1.7).
 
-use relon_analyzer::{analyze, Diagnostic};
-use relon_parser::parse_document;
-use std::path::PathBuf;
-use std::sync::Arc;
+use relon_analyzer::Diagnostic;
 
-fn load_fixture(rel: &str) -> String {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures")
-        .join(rel);
-    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read fixture {rel}: {e}"))
-}
-
-fn analyze_fixture(rel: &str) -> Arc<relon_analyzer::AnalyzedTree> {
-    let src = load_fixture(rel);
-    let node = parse_document(&src).unwrap_or_else(|e| panic!("parse {rel}: {e}"));
-    Arc::new(analyze(&node))
-}
-
-fn count<F: Fn(&Diagnostic) -> bool>(diags: &[Diagnostic], pred: F) -> usize {
-    diags.iter().filter(|d| pred(d)).count()
-}
+mod common;
+use common::*;
 
 // ====== ban_any ======
 
@@ -107,22 +86,73 @@ fn fixture_ban_all_concrete_silent() {
     assert_eq!(n, 0, "{:?}", tree.diagnostics);
 }
 
-// ====== stdlib_generic ======
+// ====== ban_bare ======
 
 #[test]
-fn fixture_stdlib_dict_values_typed() {
-    let tree = analyze_fixture("stdlib_generic/dict_values_typed.relon");
+fn fixture_ban_bare_list_rejected() {
+    let tree = analyze_fixture("ban_bare/bare_list_rejected.relon");
+    let n = count(
+        &tree.diagnostics,
+        |d| matches!(d, Diagnostic::BareGenericContainer { type_name, .. } if type_name == "List"),
+    );
+    assert!(n >= 1, "{:?}", tree.diagnostics);
+}
+
+#[test]
+fn fixture_ban_bare_dict_rejected() {
+    let tree = analyze_fixture("ban_bare/bare_dict_rejected.relon");
+    let n = count(
+        &tree.diagnostics,
+        |d| matches!(d, Diagnostic::BareGenericContainer { type_name, .. } if type_name == "Dict"),
+    );
+    assert!(n >= 1, "{:?}", tree.diagnostics);
+}
+
+#[test]
+fn fixture_ban_bare_closure_rejected() {
+    let tree = analyze_fixture("ban_bare/bare_closure_rejected.relon");
+    let n = count(
+        &tree.diagnostics,
+        |d| matches!(d, Diagnostic::BareGenericContainer { type_name, .. } if type_name == "Closure"),
+    );
+    assert!(n >= 1, "{:?}", tree.diagnostics);
+}
+
+#[test]
+fn fixture_ban_bare_fn_rejected() {
+    let tree = analyze_fixture("ban_bare/bare_fn_rejected.relon");
+    let n = count(
+        &tree.diagnostics,
+        |d| matches!(d, Diagnostic::BareGenericContainer { type_name, .. } if type_name == "Fn"),
+    );
+    assert!(n >= 1, "{:?}", tree.diagnostics);
+}
+
+#[test]
+fn fixture_ban_bare_nested_list_rejected() {
+    let tree = analyze_fixture("ban_bare/nested_bare_list_rejected.relon");
+    let n = count(
+        &tree.diagnostics,
+        |d| matches!(d, Diagnostic::BareGenericContainer { type_name, .. } if type_name == "List"),
+    );
+    assert!(n >= 1, "{:?}", tree.diagnostics);
+}
+
+#[test]
+fn fixture_ban_bare_explicit_generics_silent() {
+    let tree = analyze_fixture("ban_bare/explicit_generics_silent.relon");
     let n = count(&tree.diagnostics, |d| {
-        matches!(d, Diagnostic::StaticTypeMismatch { .. })
+        matches!(d, Diagnostic::BareGenericContainer { .. })
     });
     assert_eq!(n, 0, "{:?}", tree.diagnostics);
 }
 
 #[test]
-fn fixture_stdlib_ensure_int_returns_int() {
-    let tree = analyze_fixture("stdlib_generic/ensure_int_returns_int.relon");
-    let n = count(&tree.diagnostics, |d| {
-        matches!(d, Diagnostic::StaticTypeMismatch { .. })
-    });
-    assert_eq!(n, 0, "{:?}", tree.diagnostics);
+fn fixture_ban_bare_main_param_rejected() {
+    let tree = analyze_fixture("ban_bare/bare_main_param_rejected.relon");
+    let n = count(
+        &tree.diagnostics,
+        |d| matches!(d, Diagnostic::BareGenericContainer { type_name, .. } if type_name == "List"),
+    );
+    assert!(n >= 1, "{:?}", tree.diagnostics);
 }

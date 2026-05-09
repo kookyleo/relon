@@ -1,32 +1,11 @@
-//! Integration tests over `tests/fixtures/`.
-//!
-//! v1.7 introduces structured tuple types (replacing the
-//! `List`-as-tuple overload) and bans the bare-generic shorthand
-//! (`List` / `Dict` / `Closure` / `Fn` / `Enum` without explicit
-//! generic arguments). Each fixture's leading comment declares the
-//! expected outcome — we re-state it as an assertion below.
+//! Integration tests for structured tuple types (v1.7 replacement of
+//! the `List`-as-tuple overload) and positional tuple-index access
+//! (v1.8 `t.0` / `t.1` form).
 
-use relon_analyzer::{analyze, Diagnostic};
-use relon_parser::parse_document;
-use std::path::PathBuf;
-use std::sync::Arc;
+use relon_analyzer::Diagnostic;
 
-fn load_fixture(rel: &str) -> String {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures")
-        .join(rel);
-    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read fixture {rel}: {e}"))
-}
-
-fn analyze_fixture(rel: &str) -> Arc<relon_analyzer::AnalyzedTree> {
-    let src = load_fixture(rel);
-    let node = parse_document(&src).unwrap_or_else(|e| panic!("parse {rel}: {e}"));
-    Arc::new(analyze(&node))
-}
-
-fn count<F: Fn(&Diagnostic) -> bool>(diags: &[Diagnostic], pred: F) -> usize {
-    diags.iter().filter(|d| pred(d)).count()
-}
+mod common;
+use common::*;
 
 // ====== tuple ======
 
@@ -120,73 +99,49 @@ fn fixture_tuple_heterogeneous_typed_tuple() {
     assert_eq!(n, 0, "{:?}", tree.diagnostics);
 }
 
-// ====== ban_bare ======
+// ====== tuple_index (positional access) ======
 
 #[test]
-fn fixture_ban_bare_list_rejected() {
-    let tree = analyze_fixture("ban_bare/bare_list_rejected.relon");
-    let n = count(
-        &tree.diagnostics,
-        |d| matches!(d, Diagnostic::BareGenericContainer { type_name, .. } if type_name == "List"),
-    );
-    assert!(n >= 1, "{:?}", tree.diagnostics);
-}
-
-#[test]
-fn fixture_ban_bare_dict_rejected() {
-    let tree = analyze_fixture("ban_bare/bare_dict_rejected.relon");
-    let n = count(
-        &tree.diagnostics,
-        |d| matches!(d, Diagnostic::BareGenericContainer { type_name, .. } if type_name == "Dict"),
-    );
-    assert!(n >= 1, "{:?}", tree.diagnostics);
-}
-
-#[test]
-fn fixture_ban_bare_closure_rejected() {
-    let tree = analyze_fixture("ban_bare/bare_closure_rejected.relon");
-    let n = count(
-        &tree.diagnostics,
-        |d| matches!(d, Diagnostic::BareGenericContainer { type_name, .. } if type_name == "Closure"),
-    );
-    assert!(n >= 1, "{:?}", tree.diagnostics);
-}
-
-#[test]
-fn fixture_ban_bare_fn_rejected() {
-    let tree = analyze_fixture("ban_bare/bare_fn_rejected.relon");
-    let n = count(
-        &tree.diagnostics,
-        |d| matches!(d, Diagnostic::BareGenericContainer { type_name, .. } if type_name == "Fn"),
-    );
-    assert!(n >= 1, "{:?}", tree.diagnostics);
-}
-
-#[test]
-fn fixture_ban_bare_nested_list_rejected() {
-    let tree = analyze_fixture("ban_bare/nested_bare_list_rejected.relon");
-    let n = count(
-        &tree.diagnostics,
-        |d| matches!(d, Diagnostic::BareGenericContainer { type_name, .. } if type_name == "List"),
-    );
-    assert!(n >= 1, "{:?}", tree.diagnostics);
-}
-
-#[test]
-fn fixture_ban_bare_explicit_generics_silent() {
-    let tree = analyze_fixture("ban_bare/explicit_generics_silent.relon");
+fn fixture_tuple_index_position_int_silent() {
+    let tree = analyze_fixture("tuple_index/position_int_silent.relon");
     let n = count(&tree.diagnostics, |d| {
-        matches!(d, Diagnostic::BareGenericContainer { .. })
+        matches!(d, Diagnostic::StaticTypeMismatch { .. })
     });
     assert_eq!(n, 0, "{:?}", tree.diagnostics);
 }
 
 #[test]
-fn fixture_ban_bare_main_param_rejected() {
-    let tree = analyze_fixture("ban_bare/bare_main_param_rejected.relon");
-    let n = count(
-        &tree.diagnostics,
-        |d| matches!(d, Diagnostic::BareGenericContainer { type_name, .. } if type_name == "List"),
-    );
+fn fixture_tuple_index_position_string_silent() {
+    let tree = analyze_fixture("tuple_index/position_string_silent.relon");
+    let n = count(&tree.diagnostics, |d| {
+        matches!(d, Diagnostic::StaticTypeMismatch { .. })
+    });
+    assert_eq!(n, 0, "{:?}", tree.diagnostics);
+}
+
+#[test]
+fn fixture_tuple_index_position_type_mismatch() {
+    let tree = analyze_fixture("tuple_index/position_type_mismatch.relon");
+    let n = count(&tree.diagnostics, |d| {
+        matches!(d, Diagnostic::StaticTypeMismatch { .. })
+    });
     assert!(n >= 1, "{:?}", tree.diagnostics);
+}
+
+#[test]
+fn fixture_tuple_index_out_of_range() {
+    let tree = analyze_fixture("tuple_index/out_of_range.relon");
+    let n = count(&tree.diagnostics, |d| {
+        matches!(d, Diagnostic::UnknownReferenceType { .. })
+    });
+    assert!(n >= 1, "{:?}", tree.diagnostics);
+}
+
+#[test]
+fn fixture_tuple_index_list_index_silent() {
+    let tree = analyze_fixture("tuple_index/list_index_silent.relon");
+    let n = count(&tree.diagnostics, |d| {
+        matches!(d, Diagnostic::StaticTypeMismatch { .. })
+    });
+    assert_eq!(n, 0, "{:?}", tree.diagnostics);
 }
