@@ -1,0 +1,4 @@
+// v1.7: `()` is the empty tuple; a literal `[]` infers as
+// `Tuple()` (zero-element) and lines up with the declared slot.
+// EXPECTED: 0 × StaticTypeMismatch.
+{ () unit: [] }

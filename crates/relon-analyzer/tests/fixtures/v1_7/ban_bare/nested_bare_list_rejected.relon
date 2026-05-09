@@ -1,0 +1,4 @@
+// v1.7: ban-bare descends into generic arguments. A bare `List`
+// nested inside a `Dict<String, ...>` slot is still flagged.
+// EXPECTED: ≥ 1 × BareGenericContainer for `List`.
+{ Dict<String, List> data: { tags: ["a", "b"] } }

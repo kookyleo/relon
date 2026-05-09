@@ -1,0 +1,5 @@
+// v1.7 retires the bare-generic shorthand. Pre-v1.7 a bare `List`
+// silently expanded to `List<Any>`, defeating every other
+// guarantee. The walker now flags it.
+// EXPECTED: ≥ 1 × BareGenericContainer for `List`.
+{ List items: [1, 2, 3] }

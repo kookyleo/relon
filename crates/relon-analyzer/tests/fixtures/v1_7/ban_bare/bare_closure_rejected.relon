@@ -1,0 +1,4 @@
+// v1.7: bare `Closure` (no parameter / return generics) used to
+// degrade to `Fn(_, Any)`. The ban-bare walker rejects it.
+// EXPECTED: ≥ 1 × BareGenericContainer for `Closure`.
+{ Closure callback: (x) => x }

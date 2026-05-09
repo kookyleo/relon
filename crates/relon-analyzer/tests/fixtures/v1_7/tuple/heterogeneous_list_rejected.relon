@@ -1,0 +1,5 @@
+// v1.7: a heterogeneous list literal infers as `Tuple<Int, String>`
+// and now fails the `List<Int>` slot check (pre-v1.7 it widened the
+// elements to `List<Any>` and silently passed in non-strict mode).
+// EXPECTED: ≥ 1 × StaticTypeMismatch on the `mixed` field.
+{ List<Int> mixed: [1, "two"] }

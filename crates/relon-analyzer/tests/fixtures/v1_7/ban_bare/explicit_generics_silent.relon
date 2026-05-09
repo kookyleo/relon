@@ -1,0 +1,7 @@
+// v1.7 sanity: explicit generics (the only legal form) pass the
+// ban-bare walker silently.
+// EXPECTED: 0 × BareGenericContainer.
+{
+  List<Int> nums: [1, 2, 3],
+  Dict<String, Int> scores: { math: 100 }
+}

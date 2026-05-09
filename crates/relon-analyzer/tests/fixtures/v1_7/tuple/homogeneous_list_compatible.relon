@@ -1,0 +1,6 @@
+// v1.7: list literals now infer as `Tuple<T1, T2, ...>` so we can
+// preserve element types. A homogeneous tuple still folds into the
+// declared `List<Int>` slot via the Tuple→List subsumption rule —
+// no diagnostic should fire here.
+// EXPECTED: 0 × StaticTypeMismatch.
+{ List<Int> nums: [1, 2, 3] }

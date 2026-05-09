@@ -1,0 +1,6 @@
+// v1.7: outer arity is fine, but the second row's position 1 fails
+// the inner `String` constraint. The recursive walker pinpoints the
+// inner element rather than reporting only an outer container
+// mismatch.
+// EXPECTED: ≥ 1 × StaticTypeMismatch.
+{ List<(Int, String)> rows: [[1, "a"], [2, 99]] }

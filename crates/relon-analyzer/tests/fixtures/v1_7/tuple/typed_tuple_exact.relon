@@ -1,0 +1,6 @@
+// v1.7: explicit `(Int, String)` tuple-typed slot accepts a literal
+// of matching arity and per-position types. This is the canonical
+// way to declare "fixed-shape, mixed-element" data without abusing
+// `List<Any>`.
+// EXPECTED: 0 × StaticTypeMismatch.
+{ (Int, String) pair: [42, "hello"] }

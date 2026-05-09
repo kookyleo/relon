@@ -1,0 +1,10 @@
+// v1.7: the chief use case for tuples — a mixed-type record where
+// `List<Any>` would have been the only previous option. Pairs of
+// (key, count, label) are now precisely typed.
+// EXPECTED: 0 × StaticTypeMismatch.
+{
+  List<(String, Int, Bool)> rows: [
+    ["alice", 3, true],
+    ["bob", 1, false]
+  ]
+}

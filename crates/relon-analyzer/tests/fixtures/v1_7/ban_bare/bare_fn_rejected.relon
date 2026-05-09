@@ -1,0 +1,4 @@
+// v1.7: `Fn` is the alias for `Closure` and ban-bare treats it
+// the same way.
+// EXPECTED: ≥ 1 × BareGenericContainer for `Fn`.
+{ Fn cb: (x) => x }

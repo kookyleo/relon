@@ -1,0 +1,5 @@
+// v1.7: ban-bare also fires on `#main` parameters. Without it the
+// `xs` slot used to silently widen to `List<Any>`.
+// EXPECTED: ≥ 1 × BareGenericContainer for `List`.
+#main(List xs) -> Int
+0

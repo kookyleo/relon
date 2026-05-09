@@ -1,0 +1,4 @@
+// v1.7: arity matches but position 1 carries the wrong type. The
+// per-position recursion catches this and reports the mismatch.
+// EXPECTED: ≥ 1 × StaticTypeMismatch on the `pair` field.
+{ (Int, String) pair: [1, 2] }

@@ -1,0 +1,5 @@
+// v1.7: bare `Dict` (no generics) used to expand to
+// `Dict<Any, Any>`. The ban-bare walker now requires explicit
+// type arguments.
+// EXPECTED: ≥ 1 × BareGenericContainer for `Dict`.
+{ Dict scores: { math: 100 } }
