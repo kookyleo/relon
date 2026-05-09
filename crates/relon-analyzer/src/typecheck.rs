@@ -1,15 +1,24 @@
 //! Static type-check pass.
 //!
-//! Two complementary checks, both emitted as `Warning`-severity
-//! diagnostics so the evaluator's authoritative runtime checks remain
-//! the source of truth:
+//! Statically classifiable type errors are surfaced as `Error`-severity
+//! diagnostics — the analyzer is the source of truth for anything
+//! derivable from source + schemas alone, and the facade refuses to
+//! enter the evaluator while errors are present (see
+//! `Diagnostic::severity`). The evaluator's runtime `check_type` only
+//! handles the residual cases the static pass can't see (host-pushed
+//! `#main(...)` args, dynamic `#brand`, `Match` arms over a runtime
+//! value, etc.).
+//!
+//! Two complementary findings live here:
 //!
 //! * [`UnresolvedReference`] — a `&sibling.X` / `Variable(X)` whose
 //!   head couldn't be statically bound *and* no spread / closure
 //!   binding on the active scope chain could plausibly save it.
+//!   Surfaced as `Warning` because the analyzer's view is conservative.
 //! * [`StaticTypeMismatch`] — a typed schema binding whose value
 //!   expression has a determinable shape (literal, list, dict, type)
-//!   that disagrees with the field's declared type.
+//!   that disagrees with the field's declared type. Surfaced as
+//!   `Error`.
 //!
 //! [`UnresolvedReference`]: crate::Diagnostic::UnresolvedReference
 //! [`StaticTypeMismatch`]: crate::Diagnostic::StaticTypeMismatch
@@ -233,7 +242,16 @@ fn seed_prelude_variants(index: &mut VariantFieldIndex) {
 /// Substitute generic-parameter names with the corresponding
 /// concrete TypeNodes from the slot's generic arguments. Used to
 /// resolve `Ok { value: T }` against `Result<Int, String>`.
-fn substitute_generics_in_typenode(t: &TypeNode, subst: &HashMap<String, TypeNode>) -> TypeNode {
+///
+/// `pub` so the evaluator can reuse the same routine instead of
+/// maintaining its own copy on `Value::Schema` field types — the two
+/// were drifting independently (CHANGELOG v1.8b explicitly flagged this
+/// as duplicate machinery). The function is pure (no `tree` access),
+/// so exposing it doesn't widen the analyzer's contract.
+pub fn substitute_generics_in_typenode(
+    t: &TypeNode,
+    subst: &HashMap<String, TypeNode>,
+) -> TypeNode {
     if t.path.len() == 1 && t.generics.is_empty() {
         if let Some(replacement) = subst.get(&t.path[0]) {
             let mut clone = replacement.clone();
@@ -2088,7 +2106,11 @@ fn same_outer_container(inferred: &InferredType, expected: &TypeNode) -> bool {
     )
 }
 
-fn format_type(t: &TypeNode) -> String {
+/// Compact `TypeNode` formatter shared by every diagnostic /
+/// runtime-error site that needs to render a declared type. `pub` so the
+/// evaluator can drop its own duplicate (the two implementations were
+/// byte-identical and drifted by accident before).
+pub fn format_type(t: &TypeNode) -> String {
     let suffix = if t.is_optional { "?" } else { "" };
     let path = t.path.join(".");
     if t.generics.is_empty() {

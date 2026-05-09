@@ -24,6 +24,7 @@ use crate::decorator_names::VALUE;
 use crate::diagnostic::{span_of, Diagnostic};
 use crate::directive_names::{BRAND, DEFAULT, ERROR, EXPECT, MSG, SCHEMA};
 use crate::tree::AnalyzedTree;
+use crate::typecheck::format_type;
 use relon_parser::{
     type_node_from_brand_arg, Directive, DirectiveBody, Expr, Node, NodeId, Operator, TokenKey,
     TokenRange, TypeNode,
@@ -417,7 +418,7 @@ fn collect_fields(pairs: &[(TokenKey, Node)], def: &mut SchemaDef, tree: &mut An
                 Some(existing) => {
                     tree.diagnostics.push(Diagnostic::SchemaFieldBrandConflict {
                         field: field_name.clone(),
-                        type_prefix: format_type_node_simple(existing),
+                        type_prefix: format_type(existing),
                         range: span_of(dir.range),
                     });
                 }
@@ -512,20 +513,6 @@ fn brand_directive_type<'a>(
         }
     }
     None
-}
-
-/// Compact `TypeNode` formatter for diagnostic messages. Mirrors the
-/// evaluator's `format_type_node`, kept private here so the analyzer
-/// doesn't need a dependency on the evaluator.
-fn format_type_node_simple(t: &TypeNode) -> String {
-    let suffix = if t.is_optional { "?" } else { "" };
-    let path_str = t.path.join(".");
-    if t.generics.is_empty() {
-        format!("{path_str}{suffix}")
-    } else {
-        let generics: Vec<String> = t.generics.iter().map(format_type_node_simple).collect();
-        format!("{path_str}<{}>{suffix}", generics.join(", "))
-    }
 }
 
 fn base_ref(node: &Node) -> Option<BaseRef> {

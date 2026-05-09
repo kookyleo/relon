@@ -49,6 +49,7 @@ pub use schema::{
 };
 pub use sig::{lookup_signature, type_node_generic, type_node_simple, FnParam, FnSignature};
 pub use tree::AnalyzedTree;
+pub use typecheck::{format_type, substitute_generics_in_typenode};
 pub use workspace::{
     analyze_entry, analyze_entry_with_options, LoadError, LoadedModule, ModuleLoader, Workspace,
     WorkspaceDiagnostic, WorkspaceDiagnosticItem, WorkspaceTree,

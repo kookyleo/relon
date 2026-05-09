@@ -3,7 +3,7 @@ use crate::eval::{decorator_name, Evaluator};
 use crate::native_fn::EvaluatedArg;
 use crate::scope::Scope;
 use crate::value::{SchemaField, Value};
-use relon_analyzer::{SchemaDef, SchemaFieldDef};
+use relon_analyzer::{format_type, substitute_generics_in_typenode, SchemaDef, SchemaFieldDef};
 use relon_parser::{is_builtin_type_name, Expr, Node, TokenKey, TokenRange, TypeNode};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -94,7 +94,7 @@ impl Evaluator {
                     let expected_arity = type_hint.generics.len();
                     if l.len() != expected_arity {
                         return Err(RuntimeError::TypeMismatch {
-                            expected: format_type_node(type_hint),
+                            expected: format_type(type_hint),
                             found: format!("List of length {}", l.len()),
                             range,
                         });
@@ -143,7 +143,7 @@ impl Evaluator {
                         Ok(())
                     } else {
                         let alts: Vec<String> =
-                            type_hint.generics.iter().map(format_type_node).collect();
+                            type_hint.generics.iter().map(format_type).collect();
                         Err(RuntimeError::TypeMismatch {
                             expected: format!("one of [{}]", alts.join(", ")),
                             found: val.to_string(),
@@ -320,28 +320,21 @@ impl Evaluator {
             || (p.starts_with('\'') && p.ends_with('\'') && p.len() >= 2)
     }
 
+    /// Substitute generic-parameter names in every field's `type_hint`.
+    /// Delegates to [`substitute_generics_in_typenode`] in the analyzer
+    /// so the rewrite rule has exactly one definition workspace-wide
+    /// (CHANGELOG v1.8b flagged the prior duplicate machinery as a
+    /// drift hazard). Schema validation in this crate operates on the
+    /// resolved fields, so swapping in the analyzer's pure rewriter
+    /// preserves behavior 1:1.
     fn substitute_generics_in_schema(
         mut fields: HashMap<String, SchemaField>,
         subst_map: &HashMap<String, TypeNode>,
     ) -> HashMap<String, SchemaField> {
         for field in fields.values_mut() {
-            Self::substitute_generics_in_type(&mut field.type_hint, subst_map);
+            field.type_hint = substitute_generics_in_typenode(&field.type_hint, subst_map);
         }
         fields
-    }
-
-    fn substitute_generics_in_type(t: &mut TypeNode, subst_map: &HashMap<String, TypeNode>) {
-        if t.path.len() == 1 && t.generics.is_empty() {
-            if let Some(replacement) = subst_map.get(&t.path[0]) {
-                let is_optional = t.is_optional || replacement.is_optional;
-                *t = replacement.clone();
-                t.is_optional = is_optional;
-                return;
-            }
-        }
-        for generic in &mut t.generics {
-            Self::substitute_generics_in_type(generic, subst_map);
-        }
     }
 
     pub(crate) fn apply_schema(
@@ -651,21 +644,3 @@ pub(crate) fn merge_schema_fields(
     }
 }
 
-pub fn format_type_node(t: &TypeNode) -> String {
-    let mut s = t.path.join(".");
-    if !t.generics.is_empty() {
-        s.push('<');
-        s.push_str(
-            &t.generics
-                .iter()
-                .map(format_type_node)
-                .collect::<Vec<_>>()
-                .join(", "),
-        );
-        s.push('>');
-    }
-    if t.is_optional {
-        s.push('?');
-    }
-    s
-}

@@ -11,6 +11,7 @@
 use crate::diagnostic::{span_of, Diagnostic};
 use crate::infer::{infer_from_type_node_with_imports, infer_type, InferredType, TypeScope};
 use crate::tree::AnalyzedTree;
+use crate::typecheck::format_type;
 use relon_parser::Node;
 
 /// Walk the entry root's body under the inferred-types lens and push a
@@ -65,17 +66,6 @@ pub(crate) fn check_main_return(root: &Node, tree: &mut AnalyzedTree) {
         found: body_ty.name(),
         range: span_of(signature.range),
     });
-}
-
-fn format_type(t: &relon_parser::TypeNode) -> String {
-    let suffix = if t.is_optional { "?" } else { "" };
-    let path = t.path.join(".");
-    if t.generics.is_empty() {
-        format!("{path}{suffix}")
-    } else {
-        let inner: Vec<String> = t.generics.iter().map(format_type).collect();
-        format!("{path}<{}>{suffix}", inner.join(", "))
-    }
 }
 
 #[cfg(test)]

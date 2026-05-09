@@ -2097,7 +2097,7 @@ impl std::fmt::Display for Value {
             Value::Closure { .. } => write!(f, "<closure>"),
             Value::Schema { .. } => write!(f, "<schema>"),
             Value::EnumSchema { name, .. } => write!(f, "<enum {name}>"),
-            Value::Type(t) => write!(f, "Type<{}>", crate::schema::format_type_node(t)),
+            Value::Type(t) => write!(f, "Type<{}>", relon_analyzer::format_type(t)),
             Value::Wildcard => write!(f, "*"),
         }
     }

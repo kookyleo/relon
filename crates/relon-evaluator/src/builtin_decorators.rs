@@ -24,9 +24,9 @@ use crate::decorator_names::{DEFAULT, ERROR, EXPECT, MSG, VALUE};
 use crate::error::RuntimeError;
 use crate::eval::{Context, Evaluator};
 use crate::native_fn::EvaluatedArg;
-use crate::schema::format_type_node;
 use crate::scope::Scope;
 use crate::value::{SchemaField, Value};
+use relon_analyzer::format_type;
 use relon_parser::{is_builtin_type_name, TokenRange, TypeNode};
 use std::sync::Arc;
 
@@ -110,7 +110,7 @@ impl DecoratorPlugin for DefaultDecorator {
 ///   `None` (built-ins never carry an identity brand, same as the field form).
 /// * Single segment custom type without generics or `?` → just the name
 ///   (`Some("Weather")`).
-/// * Anything else → `format_type_node`-serialized string
+/// * Anything else → `format_type`-serialized string
 ///   (`Some("Map<String, Int>")`, `Some("Weather?")`, `Some("geo.Location")`).
 pub(crate) fn brand_string_for(type_node: &TypeNode) -> Option<String> {
     if type_node.generics.is_empty() && !type_node.is_optional && type_node.path.len() == 1 {
@@ -120,5 +120,5 @@ pub(crate) fn brand_string_for(type_node: &TypeNode) -> Option<String> {
         }
         return Some(tname.clone());
     }
-    Some(format_type_node(type_node))
+    Some(format_type(type_node))
 }
