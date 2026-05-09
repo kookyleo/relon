@@ -1,33 +1,39 @@
 //! Constant folding for arithmetic on literals.
 //!
-//! Walks Binary / Unary nodes whose every leaf is a numeric literal
-//! and computes the result with `checked_*` arithmetic. When the fold
-//! hits a divide-by-zero or an integer overflow, we emit a static
-//! diagnostic instead of letting the same expression re-explode in
-//! the evaluator. Floats fold without reporting (IEEE-754 Inf/NaN
-//! are valid). Anything containing a non-literal sub-tree (Variable,
-//! Reference, FnCall, Closure, Dict, List, FString, Ternary, Match)
-//! returns `Ok(None)` — runtime keeps the truth.
+//! Walks Binary / Unary / Ternary nodes whose relevant leaves are
+//! literals and computes the result with `checked_*` arithmetic (for
+//! integer ops) or direct evaluation (for bool / string / float).
+//! When the fold hits a divide-by-zero or an integer overflow, we
+//! emit a static diagnostic instead of letting the same expression
+//! re-explode in the evaluator. Floats fold without reporting
+//! (IEEE-754 Inf/NaN are valid). Anything containing a non-literal
+//! sub-tree (Variable, Reference, FnCall, Closure, Dict, List,
+//! FString, Match) returns `Ok(None)` — runtime keeps the truth.
 //!
-//! Stage 5 of the staged hardening roadmap. The fold is intentionally
-//! literal-only: bool / string folding is out of scope for v1, and
-//! anything that branches on data (`Ternary`, `Match`) is left to the
-//! evaluator. Mixed `Int`/`Float` operands promote to `Float` to mirror
-//! the evaluator's promotion rule (see `eval_numeric_arithmetic`).
+//! Stage 5 introduced numeric folding; v1.1 extends coverage to bool
+//! short-circuit (`&&` / `||` / `!`), string-literal concatenation
+//! (`"a" + "b"`), and ternary-on-bool branch selection (`true ? a :
+//! b` → fold `a`). The walker still recurses into children of a
+//! non-folding node, so a literal `1 / 0` hidden in an unreachable
+//! ternary branch still raises — pruning unreachable branches is the
+//! job of the upcoming control-flow pass (#41), not this one.
+//! Mixed `Int`/`Float` operands promote to `Float` to mirror the
+//! evaluator's promotion rule (see `eval_numeric_arithmetic`).
 
 use relon_parser::{Expr, Node, Operator, TokenRange};
 
-/// A numeric literal value that has been statically folded. Bool is
-/// included so unary `!` could be supported in a future iteration —
-/// today we never produce or consume `Bool` here, but carrying the
-/// variant lets `apply_*` exhaustively pattern-match without panicking
-/// on shapes the upper walker might one day pass in.
-#[derive(Debug, Clone, Copy)]
+/// A literal value that has been statically folded. Carries `Bool`
+/// (consumed by `&&`, `||`, `!`, and ternary branch selection) and
+/// `String` (consumed by literal `+` concatenation) alongside the
+/// numeric variants. Cloned (not copied) because `String` owns a heap
+/// allocation; the fold keeps clones cheap by only constructing them
+/// at literal leaves and at the final concat result.
+#[derive(Debug, Clone)]
 pub(crate) enum ConstValue {
     Int(i64),
     Float(f64),
-    #[allow(dead_code)]
     Bool(bool),
+    String(String),
 }
 
 /// Fold-time error surfaced as a static analyzer diagnostic. Carries
@@ -52,6 +58,11 @@ pub(crate) fn try_fold(node: &Node) -> Result<Option<ConstValue>, FoldError> {
         Expr::Int(i) => Ok(Some(ConstValue::Int(*i))),
         Expr::Float(f) => Ok(Some(ConstValue::Float(f.into_inner()))),
         Expr::Bool(b) => Ok(Some(ConstValue::Bool(*b))),
+        // FString carries interpolations and is *not* a literal — only
+        // the bare-string variant qualifies. The walker still descends
+        // into FString parts via `child_nodes`, so a `1 / 0` hidden in
+        // an interpolation slot is reported normally.
+        Expr::String(s) => Ok(Some(ConstValue::String(s.clone()))),
         Expr::Binary(op, l, r) => {
             let lv = try_fold(l)?;
             let rv = try_fold(r)?;
@@ -67,10 +78,27 @@ pub(crate) fn try_fold(node: &Node) -> Result<Option<ConstValue>, FoldError> {
                 None => Ok(None),
             }
         }
+        // Ternary on a constant `Bool` cond collapses to the chosen
+        // branch's fold result. The unchosen branch is intentionally
+        // *not* skipped by the caller's child-walk — pruning it is
+        // #41's territory; here we only resolve the value when both
+        // cond and the chosen branch are foldable.
+        Expr::Ternary { cond, then, els } => {
+            let cond_val = try_fold(cond)?;
+            match cond_val {
+                Some(ConstValue::Bool(true)) => try_fold(then),
+                Some(ConstValue::Bool(false)) => try_fold(els),
+                // Non-bool const cond (e.g. `1 ? a : b`) is a type
+                // error the type-checker owns; we just decline to
+                // fold and let runtime / typecheck speak.
+                Some(_) => Ok(None),
+                None => Ok(None),
+            }
+        }
         // Anything else (Variable, Reference, FnCall, Closure, Dict,
-        // List, FString, Ternary, Match, VariantCtor, Type, Wildcard,
-        // String, Null, Where, Spread, Comprehension) is non-foldable
-        // at this stage. Runtime keeps owning the verdict.
+        // List, FString, Match, VariantCtor, Type, Wildcard, Null,
+        // Where, Spread, Comprehension) is non-foldable at this stage.
+        // Runtime keeps owning the verdict.
         _ => Ok(None),
     }
 }
@@ -81,7 +109,7 @@ fn apply_binary(
     r: ConstValue,
     range: TokenRange,
 ) -> Result<Option<ConstValue>, FoldError> {
-    use ConstValue::{Float, Int};
+    use ConstValue::{Bool, Float, Int, String as Str};
     match (op, l, r) {
         // ---- Int / Int ----
         (Operator::Add, Int(a), Int(b)) => a
@@ -127,9 +155,22 @@ fn apply_binary(
         (Operator::Mod, Int(a), Float(b)) => Ok(Some(Float(a as f64 % b))),
         (Operator::Mod, Float(a), Int(b)) => Ok(Some(Float(a % b as f64))),
 
-        // Comparison / logical / pipe / concat and any Bool-involved
-        // arithmetic falls through. v1 only diagnoses arithmetic on
-        // numeric literals; everything else stays runtime's verdict.
+        // ---- Bool && / || ---- (no diagnostics; both branches still
+        // walked by the caller, so a literal `1 / 0` hidden in the
+        // unreached side is still reported via child-walk).
+        (Operator::And, Bool(a), Bool(b)) => Ok(Some(Bool(a && b))),
+        (Operator::Or, Bool(a), Bool(b)) => Ok(Some(Bool(a || b))),
+
+        // ---- String literal concat via `+` ---- (the parser routes
+        // `"a" + "b"` through `Operator::Add`; `Operator::Concat` is
+        // unused at parse time, but listed here so a future swap to
+        // a dedicated concat operator drops in cleanly).
+        (Operator::Add | Operator::Concat, Str(a), Str(b)) => Ok(Some(Str(a + &b))),
+
+        // Comparison / pipe and any cross-type combination
+        // (`1 + true`, `"a" + 1`, ...) falls through. v1 only
+        // diagnoses arithmetic on numeric literals; everything
+        // else stays runtime's verdict.
         _ => Ok(None),
     }
 }
@@ -139,14 +180,16 @@ fn apply_unary(
     v: ConstValue,
     range: TokenRange,
 ) -> Result<Option<ConstValue>, FoldError> {
-    use ConstValue::{Float, Int};
+    use ConstValue::{Bool, Float, Int};
     match (op, v) {
         (Operator::Sub, Int(a)) => a
             .checked_neg()
             .map(|v| Some(Int(v)))
             .ok_or(FoldError::Overflow { op, range }),
         (Operator::Sub, Float(a)) => Ok(Some(Float(-a))),
-        // `!` on bool / other unary shapes — leave to runtime.
+        (Operator::Not, Bool(b)) => Ok(Some(Bool(!b))),
+        // `Not` on numeric / string and other unary shapes — leave
+        // the verdict to runtime / typecheck.
         _ => Ok(None),
     }
 }
@@ -264,11 +307,114 @@ mod tests {
         assert!(res.is_none());
     }
 
+    // ----- v1.1 extensions: Bool / String / Ternary -----------------
+
     #[test]
-    fn ternary_does_not_fold() {
-        // Even when both branches would be foldable, we skip Ternary
-        // entirely — branches depend on data, runtime owns it.
-        let res = fold_root_value("{ x: true ? 1 / 0 : 0 }").unwrap();
+    fn folds_bool_and() {
+        let v = fold_root_value("{ x: true && false }").unwrap().unwrap();
+        match v {
+            ConstValue::Bool(false) => {}
+            other => panic!("expected Bool(false), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn folds_bool_or() {
+        let v = fold_root_value("{ x: false || true }").unwrap().unwrap();
+        match v {
+            ConstValue::Bool(true) => {}
+            other => panic!("expected Bool(true), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn folds_bool_not() {
+        let v = fold_root_value("{ x: !true }").unwrap().unwrap();
+        match v {
+            ConstValue::Bool(false) => {}
+            other => panic!("expected Bool(false), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn folds_string_concat() {
+        let v = fold_root_value(r#"{ x: "hi " + "there" }"#)
+            .unwrap()
+            .unwrap();
+        match v {
+            ConstValue::String(s) => assert_eq!(s, "hi there"),
+            other => panic!("expected String(\"hi there\"), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn folds_ternary_true_branch() {
+        let v = fold_root_value("{ x: true ? 1 : 2 }").unwrap().unwrap();
+        match v {
+            ConstValue::Int(1) => {}
+            other => panic!("expected Int(1), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn folds_ternary_false_branch() {
+        let v = fold_root_value("{ x: false ? 1 : 2 }").unwrap().unwrap();
+        match v {
+            ConstValue::Int(2) => {}
+            other => panic!("expected Int(2), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ternary_with_unreachable_div_zero_still_walked_by_caller() {
+        // Stage 5's contract — and v1.1 keeps it: the fold collapses
+        // to the chosen branch (`0`), but the unreached `1 / 0` is
+        // *not* pruned. Walker child-walk still hits the literal
+        // div-by-zero and reports it. Asserting from inside `try_fold`
+        // we just see the FoldError bubble from the recursive call
+        // into the unreached branch — `try_fold` is recursive and
+        // visits both sides of the ternary's children too? No: this
+        // implementation only folds the chosen side. So fold-time
+        // here returns `Some(Int(0))`, and child-walk reports.
+        let v = fold_root_value("{ x: true ? 0 : 1 / 0 }").unwrap().unwrap();
+        match v {
+            ConstValue::Int(0) => {}
+            other => panic!("expected Int(0), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn variable_short_circuits_bool_and() {
+        // `x && true` — `x` is non-literal, fold declines.
+        let res = fold_root_value("{ y: true, x: y && true }").unwrap();
+        assert!(res.is_none());
+    }
+
+    #[test]
+    fn ternary_with_variable_cond_returns_none() {
+        let res = fold_root_value("{ y: true, x: y ? 1 : 2 }").unwrap();
+        assert!(res.is_none());
+    }
+
+    #[test]
+    fn string_concat_with_variable_returns_none() {
+        let res = fold_root_value(r#"{ y: "b", x: "a" + y }"#).unwrap();
+        assert!(res.is_none());
+    }
+
+    #[test]
+    fn cross_type_int_plus_bool_returns_none() {
+        // `1 + true` is a type error the type-checker reports; the
+        // fold simply declines (no `FoldError`, no constant value).
+        let res = fold_root_value("{ x: 1 + true }").unwrap();
+        assert!(res.is_none());
+    }
+
+    #[test]
+    fn fstring_does_not_count_as_string_literal() {
+        // FString is *not* a literal — fold declines so the walker
+        // descends into its parts.
+        let res = fold_root_value(r#"{ x: f"hello {1 + 2}" }"#).unwrap();
         assert!(res.is_none());
     }
 }
