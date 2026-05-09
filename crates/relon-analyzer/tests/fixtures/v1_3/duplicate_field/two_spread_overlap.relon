@@ -1,0 +1,3 @@
+// v1.3 forward: two spread sources contribute the same key.
+// EXPECTED: 1 × DuplicateField on the second spread's `a`.
+{ ...{ a: 1 }, ...{ a: 2 } }

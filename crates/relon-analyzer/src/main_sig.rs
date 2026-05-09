@@ -92,6 +92,34 @@ pub fn collect_main(root: &Node, tree: &mut AnalyzedTree) {
     // schema pass populates `tree.schemas` before us.
     check_unknown_param_types(tree);
     check_unknown_return_type(tree);
+    // v1.6: ban `Any` (and any nested `Any` inside generics) in
+    // every `#main(...)` parameter type and in the return-type
+    // annotation. Replaces the v1.5 strict-only `Any` head check —
+    // `Any` is now retired from the user-facing surface entirely,
+    // not just under `#strict`.
+    check_ban_any_main_signature(tree);
+}
+
+/// v1.6: scan every `#main(...)` parameter type and the optional
+/// return type for `Any` and push [`Diagnostic::ExplicitAnyForbidden`]
+/// on each occurrence. The walk is recursive so `List<Any>` /
+/// `Dict<String, Any>` / `Result<Any, Err>` are all caught.
+fn check_ban_any_main_signature(tree: &mut AnalyzedTree) {
+    let Some(sig) = tree.main_signature.as_ref() else {
+        return;
+    };
+    let mut to_emit: Vec<Diagnostic> = Vec::new();
+    for p in &sig.params {
+        crate::ban_unsafe_types::scan_typenode_for_any(
+            &p.type_node,
+            &format!("#main parameter `{}`", p.name),
+            &mut to_emit,
+        );
+    }
+    if let Some(rt) = sig.return_type.as_ref() {
+        crate::ban_unsafe_types::scan_typenode_for_any(rt, "#main return type", &mut to_emit);
+    }
+    tree.diagnostics.extend(to_emit);
 }
 
 /// Push `UnknownTypeName` for any `#main` parameter whose declared
@@ -124,31 +152,42 @@ fn check_unknown_return_type(tree: &mut AnalyzedTree) {
 }
 
 fn unknown_type_diagnostic(t: &TypeNode, tree: &AnalyzedTree) -> Option<Diagnostic> {
-    if t.path.len() != 1 {
-        return None;
+    // Single-segment: original v1 check (builtin / prelude / declared).
+    if t.path.len() == 1 {
+        let head = &t.path[0];
+        if is_builtin_type_name(head) {
+            return None;
+        }
+        if matches!(head.as_str(), "Result" | "Option") {
+            return None;
+        }
+        let known = tree
+            .schemas
+            .values()
+            .any(|def| def.name.as_deref() == Some(head.as_str()))
+            || tree.root_schemas.iter().any(|d| d.name == *head);
+        if known {
+            return None;
+        }
+        return Some(Diagnostic::UnknownTypeName {
+            name: head.clone(),
+            range: span_of(t.range),
+        });
     }
-    let head = &t.path[0];
-    if is_builtin_type_name(head) {
-        return None;
+    // v1.8+: two-segment `pkg.Tail` reaches us before the workspace
+    // import index is attached. Push a tentative `UnknownTypeName` with
+    // a dotted name; `re_check_unknown_types` clears it iff the entry's
+    // import index resolves `head` to an alias whose exports include
+    // `tail`. Otherwise the user sees the diagnostic, which is the
+    // correct outcome for `#main(pkg.Wrong x)`.
+    if t.path.len() == 2 {
+        let dotted = format!("{}.{}", t.path[0], t.path[1]);
+        return Some(Diagnostic::UnknownTypeName {
+            name: dotted,
+            range: span_of(t.range),
+        });
     }
-    // Evaluator-side prelude schemas. The analyzer doesn't seed them
-    // into `tree.schemas`, but they're guaranteed to exist at runtime,
-    // so accept them silently here.
-    if matches!(head.as_str(), "Result" | "Option") {
-        return None;
-    }
-    let known = tree
-        .schemas
-        .values()
-        .any(|def| def.name.as_deref() == Some(head.as_str()))
-        || tree.root_schemas.iter().any(|d| d.name == *head);
-    if known {
-        return None;
-    }
-    Some(Diagnostic::UnknownTypeName {
-        name: head.clone(),
-        range: span_of(t.range),
-    })
+    None
 }
 
 #[cfg(test)]
@@ -208,5 +247,75 @@ mod tests {
             .filter(|d| matches!(d, Diagnostic::UnknownTypeName { .. }))
             .collect();
         assert!(unk.is_empty(), "{:?}", tree.diagnostics);
+    }
+
+    // ============= v1.6 ban-Any in #main =============
+
+    /// v1.6 forward: `#main(Any x)` reports `ExplicitAnyForbidden`
+    /// regardless of strict-mode setting.
+    #[test]
+    fn v1_6_main_param_any_flagged_default_mode() {
+        let tree = analyze_str(
+            r#"#main(Any x) -> Int
+            1"#,
+        );
+        let n: Vec<_> = tree
+            .diagnostics
+            .iter()
+            .filter(|d| {
+                matches!(d, Diagnostic::ExplicitAnyForbidden { context, .. }
+                if context.contains("#main parameter") && context.contains("`x`"))
+            })
+            .collect();
+        assert_eq!(n.len(), 1, "{:?}", tree.diagnostics);
+    }
+
+    /// v1.6 forward: `#main(...) -> Any` flagged on the return type.
+    #[test]
+    fn v1_6_main_return_any_flagged() {
+        let tree = analyze_str(
+            r#"#main(Int n) -> Any
+            n"#,
+        );
+        let n: Vec<_> = tree
+            .diagnostics
+            .iter()
+            .filter(|d| {
+                matches!(d, Diagnostic::ExplicitAnyForbidden { context, .. }
+                if context.contains("#main return"))
+            })
+            .collect();
+        assert_eq!(n.len(), 1, "{:?}", tree.diagnostics);
+    }
+
+    /// v1.6 forward: nested `Any` inside a `#main` param's
+    /// generic (e.g. `List<Any>`) is also flagged.
+    #[test]
+    fn v1_6_main_param_nested_list_any_flagged() {
+        let tree = analyze_str(
+            r#"#main(List<Any> xs) -> Int
+            len(xs)"#,
+        );
+        let n: Vec<_> = tree
+            .diagnostics
+            .iter()
+            .filter(|d| matches!(d, Diagnostic::ExplicitAnyForbidden { .. }))
+            .collect();
+        assert!(!n.is_empty(), "{:?}", tree.diagnostics);
+    }
+
+    /// v1.6 reverse: a fully concrete `#main` is silent.
+    #[test]
+    fn v1_6_main_concrete_silent() {
+        let tree = analyze_str(
+            r#"#main(Int n) -> Int
+            n + 1"#,
+        );
+        let n: Vec<_> = tree
+            .diagnostics
+            .iter()
+            .filter(|d| matches!(d, Diagnostic::ExplicitAnyForbidden { .. }))
+            .collect();
+        assert!(n.is_empty(), "{:?}", tree.diagnostics);
     }
 }

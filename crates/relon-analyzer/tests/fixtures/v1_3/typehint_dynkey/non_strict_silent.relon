@@ -1,0 +1,3 @@
+// v1.3 reverse: non-strict mode lets `[k]: 1` go through.
+// EXPECTED: no diagnostics.
+{ k: "key", [k]: 1 }

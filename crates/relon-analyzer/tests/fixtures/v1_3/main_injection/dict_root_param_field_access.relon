@@ -1,0 +1,10 @@
+// v1.3a: schema-typed param `Order` accessed in a dict root. The
+// param is correctly resolved (no UnresolvedReference) and the
+// `o.id` head walks through to the `Int` field — the analyzer's
+// path-tail walker validates `o.id` against `Order`'s declared
+// fields. The expected return is `Order` so the body's inferred
+// `Order` matches.
+// EXPECTED: no diagnostics.
+#schema Order { Int id: *, Float total: * }
+#main(Order o) -> Order
+o

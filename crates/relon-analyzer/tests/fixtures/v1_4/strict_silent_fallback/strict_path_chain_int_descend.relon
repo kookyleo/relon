@@ -1,0 +1,9 @@
+// v1.4 strict: descend through `customer.name` — `name` is String,
+// then `.upper` tries to step further, but String has no nested
+// fields. Strict reports UnknownReferenceType on the failing segment.
+// EXPECTED: 1 × UnknownReferenceType.
+#strict
+#schema Customer { String name: * }
+#schema Order { Customer customer: *, Int id: * }
+#main(Order o) -> Dict<String, Int>
+{ x: o.customer.name.upper }

@@ -1,0 +1,5 @@
+// v1.3a forward: atomic root body's type (Int) mismatches declared
+// String return type.
+// EXPECTED: 1 × MainReturnTypeMismatch.
+#main(Int n) -> String
+n + 1

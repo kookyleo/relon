@@ -1,0 +1,5 @@
+// v1.3a: atomic-root body that uses a #main param. Returns Int via
+// `n+1`, declared `-> Int` — silent.
+// EXPECTED: no diagnostics.
+#main(Int n) -> Int
+n + 1

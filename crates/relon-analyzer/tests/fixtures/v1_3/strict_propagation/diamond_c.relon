@@ -1,0 +1,2 @@
+#import * from "./diamond_d.relon"
+{ from_c: 1 }

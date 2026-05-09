@@ -1,0 +1,4 @@
+// v1.3: typed dynamic key with Int — silent under strict.
+// EXPECTED: no diagnostics.
+#strict
+{ idx: 0, [<Int> idx]: "row0" }

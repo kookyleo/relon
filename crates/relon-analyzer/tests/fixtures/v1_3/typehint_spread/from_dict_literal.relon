@@ -1,0 +1,5 @@
+// v1.3: dict-literal spread is silent under strict mode (the keys
+// are visible to the analyzer).
+// EXPECTED: no diagnostics.
+#strict
+{ val: { ...{ a: 1, b: 2 } } }

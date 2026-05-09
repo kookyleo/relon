@@ -212,12 +212,24 @@ pub fn parse_base<'a>(input: &mut Span<'a>) -> ModalResult<Node> {
         .or_else(|| directives.first().map(|d| d.range.start.offset))
         .unwrap_or_else(|| input.location());
 
-    let root = alt((structure::dict::parse_dict, structure::list::parse_list)).parse_next(input)?;
+    // v1.2: root may be any expression, not just `dict` / `list`
+    // literals. The full expr precedence chain (`parse_expr`)
+    // includes both as atomics, so this stays a strict superset of
+    // the old behavior; atomic / variant / arithmetic / fn-call
+    // roots become legal as well. JSON-shape conformance of the
+    // final value is enforced by `#main(...) -> ReturnType` (when
+    // declared) or by the host's projector — the parser no longer
+    // rejects them eagerly.
+    let root = crate::expr::parse_expr.parse_next(input)?;
 
-    // Merge any standalone directives the dict parser collected onto
-    // the root node so the analyzer's root-directive passes see one
-    // unified list.
-    directives.extend(root.directives);
+    // Only Dict roots have inner standalone directives that the
+    // dict parser hoists onto its node — list / atomic / call /
+    // variant roots carry no such inner directives, so merging
+    // would only ever be a noop on them. Guard the merge to avoid
+    // implying otherwise.
+    if matches!(root.expr.as_ref(), Expr::Dict(_)) {
+        directives.extend(root.directives);
+    }
 
     let end_offset = input.location();
     let range = create_range(input, start_offset, end_offset);
@@ -493,5 +505,63 @@ mod tests {
 
         let mut s = Span::new("/* block comment */");
         assert_eq!(comment(&mut s).unwrap(), " block comment ");
+    }
+
+    /// v1.2: `parse_base` accepts any expression as the root, not
+    /// just `dict` / `list` literals. The chain through `parse_expr`
+    /// already covers the full precedence ladder, so each of these
+    /// forms must reach `parse_document` without trailing-input
+    /// errors and produce the corresponding `Expr` head.
+    #[test]
+    fn test_root_accepts_atomic_literals() {
+        let node = parse_document("42").unwrap();
+        assert!(matches!(*node.expr, Expr::Int(42)));
+
+        let node = parse_document(r#""hello""#).unwrap();
+        assert!(matches!(*node.expr, Expr::String(_)));
+
+        let node = parse_document("true").unwrap();
+        assert!(matches!(*node.expr, Expr::Bool(true)));
+
+        let node = parse_document("null").unwrap();
+        assert!(matches!(*node.expr, Expr::Null));
+    }
+
+    #[test]
+    fn test_root_accepts_binary_expression() {
+        let node = parse_document("1 + 2").unwrap();
+        assert!(matches!(*node.expr, Expr::Binary(Operator::Add, _, _)));
+    }
+
+    #[test]
+    fn test_root_accepts_variant_constructor() {
+        let node = parse_document("Result.Ok { value: 1 }").unwrap();
+        assert!(matches!(*node.expr, Expr::VariantCtor { .. }));
+    }
+
+    #[test]
+    fn test_root_accepts_fn_call() {
+        let node = parse_document("range(0, 10)").unwrap();
+        assert!(matches!(*node.expr, Expr::FnCall { .. }));
+    }
+
+    /// Pre-v1.2 root forms (dict / list literals) must keep parsing
+    /// — v1.2 is a strict superset.
+    #[test]
+    fn test_root_dict_and_list_still_work() {
+        let node = parse_document("{ a: 1 }").unwrap();
+        assert!(matches!(*node.expr, Expr::Dict(_)));
+
+        let node = parse_document("[1, 2, 3]").unwrap();
+        assert!(matches!(*node.expr, Expr::List(_)));
+    }
+
+    /// Truly invalid input is still rejected — v1.2 widens the root
+    /// shape but does not weaken parser strictness elsewhere.
+    #[test]
+    fn test_root_rejects_garbage() {
+        assert!(parse_document("").is_err());
+        assert!(parse_document("   \n\t  ").is_err());
+        assert!(parse_document("{ bad syntax").is_err());
     }
 }

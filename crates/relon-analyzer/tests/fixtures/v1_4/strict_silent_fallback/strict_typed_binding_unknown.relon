@@ -1,0 +1,8 @@
+// v1.5 strict: comprehension element inference now derives
+// `List<Int>` for `[x * 2 for x in range(o.id) if x > 0]`, matching
+// the declared `List<Int>` slot — no InferenceLimit / no mismatch.
+// EXPECTED: 0 × InferenceLimit, 0 × StaticTypeMismatch.
+#strict
+#schema Order { Int id: *, Float total: * }
+#main(Order o) -> Dict<String, Int>
+{ List<Int> xs: [x * 2 for x in range(o.id) if x > 0] }

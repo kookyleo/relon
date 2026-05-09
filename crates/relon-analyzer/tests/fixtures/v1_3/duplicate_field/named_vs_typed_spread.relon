@@ -1,0 +1,5 @@
+// v1.3 forward: named field `a` collides with key contributed by a
+// typed spread.
+// EXPECTED: 1 × DuplicateField { field == "a" }.
+#schema Extra { Int a: *, Int b: * }
+{ src: { a: 1, b: 2 }, a: 99, ...<Extra> src }

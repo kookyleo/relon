@@ -1,0 +1,8 @@
+// v1.3: `Dict<String, Result<Int, String>>` parses and accepts.
+// EXPECTED: no diagnostics.
+{
+    Dict<String, Result<Int, String>> tasks: {
+        a: Result.Ok { value: 1 },
+        b: Result.Err { error: "no" }
+    }
+}

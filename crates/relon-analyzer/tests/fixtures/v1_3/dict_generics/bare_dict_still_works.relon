@@ -1,0 +1,8 @@
+// v1.7 retires bare-generic shorthand. The legacy v1.3 fixture name
+// is preserved for archaeology, but the source now uses the
+// explicit form `Dict<String, Int>` since that's the only way to
+// declare a Dict-typed slot today. Pre-v1.7 the bare form silently
+// expanded to `Dict<Any, Any>`, which v1.6 would in turn flag as
+// laundering `Any`.
+// EXPECTED: no diagnostics.
+{ Dict<String, Int> scores: { math: 100, art: 90 } }

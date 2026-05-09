@@ -1,0 +1,7 @@
+// v1.4 path-tail: multi-hop schema field chain `o.customer.name` infers
+// String (Customer.name), matching the declared String return.
+// EXPECTED: no diagnostics.
+#schema Customer { String name: * }
+#schema Order { Customer customer: *, Int id: * }
+#main(Order o) -> String
+o.customer.name

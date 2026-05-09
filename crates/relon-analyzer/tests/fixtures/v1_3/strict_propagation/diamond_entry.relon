@@ -1,0 +1,6 @@
+// v1.3: diamond — entry imports b and c, both import d. Strict
+// reaches every node.
+#strict
+#import * from "./diamond_b.relon"
+#import * from "./diamond_c.relon"
+{ x: 1 }

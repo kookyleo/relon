@@ -1,0 +1,8 @@
+// v1.4 strict: a match whose arm body relies on a runtime-only call
+// (an unknown function `mystery_call`) — strict mode reports
+// InferenceLimit pinned on the arm body.
+// EXPECTED: ≥ 1 × InferenceLimit.
+#strict
+#schema Status Enum<"on", "off">
+#main(Status s) -> Dict<String, Int>
+{ result: s match { on: mystery_call(), off: 0 } }

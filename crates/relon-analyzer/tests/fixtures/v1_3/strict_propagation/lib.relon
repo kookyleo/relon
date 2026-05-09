@@ -1,0 +1,4 @@
+// v1.3: a non-strict lib that contains a silent-fallback shape (a
+// non-literal untyped spread). Imported by `entry.relon`, which is
+// strict — contagion makes the analyzer flag this lib's spread.
+{ src: 1 + 2, val: { ...src } }

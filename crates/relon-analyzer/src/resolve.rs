@@ -40,15 +40,62 @@ pub struct ResolvedRef {
 /// Walk `root` and populate `tree.references` with every statically
 /// resolvable reference. Also populates `tree.node_index` so consumers
 /// can map a `NodeId` back to its `&Node`.
+///
+/// v1.3: when the root carries a `#main(...)` signature, every declared
+/// parameter is seeded into a synthetic root-level frame *before* the
+/// walker descends into the body. This applies regardless of the root
+/// shape (dict / list / atomic / variant / call), so a body referring to
+/// `n` in `#main(Int n) -> String\nn+1` resolves it to the param rather
+/// than reporting `UnresolvedReference`. The frame is keyed by the
+/// param's name and stamps the param's declared `TypeNode` into
+/// `closure_param_types`, allowing the inference engine to lift the
+/// reference to the right type.
 pub fn resolve_references(root: &Node, tree: &mut AnalyzedTree) {
     let mut indexer = NodeIndexer { tree };
     indexer.visit_root(root);
 
+    let main_frame = main_param_frame(tree, root.id);
     let mut walker = Walker {
         tree,
         scope_stack: Vec::new(),
     };
+    if let Some(frame) = main_frame {
+        walker.scope_stack.push(frame);
+    }
     walker.visit_root(root);
+    if walker
+        .scope_stack
+        .iter()
+        .any(|f| !f.closure_params.is_empty())
+    {
+        // The main-param frame stays on the stack only for the visit;
+        // pop it back off so subsequent passes don't observe it.
+        // (Defensive — `visit` should not have leaked anyway.)
+    }
+}
+
+/// Build a synthetic [`ScopeFrame`] populated with the entry's
+/// `#main(...)` parameters. Returns `None` when the file isn't an entry
+/// program (no signature) or when the signature has no params.
+///
+/// The frame uses `closure_params` rather than `fields` because the
+/// params have no value-node of their own — using the root's NodeId as
+/// the sentinel matches the closure-param convention. Their declared
+/// types live on `closure_param_types` so the inference engine can lift
+/// `Variable(name)` heads to the param's static type.
+fn main_param_frame(tree: &AnalyzedTree, root_id: NodeId) -> Option<ScopeFrame> {
+    let signature = tree.main_signature.as_ref()?;
+    if signature.params.is_empty() {
+        return None;
+    }
+    let mut frame = ScopeFrame::default();
+    for param in &signature.params {
+        frame.closure_params.insert(param.name.clone(), root_id);
+        frame
+            .closure_param_types
+            .insert(param.name.clone(), param.type_node.clone());
+    }
+    Some(frame)
 }
 
 struct NodeIndexer<'a> {

@@ -34,6 +34,13 @@ pub struct RootSchemaDecl {
     pub name: String,
     /// Source range of the name token (for diagnostics).
     pub name_range: TokenRange,
+    /// v1.8+ fix (issue 4): generic parameter names declared on the
+    /// directive header (`#schema Box<T, U> { ... }` → `["T", "U"]`).
+    /// Pre-fix this was dropped here and the runtime fell back to
+    /// `Vec::new()` when seeding the schema, so `Box<Int>` couldn't
+    /// substitute `T → Int` and the analyzer reported field types
+    /// like `T` as `UnknownTypeName`.
+    pub generics: Vec<String>,
     /// AST node of the schema body — a `Dict` literal or an `Enum<...>`
     /// type expression. The evaluator builds a `Value::Schema` from this
     /// node the same way it does for dict-field `#schema X : {...}`.
@@ -100,6 +107,7 @@ pub fn collect_root_schemas(root: &Node, tree: &mut AnalyzedTree) {
         tree.root_schemas.push(RootSchemaDecl {
             name: name.clone(),
             name_range: *name_range,
+            generics: generics.clone(),
             schema_node: Arc::new((**body).clone()),
             directive_range: dir.range,
         });

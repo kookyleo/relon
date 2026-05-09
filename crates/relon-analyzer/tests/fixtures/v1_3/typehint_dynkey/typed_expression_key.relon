@@ -1,0 +1,4 @@
+// v1.3: typed dynamic key whose expression is a binary op.
+// EXPECTED: no diagnostics.
+#strict
+{ a: "x", b: "y", [<String> a + b]: 1 }

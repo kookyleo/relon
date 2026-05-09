@@ -1,0 +1,7 @@
+// v1.4 strict: `o.id.something` — after `.id` the running type is Int,
+// which has no nested fields. Strict reports UnknownReferenceType.
+// EXPECTED: 1 × UnknownReferenceType (name="something").
+#strict
+#schema Order { Int id: *, Float total: * }
+#main(Order o) -> Dict<String, Int>
+{ x: o.id.something }

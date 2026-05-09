@@ -2924,6 +2924,288 @@ fn run_main_return_type_match_passes() {
     assert_eq!(d.map.get("result"), Some(&Value::Int(8)));
 }
 
+// ---------- v1.4 strict completeness end-to-end ----------
+
+/// v1.4 forward: `#main(Order o) -> Int` with body `o.id` should be
+/// caught statically by the analyzer (no MainReturnTypeMismatch since
+/// `Order.id : Int`). The evaluator runs the same body and returns the
+/// Int value; the harness verifies the path-tail walking lined up the
+/// static check before evaluation rather than letting the runtime
+/// decide.
+#[test]
+fn v1_4_run_main_path_tail_int_field_returns_int() {
+    use std::collections::{BTreeMap, HashMap};
+    let source = r#"#schema Order { Int id: *, Float total: * }
+#main(Order o) -> Int
+o.id"#;
+    let node = parse_doc(source);
+    let analyzed = std::sync::Arc::new(relon_analyzer::analyze(&node));
+    // Static MainReturnTypeMismatch must NOT fire — proves path-tail
+    // walking inferred the body as Int.
+    let mm = analyzed
+        .diagnostics
+        .iter()
+        .filter(|d| matches!(d, relon_analyzer::Diagnostic::MainReturnTypeMismatch { .. }))
+        .count();
+    assert_eq!(mm, 0, "{:?}", analyzed.diagnostics);
+
+    let mut order = BTreeMap::new();
+    order.insert("id".to_string(), Value::Int(42));
+    order.insert("total".to_string(), Value::Float(9.95.into()));
+    let mut args: HashMap<String, Value> = HashMap::new();
+    args.insert("o".to_string(), Value::dict(order));
+
+    let ctx = Context::new()
+        .with_root(node.clone())
+        .with_analyzed(std::sync::Arc::clone(&analyzed));
+    let result = Evaluator::new(std::sync::Arc::new(ctx))
+        .run_main(&std::sync::Arc::new(Scope::default()), args)
+        .unwrap();
+    assert_eq!(result, Value::Int(42));
+}
+
+/// v1.4 forward: same shape, declared return is `String` while
+/// `o.id : Int`. Analyzer must flag MainReturnTypeMismatch ahead of
+/// evaluation; the runtime never sees the type-mismatched body.
+#[test]
+fn v1_4_main_return_type_mismatch_caught_statically() {
+    let source = r#"#schema Order { Int id: *, Float total: * }
+#main(Order o) -> String
+o.id"#;
+    let node = parse_doc(source);
+    let analyzed = std::sync::Arc::new(relon_analyzer::analyze(&node));
+    let mm = analyzed
+        .diagnostics
+        .iter()
+        .filter(|d| {
+            matches!(d, relon_analyzer::Diagnostic::MainReturnTypeMismatch { expected, found, .. }
+            if expected == "String" && found == "Int")
+        })
+        .count();
+    assert_eq!(mm, 1, "{:?}", analyzed.diagnostics);
+}
+
+/// v1.4 forward: multi-hop path (`o.customer.name`) lines up Customer.name
+/// (String) with the declared `-> String`. Evaluator runs and returns
+/// the inner String value.
+#[test]
+fn v1_4_run_main_multi_hop_chain_string() {
+    use std::collections::{BTreeMap, HashMap};
+    let source = r#"#schema Customer { String name: * }
+#schema Order { Customer customer: *, Int id: * }
+#main(Order o) -> String
+o.customer.name"#;
+    let node = parse_doc(source);
+    let analyzed = std::sync::Arc::new(relon_analyzer::analyze(&node));
+    let mm = analyzed
+        .diagnostics
+        .iter()
+        .filter(|d| matches!(d, relon_analyzer::Diagnostic::MainReturnTypeMismatch { .. }))
+        .count();
+    assert_eq!(mm, 0, "{:?}", analyzed.diagnostics);
+
+    let mut customer = BTreeMap::new();
+    customer.insert("name".to_string(), Value::String("Alice".to_string()));
+    let mut order = BTreeMap::new();
+    order.insert("customer".to_string(), Value::dict(customer));
+    order.insert("id".to_string(), Value::Int(1));
+    let mut args: HashMap<String, Value> = HashMap::new();
+    args.insert("o".to_string(), Value::dict(order));
+
+    let ctx = Context::new()
+        .with_root(node.clone())
+        .with_analyzed(std::sync::Arc::clone(&analyzed));
+    let result = Evaluator::new(std::sync::Arc::new(ctx))
+        .run_main(&std::sync::Arc::new(Scope::default()), args)
+        .unwrap();
+    assert_eq!(result, Value::String("Alice".to_string()));
+}
+
+/// v1.4 forward: strict mode with a path-spread of a typed field
+/// (`...o.extras` where Order.extras : Extras) — analyzer is silent
+/// (no MissingSpreadTypeHint) and evaluation produces the merged dict.
+#[test]
+fn v1_4_run_main_strict_path_spread_schema() {
+    use std::collections::{BTreeMap, HashMap};
+    let source = r#"#strict
+#schema Extras { Int a: *, Int b: * }
+#schema Order { Extras extras: *, Int id: * }
+#main(Order o) -> Dict
+{ id: o.id, ...o.extras }"#;
+    let node = parse_doc(source);
+    let analyzed = std::sync::Arc::new(relon_analyzer::analyze(&node));
+    // No MissingSpreadTypeHint and no UnknownReferenceType — proves
+    // the spread extension accepted the path-derived schema.
+    let strict_diags = analyzed
+        .diagnostics
+        .iter()
+        .filter(|d| {
+            matches!(
+                d,
+                relon_analyzer::Diagnostic::MissingSpreadTypeHint { .. }
+                    | relon_analyzer::Diagnostic::UnknownReferenceType { .. }
+            )
+        })
+        .count();
+    assert_eq!(strict_diags, 0, "{:?}", analyzed.diagnostics);
+
+    let mut extras = BTreeMap::new();
+    extras.insert("a".to_string(), Value::Int(7));
+    extras.insert("b".to_string(), Value::Int(9));
+    let mut order = BTreeMap::new();
+    order.insert("extras".to_string(), Value::dict(extras));
+    order.insert("id".to_string(), Value::Int(42));
+    let mut args: HashMap<String, Value> = HashMap::new();
+    args.insert("o".to_string(), Value::dict(order));
+
+    let ctx = Context::new()
+        .with_root(node.clone())
+        .with_analyzed(std::sync::Arc::clone(&analyzed));
+    let result = Evaluator::new(std::sync::Arc::new(ctx))
+        .run_main(&std::sync::Arc::new(Scope::default()), args)
+        .unwrap();
+    let Value::Dict(d) = result else {
+        panic!("expected dict")
+    };
+    assert_eq!(d.map.get("id"), Some(&Value::Int(42)));
+    assert_eq!(d.map.get("a"), Some(&Value::Int(7)));
+    assert_eq!(d.map.get("b"), Some(&Value::Int(9)));
+}
+
+// ---------- v1.5 strict completeness end-to-end ----------
+
+/// v1.5 forward: list comprehension as the entry body. The analyzer
+/// derives `List<Int>` for the body, matching the declared return —
+/// no MainReturnTypeMismatch — and the evaluator runs it without
+/// host-side surprises.
+#[test]
+fn v1_5_run_main_comprehension_list_int() {
+    use std::collections::HashMap;
+    let source = r#"#main(Int n) -> List<Int>
+[x * x for x in range(n)]"#;
+    let node = parse_doc(source);
+    let analyzed = std::sync::Arc::new(relon_analyzer::analyze(&node));
+    // The static walker must not flag a return mismatch — proving
+    // the new `Expr::Comprehension` arm derives the list element
+    // type correctly.
+    let mm = analyzed
+        .diagnostics
+        .iter()
+        .filter(|d| matches!(d, relon_analyzer::Diagnostic::MainReturnTypeMismatch { .. }))
+        .count();
+    assert_eq!(mm, 0, "{:?}", analyzed.diagnostics);
+
+    let mut args: HashMap<String, Value> = HashMap::new();
+    args.insert("n".to_string(), Value::Int(4));
+    let ctx = Context::new()
+        .with_root(node.clone())
+        .with_analyzed(std::sync::Arc::clone(&analyzed));
+    let result = Evaluator::new(std::sync::Arc::new(ctx))
+        .run_main(&std::sync::Arc::new(Scope::default()), args)
+        .unwrap();
+    let Value::List(items) = result else {
+        panic!("expected list")
+    };
+    assert_eq!(items.len(), 4);
+    assert_eq!(items[0], Value::Int(0));
+    assert_eq!(items[3], Value::Int(9));
+}
+
+/// v1.5 forward: where-expression as the entry body. `(n + 1) where
+/// { n: x }` derives `Int`, matching the declared return.
+#[test]
+fn v1_5_run_main_where_int() {
+    use std::collections::HashMap;
+    let source = r#"#main(Int x) -> Int
+(n + 1) where { n: x }"#;
+    let node = parse_doc(source);
+    let analyzed = std::sync::Arc::new(relon_analyzer::analyze(&node));
+    let mm = analyzed
+        .diagnostics
+        .iter()
+        .filter(|d| matches!(d, relon_analyzer::Diagnostic::MainReturnTypeMismatch { .. }))
+        .count();
+    assert_eq!(mm, 0, "{:?}", analyzed.diagnostics);
+
+    let mut args: HashMap<String, Value> = HashMap::new();
+    args.insert("x".to_string(), Value::Int(41));
+    let ctx = Context::new()
+        .with_root(node.clone())
+        .with_analyzed(std::sync::Arc::clone(&analyzed));
+    let result = Evaluator::new(std::sync::Arc::new(ctx))
+        .run_main(&std::sync::Arc::new(Scope::default()), args)
+        .unwrap();
+    assert_eq!(result, Value::Int(42));
+}
+
+/// v1.5 forward: strict mode with a typed closure parameter — the
+/// analyzer is silent on `StrictForbidsUntypedClosureParam` and the
+/// sibling-callable form runs cleanly.
+#[test]
+fn v1_5_run_strict_closure_typed_param() {
+    let source = r#"#strict
+{ helper: (Int n) -> Int => n * 2, Int doubled: helper(7) }"#;
+    let node = parse_doc(source);
+    let analyzed = std::sync::Arc::new(relon_analyzer::analyze(&node));
+    let strict_diags = analyzed
+        .diagnostics
+        .iter()
+        .filter(|d| {
+            matches!(
+                d,
+                relon_analyzer::Diagnostic::StrictForbidsUntypedClosureParam { .. }
+            )
+        })
+        .count();
+    assert_eq!(strict_diags, 0, "{:?}", analyzed.diagnostics);
+}
+
+/// v1.5 forward: untyped closure parameter under strict mode is
+/// flagged, even when the body is otherwise inferable. Pairs with the
+/// typed-param test above as a forward / reverse pair.
+#[test]
+fn v1_5_strict_closure_untyped_param_flagged_via_evaluator_pipeline() {
+    let source = r#"#strict
+{ helper: (n) => n + 1 }"#;
+    let node = parse_doc(source);
+    let analyzed = std::sync::Arc::new(relon_analyzer::analyze(&node));
+    let n = analyzed
+        .diagnostics
+        .iter()
+        .filter(|d| {
+            matches!(
+                d,
+                relon_analyzer::Diagnostic::StrictForbidsUntypedClosureParam { param_name, .. }
+                    if param_name == "n"
+            )
+        })
+        .count();
+    assert!(n >= 1, "{:?}", analyzed.diagnostics);
+}
+
+/// v1.5 forward: comprehension under strict mode produces the right
+/// `List<Int>` element type to match a typed slot — analyzer is
+/// silent.
+#[test]
+fn v1_5_strict_typed_list_comp_silent() {
+    let source = r#"#strict
+{ List<Int> doubled: [x * 2 for x in range(5) if x > 0] }"#;
+    let node = parse_doc(source);
+    let analyzed = std::sync::Arc::new(relon_analyzer::analyze(&node));
+    let il = analyzed
+        .diagnostics
+        .iter()
+        .filter(|d| matches!(d, relon_analyzer::Diagnostic::InferenceLimit { .. }))
+        .count();
+    let stm = analyzed
+        .diagnostics
+        .iter()
+        .filter(|d| matches!(d, relon_analyzer::Diagnostic::StaticTypeMismatch { .. }))
+        .count();
+    assert_eq!(il, 0, "{:?}", analyzed.diagnostics);
+    assert_eq!(stm, 0, "{:?}", analyzed.diagnostics);
+}
+
 // ---------- Generic schema tests (Phase 7) ----------
 
 #[test]
@@ -3313,4 +3595,460 @@ fn workspace_module_lookup_skips_reparse_during_evaluate_module_source() {
         panic!("expected dict, got {result:?}")
     };
     assert_eq!(d.map.get("msg"), Some(&Value::String("hi".to_string())));
+}
+
+// ---------------------------------------------------------------------
+// v1.2: root expression accepts any shape that evaluates to a JSON
+// value. Pre-v1.2 the parser hard-coded `dict | list` at the root, so
+// these forms used to fail at parse time. The block below covers both
+// `eval_root` (library-style scripts) and `run_main` (entry programs)
+// to keep the runtime contract honest as the parser widened.
+// ---------------------------------------------------------------------
+
+#[test]
+fn v12_root_atomic_int() {
+    let result = eval_doc("42").unwrap();
+    assert_eq!(result, Value::Int(42));
+}
+
+#[test]
+fn v12_root_atomic_string() {
+    let result = eval_doc(r#""hello""#).unwrap();
+    assert_eq!(result, Value::String("hello".to_string()));
+}
+
+#[test]
+fn v12_root_atomic_bool() {
+    let result = eval_doc("true").unwrap();
+    assert_eq!(result, Value::Bool(true));
+}
+
+#[test]
+fn v12_root_atomic_null() {
+    let result = eval_doc("null").unwrap();
+    assert_eq!(result, Value::Null);
+}
+
+#[test]
+fn v12_root_dict_and_list_still_work() {
+    // Pre-v1.2 root forms must keep working (superset, not breaking
+    // change).
+    let result = eval_doc("{a: 1}").unwrap();
+    let Value::Dict(d) = result else {
+        panic!("expected Dict")
+    };
+    assert_eq!(d.map.get("a"), Some(&Value::Int(1)));
+
+    let result = eval_doc("[1, 2, 3]").unwrap();
+    let Value::List(items) = result else {
+        panic!("expected List")
+    };
+    assert_eq!(items.len(), 3);
+}
+
+#[test]
+fn v12_root_arithmetic_expression() {
+    // `1 + 2 * 3` exercises the precedence chain at the root — the
+    // result must be an `Int(7)` because `*` binds tighter than `+`.
+    let result = eval_doc("1 + 2 * 3").unwrap();
+    assert_eq!(result, Value::Int(7));
+}
+
+#[test]
+fn v12_run_main_atomic_int_body() {
+    // `#main(Int n) -> Int` with a pure-arithmetic root body: the
+    // parser used to reject this form because the root wasn't a dict
+    // or list literal. Now host pushes `n=5` and we expect `Int(6)`.
+    use std::collections::HashMap;
+    let source = r#"#main(Int n) -> Int
+n + 1"#;
+    let node = parse_doc(source);
+    let analyzed = std::sync::Arc::new(relon_analyzer::analyze(&node));
+    assert!(analyzed.main_signature.is_some());
+    let mut args: HashMap<String, Value> = HashMap::new();
+    args.insert("n".to_string(), Value::Int(5));
+
+    let ctx = Context::new()
+        .with_root(node.clone())
+        .with_analyzed(std::sync::Arc::clone(&analyzed));
+    let result = Evaluator::new(std::sync::Arc::new(ctx))
+        .run_main(&std::sync::Arc::new(Scope::default()), args)
+        .unwrap();
+    assert_eq!(result, Value::Int(6));
+}
+
+#[test]
+fn v12_run_main_atomic_string_body() {
+    // `#main(String s) -> String` returning a pure variable reference:
+    // root body is just `s` (atomic Variable expression).
+    use std::collections::HashMap;
+    let source = r#"#main(String s) -> String
+s"#;
+    let node = parse_doc(source);
+    let analyzed = std::sync::Arc::new(relon_analyzer::analyze(&node));
+    let mut args: HashMap<String, Value> = HashMap::new();
+    args.insert("s".to_string(), Value::String("hi".to_string()));
+
+    let ctx = Context::new()
+        .with_root(node.clone())
+        .with_analyzed(std::sync::Arc::clone(&analyzed));
+    let result = Evaluator::new(std::sync::Arc::new(ctx))
+        .run_main(&std::sync::Arc::new(Scope::default()), args)
+        .unwrap();
+    assert_eq!(result, Value::String("hi".to_string()));
+}
+
+#[test]
+fn v12_run_main_variant_ctor_root_body() {
+    // Built-in `Result<T, E>` is seeded into every Context, so we can
+    // construct a variant at the root without declaring the schema.
+    // Body: `Result.Ok { value: o }` — a `VariantCtor` expression as
+    // the document root.
+    use std::collections::{BTreeMap, HashMap};
+    let body = r#"#main(Order o) -> Result<Order, Int>
+Result.Ok { value: o }"#;
+    // Need a `#schema Order` declaration in scope for the parameter
+    // type to resolve. Wrap the entry program with a top-level schema
+    // declaration:
+    let full_source = format!("#schema Order {{ Int id: * }}\n{body}");
+    let node = parse_doc(&full_source);
+    let analyzed = std::sync::Arc::new(relon_analyzer::analyze(&node));
+    assert!(analyzed.main_signature.is_some());
+
+    let mut order = BTreeMap::new();
+    order.insert("id".to_string(), Value::Int(7));
+    let mut args: HashMap<String, Value> = HashMap::new();
+    args.insert("o".to_string(), Value::dict(order));
+
+    let ctx = Context::new()
+        .with_root(node.clone())
+        .with_analyzed(std::sync::Arc::clone(&analyzed));
+    let result = Evaluator::new(std::sync::Arc::new(ctx))
+        .run_main(&std::sync::Arc::new(Scope::default()), args)
+        .unwrap();
+    // The result is a tagged-enum variant whose dict carries
+    // `variant_of=Result` / `brand=Ok` and a `value` field with the
+    // pushed Order.
+    let Value::Dict(d) = result else {
+        panic!("expected variant dict, got {result:?}")
+    };
+    assert_eq!(d.brand.as_deref(), Some("Ok"));
+    let Some(Value::Dict(inner)) = d.map.get("value") else {
+        panic!("missing or non-dict `value`")
+    };
+    assert_eq!(inner.map.get("id"), Some(&Value::Int(7)));
+}
+
+#[test]
+fn v13a_main_atomic_return_type_mismatch_caught_statically() {
+    // v1.3a fix: `#main(Int n) -> String` with body `n + 1` now
+    // surfaces `MainReturnTypeMismatch` at the *analyzer* level — the
+    // resolver and typecheck walkers seed `#main(...)` parameters into
+    // the root scope frame, so the body's static type is `Int`
+    // (not `Any`), the return-type check fires before evaluation. The
+    // v1.2 runtime fallback that this test previously asserted is
+    // now superseded.
+    let source = r#"#main(Int n) -> String
+n + 1"#;
+    let node = parse_doc(source);
+    let analyzed = relon_analyzer::analyze(&node);
+    let mismatches: Vec<_> = analyzed
+        .diagnostics
+        .iter()
+        .filter(|d| matches!(d, relon_analyzer::Diagnostic::MainReturnTypeMismatch { .. }))
+        .collect();
+    assert_eq!(
+        mismatches.len(),
+        1,
+        "v1.3a should statically flag the atomic-root return mismatch: {:?}",
+        analyzed.diagnostics
+    );
+    // The `has_errors()` flag flips: hosts that follow the documented
+    // "skip eval on errors" pattern won't reach the evaluator.
+    assert!(analyzed.has_errors());
+}
+
+#[test]
+fn v13a_main_atomic_return_type_match_no_diagnostics() {
+    // v1.3a reverse: `#main(Int n) -> Int` with body `n + 1` is silent
+    // because the inferred body type matches the declared return.
+    let source = r#"#main(Int n) -> Int
+n + 1"#;
+    let node = parse_doc(source);
+    let analyzed = relon_analyzer::analyze(&node);
+    let mismatches: Vec<_> = analyzed
+        .diagnostics
+        .iter()
+        .filter(|d| matches!(d, relon_analyzer::Diagnostic::MainReturnTypeMismatch { .. }))
+        .collect();
+    assert!(mismatches.is_empty(), "{:?}", analyzed.diagnostics);
+}
+
+#[test]
+fn v13_strict_mode_blocks_eval_when_spread_lacks_hint() {
+    // v1.3 end-to-end: `#strict\n{ src: 1+2, val: { ...src } }`
+    // is reported by the analyzer with `MissingSpreadTypeHint`; hosts
+    // that gate eval on `analyzed.has_errors()` never reach the
+    // evaluator, the documented contract.
+    let source = "#strict\n{ src: 1 + 2, val: { ...src } }";
+    let node = parse_doc(source);
+    let analyzed = relon_analyzer::analyze(&node);
+    assert!(
+        analyzed
+            .diagnostics
+            .iter()
+            .any(|d| matches!(d, relon_analyzer::Diagnostic::MissingSpreadTypeHint { .. })),
+        "{:?}",
+        analyzed.diagnostics
+    );
+    assert!(analyzed.has_errors());
+}
+
+#[test]
+fn v13_strict_mode_blocks_eval_when_dynkey_lacks_hint() {
+    // v1.3 end-to-end: untyped dynamic key under `#strict`.
+    let source = r#"#strict
+{ k: "key", [k]: 1 }"#;
+    let node = parse_doc(source);
+    let analyzed = relon_analyzer::analyze(&node);
+    assert!(
+        analyzed.diagnostics.iter().any(|d| matches!(
+            d,
+            relon_analyzer::Diagnostic::MissingDynamicKeyTypeHint { .. }
+        )),
+        "{:?}",
+        analyzed.diagnostics
+    );
+    assert!(analyzed.has_errors());
+}
+
+#[test]
+fn v13_strict_mode_typed_spread_passes_eval() {
+    // v1.3 end-to-end: when the source provides the typed spread, the
+    // analyzer is silent and evaluation proceeds.
+    let source = r#"#strict
+#schema Extra { Int a: *, Int b: * }
+{ src: { a: 1, b: 2 }, ...<Extra> src }"#;
+    let node = parse_doc(source);
+    let analyzed = relon_analyzer::analyze(&node);
+    assert!(
+        !analyzed.has_errors(),
+        "expected silent v1.3 typed spread, got: {:?}",
+        analyzed.diagnostics
+    );
+}
+
+#[test]
+fn v13_dict_generics_string_int_mismatch_caught_statically() {
+    // v1.3 end-to-end: `Dict<String, Int>` rejects a String value.
+    let source = r#"{ Dict<String, Int> scores: { math: 100, art: "A" } }"#;
+    let node = parse_doc(source);
+    let analyzed = relon_analyzer::analyze(&node);
+    assert!(
+        analyzed.diagnostics.iter().any(|d| matches!(
+            d,
+            relon_analyzer::Diagnostic::StaticTypeMismatch { field, .. } if field == "scores.art"
+        )),
+        "{:?}",
+        analyzed.diagnostics
+    );
+    assert!(analyzed.has_errors());
+}
+
+#[test]
+fn v13_duplicate_field_via_typed_spread_caught_statically() {
+    // v1.3 end-to-end: spread + named field collision.
+    let source = r#"#schema Extra { Int a: *, Int b: * }
+{ src: { a: 1, b: 2 }, a: 99, ...<Extra> src }"#;
+    let node = parse_doc(source);
+    let analyzed = relon_analyzer::analyze(&node);
+    assert!(
+        analyzed
+            .diagnostics
+            .iter()
+            .any(|d| matches!(d, relon_analyzer::Diagnostic::DuplicateField { field, .. } if field == "a")),
+        "{:?}",
+        analyzed.diagnostics
+    );
+}
+
+#[test]
+fn v13_strict_unresolved_schema_caught_statically() {
+    // v1.3 end-to-end: typed spread whose schema isn't declared.
+    let source = r#"#strict
+{ src: 1, val: { ...<Mystery> src } }"#;
+    let node = parse_doc(source);
+    let analyzed = relon_analyzer::analyze(&node);
+    assert!(
+        analyzed
+            .diagnostics
+            .iter()
+            .any(|d| matches!(d, relon_analyzer::Diagnostic::UnresolvedSchema { name, .. } if name == "Mystery")),
+        "{:?}",
+        analyzed.diagnostics
+    );
+}
+
+#[test]
+fn v13_main_param_resolves_in_dict_root() {
+    // v1.3 end-to-end: `#main(Order o)` body `{ id: o.id }`. The
+    // analyzer's resolver seeds `o`; the typecheck walker uses the
+    // `Order` schema to validate `o.id` as `Int`. No diagnostic.
+    let source = r#"#schema Order { Int id: *, Float total: * }
+#main(Order o) -> Dict
+{ id: o.id }"#;
+    let node = parse_doc(source);
+    let analyzed = relon_analyzer::analyze(&node);
+    let unresolved: Vec<_> = analyzed
+        .diagnostics
+        .iter()
+        .filter(|d| matches!(d, relon_analyzer::Diagnostic::UnresolvedReference { .. }))
+        .collect();
+    assert!(unresolved.is_empty(), "{:?}", analyzed.diagnostics);
+}
+
+// ====== v1.7: tuple types end-to-end ======
+
+#[test]
+fn v17_tuple_typed_field_evaluates_as_list() {
+    // v1.7 e2e: a `(Int, String)`-typed field in a dict accepts a
+    // `[1, "x"]` literal. At runtime tuple is just a list (heterogeneous
+    // by intent), so the evaluator returns a `Value::List` of two
+    // entries.
+    let source = r#"{ (Int, String) pair: [42, "hello"] }"#;
+    let result = eval_doc(source).expect("eval");
+    let Value::Dict(map) = result else {
+        panic!("expected Dict");
+    };
+    let pair = map.map.get("pair").expect("pair field");
+    let Value::List(items) = pair else {
+        panic!("expected List for tuple field, got {pair:?}");
+    };
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[0], Value::Int(42));
+    assert_eq!(items[1], Value::String("hello".to_string()));
+}
+
+#[test]
+fn v17_tuple_nested_in_list() {
+    // v1.7 e2e: `List<(String, Int)>` of records, exercising both
+    // outer list iteration and inner tuple positions at runtime.
+    let source = r#"{
+  List<(String, Int)> rows: [["alice", 3], ["bob", 1]]
+}"#;
+    let result = eval_doc(source).expect("eval");
+    let Value::Dict(map) = result else {
+        panic!("expected Dict");
+    };
+    let rows = map.map.get("rows").expect("rows");
+    let Value::List(outer) = rows else {
+        panic!("expected outer List");
+    };
+    assert_eq!(outer.len(), 2);
+}
+
+#[test]
+fn v17_tuple_static_check_passes_for_homogeneous_list_slot() {
+    // Tuple → List collapse: `[1, 2, 3]` infers as
+    // `Tuple<Int, Int, Int>` and still subsumes `List<Int>`. The
+    // analyzer should issue zero `StaticTypeMismatch`.
+    let source = r#"{ List<Int> xs: [1, 2, 3] }"#;
+    let node = parse_doc(source);
+    let analyzed = relon_analyzer::analyze(&node);
+    let mismatches: Vec<_> = analyzed
+        .diagnostics
+        .iter()
+        .filter(|d| matches!(d, relon_analyzer::Diagnostic::StaticTypeMismatch { .. }))
+        .collect();
+    assert!(mismatches.is_empty(), "{:?}", analyzed.diagnostics);
+}
+
+#[test]
+fn v17_tuple_runtime_arity_mismatch() {
+    // v1.7 e2e: runtime tuple check enforces arity. A 3-element
+    // literal in a `(Int, String)` slot raises a `TypeMismatch` at
+    // eval time (the analyzer also flags it statically — this test
+    // exercises the runtime path independently).
+    let source = r#"{ (Int, String) pair: [1, "two", 3] }"#;
+    let result = eval_doc(source);
+    assert!(
+        matches!(
+            result,
+            Err(RuntimeError::TypeMismatch { ref expected, .. })
+                if expected.starts_with("Tuple") || expected.contains('(')
+        ),
+        "expected tuple arity TypeMismatch, got {result:?}"
+    );
+}
+
+#[test]
+fn v17_tuple_runtime_position_mismatch() {
+    // v1.7 e2e: position 1 carries the wrong type. Runtime descends
+    // into the tuple, hits the `String` slot, and reports the inner
+    // mismatch.
+    let source = r#"{ (Int, String) pair: [1, 2] }"#;
+    let result = eval_doc(source);
+    assert!(
+        matches!(result, Err(RuntimeError::TypeMismatch { .. })),
+        "expected position TypeMismatch, got {result:?}"
+    );
+}
+
+#[test]
+fn v18_tuple_position_access_runtime() {
+    // v1.8 e2e: `pair.0` and `pair.1` retrieve the typed elements
+    // of a `(Int, String)` tuple at runtime. Tuples reuse
+    // `Value::List`, so positional access goes through the
+    // existing list-index lookup.
+    let source = r#"{
+  (Int, String) pair: [42, "hello"],
+  Int first: pair.0,
+  String second: pair.1
+}"#;
+    let result = eval_doc(source).expect("eval");
+    let Value::Dict(map) = result else {
+        panic!("expected Dict");
+    };
+    assert_eq!(map.map.get("first").unwrap(), &Value::Int(42));
+    assert_eq!(
+        map.map.get("second").unwrap(),
+        &Value::String("hello".to_string())
+    );
+}
+
+#[test]
+fn v18_tuple_position_static_mismatch() {
+    // v1.8 static: `pair.0` is statically `Int`, so binding it to
+    // a `String wrong` slot raises `StaticTypeMismatch` at the
+    // analyzer level — pre-v1.8 the walker dropped the index
+    // segment and `pair` typed as `Tuple`, masking the mismatch.
+    let source = r#"{
+  (Int, String) pair: [42, "hello"],
+  String wrong: pair.0
+}"#;
+    let node = parse_doc(source);
+    let analyzed = relon_analyzer::analyze(&node);
+    let mismatches: Vec<_> = analyzed
+        .diagnostics
+        .iter()
+        .filter(|d| matches!(d, relon_analyzer::Diagnostic::StaticTypeMismatch { .. }))
+        .collect();
+    assert!(!mismatches.is_empty(), "{:?}", analyzed.diagnostics);
+}
+
+#[test]
+fn v17_bare_list_diagnoses_at_analyzer() {
+    // ban-bare: a `List` with no generics raises
+    // `BareGenericContainer`. The runtime would still evaluate
+    // (analyzer-side ban only); the analyzer surfaces the
+    // diagnostic.
+    let source = r#"{ List items: [1, 2, 3] }"#;
+    let node = parse_doc(source);
+    let analyzed = relon_analyzer::analyze(&node);
+    let bare: Vec<_> = analyzed
+        .diagnostics
+        .iter()
+        .filter(|d| matches!(d, relon_analyzer::Diagnostic::BareGenericContainer { type_name, .. } if type_name == "List"))
+        .collect();
+    assert!(!bare.is_empty(), "{:?}", analyzed.diagnostics);
 }

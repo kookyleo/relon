@@ -1,0 +1,3 @@
+// v1.3 reverse: untyped non-literal spread — keys unknown — silent.
+// EXPECTED: no DuplicateField (we never claim what we can't prove).
+{ src: outer_value, a: 99, ...src }

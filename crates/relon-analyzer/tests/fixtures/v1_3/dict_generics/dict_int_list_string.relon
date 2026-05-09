@@ -1,0 +1,6 @@
+// v1.3: `Dict<Int, List<String>>` parses (Int keys are dynamic, but
+// the type slot itself is well-formed).
+// EXPECTED: no diagnostics.
+{
+    Dict<Int, List<String>> rows: { row: ["a", "b"] }
+}

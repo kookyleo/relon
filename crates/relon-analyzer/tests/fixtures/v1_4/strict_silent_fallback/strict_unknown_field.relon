@@ -1,0 +1,8 @@
+// v1.4 strict: `f.unknown` walks an Order schema with no `unknown`
+// field — strict reports UnknownReferenceType pinned on the failing
+// segment, with the full dotted path.
+// EXPECTED: 1 × UnknownReferenceType (name="unknown", path=["f","unknown"]).
+#strict
+#schema Order { Int id: *, Float total: * }
+#main(Order f) -> Dict<String, Int>
+{ x: f.unknown }

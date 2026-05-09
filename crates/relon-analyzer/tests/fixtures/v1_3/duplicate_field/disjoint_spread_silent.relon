@@ -1,0 +1,3 @@
+// v1.3 reverse: spread keys are disjoint from named — silent.
+// EXPECTED: no diagnostics.
+{ ...{ a: 1 }, b: 2, c: 3 }

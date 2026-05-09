@@ -1,0 +1,4 @@
+// v1.3a: variant constructor at root uses `n`.
+// EXPECTED: no diagnostics — Result.Ok with n is a valid variant.
+#main(Int n) -> Result<Int, String>
+Result.Ok { value: n }

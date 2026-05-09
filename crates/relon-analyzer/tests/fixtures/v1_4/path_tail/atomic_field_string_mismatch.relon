@@ -1,0 +1,5 @@
+// v1.4 path-tail: `o.id` infers Int, but the declared return is String.
+// EXPECTED: 1 × MainReturnTypeMismatch (expected String, found Int).
+#schema Order { Int id: *, Float total: * }
+#main(Order o) -> String
+o.id

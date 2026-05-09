@@ -1,0 +1,5 @@
+// v1.3 reverse: typed dynamic key `[<String> k]` is silent under
+// strict mode.
+// EXPECTED: no diagnostics.
+#strict
+{ k: "key", [<String> k]: 1 }

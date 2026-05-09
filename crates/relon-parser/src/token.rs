@@ -477,6 +477,12 @@ pub fn is_builtin_type_name(name: &str) -> bool {
             | "Closure"
             | "Fn"
             | "Enum"
+            // v1.7: tuple types `(T1, T2, ...)` are encoded internally
+            // as a single-segment path `Tuple` whose `generics` carry
+            // the element types in order. Reserved as a builtin name
+            // so a user-declared `#schema Tuple { ... }` doesn't
+            // shadow the encoding.
+            | "Tuple"
     )
 }
 

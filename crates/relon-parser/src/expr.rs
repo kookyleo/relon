@@ -476,9 +476,162 @@ fn parse_variant_field<'a>(input: &mut Span<'a>) -> ModalResult<(String, crate::
     Ok((name, ty))
 }
 
+/// v1.7 helper: parse a tuple-type literal at the current position.
+///
+/// Returns `Ok(Some(TypeNode))` when the input starts with `(`:
+/// - `()` — unit tuple (0 elements)
+/// - `(T,)` — 1-tuple (mandatory trailing comma)
+/// - `(T1, T2, ...)` — N-tuple
+/// - `(T)` — parenthesized type, returned as the inner `T` directly
+///   (Rust's tuple-literal convention: a single `(T)` is just `T`).
+///
+/// Returns `Ok(None)` when the input doesn't start with `(`. On parse
+/// failure mid-tuple (e.g. an unterminated `(T1, T2`) the input is
+/// reset and `Ok(None)` is returned so the caller can fall back to
+/// the bare-identifier branch.
+fn parse_tuple_type<'a>(input: &mut Span<'a>) -> ModalResult<Option<crate::TypeNode>> {
+    let outer = input.checkpoint();
+    let outer_start = input.location();
+    if (soc0, "(", soc0).parse_next(input).is_err() {
+        // The leading whitespace + `(` lookahead failed. `soc0` may
+        // have consumed bytes before the `(` literal mismatched, so
+        // restore the cursor before bailing.
+        input.reset(&outer);
+        return Ok(None);
+    }
+    // Empty tuple `()` — unit.
+    if winnow::token::literal::<_, _, winnow::error::ContextError>(")")
+        .parse_next(input)
+        .is_ok()
+    {
+        let end_offset = input.location();
+        return Ok(Some(crate::TypeNode {
+            path: vec!["Tuple".to_string()],
+            generics: Vec::new(),
+            is_optional: false,
+            range: create_range(input, outer_start, end_offset),
+            variant_fields: None,
+            doc_comment: None,
+        }));
+    }
+    // Parse first inner type.
+    let first = match parse_type_node.parse_next(input) {
+        Ok(t) => t,
+        Err(_) => {
+            input.reset(&outer);
+            return Ok(None);
+        }
+    };
+    // Consume `,` deliberately so we can tell `(T)` from `(T,)`.
+    let saw_comma = (soc0, ",", soc0).parse_next(input).is_ok();
+    if !saw_comma {
+        // `(T)` — *not* a tuple (single elem, no trailing comma) and
+        // *not* something `parse_type_node` should claim. v1.7 reserves
+        // parenthesized type-expression syntax for actual tuples; a
+        // parenthesized single type is rejected here so callers (e.g.
+        // method-shorthand `f(x):` in dict-key position) can keep
+        // their own meaning for `(...)`. Reset and bail out — the
+        // caller falls back to the bare-identifier branch.
+        input.reset(&outer);
+        return Ok(None);
+    }
+    // We had a comma; collect remaining elements until `)`.
+    let mut elems = vec![first];
+    // Accept either `(T,)` (immediate close after comma) or
+    // additional elements separated by `,`.
+    if winnow::token::literal::<_, _, winnow::error::ContextError>(")")
+        .parse_next(input)
+        .is_ok()
+    {
+        let end_offset = input.location();
+        return Ok(Some(crate::TypeNode {
+            path: vec!["Tuple".to_string()],
+            generics: elems,
+            is_optional: false,
+            range: create_range(input, outer_start, end_offset),
+            variant_fields: None,
+            doc_comment: None,
+        }));
+    }
+    // Continue with the rest of the comma-separated list. Between any
+    // two elements we *require* a separating `,` — `(Int, String Bool)`
+    // is a parse error, not a 3-tuple. The trailing comma before `)`
+    // is optional.
+    loop {
+        let next = match parse_type_node.parse_next(input) {
+            Ok(t) => t,
+            Err(_) => {
+                input.reset(&outer);
+                return Ok(None);
+            }
+        };
+        elems.push(next);
+        // Eat optional whitespace, then look for either `)` (terminator)
+        // or `,` (next element separator). Anything else is malformed
+        // and we backtrack to the outer caller — that prevents
+        // `(Int, String Bool)` from silently parsing as `(Int, String,
+        // Bool)`.
+        let _ = soc0.parse_next(input);
+        if winnow::token::literal::<_, _, winnow::error::ContextError>(")")
+            .parse_next(input)
+            .is_ok()
+        {
+            break;
+        }
+        if (",", soc0).parse_next(input).is_err() {
+            input.reset(&outer);
+            return Ok(None);
+        }
+        // After the separator, also accept `,)` — a trailing comma
+        // before `)` is allowed.
+        if winnow::token::literal::<_, _, winnow::error::ContextError>(")")
+            .parse_next(input)
+            .is_ok()
+        {
+            break;
+        }
+    }
+    let end_offset = input.location();
+    Ok(Some(crate::TypeNode {
+        path: vec!["Tuple".to_string()],
+        generics: elems,
+        is_optional: false,
+        range: create_range(input, outer_start, end_offset),
+        variant_fields: None,
+        doc_comment: None,
+    }))
+}
+
 pub fn parse_type_node<'a>(input: &mut Span<'a>) -> ModalResult<crate::TypeNode> {
     let doc_comment = crate::parse_leading_comments(input)?;
     let start_offset = input.location();
+
+    // v1.7: tuple type literal `(T1, T2, ...)` / `(T,)` / `()`.
+    // Encoded as `TypeNode { path: ["Tuple"], generics: [T1, T2, ...] }`
+    // so the rest of the pipeline reuses the standard generic plumbing.
+    //
+    // Disambiguation rules:
+    // - `()` → 0-tuple (unit)
+    // - `(T,)` (mandatory trailing comma) → 1-tuple
+    // - `(T1, T2, ...)` → N-tuple
+    // - `(T)` → parenthesized type (just `T`, optional `?` suffix
+    //   applies after the paren). Matches Rust's tuple convention.
+    if let Some(t) = parse_tuple_type(input)? {
+        let mut t = t;
+        // The standalone `(...)` form may be followed by `?` to mark
+        // the tuple itself as optional. The helper already swallowed
+        // the closing paren; pick up the optional-marker here.
+        if opt("?").parse_next(input)?.is_some() {
+            t.is_optional = true;
+        }
+        // Refresh the doc_comment and range to anchor on the outer
+        // start offset so error labels point at the user-visible
+        // tuple opener.
+        t.doc_comment = doc_comment;
+        let end_offset = input.location();
+        t.range = create_range(input, start_offset, end_offset);
+        return Ok(t);
+    }
 
     let first_part = alt((
         crate::id::id.map(|i| i.0),
@@ -805,6 +958,46 @@ mod tests {
             *parse_atomic(&mut s).unwrap().expr,
             Expr::String(_)
         ));
+    }
+
+    /// v1.8+ regression: tuple-type parser must demand a `,` between
+    /// every two elements. Pre-fix `(Int, String Bool)` was silently
+    /// accepted as `(Int, String, Bool)` because the inter-element
+    /// separator was `opt(",")`.
+    #[test]
+    fn parse_tuple_type_requires_comma_between_elems() {
+        let mut s = Span::new("(Int, String Bool)");
+        // The full source is wrapped in a dict-typed binding so the
+        // type-node parse failure propagates to the dict pair (which
+        // is the user-visible reporting boundary).
+        let result = parse_type_node(&mut s);
+        // We expect either an outright parser error or a partial parse
+        // that doesn't consume `Bool` — i.e. the input must NOT silently
+        // accept the missing comma as a 3-tuple.
+        if let Ok(t) = result {
+            assert!(
+                t.path != ["Tuple"] || t.generics.len() != 3,
+                "missing-comma `(Int, String Bool)` was silently accepted as 3-tuple",
+            );
+        }
+    }
+
+    /// v1.8+ regression boundary: a well-formed 3-tuple still parses.
+    #[test]
+    fn parse_tuple_type_three_elems_with_commas_ok() {
+        let mut s = Span::new("(Int, String, Bool)");
+        let t = parse_type_node(&mut s).expect("well-formed 3-tuple should parse");
+        assert_eq!(t.path, vec!["Tuple".to_string()]);
+        assert_eq!(t.generics.len(), 3);
+    }
+
+    /// v1.8+ regression boundary: trailing comma before `)` remains
+    /// allowed (`(Int, String,)` is still a 2-tuple).
+    #[test]
+    fn parse_tuple_type_trailing_comma_two_elems_ok() {
+        let mut s = Span::new("(Int, String,)");
+        let t = parse_type_node(&mut s).expect("trailing-comma 2-tuple should parse");
+        assert_eq!(t.generics.len(), 2);
     }
 
     #[test]

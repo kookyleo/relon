@@ -1,0 +1,5 @@
+// v1.3a: dict root body uses #main param `n`. Type-hint on the dict
+// field passes through inference.
+// EXPECTED: no diagnostics.
+#main(Int n) -> Dict<String, Int>
+{ result: n + 1 }

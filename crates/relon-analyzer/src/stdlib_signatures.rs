@@ -6,15 +6,28 @@
 //! `typecheck.rs::tests`) compares this table against the evaluator's
 //! registered names and fails if any name lacks a signature.
 //!
-//! v1 deliberately models polymorphic fns conservatively:
-//! - `len` / `type` accept `Any`; their precise `String∣List∣Dict` union
-//!   is not modeled because we have no union shape in `InferredType`
-//!   yet. Returns `Int` / `String` respectively.
-//! - `_list_*` / `_math_*` polymorphics return `Any` (no generic
-//!   instantiation in v1).
-//! - `_dict_merge` is variadic over `Dict`.
-//! - Validators (`ensure.*`) accept the value as `Any`, return `Any`,
-//!   and treat the trailing `message` arg as `optional: true`.
+//! v1.6 ban-Any policy: every stdlib position that previously declared
+//! `Any` as its parameter or return type is now expressed via an
+//! *unbound generic placeholder*. Single-arg accept-anything fns (e.g.
+//! `len(value)`) declare a single `<T>` placeholder; pass-through
+//! validators (e.g. `ensure.int(value, message?)`) declare `<T>` and
+//! return `T` so the caller's typed binding picks up the original
+//! arg's type. The placeholder is bound at the call site by
+//! `crates/relon-analyzer/src/generics.rs::collect_bindings` and
+//! substituted into the return slot via
+//! `crates/relon-analyzer/src/sig.rs::instantiate`.
+//!
+//! Concretely:
+//! - `len` / `_len` / `type` accept `<T>(T) -> Int|String` — the
+//!   placeholder doesn't constrain the arg (Relon has no trait bounds
+//!   yet) but keeps `Any` out of the language surface.
+//! - `_string_join` accepts `<T>(List<T>, String) -> String`.
+//! - `_dict_*` operate on `<V>(Dict<String, V>, ...) -> ...`, returning
+//!   `List<V>` / preserved `Dict<String, V>` shape where applicable.
+//! - `ensure.*` validators bind `<T>` from the value arg and return
+//!   `T` — strictly more informative than the previous `Any` return.
+//! - `_dict_merge` is variadic over `Dict<String, V>` (one V across
+//!   every Dict).
 
 use crate::sig::{type_node_generic, FnParam, FnSignature};
 use std::collections::HashMap;
@@ -98,12 +111,28 @@ fn build() -> HashMap<String, FnSignature> {
     let mut m = HashMap::new();
 
     // -- builtins always in scope ----------------------------------------
-    // `len(value)` — String/List/Dict → Int. Modeled as `Any` since we
-    // don't carry union types; runtime reports the shape mismatch.
-    let (k, v) = sig("len", vec![param("value", tn!(Any))], tn!(Int), None);
+    // v1.6: `len(value)` — String/List/Dict → Int. Modeled as
+    // `<T>(T) -> Int` so `Any` doesn't leak into the language surface.
+    // The unbound `T` is unconstrained (Relon has no trait bounds
+    // today), but this still beats `Any` because the placeholder is
+    // call-site bound and the runtime keeps owning the
+    // String/List/Dict shape check.
+    let (k, v) = sig_generic(
+        "len",
+        vec!["T".into()],
+        vec![param("value", tn_var("T"))],
+        tn!(Int),
+        None,
+    );
     m.insert(k, v);
     // `_len` is the alias the evaluator also registers.
-    let (k, v) = sig("_len", vec![param("value", tn!(Any))], tn!(Int), None);
+    let (k, v) = sig_generic(
+        "_len",
+        vec!["T".into()],
+        vec![param("value", tn_var("T"))],
+        tn!(Int),
+        None,
+    );
     m.insert(k, v);
 
     // `range(stop)` or `range(start, stop)` → List<Int>. v1 expresses this
@@ -118,8 +147,15 @@ fn build() -> HashMap<String, FnSignature> {
     );
     m.insert(k, v);
 
-    // `type(v)` → String. Accepts anything.
-    let (k, v) = sig("type", vec![param("value", tn!(Any))], tn!(String), None);
+    // v1.6: `type(v)` → String. Same treatment as `len` — accepts any
+    // `<T>` without committing to `Any`.
+    let (k, v) = sig_generic(
+        "type",
+        vec!["T".into()],
+        vec![param("value", tn_var("T"))],
+        tn!(String),
+        None,
+    );
     m.insert(k, v);
 
     // -- list intrinsics (polymorphic; v1.1 generics) -----------------
@@ -203,10 +239,17 @@ fn build() -> HashMap<String, FnSignature> {
         None,
     );
     m.insert(k, v);
-    let (k, v) = sig(
+    // v1.6: `_string_join<T>(List<T>, String) -> String` — the runtime
+    // calls `Display`-equivalent on each element; the analyzer doesn't
+    // model that constraint, so the placeholder is unbound. Still
+    // strictly better than `List<Any>`: `_string_join([1,2], ",")`
+    // binds `T → Int` in the return-type pipeline (no behavioral
+    // change since the return type is `String`, but uniformly clean).
+    let (k, v) = sig_generic(
         "_string_join",
+        vec!["T".into()],
         vec![
-            param("list", type_node_generic("List", vec![tn!(Any)])),
+            param("list", type_node_generic("List", vec![tn_var("T")])),
             param("sep", tn!(String)),
         ],
         tn!(String),
@@ -247,43 +290,57 @@ fn build() -> HashMap<String, FnSignature> {
     m.insert(k, v);
 
     // -- dict intrinsics ------------------------------------------------
-    // `_dict_merge` — at least one Dict; merges any number of trailing
-    // Dict arguments into the first. v1 models this as 1 fixed Dict param
-    // + Dict variadic_tail.
-    let (k, v) = sig(
+    // v1.6: `_dict_merge<V>(Dict<String, V>, ...Dict<String, V>) ->
+    // Dict<String, V>`. One placeholder across every Dict — the
+    // unifier collects bindings from each arg's value type, joining
+    // them when the arg infers concretely. Mixed-V calls
+    // (`_dict_merge({a: 1}, {b: "x"})`) end up with `V → Any` after
+    // join, equivalent to the v1.5 behavior; uniform-V calls
+    // (`_dict_merge({a: 1}, {b: 2})`) bind `V → Int` and let the
+    // caller's typed slot pick that up.
+    let (k, v) = sig_generic(
         "_dict_merge",
+        vec!["V".into()],
         vec![param(
             "base",
-            type_node_generic("Dict", vec![tn!(String), tn!(Any)]),
+            type_node_generic("Dict", vec![tn!(String), tn_var("V")]),
         )],
-        type_node_generic("Dict", vec![tn!(String), tn!(Any)]),
-        Some(type_node_generic("Dict", vec![tn!(String), tn!(Any)])),
+        type_node_generic("Dict", vec![tn!(String), tn_var("V")]),
+        Some(type_node_generic("Dict", vec![tn!(String), tn_var("V")])),
     );
     m.insert(k, v);
-    let (k, v) = sig(
+    let (k, v) = sig_generic(
         "_dict_keys",
+        vec!["V".into()],
         vec![param(
             "d",
-            type_node_generic("Dict", vec![tn!(String), tn!(Any)]),
+            type_node_generic("Dict", vec![tn!(String), tn_var("V")]),
         )],
         type_node_generic("List", vec![tn!(String)]),
         None,
     );
     m.insert(k, v);
-    let (k, v) = sig(
+    // v1.6: `_dict_values<V>(Dict<String, V>) -> List<V>` — the value
+    // type now flows from input to output. Previously `List<Any>`.
+    let (k, v) = sig_generic(
         "_dict_values",
+        vec!["V".into()],
         vec![param(
             "d",
-            type_node_generic("Dict", vec![tn!(String), tn!(Any)]),
+            type_node_generic("Dict", vec![tn!(String), tn_var("V")]),
         )],
-        type_node_generic("List", vec![tn!(Any)]),
+        type_node_generic("List", vec![tn_var("V")]),
         None,
     );
     m.insert(k, v);
-    let (k, v) = sig(
+    let (k, v) = sig_generic(
         "_dict_has_key",
+        vec!["V".into()],
         vec![
-            param("d", type_node_generic("Dict", vec![tn!(String), tn!(Any)])),
+            param(
+                "d",
+                type_node_generic("Dict", vec![tn!(String), tn_var("V")]),
+            ),
             param("key", tn!(String)),
         ],
         tn!(Bool),
@@ -291,11 +348,7 @@ fn build() -> HashMap<String, FnSignature> {
     );
     m.insert(k, v);
 
-    // -- math intrinsics (polymorphic Number; return Any in v1) ----------
-    // `_math_abs(n)` — Number → Number. v1 accepts Any to avoid false
-    // flagging on `Int` (where `Number` subsumption already holds, but
-    // the param check uses `subsumes_with` which wouldn't recognize a
-    // declared `Number` slot accepting an `Int` literal as wrong).
+    // -- math intrinsics (Number-typed; no Any leak) --------------------
     let (k, v) = sig(
         "_math_abs",
         vec![param("n", tn!(Number))],
@@ -330,10 +383,19 @@ fn build() -> HashMap<String, FnSignature> {
     m.insert(k, v);
 
     // -- ensure.* validators --------------------------------------------
-    // All `ensure.*` validators take the value first, then their
-    // type-specific args, then an optional trailing `message: String`.
-    // Return the value unchanged (v1 models as Any for simplicity).
-    let value_param = || param("value", tn!(Any));
+    // v1.6: every validator binds `<T>` from the value arg and
+    // returns `T`. Pre-v1.6 the return type was `Any`, which
+    // collapsed information at the typed binding site
+    // (`Int n: ensure.int(x)` lost the `Int` brand because `Any`
+    // subsumed it). Now `T` round-trips: `ensure.int(7)` returns
+    // `Int`, and the caller's slot stays sharp.
+    let value_param_t = || param("value", tn_var("T"));
+    let value_param_d = || {
+        param(
+            "dict",
+            type_node_generic("Dict", vec![tn!(String), tn_var("V")]),
+        )
+    };
     let msg_param = || param_opt("message", tn!(String));
 
     for tname in [
@@ -344,77 +406,85 @@ fn build() -> HashMap<String, FnSignature> {
         "ensure.list",
         "ensure.dict",
     ] {
-        let (k, v) = sig(tname, vec![value_param(), msg_param()], tn!(Any), None);
+        let (k, v) = sig_generic(
+            tname,
+            vec!["T".into()],
+            vec![value_param_t(), msg_param()],
+            tn_var("T"),
+            None,
+        );
         m.insert(k, v);
     }
 
-    // `ensure.at_least(value, min, message?)`.
-    let (k, v) = sig(
+    // `ensure.at_least(value, min, message?)` — bound: `<T>`.
+    let (k, v) = sig_generic(
         "ensure.at_least",
-        vec![value_param(), param("min", tn!(Number)), msg_param()],
-        tn!(Any),
+        vec!["T".into()],
+        vec![value_param_t(), param("min", tn!(Number)), msg_param()],
+        tn_var("T"),
         None,
     );
     m.insert(k, v);
-    let (k, v) = sig(
+    let (k, v) = sig_generic(
         "ensure.at_most",
-        vec![value_param(), param("max", tn!(Number)), msg_param()],
-        tn!(Any),
+        vec!["T".into()],
+        vec![value_param_t(), param("max", tn!(Number)), msg_param()],
+        tn_var("T"),
         None,
     );
     m.insert(k, v);
-    let (k, v) = sig(
+    // `ensure.one_of<T>(value, List<T>, message?)` — `T` flows from
+    // either the value arg (single placeholder) or the list arg's
+    // element type. The unifier joins the two; mismatched calls
+    // (`ensure.one_of(1, ["a", "b"])`) collapse to `T → Any` (after
+    // join) and behave like the v1.5 pre-strict path.
+    let (k, v) = sig_generic(
         "ensure.one_of",
+        vec!["T".into()],
         vec![
-            value_param(),
-            param("allowed", type_node_generic("List", vec![tn!(Any)])),
+            value_param_t(),
+            param("allowed", type_node_generic("List", vec![tn_var("T")])),
             msg_param(),
         ],
-        tn!(Any),
+        tn_var("T"),
         None,
     );
     m.insert(k, v);
-    let (k, v) = sig(
+    let (k, v) = sig_generic(
         "ensure.required_fields",
+        vec!["V".into()],
         vec![
-            param(
-                "dict",
-                type_node_generic("Dict", vec![tn!(String), tn!(Any)]),
-            ),
+            value_param_d(),
             param("fields", type_node_generic("List", vec![tn!(String)])),
             msg_param(),
         ],
-        type_node_generic("Dict", vec![tn!(String), tn!(Any)]),
+        type_node_generic("Dict", vec![tn!(String), tn_var("V")]),
         None,
     );
     m.insert(k, v);
-    let (k, v) = sig(
+    let (k, v) = sig_generic(
         "ensure.requires",
+        vec!["V".into()],
         vec![
-            param(
-                "dict",
-                type_node_generic("Dict", vec![tn!(String), tn!(Any)]),
-            ),
+            value_param_d(),
             param("field", tn!(String)),
             param("required", tn!(String)),
             msg_param(),
         ],
-        type_node_generic("Dict", vec![tn!(String), tn!(Any)]),
+        type_node_generic("Dict", vec![tn!(String), tn_var("V")]),
         None,
     );
     m.insert(k, v);
-    let (k, v) = sig(
+    let (k, v) = sig_generic(
         "ensure.fields_equal",
+        vec!["V".into()],
         vec![
-            param(
-                "dict",
-                type_node_generic("Dict", vec![tn!(String), tn!(Any)]),
-            ),
+            value_param_d(),
             param("left", tn!(String)),
             param("right", tn!(String)),
             msg_param(),
         ],
-        type_node_generic("Dict", vec![tn!(String), tn!(Any)]),
+        type_node_generic("Dict", vec![tn!(String), tn_var("V")]),
         None,
     );
     m.insert(k, v);

@@ -449,6 +449,26 @@ impl Evaluator {
             .ok_or_else(|| RuntimeError::NoMainSignature { range: root.range })?;
         let scope = self.prepare_root_scope(scope, &root)?;
 
+        // v1.8+ fix (issue 1): apply root-level `#import` directives
+        // *before* main-arg type-checking so a `#main(pkg.Schema u)`
+        // signature can be validated against the imported alias.
+        // Pre-fix `apply_directive_pre` for `#import` ran inside the
+        // main `eval(root)` call (after args were already type-checked
+        // and bound), so `pkg` wasn't in scope when `check_type` tried
+        // to resolve the param's type — the analyzer let `lib.User u`
+        // through but the runtime errored with `Variable not found:
+        // lib`. We mirror the same `apply_directive_pre` walk the
+        // evaluator does at the start of `eval()`, but only for
+        // root-level directives. Bare `#schema` overrides are
+        // surfaced as the entry's value (matching `eval_root`).
+        let mut current_scope = scope.clone();
+        for dir in &root.directives {
+            if let Some(override_val) = self.apply_directive_pre(dir, &root, &mut current_scope)? {
+                return Ok(override_val);
+            }
+        }
+        let scope = current_scope;
+
         // Schema scope: root-level `#schema A Body` declarations must be
         // visible before we type-check arguments referring to them, and
         // dict-field `#schema X: {...}` schemas likewise. Both seedings
@@ -556,13 +576,22 @@ impl Evaluator {
             scope.locals.lock().unwrap().insert(
                 decl.name.clone(),
                 Value::Schema {
-                    generics: Vec::new(),
+                    // v1.8+ fix (issue 4): the placeholder uses the
+                    // real generic param names so a recursive body
+                    // referring to `Box<T>` already sees the right
+                    // shape during predicate building.
+                    generics: decl.generics.clone(),
                     fields: HashMap::new(),
                 },
             );
             let (lowered, _diags) = relon_analyzer::lower_schema_pure(
                 Some(decl.name.clone()),
-                Vec::new(),
+                // v1.8+ fix (issue 4): forward the directive's
+                // generic param names so the lowered `SchemaDef`
+                // carries them. Pre-fix this passed `Vec::new()`,
+                // dropping the generics entirely — `Box<Int>` then
+                // had no `T` to substitute against.
+                decl.generics.clone(),
                 decl.schema_node.as_ref(),
             );
             let Some(def) = lowered else {
@@ -1425,7 +1454,57 @@ impl Evaluator {
             root_ref: Some(crate::scope::RootRef::new(Arc::clone(&node_arc))),
             ..Default::default()
         });
-        let evaluated = self.eval(&node_arc, &module_scope)?;
+        let mut evaluated = self.eval(&node_arc, &module_scope)?;
+        // v1.8+ fix (issue 1): expose the lib's root-level `#schema X
+        // { ... }` declarations as fields on the evaluated module so
+        // `#main(lib.X u)` (alias-form import) can resolve `X`
+        // through the module's value at type-check time. Pre-fix the
+        // module value was just the dict body — `lib.User` failed
+        // with `Variable not found: lib.User` even after `lib` was
+        // bound, because `lib` had no `User` field. We only inject
+        // when the body is itself a Dict; non-dict module bodies
+        // (atomic root, list, ...) don't have a natural place to
+        // hang named schemas, so cross-module schema reference
+        // through them stays unsupported.
+        if let Value::Dict(ref mut d) = evaluated {
+            if let Some(ws) = &self.context.workspace {
+                if let Some(tree) = ws.modules.get(&source.canonical_id) {
+                    if !tree.root_schemas.is_empty() {
+                        // Build each schema value the same way
+                        // `seed_root_schemas` does, then merge into
+                        // the dict map. Existing dict fields win on
+                        // collision (the user's data takes
+                        // precedence over the schema name).
+                        let d_mut = Arc::make_mut(d);
+                        for decl in &tree.root_schemas {
+                            if d_mut.map.contains_key(&decl.name) {
+                                continue;
+                            }
+                            let (lowered, _diags) = relon_analyzer::lower_schema_pure(
+                                Some(decl.name.clone()),
+                                // v1.8+ fix (issue 4): forward the
+                                // generics so a `lib.Box<Int>` lookup
+                                // can substitute T → Int through the
+                                // module-injected `Value::Schema`.
+                                decl.generics.clone(),
+                                decl.schema_node.as_ref(),
+                            );
+                            let Some(def) = lowered else { continue };
+                            let value = if !def.variants.is_empty() {
+                                self.build_root_enum_schema(&def)
+                            } else {
+                                let fields = self.build_schema_from_def(&def, &module_scope)?;
+                                Value::Schema {
+                                    generics: def.generics.clone(),
+                                    fields,
+                                }
+                            };
+                            d_mut.map.insert(decl.name.clone(), value);
+                        }
+                    }
+                }
+            }
+        }
         self.context
             .module_cache
             .lock()

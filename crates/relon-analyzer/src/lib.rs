@@ -16,6 +16,7 @@
 //! the AST itself stays immutable and consumers (evaluator, LSP, lint)
 //! pick up just the side-tables they need.
 
+pub(crate) mod ban_unsafe_types;
 pub mod cap;
 pub(crate) mod capability_check;
 pub(crate) mod const_fold;
@@ -56,6 +57,50 @@ pub use workspace::{
 use relon_parser::Node;
 use std::collections::{HashMap, HashSet};
 
+/// True when `root` declares a bare `#strict` directive on its
+/// directive stack. Used by [`analyze_with_options`] to enable strict
+/// mode whenever the root opts in directly, regardless of whether the
+/// caller forwarded a strict workspace flag.
+pub(crate) fn has_strict_directive(root: &Node) -> bool {
+    root.directives
+        .iter()
+        .any(|d| d.name == directive_names::STRICT)
+}
+
+/// v1.8 (C4 audit): walk every host-registered FnSignature and emit
+/// the same `ExplicitAnyForbidden` / `BareGenericContainer`
+/// diagnostics the user-source ban-walker fires. Without this a host
+/// could ship `register_fn("foo", fn_of_signature("foo", &[Any], Any))`
+/// and re-open the back-door v1.6 / v1.7 closed for user source.
+///
+/// Diagnostics carry `host fn '{name}' parameter '{param}'` /
+/// `host fn '{name}' return type` / `host fn '{name}' variadic
+/// tail` as context so the operator knows which host integration to
+/// fix.
+fn audit_host_fn_signatures(tree: &mut AnalyzedTree) {
+    let sigs: Vec<(String, FnSignature)> = tree
+        .host_fn_signatures
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    for (fn_name, sig) in sigs {
+        for param in &sig.params {
+            let context = format!("host fn '{}' parameter '{}'", fn_name, param.name);
+            ban_unsafe_types::scan_typenode_for_any(&param.ty, &context, &mut tree.diagnostics);
+        }
+        let ret_context = format!("host fn '{}' return type", fn_name);
+        ban_unsafe_types::scan_typenode_for_any(
+            &sig.return_type,
+            &ret_context,
+            &mut tree.diagnostics,
+        );
+        if let Some(tail) = &sig.variadic_tail {
+            let tail_context = format!("host fn '{}' variadic tail", fn_name);
+            ban_unsafe_types::scan_typenode_for_any(tail, &tail_context, &mut tree.diagnostics);
+        }
+    }
+}
+
 /// Run every analyzer pass over `root` and return the aggregated tree.
 ///
 /// Errors are collected into [`AnalyzedTree::diagnostics`] rather than
@@ -82,6 +127,21 @@ pub fn analyze_with_options(root: &Node, options: &AnalyzeOptions) -> AnalyzedTr
     tree.host_fn_signatures = options.host_fn_signatures.clone();
     tree.host_fn_gates = options.host_fn_gates.clone();
     tree.caps = options.caps.clone();
+    // v1.8 (C4 audit): every host-supplied signature is part of the
+    // language surface — its parameter / return / variadic types are
+    // visible to user source through stdlib-style resolution. Run the
+    // same `Any` / bare-generic ban over them so a host that shipped
+    // `register_fn` with `Any`-typed params can't silently re-open
+    // the v1.6 / v1.7 back-doors. Diagnostics carry a `host fn`
+    // context so the user can pinpoint which host integration is
+    // misconfigured.
+    audit_host_fn_signatures(&mut tree);
+    // v1.3: strict mode is the OR of (caller-supplied option) ∨ (root's
+    // own `#strict` directive). The OR is what makes the workspace
+    // post-pass's contagion rule work — a non-strict library imported
+    // by a strict entry inherits the bit through `options.strict_mode`,
+    // while a single-file source can still opt in via the directive.
+    tree.strict_mode = options.strict_mode || has_strict_directive(root);
     schema::collect_schemas(root, &mut tree);
     // Root-level `#schema A Body` directives must run after
     // `collect_schemas` so the dual-declaration collision check has the
@@ -110,6 +170,15 @@ pub fn analyze_with_options(root: &Node, options: &AnalyzeOptions) -> AnalyzedTr
 /// allowlist of native fn names that should not be flagged as
 /// `UnresolvedReference` when used as a free variable in a closure
 /// body.
+///
+/// v1.3 adds `strict_mode`: when set, every value must be statically
+/// inferable; sites that the analyzer would otherwise silently fall
+/// back on (uninferrable spread sources, dynamic keys without a `<T>`
+/// type hint, native fn returns whose signature isn't visible) become
+/// errors instead. Strict mode is *contagious* across `#import`s — the
+/// workspace pass propagates it from the entry to every reachable
+/// module so a strict entry can't inherit a non-strict library that
+/// silently leaks `Any` types.
 #[derive(Debug, Default, Clone)]
 pub struct AnalyzeOptions {
     /// Names registered with the host's `Context::functions`. Empty by
@@ -135,4 +204,11 @@ pub struct AnalyzeOptions {
     /// check to decide whether a gated fn would be denied at runtime.
     /// Defaults to zero-trust — same as the evaluator default.
     pub caps: cap::Capabilities,
+    /// v1.3: when `true`, the analyzer demands a static type for every
+    /// value. Sites that previously fell back to `Any` produce error-
+    /// severity diagnostics describing what couldn't be inferred. Set
+    /// from the entry's `#strict` directive by the workspace pass and
+    /// propagated to every reachable module so a strict entry can't
+    /// inherit silent fallbacks from a non-strict library.
+    pub strict_mode: bool,
 }

@@ -1,0 +1,9 @@
+// v1.4 spread extension: `...o.extras` — the spread source is a path
+// chain whose tail-walk lands on a schema (`Extras`). Strict mode
+// accepts it without an explicit `<T>` hint.
+// EXPECTED: no MissingSpreadTypeHint.
+#strict
+#schema Extras { Int a: *, Int b: * }
+#schema Order { Extras extras: *, Int id: * }
+#main(Order o) -> Dict<String, Int>
+{ id: o.id, ...o.extras }

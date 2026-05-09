@@ -1,0 +1,4 @@
+// v1.3 forward: strict mode rejects an untyped non-literal spread.
+// EXPECTED: 1 × MissingSpreadTypeHint.
+#strict
+{ src: 1 + 2, val: { ...src } }

@@ -1,0 +1,4 @@
+// v1.3 forward: typed spread whose schema isn't declared.
+// EXPECTED: 1 × UnresolvedSchema { name = "Mystery" }.
+#strict
+{ src: 1, val: { ...<Mystery> src } }

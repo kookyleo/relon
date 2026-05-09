@@ -86,6 +86,12 @@ pub struct AnalyzedTree {
     /// [`crate::sig::lookup_signature`] to resolve calls to closure
     /// signatures from `#import`ed modules.
     pub workspace_import_index: Option<WorkspaceImportIndex>,
+    /// v1.3: when `true`, this module was analyzed under strict mode.
+    /// Either the module declared `#strict` directly, or the workspace
+    /// pass propagated the flag from a strict entry's `#import` graph
+    /// (transitive). Drives the analyzer's no-silent-fallback policy
+    /// during inference.
+    pub strict_mode: bool,
 }
 
 impl AnalyzedTree {

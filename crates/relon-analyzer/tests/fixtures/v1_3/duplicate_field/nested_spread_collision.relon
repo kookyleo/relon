@@ -1,0 +1,5 @@
+// v1.3: a nested dict (inside a sibling field) has its own spread
+// collision. The walker recurses into nested dicts, so the inner
+// duplicate fires too.
+// EXPECTED: 1 × DuplicateField on the inner dict's `x`.
+{ outer: { ...{ x: 1 }, ...{ x: 2 } } }

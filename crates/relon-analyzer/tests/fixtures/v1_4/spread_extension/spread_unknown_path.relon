@@ -1,0 +1,10 @@
+// v1.4 spread extension reverse: `...o.unknown` — path-tail walk
+// fails (unknown field on Order). Strict mode prefers the more
+// specific `UnknownReferenceType` over the generic
+// `MissingSpreadTypeHint`, but at minimum reports the failure.
+// EXPECTED: ≥ 1 × UnknownReferenceType (not just MissingSpreadTypeHint).
+#strict
+#schema Extras { Int a: *, Int b: * }
+#schema Order { Extras extras: *, Int id: * }
+#main(Order o) -> Dict<String, Int>
+{ id: o.id, ...o.unknown }

@@ -86,6 +86,25 @@ impl Evaluator {
                     }
                     Ok(())
                 }
+                ("Tuple", Value::List(l)) => {
+                    // v1.7: a tuple is positionally-typed. The runtime
+                    // representation reuses `Value::List`, so we
+                    // length-check the list, then recurse per position
+                    // into each declared element type.
+                    let expected_arity = type_hint.generics.len();
+                    if l.len() != expected_arity {
+                        return Err(RuntimeError::TypeMismatch {
+                            expected: format_type_node(type_hint),
+                            found: format!("List of length {}", l.len()),
+                            range,
+                        });
+                    }
+                    let l_mut = Arc::make_mut(l);
+                    for (item, slot_ty) in l_mut.iter_mut().zip(type_hint.generics.iter()) {
+                        self.check_type_internal(item, slot_ty, scope, range, visited, depth + 1)?;
+                    }
+                    Ok(())
+                }
                 ("Enum", val) => {
                     // Two-pass match: cheap literal/primitive matchers
                     // first (no clone), then structural alternatives

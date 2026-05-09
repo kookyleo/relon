@@ -1,0 +1,7 @@
+// v1.4 strict reverse: a typed binding whose value is fully
+// inferable (a literal Int) — no InferenceLimit.
+// EXPECTED: 0 × InferenceLimit, 0 × UnknownReferenceType.
+#strict
+#schema Order { Int id: *, Float total: * }
+#main(Order o) -> Dict<String, Int>
+{ Int x: 42 }

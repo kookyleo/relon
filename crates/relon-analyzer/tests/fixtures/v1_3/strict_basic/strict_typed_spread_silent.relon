@@ -1,0 +1,5 @@
+// v1.3 reverse: typed spread `...<Extra> e` satisfies strict mode.
+// EXPECTED: no diagnostics.
+#strict
+#schema Extra { Int a: *, Int b: * }
+{ src: { a: 1, b: 2 }, ...<Extra> src }

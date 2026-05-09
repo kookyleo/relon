@@ -1,0 +1,5 @@
+// v1.4 path-tail: stepping into a `Dict<String, Int>` via a string key
+// produces Int, satisfying the declared Int return.
+// EXPECTED: no diagnostics.
+#main(Dict<String, Int> kv) -> Int
+kv.foo

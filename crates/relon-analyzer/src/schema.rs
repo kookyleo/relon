@@ -124,6 +124,12 @@ pub struct BaseRef {
 /// `UnknownTypeName` for heads that aren't builtins, prelude names, or
 /// declared schemas. Multi-segment heads (`pkg.Type`) are handled by the
 /// workspace-level `re_check_unknown_types` post-pass.
+///
+/// v1.6 piggyback: same walk also enforces the "no `Any` in user code"
+/// policy on schema field types. The recursive
+/// [`crate::ban_unsafe_types::scan_typenode_for_any`] helper covers nested generics
+/// like `List<Any>` / `Dict<String, Any>` — those used to be a sneaky
+/// way to launder `Any` past the surface check.
 pub fn check_schema_field_types(tree: &mut AnalyzedTree) {
     use crate::diagnostic::Diagnostic;
     let mut diagnostics: Vec<Diagnostic> = Vec::new();
@@ -136,25 +142,49 @@ pub fn check_schema_field_types(tree: &mut AnalyzedTree) {
         .chain(tree.root_schemas.iter().map(|d| d.name.clone()))
         .collect();
     for def in tree.schemas.values() {
+        // v1.8+ fix (issue 4): a generic schema like `#schema Box<T> {
+        // T value: * }` legitimately uses `T` as a field type. Pre-fix
+        // `T` wasn't in `known_names`, so the field-type walker
+        // reported `unknown type name T`. The generic parameters are
+        // schema-local, so we extend the known set per schema instead
+        // of polluting the global set.
+        let mut local_known = known_names.clone();
+        for g in &def.generics {
+            local_known.insert(g.clone());
+        }
         for field in &def.fields {
             let Some(t) = &field.type_hint else { continue };
-            if t.path.len() != 1 {
-                continue;
+            // v1.6: ban `Any` (anywhere in the type tree).
+            crate::ban_unsafe_types::scan_typenode_for_any(
+                t,
+                &format!("schema field `{}`", field.name),
+                &mut diagnostics,
+            );
+            if t.path.len() == 1 {
+                let head = &t.path[0];
+                if relon_parser::is_builtin_type_name(head) {
+                    continue;
+                }
+                if matches!(head.as_str(), "Result" | "Option") {
+                    continue;
+                }
+                if local_known.contains(head) {
+                    continue;
+                }
+                diagnostics.push(Diagnostic::UnknownTypeName {
+                    name: head.clone(),
+                    range: span_of(t.range),
+                });
+            } else if t.path.len() == 2 {
+                // v1.8+: tentative `pkg.Tail` diagnostic; cleared by
+                // `re_check_unknown_types` iff the entry's import index
+                // resolves `head` to an alias whose exports include
+                // `tail`. Otherwise the user sees the diagnostic.
+                diagnostics.push(Diagnostic::UnknownTypeName {
+                    name: format!("{}.{}", t.path[0], t.path[1]),
+                    range: span_of(t.range),
+                });
             }
-            let head = &t.path[0];
-            if relon_parser::is_builtin_type_name(head) {
-                continue;
-            }
-            if matches!(head.as_str(), "Result" | "Option") {
-                continue;
-            }
-            if known_names.contains(head) {
-                continue;
-            }
-            diagnostics.push(Diagnostic::UnknownTypeName {
-                name: head.clone(),
-                range: span_of(t.range),
-            });
         }
     }
     tree.diagnostics.extend(diagnostics);

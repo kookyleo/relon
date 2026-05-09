@@ -1,0 +1,7 @@
+// v1.4 strict reverse: a fully classified `o.id` (Int) silently passes
+// strict mode — no UnknownReferenceType.
+// EXPECTED: no UnknownReferenceType.
+#strict
+#schema Order { Int id: *, Float total: * }
+#main(Order o) -> Dict<String, Int>
+{ x: o.id }

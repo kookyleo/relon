@@ -45,6 +45,12 @@ pub struct WorkspaceTree {
     pub nodes: HashMap<String, Arc<Node>>,
     pub import_graph: HashMap<String, Vec<String>>,
     pub workspace_diagnostics: Vec<WorkspaceDiagnostic>,
+    /// v1.3: `true` when the entry module (or any caller-forwarded
+    /// `AnalyzeOptions::strict_mode`) declared strict mode. Mirrored
+    /// onto every reachable module's `AnalyzedTree::strict_mode` by
+    /// the workspace build pass so contagion is observable from a
+    /// single field.
+    pub strict_mode: bool,
 }
 
 impl WorkspaceTree {

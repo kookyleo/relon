@@ -102,6 +102,23 @@ pub(crate) fn unify(
                 unify(inner, elem, generics, bindings);
             }
         }
+        // v1.8+ fix: list literals now infer as `Tuple(...)` (v1.7
+        // change), so a `List<T>` slot needs to bind T from the
+        // tuple's element-type join. Pre-fix `_list_map([1,2,3], (n)
+        // => n + 1)` left T unbound (then defaulted to `Any`), which
+        // silently accepted any return type at the call site —
+        // analyzer missed the mismatch and runtime caught it.
+        ("List", InferredType::Tuple(elems)) => {
+            if let Some(inner) = param_ty.generics.first() {
+                if let Some(joined) = elems
+                    .iter()
+                    .cloned()
+                    .reduce(|acc, t| InferredType::join(&acc, &t))
+                {
+                    unify(inner, &joined, generics, bindings);
+                }
+            }
+        }
         ("Dict", InferredType::Dict(val)) => {
             // Dict<K, V>: keys are always String in the language, so
             // only the value slot can carry a placeholder we'd want
@@ -160,6 +177,12 @@ fn type_node_for(t: &InferredType) -> TypeNode {
         // `infer_from_type_node` would also yield `Any`, so no
         // information is lost.
         InferredType::Fn(_, _) => type_node_simple("Any"),
+        // v1.7: tuple round-trips through the `Tuple<T1, ...>`
+        // single-segment encoding the parser uses for `(T1, ...)`.
+        InferredType::Tuple(elems) => {
+            let inner: Vec<TypeNode> = elems.iter().map(type_node_for).collect();
+            type_node_generic("Tuple", inner)
+        }
     }
 }
 
@@ -246,13 +269,14 @@ pub(crate) fn collect_bindings(
         // current bindings (so `T` resolves to the type already
         // bound from pass 1).
         let mut child_locals = scope.locals.clone();
+        let imports = scope.tree.and_then(|t| t.workspace_import_index.as_ref());
         for (p_idx, cp) in params.iter().enumerate() {
             let local_ty = if let Some(hint) = &cp.type_hint {
-                infer_from_type_node(hint)
+                crate::infer::infer_from_type_node_with_imports(hint, imports)
             } else if let Some(slot) = slot_param_tys.get(p_idx) {
                 let mut sub = slot.clone();
                 crate::sig::substitute_in_type_node(&mut sub, &sig.generics, &bindings);
-                infer_from_type_node(&sub)
+                crate::infer::infer_from_type_node_with_imports(&sub, imports)
             } else {
                 InferredType::Any
             };
@@ -267,7 +291,7 @@ pub(crate) fn collect_bindings(
         // Body type: prefer an explicit `-> Ret` annotation; fall
         // back to walking the body under the child scope.
         let body_ty = if let Some(rt) = return_type {
-            infer_from_type_node(rt)
+            crate::infer::infer_from_type_node_with_imports(rt, imports)
         } else {
             infer_type(body, &child_scope).unwrap_or(InferredType::Any)
         };

@@ -1,0 +1,14 @@
+// v1.4 spread extension: `...load_extras()` — the spread source is a
+// FnCall to a sibling closure whose declared `-> Extras` return is a
+// single-segment Schema. Strict mode accepts it without an explicit
+// `<T>` hint. The closure body returns a typed binding that already
+// satisfies `Extras` so we don't conflate the spread test with a
+// closure-return-type mismatch.
+// EXPECTED: no MissingSpreadTypeHint.
+#strict
+#schema Extras { Int a: *, Int b: * }
+{
+  Extras src: { a: 1, b: 2 },
+  load_extras: () -> Extras => src,
+  ...load_extras()
+}

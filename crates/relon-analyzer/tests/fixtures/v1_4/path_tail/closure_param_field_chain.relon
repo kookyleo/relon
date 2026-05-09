@@ -1,0 +1,9 @@
+// v1.4 path-tail: a closure parameter typed as a Schema also flows
+// through path-tail walking. The body's `o.id` infers Int, matching
+// the closure's declared `-> Int` return — no
+// `StaticTypeMismatch` against the declared closure return.
+// EXPECTED: no diagnostics.
+#schema Order { Int id: *, Float total: * }
+{
+  compute: (Order o) -> Int => o.id
+}

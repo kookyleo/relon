@@ -1,0 +1,5 @@
+// v1.4 path-tail: `o.id` infers Int, matching the declared Int return.
+// EXPECTED: no diagnostics.
+#schema Order { Int id: *, Float total: * }
+#main(Order o) -> Int
+o.id

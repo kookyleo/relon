@@ -1,0 +1,5 @@
+// v1.4 path-tail: stepping into a `Dict<String, Int>` produces Int,
+// not String — the declared return is String, so a static mismatch.
+// EXPECTED: 1 × MainReturnTypeMismatch.
+#main(Dict<String, Int> kv) -> String
+kv.foo

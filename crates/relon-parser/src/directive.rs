@@ -42,6 +42,14 @@ pub const BRAND: &str = "brand";
 pub const SCHEMA: &str = "schema";
 pub const IMPORT: &str = "import";
 pub const MAIN: &str = "main";
+/// v1.3: `#strict` — bare directive at the file level enabling strict
+/// inference mode. Once present, every value must have a statically
+/// inferable type; sites that the analyzer would otherwise silently
+/// fall back on (uninferrable spread sources, dynamic keys without a
+/// type hint, references with no type, native fn returns, …) become
+/// errors. The flag is *contagious*: an entry module marked `#strict`
+/// applies the rule transitively to every reachable `#import` target.
+pub const STRICT: &str = "strict";
 
 /// Directive name → expected shape. Dispatch happens by name; unknown
 /// `#name` produces a parse error.
@@ -55,6 +63,7 @@ pub const DIRECTIVE_SHAPES: &[(&str, DirectiveShape)] = &[
     (SCHEMA, DirectiveShape::NameBody),
     (IMPORT, DirectiveShape::Import),
     (MAIN, DirectiveShape::Main),
+    (STRICT, DirectiveShape::Bare),
 ];
 
 /// Look up a directive's expected shape by name. Returns `None` for
@@ -463,5 +472,25 @@ mod tests {
     fn rejects_unknown_directive_name() {
         let mut s = Span::new("#bogus 0");
         assert!(parse_directives(&mut s).is_err());
+    }
+
+    /// v1.3 forward: bare `#strict` directive parses as a Bare body.
+    #[test]
+    fn parses_strict_directive() {
+        let mut s = Span::new("#strict");
+        let dirs = parse_directives(&mut s).unwrap();
+        assert_eq!(dirs.len(), 1);
+        assert_eq!(dirs[0].name, "strict");
+        assert!(matches!(dirs[0].body, crate::DirectiveBody::Bare));
+    }
+
+    /// v1.3: `#strict` interleaves with other directives.
+    #[test]
+    fn parses_strict_alongside_other_directives() {
+        let mut s = Span::new("#strict\n#main(Int n) -> Int");
+        let dirs = parse_directives(&mut s).unwrap();
+        assert_eq!(dirs.len(), 2);
+        assert_eq!(dirs[0].name, "strict");
+        assert_eq!(dirs[1].name, "main");
     }
 }

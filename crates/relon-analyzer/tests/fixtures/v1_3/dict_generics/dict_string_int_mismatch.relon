@@ -1,0 +1,3 @@
+// v1.3 forward: `Dict<String, Int>` rejects a String value.
+// EXPECTED: 1 × StaticTypeMismatch on `scores.art`.
+{ Dict<String, Int> scores: { math: 100, art: "A" } }

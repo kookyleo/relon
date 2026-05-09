@@ -1,10 +1,639 @@
 # Changelog
 
-## [Unreleased] — Generic schemas + built-in Result / Option
+## [Unreleased] — v1.8: Enum / Result first-class + host fn audit + cross-module + tuple-index
+
+v1.7 closed the user-source back-doors (`Any`, bare generics). v1.8
+sweeps the remaining surface: the `Enum<...>` slot's
+unconditionally-accept behaviour, generic substitution for sum-type
+schemas (chiefly `Result<T, E>` / `Option<T>`), host-supplied
+signatures that previously bypassed both v1.6 / v1.7 walks,
+cross-module `pkg.SchemaName` slot resolution, and structured
+positional access on tuples / lists (`pair.0` / `xs.1`).
+
+### v1.8a: Enum<...> alternative-aware subsumption
+
+`InferredType::subsumes_with` for an `Enum<...>` slot used to return
+`true` for everything (`"Enum" => true`). v1.8 walks the
+alternatives and accepts only when at least one is statically
+compatible. Mirrors the runtime's `enum_alt_matches_cheaply` cascade:
+
+- Built-in primitive alternative (`Int`, `String`, `Bool`, …):
+  recurse into `subsumes_with`.
+- Bareword alternative without generics (parser-stripped string
+  literal `"up"` or schema name `Active`): treated as a `String`
+  candidate, since the runtime cheap-path matches both shapes
+  against `Value::String`.
+- Anything else: recurse into `subsumes_with`.
+
+`infer_from_type_node`'s `"Enum"` arm now lifts the slot to the
+**join** of all alternative value types (`Enum<"up", "down">` →
+`String`; `Enum<Int, Float>` → `Number`; `Enum<Int, String>` →
+`Any`), so closure parameters / typed bindings declared as enums
+get a precise upper bound instead of `Any`.
+
+### v1.8b: Result<T, E> / variant-generic substitution
+
+When the slot is `Result<Int, String>` and the value is
+`Result.Ok { value: 42 }`, the analyzer now substitutes
+`T -> Int, E -> String` into the variant's declared field types and
+recurses per body field — the same machinery the runtime already
+runs in `substitute_generics_in_schema`. A new
+`VariantFieldIndex` collects per-variant `(generic_param_names,
+field_types)` from `tree.schemas`, plus a `seed_prelude_variants`
+pass that injects `Result<T, E>` / `Option<T>` so prelude types
+match the runtime's view.
+
+Previously the value `Result.Ok { value: "wrong" }` against
+`Result<Int, String>` was caught only at runtime; v1.8 catches it
+statically.
+
+### v1.8c: host fn signature audit
+
+`audit_host_fn_signatures` runs over every host-registered
+`FnSignature` and pushes the same `ExplicitAnyForbidden` /
+`BareGenericContainer` diagnostics the user-source walker emits.
+Without this a host could ship `register_fn("foo", sig{ params:
+[Any], return: Any })` and bypass the v1.6 / v1.7 bans. Diagnostics
+carry `host fn '{name}' parameter '{param}'` /
+`host fn '{name}' return type` / `host fn '{name}' variadic tail`
+context labels so the operator can pinpoint which integration to
+fix.
+
+### v1.8d: cleanup
+
+- The walker module renamed `ban_any.rs` → `ban_unsafe_types.rs`
+  to reflect its dual role (ban-`Any` + ban-bare-generic) since v1.7.
+- v1.7 evaluator e2e: `check_type` in `schema.rs` gains a `Tuple`
+  arm so `(Int, String)`-typed fields are validated at runtime
+  (arity check + per-position recursion). Pre-v1.8 a tuple-typed
+  field landed in the catchall and raised a spurious
+  `TypeMismatch { expected: "Tuple", found: "List" }`.
+- `walk_path` adds an explicit `Tuple` arm (descending by name into
+  a positional tuple yields `UnknownStep`; tuple-position access
+  syntax `pair.0` / `pair.1` would plumb through this branch).
+- `walk_path`'s `InferredType::Any` branch now documents that the
+  only remaining hit is "non-strict closure parameter without a
+  type_hint" (post v1.6 / v1.7 ban).
+- `infer_from_type_node`'s `"Closure" | "Fn"` arm now requires
+  non-empty generics and lifts properly-shaped `Closure<T1, ...,
+  Tn, Ret>` into `Fn(params, ret)` (degenerate cases collapse to
+  internal `Any`, never to a fake `Schema(...)`).
+
+### v1.8e: cross-module `pkg.SchemaName` static resolution
+
+Pre-v1.8 a `lib.User` slot in a typed binding collapsed to `Any`
+(`infer_from_type_node` returned `Any` for any multi-segment
+path), so `lib.User u: 42` silently passed. v1.8 introduces
+`infer_from_type_node_with_imports` and
+`subsumes_with_imports`, both of which take an
+`Option<&WorkspaceImportIndex>`. When the slot is a two-segment
+path whose head is a known import alias and whose tail is one of
+that alias's exported root-level schemas, the slot folds to
+`Schema(tail)` and the rest of the subsumption logic runs as if
+the user had written the bare schema name. Callers in
+`typecheck::check_typed_binding`, `check_fn_call`, the closure
+return-type check, and `main_return::check_main_return` all
+forward `tree.workspace_import_index.as_ref()` so cross-module
+slots get the same rigour as same-file ones.
+
+The catchall `_ => true` in `subsumes_with` for a single-segment
+custom-schema slot also got tightened: a clearly non-schema value
+shape (primitive, list, fn, tuple) is now a hard mismatch instead
+of silently accepted. This was an opportunistic fix lurking in the
+v1.8 cross-module work — `User u: 42` now flags statically in
+single-file mode too.
+
+### v1.8f: tuple-position access (`pair.0` / `pair.1`)
+
+The walker stack used to drop every non-`String` segment via
+`path_segments`, so `pair.0` walked just `pair` and the static
+type stayed `Tuple<...>`. v1.8 introduces `WalkSeg` and
+`walk_segments` that preserve `TokenKey::Index` segments, plus
+new `walk_path` arms:
+
+- `Tuple, Index(i)` → element at position `i`. Out-of-range
+  indices surface `UnknownStep`, which strict mode lifts to
+  `UnknownReferenceType`.
+- `Tuple, Name(_)` → hard `UnknownStep` (tuples are positional).
+- `List<T>, Index(_)` → `T`. Bounds checks stay runtime's job
+  (the literal length isn't tracked in `InferredType`).
+
+The runtime side already handled positional access on a
+`Value::List` (which is what tuples reduce to at runtime), so no
+evaluator changes were needed beyond the v1.7 `("Tuple", List)`
+arm in `schema.rs::check_type`.
+
+### Test surface
+
+35 net new tests (was 22 before the v1.8e/v1.8f work):
+
+- 11 fixture tests in `tests/v1_8_fixtures.rs::enum` + `::result`
+  covering string-literal alts, heterogeneous alts, primitive
+  alts, list-in-enum-slot rejection, `Result.Ok` /
+  `Result.Err` correct & mistyped, custom `Pair<T, U>` sum-type
+  variant-generic substitution.
+- 5 unit tests in `typecheck.rs` for the host fn audit (`Any`
+  param / return / variadic tail, bare `List` param, clean-signature
+  silent path).
+- 6 evaluator e2e tests in `eval_tests.rs::v17_*` for v1.7 tuple
+  e2e (typed field, nested in list, runtime arity / position
+  mismatch, homogeneous fold, ban-bare diagnostic).
+- 3 cross-module fixture tests in `tests/v1_8_fixtures.rs::cross_module`
+  (silent pass through `pkg.User`, primitive-vs-pkg-schema
+  mismatch, `#main(pkg.User u)` parameter resolution).
+- 5 tuple-index fixture tests in `tests/v1_8_fixtures.rs::tuple_index`
+  (`pair.0` / `pair.1` positional access, mismatch, out-of-range
+  under strict mode, list-index silent fold).
+- 2 evaluator e2e tests in `eval_tests.rs::v18_tuple_position_*`
+  for runtime + static tuple-position behaviour.
+
+The full v1.0 – v1.7 corpus continues to pass — 753 tests green
+after v1.8.
+
+## [Unreleased] — v1.7: tuple types + ban bare generics
+
+v1.6 left two related back-doors open: list literals doubled as tuples
+(`[1, "x"]` had no legal annotation after `List<Any>` retired), and
+the bare-generic shorthand (`List`, `Dict`, `Closure`, `Fn`, `Enum`)
+silently expanded to `<Any>` shapes. v1.7 closes both.
+
+### v1.7a: structured tuple types
+
+A new TypeNode shape `Tuple<T1, T2, ...>` (parser-encoded from the
+surface syntax `()`, `(T,)`, `(T1, T2, ...)`) becomes the analyzer's
+representation for "fixed-length, mixed-element" data. Highlights:
+
+- The parser accepts `(T1, T2, ...)` as a type wherever a `TypeNode`
+  appears: schema fields, dict bindings, `#main` params, closure
+  params, generic slots. The 1-tuple uses the trailing-comma form
+  `(T,)` to disambiguate from a parenthesized type — `(T)` deliberately
+  fails the tuple parser so method-shorthand `helper():` keeps parsing.
+- `InferredType::Tuple(Vec<InferredType>)` is the new variant.
+  `infer_from_type_node` lifts `Tuple<...>` to it; the printer
+  formats it as `()` / `(T,)` / `(T1, T2)` matching the source syntax.
+- **List literals now infer as `Tuple<T1, T2, ...>`** instead of
+  `List<join(...)>`. `[1, 2, 3]` infers as `Tuple<Int, Int, Int>`,
+  preserving each element's precise type.
+- **Tuple → List collapse**: a homogeneous tuple subsumes a `List<T>`
+  slot (every element subsumes `T`), keeping all pre-v1.7
+  homogeneous-list usage working.
+- **Tuple → Tuple**: arity check + per-position recursion; a
+  mismatch surfaces as `StaticTypeMismatch` pinned to the offending
+  position.
+- `check_generics` and the path-tail walker recognise `Tuple` as a
+  same-outer-container companion to `List` so per-element diagnostics
+  can fire with the precise field path.
+
+### v1.7b: ban bare generics
+
+A new diagnostic `BareGenericContainer { type_name, context, range }`
+(Error severity, mode-agnostic — same status as v1.6's
+`ExplicitAnyForbidden`) fires for every user-written `TypeNode` whose
+single-segment head is `List` / `Dict` / `Closure` / `Fn` / `Enum`
+and whose `generics` is empty. The check piggybacks on the existing
+`scan_typenode_for_any` walker so nested occurrences
+(`Dict<String, List>`, `List<Closure>`, …) are caught at every depth.
+
+```relon
+{ List items: [1, 2, 3] }              // BareGenericContainer
+{ Dict scores: { math: 100 } }         // BareGenericContainer
+{ Closure cb: (x) => x }               // BareGenericContainer
+{ Dict<String, List> data: ... }       // BareGenericContainer (nested)
+
+{ List<Int> items: [1, 2, 3] }         // OK
+{ Dict<String, Int> scores: { ... } }  // OK
+```
+
+The legacy v1.3 fixture `bare_dict_still_works.relon` (which asserted
+the old `Dict → Dict<Any, Any>` expansion) is rewritten to use
+explicit generics, and 11 v1.3/v1.4 fixtures with bare `-> Dict`
+return types are updated to `-> Dict<String, Int>` so they no longer
+trip the new ban.
+
+### v1.7c: dead-code cleanup in `infer_from_type_node`
+
+With ban-bare in place, the degenerate `"Closure" | "Fn"` arm
+(returning `Fn(_, Any)` for empty generics) no longer fires from
+user source. The arm now requires non-empty generics and lifts
+`Closure<T1, ..., Tn, Ret>` into a properly-typed
+`InferredType::Fn(params, ret)`. Bare `Closure` / `Fn` / `Enum` that
+slip through pre-source-walk passes collapse to the internal
+`InferredType::Any` placeholder, never to a fake `Schema(...)`.
+
+### Test surface
+
+26 new tests:
+
+- 9 unit tests in `typecheck.rs` for tuple subsumption (homogeneous
+  list compatibility, heterogeneous rejection, nested matching,
+  arity / per-position mismatch).
+- 17 fixture tests in `tests/v1_7_fixtures.rs` across two themes:
+  `tuple/` (10 fixtures: empty / 1-tuple / pair / nested / mismatch
+  / heterogeneous typed) and `ban_bare/` (7 fixtures: bare List /
+  Dict / Closure / Fn, nested bare, explicit-generics silent,
+  `#main` parameter ban).
+
+The full v1.0–v1.6 corpus continues to pass — 704+17 = 721 tests
+green after v1.7.
+
+## [Unreleased] — v1.6: retire `Any` from user space
+
+v1.5 left `Any` as a usable keyword in user code; v1.6 retires it
+entirely. The user-facing surface — schema fields, `#main` params,
+closure parameters, return-type annotations, typed-binding type
+prefixes, nested generics — no longer accepts `Any`. The stdlib's
+internal use of `Any` is also gone, replaced with unbound generic
+placeholders that flow concrete types through the analyzer pipeline.
+
+### v1.6a: ban `Any` in user code, every mode
+
+A new diagnostic `ExplicitAnyForbidden { context, range }` (Error
+severity, mode-agnostic) fires whenever a user-written `TypeNode`
+contains a single-segment `Any` head, anywhere in the type tree:
+
+```relon
+{ Any payload: 42 }                  // ExplicitAnyForbidden
+{ List<Any> xs: [...] }              // ExplicitAnyForbidden (nested)
+{ Dict<String, Any> kv: {...} }      // ExplicitAnyForbidden (nested)
+{ helper: (Any n) -> Int => 1 }      // ExplicitAnyForbidden (closure param)
+{ helper: (Int n) -> Any => n }      // ExplicitAnyForbidden (closure return)
+#schema X { Any payload: * }          // ExplicitAnyForbidden (schema field)
+#main(Any x) -> Int                   // ExplicitAnyForbidden (#main parameter)
+#main(Int n) -> Any                   // ExplicitAnyForbidden (#main return type)
+```
+
+Every site where a `TypeNode` reaches user source routes through a
+new helper `crate::ban_any::scan_typenode_for_any`, which walks the
+node tree (descending into nested generics) and pushes one diagnostic
+per occurrence. Multi-segment paths (`pkg.Any`) are silently allowed
+— users may genuinely have a schema named `Any` in another module.
+
+### v1.6b: retire `StrictForbidsUntypedMainParam`
+
+The v1.5-specific `StrictForbidsUntypedMainParam` diagnostic (which
+only fired under `#strict` for `#main(Any x)`) is removed: the new
+generic `ExplicitAnyForbidden` covers the same case in every mode,
+making the diagnostic surface simpler and more uniform.
+
+### v1.6c: stdlib-signature rewrite
+
+Every `Any` in `crates/relon-analyzer/src/stdlib_signatures.rs` is
+replaced with an unbound generic placeholder. Notable wins:
+
+- `len<T>(T) -> Int`, `_len<T>(T) -> Int`, `type<T>(T) -> String` —
+  accept anything without committing to `Any` in the signature surface.
+- `_dict_values<V>(Dict<String, V>) -> List<V>` — value type now
+  flows end-to-end. `Dict<String, Int>` in produces `List<Int>` out.
+- `ensure.int / .string / .bool / .float / .list / .dict /
+  .at_least / .at_most / .one_of <T>(T, message?) -> T` — every
+  validator now preserves the input type instead of returning `Any`.
+- `ensure.required_fields / .requires / .fields_equal <V>(Dict<String,
+  V>, ...) -> Dict<String, V>` — Dict shape preserved.
+- `_dict_merge<V>` — uniform-V calls bind `V → T` and the return
+  type stays `Dict<String, T>`.
+- `_string_join<T>(List<T>, String) -> String` — accepts any
+  element type without `List<Any>` in the signature.
+- `_dict_keys<V>` / `_dict_has_key<V>` — value placeholder unused in
+  the return but keeps the signature surface uniform.
+
+Unbound `<T>` / `<V>` is behaviorally equivalent to "accepts any
+type" today (Relon doesn't have trait bounds), but the type flow
+through the analyzer is now clean: a typed binding consuming a
+stdlib result picks up the precise input type instead of being
+swallowed by `Any`.
+
+### v1.6d: language-surface retentions
+
+The only `Any` references that survive v1.6 are deliberately
+internal:
+
+1. `InferredType::Any` — analyzer's "couldn't infer" placeholder.
+   User never sees it; v1.5 strict checks already catch leaks.
+2. Generic-placeholder fallback in
+   `crates/relon-analyzer/src/generics.rs::collect_bindings` Pass 3:
+   unbound `<T>` after unification gets filled with `Any` so
+   substitution doesn't leave residual placeholders. Internal.
+3. Runtime `Value` is dynamically typed. Implementation detail.
+
+### Test surface
+
+36 new tests across the analyzer (unit + fixture + ban_any helper),
+covering:
+
+- 8 ban-Any positions (schema field, #main param, #main return,
+  closure param, closure return, typed binding, nested list, nested
+  dict)
+- 4 stdlib-rewrite regression guards (`_dict_values`, `ensure.int`,
+  `_dict_merge`, `len`)
+- 7 ban_any helper unit tests (recursion, multi-segment, context
+  propagation)
+- v1.5 fixtures updated to assert the new `ExplicitAnyForbidden`
+  shape where they previously checked `StrictForbidsUntypedMainParam`
+
+The full v1.0–v1.5 corpus continues to pass unchanged.
+
+## [Unreleased] — v1.5: kill the long tail
+
+v1.5 finishes what v1.4 started: under strict mode, every value the
+analyzer could derive from source + schemas is now derived. Strict-mode
+silent-fallback positions still in v1.4 — comprehension / where / spread
+expressions, untyped closure / `#main` params, head-unresolved
+variables, multi-segment FnCall — are all closed.
+
+### v1.5a: `comprehension` / `where` / `spread` inference
+
+`infer_type` now walks three new expression shapes:
+
+- **`Expr::Comprehension`** — once the iterable infers as `List<T>` /
+  `Dict<V>`, the binding name is typed as the element type inside a
+  child scope, and the comprehension's overall type becomes
+  `List<element_type>`. Heterogeneous / non-list iterables still fall
+  back to `Any` for the binding so the body inference stays well-formed.
+- **`Expr::Where`** — the bindings dict is walked, each key's inferred
+  value type seeds the body's scope, and the body inference defines the
+  expression's type.
+- **`Expr::Spread`** as a standalone expression — equals the inner's
+  inference result. Used by FnCall args and other expression-position
+  spreads.
+
+These three together kill the largest remaining v1.4
+"`InferenceLimit`-because-we-haven't-implemented-it" surface.
+
+### v1.5b: closure / `#main` strict typing
+
+Three new diagnostics — every closure / entry parameter must declare a
+type stronger than `Any`, and closure bodies must be statically
+classifiable:
+
+- `StrictForbidsUntypedClosureParam { param_name }` — a closure
+  parameter has no `type_hint`. Pinned on the closure's range.
+- `StrictForbidsUntypedMainParam { param_name }` — a `#main(Any x)`
+  declaration. Pinned on the param's range.
+- `StrictForbidsUnclassifiedClosureBody { role }` — a closure with no
+  declared `-> ReturnType` whose body's static inference lands on
+  `Any`.
+
+A closure with `(Int n) -> Int => …` keeps passing strict mode silently;
+any single drop into `Any` (untyped param, body relying on an unknown
+call without a declared return) now produces an explicit error.
+
+### v1.5c: strict-mode head-unresolved escalation
+
+`UnresolvedReference` (warning severity) keeps firing for
+non-strict / IDE consumers. Strict mode additionally pushes
+`UnknownReferenceType { name, path: [head] }` at error severity, so
+strict callers never reach a runtime "name not found" path even for
+single-segment lookups that the old path-tail walker couldn't reach.
+
+### v1.5d: multi-segment FnCall inference
+
+`infer_type`'s `Expr::FnCall` arm now routes through
+`lookup_signature_path` for paths longer than one segment. This picks
+up cross-module `alias.method` calls (already supported by the legacy
+typecheck walker) for return-type inference too — a previously dropped
+path that landed `obj.method()` calls on `None` and silently leaked
+`Any` into surrounding contexts.
+
+### v1.5e: list / dict element strict-aware sweep
+
+The dict and list walker arms now run a strict-aware element sweep:
+under strict mode, every untyped list element / untyped dict-field
+value whose inference lands on `Any` (and whose surrounding slot
+doesn't own the diagnostic via the typed-binding walker) produces an
+`InferenceLimit { reason }`.
+
+### Test surface
+
+50 new tests across analyzer (unit + fixture) and evaluator (e2e), in
+addition to the v1.4 surface. Fixture tree at
+`crates/relon-analyzer/tests/fixtures/v1_5/{comprehension,where_expr,closure_strict,strict_head,main_strict}/`,
+driven by `crates/relon-analyzer/tests/v1_5_fixtures.rs`. The full
+v1.0–v1.4 corpus continues to pass unchanged.
+
+## [Unreleased] — v1.4: strict completeness
+
+v1.4 closes the three gaps v1.3 left open. The strict-mode contract
+("every value must have a derivable static type") is now enforced
+across the inference engine end-to-end rather than just at a few
+boundary checks.
+
+### v1.4a: `infer.rs` path-tail walking
+
+The expression-level inference engine now walks the full
+`Variable(path)` / `Reference { path }` chain instead of dropping every
+segment after the head. The new `walk_path` returns one of three
+outcomes:
+
+- `Resolved(InferredType)` — every hop succeeded; the final type is
+  exposed to callers (return-type checks, typed-binding subsumption,
+  spread-source classification, …).
+- `UnknownStep { at_segment, running_name }` — the head was visible
+  but a later segment could not be classified (missing schema field,
+  attempt to descend into a leaf type like `Int`).
+- `UnknownHead` — the path's first segment isn't visible in the active
+  scope; the resolution layer's `UnresolvedReference` already owns
+  this case.
+
+Each step understands four head shapes: `Schema(name)` (looks up the
+field on `schema_index`), `Dict<K, V>` (steps onto the value type),
+`Optional<T>` (strips the `?` wrapper before retrying), and `Any`
+(propagates without failing — strict mode decides whether to flag).
+Concretely, `#main(Order o) -> Int\no.id` now infers `Int` and lines
+up against the declared return; `#main(Order o) -> String\no.id`
+fires a static `MainReturnTypeMismatch` instead of letting the
+runtime discover the same problem.
+
+### v1.4b: strict-aware silent-fallback diagnostics
+
+The previously-reserved `UnknownReferenceType` and `InferenceLimit`
+diagnostics are now wired up:
+
+- `UnknownReferenceType { name, path }` fires under `#strict` when the
+  path-tail walker can't classify some step. `name` is the failing
+  segment; `path` is the full source-order chain so consumers can
+  reconstruct the lineage without re-walking the AST. (The variant
+  shape changed — `path: Vec<String>` is new.)
+- `InferenceLimit { reason }` fires under `#strict` for genuinely
+  opaque positions that nonetheless demand a derivable type: a typed
+  binding whose value is a comprehension / `where` / FnCall without a
+  signature, and match arm bodies whose type can't be inferred. The
+  `reason` string discriminates sub-cases.
+
+The strict path-tail check is layered on top of the existing v1.0
+`check_path_tail` (which kept emitting `UnresolvedReference` for
+shape-driven failures); the two are complementary, not duplicated.
+
+### v1.4c: spread-source extension
+
+`spread_source_schema` now lifts two more shapes into the strict
+"typed spread" pool:
+
+- path chain: `...o.extras` where `o.extras : Extras` — driven by the
+  same `walk_path` machinery as the inference engine.
+- FnCall: `...load_extras()` whose static signature returns a
+  single-segment `Schema` (or `Dict<K, V>`).
+
+Because sibling closure signatures are needed before the dict's
+`check_dict_v1_3` runs, the type-check walker now pre-registers every
+`field_name → closure_signature` pair on the dict before performing
+the spread/dyn-key checks. Strict mode also accepts a `Dict<K, V>`-
+typed spread source out of the box (the value type is fully known
+even when the key set is dynamic).
+
+When the source can't be classified, strict mode prefers the more
+specific path-tail diagnostic over the generic
+`MissingSpreadTypeHint`, so users see the precise failing step
+instead of "needs a type hint".
+
+### Test surface
+
+51 new tests across the analyzer (unit + fixture) and evaluator (e2e)
+crates. Fixture tree at
+`crates/relon-analyzer/tests/fixtures/v1_4/{path_tail,strict_silent_fallback,spread_extension}/`,
+driven by `crates/relon-analyzer/tests/v1_4_fixtures.rs`. The full
+v1.0–v1.3 corpus (557 tests) continues to pass unchanged.
+
+## [Unreleased] — v1.3: `#main` param injection + `#strict` mode
+
+### v1.3a: `#main(...)` parameters reach the root body's static scope
+
+Previously, the analyzer's `resolve.rs` walker didn't seed the
+`#main(...)` parameter names into the root scope frame, so an entry
+program like
+
+```relon
+#main(Int n) -> String
+n + 1
+```
+
+would have `n` flagged as `UnresolvedReference` and `infer_type` would
+fall back to `Any` — at which point `check_main_return` silently
+accepted the body, deferring the obvious mismatch to runtime.
+
+v1.3a fixes the gap: both `resolve::resolve_references` and
+`typecheck::typecheck` now build a synthetic root frame populated with
+every `#main` parameter (`closure_params` for binding lookup,
+`closure_param_types` for inference) before descending into the body.
+The frame is shape-agnostic — it applies to atomic / list / dict /
+variant / fn-call roots alike — so the body's references resolve and
+its inferred type reaches the return-type check intact. The static
+`MainReturnTypeMismatch` now fires for the example above.
+
+### v1.3b: `#strict` directive — every value must have a static type
+
+A new bare directive `#strict` opts a file (and, transitively, every
+module it reaches via `#import`) into a stricter inference contract:
+sites the analyzer would otherwise let pass with an implicit `Any`
+fallback now produce errors. The diagnostic kinds:
+
+- `MissingSpreadTypeHint` — `{ ...e }` where `e` isn't a dict literal
+  and lacks the new `<T>` typed-spread hint.
+- `MissingDynamicKeyTypeHint` — `{ [k]: 1 }` without the typed key
+  hint `[<T> k]: 1`.
+- `UnresolvedSchema` — typed spread / dynamic key whose `<T>`
+  references a name nobody declared.
+- `StrictForbidsNativeReturn` — call site of a host-registered native
+  fn that has no `host_fn_signatures` entry, so its return type is
+  invisible to inference.
+- `UnknownReferenceType` / `InferenceLimit` — reserved for future
+  silent-fallback sites the analyzer wants to surface.
+
+Strict mode is contagious. The workspace pass detects `#strict` on
+the entry, sets `WorkspaceTree.strict_mode`, and threads the bit
+through every per-module `analyze_with_options` call so `#import`
+dependencies inherit the same rules. This means a strict entry can't
+hide silent-fallback shapes inside a non-strict library it imports —
+the lib will be stamped strict and the analyzer will report.
+
+### v1.3c: typed spread `...<T> e` and typed dynamic key `[<T> k]: v`
+
+The dict parser now accepts an optional `<T>` immediately after `...`
+and immediately after `[`. The type lifts onto the inner Node's
+existing `type_hint` slot (no new AST shape — the runtime simply
+ignores it, since strict-mode rules are an analyzer contract), so:
+
+```relon
+#strict
+#schema Extra { Int a: *, Int b: * }
+{ src: { a: 1, b: 2 }, ...<Extra> src }      // typed spread
+{ k: "key", [<String> k]: 1 }                // typed dynamic key
+```
+
+Outside strict mode the hints are still recognized and used for
+DuplicateField analysis; they just stop being mandatory.
+
+### v1.3d: `Dict<K, V>` generics
+
+`parse_type_node` already accepted generic type parameters
+(`Result<T, E>`, `List<T>`); v1.3 documents and tests that `Dict`
+participates the same way. `Dict<String, Int>` validates each value's
+inferred type against `Int`; bare `Dict` (no generics) remains
+backwards-compatible and means `Dict<Any, Any>`.
+
+### v1.3e: `DuplicateField` for spread-induced collisions
+
+`{ a: 1, ...<Extra> e }` where `Extra`'s schema declares an `a` field
+now reports `DuplicateField` regardless of strict mode. Same for two
+spreads of dict literals that share a key (`{ ...{a: 1}, ...{a: 2} }`)
+or a typed spread that overlaps a named field. Conflicts the analyzer
+can't *prove* (untyped non-literal spread) stay silent — the analyzer
+won't claim what it can't see.
+
+### Test corpus
+
+`crates/relon-analyzer/tests/fixtures/v1_3/` is the new
+fixture-driven test corpus. Each scenario lives in its own `.relon`
+file with an `EXPECTED:` comment, and the integration test
+`crates/relon-analyzer/tests/v1_3_fixtures.rs` runs them all.
+
+### Counts (this batch)
+
+- 80+ new tests across parser, analyzer, evaluator, and integration
+  fixtures (`cargo test --workspace`: 557 / 557 passing).
+- 0 clippy warnings (`cargo clippy --workspace --all-targets -D warnings`).
+- 0 fmt drift (`cargo fmt --all -- --check`).
+- 0 changes to evaluator runtime semantics — strict mode is a
+  pure-analyzer contract.
+
+## [Unreleased] — Generic schemas + built-in Result / Option + open root
 
 Schema definitions now accept type parameters, and `Result<T, E>` /
 `Option<T>` are seeded into every Context as built-in tagged-enum
-schemas — no explicit declaration needed.
+schemas — no explicit declaration needed. The document root is also
+no longer restricted to dict / list literals — any expression is now
+accepted, as long as it evaluates to a JSON value.
+
+### v1.2: open root expression
+
+`parse_base` now accepts any expression at the document root, not
+just dict / list literals. Atomic literals (`42`, `"hello"`, `true`,
+`null`), arithmetic / pipe / ternary expressions, function calls,
+variant constructors (`Result.Ok { value: x }`), references, and the
+rest of the expression precedence chain are all valid roots.
+
+This unlocks atomic / variant `#main(...) -> ReturnType` bodies that
+the parser previously rejected:
+
+```relon
+// Before v1.2: rejected at parse time (root must be dict/list)
+// v1.2+: legal — `n + 1` is a binary expression at the root.
+#main(Int n) -> Int
+n + 1
+
+// Variant constructor as root for `-> Result<T, E>` entries:
+#main(Order o) -> Result<Order, String>
+Result.Ok { value: o }
+```
+
+Pre-v1.2 root forms (dict / list literals) continue to parse
+identically — v1.2 is a strict superset, no migration required.
+
+`Closure` / `Schema` / `Type` / `Wildcard` are not JSON values; if
+the root evaluates to one, the host's projector
+(`relon::JsonProjector`) reports `UnsupportedClosure` /
+`UnsupportedSchema` as before. Static `#main(...) -> ReturnType`
+mismatches with non-JSON ReturnTypes continue to surface via the
+analyzer's `MainReturnTypeMismatch`.
 
 ### Generic type parameters on `#schema`
 

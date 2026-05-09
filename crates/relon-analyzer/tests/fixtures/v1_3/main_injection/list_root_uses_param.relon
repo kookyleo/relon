@@ -1,0 +1,4 @@
+// v1.3a: list root body uses `n`.
+// EXPECTED: no diagnostics.
+#main(Int n) -> List<Int>
+[n, n + 1, n * 2]

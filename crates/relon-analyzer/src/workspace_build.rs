@@ -9,7 +9,7 @@ use crate::sig::FnSignature;
 use crate::tree::AnalyzedTree;
 use crate::workspace::{LoadError, ModuleLoader, WorkspaceDiagnostic, WorkspaceTree};
 use miette::SourceSpan;
-use relon_parser::{parse_document, Expr, Node, TokenKey, TokenRange};
+use relon_parser::{parse_document, Expr, Node, TokenKey, TokenRange, TypeNode};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -52,7 +52,19 @@ pub(crate) fn build<L: ModuleLoader>(
     match parse_document(entry_source) {
         Ok(node) => {
             let arc_node = Arc::new(node);
-            let tree = crate::analyze_with_options(&arc_node, options);
+            // v1.3: strict mode is set when either the caller forwarded
+            // it via `options.strict_mode` *or* the entry source itself
+            // declared `#strict`. Detection looks at the parsed entry
+            // root's directives — a parse-time check. We then build a
+            // mutated `AnalyzeOptions` with the bit so every per-module
+            // analyze call sees the same flag (the workspace-wide
+            // contagion contract).
+            let entry_strict = options.strict_mode || crate::has_strict_directive(&arc_node);
+            ws.strict_mode = entry_strict;
+            let mut effective_options = options.clone();
+            effective_options.strict_mode = entry_strict;
+
+            let tree = crate::analyze_with_options(&arc_node, &effective_options);
             let imports = collect_import_targets(&tree, &entry_id, &entry_current_dir);
             ws.import_graph.insert(
                 entry_id.clone(),
@@ -69,18 +81,29 @@ pub(crate) fn build<L: ModuleLoader>(
             // raw paths to canonical ids, so we have to call it to know
             // whether a module is already loaded).
             //
-            // `seen_raw` short-circuits the common case where the same
-            // file is `#import`ed twice from the same importer with the
-            // same relative path: we skip the loader call entirely.
-            // Different relative paths to the same canonical id still
-            // dedup downstream via `ws.modules.contains_key`.
-            let mut seen_raw: HashSet<(String, String)> = HashSet::new();
+            // v1.8+ fix: pre-fix this loop carried a `seen_raw:
+            // HashSet<(importer_id, raw_path)>` short-circuit that
+            // skipped the loader call when the same `(importer,
+            // raw_path)` pair was queued twice. That elided
+            // `#import a from "./lib"` followed by `#import b from
+            // "./lib"` — the second alias never reached
+            // `process_import`, so its `import_graph` edge stayed at
+            // the raw path and `build_import_index` lost `b`'s
+            // schemas / closures (lockstep with `tree.imports`
+            // broken). The dedup is now done downstream inside
+            // `process_import` via `ws.modules.contains_key` after
+            // the loader resolves to a canonical id; the only cost
+            // is one extra loader call per duplicate raw path, which
+            // is negligible for the common filesystem-resolver case.
             while let Some(item) = queue.pop_front() {
-                let key = (item.importer_id.clone(), item.raw_path.clone());
-                if !seen_raw.insert(key) {
-                    continue;
-                }
-                process_import(item, loader, &mut ws, &mut queue, &mut module_dirs, options);
+                process_import(
+                    item,
+                    loader,
+                    &mut ws,
+                    &mut queue,
+                    &mut module_dirs,
+                    &effective_options,
+                );
             }
         }
         Err(parse_err) => {
@@ -387,6 +410,16 @@ pub struct WorkspaceImportIndex {
     /// upstream). The signature itself is a clone of the upstream
     /// closure's signature.
     pub destructured_closures: HashMap<String, FnSignature>,
+    /// v1.8e: schema field info for every imported schema, keyed by the
+    /// *bare* schema name. Populated for alias / spread / destructure
+    /// imports alike. After `cross_module_schema` collapses
+    /// `pkg.User` to `Schema("User")` in `infer_from_type_node_with_imports`,
+    /// the path-tail walker needs to look up `User`'s fields somewhere
+    /// — but the importer's own `tree.schemas` doesn't see imports.
+    /// `build_schema_index` merges this map in so the walker resolves
+    /// `u.name` for cross-module schema parameters too. Last-write-wins
+    /// on name collisions (same permissive policy as `spread_closures`).
+    pub imported_schemas: HashMap<String, HashMap<String, TypeNode>>,
 }
 
 impl WorkspaceImportIndex {
@@ -430,6 +463,29 @@ pub(crate) fn build_import_index(ws: &WorkspaceTree, importer_id: &str) -> Works
             .iter()
             .map(|d| d.name.clone())
             .collect();
+        // v1.8e: also pre-extract each exported schema's fields so the
+        // importer's path-tail walker can resolve `u.name` when `u`
+        // is typed as a cross-module schema. Walks
+        // `target_tree.schemas` (which `collect_root_schemas` populates
+        // alongside `root_schemas`) so dict-form and directive-form
+        // schemas land here uniformly.
+        let exported_schema_fields: HashMap<String, HashMap<String, TypeNode>> = target_tree
+            .schemas
+            .values()
+            .filter_map(|def| {
+                let name = def.name.clone()?;
+                if !exported_names.contains(&name) {
+                    return None;
+                }
+                let mut fields = HashMap::new();
+                for f in &def.fields {
+                    if let Some(t) = &f.type_hint {
+                        fields.insert(f.name.clone(), t.clone());
+                    }
+                }
+                Some((name, fields))
+            })
+            .collect();
         // v1.1: pick up the imported module's *root-level* closure
         // signatures. We re-walk the module's parsed root node here
         // (rather than using `field_closure_index`, which is
@@ -457,6 +513,17 @@ pub(crate) fn build_import_index(ws: &WorkspaceTree, importer_id: &str) -> Works
                         .iter()
                         .map(|(k, v)| (k.clone(), v.clone())),
                 );
+            // v1.8e+ fix (issue 3): schemas behind an alias are stored
+            // under the *qualified* `alias.Name` key so two aliases
+            // pointing at different libs that both export `User`
+            // don't collide on the bare name. The path-tail walker
+            // and `subsumes_with` look up the same qualified key
+            // because `cross_module_schema` returns
+            // `Some("alias.Name")` after the v1.8e fix.
+            for (name, fields) in &exported_schema_fields {
+                let qualified = format!("{alias}.{name}");
+                index.imported_schemas.insert(qualified, fields.clone());
+            }
             continue;
         }
         if imp.spread {
@@ -465,6 +532,13 @@ pub(crate) fn build_import_index(ws: &WorkspaceTree, importer_id: &str) -> Works
             // namespace under their original field names.
             for (k, v) in &exported_closures {
                 index.spread_closures.insert(k.clone(), v.clone());
+            }
+            // v1.8e: spread-imported schemas keyed by their upstream
+            // name (mirrors closures' last-write-wins policy). No
+            // alias prefix because spread imports flatten into the
+            // importer's namespace.
+            for (name, fields) in &exported_schema_fields {
+                index.imported_schemas.insert(name.clone(), fields.clone());
             }
             continue;
         }
@@ -479,7 +553,13 @@ pub(crate) fn build_import_index(ws: &WorkspaceTree, importer_id: &str) -> Works
                 if let Some(sig) = exported_closures.get(upstream) {
                     let mut renamed = sig.clone();
                     renamed.name = local.clone();
-                    index.destructured_closures.insert(local, renamed);
+                    index.destructured_closures.insert(local.clone(), renamed);
+                }
+                // v1.8e: destructure-imported schemas land under
+                // their *local* (alias-or-upstream) name so type
+                // references like `MyUser` (alias of `User`) resolve.
+                if let Some(fields) = exported_schema_fields.get(upstream) {
+                    index.imported_schemas.insert(local, fields.clone());
                 }
             }
         }
@@ -549,14 +629,22 @@ fn recheck_cross_module_calls(ws: &mut WorkspaceTree) {
         let Some(index) = indexes.remove(id) else {
             continue;
         };
-        // Skip modules that don't import anything — there's nothing
-        // the index could change. Single-file workspaces (entry only,
-        // no imports anywhere) take this branch and pay zero overhead
-        // beyond stamping the (empty) index.
-        let has_closures = !index.aliased_closures.is_empty()
+        // v1.8e fix: skip the rerun only for modules whose import index
+        // is *empty* (no aliased schemas, no aliased / spread /
+        // destructured closures). Pre-fix this skipped any module
+        // without imported closures, even when imported schemas were
+        // present — leaving every `pkg.Schema` lift in `infer.rs` to
+        // see `workspace_import_index = None` and silently fall back
+        // to `InferredType::Any`. The result: cross-module
+        // `MainReturnTypeMismatch` and strict-mode path-tail checks
+        // were both broken.
+        let has_imports = !index.aliased.is_empty()
+            || !index.aliased_closures.is_empty()
+            || !index.spread.is_empty()
             || !index.spread_closures.is_empty()
+            || !index.destructured.is_empty()
             || !index.destructured_closures.is_empty();
-        if !has_closures {
+        if !has_imports {
             if let Some(arc_tree) = ws.modules.get_mut(id) {
                 if let Some(tree) = Arc::get_mut(arc_tree) {
                     tree.workspace_import_index = Some(index);
@@ -575,10 +663,12 @@ fn recheck_cross_module_calls(ws: &mut WorkspaceTree) {
         };
         // Drop every typecheck-produced diagnostic; the rerun will
         // re-emit the still-valid ones. Any diagnostic kind owned by a
-        // *different* pass (schema, resolve, root_schemas, main_*) is
-        // kept as-is.
+        // *different* pass (schema, resolve, root_schemas, main_sig)
+        // is kept as-is. `MainReturnTypeMismatch` is also cleared
+        // because the body type re-derives once the import index lifts
+        // `pkg.Schema` correctly.
         tree.diagnostics
-            .retain(|d| !is_typecheck_owned_diagnostic(d));
+            .retain(|d| !is_typecheck_owned_diagnostic(d) && !is_main_return_diagnostic(d));
         // Closure signatures populated by the first typecheck walk
         // get overwritten in place by the rerun; clearing the table
         // first avoids leaking stale entries when (theoretically) a
@@ -589,7 +679,21 @@ fn recheck_cross_module_calls(ws: &mut WorkspaceTree) {
         tree.field_closure_index.clear();
         tree.workspace_import_index = Some(index);
         crate::typecheck::typecheck(&arc_node, tree);
+        // v1.8e fix: re-evaluate `#main(...) -> Type` against the
+        // freshly re-inferred body type. Pre-fix the entry's body lift
+        // saw `Any` for `pkg.Schema` parameters during the first
+        // analyze pass, the mismatch check skipped on `Any`, and the
+        // rerun never touched it.
+        crate::main_return::check_main_return(&arc_node, tree);
     }
+}
+
+/// True when `d` is the `MainReturnTypeMismatch` emitted by
+/// [`crate::main_return::check_main_return`]. Used by
+/// [`recheck_cross_module_calls`] to clear stale entries before the
+/// import-index-aware rerun.
+fn is_main_return_diagnostic(d: &Diagnostic) -> bool {
+    matches!(d, Diagnostic::MainReturnTypeMismatch { .. })
 }
 
 /// True when `d` is a diagnostic kind emitted exclusively by
@@ -609,6 +713,18 @@ fn is_typecheck_owned_diagnostic(d: &Diagnostic) -> bool {
             | Diagnostic::UnknownVariant { .. }
             | Diagnostic::DuplicateMatchArm { .. }
             | Diagnostic::NonExhaustiveMatch { .. }
+            // v1.4-v1.8 strict / type-quality diagnostics that
+            // `typecheck` emits via its dict / list / closure / spread
+            // walkers. All of them re-derive on each typecheck run,
+            // so the import-aware rerun must clear them too.
+            | Diagnostic::UnknownReferenceType { .. }
+            | Diagnostic::InferenceLimit { .. }
+            | Diagnostic::MissingSpreadTypeHint { .. }
+            | Diagnostic::MissingDynamicKeyTypeHint { .. }
+            | Diagnostic::DuplicateField { .. }
+            | Diagnostic::StrictForbidsNativeReturn { .. }
+            | Diagnostic::StrictForbidsUntypedClosureParam { .. }
+            | Diagnostic::StrictForbidsUnclassifiedClosureBody { .. }
     )
 }
 
@@ -647,10 +763,24 @@ fn re_check_unknown_types(ws: &mut WorkspaceTree) {
 /// Decide whether `d` is an `UnknownTypeName` whose head is visible
 /// through `index`. Anything else (any other diagnostic, or an
 /// `UnknownTypeName` head that's still unknown) is kept as-is.
+///
+/// v1.8+ extension: a dotted `head.tail` name is "now known" iff the
+/// entry's import index has `head` as a known alias whose exported
+/// schemas include `tail`. This drives the `pkg.Wrong` cross-module
+/// check — main_sig / check_schema_field_types push tentative
+/// dotted-name diagnostics at module-analyze time; this pass clears
+/// those that the workspace-level alias index can resolve.
 fn is_now_known_type(d: &Diagnostic, index: &WorkspaceImportIndex) -> bool {
     let Diagnostic::UnknownTypeName { name, .. } = d else {
         return false;
     };
+    if let Some((head, tail)) = name.split_once('.') {
+        return index
+            .aliased
+            .get(head)
+            .map(|set| set.contains(tail))
+            .unwrap_or(false);
+    }
     index.knows(name)
 }
 
@@ -1406,6 +1536,114 @@ mod tests {
             count_for_plus >= 1,
             "{:?}",
             ws.modules.get("/abs/entry").map(|t| t.diagnostics.clone())
+        );
+    }
+
+    // ====== v1.3 strict-mode contagion ======
+
+    /// v1.3 forward: a `#strict` entry stamps `strict_mode=true` on
+    /// every reachable module's `AnalyzedTree`, including modules that
+    /// don't declare `#strict` themselves. Demonstrates contagion.
+    #[test]
+    fn v1_3_strict_entry_propagates_to_imports() {
+        let mut loader = MapLoader::new();
+        loader.add("./lib", "/abs/lib", r#"{ helper(Int x): x + 1 }"#);
+        let ws = build(
+            "/abs/entry".to_string(),
+            "#strict\n#import * from \"./lib\"\n{ x: 1 }",
+            PathBuf::from("/abs"),
+            &mut loader,
+        );
+        assert!(ws.strict_mode);
+        assert!(ws.modules.get("/abs/entry").unwrap().strict_mode);
+        assert!(ws.modules.get("/abs/lib").unwrap().strict_mode);
+    }
+
+    /// v1.3 reverse: a non-strict entry leaves every module's
+    /// strict_mode flag at the default `false`.
+    #[test]
+    fn v1_3_non_strict_entry_does_not_propagate() {
+        let mut loader = MapLoader::new();
+        loader.add("./lib", "/abs/lib", r#"{ helper(Int x): x + 1 }"#);
+        let ws = build(
+            "/abs/entry".to_string(),
+            "#import * from \"./lib\"\n{ x: 1 }",
+            PathBuf::from("/abs"),
+            &mut loader,
+        );
+        assert!(!ws.strict_mode);
+        assert!(!ws.modules.get("/abs/entry").unwrap().strict_mode);
+        assert!(!ws.modules.get("/abs/lib").unwrap().strict_mode);
+    }
+
+    /// v1.3: contagion through a 2-hop chain (entry → mid → leaf).
+    #[test]
+    fn v1_3_strict_propagates_two_hops() {
+        let mut loader = MapLoader::new();
+        loader
+            .add(
+                "./mid",
+                "/abs/mid",
+                "#import * from \"./leaf\"\n{ relay: 1 }",
+            )
+            .add("./leaf", "/abs/leaf", r#"{ leaf: 1 }"#);
+        let ws = build(
+            "/abs/entry".to_string(),
+            "#strict\n#import * from \"./mid\"\n{ x: 1 }",
+            PathBuf::from("/abs"),
+            &mut loader,
+        );
+        assert!(ws.strict_mode);
+        assert!(ws.modules.get("/abs/entry").unwrap().strict_mode);
+        assert!(ws.modules.get("/abs/mid").unwrap().strict_mode);
+        assert!(ws.modules.get("/abs/leaf").unwrap().strict_mode);
+    }
+
+    /// v1.3: diamond import (entry → b, c; b → d; c → d). Strict mode
+    /// reaches every node — `d` is visited once and stamped strict.
+    #[test]
+    fn v1_3_strict_propagates_diamond() {
+        let mut loader = MapLoader::new();
+        loader
+            .add("./b", "/abs/b", "#import * from \"./d\"\n{ from_b: 1 }")
+            .add("./c", "/abs/c", "#import * from \"./d\"\n{ from_c: 1 }")
+            .add("./d", "/abs/d", r#"{ deep: 1 }"#);
+        let ws = build(
+            "/abs/entry".to_string(),
+            "#strict\n#import * from \"./b\"\n#import * from \"./c\"\n{ x: 1 }",
+            PathBuf::from("/abs"),
+            &mut loader,
+        );
+        assert!(ws.strict_mode);
+        for m in ["/abs/entry", "/abs/b", "/abs/c", "/abs/d"] {
+            assert!(
+                ws.modules.get(m).unwrap().strict_mode,
+                "module {m} should be strict"
+            );
+        }
+    }
+
+    /// v1.3 forward: a strict entry catches a silent-fallback in an
+    /// imported module (untyped non-literal spread). The import stamps
+    /// strict_mode=true on the lib, which then runs the spread check
+    /// and emits `MissingSpreadTypeHint`.
+    #[test]
+    fn v1_3_strict_contagion_catches_lib_silent_fallback() {
+        let mut loader = MapLoader::new();
+        loader.add("./lib", "/abs/lib", r#"{ src: 1 + 2, val: { ...src } }"#);
+        let ws = build(
+            "/abs/entry".to_string(),
+            "#strict\n#import * from \"./lib\"\n{ x: 1 }",
+            PathBuf::from("/abs"),
+            &mut loader,
+        );
+        let lib_diags = &ws.modules.get("/abs/lib").unwrap().diagnostics;
+        assert!(
+            lib_diags
+                .iter()
+                .any(|d| matches!(d, Diagnostic::MissingSpreadTypeHint { .. })),
+            "lib should report MissingSpreadTypeHint under strict contagion: {:?}",
+            lib_diags
         );
     }
 

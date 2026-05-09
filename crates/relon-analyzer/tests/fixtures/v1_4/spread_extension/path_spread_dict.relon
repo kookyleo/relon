@@ -1,0 +1,8 @@
+// v1.4 spread extension: `...o.kv` where `kv: Dict<String, Int>` —
+// the spread source's static type is `Dict<...>`, fully classified.
+// Strict mode accepts it.
+// EXPECTED: no MissingSpreadTypeHint.
+#strict
+#schema Order { Dict<String, Int> kv: *, Int id: * }
+#main(Order o) -> Dict<String, Int>
+{ id: o.id, ...o.kv }

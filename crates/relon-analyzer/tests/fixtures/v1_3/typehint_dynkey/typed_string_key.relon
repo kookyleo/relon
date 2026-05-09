@@ -1,0 +1,4 @@
+// v1.3: typed dynamic key with String — silent.
+// EXPECTED: no diagnostics.
+#strict
+{ k: "answer", [<String> k]: 42 }

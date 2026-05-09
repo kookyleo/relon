@@ -321,6 +321,173 @@ pub enum Diagnostic {
         #[label("overflows here")]
         range: SourceSpan,
     },
+
+    // === v1.3 strict-mode diagnostics ===
+    #[error("dynamic spread requires a `<T>` type hint under `#strict`")]
+    #[diagnostic(
+        code(relon::analyze::missing_spread_type_hint),
+        help(
+            "Strict mode forbids spreading a value whose static shape isn't known. Annotate the spread with the spread source's schema, e.g. `...<Extra> e`, or remove `#strict`."
+        )
+    )]
+    MissingSpreadTypeHint {
+        #[label("untyped spread")]
+        range: SourceSpan,
+    },
+
+    #[error("dynamic dict key requires a `<T>` type hint under `#strict`")]
+    #[diagnostic(
+        code(relon::analyze::missing_dynamic_key_type_hint),
+        help(
+            "Strict mode forbids `[expr]: value` keys whose type isn't statically declared. Annotate the key, e.g. `[<String> k]: value`, or remove `#strict`."
+        )
+    )]
+    MissingDynamicKeyTypeHint {
+        #[label("untyped dynamic key")]
+        range: SourceSpan,
+    },
+
+    #[error("strict mode: type of reference `{name}` cannot be inferred")]
+    #[diagnostic(
+        code(relon::analyze::unknown_reference_type),
+        help(
+            "Strict mode requires every value to have a statically inferable type. The reference resolves but its target carries no declared type. Add a type annotation at the target, or remove `#strict`."
+        )
+    )]
+    UnknownReferenceType {
+        /// Final segment whose type couldn't be determined. For a
+        /// single-segment failure (`Variable("u")` with no static
+        /// type) this is the bare head; for a multi-segment failure
+        /// (`o.unknown` where `o` is a known schema but `unknown`
+        /// isn't a declared field) this is the failing tail segment.
+        name: String,
+        /// Full dotted path the strict pass walked, in source order
+        /// (`["o", "unknown"]`). Lets diagnostic consumers reconstruct
+        /// the chain of fields that led to the failure without
+        /// re-walking the AST.
+        path: Vec<String>,
+        #[label("type unknown")]
+        range: SourceSpan,
+    },
+
+    #[error("strict mode: schema `{name}` is not declared in this workspace")]
+    #[diagnostic(
+        code(relon::analyze::unresolved_schema),
+        help(
+            "Strict mode requires every schema reference to point at a declared `#schema` definition. Declare the schema or remove `#strict`."
+        )
+    )]
+    UnresolvedSchema {
+        name: String,
+        #[label("schema not found")]
+        range: SourceSpan,
+    },
+
+    #[error("strict mode: cannot statically infer this expression ({reason})")]
+    #[diagnostic(
+        code(relon::analyze::inference_limit),
+        help(
+            "Strict mode requires every expression to have a derivable static type. Either annotate the surrounding binding so inference has a target, or remove `#strict`."
+        )
+    )]
+    InferenceLimit {
+        reason: String,
+        #[label("inference failed")]
+        range: SourceSpan,
+    },
+
+    #[error(
+        "strict mode forbids native fn `{fn_name}` whose return type isn't statically declared"
+    )]
+    #[diagnostic(
+        code(relon::analyze::strict_forbids_native_return),
+        help(
+            "Native functions reach a host implementation that may produce any value; strict mode demands a static return type. Either expose the fn through `host_fn_signatures` with a declared return type, or stop calling it from a strict module."
+        )
+    )]
+    StrictForbidsNativeReturn {
+        fn_name: String,
+        #[label("untyped native call")]
+        range: SourceSpan,
+    },
+
+    #[error("strict mode requires closure parameter `{param_name}` to declare a type")]
+    #[diagnostic(
+        code(relon::analyze::strict_forbids_untyped_closure_param),
+        help(
+            "Strict mode forbids closure parameters whose type defaults to `Any`. Annotate each parameter with a type (e.g. `(Int n) => n + 1`), or remove `#strict`."
+        )
+    )]
+    StrictForbidsUntypedClosureParam {
+        param_name: String,
+        #[label("missing type for `{param_name}`")]
+        range: SourceSpan,
+    },
+
+    // (v1.5 `StrictForbidsUntypedMainParam` retired in v1.6 — the
+    // generic `ExplicitAnyForbidden` covers `#main(Any x)` in every
+    // mode, replacing the strict-only variant.)
+    #[error(
+        "strict mode requires closure body inference — `{role}` cannot be classified statically"
+    )]
+    #[diagnostic(
+        code(relon::analyze::strict_forbids_unclassified_closure_body),
+        help(
+            "Strict mode demands every closure body produce a derivable type. Either declare `-> ReturnType`, or refactor the body so its type is reachable from inference. Removing `#strict` is the other escape hatch."
+        )
+    )]
+    StrictForbidsUnclassifiedClosureBody {
+        role: String,
+        #[label("uninferable closure body")]
+        range: SourceSpan,
+    },
+
+    #[error("duplicate field `{field}` produced by spread")]
+    #[diagnostic(
+        code(relon::analyze::duplicate_field),
+        help(
+            "A spread source contributes a key that's already declared on the dict. Rename one of the conflicting entries, or restructure the spread so it doesn't double-bind the same name."
+        )
+    )]
+    DuplicateField {
+        field: String,
+        #[label("duplicate field")]
+        range: SourceSpan,
+    },
+
+    #[error("type `Any` is not allowed in user code (`{context}`)")]
+    #[diagnostic(
+        code(relon::analyze::explicit_any_forbidden),
+        help(
+            "v1.6 retired `Any` from the user-facing surface. Use a concrete type (`Int`, `String`, ...), a parameterized container (`List<T>`, `Dict<String, V>`), an `Enum<...>` for sum types, or declare a `#schema` for structured payloads. If you genuinely need an opaque pass-through, define a single-field schema and pass it explicitly."
+        )
+    )]
+    ExplicitAnyForbidden {
+        /// Where the `Any` token appeared, named for the diagnostic
+        /// message: e.g. `schema field`, `#main parameter`, `closure
+        /// parameter`, `closure return type`, `typed binding`.
+        context: String,
+        #[label("`Any` is no longer accepted here")]
+        range: SourceSpan,
+    },
+
+    #[error("bare `{type_name}` requires explicit type parameter(s) in `{context}`")]
+    #[diagnostic(
+        code(relon::analyze::bare_generic_container),
+        help(
+            "v1.7 retires the bare-generic shorthand. Write `List<T>`, `Dict<K, V>`, or `Closure<...>` with explicit element / parameter / return types — bare `List` was equivalent to `List<Any>` and v1.6 already banned `Any` from the user surface. `Enum<...>` likewise needs at least one alternative."
+        )
+    )]
+    BareGenericContainer {
+        /// The bare type name encountered (`List`, `Dict`, `Closure`,
+        /// `Fn`, `Enum`).
+        type_name: String,
+        /// Same `context` shape as `ExplicitAnyForbidden` so
+        /// diagnostics from both checks read uniformly.
+        context: String,
+        #[label("missing type parameter(s)")]
+        range: SourceSpan,
+    },
 }
 
 impl Diagnostic {
@@ -358,7 +525,34 @@ impl Diagnostic {
             // from source — promote to Error so the evaluator never
             // re-discovers the same problem.
             | Diagnostic::ConstDivisionByZero { .. }
-            | Diagnostic::ConstNumericOverflow { .. } => Severity::Error,
+            | Diagnostic::ConstNumericOverflow { .. }
+            // v1.3: strict-mode diagnostics gate evaluation just like
+            // every other static error — the language contract is
+            // "everything statically inferable is checked statically".
+            | Diagnostic::MissingSpreadTypeHint { .. }
+            | Diagnostic::MissingDynamicKeyTypeHint { .. }
+            | Diagnostic::UnknownReferenceType { .. }
+            | Diagnostic::UnresolvedSchema { .. }
+            | Diagnostic::InferenceLimit { .. }
+            | Diagnostic::StrictForbidsNativeReturn { .. }
+            // v1.5: every closure parameter must declare a type
+            // under strict mode; closure bodies must be statically
+            // classifiable. (`StrictForbidsUntypedMainParam` was
+            // retired in v1.6 — the generic `ExplicitAnyForbidden`
+            // diagnostic now covers `#main(Any x)` in every mode.)
+            | Diagnostic::StrictForbidsUntypedClosureParam { .. }
+            | Diagnostic::StrictForbidsUnclassifiedClosureBody { .. }
+            // v1.6: `Any` is banned from the user-facing surface in
+            // every mode. Reaches Error because nothing the user
+            // could have meant by writing `Any` is well-defined any
+            // more — the language has concrete types, parameterized
+            // containers, enums, and schemas to cover the space.
+            | Diagnostic::ExplicitAnyForbidden { .. }
+            // v1.7: bare `List` / `Dict` / `Closure` / `Fn` / `Enum`
+            // (no generic parameters) is equivalent to leaking `Any`
+            // through the back door — Error severity in every mode.
+            | Diagnostic::BareGenericContainer { .. }
+            | Diagnostic::DuplicateField { .. } => Severity::Error,
             // Informational: the analyzer's view is conservative — a
             // spread, closure binding, or runtime-computed field may
             // still resolve, so we don't gate evaluation on it.

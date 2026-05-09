@@ -1,0 +1,6 @@
+// v1.3: spread of a sibling field. Sibling target carries an
+// explicit `Extra:` type prefix; strict mode accepts the spread.
+// EXPECTED: no diagnostics.
+#strict
+#schema Extra { Int a: *, Int b: * }
+{ Extra base: { a: 1, b: 2 }, val: { ...<Extra> base } }
