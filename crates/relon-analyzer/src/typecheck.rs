@@ -15,9 +15,10 @@
 //! [`StaticTypeMismatch`]: crate::Diagnostic::StaticTypeMismatch
 
 use crate::diagnostic::{span_of, Diagnostic};
+use crate::generics::collect_bindings;
 use crate::infer::{self, infer_type, InferredType, SchemaBaseIndex, TypeScope};
 use crate::resolve::{build_frame, path_head, ScopeFrame};
-use crate::sig::{lookup_signature, type_node_simple, FnParam, FnSignature};
+use crate::sig::{instantiate, lookup_signature, type_node_simple, FnParam, FnSignature};
 use crate::tree::AnalyzedTree;
 use relon_parser::{
     child_nodes, ClosureParam, Expr, Node, RefBase, TokenKey, TokenRange, TypeNode,
@@ -359,14 +360,34 @@ impl<'a> Walker<'a> {
         // We collect diagnostics into a local Vec so the inference
         // scope's read-only borrow of `self.tree` doesn't collide with
         // the diagnostic push's mutable borrow.
+        //
+        // v1.1: when `sig.generics` is non-empty, run unification over
+        // every (param_ty, arg_ty) pair first to collect placeholder
+        // bindings, then instantiate the signature so each per-arg
+        // subsumption check sees a concrete type. The substitution
+        // is shared with the FnCall return-type inference path in
+        // `infer::infer_type` so the rest of the analyzer reads the
+        // tightened type back out as `List<Int>` etc.
         let mut to_emit: Vec<Diagnostic> = Vec::new();
         {
             let scope = self.build_type_scope();
+            let working_sig = if sig.generics.is_empty() {
+                sig.clone()
+            } else {
+                let bindings = collect_bindings(&sig, args, &scope);
+                instantiate(&sig, &bindings)
+            };
             for (idx, arg) in args.iter().enumerate() {
-                let (param_name, expected_ty) = if idx < sig.params.len() {
-                    (sig.params[idx].name.clone(), sig.params[idx].ty.clone())
-                } else if let Some(tail_ty) = &sig.variadic_tail {
-                    (format!("rest[{}]", idx - sig.params.len()), tail_ty.clone())
+                let (param_name, expected_ty) = if idx < working_sig.params.len() {
+                    (
+                        working_sig.params[idx].name.clone(),
+                        working_sig.params[idx].ty.clone(),
+                    )
+                } else if let Some(tail_ty) = &working_sig.variadic_tail {
+                    (
+                        format!("rest[{}]", idx - working_sig.params.len()),
+                        tail_ty.clone(),
+                    )
                 } else {
                     continue;
                 };
@@ -880,6 +901,21 @@ impl<'a> Walker<'a> {
                 self.check_generics(expected, value, field_name);
                 return;
             }
+            // v1.1: when the failure is at the *element* level of a
+            // matching outer shape (`List<...>` against `List<...>`,
+            // `Dict<...>` against `Dict<...>`) and the value is a
+            // literal, defer to the structural `check_generics`
+            // walker so the diagnostic carries the precise inner
+            // path (`matrix[1][0]: Int / String`) instead of the
+            // coarser `matrix[1]: List<Int> / List<String>`. The
+            // outer head must still match — an Int landing in a
+            // List slot stays a coarse mismatch.
+            if same_outer_container(t, expected)
+                && matches!(&*value.expr, Expr::List(_) | Expr::Dict(_))
+            {
+                self.check_generics(expected, value, field_name);
+                return;
+            }
             self.tree.diagnostics.push(Diagnostic::StaticTypeMismatch {
                 field: field_name.to_string(),
                 expected: format_type(expected),
@@ -1030,10 +1066,27 @@ fn extract_closure_signature(
         // names them by their `NodeId` so diagnostics referring back to
         // the original site still have an unambiguous handle.
         name: format!("<closure#{:?}>", closure_node.id),
+        // v1 user closures don't declare generic parameters in source,
+        // so the placeholder list stays empty.
+        generics: Vec::new(),
         params: fn_params,
         return_type: return_ty,
         variadic_tail: None,
     }
+}
+
+/// True when `inferred` and `expected` agree on their outer
+/// container shape (`List`/`Dict`) but disagree somewhere deeper.
+/// Used by `check_typed_binding` to decide whether to defer to the
+/// structural element walker for a more precise diagnostic location.
+fn same_outer_container(inferred: &InferredType, expected: &TypeNode) -> bool {
+    if expected.path.len() != 1 {
+        return false;
+    }
+    matches!(
+        (inferred, expected.path[0].as_str()),
+        (InferredType::List(_), "List") | (InferredType::Dict(_), "Dict")
+    )
 }
 
 fn format_type(t: &TypeNode) -> String {
@@ -2443,5 +2496,111 @@ mod tests {
                 .map(|d| d.severity()),
             Some(crate::Severity::Error)
         );
+    }
+
+    // ----- v1.1: generic instantiation (List<T> / Result<T,E> -----
+
+    fn fn_call_arg_mismatch_count(tree: &AnalyzedTree) -> usize {
+        tree.diagnostics
+            .iter()
+            .filter(|d| matches!(d, Diagnostic::FnCallArgTypeMismatch { .. }))
+            .count()
+    }
+
+    fn static_mismatch_count(tree: &AnalyzedTree) -> usize {
+        tree.diagnostics
+            .iter()
+            .filter(|d| matches!(d, Diagnostic::StaticTypeMismatch { .. }))
+            .count()
+    }
+
+    /// `_list_map(["a","b"], (s) => s)` returns `List<String>`; placing
+    /// it in a `List<Int>` slot must flag a static mismatch derivable
+    /// purely from source + stdlib signatures.
+    #[test]
+    fn v1_1_list_map_return_type_mismatches_int_slot() {
+        let tree = analyze_str(r#"{ List<Int> xs: _list_map(["a", "b"], (s) => s) }"#);
+        assert!(static_mismatch_count(&tree) >= 1, "{:?}", tree.diagnostics);
+        assert!(tree.has_errors());
+    }
+
+    /// Inverse: `List<String>` slot, mapping `[1,2,3]` through
+    /// `(n) => n` returns `List<Int>` — should also flag.
+    #[test]
+    fn v1_1_list_map_return_type_mismatches_string_slot() {
+        let tree = analyze_str(r#"{ List<String> xs: _list_map([1, 2, 3], (n) => n) }"#);
+        assert!(static_mismatch_count(&tree) >= 1, "{:?}", tree.diagnostics);
+        assert!(tree.has_errors());
+    }
+
+    /// `_list_contains([1,2], "x")` — `T` binds `Int` from arg 0; the
+    /// String literal in arg 1 then mismatches the substituted `T`
+    /// slot.
+    #[test]
+    fn v1_1_list_contains_arg_type_mismatch_after_unification() {
+        let tree = analyze_str(r#"{ Bool b: _list_contains([1, 2], "x") }"#);
+        assert!(
+            fn_call_arg_mismatch_count(&tree) >= 1,
+            "{:?}",
+            tree.diagnostics
+        );
+        assert!(tree.has_errors());
+    }
+
+    /// Negative: `List<Int> xs: _list_map([1,2,3], (n) => n + 1)` —
+    /// `T → Int`, body type `Int`, `U → Int`, return `List<Int>`,
+    /// matches the slot. Should produce zero static / FnCall arg
+    /// mismatches related to the call.
+    #[test]
+    fn v1_1_list_map_int_to_int_passes() {
+        let tree = analyze_str(r#"{ List<Int> xs: _list_map([1, 2, 3], (n) => n + 1) }"#);
+        let irrelevant_ok = tree.diagnostics.iter().all(|d| {
+            !matches!(
+                d,
+                Diagnostic::StaticTypeMismatch { .. } | Diagnostic::FnCallArgTypeMismatch { .. }
+            )
+        });
+        assert!(irrelevant_ok, "{:?}", tree.diagnostics);
+    }
+
+    /// Negative: `_list_contains` with a same-typed needle stays
+    /// silent.
+    #[test]
+    fn v1_1_list_contains_same_type_passes() {
+        let tree = analyze_str(r#"{ Bool b: _list_contains([1, 2, 3], 2) }"#);
+        let irrelevant_ok = tree.diagnostics.iter().all(|d| {
+            !matches!(
+                d,
+                Diagnostic::StaticTypeMismatch { .. } | Diagnostic::FnCallArgTypeMismatch { .. }
+            )
+        });
+        assert!(irrelevant_ok, "{:?}", tree.diagnostics);
+    }
+
+    /// Negative: `_list_reduce([1,2,3], 0, (acc, x) => acc + x)` —
+    /// `T → Int` (from arg 0), `U → Int` (from `init`), body type
+    /// `Int`. Return slot `U` reads as `Int`, matches the
+    /// `Int s:` binding.
+    #[test]
+    fn v1_1_list_reduce_int_init_passes_int_slot() {
+        let tree = analyze_str(r#"{ Int s: _list_reduce([1, 2, 3], 0, (acc, x) => acc + x) }"#);
+        let irrelevant_ok = tree.diagnostics.iter().all(|d| {
+            !matches!(
+                d,
+                Diagnostic::StaticTypeMismatch { .. } | Diagnostic::FnCallArgTypeMismatch { .. }
+            )
+        });
+        assert!(irrelevant_ok, "{:?}", tree.diagnostics);
+    }
+
+    /// Consistency: when the analyzer reports a v1.1 mismatch, the
+    /// tree must have `has_errors() == true` so hosts that follow
+    /// the documented "skip eval on errors" pattern won't reach
+    /// the evaluator's runtime path. (The v1.1 report flips the
+    /// "is this caught statically?" answer to yes.)
+    #[test]
+    fn v1_1_static_mismatch_marks_tree_as_errored() {
+        let tree = analyze_str(r#"{ Bool b: _list_contains([1, 2], "x") }"#);
+        assert!(tree.has_errors(), "{:?}", tree.diagnostics);
     }
 }

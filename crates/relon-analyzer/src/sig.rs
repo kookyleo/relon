@@ -39,12 +39,83 @@ pub struct FnParam {
 #[derive(Debug, Clone)]
 pub struct FnSignature {
     pub name: String,
+    /// v1.1: ordered list of generic type parameter names declared by
+    /// this signature (e.g. `["T", "U"]`). Empty for monomorphic fns.
+    /// Occurrences of these names inside `params[i].ty`,
+    /// `variadic_tail`, or `return_type` (as a single-segment
+    /// zero-generic `TypeNode`) are placeholders, instantiated at the
+    /// call site by [`instantiate`].
+    pub generics: Vec<String>,
     pub params: Vec<FnParam>,
     pub return_type: TypeNode,
     /// When `Some`, the call may receive zero or more *additional*
     /// trailing arguments of this type after the fixed `params`. Used
     /// for `_dict_merge` and the `range` 1-or-2-arg form.
     pub variadic_tail: Option<TypeNode>,
+}
+
+impl FnSignature {
+    /// True when `name` matches one of this signature's declared
+    /// generic parameter names. Used by the unification / substitution
+    /// helpers to distinguish `T` (placeholder) from `Int` (concrete).
+    pub fn is_generic_param(&self, name: &str) -> bool {
+        self.generics.iter().any(|g| g == name)
+    }
+}
+
+/// v1.1: apply a binding map to every type slot in `sig` (params,
+/// `variadic_tail`, `return_type`), producing an instantiated copy.
+/// Unbound generic placeholders are left as-is; the caller may treat
+/// such residual references as "couldn't pin down — fall back to Any"
+/// at use sites.
+pub fn instantiate(
+    sig: &FnSignature,
+    bindings: &std::collections::HashMap<String, TypeNode>,
+) -> FnSignature {
+    if bindings.is_empty() || sig.generics.is_empty() {
+        return sig.clone();
+    }
+    let mut out = sig.clone();
+    for p in &mut out.params {
+        substitute_in_type_node(&mut p.ty, &sig.generics, bindings);
+    }
+    if let Some(tail) = out.variadic_tail.as_mut() {
+        substitute_in_type_node(tail, &sig.generics, bindings);
+    }
+    substitute_in_type_node(&mut out.return_type, &sig.generics, bindings);
+    out
+}
+
+/// In-place substitution. A `TypeNode` is treated as a placeholder
+/// when its `path` is a single segment listed in `generics` and it
+/// carries no nested generics of its own (mirrors the
+/// runtime-evaluator schema substitution rule). Optionality flags are
+/// preserved by ORing the placeholder's `is_optional` with the
+/// replacement's.
+///
+/// Exposed `pub(crate)` so the closure-aware unification pass in
+/// `crate::generics::collect_bindings` can reuse the same rule when
+/// projecting partial bindings into a closure-arg's child scope.
+pub(crate) fn substitute_in_type_node(
+    t: &mut TypeNode,
+    generics: &[String],
+    bindings: &std::collections::HashMap<String, TypeNode>,
+) {
+    if t.path.len() == 1 && t.generics.is_empty() && generics.iter().any(|g| g == &t.path[0]) {
+        if let Some(replacement) = bindings.get(&t.path[0]) {
+            let was_optional = t.is_optional;
+            let range = t.range;
+            *t = replacement.clone();
+            t.is_optional = t.is_optional || was_optional;
+            t.range = range;
+            return;
+        }
+        // Unbound placeholder: leave as-is (caller decides).
+        return;
+    }
+    for inner in &mut t.generics {
+        substitute_in_type_node(inner, generics, bindings);
+    }
 }
 
 /// Build a single-segment `TypeNode` for a builtin name (`Int`, `Bool`,

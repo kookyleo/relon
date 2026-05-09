@@ -27,6 +27,15 @@ macro_rules! tn {
     };
 }
 
+/// v1.1 helper: build a single-segment `TypeNode` whose name is
+/// listed in the surrounding signature's `generics`. Visually
+/// distinct from [`tn!`] at the call site so reviewers can see at a
+/// glance which slots are placeholders. Identical encoding —
+/// disambiguation happens via [`crate::sig::FnSignature::generics`].
+fn tn_var(name: &str) -> relon_parser::TypeNode {
+    crate::sig::type_node_simple(name)
+}
+
 /// Required-positional parameter helper. `param!("x", tn!(Int))`.
 fn param(name: &str, ty: relon_parser::TypeNode) -> FnParam {
     FnParam {
@@ -51,10 +60,26 @@ fn sig(
     return_type: relon_parser::TypeNode,
     variadic_tail: Option<relon_parser::TypeNode>,
 ) -> (String, FnSignature) {
+    sig_generic(name, Vec::new(), params, return_type, variadic_tail)
+}
+
+/// v1.1: variant of [`sig`] for polymorphic stdlib fns. `generics` is
+/// the ordered list of placeholder names that may appear inside any
+/// `TypeNode` slot (param ty, variadic_tail, return_type). The call
+/// site instantiates them via [`crate::sig::instantiate`] after
+/// running unification against the actual arg types.
+fn sig_generic(
+    name: &str,
+    generics: Vec<String>,
+    params: Vec<FnParam>,
+    return_type: relon_parser::TypeNode,
+    variadic_tail: Option<relon_parser::TypeNode>,
+) -> (String, FnSignature) {
     (
         name.to_string(),
         FnSignature {
             name: name.to_string(),
+            generics,
             params,
             return_type,
             variadic_tail,
@@ -97,46 +122,73 @@ fn build() -> HashMap<String, FnSignature> {
     let (k, v) = sig("type", vec![param("value", tn!(Any))], tn!(String), None);
     m.insert(k, v);
 
-    // -- list intrinsics (polymorphic; return Any in v1) -----------------
-    // `_list_map(list, fn)` — first arg must be List, second is a closure /
-    // Any. Return is the mapped list — modeled as Any (no generic
-    // instantiation in v1).
-    let (k, v) = sig(
+    // -- list intrinsics (polymorphic; v1.1 generics) -----------------
+    // `_list_map<T, U>(List<T>, Closure<(T) -> U>) -> List<U>`.
+    //
+    // The closure slot is encoded as `Closure<T, U>` (positional —
+    // last generic is the return slot). The unifier descends into
+    // closure-literal args, runs the closure body under a scope
+    // where `T` is already bound, and pulls the body's type back out
+    // as the binding for `U`. Args that aren't closure literals fall
+    // back to the per-arg subsumption check, which accepts any
+    // closure shape (Closure / Fn / Any).
+    let (k, v) = sig_generic(
         "_list_map",
+        vec!["T".into(), "U".into()],
         vec![
-            param("list", type_node_generic("List", vec![tn!(Any)])),
-            param("f", tn!(Any)),
+            param("list", type_node_generic("List", vec![tn_var("T")])),
+            param(
+                "f",
+                type_node_generic("Closure", vec![tn_var("T"), tn_var("U")]),
+            ),
         ],
-        tn!(Any),
+        type_node_generic("List", vec![tn_var("U")]),
         None,
     );
     m.insert(k, v);
-    let (k, v) = sig(
+    // `_list_filter<T>(List<T>, Closure<(T) -> Bool>) -> List<T>`.
+    let (k, v) = sig_generic(
         "_list_filter",
+        vec!["T".into()],
         vec![
-            param("list", type_node_generic("List", vec![tn!(Any)])),
-            param("f", tn!(Any)),
+            param("list", type_node_generic("List", vec![tn_var("T")])),
+            param(
+                "f",
+                type_node_generic("Closure", vec![tn_var("T"), tn!(Bool)]),
+            ),
         ],
-        tn!(Any),
+        type_node_generic("List", vec![tn_var("T")]),
         None,
     );
     m.insert(k, v);
-    let (k, v) = sig(
+    // `_list_reduce<T, U>(List<T>, U, Closure<(U, T) -> U>) -> U`.
+    // We bind `U` from the `init` arg (arg 1) — that's enough to
+    // instantiate the return type when the caller declares
+    // `Int s: _list_reduce([1,2,3], 0, ...)`.
+    let (k, v) = sig_generic(
         "_list_reduce",
+        vec!["T".into(), "U".into()],
         vec![
-            param("list", type_node_generic("List", vec![tn!(Any)])),
-            param("init", tn!(Any)),
-            param("f", tn!(Any)),
+            param("list", type_node_generic("List", vec![tn_var("T")])),
+            param("init", tn_var("U")),
+            param(
+                "f",
+                type_node_generic("Closure", vec![tn_var("U"), tn_var("T"), tn_var("U")]),
+            ),
         ],
-        tn!(Any),
+        tn_var("U"),
         None,
     );
     m.insert(k, v);
-    let (k, v) = sig(
+    // `_list_contains<T>(List<T>, T) -> Bool`. `T` is bound from
+    // arg 0; the per-arg subsumption check then catches a
+    // `_list_contains([1,2], "x")` mismatch as `String` vs `Int`.
+    let (k, v) = sig_generic(
         "_list_contains",
+        vec!["T".into()],
         vec![
-            param("list", type_node_generic("List", vec![tn!(Any)])),
-            param("needle", tn!(Any)),
+            param("list", type_node_generic("List", vec![tn_var("T")])),
+            param("needle", tn_var("T")),
         ],
         tn!(Bool),
         None,

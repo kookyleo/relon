@@ -22,6 +22,7 @@ pub(crate) mod const_fold;
 pub(crate) mod decorator_names;
 pub mod diagnostic;
 pub(crate) mod directive_names;
+pub(crate) mod generics;
 pub(crate) mod infer;
 pub(crate) mod main_return;
 pub mod main_sig;

@@ -24,7 +24,7 @@ use relon_parser::{Expr, Node, Operator, TokenKey, TypeNode};
 use std::collections::HashMap;
 
 use crate::resolve::ScopeFrame;
-use crate::sig::lookup_signature;
+use crate::sig::{instantiate, lookup_signature};
 use crate::tree::AnalyzedTree;
 
 /// Map from schema-name → field-name → declared type. Lets the inference
@@ -171,8 +171,25 @@ impl InferredType {
             "Bool" => matches!(self, InferredType::Bool),
             "String" => matches!(self, InferredType::String),
             "Null" => matches!(self, InferredType::Null),
-            "List" => matches!(self, InferredType::List(_)),
-            "Dict" => matches!(self, InferredType::Dict(_)),
+            // v1.1: when the slot declares an element type
+            // (`List<T>`, `Dict<String, T>`), recurse so a `List<Int>`
+            // doesn't slip into a `List<String>` slot. A bare
+            // unparameterized `List` keeps the v1 permissive
+            // behavior.
+            "List" => match self {
+                InferredType::List(elem) => match expected.generics.first() {
+                    Some(slot) => elem.subsumes_with(slot, bases),
+                    None => true,
+                },
+                _ => false,
+            },
+            "Dict" => match self {
+                InferredType::Dict(val) => match expected.generics.get(1) {
+                    Some(slot) => val.subsumes_with(slot, bases),
+                    None => true,
+                },
+                _ => false,
+            },
             "Closure" | "Fn" => matches!(self, InferredType::Fn(_, _)),
             "Enum" => true, // tagged-enum metadata isn't tracked here
             // Custom schema name: we'd need the schema_index to know
@@ -504,7 +521,15 @@ pub(crate) fn infer_type(node: &Node, scope: &TypeScope) -> Option<InferredType>
         // signature (closure-index → host fns → stdlib), surface its
         // return type. Multi-segment / unknown calls still return
         // `None` so runtime keeps the verdict.
-        Expr::FnCall { path, .. } => {
+        //
+        // v1.1: if the signature is generic, run unification against
+        // each arg's inferred type so the returned `InferredType`
+        // reflects placeholders the call site can pin down — e.g.
+        // `_list_map([1,2,3], (n) => n + 1)` returns `List<Int>`
+        // instead of `Any`. Args that infer to `None` / `Any`
+        // contribute no binding; remaining placeholders fall back to
+        // `Any` via `infer_from_type_node`.
+        Expr::FnCall { path, args } => {
             if path.len() != 1 {
                 return None;
             }
@@ -513,7 +538,12 @@ pub(crate) fn infer_type(node: &Node, scope: &TypeScope) -> Option<InferredType>
             };
             let tree = scope.tree?;
             let sig = lookup_signature(name, tree, &tree.host_fn_signatures)?;
-            Some(infer_from_type_node(&sig.return_type))
+            if sig.generics.is_empty() {
+                return Some(infer_from_type_node(&sig.return_type));
+            }
+            let bindings = crate::generics::collect_bindings(&sig, args, scope);
+            let instantiated = instantiate(&sig, &bindings);
+            Some(infer_from_type_node(&instantiated.return_type))
         }
         // Comprehension / Where / Spread fall through to None — Stage 1
         // explicitly leaves them for later phases.
