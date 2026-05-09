@@ -1,6 +1,40 @@
 # Changelog
 
-## [Unreleased] — v1.8: Enum / Result first-class + host fn audit + cross-module + tuple-index
+## [Unreleased] — Sandboxed-by-default facade + spec narrative cleanup
+
+### BREAKING: facade entry points now default to a sandboxed runtime
+
+The default-host entry points — `relon::value_from_str`,
+`value_from_file`, `from_str`, `from_file`, `json_from_str`,
+`json_from_file`, `project_from_str`, plus the `relon-cli run`
+subcommand — used to mount `Capabilities::all_granted()` plus a
+trusted `FilesystemModuleResolver`. Anyone copying the README's quick
+start was actually getting "all granted by default", which contradicts
+the spec's `Sandboxed by default` posture.
+
+These entry points now default to **sandboxed**:
+
+- only `std/*` virtual modules resolve; local `#import "./foo.relon"`
+  paths surface as `ModuleNotFound`,
+- `Capabilities` stay at the `Context::sandboxed()` defaults — fs
+  reads denied, capability-gated native fns denied.
+
+Hosts that need the legacy fully-granted environment now opt in via
+explicit `*_trusted` variants:
+
+- `value_from_str_trusted`, `value_from_file_trusted`,
+- `from_str_trusted`, `from_file_trusted`,
+- `json_from_str_trusted`, `json_from_file_trusted`,
+- `project_from_str_trusted`,
+- on the CLI: `relon-cli run <file> --trust`.
+
+If your script imports local files, calls `register_fn_with_caps`-
+gated host fns, or otherwise needs FS / network capability, switch
+the call site to the corresponding `*_trusted` entry. Plain `std/*`
+imports and host-owned data (no FS / native-fn dependencies) need no
+change.
+
+## [Earlier-Unreleased] — v1.8: Enum / Result first-class + host fn audit + cross-module + tuple-index
 
 v1.7 closed the user-source back-doors (`Any`, bare generics). v1.8
 sweeps the remaining surface: the `Enum<...>` slot's

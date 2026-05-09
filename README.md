@@ -20,6 +20,14 @@ Use the `relon-cli` to evaluate a file and output JSON:
 cargo run -p relon-cli -- run examples/demo.relon
 ```
 
+The CLI runs **sandboxed by default**: only `std/*` imports resolve and
+capability-gated native fns are denied. If your script needs local
+`#import "./lib.relon"` paths or registered host fns that touch FS /
+network, pass `--trust`:
+```bash
+cargo run -p relon-cli -- run fixtures/modules/main.relon --trust
+```
+
 ### Local Validation
 Run the full test suite and strict lint gate before shipping changes:
 ```bash

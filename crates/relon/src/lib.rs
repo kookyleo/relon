@@ -68,6 +68,10 @@ pub enum Error {
     UnsupportedSchema,
 }
 
+/// Default-sandboxed: filesystem `#import` and capability-gated
+/// native fns are denied; only `std/*` imports resolve. Use
+/// [`from_str_trusted`] when the script needs the legacy
+/// fully-granted environment.
 pub fn from_str<T>(source: &str) -> Result<T>
 where
     T: DeserializeOwned,
@@ -76,6 +80,18 @@ where
     Ok(serde_json::from_value(value)?)
 }
 
+/// Trusted variant: grants every capability and allows local
+/// filesystem `#import`. Use only on host-owned input.
+pub fn from_str_trusted<T>(source: &str) -> Result<T>
+where
+    T: DeserializeOwned,
+{
+    let value = json_from_str_trusted(source)?;
+    Ok(serde_json::from_value(value)?)
+}
+
+/// Default-sandboxed. See [`from_str`] for the trust posture and
+/// [`from_file_trusted`] for the legacy variant.
 pub fn from_file<T>(path: impl AsRef<Path>) -> Result<T>
 where
     T: DeserializeOwned,
@@ -84,19 +100,48 @@ where
     Ok(serde_json::from_value(value)?)
 }
 
+/// Trusted variant of [`from_file`].
+pub fn from_file_trusted<T>(path: impl AsRef<Path>) -> Result<T>
+where
+    T: DeserializeOwned,
+{
+    let value = json_from_file_trusted(path)?;
+    Ok(serde_json::from_value(value)?)
+}
+
 pub fn json_from_str(source: &str) -> Result<serde_json::Value> {
     to_json_value(value_from_str(source)?)
+}
+
+pub fn json_from_str_trusted(source: &str) -> Result<serde_json::Value> {
+    to_json_value(value_from_str_trusted(source)?)
 }
 
 pub fn json_from_file(path: impl AsRef<Path>) -> Result<serde_json::Value> {
     to_json_value(value_from_file(path)?)
 }
 
+pub fn json_from_file_trusted(path: impl AsRef<Path>) -> Result<serde_json::Value> {
+    to_json_value(value_from_file_trusted(path)?)
+}
+
 pub fn value_from_str(source: &str) -> Result<Value> {
-    evaluate_source(source, ".", "<memory>")
+    evaluate_source(source, ".", "<memory>", TrustMode::Sandboxed)
+}
+
+pub fn value_from_str_trusted(source: &str) -> Result<Value> {
+    evaluate_source(source, ".", "<memory>", TrustMode::Trusted)
 }
 
 pub fn value_from_file(path: impl AsRef<Path>) -> Result<Value> {
+    value_from_file_inner(path, TrustMode::Sandboxed)
+}
+
+pub fn value_from_file_trusted(path: impl AsRef<Path>) -> Result<Value> {
+    value_from_file_inner(path, TrustMode::Trusted)
+}
+
+fn value_from_file_inner(path: impl AsRef<Path>, trust: TrustMode) -> Result<Value> {
     let path = path.as_ref();
     let canonical_path = std::fs::canonicalize(path).map_err(|source| Error::Io {
         path: path.to_path_buf(),
@@ -115,7 +160,17 @@ pub fn value_from_file(path: impl AsRef<Path>) -> Result<Value> {
         &source,
         current_dir,
         canonical_path.to_string_lossy().to_string(),
+        trust,
     )
+}
+
+/// Trust posture used by the facade entry points. The default
+/// (`Sandboxed`) refuses filesystem `#import` and capability-gated
+/// native functions; `Trusted` grants every capability.
+#[derive(Debug, Clone, Copy)]
+enum TrustMode {
+    Sandboxed,
+    Trusted,
 }
 
 /// Project an evaluated [`Value`] to `serde_json::Value` using the default
@@ -149,6 +204,15 @@ pub fn project_from_str<P: Projector>(
     projector.project(&value).map_err(ProjectError::Project)
 }
 
+/// Trusted variant of [`project_from_str`].
+pub fn project_from_str_trusted<P: Projector>(
+    source: &str,
+    projector: &P,
+) -> std::result::Result<P::Output, ProjectError<P::Error>> {
+    let value = value_from_str_trusted(source).map_err(ProjectError::Eval)?;
+    projector.project(&value).map_err(ProjectError::Project)
+}
+
 /// Combined error type returned by [`project_from_str`]: separates
 /// evaluation failures (already typed) from projection failures (whichever
 /// error type the projector chose).
@@ -170,12 +234,20 @@ struct FacadeLoader {
 }
 
 impl FacadeLoader {
+    fn new_sandboxed() -> Self {
+        // Sandboxed posture: only `std/*` virtual modules resolve.
+        // Local `#import "./foo.relon"` paths get no resolver and
+        // surface as `ModuleNotFound`, mirroring the default
+        // `Capabilities` (no `reads_fs`).
+        Self {
+            resolvers: vec![Arc::new(StdModuleResolver)],
+        }
+    }
+
     fn new_trusted() -> Self {
-        // Mirror the resolver chain that `evaluate_source` mounts on
-        // the `Context` below: `std/*` first, then trusted filesystem
-        // fallback. Any host change to one chain has to be made to the
-        // other; centralized here so future refactors can collapse the
-        // two assemblies.
+        // Trusted posture: `std/*` + trusted filesystem fallback. Any
+        // host change to one chain has to mirror the `Context`
+        // assembly below in `evaluate_source`.
         Self {
             resolvers: vec![
                 Arc::new(StdModuleResolver),
@@ -256,6 +328,7 @@ fn evaluate_source(
     source: &str,
     current_dir: impl Into<String>,
     cache_namespace: impl Into<String>,
+    trust: TrustMode,
 ) -> Result<Value> {
     let current_dir = current_dir.into();
     let cache_namespace = cache_namespace.into();
@@ -272,8 +345,12 @@ fn evaluate_source(
     // entry plus every transitive `#import`'d module through one BFS,
     // running the per-file analyzer pass on each. Cycles, missing
     // modules, parse / structural errors anywhere in the graph all
-    // surface here — before we touch the evaluator.
-    let mut loader = FacadeLoader::new_trusted();
+    // surface here — before we touch the evaluator. Loader trust
+    // posture mirrors the eval-side `Context` assembly below.
+    let mut loader = match trust {
+        TrustMode::Sandboxed => FacadeLoader::new_sandboxed(),
+        TrustMode::Trusted => FacadeLoader::new_trusted(),
+    };
     let entry_dir_path = PathBuf::from(&current_dir);
     let workspace = analyze_entry(cache_namespace.clone(), source, entry_dir_path, &mut loader);
 
@@ -302,16 +379,19 @@ fn evaluate_source(
 
     let workspace = Arc::new(workspace);
 
-    // `value_from_str` / `value_from_file` are the host's "evaluate
-    // this Relon document and give me the JSON" entry points — by
-    // construction the file is host-owned, so every capability is
-    // granted. Spelled out so a code reviewer sees the trust scope.
+    // Default entry points (`value_from_str` / `value_from_file`)
+    // run sandboxed: only `std/*` imports resolve, capability-gated
+    // native fns are denied, no fs reads. Hosts that need the legacy
+    // fully-granted runtime call the `*_trusted` variants instead.
+    // Spelled out so a code reviewer sees the trust scope.
     let ctx = {
         let mut ctx = Context::sandboxed()
             .with_root(entry_node)
             .with_workspace(Arc::clone(&workspace));
-        ctx.capabilities = Capabilities::all_granted();
-        ctx.prepend_module_resolver(Arc::new(FilesystemModuleResolver::trusted()));
+        if matches!(trust, TrustMode::Trusted) {
+            ctx.capabilities = Capabilities::all_granted();
+            ctx.prepend_module_resolver(Arc::new(FilesystemModuleResolver::trusted()));
+        }
         Arc::new(ctx)
     };
 
@@ -536,7 +616,9 @@ mod tests {
         let root = workspace_root();
         for file in success_relon_files(&root) {
             let rel_path = file.strip_prefix(&root).unwrap();
-            let value = json_from_file(&file)
+            // Trusted: fixtures use cross-file `#import` and the
+            // sandboxed default would surface those as ModuleNotFound.
+            let value = json_from_file_trusted(&file)
                 .unwrap_or_else(|error| panic!("{} failed: {error}", rel_path.display()));
             let actual = format!("{}\n", serde_json::to_string_pretty(&value).unwrap());
             let expected_path = root
@@ -565,7 +647,8 @@ mod tests {
             "examples/validation.relon",
         ] {
             let path = root.join(rel_path);
-            let error = value_from_file(&path).expect_err("expected fixture to fail");
+            let error =
+                value_from_file_trusted(&path).expect_err("expected fixture to fail");
             let actual = format_error_golden(&root, &path, error);
             let expected_path = root
                 .join("fixtures/golden/errors")
@@ -595,7 +678,7 @@ mod tests {
         )
         .unwrap();
 
-        let value = json_from_file(dir.join("main.relon")).unwrap();
+        let value = json_from_file_trusted(dir.join("main.relon")).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(value.get("msg").and_then(|v| v.as_str()), Some("hi"));
     }
@@ -618,7 +701,9 @@ mod tests {
         )
         .unwrap();
 
-        let result = value_from_file(&entry_path);
+        // Trusted: cycle detection requires the loader to actually
+        // resolve the imported file, which the sandbox loader can't.
+        let result = value_from_file_trusted(&entry_path);
         let _ = std::fs::remove_dir_all(&dir);
         match result {
             Err(Error::AnalyzeWorkspace { workspace, .. }) => {
@@ -673,8 +758,8 @@ mod tests {
         )
         .unwrap();
 
-        let as_entry = json_from_file(dir.join("shared.relon")).unwrap();
-        let as_imported = json_from_file(dir.join("entry.relon")).unwrap();
+        let as_entry = json_from_file_trusted(dir.join("shared.relon")).unwrap();
+        let as_imported = json_from_file_trusted(dir.join("entry.relon")).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(
             as_entry.get("greeting").and_then(|v| v.as_str()),

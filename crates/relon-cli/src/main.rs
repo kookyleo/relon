@@ -17,6 +17,12 @@ struct CliLoader {
 }
 
 impl CliLoader {
+    fn new_sandboxed() -> Self {
+        Self {
+            resolvers: vec![Arc::new(StdModuleResolver)],
+        }
+    }
+
     fn new_trusted() -> Self {
         Self {
             resolvers: vec![
@@ -84,6 +90,16 @@ enum Commands {
         /// or via stdin redirect (`--args -` reads from stdin).
         #[arg(long)]
         args: Option<String>,
+        /// Grant full filesystem and capability-gated native-fn
+        /// access. By default the runtime runs sandboxed: only
+        /// `std/*` imports resolve, local `#import "./foo.relon"`
+        /// paths surface as `ModuleNotFound`, and native fns
+        /// registered via `register_fn_with_caps` are denied. Pass
+        /// `--trust` when the script expects the legacy fully-granted
+        /// environment (e.g. local imports, registered HTTP / FS
+        /// helpers).
+        #[arg(long)]
+        trust: bool,
     },
 }
 
@@ -91,7 +107,12 @@ fn main() -> miette::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Run { file, pretty, args } => {
+        Commands::Run {
+            file,
+            pretty,
+            args,
+            trust,
+        } => {
             let canonical_file = std::fs::canonicalize(&file)
                 .into_diagnostic()
                 .map_err(|e| e.wrap_err(format!("Failed to resolve file {:?}", file)))?;
@@ -99,10 +120,11 @@ fn main() -> miette::Result<()> {
                 .into_diagnostic()
                 .map_err(|e| e.wrap_err(format!("Failed to read file {:?}", canonical_file)))?;
 
-            // The CLI is the host's own trusted entry point: it runs
-            // files the operator explicitly hands it, so it grants
-            // every capability. The grant is written out so a code
-            // reviewer can see what's being trusted.
+            // The CLI runs sandboxed by default: the operator passes
+            // `--trust` when the script needs filesystem `#import`
+            // paths or capability-gated native fns. The grant is
+            // written out so a code reviewer can see what's being
+            // trusted.
             //
             // Run the workspace analyzer over the entry + every
             // transitive `#import` so cycles, missing modules,
@@ -113,7 +135,11 @@ fn main() -> miette::Result<()> {
                 .parent()
                 .unwrap_or(Path::new("."))
                 .to_path_buf();
-            let mut loader = CliLoader::new_trusted();
+            let mut loader = if trust {
+                CliLoader::new_trusted()
+            } else {
+                CliLoader::new_sandboxed()
+            };
             let workspace =
                 analyze_entry(cache_namespace.clone(), &content, entry_dir, &mut loader);
             if workspace.has_errors() {
@@ -197,8 +223,10 @@ fn main() -> miette::Result<()> {
                 let mut ctx = Context::sandboxed()
                     .with_root(entry_node)
                     .with_workspace(Arc::clone(&workspace));
-                ctx.capabilities = Capabilities::all_granted();
-                ctx.prepend_module_resolver(Arc::new(FilesystemModuleResolver::trusted()));
+                if trust {
+                    ctx.capabilities = Capabilities::all_granted();
+                    ctx.prepend_module_resolver(Arc::new(FilesystemModuleResolver::trusted()));
+                }
                 Arc::new(ctx)
             };
             let _root_loading_guard = ctx.enter_loading_module(cache_namespace.clone());
