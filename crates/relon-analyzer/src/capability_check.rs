@@ -33,11 +33,12 @@
 //! channel as the rest of Stage 4.
 
 use crate::cap::{Capabilities, NativeFnGate};
+use crate::const_fold;
 use crate::diagnostic::Diagnostic;
 use crate::workspace::WorkspaceTree;
 use miette::SourceSpan;
-use relon_parser::{Expr, Node, TokenKey};
-use std::collections::HashMap;
+use relon_parser::{child_nodes, Expr, Node, NodeId, TokenKey};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 /// Drive the reachability check over `workspace`. Reads every module's
@@ -61,9 +62,29 @@ pub(crate) fn run(workspace: &mut WorkspaceTree) {
         return;
     }
 
+    // v1.1 control-flow pruning: collect every node id that lives
+    // under a statically-dead branch (`false ? ... : 0` then-side,
+    // `false && ...` rhs, `true || ...` rhs, etc.) so the FnCall
+    // walk below skips them. Per-module: dead-branch ids never cross
+    // module boundaries, and `child_nodes` doesn't follow imports —
+    // so we collect against the same module we walk.
+    //
+    // Scope: capability_check only. The type-checker's walker still
+    // visits dead branches so const-fold diagnostics (DivByZero,
+    // Overflow) and resolve-time diagnostics (UnresolvedReference)
+    // continue to fire; pruning those is a v1.2+ decision (see #41).
     let mut diagnostics: Vec<Diagnostic> = Vec::new();
     for tree in workspace.modules.values() {
+        let mut dead_ids: HashSet<NodeId> = HashSet::new();
         for node in tree.node_index.values() {
+            if let Some(dead) = const_fold::dead_branch_of(node) {
+                collect_descendant_ids(dead, &mut dead_ids);
+            }
+        }
+        for node in tree.node_index.values() {
+            if dead_ids.contains(&node.id) {
+                continue;
+            }
             check_node(node, &caps, &gates, &mut diagnostics);
         }
     }
@@ -121,6 +142,22 @@ fn check_node(
             capability: "reads_fs".to_string(),
             range: SourceSpan::from(node.range),
         });
+    }
+}
+
+/// Recursively collect `node`'s id and every descendant id reachable
+/// through `child_nodes`. Used to mark a statically-dead branch as
+/// unreachable for the FnCall walk: any FnCall whose own id (or whose
+/// containing-expression's id) lands in the resulting set is silenced.
+///
+/// Mirrors the parser's `child_nodes` set — decorators, directives,
+/// and type hints are intentionally skipped because they're processed
+/// by separate walkers and their reachability isn't gated by the
+/// control-flow head sitting above this expression.
+fn collect_descendant_ids(node: &Node, out: &mut HashSet<NodeId>) {
+    out.insert(node.id);
+    for child in child_nodes(node) {
+        collect_descendant_ids(child, out);
     }
 }
 
@@ -404,6 +441,105 @@ mod tests {
         );
         let diags = cap_diags(&ws);
         assert_eq!(diags.len(), 1, "{diags:#?}");
+    }
+
+    // -------------------------------------------------------------------
+    // v1.1 — control-flow pruning: dead branches under a statically-known
+    // ternary cond no longer flag. `false ? read_file() : 0` keeps the
+    // FnCall in the AST (and in `node_index`), but `dead_branch_of`
+    // hides it from the capability walk.
+    #[test]
+    fn dead_ternary_branch_is_not_flagged() {
+        let opts = options_with_read_file_gate(Capabilities::default());
+        let mut loader = MapLoader::new();
+        let ws = build_with_options(
+            "/abs/entry",
+            r#"{ f(): false ? read_file("a.txt") : 0 }"#,
+            &mut loader,
+            &opts,
+        );
+        assert!(
+            cap_diags(&ws).is_empty(),
+            "{:?}",
+            cap_diags(&ws).iter().collect::<Vec<_>>()
+        );
+    }
+
+    // v1.1 — `false && gated()` short-circuits at fold time → rhs is dead
+    // and the gated call inside it is silenced.
+    #[test]
+    fn dead_and_rhs_is_not_flagged() {
+        let opts = options_with_read_file_gate(Capabilities::default());
+        let mut loader = MapLoader::new();
+        let ws = build_with_options(
+            "/abs/entry",
+            r#"{ x: false && (read_file("a.txt") == "") }"#,
+            &mut loader,
+            &opts,
+        );
+        assert!(cap_diags(&ws).is_empty());
+    }
+
+    // v1.1 — `true || gated()` short-circuits at fold time → rhs dead.
+    #[test]
+    fn dead_or_rhs_is_not_flagged() {
+        let opts = options_with_read_file_gate(Capabilities::default());
+        let mut loader = MapLoader::new();
+        let ws = build_with_options(
+            "/abs/entry",
+            r#"{ x: true || (read_file("a.txt") == "") }"#,
+            &mut loader,
+            &opts,
+        );
+        assert!(cap_diags(&ws).is_empty());
+    }
+
+    // v1.1 negative — the live branch of a constant-cond ternary is still
+    // walked. `true ? read_file() : 0` keeps `read_file()` reachable.
+    #[test]
+    fn live_ternary_branch_is_still_flagged() {
+        let opts = options_with_read_file_gate(Capabilities::default());
+        let mut loader = MapLoader::new();
+        let ws = build_with_options(
+            "/abs/entry",
+            r#"{ f(): true ? read_file("a.txt") : 0 }"#,
+            &mut loader,
+            &opts,
+        );
+        let diags = cap_diags(&ws);
+        assert_eq!(diags.len(), 1, "{diags:#?}");
+    }
+
+    // v1.1 negative — non-constant cond keeps both branches live, so the
+    // gated call inside either branch still flags.
+    #[test]
+    fn variable_cond_keeps_both_branches_live() {
+        let opts = options_with_read_file_gate(Capabilities::default());
+        let mut loader = MapLoader::new();
+        let ws = build_with_options(
+            "/abs/entry",
+            r#"{ flag: true, f(): flag ? read_file("a.txt") : 0 }"#,
+            &mut loader,
+            &opts,
+        );
+        let diags = cap_diags(&ws);
+        assert_eq!(diags.len(), 1, "{diags:#?}");
+    }
+
+    // v1.1 — pruning is recursive: a gated call buried inside a list /
+    // closure / nested expression sitting on the dead side is also
+    // silenced.
+    #[test]
+    fn nested_call_in_dead_branch_is_silenced() {
+        let opts = options_with_read_file_gate(Capabilities::default());
+        let mut loader = MapLoader::new();
+        let ws = build_with_options(
+            "/abs/entry",
+            r#"{ f(): false ? [read_file("a.txt"), read_file("b.txt")] : [] }"#,
+            &mut loader,
+            &opts,
+        );
+        assert!(cap_diags(&ws).is_empty());
     }
 
     // -------------------------------------------------------------------
