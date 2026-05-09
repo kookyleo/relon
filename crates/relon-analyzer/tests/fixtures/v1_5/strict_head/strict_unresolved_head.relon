@@ -1,0 +1,6 @@
+// v1.5 forward: strict mode escalates a head-unresolved reference
+// from `UnresolvedReference` (warning) to `UnknownReferenceType`
+// (error). The head `mystery` isn't a known fn, sibling, or import.
+// EXPECTED: ≥ 1 × UnknownReferenceType (name="mystery", path=["mystery"]).
+#strict
+{ x: mystery }

@@ -1,0 +1,7 @@
+// v1.5 forward: typed closure parameter, no declared return type,
+// body relies on an unknown call. Strict mode reports
+// StrictForbidsUnclassifiedClosureBody (the body's inferred type is
+// Any).
+// EXPECTED: ≥ 1 × StrictForbidsUnclassifiedClosureBody.
+#strict
+{ helper: (Int n) => mystery(n) }

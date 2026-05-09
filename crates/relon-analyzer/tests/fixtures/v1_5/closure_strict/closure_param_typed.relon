@@ -1,0 +1,5 @@
+// v1.5 reverse: typed closure parameters silence the
+// StrictForbidsUntypedClosureParam check.
+// EXPECTED: no StrictForbidsUntypedClosureParam.
+#strict
+{ helper: (Int n) -> Int => n + 1 }

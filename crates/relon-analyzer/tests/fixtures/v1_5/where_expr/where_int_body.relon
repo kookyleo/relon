@@ -1,0 +1,6 @@
+// v1.5 forward: `where`-expression infers from body in a scope that
+// includes the bindings. `(n + 1)` infers Int, matching the `-> Int`
+// declared return.
+// EXPECTED: no diagnostics.
+#main(Int x) -> Int
+(n + 1) where { n: x }

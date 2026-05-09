@@ -1,0 +1,4 @@
+// v1.5 reverse: non-strict mode keeps the warning-level
+// UnresolvedReference but does NOT push UnknownReferenceType.
+// EXPECTED: 0 × UnknownReferenceType.
+{ x: mystery }

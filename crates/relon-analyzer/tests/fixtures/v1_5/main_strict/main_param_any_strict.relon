@@ -1,0 +1,8 @@
+// v1.6 (originally v1.5): `Any`-typed `#main` parameter is rejected
+// in every mode. Pre-v1.6 this used `StrictForbidsUntypedMainParam`
+// (strict only); v1.6 routes through the generic
+// `ExplicitAnyForbidden` so the same fixture still pins the failure.
+// EXPECTED: ≥ 1 × ExplicitAnyForbidden (#main parameter `x`).
+#strict
+#main(Any x) -> Int
+1

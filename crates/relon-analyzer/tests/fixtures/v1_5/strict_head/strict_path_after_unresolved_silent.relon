@@ -1,0 +1,8 @@
+// v1.5 boundary: a known stdlib name like `range` does NOT trigger
+// the strict head-unresolved check (it isn't `UnresolvedReference` —
+// `is_known_fn` saves it).
+// EXPECTED: 0 × UnknownReferenceType, 0 × UnresolvedReference (for
+// `range`).
+#strict
+#main(Int n) -> List<Int>
+range(n)

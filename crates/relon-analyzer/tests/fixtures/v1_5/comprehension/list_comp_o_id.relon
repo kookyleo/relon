@@ -1,0 +1,7 @@
+// v1.5 forward: comprehension whose element refers to a #main param
+// path (`o.id`) — the path-tail walker resolves to Int and the
+// resulting List<Int> matches the declared return.
+// EXPECTED: no MainReturnTypeMismatch.
+#schema Order { Int id: *, Float total: * }
+#main(Order o) -> List<Int>
+[x + o.id for x in range(o.id)]

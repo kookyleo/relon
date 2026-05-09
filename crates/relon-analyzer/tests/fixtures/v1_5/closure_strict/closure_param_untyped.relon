@@ -1,0 +1,5 @@
+// v1.5 forward: untyped closure parameter under strict mode triggers
+// StrictForbidsUntypedClosureParam.
+// EXPECTED: ≥ 1 × StrictForbidsUntypedClosureParam (param "n").
+#strict
+{ helper: (n) => n + 1 }

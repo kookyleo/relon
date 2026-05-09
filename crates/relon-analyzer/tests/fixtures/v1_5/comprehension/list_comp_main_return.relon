@@ -1,0 +1,5 @@
+// v1.5 forward: comprehension as the entry body. The element type
+// derives to Int, so `List<Int>` matches the declared return.
+// EXPECTED: no MainReturnTypeMismatch.
+#main(Int n) -> List<Int>
+[x * x for x in range(n)]

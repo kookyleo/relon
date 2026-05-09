@@ -1,0 +1,4 @@
+// v1.5 forward: where-body produces Int, declared return is String.
+// EXPECTED: 1 × MainReturnTypeMismatch.
+#main(Int x) -> String
+(n + 1) where { n: x }
