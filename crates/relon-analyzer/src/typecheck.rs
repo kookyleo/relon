@@ -22,6 +22,42 @@
 //!
 //! [`UnresolvedReference`]: crate::Diagnostic::UnresolvedReference
 //! [`StaticTypeMismatch`]: crate::Diagnostic::StaticTypeMismatch
+//!
+//! ## Walker pass map
+//!
+//! The `Walker` impl below carries 30 methods that all share three
+//! pieces of mutable state: `tree.diagnostics`, `scope_stack`, and
+//! `schema_index` (plus a few smaller side-tables). The methods are
+//! grouped by responsibility below — there are no separate trait
+//! passes because the coupling on that shared state makes splitting
+//! into independent visitor passes negative-ROI (a prior P3 audit
+//! over-counted by folding `mod tests` free fns into the impl total
+//! and recommended a refactor that turned out to be unwarranted; this
+//! map is the minimal landing of that audit's actual finding —
+//! discoverability, not decomposition). The size is on par with
+//! rustc's / clippy's analogous walkers.
+//!
+//! - **dispatch** — `visit`, `visit_internal` (the ~290-line
+//!   `match &*node.expr` that fans out to every other group).
+//! - **fn_call** — `check_unresolved_fn_call`, `check_fn_call`,
+//!   `resolve_call_signature`, `check_strict_fn_call`.
+//! - **const_fold + binary** — `check_binary_mismatch`,
+//!   `check_const_fold`.
+//! - **dict v1.3 / spread bypass** — `check_dict_v1_3`,
+//!   `schema_known`, `spread_source_schema`, `spread_source_is_dict`,
+//!   `spread_contributed_keys`.
+//! - **scope construction** — `build_type_scope`,
+//!   `build_type_scope_with_closure`.
+//! - **match / closure return** — `check_match_arm_types`,
+//!   `check_closure_return`, `check_match_exhaustiveness`,
+//!   `infer_enum_type`.
+//! - **reference / variable / path tail** — `check_unresolved_ref`,
+//!   `check_unresolved_var`, `check_strict_path`, `check_path_tail`.
+//! - **small helpers** — `is_known_fn`, `lookup_field_node`,
+//!   `dynamic_save`.
+//! - **typed binding + custom schema + generics** —
+//!   `check_typed_binding`, `check_generics`,
+//!   `check_against_custom_schema`, `build_generic_subst`.
 
 use crate::diagnostic::{span_of, Diagnostic};
 use crate::generics::collect_bindings;
