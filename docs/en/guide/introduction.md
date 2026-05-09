@@ -2,15 +2,12 @@
 
 Relon is an **executable data format**: its payload is business logic.
 Write a validation rule, a pricing formula, a workflow, a risk policy
-once as a Relon document; store it like JSON; **any conformant runtime
-(Rust, Go, TypeScript, Swift, browser-WASM…) parsing the same source
-with the same input produces a byte-identical result.**
+once as a Relon document, store it like JSON, and let the embedded
+Rust runtime evaluate it **deterministically** — the same source plus
+the same input always produces a byte-identical result.
 
-The Rust implementation in this repo is the reference runtime. The
-language spec itself is runtime-agnostic.
-
-> **One-liner**: Logic as portable data — write the rule once, store
-> it like JSON, evaluate it identically anywhere.
+> **One-liner**: Logic as data — write the rule once, store it like
+> JSON, evaluate it deterministically inside a sandbox.
 
 ## What this commits us to (the hard constraints)
 
@@ -21,10 +18,10 @@ language spec itself is runtime-agnostic.
   privileges. Filesystem, network, native functions are all gated by
   `Capabilities` and granted explicitly by the host. There is no
   "trusted mode" that lets a script bypass that consent.
-* **The std library is part of the spec.** `std/list`, `std/string`,
-  `std/math`, … are not per-runtime extensions; every conformant
-  runtime ships the same set with the same semantics. Scripts depend
-  only on names reachable through the spec.
+* **The std library is part of the language.** `std/list`,
+  `std/string`, `std/math`, … ship with the runtime — scripts can
+  `#import` them without the embedder wiring anything up. Authors
+  depend only on the stable names the language provides.
 
 <figure style="margin: 2rem auto; max-width: 720px; text-align: center;">
   <img src="/positioning.svg" alt="Relon two-tier authoring diagram" style="width: 100%; height: auto;" />

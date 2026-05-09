@@ -1,14 +1,11 @@
 # Relon
 
-**Logic as portable data.** Relon is an executable data format: business
+**Logic as data.** Relon is an executable data format: business
 logic — validation rules, pricing formulas, workflow steps — is written
-once, stored like JSON, and evaluated identically by any conformant
-runtime. The reference runtime is Rust; the language spec is
-runtime-agnostic and deterministic by construction.
-
-> Write the rule once. Store it in your database, your config file, your
-> RPC payload. Run it from Go, TypeScript, Swift, the browser. Get the
-> same answer everywhere.
+once and stored like JSON, then evaluated by an embeddable, sandboxed
+runtime. Determinism is part of the design: same source + same input →
+byte-identical output, no floating-point quirks, no iteration-order
+leaks, no implicit ambient state.
 
 ## 🚀 Quick Start
 
@@ -33,9 +30,6 @@ cargo run -q -p relon-fmt -- --check fixtures/*.relon fixtures/modules/*.relon f
 
 ## 🛠 Features
 
-- **Deterministic by spec**: same source + same input → byte-identical
-  output, regardless of host language. No floating-point quirks, no
-  iteration-order leaks, no implicit ambient state.
 - **Sandboxed by default**: a script declares the capabilities it needs
   (`reads_fs`, `network`, allow-listed native fns); the host grants
   them. There is no "trusted mode" the script can fall back to.
@@ -46,9 +40,9 @@ cargo run -q -p relon-fmt -- --check fixtures/*.relon fixtures/modules/*.relon f
   let logic reference its surrounding data without hard-coded paths.
 - **Functional core**: unified closures (`@fn`), comprehensions, pipes,
   pattern match — pure expressions, no IO or side effects.
-- **Canonical std**: `@import("std/list", as="list")` ships with every
-  conformant runtime; the std module set is part of the spec, not a
-  per-runtime extension.
+- **Canonical std**: `@import("std/list", as="list")` is part of the
+  language, not a host extension — scripts can rely on it without the
+  embedder wiring anything up.
 
 ## 📖 Example
 
@@ -66,7 +60,7 @@ cargo run -q -p relon-fmt -- --check fixtures/*.relon fixtures/modules/*.relon f
 
 ## 📚 Documentation
 
-- **Language spec** (the cross-runtime contract):
+- **Language spec**:
   [`docs/zh/guide/spec.md`](docs/zh/guide/spec.md) ·
   [English](docs/en/guide/spec.md)
 - **Use cases & positioning**:

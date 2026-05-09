@@ -3,8 +3,8 @@ layout: home
 
 hero:
   name: "Relon"
-  text: "Logic as portable data"
-  tagline: "Write the business rule once. Store it like JSON, ship it like JSON, evaluate it identically on any conformant runtime — Go, TypeScript, Swift, browser-WASM, Rust. The reference runtime in this repo is Rust; the spec is runtime-agnostic and deterministic by construction."
+  text: "Logic as data"
+  tagline: "Write the business rule once and store it like JSON. Relon is an executable data format whose payload is the logic itself — validation rules, pricing formulas, workflows, risk policies — evaluated by a sandboxed embeddable runtime (Rust). Same source + same input → byte-identical output, by design."
   image:
     src: /logo.svg
     alt: Relon
@@ -17,14 +17,14 @@ hero:
       link: https://github.com/kookyleo/relon
 
 features:
-  - title: Deterministic across runtimes
-    details: "Same source + same input → byte-identical output. Dict iteration is `BTreeMap`-ordered, floats are IEEE-754 `f64`, environment is opaque to the script. Logic stored in your database evaluates the same in every runtime that consumes it."
+  - title: Deterministic by design
+    details: "Same source + same input → byte-identical output. Dict iteration is `BTreeMap`-ordered, floats are IEEE-754 `f64`, the environment is opaque to the script. Replay, hash, cache evaluation freely — running the same `.relon` twice cannot diverge."
   - title: Sandboxed by default — no escape hatch
     details: "Scripts hold zero ambient privileges. `Capabilities` explicitly grant filesystem reads, step budgets, value-size watermarks, and per-function allowlists. There is no \"trusted mode\" the script can fall back to without the host's consent."
   - title: Self-describing type contracts
     details: "`#schema`, sum-type tagged enums, recursive schemas, branded values, computed defaults — type information travels with the payload. Receivers validate without out-of-band documentation."
   - title: Context-aware references
-    details: "`&root`, `&sibling`, `&prev`, `&next` let logic reference its surrounding data declaratively, no hard-coded paths. Declarative references stay deterministic across runtimes."
+    details: "`&root`, `&sibling`, `&prev`, `&next` let logic reference its surrounding data declaratively — move a fragment to a different position in the tree and references re-resolve against its new neighbors automatically."
 ---
 
 <RelonGallery />

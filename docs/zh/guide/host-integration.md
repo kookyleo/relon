@@ -94,8 +94,7 @@ match evaluator.run_main(&scope, args) {
 ```
 
 这样写有几个一致好处：
-- 「外部数据契约」写在 .relon 文件里，任何 conformant runtime 按相
-  同 schema 校验
+- 「外部数据契约」写在 .relon 文件里，由 `#schema` 静态校验
 - host 推数据缺字段 / 类型不匹配 → 求值开始前就报错
 - 多个 schema 自然组合成入口签名（每个 slot 命名空间隔离）
 
@@ -125,10 +124,10 @@ ctx.register_fn_with_caps("http.get",
 | 测试 | 构造 args 即可 | 要 mock http / db client |
 | 缓存 / 预编译 / fuzz | 真·纯函数，可 memoize | 任何缓存都跟时间和外部状态绑死 |
 | 审计「这段逻辑会读到什么」 | 看一眼 `#main(...)` 签名 | 要 trace 所有 host fn reachability |
-| 跨 runtime 一致性（spec §1.1） | ✅ 只要 args 一致，结果一致 | ❌ 不同 runtime 的 http / 网络环境本就不同 |
+| 求值确定性（spec §1） | ✅ 只要 args 一致，结果一致 | ❌ 网络 / 外部状态随时间变化，结果无法重放 |
 | 心智分工 | host 负责跨界 I/O，脚本负责数据组合，边界清晰 | 两者交织 |
 
-### pull 不是禁，是「主动放弃跨 runtime 一致性」
+### pull 不是禁，是「主动放弃求值确定性」
 
 下面这些场景里 pull 仍合理：
 
@@ -139,12 +138,12 @@ ctx.register_fn_with_caps("http.get",
 
 这些场景下 host fn 用 [`register_fn_with_caps`](#受-capability-门控的注册)
 注册，按需声明 `NativeFnGate { reads_clock: true, network: true, ... }`。
-**这是有意识的取舍**：脚本作者主动放弃了「换一个 conformant runtime
-跑同一份脚本得到同样结果」的承诺，换取了「能动态拉数据」。spec §1.1
-的跨端一致只覆盖 push 形态。
+**这是有意识的取舍**：脚本作者主动放弃了「同一份 args 跑两次结果
+必然一致」的承诺，换取了「能动态拉数据」。spec §1 的求值确定性只覆
+盖 push 形态。
 
 > **一句话总结**：能 push 就 push。只在 push 实在不可行时（数据量、
-> 动态性、副作用）才用 pull，并且清楚知道这部分逻辑不再 portable。
+> 动态性、副作用）才用 pull，并且清楚知道这部分逻辑不再可重放。
 
 ## 入口程序 vs 库
 
@@ -158,7 +157,7 @@ ctx.register_fn_with_caps("http.get",
 库文件被 `#import` 时不需要 `#main`——`#import` 只取它的导出。这条
 设计的好处：
 - 库与入口的边界清晰，宿主不会把库文件当 entry 跑（拒之于门外）；
-- 入口程序的 args 契约写在源码里，任何 conformant runtime 行为一致。
+- 入口程序的 args 契约写在源码里，宿主无须额外约定。
 
 ## 最小例子
 

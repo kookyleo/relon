@@ -1,23 +1,24 @@
 # Relon Language Specification
 
 > **Status**: v1 candidate. This document is the executable
-> formulation of Relon's Logic-as-Portable-Data promise — any conformant
-> runtime (the reference implementation is in Rust) MUST behave per the
-> semantics described here; scripts may rely only on the names and
-> contracts the spec declares.
+> formulation of Relon's Logic-as-Data promise — implementations MUST
+> behave per the semantics described here; scripts may rely only on
+> the names and contracts the spec declares. The only reference
+> implementation today is the Rust crates in this repo.
 
 ## 1. Design commitment
 
 > **Same source + same input → byte-identical output.**
 
 This is the load-bearing axis of the spec. Every constraint below
-exists to make that single sentence remain true across runtimes,
-machines, and time.
+exists to make that single sentence remain true across machines and
+time — running the same `.relon` twice MUST produce the same result,
+so evaluation can be replayed, hashed, and cached.
 
-### 1.1 Conformant runtime
+### 1.1 Implementation contract
 
-An implementation is **conformant** if and only if, for every
-source + input combination covered by this spec:
+An implementation satisfies the spec if and only if, for every
+source + input combination covered by it:
 
 1. **Parse**: it accepts every source the reference parser accepts and
    rejects every source it rejects.
@@ -30,10 +31,10 @@ source + input combination covered by this spec:
    human-readable text may be localized).
 
 Implementation details left unspecified (internal caches, threading,
-build-artifact size) are up to each runtime and don't affect
-conformance.
+build-artifact size) are up to the implementation and don't affect
+the contract.
 
-### 1.2 Conditions for cross-runtime determinism
+### 1.2 Determinism boundary: push vs pull
 
 In "same source + same input → byte-identical output", **input** means
 the explicit `Value` tree the host pushes via
@@ -46,13 +47,13 @@ are **not** input. Therefore:
 
 - **Push form** (host completes I/O before evaluation, materializes
   the data into a `Value`, and pushes it via `run_main(args)`; the
-  script declares the contract with `#main(...)`): cross-runtime
-  determinism is in scope.
+  script declares the contract with `#main(...)`): determinism is in
+  scope — the same args evaluated twice MUST produce the same result,
+  replay/hash/cache safe.
 - **Pull form** (the script pulls external data through native
-  functions during evaluation): the author has **deliberately
-  given up** cross-runtime determinism — different host /
-  runtime / time inherently sees different network and external
-  state, and the spec neither requires nor can guarantee parity.
+  functions during evaluation): the author has **deliberately given
+  up** determinism — network and external state vary over time, and
+  the spec neither requires nor can guarantee parity.
 
 See `docs/zh/guide/host-integration.md` for the implementer guide
 (the comprehensive guide is currently Chinese-first).
@@ -60,8 +61,8 @@ See `docs/zh/guide/host-integration.md` for the implementer guide
 ### 1.3 sigil split: `@` vs `#`
 
 Relon separates "metadata stacked on a node" into two disjoint
-namespaces. This is a hard spec requirement — a conformant runtime
-MUST NOT allow a single name to exist in both `@`-form and `#`-form.
+namespaces. This is a hard spec requirement — an implementation MUST
+NOT allow a single name to exist in both `@`-form and `#`-form.
 
 | sigil | Purpose | Who can register |
 | --- | --- | --- |
@@ -111,7 +112,7 @@ hardening.
 
 ## 2. Determinism contract
 
-To honor §1, every conformant runtime MUST:
+To honor §1, every implementation MUST:
 
 ### 2.1 Dict iteration order
 
@@ -142,7 +143,7 @@ sorting are forbidden.
   forbidden.
 * Integer arithmetic on `i64` follows Rust semantics: overflow wraps
   in release. The spec mandates this wrap behavior — saturating /
-  panicking implementations are non-conformant.
+  panicking implementations don't satisfy the contract.
 
 ### 2.4 Strings
 
@@ -176,7 +177,7 @@ localized.
 
 Reference implementation: `crates/relon-parser`.
 
-A conformant runtime MUST accept every source the reference parser
+An implementation MUST accept every source the reference parser
 accepts and reject every source it rejects. The grammar corpus is
 defined by `fixtures/`, `examples/`, and `crates/relon-parser/tests/`.
 
@@ -230,8 +231,7 @@ ctx.capabilities.max_steps = Some(1_000_000);               // step budget
 Or grant everything at once via `Capabilities::all_granted()` — but
 that's an explicit, auditable grant rather than an implicit "trusted"
 mode. **The spec forbids any `trusted()`-style shortcut constructor**:
-scripts must be able to observe what the host did and didn't grant on
-any conformant runtime.
+scripts must be able to observe what the host did and didn't grant.
 
 ### 4.3 std modules' special status
 
@@ -242,7 +242,7 @@ spec, not a trust decision.
 
 ## 5. Error kinds
 
-Conformant runtimes MUST use these stable tags:
+Implementations MUST use these stable tags:
 
 | Kind | Trigger |
 |---|---|
@@ -267,14 +267,14 @@ Conformant runtimes MUST use these stable tags:
 
 ## 6. Standard library (spec-mandated)
 
-Every conformant runtime MUST implement these std modules. Scripts
-import them via `#import <bindspec> from "std/<name>"`.
+Every implementation MUST provide these std modules. Scripts import
+them via `#import <bindspec> from "std/<name>"`.
 
 ### 6.1 Language-level builtins (no import needed)
 
 Three names belong to the **language**, not std modules — they are
-metadata operations on the data structures themselves and every
-runtime ships them unconditionally:
+metadata operations on the data structures themselves and are
+available unconditionally:
 
 * `len(value)` — element count of a `String` / `List` / `Dict`
   (`Int`).
@@ -302,7 +302,7 @@ sources; those `.relon` files are themselves part of the spec
 
 The `#schema` machinery depends internally on `ensure.*` functions
 (`ensure.int`, `ensure.string`, etc.). They are an implementation
-detail and not part of the user-facing API — but conformant runtimes
+detail and not part of the user-facing API — but the implementation
 MUST provide them with the spec'd semantics, otherwise `#schema`
 will diverge.
 
@@ -329,10 +329,10 @@ range(0, 10)                       // function call
 @projector { ... }                 // decorated dict
 ```
 
-Cross-runtime conformance: every conformant runtime MUST accept
-every root shape the reference parser accepts. Pre-v1.2
-implementations that only accepted dict / list literals at the
-root must extend to the full expression chain.
+Implementation requirement: implementations MUST accept every root
+shape the reference parser accepts. Pre-v1.2 implementations that
+only accepted dict / list literals at the root must extend to the
+full expression chain.
 
 `Closure` / `Schema` / `Type` / `Wildcard` are not JSON values. If
 the user evaluates the root to one of these, host-side projectors
@@ -410,7 +410,7 @@ n + 1
 ...
 ```
 
-**Semantic requirements** (every conformant runtime MUST implement):
+**Semantic requirements** (every implementation MUST provide):
 
 1. `#main(...)` MUST be a **root-level directive** (placed before the
    file's root expression); writing it on a nested dict is
@@ -441,9 +441,9 @@ n + 1
    references them via `#import`.
 
 `#main(...)` writes the entry contract into the `.relon` source
-rather than the host, so any conformant runtime sees the same
-script and validates against the same schema — the keystone of §1.2's
-cross-runtime determinism guarantee.
+rather than the host, so the script can be audited independently and
+the boundary checker rejects mis-shaped pushes before any body
+evaluation — the keystone of §1.2's determinism boundary.
 
 **v1.3** extends static analysis to cover `#main(...)` parameters
 inside the root body: every declared parameter is seeded into the
@@ -754,16 +754,16 @@ The host can inject via `register_fn` / `register_fn_with_caps` /
 * Decorator plugins (custom `@value` replacements, domain-specific
   transformers).
 
-But **the spec does not require other runtimes to provide these
-host-injected names**. A script that depends on a host-injected name
-forfeits cross-runtime portability for that scope and only works on
-that host.
+**Host-injected names are not part of the spec**. A script that
+depends on a host-injected name steps outside the spec's guarantees
+and only behaves predictably on that host configuration.
 
 Best practice:
 
 * Ship business libraries as `.relon` files (libraries without
-  `#main`) and distribute them via `#import`. They are portable
-  across runtimes by construction.
+  `#main`) and distribute them via `#import`. They depend only on
+  the language and std, so behavior is fully determined by spec +
+  source.
 * Register native functions only when "needs host capability"
   applies (FS, DB, HTTP), and tag them via `register_fn_with_caps`
   with the appropriate `NativeFnGate`.
@@ -776,41 +776,24 @@ Best practice:
 * `#import * from "std/<name>"` binds to the runtime's latest
   compatible version. A future direction is
   `#import * from "std/<name>@1.x"` for explicit pinning.
-* Runtimes MUST report the spec version they implement in metadata
+* The runtime MUST report the spec version it implements in metadata
   (`relon --version` or equivalent API).
-
-## 9. Building a new runtime
-
-If you want to write a Go / TS / Swift / your-language conformant
-runtime:
-
-1. **Start from the grammar corpus**: ensure your parser accepts every
-   `.relon` in `fixtures/` and `examples/` and produces an AST
-   isomorphic to the reference.
-2. **Reuse the std `.relon` sources**:
-   `crates/relon-evaluator/src/std_relon/*.relon` files are the
-   reference behavior of std modules; you only need to implement the
-   `_*` intrinsics (`_list_map`, …) as native; the rest is plain
-   Relon and shared across runtimes.
-3. **Pass conformance tests**: `fixtures/golden/` lists reference
-   outputs; any conformant runtime running the same source MUST
-   produce the same JSON.
-4. **Align error codes** per §5.
 
 ## Appendix A: Saying goodbye to the "configuration language" framing
 
 Historically Relon docs framed it as a "typed business-config DSL".
 That framing was **inaccurate**: with each host extending freely and
-scripts depending on ambient state, cross-runtime parity has nothing
-to stand on.
+scripts depending on ambient state, evaluation determinism has
+nothing to stand on.
 
-Logic-as-Portable-Data replaces that framing. It means:
+Logic-as-Data replaces that framing. It means:
 
 * No "trusted mode" lets scripts bypass the sandbox.
-* No runtime-private global names for scripts to depend on
-  implicitly.
+* No ambient global names for scripts to depend on implicitly
+  (host-injected names are out of spec scope; authors choose
+  whether to use them).
 * No unspecified float / iteration-order behavior.
-* std is part of the spec, not an optional extension.
+* std is part of the language, not an optional extension.
 
-Each choice serves the same goal: **logic flows between systems like
-JSON, with completely deterministic results.**
+Each choice serves the same goal: **logic stored and shipped like
+JSON, evaluated deterministically inside a sandbox.**
