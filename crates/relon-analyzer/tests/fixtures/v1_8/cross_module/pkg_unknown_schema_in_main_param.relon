@@ -1,0 +1,14 @@
+// v1.8+ cross-module type validation: `#main(lib.NoSuchSchema u)`
+// references `lib` (a valid alias) but `NoSuchSchema` isn't one of
+// `lib`'s exported schemas. Pre-fix, multi-segment paths fell through
+// the conservative `path.len() != 1 ⇒ true` branch in
+// `subsumes_with_imports` and `unknown_type_diagnostic` only checked
+// single-segment paths, so the entire `pkg.Wrong` form was silent.
+//
+// EXPECTED: at least 1 `UnknownTypeName { name: "lib.NoSuchSchema" }`
+// (pushed tentatively by `unknown_type_diagnostic` and surviving
+// `re_check_unknown_types` because the alias's exports don't include
+// `NoSuchSchema`).
+#import lib from "./lib.relon"
+#main(lib.NoSuchSchema u) -> Int
+42

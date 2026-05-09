@@ -1,0 +1,5 @@
+// v1.8: `Enum<Int, String>` does not accept a List value.
+// Pre-v1.8 the `Enum` slot returned `true` unconditionally and
+// silently passed.
+// EXPECTED: ≥ 1 × StaticTypeMismatch on the `payload` field.
+{ Enum<Int, String> payload: [1, 2, 3] }

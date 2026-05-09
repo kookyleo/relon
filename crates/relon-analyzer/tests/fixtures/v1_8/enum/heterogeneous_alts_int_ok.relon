@@ -1,0 +1,3 @@
+// v1.8: `Enum<Int, String>` accepts an Int (matches first alt).
+// EXPECTED: 0 × StaticTypeMismatch.
+{ Enum<Int, String> id: 42 }

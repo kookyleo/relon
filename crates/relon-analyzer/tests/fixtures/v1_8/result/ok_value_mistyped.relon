@@ -1,0 +1,6 @@
+// v1.8 C3: the `Ok` variant carries `value: T`, and the slot binds
+// `T -> Int`. Passing a `String` to `value` should be caught
+// statically — pre-v1.8 the analyzer accepted any value because it
+// didn't substitute generics into the variant's field types.
+// EXPECTED: ≥ 1 × StaticTypeMismatch on the `r.value` field.
+{ Result<Int, String> r: Result.Ok { value: "wrong type" } }

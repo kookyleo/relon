@@ -1,0 +1,6 @@
+// v1.8+ regression-fixture support: lib_b exports `User` with a
+// completely different shape (`email: String`). Pair with
+// `lib_a.relon` to verify that `a.User.name` and `b.User.email` both
+// resolve correctly despite the schema name collision.
+#schema User { String email: * }
+{ kind: "lib-b" }

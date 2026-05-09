@@ -1,0 +1,16 @@
+// v1.8+ regression: strict mode + cross-module schema + path-tail
+// walking through a `pkg.User` parameter into a field. With v1.8e the
+// `lib.User u` parameter type lifts to `Schema("User")`, and v1.4
+// path-tail walking resolves `u.name` to `String` via the schema's
+// field index. The declared return type `Int` then mismatches.
+//
+// EXPECTED: exactly 1 `MainReturnTypeMismatch` (expected Int, found
+// String) and 0 `UnknownReferenceType`. Pre-v1.8e the body would
+// have collapsed to `Any` (because `infer_from_type_node` ignored
+// imports), the mismatch check would silently skip on `Any`, and
+// strict mode would push a false-positive `UnknownReferenceType`
+// because `walk_path` saw `Any` head + tail step → `UnknownStep`.
+#strict
+#import lib from "./lib.relon"
+#main(lib.User u) -> Int
+u.name

@@ -1,0 +1,7 @@
+// v1.8 tuple-position access: `pair.0` is `Int`, but the slot
+// expects `String`. The walker pinpoints the mismatch.
+// EXPECTED: ≥ 1 × StaticTypeMismatch on the `wrong` field.
+{
+  (Int, String) pair: [42, "hello"],
+  String wrong: pair.0
+}

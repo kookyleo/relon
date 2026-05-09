@@ -1,0 +1,8 @@
+// v1.8: positional access on a `List<T>` yields its element
+// type — `xs.0` on `List<Int>` is `Int`. Bounds checks are
+// runtime's job (the literal length isn't statically tracked).
+// EXPECTED: 0 × StaticTypeMismatch.
+{
+  List<Int> xs: [10, 20, 30],
+  Int head: xs.0
+}

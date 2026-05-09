@@ -1,0 +1,4 @@
+// v1.8 C3: the `Err` variant's `error: E` is bound to `String`, so
+// an Int literal is rejected statically.
+// EXPECTED: ≥ 1 × StaticTypeMismatch on the `r.error` field.
+{ Result<Int, String> r: Result.Err { error: 42 } }

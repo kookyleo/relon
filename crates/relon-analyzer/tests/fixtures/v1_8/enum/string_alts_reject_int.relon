@@ -1,0 +1,5 @@
+// v1.8: `Enum<"up", "down">` only accepts String values. Pre-v1.8
+// the `Enum` slot returned `true` for everything — now an Int
+// value is rejected statically.
+// EXPECTED: ≥ 1 × StaticTypeMismatch on the `status` field.
+{ Enum<"up", "down"> status: 42 }

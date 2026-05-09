@@ -1,0 +1,7 @@
+// v1.8 cross-module: a typed binding using `lib.User` rejects a
+// value of an incompatible static shape (Int) — pre-v1.8 this
+// silently passed because the multi-segment slot collapsed to
+// `Any`.
+// EXPECTED: ≥ 1 × StaticTypeMismatch on the `u` field.
+#import lib from "./lib.relon"
+{ lib.User u: 42 }

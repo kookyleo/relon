@@ -1,0 +1,7 @@
+// v1.8: `Enum<"up", "down">` is a string-literal sum. Any
+// `String` value is statically compatible (the specific literal
+// match is enforced at runtime). Pre-v1.8 the `Enum` head returned
+// `true` unconditionally — now the alternative-aware check still
+// passes, but for a structured reason.
+// EXPECTED: 0 × StaticTypeMismatch.
+{ Enum<"up", "down"> status: "up" }

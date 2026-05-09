@@ -1,0 +1,11 @@
+// v1.8+ regression: when the same file is imported twice from the
+// same module with different aliases, both aliases must resolve to
+// the lib's exported schema set. Pre-fix `seen_raw` deduped by
+// `(importer, raw_path)` and dropped the second import entirely,
+// leaving `b.User` as an unknown 2-segment type.
+//
+// EXPECTED: 0 `UnknownTypeName` for either `a.User` or `b.User`.
+#import a from "./lib.relon"
+#import b from "./lib.relon"
+#main(a.User u, b.User v) -> Int
+u.id + v.id

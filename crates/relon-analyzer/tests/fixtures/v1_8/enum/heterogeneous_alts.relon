@@ -1,0 +1,5 @@
+// v1.8: `Enum<Int, String>` has heterogeneous alternatives. Any
+// `Int` or `String` value statically satisfies the slot. A `Bool`
+// value matches neither alternative and is rejected.
+// EXPECTED: ≥ 1 × StaticTypeMismatch on the `id` field.
+{ Enum<Int, String> id: true }

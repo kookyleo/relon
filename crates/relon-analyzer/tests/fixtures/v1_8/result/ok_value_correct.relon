@@ -1,0 +1,5 @@
+// v1.8 C3: Result first-class. `Result<Int, String>` slot accepts a
+// `Result.Ok { value: 42 }` literal — generic substitution maps
+// `T -> Int` and the inner `value: 42` checks against `Int`.
+// EXPECTED: 0 × StaticTypeMismatch.
+{ Result<Int, String> r: Result.Ok { value: 42 } }

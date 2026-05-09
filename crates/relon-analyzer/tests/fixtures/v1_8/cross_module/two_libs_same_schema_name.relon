@@ -1,0 +1,15 @@
+// v1.8+ regression (issue 3): two libs both export `User` but with
+// different fields. Pre-fix the importer's `imported_schemas` keyed
+// by the *bare* `User`, so last-write-wins lost one of the two field
+// sets — `u.name` would be reported as UnknownReferenceType because
+// the surviving entry was lib_b.User (no `name` field). Post-fix the
+// key is `a.User` / `b.User`, and the field-tail walker resolves
+// each side correctly.
+//
+// EXPECTED: 0 `UnknownReferenceType` for `u.name` or `v.email`,
+// 0 `MainReturnTypeMismatch` (body is Int matching `-> Int` return).
+#strict
+#import a from "./lib_a.relon"
+#import b from "./lib_b.relon"
+#main(a.User u, b.User v) -> Int
+u.id

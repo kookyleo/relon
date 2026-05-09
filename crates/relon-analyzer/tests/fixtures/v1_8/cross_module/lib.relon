@@ -1,0 +1,4 @@
+// v1.8 cross-module: a module declaring `User` at root level so the
+// entry can reference it via `pkg.User` (alias-form import).
+#schema User { Int id: *, String name: * }
+{ kind: "user-lib" }

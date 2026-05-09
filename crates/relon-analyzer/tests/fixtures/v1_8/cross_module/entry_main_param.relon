@@ -1,0 +1,8 @@
+// v1.8 cross-module: `#main(lib.User u)` declares the `u`
+// parameter as the lib's exported `User` schema. The body
+// references `u.name` which should resolve to `String` via the
+// schema field — no UnknownReferenceType / StaticTypeMismatch.
+// EXPECTED: 0 × UnknownReferenceType, 0 × StaticTypeMismatch.
+#import lib from "./lib.relon"
+#main(lib.User u) -> String
+u.name

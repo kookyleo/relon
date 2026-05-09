@@ -1,0 +1,4 @@
+// v1.8 C3: the `Err` variant carries `error: E`, and the slot binds
+// `E -> String`. A String literal satisfies the substituted type.
+// EXPECTED: 0 × StaticTypeMismatch.
+{ Result<Int, String> r: Result.Err { error: "boom" } }

@@ -1,0 +1,5 @@
+// v1.8+ regression-fixture support: lib_a exports `User` with
+// `id: Int` + `name: String`. Paired with `lib_b.relon` (different
+// `User` shape) to verify alias-namespacing under issue 3.
+#schema User { Int id: *, String name: * }
+{ kind: "lib-a" }

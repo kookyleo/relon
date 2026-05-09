@@ -1,0 +1,8 @@
+// v1.8 cross-module: `#import lib from "./lib.relon"` exposes the
+// lib's `User` schema as `lib.User`. A typed binding using
+// `lib.User` should accept a matching dict literal silently —
+// pre-v1.8 this fell back to `Any` because multi-segment paths
+// landed in the silent `_ => Any` arm.
+// EXPECTED: 0 × StaticTypeMismatch.
+#import lib from "./lib.relon"
+{ lib.User u: { id: 1, name: "alice" } }

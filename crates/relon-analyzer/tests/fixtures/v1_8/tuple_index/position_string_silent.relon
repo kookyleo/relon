@@ -1,0 +1,7 @@
+// v1.8 tuple-position access: `pair.1` on a `(Int, String)`-typed
+// pair returns the second element as `String`.
+// EXPECTED: 0 × StaticTypeMismatch.
+{
+  (Int, String) pair: [42, "hello"],
+  String second: pair.1
+}
