@@ -1,0 +1,9 @@
+// Invalid: same constraint listed twice on the same method. Each
+// `#derive` line should declare exactly one constraint, and the same
+// constraint may not be repeated for one method.
+#schema Money { Int cents: * } with {
+    #derive Equatable
+    #derive Equatable
+    eq(other: Self) -> Bool: self.cents == other.cents
+}
+{ Money price: { cents: 100 } }

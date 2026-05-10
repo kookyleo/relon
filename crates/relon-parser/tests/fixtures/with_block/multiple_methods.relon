@@ -1,0 +1,8 @@
+// Several plain methods in one `with` block, no derives.
+// Exercises: multiple sequential method declarations, `String` and `Bool`
+// return types, string concatenation in a body expr.
+#schema User { String name: *, Int age: * } with {
+    full_name() -> String: self.name
+    is_admin() -> Bool: self.age > 0
+}
+{ User u: { name: "Ada", age: 30 } }

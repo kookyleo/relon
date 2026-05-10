@@ -50,6 +50,24 @@ pub const MAIN: &str = "main";
 /// errors. The flag is *contagious*: an entry module marked `#strict`
 /// applies the rule transitively to every reachable `#import` target.
 pub const STRICT: &str = "strict";
+/// Phase A of the trait-bound / schema-method system: a method-level
+/// pragma `#derive <Constraint>` declares the following method is the
+/// witness for the named built-in constraint (e.g. `Equatable`,
+/// `Comparable`). Body shape is a single bare identifier (the
+/// constraint name). Registered globally so the parser accepts it; the
+/// analyzer enforces that it only appears immediately above a method
+/// inside a `with { ... }` block.
+pub const DERIVE: &str = "derive";
+/// Schema-level (or, in rare cases, method-level) pragma
+/// `#no_auto_derive <Constraint>` opts the schema out of structural
+/// auto-derivation for the named constraint (e.g. opt out of the
+/// default `JsonProjectable` derivation for an internal-only schema).
+pub const NO_AUTO_DERIVE: &str = "no_auto_derive";
+/// Method-level pragma `#native` declares the method's body lives in
+/// host Rust (registered through the schema-method host API). The
+/// parser leaves the method's body empty when this pragma is present;
+/// the analyzer cross-checks against the host registry.
+pub const NATIVE: &str = "native";
 
 /// Directive name → expected shape. Dispatch happens by name; unknown
 /// `#name` produces a parse error.
@@ -64,6 +82,11 @@ pub const DIRECTIVE_SHAPES: &[(&str, DirectiveShape)] = &[
     (IMPORT, DirectiveShape::Import),
     (MAIN, DirectiveShape::Main),
     (STRICT, DirectiveShape::Bare),
+    // Trait-bound / schema-method pragmas (Phase A): parsed globally,
+    // semantic placement enforced by the analyzer.
+    (DERIVE, DirectiveShape::Value),
+    (NO_AUTO_DERIVE, DirectiveShape::Value),
+    (NATIVE, DirectiveShape::Bare),
 ];
 
 /// Look up a directive's expected shape by name. Returns `None` for
@@ -177,12 +200,236 @@ fn parse_name_body<'a>(input: &mut Span<'a>) -> ModalResult<crate::DirectiveBody
             return Ok(crate::DirectiveBody::Bare);
         }
     };
+
+    // Phase A: optional trailing `with { ... }` block carrying schema
+    // methods. Detection is conservative — if `with` doesn't sit at a
+    // word boundary or `{` doesn't follow, leave the input alone for
+    // the surrounding grammar to consume.
+    let (methods, schema_no_auto_derives) = opt_parse_with_block(input).unwrap_or_default();
+
     Ok(crate::DirectiveBody::NameBody {
         name: name_token.0,
         name_range,
         generics,
         body: Box::new(body),
+        methods,
+        schema_no_auto_derives,
     })
+}
+
+/// Try to consume a trailing `with { ... }` block after a schema body.
+/// Returns the parsed methods + schema-level `#no_auto_derive` constraint
+/// names. When the input doesn't start with `with` (after optional
+/// whitespace), the input is rewound and `None` is returned. Inside the
+/// `with { ... }` block, parse errors are propagated as cuts — once
+/// committed (we saw `with {`), malformed contents must surface as
+/// errors rather than silent rewind.
+fn opt_parse_with_block<'a>(
+    input: &mut Span<'a>,
+) -> Option<(Vec<crate::SchemaMethod>, Vec<String>)> {
+    let pre = input.checkpoint();
+    if soc0.parse_next(input).is_err() {
+        input.reset(&pre);
+        return None;
+    }
+    if !at_keyword(input, "with") {
+        input.reset(&pre);
+        return None;
+    }
+    // Consume the keyword and the opening brace.
+    let _ = winnow::token::literal::<_, _, winnow::error::ContextError>("with")
+        .parse_next(input)
+        .ok()?;
+    if (soc0, '{').parse_next(input).is_err() {
+        input.reset(&pre);
+        return None;
+    }
+
+    let mut methods: Vec<crate::SchemaMethod> = Vec::new();
+    let mut schema_no_auto_derives: Vec<String> = Vec::new();
+
+    loop {
+        if soc0.parse_next(input).is_err() {
+            return Some((methods, schema_no_auto_derives));
+        }
+        if winnow::token::literal::<_, _, winnow::error::ContextError>("}")
+            .parse_next(input)
+            .is_ok()
+        {
+            return Some((methods, schema_no_auto_derives));
+        }
+
+        // Collect leading directive pragmas. Each one is attributed to
+        // the right scope by name:
+        //   * `#derive C` / `#native` are method-level — they decorate
+        //     the next method declaration in this `with { ... }` block.
+        //   * `#no_auto_derive C` is *always* schema-level — it opts
+        //     the enclosing schema out of structural derivation, so it
+        //     lands directly on `schema_no_auto_derives` regardless of
+        //     whether a method follows. Mixing the two scopes in one
+        //     stack is allowed; source order between them is preserved
+        //     within each scope's vec.
+        let mut method_derives: Vec<String> = Vec::new();
+        let mut is_native = false;
+        loop {
+            let pre_dir = input.checkpoint();
+            let _ = soc0.parse_next(input);
+            if !input.as_ref().starts_with('#') {
+                input.reset(&pre_dir);
+                break;
+            }
+            let dir = match parse_directive(input) {
+                Ok(d) => d,
+                Err(_) => {
+                    input.reset(&pre_dir);
+                    break;
+                }
+            };
+            match dir.name.as_str() {
+                DERIVE => match constraint_name_from_value(&dir.body) {
+                    Some(name) => method_derives.push(name),
+                    None => return None,
+                },
+                NO_AUTO_DERIVE => match constraint_name_from_value(&dir.body) {
+                    Some(name) => schema_no_auto_derives.push(name),
+                    None => return None,
+                },
+                NATIVE => is_native = true,
+                _ => {
+                    // Not a method/schema pragma — bail out of the with
+                    // block; the directive is likely intended for the
+                    // surrounding grammar. Rewind any progress made.
+                    return None;
+                }
+            }
+        }
+
+        let _ = soc0.parse_next(input);
+
+        // After the pragma stack, either a method header follows or we
+        // hit `}` — in which case any collected method-level pragma
+        // (`#derive` / `#native`) without a method is a parse error
+        // (`#no_auto_derive` already landed on schema_no_auto_derives).
+        if winnow::token::literal::<_, _, winnow::error::ContextError>("}")
+            .parse_next(input)
+            .is_ok()
+        {
+            if !method_derives.is_empty() || is_native {
+                // Stray method pragmas without a following method.
+                return None;
+            }
+            return Some((methods, schema_no_auto_derives));
+        }
+
+        // Method header: `name(p: T, ...) -> R`.
+        let method_start = input.location();
+        let name_start = input.location();
+        let name_token = match id.parse_next(input) {
+            Ok(t) => t,
+            Err(_) => return None,
+        };
+        let name_range = create_range(input, name_start, input.location());
+
+        if (soc0, '(', soc0).parse_next(input).is_err() {
+            return None;
+        }
+        let params: Vec<crate::SchemaMethodParam> =
+            match separated::<_, _, Vec<crate::SchemaMethodParam>, _, _, _, _>(
+                0..,
+                parse_schema_method_param,
+                (soc0, ',', soc0),
+            )
+            .parse_next(input)
+            {
+                Ok(v) => v,
+                Err(_) => return None,
+            };
+        if (soc0, opt(','), soc0, ')').parse_next(input).is_err() {
+            return None;
+        }
+        if (soc0, "->", soc0).parse_next(input).is_err() {
+            return None;
+        }
+        let return_type = match crate::expr::parse_type_node.parse_next(input) {
+            Ok(t) => t,
+            Err(_) => return None,
+        };
+
+        // Body: `: <expr>` for non-native methods; absent for `#native`.
+        let body = if is_native {
+            None
+        } else {
+            if (soc0, ':', soc0).parse_next(input).is_err() {
+                return None;
+            }
+            match parse_expr.parse_next(input) {
+                Ok(b) => Some(Box::new(b)),
+                Err(_) => return None,
+            }
+        };
+
+        let method_end = input.location();
+        methods.push(crate::SchemaMethod {
+            name: name_token.0,
+            name_range,
+            params,
+            return_type,
+            body,
+            derives: method_derives,
+            is_native,
+            range: create_range(input, method_start, method_end),
+            doc_comment: None,
+        });
+    }
+}
+
+/// Parse one `<ident>: <TypeNode>` schema-method parameter.
+fn parse_schema_method_param<'a>(input: &mut Span<'a>) -> ModalResult<crate::SchemaMethodParam> {
+    soc0.parse_next(input)?;
+    let name_start = input.location();
+    let name_token = id.parse_next(input)?;
+    let name_range = create_range(input, name_start, input.location());
+    let _ = (soc0, ':', soc0).parse_next(input)?;
+    let type_node = crate::expr::parse_type_node.parse_next(input)?;
+    Ok(crate::SchemaMethodParam {
+        name: name_token.0,
+        name_range,
+        type_node,
+    })
+}
+
+/// Extract a bare-identifier constraint name from a `#derive` /
+/// `#no_auto_derive` directive body. Returns `None` when the body isn't
+/// a single Path of one segment (which would be a parser-level
+/// programming error — the analyzer surfaces a friendlier diagnostic).
+fn constraint_name_from_value(body: &crate::DirectiveBody) -> Option<String> {
+    let crate::DirectiveBody::Value(node) = body else {
+        return None;
+    };
+    let Expr::Variable(path) = node.expr.as_ref() else {
+        return None;
+    };
+    if path.len() != 1 {
+        return None;
+    }
+    match path.first()? {
+        TokenKey::String(s, _, _) => Some(s.clone()),
+        _ => None,
+    }
+}
+
+/// Word-boundary check: does the input start with `keyword` followed by
+/// a non-identifier character (whitespace, `{`, `(`, EOF, etc.)?
+/// Without this `with` would also match the prefix of `withhold` etc.
+fn at_keyword(input: &Span<'_>, keyword: &str) -> bool {
+    let s = input.as_ref();
+    if !s.starts_with(keyword) {
+        return false;
+    }
+    match s.as_bytes().get(keyword.len()) {
+        None => true,
+        Some(&b) => !b.is_ascii_alphanumeric() && b != b'_',
+    }
 }
 
 /// Parse `<T, U, ...>` — a comma-separated list of bare identifiers.

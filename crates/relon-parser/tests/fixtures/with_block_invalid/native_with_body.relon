@@ -1,0 +1,8 @@
+// Invalid: `#native` declares the method has no `.relon` body — but
+// this declaration also writes `: self.text`. Spec says non-`#native`
+// methods must have a body and `#native` methods must not.
+#schema Document { String text: * } with {
+    #native
+    render() -> String: self.text
+}
+{ Document d: { text: "hello" } }

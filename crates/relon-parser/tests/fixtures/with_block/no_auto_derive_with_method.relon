@@ -1,0 +1,10 @@
+// Schema-level `#no_auto_derive` plus a regular method in the same block.
+// Exercises: parser keeps schema-level pragma and method-level decl as
+// distinct items in `with { ... }`.
+#schema UserId { String value: * } with {
+    #no_auto_derive Equatable
+
+    #derive Equatable
+    eq(other: Self) -> Bool: self.value == other.value
+}
+{ UserId id: { value: "u-1" } }

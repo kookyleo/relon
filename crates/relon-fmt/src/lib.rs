@@ -620,4 +620,34 @@ mod tests {
         assert_eq!(formatted, source);
         assert_eq!(format_source(&formatted).unwrap(), formatted);
     }
+
+    #[test]
+    fn arrow_token_keeps_compact() {
+        // `->` must round-trip as a single token. Until source.rs added it
+        // to the multi-char operator list, the formatter split it into
+        // `-` + `>` and the result failed to re-parse.
+        let source = "#main(Int x) -> Int\n{\n    n: x\n}\n";
+        let formatted = format_source(source).unwrap();
+        assert_eq!(formatted, source);
+        assert_eq!(format_source(&formatted).unwrap(), formatted);
+    }
+
+    #[test]
+    fn formats_with_block_round_trip() {
+        // Schema-method `with { ... }` block — the trait-bound system's
+        // Phase A surface. Round-trip and idempotence check.
+        let source = "#schema Money {\n    Int cents: *\n} with {\n    cents_value() -> Int: self.cents\n}\n{\n    Money price: {\n        cents: 100\n    }\n}\n";
+        let formatted = format_source(source).unwrap();
+        assert_eq!(formatted, source);
+        assert_eq!(format_source(&formatted).unwrap(), formatted);
+    }
+
+    #[test]
+    fn formats_with_block_derive_pragma() {
+        // `#derive Equatable` stacked above the witness method.
+        let source = "#schema Money {\n    Int cents: *\n} with {\n    #derive Equatable\n    eq(other: Self) -> Bool: self.cents == other.cents\n}\n{\n    Money price: {\n        cents: 100\n    }\n}\n";
+        let formatted = format_source(source).unwrap();
+        assert_eq!(formatted, source);
+        assert_eq!(format_source(&formatted).unwrap(), formatted);
+    }
 }

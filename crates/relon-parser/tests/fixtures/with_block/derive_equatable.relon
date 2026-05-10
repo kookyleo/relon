@@ -1,0 +1,8 @@
+// Method-level `#derive Equatable` attached to an `eq` witness.
+// Exercises: directive immediately preceding a method declaration, `Self`
+// in a parameter type, `Bool` return.
+#schema Money { Int cents: * } with {
+    #derive Equatable
+    eq(other: Self) -> Bool: self.cents == other.cents
+}
+{ Money price: { cents: 100 } }

@@ -1,0 +1,6 @@
+// Method with three typed parameters of mixed types.
+// Exercises: parser parameter-list handling beyond the 1-param case.
+#schema User { String name: * } with {
+    label(prefix: String, suffix: String, count: Int) -> String: self.name
+}
+{ User u: { name: "Ada" } }

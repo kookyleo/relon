@@ -1,0 +1,7 @@
+// Implicit `self` plus an explicit `other: Self` parameter, returning
+// `Self`. Exercises: `Self` in both parameter and return position, and
+// a body expr that references both `self` and the `other` param.
+#schema Money { Int cents: * } with {
+    plus(other: Self) -> Self: self
+}
+{ Money price: { cents: 100 } }

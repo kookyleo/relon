@@ -1,0 +1,6 @@
+// Smallest `with { ... }` shape: one trivial method, no derives, no native.
+// Exercises: schema header + method header + arrow return type + body expr.
+#schema Money { Int cents: * } with {
+    cents_value() -> Int: self.cents
+}
+{ Money price: { cents: 100 } }

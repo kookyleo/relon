@@ -147,11 +147,25 @@ pub enum DirectiveBody {
     /// Single named declaration: `<ident>[<T, ...>] <body-expr>` (no colon).
     /// `generics` carries the optional type-parameter list declared after
     /// the name (e.g. `Result<T, E>` → `["T", "E"]`); empty when absent.
+    ///
+    /// `methods` and `schema_no_auto_derives` carry the optional
+    /// `with { ... }` extension block (Phase A of the trait-bound /
+    /// schema-method system; see `docs/internal/type-constraints-spec.md`).
+    /// Both are empty when no `with` block follows the body.
     NameBody {
         name: String,
         name_range: TokenRange,
         generics: Vec<String>,
         body: Box<Node>,
+        /// Methods declared inside the trailing `with { ... }` block.
+        /// Order preserves source order. Each method may carry method-level
+        /// `#derive <Constraint>` pragmas and an `#native` flag.
+        methods: Vec<SchemaMethod>,
+        /// Schema-level `#no_auto_derive <Constraint>` directives that
+        /// appear directly inside `with { ... }` (no method follows).
+        /// Constraint names are stored as bare strings; the analyzer
+        /// validates them.
+        schema_no_auto_derives: Vec<String>,
     },
     Import {
         spec: DirectiveImportSpec,
@@ -184,6 +198,47 @@ pub struct DirectiveMainParam {
     pub name: String,
     pub name_range: TokenRange,
     pub type_node: TypeNode,
+}
+
+/// One typed parameter of a schema method declared inside `with { ... }`.
+/// Form: `<ident>: <TypeNode>`. The `self` receiver is implicit and is not
+/// represented here; analyzer-side lowering injects it as a leading
+/// parameter of type `Self`.
+#[derive(Debug, PartialEq, Clone)]
+pub struct SchemaMethodParam {
+    pub name: String,
+    pub name_range: TokenRange,
+    pub type_node: TypeNode,
+}
+
+/// A method declaration inside a schema's `with { ... }` block.
+///
+/// Source form: `[#derive C ...]* [#native] name(p1: T1, ...) -> R [: body]`
+/// — the body is required when `is_native` is false and forbidden when it
+/// is true (parser enforces this).
+#[derive(Debug, PartialEq, Clone)]
+pub struct SchemaMethod {
+    /// Method name (the `name` in `name(...) -> R`).
+    pub name: String,
+    pub name_range: TokenRange,
+    /// Typed parameters as written; `self` is implicit and is added by
+    /// the analyzer when lowering.
+    pub params: Vec<SchemaMethodParam>,
+    /// Return type (the `R` in `-> R`). Required for every method —
+    /// methods are not type-inferred at the signature level.
+    pub return_type: TypeNode,
+    /// Body expression (`: body`). `None` when the method is marked
+    /// `#native` — the host registers the implementation.
+    pub body: Option<Box<Node>>,
+    /// Constraint names from method-level `#derive <Constraint>` pragmas,
+    /// in source order.
+    pub derives: Vec<String>,
+    /// True when an `#native` pragma precedes this method, indicating
+    /// the body lives in host Rust (registered via the schema-method
+    /// host API). The parser leaves `body` `None` in this case.
+    pub is_native: bool,
+    pub range: TokenRange,
+    pub doc_comment: Option<String>,
 }
 
 /// Parsed `#name ...` directive — a structural / declarative attribute

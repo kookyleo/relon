@@ -65,6 +65,7 @@ pub fn collect_root_schemas(root: &Node, tree: &mut AnalyzedTree) {
             name_range,
             generics,
             body,
+            ..
         } = &dir.body
         else {
             continue;

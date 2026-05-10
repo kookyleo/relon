@@ -1,0 +1,5 @@
+// Invalid: `with { ... }` precedes the schema body block instead of
+// trailing it. Spec requires `#schema Name { fields } with { ... }` —
+// the field block must come first.
+#schema Money with { cents_value() -> Int: self.cents } { Int cents: * }
+{ Money price: { cents: 100 } }

@@ -1,0 +1,8 @@
+// Invalid: `#derive_xx` is not a recognized pragma (typo for `#derive`).
+// Only the closed set of method/schema-level pragmas defined by the
+// spec is allowed inside a `with { ... }` block.
+#schema Money { Int cents: * } with {
+    #derive_xx Equatable
+    eq(other: Self) -> Bool: self.cents == other.cents
+}
+{ Money price: { cents: 100 } }

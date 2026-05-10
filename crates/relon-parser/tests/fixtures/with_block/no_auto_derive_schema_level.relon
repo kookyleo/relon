@@ -1,0 +1,7 @@
+// Schema-level `#no_auto_derive` directive inside an otherwise empty
+// `with { ... }` block. No method follows the directive — it stands alone.
+// Exercises: bare schema-level pragma item, no methods at all.
+#schema InternalToken { String value: * } with {
+    #no_auto_derive JsonProjectable
+}
+{ InternalToken t: { value: "secret" } }

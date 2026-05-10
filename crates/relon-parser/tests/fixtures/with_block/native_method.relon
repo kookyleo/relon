@@ -1,0 +1,8 @@
+// `#native` method: signature only, no `: body_expr` — host implements.
+// Exercises: trailing method declaration that ends after `-> ReturnType`
+// (no colon, no body) inside a `with` block.
+#schema Document { String text: * } with {
+    #native
+    render() -> String
+}
+{ Document d: { text: "hello" } }

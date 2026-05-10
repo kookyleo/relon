@@ -1,0 +1,8 @@
+// Invalid: `Equatable` written as a bare identifier inside `with { ... }`,
+// outside any `#derive` / `#no_auto_derive` directive. Constraint names
+// only appear as arguments to those pragmas; they are not standalone items.
+#schema Money { Int cents: * } with {
+    Equatable
+    eq(other: Self) -> Bool: self.cents == other.cents
+}
+{ Money price: { cents: 100 } }

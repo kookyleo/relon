@@ -1,0 +1,11 @@
+// Two consecutive derived witnesses: `Equatable` (eq) + `Comparable` (lt).
+// Exercises: multiple methods in one `with` block, each with its own
+// preceding `#derive` directive.
+#schema Money { Int cents: * } with {
+    #derive Equatable
+    eq(other: Self) -> Bool: self.cents == other.cents
+
+    #derive Comparable
+    lt(other: Self) -> Bool: self.cents < other.cents
+}
+{ Money price: { cents: 100 } }

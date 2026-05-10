@@ -1,0 +1,8 @@
+// Generic schema header `Page<T>` carrying a `with { ... }` block whose
+// method returns `Self` (i.e. `Page<T>` of the enclosing schema).
+// Exercises: type parameter list on the schema header, `Self` as a
+// return type.
+#schema Page<T> { Int index: *, T item: * } with {
+    same() -> Self: self
+}
+{ Page<Int> p: { index: 0, item: 7 } }
