@@ -22,7 +22,8 @@
 
 use crate::diagnostic::{span_of, Diagnostic};
 use crate::directive_names::EXTEND;
-use crate::schema::method_info_from_parser;
+use crate::schema::{method_info_from_parser, SchemaMethodInfo};
+use crate::sig::{type_node_simple, FnParam, FnSignature};
 use crate::tree::AnalyzedTree;
 use relon_parser::{DirectiveBody, Node, TokenRange};
 use std::collections::HashMap;
@@ -134,4 +135,59 @@ pub fn check_method_uniqueness(tree: &mut AnalyzedTree) {
         }
     }
     tree.diagnostics.extend(diags);
+}
+
+/// Synthesize an [`FnSignature`] for `method`. `self` is *not* part of
+/// the signature's parameter list — the receiver is identified by the
+/// `(schema, method)` lookup key, so duplicating it as a leading param
+/// would over-count arity at every call site. A method declared
+/// `m(other: Self) -> Self` therefore becomes a 1-arg signature whose
+/// `Self` types stay as `Self` placeholders; `resolve_call_signature`
+/// substitutes the receiver's schema name when it has one to use.
+fn synthesize_method_signature(schema: &str, method: &SchemaMethodInfo) -> FnSignature {
+    let params = method
+        .params
+        .iter()
+        .map(|p| FnParam {
+            name: p.name.clone(),
+            ty: p.type_node.clone(),
+            optional: false,
+        })
+        .collect();
+    FnSignature {
+        name: format!("{schema}.{}", method.name),
+        generics: Vec::new(),
+        params,
+        return_type: method.return_type.clone(),
+        variadic_tail: None,
+    }
+}
+
+/// Final step of the schema-rooted lowering: for every method recorded
+/// in `tree.schema_methods`, populate `tree.method_signatures` with a
+/// synthesized signature. Native methods and methods on schemas with
+/// nameless declarations are skipped (the latter cannot be looked up
+/// by `(schema, method)` anyway). Should run after the conflict
+/// checks so that a duplicate-name pair only contributes a single
+/// signature (the first); the second will already have produced a
+/// `MethodNameConflict` diagnostic.
+pub fn build_method_signature_table(tree: &mut AnalyzedTree) {
+    let mut table: HashMap<(String, String), FnSignature> = HashMap::new();
+    for (schema_name, methods) in &tree.schema_methods {
+        for m in methods {
+            let key = (schema_name.clone(), m.name.clone());
+            if table.contains_key(&key) {
+                continue;
+            }
+            table.insert(key, synthesize_method_signature(schema_name, m));
+        }
+    }
+    tree.method_signatures = table;
+}
+
+/// Helper kept here so other passes don't have to know about
+/// `type_node_simple` to construct receiver hints (`self` placeholder).
+#[allow(dead_code)]
+pub(crate) fn self_placeholder_type() -> relon_parser::TypeNode {
+    type_node_simple("Self")
 }

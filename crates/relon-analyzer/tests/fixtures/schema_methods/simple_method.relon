@@ -1,0 +1,10 @@
+// Schema-rooted dispatch: a method declared inside `with { ... }` is
+// resolvable from inside `#main`.
+#schema Money {
+    Int cents: *
+} with {
+    cents_value() -> Int: self.cents
+}
+
+#main(Money m)
+{ Int total: m.cents_value() }

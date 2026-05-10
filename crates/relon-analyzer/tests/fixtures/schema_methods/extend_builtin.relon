@@ -1,0 +1,7 @@
+// `#extend` on a built-in type — `String` here. Method should resolve.
+#extend String with {
+    is_empty() -> Bool: self == ""
+}
+
+#main(String s)
+{ Bool b: s.is_empty() }

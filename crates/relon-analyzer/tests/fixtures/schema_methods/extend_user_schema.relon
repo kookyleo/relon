@@ -1,0 +1,11 @@
+// `#extend` adds methods to an existing user schema.
+#schema User {
+    String name: *
+}
+
+#extend User with {
+    is_admin() -> Bool: self.name == "admin"
+}
+
+#main(User u)
+{ Bool admin: u.is_admin() }

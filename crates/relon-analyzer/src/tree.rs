@@ -31,6 +31,13 @@ pub struct AnalyzedTree {
     /// directive. Consulted by the type-checker (to resolve `value.method`
     /// calls) and the evaluator (to bind `self` and dispatch).
     pub schema_methods: HashMap<String, Vec<SchemaMethodInfo>>,
+    /// Phase B (schema-rooted dispatch): synthesized `FnSignature`s for
+    /// each method, keyed by `(schema_name, method_name)`. Lets
+    /// [`crate::sig::lookup_signature`] resolve `value.method(...)` and
+    /// `Schema.method(...)` calls without re-walking the parser AST.
+    /// `self` is modelled implicitly — only declared params land in the
+    /// signature; the receiver type is recorded via the lookup key.
+    pub method_signatures: HashMap<(String, String), FnSignature>,
     /// Statically resolvable references, keyed by the reference
     /// expression's `NodeId`. Populated by `resolve_references`. Hosts
     /// (LSP, type-checker, lint) join this against `node_index` to map

@@ -1,0 +1,12 @@
+// Same method declared twice (once in `with`, once in `#extend`) → conflict.
+#schema Money {
+    Int cents: *
+} with {
+    value() -> Int: self.cents
+}
+
+#extend Money with {
+    value() -> Int: self.cents * 2
+}
+
+{ Int x: 1 }

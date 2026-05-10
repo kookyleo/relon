@@ -1,0 +1,6 @@
+// `#extend` on a non-existent schema → `ExtendUnknownSchema` diagnostic.
+#extend Nonexistent with {
+    foo() -> Int: 1
+}
+
+{ Int x: 1 }

@@ -157,6 +157,9 @@ pub fn analyze_with_options(root: &Node, options: &AnalyzeOptions) -> AnalyzedTr
     // per-pass conflict checks above (e.g. two methods of the same
     // name declared inside a single `with { ... }` block).
     extend::check_method_uniqueness(&mut tree);
+    // Synthesize one `FnSignature` per method into the lookup table
+    // consumed by `resolve_call_signature` and the evaluator.
+    extend::build_method_signature_table(&mut tree);
     // Stage 2.8: schema field types must be either a builtin / prelude
     // name or a declared schema. Runs after both schema-collecting
     // passes so the known-name set is fully populated.

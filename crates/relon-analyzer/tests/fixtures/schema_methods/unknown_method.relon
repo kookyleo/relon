@@ -1,0 +1,9 @@
+// `Money.uknown_method` does not exist — analyzer reports `UnknownMethod`.
+#schema Money {
+    Int cents: *
+} with {
+    cents_value() -> Int: self.cents
+}
+
+#main(Money m)
+{ Int total: m.uknown_method() }

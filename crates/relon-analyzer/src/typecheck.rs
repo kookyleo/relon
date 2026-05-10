@@ -623,6 +623,7 @@ impl<'a> Walker<'a> {
                 self.check_unresolved_fn_call(node, path);
                 self.check_fn_call(node, path, args);
                 self.check_strict_fn_call(node, path);
+                self.check_method_dispatch(node, path);
                 for arg in args {
                     self.visit_internal(&arg.value, None);
                 }
@@ -842,6 +843,141 @@ impl<'a> Walker<'a> {
                     return Some(sig.clone());
                 }
             }
+        }
+        // Schema-rooted Phase B: schema method dispatch. Two flavors:
+        //
+        //   1. `value.method(args)` — `value` is a binding whose static
+        //      type is some `Schema(name)`. Look up the method on that
+        //      schema's table.
+        //   2. `Schema.method(args)` — `Schema` itself is the head, and
+        //      the resolution is "static" (no receiver). The lookup is
+        //      keyed by the schema name regardless.
+        //
+        // For case 1, the receiver type comes from the path-walker so
+        // schema-typed sibling fields, schema-typed `#main(p: T)`
+        // params, and `let`-style closure params all participate.
+        if let Some(receiver_schema) = self.resolve_method_receiver(head) {
+            if let Some(sig) = self
+                .tree
+                .method_signatures
+                .get(&(receiver_schema, method.clone()))
+            {
+                return Some(sig.clone());
+            }
+        }
+        None
+    }
+
+    /// Schema-rooted Phase B: emit `UnknownMethod` when a 2-segment
+    /// `head.method(...)` call has a head whose static type resolves
+    /// to a known schema, but the method isn't recorded on that
+    /// schema's table. Also enforces `#private` visibility — a private
+    /// method may only be called from another method on the *same*
+    /// schema (currently approximated as: from inside the same
+    /// `with { ... }` block, tracked via `self.method_call_context`).
+    ///
+    /// Skipped when the head doesn't resolve to a schema receiver: the
+    /// existing single-segment `UnresolvedReference` /
+    /// `UnknownTypeName` machinery already covers that, and we must
+    /// not double-count names like sibling closures or aliased imports.
+    fn check_method_dispatch(&mut self, node: &Node, path: &[TokenKey]) {
+        if path.len() != 2 {
+            return;
+        }
+        let TokenKey::String(head, _, _) = &path[0] else {
+            return;
+        };
+        let TokenKey::String(method, method_range, _) = &path[1] else {
+            return;
+        };
+        // If head resolves to a sibling closure or an aliased imported
+        // closure, that's a non-schema dispatch — let the regular
+        // signature checks handle it.
+        if self.lookup_field_node(head).is_some() {
+            return;
+        }
+        if let Some(idx) = self.tree.workspace_import_index.as_ref() {
+            if idx.aliased_closures.contains_key(head) {
+                return;
+            }
+        }
+        let Some(schema) = self.resolve_method_receiver(head) else {
+            return;
+        };
+        let key = (schema.clone(), method.clone());
+        let Some(info) = self
+            .tree
+            .schema_methods
+            .get(&schema)
+            .and_then(|methods| methods.iter().find(|m| &m.name == method))
+            .cloned()
+        else {
+            self.tree.diagnostics.push(Diagnostic::UnknownMethod {
+                schema,
+                method: method.clone(),
+                range: span_of(*method_range),
+            });
+            return;
+        };
+        if info.is_private && !self.in_method_block(&schema) {
+            self.tree.diagnostics.push(Diagnostic::PrivateMethodViolation {
+                schema,
+                method: method.clone(),
+                range: span_of(*method_range),
+            });
+        }
+        // Suppress unused-key warning until we wire in argument
+        // type-checking against the synthesized method signature: the
+        // existing `check_fn_call` already validated arity once
+        // `resolve_call_signature` returned the method's `FnSignature`.
+        let _ = (key, node);
+    }
+
+    /// Stub for the in-method-block tracking hook used by
+    /// `check_method_dispatch`. The full implementation needs the
+    /// type-check walker to push / pop a per-method context as it
+    /// enters each `with { ... }` block; today we have no such
+    /// machinery, so the conservative answer is "no" — which means a
+    /// `#private` method called from anywhere outside its declaration
+    /// site (including from sibling methods on the same schema) is
+    /// flagged. This is a known false-positive surface that the
+    /// follow-up sub-task wires up properly.
+    fn in_method_block(&self, _schema: &str) -> bool {
+        false
+    }
+
+    /// Resolve the receiver schema name of a method call's head segment.
+    /// Returns the schema name if either:
+    ///   * `head` is itself a schema name in scope (the static
+    ///     `Schema.method` form), or
+    ///   * `head` is a binding whose static type chain ends at a
+    ///     `Schema(name)`.
+    fn resolve_method_receiver(&self, head: &str) -> Option<String> {
+        // Static `Schema.method(...)` form: head is a known schema
+        // name. Any name registered in `schema_index` (whether via a
+        // `#schema` directive, an enum, or a base reference) qualifies.
+        if self.schema_index.contains_key(head) {
+            return Some(head.to_string());
+        }
+        // Even if the schema has no `+ Base` chain (and hence no entry
+        // in `schema_index`), a name explicitly recorded in
+        // `schema_methods` is still a valid receiver root — that
+        // covers schemas declared via `#schema X with { ... }` whose
+        // body is empty / `Enum<...>` and never propagated into the
+        // base index.
+        if self.tree.schema_methods.contains_key(head) {
+            return Some(head.to_string());
+        }
+        let scope = self.build_type_scope();
+        let single_path = [TokenKey::String(
+            head.to_string(),
+            TokenRange::default(),
+            false,
+        )];
+        if let infer::PathTailOutcome::Resolved(InferredType::Schema(name)) =
+            infer::walk_path(&single_path, &scope)
+        {
+            return Some(name);
         }
         None
     }
