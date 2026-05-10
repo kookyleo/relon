@@ -920,11 +920,13 @@ impl<'a> Walker<'a> {
             return;
         };
         if info.is_private && !self.in_method_block(&schema) {
-            self.tree.diagnostics.push(Diagnostic::PrivateMethodViolation {
-                schema,
-                method: method.clone(),
-                range: span_of(*method_range),
-            });
+            self.tree
+                .diagnostics
+                .push(Diagnostic::PrivateMethodViolation {
+                    schema,
+                    method: method.clone(),
+                    range: span_of(*method_range),
+                });
         }
         // Suppress unused-key warning until we wire in argument
         // type-checking against the synthesized method signature: the

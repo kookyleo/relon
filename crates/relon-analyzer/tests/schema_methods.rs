@@ -55,9 +55,10 @@ fn extend_on_user_schema() {
 #[test]
 fn extend_on_unknown_schema_diagnoses() {
     let tree = analyze_fixture("schema_methods/extend_unknown.relon");
-    let unknown = count(&tree.diagnostics, |d| {
-        matches!(d, Diagnostic::ExtendUnknownSchema { name, .. } if name == "Nonexistent")
-    });
+    let unknown = count(
+        &tree.diagnostics,
+        |d| matches!(d, Diagnostic::ExtendUnknownSchema { name, .. } if name == "Nonexistent"),
+    );
     assert_eq!(unknown, 1, "{:?}", tree.diagnostics);
 }
 

@@ -1821,7 +1821,9 @@ impl Evaluator {
                 // Try that table before falling through to any
                 // (currently un-supported) static-body dispatch.
                 if method.is_native {
-                    if let Some(out) = self.try_call_native_method(head, method_name, None, args, range)? {
+                    if let Some(out) =
+                        self.try_call_native_method(head, method_name, None, args, range)?
+                    {
                         return Ok(Some(out));
                     }
                 }

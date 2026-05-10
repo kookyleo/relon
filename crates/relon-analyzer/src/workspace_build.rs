@@ -705,7 +705,7 @@ fn is_main_return_diagnostic(d: &Diagnostic) -> bool {
 }
 
 /// Schema-rooted Phase B post-pass: propagate `#schema X with { ... }`
-/// + `#extend X with { ... }` contributions from each transitively-
+/// and `#extend X with { ... }` contributions from each transitively
 /// imported module into the importer's `tree.schema_methods`. Runs
 /// after every reachable module has been analyzed but *before*
 /// `recheck_cross_module_calls`, so the typecheck rerun resolves
@@ -733,8 +733,10 @@ fn propagate_schema_methods_across_imports(ws: &mut WorkspaceTree) {
     // otherwise — `transitive_modules` already dedupes via the visited
     // set, but the table read still must be consistent across
     // iterations).
-    let mut original_methods: HashMap<String, HashMap<String, Vec<crate::schema::SchemaMethodInfo>>> =
-        HashMap::new();
+    let mut original_methods: HashMap<
+        String,
+        HashMap<String, Vec<crate::schema::SchemaMethodInfo>>,
+    > = HashMap::new();
     for id in &module_ids {
         if let Some(arc_tree) = ws.modules.get(id) {
             original_methods.insert(id.clone(), arc_tree.schema_methods.clone());

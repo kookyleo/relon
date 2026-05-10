@@ -249,7 +249,9 @@ pub enum Diagnostic {
         range: SourceSpan,
     },
 
-    #[error("method `{method}` on schema `{schema}` is `#private` and cannot be called from outside")]
+    #[error(
+        "method `{method}` on schema `{schema}` is `#private` and cannot be called from outside"
+    )]
     #[diagnostic(
         code(relon::analyze::private_method_violation),
         help(
