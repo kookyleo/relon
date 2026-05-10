@@ -4054,6 +4054,59 @@ fn v17_bare_list_diagnoses_at_analyzer() {
 }
 
 // ===================================================================
+// Phase D: `register_method` host API — host attaches a native impl to
+// a `#native` method declared on a schema, and dispatch routes to it.
+// ===================================================================
+
+#[test]
+fn register_method_dispatches_to_host_fn() {
+    use std::collections::{BTreeMap, HashMap};
+    let source = r#"#schema Money {
+    Int cents: *
+} with {
+    #native
+    formatted() -> String
+}
+#main(Money m)
+{ String s: m.formatted() }"#;
+    let node = parse_doc(source);
+    let analyzed = std::sync::Arc::new(relon_analyzer::analyze(&node));
+
+    struct Formatter;
+    impl crate::native_fn::RelonFunction for Formatter {
+        fn call(
+            &self,
+            args: crate::native_fn::NativeArgs,
+            _range: relon_parser::TokenRange,
+        ) -> Result<Value, crate::error::RuntimeError> {
+            let Value::Dict(d) = args.positional.first().expect("self") else {
+                panic!("self should be a Dict");
+            };
+            let Value::Int(cents) = d.map.get("cents").expect("cents") else {
+                panic!("cents should be Int");
+            };
+            Ok(Value::String(format!("${:0.2}", *cents as f64 / 100.0)))
+        }
+    }
+
+    let mut ctx = Context::new()
+        .with_root(node.clone())
+        .with_analyzed(std::sync::Arc::clone(&analyzed));
+    ctx.register_pure_method("Money", "formatted", std::sync::Arc::new(Formatter));
+
+    let mut money = BTreeMap::new();
+    money.insert("cents".to_string(), Value::Int(199));
+    let mut args: HashMap<String, Value> = HashMap::new();
+    args.insert("m".to_string(), Value::dict(money));
+
+    let result = Evaluator::new(std::sync::Arc::new(ctx))
+        .run_main(&std::sync::Arc::new(Scope::default()), args)
+        .unwrap();
+    let Value::Dict(d) = result else { panic!() };
+    assert_eq!(d.map.get("s"), Some(&Value::String("$1.99".to_string())));
+}
+
+// ===================================================================
 // Phase C: operator lowering (`==` / `!=` / `<` / `>`) onto the
 // schema-rooted `eq` / `lt` witnesses introduced by Phase B.
 // ===================================================================

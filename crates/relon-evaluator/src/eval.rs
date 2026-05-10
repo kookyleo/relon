@@ -150,6 +150,15 @@ pub struct Context {
     pub(crate) root_node: Option<Arc<Node>>,
     pub(crate) decorators: HashMap<String, Arc<dyn DecoratorPlugin>>,
     pub(crate) functions: HashMap<String, GatedNativeFn>,
+    /// Schema-rooted Phase D: native methods registered against a
+    /// specific schema. Keyed by `(schema_name, method_name)` so a
+    /// host can attach `register_method("Money", "cents_value", gate,
+    /// func)` and the evaluator dispatches `m.cents_value()` to it
+    /// when `m`'s brand is `"Money"`. Mirrors the analyzer's
+    /// `tree.method_signatures` shape; the `#native` directive on a
+    /// `with { ... }` method declares the slot, the host fills it at
+    /// runtime through this map.
+    pub(crate) native_methods: HashMap<(String, String), GatedNativeFn>,
     pub schemas: HashMap<String, Value>,
     pub(crate) module_resolvers: Vec<Arc<dyn ModuleResolver>>,
     pub(crate) path_cache: Mutex<HashMap<String, Value>>,
@@ -201,6 +210,7 @@ impl Context {
             root_node: None,
             decorators: HashMap::new(),
             functions: HashMap::new(),
+            native_methods: HashMap::new(),
             schemas: HashMap::new(),
             module_resolvers: Vec::new(),
             path_cache: Mutex::new(HashMap::new()),
@@ -304,6 +314,43 @@ impl Context {
     /// register through this entry point.
     pub fn register_pure_fn<S: Into<String>>(&mut self, name: S, func: Arc<dyn RelonFunction>) {
         self.register_fn(name, NativeFnGate::default(), func);
+    }
+
+    /// Schema-rooted Phase D: attach a host-supplied implementation to
+    /// a `#native` method on a specific schema. The evaluator
+    /// dispatches `value.method(...)` to this fn whenever `value`'s
+    /// brand matches `schema` and the source-side method body is
+    /// absent (declared `#native`). Capability gating mirrors
+    /// [`Self::register_fn`]: the `gate` declares which
+    /// [`Capabilities`] bits the body needs at runtime, and a denied
+    /// caller surfaces `RuntimeError::CapabilityDenied`.
+    ///
+    /// Replaces the v1 pattern of `register_fn("Schema.method", ...)`
+    /// with a key shape that tracks the schema-rooted dispatch model
+    /// directly — no string concatenation, no shadowing of free fn
+    /// names by accident.
+    pub fn register_method<S: Into<String>, M: Into<String>>(
+        &mut self,
+        schema: S,
+        method: M,
+        gate: NativeFnGate,
+        func: Arc<dyn RelonFunction>,
+    ) {
+        self.native_methods
+            .insert((schema.into(), method.into()), GatedNativeFn { func, gate });
+    }
+
+    /// Pure-method counterpart to [`Self::register_method`]. Equivalent
+    /// to passing [`NativeFnGate::default`] (the all-zero gate) — the
+    /// method body needs no host capability, so it dispatches under
+    /// every [`Capabilities`] including the zero-trust default.
+    pub fn register_pure_method<S: Into<String>, M: Into<String>>(
+        &mut self,
+        schema: S,
+        method: M,
+        func: Arc<dyn RelonFunction>,
+    ) {
+        self.register_method(schema, method, NativeFnGate::default(), func);
     }
 
     pub fn register_decorator<S: Into<String>>(
@@ -1769,6 +1816,15 @@ impl Evaluator {
         // Static dispatch first: head names a schema directly.
         if let Some(methods) = analyzed.schema_methods.get(head) {
             if let Some(method) = methods.iter().find(|m| m.name == *method_name) {
+                // Phase D: a `#native` method declared at source level
+                // with no body delegates to a host-registered impl.
+                // Try that table before falling through to any
+                // (currently un-supported) static-body dispatch.
+                if method.is_native {
+                    if let Some(out) = self.try_call_native_method(head, method_name, None, args, range)? {
+                        return Ok(Some(out));
+                    }
+                }
                 if let Some(body) = method.body_node.as_ref() {
                     return self
                         .invoke_method_body(body, None, &method.params, args, scope, range)
@@ -1789,6 +1845,20 @@ impl Evaluator {
         let Some(schema_name) = value_schema_tag(&receiver_value) else {
             return Ok(None);
         };
+        // Phase D: receiver-side native method dispatch. Try the
+        // host-registered table first so schemas may attach behaviors
+        // even when the source-side `with { ... }` block is empty
+        // (e.g. body-less `#schema String with { ... }` from
+        // `register_pure_method("String", "is_blank", ...)`).
+        if let Some(out) = self.try_call_native_method(
+            &schema_name,
+            method_name,
+            Some(receiver_value.clone()),
+            args,
+            range,
+        )? {
+            return Ok(Some(out));
+        }
         let Some(methods) = analyzed.schema_methods.get(&schema_name) else {
             return Ok(None);
         };
@@ -1807,6 +1877,32 @@ impl Evaluator {
             range,
         )
         .map(Some)
+    }
+
+    /// Phase D: dispatch through a host-registered native method.
+    /// Returns `Ok(None)` when no entry matches `(schema, method)`.
+    /// `receiver` is prepended to the positional args when present
+    /// (the host fn sees `self` as `args[0]`); static calls pass
+    /// `None` and the host fn just sees the declared params.
+    fn try_call_native_method(
+        &self,
+        schema: &str,
+        method: &str,
+        receiver: Option<Value>,
+        args: &[EvaluatedArg],
+        range: TokenRange,
+    ) -> Result<Option<Value>, RuntimeError> {
+        let key = (schema.to_string(), method.to_string());
+        let Some(entry) = self.context.native_methods.get(&key) else {
+            return Ok(None);
+        };
+        let display_name = format!("{schema}.{method}");
+        self.check_native_fn_capability(&display_name, entry, range)?;
+        let mut native = NativeArgs::from_evaluated(args.to_vec(), self.caps());
+        if let Some(self_val) = receiver {
+            native.positional.insert(0, self_val);
+        }
+        Ok(Some(entry.func.call(native, range)?))
     }
 
     /// Evaluate a method body with `self` bound (when a receiver is
