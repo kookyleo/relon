@@ -21,7 +21,7 @@
 
 use crate::diagnostic::{span_of, Diagnostic};
 use crate::directive_names::SCHEMA;
-use crate::schema::lower_schema_pure;
+use crate::schema::{lower_schema_pure_with, record_schema_methods};
 use crate::tree::AnalyzedTree;
 use relon_parser::{DirectiveBody, Expr, Node, Operator, TokenRange};
 use std::collections::HashMap;
@@ -65,7 +65,8 @@ pub fn collect_root_schemas(root: &Node, tree: &mut AnalyzedTree) {
             name_range,
             generics,
             body,
-            ..
+            methods,
+            schema_no_auto_derives,
         } = &dir.body
         else {
             continue;
@@ -118,9 +119,16 @@ pub fn collect_root_schemas(root: &Node, tree: &mut AnalyzedTree) {
         // ones. The lowering result also lands in `tree.schemas` —
         // keyed by the body node id — so downstream consumers can
         // treat root-form and dict-field-form uniformly.
-        let (def, diags) = lower_schema_pure(Some(name.clone()), generics.clone(), body);
+        let (def, diags) = lower_schema_pure_with(
+            Some(name.clone()),
+            generics.clone(),
+            body,
+            methods,
+            schema_no_auto_derives,
+        );
         tree.diagnostics.extend(diags);
         if let Some(def) = def {
+            record_schema_methods(&def, tree);
             tree.schemas.insert(body.id, def);
         }
         track_node(body, tree);

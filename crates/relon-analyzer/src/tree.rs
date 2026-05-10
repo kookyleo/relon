@@ -9,7 +9,7 @@ use crate::diagnostic::Diagnostic;
 use crate::main_sig::MainSignature;
 use crate::resolve::ResolvedRef;
 use crate::root_schemas::RootSchemaDecl;
-use crate::schema::SchemaDef;
+use crate::schema::{SchemaDef, SchemaMethodInfo};
 use crate::sig::FnSignature;
 use crate::workspace_build::WorkspaceImportIndex;
 use relon_parser::{Node, NodeId};
@@ -23,6 +23,14 @@ pub struct AnalyzedTree {
     /// Schema definitions discovered by the schema pass, keyed by the
     /// `NodeId` of the schema body node carried by `#schema A Body`.
     pub schemas: HashMap<NodeId, SchemaDef>,
+    /// Phase B (schema-rooted dispatch): per-schema method tables,
+    /// keyed by schema name. Aggregates methods declared on the schema
+    /// itself (`#schema X with { ... }`) plus any `#extend X with { ... }`
+    /// blocks visible to this module. Populated by the analyzer entry
+    /// pass after `lower_schema_pure_with` has lowered each `#schema`
+    /// directive. Consulted by the type-checker (to resolve `value.method`
+    /// calls) and the evaluator (to bind `self` and dispatch).
+    pub schema_methods: HashMap<String, Vec<SchemaMethodInfo>>,
     /// Statically resolvable references, keyed by the reference
     /// expression's `NodeId`. Populated by `resolve_references`. Hosts
     /// (LSP, type-checker, lint) join this against `node_index` to map

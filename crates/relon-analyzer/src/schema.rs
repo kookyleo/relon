@@ -57,8 +57,72 @@ pub struct SchemaDef {
     /// `bases` are unused — the schema is consumed via variant
     /// construction and pattern matching instead of dict validation.
     pub variants: Vec<EnumVariant>,
+    /// Schema-rooted Phase B: methods declared inside the schema's
+    /// `with { ... }` block (decisions 1, 4, 10, 12 of
+    /// `schema-rooted-model-2026-05-11.md`). Source-order; analyzer
+    /// later resolves `Self` and merges `#extend` contributions per
+    /// import-chain visibility (decision 9).
+    pub methods: Vec<SchemaMethodInfo>,
+    /// Schema-level `#no_auto_derive <Constraint>` opt-outs collected
+    /// from the schema's `with { ... }` block (decision 15). Constraint
+    /// names as bare strings; analyzer cross-references against the
+    /// built-in constraint set in Phase C.
+    pub schema_no_auto_derives: Vec<String>,
     /// Documentation extracted from leading comments.
     pub doc_comment: Option<String>,
+}
+
+/// Static skeleton of a single method declared in a `with { ... }`
+/// block (either on a `#schema X { ... } with { ... }` or on a
+/// `#extend X with { ... }`). Mirrors `relon_parser::SchemaMethod`
+/// shape but lives in the analyzer crate so passes can attach derived
+/// data without depending on the parser AST.
+///
+/// `body_node` carries the AST `Node` of the method body when present
+/// (`None` when `is_native` — host-implemented). Analyzer passes treat
+/// it as a closure-like body; evaluator dispatches by binding `self`
+/// and evaluating the body in the schema's scope.
+#[derive(Debug, Clone)]
+pub struct SchemaMethodInfo {
+    /// Method name as declared in source.
+    pub name: String,
+    /// Range of the method-name token (for LSP hover / diagnostics).
+    pub name_range: TokenRange,
+    /// Method parameters as declared (excluding the implicit `self`).
+    pub params: Vec<SchemaMethodParamInfo>,
+    /// Declared return type (`-> R` slot).
+    pub return_type: TypeNode,
+    /// Body expression node when the method has one. `None` for
+    /// `#native` methods.
+    pub body_node: Option<Arc<Node>>,
+    /// Constraint names from method-level `#derive <C>` pragmas
+    /// (decision 18: only constraints not already derived in the
+    /// owning schema's initial declaration).
+    pub derives: Vec<String>,
+    /// True when an `#native` pragma precedes this method — the body
+    /// lives in host Rust (registered via `register_method`, Phase D).
+    pub is_native: bool,
+    /// True when an `#private` pragma precedes this method (decision
+    /// 16: schema-internal visibility, only callable from other method
+    /// bodies on the same schema).
+    pub is_private: bool,
+    /// Range of the entire method declaration (signature + body).
+    pub range: TokenRange,
+    /// Source module path / hint of where this method was declared.
+    /// `None` when declared in the schema's initial `#schema X` site;
+    /// `Some(canonical_id)` when contributed by an `#extend X` in
+    /// another module (used for import-chain visibility checks in
+    /// Phase B.2).
+    pub source_module: Option<String>,
+    /// Documentation extracted from leading comments.
+    pub doc_comment: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SchemaMethodParamInfo {
+    pub name: String,
+    pub name_range: TokenRange,
+    pub type_node: TypeNode,
 }
 
 /// One alternative inside a sum-type Enum schema. `fields` is empty for
@@ -232,6 +296,7 @@ fn visit_field(key: &TokenKey, value: &Node, tree: &mut AnalyzedTree) {
         _ => {}
     }
     if let Some(def) = lower_schema(name, generics, value, tree) {
+        record_schema_methods(&def, tree);
         tree.schemas.insert(value.id, def);
     }
 }
@@ -264,6 +329,22 @@ pub fn lower_schema_pure(
     generics: Vec<String>,
     value: &Node,
 ) -> (Option<SchemaDef>, Vec<Diagnostic>) {
+    lower_schema_pure_with(name, generics, value, &[], &[])
+}
+
+/// Schema-rooted Phase B variant: also accepts the `with { ... }` block
+/// contributions parsed off the directive (`methods` and
+/// `schema_no_auto_derives`). Used by `collect_root_schemas` when the
+/// surrounding directive carries this metadata; the legacy
+/// `lower_schema_pure` keeps the empty-`with` shape for callers that
+/// don't see the directive (dict-field form).
+pub fn lower_schema_pure_with(
+    name: Option<String>,
+    generics: Vec<String>,
+    value: &Node,
+    methods: &[relon_parser::SchemaMethod],
+    schema_no_auto_derives: &[String],
+) -> (Option<SchemaDef>, Vec<Diagnostic>) {
     let mut tmp = AnalyzedTree::new();
     let mut def = SchemaDef {
         name,
@@ -272,6 +353,8 @@ pub fn lower_schema_pure(
         bases: Vec::new(),
         range: value.range,
         variants: Vec::new(),
+        methods: methods.iter().map(method_info_from_parser).collect(),
+        schema_no_auto_derives: schema_no_auto_derives.to_vec(),
         doc_comment: value.doc_comment.clone(),
     };
     let ok = walk_schema_body(value, &mut def, &mut tmp);
@@ -280,6 +363,54 @@ pub fn lower_schema_pure(
         (Some(def), diags)
     } else {
         (None, diags)
+    }
+}
+
+/// Mirror a freshly-lowered `SchemaDef.methods` list into the
+/// `tree.schema_methods` index. Schema-rooted dispatch is keyed by
+/// schema *name*, so anonymous schemas (no `name`) and method-less
+/// definitions are skipped — they cannot contribute callable methods.
+/// Append-only: when the same schema name appears in both root-level
+/// `#schema` and an `#extend` block, both contributions accumulate
+/// here in source order; conflict detection runs in a later pass.
+pub fn record_schema_methods(def: &SchemaDef, tree: &mut AnalyzedTree) {
+    let Some(name) = def.name.as_ref() else {
+        return;
+    };
+    if def.methods.is_empty() {
+        return;
+    }
+    tree.schema_methods
+        .entry(name.clone())
+        .or_default()
+        .extend(def.methods.iter().cloned());
+}
+
+/// Convert a parser-produced `SchemaMethod` into the analyzer's
+/// `SchemaMethodInfo`. `source_module` is left `None` here — the
+/// workspace pass fills it for `#extend`-contributed methods when
+/// merging across modules (Phase B.2).
+pub fn method_info_from_parser(m: &relon_parser::SchemaMethod) -> SchemaMethodInfo {
+    SchemaMethodInfo {
+        name: m.name.clone(),
+        name_range: m.name_range,
+        params: m
+            .params
+            .iter()
+            .map(|p| SchemaMethodParamInfo {
+                name: p.name.clone(),
+                name_range: p.name_range,
+                type_node: p.type_node.clone(),
+            })
+            .collect(),
+        return_type: m.return_type.clone(),
+        body_node: m.body.as_ref().map(|b| Arc::new((**b).clone())),
+        derives: m.derives.clone(),
+        is_native: m.is_native,
+        is_private: m.is_private,
+        range: m.range,
+        source_module: None,
+        doc_comment: m.doc_comment.clone(),
     }
 }
 

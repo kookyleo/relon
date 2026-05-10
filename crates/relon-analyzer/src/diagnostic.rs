@@ -206,6 +206,63 @@ pub enum Diagnostic {
         range: SourceSpan,
     },
 
+    #[error("`#extend {name}` targets schema `{name}` which is not declared in scope")]
+    #[diagnostic(
+        code(relon::analyze::extend_unknown_schema),
+        help(
+            "`#extend X with {{ ... }}` requires `X` to be either a built-in type (String / Int / List / ...) or a `#schema X` declared in the same module / a transitively imported module. Declare `X` first, or correct the spelling."
+        )
+    )]
+    ExtendUnknownSchema {
+        name: String,
+        #[label("no schema by this name in scope")]
+        range: SourceSpan,
+    },
+
+    #[error("method `{method}` declared more than once for schema `{schema}`")]
+    #[diagnostic(
+        code(relon::analyze::method_name_conflict),
+        help(
+            "Each schema may bind a given method name only once across its `with {{ ... }}` block and any `#extend` blocks visible to the current module. Rename one of the methods, or move the override into a different module that this one doesn't import together."
+        )
+    )]
+    MethodNameConflict {
+        schema: String,
+        method: String,
+        #[label("first defined here")]
+        first: SourceSpan,
+        #[label("redefined with the same name")]
+        second: SourceSpan,
+    },
+
+    #[error("method `{method}` is not declared on schema `{schema}`")]
+    #[diagnostic(
+        code(relon::analyze::unknown_method),
+        help(
+            "Schema-rooted dispatch resolves `value.method(...)` and `Schema.method(...)` against the schema's `with {{ ... }}` block (and any `#extend` blocks visible here). Add the method, or check the spelling and import paths."
+        )
+    )]
+    UnknownMethod {
+        schema: String,
+        method: String,
+        #[label("no such method on this schema")]
+        range: SourceSpan,
+    },
+
+    #[error("method `{method}` on schema `{schema}` is `#private` and cannot be called from outside")]
+    #[diagnostic(
+        code(relon::analyze::private_method_violation),
+        help(
+            "`#private` methods are only callable from the same `with {{ ... }}` block (sibling methods on the same schema). Drop the `#private` directive, or move the caller into the same block."
+        )
+    )]
+    PrivateMethodViolation {
+        schema: String,
+        method: String,
+        #[label("private method called from outside its `with {{ ... }}` block")]
+        range: SourceSpan,
+    },
+
     #[error("match arms produce incompatible types: {}", arm_types.join(" vs "))]
     #[diagnostic(
         code(relon::analyze::match_arm_type_mismatch),
@@ -506,6 +563,10 @@ impl Diagnostic {
             | Diagnostic::DuplicateRootSchemaName { .. }
             | Diagnostic::RootSchemaCollidesWithField { .. }
             | Diagnostic::RootSchemaInvalidValue { .. }
+            | Diagnostic::ExtendUnknownSchema { .. }
+            | Diagnostic::MethodNameConflict { .. }
+            | Diagnostic::UnknownMethod { .. }
+            | Diagnostic::PrivateMethodViolation { .. }
             // Static type mismatches are derivable from source + schema
             // alone — the workhorse of Stage 1 hardening. Surface them
             // as errors so the evaluator never reaches a code path that

@@ -23,6 +23,7 @@ pub(crate) mod const_fold;
 pub(crate) mod decorator_names;
 pub mod diagnostic;
 pub(crate) mod directive_names;
+pub(crate) mod extend;
 pub(crate) mod generics;
 pub(crate) mod infer;
 pub(crate) mod main_return;
@@ -148,6 +149,14 @@ pub fn analyze_with_options(root: &Node, options: &AnalyzeOptions) -> AnalyzedTr
     // `collect_schemas` so the dual-declaration collision check has the
     // field-form table to consult.
     root_schemas::collect_root_schemas(root, &mut tree);
+    // Schema-rooted Phase B: contribute `#extend X with { ... }` method
+    // tables onto every schema declared above. Must run after both
+    // schema collection passes so the in-scope name set is complete.
+    extend::collect_extends(root, &mut tree);
+    // Detect intra-block duplicate method names that survived the
+    // per-pass conflict checks above (e.g. two methods of the same
+    // name declared inside a single `with { ... }` block).
+    extend::check_method_uniqueness(&mut tree);
     // Stage 2.8: schema field types must be either a builtin / prelude
     // name or a declared schema. Runs after both schema-collecting
     // passes so the known-name set is fully populated.
