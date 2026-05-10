@@ -4054,6 +4054,128 @@ fn v17_bare_list_diagnoses_at_analyzer() {
 }
 
 // ===================================================================
+// Phase C: operator lowering (`==` / `!=` / `<` / `>`) onto the
+// schema-rooted `eq` / `lt` witnesses introduced by Phase B.
+// ===================================================================
+
+#[test]
+fn operator_eq_lowers_to_user_method() {
+    use std::collections::{BTreeMap, HashMap};
+    let source = r#"#schema Money {
+    Int cents: *
+} with {
+    eq(other: Self) -> Bool: self.cents == other.cents
+}
+#main(Money a, Money b)
+{ Bool same: a == b }"#;
+    let node = parse_doc(source);
+    let analyzed = std::sync::Arc::new(relon_analyzer::analyze(&node));
+    let mut a = BTreeMap::new();
+    a.insert("cents".to_string(), Value::Int(100));
+    let mut b = BTreeMap::new();
+    b.insert("cents".to_string(), Value::Int(100));
+    let mut args: HashMap<String, Value> = HashMap::new();
+    args.insert("a".to_string(), Value::dict(a));
+    args.insert("b".to_string(), Value::dict(b));
+    let ctx = Context::new()
+        .with_root(node.clone())
+        .with_analyzed(std::sync::Arc::clone(&analyzed));
+    let result = Evaluator::new(std::sync::Arc::new(ctx))
+        .run_main(&std::sync::Arc::new(Scope::default()), args)
+        .unwrap();
+    let Value::Dict(d) = result else { panic!() };
+    assert_eq!(d.map.get("same"), Some(&Value::Bool(true)));
+}
+
+#[test]
+fn operator_lt_lowers_to_user_method() {
+    use std::collections::{BTreeMap, HashMap};
+    let source = r#"#schema Money {
+    Int cents: *
+} with {
+    lt(other: Self) -> Bool: self.cents < other.cents
+}
+#main(Money a, Money b)
+{ Bool less: a < b }"#;
+    let node = parse_doc(source);
+    let analyzed = std::sync::Arc::new(relon_analyzer::analyze(&node));
+    let mut a = BTreeMap::new();
+    a.insert("cents".to_string(), Value::Int(50));
+    let mut b = BTreeMap::new();
+    b.insert("cents".to_string(), Value::Int(150));
+    let mut args: HashMap<String, Value> = HashMap::new();
+    args.insert("a".to_string(), Value::dict(a));
+    args.insert("b".to_string(), Value::dict(b));
+    let ctx = Context::new()
+        .with_root(node.clone())
+        .with_analyzed(std::sync::Arc::clone(&analyzed));
+    let result = Evaluator::new(std::sync::Arc::new(ctx))
+        .run_main(&std::sync::Arc::new(Scope::default()), args)
+        .unwrap();
+    let Value::Dict(d) = result else { panic!() };
+    assert_eq!(d.map.get("less"), Some(&Value::Bool(true)));
+}
+
+#[test]
+fn operator_gt_lowers_to_lt_swapped() {
+    // `a > b` lowers to `b.lt(a)` — a single `lt` witness covers both directions.
+    use std::collections::{BTreeMap, HashMap};
+    let source = r#"#schema Money {
+    Int cents: *
+} with {
+    lt(other: Self) -> Bool: self.cents < other.cents
+}
+#main(Money a, Money b)
+{ Bool greater: a > b }"#;
+    let node = parse_doc(source);
+    let analyzed = std::sync::Arc::new(relon_analyzer::analyze(&node));
+    let mut a = BTreeMap::new();
+    a.insert("cents".to_string(), Value::Int(150));
+    let mut b = BTreeMap::new();
+    b.insert("cents".to_string(), Value::Int(50));
+    let mut args: HashMap<String, Value> = HashMap::new();
+    args.insert("a".to_string(), Value::dict(a));
+    args.insert("b".to_string(), Value::dict(b));
+    let ctx = Context::new()
+        .with_root(node.clone())
+        .with_analyzed(std::sync::Arc::clone(&analyzed));
+    let result = Evaluator::new(std::sync::Arc::new(ctx))
+        .run_main(&std::sync::Arc::new(Scope::default()), args)
+        .unwrap();
+    let Value::Dict(d) = result else { panic!() };
+    assert_eq!(d.map.get("greater"), Some(&Value::Bool(true)));
+}
+
+#[test]
+fn operator_ne_inverts_user_eq() {
+    use std::collections::{BTreeMap, HashMap};
+    let source = r#"#schema Money {
+    Int cents: *
+} with {
+    eq(other: Self) -> Bool: self.cents == other.cents
+}
+#main(Money a, Money b)
+{ Bool diff: a != b }"#;
+    let node = parse_doc(source);
+    let analyzed = std::sync::Arc::new(relon_analyzer::analyze(&node));
+    let mut a = BTreeMap::new();
+    a.insert("cents".to_string(), Value::Int(100));
+    let mut b = BTreeMap::new();
+    b.insert("cents".to_string(), Value::Int(99));
+    let mut args: HashMap<String, Value> = HashMap::new();
+    args.insert("a".to_string(), Value::dict(a));
+    args.insert("b".to_string(), Value::dict(b));
+    let ctx = Context::new()
+        .with_root(node.clone())
+        .with_analyzed(std::sync::Arc::clone(&analyzed));
+    let result = Evaluator::new(std::sync::Arc::new(ctx))
+        .run_main(&std::sync::Arc::new(Scope::default()), args)
+        .unwrap();
+    let Value::Dict(d) = result else { panic!() };
+    assert_eq!(d.map.get("diff"), Some(&Value::Bool(true)));
+}
+
+// ===================================================================
 // Phase B: schema-rooted method dispatch (`with { ... }` + `#extend`)
 // ===================================================================
 

@@ -132,9 +132,37 @@ impl Evaluator {
             (Operator::Div | Operator::Mod, _, _) => {
                 eval_numeric_division(op, range, &l, left.range, &r, right.range)
             }
-            (Operator::Eq, a, b) => Ok(Value::Bool(a == b)),
-            (Operator::Ne, a, b) => Ok(Value::Bool(a != b)),
-            (Operator::Lt | Operator::Gt | Operator::Le | Operator::Ge, _, _) => {
+            (Operator::Eq, a, b) => {
+                // Phase C operator lowering: a branded value with a
+                // user-defined `eq` method dispatches through it.
+                // Falls through to structural Bool(a == b) when no
+                // method is registered (so primitives + plain dicts
+                // keep current semantics).
+                if let Some(out) = self.try_compare_op_method(a, b, "eq", scope, range)? {
+                    return Ok(out);
+                }
+                Ok(Value::Bool(a == b))
+            }
+            (Operator::Ne, a, b) => {
+                if let Some(out) = self.try_compare_op_method(a, b, "eq", scope, range)? {
+                    return Ok(invert_bool(out));
+                }
+                Ok(Value::Bool(a != b))
+            }
+            (Operator::Lt, a, b) => {
+                if let Some(out) = self.try_compare_op_method(a, b, "lt", scope, range)? {
+                    return Ok(out);
+                }
+                eval_numeric_comparison(op, &l, left.range, &r, right.range)
+            }
+            (Operator::Gt, a, b) => {
+                // `a > b` ≡ `b.lt(a)` so a single `lt` witness covers both directions.
+                if let Some(out) = self.try_compare_op_method(b, a, "lt", scope, range)? {
+                    return Ok(out);
+                }
+                eval_numeric_comparison(op, &l, left.range, &r, right.range)
+            }
+            (Operator::Le | Operator::Ge, _, _) => {
                 eval_numeric_comparison(op, &l, left.range, &r, right.range)
             }
             _ => Err(RuntimeError::UnsupportedOperator(
@@ -169,6 +197,61 @@ impl Evaluator {
                 node.range,
             )),
         }
+    }
+
+    /// Phase C operator lowering: dispatch a comparison op (`==`, `!=`,
+    /// `<`, `>`) through a user-defined witness method (`eq`, `lt`)
+    /// when the receiver is a branded value whose schema declares one.
+    /// Returns `Ok(None)` when no witness applies, so the caller falls
+    /// through to the structural / numeric default.
+    fn try_compare_op_method(
+        &self,
+        receiver: &Value,
+        other: &Value,
+        method_name: &str,
+        scope: &Arc<Scope>,
+        range: TokenRange,
+    ) -> Result<Option<Value>, RuntimeError> {
+        let Value::Dict(d) = receiver else {
+            return Ok(None);
+        };
+        let Some(brand) = d.brand.as_ref() else {
+            return Ok(None);
+        };
+        let Some(analyzed) = self.context.analyzed.as_ref() else {
+            return Ok(None);
+        };
+        let Some(method) = analyzed
+            .schema_methods
+            .get(brand)
+            .and_then(|methods| methods.iter().find(|m| m.name == method_name))
+        else {
+            return Ok(None);
+        };
+        let Some(body) = method.body_node.as_ref() else {
+            return Ok(None);
+        };
+        let arg = crate::native_fn::EvaluatedArg::positional(other.clone());
+        self.invoke_method_body(
+            body,
+            Some(receiver.clone()),
+            &method.params,
+            &[arg],
+            scope,
+            range,
+        )
+        .map(Some)
+    }
+}
+
+/// Helper for `Operator::Ne` lowering: invert the truthiness of a
+/// `Bool` returned by an `eq` witness call. Non-Bool returns from a
+/// user `eq` are unusual — propagate verbatim and let the caller
+/// surface an error if the surrounding context expects a Bool.
+fn invert_bool(v: Value) -> Value {
+    match v {
+        Value::Bool(b) => Value::Bool(!b),
+        other => other,
     }
 }
 

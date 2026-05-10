@@ -1815,7 +1815,7 @@ impl Evaluator {
     /// param list. Named args fall back to positional ordering for v1;
     /// the analyzer side already validated arity, so a missing arg is
     /// surfaced through the body's own VariableNotFound diagnostics.
-    fn invoke_method_body(
+    pub(crate) fn invoke_method_body(
         &self,
         body: &Node,
         receiver: Option<Value>,
