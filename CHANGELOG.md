@@ -1,5 +1,86 @@
 # Changelog
 
+## [Unreleased] — Schema-rooted dispatch (trait-bound foundation)
+
+Phases A.1 / B / C / D-API of the design recorded in
+[`docs/internal/schema-rooted-model-2026-05-11.md`](./docs/internal/schema-rooted-model-2026-05-11.md):
+
+### Language: `with { ... }` blocks and `#extend` (parser)
+
+```relon
+#schema Money { Int cents: * } with {
+    #derive Equatable
+    eq(other: Self) -> Bool: self.cents == other.cents
+    #private
+    helper() -> Int: self.cents * 2
+}
+
+#extend String with {
+    is_email() -> Bool: self.contains("@")
+}
+```
+
+A `#schema` or `#extend` may carry a trailing `with { ... }` block
+declaring methods. Methods support `#derive Constraint` /
+`#no_auto_derive Constraint` / `#native` / `#private` pragmas, plus
+`Self`-typed parameters and return types. Body-less `#schema X with
+{ #native foo() -> ... }` declares the method slot for a host-side
+implementation supplied through the new `register_method` API.
+
+### Analyzer / evaluator: schema-rooted method dispatch
+
+`value.method(...)` and `Schema.method(...)` now route through a
+per-schema method table built by the analyzer. Receiver dispatch
+picks `Value::Dict.brand` first and falls back to the primitive type
+name (`String`, `Int`, …) so `#extend String with { ... }` and
+similar built-in extensions work uniformly. Schema validation
+auto-brands a dict with the schema name when it has none, so
+`#main(Money m)` parameters dispatch through `Money`'s table without
+needing an explicit `#brand` directive.
+
+Cross-module visibility: `#extend X` from any module reachable via
+the importer's `#import` graph contributes to that importer's view
+of `X` (per-import-chain semantics). Conflict detection emits
+`MethodNameConflict` for clashes along the chain.
+
+New diagnostics: `ExtendUnknownSchema`, `MethodNameConflict`,
+`UnknownMethod`, `PrivateMethodViolation` (all `Error`).
+
+### Operator lowering
+
+`==` / `!=` lower to `lhs.eq(rhs)` (negated for `!=`) when the
+receiver is a branded value with an `eq` witness on its schema.
+`<` lowers to `lhs.lt(rhs)`; `>` lowers to `rhs.lt(lhs)` so a
+single `lt` witness covers both directions. Primitives and
+unbranded values keep the structural / numeric defaults.
+
+### Host API: `register_method`
+
+```rust
+ctx.register_method(
+    "Money",
+    "formatted",
+    NativeFnGate::default(),
+    Arc::new(MyFormatter),
+);
+```
+
+`Context::register_method(schema, name, gate, func)` and
+`Context::register_pure_method(schema, name, func)` attach a host
+implementation to a `#native` method on a specific schema. The
+typed `(schema, method)` key replaces the v1 pattern of
+`register_fn("Schema.method", ...)`. Capability gating mirrors
+`register_fn`. The legacy `register_fn` / `register_pure_fn` paths
+remain for free-function dispatch; the stdlib migration onto
+`register_method` is deferred to a follow-up release.
+
+### Migration
+
+Existing hosts and source files keep working. New language surface
+is purely additive at the source level. Hosts wanting to attach a
+method to a specific schema should prefer `register_method` over
+the older `register_fn("Schema.method", ...)` convention.
+
 ## [Unreleased] — Capability model hardening: 6-bit gate + unified register_fn
 
 ### BREAKING: capability bits go from 1 to 6, registration API collapses to one entry point
