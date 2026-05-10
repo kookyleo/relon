@@ -1721,6 +1721,14 @@ impl Evaluator {
                     .call(NativeArgs::from_evaluated(args, self.caps()), range);
             }
         }
+        // Schema-rooted Phase B: dispatch `value.method(...)` and
+        // `Schema.method(...)` by consulting the analyzed tree's
+        // `schema_methods` table. The lookup is keyed by the schema
+        // name extracted from either the receiver value's brand /
+        // primitive tag, or the schema name itself for static calls.
+        if let Some(result) = self.try_call_schema_method(path, &args, scope, range)? {
+            return Ok(result);
+        }
         Err(RuntimeError::FunctionNotFound(
             path.iter()
                 .map(|k| k.to_string_key())
@@ -1728,6 +1736,119 @@ impl Evaluator {
                 .join("."),
             range,
         ))
+    }
+
+    /// Dispatch an `Expr::FnCall` whose path looks like
+    /// `[receiver, method]` against the analyzer's `schema_methods`
+    /// table. Returns:
+    ///
+    ///   * `Ok(Some(value))` — dispatched and evaluated successfully.
+    ///   * `Ok(None)` — not a recognizable method call (so the caller
+    ///     should fall through to its own error path).
+    ///   * `Err(_)` — the call dispatched but evaluating the body
+    ///     failed.
+    fn try_call_schema_method(
+        &self,
+        path: &[TokenKey],
+        args: &[EvaluatedArg],
+        scope: &Arc<Scope>,
+        range: TokenRange,
+    ) -> Result<Option<Value>, RuntimeError> {
+        if path.len() != 2 {
+            return Ok(None);
+        }
+        let TokenKey::String(head, _, _) = &path[0] else {
+            return Ok(None);
+        };
+        let TokenKey::String(method_name, _, _) = &path[1] else {
+            return Ok(None);
+        };
+        let Some(analyzed) = self.context.analyzed.as_ref() else {
+            return Ok(None);
+        };
+        // Static dispatch first: head names a schema directly.
+        if let Some(methods) = analyzed.schema_methods.get(head) {
+            if let Some(method) = methods.iter().find(|m| m.name == *method_name) {
+                if let Some(body) = method.body_node.as_ref() {
+                    return self
+                        .invoke_method_body(body, None, &method.params, args, scope, range)
+                        .map(Some);
+                }
+            }
+        }
+        // Receiver dispatch: head is a binding whose value carries a
+        // schema-rooted tag.
+        let first_name = head.clone();
+        let receiver_value = if let Some(val) = scope.get_local(&first_name) {
+            val
+        } else if let Some(thunk) = scope.get_thunk(&first_name) {
+            self.force_thunk(&thunk)?
+        } else {
+            return Ok(None);
+        };
+        let Some(schema_name) = value_schema_tag(&receiver_value) else {
+            return Ok(None);
+        };
+        let Some(methods) = analyzed.schema_methods.get(&schema_name) else {
+            return Ok(None);
+        };
+        let Some(method) = methods.iter().find(|m| m.name == *method_name) else {
+            return Ok(None);
+        };
+        let Some(body) = method.body_node.as_ref() else {
+            return Ok(None);
+        };
+        self.invoke_method_body(
+            body,
+            Some(receiver_value),
+            &method.params,
+            args,
+            scope,
+            range,
+        )
+        .map(Some)
+    }
+
+    /// Evaluate a method body with `self` bound (when a receiver is
+    /// supplied) plus the positional argument bindings — `self` is
+    /// implicit, so positional args map directly onto the declared
+    /// param list. Named args fall back to positional ordering for v1;
+    /// the analyzer side already validated arity, so a missing arg is
+    /// surfaced through the body's own VariableNotFound diagnostics.
+    fn invoke_method_body(
+        &self,
+        body: &Node,
+        receiver: Option<Value>,
+        params: &[relon_analyzer::schema::SchemaMethodParamInfo],
+        args: &[EvaluatedArg],
+        scope: &Arc<Scope>,
+        _range: TokenRange,
+    ) -> Result<Value, RuntimeError> {
+        let mut bindings: HashMap<String, Value> = HashMap::new();
+        if let Some(self_val) = receiver {
+            bindings.insert("self".to_string(), self_val);
+        }
+        // Positional binding: skip `self` (which is implicit), so the
+        // i-th positional arg lands on `params[i].name`.
+        let mut pos_idx = 0;
+        for arg in args {
+            if arg.name.is_some() {
+                continue;
+            }
+            if pos_idx < params.len() {
+                bindings.insert(params[pos_idx].name.clone(), arg.value.clone());
+                pos_idx += 1;
+            }
+        }
+        // Named args win over positions when both exist (mirrors
+        // `eval_closure`).
+        for arg in args {
+            if let Some(name) = &arg.name {
+                bindings.insert(name.clone(), arg.value.clone());
+            }
+        }
+        let method_scope = scope.with_locals(bindings);
+        self.eval(body, &method_scope)
     }
 
     fn check_native_fn_capability(
@@ -2136,6 +2257,29 @@ pub(crate) fn decorator_name(dec: &DecoratorNode) -> String {
 /// variable (the substitution arrives at the use site).
 fn is_type_variable(t: &relon_parser::TypeNode, generics: &[String]) -> bool {
     t.path.len() == 1 && t.generics.is_empty() && generics.iter().any(|g| g == &t.path[0])
+}
+
+/// Schema-rooted Phase B: extract the schema name a value should be
+/// dispatched against when used as a method-call receiver.
+///
+///   * `Value::Dict { brand: Some(name) }` — branded after schema
+///     validation, dispatch on the brand.
+///   * Primitive values — dispatch on the built-in tag (`String`,
+///     `Int`, …); aligns with `#extend String with { ... }`.
+///   * `Value::Closure` / `Value::Schema` / `Value::Type` — no
+///     receiver dispatch; `None` so callers know to skip.
+fn value_schema_tag(v: &Value) -> Option<String> {
+    match v {
+        Value::Dict(d) => d.brand.clone(),
+        Value::Bool(_) => Some("Bool".to_string()),
+        Value::Int(_) => Some("Int".to_string()),
+        Value::Float(_) => Some("Float".to_string()),
+        Value::String(_) => Some("String".to_string()),
+        Value::List(_) => Some("List".to_string()),
+        Value::Null => Some("Null".to_string()),
+        Value::Closure { .. } | Value::Schema { .. } | Value::EnumSchema { .. } => None,
+        Value::Type(_) | Value::Wildcard => None,
+    }
 }
 
 /// True when `node` carries the `#private` directive. See

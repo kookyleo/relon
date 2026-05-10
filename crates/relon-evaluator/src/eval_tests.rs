@@ -4052,3 +4052,93 @@ fn v17_bare_list_diagnoses_at_analyzer() {
         .collect();
     assert!(!bare.is_empty(), "{:?}", analyzed.diagnostics);
 }
+
+// ===================================================================
+// Phase B: schema-rooted method dispatch (`with { ... }` + `#extend`)
+// ===================================================================
+
+#[test]
+fn schema_method_dispatches_with_self_binding() {
+    use std::collections::{BTreeMap, HashMap};
+    let source = r#"#schema Money {
+    Int cents: *
+} with {
+    cents_value() -> Int: self.cents
+}
+#main(Money m)
+{ Int total: m.cents_value() }"#;
+    let node = parse_doc(source);
+    let analyzed = std::sync::Arc::new(relon_analyzer::analyze(&node));
+    let errors: Vec<_> = analyzed
+        .diagnostics
+        .iter()
+        .filter(|d| d.severity() == relon_analyzer::Severity::Error)
+        .collect();
+    assert!(errors.is_empty(), "analyzer errors: {:?}", errors);
+
+    let mut money = BTreeMap::new();
+    money.insert("cents".to_string(), Value::Int(199));
+    let mut args: HashMap<String, Value> = HashMap::new();
+    args.insert("m".to_string(), Value::dict(money));
+    let ctx = Context::new()
+        .with_root(node.clone())
+        .with_analyzed(std::sync::Arc::clone(&analyzed));
+    let result = Evaluator::new(std::sync::Arc::new(ctx))
+        .run_main(&std::sync::Arc::new(Scope::default()), args)
+        .unwrap();
+    let Value::Dict(d) = result else { panic!() };
+    assert_eq!(d.map.get("total"), Some(&Value::Int(199)));
+}
+
+#[test]
+fn extend_user_schema_adds_method() {
+    use std::collections::{BTreeMap, HashMap};
+    let source = r#"#schema User {
+    String name: *
+}
+#extend User with {
+    is_admin() -> Bool: self.name == "admin"
+}
+#main(User u)
+{ Bool admin: u.is_admin() }"#;
+    let node = parse_doc(source);
+    let analyzed = std::sync::Arc::new(relon_analyzer::analyze(&node));
+    let mut user = BTreeMap::new();
+    user.insert("name".to_string(), Value::String("admin".to_string()));
+    let mut args: HashMap<String, Value> = HashMap::new();
+    args.insert("u".to_string(), Value::dict(user));
+    let ctx = Context::new()
+        .with_root(node.clone())
+        .with_analyzed(std::sync::Arc::clone(&analyzed));
+    let result = Evaluator::new(std::sync::Arc::new(ctx))
+        .run_main(&std::sync::Arc::new(Scope::default()), args)
+        .unwrap();
+    let Value::Dict(d) = result else { panic!() };
+    assert_eq!(d.map.get("admin"), Some(&Value::Bool(true)));
+}
+
+#[test]
+fn schema_method_with_arg_dispatches() {
+    use std::collections::{BTreeMap, HashMap};
+    let source = r#"#schema Money {
+    Int cents: *
+} with {
+    times(factor: Int) -> Int: self.cents * factor
+}
+#main(Money m)
+{ Int total: m.times(3) }"#;
+    let node = parse_doc(source);
+    let analyzed = std::sync::Arc::new(relon_analyzer::analyze(&node));
+    let mut money = BTreeMap::new();
+    money.insert("cents".to_string(), Value::Int(50));
+    let mut args: HashMap<String, Value> = HashMap::new();
+    args.insert("m".to_string(), Value::dict(money));
+    let ctx = Context::new()
+        .with_root(node.clone())
+        .with_analyzed(std::sync::Arc::clone(&analyzed));
+    let result = Evaluator::new(std::sync::Arc::new(ctx))
+        .run_main(&std::sync::Arc::new(Scope::default()), args)
+        .unwrap();
+    let Value::Dict(d) = result else { panic!() };
+    assert_eq!(d.map.get("total"), Some(&Value::Int(150)));
+}

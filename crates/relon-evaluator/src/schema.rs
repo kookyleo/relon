@@ -196,11 +196,25 @@ impl Evaluator {
                 };
 
                 let ptr = value as *const Value;
-                if !visited.insert((type_name, ptr)) {
+                if !visited.insert((type_name.clone(), ptr)) {
                     return Ok(());
                 }
 
                 self.apply_schema(resolved_fields, value, scope, range, visited, depth + 1)?;
+                // Schema-rooted Phase B: auto-brand the dict with the
+                // schema name so subsequent `value.method(...)` calls
+                // can dispatch against the right method table. We only
+                // overwrite a missing brand — an explicit `#brand X`
+                // already set by the user wins, since it represents an
+                // intentional nominal-type pin.
+                if !type_hint.path.is_empty() {
+                    if let Value::Dict(ref mut d) = value {
+                        let dict = Arc::make_mut(d);
+                        if dict.brand.is_none() {
+                            dict.brand = Some(type_hint.path[0].clone());
+                        }
+                    }
+                }
                 Ok(())
             }
             Value::EnumSchema {
