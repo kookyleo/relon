@@ -332,15 +332,114 @@ operator lowering 等机制。
   schema 默认提供 `eq` / `lt` 等 witness 方法」（用 host
   `register_method` 注册）
 
-## 未决问题
+## 已决细节（5 条尾巴）
 
-以下不影响 Phase A.1 / B 启动，但实施时要决定：
+### 16：方法 visibility — `#private` = schema 内部可见
 
-- **visibility on extension methods**：`#extend X with { #private foo() ... }` 是否合法？私有作用域如何（仅文件、仅 schema 定义模块）？
-- **Tuple 的方法表表达**：`Tuple<T1, T2, ...>` arity 不定，方法（如 `.0` `.1` 位置访问）怎么落到统一方法表？或位置访问保留为语言原语，不走方法表？
-- **conflict detection 在 import 闭合时的具体算法**：跨 module `#extend` 合并的冲突应在哪一阶段触发（每个 module 独立分析后合并、还是 workspace 全局收口时检测）？
-- **decorator 链 `@a @b v` 的 lowering 形态**：`a(b(v))` 还是 `v.b().a()`？两者等价但 AST 形态影响 analyzer 推导
-- **constraint 与 `#extend` 的耦合**：用户 `#extend X with { #derive Equatable eq() ... }` 是否给 X 添加 Equatable derive？
+```relon
+#schema Money { Int cents: * } with {
+    format() -> String:
+        self.amount_string() + " " + self.currency_code()    // ✅ 同 schema 其它方法可调
+
+    #private
+    amount_string() -> String: f"${self.cents / 100}"        // 内部 helper
+
+    #private
+    currency_code() -> String: "USD"
+}
+
+#main(Money m) -> String:
+    m.format()              // ✅ 公开方法
+    m.amount_string()       // ✗ MethodNotFound: amount_string is private
+```
+
+`#private` 是方法上的标记 directive（method-level pragma，跟 `#derive`
+/ `#native` 同位置）。可见性按 **schema 身份**判定，不论文件 / module
+位置：所有 `format/amount_string/currency_code` 都属于 `Money` schema 的
+方法表，分两层 —— 公开层（脚本可见）与私有层（仅其它同 schema 方法体
+内可见）。
+
+### 17：Tuple 位置访问保留为语言原语
+
+`xs.0` / `xs.1` 这种位置访问由 parser/analyzer 作 `TupleIndex` AST 节点
+处理，**不走方法表 dispatch**。Tuple<T1, T2, ...> 仍是 schema（占位
+角色），允许未来挂少量普通方法（如 `.len()` 返回 arity，`.swap()`
+等），位置访问与方法访问语义独立。
+
+```relon
+#main((Int, String) pair) -> String:
+    pair.0          // ✅ TupleIndex(0) AST，编译期 arity 检查
+    pair.1          // ✅
+    pair.len()      // ✅ Tuple schema 上的方法
+    pair.0()        // ✗ TupleIndex 不可调用
+```
+
+### 18：`#extend` + `#derive` 的耦合
+
+只能在 `#extend` 里 `#derive` 那些**原始 `#schema` 声明里未 derive
+过**的 constraint。
+
+```relon
+// fileA.relon
+#schema MyData { Int v: * }              // 没写 #derive
+
+// fileB.relon
+#import "fileA"
+#extend MyData with {
+    #derive Equatable
+    eq(other: Self) -> Bool: self.v == other.v
+}                                        // ✅ MyData 之前没 derive Equatable
+
+// fileC.relon
+#import "fileB"
+#extend MyData with {
+    #derive Equatable                    // ✗ 已经 derive 过（在 fileB），冲突
+    eq(other: Self) -> Bool: ...
+}
+```
+
+实务等价：每个 constraint 在一个 schema 上**最多 derive 一次**，无论
+原始声明位还是 `#extend` 位。冲突由 analyzer 在 import 闭合时跨 module
+检测。
+
+### 19：conflict detection 时机 — 每文件 import 闭包视角
+
+冲突判定**不是 workspace 全局**，而是**每个文件视角**：
+
+```text
+对每个模块 M：
+  collapse_extend_table = ∅
+  for each module N in M's import closure:
+    for each #extend declaration in N:
+      merge into collapse_extend_table
+      if same (schema, method) name with different signature → MethodNameConflict at M
+      if same (schema, constraint) #derive twice → DeriveConflict at M
+  M 的方法解析使用这张合并后的表
+```
+
+含义：
+
+- 两个独立 lib L1 / L2 各自 `#extend String with { sanitize() ... }` 实现不同 → 各自合法
+- 文件 F 同时 `#import L1` + `#import L2` → F 的视角看到冲突，analyzer 在 F 这个模块的 pass 里报错
+- 文件 G 只 `#import L1` → G 没事
+
+### 20：decorator 链 lowering — 链式方法调用
+
+`@a @b @c v` 等价 `a(b(c(v)))`，schema-rooted 形态：
+
+```text
+@c v       →  v.c()                         // 按 v 的类型查 c 方法
+@b (...)   →  v.c().b()                     // 按 v.c() 返回类型查 b 方法
+@a (...)   →  v.c().b().a()                 // 按 v.c().b() 返回类型查 a 方法
+```
+
+每一步独立做类型推导 + 方法表查找。a / b / c **可以在不同的
+schema 上** —— 譬如 `@uppercase @parse_int "42"` 流是
+`String → Int → Int`，第一步在 String 上找 `parse_int`，第二步在 Int
+上找 `uppercase`（如果 Int 没有 uppercase 就在第二步报
+`MethodNotFound on Int`）。
+
+
 
 ## 一句话定性
 
