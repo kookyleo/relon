@@ -66,28 +66,67 @@ ctx.prepend_module_resolver(Arc::new(FilesystemModuleResolver::trusted()));
 这三行 = 旧的 `Context::trusted()`。区别是 code review 看一眼就知道
 「FS 全开 + 所有门控函数全放 + 无步数预算」——哪行不想要就删哪行。
 
-## `Capabilities` 五个字段
+## `Capabilities` 字段
 
 完整结构（`crates/relon-evaluator/src/eval.rs::Capabilities`）：
 
 ```rust
+#[non_exhaustive]
 pub struct Capabilities {
     pub allow_all_native_fn: bool,
     pub allow_native_fn: HashSet<String>,
     pub reads_fs: bool,
+    pub writes_fs: bool,
+    pub network: bool,
+    pub reads_clock: bool,
+    pub reads_env: bool,
+    pub uses_rng: bool,
     pub max_steps: Option<u64>,
     pub max_value_elements: Option<usize>,
 }
 ```
 
+`#[non_exhaustive]` 意味着以后加新的 capability bit 不算 breaking
+change——宿主侧别用穷举式 struct literal 构造，统一通过
+`Capabilities::default()` / `Capabilities::all_granted()` 拿到一个
+基线再赋值，或者在 struct 字面量里用 `..Capabilities::default()` 收
+尾。`NativeFnGate` 同理。
+
 逐个解释：
 
-### `reads_fs: bool`
+### 六个能力 bit：`reads_fs` / `writes_fs` / `network` / `reads_clock` / `reads_env` / `uses_rng`
 
-宏观开关：脚本是否允许通过 `#import lib from "./local.relon"`、
-`#import lib from "/abs/path/x.relon"` 触发文件读。**只是开关，不
-是路径限制**——具体允许哪些路径由 `FilesystemModuleResolver` 的
-root 决定（见下文）。
+每一个 bit 都是「宿主是否授予这一类副作用」的总开关。`false`（默
+认）表示禁止，`true` 表示放行。它们的语义对照：
+
+| bit | 语义 | 典型副作用源 |
+| --- | --- | --- |
+| `reads_fs` | 文件读 | `#import "./local.relon"`、宿主注册的 `fs.read`、`std::fs::read*` |
+| `writes_fs` | 文件写 | 宿主注册的 `fs.write`、`std::fs::write*` / `OpenOptions::write` / `create_dir*` / `remove_*` |
+| `network` | 网络 | 宿主注册的 `http.get`、socket、HTTP client、DNS |
+| `reads_clock` | 时钟读 | `SystemTime::now`、`Instant::now` 之类的非确定时间源 |
+| `reads_env` | 进程环境读 | `std::env::var`、`std::env::args` |
+| `uses_rng` | 非确定随机源 | 宿主注册的 `rand.*`、任何调用 `OsRng` / `thread_rng` 的函数 |
+
+每一个 bit 同时出现在两个地方：
+
+- **`Capabilities`**（宿主授予）：`ctx.capabilities.network = true` 表
+  示「这个 context 允许做网络」；
+- **`NativeFnGate`**（函数声明）：注册原生函数时声明「我需要 network
+  这一位才能跑」。
+
+求值时每次原生函数调用都走同一条 gate 检查：函数声明的所有 bit 都
+必须在 `Capabilities` 里被授予。任何一个缺失就抛
+`RuntimeError::CapabilityDenied`，错误 `reason` 是
+``"function declared `<bit>` but caller did not grant it"``——`<bit>`
+是缺失的第一个能力名。analyzer 静态可达性检查会更激进，对每一个
+缺失的 bit 各发一条 `Diagnostic::CapabilityRequired`（一个需要
+`reads_fs + network` 但两个都没授的函数会产生两条诊断）。
+
+`reads_fs` 还有一层执行机制在 `FilesystemModuleResolver`（见下
+文）——bit 是策略开关，resolver 是实际执行点。其它 bit 都没有内置
+的 resolver 类比物：是不是「真的」会读时钟 / 发网络包，由宿主写
+的原生函数自己决定，capability 层只负责对照声明放行或拒绝。
 
 `std/...` 虚拟模块**不**消耗 `reads_fs`——它们走 `StdModuleResolver`
 而非文件系统，是规范的一部分。
@@ -125,31 +164,35 @@ ctx.capabilities.max_value_elements = Some(3);
 
 ### `allow_native_fn: HashSet<String>`
 
-通过 `register_fn_with_caps` 注册的「门控」函数，沙箱模式下**只有
-名字在这个集合里**才能调。详见
-[嵌入宿主：受 capability 门控的注册](./host-integration.md#受-capability-门控的注册)。
+按名字加白的捷径：写在这里的原生函数名，不管声明的 `NativeFnGate`
+要哪些 bit，沙箱下都能调。用于「我就是想放某一个函数过」的精确开
+口。详见
+[嵌入宿主：注册原生函数](./host-integration.md#注册一个原生函数)。
 
 ```rust
-ctx.register_fn_with_caps(
-    "fs.read",
-    NativeFnGate { reads_fs: true },
-    Arc::new(MyReader),
-);
+let mut gate = NativeFnGate::default();
+gate.reads_fs = true;
+ctx.register_fn("fs.read", gate, Arc::new(MyReader));
 ctx.capabilities.allow_native_fn.insert("fs.read".to_string());
-// 沙箱下 `.relon` 里调 fs.read() 会过；没加白名单则 CapabilityDenied
+// 沙箱下 `.relon` 里调 fs.read() 会过；没加白名单也没授 reads_fs 则
+// CapabilityDenied
 ```
 
-`register_fn`（不带 `_with_caps`）注册的函数**不**走这条路——它们
-被视作完全可信，在 sandbox 下也直接放行。stdlib（`len`、`range`、
-`type`、`ensure.*`、std 模块的 `_*` intrinsics）也是用
-`register_fn` 注册的：spec §4.3 把它们划入「规范内容」、不属于宿
-主信任决策。
+如果按 bit 授权更自然（「这个 context 整体允许 reads_fs」），直接
+设 `ctx.capabilities.reads_fs = true` 就行；`allow_native_fn` 主要
+适合「只放某个具体名字、其他相同 bit 的函数仍然拒绝」的场景。
+
+注：通过 `register_pure_fn` 注册的纯函数（`len`、`range`、`string.*`、
+`math.*` 等 stdlib intrinsics 都走这条路）声明的是空 gate
+（`NativeFnGate::default()`），任何 `Capabilities` 都能平凡满足，所
+以不需要进 `allow_native_fn` 也能跑。spec §4.3 把它们划入「规范内
+容」、不属于宿主信任决策。
 
 ### `allow_all_native_fn: bool`
 
-总开关：`true` 时所有 `register_fn_with_caps` 注册的函数全放，等于
-忽略 `allow_native_fn`。`Capabilities::all_granted()` 帮你把这个
-flag 也设成 `true`。
+总开关：`true` 时所有原生函数全放，绕过 per-bit gate 检查与
+`allow_native_fn` 名单。`Capabilities::all_granted()` 帮你把这个
+flag 和六个 bit 一起设成 `true`。
 
 ## `FilesystemModuleResolver` 的行为
 
@@ -214,15 +257,13 @@ fn run_user_rule(
     ctx.capabilities.max_steps = Some(100_000);
     ctx.capabilities.max_value_elements = Some(10_000);
 
-    // 暴露一个门控的、只读的函数
-    ctx.register_fn_with_caps(
+    // 暴露一个只读、无副作用的函数（纯函数走 register_pure_fn，
+    // 声明的是空 gate，沙箱默认 Capabilities 就能调，无需进
+    // allow_native_fn 白名单）
+    ctx.register_pure_fn(
         "user.current_id",
-        NativeFnGate::default(),
         Arc::new(CurrentUserId(current_user.to_string())),
     );
-    ctx.capabilities
-        .allow_native_fn
-        .insert("user.current_id".to_string());
 
     // 求值
     let node = parse_document(rule_src)
@@ -241,7 +282,8 @@ fn run_user_rule(
 - ✅ 能用 `std/list` / `std/string` / `std/dict` 这些纯计算模块
 - ✅ 能调 `user.current_id()` 拿当前用户 ID
 - ❌ 不能 `#import` 文件
-- ❌ 不能调 `currency.format` 这种宿主**没**加进白名单的函数
+- ❌ 不能调任何声明了 capability bit（`reads_fs` / `network` / …）
+  而宿主又没授予对应 bit 的原生函数 → `CapabilityDenied`
 - ❌ 跑超 10 万步 → `StepLimitExceeded`
 - ❌ 构造超 10000 元素的 list/dict → `ValueTooLarge`
 
@@ -251,7 +293,7 @@ fn run_user_rule(
 
 | 错误 | 触发条件 |
 | --- | --- |
-| `CapabilityDenied { name, reason, range }` | `#import` 走到 default-reject 的 resolver；或 `#import` 路径逃出 root；或调一个未在 `allow_native_fn` 里的门控函数 |
+| `CapabilityDenied { name, reason, range }` | `#import` 走到 default-reject 的 resolver；或 `#import` 路径逃出 root；或调一个声明了未授予 bit 的原生函数（`reason` 形如 ``function declared `<bit>` but caller did not grant it``） |
 | `StepLimitExceeded { limit, range }` | `eval_internal` 调用次数超过 `max_steps` |
 | `ValueTooLarge { limit, actual, range }` | 单个 list/dict 元素数超过 `max_value_elements` |
 
@@ -273,8 +315,9 @@ fn run_user_rule(
   需求请把 Relon 跑在子进程 / wasm 沙箱里。
 - ❌ **网络 / IPC 隔离**：Relon 自身没有网络原语，所以默认天然没有
   网络。但是！如果你**注册了**一个会发网络请求的原生函数，这是宿主
-  层的事，Relon capability 层管不到——记得用 `register_fn_with_caps`
-  标记相关 `NativeFnGate`，并把名字默认放在白名单外。
+  层的事——记得用 `register_fn` 时把 `NativeFnGate` 的 `network` 位
+  打上，并默认不授予 `Capabilities::network`，让 capability 层替你
+  把这个能力门关上。
 
 ## 接下来
 

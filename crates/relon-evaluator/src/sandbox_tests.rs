@@ -1,5 +1,5 @@
 //! Capability / sandbox layer (Capabilities + FilesystemModuleResolver
-//! root + step counter + value-size watermark + register_fn_with_caps).
+//! root + step counter + value-size watermark + gated `register_fn`).
 //!
 //! Each test pins one knob; together they pin down the spec from
 //! `tmp/critical-analysis-round2.md`.
@@ -217,10 +217,11 @@ fn max_value_elements_rejects_oversized_dict() {
 }
 
 #[test]
-fn legacy_register_fn_callable_under_sandbox() {
-    // `register_fn` (no caps) is treated as fully trusted — a
-    // sandboxed Context with an empty `allow_native_fn` set must
-    // still let it through.
+fn pure_fn_callable_under_sandbox() {
+    // `register_pure_fn` declares an empty `NativeFnGate`. Under a
+    // fully sandboxed Context with an empty `allow_native_fn` set the
+    // call still goes through — the all-zero gate is trivially
+    // satisfied by any `Capabilities`.
     struct Echo;
     impl crate::native_fn::RelonFunction for Echo {
         fn call(
@@ -233,7 +234,7 @@ fn legacy_register_fn_callable_under_sandbox() {
     }
 
     let mut ctx = Context::sandboxed();
-    ctx.register_fn("echo", Arc::new(Echo));
+    ctx.register_pure_fn("echo", Arc::new(Echo));
     let result = eval_with(ctx, r#"{ "x": echo(7) }"#).unwrap();
     let Value::Dict(d) = result else {
         panic!("expected dict")
@@ -242,7 +243,7 @@ fn legacy_register_fn_callable_under_sandbox() {
 }
 
 #[test]
-fn register_fn_with_caps_rejected_in_sandbox_without_allowlist() {
+fn gated_fn_rejected_in_sandbox_without_allowlist() {
     struct ReadFs;
     impl crate::native_fn::RelonFunction for ReadFs {
         fn call(
@@ -255,7 +256,14 @@ fn register_fn_with_caps_rejected_in_sandbox_without_allowlist() {
     }
 
     let mut ctx = Context::sandboxed();
-    ctx.register_fn_with_caps("fs.read", NativeFnGate { reads_fs: true }, Arc::new(ReadFs));
+    ctx.register_fn(
+        "fs.read",
+        NativeFnGate {
+            reads_fs: true,
+            ..NativeFnGate::default()
+        },
+        Arc::new(ReadFs),
+    );
     let result = eval_with(ctx, r#"{ "data": fs.read() }"#);
     assert!(
         matches!(&result, Err(RuntimeError::CapabilityDenied { name, .. }) if name == "fs.read"),
@@ -264,7 +272,7 @@ fn register_fn_with_caps_rejected_in_sandbox_without_allowlist() {
 }
 
 #[test]
-fn register_fn_with_caps_permitted_when_in_allowlist() {
+fn gated_fn_permitted_when_in_allowlist() {
     struct ReadFs;
     impl crate::native_fn::RelonFunction for ReadFs {
         fn call(
@@ -280,7 +288,14 @@ fn register_fn_with_caps_permitted_when_in_allowlist() {
     ctx.capabilities
         .allow_native_fn
         .insert("fs.read".to_string());
-    ctx.register_fn_with_caps("fs.read", NativeFnGate { reads_fs: true }, Arc::new(ReadFs));
+    ctx.register_fn(
+        "fs.read",
+        NativeFnGate {
+            reads_fs: true,
+            ..NativeFnGate::default()
+        },
+        Arc::new(ReadFs),
+    );
     let result = eval_with(ctx, r#"{ "data": fs.read() }"#).unwrap();
     let Value::Dict(d) = result else {
         panic!("expected dict")
@@ -294,8 +309,8 @@ fn register_fn_with_caps_permitted_when_in_allowlist() {
 #[test]
 fn fully_granted_caps_let_gated_fns_through() {
     // `Capabilities::all_granted()` flips `allow_all_native_fn`,
-    // so even `register_fn_with_caps`-registered fns go through
-    // without an explicit allowlist entry.
+    // so even fns with non-empty `NativeFnGate` go through without
+    // an explicit allowlist entry.
     struct ReadFs;
     impl crate::native_fn::RelonFunction for ReadFs {
         fn call(
@@ -309,7 +324,14 @@ fn fully_granted_caps_let_gated_fns_through() {
 
     let mut ctx = Context::sandboxed();
     ctx.capabilities = Capabilities::all_granted();
-    ctx.register_fn_with_caps("fs.read", NativeFnGate { reads_fs: true }, Arc::new(ReadFs));
+    ctx.register_fn(
+        "fs.read",
+        NativeFnGate {
+            reads_fs: true,
+            ..NativeFnGate::default()
+        },
+        Arc::new(ReadFs),
+    );
     let result = eval_with(ctx, r#"{ "n": fs.read() }"#).unwrap();
     let Value::Dict(d) = result else {
         panic!("expected dict")

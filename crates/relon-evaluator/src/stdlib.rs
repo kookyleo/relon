@@ -9,10 +9,10 @@ pub fn register_to(ctx: &mut Context) {
     // See `docs/zh/guide/spec.md` §6.1: these are metadata operations
     // on data structures themselves, not std-module members.
     let len: Arc<dyn RelonFunction> = Arc::new(Len);
-    ctx.register_fn("len", Arc::clone(&len));
-    ctx.register_fn("_len", len);
-    ctx.register_fn("range", Arc::new(Range));
-    ctx.register_fn("type", Arc::new(Type));
+    ctx.register_pure_fn("len", Arc::clone(&len));
+    ctx.register_pure_fn("_len", len);
+    ctx.register_pure_fn("range", Arc::new(Range));
+    ctx.register_pure_fn("type", Arc::new(Type));
 
     // Underscore intrinsics — the only Rust-side names in the
     // `std/<module>` namespace. `crates/relon-evaluator/src/std_relon/*.relon`
@@ -20,43 +20,43 @@ pub fn register_to(ctx: &mut Context) {
     // via `@import("std/<module>", as=...)`. There is no top-level
     // `string.split` / `dict.merge` / ... — that would be a
     // runtime-private global, which the spec forbids (§1.1, §6).
-    ctx.register_fn("_list_map", Arc::new(ListMap));
-    ctx.register_fn("_list_filter", Arc::new(ListFilter));
-    ctx.register_fn("_list_reduce", Arc::new(ListReduce));
-    ctx.register_fn("_list_contains", Arc::new(ListContains));
+    ctx.register_pure_fn("_list_map", Arc::new(ListMap));
+    ctx.register_pure_fn("_list_filter", Arc::new(ListFilter));
+    ctx.register_pure_fn("_list_reduce", Arc::new(ListReduce));
+    ctx.register_pure_fn("_list_contains", Arc::new(ListContains));
 
-    ctx.register_fn("_string_split", Arc::new(StringSplit));
-    ctx.register_fn("_string_join", Arc::new(StringJoin));
-    ctx.register_fn("_string_replace", Arc::new(StringReplace));
-    ctx.register_fn("_string_upper", Arc::new(StringUpper));
-    ctx.register_fn("_string_lower", Arc::new(StringLower));
-    ctx.register_fn("_string_contains", Arc::new(StringContains));
+    ctx.register_pure_fn("_string_split", Arc::new(StringSplit));
+    ctx.register_pure_fn("_string_join", Arc::new(StringJoin));
+    ctx.register_pure_fn("_string_replace", Arc::new(StringReplace));
+    ctx.register_pure_fn("_string_upper", Arc::new(StringUpper));
+    ctx.register_pure_fn("_string_lower", Arc::new(StringLower));
+    ctx.register_pure_fn("_string_contains", Arc::new(StringContains));
 
-    ctx.register_fn("_dict_merge", Arc::new(DictMerge));
-    ctx.register_fn("_dict_keys", Arc::new(DictKeys));
-    ctx.register_fn("_dict_values", Arc::new(DictValues));
-    ctx.register_fn("_dict_has_key", Arc::new(DictHasKey));
+    ctx.register_pure_fn("_dict_merge", Arc::new(DictMerge));
+    ctx.register_pure_fn("_dict_keys", Arc::new(DictKeys));
+    ctx.register_pure_fn("_dict_values", Arc::new(DictValues));
+    ctx.register_pure_fn("_dict_has_key", Arc::new(DictHasKey));
 
-    ctx.register_fn("_math_abs", Arc::new(MathAbs));
-    ctx.register_fn("_math_max", Arc::new(MathMax));
-    ctx.register_fn("_math_min", Arc::new(MathMin));
-    ctx.register_fn("_math_clamp", Arc::new(MathClamp));
+    ctx.register_pure_fn("_math_abs", Arc::new(MathAbs));
+    ctx.register_pure_fn("_math_max", Arc::new(MathMax));
+    ctx.register_pure_fn("_math_min", Arc::new(MathMin));
+    ctx.register_pure_fn("_math_clamp", Arc::new(MathClamp));
 
     // Schema-machinery validators. Spec §6.3 mandates these exist with
     // the documented semantics; they're consumed by the `#schema`
     // decorator, not by user-facing scripts directly.
-    ctx.register_fn("ensure.int", Arc::new(ValidatorInt));
-    ctx.register_fn("ensure.string", Arc::new(ValidatorString));
-    ctx.register_fn("ensure.bool", Arc::new(ValidatorBool));
-    ctx.register_fn("ensure.float", Arc::new(ValidatorFloat));
-    ctx.register_fn("ensure.list", Arc::new(ValidatorList));
-    ctx.register_fn("ensure.dict", Arc::new(ValidatorDict));
-    ctx.register_fn("ensure.at_least", Arc::new(ValidatorMin));
-    ctx.register_fn("ensure.at_most", Arc::new(ValidatorMax));
-    ctx.register_fn("ensure.one_of", Arc::new(ValidatorOneOf));
-    ctx.register_fn("ensure.required_fields", Arc::new(RequiredFields));
-    ctx.register_fn("ensure.requires", Arc::new(Requires));
-    ctx.register_fn("ensure.fields_equal", Arc::new(FieldEq));
+    ctx.register_pure_fn("ensure.int", Arc::new(ValidatorInt));
+    ctx.register_pure_fn("ensure.string", Arc::new(ValidatorString));
+    ctx.register_pure_fn("ensure.bool", Arc::new(ValidatorBool));
+    ctx.register_pure_fn("ensure.float", Arc::new(ValidatorFloat));
+    ctx.register_pure_fn("ensure.list", Arc::new(ValidatorList));
+    ctx.register_pure_fn("ensure.dict", Arc::new(ValidatorDict));
+    ctx.register_pure_fn("ensure.at_least", Arc::new(ValidatorMin));
+    ctx.register_pure_fn("ensure.at_most", Arc::new(ValidatorMax));
+    ctx.register_pure_fn("ensure.one_of", Arc::new(ValidatorOneOf));
+    ctx.register_pure_fn("ensure.required_fields", Arc::new(RequiredFields));
+    ctx.register_pure_fn("ensure.requires", Arc::new(Requires));
+    ctx.register_pure_fn("ensure.fields_equal", Arc::new(FieldEq));
 }
 
 struct ListMap;
@@ -831,5 +831,47 @@ fn validation_failure(
         ))
     } else {
         Err(default)
+    }
+}
+
+#[cfg(test)]
+mod purity_guard {
+    /// stdlib intrinsics must remain structurally pure: no I/O, no
+    /// clocks, no RNG, no env. The 6-bit capability model gates host
+    /// fns; this test guards that nobody quietly adds `use std::fs;`
+    /// (etc.) to `stdlib.rs` and bypasses the gate.
+    ///
+    /// If a real ambient capability is needed (e.g. `std/time`),
+    /// expose it as a host-facing module via `register_fn(name, gate, fn)`
+    /// with the matching `NativeFnGate` bit set, *not* as an ungated
+    /// stdlib intrinsic.
+    #[test]
+    fn stdlib_rs_uses_no_ambient_apis() {
+        let source = include_str!("stdlib.rs");
+        // Trim this test's own banned-list literals and the leading
+        // doc comment so the scan doesn't flag itself.
+        let source = match source.find("#[cfg(test)]\nmod purity_guard") {
+            Some(idx) => &source[..idx],
+            None => source,
+        };
+        let banned = [
+            "std::fs",
+            "std::env",
+            "std::net",
+            "std::process",
+            "SystemTime",
+            "Instant::now",
+            "rand::",
+            "chrono::",
+            "tokio::fs",
+            "tokio::net",
+            "reqwest",
+        ];
+        for needle in banned {
+            assert!(
+                !source.contains(needle),
+                "stdlib.rs must not reference `{needle}` — ambient state must be a gated host fn (use `register_fn` with a `NativeFnGate` bit), not an ungated stdlib intrinsic.",
+            );
+        }
     }
 }

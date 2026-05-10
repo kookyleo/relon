@@ -3488,7 +3488,7 @@ fn dynamic_path_segment_is_evaluated_only_once() {
         }"#,
     );
     let mut ctx = Context::new().with_root(node);
-    ctx.register_fn("counting_key", Arc::new(CountingKey));
+    ctx.register_pure_fn("counting_key", Arc::new(CountingKey));
     let result = Evaluator::new(Arc::new(ctx))
         .eval_root(&Arc::new(Scope::default()))
         .unwrap();

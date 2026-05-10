@@ -39,8 +39,9 @@ cargo run -q -p relon-fmt -- --check fixtures/*.relon fixtures/modules/*.relon f
 ## 🛠 Features
 
 - **Sandboxed by default**: a script declares the capabilities it needs
-  (`reads_fs`, `network`, allow-listed native fns); the host grants
-  them. There is no "trusted mode" the script can fall back to.
+  (`reads_fs` / `writes_fs` / `network` / `reads_clock` / `reads_env` /
+  `uses_rng`, plus allow-listed native fns); the host grants them.
+  There is no "trusted mode" the script can fall back to.
 - **Self-describing schemas**: `@schema`, sum-type tagged enums,
   recursive contracts, branded values — type information travels with
   the payload.

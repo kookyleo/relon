@@ -213,7 +213,9 @@ A freshly constructed `Context` has **no capabilities**. Scripts:
 * Cannot read the filesystem
   (`#import x from "./local.relon"` → `CapabilityDenied`).
 * Cannot call any native function registered via
-  `register_fn_with_caps`.
+  `register_fn(name, gate, fn)` whose `NativeFnGate` declares any
+  capability bit (pure fns registered via `register_pure_fn(name, fn)`
+  carry an empty gate and pass under the sandbox).
 * Have no step / value-size budget (`None` means "unenforced", but
   hosts SHOULD set both based on trust level).
 
@@ -747,7 +749,7 @@ are now mandatory.
 
 ## 7. Boundary of host-registered extensions
 
-The host can inject via `register_fn` / `register_fn_with_caps` /
+The host can inject via `register_fn` / `register_pure_fn` /
 `register_decorator`:
 
 * Native functions (data in, data out).
@@ -765,8 +767,10 @@ Best practice:
   the language and std, so behavior is fully determined by spec +
   source.
 * Register native functions only when "needs host capability"
-  applies (FS, DB, HTTP), and tag them via `register_fn_with_caps`
-  with the appropriate `NativeFnGate`.
+  applies (FS, DB, HTTP). Use `register_fn(name, gate, fn)` and
+  declare the required bits on the `NativeFnGate`; pure fns go through
+  `register_pure_fn(name, fn)` (empty gate, trivially satisfied under
+  the sandbox).
 
 ## 8. Versioning
 

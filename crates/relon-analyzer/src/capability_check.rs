@@ -57,7 +57,7 @@ pub(crate) fn run(workspace: &mut WorkspaceTree) {
     let gates = entry_tree.host_fn_gates.clone();
 
     // No gates → nothing to enforce. Skip the walk entirely so hosts
-    // that don't use `register_fn_with_caps` pay zero overhead.
+    // that only register pure fns (empty gate map) pay zero overhead.
     if gates.is_empty() {
         return;
     }
@@ -136,10 +136,13 @@ fn check_node(
     if caps.allow_all_native_fn || caps.allow_native_fn.contains(&name) {
         return;
     }
-    if gate.reads_fs && !caps.reads_fs {
+    // Emit one diagnostic per missing bit. Analyzer is a batch reporter,
+    // so a fn declaring `reads_fs + network` with neither granted shows
+    // up as two diagnostics — runtime would stop at the first.
+    for bit in gate.missing_bits(caps) {
         out.push(Diagnostic::CapabilityRequired {
-            fn_name: name,
-            capability: "reads_fs".to_string(),
+            fn_name: name.clone(),
+            capability: bit.to_string(),
             range: SourceSpan::from(node.range),
         });
     }
@@ -223,10 +226,21 @@ mod tests {
     }
 
     fn options_with_read_file_gate(caps: Capabilities) -> AnalyzeOptions {
+        options_with_gate(
+            "read_file",
+            NativeFnGate {
+                reads_fs: true,
+                ..NativeFnGate::default()
+            },
+            caps,
+        )
+    }
+
+    fn options_with_gate(name: &str, gate: NativeFnGate, caps: Capabilities) -> AnalyzeOptions {
         let mut gates: HashMap<String, NativeFnGate> = HashMap::new();
-        gates.insert("read_file".to_string(), NativeFnGate { reads_fs: true });
+        gates.insert(name.to_string(), gate);
         let mut names = HashSet::new();
-        names.insert("read_file".to_string());
+        names.insert(name.to_string());
         AnalyzeOptions {
             host_fn_names: names,
             host_fn_signatures: HashMap::new(),
@@ -563,5 +577,114 @@ mod tests {
             &opts,
         );
         assert!(cap_diags(&ws).is_empty());
+    }
+
+    // -------------------------------------------------------------------
+    // 11. Each new capability bit is flagged independently — same
+    //     diagnostic shape as the original `reads_fs` test, just with a
+    //     different `capability` string. Drives the table-driven check
+    //     in `capability_check::check_node`.
+    #[test]
+    fn each_new_capability_bit_flagged_independently() {
+        let cases: Vec<(&str, NativeFnGate)> = vec![
+            (
+                "writes_fs",
+                NativeFnGate {
+                    writes_fs: true,
+                    ..NativeFnGate::default()
+                },
+            ),
+            (
+                "network",
+                NativeFnGate {
+                    network: true,
+                    ..NativeFnGate::default()
+                },
+            ),
+            (
+                "reads_clock",
+                NativeFnGate {
+                    reads_clock: true,
+                    ..NativeFnGate::default()
+                },
+            ),
+            (
+                "reads_env",
+                NativeFnGate {
+                    reads_env: true,
+                    ..NativeFnGate::default()
+                },
+            ),
+            (
+                "uses_rng",
+                NativeFnGate {
+                    uses_rng: true,
+                    ..NativeFnGate::default()
+                },
+            ),
+        ];
+        for (bit, gate) in cases {
+            let opts = options_with_gate("f", gate, Capabilities::default());
+            let mut loader = MapLoader::new();
+            let ws = build_with_options("/abs/entry", r#"{ x: f() }"#, &mut loader, &opts);
+            let diags = cap_diags(&ws);
+            assert_eq!(diags.len(), 1, "bit `{bit}`: {diags:#?}");
+            let Diagnostic::CapabilityRequired { capability, .. } = diags[0] else {
+                panic!(
+                    "bit `{bit}`: expected CapabilityRequired, got {:?}",
+                    diags[0]
+                );
+            };
+            assert_eq!(capability, bit, "diagnostic bit name");
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // 12. A fn declaring multiple bits with none granted produces one
+    //     diagnostic per missing bit. Order is the field-declaration
+    //     order in `NativeFnGate`.
+    #[test]
+    fn multiple_missing_bits_emit_multiple_diagnostics() {
+        let gate = NativeFnGate {
+            reads_fs: true,
+            network: true,
+            ..NativeFnGate::default()
+        };
+        let opts = options_with_gate("fetch", gate, Capabilities::default());
+        let mut loader = MapLoader::new();
+        let ws = build_with_options("/abs/entry", r#"{ x: fetch() }"#, &mut loader, &opts);
+        let diags = cap_diags(&ws);
+        assert_eq!(diags.len(), 2, "{diags:#?}");
+        let names: Vec<&str> = diags
+            .iter()
+            .filter_map(|d| match d {
+                Diagnostic::CapabilityRequired { capability, .. } => Some(capability.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(names, vec!["reads_fs", "network"]);
+    }
+
+    // -------------------------------------------------------------------
+    // 13. Granting every bit (without `allow_all_native_fn`) silences
+    //     every diagnostic. Exercises the per-bit grant path, not the
+    //     global short-circuit.
+    #[test]
+    fn explicit_per_bit_grants_silence_check() {
+        let mut caps = Capabilities::all_granted();
+        caps.allow_all_native_fn = false; // force the per-bit path
+        let gate = NativeFnGate {
+            reads_fs: true,
+            writes_fs: true,
+            network: true,
+            reads_clock: true,
+            reads_env: true,
+            uses_rng: true,
+        };
+        let opts = options_with_gate("everything", gate, caps);
+        let mut loader = MapLoader::new();
+        let ws = build_with_options("/abs/entry", r#"{ x: everything() }"#, &mut loader, &opts);
+        let diags = cap_diags(&ws);
+        assert!(diags.is_empty(), "{diags:#?}");
     }
 }

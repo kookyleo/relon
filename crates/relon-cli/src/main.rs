@@ -37,10 +37,11 @@ enum Commands {
         /// access. By default the runtime runs sandboxed: only
         /// `std/*` imports resolve, local `#import "./foo.relon"`
         /// paths surface as `ModuleNotFound`, and native fns
-        /// registered via `register_fn_with_caps` are denied. Pass
-        /// `--trust` when the script expects the legacy fully-granted
-        /// environment (e.g. local imports, registered HTTP / FS
-        /// helpers).
+        /// registered with a non-empty `NativeFnGate` are denied
+        /// (pure fns registered via `register_pure_fn` keep working).
+        /// Pass `--trust` when the script expects the legacy
+        /// fully-granted environment (e.g. local imports, registered
+        /// HTTP / FS helpers).
         #[arg(long)]
         trust: bool,
     },

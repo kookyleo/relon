@@ -660,8 +660,7 @@ mod tests {
             "examples/validation.relon",
         ] {
             let path = root.join(rel_path);
-            let error =
-                value_from_file_trusted(&path).expect_err("expected fixture to fail");
+            let error = value_from_file_trusted(&path).expect_err("expected fixture to fail");
             let actual = format_error_golden(&root, &path, error);
             let expected_path = root
                 .join("fixtures/golden/errors")

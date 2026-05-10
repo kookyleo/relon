@@ -287,7 +287,7 @@ pub enum Diagnostic {
     #[diagnostic(
         code(relon::analyze::capability_required),
         help(
-            "This native fn was registered with `register_fn_with_caps` requiring `{capability}`, but the host's `Capabilities` doesn't grant it. Either grant the capability (e.g. `caps.reads_fs = true` / add the fn name to `allow_native_fn`) or stop calling this fn from a script-reachable path."
+            "This native fn was registered with `register_fn` requiring `{capability}`, but the host's `Capabilities` doesn't grant it. Either grant the capability (e.g. `caps.{capability} = true` / add the fn name to `allow_native_fn`) or stop calling this fn from a script-reachable path."
         )
     )]
     CapabilityRequired {

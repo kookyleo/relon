@@ -5,9 +5,8 @@
 //! depending on the evaluator crate. The analyzer sits *below* the
 //! evaluator in the dependency graph (the evaluator pulls the analyzer's
 //! workspace tree at startup); reaching into the evaluator from here
-//! would create a cycle. The mirror is small and stable — Stage 4 keeps
-//! it in lock-step with the evaluator's v1 (`reads_fs` only) shape, and
-//! later stages extend both crates together.
+//! would create a cycle. The mirror is small and stable — every
+//! capability bit lands in both crates simultaneously.
 //!
 //! Hosts that drive the analyzer feed the evaluator's `Capabilities`
 //! into [`Capabilities`] via field-by-field copy at the facade layer
@@ -17,40 +16,100 @@
 use std::collections::HashSet;
 
 /// Per-fn capability requirement declared at registration time. Mirrors
-/// `relon_evaluator::eval::NativeFnGate` exactly. Stage 4 v1 carries
-/// only `reads_fs`; future stages add `network`, `writes_fs`, `env`, …
-/// in both crates simultaneously.
+/// `relon_evaluator::eval::NativeFnGate` field-for-field. A pure fn
+/// carries `NativeFnGate::default()` (every bit zero) and is trivially
+/// satisfied by any [`Capabilities`].
+///
+/// `#[non_exhaustive]`: future capability bits are added here without a
+/// breaking semver bump. External callers should construct via
+/// `NativeFnGate::default()` and set the bits they need.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct NativeFnGate {
-    /// The function reads from the filesystem (callers must hold
-    /// `Capabilities::reads_fs` to invoke it under sandbox).
+    /// Function reads from the filesystem.
     pub reads_fs: bool,
+    /// Function writes to or mutates the filesystem.
+    pub writes_fs: bool,
+    /// Function makes network requests.
+    pub network: bool,
+    /// Function reads wall / monotonic clocks.
+    pub reads_clock: bool,
+    /// Function reads process environment.
+    pub reads_env: bool,
+    /// Function consumes randomness from a non-deterministic source.
+    pub uses_rng: bool,
+}
+
+impl NativeFnGate {
+    /// Capability bits required by this gate that are *not* granted in
+    /// `caps`. Iteration order is the field-declaration order; the
+    /// analyzer emits one diagnostic per entry, runtime stops at the
+    /// first.
+    pub fn missing_bits(&self, caps: &Capabilities) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        if self.reads_fs && !caps.reads_fs {
+            out.push("reads_fs");
+        }
+        if self.writes_fs && !caps.writes_fs {
+            out.push("writes_fs");
+        }
+        if self.network && !caps.network {
+            out.push("network");
+        }
+        if self.reads_clock && !caps.reads_clock {
+            out.push("reads_clock");
+        }
+        if self.reads_env && !caps.reads_env {
+            out.push("reads_env");
+        }
+        if self.uses_rng && !caps.uses_rng {
+            out.push("uses_rng");
+        }
+        out
+    }
 }
 
 /// Context-wide grant the host hands the evaluator. Mirrors the
 /// allow-list-shaped fields of `relon_evaluator::eval::Capabilities`.
 /// Resource budgets (`max_steps`, `max_value_elements`) are deliberately
 /// excluded — they affect runtime evaluation, not static reachability.
+///
+/// `#[non_exhaustive]`: same rationale as the evaluator twin.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Capabilities {
     /// If true, every gated native fn is allowed regardless of `name`.
     pub allow_all_native_fn: bool,
     /// Specific native fn names that are allowed even when
     /// `allow_all_native_fn` is off.
     pub allow_native_fn: HashSet<String>,
-    /// Filesystem reads permitted. Required to call any native fn whose
-    /// gate sets `reads_fs: true`.
+    /// Filesystem reads permitted.
     pub reads_fs: bool,
+    /// Filesystem writes permitted.
+    pub writes_fs: bool,
+    /// Network access permitted.
+    pub network: bool,
+    /// Clock reads permitted.
+    pub reads_clock: bool,
+    /// Process environment reads permitted.
+    pub reads_env: bool,
+    /// Randomness (non-deterministic) permitted.
+    pub uses_rng: bool,
 }
 
 impl Default for Capabilities {
-    /// Zero-trust default — matches the evaluator's
-    /// `Capabilities::default()` shape (no fn calls, no fs).
+    /// Zero-trust default — every bit off. Matches the evaluator's
+    /// `Capabilities::default()` shape.
     fn default() -> Self {
         Self {
             allow_all_native_fn: false,
             allow_native_fn: HashSet::new(),
             reads_fs: false,
+            writes_fs: false,
+            network: false,
+            reads_clock: false,
+            reads_env: false,
+            uses_rng: false,
         }
     }
 }
@@ -65,6 +124,11 @@ impl Capabilities {
             allow_all_native_fn: true,
             allow_native_fn: HashSet::new(),
             reads_fs: true,
+            writes_fs: true,
+            network: true,
+            reads_clock: true,
+            reads_env: true,
+            uses_rng: true,
         }
     }
 }

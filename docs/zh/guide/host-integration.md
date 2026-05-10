@@ -102,7 +102,7 @@ match evaluator.run_main(&scope, args) {
 
 ```rust
 // ⚠️ pull-style：把 I/O 搬进求值过程
-ctx.register_fn_with_caps("http.get",
+ctx.register_fn("http.get",
     NativeFnGate { network: true, ..Default::default() },
     Arc::new(HttpGet),
 );
@@ -136,8 +136,8 @@ ctx.register_fn_with_caps("http.get",
 - **副作用动作**：规则引擎判断后触发邮件 / 日志 / webhook —— 本来就要 side effect
 - **观察性**：调试用 `@log("...")` 装饰器，不影响结果
 
-这些场景下 host fn 用 [`register_fn_with_caps`](#受-capability-门控的注册)
-注册，按需声明 `NativeFnGate { reads_clock: true, network: true, ... }`。
+这些场景下 host fn 用 [`register_fn`](#受-capability-门控的注册)
+注册，按需声明 `NativeFnGate { reads_clock: true, network: true, ..Default::default() }`。
 **这是有意识的取舍**：脚本作者主动放弃了「同一份 args 跑两次结果
 必然一致」的承诺，换取了「能动态拉数据」。spec §1 的求值确定性只覆
 盖 push 形态。
@@ -229,7 +229,7 @@ let value = Evaluator::new(Arc::new(ctx)).eval_root(&Arc::new(Scope::default()))
 
 `Context` 持有：
 
-- **`functions`** — 通过 `register_fn` / `register_fn_with_caps` 注册的原生函数表。
+- **`functions`** — 通过 `register_fn` 注册的原生函数表（纯函数走便捷封装 `register_pure_fn`）。
 - **`decorators`** — 通过 `register_decorator` 注册的装饰器插件。
 - **`module_resolvers`** — `#import` 走的解析器链；`Context::sandboxed()` 默认是 `[StdModuleResolver, FilesystemModuleResolver::default()]`。
 - **`capabilities`** — 沙箱 / 资源预算（[沙箱与权限](./sandbox.md) 详解）。
@@ -268,7 +268,7 @@ impl RelonFunction for AppVersion {
 }
 
 let mut ctx = Context::new();
-ctx.register_fn("app_version", Arc::new(AppVersion));
+ctx.register_pure_fn("app_version", Arc::new(AppVersion));
 ```
 
 之后在 `.relon` 里：
@@ -281,13 +281,16 @@ ctx.register_fn("app_version", Arc::new(AppVersion));
 
 要点：
 
-- `register_fn` 注册的函数被视作**完全可信**——即使在沙箱模式下也直接放行（绕过 `allow_native_fn` 列表）。
+- `register_pure_fn` 是 `register_fn(name, NativeFnGate::default(), fn)`
+  的便捷封装：声明一个空 gate，任何 `Capabilities` 都能平凡满足，所
+  以纯函数在沙箱下也能直接调。
 - `NativeArgs` 同时拆好了 positional 和 named 参数：`args.get(0)` 拿位置参数，`args.get_named("name")` 拿命名参数。
 - 函数返回 `Value`——Relon 的内存值类型；想构造 dict / list 用 `Value::Dict` / `Value::List`。
 
 ## 受 capability 门控的注册
 
-读文件、调网络、读环境这类**有副作用**的函数，应该用 `register_fn_with_caps` 注册：
+读文件、调网络、读环境这类**有副作用**的函数，用 `register_fn` 注
+册时把对应的 `NativeFnGate` bit 标上：
 
 ```rust
 use relon_evaluator::{Context, NativeFnGate, NativeArgs, RelonFunction, Value, RuntimeError};
@@ -304,17 +307,27 @@ impl RelonFunction for ReadSecret {
 }
 
 let mut ctx = Context::sandboxed();
-ctx.register_fn_with_caps(
+ctx.register_fn(
     "secret.read",
-    NativeFnGate { reads_fs: true },
+    NativeFnGate { reads_fs: true, ..Default::default() },
     Arc::new(ReadSecret),
 );
 
-// 在沙箱模式下，必须显式加白名单才能调
+// 在沙箱下两种放行方式任选其一：
+// (a) 按 bit 授权（推荐）：让任何声明 reads_fs 的函数都能调
+ctx.capabilities.reads_fs = true;
+// (b) 按名字加白：只放 secret.read 一个名字过
 ctx.capabilities.allow_native_fn.insert("secret.read".to_string());
 ```
 
-行为差异一句话：**`register_fn` 默认放行；`register_fn_with_caps` 默认拦截**。后者在显式设置 `Capabilities::all_granted()` 后也能跑（因为 `allow_all_native_fn = true`），但语义上明确传达「我是有副作用的」。详见 [沙箱与权限](./sandbox.md)。
+每个原生函数都走同一条 gate 检查：函数声明的所有 bit 都必须在
+`Capabilities` 里被授予，否则 `CapabilityDenied`。`register_pure_fn`
+注册的纯函数声明的是空 gate，零 bit 缺失，所以不需要 capability 授
+权也能跑；`register_fn(name, gate, fn)` 在 `gate` 含任何置位的 bit
+时就需要宿主显式授予对应能力（或 `allow_all_native_fn = true`，或
+`name` 出现在 `allow_native_fn` 白名单）。`Capabilities::all_granted()`
+一次把六个 bit 和 `allow_all_native_fn` 全部打开。详见
+[沙箱与权限](./sandbox.md)。
 
 ## 模块解析（Module Resolvers）
 

@@ -270,9 +270,12 @@ fn host_receives_capability_denied() {
 
     let node = parse_document(r#"{ x: read_file() }"#).expect("parse");
     let mut ctx = Context::sandboxed().with_root(node);
-    ctx.register_fn_with_caps(
+    ctx.register_fn(
         "read_file",
-        NativeFnGate { reads_fs: true },
+        NativeFnGate {
+            reads_fs: true,
+            ..NativeFnGate::default()
+        },
         Arc::new(ReadsFs),
     );
     let result = Evaluator::new(Arc::new(ctx)).eval_root(&Arc::new(Scope::default()));
@@ -408,4 +411,137 @@ fn host_can_render_diagnostic_with_source_for_user() {
         rendered.contains("undefined"),
         "rendered diagnostic should reference the offending token, got:\n{rendered}"
     );
+}
+
+#[test]
+fn host_receives_capability_denied_for_each_new_bit() {
+    // Each of the 5 new capability bits — `writes_fs`, `network`,
+    // `reads_clock`, `reads_env`, `uses_rng` — must surface the same
+    // typed `CapabilityDenied` shape as `reads_fs`, with `reason`
+    // mentioning the specific bit. Drives runtime's
+    // `check_native_fn_capability` table-driven walk.
+    struct Stub;
+    impl RelonFunction for Stub {
+        fn call(&self, _args: NativeArgs, _range: TokenRange) -> Result<Value, RuntimeError> {
+            Ok(Value::Null)
+        }
+    }
+
+    let cases: Vec<(&str, NativeFnGate)> = vec![
+        (
+            "writes_fs",
+            NativeFnGate {
+                writes_fs: true,
+                ..NativeFnGate::default()
+            },
+        ),
+        (
+            "network",
+            NativeFnGate {
+                network: true,
+                ..NativeFnGate::default()
+            },
+        ),
+        (
+            "reads_clock",
+            NativeFnGate {
+                reads_clock: true,
+                ..NativeFnGate::default()
+            },
+        ),
+        (
+            "reads_env",
+            NativeFnGate {
+                reads_env: true,
+                ..NativeFnGate::default()
+            },
+        ),
+        (
+            "uses_rng",
+            NativeFnGate {
+                uses_rng: true,
+                ..NativeFnGate::default()
+            },
+        ),
+    ];
+
+    for (bit, gate) in cases {
+        let node = parse_document(r#"{ x: f() }"#).expect("parse");
+        let mut ctx = Context::sandboxed().with_root(node);
+        ctx.register_fn("f", gate, Arc::new(Stub));
+        let result = Evaluator::new(Arc::new(ctx)).eval_root(&Arc::new(Scope::default()));
+        let err = result.expect_err(&format!("bit `{bit}` should error"));
+        let RuntimeError::CapabilityDenied { name, reason, .. } = &err else {
+            panic!("bit `{bit}`: expected CapabilityDenied, got {err:?}");
+        };
+        assert_eq!(name, "f", "bit `{bit}`: name");
+        assert!(
+            reason.contains(bit),
+            "bit `{bit}`: reason should mention `{bit}`, got `{reason}`"
+        );
+    }
+}
+
+#[test]
+fn capability_denied_reports_first_missing_bit() {
+    // Fn declares `reads_fs + network`; host grants `reads_fs` only.
+    // Runtime stops at the first miss in `NativeFnGate`'s
+    // field-declaration order (reads_fs first, network second). With
+    // reads_fs already granted, the report names `network`.
+    struct Stub;
+    impl RelonFunction for Stub {
+        fn call(&self, _args: NativeArgs, _range: TokenRange) -> Result<Value, RuntimeError> {
+            Ok(Value::Null)
+        }
+    }
+
+    let node = parse_document(r#"{ x: fetch() }"#).expect("parse");
+    let mut ctx = Context::sandboxed().with_root(node);
+    ctx.capabilities.reads_fs = true; // grant one of the two
+    ctx.register_fn(
+        "fetch",
+        NativeFnGate {
+            reads_fs: true,
+            network: true,
+            ..NativeFnGate::default()
+        },
+        Arc::new(Stub),
+    );
+    let err = Evaluator::new(Arc::new(ctx))
+        .eval_root(&Arc::new(Scope::default()))
+        .expect_err("should error on the ungranted bit");
+    let RuntimeError::CapabilityDenied { reason, .. } = &err else {
+        panic!("expected CapabilityDenied, got {err:?}");
+    };
+    assert!(
+        reason.contains("network"),
+        "reason should mention the ungranted bit `network`, got `{reason}`"
+    );
+    assert!(
+        !reason.contains("reads_fs"),
+        "reason should not mention the already-granted bit `reads_fs`, got `{reason}`"
+    );
+}
+
+#[test]
+fn pure_fn_passes_under_full_sandbox() {
+    // `register_pure_fn` declares the empty gate. Even under a fully
+    // sandboxed Context (no allowlist, no granted bits) the call
+    // succeeds — the all-zero gate is trivially satisfied.
+    struct Pure;
+    impl RelonFunction for Pure {
+        fn call(&self, _args: NativeArgs, _range: TokenRange) -> Result<Value, RuntimeError> {
+            Ok(Value::Int(42))
+        }
+    }
+    let node = parse_document(r#"{ x: deterministic() }"#).expect("parse");
+    let mut ctx = Context::sandboxed().with_root(node);
+    ctx.register_pure_fn("deterministic", Arc::new(Pure));
+    let result = Evaluator::new(Arc::new(ctx))
+        .eval_root(&Arc::new(Scope::default()))
+        .expect("pure fn should pass under full sandbox");
+    let Value::Dict(d) = result else {
+        panic!("expected dict")
+    };
+    assert_eq!(d.map.get("x"), Some(&Value::Int(42)));
 }

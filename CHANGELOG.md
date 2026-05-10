@@ -1,6 +1,65 @@
 # Changelog
 
-## [Unreleased] — Sandboxed-by-default facade + spec narrative cleanup
+## [Unreleased] — Capability model hardening: 6-bit gate + unified register_fn
+
+### BREAKING: capability bits go from 1 to 6, registration API collapses to one entry point
+
+`NativeFnGate` and `Capabilities` used to carry only one bit (`reads_fs`).
+Hosts wired up `network` / `reads_clock` / `reads_env` examples in their
+own code as if those bits existed; the docs even showed
+`NativeFnGate { network: true, .. }`. They didn't actually exist.
+
+Both structs now carry six bits — `reads_fs`, `writes_fs`, `network`,
+`reads_clock`, `reads_env`, `uses_rng` — covering every ambient
+capability the embedding model wants to gate. Both are
+`#[non_exhaustive]` so adding bit number seven won't be a breaking
+change. `Capabilities::all_granted()` flips every one of the six.
+
+The runtime check (`check_native_fn_capability`) and the analyzer's
+static check (`capability_check`) now share a `NativeFnGate::missing_bits`
+helper. Runtime reports the first miss; analyzer emits one
+`Diagnostic::CapabilityRequired` per missing bit, so a fn declaring
+`reads_fs + network` with neither granted produces two diagnostics.
+
+The two registration entry points collapse into one:
+
+- `register_fn(name, fn)` (no caps, internal `gated: false` bypass) and
+  `register_fn_with_caps(name, gate, fn)` are gone.
+- New canonical API: `register_fn(name, gate, fn)` — every fn declares
+  its gate. A pure fn carries `NativeFnGate::default()` (every bit zero)
+  and the gate check is trivially satisfied even under a fully sandboxed
+  `Capabilities::default()`.
+- Convenience: `register_pure_fn(name, fn)` is a one-line wrapper for
+  `register_fn(name, NativeFnGate::default(), fn)`. Use it for
+  deterministic, args-in / value-out fns; the name documents intent.
+
+The internal `gated: bool` flag on the registered-fn record is removed;
+every call goes through the same per-bit check, and pure fns pass
+because `missing_bits` returns an empty list.
+
+stdlib intrinsics (`stdlib.rs`) now register through `register_pure_fn`.
+A new `#[cfg(test)]` purity-guard test scans `stdlib.rs` and blocks
+`std::fs` / `std::env` / `std::net` / `std::process` / `SystemTime` /
+`Instant::now` / `rand::` / `chrono::` / `tokio::fs` / `tokio::net` /
+`reqwest`. Any future ambient capability must live as a gated host-facing
+module (e.g. `std/time` exposed via `register_fn(name, NativeFnGate { reads_clock: true, .. }, fn)`),
+not as an ungated stdlib intrinsic.
+
+#### Migration
+
+`register_fn_with_caps(name, gate, fn)` → `register_fn(name, gate, fn)`
+(rename only).
+
+`register_fn(name, fn)` for a pure fn → `register_pure_fn(name, fn)`.
+If the fn does have side effects, pick the right `NativeFnGate` bits
+and register through `register_fn(name, gate, fn)` instead.
+
+`NativeFnGate { reads_fs: true }` literal → `NativeFnGate { reads_fs: true, ..NativeFnGate::default() }`
+(the struct now has more fields, so partial literals need the spread).
+Same for `Capabilities { reads_fs: true, ..Capabilities::default() }`
+when toggling individual bits in tests.
+
+## [Earlier-Unreleased] — Sandboxed-by-default facade + spec narrative cleanup
 
 ### BREAKING: facade entry points now default to a sandboxed runtime
 

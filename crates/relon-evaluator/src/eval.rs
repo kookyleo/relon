@@ -18,14 +18,32 @@ use std::sync::{Arc, Mutex};
 ///
 /// Per-function capability *requirements* (e.g. "this fn needs fs read")
 /// live on [`NativeFnGate`]; this struct is what the host *grants*.
+///
+/// `#[non_exhaustive]`: future capability bits are added here without a
+/// breaking semver bump. External callers must construct via
+/// [`Capabilities::default`] / [`Capabilities::all_granted`] and mutate
+/// fields, rather than struct literals.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct Capabilities {
     /// If true, all registered native functions can be called.
     pub allow_all_native_fn: bool,
     /// Set of specifically allowed native function names (e.g. `["math.sum"]`).
     pub allow_native_fn: HashSet<String>,
-    /// If true, filesystem-based module resolution is permitted.
+    /// Filesystem reads (host fn that calls `std::fs::read*`, also the
+    /// policy bit consulted by [`crate::module::FilesystemModuleResolver`]).
     pub reads_fs: bool,
+    /// Filesystem writes (host fn that calls `std::fs::write*` /
+    /// `OpenOptions::write` / `create_dir*` / `remove_*`).
+    pub writes_fs: bool,
+    /// Network access (sockets, HTTP clients, DNS).
+    pub network: bool,
+    /// Wall / monotonic clock reads (`SystemTime::now`, `Instant::now`).
+    pub reads_clock: bool,
+    /// Process environment reads (`std::env::var`, `args`, etc.).
+    pub reads_env: bool,
+    /// Random number generation (any non-deterministic source).
+    pub uses_rng: bool,
     /// Maximum number of AST nodes to process before aborting.
     pub max_steps: Option<u64>,
     /// Maximum number of elements in a single List or Dict.
@@ -33,12 +51,11 @@ pub struct Capabilities {
 }
 
 impl Capabilities {
-    /// Audit-visible "grant everything" preset: all native functions
-    /// allowed, filesystem reads permitted, no step / value-size
-    /// budget. The spec forbids an implicit `Context::trusted()`-style
-    /// shortcut; hosts that need full grant must call this and read
-    /// the resulting `Capabilities` *as data*. See `docs/zh/guide/spec.md`
-    /// §4.2.
+    /// Audit-visible "grant everything" preset: every capability bit
+    /// flipped, no step / value-size budget. The spec forbids an
+    /// implicit `Context::trusted()`-style shortcut; hosts that need
+    /// full grant must call this and read the resulting `Capabilities`
+    /// *as data*. See `docs/zh/guide/spec.md` §4.2.
     ///
     /// Note: opening filesystem reads also requires installing a
     /// non-rejecting [`crate::module::FilesystemModuleResolver`] (e.g.
@@ -51,6 +68,11 @@ impl Capabilities {
             allow_all_native_fn: true,
             allow_native_fn: HashSet::new(),
             reads_fs: true,
+            writes_fs: true,
+            network: true,
+            reads_clock: true,
+            reads_env: true,
+            uses_rng: true,
             max_steps: None,
             max_value_elements: None,
         }
@@ -61,19 +83,62 @@ impl Capabilities {
 /// time. The gate compares these against the context-wide
 /// [`Capabilities`] grant when the function is invoked under sandbox.
 ///
-/// Kept distinct from `Capabilities` so the per-fn record can grow
-/// independently (future: `network`, `env`, `writes_fs`, …) without
-/// dragging context-only fields like `max_steps` into per-fn metadata.
+/// A pure function (no host capability needed) carries
+/// `NativeFnGate::default()` — every bit zero. The gate check is
+/// trivially satisfied by any `Capabilities` value, including a
+/// fully-sandboxed [`Capabilities::default`].
+///
+/// `#[non_exhaustive]`: future capability bits are added here without a
+/// breaking semver bump. External callers should construct via
+/// `NativeFnGate::default()` and set the bits they need.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct NativeFnGate {
-    /// The function reads from the filesystem (callers must hold
-    /// `Capabilities::reads_fs` to invoke it under sandbox).
+    /// Function reads from the filesystem.
     pub reads_fs: bool,
+    /// Function writes to or mutates the filesystem.
+    pub writes_fs: bool,
+    /// Function makes network requests.
+    pub network: bool,
+    /// Function reads wall / monotonic clocks.
+    pub reads_clock: bool,
+    /// Function reads process environment.
+    pub reads_env: bool,
+    /// Function consumes randomness from a non-deterministic source.
+    pub uses_rng: bool,
+}
+
+impl NativeFnGate {
+    /// Capability bits required by this gate that are *not* granted in
+    /// `caps`. Iteration order is the field-declaration order; runtime
+    /// uses the first entry as the failure reason, analyzer emits one
+    /// diagnostic per entry.
+    pub(crate) fn missing_bits(&self, caps: &Capabilities) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        if self.reads_fs && !caps.reads_fs {
+            out.push("reads_fs");
+        }
+        if self.writes_fs && !caps.writes_fs {
+            out.push("writes_fs");
+        }
+        if self.network && !caps.network {
+            out.push("network");
+        }
+        if self.reads_clock && !caps.reads_clock {
+            out.push("reads_clock");
+        }
+        if self.reads_env && !caps.reads_env {
+            out.push("reads_env");
+        }
+        if self.uses_rng && !caps.uses_rng {
+            out.push("uses_rng");
+        }
+        out
+    }
 }
 
 pub(crate) struct GatedNativeFn {
     pub(crate) func: Arc<dyn RelonFunction>,
-    pub(crate) gated: bool,
     pub(crate) gate: NativeFnGate,
 }
 
@@ -124,11 +189,13 @@ impl Default for Context {
 impl Context {
     /// Minimal context: virtual `std/...` resolver, builtin decorators,
     /// and the pure-functional stdlib (`len`, `range`, `string.*`,
-    /// `math.*`, …) registered via [`Self::register_fn`] (i.e. ungated —
-    /// they're considered trusted infrastructure regardless of sandbox
-    /// state). No filesystem resolver is mounted; `@import("./x.relon")`
-    /// will fall through to a `ModuleNotFound`. Use [`Self::sandboxed`]
-    /// for real workloads and then grant capabilities explicitly.
+    /// `math.*`, …) registered via [`Self::register_pure_fn`]. Pure fns
+    /// declare the empty gate ([`NativeFnGate::default`]), so the
+    /// capability check is trivially satisfied even under a fully
+    /// sandboxed [`Capabilities::default`]. No filesystem resolver is
+    /// mounted; `@import("./x.relon")` falls through to a
+    /// `ModuleNotFound`. Use [`Self::sandboxed`] for real workloads and
+    /// then grant capabilities explicitly.
     pub fn new() -> Self {
         let mut this = Self {
             root_node: None,
@@ -160,15 +227,17 @@ impl Context {
     /// [`FilesystemModuleResolver`] after the virtual `std/...` resolver
     /// so `@import("std/list")` works while `@import("./local.relon")`
     /// returns `CapabilityDenied`. `Capabilities` defaults are
-    /// restrictive: no fs grant, no native-fn allowlist.
+    /// restrictive: no capability bits set, no native-fn allowlist.
     ///
-    /// **Sandbox scope:** this only constrains filesystem `#import` and
-    /// host-registered functions added via [`Self::register_fn_with_caps`].
-    /// The pure-functional stdlib (registered via [`Self::register_fn`])
-    /// is intentionally ungated — those functions perform no I/O and
-    /// have no side-effects beyond their return value. Hosts that need
-    /// to forbid even the stdlib should re-register the relevant entries
-    /// via `register_fn_with_caps` after construction.
+    /// **Sandbox scope:** filesystem `#import` and every host-registered
+    /// function go through the same gate. Pure fns (registered via
+    /// [`Self::register_pure_fn`] or with an empty
+    /// [`NativeFnGate`]) carry an all-zero gate that the check
+    /// trivially satisfies — they keep working under the sandbox. Fns
+    /// registered via [`Self::register_fn`] with non-empty gate bits
+    /// are rejected unless the host grants the matching
+    /// [`Capabilities`] bit (or names the fn in `allow_native_fn`, or
+    /// flips `allow_all_native_fn`).
     pub fn sandboxed() -> Self {
         let mut this = Self::new();
         this.module_resolvers
@@ -204,41 +273,37 @@ impl Context {
         self.module_resolvers.insert(0, resolver);
     }
 
-    /// Register a fully-trusted native function. Calls bypass the sandbox
-    /// gate entirely — equivalent to "all caps true". Use
-    /// [`Self::register_fn_with_caps`] for anything that needs to be
-    /// guarded by host policy.
-    pub fn register_fn<S: Into<String>>(&mut self, name: S, func: Arc<dyn RelonFunction>) {
-        self.functions.insert(
-            name.into(),
-            GatedNativeFn {
-                func,
-                gated: false,
-                gate: NativeFnGate::default(),
-            },
-        );
-    }
-
-    /// Register a native function whose calls are gated by the
-    /// context-wide [`Capabilities`]. The function declares what it
-    /// *requires* via [`NativeFnGate`] (e.g. `reads_fs: true`); under
-    /// sandbox the call is rejected unless either
-    /// `Capabilities::allow_all_native_fn` is on or `name` appears in
-    /// `Capabilities::allow_native_fn`.
-    pub fn register_fn_with_caps<S: Into<String>>(
+    /// Register a native function with explicit capability requirements.
+    /// The function declares which bits it needs via `gate`; under the
+    /// sandbox the call is rejected unless every set bit is granted in
+    /// the context-wide [`Capabilities`] (or `name` appears in
+    /// `allow_native_fn`, or `allow_all_native_fn` is on).
+    ///
+    /// For pure functions (no host capability, no I/O, no ambient
+    /// state) prefer [`Self::register_pure_fn`] — it makes the
+    /// "this fn is pure" intent explicit. Passing
+    /// `NativeFnGate::default()` here is equivalent.
+    pub fn register_fn<S: Into<String>>(
         &mut self,
         name: S,
         gate: NativeFnGate,
         func: Arc<dyn RelonFunction>,
     ) {
-        self.functions.insert(
-            name.into(),
-            GatedNativeFn {
-                func,
-                gated: true,
-                gate,
-            },
-        );
+        self.functions
+            .insert(name.into(), GatedNativeFn { func, gate });
+    }
+
+    /// Register a pure native function: no I/O, no ambient state, no
+    /// host capability required. Equivalent to
+    /// `register_fn(name, NativeFnGate::default(), func)`. The all-zero
+    /// gate is trivially satisfied by every `Capabilities` value, so
+    /// pure fns keep working under a fully sandboxed context.
+    ///
+    /// Stdlib intrinsics (`len`, `range`, `string.*`, …) and
+    /// deterministic host fns whose contract is "args in, value out"
+    /// register through this entry point.
+    pub fn register_pure_fn<S: Into<String>>(&mut self, name: S, func: Arc<dyn RelonFunction>) {
+        self.register_fn(name, NativeFnGate::default(), func);
     }
 
     pub fn register_decorator<S: Into<String>>(
@@ -1671,22 +1736,19 @@ impl Evaluator {
         entry: &GatedNativeFn,
         range: TokenRange,
     ) -> Result<(), RuntimeError> {
-        if !entry.gated {
-            return Ok(());
-        }
         let caps = &self.context.capabilities;
         if caps.allow_all_native_fn || caps.allow_native_fn.contains(name) {
             return Ok(());
         }
-        Err(RuntimeError::CapabilityDenied {
-            name: name.to_string(),
-            reason: if entry.gate.reads_fs {
-                "function declared `reads_fs` but is not in the sandbox allowlist".to_string()
-            } else {
-                "function not in sandbox allowlist".to_string()
-            },
-            range,
-        })
+        let missing = entry.gate.missing_bits(caps);
+        if let Some(bit) = missing.first() {
+            return Err(RuntimeError::CapabilityDenied {
+                name: name.to_string(),
+                reason: format!("function declared `{bit}` but caller did not grant it"),
+                range,
+            });
+        }
+        Ok(())
     }
 
     fn fallback_decorator(

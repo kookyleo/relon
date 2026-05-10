@@ -195,10 +195,10 @@ pub struct AnalyzeOptions {
     pub host_fn_signatures: HashMap<String, FnSignature>,
     /// Stage 4: capability requirements declared by each registered
     /// native fn (mirror of the evaluator's `NativeFnGate` table). A
-    /// missing entry means the fn was registered ungated (i.e. via
-    /// `register_fn` not `register_fn_with_caps`) — the static check
-    /// stays silent on it. Hosts populate this from the `gate` argument
-    /// they passed to `register_fn_with_caps`.
+    /// missing entry means the fn isn't registered, or carries the
+    /// empty gate (e.g. via `register_pure_fn`) — the static check
+    /// stays silent on those. Hosts populate this from the `gate`
+    /// argument they passed to `register_fn(name, gate, fn)`.
     pub host_fn_gates: HashMap<String, cap::NativeFnGate>,
     /// Stage 4: the host's actual capability grant (mirror of the
     /// evaluator's `Capabilities`). Used by the static reachability
