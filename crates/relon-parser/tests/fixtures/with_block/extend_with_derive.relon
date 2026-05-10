@@ -1,0 +1,9 @@
+// Phase A.1: #extend + #derive Equatable 在扩展点 derive constraint（决策 18）。
+#schema MyData { Int v: * }
+
+#extend MyData with {
+    #derive Equatable
+    eq(other: Self) -> Bool: self.v == other.v
+}
+
+{ MyData d: { v: 1 } }

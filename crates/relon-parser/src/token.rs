@@ -237,6 +237,11 @@ pub struct SchemaMethod {
     /// the body lives in host Rust (registered via the schema-method
     /// host API). The parser leaves `body` `None` in this case.
     pub is_native: bool,
+    /// True when a `#private` pragma precedes this method. Private
+    /// methods are visible only from other method bodies on the same
+    /// schema; script-level `value.method()` calls fail with
+    /// `MethodNotFound` at the analyzer stage.
+    pub is_private: bool,
     pub range: TokenRange,
     pub doc_comment: Option<String>,
 }

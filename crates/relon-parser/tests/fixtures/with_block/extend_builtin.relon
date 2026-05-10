@@ -1,0 +1,6 @@
+// Phase A.1: #extend 内置 schema（决策 8 末尾「含 built-in」）。
+#extend String with {
+    is_email() -> Bool: self.contains("@")
+}
+
+{ String s: "ada@example.com" }

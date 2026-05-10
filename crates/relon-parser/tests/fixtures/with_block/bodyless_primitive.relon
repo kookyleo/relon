@@ -1,0 +1,7 @@
+// Phase A.1: body-less #schema —— 用于内置 primitive 类型 schema 声明（决策 10）。
+// 没有字段 dict body，直接接 with { ... } 方法块。
+#schema MyString with {
+    #native upper() -> String
+    #native len() -> Int
+}
+{ MyString s: "hello" }

@@ -68,6 +68,18 @@ pub const NO_AUTO_DERIVE: &str = "no_auto_derive";
 /// parser leaves the method's body empty when this pragma is present;
 /// the analyzer cross-checks against the host registry.
 pub const NATIVE: &str = "native";
+/// Schema-rooted Phase A.1: `#extend X with { ... }` adds methods to
+/// an already-declared schema X (built-in or user). Same parser shape
+/// as `#schema` (NameBody), distinguished from `#schema` by the
+/// directive name. Visibility is tied to the file's `#import` chain
+/// (decision 9). Cannot re-declare X — only extend its method table.
+///
+/// Note: method-level `#private` is the existing [`PRIVATE`] directive
+/// reused — `#private` was already a field-level visibility marker for
+/// schema bodies. In a `with { ... }` block, the same `#private`
+/// directive marks a method as schema-internal (only callable from
+/// other method bodies on the same schema).
+pub const EXTEND: &str = "extend";
 
 /// Directive name → expected shape. Dispatch happens by name; unknown
 /// `#name` produces a parse error.
@@ -87,6 +99,7 @@ pub const DIRECTIVE_SHAPES: &[(&str, DirectiveShape)] = &[
     (DERIVE, DirectiveShape::Value),
     (NO_AUTO_DERIVE, DirectiveShape::Value),
     (NATIVE, DirectiveShape::Bare),
+    (EXTEND, DirectiveShape::NameBody),
 ];
 
 /// Look up a directive's expected shape by name. Returns `None` for
@@ -191,15 +204,39 @@ fn parse_name_body<'a>(input: &mut Span<'a>) -> ModalResult<crate::DirectiveBody
         input.reset(&after_ws);
         return Ok(crate::DirectiveBody::Bare);
     }
-    let body = match parse_expr.parse_next(input) {
-        Ok(b) => b,
-        Err(_) => {
-            // No body — bare directive, rewind so the surrounding
-            // grammar sees the ident again (e.g. as a key).
-            input.reset(&after_ws);
-            return Ok(crate::DirectiveBody::Bare);
+
+    // Schema-rooted Phase A.1: `#schema X with { ... }` and
+    // `#extend X with { ... }` are body-less — they carry only a
+    // method-table contribution. When `with` sits at a word boundary
+    // immediately after the name (no field-shape body in between),
+    // synthesize an empty dict body so downstream code that pattern-
+    // matches `NameBody { body, .. }` keeps working unchanged. The
+    // analyzer differentiates `schema` vs `extend` by the directive's
+    // `name` field, not by the body shape.
+    let (body, with_already_consumed) = if at_keyword(input, "with") {
+        let body_range = create_range(input, input.location(), input.location());
+        let synth = crate::Node {
+            id: crate::NodeId::alloc(),
+            expr: Box::new(crate::Expr::Dict(Vec::new())),
+            decorators: Vec::new(),
+            directives: Vec::new(),
+            type_hint: None,
+            range: body_range,
+            doc_comment: None,
+        };
+        (synth, false)
+    } else {
+        match parse_expr.parse_next(input) {
+            Ok(b) => (b, false),
+            Err(_) => {
+                // No body — bare directive, rewind so the surrounding
+                // grammar sees the ident again (e.g. as a key).
+                input.reset(&after_ws);
+                return Ok(crate::DirectiveBody::Bare);
+            }
         }
     };
+    let _ = with_already_consumed; // reserved for future grammar tweaks
 
     // Phase A: optional trailing `with { ... }` block carrying schema
     // methods. Detection is conservative — if `with` doesn't sit at a
@@ -271,6 +308,7 @@ fn opt_parse_with_block<'a>(
         //     within each scope's vec.
         let mut method_derives: Vec<String> = Vec::new();
         let mut is_native = false;
+        let mut is_private = false;
         loop {
             let pre_dir = input.checkpoint();
             let _ = soc0.parse_next(input);
@@ -295,6 +333,7 @@ fn opt_parse_with_block<'a>(
                     None => return None,
                 },
                 NATIVE => is_native = true,
+                PRIVATE => is_private = true,
                 _ => {
                     // Not a method/schema pragma — bail out of the with
                     // block; the directive is likely intended for the
@@ -377,6 +416,7 @@ fn opt_parse_with_block<'a>(
             body,
             derives: method_derives,
             is_native,
+            is_private,
             range: create_range(input, method_start, method_end),
             doc_comment: None,
         });

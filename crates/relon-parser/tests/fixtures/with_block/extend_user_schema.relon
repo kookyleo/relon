@@ -1,0 +1,10 @@
+// Phase A.1: #extend 给已声明的 user schema 加方法（决策 8）。
+#schema User { String name: * } with {
+    full_name() -> String: self.name
+}
+
+#extend User with {
+    is_admin() -> Bool: self.name == "admin"
+}
+
+{ User u: { name: "ada" } }

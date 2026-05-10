@@ -193,6 +193,113 @@ fn multi_param_method_parses() {
 }
 
 // -------------------------------------------------------------------
+// Phase A.1 fixtures — body-less #schema, #extend, #private.
+
+#[test]
+fn bodyless_primitive_schema_parses() {
+    let root = parse_or_panic("bodyless_primitive");
+    let body = first_schema_namebody(&root);
+    let DirectiveBody::NameBody {
+        name,
+        methods,
+        body,
+        ..
+    } = body
+    else {
+        panic!("expected NameBody");
+    };
+    assert_eq!(name, "MyString");
+    assert_eq!(methods.len(), 2);
+    assert!(methods.iter().all(|m| m.is_native));
+    // body 是合成的空 dict 占位
+    let relon_parser::Expr::Dict(entries) = body.expr.as_ref() else {
+        panic!("expected synthesized empty dict body, got {:?}", body.expr);
+    };
+    assert!(
+        entries.is_empty(),
+        "body-less synthesized dict must be empty"
+    );
+}
+
+#[test]
+fn extend_user_schema_parses() {
+    let source = read_fixture("with_block", "extend_user_schema");
+    let root = parse_document(&source).expect("parse");
+    let extend_dir = root
+        .directives
+        .iter()
+        .find(|d| d.name == "extend")
+        .expect("expected #extend directive");
+    let DirectiveBody::NameBody {
+        name,
+        methods,
+        body,
+        ..
+    } = &extend_dir.body
+    else {
+        panic!("extend body must be NameBody");
+    };
+    assert_eq!(name, "User");
+    assert_eq!(methods.len(), 1);
+    assert_eq!(methods[0].name, "is_admin");
+    let relon_parser::Expr::Dict(entries) = body.expr.as_ref() else {
+        panic!("extend body must be synthesized empty dict");
+    };
+    assert!(entries.is_empty());
+}
+
+#[test]
+fn extend_with_derive_parses() {
+    let source = read_fixture("with_block", "extend_with_derive");
+    let root = parse_document(&source).expect("parse");
+    let extend_dir = root
+        .directives
+        .iter()
+        .find(|d| d.name == "extend")
+        .expect("expected #extend directive");
+    let DirectiveBody::NameBody { name, methods, .. } = &extend_dir.body else {
+        panic!("extend body must be NameBody");
+    };
+    assert_eq!(name, "MyData");
+    assert_eq!(methods.len(), 1);
+    assert_eq!(methods[0].name, "eq");
+    assert_eq!(methods[0].derives, vec!["Equatable".to_string()]);
+}
+
+#[test]
+fn private_method_parses() {
+    let root = parse_or_panic("private_method");
+    let body = first_schema_namebody(&root);
+    let DirectiveBody::NameBody { methods, .. } = body else {
+        panic!("expected NameBody");
+    };
+    assert_eq!(methods.len(), 2);
+    let format = &methods[0];
+    let helper = &methods[1];
+    assert_eq!(format.name, "format");
+    assert!(!format.is_private);
+    assert_eq!(helper.name, "amount_string");
+    assert!(helper.is_private);
+}
+
+#[test]
+fn extend_builtin_parses() {
+    let source = read_fixture("with_block", "extend_builtin");
+    let root = parse_document(&source).expect("parse");
+    let extend_dir = root
+        .directives
+        .iter()
+        .find(|d| d.name == "extend")
+        .expect("expected #extend directive");
+    let DirectiveBody::NameBody { name, methods, .. } = &extend_dir.body else {
+        panic!("extend body must be NameBody");
+    };
+    assert_eq!(name, "String");
+    assert_eq!(methods.len(), 1);
+    assert_eq!(methods[0].name, "is_email");
+}
+
+// -------------------------------------------------------------------
 // Negative cases — every file under `with_block_invalid/` must fail
 // to parse. The exact diagnostic isn't asserted (Phase A), only the
 // `parse_document` returning an error.
