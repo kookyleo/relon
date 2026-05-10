@@ -143,6 +143,14 @@ pub(crate) fn build<L: ModuleLoader>(
     //    correction has to happen here.
     re_check_unknown_types(&mut ws);
 
+    // 4.4 Schema-rooted Phase B: for every reachable module, fold its
+    //     transitive imports' `tree.schema_methods` contributions into
+    //     the importer's own table — that is the per-import-chain
+    //     visibility decision (schema-rooted-model-2026-05-11.md §9).
+    //     Runs *before* `recheck_cross_module_calls` so that the rerun's
+    //     dispatch lookups already see the merged tables.
+    propagate_schema_methods_across_imports(&mut ws);
+
     // 4.5 v1.1: populate each module's `workspace_import_index` and
     //    re-run typecheck so calls that resolve only through cross-
     //    module closures (`map(...)` after `#import * from "list"`)
@@ -696,6 +704,113 @@ fn is_main_return_diagnostic(d: &Diagnostic) -> bool {
     matches!(d, Diagnostic::MainReturnTypeMismatch { .. })
 }
 
+/// Schema-rooted Phase B post-pass: propagate `#schema X with { ... }`
+/// + `#extend X with { ... }` contributions from each transitively-
+/// imported module into the importer's `tree.schema_methods`. Runs
+/// after every reachable module has been analyzed but *before*
+/// `recheck_cross_module_calls`, so the typecheck rerun resolves
+/// `value.method(...)` against the merged tables rather than the
+/// per-module-only ones.
+///
+/// Conflict policy mirrors the single-module rules: if an importer
+/// would inherit two different definitions of the same `(schema,
+/// method)` pair, the duplicate is dropped and a `MethodNameConflict`
+/// is appended (with the importer's own range when available, the
+/// imported range otherwise).
+///
+/// Visibility rule: an importer sees an `#extend` contribution from
+/// any module reachable via `import_graph` BFS, regardless of whether
+/// the extender is itself a directly-imported neighbor — that is the
+/// per-import-chain semantics chosen in the design doc. We do *not*
+/// gate on whether the extended schema is also visible to the
+/// importer (a method on a never-referenced schema is harmless).
+fn propagate_schema_methods_across_imports(ws: &mut WorkspaceTree) {
+    let module_ids: Vec<String> = ws.modules.keys().cloned().collect();
+
+    // Snapshot each module's pre-merge `schema_methods` so we don't
+    // double-count contributions when a module imports another that
+    // also imported it (cycles return through the same node twice
+    // otherwise — `transitive_modules` already dedupes via the visited
+    // set, but the table read still must be consistent across
+    // iterations).
+    let mut original_methods: HashMap<String, HashMap<String, Vec<crate::schema::SchemaMethodInfo>>> =
+        HashMap::new();
+    for id in &module_ids {
+        if let Some(arc_tree) = ws.modules.get(id) {
+            original_methods.insert(id.clone(), arc_tree.schema_methods.clone());
+        }
+    }
+
+    for id in &module_ids {
+        let transitive = transitive_modules(ws, id);
+        let Some(arc_tree) = ws.modules.get_mut(id) else {
+            continue;
+        };
+        let Some(tree) = Arc::get_mut(arc_tree) else {
+            continue;
+        };
+        let mut conflicts: Vec<Diagnostic> = Vec::new();
+        for imported in transitive {
+            if &imported == id {
+                continue;
+            }
+            let Some(donor_methods) = original_methods.get(&imported) else {
+                continue;
+            };
+            for (schema_name, methods) in donor_methods {
+                let entry = tree.schema_methods.entry(schema_name.clone()).or_default();
+                for method in methods {
+                    if let Some(existing) = entry.iter().find(|m| m.name == method.name) {
+                        // Skip when the importer already has this exact
+                        // body (idempotent re-merge across diamond
+                        // imports). Compare by source range — every
+                        // method body has a unique `range` in source.
+                        if existing.range == method.range {
+                            continue;
+                        }
+                        conflicts.push(Diagnostic::MethodNameConflict {
+                            schema: schema_name.clone(),
+                            method: method.name.clone(),
+                            first: crate::diagnostic::span_of(existing.name_range),
+                            second: crate::diagnostic::span_of(method.name_range),
+                        });
+                        continue;
+                    }
+                    let mut tagged = method.clone();
+                    if tagged.source_module.is_none() {
+                        tagged.source_module = Some(imported.clone());
+                    }
+                    entry.push(tagged);
+                }
+            }
+        }
+        tree.diagnostics.extend(conflicts);
+        // Rebuild `method_signatures` to reflect the merged table.
+        crate::extend::build_method_signature_table(tree);
+    }
+}
+
+/// Walk the import graph from `root` and return every reachable module
+/// id (including `root` itself). Order is BFS for stability.
+fn transitive_modules(ws: &WorkspaceTree, root: &str) -> Vec<String> {
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut queue: VecDeque<String> = VecDeque::new();
+    let mut out: Vec<String> = Vec::new();
+    queue.push_back(root.to_string());
+    seen.insert(root.to_string());
+    while let Some(id) = queue.pop_front() {
+        out.push(id.clone());
+        if let Some(edges) = ws.import_graph.get(&id) {
+            for edge in edges {
+                if seen.insert(edge.clone()) {
+                    queue.push_back(edge.clone());
+                }
+            }
+        }
+    }
+    out
+}
+
 /// True when `d` is a diagnostic kind emitted exclusively by
 /// [`crate::typecheck::typecheck`]. Used by [`recheck_cross_module_calls`]
 /// to clear those entries before a second typecheck run; other passes'
@@ -725,6 +840,13 @@ fn is_typecheck_owned_diagnostic(d: &Diagnostic) -> bool {
             | Diagnostic::StrictForbidsNativeReturn { .. }
             | Diagnostic::StrictForbidsUntypedClosureParam { .. }
             | Diagnostic::StrictForbidsUnclassifiedClosureBody { .. }
+            // Schema-rooted Phase B dispatch diagnostics — re-derived
+            // by `check_method_dispatch` on every typecheck run, so
+            // they must be cleared too. Otherwise a single-module
+            // emission survives into the workspace pass after the
+            // import propagation that resolves the method.
+            | Diagnostic::UnknownMethod { .. }
+            | Diagnostic::PrivateMethodViolation { .. }
     )
 }
 

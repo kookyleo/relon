@@ -1,0 +1,8 @@
+// Library declares the `User` schema with a method.
+#schema User {
+    String name: *
+} with {
+    greet() -> String: f"hello ${self.name}"
+}
+
+{ kind: "user-lib" }

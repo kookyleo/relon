@@ -66,7 +66,17 @@ fn schema_known(name: &str, tree: &AnalyzedTree) -> bool {
 /// Walk `root.directives`, ingest every `#extend Name with { ... }`
 /// into `tree.schema_methods`. Must run after `collect_schemas` and
 /// `collect_root_schemas` so the in-scope schema set is fully populated.
+///
+/// When the module has any `#import` directives, an unknown schema
+/// name is *not* reported here — the workspace post-pass owns the
+/// final visibility verdict, since the target may live behind one of
+/// the imports. Single-file modules (no imports) take the strict
+/// check directly so typos still surface in offline mode.
 pub fn collect_extends(root: &Node, tree: &mut AnalyzedTree) {
+    let has_imports = root
+        .directives
+        .iter()
+        .any(|d| d.name == crate::directive_names::IMPORT);
     for dir in &root.directives {
         if dir.name != EXTEND {
             continue;
@@ -80,7 +90,7 @@ pub fn collect_extends(root: &Node, tree: &mut AnalyzedTree) {
         else {
             continue;
         };
-        if !schema_known(name, tree) {
+        if !has_imports && !schema_known(name, tree) {
             tree.diagnostics.push(Diagnostic::ExtendUnknownSchema {
                 name: name.clone(),
                 range: span_of(*name_range),

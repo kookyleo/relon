@@ -72,6 +72,51 @@ fn duplicate_method_conflict() {
 }
 
 #[test]
+fn cross_module_extend_visible_to_entry() {
+    let ws = analyze_fixture_workspace("schema_methods_xmod", "entry.relon");
+    let entry_id = ws
+        .modules
+        .keys()
+        .find(|k| k.ends_with("entry.relon"))
+        .cloned()
+        .expect("entry module present");
+    let entry_tree = ws.modules.get(&entry_id).expect("entry tree");
+    let user_methods = entry_tree
+        .schema_methods
+        .get("User")
+        .expect("User accumulated methods on entry");
+    let names: Vec<_> = user_methods.iter().map(|m| m.name.as_str()).collect();
+    assert!(
+        names.contains(&"greet"),
+        "schema's own method propagated: {names:?}"
+    );
+    assert!(
+        names.contains(&"is_admin"),
+        "#extend method propagated: {names:?}"
+    );
+    let unknown = ws
+        .modules
+        .values()
+        .flat_map(|t| t.diagnostics.iter())
+        .filter(|d| matches!(d, Diagnostic::UnknownMethod { .. }))
+        .count();
+    assert_eq!(unknown, 0);
+}
+
+#[test]
+fn self_calls_other_method_resolves() {
+    let tree = analyze_fixture("schema_methods/self_calls_other_method.relon");
+    let unknown = count(&tree.diagnostics, |d| {
+        matches!(d, Diagnostic::UnknownMethod { .. })
+    });
+    assert_eq!(unknown, 0, "{:?}", tree.diagnostics);
+    let methods = tree.schema_methods.get("Money").unwrap();
+    let names: Vec<_> = methods.iter().map(|m| m.name.as_str()).collect();
+    assert!(names.contains(&"doubled"));
+    assert!(names.contains(&"quadrupled"));
+}
+
+#[test]
 fn extend_on_builtin_string() {
     let tree = analyze_fixture("schema_methods/extend_builtin.relon");
     let methods = tree.schema_methods.get("String").expect("String extended");

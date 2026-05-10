@@ -1,0 +1,9 @@
+// Side-module that contributes an `#extend User` block. Importing it
+// should make `User.is_admin()` visible to the importer.
+#import u from "./lib_user.relon"
+
+#extend User with {
+    is_admin() -> Bool: self.name == "admin"
+}
+
+{ kind: "user-extend" }

@@ -1,0 +1,8 @@
+// Entry: imports the lib (for the schema) plus the extend module
+// (for the additional method). Both contributions should land in
+// the entry's `User` method table.
+#import * from "./lib_user.relon"
+#import * from "./lib_extend.relon"
+
+#main(User u)
+{ Bool admin: u.is_admin() }

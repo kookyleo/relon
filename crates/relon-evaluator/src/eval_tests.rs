@@ -4118,6 +4118,33 @@ fn extend_user_schema_adds_method() {
 }
 
 #[test]
+fn schema_method_calls_sibling_method_via_self() {
+    use std::collections::{BTreeMap, HashMap};
+    let source = r#"#schema Money {
+    Int cents: *
+} with {
+    doubled() -> Int: self.cents * 2
+    quadrupled() -> Int: self.doubled() * 2
+}
+#main(Money m)
+{ Int total: m.quadrupled() }"#;
+    let node = parse_doc(source);
+    let analyzed = std::sync::Arc::new(relon_analyzer::analyze(&node));
+    let mut money = BTreeMap::new();
+    money.insert("cents".to_string(), Value::Int(7));
+    let mut args: HashMap<String, Value> = HashMap::new();
+    args.insert("m".to_string(), Value::dict(money));
+    let ctx = Context::new()
+        .with_root(node.clone())
+        .with_analyzed(std::sync::Arc::clone(&analyzed));
+    let result = Evaluator::new(std::sync::Arc::new(ctx))
+        .run_main(&std::sync::Arc::new(Scope::default()), args)
+        .unwrap();
+    let Value::Dict(d) = result else { panic!() };
+    assert_eq!(d.map.get("total"), Some(&Value::Int(28))); // 7 * 2 * 2
+}
+
+#[test]
 fn schema_method_with_arg_dispatches() {
     use std::collections::{BTreeMap, HashMap};
     let source = r#"#schema Money {

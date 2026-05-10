@@ -1,0 +1,10 @@
+// One method calls another on the same schema via `self.other()`.
+#schema Money {
+    Int cents: *
+} with {
+    doubled() -> Int: self.cents * 2
+    quadrupled() -> Int: self.doubled() * 2
+}
+
+#main(Money m)
+{ Int total: m.quadrupled() }
