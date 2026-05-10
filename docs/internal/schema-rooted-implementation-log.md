@@ -157,3 +157,102 @@ detection。
 
 **回流**：否，分层 validate 是实施细节。
 
+---
+
+## C 阶段（约束模型 + auto-derive + operator lowering）
+
+### C.1：operator lowering 与原 built-in 共存
+2026-05-11 / Phase C / `crates/relon-evaluator/src/arithmetic.rs`
+
+**问题**：`==` / `<` 决策是「下沉到 schema-rooted witness」。但
+现存代码全靠 `Value PartialEq` 与 `eval_numeric_comparison` 跑——
+要把所有 primitives 也强制走 method dispatch 吗？
+
+**选择**：分层。`try_compare_op_method` 作为 fast-path：仅当
+receiver 是 *branded* 的 dict 且 schema 上确实声明了 `eq`/`lt`，
+才走 method 路径；否则 fallback 到原 built-in。
+
+**理由**：
+- 决策 18 主要解决「用户类型上的语义」——i32 / String 这些
+  primitives 的相等/比较语义是固定的，没必要绕 method dispatch
+  增加调用成本。
+- 不强制 primitives 走 method 也避免了「需要给所有内置类型
+  hardcode `eq`/`lt` 注册」的工程债，这本属于 Phase D stdlib 迁移。
+- `>` 拆成 `rhs.lt(lhs)` 而非「同时支持 lt 与 gt witness」是
+  决策 18 末尾「单 lt 覆盖两向」的直接落实，少一个 witness slot。
+
+**回流**：是。属于语言级 evaluation 语义，应折叠回主文档「operator
+lowering」一节。
+
+### C.2：scope 收口 —— Phase C 仅做 lowering
+2026-05-11 / Phase C / N/A（scope 决策）
+
+**问题**：Phase C 原计划包含 (a) operator lowering、(b) constraint
+模型登记、(c) auto-derive、(d) `#derive` witness 检查。彻底实施需要
+新建 constraint registry + 在 analyzer 验证 method 满足 witness
+形状（`eq(other: Self) -> Bool` 等）。是一气呵成还是分次落地？
+
+**选择**：本批仅落地 (a) operator lowering。constraint 模型
+登记、auto-derive、`#derive` witness 形状校验留给后续 PR。
+
+**理由**：
+- 整个 Phase C 工作量超过单批可控范围；先把 (a) 做齐让用户层
+  立刻能用 schema-rooted `==` / `<`，降低尾部风险。
+- (b)~(d) 之间有相互依赖：constraint 注册表是 (c)/(d) 的前提，
+  但 (a) 不需要它——operator lowering 通过 method 名（`eq`/`lt`）
+  驱动而非通过 trait bound，正是决策 17 选「nominal trait」时
+  避开的复杂度。
+- 无 (b)~(d) 时用户依然要手写 `eq` / `lt`；折损是没自动 derive
+  能力，而非缺失语义。这与「先稳，再扩」节奏一致。
+
+**回流**：否，路线图层面调度选择。已记录到 roadmap.md §J。
+
+---
+
+## D 阶段（register_method + stdlib 迁移）
+
+### D.1：register_method key 形状
+2026-05-11 / Phase D / `crates/relon-evaluator/src/eval.rs`
+
+**问题**：host 注册 `Money::formatted` 时，存哪？候选：
+1. 复用 `functions: HashMap<String, GatedNativeFn>`，key 为
+   `"Money.formatted"` 字符串。
+2. 新建 `native_methods: HashMap<(String, String), GatedNativeFn>`。
+
+**选择**：方案 2（新建表）。
+
+**理由**：
+- 决策 12 把 method 与 free fn 视为正交两套调度。复用同一表
+  会让 free fn `Money` 与方法 `Money.formatted` 撞一个 key
+  分隔符（'.' 还是没分隔符？），增加误解风险。
+- `(String, String)` key 直接对应 `tree.method_signatures` 的
+  分析层 key，命中查找逻辑形态一致，方便后续添加 method-only
+  能力（per-schema 计数、per-schema 反射）。
+- 性能：双 HashMap 查找比单 HashMap + 字符串拼接还快（无堆分配）。
+
+**回流**：否，runtime 内部表结构选型。
+
+### D.2：stdlib 迁移留作后续
+2026-05-11 / Phase D / N/A（scope 决策）
+
+**问题**：原计划把 36 条 stdlib intrinsic（`len`、`string.*`、
+`math.*`、`list.*` 等）从 `register_pure_fn` 全部迁到
+`register_pure_method` + 新 `std_relon/<type>.relon` schema 声明
+载体。是本批次做完吗？
+
+**选择**：仅落地 `register_method` API；stdlib 迁移留 follow-up PR。
+
+**理由**：
+- 36 条迁移本质机械重复，但每条都涉及 stdlib_signatures.rs
+  里的签名条目、analyzer-side built-in 名集、用户文档示例。
+  风险来自分布式细节（哪些当 method 哪些保留 free-fn），不
+  适合塞进同一批改动。
+- `register_fn` / `register_pure_fn` 保持兼容，现存 host 与
+  全部 test corpus 不受影响——可以平滑滚动迁移。
+- 决策 14 强调「method 是模型的中心」，但没要求 stdlib 必须
+  立刻全转过去；现有 `len(x)` 风格仍合法的「polymorphic free
+  fn」语义（决策 14 只反对 *用户定义* 的 free fn）。
+
+**回流**：是。属于 Phase 范围调整，已在 roadmap.md §J 标记
+「Phase D 收尾」未完成。
+
