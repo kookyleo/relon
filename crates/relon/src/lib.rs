@@ -659,26 +659,75 @@ mod tests {
         // through `Evaluator::run_main` with the canonical `--args`
         // documented in each file's header and compares JSON output
         // against a golden snapshot under `fixtures/golden/examples_main/`.
-        // Without this, a future edit to feature_flag.relon / pricing.relon
-        // / workflow.relon could silently change behavior without
-        // surfacing in `cargo test`.
+        //
+        // `examples/feature_flag.relon` requires a host-registered
+        // `native_hash(String) -> Int` (the example documents this in
+        // its header). This test wires a deterministic stand-in so the
+        // example actually runs; production hosts substitute siphash /
+        // blake3 / fxhash.
+        use relon_evaluator::{NativeArgs, RelonFunction};
+        use relon_parser::TokenRange;
+
+        struct StableHostHash;
+        impl RelonFunction for StableHostHash {
+            fn call(
+                &self,
+                args: NativeArgs,
+                range: TokenRange,
+            ) -> std::result::Result<Value, RuntimeError> {
+                let positional = args.into_positional();
+                if positional.len() != 1 {
+                    return Err(RuntimeError::TypeMismatch {
+                        expected: "1 argument".to_string(),
+                        found: positional.len().to_string(),
+                        range,
+                    });
+                }
+                let Value::String(s) = &positional[0] else {
+                    return Err(RuntimeError::TypeMismatch {
+                        expected: "String".to_string(),
+                        found: positional[0].type_name().to_string(),
+                        range,
+                    });
+                };
+                // Deterministic, byte-stable hash. Production hosts
+                // would swap in a real hash family; this one is good
+                // enough that the snapshot stays stable across
+                // platforms and rustc versions.
+                let mut h: i64 = 0;
+                for b in s.as_bytes() {
+                    h = h.wrapping_mul(31).wrapping_add(*b as i64);
+                }
+                Ok(Value::Int(h.wrapping_abs()))
+            }
+        }
+
+        type CtxSetup = fn(&mut Context);
+        let no_setup: CtxSetup = |_ctx: &mut Context| {};
+        let feature_flag_setup: CtxSetup = |ctx: &mut Context| {
+            ctx.register_pure_fn("native_hash", Arc::new(StableHostHash));
+        };
+
         let root = workspace_root();
-        let cases: &[(&str, &str)] = &[
+        let cases: &[(&str, &str, CtxSetup)] = &[
             (
                 "examples/feature_flag.relon",
                 r#"{"user": {"id": "alice-42", "region": "eu", "plan": "pro"}}"#,
+                feature_flag_setup,
             ),
             (
                 "examples/pricing.relon",
                 r#"{"order": {"tier": "gold", "items": [{"sku": "BOOK-01", "qty": 3, "unit_price": 100.0}, {"sku": "PEN-09", "qty": 4, "unit_price": 50.0}, {"sku": "DESK-22", "qty": 1, "unit_price": 300.0}]}}"#,
+                no_setup,
             ),
             (
                 "examples/workflow.relon",
                 r#"{"state": "placed", "event": "pay"}"#,
+                no_setup,
             ),
         ];
 
-        for (rel_path, args_json) in cases {
+        for (rel_path, args_json, setup) in cases {
             let file = root.join(rel_path);
             let content = std::fs::read_to_string(&file)
                 .unwrap_or_else(|e| panic!("{rel_path}: failed to read: {e}"));
@@ -688,9 +737,10 @@ mod tests {
             let args: std::collections::HashMap<String, Value> =
                 serde_json::from_str(args_json)
                     .unwrap_or_else(|e| panic!("{rel_path}: args json: {e}"));
-            let ctx = Context::new()
+            let mut ctx = Context::new()
                 .with_root(node)
                 .with_analyzed(Arc::clone(&analyzed));
+            setup(&mut ctx);
             let evaluator = Evaluator::new(Arc::new(ctx));
             let value = evaluator
                 .run_main(&Arc::new(Scope::default()), args)

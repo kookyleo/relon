@@ -3,7 +3,25 @@
 
   Given a user (id / region / plan) and a fixed set of rollout rules,
   produce a `{ flags: { name: bool, ... } }` dict the host can read
-  cheaply. Pure Relon — no host fns required.
+  cheaply.
+
+  ──────────────────────────────────────────────────────────────────
+  HOST INTEGRATION REQUIRED
+
+  Percentage rollouts need a real hash so the rollout fraction is
+  uniformly distributed across user ids. This example calls
+  `native_hash(s) -> Int`, which the host MUST register before
+  evaluation — e.g. with `ctx.register_pure_fn("native_hash", ...)`
+  wrapping siphash / blake3 / fxhash. The bundled `relon-cli` does
+  not register one, so running this file directly via
+  `cargo run -p relon-cli -- run examples/feature_flag.relon ...`
+  surfaces a `FunctionNotFound: native_hash` — by design. The
+  example demonstrates the **shape** of a real feature-flag wiring,
+  not a runnable shortcut.
+
+  See `crates/relon/src/lib.rs::main_entry_examples_match_canonical_outputs`
+  for a programmatic example that does register the hash.
+  ──────────────────────────────────────────────────────────────────
 
   Try:
     cargo run -q -p relon-cli -- run examples/feature_flag.relon \
@@ -18,11 +36,13 @@
 }
 #main(User user) -> Dict<String, Dict<String, Bool>>
 {
-    // Pure stand-in for a real hash. In production wire a
-    // host-registered native fn (e.g. siphash) and replace this with
-    // `hash_mod_100(s): native_hash(s) % 100`.
+    // Maps a user id to a stable bucket 0..99. Backed by a
+    // host-registered `native_hash(String) -> Int` — see the file
+    // header. The host is responsible for picking a hash family
+    // that's deterministic across runs and uniformly distributed
+    // across the input space (siphash / blake3 / fxhash all qualify).
     #private
-    hash_mod_100(s): len(s) * 2654435761 % 100,
+    hash_mod_100(s): native_hash(s) % 100,
     // Each flag returns a Bool given the User. Keeping them as
     // closures lets the rollout table below stay tabular.
     #private
