@@ -318,6 +318,7 @@ impl RelonFunction for Range {
         args: NativeArgs,
         range: relon_parser::TokenRange,
     ) -> Result<Value, RuntimeError> {
+        let caps_max = args.caps().max_value_elements();
         let args = args.into_positional();
         let (start, end) = match args.len() {
             1 => (0, expect_int(&args[0], range)?),
@@ -330,6 +331,31 @@ impl RelonFunction for Range {
                 })
             }
         };
+        // Pre-flight enforcement of `Capabilities::max_value_elements`.
+        // Without this an oversized request (`range(0, 10_000_000_000)`)
+        // would allocate the full `Vec<Value>` before the evaluator's
+        // post-call `check_value_size` ever runs — OOM-ing the host long
+        // before the cap fires. Compare the requested length (saturating
+        // to handle inverted ranges and `i64` underflow) against the cap
+        // up front and refuse early. The post-call catch-all in
+        // `Evaluator::call_function` is still the authority for the
+        // narrow `actual == limit + 1` race; this check just stops the
+        // allocator from being weaponized.
+        let requested_len = (end as i128 - start as i128).max(0) as u128;
+        if let Some(limit) = caps_max {
+            if requested_len > limit as u128 {
+                let actual = if requested_len > usize::MAX as u128 {
+                    usize::MAX
+                } else {
+                    requested_len as usize
+                };
+                return Err(RuntimeError::ValueTooLarge {
+                    limit,
+                    actual,
+                    range,
+                });
+            }
+        }
         Ok(Value::list((start..end).map(Value::Int).collect()))
     }
 }

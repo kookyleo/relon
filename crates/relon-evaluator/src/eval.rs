@@ -1767,9 +1767,21 @@ impl Evaluator {
         if let Some(name) = Self::native_function_name(path) {
             if let Some(entry) = self.context.functions.get(&name) {
                 self.check_native_fn_capability(&name, entry, range)?;
-                return entry
+                let result = entry
                     .func
-                    .call(NativeArgs::from_evaluated(args, self.caps()), range);
+                    .call(NativeArgs::from_evaluated(args, self.caps()), range)?;
+                // Catch-all enforcement of `max_value_elements` for
+                // every `List` / `Dict` produced by a native fn —
+                // covers `range`, `string.split`, `dict.merge` (free
+                // form), `_list_map` / `_list_filter`, the `iter()`
+                // family, host-registered native fns, etc., without
+                // sprinkling a per-intrinsic check. `check_value_size`
+                // only inspects the outermost container, so wrappers
+                // like the `Iter`-branded dict (`{ _kind, _source,
+                // _id }`) are sized as a 3-key dict regardless of how
+                // large `_source` is — exactly the desired semantics.
+                self.check_value_size(&result, range)?;
+                return Ok(result);
             }
         }
         // Schema-rooted Phase B: dispatch `value.method(...)` and
@@ -2013,7 +2025,17 @@ impl Evaluator {
         if let Some(self_val) = receiver {
             native.positional.insert(0, self_val);
         }
-        Ok(Some(entry.func.call(native, range)?))
+        let result = entry.func.call(native, range)?;
+        // Catch-all enforcement of `max_value_elements` for the
+        // receiver-side method dispatch path (`xs.map(...)`,
+        // `d.merge(other)`, `s.split(...)`, …). Mirrors the post-call
+        // check in `call_function`. `check_value_size` looks at the
+        // outermost container only, so wrapper dicts like the
+        // `Iter`-branded `{ _kind, _source, _id }` produced by
+        // `xs.iter()` are sized as a 3-key dict — they don't trip the
+        // cap based on the wrapped `_source`'s element count.
+        self.check_value_size(&result, range)?;
+        Ok(Some(result))
     }
 
     /// Decision 21 (Iterable lowering): turn an arbitrary iterable
@@ -2575,6 +2597,10 @@ impl NativeFnCaps for EvaluatorCaps {
         let evaluated_args = args.into_iter().map(EvaluatedArg::positional).collect();
         let scope = Arc::clone(evaluator.empty_scope());
         evaluator.call_function_by_value(func.clone(), evaluated_args, &scope, range)
+    }
+
+    fn max_value_elements(&self) -> Option<usize> {
+        self.context.capabilities.max_value_elements
     }
 }
 

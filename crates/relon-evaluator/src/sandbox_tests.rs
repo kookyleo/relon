@@ -178,10 +178,13 @@ fn max_steps_does_not_fire_under_limit() {
 
 #[test]
 fn max_value_elements_rejects_oversized_list() {
-    // The watermark fires at evaluator-side construction sites
-    // (literal lists, dict-merge, list-comprehension). Stdlib-built
-    // values like `range(...)` aren't gated — by design, since the
-    // host owns those caps. Cover the literal-list path here.
+    // The watermark fires at every language-level constructor:
+    // literal lists, dict `+` merge, list-comprehension, and every
+    // stdlib intrinsic that returns a `List` / `Dict` (covered by
+    // the catch-all in `Evaluator::call_function` /
+    // `try_call_native_method`). Cover the literal-list path here;
+    // the stdlib-intrinsic cases live in their own dedicated tests
+    // below (see `max_value_elements_rejects_range_preflight` etc.).
     let mut ctx = Context::sandboxed();
     ctx.capabilities.max_value_elements = Some(3);
     let result = eval_with(ctx, r#"{ "big": [1, 2, 3, 4, 5] }"#);
@@ -213,6 +216,236 @@ fn max_value_elements_rejects_oversized_dict() {
             })
         ),
         "expected ValueTooLarge, got {result:?}"
+    );
+}
+
+#[test]
+fn max_value_elements_rejects_range_preflight() {
+    // `range(0, N)` with N far above any plausible host RAM must be
+    // refused *before* it allocates the underlying `Vec<Value>`. The
+    // pre-flight check inside `Range::call` consults
+    // `NativeFnCaps::max_value_elements()` and bails on
+    // `end - start > cap`. Without it, asking for 10M elements with
+    // cap=3 would burn 10M * sizeof(Value) bytes before the post-call
+    // `check_value_size` ever ran — a real OOM vector on small hosts.
+    // We pick 10_000_000 (not the brief's 10G) so a regression here is
+    // visible as a noticeable slowdown / RSS spike on every CI run
+    // rather than a hard-kill, while still being unambiguously larger
+    // than what the post-call check would let through "for free."
+    let mut ctx = Context::sandboxed();
+    ctx.capabilities.max_value_elements = Some(3);
+    let result = eval_with(ctx, r#"{ x: len(range(0, 10000000)) }"#);
+    assert!(
+        matches!(
+            result,
+            Err(RuntimeError::ValueTooLarge {
+                limit: 3,
+                actual: 10_000_000,
+                ..
+            })
+        ),
+        "expected ValueTooLarge, got {result:?}"
+    );
+}
+
+#[test]
+fn max_value_elements_rejects_list_map_result() {
+    // `_list_map` is the underscore intrinsic that backs both
+    // `list.map(xs, f)` (via the `std/list` virtual module) and
+    // `xs.map(f)` (via `register_pure_method("List", "map", ...)`).
+    // Both shapes ultimately funnel through `call_function` /
+    // `try_call_native_method`, so the catch-all `check_value_size`
+    // there is the only enforcement point. Using the underscore form
+    // here avoids the `#import` boilerplate while exercising the same
+    // dispatch path.
+    //
+    // Positive baseline: input and output both at cap → success.
+    let mut ctx = Context::sandboxed();
+    ctx.capabilities.max_value_elements = Some(3);
+    let result = eval_with(ctx, r#"{ xs: _list_map(range(0, 3), (x) => x * 2) }"#);
+    assert!(result.is_ok(), "expected success at cap=3, got {result:?}");
+
+    // Negative: input of 4 trips the cap. The check fires somewhere on
+    // the construction chain (range pre-flight, or the map result) —
+    // we only care that the system refuses to bind an oversized list.
+    let mut ctx = Context::sandboxed();
+    ctx.capabilities.max_value_elements = Some(3);
+    let result = eval_with(ctx, r#"{ xs: _list_map(range(0, 4), (x) => x * 2) }"#);
+    assert!(
+        matches!(result, Err(RuntimeError::ValueTooLarge { limit: 3, .. })),
+        "expected ValueTooLarge with limit=3, got {result:?}"
+    );
+}
+
+#[test]
+fn max_value_elements_rejects_list_filter_result() {
+    // `_list_filter` is the same dispatch path as `_list_map`. Even
+    // when the filter throws away elements, the *input* list still
+    // has to be built first — and the catch-all guards every native-fn
+    // return value. We exercise the positive path (input + result both
+    // fit) and a negative path where the input exceeds the cap, which
+    // is rejected at the list-literal construction site.
+    let mut ctx = Context::sandboxed();
+    ctx.capabilities.max_value_elements = Some(5);
+    let result = eval_with(ctx, r#"{ ys: _list_filter(range(0, 5), (x) => x > 0) }"#);
+    assert!(result.is_ok(), "expected success at cap=5, got {result:?}");
+
+    let mut ctx = Context::sandboxed();
+    ctx.capabilities.max_value_elements = Some(4);
+    let result = eval_with(ctx, r#"{ ys: _list_filter(range(0, 5), (x) => x > 0) }"#);
+    assert!(
+        matches!(result, Err(RuntimeError::ValueTooLarge { limit: 4, .. })),
+        "expected ValueTooLarge with limit=4, got {result:?}"
+    );
+}
+
+#[test]
+fn max_value_elements_rejects_string_split_result() {
+    // `_string_split` returns `List<String>`. The catch-all post-call
+    // check on `call_function` is the only enforcement point for the
+    // result — the input string itself has no element-count semantics
+    // under `max_value_elements`. Splitting a 5-piece string under
+    // cap=3 must reject with `actual=5`.
+    let mut ctx = Context::sandboxed();
+    ctx.capabilities.max_value_elements = Some(3);
+    let result = eval_with(ctx, r#"{ parts: _string_split("a,b,c,d,e", ",") }"#);
+    assert!(
+        matches!(
+            result,
+            Err(RuntimeError::ValueTooLarge {
+                limit: 3,
+                actual: 5,
+                ..
+            })
+        ),
+        "expected ValueTooLarge, got {result:?}"
+    );
+
+    // Positive baseline: cap=5 lets the same call through.
+    let mut ctx = Context::sandboxed();
+    ctx.capabilities.max_value_elements = Some(5);
+    let result = eval_with(ctx, r#"{ parts: _string_split("a,b,c,d,e", ",") }"#);
+    assert!(result.is_ok(), "expected success at cap=5, got {result:?}");
+}
+
+#[test]
+fn max_value_elements_rejects_dict_merge_method_result() {
+    // `_dict_merge` is the underscore intrinsic that services both the
+    // `dict.merge(a, b)` free-form (via `std/dict`) and the `d.merge(b)`
+    // receiver form (via `register_pure_method("Dict", "merge", ...)`).
+    // Both routes funnel through `call_function` /
+    // `try_call_native_method`, distinct from the `Dict + Dict`
+    // binary-op path (which has its own enforcement site in
+    // `arithmetic.rs`). Two 2-key dicts merged into a 4-key result must
+    // reject under cap=3.
+    let mut ctx = Context::sandboxed();
+    ctx.capabilities.max_value_elements = Some(3);
+    let result = eval_with(
+        ctx,
+        r#"{
+    a: { p: 1, q: 2 },
+    b: { r: 3, s: 4 },
+    m: _dict_merge(&sibling.a, &sibling.b)
+}"#,
+    );
+    assert!(
+        matches!(
+            result,
+            Err(RuntimeError::ValueTooLarge {
+                limit: 3,
+                actual: 4,
+                ..
+            })
+        ),
+        "expected ValueTooLarge, got {result:?}"
+    );
+
+    // Positive baseline: under cap=4 the same merge passes.
+    let mut ctx = Context::sandboxed();
+    ctx.capabilities.max_value_elements = Some(4);
+    let result = eval_with(
+        ctx,
+        r#"{
+    a: { p: 1, q: 2 },
+    b: { r: 3, s: 4 },
+    m: _dict_merge(&sibling.a, &sibling.b)
+}"#,
+    );
+    assert!(result.is_ok(), "expected success at cap=4, got {result:?}");
+}
+
+#[test]
+fn max_value_elements_allows_within_budget_intrinsics() {
+    // Positive coverage for the catch-all: each stdlib intrinsic that
+    // produces a List/Dict must still succeed when the result fits the
+    // cap. Guards against the catch-all going over-eager and rejecting
+    // results whose size is exactly at the limit. We pick a top-level
+    // dict with 4 keys (≤ cap=5) so the outermost literal also passes.
+    let mut ctx = Context::sandboxed();
+    ctx.capabilities.max_value_elements = Some(5);
+    let result = eval_with(
+        ctx,
+        r#"{
+    r: range(0, 5),
+    mapped: _list_map(range(0, 3), (x) => x * 10),
+    filtered: _list_filter(range(0, 5), (x) => x > 0),
+    split: _string_split("a,b,c,d,e", ",")
+}"#,
+    );
+    assert!(
+        result.is_ok(),
+        "intrinsics producing at-cap-sized results must pass, got {result:?}"
+    );
+}
+
+#[test]
+fn max_value_elements_rejects_receiver_method_intrinsic() {
+    // The catch-all in `try_call_native_method` (the receiver-side
+    // dispatch path) must also enforce `max_value_elements`. This
+    // route is taken by `xs.map(f)` / `d.merge(other)` /
+    // `s.split(sep)` etc. once the analyzer has resolved the schema
+    // tag on the receiver — distinct from the free-form route in
+    // `call_function`. We require an `AnalyzedTree` for receiver-side
+    // dispatch to fire, so wire it up explicitly.
+    //
+    // Negative shape: a 5-element source mapped under cap=4. The
+    // refusal can fire at either site — the literal / `range`
+    // pre-flight or the post-call check on the map result — but the
+    // sandbox guarantee is "no `List` larger than cap ever escapes,"
+    // so any `ValueTooLarge { limit: 4 }` counts as the cap holding.
+    let src = r#"{
+    xs: range(0, 5),
+    ys: xs.map((x) => x * 2)
+}"#;
+    let node = relon_parser::parse_document(src).expect("parse");
+    let analyzed = relon_analyzer::analyze(&node);
+    let mut ctx = Context::sandboxed();
+    ctx.capabilities.max_value_elements = Some(4);
+    let ctx = ctx.with_root(node).with_analyzed(Arc::new(analyzed));
+    let ctx = std::sync::Arc::new(ctx);
+    let result = Evaluator::new(std::sync::Arc::clone(&ctx)).eval_root(&Arc::new(Scope::default()));
+    assert!(
+        matches!(result, Err(RuntimeError::ValueTooLarge { limit: 4, .. })),
+        "expected ValueTooLarge at receiver path, got {result:?}"
+    );
+
+    // Positive baseline at cap=5: `range(0, 5).map(...)` stays within
+    // budget. Both the range pre-flight and the receiver-side post-call
+    // check must let it through.
+    let src = r#"{
+    xs: range(0, 5),
+    ys: xs.map((x) => x * 2)
+}"#;
+    let node = relon_parser::parse_document(src).expect("parse");
+    let analyzed = relon_analyzer::analyze(&node);
+    let mut ctx = Context::sandboxed();
+    ctx.capabilities.max_value_elements = Some(5);
+    let ctx = ctx.with_root(node).with_analyzed(Arc::new(analyzed));
+    let ctx = std::sync::Arc::new(ctx);
+    let result = Evaluator::new(std::sync::Arc::clone(&ctx)).eval_root(&Arc::new(Scope::default()));
+    assert!(
+        result.is_ok(),
+        "expected receiver-side success at cap=5, got {result:?}"
     );
 }
 

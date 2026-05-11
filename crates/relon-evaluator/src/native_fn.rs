@@ -37,6 +37,24 @@ pub trait NativeFnCaps: Send + Sync {
         args: Vec<Value>,
         range: TokenRange,
     ) -> Result<Value, RuntimeError>;
+
+    /// Expose `Capabilities::max_value_elements` to native functions
+    /// so collection-building intrinsics (`range`, future bulk
+    /// constructors) can pre-flight oversized requests before
+    /// allocating. Returning `None` means the host imposes no cap on
+    /// `List` / `Dict` element counts.
+    ///
+    /// The evaluator still runs a post-call `check_value_size` on
+    /// every `List` / `Dict` produced by a native fn (catch-all in
+    /// `call_function` / `try_call_native_method`), so an intrinsic
+    /// that ignores this hint is still bounded — but allocating
+    /// `Vec::with_capacity(end - start)` first would OOM the host
+    /// before the post-call check fires. Intrinsics that build a
+    /// collection whose size is known up-front from their arguments
+    /// should consult this and reject early.
+    fn max_value_elements(&self) -> Option<usize> {
+        None
+    }
 }
 
 /// Argument bundle handed to a [`RelonFunction`]. Positional and named
