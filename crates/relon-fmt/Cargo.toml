@@ -6,6 +6,6 @@ license.workspace = true
 description = "Formatter and syntax checker for Relon files"
 
 [dependencies]
-clap = { version = "4.4", features = ["derive"] }
+clap = { workspace = true, features = ["derive"] }
 relon-parser = { path = "../relon-parser" }
 thiserror = { workspace = true }

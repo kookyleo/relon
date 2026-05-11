@@ -13,7 +13,7 @@ ordered-float.workspace = true
 # `Value::List(Arc<Vec<Value>>)` and `Value::Dict(Arc<ValueDict>)` can
 # auto-derive the trait. Removing it requires hand-rolled impls — keep
 # the feature on as long as Value carries Arc'd payloads.
-serde = { version = "1.0", features = ["derive", "rc"] }
-serde_json = "1.0"
+serde = { workspace = true, features = ["derive", "rc"] }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
-miette = { version = "7.6.0", features = ["derive"] }
+miette = { workspace = true, features = ["derive"] }
