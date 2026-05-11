@@ -1900,6 +1900,96 @@ impl Evaluator {
         .map(Some)
     }
 
+    /// Phase C (Indexable lowering, decision 22): dispatch `a[i]` on a
+    /// branded value whose schema derives `Indexable` (witness
+    /// `index(key: K) -> Optional<V>`). Returns:
+    ///
+    ///   * `Ok(Some(value))` — the receiver has an `index` method
+    ///     (user body or host-registered native); we dispatched it and
+    ///     unwrapped the returned `Optional<V>` per the dynamic key's
+    ///     `?` flag:
+    ///       - `Some { value: v }` → `v`.
+    ///       - `None` → `Value::Null` when `is_optional`; otherwise a
+    ///         `VariableNotFound` matching the built-in dict / list
+    ///         miss diagnostic.
+    ///       - Anything else (non-Option-shaped return) is surfaced
+    ///         as-is; the user's witness signature is the contract.
+    ///   * `Ok(None)` — no `index` method registered for this value's
+    ///     schema tag. Caller falls back to its built-in dict / list
+    ///     lookup so plain `dict["foo"]` / `list[0]` keep working.
+    ///   * `Err(_)` — the dispatch fired but evaluating the body or
+    ///     a sub-step failed.
+    ///
+    /// `display_name` is used only for the not-found diagnostic when an
+    /// `index()` call returns `Option.None` without the `?` flag — it
+    /// mirrors the `VariableNotFound` text that the surrounding caller
+    /// would have produced via plain key miss.
+    pub(crate) fn try_index_method(
+        &self,
+        receiver: &Value,
+        key_value: Value,
+        is_optional: bool,
+        display_name: &str,
+        scope: &Arc<Scope>,
+        range: TokenRange,
+    ) -> Result<Option<Value>, RuntimeError> {
+        let Some(schema_name) = value_schema_tag(receiver) else {
+            return Ok(None);
+        };
+        let Some(analyzed) = self.context.analyzed.as_ref() else {
+            return Ok(None);
+        };
+        let has_method = analyzed
+            .schema_methods
+            .get(&schema_name)
+            .map(|methods| methods.iter().any(|m| m.name == "index"))
+            .unwrap_or(false);
+        let has_native = self
+            .context
+            .native_methods
+            .contains_key(&(schema_name.clone(), "index".to_string()));
+        if !has_method && !has_native {
+            return Ok(None);
+        }
+        let args = vec![EvaluatedArg::positional(key_value)];
+        // Host-registered native impl wins when both exist (mirrors
+        // `try_call_schema_method`'s receiver-side native check).
+        let raw = if has_native {
+            self.try_call_native_method(
+                &schema_name,
+                "index",
+                Some(receiver.clone()),
+                &args,
+                range,
+            )?
+            .expect("native method existence checked above")
+        } else {
+            let methods = analyzed.schema_methods.get(&schema_name).unwrap();
+            let method = methods.iter().find(|m| m.name == "index").unwrap();
+            if let Some(body) = method.body_node.as_ref() {
+                self.invoke_method_body(
+                    body,
+                    Some(receiver.clone()),
+                    &method.params,
+                    &args,
+                    scope,
+                    range,
+                )?
+            } else {
+                // Method recorded without a body (e.g. `#native`
+                // declaration whose host registration is missing).
+                // Fall through so the caller's diagnostic wins.
+                return Ok(None);
+            }
+        };
+        Ok(Some(unwrap_optional_for_index(
+            raw,
+            is_optional,
+            display_name,
+            range,
+        )?))
+    }
+
     /// Phase D: dispatch through a host-registered native method.
     /// Returns `Ok(None)` when no entry matches `(schema, method)`.
     /// `receiver` is prepended to the positional args when present
@@ -2532,6 +2622,55 @@ fn value_schema_tag(v: &Value) -> Option<String> {
         Value::Closure { .. } | Value::Schema { .. } | Value::EnumSchema { .. } => None,
         Value::Type(_) | Value::Wildcard => None,
     }
+}
+
+/// Phase C (Indexable lowering, decision 22): unwrap the `Optional<V>`
+/// returned by a witness `index(key) -> Optional<V>` body into the
+/// shape the surrounding `a[i]` / `a[i]?` site expects.
+///
+/// The shape is `variant_dict(map, "Some" | "None", "Option")` — built
+/// by the prelude's `Option<T>` enum schema and the stdlib's
+/// [`option_value`] constructor. Wrapped success returns the inner
+/// `value`; a `None` result either becomes `Value::Null` (when the
+/// caller used `a[i]?`) or surfaces as `VariableNotFound` (matching the
+/// existing dict / list miss diagnostic for `a[i]` without `?`).
+///
+/// Non-Option-shaped returns pass through verbatim: the analyzer's
+/// constraint-witness shape check (`constraints.rs::Indexable` →
+/// `return_type: "Optional"`) already gates source-level
+/// `#derive Indexable` to `index() -> Optional<...>`, so reaching this
+/// helper with a non-Option value implies a host-registered native
+/// method that bypassed the source-side check — surfacing it as-is is
+/// the only safe move (we don't have the original type to coerce
+/// against).
+pub(crate) fn unwrap_optional_for_index(
+    raw: Value,
+    is_optional: bool,
+    display_name: &str,
+    range: TokenRange,
+) -> Result<Value, RuntimeError> {
+    if let Value::Dict(d) = &raw {
+        if d.variant_of.as_deref() == Some("Option") {
+            match d.brand.as_deref() {
+                Some("Some") => {
+                    return Ok(d.map.get("value").cloned().unwrap_or(Value::Null));
+                }
+                Some("None") => {
+                    return if is_optional {
+                        Ok(Value::Null)
+                    } else {
+                        Err(RuntimeError::VariableNotFound(
+                            display_name.to_string(),
+                            range,
+                        ))
+                    };
+                }
+                _ => {}
+            }
+        }
+    }
+    // Non-Option return: pass through. See doc-comment rationale.
+    Ok(raw)
 }
 
 /// True when `node` carries the `#private` directive. See

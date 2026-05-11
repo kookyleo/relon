@@ -87,4 +87,18 @@ mod tests {
             panic!()
         }
     }
+
+    #[test]
+    fn test_optional_bracket() {
+        let mut s = Span::new("a?[0]");
+        let node = parse_var(&mut s).unwrap();
+        let Expr::Variable(path) = *node.expr else {
+            panic!("not a variable")
+        };
+        assert_eq!(path.len(), 2);
+        let TokenKey::Dynamic(_, opt) = &path[1] else {
+            panic!("expected Dynamic, got {:?}", path[1]);
+        };
+        assert!(opt, "expected optional flag on dynamic key");
+    }
 }

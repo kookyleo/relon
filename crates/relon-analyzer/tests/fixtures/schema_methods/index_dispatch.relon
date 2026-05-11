@@ -1,0 +1,17 @@
+// Decision 22 (Indexable lowering): `a[i]` on a branded value with a
+// derived `index() -> Optional<V>` witness desugars to a method call.
+// The fixture's `Bag.index` returns `Option.Some { value: ... }` for
+// in-range keys and `Option.None { }` otherwise; the analyzer's
+// witness-shape check should accept it and populate
+// `schema_methods["Bag"]` with the method.
+#schema Bag {
+    List<Int> items: *
+} with {
+    #derive Indexable
+    index(key: Int) -> Option<Int>:
+        key >= 0 && key < len(self.items)
+            ? Option.Some { value: self.items[key] }
+            : Option.None { }
+}
+
+{ Bag b: { items: [10, 20, 30] } }

@@ -259,6 +259,33 @@ fn derive_addable_with_wrong_shape_diagnoses() {
     );
 }
 
+#[test]
+fn derive_indexable_with_matching_shape_populates_method_table() {
+    // Decision 22 (Indexable lowering): the source-level `#derive
+    // Indexable` + `index(key: K) -> Option<V>` witness should pass
+    // the shape check and land in `schema_methods["Bag"]` so the
+    // evaluator can dispatch `bag[i]` against it.
+    let tree = analyze_fixture("schema_methods/index_dispatch.relon");
+    let bad = count(&tree.diagnostics, |d| {
+        matches!(d, Diagnostic::ConstraintWitnessShapeMismatch { .. })
+    });
+    assert_eq!(bad, 0, "{:?}", tree.diagnostics);
+    let methods = tree
+        .schema_methods
+        .get("Bag")
+        .expect("Bag should have a method table entry");
+    let index_method = methods
+        .iter()
+        .find(|m| m.name == "index")
+        .expect("Bag.index should be registered");
+    assert!(index_method.body_node.is_some(), "Bag.index expects a body");
+    assert_eq!(
+        index_method.params.len(),
+        1,
+        "Bag.index expects one param (`key`)"
+    );
+}
+
 // ===================================================================
 // Phase C.4: auto-derive Equatable / JsonProjectable.
 // ===================================================================

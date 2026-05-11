@@ -76,23 +76,87 @@ impl Evaluator {
         let mut parts = vec![first_name.clone()];
         for part in &path[1..] {
             let is_optional = part.is_optional();
-            let key = match part {
-                TokenKey::Dynamic(expr_node, _) => {
-                    let val = self.eval(expr_node, scope)?;
-                    match val {
-                        Value::String(s) => s,
-                        Value::Int(i) => i.to_string(),
-                        other => {
-                            return Err(RuntimeError::TypeMismatch {
-                                expected: "String or Int for dynamic key".to_string(),
-                                found: other.type_name().to_string(),
-                                range: expr_node.range,
-                            })
+            // Decision 22 (Indexable lowering): when this segment is a
+            // bracket access (`a[i]`) and the current value's schema
+            // declares an `index()` witness, dispatch the method
+            // *before* falling through to the structural Dict/List
+            // lookup. The display path used for the not-found
+            // diagnostic mirrors the structural-miss text shape
+            // (`parts.join(".")` with `<dynamic>` as the segment
+            // placeholder).
+            if let TokenKey::Dynamic(expr_node, _) = part {
+                let key_value = self.eval(expr_node, scope)?;
+                let mut tentative_display = parts.clone();
+                tentative_display.push("<dynamic>".to_string());
+                let display_name = tentative_display.join(".");
+                if let Some(result) = self.try_index_method(
+                    &current_val,
+                    key_value.clone(),
+                    is_optional,
+                    &display_name,
+                    scope,
+                    range,
+                )? {
+                    parts.push("<dynamic>".to_string());
+                    current_val = result;
+                    continue;
+                }
+                // No witness — coerce the evaluated key into the
+                // String / Int form the structural fallback expects.
+                let key = match key_value {
+                    Value::String(s) => s,
+                    Value::Int(i) => i.to_string(),
+                    other => {
+                        return Err(RuntimeError::TypeMismatch {
+                            expected: "String or Int for dynamic key".to_string(),
+                            found: other.type_name().to_string(),
+                            range: expr_node.range,
+                        })
+                    }
+                };
+                parts.push(key.clone());
+                let display_name = parts.join(".");
+                match current_val {
+                    Value::Dict(ref d) => {
+                        if let Some(val) = d.map.get(&key) {
+                            current_val = val.clone();
+                        } else if is_optional {
+                            return Ok(Value::Null);
+                        } else {
+                            return Err(RuntimeError::VariableNotFound(display_name, range));
                         }
                     }
+                    Value::List(ref list) => {
+                        let idx = key
+                            .parse::<usize>()
+                            .map_err(|_| RuntimeError::TypeMismatch {
+                                expected: "Index".to_string(),
+                                found: "String".to_string(),
+                                range,
+                            })?;
+                        if let Some(val) = list.get(idx) {
+                            current_val = val.clone();
+                        } else if is_optional {
+                            return Ok(Value::Null);
+                        } else {
+                            return Err(RuntimeError::VariableNotFound(display_name, range));
+                        }
+                    }
+                    Value::Null if is_optional => return Ok(Value::Null),
+                    _ => {
+                        if is_optional {
+                            return Ok(Value::Null);
+                        }
+                        return Err(RuntimeError::TypeMismatch {
+                            expected: "Dict/List".to_string(),
+                            found: current_val.type_name().to_string(),
+                            range,
+                        });
+                    }
                 }
-                _ => part.to_string_key(),
-            };
+                continue;
+            }
+            let key = part.to_string_key();
             parts.push(key.clone());
             let display_name = parts.join(".");
 
@@ -746,26 +810,89 @@ impl Evaluator {
     ) -> Result<Value, RuntimeError> {
         for part in path {
             let is_optional = part.is_optional();
+            // Decision 22 (Indexable lowering): bracket-access segments
+            // dispatch through the receiver's `index()` witness when
+            // its schema declares one, before the structural Dict /
+            // List fallback below kicks in.
+            if let TokenKey::Dynamic(expr_node, _) = part {
+                let key_value = self.eval(expr_node, scope)?;
+                if let Some(result) = self.try_index_method(
+                    &current_val,
+                    key_value.clone(),
+                    is_optional,
+                    display_path,
+                    scope,
+                    range,
+                )? {
+                    current_val = result;
+                    if current_val == Value::Null && is_optional {
+                        return Ok(Value::Null);
+                    }
+                    continue;
+                }
+                // No witness — fall through to the structural lookup
+                // by coercing the key into a String / Int.
+                let key = match key_value {
+                    Value::String(s) => s,
+                    Value::Int(i) => i.to_string(),
+                    other => {
+                        return Err(RuntimeError::TypeMismatch {
+                            expected: "String or Int for dynamic key".to_string(),
+                            found: other.type_name().to_string(),
+                            range: expr_node.range,
+                        })
+                    }
+                };
+                current_val = match current_val {
+                    Value::Dict(ref d) => {
+                        if let Some(v) = d.map.get(&key) {
+                            v.clone()
+                        } else if is_optional {
+                            Value::Null
+                        } else {
+                            return Err(RuntimeError::VariableNotFound(
+                                display_path.to_string(),
+                                range,
+                            ));
+                        }
+                    }
+                    Value::List(list) => {
+                        let index = key.parse::<usize>().map_err(|_| {
+                            RuntimeError::VariableNotFound(display_path.to_string(), range)
+                        })?;
+                        if let Some(v) = list.get(index) {
+                            v.clone()
+                        } else if is_optional {
+                            Value::Null
+                        } else {
+                            return Err(RuntimeError::VariableNotFound(
+                                display_path.to_string(),
+                                range,
+                            ));
+                        }
+                    }
+                    Value::Null if is_optional => Value::Null,
+                    other => {
+                        if is_optional {
+                            Value::Null
+                        } else {
+                            return Err(RuntimeError::TypeMismatch {
+                                expected: "Dict/List".to_string(),
+                                found: other.type_name().to_string(),
+                                range,
+                            });
+                        }
+                    }
+                };
+                if current_val == Value::Null && is_optional {
+                    return Ok(Value::Null);
+                }
+                continue;
+            }
             // Fix 2: dynamic segments must be evaluated against the live
             // scope; falling back to `part.name()` would silently look up
             // the literal string `"<dynamic>"`.
-            let key = match part {
-                TokenKey::Dynamic(expr_node, _) => {
-                    let val = self.eval(expr_node, scope)?;
-                    match val {
-                        Value::String(s) => s,
-                        Value::Int(i) => i.to_string(),
-                        other => {
-                            return Err(RuntimeError::TypeMismatch {
-                                expected: "String or Int for dynamic key".to_string(),
-                                found: other.type_name().to_string(),
-                                range: expr_node.range,
-                            })
-                        }
-                    }
-                }
-                _ => part.name(),
-            };
+            let key = part.name();
 
             current_val = match current_val {
                 Value::Dict(ref d) => {

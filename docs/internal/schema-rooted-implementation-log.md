@@ -784,3 +784,110 @@ schema-level `parse_generic_param_list` helper；analyzer
 generics；载体即真签名」。stdlib_signatures.rs 的注释「The carrier
 here is just the dispatch shell」也已经在 list.relon 里替换为
 「The carrier is the single source of truth」。
+
+### C.13：Indexable lowering（`a[i]` → `a.index(i)`）
+2026-05-11 / Phase C / `crates/relon-parser/src/expr.rs`
++ `crates/relon-analyzer/src/constraints.rs`
++ `crates/relon-evaluator/src/eval.rs` + `reference.rs`
+
+**问题**：决策 22 要求 `a[i]` 在 receiver schema 派生 `Indexable` 时
+desugar 到 `a.index(i)` 调用，witness 形状 `index(key: K) -> Option<V>`。
+constraint 注册表的 shape 校验已经登记，但「bracket 后跟方法分派 +
+Optional 透明解包」这条 evaluator 通路一直空缺。
+
+**IR 选择**：保留现有 `Expr::Variable(Vec<TokenKey>)` + `TokenKey::Dynamic(expr, opt)` 形态，**不**引入新的 `Expr::IndexAccess` variant。
+理由：
+- parser 早就把 `a[i]` / `a?[i]` 解析成 `Variable(vec![..., Dynamic])`，
+  evaluator 端只需要在 dispatch 时增加一层 schema-method 兜底；新建
+  variant 会让 `resolve_variable` / `lookup_value_path` / dict
+  reference 路径都要各自学认两种节点形态，回报甚低。
+- 「a[i] 是带 dynamic key 的路径访问」的语义本来就一致，分支只在
+  「访问目标是 branded value + schema 有 index 方法」这一点收窄。
+- 同样的好处：未来如果想给 `a?[i]` 的 `?` 走 path-tail Optional 通路
+  统一解包，IR 不需要再拆一次。
+
+**dispatch 通路**：新增 `Evaluator::try_index_method(receiver,
+key_value, is_optional, display, scope, range)`，封装：
+1. 用 `value_schema_tag` 抽 receiver 的 schema 标签。
+2. 查 `analyzed.schema_methods[&schema][index]`，或
+   `context.native_methods[(schema, "index")]`。两表都空 →
+   `Ok(None)`，由 caller 落回内建 Dict/List 的结构性查找。
+3. 命中后调 method body（`invoke_method_body`，receiver 进 `self`）或
+   native impl（`try_call_native_method`）。
+4. 通过 free 函数 `unwrap_optional_for_index` 统一解 Optional 包。
+
+调用点三处：
+- `reference.rs::resolve_variable`：`a[i]` 在 root 是 local 变量的场景；
+- `reference.rs::lookup_value_path`：`&this.bag[i]` / `&prev.x[i]` /
+  函数返回值后接 `[i]` 的场景；
+- 注：`eval_reference_path_from` 的 `Expr::Dict` / `Expr::List` 两条
+  AST-walk 分支不引入分派——它们处理的是**字面量** AST，brand 信息
+  要等 thunk 物化后才存在；物化后的值最终都会经过
+  `lookup_value_path`，那里已经接好。
+
+**Optional 解包协议**：witness 返回 `Option.Some { value: v } |
+Option.None {}`（prelude 的 `Option` enum schema 形状，`variant_dict
+brand=Some/None, variant_of=Option`）。`unwrap_optional_for_index`
+按下列规则解包：
+- `Some { value }` → 取 `value` 字段返回；
+- `None`：若 caller 段是 `?[i]`（is_optional=true）→ `Value::Null`；
+  否则 → `VariableNotFound(display, range)`（和内建 dict-miss /
+  list-miss 一致的错误形态）；
+- 非 Option-shape 的返回 → 原样穿透。analyzer 的 witness shape
+  校验已经把源代码侧的 `#derive Indexable` 锁到 `-> Option<...>`，所以
+  非 Option 出现意味着 host 注册的 native method 绕开了源代码侧
+  形状校验——此时穿透是唯一安全选择。
+
+**和现有 `?` 协议的对接**：路径段的 `?` 在 Relon 里是**前缀**形式
+（`?.field` / `?[expr]`），不是后缀（任务描述里写的 `a[i]?` 实为
+笔误，确认与 path-tail `?.field` 保持一致 = `a?[i]` 前缀）。
+是不变量：`TokenKey::Dynamic(expr, is_optional)` 的 `is_optional`
+原本就映射 `?[` 前缀；evaluator dispatch 时直接读这个 bit。
+
+**parser 微调**：`parse_type_expr` 之前对单段标识符 `xs?` 太贪——
+`xs?[0]` 整体被吃成 `Type(xs?)` + 残留的 `[0]`，让上层
+`parse_var` 永远拿不到。修正：当 `t.is_optional && t.generics.is_empty()
+&& t.path.len() == 1` 且后续 char 是 `[` 时，让 `parse_type_expr`
+回滚，把控制权交给 `parse_var` 走 `Variable + Dynamic`。改动局限
+于一处布尔卫语句，对 `Int?` / `List<T>?` / 复合路径 `a.b?` 这些
+合法 type 形态无影响。
+
+**constraint 注册表 shape 校验微调**：注册表本体「不动」（per
+任务约束），但 shape 校验的**比对逻辑**做了两处放宽：
+- `param_type_matches`：`expected.type_name == "Any"` 视作通配。
+  注册表里 Indexable.key 用 `"Any"` 当 stand-in（注释明确说是
+  placeholder，generic K 还没参与），不放宽就永远拒掉用户的
+  `index(key: Int)` 这种具体类型。
+- `return_type_matches`：`"Optional"` 兼容 head `"Optional"` 与
+  `"Option"`。prelude 把运行期 enum schema 注册成 `Option`，让
+  用户写 `-> Option<V>`（短名，和代码库其它地方一致）也能过
+  shape 校验。
+
+**测试**：4 个新测试 + 1 个 fixture。
+- analyzer 端 `derive_indexable_with_matching_shape_populates_method_table`：
+  fixture `schema_methods/index_dispatch.relon`（`Bag` schema +
+  `index(key: Int) -> Option<Int>` 三段式 ternary 体），验证零
+  `ConstraintWitnessShapeMismatch` + `schema_methods["Bag"]` 含
+  `index` method。
+- evaluator 端 `indexable_lowering_dispatches_through_index_method`：
+  端到端跑 `bag[0]` / `bag[1]`（命中 Some）/ `bag?[99]`（命中
+  None，`?` 解包成 Null）。
+- evaluator 端 `indexable_lowering_missing_key_without_question_mark_errors`：
+  `bag[99]`（无 `?`）走 None → `RuntimeError::VariableNotFound`。
+- evaluator 端 `builtin_dict_and_list_indexing_still_works_without_witness`：
+  回归测试，`{ d: {...}, xs: [...], d["b"], xs[2] }` 无 schema-method
+  注册时落回内建结构性查找。
+- parser 端 `test_optional_bracket`：直接对 `parse_var` 跑 `a?[0]`，
+  锁定 `Dynamic(opt=true)` 的解码不再因 `parse_type_expr` 抢跑而退化。
+
+**未决问题**：witness `index(key: K)` 里 generic `K` 的类型推断还没
+做——目前 shape 校验把 `K` 等价为「Any」，evaluator dispatch 时
+把用户传进来的 key 原样喂给 method body。当用户写 `bag["abc"]` 而
+witness 声明 `index(key: Int)` 时，本应在 typecheck 早期报错，但
+当前只会在 method body 里运行时崩。这条挂在 follow-up「constraint
+generic unification」里，IR 选择没有挡道。
+
+**回流**：是。`constraints.rs` 模块顶注释「Indexable lowering not
+yet hooked up」可以划掉。decision 22 在主文档里关于「a[i]? 后缀」的
+描述应澄清为「`?[i]` 前缀，与 path-tail `?.field` 一致」——避免再
+有 follow-up agent 误读。

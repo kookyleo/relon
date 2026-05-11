@@ -5472,3 +5472,133 @@ fn iter_next_on_dict_yields_key_sorted_entries() {
     assert_eq!(read_some_pair("second"), ("b".to_string(), 2));
     assert_none("third");
 }
+
+/// Decision 22 (Indexable lowering): `a[i]` on a branded value whose
+/// schema derives `Indexable` and supplies an `index(key) -> Option<V>`
+/// body desugars to a `.index(i)` method call. The evaluator unwraps
+/// the returned `Option`: a `Some { value }` becomes the inner value;
+/// a `None` becomes `Null` when the access used `a[i]?`, or surfaces
+/// a `VariableNotFound` when it didn't.
+///
+/// Covers all three legs of the Optional protocol — Some payload,
+/// `?`-unwrapped None, and (separately) the no-`?` None error.
+#[test]
+fn indexable_lowering_dispatches_through_index_method() {
+    use std::collections::HashMap;
+    // Optional-bracket syntax is the *prefix* `?[expr]` form, mirroring
+    // the path-tail prefix `?.field` convention. The witness's
+    // `Option.None` becomes `Value::Null` at this site; without the `?`
+    // it would surface as `VariableNotFound` (covered in the
+    // companion test below).
+    let source = r#"#schema Bag {
+    List<Int> items: *
+} with {
+    #derive Indexable
+    index(key: Int) -> Option<Int>:
+        key >= 0 && key < len(self.items)
+            ? Option.Some { value: self.items[key] }
+            : Option.None { }
+}
+#main(Bag bag)
+{
+    first: bag[0],
+    second: bag[1],
+    missing: bag?[99]
+}"#;
+    let node = parse_doc(source);
+    let analyzed = std::sync::Arc::new(relon_analyzer::analyze(&node));
+    let errors: Vec<_> = analyzed
+        .diagnostics
+        .iter()
+        .filter(|d| d.severity() == relon_analyzer::Severity::Error)
+        .collect();
+    assert!(errors.is_empty(), "analyzer errors: {:?}", errors);
+    let mut bag_map = std::collections::BTreeMap::new();
+    bag_map.insert(
+        "items".to_string(),
+        Value::list(vec![Value::Int(10), Value::Int(20), Value::Int(30)]),
+    );
+    let mut args: HashMap<String, Value> = HashMap::new();
+    args.insert(
+        "bag".to_string(),
+        Value::branded_dict(bag_map, Some("Bag".to_string())),
+    );
+    let ctx = Context::new()
+        .with_root(node.clone())
+        .with_analyzed(std::sync::Arc::clone(&analyzed));
+    let result = Evaluator::new(std::sync::Arc::new(ctx))
+        .run_main(&std::sync::Arc::new(Scope::default()), args)
+        .unwrap();
+    let Value::Dict(d) = result else { panic!() };
+    assert_eq!(d.map.get("first"), Some(&Value::Int(10)));
+    assert_eq!(d.map.get("second"), Some(&Value::Int(20)));
+    // `a[i]?` on an out-of-range key flows the witness's
+    // `Option.None` through the Optional-unwrap protocol and lands as
+    // `Null` at the call site.
+    assert_eq!(d.map.get("missing"), Some(&Value::Null));
+}
+
+/// Decision 22: `a[i]` without the `?` flag on a missing key (witness
+/// returns `Option.None`) raises `VariableNotFound`, mirroring the
+/// built-in dict-key miss behaviour. Distinct test so the success
+/// case above doesn't have to mix Ok-paths with error paths.
+#[test]
+fn indexable_lowering_missing_key_without_question_mark_errors() {
+    use std::collections::HashMap;
+    let source = r#"#schema Bag {
+    List<Int> items: *
+} with {
+    #derive Indexable
+    index(key: Int) -> Option<Int>:
+        key >= 0 && key < len(self.items)
+            ? Option.Some { value: self.items[key] }
+            : Option.None { }
+}
+#main(Bag bag)
+{ Int v: bag[99] }"#;
+    let node = parse_doc(source);
+    let analyzed = std::sync::Arc::new(relon_analyzer::analyze(&node));
+    let mut bag_map = std::collections::BTreeMap::new();
+    bag_map.insert("items".to_string(), Value::list(vec![Value::Int(1)]));
+    let mut args: HashMap<String, Value> = HashMap::new();
+    args.insert(
+        "bag".to_string(),
+        Value::branded_dict(bag_map, Some("Bag".to_string())),
+    );
+    let ctx = Context::new()
+        .with_root(node.clone())
+        .with_analyzed(std::sync::Arc::clone(&analyzed));
+    let err = Evaluator::new(std::sync::Arc::new(ctx))
+        .run_main(&std::sync::Arc::new(Scope::default()), args)
+        .unwrap_err();
+    // Either VariableNotFound (Indexable-dispatched None without ?) or
+    // a TypeMismatch from a downstream schema check; the witness-
+    // dispatch path returns VariableNotFound and that's what should
+    // propagate. Pin it strictly.
+    assert!(
+        matches!(err, RuntimeError::VariableNotFound(_, _)),
+        "expected VariableNotFound from `bag[99]` (no ?), got {:?}",
+        err
+    );
+}
+
+/// Decision 22 regression: built-in `dict["foo"]` / `list[0]` paths
+/// must keep working unchanged when no `index()` witness is in scope.
+/// The analyzer registers `schema_methods["Dict"]` / `["List"]` only
+/// when a user `#extend`s them with `index`, so the dispatch helper's
+/// "no witness" arm should fall through to the structural lookup.
+#[test]
+fn builtin_dict_and_list_indexing_still_works_without_witness() {
+    let result = eval_doc(
+        r#"{
+            d: { a: 1, b: 2 },
+            xs: [10, 20, 30],
+            from_dict: d["b"],
+            from_list: xs[2]
+        }"#,
+    )
+    .unwrap();
+    let Value::Dict(d) = result else { panic!() };
+    assert_eq!(d.map.get("from_dict"), Some(&Value::Int(2)));
+    assert_eq!(d.map.get("from_list"), Some(&Value::Int(30)));
+}

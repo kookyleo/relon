@@ -381,6 +381,25 @@ fn parse_type_expr<'a>(input: &mut Span<'a>) -> ModalResult<Node> {
         ));
     }
 
+    // Decision 22 (Indexable lowering): when the parsed "type" is a
+    // bare identifier marked optional (`xs?`) and the next character
+    // is `[`, this is actually a variable with an optional bracket
+    // access (`xs?[expr]`), not an `xs`-typed-optional value. Hand it
+    // back to the grammar so `parse_var` can pick it up. We only do
+    // this for single-segment paths with no generics — `List<Int>?`
+    // followed by `[` is genuinely a type expression (the `[...]`
+    // would belong to a surrounding list / index site, not the type).
+    if t.is_optional
+        && t.generics.is_empty()
+        && t.path.len() == 1
+        && input.as_ref().starts_with('[')
+    {
+        input.reset(&checkpoint);
+        return Err(winnow::error::ErrMode::Backtrack(
+            winnow::error::ContextError::default(),
+        ));
+    }
+
     if !t.generics.is_empty()
         || t.is_optional
         || (t.path.len() == 1

@@ -26,10 +26,20 @@
 //!    `to_json`) onto each user schema that hasn't opted out and
 //!    doesn't already provide a user method of that name.
 //!
-//! Constraints that need lowering for `()`/index/call/numeric
-//! operators (Iterable / Indexable / Callable / Number) are not yet
-//! registered here — they require evaluator-side work that is out of
-//! scope for the C.3-C.5 batch and will be filled in later.
+//! Constraints with operator lowering wire in two halves:
+//!   * the *shape check* (parameter / return type witness signature),
+//!     registered in [`CONSTRAINTS`] below;
+//!   * the *dispatch hook* (operator evaluator looking up the witness
+//!     method and calling it on a branded receiver), implemented in
+//!     the evaluator (`arithmetic.rs::try_arith_op_method`,
+//!     `eval.rs::try_index_method`, …).
+//!
+//! Iterable / Callable still only have the shape check — their
+//! dispatch hooks (`for x in c` → `c.iter()` + `it.next()`, and the
+//! Callable equivalent) are deferred. Indexable lowering (`a[i]`
+//! → `a.index(i)`, §C.13) is fully wired through both halves; Number
+//! family (Addable / Subtractable / Multiplicable / Divisible /
+//! Modable) is wired through `try_arith_op_method`.
 
 use crate::diagnostic::{span_of, Diagnostic};
 use crate::schema::{SchemaMethodInfo, SchemaMethodParamInfo};
@@ -115,12 +125,14 @@ pub(crate) const CONSTRAINTS: &[ExpectedWitness] = &[
         // unification is deferred to lowering time.
         return_type: "Iter",
     },
-    // Indexable: `a[i]` desugars to `a.index(i)`. Witness signature
-    // is parameterized — `index(key: K) -> Optional<V>` — and the
-    // ExpectedParam table can only encode single-segment names, so
-    // the param type is left as a stand-in (`Any` is wrong; we use
-    // the constraint-internal placeholder `Key`). The lowering pass
-    // will eventually do proper generic unification.
+    // Indexable: `a[i]` desugars to `a.index(i)` and the evaluator
+    // unwraps the returned `Option<V>` per the dynamic key's `?`
+    // flag (§C.13). Witness signature is parameterized —
+    // `index(key: K) -> Option<V>` — and the ExpectedParam table can
+    // only encode single-segment names, so `key`'s expected type is
+    // left as the stand-in `"Any"` which `param_type_matches` treats
+    // as wildcard. Full generic unification across `K` / `V` is the
+    // open follow-up (constraint generic typecheck pass).
     ExpectedWitness {
         constraint: "Indexable",
         method: "index",
@@ -184,9 +196,10 @@ pub(crate) const CONSTRAINTS: &[ExpectedWitness] = &[
     },
 ];
 
-/// Look up a constraint by name. Returns `None` for names that aren't
-/// registered yet (Iterable / Indexable / Callable / Number per the
-/// module-level note).
+/// Look up a constraint by name. Returns `None` for constraint names
+/// that aren't registered (e.g. `Callable`, whose witness shape table
+/// still lives in the deferred-lowering pile — see the module-level
+/// note for which dispatchers are wired).
 fn lookup_constraint(name: &str) -> Option<&'static ExpectedWitness> {
     CONSTRAINTS.iter().find(|c| c.constraint == name)
 }
@@ -239,6 +252,14 @@ fn type_matches_named(actual: &TypeNode, name: &str) -> bool {
 }
 
 /// Decide whether `actual_param.type_node` matches `expected.type_name`.
+///
+/// Special case: `expected.type_name == "Any"` is a stand-in for
+/// witness params whose concrete type isn't expressible in the
+/// flat `ExpectedParam` table (decision 22's `Indexable.index(key: K)`
+/// — the key type is a per-schema generic that lowering will unify
+/// later). Treating `"Any"` as wildcard here lets the shape check
+/// accept any user-declared param type for those slots while still
+/// pinning the param *name* and *arity*.
 fn param_type_matches(
     expected: &ExpectedParam,
     actual: &SchemaMethodParamInfo,
@@ -246,6 +267,8 @@ fn param_type_matches(
 ) -> bool {
     if expected.type_name == "Self" {
         type_matches_self_or_schema(&actual.type_node, schema)
+    } else if expected.type_name == "Any" {
+        true
     } else {
         type_matches_named(&actual.type_node, expected.type_name)
     }
@@ -275,7 +298,21 @@ fn return_type_matches(actual: &TypeNode, expected_return: &str, schema: &str) -
         return type_matches_self_or_schema(actual, schema);
     }
     if is_generic_head_constraint_return(expected_return) {
-        return !actual.is_optional && actual.path.len() == 1 && actual.path[0] == expected_return;
+        if actual.is_optional || actual.path.len() != 1 {
+            return false;
+        }
+        let head = &actual.path[0];
+        // Decision 22 (Indexable lowering): the constraint registry
+        // records the witness return head as `"Optional"`, but the
+        // prelude exposes the runtime enum schema under the shorter
+        // name `Option`. Accept either spelling here so users can
+        // write `-> Option<V>` (the canonical, shorter form used by
+        // the rest of the codebase) and still satisfy the witness
+        // shape check.
+        if expected_return == "Optional" {
+            return head == "Optional" || head == "Option";
+        }
+        return head == expected_return;
     }
     type_matches_named(actual, expected_return)
 }
