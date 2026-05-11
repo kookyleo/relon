@@ -83,6 +83,29 @@ pub trait NativeFnCaps: Send + Sync {
     fn iter_cursor_fetch_and_inc(&self, _iter_id: u64, _len: usize) -> Option<usize> {
         None
     }
+
+    /// Advance the step counter by `n` and bail with
+    /// [`RuntimeError::StepLimitExceeded`] if the new count would exceed
+    /// `max_steps`. Native fns with internal loops (`range`,
+    /// `list.map / filter / reduce`, `string.split / replace`,
+    /// `dict.merge`, ...) call this once per inner iteration so a
+    /// million-element pipeline can't hide behind a single AST-node
+    /// step.
+    ///
+    /// Behaviour:
+    /// * `max_steps == None` → no-op (`Ok(())`), no allocation, no
+    ///   lock — the default impl below mirrors that for hosts that
+    ///   build a custom [`NativeFnCaps`].
+    /// * `max_steps == Some(limit)` → `fetch_add(n)` on the same
+    ///   atomic counter `eval_internal` increments; if the new value
+    ///   crosses the limit, return `StepLimitExceeded { limit, range }`.
+    ///
+    /// `range` should pin the call-site span of the intrinsic so the
+    /// resulting diagnostic points at the same node the AST-level step
+    /// check would have flagged.
+    fn tick(&self, _n: u64, _range: TokenRange) -> Result<(), RuntimeError> {
+        Ok(())
+    }
 }
 
 /// Argument bundle handed to a [`RelonFunction`]. Positional and named

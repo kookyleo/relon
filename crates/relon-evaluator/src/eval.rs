@@ -2697,6 +2697,26 @@ impl NativeFnCaps for EvaluatorCaps {
     fn iter_cursor_fetch_and_inc(&self, iter_id: u64, len: usize) -> Option<usize> {
         self.context.iter_cursor_fetch_and_inc(iter_id, len)
     }
+
+    /// Charge `n` against the same `step_counter` the AST-node loop in
+    /// `eval_internal` increments. Single source of truth — no parallel
+    /// counter, no separate cap. Hot-path shape: `fetch_add` first, post-
+    /// check second, mirroring `eval_internal` near `eval.rs:870`.
+    fn tick(&self, n: u64, range: TokenRange) -> Result<(), RuntimeError> {
+        let Some(limit) = self.context.capabilities.max_steps else {
+            return Ok(());
+        };
+        let prev = self.context.step_counter.fetch_add(n, Ordering::Relaxed);
+        // `prev` is the count *before* this tick. Trip the gate as soon
+        // as the post-tick value exceeds the limit — matches the per-
+        // AST-node check's "prev >= limit ⇒ fail" shape (both bail when
+        // the budget is fully consumed, with a one-step grace at the
+        // boundary inherited from the existing check).
+        if prev.saturating_add(n) > limit {
+            return Err(RuntimeError::StepLimitExceeded { limit, range });
+        }
+        Ok(())
+    }
 }
 
 pub(crate) fn decorator_name(dec: &DecoratorNode) -> String {

@@ -177,6 +177,87 @@ fn max_steps_does_not_fire_under_limit() {
 }
 
 #[test]
+fn max_steps_aborts_long_list_map() {
+    // Without per-iteration ticking, `_list_map` over a 1000-element
+    // input would register as a single AST step and slip past a
+    // generous-looking `max_steps = 100` budget. With `NativeFnCaps::tick`
+    // wired into the intrinsic's inner loop, the budget reflects the
+    // real per-element work and aborts before the map drains.
+    let mut ctx = Context::sandboxed();
+    ctx.capabilities.max_steps = Some(100);
+    let src = r#"{ xs: _list_map(range(0, 1000), (x) => x) }"#;
+    let result = eval_with(ctx, src);
+    assert!(
+        matches!(
+            result,
+            Err(RuntimeError::StepLimitExceeded { limit: 100, .. })
+        ),
+        "expected StepLimitExceeded(limit=100) from ticked list_map, got {result:?}"
+    );
+}
+
+#[test]
+fn max_steps_aborts_range_collection() {
+    // `range(0, N)` had a pre-flight against `max_value_elements`, but
+    // that left the door open for hosts that prefer to bound work via
+    // the step budget instead. With the tick pre-charge, a 10_000-element
+    // range under `max_steps = 100` (and `max_value_elements = None`,
+    // so the element cap can't claim the kill) fails on the step gate.
+    let mut ctx = Context::sandboxed();
+    ctx.capabilities.max_steps = Some(100);
+    ctx.capabilities.max_value_elements = None;
+    let result = eval_with(ctx, r#"{ n: len(range(0, 10000)) }"#);
+    assert!(
+        matches!(
+            result,
+            Err(RuntimeError::StepLimitExceeded { limit: 100, .. })
+        ),
+        "expected StepLimitExceeded from range tick, got {result:?}"
+    );
+}
+
+#[test]
+fn max_steps_allows_short_pipeline_under_budget() {
+    // Positive case: small inputs with a generous budget complete.
+    // Guards against the tick being too eager — the per-element charge
+    // should leave plenty of headroom for sub-thousand-step pipelines.
+    let mut ctx = Context::sandboxed();
+    ctx.capabilities.max_steps = Some(1000);
+    let result =
+        eval_with(ctx, r#"{ ys: _list_map(range(0, 10), (x) => x * 2) }"#).expect("succeeds");
+    let Value::Dict(d) = result else {
+        panic!("expected dict")
+    };
+    let Some(Value::List(ys)) = d.map.get("ys") else {
+        panic!("expected ys list")
+    };
+    assert_eq!(ys.len(), 10);
+}
+
+#[test]
+fn max_steps_ticked_intrinsic_attributes_span() {
+    // The diagnostic must pin the offending intrinsic call's span so
+    // a host renderer can underline the right token. We feed a script
+    // where the only step-budget killer is the inner `_list_map`, then
+    // assert the resulting `StepLimitExceeded.range` covers that call
+    // (i.e. its byte slice in the source contains `_list_map`).
+    let mut ctx = Context::sandboxed();
+    ctx.capabilities.max_steps = Some(50);
+    let src = r#"{ xs: _list_map(range(0, 500), (x) => x) }"#;
+    let result = eval_with(ctx, src);
+    let Err(RuntimeError::StepLimitExceeded { range, .. }) = result else {
+        panic!("expected StepLimitExceeded, got {result:?}");
+    };
+    let start = range.start.offset;
+    let end = range.end.offset;
+    let slice = &src[start..end.min(src.len())];
+    assert!(
+        slice.contains("_list_map") || slice.contains("range"),
+        "expected span to cover the ticked intrinsic call, got `{slice}` (range={start}..{end})"
+    );
+}
+
+#[test]
 fn max_value_elements_rejects_oversized_list() {
     // The watermark fires at every language-level constructor:
     // literal lists, dict `+` merge, list-comprehension, and every

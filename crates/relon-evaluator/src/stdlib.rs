@@ -153,6 +153,9 @@ impl RelonFunction for ListMap {
         let caps = args.caps();
         let mut results = Vec::with_capacity(list.len());
         for item in list {
+            // Tick once per scanned element so `max_steps` reflects the
+            // real per-iteration work, not just the single AST call.
+            caps.tick(1, range)?;
             results.push(caps.call_relon(func, vec![item.clone()], range)?);
         }
         Ok(Value::list(results))
@@ -172,6 +175,7 @@ impl RelonFunction for ListFilter {
         let caps = args.caps();
         let mut results = Vec::new();
         for item in list {
+            caps.tick(1, range)?;
             if caps
                 .call_relon(func, vec![item.clone()], range)?
                 .is_truthy()
@@ -196,6 +200,7 @@ impl RelonFunction for ListReduce {
         let func = &args.positional[2];
         let caps = args.caps();
         for item in list {
+            caps.tick(1, range)?;
             acc = caps.call_relon(func, vec![acc, item.clone()], range)?;
         }
         Ok(acc)
@@ -316,19 +321,39 @@ impl RelonFunction for Range {
         args: NativeArgs,
         range: relon_parser::TokenRange,
     ) -> Result<Value, RuntimeError> {
-        let caps_max = args.caps().max_value_elements();
-        let args = args.into_positional();
-        let (start, end) = match args.len() {
-            1 => (0, expect_int(&args[0], range)?),
-            2 => (expect_int(&args[0], range)?, expect_int(&args[1], range)?),
+        let caps_handle = args.caps();
+        let caps_max = caps_handle.max_value_elements();
+        let positional = args.positional.clone();
+        let (start, end) = match positional.len() {
+            1 => (0, expect_int(&positional[0], range)?),
+            2 => (
+                expect_int(&positional[0], range)?,
+                expect_int(&positional[1], range)?,
+            ),
             _ => {
                 return Err(RuntimeError::TypeMismatch {
                     expected: "1 or 2 arguments".to_string(),
-                    found: format!("{}", args.len()),
+                    found: format!("{}", positional.len()),
                     range,
                 })
             }
         };
+        let requested_len = (end as i128 - start as i128).max(0) as u128;
+        // Step-budget pre-flight: charge the full requested length
+        // *before* allocating. Complements `max_value_elements` —
+        // a host that leaves `max_value_elements = None` but sets
+        // `max_steps = Some(1_000)` still refuses `range(0, 10M)`
+        // because the tick budget exhausts before we ever reach the
+        // `Vec<Value>::with_capacity` call inside `collect`. Cheap
+        // path: `tick` is a no-op when `max_steps` is None.
+        if requested_len > 0 {
+            let ticks = if requested_len > u64::MAX as u128 {
+                u64::MAX
+            } else {
+                requested_len as u64
+            };
+            caps_handle.tick(ticks, range)?;
+        }
         // Pre-flight enforcement of `Capabilities::max_value_elements`.
         // Without this an oversized request (`range(0, 10_000_000_000)`)
         // would allocate the full `Vec<Value>` before the evaluator's
@@ -339,7 +364,6 @@ impl RelonFunction for Range {
         // `Evaluator::call_function` is still the authority for the
         // narrow `actual == limit + 1` race; this check just stops the
         // allocator from being weaponized.
-        let requested_len = (end as i128 - start as i128).max(0) as u128;
         if let Some(limit) = caps_max {
             if requested_len > limit as u128 {
                 let actual = if requested_len > usize::MAX as u128 {
@@ -663,7 +687,8 @@ impl RelonFunction for StringSplit {
         args: NativeArgs,
         range: relon_parser::TokenRange,
     ) -> Result<Value, RuntimeError> {
-        let args = args.into_positional();
+        let caps = args.caps();
+        let args = args.positional.clone();
         expect_arg_count(&args, 2, range)?;
         let input = expect_string(&args[0], range)?;
         let separator = expect_string(&args[1], range)?;
@@ -673,12 +698,15 @@ impl RelonFunction for StringSplit {
                 range,
             ));
         }
-        Ok(Value::list(
-            input
-                .split(separator)
-                .map(|part| Value::String(part.to_string()))
-                .collect(),
-        ))
+        // Build the result piece-by-piece so we can tick once per
+        // emitted output. Mirrors `_string_split`'s shape (returns the
+        // same `List<String>`) but routes through the step budget.
+        let mut parts = Vec::new();
+        for part in input.split(separator) {
+            caps.tick(1, range)?;
+            parts.push(Value::String(part.to_string()));
+        }
+        Ok(Value::list(parts))
     }
 }
 
@@ -689,12 +717,14 @@ impl RelonFunction for StringJoin {
         args: NativeArgs,
         range: relon_parser::TokenRange,
     ) -> Result<Value, RuntimeError> {
-        let args = args.into_positional();
+        let caps = args.caps();
+        let args = args.positional.clone();
         expect_arg_count(&args, 2, range)?;
         let values = expect_list(&args[0], range)?;
         let separator = expect_string(&args[1], range)?;
         let mut parts = Vec::with_capacity(values.len());
         for value in values {
+            caps.tick(1, range)?;
             parts.push(format!("{}", value));
         }
         Ok(Value::String(parts.join(separator)))
@@ -708,12 +738,25 @@ impl RelonFunction for StringReplace {
         args: NativeArgs,
         range: relon_parser::TokenRange,
     ) -> Result<Value, RuntimeError> {
-        let args = args.into_positional();
+        let caps = args.caps();
+        let args = args.positional.clone();
         expect_arg_count(&args, 3, range)?;
-        Ok(Value::String(expect_string(&args[0], range)?.replace(
-            expect_string(&args[1], range)?,
-            expect_string(&args[2], range)?,
-        )))
+        let input = expect_string(&args[0], range)?;
+        let from = expect_string(&args[1], range)?;
+        let to = expect_string(&args[2], range)?;
+        // Charge one tick per replacement found. Empty `from` would
+        // make `String::replace` insert `to` at every boundary
+        // (codepoint count + 1); we tick by that count too so the
+        // budget reflects the actual edit work.
+        let occurrences = if from.is_empty() {
+            input.chars().count() + 1
+        } else {
+            input.matches(from).count()
+        };
+        if occurrences > 0 {
+            caps.tick(occurrences as u64, range)?;
+        }
+        Ok(Value::String(input.replace(from, to)))
     }
 }
 
@@ -769,7 +812,8 @@ impl RelonFunction for DictMerge {
         args: NativeArgs,
         range: relon_parser::TokenRange,
     ) -> Result<Value, RuntimeError> {
-        let args = args.into_positional();
+        let caps = args.caps();
+        let args = args.positional.clone();
         if args.is_empty() {
             return Err(RuntimeError::TypeMismatch {
                 expected: "at least 1 argument".to_string(),
@@ -779,6 +823,16 @@ impl RelonFunction for DictMerge {
         }
         let mut result = args[0].clone();
         for patch in args.iter().skip(1) {
+            // Charge one tick per top-level key in the patch. Nested
+            // dict merges recurse inside `deep_merge`, but the top-level
+            // key count is a fair proxy for the work this merge does
+            // at this level — large flat patches now cost proportional
+            // budget.
+            if let Value::Dict(d) = patch {
+                if !d.map.is_empty() {
+                    caps.tick(d.map.len() as u64, range)?;
+                }
+            }
             result.deep_merge(patch);
         }
         if matches!(result, Value::Dict(_)) {
@@ -800,13 +854,16 @@ impl RelonFunction for DictKeys {
         args: NativeArgs,
         range: relon_parser::TokenRange,
     ) -> Result<Value, RuntimeError> {
-        let args = args.into_positional();
+        let caps = args.caps();
+        let args = args.positional.clone();
         expect_arg_count(&args, 1, range)?;
-        let mut keys = expect_dict(&args[0], range)?
-            .map
-            .keys()
-            .cloned()
-            .collect::<Vec<_>>();
+        let map = &expect_dict(&args[0], range)?.map;
+        // Charge for every scanned entry — keys() iterates the whole
+        // BTreeMap and sorts it, so the per-entry cost is real.
+        if !map.is_empty() {
+            caps.tick(map.len() as u64, range)?;
+        }
+        let mut keys = map.keys().cloned().collect::<Vec<_>>();
         keys.sort();
         Ok(Value::list(keys.into_iter().map(Value::String).collect()))
     }
@@ -819,9 +876,13 @@ impl RelonFunction for DictValues {
         args: NativeArgs,
         range: relon_parser::TokenRange,
     ) -> Result<Value, RuntimeError> {
-        let args = args.into_positional();
+        let caps = args.caps();
+        let args = args.positional.clone();
         expect_arg_count(&args, 1, range)?;
         let dict = expect_dict(&args[0], range)?;
+        if !dict.map.is_empty() {
+            caps.tick(dict.map.len() as u64, range)?;
+        }
         let mut keys = dict.map.keys().cloned().collect::<Vec<_>>();
         keys.sort();
         Ok(Value::list(
@@ -1119,11 +1180,21 @@ impl RelonFunction for ListContains {
         args: NativeArgs,
         range: relon_parser::TokenRange,
     ) -> Result<Value, RuntimeError> {
-        let args = args.into_positional();
+        let caps = args.caps();
+        let args = args.positional.clone();
         expect_arg_count(&args, 2, range)?;
-        Ok(Value::Bool(
-            expect_list(&args[0], range)?.contains(&args[1]),
-        ))
+        let list = expect_list(&args[0], range)?;
+        // Tick per scanned element. Early-return on match is fine —
+        // we still charge for the elements actually compared, so a hit
+        // near the front stays cheap.
+        let needle = &args[1];
+        for item in list {
+            caps.tick(1, range)?;
+            if item == needle {
+                return Ok(Value::Bool(true));
+            }
+        }
+        Ok(Value::Bool(false))
     }
 }
 
