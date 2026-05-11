@@ -546,3 +546,80 @@ fn pure_fn_passes_under_full_sandbox() {
     };
     assert_eq!(d.map.get("x"), Some(&Value::Int(42)));
 }
+
+/// Cross-check that every `#native` method slot declared in the
+/// analyzer-side `core/*.relon` carriers has a matching runtime
+/// registration in `stdlib::register_to`. Decision 21' (carrier model)
+/// notes this risk: a `#native` slot added to `core/list.relon` without
+/// the corresponding `register_pure_method("List", "...", ...)` in the
+/// evaluator looks fine at analysis (dispatch resolves to a slot) but
+/// surfaces as `FunctionNotFound` at evaluation. Pinning the invariant
+/// at test time turns the silent drift into a noisy CI failure.
+///
+/// We accumulate every missing pair before panicking so one fix per
+/// drift covers the full delta — no whack-a-mole round trips.
+///
+/// Only the forward direction is asserted (`core/*.relon` ⇒ stdlib).
+/// The reverse direction (stdlib ⇒ core/*.relon) is intentionally
+/// skipped: `register_pure_method` also services internal aliases
+/// (e.g. `String.len` shares the polymorphic `Len` intrinsic) where the
+/// runtime table is the source of truth and the carrier's `#native`
+/// slot is the one that documents the API. Asserting reverse would
+/// false-flag these legitimate registrations.
+#[test]
+fn core_relon_native_slots_match_stdlib_registration() {
+    // Empty root is fine — `analyze` injects the core carriers regardless.
+    let node = parse_document("{}").expect("parse empty doc");
+    let tree = relon_analyzer::analyze(&node);
+
+    let ctx = Context::new();
+
+    let mut missing: Vec<(String, String)> = Vec::new();
+    for (schema_name, methods) in tree.schema_methods.iter() {
+        for method in methods {
+            if !method.is_native {
+                continue;
+            }
+            let key = (schema_name.clone(), method.name.clone());
+            if !ctx.native_methods.contains_key(&key) {
+                missing.push(key);
+            }
+        }
+    }
+
+    if !missing.is_empty() {
+        let listing = missing
+            .iter()
+            .map(|(s, m)| format!("  - ({s}, {m})"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        panic!(
+            "core/*.relon declares `#native` method(s) without a matching \
+             register_pure_method registration in stdlib::register_to:\n{listing}\n\n\
+             Adding a `#native` slot in core/*.relon without the matching runtime \
+             registration causes FunctionNotFound at evaluation time. Wire the new \
+             method through stdlib::register_to so dispatch can land on a real \
+             RelonFunction impl."
+        );
+    }
+
+    // Defensive lower bound: the four built-in carriers (`String`,
+    // `List`, `Dict`, `Iter`) collectively declare ~20 native slots
+    // today. If the carrier loader silently fails to install any of
+    // them, `missing.is_empty()` would still hold (empty universe ⇒
+    // vacuous truth), so assert we actually saw a non-trivial number
+    // of forward-checked pairs. The bound is loose enough that adding
+    // new methods doesn't flake; it just catches the "loader silently
+    // returned nothing" regression.
+    let checked = tree
+        .schema_methods
+        .values()
+        .flat_map(|v| v.iter())
+        .filter(|m| m.is_native)
+        .count();
+    assert!(
+        checked >= 15,
+        "expected at least 15 #native slots from core/*.relon carriers, \
+         saw {checked} — has inject_core_schemas regressed?"
+    );
+}
