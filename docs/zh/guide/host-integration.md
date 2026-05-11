@@ -349,7 +349,7 @@ ctx.module_resolvers = vec![
 ];
 ```
 
-`with_root_dir` 会把 root 路径 canonicalize，并在每次 import 时确认目标路径在 root 下面（包括防止符号链接逃逸）——细节见 [沙箱与权限](./sandbox.md#filesystemmoduleresolverwith_root_dir-的行为)。
+`with_root_dir` 会把 root 路径 canonicalize，并在每次 import 时确认目标路径在 root 下面（包括防止符号链接逃逸）——细节见 [沙箱与权限](./sandbox.md#filesystemmoduleresolver-的行为)。
 
 要插入自定义 resolver（比如「从内存读」「从 OCI registry 读」），实现 `ModuleResolver` trait 然后：
 
