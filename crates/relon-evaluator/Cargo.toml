@@ -21,3 +21,6 @@ serde = { workspace = true, features = ["derive", "rc"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 miette = { workspace = true, features = ["derive"] }
+
+[dev-dependencies]
+proptest = { workspace = true }

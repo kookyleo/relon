@@ -22,6 +22,7 @@ serde = "1.0"
 serde_json = "1.0"
 clap = "4.4"
 anyhow = "1.0"
+proptest = "1"
 
 # Internal crates declared with both `path` and `version` so each can
 # be published to crates.io independently while local builds keep
