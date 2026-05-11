@@ -55,6 +55,34 @@ pub trait NativeFnCaps: Send + Sync {
     fn max_value_elements(&self) -> Option<usize> {
         None
     }
+
+    /// Mint a fresh `Iter` cursor id under the originating Context.
+    /// Used by `List.iter()` / `String.iter()` / `Dict.iter()` (and
+    /// any future user-side `Iterable` constructor that wants to
+    /// participate in `Iter.next()` cursor tracking) to stamp the
+    /// `_id` field of the resulting `Iter`-branded dict. Returns
+    /// `0` from the default impl so a non-Context-backed `caps`
+    /// (e.g. in unit tests) still produces a sane id; production
+    /// evaluation overrides this on the per-Context impl.
+    fn next_iter_id(&self) -> u64 {
+        0
+    }
+
+    /// Atomic read-check-increment of the cursor associated with
+    /// `iter_id`. Returns `Some(old_cursor)` when the cursor was
+    /// strictly less than `len` (and the cursor is post-incremented
+    /// in the same critical section), or `None` when the cursor has
+    /// reached `len` **or** the id is unknown to this Context.
+    ///
+    /// The "unknown id ⇒ `None`" branch is the cross-Context
+    /// isolation policy: an `Iter` value built in Context A and then
+    /// handed to Context B looks exhausted from B's perspective.
+    /// Implementations should preserve this — silently auto-inserting
+    /// a fresh cursor for an unknown id would re-introduce ambient
+    /// state across Context boundaries.
+    fn iter_cursor_fetch_and_inc(&self, _iter_id: u64, _len: usize) -> Option<usize> {
+        None
+    }
 }
 
 /// Argument bundle handed to a [`RelonFunction`]. Positional and named

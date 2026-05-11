@@ -620,6 +620,273 @@ fn test_parameterized_schema() {
     }
 }
 
+/// Per-Context isolation of the `Iter` cursor table. Two independent
+/// `Context`s drive their own iterator past the first element; the
+/// second context's iterator must not advance based on the first
+/// context's calls. Concretely: each first call should return index
+/// 0 and each second call should return index 1 — the shared-global
+/// cursor table that lived in `stdlib.rs` would have produced
+/// 0,1,2,3 if both Contexts wrote into one place.
+#[test]
+fn iter_cursor_state_is_isolated_between_contexts() {
+    use std::collections::HashMap;
+    let source = r#"#main(List<Int> xs)
+{
+    "it": xs.iter(),
+    "first": it.next(),
+    "second": it.next()
+}"#;
+    let node = relon_parser::parse_document(source).expect("parse");
+    let analyzed = std::sync::Arc::new(relon_analyzer::analyze(&node));
+    let make_args = || {
+        let mut args: HashMap<String, Value> = HashMap::new();
+        args.insert(
+            "xs".to_string(),
+            Value::list(vec![Value::Int(10), Value::Int(20), Value::Int(30)]),
+        );
+        args
+    };
+    let read_some_int = |dict: &Value, key: &str| -> i64 {
+        let Value::Dict(d) = dict else { panic!() };
+        let Value::Dict(opt) = d.map.get(key).expect("missing") else {
+            panic!("{key} not a dict")
+        };
+        assert_eq!(opt.brand.as_deref(), Some("Some"), "{key} variant");
+        match opt.map.get("value") {
+            Some(Value::Int(n)) => *n,
+            other => panic!("{key} payload not Int: {other:?}"),
+        }
+    };
+
+    // Context A: builds and steps its iter twice.
+    let ctx_a = Context::new()
+        .with_root(node.clone())
+        .with_analyzed(std::sync::Arc::clone(&analyzed));
+    let result_a = Evaluator::new(std::sync::Arc::new(ctx_a))
+        .run_main(&Arc::new(Scope::default()), make_args())
+        .expect("ctx A run_main");
+    assert_eq!(read_some_int(&result_a, "first"), 10);
+    assert_eq!(read_some_int(&result_a, "second"), 20);
+
+    // Context B (fresh): if cursor state were shared, B's `first`
+    // would observe a stale "already advanced past 0" cursor; with
+    // per-Context isolation B walks from index 0 again.
+    let ctx_b = Context::new()
+        .with_root(node.clone())
+        .with_analyzed(std::sync::Arc::clone(&analyzed));
+    let result_b = Evaluator::new(std::sync::Arc::new(ctx_b))
+        .run_main(&Arc::new(Scope::default()), make_args())
+        .expect("ctx B run_main");
+    assert_eq!(read_some_int(&result_b, "first"), 10);
+    assert_eq!(read_some_int(&result_b, "second"), 20);
+}
+
+/// Cross-Context iter values surface as exhausted (policy (a) in the
+/// `Iter` cursor design): an `Iter` dict minted in Context A and then
+/// "used" in Context B walks no elements — every `next()` returns
+/// `None`. We mint the foreign iter in Context A, pre-bind it as a
+/// local on a fresh scope under Context B, then evaluate a script
+/// that calls `.next()` on it. Context B's cursor table has no entry
+/// for A's `_id`, so the lookup returns `None`.
+#[test]
+fn iter_cursor_cross_context_iter_reads_as_exhausted() {
+    use std::collections::HashMap;
+
+    // Context A: mint a real `Iter` dict.
+    let mint_src = r#"#main(List<Int> xs)
+{
+    "iter": xs.iter()
+}"#;
+    let mint_node = relon_parser::parse_document(mint_src).expect("parse mint");
+    let mint_analyzed = std::sync::Arc::new(relon_analyzer::analyze(&mint_node));
+    let mut mint_args: HashMap<String, Value> = HashMap::new();
+    mint_args.insert(
+        "xs".to_string(),
+        Value::list(vec![Value::Int(10), Value::Int(20)]),
+    );
+    let ctx_a = Context::new()
+        .with_root(mint_node.clone())
+        .with_analyzed(std::sync::Arc::clone(&mint_analyzed));
+    let evaluator_a = Evaluator::new(std::sync::Arc::new(ctx_a));
+    let minted = evaluator_a
+        .run_main(&Arc::new(Scope::default()), mint_args)
+        .expect("ctx A mint");
+    let Value::Dict(d) = minted else { panic!() };
+    let foreign_iter = d.map.get("iter").expect("iter missing").clone();
+    assert!(matches!(
+        &foreign_iter,
+        Value::Dict(inner) if inner.brand.as_deref() == Some("Iter")
+    ));
+    drop(evaluator_a);
+
+    // Context B: pre-bind the foreign iter as `foreign` under the
+    // root scope, then evaluate a script that calls `.next()` on
+    // it. The `Iter` brand drives method dispatch into the same
+    // registered `IterNext` intrinsic, which now reaches into
+    // Context B's cursor table — and finds no entry, so each
+    // `next()` should produce `Option.None`.
+    let use_src = r#"
+{
+    "first": foreign.next(),
+    "second": foreign.next()
+}"#;
+    let use_node = relon_parser::parse_document(use_src).expect("parse use");
+    let use_analyzed = std::sync::Arc::new(relon_analyzer::analyze(&use_node));
+    let ctx_b = Context::new()
+        .with_root(use_node.clone())
+        .with_analyzed(std::sync::Arc::clone(&use_analyzed));
+    let scope_b = Arc::new(Scope::default()).with_local("foreign".to_string(), foreign_iter);
+    let result_b = Evaluator::new(std::sync::Arc::new(ctx_b))
+        .eval_root(&scope_b)
+        .expect("ctx B eval");
+    let Value::Dict(rb) = result_b else { panic!() };
+    for key in ["first", "second"] {
+        let Value::Dict(opt) = rb.map.get(key).expect("missing") else {
+            panic!("{key} not a dict")
+        };
+        assert_eq!(
+            opt.brand.as_deref(),
+            Some("None"),
+            "cross-Context iter must exhaust immediately ({key})"
+        );
+    }
+}
+
+/// Cursor cleanup between successive top-level evaluations on the
+/// same `Context`. The first run advances an iter; the second run
+/// (re-using the same Context) builds a fresh iter and must walk
+/// from index 0, not from a stale cursor that survived the previous
+/// run. The id counter is *not* reset (so a still-live foreign iter
+/// dict couldn't collide with the fresh one) but the cursor table
+/// is.
+#[test]
+fn iter_cursor_clears_between_top_level_runs() {
+    use std::collections::HashMap;
+    let source = r#"#main(List<Int> xs)
+{
+    "it": xs.iter(),
+    "first": it.next(),
+    "second": it.next()
+}"#;
+    let node = relon_parser::parse_document(source).expect("parse");
+    let analyzed = std::sync::Arc::new(relon_analyzer::analyze(&node));
+    let make_args = || {
+        let mut args: HashMap<String, Value> = HashMap::new();
+        args.insert(
+            "xs".to_string(),
+            Value::list(vec![Value::Int(10), Value::Int(20), Value::Int(30)]),
+        );
+        args
+    };
+    let read_some_int = |dict: &Value, key: &str| -> i64 {
+        let Value::Dict(d) = dict else { panic!() };
+        let Value::Dict(opt) = d.map.get(key).expect("missing") else {
+            panic!("{key} not a dict")
+        };
+        assert_eq!(opt.brand.as_deref(), Some("Some"), "{key} variant");
+        match opt.map.get("value") {
+            Some(Value::Int(n)) => *n,
+            other => panic!("{key} payload not Int: {other:?}"),
+        }
+    };
+    let ctx = Context::new()
+        .with_root(node.clone())
+        .with_analyzed(std::sync::Arc::clone(&analyzed));
+    let evaluator = Evaluator::new(std::sync::Arc::new(ctx));
+    // Run 1: walks the first two elements.
+    let r1 = evaluator
+        .run_main(&Arc::new(Scope::default()), make_args())
+        .expect("run 1");
+    assert_eq!(read_some_int(&r1, "first"), 10);
+    assert_eq!(read_some_int(&r1, "second"), 20);
+    // Run 2: fresh iter, fresh cursor — the table cleared at run
+    // start, so the new iter's cursor begins at 0.
+    let r2 = evaluator
+        .run_main(&Arc::new(Scope::default()), make_args())
+        .expect("run 2");
+    assert_eq!(read_some_int(&r2, "first"), 10);
+    assert_eq!(read_some_int(&r2, "second"), 20);
+}
+
+/// Two threads each build their own `Context` and run an iter-heavy
+/// script. The per-Context mutex guards iter state owned by exactly
+/// one Context; if cursor handling were on a shared mutex this test
+/// could still pass (just slower), but if it deadlocked, the join
+/// timeout would expose it. Mainly we want a non-flaky signal that
+/// concurrent Contexts don't share lock state.
+#[test]
+fn iter_cursor_concurrent_contexts_do_not_deadlock() {
+    use std::collections::HashMap;
+    use std::sync::mpsc;
+    use std::time::Duration;
+    let source = r#"#main(List<Int> xs)
+{
+    "it": xs.iter(),
+    "a": it.next(),
+    "b": it.next(),
+    "c": it.next()
+}"#;
+    let node = relon_parser::parse_document(source).expect("parse");
+    let analyzed = std::sync::Arc::new(relon_analyzer::analyze(&node));
+
+    fn run_iter_loop(
+        label: &'static str,
+        node: relon_parser::Node,
+        analyzed: std::sync::Arc<relon_analyzer::AnalyzedTree>,
+    ) {
+        for _ in 0..32 {
+            let ctx = Context::new()
+                .with_root(node.clone())
+                .with_analyzed(std::sync::Arc::clone(&analyzed));
+            let mut args: HashMap<String, Value> = HashMap::new();
+            args.insert(
+                "xs".to_string(),
+                Value::list(vec![Value::Int(1), Value::Int(2), Value::Int(3)]),
+            );
+            let result = Evaluator::new(std::sync::Arc::new(ctx))
+                .run_main(&Arc::new(Scope::default()), args)
+                .unwrap_or_else(|e| panic!("{label}: {e:?}"));
+            let Value::Dict(d) = result else {
+                panic!("{label}: not a dict")
+            };
+            for key in ["a", "b", "c"] {
+                let Value::Dict(opt) = d.map.get(key).expect("missing") else {
+                    panic!("{label}/{key} not a dict")
+                };
+                assert_eq!(
+                    opt.brand.as_deref(),
+                    Some("Some"),
+                    "{label}/{key} must be Some"
+                );
+            }
+        }
+    }
+
+    // Run both threads and bound the wait with a watchdog channel.
+    // If a shared lock ever introduces a deadlock the recv() will
+    // miss the deadline and we fail loudly.
+    let (tx, rx) = mpsc::channel::<()>();
+    let tx2 = tx.clone();
+    let node_t1 = node.clone();
+    let analyzed_t1 = std::sync::Arc::clone(&analyzed);
+    let h1 = std::thread::spawn(move || {
+        run_iter_loop("t1", node_t1, analyzed_t1);
+        let _ = tx.send(());
+    });
+    let node_t2 = node.clone();
+    let analyzed_t2 = std::sync::Arc::clone(&analyzed);
+    let h2 = std::thread::spawn(move || {
+        run_iter_loop("t2", node_t2, analyzed_t2);
+        let _ = tx2.send(());
+    });
+    for which in ["t1", "t2"] {
+        rx.recv_timeout(Duration::from_secs(10))
+            .unwrap_or_else(|_| panic!("{which} did not complete in 10s — possible deadlock"));
+    }
+    h1.join().unwrap();
+    h2.join().unwrap();
+}
+
 #[test]
 fn test_brand_registry() {
     let mut ctx = Context::default();

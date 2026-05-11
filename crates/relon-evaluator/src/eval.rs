@@ -161,6 +161,26 @@ pub struct Context {
     pub(crate) module_resolvers: Vec<Arc<dyn ModuleResolver>>,
     pub(crate) path_cache: Mutex<HashMap<String, Value>>,
     pub(crate) module_cache: Mutex<HashMap<String, Value>>,
+    /// Backing cursor table for user-callable `Iter.next()`. Keyed by
+    /// the `u64` iter-id minted by [`Context::next_iter_id`] at the
+    /// `iter()` call site and stamped into the resulting `Iter`-branded
+    /// dict as `_id`. The `Value` graph is immutable (`Arc`-shared, no
+    /// interior mutability), so cursor state must live outside it; this
+    /// Context field is the canonical home — entries die when the
+    /// Context is dropped, and the table is cleared at the start of
+    /// every top-level `eval_root` / `run_main` so long-running hosts
+    /// reusing a Context never accumulate stale cursors. Cross-Context
+    /// `Iter` values surface as exhausted (`next()` returns `None`):
+    /// see [`NativeFnCaps::iter_cursor_fetch_and_inc`].
+    pub(crate) iter_cursors: Mutex<HashMap<u64, usize>>,
+    /// Monotonic per-Context id generator paired with
+    /// [`Context::iter_cursors`]. Wraps at `u64::MAX`, effectively
+    /// never reached in practice. Deliberately not reset on
+    /// `eval_root` / `run_main` cleanup — the cursor table is, but
+    /// the counter must keep climbing so a still-live `Iter` dict
+    /// from the prior run can't collide with a fresh one in the
+    /// new run.
+    pub(crate) iter_id_counter: AtomicU64,
     /// Modules currently on the load stack, with a re-entry counter so
     /// the same canonical id can appear multiple times (e.g. via `as=`
     /// vs `spread=true`) without the inner guard's `Drop` clearing the
@@ -213,6 +233,8 @@ impl Context {
             module_resolvers: Vec::new(),
             path_cache: Mutex::new(HashMap::new()),
             module_cache: Mutex::new(HashMap::new()),
+            iter_cursors: Mutex::new(HashMap::new()),
+            iter_id_counter: AtomicU64::new(0),
             loading_modules: Mutex::new(HashMap::new()),
             evaluating_paths: Mutex::new(HashSet::new()),
             step_counter: AtomicU64::new(0),
@@ -379,6 +401,68 @@ impl Context {
             .as_ref()
             .and_then(|tree| tree.node(id).map(|arc| (**arc).clone()))
     }
+
+    /// Mint a fresh `Iter` cursor id under this Context **and seed a
+    /// zero cursor entry** so that subsequent
+    /// [`Context::iter_cursor_fetch_and_inc`] calls can distinguish a
+    /// "freshly minted, cursor at 0" iter from a foreign-Context iter
+    /// (no entry → treated as exhausted; see policy note on
+    /// `iter_cursor_fetch_and_inc`).
+    ///
+    /// Each `xs.iter()` consumes one id; two Contexts mint
+    /// independently because each owns its own counter. Wraps at
+    /// `u64::MAX` — reachable only in pathological constructions —
+    /// and the `Relaxed` ordering is sufficient because the id is
+    /// opaque outside of [`Context::iter_cursors`] lookup.
+    pub(crate) fn next_iter_id(&self) -> u64 {
+        let id = self.iter_id_counter.fetch_add(1, Ordering::Relaxed);
+        // Pre-register the cursor so the "missing entry → exhausted"
+        // signal in `iter_cursor_fetch_and_inc` cleanly distinguishes
+        // a foreign-Context `_id` from a fresh local one.
+        self.iter_cursors.lock().unwrap().insert(id, 0);
+        id
+    }
+
+    /// Atomically read the cursor for `iter_id`, and if `cursor < len`,
+    /// post-increment and return the old value; otherwise return
+    /// `None`. **A missing entry** (no cursor was ever minted for
+    /// `iter_id` in this Context) is also reported as `None` —
+    /// idempotent end-of-iter, matching the `Option::None` return
+    /// type of `Iter.next() -> Option<T>`.
+    ///
+    /// Cross-Context policy (deliberate): if the host hands an
+    /// `Iter` value built in Context A to Context B and then calls
+    /// `next()`, Context B's table has no entry for that id, so we
+    /// return `None`. This is the gentlest reading of "an iter
+    /// belongs to its originating Context" — no new error variant,
+    /// no capability trap; the iter simply looks exhausted to the
+    /// foreign Context. A future stricter mode could surface a
+    /// dedicated `RuntimeError::IterNotOwnedByContext`, but today's
+    /// host APIs don't yet expose a way to attach an iter to a
+    /// Context other than via `iter()` itself, so the implicit-
+    /// exhausted reading is sufficient and matches the
+    /// "no implicit ambient state" design promise.
+    pub(crate) fn iter_cursor_fetch_and_inc(&self, iter_id: u64, len: usize) -> Option<usize> {
+        // Single-lock atomic read-check-increment. Spelled out so
+        // the bounds check and the bump happen under the same
+        // critical section — splitting them would let a concurrent
+        // caller observe a stale "in bounds" reading after the
+        // cursor moved.
+        let mut cursors = self.iter_cursors.lock().unwrap();
+        // Do *not* `entry(...).or_insert(0)`: a foreign-Context id
+        // must surface as `None` rather than silently spawn a fresh
+        // cursor in this Context's table (which would start it
+        // walking from 0 against a `_source` the caller's Context
+        // never validated).
+        let cursor_slot = cursors.get_mut(&iter_id)?;
+        if *cursor_slot < len {
+            let idx = *cursor_slot;
+            *cursor_slot += 1;
+            Some(idx)
+        } else {
+            None
+        }
+    }
 }
 
 pub struct LoadingModuleGuard<'a> {
@@ -505,6 +589,12 @@ impl Evaluator {
         // `evaluating_paths` is per single eval cycle and is already
         // managed by the resolver; don't touch it here.
         self.context.path_cache.lock().unwrap().clear();
+        // Drop every cursor from the previous top-level run. The
+        // matching id counter is *not* reset (see
+        // `Context::iter_id_counter` doc) so a still-live `Iter`
+        // dict surviving from a prior run can't collide with a
+        // fresh one minted on this run.
+        self.context.iter_cursors.lock().unwrap().clear();
         let root = self.context.root_node.clone().ok_or_else(|| {
             RuntimeError::VariableNotFound(
                 "Context has no root node — call `Context::with_root` first".to_string(),
@@ -542,6 +632,11 @@ impl Evaluator {
         // invocation with different args would return cached values
         // from the first run.
         self.context.path_cache.lock().unwrap().clear();
+        // Same rationale as the matching clear in `eval_root`: any
+        // cursor entries from the previous top-level run go away
+        // here, so a Context reused across `run_main` calls never
+        // accumulates iter state.
+        self.context.iter_cursors.lock().unwrap().clear();
         let root = self.context.root_node.clone().ok_or_else(|| {
             RuntimeError::VariableNotFound(
                 "Context has no root node — call `Context::with_root` first".to_string(),
@@ -2593,6 +2688,14 @@ impl NativeFnCaps for EvaluatorCaps {
 
     fn max_value_elements(&self) -> Option<usize> {
         self.context.capabilities.max_value_elements
+    }
+
+    fn next_iter_id(&self) -> u64 {
+        self.context.next_iter_id()
+    }
+
+    fn iter_cursor_fetch_and_inc(&self, iter_id: u64, len: usize) -> Option<usize> {
+        self.context.iter_cursor_fetch_and_inc(iter_id, len)
     }
 }
 

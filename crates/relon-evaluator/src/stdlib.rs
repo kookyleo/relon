@@ -1,10 +1,8 @@
 use crate::error::RuntimeError;
 use crate::eval::Context;
-use crate::native_fn::{NativeArgs, RelonFunction};
+use crate::native_fn::{NativeArgs, NativeFnCaps, RelonFunction};
 use crate::value::{Value, ValueDict};
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::Arc;
 
 pub fn register_to(ctx: &mut Context) {
     // Language-level builtins — always in scope, no `#import` required.
@@ -136,8 +134,8 @@ pub fn register_to(ctx: &mut Context) {
     // `Iter.next()` is the user-callable advance primitive announced
     // by the `Iter<T>` core schema. Returns `Option<T>`: `Some` while
     // the cursor is in bounds, `None` once exhausted. The cursor lives
-    // in a module-local table (`iter_cursors`), keyed by the `_id`
-    // stamped into the Iter dict at construction time. See
+    // in a per-Context table (`Context::iter_cursors`), keyed by the
+    // `_id` stamped into the Iter dict at construction time. See
     // schema-rooted-implementation-log §C.11 for the rationale.
     ctx.register_pure_method("Iter", "next", Arc::new(IterNext));
 }
@@ -863,12 +861,13 @@ impl RelonFunction for IterFromList {
         args: NativeArgs,
         range: relon_parser::TokenRange,
     ) -> Result<Value, RuntimeError> {
-        let args = args.into_positional();
+        let caps = args.caps();
+        let args = args.positional.clone();
         expect_arg_count(&args, 1, range)?;
         // expect_list validates the receiver shape; the value itself
         // is what we wrap (cheap Arc clone — no element copy).
         let _ = expect_list(&args[0], range)?;
-        Ok(make_iter_value("list", args[0].clone()))
+        Ok(make_iter_value(caps, "list", args[0].clone()))
     }
 }
 
@@ -881,10 +880,11 @@ impl RelonFunction for IterFromString {
         args: NativeArgs,
         range: relon_parser::TokenRange,
     ) -> Result<Value, RuntimeError> {
-        let args = args.into_positional();
+        let caps = args.caps();
+        let args = args.positional.clone();
         expect_arg_count(&args, 1, range)?;
         let _ = expect_string(&args[0], range)?;
-        Ok(make_iter_value("string", args[0].clone()))
+        Ok(make_iter_value(caps, "string", args[0].clone()))
     }
 }
 
@@ -899,20 +899,28 @@ impl RelonFunction for IterFromDict {
         args: NativeArgs,
         range: relon_parser::TokenRange,
     ) -> Result<Value, RuntimeError> {
-        let args = args.into_positional();
+        let caps = args.caps();
+        let args = args.positional.clone();
         expect_arg_count(&args, 1, range)?;
         let _ = expect_dict(&args[0], range)?;
-        Ok(make_iter_value("dict_entries", args[0].clone()))
+        Ok(make_iter_value(caps, "dict_entries", args[0].clone()))
     }
 }
 
 /// User-callable `Iter.next()` advance primitive — returns the next
 /// element wrapped in `Option.Some { value: ... }`, or `Option.None {}`
 /// once the underlying source is exhausted. The cursor itself lives in
-/// a module-local table (`iter_cursors`); the immutable-`Value`
-/// invariant (`Arc`-shared, no interior mutability) rules out storing
-/// a per-instance cursor inside the dict directly. Implementation log
-/// §C.11 captures the rationale for siting the cursor table here.
+/// a per-Context table (`Context::iter_cursors`); the immutable-
+/// `Value` invariant (`Arc`-shared, no interior mutability) rules out
+/// storing a per-instance cursor inside the dict directly.
+/// Implementation log §C.11 captures the rationale for siting the
+/// cursor table on `Context`.
+///
+/// Tenant isolation: each `Context` owns its own cursor table and id
+/// counter. Two concurrent Contexts never see each other's cursors,
+/// and dropping a Context releases every cursor it owned. An `Iter`
+/// value built in Context A and used in Context B reads as exhausted
+/// (`None`) because B's table has no entry for A's `_id`.
 ///
 /// Semantic notes:
 /// * Aliased iterators (`Iter<Int> it2: it`) share the same `_id` and
@@ -934,7 +942,8 @@ impl RelonFunction for IterNext {
         args: NativeArgs,
         range: relon_parser::TokenRange,
     ) -> Result<Value, RuntimeError> {
-        let args = args.into_positional();
+        let caps = args.caps();
+        let args = args.positional.clone();
         expect_arg_count(&args, 1, range)?;
         let iter_dict = expect_dict(&args[0], range)?;
         if iter_dict.brand.as_deref() != Some("Iter") {
@@ -995,7 +1004,8 @@ impl RelonFunction for IterNext {
                         })
                     }
                 };
-                iter_cursor_fetch_and_inc(iter_id, items.len()).map(|idx| items[idx].clone())
+                caps.iter_cursor_fetch_and_inc(iter_id, items.len())
+                    .map(|idx| items[idx].clone())
             }
             "string" => {
                 let s = match source {
@@ -1016,7 +1026,7 @@ impl RelonFunction for IterNext {
                 // and comprehensions take the fast `materialize_iterable`
                 // route.
                 let chars: Vec<char> = s.chars().collect();
-                iter_cursor_fetch_and_inc(iter_id, chars.len())
+                caps.iter_cursor_fetch_and_inc(iter_id, chars.len())
                     .map(|idx| Value::String(chars[idx].to_string()))
             }
             "dict_entries" => {
@@ -1038,11 +1048,12 @@ impl RelonFunction for IterNext {
                 // `for kv in d.iter()` would.
                 let mut keys: Vec<&String> = src_dict.map.keys().collect();
                 keys.sort();
-                iter_cursor_fetch_and_inc(iter_id, keys.len()).map(|idx| {
-                    let key: &String = keys[idx];
-                    let v = src_dict.map.get(key).cloned().unwrap_or(Value::Null);
-                    Value::list(vec![Value::String(key.clone()), v])
-                })
+                caps.iter_cursor_fetch_and_inc(iter_id, keys.len())
+                    .map(|idx| {
+                        let key: &String = keys[idx];
+                        let v = src_dict.map.get(key).cloned().unwrap_or(Value::Null);
+                        Value::list(vec![Value::String(key.clone()), v])
+                    })
             }
             other => {
                 return Err(RuntimeError::TypeMismatch {
@@ -1075,59 +1086,6 @@ fn option_value(inner: Option<Value>) -> Value {
     }
 }
 
-/// Module-local cursor table backing user-callable `Iter.next()`. Keyed
-/// by the `u64` iter-id minted by [`next_iter_id`] at `iter()`
-/// construction time and stamped back into the `Iter`-branded dict as
-/// `_id`. The `Value` graph is immutable (Arc-shared, no interior
-/// mutability), so cursor state must live outside it; co-locating the
-/// table with the iter constructors keeps the entire user-callable
-/// iteration protocol in one file — no trait-extension on
-/// `NativeFnCaps`, no Context-side plumbing, just static state owned
-/// by the Iter builtins.
-///
-/// Lifetime: entries accumulate for the process lifetime. Per-iter
-/// cost is `(u64 id, usize cursor) = 16 bytes`; a script that
-/// constructs N iterators leaks 16·N bytes. Acceptable for typical
-/// short-lived script runs; long-running embeddings that drive many
-/// iterators can rely on the upcoming `Context::iter_cursors`
-/// follow-up (§C.11 roadmap entry) for bounded growth.
-fn iter_cursors() -> &'static Mutex<HashMap<u64, usize>> {
-    static CURSORS: OnceLock<Mutex<HashMap<u64, usize>>> = OnceLock::new();
-    CURSORS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-/// Monotonic id generator paired with [`iter_cursors`]. Each `iter()`
-/// call takes one. Two iterators built concurrently still receive
-/// distinct ids (`fetch_add` is atomic). Wraps at `u64::MAX`, which
-/// is effectively never reached in practice.
-fn next_iter_id() -> u64 {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    // Relaxed: the id is opaque outside cursor lookup; no other
-    // memory operation depends on its publish order.
-    COUNTER.fetch_add(1, Ordering::Relaxed)
-}
-
-/// Atomically read the cursor for `iter_id`, and if it is `< len`,
-/// post-increment it and return the old value. Returns `None` once
-/// the cursor has reached `len` — the iterator is then exhausted
-/// and subsequent calls keep returning `None` (idempotent end-of-iter,
-/// matching `Option::None` semantics from `Iter.next() -> Option<T>`).
-fn iter_cursor_fetch_and_inc(iter_id: u64, len: usize) -> Option<usize> {
-    // Single-lock atomic read-check-increment. Spelled out so the
-    // bounds check and the bump happen under the same critical
-    // section — splitting them would let a concurrent caller observe
-    // a stale "in bounds" reading after the cursor moved.
-    let mut cursors = iter_cursors().lock().unwrap();
-    let cursor = cursors.entry(iter_id).or_insert(0);
-    if *cursor < len {
-        let idx = *cursor;
-        *cursor += 1;
-        Some(idx)
-    } else {
-        None
-    }
-}
-
 /// Build an `Iter`-branded dict carrying `_kind` (driver dispatch tag),
 /// `_source` (the underlying collection value), and `_id` (the
 /// per-construction cursor key consumed by `Iter.next()`). The
@@ -1135,14 +1093,22 @@ fn iter_cursor_fetch_and_inc(iter_id: u64, len: usize) -> Option<usize> {
 /// only `_kind`/`_source` and walks the source directly — it does not
 /// advance the cursor table, so user-driven `next()` and a
 /// comprehension over the same iter remain independent.
-pub(crate) fn make_iter_value(kind: &str, source: Value) -> Value {
+///
+/// The cursor table itself lives on [`crate::eval::Context`] — see
+/// `Context::iter_cursors` / `Context::next_iter_id`. We reach it via
+/// the [`NativeFnCaps`] handle so this intrinsic stays Context-
+/// agnostic and so cursor state never leaks into process-global
+/// storage. Cursors clear at the top of every `eval_root` /
+/// `run_main`, so a Context reused across top-level runs never
+/// accumulates entries.
+pub(crate) fn make_iter_value(caps: &dyn NativeFnCaps, kind: &str, source: Value) -> Value {
     let mut map = std::collections::BTreeMap::new();
     map.insert("_kind".to_string(), Value::String(kind.to_string()));
     map.insert("_source".to_string(), source);
     // `_id` is `i64`-coerced from a `u64` so the existing
     // `Value::Int(i64)` representation can carry it without inventing
     // a new variant. `IterNext` reads it back via `as u64` round-trip.
-    map.insert("_id".to_string(), Value::Int(next_iter_id() as i64));
+    map.insert("_id".to_string(), Value::Int(caps.next_iter_id() as i64));
     Value::branded_dict(map, Some("Iter".to_string()))
 }
 
