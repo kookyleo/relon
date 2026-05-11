@@ -72,7 +72,7 @@ warning: value assigned to `name`  is never read (×9)
 4. `docs/zh/guide/sandbox.md` 的 `max_value_elements` 段落已重写，删除 "host fn 返回值是宿主自己的问题" 的豁免；现在 stdlib 走和字面量同一道闸，host 真要无约束请显式设 `max_value_elements = None`。
 5. `sandbox_tests.rs` 新增 6 条 regression：`range` 预检、`_string_split` / `_list_map` / `_list_filter` / `_dict_merge` 函数式、`xs.map(...)` 接收者式（搭 `with_analyzed`）、和一条 at-cap 正向用例。
 
-### 5. "无 implicit ambient state / 确定性" 与全局 Iter cursor 表的张力
+### 5. ~~"无 implicit ambient state / 确定性" 与全局 Iter cursor 表的张力~~（已修）
 
 `stdlib.rs:1068` 的 `iter_cursors()` 是 `&'static OnceLock<Mutex<HashMap<u64, usize>>>`，`next_iter_id()` 是同一进程的 `AtomicU64`。后果：
 
@@ -80,11 +80,15 @@ warning: value assigned to `name`  is never read (×9)
 - roadmap 把它记为 "16 B leak"，但实际问题不是 16 B，而是**租户隔离失败**：宿主无法在 evaluate 结束后清理某次运行产生的 cursor entries（Context 拿不到 `_id` 的清单）。
 - 修法：cursor 表挂到 `Context` 上（即 roadmap 那条 "NativeFnCaps trait 扩展"），并在 `eval_root` / `run_main` 结束时清空，和 `path_cache` 同处理。
 
-### 6. README "There is no trusted mode" 与 `--trust` / `Capabilities::all_granted()` 的措辞冲突
+**已闭环 2026-05-11**：`Context.iter_cursors: Mutex<HashMap<u64, usize>>` + `iter_id_counter: AtomicU64` 挂到 Context；`NativeFnCaps` 暴露 `next_iter_id` / `iter_cursor_fetch_and_inc` 给 intrinsic（cross-Context 默认按 implicit-exhausted `None` 处理，无新错误类型）；cursor 表在 `eval_root` / `run_main` 入口清空。4 条 regression 覆盖跨 Context 隔离、跨 Context iter 退出、清理边界、并发不死锁。
+
+### 6. ~~README "There is no trusted mode" 与 `--trust` / `Capabilities::all_granted()` 的措辞冲突~~（已修）
 
 英文 README 里的原话是 *"There is no 'trusted mode' the script can fall back to."* 但 `crates/relon-cli/src/main.rs:46` 有 `--trust`、`crates/relon-evaluator/src/eval.rs:66` 有 `all_granted()`、`crates/relon-evaluator/src/module.rs` 有 `FilesystemModuleResolver::trusted()`。
 
-严格读其实没说谎——"the script" 不能自提权，trust 是 host 的开关。但是字面上看就是矛盾。建议改成 *"scripts can't elevate themselves; the host can choose to grant all caps explicitly via `--trust` / `Capabilities::all_granted()`"*。否则审计员看 README 会以为整套 `--trust` 路径不存在。
+严格读其实没说谎——"the script" 不能自提权，trust 是 host 的开关。但是字面上看就是矛盾。
+
+**已闭环 2026-05-11**：README 改为 *"scripts can't elevate themselves; the host can choose to grant all caps explicitly via `--trust` / `Capabilities::all_granted()`, and that grant is auditable code at the call site rather than an implicit trusted mode."*
 
 ### ~~7. 英文文档承诺远超实际~~
 
@@ -98,10 +102,10 @@ warning: value assigned to `name`  is never read (×9)
 
 历史状态：`Cargo.toml:11` 写 `relonlang/relon`，`docs/.vitepress/config.mts:108` + 两个 `index.md` + 英文 `introduction.md` 都是 `kookyleo/relon`，五处中四处一致、一处孤儿。现已把 `Cargo.toml` 的 `repository` 字段统一到 `kookyleo/relon`，作为 canonical URL。后续发布到 crates.io 不会因为 repo 校验失败被拒。
 
-### 9. 文档/代码状态漂移的细节
+### 9. ~~文档/代码状态漂移的细节~~（已修）
 
-- `crates/relon-analyzer/src/constraints.rs:106-118` 还写着 "lowering ... is the still-pending hook"，但 roadmap §J 已经把 Iterable / Indexable / 算子 lowering 都标 `[x]`。代码内注释和路线图不同步。
-- `roadmap.md:160-176` 列了四条"剩余未决项"（中段 path 推断落 Any、method generic K/V 仅 wildcard、shadow warning、Iter cursor leak），其中 Iter cursor leak 见上文已经从"节省 16 B"升级到"影响多租户隔离"，应被重新分类为安全/正确性而不是 housekeeping。
+- ~~`crates/relon-analyzer/src/constraints.rs:106-118` 还写着 "lowering ... is the still-pending hook"，但 roadmap §J 已经把 Iterable / Indexable / 算子 lowering 都标 `[x]`。代码内注释和路线图不同步。~~ 已修：`f2dcd41` 把 constraints.rs 的两段过期 doc 改成"Phase C 关闭：Equatable / Comparable / Iterable / Indexable / Number 5 类 lowering 全部接通；Callable 按决策 23 保持 shape-only"。
+- ~~`roadmap.md:160-176` 列了四条"剩余未决项"（中段 path 推断落 Any、method generic K/V 仅 wildcard、shadow warning、Iter cursor leak），其中 Iter cursor leak 见上文已经从"节省 16 B"升级到"影响多租户隔离"，应被重新分类为安全/正确性而不是 housekeeping。~~ 已修：Iter cursor leak 落地后随 §5 在 roadmap 中标 `[x]` 并附实现注脚（cursor 表 + id counter 上 Context、cross-Context implicit-exhausted）。其余三条 follow-up（中段 path、method generic K/V、shadow warning）作为真正的语义补强保留在 roadmap，留作独立工作项。
 
 ### ~~10. 多 binary 的杂物外溢~~
 
@@ -117,10 +121,10 @@ warning: value assigned to `name`  is never read (×9)
 
 ## 其他偏向中等优先级的观察
 
-- `max_steps` 的实测语义是 "AST 节点 dispatch 次数"，对 stdlib 大输入的内循环（`range`、`list.reduce` 在百万元素上的 close walk）一步只 +1，**对最长尾的 DOS 表面并不严密**。需要 native fn 内部主动 yield / 自计步，或者 stdlib 大循环里也调 `step_counter.fetch_add`。
-- `core/iter.relon` 等四个内置 schema 都是 `include_str!` 嵌进 analyzer，但是 evaluator 的 `register_pure_method` 表是手写的 17 条镜像（`stdlib.rs:102-142`）；两边只有 "decision 21'" 的注释约束、没有编译期/测试期对照（"core/*.relon 声明的每条 `#native` 都必须有对应 register_pure_method"）。建议加一条 `#[cfg(test)]` 交叉断言。
+- ~~`max_steps` 的实测语义是 "AST 节点 dispatch 次数"，对 stdlib 大输入的内循环（`range`、`list.reduce` 在百万元素上的 close walk）一步只 +1，**对最长尾的 DOS 表面并不严密**。需要 native fn 内部主动 yield / 自计步，或者 stdlib 大循环里也调 `step_counter.fetch_add`。~~ **已闭环 2026-05-11**：`NativeFnCaps::tick(n, range)` 落地，复用同一 `step_counter`；`range` / `list.map` / `filter` / `reduce` / `contains` / `string.split` / `replace` / `join` / `dict.merge` / `keys` / `values` 11 个 intrinsic 在内循环按元素 tick，`range` 在分配前预 charge。4 条 regression 验证 `_list_map` 1000 元素超 budget、`range` 大输入预拒、at-budget 正向、span 归属正确。
+- ~~`core/iter.relon` 等四个内置 schema 都是 `include_str!` 嵌进 analyzer，但是 evaluator 的 `register_pure_method` 表是手写的 17 条镜像（`stdlib.rs:102-142`）；两边只有 "decision 21'" 的注释约束、没有编译期/测试期对照（"core/*.relon 声明的每条 `#native` 都必须有对应 register_pure_method"）。建议加一条 `#[cfg(test)]` 交叉断言。~~ **已闭环 2026-05-11**：`host_boundary_tests::core_relon_native_slots_match_stdlib_registration` 启动 analyzer 收集 `tree.schema_methods` 中 `is_native = true` 的所有槽位（21 条：7 String + 7 List + 6 Dict + 1 Iter），与 `Context::new().native_methods` 表逐对断言；漏注册时 panic 含 remediation-grade 提示。当前 21 条全对。
 - ~~examples 只有两个 `.relon` 文件，对一个想做"开箱即用业务规则 DSL"的项目偏薄。`use-cases.md` 提到了 feature flag、pricing、workflow，但 `examples/` 里没有对应玩具，新用户读不到落地形态。~~ **已闭环 2026-05-11**：feature_flag / pricing / workflow 三条落地玩具已补齐。
-- workspace `Cargo.toml` 把 `winnow = "0.6"` / `memchr = "2.7"` 放到 `[workspace.dependencies]`，但 `relon` facade、`relon-cli` 各自有 `miette` / `serde_json` / `clap` 版本声明而不走 workspace deps。版本散落以后会出现 multi-version。
+- ~~workspace `Cargo.toml` 把 `winnow = "0.6"` / `memchr = "2.7"` 放到 `[workspace.dependencies]`，但 `relon` facade、`relon-cli` 各自有 `miette` / `serde_json` / `clap` 版本声明而不走 workspace deps。版本散落以后会出现 multi-version。~~ **已闭环 2026-05-11**：`miette` / `serde` / `serde_json` / `clap` / `anyhow` / `thiserror` 全部进 `[workspace.dependencies]`，consumer 用 `{ workspace = true }` 继承；同批补齐 6 个 publishable crate 的 `keywords` / `categories` / `homepage` 元数据，并把内部 path 依赖也通过 workspace 声明（带 `version = "0.1.0"`）以解除 `cargo publish` 阻断。
 
 ## 建议的优先级
 
@@ -129,13 +133,15 @@ warning: value assigned to `name`  is never read (×9)
 | ~~P0~~ | ~~stdlib intrinsic 返回值不受 `max_value_elements` 约束~~ | ~~已修：`Range::call` 在分配前对 `caps.max_value_elements` 做预检；`call_function` / `try_call_native_method` 在 native fn 返回后统一走 `check_value_size`；`sandbox_tests` 新增 range / `_string_split` / `_list_map` / `_list_filter` / `_dict_merge` / 接收者方法路径 6 条 regression test~~ |
 | ~~P0~~ | ~~README quickstart 跑不动 + 头版示例不能 eval~~ | ~~已修：`relon-cli/Cargo.toml` 加 `default-run = "relon-cli"`；README 头版例子改成可运行的方法简写形式；"unified closures (`@fn`)" 改成实际语法~~（后续治本：见 §10——`bench` 抽到独立 `relon-bench` 包，`default-run` 已撤回）|
 | ~~P0~~ | ~~`clippy -D warnings` 在文档承诺的命令下失败~~ | ~~已治标：thiserror 升 2 + 两 crate 加 `#![allow(unused_assignments)]` 引用 rust-lang/rust#147648；等上游 rustc 修后删 allow~~ |
-| P1 | 多租户 Iter cursor 隔离 | cursor 表挂到 `Context`，`eval_root` / `run_main` 末尾清空 |
+| ~~P1~~ | ~~多租户 Iter cursor 隔离~~ | ~~cursor 表挂到 `Context`，`eval_root` / `run_main` 末尾清空~~（已闭环 2026-05-11：cursor 表 + id counter 挂到 `Context`，`eval_root` / `run_main` 入口清 cursor；跨 Context iter 默认按 exhausted 返回 `None`；4 条 regression 覆盖隔离、跨 Context 退出、清理、并发不死锁） |
 | ~~P1~~ | ~~仓库 URL 漂移 + 英文文档承诺空洞~~ | ~~选一个 canonical repo url 全量替换；要么把英文文档补到与中文对齐，要么 README 不要再写 "· English"~~（已闭环 2026-05-11：URL 已统一为 `kookyleo/relon`；英文 guide 已补齐 9 页，sidebar 与中文同构）|
 | ~~P1~~ | ~~`allow_native_fn` 与 6-bit 能力的语义重叠~~ | ~~文档/命名上明确为"强制覆盖通道"，加 audit log~~（已闭环 2026-05-11：两字段已删除，授权路径收口为单一 6-bit gate 检查） |
-| P2 | constraints.rs 注释与 roadmap 状态漂移 | 清理 "still-pending hook" 注释；roadmap 上把 Iter cursor leak 重新分类 |
-| P2 | core schema vs stdlib mirror 的双源 | 加 `#[cfg(test)]` 交叉断言 |
-| P2 | examples 过薄 | 至少补 feature flag / pricing / workflow 三个落地玩具 |
+| ~~P2~~ | ~~constraints.rs 注释与 roadmap 状态漂移~~ | ~~清理 "still-pending hook" 注释；roadmap 上把 Iter cursor leak 重新分类~~（已闭环 2026-05-11：`f2dcd41` 已清 constraints.rs 注释；roadmap 中 Iter cursor leak 项随 §5 落地标 `[x]`） |
+| ~~P2~~ | ~~core schema vs stdlib mirror 的双源~~ | ~~加 `#[cfg(test)]` 交叉断言~~（已闭环 2026-05-11：21 条 `#native` 槽位由 `host_boundary_tests::core_relon_native_slots_match_stdlib_registration` 启动 analyzer 后对照 `Context::native_methods`，漏注册时 panic 带 remediation 提示） |
+| ~~P2~~ | ~~examples 过薄~~ | ~~至少补 feature flag / pricing / workflow 三个落地玩具~~（已闭环 2026-05-11：三个 `#main`-style 例子已补齐，各自带 schema、装饰器、`--args` 调用示例） |
 
 ## 一句话定性
 
 语言核心和 schema-rooted dispatch 这条主线已经基本闭环；**但项目对外的安全承诺与工程门面（沙箱默认、quickstart、clippy gate、英文文档）落后于核心代码两到三步**——这些缺口比再加一条语言特性更值得先补。
+
+**收尾状态（2026-05-11 当日）**：本审视报告里的 11 条硬缺口 + 4 条中等观察全部闭环，单日累计 30 余条 commit；workspace 测试基线 855 → 870，`cargo clippy --workspace --all-targets -- -D warnings` 干净（治标），6 个可发布 crate 通过 `cargo publish --dry-run`，英文 guide 与中文同构 11 页。下一步焦点回到语言层：roadmap §J 留下的中段 path 推断、method generics 运行时 unification、method/schema generic shadow warning 等仍然是真正的语义补强工作，不属于"对外门面收口"范畴。
