@@ -47,8 +47,9 @@ cargo run -q -p relon-fmt -- --check fixtures/*.relon fixtures/modules/*.relon f
   the payload.
 - **Context-aware references**: `&root`, `&sibling`, `&prev`, `&next`
   let logic reference its surrounding data without hard-coded paths.
-- **Functional core**: unified closures (`@fn`), comprehensions, pipes,
-  pattern match — pure expressions, no IO or side effects.
+- **Functional core**: arrow closures (`(x) => x + 1`) and method
+  shorthands (`f(x): x + 1`), comprehensions, pipes, pattern match —
+  pure expressions, no IO or side effects.
 - **Canonical std**: `@import("std/list", as="list")` is part of the
   language, not a host extension — scripts can rely on it without the
   embedder wiring anything up.
@@ -57,13 +58,12 @@ cargo run -q -p relon-fmt -- --check fixtures/*.relon fixtures/modules/*.relon f
 
 ```javascript
 {
-    @fn(val, symbol)
-    "currency": val + " " + symbol,
+    currency(val, symbol): val + " " + symbol,
 
-    "price": 100,
-    
+    price: 100,
+
     @currency("USD")
-    "display": &sibling.price
+    display: &sibling.price
 }
 ```
 

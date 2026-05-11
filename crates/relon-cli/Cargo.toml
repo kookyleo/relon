@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "Command line interface for the Relon language"
+default-run = "relon-cli"
 
 [dependencies]
 relon = { path = "../relon" }
