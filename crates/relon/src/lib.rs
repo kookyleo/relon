@@ -791,11 +791,22 @@ mod tests {
         let mut files = Vec::new();
         collect_relon_files(&root.join("fixtures"), &mut files);
         collect_relon_files(&root.join("examples"), &mut files);
+        // Exclude #main-style example entry programs: the golden runner
+        // does library-mode `eval_root` without pushing host args, so a
+        // file with `#main(Dict user)` would surface as `Variable not
+        // found: user`. Each #main example has its own canonical args
+        // documented in the file header for hands-on `cargo run` use.
+        let main_entry_examples: &[&Path] = &[
+            Path::new("examples/validation.relon"),
+            Path::new("examples/feature_flag.relon"),
+            Path::new("examples/pricing.relon"),
+            Path::new("examples/workflow.relon"),
+        ];
         files.retain(|file| {
             let rel_path = file.strip_prefix(root).unwrap();
             !rel_path.starts_with("fixtures/errors")
                 && !rel_path.starts_with("fixtures/golden")
-                && rel_path != Path::new("examples/validation.relon")
+                && !main_entry_examples.contains(&rel_path)
         });
         files.sort();
         files
