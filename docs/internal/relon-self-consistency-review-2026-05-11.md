@@ -86,11 +86,13 @@ warning: value assigned to `name`  is never read (×9)
 
 严格读其实没说谎——"the script" 不能自提权，trust 是 host 的开关。但是字面上看就是矛盾。建议改成 *"scripts can't elevate themselves; the host can choose to grant all caps explicitly via `--trust` / `Capabilities::all_granted()`"*。否则审计员看 README 会以为整套 `--trust` 路径不存在。
 
-### 7. 英文文档承诺远超实际
+### ~~7. 英文文档承诺远超实际~~
 
-- README 只在 spec 一处挂了 `· English` 链接（目标 `docs/en/guide/spec.md` 存在）；use-cases / architecture 段虽然没写 English 链接，但 vitepress 站点给读者的预期是双语对照。
-- vitepress 配置（`docs/.vitepress/config.mts`）的英文 sidebar 只有 2 项（introduction + spec），中文有 11 项；use-cases / architecture / host-integration / sandbox / types / modules / stdlib / syntax / functions 九条全都没有英文版。
-- 上一轮 review 已经点过"英文文档明显弱于中文"，至今没动。
+~~- README 只在 spec 一处挂了 `· English` 链接（目标 `docs/en/guide/spec.md` 存在）；use-cases / architecture 段虽然没写 English 链接，但 vitepress 站点给读者的预期是双语对照。~~
+~~- vitepress 配置（`docs/.vitepress/config.mts`）的英文 sidebar 只有 2 项（introduction + spec），中文有 11 项；use-cases / architecture / host-integration / sandbox / types / modules / stdlib / syntax / functions 九条全都没有英文版。~~
+~~- 上一轮 review 已经点过"英文文档明显弱于中文"，至今没动。~~
+
+**已闭环 2026-05-11**：九条缺失的英文 guide 页面（use-cases / syntax / functions / types / modules / host-integration / sandbox / stdlib / architecture）已补齐；vitepress 英文 sidebar 现已与中文 sidebar 同构。
 
 ### 8. ~~仓库身份信息不一致~~（已统一为 `kookyleo/relon`）
 
@@ -128,7 +130,7 @@ warning: value assigned to `name`  is never read (×9)
 | ~~P0~~ | ~~README quickstart 跑不动 + 头版示例不能 eval~~ | ~~已修：`relon-cli/Cargo.toml` 加 `default-run = "relon-cli"`；README 头版例子改成可运行的方法简写形式；"unified closures (`@fn`)" 改成实际语法~~（后续治本：见 §10——`bench` 抽到独立 `relon-bench` 包，`default-run` 已撤回）|
 | ~~P0~~ | ~~`clippy -D warnings` 在文档承诺的命令下失败~~ | ~~已治标：thiserror 升 2 + 两 crate 加 `#![allow(unused_assignments)]` 引用 rust-lang/rust#147648；等上游 rustc 修后删 allow~~ |
 | P1 | 多租户 Iter cursor 隔离 | cursor 表挂到 `Context`，`eval_root` / `run_main` 末尾清空 |
-| P1 | 仓库 URL 漂移 + 英文文档承诺空洞 | 选一个 canonical repo url 全量替换；要么把英文文档补到与中文对齐，要么 README 不要再写 "· English" |
+| ~~P1~~ | ~~仓库 URL 漂移 + 英文文档承诺空洞~~ | ~~选一个 canonical repo url 全量替换；要么把英文文档补到与中文对齐，要么 README 不要再写 "· English"~~（已闭环 2026-05-11：URL 已统一为 `kookyleo/relon`；英文 guide 已补齐 9 页，sidebar 与中文同构）|
 | ~~P1~~ | ~~`allow_native_fn` 与 6-bit 能力的语义重叠~~ | ~~文档/命名上明确为"强制覆盖通道"，加 audit log~~（已闭环 2026-05-11：两字段已删除，授权路径收口为单一 6-bit gate 检查） |
 | P2 | constraints.rs 注释与 roadmap 状态漂移 | 清理 "still-pending hook" 注释；roadmap 上把 Iter cursor leak 重新分类 |
 | P2 | core schema vs stdlib mirror 的双源 | 加 `#[cfg(test)]` 交叉断言 |
