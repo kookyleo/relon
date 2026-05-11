@@ -1,0 +1,15 @@
+// Schema-rooted §J follow-up: strict mode + `pkg.value.field` path
+// where `value` is a root-level addressable value in the imported
+// module. The analyzer must walk through the alias's value table to
+// recover `Schema("User")` for `pkg.alice`, then descend into the
+// schema's field set for `.region`. The declared return type `Int`
+// then surfaces a static type mismatch against the `String` field.
+//
+// Pre-fix the walker stopped at the alias head with `UnknownHead`,
+// `infer_path_inferred` returned None, and `check_typed_binding`
+// silently passed — strict mode emitted a generic `InferenceLimit`
+// instead of the precise `MainReturnTypeMismatch`.
+#strict
+#import lib from "./lib_with_value.relon"
+#main() -> Int
+lib.alice.region

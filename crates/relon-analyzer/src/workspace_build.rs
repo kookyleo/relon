@@ -428,6 +428,15 @@ pub struct WorkspaceImportIndex {
     /// `u.name` for cross-module schema parameters too. Last-write-wins
     /// on name collisions (same permissive policy as `spread_closures`).
     pub imported_schemas: HashMap<String, HashMap<String, TypeNode>>,
+    /// Schema-rooted §J follow-up: type hints for every root-level value
+    /// field exposed by an aliased import. Keyed by `alias → field →
+    /// TypeNode` so a 3-segment path `pkg.value.field` can resolve the
+    /// mid-step `value`'s static type from this table. Mirrors
+    /// `aliased_closures` but for non-callable root fields (typed
+    /// schema values, primitive values, lists, dicts, ...). Without
+    /// this, `walk_path([alias, value, ...])` lookups stop at the bare
+    /// alias head and the rest of the chain silently leaks `Any`.
+    pub aliased_values: HashMap<String, HashMap<String, TypeNode>>,
 }
 
 impl WorkspaceImportIndex {
@@ -505,6 +514,16 @@ pub(crate) fn build_import_index(ws: &WorkspaceTree, importer_id: &str) -> Works
             .get(target_id)
             .map(|root| collect_root_closure_signatures(root, target_tree))
             .unwrap_or_default();
+        // Schema-rooted §J follow-up: collect root-level value fields
+        // with declared type hints. Mirror of `exported_closures` for
+        // non-callable values — drives `pkg.value.field` mid-path
+        // resolution in `walk_path`. Closures are skipped here so the
+        // two tables stay disjoint (callable vs. addressable value).
+        let exported_values: HashMap<String, TypeNode> = ws
+            .nodes
+            .get(target_id)
+            .map(|root| collect_root_value_type_hints(root))
+            .unwrap_or_default();
         if let Some(alias) = &imp.alias {
             index
                 .aliased
@@ -521,6 +540,17 @@ pub(crate) fn build_import_index(ws: &WorkspaceTree, importer_id: &str) -> Works
                         .iter()
                         .map(|(k, v)| (k.clone(), v.clone())),
                 );
+            // Schema-rooted §J follow-up: addressable root values
+            // (e.g. `pkg.alice.region` where `alice: User` lives in
+            // the imported module). Keys are field names; values are
+            // the declared type hints so the path-tail walker can
+            // descend into the schema's field set on subsequent
+            // segments.
+            index
+                .aliased_values
+                .entry(alias.clone())
+                .or_default()
+                .extend(exported_values.iter().map(|(k, v)| (k.clone(), v.clone())));
             // v1.8e+ fix (issue 3): schemas behind an alias are stored
             // under the *qualified* `alias.Name` key so two aliases
             // pointing at different libs that both export `User`
@@ -603,6 +633,37 @@ fn collect_root_closure_signatures(
         let mut renamed = sig.clone();
         renamed.name = name.clone();
         out.insert(name.clone(), renamed);
+    }
+    out
+}
+
+/// Schema-rooted §J follow-up: walk `root_node`'s top-level dict and
+/// return `field_name → TypeNode` for every non-closure field that
+/// carries an explicit `type_hint`. The path-tail walker consults this
+/// table when descending an aliased import (`pkg.value.field`) so the
+/// mid-step value's declared schema is known to the analyzer.
+///
+/// Closure-valued fields are deliberately skipped — those land in the
+/// sibling `aliased_closures` table, which carries the full
+/// `FnSignature` (including generics / params) instead of a raw
+/// `TypeNode`. Keeping the two tables disjoint avoids a path-tail
+/// surprise where the same name reads as both callable and addressable.
+fn collect_root_value_type_hints(root_node: &Node) -> HashMap<String, TypeNode> {
+    let mut out = HashMap::new();
+    let Expr::Dict(pairs) = &*root_node.expr else {
+        return out;
+    };
+    for (key, value) in pairs {
+        let TokenKey::String(name, _, _) = key else {
+            continue;
+        };
+        if matches!(&*value.expr, Expr::Closure { .. }) {
+            continue;
+        }
+        let Some(hint) = &value.type_hint else {
+            continue;
+        };
+        out.insert(name.clone(), hint.clone());
     }
     out
 }

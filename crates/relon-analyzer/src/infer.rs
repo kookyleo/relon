@@ -1117,6 +1117,33 @@ fn walk_segments(path: &[TokenKey]) -> Vec<WalkSeg> {
     out
 }
 
+/// Schema-rooted §J follow-up: rewrite a single-segment user-schema
+/// `TypeNode` so its head carries the importer's alias prefix —
+/// `User` (recorded inside `lib_with_value.relon`) becomes
+/// `lib.User` when read through `#import lib`. Builtin / prelude
+/// names are left untouched so primitive types and generic
+/// containers don't sprout phantom alias prefixes.
+///
+/// This is what makes `aliased_values[alias][field]` lifts land on
+/// the same qualified schema key (`alias.Name`) that
+/// `build_schema_index` already merged from `imported_schemas`.
+/// Without it, the bare `User` would lift to `Schema("User")`,
+/// `walk_path`'s mid-step schema lookup would miss the importer's
+/// `lib.User` entry, and the rest of the chain would surface as
+/// `UnknownStep`.
+fn qualify_type_node_for_alias(hint: &TypeNode, alias: &str) -> TypeNode {
+    if hint.path.len() == 1
+        && hint.generics.is_empty()
+        && !is_known_builtin_alt(hint.path[0].as_str())
+    {
+        let mut qualified = hint.clone();
+        qualified.path = vec![alias.to_string(), hint.path[0].clone()];
+        qualified
+    } else {
+        hint.clone()
+    }
+}
+
 /// Outcome of walking the tail of a `Variable` / `Reference` path under
 /// the inference engine. Lets callers distinguish "fully resolved" from
 /// "head was found but a middle segment is opaque" — the latter being
@@ -1170,10 +1197,63 @@ pub(crate) fn walk_path(path: &[TokenKey], scope: &TypeScope) -> PathTailOutcome
         // String head).
         return PathTailOutcome::UnknownHead;
     };
-    let Some(mut current) = scope.lookup(head) else {
-        return PathTailOutcome::UnknownHead;
+    // Schema-rooted §J follow-up: 2-segment alias-prefixed value
+    // lookup. When `head` names a known import alias and the next
+    // segment matches a value field exported by that alias's module,
+    // synthesize the walking-current type from `aliased_values[alias]
+    // [field]` and skip both segments before descending. Without this,
+    // `pkg.alice.region` would stop at `scope.lookup("pkg")` (an alias
+    // is not a regular binding) and `walk_path` would return
+    // `UnknownHead`, silently leaking the rest of the chain to `Any`
+    // through `infer_path_inferred`.
+    //
+    // The value's type-hint TypeNode (`User`) is recorded under the
+    // exporter's namespace — bare schema names that the importer's
+    // own `tree.schemas` doesn't carry. Before lifting we splice the
+    // alias prefix onto single-segment schema paths so the result
+    // lands on the same qualified key (`lib.User`) that
+    // `build_schema_index` merged from `imported_schemas`. Builtin
+    // primitives stay un-qualified.
+    let mut start_offset = 0usize;
+    let mut current: InferredType;
+    let alias_value_resolved = if segs.len() >= 2 {
+        if let WalkSeg::Name(field) = &segs[1] {
+            scope
+                .tree
+                .and_then(|t| t.workspace_import_index.as_ref())
+                .and_then(|idx| idx.aliased_values.get(head))
+                .and_then(|values| values.get(field))
+                .map(|hint| {
+                    let qualified = qualify_type_node_for_alias(hint, head);
+                    infer_from_type_node_with_imports(
+                        &qualified,
+                        scope.tree.and_then(|t| t.workspace_import_index.as_ref()),
+                    )
+                })
+        } else {
+            None
+        }
+    } else {
+        None
     };
-    for (offset, seg) in segs[1..].iter().enumerate() {
+    if let Some(ty) = alias_value_resolved {
+        current = ty;
+        start_offset = 1;
+    } else {
+        let Some(looked_up) = scope.lookup(head) else {
+            return PathTailOutcome::UnknownHead;
+        };
+        current = looked_up;
+    }
+    for (offset, seg) in segs[1 + start_offset..].iter().enumerate() {
+        // Re-base offset so `at_segment` indices reported in
+        // `UnknownStep` line up with the *original* `path` —
+        // callers (strict-mode diagnostics) read `at_segment` to
+        // pluck the failing source name, which is unaffected by the
+        // alias-prefix shortcut. After the shortcut, the loop body
+        // is checking `segs[1 + start_offset + offset]`, so the
+        // original-index is `1 + start_offset + offset`.
+        let at_segment = 1 + start_offset + offset;
         // Strip Optional wrappers before stepping, so `Maybe<T> . x`
         // is checked against `T`'s field set.
         if let InferredType::Optional(inner) = current {
@@ -1192,19 +1272,19 @@ pub(crate) fn walk_path(path: &[TokenKey], scope: &TypeScope) -> PathTailOutcome
             (InferredType::Schema(schema_name), WalkSeg::Name(name)) => {
                 let Some(schemas) = scope.schemas else {
                     return PathTailOutcome::UnknownStep {
-                        at_segment: offset + 1,
+                        at_segment,
                         running_name: schema_name,
                     };
                 };
                 let Some(fields) = schemas.get(&schema_name) else {
                     return PathTailOutcome::UnknownStep {
-                        at_segment: offset + 1,
+                        at_segment,
                         running_name: schema_name,
                     };
                 };
                 let Some(field_ty) = fields.get(name) else {
                     return PathTailOutcome::UnknownStep {
-                        at_segment: offset + 1,
+                        at_segment,
                         running_name: schema_name,
                     };
                 };
@@ -1226,7 +1306,7 @@ pub(crate) fn walk_path(path: &[TokenKey], scope: &TypeScope) -> PathTailOutcome
                     current = elem;
                 } else {
                     return PathTailOutcome::UnknownStep {
-                        at_segment: offset + 1,
+                        at_segment,
                         running_name: format!("Tuple of arity {arity}"),
                     };
                 }
@@ -1235,7 +1315,7 @@ pub(crate) fn walk_path(path: &[TokenKey], scope: &TypeScope) -> PathTailOutcome
                 // Tuples are positional — stepping by name is a hard
                 // failure. (Use `pair.0` instead of `pair.first`.)
                 return PathTailOutcome::UnknownStep {
-                    at_segment: offset + 1,
+                    at_segment,
                     running_name: InferredType::Tuple(elems).name(),
                 };
             }
@@ -1251,7 +1331,7 @@ pub(crate) fn walk_path(path: &[TokenKey], scope: &TypeScope) -> PathTailOutcome
                 // user-visible nested fields, and a tuple wasn't
                 // matched by the more specific arms above.
                 return PathTailOutcome::UnknownStep {
-                    at_segment: offset + 1,
+                    at_segment,
                     running_name: other.name(),
                 };
             }

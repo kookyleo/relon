@@ -1,0 +1,8 @@
+// Schema-rooted §J follow-up: an aliased module that exposes a
+// root-level addressable value (`alice: User`) alongside the schema.
+// Used by the entry to exercise `pkg.alice.region` path-tail walking
+// through `aliased_values`.
+#schema User { String region: * }
+{
+    User alice: { region: "eu" }
+}

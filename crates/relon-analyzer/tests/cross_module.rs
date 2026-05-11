@@ -136,6 +136,62 @@ fn fixture_cross_module_dual_alias_same_path() {
     assert_eq!(unknown_types, 0, "{:#?}", ws.modules);
 }
 
+/// Schema-rooted §J follow-up: a `pkg.value.field` path-tail walk
+/// through an aliased import's root-level value field now resolves
+/// without strict-mode noise. The fixture's `lib.alice.region` ends
+/// in `String`, so a declared `#main() -> String` lands cleanly.
+#[test]
+fn fixture_cross_module_strict_pkg_value_path_ok() {
+    let ws = analyze_fixture_workspace("cross_module", "strict_pkg_value_path_ok.relon");
+    let stalls: usize = ws
+        .modules
+        .values()
+        .flat_map(|t| t.diagnostics.iter())
+        .filter(|d| {
+            matches!(
+                d,
+                Diagnostic::InferenceLimit { .. }
+                    | Diagnostic::UnknownReferenceType { .. }
+                    | Diagnostic::MainReturnTypeMismatch { .. }
+            )
+        })
+        .count();
+    assert_eq!(stalls, 0, "{:#?}", ws.modules);
+}
+
+/// Schema-rooted §J follow-up: the negative half — when the `pkg.value
+/// .field` walk now succeeds and produces a concrete type, a declared
+/// `#main() -> Int` mismatching the field's `String` should surface as
+/// `MainReturnTypeMismatch`. Pre-fix the walker returned `UnknownHead`
+/// and the strict-mode pass collapsed to `InferenceLimit` instead of
+/// the precise mismatch.
+#[test]
+fn fixture_cross_module_strict_pkg_value_path_mismatch() {
+    let ws = analyze_fixture_workspace("cross_module", "strict_pkg_value_path_mismatch.relon");
+    let mismatches: usize = ws
+        .modules
+        .values()
+        .flat_map(|t| t.diagnostics.iter())
+        .filter(|d| {
+            matches!(
+                d,
+                Diagnostic::MainReturnTypeMismatch { expected, found, .. }
+                    if expected == "Int" && found == "String"
+            )
+        })
+        .count();
+    assert_eq!(mismatches, 1, "{:#?}", ws.modules);
+    // No silent fallback: `InferenceLimit` must not fire — the walker
+    // resolved the value-path concretely.
+    let stalls: usize = ws
+        .modules
+        .values()
+        .flat_map(|t| t.diagnostics.iter())
+        .filter(|d| matches!(d, Diagnostic::InferenceLimit { .. }))
+        .count();
+    assert_eq!(stalls, 0, "{:#?}", ws.modules);
+}
+
 /// v1.8+ cross-module type validation: a 2-segment param type whose
 /// alias is valid but whose tail isn't in the alias's exported
 /// schemas. Pre-fix the analyzer accepted any `pkg.Wrong` silently

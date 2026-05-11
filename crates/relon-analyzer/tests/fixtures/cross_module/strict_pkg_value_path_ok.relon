@@ -1,0 +1,9 @@
+// Schema-rooted §J follow-up: the positive case — `pkg.alice.region`
+// walks through the alias's `aliased_values["lib"]["alice"]` and
+// `lib.User`'s field set without emitting any diagnostic. Pre-fix the
+// strict-mode analyzer flagged `cannot statically infer this
+// expression` because `walk_path` returned `UnknownHead` for `lib`.
+#strict
+#import lib from "./lib_with_value.relon"
+#main() -> String
+lib.alice.region
