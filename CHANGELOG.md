@@ -71,8 +71,50 @@ implementation to a `#native` method on a specific schema. The
 typed `(schema, method)` key replaces the v1 pattern of
 `register_fn("Schema.method", ...)`. Capability gating mirrors
 `register_fn`. The legacy `register_fn` / `register_pure_fn` paths
-remain for free-function dispatch; the stdlib migration onto
-`register_method` is deferred to a follow-up release.
+remain for free-function dispatch.
+
+### Stdlib method mirror
+
+`stdlib.rs` now double-registers 17 intrinsics on the built-in
+schemas:
+
+  * `String` — `split`, `replace`, `upper`, `lower`, `contains`, `len`
+  * `List` — `map`, `filter`, `reduce`, `contains`, `join`, `len`
+  * `Dict` — `merge`, `keys`, `values`, `has_key`, `len`
+
+Both the legacy free-fn name (`_string_upper`, `len`, …) and the
+schema-rooted method (`String::upper`, `String::len`) point at the
+same `Arc<dyn RelonFunction>`. `math.*` / `range` / `type` /
+`ensure.*` stay as polymorphic free fns (decision 14: a free fn that
+accepts heterogeneous types isn't a method).
+
+To call a built-in method from source today you still need to declare
+the slot via `#extend String with { #native upper() -> String }` so
+the analyzer knows it's there — the «open-box `s.upper()`» convenience
+(a built-in stdlib schema carrier) is on roadmap §J.
+
+### Constraints + auto-derive + `<=` / `>=`
+
+`constraints.rs` registers the witness shape of `Equatable` (`eq`),
+`Comparable` (`lt`), and `JsonProjectable` (`to_json`). A
+`#derive Constraint` placed above a method declaration cross-checks
+the method's signature against the registered shape — mismatches
+emit `Diagnostic::ConstraintWitnessShapeMismatch`.
+
+Every user schema auto-derives `Equatable` and `JsonProjectable` by
+default (analyzer injects placeholder methods); the evaluator's
+operator lowering falls back to `Value::PartialEq` when the
+placeholder has no host registration, so `a == b` works on every
+schema without ceremony. Opt out with `#no_auto_derive Equatable`
+(then `a == b` still works — structural fallback — but
+`#derive Equatable` against a witness-shaped method is required for
+a custom impl). `Comparable` stays opt-in.
+
+`<=` synthesizes from `lt ∨ eq`; `>=` synthesizes from
+`(swap lt) ∨ eq`. Missing `lt` drops the entire pair to numeric
+comparison (so primitives keep working); missing `eq` falls back to
+`Value::PartialEq`. Mirrors the Equatable-on-by-default /
+Comparable-opt-in asymmetry.
 
 ### Migration
 
