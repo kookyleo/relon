@@ -55,8 +55,7 @@ are **not** input. Therefore:
   up** determinism — network and external state vary over time, and
   the spec neither requires nor can guarantee parity.
 
-See `docs/zh/guide/host-integration.md` for the implementer guide
-(the comprehensive guide is currently Chinese-first).
+See [Host integration](./host-integration) for the implementer guide.
 
 ### 1.3 sigil split: `@` vs `#`
 

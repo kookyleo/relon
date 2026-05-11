@@ -117,7 +117,10 @@ To prevent misreadings, here's what's deliberately out of scope:
 
 ## Where to go next
 
-> Note: the comprehensive guide is currently Chinese-first. The English landing pages are kept in sync; deeper guides may still be Chinese-only — switch to **简体中文** in the top right for the full guide.
-
-- Syntax basics: [Syntax](../guide/introduction.md)
+- Syntax basics: [Syntax basics](./syntax)
+- Writing contracts: [Types & schema contracts](./types)
+- Modules and entry programs: [Modules & scope](./modules)
+- Embedding into a Rust host: [Host integration](./host-integration)
+- Running untrusted scripts: [Sandbox & capabilities](./sandbox)
+- Standard library tour: [Standard library](./stdlib)
 - Project on GitHub: <https://github.com/kookyleo/relon>

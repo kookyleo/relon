@@ -81,15 +81,34 @@ export default defineConfig({
         ],
         sidebar: [
           {
-            text: 'Introduction',
+            text: 'Getting started',
             items: [
               { text: 'What is Relon?', link: '/en/guide/introduction' },
+              { text: 'Use cases & positioning', link: '/en/guide/use-cases' },
+              { text: 'Syntax basics', link: '/en/guide/syntax' },
+            ]
+          },
+          {
+            text: 'Core features',
+            items: [
+              { text: 'Functions & closures', link: '/en/guide/functions' },
+              { text: 'Types & schema contracts', link: '/en/guide/types' },
+              { text: 'Modules & scope', link: '/en/guide/modules' },
+            ]
+          },
+          {
+            text: 'Embedding & sandbox',
+            items: [
+              { text: 'Host integration', link: '/en/guide/host-integration' },
+              { text: 'Sandbox & capabilities', link: '/en/guide/sandbox' },
             ]
           },
           {
             text: 'Reference',
             items: [
-              { text: 'Language Spec', link: '/en/guide/spec' },
+              { text: 'Language spec', link: '/en/guide/spec' },
+              { text: 'Standard library', link: '/en/guide/stdlib' },
+              { text: 'Architecture overview', link: '/en/guide/architecture' },
             ]
           }
         ],
