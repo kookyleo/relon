@@ -172,6 +172,44 @@ fn derive_equatable_with_wrong_return_type_diagnoses() {
 }
 
 // ===================================================================
+// Phase C.6: shape checking for the four new constraint registry
+// entries (Iterable / Indexable / Addable / Subtractable / ...) —
+// witness shape is validated even though their operator lowering
+// (for / a[i] / arithmetic) is still TODO.
+// ===================================================================
+
+#[test]
+fn derive_addable_with_matching_shape_no_diagnostic() {
+    let tree = analyze_fixture("schema_methods/derive_addable_ok.relon");
+    let bad = count(&tree.diagnostics, |d| {
+        matches!(d, Diagnostic::ConstraintWitnessShapeMismatch { .. })
+    });
+    assert_eq!(bad, 0, "{:?}", tree.diagnostics);
+}
+
+#[test]
+fn derive_addable_with_wrong_shape_diagnoses() {
+    let tree = analyze_fixture("schema_methods/derive_addable_bad_shape.relon");
+    let mismatches: Vec<_> = tree
+        .diagnostics
+        .iter()
+        .filter(|d| {
+            matches!(
+                d,
+                Diagnostic::ConstraintWitnessShapeMismatch { constraint, method, .. }
+                    if constraint == "Addable" && method == "add"
+            )
+        })
+        .collect();
+    assert_eq!(
+        mismatches.len(),
+        1,
+        "expected ConstraintWitnessShapeMismatch on Addable.add: {:?}",
+        tree.diagnostics
+    );
+}
+
+// ===================================================================
 // Phase C.4: auto-derive Equatable / JsonProjectable.
 // ===================================================================
 

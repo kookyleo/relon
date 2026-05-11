@@ -1,0 +1,11 @@
+// Phase C.6: `#derive Addable` against a method that takes `Int`
+// (not `Self`) and returns `Int` (not `Self`). Analyzer should report
+// `ConstraintWitnessShapeMismatch`.
+#schema Bad {
+    Int v: *
+} with {
+    #derive Addable
+    add(other: Int) -> Int: self.v + other
+}
+
+{ Bad b: { v: 1 } }

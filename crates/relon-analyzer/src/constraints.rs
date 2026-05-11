@@ -93,9 +93,95 @@ pub(crate) const CONSTRAINTS: &[ExpectedWitness] = &[
         params: &[],
         return_type: "String",
     },
-    // Future constraints (Iterable, Indexable, Callable, Number) need
-    // evaluator-side lowering for ()/index/call/numeric operators and
-    // are deferred — see schema-rooted-implementation-log §C.3.
+    // Decisions 21-24 of `schema-rooted-model-2026-05-11.md`: the
+    // witness *shape* for the remaining constraints is fixed here so
+    // a `#derive` against the wrong-shape method already surfaces
+    // `ConstraintWitnessShapeMismatch`. The lowering (binding the
+    // method to `for`/`a[i]`/arithmetic operators in the evaluator)
+    // is the still-pending hook — see `schema-rooted-implementation-
+    // log` §C.6 for the per-constraint TODO.
+    //
+    // Iterable: `for x in c` desugars to `c.iter()` + `it.next()`.
+    // Requires evaluator iteration site to consult `iter` witness +
+    // a built-in `Iter<T>` schema. Until that lands, `#derive
+    // Iterable iter() -> Iter<T>: ...` is shape-checked but the body
+    // can only be called as a plain method (no `for` lowering).
+    ExpectedWitness {
+        constraint: "Iterable",
+        method: "iter",
+        params: &[],
+        // `Iter<T>` is a generic schema; the shape check only
+        // compares the head-segment name. Concrete element-type
+        // unification is deferred to lowering time.
+        return_type: "Iter",
+    },
+    // Indexable: `a[i]` desugars to `a.index(i)`. Witness signature
+    // is parameterized — `index(key: K) -> Optional<V>` — and the
+    // ExpectedParam table can only encode single-segment names, so
+    // the param type is left as a stand-in (`Any` is wrong; we use
+    // the constraint-internal placeholder `Key`). The lowering pass
+    // will eventually do proper generic unification.
+    ExpectedWitness {
+        constraint: "Indexable",
+        method: "index",
+        params: &[ExpectedParam {
+            name: "key",
+            type_name: "Any",
+        }],
+        return_type: "Optional",
+    },
+    // Number family (decision 24 — five independent constraints, one
+    // method each). `+` / `-` / `*` / `/` / `%` lower to the
+    // corresponding witness when the LHS is a branded value whose
+    // schema derives the matching constraint; primitives keep their
+    // built-in arithmetic via fallback. `Callable` is intentionally
+    // NOT in this table (decision 23: Closure stays the only callable
+    // value form).
+    ExpectedWitness {
+        constraint: "Addable",
+        method: "add",
+        params: &[ExpectedParam {
+            name: "other",
+            type_name: "Self",
+        }],
+        return_type: "Self",
+    },
+    ExpectedWitness {
+        constraint: "Subtractable",
+        method: "sub",
+        params: &[ExpectedParam {
+            name: "other",
+            type_name: "Self",
+        }],
+        return_type: "Self",
+    },
+    ExpectedWitness {
+        constraint: "Multiplicable",
+        method: "mul",
+        params: &[ExpectedParam {
+            name: "other",
+            type_name: "Self",
+        }],
+        return_type: "Self",
+    },
+    ExpectedWitness {
+        constraint: "Divisible",
+        method: "div",
+        params: &[ExpectedParam {
+            name: "other",
+            type_name: "Self",
+        }],
+        return_type: "Self",
+    },
+    ExpectedWitness {
+        constraint: "Modable",
+        method: "rem",
+        params: &[ExpectedParam {
+            name: "other",
+            type_name: "Self",
+        }],
+        return_type: "Self",
+    },
 ];
 
 /// Look up a constraint by name. Returns `None` for names that aren't

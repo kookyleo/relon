@@ -439,7 +439,216 @@ schema 上** —— 譬如 `@uppercase @parse_int "42"` 流是
 上找 `uppercase`（如果 Int 没有 uppercase 就在第二步报
 `MethodNotFound on Int`）。
 
+## 4 个剩余 constraint 的 lowering（决策 21-24）
 
+`Equatable` / `Comparable` / `JsonProjectable` 已经定型（决策 15、18），
+constraint 体系闭合还差 4 项：迭代、索引、可调用、算术。逐项 design out。
+
+### 21：Iterable — `iter() -> Iter<T>` 真迭代器
+
+`for x in c` / 列表推导式 `[for x in c: ...]` 编译到 `c.iter()` 拿
+一个 `Iter<T>`，循环里反复 `it.next()` 直到 `None`。
+
+```relon
+// constraint witness
+#extend MyCollection with {
+    #derive Iterable
+    iter() -> Iter<Item>: ...
+}
+
+// 新增 prelude schema（与 Optional / Result 同级）
+#schema Iter<T> with {
+    #native next() -> Optional<T>
+}
+
+// 编译路径：
+for x in c: body
+// ↓ desugar
+let it = c.iter()
+loop {
+    match it.next() {
+        Some(x) => body,
+        None => break,
+    }
+}
+```
+
+**为什么不选 `to_list()` desugar**：lazy 表达力是 Iterable 区别于
+List 的核心；用 `to_list()` 会让大集合 / 无限序列 / IO-driven 流
+退化为 eager List。`Iter<T>` 与 immutable 模型不冲突 —— `next()`
+返回 `Optional<T>`，外部传 `it`（Iter 本身是个值），调一次拿一个元素，
+迭代器的「状态推进」由 host `#native` 实现内部封装（host 端可以是
+mutable，但 relon 源码层面只看到「函数返回下一个元素」）。这条
+设计与 Closure 已经能持有捕获环境的语义对称。
+
+**List / Dict / String 的内置 `iter()`**：在 `core.relon`（决策
+21' 见下）声明，host 提供 `register_pure_method("List", "iter", ...)`
+等实现。
+
+### 22：Indexable — `index(key: K) -> Optional<V>`
+
+`a[i]` 编译到 `a.index(i)`；返回类型固定是 `Optional<V>`。用户必须
+显式 `a[i]?` / `a[i] ?? d` 才能拿到 V，与 path-tail 可选访问语义
+（`obj.field?`）一致。
+
+```relon
+// constraint witness
+#extend Sparse<K, V> with {
+    #derive Indexable
+    index(key: K) -> Optional<V>: ...
+}
+
+// 用户层
+let v: V          = a[i]?           // panic if None
+let v: V          = a[i] ?? default
+let vo: Optional<V> = a[i]          // 不 unwrap
+
+// List / Dict / String 内置 index 一律走 Optional
+let s: Optional<String> = arr[3]
+let n: Optional<Int>    = dict["count"]
+```
+
+**为什么不允许 `index() -> V` panic 风格**：
+
+1. 与现有 `a.field?` path-tail 语义对齐 —— 同一个「访问可能失败」直觉，
+   不应该按容器形态分裂两套规则。
+2. panic 风格会让 a[i] 的可失败性从类型上消失，static analysis 无从
+   下手；强制 `Optional<V>` 把「可能失败」推到类型签名。
+3. `a[i]?` 一行就能恢复 panic 风格，写起来不贵。
+
+### 23：Callable — 不引入
+
+用户 schema **不能**直接 `f(args)` 调用；保留「只有 `Closure` 是可调用值」
+的语义。需要「值作为函数」体验的 builder / functor 模式，用具名 method：
+
+```relon
+// builder 模式
+#schema Greeter { String prefix: * } with {
+    invoke(name: String) -> String:
+        f"${self.prefix} ${name}"
+}
+
+let g = { Greeter: { prefix: "hi" } }
+let s = g.invoke("Ada")    // ✅ 具名 method
+// let s = g("Ada")        // ✗ 编译错：g 不是 Closure
+```
+
+**为什么不引入**：
+
+1. `f(args)` 已经是 FnCall 的字面形态，加 `Callable` 会让「path[0]
+   是不是 Closure」的判断变成「path[0] 的 schema 上有没有 call witness」
+   的多分支查表 —— hot path 复杂化，错误信息也更难指给用户看（「这个
+   不是函数」 vs 「这个 schema 没实现 Callable」）。
+2. Closure 已经能捕获状态，覆盖 functor 用例。builder 模式
+   `g.invoke(...)` 比 `g(...)` 多打 7 个字符，但语义更显式（读者立刻
+   看出 g 是 schema 不是 fn）。
+3. 这是 «keep the closed door closed» 决策 —— 不开 trait 多态调用，
+   就少一个 dispatch 路径需要维护、文档化、教学。
+
+constraint 注册表把 `Callable` 项目**从 spec 删除**，constraint
+体系 = {Equatable, Comparable, JsonProjectable, Iterable, Indexable,
+Addable, Subtractable, Multiplicable, Divisible, Modable}，共 10 项。
+
+### 24：Number — 拆细为 5 个独立 constraint
+
+`+` `-` `*` `/` `%` 各走独立 constraint，按需 `#derive`：
+
+| Operator | Constraint     | Witness                          |
+|----------|----------------|----------------------------------|
+| `+`      | Addable        | `add(other: Self) -> Self`       |
+| `-`      | Subtractable   | `sub(other: Self) -> Self`       |
+| `*`      | Multiplicable  | `mul(other: Self) -> Self`       |
+| `/`      | Divisible      | `div(other: Self) -> Self`       |
+| `%`      | Modable        | `rem(other: Self) -> Self`       |
+
+```relon
+#schema Vec2 { Float x: *, Float y: * } with {
+    #derive Addable
+    add(other: Self) -> Self:
+        { Vec2: { x: self.x + other.x, y: self.y + other.y } }
+    #derive Subtractable
+    sub(other: Self) -> Self:
+        { Vec2: { x: self.x - other.x, y: self.y - other.y } }
+}
+
+let u: Vec2 = ...
+let v: Vec2 = ...
+let w = u + v   // 命中 Vec2.add
+let z = u - v   // 命中 Vec2.sub
+// let r = u * v  // ✗ 编译错：Vec2 not Multiplicable
+```
+
+**为什么拆细，不要一个统一的 `Number`**：
+
+1. 大量场景只需要部分算子。向量加法不该被迫定义 `*`（点乘？外积？
+   两者语义不同），写「我们就不让 `*` 编译」比「随便实现一个」更安全。
+2. 与 Iterable / Indexable / Equatable 单 witness 的粒度对齐 ——
+   constraint 体系里「一个 constraint = 一个 method」是统一形状，
+   `Number` 5 method 一组反而是异类。
+3. analyzer 的 `ConstraintWitnessShapeMismatch` 检查每次扫一个
+   witness，5 个并立的 constraint 比 5-method 单 constraint 错误
+   信息更精准（直接说「Subtractable 的 sub method 形状不对」而不是
+   「Number 的第 2 项不对」）。
+
+**primitives 不参与**：Int / Float / String 的 `+` `-` `*` `/`
+现有语义（含 String concat、numeric promotion）保留 fallback 路径，
+constraint dispatch 仅当 LHS 是 branded value 且 schema 上有
+对应 witness 时才命中。与决策 15 「Equatable on by default for
+user schema」对称：constraint 体系**只给用户 schema 添加行为**，
+不替换 primitives 的 hardcoded 语义。
+
+**unary minus**：`-x` 独立成 `Negatable` constraint
+（`neg(self) -> Self`），不计入这 5 个里 —— `Subtractable` 是二元，
+`Negatable` 是一元，witness shape 不同。本批延后到「真有需要」再开。
+
+### 21'：core.relon 载体（统一 dispatch entry point）
+
+跟决策 4 呼应：内置 schema 的方法在 `crates/relon-evaluator/src/core/*.relon`
+（或单一 `core.relon`）声明，编译期 `include_str!` 内嵌，analyzer 启动时
+always-on 加载到 `tree.schema_methods`。host Rust 通过
+`register_pure_method` 提供 `#native` 实现。
+
+```relon
+// core/string.relon（schema-rooted 载体）
+#schema String with {
+    #native upper() -> String
+    #native lower() -> String
+    #native split(sep: String) -> List<String>
+    #native replace(from: String, to: String) -> String
+    #native contains(sub: String) -> Bool
+    #native len() -> Int
+}
+
+// core/list.relon
+#schema List<T> with {
+    #native map<U>(f: Closure<(T) -> U>) -> List<U>
+    #native filter(f: Closure<(T) -> Bool>) -> List<T>
+    #native reduce<U>(init: U, f: Closure<(U, T) -> U>) -> U
+    #native contains(x: T) -> Bool
+    #native iter() -> Iter<T>
+    #native len() -> Int
+}
+
+// core/dict.relon
+#schema Dict<K, V> with {
+    #native merge(other: Self) -> Self
+    #native keys() -> List<K>
+    #native values() -> List<V>
+    #native has_key(k: K) -> Bool
+    #native iter() -> Iter<Tuple<K, V>>
+    #native len() -> Int
+}
+
+// core/iter.relon
+#schema Iter<T> with {
+    #native next() -> Optional<T>
+}
+```
+
+用户写 `s.upper()` / `lst.map(f)` 直接命中 —— analyzer 看到 core
+schema 的 method 声明，evaluator 走 `register_pure_method` 提供的
+host 实现。零 `#extend` boilerplate，零特例：core 库与用户库走同
+一条 dispatch path。
 
 ## 一句话定性
 

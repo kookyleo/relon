@@ -343,3 +343,41 @@ a.eq(b)`。当 `lt` 命中但 `eq` 没命中（或反之），怎么处理？候
 **回流**：是。属于 Phase 范围调整，已在 roadmap.md §J 标记
 「Phase D 收尾」未完成。
 
+### C.6：补 4 个 constraint 的 witness 形状（lowering 未挂）
+2026-05-11 / Phase C / `crates/relon-analyzer/src/constraints.rs`
+
+**问题**：之前 constraint 注册表只登 Equatable / Comparable /
+JsonProjectable 三项，Iterable / Indexable / Callable / Number
+留注释占位。后续问答中决定逐条 design out（结果：选 iter() 真
+迭代器、Optional 索引、删 Callable、拆细 Number 为 5 个独立
+constraint）。现在补哪些到注册表？
+
+**选择**：把 Iterable、Indexable、Addable、Subtractable、
+Multiplicable、Divisible、Modable 加入 `CONSTRAINTS` 数组（共 7
+条新条目），witness 形状定义齐全；**但 evaluator 端的 operator
+lowering 钩子（for / `a[i]` / arithmetic）暂不实施**，留待单独
+follow-up。Callable 按决策 23 从 spec 移除，不进注册表。
+
+**理由**：
+- 注册表条目让 `#derive Addable add(other: Self) -> Self`
+  立刻享受 `ConstraintWitnessShapeMismatch` 静态检查；用户哪怕
+  现在不能 `u + v` 命中 method，至少 `#derive` 的形状错能被
+  analyzer 立刻指出来。
+- Iterable / Indexable / Number 的 witness 涉及泛型
+  (`Iter<T>` / `Optional<V>` / `Self`)，但当前 `ExpectedParam`
+  只编码单段类型名 —— Iterable 的 return type 用 `"Iter"`
+  head-name match，Indexable 的 param type 暂用 `"Any"` 占位
+  注释中标记。完整泛型 unification 等 lowering 时再补；现在
+  存的是「shape 检查能用 + 文档上说得清」的最小集合。
+- 拆细 5 个 Number constraint 而非合并：决策 24 的「按需 derive」
+  落到注册表是 5 条独立条目，与「一个 constraint = 一个 method」
+  形状对齐，方便诊断信息精准定位（错 sub 不会说成「Number 的第
+  2 项」）。
+- Callable 不登（决策 23 删除）：避免用户写 `#derive Callable
+  call(...)` 期待 `f(args)` 直接命中，事后失望。注册表是「能 derive
+  的 constraint 集合」语义，不该列出无 lowering 的项。
+
+**回流**：是。schema-rooted 主文档新增「4 个剩余 constraint 的
+lowering（决策 21-24）」章节，注册表 + 主文档同步。lowering
+钩子留 roadmap §J 单独追踪。
+
