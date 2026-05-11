@@ -36,6 +36,14 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo run -q -p relon-fmt -- --check fixtures/*.relon fixtures/modules/*.relon fixtures/errors/*.relon examples/*.relon
 ```
 
+After a fresh clone, install the repository's git hooks once:
+```bash
+./scripts/install-hooks.sh
+```
+The pre-commit hook lists every staged file before each commit so
+authors can spot accidental cross-task scope creep (common in
+parallel workflows). It's advisory — never blocks.
+
 ## 🛠 Features
 
 - **Sandboxed by default**: a script declares the capabilities it needs
