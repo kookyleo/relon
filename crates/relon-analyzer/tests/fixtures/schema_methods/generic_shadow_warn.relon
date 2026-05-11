@@ -1,0 +1,7 @@
+// Method generic `<T>` reuses the owning schema's generic name. The
+// substitution path treats both `T`s as the same binding key, so the
+// analyzer emits `MethodGenericShadowsSchemaGeneric` (Warning).
+#schema Box<T> with {
+    pick<T>(other: T) -> T: other
+}
+{}

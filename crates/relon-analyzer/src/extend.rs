@@ -147,6 +147,53 @@ pub fn check_method_uniqueness(tree: &mut AnalyzedTree) {
     tree.diagnostics.extend(diags);
 }
 
+/// Schema-rooted §J follow-up: warn when a method's own generic parameter
+/// shadows one of its owning schema's generic parameters.
+///
+/// `#schema List<T> with { foo<T>(...) -> T: ... }` is accepted by the
+/// parser and currently doesn't surface any diagnostic, but the
+/// substitution path treats the two `T`s as the same binding key —
+/// `resolve_call_signature` first substitutes the receiver's `T` (bound
+/// from the runtime receiver), then `instantiate` rebinds the same `T`
+/// against actual arg types. The end result is hard to read and
+/// regression-prone. Renaming the method generic (`foo<U>(...)`) keeps
+/// the binding keys distinct.
+///
+/// We only walk schemas the analyzer has SchemaDef metadata for —
+/// built-in carriers like `core/list.relon` populate the schema by
+/// name through the same path (`collect_schemas`), so `List<T>` /
+/// `Dict<K, V>` participate without needing a special case.
+///
+/// Severity is Warning: the program still runs, the diagnostic just
+/// flags the smell.
+pub fn check_method_generic_shadowing(tree: &mut AnalyzedTree) {
+    let mut diags = Vec::new();
+    for def in tree.schemas.values() {
+        if def.generics.is_empty() {
+            continue;
+        }
+        let Some(schema_name) = def.name.as_deref() else {
+            continue;
+        };
+        for m in &def.methods {
+            if m.generics.is_empty() {
+                continue;
+            }
+            for g in &m.generics {
+                if def.generics.iter().any(|sg| sg == g) {
+                    diags.push(Diagnostic::MethodGenericShadowsSchemaGeneric {
+                        schema: schema_name.to_string(),
+                        method: m.name.clone(),
+                        generic: g.clone(),
+                        range: span_of(m.name_range),
+                    });
+                }
+            }
+        }
+    }
+    tree.diagnostics.extend(diags);
+}
+
 /// Synthesize an [`FnSignature`] for `method`. `self` is *not* part of
 /// the signature's parameter list — the receiver is identified by the
 /// `(schema, method)` lookup key, so duplicating it as a leading param

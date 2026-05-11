@@ -1,0 +1,6 @@
+// Distinct generic names on the schema (`T`) and method (`U`) — no
+// shadowing, no diagnostic.
+#schema Box<T> with {
+    morph<U>(other: U) -> U: other
+}
+{}

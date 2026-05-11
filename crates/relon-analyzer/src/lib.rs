@@ -175,6 +175,12 @@ pub fn analyze_with_options(root: &Node, options: &AnalyzeOptions) -> AnalyzedTr
     // per-pass conflict checks above (e.g. two methods of the same
     // name declared inside a single `with { ... }` block).
     extend::check_method_uniqueness(&mut tree);
+    // Schema-rooted §J follow-up: warn when a method's generic
+    // parameter shadows one of its owning schema's. The substitution
+    // path treats the two names as the same binding key, so the
+    // method body can't distinguish them. Pure warning — does not
+    // gate evaluation.
+    extend::check_method_generic_shadowing(&mut tree);
     // Schema-rooted Phase C.3: `#derive C` witness shape checking.
     // Must run after duplicate-name detection so a duplicate that's
     // also a witness gets the single `MethodNameConflict` instead of

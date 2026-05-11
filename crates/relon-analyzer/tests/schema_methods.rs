@@ -406,3 +406,74 @@ fn method_signature_table_propagates_method_generics() {
         sig.generics
     );
 }
+
+// ===================================================================
+// Schema-rooted §J follow-up: `MethodGenericShadowsSchemaGeneric`
+// surfaces when a method's `<T>` collides with one of the owning
+// schema's `<T>` parameters. Substitution treats the two names as a
+// single binding key — the warning lets authors see the smell before
+// debugging mysterious instantiation results.
+// ===================================================================
+
+#[test]
+fn method_generic_shadowing_emits_warning() {
+    let tree = analyze_fixture("schema_methods/generic_shadow_warn.relon");
+    let warnings: Vec<_> = tree
+        .diagnostics
+        .iter()
+        .filter(|d| {
+            matches!(d,
+                Diagnostic::MethodGenericShadowsSchemaGeneric { schema, method, generic, .. }
+                    if schema == "Box" && method == "pick" && generic == "T"
+            )
+        })
+        .collect();
+    assert_eq!(
+        warnings.len(),
+        1,
+        "expected one shadow warning on Box::pick<T>: {:?}",
+        tree.diagnostics
+    );
+    // Severity is Warning — the program is still well-formed.
+    assert_eq!(
+        warnings[0].severity(),
+        relon_analyzer::Severity::Warning,
+        "shadow diagnostic should be Warning, not Error"
+    );
+}
+
+#[test]
+fn method_generic_with_distinct_name_stays_silent() {
+    let tree = analyze_fixture("schema_methods/generic_shadow_distinct.relon");
+    let warnings = count(&tree.diagnostics, |d| {
+        matches!(d, Diagnostic::MethodGenericShadowsSchemaGeneric { .. })
+    });
+    assert_eq!(
+        warnings, 0,
+        "distinct generic names must not trigger the shadow warning: {:?}",
+        tree.diagnostics
+    );
+}
+
+#[test]
+fn monomorphic_method_on_generic_schema_stays_silent() {
+    // `#schema Box<T>` with a method that has no generics of its own
+    // (e.g. `eq(other: Self) -> Bool`) is the regression-bait case
+    // called out in the task description. Must not warn.
+    let src = r#"
+#schema Box<T> with {
+    eq(other: Self) -> Bool: true
+}
+{}
+"#;
+    let node = relon_parser::parse_document(src).expect("parse");
+    let tree = relon_analyzer::analyze(&node);
+    let warnings = count(&tree.diagnostics, |d| {
+        matches!(d, Diagnostic::MethodGenericShadowsSchemaGeneric { .. })
+    });
+    assert_eq!(
+        warnings, 0,
+        "method with no generics of its own should never warn: {:?}",
+        tree.diagnostics
+    );
+}

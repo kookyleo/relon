@@ -555,6 +555,26 @@ pub enum Diagnostic {
         range: SourceSpan,
     },
 
+    #[error(
+        "method `{method}` on schema `{schema}` redeclares a generic name `{generic}` already bound by the schema"
+    )]
+    #[diagnostic(
+        code(relon::analyze::method_generic_shadows_schema_generic),
+        help(
+            "The method's `<{generic}>` shadows the schema's `<{generic}>` of the same name. Substitution at the call site binds the receiver's `{generic}` first, so the method-level placeholder silently rebinds the same key — readers can't tell which `{generic}` is meant in the body. Rename the method generic (e.g. `<U>` instead of `<{generic}>`) so each binding key is distinct."
+        )
+    )]
+    MethodGenericShadowsSchemaGeneric {
+        /// Owning schema name (`List`, `Bag`, ...).
+        schema: String,
+        /// Method that introduces the colliding generic name.
+        method: String,
+        /// The generic name that collides (`T`, `K`, ...).
+        generic: String,
+        #[label("method generic shadows schema generic `{generic}`")]
+        range: SourceSpan,
+    },
+
     #[error("bare `{type_name}` requires explicit type parameter(s) in `{context}`")]
     #[diagnostic(
         code(relon::analyze::bare_generic_container),
@@ -646,6 +666,13 @@ impl Diagnostic {
             // spread, closure binding, or runtime-computed field may
             // still resolve, so we don't gate evaluation on it.
             Diagnostic::UnresolvedReference { .. } => Severity::Warning,
+            // Schema-rooted §J follow-up: same-name shadowing between
+            // a method's `<T>` and the owning schema's `<T>` produces
+            // a confusing substitution order (the method's binding
+            // silently rebinds the schema's key). Warning rather than
+            // error because the program does run — readers just can't
+            // tell which `T` is meant in the body.
+            Diagnostic::MethodGenericShadowsSchemaGeneric { .. } => Severity::Warning,
         }
     }
 }
