@@ -4229,6 +4229,154 @@ fn operator_ne_inverts_user_eq() {
 }
 
 // ===================================================================
+// Phase C.4 + C.5: auto-derive Equatable fallback + `<=` / `>=`
+// lowering. The analyzer synthesizes an `eq` witness on every user
+// schema that hasn't opted out (default-ON for Equatable). When no
+// user body and no host native are wired, the evaluator must fall
+// back to the structural `Value::PartialEq` path so `a == b` keeps
+// working out of the box.
+// ===================================================================
+
+#[test]
+fn auto_derived_eq_falls_back_to_structural_equality() {
+    // No user `eq` method, no `#no_auto_derive` — Equatable is
+    // synthesized; the evaluator falls back to Value::PartialEq.
+    use std::collections::{BTreeMap, HashMap};
+    let source = r#"#schema User {
+    String name: *
+}
+#main(User a, User b)
+{ Bool same: a == b }"#;
+    let node = parse_doc(source);
+    let analyzed = std::sync::Arc::new(relon_analyzer::analyze(&node));
+    let mut a = BTreeMap::new();
+    a.insert("name".to_string(), Value::String("ada".to_string()));
+    let mut b = BTreeMap::new();
+    b.insert("name".to_string(), Value::String("ada".to_string()));
+    let mut args: HashMap<String, Value> = HashMap::new();
+    args.insert("a".to_string(), Value::dict(a));
+    args.insert("b".to_string(), Value::dict(b));
+    let ctx = Context::new()
+        .with_root(node.clone())
+        .with_analyzed(std::sync::Arc::clone(&analyzed));
+    let result = Evaluator::new(std::sync::Arc::new(ctx))
+        .run_main(&std::sync::Arc::new(Scope::default()), args)
+        .unwrap();
+    let Value::Dict(d) = result else { panic!() };
+    assert_eq!(d.map.get("same"), Some(&Value::Bool(true)));
+}
+
+#[test]
+fn no_auto_derive_equatable_still_falls_back_structurally() {
+    // `#no_auto_derive Equatable` blocks the synthesized witness from
+    // landing in schema_methods, but the evaluator's structural
+    // PartialEq is the ultimate fallback regardless — `==` on a dict
+    // pair never errors. This pins that behavior so opting out of the
+    // analyzer-level derive doesn't accidentally also disable runtime
+    // equality.
+    use std::collections::{BTreeMap, HashMap};
+    let source = r#"#schema Token {
+    String value: *
+} with {
+    #no_auto_derive Equatable
+}
+#main(Token a, Token b)
+{ Bool same: a == b }"#;
+    let node = parse_doc(source);
+    let analyzed = std::sync::Arc::new(relon_analyzer::analyze(&node));
+    let mut a = BTreeMap::new();
+    a.insert("value".to_string(), Value::String("abc".to_string()));
+    let mut b = BTreeMap::new();
+    b.insert("value".to_string(), Value::String("abc".to_string()));
+    let mut args: HashMap<String, Value> = HashMap::new();
+    args.insert("a".to_string(), Value::dict(a));
+    args.insert("b".to_string(), Value::dict(b));
+    let ctx = Context::new()
+        .with_root(node.clone())
+        .with_analyzed(std::sync::Arc::clone(&analyzed));
+    let result = Evaluator::new(std::sync::Arc::new(ctx))
+        .run_main(&std::sync::Arc::new(Scope::default()), args)
+        .unwrap();
+    let Value::Dict(d) = result else { panic!() };
+    assert_eq!(d.map.get("same"), Some(&Value::Bool(true)));
+}
+
+#[test]
+fn operator_le_synthesized_from_lt_and_eq() {
+    // `<=` lowers to `a.lt(b) || a.eq(b)` when both witnesses (or one
+    // witness + structural eq fallback) are reachable. With explicit
+    // `lt` + `eq` methods the analyzer-synthesized path commits and
+    // the test confirms both the strict-less and the equal boundary
+    // succeed.
+    use std::collections::{BTreeMap, HashMap};
+    let source = r#"#schema Money {
+    Int cents: *
+} with {
+    lt(other: Self) -> Bool: self.cents < other.cents
+    eq(other: Self) -> Bool: self.cents == other.cents
+}
+#main(Money a, Money b, Money c)
+{ Bool le_lt: a <= b, Bool le_eq: a <= c }"#;
+    let node = parse_doc(source);
+    let analyzed = std::sync::Arc::new(relon_analyzer::analyze(&node));
+    let mut a = BTreeMap::new();
+    a.insert("cents".to_string(), Value::Int(50));
+    let mut b = BTreeMap::new();
+    b.insert("cents".to_string(), Value::Int(150));
+    let mut c = BTreeMap::new();
+    c.insert("cents".to_string(), Value::Int(50));
+    let mut args: HashMap<String, Value> = HashMap::new();
+    args.insert("a".to_string(), Value::dict(a));
+    args.insert("b".to_string(), Value::dict(b));
+    args.insert("c".to_string(), Value::dict(c));
+    let ctx = Context::new()
+        .with_root(node.clone())
+        .with_analyzed(std::sync::Arc::clone(&analyzed));
+    let result = Evaluator::new(std::sync::Arc::new(ctx))
+        .run_main(&std::sync::Arc::new(Scope::default()), args)
+        .unwrap();
+    let Value::Dict(d) = result else { panic!() };
+    assert_eq!(d.map.get("le_lt"), Some(&Value::Bool(true)));
+    assert_eq!(d.map.get("le_eq"), Some(&Value::Bool(true)));
+}
+
+#[test]
+fn operator_ge_synthesized_from_lt_and_eq() {
+    // `>=` lowers to `b.lt(a) || a.eq(b)` — swapped `lt` for the
+    // strict-greater half, structural / witness `eq` for the boundary.
+    use std::collections::{BTreeMap, HashMap};
+    let source = r#"#schema Money {
+    Int cents: *
+} with {
+    lt(other: Self) -> Bool: self.cents < other.cents
+    eq(other: Self) -> Bool: self.cents == other.cents
+}
+#main(Money a, Money b, Money c)
+{ Bool ge_gt: a >= b, Bool ge_eq: a >= c }"#;
+    let node = parse_doc(source);
+    let analyzed = std::sync::Arc::new(relon_analyzer::analyze(&node));
+    let mut a = BTreeMap::new();
+    a.insert("cents".to_string(), Value::Int(150));
+    let mut b = BTreeMap::new();
+    b.insert("cents".to_string(), Value::Int(50));
+    let mut c = BTreeMap::new();
+    c.insert("cents".to_string(), Value::Int(150));
+    let mut args: HashMap<String, Value> = HashMap::new();
+    args.insert("a".to_string(), Value::dict(a));
+    args.insert("b".to_string(), Value::dict(b));
+    args.insert("c".to_string(), Value::dict(c));
+    let ctx = Context::new()
+        .with_root(node.clone())
+        .with_analyzed(std::sync::Arc::clone(&analyzed));
+    let result = Evaluator::new(std::sync::Arc::new(ctx))
+        .run_main(&std::sync::Arc::new(Scope::default()), args)
+        .unwrap();
+    let Value::Dict(d) = result else { panic!() };
+    assert_eq!(d.map.get("ge_gt"), Some(&Value::Bool(true)));
+    assert_eq!(d.map.get("ge_eq"), Some(&Value::Bool(true)));
+}
+
+// ===================================================================
 // Phase B: schema-rooted method dispatch (`with { ... }` + `#extend`)
 // ===================================================================
 
@@ -4343,4 +4491,190 @@ fn schema_method_with_arg_dispatches() {
         .unwrap();
     let Value::Dict(d) = result else { panic!() };
     assert_eq!(d.map.get("total"), Some(&Value::Int(150)));
+}
+
+// ===================================================================
+// Phase D 收尾: stdlib intrinsics registered as schema-rooted methods.
+// `register_pure_method("String", "upper", ...)` etc. — the same
+// `Arc<dyn RelonFunction>` that powers the legacy `_string_upper(s)`
+// free-fn form also services `s.upper()` method dispatch, because
+// `try_call_native_method` prepends the receiver into `positional[0]`.
+// Tests below pair a `#extend <Builtin> with { #native ... }` source-side
+// declaration (so analyzer accepts the method call) against the
+// host-side native_methods table populated by `stdlib::register_to`.
+// ===================================================================
+
+#[test]
+fn stdlib_method_string_upper_dispatches_via_register_pure_method() {
+    use std::collections::HashMap;
+    let source = r#"#extend String with {
+    #native upper() -> String
+}
+#main(String s)
+{ String shout: s.upper() }"#;
+    let node = parse_doc(source);
+    let analyzed = std::sync::Arc::new(relon_analyzer::analyze(&node));
+    let errors: Vec<_> = analyzed
+        .diagnostics
+        .iter()
+        .filter(|d| d.severity() == relon_analyzer::Severity::Error)
+        .collect();
+    assert!(errors.is_empty(), "analyzer errors: {:?}", errors);
+    let mut args: HashMap<String, Value> = HashMap::new();
+    args.insert("s".to_string(), Value::String("hello".to_string()));
+    let ctx = Context::new()
+        .with_root(node.clone())
+        .with_analyzed(std::sync::Arc::clone(&analyzed));
+    let result = Evaluator::new(std::sync::Arc::new(ctx))
+        .run_main(&std::sync::Arc::new(Scope::default()), args)
+        .unwrap();
+    let Value::Dict(d) = result else { panic!() };
+    assert_eq!(
+        d.map.get("shout"),
+        Some(&Value::String("HELLO".to_string()))
+    );
+}
+
+#[test]
+fn stdlib_method_list_map_dispatches_via_register_pure_method() {
+    use std::collections::HashMap;
+    let source = r#"#extend List with {
+    #native map(f: Closure<Int, Int>) -> List<Int>
+}
+#main(List<Int> xs)
+{ List<Int> doubled: xs.map((n) => n * 2) }"#;
+    let node = parse_doc(source);
+    let analyzed = std::sync::Arc::new(relon_analyzer::analyze(&node));
+    let errors: Vec<_> = analyzed
+        .diagnostics
+        .iter()
+        .filter(|d| d.severity() == relon_analyzer::Severity::Error)
+        .collect();
+    assert!(errors.is_empty(), "analyzer errors: {:?}", errors);
+    let mut args: HashMap<String, Value> = HashMap::new();
+    args.insert(
+        "xs".to_string(),
+        Value::list(vec![Value::Int(1), Value::Int(2), Value::Int(3)]),
+    );
+    let ctx = Context::new()
+        .with_root(node.clone())
+        .with_analyzed(std::sync::Arc::clone(&analyzed));
+    let result = Evaluator::new(std::sync::Arc::new(ctx))
+        .run_main(&std::sync::Arc::new(Scope::default()), args)
+        .unwrap();
+    let Value::Dict(d) = result else { panic!() };
+    assert_eq!(
+        d.map.get("doubled"),
+        Some(&Value::list(vec![
+            Value::Int(2),
+            Value::Int(4),
+            Value::Int(6),
+        ])),
+    );
+}
+
+#[test]
+fn stdlib_method_dict_keys_dispatches_via_register_pure_method() {
+    use std::collections::{BTreeMap, HashMap};
+    let source = r#"#extend Dict with {
+    #native keys() -> List<String>
+}
+#main(Dict<String, Int> d)
+{ List<String> ks: d.keys() }"#;
+    let node = parse_doc(source);
+    let analyzed = std::sync::Arc::new(relon_analyzer::analyze(&node));
+    let errors: Vec<_> = analyzed
+        .diagnostics
+        .iter()
+        .filter(|d| d.severity() == relon_analyzer::Severity::Error)
+        .collect();
+    assert!(errors.is_empty(), "analyzer errors: {:?}", errors);
+    let mut d = BTreeMap::new();
+    d.insert("b".to_string(), Value::Int(2));
+    d.insert("a".to_string(), Value::Int(1));
+    let mut args: HashMap<String, Value> = HashMap::new();
+    args.insert("d".to_string(), Value::dict(d));
+    let ctx = Context::new()
+        .with_root(node.clone())
+        .with_analyzed(std::sync::Arc::clone(&analyzed));
+    let result = Evaluator::new(std::sync::Arc::new(ctx))
+        .run_main(&std::sync::Arc::new(Scope::default()), args)
+        .unwrap();
+    let Value::Dict(out) = result else { panic!() };
+    assert_eq!(
+        out.map.get("ks"),
+        Some(&Value::list(vec![
+            Value::String("a".to_string()),
+            Value::String("b".to_string()),
+        ])),
+    );
+}
+
+#[test]
+fn stdlib_method_string_len_matches_free_fn_len() {
+    // Decision 14: `len` stays polymorphic free-fn but also acts as a
+    // method on each receiver. Both shapes must return the same value.
+    use std::collections::HashMap;
+    let source = r#"#extend String with {
+    #native len() -> Int
+}
+#main(String s)
+{
+    Int free: len(s),
+    Int method: s.len()
+}"#;
+    let node = parse_doc(source);
+    let analyzed = std::sync::Arc::new(relon_analyzer::analyze(&node));
+    let errors: Vec<_> = analyzed
+        .diagnostics
+        .iter()
+        .filter(|d| d.severity() == relon_analyzer::Severity::Error)
+        .collect();
+    assert!(errors.is_empty(), "analyzer errors: {:?}", errors);
+    let mut args: HashMap<String, Value> = HashMap::new();
+    args.insert("s".to_string(), Value::String("relon".to_string()));
+    let ctx = Context::new()
+        .with_root(node.clone())
+        .with_analyzed(std::sync::Arc::clone(&analyzed));
+    let result = Evaluator::new(std::sync::Arc::new(ctx))
+        .run_main(&std::sync::Arc::new(Scope::default()), args)
+        .unwrap();
+    let Value::Dict(d) = result else { panic!() };
+    assert_eq!(d.map.get("free"), Some(&Value::Int(5)));
+    assert_eq!(d.map.get("method"), Some(&Value::Int(5)));
+}
+
+#[test]
+fn stdlib_method_self_contains_in_extend_body() {
+    // User-side `#extend String with { is_email() -> Bool: self.contains("@") }`
+    // depends on `String.contains` being declared visible to the
+    // analyzer (so `self.contains` resolves) *and* implemented by
+    // the host (so dispatch returns a value). We declare a `#native
+    // contains` in the same `#extend` block to satisfy the analyzer;
+    // the runtime entry comes from `stdlib::register_to`.
+    use std::collections::HashMap;
+    let source = r#"#extend String with {
+    #native contains(needle: String) -> Bool
+    is_email() -> Bool: self.contains("@")
+}
+#main(String s)
+{ Bool ok: s.is_email() }"#;
+    let node = parse_doc(source);
+    let analyzed = std::sync::Arc::new(relon_analyzer::analyze(&node));
+    let errors: Vec<_> = analyzed
+        .diagnostics
+        .iter()
+        .filter(|d| d.severity() == relon_analyzer::Severity::Error)
+        .collect();
+    assert!(errors.is_empty(), "analyzer errors: {:?}", errors);
+    let mut args: HashMap<String, Value> = HashMap::new();
+    args.insert("s".to_string(), Value::String("a@b.com".to_string()));
+    let ctx = Context::new()
+        .with_root(node.clone())
+        .with_analyzed(std::sync::Arc::clone(&analyzed));
+    let result = Evaluator::new(std::sync::Arc::new(ctx))
+        .run_main(&std::sync::Arc::new(Scope::default()), args)
+        .unwrap();
+    let Value::Dict(d) = result else { panic!() };
+    assert_eq!(d.map.get("ok"), Some(&Value::Bool(true)));
 }

@@ -1,0 +1,13 @@
+// Phase C.3: `#derive Equatable` on a method whose signature matches
+// the constraint's witness shape (`eq(other: Self) -> Bool`). The
+// analyzer should record the witness without firing
+// `ConstraintWitnessShapeMismatch`.
+#schema Money {
+    Int cents: *
+} with {
+    #derive Equatable
+    eq(other: Self) -> Bool: self.cents == other.cents
+}
+
+#main(Money a, Money b)
+{ Bool same: a == b }

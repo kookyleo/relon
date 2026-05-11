@@ -10,7 +10,7 @@ pub fn register_to(ctx: &mut Context) {
     // on data structures themselves, not std-module members.
     let len: Arc<dyn RelonFunction> = Arc::new(Len);
     ctx.register_pure_fn("len", Arc::clone(&len));
-    ctx.register_pure_fn("_len", len);
+    ctx.register_pure_fn("_len", Arc::clone(&len));
     ctx.register_pure_fn("range", Arc::new(Range));
     ctx.register_pure_fn("type", Arc::new(Type));
 
@@ -20,22 +20,36 @@ pub fn register_to(ctx: &mut Context) {
     // via `@import("std/<module>", as=...)`. There is no top-level
     // `string.split` / `dict.merge` / ... — that would be a
     // runtime-private global, which the spec forbids (§1.1, §6).
-    ctx.register_pure_fn("_list_map", Arc::new(ListMap));
-    ctx.register_pure_fn("_list_filter", Arc::new(ListFilter));
-    ctx.register_pure_fn("_list_reduce", Arc::new(ListReduce));
-    ctx.register_pure_fn("_list_contains", Arc::new(ListContains));
+    let list_map: Arc<dyn RelonFunction> = Arc::new(ListMap);
+    let list_filter: Arc<dyn RelonFunction> = Arc::new(ListFilter);
+    let list_reduce: Arc<dyn RelonFunction> = Arc::new(ListReduce);
+    let list_contains: Arc<dyn RelonFunction> = Arc::new(ListContains);
+    ctx.register_pure_fn("_list_map", Arc::clone(&list_map));
+    ctx.register_pure_fn("_list_filter", Arc::clone(&list_filter));
+    ctx.register_pure_fn("_list_reduce", Arc::clone(&list_reduce));
+    ctx.register_pure_fn("_list_contains", Arc::clone(&list_contains));
 
-    ctx.register_pure_fn("_string_split", Arc::new(StringSplit));
-    ctx.register_pure_fn("_string_join", Arc::new(StringJoin));
-    ctx.register_pure_fn("_string_replace", Arc::new(StringReplace));
-    ctx.register_pure_fn("_string_upper", Arc::new(StringUpper));
-    ctx.register_pure_fn("_string_lower", Arc::new(StringLower));
-    ctx.register_pure_fn("_string_contains", Arc::new(StringContains));
+    let string_split: Arc<dyn RelonFunction> = Arc::new(StringSplit);
+    let string_join: Arc<dyn RelonFunction> = Arc::new(StringJoin);
+    let string_replace: Arc<dyn RelonFunction> = Arc::new(StringReplace);
+    let string_upper: Arc<dyn RelonFunction> = Arc::new(StringUpper);
+    let string_lower: Arc<dyn RelonFunction> = Arc::new(StringLower);
+    let string_contains: Arc<dyn RelonFunction> = Arc::new(StringContains);
+    ctx.register_pure_fn("_string_split", Arc::clone(&string_split));
+    ctx.register_pure_fn("_string_join", Arc::clone(&string_join));
+    ctx.register_pure_fn("_string_replace", Arc::clone(&string_replace));
+    ctx.register_pure_fn("_string_upper", Arc::clone(&string_upper));
+    ctx.register_pure_fn("_string_lower", Arc::clone(&string_lower));
+    ctx.register_pure_fn("_string_contains", Arc::clone(&string_contains));
 
-    ctx.register_pure_fn("_dict_merge", Arc::new(DictMerge));
-    ctx.register_pure_fn("_dict_keys", Arc::new(DictKeys));
-    ctx.register_pure_fn("_dict_values", Arc::new(DictValues));
-    ctx.register_pure_fn("_dict_has_key", Arc::new(DictHasKey));
+    let dict_merge: Arc<dyn RelonFunction> = Arc::new(DictMerge);
+    let dict_keys: Arc<dyn RelonFunction> = Arc::new(DictKeys);
+    let dict_values: Arc<dyn RelonFunction> = Arc::new(DictValues);
+    let dict_has_key: Arc<dyn RelonFunction> = Arc::new(DictHasKey);
+    ctx.register_pure_fn("_dict_merge", Arc::clone(&dict_merge));
+    ctx.register_pure_fn("_dict_keys", Arc::clone(&dict_keys));
+    ctx.register_pure_fn("_dict_values", Arc::clone(&dict_values));
+    ctx.register_pure_fn("_dict_has_key", Arc::clone(&dict_has_key));
 
     ctx.register_pure_fn("_math_abs", Arc::new(MathAbs));
     ctx.register_pure_fn("_math_max", Arc::new(MathMax));
@@ -57,6 +71,54 @@ pub fn register_to(ctx: &mut Context) {
     ctx.register_pure_fn("ensure.required_fields", Arc::new(RequiredFields));
     ctx.register_pure_fn("ensure.requires", Arc::new(Requires));
     ctx.register_pure_fn("ensure.fields_equal", Arc::new(FieldEq));
+
+    // Phase D 收尾: schema-rooted method aliases for the same Rust
+    // intrinsics. Decision 14 (`schema-rooted-model-2026-05-11.md`):
+    // `method` is the model's center; free-fn forms above remain for
+    // backward compatibility and polymorphic-dispatch cases (`len(x)`
+    // accepts String/List/Dict in one call). The aliases below let
+    // `s.upper()`, `xs.map(f)`, `d.keys()` etc. dispatch directly
+    // through the receiver-side `native_methods` table.
+    //
+    // Each handler accepts `(self, ...args)` as positional values; the
+    // method-dispatch path in `Evaluator::try_call_native_method`
+    // prepends the receiver before invoking, so the same `Arc<dyn
+    // RelonFunction>` instance services both call shapes — no
+    // adapter, no duplicate code path.
+    //
+    // Excluded from aliasing: `math.*`, `range`, `type`, `ensure.*`.
+    // Decision 14 treats those as legitimate free-fn surface (numeric
+    // helpers parameterized over a Number value, constructors,
+    // reflection, validator combinators) — not type-rooted methods.
+    //
+    // `len` is special: it's polymorphic over String/List/Dict. We
+    // keep the free-fn form (`len(x)`) and also expose `.len()` on
+    // each of the three receivers so `s.len()` / `xs.len()` / `d.len()`
+    // route through the same intrinsic.
+
+    // String methods
+    ctx.register_pure_method("String", "split", string_split);
+    ctx.register_pure_method("String", "replace", string_replace);
+    ctx.register_pure_method("String", "upper", string_upper);
+    ctx.register_pure_method("String", "lower", string_lower);
+    ctx.register_pure_method("String", "contains", Arc::clone(&string_contains));
+    ctx.register_pure_method("String", "len", Arc::clone(&len));
+
+    // List methods (note: `_string_join` takes `(List<T>, sep)`, so
+    // its receiver is the List, not the String — register under List).
+    ctx.register_pure_method("List", "map", list_map);
+    ctx.register_pure_method("List", "filter", list_filter);
+    ctx.register_pure_method("List", "reduce", list_reduce);
+    ctx.register_pure_method("List", "contains", list_contains);
+    ctx.register_pure_method("List", "join", string_join);
+    ctx.register_pure_method("List", "len", Arc::clone(&len));
+
+    // Dict methods
+    ctx.register_pure_method("Dict", "merge", dict_merge);
+    ctx.register_pure_method("Dict", "keys", dict_keys);
+    ctx.register_pure_method("Dict", "values", dict_values);
+    ctx.register_pure_method("Dict", "has_key", dict_has_key);
+    ctx.register_pure_method("Dict", "len", len);
 }
 
 struct ListMap;

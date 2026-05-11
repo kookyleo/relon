@@ -265,6 +265,31 @@ pub enum Diagnostic {
         range: SourceSpan,
     },
 
+    #[error(
+        "`#derive {constraint}` witness `{method}` does not match the constraint's expected shape (expected `{expected_shape}`, found `{found_shape}`)"
+    )]
+    #[diagnostic(
+        code(relon::analyze::constraint_witness_shape_mismatch),
+        help(
+            "A `#derive Constraint` pragma promotes the next method into the constraint's witness slot — its name, parameter list, and return type must match the constraint definition exactly. Either rewrite the method's signature to match the expected shape, or drop the `#derive` if this method isn't intended as a witness."
+        )
+    )]
+    ConstraintWitnessShapeMismatch {
+        /// Constraint name from the `#derive C` pragma (e.g. `Equatable`).
+        constraint: String,
+        /// Method as the user named it (may differ from the constraint's
+        /// expected witness name).
+        method: String,
+        /// Expected witness shape, rendered as
+        /// `eq(other: Self) -> Bool` etc. — see
+        /// [`crate::constraints`].
+        expected_shape: String,
+        /// Actual method signature as written in source.
+        found_shape: String,
+        #[label("witness shape doesn't match `{constraint}`")]
+        range: SourceSpan,
+    },
+
     #[error("match arms produce incompatible types: {}", arm_types.join(" vs "))]
     #[diagnostic(
         code(relon::analyze::match_arm_type_mismatch),
@@ -569,6 +594,7 @@ impl Diagnostic {
             | Diagnostic::MethodNameConflict { .. }
             | Diagnostic::UnknownMethod { .. }
             | Diagnostic::PrivateMethodViolation { .. }
+            | Diagnostic::ConstraintWitnessShapeMismatch { .. }
             // Static type mismatches are derivable from source + schema
             // alone — the workhorse of Stage 1 hardening. Surface them
             // as errors so the evaluator never reaches a code path that

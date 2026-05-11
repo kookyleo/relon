@@ -20,6 +20,7 @@ pub(crate) mod ban_unsafe_types;
 pub mod cap;
 pub(crate) mod capability_check;
 pub(crate) mod const_fold;
+pub(crate) mod constraints;
 pub(crate) mod decorator_names;
 pub mod diagnostic;
 pub(crate) mod directive_names;
@@ -157,6 +158,17 @@ pub fn analyze_with_options(root: &Node, options: &AnalyzeOptions) -> AnalyzedTr
     // per-pass conflict checks above (e.g. two methods of the same
     // name declared inside a single `with { ... }` block).
     extend::check_method_uniqueness(&mut tree);
+    // Schema-rooted Phase C.3: `#derive C` witness shape checking.
+    // Must run after duplicate-name detection so a duplicate that's
+    // also a witness gets the single `MethodNameConflict` instead of
+    // a witness-shape diagnostic on every clone.
+    constraints::check_derive_witnesses(&mut tree);
+    // Schema-rooted Phase C.4: auto-derive Equatable / JsonProjectable
+    // onto every user schema that hasn't opted out via
+    // `#no_auto_derive` and doesn't already declare the witness
+    // method. Must run *before* `build_method_signature_table` so the
+    // synthesized methods land in `method_signatures` too.
+    constraints::auto_derive_schemas(&mut tree);
     // Synthesize one `FnSignature` per method into the lookup table
     // consumed by `resolve_call_signature` and the evaluator.
     extend::build_method_signature_table(&mut tree);

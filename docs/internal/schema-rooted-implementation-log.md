@@ -207,6 +207,93 @@ lowering」一节。
 
 **回流**：否，路线图层面调度选择。已记录到 roadmap.md §J。
 
+### C.3：constraint registry 与 witness shape 校验位置
+2026-05-11 / Phase C / `crates/relon-analyzer/src/constraints.rs`
+
+**问题**：`#derive Constraint` 标记的 witness method 形状必须与 constraint
+定义一致（`Equatable` 需要 `eq(other: Self) -> Bool` 等）。注册表
+和形状校验放哪？候选：
+1. 直接挂在 `extend.rs` 末尾，跟 method table 走同一个文件。
+2. 拆独立模块 `constraints.rs`，把「constraint 元数据 + auto-derive
+   + witness 校验」三块耦合内容放一起。
+
+**选择**：方案 2（独立模块）。
+
+**理由**：
+- `extend.rs` 已经承担 method 收集、conflict 检测、signature
+  table 构建三件事；再加 constraint 元数据 + auto-derive 注入 +
+  shape 校验，文件会膨胀到难审计。
+- 决策 17 的「nominal trait」语义把 constraint 模型本质上变成「名字
+  + 期望签名形状」的查表，是一个独立闭包，不依赖 `#extend` /
+  `with` 的源代码采集逻辑——分模块更对位。
+- 未来添加新 constraint（Iterable / Indexable / Callable / Number）
+  时只需扩 `CONSTRAINTS` 数组 + 注入对应 lowering hooks；现在的
+  布局让这件事不会污染 extend pass。
+
+**回流**：否，纯实现层模块拆分。
+
+### C.4：auto-derive 通过合成 `is_native = true` 占位 method 实现
+2026-05-11 / Phase C / `crates/relon-analyzer/src/constraints.rs`、
+`crates/relon-evaluator/src/arithmetic.rs`
+
+**问题**：决策 15 / 19 要求 `Equatable` 和 `JsonProjectable` 默认
+ON，但 evaluator 已经把 `==` 的 fallback 路径定为
+`Value::PartialEq`，把 JSON 序列化交给 serde_json。怎么让 analyzer
+端的 auto-derive 与 evaluator 端的 fallback 无缝衔接，又不引入新的
+能力位 / 错误类型？
+
+**选择**：analyzer 合成一条 `SchemaMethodInfo { name: "eq", is_native:
+true, body_node: None, derives: ["Equatable"], ... }`（`to_json`
+同理）追加到 `schema_methods`。evaluator 在 dispatch 时检测到「有
+method entry 但既没 body 也没在 native_methods 表里注册」就走兜底
+路径：`eq` 用 `Value::PartialEq`、`to_json` 用 `serde_json::to_string`。
+
+**理由**：
+- 用同一个数据结构（`schema_methods`）表达「用户写的」「`#native`
+  host 注册的」「auto-derive 合成的」三类 method，让 dispatch 路径
+  保持单一查表，不需要在 evaluator 里加 capability bit 或专门标记。
+- 决策 17 的 nominal trait 语义已经允许 method 通过名字命中，合成
+  路径正好沿用这套机制——不需要另写一层 trait resolution。
+- evaluator 端的 fallback 是「兜底」而非「错误恢复」：auto-derived
+  `eq` 永远命中 PartialEq、`to_json` 永远命中 serde；不需要新增
+  `RuntimeError` variant，符合任务约束。
+- `#no_auto_derive Constraint` 通过 schema 级 `schema_no_auto_derives`
+  阻断 analyzer 的合成；阻断后 evaluator 的 `try_compare_op_method`
+  根本拿不到 method entry，照样落回顶层的 `Value::PartialEq`，与
+  「没合成 = 没影响」的直觉一致。
+
+**回流**：是。属于跨 analyzer / evaluator 的语言级语义——「内置
+constraint 的 evaluator 兜底」应折叠回主文档「auto-derive」一节。
+
+### C.5：`<=` / `>=` 全 lowering vs 全 fallback 的二选一
+2026-05-11 / Phase C / `crates/relon-evaluator/src/arithmetic.rs`
+
+**问题**：`<=` 设计为 `a.lt(b) || a.eq(b)`、`>=` 为 `b.lt(a) ||
+a.eq(b)`。当 `lt` 命中但 `eq` 没命中（或反之），怎么处理？候选：
+1. 一边命中就走 method 路径，缺失的一半用结构等值 / 数值默认补齐。
+2. 全有才用 method 路径，缺一个就整体 fallback 到 `eval_numeric_comparison`。
+3. 让 `eq` 缺失时落 `Value::PartialEq`，`lt` 缺失时整体 fallback。
+
+**选择**：方案 3（不对称兜底）。`lt` 是 strict-order 判别器，没有
+合理 fallback——一旦缺失就放弃 method 路径整体落数值默认；`eq`
+缺失时（即 `#no_auto_derive Equatable` 阻断了 auto-derive 合成）
+走结构 `Value::PartialEq`，因为决策 15 把结构等值定为 fallback
+合同。
+
+**理由**：
+- 方案 1 会让「同一个 `<=` 表达式在不同 schema 上有截然不同
+  语义」（一半 method、一半数值），违反 Logic-as-Data 的「可
+  审计」原则。
+- 方案 2 太严，把 `#no_auto_derive Equatable` 当成「禁止 `<=`」
+  的开关——但 `#no_auto_derive` 的本意只是「不合成 method
+  entry」，没要求 evaluator 也丢掉 fallback。
+- 方案 3 与决策 15 + C.4 一致：`eq` 永远有 fallback，`lt` 没有；
+  非对称恰好对应「Equatable 默认 ON、Comparable 默认 OFF」的非
+  对称设计。
+
+**回流**：是。属于语言级 evaluation 语义，应折叠回主文档
+「operator lowering」一节（紧跟 C.1 后面）。
+
 ---
 
 ## D 阶段（register_method + stdlib 迁移）

@@ -19,8 +19,12 @@ fn simple_method_table_populated() {
         .schema_methods
         .get("Money")
         .expect("Money should appear in schema_methods");
-    assert_eq!(methods.len(), 1, "{:?}", tree.diagnostics);
-    assert_eq!(methods[0].name, "cents_value");
+    // Phase C.4 auto-derives `eq` and `to_json` onto every user
+    // schema that hasn't opted out — filter them out to assert on the
+    // user-written methods only.
+    let user_methods: Vec<_> = methods.iter().filter(|m| !m.is_native).collect();
+    assert_eq!(user_methods.len(), 1, "{:?}", tree.diagnostics);
+    assert_eq!(user_methods[0].name, "cents_value");
     assert!(tree
         .method_signatures
         .contains_key(&("Money".to_string(), "cents_value".to_string())));
@@ -44,8 +48,10 @@ fn unknown_method_diagnoses() {
 fn extend_on_user_schema() {
     let tree = analyze_fixture("schema_methods/extend_user_schema.relon");
     let methods = tree.schema_methods.get("User").expect("User extended");
-    assert_eq!(methods.len(), 1);
-    assert_eq!(methods[0].name, "is_admin");
+    // Skip Phase C.4 auto-derived `eq` / `to_json` entries.
+    let user_methods: Vec<_> = methods.iter().filter(|m| !m.is_native).collect();
+    assert_eq!(user_methods.len(), 1);
+    assert_eq!(user_methods[0].name, "is_admin");
     let no_unknown = count(&tree.diagnostics, |d| {
         matches!(d, Diagnostic::UnknownMethod { .. })
     });
@@ -128,4 +134,93 @@ fn extend_on_builtin_string() {
         matches!(d, Diagnostic::ExtendUnknownSchema { .. })
     });
     assert_eq!(bad, 0, "{:?}", tree.diagnostics);
+}
+
+// ===================================================================
+// Phase C.3: `#derive Constraint` witness shape checking.
+// ===================================================================
+
+#[test]
+fn derive_equatable_with_matching_shape_no_diagnostic() {
+    let tree = analyze_fixture("schema_methods/derive_equatable_ok.relon");
+    let bad = count(&tree.diagnostics, |d| {
+        matches!(d, Diagnostic::ConstraintWitnessShapeMismatch { .. })
+    });
+    assert_eq!(bad, 0, "{:?}", tree.diagnostics);
+}
+
+#[test]
+fn derive_equatable_with_wrong_return_type_diagnoses() {
+    let tree = analyze_fixture("schema_methods/derive_equatable_bad_shape.relon");
+    let mismatches: Vec<_> = tree
+        .diagnostics
+        .iter()
+        .filter(|d| {
+            matches!(
+                d,
+                Diagnostic::ConstraintWitnessShapeMismatch { constraint, method, .. }
+                    if constraint == "Equatable" && method == "eq"
+            )
+        })
+        .collect();
+    assert_eq!(
+        mismatches.len(),
+        1,
+        "expected ConstraintWitnessShapeMismatch on Equatable.eq: {:?}",
+        tree.diagnostics
+    );
+}
+
+// ===================================================================
+// Phase C.4: auto-derive Equatable / JsonProjectable.
+// ===================================================================
+
+#[test]
+fn auto_derive_synthesizes_eq_on_default_schema() {
+    let tree = analyze_fixture("schema_methods/simple_method.relon");
+    let methods = tree.schema_methods.get("Money").expect("Money present");
+    // Auto-derived methods carry `is_native = true` + empty body.
+    let synthesized_eq = methods
+        .iter()
+        .find(|m| m.name == "eq" && m.is_native && m.body_node.is_none());
+    assert!(
+        synthesized_eq.is_some(),
+        "expected auto-derived eq on Money: {:?}",
+        methods.iter().map(|m| &m.name).collect::<Vec<_>>()
+    );
+    let synthesized_to_json = methods
+        .iter()
+        .find(|m| m.name == "to_json" && m.is_native && m.body_node.is_none());
+    assert!(
+        synthesized_to_json.is_some(),
+        "expected auto-derived to_json on Money: {:?}",
+        methods.iter().map(|m| &m.name).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn no_auto_derive_equatable_skips_eq_synthesis() {
+    let tree = analyze_fixture("schema_methods/no_auto_derive_equatable.relon");
+    let methods = tree
+        .schema_methods
+        .get("Token")
+        .cloned()
+        .unwrap_or_default();
+    let has_synthesized_eq = methods
+        .iter()
+        .any(|m| m.name == "eq" && m.is_native && m.body_node.is_none());
+    assert!(
+        !has_synthesized_eq,
+        "Token opted out of Equatable but eq was synthesized: {:?}",
+        methods.iter().map(|m| &m.name).collect::<Vec<_>>()
+    );
+    // JsonProjectable wasn't opted out, so to_json should still be
+    // synthesized — sanity check that the opt-out is per-constraint.
+    let has_to_json = methods
+        .iter()
+        .any(|m| m.name == "to_json" && m.is_native && m.body_node.is_none());
+    assert!(
+        has_to_json,
+        "Token didn't opt out of JsonProjectable; to_json should be synthesized"
+    );
 }

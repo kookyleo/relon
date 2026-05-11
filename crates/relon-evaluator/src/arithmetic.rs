@@ -162,7 +162,23 @@ impl Evaluator {
                 }
                 eval_numeric_comparison(op, &l, left.range, &r, right.range)
             }
-            (Operator::Le | Operator::Ge, _, _) => {
+            (Operator::Le, a, b) => {
+                // `a <= b` ≡ `a.lt(b) || a.eq(b)`. We try both witnesses
+                // and only commit to the method path when *both* hit —
+                // otherwise the operator is ambiguous (one side schema-
+                // rooted, the other numeric) and we fall back entirely.
+                if let Some(combined) = self.try_le_ge_lowering(a, b, scope, range, false)? {
+                    return Ok(combined);
+                }
+                eval_numeric_comparison(op, &l, left.range, &r, right.range)
+            }
+            (Operator::Ge, a, b) => {
+                // `a >= b` ≡ `b.lt(a) || a.eq(b)`. The `b.lt(a)` half
+                // gives strict-greater; the `eq` half closes the
+                // boundary. Same all-or-nothing rule as `<=`.
+                if let Some(combined) = self.try_le_ge_lowering(a, b, scope, range, true)? {
+                    return Ok(combined);
+                }
                 eval_numeric_comparison(op, &l, left.range, &r, right.range)
             }
             _ => Err(RuntimeError::UnsupportedOperator(
@@ -204,6 +220,14 @@ impl Evaluator {
     /// when the receiver is a branded value whose schema declares one.
     /// Returns `Ok(None)` when no witness applies, so the caller falls
     /// through to the structural / numeric default.
+    ///
+    /// Dispatch precedence:
+    /// 1. User-written `.relon` body (`body_node = Some`).
+    /// 2. Host-registered native method (`#native`).
+    /// 3. None — caller fallback (Phase C.4 auto-derive flows here:
+    ///    the analyzer synthesizes a `(eq | to_json)` placeholder
+    ///    method with `is_native = true` and no body / native impl,
+    ///    so the caller's default semantics take over).
     fn try_compare_op_method(
         &self,
         receiver: &Value,
@@ -228,19 +252,142 @@ impl Evaluator {
         else {
             return Ok(None);
         };
-        let Some(body) = method.body_node.as_ref() else {
+        if let Some(body) = method.body_node.as_ref() {
+            let arg = crate::native_fn::EvaluatedArg::positional(other.clone());
+            return self
+                .invoke_method_body(
+                    body,
+                    Some(receiver.clone()),
+                    &method.params,
+                    &[arg],
+                    scope,
+                    range,
+                )
+                .map(Some);
+        }
+        // No body — either `#native` (host-implemented) or auto-derived.
+        // Try the host registry first; if absent, fall through so the
+        // caller's structural default kicks in.
+        let key = (brand.clone(), method_name.to_string());
+        if let Some(entry) = self.context.native_methods.get(&key) {
+            let display_name = format!("{}.{}", brand, method_name);
+            self.check_native_fn_capability(&display_name, entry, range)?;
+            let mut native = crate::native_fn::NativeArgs::from_evaluated(
+                vec![
+                    crate::native_fn::EvaluatedArg::positional(receiver.clone()),
+                    crate::native_fn::EvaluatedArg::positional(other.clone()),
+                ],
+                self.caps(),
+            );
+            // The host fn convention prepends `self` as the first
+            // positional arg (see `try_call_native_method` in eval.rs).
+            // The two `positional` pushes above already match that
+            // shape, so no rotation needed.
+            let _ = &mut native; // silence unused-mut lint on future edits
+            return Ok(Some(entry.func.call(native, range)?));
+        }
+        Ok(None)
+    }
+
+    /// Combined `<=` / `>=` lowering: synthesize the operator from
+    /// `lt` + `eq` witnesses. Returns:
+    ///
+    /// * `Ok(Some(Bool))` — at least the `lt` witness dispatched. We
+    ///   fold in either the `eq` witness's result (when also present)
+    ///   or the structural `Value::PartialEq` (Phase C.4 auto-derived
+    ///   `eq` fallback) to close the boundary.
+    /// * `Ok(None)` — no `lt` witness available. The caller falls back
+    ///   to numeric comparison; without `lt` there is no sensible
+    ///   schema-rooted answer.
+    /// * `Err(_)` — the dispatch reached a witness body but evaluating
+    ///   it failed.
+    ///
+    /// Asymmetry rationale: `lt` is the strict-order discriminator; we
+    /// refuse to make up a `<=` / `>=` answer without it. `eq`, in
+    /// contrast, has a meaningful structural default (PartialEq on the
+    /// dict's contents) thanks to Phase C.4 auto-derive, so we can
+    /// close the boundary even when the schema didn't write an
+    /// explicit `eq` method.
+    ///
+    /// `swap_lt = false` for `<=` (uses `a.lt(b)`); `swap_lt = true`
+    /// for `>=` (uses `b.lt(a)`).
+    fn try_le_ge_lowering(
+        &self,
+        a: &Value,
+        b: &Value,
+        scope: &Arc<Scope>,
+        range: TokenRange,
+        swap_lt: bool,
+    ) -> Result<Option<Value>, RuntimeError> {
+        let (lt_recv, lt_other) = if swap_lt { (b, a) } else { (a, b) };
+        let Some(lt_val) = self.try_compare_op_method(lt_recv, lt_other, "lt", scope, range)?
+        else {
             return Ok(None);
         };
-        let arg = crate::native_fn::EvaluatedArg::positional(other.clone());
-        self.invoke_method_body(
-            body,
-            Some(receiver.clone()),
-            &method.params,
-            &[arg],
-            scope,
-            range,
-        )
-        .map(Some)
+        let eq_bool = match self.try_compare_op_method(a, b, "eq", scope, range)? {
+            Some(Value::Bool(b)) => b,
+            Some(_other) => false,
+            None => a == b,
+        };
+        let lt_bool = matches!(lt_val, Value::Bool(true));
+        Ok(Some(Value::Bool(lt_bool || eq_bool)))
+    }
+
+    /// Like `try_compare_op_method` but for the zero-arg
+    /// `to_json() -> String` witness — used by JsonProjectable
+    /// fallback at sites that need a serialized projection (Phase D
+    /// follow-up; defined here so the constraint registry stays
+    /// colocated with its operator hooks).
+    #[allow(dead_code)]
+    fn try_to_json_method(
+        &self,
+        receiver: &Value,
+        scope: &Arc<Scope>,
+        range: TokenRange,
+    ) -> Result<Option<Value>, RuntimeError> {
+        let Value::Dict(d) = receiver else {
+            return Ok(None);
+        };
+        let Some(brand) = d.brand.as_ref() else {
+            return Ok(None);
+        };
+        let Some(analyzed) = self.context.analyzed.as_ref() else {
+            return Ok(None);
+        };
+        let Some(method) = analyzed
+            .schema_methods
+            .get(brand)
+            .and_then(|methods| methods.iter().find(|m| m.name == "to_json"))
+        else {
+            return Ok(None);
+        };
+        if let Some(body) = method.body_node.as_ref() {
+            return self
+                .invoke_method_body(
+                    body,
+                    Some(receiver.clone()),
+                    &method.params,
+                    &[],
+                    scope,
+                    range,
+                )
+                .map(Some);
+        }
+        let key = (brand.clone(), "to_json".to_string());
+        if let Some(entry) = self.context.native_methods.get(&key) {
+            let display_name = format!("{}.to_json", brand);
+            self.check_native_fn_capability(&display_name, entry, range)?;
+            let native = crate::native_fn::NativeArgs::from_evaluated(
+                vec![crate::native_fn::EvaluatedArg::positional(receiver.clone())],
+                self.caps(),
+            );
+            return Ok(Some(entry.func.call(native, range)?));
+        }
+        // Auto-derive fallback: serialize the dict via serde_json.
+        match serde_json::to_string(receiver) {
+            Ok(s) => Ok(Some(Value::String(s))),
+            Err(_) => Ok(None),
+        }
     }
 }
 

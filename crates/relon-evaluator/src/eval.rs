@@ -422,7 +422,7 @@ impl Evaluator {
         }
     }
 
-    fn caps(&self) -> Arc<dyn NativeFnCaps> {
+    pub(crate) fn caps(&self) -> Arc<dyn NativeFnCaps> {
         self.caps
             .get_or_init(|| {
                 Arc::new(EvaluatorCaps {
@@ -1949,7 +1949,7 @@ impl Evaluator {
         self.eval(body, &method_scope)
     }
 
-    fn check_native_fn_capability(
+    pub(crate) fn check_native_fn_capability(
         &self,
         name: &str,
         entry: &GatedNativeFn,
@@ -2362,13 +2362,19 @@ fn is_type_variable(t: &relon_parser::TypeNode, generics: &[String]) -> bool {
 ///
 ///   * `Value::Dict { brand: Some(name) }` — branded after schema
 ///     validation, dispatch on the brand.
+///   * `Value::Dict { brand: None }` — unbranded dict falls back to
+///     the built-in `"Dict"` tag so stdlib methods registered via
+///     `register_pure_method("Dict", "keys", ...)` (Phase D 收尾) can
+///     dispatch without requiring a user-side schema brand. Mirrors
+///     the `String` / `List` arms below — they're equally schemaless
+///     primitives and dispatch on the type name.
 ///   * Primitive values — dispatch on the built-in tag (`String`,
 ///     `Int`, …); aligns with `#extend String with { ... }`.
 ///   * `Value::Closure` / `Value::Schema` / `Value::Type` — no
 ///     receiver dispatch; `None` so callers know to skip.
 fn value_schema_tag(v: &Value) -> Option<String> {
     match v {
-        Value::Dict(d) => d.brand.clone(),
+        Value::Dict(d) => Some(d.brand.clone().unwrap_or_else(|| "Dict".to_string())),
         Value::Bool(_) => Some("Bool".to_string()),
         Value::Int(_) => Some("Int".to_string()),
         Value::Float(_) => Some("Float".to_string()),

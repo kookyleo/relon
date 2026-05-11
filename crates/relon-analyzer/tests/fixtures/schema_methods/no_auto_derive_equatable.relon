@@ -1,0 +1,12 @@
+// Phase C.4: `#no_auto_derive Equatable` opts a user schema out of the
+// default Equatable auto-derive. The analyzer must NOT synthesize an
+// `eq` method onto `Token` — schema_methods["Token"] (after the
+// auto-derive pass) should still be empty.
+#schema Token {
+    String value: *
+} with {
+    #no_auto_derive Equatable
+}
+
+#main(Token t)
+{ String v: t.value }
