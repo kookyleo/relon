@@ -1,0 +1,7 @@
+{
+  "emit": [
+    "charge_card",
+    "log_payment"
+  ],
+  "next_state": "paid"
+}

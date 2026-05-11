@@ -1,0 +1,9 @@
+{
+  "flags": {
+    "advanced_editor": true,
+    "dark_mode": true,
+    "gdpr_banner": true,
+    "legacy_checkout": false,
+    "new_search": false
+  }
+}

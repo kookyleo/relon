@@ -1,0 +1,12 @@
+{
+  "discount_amount": 64.0,
+  "discount_display": "64 USD",
+  "discount_rate": 0.08,
+  "subtotal": 800.0,
+  "subtotal_display": "800 USD",
+  "tax_amount": 58.88,
+  "tax_display": "58.88 USD",
+  "taxable": 736.0,
+  "total": 794.88,
+  "total_display": "794.88 USD"
+}

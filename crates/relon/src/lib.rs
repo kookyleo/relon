@@ -652,6 +652,64 @@ mod tests {
     }
 
     #[test]
+    fn main_entry_examples_match_canonical_outputs() {
+        // Regression guard for the three `#main`-style examples added in
+        // commit 30e2b79. The library-mode golden runner above excludes
+        // them because it doesn't push args; this test drives each
+        // through `Evaluator::run_main` with the canonical `--args`
+        // documented in each file's header and compares JSON output
+        // against a golden snapshot under `fixtures/golden/examples_main/`.
+        // Without this, a future edit to feature_flag.relon / pricing.relon
+        // / workflow.relon could silently change behavior without
+        // surfacing in `cargo test`.
+        let root = workspace_root();
+        let cases: &[(&str, &str)] = &[
+            (
+                "examples/feature_flag.relon",
+                r#"{"user": {"id": "alice-42", "region": "eu", "plan": "pro"}}"#,
+            ),
+            (
+                "examples/pricing.relon",
+                r#"{"order": {"tier": "gold", "items": [{"sku": "BOOK-01", "qty": 3, "unit_price": 100.0}, {"sku": "PEN-09", "qty": 4, "unit_price": 50.0}, {"sku": "DESK-22", "qty": 1, "unit_price": 300.0}]}}"#,
+            ),
+            (
+                "examples/workflow.relon",
+                r#"{"state": "placed", "event": "pay"}"#,
+            ),
+        ];
+
+        for (rel_path, args_json) in cases {
+            let file = root.join(rel_path);
+            let content = std::fs::read_to_string(&file)
+                .unwrap_or_else(|e| panic!("{rel_path}: failed to read: {e}"));
+            let node = parse_document(&content)
+                .unwrap_or_else(|e| panic!("{rel_path}: parse: {e}"));
+            let analyzed = Arc::new(relon_analyzer::analyze(&node));
+            let args: std::collections::HashMap<String, Value> =
+                serde_json::from_str(args_json)
+                    .unwrap_or_else(|e| panic!("{rel_path}: args json: {e}"));
+            let ctx = Context::new()
+                .with_root(node)
+                .with_analyzed(Arc::clone(&analyzed));
+            let evaluator = Evaluator::new(Arc::new(ctx));
+            let value = evaluator
+                .run_main(&Arc::new(Scope::default()), args)
+                .unwrap_or_else(|e| panic!("{rel_path}: run_main: {e:?}"));
+            let json = to_json_value(value)
+                .unwrap_or_else(|e| panic!("{rel_path}: to_json: {e:?}"));
+            let actual = format!("{}\n", serde_json::to_string_pretty(&json).unwrap());
+            let golden_path = root
+                .join("fixtures/golden/examples_main")
+                .join(Path::new(rel_path).file_stem().unwrap())
+                .with_extension("json");
+            let expected = std::fs::read_to_string(&golden_path).unwrap_or_else(|e| {
+                panic!("failed to read {}: {e}", golden_path.display())
+            });
+            assert_eq!(actual, expected, "golden mismatch for {rel_path}");
+        }
+    }
+
+    #[test]
     fn error_fixtures_match_expected_diagnostics() {
         let root = workspace_root();
         for rel_path in [
