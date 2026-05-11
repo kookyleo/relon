@@ -92,11 +92,9 @@ warning: value assigned to `name`  is never read (×9)
 - vitepress 配置（`docs/.vitepress/config.mts`）的英文 sidebar 只有 2 项（introduction + spec），中文有 11 项；use-cases / architecture / host-integration / sandbox / types / modules / stdlib / syntax / functions 九条全都没有英文版。
 - 上一轮 review 已经点过"英文文档明显弱于中文"，至今没动。
 
-### 8. 仓库身份信息不一致
+### 8. ~~仓库身份信息不一致~~（已统一为 `kookyleo/relon`）
 
-- `Cargo.toml:11` `repository = "https://github.com/relonlang/relon"`。
-- `docs/.vitepress/config.mts:108` `https://github.com/kookyleo/relon`。
-- 同一仓库出版到 crates.io 时这种漂移会被 cargo 直接拒；现在 `0.1.0` 还没发布也许没暴露问题，但属于会爆雷的不一致。
+历史状态：`Cargo.toml:11` 写 `relonlang/relon`，`docs/.vitepress/config.mts:108` + 两个 `index.md` + 英文 `introduction.md` 都是 `kookyleo/relon`，五处中四处一致、一处孤儿。现已把 `Cargo.toml` 的 `repository` 字段统一到 `kookyleo/relon`，作为 canonical URL。后续发布到 crates.io 不会因为 repo 校验失败被拒。
 
 ### 9. 文档/代码状态漂移的细节
 
@@ -107,9 +105,11 @@ warning: value assigned to `name`  is never read (×9)
 
 `relon-cli` 包内同时挂着面向用户的 CLI 和内部用的 `bench` benchmark。`bench` 用 `Instant::now()`、`Duration`，本身没问题，但暴露成 `relon-cli` 包的二级 bin 让 `cargo run -p relon-cli` 这条最常用命令直接失败（见 #2）。`bench` 应该挪到 `crates/relon-cli/examples/` 或者一个独立的 `relon-bench` 包 / `#[cfg(feature = "bench")]`，让用户面 CLI 保持单 bin。
 
-### 11. `register_fn` API 收口仍留半口
+### ~~11. `register_fn` API 收口仍留半口~~
 
-`roadmap.md:35-44` 写的"把 `register_fn` / `register_fn_with_caps` 合并为单 `register_fn(name, gate, fn)`"已落地，但 `allow_native_fn` HashSet 还在（`crates/relon-evaluator/src/eval.rs:31-32`）——它是一个**绕过 per-bit gate 的纯名字白名单**，文档 `sandbox.md:165-179` 解释为 "我就是想放某一个函数过"。这条小后门和六位能力模型并存，会让 host 集成的最小授权失败模式难以审计——"为什么我把所有 bit 都关了它还能跑？因为有人写过 `allow_native_fn.insert("...")`"。短期是文档强调，长期建议把 `allow_native_fn` 改名为 `force_allow_native_fn` 或者要求只有 trusted Context 才能写入。
+~~`roadmap.md:35-44` 写的"把 `register_fn` / `register_fn_with_caps` 合并为单 `register_fn(name, gate, fn)`"已落地，但 `allow_native_fn` HashSet 还在（`crates/relon-evaluator/src/eval.rs:31-32`）——它是一个**绕过 per-bit gate 的纯名字白名单**，文档 `sandbox.md:165-179` 解释为 "我就是想放某一个函数过"。这条小后门和六位能力模型并存，会让 host 集成的最小授权失败模式难以审计——"为什么我把所有 bit 都关了它还能跑？因为有人写过 `allow_native_fn.insert("...")`"。短期是文档强调，长期建议把 `allow_native_fn` 改名为 `force_allow_native_fn` 或者要求只有 trusted Context 才能写入。~~
+
+（已闭环 2026-05-11：`allow_native_fn` / `allow_all_native_fn` 字段已从 evaluator 与 analyzer 镜像中删除；`Capabilities` 仅保留 6 个能力 bit + 2 个预算，授权路径单一。`Capabilities::all_granted()` 改为直接翻 6 个 bit，原"all-granted"语义在 per-bit gate 下行为等价。）
 
 ## 其他偏向中等优先级的观察
 
@@ -127,7 +127,7 @@ warning: value assigned to `name`  is never read (×9)
 | ~~P0~~ | ~~`clippy -D warnings` 在文档承诺的命令下失败~~ | ~~已治标：thiserror 升 2 + 两 crate 加 `#![allow(unused_assignments)]` 引用 rust-lang/rust#147648；等上游 rustc 修后删 allow~~ |
 | P1 | 多租户 Iter cursor 隔离 | cursor 表挂到 `Context`，`eval_root` / `run_main` 末尾清空 |
 | P1 | 仓库 URL 漂移 + 英文文档承诺空洞 | 选一个 canonical repo url 全量替换；要么把英文文档补到与中文对齐，要么 README 不要再写 "· English" |
-| P1 | `allow_native_fn` 与 6-bit 能力的语义重叠 | 文档/命名上明确为"强制覆盖通道"，加 audit log |
+| ~~P1~~ | ~~`allow_native_fn` 与 6-bit 能力的语义重叠~~ | ~~文档/命名上明确为"强制覆盖通道"，加 audit log~~（已闭环 2026-05-11：两字段已删除，授权路径收口为单一 6-bit gate 检查） |
 | P2 | constraints.rs 注释与 roadmap 状态漂移 | 清理 "still-pending hook" 注释；roadmap 上把 Iter cursor leak 重新分类 |
 | P2 | core schema vs stdlib mirror 的双源 | 加 `#[cfg(test)]` 交叉断言 |
 | P2 | examples 过薄 | 至少补 feature flag / pricing / workflow 三个落地玩具 |
