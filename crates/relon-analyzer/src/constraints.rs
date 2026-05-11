@@ -34,12 +34,14 @@
 //!     the evaluator (`arithmetic.rs::try_arith_op_method`,
 //!     `eval.rs::try_index_method`, …).
 //!
-//! Iterable / Callable still only have the shape check — their
-//! dispatch hooks (`for x in c` → `c.iter()` + `it.next()`, and the
-//! Callable equivalent) are deferred. Indexable lowering (`a[i]`
-//! → `a.index(i)`, §C.13) is fully wired through both halves; Number
-//! family (Addable / Subtractable / Multiplicable / Divisible /
-//! Modable) is wired through `try_arith_op_method`.
+//! Dispatch coverage as of schema-rooted Phase C close-out: Equatable /
+//! Comparable (operators), Iterable (`materialize_iterable` in eval.rs
+//! drives comprehensions + user-callable `Iter.next()`), Indexable
+//! (`a[i]` / `?[i]`, §C.13), and the Number family (Addable /
+//! Subtractable / Multiplicable / Divisible / Modable through
+//! `try_arith_op_method`) all have both halves wired. Callable stays
+//! shape-only by decision 23 — Closure remains the sole callable
+//! value form, so no operator lowers to a `call` witness.
 
 use crate::diagnostic::{span_of, Diagnostic};
 use crate::schema::{SchemaMethodInfo, SchemaMethodParamInfo};
@@ -103,19 +105,15 @@ pub(crate) const CONSTRAINTS: &[ExpectedWitness] = &[
         params: &[],
         return_type: "String",
     },
-    // Decisions 21-24 of `schema-rooted-model-2026-05-11.md`: the
-    // witness *shape* for the remaining constraints is fixed here so
-    // a `#derive` against the wrong-shape method already surfaces
-    // `ConstraintWitnessShapeMismatch`. The lowering (binding the
-    // method to `for`/`a[i]`/arithmetic operators in the evaluator)
-    // is the still-pending hook — see `schema-rooted-implementation-
-    // log` §C.6 for the per-constraint TODO.
+    // Decisions 21-24 of `schema-rooted-model-2026-05-11.md`: shape
+    // + lowering are both wired. See `schema-rooted-implementation-
+    // log` §C.7 / C.9 / C.13 for the per-constraint records.
     //
-    // Iterable: `for x in c` desugars to `c.iter()` + `it.next()`.
-    // Requires evaluator iteration site to consult `iter` witness +
-    // a built-in `Iter<T>` schema. Until that lands, `#derive
-    // Iterable iter() -> Iter<T>: ...` is shape-checked but the body
-    // can only be called as a plain method (no `for` lowering).
+    // Iterable: `for x in c` desugars to `c.iter()` + driver walk in
+    // `eval.rs::materialize_iterable`; user-callable `xs.iter().next()`
+    // goes through `stdlib::IterNext`. The shape check still only
+    // compares the head-segment name of `Iter<T>` — concrete element
+    // type unification stays a follow-up.
     ExpectedWitness {
         constraint: "Iterable",
         method: "iter",
