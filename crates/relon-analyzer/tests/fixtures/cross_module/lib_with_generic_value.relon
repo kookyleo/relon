@@ -1,0 +1,12 @@
+// Cross-module generic schema with a root-level addressable value
+// instantiated at `Container<Int>`. Used by importers to exercise
+// `pkg.c.value` path-tail walking through a generics-parameterized
+// schema declared in the lib namespace.
+#schema Container<T> {
+    T value: *
+}
+{
+    Container<Int> c: {
+        value: 42
+    }
+}

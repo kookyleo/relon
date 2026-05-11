@@ -210,3 +210,96 @@ fn fixture_cross_module_pkg_unknown_schema_in_main_param() {
         .count();
     assert!(unknown_types >= 1, "{:#?}", ws.modules);
 }
+
+/// Schema-rooted §J follow-up (generics): an aliased import's
+/// `Container<Int> c: ...` value should walk cleanly through
+/// `pkg.c.value` to `Int` — the substitution `{T → Int}` is
+/// induced by the value's declared type and applied to the
+/// schema's `T value: *` field declaration. Pre-fix the walker
+/// kept `T` un-substituted and the declared `#main() -> Int`
+/// surfaced a phantom `MainReturnTypeMismatch { found: "T" }`.
+#[test]
+fn fixture_cross_module_strict_pkg_generic_value_path_ok() {
+    let ws = analyze_fixture_workspace("cross_module", "strict_pkg_generic_value_path_ok.relon");
+    let stalls: usize = ws
+        .modules
+        .values()
+        .flat_map(|t| t.diagnostics.iter())
+        .filter(|d| {
+            matches!(
+                d,
+                Diagnostic::InferenceLimit { .. }
+                    | Diagnostic::UnknownReferenceType { .. }
+                    | Diagnostic::MainReturnTypeMismatch { .. }
+                    | Diagnostic::StaticTypeMismatch { .. }
+            )
+        })
+        .count();
+    assert_eq!(stalls, 0, "{:#?}", ws.modules);
+}
+
+/// Schema-rooted §J follow-up (nested generics): two-hop generic
+/// substitution through a cross-module value path. `pkg.w.inner
+/// .value` for `Wrapper<Int> w` whose schema declares
+/// `Container<T> inner: *` should thread `T → Int` through both
+/// hops. Verifies that the namespace re-qualification step rewrites
+/// `Container<T>` (bare sibling reference in `pkg`'s namespace) to
+/// `pkg.Container<Int>` before lifting, and that the new schema's
+/// substitution map is rebuilt from the post-substitution generic
+/// args.
+#[test]
+fn fixture_cross_module_strict_pkg_nested_generic_value_path_ok() {
+    let ws = analyze_fixture_workspace(
+        "cross_module",
+        "strict_pkg_nested_generic_value_path_ok.relon",
+    );
+    let stalls: usize = ws
+        .modules
+        .values()
+        .flat_map(|t| t.diagnostics.iter())
+        .filter(|d| {
+            matches!(
+                d,
+                Diagnostic::InferenceLimit { .. }
+                    | Diagnostic::UnknownReferenceType { .. }
+                    | Diagnostic::MainReturnTypeMismatch { .. }
+                    | Diagnostic::StaticTypeMismatch { .. }
+            )
+        })
+        .count();
+    assert_eq!(stalls, 0, "{:#?}", ws.modules);
+}
+
+/// Schema-rooted §J follow-up (generics): the negative half. With
+/// substitution wired through the walker, `pkg.c.value` resolves
+/// concretely to `Int`, so a declared `#main() -> String` surfaces
+/// the precise `MainReturnTypeMismatch { expected: "String",
+/// found: "Int" }` rather than a generic `InferenceLimit` (pre-fix)
+/// or a phantom `found: "T"` (mid-fix without substitution).
+#[test]
+fn fixture_cross_module_strict_pkg_generic_value_path_mismatch() {
+    let ws = analyze_fixture_workspace(
+        "cross_module",
+        "strict_pkg_generic_value_path_mismatch.relon",
+    );
+    let mismatches: usize = ws
+        .modules
+        .values()
+        .flat_map(|t| t.diagnostics.iter())
+        .filter(|d| {
+            matches!(
+                d,
+                Diagnostic::MainReturnTypeMismatch { expected, found, .. }
+                    if expected == "String" && found == "Int"
+            )
+        })
+        .count();
+    assert_eq!(mismatches, 1, "{:#?}", ws.modules);
+    let stalls: usize = ws
+        .modules
+        .values()
+        .flat_map(|t| t.diagnostics.iter())
+        .filter(|d| matches!(d, Diagnostic::InferenceLimit { .. }))
+        .count();
+    assert_eq!(stalls, 0, "{:#?}", ws.modules);
+}

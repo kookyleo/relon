@@ -1117,6 +1117,38 @@ fn walk_segments(path: &[TokenKey]) -> Vec<WalkSeg> {
     out
 }
 
+/// Schema-rooted §J follow-up (generics): look up `schema_name`'s
+/// declared generic-parameter names. Tries (in order):
+/// - the importer's local `tree.schemas` (dict-form schemas)
+/// - the importer's `tree.root_schemas` (directive-form schemas)
+/// - the workspace import index's `imported_schema_generics` (for
+///   schemas reached through `#import alias from ...` /
+///   `#import * from ...` / `#import { ... } from ...`)
+///
+/// Returns an empty vec if the schema isn't generic or can't be
+/// found at all (conservative — callers treat missing params as "no
+/// substitution to apply").
+fn schema_generic_params(scope: &TypeScope, schema_name: &str) -> Vec<String> {
+    if let Some(tree) = scope.tree {
+        for def in tree.schemas.values() {
+            if def.name.as_deref() == Some(schema_name) {
+                return def.generics.clone();
+            }
+        }
+        for d in &tree.root_schemas {
+            if d.name == schema_name {
+                return d.generics.clone();
+            }
+        }
+        if let Some(idx) = tree.workspace_import_index.as_ref() {
+            if let Some(params) = idx.imported_schema_generics.get(schema_name) {
+                return params.clone();
+            }
+        }
+    }
+    Vec::new()
+}
+
 /// Schema-rooted §J follow-up: rewrite a single-segment user-schema
 /// `TypeNode` so its head carries the importer's alias prefix —
 /// `User` (recorded inside `lib_with_value.relon`) becomes
@@ -1131,17 +1163,40 @@ fn walk_segments(path: &[TokenKey]) -> Vec<WalkSeg> {
 /// `walk_path`'s mid-step schema lookup would miss the importer's
 /// `lib.User` entry, and the rest of the chain would surface as
 /// `UnknownStep`.
+///
+/// Generics: when the value's declared type carries type arguments
+/// (`Container<T> c: ...`), we recurse into each generic so a
+/// nested user schema also gets the alias prefix —
+/// `Container<User>` becomes `pkg.Container<pkg.User>`. Builtins
+/// (`Int`, `List<…>`, `Closure<…>`, …) and the `Self` placeholder
+/// stay un-qualified because their identity doesn't change across
+/// module boundaries. Multi-segment heads (already qualified, or
+/// hostile) are passed through unchanged on the assumption the
+/// author wrote the prefix deliberately.
 fn qualify_type_node_for_alias(hint: &TypeNode, alias: &str) -> TypeNode {
-    if hint.path.len() == 1
-        && hint.generics.is_empty()
-        && !is_known_builtin_alt(hint.path[0].as_str())
-    {
-        let mut qualified = hint.clone();
-        qualified.path = vec![alias.to_string(), hint.path[0].clone()];
-        qualified
-    } else {
-        hint.clone()
+    let mut out = hint.clone();
+    // Recurse into generics first so the result is consistent
+    // regardless of whether the head also needs prefixing.
+    out.generics = hint
+        .generics
+        .iter()
+        .map(|g| qualify_type_node_for_alias(g, alias))
+        .collect();
+    // Only single-segment heads are eligible for prefix rewriting.
+    // Multi-segment paths were already qualified by their author (or
+    // are some other shape we shouldn't touch here).
+    if hint.path.len() == 1 {
+        let head = hint.path[0].as_str();
+        // `Self` is a binder placeholder used in schema methods
+        // (`eq(other: Self) -> Bool`). It refers to the enclosing
+        // schema, not a free name, so it must not gain an alias
+        // prefix. Builtins (`Int` / `List` / `Dict` / `Closure` /
+        // …) are language-level and stable across modules.
+        if head != "Self" && !is_known_builtin_alt(head) {
+            out.path = vec![alias.to_string(), hint.path[0].clone()];
+        }
     }
+    out
 }
 
 /// Outcome of walking the tail of a `Variable` / `Reference` path under
@@ -1216,6 +1271,20 @@ pub(crate) fn walk_path(path: &[TokenKey], scope: &TypeScope) -> PathTailOutcome
     // primitives stay un-qualified.
     let mut start_offset = 0usize;
     let mut current: InferredType;
+    // Schema-rooted §J follow-up (generics): substitution context for
+    // the current schema's generic parameters. Populated when we
+    // enter a generic-instantiated schema (via the alias-value
+    // shortcut below or by descending into a field whose declared
+    // type is `Container<...>`). Empty for non-generic schemas and
+    // for non-schema running types.
+    let mut current_subst: HashMap<String, TypeNode> = HashMap::new();
+    // Schema-rooted §J follow-up: alias prefix under which the
+    // current schema lives, when reached through a cross-module
+    // import. Bare schema names in field types of an imported schema
+    // refer to siblings in the *exporter's* namespace, so we need to
+    // re-qualify them before lifting (and before lookup). Empty
+    // string means "no namespace re-qualification needed".
+    let mut current_namespace: Option<String> = None;
     let alias_value_resolved = if segs.len() >= 2 {
         if let WalkSeg::Name(field) = &segs[1] {
             scope
@@ -1224,11 +1293,18 @@ pub(crate) fn walk_path(path: &[TokenKey], scope: &TypeScope) -> PathTailOutcome
                 .and_then(|idx| idx.aliased_values.get(head))
                 .and_then(|values| values.get(field))
                 .map(|hint| {
+                    // Qualify the lib-side hint so a bare `Container`
+                    // becomes `alias.Container` — the qualified key
+                    // `build_schema_index` already uses for imported
+                    // schemas. Recurse into generics so a nested
+                    // user schema (`Container<User>`) also gains the
+                    // alias prefix; builtins stay untouched.
                     let qualified = qualify_type_node_for_alias(hint, head);
-                    infer_from_type_node_with_imports(
+                    let lifted = infer_from_type_node_with_imports(
                         &qualified,
                         scope.tree.and_then(|t| t.workspace_import_index.as_ref()),
-                    )
+                    );
+                    (lifted, qualified)
                 })
         } else {
             None
@@ -1236,9 +1312,22 @@ pub(crate) fn walk_path(path: &[TokenKey], scope: &TypeScope) -> PathTailOutcome
     } else {
         None
     };
-    if let Some(ty) = alias_value_resolved {
+    if let Some((ty, qualified_hint)) = alias_value_resolved {
         current = ty;
         start_offset = 1;
+        // Schema-rooted §J follow-up (generics): record the
+        // schema's generic-arg bindings so the very next `.field`
+        // step can substitute `T → ConcreteArg` when reading the
+        // schema's declared field type.
+        if let InferredType::Schema(ref schema_name) = current {
+            current_namespace = Some(head.clone());
+            let params = schema_generic_params(scope, schema_name);
+            for (i, p) in params.iter().enumerate() {
+                if let Some(arg) = qualified_hint.generics.get(i) {
+                    current_subst.insert(p.clone(), arg.clone());
+                }
+            }
+        }
     } else {
         let Some(looked_up) = scope.lookup(head) else {
             return PathTailOutcome::UnknownHead;
@@ -1288,10 +1377,59 @@ pub(crate) fn walk_path(path: &[TokenKey], scope: &TypeScope) -> PathTailOutcome
                         running_name: schema_name,
                     };
                 };
+                // Schema-rooted §J follow-up (generics): apply the
+                // running substitution (`{T → Int}`) to the field's
+                // declared type before lifting. This is what turns
+                // `T value: *` into `Int value: *` when the running
+                // schema was reached as `Container<Int>`.
+                let substituted = if current_subst.is_empty() {
+                    field_ty.clone()
+                } else {
+                    crate::typecheck::substitute_generics_in_typenode(field_ty, &current_subst)
+                };
+                // Schema-rooted §J follow-up: if the running schema
+                // lives in an imported module's namespace, bare
+                // sibling-schema references in its field types
+                // mean "schemas in that same exporter's namespace",
+                // so re-qualify before lifting. Builtins and binder
+                // placeholders (`Self`, the schema's own generic
+                // params) stay untouched.
+                let renamespaced = if let Some(ns) = current_namespace.as_deref() {
+                    qualify_type_node_for_alias(&substituted, ns)
+                } else {
+                    substituted
+                };
                 current = infer_from_type_node_with_imports(
-                    field_ty,
+                    &renamespaced,
                     scope.tree.and_then(|t| t.workspace_import_index.as_ref()),
                 );
+                // After the step, rebuild the substitution map and
+                // namespace for the *new* running schema. A
+                // non-schema running type (e.g. `Int`, `List<…>`)
+                // resets both because there are no generic
+                // parameters to bind further.
+                current_subst.clear();
+                if let InferredType::Schema(ref new_schema) = current {
+                    // If `new_schema` is qualified (`alias.Name`),
+                    // record the alias as the new namespace for
+                    // subsequent descents.
+                    if let Some((ns, _)) = new_schema.split_once('.') {
+                        current_namespace = Some(ns.to_string());
+                    }
+                    // Build a fresh substitution from the field
+                    // type's generic args against the new schema's
+                    // declared parameters (post-substitution +
+                    // re-namespacing, so a `Container<T>` field
+                    // already has T bound to the parent's args).
+                    let new_params = schema_generic_params(scope, new_schema);
+                    for (i, p) in new_params.iter().enumerate() {
+                        if let Some(arg) = renamespaced.generics.get(i) {
+                            current_subst.insert(p.clone(), arg.clone());
+                        }
+                    }
+                } else {
+                    current_namespace = None;
+                }
             }
             (InferredType::Dict(value_ty), WalkSeg::Name(_)) => {
                 current = *value_ty;

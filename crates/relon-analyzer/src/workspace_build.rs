@@ -437,6 +437,16 @@ pub struct WorkspaceImportIndex {
     /// this, `walk_path([alias, value, ...])` lookups stop at the bare
     /// alias head and the rest of the chain silently leaks `Any`.
     pub aliased_values: HashMap<String, HashMap<String, TypeNode>>,
+    /// Schema-rooted §J follow-up (generics): declared generic-parameter
+    /// names for every imported schema, keyed the same way as
+    /// `imported_schemas` (qualified `alias.Name` for aliased imports,
+    /// bare upstream / local name for spread / destructure). The
+    /// path-tail walker reads this to build a `T → ConcreteArg`
+    /// substitution when descending through a generic-instantiated
+    /// schema field — without it, `pkg.c.value` for
+    /// `Container<Int> c: ...` would resolve to the unsubstituted `T`
+    /// and a strict-mode return-type check would mis-report.
+    pub imported_schema_generics: HashMap<String, Vec<String>>,
 }
 
 impl WorkspaceImportIndex {
@@ -503,6 +513,24 @@ pub(crate) fn build_import_index(ws: &WorkspaceTree, importer_id: &str) -> Works
                 Some((name, fields))
             })
             .collect();
+        // Schema-rooted §J follow-up (generics): pair `exported_schema_fields`
+        // with each schema's declared generic-parameter names (e.g.
+        // `Container<T>` → `["T"]`). The path-tail walker uses these
+        // to substitute `T → Int` when descending through a
+        // `Container<Int>` value field — without the substitution,
+        // `pkg.c.value` for `Container<Int> c: ...` would surface as
+        // the unbound binder `T` and confuse downstream type checks.
+        let exported_schema_generics: HashMap<String, Vec<String>> = target_tree
+            .schemas
+            .values()
+            .filter_map(|def| {
+                let name = def.name.clone()?;
+                if !exported_names.contains(&name) {
+                    return None;
+                }
+                Some((name, def.generics.clone()))
+            })
+            .collect();
         // v1.1: pick up the imported module's *root-level* closure
         // signatures. We re-walk the module's parsed root node here
         // (rather than using `field_closure_index`, which is
@@ -562,6 +590,14 @@ pub(crate) fn build_import_index(ws: &WorkspaceTree, importer_id: &str) -> Works
                 let qualified = format!("{alias}.{name}");
                 index.imported_schemas.insert(qualified, fields.clone());
             }
+            // Schema-rooted §J follow-up (generics): mirror the
+            // qualified-key layout for generic-parameter names.
+            for (name, generics) in &exported_schema_generics {
+                let qualified = format!("{alias}.{name}");
+                index
+                    .imported_schema_generics
+                    .insert(qualified, generics.clone());
+            }
             continue;
         }
         if imp.spread {
@@ -577,6 +613,11 @@ pub(crate) fn build_import_index(ws: &WorkspaceTree, importer_id: &str) -> Works
             // importer's namespace.
             for (name, fields) in &exported_schema_fields {
                 index.imported_schemas.insert(name.clone(), fields.clone());
+            }
+            for (name, generics) in &exported_schema_generics {
+                index
+                    .imported_schema_generics
+                    .insert(name.clone(), generics.clone());
             }
             continue;
         }
@@ -597,7 +638,12 @@ pub(crate) fn build_import_index(ws: &WorkspaceTree, importer_id: &str) -> Works
                 // their *local* (alias-or-upstream) name so type
                 // references like `MyUser` (alias of `User`) resolve.
                 if let Some(fields) = exported_schema_fields.get(upstream) {
-                    index.imported_schemas.insert(local, fields.clone());
+                    index.imported_schemas.insert(local.clone(), fields.clone());
+                }
+                if let Some(generics) = exported_schema_generics.get(upstream) {
+                    index
+                        .imported_schema_generics
+                        .insert(local, generics.clone());
                 }
             }
         }

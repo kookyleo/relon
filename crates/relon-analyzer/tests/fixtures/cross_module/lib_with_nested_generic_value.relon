@@ -1,0 +1,18 @@
+// Cross-module generic schema with a nested generic field. The
+// importer must thread `T → Int` through `Wrapper<Int>` into the
+// inner `Container<T>` field, then again through that `Container`'s
+// `T value: *` slot. Each hop substitutes once and renamespaces the
+// bare `Container` reference to `pkg.Container`.
+#schema Container<T> {
+    T value: *
+}
+#schema Wrapper<T> {
+    Container<T> inner: *
+}
+{
+    Wrapper<Int> w: {
+        inner: {
+            value: 7
+        }
+    }
+}

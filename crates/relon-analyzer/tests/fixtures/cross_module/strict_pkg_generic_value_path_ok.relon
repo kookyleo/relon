@@ -1,0 +1,8 @@
+// Schema-rooted §J follow-up (generics): `pkg.c.value` walks through
+// an aliased import's root-level generic-schema value. The lib-side
+// `Container<T> c: { value: 42 }` instantiates `T = Int`, so the
+// declared `#main() -> Int` lands cleanly without strict-mode noise.
+#strict
+#import pkg from "./lib_with_generic_value.relon"
+#main() -> Int
+pkg.c.value

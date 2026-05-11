@@ -1,0 +1,9 @@
+// Schema-rooted §J follow-up (generics): the negative half — when
+// `pkg.c.value` resolves concretely to `Int` (T = Int in the lib's
+// `Container<Int> c: ...`), declaring `#main() -> String` should
+// surface as `MainReturnTypeMismatch` rather than collapsing to a
+// generic `InferenceLimit`.
+#strict
+#import pkg from "./lib_with_generic_value.relon"
+#main() -> String
+pkg.c.value
