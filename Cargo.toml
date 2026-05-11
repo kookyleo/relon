@@ -8,7 +8,7 @@ resolver = "2"
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
-repository = "https://github.com/relonlang/relon"
+repository = "https://github.com/kookyleo/relon"
 description = "A programmable configuration language that extends JSON"
 
 [workspace.dependencies]
