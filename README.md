@@ -41,7 +41,10 @@ cargo run -q -p relon-fmt -- --check fixtures/*.relon fixtures/modules/*.relon f
 - **Sandboxed by default**: a script declares the capabilities it needs
   (`reads_fs` / `writes_fs` / `network` / `reads_clock` / `reads_env` /
   `uses_rng`, plus allow-listed native fns); the host grants them.
-  There is no "trusted mode" the script can fall back to.
+  Scripts can't elevate themselves; the host can choose to grant all
+  caps explicitly via `--trust` / `Capabilities::all_granted()`, and
+  that grant is auditable code at the call site rather than an implicit
+  trusted mode.
 - **Self-describing schemas**: `@schema`, sum-type tagged enums,
   recursive contracts, branded values — type information travels with
   the payload.
