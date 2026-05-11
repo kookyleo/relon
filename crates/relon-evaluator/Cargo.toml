@@ -15,5 +15,5 @@ ordered-float.workspace = true
 # the feature on as long as Value carries Arc'd payloads.
 serde = { version = "1.0", features = ["derive", "rc"] }
 serde_json = "1.0"
-thiserror = "1.0"
+thiserror = { workspace = true }
 miette = { version = "7.6.0", features = ["derive"] }

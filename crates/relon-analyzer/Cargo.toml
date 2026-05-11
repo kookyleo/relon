@@ -8,4 +8,4 @@ description = "Semantic analysis layer for the relon language: name resolution, 
 [dependencies]
 relon-parser = { path = "../relon-parser" }
 miette = { version = "7.6.0", features = ["derive"] }
-thiserror = "1.0"
+thiserror = { workspace = true }
