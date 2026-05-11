@@ -452,9 +452,8 @@ fn max_value_elements_rejects_receiver_method_intrinsic() {
 #[test]
 fn pure_fn_callable_under_sandbox() {
     // `register_pure_fn` declares an empty `NativeFnGate`. Under a
-    // fully sandboxed Context with an empty `allow_native_fn` set the
-    // call still goes through — the all-zero gate is trivially
-    // satisfied by any `Capabilities`.
+    // fully sandboxed Context the call still goes through — the
+    // all-zero gate is trivially satisfied by any `Capabilities`.
     struct Echo;
     impl crate::native_fn::RelonFunction for Echo {
         fn call(
@@ -505,7 +504,7 @@ fn gated_fn_rejected_in_sandbox_without_allowlist() {
 }
 
 #[test]
-fn gated_fn_permitted_when_in_allowlist() {
+fn gated_fn_permitted_when_bit_granted() {
     struct ReadFs;
     impl crate::native_fn::RelonFunction for ReadFs {
         fn call(
@@ -518,9 +517,7 @@ fn gated_fn_permitted_when_in_allowlist() {
     }
 
     let mut ctx = Context::sandboxed();
-    ctx.capabilities
-        .allow_native_fn
-        .insert("fs.read".to_string());
+    ctx.capabilities.reads_fs = true;
     ctx.register_fn(
         "fs.read",
         NativeFnGate {
@@ -541,9 +538,8 @@ fn gated_fn_permitted_when_in_allowlist() {
 
 #[test]
 fn fully_granted_caps_let_gated_fns_through() {
-    // `Capabilities::all_granted()` flips `allow_all_native_fn`,
-    // so even fns with non-empty `NativeFnGate` go through without
-    // an explicit allowlist entry.
+    // `Capabilities::all_granted()` flips every capability bit, so a
+    // fn declaring any subset of those bits is satisfied.
     struct ReadFs;
     impl crate::native_fn::RelonFunction for ReadFs {
         fn call(
@@ -576,7 +572,7 @@ fn fully_granted_caps_let_gated_fns_through() {
 fn std_module_resolver_works_under_full_sandbox() {
     // `std/...` modules are virtual + zero-IO, so they must keep
     // working even under the strictest sandbox (no fs root, no
-    // native-fn allowlist, etc.).
+    // capability bits granted, etc.).
     let result = eval_with(
         Context::sandboxed(),
         r#"#import list from "std/list"

@@ -129,16 +129,11 @@ fn check_node(
     let Some(gate) = gates.get(&name) else {
         return;
     };
-    // `allow_all_native_fn` and explicit allowlist short-circuit any
-    // gate. Match the evaluator's order in `check_native_fn_capability`
-    // so a denial reason here means the same denial would surface at
-    // runtime.
-    if caps.allow_all_native_fn || caps.allow_native_fn.contains(&name) {
-        return;
-    }
     // Emit one diagnostic per missing bit. Analyzer is a batch reporter,
     // so a fn declaring `reads_fs + network` with neither granted shows
-    // up as two diagnostics — runtime would stop at the first.
+    // up as two diagnostics — runtime would stop at the first. When
+    // every required bit is granted the loop body is skipped and no
+    // diagnostic is emitted.
     for bit in gate.missing_bits(caps) {
         out.push(Diagnostic::CapabilityRequired {
             fn_name: name.clone(),
@@ -559,27 +554,6 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // 10. caps.allow_native_fn contains the fn → silent (per-fn allowlist).
-    #[test]
-    fn allow_native_fn_silences_diagnostic() {
-        let mut allow = HashSet::new();
-        allow.insert("read_file".to_string());
-        let caps = Capabilities {
-            allow_native_fn: allow,
-            ..Capabilities::default()
-        };
-        let opts = options_with_read_file_gate(caps);
-        let mut loader = MapLoader::new();
-        let ws = build_with_options(
-            "/abs/entry",
-            r#"{ x: read_file("a.txt") }"#,
-            &mut loader,
-            &opts,
-        );
-        assert!(cap_diags(&ws).is_empty());
-    }
-
-    // -------------------------------------------------------------------
     // 11. Each new capability bit is flagged independently — same
     //     diagnostic shape as the original `reads_fs` test, just with a
     //     different `capability` string. Drives the table-driven check
@@ -666,13 +640,12 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // 13. Granting every bit (without `allow_all_native_fn`) silences
-    //     every diagnostic. Exercises the per-bit grant path, not the
-    //     global short-circuit.
+    // 13. Granting every bit silences every diagnostic. Exercises the
+    //     only grant path — there is no global short-circuit to fall
+    //     back on.
     #[test]
     fn explicit_per_bit_grants_silence_check() {
-        let mut caps = Capabilities::all_granted();
-        caps.allow_all_native_fn = false; // force the per-bit path
+        let caps = Capabilities::all_granted();
         let gate = NativeFnGate {
             reads_fs: true,
             writes_fs: true,

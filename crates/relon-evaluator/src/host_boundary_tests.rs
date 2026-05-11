@@ -260,7 +260,8 @@ fn host_receives_value_too_large() {
 fn host_receives_capability_denied() {
     // A native function gated on `reads_fs` is rejected by a sandboxed
     // (zero-grant) Context. The `Capabilities::default` Context has
-    // neither `reads_fs` nor an entry in `allow_native_fn` for this fn.
+    // neither `reads_fs` nor any other path that would satisfy the
+    // gate.
     struct ReadsFs;
     impl RelonFunction for ReadsFs {
         fn call(&self, _args: NativeArgs, _range: TokenRange) -> Result<Value, RuntimeError> {

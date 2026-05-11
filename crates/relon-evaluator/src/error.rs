@@ -136,7 +136,7 @@ pub enum RuntimeError {
     #[error("Capability denied: native function `{name}` ({reason})")]
     #[diagnostic(
         code(relon::eval::capability_denied),
-        help("This Context is sandboxed. Add the function name to `Capabilities::allow_native_fn` to permit it.")
+        help("This Context is sandboxed. Grant the capability declared on the fn's gate (e.g. `caps.reads_fs = true`) to permit it.")
     )]
     CapabilityDenied {
         name: String,

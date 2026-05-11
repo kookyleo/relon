@@ -132,7 +132,7 @@ pub fn analyze(root: &Node) -> AnalyzedTree {
 /// Run every analyzer pass over `root` with caller-supplied options
 /// (currently just the host-registered native fn name set). Used by the
 /// workspace pass and by hosts that want analyzer diagnostics to align
-/// with their actual `Capabilities::allow_native_fn` grant.
+/// with their actual `Capabilities` bit grants.
 pub fn analyze_with_options(root: &Node, options: &AnalyzeOptions) -> AnalyzedTree {
     let mut tree = AnalyzedTree::new();
     tree.host_fn_names = options.host_fn_names.clone();
@@ -225,8 +225,7 @@ pub fn analyze_with_options(root: &Node, options: &AnalyzeOptions) -> AnalyzedTr
 pub struct AnalyzeOptions {
     /// Names registered with the host's `Context::functions`. Empty by
     /// default — hosts that want their custom fn names recognized must
-    /// populate this from their `Capabilities::allow_native_fn` set or
-    /// from the keys of `Context::functions` directly.
+    /// populate this from the keys of `Context::functions` directly.
     pub host_fn_names: HashSet<String>,
     /// Stage 3.4: signatures the host has declared for its native fns.
     /// When supplied, the FnCall checker validates arity / arg types

@@ -13,8 +13,6 @@
 //! (e.g. `relon`'s `Context::analyze_workspace` adapter). Field names
 //! match exactly so that copy is a one-liner.
 
-use std::collections::HashSet;
-
 /// Per-fn capability requirement declared at registration time. Mirrors
 /// `relon_evaluator::eval::NativeFnGate` field-for-field. A pure fn
 /// carries `NativeFnGate::default()` (every bit zero) and is trivially
@@ -69,20 +67,15 @@ impl NativeFnGate {
     }
 }
 
-/// Context-wide grant the host hands the evaluator. Mirrors the
-/// allow-list-shaped fields of `relon_evaluator::eval::Capabilities`.
-/// Resource budgets (`max_steps`, `max_value_elements`) are deliberately
-/// excluded — they affect runtime evaluation, not static reachability.
+/// Context-wide grant the host hands the evaluator. Mirrors the bit
+/// grants from `relon_evaluator::eval::Capabilities`. Resource budgets
+/// (`max_steps`, `max_value_elements`) are excluded — they affect
+/// runtime evaluation, not static reachability.
 ///
 /// `#[non_exhaustive]`: same rationale as the evaluator twin.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct Capabilities {
-    /// If true, every gated native fn is allowed regardless of `name`.
-    pub allow_all_native_fn: bool,
-    /// Specific native fn names that are allowed even when
-    /// `allow_all_native_fn` is off.
-    pub allow_native_fn: HashSet<String>,
     /// Filesystem reads permitted.
     pub reads_fs: bool,
     /// Filesystem writes permitted.
@@ -102,8 +95,6 @@ impl Default for Capabilities {
     /// `Capabilities::default()` shape.
     fn default() -> Self {
         Self {
-            allow_all_native_fn: false,
-            allow_native_fn: HashSet::new(),
             reads_fs: false,
             writes_fs: false,
             network: false,
@@ -121,8 +112,6 @@ impl Capabilities {
     /// and the static check stays silent.
     pub fn all_granted() -> Self {
         Self {
-            allow_all_native_fn: true,
-            allow_native_fn: HashSet::new(),
             reads_fs: true,
             writes_fs: true,
             network: true,

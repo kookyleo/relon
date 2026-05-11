@@ -12,12 +12,16 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-/// Context-wide sandbox policy. Holds both the resource budgets the
+/// Context-wide sandbox policy. Holds the resource budgets the
 /// evaluator enforces (`max_steps`, `max_value_elements`) and the
-/// allow-lists used to gate calls to host-registered native functions.
+/// per-capability grant bits consulted when a host-registered native
+/// function is invoked.
 ///
 /// Per-function capability *requirements* (e.g. "this fn needs fs read")
-/// live on [`NativeFnGate`]; this struct is what the host *grants*.
+/// live on [`NativeFnGate`]; this struct is what the host *grants*. A
+/// call goes through iff every bit declared on the fn's gate is also
+/// set here — there is no per-name allowlist or global short-circuit,
+/// so a successful call proves that every bit on its gate was granted.
 ///
 /// `#[non_exhaustive]`: future capability bits are added here without a
 /// breaking semver bump. External callers must construct via
@@ -26,10 +30,6 @@ use std::sync::{Arc, Mutex};
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub struct Capabilities {
-    /// If true, all registered native functions can be called.
-    pub allow_all_native_fn: bool,
-    /// Set of specifically allowed native function names (e.g. `["math.sum"]`).
-    pub allow_native_fn: HashSet<String>,
     /// Filesystem reads (host fn that calls `std::fs::read*`, also the
     /// policy bit consulted by [`crate::module::FilesystemModuleResolver`]).
     pub reads_fs: bool,
@@ -65,8 +65,6 @@ impl Capabilities {
     /// machinery that enforces it.
     pub fn all_granted() -> Self {
         Self {
-            allow_all_native_fn: true,
-            allow_native_fn: HashSet::new(),
             reads_fs: true,
             writes_fs: true,
             network: true,
@@ -245,9 +243,8 @@ impl Context {
     /// [`NativeFnGate`]) carry an all-zero gate that the check
     /// trivially satisfies — they keep working under the sandbox. Fns
     /// registered via [`Self::register_fn`] with non-empty gate bits
-    /// are rejected unless the host grants the matching
-    /// [`Capabilities`] bit (or names the fn in `allow_native_fn`, or
-    /// flips `allow_all_native_fn`).
+    /// are rejected unless the host grants every bit declared on the
+    /// gate.
     pub fn sandboxed() -> Self {
         let mut this = Self::new();
         this.module_resolvers
@@ -286,8 +283,7 @@ impl Context {
     /// Register a native function with explicit capability requirements.
     /// The function declares which bits it needs via `gate`; under the
     /// sandbox the call is rejected unless every set bit is granted in
-    /// the context-wide [`Capabilities`] (or `name` appears in
-    /// `allow_native_fn`, or `allow_all_native_fn` is on).
+    /// the context-wide [`Capabilities`].
     ///
     /// For pure functions (no host capability, no I/O, no ambient
     /// state) prefer [`Self::register_pure_fn`] — it makes the
@@ -2216,11 +2212,7 @@ impl Evaluator {
         range: TokenRange,
     ) -> Result<(), RuntimeError> {
         let caps = &self.context.capabilities;
-        if caps.allow_all_native_fn || caps.allow_native_fn.contains(name) {
-            return Ok(());
-        }
-        let missing = entry.gate.missing_bits(caps);
-        if let Some(bit) = missing.first() {
+        if let Some(bit) = entry.gate.missing_bits(caps).first() {
             return Err(RuntimeError::CapabilityDenied {
                 name: name.to_string(),
                 reason: format!("function declared `{bit}` but caller did not grant it"),
