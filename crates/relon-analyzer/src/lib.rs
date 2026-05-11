@@ -16,6 +16,14 @@
 //! the AST itself stays immutable and consumers (evaluator, LSP, lint)
 //! pick up just the side-tables they need.
 
+// rustc ≥ 1.93 false-positive: `unused_assignments` fires on fields of
+// every `#[derive(miette::Diagnostic)]` / `thiserror::Error` enum (the
+// derive expands to internal let-bindings that the lint mis-reads).
+// Upstream: <https://github.com/rust-lang/rust/issues/147648>
+// (stable→stable regression, P-medium, still open). Drop this `allow`
+// once the rustc fix lands.
+#![allow(unused_assignments)]
+
 pub(crate) mod ban_unsafe_types;
 pub mod cap;
 pub(crate) mod capability_check;

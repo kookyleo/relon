@@ -1,3 +1,11 @@
+// rustc ≥ 1.93 false-positive: `unused_assignments` fires on fields of
+// every `#[derive(miette::Diagnostic)]` / `thiserror::Error` enum (the
+// derive expands to internal let-bindings that the lint mis-reads).
+// Upstream: <https://github.com/rust-lang/rust/issues/147648>
+// (stable→stable regression, P-medium, still open). Drop this `allow`
+// once the rustc fix lands.
+#![allow(unused_assignments)]
+
 pub mod arithmetic;
 pub mod builtin_decorators;
 pub mod decorator;
