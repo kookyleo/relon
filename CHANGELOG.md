@@ -262,6 +262,57 @@ still listed `Any` as a built-in — v1.6's `ExplicitAnyForbidden`
 retired it from user space. Both pages now reflect the current
 user-facing surface.
 
+### Third wave: language follow-ups + test hygiene
+
+Closes the three open follow-ups under roadmap §J and seeds two
+new test-infrastructure pieces flagged by the post-batch code
+review.
+
+`analyzer` follow-ups (roadmap §J):
+
+- `MethodGenericShadowsSchemaGeneric` (Warning) — `#schema Foo<T> with
+  { bar<T>(...) }` now surfaces a shadow-warning so a reader can't
+  miss the rebound generic key.
+- Cross-module value-path resolution — `pkg.alice.region` (and
+  nested `pkg.w.inner.value` through generic schemas like
+  `Wrapper<Container<Int>>`) now resolves to a concrete type at
+  analysis time instead of falling back to `Any`. `walk_path` gains
+  a per-hop substitution context so schema-field descent applies
+  `T → Int` before lifting the type into the importer's namespace.
+  `WorkspaceImportIndex` gains `aliased_values` and
+  `imported_schema_generics` indices.
+- `MethodGenericArgMismatch` (Error) — call sites like `bag["abc"]`
+  against a schema declaring `#derive Indexable index(key: Int) ->
+  Option<V>` now flag at analysis instead of waiting for the
+  evaluator's runtime `TypeMismatch`.
+
+Test-infrastructure additions:
+
+- `proptest` harness seeded under `crates/relon-evaluator/tests/property_tests.rs`
+  with five properties covering arithmetic determinism + numeric
+  overflow consistency, `max_value_elements` boundary correctness,
+  `BTreeMap`-ordered dict iteration, per-`Context` `Iter` cursor
+  isolation, and closure capture determinism. ~2.7 s wall-clock
+  for the property suite at 64 cases each.
+- Golden snapshot test for the three `#main`-style examples
+  (`feature_flag.relon` / `pricing.relon` / `workflow.relon`)
+  under `fixtures/golden/examples_main/`. Drives each via
+  `Evaluator::run_main` with the canonical `--args` documented in
+  each file's header. Catches silent regressions the
+  library-mode golden runner can't see.
+
+Authoring hygiene:
+
+- `examples/feature_flag.relon` no longer uses `len(s) % 100` as a
+  hash stand-in (deterministic but non-uniform — anti-pedagogical).
+  Reframed as a host-integration demo that calls
+  `native_hash(s) -> Int`; the bundled `relon-cli` doesn't register
+  one, so direct `cargo run` surfaces `FunctionNotFound` by design
+  and the snapshot test wires a deterministic in-process stand-in.
+- `scripts/pre-commit.sh` (advisory) prints every staged file at
+  commit time so multi-task workflows can spot cross-topic strays.
+  `scripts/install-hooks.sh` symlinks it into `.git/hooks/`.
+
 ## [Unreleased] — Capability model hardening: 6-bit gate + unified register_fn
 
 ### BREAKING: capability bits go from 1 to 6, registration API collapses to one entry point
