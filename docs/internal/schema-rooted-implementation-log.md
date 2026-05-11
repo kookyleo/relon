@@ -381,3 +381,173 @@ follow-up。Callable 按决策 23 从 spec 移除，不进注册表。
 lowering（决策 21-24）」章节，注册表 + 主文档同步。lowering
 钩子留 roadmap §J 单独追踪。
 
+### C.8：core.relon 载体落在 analyzer crate 而非 evaluator crate
+2026-05-11 / Phase C-D / `crates/relon-analyzer/src/core/*.relon`、
+`crates/relon-analyzer/src/core_schemas.rs`
+
+**问题**：决策 21' 要求把 `#schema String with { #native upper() -> String,
+... }` 等内置 method 声明做成 always-on 编译期内嵌的 .relon 载体，
+让用户写 `s.upper()` 无需 `#extend` boilerplate。.relon 文件物理上
+该放在 evaluator 还是 analyzer crate？
+
+**选择**：放在 `crates/relon-analyzer/src/core/*.relon`，新增
+`crates/relon-analyzer/src/core_schemas.rs` 模块用 `include_str!` 嵌入
++ `inject_core_schemas(&mut tree)` 入口，从 `analyze_with_options`
+最前面调用（位于 `collect_schemas` 之前）。host 实现仍在
+evaluator 的 `stdlib::register_to`，跟 analyzer 隔开。
+
+**理由**：
+- 「这些 schema 存在 + 它们的 method 表是什么形状」是 analyzer 的
+  权威知识；evaluator 只是消费方（依靠 `register_pure_method` 提供
+  native 实现）。把声明放在 analyzer crate 就避免了 analyzer 反向
+  依赖 evaluator —— 这与现有 crate 依赖方向（evaluator -> analyzer
+  -> parser）一致。
+- `include_str!` 与 `parse_document` + `collect_root_schemas` 复用
+  现有 lowering 路径，跟用户写 `#schema Foo with { ... }` 走完全
+  同一条 pipeline。没有「内置 schema 专用」的代码分支，意味着 schema-
+  rooted dispatch 的 method 表对内置与用户类型保持同一形态。
+- 把 .relon 文件「内嵌进 analyzer」而非「内嵌进 evaluator」还
+  让 LSP / cli / fmt 这些只引 analyzer 的 crate 自动获得内置
+  schema 视图 —— 不需要 host 提前 wire evaluator 才能 hover 出
+  `upper` 的签名。
+
+**实施细节注脚**：
+- 把 `inject_core_schemas` 放在 `analyze_with_options` 的最前面
+  （早于 `collect_schemas`）。这样后续所有 collector / checker
+  看到的 `tree.schema_methods` 已经包含内置项，
+  `check_method_uniqueness` / `check_derive_witnesses` / `auto_derive_schemas`
+  全部对内置与用户 method 一视同仁。
+- `merge_core_into` 不复制 `schemas` / `root_schemas` 条目，只
+  搬 `schema_methods`。原因：把内置 schema 也算入用户视野的
+  declared-schemas 集合会触发奇怪的 cross-module collision 检测
+  （比如「String 已在内置中声明，用户 import 后又看见」）。
+- carrier .relon 文件以 `{}` 结尾：parser 要求 root 能解出一个
+  `Expr`，body-less `#schema X with { ... }` 后必须接表达式才能
+  parse 通过。用空 dict 占位最经济。
+- `core/list.relon` 写 `map(f: Closure)` 而非
+  `map<U>(f: Closure<(T) -> U>)`：parser 不支持 method-level
+  generics 与 tuple-arrow 类型；真正的多态签名仍由
+  `relon-analyzer/src/stdlib_signatures.rs::_list_map` 承载。
+  carrier 只是 method-name 注册 shell，与 `register_pure_method`
+  的角色对称。
+
+**回流**：是。schema-rooted 主文档「21' core.relon 载体」章节加
+最后一段说明 carrier 的落点 + 注脚原因。
+
+### C.9：`Iter<T>` 形态 + Iterable lowering 的 Comprehension 路径
+2026-05-11 / Phase C-D / `crates/relon-analyzer/src/core/iter.relon`、
+`crates/relon-evaluator/src/stdlib.rs`、`crates/relon-evaluator/src/eval.rs`
+
+**问题**：决策 21 要求把 `for x in c` / `[x for x in c]` Comprehension
+lowering 到 `c.iter()` + 反复 `next()`。但 Relon Value 是不可变的
+（`Arc` 共享，无 interior mutability），用户写的 `next() -> Optional<T>`
+witness 没法在原地推进 cursor —— 这与「不可变值」的语言约束冲突。
+怎么定 Iter 的运行时形态？
+
+**选择**：
+1. `Iter<T>` 的 analyzer-side 声明保留主文档原样：
+   `#schema Iter<T> with { #native next() -> Option<T> }`。
+   `Option` 对齐现有 prelude 里 `Option<T>` 的命名（主文档写
+   `Optional<T>` 是 typo —— prelude 实装是 `Option`）。
+2. 运行时 `Iter<T>` 实装为 brand `"Iter"` 的 Dict，字段
+   `_kind: String` (one of `"list"` / `"string"` / `"dict_entries"`)、
+   `_source: Value`。`List.iter()` / `String.iter()` / `Dict.iter()`
+   就是构造这种 Dict 的 thin wrapper。
+3. Comprehension evaluator (`Expr::Comprehension` arm) 不调
+   `next()`，而是直接 dispatch on `_kind` 走 list / string / dict
+   迭代驱动。即「内置 Iter 是 inert 容器，迭代逻辑由 evaluator
+   loop 持有」。
+4. `Iter.next()` host 实现是 stub（返回
+   `RuntimeError::UnsupportedOperator`），保留 witness slot 给
+   未来真正的 user-callable next 协议；用户当前调 `it.next()`
+   得到明确错误信息。
+
+**理由**：
+- 拒绝 mutable cursor on Value：会破坏 `Arc::make_mut` 的 lazy-clone
+  契约（next() 推进会让所有共享别名跟着动），与 Logic-as-Data 的
+  「值即快照」直觉冲突。
+- 拒绝 `next() -> Optional<Tuple<T, Self>>` witness 形状：与主文档
+  公开签名 `next() -> Optional<T>` 不一致；改 witness 形状要求所有
+  user `#derive Iterable` 同步改 —— 影响面大，PR 内不消化。
+- 选 「evaluator 持有迭代状态 + Iter 是 inert 容器」：
+  - 与现有 List comprehension 已落 `for item in items.iter()` 的
+    Rust-侧 driver 形态对齐（这条 PR 之前的代码本就是 host-loop 模型）。
+  - 用户 `iter()` 现在只能返回内置 Iter 形状（一般做法是
+    `self.items.iter()` 委托），无法真正自定义 lazy 迭代逻辑 —— 这
+    与决策 21 「lazy 表达力」的 spirit 部分让步，但保留了 witness
+    形状的稳定性，留出 next-PR 升级路径。
+- shape 校验放松：constraints.rs 的 `return_type_matches` 对 `Iter`/
+  `Option`/`Optional` 三个 generic head 改成「head 名相等即认」。
+  否则 `iter() -> Iter<Int>` 被注册表的 `return_type: "Iter"` 拒掉。
+  这是「witness 形状 = head 名」的最小放松，对其他 primitive
+  return type 仍是严格匹配。
+- multi-hop receiver 限制：`self.items.iter()` 调用形式（path 3 段）
+  当前 `try_call_schema_method` 不命中（它只看 path.len() == 2）。
+  user-schema Iterable 因此 short-term 只能用 sibling-binding /
+  let-style workaround 才能 end-to-end 跑通；本批次的
+  `user_schema_iterable_shape_accepted_by_analyzer` 测试退化为
+  「analyzer 接受声明」的契约校验，运行时端 user iterable 留待
+  chained-dispatch follow-up。
+
+**回流**：是。schema-rooted 主文档「21 Iterable」章节末尾加
+"runtime Iter 表达 + Comprehension lowering" 注脚；Iter witness
+对齐 `Option<T>`（不是 `Optional<T>`）。multi-hop receiver 限制
+作为已知问题记 roadmap.md §J。
+
+### C.7：5 个算术 operator 的 evaluator lowering
+2026-05-11 / Phase C / `crates/relon-evaluator/src/arithmetic.rs`
+
+**问题**：决策 24 把 Number 拆细为 Addable / Subtractable /
+Multiplicable / Divisible / Modable 5 个独立 constraint，C.6 已
+把 witness shape 登入 `CONSTRAINTS`，但 evaluator 还没把 `+ - * / %`
+接到对应 method。怎么挂？候选：
+1. 复刻 `try_compare_op_method` 5 份，每个 operator 一份独立函数。
+2. 抽 `try_arith_op_method(receiver, other, method_name, ...)` 单个
+   helper，5 个 arm 共享，operator → method 名通过 `arith_method_for`
+   小函数映射。
+3. 把 compare + arith 合成一个超级 helper，参数化方法名 + 返回类型
+   形态。
+
+**选择**：方案 2。
+
+**理由**：
+- compare witness 返回 Bool，arith witness 返回 Self（或 Int/Float
+  退化），调度后语义不同——合在一个 helper 里会让两个语义点纠缠，
+  违反「一个函数一件事」。
+- 方案 1 复制 5 份，每份只差一个字符串，违反 DRY。
+- 方案 2 抽出共享形态（branded receiver + schema_methods 查表 +
+  body / native fallback），与 `try_compare_op_method` 镜像但保持
+  独立。5 个 arm 通过 `arith_method_for(op)` 拿到方法名，主分发体
+  只多 3 行。
+
+**Dict + Dict 合并的次序权衡**：原 `(Operator::Add, Dict, Dict)`
+arm 立刻 `deep_merge` 并按 brand 重 check_type，是 Logic-as-Data 的
+「两 dict 结构组合」承诺。但用户写 `add(other: Self) -> Self` 是
+明确意图覆盖 merge——直觉是「我定义了加法，不要给我合并」。两种方案：
+
+a. Dict + Dict merge 优先（保留），用户 add 不会命中。
+b. Dict + Dict 命中 → 先 `try_arith_op_method`，无 witness 才走
+   merge。
+
+选 b。理由：
+- 用户写 `#derive Addable` + `add(...)` 是显式行为声明，沉默地被
+  merge 替代会让审计语义崩塌。
+- merge 与 method 不冲突：无 witness 时行为完全等同 a 方案，向后
+  兼容；有 witness 时按用户预期走 method，零意外。
+- compare 路径（C.1）已经走的就是「先试 method，再 fallback」次序，
+  arith 跟同一个范式才一致。
+
+**测试**：8 个新测试。
+- 5 个「branded value + body 方法命中」（Add/Sub/Mul/Div/Mod）。
+- 1 个「primitive Int + Int 仍走数值 fallback」回归保护。
+- 1 个「branded value 但 schema 没 add witness（仅有 sub）→ 其他算子
+  不被串台」。
+- 1 个「host-native add 返回带 brand 的 Money」结构化数学示例
+  （body 路径返回带 brand 的 dict 涉及 method body 语法的细节，
+  用 #native + register_pure_method 更直接，且 body 路径已被前 5
+  个测试覆盖）。
+
+**回流**：是。属于跨 analyzer / evaluator 的语言级语义——5 个算术
+constraint 从「shape-check only」推进到「lowering 完成」，主文档
+「operator lowering」节应同步列入 +、-、*、/、% 的 method 名。
+

@@ -119,6 +119,25 @@ pub fn register_to(ctx: &mut Context) {
     ctx.register_pure_method("Dict", "values", dict_values);
     ctx.register_pure_method("Dict", "has_key", dict_has_key);
     ctx.register_pure_method("Dict", "len", len);
+
+    // Decision 21 (Iterable lowering): each of String / List / Dict
+    // gets an `iter()` that wraps the receiver into an `Iter`-branded
+    // dict. The Comprehension evaluator (`Expr::Comprehension` arm in
+    // `eval.rs`) recognizes this brand and drives iteration by reading
+    // the wrapped `_source` plus `_kind` tag — `next()` itself is only
+    // exposed as a witness slot for the `Iterable` constraint shape
+    // check, not as a host-callable advance primitive (the iteration
+    // state lives in the loop driver, not in a mutable Value).
+    ctx.register_pure_method("List", "iter", Arc::new(IterFromList));
+    ctx.register_pure_method("String", "iter", Arc::new(IterFromString));
+    ctx.register_pure_method("Dict", "iter", Arc::new(IterFromDict));
+    // `Iter.next()` exists in the analyzer's `Iter<T>` core schema so
+    // user code that aliases an iterator may *write* `it.next()`; we
+    // register a host-side stub so the dispatch path doesn't fall
+    // through to `FunctionNotFound`. Returning a clear error keeps
+    // the surface honest until the "user-callable Iter.next()" follow-up
+    // lands (see schema-rooted-implementation-log §C.9).
+    ctx.register_pure_method("Iter", "next", Arc::new(IterNextStub));
 }
 
 struct ListMap;
@@ -802,6 +821,92 @@ impl RelonFunction for DictHasKey {
                 .contains_key(expect_string(&args[1], range)?),
         ))
     }
+}
+
+/// Iter-builder for `List<T>.iter()`. Decision 21 (Iterable lowering):
+/// wraps the receiver list into an `Iter`-branded dict consumed by the
+/// `Expr::Comprehension` evaluator. The wrapped representation is
+/// deliberately a plain dict so the rest of the runtime (clone, brand
+/// dispatch, serialization fallbacks) keeps working unchanged.
+struct IterFromList;
+impl RelonFunction for IterFromList {
+    fn call(
+        &self,
+        args: NativeArgs,
+        range: relon_parser::TokenRange,
+    ) -> Result<Value, RuntimeError> {
+        let args = args.into_positional();
+        expect_arg_count(&args, 1, range)?;
+        // expect_list validates the receiver shape; the value itself
+        // is what we wrap (cheap Arc clone — no element copy).
+        let _ = expect_list(&args[0], range)?;
+        Ok(make_iter_value("list", args[0].clone()))
+    }
+}
+
+/// Iter-builder for `String.iter()`. The element type is `String`
+/// (one-char-per-step). UTF-8 boundary aware via `String::chars`.
+struct IterFromString;
+impl RelonFunction for IterFromString {
+    fn call(
+        &self,
+        args: NativeArgs,
+        range: relon_parser::TokenRange,
+    ) -> Result<Value, RuntimeError> {
+        let args = args.into_positional();
+        expect_arg_count(&args, 1, range)?;
+        let _ = expect_string(&args[0], range)?;
+        Ok(make_iter_value("string", args[0].clone()))
+    }
+}
+
+/// Iter-builder for `Dict<K, V>.iter()`. Entries iterate in sorted key
+/// order (matches `Dict.keys()`). Element shape per step is a 2-tuple
+/// `(K, V)` encoded as `Value::list([k, v])` since the runtime does
+/// not have a dedicated Tuple value variant.
+struct IterFromDict;
+impl RelonFunction for IterFromDict {
+    fn call(
+        &self,
+        args: NativeArgs,
+        range: relon_parser::TokenRange,
+    ) -> Result<Value, RuntimeError> {
+        let args = args.into_positional();
+        expect_arg_count(&args, 1, range)?;
+        let _ = expect_dict(&args[0], range)?;
+        Ok(make_iter_value("dict_entries", args[0].clone()))
+    }
+}
+
+/// `Iter.next()` is reserved for the user-callable advance protocol
+/// that a follow-up PR will fill in; today the Comprehension driver
+/// reads the wrapped source directly. Calling `it.next()` from user
+/// source therefore surfaces a clear error rather than silently
+/// returning a stale value.
+struct IterNextStub;
+impl RelonFunction for IterNextStub {
+    fn call(
+        &self,
+        _args: NativeArgs,
+        range: relon_parser::TokenRange,
+    ) -> Result<Value, RuntimeError> {
+        Err(RuntimeError::UnsupportedOperator(
+            "Iter.next() is reserved for the future user-callable iteration protocol; \
+             use `for x in c: ...` / `[for x in c: ...]` comprehensions instead"
+                .to_string(),
+            range,
+        ))
+    }
+}
+
+/// Build an `Iter`-branded dict carrying `_kind` (driver dispatch tag)
+/// and `_source` (the underlying collection value). The Comprehension
+/// evaluator switches on `_kind` to walk `_source` correctly.
+pub(crate) fn make_iter_value(kind: &str, source: Value) -> Value {
+    let mut map = std::collections::BTreeMap::new();
+    map.insert("_kind".to_string(), Value::String(kind.to_string()));
+    map.insert("_source".to_string(), source);
+    Value::branded_dict(map, Some("Iter".to_string()))
 }
 
 struct ListContains;

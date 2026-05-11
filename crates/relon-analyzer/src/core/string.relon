@@ -1,0 +1,20 @@
+// core.relon — String methods (decision 21' of
+// schema-rooted-model-2026-05-11.md).
+//
+// These declarations make `s.upper()` / `s.split(",")` / `s.iter()` etc.
+// dispatch through the analyzer's schema_methods table with zero
+// user-side `#extend String with { ... }` boilerplate. Host-side `#native`
+// implementations are registered via
+// `Context::register_pure_method("String", "upper", ...)` in
+// `crates/relon-evaluator/src/stdlib.rs` — the names below must stay in
+// lock-step with that table.
+#schema String with {
+    #native upper() -> String
+    #native lower() -> String
+    #native split(sep: String) -> List<String>
+    #native replace(from: String, to: String) -> String
+    #native contains(sub: String) -> Bool
+    #native len() -> Int
+    #native iter() -> Iter<String>
+}
+{}

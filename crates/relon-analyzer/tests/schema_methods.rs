@@ -127,8 +127,16 @@ fn self_calls_other_method_resolves() {
 fn extend_on_builtin_string() {
     let tree = analyze_fixture("schema_methods/extend_builtin.relon");
     let methods = tree.schema_methods.get("String").expect("String extended");
-    assert_eq!(methods.len(), 1);
-    assert_eq!(methods[0].name, "is_empty");
+    // Decision 21' (core.relon carrier): String comes pre-populated
+    // with the built-in method set (`upper`, `lower`, `split`, ...).
+    // The user-side `#extend String with { is_empty() ... }` adds one
+    // method on top, so the total count is the carrier set + 1.
+    let names: Vec<&str> = methods.iter().map(|m| m.name.as_str()).collect();
+    assert!(
+        names.contains(&"is_empty"),
+        "user-side is_empty method present alongside core methods: {names:?}",
+    );
+    assert!(names.contains(&"upper"), "core method survives: {names:?}");
     // No `ExtendUnknownSchema` for built-in extension.
     let bad = count(&tree.diagnostics, |d| {
         matches!(d, Diagnostic::ExtendUnknownSchema { .. })

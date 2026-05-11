@@ -21,6 +21,7 @@ pub mod cap;
 pub(crate) mod capability_check;
 pub(crate) mod const_fold;
 pub(crate) mod constraints;
+pub(crate) mod core_schemas;
 pub(crate) mod decorator_names;
 pub mod diagnostic;
 pub(crate) mod directive_names;
@@ -145,6 +146,14 @@ pub fn analyze_with_options(root: &Node, options: &AnalyzeOptions) -> AnalyzedTr
     // by a strict entry inherits the bit through `options.strict_mode`,
     // while a single-file source can still opt in via the directive.
     tree.strict_mode = options.strict_mode || has_strict_directive(root);
+    // Schema-rooted decision 21' (core.relon carrier): install the
+    // built-in `String` / `List<T>` / `Dict<K, V>` / `Iter<T>` method
+    // tables before any user-source pass. Every subsequent collector
+    // / checker sees built-in methods alongside user-declared ones —
+    // that uniformity is what lets `s.upper()` dispatch through the
+    // same path as `user_value.user_method()` with zero `#extend
+    // String with { ... }` boilerplate.
+    core_schemas::inject_core_schemas(&mut tree);
     schema::collect_schemas(root, &mut tree);
     // Root-level `#schema A Body` directives must run after
     // `collect_schemas` so the dual-declaration collision check has the

@@ -1,0 +1,14 @@
+// core.relon — Dict<K, V> methods (decision 21' of
+// schema-rooted-model-2026-05-11.md).
+//
+// `iter()` returns `Iter<Tuple<K, V>>` — entries iterate in sorted key
+// order, matching the runtime contract of `Dict.keys()` / `Dict.values()`.
+#schema Dict<K, V> with {
+    #native merge(other: Self) -> Self
+    #native keys() -> List<K>
+    #native values() -> List<V>
+    #native has_key(k: K) -> Bool
+    #native len() -> Int
+    #native iter() -> Iter<Tuple<K, V>>
+}
+{}

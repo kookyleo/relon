@@ -959,16 +959,20 @@ impl Evaluator {
                 condition,
             } => {
                 let iter_val = self.eval(iterable, &current_scope)?;
-                let items = match iter_val {
-                    Value::List(l) => l,
-                    _ => {
-                        return Err(RuntimeError::TypeMismatch {
-                            expected: "List".to_string(),
-                            found: iter_val.type_name().to_string(),
-                            range: iterable.range,
-                        })
-                    }
-                };
+                // Decision 21 (Iterable lowering): drive iteration over
+                // any value the evaluator can convert into a sequence of
+                // elements. The branch order is intentional —
+                //   1. `List` is the legacy fast path (most common,
+                //      avoids the Iter-wrapping detour).
+                //   2. `Iter`-branded `Dict` is the new path that opens
+                //      `for x in c` to user schemas that derive
+                //      `Iterable` and return `c.iter()` from their
+                //      witness. Built-in `List.iter()` / `String.iter()`
+                //      / `Dict.iter()` produce values of this shape too
+                //      so user iteration over primitives is uniform.
+                // Anything else is an error — same diagnostic shape as
+                // before, just with an updated `expected` slot.
+                let items = self.materialize_iterable(&iter_val, iterable.range)?;
                 let mut result = Vec::new();
                 for item in items.iter() {
                     let mut iter_scope_map = HashMap::new();
@@ -1905,6 +1909,135 @@ impl Evaluator {
             native.positional.insert(0, self_val);
         }
         Ok(Some(entry.func.call(native, range)?))
+    }
+
+    /// Decision 21 (Iterable lowering): turn an arbitrary iterable
+    /// `Value` into the linear element sequence consumed by the
+    /// `Expr::Comprehension` driver.
+    ///
+    /// Recognized shapes:
+    ///
+    ///   * `Value::List` — fast path, element-by-element.
+    ///   * `Value::Dict` with brand `"Iter"` — the wrapped form
+    ///     produced by `List.iter()` / `String.iter()` /
+    ///     `Dict.iter()` (and any user `Iterable` witness that
+    ///     delegates to one of those). Unwrapped using the `_kind`
+    ///     tag to dispatch the right driver:
+    ///       - `"list"` → element-by-element over the wrapped list.
+    ///       - `"string"` → one-codepoint-per-step over the wrapped
+    ///         string (each element a fresh single-char `String`).
+    ///       - `"dict_entries"` → key-sorted `(K, V)` pairs encoded
+    ///         as 2-element `Value::list([k, v])` (the runtime has no
+    ///         dedicated tuple variant).
+    ///
+    /// Any other shape — including raw `String` / `Dict` not first
+    /// turned into an iterator — surfaces a `TypeMismatch` whose
+    /// `expected` slot now reads "List or Iter" so the user can wire
+    /// in the missing `.iter()` call.
+    fn materialize_iterable(
+        &self,
+        value: &Value,
+        range: TokenRange,
+    ) -> Result<Vec<Value>, RuntimeError> {
+        // Legacy fast path: a literal `[1, 2, 3]` / `xs` of type
+        // `List<T>` lands here without ever building an `Iter`. Saves
+        // both a host-call into `IterFromList` and the post-loop
+        // re-collection that an `Iter`-wrapped version would force.
+        if let Value::List(items) = value {
+            return Ok(items.iter().cloned().collect());
+        }
+        // Decision 21' Iter representation: branded dict with
+        // `_kind` + `_source` fields. We deliberately recurse through
+        // the driver here (rather than reading `_source` once and
+        // delegating to the surrounding match) so a user-built
+        // `Iter`-shaped dict that wraps another `Iter` still works.
+        if let Value::Dict(d) = value {
+            if d.brand.as_deref() == Some("Iter") {
+                let kind = d
+                    .map
+                    .get("_kind")
+                    .and_then(|v| match v {
+                        Value::String(s) => Some(s.as_str()),
+                        _ => None,
+                    })
+                    .ok_or_else(|| RuntimeError::TypeMismatch {
+                        expected: "Iter with `_kind` String field".to_string(),
+                        found: "Iter without `_kind`".to_string(),
+                        range,
+                    })?;
+                let source = d
+                    .map
+                    .get("_source")
+                    .ok_or_else(|| RuntimeError::TypeMismatch {
+                        expected: "Iter with `_source` field".to_string(),
+                        found: "Iter without `_source`".to_string(),
+                        range,
+                    })?;
+                return match kind {
+                    "list" => {
+                        let items = match source {
+                            Value::List(l) => l,
+                            other => {
+                                return Err(RuntimeError::TypeMismatch {
+                                    expected: "List source for Iter(kind=list)".to_string(),
+                                    found: other.type_name().to_string(),
+                                    range,
+                                })
+                            }
+                        };
+                        Ok(items.iter().cloned().collect())
+                    }
+                    "string" => {
+                        let s = match source {
+                            Value::String(s) => s,
+                            other => {
+                                return Err(RuntimeError::TypeMismatch {
+                                    expected: "String source for Iter(kind=string)".to_string(),
+                                    found: other.type_name().to_string(),
+                                    range,
+                                })
+                            }
+                        };
+                        Ok(s.chars().map(|c| Value::String(c.to_string())).collect())
+                    }
+                    "dict_entries" => {
+                        let src_dict = match source {
+                            Value::Dict(d) => d,
+                            other => {
+                                return Err(RuntimeError::TypeMismatch {
+                                    expected: "Dict source for Iter(kind=dict_entries)".to_string(),
+                                    found: other.type_name().to_string(),
+                                    range,
+                                })
+                            }
+                        };
+                        // Sorted-by-key for stable iteration order —
+                        // matches `Dict.keys()` / `Dict.values()`.
+                        let mut keys: Vec<&String> = src_dict.map.keys().collect();
+                        keys.sort();
+                        Ok(keys
+                            .into_iter()
+                            .filter_map(|k| {
+                                src_dict
+                                    .map
+                                    .get(k)
+                                    .map(|v| Value::list(vec![Value::String(k.clone()), v.clone()]))
+                            })
+                            .collect())
+                    }
+                    other => Err(RuntimeError::TypeMismatch {
+                        expected: "Iter._kind in {list, string, dict_entries}".to_string(),
+                        found: other.to_string(),
+                        range,
+                    }),
+                };
+            }
+        }
+        Err(RuntimeError::TypeMismatch {
+            expected: "List or Iter".to_string(),
+            found: value.type_name().to_string(),
+            range,
+        })
     }
 
     /// Evaluate a method body with `self` bound (when a receiver is

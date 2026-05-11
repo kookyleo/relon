@@ -4506,11 +4506,13 @@ fn schema_method_with_arg_dispatches() {
 
 #[test]
 fn stdlib_method_string_upper_dispatches_via_register_pure_method() {
+    // Decision 21' (core.relon carrier): `String.upper` lives in the
+    // analyzer's pre-injected core schema set, so no `#extend String
+    // with { #native upper() -> String }` declaration is needed in
+    // user source. Same `register_pure_method` runtime impl, same
+    // method dispatch — minus the boilerplate.
     use std::collections::HashMap;
-    let source = r#"#extend String with {
-    #native upper() -> String
-}
-#main(String s)
+    let source = r#"#main(String s)
 { String shout: s.upper() }"#;
     let node = parse_doc(source);
     let analyzed = std::sync::Arc::new(relon_analyzer::analyze(&node));
@@ -4537,11 +4539,11 @@ fn stdlib_method_string_upper_dispatches_via_register_pure_method() {
 
 #[test]
 fn stdlib_method_list_map_dispatches_via_register_pure_method() {
+    // Decision 21' (core.relon carrier): `List.map` is built-in; the
+    // user source no longer needs an `#extend List with { ... }`
+    // declaration to invoke it.
     use std::collections::HashMap;
-    let source = r#"#extend List with {
-    #native map(f: Closure<Int, Int>) -> List<Int>
-}
-#main(List<Int> xs)
+    let source = r#"#main(List<Int> xs)
 { List<Int> doubled: xs.map((n) => n * 2) }"#;
     let node = parse_doc(source);
     let analyzed = std::sync::Arc::new(relon_analyzer::analyze(&node));
@@ -4575,11 +4577,9 @@ fn stdlib_method_list_map_dispatches_via_register_pure_method() {
 
 #[test]
 fn stdlib_method_dict_keys_dispatches_via_register_pure_method() {
+    // Decision 21' (core.relon carrier): `Dict.keys` is built-in.
     use std::collections::{BTreeMap, HashMap};
-    let source = r#"#extend Dict with {
-    #native keys() -> List<String>
-}
-#main(Dict<String, Int> d)
+    let source = r#"#main(Dict<String, Int> d)
 { List<String> ks: d.keys() }"#;
     let node = parse_doc(source);
     let analyzed = std::sync::Arc::new(relon_analyzer::analyze(&node));
@@ -4614,11 +4614,9 @@ fn stdlib_method_dict_keys_dispatches_via_register_pure_method() {
 fn stdlib_method_string_len_matches_free_fn_len() {
     // Decision 14: `len` stays polymorphic free-fn but also acts as a
     // method on each receiver. Both shapes must return the same value.
+    // Decision 21' (core.relon carrier) drops the `#extend` declaration.
     use std::collections::HashMap;
-    let source = r#"#extend String with {
-    #native len() -> Int
-}
-#main(String s)
+    let source = r#"#main(String s)
 {
     Int free: len(s),
     Int method: s.len()
@@ -4646,15 +4644,14 @@ fn stdlib_method_string_len_matches_free_fn_len() {
 
 #[test]
 fn stdlib_method_self_contains_in_extend_body() {
-    // User-side `#extend String with { is_email() -> Bool: self.contains("@") }`
-    // depends on `String.contains` being declared visible to the
-    // analyzer (so `self.contains` resolves) *and* implemented by
-    // the host (so dispatch returns a value). We declare a `#native
-    // contains` in the same `#extend` block to satisfy the analyzer;
-    // the runtime entry comes from `stdlib::register_to`.
+    // Decision 21' (core.relon carrier): `String.contains` is built-in.
+    // User code adds `is_email` on top via `#extend`, and that body
+    // calls `self.contains("@")` which dispatches through the same
+    // pre-injected entry. No more dual-declaration boilerplate
+    // (previously the test had to repeat `#native contains` to keep
+    // the analyzer happy).
     use std::collections::HashMap;
     let source = r#"#extend String with {
-    #native contains(needle: String) -> Bool
     is_email() -> Bool: self.contains("@")
 }
 #main(String s)
@@ -4677,4 +4674,519 @@ fn stdlib_method_self_contains_in_extend_body() {
         .unwrap();
     let Value::Dict(d) = result else { panic!() };
     assert_eq!(d.map.get("ok"), Some(&Value::Bool(true)));
+}
+
+// ===================================================================
+// Phase C.7: arithmetic operator lowering (`+` / `-` / `*` / `/` / `%`)
+// onto schema-rooted Addable / Subtractable / Multiplicable / Divisible
+// / Modable witnesses. Mirrors the C.1/C.3/C.5 dispatch path: branded
+// receiver + matching witness method → user body; otherwise fall back
+// to numeric primitive arithmetic.
+// ===================================================================
+
+#[test]
+fn operator_add_lowers_to_user_method() {
+    use std::collections::{BTreeMap, HashMap};
+    let source = r#"#schema Money {
+    Int cents: *
+} with {
+    add(other: Self) -> Int: self.cents + other.cents
+}
+#main(Money a, Money b)
+{ Int total: a + b }"#;
+    let node = parse_doc(source);
+    let analyzed = std::sync::Arc::new(relon_analyzer::analyze(&node));
+    let mut a = BTreeMap::new();
+    a.insert("cents".to_string(), Value::Int(150));
+    let mut b = BTreeMap::new();
+    b.insert("cents".to_string(), Value::Int(75));
+    let mut args: HashMap<String, Value> = HashMap::new();
+    args.insert("a".to_string(), Value::dict(a));
+    args.insert("b".to_string(), Value::dict(b));
+    let ctx = Context::new()
+        .with_root(node.clone())
+        .with_analyzed(std::sync::Arc::clone(&analyzed));
+    let result = Evaluator::new(std::sync::Arc::new(ctx))
+        .run_main(&std::sync::Arc::new(Scope::default()), args)
+        .unwrap();
+    let Value::Dict(d) = result else { panic!() };
+    assert_eq!(d.map.get("total"), Some(&Value::Int(225)));
+}
+
+#[test]
+fn operator_sub_lowers_to_user_method() {
+    use std::collections::{BTreeMap, HashMap};
+    let source = r#"#schema Money {
+    Int cents: *
+} with {
+    sub(other: Self) -> Int: self.cents - other.cents
+}
+#main(Money a, Money b)
+{ Int diff: a - b }"#;
+    let node = parse_doc(source);
+    let analyzed = std::sync::Arc::new(relon_analyzer::analyze(&node));
+    let mut a = BTreeMap::new();
+    a.insert("cents".to_string(), Value::Int(200));
+    let mut b = BTreeMap::new();
+    b.insert("cents".to_string(), Value::Int(75));
+    let mut args: HashMap<String, Value> = HashMap::new();
+    args.insert("a".to_string(), Value::dict(a));
+    args.insert("b".to_string(), Value::dict(b));
+    let ctx = Context::new()
+        .with_root(node.clone())
+        .with_analyzed(std::sync::Arc::clone(&analyzed));
+    let result = Evaluator::new(std::sync::Arc::new(ctx))
+        .run_main(&std::sync::Arc::new(Scope::default()), args)
+        .unwrap();
+    let Value::Dict(d) = result else { panic!() };
+    assert_eq!(d.map.get("diff"), Some(&Value::Int(125)));
+}
+
+#[test]
+fn operator_mul_lowers_to_user_method() {
+    use std::collections::{BTreeMap, HashMap};
+    let source = r#"#schema Money {
+    Int cents: *
+} with {
+    mul(other: Self) -> Int: self.cents * other.cents
+}
+#main(Money a, Money b)
+{ Int product: a * b }"#;
+    let node = parse_doc(source);
+    let analyzed = std::sync::Arc::new(relon_analyzer::analyze(&node));
+    let mut a = BTreeMap::new();
+    a.insert("cents".to_string(), Value::Int(6));
+    let mut b = BTreeMap::new();
+    b.insert("cents".to_string(), Value::Int(7));
+    let mut args: HashMap<String, Value> = HashMap::new();
+    args.insert("a".to_string(), Value::dict(a));
+    args.insert("b".to_string(), Value::dict(b));
+    let ctx = Context::new()
+        .with_root(node.clone())
+        .with_analyzed(std::sync::Arc::clone(&analyzed));
+    let result = Evaluator::new(std::sync::Arc::new(ctx))
+        .run_main(&std::sync::Arc::new(Scope::default()), args)
+        .unwrap();
+    let Value::Dict(d) = result else { panic!() };
+    assert_eq!(d.map.get("product"), Some(&Value::Int(42)));
+}
+
+#[test]
+fn operator_div_lowers_to_user_method() {
+    use std::collections::{BTreeMap, HashMap};
+    let source = r#"#schema Money {
+    Int cents: *
+} with {
+    div(other: Self) -> Int: self.cents / other.cents
+}
+#main(Money a, Money b)
+{ Int quotient: a / b }"#;
+    let node = parse_doc(source);
+    let analyzed = std::sync::Arc::new(relon_analyzer::analyze(&node));
+    let mut a = BTreeMap::new();
+    a.insert("cents".to_string(), Value::Int(100));
+    let mut b = BTreeMap::new();
+    b.insert("cents".to_string(), Value::Int(4));
+    let mut args: HashMap<String, Value> = HashMap::new();
+    args.insert("a".to_string(), Value::dict(a));
+    args.insert("b".to_string(), Value::dict(b));
+    let ctx = Context::new()
+        .with_root(node.clone())
+        .with_analyzed(std::sync::Arc::clone(&analyzed));
+    let result = Evaluator::new(std::sync::Arc::new(ctx))
+        .run_main(&std::sync::Arc::new(Scope::default()), args)
+        .unwrap();
+    let Value::Dict(d) = result else { panic!() };
+    assert_eq!(d.map.get("quotient"), Some(&Value::Int(25)));
+}
+
+#[test]
+fn operator_mod_lowers_to_user_method() {
+    // Modable's witness is `rem(other: Self) -> Self` per decision 24:
+    // method name `rem`, operator `%`.
+    use std::collections::{BTreeMap, HashMap};
+    let source = r#"#schema Money {
+    Int cents: *
+} with {
+    rem(other: Self) -> Int: self.cents % other.cents
+}
+#main(Money a, Money b)
+{ Int leftover: a % b }"#;
+    let node = parse_doc(source);
+    let analyzed = std::sync::Arc::new(relon_analyzer::analyze(&node));
+    let mut a = BTreeMap::new();
+    a.insert("cents".to_string(), Value::Int(17));
+    let mut b = BTreeMap::new();
+    b.insert("cents".to_string(), Value::Int(5));
+    let mut args: HashMap<String, Value> = HashMap::new();
+    args.insert("a".to_string(), Value::dict(a));
+    args.insert("b".to_string(), Value::dict(b));
+    let ctx = Context::new()
+        .with_root(node.clone())
+        .with_analyzed(std::sync::Arc::clone(&analyzed));
+    let result = Evaluator::new(std::sync::Arc::new(ctx))
+        .run_main(&std::sync::Arc::new(Scope::default()), args)
+        .unwrap();
+    let Value::Dict(d) = result else { panic!() };
+    assert_eq!(d.map.get("leftover"), Some(&Value::Int(2)));
+}
+
+#[test]
+fn primitive_arithmetic_still_falls_back_to_numeric() {
+    // Regression: with no branded receiver on either side, `+ - * / %`
+    // must keep their built-in semantics regardless of whether any
+    // schema in scope happens to define arithmetic methods.
+    let result = eval_doc(
+        r#"{
+        sum: 1 + 2,
+        diff: 10 - 3,
+        product: 4 * 5,
+        quotient: 20 / 4,
+        leftover: 17 % 5
+    }"#,
+    )
+    .unwrap();
+    let Value::Dict(d) = result else { panic!() };
+    assert_eq!(d.map.get("sum"), Some(&Value::Int(3)));
+    assert_eq!(d.map.get("diff"), Some(&Value::Int(7)));
+    assert_eq!(d.map.get("product"), Some(&Value::Int(20)));
+    assert_eq!(d.map.get("quotient"), Some(&Value::Int(5)));
+    assert_eq!(d.map.get("leftover"), Some(&Value::Int(2)));
+}
+
+#[test]
+fn operator_add_without_add_witness_falls_back_to_numeric() {
+    // A branded value whose schema does NOT define `add` keeps the
+    // numeric fallback. With raw Int / Float fields the dispatcher
+    // would call `eval_numeric_arithmetic`, which rejects Dict — so
+    // we use Int operands here and just confirm that *missing*
+    // witness doesn't accidentally short-circuit to an error before
+    // the fallback fires.
+    use std::collections::{BTreeMap, HashMap};
+    let source = r#"#schema Money {
+    Int cents: *
+} with {
+    sub(other: Self) -> Int: self.cents - other.cents
+}
+#main(Money a, Int n)
+{ Int total: n + 1, Int diff: a - a }"#;
+    let node = parse_doc(source);
+    let analyzed = std::sync::Arc::new(relon_analyzer::analyze(&node));
+    let mut a = BTreeMap::new();
+    a.insert("cents".to_string(), Value::Int(10));
+    let mut args: HashMap<String, Value> = HashMap::new();
+    args.insert("a".to_string(), Value::dict(a));
+    args.insert("n".to_string(), Value::Int(41));
+    let ctx = Context::new()
+        .with_root(node.clone())
+        .with_analyzed(std::sync::Arc::clone(&analyzed));
+    let result = Evaluator::new(std::sync::Arc::new(ctx))
+        .run_main(&std::sync::Arc::new(Scope::default()), args)
+        .unwrap();
+    let Value::Dict(d) = result else { panic!() };
+    // `n + 1` is pure-Int — numeric fallback (no Money in the mix).
+    assert_eq!(d.map.get("total"), Some(&Value::Int(42)));
+    // `a - a` dispatches through the `sub` witness; no `add` exists,
+    // confirming missing-witness arms still resolve other operators
+    // and didn't tangle the dispatch table.
+    assert_eq!(d.map.get("diff"), Some(&Value::Int(0)));
+}
+
+#[test]
+fn operator_add_returns_branded_result_from_user_method() {
+    // Structural-math smoke test: `u + v` on a branded Money returns
+    // a fresh Money. We register `add` as a host-native method so the
+    // implementation can hand back a Dict with `brand = "Money"`
+    // directly — keeping the test focused on dispatch + return-shape
+    // rather than on schema-body syntactic ergonomics for typed
+    // construction. The body-driven path is already covered by the
+    // five Add/Sub/Mul/Div/Mod tests above.
+    use std::collections::{BTreeMap, HashMap};
+    let source = r#"#schema Money {
+    Int cents: *
+} with {
+    #native
+    add(other: Self) -> Self
+}
+#main(Money a, Money b)
+{ Money sum: a + b }"#;
+    let node = parse_doc(source);
+    let analyzed = std::sync::Arc::new(relon_analyzer::analyze(&node));
+
+    struct Adder;
+    impl crate::native_fn::RelonFunction for Adder {
+        fn call(
+            &self,
+            args: crate::native_fn::NativeArgs,
+            _range: relon_parser::TokenRange,
+        ) -> Result<Value, crate::error::RuntimeError> {
+            let Value::Dict(a) = args.positional.first().expect("self") else {
+                panic!("self should be a Dict");
+            };
+            let Value::Dict(b) = args.positional.get(1).expect("other") else {
+                panic!("other should be a Dict");
+            };
+            let Value::Int(ca) = a.map.get("cents").expect("cents") else {
+                panic!("cents should be Int");
+            };
+            let Value::Int(cb) = b.map.get("cents").expect("cents") else {
+                panic!("cents should be Int");
+            };
+            let mut map = std::collections::BTreeMap::new();
+            map.insert("cents".to_string(), Value::Int(*ca + *cb));
+            Ok(Value::Dict(std::sync::Arc::new(
+                crate::value::ValueDict::with_brand(map, Some("Money".to_string())),
+            )))
+        }
+    }
+
+    let mut ctx = Context::new()
+        .with_root(node.clone())
+        .with_analyzed(std::sync::Arc::clone(&analyzed));
+    ctx.register_pure_method("Money", "add", std::sync::Arc::new(Adder));
+
+    let mut a = BTreeMap::new();
+    a.insert("cents".to_string(), Value::Int(125));
+    let mut b = BTreeMap::new();
+    b.insert("cents".to_string(), Value::Int(75));
+    let mut args: HashMap<String, Value> = HashMap::new();
+    args.insert("a".to_string(), Value::dict(a));
+    args.insert("b".to_string(), Value::dict(b));
+    let result = Evaluator::new(std::sync::Arc::new(ctx))
+        .run_main(&std::sync::Arc::new(Scope::default()), args)
+        .unwrap();
+    let Value::Dict(d) = result else { panic!() };
+    let Value::Dict(sum) = d.map.get("sum").expect("sum field") else {
+        panic!("sum should be a Dict");
+    };
+    assert_eq!(sum.brand.as_deref(), Some("Money"));
+    assert_eq!(sum.map.get("cents"), Some(&Value::Int(200)));
+}
+
+// ===================================================================
+// Decision 21 (Iterable lowering): `for x in c: ...` /
+// `[for x in c: ...]` Comprehensions accept both raw `List<T>` and
+// `Iter<T>` values produced by `List.iter()` / `String.iter()` /
+// `Dict.iter()`. Decision 21' (core.relon carrier): no `#extend
+// String with { #native upper() -> ... }` boilerplate required for
+// these dispatch tests — the methods come from the analyzer-side
+// core schemas.
+// ===================================================================
+
+#[test]
+fn core_string_method_no_extend_needed() {
+    // Plain `s.upper()` works against the pre-injected core String
+    // schema. No source-side declaration; the analyzer accepts the
+    // dispatch and the runtime hits `register_pure_method("String",
+    // "upper", ...)`.
+    use std::collections::HashMap;
+    let source = r#"#main(String s)
+{ String shout: s.upper() }"#;
+    let node = parse_doc(source);
+    let analyzed = std::sync::Arc::new(relon_analyzer::analyze(&node));
+    let errors: Vec<_> = analyzed
+        .diagnostics
+        .iter()
+        .filter(|d| d.severity() == relon_analyzer::Severity::Error)
+        .collect();
+    assert!(errors.is_empty(), "analyzer errors: {:?}", errors);
+    let mut args: HashMap<String, Value> = HashMap::new();
+    args.insert("s".to_string(), Value::String("hi".to_string()));
+    let ctx = Context::new()
+        .with_root(node.clone())
+        .with_analyzed(std::sync::Arc::clone(&analyzed));
+    let result = Evaluator::new(std::sync::Arc::new(ctx))
+        .run_main(&std::sync::Arc::new(Scope::default()), args)
+        .unwrap();
+    let Value::Dict(d) = result else { panic!() };
+    assert_eq!(d.map.get("shout"), Some(&Value::String("HI".to_string())));
+}
+
+#[test]
+fn core_list_method_no_extend_needed() {
+    // `lst.map(...)` against the pre-injected core List schema, again
+    // with no user-side `#extend` declaration.
+    use std::collections::HashMap;
+    let source = r#"#main(List<Int> xs)
+{ List<Int> tripled: xs.map((n) => n * 3) }"#;
+    let node = parse_doc(source);
+    let analyzed = std::sync::Arc::new(relon_analyzer::analyze(&node));
+    let errors: Vec<_> = analyzed
+        .diagnostics
+        .iter()
+        .filter(|d| d.severity() == relon_analyzer::Severity::Error)
+        .collect();
+    assert!(errors.is_empty(), "analyzer errors: {:?}", errors);
+    let mut args: HashMap<String, Value> = HashMap::new();
+    args.insert(
+        "xs".to_string(),
+        Value::list(vec![Value::Int(1), Value::Int(2), Value::Int(3)]),
+    );
+    let ctx = Context::new()
+        .with_root(node.clone())
+        .with_analyzed(std::sync::Arc::clone(&analyzed));
+    let result = Evaluator::new(std::sync::Arc::new(ctx))
+        .run_main(&std::sync::Arc::new(Scope::default()), args)
+        .unwrap();
+    let Value::Dict(d) = result else { panic!() };
+    assert_eq!(
+        d.map.get("tripled"),
+        Some(&Value::list(vec![
+            Value::Int(3),
+            Value::Int(6),
+            Value::Int(9),
+        ])),
+    );
+}
+
+#[test]
+fn comprehension_over_list_iter() {
+    // `xs.iter()` returns an `Iter<Int>`-branded dict; the
+    // Comprehension driver detects the brand and walks the wrapped
+    // source. End-to-end check that the iteration produces the same
+    // elements as plain-list iteration.
+    use std::collections::HashMap;
+    let source = r#"#main(List<Int> xs)
+{ List<Int> squared: [n * n for n in xs.iter()] }"#;
+    let node = parse_doc(source);
+    let analyzed = std::sync::Arc::new(relon_analyzer::analyze(&node));
+    let errors: Vec<_> = analyzed
+        .diagnostics
+        .iter()
+        .filter(|d| d.severity() == relon_analyzer::Severity::Error)
+        .collect();
+    assert!(errors.is_empty(), "analyzer errors: {:?}", errors);
+    let mut args: HashMap<String, Value> = HashMap::new();
+    args.insert(
+        "xs".to_string(),
+        Value::list(vec![Value::Int(2), Value::Int(3), Value::Int(4)]),
+    );
+    let ctx = Context::new()
+        .with_root(node.clone())
+        .with_analyzed(std::sync::Arc::clone(&analyzed));
+    let result = Evaluator::new(std::sync::Arc::new(ctx))
+        .run_main(&std::sync::Arc::new(Scope::default()), args)
+        .unwrap();
+    let Value::Dict(d) = result else { panic!() };
+    assert_eq!(
+        d.map.get("squared"),
+        Some(&Value::list(vec![
+            Value::Int(4),
+            Value::Int(9),
+            Value::Int(16),
+        ])),
+    );
+}
+
+#[test]
+fn comprehension_over_string_iter() {
+    // `s.iter()` yields one element per char as a fresh `String`.
+    use std::collections::HashMap;
+    let source = r#"#main(String s)
+{ List<String> chars: [c for c in s.iter()] }"#;
+    let node = parse_doc(source);
+    let analyzed = std::sync::Arc::new(relon_analyzer::analyze(&node));
+    let errors: Vec<_> = analyzed
+        .diagnostics
+        .iter()
+        .filter(|d| d.severity() == relon_analyzer::Severity::Error)
+        .collect();
+    assert!(errors.is_empty(), "analyzer errors: {:?}", errors);
+    let mut args: HashMap<String, Value> = HashMap::new();
+    args.insert("s".to_string(), Value::String("abc".to_string()));
+    let ctx = Context::new()
+        .with_root(node.clone())
+        .with_analyzed(std::sync::Arc::clone(&analyzed));
+    let result = Evaluator::new(std::sync::Arc::new(ctx))
+        .run_main(&std::sync::Arc::new(Scope::default()), args)
+        .unwrap();
+    let Value::Dict(d) = result else { panic!() };
+    assert_eq!(
+        d.map.get("chars"),
+        Some(&Value::list(vec![
+            Value::String("a".to_string()),
+            Value::String("b".to_string()),
+            Value::String("c".to_string()),
+        ])),
+    );
+}
+
+#[test]
+fn comprehension_over_dict_iter_yields_entries() {
+    // `d.iter()` yields `(K, V)` 2-element lists, key-sorted.
+    use std::collections::{BTreeMap, HashMap};
+    // The Indexable `a[i]` syntax isn't ready, so the assertion
+    // below walks `d.iter()` and checks the count rather than the
+    // specific (K, V) shape of each element — full tuple
+    // destructuring is left for the post-Indexable follow-up.
+    let source = r#"#main(Dict<String, Int> d)
+{ Int count: len([kv for kv in d.iter()]) }"#;
+    let node = parse_doc(source);
+    let analyzed = std::sync::Arc::new(relon_analyzer::analyze(&node));
+    let errors: Vec<_> = analyzed
+        .diagnostics
+        .iter()
+        .filter(|d| d.severity() == relon_analyzer::Severity::Error)
+        .collect();
+    assert!(errors.is_empty(), "analyzer errors: {:?}", errors);
+    let mut dmap = BTreeMap::new();
+    dmap.insert("a".to_string(), Value::Int(1));
+    dmap.insert("b".to_string(), Value::Int(2));
+    let mut args: HashMap<String, Value> = HashMap::new();
+    args.insert("d".to_string(), Value::dict(dmap));
+    let ctx = Context::new()
+        .with_root(node.clone())
+        .with_analyzed(std::sync::Arc::clone(&analyzed));
+    let result = Evaluator::new(std::sync::Arc::new(ctx))
+        .run_main(&std::sync::Arc::new(Scope::default()), args)
+        .unwrap();
+    let Value::Dict(d) = result else { panic!() };
+    assert_eq!(d.map.get("count"), Some(&Value::Int(2)));
+}
+
+#[test]
+fn user_schema_iterable_shape_accepted_by_analyzer() {
+    // Decision 21 witness-shape check: a user schema that derives
+    // `Iterable` with `iter() -> Iter<T>` should pass the
+    // `ConstraintWitnessShapeMismatch` walker — the registry entry
+    // for `Iterable` carries head-only `Iter` so the generic arg
+    // (`Iter<Int>` here) is accepted.
+    //
+    // End-to-end Comprehension iteration over a user iterable still
+    // requires chained method dispatch (`self.items.iter()`), which
+    // is queued for the post-Indexable follow-up — but the shape
+    // check is what gates the user-facing surface today.
+    let source = r#"#schema MyBag {
+    List<Int> items: *
+} with {
+    #derive Iterable
+    iter() -> Iter<Int>: self.items
+}
+#main(MyBag bag)
+{ Int count: len(bag.items) }"#;
+    let node = parse_doc(source);
+    let analyzed = relon_analyzer::analyze(&node);
+    let shape_mismatches: Vec<_> = analyzed
+        .diagnostics
+        .iter()
+        .filter(|d| {
+            matches!(
+                d,
+                relon_analyzer::Diagnostic::ConstraintWitnessShapeMismatch { .. }
+            )
+        })
+        .collect();
+    assert!(
+        shape_mismatches.is_empty(),
+        "no witness-shape mismatch expected: {:?}",
+        shape_mismatches
+    );
+    let methods = analyzed
+        .schema_methods
+        .get("MyBag")
+        .expect("MyBag method table populated");
+    assert!(
+        methods.iter().any(|m| m.name == "iter"),
+        "user iter() method recorded: {methods:?}"
+    );
 }

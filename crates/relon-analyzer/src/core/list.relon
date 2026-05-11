@@ -1,0 +1,24 @@
+// core.relon — List<T> methods (decision 21' of
+// schema-rooted-model-2026-05-11.md).
+//
+// `join` lives on List because the receiver is the list of strings, not
+// the separator — see the rationale in `stdlib.rs::register_to`.
+//
+// Encoding note: the parser does not support method-level generics
+// (`map<U>(...)`); the analyzer's stdlib-signatures table
+// (`relon-analyzer/src/stdlib_signatures.rs::_list_map`) carries the
+// real generic-aware signature. The carrier here is just the dispatch
+// shell — its `Closure` slot is single-segment so the parser accepts
+// it, and the typechecker keeps using the stdlib-signature variant for
+// argument inference. Mirrors the role of `register_pure_method` on
+// the runtime side: name registration only, not signature truth.
+#schema List<T> with {
+    #native map(f: Closure) -> List<T>
+    #native filter(f: Closure) -> List<T>
+    #native reduce(init: T, f: Closure) -> T
+    #native contains(x: T) -> Bool
+    #native join(sep: String) -> String
+    #native len() -> Int
+    #native iter() -> Iter<T>
+}
+{}

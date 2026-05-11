@@ -252,8 +252,40 @@ fn param_type_matches(
 }
 
 /// Decide whether `actual` return type matches `expected_return`.
-fn return_type_matches(actual: &TypeNode, expected_return: &str) -> bool {
+///
+/// Constraint registry entries carry the *head* name (`"Iter"`,
+/// `"Optional"`, `"Bool"`, `"Self"`). Three matching modes:
+///
+///   * `"Self"` — accept either literal `Self` or the schema's own
+///     concrete name (mirrors `param_type_matches`). Used by the
+///     Number family witnesses (`add(other: Self) -> Self`).
+///   * Generic-head names (`"Iter"`, `"Optional"`) — match by head
+///     only; generic args (`Iter<T>` vs `Iter<U>`) are not unified at
+///     this layer. The lowering pass handles concrete-type checking
+///     later, but the witness shape check is satisfied as soon as
+///     the right *container* head is named. Without this loosening,
+///     `iter() -> Iter<Int>` would fail the shape check against the
+///     `Iterable` witness whose return slot is recorded as bare
+///     `Iter`.
+///   * Concrete primitive names (`"Bool"`, `"String"`) — must be a
+///     bare single-segment path; generics are rejected, which is
+///     correct for these (a `Bool<T>` would be nonsense).
+fn return_type_matches(actual: &TypeNode, expected_return: &str, schema: &str) -> bool {
+    if expected_return == "Self" {
+        return type_matches_self_or_schema(actual, schema);
+    }
+    if is_generic_head_constraint_return(expected_return) {
+        return !actual.is_optional && actual.path.len() == 1 && actual.path[0] == expected_return;
+    }
     type_matches_named(actual, expected_return)
+}
+
+/// True when the expected return type is a known generic-head form
+/// (currently `Iter` and `Optional`) for which the witness check
+/// ignores generic args. Keeping this as a tiny allowlist makes it
+/// hard to accidentally relax the shape check on a primitive return.
+fn is_generic_head_constraint_return(name: &str) -> bool {
+    matches!(name, "Iter" | "Optional" | "Option")
 }
 
 /// Walk every method on every schema, find `#derive C` pragmas, and
@@ -284,7 +316,7 @@ pub fn check_derive_witnesses(tree: &mut AnalyzedTree) {
                         .iter()
                         .zip(expected.params.iter())
                         .all(|(actual, exp)| param_type_matches(exp, actual, schema_name))
-                    && return_type_matches(&method.return_type, expected.return_type);
+                    && return_type_matches(&method.return_type, expected.return_type, schema_name);
                 if !ok {
                     diags.push(Diagnostic::ConstraintWitnessShapeMismatch {
                         constraint: constraint_name.clone(),

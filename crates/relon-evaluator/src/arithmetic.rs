@@ -96,6 +96,17 @@ impl Evaluator {
         let r = self.eval(right, scope)?;
         match (op, &l, &r) {
             (Operator::Add, Value::Dict(_), Value::Dict(_)) => {
+                // Phase C.7: branded receiver with an `add` witness wins
+                // over structural merge. Without this check `Money + Money`
+                // would always merge field-by-field instead of dispatching
+                // through the user-defined Addable::add. The witness path
+                // takes a body or a host-registered native impl; if neither
+                // is present we fall through to the original merge
+                // semantics (which keep Logic-as-Data's "two dicts compose
+                // structurally" promise).
+                if let Some(out) = self.try_arith_op_method(&l, &r, "add", scope, range)? {
+                    return Ok(out);
+                }
                 let mut merged = l.clone();
                 merged.deep_merge(&r);
                 self.check_value_size(&merged, left.range)?;
@@ -126,10 +137,28 @@ impl Evaluator {
             }
             (Operator::Add, Value::String(a), b) => Ok(Value::String(format!("{}{}", a, b))),
             (Operator::Add, a, Value::String(b)) => Ok(Value::String(format!("{}{}", a, b))),
-            (Operator::Add | Operator::Sub | Operator::Mul, _, _) => {
+            (Operator::Add | Operator::Sub | Operator::Mul, a, b) => {
+                // Phase C operator lowering: a branded value whose
+                // schema derives Addable / Subtractable / Multiplicable
+                // dispatches `+` / `-` / `*` through its witness method
+                // (`add` / `sub` / `mul`). Inserted *after* the schema-
+                // merge / dict-merge / String-concat short-circuits
+                // above and *before* the numeric fallback, so primitive
+                // arithmetic on Int / Float keeps current semantics.
+                let method = arith_method_for(op);
+                if let Some(out) = self.try_arith_op_method(a, b, method, scope, range)? {
+                    return Ok(out);
+                }
                 eval_numeric_arithmetic(op, range, &l, left.range, &r, right.range)
             }
-            (Operator::Div | Operator::Mod, _, _) => {
+            (Operator::Div | Operator::Mod, a, b) => {
+                // Same lowering shape as Add/Sub/Mul. `/` lowers through
+                // Divisible::div, `%` through Modable::rem. Numeric
+                // fallback handles primitive Int / Float arithmetic.
+                let method = arith_method_for(op);
+                if let Some(out) = self.try_arith_op_method(a, b, method, scope, range)? {
+                    return Ok(out);
+                }
                 eval_numeric_division(op, range, &l, left.range, &r, right.range)
             }
             (Operator::Eq, a, b) => {
@@ -333,6 +362,73 @@ impl Evaluator {
         Ok(Some(Value::Bool(lt_bool || eq_bool)))
     }
 
+    /// Phase C operator lowering: dispatch an arithmetic op (`+`, `-`,
+    /// `*`, `/`, `%`) through a user-defined witness method (`add`,
+    /// `sub`, `mul`, `div`, `rem`) when the receiver is a branded value
+    /// whose schema derives the matching constraint (Addable,
+    /// Subtractable, Multiplicable, Divisible, Modable — decision 24).
+    /// Returns `Ok(None)` when no witness applies, so the caller falls
+    /// through to the numeric default (`eval_numeric_arithmetic` /
+    /// `eval_numeric_division`).
+    ///
+    /// Dispatch precedence mirrors `try_compare_op_method`:
+    /// 1. User-written `.relon` body (`body_node = Some`).
+    /// 2. Host-registered native method (`#native`).
+    /// 3. None — caller fallback (no auto-derive: the arithmetic
+    ///    constraints are opt-in, with no synthesized placeholder).
+    fn try_arith_op_method(
+        &self,
+        receiver: &Value,
+        other: &Value,
+        method_name: &str,
+        scope: &Arc<Scope>,
+        range: TokenRange,
+    ) -> Result<Option<Value>, RuntimeError> {
+        let Value::Dict(d) = receiver else {
+            return Ok(None);
+        };
+        let Some(brand) = d.brand.as_ref() else {
+            return Ok(None);
+        };
+        let Some(analyzed) = self.context.analyzed.as_ref() else {
+            return Ok(None);
+        };
+        let Some(method) = analyzed
+            .schema_methods
+            .get(brand)
+            .and_then(|methods| methods.iter().find(|m| m.name == method_name))
+        else {
+            return Ok(None);
+        };
+        if let Some(body) = method.body_node.as_ref() {
+            let arg = crate::native_fn::EvaluatedArg::positional(other.clone());
+            return self
+                .invoke_method_body(
+                    body,
+                    Some(receiver.clone()),
+                    &method.params,
+                    &[arg],
+                    scope,
+                    range,
+                )
+                .map(Some);
+        }
+        let key = (brand.clone(), method_name.to_string());
+        if let Some(entry) = self.context.native_methods.get(&key) {
+            let display_name = format!("{}.{}", brand, method_name);
+            self.check_native_fn_capability(&display_name, entry, range)?;
+            let native = crate::native_fn::NativeArgs::from_evaluated(
+                vec![
+                    crate::native_fn::EvaluatedArg::positional(receiver.clone()),
+                    crate::native_fn::EvaluatedArg::positional(other.clone()),
+                ],
+                self.caps(),
+            );
+            return Ok(Some(entry.func.call(native, range)?));
+        }
+        Ok(None)
+    }
+
     /// Like `try_compare_op_method` but for the zero-arg
     /// `to_json() -> String` witness — used by JsonProjectable
     /// fallback at sites that need a serialized projection (Phase D
@@ -399,6 +495,22 @@ fn invert_bool(v: Value) -> Value {
     match v {
         Value::Bool(b) => Value::Bool(!b),
         other => other,
+    }
+}
+
+/// Map an arithmetic operator to the witness method name registered
+/// in the constraint table (`crates/relon-analyzer/src/constraints.rs`).
+/// `unreachable!` for non-arithmetic operators because the caller in
+/// `eval_binary` only invokes this helper from the Add/Sub/Mul/Div/Mod
+/// arms.
+fn arith_method_for(op: Operator) -> &'static str {
+    match op {
+        Operator::Add => "add",
+        Operator::Sub => "sub",
+        Operator::Mul => "mul",
+        Operator::Div => "div",
+        Operator::Mod => "rem",
+        _ => unreachable!("arith_method_for called with non-arithmetic operator"),
     }
 }
 

@@ -1,0 +1,16 @@
+// core.relon — Iter<T> schema (decisions 21 and 21' of
+// schema-rooted-model-2026-05-11.md).
+//
+// Backs the `for x in c` / `[for x in c: ...]` Comprehension lowering:
+// the iteration site fetches `c.iter()` to obtain an `Iter<T>`, then
+// (for built-in iterables produced by `List.iter()` / `String.iter()` /
+// `Dict.iter()`) drives the loop by reading the iterator's host-managed
+// cursor state. The `next()` witness exists so user schemas can derive
+// `Iterable` and have their `iter()` return type shape-checked — the
+// evaluator currently drives built-in iterators directly; the
+// `next()` method itself is reserved for user-side iteration when the
+// follow-up "expose Iter as a user-callable protocol" PR lands.
+#schema Iter<T> with {
+    #native next() -> Option<T>
+}
+{}
