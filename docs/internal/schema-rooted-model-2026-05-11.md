@@ -44,7 +44,7 @@ Relon v1.x 同时存在两条调用 dispatch 路径：
 | # | 决策 | 关键含义 |
 | --- | --- | --- |
 | 1 | **标量即 schema** | Int / Float / String / Bool / Null 是一等内置 schema，与用户 `#schema User` 同种 |
-| 2 | **容器都是 schema，泛型参数化** | List<T> / Dict<K,V> / Tuple / Optional / Result / Option 都是 schema，方法以泛型参数化定义 |
+| 2 | **容器都是 schema，泛型参数化** | `List<T>` / `Dict<K,V>` / `Tuple` / `Optional` / `Result` / `Option` 都是 schema，方法以泛型参数化定义 |
 | 3 | **schema 静态方法 + 受控 prelude** | 主路径 `Schema.method(args)` / `value.method(args)`；保留 3 个 prelude 糖名：`len(x)` / `range(s, e)` / `type(x)` |
 | 4 | **声明 .relon、实现 Rust** | 内置 schema 在 `std_relon/<type>.relon` 用 `#schema X with { ... #native method() -> R }` 声明，host Rust 用 `register_method` 提供 `#native` 实现 |
 | 5 | **全部 prelude，无需 import** | 所有内置 schema（标量+容器）默认在作用域内。`#import` 仅用于用户自定义模块 |
@@ -362,7 +362,7 @@ operator lowering 等机制。
 ### 17：Tuple 位置访问保留为语言原语
 
 `xs.0` / `xs.1` 这种位置访问由 parser/analyzer 作 `TupleIndex` AST 节点
-处理，**不走方法表 dispatch**。Tuple<T1, T2, ...> 仍是 schema（占位
+处理，**不走方法表 dispatch**。`Tuple<T1, T2, ...>` 仍是 schema（占位
 角色），允许未来挂少量普通方法（如 `.len()` 返回 arity，`.swap()`
 等），位置访问与方法访问语义独立。
 
