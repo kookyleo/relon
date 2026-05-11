@@ -151,16 +151,34 @@ CPU 时间——一次 dispatch 内部如果调了一个慢的内置算子（比
 ### `max_value_elements: Option<usize>`
 
 字段名带 `_bytes` 是为了未来扩展，**当前的实测维度是「Value 的元素
-数」**——一个 list 的元素个数，或一个 dict 的键值对数。检查点在求
-值器构造 list/dict 的边界（字面量、`+` 合并、推导式）。
+数」**——一个 list 的元素个数，或一个 dict 的键值对数。检查点覆盖
+所有「语言层面」产生 list/dict 的入口：
+
+- 字面量构造（`[...]` / `{ k: v }`）；
+- 字典 `+` 合并；
+- 推导式 `[for x in xs: ...]`；
+- 标准库内置算子（`range`、`string.split`、`list.map` / `filter` /
+  `reduce`、`dict.merge` 方法形式、`dict.keys` / `values`、`iter()`
+  家族等）。这些都在 `call_function` / `try_call_native_method` 的
+  公共出口被检查，无论是自由函数还是 `xs.method(...)` 派发。
+- `range` 还会**在分配前**预检：`range(0, 10_000_000_000)` 不会先
+  分配一个 10G 的 `Vec` 再触发检查——它会先比较 `end - start` 和
+  cap，立刻拒绝。
 
 ```rust
 ctx.capabilities.max_value_elements = Some(3);
 // `[1, 2, 3, 4, 5]` 触发 ValueTooLarge { limit: 3, actual: 5 }
+// `range(0, 1_000_000)` 同样在 stdlib 入口被拦截
 ```
 
-注意：通过 `register_fn` 自己写的函数返回的 list/dict 不会被自动
-检查——那是宿主自己的领域（你在自己的函数里想多大就多大）。
+注意范围：检查只看「最外层」容器的元素数。`List<List<T>>` 外层
+长度小、内层巨大的情况会绕过——递归大小检查是后续的独立决策，
+现在不在 cap 的语义里。
+
+宿主自己通过 `register_fn` 注册的原生函数返回 list/dict 时也会被
+同一个 cap 拦截——之前文档说「那是宿主自己的领域」是 spec 之前的
+状态，现在统一按「runtime 出 list/dict ⇒ 走 check」处理；宿主想
+完全不受限请把 `max_value_elements = None`。
 
 ### `allow_native_fn: HashSet<String>`
 

@@ -56,17 +56,21 @@ warning: value assigned to `name`  is never read (×9)
 - `relon-analyzer/src/lib.rs` + `relon-evaluator/src/lib.rs` 各加 `#![allow(unused_assignments)]` + 指向 `rust-lang/rust#147648` 的注释。
 - 等上游 rustc 修了就把这条 allow 删掉。
 
-### 4. "默认沙箱" 的 `max_value_elements` 在 stdlib 路径上是漏的
+### 4. ~~"默认沙箱" 的 `max_value_elements` 在 stdlib 路径上是漏的~~（已修）
 
-`Capabilities::max_value_elements` 的 sandbox 文档承诺："字面量、`+` 合并、推导式都会检查"。但 `check_value_size` 调用点只有 4 处（`eval.rs:855 / :950 / :992`，`arithmetic.rs:112`），**所有 stdlib intrinsic 返回的集合都不过这道闸**：
+`Capabilities::max_value_elements` 的 sandbox 文档承诺过："字面量、`+` 合并、推导式都会检查"。原始版本下 `check_value_size` 调用点只有 4 处（`eval.rs:855 / :950 / :992`，`arithmetic.rs:112`），**所有 stdlib intrinsic 返回的集合都不过这道闸**：
 
 - `range(0, 1_000_000)` 直接在 `Range::call` 里 `Value::list(...)` 收集千万元素（`stdlib.rs:333`）。
 - `list.map` / `list.filter` / `list.reduce` / `string.split` / `string.replace` / `dict.merge`（除字面量 spread 的那一个路径外）类似。
 - 实测：`{ x: len(range(0, 1_000_000)) }` 在沙箱 default Context 下正常返回 `1000000`；即使 `max_value_elements = Some(3)`，因为 `len(range(...))` 的中间结果不进 `Expr::List`、不进推导式、不进 dict-merge，cap 永远不会触发。
 
-`docs/zh/guide/sandbox.md:162` 那段"通过 `register_fn` 写的函数返回的不会被自动检查"的注脚，把 stdlib 也悄悄放进了这个豁免——但 stdlib 是规范一部分、不是 host fn，让脚本能稳定绕过尺寸限制和"默认沙箱"的整体承诺直接冲突。
+修法落地：
 
-修法应该是：在 `call_function` 拿到 native fn 返回值后统一 `check_value_size`，或者 stdlib 各 intrinsic 在生成 Vec 之前用 `caps.max_value_elements` 做提前剪枝（`range` 尤其需要——一次性 `Vec<Value>` 千万元素是真实 OOM 风险）。
+1. `NativeFnCaps` 多了一个 `max_value_elements()` 方法（`crates/relon-evaluator/src/native_fn.rs`），把 cap 暴露给 native fn 自查；`EvaluatorCaps` 读 `Capabilities::max_value_elements`。
+2. `Range::call` 在分配 `Vec<Value>` 之前对 `end - start` 与 cap 做预检——`range(0, 10_000_000_000)` 立即被拒绝，不会 OOM。
+3. `Evaluator::call_function` / `Evaluator::try_call_native_method` 在拿到 native fn 返回值后统一走 `check_value_size`，覆盖所有自由函数 + 接收者方法 + host 注册的 native fn。`check_value_size` 仍只看最外层容器（递归大小检查是独立话题）。
+4. `docs/zh/guide/sandbox.md` 的 `max_value_elements` 段落已重写，删除 "host fn 返回值是宿主自己的问题" 的豁免；现在 stdlib 走和字面量同一道闸，host 真要无约束请显式设 `max_value_elements = None`。
+5. `sandbox_tests.rs` 新增 6 条 regression：`range` 预检、`_string_split` / `_list_map` / `_list_filter` / `_dict_merge` 函数式、`xs.map(...)` 接收者式（搭 `with_analyzed`）、和一条 at-cap 正向用例。
 
 ### 5. "无 implicit ambient state / 确定性" 与全局 Iter cursor 表的张力
 
@@ -118,7 +122,7 @@ warning: value assigned to `name`  is never read (×9)
 
 | 优先级 | 项 | 行动 |
 | --- | --- | --- |
-| P0 | stdlib intrinsic 返回值不受 `max_value_elements` 约束 | `range` 提前剪枝；`call_function` 在 native fn 返回后统一 `check_value_size`；加 sandbox regression test |
+| ~~P0~~ | ~~stdlib intrinsic 返回值不受 `max_value_elements` 约束~~ | ~~已修：`Range::call` 在分配前对 `caps.max_value_elements` 做预检；`call_function` / `try_call_native_method` 在 native fn 返回后统一走 `check_value_size`；`sandbox_tests` 新增 range / `_string_split` / `_list_map` / `_list_filter` / `_dict_merge` / 接收者方法路径 6 条 regression test~~ |
 | ~~P0~~ | ~~README quickstart 跑不动 + 头版示例不能 eval~~ | ~~已修：`relon-cli/Cargo.toml` 加 `default-run = "relon-cli"`；README 头版例子改成可运行的方法简写形式；"unified closures (`@fn`)" 改成实际语法~~ |
 | ~~P0~~ | ~~`clippy -D warnings` 在文档承诺的命令下失败~~ | ~~已治标：thiserror 升 2 + 两 crate 加 `#![allow(unused_assignments)]` 引用 rust-lang/rust#147648；等上游 rustc 修后删 allow~~ |
 | P1 | 多租户 Iter cursor 隔离 | cursor 表挂到 `Context`，`eval_root` / `run_main` 末尾清空 |
