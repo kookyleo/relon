@@ -731,12 +731,11 @@ mod tests {
             let file = root.join(rel_path);
             let content = std::fs::read_to_string(&file)
                 .unwrap_or_else(|e| panic!("{rel_path}: failed to read: {e}"));
-            let node = parse_document(&content)
-                .unwrap_or_else(|e| panic!("{rel_path}: parse: {e}"));
+            let node =
+                parse_document(&content).unwrap_or_else(|e| panic!("{rel_path}: parse: {e}"));
             let analyzed = Arc::new(relon_analyzer::analyze(&node));
-            let args: std::collections::HashMap<String, Value> =
-                serde_json::from_str(args_json)
-                    .unwrap_or_else(|e| panic!("{rel_path}: args json: {e}"));
+            let args: std::collections::HashMap<String, Value> = serde_json::from_str(args_json)
+                .unwrap_or_else(|e| panic!("{rel_path}: args json: {e}"));
             let mut ctx = Context::new()
                 .with_root(node)
                 .with_analyzed(Arc::clone(&analyzed));
@@ -745,16 +744,15 @@ mod tests {
             let value = evaluator
                 .run_main(&Arc::new(Scope::default()), args)
                 .unwrap_or_else(|e| panic!("{rel_path}: run_main: {e:?}"));
-            let json = to_json_value(value)
-                .unwrap_or_else(|e| panic!("{rel_path}: to_json: {e:?}"));
+            let json =
+                to_json_value(value).unwrap_or_else(|e| panic!("{rel_path}: to_json: {e:?}"));
             let actual = format!("{}\n", serde_json::to_string_pretty(&json).unwrap());
             let golden_path = root
                 .join("fixtures/golden/examples_main")
                 .join(Path::new(rel_path).file_stem().unwrap())
                 .with_extension("json");
-            let expected = std::fs::read_to_string(&golden_path).unwrap_or_else(|e| {
-                panic!("failed to read {}: {e}", golden_path.display())
-            });
+            let expected = std::fs::read_to_string(&golden_path)
+                .unwrap_or_else(|e| panic!("failed to read {}: {e}", golden_path.display()));
             assert_eq!(actual, expected, "golden mismatch for {rel_path}");
         }
     }
