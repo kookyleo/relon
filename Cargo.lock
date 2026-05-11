@@ -598,6 +598,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "relon-bench"
+version = "0.1.0"
+dependencies = [
+ "relon-evaluator",
+ "relon-parser",
+]
+
+[[package]]
 name = "relon-cli"
 version = "0.1.0"
 dependencies = [

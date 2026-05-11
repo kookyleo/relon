@@ -101,9 +101,11 @@ warning: value assigned to `name`  is never read (×9)
 - `crates/relon-analyzer/src/constraints.rs:106-118` 还写着 "lowering ... is the still-pending hook"，但 roadmap §J 已经把 Iterable / Indexable / 算子 lowering 都标 `[x]`。代码内注释和路线图不同步。
 - `roadmap.md:160-176` 列了四条"剩余未决项"（中段 path 推断落 Any、method generic K/V 仅 wildcard、shadow warning、Iter cursor leak），其中 Iter cursor leak 见上文已经从"节省 16 B"升级到"影响多租户隔离"，应被重新分类为安全/正确性而不是 housekeeping。
 
-### 10. 多 binary 的杂物外溢
+### ~~10. 多 binary 的杂物外溢~~
 
-`relon-cli` 包内同时挂着面向用户的 CLI 和内部用的 `bench` benchmark。`bench` 用 `Instant::now()`、`Duration`，本身没问题，但暴露成 `relon-cli` 包的二级 bin 让 `cargo run -p relon-cli` 这条最常用命令直接失败（见 #2）。`bench` 应该挪到 `crates/relon-cli/examples/` 或者一个独立的 `relon-bench` 包 / `#[cfg(feature = "bench")]`，让用户面 CLI 保持单 bin。
+~~`relon-cli` 包内同时挂着面向用户的 CLI 和内部用的 `bench` benchmark。`bench` 用 `Instant::now()`、`Duration`，本身没问题，但暴露成 `relon-cli` 包的二级 bin 让 `cargo run -p relon-cli` 这条最常用命令直接失败（见 #2）。`bench` 应该挪到 `crates/relon-cli/examples/` 或者一个独立的 `relon-bench` 包 / `#[cfg(feature = "bench")]`，让用户面 CLI 保持单 bin。~~
+
+（已闭环 2026-05-11：`crates/relon-cli/src/bin/bench.rs` 已抽出为独立的 `crates/relon-bench` 包，并标记 `publish = false`；作为跟进清理，`relon-cli/Cargo.toml` 中的 `default-run = "relon-cli"` 已删除——每个包恰好一个 bin 后 `cargo run -p relon-cli` 无需 default 声明即可消歧。）
 
 ### ~~11. `register_fn` API 收口仍留半口~~
 
@@ -123,7 +125,7 @@ warning: value assigned to `name`  is never read (×9)
 | 优先级 | 项 | 行动 |
 | --- | --- | --- |
 | ~~P0~~ | ~~stdlib intrinsic 返回值不受 `max_value_elements` 约束~~ | ~~已修：`Range::call` 在分配前对 `caps.max_value_elements` 做预检；`call_function` / `try_call_native_method` 在 native fn 返回后统一走 `check_value_size`；`sandbox_tests` 新增 range / `_string_split` / `_list_map` / `_list_filter` / `_dict_merge` / 接收者方法路径 6 条 regression test~~ |
-| ~~P0~~ | ~~README quickstart 跑不动 + 头版示例不能 eval~~ | ~~已修：`relon-cli/Cargo.toml` 加 `default-run = "relon-cli"`；README 头版例子改成可运行的方法简写形式；"unified closures (`@fn`)" 改成实际语法~~ |
+| ~~P0~~ | ~~README quickstart 跑不动 + 头版示例不能 eval~~ | ~~已修：`relon-cli/Cargo.toml` 加 `default-run = "relon-cli"`；README 头版例子改成可运行的方法简写形式；"unified closures (`@fn`)" 改成实际语法~~（后续治本：见 §10——`bench` 抽到独立 `relon-bench` 包，`default-run` 已撤回）|
 | ~~P0~~ | ~~`clippy -D warnings` 在文档承诺的命令下失败~~ | ~~已治标：thiserror 升 2 + 两 crate 加 `#![allow(unused_assignments)]` 引用 rust-lang/rust#147648；等上游 rustc 修后删 allow~~ |
 | P1 | 多租户 Iter cursor 隔离 | cursor 表挂到 `Context`，`eval_root` / `run_main` 末尾清空 |
 | P1 | 仓库 URL 漂移 + 英文文档承诺空洞 | 选一个 canonical repo url 全量替换；要么把英文文档补到与中文对齐，要么 README 不要再写 "· English" |

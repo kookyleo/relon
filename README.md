@@ -86,4 +86,5 @@ cargo run -q -p relon-fmt -- --check fixtures/*.relon fixtures/modules/*.relon f
 - `crates/relon-cli`: Command-line tool.
 - `crates/relon-fmt`: Formatter / syntax checker.
 - `crates/relon-lsp`: Language Server (parse + analyze + diagnostics).
+- `crates/relon-bench`: Internal micro-benchmark harness (not published).
 - `examples/`, `fixtures/`: Demo / golden files.
