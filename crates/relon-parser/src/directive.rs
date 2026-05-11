@@ -360,7 +360,7 @@ fn opt_parse_with_block<'a>(
             return Some((methods, schema_no_auto_derives));
         }
 
-        // Method header: `name(p: T, ...) -> R`.
+        // Method header: `name[<T, U, ...>](p: T, ...) -> R`.
         let method_start = input.location();
         let name_start = input.location();
         let name_token = match id.parse_next(input) {
@@ -368,6 +368,24 @@ fn opt_parse_with_block<'a>(
             Err(_) => return None,
         };
         let name_range = create_range(input, name_start, input.location());
+
+        // Optional method-level generic parameter list. Form params are
+        // bare identifiers, shape-identical to the schema-level
+        // `parse_generic_param_list` helper. Rewind on parse failure so
+        // a stray `<` (e.g. a comparison expression inside the body, in
+        // future grammar tweaks) doesn't blow up the method header.
+        let pre_method_generics = input.checkpoint();
+        let method_generics: Vec<String> = if input.as_ref().starts_with('<') {
+            match parse_generic_param_list(input) {
+                Ok(list) => list,
+                Err(_) => {
+                    input.reset(&pre_method_generics);
+                    Vec::new()
+                }
+            }
+        } else {
+            Vec::new()
+        };
 
         if (soc0, '(', soc0).parse_next(input).is_err() {
             return None;
@@ -411,6 +429,7 @@ fn opt_parse_with_block<'a>(
         methods.push(crate::SchemaMethod {
             name: name_token.0,
             name_range,
+            generics: method_generics,
             params,
             return_type,
             body,

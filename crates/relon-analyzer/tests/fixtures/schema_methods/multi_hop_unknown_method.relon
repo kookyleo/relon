@@ -1,0 +1,16 @@
+// Multi-hop variant of `unknown_method.relon`: the path-walker
+// resolves the prefix `o.customer` to `Schema("User")`, but `User`
+// has no method named `wave`. Same `UnknownMethod` we emit for the
+// 2-segment form should fire here.
+#schema User {
+    String name: *
+} with {
+    greet() -> String: f"hello ${self.name}"
+}
+
+#schema Order {
+    User customer: *
+}
+
+#main(Order o)
+{ String s: o.customer.wave() }

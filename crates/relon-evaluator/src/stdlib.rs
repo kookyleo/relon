@@ -2,7 +2,9 @@ use crate::error::RuntimeError;
 use crate::eval::Context;
 use crate::native_fn::{NativeArgs, RelonFunction};
 use crate::value::{Value, ValueDict};
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 pub fn register_to(ctx: &mut Context) {
     // Language-level builtins — always in scope, no `#import` required.
@@ -131,13 +133,13 @@ pub fn register_to(ctx: &mut Context) {
     ctx.register_pure_method("List", "iter", Arc::new(IterFromList));
     ctx.register_pure_method("String", "iter", Arc::new(IterFromString));
     ctx.register_pure_method("Dict", "iter", Arc::new(IterFromDict));
-    // `Iter.next()` exists in the analyzer's `Iter<T>` core schema so
-    // user code that aliases an iterator may *write* `it.next()`; we
-    // register a host-side stub so the dispatch path doesn't fall
-    // through to `FunctionNotFound`. Returning a clear error keeps
-    // the surface honest until the "user-callable Iter.next()" follow-up
-    // lands (see schema-rooted-implementation-log §C.9).
-    ctx.register_pure_method("Iter", "next", Arc::new(IterNextStub));
+    // `Iter.next()` is the user-callable advance primitive announced
+    // by the `Iter<T>` core schema. Returns `Option<T>`: `Some` while
+    // the cursor is in bounds, `None` once exhausted. The cursor lives
+    // in a module-local table (`iter_cursors`), keyed by the `_id`
+    // stamped into the Iter dict at construction time. See
+    // schema-rooted-implementation-log §C.11 for the rationale.
+    ctx.register_pure_method("Iter", "next", Arc::new(IterNext));
 }
 
 struct ListMap;
@@ -878,34 +880,243 @@ impl RelonFunction for IterFromDict {
     }
 }
 
-/// `Iter.next()` is reserved for the user-callable advance protocol
-/// that a follow-up PR will fill in; today the Comprehension driver
-/// reads the wrapped source directly. Calling `it.next()` from user
-/// source therefore surfaces a clear error rather than silently
-/// returning a stale value.
-struct IterNextStub;
-impl RelonFunction for IterNextStub {
+/// User-callable `Iter.next()` advance primitive — returns the next
+/// element wrapped in `Option.Some { value: ... }`, or `Option.None {}`
+/// once the underlying source is exhausted. The cursor itself lives in
+/// a module-local table (`iter_cursors`); the immutable-`Value`
+/// invariant (`Arc`-shared, no interior mutability) rules out storing
+/// a per-instance cursor inside the dict directly. Implementation log
+/// §C.11 captures the rationale for siting the cursor table here.
+///
+/// Semantic notes:
+/// * Aliased iterators (`Iter<Int> it2: it`) share the same `_id` and
+///   therefore the same cursor — the standard "iterator handle" model.
+///   A user who wants a fresh cursor re-calls `xs.iter()`.
+/// * Returning `Option.None {}` is idempotent: continuing to call
+///   `next()` after exhaustion keeps returning `None`. The cursor
+///   stops advancing once it reaches `len`.
+/// * `Iter.next()` does **not** drive `for x in c: ...` /
+///   `[for x in c: ...]` comprehensions. Those go through
+///   `materialize_iterable` in `eval.rs` which reads `_kind`/`_source`
+///   directly — faster than per-element host-fn dispatch and lets the
+///   comprehension's iteration count stay independent of any prior
+///   `next()` calls on the same `Iter` value.
+struct IterNext;
+impl RelonFunction for IterNext {
     fn call(
         &self,
-        _args: NativeArgs,
+        args: NativeArgs,
         range: relon_parser::TokenRange,
     ) -> Result<Value, RuntimeError> {
-        Err(RuntimeError::UnsupportedOperator(
-            "Iter.next() is reserved for the future user-callable iteration protocol; \
-             use `for x in c: ...` / `[for x in c: ...]` comprehensions instead"
-                .to_string(),
-            range,
-        ))
+        let args = args.into_positional();
+        expect_arg_count(&args, 1, range)?;
+        let iter_dict = expect_dict(&args[0], range)?;
+        if iter_dict.brand.as_deref() != Some("Iter") {
+            return Err(RuntimeError::TypeMismatch {
+                expected: "Iter".to_string(),
+                found: iter_dict
+                    .brand
+                    .clone()
+                    .unwrap_or_else(|| "Dict".to_string()),
+                range,
+            });
+        }
+        let kind = iter_dict
+            .map
+            .get("_kind")
+            .and_then(|v| match v {
+                Value::String(s) => Some(s.as_str()),
+                _ => None,
+            })
+            .ok_or_else(|| RuntimeError::TypeMismatch {
+                expected: "Iter with `_kind` String field".to_string(),
+                found: "Iter without `_kind`".to_string(),
+                range,
+            })?;
+        let source = iter_dict
+            .map
+            .get("_source")
+            .ok_or_else(|| RuntimeError::TypeMismatch {
+                expected: "Iter with `_source` field".to_string(),
+                found: "Iter without `_source`".to_string(),
+                range,
+            })?;
+        let iter_id = iter_dict
+            .map
+            .get("_id")
+            .and_then(|v| match v {
+                Value::Int(i) => Some(*i as u64),
+                _ => None,
+            })
+            .ok_or_else(|| RuntimeError::TypeMismatch {
+                expected: "Iter with `_id` Int field".to_string(),
+                found: "Iter without `_id`".to_string(),
+                range,
+            })?;
+        // Per-kind: compute element-count, then atomically advance the
+        // cursor. `iter_cursor_fetch_and_inc` performs the bounded
+        // check and increment under one critical section so concurrent
+        // advances on the same id remain consistent.
+        let element = match kind {
+            "list" => {
+                let items = match source {
+                    Value::List(l) => l,
+                    other => {
+                        return Err(RuntimeError::TypeMismatch {
+                            expected: "List source for Iter(kind=list)".to_string(),
+                            found: other.type_name().to_string(),
+                            range,
+                        })
+                    }
+                };
+                iter_cursor_fetch_and_inc(iter_id, items.len()).map(|idx| items[idx].clone())
+            }
+            "string" => {
+                let s = match source {
+                    Value::String(s) => s,
+                    other => {
+                        return Err(RuntimeError::TypeMismatch {
+                            expected: "String source for Iter(kind=string)".to_string(),
+                            found: other.type_name().to_string(),
+                            range,
+                        })
+                    }
+                };
+                // Char count, not byte length — `_kind=string` iter is
+                // one element per codepoint. We re-walk the string each
+                // call: O(n) per next(), so a hot loop is O(n²). The
+                // alternative (cache the char vec) is left for a future
+                // optimization — user-driven iteration is a rare path,
+                // and comprehensions take the fast `materialize_iterable`
+                // route.
+                let chars: Vec<char> = s.chars().collect();
+                iter_cursor_fetch_and_inc(iter_id, chars.len())
+                    .map(|idx| Value::String(chars[idx].to_string()))
+            }
+            "dict_entries" => {
+                let src_dict = match source {
+                    Value::Dict(d) => d,
+                    other => {
+                        return Err(RuntimeError::TypeMismatch {
+                            expected: "Dict source for Iter(kind=dict_entries)".to_string(),
+                            found: other.type_name().to_string(),
+                            range,
+                        })
+                    }
+                };
+                // Key-sort each call. Same O(n log n) per `next()` as
+                // the char-vec rebuild above; comprehension fast path
+                // avoids this entirely. Matches the iteration order
+                // used by `materialize_iterable` so user-side
+                // `it.next()` walks pairs in the same order a
+                // `for kv in d.iter()` would.
+                let mut keys: Vec<&String> = src_dict.map.keys().collect();
+                keys.sort();
+                iter_cursor_fetch_and_inc(iter_id, keys.len()).map(|idx| {
+                    let key: &String = keys[idx];
+                    let v = src_dict.map.get(key).cloned().unwrap_or(Value::Null);
+                    Value::list(vec![Value::String(key.clone()), v])
+                })
+            }
+            other => {
+                return Err(RuntimeError::TypeMismatch {
+                    expected: "Iter._kind in {list, string, dict_entries}".to_string(),
+                    found: other.to_string(),
+                    range,
+                })
+            }
+        };
+        Ok(option_value(element))
     }
 }
 
-/// Build an `Iter`-branded dict carrying `_kind` (driver dispatch tag)
-/// and `_source` (the underlying collection value). The Comprehension
-/// evaluator switches on `_kind` to walk `_source` correctly.
+/// Build an `Option.Some { value }` (when `inner` is `Some`) or
+/// `Option.None {}` variant dict. Matches the prelude's `Option<T>`
+/// tagged-enum shape so downstream `match`/projection sees a normal
+/// `Option` value.
+fn option_value(inner: Option<Value>) -> Value {
+    match inner {
+        Some(v) => {
+            let mut map = std::collections::BTreeMap::new();
+            map.insert("value".to_string(), v);
+            Value::variant_dict(map, "Some".to_string(), "Option".to_string())
+        }
+        None => Value::variant_dict(
+            std::collections::BTreeMap::new(),
+            "None".to_string(),
+            "Option".to_string(),
+        ),
+    }
+}
+
+/// Module-local cursor table backing user-callable `Iter.next()`. Keyed
+/// by the `u64` iter-id minted by [`next_iter_id`] at `iter()`
+/// construction time and stamped back into the `Iter`-branded dict as
+/// `_id`. The `Value` graph is immutable (Arc-shared, no interior
+/// mutability), so cursor state must live outside it; co-locating the
+/// table with the iter constructors keeps the entire user-callable
+/// iteration protocol in one file — no trait-extension on
+/// `NativeFnCaps`, no Context-side plumbing, just static state owned
+/// by the Iter builtins.
+///
+/// Lifetime: entries accumulate for the process lifetime. Per-iter
+/// cost is `(u64 id, usize cursor) = 16 bytes`; a script that
+/// constructs N iterators leaks 16·N bytes. Acceptable for typical
+/// short-lived script runs; long-running embeddings that drive many
+/// iterators can rely on the upcoming `Context::iter_cursors`
+/// follow-up (§C.11 roadmap entry) for bounded growth.
+fn iter_cursors() -> &'static Mutex<HashMap<u64, usize>> {
+    static CURSORS: OnceLock<Mutex<HashMap<u64, usize>>> = OnceLock::new();
+    CURSORS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Monotonic id generator paired with [`iter_cursors`]. Each `iter()`
+/// call takes one. Two iterators built concurrently still receive
+/// distinct ids (`fetch_add` is atomic). Wraps at `u64::MAX`, which
+/// is effectively never reached in practice.
+fn next_iter_id() -> u64 {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    // Relaxed: the id is opaque outside cursor lookup; no other
+    // memory operation depends on its publish order.
+    COUNTER.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Atomically read the cursor for `iter_id`, and if it is `< len`,
+/// post-increment it and return the old value. Returns `None` once
+/// the cursor has reached `len` — the iterator is then exhausted
+/// and subsequent calls keep returning `None` (idempotent end-of-iter,
+/// matching `Option::None` semantics from `Iter.next() -> Option<T>`).
+fn iter_cursor_fetch_and_inc(iter_id: u64, len: usize) -> Option<usize> {
+    // Single-lock atomic read-check-increment. Spelled out so the
+    // bounds check and the bump happen under the same critical
+    // section — splitting them would let a concurrent caller observe
+    // a stale "in bounds" reading after the cursor moved.
+    let mut cursors = iter_cursors().lock().unwrap();
+    let cursor = cursors.entry(iter_id).or_insert(0);
+    if *cursor < len {
+        let idx = *cursor;
+        *cursor += 1;
+        Some(idx)
+    } else {
+        None
+    }
+}
+
+/// Build an `Iter`-branded dict carrying `_kind` (driver dispatch tag),
+/// `_source` (the underlying collection value), and `_id` (the
+/// per-construction cursor key consumed by `Iter.next()`). The
+/// Comprehension evaluator (`materialize_iterable` in `eval.rs`) reads
+/// only `_kind`/`_source` and walks the source directly — it does not
+/// advance the cursor table, so user-driven `next()` and a
+/// comprehension over the same iter remain independent.
 pub(crate) fn make_iter_value(kind: &str, source: Value) -> Value {
     let mut map = std::collections::BTreeMap::new();
     map.insert("_kind".to_string(), Value::String(kind.to_string()));
     map.insert("_source".to_string(), source);
+    // `_id` is `i64`-coerced from a `u64` so the existing
+    // `Value::Int(i64)` representation can carry it without inventing
+    // a new variant. `IterNext` reads it back via `as u64` round-trip.
+    map.insert("_id".to_string(), Value::Int(next_iter_id() as i64));
     Value::branded_dict(map, Some("Iter".to_string()))
 }
 

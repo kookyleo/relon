@@ -145,6 +145,48 @@ fn extend_on_builtin_string() {
 }
 
 // ===================================================================
+// Phase J: multi-hop receiver dispatch (`o.customer.greet()` etc.).
+// `check_method_dispatch` and `resolve_call_signature` walk the path
+// prefix via `infer::walk_path` so n>2 chains land on the same
+// schema_methods table as the legacy 2-segment form.
+// ===================================================================
+
+#[test]
+fn multi_hop_dispatch_resolves_method() {
+    let tree = analyze_fixture("schema_methods/multi_hop_dispatch.relon");
+    let errors: Vec<_> = tree
+        .diagnostics
+        .iter()
+        .filter(|d| matches!(d, Diagnostic::UnknownMethod { .. }))
+        .collect();
+    assert!(
+        errors.is_empty(),
+        "expected no UnknownMethod on multi-hop receiver: {:?}",
+        tree.diagnostics
+    );
+    // The synthesized method signature lookup is keyed by `(Schema,
+    // method)`. The multi-hop call still dispatches against
+    // `(User, greet)`, regardless of how many fields preceded it.
+    assert!(tree
+        .method_signatures
+        .contains_key(&("User".to_string(), "greet".to_string())));
+}
+
+#[test]
+fn multi_hop_unknown_method_diagnoses() {
+    let tree = analyze_fixture("schema_methods/multi_hop_unknown_method.relon");
+    let unknown = count(&tree.diagnostics, |d| {
+        matches!(d, Diagnostic::UnknownMethod { schema, method, .. }
+            if schema == "User" && method == "wave")
+    });
+    assert_eq!(
+        unknown, 1,
+        "expected UnknownMethod for User.wave: {:?}",
+        tree.diagnostics
+    );
+}
+
+// ===================================================================
 // Phase C.3: `#derive Constraint` witness shape checking.
 // ===================================================================
 
@@ -268,5 +310,72 @@ fn no_auto_derive_equatable_skips_eq_synthesis() {
     assert!(
         has_to_json,
         "Token didn't opt out of JsonProjectable; to_json should be synthesized"
+    );
+}
+
+// ===================================================================
+// Method-level generics (parser-supported as of the follow-up to
+// schema-rooted-model-2026-05-11 decision 4): `map<U>(...)` etc.
+// flow from parser SchemaMethod.generics into analyzer
+// SchemaMethodInfo.generics into the synthesized FnSignature.generics
+// so the existing `sig::instantiate` machinery binds them at call
+// sites. Carrier `core/list.relon` ships `map<U>` / `reduce<U>` as
+// the canonical examples.
+// ===================================================================
+
+#[test]
+fn core_list_map_carries_method_level_generics() {
+    // Empty source — the core carriers inject themselves regardless.
+    let tree = relon_analyzer::analyze(
+        &relon_parser::parse_document("{}").expect("empty document parses"),
+    );
+    let methods = tree
+        .schema_methods
+        .get("List")
+        .expect("core carrier installs List schema");
+    let map = methods
+        .iter()
+        .find(|m| m.name == "map")
+        .expect("List.map present");
+    assert_eq!(
+        map.generics,
+        vec!["U".to_string()],
+        "List.map declares the U placeholder: {:?}",
+        map.generics
+    );
+    let reduce = methods
+        .iter()
+        .find(|m| m.name == "reduce")
+        .expect("List.reduce present");
+    assert_eq!(reduce.generics, vec!["U".to_string()]);
+    // Monomorphic methods stay empty.
+    let len_ = methods
+        .iter()
+        .find(|m| m.name == "len")
+        .expect("List.len present");
+    assert!(len_.generics.is_empty(), "len has no method-level generics");
+}
+
+#[test]
+fn method_signature_table_propagates_method_generics() {
+    let tree = relon_analyzer::analyze(
+        &relon_parser::parse_document("{}").expect("empty document parses"),
+    );
+    let sig = tree
+        .method_signatures
+        .get(&("List".to_string(), "map".to_string()))
+        .expect("List.map signature synthesized");
+    assert_eq!(
+        sig.generics,
+        vec!["U".to_string()],
+        "synthesized signature carries method-level generics: {:?}",
+        sig.generics
+    );
+    // Schema-level T must *not* be re-declared on the method signature
+    // — it's bound by the receiver's concrete type at dispatch time.
+    assert!(
+        !sig.generics.iter().any(|g| g == "T"),
+        "schema-level T should not appear in method signature.generics: {:?}",
+        sig.generics
     );
 }

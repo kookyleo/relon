@@ -551,3 +551,236 @@ b. Dict + Dict 命中 → 先 `try_arith_op_method`，无 witness 才走
 constraint 从「shape-check only」推进到「lowering 完成」，主文档
 「operator lowering」节应同步列入 +、-、*、/、% 的 method 名。
 
+### C.10：多段 receiver dispatch（`o.customer.greet()`）
+2026-05-11 / Phase C / `crates/relon-analyzer/src/typecheck.rs` +
+`crates/relon-evaluator/src/eval.rs`
+
+**问题**：决策 12 起的 schema-rooted dispatch 在 analyzer 端
+`check_method_dispatch` / `resolve_call_signature` 末尾的 schema-
+method 分支、evaluator 端 `try_call_schema_method`，都硬性写
+`path.len() == 2`，只识别 `value.method(...)` / `Schema.method(...)`
+两种 2-segment 形态。3 段及以上的 `o.customer.greet()` 走不到
+schema_methods 查表——analyzer 直接 `return`，evaluator 也直接
+`Ok(None)` → 上层 `FunctionNotFound`。roadmap.md §J 把它显式记为
+「3-segment 需要 path-tail 推断与 receiver 解耦」。怎么破？候选：
+
+1. 在 `check_method_dispatch` 里特化 path.len() == 3 / 4 / ...
+   每个长度分别处理。
+2. 用 `infer::walk_path(path[..-1], scope)` 一把推 prefix 到
+   `InferredType::Schema(name)`，最后段做 method 查表。evaluator
+   端镜像形态：`resolve_variable(path[..-1])` 拿 value，
+   `value_schema_tag(value)` 拿 brand，最后段做 method dispatch。
+3. 把 dispatch 抽成 Expr 上的 method-call variant（让 parser 产生
+   独立 AST 节点），analyzer / evaluator 都不用走 path 分支。
+
+**选择**：方案 2。
+
+**理由**：
+- 方案 1 长度爆炸，且每个 case 与 2-seg 的逻辑只差「prefix 怎么
+  推到 schema」一处——重复成本远超共享成本。
+- 方案 3 是「语言层重构」级别的改动，需要 parser / AST / formatter /
+  IDE 全栈跟随，跟「填一个 TODO」的 scope 完全不匹配。也不符合主
+  agent「不引入新 Expr variant」的边界。
+- 方案 2 顺着 v1.4 path-tail walker 已经服役的形态走：
+  - analyzer：`walk_path` 已经处理 Schema field → field type 的递
+    归下钻、Optional 拨皮、Dict 的 value-type、Tuple positional
+    等所有形态，spread / strict-mode 等模块都在用同一个 driver；
+    把 method dispatch 接上去就是「再添一个 consumer」。
+  - evaluator：`resolve_variable` 已经支持任意长度 path（dict /
+    list 下钻、optional 拨皮、动态 key），`try_call_schema_method`
+    在 2-seg 形态下已经从 `scope.get_local(head)` 取 value——把
+    它升级成 `resolve_variable(prefix)` 是最小代码 delta。
+- side-effect：head 是 sibling closure / aliased import 的「让规
+  则签名检查兜底」逻辑只对 2-seg 仍有意义（3+ seg 时这些表都没
+  有「nested fields」概念），所以保留 `path.len() == 2` 时的早
+  退分支，3+ seg 直接走 path-walk authoritative。
+
+**evaluator 端 prefix 解析失败的处理**：`resolve_variable(prefix)`
+失败（typo head、缺字段……）时，返回 `Ok(None)` 让上层
+`call_function` 走 `FunctionNotFound`，**不** 当场抛 prefix 的
+`VariableNotFound`。理由：
+
+- 用户写 `o.typo_field.method()` 时，prefix 推断失败已经在
+  analyzer 端通过 `UnresolvedReference` / `UnknownMethod` 兜底报
+  过；evaluator 撞到错误时再多一份「method not found」反而对用
+  户更友好（一次顶层 path-level 错误比深层 field-walk 错误更易
+  排查）。
+- 与 2-seg「receiver 不在 scope」时已经 `return Ok(None)` 的回退
+  语义一致——同一个分发函数对「找不到 receiver」的两种长度形态
+  给同样的契约（让 caller 决定生 `FunctionNotFound`）。
+
+**静态 `Schema.method` 分支限制为 2-seg**：multi-hop 形态下，
+`Order.User.greet` 这种 prefix 不会是「找一个静态 schema 名」——
+prefix 必然要 resolve 到一个 runtime value 才能拿 brand。所以静
+态分支只在 `path.len() == 2` 时进入，这是从语义而非便利出发的硬
+约束。
+
+**动态 key 在 prefix 中是否支持**：当前不需要特殊处理。
+`resolve_variable` 已经处理 `TokenKey::Dynamic`（运行时求值后当
+key 用），但 analyzer 端 `walk_path` 把 Dynamic step 当 Name step
+看——这对 `Dict<K, V>` 形态返回 value-type，对 Schema 形态会
+unknown-step。语义上「`m[key].method()` 推不到 schema」就静默
+fallback 到 `FunctionNotFound`（runtime 端 `resolve_variable` 跑
+通，但 `value_schema_tag` 拿不到目标 schema 也 fallback）——和
+2-seg 同样的契约，无新行为。
+
+**测试**：4 个新测试。
+- 2 个 analyzer fixture + 测试（`multi_hop_dispatch.relon` 正向、
+  `multi_hop_unknown_method.relon` UnknownMethod 反向）。
+- 2 个 evaluator 端 e2e 测试：
+  - `multi_hop_schema_method_dispatches_through_field`：
+    `o.customer.greet()` 走 prefix 解析 + brand → User.greet。
+  - `multi_hop_schema_method_with_arg`：multi-hop + 非空 arg 列
+    表，验证 `invoke_method_body` 的 arg-binding 在 multi-hop 前
+    缀下不变。
+
+**回流**：是。roadmap.md §J「多段 method dispatch」从「TODO」推
+进到「已落地」；主文档 dispatch 章节末尾应补一句「path n>2 走
+walk_path 推 prefix 到 Schema，behavior 与 2-seg 等价」。
+
+
+### C.11：user-callable `Iter.next()` 的 cursor 承载方案
+2026-05-11 / Phase D 收尾 / `crates/relon-evaluator/src/stdlib.rs`
+
+**问题**：C.9 把 `Iter.next()` 留成 stub（返回
+`RuntimeError::UnsupportedOperator`），Comprehension 走
+`materialize_iterable` 旁路。用户写 `let first = it.next()` 还是
+拿不到迭代器协议。本批次的目标是把这条「user-callable next」补
+上。难点回到 C.9 已经辨认过的核心矛盾：`Value` 不可变（`Arc`
+共享，无 interior mutability），cursor 没法放进 Value 内部；放
+外面又得有个状态承载点。
+
+**选择**：把 cursor 表放在 stdlib.rs 的 module-local static
+（`OnceLock<Mutex<HashMap<u64, usize>>>`），iter id 由 module-local
+`AtomicU64` 分配。`iter()` 构造时 stamp 一个 `_id` 字段到
+`Iter`-branded dict 上；`next()` 读 `_id` 查表推 cursor。
+
+**理由**：候选三选项的对比——
+
+1. **(A) Context-side cursor 表 + NativeFnCaps trait 扩展**：
+   cleaner——cursor 生命周期跟 Context 走，`eval_root`/`run_main`
+   末尾 clear；多 Evaluator 之间互不干扰；测试可观测。但需要：
+   - `Context` 加 `iter_cursors: Mutex<HashMap<u64, usize>>` +
+     `iter_id_counter: AtomicU64`；
+   - `NativeFnCaps` 加两条 default-method（`allocate_iter_id` +
+     `iter_cursor_fetch_and_inc`），`EvaluatorCaps` 覆写；
+   - `make_iter_value` 拿 `&dyn NativeFnCaps` 参数。
+   触动 `native_fn.rs`（trait 公开 API）+ `eval.rs`（Context 字段 +
+   EvaluatorCaps impl），活动范围溢出本批次的 stdlib-only 任务边界。
+
+2. **(B) Value 内部带 `Arc<AtomicUsize>` 的特殊变体**：在 `Value`
+   enum 加 `IterCursor(Arc<AtomicUsize>)`。但动 `Value` enum 是大
+   面积破坏（`PartialEq` / `Serialize` / 各 match 站点全要补），与
+   C.9 的「Iter 是 inert 容器」哲学也冲突。
+
+3. **(C) 当前选项：stdlib-local static**：cursor 表与 iter
+   builtin 共处一文件；id 从 module-local `AtomicU64` 取；表本身
+   是 `OnceLock<Mutex<HashMap<u64, usize>>>`。代价：
+   - 进程生命周期内不释放（每个 iter() 留 16B：`(u64, usize)`），
+     短脚本可接受，长跑 host 是已知 leak；
+   - 跨 Context 共享同一张表（id 唯一性靠全局 `AtomicU64` 保证，
+     不撞车，但表本身全局）。
+   收益：完全不触 `native_fn.rs` / `eval.rs`，整个 user-callable
+   iteration protocol 全部落在 stdlib.rs 一个文件，PR scope 小到
+   只剩单文件 + 测试。
+
+选 (C) 作为本批次的实装，把 (A) 列为 §J roadmap entry「`Iter.next()`
+cursor table 升级到 Context-bound 生命周期」的未来工作 —— 接口收口
+之后回流（届时再补 NativeFnCaps 扩展）。
+
+形态细节：
+- `Iter`-branded dict 字段新增 `_id: Value::Int(i64)` —— `u64` 用
+  `as i64` 二进制转回（`IterNext` 端再 `as u64` 回去），不动
+  `Value::Int(i64)` 既有签名。
+- `next()` 返回 `Option.Some { value: T }` / `Option.None {}` 的
+  `Value::variant_dict`（prelude `Option<T>` 形状）；exhaustion 后
+  幂等返回 `None`，cursor 永不回退。
+- Comprehension fast path（`materialize_iterable`）**不读** `_id`、
+  **不动** cursor 表 —— 保证 user-side `it.next()` 与
+  `[for x in it: ...]` 互相独立，不会因 comprehension 把 cursor
+  推过头让后续 `next()` 直接拿到 `None`。
+- String / Dict 的每次 `next()` 当前重建 `chars` / sorted keys
+  vec —— O(n) per call。优化（缓存解 vec）留给 follow-up；
+  comprehension 走 fast path 不受影响。
+
+**测试**：3 个 evaluator test 覆盖三种 kind：
+- `iter_next_on_list_walks_through_then_returns_none`：3 个元素
+  + 1 次 over-run，断言每次 `Some / None` 形态正确。
+- `iter_next_on_string_advances_per_codepoint`：UTF-8 边界 + 末尾
+  `None` 幂等。
+- `iter_next_on_dict_yields_key_sorted_entries`：dict 乱序 insert
+  后 `next()` 仍按 key-sorted 出对，与 `materialize_iterable` 同
+  规约。
+
+**回流**：是。roadmap.md §J「`Iter.next()` 升级到 Context-bound
+cursor 表」新增 TODO（当前是 stdlib-local static 的过渡实装）；
+主文档「21 Iterable」章节末尾「next() 是 stub」一句改为「next()
+是 host 实装，cursor 走 stdlib-local static（升级到 Context-bound
+是 §J follow-up）」。
+
+
+### C.12：方法级 generics 解析（载体 vs stdlib_signatures 单源化）
+2026-05-11 / Phase C / `crates/relon-parser/src/directive.rs` + `token.rs`
++ `crates/relon-analyzer/src/schema.rs` + `extend.rs` + `core/list.relon`
+
+**问题**：C.8 让 `core/list.relon` 充当 List/Dict/Iter method 的「dispatch
+载体」，但 parser 当时不支持方法级 generics（`map<U>(...)`），载体
+被迫退化为 `map(f: Closure) -> List<T>`——signature 真相落在
+`stdlib_signatures.rs::_list_map<T, U>(...)`。一个 name 注册在 carrier，
+一个 generic 化的真签名活在另一处，是双源。要清掉这条 TODO，把
+方法级 generics 也接上 parser → analyzer → FnSignature.generics 这条链。
+
+**选择**：parser 接受可选的 `name<T1, T2, ...>(params)` 语法，复用现有
+schema-level `parse_generic_param_list` helper；analyzer
+`SchemaMethodInfo` 增 `generics: Vec<String>` 字段，
+`method_info_from_parser` 复制过来；`extend.rs::synthesize_method_signature`
+把它接到 `FnSignature.generics`；carrier `core/list.relon` 升级回真泛型
+`map<U>(f: Closure<T, U>) -> List<U>` 等签名。
+
+**理由**：
+- 复用 schema-level 已有的 `parse_generic_param_list` 让 parser 改动
+  最小（一个 try-parse + 一个新字段），不引入新 grammar 规则。
+- `FnSignature.generics` 早就存在（v1.1 通用机制），载体侧填进
+  method 的 generics 后，现有 `sig::instantiate` 直接复用——零额外
+  inference 逻辑。
+- 单一真理源：method-form dispatch (`lst.map(f)`) 现在从 carrier 拿
+  签名，free-fn `_list_map(list, f)` 继续从 `stdlib_signatures` 拿——
+  两个 dispatch path 各有独立的 signature carrier，互不重叠，不再
+  「同一信息写两次」。
+
+**schema-level vs method-level generics 同名怎么办**：当前不查重。
+若用户写 `List<T> with { foo<T>(...) ... }`，parser 不报错，analyzer
+不报错——`foo` 的 `T` 在 method scope 内 shadow 掉 schema 的 `T`。
+设计上方法 generics 是 method body 内可见的占位符；外层 schema 的 `T`
+绑到 receiver 类型，方法 generic 的 `T` 是 fresh placeholder。这两者
+在 `instantiate` 里是独立 binding key——key 撞了的话，substitution
+顺序是先把 receiver schema T 套进 method 的 `params/return_type`
+（在 `resolve_call_signature` 里），再把方法 generic 的 T 让
+`instantiate` 绑到具体类型。但因为是同名 key，前一步会把 receiver T
+当成方法 generic T 一并替换掉，导致语义混乱。短期可接受（这种命名
+违反一般编码规范，用户不会真正这么写）；后续 follow-up 可以在
+`build_method_signature_table` 处加一个 warning diagnostic
+「method generic shadows schema generic」。
+
+**stdlib_signatures.rs 清理**：扫了一遍，没有「method-only」重复的条目
+——`_list_map` 这些是 free-fn dispatch 的真签名，与载体 `List.map` 走
+**不同**的 lookup path（一个查 stdlib_signatures，一个查 schema_methods）。
+都保留，没有冗余可清。
+
+**测试**：3 个新测试 + 1 个 fixture。
+- parser 端 `method_with_generics_parses`：fixture
+  `with_block/method_with_generics.relon` 包含
+  `map<U>(...) -> List<U>` + `reduce<U>(...) -> U` + 单态 `same()`，
+  断言 SchemaMethod.generics 字段被正确填充。
+- analyzer 端 `core_list_map_carries_method_level_generics`：空
+  document，验证 carrier 注入的 List.map.generics 为 `["U"]`。
+- analyzer 端 `method_signature_table_propagates_method_generics`：
+  验证 FnSignature.generics 被 `synthesize_method_signature` 接住，
+  且 schema-level T 没被错误地复制进 method signature 的 generics
+  列表。
+
+**回流**：是。主文档决策 4 那块「parser 改动：method generics 当前
+不支持，stdlib_signatures 兜底」一句应改为「parser 支持方法级
+generics；载体即真签名」。stdlib_signatures.rs 的注释「The carrier
+here is just the dispatch shell」也已经在 list.relon 里替换为
+「The carrier is the single source of truth」。

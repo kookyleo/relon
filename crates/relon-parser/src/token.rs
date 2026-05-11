@@ -221,6 +221,12 @@ pub struct SchemaMethod {
     /// Method name (the `name` in `name(...) -> R`).
     pub name: String,
     pub name_range: TokenRange,
+    /// Method-level generic type parameter names (e.g. `["U"]` for
+    /// `map<U>(...)`). Empty for monomorphic methods. Each occurrence
+    /// inside `params[i].type_node` or `return_type` is a placeholder
+    /// instantiated at the call site, on top of any schema-level
+    /// placeholders already in scope.
+    pub generics: Vec<String>,
     /// Typed parameters as written; `self` is implicit and is added by
     /// the analyzer when lowering.
     pub params: Vec<SchemaMethodParam>,

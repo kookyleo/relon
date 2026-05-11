@@ -429,6 +429,10 @@ fn synthesize_auto_method(target: &ExpectedWitness) -> SchemaMethodInfo {
     SchemaMethodInfo {
         name: target.method.to_string(),
         name_range: relon_parser::TokenRange::default(),
+        // Auto-derived witnesses (`eq`, `to_json`) are monomorphic;
+        // schema-level generics flow in through the receiver type at
+        // dispatch time, no method-level placeholders needed.
+        generics: Vec::new(),
         params,
         return_type: type_node_simple(target.return_type),
         body_node: None,

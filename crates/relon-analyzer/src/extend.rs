@@ -166,7 +166,14 @@ fn synthesize_method_signature(schema: &str, method: &SchemaMethodInfo) -> FnSig
         .collect();
     FnSignature {
         name: format!("{schema}.{}", method.name),
-        generics: Vec::new(),
+        // Method-level generics (e.g. `map<U>` on `List<T>`) flow
+        // through here so the existing `sig::instantiate` machinery
+        // can bind them at the call site. Schema-level generics
+        // (the `T` on `List<T>`) are *not* duplicated — they're
+        // bound by the receiver type when `resolve_call_signature`
+        // walks the path, and re-adding them here would shadow
+        // those bindings with fresh placeholders.
+        generics: method.generics.clone(),
         params,
         return_type: method.return_type.clone(),
         variadic_tail: None,

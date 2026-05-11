@@ -1,0 +1,17 @@
+// Multi-hop schema-rooted dispatch: a 3-segment FnCall path
+// (`o.customer.greet()`) walks the prefix `o.customer` through the
+// inference engine, lands on `Schema("User")`, and resolves the last
+// segment as a method on that schema. The 2-segment receiver form is
+// the legacy case; this fixture pins the n>2 generalization.
+#schema User {
+    String name: *
+} with {
+    greet() -> String: f"hello ${self.name}"
+}
+
+#schema Order {
+    User customer: *
+}
+
+#main(Order o)
+{ String s: o.customer.greet() }

@@ -4,18 +4,19 @@
 // `join` lives on List because the receiver is the list of strings, not
 // the separator — see the rationale in `stdlib.rs::register_to`.
 //
-// Encoding note: the parser does not support method-level generics
-// (`map<U>(...)`); the analyzer's stdlib-signatures table
-// (`relon-analyzer/src/stdlib_signatures.rs::_list_map`) carries the
-// real generic-aware signature. The carrier here is just the dispatch
-// shell — its `Closure` slot is single-segment so the parser accepts
-// it, and the typechecker keeps using the stdlib-signature variant for
-// argument inference. Mirrors the role of `register_pure_method` on
-// the runtime side: name registration only, not signature truth.
+// Method-level generics (`map<U>`, `reduce<U>`) flow through the parser,
+// the analyzer's `SchemaMethodInfo.generics`, and the synthesized
+// `FnSignature.generics` (see extend.rs:synthesize_method_signature).
+// The carrier is the single source of truth for these polymorphic
+// signatures — there is no parallel `_list_map` / `_list_reduce`
+// shadow signature backing the method-form dispatch. The
+// stdlib-signatures table still owns the *free-fn* form
+// (`_list_map(list, f)`), because that call path doesn't go through
+// `schema_methods` at all.
 #schema List<T> with {
-    #native map(f: Closure) -> List<T>
-    #native filter(f: Closure) -> List<T>
-    #native reduce(init: T, f: Closure) -> T
+    #native map<U>(f: Closure<T, U>) -> List<U>
+    #native filter(f: Closure<T, Bool>) -> List<T>
+    #native reduce<U>(init: U, f: Closure<U, T, U>) -> U
     #native contains(x: T) -> Bool
     #native join(sep: String) -> String
     #native len() -> Int

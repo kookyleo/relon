@@ -4493,6 +4493,93 @@ fn schema_method_with_arg_dispatches() {
     assert_eq!(d.map.get("total"), Some(&Value::Int(150)));
 }
 
+#[test]
+fn multi_hop_schema_method_dispatches_through_field() {
+    // Phase J: a 3-segment FnCall path (`o.customer.greet()`) resolves
+    // the receiver by walking `path[..-1]` through `resolve_variable`,
+    // reads its auto-brand (`User`), and dispatches the trailing
+    // method against `User`'s table. The 2-segment forms above already
+    // cover the legacy receiver shape; this test pins the multi-hop
+    // generalization end-to-end (analyzer + evaluator).
+    use std::collections::{BTreeMap, HashMap};
+    let source = r#"#schema User {
+    String name: *
+} with {
+    greet() -> String: f"hello ${self.name}"
+}
+#schema Order {
+    User customer: *
+}
+#main(Order o)
+{ String s: o.customer.greet() }"#;
+    let node = parse_doc(source);
+    let analyzed = std::sync::Arc::new(relon_analyzer::analyze(&node));
+    let errors: Vec<_> = analyzed
+        .diagnostics
+        .iter()
+        .filter(|d| d.severity() == relon_analyzer::Severity::Error)
+        .collect();
+    assert!(errors.is_empty(), "analyzer errors: {:?}", errors);
+
+    let mut customer = BTreeMap::new();
+    customer.insert("name".to_string(), Value::String("Alice".to_string()));
+    let mut order = BTreeMap::new();
+    order.insert("customer".to_string(), Value::dict(customer));
+    let mut args: HashMap<String, Value> = HashMap::new();
+    args.insert("o".to_string(), Value::dict(order));
+    let ctx = Context::new()
+        .with_root(node.clone())
+        .with_analyzed(std::sync::Arc::clone(&analyzed));
+    let result = Evaluator::new(std::sync::Arc::new(ctx))
+        .run_main(&std::sync::Arc::new(Scope::default()), args)
+        .unwrap();
+    let Value::Dict(d) = result else { panic!() };
+    assert_eq!(
+        d.map.get("s"),
+        Some(&Value::String("hello Alice".to_string()))
+    );
+}
+
+#[test]
+fn multi_hop_schema_method_with_arg() {
+    // Multi-hop receiver + non-empty arg list — exercises the
+    // `invoke_method_body` arg-binding path with a non-trivial
+    // prefix walk in front. The receiver is resolved via
+    // `resolve_variable` (not the legacy 2-segment local lookup),
+    // so the auto-brand on the nested `customer` field is what
+    // drives `value_schema_tag` → `"User"`.
+    use std::collections::{BTreeMap, HashMap};
+    let source = r#"#schema User {
+    String name: *
+} with {
+    greet(suffix: String) -> String: f"hello ${self.name}${suffix}"
+}
+#schema Order {
+    User customer: *
+}
+#main(Order o)
+{ String s: o.customer.greet("!") }"#;
+    let node = parse_doc(source);
+    let analyzed = std::sync::Arc::new(relon_analyzer::analyze(&node));
+    let mut customer = BTreeMap::new();
+    customer.insert("name".to_string(), Value::String("Bob".to_string()));
+    let mut order = BTreeMap::new();
+    order.insert("customer".to_string(), Value::dict(customer));
+    let mut args: HashMap<String, Value> = HashMap::new();
+    args.insert("o".to_string(), Value::dict(order));
+    let ctx = Context::new()
+        .with_root(node.clone())
+        .with_analyzed(std::sync::Arc::clone(&analyzed));
+    let result = Evaluator::new(std::sync::Arc::new(ctx))
+        .run_main(&std::sync::Arc::new(Scope::default()), args)
+        .unwrap();
+    let Value::Dict(d) = result else { panic!() };
+    assert_eq!(
+        d.map.get("s"),
+        Some(&Value::String("hello Bob!".to_string()))
+    );
+}
+
 // ===================================================================
 // Phase D 收尾: stdlib intrinsics registered as schema-rooted methods.
 // `register_pure_method("String", "upper", ...)` etc. — the same
@@ -5189,4 +5276,199 @@ fn user_schema_iterable_shape_accepted_by_analyzer() {
         methods.iter().any(|m| m.name == "iter"),
         "user iter() method recorded: {methods:?}"
     );
+}
+
+/// Schema-rooted decision 21 follow-up (§C.11 in
+/// `schema-rooted-implementation-log.md`): user-callable
+/// `Iter.next()`. The host stamps a fresh cursor id into every
+/// `iter()` value; `next()` reads the id, advances the table, and
+/// returns `Option.Some { value: T } | Option.None {}`.
+///
+/// This test binds an iter, drives it past the end, and asserts each
+/// `next()` returns the expected variant. The bindings live in the
+/// same dict so the test exercises the sibling-thunk lookup path
+/// (`scope.get_local("it")`) inside the receiver-dispatch arm of
+/// `try_call_schema_method`.
+#[test]
+fn iter_next_on_list_walks_through_then_returns_none() {
+    use std::collections::HashMap;
+    // `Iter<T>` lives in the analyzer's core schema set as a method
+    // table, but it isn't bound as a user-facing `Value::Schema` (the
+    // core carrier intentionally avoids exporting names; see
+    // `core_schemas::merge_core_into`). So we let the iter bindings
+    // be inferred — the dispatch path keys off the value's brand
+    // (`"Iter"`), not the declared field type.
+    let source = r#"#main(List<Int> xs)
+{
+    "it": xs.iter(),
+    "first": it.next(),
+    "second": it.next(),
+    "third": it.next(),
+    "fourth": it.next()
+}"#;
+    let node = parse_doc(source);
+    let analyzed = std::sync::Arc::new(relon_analyzer::analyze(&node));
+    let errors: Vec<_> = analyzed
+        .diagnostics
+        .iter()
+        .filter(|d| d.severity() == relon_analyzer::Severity::Error)
+        .collect();
+    assert!(errors.is_empty(), "analyzer errors: {:?}", errors);
+    let mut args: HashMap<String, Value> = HashMap::new();
+    args.insert(
+        "xs".to_string(),
+        Value::list(vec![Value::Int(10), Value::Int(20), Value::Int(30)]),
+    );
+    let ctx = Context::new()
+        .with_root(node.clone())
+        .with_analyzed(std::sync::Arc::clone(&analyzed));
+    let result = Evaluator::new(std::sync::Arc::new(ctx))
+        .run_main(&std::sync::Arc::new(Scope::default()), args)
+        .unwrap();
+    let Value::Dict(d) = result else { panic!() };
+    let assert_some = |key: &str, expected: i64| {
+        let Value::Dict(opt) = d.map.get(key).unwrap_or_else(|| panic!("{key} missing")) else {
+            panic!("{key} not a dict");
+        };
+        assert_eq!(opt.brand.as_deref(), Some("Some"), "{key} variant");
+        assert_eq!(opt.variant_of.as_deref(), Some("Option"), "{key} enum_of");
+        assert_eq!(
+            opt.map.get("value"),
+            Some(&Value::Int(expected)),
+            "{key} payload"
+        );
+    };
+    let assert_none = |key: &str| {
+        let Value::Dict(opt) = d.map.get(key).unwrap_or_else(|| panic!("{key} missing")) else {
+            panic!("{key} not a dict");
+        };
+        assert_eq!(opt.brand.as_deref(), Some("None"), "{key} variant");
+        assert_eq!(opt.variant_of.as_deref(), Some("Option"), "{key} enum_of");
+        assert!(opt.map.is_empty(), "{key} payload should be empty");
+    };
+    assert_some("first", 10);
+    assert_some("second", 20);
+    assert_some("third", 30);
+    assert_none("fourth");
+}
+
+/// `String.iter()` yields one element per codepoint; `next()` should
+/// walk them in order then return `None`. Mirrors the comprehension
+/// test (`comprehension_over_string_iter`) but exercises the
+/// host-callable `next()` path.
+#[test]
+fn iter_next_on_string_advances_per_codepoint() {
+    use std::collections::HashMap;
+    let source = r#"#main(String s)
+{
+    "it": s.iter(),
+    "first": it.next(),
+    "second": it.next(),
+    "third": it.next(),
+    "fourth": it.next()
+}"#;
+    let node = parse_doc(source);
+    let analyzed = std::sync::Arc::new(relon_analyzer::analyze(&node));
+    let errors: Vec<_> = analyzed
+        .diagnostics
+        .iter()
+        .filter(|d| d.severity() == relon_analyzer::Severity::Error)
+        .collect();
+    assert!(errors.is_empty(), "analyzer errors: {:?}", errors);
+    let mut args: HashMap<String, Value> = HashMap::new();
+    args.insert("s".to_string(), Value::String("ab".to_string()));
+    let ctx = Context::new()
+        .with_root(node.clone())
+        .with_analyzed(std::sync::Arc::clone(&analyzed));
+    let result = Evaluator::new(std::sync::Arc::new(ctx))
+        .run_main(&std::sync::Arc::new(Scope::default()), args)
+        .unwrap();
+    let Value::Dict(d) = result else { panic!() };
+    let read_some_string = |key: &str| -> String {
+        let Value::Dict(opt) = d.map.get(key).unwrap_or_else(|| panic!("{key} missing")) else {
+            panic!("{key} not a dict");
+        };
+        assert_eq!(opt.brand.as_deref(), Some("Some"), "{key} should be Some");
+        match opt.map.get("value") {
+            Some(Value::String(s)) => s.clone(),
+            other => panic!("{key} payload not String: {other:?}"),
+        }
+    };
+    let assert_none = |key: &str| {
+        let Value::Dict(opt) = d.map.get(key).unwrap_or_else(|| panic!("{key} missing")) else {
+            panic!("{key} not a dict");
+        };
+        assert_eq!(opt.brand.as_deref(), Some("None"), "{key} should be None");
+    };
+    assert_eq!(read_some_string("first"), "a");
+    assert_eq!(read_some_string("second"), "b");
+    assert_none("third");
+    assert_none("fourth");
+}
+
+/// `Dict.iter()` yields key-sorted `(K, V)` pairs as 2-element lists.
+/// `next()` should produce them in the same order
+/// `materialize_iterable` would walk so user-driven and comprehension
+/// iteration over the same dict agree on order.
+#[test]
+fn iter_next_on_dict_yields_key_sorted_entries() {
+    use std::collections::{BTreeMap, HashMap};
+    let source = r#"#main(Dict<String, Int> d)
+{
+    "it": d.iter(),
+    "first": it.next(),
+    "second": it.next(),
+    "third": it.next()
+}"#;
+    let node = parse_doc(source);
+    let analyzed = std::sync::Arc::new(relon_analyzer::analyze(&node));
+    let errors: Vec<_> = analyzed
+        .diagnostics
+        .iter()
+        .filter(|d| d.severity() == relon_analyzer::Severity::Error)
+        .collect();
+    assert!(errors.is_empty(), "analyzer errors: {:?}", errors);
+    let mut dmap = BTreeMap::new();
+    // Insert out of alphabetic order; the iter should still emit
+    // them sorted (matches `materialize_iterable`'s `keys.sort()`).
+    dmap.insert("b".to_string(), Value::Int(2));
+    dmap.insert("a".to_string(), Value::Int(1));
+    let mut args: HashMap<String, Value> = HashMap::new();
+    args.insert("d".to_string(), Value::dict(dmap));
+    let ctx = Context::new()
+        .with_root(node.clone())
+        .with_analyzed(std::sync::Arc::clone(&analyzed));
+    let result = Evaluator::new(std::sync::Arc::new(ctx))
+        .run_main(&std::sync::Arc::new(Scope::default()), args)
+        .unwrap();
+    let Value::Dict(d) = result else { panic!() };
+    let read_some_pair = |key: &str| -> (String, i64) {
+        let Value::Dict(opt) = d.map.get(key).unwrap_or_else(|| panic!("{key} missing")) else {
+            panic!("{key} not a dict");
+        };
+        assert_eq!(opt.brand.as_deref(), Some("Some"), "{key} should be Some");
+        let Value::List(items) = opt.map.get("value").expect("payload missing") else {
+            panic!("{key} payload not List");
+        };
+        assert_eq!(items.len(), 2, "{key} payload should be 2-tuple");
+        let k = match &items[0] {
+            Value::String(s) => s.clone(),
+            other => panic!("{key} key not String: {other:?}"),
+        };
+        let v = match &items[1] {
+            Value::Int(n) => *n,
+            other => panic!("{key} value not Int: {other:?}"),
+        };
+        (k, v)
+    };
+    let assert_none = |key: &str| {
+        let Value::Dict(opt) = d.map.get(key).unwrap_or_else(|| panic!("{key} missing")) else {
+            panic!("{key} not a dict");
+        };
+        assert_eq!(opt.brand.as_deref(), Some("None"), "{key} should be None");
+    };
+    // Key-sorted: "a" before "b".
+    assert_eq!(read_some_pair("first"), ("a".to_string(), 1));
+    assert_eq!(read_some_pair("second"), ("b".to_string(), 2));
+    assert_none("third");
 }

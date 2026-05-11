@@ -88,6 +88,13 @@ pub struct SchemaMethodInfo {
     pub name: String,
     /// Range of the method-name token (for LSP hover / diagnostics).
     pub name_range: TokenRange,
+    /// Method-level generic type parameter names (e.g. `["U"]` for
+    /// `map<U>(...)`). Empty for monomorphic methods. These get spliced
+    /// into the synthesized `FnSignature.generics` so the existing
+    /// `instantiate` machinery in `sig.rs` can bind them at the call
+    /// site — schema-level generics already in scope come from the
+    /// `SchemaDef.generics` field on the owning schema.
+    pub generics: Vec<String>,
     /// Method parameters as declared (excluding the implicit `self`).
     pub params: Vec<SchemaMethodParamInfo>,
     /// Declared return type (`-> R` slot).
@@ -394,6 +401,7 @@ pub fn method_info_from_parser(m: &relon_parser::SchemaMethod) -> SchemaMethodIn
     SchemaMethodInfo {
         name: m.name.clone(),
         name_range: m.name_range,
+        generics: m.generics.clone(),
         params: m
             .params
             .iter()

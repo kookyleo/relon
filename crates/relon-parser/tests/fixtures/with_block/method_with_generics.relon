@@ -1,0 +1,11 @@
+// Method-level generics: `map<U>(...)` on a generic schema `List<T>`.
+// Exercises: method-name followed by an angle-bracketed type-param list,
+// `Closure<T, U>` (positional — last generic is the return slot)
+// referencing both the schema-level `T` and the method-level `U`,
+// return type `List<U>` carrying the method's own placeholder.
+#schema List<T> with {
+    #native map<U>(f: Closure<T, U>) -> List<U>
+    #native reduce<U>(init: U, f: Closure<U, T, U>) -> U
+    same() -> Self: self
+}
+{}

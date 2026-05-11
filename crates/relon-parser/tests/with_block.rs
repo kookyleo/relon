@@ -178,6 +178,48 @@ fn self_param_self_return_parses() {
 }
 
 #[test]
+fn method_with_generics_parses() {
+    let root = parse_or_panic("method_with_generics");
+    let body = first_schema_namebody(&root);
+    let DirectiveBody::NameBody {
+        generics, methods, ..
+    } = body
+    else {
+        panic!("expected NameBody");
+    };
+    // Schema-level generics survive.
+    assert_eq!(generics, &vec!["T".to_string()]);
+    // Three methods declared: `map<U>`, `reduce<U>`, monomorphic `same`.
+    assert_eq!(methods.len(), 3);
+
+    let map = &methods[0];
+    assert_eq!(map.name, "map");
+    assert!(map.is_native);
+    assert_eq!(map.generics, vec!["U".to_string()]);
+    assert_eq!(map.params.len(), 1);
+    assert_eq!(map.params[0].name, "f");
+    assert_eq!(map.params[0].type_node.path, vec!["Closure".to_string()]);
+    // Return type `List<U>` — single-segment path with one generic arg.
+    assert_eq!(map.return_type.path, vec!["List".to_string()]);
+    assert_eq!(map.return_type.generics.len(), 1);
+    assert_eq!(map.return_type.generics[0].path, vec!["U".to_string()]);
+
+    let reduce = &methods[1];
+    assert_eq!(reduce.name, "reduce");
+    assert!(reduce.is_native);
+    assert_eq!(reduce.generics, vec!["U".to_string()]);
+    assert_eq!(reduce.params.len(), 2);
+    assert_eq!(reduce.params[0].name, "init");
+    assert_eq!(reduce.params[0].type_node.path, vec!["U".to_string()]);
+    assert_eq!(reduce.return_type.path, vec!["U".to_string()]);
+
+    // Monomorphic methods keep an empty `generics` list.
+    let same = &methods[2];
+    assert_eq!(same.name, "same");
+    assert!(same.generics.is_empty());
+}
+
+#[test]
 fn multi_param_method_parses() {
     let root = parse_or_panic("multi_param_method");
     let body = first_schema_namebody(&root);

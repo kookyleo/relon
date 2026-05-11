@@ -802,61 +802,72 @@ impl<'a> Walker<'a> {
         if path.len() == 1 {
             return lookup_signature(head, self.tree, &self.tree.host_fn_signatures);
         }
-        // Multi-segment v1: limit to dict-literal sibling closure.
-        if path.len() != 2 {
-            return None;
-        }
-        let TokenKey::String(method, _, _) = &path[1] else {
+        // 2-segment paths: dict-literal sibling closure, cross-module
+        // aliased closure, and the head-as-schema dispatch all live
+        // here. 3+ segment paths fall through to schema-rooted
+        // multi-hop dispatch at the bottom (no sibling-dict /
+        // aliased-import shape applies there — those tables are keyed
+        // by head name alone).
+        let last_idx = path.len() - 1;
+        let TokenKey::String(method, _, _) = &path[last_idx] else {
             return None;
         };
-        // Try sibling-field dict-literal first (Stage 3.6). Falls
-        // through to the v1.1 cross-module index when there's no
-        // sibling field with that name.
-        if let Some(target) = self.lookup_field_node(head) {
-            // Only walk literal dicts — abstract types (FnCall /
-            // Reference / typed schema bindings) silently fall through
-            // to runtime.
-            if target.type_hint.is_none() {
-                if let Expr::Dict(inner_pairs) = &*target.expr {
-                    for (k, v) in inner_pairs {
-                        if let TokenKey::String(name, _, _) = k {
-                            if name == method {
-                                if matches!(&*v.expr, Expr::Closure { .. }) {
-                                    let mut sig =
-                                        self.tree.closure_signatures.get(&v.id).cloned()?;
-                                    sig.name = format!("{head}.{method}");
-                                    return Some(sig);
+        if path.len() == 2 {
+            // Try sibling-field dict-literal first (Stage 3.6). Falls
+            // through to the v1.1 cross-module index when there's no
+            // sibling field with that name.
+            if let Some(target) = self.lookup_field_node(head) {
+                // Only walk literal dicts — abstract types (FnCall /
+                // Reference / typed schema bindings) silently fall
+                // through to runtime.
+                if target.type_hint.is_none() {
+                    if let Expr::Dict(inner_pairs) = &*target.expr {
+                        for (k, v) in inner_pairs {
+                            if let TokenKey::String(name, _, _) = k {
+                                if name == method {
+                                    if matches!(&*v.expr, Expr::Closure { .. }) {
+                                        let mut sig =
+                                            self.tree.closure_signatures.get(&v.id).cloned()?;
+                                        sig.name = format!("{head}.{method}");
+                                        return Some(sig);
+                                    }
+                                    return None;
                                 }
-                                return None;
                             }
                         }
                     }
                 }
             }
-        }
-        // v1.1: cross-module alias.method — `#import alias from "lib"`
-        // exposes the imported module's top-level closures under
-        // `alias.method`.
-        if let Some(idx) = self.tree.workspace_import_index.as_ref() {
-            if let Some(methods) = idx.aliased_closures.get(head) {
-                if let Some(sig) = methods.get(method) {
-                    return Some(sig.clone());
+            // v1.1: cross-module alias.method — `#import alias from
+            // "lib"` exposes the imported module's top-level closures
+            // under `alias.method`.
+            if let Some(idx) = self.tree.workspace_import_index.as_ref() {
+                if let Some(methods) = idx.aliased_closures.get(head) {
+                    if let Some(sig) = methods.get(method) {
+                        return Some(sig.clone());
+                    }
                 }
             }
         }
-        // Schema-rooted Phase B: schema method dispatch. Two flavors:
+        // Schema-rooted Phase B: schema method dispatch. Three flavors:
         //
-        //   1. `value.method(args)` — `value` is a binding whose static
-        //      type is some `Schema(name)`. Look up the method on that
-        //      schema's table.
-        //   2. `Schema.method(args)` — `Schema` itself is the head, and
-        //      the resolution is "static" (no receiver). The lookup is
-        //      keyed by the schema name regardless.
+        //   1. `value.method(args)` — `value` is a 1-segment binding
+        //      whose static type is some `Schema(name)`. Look up the
+        //      method on that schema's table.
+        //   2. `Schema.method(args)` — `Schema` itself is the head,
+        //      static (no receiver) dispatch; lookup keyed by the
+        //      schema name regardless.
+        //   3. `head.f1.f2…fk.method(args)` (multi-hop) — walk
+        //      `path[..-1]` through the inference engine; when it
+        //      terminates on `Schema(name)` we dispatch the last
+        //      segment against that schema's method table. Mirrors
+        //      the v1.4 path-tail machinery `infer::walk_path`
+        //      already powers for spreads / strict mode.
         //
         // For case 1, the receiver type comes from the path-walker so
         // schema-typed sibling fields, schema-typed `#main(p: T)`
         // params, and `let`-style closure params all participate.
-        if let Some(receiver_schema) = self.resolve_method_receiver(head) {
+        if let Some(receiver_schema) = self.resolve_method_receiver_prefix(&path[..last_idx]) {
             if let Some(sig) = self
                 .tree
                 .method_signatures
@@ -881,27 +892,34 @@ impl<'a> Walker<'a> {
     /// `UnknownTypeName` machinery already covers that, and we must
     /// not double-count names like sibling closures or aliased imports.
     fn check_method_dispatch(&mut self, node: &Node, path: &[TokenKey]) {
-        if path.len() != 2 {
+        if path.len() < 2 {
             return;
         }
         let TokenKey::String(head, _, _) = &path[0] else {
             return;
         };
-        let TokenKey::String(method, method_range, _) = &path[1] else {
+        let last_idx = path.len() - 1;
+        let TokenKey::String(method, method_range, _) = &path[last_idx] else {
             return;
         };
-        // If head resolves to a sibling closure or an aliased imported
-        // closure, that's a non-schema dispatch — let the regular
-        // signature checks handle it.
-        if self.lookup_field_node(head).is_some() {
-            return;
-        }
-        if let Some(idx) = self.tree.workspace_import_index.as_ref() {
-            if idx.aliased_closures.contains_key(head) {
+        // For the 2-segment form only, head-as-sibling-closure or
+        // head-as-aliased-import is a non-schema dispatch — let the
+        // regular signature checks handle it. With 3+ segments, the
+        // head is necessarily the root of a path walk (sibling
+        // closures and aliased imports don't have nested fields the
+        // walker would descend through), so we keep the multi-hop
+        // path-walk authoritative.
+        if path.len() == 2 {
+            if self.lookup_field_node(head).is_some() {
                 return;
             }
+            if let Some(idx) = self.tree.workspace_import_index.as_ref() {
+                if idx.aliased_closures.contains_key(head) {
+                    return;
+                }
+            }
         }
-        let Some(schema) = self.resolve_method_receiver(head) else {
+        let Some(schema) = self.resolve_method_receiver_prefix(&path[..last_idx]) else {
             return;
         };
         let key = (schema.clone(), method.clone());
@@ -978,6 +996,39 @@ impl<'a> Walker<'a> {
         )];
         if let infer::PathTailOutcome::Resolved(InferredType::Schema(name)) =
             infer::walk_path(&single_path, &scope)
+        {
+            return Some(name);
+        }
+        None
+    }
+
+    /// Multi-hop receiver resolution: walk `path[..-1]` and return the
+    /// schema name when the walk lands on `Schema(name)`. The last
+    /// segment is the method name and is *not* included in the walk.
+    ///
+    /// For `path.len() == 2` this reduces to single-name head lookup
+    /// (mirrors [`Self::resolve_method_receiver`]).
+    /// For `path.len() >= 3` (`o.customer.greet()`) we let `walk_path`
+    /// descend through every intermediate field — the prefix that gets
+    /// fed to `walk_path` is `[o, customer]`, and a successful
+    /// `Resolved(Schema("User"))` makes `greet` dispatch against
+    /// `User`'s method table.
+    ///
+    /// Returns `None` when the prefix walk doesn't terminate on a
+    /// schema (`UnknownHead` / `UnknownStep` / non-schema final type).
+    /// Callers fall through to whatever non-schema dispatch path they
+    /// own — no new diagnostic is emitted here.
+    fn resolve_method_receiver_prefix(&self, prefix: &[TokenKey]) -> Option<String> {
+        debug_assert!(!prefix.is_empty());
+        if prefix.len() == 1 {
+            let TokenKey::String(head, _, _) = &prefix[0] else {
+                return None;
+            };
+            return self.resolve_method_receiver(head);
+        }
+        let scope = self.build_type_scope();
+        if let infer::PathTailOutcome::Resolved(InferredType::Schema(name)) =
+            infer::walk_path(prefix, &scope)
         {
             return Some(name);
         }

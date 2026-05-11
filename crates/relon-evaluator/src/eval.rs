@@ -1790,8 +1790,11 @@ impl Evaluator {
     }
 
     /// Dispatch an `Expr::FnCall` whose path looks like
-    /// `[receiver, method]` against the analyzer's `schema_methods`
-    /// table. Returns:
+    /// `[receiver_root, ..fields, method]` (`path.len() >= 2`) against
+    /// the analyzer's `schema_methods` table. The receiver value is
+    /// resolved by walking `path[..-1]`, so chained access like
+    /// `o.customer.greet()` lands on `User.greet` once `o.customer`'s
+    /// runtime value carries a `"User"` brand. Returns:
     ///
     ///   * `Ok(Some(value))` — dispatched and evaluated successfully.
     ///   * `Ok(None)` — not a recognizable method call (so the caller
@@ -1805,48 +1808,60 @@ impl Evaluator {
         scope: &Arc<Scope>,
         range: TokenRange,
     ) -> Result<Option<Value>, RuntimeError> {
-        if path.len() != 2 {
+        if path.len() < 2 {
             return Ok(None);
         }
         let TokenKey::String(head, _, _) = &path[0] else {
             return Ok(None);
         };
-        let TokenKey::String(method_name, _, _) = &path[1] else {
+        let last_idx = path.len() - 1;
+        let TokenKey::String(method_name, _, _) = &path[last_idx] else {
             return Ok(None);
         };
         let Some(analyzed) = self.context.analyzed.as_ref() else {
             return Ok(None);
         };
-        // Static dispatch first: head names a schema directly.
-        if let Some(methods) = analyzed.schema_methods.get(head) {
-            if let Some(method) = methods.iter().find(|m| m.name == *method_name) {
-                // Phase D: a `#native` method declared at source level
-                // with no body delegates to a host-registered impl.
-                // Try that table before falling through to any
-                // (currently un-supported) static-body dispatch.
-                if method.is_native {
-                    if let Some(out) =
-                        self.try_call_native_method(head, method_name, None, args, range)?
-                    {
-                        return Ok(Some(out));
+        // Static dispatch first: head names a schema directly, and
+        // the path is exactly `Schema.method` (2 segments). Multi-hop
+        // paths can't be static — `Order.User.greet` doesn't make
+        // sense; the prefix must resolve to a value at runtime.
+        if path.len() == 2 {
+            if let Some(methods) = analyzed.schema_methods.get(head) {
+                if let Some(method) = methods.iter().find(|m| m.name == *method_name) {
+                    // Phase D: a `#native` method declared at source
+                    // level with no body delegates to a host-registered
+                    // impl. Try that table before falling through to
+                    // any (currently un-supported) static-body
+                    // dispatch.
+                    if method.is_native {
+                        if let Some(out) =
+                            self.try_call_native_method(head, method_name, None, args, range)?
+                        {
+                            return Ok(Some(out));
+                        }
                     }
-                }
-                if let Some(body) = method.body_node.as_ref() {
-                    return self
-                        .invoke_method_body(body, None, &method.params, args, scope, range)
-                        .map(Some);
+                    if let Some(body) = method.body_node.as_ref() {
+                        return self
+                            .invoke_method_body(body, None, &method.params, args, scope, range)
+                            .map(Some);
+                    }
                 }
             }
         }
-        // Receiver dispatch: head is a binding whose value carries a
-        // schema-rooted tag.
-        let first_name = head.clone();
-        let receiver_value = if let Some(val) = scope.get_local(&first_name) {
-            val
-        } else if let Some(thunk) = scope.get_thunk(&first_name) {
-            self.force_thunk(&thunk)?
-        } else {
-            return Ok(None);
+        // Receiver dispatch: walk `path[..-1]` to materialize the
+        // receiver value, then read its schema tag. For 2-segment
+        // calls (`m.method`) this collapses to the original
+        // single-name lookup; for 3+ segments (`o.customer.method`)
+        // we descend through the intermediate fields using the same
+        // `resolve_variable` driver that powers `Expr::Variable`.
+        let prefix = &path[..last_idx];
+        let receiver_value = match self.resolve_variable(prefix, scope, range) {
+            Ok(v) => v,
+            // The prefix doesn't bind to a value (typo head, missing
+            // field, …). Fall through to the caller's
+            // `FunctionNotFound` so the user sees the path-level
+            // error rather than a synthetic "no such method".
+            Err(_) => return Ok(None),
         };
         let Some(schema_name) = value_schema_tag(&receiver_value) else {
             return Ok(None);
