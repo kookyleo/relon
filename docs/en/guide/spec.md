@@ -225,8 +225,7 @@ The host grants via `Capabilities` fields:
 
 ```rust
 let mut ctx = Context::sandboxed();
-ctx.capabilities.reads_fs = true;                          // permit #import on real FS
-ctx.capabilities.allow_native_fn.insert("fs.read".into());  // permit calls to a named host fn
+ctx.capabilities.reads_fs = true;                           // permit #import on real FS and any host fn gated on reads_fs
 ctx.capabilities.max_steps = Some(1_000_000);               // step budget
 ```
 

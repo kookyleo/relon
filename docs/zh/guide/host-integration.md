@@ -313,20 +313,16 @@ ctx.register_fn(
     Arc::new(ReadSecret),
 );
 
-// 在沙箱下两种放行方式任选其一：
-// (a) 按 bit 授权（推荐）：让任何声明 reads_fs 的函数都能调
+// 沙箱下放行的方式：授予 gate 声明的每一个 bit
 ctx.capabilities.reads_fs = true;
-// (b) 按名字加白：只放 secret.read 一个名字过
-ctx.capabilities.allow_native_fn.insert("secret.read".to_string());
 ```
 
 每个原生函数都走同一条 gate 检查：函数声明的所有 bit 都必须在
 `Capabilities` 里被授予，否则 `CapabilityDenied`。`register_pure_fn`
 注册的纯函数声明的是空 gate，零 bit 缺失，所以不需要 capability 授
 权也能跑；`register_fn(name, gate, fn)` 在 `gate` 含任何置位的 bit
-时就需要宿主显式授予对应能力（或 `allow_all_native_fn = true`，或
-`name` 出现在 `allow_native_fn` 白名单）。`Capabilities::all_granted()`
-一次把六个 bit 和 `allow_all_native_fn` 全部打开。详见
+时就需要宿主显式授予对应能力。`Capabilities::all_granted()` 一次把
+六个 bit 全部打开。详见
 [沙箱与权限](./sandbox.md)。
 
 ## 模块解析（Module Resolvers）

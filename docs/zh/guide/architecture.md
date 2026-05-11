@@ -87,15 +87,14 @@ plain JSON
 
 ## 沙箱模型
 
-`Capabilities` 决定 evaluator 的边界。结构是 `#[non_exhaustive]`，主要分三类：
+`Capabilities` 决定 evaluator 的边界。结构是 `#[non_exhaustive]`，主要分两类：
 
-- **能力 bit（6 个）**：`reads_fs` / `writes_fs` / `network` / `reads_clock` / `reads_env` / `uses_rng`，对应 `NativeFnGate` 上同名的 6 个 bit。一个 host fn 声明哪些 bit，host 必须在 `Capabilities` 上同步授予才能在沙箱下被调到。
-- **白名单**：`allow_native_fn`（按名授予）与 `allow_all_native_fn`（总开关），任一命中即跳过 per-bit 检查。
+- **能力 bit（6 个）**：`reads_fs` / `writes_fs` / `network` / `reads_clock` / `reads_env` / `uses_rng`，对应 `NativeFnGate` 上同名的 6 个 bit。一个 host fn 声明哪些 bit，host 必须在 `Capabilities` 上同步授予才能在沙箱下被调到。授权路径只有这一条——没有按名白名单、没有总开关短路。
 - **预算**：`max_steps`（超阈值 → `StepLimitExceeded`）、`max_value_elements`（list/dict 构造点）。
 
 文件系统的真正执行点在 resolver：`FilesystemModuleResolver` 默认拒绝；`with_root_dir` 限定根目录；`trusted()` 全开。`reads_fs` / `writes_fs` 只是 capability 层的 bit。
 
-`Context::sandboxed()` 默认拒绝文件系统与有 bit 声明的原生函数；需要全开时显式设置 `Capabilities::all_granted()`（一次翻全 6 bit + `allow_all_native_fn`），并安装 `FilesystemModuleResolver::trusted()`。`Context::new()` 是轻量基础构造器：只挂载虚拟 std 模块与内置纯函数，不代表全开信任模式。
+`Context::sandboxed()` 默认拒绝文件系统与有 bit 声明的原生函数；需要全开时显式设置 `Capabilities::all_granted()`（一次翻全 6 bit），并安装 `FilesystemModuleResolver::trusted()`。`Context::new()` 是轻量基础构造器：只挂载虚拟 std 模块与内置纯函数，不代表全开信任模式。
 
 详见[沙箱与权限](./sandbox.md)。
 

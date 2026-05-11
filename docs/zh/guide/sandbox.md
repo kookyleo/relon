@@ -47,8 +47,8 @@ ctx.capabilities.max_steps = Some(1_000_000);
 // 3. 设 value 元素水位（防止巨型 list/dict）
 ctx.capabilities.max_value_elements = Some(10_000);
 
-// 4. 把允许调用的「门控」原生函数加白名单（如果有）
-ctx.capabilities.allow_native_fn.insert("currency.format".to_string());
+// 4. 给确实需要的 bit 授权（按需开放，例如读时钟）
+ctx.capabilities.reads_clock = true;
 ```
 
 ### 「我就是想全开」——`Capabilities::all_granted()`
@@ -64,7 +64,8 @@ ctx.prepend_module_resolver(Arc::new(FilesystemModuleResolver::trusted()));
 ```
 
 这三行 = 旧的 `Context::trusted()`。区别是 code review 看一眼就知道
-「FS 全开 + 所有门控函数全放 + 无步数预算」——哪行不想要就删哪行。
+「FS 全开 + 六个能力 bit 全开（任何 gate 都过）+ 无步数预算」——哪
+行不想要就删哪行。
 
 ## `Capabilities` 字段
 
@@ -73,8 +74,6 @@ ctx.prepend_module_resolver(Arc::new(FilesystemModuleResolver::trusted()));
 ```rust
 #[non_exhaustive]
 pub struct Capabilities {
-    pub allow_all_native_fn: bool,
-    pub allow_native_fn: HashSet<String>,
     pub reads_fs: bool,
     pub writes_fs: bool,
     pub network: bool,
@@ -180,37 +179,11 @@ ctx.capabilities.max_value_elements = Some(3);
 状态，现在统一按「runtime 出 list/dict ⇒ 走 check」处理；宿主想
 完全不受限请把 `max_value_elements = None`。
 
-### `allow_native_fn: HashSet<String>`
-
-按名字加白的捷径：写在这里的原生函数名，不管声明的 `NativeFnGate`
-要哪些 bit，沙箱下都能调。用于「我就是想放某一个函数过」的精确开
-口。详见
-[嵌入宿主：注册原生函数](./host-integration.md#注册一个原生函数)。
-
-```rust
-let mut gate = NativeFnGate::default();
-gate.reads_fs = true;
-ctx.register_fn("fs.read", gate, Arc::new(MyReader));
-ctx.capabilities.allow_native_fn.insert("fs.read".to_string());
-// 沙箱下 `.relon` 里调 fs.read() 会过；没加白名单也没授 reads_fs 则
-// CapabilityDenied
-```
-
-如果按 bit 授权更自然（「这个 context 整体允许 reads_fs」），直接
-设 `ctx.capabilities.reads_fs = true` 就行；`allow_native_fn` 主要
-适合「只放某个具体名字、其他相同 bit 的函数仍然拒绝」的场景。
-
 注：通过 `register_pure_fn` 注册的纯函数（`len`、`range`、`string.*`、
 `math.*` 等 stdlib intrinsics 都走这条路）声明的是空 gate
 （`NativeFnGate::default()`），任何 `Capabilities` 都能平凡满足，所
-以不需要进 `allow_native_fn` 也能跑。spec §4.3 把它们划入「规范内
-容」、不属于宿主信任决策。
-
-### `allow_all_native_fn: bool`
-
-总开关：`true` 时所有原生函数全放，绕过 per-bit gate 检查与
-`allow_native_fn` 名单。`Capabilities::all_granted()` 帮你把这个
-flag 和六个 bit 一起设成 `true`。
+以即便所有 bit 都没授权也能跑。spec §4.3 把它们划入「规范内容」、
+不属于宿主信任决策。
 
 ## `FilesystemModuleResolver` 的行为
 
@@ -276,8 +249,8 @@ fn run_user_rule(
     ctx.capabilities.max_value_elements = Some(10_000);
 
     // 暴露一个只读、无副作用的函数（纯函数走 register_pure_fn，
-    // 声明的是空 gate，沙箱默认 Capabilities 就能调，无需进
-    // allow_native_fn 白名单）
+    // 声明的是空 gate，沙箱默认 Capabilities 就能调，无需授予任何
+    // bit）
     ctx.register_pure_fn(
         "user.current_id",
         Arc::new(CurrentUserId(current_user.to_string())),
