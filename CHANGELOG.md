@@ -123,6 +123,145 @@ is purely additive at the source level. Hosts wanting to attach a
 method to a specific schema should prefer `register_method` over
 the older `register_fn("Schema.method", ...)` convention.
 
+---
+
+### Second wave: sandbox hardening + housekeeping
+
+A follow-up batch landed after the schema-rooted phases closed.
+Three themes: tighter sandbox enforcement (resource caps, iterator
+state, capability surface), build / dependency cleanup, and the
+English documentation guide reaching parity with Chinese.
+
+### Sandbox hardening
+
+`max_value_elements` now applies to every native fn return value.
+Pre-batch, `check_value_size` only fired at language-level
+construction sites (list / dict literals, dict + merge,
+comprehensions). Every stdlib intrinsic that returned a `List` or
+`Dict` (`range`, `_list_map`, `_list_filter`, `_list_reduce`,
+`_string_split`, `_dict_merge`, and their receiver-form mirrors
+`xs.map(f)`, `d.merge(b)`, …) bypassed the cap, and `range(0, N)`
+could allocate `Vec<Value>` before any check ran — a real OOM
+vector.
+
+- `Range::call` now pre-flights `end - start` against the cap and
+  refuses oversized requests before allocating.
+- `NativeFnCaps` gains `max_value_elements()`; `EvaluatorCaps`
+  wires it to `Capabilities`. Both
+  `Evaluator::call_function` and `try_call_native_method` run
+  `check_value_size` on every native fn return value, covering
+  free-form and receiver-form routes uniformly.
+- `check_value_size` stays intentionally non-recursive so the
+  `Iter` wrapper dict (`{ _kind, _source, _id }`) is sized as
+  three keys, not by the source length it iterates over.
+- The sandbox guide drops its stdlib exemption: every enforcement
+  point is now listed explicitly and the `range` pre-flight is
+  documented.
+
+`Iter` cursor state moved off process-global storage into `Context`.
+The user-callable `Iter.next()` cursor map and the iter-id counter
+used to live in module-level statics, so two concurrent `Context`s
+sharing the same process would step each other's cursors. Cursors
+now live on `Context`; they clear at the top of every `eval_root` /
+`run_main`, so a `Context` reused across top-level runs never
+accumulates entries. The id counter intentionally keeps climbing
+across runs to avoid colliding with a long-lived `Iter` dict
+carried across boundaries.
+
+- `NativeFnCaps` gains `next_iter_id` and
+  `iter_cursor_fetch_and_inc` primitives; `EvaluatorCaps` routes
+  them to the per-`Context` table.
+- Cross-`Context` iter handling follows the implicit-exhausted
+  policy: a foreign `_id` with no entry in this `Context`'s table
+  surfaces as `None` rather than a new error variant. Concurrent
+  iter loops under a watchdog are part of the regression suite.
+
+Capabilities surface collapsed: `Capabilities::allow_native_fn`
+(the per-name `HashSet` allowlist) and `Capabilities::allow_all_native_fn`
+(the global bypass) are gone. Only the 6 capability bits
+(`reads_fs` / `writes_fs` / `network` / `reads_clock` / `reads_env`
+/ `uses_rng`) and the 2 resource budgets (`max_steps`,
+`max_value_elements`) remain. `Capabilities::all_granted()` flips
+the 6 bits directly. After this change, a successful gated-fn call
+proves every bit declared on its gate was granted; audit reasoning
+no longer has to consider two parallel bypass paths. The
+user-facing sandbox / host-integration / spec / architecture docs
+are rewritten in step — the recipe for "let a host fn run" is now
+uniformly "grant the matching capability bit", never "add the name
+to the allowlist".
+
+### Build & dependencies
+
+`thiserror` bumped 1.0 → 2 via `[workspace.dependencies]`. No
+source-level changes — existing `#[error]` / `#[from]` /
+`#[source]` usages are forward-compatible. Future bumps land in
+one place instead of four crate manifests.
+
+`miette` / `serde` / `serde_json` / `clap` / `anyhow` are now
+routed through `[workspace.dependencies]` too. Consumers inherit
+via `{ workspace = true }` plus their own features. No semantic
+change — cargo unifies features across consumers exactly as before.
+
+Bench harness extracted into a standalone `relon-bench` crate
+(`publish = false`). The user-facing `cargo run -p relon-cli`
+command used to fail with "could not determine which binary to run"
+because `relon-cli` shipped two binaries and no `default-run`.
+After the split, `relon-cli` carries a single binary and the
+`default-run = "relon-cli"` workaround is dropped.
+
+Crate-level `#![allow(unused_assignments)]` on `relon-analyzer` and
+`relon-evaluator` works around rust-lang/rust#147648 — a
+stable-to-stable regression where the `unused_assignments` lint
+fires on every field of a proc-macro-derived enum (`miette::Diagnostic`
+/ `thiserror::Error`, plus several other unrelated crates on the
+upstream issue). Each `allow` carries a comment pointing at the
+issue; drop the `allow` once the rustc fix lands. Restores
+`cargo clippy --workspace --all-targets -- -D warnings` as a
+working pre-ship gate.
+
+The `[workspace.package].repository` URL is unified to
+`https://github.com/kookyleo/relon`. `Cargo.toml` previously
+pointed at `relonlang/relon` while the vitepress config, both
+locale index pages, and the English introduction all referenced
+`kookyleo/relon` — picking the four-vs-one majority avoids a
+crates.io repo-mismatch rejection when the first release ships.
+
+### Documentation
+
+English guide reaches parity with Chinese: nine new pages —
+`use-cases`, `syntax`, `functions`, `types`, `modules`,
+`host-integration`, `sandbox`, `stdlib`, `architecture`. The
+vitepress English sidebar is restructured to mirror the Chinese
+one (Getting started / Core features / Embedding & sandbox /
+Reference); `introduction.md` and `spec.md` cross-links now point
+at their English twins, and the obsolete "comprehensive guide is
+currently Chinese-first" notes are gone. The English `sandbox`
+page mirrors the recent 6-bit + 2-budget surface (no
+`allow_native_fn` / `allow_all_native_fn` references) and the
+`max_value_elements` enforcement on stdlib intrinsics.
+
+README quickstart and headline example fixed. The headline example
+used `@fn(val, symbol)` decorator syntax that does not bind
+parameters — it errored with `VariableNotFound` on `val`. The
+method-shorthand form (`currency(val, symbol): ...`) replaces it,
+matching what `examples/demo.relon` already shipped. A features
+bullet referenced "unified closures (`@fn`)", but the language has
+no `@fn` syntax — replaced with the actual surface (arrow closures
+`(x) => x + 1` and method shorthands `f(x): x + 1`). README also
+clarifies the trust model: scripts can't elevate themselves, but
+the host can grant everything via auditable, code-visible calls
+(`--trust` on the CLI, `Capabilities::all_granted()` from Rust).
+The previous "There is no trusted mode" wording contradicted those
+APIs and is rephrased.
+
+Chinese syntax / types pages updated for v1.6 and v1.7.
+`syntax.md` previously claimed "bare `Dict` (no generics) is still
+legal, equivalent to `Dict<Any, Any>`" — v1.7's
+`BareGenericContainer` ban rejects that at the analyzer. `types.md`
+still listed `Any` as a built-in — v1.6's `ExplicitAnyForbidden`
+retired it from user space. Both pages now reflect the current
+user-facing surface.
+
 ## [Unreleased] — Capability model hardening: 6-bit gate + unified register_fn
 
 ### BREAKING: capability bits go from 1 to 6, registration API collapses to one entry point
