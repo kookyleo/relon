@@ -1,0 +1,19 @@
+// Schema-rooted §J follow-up: positive case for the index key
+// arg-type check. `bag[0]` is an `Int` against the schema's
+// `index(key: Int)` — no diagnostic. Pre-fix the analyzer never
+// validated either; the fixture exists to lock in the silent-pass
+// behavior alongside its mismatch sibling.
+#schema Bag {
+    List<Int> items: *
+} with {
+    #derive Indexable
+    index(key: Int) -> Option<Int>:
+        key >= 0 && key < len(self.items)
+            ? Option.Some { value: self.items[key] }
+            : Option.None { }
+}
+
+{
+    Bag b: { items: [10, 20, 30] },
+    hit: b[0]
+}

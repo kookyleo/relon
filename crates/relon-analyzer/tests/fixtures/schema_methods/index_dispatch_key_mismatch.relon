@@ -1,0 +1,18 @@
+// Schema-rooted §J follow-up: `bag["abc"]` against a schema whose
+// `#derive Indexable index(key: Int)` parameter declares a concrete
+// `Int` should surface `MethodGenericArgMismatch` at analysis time
+// instead of at runtime via the witness body's `TypeMismatch`.
+#schema Bag {
+    List<Int> items: *
+} with {
+    #derive Indexable
+    index(key: Int) -> Option<Int>:
+        key >= 0 && key < len(self.items)
+            ? Option.Some { value: self.items[key] }
+            : Option.None { }
+}
+
+{
+    Bag b: { items: [10, 20, 30] },
+    miss: b["abc"]
+}

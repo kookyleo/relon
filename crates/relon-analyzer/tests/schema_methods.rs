@@ -455,6 +455,59 @@ fn method_generic_with_distinct_name_stays_silent() {
     );
 }
 
+// ===================================================================
+// Schema-rooted §J follow-up: `MethodGenericArgMismatch` flags an
+// `index(key: K)` call site whose actual key type contradicts the
+// constraint-substituted `K`. Polymorphic witnesses stay silent.
+// ===================================================================
+
+#[test]
+fn index_key_mismatch_emits_diagnostic() {
+    let tree = analyze_fixture("schema_methods/index_dispatch_key_mismatch.relon");
+    let mismatches: Vec<_> = tree
+        .diagnostics
+        .iter()
+        .filter(|d| {
+            matches!(d,
+                Diagnostic::MethodGenericArgMismatch { schema, method, expected, found, .. }
+                    if schema == "Bag" && method == "index" && expected == "Int" && found == "String"
+            )
+        })
+        .collect();
+    assert_eq!(
+        mismatches.len(),
+        1,
+        "expected one MethodGenericArgMismatch on Bag.index: {:?}",
+        tree.diagnostics
+    );
+}
+
+#[test]
+fn index_key_ok_stays_silent() {
+    let tree = analyze_fixture("schema_methods/index_dispatch_key_ok.relon");
+    let mismatches = count(&tree.diagnostics, |d| {
+        matches!(d, Diagnostic::MethodGenericArgMismatch { .. })
+    });
+    assert_eq!(
+        mismatches, 0,
+        "matching key type must not trigger MethodGenericArgMismatch: {:?}",
+        tree.diagnostics
+    );
+}
+
+#[test]
+fn index_key_polymorphic_witness_stays_silent() {
+    let tree = analyze_fixture("schema_methods/index_dispatch_key_polymorphic.relon");
+    let mismatches = count(&tree.diagnostics, |d| {
+        matches!(d, Diagnostic::MethodGenericArgMismatch { .. })
+    });
+    assert_eq!(
+        mismatches, 0,
+        "polymorphic K must not surface MethodGenericArgMismatch: {:?}",
+        tree.diagnostics
+    );
+}
+
 #[test]
 fn monomorphic_method_on_generic_schema_stays_silent() {
     // `#schema Box<T>` with a method that has no generics of its own

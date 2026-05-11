@@ -1,0 +1,15 @@
+// Schema-rooted §J follow-up: when the witness declares
+// `index(key: K)` with `K` still bound to the schema's generic
+// param (not yet substituted to a concrete type), the analyzer
+// must stay silent — runtime owns the verdict because the binding
+// is only known once the receiver's concrete type lands. The
+// fixture covers this by leaving `<K, V>` open on the schema.
+#schema GenBag<K, V> with {
+    #derive Indexable
+    index(key: K) -> Option<V>: Option.None { }
+}
+
+{
+    GenBag<Int, String> b: { },
+    miss: b["abc"]
+}

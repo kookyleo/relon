@@ -584,6 +584,14 @@ impl<'a> Walker<'a> {
             }
             Expr::Variable(path) => {
                 self.check_unresolved_var(node, path);
+                // Schema-rooted §J follow-up: a Dynamic segment in a
+                // path lowers to `receiver.index(key)`. When the
+                // receiver schema declares a concrete `index(key:
+                // K)` parameter type, validate the dynamic key
+                // expression's static type matches; otherwise the
+                // mismatch would only surface at runtime from inside
+                // the witness body.
+                self.check_index_dispatch(path);
             }
             Expr::Match { expr, arms } => {
                 self.check_match_exhaustiveness(node.range, expr, arms);
@@ -951,6 +959,88 @@ impl<'a> Walker<'a> {
         // existing `check_fn_call` already validated arity once
         // `resolve_call_signature` returned the method's `FnSignature`.
         let _ = (key, node);
+    }
+
+    /// Schema-rooted §J follow-up: walk `path` for any `Dynamic`
+    /// segments. Each one is the bracket-form `a[expr]` desugar
+    /// landing site — at runtime it dispatches through the receiver
+    /// schema's `index(key: ...)` witness. When that witness's
+    /// declared key parameter has a concrete type (after constraint-
+    /// generic substitution, e.g. `index(key: Int)`), validate the
+    /// dynamic key's inferred type against it. Mismatch surfaces as
+    /// `MethodGenericArgMismatch`; without this check the same
+    /// disagreement only fires at runtime from inside the witness
+    /// body.
+    ///
+    /// The receiver type is recovered by walking `path[..i]` through
+    /// `walk_path`. If the prefix doesn't land on a schema we have a
+    /// method table for (or the schema has no `index` method, or its
+    /// `index` declares `key: K` with `K` still polymorphic), we
+    /// silently skip — runtime still owns those cases.
+    fn check_index_dispatch(&mut self, path: &[TokenKey]) {
+        // Walk the segments looking for a Dynamic — each one is an
+        // independent index call against the prefix up to (but not
+        // including) the segment itself.
+        let scope = self.build_type_scope();
+        let mut to_emit: Vec<Diagnostic> = Vec::new();
+        for (idx, seg) in path.iter().enumerate() {
+            let TokenKey::Dynamic(key_node, _is_optional) = seg else {
+                continue;
+            };
+            if idx == 0 {
+                // A leading Dynamic would mean `[expr]` at the root,
+                // which the parser never produces — but be defensive.
+                continue;
+            }
+            let prefix = &path[..idx];
+            let schema_name = match infer::walk_path(prefix, &scope) {
+                infer::PathTailOutcome::Resolved(InferredType::Schema(name)) => name,
+                _ => continue,
+            };
+            // Locate the synthesized signature so we have both the
+            // method's generics list and the param's TypeNode. The
+            // method-signature table is the single source of truth
+            // after `build_method_signature_table`.
+            let key = (schema_name.clone(), "index".to_string());
+            let Some(sig) = self.tree.method_signatures.get(&key).cloned() else {
+                continue;
+            };
+            let Some(key_param) = sig.params.first() else {
+                continue;
+            };
+            // Skip when the param type is still a polymorphic
+            // placeholder. The receiver-schema's generics shadow the
+            // method's own — both must be subtracted before declaring
+            // a leftover name "polymorphic". Concrete types
+            // (`Int`/`String`/builtins/user schemas) pass.
+            if param_is_polymorphic(&key_param.ty, &sig.generics, &schema_name, self.tree) {
+                continue;
+            }
+            let Some(arg_ty) = infer_type(key_node, &scope) else {
+                continue;
+            };
+            // `Any` here is the closure-param-without-type leak (the
+            // only Any source left after v1.6); don't double-flag.
+            if matches!(arg_ty, InferredType::Any) {
+                continue;
+            }
+            if arg_ty.subsumes_with_imports(
+                &key_param.ty,
+                Some(&self.base_index),
+                self.tree.workspace_import_index.as_ref(),
+            ) {
+                continue;
+            }
+            to_emit.push(Diagnostic::MethodGenericArgMismatch {
+                schema: schema_name,
+                method: "index".to_string(),
+                param_name: key_param.name.clone(),
+                expected: format_type(&key_param.ty),
+                found: arg_ty.name(),
+                range: span_of(key_node.range),
+            });
+        }
+        self.tree.diagnostics.extend(to_emit);
     }
 
     /// Stub for the in-method-block tracking hook used by
@@ -2243,6 +2333,51 @@ impl<'a> Walker<'a> {
 // last in-tree caller migrated in Stage 1.4. The legacy helpers are
 // removed here; consumers that need the old name-string view can
 // build it from `InferredType::name`.
+
+/// Schema-rooted §J follow-up helper: classify a method param's
+/// `TypeNode` as polymorphic (still a placeholder name) vs concrete
+/// (`Int`, `String`, a user schema, an alias-qualified schema, …).
+///
+/// Polymorphic means **the param type is exactly one of the in-scope
+/// generic names** with no further structure — `key: K` on a
+/// constraint witness whose `K` hasn't been pinned. Such a param
+/// can't be statically validated against an arg type because the
+/// receiver supplies the concrete binding only at runtime; the
+/// `check_index_dispatch` walker silently skips.
+///
+/// "In-scope" is the union of (a) the method's own `generics` list
+/// (e.g. `map<U>` declares `U`) and (b) the owning schema's generics
+/// (`List<T>` declares `T`, visible to every method body). The
+/// shadow-warning emitted in Item 3 catches the name-collision case;
+/// here we treat both name spaces as polymorphic for the purpose of
+/// "is this param still unbound".
+fn param_is_polymorphic(
+    ty: &relon_parser::TypeNode,
+    method_generics: &[String],
+    schema_name: &str,
+    tree: &AnalyzedTree,
+) -> bool {
+    if ty.path.len() != 1 || !ty.generics.is_empty() {
+        return false;
+    }
+    let head = &ty.path[0];
+    if method_generics.iter().any(|g| g == head) {
+        return true;
+    }
+    let schema_generics: Vec<String> = tree
+        .schemas
+        .values()
+        .find(|def| def.name.as_deref() == Some(schema_name))
+        .map(|def| def.generics.clone())
+        .or_else(|| {
+            tree.root_schemas
+                .iter()
+                .find(|d| d.name == schema_name)
+                .map(|d| d.generics.clone())
+        })
+        .unwrap_or_default();
+    schema_generics.iter().any(|g| g == head)
+}
 
 /// Return `(required_count, max_fixed_count)` for the given signature.
 /// `required_count` is the number of leading non-optional params;

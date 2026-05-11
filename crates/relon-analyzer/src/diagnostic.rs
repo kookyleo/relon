@@ -555,6 +555,30 @@ pub enum Diagnostic {
         range: SourceSpan,
     },
 
+    #[error("index key for schema `{schema}` expects {expected}, got {found}")]
+    #[diagnostic(
+        code(relon::analyze::method_generic_arg_mismatch),
+        help(
+            "The schema declares `#derive Indexable index(key: {expected}) -> ...` (or a constraint-specified equivalent). Pass a `{expected}` here; the analyzer previously deferred this check to runtime, where it surfaced as a `TypeMismatch` from inside the method body."
+        )
+    )]
+    MethodGenericArgMismatch {
+        /// Receiver schema name (`Bag`, `Cache`, ...).
+        schema: String,
+        /// Method whose generic parameter the call site violates
+        /// (`index`, `at`, ...).
+        method: String,
+        /// Argument name from the method declaration (`key`, `idx`, ...).
+        param_name: String,
+        /// Expected type (e.g. `Int`) — what the method's parameter
+        /// declares after constraint-generic substitution.
+        expected: String,
+        /// Actual type the call site supplied.
+        found: String,
+        #[label("expected `{expected}` for `{param_name}`")]
+        range: SourceSpan,
+    },
+
     #[error(
         "method `{method}` on schema `{schema}` redeclares a generic name `{generic}` already bound by the schema"
     )]
@@ -661,6 +685,12 @@ impl Diagnostic {
             // (no generic parameters) is equivalent to leaking `Any`
             // through the back door — Error severity in every mode.
             | Diagnostic::BareGenericContainer { .. }
+            // Schema-rooted §J follow-up: a concrete arg-type for a
+            // method's constraint-supplied generic param (e.g.
+            // `bag["abc"]` against `index(key: Int)`) — Error because
+            // the runtime would otherwise raise `TypeMismatch` from
+            // inside the method body.
+            | Diagnostic::MethodGenericArgMismatch { .. }
             | Diagnostic::DuplicateField { .. } => Severity::Error,
             // Informational: the analyzer's view is conservative — a
             // spread, closure binding, or runtime-computed field may
