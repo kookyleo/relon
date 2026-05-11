@@ -3,12 +3,16 @@ name = "relon"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 description = "Public API facade for the Relon language"
+keywords = ["config", "dsl", "json", "sandboxed", "embedded"]
+categories = ["config", "parsing", "compilers"]
 
 [dependencies]
-relon-evaluator = { path = "../relon-evaluator" }
-relon-parser = { path = "../relon-parser" }
-relon-analyzer = { path = "../relon-analyzer" }
+relon-evaluator = { workspace = true }
+relon-parser = { workspace = true }
+relon-analyzer = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

@@ -3,7 +3,11 @@ name = "relon-parser"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "The core parser for the relon language"
+repository.workspace = true
+homepage.workspace = true
+description = "The core parser for the Relon language"
+keywords = ["parser", "dsl", "json", "winnow", "config"]
+categories = ["parser-implementations", "config"]
 
 [dependencies]
 winnow.workspace = true

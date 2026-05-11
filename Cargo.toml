@@ -9,6 +9,7 @@ version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/kookyleo/relon"
+homepage = "https://github.com/kookyleo/relon"
 description = "A programmable configuration language that extends JSON"
 
 [workspace.dependencies]
@@ -21,6 +22,17 @@ serde = "1.0"
 serde_json = "1.0"
 clap = "4.4"
 anyhow = "1.0"
+
+# Internal crates declared with both `path` and `version` so each can
+# be published to crates.io independently while local builds keep
+# using the in-tree source. A version-less path dependency is a
+# `cargo publish` blocker.
+relon = { path = "crates/relon", version = "0.1.0" }
+relon-parser = { path = "crates/relon-parser", version = "0.1.0" }
+relon-analyzer = { path = "crates/relon-analyzer", version = "0.1.0" }
+relon-evaluator = { path = "crates/relon-evaluator", version = "0.1.0" }
+relon-fmt = { path = "crates/relon-fmt", version = "0.1.0" }
+relon-lsp = { path = "crates/relon-lsp", version = "0.1.0" }
 
 # Default release profile — throughput-tuned. Fat LTO + single
 # codegen unit so the optimizer sees the whole program; downstream

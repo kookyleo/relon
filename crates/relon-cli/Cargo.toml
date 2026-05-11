@@ -3,15 +3,19 @@ name = "relon-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 description = "Command line interface for the Relon language"
+keywords = ["cli", "config", "dsl", "json", "sandboxed"]
+categories = ["command-line-utilities", "config"]
 
 [dependencies]
-relon = { path = "../relon" }
-relon-parser = { path = "../relon-parser" }
-relon-evaluator = { path = "../relon-evaluator" }
-relon-analyzer = { path = "../relon-analyzer" }
-relon-fmt = { path = "../relon-fmt" }
-relon-lsp = { path = "../relon-lsp" }
+relon = { workspace = true }
+relon-parser = { workspace = true }
+relon-evaluator = { workspace = true }
+relon-analyzer = { workspace = true }
+relon-fmt = { workspace = true }
+relon-lsp = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 anyhow = { workspace = true }

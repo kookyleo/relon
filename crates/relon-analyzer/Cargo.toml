@@ -3,9 +3,13 @@ name = "relon-analyzer"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Semantic analysis layer for the relon language: name resolution, schema desugar, diagnostics"
+repository.workspace = true
+homepage.workspace = true
+description = "Semantic analysis layer for the Relon language: name resolution, schema desugar, diagnostics"
+keywords = ["analyzer", "static-analysis", "dsl", "diagnostics", "schema"]
+categories = ["compilers", "development-tools"]
 
 [dependencies]
-relon-parser = { path = "../relon-parser" }
+relon-parser = { workspace = true }
 miette = { workspace = true, features = ["derive"] }
 thiserror = { workspace = true }

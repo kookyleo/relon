@@ -7,5 +7,5 @@ description = "Micro-benchmarks for the Relon evaluator (parse + eval timings on
 publish = false
 
 [dependencies]
-relon-parser = { path = "../relon-parser" }
-relon-evaluator = { path = "../relon-evaluator" }
+relon-parser = { workspace = true }
+relon-evaluator = { workspace = true }

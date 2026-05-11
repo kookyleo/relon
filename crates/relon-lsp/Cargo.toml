@@ -3,16 +3,20 @@ name = "relon-lsp"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 description = "Language Server Protocol implementation for Relon (parse + analyze + diagnostics)"
+keywords = ["lsp", "language-server", "dsl", "config", "diagnostics"]
+categories = ["development-tools"]
 
 [[bin]]
 name = "relon-lsp"
 path = "src/main.rs"
 
 [dependencies]
-relon-parser = { path = "../relon-parser" }
-relon-analyzer = { path = "../relon-analyzer" }
-relon-evaluator = { path = "../relon-evaluator" }
+relon-parser = { workspace = true }
+relon-analyzer = { workspace = true }
+relon-evaluator = { workspace = true }
 lsp-server = "0.7"
 lsp-types = "0.95"
 miette = { workspace = true }

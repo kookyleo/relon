@@ -3,9 +3,13 @@ name = "relon-fmt"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 description = "Formatter and syntax checker for Relon files"
+keywords = ["formatter", "cli", "dsl", "config"]
+categories = ["development-tools", "command-line-utilities"]
 
 [dependencies]
 clap = { workspace = true, features = ["derive"] }
-relon-parser = { path = "../relon-parser" }
+relon-parser = { workspace = true }
 thiserror = { workspace = true }

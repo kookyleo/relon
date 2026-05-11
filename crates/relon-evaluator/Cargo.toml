@@ -3,11 +3,15 @@ name = "relon-evaluator"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "The evaluation engine for the relon language"
+repository.workspace = true
+homepage.workspace = true
+description = "The evaluation engine for the Relon language"
+keywords = ["evaluator", "interpreter", "sandboxed", "dsl", "config"]
+categories = ["compilers", "config"]
 
 [dependencies]
-relon-parser = { path = "../relon-parser" }
-relon-analyzer = { path = "../relon-analyzer" }
+relon-parser = { workspace = true }
+relon-analyzer = { workspace = true }
 ordered-float.workspace = true
 # `rc` enables `serde::Serialize`/`Deserialize` for `Arc<T>` so that
 # `Value::List(Arc<Vec<Value>>)` and `Value::Dict(Arc<ValueDict>)` can
