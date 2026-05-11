@@ -1,0 +1,71 @@
+/*
+  Invoice pricing with tiered discounts and tax.
+
+  Subtotal = sum(qty * unit_price). Two stacking discounts apply:
+    - Volume:  5% at >= 500, 10% at >= 1000.
+    - Loyalty: 3% extra for `gold`-tier customers.
+  Tax (8%) is applied to (subtotal - total_discount).
+
+  The display fields are formatted with a `@currency("USD")` decorator
+  so the JSON reads `"USD 567.34"` rather than the raw number.
+
+  Try:
+    cargo run -q -p relon-cli -- run examples/pricing.relon \
+        --args '{"order": {"tier": "gold", "items": [\
+            {"sku": "BOOK-01", "qty": 3, "unit_price": 100.0}, \
+            {"sku": "PEN-09",  "qty": 4, "unit_price": 50.0},  \
+            {"sku": "DESK-22", "qty": 1, "unit_price": 300.0}  \
+        ]}}'
+
+  Note: IEEE-754 binary floats produce trailing-digit noise on values
+  like 0.08 * 460.0. Real billing systems keep money in integer cents;
+  this toy uses Float for readability and leaves rounding to the host.
+*/
+#schema LineItem {
+    String sku: * ,
+    #expect "qty must be > 0"
+    Int qty: (n) => n > 0,
+    #expect "unit_price must be >= 0"
+    Float unit_price: (p) => p >= 0
+}
+#schema Order {
+    List<LineItem> items: * ,
+    #expect "tier must be one of: standard / gold"
+    String tier: (t) => t == "standard" || t == "gold"
+}
+#main(Order order)
+{
+    // Currency formatter — used as a decorator below. Two positional
+    // args (symbol, value); the decorated field's value is appended
+    // as the last positional, so `@currency("USD") x: 12.3` reads as
+    // `currency("USD", 12.3)`.
+    #private
+    currency(symbol, val): symbol + " " + val,
+    // Tiered volume discount expressed as a rate, not a flat amount.
+    #private
+    volume_rate(sub): sub >= 1000 ? 0.10: sub >= 500 ? 0.05: 0.0,
+    // Loyalty discount stacks on top of volume.
+    #private
+    loyalty_rate(tier): tier == "gold" ? 0.03: 0.0,
+    #private
+    tax_rate: 0.08,
+    // Pure aggregation over the line items.
+    #private
+    sum_floats(xs): _list_reduce(xs, 0.0, (a, x) => a + x),
+    subtotal: sum_floats([
+        it.qty * it.unit_price for it in order.items
+    ]),
+    discount_rate: volume_rate(&sibling.subtotal) + loyalty_rate(order.tier),
+    discount_amount: &sibling.subtotal * &sibling.discount_rate,
+    taxable: &sibling.subtotal - &sibling.discount_amount,
+    tax_amount: &sibling.taxable * tax_rate,
+    total: &sibling.taxable + &sibling.tax_amount,
+    @currency("USD")
+    subtotal_display: &sibling.subtotal,
+    @currency("USD")
+    discount_display: &sibling.discount_amount,
+    @currency("USD")
+    tax_display: &sibling.tax_amount,
+    @currency("USD")
+    total_display: &sibling.total
+}

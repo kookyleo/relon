@@ -119,7 +119,7 @@ warning: value assigned to `name`  is never read (×9)
 
 - `max_steps` 的实测语义是 "AST 节点 dispatch 次数"，对 stdlib 大输入的内循环（`range`、`list.reduce` 在百万元素上的 close walk）一步只 +1，**对最长尾的 DOS 表面并不严密**。需要 native fn 内部主动 yield / 自计步，或者 stdlib 大循环里也调 `step_counter.fetch_add`。
 - `core/iter.relon` 等四个内置 schema 都是 `include_str!` 嵌进 analyzer，但是 evaluator 的 `register_pure_method` 表是手写的 17 条镜像（`stdlib.rs:102-142`）；两边只有 "decision 21'" 的注释约束、没有编译期/测试期对照（"core/*.relon 声明的每条 `#native` 都必须有对应 register_pure_method"）。建议加一条 `#[cfg(test)]` 交叉断言。
-- examples 只有两个 `.relon` 文件，对一个想做"开箱即用业务规则 DSL"的项目偏薄。`use-cases.md` 提到了 feature flag、pricing、workflow，但 `examples/` 里没有对应玩具，新用户读不到落地形态。
+- ~~examples 只有两个 `.relon` 文件，对一个想做"开箱即用业务规则 DSL"的项目偏薄。`use-cases.md` 提到了 feature flag、pricing、workflow，但 `examples/` 里没有对应玩具，新用户读不到落地形态。~~ **已闭环 2026-05-11**：feature_flag / pricing / workflow 三条落地玩具已补齐。
 - workspace `Cargo.toml` 把 `winnow = "0.6"` / `memchr = "2.7"` 放到 `[workspace.dependencies]`，但 `relon` facade、`relon-cli` 各自有 `miette` / `serde_json` / `clap` 版本声明而不走 workspace deps。版本散落以后会出现 multi-version。
 
 ## 建议的优先级

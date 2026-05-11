@@ -1,0 +1,89 @@
+/*
+  Order workflow as a data-driven state machine.
+
+  The transition table maps (current_state, event) -> (next_state, emit).
+  Side-effects are returned as a list of opaque strings — the host
+  interprets each entry and performs the actual I/O. Relon stays pure:
+  we just return the *decision*, never the action.
+
+  States:   placed -> paid -> shipped -> delivered (or -> cancelled)
+  Failures: an unknown (state, event) returns the same state and a
+            single-element list `["unhandled_event"]`. No exception —
+            just a data-shaped no-op so callers can branch on it.
+
+  Try:
+    cargo run -q -p relon-cli -- run examples/workflow.relon \
+        --args '{"state": "placed", "event": "pay"}'
+
+  Other shapes to try:
+    --args '{"state": "paid",    "event": "cancel"}'    // refund
+    --args '{"state": "shipped", "event": "deliver"}'   // happy path
+    --args '{"state": "placed",  "event": "deliver"}'   // unhandled
+*/
+#schema Transition {
+    #expect "from must be a known state"
+    String from: (s) => s == "placed" || s == "paid" || s == "shipped",
+    String on: * ,
+    #expect "to must be a known state"
+    String to: (s) => s == "paid" || s == "shipped" || s == "delivered" || s == "cancelled",
+    List<String> emit: *
+}
+#main(String state, String event)
+{
+    // The table is the contract. Adding a new edge means appending a
+    // row here — no Rust changes, no redeploy. The schema brand on
+    // each row enforces the four-field shape at load time.
+    #private
+    transitions: [
+        #brand Transition {
+            from: "placed",
+            on: "pay",
+            to: "paid",
+            emit: [
+                "charge_card",
+                "log_payment"
+            ]
+        },
+        #brand Transition {
+            from: "paid",
+            on: "ship",
+            to: "shipped",
+            emit: [
+                "notify_shipper",
+                "email_user"
+            ]
+        },
+        #brand Transition {
+            from: "shipped",
+            on: "deliver",
+            to: "delivered",
+            emit: [
+                "email_user"
+            ]
+        },
+        #brand Transition {
+            from: "placed",
+            on: "cancel",
+            to: "cancelled",
+            emit: []
+        },
+        #brand Transition {
+            from: "paid",
+            on: "cancel",
+            to: "cancelled",
+            emit: [
+                "refund_card"
+            ]
+        }
+    ],
+    // Linear scan — workflows tend to have < 50 transitions, so a
+    // hash table would be overkill.
+    #private
+    match_one(t): t.from == state && t.on == event,
+    #private
+    matched: _list_filter(&sibling.transitions, &sibling.match_one),
+    next_state: len(matched) > 0 ? matched[0].to: state,
+    emit: len(matched) > 0 ? matched[0].emit: [
+        "unhandled_event"
+    ]
+}

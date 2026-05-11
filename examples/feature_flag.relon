@@ -1,0 +1,48 @@
+/*
+  Runtime feature-flag evaluator.
+
+  Given a user (id / region / plan) and a fixed set of rollout rules,
+  produce a `{ flags: { name: bool, ... } }` dict the host can read
+  cheaply. Pure Relon — no host fns required.
+
+  Try:
+    cargo run -q -p relon-cli -- run examples/feature_flag.relon \
+        --args '{"user": {"id": "alice-42", "region": "eu", "plan": "pro"}}'
+*/
+#schema User {
+    String id: * ,
+    #expect "region must be one of: us / eu / apac"
+    String region: (r) => r == "us" || r == "eu" || r == "apac",
+    #expect "plan must be one of: free / pro / enterprise"
+    String plan: (p) => p == "free" || p == "pro" || p == "enterprise"
+}
+#main(User user) -> Dict<String, Dict<String, Bool>>
+{
+    // Pure stand-in for a real hash. In production wire a
+    // host-registered native fn (e.g. siphash) and replace this with
+    // `hash_mod_100(s): native_hash(s) % 100`.
+    #private
+    hash_mod_100(s): len(s) * 2654435761 % 100,
+    // Each flag returns a Bool given the User. Keeping them as
+    // closures lets the rollout table below stay tabular.
+    #private
+    rules: {
+        // 1. Hard-off — kill switch for a half-shipped experiment.
+        legacy_checkout: (u) => false,
+        // 2. Hard-on — feature is GA, kept in the table for audit.
+        dark_mode: (u) => true,
+        // 3. Region gate — EU only while we finish a localization pass.
+        gdpr_banner: (u) => u.region == "eu",
+        // 4. Tier gate — paid plans unlock the advanced editor.
+        advanced_editor: (u) => u.plan == "pro" || u.plan == "enterprise",
+        // 5. Percentage rollout — 25% of users see the new search.
+        new_search: (u) => hash_mod_100(u.id) < 25
+    },
+    flags: {
+        legacy_checkout: rules.legacy_checkout(user),
+        dark_mode: rules.dark_mode(user),
+        gdpr_banner: rules.gdpr_banner(user),
+        advanced_editor: rules.advanced_editor(user),
+        new_search: rules.new_search(user)
+    }
+}
