@@ -105,7 +105,7 @@ analyzer 会报 `MissingSpreadTypeHint`。
 { Dict<String, Result<Int, String>> tasks: { ... } }
 ```
 
-bare `Dict`（无泛型）仍合法，等价于 `Dict<Any, Any>`。
+`Dict`、`List`、`Closure`、`Fn`、`Enum` 都必须带泛型参数——v1.7 起，bare `Dict` / `List` / `Closure` 等会被分析器以 `BareGenericContainer` 拒绝。配合 v1.6 的 `Any` 退出用户面（`ExplicitAnyForbidden`），用户必须写明键值/元素类型。
 
 ## 文档根 (Document Root)
 

@@ -21,7 +21,7 @@
 }
 ```
 
-内置的基础类型名称包括：`Any`, `Int`, `Float`, `Number`（兼容 Int 和 Float）, `String`, `Bool`, `Null`, `List`, `Dict`, `Closure`。
+内置的基础类型名称包括：`Int`, `Float`, `Number`（兼容 Int 和 Float）, `String`, `Bool`, `Null`, `List<T>`, `Dict<K, V>`, `Closure<...>`。`Any` 在 v1.6 起从用户面退出（`ExplicitAnyForbidden`）；`List` / `Dict` / `Closure` / `Fn` / `Enum` 在 v1.7 起必须带泛型参数，bare 形式会被 `BareGenericContainer` 拒绝。
 
 ## 联合类型 / Untagged Enum
 
