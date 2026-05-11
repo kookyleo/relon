@@ -140,9 +140,10 @@ sorting are forbidden.
 * Float arithmetic obeys IEEE-754; fast-math, automatic FMA fusing,
   and compile-time constant folding that changes rounding are
   forbidden.
-* Integer arithmetic on `i64` follows Rust semantics: overflow wraps
-  in release. The spec mandates this wrap behavior — saturating /
-  panicking implementations don't satisfy the contract.
+* Integer arithmetic on `i64` is checked: `+`, `-`, `*`, `/`, `%`,
+  and unary `-` must raise `NumericOverflow` whenever the result
+  would exceed `i64`'s representable range. The spec forbids wrap,
+  saturate, panic, or any Rust debug-vs-release dependence.
 
 ### 2.4 Strings
 
@@ -256,6 +257,7 @@ Implementations MUST use these stable tags:
 | `ModuleParseError` | Module file failed to parse |
 | `IoError` | Genuine I/O error (within an allowed `reads_fs` op) |
 | `CapabilityDenied` | Blocked by §4 |
+| `NumericOverflow` | Integer arithmetic exceeds `i64`'s representable range |
 | `StepLimitExceeded` | `max_steps` budget exhausted |
 | `RecursionLimitExceeded` | Type-check / schema-validate recursion exceeds the runtime's safety cap (separate budget from `max_steps`) |
 | `ValueTooLarge` | `max_value_elements` exceeded |
