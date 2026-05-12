@@ -830,6 +830,7 @@ dependencies = [
  "ordered-float",
  "proptest",
  "relon-analyzer",
+ "relon-fmt",
  "relon-parser",
  "serde",
  "serde_json",

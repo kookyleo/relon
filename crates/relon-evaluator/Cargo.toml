@@ -24,3 +24,9 @@ miette = { workspace = true, features = ["derive"] }
 
 [dev-dependencies]
 proptest = { workspace = true }
+# `relon-fmt` is pulled in only for the fmt round-trip property in
+# `tests/property_tests.rs` — formatter ↔ evaluator equivalence is a
+# determinism guarantee, but the runtime crate stays formatter-free.
+# `relon-fmt`'s own dependency closure (parser only) does not loop back
+# through `relon-evaluator`, so this dev-dep is acyclic.
+relon-fmt = { workspace = true }

@@ -431,3 +431,160 @@ proptest! {
         prop_assert_eq!(ys.len(), xs.len());
     }
 }
+
+// ---------------------------------------------------------------------
+// Property F: fmt round-trip preserves evaluation semantics, and
+// `format_source` is idempotent. For any dict-literal source built from
+// the same generator that powers Property C, evaluating the source and
+// evaluating its formatted twin must produce byte-identical output, and
+// `format_source(format_source(src))` must equal `format_source(src)`.
+// Guards the README's "same source + same input → byte-identical
+// output" claim against the formatter: a rule-based rewrite must never
+// drift semantics.
+// ---------------------------------------------------------------------
+proptest! {
+    #![proptest_config(ProptestConfig {
+        // Each case runs the full pipeline twice (parse + analyze +
+        // eval on the original, then again on the formatted output)
+        // plus two fmt passes. Half the case count of the simpler
+        // properties keeps the suite roughly proportional in wall
+        // time without sacrificing shrinking coverage.
+        cases: 32,
+        failure_persistence: None,
+        .. ProptestConfig::default()
+    })]
+
+    #[test]
+    fn fmt_roundtrip_preserves_eval(
+        // Reuse the Property C generator profile: ASCII-identifier
+        // keys + arbitrary i64 values. These are guaranteed to parse
+        // and evaluate, so any difference between the two runs is a
+        // real fmt regression rather than "generator surfaced a parser
+        // edge case". Smaller upper bound (10 vs. 20) keeps the
+        // formatted output size predictable for the second eval pass.
+        entries in proptest_hash_map(
+            "[a-zA-Z][a-zA-Z0-9_]{0,8}",
+            any::<i64>(),
+            0..=10,
+        ),
+    ) {
+        let mut pairs: Vec<(String, i64)> = entries.iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect();
+        // Sort the source-side ordering so proptest shrinking has a
+        // stable starting point; the formatter normalizes layout but
+        // does NOT reorder keys (that's the BTreeMap's job at eval).
+        pairs.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let body: Vec<String> = pairs.iter()
+            .map(|(k, v)| format!(
+                "{}: {}",
+                serde_json::to_string(k).unwrap(),
+                render_i64_literal(*v),
+            ))
+            .collect();
+        // Deliberately omit pretty-print whitespace — the formatter
+        // should reach the same canonical layout regardless of input
+        // shape. Single-line dense source exercises the formatter's
+        // line-break insertion path.
+        let source = format!("{{ {} }}", body.join(", "));
+
+        // Step 1: original source must evaluate. Property C already
+        // proves this generator always lands in the success path, so
+        // a failure here would be a separate regression.
+        let original_eval = eval_in_fresh_context(&source)
+            .expect("generator emits always-evaluable source");
+
+        // Step 2: format the source, then re-evaluate. Both runs go
+        // through fresh `Context::sandboxed()` instances (the helper
+        // builds one per call) — proves the formatter only rewrites
+        // layout, not the value tree or any per-Context state.
+        let formatted = relon_fmt::format_source(&source)
+            .expect("formatter must accept always-parseable source");
+        let formatted_eval = eval_in_fresh_context(&formatted)
+            .expect("formatted source must remain evaluable");
+
+        // Byte-identical JSON projection. Stronger than `==` on Value
+        // because it also catches a hypothetical regression where the
+        // formatter perturbs key ordering (BTreeMap would mask it,
+        // serde_json output would not).
+        prop_assert_eq!(snapshot(&Ok(original_eval)), snapshot(&Ok(formatted_eval)));
+
+        // Step 3: formatter idempotence. `format_source` advertises
+        // itself as a canonical-form rewriter, so a second pass on an
+        // already-formatted string must be a no-op. Catches subtle
+        // bugs where, e.g., a trailing-comma rule keeps inserting
+        // newlines on each pass.
+        let formatted_twice = relon_fmt::format_source(&formatted)
+            .expect("formatter must accept its own output");
+        prop_assert_eq!(formatted, formatted_twice);
+    }
+}
+
+// ---------------------------------------------------------------------
+// Property G: cross-Context evaluation produces byte-identical output
+// for a richer source shape than Properties A / C / D / E individually.
+// Combines a list-typed binding plus two independent closure-bearing
+// method calls (`.filter(...)` and `.map(...)`) over the same list,
+// alongside literal sibling fields. Two `Context::sandboxed()` instances
+// must agree byte-for-byte — guards every per-Context state slot
+// (symbol id counter, iter_cursors table, analyzer cache, path cache)
+// against accidental cross-tenant bleed. Complements Property D, which
+// focuses on iter cursors specifically.
+// ---------------------------------------------------------------------
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: 32,
+        failure_persistence: None,
+        .. ProptestConfig::default()
+    })]
+
+    #[test]
+    fn cross_context_eval_is_identical(
+        xs in proptest::collection::vec(-100i64..=100, 0..=8),
+        threshold in -100i64..=100,
+        offset in -100i64..=100,
+    ) {
+        let xs_literal: Vec<String> = xs.iter()
+            .map(|n| render_i64_literal(*n))
+            .collect();
+        // Source combines:
+        //   * a list binding (exercises the list-allocation path)
+        //   * two independent method calls — `.filter(...)` and
+        //     `.map(...)` — each with its own closure (exercises
+        //     closure capture + analyzer-driven method dispatch on
+        //     `List<Int>`)
+        //   * sibling field references via literal threshold/offset
+        //     (exercises name resolution and the per-Context symbol
+        //     id counter)
+        // All three lean on different per-Context state slots; if any
+        // one slot leaked from a prior eval, the two runs would
+        // diverge. We deliberately avoid `.filter(...).map(...)`
+        // chaining — the current parser does not accept it, and the
+        // separate-field form already exercises the same dispatch
+        // paths without depending on grammar surface area outside the
+        // scope of this property.
+        let source = format!(
+            "{{ List<Int> xs: [{xs}], filtered: xs.filter((n) => n > ({thr})), mapped: xs.map((n) => n + ({off})), threshold: {thr}, offset: {off} }}",
+            xs = xs_literal.join(", "),
+            thr = render_i64_literal(threshold),
+            off = render_i64_literal(offset),
+        );
+
+        // Two independent `Context::sandboxed()` instances — the
+        // helper constructs a fresh one per call. If the result
+        // depends on anything outside the per-Context state (a
+        // 'static cache, a global counter, a thread-local), the two
+        // snapshots will not match.
+        let first = eval_in_fresh_context(&source);
+        let second = eval_in_fresh_context(&source);
+
+        // Note: `eval` may legitimately fail with `NumericOverflow`
+        // for some `xs[i] + offset` combinations — that's fine, both
+        // runs must hit the same error variant, and `snapshot` encodes
+        // the error payload deterministically. We deliberately do NOT
+        // skip / assume success here; the cross-Context invariant
+        // applies equally on the error path.
+        prop_assert_eq!(snapshot(&first), snapshot(&second));
+    }
+}
