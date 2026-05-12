@@ -4,6 +4,24 @@
 > [`schema-rooted-model-2026-05-11.md`](./schema-rooted-model-2026-05-11.md)
 > 决策清单里覆盖的细节，在这里登记。每条记录形态：上下文 + 选择 + 理由。
 
+## Reading guide / Status snapshot
+
+- 本 log 是 **append-only** 时间序日志，记录每一节实现细节；**不是
+  现状文档**。要看当前实施进度请去 [`roadmap.md §J`](./roadmap.md)；
+  要看设计基线请去 [`schema-rooted-model-2026-05-11.md`](./schema-rooted-model-2026-05-11.md)。
+- 章节走向：
+  - **A.1**：parser 层 body-less `#schema` + `#extend` directive；
+  - **B**：analyzer schema-rooted dispatch + evaluator method call 端到端；
+  - **C.1 .. C.13**：constraint lowering（Equatable / Comparable /
+    Iterable / Indexable / Addable 等 witness）、cross-module method
+    propagation、generic K/V unification、Iter cursor 等子项；
+  - **D**：host-side API（`register_method` / `register_pure_method`）+
+    stdlib mirror；
+  - **Phase D 收尾后**：review-driven follow-up（sandbox 实测语义、
+    proptest harness、cross-module value-path 推断等）也按时间序追加
+    到对应字母后面。
+- 找具体决策回流（哪条折叠回设计文档）时，按 "决策 X" 字样 grep。
+
 ## 体例
 
 每个条目：
