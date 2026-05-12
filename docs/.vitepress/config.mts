@@ -5,6 +5,14 @@ export default defineConfig({
   description: "A production-grade, strongly-typed configuration language.",
   base: "/relon/",
 
+  // `internal/` snapshot docs carry forward-references to planned
+  // companion documents (e.g. `type-constraints-spec.md`) that haven't
+  // been promoted out of design yet. Whitelist exactly those slugs so
+  // reader-facing zh/ + en/ pages still get strict link checking.
+  ignoreDeadLinks: [
+    /^\.\/type-constraints-spec$/,
+  ],
+
   head: [
     ['link', { rel: 'icon', type: 'image/svg+xml', href: '/relon/favicon.svg' }],
     ['link', { rel: 'icon', type: 'image/x-icon', href: '/relon/favicon.ico' }]
