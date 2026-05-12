@@ -1,0 +1,129 @@
+{
+  "name": "relon",
+  "scopeName": "source.relon",
+  "fileTypes": ["relon"],
+  "patterns": [
+    { "include": "#comments" },
+    { "include": "#strings" },
+    { "include": "#hash-keywords" },
+    { "include": "#at-forms" },
+    { "include": "#numbers" },
+    { "include": "#atoms" },
+    { "include": "#identifiers" }
+  ],
+  "repository": {
+    "comments": {
+      "patterns": [
+        {
+          "name": "comment.line.double-slash.relon",
+          "begin": "//",
+          "end": "$",
+          "beginCaptures": {
+            "0": { "name": "punctuation.definition.comment.relon" }
+          }
+        },
+        {
+          "name": "comment.block.relon",
+          "begin": "/\\*",
+          "end": "\\*/",
+          "beginCaptures": {
+            "0": { "name": "punctuation.definition.comment.begin.relon" }
+          },
+          "endCaptures": {
+            "0": { "name": "punctuation.definition.comment.end.relon" }
+          }
+        }
+      ]
+    },
+    "strings": {
+      "patterns": [
+        {
+          "name": "string.interpolated.relon",
+          "begin": "f\"",
+          "end": "\"",
+          "beginCaptures": {
+            "0": { "name": "punctuation.definition.string.begin.relon" }
+          },
+          "endCaptures": {
+            "0": { "name": "punctuation.definition.string.end.relon" }
+          },
+          "patterns": [
+            {
+              "name": "constant.character.escape.relon",
+              "match": "\\\\."
+            }
+          ]
+        },
+        {
+          "name": "string.quoted.double.relon",
+          "begin": "\"",
+          "end": "\"",
+          "beginCaptures": {
+            "0": { "name": "punctuation.definition.string.begin.relon" }
+          },
+          "endCaptures": {
+            "0": { "name": "punctuation.definition.string.end.relon" }
+          },
+          "patterns": [
+            {
+              "name": "constant.character.escape.relon",
+              "match": "\\\\."
+            }
+          ]
+        }
+      ]
+    },
+    "hash-keywords": {
+      "patterns": [
+        {
+          "name": "keyword.control.directive.relon",
+          "match": "#(?:schema|main|extend|derive|no_auto_derive|native|private|brand|import)\\b"
+        },
+        {
+          "name": "entity.name.tag.directive.relon",
+          "match": "#[A-Za-z_][A-Za-z0-9_]*"
+        }
+      ]
+    },
+    "at-forms": {
+      "patterns": [
+        {
+          "name": "keyword.control.decorator.builtin.relon",
+          "match": "@(?:schema|fn)\\b"
+        },
+        {
+          "name": "entity.name.tag.decorator.relon",
+          "match": "@[A-Za-z_][A-Za-z0-9_]*"
+        }
+      ]
+    },
+    "numbers": {
+      "patterns": [
+        {
+          "name": "constant.numeric.relon",
+          "match": "\\b\\d+(?:\\.\\d+)?(?:[eE][+-]?\\d+)?\\b"
+        }
+      ]
+    },
+    "atoms": {
+      "patterns": [
+        {
+          "name": "constant.language.boolean.relon",
+          "match": "\\b(?:true|false)\\b"
+        },
+        {
+          "name": "constant.language.null.relon",
+          "match": "\\bnull\\b"
+        }
+      ]
+    },
+    "identifiers": {
+      "patterns": [
+        {
+          "name": "variable.other.relon",
+          "match": "\\b[A-Za-z_][A-Za-z0-9_]*\\b"
+        }
+      ]
+    }
+  }
+}

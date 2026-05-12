@@ -1,4 +1,16 @@
+import { readFileSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
 import { defineConfig } from 'vitepress'
+
+// Load the Relon TextMate grammar at config-eval time. Inlining via JSON
+// import assertions would tie us to a specific Node/tsx config; reading
+// the file ourselves keeps it portable across the toolchain.
+const relonGrammar = JSON.parse(
+  readFileSync(
+    fileURLToPath(new URL('./lang/relon.tmLanguage.json', import.meta.url)),
+    'utf8'
+  )
+)
 
 export default defineConfig({
   title: "Relon",
@@ -12,6 +24,15 @@ export default defineConfig({
   ignoreDeadLinks: [
     /^\.\/type-constraints-spec$/,
   ],
+
+  // Register the Relon TextMate grammar so shiki highlights every
+  // ```relon ...``` block instead of falling back to `txt` (which used
+  // to emit one "language not loaded" warning per code fence at dev
+  // startup). Token coverage is intentionally aligned with the
+  // CodeMirror tokenizer in `theme/components/playground/relon-mode.ts`.
+  markdown: {
+    languages: [relonGrammar as any],
+  },
 
   head: [
     ['link', { rel: 'icon', type: 'image/svg+xml', href: '/relon/favicon.svg' }],
