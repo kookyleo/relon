@@ -240,9 +240,69 @@ ADR 也没有 benchmark baseline，先不预设方案。下一轮立项时应先
       `next_iter_id` / `iter_cursor_fetch_and_inc` 给 intrinsics；
       跨 Context iter 默认按 exhausted（`None`）处理，无新错误类型。
 
+### 阶段 K — Playground & docs UX
+
+设计文档：[`playground-design-2026-05-12.md`](./playground-design-2026-05-12.md)。
+驱动事件：2026-05-12 hands-on 实测后整合的需求。
+
+- [x] **Wave 1**：`crates/relon-wasm` cdylib + wasm-bindgen，暴露
+      `evaluate` / `format` / `version`；`InMemoryModuleResolver`
+      支持多文件；release-small `.wasm` 1.21 MiB。
+- [x] **Wave 2**：VitePress 组件 `PlaygroundClient.vue`，CodeMirror 6
+      + Relon `relon-mode.ts` tokenizer + lint gutter / panel
+      双通道错误显示 + 文件 tab + JSON 视图。
+- [x] **highlight 同步两端**：shiki TextMate grammar
+      (`relon.tmLanguage.json`) 与 CodeMirror tokenizer 严格对齐
+      token 集（注释 / 字符串 / 数字 / `#` 指令 / `@` 装饰器 /
+      reference 前缀 / 控制流 / 内建类型 / 操作符）；docs dev server
+      `'relon' is not loaded` 警告归零。
+- [x] **Wave 3**：preset 4 个（demo / pricing / feature_flag /
+      workflow），双语 markdown 引导页 + sidebar entry，新建文件
+      改 in-page modal，wasm-bindgen 单 object init API。
+- [x] **dead link 清账**：`archive/type-constraints-spec.md` 路径
+      修复，`ignoreDeadLinks` 撤回。
+
+剩余未决项（Wave 4 入口）：
+
+- [ ] **`#main(args)` 浏览器内输入面板**：pricing / workflow /
+      feature_flag 在 sandbox 内的"诚实失败 + banner 引导 CLI"
+      只是 stop-gap。要落地浏览器内的 args 编辑器（JSON form），
+      与 `evaluate(sources, entry, args?)` 的 wasm API 扩展同步。
+- [ ] **host fn 注册接口**：feature_flag 需要 `native_hash`。
+      考虑给 playground 暴露一个 "安全 demo native fn 注册" 通道
+      （wasm 端不接 real syscall，host JS 提供 deterministic
+      fallback）。
+- [ ] **Rendered 视图**：右侧 toggle 当前为 `disabled` 占位。
+      用户消息原话提 "基于 jsonui 的 html"，决策未定。预选方案
+      是自建 schema-rooted 渲染器（≈200 行 Vue），但未启动。
+- [ ] **preset / state URL 持久化**：hash routing 或 query
+      param，便于分享。
+- [ ] **non-entry 文件 analyze-time error 也展示**：当前
+      playground 只 evaluate entry，non-entry 文件的 parse /
+      analyze 错误不在 panel 出现，要按 workspace 维度展示。
+
+### 阶段 L — 工程化收尾（短期）
+
+近期非语言层面的工程项，单独编排避免与语言主线混淆：
+
+- [ ] **0.1.0 发布决策**：`cargo publish --dry-run` 已通过，
+      CHANGELOG 仍长期 `[Unreleased]`。两条路径选一并执行：
+      (a) 切 `0.1.0` + 锁 semver 表面；(b) 撤回 README
+      "published to crates.io" 类承诺，标 "pre-release"。
+      需要项目维护者拍板。
+- [ ] **跨文件 references analyzer 反向表**：阶段 F 第 3 条
+      标 `[~]`（in-file 已通过 `e8bf99b` 落地）。续作要给
+      analyzer 补 `(canonical_id, NodeId) → usages` 表，
+      LSP 走 workspace-wide 反向查询。
+- [ ] **proptest 续作**：当前 7 条 property（含 fmt round-trip
+      + cross-Context）已覆盖 README 头版 determinism 承诺的
+      关键链路。续作把 random source strategy 之外的 fixture
+      集合（`fixtures/*.relon`）也喂给 round-trip property，
+      作为已知 corner case 的回归层。
+
 ## 测试基线
 
-- **当前测试总数**：887 项（`cargo test`，2026-05-11，schema-rooted
+- **当前测试总数**：902 项（`cargo test`，2026-05-12，schema-rooted
   Phase A.1 / B / C / D 全部落地，所有 §J follow-up 关闭；同日完成
   第二轮自洽审视全部 P0/P1 收口——sandbox `max_value_elements` stdlib
   enforcement、`Iter` cursor per-Context 隔离、`Capabilities` 收敛到
@@ -250,11 +310,15 @@ ADR 也没有 benchmark baseline，先不预设方案。下一轮立项时应先
   ↔ `register_pure_method` 双源对照测试；§J 三条语义补强 follow-up：
   跨 module value-path 推断 + index witness arg-type unification +
   method/schema generic shadow warning；review 后第三波：seed
-  proptest harness（5 条 property test）、cross-module 泛型 schema
+  proptest harness 扩展（fmt round-trip + cross-Context 2 条新增，
+  共 7 条 property test）、cross-module 泛型 schema
   中段类型推断（substitution context 跨 module 传递）、`#main`-style
   example golden snapshot、feature_flag example 转 host-integration
-  demo、advisory pre-commit hook）
-- **最近全量测试**：`cargo test` 全绿（2026-05-11）
-- **覆盖范围**：parser、evaluator、analyzer、lsp、fmt、facade、cli
+  demo、advisory pre-commit hook；§K Playground / wasm：
+  `crates/relon-wasm` 新增 + 7 个 native 单测）
+- **最近全量测试**：`cargo test` 全绿（2026-05-12）
+- **覆盖范围**：parser、evaluator、analyzer、lsp、fmt、facade、cli、
+  wasm
 - **代码规范目标**：保持 `clippy -D warnings` 干净，`rustfmt` 对齐，
-  全工程零 `unsafe`
+  全工程零 `unsafe`（`#![forbid(unsafe_code)]` 在 10 个 crate root
+  编译期强制）
