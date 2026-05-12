@@ -7,15 +7,34 @@
 // `<RelonEditor>` consumer only sees a `LanguageSupport`.
 //
 // Tokens emitted (mapped to standard CodeMirror tags via StreamLanguage):
-//   - `keyword`        : `#schema`, `#main`, `#extend`, ... and the
-//                        legacy `@fn` / `@schema` decorators that still
-//                        appear in `examples/*.relon`.
-//   - `meta`           : `@<ident>` decorator invocations.
-//   - `string`         : `"..."` and `f"..."` (interpolation handled as
-//                        plain string at this layer; good enough).
-//   - `number`         : integers + floats.
-//   - `comment`        : `// line` and `/* block */`.
-//   - `variableName`   : bare identifiers (default fallback).
+//   - `keyword`              : `#schema`, `#main`, `#extend`, ... and the
+//                              legacy `@fn` / `@schema` decorators that
+//                              still appear in `examples/*.relon`.
+//   - `meta`                 : `@<ident>` decorator invocations.
+//   - `string`               : `"..."` and `f"..."` (interpolation
+//                              handled as plain string at this layer).
+//   - `number`               : integers + floats.
+//   - `comment`              : `// line` and `/* block */`.
+//   - `atom`                 : `true` / `false` / `null`.
+//   - `variableName.special` : reference prefixes `&root`, `&sibling`,
+//                              `&uncle`, `&prev`, `&next`, `&index`,
+//                              `&this` (path tail is plain identifier).
+//   - `controlKeyword`       : `where`, `match`, `for`, `in`, `if`, `as`,
+//                              `with` — every keyword the parser
+//                              actually consumes today.
+//   - `typeName`             : canonical builtin types as enumerated by
+//                              `is_builtin_type_name` in
+//                              `crates/relon-parser/src/token.rs`.
+//   - `operator`             : arithmetic / comparison / logical / pipe
+//                              / arrow / spread tokens (see `source.rs`
+//                              multi-char op table + single-char ops).
+//   - `variableName`         : bare identifiers (default fallback).
+//
+// CodeMirror token ↔ TextMate scope (kept in sync with relon.tmLanguage.json):
+//   reference  &root|&sibling|...        → variable.language.relon
+//   control    where|match|for|in|...    → keyword.control.relon
+//   type       Int|String|List|...       → support.type.relon
+//   operator   == != && || => -> ...     → keyword.operator.relon
 
 import { StreamLanguage, LanguageSupport, type StreamParser } from '@codemirror/language';
 
@@ -36,6 +55,96 @@ const HASH_KEYWORDS = new Set([
 // decorators). Older examples still use these; keeping them highlighted
 // distinctly avoids visual noise.
 const AT_KEYWORDS = new Set(['@schema', '@fn']);
+
+// Reference bases that follow `&`. Source of truth:
+// `crates/relon-parser/src/reference_var.rs` (`RefBase` literal table).
+const REFERENCE_BASES = new Set([
+    'root',
+    'sibling',
+    'uncle',
+    'prev',
+    'next',
+    'index',
+    'this',
+]);
+
+// Control / structural keywords actually consumed by the parser. Source
+// of truth: `crates/relon-parser/src/expr.rs` (`where` / `match` heads),
+// `structure/list.rs` (`for ... in ...` + comprehension guard `if`),
+// `directive.rs` (`as` alias, `with` for `#extend ... with { ... }`).
+// Deliberately NO `else` / `return` / `let` / `fn` — those are not
+// tokens in Relon today (the few occurrences in fixtures are inside
+// comments).
+const CONTROL_KEYWORDS = new Set([
+    'where',
+    'match',
+    'for',
+    'in',
+    'if',
+    'as',
+    'with',
+]);
+
+// Canonical builtin type names. Source of truth:
+// `crates/relon-parser/src/token.rs::is_builtin_type_name` plus the
+// names treated as builtin carriers by the analyzer (`Iter` core
+// schema, `Option` / `Result` main-signature wrappers, and the
+// `Bytes` / `Date` / `Time` / `DateTime` extend-allowed set).
+const BUILTIN_TYPES = new Set([
+    'Int',
+    'Float',
+    'Number',
+    'String',
+    'Bool',
+    'Null',
+    'Any',
+    'List',
+    'Dict',
+    'Tuple',
+    'Enum',
+    'Closure',
+    'Fn',
+    'Iter',
+    'Option',
+    'Result',
+    'Bytes',
+    'Date',
+    'Time',
+    'DateTime',
+]);
+
+// Multi-char operators tried in order (longest first to avoid ambiguity
+// between `=` / `==`, `<` / `<=`, etc.). Source of truth:
+// `crates/relon-parser/src/source.rs` op table + the ternary `?`,
+// optional-access `?.` / `?[`, and spread `...` consumed elsewhere.
+const MULTI_CHAR_OPERATORS = [
+    '...',
+    '==',
+    '!=',
+    '<=',
+    '>=',
+    '&&',
+    '||',
+    '++',
+    '=>',
+    '->',
+    '?.',
+    '?[',
+];
+
+// Single-char operators / pipe / ternary punctuator.
+const SINGLE_CHAR_OPERATORS = new Set([
+    '+',
+    '-',
+    '*',
+    '/',
+    '%',
+    '<',
+    '>',
+    '!',
+    '?',
+    '|',
+]);
 
 interface RelonState {
     inBlockComment: boolean;
@@ -123,24 +232,63 @@ const parser: StreamParser<RelonState> = {
             return null;
         }
 
+        // `&<base>`: reference prefix. Only the prefix is the special
+        // token — any trailing `.field` walks through the identifier
+        // path on subsequent token calls, which is what we want (path
+        // segments highlight as plain identifiers).
+        if (stream.peek() === '&') {
+            const match = stream.match(/^&([A-Za-z_][A-Za-z0-9_]*)/);
+            if (match) {
+                const base = (match as RegExpMatchArray)[1];
+                if (REFERENCE_BASES.has(base)) {
+                    return 'variableName.special';
+                }
+                // Unknown `&xxx` — treat as bareword so a future
+                // language addition shows up as identifier rather than
+                // silently inheriting reference styling.
+                return 'variableName';
+            }
+            stream.next();
+            return null;
+        }
+
         // Numbers (int / float, optional leading `-` is left to the
         // operator path so `1-2` doesn't get glued).
         if (stream.match(/^\d+(\.\d+)?([eE][+-]?\d+)?/)) {
             return 'number';
         }
 
-        // Identifiers / keywords-by-value. `true`/`false`/`null` are
-        // values; surface them as `atom` so themes pick the literal
-        // colour.
+        // Multi-char operators first so we don't split `==` into `=` `=`.
+        for (const op of MULTI_CHAR_OPERATORS) {
+            if (stream.match(op)) {
+                return 'operator';
+            }
+        }
+
+        // Identifiers / keywords-by-value / builtin types.
         if (stream.match(/^[A-Za-z_][A-Za-z0-9_]*/)) {
-            const word = (stream.current() as string).toLowerCase();
-            if (word === 'true' || word === 'false' || word === 'null') {
+            const word = stream.current() as string;
+            const lower = word.toLowerCase();
+            if (lower === 'true' || lower === 'false' || lower === 'null') {
                 return 'atom';
+            }
+            if (CONTROL_KEYWORDS.has(word)) {
+                return 'controlKeyword';
+            }
+            if (BUILTIN_TYPES.has(word)) {
+                return 'typeName';
             }
             return 'variableName';
         }
 
-        // Operators / punctuation — eat one char, no token (default colour).
+        // Single-char operators / punctuation.
+        const ch = stream.peek();
+        if (ch && SINGLE_CHAR_OPERATORS.has(ch)) {
+            stream.next();
+            return 'operator';
+        }
+
+        // Everything else (braces, brackets, commas, colons, dots, ...).
         stream.next();
         return null;
     },

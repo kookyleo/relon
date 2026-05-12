@@ -1,4 +1,5 @@
 {
+  "$comment": "Relon TextMate grammar. Kept in lock-step with the CodeMirror tokenizer at docs/.vitepress/theme/components/playground/relon-mode.ts. Token group -> scope name mapping (mirror the comment in relon-mode.ts): reference (&root, &sibling, ...) -> variable.language.relon; control (where, match, for, in, if, as, with) -> keyword.control.relon; type (Int, String, List, ...) -> support.type.relon; operator (==, !=, &&, =>, ->, ...) -> keyword.operator.relon.",
   "name": "relon",
   "scopeName": "source.relon",
   "fileTypes": ["relon"],
@@ -7,8 +8,12 @@
     { "include": "#strings" },
     { "include": "#hash-keywords" },
     { "include": "#at-forms" },
+    { "include": "#references" },
     { "include": "#numbers" },
     { "include": "#atoms" },
+    { "include": "#control-keywords" },
+    { "include": "#builtin-types" },
+    { "include": "#operators" },
     { "include": "#identifiers" }
   ],
   "repository": {
@@ -97,6 +102,14 @@
         }
       ]
     },
+    "references": {
+      "patterns": [
+        {
+          "name": "variable.language.relon",
+          "match": "&(?:root|sibling|uncle|prev|next|index|this)\\b"
+        }
+      ]
+    },
     "numbers": {
       "patterns": [
         {
@@ -114,6 +127,58 @@
         {
           "name": "constant.language.null.relon",
           "match": "\\bnull\\b"
+        }
+      ]
+    },
+    "control-keywords": {
+      "patterns": [
+        {
+          "name": "keyword.control.relon",
+          "match": "\\b(?:where|match|for|in|if|as|with)\\b"
+        }
+      ]
+    },
+    "builtin-types": {
+      "patterns": [
+        {
+          "name": "support.type.relon",
+          "match": "\\b(?:Int|Float|Number|String|Bool|Null|Any|List|Dict|Tuple|Enum|Closure|Fn|Iter|Option|Result|Bytes|Date|Time|DateTime)\\b"
+        }
+      ]
+    },
+    "operators": {
+      "patterns": [
+        {
+          "name": "keyword.operator.spread.relon",
+          "match": "\\.\\.\\."
+        },
+        {
+          "name": "keyword.operator.arrow.relon",
+          "match": "=>|->"
+        },
+        {
+          "name": "keyword.operator.optional.relon",
+          "match": "\\?\\.|\\?\\["
+        },
+        {
+          "name": "keyword.operator.comparison.relon",
+          "match": "==|!=|<=|>=|<|>"
+        },
+        {
+          "name": "keyword.operator.logical.relon",
+          "match": "&&|\\|\\||!"
+        },
+        {
+          "name": "keyword.operator.arithmetic.relon",
+          "match": "\\+\\+|\\+|-|\\*|/|%"
+        },
+        {
+          "name": "keyword.operator.pipe.relon",
+          "match": "\\|"
+        },
+        {
+          "name": "keyword.operator.ternary.relon",
+          "match": "\\?"
         }
       ]
     },
