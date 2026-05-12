@@ -24,7 +24,7 @@ use lsp_types::notification::{
     DidChangeTextDocument, DidCloseTextDocument, DidOpenTextDocument, Notification as _,
     PublishDiagnostics,
 };
-use lsp_types::request::{Completion, GotoDefinition, HoverRequest, Request as _};
+use lsp_types::request::{Completion, GotoDefinition, HoverRequest, References, Request as _};
 use lsp_types::{
     CompletionOptions, GotoDefinitionParams, GotoDefinitionResponse, HoverParams, InitializeParams,
     OneOf, PublishDiagnosticsParams, ServerCapabilities, TextDocumentSyncCapability,
@@ -52,6 +52,10 @@ pub fn run_with_connection(connection: Connection) -> Result<()> {
         // Static features powered by `relon-analyzer` side-tables.
         // Kept simple — no resolveProvider, no triggerCharacters yet.
         definition_provider: Some(OneOf::Left(true)),
+        // In-file references only — the analyzer's reference table is
+        // forward-only and scoped to a single module. Cross-file
+        // "find references" is tracked as a deferred follow-up.
+        references_provider: Some(OneOf::Left(true)),
         hover_provider: Some(lsp_types::HoverProviderCapability::Simple(true)),
         completion_provider: Some(CompletionOptions::default()),
         ..ServerCapabilities::default()
@@ -197,6 +201,16 @@ fn handle_request(conn: &Connection, state: &mut ServerState, req: Request) -> R
                 .get(&uri)
                 .and_then(|entry| features::definition::resolve(entry, position, &uri))
                 .map(GotoDefinitionResponse::Scalar);
+            ok_response(id, &result)?
+        }
+        References::METHOD => {
+            let params: lsp_types::ReferenceParams = serde_json::from_value(req.params)?;
+            let uri = params.text_document_position.text_document.uri.clone();
+            let position = params.text_document_position.position;
+            let include_decl = params.context.include_declaration;
+            let result = state.docs.get(&uri).and_then(|entry| {
+                features::references::resolve(entry, position, &uri, include_decl)
+            });
             ok_response(id, &result)?
         }
         HoverRequest::METHOD => {
