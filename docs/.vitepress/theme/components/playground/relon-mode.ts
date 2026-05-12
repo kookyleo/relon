@@ -36,7 +36,14 @@
 //   type       Int|String|List|...       → support.type.relon
 //   operator   == != && || => -> ...     → keyword.operator.relon
 
-import { StreamLanguage, LanguageSupport, type StreamParser } from '@codemirror/language';
+import {
+    StreamLanguage,
+    LanguageSupport,
+    HighlightStyle,
+    syntaxHighlighting,
+    type StreamParser,
+} from '@codemirror/language';
+import { tags as t } from '@lezer/highlight';
 
 // Hash-prefixed keywords. Order is irrelevant; `Set.has` lookup.
 const HASH_KEYWORDS = new Set([
@@ -311,6 +318,35 @@ function consumeString(stream: { eol: () => boolean; next: () => string | undefi
     }
 }
 
+// Color table for Relon tokens. Hand-tuned for contrast against VitePress
+// default light/dark backgrounds. The `meta` (decorator) entry was darker
+// than every other meaningful token before; bumping it to a saturated
+// magenta brings it inline with the keyword / type / control hue family.
+// Operator entry exists explicitly because `defaultHighlightStyle` ships
+// no rule for `tags.operator`, leaving `==` / `+` / `*` etc. unstyled —
+// see CodeMirror 6 default highlight table.
+const relonHighlightStyle = HighlightStyle.define([
+    { tag: t.comment, color: '#994400' },
+    { tag: t.string, color: '#aa1111' },
+    { tag: t.number, color: '#116644' },
+    { tag: t.atom, color: '#116644' },
+    { tag: t.keyword, color: '#770088', fontWeight: 'bold' },
+    { tag: t.controlKeyword, color: '#770088', fontWeight: 'bold' },
+    { tag: t.typeName, color: '#008855' },
+    // `&root`, `&sibling`, ... — emitted via `variableName.special`.
+    { tag: t.special(t.variableName), color: '#225566', fontWeight: 'bold' },
+    // `@decorator` invocations. Previously `#404740` (almost-black gray) —
+    // visually indistinguishable from body text. `#aa00aa` matches the
+    // TextMate `entity.name.function.decorator` hue used in the shiki
+    // grammar for parity between rendered docs and the live editor.
+    { tag: t.meta, color: '#aa00aa' },
+    // Arithmetic / comparison / logical / arrow / spread. Slate blue —
+    // distinct from every other Relon hue, easy on light backgrounds.
+    { tag: t.operator, color: '#4a5560' },
+]);
+
 export function relonLanguage(): LanguageSupport {
-    return new LanguageSupport(StreamLanguage.define(parser));
+    return new LanguageSupport(StreamLanguage.define(parser), [
+        syntaxHighlighting(relonHighlightStyle),
+    ]);
 }
