@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 pub mod decorator;
 pub mod directive;
 pub mod expr;

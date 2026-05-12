@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 pub mod projector;
 
 use relon_analyzer::{

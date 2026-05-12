@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use relon_parser::{
     parse_document,
     source::{tokenize_source, SourceToken as Token, SourceTokenKind as TokenKind},

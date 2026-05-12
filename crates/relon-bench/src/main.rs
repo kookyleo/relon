@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use relon_evaluator::{Context, Evaluator, Scope};
 use relon_parser::parse_document;
 use std::sync::Arc;

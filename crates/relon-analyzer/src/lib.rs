@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 //! Semantic analysis layer for Relon.
 //!
 //! Sits between `relon-parser` (raw AST) and `relon-evaluator` (runtime

@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use clap::Parser;
 use relon_fmt::{format_source, Error};
 use std::path::PathBuf;

@@ -5,6 +5,7 @@
 // (stable→stable regression, P-medium, still open). Drop this `allow`
 // once the rustc fix lands.
 #![allow(unused_assignments)]
+#![forbid(unsafe_code)]
 
 pub mod arithmetic;
 pub mod builtin_decorators;

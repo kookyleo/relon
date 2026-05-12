@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 //! LSP plumbing for Relon.
 //!
 //! The crate is split into:
