@@ -4,7 +4,7 @@
 >
 > 本文记录将 Relon 的调用模型统一为「每个可调用都有 schema 根」的
 > 重大重构所做的全部设计决策。type-constraints 系统
-> ([`type-constraints-spec.md`](./type-constraints-spec.md)) 是这套
+> ([`type-constraints-spec.md`](./archive/type-constraints-spec.md)) 是这套
 > 模型的子集 —— constraint / `#derive` / `with { ... }` 在这套模型下
 > 自然落位。
 
@@ -312,7 +312,7 @@ strategy / hierarchy）的现有覆盖：
 
 ## 与 type-constraints-spec 的关系
 
-[`type-constraints-spec.md`](./type-constraints-spec.md) 描述
+[`type-constraints-spec.md`](./archive/type-constraints-spec.md) 描述
 `#derive Constraint` / `with { ... }` / 7 个内置 constraint /
 operator lowering 等机制。
 
