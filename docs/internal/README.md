@@ -24,6 +24,9 @@
   git 历史。
 - 阅读 `archive/` 下文档的前提：理解它是当时的快照，**不是当前现状**。
   评估现状请回到 `roadmap.md` 与 `schema-rooted-implementation-log.md`。
+- perf baseline 文件（如 [`perf-baseline-2026-05-12.md`](./perf-baseline-2026-05-12.md)）
+  同样是 snapshot 性质，命名为 `perf-baseline-YYYY-MM-DD.md`，按需归档，
+  遵循上述同一份 retention policy。
 
 ## Archived
 
