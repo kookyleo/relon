@@ -1,0 +1,30 @@
+[package]
+name = "relon-wasm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "WASM bindings for the Relon language (browser playground / embeddable runtime)"
+keywords = ["wasm", "dsl", "config", "playground"]
+categories = ["wasm", "development-tools"]
+# Not published yet: kept internal until the docs playground (Wave 2/3)
+# ships and we have user-facing examples. Flip to true once the API
+# surface stabilises.
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+relon = { workspace = true }
+relon-parser = { workspace = true }
+relon-evaluator = { workspace = true }
+relon-analyzer = { workspace = true }
+relon-fmt = { workspace = true }
+miette = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+wasm-bindgen = "0.2"
+serde-wasm-bindgen = "0.6"

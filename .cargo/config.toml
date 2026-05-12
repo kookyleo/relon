@@ -1,0 +1,19 @@
+# Project-local cargo configuration.
+#
+# Why this exists: some contributors keep `[build] rustflags = ["-C",
+# "link-arg=-fuse-ld=mold"]` in their global `~/.cargo/config.toml` to
+# accelerate native link times. `mold` is x86_64-only and `rust-lld`
+# (the wasm32 linker) rejects `-fuse-ld=mold` outright, so without an
+# override here the wasm cdylib build (`relon-wasm`) fails at link
+# time. We explicitly blank out the wasm32 target rustflags so the
+# project builds out of the box regardless of the host's global cargo
+# settings. The default `release` and `release-small` profile knobs
+# (LTO, opt-level, panic-abort) still apply — they're profile-level,
+# not rustflag-level.
+[target.wasm32-unknown-unknown]
+# Empty would be ideal, but cargo treats `rustflags = []` at this
+# section as "no override" and falls back to `[build].rustflags`. A
+# benign no-op flag (e.g. `--cap-lints=warn`, which is the default
+# anyway) is enough to anchor this as a non-empty override and shadow
+# the host's mold link-arg.
+rustflags = ["--cap-lints=warn"]
