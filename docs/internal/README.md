@@ -10,6 +10,7 @@
 | [`schema-rooted-implementation-log.md`](./schema-rooted-implementation-log.md) | Phase A/B/C/D 落地日志，append-only。顶部带 "Reading guide" 索引 | 新决策回流时追加新章节；不重写历史条目 |
 | [`relon-self-consistency-review-2026-05-10.md`](./relon-self-consistency-review-2026-05-10.md) | 一次批判性审视的时间点快照（P0 capability hardening 已折叠进 roadmap） | 不要求长期同步；遵循下方 retention policy |
 | [`relon-self-consistency-review-2026-05-11.md`](./relon-self-consistency-review-2026-05-11.md) | schema-rooted Phase A-D 落地后的第二次批判性审视：沙箱实测语义、quickstart 门面、英文文档承诺 | 同上 |
+| [`playground-design-2026-05-12.md`](./playground-design-2026-05-12.md) | docs playground Wave 1 设计文档：relon-wasm crate 现状、jsonui 含义调研、editor 选型、Wave 2/3 实施拆分 | snapshot；Wave 2/3 落地后视为历史快照，遵循下方 retention policy |
 
 公开规范和用户文档仍以 `docs/zh/guide/spec.md`、`docs/zh/guide/*`
 以及对应英文文档为准。
@@ -27,6 +28,11 @@
 - perf baseline 文件（如 [`perf-baseline-2026-05-12.md`](./perf-baseline-2026-05-12.md)）
   同样是 snapshot 性质，命名为 `perf-baseline-YYYY-MM-DD.md`，按需归档，
   遵循上述同一份 retention policy。
+- feature design 文件（如 [`playground-design-2026-05-12.md`](./playground-design-2026-05-12.md)）
+  也是 snapshot 性质，命名为 `<feature>-design-YYYY-MM-DD.md`。决策回流进
+  `roadmap.md` 或 feature 实施完毕后转为历史快照，**不再要求与现状同步**；
+  按需归档进 `archive/`。同一 feature 多次设计迭代需新建新日期文件，
+  老文件 git mv 进 archive，保留 git 历史。
 
 ## Archived
 
