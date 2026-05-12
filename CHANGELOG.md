@@ -313,6 +313,26 @@ Authoring hygiene:
   commit time so multi-task workflows can spot cross-topic strays.
   `scripts/install-hooks.sh` symlinks it into `.git/hooks/`.
 
+### CI + MSRV pin
+
+Closes the "ship gate is local-only / CI absent" finding from the
+self-consistency review. The four-step ship gate (`fmt --check`,
+`clippy -D warnings`, `cargo test`, `relon-fmt --check` against all
+bundled fixtures + examples) is now reproduced verbatim in a
+`stable` job under `.github/workflows/ci.yml`, gated on every push
+to `main` and every pull request. A second `msrv` job builds the
+workspace against the freshly pinned `rust-version = "1.92"`
+(declared in `[workspace.package]`) so toolchain drift — and the
+day rustc bug `rust-lang/rust#147648` (proc-macro `unused_assignments`
+false-positive currently masked by two crate-level `#![allow]`s) gets
+fixed upstream — becomes visible in CI rather than silently floating
+forward. The MSRV is one minor below the current stable so the gate
+has room to breathe without lagging the ecosystem; max dep
+`rust-version` across the resolved graph is `1.87`, leaving
+comfortable headroom. Default workflow `permissions:` are narrowed
+to `contents: read` and `Swatinem/rust-cache@v2` keeps PR feedback
+under the patience threshold.
+
 ## [Unreleased] — Capability model hardening: 6-bit gate + unified register_fn
 
 ### BREAKING: capability bits go from 1 to 6, registration API collapses to one entry point

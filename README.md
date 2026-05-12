@@ -36,6 +36,13 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo run -q -p relon-fmt -- --check fixtures/*.relon fixtures/modules/*.relon fixtures/errors/*.relon examples/*.relon
 ```
 
+CI on GitHub Actions enforces the same four checks on every PR, plus
+a separate `cargo build` job against the pinned MSRV (`1.92`) so
+toolchain drift surfaces early.
+
+See [`SECURITY.md`](./SECURITY.md) for the sandbox threat model and
+how to report vulnerabilities.
+
 After a fresh clone, install the repository's git hooks once:
 ```bash
 ./scripts/install-hooks.sh
