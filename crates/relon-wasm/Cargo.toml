@@ -17,6 +17,20 @@ publish = false
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+# wasm-pack profile knobs.
+#
+# Rust 1.82+ emits `memory.copy` / `memory.fill` (the bulk-memory proposal)
+# unconditionally because the wasm32-unknown-unknown spec baseline now
+# enables them. The `wasm-opt` binary `wasm-pack` vendors defaults to a
+# pre-bulk-memory feature set and rejects the input as invalid. Explicitly
+# enable the feature so optimisation succeeds. Bulk-memory is supported by
+# every evergreen browser since 2021, so this widens nothing in practice.
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = ["-O", "--enable-bulk-memory", "--enable-nontrapping-float-to-int"]
+
+[package.metadata.wasm-pack.profile.profiling]
+wasm-opt = ["-O", "--enable-bulk-memory", "--enable-nontrapping-float-to-int"]
+
 [dependencies]
 relon = { workspace = true }
 relon-parser = { workspace = true }

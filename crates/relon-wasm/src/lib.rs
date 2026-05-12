@@ -27,6 +27,8 @@ use relon_evaluator::module::{ModuleResolver, ModuleSource, StdModuleResolver};
 use relon_evaluator::{Context, Evaluator, RuntimeError, Scope};
 use relon_parser::{parse_document, TokenRange};
 use serde::{Deserialize, Serialize};
+// Re-imported below where `value.serialize(&serializer)` is invoked; the
+// `use serde::Serialize` already in scope satisfies the trait bound.
 use wasm_bindgen::prelude::*;
 
 /// Structured error payload returned to JavaScript. Stable JSON shape so
@@ -135,7 +137,13 @@ fn err_to_js(report: ErrorReport) -> JsValue {
     // the JS side always sees *something* throwable rather than an
     // opaque `undefined`. Serialization should never fail in practice
     // (the struct is plain data), but defensive code is cheap here.
-    match serde_wasm_bindgen::to_value(&report) {
+    //
+    // `serialize_maps_as_objects(true)` matters here too: `spans` is a
+    // `Vec<SpanInfo>` (already a JS array), but the wrapping struct is
+    // serialised as a JS object — without the flag, downstream
+    // `err.kind` access on the JS side would fail.
+    let serializer = serde_wasm_bindgen::Serializer::new().serialize_maps_as_objects(true);
+    match report.serialize(&serializer) {
         Ok(value) => value,
         Err(_) => JsValue::from_str(&report.message),
     }
@@ -301,11 +309,21 @@ fn type_name(v: &serde_json::Value) -> &'static str {
 pub fn evaluate(sources: JsValue, entry: &str) -> Result<JsValue, JsValue> {
     let sources = decode_sources(sources).map_err(err_to_js)?;
     match evaluate_internal(&sources, entry) {
-        Ok(value) => serde_wasm_bindgen::to_value(&value).map_err(|err| {
-            err_to_js(ErrorReport::invalid_input(format!(
-                "result is not JS-serialisable: {err}"
-            )))
-        }),
+        Ok(value) => {
+            // `serde-wasm-bindgen` defaults to projecting `serde_json`
+            // objects as JS `Map` instances, which surprises every JS
+            // consumer (`JSON.stringify` returns `{}`, property access
+            // returns `undefined`). The playground wants plain objects,
+            // which is also what the README-documented contract implies
+            // ("projected JSON result"). Flip the flag on the serializer
+            // so maps round-trip as `{...}`.
+            let serializer = serde_wasm_bindgen::Serializer::new().serialize_maps_as_objects(true);
+            value.serialize(&serializer).map_err(|err| {
+                err_to_js(ErrorReport::invalid_input(format!(
+                    "result is not JS-serialisable: {err}"
+                )))
+            })
+        }
         Err(report) => Err(err_to_js(report)),
     }
 }
