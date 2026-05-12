@@ -17,14 +17,6 @@ export default defineConfig({
   description: "A production-grade, strongly-typed configuration language.",
   base: "/relon/",
 
-  // `internal/` snapshot docs carry forward-references to planned
-  // companion documents (e.g. `type-constraints-spec.md`) that haven't
-  // been promoted out of design yet. Whitelist exactly those slugs so
-  // reader-facing zh/ + en/ pages still get strict link checking.
-  ignoreDeadLinks: [
-    /^\.\/type-constraints-spec$/,
-  ],
-
   // Register the Relon TextMate grammar so shiki highlights every
   // ```relon ...``` block instead of falling back to `txt` (which used
   // to emit one "language not loaded" warning per code fence at dev
@@ -60,6 +52,7 @@ export default defineConfig({
               { text: '什么是 Relon？', link: '/zh/guide/introduction' },
               { text: '业务场景与定位', link: '/zh/guide/use-cases' },
               { text: '基础语法', link: '/zh/guide/syntax' },
+              { text: 'Playground', link: '/zh/playground' },
             ]
           },
           {
@@ -115,6 +108,7 @@ export default defineConfig({
               { text: 'What is Relon?', link: '/en/guide/introduction' },
               { text: 'Use cases & positioning', link: '/en/guide/use-cases' },
               { text: 'Syntax basics', link: '/en/guide/syntax' },
+              { text: 'Playground', link: '/en/playground' },
             ]
           },
           {

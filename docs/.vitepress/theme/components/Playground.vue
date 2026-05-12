@@ -13,8 +13,8 @@
        Showing a placeholder while the bundle and the wasm hydrate
        gives users immediate feedback rather than a blank slate.
 
-  Wave 3 will wrap this in a docs page with sidebar entry; for now the
-  page-level mount in `docs/playground.md` is the only consumer.
+  Mounted from `docs/zh/playground.md` and `docs/en/playground.md`
+  (both linked from the per-locale sidebar's "Getting started" group).
 -->
 <script setup lang="ts">
 import { defineAsyncComponent } from 'vue';
