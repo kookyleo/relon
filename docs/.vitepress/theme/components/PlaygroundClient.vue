@@ -32,6 +32,7 @@ import { setDiagnostics, lintGutter, type Diagnostic } from '@codemirror/lint';
 import { json as jsonLang } from '@codemirror/lang-json';
 
 import { relonLanguage } from './playground/relon-mode';
+import { PRESETS, DEFAULT_PRESET_ID, type Preset } from './playground/presets';
 
 // ---------------- types --------------------------------------------------
 
@@ -56,44 +57,26 @@ interface ErrorReport {
 }
 
 interface WasmModule {
-    default: (init?: unknown) => Promise<unknown>;
+    // wasm-pack `--target web` glue 0.2.x+ accepts `{ module_or_path }`;
+    // the legacy positional shape still works but logs a deprecation
+    // warning. We pass an object to keep the console clean.
+    default: (init?: { module_or_path?: unknown }) => Promise<unknown>;
     evaluate: (sources: unknown, entry: string) => unknown;
     format: (content: string) => string;
     version: () => string;
 }
 
-// ---------------- preset --------------------------------------------------
-
-// Default content: small, immediately interesting, exercises function
-// definitions, sibling refs, decorators, and f-strings. Lifted from
-// `examples/demo.relon` and lightly trimmed for vertical space.
-const DEFAULT_MAIN = `// Try editing me - evaluate runs automatically.
-{
-    currency(val, symbol): val + " " + symbol,
-    multiply(a, b): a * b,
-    project: {
-        name: "Relon Playground",
-        details: {
-            base_price: 1500,
-            total: multiply(&sibling.base_price, 1.2),
-            @currency("GBP")
-            display: &sibling.total
-        }
-    },
-    meta: {
-        tags_count: len(["rust", "config", "dsl"]),
-        summary: f"Active project: \${&root.project.name}"
-    }
-}
-`;
-
 // ---------------- reactive state -----------------------------------------
 
-const files = ref<PlaygroundFile[]>([
-    { path: 'main.relon', content: DEFAULT_MAIN },
-]);
-const activeFile = ref<string>('main.relon');
-const entry = ref<string>('main.relon');
+// Initial state derives from the default preset so the playground boots
+// with something interesting; subsequent preset selections load through
+// `loadPreset()` below (which also handles the multi-file case).
+const initialPreset = PRESETS.find((p) => p.id === DEFAULT_PRESET_ID) ?? PRESETS[0];
+const files = ref<PlaygroundFile[]>(
+    initialPreset.files.map((f) => ({ path: f.path, content: f.content }))
+);
+const activeFile = ref<string>(initialPreset.files[0].path);
+const entry = ref<string>(initialPreset.entry);
 const viewMode = ref<'json' | 'rendered'>('json');
 const resultJson = ref<string>('');
 const errors = ref<ErrorReport[]>([]);
@@ -101,6 +84,23 @@ const errorsExpanded = ref<boolean>(false);
 const status = ref<string>('Loading runtime…');
 const wasmVersion = ref<string>('');
 const isReady = ref<boolean>(false);
+
+// Currently selected preset id; drives the dropdown and the explanatory
+// banner. Not persisted across reloads — keeping URL hash-routing out of
+// scope for the first cut.
+const presetId = ref<string>(DEFAULT_PRESET_ID);
+const activePreset = computed<Preset>(() =>
+    PRESETS.find((p) => p.id === presetId.value) ?? PRESETS[0]
+);
+const presetBannerDismissed = ref<boolean>(false);
+
+// New-file modal state. We avoid `window.prompt` because it blocks the
+// event loop, can't be themed, and on some browsers (notably mobile
+// Safari) it's been quietly removed. Native `<dialog>` is in every
+// evergreen target VitePress supports today.
+const newFileDialog = ref<HTMLDialogElement | null>(null);
+const newFilePath = ref<string>('');
+const newFileError = ref<string>('');
 
 // Refs to DOM mount points.
 const editorHost = ref<HTMLElement | null>(null);
@@ -146,19 +146,78 @@ function setEntry(path: string) {
     void runEvaluate();
 }
 
-function addFile() {
-    // Minimal new-file UX: a `prompt()` is jarring but cheap. Wave 3 can
-    // upgrade to an inline form. Block paths already present.
-    const next = window.prompt('New file path (e.g. lib.relon):', 'lib.relon');
-    if (!next) return;
-    const trimmed = next.trim();
-    if (!trimmed) return;
-    if (files.value.some((f) => f.path === trimmed)) {
-        window.alert(`A file named "${trimmed}" already exists.`);
+function openNewFileDialog() {
+    newFilePath.value = 'lib.relon';
+    newFileError.value = '';
+    const dlg = newFileDialog.value;
+    if (!dlg) return;
+    // `showModal` is the right call here — it grabs focus, traps the
+    // Tab cycle, and closes on Esc without us wiring a keydown handler.
+    if (typeof dlg.showModal === 'function') {
+        dlg.showModal();
+    } else {
+        // Fallback for the (vanishingly small) set of browsers that
+        // shipped without `<dialog>` support.
+        dlg.setAttribute('open', '');
+    }
+    // Defer focus to after the dialog has actually rendered.
+    queueMicrotask(() => {
+        const input = dlg.querySelector('input');
+        if (input) (input as HTMLInputElement).focus();
+    });
+}
+
+function closeNewFileDialog() {
+    const dlg = newFileDialog.value;
+    if (!dlg) return;
+    if (typeof dlg.close === 'function') {
+        dlg.close();
+    } else {
+        dlg.removeAttribute('open');
+    }
+}
+
+function confirmNewFile() {
+    const raw = newFilePath.value.trim();
+    if (!raw) {
+        newFileError.value = 'Path cannot be empty.';
         return;
     }
-    files.value.push({ path: trimmed, content: '{\n    // ' + trimmed + '\n}\n' });
-    selectFile(trimmed);
+    // Append `.relon` if the user dropped the extension — keeps the
+    // import-by-path scenario obvious. Matching is case-sensitive
+    // because module ids are case-sensitive on the analyzer side.
+    const path = raw.endsWith('.relon') ? raw : `${raw}.relon`;
+    if (files.value.some((f) => f.path === path)) {
+        newFileError.value = `A file named "${path}" already exists.`;
+        return;
+    }
+    files.value.push({ path, content: `{\n    // ${path}\n}\n` });
+    closeNewFileDialog();
+    selectFile(path);
+}
+
+function loadPreset(id: string) {
+    const preset = PRESETS.find((p) => p.id === id);
+    if (!preset) return;
+    presetId.value = id;
+    presetBannerDismissed.value = false;
+    // Replace the full file set; keeps things deterministic even when
+    // the user has been editing — we trade auto-save for predictability.
+    files.value = preset.files.map((f) => ({ path: f.path, content: f.content }));
+    entry.value = preset.entry;
+    const nextActive = preset.files[0].path;
+    activeFile.value = nextActive;
+    const view = editorView.value;
+    if (view) {
+        view.dispatch({
+            changes: { from: 0, to: view.state.doc.length, insert: preset.files[0].content },
+        });
+    }
+    // Evaluate against the new payload. For non-sandbox-runnable presets
+    // this surfaces a genuine `EvalError` / `AnalyzeError`, which is the
+    // demo-correct behaviour; the banner above the error panel explains
+    // why and points at the CLI.
+    void runEvaluate();
 }
 
 function removeFile(path: string) {
@@ -185,7 +244,11 @@ async function bootWasm() {
         // `/* @vite-ignore */` suppresses Vite trying to follow the URL
         // statically; we want a plain runtime fetch.
         const mod = (await import(/* @vite-ignore */ glueUrl.href)) as WasmModule;
-        await mod.default(wasmUrl);
+        // wasm-bindgen 0.2.93+ deprecated the positional-arg shape in
+        // favour of `{ module_or_path }`. Passing the URL directly still
+        // works but logs a console warning every page load; passing the
+        // object keeps the console clean and is forward-compatible.
+        await mod.default({ module_or_path: wasmUrl });
         wasmRef.value = mod;
         wasmVersion.value = mod.version();
         isReady.value = true;
@@ -387,8 +450,34 @@ watch(files, () => {
 <template>
   <div class="relon-playground">
     <header class="rp-status">
+      <label class="rp-preset">
+        <span class="rp-preset-label">Example</span>
+        <select
+          class="rp-preset-select"
+          :value="presetId"
+          @change="loadPreset(($event.target as HTMLSelectElement).value)"
+        >
+          <option v-for="p in PRESETS" :key="p.id" :value="p.id">{{ p.label }}</option>
+        </select>
+      </label>
       <span class="rp-status-text">{{ status }}</span>
     </header>
+
+    <div
+      v-if="!activePreset.runnableInSandbox && !presetBannerDismissed"
+      class="rp-banner"
+      role="note"
+    >
+      <span class="rp-banner-text">{{
+        activePreset.note ??
+          'This example demonstrates source shape only; running requires host integration / args. See the CLI demo in the repo.'
+      }}</span>
+      <button
+        class="rp-banner-close"
+        title="Dismiss"
+        @click="presetBannerDismissed = true"
+      >×</button>
+    </div>
 
     <div class="rp-panes">
       <section class="rp-pane rp-pane-editor">
@@ -415,7 +504,7 @@ watch(files, () => {
               @click.stop="removeFile(f.path)"
             >×</span>
           </button>
-          <button class="rp-tab rp-tab-add" title="Add a new file" @click="addFile">+</button>
+          <button class="rp-tab rp-tab-add" title="Add a new file" @click="openNewFileDialog">+</button>
           <span class="rp-spacer" />
           <button
             class="rp-action"
@@ -472,6 +561,31 @@ watch(files, () => {
         </li>
       </ul>
     </details>
+
+    <dialog ref="newFileDialog" class="rp-dialog" @close="newFileError = ''">
+      <form class="rp-dialog-form" @submit.prevent="confirmNewFile">
+        <h3 class="rp-dialog-title">New file</h3>
+        <label class="rp-dialog-row">
+          <span class="rp-dialog-label">Path</span>
+          <input
+            v-model="newFilePath"
+            class="rp-dialog-input"
+            type="text"
+            placeholder="lib.relon"
+            autocomplete="off"
+            @keydown.esc.prevent="closeNewFileDialog"
+          />
+        </label>
+        <p v-if="newFileError" class="rp-dialog-error">{{ newFileError }}</p>
+        <p class="rp-dialog-hint">
+          If you omit the extension, <code>.relon</code> is appended.
+        </p>
+        <div class="rp-dialog-actions">
+          <button type="button" class="rp-dialog-btn" @click="closeNewFileDialog">Cancel</button>
+          <button type="submit" class="rp-dialog-btn rp-dialog-btn-primary">Create</button>
+        </div>
+      </form>
+    </dialog>
   </div>
 </template>
 
@@ -489,12 +603,77 @@ watch(files, () => {
 }
 
 .rp-status {
+  display: flex;
+  align-items: center;
+  gap: 12px;
   padding: 4px 12px;
   background: var(--vp-c-bg-soft);
   border-bottom: 1px solid var(--vp-c-divider);
   color: var(--vp-c-text-2);
   font-size: 12px;
 }
+
+.rp-preset {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.rp-preset-label {
+  color: var(--vp-c-text-3);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.rp-preset-select {
+  padding: 1px 6px;
+  border: 1px solid var(--vp-c-divider);
+  border-radius: 3px;
+  background: var(--vp-c-bg);
+  color: var(--vp-c-text-1);
+  font-size: 12px;
+  font-family: var(--vp-font-family-mono);
+}
+
+.rp-status-text { color: var(--vp-c-text-3); }
+
+.rp-banner {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 6px 12px;
+  background: var(--vp-c-warning-soft, #fff8e1);
+  border-bottom: 1px solid var(--vp-c-divider);
+  color: var(--vp-c-text-1);
+  font-size: 12px;
+}
+
+.rp-banner-text {
+  flex: 1 1 auto;
+  line-height: 1.45;
+}
+
+.rp-banner-text :deep(code),
+.rp-banner code {
+  font-family: var(--vp-font-family-mono);
+  font-size: 11px;
+  background: var(--vp-c-bg-soft);
+  padding: 0 4px;
+  border-radius: 3px;
+}
+
+.rp-banner-close {
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  color: var(--vp-c-text-2);
+  font-size: 16px;
+  line-height: 1;
+  padding: 0 4px;
+}
+
+.rp-banner-close:hover { color: var(--vp-c-text-1); }
 
 .rp-panes {
   display: grid;
@@ -708,6 +887,110 @@ watch(files, () => {
 .rp-error-span-label {
   color: var(--vp-c-text-2);
   font-style: italic;
+}
+
+.rp-dialog {
+  border: 1px solid var(--vp-c-divider);
+  border-radius: 6px;
+  background: var(--vp-c-bg);
+  color: var(--vp-c-text-1);
+  padding: 0;
+  min-width: 320px;
+  max-width: 480px;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.18);
+}
+
+.rp-dialog::backdrop {
+  background: rgba(0, 0, 0, 0.35);
+}
+
+.rp-dialog-form {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 16px;
+  font-size: 13px;
+}
+
+.rp-dialog-title {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.rp-dialog-row {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.rp-dialog-label {
+  color: var(--vp-c-text-2);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.rp-dialog-input {
+  padding: 4px 8px;
+  border: 1px solid var(--vp-c-divider);
+  border-radius: 4px;
+  background: var(--vp-c-bg-soft);
+  color: var(--vp-c-text-1);
+  font-family: var(--vp-font-family-mono);
+  font-size: 13px;
+}
+
+.rp-dialog-input:focus {
+  outline: 2px solid var(--vp-c-brand-1, #3eaf7c);
+  outline-offset: -1px;
+}
+
+.rp-dialog-error {
+  margin: 0;
+  color: var(--vp-c-danger-1, #b8333a);
+  font-size: 12px;
+}
+
+.rp-dialog-hint {
+  margin: 0;
+  color: var(--vp-c-text-3);
+  font-size: 11px;
+}
+
+.rp-dialog-hint code {
+  font-family: var(--vp-font-family-mono);
+  background: var(--vp-c-bg-soft);
+  padding: 0 4px;
+  border-radius: 3px;
+}
+
+.rp-dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.rp-dialog-btn {
+  padding: 4px 12px;
+  border: 1px solid var(--vp-c-divider);
+  border-radius: 4px;
+  background: var(--vp-c-bg);
+  color: var(--vp-c-text-1);
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.rp-dialog-btn:hover { background: var(--vp-c-default-soft); }
+
+.rp-dialog-btn-primary {
+  background: var(--vp-c-brand-1, #3eaf7c);
+  border-color: var(--vp-c-brand-1, #3eaf7c);
+  color: #ffffff;
+}
+
+.rp-dialog-btn-primary:hover {
+  background: var(--vp-c-brand-2, #379469);
 }
 
 @media (max-width: 768px) {

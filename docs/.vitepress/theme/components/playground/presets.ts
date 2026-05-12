@@ -1,0 +1,189 @@
+// Pre-baked example sources offered as a quick-switch dropdown in the
+// playground. Contents are inlined (rather than fetched at runtime) so
+// the playground stays self-contained — no extra network round trips,
+// no build-step magic for `?raw` imports, and the bundle works whether
+// VitePress is served from `/`, `/relon/`, or a CDN sub-path.
+//
+// Each preset declares its own `entry` plus a `runnableInSandbox` flag.
+// When `false`, the playground will still call `evaluate()` (we don't
+// want a special-case branch that hides errors) — but a dismissable
+// banner explains why an `EvalError` is the expected outcome. The four
+// `#main(...)` examples need either CLI `--args` or host-registered
+// native functions; running them in the in-browser sandbox surfaces a
+// genuine, demo-correct failure, and the banner points users at the
+// CLI command that does work.
+
+export interface PresetFile {
+    path: string;
+    content: string;
+}
+
+export interface Preset {
+    id: string;
+    label: string;
+    files: PresetFile[];
+    entry: string;
+    runnableInSandbox: boolean;
+    /** Shown above the error panel when this preset is active. */
+    note?: string;
+}
+
+const DEMO_MAIN = `// Try editing me - evaluate runs automatically.
+{
+    currency(val, symbol): val + " " + symbol,
+    multiply(a, b): a * b,
+    project: {
+        name: "Relon Playground",
+        details: {
+            base_price: 1500,
+            total: multiply(&sibling.base_price, 1.2),
+            @currency("GBP")
+            display: &sibling.total
+        }
+    },
+    meta: {
+        tags_count: len(["rust", "config", "dsl"]),
+        summary: f"Active project: \${&root.project.name}"
+    }
+}
+`;
+
+const PRICING_MAIN = `/*
+  Invoice pricing with tiered discounts and tax.
+  See examples/pricing.relon in the repo for the full annotated source.
+*/
+#schema LineItem {
+    String sku: * ,
+    #expect "qty must be > 0"
+    Int qty: (n) => n > 0,
+    #expect "unit_price must be >= 0"
+    Float unit_price: (p) => p >= 0
+}
+#schema Order {
+    List<LineItem> items: * ,
+    #expect "tier must be one of: standard / gold"
+    String tier: (t) => t == "standard" || t == "gold"
+}
+#main(Order order)
+{
+    #private
+    currency(symbol, val): symbol + " " + val,
+    #private
+    volume_rate(sub): sub >= 1000 ? 0.10: sub >= 500 ? 0.05: 0.0,
+    #private
+    loyalty_rate(tier): tier == "gold" ? 0.03: 0.0,
+    #private
+    tax_rate: 0.08,
+    #private
+    sum_floats(xs): _list_reduce(xs, 0.0, (a, x) => a + x),
+    subtotal: sum_floats([it.qty * it.unit_price for it in order.items]),
+    discount_rate: volume_rate(&sibling.subtotal) + loyalty_rate(order.tier),
+    discount_amount: &sibling.subtotal * &sibling.discount_rate,
+    taxable: &sibling.subtotal - &sibling.discount_amount,
+    tax_amount: &sibling.taxable * tax_rate,
+    total: &sibling.taxable + &sibling.tax_amount,
+    @currency("USD")
+    total_display: &sibling.total
+}
+`;
+
+const FEATURE_FLAG_MAIN = `/*
+  Runtime feature-flag evaluator.
+
+  Percentage rollouts need a host-registered \`native_hash(s) -> Int\`.
+  See examples/feature_flag.relon for the full annotated source.
+*/
+#schema User {
+    String id: * ,
+    String region: (r) => r == "us" || r == "eu" || r == "apac",
+    String plan: (p) => p == "free" || p == "pro" || p == "enterprise"
+}
+#main(User user) -> Dict<String, Dict<String, Bool>>
+{
+    #private
+    hash_mod_100(s): native_hash(s) % 100,
+    #private
+    rules: {
+        legacy_checkout: (u) => false,
+        dark_mode: (u) => true,
+        gdpr_banner: (u) => u.region == "eu",
+        advanced_editor: (u) => u.plan == "pro" || u.plan == "enterprise",
+        new_search: (u) => hash_mod_100(u.id) < 25
+    },
+    flags: {
+        legacy_checkout: rules.legacy_checkout(user),
+        dark_mode: rules.dark_mode(user),
+        gdpr_banner: rules.gdpr_banner(user),
+        advanced_editor: rules.advanced_editor(user),
+        new_search: rules.new_search(user)
+    }
+}
+`;
+
+const WORKFLOW_MAIN = `/*
+  Order workflow as a data-driven state machine.
+
+  Try via the CLI:
+    cargo run -q -p relon-cli -- run examples/workflow.relon \\
+        --args '{"state": "placed", "event": "pay"}'
+*/
+#schema Transition {
+    String from: (s) => s == "placed" || s == "paid" || s == "shipped",
+    String on: * ,
+    String to: (s) => s == "paid" || s == "shipped" || s == "delivered" || s == "cancelled",
+    List<String> emit: *
+}
+#main(String state, String event)
+{
+    #private
+    transitions: [
+        #brand Transition { from: "placed", on: "pay",     to: "paid",      emit: ["charge_card", "log_payment"] },
+        #brand Transition { from: "paid",   on: "ship",    to: "shipped",   emit: ["notify_shipper", "email_user"] },
+        #brand Transition { from: "shipped",on: "deliver", to: "delivered", emit: ["email_user"] },
+        #brand Transition { from: "placed", on: "cancel",  to: "cancelled", emit: [] },
+        #brand Transition { from: "paid",   on: "cancel",  to: "cancelled", emit: ["refund_card"] }
+    ],
+    #private
+    match_one(t): t.from == state && t.on == event,
+    #private
+    matched: _list_filter(&sibling.transitions, &sibling.match_one),
+    next_state: len(matched) > 0 ? matched[0].to: state,
+    emit: len(matched) > 0 ? matched[0].emit: ["unhandled_event"]
+}
+`;
+
+export const PRESETS: Preset[] = [
+    {
+        id: 'demo',
+        label: 'demo',
+        files: [{ path: 'main.relon', content: DEMO_MAIN }],
+        entry: 'main.relon',
+        runnableInSandbox: true,
+    },
+    {
+        id: 'pricing',
+        label: 'pricing',
+        files: [{ path: 'main.relon', content: PRICING_MAIN }],
+        entry: 'main.relon',
+        runnableInSandbox: false,
+        note: 'Pricing example: requires an `Order` value via CLI `--args`. The browser sandbox cannot supply arguments to `#main(Order order)`, so evaluate will fail. Source is shown for reference; run it locally with `cargo run -p relon-cli -- run examples/pricing.relon --args \'{...}\'`.',
+    },
+    {
+        id: 'feature_flag',
+        label: 'feature_flag',
+        files: [{ path: 'main.relon', content: FEATURE_FLAG_MAIN }],
+        entry: 'main.relon',
+        runnableInSandbox: false,
+        note: 'Feature-flag example: needs both `--args` and a host-registered `native_hash` function. The browser sandbox provides neither. Source is shown for reference; see the host-integration guide for wiring instructions.',
+    },
+    {
+        id: 'workflow',
+        label: 'workflow',
+        files: [{ path: 'main.relon', content: WORKFLOW_MAIN }],
+        entry: 'main.relon',
+        runnableInSandbox: false,
+        note: 'Workflow example: requires `{state, event}` via CLI `--args`. The browser sandbox cannot supply arguments to `#main(String state, String event)`, so evaluate will fail. Run locally with `cargo run -p relon-cli -- run examples/workflow.relon --args \'{...}\'`.',
+    },
+];
+
+export const DEFAULT_PRESET_ID = 'demo';
