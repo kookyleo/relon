@@ -3,6 +3,7 @@
 use relon_parser::{
     parse_document,
     source::{tokenize_source, SourceToken as Token, SourceTokenKind as TokenKind},
+    Expr, Node, TokenKey,
 };
 use std::path::PathBuf;
 
@@ -30,8 +31,16 @@ pub enum Error {
 }
 
 pub fn format_source(source: &str) -> Result<String, Error> {
-    validate_source(source)?;
-    let tokens = tokenize_source(source).map_err(|error| Error::Tokenize(error.to_string()))?;
+    let root = parse_document(source).map_err(|error| Error::Parse(error.to_string()))?;
+    // Phase 2: lift methods (closure-bound pairs) to the front of any
+    // Dict in which they trail a non-closure field. Performed as a
+    // pre-pass over the *source string* so subsequent token-level
+    // formatting sees a canonical pair order; the formatter itself
+    // doesn't need to know about the reorder.
+    let reordered = reorder_methods_first(source, &root);
+    let source_for_fmt = reordered.as_deref().unwrap_or(source);
+    let tokens =
+        tokenize_source(source_for_fmt).map_err(|error| Error::Tokenize(error.to_string()))?;
     let mut formatter = SourceFormatter::new(&tokens);
     let output = formatter.format();
     validate_source(&output)?;
@@ -45,6 +54,296 @@ pub fn is_formatted(source: &str) -> Result<bool, Error> {
 fn validate_source(source: &str) -> Result<(), Error> {
     parse_document(source).map_err(|error| Error::Parse(error.to_string()))?;
     Ok(())
+}
+
+// ----- Phase 2: method-first pair reordering ----------------------------
+
+/// Pair classification used by the reorder pre-pass. Mirrors
+/// `PairClass` lower down (used by the formatter for separator
+/// emission) — kept as a separate enum so the two stay decoupled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PairKind {
+    /// Value is an `Expr::Closure { ... }` — i.e. a function
+    /// definition (`name(p): body` lowered by the parser).
+    Method,
+    Field,
+}
+
+/// Single byte-range edit applied to the source string.
+struct PairEdit {
+    /// Inclusive start in the original source.
+    start: usize,
+    /// Exclusive end in the original source.
+    end: usize,
+    /// Replacement text for `source[start..end]`.
+    replacement: String,
+}
+
+/// Top-level reorder driver. Walks the parsed AST, collects edits for
+/// each Dict whose pairs are not already methods-first, then applies
+/// the edits right-to-left to produce a new source string. Returns
+/// `None` when no Dict needed reordering — the caller can then keep
+/// the original source pointer.
+fn reorder_methods_first(source: &str, root: &Node) -> Option<String> {
+    let mut edits: Vec<PairEdit> = Vec::new();
+    collect_dict_reorder_edits(root, false, source, &mut edits);
+    if edits.is_empty() {
+        return None;
+    }
+    edits.sort_by_key(|e| std::cmp::Reverse(e.start));
+    let mut out = source.to_string();
+    for edit in edits {
+        out.replace_range(edit.start..edit.end, &edit.replacement);
+    }
+    Some(out)
+}
+
+/// Walk `node` bottom-up, queuing a reorder edit for any Dict whose
+/// pairs need methods grouped to the front. `in_directive_body` is
+/// `true` exactly when this node is the immediate body of a
+/// `#schema` / `#extend` / `#derive` / similar `NameBody`/`Value`
+/// directive — those Dicts encode declarations whose order is
+/// semantically meaningful (field-declaration order), so we leave
+/// them alone. Children of the body that happen to be Dicts again
+/// (e.g. a nested default-value `{ ... }`) reorder normally.
+fn collect_dict_reorder_edits(
+    node: &Node,
+    in_directive_body: bool,
+    source: &str,
+    edits: &mut Vec<PairEdit>,
+) {
+    // Directive bodies — mark the immediate body Dict as
+    // declaration-shaped so it doesn't get reordered.
+    for dir in &node.directives {
+        let body = match &dir.body {
+            relon_parser::DirectiveBody::Value(b) => Some(b),
+            relon_parser::DirectiveBody::NameBody { body, .. } => Some(body),
+            _ => None,
+        };
+        if let Some(b) = body {
+            collect_dict_reorder_edits(b, true, source, edits);
+        }
+    }
+    // Decorator args + the expression children below are regular
+    // values; reorder applies inside them.
+    for dec in &node.decorators {
+        for arg in &dec.args {
+            collect_dict_reorder_edits(&arg.value, false, source, edits);
+        }
+    }
+    for child in expr_children(node) {
+        collect_dict_reorder_edits(child, false, source, edits);
+    }
+    if in_directive_body {
+        return;
+    }
+    let Expr::Dict(pairs) = &*node.expr else {
+        return;
+    };
+    if pairs.len() < 2 {
+        return;
+    }
+    let classified: Vec<(PairKind, &(TokenKey, Node))> = pairs
+        .iter()
+        .map(|p| (classify_dict_pair(p), p))
+        .collect();
+    if methods_already_first(&classified) {
+        return;
+    }
+    // Conservative v1 guard: skip reorder if the body contains a
+    // comment. Comment placement is brittle to byte-level reorder
+    // because comments live in the token stream, not the AST — we
+    // can't know which pair they "belong" to. Files with comments
+    // keep their original pair order.
+    let (body_start, body_end) = match dict_body_range(node, source) {
+        Some(range) => range,
+        None => return,
+    };
+    let body = &source[body_start..body_end];
+    if body.contains("//") || body.contains("/*") {
+        return;
+    }
+    // Build the new body text: methods (in original order) then
+    // fields (in original order), joined by `,\n`. Outer formatter
+    // re-indents the result, so this only has to produce a valid
+    // pair sequence.
+    let methods = classified.iter().filter(|(c, _)| *c == PairKind::Method);
+    let fields = classified.iter().filter(|(c, _)| *c == PairKind::Field);
+    let pieces: Vec<&str> = methods
+        .chain(fields)
+        .map(|(_, pair)| pair_source_slice(source, pair))
+        .collect();
+    let new_body = format!("\n{}\n", pieces.join(",\n"));
+    edits.push(PairEdit {
+        start: body_start,
+        end: body_end,
+        replacement: new_body,
+    });
+}
+
+fn classify_dict_pair(pair: &(TokenKey, Node)) -> PairKind {
+    let (_, value) = pair;
+    match &*value.expr {
+        Expr::Closure { .. } => PairKind::Method,
+        _ => PairKind::Field,
+    }
+}
+
+fn methods_already_first(classified: &[(PairKind, &(TokenKey, Node))]) -> bool {
+    let mut seen_field = false;
+    for (kind, _) in classified {
+        match kind {
+            PairKind::Field => seen_field = true,
+            PairKind::Method if seen_field => return false,
+            PairKind::Method => {}
+        }
+    }
+    true
+}
+
+/// Locate the byte range *inside* a Dict's braces (exclusive of
+/// `{` and `}`). Scans the source from the Dict node's range start
+/// for the first `{`, then walks forward with depth tracking for
+/// the matching `}`. Returns `None` if the braces can't be found —
+/// defensive; should not happen for a parsed Dict.
+fn dict_body_range(node: &Node, source: &str) -> Option<(usize, usize)> {
+    let span_start = node.range.start.offset;
+    let span_end = node.range.end.offset.min(source.len());
+    let span = &source[span_start..span_end];
+    let open_rel = span.find('{')?;
+    let open_abs = span_start + open_rel;
+    let mut depth = 0i32;
+    let bytes = source.as_bytes();
+    let mut i = open_abs;
+    while i < span_end {
+        let c = bytes[i] as char;
+        match c {
+            '"' => {
+                // Skip over a string literal (with backslash escape
+                // awareness) so an inner `{` / `}` doesn't move the
+                // depth counter.
+                i += 1;
+                while i < span_end {
+                    let cc = bytes[i] as char;
+                    if cc == '\\' {
+                        i += 2;
+                        continue;
+                    }
+                    if cc == '"' {
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+                continue;
+            }
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some((open_abs + 1, i));
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Source slice covering an entire Dict pair, including any
+/// directives / decorators attached to its value node (which
+/// precede the key in the source). Used to copy pair text verbatim
+/// when reordering.
+fn pair_source_slice<'a>(source: &'a str, pair: &(TokenKey, Node)) -> &'a str {
+    let (key, value) = pair;
+    let mut start = key_start_offset(key).unwrap_or(value.range.start.offset);
+    for dir in &value.directives {
+        start = start.min(dir.range.start.offset);
+    }
+    for dec in &value.decorators {
+        start = start.min(dec.range.start.offset);
+    }
+    let end = value.range.end.offset.min(source.len());
+    source[start..end].trim().into()
+}
+
+fn key_start_offset(key: &TokenKey) -> Option<usize> {
+    match key {
+        TokenKey::String(_, range, _) => Some(range.start.offset),
+        TokenKey::Dynamic(node, _) => Some(node.range.start.offset),
+        TokenKey::Spread(range) => Some(range.start.offset),
+        _ => None,
+    }
+}
+
+/// Yield expression children only — decorators and directives are
+/// walked separately by the reorder driver so it can flag the
+/// immediate body of a `#schema` / `#extend` / similar declaration
+/// directive as "don't reorder me".
+fn expr_children(node: &Node) -> Vec<&Node> {
+    let mut out = Vec::new();
+    match &*node.expr {
+        Expr::Dict(pairs) => {
+            for (key, value) in pairs {
+                if let TokenKey::Dynamic(inner, _) = key {
+                    out.push(inner);
+                }
+                out.push(value);
+            }
+        }
+        Expr::List(items) => out.extend(items.iter()),
+        Expr::Spread(inner) => out.push(inner),
+        Expr::Comprehension {
+            element,
+            iterable,
+            condition,
+            ..
+        } => {
+            out.push(element);
+            out.push(iterable);
+            if let Some(c) = condition {
+                out.push(c);
+            }
+        }
+        Expr::Binary(_, l, r) => {
+            out.push(l);
+            out.push(r);
+        }
+        Expr::Unary(_, inner) => out.push(inner),
+        Expr::Ternary { cond, then, els } => {
+            out.push(cond);
+            out.push(then);
+            out.push(els);
+        }
+        Expr::FnCall { args, .. } => {
+            for arg in args {
+                out.push(&arg.value);
+            }
+        }
+        Expr::FString(parts) => {
+            for part in parts {
+                if let relon_parser::FStringPart::Interpolation(n) = part {
+                    out.push(n);
+                }
+            }
+        }
+        Expr::Where { expr, bindings } => {
+            out.push(expr);
+            out.push(bindings);
+        }
+        Expr::Match { expr, arms } => {
+            out.push(expr);
+            for (pat, body) in arms {
+                out.push(pat);
+                out.push(body);
+            }
+        }
+        Expr::Closure { body, .. } => out.push(body),
+        Expr::VariantCtor { body, .. } => out.push(body),
+        _ => {}
+    }
+    out
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -857,6 +1156,52 @@ mod tests {
         assert!(
             formatted.contains("}\n\n#main("),
             "missing blank between #schema B and #main: {formatted}"
+        );
+    }
+
+    #[test]
+    fn methods_lifted_to_front_of_dict() {
+        // Scrambled order: field, method, field, method. After fmt,
+        // methods come first (preserving relative order), then fields
+        // (also in original order), with a blank line between the
+        // two groups.
+        let source = "{\n    project: { name: \"x\" },\n    multiply(a, b): a * b,\n    meta: { count: 3 },\n    currency(v, s): v + \" \" + s\n}\n";
+        let formatted = format_source(source).unwrap();
+        let methods_idx = formatted.find("multiply").unwrap();
+        let currency_idx = formatted.find("currency").unwrap();
+        let project_idx = formatted.find("project:").unwrap();
+        let meta_idx = formatted.find("meta:").unwrap();
+        assert!(methods_idx < currency_idx, "method order preserved");
+        assert!(currency_idx < project_idx, "methods land before fields");
+        assert!(project_idx < meta_idx, "field order preserved");
+        // Idempotent: second pass produces the same output.
+        assert_eq!(format_source(&formatted).unwrap(), formatted);
+    }
+
+    #[test]
+    fn schema_body_field_order_preserved() {
+        // Schema fields with predicate-shaped closure values must
+        // not get reordered — schemas are declarations, not Dict
+        // bodies in the reorder-policy sense.
+        let source = "#schema User {\n    String name: *,\n    Int age: (a) => a >= 0\n}\n\n{\n    x: 1\n}\n";
+        let formatted = format_source(source).unwrap();
+        let name_idx = formatted.find("String name").unwrap();
+        let age_idx = formatted.find("Int age").unwrap();
+        assert!(name_idx < age_idx, "schema field order preserved: {formatted}");
+    }
+
+    #[test]
+    fn comments_disable_reorder() {
+        // Conservative v1: any comment inside the Dict body disables
+        // reorder for that Dict (comments can't be statically routed
+        // to a specific pair).
+        let source = "{\n    // keep me\n    project: { x: 1 },\n    multiply(a, b): a * b\n}\n";
+        let formatted = format_source(source).unwrap();
+        let project_idx = formatted.find("project:").unwrap();
+        let multiply_idx = formatted.find("multiply").unwrap();
+        assert!(
+            project_idx < multiply_idx,
+            "expected original order kept when comments present: {formatted}"
         );
     }
 
