@@ -26,6 +26,8 @@ export interface Preset {
     runnableInSandbox: boolean;
     /** Shown above the error panel when this preset is active. */
     note?: string;
+    /** Pre-fills the playground's "Args" input. Pretty-printed JSON. */
+    defaultArgs?: string;
 }
 
 const DEMO_MAIN = `// Try editing me - evaluate runs automatically.
@@ -166,7 +168,17 @@ export const PRESETS: Preset[] = [
         files: [{ path: 'main.relon', content: PRICING_MAIN }],
         entry: 'main.relon',
         runnableInSandbox: false,
-        note: 'Pricing example: requires an `Order` value via CLI `--args`. The browser sandbox cannot supply arguments to `#main(Order order)`, so evaluate will fail. Source is shown for reference; run it locally with `cargo run -p relon-cli -- run examples/pricing.relon --args \'{...}\'`.',
+        note: '`#main(Order order)` expects an `order` argument. Fill the Args box (right side of the title bar) and click Run — or use the CLI with the same JSON.',
+        defaultArgs: `{
+  "order": {
+    "tier": "gold",
+    "items": [
+      { "sku": "BOOK-01", "qty": 3, "unit_price": 100.0 },
+      { "sku": "PEN-09",  "qty": 4, "unit_price": 50.0  },
+      { "sku": "DESK-22", "qty": 1, "unit_price": 300.0 }
+    ]
+  }
+}`,
     },
     {
         id: 'feature_flag',
@@ -174,7 +186,10 @@ export const PRESETS: Preset[] = [
         files: [{ path: 'main.relon', content: FEATURE_FLAG_MAIN }],
         entry: 'main.relon',
         runnableInSandbox: false,
-        note: 'Feature-flag example: needs both `--args` and a host-registered `native_hash` function. The browser sandbox provides neither. Source is shown for reference; see the host-integration guide for wiring instructions.',
+        note: '`#main(User user)` expects a `user` argument *and* a host-registered `native_hash` fn. The Args input takes care of the first; the browser sandbox can\'t register host fns, so evaluate still fails on `new_search` — see the host-integration guide for wiring.',
+        defaultArgs: `{
+  "user": { "id": "u123", "region": "us", "plan": "pro" }
+}`,
     },
     {
         id: 'workflow',
@@ -182,7 +197,11 @@ export const PRESETS: Preset[] = [
         files: [{ path: 'main.relon', content: WORKFLOW_MAIN }],
         entry: 'main.relon',
         runnableInSandbox: false,
-        note: 'Workflow example: requires `{state, event}` via CLI `--args`. The browser sandbox cannot supply arguments to `#main(String state, String event)`, so evaluate will fail. Run locally with `cargo run -p relon-cli -- run examples/workflow.relon --args \'{...}\'`.',
+        note: '`#main(String state, String event)` expects `state` and `event` arguments. Fill the Args box (right side of the title bar) and click Run.',
+        defaultArgs: `{
+  "state": "placed",
+  "event": "pay"
+}`,
     },
 ];
 

@@ -24,7 +24,7 @@ use miette::Diagnostic as MietteDiagnostic;
 use relon::ResolverChainLoader;
 use relon_analyzer::{analyze_entry, Severity};
 use relon_evaluator::module::{ModuleResolver, ModuleSource, StdModuleResolver};
-use relon_evaluator::{Context, Evaluator, RuntimeError, Scope};
+use relon_evaluator::{Context, Evaluator, RuntimeError, Scope, Value};
 use relon_parser::{parse_document, TokenRange};
 use serde::{Deserialize, Serialize};
 // Re-imported below where `value.serialize(&serializer)` is invoked; the
@@ -308,7 +308,7 @@ fn type_name(v: &serde_json::Value) -> &'static str {
 #[wasm_bindgen]
 pub fn evaluate(sources: JsValue, entry: &str) -> Result<JsValue, JsValue> {
     let sources = decode_sources(sources).map_err(err_to_js)?;
-    match evaluate_internal(&sources, entry) {
+    match evaluate_internal(&sources, entry, None) {
         Ok(value) => {
             // `serde-wasm-bindgen` defaults to projecting `serde_json`
             // objects as JS `Map` instances, which surprises every JS
@@ -328,9 +328,56 @@ pub fn evaluate(sources: JsValue, entry: &str) -> Result<JsValue, JsValue> {
     }
 }
 
+/// Evaluate `entry` as an entry program: validate `args` against the
+/// file's `#main(...)` signature and bind each parameter before running
+/// the body. Counterpart to the CLI's `--args` path.
+///
+/// `args` accepts either a JS object `{name: value}` (most common, as
+/// JS callers can `JSON.parse` the user's input themselves) or `null`/
+/// `undefined` for an empty map. Each value is fed through `Value`'s
+/// serde deserialiser, so the JSON shape is identical to the CLI.
+#[wasm_bindgen]
+pub fn evaluate_main(sources: JsValue, entry: &str, args: JsValue) -> Result<JsValue, JsValue> {
+    let sources = decode_sources(sources).map_err(err_to_js)?;
+    let args = decode_args(args).map_err(err_to_js)?;
+    match evaluate_internal(&sources, entry, Some(args)) {
+        Ok(value) => {
+            let serializer =
+                serde_wasm_bindgen::Serializer::new().serialize_maps_as_objects(true);
+            value.serialize(&serializer).map_err(|err| {
+                err_to_js(ErrorReport::invalid_input(format!(
+                    "result is not JS-serialisable: {err}"
+                )))
+            })
+        }
+        Err(report) => Err(err_to_js(report)),
+    }
+}
+
+fn decode_args(value: JsValue) -> Result<HashMap<String, Value>, ErrorReport> {
+    if value.is_undefined() || value.is_null() {
+        return Ok(HashMap::new());
+    }
+    let json: serde_json::Value = serde_wasm_bindgen::from_value(value).map_err(|err| {
+        ErrorReport::invalid_input(format!("args is not JSON-serialisable: {err}"))
+    })?;
+    match json {
+        serde_json::Value::Object(_) => serde_json::from_value(json).map_err(|err| {
+            ErrorReport::invalid_input(format!(
+                "args must be a JSON object keyed by `#main(...)` parameter names: {err}"
+            ))
+        }),
+        other => Err(ErrorReport::invalid_input(format!(
+            "args: expected object, got {}",
+            type_name(&other)
+        ))),
+    }
+}
+
 fn evaluate_internal(
     sources: &HashMap<String, String>,
     entry: &str,
+    args: Option<HashMap<String, Value>>,
 ) -> Result<serde_json::Value, ErrorReport> {
     let source = sources.get(entry).ok_or_else(|| {
         ErrorReport::invalid_input(format!(
@@ -402,9 +449,24 @@ fn evaluate_internal(
     root_scope.current_dir = entry_dir;
     root_scope.cache_namespace = entry.to_string();
 
-    let value = evaluator
-        .eval_root(&Arc::new(root_scope))
-        .map_err(|err| ErrorReport::from_miette(ErrorKind::EvalError, &err, Some(entry)))?;
+    let scope_arc = Arc::new(root_scope);
+    let value = match args {
+        Some(args_map) => evaluator
+            .run_main(&scope_arc, args_map)
+            .map_err(|err| ErrorReport::from_miette(ErrorKind::EvalError, &err, Some(entry)))?,
+        None => evaluator.eval_root(&scope_arc).map_err(|err| {
+            // The browser sandbox's auto-evaluate runs `eval_root`, not
+            // `run_main`, so a `#main(Order order)` script reaches
+            // `order.items` with no binding for `order` and the
+            // generic `VariableNotFound` surfaces. That's technically
+            // accurate but misleading — `order` is right there in the
+            // signature — so we rewrite it to `MissingMainArg`, which
+            // says what's actually missing. Anything else passes
+            // through untouched.
+            let err = rewrite_missing_main_arg(&ctx, err);
+            ErrorReport::from_miette(ErrorKind::EvalError, &err, Some(entry))
+        })?,
+    };
 
     relon::to_json_value(value).map_err(|err| match err {
         relon::Error::NonFiniteFloat(_)
@@ -424,6 +486,37 @@ fn evaluate_internal(
             code: None,
         },
     })
+}
+
+/// Reframe a generic `VariableNotFound` as `MissingMainArg` when the
+/// missing name is one declared by the entry's `#main(...)` signature.
+///
+/// We run scripts via `eval_root` rather than `run_main`, so a
+/// `#main(Order order)` script that references `order.items` raises
+/// `VariableNotFound("order")`. The playground user sees `order` right
+/// there in the signature and reasonably finds that error misleading.
+/// `MissingMainArg` says what's actually wrong and points at the
+/// missing argument — same diagnostic the evaluator emits when a host
+/// calls `run_main` with an incomplete arg map.
+fn rewrite_missing_main_arg(ctx: &Context, err: RuntimeError) -> RuntimeError {
+    let name = match &err {
+        RuntimeError::VariableNotFound(n, _) => n.clone(),
+        _ => return err,
+    };
+    // Point the marker at the parameter's declaration site (`#main(...)
+    // <name>`) — that's the contract the missing arg violates. The
+    // use-site is just where evaluation noticed; matching `run_main`'s
+    // own behaviour keeps both paths consistent.
+    let param_range = ctx
+        .analyzed
+        .as_ref()
+        .and_then(|tree| tree.main_signature.as_ref())
+        .and_then(|sig| sig.params.iter().find(|p| p.name == name))
+        .map(|p| p.range);
+    match param_range {
+        Some(range) => RuntimeError::MissingMainArg { name, range },
+        None => err,
+    }
 }
 
 fn workspace_to_report(workspace: &relon_analyzer::WorkspaceTree) -> ErrorReport {
@@ -534,7 +627,7 @@ mod tests {
     #[test]
     fn evaluates_single_file_arithmetic() {
         let sources = single_file(r#"{ val: 1 + 2 * 3 }"#);
-        let value = evaluate_internal(&sources, "main.relon").unwrap();
+        let value = evaluate_internal(&sources, "main.relon", None).unwrap();
         assert_eq!(
             value,
             serde_json::json!({
@@ -557,7 +650,7 @@ mod tests {
             .to_string(),
         );
         sources.insert("lib.relon".to_string(), r#"{ hello: "hi" }"#.to_string());
-        let value = evaluate_internal(&sources, "main.relon").unwrap();
+        let value = evaluate_internal(&sources, "main.relon", None).unwrap();
         assert_eq!(
             value,
             serde_json::json!({
@@ -569,14 +662,14 @@ mod tests {
     #[test]
     fn parse_error_surfaces_as_parse_kind() {
         let sources = single_file("{ not closed");
-        let err = evaluate_internal(&sources, "main.relon").unwrap_err();
+        let err = evaluate_internal(&sources, "main.relon", None).unwrap_err();
         assert_eq!(err.kind, ErrorKind::ParseError);
     }
 
     #[test]
     fn missing_entry_is_invalid_input() {
         let sources = single_file("{ a: 1 }");
-        let err = evaluate_internal(&sources, "does-not-exist.relon").unwrap_err();
+        let err = evaluate_internal(&sources, "does-not-exist.relon", None).unwrap_err();
         assert_eq!(err.kind, ErrorKind::InvalidInput);
     }
 
@@ -594,7 +687,7 @@ mod tests {
     x: missing.value
 }"#,
         );
-        let err = evaluate_internal(&sources, "main.relon").unwrap_err();
+        let err = evaluate_internal(&sources, "main.relon", None).unwrap_err();
         assert_eq!(err.kind, ErrorKind::AnalyzeError);
     }
 

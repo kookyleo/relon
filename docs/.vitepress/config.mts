@@ -43,7 +43,8 @@ export default defineConfig({
       themeConfig: {
         nav: [
           { text: '首页', link: '/zh/' },
-          { text: '指南', link: '/zh/guide/introduction' }
+          { text: '指南', link: '/zh/guide/introduction' },
+          { text: 'Playground', link: '/zh/playground' }
         ],
         sidebar: [
           {
@@ -52,7 +53,6 @@ export default defineConfig({
               { text: '什么是 Relon？', link: '/zh/guide/introduction' },
               { text: '业务场景与定位', link: '/zh/guide/use-cases' },
               { text: '基础语法', link: '/zh/guide/syntax' },
-              { text: 'Playground', link: '/zh/playground' },
             ]
           },
           {
@@ -99,7 +99,8 @@ export default defineConfig({
       themeConfig: {
         nav: [
           { text: 'Home', link: '/en/' },
-          { text: 'Guide', link: '/en/guide/introduction' }
+          { text: 'Guide', link: '/en/guide/introduction' },
+          { text: 'Playground', link: '/en/playground' }
         ],
         sidebar: [
           {
@@ -108,7 +109,6 @@ export default defineConfig({
               { text: 'What is Relon?', link: '/en/guide/introduction' },
               { text: 'Use cases & positioning', link: '/en/guide/use-cases' },
               { text: 'Syntax basics', link: '/en/guide/syntax' },
-              { text: 'Playground', link: '/en/playground' },
             ]
           },
           {

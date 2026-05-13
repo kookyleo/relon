@@ -33,6 +33,11 @@ import { json as jsonLang } from '@codemirror/lang-json';
 
 import { relonLanguage } from './playground/relon-mode';
 import { PRESETS, DEFAULT_PRESET_ID, type Preset } from './playground/presets';
+import {
+    runtimeErrorExtension,
+    setRuntimeErrors,
+    type RuntimeErrorMark,
+} from './playground/runtime-errors';
 
 // ---------------- types --------------------------------------------------
 
@@ -62,6 +67,7 @@ interface WasmModule {
     // warning. We pass an object to keep the console clean.
     default: (init?: { module_or_path?: unknown }) => Promise<unknown>;
     evaluate: (sources: unknown, entry: string) => unknown;
+    evaluate_main: (sources: unknown, entry: string, args: unknown) => unknown;
     format: (content: string) => string;
     version: () => string;
 }
@@ -92,7 +98,6 @@ const presetId = ref<string>(DEFAULT_PRESET_ID);
 const activePreset = computed<Preset>(() =>
     PRESETS.find((p) => p.id === presetId.value) ?? PRESETS[0]
 );
-const presetBannerDismissed = ref<boolean>(false);
 
 // New-file modal state. We avoid `window.prompt` because it blocks the
 // event loop, can't be themed, and on some browsers (notably mobile
@@ -105,6 +110,20 @@ const newFileError = ref<string>('');
 // Refs to DOM mount points.
 const editorHost = ref<HTMLElement | null>(null);
 const jsonHost = ref<HTMLElement | null>(null);
+const panesEl = ref<HTMLElement | null>(null);
+
+// Editor / output split, in percent of `.rp-panes` width. Pointer drag
+// on `.rp-resizer` mutates it; clamped to keep both panes usable.
+const editorWidthPct = ref<number>(50);
+
+// Errors panel height in CSS pixels (only honoured when the panel is
+// open). Drag the top edge to resize — Chrome devtools style.
+const errorsHeight = ref<number>(240);
+
+// Args input for `#main(...)` entries. Pre-filled from the preset's
+// `defaultArgs` and editable; the Run button feeds it to wasm's
+// `evaluate_main`. Empty text means "no args" (auto-eval handles that).
+const argsInput = ref<string>(initialPreset.defaultArgs ?? '');
 
 // Editor instances (shallow: CM objects are mutable, we don't want Vue
 // to reach inside them).
@@ -200,7 +219,7 @@ function loadPreset(id: string) {
     const preset = PRESETS.find((p) => p.id === id);
     if (!preset) return;
     presetId.value = id;
-    presetBannerDismissed.value = false;
+    argsInput.value = preset.defaultArgs ?? '';
     // Replace the full file set; keeps things deterministic even when
     // the user has been editing — we trade auto-save for predictability.
     files.value = preset.files.map((f) => ({ path: f.path, content: f.content }));
@@ -215,8 +234,8 @@ function loadPreset(id: string) {
     }
     // Evaluate against the new payload. For non-sandbox-runnable presets
     // this surfaces a genuine `EvalError` / `AnalyzeError`, which is the
-    // demo-correct behaviour; the banner above the error panel explains
-    // why and points at the CLI.
+    // demo-correct behaviour; the context hint inside the error panel
+    // explains why and points at the CLI.
     void runEvaluate();
 }
 
@@ -295,6 +314,51 @@ async function runEvaluate() {
     }
 }
 
+/// Run the entry through `evaluate_main`, feeding it the user-supplied
+/// args JSON. Triggered by the explicit Run button — auto-eval keeps
+/// using arg-less `evaluate` so `#main(...)` scripts surface their
+/// missing-arg error live as you type.
+async function runWithArgs() {
+    const mod = wasmRef.value;
+    if (!mod) return;
+    const payload = files.value.map((f) => ({ path: f.path, content: f.content }));
+    let parsedArgs: unknown = undefined;
+    const text = argsInput.value.trim();
+    if (text.length > 0) {
+        try {
+            parsedArgs = JSON.parse(text);
+        } catch (err) {
+            errors.value = [{
+                kind: 'InvalidInput',
+                message: `Args is not valid JSON: ${(err as Error).message}`,
+                spans: [],
+                help: 'The Args box accepts a JSON object keyed by `#main(...)` parameter names.',
+                code: null,
+            }];
+            errorsExpanded.value = true;
+            applyDiagnosticsForActive();
+            return;
+        }
+    }
+    try {
+        const value = mod.evaluate_main(payload, entry.value, parsedArgs);
+        errors.value = [];
+        resultJson.value = JSON.stringify(value, null, 2);
+        applyDiagnosticsForActive();
+    } catch (raw) {
+        const report = coerceErrorReport(raw);
+        errors.value = [report];
+        resultJson.value = '';
+        errorsExpanded.value = true;
+        applyDiagnosticsForActive();
+    }
+    if (jsonView.value) {
+        jsonView.value.dispatch({
+            changes: { from: 0, to: jsonView.value.state.doc.length, insert: resultJson.value },
+        });
+    }
+}
+
 function runFormat() {
     const mod = wasmRef.value;
     const view = editorView.value;
@@ -347,23 +411,42 @@ function applyDiagnosticsForActive() {
     if (!view) return;
     const docLen = view.state.doc.length;
     const diagnostics: Diagnostic[] = [];
+    const runtimeMarks: RuntimeErrorMark[] = [];
     for (const report of errors.value) {
+        // Parse / analyze problems are source-level — lint's red squiggle
+        // is the right vocabulary. Eval / projection problems happen at
+        // runtime against valid syntax; we route them through a separate
+        // decoration so the line gets a soft highlight + a gutter dot
+        // instead of a "syntax error" squiggle.
+        const isRuntime =
+            report.kind === 'EvalError' || report.kind === 'ProjectionError';
         for (const span of report.spans) {
             if (span.file !== activeFile.value) continue;
             // Clamp to current doc length; a recently edited buffer can
             // drift past the offsets the analyzer saw.
             const from = Math.min(span.start, docLen);
             const to = Math.min(span.end > span.start ? span.end : span.start + 1, docLen);
-            diagnostics.push({
-                from,
-                to,
-                severity: 'error',
-                message: span.label ? `${span.label}: ${report.message}` : report.message,
-                source: report.code ?? report.kind,
-            });
+            const message = span.label
+                ? `${span.label}: ${report.message}`
+                : report.message;
+            if (isRuntime) {
+                runtimeMarks.push({
+                    line: view.state.doc.lineAt(from).number,
+                    message,
+                });
+            } else {
+                diagnostics.push({
+                    from,
+                    to,
+                    severity: 'error',
+                    message,
+                    source: report.code ?? report.kind,
+                });
+            }
         }
     }
     view.dispatch(setDiagnostics(view.state, diagnostics));
+    view.dispatch({ effects: setRuntimeErrors.of(runtimeMarks) });
 }
 
 function jumpToSpan(report: ErrorReport, span: ErrorSpan) {
@@ -384,6 +467,61 @@ function jumpToSpan(report: ErrorReport, span: ErrorSpan) {
     // Surface the message even when the span is on the active file —
     // helpful when the error is in a region not currently visible.
     void report;
+}
+
+function startResize(e: PointerEvent) {
+    const panes = panesEl.value;
+    if (!panes) return;
+    const total = panes.clientWidth;
+    if (total <= 0) return;
+    e.preventDefault();
+    const target = e.currentTarget as HTMLElement;
+    target.setPointerCapture(e.pointerId);
+    const startX = e.clientX;
+    const startW = editorWidthPct.value;
+
+    const onMove = (ev: PointerEvent) => {
+        const dx = ev.clientX - startX;
+        const next = startW + (dx / total) * 100;
+        editorWidthPct.value = Math.min(80, Math.max(20, next));
+    };
+    const stop = () => {
+        try { target.releasePointerCapture(e.pointerId); } catch { /* already released */ }
+        target.removeEventListener('pointermove', onMove);
+        target.removeEventListener('pointerup', stop);
+        target.removeEventListener('pointercancel', stop);
+    };
+    target.addEventListener('pointermove', onMove);
+    target.addEventListener('pointerup', stop);
+    target.addEventListener('pointercancel', stop);
+}
+
+function startErrorsResize(e: PointerEvent) {
+    // Drag is only meaningful while the panel is open. Closed → no-op,
+    // so a stray pointerdown on the title bar doesn't visually do
+    // anything. The +/- button has its own @pointerdown.stop.
+    if (!errorsExpanded.value) return;
+    e.preventDefault();
+    const target = e.currentTarget as HTMLElement;
+    target.setPointerCapture(e.pointerId);
+    const startY = e.clientY;
+    const startH = errorsHeight.value;
+
+    const onMove = (ev: PointerEvent) => {
+        // Dragging up (negative dy) grows the panel.
+        const next = startH - (ev.clientY - startY);
+        const ceiling = Math.max(120, window.innerHeight * 0.75);
+        errorsHeight.value = Math.min(ceiling, Math.max(80, next));
+    };
+    const stop = () => {
+        try { target.releasePointerCapture(e.pointerId); } catch { /* already released */ }
+        target.removeEventListener('pointermove', onMove);
+        target.removeEventListener('pointerup', stop);
+        target.removeEventListener('pointercancel', stop);
+    };
+    target.addEventListener('pointermove', onMove);
+    target.addEventListener('pointerup', stop);
+    target.addEventListener('pointercancel', stop);
 }
 
 onMounted(() => {
@@ -407,6 +545,7 @@ onMounted(() => {
             syntaxHighlighting(defaultHighlightStyle, { fallback: true }),
             lintGutter(),
             gutter({ class: 'cm-relon-gutter' }),
+            runtimeErrorExtension,
             keymap.of([...defaultKeymap, ...historyKeymap, indentWithTab]),
             langCompartment.of(relonLanguage()),
             EditorView.lineWrapping,
@@ -461,25 +600,35 @@ watch(files, () => {
         </select>
       </label>
       <span class="rp-status-text">{{ status }}</span>
+      <span class="rp-status-spacer" />
+      <label v-if="!activePreset.runnableInSandbox" class="rp-args">
+        <span class="rp-args-label">Args</span>
+        <input
+          v-model="argsInput"
+          class="rp-args-input"
+          type="text"
+          spellcheck="false"
+          autocomplete="off"
+          autocorrect="off"
+          autocapitalize="off"
+          placeholder='{"...": ...}'
+          @keydown.enter.prevent="runWithArgs"
+        />
+      </label>
+      <button
+        v-if="!activePreset.runnableInSandbox"
+        class="rp-action rp-run"
+        :disabled="!isReady"
+        title="Evaluate with the args JSON above"
+        @click="runWithArgs"
+      >Run</button>
     </header>
 
     <div
-      v-if="!activePreset.runnableInSandbox && !presetBannerDismissed"
-      class="rp-banner"
-      role="note"
+      ref="panesEl"
+      class="rp-panes"
+      :style="{ '--rp-editor-w': editorWidthPct + '%' }"
     >
-      <span class="rp-banner-text">{{
-        activePreset.note ??
-          'This example demonstrates source shape only; running requires host integration / args. See the CLI demo in the repo.'
-      }}</span>
-      <button
-        class="rp-banner-close"
-        title="Dismiss"
-        @click="presetBannerDismissed = true"
-      >×</button>
-    </div>
-
-    <div class="rp-panes">
       <section class="rp-pane rp-pane-editor">
         <div class="rp-tabs">
           <button
@@ -516,6 +665,17 @@ watch(files, () => {
         <div ref="editorHost" class="rp-editor"></div>
       </section>
 
+      <div
+        class="rp-resizer"
+        role="separator"
+        aria-orientation="vertical"
+        :aria-valuenow="Math.round(editorWidthPct)"
+        aria-valuemin="20"
+        aria-valuemax="80"
+        title="Drag to resize"
+        @pointerdown="startResize"
+      ></div>
+
       <section class="rp-pane rp-pane-output">
         <div class="rp-tabs">
           <button
@@ -533,34 +693,61 @@ watch(files, () => {
       </section>
     </div>
 
-    <details class="rp-errors" :open="errorsExpanded && errors.length > 0">
-      <summary @click="errorsExpanded = !errorsExpanded">
+    <section
+      class="rp-errors"
+      :class="{ 'is-open': errorsExpanded }"
+      :style="errorsExpanded ? { height: errorsHeight + 'px' } : undefined"
+    >
+      <div
+        class="rp-errors-head"
+        :class="{ 'is-draggable': errorsExpanded }"
+        :title="errorsExpanded ? 'Drag to resize' : undefined"
+        @pointerdown="startErrorsResize"
+      >
         <span class="rp-errors-title">Errors ({{ errorCount }})</span>
-      </summary>
-      <div v-if="errors.length === 0" class="rp-errors-empty">No errors.</div>
-      <ul v-else class="rp-errors-list">
-        <li v-for="(report, idx) in errors" :key="idx" class="rp-error">
-          <div class="rp-error-head">
-            <span class="rp-error-kind" :data-kind="report.kind">{{ report.kind }}</span>
-            <span v-if="report.code" class="rp-error-code">{{ report.code }}</span>
-          </div>
-          <div class="rp-error-message">{{ report.message }}</div>
-          <div v-if="report.help" class="rp-error-help">{{ report.help }}</div>
-          <ul v-if="report.spans.length > 0" class="rp-error-spans">
-            <li
-              v-for="(span, sidx) in report.spans"
-              :key="sidx"
-              class="rp-error-span"
-              :class="{ 'is-clickable': !!span.file }"
-              @click="span.file && jumpToSpan(report, span)"
-            >
-              <code>{{ span.file ?? '<workspace>' }}:{{ span.start }}-{{ span.end }}</code>
-              <span v-if="span.label" class="rp-error-span-label"> — {{ span.label }}</span>
-            </li>
-          </ul>
-        </li>
-      </ul>
-    </details>
+        <button
+          type="button"
+          class="rp-errors-toggle-btn"
+          :aria-expanded="errorsExpanded"
+          :aria-label="errorsExpanded ? 'Collapse errors' : 'Expand errors'"
+          @click="errorsExpanded = !errorsExpanded"
+          @pointerdown.stop
+        >{{ errorsExpanded ? '−' : '+' }}</button>
+      </div>
+      <div v-if="errorsExpanded" class="rp-errors-body">
+        <div
+          v-if="!activePreset.runnableInSandbox && activePreset.note"
+          class="rp-errors-context"
+          role="note"
+        >
+          <span class="rp-errors-context-label">Why is this failing?</span>
+          <span class="rp-errors-context-text">{{ activePreset.note }}</span>
+        </div>
+        <div v-if="errors.length === 0" class="rp-errors-empty">No errors.</div>
+        <ul v-else class="rp-errors-list">
+          <li v-for="(report, idx) in errors" :key="idx" class="rp-error">
+            <div class="rp-error-head">
+              <span class="rp-error-kind" :data-kind="report.kind">{{ report.kind }}</span>
+              <span v-if="report.code" class="rp-error-code">{{ report.code }}</span>
+            </div>
+            <div class="rp-error-message">{{ report.message }}</div>
+            <div v-if="report.help" class="rp-error-help">{{ report.help }}</div>
+            <ul v-if="report.spans.length > 0" class="rp-error-spans">
+              <li
+                v-for="(span, sidx) in report.spans"
+                :key="sidx"
+                class="rp-error-span"
+                :class="{ 'is-clickable': !!span.file }"
+                @click="span.file && jumpToSpan(report, span)"
+              >
+                <code>{{ span.file ?? '<workspace>' }}:{{ span.start }}-{{ span.end }}</code>
+                <span v-if="span.label" class="rp-error-span-label"> — {{ span.label }}</span>
+              </li>
+            </ul>
+          </li>
+        </ul>
+      </div>
+    </section>
 
     <dialog ref="newFileDialog" class="rp-dialog" @close="newFileError = ''">
       <form class="rp-dialog-form" @submit.prevent="confirmNewFile">
@@ -638,58 +825,87 @@ watch(files, () => {
 
 .rp-status-text { color: var(--vp-c-text-3); }
 
-.rp-banner {
-  display: flex;
-  align-items: flex-start;
-  gap: 8px;
-  padding: 6px 12px;
-  background: var(--vp-c-warning-soft, #fff8e1);
-  border-bottom: 1px solid var(--vp-c-divider);
-  color: var(--vp-c-text-1);
-  font-size: 12px;
-}
-
-.rp-banner-text {
+.rp-status-spacer {
   flex: 1 1 auto;
-  line-height: 1.45;
+  min-width: 8px;
 }
 
-.rp-banner-text :deep(code),
-.rp-banner code {
+.rp-args {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.rp-args-label {
+  color: var(--vp-c-text-3);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.rp-args-input {
+  width: 280px;
+  padding: 2px 8px;
+  border: 1px solid var(--vp-c-divider);
+  border-radius: 4px;
+  background: var(--vp-c-bg);
+  color: var(--vp-c-text-1);
   font-family: var(--vp-font-family-mono);
   font-size: 11px;
-  background: var(--vp-c-bg-soft);
-  padding: 0 4px;
-  border-radius: 3px;
+  line-height: 1.6;
+  outline: none;
 }
 
-.rp-banner-close {
-  border: none;
-  background: transparent;
-  cursor: pointer;
-  color: var(--vp-c-text-2);
-  font-size: 16px;
-  line-height: 1;
-  padding: 0 4px;
+.rp-args-input:focus {
+  border-color: var(--vp-c-brand-1, #6470ff);
 }
 
-.rp-banner-close:hover { color: var(--vp-c-text-1); }
+.rp-run {
+  /* Inherits `.rp-action`; this just nudges visual weight. */
+  font-weight: 600;
+}
 
 .rp-panes {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
+  display: flex;
+  flex-direction: row;
   flex: 1 1 auto;
-  min-height: 480px;
+  min-height: 0;
+  overflow: hidden;
 }
 
 .rp-pane {
   display: flex;
   flex-direction: column;
   min-width: 0;
+  min-height: 0;
 }
 
 .rp-pane-editor {
-  border-right: 1px solid var(--vp-c-divider);
+  flex: 0 0 var(--rp-editor-w, 50%);
+  min-width: 200px;
+}
+
+.rp-pane-output {
+  flex: 1 1 0;
+  min-width: 200px;
+}
+
+.rp-resizer {
+  flex: 0 0 6px;
+  align-self: stretch;
+  cursor: col-resize;
+  background: transparent;
+  border-left: 1px solid var(--vp-c-divider);
+  border-right: 1px solid transparent;
+  margin: 0 -3px;
+  z-index: 1;
+  touch-action: none;
+  transition: background-color 120ms ease;
+}
+
+.rp-resizer:hover,
+.rp-resizer:active {
+  background: var(--vp-c-brand-soft, rgba(100, 108, 255, 0.18));
 }
 
 .rp-tabs {
@@ -792,28 +1008,145 @@ watch(files, () => {
   font-family: var(--vp-font-family-mono);
 }
 
-.rp-errors {
-  border-top: 1px solid var(--vp-c-divider);
-  background: var(--vp-c-bg-soft);
-  font-size: 12px;
+/* Runtime errors: line-background + breakpoint-style gutter dot.
+   Distinct from lint's red squiggle so users don't read evaluation
+   failures as syntax errors. */
+.rp-editor :deep(.cm-relon-runtime-line) {
+  background: var(--vp-c-danger-soft, rgba(229, 83, 91, 0.08));
 }
 
-.rp-errors summary {
-  padding: 6px 12px;
-  cursor: pointer;
+.rp-editor :deep(.cm-relon-runtime-gutter) {
+  width: 12px;
+}
+
+.rp-editor :deep(.cm-relon-runtime-dot) {
+  display: block;
+  width: 7px;
+  height: 7px;
+  margin: 6px auto 0;
+  border-radius: 50%;
+  background: var(--vp-c-danger-1, #e0535b);
+  opacity: 0.78;
+  cursor: help;
+}
+
+/* Errors dock — Chrome devtools style. Collapsed: just the header.
+   Open: header + draggable top edge + scrollable body sized to
+   `errorsHeight`. The dock never pushes the editor off-screen because
+   the body owns its own overflow. */
+.rp-errors {
+  border-top: 2px solid var(--vp-c-divider);
+  background: var(--vp-c-bg-alt, var(--vp-c-bg-soft));
+  box-shadow: 0 -1px 4px rgba(0, 0, 0, 0.05);
+  font-size: 12px;
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+}
+
+.rp-errors.is-open {
+  /* Height comes from inline style bound to `errorsHeight`. */
+  min-height: 0;
+  overflow: hidden;
+}
+
+/* Title bar doubles as the drag handle when the panel is open. */
+.rp-errors-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 2px 8px 2px 12px;
+  min-height: 24px;
+  color: var(--vp-c-text-1);
+  font-size: 12px;
+  line-height: 1;
   user-select: none;
+  flex: 0 0 auto;
+  touch-action: none;
+}
+
+.rp-errors-head.is-draggable {
+  cursor: row-resize;
+}
+
+.rp-errors-head.is-draggable:hover,
+.rp-errors-head.is-draggable:active {
+  background: var(--vp-c-default-soft);
+}
+
+.rp-errors-title {
+  font-weight: 500;
+}
+
+.rp-errors-toggle-btn {
+  margin-left: auto;
+  border: none;
+  background: transparent;
+  color: var(--vp-c-text-2);
+  font-size: 20px;
+  font-weight: 500;
+  line-height: 1;
+  padding: 0 4px;
+  cursor: pointer;
+}
+
+.rp-errors-toggle-btn:hover {
+  color: var(--vp-c-text-1);
+}
+
+.rp-errors-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  padding: 0 12px 12px;
+}
+
+.rp-errors-context {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 0 0 10px;
+  padding: 8px 10px;
+  border: 1px solid var(--vp-c-divider);
+  border-left: 3px solid var(--vp-c-warning-1, #f4b400);
+  border-radius: 4px;
+  background: var(--vp-c-bg);
+  color: var(--vp-c-text-1);
+  line-height: 1.5;
+}
+
+.rp-errors-context-label {
+  font-weight: 600;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
   color: var(--vp-c-text-2);
 }
 
-.rp-errors-empty {
-  padding: 6px 12px 12px;
-  color: var(--vp-c-text-3);
+.rp-errors-context-text {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.rp-errors-context-text :deep(code),
+.rp-errors-context-text code {
+  font-family: var(--vp-font-family-mono);
+  font-size: 11px;
+  background: var(--vp-c-bg-soft);
+  padding: 0 4px;
+  border-radius: 3px;
 }
 
 .rp-errors-list {
   list-style: none;
   margin: 0;
-  padding: 4px 12px 12px;
+  padding: 4px 0 0;
+}
+
+.rp-errors-empty {
+  padding: 8px 0;
+  color: var(--vp-c-text-3);
 }
 
 .rp-error {
@@ -995,12 +1328,20 @@ watch(files, () => {
 
 @media (max-width: 768px) {
   .rp-panes {
-    grid-template-columns: 1fr;
-    grid-template-rows: 1fr 1fr;
+    flex-direction: column;
   }
   .rp-pane-editor {
-    border-right: none;
+    flex: 1 1 50%;
+    min-height: 200px;
     border-bottom: 1px solid var(--vp-c-divider);
+  }
+  .rp-pane-output {
+    flex: 1 1 50%;
+    min-height: 200px;
+  }
+  /* Horizontal drag isn't useful in the vertical mobile layout. */
+  .rp-resizer {
+    display: none;
   }
 }
 </style>
