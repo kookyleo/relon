@@ -825,53 +825,8 @@ fn complete_internal(
 
     let source = sources.get(entry)?;
 
-    // Try the full scope-aware path on the unmodified source first
-    // — that's the common case (cursor on whitespace, inside a
-    // syntactically complete construct).
-    if let Some(items) = try_full_complete(sources, entry, source, line, character) {
-        return Some(items.into_iter().map(into_result).collect());
-    }
-
-    // Recovery path. Mid-edit input is broken in some way: typically a
-    // half-typed identifier (`lib.fo│`) or a trigger char waiting for
-    // its target (`&│`, `@│`, `lib.│`). We can't fix the parser, so
-    // we patch the broken span with an equally-long numeric literal
-    // (always a valid expression), re-parse, and walk the recovered
-    // AST for scope. Cursor-context classification still runs against
-    // the *original* bytes so we know whether to offer references,
-    // decorators, member candidates, etc.
-    let offset = relon_analyzer::goto_def::position_to_offset(source, line, character);
-    if let Some(patched) = patch_in_progress_token(source, offset) {
-        let mut patched_sources = sources.clone();
-        patched_sources.insert(entry.to_string(), patched.clone());
-        if let Some(items) = try_full_complete(&patched_sources, entry, source, line, character)
-        {
-            return Some(items.into_iter().map(into_result).collect());
-        }
-    }
-
-    // Final fallback: pure source-byte cursor classification. Always
-    // returns *something* for `#` / `@` / `&` triggers even when the
-    // file is severely broken; empty list for bare contexts that need
-    // an AST.
-    let items = complete::keywords_for_cursor(source, line, character);
-    Some(items.into_iter().map(into_result).collect())
-}
-
-/// Run the scope-aware completion against `sources`. `display_source`
-/// is the bytes used for cursor-context classification — pass the
-/// user's actual document, not the patched one, so the classifier
-/// sees the prefix character the user typed.
-fn try_full_complete(
-    sources: &HashMap<String, String>,
-    entry: &str,
-    display_source: &str,
-    line: u32,
-    character: u32,
-) -> Option<Vec<relon_analyzer::complete::CompletionItem>> {
-    use relon_analyzer::complete;
-
-    let parse_source = sources.get(entry)?;
+    // Same loader chain as goto_definition — in-memory first, std
+    // fallback — so `#import` resolution sees the playground's tabs.
     let in_memory: Arc<dyn ModuleResolver> =
         Arc::new(InMemoryModuleResolver::new(sources.clone()));
     let std_resolver: Arc<dyn ModuleResolver> = Arc::new(StdModuleResolver);
@@ -884,73 +839,29 @@ fn try_full_complete(
     let mut loader = ResolverChainLoader::from_resolvers(vec![in_memory, std_resolver]);
     let workspace = relon_analyzer::workspace::analyze_entry(
         entry.to_string(),
-        parse_source,
+        source,
         entry_dir_path,
         &mut loader,
     );
-    let tree = workspace.modules.get(entry)?;
-    let root = workspace.nodes.get(entry)?;
-    Some(complete::resolve(
-        display_source,
-        root,
-        tree,
-        Some(&workspace),
-        line,
-        character,
-    ))
-}
 
-/// Replace the user's in-progress token at `offset` with an equally-
-/// long numeric placeholder so the rest of the file can parse. The
-/// "token" is grabbed by walking back from the cursor over identifier
-/// chars, then optionally over one `.<ident>` segment (so `lib.fo│`
-/// is replaced as a unit), then optionally over the leading
-/// `#`/`@`/`&` trigger char (so the prefix-only `#│` / `&│` case
-/// turns into a valid `1`).
-///
-/// Returns `None` when there's nothing meaningful to patch (cursor in
-/// whitespace, at file start, or the token doesn't fit a numeric
-/// placeholder).
-fn patch_in_progress_token(source: &str, offset: usize) -> Option<String> {
-    let bytes = source.as_bytes();
-    let pos = offset.min(bytes.len());
+    // Two tiers, no source-rewriting tricks:
+    //   1. Stable parse → full scope-aware completion.
+    //   2. Parse failed → degraded mode: directive / reference
+    //      keyword lists driven purely from source-byte
+    //      classification (`#`, `@`, `&` triggers). Bare /
+    //      member contexts return an empty list rather than
+    //      misleading suggestions. Proper mid-edit support
+    //      lands when the parser becomes error-recovering
+    //      (rowan rewrite, separate epic).
+    let items: Vec<complete::CompletionItem> =
+        match (workspace.modules.get(entry), workspace.nodes.get(entry)) {
+            (Some(tree), Some(root)) => {
+                complete::resolve(source, root, tree, Some(&workspace), line, character)
+            }
+            _ => complete::keywords_for_cursor(source, line, character),
+        };
 
-    let mut start = pos;
-    // Walk back over identifier chars.
-    while start > 0 && is_ident_byte(bytes[start - 1]) {
-        start -= 1;
-    }
-    // For member-style `head.tail` access, swallow the dot + head.
-    if start > 0 && bytes[start - 1] == b'.' {
-        start -= 1;
-        while start > 0 && is_ident_byte(bytes[start - 1]) {
-            start -= 1;
-        }
-    }
-    // Swallow the trigger character itself (`#` / `@` / `&`) so a
-    // bare `#│` doesn't leave behind an orphan `#` that the parser
-    // would still reject.
-    if start > 0 && matches!(bytes[start - 1], b'#' | b'@' | b'&') {
-        start -= 1;
-    }
-
-    let span_len = pos.checked_sub(start)?;
-    if span_len == 0 {
-        return None;
-    }
-
-    // Numeric literal of matching length. `1` is always a valid
-    // expression; repeating it produces a valid larger integer.
-    let placeholder: String = std::iter::repeat('1').take(span_len).collect();
-    let mut out = String::with_capacity(source.len());
-    out.push_str(&source[..start]);
-    out.push_str(&placeholder);
-    out.push_str(&source[pos..]);
-    Some(out)
-}
-
-fn is_ident_byte(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b == b'_'
+    Some(items.into_iter().map(into_result).collect())
 }
 
 fn into_result(item: relon_analyzer::complete::CompletionItem) -> CompletionResult {
