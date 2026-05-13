@@ -50,9 +50,6 @@ export function relonAutocomplete(resolver: CompletionResolver): Extension {
         // "type" icon so the popup stays compact. The kind label is
         // surfaced via `detail` instead.
         icons: false,
-        // Allow completions to fire after `#`, `@`, `&`, `.` even
-        // when there's no word character behind them yet — the user
-        // just typed the trigger.
         activateOnTyping: true,
         override: [
             (context: CompletionContext): CompletionResult | null => {
@@ -62,30 +59,28 @@ export function relonAutocomplete(resolver: CompletionResolver): Extension {
                 const line = lineObj.number - 1; // CodeMirror lines are 1-based; LSP is 0-based.
                 const character = pos - lineObj.from;
 
-                // Detect what the user just typed so we know how
-                // wide the completion's replacement anchor should be.
-                // The default `matchBefore(WORD)` returns a span like
-                // `len`, but for `&|`, `#|`, `@|`, `lib.|` we want
-                // the replacement to start at the cursor (the prefix
-                // chars themselves stay).
+                // Trigger detection:
+                //   - `wordMatch` covers the in-progress identifier
+                //     (`pri│`, `len│`).
+                //   - `triggerMatch` covers the special-prefix chars
+                //     (`#│`, `@│`, `&│`, `.│`) — completion should
+                //     pop up the moment the user types one of these
+                //     even though there's no word yet.
                 const wordMatch = context.matchBefore(WORD);
                 const triggerMatch = context.matchBefore(/[#@&.]/);
                 const explicit = context.explicit;
 
-                // If the user didn't explicitly invoke completion
-                // (Ctrl-Space) AND we're not on a word or trigger,
-                // bail — keeps the popup from appearing inside
-                // whitespace.
                 if (!explicit && !wordMatch && !triggerMatch) {
                     return null;
                 }
 
-                let from: number;
-                if (wordMatch) {
-                    from = wordMatch.from;
-                } else {
-                    from = pos;
-                }
+                // Replacement anchor:
+                //   - in `pri│` → start of `pri` so typing `private`
+                //     replaces what's there.
+                //   - in `#│` / `&│` etc. → cursor (the trigger
+                //     itself stays in source; the suggestion is what
+                //     follows).
+                const from = wordMatch ? wordMatch.from : pos;
 
                 const items = resolver(line, character);
                 if (items.length === 0) {
@@ -101,10 +96,13 @@ export function relonAutocomplete(resolver: CompletionResolver): Extension {
                 return {
                     from,
                     options: completions,
-                    // CodeMirror's default filter does prefix
-                    // matching; for fuzzier behaviour set
-                    // `filter: false` and supply your own.
-                    validFor: WORD,
+                    // No `validFor`: any keystroke re-invokes the
+                    // resolver. Setting `validFor: WORD` here would
+                    // close the popup the instant the user types a
+                    // trigger char (since the empty string doesn't
+                    // match WORD), which is precisely the wrong UX —
+                    // the popup should stay open as the user keeps
+                    // typing.
                 };
             },
         ],
