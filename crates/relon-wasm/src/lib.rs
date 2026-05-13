@@ -821,7 +821,7 @@ fn complete_internal(
     line: u32,
     character: u32,
 ) -> Option<Vec<CompletionResult>> {
-    use relon_analyzer::complete::{self, CompletionKind};
+    use relon_analyzer::complete::{self, CompletionItem};
 
     let source = sources.get(entry)?;
 
@@ -844,42 +844,42 @@ fn complete_internal(
         &mut loader,
     );
 
-    let entry_tree = workspace.modules.get(entry)?;
-    let entry_root = workspace.nodes.get(entry)?;
+    // Best-effort: when the entry file parses we get full scope-aware
+    // completion. When parsing fails (mid-edit input like a bare `#`),
+    // fall back to keyword-only completion that still surfaces
+    // directives / reference vars driven purely from source bytes.
+    let items: Vec<CompletionItem> =
+        match (workspace.modules.get(entry), workspace.nodes.get(entry)) {
+            (Some(tree), Some(root)) => {
+                complete::resolve(source, root, tree, Some(&workspace), line, character)
+            }
+            _ => complete::keywords_for_cursor(source, line, character),
+        };
 
-    let items = complete::resolve(
-        source,
-        entry_root,
-        entry_tree,
-        Some(&workspace),
-        line,
-        character,
-    );
+    Some(items.into_iter().map(into_result).collect())
+}
 
-    Some(
-        items
-            .into_iter()
-            .map(|i| CompletionResult {
-                label: i.label,
-                kind: match i.kind {
-                    CompletionKind::Method => "method",
-                    CompletionKind::Field => "field",
-                    CompletionKind::Parameter => "param",
-                    CompletionKind::Schema => "schema",
-                    CompletionKind::Stdlib => "stdlib",
-                    CompletionKind::Module => "module",
-                    CompletionKind::Import => "import",
-                    CompletionKind::Reference => "reference",
-                    CompletionKind::Directive => "directive",
-                    CompletionKind::Pragma => "pragma",
-                    CompletionKind::Decorator => "decorator",
-                    CompletionKind::Keyword => "keyword",
-                }
-                .to_string(),
-                detail: i.detail,
-            })
-            .collect(),
-    )
+fn into_result(item: relon_analyzer::complete::CompletionItem) -> CompletionResult {
+    use relon_analyzer::complete::CompletionKind;
+    CompletionResult {
+        label: item.label,
+        kind: match item.kind {
+            CompletionKind::Method => "method",
+            CompletionKind::Field => "field",
+            CompletionKind::Parameter => "param",
+            CompletionKind::Schema => "schema",
+            CompletionKind::Stdlib => "stdlib",
+            CompletionKind::Module => "module",
+            CompletionKind::Import => "import",
+            CompletionKind::Reference => "reference",
+            CompletionKind::Directive => "directive",
+            CompletionKind::Pragma => "pragma",
+            CompletionKind::Decorator => "decorator",
+            CompletionKind::Keyword => "keyword",
+        }
+        .to_string(),
+        detail: item.detail,
+    }
 }
 
 #[cfg(test)]

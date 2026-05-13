@@ -94,6 +94,32 @@ enum CursorContext {
     Bare { prefix: String },
 }
 
+/// Parse-free completion fallback. Used when the file fails to
+/// parse (e.g. the user just typed `#` on a blank line and there's
+/// no directive name yet). Driven entirely off the source bytes:
+/// returns the static keyword lists for `#` / `@` / `&` triggers;
+/// returns an empty list for bare/member contexts (those need the
+/// AST to know what's in scope).
+///
+/// Callers should prefer [`resolve`] when an `AnalyzedTree` is
+/// available — this is a graceful-degradation path, not a primary
+/// entry point.
+pub fn keywords_for_cursor(source: &str, line: u32, character: u32) -> Vec<CompletionItem> {
+    let offset = crate::goto_def::position_to_offset(source, line, character);
+    let context = classify_cursor(source, offset);
+    let mut items: Vec<CompletionItem> = Vec::new();
+    match context {
+        CursorContext::Directive { .. } => push_directive_candidates(&mut items),
+        // Without an AST we can't tell if the cursor is inside a
+        // List / Comprehension; offer only the non-iteration
+        // reference vars to avoid surfacing refs that would lint as
+        // errors at runtime.
+        CursorContext::Reference { .. } => push_reference_candidates(&mut items, false),
+        CursorContext::Decorator { .. } | CursorContext::Member { .. } | CursorContext::Bare { .. } => {}
+    }
+    items
+}
+
 /// Public entry point — mirrors [`crate::goto_def::resolve`] in
 /// signature. Returns every candidate the resolver thinks is
 /// reasonable for the cursor position; the LSP / WASM adapter wraps
@@ -641,6 +667,41 @@ mod tests {
         // Original `bar` (without alias) shouldn't show — only the
         // visible local binding.
         assert!(!imports.contains(&"bar".to_string()), "{imports:?}");
+    }
+
+    #[test]
+    fn keywords_for_cursor_directive_works_without_parse() {
+        // A bare `#` on its own line doesn't parse — this is the
+        // mid-edit state right after the user types `#`. The
+        // parse-free fallback still emits directive names.
+        let src = "// header\n\n#\n\n{ x: 1 }\n";
+        // Cursor right after the `#` on line 2.
+        let items = keywords_for_cursor(src, 2, 1);
+        let names: Vec<String> =
+            items.iter().filter(|i| i.kind == CompletionKind::Directive)
+                 .map(|i| i.label.clone()).collect();
+        assert!(names.contains(&"schema".to_string()), "{names:?}");
+        assert!(names.contains(&"main".to_string()), "{names:?}");
+        assert!(names.contains(&"import".to_string()), "{names:?}");
+        let pragmas: Vec<String> =
+            items.iter().filter(|i| i.kind == CompletionKind::Pragma)
+                 .map(|i| i.label.clone()).collect();
+        assert!(pragmas.contains(&"private".to_string()), "{pragmas:?}");
+    }
+
+    #[test]
+    fn keywords_for_cursor_reference_works_without_parse() {
+        // Mid-edit: bare `&` with no AST yet.
+        let src = "&";
+        let items = keywords_for_cursor(src, 0, 1);
+        let refs: Vec<String> =
+            items.iter().filter(|i| i.kind == CompletionKind::Reference)
+                 .map(|i| i.label.clone()).collect();
+        assert!(refs.contains(&"root".to_string()), "{refs:?}");
+        assert!(refs.contains(&"sibling".to_string()), "{refs:?}");
+        // Without AST we can't know if cursor is inside a list →
+        // iteration-only refs are suppressed.
+        assert!(!refs.contains(&"prev".to_string()), "{refs:?}");
     }
 
     #[test]
