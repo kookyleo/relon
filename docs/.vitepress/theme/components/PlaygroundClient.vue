@@ -1039,7 +1039,17 @@ watch([files, entry, argsInput], () => {
           :title="activePreset.runnableInSandbox ? 'Evaluate' : 'Evaluate with the args JSON above'"
           aria-label="Run"
           @click="runActive"
-        ></button>
+        >
+          <svg viewBox="0 0 10 10" width="8" height="8" aria-hidden="true" class="rp-run-icon">
+            <path
+              d="M3 2L8 5L3 8Z"
+              :fill="autoRun ? 'currentColor' : 'none'"
+              :stroke="autoRun ? 'none' : 'currentColor'"
+              stroke-width="1.2"
+              stroke-linejoin="round"
+            />
+          </svg>
+        </button>
         <label
           class="rp-autorun"
           :title="autoRun ? 'Auto-run on every edit (click to disable)' : 'Auto-run is off — use the Run button or re-enable'"
@@ -1317,6 +1327,8 @@ watch([files, entry, argsInput], () => {
   --rp-c-meta:    #a300a3;
   --rp-c-operator:#5a6675;
   --rp-c-property:#0f4c91;
+  --rp-c-function:#8c5a00;
+  --rp-c-param:   #a14d00;
 
   display: flex;
   flex-direction: column;
@@ -1340,6 +1352,8 @@ watch([files, entry, argsInput], () => {
   --rp-c-meta:    #f486f4;
   --rp-c-operator:#9aa6b5;
   --rp-c-property:#a4c8ff;
+  --rp-c-function:#dcdcaa;
+  --rp-c-param:   #e8b97a;
 }
 
 .rp-editor :deep(.cm-r-comment),
@@ -1362,6 +1376,10 @@ watch([files, entry, argsInput], () => {
 .rp-output :deep(.cm-r-operator) { color: var(--rp-c-operator); }
 .rp-editor :deep(.cm-r-property),
 .rp-output :deep(.cm-r-property) { color: var(--rp-c-property); }
+.rp-editor :deep(.cm-r-function),
+.rp-output :deep(.cm-r-function) { color: var(--rp-c-function); font-weight: 600; }
+.rp-editor :deep(.cm-r-param),
+.rp-output :deep(.cm-r-param)    { color: var(--rp-c-param); font-style: italic; }
 
 .rp-status {
   display: flex;
@@ -1389,32 +1407,49 @@ watch([files, entry, argsInput], () => {
   --vp-nav-height: 34px;
 }
 
-/* Brand lockup in the top-left of the playground header. The
-   standalone layout has no VitePress navbar, so this is the only
-   place where users can click back out to the docs root — make it
-   look obviously interactive. */
+/* Brand lockup in the top-left of the playground header. Two-tone
+   horizontal pill mirroring the file-icon brand mark: {R} on the
+   neutral background (left segment) + white "Relon" wordmark on a
+   filled green segment (right). The standalone layout has no
+   VitePress navbar, so this is the only path back to the docs root —
+   the pill makes the click target obvious. */
+/* Brand palette pinned to the logo.svg artwork (not VitePress brand
+   tokens) so the playground header reads as the same lockup as the
+   home-page hero — cream {R} half + green "Relon" half. */
 .rp-brand {
   display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  padding: 2px 8px 2px 0;
+  align-items: stretch;
+  height: 28px;
+  border-radius: 6px;
+  border: 1px solid #3E8A50;
+  overflow: hidden;
   text-decoration: none;
-  color: var(--vp-c-text-1);
-  font-size: 14px;
   line-height: 1;
+  background: #F3F1ED;
+  transition: filter 0.15s ease;
 }
 
 .rp-brand:hover {
-  color: var(--vp-c-brand-1, #3eaf7c);
+  filter: brightness(0.97);
 }
 
 .rp-brand-logo {
-  width: 22px;
-  height: 22px;
+  width: 20px;
+  height: 20px;
+  margin: 0 8px;
+  align-self: center;
   display: block;
 }
 
 .rp-brand-name {
+  display: inline-flex;
+  align-items: center;
+  padding: 0 10px;
+  background: #3E8A50;
+  color: #F3F1ED;
+  font-family: var(--vp-font-family-base);
+  font-weight: 700;
+  font-size: 14px;
   letter-spacing: 0.01em;
 }
 
@@ -1744,20 +1779,16 @@ watch([files, entry, argsInput], () => {
 }
 
 /* Play-button styling: square footprint, green fill, white triangle.
-   The project's `--vp-c-brand-1` is the VitePress indigo default,
-   which clashes with the green {R} logo — so we pin the Run fill to
-   VitePress's green palette tokens (`--vp-c-green-*`), which are
-   themed for both light + dark and so will track the user's
-   appearance choice without further wiring. Selector is doubled
+   Fill / hover / active steps are pinned to the logo.svg green
+   palette (#3E8A50 base, with adjacent shades present in the artwork)
+   so the Run button reads as the same green as the {R}/Relon brand
+   pill on the left of the header. Selector is doubled
    (`.rp-status .rp-action.rp-run`) to beat the unified-control rule
    above on specificity. */
 .rp-status .rp-action.rp-run {
-  /* Core 18px circle. Ring is drawn by `::after` below (a positioned
-     pseudo element) — `outline` would have worked too, except that
-     browser UA stylesheets reach in and replace `outline` on `:focus`
-     / `:active`, blanking our state ring the moment the user clicks
-     the button. A pseudo-element is outside the focus-ring contract
-     and lives in our cascade entirely. */
+  /* Core 18px circle. The ring and triangle are now integrated via
+     an SVG child and a simple border toggle on this parent, replacing
+     the fussy three-layer pseudo-element stack. */
   position: relative;
   width: 18px;
   height: 18px;
@@ -1766,45 +1797,33 @@ watch([files, entry, argsInput], () => {
   align-items: center;
   justify-content: center;
   border-radius: 50%;
-  background: var(--vp-c-green-3);
-  border-color: var(--vp-c-green-3);
+  background: #3E8A50;
+  border: 1px solid #3E8A50;
   color: #ffffff;
   outline: none;
   transition: background 120ms ease, border-color 120ms ease,
-              transform 80ms ease;
+              color 120ms ease, transform 80ms ease;
 }
 
-/* Always-visible status ring. `inset: -3px` = 2px gap + 1px border
-   thickness, so the ring sits exactly where the old `outline-offset: 2px;
-   outline: 1px ...` placed it. `pointer-events: none` keeps it from
-   stealing hover/click from the button beneath. */
-.rp-status .rp-action.rp-run::after {
-  content: '';
-  position: absolute;
-  inset: -3px;
-  border: 1px solid var(--vp-c-divider);
-  border-radius: 50%;
-  pointer-events: none;
-  transition: border-color 120ms ease;
-}
-
-.rp-run-cluster.is-auto .rp-action.rp-run::after {
-  border-color: var(--vp-c-green-3);
+/* Auto state: the solid fill evaporates into a ring (the "hollow
+   outer circle") and the triangle flips to solid green. */
+.rp-run-cluster.is-auto .rp-action.rp-run {
+  background: transparent;
+  color: #3E8A50;
 }
 
 .rp-status .rp-action.rp-run:hover:not(:disabled) {
-  background: var(--vp-c-green-2);
-  border-color: var(--vp-c-green-2);
+  background: #479759;
+  border-color: #479759;
 }
 
-/* Click feedback: brief press-down + a deeper green fill so the
-   button visibly responds to the tap. The ring lives on `::after`,
-   which scales with the button (matching its position relative to
-   the visible circle); the contract "ring is always there" holds. */
+.rp-run-cluster.is-auto .rp-action.rp-run:hover:not(:disabled) {
+  background: rgba(62, 138, 80, 0.08);
+}
+
+/* Click feedback: brief press-down. */
 .rp-status .rp-action.rp-run:active:not(:disabled) {
   transform: scale(0.9);
-  background: var(--vp-c-green-1);
-  border-color: var(--vp-c-green-1);
 }
 
 .rp-status .rp-action.rp-run:disabled {
@@ -1814,18 +1833,7 @@ watch([files, entry, argsInput], () => {
   cursor: not-allowed;
 }
 
-.rp-run::before {
-  content: '';
-  width: 0;
-  height: 0;
-  border-style: solid;
-  /* Scaled to the 18px button — 4×6 triangle reads sharp at this size
-     without crowding the rim. */
-  border-width: 4px 0 4px 6px;
-  /* Two horizontal-equal sides ("0") collapse to a vertical edge; the
-     remaining slanted sides form a right-pointing triangle filled
-     with `currentColor` (white above). */
-  border-color: transparent transparent transparent currentColor;
+.rp-run-icon {
   /* Optical centring — the glyph's visual mass sits ~1px left of its
      bounding box, so nudge right. */
   margin-left: 1px;
@@ -1969,7 +1977,7 @@ watch([files, entry, argsInput], () => {
 
 .rp-tab-entry.is-entry {
   opacity: 1;
-  color: var(--vp-c-green-3);
+  color: #3E8A50;
 }
 
 .rp-tab-close {

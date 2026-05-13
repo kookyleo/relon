@@ -155,13 +155,24 @@ const SINGLE_CHAR_OPERATORS = new Set([
 
 interface RelonState {
     inBlockComment: boolean;
+    // Paren depth inside the parameter list of a function definition
+    // we have already identified via lookahead. 0 = not inside a def's
+    // params. The depth counter exists so that nested parens (e.g. a
+    // default-value expression, if Relon ever grows them) don't prematurely
+    // close param mode.
+    defParamDepth: number;
+    // We've just emitted a function-definition name and are waiting for
+    // the next `(` to flip into `defParamDepth = 1`. Cleared once we
+    // either consume that `(` or hit any non-whitespace that isn't `(`
+    // (defensive — keeps us out of param mode if the lookahead was wrong).
+    awaitingDefOpenParen: boolean;
 }
 
 const parser: StreamParser<RelonState> = {
     name: 'relon',
 
     startState(): RelonState {
-        return { inBlockComment: false };
+        return { inBlockComment: false, defParamDepth: 0, awaitingDefOpenParen: false };
     },
 
     token(stream, state) {
@@ -285,17 +296,72 @@ const parser: StreamParser<RelonState> = {
             if (BUILTIN_TYPES.has(word)) {
                 return 'typeName';
             }
+            // Inside the parameter list of a function definition, bare
+            // identifiers are formal parameters — give them a distinct
+            // token so the highlighter can italicise them.
+            if (state.defParamDepth > 0) {
+                return 'variableName.local';
+            }
+            // Function name detection. We use a single lookahead at the
+            // remainder of the current line; multi-line signatures aren't
+            // a thing in Relon definitions today.
+            //
+            // Definition: `name(p1, p2): ...` — only triggers when the
+            // paren contents are a comma-separated bareword list (or
+            // empty), and a `:` follows the close paren. That keeps
+            // expression-like call args (`multiply(&sibling.x, 1.2)`)
+            // from getting misclassified as definitions.
+            //
+            // Call: `name(...` — any open-paren immediately after the
+            // identifier. Calls and definitions share the same colour;
+            // the parameter highlight is what's gated on a real def.
+            const rest = stream.string.slice(stream.pos);
+            const isDef = /^\(\s*([A-Za-z_][A-Za-z0-9_]*(\s*,\s*[A-Za-z_][A-Za-z0-9_]*)*)?\s*\)\s*:/.test(rest);
+            if (isDef) {
+                state.awaitingDefOpenParen = true;
+                return 'variableName.function';
+            }
+            if (rest.startsWith('(')) {
+                return 'variableName.function';
+            }
             return 'variableName';
         }
 
-        // Single-char operators / punctuation.
+        // Parens drive the function-definition param-mode counter. We
+        // still emit `null` (no specific token) so the visual style of
+        // brackets is unchanged — only the state machine cares.
         const ch = stream.peek();
+        if (ch === '(') {
+            stream.next();
+            if (state.awaitingDefOpenParen) {
+                state.defParamDepth = 1;
+                state.awaitingDefOpenParen = false;
+            } else if (state.defParamDepth > 0) {
+                state.defParamDepth += 1;
+            }
+            return null;
+        }
+        if (ch === ')') {
+            stream.next();
+            if (state.defParamDepth > 0) {
+                state.defParamDepth -= 1;
+            }
+            return null;
+        }
+
+        // Single-char operators / punctuation.
         if (ch && SINGLE_CHAR_OPERATORS.has(ch)) {
             stream.next();
             return 'operator';
         }
 
         // Everything else (braces, brackets, commas, colons, dots, ...).
+        // If we were waiting for a def's `(` but hit something else
+        // first, abandon the expectation — keeps stray tokens from
+        // accidentally enrolling later parens into param mode.
+        if (state.awaitingDefOpenParen) {
+            state.awaitingDefOpenParen = false;
+        }
         stream.next();
         return null;
     },
@@ -341,6 +407,12 @@ export const playgroundHighlightStyle = HighlightStyle.define([
     { tag: t.typeName, class: 'cm-r-type' },
     // `&root`, `&sibling`, ... — emitted via `variableName.special`.
     { tag: t.special(t.variableName), class: 'cm-r-ref' },
+    // Function names (definition + call site) — emitted via
+    // `variableName.function`.
+    { tag: t.function(t.variableName), class: 'cm-r-function' },
+    // Formal parameters inside a function definition — emitted via
+    // `variableName.local`.
+    { tag: t.local(t.variableName), class: 'cm-r-param' },
     // `@decorator` invocations.
     { tag: t.meta, class: 'cm-r-meta' },
     // Arithmetic / comparison / logical / arrow / spread. `defaultHighlightStyle`
