@@ -616,6 +616,34 @@ pub enum Diagnostic {
         #[label("missing type parameter(s)")]
         range: SourceSpan,
     },
+
+    #[error("`&this` used outside a list-iteration context")]
+    #[diagnostic(
+        code(relon::analyze::this_outside_iteration),
+        help(
+            "`&this` is the current iteration element of a list / list-comprehension. In Dict scope it falls back to `&root`, which works but obscures intent — prefer `&root` directly so readers don't have to know about the fallback."
+        )
+    )]
+    ThisOutsideIteration {
+        #[label("equivalent to `&root` here")]
+        range: SourceSpan,
+    },
+
+    #[error("`&{base}` used outside a list-iteration context")]
+    #[diagnostic(
+        code(relon::analyze::iteration_ref_outside_list),
+        help(
+            "`&prev` / `&next` / `&index` only have meaning while iterating a list (or inside a list comprehension's body). Using them anywhere else evaluates to a runtime `VariableNotFound`."
+        )
+    )]
+    IterationRefOutsideList {
+        /// Which iteration ref triggered the diagnostic — `prev`,
+        /// `next`, or `index`. Stored as a string so the message
+        /// formats cleanly across all three.
+        base: String,
+        #[label("requires a list context")]
+        range: SourceSpan,
+    },
 }
 
 impl Diagnostic {
@@ -691,11 +719,20 @@ impl Diagnostic {
             // the runtime would otherwise raise `TypeMismatch` from
             // inside the method body.
             | Diagnostic::MethodGenericArgMismatch { .. }
+            // `&prev` / `&next` / `&index` outside any list iteration
+            // are statically broken: the evaluator will raise
+            // `VariableNotFound`. Surface as Error so the user fixes
+            // it before running.
+            | Diagnostic::IterationRefOutsideList { .. }
             | Diagnostic::DuplicateField { .. } => Severity::Error,
             // Informational: the analyzer's view is conservative — a
             // spread, closure binding, or runtime-computed field may
             // still resolve, so we don't gate evaluation on it.
             Diagnostic::UnresolvedReference { .. } => Severity::Warning,
+            // `&this` outside iteration still evaluates (falls back to
+            // `&root` per reference.rs). Warn rather than error — the
+            // program runs, but `&root` is the clearer spelling.
+            Diagnostic::ThisOutsideIteration { .. } => Severity::Warning,
             // Schema-rooted §J follow-up: same-name shadowing between
             // a method's `<T>` and the owning schema's `<T>` produces
             // a confusing substitution order (the method's binding

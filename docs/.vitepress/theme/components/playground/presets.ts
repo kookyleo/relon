@@ -154,6 +154,35 @@ const WORKFLOW_MAIN = `/*
 }
 `;
 
+// Multi-file preset — exercises the cross-file `#import` path so the
+// playground's tab bar + workspace analyzer are visibly involved. The
+// entry pulls in a small "currency" lib via three import shapes so
+// users can see all three forms (alias, destructure, spread) in one
+// place and compare them.
+const MODULES_MAIN = `// Three #import shapes — try Mod-clicking any imported name to
+// jump across files.
+#import lib from "./lib.relon"
+#import { format_price } from "./lib.relon"
+#import * from "./lib.relon"
+{
+    namespaced: lib.with_tax(100.0, 0.08),
+
+    destructured: format_price(199.99, "USD"),
+
+    spread: discount(50.0, 0.15)
+}
+`;
+
+const MODULES_LIB = `// Pricing helpers shared by main.relon.
+{
+    with_tax(amount, rate): amount * (1.0 + rate),
+
+    format_price(value, symbol): symbol + " " + value,
+
+    discount(amount, rate): amount * (1.0 - rate)
+}
+`;
+
 export const PRESETS: Preset[] = [
     {
         id: 'demo',
@@ -202,6 +231,17 @@ export const PRESETS: Preset[] = [
   "state": "placed",
   "event": "pay"
 }`,
+    },
+    {
+        id: 'modules',
+        label: 'modules',
+        files: [
+            { path: 'main.relon', content: MODULES_MAIN },
+            { path: 'lib.relon', content: MODULES_LIB },
+        ],
+        entry: 'main.relon',
+        runnableInSandbox: true,
+        note: 'Cross-file workspace. Mod-click `lib`, `format_price`, or `discount` to jump into lib.relon — the tab bar switches and the destination key is selected.',
     },
 ];
 

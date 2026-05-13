@@ -17,6 +17,7 @@
 //! shape isn't a regular dict and the predicate values aren't really
 //! references in the data sense.
 
+use crate::diagnostic::Diagnostic;
 use crate::tree::AnalyzedTree;
 use relon_parser::{child_nodes, Expr, Node, NodeId, RefBase, TokenKey, TokenRange};
 use std::collections::HashMap;
@@ -143,6 +144,7 @@ pub fn resolve_references(root: &Node, tree: &mut AnalyzedTree) {
     let mut walker = Walker {
         tree,
         scope_stack: Vec::new(),
+        iteration_depth: 0,
     };
     if let Some(frame) = main_frame {
         walker.scope_stack.push(frame);
@@ -252,6 +254,12 @@ impl ScopeFrame {
 struct Walker<'a> {
     tree: &'a mut AnalyzedTree,
     scope_stack: Vec<ScopeFrame>,
+    /// Depth counter for enclosing `Expr::List` / `Expr::Comprehension`
+    /// scopes. Used to flag `&prev` / `&next` / `&index` / `&this`
+    /// outside any iteration — they have no meaningful semantics
+    /// there (the first three runtime-error, the last falls back to
+    /// `&root` and is better spelled as such).
+    iteration_depth: usize,
 }
 
 impl<'a> Walker<'a> {
@@ -278,9 +286,27 @@ impl<'a> Walker<'a> {
                 self.scope_stack.pop();
             }
             Expr::List(items) => {
+                self.iteration_depth += 1;
                 for item in items {
                     self.visit(item);
                 }
+                self.iteration_depth -= 1;
+            }
+            Expr::Comprehension {
+                element,
+                iterable,
+                condition,
+                ..
+            } => {
+                // Comprehensions iterate over `iterable`; the element /
+                // condition expressions both see iteration context.
+                self.iteration_depth += 1;
+                self.visit(element);
+                self.visit(iterable);
+                if let Some(c) = condition {
+                    self.visit(c);
+                }
+                self.iteration_depth -= 1;
             }
             Expr::Closure { params, body, .. } => {
                 // Open a frame whose `closure_params` shadow outer
@@ -301,6 +327,36 @@ impl<'a> Walker<'a> {
                 self.scope_stack.pop();
             }
             Expr::Reference { base, path } => {
+                // List-iteration bases used outside a list / list-
+                // comprehension are statically wrong: `&prev / &next /
+                // &index` runtime-error, and `&this` silently falls
+                // back to `&root` (better written as `&root`).
+                if self.iteration_depth == 0 {
+                    match base {
+                        RefBase::This => {
+                            self.tree
+                                .diagnostics
+                                .push(Diagnostic::ThisOutsideIteration {
+                                    range: node.range.into(),
+                                });
+                        }
+                        RefBase::Prev | RefBase::Next | RefBase::Index => {
+                            let label = match base {
+                                RefBase::Prev => "prev",
+                                RefBase::Next => "next",
+                                RefBase::Index => "index",
+                                _ => unreachable!(),
+                            };
+                            self.tree
+                                .diagnostics
+                                .push(Diagnostic::IterationRefOutsideList {
+                                    base: label.to_string(),
+                                    range: node.range.into(),
+                                });
+                        }
+                        _ => {}
+                    }
+                }
                 if let Some(resolved) = self.resolve(base, path, node.range) {
                     self.tree.references.insert(node.id, resolved);
                 } else if matches!(base, RefBase::Sibling | RefBase::Root | RefBase::Uncle) {
