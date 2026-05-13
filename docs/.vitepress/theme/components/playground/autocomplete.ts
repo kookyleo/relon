@@ -5,9 +5,26 @@
 // `autocompletion` extension. The CodeMirror layer handles filtering
 // + ranking; this module just returns every candidate the analyzer
 // thinks is reasonable for the cursor position.
+//
+// Two extras layered on top of `autocompletion(...)`:
+//   1. Explicit popup trigger after the user types one of `#@&.` —
+//      CodeMirror's default `activateOnTyping` only fires on word
+//      characters, so without this the popup stays closed when the
+//      user types e.g. `#` and waits to be told what's available.
+//   2. Tab accepts the highlighted suggestion (matches VS Code /
+//      JetBrains convention). Falls through to the existing
+//      `indentWithTab` when no popup is open.
 
-import { autocompletion, type Completion, type CompletionContext, type CompletionResult } from '@codemirror/autocomplete';
-import type { Extension } from '@codemirror/state';
+import {
+    acceptCompletion,
+    autocompletion,
+    startCompletion,
+    type Completion,
+    type CompletionContext,
+    type CompletionResult,
+} from '@codemirror/autocomplete';
+import { EditorView, keymap } from '@codemirror/view';
+import { Prec, type Extension } from '@codemirror/state';
 
 /// One item returned by the wasm `complete` call. Kind is the
 /// lowercase tag we serialise on the Rust side (see
@@ -44,8 +61,40 @@ const KIND_TO_TYPE: Record<string, Completion['type']> = {
 /// them.
 const WORD = /[A-Za-z_][A-Za-z0-9_]*/;
 
-export function relonAutocomplete(resolver: CompletionResolver): Extension {
-    return autocompletion({
+/// Triggers `startCompletion` whenever the user types one of the
+/// special-prefix characters. CodeMirror's default activation only
+/// fires for word characters, so without this the popup never
+/// opens after `#`, `@`, `&`, or `.`.
+const triggerOnSpecialChars = EditorView.updateListener.of((update) => {
+    if (!update.docChanged) return;
+    let triggered = false;
+    update.transactions.forEach((tr) => {
+        if (triggered || !tr.docChanged) return;
+        tr.changes.iterChanges((_fromA, _toA, _fromB, _toB, inserted) => {
+            if (triggered) return;
+            const text = inserted.toString();
+            if (text.length === 1 && /[#@&.]/.test(text)) {
+                triggered = true;
+            }
+        });
+    });
+    if (triggered) {
+        // Defer to the next tick so `startCompletion` reads the
+        // post-transaction doc state.
+        queueMicrotask(() => startCompletion(update.view));
+    }
+});
+
+/// Tab → accept the highlighted suggestion when the popup is open.
+/// Returns false when the popup is closed, letting subsequent
+/// keybindings (e.g. `indentWithTab`) take over. Bound at
+/// `Prec.high` so it sits ahead of `indentWithTab` in the chain.
+const tabAcceptsCompletion = Prec.high(
+    keymap.of([{ key: 'Tab', run: acceptCompletion }]),
+);
+
+export function relonAutocomplete(resolver: CompletionResolver): Extension[] {
+    const completionExt = autocompletion({
         // No icons in our HighlightStyle yet; suppress the default
         // "type" icon so the popup stays compact. The kind label is
         // surfaced via `detail` instead.
@@ -107,4 +156,6 @@ export function relonAutocomplete(resolver: CompletionResolver): Extension {
             },
         ],
     });
+
+    return [completionExt, triggerOnSpecialChars, tabAcceptsCompletion];
 }

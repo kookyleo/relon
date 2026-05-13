@@ -461,16 +461,25 @@ fn push_directive_candidates(items: &mut Vec<CompletionItem>) {
 }
 
 fn push_decorator_candidates(
-    _items: &mut Vec<CompletionItem>,
-    _root: &Node,
-    _offset: usize,
+    items: &mut Vec<CompletionItem>,
+    root: &Node,
+    offset: usize,
 ) {
-    // The decorator registry isn't centralized in the analyzer; the
-    // common-case host decorators land via the @ prefix anyway since
-    // they're sibling closures the user defines. A future iteration
-    // can walk Dicts for closure pairs and offer them with the @
-    // prefix; for v1 we leave this as a no-op (CodeMirror still
-    // surfaces the popup at @ but with zero candidates → just hides).
+    // No host decorator registry in v1, so we surface every visible
+    // closure-valued pair (the user-defined hook shape — `pricing` uses
+    // `@currency(...)` where `currency` is a sibling method). Same
+    // scope walk as the bare path but filtered to Methods only.
+    let mut scope: Vec<CompletionItem> = Vec::new();
+    walk_scope(root, offset, &mut scope);
+    for item in scope {
+        if matches!(item.kind, CompletionKind::Method) {
+            items.push(CompletionItem {
+                label: item.label,
+                kind: CompletionKind::Decorator,
+                detail: Some("decorator".to_string()),
+            });
+        }
+    }
 }
 
 // =====================================================================
