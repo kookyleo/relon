@@ -614,6 +614,166 @@ pub fn version() -> String {
     env!("CARGO_PKG_VERSION").to_string()
 }
 
+/// Result of a successful go-to-definition lookup. Sent to JS as a
+/// plain object — fields are flat so consumers can dispatch a
+/// CodeMirror selection without parsing nested shapes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GotoDefinitionResult {
+    /// Path of the target file inside the `sources` map. Same string
+    /// the entry was identified by, or a different module's canonical
+    /// id reached through `#import`.
+    pub path: String,
+    /// Start `(line, character)` of the target range. `character` is
+    /// a UTF-16 code-unit index (matches `CodeMirror`'s + LSP's
+    /// position convention).
+    pub start: Position,
+    /// End `(line, character)` of the target range. For "jump to top
+    /// of file" cases (cursor on a `#import` path string or on an
+    /// alias head alone), `start == end == (0, 0)`.
+    pub end: Position,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Position {
+    pub line: u32,
+    pub character: u32,
+}
+
+/// Resolve a cursor position to its definition. Mirrors what the LSP's
+/// `textDocument/definition` handler does, but driven entirely from
+/// the in-memory `sources` map so the browser playground gets the
+/// same semantics without a filesystem.
+///
+/// `sources` is the same object/array shape as [`evaluate`]: either
+/// `{ path: content }` or `[ { path, content } ]`. `entry` is one of
+/// the keys (the file the cursor sits in). `line` / `character` are
+/// 0-based, with `character` measured in UTF-16 code units
+/// (CodeMirror / LSP convention).
+///
+/// Returns `null` (JS) when the cursor isn't on a recognisable
+/// reference, when the target couldn't be located in the workspace,
+/// or when the workspace failed to build (parse errors etc. — the
+/// caller can re-run `evaluate` to get a structured error report).
+#[wasm_bindgen]
+pub fn goto_definition(
+    sources: JsValue,
+    entry: &str,
+    line: u32,
+    character: u32,
+) -> Result<JsValue, JsValue> {
+    let sources = decode_sources(sources).map_err(err_to_js)?;
+    let target = match goto_definition_internal(&sources, entry, line, character) {
+        Some(t) => t,
+        None => return Ok(JsValue::NULL),
+    };
+    let serializer = serde_wasm_bindgen::Serializer::new().serialize_maps_as_objects(true);
+    target.serialize(&serializer).map_err(|err| {
+        err_to_js(ErrorReport::invalid_input(format!(
+            "goto_definition result is not JS-serialisable: {err}"
+        )))
+    })
+}
+
+fn goto_definition_internal(
+    sources: &HashMap<String, String>,
+    entry: &str,
+    line: u32,
+    character: u32,
+) -> Option<GotoDefinitionResult> {
+    use relon_analyzer::goto_def::{self, GotoTarget};
+
+    let source = sources.get(entry)?;
+
+    // Re-use the same loader chain that `evaluate_internal` uses —
+    // in-memory first, std fallback — so `#import` resolution lands on
+    // the playground's tabs and not the filesystem.
+    let in_memory: Arc<dyn ModuleResolver> =
+        Arc::new(InMemoryModuleResolver::new(sources.clone()));
+    let std_resolver: Arc<dyn ModuleResolver> = Arc::new(StdModuleResolver);
+    let entry_dir = parent_dir(entry);
+    let entry_dir_path = PathBuf::from(if entry_dir.is_empty() {
+        ".".to_string()
+    } else {
+        entry_dir.clone()
+    });
+    let mut loader = ResolverChainLoader::from_resolvers(vec![in_memory, std_resolver]);
+    let workspace = relon_analyzer::workspace::analyze_entry(
+        entry.to_string(),
+        source,
+        entry_dir_path,
+        &mut loader,
+    );
+
+    // Even if the workspace reports errors we still try to resolve —
+    // the cross-module map only gets populated on successful post-pass,
+    // but same-file `references` survive most analyzer errors. A
+    // user editing through a transient parse error shouldn't lose
+    // navigation.
+    let entry_tree = workspace.modules.get(entry)?;
+    let entry_root = workspace.nodes.get(entry)?;
+
+    let target = goto_def::resolve(
+        source,
+        entry_root,
+        entry_tree,
+        Some(&workspace),
+        Some(entry),
+        line,
+        character,
+    )?;
+
+    match target {
+        GotoTarget::Node {
+            module_id,
+            start,
+            end,
+        } => {
+            let target_path = module_id.unwrap_or_else(|| entry.to_string());
+            let target_source = sources.get(&target_path)?;
+            let (s_line, s_char) = goto_def::offset_to_position(target_source, start);
+            let (e_line, e_char) = goto_def::offset_to_position(target_source, end);
+            Some(GotoDefinitionResult {
+                path: target_path,
+                start: Position {
+                    line: s_line,
+                    character: s_char,
+                },
+                end: Position {
+                    line: e_line,
+                    character: e_char,
+                },
+            })
+        }
+        GotoTarget::ImportPath {
+            raw_path,
+            canonical_id,
+        } => {
+            // Prefer the workspace-resolved canonical id; fall back to
+            // the raw path if the import didn't resolve (the file
+            // doesn't exist in `sources` — the playground UI surfaces
+            // that as a module-not-found diagnostic elsewhere).
+            let target_path = canonical_id.unwrap_or(raw_path);
+            // Only honour paths that actually exist in the sources
+            // map. `std/...` and non-existent files return null so
+            // the UI doesn't try to switch to a tab that isn't there.
+            if !sources.contains_key(&target_path) {
+                return None;
+            }
+            Some(GotoDefinitionResult {
+                path: target_path,
+                start: Position {
+                    line: 0,
+                    character: 0,
+                },
+                end: Position {
+                    line: 0,
+                    character: 0,
+                },
+            })
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

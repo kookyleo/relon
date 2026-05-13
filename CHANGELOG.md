@@ -2,6 +2,15 @@
 
 ## [Unreleased] — Schema-rooted dispatch (trait-bound foundation)
 
+### Playground: Mod-click go-to-definition
+
+The browser playground now mirrors VS Code / IntelliJ navigation:
+hold Cmd (macOS) or Ctrl, hover any identifier that has a known
+definition and it picks up an underline + pointer cursor; click jumps
+to the definition. Cross-file jumps (`#import lib from "./lib.relon"`
++ `lib.shout(...)`) switch tabs automatically. Driven by a new
+`goto_definition` WASM export that wraps the analyzer's resolver.
+
 ### Analyzer / LSP: cross-file go-to-definition
 
 `#import` bindings now carry through to definition resolution. The

@@ -1,142 +1,131 @@
 //! `textDocument/definition`.
 //!
-//! Walk the cursor to a `Reference` / `Variable` / `FnCall` node, look it
-//! up in `AnalyzedTree.references` (same-file) or
-//! `AnalyzedTree.cross_module_references` (resolved against a
-//! `WorkspaceTree` when one is provided), and return the target
-//! value-node's source range as a `Location`.
-//!
-//! When the caller passes `Some(workspace)`, cross-file jumps work
-//! through `#import` bindings: alias-form (`lib.x`), destructure
-//! (`#import { a }`) and spread (`#import *`). Without a workspace,
-//! only same-file resolution runs — matching the pre-cross-file
-//! behaviour for callers that haven't wired workspace state yet.
+//! Thin LSP adapter over [`relon_analyzer::goto_def::resolve`]. The
+//! analyzer module owns the cursor walking, position math, and
+//! same-file / cross-file resolution rules; this handler converts the
+//! resulting [`GotoTarget`] into `lsp_types::Location`.
 
-use crate::features::cursor::{covers, smallest_node_at};
-use crate::position::{position_to_offset, token_range};
 use crate::server::DocumentEntry;
 use lsp_types::{Location, Position, Range, Url};
+use relon_analyzer::goto_def::{self, GotoTarget};
 use relon_analyzer::WorkspaceTree;
-use relon_parser::Expr;
 
 /// Resolve `position` (in `entry`) to a definition location. The
-/// returned `Location` carries `uri` for in-document hits and a
-/// URI derived from the imported module's canonical id (a filesystem
+/// returned `Location` carries `uri` for in-document hits and a URI
+/// derived from the imported module's canonical id (a filesystem
 /// path) for cross-file hits.
-///
-/// Cases checked, in order:
-///
-/// 1. Cursor on an `#import path from "path"` path string — jump to
-///    the start of the imported file (URI computed relative to `uri`).
-/// 2. Cursor on a node that has a [`relon_analyzer::CrossModuleRef`]
-///    (when a `WorkspaceTree` is supplied) — jump cross-file.
-/// 3. Cursor on a `Reference` / `Variable` / `FnCall` whose
-///    analyzer binding hits — return the same-file target range.
-/// 4. Otherwise — `None`.
 pub fn resolve(
     entry: &DocumentEntry,
     position: Position,
     uri: &Url,
     workspace: Option<&WorkspaceTree>,
 ) -> Option<Location> {
-    let offset = position_to_offset(&entry.source, position);
+    // The analyzer needs to know which module the cursor is in so it
+    // can find the `import_graph` slot for the import-path-literal
+    // case. We derive a canonical id from the URI when it's a file://;
+    // for non-file URIs (untitled, synthetic) we pass None and the
+    // analyzer's path-literal lookup falls back to "no canonical id".
+    let entry_id = uri
+        .to_file_path()
+        .ok()
+        .and_then(|p| std::fs::canonicalize(&p).ok())
+        .map(|p| p.to_string_lossy().to_string());
 
-    if let Some(loc) = import_target(entry, offset, uri) {
-        return Some(loc);
-    }
+    let target = goto_def::resolve(
+        &entry.source,
+        &entry.root,
+        &entry.tree,
+        workspace,
+        entry_id.as_deref(),
+        position.line,
+        position.character,
+    )?;
 
-    let node = smallest_node_at(&entry.root, offset)?;
-    match &*node.expr {
-        Expr::Reference { .. } | Expr::Variable(_) | Expr::FnCall { .. } => {}
-        _ => return None,
-    }
-    // Cross-module first: a node that has a cross_module_references
-    // entry is by construction not in `references` (we only queue the
-    // pending entry after the in-document lookup misses).
-    if let Some(ws) = workspace {
-        if let Some(cross) = entry.tree.cross_module_references.get(&node.id) {
-            return cross_module_location(ws, cross);
+    match target {
+        GotoTarget::Node {
+            module_id,
+            start,
+            end,
+        } => {
+            let target_uri = match module_id.as_deref() {
+                Some(id) => module_id_to_uri(id)?,
+                None => uri.clone(),
+            };
+            let source = match module_id.as_deref() {
+                Some(id) => workspace
+                    .and_then(|ws| {
+                        // The workspace pass doesn't retain raw source
+                        // text; we re-read it for non-entry modules so
+                        // offset → (line, col) translation works. Tiny
+                        // I/O cost (one read per goto-def), acceptable
+                        // for an interactive request.
+                        if let Ok(text) = std::fs::read_to_string(id) {
+                            return Some(text);
+                        }
+                        ws.modules.get(id).map(|_| String::new())
+                    })
+                    .unwrap_or_default(),
+                None => entry.source.clone(),
+            };
+            // Range::default() (0..0) is the "alias head alone" /
+            // "module-only" jump signal coming out of the analyzer;
+            // pass it through verbatim so the LSP client just opens
+            // the target file at the top.
+            let range = if start == 0 && end == 0 {
+                Range::default()
+            } else {
+                let start_pos = position_from_offset(&source, start);
+                let end_pos = position_from_offset(&source, end);
+                Range {
+                    start: start_pos,
+                    end: end_pos,
+                }
+            };
+            Some(Location {
+                uri: target_uri,
+                range,
+            })
+        }
+        GotoTarget::ImportPath {
+            raw_path,
+            canonical_id,
+        } => {
+            // Prefer the canonical id the workspace already resolved.
+            // Fall back to the legacy URI-join behaviour for clients
+            // running without a workspace pass (single-file LSP mode).
+            if let Some(id) = canonical_id {
+                return module_id_to_uri(&id).map(|target_uri| Location {
+                    uri: target_uri,
+                    range: Range::default(),
+                });
+            }
+            if raw_path.starts_with("std/") {
+                return None;
+            }
+            let target_uri = uri.join(&raw_path).ok()?;
+            Some(Location {
+                uri: target_uri,
+                range: Range::default(),
+            })
         }
     }
-    let resolved = entry.tree.references.get(&node.id)?;
-    let target = entry.tree.node_index.get(&resolved.target)?;
-    Some(Location {
-        uri: uri.clone(),
-        range: token_range(target.range),
-    })
 }
 
-/// Build a `Location` for a [`CrossModuleRef`]. When the target field
-/// is known we point at its range; when it's not (alias head alone),
-/// we land at offset 0 of the target file so the client at least
-/// switches to the right document.
-fn cross_module_location(
-    workspace: &WorkspaceTree,
-    cross: &relon_analyzer::CrossModuleRef,
-) -> Option<Location> {
-    let target_uri = module_id_to_uri(&cross.module_id)?;
-    if let Some(target_id) = cross.target {
-        let target_tree = workspace.modules.get(&cross.module_id)?;
-        let target_node = target_tree.node_index.get(&target_id)?;
-        return Some(Location {
-            uri: target_uri,
-            range: token_range(target_node.range),
-        });
-    }
-    Some(Location {
-        uri: target_uri,
-        range: Range::default(),
-    })
+/// Re-export of `offset_to_position` shaped for the `lsp_types::Position`
+/// return type that the rest of the LSP layer expects.
+fn position_from_offset(source: &str, offset: usize) -> Position {
+    let (line, character) = goto_def::offset_to_position(source, offset);
+    Position { line, character }
 }
 
-/// Translate a canonical module id back into an LSP URI. The workspace
-/// pass keys modules by canonical filesystem paths (for disk-backed
-/// modules) or synthetic ids (`std/...`, in-memory playground keys);
-/// the former map cleanly via `Url::from_file_path`, the latter need
-/// to be passed through as a `file:`-shaped path so clients have
-/// *something* to navigate to. We try the filesystem form first and
-/// fall back to a synthetic `relon-module://` scheme.
+/// Translate a canonical module id back into an LSP URI. Filesystem
+/// paths round-trip through `Url::from_file_path`; synthetic ids
+/// (`std/...`, in-memory playground keys) get a fallback scheme.
 fn module_id_to_uri(canonical_id: &str) -> Option<Url> {
     if let Ok(uri) = Url::from_file_path(canonical_id) {
         return Some(uri);
     }
     Url::parse(&format!("relon-module:///{canonical_id}")).ok()
-}
-
-/// If `offset` falls inside any `@import(path, ...)` decorator's
-/// `path` string, return a `Location` pointing at the start of the
-/// resolved file. Returns `None` for non-string paths (dynamic
-/// f-strings) or unresolvable URIs (non-`file://` schemes, paths that
-/// don't exist on disk are still returned — LSP clients treat that as
-/// a "create file" affordance).
-fn import_target(entry: &DocumentEntry, offset: usize, uri: &Url) -> Option<Location> {
-    for import in &entry.tree.imports {
-        if !covers(import.range, offset) {
-            continue;
-        }
-        let path = import.path.as_deref()?;
-        let target_uri = resolve_import_uri(uri, path)?;
-        return Some(Location {
-            uri: target_uri,
-            range: Range::default(),
-        });
-    }
-    None
-}
-
-/// Translate an import path, relative to the importing document's
-/// URI, into the target document's URI. We deliberately don't touch
-/// the filesystem here — the LSP spec lets us return URIs that point
-/// at unopened (or even non-existent) files; the client decides what
-/// to do.
-///
-/// `std/...` virtual-module paths are skipped (no source file to
-/// jump to).
-fn resolve_import_uri(base: &Url, path: &str) -> Option<Url> {
-    if path.starts_with("std/") {
-        return None;
-    }
-    base.join(path).ok()
 }
 
 #[cfg(test)]

@@ -40,6 +40,7 @@ pub(crate) mod infer;
 pub(crate) mod main_return;
 pub mod main_sig;
 pub mod modules;
+pub mod goto_def;
 pub mod resolve;
 pub mod root_schemas;
 pub mod schema;

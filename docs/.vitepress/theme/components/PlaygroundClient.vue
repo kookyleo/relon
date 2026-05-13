@@ -54,6 +54,7 @@ import {
     setRuntimeErrors,
     type RuntimeErrorMark,
 } from './playground/runtime-errors';
+import { gotoDefinitionExtension } from './playground/goto-def';
 
 // ---------------- types --------------------------------------------------
 
@@ -86,6 +87,18 @@ interface WasmModule {
     evaluate_main: (sources: unknown, entry: string, args: unknown) => unknown;
     format: (content: string) => string;
     version: () => string;
+    goto_definition: (
+        sources: unknown,
+        entry: string,
+        line: number,
+        character: number
+    ) => GotoDefinitionResult | null;
+}
+
+export interface GotoDefinitionResult {
+    path: string;
+    start: { line: number; character: number };
+    end: { line: number; character: number };
 }
 
 // ---------------- reactive state -----------------------------------------
@@ -875,6 +888,45 @@ function startErrorsResize(e: PointerEvent) {
     target.addEventListener('pointercancel', stop);
 }
 
+/// Run the workspace-aware goto-definition lookup at the cursor's
+/// (line, character) and return the target the wasm layer found, or
+/// null. Called by the CodeMirror gotoDef extension on Mod-hover and
+/// Mod-click — must be cheap (synchronous, ≤ a few ms).
+function resolveGotoDef(line: number, character: number): GotoDefinitionResult | null {
+    const mod = wasmRef.value;
+    if (!mod) return null;
+    const sources = files.value.map((f) => ({ path: f.path, content: f.content }));
+    try {
+        return mod.goto_definition(sources, activeFile.value, line, character);
+    } catch {
+        // Defensive: a transient parse error or workspace cycle is a
+        // perfectly normal state for an editing session — don't crash
+        // the editor over it.
+        return null;
+    }
+}
+
+/// Apply a goto-definition target: switch to the right tab (for
+/// cross-file jumps) and move the editor's selection to the target's
+/// start. The viewportPad + scrollIntoView lands the target line a
+/// few rows below the top, which feels natural.
+function applyGotoDef(target: GotoDefinitionResult) {
+    if (target.path !== activeFile.value) {
+        selectFile(target.path);
+    }
+    const view = editorView.value;
+    if (!view) return;
+    const lineNum = target.start.line + 1;
+    if (lineNum < 1 || lineNum > view.state.doc.lines) return;
+    const lineObj = view.state.doc.line(lineNum);
+    const offset = Math.min(lineObj.from + target.start.character, lineObj.to);
+    view.dispatch({
+        selection: { anchor: offset, head: offset },
+        scrollIntoView: true,
+    });
+    view.focus();
+}
+
 onMounted(() => {
     if (!editorHost.value) return;
     const startDoc = activeFileObj.value?.content ?? '';
@@ -900,6 +952,10 @@ onMounted(() => {
             runtimeErrorExtension,
             keymap.of([...defaultKeymap, ...historyKeymap, indentWithTab]),
             langCompartment.of(relonLanguage()),
+            gotoDefinitionExtension({
+                resolve: resolveGotoDef,
+                jump: applyGotoDef,
+            }),
             EditorView.lineWrapping,
             viewportPad,
             updateListener,
@@ -1022,16 +1078,20 @@ watch([files, entry, argsInput], () => {
           </li>
         </ul>
       </div>
-      <button
-        type="button"
-        class="rp-args-input rp-args-trigger"
-        :class="{ 'is-empty': !argsCompact }"
-        :title="argsCompact ? 'Click to edit args (JSON)' : 'Click to enter args (JSON)'"
-        @click="openArgsDialog"
-      >
-        <span v-if="argsCompact" class="rp-args-text">{{ argsCompact }}</span>
-        <span v-else class="rp-args-placeholder">args:{}</span>
-      </button>
+      <div class="rp-args-cluster">
+        <span class="rp-args-bracket">main(</span>
+        <button
+          type="button"
+          class="rp-args-input rp-args-trigger"
+          :class="{ 'is-empty': !argsCompact }"
+          :title="argsCompact ? 'Click to edit args (JSON)' : 'Click to enter args (JSON)'"
+          @click="openArgsDialog"
+        >
+          <span v-if="argsCompact" class="rp-args-text">{{ argsCompact }}</span>
+          <span v-else class="rp-args-placeholder">args:{}</span>
+        </button>
+        <span class="rp-args-bracket">)</span>
+      </div>
       <span class="rp-run-cluster" :class="{ 'is-auto': autoRun }">
         <button
           class="rp-action rp-run"
@@ -1040,7 +1100,7 @@ watch([files, entry, argsInput], () => {
           aria-label="Run"
           @click="runActive"
         >
-          <svg viewBox="0 0 10 10" width="8" height="8" aria-hidden="true" class="rp-run-icon">
+          <svg viewBox="0 0 10 10" width="10" height="10" aria-hidden="true" class="rp-run-icon">
             <path
               d="M3 2L8 5L3 8Z"
               :fill="autoRun ? 'currentColor' : 'none'"
@@ -1735,6 +1795,22 @@ watch([files, entry, argsInput], () => {
 }
 
 
+.rp-args-cluster {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.rp-args-bracket {
+  font-family: var(--vp-font-family-mono);
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--vp-c-text-3);
+  user-select: none;
+  /* Slight nudge to align with the mono text inside the box */
+  margin-top: -1px;
+}
+
 .rp-args-input {
   /* Halved from the original 280px — 140px is enough to scan the
      compact JSON preview at a glance without crowding out the rest
@@ -1778,7 +1854,7 @@ watch([files, entry, argsInput], () => {
   color: var(--vp-c-text-3);
 }
 
-/* Play-button styling: square footprint, green fill, white triangle.
+/* Play-button styling: rounded rectangle footprint, green fill, white triangle.
    Fill / hover / active steps are pinned to the logo.svg green
    palette (#3E8A50 base, with adjacent shades present in the artwork)
    so the Run button reads as the same green as the {R}/Relon brand
@@ -1786,17 +1862,17 @@ watch([files, entry, argsInput], () => {
    (`.rp-status .rp-action.rp-run`) to beat the unified-control rule
    above on specificity. */
 .rp-status .rp-action.rp-run {
-  /* Core 18px circle. The ring and triangle are now integrated via
-     an SVG child and a simple border toggle on this parent, replacing
-     the fussy three-layer pseudo-element stack. */
+  /* Rounded rectangle (slightly smaller 24px to match the args box
+     visual weight). The ring and triangle are now integrated via an
+     SVG child and a simple border toggle on this parent. */
   position: relative;
-  width: 18px;
-  height: 18px;
+  width: 24px;
+  height: 24px;
   padding: 0;
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  border-radius: 50%;
+  border-radius: 4px;
   background: #3E8A50;
   border: 1px solid #3E8A50;
   color: #ffffff;
@@ -1836,7 +1912,6 @@ watch([files, entry, argsInput], () => {
 .rp-run-icon {
   /* Optical centring — the glyph's visual mass sits ~1px left of its
      bounding box, so nudge right. */
-  margin-left: 1px;
 }
 
 .rp-panes {
