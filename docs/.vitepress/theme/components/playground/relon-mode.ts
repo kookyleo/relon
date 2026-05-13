@@ -318,35 +318,41 @@ function consumeString(stream: { eol: () => boolean; next: () => string | undefi
     }
 }
 
-// Color table for Relon tokens. Hand-tuned for contrast against VitePress
-// default light/dark backgrounds. The `meta` (decorator) entry was darker
-// than every other meaningful token before; bumping it to a saturated
-// magenta brings it inline with the keyword / type / control hue family.
-// Operator entry exists explicitly because `defaultHighlightStyle` ships
-// no rule for `tags.operator`, leaving `==` / `+` / `*` etc. unstyled —
-// see CodeMirror 6 default highlight table.
-const relonHighlightStyle = HighlightStyle.define([
-    { tag: t.comment, color: '#994400' },
-    { tag: t.string, color: '#aa1111' },
-    { tag: t.number, color: '#116644' },
-    { tag: t.atom, color: '#116644' },
-    { tag: t.keyword, color: '#770088', fontWeight: 'bold' },
-    { tag: t.controlKeyword, color: '#770088', fontWeight: 'bold' },
-    { tag: t.typeName, color: '#008855' },
+// Class-based highlight style. We deliberately avoid hard-coded `color`
+// values here because hex literals can't react to VitePress's
+// `:root.dark` theme toggle — a dark-mode visitor would see saturated
+// `#aa1111` on a near-black background, which is what triggered the
+// original "the colors look terrible" report. The classes resolve to
+// CSS variables defined in `PlaygroundClient.vue`'s scoped style, so
+// the palette swaps automatically with the documentation theme.
+//
+// Shared with the JSON output pane via `playgroundHighlightStyle` —
+// keeping one palette across both editors avoids the eye-jarring
+// contrast of two unrelated colour systems sitting side by side.
+export const playgroundHighlightStyle = HighlightStyle.define([
+    { tag: t.comment, class: 'cm-r-comment' },
+    { tag: t.string, class: 'cm-r-string' },
+    { tag: t.number, class: 'cm-r-number' },
+    { tag: t.atom, class: 'cm-r-atom' },
+    { tag: t.bool, class: 'cm-r-atom' },
+    { tag: t.null, class: 'cm-r-atom' },
+    { tag: t.keyword, class: 'cm-r-keyword' },
+    { tag: t.controlKeyword, class: 'cm-r-keyword' },
+    { tag: t.typeName, class: 'cm-r-type' },
     // `&root`, `&sibling`, ... — emitted via `variableName.special`.
-    { tag: t.special(t.variableName), color: '#225566', fontWeight: 'bold' },
-    // `@decorator` invocations. Previously `#404740` (almost-black gray) —
-    // visually indistinguishable from body text. `#aa00aa` matches the
-    // TextMate `entity.name.function.decorator` hue used in the shiki
-    // grammar for parity between rendered docs and the live editor.
-    { tag: t.meta, color: '#aa00aa' },
-    // Arithmetic / comparison / logical / arrow / spread. Slate blue —
-    // distinct from every other Relon hue, easy on light backgrounds.
-    { tag: t.operator, color: '#4a5560' },
+    { tag: t.special(t.variableName), class: 'cm-r-ref' },
+    // `@decorator` invocations.
+    { tag: t.meta, class: 'cm-r-meta' },
+    // Arithmetic / comparison / logical / arrow / spread. `defaultHighlightStyle`
+    // ships no `tags.operator` rule, so without this they'd be unstyled.
+    { tag: t.operator, class: 'cm-r-operator' },
+    // JSON-specific: object keys.
+    { tag: t.propertyName, class: 'cm-r-property' },
+    { tag: t.definition(t.propertyName), class: 'cm-r-property' },
 ]);
 
 export function relonLanguage(): LanguageSupport {
     return new LanguageSupport(StreamLanguage.define(parser), [
-        syntaxHighlighting(relonHighlightStyle),
+        syntaxHighlighting(playgroundHighlightStyle),
     ]);
 }

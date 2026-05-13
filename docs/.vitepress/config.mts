@@ -32,10 +32,13 @@ export default defineConfig({
   ],
 
   locales: {
-    root: {
-      label: 'Language',
-      lang: 'en', // default for root is just redirect, but VitePress requires a root locale fallback
-    },
+    // No `root` entry — `docs/index.md` is a `layout: false` JS-redirect
+    // page that sends `/` to `/en/` or `/zh/` based on `navigator.language`.
+    // Adding a root locale here would make it appear as a third
+    // "Language" item in the locale switcher dropdown (VPNavBarTranslations
+    // iterates every `locales` key with a label). The two real locales
+    // below carry explicit `link` values so VitePress can still resolve
+    // routing without a root.
     zh: {
       label: '简体中文',
       lang: 'zh',
