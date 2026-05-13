@@ -6,6 +6,7 @@ pub mod expr;
 pub mod fmt_string;
 pub mod fn_call;
 pub mod id;
+pub mod cst;
 pub mod lex;
 pub mod prim;
 pub mod reference_var;
