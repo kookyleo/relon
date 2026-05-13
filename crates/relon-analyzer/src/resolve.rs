@@ -37,6 +37,91 @@ pub struct ResolvedRef {
     pub via: RefBase,
 }
 
+/// A reference site that resolves into another module via a `#import`
+/// binding. Filled in by the workspace post-pass once every module's
+/// AST is available — per-module resolution can only see that the
+/// head matches an import alias / destructure / spread, not what the
+/// imported module actually exports.
+#[derive(Debug, Clone)]
+pub struct CrossModuleRef {
+    /// Canonical id of the target module. The post-pass looks this up
+    /// in `WorkspaceTree::nodes` to descend into the imported file.
+    pub module_id: String,
+    /// `Some(NodeId)` when the post-pass located a specific field in
+    /// the target module's root Dict. `None` when the reference is the
+    /// alias head alone (`lib` in a bare `lib` expression — no
+    /// following segment to descend through), in which case callers
+    /// jump to the module's start.
+    pub target: Option<NodeId>,
+    /// Source range of the reference expression in the importer.
+    pub source_range: TokenRange,
+    /// Which import binding form surfaced this reference. The post-pass
+    /// uses this to decide what to look up in the target module.
+    pub via: CrossModuleVia,
+}
+
+/// Discriminator for [`CrossModuleRef`] / [`PendingCrossModuleRef`] —
+/// which `#import` form brought the binding into scope. Determines how
+/// the post-pass resolves the tail name (alias namespaces walk one
+/// step deeper; spread / destructure bind a single top-level field).
+#[derive(Debug, Clone)]
+pub enum CrossModuleVia {
+    /// `#import alias from "p"`: the head matched `alias`. Tail (if
+    /// any) is the field name to look up in p's root Dict; an empty
+    /// tail means the cursor sits on the alias itself.
+    Alias,
+    /// `#import { upstream as local } from "p"`: the head matched the
+    /// local binding, which maps to `upstream` in p's root Dict.
+    Destructured {
+        /// Name to look up in the target module's root Dict (the
+        /// upstream symbol the local name aliases).
+        upstream: String,
+    },
+    /// `#import * from "p"`: the head was looked up across every
+    /// spread target until one resolved.
+    Spread,
+}
+
+/// A cross-module reference recorded during per-module resolution,
+/// waiting for the workspace post-pass to look up its target NodeId.
+/// Carries enough context that the post-pass doesn't have to re-walk
+/// the importer's tree to decide which import index slot to consult.
+#[derive(Debug, Clone)]
+pub struct PendingCrossModuleRef {
+    /// NodeId of the reference site in the importer. Becomes the key
+    /// in `AnalyzedTree::cross_module_references` once resolved.
+    pub node_id: NodeId,
+    /// Source range of the reference site, mirrored from the source
+    /// expression. Carried separately so the post-pass doesn't have to
+    /// re-traverse the importer to recover it.
+    pub source_range: TokenRange,
+    /// Index into `AnalyzedTree::imports` identifying the import
+    /// directive that brought the head binding into scope. Walked in
+    /// lockstep with `WorkspaceTree::import_graph[importer]` to find
+    /// the target module's canonical id.
+    pub import_index: usize,
+    /// Tail segments after the head — what to look up in the target
+    /// module. For an alias import this is the path tail after the
+    /// alias; for destructure / spread imports it is empty (the head
+    /// itself is the imported binding).
+    pub tail: Vec<String>,
+    pub via: PendingCrossModuleVia,
+}
+
+#[derive(Debug, Clone)]
+pub enum PendingCrossModuleVia {
+    /// Head matched an `#import alias` binding. The first tail segment
+    /// (if any) is the field to look up in the target module.
+    Alias,
+    /// Head matched a destructure entry; resolve `upstream` in the
+    /// target module's root Dict.
+    Destructured { upstream: String },
+    /// Head didn't match any alias / destructure on this importer but
+    /// at least one `#import *` was in scope. The post-pass tries
+    /// every spread target in source order; first match wins.
+    SpreadCandidate { head: String },
+}
+
 /// Walk `root` and populate `tree.references` with every statically
 /// resolvable reference. Also populates `tree.node_index` so consumers
 /// can map a `NodeId` back to its `&Node`.
@@ -210,6 +295,15 @@ impl<'a> Walker<'a> {
             Expr::Reference { base, path } => {
                 if let Some(resolved) = self.resolve(base, path, node.range) {
                     self.tree.references.insert(node.id, resolved);
+                } else if matches!(base, RefBase::Sibling | RefBase::Root | RefBase::Uncle) {
+                    // Sibling / root / uncle references can still target
+                    // a cross-module binding: `&root.lib.x` when the
+                    // entry's root dict carries `#import lib from "p"`.
+                    // The cross-module record reuses path_head + the
+                    // tail logic; the per-doc lookup already failed, so
+                    // anything we file here is non-overlapping with
+                    // `references`.
+                    self.queue_cross_module(node.id, path, node.range);
                 }
             }
             Expr::Variable(path) => {
@@ -218,6 +312,27 @@ impl<'a> Walker<'a> {
                 // also bind. `resolve_variable` handles both.
                 if let Some(resolved) = self.resolve_variable(path, node.range) {
                     self.tree.references.insert(node.id, resolved);
+                } else {
+                    self.queue_cross_module(node.id, path, node.range);
+                }
+            }
+            Expr::FnCall { path, args } => {
+                // Call sites (`multiply(a, b)`, `lib.shout("hi")`) want
+                // the same head-resolution treatment as `Variable`:
+                // without it, go-to-definition on a function name only
+                // works at definition sites, not call sites. We resolve
+                // `path[0]` against the scope chain (closure params +
+                // dict fields), then queue cross-module otherwise.
+                if let Some(resolved) = self.resolve_variable(path, node.range) {
+                    self.tree.references.insert(node.id, resolved);
+                } else {
+                    self.queue_cross_module(node.id, path, node.range);
+                }
+                // Walk args ourselves — the `_` fallthrough would have
+                // done it via `child_nodes`, but we've handled the
+                // FnCall arm explicitly so we have to recurse manually.
+                for arg in args {
+                    self.visit(&arg.value);
                 }
             }
             _ => {
@@ -225,6 +340,84 @@ impl<'a> Walker<'a> {
                     self.visit(child);
                 }
             }
+        }
+    }
+
+    /// Record a pending cross-module reference if `path[0]` matches a
+    /// `#import` binding visible to this importer. No-op when the head
+    /// doesn't match any import — the typecheck pass will report it as
+    /// `UnresolvedReference` later if it stays unbound. The function
+    /// is deliberately a strict superset of the in-document scope walk:
+    /// callers invoke it only after the in-document lookup has failed.
+    fn queue_cross_module(&mut self, node_id: NodeId, path: &[TokenKey], source_range: TokenRange) {
+        let Some(head) = path_head(path) else { return };
+        // Tail segments after the head, lowered to string keys. Dynamic
+        // / spread / non-string tails (`alias.[expr]`) aren't statically
+        // resolvable and stay None — we still record the entry so the
+        // hover layer can offer a jump to the module head.
+        let tail: Vec<String> = path
+            .iter()
+            .skip(1)
+            .filter_map(|seg| match seg {
+                TokenKey::String(s, _, _) => Some(s.clone()),
+                _ => None,
+            })
+            .collect();
+        for (idx, imp) in self.tree.imports.iter().enumerate() {
+            if imp.alias.as_deref() == Some(head.as_str()) {
+                self.tree
+                    .pending_cross_module_refs
+                    .push(PendingCrossModuleRef {
+                        node_id,
+                        source_range,
+                        import_index: idx,
+                        tail,
+                        via: PendingCrossModuleVia::Alias,
+                    });
+                return;
+            }
+            for (upstream, local) in &imp.destructure {
+                let bound_name = local.as_deref().unwrap_or(upstream);
+                if bound_name == head {
+                    self.tree
+                        .pending_cross_module_refs
+                        .push(PendingCrossModuleRef {
+                            node_id,
+                            source_range,
+                            import_index: idx,
+                            tail,
+                            via: PendingCrossModuleVia::Destructured {
+                                upstream: upstream.clone(),
+                            },
+                        });
+                    return;
+                }
+            }
+        }
+        // Fall back to a spread candidate. We can't tell yet which
+        // spread import (if any) exports `head`; the post-pass tries
+        // each `#import *` in source order. Only queue when at least
+        // one spread import exists, otherwise the entry is dead noise.
+        if self.tree.imports.iter().any(|imp| imp.spread) {
+            // `import_index` for spread candidates points at the *first*
+            // spread import in source order; the post-pass uses the
+            // head name + every spread import on the importer, so this
+            // anchor is just bookkeeping for diagnostics.
+            let first_spread = self
+                .tree
+                .imports
+                .iter()
+                .position(|imp| imp.spread)
+                .expect("at least one spread import (checked above)");
+            self.tree
+                .pending_cross_module_refs
+                .push(PendingCrossModuleRef {
+                    node_id,
+                    source_range,
+                    import_index: first_spread,
+                    tail,
+                    via: PendingCrossModuleVia::SpreadCandidate { head },
+                });
         }
     }
 

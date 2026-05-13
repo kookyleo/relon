@@ -2,6 +2,25 @@
 
 ## [Unreleased] — Schema-rooted dispatch (trait-bound foundation)
 
+### Analyzer / LSP: cross-file go-to-definition
+
+`#import` bindings now carry through to definition resolution. The
+analyzer's per-document `resolve` pass records `Variable` and `FnCall`
+heads that match a `#import alias` / `#import { x }` / `#import *`
+binding as pending cross-module refs; a workspace post-pass drains
+those into `AnalyzedTree::cross_module_references` once every
+imported module has been parsed. The LSP `textDocument/definition`
+handler reads the new map (when a `WorkspaceTree` is provided) and
+returns a `Location` pointing at the imported module's URI + the
+target field's range.
+
+A related fix: `Expr::FnCall` heads are now resolved against the
+local scope chain too (the previous resolver only walked `Variable` /
+`Reference`), so same-file `multiply(...)` call sites get a
+references entry without needing the cross-module path.
+
+
+
 Phases A.1 / B / C / D-API of the design recorded in
 [`docs/internal/schema-rooted-model-2026-05-11.md`](./docs/internal/schema-rooted-model-2026-05-11.md):
 

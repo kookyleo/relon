@@ -162,6 +162,14 @@ pub(crate) fn build<L: ModuleLoader>(
     //    without duplicates.
     recheck_cross_module_calls(&mut ws);
 
+    // 4.7 Cross-module reference resolution. Drain each module's
+    //    `pending_cross_module_refs` into `cross_module_references`
+    //    by walking the imported module's root Dict for the named
+    //    field. Runs after every module's tree is in place; uses
+    //    `ws.nodes` (the parsed roots stored alongside the analyzed
+    //    side-tables) to descend without re-parsing.
+    resolve_cross_module_references(&mut ws);
+
     // 5. Stage 4: cross-module capability reachability. Runs after the
     //    import index is settled because the walker needs every
     //    reachable module's `node_index` populated. Diagnostics land
@@ -169,6 +177,160 @@ pub(crate) fn build<L: ModuleLoader>(
     crate::capability_check::run(&mut ws);
 
     ws
+}
+
+/// Resolve every module's pending cross-module references into the
+/// concrete `(module_id, NodeId)` form LSP consumers need. The pass is
+/// idempotent and safe to call exactly once after the workspace BFS
+/// is complete.
+///
+/// Strategy per pending entry:
+///
+/// * `Alias` — pair with `import_graph[importer][import_index]` to get
+///   the target's canonical id; if the tail has a head segment, walk
+///   the target module's root Dict for that field. Tail-less entries
+///   (cursor on the alias itself) yield a `CrossModuleRef` with
+///   `target = None` so callers can still surface a "jump to module"
+///   affordance.
+/// * `Destructured { upstream }` — look up `upstream` directly in the
+///   target module's root Dict.
+/// * `SpreadCandidate { head }` — try every `#import *` import on the
+///   importer in source order; first module whose root Dict carries
+///   `head` wins. Mirrors evaluator's lookup order.
+fn resolve_cross_module_references(ws: &mut WorkspaceTree) {
+    use crate::resolve::{CrossModuleRef, CrossModuleVia, PendingCrossModuleVia};
+
+    // First pass: snapshot which module ids each importer's pending
+    // entries should consult. We can't mutate `ws.modules[i]` while
+    // reading other modules' trees via `Arc`, so we resolve targets
+    // here against immutable borrows and apply the writes in a second
+    // pass after the borrow tree settles.
+    let importer_ids: Vec<String> = ws.modules.keys().cloned().collect();
+    for importer_id in importer_ids {
+        let pending = {
+            let Some(tree) = ws.modules.get(&importer_id) else {
+                continue;
+            };
+            if tree.pending_cross_module_refs.is_empty() {
+                continue;
+            }
+            tree.pending_cross_module_refs.clone()
+        };
+        let edges = ws
+            .import_graph
+            .get(&importer_id)
+            .cloned()
+            .unwrap_or_default();
+        let imports = {
+            let Some(tree) = ws.modules.get(&importer_id) else {
+                continue;
+            };
+            tree.imports.clone()
+        };
+
+        let mut resolved: Vec<(relon_parser::NodeId, CrossModuleRef)> = Vec::new();
+        for pending_ref in &pending {
+            match &pending_ref.via {
+                PendingCrossModuleVia::Alias => {
+                    let Some(target_id) = edges.get(pending_ref.import_index).cloned() else {
+                        continue;
+                    };
+                    let head_tail = pending_ref.tail.first().cloned();
+                    let target_node_id = head_tail
+                        .and_then(|name| lookup_root_field(ws, &target_id, &name));
+                    resolved.push((
+                        pending_ref.node_id,
+                        CrossModuleRef {
+                            module_id: target_id,
+                            target: target_node_id,
+                            source_range: pending_ref.source_range,
+                            via: CrossModuleVia::Alias,
+                        },
+                    ));
+                }
+                PendingCrossModuleVia::Destructured { upstream } => {
+                    let Some(target_id) = edges.get(pending_ref.import_index).cloned() else {
+                        continue;
+                    };
+                    let target_node_id = lookup_root_field(ws, &target_id, upstream);
+                    resolved.push((
+                        pending_ref.node_id,
+                        CrossModuleRef {
+                            module_id: target_id,
+                            target: target_node_id,
+                            source_range: pending_ref.source_range,
+                            via: CrossModuleVia::Destructured {
+                                upstream: upstream.clone(),
+                            },
+                        },
+                    ));
+                }
+                PendingCrossModuleVia::SpreadCandidate { head } => {
+                    // Try every spread import in source order.
+                    for (idx, imp) in imports.iter().enumerate() {
+                        if !imp.spread {
+                            continue;
+                        }
+                        let Some(target_id) = edges.get(idx).cloned() else {
+                            continue;
+                        };
+                        if let Some(nid) = lookup_root_field(ws, &target_id, head) {
+                            resolved.push((
+                                pending_ref.node_id,
+                                CrossModuleRef {
+                                    module_id: target_id,
+                                    target: Some(nid),
+                                    source_range: pending_ref.source_range,
+                                    via: CrossModuleVia::Spread,
+                                },
+                            ));
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Apply writes. `Arc::get_mut` succeeds here because the
+        // workspace BFS is the sole owner of each tree at this point —
+        // we haven't returned `WorkspaceTree` to callers yet, so no
+        // external `Arc` clone exists. (Other passes upstream of this
+        // one don't clone the Arc either; they swap `Arc::new(...)`
+        // into `ws.modules`.) The defensive `if let` keeps us
+        // recoverable: if some future pass starts holding a clone,
+        // the entries simply stay pending instead of panicking.
+        if let Some(tree_arc) = ws.modules.get_mut(&importer_id) {
+            if let Some(tree) = Arc::get_mut(tree_arc) {
+                tree.pending_cross_module_refs.clear();
+                for (nid, r) in resolved {
+                    tree.cross_module_references.insert(nid, r);
+                }
+            }
+        }
+    }
+}
+
+/// Look up `field_name` in `module_id`'s parsed root Dict and return
+/// the value-node's `NodeId`. Returns `None` for any of: missing
+/// module, non-Dict root, or absent field. Walks only the top level —
+/// nested resolution is the caller's job.
+fn lookup_root_field(
+    ws: &WorkspaceTree,
+    module_id: &str,
+    field_name: &str,
+) -> Option<relon_parser::NodeId> {
+    let root = ws.nodes.get(module_id)?;
+    let Expr::Dict(pairs) = &*root.expr else {
+        return None;
+    };
+    for (key, value) in pairs {
+        if let TokenKey::String(name, _, _) = key {
+            if name == field_name {
+                return Some(value.id);
+            }
+        }
+    }
+    None
 }
 
 fn process_import<L: ModuleLoader>(
@@ -1875,6 +2037,191 @@ mod tests {
                 .any(|d| matches!(d, Diagnostic::MissingSpreadTypeHint { .. })),
             "lib should report MissingSpreadTypeHint under strict contagion: {:?}",
             lib_diags
+        );
+    }
+
+    #[test]
+    fn cross_module_alias_dot_field_resolves_to_imported_node() {
+        // `#import lib from "./lib"` + `lib.shout(...)` should land a
+        // CrossModuleRef on the FnCall node whose `target` is the
+        // imported module's `shout:` value-node.
+        let mut loader = MapLoader::new();
+        loader.add(
+            "./lib",
+            "/abs/lib",
+            r#"{ shout(s): s + "!" }"#,
+        );
+        let ws = build(
+            "/abs/entry".to_string(),
+            r#"#import lib from "./lib"
+            { greeting: lib.shout("hi") }"#,
+            PathBuf::from("/abs"),
+            &mut loader,
+        );
+        let entry = ws.modules.get("/abs/entry").expect("entry analyzed");
+        assert!(
+            entry.pending_cross_module_refs.is_empty(),
+            "post-pass should drain pending: {:?}",
+            entry.pending_cross_module_refs
+        );
+        let resolved = entry
+            .cross_module_references
+            .values()
+            .find(|r| r.module_id == "/abs/lib")
+            .expect("at least one cross-module ref into lib");
+        assert!(resolved.target.is_some(), "tail `shout` should resolve");
+        // The target should be the closure value bound to `shout`.
+        let lib = ws.modules.get("/abs/lib").unwrap();
+        let target_node = lib.node(resolved.target.unwrap()).expect("indexed");
+        assert!(
+            matches!(&*target_node.expr, relon_parser::Expr::Closure { .. }),
+            "target should be the `shout` closure, got {:?}",
+            target_node.expr
+        );
+    }
+
+    #[test]
+    fn cross_module_alias_head_alone_resolves_to_module_with_target_none() {
+        // Cursor on the bare alias `lib` (no tail) should produce a
+        // CrossModuleRef whose `module_id` is set and `target` is None
+        // — callers (LSP) jump to the start of the file in that case.
+        let mut loader = MapLoader::new();
+        loader.add("./lib", "/abs/lib", r#"{ x: 1 }"#);
+        let ws = build(
+            "/abs/entry".to_string(),
+            r#"#import lib from "./lib"
+            { passthrough: lib }"#,
+            PathBuf::from("/abs"),
+            &mut loader,
+        );
+        let entry = ws.modules.get("/abs/entry").expect("entry analyzed");
+        let resolved = entry
+            .cross_module_references
+            .values()
+            .find(|r| r.module_id == "/abs/lib")
+            .expect("alias head should record cross-module ref");
+        assert!(
+            resolved.target.is_none(),
+            "tail-less alias head should leave target unset, got {:?}",
+            resolved.target
+        );
+    }
+
+    #[test]
+    fn cross_module_destructure_resolves_local_name_to_upstream() {
+        // `#import { add } from "./lib"` + `add(1, 2)` should resolve
+        // to lib's `add:` field.
+        let mut loader = MapLoader::new();
+        loader.add(
+            "./lib",
+            "/abs/lib",
+            r#"{ add(Int a, Int b): a + b }"#,
+        );
+        let ws = build(
+            "/abs/entry".to_string(),
+            r#"#import { add } from "./lib"
+            { v: add(1, 2) }"#,
+            PathBuf::from("/abs"),
+            &mut loader,
+        );
+        let entry = ws.modules.get("/abs/entry").expect("entry analyzed");
+        let resolved = entry
+            .cross_module_references
+            .values()
+            .find(|r| r.module_id == "/abs/lib")
+            .expect("destructure should record a cross-module ref");
+        assert!(resolved.target.is_some(), "local `add` should resolve");
+    }
+
+    #[test]
+    fn cross_module_destructure_with_rename_uses_upstream_name() {
+        // `#import { add as plus } from "./lib"` — local name is
+        // `plus`, upstream is `add`. Calling `plus(...)` should still
+        // jump to lib's `add:` field.
+        let mut loader = MapLoader::new();
+        loader.add(
+            "./lib",
+            "/abs/lib",
+            r#"{ add(Int a, Int b): a + b }"#,
+        );
+        let ws = build(
+            "/abs/entry".to_string(),
+            r#"#import { add as plus } from "./lib"
+            { v: plus(1, 2) }"#,
+            PathBuf::from("/abs"),
+            &mut loader,
+        );
+        let entry = ws.modules.get("/abs/entry").expect("entry analyzed");
+        let resolved = entry
+            .cross_module_references
+            .values()
+            .find(|r| r.module_id == "/abs/lib")
+            .expect("renamed destructure should record cross-module ref");
+        assert!(
+            resolved.target.is_some(),
+            "renamed local should resolve to upstream"
+        );
+    }
+
+    #[test]
+    fn cross_module_spread_resolves_bare_head_to_target_field() {
+        // `#import * from "./lib"` + bare `shout(...)` should resolve
+        // to lib's `shout:` field via the spread-candidate post-pass.
+        let mut loader = MapLoader::new();
+        loader.add(
+            "./lib",
+            "/abs/lib",
+            r#"{ shout(s): s + "!" }"#,
+        );
+        let ws = build(
+            "/abs/entry".to_string(),
+            r#"#import * from "./lib"
+            { v: shout("hi") }"#,
+            PathBuf::from("/abs"),
+            &mut loader,
+        );
+        let entry = ws.modules.get("/abs/entry").expect("entry analyzed");
+        let resolved = entry
+            .cross_module_references
+            .values()
+            .find(|r| r.module_id == "/abs/lib")
+            .expect("spread should record a cross-module ref");
+        assert!(
+            resolved.target.is_some(),
+            "spread-imported `shout` should resolve"
+        );
+    }
+
+    #[test]
+    fn cross_module_resolution_handles_same_file_fncall_call_site() {
+        // Same-file regression: `multiply(a, b)` defined as a sibling
+        // closure and called as `multiply(...)` should leave a
+        // local-references entry on the FnCall head, not a cross-
+        // module one. Confirms FnCall path resolution.
+        let mut loader = MapLoader::new();
+        let ws = build(
+            "/abs/entry".to_string(),
+            r#"{
+                multiply(a, b): a * b,
+                result: multiply(2, 3)
+            }"#,
+            PathBuf::from("/abs"),
+            &mut loader,
+        );
+        let entry = ws.modules.get("/abs/entry").expect("entry analyzed");
+        // At least one local reference should target the `multiply`
+        // closure (the FnCall head bound to the closure value).
+        assert!(
+            entry.references.values().any(|r| {
+                let node = entry.node(r.target).unwrap();
+                matches!(&*node.expr, relon_parser::Expr::Closure { .. })
+            }),
+            "FnCall head should resolve to local closure: {:?}",
+            entry.references
+        );
+        assert!(
+            entry.cross_module_references.is_empty(),
+            "same-file call site shouldn't produce cross-module refs"
         );
     }
 

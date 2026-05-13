@@ -54,7 +54,7 @@ pub use cap::{Capabilities, NativeFnGate};
 pub use diagnostic::{Diagnostic, Severity};
 pub use main_sig::{MainParam, MainSignature};
 pub use modules::ModuleImport;
-pub use resolve::ResolvedRef;
+pub use resolve::{CrossModuleRef, CrossModuleVia, ResolvedRef};
 pub use root_schemas::RootSchemaDecl;
 pub use schema::{
     lower_schema_pure, BaseRef, EnumVariant, MetaDecoratorRef, SchemaDef, SchemaFieldDef,
@@ -201,8 +201,13 @@ pub fn analyze_with_options(root: &Node, options: &AnalyzeOptions) -> AnalyzedTr
     // passes so the known-name set is fully populated.
     schema::check_schema_field_types(&mut tree);
     main_sig::collect_main(root, &mut tree);
-    resolve::resolve_references(root, &mut tree);
+    // `collect_imports` must run before `resolve_references` so the
+    // reference walker can detect cross-module heads (`#import alias`
+    // → `alias.x`) and queue them for the workspace post-pass.
+    // Resolution still works the same for any single-file source —
+    // imports just stays empty.
     modules::collect_imports(root, &mut tree);
+    resolve::resolve_references(root, &mut tree);
     typecheck::typecheck(root, &mut tree);
     // Stage 1.7: pre-flight check the entry's `#main(...) -> Type`
     // return annotation against the body's inferred type. Runs after

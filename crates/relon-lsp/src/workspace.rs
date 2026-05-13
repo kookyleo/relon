@@ -114,6 +114,32 @@ pub fn compute_workspace_diagnostics(
     entry_dir: PathBuf,
     workspace_root: PathBuf,
 ) -> HashMap<Url, Vec<LspDiagnostic>> {
+    let (_workspace, diags) = compute_workspace(
+        entry_uri,
+        entry_canonical,
+        entry_source,
+        entry_dir,
+        workspace_root,
+    );
+    diags
+}
+
+/// Same workspace build as [`compute_workspace_diagnostics`] but also
+/// returns the underlying [`WorkspaceTree`] for callers (the LSP
+/// server) that need to consult its module graph from later request
+/// handlers — go-to-definition reads
+/// [`relon_analyzer::AnalyzedTree::cross_module_references`] to walk
+/// `#import` jumps across files.
+pub fn compute_workspace(
+    entry_uri: &Url,
+    entry_canonical: &str,
+    entry_source: &str,
+    entry_dir: PathBuf,
+    workspace_root: PathBuf,
+) -> (
+    relon_analyzer::WorkspaceTree,
+    HashMap<Url, Vec<LspDiagnostic>>,
+) {
     let mut loader = LspLoader::new_for_workspace(workspace_root);
     let workspace = analyze_entry(
         entry_canonical.to_string(),
@@ -121,7 +147,8 @@ pub fn compute_workspace_diagnostics(
         entry_dir,
         &mut loader,
     );
-    map_workspace_to_lsp(&workspace, entry_uri, entry_canonical, entry_source)
+    let diags = map_workspace_to_lsp(&workspace, entry_uri, entry_canonical, entry_source);
+    (workspace, diags)
 }
 
 /// Translate a `WorkspaceTree` plus its sources into LSP diagnostics

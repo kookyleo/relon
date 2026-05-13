@@ -17,7 +17,7 @@
 
 use crate::diagnostics::batch_to_lsp;
 use crate::features;
-use crate::workspace::compute_workspace_diagnostics;
+use crate::workspace::compute_workspace;
 use anyhow::{Context, Result};
 use lsp_server::{Connection, Message, Notification, Request, Response};
 use lsp_types::notification::{
@@ -30,7 +30,7 @@ use lsp_types::{
     OneOf, PublishDiagnosticsParams, ServerCapabilities, TextDocumentSyncCapability,
     TextDocumentSyncKind, Url,
 };
-use relon_analyzer::{analyze, AnalyzedTree};
+use relon_analyzer::{analyze, AnalyzedTree, WorkspaceTree};
 use relon_parser::{parse_document, Node};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -100,6 +100,13 @@ struct ServerState {
     /// errors in a previously-erroring file, we can publish an empty
     /// list to that URI explicitly (LSP requires the server to clear).
     published_uris: HashSet<Url>,
+    /// Most recently-built workspace tree, retained so go-to-definition
+    /// can resolve `#import` cross-file targets through
+    /// `AnalyzedTree::cross_module_references`. Updated alongside each
+    /// publish-diagnostics pass; `None` until the first successful
+    /// workspace build, and stays `None` for single-file fallback
+    /// (no workspace_root) where every reference is intra-document.
+    last_workspace: Option<Arc<WorkspaceTree>>,
 }
 
 /// Best-effort workspace root extraction. Prefers `workspace_folders`
@@ -199,7 +206,14 @@ fn handle_request(conn: &Connection, state: &mut ServerState, req: Request) -> R
             let result = state
                 .docs
                 .get(&uri)
-                .and_then(|entry| features::definition::resolve(entry, position, &uri))
+                .and_then(|entry| {
+                    features::definition::resolve(
+                        entry,
+                        position,
+                        &uri,
+                        state.last_workspace.as_deref(),
+                    )
+                })
                 .map(GotoDefinitionResponse::Scalar);
             ok_response(id, &result)?
         }
@@ -322,12 +336,13 @@ fn publish_diagnostics(conn: &Connection, state: &mut ServerState, uri: &Url) ->
     // shy of that — detached scratch buffer, untitled doc, virtual
     // schemes — drops to the single-file path, which still surfaces
     // analyzer + parser diagnostics for the active document.
-    let workspace_diags = state
+    let workspace_pass = state
         .workspace_root
         .clone()
-        .and_then(|root| try_workspace_diagnostics(uri, &entry.source, &root));
+        .and_then(|root| try_workspace_pass(uri, &entry.source, &root));
 
-    if let Some(by_uri) = workspace_diags {
+    if let Some((workspace, by_uri)) = workspace_pass {
+        state.last_workspace = Some(Arc::new(workspace));
         // Clear any URI that previously had non-empty diagnostics but
         // no longer appears in the new pass — the editor needs an
         // explicit empty publish to drop the squiggles.
@@ -342,10 +357,15 @@ fn publish_diagnostics(conn: &Connection, state: &mut ServerState, uri: &Url) ->
         return Ok(());
     }
 
-    // Single-file fallback. Combines analyzer findings with parser
-    // failures; the latter only show up if `build_entry` swapped in
-    // the empty document. Reuse the streaming `compute_diagnostics`
-    // helper so both paths stay in lockstep.
+    // Single-file fallback. No workspace tree to retain — clear any
+    // stale one so cross-module hits don't leak from a previously
+    // open workspace into the current detached buffer's
+    // go-to-definition request.
+    state.last_workspace = None;
+    // Combines analyzer findings with parser failures; the latter only
+    // show up if `build_entry` swapped in the empty document. Reuse
+    // the streaming `compute_diagnostics` helper so both paths stay in
+    // lockstep.
     let diags = compute_diagnostics(&entry.source);
     // Whatever the workspace pass had marked previously is now stale.
     for stale in std::mem::take(&mut state.published_uris) {
@@ -363,16 +383,20 @@ fn publish_diagnostics(conn: &Connection, state: &mut ServerState, uri: &Url) ->
 /// * The URI isn't `file://`.
 /// * `to_file_path` / canonicalize fails (scratch buffer, deleted
 ///   on-disk twin, etc.).
-fn try_workspace_diagnostics(
+///
+/// On success returns the analyzed `WorkspaceTree` alongside the
+/// diagnostics; the server retains the tree so cross-file go-to-
+/// definition can later consult it.
+fn try_workspace_pass(
     uri: &Url,
     source: &str,
     workspace_root: &std::path::Path,
-) -> Option<HashMap<Url, Vec<lsp_types::Diagnostic>>> {
+) -> Option<(WorkspaceTree, HashMap<Url, Vec<lsp_types::Diagnostic>>)> {
     let path = uri.to_file_path().ok()?;
     let canonical = std::fs::canonicalize(&path).ok()?;
     let entry_dir = canonical.parent()?.to_path_buf();
     let entry_canonical = canonical.to_string_lossy().to_string();
-    Some(compute_workspace_diagnostics(
+    Some(compute_workspace(
         uri,
         &entry_canonical,
         source,

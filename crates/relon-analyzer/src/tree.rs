@@ -7,7 +7,7 @@
 use crate::cap::{Capabilities, NativeFnGate};
 use crate::diagnostic::Diagnostic;
 use crate::main_sig::MainSignature;
-use crate::resolve::ResolvedRef;
+use crate::resolve::{CrossModuleRef, PendingCrossModuleRef, ResolvedRef};
 use crate::root_schemas::RootSchemaDecl;
 use crate::schema::{SchemaDef, SchemaMethodInfo};
 use crate::sig::FnSignature;
@@ -43,6 +43,21 @@ pub struct AnalyzedTree {
     /// (LSP, type-checker, lint) join this against `node_index` to map
     /// from a reference site back to the field it points at.
     pub references: HashMap<NodeId, ResolvedRef>,
+    /// Cross-module references resolved by the workspace post-pass.
+    /// Keyed by the reference expression's `NodeId` — disjoint from
+    /// `references`, which only covers same-document targets. Each
+    /// entry carries the target module's canonical id plus the target
+    /// `NodeId` (when located); LSP go-to-definition consumes the
+    /// pair to build a cross-file Location. Empty for single-file
+    /// `analyze` (the post-pass requires a `WorkspaceTree`).
+    pub cross_module_references: HashMap<NodeId, CrossModuleRef>,
+    /// Per-module resolution's record of references whose head matches
+    /// a `#import` binding but whose target NodeId can only be located
+    /// once the importer's transitive modules are analyzed. Drained
+    /// into `cross_module_references` by the workspace post-pass.
+    /// `pub(crate)` because nothing outside the analyzer crate should
+    /// observe the pre-resolution state.
+    pub(crate) pending_cross_module_refs: Vec<PendingCrossModuleRef>,
     /// Snapshot of every `NodeId`-bearing AST node visited by an
     /// analyzer pass. Lets consumers turn a `NodeId` (returned by
     /// `references` or `schemas`) back into the original `&Node`
