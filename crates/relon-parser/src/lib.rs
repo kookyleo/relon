@@ -6,10 +6,12 @@ pub mod expr;
 pub mod fmt_string;
 pub mod fn_call;
 pub mod id;
+pub mod lex;
 pub mod prim;
 pub mod reference_var;
 pub mod source;
 pub mod structure;
+pub mod syntax;
 pub mod token;
 pub mod var;
 
