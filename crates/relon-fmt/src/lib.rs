@@ -3,7 +3,10 @@
 use relon_parser::{
     parse_document,
     source::{tokenize_source, SourceToken as Token, SourceTokenKind as TokenKind},
+    Directive, DirectiveBody, Expr, Node, TokenKey,
 };
+use std::collections::BTreeSet;
+use std::ops::Range;
 use std::path::PathBuf;
 
 const INDENT: &str = "    ";
@@ -30,11 +33,38 @@ pub enum Error {
 }
 
 pub fn format_source(source: &str) -> Result<String, Error> {
-    // Parse for syntactic validation; the formatter itself runs over
-    // the token stream so it preserves comment placement byte-for-byte.
-    parse_document(source).map_err(|error| Error::Parse(error.to_string()))?;
-    let tokens = tokenize_source(source).map_err(|error| Error::Tokenize(error.to_string()))?;
-    let mut formatter = SourceFormatter::new(&tokens);
+    // Pipeline:
+    //   1. Parse the original source.
+    //   2. AST-driven *source edits* — `lift_imports` and `reorder_methods`
+    //      build whole-pair byte-range edits that respect ownership
+    //      (directives/decorators stay glued to their pair). Applied
+    //      right-to-left so offsets remain valid.
+    //   3. Re-parse the edited source so subsequent passes work on
+    //      stable offsets.
+    //   4. Compute paragraph-break offsets — byte positions of the
+    //      first pair-byte that needs a blank line above it.
+    //   5. Tokenize + run the canonical token-stream formatter, which
+    //      consults the paragraph-break set to decide between `\n` and
+    //      `\n\n` ahead of each token.
+    //   6. Validate the output re-parses.
+    let root = parse_document(source).map_err(|error| Error::Parse(error.to_string()))?;
+
+    let mut edits: Vec<SourceEdit> = Vec::new();
+    collect_lift_import_edits(&root, source, &mut edits);
+    collect_dict_reorder_edits(&root, /*in_directive_body=*/ false, source, &mut edits);
+    let edited = apply_edits(source, edits);
+
+    let break_offsets = if edited != source {
+        let root2 =
+            parse_document(&edited).map_err(|error| Error::Parse(error.to_string()))?;
+        compute_paragraph_break_offsets(&root2, /*in_directive_body=*/ false, &edited)
+    } else {
+        compute_paragraph_break_offsets(&root, /*in_directive_body=*/ false, source)
+    };
+
+    let tokens =
+        tokenize_source(&edited).map_err(|error| Error::Tokenize(error.to_string()))?;
+    let mut formatter = SourceFormatter::new(&tokens, &break_offsets);
     let output = formatter.format();
     validate_source(&output)?;
     Ok(output)
@@ -47,6 +77,492 @@ pub fn is_formatted(source: &str) -> Result<bool, Error> {
 fn validate_source(source: &str) -> Result<(), Error> {
     parse_document(source).map_err(|error| Error::Parse(error.to_string()))?;
     Ok(())
+}
+
+// =====================================================================
+// AST-side primitives — used by every pair-level fmt feature.
+//
+// These exist for one reason: the token stream doesn't know which `#`
+// belongs to which pair, but the AST does. Every operation that
+// affects pair grouping (reorder, paragraph break, lift imports)
+// MUST go through these primitives so directives/decorators stay
+// glued to their pair.
+// =====================================================================
+
+/// Source byte range covering the interior of a Dict's braces
+/// (exclusive of `{` and `}`). Critically, the `{` search starts
+/// **after** the node's own directives/decorators/type_hint — for the
+/// root node those preceding constructs can include whole `#schema X
+/// { ... }` blocks, whose `{` must NOT be mistaken for the body's `{`.
+/// Returns `None` if the braces can't be located (defensive).
+fn dict_body_range(node: &Node, source: &str) -> Option<Range<usize>> {
+    let mut search_start = node.range.start.offset;
+    for dir in &node.directives {
+        search_start = search_start.max(dir.range.end.offset);
+    }
+    for dec in &node.decorators {
+        search_start = search_start.max(dec.range.end.offset);
+    }
+    if let Some(t) = &node.type_hint {
+        search_start = search_start.max(t.range.end.offset);
+    }
+
+    let span_end = node.range.end.offset.min(source.len());
+    if search_start >= span_end {
+        return None;
+    }
+    let bytes = source.as_bytes();
+    let mut i = search_start;
+    // Scan for `{` skipping strings and comments.
+    let open_abs = loop {
+        if i >= span_end {
+            return None;
+        }
+        match bytes[i] {
+            b'"' => {
+                i = skip_string(bytes, i, span_end);
+            }
+            b'/' if i + 1 < span_end && bytes[i + 1] == b'/' => {
+                while i < span_end && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if i + 1 < span_end && bytes[i + 1] == b'*' => {
+                i += 2;
+                while i + 1 < span_end && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                    i += 1;
+                }
+                i = (i + 2).min(span_end);
+            }
+            b'{' => break i,
+            _ => i += 1,
+        }
+    };
+
+    let mut depth: i32 = 0;
+    i = open_abs;
+    while i < span_end {
+        match bytes[i] {
+            b'"' => {
+                i = skip_string(bytes, i, span_end);
+                continue;
+            }
+            b'/' if i + 1 < span_end && bytes[i + 1] == b'/' => {
+                while i < span_end && bytes[i] != b'\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            b'/' if i + 1 < span_end && bytes[i + 1] == b'*' => {
+                i += 2;
+                while i + 1 < span_end && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                    i += 1;
+                }
+                i = (i + 2).min(span_end);
+                continue;
+            }
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some((open_abs + 1)..i);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Skip a `"..."` string literal (with backslash-escape awareness).
+/// `start` must point at the opening `"`. Returns the index *after*
+/// the closing `"`, or `end` if the string is unterminated.
+fn skip_string(bytes: &[u8], start: usize, end: usize) -> usize {
+    debug_assert_eq!(bytes[start], b'"');
+    let mut i = start + 1;
+    while i < end {
+        match bytes[i] {
+            b'\\' => i = (i + 2).min(end),
+            b'"' => return i + 1,
+            _ => i += 1,
+        }
+    }
+    end
+}
+
+/// Source byte range covering an entire Dict pair: the earliest start
+/// among the key, directives, and decorators (since `#private` /
+/// `@deco` precede the key in source), through the value's end. This
+/// is the canonical "whole pair" extent — any source-rewrite of pair
+/// order must use this range so the leading directives/decorators
+/// stay attached.
+fn pair_span(pair: &(TokenKey, Node), source: &str) -> Range<usize> {
+    let (key, value) = pair;
+    let mut start = key_start_offset(key).unwrap_or(value.range.start.offset);
+    for dir in &value.directives {
+        start = start.min(dir.range.start.offset);
+    }
+    for dec in &value.decorators {
+        start = start.min(dec.range.start.offset);
+    }
+    let end = value.range.end.offset.min(source.len());
+    start..end
+}
+
+fn key_start_offset(key: &TokenKey) -> Option<usize> {
+    match key {
+        TokenKey::String(_, range, _) => Some(range.start.offset),
+        TokenKey::Dynamic(node, _) => Some(node.range.start.offset),
+        TokenKey::Spread(range) => Some(range.start.offset),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PairKind {
+    /// Closure-valued pair `name(params): body` — a method.
+    Method,
+    /// Any other pair — a field.
+    Field,
+}
+
+fn classify_pair(pair: &(TokenKey, Node)) -> PairKind {
+    match &*pair.1.expr {
+        Expr::Closure { .. } => PairKind::Method,
+        _ => PairKind::Field,
+    }
+}
+
+/// Yield expression children only. Directives and decorators are
+/// walked separately by each pre-pass driver so they can flag a
+/// `#schema` / `#extend` / `#main` body Dict as "don't reorder me"
+/// (its declaration order is semantic).
+fn expr_children(node: &Node) -> Vec<&Node> {
+    let mut out = Vec::new();
+    match &*node.expr {
+        Expr::Dict(pairs) => {
+            for (key, value) in pairs {
+                if let TokenKey::Dynamic(inner, _) = key {
+                    out.push(inner);
+                }
+                out.push(value);
+            }
+        }
+        Expr::List(items) => out.extend(items.iter()),
+        Expr::Spread(inner) => out.push(inner),
+        Expr::Comprehension {
+            element,
+            iterable,
+            condition,
+            ..
+        } => {
+            out.push(element);
+            out.push(iterable);
+            if let Some(c) = condition {
+                out.push(c);
+            }
+        }
+        Expr::Binary(_, l, r) => {
+            out.push(l);
+            out.push(r);
+        }
+        Expr::Unary(_, inner) => out.push(inner),
+        Expr::Ternary { cond, then, els } => {
+            out.push(cond);
+            out.push(then);
+            out.push(els);
+        }
+        Expr::FnCall { args, .. } => {
+            for arg in args {
+                out.push(&arg.value);
+            }
+        }
+        Expr::FString(parts) => {
+            for part in parts {
+                if let relon_parser::FStringPart::Interpolation(n) = part {
+                    out.push(n);
+                }
+            }
+        }
+        Expr::Where { expr, bindings } => {
+            out.push(expr);
+            out.push(bindings);
+        }
+        Expr::Match { expr, arms } => {
+            out.push(expr);
+            for (pat, body) in arms {
+                out.push(pat);
+                out.push(body);
+            }
+        }
+        Expr::Closure { body, .. } => out.push(body),
+        Expr::VariantCtor { body, .. } => out.push(body),
+        _ => {}
+    }
+    out
+}
+
+// =====================================================================
+// Source edit primitive.
+// =====================================================================
+
+/// One byte-range replacement applied to the source string. Edits are
+/// applied right-to-left so earlier offsets remain valid.
+struct SourceEdit {
+    range: Range<usize>,
+    replacement: String,
+}
+
+fn apply_edits(source: &str, mut edits: Vec<SourceEdit>) -> String {
+    if edits.is_empty() {
+        return source.to_string();
+    }
+    edits.sort_by_key(|e| std::cmp::Reverse(e.range.start));
+    let mut out = source.to_string();
+    for edit in edits {
+        out.replace_range(edit.range, &edit.replacement);
+    }
+    out
+}
+
+// =====================================================================
+// Pass 1: lift `#import` directives to the top of the file.
+//
+// All consecutive `#import`s should sit as a single contiguous block
+// at the top of the file (just below any leading comments). If any
+// non-import directive is interleaved, we move every #import to the
+// top while preserving their original relative order.
+//
+// Conservative bail: if any #import's leading source text would
+// disturb a comment, leave it alone. v1 prioritises correctness over
+// completeness — files with interleaved comments simply keep their
+// order.
+// =====================================================================
+
+fn collect_lift_import_edits(root: &Node, source: &str, edits: &mut Vec<SourceEdit>) {
+    let imports: Vec<&Directive> = root
+        .directives
+        .iter()
+        .filter(|d| d.name == "import")
+        .collect();
+    if imports.is_empty() {
+        return;
+    }
+
+    // Already-packed shape: the first N directives are all imports,
+    // where N == imports.len(). Nothing to do.
+    let leading_imports = root
+        .directives
+        .iter()
+        .take_while(|d| d.name == "import")
+        .count();
+    if leading_imports == imports.len() {
+        return;
+    }
+
+    // Conservative bail: if any byte between the file start of the
+    // first directive and the last import holds a comment, moving an
+    // import could disturb the comment's visual association. Skip.
+    let first_directive_start = root.directives[0].range.start.offset;
+    let last_import_end = imports.last().unwrap().range.end.offset.min(source.len());
+    let inter_block = &source[first_directive_start..last_import_end];
+    if inter_block.contains("//") || inter_block.contains("/*") {
+        return;
+    }
+
+    // Build the lifted block: each import's source text in original
+    // order, separated by `\n`. Trailing newline so the next
+    // construct starts on its own line.
+    let mut lifted = String::new();
+    let mut import_ranges: Vec<Range<usize>> = Vec::with_capacity(imports.len());
+    for (i, dir) in imports.iter().enumerate() {
+        let r = dir.range.start.offset..dir.range.end.offset.min(source.len());
+        if i > 0 {
+            lifted.push('\n');
+        }
+        lifted.push_str(source[r.clone()].trim());
+        import_ranges.push(r);
+    }
+    lifted.push('\n');
+
+    // Edits:
+    //   (a) Insert the lifted block at the TOP of the directive list
+    //       (the byte position of the first directive). This puts
+    //       imports above any leading `#schema` / `#extend` / `#main`.
+    //   (b) Delete each import from its original position. The
+    //       formatter's whitespace pass collapses trailing blank
+    //       runs into a single canonical separator.
+    let target = first_directive_start;
+    edits.push(SourceEdit {
+        range: target..target,
+        replacement: lifted,
+    });
+    for r in &import_ranges {
+        edits.push(SourceEdit {
+            range: r.clone(),
+            replacement: String::new(),
+        });
+    }
+}
+
+// =====================================================================
+// Pass 2: lift methods to the front of each reorderable Dict.
+//
+// Walks the AST; for each Dict whose pairs are not already
+// methods-first, queues a single byte-range edit replacing the Dict's
+// body with the reordered pair_spans joined by `,\n`.
+//
+// Bails for:
+//   - Dicts inside a directive body (declaration order is semantic).
+//   - Dicts containing any comment (comments can't be statically
+//     routed to a specific pair — see the `comments_disable_reorder`
+//     test in the prior implementation).
+// =====================================================================
+
+fn collect_dict_reorder_edits(
+    node: &Node,
+    in_directive_body: bool,
+    source: &str,
+    edits: &mut Vec<SourceEdit>,
+) {
+    // Walk directives — their bodies are declaration-shaped (schema
+    // fields, main params) and opt out of reorder.
+    for dir in &node.directives {
+        if let Some(body) = directive_body_node(&dir.body) {
+            collect_dict_reorder_edits(body, true, source, edits);
+        }
+    }
+    // Decorator args and expression children reorder normally.
+    for dec in &node.decorators {
+        for arg in &dec.args {
+            collect_dict_reorder_edits(&arg.value, false, source, edits);
+        }
+    }
+    for child in expr_children(node) {
+        collect_dict_reorder_edits(child, false, source, edits);
+    }
+
+    if in_directive_body {
+        return;
+    }
+    let Expr::Dict(pairs) = &*node.expr else {
+        return;
+    };
+    if pairs.len() < 2 {
+        return;
+    }
+
+    let classified: Vec<(PairKind, &(TokenKey, Node))> =
+        pairs.iter().map(|p| (classify_pair(p), p)).collect();
+
+    if pairs_methods_first(&classified) {
+        return;
+    }
+
+    let Some(body_range) = dict_body_range(node, source) else {
+        return;
+    };
+    let body_text = &source[body_range.clone()];
+    if body_text.contains("//") || body_text.contains("/*") {
+        // Conservative: comment placement is brittle under reorder.
+        return;
+    }
+
+    let methods = classified.iter().filter(|(c, _)| *c == PairKind::Method);
+    let fields = classified.iter().filter(|(c, _)| *c == PairKind::Field);
+    let pieces: Vec<&str> = methods
+        .chain(fields)
+        .map(|(_, p)| source[pair_span(p, source)].trim())
+        .collect();
+    let new_body = format!("\n{}\n", pieces.join(",\n"));
+    edits.push(SourceEdit {
+        range: body_range,
+        replacement: new_body,
+    });
+}
+
+fn pairs_methods_first(classified: &[(PairKind, &(TokenKey, Node))]) -> bool {
+    let mut seen_field = false;
+    for (kind, _) in classified {
+        match kind {
+            PairKind::Field => seen_field = true,
+            PairKind::Method if seen_field => return false,
+            PairKind::Method => {}
+        }
+    }
+    true
+}
+
+fn directive_body_node(body: &DirectiveBody) -> Option<&Node> {
+    match body {
+        DirectiveBody::Value(b) => Some(b),
+        DirectiveBody::NameBody { body, .. } => Some(body),
+        _ => None,
+    }
+}
+
+// =====================================================================
+// Pass 3: paragraph-break offsets.
+//
+// For each reorderable Dict, find the first Method→Field transition.
+// The break offset is the FIRST BYTE of that field pair's span — i.e.
+// at or before any leading `#private` / `@decorator` of the pair.
+// The token-stream formatter inserts a blank line at this offset.
+//
+// The break fires at most once per Dict (groups read as "methods
+// paragraph", then "fields paragraph"). Subsequent transitions don't
+// fire; with reorder running first, transitions usually number one.
+// =====================================================================
+
+fn compute_paragraph_break_offsets(
+    node: &Node,
+    in_directive_body: bool,
+    source: &str,
+) -> BTreeSet<usize> {
+    let mut out = BTreeSet::new();
+    walk_for_break_offsets(node, in_directive_body, source, &mut out);
+    out
+}
+
+fn walk_for_break_offsets(
+    node: &Node,
+    in_directive_body: bool,
+    source: &str,
+    out: &mut BTreeSet<usize>,
+) {
+    for dir in &node.directives {
+        if let Some(body) = directive_body_node(&dir.body) {
+            walk_for_break_offsets(body, true, source, out);
+        }
+    }
+    for dec in &node.decorators {
+        for arg in &dec.args {
+            walk_for_break_offsets(&arg.value, false, source, out);
+        }
+    }
+    for child in expr_children(node) {
+        walk_for_break_offsets(child, false, source, out);
+    }
+
+    if in_directive_body {
+        return;
+    }
+    let Expr::Dict(pairs) = &*node.expr else {
+        return;
+    };
+    if pairs.len() < 2 {
+        return;
+    }
+    let classified: Vec<(PairKind, &(TokenKey, Node))> =
+        pairs.iter().map(|p| (classify_pair(p), p)).collect();
+    for i in 1..classified.len() {
+        if classified[i - 1].0 == PairKind::Method && classified[i].0 == PairKind::Field {
+            let span = pair_span(classified[i].1, source);
+            out.insert(span.start);
+            break; // one break per Dict
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,10 +606,17 @@ struct SourceFormatter<'a> {
     previous: Option<Token<'a>>,
     type_generic_depth: usize,
     import_phase: ImportPhase,
+    /// Byte offsets at which the formatter must emit a blank line
+    /// ahead of the token. Precomputed by [`compute_paragraph_break_offsets`]
+    /// using AST-level pair boundaries — these offsets ALWAYS point
+    /// at the first byte of a pair (leading `#…`, `@…`, or key Word)
+    /// so the blank lands BEFORE any directive of that pair, never
+    /// inside it.
+    break_offsets: &'a BTreeSet<usize>,
 }
 
 impl<'a> SourceFormatter<'a> {
-    fn new(tokens: &'a [Token<'a>]) -> Self {
+    fn new(tokens: &'a [Token<'a>], break_offsets: &'a BTreeSet<usize>) -> Self {
         Self {
             tokens,
             index: 0,
@@ -104,6 +627,7 @@ impl<'a> SourceFormatter<'a> {
             previous: None,
             type_generic_depth: 0,
             import_phase: ImportPhase::None,
+            break_offsets,
         }
     }
 
@@ -497,6 +1021,18 @@ impl<'a> SourceFormatter<'a> {
     }
 
     fn apply_leading_newline(&mut self, token: Token<'a>) {
+        // Paragraph-break check fires before any local newline rule.
+        // The break offsets are precomputed from the AST (first byte
+        // of the first Field pair that follows a Method pair) so they
+        // always land at line_start in canonical output. The break is
+        // a blank-line separator: `ensure_blank_line_separator` is
+        // idempotent and a no-op when output is empty / already
+        // separated.
+        if self.break_offsets.contains(&token.start) {
+            self.ensure_blank_line_separator();
+            return;
+        }
+
         if self.line_start {
             return;
         }
@@ -1062,6 +1598,184 @@ mod tests {
         assert!(
             formatted.contains("#brand Transition {"),
             "#brand Transition must precede its {{ on the same logical block:\n{formatted}"
+        );
+    }
+
+    // ----- Pass 1: lift #imports to top -----------------------------
+
+    #[test]
+    fn lift_imports_keeps_packed_block_unchanged() {
+        // Already packed at the top — nothing should move.
+        let source = "#import a from \"./a.relon\"\n#import b from \"./b.relon\"\n\n{\n    x: 1\n}\n";
+        let formatted = format_source(source).unwrap();
+        assert_eq!(formatted, source);
+        assert_eq!(format_source(&formatted).unwrap(), formatted);
+    }
+
+    #[test]
+    fn lift_imports_pulls_scattered_to_top() {
+        // #import is sandwiched between #schemas — it should rise to
+        // the top, with the #schemas still in their original relative
+        // order.
+        let source = "#schema A { Int x: * }\n#import a from \"./a.relon\"\n#schema B { Int y: * }\n#import b from \"./b.relon\"\n\n{\n    z: 1\n}\n";
+        let formatted = format_source(source).unwrap();
+        let import_a = formatted.find("#import a from").expect("import a missing");
+        let import_b = formatted.find("#import b from").expect("import b missing");
+        let schema_a = formatted.find("#schema A").expect("schema A missing");
+        let schema_b = formatted.find("#schema B").expect("schema B missing");
+        assert!(import_a < schema_a, "imports must precede schemas:\n{formatted}");
+        assert!(import_b < schema_a, "imports must precede schemas:\n{formatted}");
+        assert!(import_a < import_b, "imports keep relative order:\n{formatted}");
+        assert!(schema_a < schema_b, "schemas keep relative order:\n{formatted}");
+        // Idempotent.
+        assert_eq!(format_source(&formatted).unwrap(), formatted);
+    }
+
+    #[test]
+    fn lift_imports_packs_tight_with_blank_separator() {
+        // Lifted imports sit on consecutive lines, and a single blank
+        // line separates the import block from what follows.
+        let source = "#schema A { Int x: * }\n#import a from \"./a.relon\"\n#import b from \"./b.relon\"\n\n{\n    z: 1\n}\n";
+        let formatted = format_source(source).unwrap();
+        assert!(
+            formatted.contains("#import a from \"./a.relon\"\n#import b from \"./b.relon\""),
+            "lifted imports must pack:\n{formatted}"
+        );
+        assert!(
+            formatted.contains("#import b from \"./b.relon\"\n\n#schema A"),
+            "blank line missing between lifted imports and next block:\n{formatted}"
+        );
+    }
+
+    // ----- Pass 2: method-first reorder -----------------------------
+
+    #[test]
+    fn reorder_lifts_methods_to_front_of_dict() {
+        // Scrambled: field, method, field, method. Reorder so methods
+        // come first (each group keeps source-relative order).
+        let source = "{\n    project: { name: \"x\" },\n    multiply(a, b): a * b,\n    meta: { count: 3 },\n    currency(v, s): v + \" \" + s\n}\n";
+        let formatted = format_source(source).unwrap();
+        let multiply = formatted.find("multiply").unwrap();
+        let currency = formatted.find("currency").unwrap();
+        let project = formatted.find("project:").unwrap();
+        let meta = formatted.find("meta:").unwrap();
+        assert!(multiply < currency, "methods keep original order");
+        assert!(currency < project, "methods come before fields");
+        assert!(project < meta, "fields keep original order");
+        assert_eq!(format_source(&formatted).unwrap(), formatted);
+    }
+
+    #[test]
+    fn reorder_skips_schema_body() {
+        // `#schema X { ... }` body fields stay in declaration order
+        // even when some have closure-shaped predicate values.
+        let source = "#schema User {\n    String name: *,\n    Int age: (a) => a >= 0\n}\n\n{\n    x: 1\n}\n";
+        let formatted = format_source(source).unwrap();
+        let name = formatted.find("String name").unwrap();
+        let age = formatted.find("Int age").unwrap();
+        assert!(name < age, "schema field order preserved:\n{formatted}");
+    }
+
+    #[test]
+    fn reorder_bails_on_comments_inside_dict() {
+        // Any comment inside a Dict body disables reorder for that
+        // Dict — comment placement can't be statically routed.
+        let source = "{\n    // keep me\n    project: { x: 1 },\n    multiply(a, b): a * b\n}\n";
+        let formatted = format_source(source).unwrap();
+        let project = formatted.find("project:").unwrap();
+        let multiply = formatted.find("multiply").unwrap();
+        assert!(
+            project < multiply,
+            "original order kept when comments present:\n{formatted}"
+        );
+    }
+
+    #[test]
+    fn reorder_carries_pair_directives_intact() {
+        // A method pair with a leading `#private` must move along
+        // with its directive — never separated. Tests pair_span's
+        // ownership boundary.
+        let source = "{\n    field1: 1,\n    #private\n    method1(x): x + 1,\n    field2: 2\n}\n";
+        let formatted = format_source(source).unwrap();
+        // Method should now precede both fields, and #private should
+        // still sit directly above it.
+        assert!(
+            formatted.contains("#private\n    method1(x): x + 1"),
+            "#private must stay glued to method1 after reorder:\n{formatted}"
+        );
+        let method_idx = formatted.find("method1").unwrap();
+        let field1_idx = formatted.find("field1:").unwrap();
+        assert!(method_idx < field1_idx, "method should lead after reorder");
+    }
+
+    #[test]
+    fn reorder_preserves_root_dict_when_directives_present() {
+        // Regression for the catastrophic bug: the root Dict's body
+        // range must be located by skipping past root.directives,
+        // NOT by `find('{')` from node.range.start (which would land
+        // inside the first #schema body).
+        let source = "#schema Order { Int x: * }\n\n#main(Order order)\n{\n    field1: 1,\n    method1(a): a + 1,\n    field2: 2\n}\n";
+        let formatted = format_source(source).unwrap();
+        // Schema body must still contain its `Int x:` declaration —
+        // not the methods/fields from #main.
+        let schema_section =
+            &formatted[..formatted.find("#main(").expect("expected #main")];
+        assert!(
+            schema_section.contains("Int x:"),
+            "schema body must keep `Int x:` after format:\n{schema_section}"
+        );
+        assert!(
+            !schema_section.contains("method1"),
+            "method1 must not leak into schema body:\n{schema_section}"
+        );
+    }
+
+    // ----- Pass 3: method/field paragraph break ---------------------
+
+    #[test]
+    fn paragraph_break_between_method_and_field_groups() {
+        // After methods are sorted to the front, a single blank line
+        // separates them from the trailing field group.
+        let source = "{\n    multiply(a, b): a * b,\n    project: { name: \"x\" }\n}\n";
+        let formatted = format_source(source).unwrap();
+        assert!(
+            formatted.contains("a * b,\n\n    project:"),
+            "missing blank line between method and field groups:\n{formatted}"
+        );
+    }
+
+    #[test]
+    fn paragraph_break_lands_above_directive_not_key() {
+        // The break must land BEFORE the leading `#private` of the
+        // first field pair, not BETWEEN `#private` and its key. This
+        // is the regression test for the orphan-directive bug.
+        let source = "{\n    method1(a): a + 1,\n    #private\n    field1: 1\n}\n";
+        let formatted = format_source(source).unwrap();
+        assert!(
+            formatted.contains("a + 1,\n\n    #private\n    field1: 1"),
+            "blank line must land above #private, not below it:\n{formatted}"
+        );
+        assert!(
+            !formatted.contains("#private\n\n"),
+            "no blank between #private and its key:\n{formatted}"
+        );
+    }
+
+    #[test]
+    fn paragraph_break_only_once_per_dict() {
+        // Even with multiple method↔field alternations in source,
+        // the formatter (after reorder + break) emits exactly one
+        // blank between the method group and the field group.
+        let source = "{\n    project: { x: 1 },\n    multiply(a, b): a * b,\n    meta: { y: 2 },\n    currency(v, s): v + s\n}\n";
+        let formatted = format_source(source).unwrap();
+        // Only one blank-line pair in the inner Dict body.
+        let inner_start = formatted.find("{\n").unwrap();
+        let inner_end = formatted.rfind('}').unwrap();
+        let body = &formatted[inner_start..inner_end];
+        let blank_count = body.matches("\n\n").count();
+        assert_eq!(
+            blank_count, 1,
+            "expected exactly one blank line in body, got {blank_count}:\n{body}"
         );
     }
 
