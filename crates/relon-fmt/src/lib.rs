@@ -219,32 +219,43 @@ fn key_start_offset(key: &TokenKey) -> Option<usize> {
     }
 }
 
-/// Three-tier pair classification that drives both `reorder` and
-/// `paragraph_break`. Pairs sort by `PairTier` (Methods first,
-/// `#private` fields next, public fields last); blank-line separators
-/// fire at each upward transition.
+/// Four-tier pair classification driving both `reorder` and
+/// `paragraph_break`. Lower number = higher priority = earlier in
+/// the rendered Dict body. Blank-line separators fire at every
+/// upward transition, so each non-empty tier reads as its own
+/// paragraph.
 ///
-/// `#private` on a closure-valued pair leaves it in `Method`: private
-/// methods stay with regular methods. Only non-closure values pick up
-/// the `PrivateField` tier, which lets pricing's `#private tax_rate:
-/// 0.08` read as its own paragraph between the methods above and the
-/// public-field block below.
+/// The grouping is the product of two orthogonal axes:
+///   - is the value a Closure? → method vs field
+///   - does the pair carry `#private`? → private vs public
+///
+/// Both "method" and "#private" pull a pair forward; together they
+/// pull it furthest forward (private methods are the most-internal
+/// helpers — show them at the very top of the body).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum PairTier {
-    Method = 0,
-    PrivateField = 1,
-    PublicField = 2,
+    /// `#private name(p): body` — private method, the most-internal
+    /// helpers. Pricing's `#private currency(symbol, val): …` lands
+    /// here.
+    PrivateMethod = 0,
+    /// `name(p): body` — public method (closure value, no `#private`).
+    PublicMethod = 1,
+    /// `#private name: value` — private constant / config field
+    /// (e.g. pricing's `#private tax_rate: 0.08`).
+    PrivateField = 2,
+    /// `name: value` — public field, the default.
+    PublicField = 3,
 }
 
 fn classify_pair(pair: &(TokenKey, Node)) -> PairTier {
     let value = &pair.1;
-    if matches!(&*value.expr, Expr::Closure { .. }) {
-        return PairTier::Method;
-    }
-    if value.directives.iter().any(|d| d.name == "private") {
-        PairTier::PrivateField
-    } else {
-        PairTier::PublicField
+    let is_closure = matches!(&*value.expr, Expr::Closure { .. });
+    let is_private = value.directives.iter().any(|d| d.name == "private");
+    match (is_closure, is_private) {
+        (true, true) => PairTier::PrivateMethod,
+        (true, false) => PairTier::PublicMethod,
+        (false, true) => PairTier::PrivateField,
+        (false, false) => PairTier::PublicField,
     }
 }
 
@@ -484,19 +495,18 @@ fn collect_dict_reorder_edits(
     }
 
     // Stable bucket sort by tier — preserves source-relative order
-    // within each tier.
-    let methods = classified.iter().filter(|(t, _)| *t == PairTier::Method);
-    let priv_fields = classified
-        .iter()
-        .filter(|(t, _)| *t == PairTier::PrivateField);
-    let pub_fields = classified
-        .iter()
-        .filter(|(t, _)| *t == PairTier::PublicField);
-    let pieces: Vec<&str> = methods
-        .chain(priv_fields)
-        .chain(pub_fields)
-        .map(|(_, p)| source[pair_span(p, source)].trim())
-        .collect();
+    // within each tier. Iterate the four tiers in ascending order
+    // (PrivateMethod → PublicMethod → PrivateField → PublicField).
+    let pieces: Vec<&str> = [
+        PairTier::PrivateMethod,
+        PairTier::PublicMethod,
+        PairTier::PrivateField,
+        PairTier::PublicField,
+    ]
+    .iter()
+    .flat_map(|tier| classified.iter().filter(move |(t, _)| t == tier))
+    .map(|(_, p)| source[pair_span(p, source)].trim())
+    .collect();
     let new_body = format!("\n{}\n", pieces.join(",\n"));
     edits.push(SourceEdit {
         range: body_range,
@@ -505,7 +515,7 @@ fn collect_dict_reorder_edits(
 }
 
 fn pairs_tier_sorted(classified: &[(PairTier, &(TokenKey, Node))]) -> bool {
-    let mut prev = PairTier::Method;
+    let mut prev = PairTier::PrivateMethod;
     for (tier, _) in classified {
         if *tier < prev {
             return false;
@@ -1822,22 +1832,47 @@ mod tests {
     }
 
     #[test]
-    fn private_methods_stay_with_method_group() {
-        // `#private` on a closure-valued pair leaves it in the Method
-        // tier — pricing's `#private currency(symbol, val): …` lives
-        // alongside non-private methods, not in the PrivateField tier.
+    fn private_methods_lead_public_methods() {
+        // Four-tier reorder: `#private` closures come BEFORE public
+        // closures, with a blank line between the two method groups.
+        // Public methods then sit ahead of any field group.
         let source = "{\n    public_method(x): x + 1,\n    #private\n    private_method(y): y * 2,\n    field1: 1\n}\n";
         let formatted = format_source(source).unwrap();
-        let public_method = formatted.find("public_method").unwrap();
         let private_method = formatted.find("private_method").unwrap();
+        let public_method = formatted.find("public_method").unwrap();
         let field1 = formatted.find("field1:").unwrap();
-        assert!(public_method < field1);
-        assert!(private_method < field1);
-        // No blank line between the two methods.
         assert!(
-            !formatted.contains("public_method(x): x + 1,\n\n"),
-            "no blank within method group: {formatted}"
+            private_method < public_method,
+            "private method should precede public method:\n{formatted}"
         );
+        assert!(public_method < field1, "public method precedes field:\n{formatted}");
+        assert!(
+            formatted.contains("y * 2,\n\n    public_method"),
+            "blank line missing between private and public method groups:\n{formatted}"
+        );
+    }
+
+    #[test]
+    fn all_four_tiers_separated_by_blank_lines() {
+        // Exercises every tier transition.
+        let source = "{\n    pub_field: 1,\n    pub_method(a): a + 1,\n    #private\n    priv_field: 2,\n    #private\n    priv_method(b): b * 2\n}\n";
+        let formatted = format_source(source).unwrap();
+        let priv_method = formatted.find("priv_method").unwrap();
+        let pub_method = formatted.find("pub_method").unwrap();
+        let priv_field = formatted.find("priv_field").unwrap();
+        let pub_field = formatted.find("pub_field").unwrap();
+        assert!(priv_method < pub_method, "private method first:\n{formatted}");
+        assert!(pub_method < priv_field, "public method second:\n{formatted}");
+        assert!(priv_field < pub_field, "private field third:\n{formatted}");
+        // Three blank lines, one per tier transition.
+        let inner = &formatted["{".len()..formatted.rfind('}').unwrap()];
+        assert_eq!(
+            inner.matches("\n\n").count(),
+            3,
+            "expected exactly 3 tier-boundary blank lines:\n{formatted}"
+        );
+        // Idempotent.
+        assert_eq!(format_source(&formatted).unwrap(), formatted);
     }
 
     #[test]
