@@ -273,32 +273,94 @@ pub fn resolve(
     //     and the node's source range.
     if let Some(ws) = workspace {
         if let Some(cross) = entry_tree.cross_module_references.get(&node.id) {
-            return cross_module_target(ws, cross);
+            // Walk the cursor expression's path tail through the
+            // target module's Dict structure, the same way same-file
+            // refs walk path tails. For alias imports the post-pass
+            // already consumed `tail[0]` into `cross.target`, so we
+            // continue from `tail[1..]`; for destructure / spread the
+            // target *is* the head binding, so we use the full tail.
+            let full_tail = path_tail_of(&node.expr);
+            let extra_tail = match cross.via {
+                crate::resolve::CrossModuleVia::Alias => &full_tail[full_tail.len().min(1)..],
+                _ => &full_tail[..],
+            };
+            return cross_module_target(ws, cross, extra_tail);
         }
     }
 
-    // (3) Same-document reference.
+    // (3) Same-document reference. `references` resolves only the
+    //     path's head (a known v1 simplification — see resolve.rs);
+    //     for go-to-definition we want to land on the deepest field
+    //     the path can statically reach, the way IDEs do. So we
+    //     re-walk the original cursor node's path tail through the
+    //     head's value-node Dict structure.
     let resolved = entry_tree.references.get(&node.id)?;
-    let target_node = entry_tree.node_index.get(&resolved.target)?;
+    let head_node = entry_tree.node_index.get(&resolved.target)?;
+    let path_tail = path_tail_of(&node.expr);
+    let deepest = walk_path_tail(head_node, &path_tail);
     Some(GotoTarget::Node {
         module_id: None,
-        start: target_node.range.start.offset,
-        end: target_node.range.end.offset,
+        start: deepest.range.start.offset,
+        end: deepest.range.end.offset,
     })
+}
+
+/// Extract the path tail (segments after the head) for a reference
+/// expression. Returns an empty slice for non-reference shapes so
+/// callers can treat "no tail" uniformly with "head-only path".
+fn path_tail_of(expr: &Expr) -> Vec<String> {
+    let path: &[TokenKey] = match expr {
+        Expr::Reference { path, .. } => path,
+        Expr::Variable(path) => path,
+        Expr::FnCall { path, .. } => path,
+        _ => return Vec::new(),
+    };
+    path.iter()
+        .skip(1)
+        .map_while(|seg| match seg {
+            TokenKey::String(s, _, _) => Some(s.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Walk `start` deeper using the path tail, descending into each Dict
+/// child whose key matches. Returns the deepest reached node — if any
+/// segment misses (non-Dict intermediate, missing key, dynamic key),
+/// we stop walking and surface the last node found, which still gives
+/// the user a useful jump.
+fn walk_path_tail<'a>(start: &'a Node, tail: &[String]) -> &'a Node {
+    let mut current = start;
+    for seg in tail {
+        let Expr::Dict(pairs) = &*current.expr else {
+            return current;
+        };
+        let next = pairs.iter().find_map(|(k, v)| match k {
+            TokenKey::String(name, _, _) if name == seg => Some(v),
+            _ => None,
+        });
+        match next {
+            Some(child) => current = child,
+            None => return current,
+        }
+    }
+    current
 }
 
 fn cross_module_target(
     workspace: &WorkspaceTree,
     cross: &crate::resolve::CrossModuleRef,
+    extra_tail: &[String],
 ) -> Option<GotoTarget> {
     let target_node_id: Option<NodeId> = cross.target;
     if let Some(target_id) = target_node_id {
         let target_tree = workspace.modules.get(&cross.module_id)?;
-        let target_node = target_tree.node_index.get(&target_id)?;
+        let head_node = target_tree.node_index.get(&target_id)?;
+        let deepest = walk_path_tail(head_node, extra_tail);
         return Some(GotoTarget::Node {
             module_id: Some(cross.module_id.clone()),
-            start: target_node.range.start.offset,
-            end: target_node.range.end.offset,
+            start: deepest.range.start.offset,
+            end: deepest.range.end.offset,
         });
     }
     // Alias head alone — point at the start of the target file.
