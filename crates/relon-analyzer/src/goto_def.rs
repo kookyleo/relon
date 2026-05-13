@@ -11,8 +11,8 @@
 use crate::tree::AnalyzedTree;
 use crate::workspace::WorkspaceTree;
 use relon_parser::{
-    CallArg, Decorator, Directive, DirectiveBody, Expr, FStringPart, Node, NodeId, TokenKey,
-    TokenRange,
+    CallArg, Decorator, Directive, DirectiveBody, Expr, FStringPart, Node, NodeId, RefBase,
+    TokenKey, TokenRange,
 };
 
 /// Result of a goto-definition query.
@@ -267,55 +267,149 @@ pub fn resolve(
         _ => return None,
     }
 
+    // Per-segment resolution. For multi-segment paths the user
+    // expects the jump to track *which* segment the cursor is on:
+    //   &root.project.name
+    //   ^      ^       ^
+    //   |      |       └─ click here → `name`'s value
+    //   |      └─ click here → `project`'s value (Dict on line 5)
+    //   └─ click here → document root (`&root` base, line 2)
+    let cursor_segment = locate_segment(&node.expr, offset);
+
     // (2) Cross-module ref: takes precedence over same-doc references
     //     (it's only populated when the in-doc walk missed). Requires
     //     a workspace so we can grab the target module's parsed tree
     //     and the node's source range.
     if let Some(ws) = workspace {
         if let Some(cross) = entry_tree.cross_module_references.get(&node.id) {
-            // Walk the cursor expression's path tail through the
-            // target module's Dict structure, the same way same-file
-            // refs walk path tails. For alias imports the post-pass
-            // already consumed `tail[0]` into `cross.target`, so we
-            // continue from `tail[1..]`; for destructure / spread the
-            // target *is* the head binding, so we use the full tail.
-            let full_tail = path_tail_of(&node.expr);
-            let extra_tail = match cross.via {
-                crate::resolve::CrossModuleVia::Alias => &full_tail[full_tail.len().min(1)..],
-                _ => &full_tail[..],
-            };
-            return cross_module_target(ws, cross, extra_tail);
+            // The post-pass consumed `tail[0]` into `cross.target` for
+            // alias imports (so `lib.x` lands on `x`). For descent
+            // we walk the cursor expression's `tail[1..=cursor_idx]`
+            // inside the imported module's tree. For destructure /
+            // spread the target *is* the head binding, so the tail
+            // we walk starts at `[1..]` (skip head) just like the
+            // same-file case.
+            return cross_module_target(ws, cross, &node.expr, cursor_segment);
         }
     }
 
     // (3) Same-document reference. `references` resolves only the
     //     path's head (a known v1 simplification — see resolve.rs);
-    //     for go-to-definition we want to land on the deepest field
-    //     the path can statically reach, the way IDEs do. So we
-    //     re-walk the original cursor node's path tail through the
-    //     head's value-node Dict structure.
+    //     for go-to-definition we descend through Dict children up
+    //     to the segment the cursor is on. The base of a Reference
+    //     (`&root` / `&sibling` / `&uncle` prefix, with cursor before
+    //     the first path segment) is handled specially: `&root`
+    //     navigates to the document root node; other bases fall
+    //     through to the head-target (the closest natural anchor).
+    if matches!(cursor_segment, SegmentLocation::Base) {
+        if let Expr::Reference { base: RefBase::Root, .. } = &*node.expr {
+            return Some(GotoTarget::Node {
+                module_id: None,
+                start: entry_root.range.start.offset,
+                end: entry_root.range.start.offset,
+            });
+        }
+    }
     let resolved = entry_tree.references.get(&node.id)?;
     let head_node = entry_tree.node_index.get(&resolved.target)?;
-    let path_tail = path_tail_of(&node.expr);
-    let deepest = walk_path_tail(head_node, &path_tail);
+    let descent = descent_steps(&node.expr, cursor_segment);
+    let (target, target_key_range) = walk_descent(head_node, &descent);
+    // Prefer the key range so the editor lands on the *name* of the
+    // field — VS Code's "click takes you to the symbol's identifier"
+    // convention. Fall back to the value's range when (a) descent
+    // didn't move (head case — look up via `field_key_ranges`) or
+    // (b) the field's key wasn't a String literal (dynamic keys).
+    let range = target_key_range
+        .or_else(|| entry_tree.field_key_ranges.get(&resolved.target).copied())
+        .map(|r| (r.start.offset, r.end.offset))
+        .unwrap_or((target.range.start.offset, target.range.end.offset));
     Some(GotoTarget::Node {
         module_id: None,
-        start: deepest.range.start.offset,
-        end: deepest.range.end.offset,
+        start: range.0,
+        end: range.1,
     })
 }
 
-/// Extract the path tail (segments after the head) for a reference
-/// expression. Returns an empty slice for non-reference shapes so
-/// callers can treat "no tail" uniformly with "head-only path".
-fn path_tail_of(expr: &Expr) -> Vec<String> {
+/// Which part of a path-bearing expression the cursor sits on. Used
+/// to decide how deep to walk: clicking the second segment of
+/// `a.b.c` should only descend to `b`, not all the way to `c`.
+#[derive(Debug, Clone, Copy)]
+enum SegmentLocation {
+    /// Cursor before the first path segment — on the base prefix
+    /// (`&root.`, `&sibling.`, ...) for a Reference, or implicitly
+    /// the head for a Variable / FnCall when the cursor lands before
+    /// path[0] (rare but observed at the leading `f"...${` of an
+    /// interpolation start).
+    Base,
+    /// Cursor on path[i]. `0` is the head; deeper indices walk
+    /// proportionally deeper through Dict children.
+    Index(usize),
+}
+
+fn locate_segment(expr: &Expr, offset: usize) -> SegmentLocation {
+    let path: &[TokenKey] = match expr {
+        Expr::Reference { path, .. } => path,
+        Expr::Variable(path) => path,
+        Expr::FnCall { path, .. } => path,
+        _ => return SegmentLocation::Base,
+    };
+    for (i, seg) in path.iter().enumerate() {
+        let range = match seg {
+            TokenKey::String(_, r, _) => *r,
+            _ => continue,
+        };
+        if offset >= range.start.offset && offset <= range.end.offset {
+            return SegmentLocation::Index(i);
+        }
+    }
+    // Default: if the cursor doesn't land on any segment range
+    // (whitespace / dots between segments, or before the first
+    // segment), pick the segment immediately after the cursor so the
+    // user still gets a sensible jump. Falls back to Base when
+    // nothing in the path follows the cursor.
+    for (i, seg) in path.iter().enumerate() {
+        let range = match seg {
+            TokenKey::String(_, r, _) => *r,
+            _ => continue,
+        };
+        if range.start.offset > offset {
+            return if i == 0 {
+                SegmentLocation::Base
+            } else {
+                SegmentLocation::Index(i)
+            };
+        }
+    }
+    // Cursor past the last segment — Variables / FnCalls reach here
+    // when the click hits the trailing `(` or paren contents (smallest
+    // node still returns the FnCall). Treat as "deepest segment".
+    let last = path
+        .iter()
+        .rposition(|seg| matches!(seg, TokenKey::String(_, _, _)));
+    match last {
+        Some(i) => SegmentLocation::Index(i),
+        None => SegmentLocation::Base,
+    }
+}
+
+/// Compute the Dict descent path (segment names after the head)
+/// required to land on the cursor's segment. Returns an empty slice
+/// when the cursor is at or before the head; longer slices for deeper
+/// segments. The slice is consumed by `walk_descent` against the
+/// head's value-node.
+fn descent_steps(expr: &Expr, where_: SegmentLocation) -> Vec<String> {
     let path: &[TokenKey] = match expr {
         Expr::Reference { path, .. } => path,
         Expr::Variable(path) => path,
         Expr::FnCall { path, .. } => path,
         _ => return Vec::new(),
     };
+    let stop = match where_ {
+        SegmentLocation::Base => 0,
+        SegmentLocation::Index(i) => i,
+    };
     path.iter()
+        .take(stop + 1)
         .skip(1)
         .map_while(|seg| match seg {
             TokenKey::String(s, _, _) => Some(s.clone()),
@@ -324,51 +418,112 @@ fn path_tail_of(expr: &Expr) -> Vec<String> {
         .collect()
 }
 
-/// Walk `start` deeper using the path tail, descending into each Dict
-/// child whose key matches. Returns the deepest reached node — if any
-/// segment misses (non-Dict intermediate, missing key, dynamic key),
-/// we stop walking and surface the last node found, which still gives
-/// the user a useful jump.
-fn walk_path_tail<'a>(start: &'a Node, tail: &[String]) -> &'a Node {
+/// Walk `start` deeper using the descent steps, descending into each
+/// Dict child whose key matches. Returns the deepest node plus the
+/// key-range of the *last* successful descent step (for caller-side
+/// "select the key" highlighting). Empty descent → `(start, None)`.
+/// Stops at the first non-Dict / missing key.
+fn walk_descent<'a>(start: &'a Node, descent: &[String]) -> (&'a Node, Option<TokenRange>) {
     let mut current = start;
-    for seg in tail {
+    let mut key_range = None;
+    for seg in descent {
         let Expr::Dict(pairs) = &*current.expr else {
-            return current;
+            return (current, key_range);
         };
-        let next = pairs.iter().find_map(|(k, v)| match k {
-            TokenKey::String(name, _, _) if name == seg => Some(v),
-            _ => None,
-        });
+        let mut next = None;
+        for (k, v) in pairs {
+            if let TokenKey::String(name, range, _) = k {
+                if name == seg {
+                    next = Some((v, *range));
+                    break;
+                }
+            }
+        }
         match next {
-            Some(child) => current = child,
-            None => return current,
+            Some((child, range)) => {
+                current = child;
+                key_range = Some(range);
+            }
+            None => return (current, key_range),
         }
     }
-    current
+    (current, key_range)
 }
 
 fn cross_module_target(
     workspace: &WorkspaceTree,
     cross: &crate::resolve::CrossModuleRef,
-    extra_tail: &[String],
+    expr: &Expr,
+    cursor_segment: SegmentLocation,
 ) -> Option<GotoTarget> {
     let target_node_id: Option<NodeId> = cross.target;
-    if let Some(target_id) = target_node_id {
-        let target_tree = workspace.modules.get(&cross.module_id)?;
-        let head_node = target_tree.node_index.get(&target_id)?;
-        let deepest = walk_path_tail(head_node, extra_tail);
+    // Cursor on the alias head itself (Base, or Index(0) for an
+    // alias-style import): jump to the start of the imported file.
+    // For destructure / spread imports, the head *is* the binding, so
+    // Index(0) should still walk into the target field.
+    let head_only = matches!(cursor_segment, SegmentLocation::Base)
+        || (matches!(cursor_segment, SegmentLocation::Index(0))
+            && matches!(cross.via, crate::resolve::CrossModuleVia::Alias));
+    if head_only {
         return Some(GotoTarget::Node {
             module_id: Some(cross.module_id.clone()),
-            start: deepest.range.start.offset,
-            end: deepest.range.end.offset,
+            start: 0,
+            end: 0,
         });
     }
-    // Alias head alone — point at the start of the target file.
+    let target_id = target_node_id?;
+    let target_tree = workspace.modules.get(&cross.module_id)?;
+    let head_node = target_tree.node_index.get(&target_id)?;
+    // Build the extra descent: alias's `cross.target` already
+    // consumed path[1], so we descend from path[2..=cursor_idx];
+    // destructure / spread already mapped head to the target field
+    // directly, so we descend from path[1..=cursor_idx].
+    let descent = cross_module_descent(expr, cursor_segment, &cross.via);
+    let (deepest, key_range) = walk_descent(head_node, &descent);
+    let range = key_range
+        .or_else(|| target_tree.field_key_ranges.get(&target_id).copied())
+        .map(|r| (r.start.offset, r.end.offset))
+        .unwrap_or((deepest.range.start.offset, deepest.range.end.offset));
     Some(GotoTarget::Node {
         module_id: Some(cross.module_id.clone()),
-        start: 0,
-        end: 0,
+        start: range.0,
+        end: range.1,
     })
+}
+
+fn cross_module_descent(
+    expr: &Expr,
+    cursor_segment: SegmentLocation,
+    via: &crate::resolve::CrossModuleVia,
+) -> Vec<String> {
+    let path: &[TokenKey] = match expr {
+        Expr::Reference { path, .. } => path,
+        Expr::Variable(path) => path,
+        Expr::FnCall { path, .. } => path,
+        _ => return Vec::new(),
+    };
+    let stop = match cursor_segment {
+        SegmentLocation::Base => return Vec::new(),
+        SegmentLocation::Index(i) => i,
+    };
+    let start = match via {
+        // alias.field → first segment already in cross.target
+        crate::resolve::CrossModuleVia::Alias => 2,
+        // bare imported binding (destructure / spread) → head is the
+        // imported field; descend from path[1..]
+        crate::resolve::CrossModuleVia::Destructured { .. }
+        | crate::resolve::CrossModuleVia::Spread => 1,
+    };
+    if start > stop {
+        return Vec::new();
+    }
+    path[start..=stop]
+        .iter()
+        .map_while(|seg| match seg {
+            TokenKey::String(s, _, _) => Some(s.clone()),
+            _ => None,
+        })
+        .collect()
 }
 
 fn import_path_target(

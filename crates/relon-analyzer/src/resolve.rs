@@ -262,6 +262,14 @@ impl<'a> Walker<'a> {
     fn visit(&mut self, node: &Node) {
         match &*node.expr {
             Expr::Dict(pairs) => {
+                // Record every String-keyed pair's key range, indexed
+                // by the value node's id. Powers go-to-definition's
+                // "select the symbol at the destination" behaviour.
+                for (key, value) in pairs {
+                    if let TokenKey::String(_, range, _) = key {
+                        self.tree.field_key_ranges.insert(value.id, *range);
+                    }
+                }
                 let frame = build_frame(pairs);
                 self.scope_stack.push(frame);
                 for (_, value) in pairs {

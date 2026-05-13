@@ -8,6 +8,7 @@ use crate::cap::{Capabilities, NativeFnGate};
 use crate::diagnostic::Diagnostic;
 use crate::main_sig::MainSignature;
 use crate::resolve::{CrossModuleRef, PendingCrossModuleRef, ResolvedRef};
+use relon_parser::TokenRange;
 use crate::root_schemas::RootSchemaDecl;
 use crate::schema::{SchemaDef, SchemaMethodInfo};
 use crate::sig::FnSignature;
@@ -58,6 +59,15 @@ pub struct AnalyzedTree {
     /// `pub(crate)` because nothing outside the analyzer crate should
     /// observe the pre-resolution state.
     pub(crate) pending_cross_module_refs: Vec<PendingCrossModuleRef>,
+    /// Source range of the *key* for every dict-bound field, keyed by
+    /// the value node's `NodeId`. Populated alongside `resolve_references`
+    /// from each Dict's `(TokenKey::String(name, range, _), value)`
+    /// pair. Go-to-definition reads this to highlight the key (rather
+    /// than the value) at the destination — matching VS Code's
+    /// "select the symbol" convention. Missing for fields whose key
+    /// isn't a String (`{ [expr]: ... }`), in which case callers fall
+    /// back to the value's range.
+    pub field_key_ranges: HashMap<NodeId, TokenRange>,
     /// Snapshot of every `NodeId`-bearing AST node visited by an
     /// analyzer pass. Lets consumers turn a `NodeId` (returned by
     /// `references` or `schemas`) back into the original `&Node`
