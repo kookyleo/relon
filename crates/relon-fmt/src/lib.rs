@@ -3,7 +3,6 @@
 use relon_parser::{
     parse_document,
     source::{tokenize_source, SourceToken as Token, SourceTokenKind as TokenKind},
-    Expr, Node, TokenKey,
 };
 use std::path::PathBuf;
 
@@ -31,16 +30,10 @@ pub enum Error {
 }
 
 pub fn format_source(source: &str) -> Result<String, Error> {
-    let root = parse_document(source).map_err(|error| Error::Parse(error.to_string()))?;
-    // Phase 2: lift methods (closure-bound pairs) to the front of any
-    // Dict in which they trail a non-closure field. Performed as a
-    // pre-pass over the *source string* so subsequent token-level
-    // formatting sees a canonical pair order; the formatter itself
-    // doesn't need to know about the reorder.
-    let reordered = reorder_methods_first(source, &root);
-    let source_for_fmt = reordered.as_deref().unwrap_or(source);
-    let tokens =
-        tokenize_source(source_for_fmt).map_err(|error| Error::Tokenize(error.to_string()))?;
+    // Parse for syntactic validation; the formatter itself runs over
+    // the token stream so it preserves comment placement byte-for-byte.
+    parse_document(source).map_err(|error| Error::Parse(error.to_string()))?;
+    let tokens = tokenize_source(source).map_err(|error| Error::Tokenize(error.to_string()))?;
     let mut formatter = SourceFormatter::new(&tokens);
     let output = formatter.format();
     validate_source(&output)?;
@@ -56,302 +49,35 @@ fn validate_source(source: &str) -> Result<(), Error> {
     Ok(())
 }
 
-// ----- Phase 2: method-first pair reordering ----------------------------
-
-/// Pair classification used by the reorder pre-pass. Mirrors
-/// `PairClass` lower down (used by the formatter for separator
-/// emission) — kept as a separate enum so the two stay decoupled.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PairKind {
-    /// Value is an `Expr::Closure { ... }` — i.e. a function
-    /// definition (`name(p): body` lowered by the parser).
-    Method,
-    Field,
-}
-
-/// Single byte-range edit applied to the source string.
-struct PairEdit {
-    /// Inclusive start in the original source.
-    start: usize,
-    /// Exclusive end in the original source.
-    end: usize,
-    /// Replacement text for `source[start..end]`.
-    replacement: String,
-}
-
-/// Top-level reorder driver. Walks the parsed AST, collects edits for
-/// each Dict whose pairs are not already methods-first, then applies
-/// the edits right-to-left to produce a new source string. Returns
-/// `None` when no Dict needed reordering — the caller can then keep
-/// the original source pointer.
-fn reorder_methods_first(source: &str, root: &Node) -> Option<String> {
-    let mut edits: Vec<PairEdit> = Vec::new();
-    collect_dict_reorder_edits(root, false, source, &mut edits);
-    if edits.is_empty() {
-        return None;
-    }
-    edits.sort_by_key(|e| std::cmp::Reverse(e.start));
-    let mut out = source.to_string();
-    for edit in edits {
-        out.replace_range(edit.start..edit.end, &edit.replacement);
-    }
-    Some(out)
-}
-
-/// Walk `node` bottom-up, queuing a reorder edit for any Dict whose
-/// pairs need methods grouped to the front. `in_directive_body` is
-/// `true` exactly when this node is the immediate body of a
-/// `#schema` / `#extend` / `#derive` / similar `NameBody`/`Value`
-/// directive — those Dicts encode declarations whose order is
-/// semantically meaningful (field-declaration order), so we leave
-/// them alone. Children of the body that happen to be Dicts again
-/// (e.g. a nested default-value `{ ... }`) reorder normally.
-fn collect_dict_reorder_edits(
-    node: &Node,
-    in_directive_body: bool,
-    source: &str,
-    edits: &mut Vec<PairEdit>,
-) {
-    // Directive bodies — mark the immediate body Dict as
-    // declaration-shaped so it doesn't get reordered.
-    for dir in &node.directives {
-        let body = match &dir.body {
-            relon_parser::DirectiveBody::Value(b) => Some(b),
-            relon_parser::DirectiveBody::NameBody { body, .. } => Some(body),
-            _ => None,
-        };
-        if let Some(b) = body {
-            collect_dict_reorder_edits(b, true, source, edits);
-        }
-    }
-    // Decorator args + the expression children below are regular
-    // values; reorder applies inside them.
-    for dec in &node.decorators {
-        for arg in &dec.args {
-            collect_dict_reorder_edits(&arg.value, false, source, edits);
-        }
-    }
-    for child in expr_children(node) {
-        collect_dict_reorder_edits(child, false, source, edits);
-    }
-    if in_directive_body {
-        return;
-    }
-    let Expr::Dict(pairs) = &*node.expr else {
-        return;
-    };
-    if pairs.len() < 2 {
-        return;
-    }
-    let classified: Vec<(PairKind, &(TokenKey, Node))> = pairs
-        .iter()
-        .map(|p| (classify_dict_pair(p), p))
-        .collect();
-    if methods_already_first(&classified) {
-        return;
-    }
-    // Conservative v1 guard: skip reorder if the body contains a
-    // comment. Comment placement is brittle to byte-level reorder
-    // because comments live in the token stream, not the AST — we
-    // can't know which pair they "belong" to. Files with comments
-    // keep their original pair order.
-    let (body_start, body_end) = match dict_body_range(node, source) {
-        Some(range) => range,
-        None => return,
-    };
-    let body = &source[body_start..body_end];
-    if body.contains("//") || body.contains("/*") {
-        return;
-    }
-    // Build the new body text: methods (in original order) then
-    // fields (in original order), joined by `,\n`. Outer formatter
-    // re-indents the result, so this only has to produce a valid
-    // pair sequence.
-    let methods = classified.iter().filter(|(c, _)| *c == PairKind::Method);
-    let fields = classified.iter().filter(|(c, _)| *c == PairKind::Field);
-    let pieces: Vec<&str> = methods
-        .chain(fields)
-        .map(|(_, pair)| pair_source_slice(source, pair))
-        .collect();
-    let new_body = format!("\n{}\n", pieces.join(",\n"));
-    edits.push(PairEdit {
-        start: body_start,
-        end: body_end,
-        replacement: new_body,
-    });
-}
-
-fn classify_dict_pair(pair: &(TokenKey, Node)) -> PairKind {
-    let (_, value) = pair;
-    match &*value.expr {
-        Expr::Closure { .. } => PairKind::Method,
-        _ => PairKind::Field,
-    }
-}
-
-fn methods_already_first(classified: &[(PairKind, &(TokenKey, Node))]) -> bool {
-    let mut seen_field = false;
-    for (kind, _) in classified {
-        match kind {
-            PairKind::Field => seen_field = true,
-            PairKind::Method if seen_field => return false,
-            PairKind::Method => {}
-        }
-    }
-    true
-}
-
-/// Locate the byte range *inside* a Dict's braces (exclusive of
-/// `{` and `}`). Scans the source from the Dict node's range start
-/// for the first `{`, then walks forward with depth tracking for
-/// the matching `}`. Returns `None` if the braces can't be found —
-/// defensive; should not happen for a parsed Dict.
-fn dict_body_range(node: &Node, source: &str) -> Option<(usize, usize)> {
-    let span_start = node.range.start.offset;
-    let span_end = node.range.end.offset.min(source.len());
-    let span = &source[span_start..span_end];
-    let open_rel = span.find('{')?;
-    let open_abs = span_start + open_rel;
-    let mut depth = 0i32;
-    let bytes = source.as_bytes();
-    let mut i = open_abs;
-    while i < span_end {
-        let c = bytes[i] as char;
-        match c {
-            '"' => {
-                // Skip over a string literal (with backslash escape
-                // awareness) so an inner `{` / `}` doesn't move the
-                // depth counter.
-                i += 1;
-                while i < span_end {
-                    let cc = bytes[i] as char;
-                    if cc == '\\' {
-                        i += 2;
-                        continue;
-                    }
-                    if cc == '"' {
-                        i += 1;
-                        break;
-                    }
-                    i += 1;
-                }
-                continue;
-            }
-            '{' => depth += 1,
-            '}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some((open_abs + 1, i));
-                }
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-    None
-}
-
-/// Source slice covering an entire Dict pair, including any
-/// directives / decorators attached to its value node (which
-/// precede the key in the source). Used to copy pair text verbatim
-/// when reordering.
-fn pair_source_slice<'a>(source: &'a str, pair: &(TokenKey, Node)) -> &'a str {
-    let (key, value) = pair;
-    let mut start = key_start_offset(key).unwrap_or(value.range.start.offset);
-    for dir in &value.directives {
-        start = start.min(dir.range.start.offset);
-    }
-    for dec in &value.decorators {
-        start = start.min(dec.range.start.offset);
-    }
-    let end = value.range.end.offset.min(source.len());
-    source[start..end].trim().into()
-}
-
-fn key_start_offset(key: &TokenKey) -> Option<usize> {
-    match key {
-        TokenKey::String(_, range, _) => Some(range.start.offset),
-        TokenKey::Dynamic(node, _) => Some(node.range.start.offset),
-        TokenKey::Spread(range) => Some(range.start.offset),
-        _ => None,
-    }
-}
-
-/// Yield expression children only — decorators and directives are
-/// walked separately by the reorder driver so it can flag the
-/// immediate body of a `#schema` / `#extend` / similar declaration
-/// directive as "don't reorder me".
-fn expr_children(node: &Node) -> Vec<&Node> {
-    let mut out = Vec::new();
-    match &*node.expr {
-        Expr::Dict(pairs) => {
-            for (key, value) in pairs {
-                if let TokenKey::Dynamic(inner, _) = key {
-                    out.push(inner);
-                }
-                out.push(value);
-            }
-        }
-        Expr::List(items) => out.extend(items.iter()),
-        Expr::Spread(inner) => out.push(inner),
-        Expr::Comprehension {
-            element,
-            iterable,
-            condition,
-            ..
-        } => {
-            out.push(element);
-            out.push(iterable);
-            if let Some(c) = condition {
-                out.push(c);
-            }
-        }
-        Expr::Binary(_, l, r) => {
-            out.push(l);
-            out.push(r);
-        }
-        Expr::Unary(_, inner) => out.push(inner),
-        Expr::Ternary { cond, then, els } => {
-            out.push(cond);
-            out.push(then);
-            out.push(els);
-        }
-        Expr::FnCall { args, .. } => {
-            for arg in args {
-                out.push(&arg.value);
-            }
-        }
-        Expr::FString(parts) => {
-            for part in parts {
-                if let relon_parser::FStringPart::Interpolation(n) = part {
-                    out.push(n);
-                }
-            }
-        }
-        Expr::Where { expr, bindings } => {
-            out.push(expr);
-            out.push(bindings);
-        }
-        Expr::Match { expr, arms } => {
-            out.push(expr);
-            for (pat, body) in arms {
-                out.push(pat);
-                out.push(body);
-            }
-        }
-        Expr::Closure { body, .. } => out.push(body),
-        Expr::VariantCtor { body, .. } => out.push(body),
-        _ => {}
-    }
-    out
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Frame {
     Brace,
     Bracket,
     Paren,
     Index,
+    /// `#import { a, b } from "..."` destructure list — kept inline:
+    /// `{ a, b }` with single spaces inside and `, ` between entries.
+    /// Not a Dict; no indent change, no newlines inside.
+    ImportDestructure,
+}
+
+/// Tracks whether we're between `#import` and the path string at the
+/// end of the directive. Set when we emit a `#` whose next word is
+/// `import`; cleared after we emit the path string. Drives:
+///   - `{` after the import keyword becomes an inline destructure.
+///   - `*` after the import keyword is the spread wildcard (not
+///     multiplication).
+///   - Blank-line layout never wedges between `#import` and its path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImportPhase {
+    /// Not inside an import directive.
+    None,
+    /// Between `#` and the path string (anywhere in the body).
+    Inside,
+    /// Just emitted the path string — next `#import` should pack
+    /// against this one (no blank separator). Cleared on the next
+    /// non-import top-level construct.
+    JustFinished,
 }
 
 struct SourceFormatter<'a> {
@@ -363,35 +89,7 @@ struct SourceFormatter<'a> {
     frames: Vec<Frame>,
     previous: Option<Token<'a>>,
     type_generic_depth: usize,
-    /// Per-Brace-frame tracker for method/field pair classification.
-    /// Mirrors `frames` for Brace entries — pushed on `{` and popped
-    /// on `}`. Drives the once-per-Dict blank line that separates
-    /// the leading method group (`name(params): body`) from the
-    /// trailing field group (`name: value`).
-    pair_class_stack: Vec<PairFrameTracker>,
-}
-
-#[derive(Debug, Default)]
-struct PairFrameTracker {
-    /// Class of the previous pair emitted in this Dict, used to
-    /// detect a method→field transition. `None` until the first
-    /// pair has been classified.
-    prev_class: Option<PairClass>,
-    /// True once we've already emitted the method→field separator
-    /// for this Dict — ensures we only paragraph-break once even if
-    /// pairs continue to alternate.
-    transition_emitted: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PairClass {
-    /// Closure-bound pair: `name(params): body` — the key is
-    /// followed by `(` (open paren of the param list).
-    Method,
-    /// Value-bound pair: `name: value`, `"key": value`, or a typed
-    /// schema field `Type name: ...`. Any pair whose key isn't
-    /// followed by `(`.
-    Field,
+    import_phase: ImportPhase,
 }
 
 impl<'a> SourceFormatter<'a> {
@@ -405,7 +103,7 @@ impl<'a> SourceFormatter<'a> {
             frames: Vec::new(),
             previous: None,
             type_generic_depth: 0,
-            pair_class_stack: Vec::new(),
+            import_phase: ImportPhase::None,
         }
     }
 
@@ -439,7 +137,22 @@ impl<'a> SourceFormatter<'a> {
                 self.apply_leading_newline(token);
                 match token.kind {
                     TokenKind::OpenBrace => {
+                        if self.import_phase == ImportPhase::Inside {
+                            // `#import { a, b } from "..."` — destructure
+                            // list kept on one line.
+                            self.write_value_prefix();
+                            self.write_plain("{");
+                            self.space();
+                            self.frames.push(Frame::ImportDestructure);
+                            return Some(TokenKind::OpenBrace);
+                        }
                         Some(self.format_open_multiline(token, TokenKind::CloseBrace, Frame::Brace))
+                    }
+                    TokenKind::CloseBrace if self.top_frame() == Some(Frame::ImportDestructure) => {
+                        self.space();
+                        self.write_plain("}");
+                        self.frames.pop();
+                        Some(TokenKind::CloseBrace)
                     }
                     TokenKind::CloseBrace => {
                         self.format_close_multiline("}", Frame::Brace);
@@ -493,9 +206,7 @@ impl<'a> SourceFormatter<'a> {
                         Some(TokenKind::At)
                     }
                     TokenKind::Hash => {
-                        if self.is_top_level_block_directive() {
-                            self.ensure_blank_line_separator();
-                        }
+                        self.handle_top_level_hash();
                         self.write_value_prefix();
                         self.write_plain("#");
                         Some(TokenKind::Hash)
@@ -537,23 +248,63 @@ impl<'a> SourceFormatter<'a> {
                         Some(TokenKind::Equal)
                     }
                     TokenKind::Word | TokenKind::Number | TokenKind::String => {
-                        // Detect pair-start to apply the method→field
-                        // group separator. Pair keys are Word / String
-                        // tokens that arrive at line_start while
-                        // we're directly inside a Brace frame (not in
-                        // a type-generic).
-                        if self.line_start
-                            && self.top_frame() == Some(Frame::Brace)
-                            && self.type_generic_depth == 0
-                        {
-                            self.maybe_paragraph_break_for_pair(token);
-                        }
                         self.write_atom(token.text);
+                        // The path string is the last token of an
+                        // `#import` directive — mark "just finished"
+                        // so the next `#import` can pack against it
+                        // without a blank separator.
+                        if token.kind == TokenKind::String
+                            && self.import_phase == ImportPhase::Inside
+                            && self.frames.is_empty()
+                        {
+                            self.import_phase = ImportPhase::JustFinished;
+                        }
                         Some(token.kind)
                     }
                     TokenKind::LineComment | TokenKind::BlockComment => unreachable!(),
                 }
             }
+        }
+    }
+
+    /// Apply blank-line rules for top-level `#` directives. Called
+    /// just before emitting the `#`. Looks ahead at the next word to
+    /// decide whether to insert a blank separator.
+    ///
+    /// Rules:
+    ///   - `#schema` / `#extend` / `#main` always get a blank above
+    ///     them when not the first thing in the file.
+    ///   - `#import` gets a blank above unless the previous content
+    ///     was already an `#import` (consecutive imports pack tight).
+    ///   - Non-block directives (pair-level pragmas like `#private`,
+    ///     `#expect`, `#derive`) get no special treatment — they're
+    ///     attached to their following pair.
+    fn handle_top_level_hash(&mut self) {
+        if !self.frames.is_empty() {
+            return;
+        }
+        let Some(next) = self.tokens.get(self.index + 1) else {
+            return;
+        };
+        if next.kind != TokenKind::Word {
+            return;
+        }
+        match next.text {
+            "import" => {
+                if self.import_phase == ImportPhase::JustFinished {
+                    if !self.line_start {
+                        self.newline();
+                    }
+                } else {
+                    self.ensure_blank_line_separator();
+                }
+                self.import_phase = ImportPhase::Inside;
+            }
+            "schema" | "extend" | "main" => {
+                self.ensure_blank_line_separator();
+                self.import_phase = ImportPhase::None;
+            }
+            _ => {}
         }
     }
 
@@ -563,15 +314,18 @@ impl<'a> SourceFormatter<'a> {
         close_kind: TokenKind,
         frame: Frame,
     ) -> TokenKind {
-        // Blank line before a root-level `{` / `[` that follows a
-        // directive body's closing brace — e.g. `#schema X { ... }`
-        // and the file's value body. `#main(...) { ... }` is excluded
-        // because `(` not `}` precedes the `{`. Without this, the
-        // schema header and code body stick together as one block.
+        // Blank line before a root-level `{` / `[` whenever the
+        // preceding root-level construct was a directive body or an
+        // `#import` block — the file's value body must read as its
+        // own paragraph. Triggers on either `}` (e.g. after a
+        // `#schema X { ... }` body) or after a `JustFinished` import
+        // directive.
         if self.frames.is_empty()
-            && self.previous.map(|p| p.kind) == Some(TokenKind::CloseBrace)
+            && (self.previous.map(|p| p.kind) == Some(TokenKind::CloseBrace)
+                || self.import_phase == ImportPhase::JustFinished)
         {
             self.ensure_blank_line_separator();
+            self.import_phase = ImportPhase::None;
         }
         self.write_value_prefix();
 
@@ -587,9 +341,6 @@ impl<'a> SourceFormatter<'a> {
 
         self.write_plain(token.text);
         self.frames.push(frame);
-        if frame == Frame::Brace {
-            self.pair_class_stack.push(PairFrameTracker::default());
-        }
         self.indent += 1;
         self.newline();
         token.kind
@@ -597,9 +348,6 @@ impl<'a> SourceFormatter<'a> {
 
     fn format_close_multiline(&mut self, text: &str, frame: Frame) {
         self.pop_frame(frame);
-        if frame == Frame::Brace {
-            self.pair_class_stack.pop();
-        }
         self.indent = self.indent.saturating_sub(1);
         if !self.line_start {
             self.newline();
@@ -613,8 +361,10 @@ impl<'a> SourceFormatter<'a> {
         self.write_plain(",");
         if self.type_generic_depth > 0
             || self.next_is_inline_line_comment()
-            || self.top_frame() == Some(Frame::Paren)
-            || self.top_frame() == Some(Frame::Index)
+            || matches!(
+                self.top_frame(),
+                Some(Frame::Paren) | Some(Frame::Index) | Some(Frame::ImportDestructure)
+            )
         {
             self.space();
         } else {
@@ -694,14 +444,20 @@ impl<'a> SourceFormatter<'a> {
 
     fn format_operator(&mut self, text: &str) {
         let unary = text == "!" || ((text == "-" || text == "+") && !self.previous_allows_binary());
-        // `*` in value position (no preceding operand) is a Wildcard
-        // placeholder (`String name: *`), not multiplication — emit
-        // as a bare value so it doesn't pick up binary-operator
-        // padding on either side.
-        let wildcard = text == "*" && !self.previous_allows_binary();
+        // `*` in value position (no preceding operand) OR right after
+        // the `import` keyword (`#import * from ...`) is a wildcard,
+        // not multiplication — emit as a bare value so it doesn't pick
+        // up binary-operator padding on either side.
+        let after_import_keyword = self
+            .previous
+            .is_some_and(|p| p.kind == TokenKind::Word && p.text == "import");
+        let wildcard = text == "*" && (!self.previous_allows_binary() || after_import_keyword);
         if unary || wildcard {
             self.write_value_prefix();
             self.write_plain(text);
+            if wildcard {
+                self.space_if_next_starts_value();
+            }
         } else {
             self.write_binary_operator(text);
         }
@@ -776,7 +532,18 @@ impl<'a> SourceFormatter<'a> {
             return;
         }
 
-        if self.top_frame() == Some(Frame::Paren) || self.top_frame() == Some(Frame::Index) {
+        if matches!(
+            self.top_frame(),
+            Some(Frame::Paren) | Some(Frame::Index) | Some(Frame::ImportDestructure)
+        ) {
+            return;
+        }
+
+        // `#import …` directive stays on one line — suppress any
+        // leading newlines for tokens between the `#` and the path
+        // string (inclusive). Without this, a user's incoming
+        // `#import\n*\nfrom\n"…"` would format to four separate lines.
+        if self.import_phase == ImportPhase::Inside {
             return;
         }
 
@@ -872,63 +639,6 @@ impl<'a> SourceFormatter<'a> {
             )
     }
 
-    /// Classify the upcoming pair (method vs field) by looking at
-    /// the *post-key* token; if the previous pair was a method and
-    /// this one is a field, insert a blank line so the two groups
-    /// read as paragraphs. Fires at most once per Dict — once a
-    /// transition has been emitted, subsequent pairs of either class
-    /// stay flush.
-    fn maybe_paragraph_break_for_pair(&mut self, key_token: Token<'a>) {
-        let class = self.classify_pair_at(key_token);
-        let Some(tracker) = self.pair_class_stack.last_mut() else {
-            return;
-        };
-        let prev = tracker.prev_class;
-        let already = tracker.transition_emitted;
-        tracker.prev_class = Some(class);
-
-        if !already && prev == Some(PairClass::Method) && class == PairClass::Field {
-            tracker.transition_emitted = true;
-            self.ensure_blank_line_separator();
-        }
-    }
-
-    /// Inspect the token that follows the key to decide whether the
-    /// pair is a method (`name(params): body`) or a field. Schema
-    /// fields written as `Type name: ...` look like a Word followed
-    /// by another Word — still classified as field because no `(`
-    /// follows.
-    fn classify_pair_at(&self, key_token: Token<'a>) -> PairClass {
-        let next = self.tokens.get(self.index + 1);
-        let Some(next) = next else {
-            return PairClass::Field;
-        };
-        match (key_token.kind, next.kind) {
-            (TokenKind::Word, TokenKind::OpenParen) => PairClass::Method,
-            _ => PairClass::Field,
-        }
-    }
-
-    /// True when the upcoming `#…` directive is one of the block-
-    /// shaped forms at root scope: `#schema`, `#extend`, `#main`, or
-    /// `#import`. These act as top-level "section headers" so we
-    /// want a blank line ahead of them. Pair-level pragmas
-    /// (`#private`, `#brand`, `#derive`, …) stay attached to their
-    /// following pair and don't trigger the separator.
-    fn is_top_level_block_directive(&self) -> bool {
-        if !self.frames.is_empty() {
-            return false;
-        }
-        let next = self.tokens.get(self.index + 1);
-        let Some(next) = next else {
-            return false;
-        };
-        if next.kind != TokenKind::Word {
-            return false;
-        }
-        matches!(next.text, "schema" | "extend" | "main" | "import")
-    }
-
     /// Emit a blank line before the next token if the output has
     /// already produced non-trivial content. Idempotent: subsequent
     /// calls collapse into a single blank line.
@@ -936,12 +646,9 @@ impl<'a> SourceFormatter<'a> {
         if self.output.is_empty() {
             return;
         }
-        // Already at line start: just check for the preceding blank.
         if !self.line_start {
             self.newline();
         }
-        // Walk back over trailing newlines; we want exactly two
-        // (`\n\n`) so the new token starts after one empty line.
         let trailing = self
             .output
             .chars()
@@ -991,6 +698,42 @@ impl<'a> SourceFormatter<'a> {
 mod tests {
     use super::*;
 
+    /// Inlined preset sources mirroring the playground's default
+    /// examples. Each one must round-trip through `format_source` and
+    /// be idempotent (`fmt(fmt(x)) == fmt(x)`). The sources here are
+    /// the *canonical* expected output of the formatter — if the
+    /// preset content in the playground changes, mirror it here.
+    mod presets {
+        pub const DEMO: &str = "// Try editing me - evaluate runs automatically.\n{\n    currency(val, symbol): val + \" \" + symbol,\n    multiply(a, b): a * b,\n    project: {\n        name: \"Relon Playground\",\n        details: {\n            base_price: 1500,\n            total: multiply(&sibling.base_price, 1.2),\n            @currency(\"GBP\")\n            display: &sibling.total\n        }\n    },\n    meta: {\n        tags_count: len([\"rust\", \"config\", \"dsl\"]),\n        summary: f\"Active project: ${&root.project.name}\"\n    }\n}\n";
+
+        pub const PRICING: &str = "/*\n  Invoice pricing with tiered discounts and tax.\n  See examples/pricing.relon in the repo for the full annotated source.\n*/\n#schema LineItem {\n    String sku: *,\n    #expect \"qty must be > 0\"\n    Int qty: (n) => n > 0,\n    #expect \"unit_price must be >= 0\"\n    Float unit_price: (p) => p >= 0\n}\n\n#schema Order {\n    List<LineItem> items: *,\n    #expect \"tier must be one of: standard / gold\"\n    String tier: (t) => t == \"standard\" || t == \"gold\"\n}\n\n#main(Order order)\n{\n    #private\n    currency(symbol, val): symbol + \" \" + val,\n    #private\n    volume_rate(sub): sub >= 1000 ? 0.10: sub >= 500 ? 0.05: 0.0,\n    #private\n    loyalty_rate(tier): tier == \"gold\" ? 0.03: 0.0,\n    #private\n    tax_rate: 0.08,\n    #private\n    sum_floats(xs): _list_reduce(xs, 0.0, (a, x) => a + x),\n    subtotal: sum_floats([it.qty * it.unit_price for it in order.items]),\n    discount_rate: volume_rate(&sibling.subtotal) + loyalty_rate(order.tier),\n    discount_amount: &sibling.subtotal * &sibling.discount_rate,\n    taxable: &sibling.subtotal - &sibling.discount_amount,\n    tax_amount: &sibling.taxable * tax_rate,\n    total: &sibling.taxable + &sibling.tax_amount,\n    @currency(\"USD\")\n    total_display: &sibling.total\n}\n";
+
+        pub const FEATURE_FLAG: &str = "/*\n  Runtime feature-flag evaluator.\n\n  Percentage rollouts need a host-registered `native_hash(s) -> Int`.\n  See examples/feature_flag.relon for the full annotated source.\n*/\n#schema User {\n    String id: *,\n    String region: (r) => r == \"us\" || r == \"eu\" || r == \"apac\",\n    String plan: (p) => p == \"free\" || p == \"pro\" || p == \"enterprise\"\n}\n\n#main(User user) -> Dict<String, Dict<String, Bool>>\n{\n    #private\n    hash_mod_100(s): native_hash(s) % 100,\n    #private\n    rules: {\n        legacy_checkout: (u) => false,\n        dark_mode: (u) => true,\n        gdpr_banner: (u) => u.region == \"eu\",\n        advanced_editor: (u) => u.plan == \"pro\" || u.plan == \"enterprise\",\n        new_search: (u) => hash_mod_100(u.id) < 25\n    },\n    flags: {\n        legacy_checkout: rules.legacy_checkout(user),\n        dark_mode: rules.dark_mode(user),\n        gdpr_banner: rules.gdpr_banner(user),\n        advanced_editor: rules.advanced_editor(user),\n        new_search: rules.new_search(user)\n    }\n}\n";
+
+        pub const WORKFLOW: &str = "/*\n  Order workflow as a data-driven state machine.\n\n  Try via the CLI:\n    cargo run -q -p relon-cli -- run examples/workflow.relon \\\n        --args '{\"state\": \"placed\", \"event\": \"pay\"}'\n*/\n#schema Transition {\n    String from: (s) => s == \"placed\" || s == \"paid\" || s == \"shipped\",\n    String on: *,\n    String to: (s) => s == \"paid\" || s == \"shipped\" || s == \"delivered\" || s == \"cancelled\",\n    List<String> emit: *\n}\n\n#main(String state, String event)\n{\n    #private\n    transitions: [\n        #brand Transition {\n            from: \"placed\",\n            on: \"pay\",\n            to: \"paid\",\n            emit: [\n                \"charge_card\",\n                \"log_payment\"\n            ]\n        },\n        #brand Transition {\n            from: \"paid\",\n            on: \"ship\",\n            to: \"shipped\",\n            emit: [\n                \"notify_shipper\",\n                \"email_user\"\n            ]\n        },\n        #brand Transition {\n            from: \"shipped\",\n            on: \"deliver\",\n            to: \"delivered\",\n            emit: [\n                \"email_user\"\n            ]\n        },\n        #brand Transition {\n            from: \"placed\",\n            on: \"cancel\",\n            to: \"cancelled\",\n            emit: []\n        },\n        #brand Transition {\n            from: \"paid\",\n            on: \"cancel\",\n            to: \"cancelled\",\n            emit: [\n                \"refund_card\"\n            ]\n        }\n    ],\n    #private\n    match_one(t): t.from == state && t.on == event,\n    #private\n    matched: _list_filter(&sibling.transitions, &sibling.match_one),\n    next_state: len(matched) > 0 ? matched[0].to: state,\n    emit: len(matched) > 0 ? matched[0].emit: [\"unhandled_event\"]\n}\n";
+
+        pub const MODULES: &str = "// Three #import shapes — try Mod-clicking any imported name to\n// jump across files.\n#import lib from \"./lib.relon\"\n#import { format_price } from \"./lib.relon\"\n#import * from \"./lib.relon\"\n\n{\n    namespaced: lib.with_tax(100.0, 0.08),\n    destructured: format_price(199.99, \"USD\"),\n    spread: discount(50.0, 0.15)\n}\n";
+
+        pub const MODULES_LIB: &str = "// Pricing helpers shared by main.relon.\n{\n    with_tax(amount, rate): amount * (1.0 + rate),\n    format_price(value, symbol): symbol + \" \" + value,\n    discount(amount, rate): amount * (1.0 - rate)\n}\n";
+    }
+
+    /// Helper: assert that formatting the preset source succeeds, is
+    /// idempotent, and parses back. Does NOT require the source to be
+    /// pre-canonical — the formatter's output of the playground
+    /// source is allowed to differ stylistically from the source
+    /// (e.g. lists expanded). The key invariant is that running
+    /// Format twice produces the same result as running it once.
+    fn assert_preset(source: &str) {
+        let once = format_source(source)
+            .unwrap_or_else(|e| panic!("format failed: {e}\n--- source ---\n{source}"));
+        let twice = format_source(&once)
+            .unwrap_or_else(|e| panic!("re-format failed: {e}\n--- once ---\n{once}"));
+        assert_eq!(
+            once, twice,
+            "fmt is not idempotent.\n--- once ---\n{once}\n--- twice ---\n{twice}"
+        );
+    }
+
     #[test]
     fn formats_source() {
         let source = "{foo:1,bar:[2,3]}";
@@ -1039,9 +782,6 @@ mod tests {
 
     #[test]
     fn keeps_type_generics_compact() {
-        // `<...>` adjacent to an identifier opens a type-generic; the
-        // formatter must not pad the angle brackets like comparison
-        // operators. Nested generics and dotted heads stay flush.
         for source in [
             "{\n    Dict<String, Int> m: {\n        a: 1\n    }\n}\n",
             "{\n    Dict<String, List<Int>> m: {\n        a: [\n            1\n        ]\n    }\n}\n",
@@ -1055,8 +795,6 @@ mod tests {
 
     #[test]
     fn keeps_type_optional_compact() {
-        // `?` flush against an identifier or `>` is the optional-type
-        // marker, not the start of a ternary — no surrounding spaces.
         for source in [
             "{\n    Weather? w: {\n        a: 1\n    }\n}\n",
             "{\n    x: #brand Weather? {\n        a: 1\n    }\n}\n",
@@ -1070,9 +808,6 @@ mod tests {
 
     #[test]
     fn ternary_question_keeps_binary_spacing() {
-        // The `?` of a ternary sits between values with whitespace, so
-        // the type-optional heuristic must back off and keep the
-        // operator-style spacing intact.
         let source = "{\n    abs(x): x < 0 ? -x: x\n}\n";
         let formatted = format_source(source).unwrap();
         assert_eq!(formatted, source);
@@ -1081,9 +816,6 @@ mod tests {
 
     #[test]
     fn comparison_lt_gt_unchanged() {
-        // `a < b` (with whitespace) must remain a comparison — adjacent
-        // numbers/expressions should not get reinterpreted as type
-        // generics.
         let source = "{\n    cmp(a, b): a < b ? a: b\n}\n";
         let formatted = format_source(source).unwrap();
         assert_eq!(formatted, source);
@@ -1092,9 +824,6 @@ mod tests {
 
     #[test]
     fn arrow_token_keeps_compact() {
-        // `->` must round-trip as a single token. Until source.rs added it
-        // to the multi-char operator list, the formatter split it into
-        // `-` + `>` and the result failed to re-parse.
         let source = "#main(Int x) -> Int\n{\n    n: x\n}\n";
         let formatted = format_source(source).unwrap();
         assert_eq!(formatted, source);
@@ -1103,11 +832,6 @@ mod tests {
 
     #[test]
     fn formats_with_block_round_trip() {
-        // Schema-method `with { ... }` block — the trait-bound system's
-        // Phase A surface. Round-trip and idempotence check. Note the
-        // blank line between the schema declaration and the file's
-        // root value body (paragraph-break rule: any `}` followed by
-        // a root-level `{` gets one empty line).
         let source = "#schema Money {\n    Int cents: *\n} with {\n    cents_value() -> Int: self.cents\n}\n\n{\n    Money price: {\n        cents: 100\n    }\n}\n";
         let formatted = format_source(source).unwrap();
         assert_eq!(formatted, source);
@@ -1116,7 +840,6 @@ mod tests {
 
     #[test]
     fn formats_with_block_derive_pragma() {
-        // `#derive Equatable` stacked above the witness method.
         let source = "#schema Money {\n    Int cents: *\n} with {\n    #derive Equatable\n    eq(other: Self) -> Bool: self.cents == other.cents\n}\n\n{\n    Money price: {\n        cents: 100\n    }\n}\n";
         let formatted = format_source(source).unwrap();
         assert_eq!(formatted, source);
@@ -1135,8 +858,6 @@ mod tests {
 
     #[test]
     fn wildcard_star_no_binary_padding() {
-        // `*` as a schema-field wildcard (`String name: *,`) must not
-        // pick up binary-operator spacing — it isn't multiplication.
         let source = "#schema User {\n    String name: *,\n    Int age: (a) => a >= 0\n}\n\n{\n    x: 1\n}\n";
         let formatted = format_source(source).unwrap();
         assert!(formatted.contains("String name: *,"), "expected `*,` flush: {formatted}");
@@ -1145,8 +866,6 @@ mod tests {
 
     #[test]
     fn block_directives_get_blank_separator() {
-        // Two `#schema` blocks back-to-back, plus `#main` after — each
-        // top-level block directive starts after a blank line.
         let source = "#schema A { Int x: * } #schema B { Int y: * } #main(A a){ z: 1 }";
         let formatted = format_source(source).unwrap();
         assert!(
@@ -1160,61 +879,205 @@ mod tests {
     }
 
     #[test]
-    fn methods_lifted_to_front_of_dict() {
-        // Scrambled order: field, method, field, method. After fmt,
-        // methods come first (preserving relative order), then fields
-        // (also in original order), with a blank line between the
-        // two groups.
-        let source = "{\n    project: { name: \"x\" },\n    multiply(a, b): a * b,\n    meta: { count: 3 },\n    currency(v, s): v + \" \" + s\n}\n";
-        let formatted = format_source(source).unwrap();
-        let methods_idx = formatted.find("multiply").unwrap();
-        let currency_idx = formatted.find("currency").unwrap();
-        let project_idx = formatted.find("project:").unwrap();
-        let meta_idx = formatted.find("meta:").unwrap();
-        assert!(methods_idx < currency_idx, "method order preserved");
-        assert!(currency_idx < project_idx, "methods land before fields");
-        assert!(project_idx < meta_idx, "field order preserved");
-        // Idempotent: second pass produces the same output.
+    fn import_destructure_inline() {
+        // `#import { a, b } from "..."` keeps the destructure on one
+        // line even when input had it split across newlines.
+        let split = "#import {\n    format_price\n}\nfrom \"./lib.relon\"\n{\n    x: 1\n}\n";
+        let formatted = format_source(split).unwrap();
+        assert!(
+            formatted.contains("#import { format_price } from \"./lib.relon\""),
+            "destructure should be inline: {formatted}"
+        );
         assert_eq!(format_source(&formatted).unwrap(), formatted);
     }
 
     #[test]
-    fn schema_body_field_order_preserved() {
-        // Schema fields with predicate-shaped closure values must
-        // not get reordered — schemas are declarations, not Dict
-        // bodies in the reorder-policy sense.
-        let source = "#schema User {\n    String name: *,\n    Int age: (a) => a >= 0\n}\n\n{\n    x: 1\n}\n";
+    fn import_spread_star_no_binary_padding() {
+        // `#import * from "..."` — `*` is a wildcard, not multiplication.
+        let source = "#import * from \"./lib.relon\"\n\n{\n    x: 1\n}\n";
         let formatted = format_source(source).unwrap();
-        let name_idx = formatted.find("String name").unwrap();
-        let age_idx = formatted.find("Int age").unwrap();
-        assert!(name_idx < age_idx, "schema field order preserved: {formatted}");
+        assert_eq!(formatted, source);
+        assert_eq!(format_source(&formatted).unwrap(), formatted);
     }
 
     #[test]
-    fn comments_disable_reorder() {
-        // Conservative v1: any comment inside the Dict body disables
-        // reorder for that Dict (comments can't be statically routed
-        // to a specific pair).
-        let source = "{\n    // keep me\n    project: { x: 1 },\n    multiply(a, b): a * b\n}\n";
+    fn consecutive_imports_pack_tight() {
+        // Multiple #import directives sit on consecutive lines (no
+        // blank between them); a blank line separates the import
+        // block from the file body.
+        let source = "#import a from \"./a.relon\"\n#import b from \"./b.relon\"\n#import * from \"./c.relon\"\n\n{\n    x: 1\n}\n";
         let formatted = format_source(source).unwrap();
-        let project_idx = formatted.find("project:").unwrap();
-        let multiply_idx = formatted.find("multiply").unwrap();
+        assert_eq!(formatted, source);
+        assert_eq!(format_source(&formatted).unwrap(), formatted);
+    }
+
+    #[test]
+    fn preset_demo_idempotent() {
+        assert_preset(presets::DEMO);
+    }
+
+    #[test]
+    fn preset_pricing_idempotent() {
+        assert_preset(presets::PRICING);
+    }
+
+    #[test]
+    fn preset_feature_flag_idempotent() {
+        assert_preset(presets::FEATURE_FLAG);
+    }
+
+    #[test]
+    fn preset_workflow_idempotent() {
+        assert_preset(presets::WORKFLOW);
+    }
+
+    #[test]
+    fn preset_modules_idempotent() {
+        assert_preset(presets::MODULES);
+    }
+
+    #[test]
+    fn preset_modules_lib_idempotent() {
+        assert_preset(presets::MODULES_LIB);
+    }
+
+    // ----- structural regression tests -----------------------------
+    // These guard against the catastrophic and visible bugs the user
+    // hit on 2026-05-13: directives getting orphaned from their
+    // pairs, and Dict bodies getting written into the wrong braces.
+
+    #[test]
+    fn pricing_schema_bodies_unchanged_by_format() {
+        // The `#schema LineItem` body owns `String sku / Int qty /
+        // Float unit_price`. A previous reorder pre-pass
+        // mis-identified the root Dict's brace range as the schema
+        // body's range and overwrote it with `#main`'s methods. After
+        // format, both schema bodies must still contain their
+        // original declarations.
+        let formatted = format_source(presets::PRICING).unwrap();
         assert!(
-            project_idx < multiply_idx,
-            "expected original order kept when comments present: {formatted}"
+            formatted.contains("String sku:") && formatted.contains("Int qty:")
+                && formatted.contains("Float unit_price:"),
+            "#schema LineItem body lost its declarations after format:\n{formatted}"
+        );
+        assert!(
+            formatted.contains("List<LineItem> items:") && formatted.contains("String tier:"),
+            "#schema Order body lost its declarations after format:\n{formatted}"
+        );
+        // None of #main's methods should leak into either schema.
+        let schema_section = &formatted[..formatted
+            .find("#main(")
+            .expect("expected #main block in pricing preset")];
+        assert!(
+            !schema_section.contains("currency(symbol, val)"),
+            "method `currency` leaked into schema section:\n{schema_section}"
+        );
+        assert!(
+            !schema_section.contains("volume_rate("),
+            "method `volume_rate` leaked into schema section:\n{schema_section}"
         );
     }
 
     #[test]
-    fn method_field_group_separator_inside_dict() {
-        // Methods (`name(p): body`) come before fields (`name: value`)
-        // in the demo preset; the formatter inserts one blank line at
-        // the boundary.
-        let source = "{\n    multiply(a, b): a * b,\n    project: {\n        name: \"x\"\n    }\n}\n";
-        let formatted = format_source(source).unwrap();
+    fn feature_flag_private_attached_to_key() {
+        // `#private` is a pair-level pragma — it MUST sit on the
+        // immediately-preceding line of its pair's key. A previous
+        // paragraph-break pre-pass inserted a blank between
+        // `#private` and `rules:`, severing the ownership.
+        let formatted = format_source(presets::FEATURE_FLAG).unwrap();
         assert!(
-            formatted.contains("a * b,\n\n    project:"),
-            "expected blank line between method group and field group: {formatted}"
+            formatted.contains("#private\n    rules:"),
+            "#private must sit directly above `rules:` with no blank line:\n{formatted}"
+        );
+        assert!(
+            formatted.contains("#private\n    hash_mod_100("),
+            "#private must sit directly above `hash_mod_100(`:\n{formatted}"
+        );
+        // Defensive: no double-newline between `#private` and any pair key.
+        assert!(
+            !formatted.contains("#private\n\n"),
+            "found a blank line directly after `#private`:\n{formatted}"
+        );
+    }
+
+    #[test]
+    fn pricing_private_attached_to_key() {
+        let formatted = format_source(presets::PRICING).unwrap();
+        for pair in [
+            "currency(symbol, val):",
+            "volume_rate(sub):",
+            "loyalty_rate(tier):",
+            "tax_rate:",
+            "sum_floats(xs):",
+        ] {
+            let expected = format!("#private\n    {pair}");
+            assert!(
+                formatted.contains(&expected),
+                "#private must sit directly above `{pair}`:\n{formatted}"
+            );
+        }
+        assert!(
+            !formatted.contains("#private\n\n"),
+            "found a blank line directly after `#private`:\n{formatted}"
+        );
+    }
+
+    #[test]
+    fn pricing_decorator_attached_to_key() {
+        // `@currency("USD")` is a decorator attached to
+        // `total_display:`. Must stay glued to its key.
+        let formatted = format_source(presets::PRICING).unwrap();
+        assert!(
+            formatted.contains("@currency(\"USD\")\n    total_display:"),
+            "@currency decorator must sit directly above `total_display:`:\n{formatted}"
+        );
+    }
+
+    #[test]
+    fn pricing_expect_attached_to_schema_field() {
+        // `#expect "msg"` is a pair-level pragma on schema fields.
+        // Must stay glued to its field's `Type name:` line.
+        let formatted = format_source(presets::PRICING).unwrap();
+        assert!(
+            formatted.contains("#expect \"qty must be > 0\"\n    Int qty:"),
+            "#expect must sit directly above `Int qty:`:\n{formatted}"
+        );
+        assert!(
+            formatted.contains("#expect \"unit_price must be >= 0\"\n    Float unit_price:"),
+            "#expect must sit directly above `Float unit_price:`:\n{formatted}"
+        );
+        assert!(
+            formatted.contains("#expect \"tier must be one of: standard / gold\"\n    String tier:"),
+            "#expect must sit directly above `String tier:`:\n{formatted}"
+        );
+    }
+
+    #[test]
+    fn workflow_brand_directives_attached_to_dict() {
+        // `#brand Transition { ... }` is a Value-shape directive
+        // attached to the inline Dict that follows. Must stay
+        // adjacent — no blank line between `#brand Transition` and
+        // its `{`.
+        let formatted = format_source(presets::WORKFLOW).unwrap();
+        assert!(
+            formatted.contains("#brand Transition {"),
+            "#brand Transition must precede its {{ on the same logical block:\n{formatted}"
+        );
+    }
+
+    #[test]
+    fn modules_imports_pack_with_trailing_blank() {
+        // Three consecutive #import directives, then the file body.
+        // No blank between any pair of #imports; one blank before the
+        // root `{`.
+        let formatted = format_source(presets::MODULES).unwrap();
+        assert!(
+            formatted.contains("#import lib from \"./lib.relon\"\n#import { format_price }"),
+            "consecutive #imports must pack (no blank between):\n{formatted}"
+        );
+        assert!(
+            formatted.contains("#import * from \"./lib.relon\"\n\n{"),
+            "blank line missing between last #import and file body:\n{formatted}"
         );
     }
 }
