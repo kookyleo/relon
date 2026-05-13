@@ -64,6 +64,35 @@ struct SourceFormatter<'a> {
     frames: Vec<Frame>,
     previous: Option<Token<'a>>,
     type_generic_depth: usize,
+    /// Per-Brace-frame tracker for method/field pair classification.
+    /// Mirrors `frames` for Brace entries — pushed on `{` and popped
+    /// on `}`. Drives the once-per-Dict blank line that separates
+    /// the leading method group (`name(params): body`) from the
+    /// trailing field group (`name: value`).
+    pair_class_stack: Vec<PairFrameTracker>,
+}
+
+#[derive(Debug, Default)]
+struct PairFrameTracker {
+    /// Class of the previous pair emitted in this Dict, used to
+    /// detect a method→field transition. `None` until the first
+    /// pair has been classified.
+    prev_class: Option<PairClass>,
+    /// True once we've already emitted the method→field separator
+    /// for this Dict — ensures we only paragraph-break once even if
+    /// pairs continue to alternate.
+    transition_emitted: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PairClass {
+    /// Closure-bound pair: `name(params): body` — the key is
+    /// followed by `(` (open paren of the param list).
+    Method,
+    /// Value-bound pair: `name: value`, `"key": value`, or a typed
+    /// schema field `Type name: ...`. Any pair whose key isn't
+    /// followed by `(`.
+    Field,
 }
 
 impl<'a> SourceFormatter<'a> {
@@ -77,6 +106,7 @@ impl<'a> SourceFormatter<'a> {
             frames: Vec::new(),
             previous: None,
             type_generic_depth: 0,
+            pair_class_stack: Vec::new(),
         }
     }
 
@@ -164,6 +194,9 @@ impl<'a> SourceFormatter<'a> {
                         Some(TokenKind::At)
                     }
                     TokenKind::Hash => {
+                        if self.is_top_level_block_directive() {
+                            self.ensure_blank_line_separator();
+                        }
                         self.write_value_prefix();
                         self.write_plain("#");
                         Some(TokenKind::Hash)
@@ -205,6 +238,17 @@ impl<'a> SourceFormatter<'a> {
                         Some(TokenKind::Equal)
                     }
                     TokenKind::Word | TokenKind::Number | TokenKind::String => {
+                        // Detect pair-start to apply the method→field
+                        // group separator. Pair keys are Word / String
+                        // tokens that arrive at line_start while
+                        // we're directly inside a Brace frame (not in
+                        // a type-generic).
+                        if self.line_start
+                            && self.top_frame() == Some(Frame::Brace)
+                            && self.type_generic_depth == 0
+                        {
+                            self.maybe_paragraph_break_for_pair(token);
+                        }
                         self.write_atom(token.text);
                         Some(token.kind)
                     }
@@ -220,6 +264,16 @@ impl<'a> SourceFormatter<'a> {
         close_kind: TokenKind,
         frame: Frame,
     ) -> TokenKind {
+        // Blank line before a root-level `{` / `[` that follows a
+        // directive body's closing brace — e.g. `#schema X { ... }`
+        // and the file's value body. `#main(...) { ... }` is excluded
+        // because `(` not `}` precedes the `{`. Without this, the
+        // schema header and code body stick together as one block.
+        if self.frames.is_empty()
+            && self.previous.map(|p| p.kind) == Some(TokenKind::CloseBrace)
+        {
+            self.ensure_blank_line_separator();
+        }
         self.write_value_prefix();
 
         if self.next_is(close_kind) {
@@ -234,6 +288,9 @@ impl<'a> SourceFormatter<'a> {
 
         self.write_plain(token.text);
         self.frames.push(frame);
+        if frame == Frame::Brace {
+            self.pair_class_stack.push(PairFrameTracker::default());
+        }
         self.indent += 1;
         self.newline();
         token.kind
@@ -241,6 +298,9 @@ impl<'a> SourceFormatter<'a> {
 
     fn format_close_multiline(&mut self, text: &str, frame: Frame) {
         self.pop_frame(frame);
+        if frame == Frame::Brace {
+            self.pair_class_stack.pop();
+        }
         self.indent = self.indent.saturating_sub(1);
         if !self.line_start {
             self.newline();
@@ -335,7 +395,12 @@ impl<'a> SourceFormatter<'a> {
 
     fn format_operator(&mut self, text: &str) {
         let unary = text == "!" || ((text == "-" || text == "+") && !self.previous_allows_binary());
-        if unary {
+        // `*` in value position (no preceding operand) is a Wildcard
+        // placeholder (`String name: *`), not multiplication — emit
+        // as a bare value so it doesn't pick up binary-operator
+        // padding on either side.
+        let wildcard = text == "*" && !self.previous_allows_binary();
+        if unary || wildcard {
             self.write_value_prefix();
             self.write_plain(text);
         } else {
@@ -377,7 +442,26 @@ impl<'a> SourceFormatter<'a> {
     }
 
     fn apply_leading_newline(&mut self, token: Token<'a>) {
-        if token.leading_newlines == 0 || self.line_start {
+        if self.line_start {
+            return;
+        }
+
+        // Canonical layout: after a Dict-pair `:`, the value stays on
+        // the same line as the key — IDE auto-format must be
+        // deterministic, so we ignore the user's incoming whitespace
+        // here. Multi-line values still wrap because they open a `{`
+        // / `[` / `(` which has its own break behaviour.
+        if self.previous.map(|p| p.kind) == Some(TokenKind::Colon)
+            && self.top_frame() == Some(Frame::Brace)
+            && !matches!(
+                token.kind,
+                TokenKind::OpenBrace | TokenKind::OpenBracket | TokenKind::OpenParen
+            )
+        {
+            return;
+        }
+
+        if token.leading_newlines == 0 {
             return;
         }
 
@@ -487,6 +571,90 @@ impl<'a> SourceFormatter<'a> {
                     | Some(TokenKind::String)
                     | Some(TokenKind::CloseBracket)
             )
+    }
+
+    /// Classify the upcoming pair (method vs field) by looking at
+    /// the *post-key* token; if the previous pair was a method and
+    /// this one is a field, insert a blank line so the two groups
+    /// read as paragraphs. Fires at most once per Dict — once a
+    /// transition has been emitted, subsequent pairs of either class
+    /// stay flush.
+    fn maybe_paragraph_break_for_pair(&mut self, key_token: Token<'a>) {
+        let class = self.classify_pair_at(key_token);
+        let Some(tracker) = self.pair_class_stack.last_mut() else {
+            return;
+        };
+        let prev = tracker.prev_class;
+        let already = tracker.transition_emitted;
+        tracker.prev_class = Some(class);
+
+        if !already && prev == Some(PairClass::Method) && class == PairClass::Field {
+            tracker.transition_emitted = true;
+            self.ensure_blank_line_separator();
+        }
+    }
+
+    /// Inspect the token that follows the key to decide whether the
+    /// pair is a method (`name(params): body`) or a field. Schema
+    /// fields written as `Type name: ...` look like a Word followed
+    /// by another Word — still classified as field because no `(`
+    /// follows.
+    fn classify_pair_at(&self, key_token: Token<'a>) -> PairClass {
+        let next = self.tokens.get(self.index + 1);
+        let Some(next) = next else {
+            return PairClass::Field;
+        };
+        match (key_token.kind, next.kind) {
+            (TokenKind::Word, TokenKind::OpenParen) => PairClass::Method,
+            _ => PairClass::Field,
+        }
+    }
+
+    /// True when the upcoming `#…` directive is one of the block-
+    /// shaped forms at root scope: `#schema`, `#extend`, `#main`, or
+    /// `#import`. These act as top-level "section headers" so we
+    /// want a blank line ahead of them. Pair-level pragmas
+    /// (`#private`, `#brand`, `#derive`, …) stay attached to their
+    /// following pair and don't trigger the separator.
+    fn is_top_level_block_directive(&self) -> bool {
+        if !self.frames.is_empty() {
+            return false;
+        }
+        let next = self.tokens.get(self.index + 1);
+        let Some(next) = next else {
+            return false;
+        };
+        if next.kind != TokenKind::Word {
+            return false;
+        }
+        matches!(next.text, "schema" | "extend" | "main" | "import")
+    }
+
+    /// Emit a blank line before the next token if the output has
+    /// already produced non-trivial content. Idempotent: subsequent
+    /// calls collapse into a single blank line.
+    fn ensure_blank_line_separator(&mut self) {
+        if self.output.is_empty() {
+            return;
+        }
+        // Already at line start: just check for the preceding blank.
+        if !self.line_start {
+            self.newline();
+        }
+        // Walk back over trailing newlines; we want exactly two
+        // (`\n\n`) so the new token starts after one empty line.
+        let trailing = self
+            .output
+            .chars()
+            .rev()
+            .take_while(|c| *c == '\n')
+            .count();
+        if trailing < 2 {
+            for _ in trailing..2 {
+                self.output.push('\n');
+            }
+        }
+        self.line_start = true;
     }
 
     fn previous_allows_binary(&self) -> bool {
@@ -637,8 +805,11 @@ mod tests {
     #[test]
     fn formats_with_block_round_trip() {
         // Schema-method `with { ... }` block — the trait-bound system's
-        // Phase A surface. Round-trip and idempotence check.
-        let source = "#schema Money {\n    Int cents: *\n} with {\n    cents_value() -> Int: self.cents\n}\n{\n    Money price: {\n        cents: 100\n    }\n}\n";
+        // Phase A surface. Round-trip and idempotence check. Note the
+        // blank line between the schema declaration and the file's
+        // root value body (paragraph-break rule: any `}` followed by
+        // a root-level `{` gets one empty line).
+        let source = "#schema Money {\n    Int cents: *\n} with {\n    cents_value() -> Int: self.cents\n}\n\n{\n    Money price: {\n        cents: 100\n    }\n}\n";
         let formatted = format_source(source).unwrap();
         assert_eq!(formatted, source);
         assert_eq!(format_source(&formatted).unwrap(), formatted);
@@ -647,9 +818,58 @@ mod tests {
     #[test]
     fn formats_with_block_derive_pragma() {
         // `#derive Equatable` stacked above the witness method.
-        let source = "#schema Money {\n    Int cents: *\n} with {\n    #derive Equatable\n    eq(other: Self) -> Bool: self.cents == other.cents\n}\n{\n    Money price: {\n        cents: 100\n    }\n}\n";
+        let source = "#schema Money {\n    Int cents: *\n} with {\n    #derive Equatable\n    eq(other: Self) -> Bool: self.cents == other.cents\n}\n\n{\n    Money price: {\n        cents: 100\n    }\n}\n";
         let formatted = format_source(source).unwrap();
         assert_eq!(formatted, source);
         assert_eq!(format_source(&formatted).unwrap(), formatted);
+    }
+
+    #[test]
+    fn closure_body_inline_idempotent() {
+        // Function-definition body always inlines after the colon —
+        // input whitespace doesn't matter, the output is canonical.
+        let inline = "{\n    currency(val, symbol): val + \" \" + symbol,\n    multiply(a, b): a * b\n}\n";
+        let multiline = "{\n    currency(val, symbol):\n        val + \" \" + symbol,\n    multiply(a, b):\n        a * b\n}\n";
+        assert_eq!(format_source(inline).unwrap(), inline);
+        assert_eq!(format_source(multiline).unwrap(), inline);
+    }
+
+    #[test]
+    fn wildcard_star_no_binary_padding() {
+        // `*` as a schema-field wildcard (`String name: *,`) must not
+        // pick up binary-operator spacing — it isn't multiplication.
+        let source = "#schema User {\n    String name: *,\n    Int age: (a) => a >= 0\n}\n\n{\n    x: 1\n}\n";
+        let formatted = format_source(source).unwrap();
+        assert!(formatted.contains("String name: *,"), "expected `*,` flush: {formatted}");
+        assert!(!formatted.contains("* ,"));
+    }
+
+    #[test]
+    fn block_directives_get_blank_separator() {
+        // Two `#schema` blocks back-to-back, plus `#main` after — each
+        // top-level block directive starts after a blank line.
+        let source = "#schema A { Int x: * } #schema B { Int y: * } #main(A a){ z: 1 }";
+        let formatted = format_source(source).unwrap();
+        assert!(
+            formatted.contains("}\n\n#schema B"),
+            "missing blank between #schema A and #schema B: {formatted}"
+        );
+        assert!(
+            formatted.contains("}\n\n#main("),
+            "missing blank between #schema B and #main: {formatted}"
+        );
+    }
+
+    #[test]
+    fn method_field_group_separator_inside_dict() {
+        // Methods (`name(p): body`) come before fields (`name: value`)
+        // in the demo preset; the formatter inserts one blank line at
+        // the boundary.
+        let source = "{\n    multiply(a, b): a * b,\n    project: {\n        name: \"x\"\n    }\n}\n";
+        let formatted = format_source(source).unwrap();
+        assert!(
+            formatted.contains("a * b,\n\n    project:"),
+            "expected blank line between method group and field group: {formatted}"
+        );
     }
 }
