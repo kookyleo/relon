@@ -725,21 +725,46 @@ async function runWithArgs() {
 
 function runFormat() {
     const mod = wasmRef.value;
+    if (!mod) return;
+    // Format the entire workspace, not just the active tab — every
+    // file's text gets normalised in one pass. We use the editor's
+    // live buffer for the active file (so uncommitted edits round-
+    // trip cleanly) and `files.value` for the rest.
     const view = editorView.value;
-    if (!mod || !view) return;
-    const current = view.state.doc.toString();
-    try {
-        const formatted = mod.format(current);
-        view.dispatch({
-            changes: { from: 0, to: view.state.doc.length, insert: formatted },
-        });
-        // Formatter writing back will fire `updateListener` which
-        // updates the model + reschedules an evaluate.
-    } catch (raw) {
-        // Format failures don't block evaluate; we still bubble them.
-        const report = coerceErrorReport(raw);
-        errors.value = [report];
+    const liveActive = view ? view.state.doc.toString() : null;
+    const formattedByPath: Record<string, string> = {};
+    const failures: ErrorReport[] = [];
+    for (const f of files.value) {
+        const source = f.path === activeFile.value && liveActive != null
+            ? liveActive
+            : f.content;
+        try {
+            formattedByPath[f.path] = mod.format(source);
+        } catch (raw) {
+            failures.push(coerceErrorReport(raw));
+        }
+    }
+    if (failures.length > 0) {
+        // Don't apply a partial format — surface the first failure
+        // and leave every file as-is. Clearer than mixed state.
+        errors.value = failures;
         errorsExpanded.value = true;
+        return;
+    }
+    // Apply: update in-memory file contents first, then swap the
+    // editor doc for the active file (whose change fires the
+    // updateListener → model write-back path).
+    for (const f of files.value) {
+        const next = formattedByPath[f.path];
+        if (next != null) f.content = next;
+    }
+    if (view) {
+        const activeText = formattedByPath[activeFile.value];
+        if (activeText != null) {
+            view.dispatch({
+                changes: { from: 0, to: view.state.doc.length, insert: activeText },
+            });
+        }
     }
 }
 
@@ -888,6 +913,43 @@ function startErrorsResize(e: PointerEvent) {
     target.addEventListener('pointercancel', stop);
 }
 
+// Dialog dragging state: we track translation offsets per-dialog
+// instance so they "remember" where they were last dragged during a
+// single session. Map keys are the dialog elements themselves.
+const dialogOffsets = new Map<HTMLElement, { x: number; y: number }>();
+
+function startDialogDrag(e: PointerEvent) {
+    // The handle is the h3 title, but we move the parent <dialog>.
+    const dialog = (e.currentTarget as HTMLElement).closest('dialog');
+    if (!dialog) return;
+
+    e.preventDefault();
+    const handle = e.currentTarget as HTMLElement;
+    handle.setPointerCapture(e.pointerId);
+
+    if (!dialogOffsets.has(dialog)) {
+        dialogOffsets.set(dialog, { x: 0, y: 0 });
+    }
+    const offset = dialogOffsets.get(dialog)!;
+    const startX = e.clientX - offset.x;
+    const startY = e.clientY - offset.y;
+
+    const onMove = (ev: PointerEvent) => {
+        offset.x = ev.clientX - startX;
+        offset.y = ev.clientY - startY;
+        dialog.style.transform = `translate(${offset.x}px, ${offset.y}px)`;
+    };
+    const stop = () => {
+        try { handle.releasePointerCapture(e.pointerId); } catch { /* already released */ }
+        handle.removeEventListener('pointermove', onMove);
+        handle.removeEventListener('pointerup', stop);
+        handle.removeEventListener('pointercancel', stop);
+    };
+    handle.addEventListener('pointermove', onMove);
+    handle.addEventListener('pointerup', stop);
+    handle.addEventListener('pointercancel', stop);
+}
+
 /// Run the workspace-aware goto-definition lookup at the cursor's
 /// (line, character) and return the target the wasm layer found, or
 /// null. Called by the CodeMirror gotoDef extension on Mod-hover and
@@ -908,20 +970,28 @@ function resolveGotoDef(line: number, character: number): GotoDefinitionResult |
 
 /// Apply a goto-definition target: switch to the right tab (for
 /// cross-file jumps) and move the editor's selection to the target's
-/// start. The viewportPad + scrollIntoView lands the target line a
-/// few rows below the top, which feels natural.
+/// range. The range covers the *key* of the resolved field (VS Code
+/// convention — clicking lib.shout jumps to the destination and
+/// highlights "shout"). Collapsed ranges (start == end) — e.g. cursor
+/// on `&root` — degrade to a plain caret.
 function applyGotoDef(target: GotoDefinitionResult) {
     if (target.path !== activeFile.value) {
         selectFile(target.path);
     }
     const view = editorView.value;
     if (!view) return;
-    const lineNum = target.start.line + 1;
-    if (lineNum < 1 || lineNum > view.state.doc.lines) return;
-    const lineObj = view.state.doc.line(lineNum);
-    const offset = Math.min(lineObj.from + target.start.character, lineObj.to);
+    const startLineNum = target.start.line + 1;
+    if (startLineNum < 1 || startLineNum > view.state.doc.lines) return;
+    const startLine = view.state.doc.line(startLineNum);
+    const startOffset = Math.min(startLine.from + target.start.character, startLine.to);
+    const endLineNum = target.end.line + 1;
+    const endLine =
+        endLineNum >= 1 && endLineNum <= view.state.doc.lines
+            ? view.state.doc.line(endLineNum)
+            : startLine;
+    const endOffset = Math.min(endLine.from + target.end.character, endLine.to);
     view.dispatch({
-        selection: { anchor: offset, head: offset },
+        selection: { anchor: startOffset, head: endOffset },
         scrollIntoView: true,
     });
     view.focus();
@@ -1088,7 +1158,7 @@ watch([files, entry, argsInput], () => {
           @click="openArgsDialog"
         >
           <span v-if="argsCompact" class="rp-args-text">{{ argsCompact }}</span>
-          <span v-else class="rp-args-placeholder">args:{}</span>
+          <span v-else class="rp-args-placeholder">{}</span>
         </button>
         <span class="rp-args-bracket">)</span>
       </div>
@@ -1100,9 +1170,9 @@ watch([files, entry, argsInput], () => {
           aria-label="Run"
           @click="runActive"
         >
-          <svg viewBox="0 0 10 10" width="10" height="10" aria-hidden="true" class="rp-run-icon">
+          <svg viewBox="0 0 10 10" width="12" height="12" aria-hidden="true" class="rp-run-icon">
             <path
-              d="M3 2L8 5L3 8Z"
+              d="M2.5 1.5L8.5 5L2.5 8.5Z"
               :fill="autoRun ? 'currentColor' : 'none'"
               :stroke="autoRun ? 'none' : 'currentColor'"
               stroke-width="1.2"
@@ -1303,7 +1373,7 @@ watch([files, entry, argsInput], () => {
 
     <dialog ref="newFileDialog" class="rp-dialog" @close="newFileError = ''">
       <form class="rp-dialog-form" @submit.prevent="confirmNewFile">
-        <h3 class="rp-dialog-title">New file</h3>
+        <h3 class="rp-dialog-title" @pointerdown="startDialogDrag">New file</h3>
         <label class="rp-dialog-row">
           <span class="rp-dialog-label">Path</span>
           <input
@@ -1328,7 +1398,7 @@ watch([files, entry, argsInput], () => {
 
     <dialog ref="newWorkspaceDialog" class="rp-dialog" @close="newWorkspaceError = ''">
       <form class="rp-dialog-form" @submit.prevent="confirmNewWorkspace">
-        <h3 class="rp-dialog-title">New workspace</h3>
+        <h3 class="rp-dialog-title" @pointerdown="startDialogDrag">New workspace</h3>
         <label class="rp-dialog-row">
           <span class="rp-dialog-label">Name</span>
           <input
@@ -1354,7 +1424,7 @@ watch([files, entry, argsInput], () => {
 
     <dialog ref="argsDialog" class="rp-dialog rp-args-dialog" @close="argsDraftError = ''">
       <form class="rp-dialog-form" @submit.prevent="confirmArgs">
-        <h3 class="rp-dialog-title">Args</h3>
+        <h3 class="rp-dialog-title" @pointerdown="startDialogDrag">Args</h3>
         <div ref="argsEditorHost" class="rp-dialog-editor" @keydown.esc.prevent="closeArgsDialog"></div>
         <p v-if="argsDraftError" class="rp-dialog-error">{{ argsDraftError }}</p>
         <p class="rp-dialog-hint">
@@ -1748,12 +1818,10 @@ watch([files, entry, argsInput], () => {
   display: inline-flex;
   align-items: center;
   gap: 5px;
-  /* Smaller than the surrounding 13px controls — caption layer in
-     the typographic hierarchy so the Run button keeps the visual
-     centre of mass. Underlying state is the green/grey ring on the
-     button itself; the label is a clickable text-toggle. */
+  /* Balanced with the surrounding controls — same color and size as
+     the args brackets to maintain a clean horizontal rhythm. */
   color: var(--vp-c-text-3);
-  font-size: 11px;
+  font-size: 12px;
   line-height: 1;
   cursor: pointer;
   user-select: none;
@@ -1803,7 +1871,7 @@ watch([files, entry, argsInput], () => {
 
 .rp-args-bracket {
   font-family: var(--vp-font-family-mono);
-  font-size: 14px;
+  font-size: 12px;
   font-weight: 500;
   color: var(--vp-c-text-3);
   user-select: none;
@@ -2480,6 +2548,15 @@ watch([files, entry, argsInput], () => {
   margin: 0;
   font-size: 14px;
   font-weight: 600;
+  cursor: grab;
+  user-select: none;
+  /* Visual handle affordance: the header feels like a draggable bar. */
+  padding: 4px 0;
+  margin-top: -4px;
+}
+
+.rp-dialog-title:active {
+  cursor: grabbing;
 }
 
 .rp-dialog-row {
