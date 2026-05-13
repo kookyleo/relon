@@ -774,6 +774,114 @@ fn goto_definition_internal(
     }
 }
 
+/// One completion candidate. Sent to JS as a plain object so the
+/// CodeMirror callback can map to `Completion` without parsing
+/// nested shapes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompletionResult {
+    pub label: String,
+    /// One of: "method", "field", "param", "schema", "stdlib",
+    /// "module", "import", "reference", "directive", "pragma",
+    /// "decorator", "keyword".
+    pub kind: String,
+    /// Right-aligned label shown after the suggestion (e.g. file
+    /// path of an import). Optional.
+    pub detail: Option<String>,
+}
+
+/// Resolve a cursor position to a list of completion candidates.
+/// Mirrors the LSP's `textDocument/completion` handler, sharing the
+/// analyzer's [`relon_analyzer::complete::resolve`] under the hood.
+///
+/// Same `sources` / `entry` / `line` / `character` semantics as
+/// [`goto_definition`]. Returns an array of `CompletionResult`
+/// objects (possibly empty); never `null`. Parse errors in the entry
+/// source surface as an empty array so the editor doesn't break
+/// completion while the user is mid-edit.
+#[wasm_bindgen]
+pub fn complete(
+    sources: JsValue,
+    entry: &str,
+    line: u32,
+    character: u32,
+) -> Result<JsValue, JsValue> {
+    let sources = decode_sources(sources).map_err(err_to_js)?;
+    let results = complete_internal(&sources, entry, line, character).unwrap_or_default();
+    let serializer = serde_wasm_bindgen::Serializer::new().serialize_maps_as_objects(true);
+    results.serialize(&serializer).map_err(|err| {
+        err_to_js(ErrorReport::invalid_input(format!(
+            "complete result is not JS-serialisable: {err}"
+        )))
+    })
+}
+
+fn complete_internal(
+    sources: &HashMap<String, String>,
+    entry: &str,
+    line: u32,
+    character: u32,
+) -> Option<Vec<CompletionResult>> {
+    use relon_analyzer::complete::{self, CompletionKind};
+
+    let source = sources.get(entry)?;
+
+    // Same loader chain as goto_definition — in-memory first, std
+    // fallback — so `#import` resolution sees the playground's tabs.
+    let in_memory: Arc<dyn ModuleResolver> =
+        Arc::new(InMemoryModuleResolver::new(sources.clone()));
+    let std_resolver: Arc<dyn ModuleResolver> = Arc::new(StdModuleResolver);
+    let entry_dir = parent_dir(entry);
+    let entry_dir_path = PathBuf::from(if entry_dir.is_empty() {
+        ".".to_string()
+    } else {
+        entry_dir.clone()
+    });
+    let mut loader = ResolverChainLoader::from_resolvers(vec![in_memory, std_resolver]);
+    let workspace = relon_analyzer::workspace::analyze_entry(
+        entry.to_string(),
+        source,
+        entry_dir_path,
+        &mut loader,
+    );
+
+    let entry_tree = workspace.modules.get(entry)?;
+    let entry_root = workspace.nodes.get(entry)?;
+
+    let items = complete::resolve(
+        source,
+        entry_root,
+        entry_tree,
+        Some(&workspace),
+        line,
+        character,
+    );
+
+    Some(
+        items
+            .into_iter()
+            .map(|i| CompletionResult {
+                label: i.label,
+                kind: match i.kind {
+                    CompletionKind::Method => "method",
+                    CompletionKind::Field => "field",
+                    CompletionKind::Parameter => "param",
+                    CompletionKind::Schema => "schema",
+                    CompletionKind::Stdlib => "stdlib",
+                    CompletionKind::Module => "module",
+                    CompletionKind::Import => "import",
+                    CompletionKind::Reference => "reference",
+                    CompletionKind::Directive => "directive",
+                    CompletionKind::Pragma => "pragma",
+                    CompletionKind::Decorator => "decorator",
+                    CompletionKind::Keyword => "keyword",
+                }
+                .to_string(),
+                detail: i.detail,
+            })
+            .collect(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

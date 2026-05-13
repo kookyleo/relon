@@ -107,6 +107,19 @@ pub(crate) fn stdlib_signatures() -> &'static HashMap<String, FnSignature> {
     SIGS.get_or_init(build)
 }
 
+/// Public surface for tooling (autocomplete, completion suggesters):
+/// the names of every stdlib fn the evaluator registers, sorted for
+/// deterministic output. Signature details stay internal.
+pub fn stdlib_fn_names() -> impl Iterator<Item = &'static str> {
+    static NAMES: OnceLock<Vec<String>> = OnceLock::new();
+    let names = NAMES.get_or_init(|| {
+        let mut names: Vec<String> = stdlib_signatures().keys().cloned().collect();
+        names.sort();
+        names
+    });
+    names.iter().map(|s| s.as_str())
+}
+
 fn build() -> HashMap<String, FnSignature> {
     let mut m = HashMap::new();
 

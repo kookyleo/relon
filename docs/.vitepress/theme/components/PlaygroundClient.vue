@@ -55,6 +55,7 @@ import {
     type RuntimeErrorMark,
 } from './playground/runtime-errors';
 import { gotoDefinitionExtension } from './playground/goto-def';
+import { relonAutocomplete, type RelonCompletion } from './playground/autocomplete';
 
 // ---------------- types --------------------------------------------------
 
@@ -93,6 +94,12 @@ interface WasmModule {
         line: number,
         character: number
     ) => GotoDefinitionResult | null;
+    complete: (
+        sources: unknown,
+        entry: string,
+        line: number,
+        character: number
+    ) => RelonCompletion[];
 }
 
 export interface GotoDefinitionResult {
@@ -968,6 +975,22 @@ function resolveGotoDef(line: number, character: number): GotoDefinitionResult |
     }
 }
 
+/// Run the wasm-side completion resolver at the cursor's (line,
+/// character) and return the candidates. Called by the CodeMirror
+/// autocomplete extension on every keystroke; must be synchronous.
+/// Bails to an empty list on workspace errors so the editor keeps
+/// behaving sanely while the user is mid-edit.
+function resolveCompletions(line: number, character: number): RelonCompletion[] {
+    const mod = wasmRef.value;
+    if (!mod) return [];
+    const sources = files.value.map((f) => ({ path: f.path, content: f.content }));
+    try {
+        return mod.complete(sources, activeFile.value, line, character);
+    } catch {
+        return [];
+    }
+}
+
 /// Apply a goto-definition target: switch to the right tab (for
 /// cross-file jumps) and move the editor's selection to the target's
 /// range. The range covers the *key* of the resolved field (VS Code
@@ -1026,6 +1049,7 @@ onMounted(() => {
                 resolve: resolveGotoDef,
                 jump: applyGotoDef,
             }),
+            relonAutocomplete(resolveCompletions),
             EditorView.lineWrapping,
             viewportPad,
             updateListener,
