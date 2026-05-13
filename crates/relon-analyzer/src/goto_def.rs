@@ -296,18 +296,15 @@ pub fn resolve(
     // (3) Same-document reference. `references` resolves only the
     //     path's head (a known v1 simplification — see resolve.rs);
     //     for go-to-definition we descend through Dict children up
-    //     to the segment the cursor is on. The base of a Reference
-    //     (`&root` / `&sibling` / `&uncle` prefix, with cursor before
-    //     the first path segment) is handled specially: `&root`
-    //     navigates to the document root node; other bases fall
-    //     through to the head-target (the closest natural anchor).
+    //     to the segment the cursor is on. The Reference base
+    //     prefix (`&root` / `&sibling` / `&uncle`) gets its own
+    //     handling: jump to the *frame* the base would resolve into,
+    //     not to the head field.
     if matches!(cursor_segment, SegmentLocation::Base) {
-        if let Expr::Reference { base: RefBase::Root, .. } = &*node.expr {
-            return Some(GotoTarget::Node {
-                module_id: None,
-                start: entry_root.range.start.offset,
-                end: entry_root.range.start.offset,
-            });
+        if let Expr::Reference { base, .. } = &*node.expr {
+            if let Some(target) = base_frame_jump(*base, entry_root, entry_tree, offset) {
+                return Some(target);
+            }
         }
     }
     let resolved = entry_tree.references.get(&node.id)?;
@@ -328,6 +325,87 @@ pub fn resolve(
         start: range.0,
         end: range.1,
     })
+}
+
+/// Compute the goto-def target for a Reference's base prefix
+/// (`&root` / `&sibling` / `&uncle`). Each base resolves to a
+/// different scope frame at runtime:
+///   * `&root`    → the document's root Dict
+///   * `&sibling` → the immediately-enclosing Dict
+///   * `&uncle`   → the next Dict out from sibling
+/// We mirror the runtime by scanning the AST for every Dict whose
+/// range covers the cursor, outer-to-inner, then picking the right
+/// frame by base. The jump lands on the owning *key* of that Dict
+/// (e.g. `details:` for a `details: { ... }` field) when available,
+/// falling back to the Dict's own opening brace when the Dict has no
+/// owning key (the root, or a list-element dict).
+fn base_frame_jump(
+    base: RefBase,
+    root: &Node,
+    tree: &AnalyzedTree,
+    offset: usize,
+) -> Option<GotoTarget> {
+    let dicts = enclosing_dicts(root, offset);
+    let target = match base {
+        // Root could legitimately be the same Dict as `dicts[0]`
+        // (whole document), but we fall back to `root` even when no
+        // Dict was matched — the document might be a list or atomic
+        // expression at top level.
+        RefBase::Root => dicts.first().copied().unwrap_or(root),
+        RefBase::Sibling => *dicts.last()?,
+        // `&uncle` skips one Dict frame. With < 2 enclosing Dicts the
+        // reference would have stayed unresolved at analyze time too;
+        // return None so the caller produces no jump.
+        RefBase::Uncle => {
+            if dicts.len() < 2 {
+                return None;
+            }
+            dicts[dicts.len() - 2]
+        }
+        // List-context refs (`&prev`, `&next`, `&index`, `&this`) are
+        // iteration-state dependent — no static target.
+        _ => return None,
+    };
+    Some(jump_to_dict_anchor(target, tree))
+}
+
+/// Collect every Dict node whose range covers `offset`, outermost-to-
+/// innermost. The cursor's own node is included only when it is itself
+/// a Dict (rare for the base-prefix cases this helper supports).
+fn enclosing_dicts(root: &Node, offset: usize) -> Vec<&Node> {
+    let mut out = Vec::new();
+    collect_enclosing_dicts(root, offset, &mut out);
+    out
+}
+
+fn collect_enclosing_dicts<'a>(node: &'a Node, offset: usize, out: &mut Vec<&'a Node>) {
+    if !covers(node.range, offset) {
+        return;
+    }
+    if matches!(&*node.expr, Expr::Dict(_)) {
+        out.push(node);
+    }
+    for child in children(node) {
+        collect_enclosing_dicts(child, offset, out);
+    }
+}
+
+/// Land on the most informative anchor for a Dict: its owning key
+/// when it lives at `key: { ... }`, otherwise the Dict's opening
+/// brace. Always returns the "same-document" form.
+fn jump_to_dict_anchor(dict: &Node, tree: &AnalyzedTree) -> GotoTarget {
+    if let Some(key_range) = tree.field_key_ranges.get(&dict.id) {
+        return GotoTarget::Node {
+            module_id: None,
+            start: key_range.start.offset,
+            end: key_range.end.offset,
+        };
+    }
+    GotoTarget::Node {
+        module_id: None,
+        start: dict.range.start.offset,
+        end: dict.range.start.offset,
+    }
 }
 
 /// Which part of a path-bearing expression the cursor sits on. Used
