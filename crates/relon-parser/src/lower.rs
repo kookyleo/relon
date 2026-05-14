@@ -703,28 +703,181 @@ fn lower_directive_v2(dir: &ast::Directive, source: &str) -> Option<crate::Direc
     Some(value)
 }
 
-/// Lower a CST [`ast::Decorator`] to a legacy [`crate::Decorator`].
+/// Lower a CST [`ast::Decorator`] to a legacy [`crate::Decorator`] by
+/// walking the rowan node directly. The decorator shape is simple
+/// enough — dotted IDENT path under the AT sigil, optional CALL_ARG
+/// node containing positional / named arguments — that we can
+/// construct the legacy `Decorator` without re-entering the legacy
+/// combinator chain. Each arg's `value` is lowered through
+/// [`lower_expr_v2`], the shared expression dispatch.
+///
 /// Counterpart to [`lower_directive_v2`].
 #[allow(dead_code)]
 fn lower_decorator_v2(dec: &ast::Decorator, source: &str) -> Option<crate::Decorator> {
-    let r = dec.syntax().text_range();
+    let node = dec.syntax();
+    let r = node.text_range();
     let raw_start: usize = r.start().into();
     let end: usize = r.end().into();
+    // Legacy `parse_decorator` starts on the `@` sigil. The CST node
+    // range includes leading inter-attribute whitespace, so trim
+    // first to find the `@`.
     let raw_slice = source.get(raw_start..end)?;
     let trim = trim_leading_trivia(raw_slice);
     let start = raw_start + trim;
-    let slice = source.get(start..end)?;
-    let mut span = Span::new(slice);
-    use winnow::Parser as _;
-    let parsed = crate::decorator::parse_decorator
-        .parse_next(&mut span)
-        .ok()?;
-    if !span.is_empty() {
-        return None;
+
+    // Walk children-with-tokens to assemble the path + args.
+    let mut path: Vec<TokenKey> = Vec::new();
+    let mut args: Vec<crate::CallArg> = Vec::new();
+    let mut head_done = false;
+    let mut expect_segment_after_dot = false;
+
+    for el in node.children_with_tokens() {
+        match el {
+            rowan::NodeOrToken::Token(t) => match t.kind() {
+                SyntaxKind::WHITESPACE
+                | SyntaxKind::LINE_COMMENT
+                | SyntaxKind::BLOCK_COMMENT
+                | SyntaxKind::AT => continue,
+                SyntaxKind::IDENT => {
+                    let tr = t.text_range();
+                    let s: usize = tr.start().into();
+                    let e: usize = tr.end().into();
+                    let r = range_from_offsets(source, s, e);
+                    if !head_done {
+                        path.push(TokenKey::String(t.text().to_string(), r, false));
+                        head_done = true;
+                    } else if expect_segment_after_dot {
+                        path.push(TokenKey::String(t.text().to_string(), r, false));
+                        expect_segment_after_dot = false;
+                    } else {
+                        // Stray IDENT — malformed decorator.
+                        return None;
+                    }
+                }
+                SyntaxKind::DOT => {
+                    expect_segment_after_dot = true;
+                }
+                _ => continue,
+            },
+            rowan::NodeOrToken::Node(n) => {
+                if n.kind() == SyntaxKind::CALL_ARG {
+                    args.extend(walk_call_arg_node(&n, source)?);
+                }
+            }
+        }
     }
-    let mut value = parsed;
-    translate_decorator_offsets(&mut value, start, source);
-    Some(value)
+
+    // Legacy verification: once a named arg appears, all subsequent
+    // args must also be named. Mirrors the `.verify(...)` closure in
+    // `decorator::decorator`.
+    let mut saw_named = false;
+    for a in &args {
+        if a.name.is_some() {
+            saw_named = true;
+        } else if saw_named {
+            return None;
+        }
+    }
+
+    Some(crate::Decorator {
+        path,
+        args,
+        range: range_from_offsets(source, start, end),
+    })
+}
+
+/// Walk the children of a CALL_ARG CST node and extract the
+/// positional / named arguments as a flat list. Named arguments are
+/// detected by the `IDENT EQ <expr>` triple emitted by the CST
+/// parser (see `cst::parse_call_arg`).
+fn walk_call_arg_node(node: &SyntaxNode, source: &str) -> Option<Vec<crate::CallArg>> {
+    let mut args: Vec<crate::CallArg> = Vec::new();
+    let mut pending_name: Option<String> = None;
+    let mut iter = node.children_with_tokens().peekable();
+    while let Some(el) = iter.next() {
+        match el {
+            rowan::NodeOrToken::Token(t) => match t.kind() {
+                SyntaxKind::WHITESPACE
+                | SyntaxKind::LINE_COMMENT
+                | SyntaxKind::BLOCK_COMMENT
+                | SyntaxKind::L_PAREN
+                | SyntaxKind::R_PAREN
+                | SyntaxKind::COMMA => continue,
+                SyntaxKind::IDENT => {
+                    // Named arg: IDENT followed by EQ (skipping
+                    // trivia). Use the same peek-and-eat scheme the
+                    // CST parser used to emit the triple.
+                    let name = t.text().to_string();
+                    let mut after = iter.clone();
+                    let mut found_eq = false;
+                    for nx in after.by_ref() {
+                        if let Some(tt) = nx.as_token() {
+                            match tt.kind() {
+                                SyntaxKind::WHITESPACE
+                                | SyntaxKind::LINE_COMMENT
+                                | SyntaxKind::BLOCK_COMMENT => continue,
+                                SyntaxKind::EQ => {
+                                    found_eq = true;
+                                    break;
+                                }
+                                _ => break,
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+                    if found_eq {
+                        // Commit: drain trivia + EQ from the real iter.
+                        while let Some(peek) = iter.peek() {
+                            let is_eq_or_trivia = peek
+                                .as_token()
+                                .map(|tt| {
+                                    matches!(
+                                        tt.kind(),
+                                        SyntaxKind::WHITESPACE
+                                            | SyntaxKind::LINE_COMMENT
+                                            | SyntaxKind::BLOCK_COMMENT
+                                            | SyntaxKind::EQ
+                                    )
+                                })
+                                .unwrap_or(false);
+                            if is_eq_or_trivia {
+                                let eaten = iter.next();
+                                if eaten
+                                    .as_ref()
+                                    .and_then(|e| e.as_token())
+                                    .map(|tt| tt.kind() == SyntaxKind::EQ)
+                                    .unwrap_or(false)
+                                {
+                                    break;
+                                }
+                            } else {
+                                break;
+                            }
+                        }
+                        pending_name = Some(name);
+                    } else {
+                        // Bare IDENT positional arg? That would
+                        // actually be a VARIABLE_EXPR Node child in
+                        // the CST, not a raw IDENT token. A raw
+                        // IDENT token here is a malformed parse.
+                        return None;
+                    }
+                }
+                _ => continue,
+            },
+            rowan::NodeOrToken::Node(n) => {
+                if let Some(expr) = ast::Expr::cast(n.clone()) {
+                    let value = lower_expr_v2(&expr, source)?;
+                    args.push(crate::CallArg {
+                        name: pending_name.take(),
+                        value,
+                    });
+                }
+            }
+        }
+    }
+    Some(args)
 }
 
 /// Lower any expression-shaped CST node by re-running the legacy
