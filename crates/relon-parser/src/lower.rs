@@ -323,7 +323,17 @@ pub(crate) fn lower_expr_v2(expr: &ast::Expr, source: &str) -> Option<Node> {
         ast::Expr::Unary(u) => lower_expr_via_legacy(u.syntax(), source),
         ast::Expr::Ternary(t) => lower_expr_via_legacy(t.syntax(), source),
         ast::Expr::Call(c) => lower_expr_via_legacy(c.syntax(), source),
-        // Slice 3 stops here — every other construct will be wired in
+        // Slice 4: control flow. `Closure`, `Match`, `Where`, and
+        // `VariantCtor` all sit on top of expression-shaped CST nodes
+        // whose byte ranges are accepted verbatim by `parse_expr`.
+        // The closure shape (typed params, optional return type,
+        // body) and match-arm pattern/body pairs round-trip
+        // byte-identically through the legacy chain.
+        ast::Expr::Closure(c) => lower_expr_via_legacy(c.syntax(), source),
+        ast::Expr::Match(m) => lower_expr_via_legacy(m.syntax(), source),
+        ast::Expr::Where(w) => lower_expr_via_legacy(w.syntax(), source),
+        ast::Expr::VariantCtor(v) => lower_expr_via_legacy(v.syntax(), source),
+        // Slice 4 stops here — every other construct will be wired in
         // later slices. Returning `None` makes the caller fall back to
         // the legacy combinator chain.
         _ => None,
@@ -950,6 +960,94 @@ mod tests {
     #[test]
     fn slice3_lower_call_nested() {
         assert_operator_lower_matches_legacy("f(g(1), h(2, 3))");
+    }
+
+    /// Slice 4 (control flow). Same shape as previous slices' helpers
+    /// but covering Closure / Match / Where / VariantCtor. Standalone
+    /// closures use the `(params) => body` form (the dict-method
+    /// shorthand `key(params): body` reaches `lower_expr_v2` only via
+    /// its enclosing Dict, which slice 2 already lowers correctly).
+    fn assert_control_flow_lower_matches_legacy(source: &str) {
+        let parse = cst::parse_cst(source);
+        let doc = ast::document_of(parse.syntax()).expect("document");
+        let root = doc.root_expr().expect("root expr");
+        let v2 = lower_expr_v2(&root, source).expect("slice 4 supports this construct");
+        let legacy = crate::lower::legacy_parse(source).expect("legacy parse");
+        let mut a = v2;
+        let mut b = legacy;
+        strip_node_ids(&mut a);
+        strip_node_ids(&mut b);
+        assert_eq!(*a.expr, *b.expr, "expr diverged on {source:?}");
+        assert_eq!(a.range, b.range, "range diverged on {source:?}");
+    }
+
+    #[test]
+    fn slice4_lower_closure_bare() {
+        assert_control_flow_lower_matches_legacy("() => 1");
+    }
+
+    #[test]
+    fn slice4_lower_closure_typed_params() {
+        assert_control_flow_lower_matches_legacy("(Int a, Int b) => a + b");
+    }
+
+    #[test]
+    fn slice4_lower_closure_with_return_type() {
+        assert_control_flow_lower_matches_legacy("(Int a) -> Int => a + 1");
+    }
+
+    #[test]
+    fn slice4_lower_closure_method_shorthand_inside_dict() {
+        // Method-shorthand closures reach `lower_expr_v2` via the
+        // enclosing Dict's byte-slice route (slice 2). Validating the
+        // full document confirms the slice 4 dispatch on a child
+        // Closure isn't reached for this form — yet still produces a
+        // byte-identical legacy `Node`.
+        let source = "{ add(Int a, Int b): a + b }";
+        let parse = cst::parse_cst(source);
+        let doc = ast::document_of(parse.syntax()).expect("document");
+        let root = doc.root_expr().expect("root expr");
+        let v2 = lower_expr_v2(&root, source).expect("lower");
+        let legacy = crate::lower::legacy_parse(source).expect("legacy parse");
+        let mut a = v2;
+        let mut b = legacy;
+        strip_node_ids(&mut a);
+        strip_node_ids(&mut b);
+        assert_eq!(*a.expr, *b.expr);
+    }
+
+    #[test]
+    fn slice4_lower_match_simple() {
+        assert_control_flow_lower_matches_legacy("x match { Int: 1, * : 0 }");
+    }
+
+    #[test]
+    fn slice4_lower_match_multi() {
+        assert_control_flow_lower_matches_legacy(
+            "value match { Int: 1, String: 2, Bool: 3, * : 0 }",
+        );
+    }
+
+    #[test]
+    fn slice4_lower_where_simple() {
+        assert_control_flow_lower_matches_legacy("a + b where { a: 1, b: 2 }");
+    }
+
+    #[test]
+    fn slice4_lower_where_nested() {
+        assert_control_flow_lower_matches_legacy("(a + b) * c where { a: 1, b: 2, c: 3 }");
+    }
+
+    #[test]
+    fn slice4_lower_variant_ctor_simple() {
+        assert_control_flow_lower_matches_legacy("Result.Ok { value: 1 }");
+    }
+
+    #[test]
+    fn slice4_lower_variant_ctor_nested() {
+        assert_control_flow_lower_matches_legacy(
+            "Tree.Node { left: Tree.Leaf {}, right: Tree.Leaf {} }",
+        );
     }
 
     #[test]
