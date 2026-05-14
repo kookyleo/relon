@@ -77,43 +77,63 @@ use {crate::parse_base, winnow::stream::Location};
 // =====================================================================
 //
 // Inventory of `lower_*_v2` helpers and the legacy combinator they
-// still bridge to (as of mid-P6). Complexity reflects the work needed
-// to rewrite each helper as a direct rowan walk that constructs the
-// legacy `Node` shape without re-entering the winnow combinator.
+// still bridge to. Complexity reflects the work needed to rewrite
+// each helper as a direct rowan walk that constructs the legacy
+// `Node` shape without re-entering the winnow combinator.
 //
-//   helper                                | legacy fn                      | file                         | complexity
-//   --------------------------------------|--------------------------------|------------------------------|-----------
-//   lower_atom_via_legacy / WILDCARD      | (inlined: `*` → Expr::Wildcard)| —                            | done
-//   lower_atom_via_legacy / LITERAL       | parse_null/bool/number/string  | prim/{null,boolean,number,   | small (null, bool)
-//                                         |                                | string}.rs                   | medium (number, string escapes)
-//   lower_atom_via_legacy / VARIABLE_EXPR | var::parse_var                 | var.rs                       | small (CST nodes hold tokens)
-//   lower_atom_via_legacy / REFERENCE_EXPR| reference_var::parse_ref_var   | reference_var.rs             | small
-//   lower_decorator_v2                    | decorator::parse_decorator     | decorator.rs                 | small
-//   lower_directive_v2                    | directive::parse_directive     | directive.rs                 | large (5 shapes, schema body,
-//                                         |                                |                              |   with-block, main params)
-//   lower_expr_via_legacy / Dict/List/    | expr::parse_expr               | expr.rs                      | large (operator precedence,
-//     Spread/Comprehension/Binary/Unary/  |                                |                              |   call args, closures, match,
-//     Ternary/Call/Closure/Match/Where/   |                                |                              |   variant ctors, type expr,
-//     VariantCtor/FString/Type            |                                |                              |   f-strings)
+//   helper                                | status              | legacy fn used                 | notes
+//   --------------------------------------|---------------------|--------------------------------|------
+//   lower_atom_via_legacy / WILDCARD      | done (CST walk)     | none                           | `*` → Expr::Wildcard inline
+//   lower_atom_via_legacy / VARIABLE_EXPR | done (CST walk)     | none                           | `walk_path_tokens`
+//   lower_atom_via_legacy / REFERENCE_EXPR| done (CST walk)     | none                           | `walk_path_tokens` shared
+//   lower_atom_via_legacy / LITERAL       | partial (CST walk)  | prim::number, prim::string     | null / bool inlined; NUMBER + STRING
+//                                         |                     |                                |   defer escape/overflow to prim
+//   lower_decorator_v2                    | done (CST walk)     | none (lower_expr_v2 recurses)  | `walk_call_arg_node`
+//   lower_directive_v2                    | bridge              | directive::parse_directive     | 5 shapes (Bare/Value/NameBody/
+//                                         |                     |                                |   Import/Main); schema with-block
+//   lower_expr_via_legacy                 | bridge              | expr::parse_expr               | operator precedence, calls,
+//     (all composite expr kinds)          |                     |                                |   closures, match, where,
+//                                         |                     |                                |   variant ctors, f-strings, types
+//
+// Live legacy entries in `lower.rs`: only four —
+// `prim::number::parse_number`, `prim::string::parse_string`,
+// `directive::parse_directive`, `expr::parse_expr`. Pre-P6 there
+// were eight.
 //
 // Coupling: `decorator.rs` / `directive.rs` recursively call
-// `expr::parse_expr`; `var.rs` / `reference_var.rs` recursively call
-// `parse_expr` for dynamic-key (`[expr]`) accesses. `expr.rs` calls
+// `expr::parse_expr`; `var.rs` / `reference_var.rs` call
+// `parse_expr` for `[expr]` dynamic-key accesses. `expr.rs` calls
 // all the prim modules. `parse_base` + `parse_attributes` (in
 // `lib.rs`) and `structure/{dict,list}.rs` are only reachable from
-// `parse_expr` and from test-only `legacy_parse`. As a result the
-// legacy modules form a single connected web — deletion is gated on
-// the `parse_expr` / `parse_directive` retirement. The lower_*_v2
-// bridges, however, can be replaced one at a time provided each
-// rewrite preserves byte-identical `Node` output (the
-// `corpus_lower_matches_legacy` test in this module is the gate).
+// `parse_expr` and from `cfg(test)` `legacy_parse`. The legacy
+// modules form a single connected web — full deletion is gated on
+// the `parse_expr` / `parse_directive` retirement.
 //
-// Strategy: rewrite the smallest bridges first (WILDCARD ✓, then
-// VARIABLE / REFERENCE / LITERAL atoms, then `lower_decorator_v2`),
-// and only then attack the large ones. Once every `lower_*_v2`
-// stops calling its legacy counterpart, the whole legacy module web
-// can be deleted in one commit because nothing else (outside their
-// own tests + `lib.rs::parse_base`) depends on them.
+// Next slice candidates, in increasing complexity:
+//
+//   1. `lower_directive_v2`. Five branch shapes (`Bare`, `Value`,
+//      `NameBody`, `Import`, `Main`). Each maps to a clear CST
+//      child layout. The `NameBody` shape is the largest: declared
+//      name + optional generics + body expression + optional
+//      `with { ... }` block of schema-methods. Schema-methods
+//      themselves carry typed params, return type, optional body,
+//      and pragma directives.
+//
+//   2. `lower_expr_via_legacy`. Twelve composite Expr kinds. Each
+//      already has a typed-AST wrapper in `ast.rs`; the lowering
+//      is mostly mechanical CST → legacy `Node` translation. The
+//      tricky parts: operator precedence is already encoded in the
+//      CST (`BINARY_EXPR` is left/right children, op token); call
+//      arg name-detection is the `IDENT EQ <expr>` triple (handled
+//      in `walk_call_arg_node` above and reusable); the f-string
+//      decomposition is already a typed enum in `ast::FStringPart`.
+//
+// Once every `lower_*_v2` stops calling its legacy counterpart,
+// the whole legacy module web (`expr.rs`, `directive.rs`,
+// `decorator.rs`, `fn_call.rs`, `fmt_string.rs`, `var.rs`,
+// `reference_var.rs`, `prim/*`, `structure/*`) can be deleted in
+// one commit because nothing else (outside their own tests +
+// `lib.rs::parse_base`) depends on them.
 
 // =====================================================================
 // CST-walking lowering — P4 implementation.
