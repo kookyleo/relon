@@ -154,7 +154,17 @@ fn translate_node_offsets(node: &mut Node, base_offset: usize, source: &str) {
     let s = node.range.start.offset + base_offset;
     let e = node.range.end.offset + base_offset;
     node.range = range_from_offsets(source, s, e);
-    // Visit nested ranges that an atom can carry.
+    // Side-tables attached to the Node wrapper itself.
+    if let Some(t) = node.type_hint.as_mut() {
+        translate_type_node_offsets(t, base_offset, source);
+    }
+    for dec in &mut node.decorators {
+        translate_decorator_offsets(dec, base_offset, source);
+    }
+    for dir in &mut node.directives {
+        translate_directive_offsets(dir, base_offset, source);
+    }
+    // Visit nested ranges that the Expr can carry.
     match node.expr.as_mut() {
         Expr::Variable(path) | Expr::Reference { path, .. } => {
             for k in path {
@@ -209,7 +219,24 @@ fn translate_node_offsets(node: &mut Node, base_offset: usize, source: &str) {
                 translate_node_offsets(b, base_offset, source);
             }
         }
-        Expr::Closure { body, .. } => translate_node_offsets(body, base_offset, source),
+        Expr::Closure {
+            params,
+            return_type,
+            body,
+        } => {
+            for p in params {
+                let ps = p.range.start.offset + base_offset;
+                let pe = p.range.end.offset + base_offset;
+                p.range = range_from_offsets(source, ps, pe);
+                if let Some(t) = p.type_hint.as_mut() {
+                    translate_type_node_offsets(t, base_offset, source);
+                }
+            }
+            if let Some(t) = return_type.as_mut() {
+                translate_type_node_offsets(t, base_offset, source);
+            }
+            translate_node_offsets(body, base_offset, source);
+        }
         Expr::VariantCtor { body, .. } => translate_node_offsets(body, base_offset, source),
         Expr::Comprehension {
             element,
@@ -223,12 +250,12 @@ fn translate_node_offsets(node: &mut Node, base_offset: usize, source: &str) {
                 translate_node_offsets(c, base_offset, source);
             }
         }
+        Expr::Type(t) => translate_type_node_offsets(t, base_offset, source),
         Expr::Null
         | Expr::Bool(_)
         | Expr::Int(_)
         | Expr::Float(_)
         | Expr::String(_)
-        | Expr::Type(_)
         | Expr::Wildcard => {}
     }
 }
@@ -249,6 +276,204 @@ fn translate_token_key(key: &mut TokenKey, base_offset: usize, source: &str) {
         TokenKey::Dynamic(inner, _) => translate_node_offsets(inner, base_offset, source),
         TokenKey::Dummy | TokenKey::Index(_, _) => {}
     }
+}
+
+/// Shift every `TokenRange` inside a [`crate::Directive`] by
+/// `base_offset` bytes, then rewrite each `line` / `column` against
+/// the full `source`. Mirrors the body of [`translate_node_offsets`]
+/// but for the directive's own outer `range`, its
+/// `DirectiveBody`-specific sub-ranges (name / path / param names),
+/// and any inner `Node` payloads (the body expression / `with`-block
+/// schema-method bodies).
+#[allow(dead_code)]
+fn translate_directive_offsets(dir: &mut crate::Directive, base_offset: usize, source: &str) {
+    let s = dir.range.start.offset + base_offset;
+    let e = dir.range.end.offset + base_offset;
+    dir.range = range_from_offsets(source, s, e);
+    match &mut dir.body {
+        crate::DirectiveBody::Bare => {}
+        crate::DirectiveBody::Value(node) => translate_node_offsets(node, base_offset, source),
+        crate::DirectiveBody::NameBody {
+            name_range,
+            body,
+            methods,
+            ..
+        } => {
+            let ns = name_range.start.offset + base_offset;
+            let ne = name_range.end.offset + base_offset;
+            *name_range = range_from_offsets(source, ns, ne);
+            translate_node_offsets(body, base_offset, source);
+            for m in methods {
+                let ms = m.range.start.offset + base_offset;
+                let me = m.range.end.offset + base_offset;
+                m.range = range_from_offsets(source, ms, me);
+                let nms = m.name_range.start.offset + base_offset;
+                let nme = m.name_range.end.offset + base_offset;
+                m.name_range = range_from_offsets(source, nms, nme);
+                for p in &mut m.params {
+                    let ps = p.name_range.start.offset + base_offset;
+                    let pe = p.name_range.end.offset + base_offset;
+                    p.name_range = range_from_offsets(source, ps, pe);
+                    translate_type_node_offsets(&mut p.type_node, base_offset, source);
+                }
+                translate_type_node_offsets(&mut m.return_type, base_offset, source);
+                if let Some(b) = &mut m.body {
+                    translate_node_offsets(b, base_offset, source);
+                }
+            }
+        }
+        crate::DirectiveBody::Import { path_range, .. } => {
+            let ps = path_range.start.offset + base_offset;
+            let pe = path_range.end.offset + base_offset;
+            *path_range = range_from_offsets(source, ps, pe);
+        }
+        crate::DirectiveBody::Main {
+            params,
+            return_type,
+        } => {
+            for p in params {
+                let ns = p.name_range.start.offset + base_offset;
+                let ne = p.name_range.end.offset + base_offset;
+                p.name_range = range_from_offsets(source, ns, ne);
+                translate_type_node_offsets(&mut p.type_node, base_offset, source);
+            }
+            if let Some(t) = return_type {
+                translate_type_node_offsets(t, base_offset, source);
+            }
+        }
+    }
+}
+
+/// Recursively shift the `range` of a [`crate::TypeNode`] (and every
+/// nested generic argument and variant-field type) by `base_offset`.
+#[allow(dead_code)]
+fn translate_type_node_offsets(t: &mut crate::TypeNode, base_offset: usize, source: &str) {
+    let s = t.range.start.offset + base_offset;
+    let e = t.range.end.offset + base_offset;
+    t.range = range_from_offsets(source, s, e);
+    for g in &mut t.generics {
+        translate_type_node_offsets(g, base_offset, source);
+    }
+    if let Some(fields) = &mut t.variant_fields {
+        for (_name, ty) in fields {
+            translate_type_node_offsets(ty, base_offset, source);
+        }
+    }
+}
+
+/// Shift every `TokenRange` inside a [`crate::Decorator`] by
+/// `base_offset` bytes. Mirrors [`translate_directive_offsets`] for
+/// the simpler decorator shape (`path` + positional/named `args`).
+#[allow(dead_code)]
+fn translate_decorator_offsets(dec: &mut crate::Decorator, base_offset: usize, source: &str) {
+    let s = dec.range.start.offset + base_offset;
+    let e = dec.range.end.offset + base_offset;
+    dec.range = range_from_offsets(source, s, e);
+    for k in &mut dec.path {
+        translate_token_key(k, base_offset, source);
+    }
+    for a in &mut dec.args {
+        translate_node_offsets(&mut a.value, base_offset, source);
+    }
+}
+
+/// Trim leading whitespace / comment trivia bytes from the start of
+/// `slice` to find the first non-trivia byte (the directive's `#` or
+/// the decorator's `@`). Rowan CST nodes start at the previous
+/// sibling's end, which includes inter-attribute whitespace — the
+/// legacy combinators expect to start exactly on the sigil.
+#[allow(dead_code)]
+fn trim_leading_trivia(slice: &str) -> usize {
+    let mut bytes = slice.as_bytes();
+    let mut offset = 0usize;
+    loop {
+        // Skip ASCII whitespace.
+        while let Some(&b) = bytes.first() {
+            if b == b' ' || b == b'\t' || b == b'\n' || b == b'\r' {
+                bytes = &bytes[1..];
+                offset += 1;
+            } else {
+                break;
+            }
+        }
+        // Skip `// line` comments.
+        if bytes.starts_with(b"//") {
+            let mut i = 2;
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            offset += i;
+            bytes = &bytes[i..];
+            continue;
+        }
+        // Skip `/* block */` comments.
+        if bytes.starts_with(b"/*") {
+            let mut i = 2;
+            while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                i += 1;
+            }
+            if i + 1 < bytes.len() {
+                i += 2;
+            }
+            offset += i;
+            bytes = &bytes[i..];
+            continue;
+        }
+        break;
+    }
+    offset
+}
+
+/// Lower a CST [`ast::Directive`] to a legacy [`crate::Directive`] by
+/// re-running the legacy `parse_directive` combinator on the
+/// directive's exact byte range and translating the produced
+/// `TokenRange`s back onto the full source. Same byte-identical
+/// shortcut the expression-shaped lowering uses, applied to
+/// attributes.
+#[allow(dead_code)]
+fn lower_directive_v2(dir: &ast::Directive, source: &str) -> Option<crate::Directive> {
+    let r = dir.syntax().text_range();
+    let raw_start: usize = r.start().into();
+    let end: usize = r.end().into();
+    let raw_slice = source.get(raw_start..end)?;
+    let trim = trim_leading_trivia(raw_slice);
+    let start = raw_start + trim;
+    let slice = source.get(start..end)?;
+    let mut span = Span::new(slice);
+    use winnow::Parser as _;
+    let parsed = crate::directive::parse_directive
+        .parse_next(&mut span)
+        .ok()?;
+    if !span.is_empty() {
+        return None;
+    }
+    let mut value = parsed;
+    translate_directive_offsets(&mut value, start, source);
+    Some(value)
+}
+
+/// Lower a CST [`ast::Decorator`] to a legacy [`crate::Decorator`].
+/// Counterpart to [`lower_directive_v2`].
+#[allow(dead_code)]
+fn lower_decorator_v2(dec: &ast::Decorator, source: &str) -> Option<crate::Decorator> {
+    let r = dec.syntax().text_range();
+    let raw_start: usize = r.start().into();
+    let end: usize = r.end().into();
+    let raw_slice = source.get(raw_start..end)?;
+    let trim = trim_leading_trivia(raw_slice);
+    let start = raw_start + trim;
+    let slice = source.get(start..end)?;
+    let mut span = Span::new(slice);
+    use winnow::Parser as _;
+    let parsed = crate::decorator::parse_decorator
+        .parse_next(&mut span)
+        .ok()?;
+    if !span.is_empty() {
+        return None;
+    }
+    let mut value = parsed;
+    translate_decorator_offsets(&mut value, start, source);
+    Some(value)
 }
 
 /// Lower any expression-shaped CST node by re-running the legacy
@@ -353,11 +578,108 @@ pub(crate) fn lower_expr_v2(expr: &ast::Expr, source: &str) -> Option<Node> {
         // `variant_fields` / `range` / `doc_comment` — byte-
         // identically.
         ast::Expr::Type(t) => lower_expr_via_legacy(t.syntax(), source),
-        // Slice 6 stops here — every other construct will be wired in
-        // later slices. Returning `None` makes the caller fall back to
-        // the legacy combinator chain.
-        _ => None,
+        // The CST emits an `ERROR` node when recovery happens; we don't
+        // have a legacy `Node` shape for partial parses.
+        ast::Expr::Error(_) => None,
     }
+}
+
+/// Lower a full CST [`ast::Document`] to the outer-wrapped legacy
+/// [`Node`] that downstream consumers expect. Mirrors the body of
+/// [`crate::parse_base`] but reads each piece off the CST instead of
+/// the winnow stream: leading doc-comment from the bytes before the
+/// first attribute / root, every leading directive / decorator via
+/// [`lower_directive_v2`] / [`lower_decorator_v2`], the root
+/// expression via [`lower_expr_v2`].
+///
+/// Returns `None` only when one of the lowering steps fails — by
+/// construction (`parse_base` accepts the same grammar the CST does)
+/// this shouldn't happen on a well-formed source. The fallback to
+/// [`legacy_parse`] in the slice 8 [`lower_document`] body covers any
+/// future grammar drift between the two paths.
+#[allow(dead_code)]
+pub(crate) fn lower_document_node_v2(doc: &ast::Document, source: &str) -> Option<Node> {
+    // 1. Lower every leading directive + decorator. We capture them in
+    //    source order within each kind — the legacy `parse_attributes`
+    //    interleaves them in the input loop but stores them in two
+    //    ordered Vecs, so a per-kind walk over CST children preserves
+    //    the legacy ordering.
+    let mut decorators: Vec<crate::Decorator> = Vec::new();
+    for d in doc.decorators() {
+        decorators.push(lower_decorator_v2(&d, source)?);
+    }
+    let mut directives: Vec<crate::Directive> = Vec::new();
+    for d in doc.directives() {
+        directives.push(lower_directive_v2(&d, source)?);
+    }
+
+    // 2. Lower the root expression.
+    let root_ast = doc.root_expr()?;
+    let body = lower_expr_v2(&root_ast, source)?;
+
+    // 3. Compute the document-level start_offset before merging the
+    //    Dict-hoisted directives. Legacy `parse_base` reads
+    //    `directives.first()` from the *pre-extend* attribute list —
+    //    a `#schema` directive that lives inside the dict body is
+    //    hoisted onto the outer Node but does NOT count toward the
+    //    document's start offset (the dict's `{` does).
+    let start_offset = decorators
+        .first()
+        .map(|d| d.range.start.offset)
+        .or_else(|| directives.first().map(|d| d.range.start.offset))
+        .unwrap_or(body.range.start.offset);
+
+    // 4. Merge standalone-directive hoisting from a Dict root, mirroring
+    //    `parse_base`'s behavior. Only Dict roots produce hoisted
+    //    inner directives (other roots can't carry them).
+    if matches!(body.expr.as_ref(), Expr::Dict(_)) {
+        directives.extend(body.directives.clone());
+    }
+
+    // 5. Doc-comment: leading comments above the first attribute / root.
+    //    Computed by running the legacy `parse_leading_comments`
+    //    combinator on the byte prefix up to the first non-trivia
+    //    offset.
+    let leading_slice = source.get(0..start_offset).unwrap_or("");
+    let mut leading_span = Span::new(leading_slice);
+    use winnow::Parser as _;
+    let doc_comment = crate::parse_leading_comments
+        .parse_next(&mut leading_span)
+        .ok()
+        .flatten();
+
+    // 6. Compute the document-level range. Legacy `parse_base` takes
+    //    `end_offset` from the parser position after the root —
+    //    i.e. `body.range.end.offset`.
+    let end_offset = body.range.end.offset;
+    let range = range_from_offsets(source, start_offset, end_offset);
+
+    // 6. Build the outer Node. Note `body.directives` is intentionally
+    //    not propagated — those have already been hoisted onto the
+    //    outer `directives` list above. The outer Node uses
+    //    `body.expr` directly, dropping the body's now-unused
+    //    `directives` / `decorators` fields.
+    Some(Node {
+        id: crate::NodeId::alloc(),
+        expr: body.expr,
+        decorators,
+        directives,
+        type_hint: None,
+        range,
+        doc_comment,
+    })
+}
+
+/// Convenience: parse `source` via the CST and lower the result with
+/// [`lower_document_node_v2`]. Returns `None` when the CST yields no
+/// root expression (e.g. empty input). Used by the corpus extension
+/// test to drive the new path end-to-end without first flipping
+/// [`lower_document`] over (that's slice 8's job).
+#[allow(dead_code)]
+pub(crate) fn lower_document_v2(source: &str) -> Option<Node> {
+    let parse = crate::cst::parse_cst(source);
+    let doc = ast::document_of(parse.syntax())?;
+    lower_document_node_v2(&doc, source)
 }
 
 // Re-export marker for tests/consumers below.
@@ -1160,6 +1482,161 @@ mod tests {
     #[test]
     fn slice6_lower_type_enum_variant_unit() {
         assert_type_expr_lower_matches_legacy("Enum<Ok, Err>");
+    }
+
+    /// Slice 7 (attributes). Given a Relon document whose first
+    /// directive/decorator is fully covered by the CST, slice its
+    /// bytes through the legacy parser and confirm the lowered
+    /// `Directive` / `Decorator` matches the legacy `parse_base`
+    /// result byte-identically.
+    fn assert_directive_lower_matches_legacy(source: &str) {
+        let parse = cst::parse_cst(source);
+        let doc = ast::document_of(parse.syntax()).expect("document");
+        let cst_dir = doc.directives().next().expect("at least one CST directive");
+        let v2 = lower_directive_v2(&cst_dir, source).expect("slice 7 supports this directive");
+        let legacy = crate::lower::legacy_parse(source).expect("legacy parse");
+        let legacy_dir = legacy
+            .directives
+            .first()
+            .cloned()
+            .expect("at least one legacy directive");
+        assert_eq!(v2, legacy_dir, "directive diverged on {source:?}");
+    }
+
+    fn assert_decorator_lower_matches_legacy(source: &str) {
+        let parse = cst::parse_cst(source);
+        let doc = ast::document_of(parse.syntax()).expect("document");
+        let cst_dec = doc.decorators().next().expect("at least one CST decorator");
+        let v2 = lower_decorator_v2(&cst_dec, source).expect("slice 7 supports this decorator");
+        let legacy = crate::lower::legacy_parse(source).expect("legacy parse");
+        let mut legacy_dec = legacy
+            .decorators
+            .first()
+            .cloned()
+            .expect("at least one legacy decorator");
+        // CallArg.value carries a `Node` with an `id` — strip both for
+        // structural comparison.
+        for a in &mut legacy_dec.args {
+            strip_node_ids(&mut a.value);
+        }
+        let mut v2 = v2;
+        for a in &mut v2.args {
+            strip_node_ids(&mut a.value);
+        }
+        assert_eq!(v2, legacy_dec, "decorator diverged on {source:?}");
+    }
+
+    #[test]
+    fn slice7_lower_directive_bare() {
+        assert_directive_lower_matches_legacy("#private\n{ a: 1 }");
+    }
+
+    #[test]
+    fn slice7_lower_directive_value() {
+        assert_directive_lower_matches_legacy("#default 0\n{ a: 1 }");
+    }
+
+    #[test]
+    fn slice7_lower_directive_value_complex() {
+        assert_directive_lower_matches_legacy("#expect \"msg\"\n{ a: 1 }");
+    }
+
+    #[test]
+    fn slice7_lower_directive_schema_namebody() {
+        assert_directive_lower_matches_legacy("#schema User { String name: * }\n{ x: 1 }");
+    }
+
+    #[test]
+    fn slice7_lower_directive_import_alias() {
+        assert_directive_lower_matches_legacy("#import string from \"std/string\"\n{ x: 1 }");
+    }
+
+    #[test]
+    fn slice7_lower_directive_import_spread() {
+        assert_directive_lower_matches_legacy("#import * from \"std/list\"\n{ x: 1 }");
+    }
+
+    #[test]
+    fn slice7_lower_directive_import_destructure() {
+        assert_directive_lower_matches_legacy(
+            "#import { upper, lower as lo } from \"std/string\"\n{ x: 1 }",
+        );
+    }
+
+    #[test]
+    fn slice7_lower_directive_main() {
+        assert_directive_lower_matches_legacy(
+            "#main(User u, Cart cart) -> Result<Order>\n{ x: 1 }",
+        );
+    }
+
+    #[test]
+    fn slice7_lower_decorator_bare() {
+        assert_decorator_lower_matches_legacy("@foo\n{ a: 1 }");
+    }
+
+    #[test]
+    fn slice7_lower_decorator_with_args() {
+        assert_decorator_lower_matches_legacy("@brand(Color)\n{ r: 1 }");
+    }
+
+    #[test]
+    fn slice7_lower_decorator_dotted() {
+        assert_decorator_lower_matches_legacy("@lib.brand(Color)\n{ r: 1 }");
+    }
+
+    /// Slice 7 also ships `lower_document_node_v2`, which builds the
+    /// outer-wrapped `Node` (decorators + directives + doc_comment +
+    /// range + body) from the CST instead of the legacy combinator
+    /// stream. The corpus test below validates this against the legacy
+    /// path across every checked-in fixture — every fixture the
+    /// legacy parser accepts must lower byte-identically via the new
+    /// path.
+    #[test]
+    fn corpus_lower_matches_legacy() {
+        use std::fs;
+        use std::path::PathBuf;
+
+        let crate_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let workspace_root = crate_dir
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("workspace root")
+            .to_path_buf();
+        let mut files = Vec::new();
+        walk(&workspace_root, &mut files);
+        files.retain(|p| !p.to_string_lossy().contains("/target/"));
+
+        let mut checked = 0usize;
+        let mut divergent: Vec<String> = Vec::new();
+        for path in files {
+            let Ok(source) = fs::read_to_string(&path) else {
+                continue;
+            };
+            if source.is_empty() {
+                continue;
+            }
+            let Ok(mut legacy) = legacy_parse(&source) else {
+                continue;
+            };
+            let Some(mut lowered) = lower_document_v2(&source) else {
+                divergent.push(format!("{path:?}: v2 returned None"));
+                continue;
+            };
+            checked += 1;
+            strip_node_ids(&mut legacy);
+            strip_node_ids(&mut lowered);
+            if legacy != lowered {
+                divergent.push(format!("{path:?}: trees diverged"));
+            }
+        }
+        assert!(checked > 0, "expected to compare at least one fixture");
+        assert!(
+            divergent.is_empty(),
+            "corpus_lower_matches_legacy found {} divergent fixtures:\n{}",
+            divergent.len(),
+            divergent.join("\n")
+        );
     }
 
     #[test]
