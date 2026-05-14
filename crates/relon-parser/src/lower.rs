@@ -333,7 +333,17 @@ pub(crate) fn lower_expr_v2(expr: &ast::Expr, source: &str) -> Option<Node> {
         ast::Expr::Match(m) => lower_expr_via_legacy(m.syntax(), source),
         ast::Expr::Where(w) => lower_expr_via_legacy(w.syntax(), source),
         ast::Expr::VariantCtor(v) => lower_expr_via_legacy(v.syntax(), source),
-        // Slice 4 stops here — every other construct will be wired in
+        // Slice 5: f-strings. The CST decomposes an f-string into
+        // F_STRING_LITERAL chunks + F_STRING_INTERPOLATION sub-nodes
+        // for IDE highlighting, but the legacy parser keeps it as a
+        // single `Expr::FString(Vec<FStringPart>)`. Routing the
+        // F_STRING node's byte slice through `parse_expr` (which
+        // reaches `parse_fmt_string` via `parse_atomic`) reconstructs
+        // the legacy shape byte-identically — including the literal /
+        // interpolation alternation and nested-expression
+        // `TokenRange`s.
+        ast::Expr::FString(fs) => lower_expr_via_legacy(fs.syntax(), source),
+        // Slice 5 stops here — every other construct will be wired in
         // later slices. Returning `None` makes the caller fall back to
         // the legacy combinator chain.
         _ => None,
@@ -1048,6 +1058,49 @@ mod tests {
         assert_control_flow_lower_matches_legacy(
             "Tree.Node { left: Tree.Leaf {}, right: Tree.Leaf {} }",
         );
+    }
+
+    /// Slice 5 (f-strings). The CST splits an f-string into per-chunk
+    /// children for IDE work; the legacy parser keeps it as a single
+    /// `Expr::FString(Vec<FStringPart>)`. The byte-slice route still
+    /// produces the latter byte-identically.
+    fn assert_fstring_lower_matches_legacy(source: &str) {
+        let parse = cst::parse_cst(source);
+        let doc = ast::document_of(parse.syntax()).expect("document");
+        let root = doc.root_expr().expect("root expr");
+        let v2 = lower_expr_v2(&root, source).expect("slice 5 supports this f-string");
+        let legacy = crate::lower::legacy_parse(source).expect("legacy parse");
+        let mut a = v2;
+        let mut b = legacy;
+        strip_node_ids(&mut a);
+        strip_node_ids(&mut b);
+        assert_eq!(*a.expr, *b.expr, "expr diverged on {source:?}");
+        assert_eq!(a.range, b.range, "range diverged on {source:?}");
+    }
+
+    #[test]
+    fn slice5_lower_fstring_pure_literal() {
+        assert_fstring_lower_matches_legacy(r#"f"hello world""#);
+    }
+
+    #[test]
+    fn slice5_lower_fstring_one_interp() {
+        assert_fstring_lower_matches_legacy(r#"f"hi ${name}!""#);
+    }
+
+    #[test]
+    fn slice5_lower_fstring_many_interps() {
+        assert_fstring_lower_matches_legacy(r#"f"${greeting}, ${name}: ${count}""#);
+    }
+
+    #[test]
+    fn slice5_lower_fstring_with_reference() {
+        assert_fstring_lower_matches_legacy(r#"f"value=${&root.x}""#);
+    }
+
+    #[test]
+    fn slice5_lower_fstring_with_expr_interp() {
+        assert_fstring_lower_matches_legacy(r#"f"sum=${a + b}""#);
     }
 
     #[test]
