@@ -1883,6 +1883,69 @@ fn lower_unary_expr_v2(node: &SyntaxNode, source: &str) -> Option<Node> {
     ))
 }
 
+/// Lower a `BINARY_EXPR` CST node. The CST already encoded operator
+/// precedence + associativity in the tree shape (left/right children
+/// are nested BINARY_EXPRs at higher / lower precedence). We just
+/// read off the operator token and recurse on both sides.
+///
+/// Range note: the CST's BINARY_EXPR `text_range()` may extend past
+/// the lhs subexpression's actual start because the CST wraps via
+/// `open_at(lhs_ck, BINARY_EXPR)` where `lhs_ck` is captured *before*
+/// any leading `(` of a grouped LHS. The legacy parser instead
+/// computes the binary range as `combine_ranges(lhs.range, rhs.range)`
+/// — i.e. the bounds of the actual operands, no surrounding parens.
+/// We replicate that here.
+fn lower_binary_expr_v2(node: &SyntaxNode, source: &str) -> Option<Node> {
+    let mut exprs = node.children().filter_map(ast::Expr::cast);
+    let lhs_ast = exprs.next()?;
+    let rhs_ast = exprs.next()?;
+    let op_token = node
+        .children_with_tokens()
+        .filter_map(|el| el.into_token())
+        .find(|t| {
+            matches!(
+                t.kind(),
+                SyntaxKind::PLUS
+                    | SyntaxKind::MINUS
+                    | SyntaxKind::STAR
+                    | SyntaxKind::SLASH
+                    | SyntaxKind::PERCENT
+                    | SyntaxKind::PLUS_PLUS
+                    | SyntaxKind::EQ_EQ
+                    | SyntaxKind::BANG_EQ
+                    | SyntaxKind::LT
+                    | SyntaxKind::GT
+                    | SyntaxKind::LT_EQ
+                    | SyntaxKind::GT_EQ
+                    | SyntaxKind::AMP_AMP
+                    | SyntaxKind::PIPE_PIPE
+                    | SyntaxKind::PIPE
+            )
+        })?;
+    let op = match op_token.kind() {
+        SyntaxKind::PLUS => crate::Operator::Add,
+        SyntaxKind::MINUS => crate::Operator::Sub,
+        SyntaxKind::STAR => crate::Operator::Mul,
+        SyntaxKind::SLASH => crate::Operator::Div,
+        SyntaxKind::PERCENT => crate::Operator::Mod,
+        SyntaxKind::PLUS_PLUS => crate::Operator::Concat,
+        SyntaxKind::EQ_EQ => crate::Operator::Eq,
+        SyntaxKind::BANG_EQ => crate::Operator::Ne,
+        SyntaxKind::LT => crate::Operator::Lt,
+        SyntaxKind::GT => crate::Operator::Gt,
+        SyntaxKind::LT_EQ => crate::Operator::Le,
+        SyntaxKind::GT_EQ => crate::Operator::Ge,
+        SyntaxKind::AMP_AMP => crate::Operator::And,
+        SyntaxKind::PIPE_PIPE => crate::Operator::Or,
+        SyntaxKind::PIPE => crate::Operator::Pipe,
+        _ => return None,
+    };
+    let lhs = lower_expr_v2(&lhs_ast, source)?;
+    let rhs = lower_expr_v2(&rhs_ast, source)?;
+    let combined = crate::combine_ranges(lhs.range, rhs.range);
+    Some(Node::new(Expr::Binary(op, lhs, rhs), combined))
+}
+
 /// Lower a `TERNARY_EXPR` CST node. Three child expressions: cond,
 /// then, else (in source order). Maps to legacy `Expr::Ternary`.
 fn lower_ternary_expr_v2(node: &SyntaxNode, source: &str) -> Option<Node> {
@@ -1989,7 +2052,7 @@ pub(crate) fn lower_expr_v2(expr: &ast::Expr, source: &str) -> Option<Node> {
         // operator associativity, precedence, and call-arg `name:`
         // detection byte-identical with no separate token-text → enum
         // table here.
-        ast::Expr::Binary(b) => lower_expr_via_legacy(b.syntax(), source),
+        ast::Expr::Binary(b) => lower_binary_expr_v2(b.syntax(), source),
         ast::Expr::Unary(u) => lower_unary_expr_v2(u.syntax(), source),
         ast::Expr::Ternary(t) => lower_ternary_expr_v2(t.syntax(), source),
         ast::Expr::Call(c) => lower_expr_via_legacy(c.syntax(), source),
