@@ -1631,7 +1631,7 @@ impl<'a> Parser<'a> {
         self.open(SyntaxKind::CALL_ARG);
         self.bump(); // (
         while !self.at(SyntaxKind::R_PAREN) && !self.at_end() {
-            self.parse_expr();
+            self.parse_call_arg();
             if !self.eat(SyntaxKind::COMMA) && !self.at(SyntaxKind::R_PAREN) {
                 self.error_recover(
                     "expected `,` or `)` in argument list",
@@ -1642,6 +1642,24 @@ impl<'a> Parser<'a> {
         }
         self.expect(SyntaxKind::R_PAREN);
         self.close();
+    }
+
+    /// One argument inside a call's parens. Either positional (a
+    /// bare expression) or named (`IDENT = expression`). The latter
+    /// is detected by peeking IDENT-followed-by-EQ — the legacy
+    /// `parse_call_arg` (`fn_call.rs`) uses the same lookahead. We
+    /// emit the IDENT + EQ + value expression as siblings of each
+    /// other under the parent CALL_ARG node so the lowering pass can
+    /// pick the name back out without re-running token logic.
+    fn parse_call_arg(&mut self) {
+        if self.at(SyntaxKind::IDENT) && self.nth(1) == Some(SyntaxKind::EQ) {
+            // Named: IDENT EQ <expr>.
+            self.bump(); // name
+            self.bump(); // =
+            self.parse_expr();
+        } else {
+            self.parse_expr();
+        }
     }
 }
 
@@ -1978,6 +1996,31 @@ mod tests {
     #[test]
     fn unknown_byte_does_not_crash() {
         parse_round_trip("{ x: \u{0000} 1 }");
+    }
+
+    #[test]
+    fn named_call_args_parse_without_errors() {
+        let parsed = parse_round_trip("{ y: map(f = g) }");
+        assert!(!parsed.has_errors(), "errors: {:?}", parsed.errors);
+        // The CALL_ARG node contains the IDENT, EQ, and value side by
+        // side; the lowering pass groups them back into a `CallArg`.
+        let call_args: Vec<_> = parsed
+            .syntax()
+            .descendants()
+            .filter(|n| n.kind() == SyntaxKind::CALL_ARG)
+            .collect();
+        assert_eq!(call_args.len(), 1);
+        let has_eq = call_args[0]
+            .children_with_tokens()
+            .filter_map(|el| el.into_token())
+            .any(|t| t.kind() == SyntaxKind::EQ);
+        assert!(has_eq, "named arg should carry an EQ token");
+    }
+
+    #[test]
+    fn mixed_positional_and_named_args() {
+        let parsed = parse_round_trip("{ z: f(1, name = expr, more = 2) }");
+        assert!(!parsed.has_errors(), "errors: {:?}", parsed.errors);
     }
 
     #[test]
