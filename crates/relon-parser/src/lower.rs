@@ -158,6 +158,198 @@ pub(crate) fn range_from_offsets(source: &str, start: usize, end: usize) -> Toke
     }
 }
 
+/// Decode the text of a NUMBER token into the corresponding
+/// [`Expr::Int`] / [`Expr::Float`]. Mirrors the byte-identical shape of
+/// the legacy `prim::number::parse_number` combinator, but operates on
+/// a `&str` so we don't drag the winnow stream / Span machinery into
+/// the CST-walking lowering path. Returns `None` when the slice doesn't
+/// form a complete numeric literal (hex overflow, malformed exponent,
+/// trailing bytes) — the CST grammar is supposed to guarantee a
+/// well-formed slice, so this acts as a parity smoke test rather than
+/// an expected failure path.
+fn parse_number_text(text: &str) -> Option<crate::Expr> {
+    use ordered_float::OrderedFloat;
+    // Optional leading sign. The CST tokenizer emits the sign as part
+    // of the NUMBER token text when it stuck (e.g. `-1`, `+0.5`,
+    // `-0x10`), matching the legacy combinator's behaviour.
+    let bytes = text.as_bytes();
+    let (sign, rest) = match bytes.first() {
+        Some(b'+') => (1i64, &text[1..]),
+        Some(b'-') => (-1i64, &text[1..]),
+        _ => (1i64, text),
+    };
+    // Hex / oct / bin first — they have explicit prefixes so the
+    // dispatch is unambiguous.
+    if let Some(hex) = rest.strip_prefix("0x") {
+        if hex.is_empty() || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        let v: u64 = u64::from_str_radix(hex, 16).ok()?;
+        let signed = if sign >= 0 {
+            i64::try_from(v).ok()?
+        } else if v > (i64::MAX as u64) + 1 {
+            return None;
+        } else if v == (i64::MAX as u64) + 1 {
+            i64::MIN
+        } else {
+            -(v as i64)
+        };
+        return Some(crate::Expr::Int(signed));
+    }
+    if let Some(oct) = rest.strip_prefix("0o") {
+        if oct.is_empty() {
+            return None;
+        }
+        let v: i64 = i64::from_str_radix(oct, 8).ok()?;
+        return Some(crate::Expr::Int(v.checked_mul(sign)?));
+    }
+    if let Some(bin) = rest.strip_prefix("0b") {
+        if bin.is_empty() {
+            return None;
+        }
+        let v: i64 = i64::from_str_radix(bin, 2).ok()?;
+        return Some(crate::Expr::Int(v.checked_mul(sign)?));
+    }
+    // Special-named floats — the legacy parser accepted bare
+    // `Infinity` / `NaN` as float literals (with optional sign on
+    // Infinity). The CST tokenizer surfaces these as NUMBER tokens
+    // when they sit in numeric position.
+    if rest == "Infinity" {
+        return Some(crate::Expr::Float(OrderedFloat(if sign == 1 {
+            f64::INFINITY
+        } else {
+            f64::NEG_INFINITY
+        })));
+    }
+    if rest == "NaN" {
+        return Some(crate::Expr::Float(OrderedFloat(f64::NAN)));
+    }
+    // Decimal integer or float. The presence of `.` / `e` / `E` is
+    // the legacy parser's dispatch criterion.
+    if rest.contains('.') || rest.contains('e') || rest.contains('E') {
+        let f: f64 = rest.parse().ok()?;
+        return Some(crate::Expr::Float(OrderedFloat(f * sign as f64)));
+    }
+    let i: i64 = rest.parse().ok()?;
+    Some(crate::Expr::Int(i.checked_mul(sign)?))
+}
+
+/// Decode the text of a STRING token (including its surrounding quotes
+/// or raw-string `r#"..."#` envelope) into the contained Rust
+/// [`String`]. Mirrors the legacy `prim::string::parse_string` /
+/// `normal_string` / `raw_string` / `string_content` chain, but operates
+/// on a `&str` so the CST-walking lowering path doesn't need to drag
+/// in winnow's Span / parser-combinator infrastructure.
+///
+/// Handles:
+/// * Normal double-quoted strings with `\n`, `\r`, `\t`, `\b`, `\f`,
+///   `\\`, `\/`, `\"`, `\uXXXX`, `\u{X..}` escapes.
+/// * Escaped-whitespace folding: a backslash followed by one or more
+///   whitespace chars is consumed silently (the legacy combinator
+///   uses this as a line-continuation marker).
+/// * Raw strings: `r"..."`, `r#"..."#`, `r##"..."##`, etc. The
+///   number of `#`s after `r` is the same number expected before the
+///   closing quote; no escapes are processed inside.
+///
+/// Returns `None` on malformed input — same semantics as the legacy
+/// combinator (which would have returned an `Err` from the chain).
+fn parse_string_text(text: &str) -> Option<String> {
+    let bytes = text.as_bytes();
+    if bytes.first().copied() == Some(b'r') {
+        return parse_raw_string_text(&text[1..]);
+    }
+    parse_normal_string_text(text)
+}
+
+fn parse_normal_string_text(text: &str) -> Option<String> {
+    // Strip opening + closing `"`. The CST grammar guarantees both
+    // are present; if not, the token wouldn't have been classified
+    // as STRING.
+    let inner = text.strip_prefix('"')?.strip_suffix('"')?;
+    let mut out = String::with_capacity(inner.len());
+    let mut chars = inner.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        let escape = chars.next()?;
+        match escape {
+            'n' => out.push('\n'),
+            'r' => out.push('\r'),
+            't' => out.push('\t'),
+            'b' => out.push('\u{08}'),
+            'f' => out.push('\u{0C}'),
+            '\\' => out.push('\\'),
+            '/' => out.push('/'),
+            '"' => out.push('"'),
+            'u' => {
+                // `\uXXXX` (exactly 4 hex digits) or `\u{X..}` (1..=6).
+                let cp = if chars.peek().copied() == Some('{') {
+                    chars.next(); // `{`
+                    let mut hex = String::new();
+                    loop {
+                        let h = chars.next()?;
+                        if h == '}' {
+                            break;
+                        }
+                        if !h.is_ascii_hexdigit() {
+                            return None;
+                        }
+                        hex.push(h);
+                    }
+                    if hex.is_empty() || hex.len() > 6 {
+                        return None;
+                    }
+                    u32::from_str_radix(&hex, 16).ok()?
+                } else {
+                    let mut hex = String::new();
+                    for _ in 0..4 {
+                        let h = chars.next()?;
+                        if !h.is_ascii_hexdigit() {
+                            return None;
+                        }
+                        hex.push(h);
+                    }
+                    u32::from_str_radix(&hex, 16).ok()?
+                };
+                out.push(std::char::from_u32(cp)?);
+            }
+            w if w.is_whitespace() => {
+                // Escaped-whitespace continuation: silently consume
+                // any additional whitespace chars that follow.
+                while let Some(&peek) = chars.peek() {
+                    if peek.is_whitespace() {
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+            }
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
+fn parse_raw_string_text(after_r: &str) -> Option<String> {
+    // Count the leading `#`s before the opening `"`. Same number is
+    // expected before the closing `"`.
+    let mut hash_count = 0usize;
+    let bytes = after_r.as_bytes();
+    while bytes.get(hash_count).copied() == Some(b'#') {
+        hash_count += 1;
+    }
+    let rest = &after_r[hash_count..];
+    let inner = rest.strip_prefix('"')?;
+    let mut closing = String::from("\"");
+    for _ in 0..hash_count {
+        closing.push('#');
+    }
+    let content = inner.strip_suffix(closing.as_str())?;
+    Some(content.to_string())
+}
+
 /// Lower a slice 1 atom (LITERAL / VARIABLE_EXPR / REFERENCE_EXPR /
 /// WILDCARD) directly through the legacy combinator parser, sliced to
 /// the CST node's byte range. The combinator chain already knows how
@@ -231,31 +423,19 @@ fn lower_literal_v2(node: &SyntaxNode, source: &str) -> Option<Node> {
         },
         SyntaxKind::NUMBER => {
             // Numbers carry hex / oct / bin / scientific / Infinity /
-            // NaN parsing inside `prim::number::parse_number`. The
-            // token text is exactly the number literal — no
-            // surrounding bytes — so we run the combinator on it
-            // directly and translate the slice-local offsets back.
+            // NaN parsing. P6 round 2 inlined the leaf parser here as
+            // a direct `&str` decoder so the prim/ module web can be
+            // deleted later in this round.
             let slice = source.get(start..end)?;
-            let mut span = Span::new(slice);
-            use winnow::Parser as _;
-            let mut node_value = crate::prim::number::parse_number
-                .parse_next(&mut span)
-                .ok()?;
-            translate_node_offsets(&mut node_value, start, source);
-            Some(node_value)
+            let expr = parse_number_text(slice)?;
+            Some(Node::new(expr, range))
         }
         SyntaxKind::STRING => {
             // Strings own escape decoding (`\n`, `\u{...}`, raw
-            // `r#"..."#`). Same drill — leaf combinator on the
-            // token text, then translate.
+            // `r#"..."#`). P6 round 2 inlined the leaf parser here.
             let slice = source.get(start..end)?;
-            let mut span = Span::new(slice);
-            use winnow::Parser as _;
-            let mut node_value = crate::prim::string::parse_string
-                .parse_next(&mut span)
-                .ok()?;
-            translate_node_offsets(&mut node_value, start, source);
-            Some(node_value)
+            let s = parse_string_text(slice)?;
+            Some(Node::new(Expr::String(s), range))
         }
         _ => None,
     }
