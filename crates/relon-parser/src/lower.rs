@@ -1883,6 +1883,133 @@ fn lower_unary_expr_v2(node: &SyntaxNode, source: &str) -> Option<Node> {
     ))
 }
 
+/// Decode an F_STRING_LITERAL token's text. Non-raw f-strings honour
+/// the same escape set as normal strings (`\n`, `\t`, `\\`, `\u{...}`,
+/// `\"`, `\\<whitespace>` for line-continuation); raw f-strings (the
+/// `f#"..."#` form) take the text verbatim.
+fn decode_fstring_literal(text: &str, raw: bool) -> Option<String> {
+    if raw {
+        return Some(text.to_string());
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        let escape = chars.next()?;
+        match escape {
+            'n' => out.push('\n'),
+            'r' => out.push('\r'),
+            't' => out.push('\t'),
+            'b' => out.push('\u{08}'),
+            'f' => out.push('\u{0C}'),
+            '\\' => out.push('\\'),
+            '/' => out.push('/'),
+            '"' => out.push('"'),
+            'u' => {
+                let cp = if chars.peek().copied() == Some('{') {
+                    chars.next();
+                    let mut hex = String::new();
+                    loop {
+                        let h = chars.next()?;
+                        if h == '}' {
+                            break;
+                        }
+                        if !h.is_ascii_hexdigit() {
+                            return None;
+                        }
+                        hex.push(h);
+                    }
+                    if hex.is_empty() || hex.len() > 6 {
+                        return None;
+                    }
+                    u32::from_str_radix(&hex, 16).ok()?
+                } else {
+                    let mut hex = String::new();
+                    for _ in 0..4 {
+                        let h = chars.next()?;
+                        if !h.is_ascii_hexdigit() {
+                            return None;
+                        }
+                        hex.push(h);
+                    }
+                    u32::from_str_radix(&hex, 16).ok()?
+                };
+                out.push(std::char::from_u32(cp)?);
+            }
+            w if w.is_whitespace() => {
+                // Line-continuation: swallow all following whitespace.
+                while let Some(&peek) = chars.peek() {
+                    if peek.is_whitespace() {
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+            }
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
+/// Lower an `F_STRING` CST node into the legacy
+/// `Expr::FString(Vec<FStringPart>)` shape. The CST already decomposed
+/// the source into F_STRING_OPEN / F_STRING_LITERAL* /
+/// F_STRING_INTERPOLATION* / F_STRING_CLOSE tokens + sub-nodes; we
+/// walk them in source order, decoding non-raw escapes inside literal
+/// chunks and merging adjacent Literal parts to match the legacy
+/// `merge_parts` post-processing.
+fn lower_fstring_v2(node: &SyntaxNode, source: &str) -> Option<Node> {
+    let r = node.text_range();
+    let start: usize = r.start().into();
+    let end: usize = r.end().into();
+    // Detect raw form by looking at F_STRING_OPEN's text (`f"` vs
+    // `f#"` etc. — raw if any `#` between `f` and `"`).
+    let raw = node
+        .children_with_tokens()
+        .filter_map(|el| el.into_token())
+        .find(|t| t.kind() == SyntaxKind::F_STRING_OPEN)
+        .map(|t| t.text().contains('#'))
+        .unwrap_or(false);
+
+    let mut parts: Vec<crate::FStringPart> = Vec::new();
+    for el in node.children_with_tokens() {
+        match el {
+            rowan::NodeOrToken::Token(t) => {
+                if t.kind() == SyntaxKind::F_STRING_LITERAL {
+                    let decoded = decode_fstring_literal(t.text(), raw)?;
+                    if decoded.is_empty() {
+                        continue;
+                    }
+                    if let Some(crate::FStringPart::Literal(ref mut last)) =
+                        parts.last_mut()
+                    {
+                        last.push_str(&decoded);
+                    } else {
+                        parts.push(crate::FStringPart::Literal(decoded));
+                    }
+                }
+            }
+            rowan::NodeOrToken::Node(n) => {
+                if n.kind() == SyntaxKind::F_STRING_INTERPOLATION {
+                    // The interpolation has one inner Expr child.
+                    let inner_ast = n.children().find_map(ast::Expr::cast)?;
+                    let inner = lower_expr_v2(&inner_ast, source)?;
+                    parts.push(crate::FStringPart::Interpolation(Box::new(inner)));
+                }
+            }
+        }
+    }
+
+    Some(Node::new(
+        Expr::FString(parts),
+        range_from_offsets(source, start, end),
+    ))
+}
+
 /// Lower a `VARIANT_CTOR` CST node into the legacy
 /// `Expr::VariantCtor` shape. The CST emits tokens for the dotted
 /// path (e.g. `Result.Ok` is IDENT DOT IDENT) followed by a DICT
@@ -2275,7 +2402,7 @@ pub(crate) fn lower_expr_v2(expr: &ast::Expr, source: &str) -> Option<Node> {
         // the legacy shape byte-identically — including the literal /
         // interpolation alternation and nested-expression
         // `TokenRange`s.
-        ast::Expr::FString(fs) => lower_expr_via_legacy(fs.syntax(), source),
+        ast::Expr::FString(fs) => lower_fstring_v2(fs.syntax(), source),
         // Slice 6: type expressions. The CST emits a bare TYPE_NODE
         // for `Int`, `List<T>`, `Foo?`, `(T1, T2, ...)` tuple types,
         // and tagged enum variants at any expression-shaped position.
