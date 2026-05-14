@@ -150,7 +150,7 @@ fn position_at(input: &Span<'_>, offset: usize) -> TokenPosition {
     position_at_source(source, offset)
 }
 
-fn position_at_source(source: &str, offset: usize) -> TokenPosition {
+pub(crate) fn position_at_source(source: &str, offset: usize) -> TokenPosition {
     let offset = offset.min(source.len());
     let end = if source.is_char_boundary(offset) {
         offset

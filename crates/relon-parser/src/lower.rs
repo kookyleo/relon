@@ -48,10 +48,235 @@
 //! with a tight test loop: lower a fixture, compare structurally to
 //! the legacy output (with [`NodeId`]s stripped), and validate.
 
+use crate::ast;
 use crate::cst::Parse;
 use crate::syntax::{SyntaxKind, SyntaxNode};
-use crate::{parse_base, ParseDocumentError, Span};
+use crate::{
+    parse_base, position_at_source, Expr, Node, ParseDocumentError, Span, TokenKey, TokenRange,
+};
 use winnow::stream::Location;
+
+// =====================================================================
+// CST-walking lowering — incremental P4 implementation.
+//
+// Each construct lives in its own `lower_*_v2` function. The functions
+// take a typed `ast::*` wrapper plus the original source text and
+// produce a legacy `Node` byte-identical to what the combinator chain
+// would emit. Where a sub-expression isn't yet covered by P4 the
+// helper returns `None` and the caller falls back to the legacy chain
+// (or, depending on the slice, propagates the `None` so the entire
+// document drops back to `legacy_parse`).
+//
+// Once every slice ships and `lower_expr_v2` covers the full grammar,
+// slice 8 flips `lower_document` to gate on the CST instead of
+// delegating to the legacy combinator chain.
+// =====================================================================
+
+/// Compute a [`TokenRange`] for the byte span `[start, end)` against
+/// `source`. Mirrors `crate::create_range` but reads positions directly
+/// from the source string instead of from a winnow `Span`.
+#[allow(dead_code)]
+pub(crate) fn range_from_offsets(source: &str, start: usize, end: usize) -> TokenRange {
+    TokenRange {
+        start: position_at_source(source, start),
+        end: position_at_source(source, end),
+    }
+}
+
+/// Lower a slice 1 atom (LITERAL / VARIABLE_EXPR / REFERENCE_EXPR /
+/// WILDCARD) directly through the legacy combinator parser, sliced to
+/// the CST node's byte range. The combinator chain already knows how
+/// to produce the exact legacy `Node` shape for these atoms —
+/// re-deriving the same shape from the CST without it would
+/// re-implement number / string / unicode-escape parsing for no win
+/// over the legacy code path (slice 1's goal is structural parity, not
+/// independence from the legacy parser yet).
+///
+/// Note this differs in spirit from a full CST walker: it borrows the
+/// legacy parser as a black-box decoder while the CST guarantees the
+/// span is well-formed. Slices 2+ will replace these one-off calls
+/// with direct CST walks as each family ships.
+#[allow(dead_code)]
+fn lower_atom_via_legacy(node: &SyntaxNode, source: &str) -> Option<Node> {
+    // Slice the source to the node's range so the legacy parser sees
+    // exactly the bytes the CST claims belong to this atom — its
+    // `TokenRange` offsets are computed against the full source via
+    // a translation pass below.
+    let r = node.text_range();
+    let start: usize = r.start().into();
+    let end: usize = r.end().into();
+    let slice = source.get(start..end)?;
+    let mut span = Span::new(slice);
+    use winnow::Parser as _;
+    let parsed: Option<Node> = match node.kind() {
+        SyntaxKind::LITERAL => {
+            // null / bool / number / string atoms.
+            winnow::combinator::alt::<_, Node, _, _>((
+                crate::prim::null::parse_null,
+                crate::prim::boolean::parse_bool,
+                crate::prim::number::parse_number,
+                crate::prim::string::parse_string,
+            ))
+            .parse_next(&mut span)
+            .ok()
+        }
+        SyntaxKind::VARIABLE_EXPR => crate::var::parse_var.parse_next(&mut span).ok(),
+        SyntaxKind::REFERENCE_EXPR => crate::reference_var::parse_ref_var
+            .parse_next(&mut span)
+            .ok(),
+        SyntaxKind::WILDCARD => {
+            // Legacy `parse_wildcard` lives in expr.rs (private). The
+            // simplest equivalent is to consume `*` directly.
+            if slice == "*" {
+                Some(Node::new(
+                    Expr::Wildcard,
+                    range_from_offsets(source, start, end),
+                ))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    };
+    let mut node_value = parsed?;
+    // Translate the produced `TokenRange` offsets, which are zero-
+    // indexed against the sliced source, back to the full document.
+    translate_node_offsets(&mut node_value, start, source);
+    Some(node_value)
+}
+
+/// Recursively shift every `TokenRange` inside `node` by `base_offset`
+/// bytes, then rewrite `line` / `column` against the *full* `source`.
+/// Used after parsing an atom from a sliced source — the slice-local
+/// offsets need to be lifted onto the surrounding document.
+#[allow(dead_code)]
+fn translate_node_offsets(node: &mut Node, base_offset: usize, source: &str) {
+    let s = node.range.start.offset + base_offset;
+    let e = node.range.end.offset + base_offset;
+    node.range = range_from_offsets(source, s, e);
+    // Visit nested ranges that an atom can carry.
+    match node.expr.as_mut() {
+        Expr::Variable(path) | Expr::Reference { path, .. } => {
+            for k in path {
+                translate_token_key(k, base_offset, source);
+            }
+        }
+        Expr::Dict(pairs) => {
+            for (k, v) in pairs {
+                translate_token_key(k, base_offset, source);
+                translate_node_offsets(v, base_offset, source);
+            }
+        }
+        Expr::List(items) => {
+            for it in items {
+                translate_node_offsets(it, base_offset, source);
+            }
+        }
+        Expr::Spread(inner) => translate_node_offsets(inner, base_offset, source),
+        Expr::Binary(_, a, b) => {
+            translate_node_offsets(a, base_offset, source);
+            translate_node_offsets(b, base_offset, source);
+        }
+        Expr::Unary(_, inner) => translate_node_offsets(inner, base_offset, source),
+        Expr::Ternary { cond, then, els } => {
+            translate_node_offsets(cond, base_offset, source);
+            translate_node_offsets(then, base_offset, source);
+            translate_node_offsets(els, base_offset, source);
+        }
+        Expr::FnCall { path, args } => {
+            for k in path {
+                translate_token_key(k, base_offset, source);
+            }
+            for a in args {
+                translate_node_offsets(&mut a.value, base_offset, source);
+            }
+        }
+        Expr::FString(parts) => {
+            for p in parts {
+                if let crate::FStringPart::Interpolation(n) = p {
+                    translate_node_offsets(n, base_offset, source);
+                }
+            }
+        }
+        Expr::Where { expr, bindings } => {
+            translate_node_offsets(expr, base_offset, source);
+            translate_node_offsets(bindings, base_offset, source);
+        }
+        Expr::Match { expr, arms } => {
+            translate_node_offsets(expr, base_offset, source);
+            for (p, b) in arms {
+                translate_node_offsets(p, base_offset, source);
+                translate_node_offsets(b, base_offset, source);
+            }
+        }
+        Expr::Closure { body, .. } => translate_node_offsets(body, base_offset, source),
+        Expr::VariantCtor { body, .. } => translate_node_offsets(body, base_offset, source),
+        Expr::Comprehension {
+            element,
+            iterable,
+            condition,
+            ..
+        } => {
+            translate_node_offsets(element, base_offset, source);
+            translate_node_offsets(iterable, base_offset, source);
+            if let Some(c) = condition {
+                translate_node_offsets(c, base_offset, source);
+            }
+        }
+        Expr::Null
+        | Expr::Bool(_)
+        | Expr::Int(_)
+        | Expr::Float(_)
+        | Expr::String(_)
+        | Expr::Type(_)
+        | Expr::Wildcard => {}
+    }
+}
+
+#[allow(dead_code)]
+fn translate_token_key(key: &mut TokenKey, base_offset: usize, source: &str) {
+    match key {
+        TokenKey::String(_, r, _) => {
+            let s = r.start.offset + base_offset;
+            let e = r.end.offset + base_offset;
+            *r = range_from_offsets(source, s, e);
+        }
+        TokenKey::Spread(r) => {
+            let s = r.start.offset + base_offset;
+            let e = r.end.offset + base_offset;
+            *r = range_from_offsets(source, s, e);
+        }
+        TokenKey::Dynamic(inner, _) => translate_node_offsets(inner, base_offset, source),
+        TokenKey::Dummy | TokenKey::Index(_, _) => {}
+    }
+}
+
+/// Try to lower an `ast::Expr` to a legacy `Node` using the CST-walking
+/// path. Returns `None` when the construct is outside the currently-
+/// supported set (caller falls back to the legacy combinator chain).
+///
+/// Slice 1 supports: `Literal` (null / true / false / number / string),
+/// `Variable`, `Reference`, `Wildcard`. Composite forms (dict, list,
+/// binary, etc.) return `None` until later slices.
+#[allow(dead_code)]
+pub(crate) fn lower_expr_v2(expr: &ast::Expr, source: &str) -> Option<Node> {
+    match expr {
+        ast::Expr::Literal(lit) => lower_atom_via_legacy(lit.syntax(), source),
+        ast::Expr::Variable(v) => lower_atom_via_legacy(v.syntax(), source),
+        ast::Expr::Reference(r) => lower_atom_via_legacy(r.syntax(), source),
+        ast::Expr::Wildcard(w) => lower_atom_via_legacy(w.syntax(), source),
+        // Slice 1 stops here — every other construct will be wired in
+        // later slices. Returning `None` makes the caller fall back to
+        // the legacy combinator chain.
+        _ => None,
+    }
+}
+
+// Re-export marker for tests/consumers below.
+#[allow(dead_code)]
+pub(crate) fn first_real_error(parse: &Parse) -> Option<&crate::cst::ParseError> {
+    parse.errors.first()
+}
 
 /// Lower a successfully-parsed CST into a legacy [`crate::Node`] tree.
 ///
@@ -116,7 +341,7 @@ fn legacy_parse(source: &str) -> Result<crate::Node, ParseDocumentError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{cst, parse_document, Expr, NodeId};
+    use crate::{cst, parse_document, NodeId};
 
     /// Replace every [`NodeId`] in `node` with [`NodeId::SYNTHETIC`] so
     /// structural comparison is independent of allocation order. The
@@ -439,6 +664,93 @@ mod tests {
                 out.push(p);
             }
         }
+    }
+
+    /// Slice 1 (atoms): compare `lower_expr_v2` against the legacy
+    /// chain on every atomic root the grammar recognises. The helper
+    /// drives the typed `ast::Expr` wrapper directly so the assertion
+    /// catches divergence the moment one ships in slice 1's set.
+    fn assert_atom_lower_matches_legacy(source: &str) {
+        let parse = cst::parse_cst(source);
+        let doc = ast::document_of(parse.syntax()).expect("document");
+        let root = doc.root_expr().expect("root expr");
+        let v2 = lower_expr_v2(&root, source).expect("slice 1 supports this atom");
+        let legacy = crate::lower::legacy_parse(source).expect("legacy parse");
+        let mut a = v2;
+        let mut b = legacy;
+        // The legacy `parse_document` wraps the atom in an outer Node
+        // that owns leading directives / decorators / doc_comment.
+        // For slice 1 we only validate the inner `expr` + range —
+        // the outer-Node wrapping is slice 8's job.
+        strip_node_ids(&mut a);
+        strip_node_ids(&mut b);
+        assert_eq!(*a.expr, *b.expr, "expr diverged on {source:?}");
+        assert_eq!(a.range, b.range, "range diverged on {source:?}");
+    }
+
+    #[test]
+    fn slice1_lower_atoms_literal_null() {
+        assert_atom_lower_matches_legacy("null");
+    }
+
+    #[test]
+    fn slice1_lower_atoms_literal_bool() {
+        assert_atom_lower_matches_legacy("true");
+        assert_atom_lower_matches_legacy("false");
+    }
+
+    #[test]
+    fn slice1_lower_atoms_literal_int() {
+        assert_atom_lower_matches_legacy("42");
+        assert_atom_lower_matches_legacy("0x2a");
+        assert_atom_lower_matches_legacy("0o52");
+        assert_atom_lower_matches_legacy("0b101010");
+    }
+
+    #[test]
+    fn slice1_lower_atoms_literal_float() {
+        assert_atom_lower_matches_legacy("3.14");
+        assert_atom_lower_matches_legacy("1.0e10");
+    }
+
+    #[test]
+    fn slice1_lower_atoms_literal_string() {
+        assert_atom_lower_matches_legacy(r#""hello""#);
+        assert_atom_lower_matches_legacy(r#""hi\nworld""#);
+        assert_atom_lower_matches_legacy(r###"r#"raw"#"###);
+    }
+
+    #[test]
+    fn slice1_lower_atoms_variable() {
+        assert_atom_lower_matches_legacy("foo");
+        assert_atom_lower_matches_legacy("foo.bar");
+        assert_atom_lower_matches_legacy("foo.bar.baz");
+    }
+
+    #[test]
+    fn slice1_lower_atoms_reference() {
+        assert_atom_lower_matches_legacy("&root");
+        assert_atom_lower_matches_legacy("&sibling.x");
+        assert_atom_lower_matches_legacy("&root.a.b");
+    }
+
+    #[test]
+    fn slice1_lower_atoms_wildcard() {
+        // `*` isn't a legal root atom in the legacy parser (it only
+        // appears in match-arm pattern position), so we can't compare
+        // directly via `legacy_parse`. Validate the slice-1 walker on a
+        // synthetic WILDCARD node inside a match arm: the helper still
+        // produces `Expr::Wildcard` with a 1-byte range.
+        let parse = cst::parse_cst("{ f(x): x match { *: 0 } }");
+        // Walk descendants to find the wildcard.
+        let wildcard = parse
+            .syntax()
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::WILDCARD)
+            .expect("wildcard node");
+        let n =
+            lower_atom_via_legacy(&wildcard, "{ f(x): x match { *: 0 } }").expect("lower wildcard");
+        assert!(matches!(*n.expr, Expr::Wildcard));
     }
 
     /// `parse_document` (the public entry) now goes through CST first.
