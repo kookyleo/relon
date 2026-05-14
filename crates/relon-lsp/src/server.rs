@@ -166,14 +166,17 @@ impl DocumentStore {
 /// Parse + analyze a source, packaging the result for the document
 /// store. `root` and `tree` are wrapped in `Arc` so request handlers
 /// can hold them without a lifetime tied to `&ServerState`.
+///
+/// Parsing routes through [`relon_parser::parse_document_recovering`]
+/// so an in-progress edit still produces a usable partial AST.
+/// Completion / hover / goto-def get scope-aware behaviour even
+/// while the user is mid-statement; parse diagnostics still surface
+/// separately through [`compute_diagnostics`].
 fn build_entry(source: String) -> DocumentEntry {
-    let root = match parse_document(&source) {
-        Ok(node) => Arc::new(node),
-        Err(_) => {
-            // Synthesize an empty dict so the entry is still usable
-            // (diagnostics handle the parse error separately).
-            Arc::new(empty_document())
-        }
+    let parsed = relon_parser::parse_document_recovering(&source);
+    let root = match parsed.nodes.into_iter().next() {
+        Some(node) => Arc::new(node),
+        None => Arc::new(empty_document()),
     };
     let tree = Arc::new(analyze(&root));
     DocumentEntry { source, root, tree }
