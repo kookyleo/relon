@@ -1070,10 +1070,12 @@ impl<'a> Parser<'a> {
                 }
             }
             Some(SyntaxKind::IDENT) => {
-                // `null` / `true` / `false` are keyword-shaped
-                // literals but lex as IDENT — promote here.
+                // `null` / `true` / `false` / `Infinity` / `NaN` are
+                // keyword-shaped literals but lex as IDENT — promote
+                // here so the lowering can decode them via the LITERAL
+                // walker (which dispatches on the inner token text).
                 let text = self.tokens[self.pos_skip_trivia()].1;
-                if matches!(text, "null" | "true" | "false") {
+                if matches!(text, "null" | "true" | "false" | "Infinity" | "NaN") {
                     self.open(SyntaxKind::LITERAL);
                     self.bump();
                     self.close();

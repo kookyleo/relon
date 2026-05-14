@@ -14,7 +14,6 @@ homepage = "https://github.com/kookyleo/relon"
 description = "A programmable configuration language that extends JSON"
 
 [workspace.dependencies]
-winnow = "0.6"
 ordered-float = { version = "4.2", features = ["serde"] }
 memchr = "2.7"
 thiserror = "2"

@@ -6,15 +6,14 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 description = "The core parser for the Relon language"
-keywords = ["parser", "dsl", "json", "winnow", "config"]
+keywords = ["parser", "dsl", "json", "rowan", "config"]
 categories = ["parser-implementations", "config"]
 
 [dependencies]
-winnow.workspace = true
 ordered-float.workspace = true
 memchr.workspace = true
 miette = { workspace = true }
-# v2 lossless CST — rowan is the rust-analyzer-grade green/red-tree
+# Lossless CST — rowan is the rust-analyzer-grade green/red-tree
 # library used across the Rust tooling ecosystem (matklad et al.).
 rowan = "0.15"
 

@@ -2,36 +2,14 @@
 
 pub mod ast;
 pub mod cst;
-pub mod decorator;
 pub mod directive;
-pub mod expr;
-pub mod fmt_string;
-pub mod fn_call;
-pub mod id;
 pub mod lex;
 pub mod lower;
-pub mod prim;
-pub mod reference_var;
 pub mod source;
-pub mod structure;
 pub mod syntax;
 pub mod token;
-pub mod var;
 
-pub use expr::child_nodes;
 pub use token::*;
-
-use winnow::ascii::{multispace0, multispace1};
-use winnow::combinator::{alt, repeat};
-use winnow::prelude::*;
-use winnow::stream::{Location, Stream};
-
-use crate::prim::boolean::parse_bool;
-use crate::prim::null::parse_null;
-use crate::prim::number::parse_number;
-use crate::prim::string::parse_string;
-
-pub type Span<'a> = winnow::LocatingSlice<&'a str>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParseDocumentError {
@@ -65,89 +43,76 @@ impl ParseDocumentError {
 
 /// Parse a Relon document into the legacy [`Node`] tree.
 ///
-/// Post-P4 the entry point routes every call through the rowan CST
-/// ([`cst::parse_cst`]) first, then hands off to [`lower::lower_document`]
-/// for the typed-tree construction. The CST is the single source of
-/// truth for what input the parser accepts; downstream consumers
-/// (analyzer / evaluator / fmt / wasm / lsp / cli) keep seeing the same
-/// `Node` / `Expr` shape they did pre-P4. See [`lower`] for the
-/// migration design note.
+/// The entry point routes every call through the rowan CST
+/// ([`cst::parse_cst`]) first, then hands off to
+/// [`lower::lower_document`] for the typed-tree construction. The
+/// CST is the single source of truth for what input the parser
+/// accepts; downstream consumers (analyzer / evaluator / fmt / wasm
+/// / lsp / cli) keep seeing the same `Node` / `Expr` shape they did
+/// pre-rowan-rewrite. See [`lower`] for the migration design note.
 pub fn parse_document(source: &str) -> Result<Node, ParseDocumentError> {
     let parse = cst::parse_cst(source);
     lower::lower_document(&parse, source)
 }
 
-/// Parse zero or more spaces or comments.
-pub fn soc0<'a>(input: &mut Span<'a>) -> ModalResult<Vec<&'a str>> {
-    repeat(
-        0..,
-        alt((multispace1.map(|s: &str| s), comment.map(|s: &str| s))),
-    )
-    .parse_next(input)
-}
-
-/// Parse zero or more spaces (no comments).
-pub fn ws0<'a>(input: &mut Span<'a>) -> ModalResult<Vec<&'a str>> {
-    repeat(0.., multispace1.map(|s: &str| s)).parse_next(input)
-}
-
-/// Extract leading comments as a single doc string. Consumes all preceding
-/// spaces and comments up to the next non-trivia token.
-pub fn parse_leading_comments<'a>(input: &mut Span<'a>) -> ModalResult<Option<String>> {
-    let mut comments = Vec::new();
+/// Extract leading comments as a single doc string. Walks the byte
+/// prefix of `source` consuming whitespace + `//` line / `/* */`
+/// block comments until the first non-trivia byte. Returns the
+/// joined doc-comment text (if any) plus the number of bytes
+/// consumed — callers use the count to advance their cursor.
+pub fn parse_leading_comments(source: &str) -> (Option<String>, usize) {
+    let bytes = source.as_bytes();
+    let mut i = 0;
+    let mut comments: Vec<String> = Vec::new();
     loop {
-        let _ = multispace0.parse_next(input)?;
-        let checkpoint = input.checkpoint();
-        if let Ok(c) = comment.parse_next(input) {
-            comments.push(c.trim().to_string());
-        } else {
-            input.reset(&checkpoint);
-            break;
+        // Skip whitespace.
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
         }
+        // Try a `//` line comment.
+        if i + 2 <= bytes.len() && &bytes[i..i + 2] == b"//" {
+            let start = i + 2;
+            let mut end = start;
+            while end < bytes.len() && bytes[end] != b'\n' && bytes[end] != b'\r' {
+                end += 1;
+            }
+            comments.push(source[start..end].trim().to_string());
+            i = end;
+            continue;
+        }
+        // Try a `/* ... */` block comment.
+        if i + 2 <= bytes.len() && &bytes[i..i + 2] == b"/*" {
+            let start = i + 2;
+            let mut end = start;
+            while end + 1 < bytes.len() && !(bytes[end] == b'*' && bytes[end + 1] == b'/') {
+                end += 1;
+            }
+            comments.push(source[start..end].trim().to_string());
+            if end + 1 < bytes.len() {
+                i = end + 2;
+            } else {
+                i = bytes.len();
+            }
+            continue;
+        }
+        break;
     }
-    if comments.is_empty() {
-        Ok(None)
+    let joined = if comments.is_empty() {
+        None
     } else {
-        Ok(Some(comments.join("\n")))
-    }
+        Some(comments.join("\n"))
+    };
+    (joined, i)
 }
 
-/// Parse single-line or multi-line comments.
-pub fn comment<'a>(input: &mut Span<'a>) -> ModalResult<&'a str> {
-    alt((line_comment, block_comment)).parse_next(input)
-}
-
-fn line_comment<'a>(input: &mut Span<'a>) -> ModalResult<&'a str> {
-    ("//", winnow::token::take_till(0.., ('\n', '\r')))
-        .map(|(_, s)| s)
-        .parse_next(input)
-}
-
-fn block_comment<'a>(input: &mut Span<'a>) -> ModalResult<&'a str> {
-    ("/*", winnow::token::take_until(0.., "*/"), "*/")
-        .map(|(_, s, _)| s)
-        .parse_next(input)
-}
-
-pub fn create_range(input: &Span<'_>, start_offset: usize, end_offset: usize) -> TokenRange {
-    TokenRange {
-        start: position_at(input, start_offset),
-        end: position_at(input, end_offset),
-    }
-}
-
+/// Combine two `TokenRange`s — start from `start.start`, end from
+/// `end.end`. Used by binary-expression lowering to compute the
+/// operand-bounded range.
 pub fn combine_ranges(start: TokenRange, end: TokenRange) -> TokenRange {
     TokenRange {
         start: start.start,
         end: end.end,
     }
-}
-
-fn position_at(input: &Span<'_>, offset: usize) -> TokenPosition {
-    let mut full_input = *input;
-    full_input.reset_to_start();
-    let source = *full_input.as_ref();
-    position_at_source(source, offset)
 }
 
 pub(crate) fn position_at_source(source: &str, offset: usize) -> TokenPosition {
@@ -189,96 +154,90 @@ pub(crate) fn position_at_source(source: &str, offset: usize) -> TokenPosition {
     }
 }
 
-pub fn parse_prim<'a>(input: &mut Span<'a>) -> ModalResult<Node> {
-    alt((parse_null, parse_bool, parse_number, parse_string)).parse_next(input)
-}
-
-/// Parse the root base which consists of optional decorators / directives
-/// and a root List or Dict. `@decorator` and `#directive` lines may
-/// interleave above the body in any order; both lists are kept in source
-/// order on the produced [`Node`]. Standalone `#directive` lines that
-/// appear *inside* the root dict's `{...}` are also collected and
-/// merged onto the node's `directives` list — that way root-level
-/// schemas / imports may live either above the dict or among its
-/// entries.
-pub fn parse_base<'a>(input: &mut Span<'a>) -> ModalResult<Node> {
-    let doc_comment = parse_leading_comments(input)?;
-    let (decorators, mut directives) = parse_attributes(input)?;
-    soc0(input)?;
-    let start_offset = decorators
-        .first()
-        .map(|d| d.range.start.offset)
-        .or_else(|| directives.first().map(|d| d.range.start.offset))
-        .unwrap_or_else(|| input.location());
-
-    // v1.2: root may be any expression, not just `dict` / `list`
-    // literals. The full expr precedence chain (`parse_expr`)
-    // includes both as atomics, so this stays a strict superset of
-    // the old behavior; atomic / variant / arithmetic / fn-call
-    // roots become legal as well. JSON-shape conformance of the
-    // final value is enforced by `#main(...) -> ReturnType` (when
-    // declared) or by the host's projector — the parser no longer
-    // rejects them eagerly.
-    let root = crate::expr::parse_expr.parse_next(input)?;
-
-    // Only Dict roots have inner standalone directives that the
-    // dict parser hoists onto its node — list / atomic / call /
-    // variant roots carry no such inner directives, so merging
-    // would only ever be a noop on them. Guard the merge to avoid
-    // implying otherwise.
-    if matches!(root.expr.as_ref(), Expr::Dict(_)) {
-        directives.extend(root.directives);
-    }
-
-    let end_offset = input.location();
-    let range = create_range(input, start_offset, end_offset);
-
-    Ok(Node {
-        id: NodeId::alloc(),
-        expr: root.expr,
-        decorators,
-        directives,
-        type_hint: None,
-        range,
-        doc_comment,
-    })
-}
-
-/// Parse zero or more interleaved `@decorator` / `#directive` lines and
-/// return them split into the two ordered lists. Used wherever a stack
-/// of attributes can precede a node (root, dict field, etc.).
-pub fn parse_attributes<'a>(input: &mut Span<'a>) -> ModalResult<(Vec<Decorator>, Vec<Directive>)> {
-    let mut decorators = Vec::new();
-    let mut directives = Vec::new();
-    loop {
-        soc0(input)?;
-        let peek = input.as_ref().chars().next();
-        match peek {
-            Some('@') => {
-                let dec = decorator::parse_decorator(input)?;
-                decorators.push(dec);
+/// Yield the expression-shaped child nodes of `node` for AST walkers
+/// (analyzer passes, LSP enclosing-scope lookups, ...). Decorators,
+/// directives, and type hints are intentionally *not* included — those
+/// have their own dedicated walkers that need different semantics.
+pub fn child_nodes(node: &Node) -> Vec<&Node> {
+    let mut out = Vec::new();
+    match &*node.expr {
+        Expr::Dict(pairs) => {
+            for (_, value) in pairs {
+                out.push(value);
             }
-            Some('#') => {
-                let dir = directive::parse_directive(input)?;
-                directives.push(dir);
-            }
-            _ => break,
         }
+        Expr::List(items) => out.extend(items.iter()),
+        Expr::Spread(inner) => out.push(inner),
+        Expr::Comprehension {
+            element,
+            iterable,
+            condition,
+            ..
+        } => {
+            out.push(element);
+            out.push(iterable);
+            if let Some(cond) = condition {
+                out.push(cond);
+            }
+        }
+        Expr::Binary(_, l, r) => {
+            out.push(l);
+            out.push(r);
+        }
+        Expr::Unary(_, inner) => out.push(inner),
+        Expr::Ternary { cond, then, els } => {
+            out.push(cond);
+            out.push(then);
+            out.push(els);
+        }
+        Expr::FnCall { args, .. } => {
+            for arg in args {
+                out.push(&arg.value);
+            }
+        }
+        Expr::FString(parts) => {
+            for part in parts {
+                if let crate::FStringPart::Interpolation(n) = part {
+                    out.push(n);
+                }
+            }
+        }
+        Expr::Where { expr, bindings } => {
+            out.push(expr);
+            out.push(bindings);
+        }
+        Expr::Match { expr, arms } => {
+            out.push(expr);
+            for (pat, body) in arms {
+                out.push(pat);
+                out.push(body);
+            }
+        }
+        Expr::Closure { body, .. } => out.push(body),
+        Expr::VariantCtor { body, .. } => out.push(body),
+        Expr::Reference { .. }
+        | Expr::Variable(_)
+        | Expr::Type(_)
+        | Expr::Wildcard
+        | Expr::Null
+        | Expr::Bool(_)
+        | Expr::Int(_)
+        | Expr::Float(_)
+        | Expr::String(_) => {}
     }
-    Ok((decorators, directives))
+    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
     fn test_comments() {
-        let mut s = Span::new(
-            r##"/* hello world */
+        let src = r##"/* hello world */
 // this is a test file
-{}"##,
-        );
-        let node = parse_base(&mut s).unwrap();
+{}"##;
+        let node = parse_document(src).unwrap();
         assert!(matches!(*node.expr, Expr::Dict(_)));
     }
 
@@ -329,35 +288,15 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_prim() {
-        let mut s = Span::new("true");
-        assert!(matches!(
-            *parse_prim(&mut s).unwrap().expr,
-            Expr::Bool(true)
-        ));
-
-        let mut s = Span::new("null");
-        assert!(matches!(*parse_prim(&mut s).unwrap().expr, Expr::Null));
-
-        let mut s = Span::new("1");
-        assert!(matches!(*parse_prim(&mut s).unwrap().expr, Expr::Int(1)));
-
-        let mut s = Span::new("\"foo\"");
-        assert!(matches!(*parse_prim(&mut s).unwrap().expr, Expr::String(_)));
-    }
-
-    #[test]
     fn test_simple_root() {
-        let mut s = Span::new(r#"{ "a": 1 }"#);
-        let node = parse_base(&mut s).unwrap();
+        let node = parse_document(r#"{ "a": 1 }"#).unwrap();
         if let Expr::Dict(pairs) = *node.expr {
             assert_eq!(pairs.len(), 1);
         } else {
             panic!()
         }
 
-        let mut s = Span::new("// comment \n {foo: 1, bar: 2,}");
-        let node = parse_base(&mut s).unwrap();
+        let node = parse_document("// comment \n {foo: 1, bar: 2,}").unwrap();
         if let Expr::Dict(pairs) = *node.expr {
             assert_eq!(pairs.len(), 2);
         } else {
@@ -367,8 +306,7 @@ mod tests {
 
     #[test]
     fn test_expr_integration() {
-        let mut s = Span::new(r#"{ "a": 1 != 2 }"#);
-        let node = parse_base(&mut s).unwrap();
+        let node = parse_document(r#"{ "a": 1 != 2 }"#).unwrap();
         if let Expr::Dict(pairs) = *node.expr {
             assert!(matches!(*pairs[0].1.expr, Expr::Binary(Operator::Ne, _, _)));
         } else {
@@ -378,21 +316,20 @@ mod tests {
 
     #[test]
     fn test_comment_decorator_integration() {
-        let mut s = Span::new(
+        let node = parse_document(
             r###"
                 // foo decorator
                 @foo
                 { "a": 1 }"###,
-        );
-        let node = parse_base(&mut s).unwrap();
+        )
+        .unwrap();
         assert_eq!(node.decorators.len(), 1);
         assert_eq!(node.decorators[0].path[0].to_string_key(), "foo");
     }
 
     #[test]
     fn test_list_integration() {
-        let mut s = Span::new(r#"[1, 2, 3]"#);
-        let node = parse_base(&mut s).unwrap();
+        let node = parse_document(r#"[1, 2, 3]"#).unwrap();
         if let Expr::List(elements) = *node.expr {
             assert_eq!(elements.len(), 3);
         } else {
@@ -402,8 +339,7 @@ mod tests {
 
     #[test]
     fn test_ref_dict() {
-        let mut s = Span::new(r#"{ "a": &sibling.b, "b": 2 }"#);
-        let node = parse_base(&mut s).unwrap();
+        let node = parse_document(r#"{ "a": &sibling.b, "b": 2 }"#).unwrap();
         if let Expr::Dict(pairs) = *node.expr {
             assert_eq!(pairs.len(), 2);
             assert!(matches!(
@@ -420,8 +356,7 @@ mod tests {
 
     #[test]
     fn test_ref_list() {
-        let mut s = Span::new(r#"[&sibling.b[1], 2]"#);
-        let node = parse_base(&mut s).unwrap();
+        let node = parse_document(r#"[&sibling.b[1], 2]"#).unwrap();
         if let Expr::List(elements) = *node.expr {
             assert_eq!(elements.len(), 2);
         } else {
@@ -431,8 +366,7 @@ mod tests {
 
     #[test]
     fn test_var_list() {
-        let mut s = Span::new(r#"[a, 2]"#);
-        let node = parse_base(&mut s).unwrap();
+        let node = parse_document(r#"[a, 2]"#).unwrap();
         if let Expr::List(elements) = *node.expr {
             assert!(matches!(*elements[0].expr, Expr::Variable(_)));
         } else {
@@ -442,8 +376,7 @@ mod tests {
 
     #[test]
     fn test_fn_call_list() {
-        let mut s = Span::new(r#"[f({a: 1}), 2]"#);
-        let node = parse_base(&mut s).unwrap();
+        let node = parse_document(r#"[f({a: 1}), 2]"#).unwrap();
         if let Expr::List(elements) = *node.expr {
             assert!(matches!(*elements[0].expr, Expr::FnCall { .. }));
         } else {
@@ -453,8 +386,7 @@ mod tests {
 
     #[test]
     fn test_fmt_string_list() {
-        let mut s = Span::new(r#"[f"a ${ &sibling.b[1] }", "b"]"#);
-        let node = parse_base(&mut s).unwrap();
+        let node = parse_document(r#"[f"a ${ &sibling.b[1] }", "b"]"#).unwrap();
         if let Expr::List(elements) = *node.expr {
             assert!(matches!(*elements[0].expr, Expr::FString(_)));
         } else {
@@ -464,19 +396,7 @@ mod tests {
 
     #[test]
     fn test_root_ref_in_fmt_string_dict() {
-        let mut s = Span::new(r#"{ "a": f"a ${ &root.b[0] }", "b": [0, 1] }"#);
-        let _node = parse_base(&mut s).unwrap();
-        assert!(parse_base(&mut Span::new(
-            r#"{ "a": f"a ${ &root.b[0] }", "b": [0, 1] }"#
-        ))
-        .is_ok());
-    }
-
-    #[test]
-    fn test_soc0() {
-        let mut s = Span::new("  // comment\n  /* block */  ");
-        let res = soc0(&mut s).unwrap();
-        assert_eq!(res.len(), 5); // space, comment, space, block, space
+        assert!(parse_document(r#"{ "a": f"a ${ &root.b[0] }", "b": [0, 1] }"#).is_ok());
     }
 
     #[test]
@@ -497,20 +417,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_comments_detailed() {
-        let mut s = Span::new("// line comment\n");
-        assert_eq!(comment(&mut s).unwrap(), " line comment");
-
-        let mut s = Span::new("/* block comment */");
-        assert_eq!(comment(&mut s).unwrap(), " block comment ");
-    }
-
-    /// v1.2: `parse_base` accepts any expression as the root, not
-    /// just `dict` / `list` literals. The chain through `parse_expr`
-    /// already covers the full precedence ladder, so each of these
-    /// forms must reach `parse_document` without trailing-input
-    /// errors and produce the corresponding `Expr` head.
+    /// v1.2: root may be any expression, not just `dict` / `list`
+    /// literals — the parser accepts atomic / variant / arithmetic /
+    /// fn-call roots as well.
     #[test]
     fn test_root_accepts_atomic_literals() {
         let node = parse_document("42").unwrap();

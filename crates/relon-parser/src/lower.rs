@@ -68,9 +68,7 @@
 use crate::ast;
 use crate::cst::Parse;
 use crate::syntax::{SyntaxKind, SyntaxNode};
-use crate::{position_at_source, Expr, Node, ParseDocumentError, RefBase, Span, TokenKey, TokenRange};
-#[cfg(test)]
-use {crate::parse_base, winnow::stream::Location};
+use crate::{position_at_source, Expr, Node, ParseDocumentError, RefBase, TokenKey, TokenRange};
 
 // =====================================================================
 // P6 progress notes
@@ -402,6 +400,14 @@ fn lower_literal_v2(node: &SyntaxNode, source: &str) -> Option<Node> {
             "null" => Some(Node::new(Expr::Null, range)),
             "true" => Some(Node::new(Expr::Bool(true), range)),
             "false" => Some(Node::new(Expr::Bool(false), range)),
+            "Infinity" => Some(Node::new(
+                Expr::Float(ordered_float::OrderedFloat(f64::INFINITY)),
+                range,
+            )),
+            "NaN" => Some(Node::new(
+                Expr::Float(ordered_float::OrderedFloat(f64::NAN)),
+                range,
+            )),
             _ => None,
         },
         SyntaxKind::NUMBER => {
@@ -1704,6 +1710,18 @@ fn lower_schema_method(
         body = Some(Box::new(lower_expr_v2(&e, source)?));
     }
 
+    // Legacy parser enforced two shape rules:
+    //   * Non-native methods must have a body (else surface as parse
+    //     error).
+    //   * `#native` methods must NOT have a body — the host owns the
+    //     implementation.
+    if is_native && body.is_some() {
+        return None;
+    }
+    if !is_native && body.is_none() {
+        return None;
+    }
+
     let (name, name_range) = name?;
     let return_type = return_type?;
     Some((
@@ -2272,11 +2290,12 @@ fn lower_unary_expr_v2(node: &SyntaxNode, source: &str) -> Option<Node> {
         SyntaxKind::MINUS => crate::Operator::Sub,
         SyntaxKind::BANG => crate::Operator::Not,
         SyntaxKind::PLUS => {
-            // Legacy `parse_unary` only emits `!` and `-` — a bare
-            // unary `+` would have been swallowed without producing
-            // an Expr::Unary wrapper. Match that by returning the
-            // operand directly.
-            return Some(operand);
+            // Legacy `parse_unary` only emits `!` and `-` as unary
+            // ops. A leading `+` followed by whitespace + a number
+            // (`+ 1`) is rejected — the legacy parser treats the `+`
+            // as a stray token. Match that by failing the lowering;
+            // `lower_document` surfaces this as a typed parse error.
+            return None;
         }
         _ => return None,
     };
@@ -2324,8 +2343,40 @@ fn lower_dict_v2(node: &SyntaxNode, source: &str) -> Option<Node> {
     let end: usize = node.text_range().end().into();
     let mut pairs: Vec<(TokenKey, Node)> = Vec::new();
     let mut standalone_directives: Vec<crate::Directive> = Vec::new();
-
-    for field in node.children().filter(|c| c.kind() == SyntaxKind::DICT_FIELD) {
+    let fields: Vec<SyntaxNode> = node
+        .children()
+        .filter(|c| c.kind() == SyntaxKind::DICT_FIELD)
+        .collect();
+    let total = fields.len();
+    for (idx, field) in fields.into_iter().enumerate() {
+        // Detect a completely empty DICT_FIELD (the CST emits one
+        // between two commas, e.g. `{ a: 1, , b: 2 }`). The legacy
+        // `separated(0.., parse_pair, ...)` rejected this directly.
+        // A trailing empty field (after the last comma) is fine —
+        // that's the standard trailing-comma form.
+        let is_empty = field
+            .children_with_tokens()
+            .filter_map(|el| match el {
+                rowan::NodeOrToken::Token(t) => Some(t),
+                rowan::NodeOrToken::Node(_) => None,
+            })
+            .all(|t| {
+                matches!(
+                    t.kind(),
+                    SyntaxKind::WHITESPACE
+                        | SyntaxKind::LINE_COMMENT
+                        | SyntaxKind::BLOCK_COMMENT
+                )
+            })
+            && field.children().next().is_none();
+        if is_empty {
+            if idx + 1 == total {
+                // Trailing empty field — accept and skip.
+                continue;
+            }
+            // Mid-list empty field — malformed (`, ,`).
+            return None;
+        }
         match lower_dict_field(&field, source)? {
             DictFieldOut::Pair(k, v) => pairs.push((k, v)),
             DictFieldOut::Directives(dirs) => standalone_directives.extend(dirs),
@@ -2383,12 +2434,8 @@ fn lower_dict_field(node: &SyntaxNode, source: &str) -> Option<DictFieldOut> {
     if let Some(end_off) = first_non_trivia_offset {
         if end_off > field_start {
             let leading_slice = &source[field_start..end_off];
-            let mut leading_span = Span::new(leading_slice);
-            use winnow::Parser as _;
-            doc_comment = crate::parse_leading_comments
-                .parse_next(&mut leading_span)
-                .ok()
-                .flatten();
+            let (text, _) = crate::parse_leading_comments(leading_slice);
+            doc_comment = text;
         }
     }
 
@@ -3392,12 +3439,7 @@ pub(crate) fn lower_document_node_v2(doc: &ast::Document, source: &str) -> Optio
     //    combinator on the byte prefix up to the first non-trivia
     //    offset.
     let leading_slice = source.get(0..start_offset).unwrap_or("");
-    let mut leading_span = Span::new(leading_slice);
-    use winnow::Parser as _;
-    let doc_comment = crate::parse_leading_comments
-        .parse_next(&mut leading_span)
-        .ok()
-        .flatten();
+    let (doc_comment, _) = crate::parse_leading_comments(leading_slice);
 
     // 6. Compute the document-level range. Legacy `parse_base` takes
     //    `end_offset` from the parser position after the root —
@@ -3534,36 +3576,6 @@ fn first_error_offset(node: &SyntaxNode) -> Option<usize> {
         .map(|n| usize::from(n.text_range().start()))
 }
 
-/// Run the legacy winnow combinator chain on `source`. Mirrors the
-/// pre-P4 body of [`crate::parse_document`] exactly so the produced
-/// `Node` is byte-identical to what callers got before.
-///
-/// P5: no longer wired into [`lower_document`]; the public entry now
-/// runs the v2 path exclusively. Kept around so slice-level parity
-/// tests can keep cross-checking per-construct legacy output without
-/// reaching for `parse_base` directly.
-#[cfg(test)]
-fn legacy_parse(source: &str) -> Result<crate::Node, ParseDocumentError> {
-    let mut input = Span::new(source);
-    let node = parse_base(&mut input).map_err(|error| ParseDocumentError::Parse {
-        offset: input.location(),
-        message: format!("{error:?}"),
-    })?;
-    crate::soc0(&mut input).map_err(|error| ParseDocumentError::Parse {
-        offset: input.location(),
-        message: format!("{error:?}"),
-    })?;
-    if input.is_empty() {
-        Ok(node)
-    } else {
-        let remaining = input.to_string();
-        let remaining = remaining.chars().take(64).collect();
-        Err(ParseDocumentError::TrailingInput {
-            offset: input.location(),
-            remaining,
-        })
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -3571,14 +3583,10 @@ mod tests {
     use crate::{cst, parse_document, NodeId};
 
     /// Replace every [`NodeId`] in `node` with [`NodeId::SYNTHETIC`] so
-    /// structural comparison is independent of allocation order. The
-    /// `NodeId::alloc()` counter is a process-global `AtomicU32`, so two
-    /// successful parses of the same source produce different IDs even
-    /// when the tree shape is identical.
+    /// structural comparison is independent of allocation order.
+    #[allow(dead_code)]
     fn strip_node_ids(node: &mut crate::Node) {
         node.id = NodeId::SYNTHETIC;
-        // Recurse into children — every Expr variant that carries a
-        // Node needs visiting.
         match node.expr.as_mut() {
             Expr::Dict(pairs) => {
                 for (key, value) in pairs {
@@ -3661,7 +3669,6 @@ mod tests {
             | Expr::Type(_)
             | Expr::Wildcard => {}
         }
-        // Decorator / directive arguments and bodies carry Nodes too.
         for dec in &mut node.decorators {
             for arg in &mut dec.args {
                 strip_node_ids(&mut arg.value);
@@ -3685,153 +3692,20 @@ mod tests {
         }
     }
 
-    /// Drive a corpus comparison: every successful `parse_document`
-    /// path goes through CST first (via the new `parse_document`), so
-    /// the legacy invocation here is just an equality cross-check
-    /// against the same path. Once true CST-walking lowering ships,
-    /// this helper guards against regressions per fixture.
-    fn assert_lowered_matches_legacy(source: &str) {
-        let direct = crate::lower::legacy_parse(source).expect("legacy parse");
-        let parse = cst::parse_cst(source);
-        let lowered = lower_document(&parse, source).expect("lower");
-        let mut a = direct;
-        let mut b = lowered;
-        strip_node_ids(&mut a);
-        strip_node_ids(&mut b);
-        assert_eq!(a, b, "lowered tree diverged from legacy on {source:?}");
-    }
-
     #[test]
     fn lowering_detects_cst_error_descendant() {
         let parse = cst::parse_cst("{ broken @ # }");
-        // Whether or not the CST is fatal-gating for now, we still
-        // surface its ERROR descendants for the future tightening of
-        // `lower_document`.
         assert!(parse.has_errors() || has_error_descendant(&parse.syntax()));
         assert!(first_error_offset(&parse.syntax()).is_some() || parse.has_errors());
     }
 
+    /// Every checked-in fixture that the parser accepts must lower
+    /// without panicking, and the resulting Node must round-trip
+    /// through `strip_node_ids` cleanly. The CST is the single source
+    /// of truth for what's accepted; no per-construct parity guard is
+    /// needed because the legacy combinator chain is gone.
     #[test]
-    fn lowering_matches_legacy_for_simple_dict() {
-        assert_lowered_matches_legacy("{ a: 1, b: 2 }");
-    }
-
-    #[test]
-    fn lowering_matches_legacy_for_nested_dict() {
-        assert_lowered_matches_legacy("{ a: { b: { c: 1 } }, xs: [1, 2, 3] }");
-    }
-
-    #[test]
-    fn lowering_matches_legacy_for_schema() {
-        assert_lowered_matches_legacy(
-            "#schema User { String name: *, Int age: * }\n{ name: \"a\", age: 1 }",
-        );
-    }
-
-    #[test]
-    fn lowering_matches_legacy_for_main_directive() {
-        assert_lowered_matches_legacy("#main(User u, Cart cart) -> Result<Order>\n{ x: 1 }");
-    }
-
-    #[test]
-    fn lowering_matches_legacy_for_import_directive() {
-        assert_lowered_matches_legacy("#import string from \"std/string\"\n{ x: 1 }");
-    }
-
-    #[test]
-    fn lowering_matches_legacy_for_closure() {
-        assert_lowered_matches_legacy("{ add(Int a, Int b): a + b }");
-    }
-
-    #[test]
-    fn lowering_matches_legacy_for_f_string() {
-        assert_lowered_matches_legacy(r#"{ msg: f"hello ${name}!" }"#);
-    }
-
-    #[test]
-    fn lowering_matches_legacy_for_match() {
-        assert_lowered_matches_legacy("{ render(item): item match { Int: 1, String: 2, * : 0 } }");
-    }
-
-    #[test]
-    fn lowering_matches_legacy_for_where() {
-        assert_lowered_matches_legacy("{ x: a + b where { a: 1, b: 2 } }");
-    }
-
-    #[test]
-    fn lowering_matches_legacy_for_comprehension() {
-        assert_lowered_matches_legacy("{ xs: [x * 2 for x in src if x > 0] }");
-    }
-
-    #[test]
-    fn lowering_matches_legacy_for_ternary() {
-        assert_lowered_matches_legacy("{ x: a ? 1 : 2 }");
-    }
-
-    #[test]
-    fn lowering_matches_legacy_for_references() {
-        assert_lowered_matches_legacy("{ a: &root.x[0], b: &sibling.y }");
-    }
-
-    #[test]
-    fn lowering_matches_legacy_for_fn_call() {
-        assert_lowered_matches_legacy("{ x: range(0, 10), y: map(f=g) }");
-    }
-
-    #[test]
-    fn lowering_matches_legacy_for_decorator() {
-        assert_lowered_matches_legacy("@brand(Color)\n{ r: 1, g: 2, b: 3 }");
-    }
-
-    #[test]
-    fn lowering_matches_legacy_for_doc_comment() {
-        assert_lowered_matches_legacy(
-            "{\n    // outer doc\n    a: 1,\n    /* inner */\n    b: 2\n}",
-        );
-    }
-
-    #[test]
-    fn lowering_matches_legacy_for_spread() {
-        assert_lowered_matches_legacy("{ a: 1, ...base }");
-    }
-
-    #[test]
-    fn lowering_matches_legacy_for_unary() {
-        assert_lowered_matches_legacy("{ x: -1, y: !true }");
-    }
-
-    #[test]
-    fn lowering_matches_legacy_for_binary_chain() {
-        assert_lowered_matches_legacy("{ x: 1 + 2 * 3 - 4 / 2 }");
-    }
-
-    #[test]
-    fn lowering_matches_legacy_for_variant_ctor() {
-        assert_lowered_matches_legacy("{ x: Result.Ok { value: 1 } }");
-    }
-
-    #[test]
-    fn lowering_matches_legacy_for_root_atom() {
-        assert_lowered_matches_legacy("42");
-        assert_lowered_matches_legacy(r#""hello""#);
-        assert_lowered_matches_legacy("true");
-        assert_lowered_matches_legacy("null");
-    }
-
-    #[test]
-    fn lowering_matches_legacy_for_root_list() {
-        assert_lowered_matches_legacy("[1, 2, 3]");
-    }
-
-    /// Validate against the full checked-in fixture corpus that the new
-    /// `parse_document` path (CST-first) produces the same `Node` as
-    /// the pre-P4 legacy path for every file that legacy already
-    /// accepts. The CST may reject inputs the legacy parser accepted
-    /// (or vice-versa) on the long tail; those go through the
-    /// inequality branch and are tolerated — the bulk corpus is the
-    /// invariant.
-    #[test]
-    fn corpus_lowering_round_trip() {
+    fn corpus_lowering_succeeds() {
         use std::fs;
         use std::path::PathBuf;
 
@@ -3845,7 +3719,6 @@ mod tests {
         walk(&workspace_root, &mut files);
         files.retain(|p| !p.to_string_lossy().contains("/target/"));
         let mut checked = 0usize;
-        let mut divergent = 0usize;
         for path in files {
             let Ok(source) = fs::read_to_string(&path) else {
                 continue;
@@ -3853,151 +3726,17 @@ mod tests {
             if source.is_empty() {
                 continue;
             }
-            // Compare only when both paths succeed — the rare cases
-            // where one accepts and the other rejects fall outside
-            // this P4 invariant (LSP/IDE work in P5 handles those).
-            let direct = legacy_parse(&source);
-            let lowered = lower_document(&cst::parse_cst(&source), &source);
-            match (direct, lowered) {
-                (Ok(mut a), Ok(mut b)) => {
-                    checked += 1;
-                    strip_node_ids(&mut a);
-                    strip_node_ids(&mut b);
-                    if a != b {
-                        divergent += 1;
-                        eprintln!("[lower] diverged on {path:?}");
-                    }
-                }
-                _ => {}
-            }
-        }
-        assert!(checked > 0, "expected to compare at least one fixture");
-        assert_eq!(divergent, 0, "found {divergent} divergent fixtures");
-    }
-
-    /// P5 diagnostic: inspect CST behaviour on broken-input fixtures.
-    /// Mirrors the [`p5_scout_invalid_fixtures`] reporter but reads the
-    /// `tests/fixtures/broken/` corpus instead.
-    #[test]
-    #[ignore]
-    fn p5_scout_broken_fixtures() {
-        use std::fs;
-        use std::path::PathBuf;
-        let crate_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let dir = crate_dir.join("tests/fixtures/broken");
-        if !dir.is_dir() {
-            eprintln!("(no broken fixtures dir yet)");
-            return;
-        }
-        for entry in fs::read_dir(&dir).unwrap() {
-            let p = entry.unwrap().path();
-            if p.extension().and_then(|e| e.to_str()) != Some("relon") {
+            // Skip broken / known-error fixtures (they live under a
+            // distinct dir and the parser is expected to reject them).
+            if path.to_string_lossy().contains("/fixtures/broken/") {
                 continue;
             }
-            let source = fs::read_to_string(&p).unwrap();
-            let name = p.file_name().unwrap().to_string_lossy().to_string();
-            let parse = cst::parse_cst(&source);
-            eprintln!("=== {name} ===");
-            eprintln!("source: {source:?}");
-            eprintln!("round-trip: {}", parse.syntax().text().to_string() == source);
-            eprintln!("CST errors: {}", parse.errors.len());
-            for e in &parse.errors {
-                eprintln!("  - {} @ {}", e.message, e.offset);
-            }
-            let result = lower_document(&parse, &source);
-            eprintln!(
-                "lower_document: {}",
-                match &result {
-                    Ok(_) => "Ok".to_string(),
-                    Err(e) => format!("Err({e:?})"),
-                }
-            );
-            eprintln!();
-        }
-    }
-
-    /// P5 diagnostic: inspect what the CST + lowered tree look like for
-    /// the `with_block_invalid/*` corpus. The legacy fallback currently
-    /// rescues semantic-validity diagnostics on these inputs; the v2
-    /// path needs to surface the same errors.
-    #[test]
-    #[ignore]
-    fn p5_scout_invalid_fixtures() {
-        use std::fs;
-        use std::path::PathBuf;
-        let crate_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let invalid = crate_dir.join("tests/fixtures/with_block_invalid");
-        for entry in fs::read_dir(&invalid).unwrap() {
-            let p = entry.unwrap().path();
-            if p.extension().and_then(|e| e.to_str()) != Some("relon") {
-                continue;
-            }
-            let source = fs::read_to_string(&p).unwrap();
-            let name = p.file_name().unwrap().to_string_lossy().to_string();
-            let parse = cst::parse_cst(&source);
-            eprintln!("=== {name} ===");
-            eprintln!("CST errors: {}", parse.errors.len());
-            for e in &parse.errors {
-                eprintln!("  - {} @ {}", e.message, e.offset);
-            }
-            let result = lower_document(&parse, &source);
-            eprintln!(
-                "lower_document: {}",
-                match &result {
-                    Ok(_) => "Ok".to_string(),
-                    Err(e) => format!("Err({e:?})"),
-                }
-            );
-            eprintln!();
-        }
-    }
-
-    /// P5 diagnostic: walk all `.relon` fixtures and confirm that
-    /// every one either lowers successfully or surfaces a typed
-    /// `ParseDocumentError`. Run with `cargo test -- --ignored
-    /// p5_scout_corpus_errors --nocapture` to see the per-fixture
-    /// outcome breakdown.
-    #[test]
-    #[ignore]
-    fn p5_scout_corpus_errors() {
-        use std::collections::BTreeMap;
-        use std::fs;
-        use std::path::PathBuf;
-
-        let crate_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let workspace_root = crate_dir
-            .parent()
-            .and_then(|p| p.parent())
-            .expect("workspace root")
-            .to_path_buf();
-        let mut files = Vec::new();
-        walk(&workspace_root, &mut files);
-        files.retain(|p| !p.to_string_lossy().contains("/target/"));
-
-        let mut by_outcome: BTreeMap<&'static str, Vec<PathBuf>> = BTreeMap::new();
-        for path in &files {
-            let Ok(source) = fs::read_to_string(path) else {
-                continue;
-            };
-            if source.is_empty() {
-                continue;
-            }
-            let parse = cst::parse_cst(&source);
-            let label = match lower_document(&parse, &source) {
-                Ok(_) => "ok",
-                Err(ParseDocumentError::Parse { .. }) => "parse-error",
-                Err(ParseDocumentError::TrailingInput { .. }) => "trailing-input",
-            };
-            by_outcome.entry(label).or_default().push(path.clone());
-        }
-
-        eprintln!("\n=== P5 SCOUT: corpus outcome breakdown ===");
-        for (label, paths) in &by_outcome {
-            eprintln!("\n[{label}] {} fixture(s)", paths.len());
-            for p in paths {
-                eprintln!("  {}", p.display());
+            if let Ok(mut node) = parse_document(&source) {
+                strip_node_ids(&mut node);
+                checked += 1;
             }
         }
+        assert!(checked > 0, "expected to lower at least one fixture");
     }
 
     fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
@@ -4018,614 +3757,12 @@ mod tests {
         }
     }
 
-    /// Slice 1 (atoms): compare `lower_expr_v2` against the legacy
-    /// chain on every atomic root the grammar recognises. The helper
-    /// drives the typed `ast::Expr` wrapper directly so the assertion
-    /// catches divergence the moment one ships in slice 1's set.
-    fn assert_atom_lower_matches_legacy(source: &str) {
-        let parse = cst::parse_cst(source);
-        let doc = ast::document_of(parse.syntax()).expect("document");
-        let root = doc.root_expr().expect("root expr");
-        let v2 = lower_expr_v2(&root, source).expect("slice 1 supports this atom");
-        let legacy = crate::lower::legacy_parse(source).expect("legacy parse");
-        let mut a = v2;
-        let mut b = legacy;
-        // The legacy `parse_document` wraps the atom in an outer Node
-        // that owns leading directives / decorators / doc_comment.
-        // For slice 1 we only validate the inner `expr` + range —
-        // the outer-Node wrapping is slice 8's job.
-        strip_node_ids(&mut a);
-        strip_node_ids(&mut b);
-        assert_eq!(*a.expr, *b.expr, "expr diverged on {source:?}");
-        assert_eq!(a.range, b.range, "range diverged on {source:?}");
-    }
-
-    #[test]
-    fn slice1_lower_atoms_literal_null() {
-        assert_atom_lower_matches_legacy("null");
-    }
-
-    #[test]
-    fn slice1_lower_atoms_literal_bool() {
-        assert_atom_lower_matches_legacy("true");
-        assert_atom_lower_matches_legacy("false");
-    }
-
-    #[test]
-    fn slice1_lower_atoms_literal_int() {
-        assert_atom_lower_matches_legacy("42");
-        assert_atom_lower_matches_legacy("0x2a");
-        assert_atom_lower_matches_legacy("0o52");
-        assert_atom_lower_matches_legacy("0b101010");
-    }
-
-    #[test]
-    fn slice1_lower_atoms_literal_float() {
-        assert_atom_lower_matches_legacy("3.14");
-        assert_atom_lower_matches_legacy("1.0e10");
-    }
-
-    #[test]
-    fn slice1_lower_atoms_literal_string() {
-        assert_atom_lower_matches_legacy(r#""hello""#);
-        assert_atom_lower_matches_legacy(r#""hi\nworld""#);
-        assert_atom_lower_matches_legacy(r###"r#"raw"#"###);
-    }
-
-    #[test]
-    fn slice1_lower_atoms_variable() {
-        assert_atom_lower_matches_legacy("foo");
-        assert_atom_lower_matches_legacy("foo.bar");
-        assert_atom_lower_matches_legacy("foo.bar.baz");
-    }
-
-    #[test]
-    fn slice1_lower_atoms_reference() {
-        assert_atom_lower_matches_legacy("&root");
-        assert_atom_lower_matches_legacy("&sibling.x");
-        assert_atom_lower_matches_legacy("&root.a.b");
-    }
-
-    /// Slice 2 (collections): same shape as slice 1's helper but for
-    /// constructs whose root atom *is* a legal document root. The
-    /// document-shaped legacy parser (`parse_base`) wraps every
-    /// expression in an outer `Node`, so the inner-expr equality below
-    /// covers `Expr::Dict / List / Spread / Comprehension` byte-
-    /// identically.
-    fn assert_collection_lower_matches_legacy(source: &str) {
-        let parse = cst::parse_cst(source);
-        let doc = ast::document_of(parse.syntax()).expect("document");
-        let root = doc.root_expr().expect("root expr");
-        let v2 = lower_expr_v2(&root, source).expect("slice 2 supports this collection");
-        let legacy = crate::lower::legacy_parse(source).expect("legacy parse");
-        let mut a = v2;
-        let mut b = legacy;
-        strip_node_ids(&mut a);
-        strip_node_ids(&mut b);
-        assert_eq!(*a.expr, *b.expr, "expr diverged on {source:?}");
-        assert_eq!(a.range, b.range, "range diverged on {source:?}");
-    }
-
-    #[test]
-    fn slice2_lower_dict_empty() {
-        assert_collection_lower_matches_legacy("{}");
-    }
-
-    #[test]
-    fn slice2_lower_dict_flat() {
-        assert_collection_lower_matches_legacy("{ a: 1, b: 2 }");
-    }
-
-    #[test]
-    fn slice2_lower_dict_nested() {
-        assert_collection_lower_matches_legacy("{ a: { b: { c: 1 } } }");
-    }
-
-    #[test]
-    fn slice2_lower_dict_spread() {
-        assert_collection_lower_matches_legacy("{ a: 1, ...base }");
-    }
-
-    #[test]
-    fn slice2_lower_dict_typed_spread() {
-        assert_collection_lower_matches_legacy("{ ...<Extra> base }");
-    }
-
-    #[test]
-    fn slice2_lower_dict_dynamic_key() {
-        assert_collection_lower_matches_legacy(r#"{ ["k"]: 1 }"#);
-    }
-
-    #[test]
-    fn slice2_lower_list_empty() {
-        assert_collection_lower_matches_legacy("[]");
-    }
-
-    #[test]
-    fn slice2_lower_list_flat() {
-        assert_collection_lower_matches_legacy("[1, 2, 3]");
-    }
-
-    #[test]
-    fn slice2_lower_list_spread() {
-        assert_collection_lower_matches_legacy("[1, ...others, 2]");
-    }
-
-    #[test]
-    fn slice2_lower_list_nested() {
-        assert_collection_lower_matches_legacy("[[1, 2], [3, 4]]");
-    }
-
-    #[test]
-    fn slice2_lower_comprehension() {
-        assert_collection_lower_matches_legacy("[x for x in src]");
-    }
-
-    #[test]
-    fn slice2_lower_comprehension_with_condition() {
-        assert_collection_lower_matches_legacy("[x * 2 for x in src if x > 0]");
-    }
-
-    /// Slice 3 (operators + calls). Same shape as slice 2's helper but
-    /// covering binary precedence chains, unary, ternary, and function
-    /// calls with positional + named arguments.
-    fn assert_operator_lower_matches_legacy(source: &str) {
-        let parse = cst::parse_cst(source);
-        let doc = ast::document_of(parse.syntax()).expect("document");
-        let root = doc.root_expr().expect("root expr");
-        let v2 = lower_expr_v2(&root, source).expect("slice 3 supports this operator/call");
-        let legacy = crate::lower::legacy_parse(source).expect("legacy parse");
-        let mut a = v2;
-        let mut b = legacy;
-        strip_node_ids(&mut a);
-        strip_node_ids(&mut b);
-        assert_eq!(*a.expr, *b.expr, "expr diverged on {source:?}");
-        assert_eq!(a.range, b.range, "range diverged on {source:?}");
-    }
-
-    #[test]
-    fn slice3_lower_binary_add() {
-        assert_operator_lower_matches_legacy("1 + 2");
-    }
-
-    #[test]
-    fn slice3_lower_binary_precedence_chain() {
-        assert_operator_lower_matches_legacy("1 + 2 * 3 - 4 / 2");
-    }
-
-    #[test]
-    fn slice3_lower_binary_comparisons() {
-        assert_operator_lower_matches_legacy("a == b");
-        assert_operator_lower_matches_legacy("a != b");
-        assert_operator_lower_matches_legacy("a < b");
-        assert_operator_lower_matches_legacy("a >= b");
-    }
-
-    #[test]
-    fn slice3_lower_binary_logical() {
-        assert_operator_lower_matches_legacy("a && b || c");
-    }
-
-    #[test]
-    fn slice3_lower_unary_neg() {
-        assert_operator_lower_matches_legacy("-1");
-    }
-
-    #[test]
-    fn slice3_lower_unary_not() {
-        assert_operator_lower_matches_legacy("!true");
-    }
-
-    #[test]
-    fn slice3_lower_ternary_simple() {
-        assert_operator_lower_matches_legacy("a ? 1 : 2");
-    }
-
-    #[test]
-    fn slice3_lower_ternary_nested() {
-        assert_operator_lower_matches_legacy("a ? b ? 1 : 2 : 3");
-    }
-
-    #[test]
-    fn slice3_lower_call_positional() {
-        assert_operator_lower_matches_legacy("range(0, 10)");
-    }
-
-    #[test]
-    fn slice3_lower_call_named() {
-        assert_operator_lower_matches_legacy("map(f=g)");
-    }
-
-    #[test]
-    fn slice3_lower_call_mixed() {
-        assert_operator_lower_matches_legacy("fn(1, 2, k=3)");
-    }
-
-    #[test]
-    fn slice3_lower_call_nested() {
-        assert_operator_lower_matches_legacy("f(g(1), h(2, 3))");
-    }
-
-    /// Slice 4 (control flow). Same shape as previous slices' helpers
-    /// but covering Closure / Match / Where / VariantCtor. Standalone
-    /// closures use the `(params) => body` form (the dict-method
-    /// shorthand `key(params): body` reaches `lower_expr_v2` only via
-    /// its enclosing Dict, which slice 2 already lowers correctly).
-    fn assert_control_flow_lower_matches_legacy(source: &str) {
-        let parse = cst::parse_cst(source);
-        let doc = ast::document_of(parse.syntax()).expect("document");
-        let root = doc.root_expr().expect("root expr");
-        let v2 = lower_expr_v2(&root, source).expect("slice 4 supports this construct");
-        let legacy = crate::lower::legacy_parse(source).expect("legacy parse");
-        let mut a = v2;
-        let mut b = legacy;
-        strip_node_ids(&mut a);
-        strip_node_ids(&mut b);
-        assert_eq!(*a.expr, *b.expr, "expr diverged on {source:?}");
-        assert_eq!(a.range, b.range, "range diverged on {source:?}");
-    }
-
-    #[test]
-    fn slice4_lower_closure_bare() {
-        assert_control_flow_lower_matches_legacy("() => 1");
-    }
-
-    #[test]
-    fn slice4_lower_closure_typed_params() {
-        assert_control_flow_lower_matches_legacy("(Int a, Int b) => a + b");
-    }
-
-    #[test]
-    fn slice4_lower_closure_with_return_type() {
-        assert_control_flow_lower_matches_legacy("(Int a) -> Int => a + 1");
-    }
-
-    #[test]
-    fn slice4_lower_closure_method_shorthand_inside_dict() {
-        // Method-shorthand closures reach `lower_expr_v2` via the
-        // enclosing Dict's byte-slice route (slice 2). Validating the
-        // full document confirms the slice 4 dispatch on a child
-        // Closure isn't reached for this form — yet still produces a
-        // byte-identical legacy `Node`.
-        let source = "{ add(Int a, Int b): a + b }";
-        let parse = cst::parse_cst(source);
-        let doc = ast::document_of(parse.syntax()).expect("document");
-        let root = doc.root_expr().expect("root expr");
-        let v2 = lower_expr_v2(&root, source).expect("lower");
-        let legacy = crate::lower::legacy_parse(source).expect("legacy parse");
-        let mut a = v2;
-        let mut b = legacy;
-        strip_node_ids(&mut a);
-        strip_node_ids(&mut b);
-        assert_eq!(*a.expr, *b.expr);
-    }
-
-    #[test]
-    fn slice4_lower_match_simple() {
-        assert_control_flow_lower_matches_legacy("x match { Int: 1, * : 0 }");
-    }
-
-    #[test]
-    fn slice4_lower_match_multi() {
-        assert_control_flow_lower_matches_legacy(
-            "value match { Int: 1, String: 2, Bool: 3, * : 0 }",
-        );
-    }
-
-    #[test]
-    fn slice4_lower_where_simple() {
-        assert_control_flow_lower_matches_legacy("a + b where { a: 1, b: 2 }");
-    }
-
-    #[test]
-    fn slice4_lower_where_nested() {
-        assert_control_flow_lower_matches_legacy("(a + b) * c where { a: 1, b: 2, c: 3 }");
-    }
-
-    #[test]
-    fn slice4_lower_variant_ctor_simple() {
-        assert_control_flow_lower_matches_legacy("Result.Ok { value: 1 }");
-    }
-
-    #[test]
-    fn slice4_lower_variant_ctor_nested() {
-        assert_control_flow_lower_matches_legacy(
-            "Tree.Node { left: Tree.Leaf {}, right: Tree.Leaf {} }",
-        );
-    }
-
-    /// Slice 5 (f-strings). The CST splits an f-string into per-chunk
-    /// children for IDE work; the legacy parser keeps it as a single
-    /// `Expr::FString(Vec<FStringPart>)`. The byte-slice route still
-    /// produces the latter byte-identically.
-    fn assert_fstring_lower_matches_legacy(source: &str) {
-        let parse = cst::parse_cst(source);
-        let doc = ast::document_of(parse.syntax()).expect("document");
-        let root = doc.root_expr().expect("root expr");
-        let v2 = lower_expr_v2(&root, source).expect("slice 5 supports this f-string");
-        let legacy = crate::lower::legacy_parse(source).expect("legacy parse");
-        let mut a = v2;
-        let mut b = legacy;
-        strip_node_ids(&mut a);
-        strip_node_ids(&mut b);
-        assert_eq!(*a.expr, *b.expr, "expr diverged on {source:?}");
-        assert_eq!(a.range, b.range, "range diverged on {source:?}");
-    }
-
-    #[test]
-    fn slice5_lower_fstring_pure_literal() {
-        assert_fstring_lower_matches_legacy(r#"f"hello world""#);
-    }
-
-    #[test]
-    fn slice5_lower_fstring_one_interp() {
-        assert_fstring_lower_matches_legacy(r#"f"hi ${name}!""#);
-    }
-
-    #[test]
-    fn slice5_lower_fstring_many_interps() {
-        assert_fstring_lower_matches_legacy(r#"f"${greeting}, ${name}: ${count}""#);
-    }
-
-    #[test]
-    fn slice5_lower_fstring_with_reference() {
-        assert_fstring_lower_matches_legacy(r#"f"value=${&root.x}""#);
-    }
-
-    #[test]
-    fn slice5_lower_fstring_with_expr_interp() {
-        assert_fstring_lower_matches_legacy(r#"f"sum=${a + b}""#);
-    }
-
-    /// Slice 6 (type expressions). The CST emits a TYPE_NODE for any
-    /// builtin / generic / optional / variant / tuple type that
-    /// surfaces at expression position; the legacy parser lifts it
-    /// via `parse_type_expr` into `Expr::Type(TypeNode)`. The
-    /// byte-slice route preserves the full TypeNode shape.
-    fn assert_type_expr_lower_matches_legacy(source: &str) {
-        let parse = cst::parse_cst(source);
-        let doc = ast::document_of(parse.syntax()).expect("document");
-        let root = doc.root_expr().expect("root expr");
-        let v2 = lower_expr_v2(&root, source).expect("slice 6 supports this type");
-        let legacy = crate::lower::legacy_parse(source).expect("legacy parse");
-        let mut a = v2;
-        let mut b = legacy;
-        strip_node_ids(&mut a);
-        strip_node_ids(&mut b);
-        assert_eq!(*a.expr, *b.expr, "expr diverged on {source:?}");
-        assert_eq!(a.range, b.range, "range diverged on {source:?}");
-    }
-
-    #[test]
-    fn slice6_lower_type_optional_builtin() {
-        assert_type_expr_lower_matches_legacy("Int?");
-    }
-
-    #[test]
-    fn slice6_lower_type_generic_list() {
-        assert_type_expr_lower_matches_legacy("List<Int>");
-    }
-
-    #[test]
-    fn slice6_lower_type_generic_dict() {
-        assert_type_expr_lower_matches_legacy("Dict<String, Int>");
-    }
-
-    #[test]
-    fn slice6_lower_type_nested_generic() {
-        assert_type_expr_lower_matches_legacy("List<Dict<String, Int>>");
-    }
-
-    #[test]
-    fn slice6_lower_type_enum_alternatives() {
-        assert_type_expr_lower_matches_legacy(r#"Enum<"red", "green", "blue">"#);
-    }
-
-    #[test]
-    fn slice6_lower_type_enum_variant_unit() {
-        assert_type_expr_lower_matches_legacy("Enum<Ok, Err>");
-    }
-
-    /// Slice 7 (attributes). Given a Relon document whose first
-    /// directive/decorator is fully covered by the CST, slice its
-    /// bytes through the legacy parser and confirm the lowered
-    /// `Directive` / `Decorator` matches the legacy `parse_base`
-    /// result byte-identically.
-    fn assert_directive_lower_matches_legacy(source: &str) {
-        let parse = cst::parse_cst(source);
-        let doc = ast::document_of(parse.syntax()).expect("document");
-        let cst_dir = doc.directives().next().expect("at least one CST directive");
-        let v2 = lower_directive_v2(&cst_dir, source).expect("slice 7 supports this directive");
-        let legacy = crate::lower::legacy_parse(source).expect("legacy parse");
-        let legacy_dir = legacy
-            .directives
-            .first()
-            .cloned()
-            .expect("at least one legacy directive");
-        assert_eq!(v2, legacy_dir, "directive diverged on {source:?}");
-    }
-
-    fn assert_decorator_lower_matches_legacy(source: &str) {
-        let parse = cst::parse_cst(source);
-        let doc = ast::document_of(parse.syntax()).expect("document");
-        let cst_dec = doc.decorators().next().expect("at least one CST decorator");
-        let v2 = lower_decorator_v2(&cst_dec, source).expect("slice 7 supports this decorator");
-        let legacy = crate::lower::legacy_parse(source).expect("legacy parse");
-        let mut legacy_dec = legacy
-            .decorators
-            .first()
-            .cloned()
-            .expect("at least one legacy decorator");
-        // CallArg.value carries a `Node` with an `id` — strip both for
-        // structural comparison.
-        for a in &mut legacy_dec.args {
-            strip_node_ids(&mut a.value);
-        }
-        let mut v2 = v2;
-        for a in &mut v2.args {
-            strip_node_ids(&mut a.value);
-        }
-        assert_eq!(v2, legacy_dec, "decorator diverged on {source:?}");
-    }
-
-    #[test]
-    fn slice7_lower_directive_bare() {
-        assert_directive_lower_matches_legacy("#private\n{ a: 1 }");
-    }
-
-    #[test]
-    fn slice7_lower_directive_value() {
-        assert_directive_lower_matches_legacy("#default 0\n{ a: 1 }");
-    }
-
-    #[test]
-    fn slice7_lower_directive_value_complex() {
-        assert_directive_lower_matches_legacy("#expect \"msg\"\n{ a: 1 }");
-    }
-
-    #[test]
-    fn slice7_lower_directive_schema_namebody() {
-        assert_directive_lower_matches_legacy("#schema User { String name: * }\n{ x: 1 }");
-    }
-
-    #[test]
-    fn slice7_lower_directive_import_alias() {
-        assert_directive_lower_matches_legacy("#import string from \"std/string\"\n{ x: 1 }");
-    }
-
-    #[test]
-    fn slice7_lower_directive_import_spread() {
-        assert_directive_lower_matches_legacy("#import * from \"std/list\"\n{ x: 1 }");
-    }
-
-    #[test]
-    fn slice7_lower_directive_import_destructure() {
-        assert_directive_lower_matches_legacy(
-            "#import { upper, lower as lo } from \"std/string\"\n{ x: 1 }",
-        );
-    }
-
-    #[test]
-    fn slice7_lower_directive_main() {
-        assert_directive_lower_matches_legacy(
-            "#main(User u, Cart cart) -> Result<Order>\n{ x: 1 }",
-        );
-    }
-
-    #[test]
-    fn slice7_lower_decorator_bare() {
-        assert_decorator_lower_matches_legacy("@foo\n{ a: 1 }");
-    }
-
-    #[test]
-    fn slice7_lower_decorator_with_args() {
-        assert_decorator_lower_matches_legacy("@brand(Color)\n{ r: 1 }");
-    }
-
-    #[test]
-    fn slice7_lower_decorator_dotted() {
-        assert_decorator_lower_matches_legacy("@lib.brand(Color)\n{ r: 1 }");
-    }
-
-    /// Slice 7 also ships `lower_document_node_v2`, which builds the
-    /// outer-wrapped `Node` (decorators + directives + doc_comment +
-    /// range + body) from the CST instead of the legacy combinator
-    /// stream. The corpus test below validates this against the legacy
-    /// path across every checked-in fixture — every fixture the
-    /// legacy parser accepts must lower byte-identically via the new
-    /// path.
-    #[test]
-    fn corpus_lower_matches_legacy() {
-        use std::fs;
-        use std::path::PathBuf;
-
-        let crate_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let workspace_root = crate_dir
-            .parent()
-            .and_then(|p| p.parent())
-            .expect("workspace root")
-            .to_path_buf();
-        let mut files = Vec::new();
-        walk(&workspace_root, &mut files);
-        files.retain(|p| !p.to_string_lossy().contains("/target/"));
-
-        let mut checked = 0usize;
-        let mut divergent: Vec<String> = Vec::new();
-        for path in files {
-            let Ok(source) = fs::read_to_string(&path) else {
-                continue;
-            };
-            if source.is_empty() {
-                continue;
-            }
-            let Ok(mut legacy) = legacy_parse(&source) else {
-                continue;
-            };
-            let Some(mut lowered) = lower_document_v2(&source) else {
-                divergent.push(format!("{path:?}: v2 returned None"));
-                continue;
-            };
-            checked += 1;
-            strip_node_ids(&mut legacy);
-            strip_node_ids(&mut lowered);
-            if legacy != lowered {
-                divergent.push(format!("{path:?}: trees diverged"));
-            }
-        }
-        assert!(checked > 0, "expected to compare at least one fixture");
-        assert!(
-            divergent.is_empty(),
-            "corpus_lower_matches_legacy found {} divergent fixtures:\n{}",
-            divergent.len(),
-            divergent.join("\n")
-        );
-    }
-
-    #[test]
-    fn slice1_lower_atoms_wildcard() {
-        // `*` isn't a legal root atom in the legacy parser (it only
-        // appears in match-arm pattern position), so we can't compare
-        // directly via `legacy_parse`. Validate the slice-1 walker on a
-        // synthetic WILDCARD node inside a match arm: the helper still
-        // produces `Expr::Wildcard` with a 1-byte range.
-        let parse = cst::parse_cst("{ f(x): x match { *: 0 } }");
-        // Walk descendants to find the wildcard.
-        let wildcard = parse
-            .syntax()
-            .descendants()
-            .find(|n| n.kind() == SyntaxKind::WILDCARD)
-            .expect("wildcard node");
-        let n =
-            lower_atom_via_legacy(&wildcard, "{ f(x): x match { *: 0 } }").expect("lower wildcard");
-        assert!(matches!(*n.expr, Expr::Wildcard));
-    }
-
-    /// Slice 8: `lower_document` prefers the CST-walking v2 path
-    /// whenever the CST cleanly accepts the input. Verify by passing
-    /// a `Parse` that has no errors and asserting the result is
-    /// byte-identical to a direct `lower_document_node_v2` call.
-    #[test]
-    fn slice8_clean_cst_routes_through_v2() {
-        for src in ["{ a: 1 }", "[1, 2, 3]", "42", "1 + 2", "(Int a) => a + 1"] {
-            let parse = cst::parse_cst(src);
-            assert!(!parse.has_errors(), "expected clean CST for {src:?}");
-            let via_lower = lower_document(&parse, src).expect("lower_document");
-            let direct = ast::document_of(parse.syntax())
-                .and_then(|d| lower_document_node_v2(&d, src))
-                .expect("direct v2");
-            let mut a = via_lower;
-            let mut b = direct;
-            strip_node_ids(&mut a);
-            strip_node_ids(&mut b);
-            assert_eq!(a, b, "slice 8 didn't route through v2 for {src:?}");
-        }
-    }
-
-    /// Slice 8: trailing input is reported as `TrailingInput` with
-    /// the legacy-shaped offset (after whitespace consumption).
-    #[test]
-    fn slice8_trailing_input_uses_legacy_offset() {
-        let err = crate::parse_document("{ a: 1 } true").unwrap_err();
+    /// Trailing input must surface as `TrailingInput` with the
+    /// offset stepped past inter-token trivia (matches the legacy
+    /// behaviour callers were depending on).
+    #[test]
+    fn trailing_input_uses_legacy_offset() {
+        let err = parse_document("{ a: 1 } true").unwrap_err();
         assert!(matches!(
             err,
             ParseDocumentError::TrailingInput { offset: 9, ref remaining }
@@ -4633,13 +3770,11 @@ mod tests {
         ));
     }
 
-    /// P5 closed the CST gap for the `#schema X: { ... }` dict-field
-    /// shape — the legacy parser accepted a `:` separator between the
-    /// schema name and the dict body, and the CST now does too. This
-    /// regression-test pins the behaviour so a future grammar
-    /// refactor can't silently re-open the gap.
+    /// The `#schema X: { ... }` colon-shape — Bare directive plus a
+    /// separate `X: { ... }` dict field — must keep parsing without
+    /// CST errors.
     #[test]
-    fn slice8_schema_colon_body_form_parses() {
+    fn schema_colon_body_form_parses() {
         let src = r#"{
             #schema Image: { name: String },
             data: { name: "img" }
@@ -4650,24 +3785,6 @@ mod tests {
         assert!(!parse.has_errors(), "no CST errors: {:?}", parse.errors);
     }
 
-    /// Inspect what the legacy parser produced for `#schema X: { ... }`
-    /// so we can match its shape in the v2 path.
-    #[test]
-    fn slice8_schema_colon_body_matches_legacy_shape() {
-        let src = r#"{
-            #schema Image: { name: String },
-            data: { name: "img" }
-        }"#;
-        let mut legacy = crate::lower::legacy_parse(src).expect("legacy parse");
-        let mut lowered = lower_document(&cst::parse_cst(src), src).expect("lower");
-        strip_node_ids(&mut legacy);
-        strip_node_ids(&mut lowered);
-        assert_eq!(legacy, lowered, "shape diverged");
-    }
-
-    /// `parse_document` (the public entry) now goes through CST first.
-    /// This test simply asserts that `parse_document` keeps working on
-    /// the legacy corner cases the existing test suite exercises.
     #[test]
     fn parse_document_accepts_legacy_corpus_samples() {
         for src in [
