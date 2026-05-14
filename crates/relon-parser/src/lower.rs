@@ -311,7 +311,19 @@ pub(crate) fn lower_expr_v2(expr: &ast::Expr, source: &str) -> Option<Node> {
         ast::Expr::List(l) => lower_expr_via_legacy(l.syntax(), source),
         ast::Expr::Spread(s) => lower_expr_via_legacy(s.syntax(), source),
         ast::Expr::Comprehension(c) => lower_expr_via_legacy(c.syntax(), source),
-        // Slice 2 stops here — every other construct will be wired in
+        // Slice 3: operators + calls. The legacy `parse_expr` already
+        // routes binary precedence (`parse_pipe` → `parse_logic_or`
+        // → ... → `parse_multiplicative`), unary, ternary, and
+        // `parse_fn_call` (with positional + named args) — all reached
+        // from `parse_atomic`. Routing each CST node through it keeps
+        // operator associativity, precedence, and call-arg `name:`
+        // detection byte-identical with no separate token-text → enum
+        // table here.
+        ast::Expr::Binary(b) => lower_expr_via_legacy(b.syntax(), source),
+        ast::Expr::Unary(u) => lower_expr_via_legacy(u.syntax(), source),
+        ast::Expr::Ternary(t) => lower_expr_via_legacy(t.syntax(), source),
+        ast::Expr::Call(c) => lower_expr_via_legacy(c.syntax(), source),
+        // Slice 3 stops here — every other construct will be wired in
         // later slices. Returning `None` makes the caller fall back to
         // the legacy combinator chain.
         _ => None,
@@ -858,6 +870,86 @@ mod tests {
     #[test]
     fn slice2_lower_comprehension_with_condition() {
         assert_collection_lower_matches_legacy("[x * 2 for x in src if x > 0]");
+    }
+
+    /// Slice 3 (operators + calls). Same shape as slice 2's helper but
+    /// covering binary precedence chains, unary, ternary, and function
+    /// calls with positional + named arguments.
+    fn assert_operator_lower_matches_legacy(source: &str) {
+        let parse = cst::parse_cst(source);
+        let doc = ast::document_of(parse.syntax()).expect("document");
+        let root = doc.root_expr().expect("root expr");
+        let v2 = lower_expr_v2(&root, source).expect("slice 3 supports this operator/call");
+        let legacy = crate::lower::legacy_parse(source).expect("legacy parse");
+        let mut a = v2;
+        let mut b = legacy;
+        strip_node_ids(&mut a);
+        strip_node_ids(&mut b);
+        assert_eq!(*a.expr, *b.expr, "expr diverged on {source:?}");
+        assert_eq!(a.range, b.range, "range diverged on {source:?}");
+    }
+
+    #[test]
+    fn slice3_lower_binary_add() {
+        assert_operator_lower_matches_legacy("1 + 2");
+    }
+
+    #[test]
+    fn slice3_lower_binary_precedence_chain() {
+        assert_operator_lower_matches_legacy("1 + 2 * 3 - 4 / 2");
+    }
+
+    #[test]
+    fn slice3_lower_binary_comparisons() {
+        assert_operator_lower_matches_legacy("a == b");
+        assert_operator_lower_matches_legacy("a != b");
+        assert_operator_lower_matches_legacy("a < b");
+        assert_operator_lower_matches_legacy("a >= b");
+    }
+
+    #[test]
+    fn slice3_lower_binary_logical() {
+        assert_operator_lower_matches_legacy("a && b || c");
+    }
+
+    #[test]
+    fn slice3_lower_unary_neg() {
+        assert_operator_lower_matches_legacy("-1");
+    }
+
+    #[test]
+    fn slice3_lower_unary_not() {
+        assert_operator_lower_matches_legacy("!true");
+    }
+
+    #[test]
+    fn slice3_lower_ternary_simple() {
+        assert_operator_lower_matches_legacy("a ? 1 : 2");
+    }
+
+    #[test]
+    fn slice3_lower_ternary_nested() {
+        assert_operator_lower_matches_legacy("a ? b ? 1 : 2 : 3");
+    }
+
+    #[test]
+    fn slice3_lower_call_positional() {
+        assert_operator_lower_matches_legacy("range(0, 10)");
+    }
+
+    #[test]
+    fn slice3_lower_call_named() {
+        assert_operator_lower_matches_legacy("map(f=g)");
+    }
+
+    #[test]
+    fn slice3_lower_call_mixed() {
+        assert_operator_lower_matches_legacy("fn(1, 2, k=3)");
+    }
+
+    #[test]
+    fn slice3_lower_call_nested() {
+        assert_operator_lower_matches_legacy("f(g(1), h(2, 3))");
     }
 
     #[test]
