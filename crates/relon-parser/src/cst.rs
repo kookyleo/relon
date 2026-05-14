@@ -334,10 +334,14 @@ impl<'a> Parser<'a> {
     }
 
     /// `@name(...)` or `#name <body>`. Decorator bodies are always
-    /// `(args)` (or absent); directive bodies branch on the name:
-    /// `schema` / `extend` capture `name <T, U>? body? (with {})?`,
+    /// `(args)` (or absent) and decorator names may be dotted
+    /// (`@ensure.int`, `@module.fn`); directive bodies branch on the
+    /// name: `schema` / `extend` capture `name <T, U>? body? (with {})?`,
     /// `import` captures `<spec> from "path"`, `main` captures
-    /// `( typed-params ) [-> Ret]`, the rest take a single expr.
+    /// `( typed-params ) [-> Ret]`, the remaining names dispatch via
+    /// [`directive_shape`] — bare directives consume no body so they
+    /// can sit cleanly above the field they decorate, value directives
+    /// take exactly one trailing expression.
     fn parse_attribute(&mut self) {
         let is_directive = self.at(SyntaxKind::HASH);
         let kind = if is_directive {
@@ -356,23 +360,41 @@ impl<'a> Parser<'a> {
             None
         };
         if !is_directive {
-            // Decorator — body is always `(args)` or empty.
+            // Decorator — name may be dotted (`@ensure.at_least`).
+            // Body is always `(args)` or empty.
+            while self.at(SyntaxKind::DOT) {
+                self.bump();
+                if self.at(SyntaxKind::IDENT) {
+                    self.bump();
+                } else {
+                    self.error_at_current("expected identifier after `.` in decorator name");
+                    break;
+                }
+            }
             if self.at(SyntaxKind::L_PAREN) {
                 self.parse_call_args();
             }
             self.close();
             return;
         }
-        // Directive — dispatch on name.
-        match name_text {
-            Some("schema") | Some("extend") => self.parse_directive_name_body(),
-            Some("import") => self.parse_directive_import(),
-            Some("main") => self.parse_directive_main(),
-            _ => {
+        // Directive — dispatch on name. Unknown directive names take a
+        // single optional expression body to match the legacy parser's
+        // permissive fallback.
+        match name_text
+            .map(directive_shape)
+            .unwrap_or(DirectiveShape::Value)
+        {
+            DirectiveShape::Bare => {
+                // No body. `#private`, `#strict`, `#native`.
+            }
+            DirectiveShape::Value => {
                 if self.is_attribute_body_start() {
                     self.parse_expr();
                 }
             }
+            DirectiveShape::NameBody => self.parse_directive_name_body(),
+            DirectiveShape::Import => self.parse_directive_import(),
+            DirectiveShape::Main => self.parse_directive_main(),
         }
         self.close();
     }
@@ -1546,6 +1568,19 @@ impl<'a> Parser<'a> {
             self.close();
             return;
         }
+        // Attribute-only field: `#import x from "p", "next": 1` — the
+        // `#import` directive already consumed its full body, leaving
+        // the field separator next. Same for a sequence of bare
+        // directives whose payload is the field itself (e.g.
+        // `#schema X { ... },`). Close the field here so the surrounding
+        // dict resumes at the separator.
+        if matches!(
+            self.current(),
+            Some(SyntaxKind::COMMA) | Some(SyntaxKind::R_BRACE)
+        ) {
+            self.close();
+            return;
+        }
         // The key: an ident, a string, or `...` (spread).
         if self.at(SyntaxKind::ELLIPSIS) {
             self.open(SyntaxKind::SPREAD_EXPR);
@@ -1748,6 +1783,37 @@ impl<'a> Parser<'a> {
 //   8. pipe |
 // All operators are left-associative (right_bp = left_bp + 1).
 // =====================================================================
+
+/// Body shape every known `#name` directive expects. Mirrors the
+/// legacy `directive::DIRECTIVE_SHAPES` table (in `directive.rs`) —
+/// the lossless CST grammar takes the body bytes verbatim, but it
+/// still has to know whether to *try* to consume one (Value /
+/// NameBody / Import / Main) or stop right after the keyword (Bare).
+/// Unknown names fall through to `Value` so the corpus's permissive
+/// behaviour around third-party-looking directives is preserved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirectiveShape {
+    Bare,
+    Value,
+    NameBody,
+    Import,
+    Main,
+}
+
+/// Map a directive name to its expected body shape. Keep in sync with
+/// `crate::directive::DIRECTIVE_SHAPES`.
+fn directive_shape(name: &str) -> DirectiveShape {
+    match name {
+        "private" | "strict" | "native" => DirectiveShape::Bare,
+        "default" | "expect" | "msg" | "error" | "brand" | "derive" | "no_auto_derive" => {
+            DirectiveShape::Value
+        }
+        "schema" | "extend" => DirectiveShape::NameBody,
+        "import" => DirectiveShape::Import,
+        "main" => DirectiveShape::Main,
+        _ => DirectiveShape::Value,
+    }
+}
 
 fn infix_bp(kind: SyntaxKind) -> Option<(u8, u8)> {
     Some(match kind {
@@ -2166,6 +2232,33 @@ mod tests {
         assert_eq!(ts.len(), 2);
     }
 
+    #[test]
+    fn bare_directive_does_not_consume_next_field() {
+        // `#private` is a bare directive; the IDENT after it must
+        // belong to the next dict field, not to the directive body.
+        let src = "{ #private\n  field(s): s, next: 1 }";
+        let parsed = parse_round_trip(src);
+        assert!(!parsed.has_errors(), "errors: {:?}", parsed.errors);
+    }
+
+    #[test]
+    fn dict_field_can_be_attribute_only() {
+        // `#import x from "p"` consumes its whole body; the field is
+        // attribute-only and the `,` belongs to the surrounding dict.
+        let src = "{ #import x from \"p\", next: 1 }";
+        let parsed = parse_round_trip(src);
+        assert!(!parsed.has_errors(), "errors: {:?}", parsed.errors);
+    }
+
+    #[test]
+    fn decorator_dotted_name_round_trips() {
+        // `@ensure.int` / `@ensure.at_least(1024)` — dotted decorator
+        // names appear in the corpus alongside plain `@name(...)`.
+        let src = "{ @ensure.int\n  @ensure.at_least(1024)\n  \"port\": 80 }";
+        let parsed = parse_round_trip(src);
+        assert!(!parsed.has_errors(), "errors: {:?}", parsed.errors);
+    }
+
     /// Monotonic floor on how many checked-in `.relon` fixtures parse
     /// without ANY ERROR nodes. Each P2 slice MUST raise this number;
     /// regressions need a deliberate, recorded reason.
@@ -2178,7 +2271,11 @@ mod tests {
         // ~60 of ~210 — the directive / match / where / type slices
         // pushed this to 135. After the P4-prep grammar gaps
         // (ternary / named call args / variant ctor) we reach 148.
-        const FLOOR: usize = 148;
+        // Directive-shape dispatch + attribute-only dict fields pushed
+        // it to 157 (the next P2 slices target tuple types, typed
+        // spreads, and the schema with-block named-param method
+        // grammar).
+        const FLOOR: usize = 157;
         let clean = fixture_clean_parse_count();
         eprintln!("[parser] fixtures clean-parse count: {clean}");
         assert!(
@@ -2240,6 +2337,54 @@ mod tests {
             let reconstructed = parsed.syntax().text().to_string();
             assert_eq!(reconstructed, source, "round-trip mismatch on {path:?}");
         }
+    }
+
+    /// One-shot discovery test: enumerate every `.relon` fixture in the
+    /// repo that currently fails to clean-parse, print the path and the
+    /// first error position (with surrounding source context) to
+    /// stderr. Run via:
+    ///     cargo test -p relon-parser report_remaining_gaps -- --nocapture
+    /// Delete this test once `parse_cst` clean-parses every fixture.
+    #[test]
+    #[ignore]
+    fn report_remaining_gaps() {
+        use std::fs;
+        use std::path::PathBuf;
+
+        let crate_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let workspace_root = crate_dir
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("workspace root")
+            .to_path_buf();
+        let mut files = Vec::new();
+        walk(&workspace_root, &mut files);
+        files.retain(|p| !p.to_string_lossy().contains("/target/"));
+        files.sort();
+        let mut total = 0usize;
+        let mut failing = 0usize;
+        for path in &files {
+            total += 1;
+            let source = fs::read_to_string(path).unwrap_or_default();
+            if source.is_empty() {
+                continue;
+            }
+            let parsed = parse_cst(&source);
+            if parsed.has_errors() {
+                failing += 1;
+                let err = &parsed.errors[0];
+                let off = err.offset.min(source.len());
+                let lo = off.saturating_sub(40);
+                let hi = (off + 40).min(source.len());
+                let ctx = source.get(lo..hi).unwrap_or("");
+                let rel = path.strip_prefix(&workspace_root).unwrap_or(path).display();
+                eprintln!(
+                    "FAIL {rel} :: offset={} msg={:?}\n  ctx: {:?}",
+                    err.offset, err.message, ctx
+                );
+            }
+        }
+        eprintln!("--- discovery: {failing}/{total} fixtures have errors");
     }
 
     fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
