@@ -176,29 +176,64 @@ fn lower_atom_via_legacy(node: &SyntaxNode, source: &str) -> Option<Node> {
                 None
             }
         }
-        SyntaxKind::LITERAL => {
-            // null / bool / number / string atoms. The prim
-            // combinators still own the escape / overflow decoding,
-            // so we run them on the literal token's exact text and
-            // translate offsets back. The LITERAL node is a single
-            // leaf, so this is effectively the leaf parsers running
-            // on the exact token bytes — no recursion through
-            // `parse_expr` happens here.
-            let r = node.text_range();
-            let start: usize = r.start().into();
-            let end: usize = r.end().into();
+        SyntaxKind::LITERAL => lower_literal_v2(node, source),
+        _ => None,
+    }
+}
+
+/// Lower a `LITERAL` CST node to the corresponding `Node`. The
+/// CST groups null / true / false / NUMBER / STRING under a single
+/// LITERAL kind; we dispatch by inspecting the inner token. Bool
+/// and null are inlined; number and string keep delegating to the
+/// prim combinators (escape decoding / overflow handling lives
+/// there). Either way the leaf parser runs on the exact token
+/// bytes — no recursion through `parse_expr` happens here.
+fn lower_literal_v2(node: &SyntaxNode, source: &str) -> Option<Node> {
+    let token = node
+        .children_with_tokens()
+        .filter_map(|el| el.into_token())
+        .find(|t| {
+            matches!(
+                t.kind(),
+                SyntaxKind::IDENT | SyntaxKind::NUMBER | SyntaxKind::STRING
+            )
+        })?;
+    let tr = token.text_range();
+    let start: usize = tr.start().into();
+    let end: usize = tr.end().into();
+    let range = range_from_offsets(source, start, end);
+    match token.kind() {
+        SyntaxKind::IDENT => match token.text() {
+            "null" => Some(Node::new(Expr::Null, range)),
+            "true" => Some(Node::new(Expr::Bool(true), range)),
+            "false" => Some(Node::new(Expr::Bool(false), range)),
+            _ => None,
+        },
+        SyntaxKind::NUMBER => {
+            // Numbers carry hex / oct / bin / scientific / Infinity /
+            // NaN parsing inside `prim::number::parse_number`. The
+            // token text is exactly the number literal — no
+            // surrounding bytes — so we run the combinator on it
+            // directly and translate the slice-local offsets back.
             let slice = source.get(start..end)?;
             let mut span = Span::new(slice);
             use winnow::Parser as _;
-            let parsed = winnow::combinator::alt::<_, Node, _, _>((
-                crate::prim::null::parse_null,
-                crate::prim::boolean::parse_bool,
-                crate::prim::number::parse_number,
-                crate::prim::string::parse_string,
-            ))
-            .parse_next(&mut span)
-            .ok()?;
-            let mut node_value = parsed;
+            let mut node_value = crate::prim::number::parse_number
+                .parse_next(&mut span)
+                .ok()?;
+            translate_node_offsets(&mut node_value, start, source);
+            Some(node_value)
+        }
+        SyntaxKind::STRING => {
+            // Strings own escape decoding (`\n`, `\u{...}`, raw
+            // `r#"..."#`). Same drill — leaf combinator on the
+            // token text, then translate.
+            let slice = source.get(start..end)?;
+            let mut span = Span::new(slice);
+            use winnow::Parser as _;
+            let mut node_value = crate::prim::string::parse_string
+                .parse_next(&mut span)
+                .ok()?;
             translate_node_offsets(&mut node_value, start, source);
             Some(node_value)
         }
