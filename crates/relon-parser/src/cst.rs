@@ -399,6 +399,16 @@ impl<'a> Parser<'a> {
                     continue;
                 }
             }
+            if self.at(SyntaxKind::IDENT)
+                && self.current_text() == Some("where")
+                && self.nth(1) == Some(SyntaxKind::L_BRACE)
+            {
+                self.open_at(ck, SyntaxKind::WHERE_EXPR);
+                self.bump(); // `where`
+                self.parse_dict();
+                self.close();
+                continue;
+            }
             break;
         }
     }
@@ -1305,6 +1315,18 @@ mod tests {
             .filter(|n| n.kind() == SyntaxKind::MATCH_ARM)
             .collect();
         assert_eq!(arms.len(), 3);
+    }
+
+    #[test]
+    fn where_expression_emits_where_node() {
+        let parsed = parse_round_trip("{ x: a + b where { a: 1, b: 2 } }");
+        assert!(!parsed.has_errors(), "errors: {:?}", parsed.errors);
+        let wheres: Vec<_> = parsed
+            .syntax()
+            .descendants()
+            .filter(|n| n.kind() == SyntaxKind::WHERE_EXPR)
+            .collect();
+        assert_eq!(wheres.len(), 1);
     }
 
     #[test]
