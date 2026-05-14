@@ -1883,6 +1883,77 @@ fn lower_unary_expr_v2(node: &SyntaxNode, source: &str) -> Option<Node> {
     ))
 }
 
+/// Lower a `TERNARY_EXPR` CST node. Three child expressions: cond,
+/// then, else (in source order). Maps to legacy `Expr::Ternary`.
+fn lower_ternary_expr_v2(node: &SyntaxNode, source: &str) -> Option<Node> {
+    let r = node.text_range();
+    let start: usize = r.start().into();
+    let end: usize = r.end().into();
+    let mut exprs = node.children().filter_map(ast::Expr::cast);
+    let cond_ast = exprs.next()?;
+    let then_ast = exprs.next()?;
+    let els_ast = exprs.next()?;
+    let cond = lower_expr_v2(&cond_ast, source)?;
+    let then = lower_expr_v2(&then_ast, source)?;
+    let els = lower_expr_v2(&els_ast, source)?;
+    Some(Node::new(
+        Expr::Ternary { cond, then, els },
+        range_from_offsets(source, start, end),
+    ))
+}
+
+/// Lower a `WHERE_EXPR` CST node. Shape: `<expr> where <dict>`. The
+/// bindings dict is wrapped in a `Node` whose `Expr::Dict` carries
+/// each binding; the legacy `parse_where` produces the dict via
+/// `parse_dict` (which still goes through `lower_expr_via_legacy` for
+/// the dict body — that bridge retires later in P6 round 2).
+fn lower_where_expr_v2(node: &SyntaxNode, source: &str) -> Option<Node> {
+    let r = node.text_range();
+    let start: usize = r.start().into();
+    let end: usize = r.end().into();
+    let mut exprs = node.children().filter_map(ast::Expr::cast);
+    let base_ast = exprs.next()?;
+    // The bindings dict is the second expression child (the CST emits
+    // a DICT under the WHERE_EXPR after the `where` keyword).
+    let bindings_ast = exprs.next()?;
+    let base = lower_expr_v2(&base_ast, source)?;
+    let bindings = lower_expr_v2(&bindings_ast, source)?;
+    Some(Node::new(
+        Expr::Where {
+            expr: base,
+            bindings,
+        },
+        range_from_offsets(source, start, end),
+    ))
+}
+
+/// Lower a `MATCH_EXPR` CST node. The scrutinee is the first
+/// expression child; each `MATCH_ARM` carries a pattern (TYPE_NODE or
+/// WILDCARD) and a body expression.
+fn lower_match_expr_v2(node: &SyntaxNode, source: &str) -> Option<Node> {
+    let r = node.text_range();
+    let start: usize = r.start().into();
+    let end: usize = r.end().into();
+    let scrutinee_ast = node.children().find_map(ast::Expr::cast)?;
+    let scrutinee = lower_expr_v2(&scrutinee_ast, source)?;
+    let mut arms: Vec<(Node, Node)> = Vec::new();
+    for arm in node.children().filter(|c| c.kind() == SyntaxKind::MATCH_ARM) {
+        let mut arm_exprs = arm.children().filter_map(ast::Expr::cast);
+        let pat_ast = arm_exprs.next()?;
+        let body_ast = arm_exprs.next()?;
+        let pattern = lower_expr_v2(&pat_ast, source)?;
+        let body = lower_expr_v2(&body_ast, source)?;
+        arms.push((pattern, body));
+    }
+    Some(Node::new(
+        Expr::Match {
+            expr: scrutinee,
+            arms,
+        },
+        range_from_offsets(source, start, end),
+    ))
+}
+
 /// Try to lower an `ast::Expr` to a legacy `Node` using the CST-walking
 /// path. Returns `None` when the construct is outside the currently-
 /// supported set (caller falls back to the legacy combinator chain).
@@ -1920,7 +1991,7 @@ pub(crate) fn lower_expr_v2(expr: &ast::Expr, source: &str) -> Option<Node> {
         // table here.
         ast::Expr::Binary(b) => lower_expr_via_legacy(b.syntax(), source),
         ast::Expr::Unary(u) => lower_unary_expr_v2(u.syntax(), source),
-        ast::Expr::Ternary(t) => lower_expr_via_legacy(t.syntax(), source),
+        ast::Expr::Ternary(t) => lower_ternary_expr_v2(t.syntax(), source),
         ast::Expr::Call(c) => lower_expr_via_legacy(c.syntax(), source),
         // Slice 4: control flow. `Closure`, `Match`, `Where`, and
         // `VariantCtor` all sit on top of expression-shaped CST nodes
@@ -1929,8 +2000,8 @@ pub(crate) fn lower_expr_v2(expr: &ast::Expr, source: &str) -> Option<Node> {
         // body) and match-arm pattern/body pairs round-trip
         // byte-identically through the legacy chain.
         ast::Expr::Closure(c) => lower_expr_via_legacy(c.syntax(), source),
-        ast::Expr::Match(m) => lower_expr_via_legacy(m.syntax(), source),
-        ast::Expr::Where(w) => lower_expr_via_legacy(w.syntax(), source),
+        ast::Expr::Match(m) => lower_match_expr_v2(m.syntax(), source),
+        ast::Expr::Where(w) => lower_where_expr_v2(w.syntax(), source),
         ast::Expr::VariantCtor(v) => lower_expr_via_legacy(v.syntax(), source),
         // Slice 5: f-strings. The CST decomposes an f-string into
         // F_STRING_LITERAL chunks + F_STRING_INTERPOLATION sub-nodes
