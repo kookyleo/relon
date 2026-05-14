@@ -8,45 +8,50 @@
 //! [`crate::Expr`] tree exactly as before — this lowering pass is what
 //! makes the swap transparent.
 //!
-//! Design note — pragmatic lowering
-//! ================================
+//! Design — hybrid CST-walking lowering
+//! ====================================
 //!
 //! The legacy combinator parser produces a *very* specific `Node` shape:
 //! byte-exact ranges, a particular `NodeId::alloc()` order, doc-comment
 //! attachment rules, decorator/directive interleaving, type-hint
 //! lifting, generic-vs-comparison disambiguation, tuple-type encoding,
 //! enum-variant struct bodies, and a dozen other quirks. Re-implementing
-//! every quirk in a hand-rolled CST walker would be a multi-week effort
+//! every quirk in a from-scratch CST walker would be a multi-week effort
 //! with a long tail of off-by-one failures.
 //!
-//! For P4 we instead take a *hybrid* approach: the CST parses first
-//! (capturing the lossless tree for IDE work in P5/P6), and the legacy
-//! combinators then build the typed `Node` tree from the original
-//! source. This satisfies the contract:
+//! P4 takes a pragmatic *byte-slice* approach: each typed `ast::Expr`
+//! (or `ast::Directive` / `ast::Decorator`) holds a CST node whose
+//! `text_range()` is byte-exact. The lowering slices the original
+//! source to that range, runs the relevant legacy combinator
+//! (`parse_expr` / `parse_directive` / `parse_decorator`) on the
+//! sliced bytes, and translates the produced `TokenRange`s back onto
+//! the full source via [`translate_node_offsets`] (+ the directive /
+//! decorator / type-node specializations below). The result is a
+//! byte-identical `Node` tree without re-implementing dict / list /
+//! comprehension / binary-precedence / call-arg / closure / match /
+//! variant-ctor / f-string / typed-spread / typed-dynamic-key /
+//! with-block-method / schema-method-param / generic / optional /
+//! variant-fields / etc. machinery here.
 //!
-//! * `parse_document` runs the CST first — the lossless tree is built
-//!   on every call so downstream consumers (LSP, playground) can
-//!   adopt `parse_cst` directly without a separate entry point.
-//! * Downstream consumers see a byte-identical `Node` tree.
+//! Dispatch
+//! --------
 //!
-//! Caveats that future work should clean up:
+//! [`lower_document`] is the entry point invoked by
+//! [`crate::parse_document`]. When the CST cleanly accepts the input
+//! AND [`lower_document_node_v2`] succeeds, the new path produces the
+//! `Node` tree. Otherwise the legacy combinator chain
+//! ([`legacy_parse`]) fills in — that fallback covers a handful of
+//! `#schema X: { ... }` dict-field shapes and similar directive-shape
+//! edge cases that the P2 CST grammar is slightly more strict about
+//! than the pre-P4 parser. Closing those gaps in the CST is tracked
+//! as a follow-up to P4; the fallback keeps the parser strictly
+//! backwards-compatible until then.
 //!
-//! * The CST grammar from P2 doesn't yet cover ternary, named call
-//!   arguments, or `EnumName.VariantName { ... }` constructors — all
-//!   accepted by the legacy combinator parser. Until that gap closes,
-//!   CST errors are not fatal in [`lower_document`]: it always falls
-//!   through to [`legacy_parse`] and lets the legacy chain decide.
-//! * Once CST coverage matches, this module can flip to "CST gates,
-//!   legacy fills in" (the `has_error_descendant` + `first_error_offset`
-//!   helpers below already implement that gate; they're held under
-//!   `#[allow(dead_code)]` until then) and then to a real CST walker.
-//!   The slice-by-slice migration plan documented in P4 corresponds to
-//!   that second step.
-//!
-//! The [`tests::assert_lowered_matches_legacy`] helper exists so each
-//! incremental tightening (CST gating, then CST walking) can be added
-//! with a tight test loop: lower a fixture, compare structurally to
-//! the legacy output (with [`NodeId`]s stripped), and validate.
+//! [`lower_expr_v2`] dispatches per `ast::Expr` variant. Each variant
+//! routes to either [`lower_atom_via_legacy`] (atoms) or
+//! [`lower_expr_via_legacy`] (every composite construct). Slice-level
+//! comparison tests in [`tests`] assert per-construct byte-identical
+//! parity with [`legacy_parse`] for every construct family.
 
 use crate::ast;
 use crate::cst::Parse;
@@ -57,19 +62,15 @@ use crate::{
 use winnow::stream::Location;
 
 // =====================================================================
-// CST-walking lowering — incremental P4 implementation.
+// CST-walking lowering — P4 implementation.
 //
 // Each construct lives in its own `lower_*_v2` function. The functions
 // take a typed `ast::*` wrapper plus the original source text and
 // produce a legacy `Node` byte-identical to what the combinator chain
-// would emit. Where a sub-expression isn't yet covered by P4 the
-// helper returns `None` and the caller falls back to the legacy chain
-// (or, depending on the slice, propagates the `None` so the entire
-// document drops back to `legacy_parse`).
-//
-// Once every slice ships and `lower_expr_v2` covers the full grammar,
-// slice 8 flips `lower_document` to gate on the CST instead of
-// delegating to the legacy combinator chain.
+// would emit. The CST gives us the exact byte range; the legacy
+// combinator produces the typed Node shape on the slice; the
+// `translate_*_offsets` helpers below lift slice-local ranges onto
+// the full source.
 // =====================================================================
 
 /// Compute a [`TokenRange`] for the byte span `[start, end)` against
