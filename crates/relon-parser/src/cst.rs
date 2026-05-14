@@ -24,13 +24,25 @@
 //! Scope
 //! =====
 //!
-//! P2 covers the structural surface: literals, identifiers, paths,
-//! references, lists, dicts (with pair attributes), unary / binary /
-//! ternary expressions, calls, closures. Higher-level constructs
-//! (`#schema`, `#main` signatures, `match`, `where`, comprehensions)
-//! and error-recovery refinement land in subsequent commits — the
-//! `ERROR` node already keeps the round-trip invariant honest for
-//! unimplemented cases.
+//! P2 (now complete) covers the full surface grammar:
+//!
+//! * Literals, identifiers, dotted paths, references.
+//! * Lists, dicts (with pair attributes + method-shorthand closures
+//!   + typed keys), list comprehensions.
+//! * Unary, binary (Pratt-precedence), call, postfix `.field` /
+//!   `[index]`, parenthesised closure (`(p) [-> R] => body`).
+//! * `expr match { ... }` and `expr where { ... }` postfix forms.
+//! * F-string decomposition into `F_STRING` + `F_STRING_LITERAL`
+//!   chunks + nested `F_STRING_INTERPOLATION` sub-nodes (whose
+//!   children are ordinary Relon expressions).
+//! * `TYPE_NODE` — dotted paths, generics, optional `?`.
+//! * Directive bodies dispatched by name: `#schema`/`#extend`
+//!   (name + generics + body + optional `with`), `#import`
+//!   (`<spec> from "path"`), `#main(typed-params) [-> Ret]`.
+//!
+//! P3 lives in `crate::ast` — typed-AST wrappers on top of this
+//! CST. P4 will migrate downstream crates (analyzer, evaluator,
+//! fmt, wasm, lsp) onto the new wrappers.
 
 use crate::lex;
 use crate::lex::utf8_codepoint_len_for_cst as utf8_codepoint_len;
