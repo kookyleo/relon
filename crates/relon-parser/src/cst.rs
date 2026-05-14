@@ -368,9 +368,61 @@ impl<'a> Parser<'a> {
 
     /// Parse a full expression. Operator precedence is climbed with a
     /// Pratt-style loop. Lowest precedence first; primary handles
-    /// atoms and prefix unaries.
+    /// atoms and prefix unaries. `match { ... }` and `where { ... }`
+    /// trail the binary chain as the outermost postfix forms — they
+    /// take precedence above ternary etc., matching the winnow
+    /// grammar in `expr.rs`.
     fn parse_expr(&mut self) {
+        let ck = self.checkpoint();
         self.parse_expr_bp(0);
+        loop {
+            if self.at(SyntaxKind::IDENT) && self.current_text() == Some("match") {
+                // Only commit to MATCH_EXPR when `match` is followed
+                // by `{` — otherwise it's a bareword called `match`
+                // somewhere unrelated.
+                if self.nth(1) == Some(SyntaxKind::L_BRACE) {
+                    self.open_at(ck, SyntaxKind::MATCH_EXPR);
+                    self.bump(); // `match`
+                    self.bump(); // {
+                    while !self.at(SyntaxKind::R_BRACE) && !self.at_end() {
+                        self.parse_match_arm();
+                        if !self.eat(SyntaxKind::COMMA) && !self.at(SyntaxKind::R_BRACE) {
+                            self.error_recover(
+                                "expected `,` or `}` in match",
+                                &[SyntaxKind::COMMA, SyntaxKind::R_BRACE],
+                            );
+                            self.eat(SyntaxKind::COMMA);
+                        }
+                    }
+                    self.expect(SyntaxKind::R_BRACE);
+                    self.close();
+                    continue;
+                }
+            }
+            break;
+        }
+    }
+
+    /// One match arm: `pattern: body`. Pattern is either a TYPE_NODE
+    /// (the common case) or `*` (the wildcard fallback). Body is a
+    /// regular expression.
+    fn parse_match_arm(&mut self) {
+        self.open(SyntaxKind::MATCH_ARM);
+        if self.at(SyntaxKind::STAR) {
+            self.open(SyntaxKind::WILDCARD);
+            self.bump();
+            self.close();
+        } else if self.at(SyntaxKind::IDENT) {
+            self.parse_type();
+        } else {
+            self.error_at_current("expected match-arm pattern");
+        }
+        if self.eat(SyntaxKind::COLON) {
+            self.parse_expr();
+        } else {
+            self.error("expected `:` in match arm");
+        }
+        self.close();
     }
 
     fn parse_expr_bp(&mut self, min_bp: u8) {
@@ -1233,6 +1285,26 @@ mod tests {
             lists.is_empty(),
             "comprehension `[...]` should not also produce a LIST"
         );
+    }
+
+    #[test]
+    fn match_expression_emits_match_node() {
+        let parsed = parse_round_trip(
+            "{ render(item): item match { Image: \"i\", Text: \"t\", * : \"u\" } }",
+        );
+        assert!(!parsed.has_errors(), "errors: {:?}", parsed.errors);
+        let matches: Vec<_> = parsed
+            .syntax()
+            .descendants()
+            .filter(|n| n.kind() == SyntaxKind::MATCH_EXPR)
+            .collect();
+        assert_eq!(matches.len(), 1);
+        let arms: Vec<_> = parsed
+            .syntax()
+            .descendants()
+            .filter(|n| n.kind() == SyntaxKind::MATCH_ARM)
+            .collect();
+        assert_eq!(arms.len(), 3);
     }
 
     #[test]
