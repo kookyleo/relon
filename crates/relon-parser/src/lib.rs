@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+pub mod ast;
 pub mod cst;
 pub mod decorator;
 pub mod directive;
