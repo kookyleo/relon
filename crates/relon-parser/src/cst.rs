@@ -439,7 +439,19 @@ impl<'a> Parser<'a> {
             // must not consume them — they belong to a dict field
             // following `#schema X` in a `: ...` context.
             if !self.peek_attribute_terminator() {
-                self.parse_expr();
+                // Schema bodies are typically dicts (`#schema U { ... }`)
+                // but the v1 grammar also accepts a type alias body
+                // (`#schema Status Enum<"on", "off">`). When the body
+                // looks like a bare type expression — IDENT immediately
+                // followed by `<...>` — parse it as a type so the
+                // string-literal generic args don't surprise the Pratt
+                // expression grammar (which would treat `<` as a
+                // binary comparison).
+                if self.peek_is_bare_type_body() {
+                    self.parse_type();
+                } else {
+                    self.parse_expr();
+                }
             }
         }
         // Optional `with { ... }` block — a structured method list.
@@ -455,6 +467,54 @@ impl<'a> Parser<'a> {
                 self.parse_schema_with();
             }
         }
+    }
+
+    /// True when the upcoming token stream is an IDENT followed
+    /// immediately (no intervening whitespace) by `<` — the type-alias
+    /// body shape `Enum<"on", "off">` / `Int` / `List<T>`. Used by
+    /// `parse_directive_name_body` to disambiguate the type-body shape
+    /// from a regular expression body. The IDENT-and-no-`<` case
+    /// (bare-type body like `#schema MyAlias String`) is also
+    /// classified as "type body" — the body is a single primitive
+    /// type identifier without generics.
+    fn peek_is_bare_type_body(&self) -> bool {
+        if !self.at(SyntaxKind::IDENT) {
+            return false;
+        }
+        // Only commit to the type body if the IDENT is one of the
+        // known type heads (`Int`, `String`, `Bool`, `List`, `Dict`,
+        // `Enum`, `Any`, `Null`, `Float`) — otherwise a regular
+        // expression with a leading IDENT is the safer fallback.
+        let head = self.current_text().unwrap_or("");
+        if !matches!(
+            head,
+            "Int" | "String" | "Bool" | "Float" | "Any" | "Null" | "List" | "Dict" | "Enum"
+        ) {
+            return false;
+        }
+        // For `Enum` specifically, only commit when followed by `<`
+        // (with no whitespace) — bare `Enum` isn't a sensible body.
+        // For other type heads, allow both `Int` (alone) and
+        // `List<T>` (with generics).
+        let head_idx = self.pos_skip_trivia();
+        let mut idx = head_idx + 1;
+        let mut had_ws = false;
+        while idx < self.tokens.len() && self.tokens[idx].0.is_trivia() {
+            had_ws = true;
+            idx += 1;
+        }
+        if self.tokens.get(idx).map(|(k, _)| *k) == Some(SyntaxKind::LT) && !had_ws {
+            return true;
+        }
+        // Bare type identifier (`#schema MyAlias String`) — only
+        // accept when nothing else follows on the line. We approximate
+        // "nothing else" by checking the next non-trivia token isn't
+        // a typical expression-continuation symbol.
+        head != "Enum"
+            && matches!(
+                self.tokens.get(idx).map(|(k, _)| *k),
+                Some(SyntaxKind::HASH) | Some(SyntaxKind::L_BRACE) | None
+            )
     }
 
     /// `with { (pragma | method)* }` — body of a `#schema` / `#extend`
@@ -855,15 +915,17 @@ impl<'a> Parser<'a> {
                 self.close();
             } else if self.at(SyntaxKind::DOT) || self.at(SyntaxKind::L_BRACK) {
                 // Path access — fold into VARIABLE_EXPR so dotted
-                // paths like `a.b.c` end up as a single node.
+                // paths like `a.b.c` end up as a single node. v1.8
+                // positional access `xs.0` (number after `.`) is the
+                // tuple/list index form — accepted alongside `.field`.
                 self.open_at(ck, SyntaxKind::VARIABLE_EXPR);
                 while self.at(SyntaxKind::DOT) || self.at(SyntaxKind::L_BRACK) {
                     if self.at(SyntaxKind::DOT) {
                         self.bump();
-                        if self.at(SyntaxKind::IDENT) {
+                        if self.at(SyntaxKind::IDENT) || self.at(SyntaxKind::NUMBER) {
                             self.bump();
                         } else {
-                            self.error_at_current("expected identifier after `.`");
+                            self.error_at_current("expected identifier or index after `.`");
                         }
                     } else {
                         // `[ index ]`
@@ -880,6 +942,24 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_atom(&mut self) {
+        // Leading attributes (`#brand T {...}` / `@decorator(x) expr`)
+        // stack above the atom they decorate. The CST keeps them as
+        // siblings of the atom inside whatever node the caller opened
+        // (typically a DICT_FIELD value, a LIST element, or a function
+        // argument). The legacy parser handled this case the same way
+        // — the attribute decorates whatever expression follows.
+        while self.at(SyntaxKind::HASH) || self.at(SyntaxKind::AT) {
+            // Guard: when `#` heads a directive whose body is bare
+            // (e.g. `#strict` standing alone at file scope), there's
+            // no following expression — `parse_attribute` consumes
+            // nothing extra, and the loop would spin. Break out the
+            // moment we see no progress.
+            let before = self.pos;
+            self.parse_attribute();
+            if self.pos == before {
+                break;
+            }
+        }
         match self.current() {
             Some(SyntaxKind::NUMBER) => {
                 self.open(SyntaxKind::LITERAL);
@@ -912,6 +992,15 @@ impl<'a> Parser<'a> {
                     // `foo.bar` member access still falls through to
                     // the postfix loop as VARIABLE_EXPR.
                     self.parse_variant_ctor();
+                } else if self.looks_like_type_atom() {
+                    // Bareword type expressions (`Dict<String, Int>`,
+                    // `List<Int>`, `Foo?`). Legacy `parse_type_expr`
+                    // lowers these into `Expr::Type`; we follow suit so
+                    // forms like `#brand Dict<String, Int> { ... }`
+                    // and `#schema Status Enum<"on", "off">` parse
+                    // cleanly without the Pratt grammar misreading
+                    // `<` as a comparison.
+                    self.parse_type();
                 } else {
                     self.open(SyntaxKind::VARIABLE_EXPR);
                     self.bump();
@@ -995,6 +1084,88 @@ impl<'a> Parser<'a> {
             return false;
         }
         self.tokens.get(idx).map(|(k, _)| *k) == Some(SyntaxKind::L_BRACE)
+    }
+
+    /// Decide whether the current IDENT atom heads a *type* expression
+    /// (`Dict<String, Int>`, `List<Int>`, `Foo?`). Legacy
+    /// `parse_type_expr` (`expr.rs`) lowers such atoms into
+    /// `Expr::Type`; downstream forms like `#brand Dict<K, V> { ... }`
+    /// rely on this so the value body isn't misread as `Dict < K`
+    /// (binary comparison).
+    ///
+    /// Conservative: only fires when the type-ness signal is
+    /// unambiguous — the IDENT is a known type head, OR is
+    /// immediately followed by `<...>` generics (no whitespace
+    /// before `<`), with the angle balance closing cleanly. A
+    /// trailing `?` (optional marker) also qualifies.
+    fn looks_like_type_atom(&self) -> bool {
+        if !self.at(SyntaxKind::IDENT) {
+            return false;
+        }
+        let head_text = self.current_text().unwrap_or("");
+        let head_idx = self.pos_skip_trivia();
+        let mut idx = head_idx + 1;
+        let mut had_ws = false;
+        while idx < self.tokens.len() && self.tokens[idx].0.is_trivia() {
+            had_ws = true;
+            idx += 1;
+        }
+        let known_head = matches!(
+            head_text,
+            "Int" | "String" | "Bool" | "Float" | "Any" | "Null" | "List" | "Dict" | "Enum"
+        );
+        // `IDENT < ...>` — type with generics. Requires `<`
+        // immediately adjacent (no whitespace).
+        if self.tokens.get(idx).map(|(k, _)| *k) == Some(SyntaxKind::LT) && !had_ws {
+            // Scan for the matching `>` while tracking parens.
+            let mut depth: i32 = 1;
+            let mut paren_depth: i32 = 0;
+            let mut j = idx + 1;
+            while j < self.tokens.len() && depth > 0 {
+                match self.tokens[j].0 {
+                    SyntaxKind::LT => depth += 1,
+                    SyntaxKind::GT => depth -= 1,
+                    SyntaxKind::L_PAREN => paren_depth += 1,
+                    SyntaxKind::R_PAREN if paren_depth > 0 => paren_depth -= 1,
+                    SyntaxKind::L_BRACE
+                    | SyntaxKind::R_BRACE
+                    | SyntaxKind::R_PAREN
+                    | SyntaxKind::FAT_ARROW
+                        if depth == 1 && paren_depth == 0 =>
+                    {
+                        return false
+                    }
+                    _ => {}
+                }
+                j += 1;
+            }
+            return depth == 0;
+        }
+        // Bare type head with no generics — only fires when the IDENT
+        // is recognised as a primitive type name. Guarded by what
+        // follows so plain VARIABLE_EXPR usage doesn't accidentally
+        // become a TYPE_NODE: must be followed by `{` (type-tagged
+        // dict body, `#brand T { ... }`) or `?` (optional marker).
+        if known_head {
+            let next = self.tokens.get(idx).map(|(k, _)| *k);
+            if matches!(next, Some(SyntaxKind::QUESTION) | Some(SyntaxKind::L_BRACE)) {
+                return true;
+            }
+        }
+        // `IDENT ? {` — user-defined schema with optional marker and
+        // an immediately-following brace body (`Weather? { ... }`).
+        // The optional `?` plus brace makes this unambiguously a
+        // type-tagged value, never a ternary expression head.
+        if self.tokens.get(idx).map(|(k, _)| *k) == Some(SyntaxKind::QUESTION) {
+            let mut j = idx + 1;
+            while j < self.tokens.len() && self.tokens[j].0.is_trivia() {
+                j += 1;
+            }
+            if self.tokens.get(j).map(|(k, _)| *k) == Some(SyntaxKind::L_BRACE) {
+                return true;
+            }
+        }
+        false
     }
 
     /// `Enum (.Variant)+ { body }` — emit a VARIANT_CTOR node wrapping
@@ -1517,12 +1688,14 @@ impl<'a> Parser<'a> {
                     SyntaxKind::L_PAREN => paren_depth += 1,
                     SyntaxKind::R_PAREN if paren_depth > 0 => paren_depth -= 1,
                     // Anything that strongly disqualifies a type
-                    // expression — bail.
+                    // expression — bail. Commas at depth==1 are
+                    // fine (`Dict<String, Int>`) — only structural
+                    // tokens that can never appear inside a type
+                    // disqualify the scan.
                     SyntaxKind::L_BRACE
                     | SyntaxKind::R_BRACE
                     | SyntaxKind::R_PAREN
                     | SyntaxKind::FAT_ARROW
-                    | SyntaxKind::COMMA
                         if depth == 1 && paren_depth == 0 =>
                     {
                         return false
@@ -1596,6 +1769,13 @@ impl<'a> Parser<'a> {
                     break;
                 }
                 self.parse_type();
+                // `Enum<Variant { field: T, ... }, ...>` — a struct-
+                // variant body inside a sum-type's generic-arg list.
+                // The body is a dict of field-type pairs; we accept
+                // any DICT here and let the analyzer enforce shape.
+                if self.at(SyntaxKind::L_BRACE) {
+                    self.parse_dict();
+                }
                 if !self.eat(SyntaxKind::COMMA) {
                     break;
                 }
@@ -1652,10 +1832,10 @@ impl<'a> Parser<'a> {
         while self.at(SyntaxKind::DOT) || self.at(SyntaxKind::L_BRACK) {
             if self.at(SyntaxKind::DOT) {
                 self.bump();
-                if self.at(SyntaxKind::IDENT) {
+                if self.at(SyntaxKind::IDENT) || self.at(SyntaxKind::NUMBER) {
                     self.bump();
                 } else {
-                    self.error_at_current("expected identifier after `.`");
+                    self.error_at_current("expected identifier or index after `.`");
                 }
             } else {
                 self.bump(); // [
@@ -2567,6 +2747,42 @@ mod tests {
     }
 
     #[test]
+    fn tuple_index_access_round_trips() {
+        // v1.8 positional access `xs.0` — number after the dot is a
+        // valid path tail, alongside identifier-style `xs.field`.
+        let parsed = parse_round_trip("{ Int head: xs.0 }");
+        assert!(!parsed.has_errors(), "errors: {:?}", parsed.errors);
+    }
+
+    #[test]
+    fn type_atom_for_brand_directive_body() {
+        // `#brand Dict<String, Int> { ... }` — the brand directive's
+        // body is a type-tagged dict. The leading IDENT `Dict` (a
+        // known type head) must lower into a TYPE_NODE so the
+        // generics aren't mistaken for binary `<` / `>` operators.
+        let src = "{ counters: #brand Dict<String, Int> { hits: 1 } }";
+        let parsed = parse_round_trip(src);
+        assert!(!parsed.has_errors(), "errors: {:?}", parsed.errors);
+        let types: Vec<_> = parsed
+            .syntax()
+            .descendants()
+            .filter(|n| n.kind() == SyntaxKind::TYPE_NODE)
+            .collect();
+        assert!(!types.is_empty(), "expected a TYPE_NODE for Dict<...>");
+    }
+
+    #[test]
+    fn enum_with_struct_variant_inside_generic_args() {
+        // v1.8 Phase C: sum-type generics admit a struct-variant body
+        // (`Enum<Variant { field: Type }>`) as one of the generic
+        // arguments. Round-trip captures the inner `{ ... }` as a
+        // child of the outer TYPE_NODE.
+        let src = "#schema Pair<T, U> Enum<Both { left: T, right: U }>\n{}\n";
+        let parsed = parse_round_trip(src);
+        assert!(!parsed.has_errors(), "errors: {:?}", parsed.errors);
+    }
+
+    #[test]
     fn typed_spread_round_trips() {
         // v1.3 typed spread `...<Type> expr`. The `<Type>` annotation
         // lands inside the SPREAD_EXPR; the source expression follows.
@@ -2647,7 +2863,14 @@ mod tests {
         // grammar). Tuple types `(T1, T2)` brought the floor to 165.
         // Typed spreads `...<Type> expr` brought it to 170.
         // Schema with-block structured method nodes brought it to 198.
-        const FLOOR: usize = 198;
+        // Tuple-index `.N` access, type-atom recognition for
+        // `#brand Dict<K, V> { ... }` / `Weather? { ... }`,
+        // Enum-with-struct-variant inside generic args, and
+        // expression-level leading attributes brought it to 208.
+        // The remaining two `.relon` files
+        // (`with_block_invalid/*.relon`) are intentional parse-error
+        // fixtures used by the legacy parser's negative test suite.
+        const FLOOR: usize = 208;
         let clean = fixture_clean_parse_count();
         eprintln!("[parser] fixtures clean-parse count: {clean}");
         assert!(
