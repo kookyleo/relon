@@ -716,6 +716,14 @@ impl<'a> Parser<'a> {
                     self.open(SyntaxKind::LITERAL);
                     self.bump();
                     self.close();
+                } else if self.looks_like_variant_ctor() {
+                    // `Enum.Variant { ... }` — at least two dotted
+                    // segments followed by a brace body. Legacy
+                    // `parse_variant_ctor` requires `path.len() >= 2`
+                    // before committing; we match that here so plain
+                    // `foo.bar` member access still falls through to
+                    // the postfix loop as VARIABLE_EXPR.
+                    self.parse_variant_ctor();
                 } else {
                     self.open(SyntaxKind::VARIABLE_EXPR);
                     self.bump();
@@ -755,6 +763,69 @@ impl<'a> Parser<'a> {
             }
             _ => self.error_at_current("expected expression"),
         }
+    }
+
+    /// Look ahead past the current IDENT for an `IDENT (DOT IDENT)+ {`
+    /// sequence — the variant-constructor shape `Enum.Variant { ... }`
+    /// the legacy `parse_variant_ctor` (`expr.rs`) detects. Returns
+    /// true only when at least two dotted segments precede the `{`,
+    /// matching the legacy `path.len() < 2` guard. Anything else
+    /// (single-segment IDENT, dotted-path member access without a
+    /// trailing brace) falls through to the regular VARIABLE_EXPR path.
+    fn looks_like_variant_ctor(&self) -> bool {
+        if !self.at(SyntaxKind::IDENT) {
+            return false;
+        }
+        let mut idx = self.pos_skip_trivia() + 1;
+        let advance_trivia = |i: &mut usize, toks: &[(SyntaxKind, &str)]| {
+            while *i < toks.len() && toks[*i].0.is_trivia() {
+                *i += 1;
+            }
+        };
+        advance_trivia(&mut idx, &self.tokens);
+        let mut segs: usize = 1;
+        while self.tokens.get(idx).map(|(k, _)| *k) == Some(SyntaxKind::DOT) {
+            idx += 1;
+            advance_trivia(&mut idx, &self.tokens);
+            if self.tokens.get(idx).map(|(k, _)| *k) != Some(SyntaxKind::IDENT) {
+                return false;
+            }
+            idx += 1;
+            segs += 1;
+            advance_trivia(&mut idx, &self.tokens);
+        }
+        if segs < 2 {
+            return false;
+        }
+        self.tokens.get(idx).map(|(k, _)| *k) == Some(SyntaxKind::L_BRACE)
+    }
+
+    /// `Enum (.Variant)+ { body }` — emit a VARIANT_CTOR node wrapping
+    /// the dotted path (as plain IDENT + DOT tokens) and the brace
+    /// body (a regular DICT). Caller has already determined via
+    /// [`Self::looks_like_variant_ctor`] that we're at the head IDENT
+    /// of such a construct.
+    fn parse_variant_ctor(&mut self) {
+        self.open(SyntaxKind::VARIANT_CTOR);
+        // Head IDENT.
+        self.bump();
+        // Drain `.IDENT*` — guaranteed at least one by the peek.
+        while self.at(SyntaxKind::DOT) {
+            self.bump();
+            if self.at(SyntaxKind::IDENT) {
+                self.bump();
+            } else {
+                self.error_at_current("expected identifier after `.` in variant constructor");
+                break;
+            }
+        }
+        // Body is a regular dict literal.
+        if self.at(SyntaxKind::L_BRACE) {
+            self.parse_dict();
+        } else {
+            self.error("expected `{` in variant constructor");
+        }
+        self.close();
     }
 
     /// Index into `tokens` of the next non-trivia token. Caller must
@@ -1996,6 +2067,44 @@ mod tests {
     #[test]
     fn unknown_byte_does_not_crash() {
         parse_round_trip("{ x: \u{0000} 1 }");
+    }
+
+    #[test]
+    fn variant_ctor_emits_variant_node() {
+        let parsed = parse_round_trip("{ x: Result.Ok { value: 1 } }");
+        assert!(!parsed.has_errors(), "errors: {:?}", parsed.errors);
+        let vc: Vec<_> = parsed
+            .syntax()
+            .descendants()
+            .filter(|n| n.kind() == SyntaxKind::VARIANT_CTOR)
+            .collect();
+        assert_eq!(vc.len(), 1);
+    }
+
+    #[test]
+    fn variant_ctor_three_segment_path() {
+        let parsed = parse_round_trip("{ x: Foo.Bar.Baz { field: 1 } }");
+        assert!(!parsed.has_errors(), "errors: {:?}", parsed.errors);
+        let vc: Vec<_> = parsed
+            .syntax()
+            .descendants()
+            .filter(|n| n.kind() == SyntaxKind::VARIANT_CTOR)
+            .collect();
+        assert_eq!(vc.len(), 1);
+    }
+
+    #[test]
+    fn dotted_access_without_brace_stays_variable() {
+        // `foo.bar` alone is member access — must NOT become a
+        // VARIANT_CTOR. Walks the post-fix path the same as before.
+        let parsed = parse_round_trip("{ x: foo.bar }");
+        assert!(!parsed.has_errors(), "errors: {:?}", parsed.errors);
+        let vc: Vec<_> = parsed
+            .syntax()
+            .descendants()
+            .filter(|n| n.kind() == SyntaxKind::VARIANT_CTOR)
+            .collect();
+        assert!(vc.is_empty(), "single dotted access should not be a ctor");
     }
 
     #[test]
