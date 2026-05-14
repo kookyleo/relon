@@ -238,8 +238,7 @@ impl rowan::Language for RelonLanguage {
     type Kind = SyntaxKind;
 
     fn kind_from_raw(raw: rowan::SyntaxKind) -> Self::Kind {
-        SyntaxKind::from_raw(raw.0)
-            .unwrap_or_else(|| panic!("raw kind out of range: {raw:?}"))
+        SyntaxKind::from_raw(raw.0).unwrap_or_else(|| panic!("raw kind out of range: {raw:?}"))
     }
 
     fn kind_to_raw(kind: Self::Kind) -> rowan::SyntaxKind {

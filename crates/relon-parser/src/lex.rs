@@ -386,8 +386,7 @@ mod tests {
     /// the central invariant that justifies the lossless tree.
     fn assert_round_trip(source: &str) {
         let tokens = lex(source);
-        let reconstructed: String =
-            tokens.iter().map(|(_, t)| *t).collect();
+        let reconstructed: String = tokens.iter().map(|(_, t)| *t).collect();
         assert_eq!(reconstructed, source, "round-trip mismatch");
         // And every token covers at least one byte.
         for (kind, text) in &tokens {
@@ -413,7 +412,9 @@ mod tests {
 
     #[test]
     fn punctuation_and_operators() {
-        assert_round_trip("{ } [ ] ( ) , : . @ # & ? = == != <= >= && || ++ => -> + - * / % < > ! | ...");
+        assert_round_trip(
+            "{ } [ ] ( ) , : . @ # & ? = == != <= >= && || ++ => -> + - * / % < > ! | ...",
+        );
     }
 
     #[test]
@@ -423,9 +424,7 @@ mod tests {
 
     #[test]
     fn strings_normal_raw_f() {
-        assert_round_trip(
-            r###""hi" "esc\"d" r"raw" r#"r#hash"# f"fs ${x+1}" f"plain""###,
-        );
+        assert_round_trip(r###""hi" "esc\"d" r"raw" r#"r#hash"# f"fs ${x+1}" f"plain""###);
     }
 
     #[test]
@@ -506,14 +505,10 @@ mod tests {
             "no .relon fixtures found under {workspace_root:?}"
         );
         for path in files {
-            let source = fs::read_to_string(&path)
-                .unwrap_or_else(|e| panic!("read {path:?}: {e}"));
+            let source = fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path:?}: {e}"));
             let tokens = lex(&source);
             let reconstructed: String = tokens.iter().map(|(_, t)| *t).collect();
-            assert_eq!(
-                reconstructed, source,
-                "lex/round-trip mismatch on {path:?}"
-            );
+            assert_eq!(reconstructed, source, "lex/round-trip mismatch on {path:?}");
         }
     }
 

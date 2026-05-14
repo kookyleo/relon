@@ -465,8 +465,18 @@ impl<'a> Parser<'a> {
             Some(SyntaxKind::L_BRACE) => self.parse_dict(),
             Some(SyntaxKind::L_BRACK) => self.parse_list(),
             Some(SyntaxKind::L_PAREN) => {
-                // Parenthesised expression (P2 has no closure syntax
-                // detection yet — added with closures production).
+                // Two shapes share the leading `(`:
+                //   1. `(p1, p2) [-> RetType] => body` — a closure.
+                //   2. `(expr)`                       — a parenthesised
+                //      group (or, theoretically, a tuple, but the v1
+                //      grammar treats tuples only as TYPE expressions).
+                // We use lookahead to commit to the closure shape only
+                // when we can see the trailing `=>` (after the optional
+                // return type) — anything else stays as a group so the
+                // round-trip never regresses on edge cases.
+                if self.try_parse_paren_closure() {
+                    return;
+                }
                 self.bump();
                 self.parse_expr();
                 self.expect(SyntaxKind::R_PAREN);
@@ -494,6 +504,270 @@ impl<'a> Parser<'a> {
             idx += 1;
         }
         idx
+    }
+
+    /// Scan forward (without committing) starting from `start_idx`,
+    /// past a balanced `(...)`, returning the index of the first
+    /// non-trivia token AFTER the closing `)`. `start_idx` must point
+    /// at the opening `L_PAREN` token. Returns `None` if the parens
+    /// are unbalanced (we ran past EOI before matching).
+    fn scan_after_matching_paren(&self, start_idx: usize) -> Option<usize> {
+        debug_assert!(self.tokens.get(start_idx).map(|(k, _)| *k) == Some(SyntaxKind::L_PAREN));
+        let mut depth: i32 = 0;
+        let mut idx = start_idx;
+        while idx < self.tokens.len() {
+            let kind = self.tokens[idx].0;
+            match kind {
+                SyntaxKind::L_PAREN => depth += 1,
+                SyntaxKind::R_PAREN => {
+                    depth -= 1;
+                    if depth == 0 {
+                        let mut next = idx + 1;
+                        while next < self.tokens.len() && self.tokens[next].0.is_trivia() {
+                            next += 1;
+                        }
+                        return Some(next);
+                    }
+                }
+                _ => {}
+            }
+            idx += 1;
+        }
+        None
+    }
+
+    /// Without consuming anything, decide whether the `(...)` at the
+    /// current position is followed (modulo an optional `-> Type`) by
+    /// a `=>` arrow — i.e. the parens are a closure parameter list,
+    /// not a parenthesised expression. We're already at the
+    /// `L_PAREN`.
+    fn looks_like_closure_after_paren(&self) -> bool {
+        let lparen_idx = self.pos_skip_trivia();
+        let Some(after_paren) = self.scan_after_matching_paren(lparen_idx) else {
+            return false;
+        };
+        // `=> ...`?
+        if matches!(
+            self.tokens.get(after_paren).map(|(k, _)| *k),
+            Some(SyntaxKind::FAT_ARROW)
+        ) {
+            return true;
+        }
+        // `-> RetType => ...`? Skip past the return-type tokens. We
+        // can't fully parse a type without committing, so scan ahead
+        // conservatively until we hit `=>` (closure) or anything that
+        // disqualifies (newline-like break is fine — trivia is skipped
+        // by definition, but we treat `,`/`}`/`]`/`)`/`:` as a
+        // disqualifier so we never confuse `-> Type:` patterns).
+        if matches!(
+            self.tokens.get(after_paren).map(|(k, _)| *k),
+            Some(SyntaxKind::THIN_ARROW)
+        ) {
+            let mut idx = after_paren + 1;
+            let mut bracket_depth: i32 = 0;
+            while idx < self.tokens.len() {
+                let kind = self.tokens[idx].0;
+                if kind.is_trivia() {
+                    idx += 1;
+                    continue;
+                }
+                match kind {
+                    SyntaxKind::FAT_ARROW if bracket_depth == 0 => return true,
+                    SyntaxKind::COMMA
+                    | SyntaxKind::R_BRACE
+                    | SyntaxKind::R_BRACK
+                    | SyntaxKind::R_PAREN
+                    | SyntaxKind::COLON
+                        if bracket_depth == 0 =>
+                    {
+                        return false
+                    }
+                    SyntaxKind::L_BRACE
+                    | SyntaxKind::L_BRACK
+                    | SyntaxKind::L_PAREN
+                    | SyntaxKind::LT => {
+                        bracket_depth += 1;
+                    }
+                    SyntaxKind::R_BRACE | SyntaxKind::R_BRACK | SyntaxKind::GT => {
+                        if bracket_depth > 0 {
+                            bracket_depth -= 1;
+                        }
+                    }
+                    _ => {}
+                }
+                idx += 1;
+            }
+        }
+        false
+    }
+
+    /// When `current()` is `L_PAREN` and `looks_like_closure_after_paren`
+    /// is true, consume the entire `(params) [-> RetType] => body`
+    /// construct and emit a CLOSURE node. Returns true on success.
+    /// Leaves the parser untouched and returns false otherwise.
+    fn try_parse_paren_closure(&mut self) -> bool {
+        if !self.at(SyntaxKind::L_PAREN) {
+            return false;
+        }
+        if !self.looks_like_closure_after_paren() {
+            return false;
+        }
+        self.open(SyntaxKind::CLOSURE);
+        self.bump(); // (
+                     // Comma-separated CLOSURE_PARAMs.
+        while !self.at(SyntaxKind::R_PAREN) && !self.at_end() {
+            self.parse_closure_param();
+            if !self.eat(SyntaxKind::COMMA) && !self.at(SyntaxKind::R_PAREN) {
+                self.error_recover(
+                    "expected `,` or `)` in closure parameter list",
+                    &[SyntaxKind::COMMA, SyntaxKind::R_PAREN],
+                );
+                self.eat(SyntaxKind::COMMA);
+            }
+        }
+        self.expect(SyntaxKind::R_PAREN);
+        // Optional `-> RetType`.
+        if self.eat(SyntaxKind::THIN_ARROW) {
+            self.parse_type();
+        }
+        if self.expect(SyntaxKind::FAT_ARROW) {
+            self.parse_expr();
+        }
+        self.close();
+        true
+    }
+
+    /// One closure parameter — either `name` or `Type name`. P2
+    /// records the type, when present, as a TYPE_NODE child preceding
+    /// the IDENT.
+    fn parse_closure_param(&mut self) {
+        self.open(SyntaxKind::CLOSURE_PARAM);
+        // Heuristic: if the next two non-trivia tokens are IDENT IDENT
+        // (or a more elaborate type followed by an ident), treat the
+        // leading run as a TypeNode. We delegate to `parse_type` which
+        // commits conservatively (it stops at the first non-type-y
+        // token, so a bare `IDENT` doesn't get swallowed as a type).
+        // The simplest signal of "this is a typed param" is that
+        // there are at least two adjacent IDENTs, possibly with `<...>`
+        // / `?` in the type slot.
+        if self.peek_is_typed_param() {
+            self.parse_type();
+        }
+        if self.at(SyntaxKind::IDENT) {
+            self.bump();
+        } else {
+            self.error_at_current("expected closure parameter name");
+        }
+        self.close();
+    }
+
+    /// Cheap lookahead: does the upcoming token stream look like
+    /// `Type ident` (a typed closure parameter) or just `ident`
+    /// (untyped)? We say "typed" if the current token is IDENT and
+    /// the next non-trivia token after a `Type`-shaped run is another
+    /// IDENT — meaning the first one is the type and the second is
+    /// the param name. We allow `<...>` and `?` between them.
+    fn peek_is_typed_param(&self) -> bool {
+        if !self.at(SyntaxKind::IDENT) {
+            return false;
+        }
+        // Walk past IDENT, optional `.IDENT*`, optional `<...>`,
+        // optional `?`, then check for IDENT.
+        let mut idx = self.pos_skip_trivia() + 1;
+        let advance_trivia = |i: &mut usize| {
+            while *i < self.tokens.len() && self.tokens[*i].0.is_trivia() {
+                *i += 1;
+            }
+        };
+        advance_trivia(&mut idx);
+        // `.IDENT*`
+        while idx < self.tokens.len() && self.tokens[idx].0 == SyntaxKind::DOT {
+            idx += 1;
+            advance_trivia(&mut idx);
+            if self.tokens.get(idx).map(|(k, _)| *k) == Some(SyntaxKind::IDENT) {
+                idx += 1;
+                advance_trivia(&mut idx);
+            } else {
+                return false;
+            }
+        }
+        // `<...>` — balanced angle scan.
+        if self.tokens.get(idx).map(|(k, _)| *k) == Some(SyntaxKind::LT) {
+            let mut depth: i32 = 1;
+            idx += 1;
+            while idx < self.tokens.len() && depth > 0 {
+                match self.tokens[idx].0 {
+                    SyntaxKind::LT => depth += 1,
+                    SyntaxKind::GT => depth -= 1,
+                    // Anything that strongly disqualifies a type
+                    // expression — bail.
+                    SyntaxKind::L_BRACE
+                    | SyntaxKind::R_BRACE
+                    | SyntaxKind::R_PAREN
+                    | SyntaxKind::FAT_ARROW
+                    | SyntaxKind::COMMA
+                        if depth == 1 =>
+                    {
+                        return false
+                    }
+                    _ => {}
+                }
+                idx += 1;
+            }
+            if depth != 0 {
+                return false;
+            }
+            advance_trivia(&mut idx);
+        }
+        // Optional `?`.
+        if self.tokens.get(idx).map(|(k, _)| *k) == Some(SyntaxKind::QUESTION) {
+            idx += 1;
+            advance_trivia(&mut idx);
+        }
+        self.tokens.get(idx).map(|(k, _)| *k) == Some(SyntaxKind::IDENT)
+    }
+
+    /// Parse a type-expression-shaped run of tokens into a TYPE_NODE.
+    /// The grammar is approximate at this stage — refined later by
+    /// the dedicated TYPE_NODE slice. For now we accept:
+    ///   ident (`.` ident)* (`<` types `>`)? `?`?
+    /// which covers every shape closure-param + #main + schema-field
+    /// types actually use in the corpus.
+    fn parse_type(&mut self) {
+        self.open(SyntaxKind::TYPE_NODE);
+        if self.at(SyntaxKind::IDENT) {
+            self.bump();
+        } else {
+            self.error_at_current("expected type name");
+            self.close();
+            return;
+        }
+        while self.at(SyntaxKind::DOT) {
+            self.bump();
+            if self.at(SyntaxKind::IDENT) {
+                self.bump();
+            } else {
+                self.error_at_current("expected identifier after `.` in type");
+            }
+        }
+        if self.at(SyntaxKind::LT) {
+            self.bump();
+            // Comma-separated nested types.
+            loop {
+                if self.at(SyntaxKind::GT) || self.at_end() {
+                    break;
+                }
+                self.parse_type();
+                if !self.eat(SyntaxKind::COMMA) {
+                    break;
+                }
+            }
+            self.expect(SyntaxKind::GT);
+        }
+        if self.at(SyntaxKind::QUESTION) {
+            self.bump();
+        }
+        self.close();
     }
 
     fn parse_reference(&mut self) {
@@ -578,30 +852,147 @@ impl<'a> Parser<'a> {
             self.close();
             return;
         }
+        // Optional leading type hint: `Type key: value` /
+        // `Type key(params): body`. We commit only when peeking
+        // suggests a typed-key shape — otherwise the leading run is
+        // the key itself (e.g. a single identifier).
+        if self.peek_is_typed_dict_key() {
+            self.parse_type();
+        }
         if self.at(SyntaxKind::IDENT) || self.at(SyntaxKind::STRING) {
             self.bump();
+        } else if self.at(SyntaxKind::L_BRACK) {
+            // Dynamic key `[expr]: value`.
+            self.bump();
+            // Optional `<T>` type-hint between `[` and the expression.
+            if self.at(SyntaxKind::LT) {
+                self.bump();
+                self.parse_type();
+                self.expect(SyntaxKind::GT);
+            }
+            self.parse_expr();
+            self.expect(SyntaxKind::R_BRACK);
         } else {
             self.error_recover(
                 "expected dict key",
-                &[
-                    SyntaxKind::COLON,
-                    SyntaxKind::COMMA,
-                    SyntaxKind::R_BRACE,
-                ],
+                &[SyntaxKind::COLON, SyntaxKind::COMMA, SyntaxKind::R_BRACE],
             );
         }
-        // Either `:` value, or `(params): body` (closure-typed
-        // pair). v1 just consumes the `(...)` as call-args; the
-        // typed layer will recognise the closure shape.
+        // Method-shorthand closure: `key(params) [-> Ret]: body`.
+        // Detect via a `(` immediately after the key. We commit to the
+        // closure interpretation whenever a `(` follows the key, since
+        // the v1 grammar already reserves that position exclusively
+        // for the method shorthand.
         if self.at(SyntaxKind::L_PAREN) {
-            self.parse_call_args();
-        }
-        if self.eat(SyntaxKind::COLON) {
+            // Emit `(params) [-> Ret]` as a CLOSURE_PARAM list now;
+            // the body that follows the `:` will be wrapped together
+            // with the params into a CLOSURE node via a checkpoint.
+            let closure_ck = self.checkpoint();
+            self.bump(); // (
+            while !self.at(SyntaxKind::R_PAREN) && !self.at_end() {
+                self.parse_closure_param();
+                if !self.eat(SyntaxKind::COMMA) && !self.at(SyntaxKind::R_PAREN) {
+                    self.error_recover(
+                        "expected `,` or `)` in closure parameter list",
+                        &[SyntaxKind::COMMA, SyntaxKind::R_PAREN],
+                    );
+                    self.eat(SyntaxKind::COMMA);
+                }
+            }
+            self.expect(SyntaxKind::R_PAREN);
+            // Optional `-> RetType`.
+            if self.eat(SyntaxKind::THIN_ARROW) {
+                self.parse_type();
+            }
+            if self.eat(SyntaxKind::COLON) {
+                self.open_at(closure_ck, SyntaxKind::CLOSURE);
+                self.parse_expr();
+                self.close();
+            } else {
+                self.error("expected `:` in dict field");
+            }
+        } else if self.eat(SyntaxKind::COLON) {
             self.parse_expr();
         } else {
             self.error("expected `:` in dict field");
         }
         self.close();
+    }
+
+    /// Does the upcoming token stream start with a Type-shaped run
+    /// followed by an IDENT (or STRING) and then `:` / `(` (i.e. a
+    /// typed-dict-key, NOT a dotted-path or a bare key)? Conservative
+    /// — false negatives are fine (the field still parses untyped),
+    /// but a false positive would consume the key as a type.
+    fn peek_is_typed_dict_key(&self) -> bool {
+        // Same logic as peek_is_typed_param, but we also accept STRING
+        // as the trailing key segment, and we require a following
+        // `:` or `(` so a dotted-path-as-value doesn't trip us up.
+        if !self.at(SyntaxKind::IDENT) {
+            return false;
+        }
+        let mut idx = self.pos_skip_trivia() + 1;
+        let advance_trivia = |i: &mut usize, toks: &[(SyntaxKind, &str)]| {
+            while *i < toks.len() && toks[*i].0.is_trivia() {
+                *i += 1;
+            }
+        };
+        advance_trivia(&mut idx, self.tokens);
+        while idx < self.tokens.len() && self.tokens[idx].0 == SyntaxKind::DOT {
+            idx += 1;
+            advance_trivia(&mut idx, self.tokens);
+            if self.tokens.get(idx).map(|(k, _)| *k) == Some(SyntaxKind::IDENT) {
+                idx += 1;
+                advance_trivia(&mut idx, self.tokens);
+            } else {
+                return false;
+            }
+        }
+        let saw_generics = self.tokens.get(idx).map(|(k, _)| *k) == Some(SyntaxKind::LT);
+        if saw_generics {
+            let mut depth: i32 = 1;
+            idx += 1;
+            while idx < self.tokens.len() && depth > 0 {
+                match self.tokens[idx].0 {
+                    SyntaxKind::LT => depth += 1,
+                    SyntaxKind::GT => depth -= 1,
+                    SyntaxKind::L_BRACE
+                    | SyntaxKind::R_BRACE
+                    | SyntaxKind::R_PAREN
+                    | SyntaxKind::FAT_ARROW
+                    | SyntaxKind::THIN_ARROW
+                    | SyntaxKind::COLON
+                        if depth == 1 =>
+                    {
+                        return false
+                    }
+                    _ => {}
+                }
+                idx += 1;
+            }
+            if depth != 0 {
+                return false;
+            }
+            advance_trivia(&mut idx, self.tokens);
+        }
+        let saw_question = self.tokens.get(idx).map(|(k, _)| *k) == Some(SyntaxKind::QUESTION);
+        if saw_question {
+            idx += 1;
+            advance_trivia(&mut idx, self.tokens);
+        }
+        // Now we must see IDENT or STRING (the key) followed by `:`
+        // or `(`. If neither, the leading run wasn't a type — bail
+        // and let the surrounding parser treat it as the key itself.
+        if !matches!(
+            self.tokens.get(idx).map(|(k, _)| *k),
+            Some(SyntaxKind::IDENT) | Some(SyntaxKind::STRING)
+        ) {
+            return false;
+        }
+        let mut after_key = idx + 1;
+        advance_trivia(&mut after_key, self.tokens);
+        let next = self.tokens.get(after_key).map(|(k, _)| *k);
+        matches!(next, Some(SyntaxKind::COLON) | Some(SyntaxKind::L_PAREN))
     }
 
     fn parse_call_args(&mut self) {
@@ -689,9 +1080,7 @@ mod tests {
 
     #[test]
     fn nested_dict_and_list() {
-        parse_round_trip(
-            "{\n    foo: [1, 2, 3],\n    bar: { baz: \"hi\" }\n}\n",
-        );
+        parse_round_trip("{\n    foo: [1, 2, 3],\n    bar: { baz: \"hi\" }\n}\n");
     }
 
     #[test]
@@ -724,18 +1113,52 @@ mod tests {
     }
 
     #[test]
-    fn closure_shaped_pair_uses_call_args() {
-        // v1 (P2): `name(p1, p2): body` parses as DICT_FIELD with
-        // a CALL_ARG before the colon. P3 will reinterpret this as
-        // a closure; for now we just verify the shape round-trips.
-        parse_round_trip("{ add(a, b): a + b }");
+    fn method_shorthand_emits_closure() {
+        let parsed = parse_round_trip("{ add(a, b): a + b }");
+        assert!(!parsed.has_errors());
+        let closures: Vec<_> = parsed
+            .syntax()
+            .descendants()
+            .filter(|n| n.kind() == SyntaxKind::CLOSURE)
+            .collect();
+        assert_eq!(closures.len(), 1, "expected exactly one CLOSURE node");
+        let params: Vec<_> = closures[0]
+            .descendants()
+            .filter(|n| n.kind() == SyntaxKind::CLOSURE_PARAM)
+            .collect();
+        assert_eq!(params.len(), 2, "expected two CLOSURE_PARAMs");
+    }
+
+    #[test]
+    fn standalone_paren_closure() {
+        let parsed = parse_round_trip("{ f: (a, b) => a + b }");
+        assert!(!parsed.has_errors());
+        let closures: Vec<_> = parsed
+            .syntax()
+            .descendants()
+            .filter(|n| n.kind() == SyntaxKind::CLOSURE)
+            .collect();
+        assert_eq!(closures.len(), 1);
+    }
+
+    #[test]
+    fn typed_closure_param_records_type_node() {
+        let parsed = parse_round_trip("{ add(Int a, Int b): a + b }");
+        assert!(!parsed.has_errors());
+        let type_nodes: Vec<_> = parsed
+            .syntax()
+            .descendants()
+            .filter(|n| n.kind() == SyntaxKind::TYPE_NODE)
+            .collect();
+        assert!(
+            type_nodes.len() >= 2,
+            "expected TYPE_NODEs for typed params"
+        );
     }
 
     #[test]
     fn comments_round_trip() {
-        parse_round_trip(
-            "// header\n{\n    // inner\n    x: 1, /* trail */ y: 2\n}\n",
-        );
+        parse_round_trip("// header\n{\n    // inner\n    x: 1, /* trail */ y: 2\n}\n");
     }
 
     #[test]
@@ -750,6 +1173,53 @@ mod tests {
     #[test]
     fn unknown_byte_does_not_crash() {
         parse_round_trip("{ x: \u{0000} 1 }");
+    }
+
+    /// Monotonic floor on how many checked-in `.relon` fixtures parse
+    /// without ANY ERROR nodes. Each P2 slice MUST raise this number;
+    /// regressions need a deliberate, recorded reason.
+    ///
+    /// The floor starts at 30 (closures slice). Bump it as more P2
+    /// grammar lands.
+    #[test]
+    fn fixtures_clean_parse_floor() {
+        // Each P2 slice bumps the floor. At slice 1 (closures) we hit
+        // ~60 of ~210 — the directive / match / where / type slices
+        // will push this much higher.
+        const FLOOR: usize = 55;
+        let clean = fixture_clean_parse_count();
+        eprintln!("[parser] fixtures clean-parse count: {clean}");
+        assert!(
+            clean >= FLOOR,
+            "regressed clean-parse count: floor={FLOOR}, actual={clean}",
+        );
+    }
+
+    fn fixture_clean_parse_count() -> usize {
+        use std::fs;
+        use std::path::PathBuf;
+
+        let crate_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let workspace_root = crate_dir
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("workspace root")
+            .to_path_buf();
+        let mut files = Vec::new();
+        walk(&workspace_root, &mut files);
+        files.retain(|p| !p.to_string_lossy().contains("/target/"));
+        let mut clean = 0usize;
+        for path in files {
+            let source = fs::read_to_string(&path).unwrap_or_default();
+            if source.is_empty() {
+                continue;
+            }
+            let parsed = parse_cst(&source);
+            if !parsed.has_errors() {
+                clean += 1;
+            }
+        }
+        clean
     }
 
     /// The strongest invariant: every checked-in `.relon` file
@@ -773,14 +1243,10 @@ mod tests {
         files.retain(|p| !p.to_string_lossy().contains("/target/"));
         assert!(!files.is_empty());
         for path in files {
-            let source = fs::read_to_string(&path)
-                .unwrap_or_else(|e| panic!("read {path:?}: {e}"));
+            let source = fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path:?}: {e}"));
             let parsed = parse_cst(&source);
             let reconstructed = parsed.syntax().text().to_string();
-            assert_eq!(
-                reconstructed, source,
-                "round-trip mismatch on {path:?}"
-            );
+            assert_eq!(reconstructed, source, "round-trip mismatch on {path:?}");
         }
     }
 
