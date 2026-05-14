@@ -2176,8 +2176,9 @@ mod tests {
     fn fixtures_clean_parse_floor() {
         // Each P2 slice bumps the floor. At slice 1 (closures) we hit
         // ~60 of ~210 — the directive / match / where / type slices
-        // will push this much higher.
-        const FLOOR: usize = 135;
+        // pushed this to 135. After the P4-prep grammar gaps
+        // (ternary / named call args / variant ctor) we reach 148.
+        const FLOOR: usize = 148;
         let clean = fixture_clean_parse_count();
         eprintln!("[parser] fixtures clean-parse count: {clean}");
         assert!(
