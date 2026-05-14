@@ -115,7 +115,9 @@ pub fn keywords_for_cursor(source: &str, line: u32, character: u32) -> Vec<Compl
         // reference vars to avoid surfacing refs that would lint as
         // errors at runtime.
         CursorContext::Reference { .. } => push_reference_candidates(&mut items, false),
-        CursorContext::Decorator { .. } | CursorContext::Member { .. } | CursorContext::Bare { .. } => {}
+        CursorContext::Decorator { .. }
+        | CursorContext::Member { .. }
+        | CursorContext::Bare { .. } => {}
     }
     items
 }
@@ -140,7 +142,9 @@ pub fn resolve(
 
     match &context {
         CursorContext::Directive { .. } => push_directive_candidates(&mut items),
-        CursorContext::Decorator { .. } => push_decorator_candidates(&mut items, entry_root, offset),
+        CursorContext::Decorator { .. } => {
+            push_decorator_candidates(&mut items, entry_root, offset)
+        }
         CursorContext::Reference { .. } => push_reference_candidates(&mut items, in_list),
         CursorContext::Member { head, .. } => {
             push_member_candidates(&mut items, head, entry_tree, workspace);
@@ -327,11 +331,7 @@ fn walk_scope(node: &Node, offset: usize, items: &mut Vec<CompletionItem>) {
             kind: CompletionKind::Parameter,
             detail: Some("for-binding".to_string()),
         });
-        let candidates: [Option<&Node>; 3] = [
-            Some(element),
-            Some(iterable),
-            condition.as_ref(),
-        ];
+        let candidates: [Option<&Node>; 3] = [Some(element), Some(iterable), condition.as_ref()];
         for child in candidates.into_iter().flatten() {
             if contains_offset(child, offset) {
                 walk_scope(child, offset, items);
@@ -451,7 +451,15 @@ fn push_directive_candidates(items: &mut Vec<CompletionItem>) {
         });
     }
     // Pair-level pragmas — same `#` prefix, different positions.
-    for name in &["private", "expect", "default", "brand", "derive", "native", "no_auto_derive"] {
+    for name in &[
+        "private",
+        "expect",
+        "default",
+        "brand",
+        "derive",
+        "native",
+        "no_auto_derive",
+    ] {
         items.push(CompletionItem {
             label: (*name).into(),
             kind: CompletionKind::Pragma,
@@ -460,11 +468,7 @@ fn push_directive_candidates(items: &mut Vec<CompletionItem>) {
     }
 }
 
-fn push_decorator_candidates(
-    items: &mut Vec<CompletionItem>,
-    root: &Node,
-    offset: usize,
-) {
+fn push_decorator_candidates(items: &mut Vec<CompletionItem>, root: &Node, offset: usize) {
     // No host decorator registry in v1, so we surface every visible
     // closure-valued pair (the user-defined hook shape — `pricing` uses
     // `@currency(...)` where `currency` is a sibling method). Same
@@ -500,10 +504,19 @@ fn push_member_candidates(
     // *could* offer ancestor Dict pair keys, but for v1 we only do
     // module-alias member access.
 
-    let import = tree.imports.iter().find(|imp| imp.alias.as_deref() == Some(head));
-    let Some(import) = import else { return; };
-    let Some(path) = &import.path else { return; };
-    let Some(ws) = workspace else { return; };
+    let import = tree
+        .imports
+        .iter()
+        .find(|imp| imp.alias.as_deref() == Some(head));
+    let Some(import) = import else {
+        return;
+    };
+    let Some(path) = &import.path else {
+        return;
+    };
+    let Some(ws) = workspace else {
+        return;
+    };
 
     // Look up the imported module's analyzed tree by trying the path
     // directly first; if that misses, try the import graph for a key
@@ -602,7 +615,10 @@ mod tests {
         assert!(pragmas.contains(&"private".to_string()), "{pragmas:?}");
         // Should NOT include unrelated stdlib names in `#` context.
         let stdlib = labels_with_kind(&items, CompletionKind::Stdlib);
-        assert!(stdlib.is_empty(), "stdlib should not appear after `#`: {stdlib:?}");
+        assert!(
+            stdlib.is_empty(),
+            "stdlib should not appear after `#`: {stdlib:?}"
+        );
     }
 
     #[test]
@@ -655,7 +671,10 @@ mod tests {
         let src = "{\n    foo: 1\n}\n";
         let items = complete_at(src, 1, 10);
         let dirs = labels_with_kind(&items, CompletionKind::Directive);
-        assert!(dirs.is_empty(), "directives leaked into bare context: {dirs:?}");
+        assert!(
+            dirs.is_empty(),
+            "directives leaked into bare context: {dirs:?}"
+        );
     }
 
     #[test]
@@ -686,15 +705,19 @@ mod tests {
         let src = "// header\n\n#\n\n{ x: 1 }\n";
         // Cursor right after the `#` on line 2.
         let items = keywords_for_cursor(src, 2, 1);
-        let names: Vec<String> =
-            items.iter().filter(|i| i.kind == CompletionKind::Directive)
-                 .map(|i| i.label.clone()).collect();
+        let names: Vec<String> = items
+            .iter()
+            .filter(|i| i.kind == CompletionKind::Directive)
+            .map(|i| i.label.clone())
+            .collect();
         assert!(names.contains(&"schema".to_string()), "{names:?}");
         assert!(names.contains(&"main".to_string()), "{names:?}");
         assert!(names.contains(&"import".to_string()), "{names:?}");
-        let pragmas: Vec<String> =
-            items.iter().filter(|i| i.kind == CompletionKind::Pragma)
-                 .map(|i| i.label.clone()).collect();
+        let pragmas: Vec<String> = items
+            .iter()
+            .filter(|i| i.kind == CompletionKind::Pragma)
+            .map(|i| i.label.clone())
+            .collect();
         assert!(pragmas.contains(&"private".to_string()), "{pragmas:?}");
     }
 
@@ -703,9 +726,11 @@ mod tests {
         // Mid-edit: bare `&` with no AST yet.
         let src = "&";
         let items = keywords_for_cursor(src, 0, 1);
-        let refs: Vec<String> =
-            items.iter().filter(|i| i.kind == CompletionKind::Reference)
-                 .map(|i| i.label.clone()).collect();
+        let refs: Vec<String> = items
+            .iter()
+            .filter(|i| i.kind == CompletionKind::Reference)
+            .map(|i| i.label.clone())
+            .collect();
         assert!(refs.contains(&"root".to_string()), "{refs:?}");
         assert!(refs.contains(&"sibling".to_string()), "{refs:?}");
         // Without AST we can't know if cursor is inside a list →

@@ -55,15 +55,13 @@ pub fn format_source(source: &str) -> Result<String, Error> {
     let edited = apply_edits(source, edits);
 
     let break_offsets = if edited != source {
-        let root2 =
-            parse_document(&edited).map_err(|error| Error::Parse(error.to_string()))?;
+        let root2 = parse_document(&edited).map_err(|error| Error::Parse(error.to_string()))?;
         compute_paragraph_break_offsets(&root2, /*in_directive_body=*/ false, &edited)
     } else {
         compute_paragraph_break_offsets(&root, /*in_directive_body=*/ false, source)
     };
 
-    let tokens =
-        tokenize_source(&edited).map_err(|error| Error::Tokenize(error.to_string()))?;
+    let tokens = tokenize_source(&edited).map_err(|error| Error::Tokenize(error.to_string()))?;
     let mut formatter = SourceFormatter::new(&tokens, &break_offsets);
     let output = formatter.format();
     validate_source(&output)?;
@@ -1219,12 +1217,7 @@ impl<'a> SourceFormatter<'a> {
         if !self.line_start {
             self.newline();
         }
-        let trailing = self
-            .output
-            .chars()
-            .rev()
-            .take_while(|c| *c == '\n')
-            .count();
+        let trailing = self.output.chars().rev().take_while(|c| *c == '\n').count();
         if trailing < 2 {
             for _ in trailing..2 {
                 self.output.push('\n');
@@ -1420,7 +1413,8 @@ mod tests {
     fn closure_body_inline_idempotent() {
         // Function-definition body always inlines after the colon —
         // input whitespace doesn't matter, the output is canonical.
-        let inline = "{\n    currency(val, symbol): val + \" \" + symbol,\n    multiply(a, b): a * b\n}\n";
+        let inline =
+            "{\n    currency(val, symbol): val + \" \" + symbol,\n    multiply(a, b): a * b\n}\n";
         let multiline = "{\n    currency(val, symbol):\n        val + \" \" + symbol,\n    multiply(a, b):\n        a * b\n}\n";
         assert_eq!(format_source(inline).unwrap(), inline);
         assert_eq!(format_source(multiline).unwrap(), inline);
@@ -1430,7 +1424,10 @@ mod tests {
     fn wildcard_star_no_binary_padding() {
         let source = "#schema User {\n    String name: *,\n    Int age: (a) => a >= 0\n}\n\n{\n    x: 1\n}\n";
         let formatted = format_source(source).unwrap();
-        assert!(formatted.contains("String name: *,"), "expected `*,` flush: {formatted}");
+        assert!(
+            formatted.contains("String name: *,"),
+            "expected `*,` flush: {formatted}"
+        );
         assert!(!formatted.contains("* ,"));
     }
 
@@ -1526,7 +1523,8 @@ mod tests {
         // original declarations.
         let formatted = format_source(presets::PRICING).unwrap();
         assert!(
-            formatted.contains("String sku:") && formatted.contains("Int qty:")
+            formatted.contains("String sku:")
+                && formatted.contains("Int qty:")
                 && formatted.contains("Float unit_price:"),
             "#schema LineItem body lost its declarations after format:\n{formatted}"
         );
@@ -1617,7 +1615,8 @@ mod tests {
             "#expect must sit directly above `Float unit_price:`:\n{formatted}"
         );
         assert!(
-            formatted.contains("#expect \"tier must be one of: standard / gold\"\n    String tier:"),
+            formatted
+                .contains("#expect \"tier must be one of: standard / gold\"\n    String tier:"),
             "#expect must sit directly above `String tier:`:\n{formatted}"
         );
     }
@@ -1640,7 +1639,8 @@ mod tests {
     #[test]
     fn lift_imports_keeps_packed_block_unchanged() {
         // Already packed at the top — nothing should move.
-        let source = "#import a from \"./a.relon\"\n#import b from \"./b.relon\"\n\n{\n    x: 1\n}\n";
+        let source =
+            "#import a from \"./a.relon\"\n#import b from \"./b.relon\"\n\n{\n    x: 1\n}\n";
         let formatted = format_source(source).unwrap();
         assert_eq!(formatted, source);
         assert_eq!(format_source(&formatted).unwrap(), formatted);
@@ -1657,10 +1657,22 @@ mod tests {
         let import_b = formatted.find("#import b from").expect("import b missing");
         let schema_a = formatted.find("#schema A").expect("schema A missing");
         let schema_b = formatted.find("#schema B").expect("schema B missing");
-        assert!(import_a < schema_a, "imports must precede schemas:\n{formatted}");
-        assert!(import_b < schema_a, "imports must precede schemas:\n{formatted}");
-        assert!(import_a < import_b, "imports keep relative order:\n{formatted}");
-        assert!(schema_a < schema_b, "schemas keep relative order:\n{formatted}");
+        assert!(
+            import_a < schema_a,
+            "imports must precede schemas:\n{formatted}"
+        );
+        assert!(
+            import_b < schema_a,
+            "imports must precede schemas:\n{formatted}"
+        );
+        assert!(
+            import_a < import_b,
+            "imports keep relative order:\n{formatted}"
+        );
+        assert!(
+            schema_a < schema_b,
+            "schemas keep relative order:\n{formatted}"
+        );
         // Idempotent.
         assert_eq!(format_source(&formatted).unwrap(), formatted);
     }
@@ -1752,8 +1764,7 @@ mod tests {
         let formatted = format_source(source).unwrap();
         // Schema body must still contain its `Int x:` declaration —
         // not the methods/fields from #main.
-        let schema_section =
-            &formatted[..formatted.find("#main(").expect("expected #main")];
+        let schema_section = &formatted[..formatted.find("#main(").expect("expected #main")];
         assert!(
             schema_section.contains("Int x:"),
             "schema body must keep `Int x:` after format:\n{schema_section}"
@@ -1805,7 +1816,10 @@ mod tests {
         let tax_rate = formatted.find("tax_rate:").unwrap();
         let subtotal = formatted.find("subtotal:").unwrap();
         assert!(multiply < tax_rate, "methods come first: {formatted}");
-        assert!(tax_rate < subtotal, "#private fields come before public fields: {formatted}");
+        assert!(
+            tax_rate < subtotal,
+            "#private fields come before public fields: {formatted}"
+        );
         // #private must stay glued to its key.
         assert!(
             formatted.contains("#private\n    tax_rate: 0.08"),
@@ -1845,7 +1859,10 @@ mod tests {
             private_method < public_method,
             "private method should precede public method:\n{formatted}"
         );
-        assert!(public_method < field1, "public method precedes field:\n{formatted}");
+        assert!(
+            public_method < field1,
+            "public method precedes field:\n{formatted}"
+        );
         assert!(
             formatted.contains("y * 2,\n\n    public_method"),
             "blank line missing between private and public method groups:\n{formatted}"
@@ -1861,8 +1878,14 @@ mod tests {
         let pub_method = formatted.find("pub_method").unwrap();
         let priv_field = formatted.find("priv_field").unwrap();
         let pub_field = formatted.find("pub_field").unwrap();
-        assert!(priv_method < pub_method, "private method first:\n{formatted}");
-        assert!(pub_method < priv_field, "public method second:\n{formatted}");
+        assert!(
+            priv_method < pub_method,
+            "private method first:\n{formatted}"
+        );
+        assert!(
+            pub_method < priv_field,
+            "public method second:\n{formatted}"
+        );
         assert!(priv_field < pub_field, "private field third:\n{formatted}");
         // Three blank lines, one per tier transition.
         let inner = &formatted["{".len()..formatted.rfind('}').unwrap()];
@@ -1880,7 +1903,10 @@ mod tests {
         // Dict with only public fields — no transitions, no blanks.
         let source = "{\n    a: 1,\n    b: 2,\n    c: 3\n}\n";
         let formatted = format_source(source).unwrap();
-        assert!(!formatted.contains("\n\n    "), "no blank between same-tier pairs: {formatted}");
+        assert!(
+            !formatted.contains("\n\n    "),
+            "no blank between same-tier pairs: {formatted}"
+        );
     }
 
     #[test]

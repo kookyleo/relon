@@ -210,9 +210,7 @@ mod tests {
         entry_source: &str,
         loader_files: &[(&str, &str, &str)],
     ) -> (DocumentEntry, relon_analyzer::WorkspaceTree) {
-        use relon_analyzer::workspace::{
-            analyze_entry, LoadError, LoadedModule, ModuleLoader,
-        };
+        use relon_analyzer::workspace::{analyze_entry, LoadError, LoadedModule, ModuleLoader};
         use std::collections::HashMap;
         use std::path::PathBuf;
 

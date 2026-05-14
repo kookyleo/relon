@@ -236,8 +236,8 @@ fn resolve_cross_module_references(ws: &mut WorkspaceTree) {
                         continue;
                     };
                     let head_tail = pending_ref.tail.first().cloned();
-                    let target_node_id = head_tail
-                        .and_then(|name| lookup_root_field(ws, &target_id, &name));
+                    let target_node_id =
+                        head_tail.and_then(|name| lookup_root_field(ws, &target_id, &name));
                     resolved.push((
                         pending_ref.node_id,
                         CrossModuleRef {
@@ -2046,11 +2046,7 @@ mod tests {
         // CrossModuleRef on the FnCall node whose `target` is the
         // imported module's `shout:` value-node.
         let mut loader = MapLoader::new();
-        loader.add(
-            "./lib",
-            "/abs/lib",
-            r#"{ shout(s): s + "!" }"#,
-        );
+        loader.add("./lib", "/abs/lib", r#"{ shout(s): s + "!" }"#);
         let ws = build(
             "/abs/entry".to_string(),
             r#"#import lib from "./lib"
@@ -2112,11 +2108,7 @@ mod tests {
         // `#import { add } from "./lib"` + `add(1, 2)` should resolve
         // to lib's `add:` field.
         let mut loader = MapLoader::new();
-        loader.add(
-            "./lib",
-            "/abs/lib",
-            r#"{ add(Int a, Int b): a + b }"#,
-        );
+        loader.add("./lib", "/abs/lib", r#"{ add(Int a, Int b): a + b }"#);
         let ws = build(
             "/abs/entry".to_string(),
             r#"#import { add } from "./lib"
@@ -2139,11 +2131,7 @@ mod tests {
         // `plus`, upstream is `add`. Calling `plus(...)` should still
         // jump to lib's `add:` field.
         let mut loader = MapLoader::new();
-        loader.add(
-            "./lib",
-            "/abs/lib",
-            r#"{ add(Int a, Int b): a + b }"#,
-        );
+        loader.add("./lib", "/abs/lib", r#"{ add(Int a, Int b): a + b }"#);
         let ws = build(
             "/abs/entry".to_string(),
             r#"#import { add as plus } from "./lib"
@@ -2168,11 +2156,7 @@ mod tests {
         // `#import * from "./lib"` + bare `shout(...)` should resolve
         // to lib's `shout:` field via the spread-candidate post-pass.
         let mut loader = MapLoader::new();
-        loader.add(
-            "./lib",
-            "/abs/lib",
-            r#"{ shout(s): s + "!" }"#,
-        );
+        loader.add("./lib", "/abs/lib", r#"{ shout(s): s + "!" }"#);
         let ws = build(
             "/abs/entry".to_string(),
             r#"#import * from "./lib"

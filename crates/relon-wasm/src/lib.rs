@@ -342,8 +342,7 @@ pub fn evaluate_main(sources: JsValue, entry: &str, args: JsValue) -> Result<JsV
     let args = decode_args(args).map_err(err_to_js)?;
     match evaluate_internal(&sources, entry, Some(args)) {
         Ok(value) => {
-            let serializer =
-                serde_wasm_bindgen::Serializer::new().serialize_maps_as_objects(true);
+            let serializer = serde_wasm_bindgen::Serializer::new().serialize_maps_as_objects(true);
             value.serialize(&serializer).map_err(|err| {
                 err_to_js(ErrorReport::invalid_input(format!(
                     "result is not JS-serialisable: {err}"
@@ -687,8 +686,7 @@ fn goto_definition_internal(
     // Re-use the same loader chain that `evaluate_internal` uses —
     // in-memory first, std fallback — so `#import` resolution lands on
     // the playground's tabs and not the filesystem.
-    let in_memory: Arc<dyn ModuleResolver> =
-        Arc::new(InMemoryModuleResolver::new(sources.clone()));
+    let in_memory: Arc<dyn ModuleResolver> = Arc::new(InMemoryModuleResolver::new(sources.clone()));
     let std_resolver: Arc<dyn ModuleResolver> = Arc::new(StdModuleResolver);
     let entry_dir = parent_dir(entry);
     let entry_dir_path = PathBuf::from(if entry_dir.is_empty() {
@@ -827,8 +825,7 @@ fn complete_internal(
 
     // Same loader chain as goto_definition — in-memory first, std
     // fallback — so `#import` resolution sees the playground's tabs.
-    let in_memory: Arc<dyn ModuleResolver> =
-        Arc::new(InMemoryModuleResolver::new(sources.clone()));
+    let in_memory: Arc<dyn ModuleResolver> = Arc::new(InMemoryModuleResolver::new(sources.clone()));
     let std_resolver: Arc<dyn ModuleResolver> = Arc::new(StdModuleResolver);
     let entry_dir = parent_dir(entry);
     let entry_dir_path = PathBuf::from(if entry_dir.is_empty() {
