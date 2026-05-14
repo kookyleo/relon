@@ -780,6 +780,15 @@ impl<'a> Parser<'a> {
             Some(SyntaxKind::ELLIPSIS) => {
                 self.open(SyntaxKind::SPREAD_EXPR);
                 self.bump();
+                // v1.3 typed spread: `...<Type> expr`. The type hint
+                // sits between the ellipsis and the source expression
+                // and disambiguates strict-mode derivation. The inner
+                // expression follows the type with no separator.
+                if self.at(SyntaxKind::LT) {
+                    self.bump();
+                    self.parse_type();
+                    self.expect(SyntaxKind::GT);
+                }
                 self.parse_unary();
                 self.close();
             }
@@ -1625,6 +1634,14 @@ impl<'a> Parser<'a> {
         if self.at(SyntaxKind::ELLIPSIS) {
             self.open(SyntaxKind::SPREAD_EXPR);
             self.bump();
+            // v1.3 typed spread `...<Type> source` — same shape as the
+            // atom-level spread, but here we sit inside a dict field
+            // so the source expression can be a richer form.
+            if self.at(SyntaxKind::LT) {
+                self.bump();
+                self.parse_type();
+                self.expect(SyntaxKind::GT);
+            }
             self.parse_expr();
             self.close();
             self.close();
@@ -2342,6 +2359,25 @@ mod tests {
     }
 
     #[test]
+    fn typed_spread_round_trips() {
+        // v1.3 typed spread `...<Type> expr`. The `<Type>` annotation
+        // lands inside the SPREAD_EXPR; the source expression follows.
+        let parsed = parse_round_trip("{ val: { ...<Extra> base } }");
+        assert!(!parsed.has_errors(), "errors: {:?}", parsed.errors);
+        let spreads: Vec<_> = parsed
+            .syntax()
+            .descendants()
+            .filter(|n| n.kind() == SyntaxKind::SPREAD_EXPR)
+            .collect();
+        assert_eq!(spreads.len(), 1, "expected one SPREAD_EXPR");
+        let types: Vec<_> = spreads[0]
+            .descendants()
+            .filter(|n| n.kind() == SyntaxKind::TYPE_NODE)
+            .collect();
+        assert!(!types.is_empty(), "typed spread should carry a TYPE_NODE");
+    }
+
+    #[test]
     fn tuple_type_in_dict_field_round_trips() {
         // v1.7 tuple types in the type-hint slot of a dict field.
         let parsed = parse_round_trip("{ (Int, String) pair: [42, \"hello\"] }");
@@ -2401,7 +2437,8 @@ mod tests {
         // it to 157 (the next P2 slices target tuple types, typed
         // spreads, and the schema with-block named-param method
         // grammar). Tuple types `(T1, T2)` brought the floor to 165.
-        const FLOOR: usize = 165;
+        // Typed spreads `...<Type> expr` brought it to 170.
+        const FLOOR: usize = 170;
         let clean = fixture_clean_parse_count();
         eprintln!("[parser] fixtures clean-parse count: {clean}");
         assert!(
