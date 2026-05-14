@@ -9,6 +9,7 @@ pub mod fmt_string;
 pub mod fn_call;
 pub mod id;
 pub mod lex;
+pub mod lower;
 pub mod prim;
 pub mod reference_var;
 pub mod source;
@@ -62,26 +63,18 @@ impl ParseDocumentError {
     }
 }
 
+/// Parse a Relon document into the legacy [`Node`] tree.
+///
+/// Post-P4 the entry point routes every call through the rowan CST
+/// ([`cst::parse_cst`]) first, then hands off to [`lower::lower_document`]
+/// for the typed-tree construction. The CST is the single source of
+/// truth for what input the parser accepts; downstream consumers
+/// (analyzer / evaluator / fmt / wasm / lsp / cli) keep seeing the same
+/// `Node` / `Expr` shape they did pre-P4. See [`lower`] for the
+/// migration design note.
 pub fn parse_document(source: &str) -> Result<Node, ParseDocumentError> {
-    let mut input = Span::new(source);
-    let node = parse_base(&mut input).map_err(|error| ParseDocumentError::Parse {
-        offset: input.location(),
-        message: format!("{error:?}"),
-    })?;
-    soc0(&mut input).map_err(|error| ParseDocumentError::Parse {
-        offset: input.location(),
-        message: format!("{error:?}"),
-    })?;
-    if input.is_empty() {
-        Ok(node)
-    } else {
-        let remaining = input.to_string();
-        let remaining = remaining.chars().take(64).collect();
-        Err(ParseDocumentError::TrailingInput {
-            offset: input.location(),
-            remaining,
-        })
-    }
+    let parse = cst::parse_cst(source);
+    lower::lower_document(&parse, source)
 }
 
 /// Parse zero or more spaces or comments.
