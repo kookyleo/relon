@@ -1883,6 +1883,65 @@ fn lower_unary_expr_v2(node: &SyntaxNode, source: &str) -> Option<Node> {
     ))
 }
 
+/// Lower a `CALL_EXPR` CST node into the legacy `Expr::FnCall` shape.
+/// The callee is normally a VARIABLE_EXPR whose path tokens we extract
+/// via [`walk_path_tokens`]; the args list is the CALL_ARG child
+/// walked via [`walk_call_arg_node`].
+///
+/// Range note: like BINARY_EXPR, the CST's CALL_EXPR `text_range()`
+/// may extend beyond the actual callee start because the CST wraps
+/// the call via a checkpoint. Legacy `parse_fn_call` captures
+/// `start_offset = input.location()` *at the callee path's start*
+/// (after `parse_atomic`'s soc0). We match that by reading the
+/// callee VARIABLE_EXPR's range start.
+fn lower_call_expr_v2(node: &SyntaxNode, source: &str) -> Option<Node> {
+    // Find the callee Expr and the CALL_ARG node.
+    let mut callee_node: Option<SyntaxNode> = None;
+    let mut call_arg_node: Option<SyntaxNode> = None;
+    for child in node.children() {
+        if child.kind() == SyntaxKind::CALL_ARG {
+            call_arg_node = Some(child);
+        } else if callee_node.is_none() && ast::Expr::cast(child.clone()).is_some() {
+            callee_node = Some(child);
+        }
+    }
+    let callee = callee_node?;
+    // Path extraction: the callee should be a VARIABLE_EXPR. Anything
+    // else is malformed for the legacy `FnCall` shape (the analyzer
+    // doesn't accept call-on-expression at parse time; postfix calls
+    // require a path callee).
+    if callee.kind() != SyntaxKind::VARIABLE_EXPR {
+        return None;
+    }
+    let path = walk_path_tokens(&callee, source, /*is_reference=*/ false)?;
+    let callee_start: usize = callee.text_range().start().into();
+    // The end offset is the end of the CALL_ARG node (which covers
+    // through `)`), or the end of the CALL_EXPR itself if no args
+    // node found.
+    let end: usize = call_arg_node
+        .as_ref()
+        .map(|n| n.text_range().end().into())
+        .unwrap_or_else(|| node.text_range().end().into());
+    let args = if let Some(args_node) = call_arg_node {
+        walk_call_arg_node(&args_node, source)?
+    } else {
+        Vec::new()
+    };
+    // Legacy `parse_fn_call` verifies named-args-after-positional ordering.
+    let mut saw_named = false;
+    for a in &args {
+        if a.name.is_some() {
+            saw_named = true;
+        } else if saw_named {
+            return None;
+        }
+    }
+    Some(Node::new(
+        Expr::FnCall { path, args },
+        range_from_offsets(source, callee_start, end),
+    ))
+}
+
 /// Lower a `BINARY_EXPR` CST node. The CST already encoded operator
 /// precedence + associativity in the tree shape (left/right children
 /// are nested BINARY_EXPRs at higher / lower precedence). We just
@@ -2055,7 +2114,7 @@ pub(crate) fn lower_expr_v2(expr: &ast::Expr, source: &str) -> Option<Node> {
         ast::Expr::Binary(b) => lower_binary_expr_v2(b.syntax(), source),
         ast::Expr::Unary(u) => lower_unary_expr_v2(u.syntax(), source),
         ast::Expr::Ternary(t) => lower_ternary_expr_v2(t.syntax(), source),
-        ast::Expr::Call(c) => lower_expr_via_legacy(c.syntax(), source),
+        ast::Expr::Call(c) => lower_call_expr_v2(c.syntax(), source),
         // Slice 4: control flow. `Closure`, `Match`, `Where`, and
         // `VariantCtor` all sit on top of expression-shaped CST nodes
         // whose byte ranges are accepted verbatim by `parse_expr`.
