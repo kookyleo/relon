@@ -1779,26 +1779,266 @@ fn directive_constraint_name(node: &SyntaxNode) -> Option<String> {
     None
 }
 
-/// Lower a CST TYPE_NODE to the legacy [`crate::TypeNode`] by
-/// byte-slicing into the legacy `parse_type_node` combinator. P6
-/// round 2 keeps this byte-slice route because:
+/// Lower a CST TYPE_NODE (or TUPLE_TYPE) into the legacy
+/// [`crate::TypeNode`] shape. Walks the CST directly — no byte-slice
+/// re-parse — so we can retire `expr::parse_type_node` along with the
+/// rest of the legacy combinator web.
 ///
-///   * The legacy `parse_type_node` already handles every type
-///     position the directive walker needs (tuple types, `Enum<...>`
-///     variant struct bodies, doc-comment attachment).
-///   * The legacy `parse_type_node` lives in `expr.rs`, which is still
-///     active for `lower_expr_via_legacy` — the prerequisite for full
-///     legacy-web deletion is retiring *that* bridge first.
+/// Handles:
+///  * Bare type heads: `Int`, `String`, ...
+///  * Dotted paths: `geo.Location`, `"namespaced".Foo`
+///  * Generics: `List<Int>`, `Dict<String, Int>`, nested
+///    `List<Dict<String, Int>>`
+///  * Optional `?` suffix
+///  * Tuple types: `()`, `(T,)`, `(T1, T2)`
+///  * `Enum<Variant, Other { field: T }>` — emitting variant_fields
+///    on the variant alternative TypeNodes.
 fn lower_type_node_from_cst(node: &SyntaxNode, source: &str) -> Option<crate::TypeNode> {
     let r = node.text_range();
-    let start: usize = r.start().into();
+    // The legacy `parse_type_node` starts after `parse_leading_comments`,
+    // so its `start_offset` skips leading whitespace/comments. The CST
+    // node may include those leading bytes via rowan's open()
+    // flush-trivia rule. Anchor to the first non-trivia child.
+    let start: usize = first_non_trivia_offset(node).unwrap_or_else(|| r.start().into());
     let end: usize = r.end().into();
-    let slice = source.get(start..end)?;
-    let mut span = Span::new(slice);
-    use winnow::Parser as _;
-    let mut t = crate::expr::parse_type_node.parse_next(&mut span).ok()?;
-    translate_type_node_offsets(&mut t, start, source);
-    Some(t)
+
+    if node.kind() == SyntaxKind::TUPLE_TYPE {
+        // `(T1, T2, ...)`. Children: optional TYPE_NODE elements,
+        // optional trailing `?`.
+        let mut elems: Vec<crate::TypeNode> = Vec::new();
+        for child in node.children() {
+            if let Some(t) = lower_type_node_from_cst(&child, source) {
+                elems.push(t);
+            }
+        }
+        let is_optional = node
+            .children_with_tokens()
+            .filter_map(|el| el.into_token())
+            .any(|t| t.kind() == SyntaxKind::QUESTION);
+        return Some(crate::TypeNode {
+            path: vec!["Tuple".to_string()],
+            generics: elems,
+            is_optional,
+            range: range_from_offsets(source, start, end),
+            variant_fields: None,
+            doc_comment: None,
+        });
+    }
+    if node.kind() != SyntaxKind::TYPE_NODE {
+        return None;
+    }
+    // Path: leading IDENT/STRING tokens, separated by DOT, until we
+    // hit `<` (generics), `?`, or end.
+    let mut path: Vec<String> = Vec::new();
+    let mut in_generics = false;
+    let mut is_optional = false;
+    let mut after_path = false;
+    let mut generics: Vec<crate::TypeNode> = Vec::new();
+    let variant_fields: Option<Vec<(String, crate::TypeNode)>> = None;
+    let mut is_enum_head = false;
+
+    for el in node.children_with_tokens() {
+        match el {
+            rowan::NodeOrToken::Token(t) => match t.kind() {
+                SyntaxKind::WHITESPACE
+                | SyntaxKind::LINE_COMMENT
+                | SyntaxKind::BLOCK_COMMENT => continue,
+                SyntaxKind::DOT => continue,
+                SyntaxKind::IDENT | SyntaxKind::STRING if !after_path => {
+                    let txt = if t.kind() == SyntaxKind::STRING {
+                        parse_string_text(t.text())?
+                    } else {
+                        t.text().to_string()
+                    };
+                    path.push(txt);
+                }
+                SyntaxKind::LT => {
+                    after_path = true;
+                    in_generics = true;
+                    if path.len() == 1 && path[0] == "Enum" {
+                        is_enum_head = true;
+                    }
+                }
+                SyntaxKind::GT => {
+                    in_generics = false;
+                }
+                SyntaxKind::QUESTION => {
+                    is_optional = true;
+                }
+                _ => continue,
+            },
+            rowan::NodeOrToken::Node(n) => {
+                if in_generics
+                    && matches!(n.kind(), SyntaxKind::TYPE_NODE | SyntaxKind::TUPLE_TYPE)
+                {
+                    let mut g = lower_type_node_from_cst(&n, source)?;
+                    // For Enum heads, a TYPE_NODE followed by a DICT
+                    // sibling is a variant-struct alternative
+                    // (`Enum<Email { field: T }>`). We detect this by
+                    // checking the next sibling.
+                    if is_enum_head {
+                        // Bare single-segment IDENT-headed Enum
+                        // alternative is a unit variant — legacy
+                        // `parse_enum_alternative` calls `id`
+                        // (IDENT-only) first; if that fails (e.g. for
+                        // STRING-headed `"hot"`) it falls through to
+                        // `parse_type_node` and never marks it as a
+                        // variant. We replicate by checking the first
+                        // token of `n`.
+                        let first_tok = n.children_with_tokens().find_map(|el| {
+                            el.into_token().filter(|t| {
+                                !matches!(
+                                    t.kind(),
+                                    SyntaxKind::WHITESPACE
+                                        | SyntaxKind::LINE_COMMENT
+                                        | SyntaxKind::BLOCK_COMMENT
+                                )
+                            })
+                        });
+                        let ident_headed = first_tok
+                            .map(|t| t.kind() == SyntaxKind::IDENT)
+                            .unwrap_or(false);
+                        if ident_headed
+                            && g.path.len() == 1
+                            && g.generics.is_empty()
+                            && !g.is_optional
+                            && g.variant_fields.is_none()
+                        {
+                            g.variant_fields = Some(Vec::new());
+                        }
+                        if let Some(next) = n.next_sibling() {
+                            if next.kind() == SyntaxKind::DICT {
+                                // Extend the variant TypeNode's range
+                                // to cover the body `{...}` — legacy
+                                // `parse_enum_alternative` captures
+                                // `range = start_offset..end_offset`
+                                // where end_offset is after `}`.
+                                let dict_end: usize = next.text_range().end().into();
+                                g.range = range_from_offsets(
+                                    source,
+                                    g.range.start.offset,
+                                    dict_end,
+                                );
+                                // Walk DICT to extract `(field_name, field_type)` pairs.
+                                let mut fields: Vec<(String, crate::TypeNode)> = Vec::new();
+                                for f in next.children().filter(|c| c.kind() == SyntaxKind::DICT_FIELD) {
+                                    // Variant fields are emitted as
+                                    // `name: Type` shape. The CST may
+                                    // emit the type either as a
+                                    // TYPE_NODE / TUPLE_TYPE child (for
+                                    // shapes the type-atom heuristic
+                                    // claimed as types) or as a
+                                    // VARIABLE_EXPR child (for bare
+                                    // identifiers like `T`). Legacy
+                                    // `parse_variant_field` always
+                                    // calls `parse_type_node`, so we
+                                    // mirror that by also accepting
+                                    // VARIABLE_EXPR-shaped children as
+                                    // type-name paths.
+                                    let name = f
+                                        .children_with_tokens()
+                                        .filter_map(|el| el.into_token())
+                                        .find(|t| t.kind() == SyntaxKind::IDENT)
+                                        .map(|t| t.text().to_string());
+                                    let ty = f
+                                        .children()
+                                        .find_map(|c| match c.kind() {
+                                            SyntaxKind::TYPE_NODE | SyntaxKind::TUPLE_TYPE => {
+                                                lower_type_node_from_cst(&c, source)
+                                            }
+                                            SyntaxKind::VARIABLE_EXPR => {
+                                                // Build a TypeNode from
+                                                // the IDENT-only path.
+                                                let segs: Vec<String> = c
+                                                    .children_with_tokens()
+                                                    .filter_map(|el| el.into_token())
+                                                    .filter(|t| t.kind() == SyntaxKind::IDENT)
+                                                    .map(|t| t.text().to_string())
+                                                    .collect();
+                                                if segs.is_empty() {
+                                                    return None;
+                                                }
+                                                let r = c.text_range();
+                                                let s: usize = r.start().into();
+                                                let e: usize = r.end().into();
+                                                Some(crate::TypeNode {
+                                                    path: segs,
+                                                    generics: Vec::new(),
+                                                    is_optional: false,
+                                                    range: range_from_offsets(source, s, e),
+                                                    variant_fields: None,
+                                                    doc_comment: None,
+                                                })
+                                            }
+                                            _ => None,
+                                        });
+                                    if let (Some(name), Some(ty)) = (name, ty) {
+                                        fields.push((name, ty));
+                                    }
+                                }
+                                g.variant_fields = Some(fields);
+                            }
+                        }
+                    }
+                    generics.push(g);
+                } else if !in_generics && n.kind() == SyntaxKind::DICT {
+                    // This shouldn't happen for a regular TYPE_NODE —
+                    // DICT children are inside Enum variant alternatives,
+                    // not directly under TYPE_NODE.
+                    continue;
+                }
+            }
+        }
+    }
+    // For Enum heads without any variant-struct alternative, clear
+    // the tentative unit-variant markers so the rest of the pipeline
+    // treats this as a classic untagged enum.
+    if is_enum_head {
+        // Legacy `parse_enum_alternative` marks bare unit-variants
+        // with `variant_fields = Some(vec![])`. We don't do that here
+        // — the CST walker has no way to detect "this came in via
+        // the Enum-alternative parser vs the regular type parser".
+        // For now, leave variant_fields as set above.
+        let any_struct_form = generics
+            .iter()
+            .any(|g| g.variant_fields.as_ref().is_some_and(|f| !f.is_empty()));
+        if !any_struct_form {
+            for g in &mut generics {
+                g.variant_fields = None;
+            }
+        }
+    }
+    let _ = variant_fields;
+
+    if path.is_empty() {
+        return None;
+    }
+    Some(crate::TypeNode {
+        path,
+        generics,
+        is_optional,
+        range: range_from_offsets(source, start, end),
+        variant_fields: None,
+        doc_comment: None,
+    })
+}
+
+/// Find the offset of the first non-trivia child element (token or
+/// node) of `node`. Used to anchor ranges to where the legacy
+/// combinator started consuming (after `soc0` / `parse_leading_comments`).
+fn first_non_trivia_offset(node: &SyntaxNode) -> Option<usize> {
+    for el in node.children_with_tokens() {
+        match el {
+            rowan::NodeOrToken::Token(t) => match t.kind() {
+                SyntaxKind::WHITESPACE
+                | SyntaxKind::LINE_COMMENT
+                | SyntaxKind::BLOCK_COMMENT => continue,
+                _ => return Some(t.text_range().start().into()),
+            },
+            rowan::NodeOrToken::Node(n) => return Some(n.text_range().start().into()),
+        }
+    }
+    None
 }
 
 /// Lower a CST [`ast::Decorator`] to a legacy [`crate::Decorator`] by
@@ -1976,39 +2216,6 @@ fn walk_call_arg_node(node: &SyntaxNode, source: &str) -> Option<Vec<crate::Call
         }
     }
     Some(args)
-}
-
-/// Lower any expression-shaped CST node by re-running the legacy
-/// `parse_expr` combinator over the node's exact byte range. Returns
-/// `None` only when the bytes don't form a complete legal expression
-/// (which shouldn't happen if the CST is well-formed).
-///
-/// The legacy `parse_expr` already covers every expression production
-/// the rest of the language uses — dict, list, comprehension, spread,
-/// binary, unary, ternary, call, closure, f-string, where, match,
-/// variant ctor, type-expr, wildcard, reference, variable, literal.
-/// Routing through it gives us byte-identical `Node` output without
-/// re-implementing each construct in a hand-rolled walker.
-#[allow(dead_code)]
-fn lower_expr_via_legacy(node: &SyntaxNode, source: &str) -> Option<Node> {
-    let r = node.text_range();
-    let start: usize = r.start().into();
-    let end: usize = r.end().into();
-    let slice = source.get(start..end)?;
-    let mut span = Span::new(slice);
-    use winnow::Parser as _;
-    let parsed = crate::expr::parse_expr.parse_next(&mut span).ok()?;
-    // After `parse_expr`, the slice must have been fully consumed for
-    // the byte-identical guarantee to hold. If a single combinator-
-    // level production refused trailing bytes, the CST would have
-    // emitted a different node shape, so this assert acts as a smoke
-    // test rather than an expected failure path.
-    if !span.is_empty() {
-        return None;
-    }
-    let mut value = parsed;
-    translate_node_offsets(&mut value, start, source);
-    Some(value)
 }
 
 /// Lower an `Expr::Spread` CST node directly. The shape is `... inner`
@@ -2318,21 +2525,7 @@ fn lower_dict_field(node: &SyntaxNode, source: &str) -> Option<DictFieldOut> {
                 SyntaxKind::TUPLE_TYPE => {
                     // v1.7 tuple-type as typed-key hint: `(Int, String) pair: ...`.
                     if !in_brack && type_hint.is_none() && key_token.is_none() {
-                        // The TUPLE_TYPE node carries the tuple structure but
-                        // we don't have a direct converter — slice through
-                        // `parse_type_node` on the bytes (which handles tuple
-                        // shapes inside its dispatch).
-                        let r = n.text_range();
-                        let s: usize = r.start().into();
-                        let e: usize = r.end().into();
-                        let slice = source.get(s..e)?;
-                        let mut span = Span::new(slice);
-                        use winnow::Parser as _;
-                        let mut t = crate::expr::parse_type_node
-                            .parse_next(&mut span)
-                            .ok()?;
-                        translate_type_node_offsets(&mut t, s, source);
-                        type_hint = Some(t);
+                        type_hint = Some(lower_type_node_from_cst(&n, source)?);
                     }
                 }
                 SyntaxKind::CLOSURE => {
