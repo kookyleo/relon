@@ -120,6 +120,25 @@ pub enum SyntaxKind {
     /// Downstream tooling treats this like a syntax error.
     UNKNOWN,
 
+    // ----- f-string sub-tokens ---------------------------------------
+    // The lexer emits an entire f-string as one `STRING` leaf so the
+    // round-trip-by-bytes invariant holds without any cross-token
+    // coordination. The CST builder then refines that single leaf into
+    // an `F_STRING` node containing the leaves below + nested
+    // `F_STRING_INTERPOLATION` sub-nodes (whose own children are
+    // ordinary Relon expressions). The leaves stay BEFORE `DOCUMENT`
+    // in the enum order so `is_token` keeps working.
+    /// Opening `f"` / `f#"` / `f##"` ... — `#` count varies.
+    F_STRING_OPEN,
+    /// Closing `"` / `"#` / `"##` matching the open count.
+    F_STRING_CLOSE,
+    /// Verbatim literal chunk between interpolations / quotes.
+    F_STRING_LITERAL,
+    /// `${`
+    F_STRING_INTERP_START,
+    /// Closing `}` of an interpolation.
+    F_STRING_INTERP_END,
+
     // ----- composite-node kinds (populated through P2/P3) ------------
     //
     // Each kind below names a grammar production. Their byte content
@@ -169,9 +188,14 @@ pub enum SyntaxKind {
     /// `EnumName.VariantName { ... }`.
     VARIANT_CTOR,
     /// `f"..."` rendered as a CST node so interpolations are children.
-    /// (For v1 the lexer still emits a single `STRING` token; this
-    /// node kind is reserved for the later f-string refinement.)
+    /// The lexer emits the whole f-string as one `STRING` leaf; the
+    /// CST builder breaks it into F_STRING_OPEN, F_STRING_LITERAL
+    /// chunks, F_STRING_INTERPOLATION children, and F_STRING_CLOSE.
     F_STRING,
+    /// One `${ expr }` zone inside an [`F_STRING`]. Children are
+    /// `F_STRING_INTERP_START`, then a regular Relon expression node,
+    /// then `F_STRING_INTERP_END`.
+    F_STRING_INTERPOLATION,
     /// Spread expression `...expr` inside a dict / list.
     SPREAD_EXPR,
     /// A type expression: `Int`, `List<String>`, `User?`, …
@@ -293,6 +317,11 @@ impl SyntaxKind {
             x if x == Self::BANG as u16 => Self::BANG,
             x if x == Self::PIPE as u16 => Self::PIPE,
             x if x == Self::UNKNOWN as u16 => Self::UNKNOWN,
+            x if x == Self::F_STRING_OPEN as u16 => Self::F_STRING_OPEN,
+            x if x == Self::F_STRING_CLOSE as u16 => Self::F_STRING_CLOSE,
+            x if x == Self::F_STRING_LITERAL as u16 => Self::F_STRING_LITERAL,
+            x if x == Self::F_STRING_INTERP_START as u16 => Self::F_STRING_INTERP_START,
+            x if x == Self::F_STRING_INTERP_END as u16 => Self::F_STRING_INTERP_END,
             x if x == Self::DOCUMENT as u16 => Self::DOCUMENT,
             x if x == Self::DIRECTIVE as u16 => Self::DIRECTIVE,
             x if x == Self::DECORATOR as u16 => Self::DECORATOR,
@@ -314,6 +343,7 @@ impl SyntaxKind {
             x if x == Self::MATCH_ARM as u16 => Self::MATCH_ARM,
             x if x == Self::VARIANT_CTOR as u16 => Self::VARIANT_CTOR,
             x if x == Self::F_STRING as u16 => Self::F_STRING,
+            x if x == Self::F_STRING_INTERPOLATION as u16 => Self::F_STRING_INTERPOLATION,
             x if x == Self::SPREAD_EXPR as u16 => Self::SPREAD_EXPR,
             x if x == Self::TYPE_NODE as u16 => Self::TYPE_NODE,
             x if x == Self::WILDCARD as u16 => Self::WILDCARD,

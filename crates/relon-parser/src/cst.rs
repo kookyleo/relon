@@ -33,6 +33,7 @@
 //! unimplemented cases.
 
 use crate::lex;
+use crate::lex::utf8_codepoint_len_for_cst as utf8_codepoint_len;
 use crate::syntax::{RelonLanguage, SyntaxKind, SyntaxNode};
 use rowan::{Checkpoint, GreenNodeBuilder};
 
@@ -74,7 +75,7 @@ impl Parse {
 /// into `ERROR` nodes; the round-trip invariant holds regardless.
 pub fn parse_cst(source: &str) -> Parse {
     let tokens = lex::lex(source);
-    let mut parser = Parser::new(&tokens);
+    let mut parser = Parser::new(tokens);
     parser.parse_document();
     parser.finish()
 }
@@ -84,7 +85,11 @@ pub fn parse_cst(source: &str) -> Parse {
 // =====================================================================
 
 struct Parser<'a> {
-    tokens: &'a [(SyntaxKind, &'a str)],
+    /// The flat token stream the parser is currently consuming. We
+    /// own the vec so f-string interpolation sub-parses can swap in
+    /// a transient inner-token list without lifetime gymnastics —
+    /// the inner `&str` slices still point into the original source.
+    tokens: Vec<(SyntaxKind, &'a str)>,
     pos: usize,
     builder: GreenNodeBuilder<'static>,
     errors: Vec<ParseError>,
@@ -94,7 +99,7 @@ struct Parser<'a> {
 }
 
 impl<'a> Parser<'a> {
-    fn new(tokens: &'a [(SyntaxKind, &'a str)]) -> Self {
+    fn new(tokens: Vec<(SyntaxKind, &'a str)>) -> Self {
         Self {
             tokens,
             pos: 0,
@@ -504,10 +509,20 @@ impl<'a> Parser<'a> {
 
     fn parse_atom(&mut self) {
         match self.current() {
-            Some(SyntaxKind::NUMBER) | Some(SyntaxKind::STRING) => {
+            Some(SyntaxKind::NUMBER) => {
                 self.open(SyntaxKind::LITERAL);
                 self.bump();
                 self.close();
+            }
+            Some(SyntaxKind::STRING) => {
+                let text = self.tokens[self.pos_skip_trivia()].1;
+                if text.starts_with('f') {
+                    self.parse_f_string();
+                } else {
+                    self.open(SyntaxKind::LITERAL);
+                    self.bump();
+                    self.close();
+                }
             }
             Some(SyntaxKind::IDENT) => {
                 // `null` / `true` / `false` are keyword-shaped
@@ -566,6 +581,268 @@ impl<'a> Parser<'a> {
             idx += 1;
         }
         idx
+    }
+
+    /// Decompose a leading `f"..."` / `f#"..."#` STRING token into a
+    /// proper [`F_STRING`] subtree. The original token is consumed
+    /// as a SINGLE leaf at the lex level, but for the CST we walk
+    /// its bytes and emit:
+    ///
+    /// * `F_STRING_OPEN` — `f"` / `f#"` / `f##"` …
+    /// * `F_STRING_LITERAL` — verbatim text between zones.
+    /// * `F_STRING_INTERPOLATION` (a sub-node) — wraps a
+    ///   `F_STRING_INTERP_START`, a recursively-parsed expression
+    ///   (using the same flat lex on the interpolation bytes), and a
+    ///   `F_STRING_INTERP_END`.
+    /// * `F_STRING_CLOSE` — matching `"` / `"#` / `"##` …
+    ///
+    /// Reuses [`lex::lex`] for the interpolation bytes so any future
+    /// lexer change is picked up automatically. The whole emission is
+    /// driven directly by the original byte span — so the round-trip
+    /// invariant holds without help from the caller.
+    fn parse_f_string(&mut self) {
+        // Flush trivia FIRST so the F_STRING node nests under whatever
+        // production opened most recently. We then refuse to advance
+        // `self.pos` until we've emitted every sub-piece, so the
+        // overall byte count matches the original STRING token.
+        self.flush_trivia();
+        let tok_idx = self.pos;
+        let (_kind, full_text): (SyntaxKind, &'a str) = self.tokens[tok_idx];
+        let start_byte = self.cursor_byte;
+        // Parse the opening sequence: `f` + zero-or-more `#` + `"`.
+        let bytes = full_text.as_bytes();
+        // The lexer already guarantees this token starts with `f`,
+        // and that `next_is_hash_quote(bytes, 1)` was true, but be
+        // defensive — bail to plain LITERAL if anything else.
+        if bytes.first() != Some(&b'f') {
+            // Should be unreachable given the caller's guard.
+            self.open(SyntaxKind::LITERAL);
+            self.bump();
+            self.close();
+            return;
+        }
+        let mut idx: usize = 1;
+        while bytes.get(idx) == Some(&b'#') {
+            idx += 1;
+        }
+        if bytes.get(idx) != Some(&b'"') {
+            // Malformed open — emit the whole thing as a single
+            // LITERAL so byte-round-trip is preserved.
+            self.open(SyntaxKind::LITERAL);
+            self.bump();
+            self.close();
+            return;
+        }
+        let hash_count = idx - 1;
+        let open_end = idx + 1;
+        let mut closing = String::from("\"");
+        for _ in 0..hash_count {
+            closing.push('#');
+        }
+
+        // Locate the close. The body starts at `open_end`; we have to
+        // track interpolation depth so a literal `}` inside an
+        // interpolation can't be mistaken for the close.
+        let body_start = open_end;
+        let close_pos = self.find_fstring_close(bytes, body_start, &closing, hash_count);
+        let close_pos = match close_pos {
+            Some(p) => p,
+            None => {
+                // Unterminated — fall back to LITERAL.
+                self.open(SyntaxKind::LITERAL);
+                self.bump();
+                self.close();
+                return;
+            }
+        };
+
+        // Open the composite node.
+        self.open(SyntaxKind::F_STRING);
+        // Emit OPEN.
+        self.emit_raw_token(SyntaxKind::F_STRING_OPEN, &full_text[..open_end]);
+        // Walk body, splitting LITERAL chunks vs interpolation zones.
+        let mut i = body_start;
+        let mut literal_start = i;
+        let raw_string = hash_count > 0;
+        while i < close_pos {
+            if Self::starts_with_at(bytes, i, b"${") {
+                if i > literal_start {
+                    self.emit_raw_token(SyntaxKind::F_STRING_LITERAL, &full_text[literal_start..i]);
+                }
+                // Find matching `}`.
+                let interp_start = i;
+                let interp_body_start = i + 2;
+                let mut depth: usize = 1;
+                let mut j = interp_body_start;
+                while j < close_pos && depth > 0 {
+                    match bytes[j] {
+                        b'{' => {
+                            depth += 1;
+                            j += 1;
+                        }
+                        b'}' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                            j += 1;
+                        }
+                        b'"' => {
+                            // Skip nested "..." (the lexer always
+                            // pairs them up safely on round-trip).
+                            j = crate::lex::scan_normal_string_for_cst(bytes, j);
+                        }
+                        b => {
+                            // Skip a full codepoint to make progress
+                            // on invalid UTF-8 boundaries.
+                            j += utf8_codepoint_len(b);
+                        }
+                    }
+                }
+                if depth != 0 {
+                    // Unterminated interpolation — emit the rest as
+                    // one literal so bytes survive, then stop.
+                    self.emit_raw_token(SyntaxKind::F_STRING_LITERAL, &full_text[i..close_pos]);
+                    literal_start = close_pos;
+                    break;
+                }
+                let interp_body_end = j;
+                let interp_close = j + 1;
+                // Emit the interpolation sub-node.
+                self.open(SyntaxKind::F_STRING_INTERPOLATION);
+                self.emit_raw_token(
+                    SyntaxKind::F_STRING_INTERP_START,
+                    &full_text[interp_start..interp_body_start],
+                );
+                // Sub-parse the inner expression. The inner text is a
+                // self-contained slice; we hand it to a fresh `lex` +
+                // mini-parser. This is recursive (an interpolation can
+                // contain another f-string), but the byte-accounting
+                // works because we splice sub-tokens directly into the
+                // builder.
+                self.parse_fstring_interp_inner(&full_text[interp_body_start..interp_body_end]);
+                self.emit_raw_token(
+                    SyntaxKind::F_STRING_INTERP_END,
+                    &full_text[interp_body_end..interp_close],
+                );
+                self.close();
+                literal_start = interp_close;
+                i = interp_close;
+                continue;
+            }
+            // Escape handling — only relevant in non-raw f-strings.
+            if !raw_string && bytes[i] == b'\\' && i + 1 < close_pos {
+                i += 1 + utf8_codepoint_len(bytes[i + 1]);
+                continue;
+            }
+            i += utf8_codepoint_len(bytes[i]);
+        }
+        if literal_start < close_pos {
+            self.emit_raw_token(
+                SyntaxKind::F_STRING_LITERAL,
+                &full_text[literal_start..close_pos],
+            );
+        }
+        // Emit CLOSE.
+        self.emit_raw_token(SyntaxKind::F_STRING_CLOSE, &full_text[close_pos..]);
+        self.close();
+        // Advance the parser past the original STRING token now that
+        // we've emitted every sub-piece directly.
+        self.cursor_byte = start_byte + full_text.len();
+        self.pos = tok_idx + 1;
+    }
+
+    /// Emit a single leaf token directly to the builder (bypassing
+    /// the lex-token cursor). Used by f-string decomposition; never
+    /// advances `pos` / `cursor_byte`.
+    fn emit_raw_token(&mut self, kind: SyntaxKind, text: &str) {
+        self.builder
+            .token(RelonLanguage::kind_to_raw_static(kind), text);
+    }
+
+    /// Sub-parser for the inside of `${ ... }` in an f-string. We
+    /// temporarily swap `self.tokens` with the inner-text lex (the
+    /// `&str` slices inside still borrow from the original source,
+    /// so the swapped `Vec` is fully compatible lifetime-wise),
+    /// run the same Pratt expression grammar, then restore.
+    fn parse_fstring_interp_inner(&mut self, text: &'a str) {
+        let inner_tokens: Vec<(SyntaxKind, &'a str)> = crate::lex::lex(text);
+        // Stash outer state and install the inner stream.
+        let outer_tokens = std::mem::replace(&mut self.tokens, inner_tokens);
+        let outer_pos = std::mem::replace(&mut self.pos, 0);
+        let outer_cursor = self.cursor_byte;
+        self.cursor_byte = 0;
+        if !self.at_end() {
+            self.parse_expr();
+        }
+        // Absorb any remaining bytes so the F_STRING_INTERPOLATION
+        // body has full byte coverage. Trailing whitespace becomes
+        // trivia naturally; anything else lands in an ERROR node.
+        if !self.at_end() {
+            self.error_recover("trailing input in interpolation", &[]);
+        }
+        self.flush_trivia();
+        // Restore outer state.
+        self.tokens = outer_tokens;
+        self.pos = outer_pos;
+        self.cursor_byte = outer_cursor + text.len();
+    }
+
+    fn find_fstring_close(
+        &self,
+        bytes: &[u8],
+        body_start: usize,
+        closing: &str,
+        hashes: usize,
+    ) -> Option<usize> {
+        let raw = hashes > 0;
+        let mut idx = body_start;
+        while idx + closing.len() <= bytes.len() {
+            // Skip past balanced `${...}` interpolations.
+            if Self::starts_with_at(bytes, idx, b"${") {
+                let mut depth: usize = 1;
+                let mut j = idx + 2;
+                while j < bytes.len() && depth > 0 {
+                    match bytes[j] {
+                        b'{' => depth += 1,
+                        b'}' => depth -= 1,
+                        b'"' => {
+                            j = crate::lex::scan_normal_string_for_cst(bytes, j);
+                            continue;
+                        }
+                        _ => {}
+                    }
+                    if depth == 0 {
+                        j += 1;
+                        break;
+                    }
+                    j += 1;
+                }
+                if depth != 0 {
+                    return None;
+                }
+                idx = j;
+                continue;
+            }
+            if !raw && bytes[idx] == b'\\' {
+                if idx + 1 >= bytes.len() {
+                    return None;
+                }
+                idx += 1 + utf8_codepoint_len(bytes[idx + 1]);
+                continue;
+            }
+            if Self::starts_with_at(bytes, idx, closing.as_bytes()) {
+                return Some(idx);
+            }
+            idx += utf8_codepoint_len(bytes[idx]);
+        }
+        None
+    }
+
+    fn starts_with_at(bytes: &[u8], idx: usize, needle: &[u8]) -> bool {
+        bytes
+            .get(idx..idx + needle.len())
+            .is_some_and(|s| s == needle)
     }
 
     /// Scan forward (without committing) starting from `start_idx`,
@@ -1069,13 +1346,13 @@ impl<'a> Parser<'a> {
                 *i += 1;
             }
         };
-        advance_trivia(&mut idx, self.tokens);
+        advance_trivia(&mut idx, &self.tokens);
         while idx < self.tokens.len() && self.tokens[idx].0 == SyntaxKind::DOT {
             idx += 1;
-            advance_trivia(&mut idx, self.tokens);
+            advance_trivia(&mut idx, &self.tokens);
             if self.tokens.get(idx).map(|(k, _)| *k) == Some(SyntaxKind::IDENT) {
                 idx += 1;
-                advance_trivia(&mut idx, self.tokens);
+                advance_trivia(&mut idx, &self.tokens);
             } else {
                 return false;
             }
@@ -1105,12 +1382,12 @@ impl<'a> Parser<'a> {
             if depth != 0 {
                 return false;
             }
-            advance_trivia(&mut idx, self.tokens);
+            advance_trivia(&mut idx, &self.tokens);
         }
         let saw_question = self.tokens.get(idx).map(|(k, _)| *k) == Some(SyntaxKind::QUESTION);
         if saw_question {
             idx += 1;
-            advance_trivia(&mut idx, self.tokens);
+            advance_trivia(&mut idx, &self.tokens);
         }
         // Now we must see IDENT or STRING (the key) followed by `:`
         // or `(`. If neither, the leading run wasn't a type — bail
@@ -1122,7 +1399,7 @@ impl<'a> Parser<'a> {
             return false;
         }
         let mut after_key = idx + 1;
-        advance_trivia(&mut after_key, self.tokens);
+        advance_trivia(&mut after_key, &self.tokens);
         let next = self.tokens.get(after_key).map(|(k, _)| *k);
         matches!(next, Some(SyntaxKind::COLON) | Some(SyntaxKind::L_PAREN))
     }
@@ -1315,6 +1592,47 @@ mod tests {
             .filter(|n| n.kind() == SyntaxKind::MATCH_ARM)
             .collect();
         assert_eq!(arms.len(), 3);
+    }
+
+    #[test]
+    fn f_string_emits_f_string_node() {
+        let parsed = parse_round_trip(r#"{ msg: f"hello ${name}!" }"#);
+        assert!(!parsed.has_errors(), "errors: {:?}", parsed.errors);
+        let fs: Vec<_> = parsed
+            .syntax()
+            .descendants()
+            .filter(|n| n.kind() == SyntaxKind::F_STRING)
+            .collect();
+        assert_eq!(fs.len(), 1);
+        let interps: Vec<_> = parsed
+            .syntax()
+            .descendants()
+            .filter(|n| n.kind() == SyntaxKind::F_STRING_INTERPOLATION)
+            .collect();
+        assert_eq!(interps.len(), 1);
+        // Interpolation body should contain a VARIABLE_EXPR for `name`.
+        let interp = &interps[0];
+        let vars: Vec<_> = interp
+            .descendants()
+            .filter(|n| n.kind() == SyntaxKind::VARIABLE_EXPR)
+            .collect();
+        assert!(!vars.is_empty(), "expected VARIABLE_EXPR inside interp");
+    }
+
+    #[test]
+    fn raw_f_string_round_trip() {
+        parse_round_trip("{ msg: f#\"raw ${x} text\"# }");
+    }
+
+    #[test]
+    fn plain_string_still_literal() {
+        let parsed = parse_round_trip(r#"{ x: "hi" }"#);
+        let fs: Vec<_> = parsed
+            .syntax()
+            .descendants()
+            .filter(|n| n.kind() == SyntaxKind::F_STRING)
+            .collect();
+        assert!(fs.is_empty(), "plain string should not be F_STRING");
     }
 
     #[test]

@@ -163,6 +163,23 @@ fn scan_normal_string(bytes: &[u8], start: usize) -> usize {
     bytes.len()
 }
 
+/// `pub(crate)` re-export of [`scan_normal_string`] for the CST
+/// builder's f-string interior scan. The CST walks inside an
+/// already-captured f-string byte by byte; when it crosses a `"`
+/// (mid-interpolation), it needs the same "skip a balanced string"
+/// logic the main lexer uses to avoid mistaking a closing-`"`
+/// inside the interpolation for the f-string's outer close.
+pub(crate) fn scan_normal_string_for_cst(bytes: &[u8], start: usize) -> usize {
+    scan_normal_string(bytes, start)
+}
+
+/// `pub(crate)` re-export of [`utf8_codepoint_len`] for the CST
+/// builder's f-string interior scan. Same forward-progress
+/// guarantees apply.
+pub(crate) fn utf8_codepoint_len_for_cst(b: u8) -> usize {
+    utf8_codepoint_len(b)
+}
+
 fn scan_raw_string(source: &str, start: usize, prefix_len: usize) -> usize {
     let bytes = source.as_bytes();
     let mut quote = start + prefix_len;
