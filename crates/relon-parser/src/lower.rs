@@ -37,21 +37,33 @@
 //! --------
 //!
 //! [`lower_document`] is the entry point invoked by
-//! [`crate::parse_document`]. When the CST cleanly accepts the input
-//! AND [`lower_document_node_v2`] succeeds, the new path produces the
-//! `Node` tree. Otherwise the legacy combinator chain
-//! ([`legacy_parse`]) fills in — that fallback covers a handful of
-//! `#schema X: { ... }` dict-field shapes and similar directive-shape
-//! edge cases that the P2 CST grammar is slightly more strict about
-//! than the pre-P4 parser. Closing those gaps in the CST is tracked
-//! as a follow-up to P4; the fallback keeps the parser strictly
-//! backwards-compatible until then.
+//! [`crate::parse_document`]. P5 retired the top-level legacy
+//! combinator fallback — the v2 path is now the single source of
+//! truth for what `parse_document` accepts. When the CST cleanly
+//! accepts the input AND [`lower_document_node_v2`] succeeds, the
+//! new path produces the `Node` tree; any failure (CST errors, or
+//! v2-lowering rejecting a byte-slice) surfaces as a typed
+//! [`ParseDocumentError`] without re-running [`parse_base`].
+//!
+//! The previously-known CST grammar gaps — `#schema X: { ... }`
+//! colon-separated body, optional-chain `?.` / `?[`, and `#import
+//! { a, b as c } from ...` destructure — are closed in `cst.rs`.
+//! Inputs that historically required the legacy fallback now reach
+//! the v2 path directly.
 //!
 //! [`lower_expr_v2`] dispatches per `ast::Expr` variant. Each variant
 //! routes to either [`lower_atom_via_legacy`] (atoms) or
-//! [`lower_expr_via_legacy`] (every composite construct). Slice-level
-//! comparison tests in [`tests`] assert per-construct byte-identical
-//! parity with [`legacy_parse`] for every construct family.
+//! [`lower_expr_via_legacy`] (every composite construct). The
+//! "via_legacy" naming is historical — these helpers re-run the
+//! per-construct winnow combinator on the CST node's byte slice to
+//! produce the byte-identical legacy `Node` shape. They remain
+//! load-bearing because re-implementing typed-Node construction
+//! directly from rowan walks is P6 territory; the [`legacy_parse`]
+//! retired in P5 was specifically the *top-level* `parse_base`
+//! fallback in [`lower_document`], not the per-construct byte-slice
+//! routes used by `lower_*_v2`. Slice-level comparison tests in
+//! [`tests`] assert per-construct byte-identical parity with the
+//! cfg(test)-only [`legacy_parse`] for every construct family.
 
 use crate::ast;
 use crate::cst::Parse;
@@ -690,20 +702,18 @@ pub(crate) fn first_real_error(parse: &Parse) -> Option<&crate::cst::ParseError>
 
 /// Lower a successfully-parsed CST into a legacy [`crate::Node`] tree.
 ///
-/// Slice 8 (final): the CST is the primary source of truth for what
-/// inputs the parser accepts. When the CST cleanly accepts the input
-/// AND [`lower_document_node_v2`] succeeds, the new path produces the
-/// byte-identical `Node` tree. The legacy combinator chain remains
-/// only as a fallback for the long tail of inputs the P2 CST grammar
-/// is still slightly more strict about than the pre-P4 legacy parser
-/// (a handful of `#schema X: { ... }` dict-field shapes and similar
-/// directive-shape edge cases). Closing those CST gaps is tracked as
-/// a follow-up to P4; until then the fallback keeps the parser
-/// strictly backwards-compatible.
+/// P5 (final, post-fallback): the CST is the single source of truth
+/// for what inputs `parse_document` accepts. When the CST cleanly
+/// accepts the input AND [`lower_document_node_v2`] succeeds, this
+/// returns `Ok` with a byte-identical legacy `Node` tree. Any other
+/// outcome — CST errors, v2 lowering failure, an empty document —
+/// surfaces as a typed [`ParseDocumentError`] without re-running
+/// the top-level legacy combinator chain.
 ///
 /// Trailing-input errors are surfaced as
 /// [`ParseDocumentError::TrailingInput`] (matching the pre-P4 shape)
-/// when the CST detects them and the v2 path is otherwise clean.
+/// with the offset stepped past inter-token trivia so callers see
+/// the legacy span the analyzer / fmt expect.
 pub fn lower_document(parse: &Parse, source: &str) -> Result<crate::Node, ParseDocumentError> {
     // Fast path: clean CST + v2 lowering succeeds. The v2 path is the
     // single source of truth post-P5; the top-level legacy combinator
