@@ -68,9 +68,52 @@
 use crate::ast;
 use crate::cst::Parse;
 use crate::syntax::{SyntaxKind, SyntaxNode};
-use crate::{position_at_source, Expr, Node, ParseDocumentError, Span, TokenKey, TokenRange};
+use crate::{position_at_source, Expr, Node, ParseDocumentError, RefBase, Span, TokenKey, TokenRange};
 #[cfg(test)]
 use {crate::parse_base, winnow::stream::Location};
+
+// =====================================================================
+// P6 progress notes
+// =====================================================================
+//
+// Inventory of `lower_*_v2` helpers and the legacy combinator they
+// still bridge to (as of mid-P6). Complexity reflects the work needed
+// to rewrite each helper as a direct rowan walk that constructs the
+// legacy `Node` shape without re-entering the winnow combinator.
+//
+//   helper                                | legacy fn                      | file                         | complexity
+//   --------------------------------------|--------------------------------|------------------------------|-----------
+//   lower_atom_via_legacy / WILDCARD      | (inlined: `*` → Expr::Wildcard)| —                            | done
+//   lower_atom_via_legacy / LITERAL       | parse_null/bool/number/string  | prim/{null,boolean,number,   | small (null, bool)
+//                                         |                                | string}.rs                   | medium (number, string escapes)
+//   lower_atom_via_legacy / VARIABLE_EXPR | var::parse_var                 | var.rs                       | small (CST nodes hold tokens)
+//   lower_atom_via_legacy / REFERENCE_EXPR| reference_var::parse_ref_var   | reference_var.rs             | small
+//   lower_decorator_v2                    | decorator::parse_decorator     | decorator.rs                 | small
+//   lower_directive_v2                    | directive::parse_directive     | directive.rs                 | large (5 shapes, schema body,
+//                                         |                                |                              |   with-block, main params)
+//   lower_expr_via_legacy / Dict/List/    | expr::parse_expr               | expr.rs                      | large (operator precedence,
+//     Spread/Comprehension/Binary/Unary/  |                                |                              |   call args, closures, match,
+//     Ternary/Call/Closure/Match/Where/   |                                |                              |   variant ctors, type expr,
+//     VariantCtor/FString/Type            |                                |                              |   f-strings)
+//
+// Coupling: `decorator.rs` / `directive.rs` recursively call
+// `expr::parse_expr`; `var.rs` / `reference_var.rs` recursively call
+// `parse_expr` for dynamic-key (`[expr]`) accesses. `expr.rs` calls
+// all the prim modules. `parse_base` + `parse_attributes` (in
+// `lib.rs`) and `structure/{dict,list}.rs` are only reachable from
+// `parse_expr` and from test-only `legacy_parse`. As a result the
+// legacy modules form a single connected web — deletion is gated on
+// the `parse_expr` / `parse_directive` retirement. The lower_*_v2
+// bridges, however, can be replaced one at a time provided each
+// rewrite preserves byte-identical `Node` output (the
+// `corpus_lower_matches_legacy` test in this module is the gate).
+//
+// Strategy: rewrite the smallest bridges first (WILDCARD ✓, then
+// VARIABLE / REFERENCE / LITERAL atoms, then `lower_decorator_v2`),
+// and only then attack the large ones. Once every `lower_*_v2`
+// stops calling its legacy counterpart, the whole legacy module web
+// can be deleted in one commit because nothing else (outside their
+// own tests + `lib.rs::parse_base`) depends on them.
 
 // =====================================================================
 // CST-walking lowering — P4 implementation.
@@ -110,35 +153,20 @@ pub(crate) fn range_from_offsets(source: &str, start: usize, end: usize) -> Toke
 /// with direct CST walks as each family ships.
 #[allow(dead_code)]
 fn lower_atom_via_legacy(node: &SyntaxNode, source: &str) -> Option<Node> {
-    // Slice the source to the node's range so the legacy parser sees
-    // exactly the bytes the CST claims belong to this atom — its
-    // `TokenRange` offsets are computed against the full source via
-    // a translation pass below.
-    let r = node.text_range();
-    let start: usize = r.start().into();
-    let end: usize = r.end().into();
-    let slice = source.get(start..end)?;
-    let mut span = Span::new(slice);
-    use winnow::Parser as _;
-    let parsed: Option<Node> = match node.kind() {
-        SyntaxKind::LITERAL => {
-            // null / bool / number / string atoms.
-            winnow::combinator::alt::<_, Node, _, _>((
-                crate::prim::null::parse_null,
-                crate::prim::boolean::parse_bool,
-                crate::prim::number::parse_number,
-                crate::prim::string::parse_string,
-            ))
-            .parse_next(&mut span)
-            .ok()
-        }
-        SyntaxKind::VARIABLE_EXPR => crate::var::parse_var.parse_next(&mut span).ok(),
-        SyntaxKind::REFERENCE_EXPR => crate::reference_var::parse_ref_var
-            .parse_next(&mut span)
-            .ok(),
+    match node.kind() {
+        // CST walker — no byte-slice re-parse needed. The CST already
+        // carries the typed tokens; we read them off in order and
+        // build the legacy `Vec<TokenKey>` directly. Dynamic-key
+        // (`[expr]`) accesses recurse through `lower_expr_v2`, which
+        // is itself the lowering dispatch — keeping a single source
+        // of truth for nested expressions.
+        SyntaxKind::VARIABLE_EXPR => lower_variable_expr_v2(node, source),
+        SyntaxKind::REFERENCE_EXPR => lower_reference_expr_v2(node, source),
         SyntaxKind::WILDCARD => {
-            // Legacy `parse_wildcard` lives in expr.rs (private). The
-            // simplest equivalent is to consume `*` directly.
+            let r = node.text_range();
+            let start: usize = r.start().into();
+            let end: usize = r.end().into();
+            let slice = source.get(start..end)?;
             if slice == "*" {
                 Some(Node::new(
                     Expr::Wildcard,
@@ -148,13 +176,224 @@ fn lower_atom_via_legacy(node: &SyntaxNode, source: &str) -> Option<Node> {
                 None
             }
         }
+        SyntaxKind::LITERAL => {
+            // null / bool / number / string atoms. The prim
+            // combinators still own the escape / overflow decoding,
+            // so we run them on the literal token's exact text and
+            // translate offsets back. The LITERAL node is a single
+            // leaf, so this is effectively the leaf parsers running
+            // on the exact token bytes — no recursion through
+            // `parse_expr` happens here.
+            let r = node.text_range();
+            let start: usize = r.start().into();
+            let end: usize = r.end().into();
+            let slice = source.get(start..end)?;
+            let mut span = Span::new(slice);
+            use winnow::Parser as _;
+            let parsed = winnow::combinator::alt::<_, Node, _, _>((
+                crate::prim::null::parse_null,
+                crate::prim::boolean::parse_bool,
+                crate::prim::number::parse_number,
+                crate::prim::string::parse_string,
+            ))
+            .parse_next(&mut span)
+            .ok()?;
+            let mut node_value = parsed;
+            translate_node_offsets(&mut node_value, start, source);
+            Some(node_value)
+        }
         _ => None,
+    }
+}
+
+/// Walk a `VARIABLE_EXPR` CST node and rebuild the legacy
+/// `Expr::Variable(Vec<TokenKey>)` shape directly. The CST tracks
+/// every path token (head IDENT, `.` / `?.` access, `[expr]` /
+/// `?[expr]` dynamic, numeric `.N` index) as siblings under the
+/// VARIABLE_EXPR node. We walk the `children_with_tokens()` iter
+/// once, threading a "pending optional" flag for the `?.` / `?[`
+/// prefix, and emit one `TokenKey` per segment.
+///
+/// Dynamic-key (`[expr]`) accesses recurse through [`lower_expr_v2`]
+/// — the same dispatch the outer lowering uses — so the bracket-
+/// expression shape matches whatever the rest of the pipeline
+/// produces (e.g. inner BINARY_EXPR with operator precedence).
+fn lower_variable_expr_v2(node: &SyntaxNode, source: &str) -> Option<Node> {
+    let r = node.text_range();
+    let start: usize = r.start().into();
+    let end: usize = r.end().into();
+    let path = walk_path_tokens(node, source, /*is_reference=*/ false)?;
+    Some(Node::new(
+        Expr::Variable(path),
+        range_from_offsets(source, start, end),
+    ))
+}
+
+/// Walk a `REFERENCE_EXPR` CST node and rebuild the legacy
+/// `Expr::Reference { base, path }` shape. The CST emits `&` as a
+/// leaf token, then a single IDENT for the base name, then the same
+/// path-token alternation as `VARIABLE_EXPR`.
+fn lower_reference_expr_v2(node: &SyntaxNode, source: &str) -> Option<Node> {
+    let r = node.text_range();
+    let start: usize = r.start().into();
+    let end: usize = r.end().into();
+    // First IDENT after the `&` AMP token names the reference base.
+    // Locate it without consuming any other tokens — `walk_path_tokens`
+    // will re-walk from the start and skip both `&` + base IDENT.
+    let base_text = node
+        .children_with_tokens()
+        .filter_map(|el| el.into_token())
+        .find(|t| t.kind() == SyntaxKind::IDENT)
+        .map(|t| t.text().to_string())?;
+    let base = match base_text.as_str() {
+        "root" => RefBase::Root,
+        "sibling" => RefBase::Sibling,
+        "uncle" => RefBase::Uncle,
+        "prev" => RefBase::Prev,
+        "next" => RefBase::Next,
+        "index" => RefBase::Index,
+        "this" => RefBase::This,
+        _ => return None,
     };
-    let mut node_value = parsed?;
-    // Translate the produced `TokenRange` offsets, which are zero-
-    // indexed against the sliced source, back to the full document.
-    translate_node_offsets(&mut node_value, start, source);
-    Some(node_value)
+    let path = walk_path_tokens(node, source, /*is_reference=*/ true)?;
+    Some(Node::new(
+        Expr::Reference { base, path },
+        range_from_offsets(source, start, end),
+    ))
+}
+
+/// Read the path tokens off a `VARIABLE_EXPR` / `REFERENCE_EXPR` node.
+/// For variables (`is_reference = false`) the first IDENT is the
+/// head segment (`a` in `a.b[0]`) and is emitted as a non-optional
+/// `TokenKey::String`. For references (`is_reference = true`) the
+/// first IDENT (after the `&` AMP token) is the base name; the
+/// caller consumed it already, so we skip it here and start the
+/// path with whatever follows.
+///
+/// The token loop mirrors the legacy `parse_path` / `parse_ref_var`
+/// shape exactly: a `?` is consumed as an optional prefix only when
+/// followed by `.` or `[`; bare `?` would have been emitted as a
+/// ternary operator at a different position in the grammar.
+fn walk_path_tokens(
+    node: &SyntaxNode,
+    source: &str,
+    is_reference: bool,
+) -> Option<Vec<TokenKey>> {
+    let mut path: Vec<TokenKey> = Vec::new();
+    // Tracks whether we've already consumed the head — either the
+    // first IDENT (variable) or the `&` + base IDENT pair
+    // (reference). For variables, the parser also folds nested
+    // VARIABLE_EXPR children at the head position (the postfix
+    // re-wrapper at `parse_postfix`), so a head VARIABLE_EXPR's
+    // path gets flattened into ours.
+    let mut head_done = false;
+    let mut pending_optional = false;
+    let mut expect_segment_after_dot = false;
+
+    for el in node.children_with_tokens() {
+        match el {
+            rowan::NodeOrToken::Token(t) => match t.kind() {
+                SyntaxKind::WHITESPACE
+                | SyntaxKind::LINE_COMMENT
+                | SyntaxKind::BLOCK_COMMENT => continue,
+                SyntaxKind::AMP => continue,
+                SyntaxKind::IDENT => {
+                    if !head_done {
+                        head_done = true;
+                        if is_reference {
+                            // Base name — caller already captured it
+                            // as `RefBase`. We do NOT push a path
+                            // segment for the base.
+                            continue;
+                        }
+                        // Head segment of a VARIABLE_EXPR.
+                        let tr = t.text_range();
+                        let s: usize = tr.start().into();
+                        let e: usize = tr.end().into();
+                        path.push(TokenKey::String(
+                            t.text().to_string(),
+                            range_from_offsets(source, s, e),
+                            false,
+                        ));
+                        continue;
+                    }
+                    if expect_segment_after_dot {
+                        let tr = t.text_range();
+                        let s: usize = tr.start().into();
+                        let e: usize = tr.end().into();
+                        path.push(TokenKey::String(
+                            t.text().to_string(),
+                            range_from_offsets(source, s, e),
+                            pending_optional,
+                        ));
+                        pending_optional = false;
+                        expect_segment_after_dot = false;
+                        continue;
+                    }
+                    // Unexpected bare IDENT — should never happen in a
+                    // well-formed VARIABLE_EXPR / REFERENCE_EXPR.
+                    return None;
+                }
+                SyntaxKind::NUMBER => {
+                    if expect_segment_after_dot {
+                        let idx: usize = t.text().parse().ok()?;
+                        path.push(TokenKey::Index(idx, pending_optional));
+                        pending_optional = false;
+                        expect_segment_after_dot = false;
+                        continue;
+                    }
+                    return None;
+                }
+                SyntaxKind::DOT => {
+                    expect_segment_after_dot = true;
+                    continue;
+                }
+                SyntaxKind::QUESTION => {
+                    // Legacy grammar: `?` only stands in the path when
+                    // followed by `.` or `[`. The CST grammar enforces
+                    // the same lookahead before emitting the QUESTION
+                    // as a path token; if we encounter one here, it's
+                    // always the optional-chain prefix.
+                    pending_optional = true;
+                    continue;
+                }
+                SyntaxKind::L_BRACK | SyntaxKind::R_BRACK => continue,
+                _ => continue,
+            },
+            rowan::NodeOrToken::Node(n) => {
+                // Two shapes nest a Node inside a VARIABLE_EXPR /
+                // REFERENCE_EXPR:
+                //
+                //   1. A nested VARIABLE_EXPR at the head position.
+                //      `parse_postfix` reopens VARIABLE_EXPR at a
+                //      checkpoint covering the *atom* it just parsed,
+                //      so for `foo.bar` the CST has the inner `foo`
+                //      VARIABLE_EXPR as a child of the outer
+                //      VARIABLE_EXPR. Flatten its path into ours.
+                //
+                //   2. A bracketed expression: `a[expr]` or `a?[expr]`.
+                //      The inner Expr recurses through `lower_expr_v2`
+                //      so its shape matches the rest of the lowering.
+                if !head_done && !is_reference && n.kind() == SyntaxKind::VARIABLE_EXPR {
+                    // Flatten the inner VARIABLE_EXPR's path. The
+                    // inner path's `is_optional` flags stay as-is
+                    // because the inner expression had no leading
+                    // `?` (a `?.foo` head would have been parsed as
+                    // a ternary, not as a path).
+                    let inner_path = walk_path_tokens(&n, source, /*is_reference=*/ false)?;
+                    path.extend(inner_path);
+                    head_done = true;
+                    continue;
+                }
+                if let Some(inner) = ast::Expr::cast(n.clone()) {
+                    let inner_node = lower_expr_v2(&inner, source)?;
+                    path.push(TokenKey::Dynamic(inner_node, pending_optional));
+                    pending_optional = false;
+                }
+            }
+        }
+    }
+    Some(path)
 }
 
 /// Recursively shift every `TokenRange` inside `node` by `base_offset`
