@@ -1,10 +1,9 @@
 #![forbid(unsafe_code)]
 
-use relon_parser::{
-    parse_document,
-    source::{tokenize_source, SourceToken as Token, SourceTokenKind as TokenKind},
-    Directive, DirectiveBody, Expr, Node, TokenKey,
-};
+use relon_parser::ast::{self, Document};
+use relon_parser::cst::parse_cst;
+use relon_parser::source::{tokenize_source, SourceToken as Token, SourceTokenKind as TokenKind};
+use relon_parser::syntax::{SyntaxKind, SyntaxNode};
 use std::collections::BTreeSet;
 use std::ops::Range;
 use std::path::PathBuf;
@@ -34,8 +33,8 @@ pub enum Error {
 
 pub fn format_source(source: &str) -> Result<String, Error> {
     // Pipeline:
-    //   1. Parse the original source.
-    //   2. AST-driven *source edits* — `lift_imports` and `reorder_methods`
+    //   1. Parse the original source into a rowan CST.
+    //   2. CST-driven *source edits* — `lift_imports` and `reorder_methods`
     //      build whole-pair byte-range edits that respect ownership
     //      (directives/decorators stay glued to their pair). Applied
     //      right-to-left so offsets remain valid.
@@ -47,18 +46,22 @@ pub fn format_source(source: &str) -> Result<String, Error> {
     //      consults the paragraph-break set to decide between `\n` and
     //      `\n\n` ahead of each token.
     //   6. Validate the output re-parses.
-    let root = parse_document(source).map_err(|error| Error::Parse(error.to_string()))?;
+    let doc = parse_strict(source)?;
 
     let mut edits: Vec<SourceEdit> = Vec::new();
-    collect_lift_import_edits(&root, source, &mut edits);
-    collect_dict_reorder_edits(&root, /*in_directive_body=*/ false, source, &mut edits);
+    collect_lift_import_edits(&doc, source, &mut edits);
+    collect_dict_reorder_edits_root(&doc, source, &mut edits);
     let edited = apply_edits(source, edits);
 
     let break_offsets = if edited != source {
-        let root2 = parse_document(&edited).map_err(|error| Error::Parse(error.to_string()))?;
-        compute_paragraph_break_offsets(&root2, /*in_directive_body=*/ false, &edited)
+        let doc2 = parse_strict(&edited)?;
+        let mut out = BTreeSet::new();
+        walk_for_break_offsets_root(&doc2, &edited, &mut out);
+        out
     } else {
-        compute_paragraph_break_offsets(&root, /*in_directive_body=*/ false, source)
+        let mut out = BTreeSet::new();
+        walk_for_break_offsets_root(&doc, source, &mut out);
+        out
     };
 
     let tokens = tokenize_source(&edited).map_err(|error| Error::Tokenize(error.to_string()))?;
@@ -73,148 +76,95 @@ pub fn is_formatted(source: &str) -> Result<bool, Error> {
 }
 
 fn validate_source(source: &str) -> Result<(), Error> {
-    parse_document(source).map_err(|error| Error::Parse(error.to_string()))?;
+    parse_strict(source)?;
     Ok(())
 }
 
+/// Strict-parse a Relon source into a typed [`Document`]. Any
+/// parser error surfaces as a [`Error::Parse`] with the legacy
+/// error shape so existing callers (CLI, tests) keep seeing the
+/// same diagnostic string.
+///
+/// We call [`relon_parser::parse_document`] to leverage its
+/// canonical error formatting (`parse error: ...` /
+/// `trailing input at byte N: ...`), then re-parse via
+/// [`parse_cst`] for CST walking. The double parse is intentional
+/// — `parse_document` is the strict surface contract, and CST
+/// walking needs the rowan tree.
+fn parse_strict(source: &str) -> Result<Document, Error> {
+    relon_parser::parse_document(source).map_err(|err| Error::Parse(err.to_string()))?;
+    let parse = parse_cst(source);
+    ast::document_of(parse.syntax()).ok_or_else(|| Error::Parse("empty document".to_string()))
+}
+
 // =====================================================================
-// AST-side primitives — used by every pair-level fmt feature.
+// CST-side primitives — used by every pair-level fmt feature.
 //
 // These exist for one reason: the token stream doesn't know which `#`
-// belongs to which pair, but the AST does. Every operation that
+// belongs to which pair, but the CST does. Every operation that
 // affects pair grouping (reorder, paragraph break, lift imports)
 // MUST go through these primitives so directives/decorators stay
 // glued to their pair.
+//
+// P6 round 3: the walkers operate on raw [`SyntaxNode`]s
+// (rowan-typed CST) rather than the legacy `Node` / `Expr` /
+// `TokenKey` tree. The previous AST-based helpers
+// (`dict_body_range`, `pair_span`, `classify_pair`, ...) are gone —
+// the rowan tree exposes byte ranges directly via `text_range()`,
+// so the brace-finder / scope-trackers from the old layer
+// disappear.
 // =====================================================================
 
-/// Source byte range covering the interior of a Dict's braces
-/// (exclusive of `{` and `}`). Critically, the `{` search starts
-/// **after** the node's own directives/decorators/type_hint — for the
-/// root node those preceding constructs can include whole `#schema X
-/// { ... }` blocks, whose `{` must NOT be mistaken for the body's `{`.
-/// Returns `None` if the braces can't be located (defensive).
-fn dict_body_range(node: &Node, source: &str) -> Option<Range<usize>> {
-    let mut search_start = node.range.start.offset;
-    for dir in &node.directives {
-        search_start = search_start.max(dir.range.end.offset);
-    }
-    for dec in &node.decorators {
-        search_start = search_start.max(dec.range.end.offset);
-    }
-    if let Some(t) = &node.type_hint {
-        search_start = search_start.max(t.range.end.offset);
-    }
-
-    let span_end = node.range.end.offset.min(source.len());
-    if search_start >= span_end {
-        return None;
-    }
-    let bytes = source.as_bytes();
-    let mut i = search_start;
-    // Scan for `{` skipping strings and comments.
-    let open_abs = loop {
-        if i >= span_end {
-            return None;
-        }
-        match bytes[i] {
-            b'"' => {
-                i = skip_string(bytes, i, span_end);
+/// Source byte range covering the interior of a `DICT` node's
+/// braces (exclusive of `{` and `}`). The rowan tree records the
+/// open / close brace tokens as the first and last leaf tokens of
+/// the DICT — we just read them off.
+fn dict_body_range_cst(dict: &SyntaxNode) -> Option<Range<usize>> {
+    debug_assert_eq!(dict.kind(), SyntaxKind::DICT);
+    let mut open = None;
+    let mut close = None;
+    for el in dict.children_with_tokens() {
+        let Some(tok) = el.into_token() else { continue };
+        match tok.kind() {
+            SyntaxKind::L_BRACE if open.is_none() => {
+                open = Some(usize::from(tok.text_range().end()));
             }
-            b'/' if i + 1 < span_end && bytes[i + 1] == b'/' => {
-                while i < span_end && bytes[i] != b'\n' {
-                    i += 1;
-                }
-            }
-            b'/' if i + 1 < span_end && bytes[i + 1] == b'*' => {
-                i += 2;
-                while i + 1 < span_end && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
-                    i += 1;
-                }
-                i = (i + 2).min(span_end);
-            }
-            b'{' => break i,
-            _ => i += 1,
-        }
-    };
-
-    let mut depth: i32 = 0;
-    i = open_abs;
-    while i < span_end {
-        match bytes[i] {
-            b'"' => {
-                i = skip_string(bytes, i, span_end);
-                continue;
-            }
-            b'/' if i + 1 < span_end && bytes[i + 1] == b'/' => {
-                while i < span_end && bytes[i] != b'\n' {
-                    i += 1;
-                }
-                continue;
-            }
-            b'/' if i + 1 < span_end && bytes[i + 1] == b'*' => {
-                i += 2;
-                while i + 1 < span_end && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
-                    i += 1;
-                }
-                i = (i + 2).min(span_end);
-                continue;
-            }
-            b'{' => depth += 1,
-            b'}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some((open_abs + 1)..i);
-                }
+            SyntaxKind::R_BRACE => {
+                close = Some(usize::from(tok.text_range().start()));
             }
             _ => {}
         }
-        i += 1;
     }
-    None
+    Some(open?..close?)
 }
 
-/// Skip a `"..."` string literal (with backslash-escape awareness).
-/// `start` must point at the opening `"`. Returns the index *after*
-/// the closing `"`, or `end` if the string is unterminated.
-fn skip_string(bytes: &[u8], start: usize, end: usize) -> usize {
-    debug_assert_eq!(bytes[start], b'"');
-    let mut i = start + 1;
-    while i < end {
-        match bytes[i] {
-            b'\\' => i = (i + 2).min(end),
-            b'"' => return i + 1,
-            _ => i += 1,
-        }
-    }
-    end
-}
-
-/// Source byte range covering an entire Dict pair: the earliest start
-/// among the key, directives, and decorators (since `#private` /
-/// `@deco` precede the key in source), through the value's end. This
-/// is the canonical "whole pair" extent — any source-rewrite of pair
-/// order must use this range so the leading directives/decorators
-/// stay attached.
-fn pair_span(pair: &(TokenKey, Node), source: &str) -> Range<usize> {
-    let (key, value) = pair;
-    let mut start = key_start_offset(key).unwrap_or(value.range.start.offset);
-    for dir in &value.directives {
-        start = start.min(dir.range.start.offset);
-    }
-    for dec in &value.decorators {
-        start = start.min(dec.range.start.offset);
-    }
-    let end = value.range.end.offset.min(source.len());
+/// Source byte range covering an entire `DICT_FIELD` — leading
+/// directives + decorators + the key + value. The CST groups all of
+/// these as direct children of the `DICT_FIELD` node; we ignore any
+/// pure-trivia leading bytes attached to the first child (rowan
+/// stuffs them inside the node) and start at the first real token.
+/// The mirrored legacy `pair_span` started at the first significant
+/// byte; byte-identical output depends on the break offset landing
+/// on the field's first non-trivia token.
+fn dict_field_span(field: &SyntaxNode) -> Range<usize> {
+    let start = first_significant_offset(field).unwrap_or_else(|| {
+        let r = field.text_range();
+        usize::from(r.start())
+    });
+    let end = usize::from(field.text_range().end());
     start..end
 }
 
-fn key_start_offset(key: &TokenKey) -> Option<usize> {
-    match key {
-        TokenKey::String(_, range, _) => Some(range.start.offset),
-        TokenKey::Dynamic(node, _) => Some(node.range.start.offset),
-        TokenKey::Spread(range) => Some(range.start.offset),
-        _ => None,
+/// First non-trivia byte offset inside `node`. Walks the green tree
+/// descendants in source order and returns the start of the first
+/// leaf token whose kind isn't a comment / whitespace.
+fn first_significant_offset(node: &SyntaxNode) -> Option<usize> {
+    for tok in node.descendants_with_tokens().filter_map(|el| el.into_token()) {
+        if !tok.kind().is_trivia() {
+            return Some(usize::from(tok.text_range().start()));
+        }
     }
+    None
 }
 
 /// Four-tier pair classification driving both `reorder` and
@@ -245,10 +195,9 @@ enum PairTier {
     PublicField = 3,
 }
 
-fn classify_pair(pair: &(TokenKey, Node)) -> PairTier {
-    let value = &pair.1;
-    let is_closure = matches!(&*value.expr, Expr::Closure { .. });
-    let is_private = value.directives.iter().any(|d| d.name == "private");
+fn classify_dict_field(field: &ast::DictField) -> PairTier {
+    let is_closure = matches!(field.value(), Some(ast::Expr::Closure(_)));
+    let is_private = field_has_private_directive(field);
     match (is_closure, is_private) {
         (true, true) => PairTier::PrivateMethod,
         (true, false) => PairTier::PublicMethod,
@@ -257,73 +206,26 @@ fn classify_pair(pair: &(TokenKey, Node)) -> PairTier {
     }
 }
 
-/// Yield expression children only. Directives and decorators are
-/// walked separately by each pre-pass driver so they can flag a
-/// `#schema` / `#extend` / `#main` body Dict as "don't reorder me"
-/// (its declaration order is semantic).
-fn expr_children(node: &Node) -> Vec<&Node> {
-    let mut out = Vec::new();
-    match &*node.expr {
-        Expr::Dict(pairs) => {
-            for (key, value) in pairs {
-                if let TokenKey::Dynamic(inner, _) = key {
-                    out.push(inner);
-                }
-                out.push(value);
-            }
-        }
-        Expr::List(items) => out.extend(items.iter()),
-        Expr::Spread(inner) => out.push(inner),
-        Expr::Comprehension {
-            element,
-            iterable,
-            condition,
-            ..
-        } => {
-            out.push(element);
-            out.push(iterable);
-            if let Some(c) = condition {
-                out.push(c);
-            }
-        }
-        Expr::Binary(_, l, r) => {
-            out.push(l);
-            out.push(r);
-        }
-        Expr::Unary(_, inner) => out.push(inner),
-        Expr::Ternary { cond, then, els } => {
-            out.push(cond);
-            out.push(then);
-            out.push(els);
-        }
-        Expr::FnCall { args, .. } => {
-            for arg in args {
-                out.push(&arg.value);
-            }
-        }
-        Expr::FString(parts) => {
-            for part in parts {
-                if let relon_parser::FStringPart::Interpolation(n) = part {
-                    out.push(n);
-                }
-            }
-        }
-        Expr::Where { expr, bindings } => {
-            out.push(expr);
-            out.push(bindings);
-        }
-        Expr::Match { expr, arms } => {
-            out.push(expr);
-            for (pat, body) in arms {
-                out.push(pat);
-                out.push(body);
-            }
-        }
-        Expr::Closure { body, .. } => out.push(body),
-        Expr::VariantCtor { body, .. } => out.push(body),
-        _ => {}
-    }
-    out
+/// True when a `DICT_FIELD` carries a `#private` pragma. The CST
+/// stacks pair-level pragmas as `DIRECTIVE` children of the field
+/// itself (the same shape document-level directives use under
+/// `DOCUMENT`).
+fn field_has_private_directive(field: &ast::DictField) -> bool {
+    field
+        .syntax()
+        .children()
+        .filter(|c| c.kind() == SyntaxKind::DIRECTIVE)
+        .any(|d| directive_name_text(&d).as_deref() == Some("private"))
+}
+
+/// Name of a `DIRECTIVE` node — the IDENT token immediately
+/// following the leading `#`.
+fn directive_name_text(dir: &SyntaxNode) -> Option<String> {
+    debug_assert_eq!(dir.kind(), SyntaxKind::DIRECTIVE);
+    dir.children_with_tokens()
+        .filter_map(|el| el.into_token())
+        .find(|t| t.kind() == SyntaxKind::IDENT)
+        .map(|t| t.text().to_string())
 }
 
 // =====================================================================
@@ -363,11 +265,20 @@ fn apply_edits(source: &str, mut edits: Vec<SourceEdit>) -> String {
 // order.
 // =====================================================================
 
-fn collect_lift_import_edits(root: &Node, source: &str, edits: &mut Vec<SourceEdit>) {
-    let imports: Vec<&Directive> = root
-        .directives
+fn collect_lift_import_edits(doc: &Document, source: &str, edits: &mut Vec<SourceEdit>) {
+    // Top-level directives are direct DOCUMENT children — same
+    // ordering the legacy `root.directives` Vec used.
+    let directives: Vec<SyntaxNode> = doc
+        .syntax()
+        .children()
+        .filter(|c| c.kind() == SyntaxKind::DIRECTIVE)
+        .collect();
+    if directives.is_empty() {
+        return;
+    }
+    let imports: Vec<&SyntaxNode> = directives
         .iter()
-        .filter(|d| d.name == "import")
+        .filter(|d| directive_name_text(d).as_deref() == Some("import"))
         .collect();
     if imports.is_empty() {
         return;
@@ -375,10 +286,9 @@ fn collect_lift_import_edits(root: &Node, source: &str, edits: &mut Vec<SourceEd
 
     // Already-packed shape: the first N directives are all imports,
     // where N == imports.len(). Nothing to do.
-    let leading_imports = root
-        .directives
+    let leading_imports = directives
         .iter()
-        .take_while(|d| d.name == "import")
+        .take_while(|d| directive_name_text(d).as_deref() == Some("import"))
         .count();
     if leading_imports == imports.len() {
         return;
@@ -387,8 +297,10 @@ fn collect_lift_import_edits(root: &Node, source: &str, edits: &mut Vec<SourceEd
     // Conservative bail: if any byte between the file start of the
     // first directive and the last import holds a comment, moving an
     // import could disturb the comment's visual association. Skip.
-    let first_directive_start = root.directives[0].range.start.offset;
-    let last_import_end = imports.last().unwrap().range.end.offset.min(source.len());
+    let first_directive_start = first_significant_offset(&directives[0])
+        .unwrap_or_else(|| usize::from(directives[0].text_range().start()));
+    let last_import_end =
+        usize::from(imports.last().unwrap().text_range().end()).min(source.len());
     let inter_block = &source[first_directive_start..last_import_end];
     if inter_block.contains("//") || inter_block.contains("/*") {
         return;
@@ -400,7 +312,9 @@ fn collect_lift_import_edits(root: &Node, source: &str, edits: &mut Vec<SourceEd
     let mut lifted = String::new();
     let mut import_ranges: Vec<Range<usize>> = Vec::with_capacity(imports.len());
     for (i, dir) in imports.iter().enumerate() {
-        let r = dir.range.start.offset..dir.range.end.offset.min(source.len());
+        let start = first_significant_offset(dir)
+            .unwrap_or_else(|| usize::from(dir.text_range().start()));
+        let r = start..usize::from(dir.text_range().end()).min(source.len());
         if i > 0 {
             lifted.push('\n');
         }
@@ -443,47 +357,66 @@ fn collect_lift_import_edits(root: &Node, source: &str, edits: &mut Vec<SourceEd
 //     test in the prior implementation).
 // =====================================================================
 
-fn collect_dict_reorder_edits(
-    node: &Node,
+/// Driver: walk the Document's CST children and dispatch each top
+/// level construct to the recursive walker. Directive children get
+/// `in_directive_body=true` (schema/extend/main bodies have
+/// declaration-shaped Dicts whose pair order is semantic);
+/// decorator args + the root expression get `false`.
+fn collect_dict_reorder_edits_root(doc: &Document, source: &str, edits: &mut Vec<SourceEdit>) {
+    for child in doc.syntax().children() {
+        let in_dir = child.kind() == SyntaxKind::DIRECTIVE;
+        collect_dict_reorder_edits_cst(&child, in_dir, source, edits);
+    }
+}
+
+/// Recursive walker: descends into `node`'s children and emits a
+/// reorder edit for any DICT whose pair tiers aren't already sorted
+/// (and whose body holds no comments — comment placement is brittle
+/// under reorder).
+fn collect_dict_reorder_edits_cst(
+    node: &SyntaxNode,
     in_directive_body: bool,
     source: &str,
     edits: &mut Vec<SourceEdit>,
 ) {
-    // Walk directives — their bodies are declaration-shaped (schema
-    // fields, main params) and opt out of reorder.
-    for dir in &node.directives {
-        if let Some(body) = directive_body_node(&dir.body) {
-            collect_dict_reorder_edits(body, true, source, edits);
-        }
-    }
-    // Decorator args and expression children reorder normally.
-    for dec in &node.decorators {
-        for arg in &dec.args {
-            collect_dict_reorder_edits(&arg.value, false, source, edits);
-        }
-    }
-    for child in expr_children(node) {
-        collect_dict_reorder_edits(child, false, source, edits);
+    // Recurse into every child, threading the directive-body flag:
+    //   - DIRECTIVE children of `node` stay in declaration mode
+    //     (their inner Dict is a schema body / main params).
+    //   - Decorator args go back to non-directive mode.
+    //   - Everything else inherits the current flag.
+    for child in node.children() {
+        let nested_in_dir = match child.kind() {
+            SyntaxKind::DIRECTIVE => true,
+            SyntaxKind::DECORATOR => false,
+            _ => in_directive_body,
+        };
+        collect_dict_reorder_edits_cst(&child, nested_in_dir, source, edits);
     }
 
     if in_directive_body {
         return;
     }
-    let Expr::Dict(pairs) = &*node.expr else {
+    if node.kind() != SyntaxKind::DICT {
+        return;
+    }
+    let Some(dict) = ast::Dict::cast(node.clone()) else {
         return;
     };
-    if pairs.len() < 2 {
+    let fields: Vec<ast::DictField> = dict.fields().collect();
+    if fields.len() < 2 {
         return;
     }
 
-    let classified: Vec<(PairTier, &(TokenKey, Node))> =
-        pairs.iter().map(|p| (classify_pair(p), p)).collect();
+    let classified: Vec<(PairTier, &ast::DictField)> = fields
+        .iter()
+        .map(|f| (classify_dict_field(f), f))
+        .collect();
 
     if pairs_tier_sorted(&classified) {
         return;
     }
 
-    let Some(body_range) = dict_body_range(node, source) else {
+    let Some(body_range) = dict_body_range_cst(node) else {
         return;
     };
     let body_text = &source[body_range.clone()];
@@ -503,7 +436,7 @@ fn collect_dict_reorder_edits(
     ]
     .iter()
     .flat_map(|tier| classified.iter().filter(move |(t, _)| t == tier))
-    .map(|(_, p)| source[pair_span(p, source)].trim())
+    .map(|(_, f)| source[dict_field_span(f.syntax())].trim())
     .collect();
     let new_body = format!("\n{}\n", pieces.join(",\n"));
     edits.push(SourceEdit {
@@ -512,7 +445,7 @@ fn collect_dict_reorder_edits(
     });
 }
 
-fn pairs_tier_sorted(classified: &[(PairTier, &(TokenKey, Node))]) -> bool {
+fn pairs_tier_sorted(classified: &[(PairTier, &ast::DictField)]) -> bool {
     let mut prev = PairTier::PrivateMethod;
     for (tier, _) in classified {
         if *tier < prev {
@@ -521,14 +454,6 @@ fn pairs_tier_sorted(classified: &[(PairTier, &(TokenKey, Node))]) -> bool {
         prev = *tier;
     }
     true
-}
-
-fn directive_body_node(body: &DirectiveBody) -> Option<&Node> {
-    match body {
-        DirectiveBody::Value(b) => Some(b),
-        DirectiveBody::NameBody { body, .. } => Some(body),
-        _ => None,
-    }
 }
 
 // =====================================================================
@@ -544,57 +469,60 @@ fn directive_body_node(body: &DirectiveBody) -> Option<&Node> {
 // fire; with reorder running first, transitions usually number one.
 // =====================================================================
 
-fn compute_paragraph_break_offsets(
-    node: &Node,
-    in_directive_body: bool,
-    source: &str,
-) -> BTreeSet<usize> {
-    let mut out = BTreeSet::new();
-    walk_for_break_offsets(node, in_directive_body, source, &mut out);
-    out
+/// CST-walking driver for paragraph-break offsets. Mirrors
+/// [`collect_dict_reorder_edits_root`] in shape: each top-level
+/// directive contributes its declaration-shaped body (which never
+/// produces break offsets); the rest of the document walks normally.
+fn walk_for_break_offsets_root(doc: &Document, source: &str, out: &mut BTreeSet<usize>) {
+    for child in doc.syntax().children() {
+        let in_dir = child.kind() == SyntaxKind::DIRECTIVE;
+        walk_for_break_offsets_cst(&child, in_dir, source, out);
+    }
 }
 
-fn walk_for_break_offsets(
-    node: &Node,
+fn walk_for_break_offsets_cst(
+    node: &SyntaxNode,
     in_directive_body: bool,
     source: &str,
     out: &mut BTreeSet<usize>,
 ) {
-    for dir in &node.directives {
-        if let Some(body) = directive_body_node(&dir.body) {
-            walk_for_break_offsets(body, true, source, out);
-        }
-    }
-    for dec in &node.decorators {
-        for arg in &dec.args {
-            walk_for_break_offsets(&arg.value, false, source, out);
-        }
-    }
-    for child in expr_children(node) {
-        walk_for_break_offsets(child, false, source, out);
+    for child in node.children() {
+        let nested_in_dir = match child.kind() {
+            SyntaxKind::DIRECTIVE => true,
+            SyntaxKind::DECORATOR => false,
+            _ => in_directive_body,
+        };
+        walk_for_break_offsets_cst(&child, nested_in_dir, source, out);
     }
 
     if in_directive_body {
         return;
     }
-    let Expr::Dict(pairs) = &*node.expr else {
-        return;
-    };
-    if pairs.len() < 2 {
+    if node.kind() != SyntaxKind::DICT {
         return;
     }
-    let classified: Vec<(PairTier, &(TokenKey, Node))> =
-        pairs.iter().map(|p| (classify_pair(p), p)).collect();
+    let Some(dict) = ast::Dict::cast(node.clone()) else {
+        return;
+    };
+    let fields: Vec<ast::DictField> = dict.fields().collect();
+    if fields.len() < 2 {
+        return;
+    }
+    let classified: Vec<(PairTier, &ast::DictField)> = fields
+        .iter()
+        .map(|f| (classify_dict_field(f), f))
+        .collect();
     // Break at every upward tier transition (Method→PrivateField,
     // Method→PublicField, PrivateField→PublicField). After the
     // reorder pre-pass, tiers are non-decreasing, so each transition
     // we see here is a real paragraph boundary.
     for i in 1..classified.len() {
         if classified[i].0 > classified[i - 1].0 {
-            let span = pair_span(classified[i].1, source);
+            let span = dict_field_span(classified[i].1.syntax());
             out.insert(span.start);
         }
     }
+    let _ = source;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
