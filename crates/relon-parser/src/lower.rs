@@ -911,31 +911,681 @@ fn trim_leading_trivia(slice: &str) -> usize {
 }
 
 /// Lower a CST [`ast::Directive`] to a legacy [`crate::Directive`] by
-/// re-running the legacy `parse_directive` combinator on the
-/// directive's exact byte range and translating the produced
-/// `TokenRange`s back onto the full source. Same byte-identical
-/// shortcut the expression-shaped lowering uses, applied to
-/// attributes.
+/// walking the rowan node directly. Each shape (Bare / Value /
+/// NameBody / Import / Main) reads its structural pieces off the CST
+/// children — body expressions go through [`lower_expr_v2`], type
+/// nodes go through [`lower_type_node_from_cst`], with-block schema
+/// methods walk their own [`SCHEMA_METHOD`] / [`SCHEMA_WITH`] CST
+/// children.
+///
+/// P6 round 2: replaced the byte-slice route into
+/// `directive::parse_directive`. The CST now drives every shape
+/// directly so the legacy `directive.rs` module web can retire.
 #[allow(dead_code)]
 fn lower_directive_v2(dir: &ast::Directive, source: &str) -> Option<crate::Directive> {
-    let r = dir.syntax().text_range();
+    let node = dir.syntax();
+    let r = node.text_range();
     let raw_start: usize = r.start().into();
     let end: usize = r.end().into();
     let raw_slice = source.get(raw_start..end)?;
     let trim = trim_leading_trivia(raw_slice);
     let start = raw_start + trim;
+
+    // Directive name — the first IDENT after the `#` sigil.
+    let name = dir.name()?;
+    let shape = crate::directive::directive_shape(&name)?;
+
+    let body = match shape {
+        crate::DirectiveShape::Bare => crate::DirectiveBody::Bare,
+        crate::DirectiveShape::Value => lower_directive_value_body(node, source)?,
+        crate::DirectiveShape::NameBody => lower_directive_name_body(node, source)?,
+        crate::DirectiveShape::Import => lower_directive_import_body(node, source)?,
+        crate::DirectiveShape::Main => lower_directive_main_body(node, source)?,
+    };
+
+    // The directive's outer range matches the legacy combinator's
+    // `start_offset..end_offset` shape: from `#` (after leading
+    // trivia) to the input position the legacy parser stopped at.
+    // For most shapes that's the end of the parsed body; for Bare we
+    // stop right after the directive name. The CST node already
+    // covers exactly that span when the legacy parser would have,
+    // *except* for trailing trivia inside the node — the legacy
+    // parser would have left that for the surrounding grammar. We
+    // need to trim trailing trivia from the directive's range so the
+    // ranges line up byte-for-byte with the legacy `Directive.range`.
+    let end_trimmed = directive_end_offset(node, &name, shape, end, source);
+    Some(crate::Directive {
+        name,
+        body,
+        range: range_from_offsets(source, start, end_trimmed),
+    })
+}
+
+/// Walk a DIRECTIVE node for the trailing offset the legacy combinator
+/// chain would have reported. The CST node spans every byte of the
+/// directive *including* trailing trivia inside its range; the legacy
+/// `directive` combinator returns `end_offset = input.location()`
+/// *after* its last child production, which excludes trailing
+/// whitespace / comments.
+///
+/// For Bare directives the legacy parser stops right after the name
+/// IDENT — we walk to find that IDENT's end.
+///
+/// For other shapes we find the last "real" child (the body expr, the
+/// `with` block, the path STRING, the return TYPE_NODE, or the `)`
+/// token closing the main param list) and use its end.
+fn directive_end_offset(
+    node: &SyntaxNode,
+    name: &str,
+    shape: crate::DirectiveShape,
+    cst_end: usize,
+    source: &str,
+) -> usize {
+    let mut last_significant: Option<usize> = None;
+    for el in node.children_with_tokens() {
+        let kind = match &el {
+            rowan::NodeOrToken::Token(t) => t.kind(),
+            rowan::NodeOrToken::Node(n) => n.kind(),
+        };
+        let range = match &el {
+            rowan::NodeOrToken::Token(t) => t.text_range(),
+            rowan::NodeOrToken::Node(n) => n.text_range(),
+        };
+        // Skip pure trivia.
+        if matches!(
+            kind,
+            SyntaxKind::WHITESPACE | SyntaxKind::LINE_COMMENT | SyntaxKind::BLOCK_COMMENT
+        ) {
+            continue;
+        }
+        let end: usize = range.end().into();
+        // Bare directives: stop right after the name IDENT.
+        if matches!(shape, crate::DirectiveShape::Bare)
+            && kind == SyntaxKind::IDENT
+            && last_significant.is_none()
+        {
+            // Skip the directive's own name IDENT, but no — the
+            // `#name` form has `#` token first, then IDENT (the
+            // name), and nothing else. We track the IDENT end.
+            last_significant = Some(end);
+            continue;
+        }
+        last_significant = Some(end);
+    }
+    let _ = (name, cst_end, source); // suppress unused-warning lint hints
+    last_significant.unwrap_or(cst_end)
+}
+
+/// Walk the body expression of a `Value`-shape directive.
+fn lower_directive_value_body(
+    node: &SyntaxNode,
+    source: &str,
+) -> Option<crate::DirectiveBody> {
+    let body_expr = node.children().find_map(ast::Expr::cast)?;
+    let body_node = lower_expr_v2(&body_expr, source)?;
+    Some(crate::DirectiveBody::Value(Box::new(body_node)))
+}
+
+/// Walk the body of an `Import`-shape directive: spec + `from` + path.
+fn lower_directive_import_body(
+    node: &SyntaxNode,
+    source: &str,
+) -> Option<crate::DirectiveBody> {
+    // Children we care about (in source order, after the `#import`
+    // tokens): STAR / L_BRACE-block / IDENT (spec), then the `from`
+    // IDENT, then the path STRING token.
+    let mut after_hash_name = false; // have we passed the `#import` name?
+    let mut spec: Option<crate::DirectiveImportSpec> = None;
+    let mut path_string: Option<(String, TokenRange)> = None;
+    let mut destructure_open = false;
+    let mut destructure_entries: Vec<(String, Option<String>)> = Vec::new();
+    let mut pending_name: Option<String> = None;
+    let mut expect_as_alias = false;
+
+    for el in node.children_with_tokens() {
+        match el {
+            rowan::NodeOrToken::Token(t) => {
+                match t.kind() {
+                    SyntaxKind::WHITESPACE
+                    | SyntaxKind::LINE_COMMENT
+                    | SyntaxKind::BLOCK_COMMENT
+                    | SyntaxKind::HASH => continue,
+                    SyntaxKind::IDENT => {
+                        let text = t.text();
+                        if !after_hash_name {
+                            // The `import` name itself.
+                            if text == "import" {
+                                after_hash_name = true;
+                            }
+                            continue;
+                        }
+                        if destructure_open {
+                            if expect_as_alias {
+                                if let Some(prev) = pending_name.take() {
+                                    destructure_entries.push((prev, Some(text.to_string())));
+                                }
+                                expect_as_alias = false;
+                                continue;
+                            }
+                            if text == "as" {
+                                expect_as_alias = true;
+                                continue;
+                            }
+                            if let Some(prev) = pending_name.take() {
+                                destructure_entries.push((prev, None));
+                            }
+                            pending_name = Some(text.to_string());
+                            continue;
+                        }
+                        if text == "from" {
+                            // After `from` we expect the path STRING.
+                            continue;
+                        }
+                        // Alias-shape spec: the bare IDENT is the alias.
+                        if spec.is_none() {
+                            spec = Some(crate::DirectiveImportSpec::Alias(text.to_string()));
+                        }
+                    }
+                    SyntaxKind::STAR => {
+                        if spec.is_none() {
+                            spec = Some(crate::DirectiveImportSpec::Spread);
+                        }
+                    }
+                    SyntaxKind::L_BRACE => {
+                        destructure_open = true;
+                    }
+                    SyntaxKind::R_BRACE => {
+                        if let Some(prev) = pending_name.take() {
+                            destructure_entries.push((prev, None));
+                        }
+                        if destructure_open {
+                            spec = Some(crate::DirectiveImportSpec::Destructure(
+                                destructure_entries.clone(),
+                            ));
+                            destructure_open = false;
+                        }
+                    }
+                    SyntaxKind::COMMA => {
+                        if destructure_open {
+                            if let Some(prev) = pending_name.take() {
+                                destructure_entries.push((prev, None));
+                            }
+                        }
+                    }
+                    SyntaxKind::STRING => {
+                        let tr = t.text_range();
+                        let s: usize = tr.start().into();
+                        let e: usize = tr.end().into();
+                        let raw = source.get(s..e)?;
+                        let decoded = parse_string_text(raw)?;
+                        path_string = Some((decoded, range_from_offsets(source, s, e)));
+                    }
+                    _ => continue,
+                }
+            }
+            rowan::NodeOrToken::Node(_) => continue,
+        }
+    }
+
+    let spec = spec?;
+    let (path, path_range) = path_string?;
+    Some(crate::DirectiveBody::Import {
+        spec,
+        path,
+        path_range,
+    })
+}
+
+/// Walk the body of a `Main`-shape directive: `(typed-params) [-> Ret]`.
+fn lower_directive_main_body(
+    node: &SyntaxNode,
+    source: &str,
+) -> Option<crate::DirectiveBody> {
+    let mut params: Vec<crate::DirectiveMainParam> = Vec::new();
+    let mut return_type: Option<crate::TypeNode> = None;
+    // The CST emits CLOSURE_PARAM children for each `Type ident` pair.
+    // The optional return TYPE_NODE follows after `THIN_ARROW`.
+    let mut saw_arrow = false;
+    for child in node.children_with_tokens() {
+        match child {
+            rowan::NodeOrToken::Token(t) => {
+                if t.kind() == SyntaxKind::THIN_ARROW {
+                    saw_arrow = true;
+                }
+            }
+            rowan::NodeOrToken::Node(n) => match n.kind() {
+                SyntaxKind::CLOSURE_PARAM => {
+                    params.push(lower_main_param(&n, source)?);
+                }
+                SyntaxKind::TYPE_NODE if saw_arrow && return_type.is_none() => {
+                    return_type = Some(lower_type_node_from_cst(&n, source)?);
+                }
+                _ => continue,
+            },
+        }
+    }
+    Some(crate::DirectiveBody::Main {
+        params,
+        return_type,
+    })
+}
+
+/// One `#main` parameter — `Type ident` (closure-param shape, but with
+/// the type *before* the name like a typed-spread).
+fn lower_main_param(node: &SyntaxNode, source: &str) -> Option<crate::DirectiveMainParam> {
+    // CLOSURE_PARAM children: TYPE_NODE + IDENT.
+    let type_node = node
+        .children()
+        .find(|c| c.kind() == SyntaxKind::TYPE_NODE)
+        .and_then(|n| lower_type_node_from_cst(&n, source))?;
+    let ident_tok = node
+        .children_with_tokens()
+        .filter_map(|el| el.into_token())
+        .find(|t| t.kind() == SyntaxKind::IDENT)?;
+    let tr = ident_tok.text_range();
+    let s: usize = tr.start().into();
+    let e: usize = tr.end().into();
+    Some(crate::DirectiveMainParam {
+        name: ident_tok.text().to_string(),
+        name_range: range_from_offsets(source, s, e),
+        type_node,
+    })
+}
+
+/// Walk the body of a `NameBody`-shape directive: `<name>[<T, ...>]
+/// <body-expr> [with { methods... }]`.
+fn lower_directive_name_body(
+    node: &SyntaxNode,
+    source: &str,
+) -> Option<crate::DirectiveBody> {
+    // Children of the DIRECTIVE node:
+    //   `#` HASH, name IDENT, optional generics (LT ... GT), optional
+    //   body Expr, optional SCHEMA_WITH node.
+    //
+    // The name IDENT is the second IDENT child (the first being the
+    // directive name itself — `schema` / `extend`). We track state:
+    //   * `after_dir_name = false` until we've seen the directive name IDENT
+    //   * `seen_decl_name = false` until we've recorded the declared name IDENT
+    //   * `in_generics = false` while inside `< ... >`
+    let mut after_dir_name = false;
+    let mut declared_name: Option<(String, TokenRange)> = None;
+    let mut in_generics = false;
+    let mut generics: Vec<String> = Vec::new();
+    let mut body_expr_ast: Option<ast::Expr> = None;
+    let mut schema_with: Option<SyntaxNode> = None;
+
+    for el in node.children_with_tokens() {
+        match el {
+            rowan::NodeOrToken::Token(t) => match t.kind() {
+                SyntaxKind::WHITESPACE
+                | SyntaxKind::LINE_COMMENT
+                | SyntaxKind::BLOCK_COMMENT
+                | SyntaxKind::HASH
+                | SyntaxKind::COLON
+                | SyntaxKind::COMMA => continue,
+                SyntaxKind::IDENT => {
+                    if !after_dir_name {
+                        after_dir_name = true;
+                        continue;
+                    }
+                    if declared_name.is_none() {
+                        let tr = t.text_range();
+                        let s: usize = tr.start().into();
+                        let e: usize = tr.end().into();
+                        declared_name = Some((
+                            t.text().to_string(),
+                            range_from_offsets(source, s, e),
+                        ));
+                        continue;
+                    }
+                    if in_generics {
+                        generics.push(t.text().to_string());
+                        continue;
+                    }
+                    // Trailing `with` keyword — handled when we hit
+                    // the SCHEMA_WITH node child below.
+                }
+                SyntaxKind::LT => in_generics = true,
+                SyntaxKind::GT => in_generics = false,
+                _ => continue,
+            },
+            rowan::NodeOrToken::Node(n) => match n.kind() {
+                SyntaxKind::SCHEMA_WITH => schema_with = Some(n),
+                _ => {
+                    if let Some(e) = ast::Expr::cast(n.clone()) {
+                        if body_expr_ast.is_none() {
+                            body_expr_ast = Some(e);
+                        }
+                    }
+                }
+            },
+        }
+    }
+
+    let (name, name_range) = declared_name?;
+
+    // Body — when missing (e.g. `#schema X with { ... }` with no body),
+    // synthesize an empty dict at the `with` keyword's position to match
+    // the legacy parser's behaviour (which captures
+    // `body_range = create_range(input, input.location(), input.location())`
+    // after consuming the post-name whitespace but before consuming
+    // `with`).
+    let body = if let Some(expr) = body_expr_ast {
+        Box::new(lower_expr_v2(&expr, source)?)
+    } else {
+        // Position: at the start of the `with` keyword. The CST emits
+        // `with` as a bare IDENT token (not wrapped in any node) and
+        // SCHEMA_WITH starts at the following `{`. We find the `with`
+        // IDENT by looking for the IDENT-token sibling preceding the
+        // SCHEMA_WITH child.
+        let pos = if let Some(sw) = &schema_with {
+            // Find the IDENT("with") right before the SCHEMA_WITH node.
+            let mut last_ident_start: Option<usize> = None;
+            for el in node.children_with_tokens() {
+                match el {
+                    rowan::NodeOrToken::Token(t) => {
+                        if t.kind() == SyntaxKind::IDENT && t.text() == "with" {
+                            last_ident_start = Some(t.text_range().start().into());
+                        }
+                    }
+                    rowan::NodeOrToken::Node(n) => {
+                        if n.kind() == SyntaxKind::SCHEMA_WITH {
+                            break;
+                        }
+                    }
+                }
+            }
+            last_ident_start.unwrap_or_else(|| sw.text_range().start().into())
+        } else {
+            let r = node.text_range();
+            let end: usize = r.end().into();
+            end
+        };
+        Box::new(crate::Node {
+            id: crate::NodeId::alloc(),
+            expr: Box::new(crate::Expr::Dict(Vec::new())),
+            decorators: Vec::new(),
+            directives: Vec::new(),
+            type_hint: None,
+            range: range_from_offsets(source, pos, pos),
+            doc_comment: None,
+        })
+    };
+
+    let (methods, schema_no_auto_derives) = if let Some(sw) = schema_with {
+        lower_schema_with(&sw, source)?
+    } else {
+        (Vec::new(), Vec::new())
+    };
+
+    Some(crate::DirectiveBody::NameBody {
+        name,
+        name_range,
+        generics,
+        body,
+        methods,
+        schema_no_auto_derives,
+    })
+}
+
+/// Walk a SCHEMA_WITH CST node into the `(methods, schema_no_auto_derives)`
+/// pair the legacy `DirectiveBody::NameBody` carries.
+///
+/// The CST groups each method (plus its leading pragmas like `#derive`
+/// or `#native`) into a SCHEMA_METHOD node; schema-level pragmas like
+/// `#no_auto_derive` that don't precede a method sit as DIRECTIVE
+/// children of the SCHEMA_WITH node itself.
+fn lower_schema_with(
+    node: &SyntaxNode,
+    source: &str,
+) -> Option<(Vec<crate::SchemaMethod>, Vec<String>)> {
+    let mut methods: Vec<crate::SchemaMethod> = Vec::new();
+    let mut schema_no_auto_derives: Vec<String> = Vec::new();
+    for child in node.children() {
+        match child.kind() {
+            SyntaxKind::SCHEMA_METHOD => {
+                let (method, method_no_auto_derives) =
+                    lower_schema_method(&child, source)?;
+                schema_no_auto_derives.extend(method_no_auto_derives);
+                methods.push(method);
+            }
+            SyntaxKind::DIRECTIVE => {
+                // Schema-level pragmas (typically `#no_auto_derive C`)
+                // that didn't attach to a method.
+                let name = child
+                    .children_with_tokens()
+                    .filter_map(|el| el.into_token())
+                    .find(|t| t.kind() == SyntaxKind::IDENT)
+                    .map(|t| t.text().to_string());
+                if name.as_deref() == Some(crate::directive::NO_AUTO_DERIVE) {
+                    if let Some(constraint) = directive_constraint_name(&child) {
+                        schema_no_auto_derives.push(constraint);
+                    } else {
+                        return None;
+                    }
+                }
+                // Other stray pragmas at the SCHEMA_WITH level are
+                // ignored — they would have been bound to a method by
+                // the CST grouping rule.
+            }
+            _ => continue,
+        }
+    }
+    Some((methods, schema_no_auto_derives))
+}
+
+/// Walk a SCHEMA_METHOD CST node into the legacy [`crate::SchemaMethod`]
+/// shape plus any inline schema-level `#no_auto_derive` pragmas that
+/// landed inside the method's pragma stack (rare, but the legacy parser
+/// accepted it — schema-level pragmas in mixed pragma stacks).
+fn lower_schema_method(
+    node: &SyntaxNode,
+    source: &str,
+) -> Option<(crate::SchemaMethod, Vec<String>)> {
+    // The legacy parser's `method_start` is the input position *after*
+    // consuming leading pragma directives AND the trivia between the
+    // last pragma and the method name. Concretely it lands on the
+    // method name IDENT — even when one or more `#derive` / `#native` /
+    // `#private` pragmas precede it. We replicate that by skipping
+    // every DIRECTIVE child (and surrounding trivia) and taking the
+    // first IDENT token we encounter.
+    let method_start: usize = {
+        let mut found: Option<usize> = None;
+        for el in node.children_with_tokens() {
+            match el {
+                rowan::NodeOrToken::Token(t) => match t.kind() {
+                    SyntaxKind::WHITESPACE
+                    | SyntaxKind::LINE_COMMENT
+                    | SyntaxKind::BLOCK_COMMENT => continue,
+                    SyntaxKind::IDENT => {
+                        found = Some(t.text_range().start().into());
+                        break;
+                    }
+                    _ => continue,
+                },
+                rowan::NodeOrToken::Node(n) => {
+                    if n.kind() == SyntaxKind::DIRECTIVE {
+                        continue;
+                    }
+                    // Non-DIRECTIVE node at the start would be unusual —
+                    // CST shape places the method-name IDENT first.
+                    break;
+                }
+            }
+        }
+        found.unwrap_or_else(|| node.text_range().start().into())
+    };
+    let method_end: usize = node.text_range().end().into();
+
+    let mut derives: Vec<String> = Vec::new();
+    let mut schema_no_auto_derives: Vec<String> = Vec::new();
+    let mut is_native = false;
+    let mut is_private = false;
+    let mut name: Option<(String, TokenRange)> = None;
+    let mut method_generics: Vec<String> = Vec::new();
+    let mut params: Vec<crate::SchemaMethodParam> = Vec::new();
+    let mut return_type: Option<crate::TypeNode> = None;
+    let mut body: Option<Box<crate::Node>> = None;
+    let mut saw_arrow = false;
+    let mut in_generics = false;
+    let mut after_name = false;
+    let mut after_body_colon = false;
+    let mut body_after_colon_ast: Option<ast::Expr> = None;
+
+    for el in node.children_with_tokens() {
+        match el {
+            rowan::NodeOrToken::Token(t) => match t.kind() {
+                SyntaxKind::WHITESPACE
+                | SyntaxKind::LINE_COMMENT
+                | SyntaxKind::BLOCK_COMMENT
+                | SyntaxKind::L_PAREN
+                | SyntaxKind::R_PAREN
+                | SyntaxKind::COMMA => continue,
+                SyntaxKind::IDENT => {
+                    if name.is_none() {
+                        let tr = t.text_range();
+                        let s: usize = tr.start().into();
+                        let e: usize = tr.end().into();
+                        name = Some((
+                            t.text().to_string(),
+                            range_from_offsets(source, s, e),
+                        ));
+                        after_name = true;
+                        continue;
+                    }
+                    if in_generics {
+                        method_generics.push(t.text().to_string());
+                    }
+                    let _ = after_name;
+                }
+                SyntaxKind::LT => in_generics = true,
+                SyntaxKind::GT => in_generics = false,
+                SyntaxKind::THIN_ARROW => saw_arrow = true,
+                SyntaxKind::COLON => after_body_colon = true,
+                _ => continue,
+            },
+            rowan::NodeOrToken::Node(n) => match n.kind() {
+                SyntaxKind::DIRECTIVE => {
+                    // Pragma: `#derive C`, `#native`, `#private`, or
+                    // `#no_auto_derive C` (which is schema-level).
+                    let dname = n
+                        .children_with_tokens()
+                        .filter_map(|el| el.into_token())
+                        .find(|t| t.kind() == SyntaxKind::IDENT)
+                        .map(|t| t.text().to_string());
+                    match dname.as_deref() {
+                        Some(crate::directive::DERIVE) => {
+                            derives.push(directive_constraint_name(&n)?);
+                        }
+                        Some(crate::directive::NATIVE) => is_native = true,
+                        Some(crate::directive::PRIVATE) => is_private = true,
+                        Some(crate::directive::NO_AUTO_DERIVE) => {
+                            schema_no_auto_derives.push(directive_constraint_name(&n)?);
+                        }
+                        _ => return None,
+                    }
+                }
+                SyntaxKind::CLOSURE_PARAM => {
+                    params.push(lower_schema_method_param(&n, source)?);
+                }
+                SyntaxKind::TYPE_NODE if saw_arrow && return_type.is_none() => {
+                    return_type = Some(lower_type_node_from_cst(&n, source)?);
+                }
+                _ => {
+                    if after_body_colon {
+                        if let Some(e) = ast::Expr::cast(n.clone()) {
+                            if body_after_colon_ast.is_none() {
+                                body_after_colon_ast = Some(e);
+                            }
+                        }
+                    }
+                }
+            },
+        }
+    }
+
+    if let Some(e) = body_after_colon_ast {
+        body = Some(Box::new(lower_expr_v2(&e, source)?));
+    }
+
+    let (name, name_range) = name?;
+    let return_type = return_type?;
+    Some((
+        crate::SchemaMethod {
+            name,
+            name_range,
+            generics: method_generics,
+            params,
+            return_type,
+            body,
+            derives,
+            is_native,
+            is_private,
+            range: range_from_offsets(source, method_start, method_end),
+            doc_comment: None,
+        },
+        schema_no_auto_derives,
+    ))
+}
+
+/// One `name: Type` parameter inside a SCHEMA_METHOD's param list.
+fn lower_schema_method_param(
+    node: &SyntaxNode,
+    source: &str,
+) -> Option<crate::SchemaMethodParam> {
+    let name_tok = node
+        .children_with_tokens()
+        .filter_map(|el| el.into_token())
+        .find(|t| t.kind() == SyntaxKind::IDENT)?;
+    let tr = name_tok.text_range();
+    let s: usize = tr.start().into();
+    let e: usize = tr.end().into();
+    let type_node = node
+        .children()
+        .find(|c| c.kind() == SyntaxKind::TYPE_NODE)
+        .and_then(|n| lower_type_node_from_cst(&n, source))?;
+    Some(crate::SchemaMethodParam {
+        name: name_tok.text().to_string(),
+        name_range: range_from_offsets(source, s, e),
+        type_node,
+    })
+}
+
+/// Extract the single-segment constraint name from a `#derive` /
+/// `#no_auto_derive` directive's body. The body is a `Value` shape
+/// holding a `Variable` whose path is one IDENT.
+fn directive_constraint_name(node: &SyntaxNode) -> Option<String> {
+    // Find the body expression child and read its IDENT text.
+    let body_expr = node.children().find_map(ast::Expr::cast)?;
+    if let ast::Expr::Variable(v) = body_expr {
+        let segs = v.segments();
+        if segs.len() == 1 {
+            return Some(segs.into_iter().next().unwrap());
+        }
+    }
+    None
+}
+
+/// Lower a CST TYPE_NODE to the legacy [`crate::TypeNode`] by
+/// byte-slicing into the legacy `parse_type_node` combinator. P6
+/// round 2 keeps this byte-slice route because:
+///
+///   * The legacy `parse_type_node` already handles every type
+///     position the directive walker needs (tuple types, `Enum<...>`
+///     variant struct bodies, doc-comment attachment).
+///   * The legacy `parse_type_node` lives in `expr.rs`, which is still
+///     active for `lower_expr_via_legacy` — the prerequisite for full
+///     legacy-web deletion is retiring *that* bridge first.
+fn lower_type_node_from_cst(node: &SyntaxNode, source: &str) -> Option<crate::TypeNode> {
+    let r = node.text_range();
+    let start: usize = r.start().into();
+    let end: usize = r.end().into();
     let slice = source.get(start..end)?;
     let mut span = Span::new(slice);
     use winnow::Parser as _;
-    let parsed = crate::directive::parse_directive
-        .parse_next(&mut span)
-        .ok()?;
-    if !span.is_empty() {
-        return None;
-    }
-    let mut value = parsed;
-    translate_directive_offsets(&mut value, start, source);
-    Some(value)
+    let mut t = crate::expr::parse_type_node.parse_next(&mut span).ok()?;
+    translate_type_node_offsets(&mut t, start, source);
+    Some(t)
 }
 
 /// Lower a CST [`ast::Decorator`] to a legacy [`crate::Decorator`] by
