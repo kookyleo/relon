@@ -108,6 +108,27 @@ ast_node!(FString, F_STRING);
 ast_node!(FStringInterpolation, F_STRING_INTERPOLATION);
 ast_node!(SpreadExpr, SPREAD_EXPR);
 ast_node!(TypeNode, TYPE_NODE);
+ast_node!(
+    /// `(T1, T2, ...)` tuple type. Sits inside a TypeNode-shaped
+    /// position (typed dict field, generic argument list, closure
+    /// parameter, schema-method param).
+    TupleType,
+    TUPLE_TYPE
+);
+ast_node!(
+    /// `with { ... }` body of a `#schema` / `#extend` directive.
+    /// Children: pragma directives + zero or more [`SchemaMethod`].
+    SchemaWith,
+    SCHEMA_WITH
+);
+ast_node!(
+    /// One method declaration inside a [`SchemaWith`] block.
+    /// Children: leading pragma directives, the method name token,
+    /// optional generic params, a closure-param list, return type,
+    /// and an optional body expression.
+    SchemaMethod,
+    SCHEMA_METHOD
+);
 ast_node!(Wildcard, WILDCARD);
 ast_node!(Literal, LITERAL);
 ast_node!(ErrorNode, ERROR);

@@ -2934,54 +2934,6 @@ mod tests {
         }
     }
 
-    /// One-shot discovery test: enumerate every `.relon` fixture in the
-    /// repo that currently fails to clean-parse, print the path and the
-    /// first error position (with surrounding source context) to
-    /// stderr. Run via:
-    ///     cargo test -p relon-parser report_remaining_gaps -- --nocapture
-    /// Delete this test once `parse_cst` clean-parses every fixture.
-    #[test]
-    #[ignore]
-    fn report_remaining_gaps() {
-        use std::fs;
-        use std::path::PathBuf;
-
-        let crate_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let workspace_root = crate_dir
-            .parent()
-            .and_then(|p| p.parent())
-            .expect("workspace root")
-            .to_path_buf();
-        let mut files = Vec::new();
-        walk(&workspace_root, &mut files);
-        files.retain(|p| !p.to_string_lossy().contains("/target/"));
-        files.sort();
-        let mut total = 0usize;
-        let mut failing = 0usize;
-        for path in &files {
-            total += 1;
-            let source = fs::read_to_string(path).unwrap_or_default();
-            if source.is_empty() {
-                continue;
-            }
-            let parsed = parse_cst(&source);
-            if parsed.has_errors() {
-                failing += 1;
-                let err = &parsed.errors[0];
-                let off = err.offset.min(source.len());
-                let lo = off.saturating_sub(40);
-                let hi = (off + 40).min(source.len());
-                let ctx = source.get(lo..hi).unwrap_or("");
-                let rel = path.strip_prefix(&workspace_root).unwrap_or(path).display();
-                eprintln!(
-                    "FAIL {rel} :: offset={} msg={:?}\n  ctx: {:?}",
-                    err.offset, err.message, ctx
-                );
-            }
-        }
-        eprintln!("--- discovery: {failing}/{total} fixtures have errors");
-    }
-
     fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
         let Ok(read) = std::fs::read_dir(dir) else {
             return;
