@@ -1,3 +1,29 @@
+//! Relon parser.
+//!
+//! Two public entry points cover the full surface:
+//!
+//! * [`parse_document`] — strict-parse. Returns
+//!   `Result<Node, ParseDocumentError>` and rejects any input that
+//!   doesn't form a complete document. Use it from the analyzer's
+//!   main entry, the evaluator, the formatter, and the CLI — they
+//!   all want a hard fail on broken input.
+//! * [`parse_document_recovering`] — IDE-facing partial-AST entry.
+//!   Returns a [`ParsedDocument`] (partial AST + diagnostics) that
+//!   is always populated, even on completely broken input. Use it
+//!   from completion / hover / goto-def callers that must keep
+//!   offering features while the user is mid-edit (`#`, `&`, `@`,
+//!   `{a:`, ...).
+//!
+//! Internals:
+//!
+//! * [`cst`] / [`syntax`] — rowan CST, the single source of truth
+//!   for what input the parser accepts.
+//! * [`ast`] — typed wrappers over the CST nodes.
+//! * [`lower`] — CST → legacy [`Node`] / [`Expr`] / [`TokenKey`]
+//!   tree. The legacy tree is still public because the analyzer and
+//!   evaluator depend on its semantic shape; new consumers should
+//!   prefer the [`ast`] wrappers (cheap, ranged, error-tolerant).
+
 #![forbid(unsafe_code)]
 
 pub mod ast;
