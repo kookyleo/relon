@@ -1883,6 +1883,44 @@ fn lower_unary_expr_v2(node: &SyntaxNode, source: &str) -> Option<Node> {
     ))
 }
 
+/// Lower a `VARIANT_CTOR` CST node into the legacy
+/// `Expr::VariantCtor` shape. The CST emits tokens for the dotted
+/// path (e.g. `Result.Ok` is IDENT DOT IDENT) followed by a DICT
+/// child for the body braces.
+fn lower_variant_ctor_v2(node: &SyntaxNode, source: &str) -> Option<Node> {
+    let r = node.text_range();
+    let start: usize = r.start().into();
+    let end: usize = r.end().into();
+
+    // Path: every IDENT token in the head, in source order.
+    let mut path: Vec<String> = Vec::new();
+    for el in node.children_with_tokens() {
+        if let Some(t) = el.into_token() {
+            if t.kind() == SyntaxKind::IDENT {
+                path.push(t.text().to_string());
+            }
+        }
+    }
+    if path.len() < 2 {
+        return None;
+    }
+    let variant = path.pop().unwrap();
+
+    // Body: the DICT child carries the constructor's fields.
+    let body_dict = node.children().find(|c| c.kind() == SyntaxKind::DICT)?;
+    let body_expr = ast::Expr::cast(body_dict)?;
+    let body = lower_expr_v2(&body_expr, source)?;
+
+    Some(Node::new(
+        Expr::VariantCtor {
+            enum_path: path,
+            variant,
+            body,
+        },
+        range_from_offsets(source, start, end),
+    ))
+}
+
 /// Lower a CLOSURE_PARAM CST node into the legacy `ClosureParam`.
 ///
 /// The CST emits CLOSURE_PARAM in two roles:
@@ -2227,7 +2265,7 @@ pub(crate) fn lower_expr_v2(expr: &ast::Expr, source: &str) -> Option<Node> {
         ast::Expr::Closure(c) => lower_closure_v2(c.syntax(), source),
         ast::Expr::Match(m) => lower_match_expr_v2(m.syntax(), source),
         ast::Expr::Where(w) => lower_where_expr_v2(w.syntax(), source),
-        ast::Expr::VariantCtor(v) => lower_expr_via_legacy(v.syntax(), source),
+        ast::Expr::VariantCtor(v) => lower_variant_ctor_v2(v.syntax(), source),
         // Slice 5: f-strings. The CST decomposes an f-string into
         // F_STRING_LITERAL chunks + F_STRING_INTERPOLATION sub-nodes
         // for IDE highlighting, but the legacy parser keeps it as a
