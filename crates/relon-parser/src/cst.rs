@@ -1006,19 +1006,34 @@ impl<'a> Parser<'a> {
     /// the next non-trivia token after a `Type`-shaped run is another
     /// IDENT — meaning the first one is the type and the second is
     /// the param name. We allow `<...>` and `?` between them.
+    ///
+    /// Crucial heuristic: when a `<` appears, it must be immediately
+    /// adjacent (no whitespace) to the preceding IDENT for it to
+    /// count as opening a generic argument list. Without this
+    /// guard, `a < b: c` (a closure param of type `a` named `< b`
+    /// — but `<` isn't a valid name leader, so it bails)
+    /// would still be misinterpreted in pathological cases. Rust /
+    /// TypeScript both use the same lex-time adjacency check.
     fn peek_is_typed_param(&self) -> bool {
         if !self.at(SyntaxKind::IDENT) {
             return false;
         }
         // Walk past IDENT, optional `.IDENT*`, optional `<...>`,
         // optional `?`, then check for IDENT.
-        let mut idx = self.pos_skip_trivia() + 1;
+        let head_idx = self.pos_skip_trivia();
+        let mut idx = head_idx + 1;
         let advance_trivia = |i: &mut usize| {
             while *i < self.tokens.len() && self.tokens[*i].0.is_trivia() {
                 *i += 1;
             }
         };
-        advance_trivia(&mut idx);
+        // For the adjacency check we want to know whether ANY trivia
+        // intervenes between the IDENT and the next non-trivia token.
+        let mut had_trivia_after_head = false;
+        if idx < self.tokens.len() && self.tokens[idx].0.is_trivia() {
+            had_trivia_after_head = true;
+            advance_trivia(&mut idx);
+        }
         // `.IDENT*`
         while idx < self.tokens.len() && self.tokens[idx].0 == SyntaxKind::DOT {
             idx += 1;
@@ -1029,9 +1044,15 @@ impl<'a> Parser<'a> {
             } else {
                 return false;
             }
+            had_trivia_after_head = false;
         }
-        // `<...>` — balanced angle scan.
+        // `<...>` — balanced angle scan. Refuse when whitespace
+        // separates the IDENT and the `<` — that's the disambiguation
+        // hook between `Foo<Bar>` (type) and `a < b` (comparison).
         if self.tokens.get(idx).map(|(k, _)| *k) == Some(SyntaxKind::LT) {
+            if had_trivia_after_head {
+                return false;
+            }
             let mut depth: i32 = 1;
             idx += 1;
             while idx < self.tokens.len() && depth > 0 {
@@ -1067,31 +1088,48 @@ impl<'a> Parser<'a> {
     }
 
     /// Parse a type-expression-shaped run of tokens into a TYPE_NODE.
-    /// The grammar is approximate at this stage — refined later by
-    /// the dedicated TYPE_NODE slice. For now we accept:
-    ///   ident (`.` ident)* (`<` types `>`)? `?`?
-    /// which covers every shape closure-param + #main + schema-field
-    /// types actually use in the corpus.
+    /// The grammar:
+    ///
+    ///   TypeNode    := PathSeg ('.' PathSeg)* GenericArgs? '?'?
+    ///   PathSeg     := IDENT | STRING
+    ///   GenericArgs := '<' (TypeNode (',' TypeNode)*)? ','? '>'
+    ///
+    /// Matches the winnow `parse_type_node` (in `expr.rs`) for every
+    /// shape the corpus uses today, including string-keyed segments
+    /// (`"namespaced".Foo`), nested generics (`Map<String, Int>`),
+    /// and the optional `?` marker.
+    ///
+    /// Parens-typed tuples `(T1, T2)` are NOT lowered here — they
+    /// appear only as the leading slot in a `#main(...)` parameter
+    /// or `(p) -> T` closure return, both of which take a different
+    /// grammar path. Adding the tuple shape here would mis-parse
+    /// `(p) => body` shorthands when the parser is in a type-eager
+    /// context.
     fn parse_type(&mut self) {
         self.open(SyntaxKind::TYPE_NODE);
-        if self.at(SyntaxKind::IDENT) {
+        // First segment: IDENT or STRING (allowed in the v1 grammar
+        // for dotted-string paths like `"foo".Bar`).
+        if self.at(SyntaxKind::IDENT) || self.at(SyntaxKind::STRING) {
             self.bump();
         } else {
             self.error_at_current("expected type name");
             self.close();
             return;
         }
+        // Dotted continuation.
         while self.at(SyntaxKind::DOT) {
             self.bump();
-            if self.at(SyntaxKind::IDENT) {
+            if self.at(SyntaxKind::IDENT) || self.at(SyntaxKind::STRING) {
                 self.bump();
             } else {
                 self.error_at_current("expected identifier after `.` in type");
             }
         }
+        // Generic argument list. We're in a committed type context
+        // here (the caller already decided "this is a type"), so any
+        // `<` opens generics — no adjacency check needed.
         if self.at(SyntaxKind::LT) {
             self.bump();
-            // Comma-separated nested types.
             loop {
                 if self.at(SyntaxKind::GT) || self.at_end() {
                     break;
@@ -1103,6 +1141,7 @@ impl<'a> Parser<'a> {
             }
             self.expect(SyntaxKind::GT);
         }
+        // Optional `?` (i.e. `User?`).
         if self.at(SyntaxKind::QUESTION) {
             self.bump();
         }
@@ -1660,6 +1699,38 @@ mod tests {
     }
 
     #[test]
+    fn generic_type_in_closure_param() {
+        let parsed = parse_round_trip("{ extract(List<Int> xs, String? sep): xs }");
+        assert!(!parsed.has_errors(), "errors: {:?}", parsed.errors);
+        let types: Vec<_> = parsed
+            .syntax()
+            .descendants()
+            .filter(|n| n.kind() == SyntaxKind::TYPE_NODE)
+            .collect();
+        // `List<Int>` outer + `Int` nested + `String?` = 3 TYPE_NODEs.
+        assert!(
+            types.len() >= 3,
+            "expected at least 3 TYPE_NODE, got {}",
+            types.len()
+        );
+    }
+
+    #[test]
+    fn comparison_lt_not_treated_as_generics() {
+        // The closure-param peek must NOT decide `a < b` is a typed
+        // param — there's whitespace between `a` and `<`. The dict
+        // body should be a single binary expression.
+        let parsed = parse_round_trip("{ f: a < b }");
+        assert!(!parsed.has_errors(), "errors: {:?}", parsed.errors);
+        let binaries: Vec<_> = parsed
+            .syntax()
+            .descendants()
+            .filter(|n| n.kind() == SyntaxKind::BINARY_EXPR)
+            .collect();
+        assert_eq!(binaries.len(), 1, "expected one BINARY_EXPR");
+    }
+
+    #[test]
     fn typed_closure_param_records_type_node() {
         let parsed = parse_round_trip("{ add(Int a, Int b): a + b }");
         assert!(!parsed.has_errors());
@@ -1704,7 +1775,7 @@ mod tests {
         // Each P2 slice bumps the floor. At slice 1 (closures) we hit
         // ~60 of ~210 — the directive / match / where / type slices
         // will push this much higher.
-        const FLOOR: usize = 62;
+        const FLOOR: usize = 64;
         let clean = fixture_clean_parse_count();
         eprintln!("[parser] fixtures clean-parse count: {clean}");
         assert!(
