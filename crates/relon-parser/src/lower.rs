@@ -131,8 +131,7 @@ use crate::{position_at_source, Expr, Node, ParseDocumentError, RefBase, TokenKe
 /// Compute a [`TokenRange`] for the byte span `[start, end)` against
 /// `source`. Mirrors `crate::create_range` but reads positions directly
 /// from the source string instead of from a winnow `Span`.
-#[allow(dead_code)]
-pub(crate) fn range_from_offsets(source: &str, start: usize, end: usize) -> TokenRange {
+pub fn range_from_offsets(source: &str, start: usize, end: usize) -> TokenRange {
     TokenRange {
         start: position_at_source(source, start),
         end: position_at_source(source, end),
@@ -3396,7 +3395,7 @@ pub(crate) fn lower_expr_v2(expr: &ast::Expr, source: &str) -> Option<Node> {
 /// [`legacy_parse`] in the slice 8 [`lower_document`] body covers any
 /// future grammar drift between the two paths.
 #[allow(dead_code)]
-pub(crate) fn lower_document_node_v2(doc: &ast::Document, source: &str) -> Option<Node> {
+pub fn lower_document_node_v2(doc: &ast::Document, source: &str) -> Option<Node> {
     // 1. Lower every leading directive + decorator. We capture them in
     //    source order within each kind — the legacy `parse_attributes`
     //    interleaves them in the input loop but stores them in two

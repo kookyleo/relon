@@ -50,9 +50,107 @@ impl ParseDocumentError {
 /// accepts; downstream consumers (analyzer / evaluator / fmt / wasm
 /// / lsp / cli) keep seeing the same `Node` / `Expr` shape they did
 /// pre-rowan-rewrite. See [`lower`] for the migration design note.
+///
+/// This is the strict-parsing entry point — any CST error or
+/// lowering failure surfaces as a typed [`ParseDocumentError`]. Use
+/// it from the analyzer's main entry, the evaluator, fmt, and the
+/// CLI where the caller wants a hard fail on broken input. For IDE
+/// features (completion, hover, goto-def) that must tolerate
+/// in-progress edits, prefer [`parse_document_recovering`] — it
+/// never returns `Err` and yields a partial [`ParsedDocument`] +
+/// diagnostics.
 pub fn parse_document(source: &str) -> Result<Node, ParseDocumentError> {
     let parse = cst::parse_cst(source);
     lower::lower_document(&parse, source)
+}
+
+/// One span-bearing diagnostic from a partial parse. Emitted by
+/// [`parse_document_recovering`] for every CST recovery point plus
+/// any sub-tree the lowering walker could not turn into a [`Node`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParseDiagnostic {
+    pub message: String,
+    pub range: TokenRange,
+}
+
+/// Result of [`parse_document_recovering`]. Always populated — even
+/// completely unrecoverable input yields an empty `nodes` + a
+/// non-empty `diagnostics` list.
+#[derive(Debug, Clone)]
+pub struct ParsedDocument {
+    /// Top-level nodes successfully lowered from the CST. Empty if
+    /// the CST root is unrecoverable; otherwise contains as many
+    /// partial nodes as the lowering could produce. A clean Relon
+    /// document yields exactly one element — the legacy single-root
+    /// `Node` — but the API shape is `Vec<_>` for forward
+    /// compatibility with future multi-top-level forms.
+    pub nodes: Vec<Node>,
+    /// Span-bearing diagnostics describing why parsing was
+    /// incomplete. Empty iff the source parsed cleanly.
+    pub diagnostics: Vec<ParseDiagnostic>,
+}
+
+/// Parse `source` into a partial AST + diagnostics. Never returns
+/// `Err` for any byte input — even completely broken sources
+/// produce an empty `nodes` vec + a populated `diagnostics` list.
+///
+/// This is the IDE entry point: use it from completion / hover /
+/// goto-def call sites that need to keep offering features while
+/// the user is mid-edit (`#`, `&`, `@`, `{`, `{a:`, `{ ?`, ...).
+/// The strict counterpart [`parse_document`] still surfaces a hard
+/// `Err` for callers that require well-formed input (evaluator,
+/// fmt, CLI, analyzer main entry).
+///
+/// Implementation: routes through [`cst::parse_cst`] (which never
+/// panics) and then walks the resulting CST, lowering every
+/// top-level expression child via [`lower::lower_document_node_v2`].
+/// CST `ERROR` spans + lowering misses are collected as
+/// [`ParseDiagnostic`]s with byte-accurate ranges.
+pub fn parse_document_recovering(source: &str) -> ParsedDocument {
+    let parse = cst::parse_cst(source);
+    let mut nodes: Vec<Node> = Vec::new();
+    let mut diagnostics: Vec<ParseDiagnostic> = Vec::new();
+
+    // Surface every CST parser error as a diagnostic. Each one
+    // carries a byte offset into the original source; we widen the
+    // range to a 1-byte span so the IDE has something to anchor to.
+    for err in &parse.errors {
+        let end = (err.offset + 1).min(source.len().max(err.offset));
+        diagnostics.push(ParseDiagnostic {
+            message: err.message.clone(),
+            range: lower::range_from_offsets(source, err.offset, end),
+        });
+    }
+
+    if let Some(doc) = ast::document_of(parse.syntax()) {
+        // Lowering yields a single root Node when it succeeds. We
+        // attempt it unconditionally — `lower_document_node_v2` is
+        // tolerant of mostly-well-formed CSTs (the `parse.errors`
+        // list above already covers the holes) and returns `None`
+        // only when the root expression slot is empty or one of
+        // the sub-lowerings rejects.
+        if doc.root_expr().is_some() {
+            if let Some(node) = lower::lower_document_node_v2(&doc, source) {
+                nodes.push(node);
+            } else if parse.errors.is_empty() {
+                // CST clean but lowering failed — surface as a
+                // diagnostic on the document range so the IDE has
+                // something to attach to.
+                let end_offset = source.len();
+                diagnostics.push(ParseDiagnostic {
+                    message: "could not lower CST to legacy Node".to_string(),
+                    range: lower::range_from_offsets(source, 0, end_offset),
+                });
+            }
+        } else if parse.errors.is_empty() {
+            diagnostics.push(ParseDiagnostic {
+                message: "empty document".to_string(),
+                range: lower::range_from_offsets(source, 0, 0),
+            });
+        }
+    }
+
+    ParsedDocument { nodes, diagnostics }
 }
 
 /// Extract leading comments as a single doc string. Walks the byte
@@ -471,5 +569,79 @@ mod tests {
         assert!(parse_document("").is_err());
         assert!(parse_document("   \n\t  ").is_err());
         assert!(parse_document("{ bad syntax").is_err());
+    }
+
+    // -----------------------------------------------------------------
+    // parse_document_recovering — IDE-facing partial-AST entry point.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn recovering_clean_input_yields_one_node_no_diagnostics() {
+        let result = parse_document_recovering("{ a: 1, b: 2 }");
+        assert_eq!(result.nodes.len(), 1);
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        if let Expr::Dict(pairs) = &*result.nodes[0].expr {
+            assert_eq!(pairs.len(), 2);
+        } else {
+            panic!("expected Dict root");
+        }
+    }
+
+    #[test]
+    fn recovering_never_errs_on_partial_inputs() {
+        // Every one of these inputs would force `parse_document` to
+        // surface an `Err`; the recovering API must absorb each one.
+        for src in &[
+            "#", "&", "@", "{", "{a:", "{ ?", "}", "[", "(", "f\"hi ${",
+            "", "   ", "\n\t",
+        ] {
+            let result = parse_document_recovering(src);
+            // We only assert: never panics, never crashes. Diagnostics
+            // may or may not be populated — empty input is its own
+            // edge case.
+            let _ = result.nodes;
+            let _ = result.diagnostics;
+        }
+    }
+
+    #[test]
+    fn recovering_reports_diagnostic_for_unterminated_dict() {
+        let result = parse_document_recovering("{ a: ");
+        assert!(
+            !result.diagnostics.is_empty(),
+            "expected at least one diagnostic for unterminated dict"
+        );
+        // The span should fall within the source.
+        for diag in &result.diagnostics {
+            assert!(
+                diag.range.start.offset <= 5,
+                "diagnostic offset out of range: {:?}",
+                diag
+            );
+        }
+    }
+
+    #[test]
+    fn recovering_includes_empty_document_diagnostic() {
+        let result = parse_document_recovering("");
+        assert!(result.nodes.is_empty());
+        // Either a CST error or our own "empty document" — but
+        // diagnostics MUST be non-empty (the caller has nothing to
+        // attach a "you must write something" hint to otherwise).
+        assert!(!result.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn recovering_completes_partial_for_lone_hash() {
+        // The IDE feeds us `#` to look up directive completions.
+        // We must yield a diagnostic + leave the byte-offset usable.
+        let result = parse_document_recovering("#");
+        assert!(!result.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn recovering_completes_partial_for_lone_amp() {
+        let result = parse_document_recovering("&");
+        assert!(!result.diagnostics.is_empty());
     }
 }
