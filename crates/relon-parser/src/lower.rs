@@ -251,13 +251,49 @@ fn translate_token_key(key: &mut TokenKey, base_offset: usize, source: &str) {
     }
 }
 
+/// Lower any expression-shaped CST node by re-running the legacy
+/// `parse_expr` combinator over the node's exact byte range. Returns
+/// `None` only when the bytes don't form a complete legal expression
+/// (which shouldn't happen if the CST is well-formed).
+///
+/// The legacy `parse_expr` already covers every expression production
+/// the rest of the language uses — dict, list, comprehension, spread,
+/// binary, unary, ternary, call, closure, f-string, where, match,
+/// variant ctor, type-expr, wildcard, reference, variable, literal.
+/// Routing through it gives us byte-identical `Node` output without
+/// re-implementing each construct in a hand-rolled walker.
+#[allow(dead_code)]
+fn lower_expr_via_legacy(node: &SyntaxNode, source: &str) -> Option<Node> {
+    let r = node.text_range();
+    let start: usize = r.start().into();
+    let end: usize = r.end().into();
+    let slice = source.get(start..end)?;
+    let mut span = Span::new(slice);
+    use winnow::Parser as _;
+    let parsed = crate::expr::parse_expr.parse_next(&mut span).ok()?;
+    // After `parse_expr`, the slice must have been fully consumed for
+    // the byte-identical guarantee to hold. If a single combinator-
+    // level production refused trailing bytes, the CST would have
+    // emitted a different node shape, so this assert acts as a smoke
+    // test rather than an expected failure path.
+    if !span.is_empty() {
+        return None;
+    }
+    let mut value = parsed;
+    translate_node_offsets(&mut value, start, source);
+    Some(value)
+}
+
 /// Try to lower an `ast::Expr` to a legacy `Node` using the CST-walking
 /// path. Returns `None` when the construct is outside the currently-
 /// supported set (caller falls back to the legacy combinator chain).
 ///
-/// Slice 1 supports: `Literal` (null / true / false / number / string),
-/// `Variable`, `Reference`, `Wildcard`. Composite forms (dict, list,
-/// binary, etc.) return `None` until later slices.
+/// Slice 1 supports atoms (Literal / Variable / Reference / Wildcard).
+/// Slice 2 adds the structural collections (Dict / List / Spread) plus
+/// Comprehension (which the CST parses inline under the `LIST` kind, so
+/// the dispatch entry for it lives on `List` as well). Composite
+/// non-collection forms (Binary, Call, Closure, ...) still return
+/// `None` until later slices.
 #[allow(dead_code)]
 pub(crate) fn lower_expr_v2(expr: &ast::Expr, source: &str) -> Option<Node> {
     match expr {
@@ -265,7 +301,17 @@ pub(crate) fn lower_expr_v2(expr: &ast::Expr, source: &str) -> Option<Node> {
         ast::Expr::Variable(v) => lower_atom_via_legacy(v.syntax(), source),
         ast::Expr::Reference(r) => lower_atom_via_legacy(r.syntax(), source),
         ast::Expr::Wildcard(w) => lower_atom_via_legacy(w.syntax(), source),
-        // Slice 1 stops here — every other construct will be wired in
+        // Slice 2: collections. The byte-slice route through
+        // `parse_expr` produces the exact legacy shape — including
+        // typed-spread `type_hint` stamping inside dict entries and
+        // standalone `#schema` / `#import` / `#main` directive
+        // hoisting onto the dict node — without re-implementing the
+        // dict / list / spread machinery here.
+        ast::Expr::Dict(d) => lower_expr_via_legacy(d.syntax(), source),
+        ast::Expr::List(l) => lower_expr_via_legacy(l.syntax(), source),
+        ast::Expr::Spread(s) => lower_expr_via_legacy(s.syntax(), source),
+        ast::Expr::Comprehension(c) => lower_expr_via_legacy(c.syntax(), source),
+        // Slice 2 stops here — every other construct will be wired in
         // later slices. Returning `None` makes the caller fall back to
         // the legacy combinator chain.
         _ => None,
@@ -732,6 +778,86 @@ mod tests {
         assert_atom_lower_matches_legacy("&root");
         assert_atom_lower_matches_legacy("&sibling.x");
         assert_atom_lower_matches_legacy("&root.a.b");
+    }
+
+    /// Slice 2 (collections): same shape as slice 1's helper but for
+    /// constructs whose root atom *is* a legal document root. The
+    /// document-shaped legacy parser (`parse_base`) wraps every
+    /// expression in an outer `Node`, so the inner-expr equality below
+    /// covers `Expr::Dict / List / Spread / Comprehension` byte-
+    /// identically.
+    fn assert_collection_lower_matches_legacy(source: &str) {
+        let parse = cst::parse_cst(source);
+        let doc = ast::document_of(parse.syntax()).expect("document");
+        let root = doc.root_expr().expect("root expr");
+        let v2 = lower_expr_v2(&root, source).expect("slice 2 supports this collection");
+        let legacy = crate::lower::legacy_parse(source).expect("legacy parse");
+        let mut a = v2;
+        let mut b = legacy;
+        strip_node_ids(&mut a);
+        strip_node_ids(&mut b);
+        assert_eq!(*a.expr, *b.expr, "expr diverged on {source:?}");
+        assert_eq!(a.range, b.range, "range diverged on {source:?}");
+    }
+
+    #[test]
+    fn slice2_lower_dict_empty() {
+        assert_collection_lower_matches_legacy("{}");
+    }
+
+    #[test]
+    fn slice2_lower_dict_flat() {
+        assert_collection_lower_matches_legacy("{ a: 1, b: 2 }");
+    }
+
+    #[test]
+    fn slice2_lower_dict_nested() {
+        assert_collection_lower_matches_legacy("{ a: { b: { c: 1 } } }");
+    }
+
+    #[test]
+    fn slice2_lower_dict_spread() {
+        assert_collection_lower_matches_legacy("{ a: 1, ...base }");
+    }
+
+    #[test]
+    fn slice2_lower_dict_typed_spread() {
+        assert_collection_lower_matches_legacy("{ ...<Extra> base }");
+    }
+
+    #[test]
+    fn slice2_lower_dict_dynamic_key() {
+        assert_collection_lower_matches_legacy(r#"{ ["k"]: 1 }"#);
+    }
+
+    #[test]
+    fn slice2_lower_list_empty() {
+        assert_collection_lower_matches_legacy("[]");
+    }
+
+    #[test]
+    fn slice2_lower_list_flat() {
+        assert_collection_lower_matches_legacy("[1, 2, 3]");
+    }
+
+    #[test]
+    fn slice2_lower_list_spread() {
+        assert_collection_lower_matches_legacy("[1, ...others, 2]");
+    }
+
+    #[test]
+    fn slice2_lower_list_nested() {
+        assert_collection_lower_matches_legacy("[[1, 2], [3, 4]]");
+    }
+
+    #[test]
+    fn slice2_lower_comprehension() {
+        assert_collection_lower_matches_legacy("[x for x in src]");
+    }
+
+    #[test]
+    fn slice2_lower_comprehension_with_condition() {
+        assert_collection_lower_matches_legacy("[x * 2 for x in src if x > 0]");
     }
 
     #[test]
