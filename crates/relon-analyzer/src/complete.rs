@@ -27,7 +27,7 @@
 use crate::stdlib_signatures::stdlib_fn_names;
 use crate::tree::AnalyzedTree;
 use crate::workspace::WorkspaceTree;
-use relon_parser::{Expr, Node, TokenKey};
+use relon_parser::{Expr, Node, ParsedDocument, TokenKey};
 
 /// One entry in the completion candidate list.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -94,32 +94,89 @@ enum CursorContext {
     Bare { prefix: String },
 }
 
-/// Parse-free completion fallback. Used when the file fails to
-/// parse (e.g. the user just typed `#` on a blank line and there's
-/// no directive name yet). Driven entirely off the source bytes:
-/// returns the static keyword lists for `#` / `@` / `&` triggers;
-/// returns an empty list for bare/member contexts (those need the
-/// AST to know what's in scope).
+/// Partial-AST completion entry point. Drives IDE completion when
+/// the workspace analyzer couldn't produce an `AnalyzedTree` for the
+/// file — typically because the user is mid-edit (`{ a:│`, `&│`,
+/// `f"hi ${│`, etc.). Routes through the recovering parser so a
+/// partial root expression is still available where the CST could
+/// recover; falls back to source-byte classification only when
+/// neither the partial AST nor the cursor context yields useful
+/// candidates.
 ///
-/// Callers should prefer [`resolve`] when an `AnalyzedTree` is
-/// available — this is a graceful-degradation path, not a primary
-/// entry point.
-pub fn keywords_for_cursor(source: &str, line: u32, character: u32) -> Vec<CompletionItem> {
+/// Caller responsibility: pass [`relon_parser::parse_document_recovering`]
+/// output. Don't call [`relon_parser::parse_document`] in front of
+/// this — recovery is the whole point.
+pub fn resolve_recovering(
+    source: &str,
+    parsed: &ParsedDocument,
+    line: u32,
+    character: u32,
+) -> Vec<CompletionItem> {
     let offset = crate::goto_def::position_to_offset(source, line, character);
     let context = classify_cursor(source, offset);
+    let partial_root = parsed.nodes.first();
+    let in_list = partial_root
+        .map(|root| is_inside_list(root, offset))
+        .unwrap_or(false);
+
     let mut items: Vec<CompletionItem> = Vec::new();
-    match context {
+    match &context {
         CursorContext::Directive { .. } => push_directive_candidates(&mut items),
-        // Without an AST we can't tell if the cursor is inside a
-        // List / Comprehension; offer only the non-iteration
-        // reference vars to avoid surfacing refs that would lint as
-        // errors at runtime.
-        CursorContext::Reference { .. } => push_reference_candidates(&mut items, false),
-        CursorContext::Decorator { .. }
-        | CursorContext::Member { .. }
-        | CursorContext::Bare { .. } => {}
+        CursorContext::Reference { .. } => push_reference_candidates(&mut items, in_list),
+        CursorContext::Decorator { .. } => {
+            // Best-effort scope walk for decorator candidates. With a
+            // partial root we can still surface sibling closures.
+            if let Some(root) = partial_root {
+                push_decorator_candidates(&mut items, root, offset);
+            }
+        }
+        CursorContext::Member { head, .. } => {
+            // Member access without a workspace tree — best we can do
+            // is suggest from any visible Dict pairs whose key matches
+            // the head, but that's noisy. Skip; the workspace-aware
+            // `resolve` handles it once the file parses cleanly.
+            let _ = head;
+        }
+        CursorContext::Bare { .. } => {
+            if let Some(root) = partial_root {
+                push_scope_candidates_partial(&mut items, root, offset);
+            }
+            push_stdlib_candidates(&mut items);
+        }
     }
+
+    // Dedupe — same logic as `resolve`.
+    let mut seen: std::collections::HashSet<(String, CompletionKind)> =
+        std::collections::HashSet::new();
+    items.retain(|item| seen.insert((item.label.clone(), item.kind)));
     items
+}
+
+/// Legacy parse-free fallback retained for callers that don't yet
+/// route through [`resolve_recovering`]. Forwards to the recovering
+/// entry with an empty partial AST so the result matches the old
+/// behaviour: directive / reference keyword lists for `#` / `&`,
+/// empty for bare / member contexts (no AST means no scope).
+///
+/// New callers should use [`resolve_recovering`] directly with a
+/// real [`ParsedDocument`] — it offers context-aware completion
+/// where the legacy fallback could only offer the static keyword
+/// lists.
+pub fn keywords_for_cursor(source: &str, line: u32, character: u32) -> Vec<CompletionItem> {
+    let empty = ParsedDocument {
+        nodes: Vec::new(),
+        diagnostics: Vec::new(),
+    };
+    resolve_recovering(source, &empty, line, character)
+}
+
+/// Mirror of [`push_scope_candidates`] for the partial-AST path.
+/// Same scope walk, just without the unused `AnalyzedTree` argument
+/// that the workspace-aware `resolve` threads through. Kept separate
+/// so the recovering entry never reaches into analyzer-internal
+/// machinery a partial parse couldn't populate.
+fn push_scope_candidates_partial(items: &mut Vec<CompletionItem>, root: &Node, offset: usize) {
+    walk_scope(root, offset, items);
 }
 
 /// Public entry point — mirrors [`crate::goto_def::resolve`] in

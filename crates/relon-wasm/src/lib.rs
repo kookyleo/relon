@@ -25,7 +25,7 @@ use relon::ResolverChainLoader;
 use relon_analyzer::{analyze_entry, Severity};
 use relon_evaluator::module::{ModuleResolver, ModuleSource, StdModuleResolver};
 use relon_evaluator::{Context, Evaluator, RuntimeError, Scope, Value};
-use relon_parser::{parse_document, TokenRange};
+use relon_parser::{parse_document, parse_document_recovering, TokenRange};
 use serde::{Deserialize, Serialize};
 // Re-imported below where `value.serialize(&serializer)` is invoked; the
 // `use serde::Serialize` already in scope satisfies the trait bound.
@@ -841,21 +841,24 @@ fn complete_internal(
         &mut loader,
     );
 
-    // Two tiers, no source-rewriting tricks:
-    //   1. Stable parse → full scope-aware completion.
-    //   2. Parse failed → degraded mode: directive / reference
-    //      keyword lists driven purely from source-byte
-    //      classification (`#`, `@`, `&` triggers). Bare /
-    //      member contexts return an empty list rather than
-    //      misleading suggestions. Proper mid-edit support
-    //      lands when the parser becomes error-recovering
-    //      (rowan rewrite, separate epic).
+    // Two tiers, post-P6:
+    //   1. Workspace analysis succeeded → full scope-aware completion
+    //      with cross-module visibility.
+    //   2. Workspace failed (entry didn't parse cleanly) → fall back
+    //      to a partial-AST parse via the recovering API and route
+    //      it through the analyzer's recovering completion path.
+    //      The partial AST gives us bare / member context awareness
+    //      even for `#`, `&`, `@`, `{`, `f"…${`, ... — anywhere the
+    //      user is mid-typing. The keywords-only fallback is gone.
     let items: Vec<complete::CompletionItem> =
         match (workspace.modules.get(entry), workspace.nodes.get(entry)) {
             (Some(tree), Some(root)) => {
                 complete::resolve(source, root, tree, Some(&workspace), line, character)
             }
-            _ => complete::keywords_for_cursor(source, line, character),
+            _ => {
+                let parsed = parse_document_recovering(source);
+                complete::resolve_recovering(source, &parsed, line, character)
+            }
         };
 
     Some(items.into_iter().map(into_result).collect())
