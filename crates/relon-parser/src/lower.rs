@@ -343,7 +343,17 @@ pub(crate) fn lower_expr_v2(expr: &ast::Expr, source: &str) -> Option<Node> {
         // interpolation alternation and nested-expression
         // `TokenRange`s.
         ast::Expr::FString(fs) => lower_expr_via_legacy(fs.syntax(), source),
-        // Slice 5 stops here — every other construct will be wired in
+        // Slice 6: type expressions. The CST emits a bare TYPE_NODE
+        // for `Int`, `List<T>`, `Foo?`, `(T1, T2, ...)` tuple types,
+        // and tagged enum variants at any expression-shaped position.
+        // The legacy parser surfaces these via `parse_type_expr`
+        // (inside `parse_atomic`) as `Expr::Type(TypeNode)`. Routing
+        // the TYPE_NODE byte slice through `parse_expr` preserves the
+        // full TypeNode shape — `path` / `generics` / `is_optional` /
+        // `variant_fields` / `range` / `doc_comment` — byte-
+        // identically.
+        ast::Expr::Type(t) => lower_expr_via_legacy(t.syntax(), source),
+        // Slice 6 stops here — every other construct will be wired in
         // later slices. Returning `None` makes the caller fall back to
         // the legacy combinator chain.
         _ => None,
@@ -1101,6 +1111,55 @@ mod tests {
     #[test]
     fn slice5_lower_fstring_with_expr_interp() {
         assert_fstring_lower_matches_legacy(r#"f"sum=${a + b}""#);
+    }
+
+    /// Slice 6 (type expressions). The CST emits a TYPE_NODE for any
+    /// builtin / generic / optional / variant / tuple type that
+    /// surfaces at expression position; the legacy parser lifts it
+    /// via `parse_type_expr` into `Expr::Type(TypeNode)`. The
+    /// byte-slice route preserves the full TypeNode shape.
+    fn assert_type_expr_lower_matches_legacy(source: &str) {
+        let parse = cst::parse_cst(source);
+        let doc = ast::document_of(parse.syntax()).expect("document");
+        let root = doc.root_expr().expect("root expr");
+        let v2 = lower_expr_v2(&root, source).expect("slice 6 supports this type");
+        let legacy = crate::lower::legacy_parse(source).expect("legacy parse");
+        let mut a = v2;
+        let mut b = legacy;
+        strip_node_ids(&mut a);
+        strip_node_ids(&mut b);
+        assert_eq!(*a.expr, *b.expr, "expr diverged on {source:?}");
+        assert_eq!(a.range, b.range, "range diverged on {source:?}");
+    }
+
+    #[test]
+    fn slice6_lower_type_optional_builtin() {
+        assert_type_expr_lower_matches_legacy("Int?");
+    }
+
+    #[test]
+    fn slice6_lower_type_generic_list() {
+        assert_type_expr_lower_matches_legacy("List<Int>");
+    }
+
+    #[test]
+    fn slice6_lower_type_generic_dict() {
+        assert_type_expr_lower_matches_legacy("Dict<String, Int>");
+    }
+
+    #[test]
+    fn slice6_lower_type_nested_generic() {
+        assert_type_expr_lower_matches_legacy("List<Dict<String, Int>>");
+    }
+
+    #[test]
+    fn slice6_lower_type_enum_alternatives() {
+        assert_type_expr_lower_matches_legacy(r#"Enum<"red", "green", "blue">"#);
+    }
+
+    #[test]
+    fn slice6_lower_type_enum_variant_unit() {
+        assert_type_expr_lower_matches_legacy("Enum<Ok, Err>");
     }
 
     #[test]
