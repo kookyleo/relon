@@ -267,6 +267,21 @@ impl<'a> Parser<'a> {
         self.close();
     }
 
+    /// Canonical "back to a sane structural boundary" sync set: the
+    /// closing punctuators a dict / list / call would resume at, plus
+    /// the directive `#` head. Productions that recover with this set
+    /// re-enter their parent's punctuation-aware loop on the next
+    /// iteration. Used by the few productions that don't know which
+    /// container they're inside; container-specific recovery sites
+    /// keep narrower sets (`COMMA` + their own closing bracket).
+    const STRUCTURAL_SYNC: &'static [SyntaxKind] = &[
+        SyntaxKind::COMMA,
+        SyntaxKind::R_BRACE,
+        SyntaxKind::R_BRACK,
+        SyntaxKind::R_PAREN,
+        SyntaxKind::HASH,
+    ];
+
     // ----- node bracketing ---------------------------------------------
 
     fn open(&mut self, kind: SyntaxKind) {
@@ -1125,7 +1140,16 @@ impl<'a> Parser<'a> {
                 self.parse_unary();
                 self.close();
             }
-            _ => self.error_at_current("expected expression"),
+            _ => {
+                // `parse_atom` is reached from inside dict / list /
+                // call / argument productions. When no atom shape
+                // matches the current token, recover to the nearest
+                // structural boundary so the surrounding loop can
+                // resume without spinning. We emit a single ERROR
+                // covering the bad span; the diagnostic message is
+                // the standard "expected expression."
+                self.error_recover("expected expression", Self::STRUCTURAL_SYNC);
+            }
         }
     }
 

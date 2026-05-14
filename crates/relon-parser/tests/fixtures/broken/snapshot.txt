@@ -79,9 +79,8 @@ parse_document: Err(parse error: could not lower well-formed CST to legacy Node)
 === 11_stray_hash.relon ===
 source: "{ a: # b: 2 }\n"
 round_trip: true
-cst_errors: 2
+cst_errors: 1
   - expected expression @ 8
-  - expected `,` or `}` in dict @ 9
 parse_document: Err(parse error: expected expression)
 
 === 12_for_no_var.relon ===
@@ -111,7 +110,7 @@ round_trip: true
 cst_errors: 3
   - expected attribute name @ 1
   - expected expression @ 5
-  - trailing input after root value @ 6
+  - trailing input after root value @ 8
 parse_document: Err(parse error: expected attribute name)
 
 === 16_half_schema.relon ===
@@ -124,9 +123,8 @@ parse_document: Err(parse error: expected dict key)
 === 17_dict_key_no_value.relon ===
 source: "{ a:, b: 2 }\n"
 round_trip: true
-cst_errors: 2
+cst_errors: 1
   - expected expression @ 4
-  - expected `,` or `}` in dict @ 5
 parse_document: Err(parse error: expected expression)
 
 === 18_half_arrow.relon ===
