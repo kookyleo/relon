@@ -5,13 +5,24 @@
 //! need access to `pub(crate)` items such as `Context::module_resolvers`.
 
 use super::*;
-use relon_parser::expr::parse_expr;
 use relon_parser::parse_document;
 use relon_parser::Expr;
-use relon_parser::Span;
 
 fn parse_doc(source: &str) -> relon_parser::Node {
     parse_document(source).expect("Parser failed")
+}
+
+/// Parse a single expression by wrapping it in a 1-field dict and
+/// extracting the value Node. Used by tests that historically called
+/// the legacy `parse_expr` directly; P6 round 2 routes them through
+/// `parse_document` so the legacy combinator chain can retire.
+fn parse_expr_test(source: &str) -> relon_parser::Node {
+    let wrapped = format!("{{ x: {source} }}");
+    let doc = parse_doc(&wrapped);
+    let Expr::Dict(pairs) = *doc.expr else {
+        panic!("expected dict wrapper");
+    };
+    pairs.into_iter().next().expect("one pair").1
 }
 
 fn eval_doc(source: &str) -> Result<Value, RuntimeError> {
@@ -103,8 +114,7 @@ fn test_invalid_fn_name() {
 
 #[test]
 fn test_pipe_operator() {
-    let mut input = Span::new(r#"[1, 2, 3] | len()"#);
-    let node = parse_expr(&mut input).unwrap();
+    let node = parse_expr_test(r#"[1, 2, 3] | len()"#);
     let ctx = Context::new();
     let ctx = std::sync::Arc::new(ctx);
     let result = Evaluator::new(std::sync::Arc::clone(&ctx))
@@ -571,8 +581,7 @@ fn test_circular_reference_with_thunks() {
 
 #[test]
 fn test_list_comprehension() {
-    let mut input = Span::new(r#"[x * 2 for x in range(5) if x % 2 == 0]"#);
-    let node = parse_expr(&mut input).unwrap();
+    let node = parse_expr_test(r#"[x * 2 for x in range(5) if x % 2 == 0]"#);
     let ctx = Context::new();
     let ctx = std::sync::Arc::new(ctx);
     let result = Evaluator::new(std::sync::Arc::clone(&ctx))
