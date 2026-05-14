@@ -530,6 +530,40 @@ impl<'a> Parser<'a> {
     fn parse_expr(&mut self) {
         let ck = self.checkpoint();
         self.parse_expr_bp(0);
+        // Ternary: `cond ? then : else`. Bound at expression-tail
+        // precedence — lower than every binary operator (so the binary
+        // chain absorbs into `cond`) but higher than the trailing
+        // `match` / `where` postfix forms (which wrap whatever ternary
+        // produces). The legacy `parse_ternary` (`expr.rs`) sits at the
+        // same level — see the precedence chain notes there.
+        //
+        // Disambiguation: `?` may also be a path-access prefix
+        // (`a?.b`, `a?[0]`) or a type-optional marker (`Foo?` inside a
+        // typed context). Path access is consumed earlier — the CST's
+        // current postfix loop doesn't fold `?.` / `?[`, but the legacy
+        // pre-P4 path always took those bytes itself, so no fixture
+        // reaches this branch with them in postfix position. Type
+        // optionals only appear inside committed `parse_type` calls
+        // (match arms, closure params, directive bodies), never at the
+        // outermost expression level — so seeing `?` here is
+        // unambiguously a ternary head.
+        if self.at(SyntaxKind::QUESTION) {
+            // Guard: don't claim a ternary on `?.` / `?[`. Those forms
+            // belong to path access and are handled (or rejected) by the
+            // atom layer; consuming `?` here would steal the prefix.
+            let next = self.nth(1);
+            if !matches!(next, Some(SyntaxKind::DOT) | Some(SyntaxKind::L_BRACK)) {
+                self.open_at(ck, SyntaxKind::TERNARY_EXPR);
+                self.bump(); // ?
+                self.parse_expr();
+                if !self.expect(SyntaxKind::COLON) {
+                    self.close();
+                    return;
+                }
+                self.parse_expr();
+                self.close();
+            }
+        }
         loop {
             if self.at(SyntaxKind::IDENT) && self.current_text() == Some("match") {
                 // Only commit to MATCH_EXPR when `match` is followed
@@ -1944,6 +1978,40 @@ mod tests {
     #[test]
     fn unknown_byte_does_not_crash() {
         parse_round_trip("{ x: \u{0000} 1 }");
+    }
+
+    #[test]
+    fn ternary_expression_emits_ternary_node() {
+        let parsed = parse_round_trip("{ x: a ? 1 : 2 }");
+        assert!(!parsed.has_errors(), "errors: {:?}", parsed.errors);
+        let ts: Vec<_> = parsed
+            .syntax()
+            .descendants()
+            .filter(|n| n.kind() == SyntaxKind::TERNARY_EXPR)
+            .collect();
+        assert_eq!(ts.len(), 1, "expected one TERNARY_EXPR");
+    }
+
+    #[test]
+    fn ternary_root_no_whitespace() {
+        // Legacy accepts `true? 1:2` — every `?` / `:` boundary is
+        // surrounded by `soc0` so adjacent forms parse without spaces.
+        let parsed = parse_round_trip("true? 1:2");
+        assert!(!parsed.has_errors(), "errors: {:?}", parsed.errors);
+    }
+
+    #[test]
+    fn ternary_nested_in_else() {
+        // Right-recursive parse: `a ? 1 : b ? 2 : 3` should produce a
+        // ternary whose `els` is another ternary.
+        let parsed = parse_round_trip("{ x: a ? 1 : b ? 2 : 3 }");
+        assert!(!parsed.has_errors(), "errors: {:?}", parsed.errors);
+        let ts: Vec<_> = parsed
+            .syntax()
+            .descendants()
+            .filter(|n| n.kind() == SyntaxKind::TERNARY_EXPR)
+            .collect();
+        assert_eq!(ts.len(), 2);
     }
 
     /// Monotonic floor on how many checked-in `.relon` fixtures parse
