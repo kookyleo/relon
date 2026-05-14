@@ -442,16 +442,182 @@ impl<'a> Parser<'a> {
                 self.parse_expr();
             }
         }
-        // Optional `with { ... }` block. We parse it as a free-form
-        // dict — the schema-method grammar inside it (method
-        // signatures, `#derive`, `#native`, etc.) is a typed-AST
-        // concern; the CST keeps the bytes whole inside a DICT.
+        // Optional `with { ... }` block — a structured method list.
+        // The legacy `opt_parse_with_block` (`directive.rs`) drives the
+        // shape: leading pragma stack (`#derive` / `#native` /
+        // `#private` / `#no_auto_derive`), then a `name<T>?(p: T,
+        // ...) -> Ret (: body)?` declaration. We emit each method as
+        // a SCHEMA_METHOD node so the typed-AST layer can read the
+        // structure cheaply.
         if self.at(SyntaxKind::IDENT) && self.current_text() == Some("with") {
             self.bump();
             if self.at(SyntaxKind::L_BRACE) {
-                self.parse_dict();
+                self.parse_schema_with();
             }
         }
+    }
+
+    /// `with { (pragma | method)* }` — body of a `#schema` / `#extend`
+    /// directive. Lossless: every byte (whitespace, comments, leading
+    /// pragmas) sits inside the [`SCHEMA_WITH`] node, with each method
+    /// declaration wrapped in its own [`SCHEMA_METHOD`] child.
+    fn parse_schema_with(&mut self) {
+        self.open(SyntaxKind::SCHEMA_WITH);
+        self.bump(); // {
+        while !self.at(SyntaxKind::R_BRACE) && !self.at_end() {
+            // Method declarations are introduced by either a pragma
+            // (`#derive` / `#native` / `#private` / `#no_auto_derive`)
+            // or directly by a method name. We greedily group leading
+            // pragmas with the next method into one SCHEMA_METHOD node
+            // — if no method follows (e.g. trailing schema-level
+            // `#no_auto_derive`), the directives sit at the
+            // SCHEMA_WITH level as siblings.
+            if self.at(SyntaxKind::HASH) {
+                let ck = self.checkpoint();
+                let mut had_method_pragma = false;
+                while self.at(SyntaxKind::HASH) {
+                    let name = self.directive_name_after_hash();
+                    if matches!(
+                        name.as_deref(),
+                        Some("derive") | Some("native") | Some("private")
+                    ) {
+                        had_method_pragma = true;
+                    }
+                    self.parse_attribute();
+                }
+                if self.at(SyntaxKind::IDENT) && !self.at_method_terminator() {
+                    self.open_at(ck, SyntaxKind::SCHEMA_METHOD);
+                    self.parse_schema_method_after_pragmas();
+                    self.close();
+                } else if had_method_pragma {
+                    // Pragma stack without a method — surface a recovery
+                    // error to mirror the legacy "stray method pragma"
+                    // diagnostic but keep parsing.
+                    self.error(
+                        "expected method declaration after `#derive` / `#native` / `#private`",
+                    );
+                }
+                continue;
+            }
+            if self.at(SyntaxKind::IDENT) {
+                self.open(SyntaxKind::SCHEMA_METHOD);
+                self.parse_schema_method_after_pragmas();
+                self.close();
+                continue;
+            }
+            // Unexpected token inside the with-block — recover to the
+            // next likely start of a method (HASH / IDENT / R_BRACE).
+            self.error_recover(
+                "expected method or pragma inside `with { ... }`",
+                &[SyntaxKind::HASH, SyntaxKind::IDENT, SyntaxKind::R_BRACE],
+            );
+        }
+        self.expect(SyntaxKind::R_BRACE);
+        self.close();
+    }
+
+    /// True when the upcoming non-trivia token is the with-block
+    /// terminator (`}`) — used to spot a pragma stack with no method
+    /// trailing it without confusing it for a normal method header.
+    fn at_method_terminator(&self) -> bool {
+        matches!(self.current(), Some(SyntaxKind::R_BRACE)) || self.at_end()
+    }
+
+    /// Peek the IDENT immediately after a HASH at the current position
+    /// (skipping trivia). Returns `None` if `#` isn't followed by an
+    /// identifier.
+    fn directive_name_after_hash(&self) -> Option<String> {
+        let mut idx = self.pos_skip_trivia();
+        if self.tokens.get(idx).map(|(k, _)| *k) != Some(SyntaxKind::HASH) {
+            return None;
+        }
+        idx += 1;
+        while idx < self.tokens.len() && self.tokens[idx].0.is_trivia() {
+            idx += 1;
+        }
+        match self.tokens.get(idx) {
+            Some((SyntaxKind::IDENT, text)) => Some((*text).to_string()),
+            _ => None,
+        }
+    }
+
+    /// Parse a single method declaration inside a `with { ... }` block.
+    /// Caller has already opened a SCHEMA_METHOD node and emitted any
+    /// leading pragma directives. Shape:
+    ///
+    ///   IDENT GenericParams? '(' (Param (',' Param)*)? ')' '->' Type (':' Expr)?
+    ///
+    /// Each parameter takes the named form `name: Type` (opposite of
+    /// `#main`'s `Type name`), reusing the existing CLOSURE_PARAM
+    /// wrapper to keep the typed-AST layer simple. The body is omitted
+    /// for `#native` methods.
+    fn parse_schema_method_after_pragmas(&mut self) {
+        // Method name.
+        if self.at(SyntaxKind::IDENT) {
+            self.bump();
+        } else {
+            self.error_at_current("expected method name");
+            return;
+        }
+        // Optional method-level generics `<U, V>`.
+        if self.at(SyntaxKind::LT) {
+            self.bump();
+            while !self.at(SyntaxKind::GT) && !self.at_end() {
+                if self.at(SyntaxKind::IDENT) {
+                    self.bump();
+                } else {
+                    self.error_at_current("expected method generic parameter");
+                    break;
+                }
+                if !self.eat(SyntaxKind::COMMA) {
+                    break;
+                }
+            }
+            self.expect(SyntaxKind::GT);
+        }
+        // Parameter list `(name: Type, ...)`.
+        if !self.expect(SyntaxKind::L_PAREN) {
+            return;
+        }
+        while !self.at(SyntaxKind::R_PAREN) && !self.at_end() {
+            self.parse_schema_method_param();
+            if !self.eat(SyntaxKind::COMMA) {
+                break;
+            }
+        }
+        self.expect(SyntaxKind::R_PAREN);
+        // `-> ReturnType` — required by the analyzer-level grammar
+        // (every with-block method declares its return), but the CST
+        // accepts the missing-arrow shape so older test fixtures
+        // that elided the return type still round-trip cleanly.
+        if self.eat(SyntaxKind::THIN_ARROW) {
+            self.parse_type();
+        }
+        // Optional `: body`. Methods marked `#native` omit it; for
+        // others the analyzer enforces presence.
+        if self.eat(SyntaxKind::COLON) {
+            self.parse_expr();
+        }
+    }
+
+    /// One schema-method parameter: `name: Type`. Lossless — emitted
+    /// inside a CLOSURE_PARAM node so the typed-AST layer can reuse
+    /// the existing wrapper.
+    fn parse_schema_method_param(&mut self) {
+        self.open(SyntaxKind::CLOSURE_PARAM);
+        if self.at(SyntaxKind::IDENT) {
+            self.bump();
+        } else {
+            self.error_at_current("expected parameter name");
+            self.close();
+            return;
+        }
+        if self.eat(SyntaxKind::COLON) {
+            self.parse_type();
+        } else {
+            self.error("expected `:` in schema method parameter");
+        }
+        self.close();
     }
 
     /// `#import <spec> from "path"`. `<spec>` is one of
@@ -2359,6 +2525,48 @@ mod tests {
     }
 
     #[test]
+    fn schema_with_block_emits_method_nodes() {
+        // Slice-opener for the schema with-block grammar. Two methods
+        // back-to-back, one carrying a `#derive` pragma and a `Self`
+        // parameter type.
+        let src = "#schema Money { Int cents: * } with {\n    #derive Equatable\n    eq(other: Self) -> Bool: self.cents == other.cents\n}\n{ Money p: { cents: 100 } }\n";
+        let parsed = parse_round_trip(src);
+        assert!(!parsed.has_errors(), "errors: {:?}", parsed.errors);
+        let with_blocks: Vec<_> = parsed
+            .syntax()
+            .descendants()
+            .filter(|n| n.kind() == SyntaxKind::SCHEMA_WITH)
+            .collect();
+        assert_eq!(with_blocks.len(), 1);
+        let methods: Vec<_> = with_blocks[0]
+            .descendants()
+            .filter(|n| n.kind() == SyntaxKind::SCHEMA_METHOD)
+            .collect();
+        assert_eq!(methods.len(), 1);
+        // The method should contain the `#derive` directive and a
+        // CLOSURE_PARAM for `other`.
+        let dirs: Vec<_> = methods[0]
+            .descendants()
+            .filter(|n| n.kind() == SyntaxKind::DIRECTIVE)
+            .collect();
+        assert_eq!(dirs.len(), 1);
+        let params: Vec<_> = methods[0]
+            .descendants()
+            .filter(|n| n.kind() == SyntaxKind::CLOSURE_PARAM)
+            .collect();
+        assert_eq!(params.len(), 1);
+    }
+
+    #[test]
+    fn schema_with_block_native_method_skips_body() {
+        // `#native` method has no `: body` — just the signature.
+        let src =
+            "#schema Doc { String text: * } with {\n    #native\n    render() -> String\n}\n{}\n";
+        let parsed = parse_round_trip(src);
+        assert!(!parsed.has_errors(), "errors: {:?}", parsed.errors);
+    }
+
+    #[test]
     fn typed_spread_round_trips() {
         // v1.3 typed spread `...<Type> expr`. The `<Type>` annotation
         // lands inside the SPREAD_EXPR; the source expression follows.
@@ -2438,7 +2646,8 @@ mod tests {
         // spreads, and the schema with-block named-param method
         // grammar). Tuple types `(T1, T2)` brought the floor to 165.
         // Typed spreads `...<Type> expr` brought it to 170.
-        const FLOOR: usize = 170;
+        // Schema with-block structured method nodes brought it to 198.
+        const FLOOR: usize = 198;
         let clean = fixture_clean_parse_count();
         eprintln!("[parser] fixtures clean-parse count: {clean}");
         assert!(
