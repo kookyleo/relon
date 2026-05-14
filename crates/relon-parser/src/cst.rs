@@ -321,35 +321,173 @@ impl<'a> Parser<'a> {
         self.close();
     }
 
-    /// `@name(...)` or `#name <body>`. Lightweight v1 — captures the
-    /// attribute body as a generic expression, lets the typed-AST
-    /// layer (P3) lower it to `Directive` / `Decorator`. Recovery
-    /// resyncs to the next attribute or the start of a value.
+    /// `@name(...)` or `#name <body>`. Decorator bodies are always
+    /// `(args)` (or absent); directive bodies branch on the name:
+    /// `schema` / `extend` capture `name <T, U>? body? (with {})?`,
+    /// `import` captures `<spec> from "path"`, `main` captures
+    /// `( typed-params ) [-> Ret]`, the rest take a single expr.
     fn parse_attribute(&mut self) {
-        let kind = if self.at(SyntaxKind::HASH) {
+        let is_directive = self.at(SyntaxKind::HASH);
+        let kind = if is_directive {
             SyntaxKind::DIRECTIVE
         } else {
             SyntaxKind::DECORATOR
         };
         self.open(kind);
         self.bump(); // # or @
+        let name_text = if self.at(SyntaxKind::IDENT) {
+            let text = self.current_text();
+            self.bump();
+            text
+        } else {
+            self.error_at_current("expected attribute name");
+            None
+        };
+        if !is_directive {
+            // Decorator — body is always `(args)` or empty.
+            if self.at(SyntaxKind::L_PAREN) {
+                self.parse_call_args();
+            }
+            self.close();
+            return;
+        }
+        // Directive — dispatch on name.
+        match name_text {
+            Some("schema") | Some("extend") => self.parse_directive_name_body(),
+            Some("import") => self.parse_directive_import(),
+            Some("main") => self.parse_directive_main(),
+            _ => {
+                if self.is_attribute_body_start() {
+                    self.parse_expr();
+                }
+            }
+        }
+        self.close();
+    }
+
+    /// `#schema Name <T, U>? body? (with { methods... })?`. The body
+    /// is whatever expression follows the name + generics (typically
+    /// a dict but the parser accepts any expression — the analyzer
+    /// emits a diagnostic when it isn't a dict). The trailing `with`
+    /// block is optional and may also follow a body-less `#schema X`
+    /// declaration.
+    fn parse_directive_name_body(&mut self) {
+        // Optional declared name.
         if self.at(SyntaxKind::IDENT) {
             self.bump();
         } else {
-            self.error_at_current("expected attribute name");
+            return;
         }
-        // Optional body — a `(...)` arg list for decorators, or a
-        // free-form expression for directives. We delegate to the
-        // primary parser; it'll stop at the next attribute / EOI.
-        // Conservative for v1: only consume a single primary token
-        // sequence if the next thing isn't another attribute or the
-        // root value boundary.
-        if self.at(SyntaxKind::L_PAREN) {
-            self.parse_call_args();
-        } else if self.is_attribute_body_start() {
-            self.parse_expr();
+        // Optional generic param list `<T, U>` — bare identifiers.
+        if self.at(SyntaxKind::LT) {
+            self.bump();
+            while !self.at(SyntaxKind::GT) && !self.at_end() {
+                if self.at(SyntaxKind::IDENT) {
+                    self.bump();
+                } else {
+                    self.error_at_current("expected generic param");
+                    break;
+                }
+                if !self.eat(SyntaxKind::COMMA) {
+                    break;
+                }
+            }
+            self.expect(SyntaxKind::GT);
         }
-        self.close();
+        // The body is everything up to (a) the next attribute, (b)
+        // the `with` keyword, or (c) the dict-field separator (`:`
+        // / `,` / `}` / EOI). Special-case the `with`-only shape
+        // (`#schema X with { ... }`) by skipping the body when we
+        // see `with` immediately.
+        let saw_with = self.at(SyntaxKind::IDENT) && self.current_text() == Some("with");
+        if !saw_with && self.is_attribute_body_start() {
+            // Guard: when the next chars are `Ident:` / `Ident,` we
+            // must not consume them — they belong to a dict field
+            // following `#schema X` in a `: ...` context.
+            if !self.peek_attribute_terminator() {
+                self.parse_expr();
+            }
+        }
+        // Optional `with { ... }` block. We parse it as a free-form
+        // dict — the schema-method grammar inside it (method
+        // signatures, `#derive`, `#native`, etc.) is a typed-AST
+        // concern; the CST keeps the bytes whole inside a DICT.
+        if self.at(SyntaxKind::IDENT) && self.current_text() == Some("with") {
+            self.bump();
+            if self.at(SyntaxKind::L_BRACE) {
+                self.parse_dict();
+            }
+        }
+    }
+
+    /// `#import <spec> from "path"`. `<spec>` is one of
+    /// `*`, `{ a, b as c }`, or a single identifier.
+    fn parse_directive_import(&mut self) {
+        if self.at(SyntaxKind::STAR) {
+            self.bump();
+        } else if self.at(SyntaxKind::L_BRACE) {
+            // Destructure list `{ a, b as c }` — parse as a dict for
+            // CST purposes; the typed-AST layer interprets it.
+            self.parse_dict();
+        } else if self.at(SyntaxKind::IDENT) {
+            self.bump();
+        } else {
+            self.error_at_current("expected import spec");
+            return;
+        }
+        if self.at(SyntaxKind::IDENT) && self.current_text() == Some("from") {
+            self.bump();
+        } else {
+            self.error("expected `from` in #import");
+            return;
+        }
+        if self.at(SyntaxKind::STRING) {
+            self.bump();
+        } else {
+            self.error_at_current("expected path string in #import");
+        }
+    }
+
+    /// `#main ( type ident, ... ) [-> Type]`. Captures the typed
+    /// param list directly so the directive node carries the same
+    /// structure the analyzer needs.
+    fn parse_directive_main(&mut self) {
+        if !self.eat(SyntaxKind::L_PAREN) {
+            self.error("expected `(` after `#main`");
+            return;
+        }
+        while !self.at(SyntaxKind::R_PAREN) && !self.at_end() {
+            // Each param: `Type ident` (closure-param shape).
+            self.parse_closure_param();
+            if !self.eat(SyntaxKind::COMMA) {
+                break;
+            }
+        }
+        self.expect(SyntaxKind::R_PAREN);
+        // Optional `-> ReturnType`.
+        if self.eat(SyntaxKind::THIN_ARROW) {
+            self.parse_type();
+        }
+    }
+
+    /// True when the next non-trivia token signals "no directive body
+    /// here, leave the ident for the surrounding grammar" — used by
+    /// `#schema X: value` (inside a dict) where `X` is the dict key,
+    /// not the schema-name body.
+    fn peek_attribute_terminator(&self) -> bool {
+        let mut idx = self.pos_skip_trivia();
+        // Skip an IDENT (and an optional generic angle-list).
+        if self.tokens.get(idx).map(|(k, _)| *k) != Some(SyntaxKind::IDENT) {
+            return false;
+        }
+        idx += 1;
+        while idx < self.tokens.len() && self.tokens[idx].0.is_trivia() {
+            idx += 1;
+        }
+        matches!(
+            self.tokens.get(idx).map(|(k, _)| *k),
+            Some(SyntaxKind::COLON) | Some(SyntaxKind::COMMA) | Some(SyntaxKind::R_BRACE)
+        )
     }
 
     fn is_attribute_body_start(&self) -> bool {
@@ -1634,6 +1772,38 @@ mod tests {
     }
 
     #[test]
+    fn schema_directive_with_body() {
+        let parsed = parse_round_trip("#schema User { String name: *, Int age: * }\n{ a: 1 }");
+        assert!(!parsed.has_errors(), "errors: {:?}", parsed.errors);
+        let dirs: Vec<_> = parsed
+            .syntax()
+            .descendants()
+            .filter(|n| n.kind() == SyntaxKind::DIRECTIVE)
+            .collect();
+        assert_eq!(dirs.len(), 1);
+    }
+
+    #[test]
+    fn schema_with_generic_params_and_with_block() {
+        let parsed = parse_round_trip(
+            "#schema Result<T, E> { T value: *, E error: * } with { unwrap(): value }\n{ x: 1 }",
+        );
+        assert!(!parsed.has_errors(), "errors: {:?}", parsed.errors);
+    }
+
+    #[test]
+    fn import_directive_round_trip() {
+        let parsed = parse_round_trip("#import string from \"std/string\"\n{ x: 1 }");
+        assert!(!parsed.has_errors(), "errors: {:?}", parsed.errors);
+    }
+
+    #[test]
+    fn main_directive_round_trip() {
+        let parsed = parse_round_trip("#main(User u, Cart cart) -> Result<Order>\n{ x: 1 }");
+        assert!(!parsed.has_errors(), "errors: {:?}", parsed.errors);
+    }
+
+    #[test]
     fn f_string_emits_f_string_node() {
         let parsed = parse_round_trip(r#"{ msg: f"hello ${name}!" }"#);
         assert!(!parsed.has_errors(), "errors: {:?}", parsed.errors);
@@ -1775,7 +1945,7 @@ mod tests {
         // Each P2 slice bumps the floor. At slice 1 (closures) we hit
         // ~60 of ~210 — the directive / match / where / type slices
         // will push this much higher.
-        const FLOOR: usize = 64;
+        const FLOOR: usize = 135;
         let clean = fixture_clean_parse_count();
         eprintln!("[parser] fixtures clean-parse count: {clean}");
         assert!(
