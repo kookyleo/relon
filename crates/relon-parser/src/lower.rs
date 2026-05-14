@@ -729,6 +729,7 @@ pub fn lower_document(parse: &Parse, source: &str) -> Result<crate::Node, ParseD
             // rejects as "trailing"; double-check by trying legacy
             // before committing to the typed error.
             if legacy_parse(source).is_err() {
+                record_fallback(source, "trailing-input typed-err");
                 return Err(ParseDocumentError::TrailingInput {
                     offset: start,
                     remaining,
@@ -737,8 +738,28 @@ pub fn lower_document(parse: &Parse, source: &str) -> Result<crate::Node, ParseD
         }
     }
     // Long-tail fallback through the legacy combinator chain.
+    record_fallback(source, "long-tail");
     legacy_parse(source)
 }
+
+#[cfg(test)]
+thread_local! {
+    /// Diagnostic capture of every input that took the legacy fallback.
+    /// Tests using this should clear it at the top of the test.
+    pub(crate) static FALLBACK_LOG: std::cell::RefCell<Vec<(String, String)>>
+        = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+fn record_fallback(source: &str, reason: &str) {
+    FALLBACK_LOG.with(|log| {
+        log.borrow_mut()
+            .push((source.to_string(), reason.to_string()))
+    });
+}
+
+#[cfg(not(test))]
+fn record_fallback(_source: &str, _reason: &str) {}
 
 /// True when any descendant of `node` (or `node` itself) is an
 /// [`SyntaxKind::ERROR`] node. Reserved for the future "CST gates"
@@ -1098,6 +1119,95 @@ mod tests {
         }
         assert!(checked > 0, "expected to compare at least one fixture");
         assert_eq!(divergent, 0, "found {divergent} divergent fixtures");
+    }
+
+    /// P5 diagnostic: inspect what the CST + lowered tree look like for
+    /// the `with_block_invalid/*` corpus. The legacy fallback currently
+    /// rescues semantic-validity diagnostics on these inputs; the v2
+    /// path needs to surface the same errors.
+    #[test]
+    #[ignore]
+    fn p5_scout_invalid_fixtures() {
+        use std::fs;
+        use std::path::PathBuf;
+        let crate_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let invalid = crate_dir.join("tests/fixtures/with_block_invalid");
+        for entry in fs::read_dir(&invalid).unwrap() {
+            let p = entry.unwrap().path();
+            if p.extension().and_then(|e| e.to_str()) != Some("relon") {
+                continue;
+            }
+            let source = fs::read_to_string(&p).unwrap();
+            let name = p.file_name().unwrap().to_string_lossy().to_string();
+            let parse = cst::parse_cst(&source);
+            eprintln!("=== {name} ===");
+            eprintln!("CST errors: {}", parse.errors.len());
+            for e in &parse.errors {
+                eprintln!("  - {} @ {}", e.message, e.offset);
+            }
+            let result = lower_document(&parse, &source);
+            eprintln!(
+                "lower_document: {}",
+                match &result {
+                    Ok(_) => "Ok".to_string(),
+                    Err(e) => format!("Err({e:?})"),
+                }
+            );
+            eprintln!();
+        }
+    }
+
+    /// P5 diagnostic: walk all `.relon` fixtures and print which ones
+    /// caused `lower_document` to fall back to the legacy combinator
+    /// chain. Run with `cargo test -- --ignored
+    /// p5_scout_legacy_fallback_inputs --nocapture`.
+    ///
+    /// The output is grouped by reason (`long-tail` vs typed trailing
+    /// errors). Each unique source snippet is printed once so the list
+    /// is human-scannable.
+    #[test]
+    #[ignore]
+    fn p5_scout_legacy_fallback_inputs() {
+        use std::collections::BTreeMap;
+        use std::fs;
+        use std::path::PathBuf;
+
+        let crate_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let workspace_root = crate_dir
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("workspace root")
+            .to_path_buf();
+        let mut files = Vec::new();
+        walk(&workspace_root, &mut files);
+        files.retain(|p| !p.to_string_lossy().contains("/target/"));
+
+        let mut by_reason: BTreeMap<String, Vec<PathBuf>> = BTreeMap::new();
+        for path in &files {
+            let Ok(source) = fs::read_to_string(path) else {
+                continue;
+            };
+            if source.is_empty() {
+                continue;
+            }
+            FALLBACK_LOG.with(|log| log.borrow_mut().clear());
+            let _ = lower_document(&cst::parse_cst(&source), &source);
+            let entries: Vec<(String, String)> = FALLBACK_LOG.with(|log| log.borrow().clone());
+            for (_, reason) in entries {
+                by_reason.entry(reason).or_default().push(path.clone());
+            }
+        }
+
+        eprintln!("\n=== P5 SCOUT: legacy fallback inputs ===");
+        for (reason, paths) in &by_reason {
+            eprintln!("\n[reason] {reason}: {} hit(s)", paths.len());
+            for p in paths {
+                eprintln!("  {}", p.display());
+            }
+        }
+        if by_reason.is_empty() {
+            eprintln!("(no fallbacks recorded; corpus is fully on v2 path)");
+        }
     }
 
     fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
