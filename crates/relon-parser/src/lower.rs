@@ -56,10 +56,9 @@
 use crate::ast;
 use crate::cst::Parse;
 use crate::syntax::{SyntaxKind, SyntaxNode};
-use crate::{
-    parse_base, position_at_source, Expr, Node, ParseDocumentError, Span, TokenKey, TokenRange,
-};
-use winnow::stream::Location;
+use crate::{position_at_source, Expr, Node, ParseDocumentError, Span, TokenKey, TokenRange};
+#[cfg(test)]
+use {crate::parse_base, winnow::stream::Location};
 
 // =====================================================================
 // CST-walking lowering — P4 implementation.
@@ -706,60 +705,67 @@ pub(crate) fn first_real_error(parse: &Parse) -> Option<&crate::cst::ParseError>
 /// [`ParseDocumentError::TrailingInput`] (matching the pre-P4 shape)
 /// when the CST detects them and the v2 path is otherwise clean.
 pub fn lower_document(parse: &Parse, source: &str) -> Result<crate::Node, ParseDocumentError> {
-    // Fast path: clean CST + v2 lowering succeeds.
+    // Fast path: clean CST + v2 lowering succeeds. The v2 path is the
+    // single source of truth post-P5; the top-level legacy combinator
+    // fallback is gone and any failure inside this branch surfaces as
+    // a typed `ParseDocumentError`.
     if !parse.has_errors() {
         if let Some(doc) = ast::document_of(parse.syntax()) {
+            if doc.root_expr().is_none() {
+                return Err(ParseDocumentError::Parse {
+                    offset: 0,
+                    message: "empty document".to_string(),
+                });
+            }
             if let Some(node) = lower_document_node_v2(&doc, source) {
                 return Ok(node);
             }
+            // CST accepted the source, but a byte-slice lowering step
+            // (one of the `lower_directive_v2` / `lower_decorator_v2`
+            // sub-parses, or the legacy `parse_expr` on a CST node)
+            // rejected the contents on semantic grounds — e.g. a
+            // `with { ... }` block carrying an unknown pragma, a
+            // `#native` method with a body, or an expression form
+            // the legacy expression combinator stops short of (e.g.
+            // a stray leading `+`). Surface as a parse error at
+            // offset 0; the analyzer surfaces a friendlier
+            // diagnostic downstream.
+            return Err(ParseDocumentError::Parse {
+                offset: 0,
+                message: "could not lower well-formed CST to legacy Node".to_string(),
+            });
         }
+        // No DOCUMENT node at all — the lexer produced an empty token
+        // stream. Treat as a parse error at offset 0.
+        return Err(ParseDocumentError::Parse {
+            offset: 0,
+            message: "empty document".to_string(),
+        });
     }
-    // CST surfaced a trailing-input error and the legacy fallback
-    // would itself reject the input. Surface the typed error.
-    if let Some(err) = first_real_error(parse) {
-        if err.message.starts_with("trailing input after root value") {
-            // The legacy `parse_base` consumes inter-token trivia
-            // before recording the trailing offset; the CST stops at
-            // the next-token-start. Step over whitespace + comments
-            // so callers see the legacy offset / remaining shape.
-            let mut start = err.offset;
-            start += trim_leading_trivia(source.get(start..).unwrap_or(""));
-            let remaining: String = source.get(start..).unwrap_or("").chars().take(64).collect();
-            // The legacy fallback may also accept inputs the CST
-            // rejects as "trailing"; double-check by trying legacy
-            // before committing to the typed error.
-            if legacy_parse(source).is_err() {
-                record_fallback(source, "trailing-input typed-err");
-                return Err(ParseDocumentError::TrailingInput {
-                    offset: start,
-                    remaining,
-                });
-            }
-        }
+    // CST surfaced one or more errors. Surface the first one in the
+    // typed shape callers expect.
+    let err = parse
+        .errors
+        .first()
+        .expect("parse.has_errors() implies at least one error");
+    if err.message.starts_with("trailing input after root value") {
+        // The legacy `parse_base` consumed inter-token trivia before
+        // recording the trailing offset; the CST stops at the next-
+        // token-start. Step over whitespace + comments so callers
+        // see the legacy offset / remaining shape.
+        let mut start = err.offset;
+        start += trim_leading_trivia(source.get(start..).unwrap_or(""));
+        let remaining: String = source.get(start..).unwrap_or("").chars().take(64).collect();
+        return Err(ParseDocumentError::TrailingInput {
+            offset: start,
+            remaining,
+        });
     }
-    // Long-tail fallback through the legacy combinator chain.
-    record_fallback(source, "long-tail");
-    legacy_parse(source)
+    Err(ParseDocumentError::Parse {
+        offset: err.offset,
+        message: err.message.clone(),
+    })
 }
-
-#[cfg(test)]
-thread_local! {
-    /// Diagnostic capture of every input that took the legacy fallback.
-    /// Tests using this should clear it at the top of the test.
-    pub(crate) static FALLBACK_LOG: std::cell::RefCell<Vec<(String, String)>>
-        = const { std::cell::RefCell::new(Vec::new()) };
-}
-
-#[cfg(test)]
-fn record_fallback(source: &str, reason: &str) {
-    FALLBACK_LOG.with(|log| {
-        log.borrow_mut()
-            .push((source.to_string(), reason.to_string()))
-    });
-}
-
-#[cfg(not(test))]
-fn record_fallback(_source: &str, _reason: &str) {}
 
 /// True when any descendant of `node` (or `node` itself) is an
 /// [`SyntaxKind::ERROR`] node. Reserved for the future "CST gates"
@@ -783,12 +789,11 @@ fn first_error_offset(node: &SyntaxNode) -> Option<usize> {
 /// pre-P4 body of [`crate::parse_document`] exactly so the produced
 /// `Node` is byte-identical to what callers got before.
 ///
-/// Slice 8: retained as the long-tail fallback for inputs the P2 CST
-/// grammar is slightly more strict about than the pre-P4 legacy
-/// parser. The new path ([`lower_document_node_v2`]) is preferred
-/// whenever the CST cleanly accepts the input — see [`lower_document`]
-/// for the dispatch rules. Slice-level comparison tests also call
-/// this directly to validate per-construct parity.
+/// P5: no longer wired into [`lower_document`]; the public entry now
+/// runs the v2 path exclusively. Kept around so slice-level parity
+/// tests can keep cross-checking per-construct legacy output without
+/// reaching for `parse_base` directly.
+#[cfg(test)]
 fn legacy_parse(source: &str) -> Result<crate::Node, ParseDocumentError> {
     let mut input = Span::new(source);
     let node = parse_base(&mut input).map_err(|error| ParseDocumentError::Parse {
@@ -1198,17 +1203,14 @@ mod tests {
         }
     }
 
-    /// P5 diagnostic: walk all `.relon` fixtures and print which ones
-    /// caused `lower_document` to fall back to the legacy combinator
-    /// chain. Run with `cargo test -- --ignored
-    /// p5_scout_legacy_fallback_inputs --nocapture`.
-    ///
-    /// The output is grouped by reason (`long-tail` vs typed trailing
-    /// errors). Each unique source snippet is printed once so the list
-    /// is human-scannable.
+    /// P5 diagnostic: walk all `.relon` fixtures and confirm that
+    /// every one either lowers successfully or surfaces a typed
+    /// `ParseDocumentError`. Run with `cargo test -- --ignored
+    /// p5_scout_corpus_errors --nocapture` to see the per-fixture
+    /// outcome breakdown.
     #[test]
     #[ignore]
-    fn p5_scout_legacy_fallback_inputs() {
+    fn p5_scout_corpus_errors() {
         use std::collections::BTreeMap;
         use std::fs;
         use std::path::PathBuf;
@@ -1223,7 +1225,7 @@ mod tests {
         walk(&workspace_root, &mut files);
         files.retain(|p| !p.to_string_lossy().contains("/target/"));
 
-        let mut by_reason: BTreeMap<String, Vec<PathBuf>> = BTreeMap::new();
+        let mut by_outcome: BTreeMap<&'static str, Vec<PathBuf>> = BTreeMap::new();
         for path in &files {
             let Ok(source) = fs::read_to_string(path) else {
                 continue;
@@ -1231,23 +1233,21 @@ mod tests {
             if source.is_empty() {
                 continue;
             }
-            FALLBACK_LOG.with(|log| log.borrow_mut().clear());
-            let _ = lower_document(&cst::parse_cst(&source), &source);
-            let entries: Vec<(String, String)> = FALLBACK_LOG.with(|log| log.borrow().clone());
-            for (_, reason) in entries {
-                by_reason.entry(reason).or_default().push(path.clone());
-            }
+            let parse = cst::parse_cst(&source);
+            let label = match lower_document(&parse, &source) {
+                Ok(_) => "ok",
+                Err(ParseDocumentError::Parse { .. }) => "parse-error",
+                Err(ParseDocumentError::TrailingInput { .. }) => "trailing-input",
+            };
+            by_outcome.entry(label).or_default().push(path.clone());
         }
 
-        eprintln!("\n=== P5 SCOUT: legacy fallback inputs ===");
-        for (reason, paths) in &by_reason {
-            eprintln!("\n[reason] {reason}: {} hit(s)", paths.len());
+        eprintln!("\n=== P5 SCOUT: corpus outcome breakdown ===");
+        for (label, paths) in &by_outcome {
+            eprintln!("\n[{label}] {} fixture(s)", paths.len());
             for p in paths {
                 eprintln!("  {}", p.display());
             }
-        }
-        if by_reason.is_empty() {
-            eprintln!("(no fallbacks recorded; corpus is fully on v2 path)");
         }
     }
 
@@ -1884,23 +1884,36 @@ mod tests {
         ));
     }
 
-    /// Slice 8: inputs the CST P2 grammar is slightly more strict
-    /// about (e.g. `#schema X: { ... }` dict-field shapes) still
-    /// parse via the legacy fallback. This is the conservative
-    /// pre-cutover behavior — closing those CST gaps is tracked as a
-    /// follow-up to P4.
+    /// P5 closed the CST gap for the `#schema X: { ... }` dict-field
+    /// shape — the legacy parser accepted a `:` separator between the
+    /// schema name and the dict body, and the CST now does too. This
+    /// regression-test pins the behaviour so a future grammar
+    /// refactor can't silently re-open the gap.
     #[test]
-    fn slice8_legacy_fallback_handles_cst_strictness_gaps() {
+    fn slice8_schema_colon_body_form_parses() {
         let src = r#"{
             #schema Image: { name: String },
             data: { name: "img" }
         }"#;
         let parse = cst::parse_cst(src);
-        // The CST emits at least one error for this shape today; the
-        // fallback still produces a working `Node`.
-        assert!(parse.has_errors());
-        let node = lower_document(&parse, src).expect("legacy fallback");
+        let node = lower_document(&parse, src).expect("schema-colon shape lowers cleanly");
         assert!(matches!(*node.expr, Expr::Dict(_)));
+        assert!(!parse.has_errors(), "no CST errors: {:?}", parse.errors);
+    }
+
+    /// Inspect what the legacy parser produced for `#schema X: { ... }`
+    /// so we can match its shape in the v2 path.
+    #[test]
+    fn slice8_schema_colon_body_matches_legacy_shape() {
+        let src = r#"{
+            #schema Image: { name: String },
+            data: { name: "img" }
+        }"#;
+        let mut legacy = crate::lower::legacy_parse(src).expect("legacy parse");
+        let mut lowered = lower_document(&cst::parse_cst(src), src).expect("lower");
+        strip_node_ids(&mut legacy);
+        strip_node_ids(&mut lowered);
+        assert_eq!(legacy, lowered, "shape diverged");
     }
 
     /// `parse_document` (the public entry) now goes through CST first.
