@@ -1798,6 +1798,91 @@ fn lower_expr_via_legacy(node: &SyntaxNode, source: &str) -> Option<Node> {
     Some(value)
 }
 
+/// Lower an `Expr::Spread` CST node directly. The shape is `... inner`
+/// (or `...<TypeHint> inner` for the typed-spread form). The typed
+/// spread's `type_hint` stamps onto the inner Node's `type_hint`
+/// field rather than the Spread wrapper itself — that's where the
+/// legacy `parse_dict_entry` puts it so type-checked spreads inherit
+/// the dict-typed-key flow.
+fn lower_spread_expr_v2(node: &SyntaxNode, source: &str) -> Option<Node> {
+    let r = node.text_range();
+    let start: usize = r.start().into();
+    let end: usize = r.end().into();
+    // Optional `<Type>` between `...` and the inner expression.
+    let mut type_hint: Option<crate::TypeNode> = None;
+    let mut inner_expr: Option<ast::Expr> = None;
+    for child in node.children() {
+        if child.kind() == SyntaxKind::TYPE_NODE && type_hint.is_none() && inner_expr.is_none() {
+            type_hint = Some(lower_type_node_from_cst(&child, source)?);
+            continue;
+        }
+        if let Some(e) = ast::Expr::cast(child) {
+            inner_expr = Some(e);
+            break;
+        }
+    }
+    let inner_ast = inner_expr?;
+    let mut inner = lower_expr_v2(&inner_ast, source)?;
+    if let Some(th) = type_hint {
+        inner.type_hint = Some(th);
+    }
+    Some(Node::new(
+        Expr::Spread(inner),
+        range_from_offsets(source, start, end),
+    ))
+}
+
+/// Lower a `TYPE_NODE` CST node sitting at expression position into
+/// the legacy `Expr::Type` wrapper. The CST emits `TYPE_NODE` directly
+/// (no surrounding marker) when the type-expr disambiguation in
+/// `parse_atomic` claims it as a type rather than a variable.
+///
+/// The CST node's `text_range()` may include leading trivia (rowan's
+/// `open()` flushes pending trivia *into* the new node — see
+/// `cst::open`). The legacy `parse_type_expr` captures
+/// `start_offset = input.location()` *after* `soc0` is consumed by
+/// `parse_atomic`, so the outer Node range should start at the first
+/// non-trivia byte. The inner `TypeNode.range` already carries that
+/// post-trivia offset (it's set inside `parse_type_node` after
+/// `parse_leading_comments`), so reuse it for the outer wrapper.
+fn lower_type_expr_v2(node: &SyntaxNode, source: &str) -> Option<Node> {
+    let t = lower_type_node_from_cst(node, source)?;
+    let range = t.range;
+    Some(Node::new(Expr::Type(t), range))
+}
+
+/// Lower a `UNARY_EXPR` CST node. The single operator token (`-`/`!`/
+/// `+`) plus the operand expression. Maps to legacy `Expr::Unary(op,
+/// operand)`. `+x` collapses to `x` (the legacy parser dropped the
+/// sign for unary-`+` since it's a no-op).
+fn lower_unary_expr_v2(node: &SyntaxNode, source: &str) -> Option<Node> {
+    let r = node.text_range();
+    let start: usize = r.start().into();
+    let end: usize = r.end().into();
+    let op_token = node
+        .children_with_tokens()
+        .filter_map(|el| el.into_token())
+        .find(|t| matches!(t.kind(), SyntaxKind::MINUS | SyntaxKind::BANG | SyntaxKind::PLUS))?;
+    let operand_ast = node.children().find_map(ast::Expr::cast)?;
+    let operand = lower_expr_v2(&operand_ast, source)?;
+    let op = match op_token.kind() {
+        SyntaxKind::MINUS => crate::Operator::Sub,
+        SyntaxKind::BANG => crate::Operator::Not,
+        SyntaxKind::PLUS => {
+            // Legacy `parse_unary` only emits `!` and `-` — a bare
+            // unary `+` would have been swallowed without producing
+            // an Expr::Unary wrapper. Match that by returning the
+            // operand directly.
+            return Some(operand);
+        }
+        _ => return None,
+    };
+    Some(Node::new(
+        Expr::Unary(op, operand),
+        range_from_offsets(source, start, end),
+    ))
+}
+
 /// Try to lower an `ast::Expr` to a legacy `Node` using the CST-walking
 /// path. Returns `None` when the construct is outside the currently-
 /// supported set (caller falls back to the legacy combinator chain).
@@ -1823,7 +1908,7 @@ pub(crate) fn lower_expr_v2(expr: &ast::Expr, source: &str) -> Option<Node> {
         // dict / list / spread machinery here.
         ast::Expr::Dict(d) => lower_expr_via_legacy(d.syntax(), source),
         ast::Expr::List(l) => lower_expr_via_legacy(l.syntax(), source),
-        ast::Expr::Spread(s) => lower_expr_via_legacy(s.syntax(), source),
+        ast::Expr::Spread(s) => lower_spread_expr_v2(s.syntax(), source),
         ast::Expr::Comprehension(c) => lower_expr_via_legacy(c.syntax(), source),
         // Slice 3: operators + calls. The legacy `parse_expr` already
         // routes binary precedence (`parse_pipe` → `parse_logic_or`
@@ -1834,7 +1919,7 @@ pub(crate) fn lower_expr_v2(expr: &ast::Expr, source: &str) -> Option<Node> {
         // detection byte-identical with no separate token-text → enum
         // table here.
         ast::Expr::Binary(b) => lower_expr_via_legacy(b.syntax(), source),
-        ast::Expr::Unary(u) => lower_expr_via_legacy(u.syntax(), source),
+        ast::Expr::Unary(u) => lower_unary_expr_v2(u.syntax(), source),
         ast::Expr::Ternary(t) => lower_expr_via_legacy(t.syntax(), source),
         ast::Expr::Call(c) => lower_expr_via_legacy(c.syntax(), source),
         // Slice 4: control flow. `Closure`, `Match`, `Where`, and
@@ -1866,7 +1951,7 @@ pub(crate) fn lower_expr_v2(expr: &ast::Expr, source: &str) -> Option<Node> {
         // full TypeNode shape — `path` / `generics` / `is_optional` /
         // `variant_fields` / `range` / `doc_comment` — byte-
         // identically.
-        ast::Expr::Type(t) => lower_expr_via_legacy(t.syntax(), source),
+        ast::Expr::Type(t) => lower_type_expr_v2(t.syntax(), source),
         // The CST emits an `ERROR` node when recovery happens; we don't
         // have a legacy `Node` shape for partial parses.
         ast::Expr::Error(_) => None,
