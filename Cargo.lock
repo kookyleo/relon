@@ -937,6 +937,7 @@ dependencies = [
  "memchr",
  "miette",
  "ordered-float",
+ "proptest",
  "rand 0.8.6",
  "rowan",
  "winnow",

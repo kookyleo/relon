@@ -20,4 +20,5 @@ rowan = "0.15"
 
 [dev-dependencies]
 rand = "0.8"
+proptest = { workspace = true }
 

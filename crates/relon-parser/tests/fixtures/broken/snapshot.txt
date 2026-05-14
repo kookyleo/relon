@@ -1,0 +1,151 @@
+=== 01_missing_colon.relon ===
+source: "{ a 1, b: 2 }\n"
+round_trip: true
+cst_errors: 2
+  - expected `:` in dict field @ 3
+  - expected `,` or `}` in dict @ 3
+parse_document: Err(parse error: Backtrack(ContextError { context: [], cause: None }))
+
+=== 02_unclosed_brace.relon ===
+source: "{ a: 1, b: 2\n"
+round_trip: true
+cst_errors: 2
+  - expected `,` or `}` in dict @ 12
+  - expected R_BRACE, found None @ 13
+parse_document: Err(parse error: Backtrack(ContextError { context: [], cause: None }))
+
+=== 03_unclosed_bracket.relon ===
+source: "[1, 2, 3\n"
+round_trip: true
+cst_errors: 2
+  - expected `,` or `]` in list @ 8
+  - expected R_BRACK, found None @ 9
+parse_document: Err(parse error: Backtrack(ContextError { context: [], cause: None }))
+
+=== 04_unclosed_paren.relon ===
+source: "{ x: f(1, 2 }\n"
+round_trip: true
+cst_errors: 4
+  - expected `,` or `)` in argument list @ 11
+  - expected R_PAREN, found None @ 13
+  - expected `,` or `}` in dict @ 13
+  - expected R_BRACE, found None @ 14
+parse_document: Err(parse error: Backtrack(ContextError { context: [], cause: None }))
+
+=== 05_unterminated_string.relon ===
+source: "{ a: \"hello }\n"
+round_trip: true
+cst_errors: 2
+  - expected `,` or `}` in dict @ 14
+  - expected R_BRACE, found None @ 14
+parse_document: Err(parse error: Backtrack(ContextError { context: [], cause: None }))
+
+=== 06_unterminated_fstring.relon ===
+source: "{ a: f\"hello ${name }\n"
+round_trip: true
+cst_errors: 2
+  - expected `,` or `}` in dict @ 22
+  - expected R_BRACE, found None @ 22
+parse_document: Err(parse error: Backtrack(ContextError { context: [], cause: None }))
+
+=== 07_dangling_dot.relon ===
+source: "{ a: foo. }\n"
+round_trip: true
+cst_errors: 3
+  - expected identifier or index after `.` @ 9
+  - expected `,` or `}` in dict @ 11
+  - expected R_BRACE, found None @ 12
+parse_document: Err(parse error: Backtrack(ContextError { context: [], cause: None }))
+
+=== 08_bad_number.relon ===
+source: "{ a: 0xZZ, b: 2 }\n"
+round_trip: true
+cst_errors: 1
+  - expected `,` or `}` in dict @ 7
+parse_document: Err(parse error: Cut(ContextError { context: [], cause: None }))
+
+=== 09_stray_operator.relon ===
+source: "{ a: + 1 }\n"
+round_trip: true
+cst_errors: 0
+parse_document: Err(parse error: Backtrack(ContextError { context: [], cause: None }))
+
+=== 10_double_comma.relon ===
+source: "{ a: 1, , b: 2 }\n"
+round_trip: true
+cst_errors: 0
+parse_document: Err(parse error: Backtrack(ContextError { context: [], cause: None }))
+
+=== 11_stray_hash.relon ===
+source: "{ a: # b: 2 }\n"
+round_trip: true
+cst_errors: 2
+  - expected expression @ 8
+  - expected `,` or `}` in dict @ 9
+parse_document: Err(parse error: Backtrack(ContextError { context: [], cause: None }))
+
+=== 12_for_no_var.relon ===
+source: "{ xs: [x for in src] }\n"
+round_trip: true
+cst_errors: 1
+  - expected `in` in comprehension @ 15
+parse_document: Err(parse error: Backtrack(ContextError { context: [], cause: None }))
+
+=== 13_bad_escape.relon ===
+source: "{ msg: \"hello\\q world\" }\n"
+round_trip: true
+cst_errors: 0
+parse_document: Err(parse error: Backtrack(ContextError { context: [], cause: None }))
+
+=== 14_fstring_unclosed_interp.relon ===
+source: "{ msg: f\"${ } }\n"
+round_trip: true
+cst_errors: 2
+  - expected `,` or `}` in dict @ 16
+  - expected R_BRACE, found None @ 16
+parse_document: Err(parse error: Backtrack(ContextError { context: [], cause: None }))
+
+=== 15_bare_hash.relon ===
+source: "#\n{ a: 1 }\n"
+round_trip: true
+cst_errors: 3
+  - expected attribute name @ 1
+  - expected expression @ 5
+  - trailing input after root value @ 6
+parse_document: Err(parse error: Backtrack(ContextError { context: [], cause: None }))
+
+=== 16_half_schema.relon ===
+source: "#schema X {\n{ x: 1 }\n"
+round_trip: true
+cst_errors: 1
+  - expected dict key @ 12
+parse_document: Err(trailing input at byte 10: "{\n{ x: 1 }\n")
+
+=== 17_dict_key_no_value.relon ===
+source: "{ a:, b: 2 }\n"
+round_trip: true
+cst_errors: 2
+  - expected expression @ 4
+  - expected `,` or `}` in dict @ 5
+parse_document: Err(parse error: Backtrack(ContextError { context: [], cause: None }))
+
+=== 18_half_arrow.relon ===
+source: "{ f: (x) -> }\n"
+round_trip: true
+cst_errors: 1
+  - expected `,` or `}` in dict @ 8
+parse_document: Err(parse error: Backtrack(ContextError { context: [], cause: None }))
+
+=== 19_garbage_byte.relon ===
+source: "{ a: 1 ~ b: 2 }\n"
+round_trip: true
+cst_errors: 1
+  - expected `,` or `}` in dict @ 6
+parse_document: Err(parse error: Backtrack(ContextError { context: [], cause: None }))
+
+=== 20_empty.relon ===
+source: "\n"
+round_trip: true
+cst_errors: 0
+parse_document: Err(parse error: Backtrack(ContextError { context: [], cause: None }))
+

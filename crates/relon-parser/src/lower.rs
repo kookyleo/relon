@@ -1121,6 +1121,47 @@ mod tests {
         assert_eq!(divergent, 0, "found {divergent} divergent fixtures");
     }
 
+    /// P5 diagnostic: inspect CST behaviour on broken-input fixtures.
+    /// Mirrors the [`p5_scout_invalid_fixtures`] reporter but reads the
+    /// `tests/fixtures/broken/` corpus instead.
+    #[test]
+    #[ignore]
+    fn p5_scout_broken_fixtures() {
+        use std::fs;
+        use std::path::PathBuf;
+        let crate_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let dir = crate_dir.join("tests/fixtures/broken");
+        if !dir.is_dir() {
+            eprintln!("(no broken fixtures dir yet)");
+            return;
+        }
+        for entry in fs::read_dir(&dir).unwrap() {
+            let p = entry.unwrap().path();
+            if p.extension().and_then(|e| e.to_str()) != Some("relon") {
+                continue;
+            }
+            let source = fs::read_to_string(&p).unwrap();
+            let name = p.file_name().unwrap().to_string_lossy().to_string();
+            let parse = cst::parse_cst(&source);
+            eprintln!("=== {name} ===");
+            eprintln!("source: {source:?}");
+            eprintln!("round-trip: {}", parse.syntax().text().to_string() == source);
+            eprintln!("CST errors: {}", parse.errors.len());
+            for e in &parse.errors {
+                eprintln!("  - {} @ {}", e.message, e.offset);
+            }
+            let result = lower_document(&parse, &source);
+            eprintln!(
+                "lower_document: {}",
+                match &result {
+                    Ok(_) => "Ok".to_string(),
+                    Err(e) => format!("Err({e:?})"),
+                }
+            );
+            eprintln!();
+        }
+    }
+
     /// P5 diagnostic: inspect what the CST + lowered tree look like for
     /// the `with_block_invalid/*` corpus. The legacy fallback currently
     /// rescues semantic-validity diagnostics on these inputs; the v2
