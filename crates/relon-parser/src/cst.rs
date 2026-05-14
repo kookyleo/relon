@@ -434,6 +434,17 @@ impl<'a> Parser<'a> {
         // (`#schema X with { ... }`) by skipping the body when we
         // see `with` immediately.
         let saw_with = self.at(SyntaxKind::IDENT) && self.current_text() == Some("with");
+        // v1 accepts an optional `:` separator between schema name and
+        // body: `#schema Image: { name: String }` is equivalent to
+        // `#schema Image { name: String }`. The legacy combinator chain
+        // consumed the `:` as part of the directive; the CST does the
+        // same so the `is_attribute_body_start` check below sees the
+        // body proper. Without this, the dict-field grammar would
+        // (correctly!) parse `Image:` as a malformed dict field after
+        // mistaking the directive for body-less.
+        if !saw_with && self.at(SyntaxKind::COLON) {
+            self.bump();
+        }
         if !saw_with && self.is_attribute_body_start() {
             // Guard: when the next chars are `Ident:` / `Ident,` we
             // must not consume them — they belong to a dict field
@@ -686,9 +697,12 @@ impl<'a> Parser<'a> {
         if self.at(SyntaxKind::STAR) {
             self.bump();
         } else if self.at(SyntaxKind::L_BRACE) {
-            // Destructure list `{ a, b as c }` — parse as a dict for
-            // CST purposes; the typed-AST layer interprets it.
-            self.parse_dict();
+            // Destructure list `{ a, b as c }` — each entry is an
+            // IDENT optionally followed by `as IDENT`. This is NOT a
+            // dict, so we don't reuse `parse_dict`. The legacy
+            // `parse_import_spec` accepts this shape; the typed-AST
+            // layer carries the entries on `DirectiveImportSpec`.
+            self.parse_import_destructure();
         } else if self.at(SyntaxKind::IDENT) {
             self.bump();
         } else {
@@ -706,6 +720,37 @@ impl<'a> Parser<'a> {
         } else {
             self.error_at_current("expected path string in #import");
         }
+    }
+
+    fn parse_import_destructure(&mut self) {
+        debug_assert!(self.at(SyntaxKind::L_BRACE));
+        self.bump(); // {
+        loop {
+            if self.at(SyntaxKind::R_BRACE) || self.at_end() {
+                break;
+            }
+            if self.at(SyntaxKind::IDENT) {
+                self.bump();
+                // Optional `as IDENT` alias.
+                if self.at(SyntaxKind::IDENT) && self.current_text() == Some("as") {
+                    self.bump();
+                    if self.at(SyntaxKind::IDENT) {
+                        self.bump();
+                    } else {
+                        self.error_at_current("expected identifier after `as` in #import");
+                    }
+                }
+            } else {
+                self.error_recover(
+                    "expected identifier in #import destructure",
+                    &[SyntaxKind::COMMA, SyntaxKind::R_BRACE],
+                );
+            }
+            if !self.eat(SyntaxKind::COMMA) {
+                break;
+            }
+        }
+        self.expect(SyntaxKind::R_BRACE);
     }
 
     /// `#main ( type ident, ... ) [-> Type]`. Captures the typed
@@ -759,10 +804,20 @@ impl<'a> Parser<'a> {
                     | SyntaxKind::STRING
                     | SyntaxKind::L_BRACE
                     | SyntaxKind::L_BRACK
+                    // `L_PAREN` covers the parenthesised closure form
+                    // `(p) => body` and parenthesised expressions
+                    // `(a + b)`. Without this, value-shape directives
+                    // like `#default (self) => ...` and
+                    // `#expect (n) => n > 0` would be parsed as
+                    // body-less, leaving the closure for the
+                    // surrounding dict to choke on.
+                    | SyntaxKind::L_PAREN
                     | SyntaxKind::AMP
                     | SyntaxKind::MINUS
                     | SyntaxKind::BANG
                     | SyntaxKind::STAR
+                    // F-strings start a fresh atom too.
+                    | SyntaxKind::F_STRING_OPEN
             )
         })
     }
@@ -904,7 +959,8 @@ impl<'a> Parser<'a> {
         self.parse_postfix();
     }
 
-    /// Atom with postfix suffixes (`.field`, `[i]`, `(args)`).
+    /// Atom with postfix suffixes (`.field`, `[i]`, `(args)`,
+    /// plus optional-chain `?.field` / `?[i]`).
     fn parse_postfix(&mut self) {
         let ck = self.checkpoint();
         self.parse_atom();
@@ -913,13 +969,33 @@ impl<'a> Parser<'a> {
                 self.open_at(ck, SyntaxKind::CALL_EXPR);
                 self.parse_call_args();
                 self.close();
-            } else if self.at(SyntaxKind::DOT) || self.at(SyntaxKind::L_BRACK) {
+            } else if self.at(SyntaxKind::DOT)
+                || self.at(SyntaxKind::L_BRACK)
+                || (self.at(SyntaxKind::QUESTION)
+                    && matches!(
+                        self.nth(1),
+                        Some(SyntaxKind::DOT) | Some(SyntaxKind::L_BRACK)
+                    ))
+            {
                 // Path access — fold into VARIABLE_EXPR so dotted
                 // paths like `a.b.c` end up as a single node. v1.8
                 // positional access `xs.0` (number after `.`) is the
                 // tuple/list index form — accepted alongside `.field`.
+                // Optional chaining (`a?.b`, `a?[0]`) consumes the `?`
+                // as a prefix on the next segment; the typed-AST
+                // marks the segment as optional.
                 self.open_at(ck, SyntaxKind::VARIABLE_EXPR);
-                while self.at(SyntaxKind::DOT) || self.at(SyntaxKind::L_BRACK) {
+                loop {
+                    let is_optional_prefix = self.at(SyntaxKind::QUESTION)
+                        && matches!(
+                            self.nth(1),
+                            Some(SyntaxKind::DOT) | Some(SyntaxKind::L_BRACK)
+                        );
+                    if is_optional_prefix {
+                        self.bump(); // ?
+                    } else if !self.at(SyntaxKind::DOT) && !self.at(SyntaxKind::L_BRACK) {
+                        break;
+                    }
                     if self.at(SyntaxKind::DOT) {
                         self.bump();
                         if self.at(SyntaxKind::IDENT) || self.at(SyntaxKind::NUMBER) {
@@ -927,11 +1003,13 @@ impl<'a> Parser<'a> {
                         } else {
                             self.error_at_current("expected identifier or index after `.`");
                         }
-                    } else {
+                    } else if self.at(SyntaxKind::L_BRACK) {
                         // `[ index ]`
                         self.bump();
                         self.parse_expr();
                         self.expect(SyntaxKind::R_BRACK);
+                    } else {
+                        break;
                     }
                 }
                 self.close();
@@ -1821,7 +1899,10 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_reference(&mut self) {
-        // `&base.tail.tail...`
+        // `&base.tail.tail...` with optional-chain `?.` / `?[` access
+        // forms (`&a.b?.c`, `&a?.[0]`). The legacy `reference_var`
+        // grammar accepts both `.` / `[` and the `?`-prefixed variant
+        // — the typed-AST tags the optional-ness on each `TokenKey`.
         self.open(SyntaxKind::REFERENCE_EXPR);
         self.bump(); // &
         if self.at(SyntaxKind::IDENT) {
@@ -1829,7 +1910,16 @@ impl<'a> Parser<'a> {
         } else {
             self.error_at_current("expected reference base after `&`");
         }
-        while self.at(SyntaxKind::DOT) || self.at(SyntaxKind::L_BRACK) {
+        loop {
+            // `?.` and `?[` — eat the `?` prefix first, then fall
+            // through to the regular dot / bracket handling.
+            if self.at(SyntaxKind::QUESTION)
+                && matches!(self.nth(1), Some(SyntaxKind::DOT) | Some(SyntaxKind::L_BRACK))
+            {
+                self.bump(); // ?
+            } else if !self.at(SyntaxKind::DOT) && !self.at(SyntaxKind::L_BRACK) {
+                break;
+            }
             if self.at(SyntaxKind::DOT) {
                 self.bump();
                 if self.at(SyntaxKind::IDENT) || self.at(SyntaxKind::NUMBER) {
@@ -1837,10 +1927,12 @@ impl<'a> Parser<'a> {
                 } else {
                     self.error_at_current("expected identifier or index after `.`");
                 }
-            } else {
+            } else if self.at(SyntaxKind::L_BRACK) {
                 self.bump(); // [
                 self.parse_expr();
                 self.expect(SyntaxKind::R_BRACK);
+            } else {
+                break;
             }
         }
         self.close();
