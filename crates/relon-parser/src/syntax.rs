@@ -209,6 +209,22 @@ pub enum SyntaxKind {
     /// child token. This is the "first-class hole" that lets
     /// downstream tooling keep working on partial input.
     ERROR,
+    /// `(T1, T2, ...)` tuple type — appears in type-hint position
+    /// (`(Int, String) pair: ...`) and inside generic argument lists
+    /// (`List<(Int, String)>`). The 1-tuple uses a trailing-comma
+    /// `(T,)` disambiguator; `()` is the zero-tuple.
+    TUPLE_TYPE,
+    /// `#schema ... with { ... }` body — a structured method list.
+    /// Children: one `SCHEMA_METHOD` per declaration plus any
+    /// schema-level pragma directives. The CST keeps every byte
+    /// verbatim; the typed-AST layer reads the structure.
+    SCHEMA_WITH,
+    /// One method declaration inside a [`SCHEMA_WITH`] block.
+    /// Children: optional pragma directives (`#derive`, `#native`,
+    /// `#private`), an IDENT method name, optional `<T>` generics,
+    /// `CLOSURE_PARAM` list, a TYPE_NODE return type, and an
+    /// expression body (omitted when `#native` is set).
+    SCHEMA_METHOD,
 
     // Append new kinds above this line.
     /// Sentinel to keep `(SyntaxKind as u16) < (__LAST as u16)`
@@ -349,6 +365,9 @@ impl SyntaxKind {
             x if x == Self::WILDCARD as u16 => Self::WILDCARD,
             x if x == Self::LITERAL as u16 => Self::LITERAL,
             x if x == Self::ERROR as u16 => Self::ERROR,
+            x if x == Self::TUPLE_TYPE as u16 => Self::TUPLE_TYPE,
+            x if x == Self::SCHEMA_WITH as u16 => Self::SCHEMA_WITH,
+            x if x == Self::SCHEMA_METHOD as u16 => Self::SCHEMA_METHOD,
             _ => return None,
         };
         Some(kind)

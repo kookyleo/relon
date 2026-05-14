@@ -1331,11 +1331,16 @@ impl<'a> Parser<'a> {
                 return false;
             }
             let mut depth: i32 = 1;
+            // Track nested `(...)` so tuple-type arguments like
+            // `List<(Int, String)>` don't trip the comma rejection.
+            let mut paren_depth: i32 = 0;
             idx += 1;
             while idx < self.tokens.len() && depth > 0 {
                 match self.tokens[idx].0 {
                     SyntaxKind::LT => depth += 1,
                     SyntaxKind::GT => depth -= 1,
+                    SyntaxKind::L_PAREN => paren_depth += 1,
+                    SyntaxKind::R_PAREN if paren_depth > 0 => paren_depth -= 1,
                     // Anything that strongly disqualifies a type
                     // expression — bail.
                     SyntaxKind::L_BRACE
@@ -1343,7 +1348,7 @@ impl<'a> Parser<'a> {
                     | SyntaxKind::R_PAREN
                     | SyntaxKind::FAT_ARROW
                     | SyntaxKind::COMMA
-                        if depth == 1 =>
+                        if depth == 1 && paren_depth == 0 =>
                     {
                         return false
                     }
@@ -1367,22 +1372,26 @@ impl<'a> Parser<'a> {
     /// Parse a type-expression-shaped run of tokens into a TYPE_NODE.
     /// The grammar:
     ///
-    ///   TypeNode    := PathSeg ('.' PathSeg)* GenericArgs? '?'?
+    ///   TypeNode    := TupleType | (PathSeg ('.' PathSeg)* GenericArgs? '?'?)
+    ///   TupleType   := '(' ')' | '(' TypeNode ',' ')' | '(' TypeNode (',' TypeNode)+ ','? ')'
     ///   PathSeg     := IDENT | STRING
     ///   GenericArgs := '<' (TypeNode (',' TypeNode)*)? ','? '>'
     ///
     /// Matches the winnow `parse_type_node` (in `expr.rs`) for every
     /// shape the corpus uses today, including string-keyed segments
     /// (`"namespaced".Foo`), nested generics (`Map<String, Int>`),
-    /// and the optional `?` marker.
-    ///
-    /// Parens-typed tuples `(T1, T2)` are NOT lowered here — they
-    /// appear only as the leading slot in a `#main(...)` parameter
-    /// or `(p) -> T` closure return, both of which take a different
-    /// grammar path. Adding the tuple shape here would mis-parse
-    /// `(p) => body` shorthands when the parser is in a type-eager
-    /// context.
+    /// the optional `?` marker, and v1.7 tuple types in both
+    /// type-hint position (`(Int, String) pair: ...`) and as generic
+    /// arguments (`List<(Int, String)>`).
     fn parse_type(&mut self) {
+        // Tuple type — committed only when the caller picked
+        // `parse_type` (typed-key / generic-arg / closure-param /
+        // return-type position). The expression grammar uses its own
+        // `(...)` handler so a parens group never reaches this branch.
+        if self.at(SyntaxKind::L_PAREN) {
+            self.parse_tuple_type();
+            return;
+        }
         self.open(SyntaxKind::TYPE_NODE);
         // First segment: IDENT or STRING (allowed in the v1 grammar
         // for dotted-string paths like `"foo".Bar`).
@@ -1419,6 +1428,37 @@ impl<'a> Parser<'a> {
             self.expect(SyntaxKind::GT);
         }
         // Optional `?` (i.e. `User?`).
+        if self.at(SyntaxKind::QUESTION) {
+            self.bump();
+        }
+        self.close();
+    }
+
+    /// `(T1, T2, ...)` tuple type. Three shapes:
+    ///
+    /// * `()`         — zero-tuple.
+    /// * `(T,)`       — one-tuple (trailing comma is mandatory; without
+    ///                  it the form is a parenthesised type, not used
+    ///                  in the current grammar but still consumed as
+    ///                  a single-element TUPLE_TYPE for forward-compat).
+    /// * `(T1, T2)`   — 2+ tuple, optional trailing comma.
+    ///
+    /// Caller has already committed to type-position via `parse_type`,
+    /// so we don't have to worry about confusing this with a closure
+    /// param list — the closure detection happens at the expression
+    /// layer (`try_parse_paren_closure`) and never reaches here.
+    fn parse_tuple_type(&mut self) {
+        self.open(SyntaxKind::TUPLE_TYPE);
+        self.bump(); // (
+        while !self.at(SyntaxKind::R_PAREN) && !self.at_end() {
+            self.parse_type();
+            if !self.eat(SyntaxKind::COMMA) {
+                break;
+            }
+        }
+        self.expect(SyntaxKind::R_PAREN);
+        // Tuple types support the same trailing `?` as regular types
+        // (`(Int, String)?` — nullable pair).
         if self.at(SyntaxKind::QUESTION) {
             self.bump();
         }
@@ -1593,8 +1633,12 @@ impl<'a> Parser<'a> {
         // Optional leading type hint: `Type key: value` /
         // `Type key(params): body`. We commit only when peeking
         // suggests a typed-key shape — otherwise the leading run is
-        // the key itself (e.g. a single identifier).
-        if self.peek_is_typed_dict_key() {
+        // the key itself (e.g. a single identifier). v1.7 tuple types
+        // (`(Int, String) pair: ...`) take the same slot and are
+        // detected by a separate `(...)`-leading peek.
+        if self.peek_is_tuple_typed_dict_key() {
+            self.parse_tuple_type();
+        } else if self.peek_is_typed_dict_key() {
             self.parse_type();
         }
         if self.at(SyntaxKind::IDENT) || self.at(SyntaxKind::STRING) {
@@ -1689,18 +1733,24 @@ impl<'a> Parser<'a> {
         let saw_generics = self.tokens.get(idx).map(|(k, _)| *k) == Some(SyntaxKind::LT);
         if saw_generics {
             let mut depth: i32 = 1;
+            // Track nested `(` / `)` so a tuple-type argument like
+            // `List<(Int, String)>` doesn't make the rejection bail
+            // out the moment it hits a comma or `)`.
+            let mut paren_depth: i32 = 0;
             idx += 1;
             while idx < self.tokens.len() && depth > 0 {
                 match self.tokens[idx].0 {
                     SyntaxKind::LT => depth += 1,
                     SyntaxKind::GT => depth -= 1,
+                    SyntaxKind::L_PAREN => paren_depth += 1,
+                    SyntaxKind::R_PAREN if paren_depth > 0 => paren_depth -= 1,
                     SyntaxKind::L_BRACE
                     | SyntaxKind::R_BRACE
                     | SyntaxKind::R_PAREN
                     | SyntaxKind::FAT_ARROW
                     | SyntaxKind::THIN_ARROW
                     | SyntaxKind::COLON
-                        if depth == 1 =>
+                        if depth == 1 && paren_depth == 0 =>
                     {
                         return false
                     }
@@ -1731,6 +1781,47 @@ impl<'a> Parser<'a> {
         advance_trivia(&mut after_key, &self.tokens);
         let next = self.tokens.get(after_key).map(|(k, _)| *k);
         matches!(next, Some(SyntaxKind::COLON) | Some(SyntaxKind::L_PAREN))
+    }
+
+    /// Does the upcoming token stream start with a balanced `(...)`
+    /// tuple-type prefix followed by an IDENT (or STRING) and then
+    /// `:` / `(` (i.e. `(Int, String) pair: ...`)? Used by
+    /// [`parse_dict_field`] to commit to the tuple-type lead, which
+    /// has to win over the "parens group" interpretation of the same
+    /// bytes when they appear at the head of a dict field. The
+    /// balanced paren scan walks past nested generics / nested parens
+    /// so `List<(Int, String)>` doesn't fool the outer detector.
+    fn peek_is_tuple_typed_dict_key(&self) -> bool {
+        if !self.at(SyntaxKind::L_PAREN) {
+            return false;
+        }
+        let lparen_idx = self.pos_skip_trivia();
+        let Some(after_paren) = self.scan_after_matching_paren(lparen_idx) else {
+            return false;
+        };
+        // Optional trailing `?` after the tuple type.
+        let mut idx = after_paren;
+        if self.tokens.get(idx).map(|(k, _)| *k) == Some(SyntaxKind::QUESTION) {
+            idx += 1;
+            while idx < self.tokens.len() && self.tokens[idx].0.is_trivia() {
+                idx += 1;
+            }
+        }
+        // Must see IDENT or STRING (the key), followed by `:` or `(`.
+        if !matches!(
+            self.tokens.get(idx).map(|(k, _)| *k),
+            Some(SyntaxKind::IDENT) | Some(SyntaxKind::STRING)
+        ) {
+            return false;
+        }
+        let mut after_key = idx + 1;
+        while after_key < self.tokens.len() && self.tokens[after_key].0.is_trivia() {
+            after_key += 1;
+        }
+        matches!(
+            self.tokens.get(after_key).map(|(k, _)| *k),
+            Some(SyntaxKind::COLON) | Some(SyntaxKind::L_PAREN)
+        )
     }
 
     fn parse_call_args(&mut self) {
@@ -2251,6 +2342,41 @@ mod tests {
     }
 
     #[test]
+    fn tuple_type_in_dict_field_round_trips() {
+        // v1.7 tuple types in the type-hint slot of a dict field.
+        let parsed = parse_round_trip("{ (Int, String) pair: [42, \"hello\"] }");
+        assert!(!parsed.has_errors(), "errors: {:?}", parsed.errors);
+        let tts: Vec<_> = parsed
+            .syntax()
+            .descendants()
+            .filter(|n| n.kind() == SyntaxKind::TUPLE_TYPE)
+            .collect();
+        assert_eq!(tts.len(), 1, "expected one TUPLE_TYPE");
+    }
+
+    #[test]
+    fn tuple_type_inside_generic() {
+        let parsed = parse_round_trip("{ List<(Int, String)> rows: [[1, \"a\"]] }");
+        assert!(!parsed.has_errors(), "errors: {:?}", parsed.errors);
+        let tts: Vec<_> = parsed
+            .syntax()
+            .descendants()
+            .filter(|n| n.kind() == SyntaxKind::TUPLE_TYPE)
+            .collect();
+        assert_eq!(tts.len(), 1);
+    }
+
+    #[test]
+    fn tuple_type_zero_and_one() {
+        // Zero-tuple `()` and one-tuple `(T,)` both round-trip
+        // cleanly. The trailing comma in the one-tuple matters for the
+        // typed-AST layer (it disambiguates from `(T)` parens), but the
+        // CST keeps the bytes verbatim.
+        let parsed = parse_round_trip("{ () unit: [], (Int,) one: [1] }");
+        assert!(!parsed.has_errors(), "errors: {:?}", parsed.errors);
+    }
+
+    #[test]
     fn decorator_dotted_name_round_trips() {
         // `@ensure.int` / `@ensure.at_least(1024)` — dotted decorator
         // names appear in the corpus alongside plain `@name(...)`.
@@ -2274,8 +2400,8 @@ mod tests {
         // Directive-shape dispatch + attribute-only dict fields pushed
         // it to 157 (the next P2 slices target tuple types, typed
         // spreads, and the schema with-block named-param method
-        // grammar).
-        const FLOOR: usize = 157;
+        // grammar). Tuple types `(T1, T2)` brought the floor to 165.
+        const FLOOR: usize = 165;
         let clean = fixture_clean_parse_count();
         eprintln!("[parser] fixtures clean-parse count: {clean}");
         assert!(
