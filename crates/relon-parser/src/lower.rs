@@ -1883,6 +1883,109 @@ fn lower_unary_expr_v2(node: &SyntaxNode, source: &str) -> Option<Node> {
     ))
 }
 
+/// Lower a CLOSURE_PARAM CST node into the legacy `ClosureParam`.
+///
+/// The CST emits CLOSURE_PARAM in two roles:
+///  * Standalone-closure form `(p1, p2) => body` — params are
+///    `[Type] ident` (type optional, but if present comes before name).
+///  * Schema-method param `name: Type` — name first, then `:`, then
+///    type. This branch is detected by checking for a COLON token
+///    inside the node.
+///
+/// The `range` follows the legacy `parse_closure_param`:
+///  * Standalone form: from `start_offset` (before any type) to
+///    `end_offset` (after the name IDENT).
+///  * Schema-method form: handled by `lower_schema_method_param`
+///    instead, not here.
+fn lower_closure_param_v2(node: &SyntaxNode, source: &str) -> Option<crate::ClosureParam> {
+    let r = node.text_range();
+    // Use the first non-trivia child as start (mirrors legacy
+    // `start_offset = input.location()` after `soc0` in the
+    // `(p1, p2)` list separator).
+    let start: usize = node
+        .children_with_tokens()
+        .find_map(|el| match el {
+            rowan::NodeOrToken::Token(t) if matches!(
+                t.kind(),
+                SyntaxKind::WHITESPACE
+                    | SyntaxKind::LINE_COMMENT
+                    | SyntaxKind::BLOCK_COMMENT
+            ) => None,
+            rowan::NodeOrToken::Token(t) => Some(t.text_range().start().into()),
+            rowan::NodeOrToken::Node(n) => Some(n.text_range().start().into()),
+        })
+        .unwrap_or_else(|| r.start().into());
+    let end: usize = r.end().into();
+
+    let type_hint = node
+        .children()
+        .find(|c| c.kind() == SyntaxKind::TYPE_NODE)
+        .and_then(|n| lower_type_node_from_cst(&n, source));
+    // The closure param's name IDENT — for `Type ident` form it's
+    // the last IDENT child (since TYPE_NODE may contain IDENT
+    // tokens too — but TYPE_NODE is a Node child, not a token
+    // child of CLOSURE_PARAM).
+    let name_tok = node
+        .children_with_tokens()
+        .filter_map(|el| el.into_token())
+        .filter(|t| t.kind() == SyntaxKind::IDENT)
+        .last()?;
+    Some(crate::ClosureParam {
+        name: name_tok.text().to_string(),
+        type_hint,
+        range: range_from_offsets(source, start, end),
+    })
+}
+
+/// Lower a `CLOSURE` CST node. Shape: `( params ) [-> RetType] =>
+/// body`. Maps to legacy `Expr::Closure { params, return_type, body }`.
+fn lower_closure_v2(node: &SyntaxNode, source: &str) -> Option<Node> {
+    let r = node.text_range();
+    let start: usize = r.start().into();
+    let end: usize = r.end().into();
+
+    let mut params: Vec<crate::ClosureParam> = Vec::new();
+    let mut return_type: Option<crate::TypeNode> = None;
+    let mut body_ast: Option<ast::Expr> = None;
+    let mut saw_arrow = false;
+
+    for el in node.children_with_tokens() {
+        match el {
+            rowan::NodeOrToken::Token(t) => {
+                if t.kind() == SyntaxKind::THIN_ARROW {
+                    saw_arrow = true;
+                }
+            }
+            rowan::NodeOrToken::Node(n) => match n.kind() {
+                SyntaxKind::CLOSURE_PARAM => {
+                    params.push(lower_closure_param_v2(&n, source)?);
+                }
+                SyntaxKind::TYPE_NODE if saw_arrow && return_type.is_none() => {
+                    return_type = Some(lower_type_node_from_cst(&n, source)?);
+                }
+                _ => {
+                    if let Some(e) = ast::Expr::cast(n.clone()) {
+                        if body_ast.is_none() {
+                            body_ast = Some(e);
+                        }
+                    }
+                }
+            },
+        }
+    }
+
+    let body_ast = body_ast?;
+    let body = lower_expr_v2(&body_ast, source)?;
+    Some(Node::new(
+        Expr::Closure {
+            params,
+            return_type,
+            body,
+        },
+        range_from_offsets(source, start, end),
+    ))
+}
+
 /// Lower a `CALL_EXPR` CST node into the legacy `Expr::FnCall` shape.
 /// The callee is normally a VARIABLE_EXPR whose path tokens we extract
 /// via [`walk_path_tokens`]; the args list is the CALL_ARG child
@@ -2121,7 +2224,7 @@ pub(crate) fn lower_expr_v2(expr: &ast::Expr, source: &str) -> Option<Node> {
         // The closure shape (typed params, optional return type,
         // body) and match-arm pattern/body pairs round-trip
         // byte-identically through the legacy chain.
-        ast::Expr::Closure(c) => lower_expr_via_legacy(c.syntax(), source),
+        ast::Expr::Closure(c) => lower_closure_v2(c.syntax(), source),
         ast::Expr::Match(m) => lower_match_expr_v2(m.syntax(), source),
         ast::Expr::Where(w) => lower_where_expr_v2(w.syntax(), source),
         ast::Expr::VariantCtor(v) => lower_expr_via_legacy(v.syntax(), source),
