@@ -797,8 +797,71 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_list(&mut self) {
-        self.open(SyntaxKind::LIST);
+        // We don't know up-front whether this `[` opens a list or a
+        // comprehension — comprehensions look like `[ expr for id in
+        // iterable (if cond)? ]`. Use a checkpoint so we can wrap the
+        // first expression into either LIST or COMPREHENSION based on
+        // what we find next.
+        let outer_ck = self.checkpoint();
         self.bump(); // [
+                     // Empty list — handle explicitly so we don't try to parse an
+                     // expression after `[`.
+        if self.at(SyntaxKind::R_BRACK) {
+            self.open_at(outer_ck, SyntaxKind::LIST);
+            self.bump();
+            self.close();
+            return;
+        }
+        // Parse the first element (or `for` head). If it's a spread,
+        // it can't be a comprehension head — emit LIST directly.
+        if self.at(SyntaxKind::ELLIPSIS) {
+            self.open_at(outer_ck, SyntaxKind::LIST);
+            self.parse_list_body_tail();
+            return;
+        }
+        self.parse_expr();
+        // After the first expression: if `for IDENT in ...`, this is
+        // a comprehension. Otherwise it's a regular list — wrap as
+        // LIST and continue collecting the rest.
+        if self.at(SyntaxKind::IDENT) && self.current_text() == Some("for") {
+            self.open_at(outer_ck, SyntaxKind::COMPREHENSION);
+            self.bump(); // `for`
+            if self.at(SyntaxKind::IDENT) {
+                self.bump();
+            } else {
+                self.error_at_current("expected identifier after `for`");
+            }
+            if self.at(SyntaxKind::IDENT) && self.current_text() == Some("in") {
+                self.bump();
+            } else {
+                self.error("expected `in` in comprehension");
+            }
+            self.parse_expr();
+            if self.at(SyntaxKind::IDENT) && self.current_text() == Some("if") {
+                self.bump();
+                self.parse_expr();
+            }
+            self.expect(SyntaxKind::R_BRACK);
+            self.close();
+            return;
+        }
+        // Regular list — wrap the existing first element into a LIST
+        // node and continue.
+        self.open_at(outer_ck, SyntaxKind::LIST);
+        if !self.eat(SyntaxKind::COMMA) && !self.at(SyntaxKind::R_BRACK) {
+            self.error_recover(
+                "expected `,` or `]` in list",
+                &[SyntaxKind::COMMA, SyntaxKind::R_BRACK],
+            );
+            self.eat(SyntaxKind::COMMA);
+        }
+        self.parse_list_body_tail();
+    }
+
+    /// Consume the remainder of a LIST body (after the optional leading
+    /// element + comma have already been emitted) up to and including
+    /// the closing `]`, then close the LIST node.
+    fn parse_list_body_tail(&mut self) {
         while !self.at(SyntaxKind::R_BRACK) && !self.at_end() {
             self.parse_expr();
             if !self.eat(SyntaxKind::COMMA) && !self.at(SyntaxKind::R_BRACK) {
@@ -806,12 +869,19 @@ impl<'a> Parser<'a> {
                     "expected `,` or `]` in list",
                     &[SyntaxKind::COMMA, SyntaxKind::R_BRACK],
                 );
-                // Consume the comma if recovery landed on it.
                 self.eat(SyntaxKind::COMMA);
             }
         }
         self.expect(SyntaxKind::R_BRACK);
         self.close();
+    }
+
+    /// Text of the current (non-trivia) token, or None at EOI. Used by
+    /// keyword-tail productions (`for`, `in`, `if`, `match`, `where`,
+    /// `with`) that the lexer doesn't split out.
+    fn current_text(&self) -> Option<&'a str> {
+        let idx = self.pos_skip_trivia();
+        self.tokens.get(idx).map(|(_, t)| *t)
     }
 
     fn parse_dict(&mut self) {
@@ -1142,6 +1212,42 @@ mod tests {
     }
 
     #[test]
+    fn list_comprehension_emits_comprehension_node() {
+        let parsed = parse_round_trip("{ xs: [x * 2 for x in src if x > 0] }");
+        assert!(!parsed.has_errors());
+        let comps: Vec<_> = parsed
+            .syntax()
+            .descendants()
+            .filter(|n| n.kind() == SyntaxKind::COMPREHENSION)
+            .collect();
+        assert_eq!(comps.len(), 1);
+        // The COMPREHENSION should NOT also be a LIST.
+        let lists: Vec<_> = parsed
+            .syntax()
+            .descendants()
+            .filter(|n| n.kind() == SyntaxKind::LIST)
+            .collect();
+        // The dict body is not a list, so the only [...] in source
+        // becomes a COMPREHENSION — no LIST nodes at top level.
+        assert!(
+            lists.is_empty(),
+            "comprehension `[...]` should not also produce a LIST"
+        );
+    }
+
+    #[test]
+    fn list_without_for_stays_list() {
+        let parsed = parse_round_trip("{ xs: [1, 2, 3] }");
+        assert!(!parsed.has_errors());
+        let lists: Vec<_> = parsed
+            .syntax()
+            .descendants()
+            .filter(|n| n.kind() == SyntaxKind::LIST)
+            .collect();
+        assert_eq!(lists.len(), 1);
+    }
+
+    #[test]
     fn typed_closure_param_records_type_node() {
         let parsed = parse_round_trip("{ add(Int a, Int b): a + b }");
         assert!(!parsed.has_errors());
@@ -1186,7 +1292,7 @@ mod tests {
         // Each P2 slice bumps the floor. At slice 1 (closures) we hit
         // ~60 of ~210 — the directive / match / where / type slices
         // will push this much higher.
-        const FLOOR: usize = 55;
+        const FLOOR: usize = 62;
         let clean = fixture_clean_parse_count();
         eprintln!("[parser] fixtures clean-parse count: {clean}");
         assert!(
