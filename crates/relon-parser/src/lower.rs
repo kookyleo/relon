@@ -1883,6 +1883,71 @@ fn lower_unary_expr_v2(node: &SyntaxNode, source: &str) -> Option<Node> {
     ))
 }
 
+/// Lower a `LIST` CST node into `Expr::List(items)`. Each child Expr
+/// is one item (regular value or SPREAD_EXPR).
+fn lower_list_v2(node: &SyntaxNode, source: &str) -> Option<Node> {
+    let r = node.text_range();
+    let start: usize = r.start().into();
+    let end: usize = r.end().into();
+    let mut items: Vec<Node> = Vec::new();
+    for child in node.children() {
+        if let Some(e) = ast::Expr::cast(child) {
+            items.push(lower_expr_v2(&e, source)?);
+        }
+    }
+    Some(Node::new(
+        Expr::List(items),
+        range_from_offsets(source, start, end),
+    ))
+}
+
+/// Lower a `COMPREHENSION` CST node into `Expr::Comprehension`.
+/// Children in source order: element Expr, then `for` IDENT bind, then
+/// iterable Expr, optional `if` cond Expr.
+fn lower_comprehension_v2(node: &SyntaxNode, source: &str) -> Option<Node> {
+    let r = node.text_range();
+    let start: usize = r.start().into();
+    let end: usize = r.end().into();
+
+    // Read the bound identifier (IDENT after `for`).
+    let mut id_text: Option<String> = None;
+    let mut after_for = false;
+    for el in node.children_with_tokens() {
+        if let Some(t) = el.into_token() {
+            if t.kind() == SyntaxKind::IDENT {
+                let txt = t.text();
+                if after_for && id_text.is_none() {
+                    id_text = Some(txt.to_string());
+                } else if txt == "for" {
+                    after_for = true;
+                }
+            }
+        }
+    }
+    let id = id_text?;
+
+    // Three Expr children: element, iterable, optional condition.
+    let mut exprs = node.children().filter_map(ast::Expr::cast);
+    let element_ast = exprs.next()?;
+    let iterable_ast = exprs.next()?;
+    let condition_ast = exprs.next();
+    let element = lower_expr_v2(&element_ast, source)?;
+    let iterable = lower_expr_v2(&iterable_ast, source)?;
+    let condition = match condition_ast {
+        Some(c) => Some(lower_expr_v2(&c, source)?),
+        None => None,
+    };
+    Some(Node::new(
+        Expr::Comprehension {
+            element,
+            id,
+            iterable,
+            condition,
+        },
+        range_from_offsets(source, start, end),
+    ))
+}
+
 /// Decode an F_STRING_LITERAL token's text. Non-raw f-strings honour
 /// the same escape set as normal strings (`\n`, `\t`, `\\`, `\u{...}`,
 /// `\"`, `\\<whitespace>` for line-continuation); raw f-strings (the
@@ -2368,9 +2433,9 @@ pub(crate) fn lower_expr_v2(expr: &ast::Expr, source: &str) -> Option<Node> {
         // hoisting onto the dict node — without re-implementing the
         // dict / list / spread machinery here.
         ast::Expr::Dict(d) => lower_expr_via_legacy(d.syntax(), source),
-        ast::Expr::List(l) => lower_expr_via_legacy(l.syntax(), source),
+        ast::Expr::List(l) => lower_list_v2(l.syntax(), source),
         ast::Expr::Spread(s) => lower_spread_expr_v2(s.syntax(), source),
-        ast::Expr::Comprehension(c) => lower_expr_via_legacy(c.syntax(), source),
+        ast::Expr::Comprehension(c) => lower_comprehension_v2(c.syntax(), source),
         // Slice 3: operators + calls. The legacy `parse_expr` already
         // routes binary precedence (`parse_pipe` → `parse_logic_or`
         // → ... → `parse_multiplicative`), unary, ternary, and
