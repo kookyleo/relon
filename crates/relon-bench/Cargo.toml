@@ -6,6 +6,13 @@ license.workspace = true
 description = "Micro-benchmarks for the Relon evaluator (parse + eval timings on canned sources)"
 publish = false
 
+[features]
+# Enable heap allocation profiling for `profile_alloc`. Off by default so
+# the workspace `cargo build` / `cargo test` paths stay free of the
+# profiler's global allocator override.
+dhat-heap = ["dep:dhat"]
+
 [dependencies]
 relon-parser = { workspace = true }
 relon-evaluator = { workspace = true }
+dhat = { version = "0.3", optional = true }
