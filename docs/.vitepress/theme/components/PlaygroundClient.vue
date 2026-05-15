@@ -40,7 +40,7 @@ import VPNavBarAppearance from 'vitepress/dist/client/theme-default/components/V
 import VPNavBarSocialLinks from 'vitepress/dist/client/theme-default/components/VPNavBarSocialLinks.vue';
 
 import { EditorState, Compartment } from '@codemirror/state';
-import { EditorView, keymap, lineNumbers, highlightActiveLine } from '@codemirror/view';
+import { EditorView, keymap, lineNumbers, highlightActiveLine, hoverTooltip, type Tooltip } from '@codemirror/view';
 import { defaultKeymap, history, historyKeymap, indentWithTab } from '@codemirror/commands';
 import { bracketMatching, indentOnInput, syntaxHighlighting, foldGutter, foldKeymap } from '@codemirror/language';
 import { setDiagnostics, type Diagnostic } from '@codemirror/lint';
@@ -102,6 +102,31 @@ interface WasmModule {
         line: number,
         character: number
     ) => RelonCompletion[];
+    hover: (
+        sources: unknown,
+        entry: string,
+        line: number,
+        character: number
+    ) => HoverResult | null;
+    signature_help: (
+        sources: unknown,
+        entry: string,
+        line: number,
+        character: number
+    ) => SignatureHelpResult | null;
+}
+
+interface HoverResult {
+    markdown: string;
+    range_start_offset: number;
+    range_end_offset: number;
+}
+
+interface SignatureHelpResult {
+    signature: string;
+    active_parameter: number;
+    range_start_offset: number;
+    range_end_offset: number;
 }
 
 export interface GotoDefinitionResult {
@@ -993,6 +1018,124 @@ function resolveCompletions(line: number, character: number): RelonCompletion[] 
     }
 }
 
+/// Hover tooltip extension. Translates CodeMirror's byte position to
+/// the LSP-style (line, character) the wasm `hover()` export expects,
+/// then renders the returned markdown inside a styled DOM tooltip.
+const relonHoverTooltip = hoverTooltip((view, pos) => {
+    const mod = wasmRef.value;
+    if (!mod) return null;
+    const lineObj = view.state.doc.lineAt(pos);
+    const line = lineObj.number - 1;
+    const character = pos - lineObj.from;
+    const sources = files.value.map((f) => ({ path: f.path, content: f.content }));
+    let result: HoverResult | null;
+    try {
+        result = mod.hover(sources, activeFile.value, line, character);
+    } catch {
+        return null;
+    }
+    if (!result) return null;
+    return {
+        pos: result.range_start_offset,
+        end: result.range_end_offset,
+        above: true,
+        create() {
+            const dom = document.createElement('div');
+            dom.className = 'rp-hover-tooltip';
+            dom.innerHTML = renderMarkdownToHtml(result!.markdown);
+            return { dom };
+        },
+    } satisfies Tooltip;
+});
+
+/// Signature-help: triggers on cursor moves inside a function call's
+/// argument list. CodeMirror doesn't have a native `signatureHelp`
+/// extension — we piggy-back on `hoverTooltip` with a wider trigger
+/// (the call's range) so the tooltip stays open across typing.
+const relonSignatureHelp = hoverTooltip(
+    (view, pos) => {
+        const mod = wasmRef.value;
+        if (!mod) return null;
+        const lineObj = view.state.doc.lineAt(pos);
+        const line = lineObj.number - 1;
+        const character = pos - lineObj.from;
+        const sources = files.value.map((f) => ({ path: f.path, content: f.content }));
+        let result: SignatureHelpResult | null;
+        try {
+            result = mod.signature_help(sources, activeFile.value, line, character);
+        } catch {
+            return null;
+        }
+        if (!result) return null;
+        return {
+            pos: result.range_start_offset,
+            end: result.range_end_offset,
+            above: true,
+            create() {
+                const dom = document.createElement('div');
+                dom.className = 'rp-sighelp-tooltip';
+                dom.textContent = result!.signature;
+                // Bold the active parameter. We split the rendered
+                // signature on commas inside the param list and wrap
+                // the matching slot in <strong>.
+                const sigDom = document.createElement('span');
+                const sig = result!.signature;
+                const open = sig.indexOf('(');
+                const close = sig.lastIndexOf(')');
+                if (open >= 0 && close > open) {
+                    const prefix = sig.slice(0, open + 1);
+                    const inside = sig.slice(open + 1, close);
+                    const suffix = sig.slice(close);
+                    const params = inside.split(/,(?![^<>]*>)/);
+                    sigDom.appendChild(document.createTextNode(prefix));
+                    params.forEach((p, i) => {
+                        if (i > 0) sigDom.appendChild(document.createTextNode(','));
+                        if (i === result!.active_parameter) {
+                            const strong = document.createElement('strong');
+                            strong.textContent = p;
+                            sigDom.appendChild(strong);
+                        } else {
+                            sigDom.appendChild(document.createTextNode(p));
+                        }
+                    });
+                    sigDom.appendChild(document.createTextNode(suffix));
+                    dom.replaceChildren(sigDom);
+                }
+                return { dom };
+            },
+        } satisfies Tooltip;
+    },
+    { hideOnChange: false },
+);
+
+/// Minimal Markdown → HTML for hover tooltips. The analyzer output
+/// uses a small vocabulary — `**bold**`, `_italic_`, fenced code
+/// blocks, and `---` separators. A real parser is overkill; this
+/// covers what `hover::resolve` actually emits.
+function renderMarkdownToHtml(md: string): string {
+    const esc = (s: string) => s
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;');
+    const blocks: string[] = [];
+    const parts = md.split(/(```relon\n[\s\S]*?\n```)/g);
+    for (const part of parts) {
+        if (part.startsWith('```relon')) {
+            const code = part.replace(/^```relon\n/, '').replace(/\n```$/, '');
+            blocks.push(`<pre><code>${esc(code)}</code></pre>`);
+        } else {
+            const html = esc(part)
+                .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+                .replace(/_([^_]+)_/g, '<em>$1</em>')
+                .replace(/`([^`]+)`/g, '<code>$1</code>')
+                .replace(/^---$/gm, '<hr>')
+                .replace(/\n\n+/g, '</p><p>');
+            blocks.push(`<p>${html}</p>`);
+        }
+    }
+    return blocks.join('');
+}
+
 /// Apply a goto-definition target: switch to the right tab (for
 /// cross-file jumps) and move the editor's selection to the target's
 /// range. The range covers the *key* of the resolved field (VS Code
@@ -1075,6 +1218,8 @@ onMounted(() => {
                 jump: applyGotoDef,
             }),
             relonAutocomplete(resolveCompletions),
+            relonHoverTooltip,
+            relonSignatureHelp,
             EditorView.lineWrapping,
             viewportPad,
             updateListener,
@@ -2776,5 +2921,65 @@ watch([files, entry, argsInput], () => {
   .rp-resizer {
     display: none;
   }
+}
+
+/* CodeMirror renders tooltip DOM outside the component scope; use
+   :deep() so scoped-style hashing doesn't strip the rules. */
+:deep(.rp-hover-tooltip) {
+  max-width: 480px;
+  padding: 8px 12px;
+  font-size: 12.5px;
+  line-height: 1.5;
+  background: var(--vp-c-bg-soft);
+  color: var(--vp-c-text-1);
+  border: 1px solid var(--vp-c-divider);
+  border-radius: 6px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.08);
+  overflow: hidden;
+}
+
+:deep(.rp-hover-tooltip p) {
+  margin: 0 0 6px;
+}
+
+:deep(.rp-hover-tooltip p:last-child) {
+  margin-bottom: 0;
+}
+
+:deep(.rp-hover-tooltip pre) {
+  margin: 6px 0;
+  padding: 6px 8px;
+  background: var(--vp-c-default-soft);
+  border-radius: 4px;
+  font-size: 12px;
+  overflow-x: auto;
+}
+
+:deep(.rp-hover-tooltip code) {
+  font-family: var(--vp-font-family-mono);
+  font-size: 12px;
+}
+
+:deep(.rp-hover-tooltip hr) {
+  border: 0;
+  border-top: 1px solid var(--vp-c-divider);
+  margin: 8px -12px;
+}
+
+:deep(.rp-sighelp-tooltip) {
+  padding: 6px 10px;
+  font-family: var(--vp-font-family-mono);
+  font-size: 12px;
+  line-height: 1.4;
+  background: var(--vp-c-bg-soft);
+  color: var(--vp-c-text-1);
+  border: 1px solid var(--vp-c-divider);
+  border-radius: 6px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.08);
+}
+
+:deep(.rp-sighelp-tooltip strong) {
+  color: var(--vp-c-brand-1);
+  font-weight: 600;
 }
 </style>
