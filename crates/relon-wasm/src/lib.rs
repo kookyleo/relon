@@ -877,6 +877,80 @@ fn signature_help_internal(
     })
 }
 
+/// A single find-references hit. `start`/`end` mirror the LSP-style
+/// `Position` shape so the browser caller can highlight or jump
+/// without re-walking the source.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReferenceLocation {
+    pub start_line: u32,
+    pub start_character: u32,
+    pub end_line: u32,
+    pub end_character: u32,
+    pub start_offset: u32,
+    pub end_offset: u32,
+}
+
+/// Resolve find-references at `(line, character)`. When the cursor
+/// sits on a reference site or a dict-field declaration, returns every
+/// in-file occurrence (plus the declaration when `include_declaration`
+/// is true). Returns `null` when the cursor isn't over a recognised
+/// symbol, and an empty array when the symbol has no references.
+#[wasm_bindgen]
+pub fn find_references(
+    sources: JsValue,
+    entry: &str,
+    line: u32,
+    character: u32,
+    include_declaration: bool,
+) -> Result<JsValue, JsValue> {
+    let sources = decode_sources(sources).map_err(err_to_js)?;
+    let result =
+        match find_references_internal(&sources, entry, line, character, include_declaration) {
+            Some(r) => r,
+            None => return Ok(JsValue::NULL),
+        };
+    let serializer = serde_wasm_bindgen::Serializer::new().serialize_maps_as_objects(true);
+    result.serialize(&serializer).map_err(|err| {
+        err_to_js(ErrorReport::invalid_input(format!(
+            "find_references result is not JS-serialisable: {err}"
+        )))
+    })
+}
+
+fn find_references_internal(
+    sources: &HashMap<String, String>,
+    entry: &str,
+    line: u32,
+    character: u32,
+    include_declaration: bool,
+) -> Option<Vec<ReferenceLocation>> {
+    let source = sources.get(entry)?;
+    let workspace = build_workspace(sources, entry, source);
+    let tree = workspace.modules.get(entry)?;
+    let root = workspace.nodes.get(entry)?;
+    let ranges = relon_analyzer::references::resolve(
+        source,
+        root,
+        tree,
+        line,
+        character,
+        include_declaration,
+    )?;
+    Some(
+        ranges
+            .into_iter()
+            .map(|r| ReferenceLocation {
+                start_line: r.start.line,
+                start_character: r.start.column as u32,
+                end_line: r.end.line,
+                end_character: r.end.column as u32,
+                start_offset: r.start.offset as u32,
+                end_offset: r.end.offset as u32,
+            })
+            .collect(),
+    )
+}
+
 /// Build the workspace tree for the given entry using the same
 /// in-memory + std loader chain as `goto_definition` / `complete`.
 /// Pulled out so hover / signature_help share the construction.

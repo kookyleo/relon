@@ -39,8 +39,8 @@ import VPNavBarTranslations from 'vitepress/dist/client/theme-default/components
 import VPNavBarAppearance from 'vitepress/dist/client/theme-default/components/VPNavBarAppearance.vue';
 import VPNavBarSocialLinks from 'vitepress/dist/client/theme-default/components/VPNavBarSocialLinks.vue';
 
-import { EditorState, Compartment } from '@codemirror/state';
-import { EditorView, keymap, lineNumbers, highlightActiveLine, hoverTooltip, type Tooltip } from '@codemirror/view';
+import { EditorState, Compartment, StateField, StateEffect, EditorSelection } from '@codemirror/state';
+import { EditorView, keymap, lineNumbers, highlightActiveLine, hoverTooltip, type Tooltip, Decoration, type DecorationSet } from '@codemirror/view';
 import { defaultKeymap, history, historyKeymap, indentWithTab } from '@codemirror/commands';
 import { bracketMatching, indentOnInput, syntaxHighlighting, foldGutter, foldKeymap } from '@codemirror/language';
 import { setDiagnostics, type Diagnostic } from '@codemirror/lint';
@@ -114,6 +114,22 @@ interface WasmModule {
         line: number,
         character: number
     ) => SignatureHelpResult | null;
+    find_references: (
+        sources: unknown,
+        entry: string,
+        line: number,
+        character: number,
+        include_declaration: boolean
+    ) => ReferenceLocation[] | null;
+}
+
+interface ReferenceLocation {
+    start_line: number;
+    start_character: number;
+    end_line: number;
+    end_character: number;
+    start_offset: number;
+    end_offset: number;
 }
 
 interface HoverResult {
@@ -1108,6 +1124,66 @@ const relonSignatureHelp = hoverTooltip(
     { hideOnChange: false },
 );
 
+/// Find-references state. Holds a `DecorationSet` of `.rp-ref-hit`
+/// marks. `setReferences` replaces it; any user-issued document change
+/// clears it (stale highlights confuse more than they help once the
+/// underlying source has moved).
+const setReferences = StateEffect.define<DecorationSet>();
+const clearReferences = StateEffect.define<null>();
+const referencesField = StateField.define<DecorationSet>({
+    create: () => Decoration.none,
+    update(deco, tr) {
+        let next = deco.map(tr.changes);
+        for (const e of tr.effects) {
+            if (e.is(setReferences)) next = e.value;
+            else if (e.is(clearReferences)) next = Decoration.none;
+        }
+        if (tr.docChanged && !tr.effects.some((e) => e.is(setReferences))) {
+            next = Decoration.none;
+        }
+        return next;
+    },
+    provide: (f) => EditorView.decorations.from(f),
+});
+const refMark = Decoration.mark({ class: 'rp-ref-hit' });
+
+/// Run find-references at the current cursor and paint hits. Bound to
+/// Shift-F12. Skips paint when there are zero results so the user
+/// doesn't get a silent no-op without feedback — instead we leave any
+/// existing highlights in place so consecutive Shift-F12s don't flicker.
+function findReferencesAtCursor(view: EditorView): boolean {
+    const mod = wasmRef.value;
+    if (!mod) return false;
+    const head = view.state.selection.main.head;
+    const lineObj = view.state.doc.lineAt(head);
+    const line = lineObj.number - 1;
+    const character = head - lineObj.from;
+    const sources = files.value.map((f) => ({ path: f.path, content: f.content }));
+    let hits: ReferenceLocation[] | null;
+    try {
+        hits = mod.find_references(sources, activeFile.value, line, character, true);
+    } catch {
+        return false;
+    }
+    if (!hits || hits.length === 0) return true;
+    const docLen = view.state.doc.length;
+    const marks = hits
+        .map((h) => ({
+            from: Math.min(h.start_offset, docLen),
+            to: Math.min(h.end_offset, docLen),
+        }))
+        .filter((r) => r.to > r.from)
+        .sort((a, b) => a.from - b.from)
+        .map((r) => refMark.range(r.from, r.to));
+    const deco = Decoration.set(marks);
+    view.dispatch({
+        effects: setReferences.of(deco),
+        selection: EditorSelection.single(marks[0].from, marks[0].to),
+        scrollIntoView: true,
+    });
+    return true;
+}
+
 /// Minimal Markdown → HTML for hover tooltips. The analyzer output
 /// uses a small vocabulary — `**bold**`, `_italic_`, fenced code
 /// blocks, and `---` separators. A real parser is overkill; this
@@ -1211,7 +1287,18 @@ onMounted(() => {
                     preventDefault: true,
                     run: () => { runFormat(); return true; },
                 },
+                {
+                    key: 'Shift-F12',
+                    preventDefault: true,
+                    run: findReferencesAtCursor,
+                },
+                {
+                    key: 'Alt-F8',
+                    preventDefault: true,
+                    run: findReferencesAtCursor,
+                },
             ]),
+            referencesField,
             langCompartment.of(relonLanguage()),
             gotoDefinitionExtension({
                 resolve: resolveGotoDef,
@@ -2981,5 +3068,13 @@ watch([files, entry, argsInput], () => {
 :deep(.rp-sighelp-tooltip strong) {
   color: var(--vp-c-brand-1);
   font-weight: 600;
+}
+
+/* Shift-F12 / Alt-F8 find-references hit overlay. Tinted brand colour
+   so it's visible in both light and dark themes without competing with
+   the selection's own background. */
+:deep(.rp-ref-hit) {
+  background: color-mix(in srgb, var(--vp-c-brand-1) 22%, transparent);
+  border-radius: 2px;
 }
 </style>
