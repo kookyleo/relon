@@ -16,3 +16,25 @@ dhat-heap = ["dep:dhat"]
 relon-parser = { workspace = true }
 relon-evaluator = { workspace = true }
 dhat = { version = "0.3", optional = true }
+
+[dev-dependencies]
+# Criterion 0.5.x: stage P0 measurement infra. Provides per-dimension
+# corpus + statistical report (mean / median / stddev / outliers).
+# Pinned to 0.5 to avoid upstream churn (0.6+ API / wasm tweaks).
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+
+# Method-dispatch group uses `#main(List<Int> xs) ... xs.map((n) => n * 2)`
+# so the receiver type is known statically — that requires the analyzer to
+# resolve `.map` against the core `List` schema. Pulled in as a dev-dep so
+# it does not leak into the (non-test) bench binary surface.
+relon-analyzer = { workspace = true }
+
+# `main.rs` is kept as a quick-eyeball binary (single cold run + 1000-iter
+# steady-state mean, same shape as the legacy output) so contributors can
+# read absolute magnitudes without spinning up the full criterion sampler.
+# For serious measurement run `cargo bench -p relon-bench` (group below).
+
+[[bench]]
+name = "harness_v1"
+harness = false
+path = "benches/harness_v1.rs"
