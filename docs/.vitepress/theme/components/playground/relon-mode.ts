@@ -41,8 +41,10 @@ import {
     LanguageSupport,
     HighlightStyle,
     syntaxHighlighting,
+    indentService,
     type StreamParser,
 } from '@codemirror/language';
+import { EditorState } from '@codemirror/state';
 import { tags as t } from '@lezer/highlight';
 
 // Hash-prefixed keywords. Order is irrelevant; `Set.has` lookup.
@@ -423,8 +425,49 @@ export const playgroundHighlightStyle = HighlightStyle.define([
     { tag: t.definition(t.propertyName), class: 'cm-r-property' },
 ]);
 
+/// Bracket-aware indent rule. Looks at the previous non-blank line:
+///   - ends with an unclosed `{` / `[` / `(` → indent one level deeper
+///   - otherwise → match the previous line's indent
+/// Then dedents the current line one level when it starts with
+/// `}` / `]` / `)`. Mirrors what every JS / Rust / Python IDE does.
+const relonIndent = indentService.of((context, pos) => {
+    const line = context.state.doc.lineAt(pos);
+    const lineText = line.text;
+    if (line.number <= 1) return 0;
+
+    // Walk back to the nearest preceding non-blank line.
+    let prevLineNo = line.number - 1;
+    let prevText = context.state.doc.line(prevLineNo).text;
+    while (prevLineNo > 1 && prevText.trim() === '') {
+        prevLineNo -= 1;
+        prevText = context.state.doc.line(prevLineNo).text;
+    }
+    const prevIndent = prevText.match(/^\s*/)?.[0].length ?? 0;
+
+    // Strip trailing line comments + whitespace to see the line's
+    // last syntactic character.
+    const stripped = prevText.replace(/\/\/.*$/, '').trimEnd();
+    let target = prevIndent;
+    if (/[{[(]$/.test(stripped)) {
+        target += context.unit;
+    }
+
+    // Lines starting with a closing bracket dedent one level.
+    if (/^\s*[}\])]/.test(lineText)) {
+        target = Math.max(0, target - context.unit);
+    }
+    return target;
+});
+
 export function relonLanguage(): LanguageSupport {
     return new LanguageSupport(StreamLanguage.define(parser), [
         syntaxHighlighting(playgroundHighlightStyle),
+        relonIndent,
+        // Triggers `indentOnInput()` to re-indent the current line
+        // when one of these characters is typed — so typing `}`
+        // snaps the line back to the matching opener's column.
+        EditorState.languageData.of(() => [{
+            indentOnInput: /^\s*[}\])]$/,
+        }]),
     ]);
 }
