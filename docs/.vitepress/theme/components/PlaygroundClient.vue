@@ -38,6 +38,8 @@ import VPNavBarMenu from 'vitepress/dist/client/theme-default/components/VPNavBa
 import VPNavBarTranslations from 'vitepress/dist/client/theme-default/components/VPNavBarTranslations.vue';
 import VPNavBarAppearance from 'vitepress/dist/client/theme-default/components/VPNavBarAppearance.vue';
 import VPNavBarSocialLinks from 'vitepress/dist/client/theme-default/components/VPNavBarSocialLinks.vue';
+import VPNavBarHamburger from 'vitepress/dist/client/theme-default/components/VPNavBarHamburger.vue';
+import VPNavScreen from 'vitepress/dist/client/theme-default/components/VPNavScreen.vue';
 
 import { EditorState, Compartment, StateField, StateEffect, EditorSelection } from '@codemirror/state';
 import { EditorView, keymap, lineNumbers, highlightActiveLine, hoverTooltip, type Tooltip, Decoration, type DecorationSet, ViewPlugin, type ViewUpdate, WidgetType } from '@codemirror/view';
@@ -292,6 +294,14 @@ const activeWorkspace = computed<Workspace | null>(() =>
 // items just additionally render a `−` delete control on the right.
 const sourceMenuOpen = ref<boolean>(false);
 const sourceMenuRoot = ref<HTMLElement | null>(null);
+
+// Mobile nav (hamburger + VPNavScreen overlay). Mirrors the
+// VitePress home-page behaviour: at narrow viewports the wide-screen
+// nav cluster (`VPNavBarMenu` / `VPNavBarTranslations` / etc.) self-
+// hides and a ☰ button takes over. Toggling the button slides down
+// `VPNavScreen`, which reads from the same VitePress nav config so
+// the menu options match the rest of the docs exactly.
+const mobileNavOpen = ref<boolean>(false);
 
 const activeSourceLabel = computed<string>(() => {
     if (sourceMode.value === 'workspace' && activeWorkspace.value) return activeWorkspace.value.name;
@@ -1732,7 +1742,10 @@ watch([files, entry, argsInput], () => {
   <div class="relon-playground">
     <header class="rp-status">
       <a class="rp-brand" href="../" aria-label="Relon home">
-        <img class="rp-brand-logo" :src="withBase('/logo-mini.svg')" alt="" />
+        <!-- Plain `{R}` text instead of the framed SVG. At 20px the
+             inline glyph reads cleaner than the rounded-rect logo,
+             and skips an asset request + per-pixel centring puzzle. -->
+        <span class="rp-brand-logo" aria-hidden="true">{R}</span>
         <span class="rp-brand-name">Relon</span>
       </a>
       <div ref="sourceMenuRoot" class="rp-source-wrap">
@@ -1846,8 +1859,20 @@ watch([files, entry, argsInput], () => {
         <VPNavBarTranslations class="translations" />
         <VPNavBarAppearance class="appearance" />
         <VPNavBarSocialLinks class="social-links" />
+        <VPNavBarHamburger
+          class="rp-navbar-hamburger"
+          :active="mobileNavOpen"
+          @click="mobileNavOpen = !mobileNavOpen"
+        />
       </div>
     </header>
+
+    <!-- `VPNavScreen` is `position: fixed` so it doesn't matter where
+         in the DOM we mount it — but keep it outside `.rp-status` so
+         the header's overflow / stacking context doesn't clip the
+         overlay. Reads from the shared VitePress nav config; matching
+         the home-page drawer is automatic. -->
+    <VPNavScreen :open="mobileNavOpen" />
 
     <div
       ref="panesEl"
@@ -2148,6 +2173,15 @@ watch([files, entry, argsInput], () => {
    when VitePress toggles `:root.dark`. Hex values picked to keep
    AA contrast (≥4.5:1) against `--vp-c-bg` in each mode. */
 .relon-playground {
+  /* Our top header (`.rp-status`) is shorter than VitePress's stock
+     64px navbar. Override the variable VPNavScreen reads when
+     positioning its `top` so the slide-down drawer hugs the bottom
+     of our header rather than leaving a 20px strip of editor visible
+     above it. The status row is `min-height: 44px` with a 1px border
+     below — 46px total when fully populated, but `--vp-nav-height`
+     also gates VPNavScreen's `padding-top` for its first item so
+     leaving a couple of pixels of breathing room reads well. */
+  --vp-nav-height: 46px;
   --rp-c-comment: #8a6f47;
   --rp-c-string:  #a31515;
   --rp-c-number:  #117a4f;
@@ -2267,11 +2301,22 @@ watch([files, entry, argsInput], () => {
 }
 
 .rp-brand-logo {
-  width: 20px;
-  height: 20px;
   margin: 0 8px;
   align-self: center;
-  display: block;
+  display: inline-flex;
+  align-items: center;
+  /* Use the literal Relon logo green rather than `--vp-c-brand-1`,
+     which the docs theme currently leaves at VitePress's default
+     blue. Matches the colours used inside `logo-mini.svg`. */
+  color: #3e8a50;
+  font-family: var(--vp-font-family-mono);
+  font-weight: 700;
+  font-size: 13px;
+  letter-spacing: -0.02em;
+  line-height: 1;
+  /* Pure decoration; don't snag triple-click selections aimed at the
+     source title beside it. */
+  user-select: none;
 }
 
 .rp-brand-name {
@@ -2462,12 +2507,32 @@ watch([files, entry, argsInput], () => {
   margin-left: 12px;
 }
 
-.rp-navbar :deep(.VPNavBarMenu),
-.rp-navbar :deep(.VPNavBarTranslations),
-.rp-navbar :deep(.VPNavBarAppearance),
-.rp-navbar :deep(.VPNavBarSocialLinks) {
-  display: flex;
-  align-items: center;
+/* Force flex only at desktop widths. Below 768px each VitePress
+   navbar component self-hides via its own internal `@media (max-width:
+   767px) { display: none }` rule; without this width-gate, the
+   playground's :deep selector would override that hide and the
+   "Home" link would keep leaking into the narrow-viewport header,
+   even though the right place for it is inside the hamburger
+   drawer (`VPNavScreen`). */
+@media (min-width: 768px) {
+  .rp-navbar :deep(.VPNavBarMenu),
+  .rp-navbar :deep(.VPNavBarTranslations),
+  .rp-navbar :deep(.VPNavBarAppearance),
+  .rp-navbar :deep(.VPNavBarSocialLinks) {
+    display: flex;
+    align-items: center;
+  }
+}
+
+/* CodeMirror's `.cm-editor` creates its own stacking context (via
+   `transform` / `contain`), so a sibling `position: fixed` element
+   with the default `z-index: auto` slides BEHIND the editor rather
+   than over it. Pin VPNavScreen above every playground layer so the
+   slide-down drawer covers the editor as VitePress's stock layout
+   does for the docs pages. 60 leaves headroom for native dialogs
+   (which we mount with `<dialog>`'s implicit top-layer). */
+:deep(.VPNavScreen) {
+  z-index: 60;
 }
 
 /* The default VPNavBarMenuLink renders at `font-weight: 500` and
