@@ -14,7 +14,6 @@ use crate::eval::{is_private_field, Evaluator};
 use crate::scope::{ListContext, Scope, Thunk};
 use crate::value::Value;
 use relon_parser::{Expr, Node, RefBase, TokenKey, TokenRange};
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 /// Result of looking up a single dict key during reference path resolution.
@@ -438,13 +437,10 @@ impl Evaluator {
                 .and_then(|r| r.parent_fallback.clone());
             Arc::new(Scope {
                 parent,
-                path_node: None,
-                locals: Mutex::new(HashMap::new()),
                 current_dir: original_scope.current_dir.clone(),
                 cache_namespace: original_scope.cache_namespace.clone(),
                 root_ref: original_scope.root_ref.clone(),
-                list_context: None,
-                thunks: Mutex::new(HashMap::new()),
+                ..Default::default()
             })
         });
 

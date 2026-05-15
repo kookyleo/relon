@@ -705,9 +705,7 @@ impl Evaluator {
                     other => other,
                 })?;
             scope
-                .locals
-                .lock()
-                .unwrap()
+                .locals_for_write()
                 .insert(param.name.clone(), value);
         }
         if let Some((extra_name, _)) = args.into_iter().next() {
@@ -775,7 +773,7 @@ impl Evaluator {
             // schema body (`@schema(Tree={ children: List<Tree> })`)
             // can resolve the in-flight name during predicate building.
             // Same trick `prepare_dict_scope` uses for the field-form.
-            scope.locals.lock().unwrap().insert(
+            scope.locals_for_write().insert(
                 decl.name.clone(),
                 Value::Schema {
                     // v1.8+ fix (issue 4): the placeholder uses the
@@ -816,9 +814,7 @@ impl Evaluator {
                 }
             };
             scope
-                .locals
-                .lock()
-                .unwrap()
+                .locals_for_write()
                 .insert(decl.name.clone(), value);
         }
         Ok(())
@@ -955,13 +951,11 @@ impl Evaluator {
 
                 let mut dict_scope = Arc::new(Scope {
                     parent: Some(Arc::clone(&current_scope)),
-                    path_node: None,
-                    locals: Mutex::new(HashMap::new()),
                     current_dir: current_scope.current_dir.clone(),
                     cache_namespace: current_scope.cache_namespace.clone(),
                     root_ref: current_scope.root_ref.clone(),
                     list_context: current_scope.list_context.clone(),
-                    thunks: Mutex::new(HashMap::new()),
+                    ..Default::default()
                 });
 
                 if is_root {
@@ -983,9 +977,7 @@ impl Evaluator {
                                 for (k, v) in d.map.iter() {
                                     map.insert(k.clone(), v.clone());
                                     dict_scope
-                                        .locals
-                                        .lock()
-                                        .unwrap()
+                                        .locals_for_write()
                                         .insert(k.clone(), v.clone());
                                 }
                             } else {
@@ -1033,7 +1025,7 @@ impl Evaluator {
                             if !is_private_field(value_node) {
                                 map.insert(key_str.clone(), val.clone());
                             }
-                            dict_scope.locals.lock().unwrap().insert(key_str, val);
+                            dict_scope.locals_for_write().insert(key_str, val);
                         }
                     }
                 }
@@ -2427,19 +2419,15 @@ impl Evaluator {
         };
         let bindings_scope = Arc::new(Scope {
             parent: Some(Arc::clone(captured_env)),
-            path_node: None,
             locals: Mutex::new(bindings),
             current_dir: captured_env.current_dir.clone(),
             cache_namespace: call_namespace,
             root_ref: captured_env.root_ref.clone(),
-            list_context: None,
-            thunks: Mutex::new(HashMap::new()),
+            ..Default::default()
         });
         let body_arc = Arc::new(body.clone());
         let body_scope = Arc::new(Scope {
             parent: Some(Arc::clone(&bindings_scope)),
-            path_node: None,
-            locals: Mutex::new(HashMap::new()),
             current_dir: bindings_scope.current_dir.clone(),
             cache_namespace: bindings_scope.cache_namespace.clone(),
             root_ref: Some(crate::scope::RootRef {
@@ -2447,8 +2435,7 @@ impl Evaluator {
                 scope: None,
                 parent_fallback: Some(bindings_scope.clone()),
             }),
-            list_context: None,
-            thunks: Mutex::new(HashMap::new()),
+            ..Default::default()
         });
         self.eval(&body_arc, &body_scope)
     }
@@ -2476,7 +2463,7 @@ impl Evaluator {
             // again to actually build each schema's value.
             let mut seeded: HashSet<&str> = HashSet::new();
             {
-                let mut locals = scope.locals.lock().unwrap();
+                let mut locals = scope.locals_for_write();
                 for dir in &node.directives {
                     if dir.name != crate::decorator_names::SCHEMA {
                         continue;
@@ -2515,7 +2502,7 @@ impl Evaluator {
                     continue;
                 }
                 let val = self.lower_schema_binding(name, generics, body, scope)?;
-                scope.locals.lock().unwrap().insert(name.clone(), val);
+                scope.locals_for_write().insert(name.clone(), val);
             }
 
             for (key, value_node) in pairs {
@@ -2563,7 +2550,7 @@ impl Evaluator {
                                     .collect();
                             }
                         }
-                        scope.locals.lock().unwrap().insert(
+                        scope.locals_for_write().insert(
                             key_str.clone(),
                             Value::Schema {
                                 generics,
@@ -2572,7 +2559,7 @@ impl Evaluator {
                         );
                     }
                     let val = self.eval(value_node, scope)?;
-                    scope.locals.lock().unwrap().insert(key_str, val);
+                    scope.locals_for_write().insert(key_str, val);
                 }
             }
         }
@@ -2619,7 +2606,7 @@ impl Evaluator {
             entries.push((key_str, value_node.clone()));
         }
 
-        let mut thunks = scope.thunks.lock().unwrap();
+        let mut thunks = scope.thunks_for_write();
         for (key_str, value_node) in entries {
             let item_scope = scope.with_path(key_str.clone());
             let path = item_scope.full_path();
