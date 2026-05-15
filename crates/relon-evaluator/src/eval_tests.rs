@@ -1452,7 +1452,7 @@ fn test_brand_decorator_at_document_root() {
     let outer_scope = std::sync::Arc::new(Scope::default());
     outer_scope
         .locals_for_write()
-        .insert("Weather".to_string(), weather_schema);
+        .insert(std::sync::Arc::from("Weather"), weather_schema);
 
     let result = Evaluator::new(std::sync::Arc::clone(&ctx))
         .eval_root(&outer_scope)

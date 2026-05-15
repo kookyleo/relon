@@ -707,7 +707,7 @@ impl Evaluator {
                 })?;
             scope
                 .locals_for_write()
-                .insert(param.name.clone(), value);
+                .insert(Arc::from(param.name.as_str()), value);
         }
         if let Some((extra_name, _)) = args.into_iter().next() {
             return Err(RuntimeError::UnexpectedMainArg {
@@ -775,7 +775,7 @@ impl Evaluator {
             // can resolve the in-flight name during predicate building.
             // Same trick `prepare_dict_scope` uses for the field-form.
             scope.locals_for_write().insert(
-                decl.name.clone(),
+                Arc::from(decl.name.as_str()),
                 Value::Schema {
                     // v1.8+ fix (issue 4): the placeholder uses the
                     // real generic param names so a recursive body
@@ -816,7 +816,7 @@ impl Evaluator {
             };
             scope
                 .locals_for_write()
-                .insert(decl.name.clone(), value);
+                .insert(Arc::from(decl.name.as_str()), value);
         }
         Ok(())
     }
@@ -979,7 +979,7 @@ impl Evaluator {
                                     map.insert(k.clone(), v.clone());
                                     dict_scope
                                         .locals_for_write()
-                                        .insert(k.clone(), v.clone());
+                                        .insert(Arc::from(k.as_str()), v.clone());
                                 }
                             } else {
                                 return Err(RuntimeError::TypeMismatch {
@@ -1026,7 +1026,9 @@ impl Evaluator {
                             if !is_private_field(value_node) {
                                 map.insert(key_str.clone(), val.clone());
                             }
-                            dict_scope.locals_for_write().insert(key_str, val);
+                            dict_scope
+                                .locals_for_write()
+                                .insert(Arc::from(key_str), val);
                         }
                     }
                 }
@@ -1065,10 +1067,17 @@ impl Evaluator {
                 // were the second-biggest line item in the dhat
                 // attribution table).
                 let mut result: Vec<Value> = Vec::with_capacity(items.len());
+                // Intern the loop variable name once: each iteration
+                // rebinds it under a fresh child scope, so without this
+                // hoist we were paying one `String::clone` (malloc +
+                // memcpy) per element. After interning, the inner loop
+                // only bumps an `Arc` refcount per element — the
+                // `with_local` call below feeds the cloned `Arc` into
+                // the child scope's bindings table, which is the only
+                // HashMap allocation that survives this loop body.
+                let id_arc: Arc<str> = Arc::from(id.as_str());
                 for item in items.iter() {
-                    let mut iter_scope_map = HashMap::new();
-                    iter_scope_map.insert(id.clone(), item.clone());
-                    let iter_scope = current_scope.with_locals(iter_scope_map);
+                    let iter_scope = current_scope.with_local(Arc::clone(&id_arc), item.clone());
 
                     let should_include = if let Some(cond) = condition {
                         self.eval(cond, &iter_scope)?.is_truthy()
@@ -1182,8 +1191,11 @@ impl Evaluator {
             Expr::Where { expr, bindings } => {
                 let bindings_val = self.eval(bindings, &current_scope)?;
                 if let Value::Dict(d) = bindings_val {
-                    let map_as_hashmap: std::collections::HashMap<String, Value> =
-                        d.map.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                    let map_as_hashmap: std::collections::HashMap<Arc<str>, Value> = d
+                        .map
+                        .iter()
+                        .map(|(k, v)| (Arc::from(k.as_str()), v.clone()))
+                        .collect();
                     let local_scope = current_scope.with_locals(map_as_hashmap);
                     self.eval(expr, &local_scope)
                 } else {
@@ -1495,15 +1507,15 @@ impl Evaluator {
     ) -> Result<Arc<Scope>, RuntimeError> {
         use relon_parser::DirectiveImportSpec;
         let evaluated_module = self.load_module(path, scope, range)?;
-        let mut new_locals = HashMap::new();
+        let mut new_locals: HashMap<Arc<str>, Value> = HashMap::new();
         match spec {
             DirectiveImportSpec::Alias(name) => {
-                new_locals.insert(name.clone(), evaluated_module);
+                new_locals.insert(Arc::from(name.as_str()), evaluated_module);
             }
             DirectiveImportSpec::Spread => {
                 if let Value::Dict(d) = evaluated_module {
                     for (k, v) in d.map.iter() {
-                        new_locals.insert(k.clone(), v.clone());
+                        new_locals.insert(Arc::from(k.as_str()), v.clone());
                     }
                 } else {
                     return Err(RuntimeError::TypeMismatch {
@@ -1522,7 +1534,10 @@ impl Evaluator {
                     });
                 };
                 for (name, alias) in entries {
-                    let local_name = alias.clone().unwrap_or_else(|| name.clone());
+                    let local_name: Arc<str> = match alias {
+                        Some(a) => Arc::from(a.as_str()),
+                        None => Arc::from(name.as_str()),
+                    };
                     let Some(v) = d.map.get(name) else {
                         return Err(RuntimeError::VariableNotFound(
                             format!("`{name}` not exported by `{path}`"),
@@ -2284,9 +2299,9 @@ impl Evaluator {
         scope: &Arc<Scope>,
         _range: TokenRange,
     ) -> Result<Value, RuntimeError> {
-        let mut bindings: HashMap<String, Value> = HashMap::new();
+        let mut bindings: HashMap<Arc<str>, Value> = HashMap::new();
         if let Some(self_val) = receiver {
-            bindings.insert("self".to_string(), self_val);
+            bindings.insert(Arc::from("self"), self_val);
         }
         // Positional binding: skip `self` (which is implicit), so the
         // i-th positional arg lands on `params[i].name`.
@@ -2296,7 +2311,10 @@ impl Evaluator {
                 continue;
             }
             if pos_idx < params.len() {
-                bindings.insert(params[pos_idx].name.clone(), arg.value.clone());
+                bindings.insert(
+                    Arc::from(params[pos_idx].name.as_str()),
+                    arg.value.clone(),
+                );
                 pos_idx += 1;
             }
         }
@@ -2304,7 +2322,7 @@ impl Evaluator {
         // `eval_closure`).
         for arg in args {
             if let Some(name) = &arg.name {
-                bindings.insert(name.clone(), arg.value.clone());
+                bindings.insert(Arc::from(name.as_str()), arg.value.clone());
             }
         }
         let method_scope = scope.with_locals(bindings);
@@ -2385,12 +2403,12 @@ impl Evaluator {
         captured_env: &Arc<Scope>,
         range: TokenRange,
     ) -> Result<Value, RuntimeError> {
-        let mut bindings = HashMap::new();
+        let mut bindings: HashMap<Arc<str>, Value> = HashMap::new();
         let mut pos_idx = 0;
         for arg in &args {
             if arg.name.is_none() {
                 if pos_idx < params.len() {
-                    bindings.insert(params[pos_idx].clone(), arg.value.clone());
+                    bindings.insert(Arc::from(params[pos_idx].as_str()), arg.value.clone());
                     pos_idx += 1;
                 } else {
                     return Err(RuntimeError::TypeMismatch {
@@ -2406,13 +2424,13 @@ impl Evaluator {
                 if !params.contains(name) {
                     return Err(RuntimeError::VariableNotFound(name.clone(), range));
                 }
-                if bindings.contains_key(name) {
+                if bindings.contains_key(name.as_str()) {
                     return Err(RuntimeError::UnsupportedOperator(
                         format!("Duplicate {}", name),
                         range,
                     ));
                 }
-                bindings.insert(name.clone(), arg.value.clone());
+                bindings.insert(Arc::from(name.as_str()), arg.value.clone());
             }
         }
         if bindings.len() < params.len() {
@@ -2491,11 +2509,11 @@ impl Evaluator {
                     else {
                         continue;
                     };
-                    if locals.contains_key(name) {
+                    if locals.contains_key(name.as_str()) {
                         continue;
                     }
                     locals.insert(
-                        name.clone(),
+                        Arc::from(name.as_str()),
                         Value::Schema {
                             generics: generics.clone(),
                             fields: HashMap::new(),
@@ -2521,7 +2539,9 @@ impl Evaluator {
                     continue;
                 }
                 let val = self.lower_schema_binding(name, generics, body, scope)?;
-                scope.locals_for_write().insert(name.clone(), val);
+                scope
+                    .locals_for_write()
+                    .insert(Arc::from(name.as_str()), val);
             }
 
             for (key, value_node) in pairs {
@@ -2570,7 +2590,7 @@ impl Evaluator {
                             }
                         }
                         scope.locals_for_write().insert(
-                            key_str.clone(),
+                            Arc::from(key_str.as_str()),
                             Value::Schema {
                                 generics,
                                 fields: HashMap::new(),
@@ -2578,7 +2598,9 @@ impl Evaluator {
                         );
                     }
                     let val = self.eval(value_node, scope)?;
-                    scope.locals_for_write().insert(key_str, val);
+                    scope
+                        .locals_for_write()
+                        .insert(Arc::from(key_str), val);
                 }
             }
         }
@@ -2631,7 +2653,7 @@ impl Evaluator {
             let path = item_scope.full_path();
             let cache_key = item_scope.path_cache_key(&path);
             thunks.insert(
-                key_str,
+                Arc::from(key_str),
                 Arc::new(Thunk::new(value_node, item_scope, path, cache_key)),
             );
         }
