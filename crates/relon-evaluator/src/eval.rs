@@ -8,6 +8,7 @@ use relon_parser::{
     is_builtin_type_name, parse_document, CallArg, Decorator as DecoratorNode, Expr, FStringPart,
     Node, Operator, TokenKey, TokenRange,
 };
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -1064,7 +1065,14 @@ impl Evaluator {
                 // Anything else is an error — same diagnostic shape as
                 // before, just with an updated `expected` slot.
                 let items = self.materialize_iterable(&iter_val, iterable.range)?;
-                let mut result = Vec::new();
+                // Pre-size the result. Without a filter, length is
+                // exact; with a filter, `items.len()` is an upper
+                // bound and over-allocating is still cheaper than the
+                // ~log2(n) doubling steps a `Vec::new()` would incur
+                // (the eight grow steps on a 1000-elem comprehension
+                // were the second-biggest line item in the dhat
+                // attribution table).
+                let mut result: Vec<Value> = Vec::with_capacity(items.len());
                 for item in items.iter() {
                     let mut iter_scope_map = HashMap::new();
                     iter_scope_map.insert(id.clone(), item.clone());
@@ -2152,17 +2160,21 @@ impl Evaluator {
     /// turned into an iterator — surfaces a `TypeMismatch` whose
     /// `expected` slot now reads "List or Iter" so the user can wire
     /// in the missing `.iter()` call.
-    fn materialize_iterable(
+    fn materialize_iterable<'a>(
         &self,
-        value: &Value,
+        value: &'a Value,
         range: TokenRange,
-    ) -> Result<Vec<Value>, RuntimeError> {
-        // Legacy fast path: a literal `[1, 2, 3]` / `xs` of type
-        // `List<T>` lands here without ever building an `Iter`. Saves
-        // both a host-call into `IterFromList` and the post-loop
-        // re-collection that an `Iter`-wrapped version would force.
+    ) -> Result<Cow<'a, [Value]>, RuntimeError> {
+        // Fast path: a literal `[1, 2, 3]` / `xs` of type `List<T>`
+        // lands here without ever being wrapped in `Iter`. Return a
+        // borrowed slice so the comprehension loop avoids cloning the
+        // whole backing `Vec<Value>` — the loop already does its own
+        // per-item `clone()` when binding the iteration variable into
+        // the scope, so the intermediate `Vec` was pure waste. dhat
+        // attribution flagged this site as the dominant allocator in
+        // the `stdlib::Range` / comprehension bucket.
         if let Value::List(items) = value {
-            return Ok(items.iter().cloned().collect());
+            return Ok(Cow::Borrowed(items.as_slice()));
         }
         // Decision 21' Iter representation: branded dict with
         // `_kind` + `_source` fields. We deliberately recurse through
@@ -2203,7 +2215,12 @@ impl Evaluator {
                                 })
                             }
                         };
-                        Ok(items.iter().cloned().collect())
+                        // Same zero-clone borrow as the top-level
+                        // `Value::List` fast path — works because
+                        // `items` is an `Arc<Vec<Value>>` owned by the
+                        // input `value`, whose lifetime `'a` outlives
+                        // the returned `Cow`.
+                        Ok(Cow::Borrowed(items.as_slice()))
                     }
                     "string" => {
                         let s = match source {
@@ -2216,7 +2233,9 @@ impl Evaluator {
                                 })
                             }
                         };
-                        Ok(s.chars().map(|c| Value::String(c.to_string())).collect())
+                        Ok(Cow::Owned(
+                            s.chars().map(|c| Value::String(c.to_string())).collect(),
+                        ))
                     }
                     "dict_entries" => {
                         let src_dict = match source {
@@ -2233,15 +2252,15 @@ impl Evaluator {
                         // matches `Dict.keys()` / `Dict.values()`.
                         let mut keys: Vec<&String> = src_dict.map.keys().collect();
                         keys.sort();
-                        Ok(keys
-                            .into_iter()
-                            .filter_map(|k| {
-                                src_dict
-                                    .map
-                                    .get(k)
-                                    .map(|v| Value::list(vec![Value::String(k.clone()), v.clone()]))
-                            })
-                            .collect())
+                        Ok(Cow::Owned(
+                            keys.into_iter()
+                                .filter_map(|k| {
+                                    src_dict.map.get(k).map(|v| {
+                                        Value::list(vec![Value::String(k.clone()), v.clone()])
+                                    })
+                                })
+                                .collect(),
+                        ))
                     }
                     other => Err(RuntimeError::TypeMismatch {
                         expected: "Iter._kind in {list, string, dict_entries}".to_string(),
