@@ -72,7 +72,19 @@ impl Evaluator {
         } else {
             return Err(RuntimeError::VariableNotFound(first_name, range));
         };
-        let mut parts = vec![first_name.clone()];
+        // Fast path: single-segment variable references (`x`, the
+        // dominant shape in comprehension bodies) don't need the
+        // diagnostic `parts` vector at all — `current_val` is already
+        // the answer. dhat showed the unconditional `vec![first_name]`
+        // landing as ~7 MB / 300 K blocks across the resolve_variable
+        // call sites in the comprehension hot loop.
+        if path.len() == 1 {
+            return Ok(current_val);
+        }
+        // Multi-segment path: build the diagnostic vector. `first_name`
+        // is moved (not cloned) into the head so the success branch
+        // doesn't pay an extra allocation.
+        let mut parts = vec![first_name];
         for part in &path[1..] {
             let is_optional = part.is_optional();
             // Decision 22 (Indexable lowering): when this segment is a
