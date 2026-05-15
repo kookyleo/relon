@@ -291,8 +291,43 @@ helper API seam 已在 `scope.rs` 留下，为后续工作减少改造面。
 | 1 | `Scope::child` Mutex 去除 | **判定无效**——alloc 不在 Mutex 上，留 seam 等下一阶段做"hot loop 复用" |
 | 2 | `stdlib::Range` lazy | **降级落地为 narrow path (a)**（P1-A，cherry-pick `4413295`），干掉了 `materialize_iterable` 的中转 clone |
 | 3 | comprehension Vec `with_capacity` | **已落地**（P1-A 同 commit），cap 来自 items.len() |
-| 4 | 字符串 interner | **P1-C 排队中**——comprehension 52% 单项命中 `String::clone` × 10w，仍是 dhat 端实证最大单项 |
+| 4 | 字符串 interner | **已落地**（P1-C，merge `60244c5`）；见下节 P1-C 二次诊断更正 |
 | 5-7 | Context 复用 / BTreeMap→IndexMap / path_cache_key | 不变，等后续 wave |
+
+### P1-C 已落地 + **二次诊断更正**（merge `60244c5`）
+
+> 原归因报告 §"comprehension workload" 把 "**52% / 279 MB 在 `eval.rs:1070`**"
+> 描述为"`id.clone()` × 10 万次 `String::clone`"。**这条聚合视图实测仅对部分。**
+
+P1-C 实施时把 `Locals` / `Thunks` 内部类型从 `HashMap<String, V>` 改为
+`HashMap<Arc<str>, V>`、comprehension hot loop 的 `id` 在循环外建一次
+`Arc<str>` 之后 refcount-clone，并把 `reference::resolve_variable` 的
+length-1 path 跳过 diagnostic Vec 构造。实测结果：
+
+| 指标 | pre-P1-C (`a590bc9`) | post-P1-C (`60244c5`) | Delta |
+| --- | --- | --- | --- |
+| total bytes | 474.8 MB | 460.7 MB | **-14 MB** |
+| total blocks | 1.55 M | 752 K | **-800 K / -52%** |
+| at-gmax | 67.5 MB | 67.5 MB | ~0 |
+
+**真实份额拆解**：原 dhat PP 把 `eval.rs:1070` 附近的多个 alloc 聚合
+显示成"52% / 279 MB"，但实际拆分：
+
+- `id.clone()` 自身的 String 头：**仅 ~3 MB**（每次 ~32 B × 10w）
+- `item.clone()` Value::clone：对 Int 几乎不分配（按值 copy）
+- `iter_scope_map` HashMap 桶表 grow：**~272 MB**（680 B / 桶 × 200 K 桶）
+- `with_locals` 内的 HashMap 反 insert：剩余几 MB
+
+interner 把 id-clone 和 reference 桶完全清零（**blocks -52%** 是实证收益），
+但**字节大头 272 MB 在 HashMap 桶表本身**——受 `Value` enum 宽度
+（当前 ~150 B，被 `Closure { Node }` 撑大）约束，需要后续 wave 做
+**enum 布局优化或 small-inline locals 表示**才能继续砍。
+
+### 残留可优化项（P2 候选，非 P1 阶段范围）
+
+1. **`Value` enum 宽度收窄**——当前 `Closure { params: Vec<String>, body: Node, captured_env: Arc<Scope> }` 把 enum 撑到 ~150 B；`Schema` / `EnumSchema` 也宽。Box 化大变体让 enum 退回到 ~32 B，HashMap 桶表立省一半（~272 MB → ~64 MB）
+2. **comprehension hot loop 复用 Scope frame**（P1-B 诊断的真正目标）——每元素 `with_local` → `child()` → 一个 `Arc<Scope>` alloc，48 MB / 200 K blocks 还在。改造方向：把迭代绑定下沉到 `list_context`，跳过 per-element scope frame
+3. **CPU 端 profile**——上述两项的 CPU cost 占比未测，需要离线 host 上把 `perf_event_paranoid` 调到 ≤1 跑一次 flamegraph 确认
 
 ---
 
