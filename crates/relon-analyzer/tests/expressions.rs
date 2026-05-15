@@ -13,7 +13,7 @@ use common::*;
 fn fixture_comprehension_int_match() {
     let tree = analyze_fixture("comprehension/list_comp_int.relon");
     let il = count(&tree.diagnostics, |d| {
-        matches!(d, Diagnostic::InferenceLimit { .. })
+        matches!(d, Diagnostic::ExpressionTypeUnknown { .. })
     });
     let stm = count(&tree.diagnostics, |d| {
         matches!(d, Diagnostic::StaticTypeMismatch { .. })

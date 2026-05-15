@@ -14,7 +14,7 @@ fn fixture_typehint_spread_from_main_param() {
     let strict_diags = count(&tree.diagnostics, |d| {
         matches!(
             d,
-            Diagnostic::MissingSpreadTypeHint { .. } | Diagnostic::UnresolvedSchema { .. }
+            Diagnostic::SpreadSourceTypeUnknown { .. } | Diagnostic::UnresolvedSchema { .. }
         )
     });
     assert_eq!(strict_diags, 0, "{:?}", tree.diagnostics);
@@ -26,7 +26,7 @@ fn fixture_typehint_spread_from_sibling_field() {
     let strict_diags = count(&tree.diagnostics, |d| {
         matches!(
             d,
-            Diagnostic::MissingSpreadTypeHint { .. } | Diagnostic::UnresolvedSchema { .. }
+            Diagnostic::SpreadSourceTypeUnknown { .. } | Diagnostic::UnresolvedSchema { .. }
         )
     });
     assert_eq!(strict_diags, 0, "{:?}", tree.diagnostics);
@@ -36,7 +36,7 @@ fn fixture_typehint_spread_from_sibling_field() {
 fn fixture_typehint_spread_from_dict_literal() {
     let tree = analyze_fixture("typehint_spread/from_dict_literal.relon");
     let n = count(&tree.diagnostics, |d| {
-        matches!(d, Diagnostic::MissingSpreadTypeHint { .. })
+        matches!(d, Diagnostic::SpreadSourceTypeUnknown { .. })
     });
     assert_eq!(n, 0, "{:?}", tree.diagnostics);
 }
@@ -45,7 +45,7 @@ fn fixture_typehint_spread_from_dict_literal() {
 fn fixture_typehint_spread_strict_missing_hint() {
     let tree = analyze_fixture("typehint_spread/strict_missing_hint.relon");
     let n = count(&tree.diagnostics, |d| {
-        matches!(d, Diagnostic::MissingSpreadTypeHint { .. })
+        matches!(d, Diagnostic::SpreadSourceTypeUnknown { .. })
     });
     assert_eq!(n, 1, "{:?}", tree.diagnostics);
 }
@@ -66,7 +66,7 @@ fn fixture_typehint_spread_strict_unknown_schema() {
 fn fixture_typehint_dynkey_typed_string() {
     let tree = analyze_fixture("typehint_dynkey/typed_string_key.relon");
     let n = count(&tree.diagnostics, |d| {
-        matches!(d, Diagnostic::MissingDynamicKeyTypeHint { .. })
+        matches!(d, Diagnostic::DynamicKeyTypeUnknown { .. })
     });
     assert_eq!(n, 0, "{:?}", tree.diagnostics);
 }
@@ -75,7 +75,7 @@ fn fixture_typehint_dynkey_typed_string() {
 fn fixture_typehint_dynkey_typed_int() {
     let tree = analyze_fixture("typehint_dynkey/typed_int_key.relon");
     let n = count(&tree.diagnostics, |d| {
-        matches!(d, Diagnostic::MissingDynamicKeyTypeHint { .. })
+        matches!(d, Diagnostic::DynamicKeyTypeUnknown { .. })
     });
     assert_eq!(n, 0, "{:?}", tree.diagnostics);
 }
@@ -84,7 +84,7 @@ fn fixture_typehint_dynkey_typed_int() {
 fn fixture_typehint_dynkey_typed_expression() {
     let tree = analyze_fixture("typehint_dynkey/typed_expression_key.relon");
     let n = count(&tree.diagnostics, |d| {
-        matches!(d, Diagnostic::MissingDynamicKeyTypeHint { .. })
+        matches!(d, Diagnostic::DynamicKeyTypeUnknown { .. })
     });
     assert_eq!(n, 0, "{:?}", tree.diagnostics);
 }
@@ -93,7 +93,7 @@ fn fixture_typehint_dynkey_typed_expression() {
 fn fixture_typehint_dynkey_missing_strict() {
     let tree = analyze_fixture("typehint_dynkey/missing_hint_strict.relon");
     let n = count(&tree.diagnostics, |d| {
-        matches!(d, Diagnostic::MissingDynamicKeyTypeHint { .. })
+        matches!(d, Diagnostic::DynamicKeyTypeUnknown { .. })
     });
     assert_eq!(n, 1, "{:?}", tree.diagnostics);
 }
@@ -102,7 +102,7 @@ fn fixture_typehint_dynkey_missing_strict() {
 fn fixture_typehint_dynkey_non_strict_silent() {
     let tree = analyze_fixture("typehint_dynkey/non_strict_silent.relon");
     let n = count(&tree.diagnostics, |d| {
-        matches!(d, Diagnostic::MissingDynamicKeyTypeHint { .. })
+        matches!(d, Diagnostic::DynamicKeyTypeUnknown { .. })
     });
     assert_eq!(n, 0, "{:?}", tree.diagnostics);
 }
@@ -113,7 +113,7 @@ fn fixture_typehint_dynkey_non_strict_silent() {
 fn fixture_spread_path_schema() {
     let tree = analyze_fixture("spread_extension/path_spread_schema.relon");
     let n = count(&tree.diagnostics, |d| {
-        matches!(d, Diagnostic::MissingSpreadTypeHint { .. })
+        matches!(d, Diagnostic::SpreadSourceTypeUnknown { .. })
     });
     assert_eq!(n, 0, "{:?}", tree.diagnostics);
 }
@@ -122,7 +122,7 @@ fn fixture_spread_path_schema() {
 fn fixture_spread_path_dict() {
     let tree = analyze_fixture("spread_extension/path_spread_dict.relon");
     let n = count(&tree.diagnostics, |d| {
-        matches!(d, Diagnostic::MissingSpreadTypeHint { .. })
+        matches!(d, Diagnostic::SpreadSourceTypeUnknown { .. })
     });
     assert_eq!(n, 0, "{:?}", tree.diagnostics);
 }
@@ -131,7 +131,7 @@ fn fixture_spread_path_dict() {
 fn fixture_spread_fncall_schema() {
     let tree = analyze_fixture("spread_extension/fncall_spread_schema.relon");
     let n = count(&tree.diagnostics, |d| {
-        matches!(d, Diagnostic::MissingSpreadTypeHint { .. })
+        matches!(d, Diagnostic::SpreadSourceTypeUnknown { .. })
     });
     assert_eq!(n, 0, "{:?}", tree.diagnostics);
 }

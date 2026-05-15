@@ -150,7 +150,7 @@ fn fixture_cross_module_strict_pkg_value_path_ok() {
         .filter(|d| {
             matches!(
                 d,
-                Diagnostic::InferenceLimit { .. }
+                Diagnostic::ExpressionTypeUnknown { .. }
                     | Diagnostic::UnknownReferenceType { .. }
                     | Diagnostic::MainReturnTypeMismatch { .. }
             )
@@ -163,7 +163,7 @@ fn fixture_cross_module_strict_pkg_value_path_ok() {
 /// .field` walk now succeeds and produces a concrete type, a declared
 /// `#main() -> Int` mismatching the field's `String` should surface as
 /// `MainReturnTypeMismatch`. Pre-fix the walker returned `UnknownHead`
-/// and the strict-mode pass collapsed to `InferenceLimit` instead of
+/// and the strict-mode pass collapsed to `ExpressionTypeUnknown` instead of
 /// the precise mismatch.
 #[test]
 fn fixture_cross_module_strict_pkg_value_path_mismatch() {
@@ -181,13 +181,13 @@ fn fixture_cross_module_strict_pkg_value_path_mismatch() {
         })
         .count();
     assert_eq!(mismatches, 1, "{:#?}", ws.modules);
-    // No silent fallback: `InferenceLimit` must not fire — the walker
+    // No silent fallback: `ExpressionTypeUnknown` must not fire — the walker
     // resolved the value-path concretely.
     let stalls: usize = ws
         .modules
         .values()
         .flat_map(|t| t.diagnostics.iter())
-        .filter(|d| matches!(d, Diagnostic::InferenceLimit { .. }))
+        .filter(|d| matches!(d, Diagnostic::ExpressionTypeUnknown { .. }))
         .count();
     assert_eq!(stalls, 0, "{:#?}", ws.modules);
 }
@@ -228,7 +228,7 @@ fn fixture_cross_module_strict_pkg_generic_value_path_ok() {
         .filter(|d| {
             matches!(
                 d,
-                Diagnostic::InferenceLimit { .. }
+                Diagnostic::ExpressionTypeUnknown { .. }
                     | Diagnostic::UnknownReferenceType { .. }
                     | Diagnostic::MainReturnTypeMismatch { .. }
                     | Diagnostic::StaticTypeMismatch { .. }
@@ -260,7 +260,7 @@ fn fixture_cross_module_strict_pkg_nested_generic_value_path_ok() {
         .filter(|d| {
             matches!(
                 d,
-                Diagnostic::InferenceLimit { .. }
+                Diagnostic::ExpressionTypeUnknown { .. }
                     | Diagnostic::UnknownReferenceType { .. }
                     | Diagnostic::MainReturnTypeMismatch { .. }
                     | Diagnostic::StaticTypeMismatch { .. }
@@ -274,7 +274,7 @@ fn fixture_cross_module_strict_pkg_nested_generic_value_path_ok() {
 /// substitution wired through the walker, `pkg.c.value` resolves
 /// concretely to `Int`, so a declared `#main() -> String` surfaces
 /// the precise `MainReturnTypeMismatch { expected: "String",
-/// found: "Int" }` rather than a generic `InferenceLimit` (pre-fix)
+/// found: "Int" }` rather than a generic `ExpressionTypeUnknown` (pre-fix)
 /// or a phantom `found: "T"` (mid-fix without substitution).
 #[test]
 fn fixture_cross_module_strict_pkg_generic_value_path_mismatch() {
@@ -299,7 +299,7 @@ fn fixture_cross_module_strict_pkg_generic_value_path_mismatch() {
         .modules
         .values()
         .flat_map(|t| t.diagnostics.iter())
-        .filter(|d| matches!(d, Diagnostic::InferenceLimit { .. }))
+        .filter(|d| matches!(d, Diagnostic::ExpressionTypeUnknown { .. }))
         .count();
     assert_eq!(stalls, 0, "{:#?}", ws.modules);
 }

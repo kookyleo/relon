@@ -476,41 +476,50 @@ library that itself didn't write `#strict` is still analyzed under
 the strict rules — preventing non-strict libraries from sneaking
 silent fallbacks into a strict entry.
 
-**New diagnostic kinds (Error severity under strict mode)**:
+**Diagnostic kinds** (all Error severity). v2 split the strict-mode
+checks into *cross-mode* and *strict-only* buckets — see the
+[strict-mode reference](./strict-mode.md) for the full matrix.
+
+Cross-mode (fire regardless of `#strict`):
 
 | Diagnostic | Trigger |
 |---|---|
-| `MissingSpreadTypeHint` | `{ ...e }` where `e` isn't a dict literal, lacks a `<T>` typehint, and the source can't be lifted from a path-tail walk (`...x.y`) or FnCall signature (`...f()`) into a Schema / `Dict<K,V>` type |
-| `MissingDynamicKeyTypeHint` | `{ [k]: v }` without a `<T>` typehint |
-| `UnresolvedSchema` | typed spread / dynamic-key `<T>` references an undeclared schema |
-| `UnknownReferenceType { name, path }` | path-tail walking failed at some segment: head or middle type unknown (`o.unknown`), middle type is a leaf with no nested fields (`o.id.something`), or — under v1.5 — the head itself is fully unresolved. `name` is the failing segment; `path` is the full segment chain in source order |
-| `InferenceLimit { reason }` | a genuinely opaque expression in a position that demands a derivable type: FnCall without a static signature in a typed slot, list element / dict field value that can't be inferred, match arm body that can't be inferred. `reason` describes which sub-case fired |
-| `StrictForbidsNativeReturn` | call to a host-registered native fn with no `host_fn_signatures` entry |
-| `StrictForbidsUntypedClosureParam { param_name }` | v1.5: closure parameter has no declared type, leaking `Any` into the body scope |
-| `StrictForbidsUnclassifiedClosureBody { role }` | v1.5: closure has neither a declared `-> ReturnType` nor an inferable body, so the synthesized signature ends up returning `Any` |
-| `ExplicitAnyForbidden { context }` | v1.6: user wrote `Any` somewhere in source code (including nested `List<Any>` / `Dict<String, Any>`). **This one fires regardless of strict mode** — `Any` is retired from the user-facing surface in every mode |
-| `BareGenericContainer { type_name, context }` | v1.7: user wrote `List` / `Dict` / `Closure` / `Fn` / `Enum` without generic arguments — pre-v1.7 these silently expanded to `<Any>` shapes. **Mode-independent**, like `ExplicitAnyForbidden` |
-| `DuplicateField` | spread contributes a key already declared on the dict, or two spreads contribute the same key (this one fires regardless of strict mode) |
+| `NonSpreadableSource { source_type }` | `{ ...e }` where `e`'s static type is known but isn't dict-shaped (e.g. `Int`, `Bool`, `List<T>`). No `<T>` hint can make this valid — the program is wrong in any mode |
+| `UnresolvedSchema` | `<Schema>` annotation (typed spread, dynamic-key hint, etc.) names a schema that isn't declared in the workspace |
+| `UnknownReferenceType { name, path }` | path-tail walker has positive knowledge a step is broken: descend into an undeclared schema field (`o.unknown`), descend past a leaf type (`o.id.something`), or — under strict mode — descend into `Any` |
+| `DuplicateField` | spread contributes a key already declared on the dict, or two spreads contribute the same key |
+| `ExplicitAnyForbidden { context }` | v1.6: user wrote `Any` somewhere in source (including nested `List<Any>` / `Dict<String, Any>`). `Any` is retired from the user-facing surface in every mode |
+| `BareGenericContainer { type_name, context }` | v1.7: user wrote `List` / `Dict` / `Closure` / `Fn` / `Enum` without generic arguments |
+
+Strict-only (fire only when `#strict` is in effect; the underlying
+information is *genuinely* missing rather than statically known):
+
+| Diagnostic | Trigger |
+|---|---|
+| `SpreadSourceTypeUnknown` | `{ ...e }` where the analyzer can't determine `e`'s static shape (untyped closure parameter, untyped binding, etc.) and there's no `<T>` hint. Fix is to annotate the spread or type the source |
+| `DynamicKeyTypeUnknown` | `{ [k]: v }` without a `<T>` typehint |
+| `ExpressionTypeUnknown { reason }` | a genuinely opaque expression in a position that demands a derivable type: FnCall without a static signature in a typed slot, list element / dict field value that can't be inferred, match-arm body that can't be inferred |
+| `NativeFnSignatureMissing { fn_name }` | call to a host-registered native fn with no `host_fn_signatures` entry |
+| `ClosureParamTypeMissing { param_name }` | closure parameter has no declared type, leaking `Any` into the body scope |
+| `ClosureReturnTypeUnknown { role }` | closure has neither a declared `-> ReturnType` nor an inferable body, so the synthesized signature would return `Any` |
 
 **v1.4 path-tail walking** (applies to `Variable` / `Reference` paths
 with multiple segments):
 
 * `Schema(name)` head → next segment must be a declared field of that
-  schema; missing → strict reports `UnknownReferenceType`.
-* `Dict<K, V>` head → every key step yields V (homogeneous values);
-  strict accepts.
+  schema; missing → `UnknownReferenceType` (cross-mode).
+* `Dict<K, V>` head → every key step yields V (homogeneous values).
 * `Optional<T>` head → strip the `?` wrapper before stepping again,
   matching the runtime's `T?.x` semantics.
 * `Any` head → after the v1.6/v1.7 double ban, the only path-head that
   can still land here is a closure parameter without a `type_hint`
-  under non-strict mode (strict raises
-  `StrictForbidsUntypedClosureParam` and never reaches the walker).
-  Propagate `Any` so non-strict callers continue to defer to runtime.
+  (strict raises `ClosureParamTypeMissing` and never reaches the
+  walker). Propagate `Any` so non-strict callers defer to runtime.
 * `Tuple<T1, T2, ...>` head (v1.7) → tuples are positional, not named;
   descending by name always yields `UnknownStep`. (Positional indexing
   syntax like `pair.0` / `pair.1` would plumb through this branch.)
 * `Int` / `String` / `Bool` / `List<...>` and other leaves → cannot
-  descend; strict reports `UnknownReferenceType`.
+  descend; `UnknownReferenceType` (cross-mode).
 
 **v1.4 typed-spread sources** accepted in addition to an inline
 `<T>` typehint:
@@ -524,7 +533,7 @@ with multiple segments):
 
 When the source can't be classified, strict mode prefers the more
 specific path-tail diagnostic (`UnknownReferenceType`) over the
-generic `MissingSpreadTypeHint`.
+generic `SpreadSourceTypeUnknown`.
 
 **v1.5 inference upgrades** — these expressions move from "decided at
 runtime" to "statically inferable":
@@ -550,11 +559,14 @@ runtime" to "statically inferable":
   forms uniformly.
 
 After v1.5 the only silent fallbacks left under strict mode are: (i)
-host-registered native fns with no declared signature (already covered
-by `StrictForbidsNativeReturn`), and (ii) explicitly-untyped sites the
-user opted into (untyped spread / dynamic key, covered by
-`Missing*Hint`). Everything that's derivable from source + schemas is
-caught statically.
+host-registered native fns with no declared signature (covered by
+`NativeFnSignatureMissing`), and (ii) explicitly-untyped sites the
+user opted into (covered by `SpreadSourceTypeUnknown` /
+`DynamicKeyTypeUnknown`). Everything else that's derivable from
+source + schemas is caught statically — v2 hardens this further by
+moving every "statically known to be wrong" check (non-dict spread
+source, undeclared schema, broken path step) to cross-mode error
+severity.
 
 **v1.6: retire `Any` from the user-facing surface entirely**
 

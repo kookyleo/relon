@@ -1,4 +1,10 @@
-// v1.3 forward: strict mode + non-literal source + no hint → flag.
-// EXPECTED: 1 × MissingSpreadTypeHint.
+// v1.3 forward (v2-updated): strict mode flags a spread whose
+// source's static type is genuinely unknown. (The previous fixture
+// used `1 + 2` as the source — v2 now flags that case cross-mode
+// via `NonSpreadableSource`. An untyped closure parameter is the
+// canonical "type genuinely unknown" case: `n` leaks `Any` so the
+// inner spread has no derivable shape, and strict demands a hint.)
+// EXPECTED: 1 × SpreadSourceTypeUnknown (plus the closure-param
+// diagnostics for the untyped `n`).
 #strict
-{ src: 1 + 2, val: { ...src } }
+{ f: (n) => { ...n } }

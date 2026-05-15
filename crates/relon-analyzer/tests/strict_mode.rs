@@ -20,7 +20,7 @@ fn fixture_strict_enables_bit() {
 fn fixture_strict_demands_spread_hint() {
     let tree = analyze_fixture("strict_basic/strict_demands_spread_hint.relon");
     let n = count(&tree.diagnostics, |d| {
-        matches!(d, Diagnostic::MissingSpreadTypeHint { .. })
+        matches!(d, Diagnostic::SpreadSourceTypeUnknown { .. })
     });
     assert_eq!(n, 1, "{:?}", tree.diagnostics);
 }
@@ -29,7 +29,7 @@ fn fixture_strict_demands_spread_hint() {
 fn fixture_strict_demands_dynkey_hint() {
     let tree = analyze_fixture("strict_basic/strict_demands_dynkey_hint.relon");
     let n = count(&tree.diagnostics, |d| {
-        matches!(d, Diagnostic::MissingDynamicKeyTypeHint { .. })
+        matches!(d, Diagnostic::DynamicKeyTypeUnknown { .. })
     });
     assert!(n >= 1, "{:?}", tree.diagnostics);
 }
@@ -38,7 +38,7 @@ fn fixture_strict_demands_dynkey_hint() {
 fn fixture_strict_typed_spread_silent() {
     let tree = analyze_fixture("strict_basic/strict_typed_spread_silent.relon");
     let n = count(&tree.diagnostics, |d| {
-        matches!(d, Diagnostic::MissingSpreadTypeHint { .. })
+        matches!(d, Diagnostic::SpreadSourceTypeUnknown { .. })
     });
     assert_eq!(n, 0, "{:?}", tree.diagnostics);
 }
@@ -47,7 +47,7 @@ fn fixture_strict_typed_spread_silent() {
 fn fixture_strict_typed_dynkey_silent() {
     let tree = analyze_fixture("strict_basic/strict_typed_dynkey_silent.relon");
     let n = count(&tree.diagnostics, |d| {
-        matches!(d, Diagnostic::MissingDynamicKeyTypeHint { .. })
+        matches!(d, Diagnostic::DynamicKeyTypeUnknown { .. })
     });
     assert_eq!(n, 0, "{:?}", tree.diagnostics);
 }
@@ -83,23 +83,21 @@ fn fixture_strict_known_path_silent() {
     assert_eq!(n, 0, "{:?}", tree.diagnostics);
 }
 
-#[test]
-fn fixture_strict_non_strict_silent() {
-    let tree = analyze_fixture("strict_silent_fallback/non_strict_silent.relon");
-    let n = count(&tree.diagnostics, |d| {
-        matches!(d, Diagnostic::UnknownReferenceType { .. })
-    });
-    assert_eq!(n, 0, "{:?}", tree.diagnostics);
-}
+// (v1.4's `fixture_strict_non_strict_silent` retired in v2 — its
+// premise was "non-strict stays silent on `o.unknown`", which v2
+// inverts: the path-tail walker now fires `UnknownReferenceType`
+// cross-mode whenever the analyzer has positive knowledge a step
+// is broken. The replacement assertion lives in
+// `typecheck::tests::non_strict_path_tail_reports_unknown_ref_type`.)
 
 #[test]
 fn fixture_strict_typed_binding_unknown() {
     // v1.5 reframe: list comprehension is now inferable, so the
-    // previously expected InferenceLimit no longer fires. We assert
-    // silence on both InferenceLimit and StaticTypeMismatch.
+    // previously expected ExpressionTypeUnknown no longer fires. We assert
+    // silence on both ExpressionTypeUnknown and StaticTypeMismatch.
     let tree = analyze_fixture("strict_silent_fallback/strict_typed_binding_unknown.relon");
     let il = count(&tree.diagnostics, |d| {
-        matches!(d, Diagnostic::InferenceLimit { .. })
+        matches!(d, Diagnostic::ExpressionTypeUnknown { .. })
     });
     let stm = count(&tree.diagnostics, |d| {
         matches!(d, Diagnostic::StaticTypeMismatch { .. })
@@ -112,7 +110,7 @@ fn fixture_strict_typed_binding_unknown() {
 fn fixture_strict_match_arm_unknown() {
     let tree = analyze_fixture("strict_silent_fallback/strict_match_arm_unknown.relon");
     let n = count(&tree.diagnostics, |d| {
-        matches!(d, Diagnostic::InferenceLimit { .. })
+        matches!(d, Diagnostic::ExpressionTypeUnknown { .. })
     });
     assert!(n >= 1, "{:?}", tree.diagnostics);
 }
@@ -131,7 +129,7 @@ fn fixture_strict_path_chain_int_descend() {
 fn fixture_strict_typed_silent_inferable() {
     let tree = analyze_fixture("strict_silent_fallback/strict_typed_silent_inferable.relon");
     let inf = count(&tree.diagnostics, |d| {
-        matches!(d, Diagnostic::InferenceLimit { .. })
+        matches!(d, Diagnostic::ExpressionTypeUnknown { .. })
     });
     let unk = count(&tree.diagnostics, |d| {
         matches!(d, Diagnostic::UnknownReferenceType { .. })
@@ -182,7 +180,7 @@ fn fixture_strict_path_after_unresolved_silent() {
 fn fixture_closure_param_typed_silent() {
     let tree = analyze_fixture("closure_strict/closure_param_typed.relon");
     let n = count(&tree.diagnostics, |d| {
-        matches!(d, Diagnostic::StrictForbidsUntypedClosureParam { .. })
+        matches!(d, Diagnostic::ClosureParamTypeMissing { .. })
     });
     assert_eq!(n, 0, "{:?}", tree.diagnostics);
 }
@@ -191,7 +189,7 @@ fn fixture_closure_param_typed_silent() {
 fn fixture_closure_param_untyped_flags() {
     let tree = analyze_fixture("closure_strict/closure_param_untyped.relon");
     let n = count(&tree.diagnostics, |d| {
-        matches!(d, Diagnostic::StrictForbidsUntypedClosureParam { param_name, .. }
+        matches!(d, Diagnostic::ClosureParamTypeMissing { param_name, .. }
             if param_name == "n")
     });
     assert!(n >= 1, "{:?}", tree.diagnostics);
@@ -201,7 +199,7 @@ fn fixture_closure_param_untyped_flags() {
 fn fixture_closure_body_unclassified_flags() {
     let tree = analyze_fixture("closure_strict/closure_body_unclassified.relon");
     let n = count(&tree.diagnostics, |d| {
-        matches!(d, Diagnostic::StrictForbidsUnclassifiedClosureBody { .. })
+        matches!(d, Diagnostic::ClosureReturnTypeUnknown { .. })
     });
     assert!(n >= 1, "{:?}", tree.diagnostics);
 }
@@ -224,7 +222,7 @@ fn fixture_strict_propagation_one_hop() {
         .modules
         .values()
         .flat_map(|t| t.diagnostics.iter())
-        .filter(|d| matches!(d, Diagnostic::MissingSpreadTypeHint { .. }))
+        .filter(|d| matches!(d, Diagnostic::SpreadSourceTypeUnknown { .. }))
         .count();
     assert!(total_spread_diags >= 1, "expected lib's spread diag");
 }

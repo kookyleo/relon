@@ -442,7 +442,7 @@ impl<'a> Walker<'a> {
                             matches!(t, InferredType::Any)
                         };
                         if any_result {
-                            self.tree.diagnostics.push(Diagnostic::InferenceLimit {
+                            self.tree.diagnostics.push(Diagnostic::ExpressionTypeUnknown {
                                 reason: format!(
                                     "dict field `{}` value type is not statically derivable",
                                     field_name.unwrap_or("_")
@@ -478,7 +478,7 @@ impl<'a> Walker<'a> {
                     for param in params {
                         if param.type_hint.is_none() {
                             self.tree.diagnostics.push(
-                                Diagnostic::StrictForbidsUntypedClosureParam {
+                                Diagnostic::ClosureParamTypeMissing {
                                     param_name: param.name.clone(),
                                     range: span_of(node.range),
                                 },
@@ -533,7 +533,7 @@ impl<'a> Walker<'a> {
                     let body_ty = infer_type(body, &scope).unwrap_or(InferredType::Any);
                     if matches!(body_ty, InferredType::Any) {
                         self.tree.diagnostics.push(
-                            Diagnostic::StrictForbidsUnclassifiedClosureBody {
+                            Diagnostic::ClosureReturnTypeUnknown {
                                 role: field_name.unwrap_or("<closure>").to_string(),
                                 range: span_of(body.range),
                             },
@@ -565,7 +565,7 @@ impl<'a> Walker<'a> {
                                     Expr::Variable(_) | Expr::Reference { .. }
                                 )
                             {
-                                to_emit.push(Diagnostic::InferenceLimit {
+                                to_emit.push(Diagnostic::ExpressionTypeUnknown {
                                     reason: "list element type is not statically derivable"
                                         .to_string(),
                                     range: span_of(item.range),
@@ -1186,7 +1186,7 @@ impl<'a> Walker<'a> {
     /// v1.3: under strict mode, an FnCall whose name resolves *only*
     /// through the host's native fn allowlist (no static signature
     /// describing its return) leaks `Any` into the surrounding type
-    /// flow. Surface a `StrictForbidsNativeReturn` so the user adds a
+    /// flow. Surface a `NativeFnSignatureMissing` so the user adds a
     /// signature or stops calling the unknown native fn.
     fn check_strict_fn_call(&mut self, node: &relon_parser::Node, path: &[TokenKey]) {
         if !self.tree.strict_mode {
@@ -1219,7 +1219,7 @@ impl<'a> Walker<'a> {
         if self.tree.host_fn_names.contains(name) {
             self.tree
                 .diagnostics
-                .push(Diagnostic::StrictForbidsNativeReturn {
+                .push(Diagnostic::NativeFnSignatureMissing {
                     fn_name: name.clone(),
                     range: span_of(node.range),
                 });
@@ -1256,44 +1256,53 @@ impl<'a> Walker<'a> {
         for (key, value) in pairs {
             match key {
                 TokenKey::Spread(range) => {
-                    // Strict mode: untyped + non-dict-literal source =
-                    // we can't see the keys, so the spread "leaks" Any
-                    // into the frame. Demand a `<T>` type hint or a
-                    // dict literal whose keys we already see.
-                    if strict {
-                        let has_hint = value.type_hint.is_some();
-                        let is_dict_literal = matches!(&*value.expr, Expr::Dict(_));
-                        // Resolve a Variable / Reference head to its
-                        // sibling target; if that target is itself a
-                        // typed binding to a known schema we treat the
-                        // spread as having a derivable shape.
-                        let derived_schema = self.spread_source_schema(value);
-                        let resolves_to_schema = derived_schema.is_some();
-                        // v1.4: a `Dict<K, V>`-typed spread source is
-                        // also acceptable under strict mode — the value
-                        // type is fully classified even though the keys
-                        // are dynamic. Detect via the inference walker
-                        // so path chains and FnCall returns work the
-                        // same as the schema case.
-                        let resolves_to_dict = self.spread_source_is_dict(value);
-                        if !has_hint && !is_dict_literal && !resolves_to_schema && !resolves_to_dict
-                        {
-                            to_emit.push(Diagnostic::MissingSpreadTypeHint {
+                    let has_hint = value.type_hint.is_some();
+                    let is_dict_literal = matches!(&*value.expr, Expr::Dict(_));
+                    // Resolve a Variable / Reference head to its
+                    // sibling target; if that target is itself a
+                    // typed binding to a known schema we treat the
+                    // spread as having a derivable shape.
+                    let derived_schema = self.spread_source_schema(value);
+                    let resolves_to_schema = derived_schema.is_some();
+                    // v1.4: a `Dict<K, V>`-typed spread source is
+                    // also acceptable under strict mode — the value
+                    // type is fully classified even though the keys
+                    // are dynamic. Detect via the inference walker
+                    // so path chains and FnCall returns work the
+                    // same as the schema case.
+                    let resolves_to_dict = self.spread_source_is_dict(value);
+                    let is_spreadable_shape =
+                        is_dict_literal || has_hint || resolves_to_schema || resolves_to_dict;
+
+                    // Cross-mode: if the source has a known static
+                    // type but that type isn't dict-shaped (Int,
+                    // List<T>, Bool, ...) the program is wrong in
+                    // every mode — no `<T>` hint can rescue it.
+                    if !is_spreadable_shape {
+                        if let Some(known_ty) = self.spread_source_known_non_dict(value) {
+                            to_emit.push(Diagnostic::NonSpreadableSource {
+                                source_type: known_ty,
+                                range: span_of(*range),
+                            });
+                        } else if strict {
+                            // Strict-only: the source's type is
+                            // genuinely unknown — adding a hint or
+                            // typing the binding is the literal fix.
+                            to_emit.push(Diagnostic::SpreadSourceTypeUnknown {
                                 range: span_of(*range),
                             });
                         }
-                        // When the typehint *or* the resolved-source
-                        // schema name isn't found in the workspace's
-                        // schema set, strict mode reports
-                        // `UnresolvedSchema` so the user knows the hint
-                        // doesn't actually buy them anything.
-                        if let Some(name) = &derived_schema {
-                            if !self.schema_known(name) {
-                                to_emit.push(Diagnostic::UnresolvedSchema {
-                                    name: name.clone(),
-                                    range: span_of(*range),
-                                });
-                            }
+                    }
+                    // Cross-mode: an explicit `<Schema>` hint (or a
+                    // resolved-source schema name) that isn't in the
+                    // workspace's schema set is broken regardless of
+                    // strict mode — the runtime would error too.
+                    if let Some(name) = &derived_schema {
+                        if !self.schema_known(name) {
+                            to_emit.push(Diagnostic::UnresolvedSchema {
+                                name: name.clone(),
+                                range: span_of(*range),
+                            });
                         }
                     }
                     // DuplicateField: collect the spread's contributed
@@ -1312,7 +1321,7 @@ impl<'a> Walker<'a> {
                 }
                 TokenKey::Dynamic(inner, _) => {
                     if strict && inner.type_hint.is_none() {
-                        to_emit.push(Diagnostic::MissingDynamicKeyTypeHint {
+                        to_emit.push(Diagnostic::DynamicKeyTypeUnknown {
                             range: span_of(inner.range),
                         });
                     }
@@ -1458,6 +1467,52 @@ impl<'a> Walker<'a> {
     /// is known, even if the keys are dynamic — so they don't need a
     /// `<T>` typehint. Returns `true` when the spread source's static
     /// type is some `Dict<...>` variant.
+    /// Return the printable name of the spread source's static type
+    /// when that type is **known** and **isn't** dict-shaped — the
+    /// signal for `NonSpreadableSource`. Returns `None` for dict /
+    /// schema / `Dict<K,V>` sources (the spread is fine) or for
+    /// genuinely unknown / `Any` sources (the strict-only
+    /// `SpreadSourceTypeUnknown` covers them).
+    ///
+    /// Only inspects expression forms whose type the inference layer
+    /// is confident about today: literal scalars / lists, references
+    /// to typed bindings whose declared type is a non-dict primitive,
+    /// and path-tail walks resolving to a non-dict / non-schema head.
+    fn spread_source_known_non_dict(&self, value: &relon_parser::Node) -> Option<String> {
+        // Literal scalars and lists are obvious offenders.
+        match &*value.expr {
+            Expr::Int(_) => return Some("Int".to_string()),
+            Expr::Float(_) => return Some("Float".to_string()),
+            Expr::Bool(_) => return Some("Bool".to_string()),
+            Expr::String(_) => return Some("String".to_string()),
+            Expr::List(_) => return Some("List".to_string()),
+            Expr::Null => return Some("Null".to_string()),
+            _ => {}
+        }
+        // Fall through to the inference walker for everything else
+        // (binops like `1 + 2`, identifiers, path chains).
+        let scope = self.build_type_scope();
+        let inferred = infer::infer_type(value, &scope).unwrap_or(InferredType::Any);
+        match inferred {
+            // Dict-shaped — handled by `spread_source_is_dict`.
+            InferredType::Dict(_) | InferredType::Schema(_) => None,
+            // Genuinely unknown — `SpreadSourceTypeUnknown` covers it.
+            InferredType::Any => None,
+            // Anything else has a known, non-spreadable shape.
+            InferredType::Null => Some("Null".to_string()),
+            InferredType::Bool => Some("Bool".to_string()),
+            InferredType::Int => Some("Int".to_string()),
+            InferredType::Float => Some("Float".to_string()),
+            InferredType::Number => Some("Number".to_string()),
+            InferredType::String => Some("String".to_string()),
+            InferredType::List(_) => Some("List".to_string()),
+            InferredType::Variant(_, _) => Some("Variant".to_string()),
+            InferredType::Optional(_) => Some("Optional".to_string()),
+            InferredType::Fn(_, _) => Some("Fn".to_string()),
+            InferredType::Tuple(_) => Some("Tuple".to_string()),
+        }
+    }
+
     fn spread_source_is_dict(&self, value: &relon_parser::Node) -> bool {
         // Inline `<Dict<K, V>>` typehint.
         if let Some(t) = &value.type_hint {
@@ -1587,7 +1642,7 @@ impl<'a> Walker<'a> {
                 // type. Pin the diagnostic on the failing arm body so
                 // the user knows where to add an annotation.
                 if strict {
-                    self.tree.diagnostics.push(Diagnostic::InferenceLimit {
+                    self.tree.diagnostics.push(Diagnostic::ExpressionTypeUnknown {
                         reason: "match arm body type is not statically derivable".to_string(),
                         range: span_of(body.range),
                     });
@@ -1838,30 +1893,28 @@ impl<'a> Walker<'a> {
         }
     }
 
-    /// v1.4: under strict mode, run the inference-driven path walker
-    /// over `path` and report a [`Diagnostic::UnknownReferenceType`]
-    /// whenever a segment can't be classified. Complements the older
-    /// schema-index-only `check_path_tail` by:
+    /// Run the inference-driven path walker over `path` and report a
+    /// [`Diagnostic::UnknownReferenceType`] whenever a segment can't
+    /// be classified. Splits the responsibility:
     ///
-    /// * Catching cases where the head's static type is `Any` (closure
-    ///   param without a type annotation, a sibling field with no
-    ///   declared type) — strict mode demands a derivable type.
-    /// * Catching middle-of-path failures whose running type is a
-    ///   leaf (`Int.something`) which Stage 2.6 silently passed.
-    ///
-    /// Non-strict mode keeps the old behavior (Any / silent fallback)
-    /// so existing diagnostics don't double-fire.
+    /// * `UnknownStep` (e.g. `o.unknown` where `o: Schema` has no
+    ///   `unknown` field, or `int_field.something` descending past a
+    ///   leaf) is a **static error** — the analyzer has positive
+    ///   knowledge the path is broken. Fired cross-mode.
+    /// * `Resolved(Any)` (e.g. path runs into an untyped closure
+    ///   parameter whose type the analyzer literally can't see) is a
+    ///   **strict-only** finding — the analyzer doesn't *know* the
+    ///   path is broken, it just refuses to keep going under strict.
+    /// * `UnknownHead` is owned by the resolution-side
+    ///   `UnresolvedReference` diagnostic, so we don't report here.
     fn check_strict_path(&mut self, node: &Node, path: &[TokenKey]) {
-        if !self.tree.strict_mode {
-            return;
-        }
         let segs = infer::path_segments(path);
         if segs.is_empty() {
             return;
         }
         // v1.5 deduplication: when the path is a single segment whose
         // head names an *untyped closure parameter* on the active
-        // scope stack, the `StrictForbidsUntypedClosureParam` walker
+        // scope stack, the `ClosureParamTypeMissing` walker
         // already pinned a diagnostic on the param's declaration. Don't
         // double-fire `UnknownReferenceType` on every body reference
         // — the user already knows which param to annotate.
@@ -1878,10 +1931,12 @@ impl<'a> Walker<'a> {
         let scope = self.build_type_scope();
         match infer::walk_path(path, &scope) {
             infer::PathTailOutcome::Resolved(InferredType::Any) => {
-                // Head resolved to `Any` (or the walk landed on `Any`
-                // mid-way). Strict mode forbids the leak — pin the
-                // diagnostic on the *final* dotted name so the user
-                // knows which value's type is missing.
+                // Head / mid-walk landed on `Any`. The analyzer can't
+                // verify or refute the path — strict mode refuses the
+                // leak, non-strict keeps the silent fallback.
+                if !self.tree.strict_mode {
+                    return;
+                }
                 let last = segs.last().cloned().unwrap_or_default();
                 self.tree
                     .diagnostics
@@ -1892,9 +1947,11 @@ impl<'a> Walker<'a> {
                     });
             }
             infer::PathTailOutcome::Resolved(_) => {
-                // Fully classified — strict mode is satisfied.
+                // Fully classified — both modes are satisfied.
             }
             infer::PathTailOutcome::UnknownStep { at_segment, .. } => {
+                // Cross-mode: the walker has positive knowledge that
+                // the path is broken. The runtime would fail too.
                 let name = segs.get(at_segment).cloned().unwrap_or_default();
                 self.tree
                     .diagnostics
@@ -2117,7 +2174,7 @@ impl<'a> Walker<'a> {
         // v1.4 / v1.5: under strict mode, a typed binding whose value
         // can't produce *any* inferred type leaks `Any` into the
         // typed slot — strict mode demands a derivable type, so emit
-        // `InferenceLimit` describing the precise reason. v1.5 made
+        // `ExpressionTypeUnknown` describing the precise reason. v1.5 made
         // comprehensions / where / spread / closures all inferable
         // out-of-the-box, so the only paths that still hit this branch
         // are FnCall without a signature and a handful of edge cases
@@ -2132,7 +2189,7 @@ impl<'a> Walker<'a> {
                 },
                 _ => "value type is not statically derivable".to_string(),
             };
-            self.tree.diagnostics.push(Diagnostic::InferenceLimit {
+            self.tree.diagnostics.push(Diagnostic::ExpressionTypeUnknown {
                 reason,
                 range: span_of(value.range),
             });
@@ -3993,7 +4050,7 @@ mod tests {
 
     /// v1.3 forward: in strict mode, an untyped non-dict spread
     /// (`...e` where `e` isn't a dict literal) reports
-    /// `MissingSpreadTypeHint`.
+    /// `SpreadSourceTypeUnknown`.
     #[test]
     fn v1_3_strict_spread_without_type_flagged() {
         let tree = analyze_str(
@@ -4003,7 +4060,7 @@ mod tests {
             "#,
         );
         let n = count(&tree, |d| {
-            matches!(d, Diagnostic::MissingSpreadTypeHint { .. })
+            matches!(d, Diagnostic::SpreadSourceTypeUnknown { .. })
         });
         assert_eq!(n, 1, "{:?}", tree.diagnostics);
     }
@@ -4013,7 +4070,7 @@ mod tests {
     fn v1_3_non_strict_spread_silent() {
         let tree = analyze_str(r#"{ src: 1 + 2, ...src }"#);
         let n = count(&tree, |d| {
-            matches!(d, Diagnostic::MissingSpreadTypeHint { .. })
+            matches!(d, Diagnostic::SpreadSourceTypeUnknown { .. })
         });
         assert_eq!(n, 0, "{:?}", tree.diagnostics);
     }
@@ -4030,7 +4087,7 @@ mod tests {
             "#,
         );
         let n = count(&tree, |d| {
-            matches!(d, Diagnostic::MissingSpreadTypeHint { .. })
+            matches!(d, Diagnostic::SpreadSourceTypeUnknown { .. })
         });
         assert_eq!(n, 0, "{:?}", tree.diagnostics);
     }
@@ -4046,7 +4103,7 @@ mod tests {
             "#,
         );
         let n = count(&tree, |d| {
-            matches!(d, Diagnostic::MissingDynamicKeyTypeHint { .. })
+            matches!(d, Diagnostic::DynamicKeyTypeUnknown { .. })
         });
         assert!(n >= 1, "{:?}", tree.diagnostics);
     }
@@ -4061,7 +4118,7 @@ mod tests {
             "#,
         );
         let n = count(&tree, |d| {
-            matches!(d, Diagnostic::MissingDynamicKeyTypeHint { .. })
+            matches!(d, Diagnostic::DynamicKeyTypeUnknown { .. })
         });
         assert_eq!(n, 0, "{:?}", tree.diagnostics);
     }
@@ -4071,7 +4128,7 @@ mod tests {
     fn v1_3_non_strict_dynamic_key_silent() {
         let tree = analyze_str(r#"{ k: "key", [k]: 1 }"#);
         let n = count(&tree, |d| {
-            matches!(d, Diagnostic::MissingDynamicKeyTypeHint { .. })
+            matches!(d, Diagnostic::DynamicKeyTypeUnknown { .. })
         });
         assert_eq!(n, 0, "{:?}", tree.diagnostics);
     }
@@ -4167,11 +4224,11 @@ mod tests {
     }
 
     /// v1.3: strict + native fn without static signature should report
-    /// `StrictForbidsNativeReturn`. We simulate via an
+    /// `NativeFnSignatureMissing`. We simulate via an
     /// `AnalyzeOptions::host_fn_names` entry without a corresponding
     /// signature.
     #[test]
-    fn v1_3_strict_forbids_native_return_without_signature() {
+    fn v1_3_native_fn_signature_missing_without_signature() {
         let src = "#strict\n{ x: my_native(1, 2) }";
         let node = parse_document(src).unwrap();
         let mut names = std::collections::HashSet::new();
@@ -4186,7 +4243,7 @@ mod tests {
         let tree = crate::analyze_with_options(&node, &opts);
         let n = count(
             &tree,
-            |d| matches!(d, Diagnostic::StrictForbidsNativeReturn { fn_name, .. } if fn_name == "my_native"),
+            |d| matches!(d, Diagnostic::NativeFnSignatureMissing { fn_name, .. } if fn_name == "my_native"),
         );
         assert_eq!(n, 1, "{:?}", tree.diagnostics);
     }
@@ -4207,7 +4264,7 @@ mod tests {
         };
         let tree = crate::analyze_with_options(&node, &opts);
         let n = count(&tree, |d| {
-            matches!(d, Diagnostic::StrictForbidsNativeReturn { .. })
+            matches!(d, Diagnostic::NativeFnSignatureMissing { .. })
         });
         assert_eq!(n, 0);
     }
@@ -4250,7 +4307,7 @@ mod tests {
         };
         let tree = crate::analyze_with_options(&node, &opts);
         let n = count(&tree, |d| {
-            matches!(d, Diagnostic::StrictForbidsNativeReturn { .. })
+            matches!(d, Diagnostic::NativeFnSignatureMissing { .. })
         });
         assert_eq!(n, 0, "{:?}", tree.diagnostics);
     }
@@ -4453,7 +4510,7 @@ mod tests {
             "#,
         );
         let n = count(&tree, |d| {
-            matches!(d, Diagnostic::MissingDynamicKeyTypeHint { .. })
+            matches!(d, Diagnostic::DynamicKeyTypeUnknown { .. })
         });
         assert_eq!(n, 0, "{:?}", tree.diagnostics);
     }
@@ -4469,7 +4526,7 @@ mod tests {
             "#,
         );
         let n = count(&tree, |d| {
-            matches!(d, Diagnostic::MissingDynamicKeyTypeHint { .. })
+            matches!(d, Diagnostic::DynamicKeyTypeUnknown { .. })
         });
         assert_eq!(n, 0, "{:?}", tree.diagnostics);
     }
@@ -4542,22 +4599,25 @@ mod tests {
         assert_eq!(n, 0, "{:?}", tree.diagnostics);
     }
 
-    /// v1.4 reverse: same shape without `#strict` — no
-    /// `UnknownReferenceType` even when the tail-walk fails. The older
-    /// `UnresolvedReference` warning is what fires for that case.
+    /// v2: even without `#strict`, the path-tail walker reports
+    /// `UnknownReferenceType` for a positively-known broken step
+    /// (`o.unknown` on `Order` with no such field). The analyzer has
+    /// the schema's field index, so the failure is a static error
+    /// regardless of mode. Pre-v2 this case was silent in non-strict
+    /// and only the legacy `UnresolvedReference` warning fired.
     #[test]
-    fn v1_4_non_strict_path_tail_no_unknown_ref_type() {
+    fn non_strict_path_tail_reports_unknown_ref_type() {
         let tree = analyze_str(
             r#"
             #schema Order { Int id: *, Float total: * }
-            #main(Order o) -> Dict
+            #main(Order o) -> Dict<String, Int>
             { x: o.unknown }
             "#,
         );
         let n = count(&tree, |d| {
-            matches!(d, Diagnostic::UnknownReferenceType { .. })
+            matches!(d, Diagnostic::UnknownReferenceType { name, .. } if name == "unknown")
         });
-        assert_eq!(n, 0, "{:?}", tree.diagnostics);
+        assert_eq!(n, 1, "{:?}", tree.diagnostics);
     }
 
     /// v1.4 forward: strict mode reports `UnknownReferenceType`
@@ -4597,14 +4657,14 @@ mod tests {
             "#,
         );
         let n = count(&tree, |d| {
-            matches!(d, Diagnostic::MissingSpreadTypeHint { .. })
+            matches!(d, Diagnostic::SpreadSourceTypeUnknown { .. })
         });
         assert_eq!(n, 0, "{:?}", tree.diagnostics);
     }
 
     /// v1.4 forward: strict mode + path-spread of a `Dict<K,V>` field
     /// — the value type is fully classified even though keys are
-    /// dynamic. No MissingSpreadTypeHint.
+    /// dynamic. No SpreadSourceTypeUnknown.
     #[test]
     fn v1_4_strict_path_spread_dict_silent() {
         let tree = analyze_str(
@@ -4616,7 +4676,7 @@ mod tests {
             "#,
         );
         let n = count(&tree, |d| {
-            matches!(d, Diagnostic::MissingSpreadTypeHint { .. })
+            matches!(d, Diagnostic::SpreadSourceTypeUnknown { .. })
         });
         assert_eq!(n, 0, "{:?}", tree.diagnostics);
     }
@@ -4639,7 +4699,7 @@ mod tests {
             "#,
         );
         let n = count(&tree, |d| {
-            matches!(d, Diagnostic::MissingSpreadTypeHint { .. })
+            matches!(d, Diagnostic::SpreadSourceTypeUnknown { .. })
         });
         assert_eq!(n, 0, "{:?}", tree.diagnostics);
     }
@@ -4670,7 +4730,7 @@ mod tests {
     /// well-formed list comprehension. The v1.5 inference engine now
     /// derives `List<Int>` for `[x * 2 for x in range(5) if x > 0]`,
     /// matching the declared `List<Int>` slot — no diagnostic.
-    /// (Pre-v1.5 this was an `InferenceLimit` because the comprehension
+    /// (Pre-v1.5 this was an `ExpressionTypeUnknown` because the comprehension
     /// was unconditionally opaque.)
     #[test]
     fn v1_5_strict_typed_binding_comprehension_inferable() {
@@ -4680,9 +4740,9 @@ mod tests {
             { List<Int> xs: [x * 2 for x in range(5) if x > 0] }
             "#,
         );
-        // No InferenceLimit / StaticTypeMismatch — strict mode is
+        // No ExpressionTypeUnknown / StaticTypeMismatch — strict mode is
         // satisfied by the comprehension's derived element type.
-        let il = count(&tree, |d| matches!(d, Diagnostic::InferenceLimit { .. }));
+        let il = count(&tree, |d| matches!(d, Diagnostic::ExpressionTypeUnknown { .. }));
         let stm = count(&tree, |d| {
             matches!(d, Diagnostic::StaticTypeMismatch { .. })
         });
@@ -4691,7 +4751,7 @@ mod tests {
     }
 
     /// v1.4 reverse: a typed binding whose value *is* inferrable
-    /// (literal Int) doesn't fire InferenceLimit even under strict
+    /// (literal Int) doesn't fire ExpressionTypeUnknown even under strict
     /// mode.
     #[test]
     fn v1_4_strict_typed_binding_inferrable_silent() {
@@ -4701,12 +4761,12 @@ mod tests {
             { Int x: 42 }
             "#,
         );
-        let n = count(&tree, |d| matches!(d, Diagnostic::InferenceLimit { .. }));
+        let n = count(&tree, |d| matches!(d, Diagnostic::ExpressionTypeUnknown { .. }));
         assert_eq!(n, 0, "{:?}", tree.diagnostics);
     }
 
     /// v1.4 forward: strict mode + a match arm whose body relies on
-    /// an unknown call — InferenceLimit pinned on the arm body.
+    /// an unknown call — ExpressionTypeUnknown pinned on the arm body.
     #[test]
     fn v1_4_strict_match_arm_uninferrable() {
         let tree = analyze_str(
@@ -4718,14 +4778,14 @@ mod tests {
             "#,
         );
         let n = count(&tree, |d| {
-            matches!(d, Diagnostic::InferenceLimit { reason, .. }
+            matches!(d, Diagnostic::ExpressionTypeUnknown { reason, .. }
                 if reason.contains("match arm"))
         });
         assert!(n >= 1, "{:?}", tree.diagnostics);
     }
 
     /// v1.4 reverse: strict mode + a match where every arm is
-    /// inferrable — no InferenceLimit. Verifies the strict-aware
+    /// inferrable — no ExpressionTypeUnknown. Verifies the strict-aware
     /// walker doesn't false-flag well-typed matches.
     #[test]
     fn v1_4_strict_match_arms_inferrable_silent() {
@@ -4737,7 +4797,7 @@ mod tests {
             { result: s match { on: 1, off: 0 } }
             "#,
         );
-        let n = count(&tree, |d| matches!(d, Diagnostic::InferenceLimit { .. }));
+        let n = count(&tree, |d| matches!(d, Diagnostic::ExpressionTypeUnknown { .. }));
         assert_eq!(n, 0, "{:?}", tree.diagnostics);
     }
 
@@ -4769,7 +4829,7 @@ mod tests {
         });
         assert_eq!(n, 0, "{:?}", tree.diagnostics);
         let m = count(&tree, |d| {
-            matches!(d, Diagnostic::MissingSpreadTypeHint { .. })
+            matches!(d, Diagnostic::SpreadSourceTypeUnknown { .. })
         });
         assert_eq!(m, 0, "{:?}", tree.diagnostics);
     }
@@ -4790,7 +4850,7 @@ mod tests {
             "#,
         );
         let n = count(&tree, |d| {
-            matches!(d, Diagnostic::MissingSpreadTypeHint { .. })
+            matches!(d, Diagnostic::SpreadSourceTypeUnknown { .. })
         });
         assert_eq!(n, 0, "{:?}", tree.diagnostics);
     }
@@ -4799,7 +4859,7 @@ mod tests {
 
     /// v1.5 forward: list comprehension under a typed `List<Int>` slot
     /// produces the matching element type and silences strict checks
-    /// that previously fired `InferenceLimit`.
+    /// that previously fired `ExpressionTypeUnknown`.
     #[test]
     fn v1_5_strict_comprehension_list_int_silent() {
         let tree = analyze_str(
@@ -4808,7 +4868,7 @@ mod tests {
             { List<Int> doubled: [x * 2 for x in range(5)] }
             "#,
         );
-        let il = count(&tree, |d| matches!(d, Diagnostic::InferenceLimit { .. }));
+        let il = count(&tree, |d| matches!(d, Diagnostic::ExpressionTypeUnknown { .. }));
         let stm = count(&tree, |d| {
             matches!(d, Diagnostic::StaticTypeMismatch { .. })
         });
@@ -4879,7 +4939,7 @@ mod tests {
             "#,
         );
         let n = count(&tree, |d| {
-            matches!(d, Diagnostic::StrictForbidsUntypedClosureParam { param_name, .. }
+            matches!(d, Diagnostic::ClosureParamTypeMissing { param_name, .. }
                 if param_name == "n")
         });
         assert!(n >= 1, "{:?}", tree.diagnostics);
@@ -4895,14 +4955,14 @@ mod tests {
             "#,
         );
         let n = count(&tree, |d| {
-            matches!(d, Diagnostic::StrictForbidsUntypedClosureParam { .. })
+            matches!(d, Diagnostic::ClosureParamTypeMissing { .. })
         });
         assert_eq!(n, 0, "{:?}", tree.diagnostics);
     }
 
     /// v1.5 forward: typed param but body relies on an unknown call,
     /// no declared `-> ReturnType`. Body inference yields `Any` →
-    /// StrictForbidsUnclassifiedClosureBody.
+    /// ClosureReturnTypeUnknown.
     #[test]
     fn v1_5_strict_closure_unclassified_body_flagged() {
         let tree = analyze_str(
@@ -4912,14 +4972,14 @@ mod tests {
             "#,
         );
         let n = count(&tree, |d| {
-            matches!(d, Diagnostic::StrictForbidsUnclassifiedClosureBody { .. })
+            matches!(d, Diagnostic::ClosureReturnTypeUnknown { .. })
         });
         assert!(n >= 1, "{:?}", tree.diagnostics);
     }
 
     /// v1.5 reverse: declared `-> ReturnType` makes the closure body
     /// classifiable from the signature alone — no
-    /// StrictForbidsUnclassifiedClosureBody.
+    /// ClosureReturnTypeUnknown.
     #[test]
     fn v1_5_strict_closure_declared_return_silent() {
         let tree = analyze_str(
@@ -4929,7 +4989,7 @@ mod tests {
             "#,
         );
         let n = count(&tree, |d| {
-            matches!(d, Diagnostic::StrictForbidsUnclassifiedClosureBody { .. })
+            matches!(d, Diagnostic::ClosureReturnTypeUnknown { .. })
         });
         assert_eq!(n, 0, "{:?}", tree.diagnostics);
     }
@@ -5019,7 +5079,7 @@ mod tests {
     }
 
     /// v1.5 forward: list element under strict mode whose value can't
-    /// be classified (FnCall without sig). InferenceLimit pinned on
+    /// be classified (FnCall without sig). ExpressionTypeUnknown pinned on
     /// the element.
     #[test]
     fn v1_5_strict_list_element_uninferable() {
@@ -5030,7 +5090,7 @@ mod tests {
             "#,
         );
         let il = count(&tree, |d| {
-            matches!(d, Diagnostic::InferenceLimit { reason, .. }
+            matches!(d, Diagnostic::ExpressionTypeUnknown { reason, .. }
                 if reason.contains("list element"))
         });
         assert!(il >= 1, "{:?}", tree.diagnostics);
@@ -5045,12 +5105,12 @@ mod tests {
             [1, 2, 3]
             "#,
         );
-        let il = count(&tree, |d| matches!(d, Diagnostic::InferenceLimit { .. }));
+        let il = count(&tree, |d| matches!(d, Diagnostic::ExpressionTypeUnknown { .. }));
         assert_eq!(il, 0, "{:?}", tree.diagnostics);
     }
 
     /// v1.5 forward: untyped dict value with opaque expression →
-    /// InferenceLimit.
+    /// ExpressionTypeUnknown.
     #[test]
     fn v1_5_strict_dict_value_uninferable() {
         let tree = analyze_str(
@@ -5060,7 +5120,7 @@ mod tests {
             "#,
         );
         let il = count(&tree, |d| {
-            matches!(d, Diagnostic::InferenceLimit { reason, .. }
+            matches!(d, Diagnostic::ExpressionTypeUnknown { reason, .. }
                 if reason.contains("dict field"))
         });
         assert!(il >= 1, "{:?}", tree.diagnostics);
@@ -5152,7 +5212,7 @@ mod tests {
             "#,
         );
         let n = count(&tree, |d| {
-            matches!(d, Diagnostic::MissingSpreadTypeHint { .. })
+            matches!(d, Diagnostic::SpreadSourceTypeUnknown { .. })
         });
         assert_eq!(n, 0, "{:?}", tree.diagnostics);
     }
@@ -5527,18 +5587,18 @@ mod tests {
         assert!(
             count(
                 &tree,
-                |d| matches!(d, Diagnostic::InferenceLimit { reason, .. }
+                |d| matches!(d, Diagnostic::ExpressionTypeUnknown { reason, .. }
                 if reason.contains("list element"))
             ) >= 1,
-            "list element InferenceLimit missing: {:?}",
+            "list element ExpressionTypeUnknown missing: {:?}",
             tree.diagnostics
         );
         assert!(
             count(&tree, |d| matches!(
                 d,
-                Diagnostic::StrictForbidsUnclassifiedClosureBody { .. }
+                Diagnostic::ClosureReturnTypeUnknown { .. }
             )) >= 1,
-            "closure body StrictForbidsUnclassifiedClosureBody missing: {:?}",
+            "closure body ClosureReturnTypeUnknown missing: {:?}",
             tree.diagnostics
         );
         assert!(
@@ -5552,10 +5612,10 @@ mod tests {
         assert!(
             count(&tree, |d| matches!(
                 d,
-                Diagnostic::StrictForbidsUntypedClosureParam { param_name, .. }
+                Diagnostic::ClosureParamTypeMissing { param_name, .. }
                     if param_name == "n"
             )) >= 1,
-            "untyped param StrictForbidsUntypedClosureParam missing: {:?}",
+            "untyped param ClosureParamTypeMissing missing: {:?}",
             tree.diagnostics
         );
     }

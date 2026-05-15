@@ -1,7 +1,0 @@
-// v1.4 reverse: same shape as `strict_unknown_field.relon` but without
-// `#strict`. The analyzer must NOT push UnknownReferenceType (the
-// existing `UnresolvedReference` warning still fires for `o.unknown`).
-// EXPECTED: 0 × UnknownReferenceType.
-#schema Order { Int id: *, Float total: * }
-#main(Order o) -> Dict<String, Int>
-{ x: o.unknown }

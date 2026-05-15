@@ -419,30 +419,40 @@ workspace 分析器会把 strict bit 传播给该 entry 的所有可达 `#import
 模块。被 import 的 lib 即使自己没写 `#strict` 也按 strict 校验。这
 是为了防止「非 strict lib 把 silent fallback 偷渡给 strict entry」。
 
-**新增诊断（strict 下报 Error 级别）**：
+**新增诊断**（均为 Error 级别）。v2 起按「静态信息是否齐备」拆成
+**跨模式**与**仅 strict** 两组——完整对照见
+[严格模式参考](./strict-mode.md)。
+
+跨模式（与 `#strict` 无关，两种模式都报）：
 
 | Diagnostic | 触发条件 |
 |---|---|
-| `MissingSpreadTypeHint` | `{ ...e }` 中 `e` 不是 dict 字面量、也没有 `<T>` typehint、且无法从 path-tail（`...x.y`）或 FnCall 签名（`...f()`）推出 schema/Dict 类型 |
-| `MissingDynamicKeyTypeHint` | `{ [k]: v }` 缺少 `<T>` typehint |
-| `UnresolvedSchema` | typed spread / dynamic key 中 `<T>` 引用了未声明的 schema |
-| `UnknownReferenceType { name, path }` | path-tail 推断在某段失败：头部或中段类型未知（如 `o.unknown`），中段是无字段的 leaf 类型（如 `o.id.something`），或 v1.5 起 strict 下 head 完全 unresolved。`name` 是失败段，`path` 是源码顺序的完整段链 |
-| `InferenceLimit { reason }` | 真正不可静态分类的位点：FnCall 无签名落在 typed slot、list 元素 / dict 字段值不可推、match arm body 不可推。`reason` 描述具体子类 |
-| `StrictForbidsNativeReturn` | 调用一个被 host 注册了名字、但没在 `host_fn_signatures` 里登记返回类型的 native fn |
-| `StrictForbidsUntypedClosureParam { param_name }` | v1.5：closure 参数没标 type，body 推断会被默认 `Any` 污染 |
-| `StrictForbidsUnclassifiedClosureBody { role }` | v1.5：closure 既未声明 `-> ReturnType`，body 推断又落到 `Any`，签名最终带 Any 返回 |
-| `ExplicitAnyForbidden { context }` | v1.6：用户在源码任意类型位置写了 `Any`（包括嵌套 `List<Any>` / `Dict<String, Any>`）。**这一条与 strict 模式无关**，所有模式都报 |
-| `BareGenericContainer { type_name, context }` | v1.7：用户写了不带泛型参数的 `List` / `Dict` / `Closure` / `Fn` / `Enum`——pre-v1.7 它们静默展开为 `<Any>`。**与 strict 模式无关**，与 `ExplicitAnyForbidden` 同等地位 |
-| `DuplicateField` | spread 引入的 key 与另一个 named field 或 spread 冲突（**这一条 strict 与否都报**）|
+| `NonSpreadableSource { source_type }` | `{ ...e }` 中 `e` 的静态类型已知但**不是** dict 形（如 `Int` / `Bool` / `List<T>`）。任何 `<T>` hint 都救不了——程序在任何模式都错 |
+| `UnresolvedSchema` | `<Schema>` 标注（typed spread、动态键 hint 等）引用了 workspace 未声明的 schema |
+| `UnknownReferenceType { name, path }` | path-tail 走查掌握到某段确切错误：下钻到未声明的 schema 字段（`o.unknown`）、越过叶子类型继续下钻（`o.id.something`），或者——在 strict 下——下钻进 `Any` |
+| `DuplicateField` | spread 引入的 key 与另一个 named field 或 spread 冲突 |
+| `ExplicitAnyForbidden { context }` | v1.6：用户在源码任意类型位置写了 `Any`（包括嵌套 `List<Any>` / `Dict<String, Any>`）。`Any` 已从用户面退役 |
+| `BareGenericContainer { type_name, context }` | v1.7：用户写了不带泛型参数的 `List` / `Dict` / `Closure` / `Fn` / `Enum` |
+
+仅 strict（信息**真的**缺失，而非「静态已知」）：
+
+| Diagnostic | 触发条件 |
+|---|---|
+| `SpreadSourceTypeUnknown` | `{ ...e }` 中 analyzer 真的拿不到 `e` 的静态形状（未标类型的 closure 参数、未标的 binding 等），且没有 `<T>` hint。修法是给 spread 加 hint 或给源标类型 |
+| `DynamicKeyTypeUnknown` | `{ [k]: v }` 缺少 `<T>` typehint |
+| `ExpressionTypeUnknown { reason }` | 真正不可静态分类的位点：FnCall 无签名落在 typed slot、list 元素 / dict 字段值不可推、match arm body 不可推 |
+| `NativeFnSignatureMissing { fn_name }` | 调用一个被 host 注册了名字、但没在 `host_fn_signatures` 里登记返回类型的 native fn |
+| `ClosureParamTypeMissing { param_name }` | closure 参数没标 type，body 推断会被默认 `Any` 污染 |
+| `ClosureReturnTypeUnknown { role }` | closure 既未声明 `-> ReturnType`，body 推断又落到 `Any`，签名最终带 Any 返回 |
 
 **v1.4 path-tail 推断细则**（针对 `Variable` / `Reference` 多段路径）：
 
-* `Schema(name)` 头：下一段必须是该 schema 声明过的字段；不存在 → strict 下 `UnknownReferenceType`。
-* `Dict<K, V>` 头：每段都解析成 V（值类型一致），strict 接受。
+* `Schema(name)` 头：下一段必须是该 schema 声明过的字段；不存在 → `UnknownReferenceType`（跨模式）。
+* `Dict<K, V>` 头：每段都解析成 V（值类型一致）。
 * `Optional<T>` 头：在尝试下一段前自动 strip 一层 `?` 包装，再按 T 处理。
-* `Any` 头：v1.6/v1.7 双禁之后，唯一仍能命中此分支的位点是「非 strict 模式下未类型化的 closure 参数」（strict 会被 `StrictForbidsUntypedClosureParam` 提前拦截）；继续传播 `Any`，由 runtime 兜底。
+* `Any` 头：v1.6/v1.7 双禁之后，唯一仍能命中此分支的位点是未标类型的 closure 参数（strict 会被 `ClosureParamTypeMissing` 提前拦截）；继续传播 `Any`，由 runtime 兜底。
 * `Tuple<T1, T2, ...>` 头（v1.7）：tuple 是位置型而非名字型，按名字下钻一律 `UnknownStep`（未来若引入 `pair.0` / `pair.1` 位置访问语法，会从这条分支接入）。
-* `Int` / `String` / `Bool` / `List<...>` 等 leaf 头：不能继续下钻，strict 下 `UnknownReferenceType`。
+* `Int` / `String` / `Bool` / `List<...>` 等 leaf 头：不能继续下钻 → `UnknownReferenceType`（跨模式）。
 
 **v1.4 typed spread 扩展接受的源**（在 `<T>` 显式 typehint 之外）：
 
@@ -451,7 +461,7 @@ workspace 分析器会把 strict bit 传播给该 entry 的所有可达 `#import
 * 同级 typed 字段：`...e`（`Type e: ...` 已是 v1.3 行为）
 * dict literal：`...{ a: 1 }`（v1.3 行为）
 
-推不出时优先报 path-tail 的具体诊断（如 `UnknownReferenceType`），避免与 generic `MissingSpreadTypeHint` 重叠。
+推不出时优先报 path-tail 的具体诊断（如 `UnknownReferenceType`），避免与 generic `SpreadSourceTypeUnknown` 重叠。
 
 **v1.5 推断升级**——以下表达式从「runtime 才能定」变为「analyzer 静态推断」：
 
@@ -468,9 +478,11 @@ workspace 分析器会把 strict bit 传播给该 entry 的所有可达 `#import
   cross-module 与 sibling-method 形态。
 
 经过 v1.5 后，**strict 模式下唯一的 silent fallback 仅剩**：（i）host 注册了名字
-但没声明签名的 native fn（已由 `StrictForbidsNativeReturn` 覆盖）；（ii）真正动态
-键 / spread 等用户主动选择的 untyped 位点，已由 `Missing*Hint` 系列覆盖。所有
-「能从 source + schemas 推得出」的位点都被静态检查捕获。
+但没声明签名的 native fn（由 `NativeFnSignatureMissing` 覆盖）；（ii）真正动态
+键 / spread 等用户主动选择的 untyped 位点（由 `SpreadSourceTypeUnknown` /
+`DynamicKeyTypeUnknown` 覆盖）。所有「能从 source + schemas 推得出」的位点都被
+静态检查捕获——v2 进一步把「静态已知错」的检查（非 dict spread 源、未声明
+schema、broken path 段）都升为跨模式 Error。
 
 **v1.6：`Any` 类型从用户空间彻底退役**
 

@@ -3032,7 +3032,7 @@ o.customer.name"#;
 
 /// v1.4 forward: strict mode with a path-spread of a typed field
 /// (`...o.extras` where Order.extras : Extras) — analyzer is silent
-/// (no MissingSpreadTypeHint) and evaluation produces the merged dict.
+/// (no SpreadSourceTypeUnknown) and evaluation produces the merged dict.
 #[test]
 fn v1_4_run_main_strict_path_spread_schema() {
     use std::collections::{BTreeMap, HashMap};
@@ -3043,7 +3043,7 @@ fn v1_4_run_main_strict_path_spread_schema() {
 { id: o.id, ...o.extras }"#;
     let node = parse_doc(source);
     let analyzed = std::sync::Arc::new(relon_analyzer::analyze(&node));
-    // No MissingSpreadTypeHint and no UnknownReferenceType — proves
+    // No SpreadSourceTypeUnknown and no UnknownReferenceType — proves
     // the spread extension accepted the path-derived schema.
     let strict_diags = analyzed
         .diagnostics
@@ -3051,7 +3051,7 @@ fn v1_4_run_main_strict_path_spread_schema() {
         .filter(|d| {
             matches!(
                 d,
-                relon_analyzer::Diagnostic::MissingSpreadTypeHint { .. }
+                relon_analyzer::Diagnostic::SpreadSourceTypeUnknown { .. }
                     | relon_analyzer::Diagnostic::UnknownReferenceType { .. }
             )
         })
@@ -3148,7 +3148,7 @@ fn v1_5_run_main_where_int() {
 }
 
 /// v1.5 forward: strict mode with a typed closure parameter — the
-/// analyzer is silent on `StrictForbidsUntypedClosureParam` and the
+/// analyzer is silent on `ClosureParamTypeMissing` and the
 /// sibling-callable form runs cleanly.
 #[test]
 fn v1_5_run_strict_closure_typed_param() {
@@ -3162,7 +3162,7 @@ fn v1_5_run_strict_closure_typed_param() {
         .filter(|d| {
             matches!(
                 d,
-                relon_analyzer::Diagnostic::StrictForbidsUntypedClosureParam { .. }
+                relon_analyzer::Diagnostic::ClosureParamTypeMissing { .. }
             )
         })
         .count();
@@ -3184,7 +3184,7 @@ fn v1_5_strict_closure_untyped_param_flagged_via_evaluator_pipeline() {
         .filter(|d| {
             matches!(
                 d,
-                relon_analyzer::Diagnostic::StrictForbidsUntypedClosureParam { param_name, .. }
+                relon_analyzer::Diagnostic::ClosureParamTypeMissing { param_name, .. }
                     if param_name == "n"
             )
         })
@@ -3204,7 +3204,7 @@ fn v1_5_strict_typed_list_comp_silent() {
     let il = analyzed
         .diagnostics
         .iter()
-        .filter(|d| matches!(d, relon_analyzer::Diagnostic::InferenceLimit { .. }))
+        .filter(|d| matches!(d, relon_analyzer::Diagnostic::ExpressionTypeUnknown { .. }))
         .count();
     let stm = analyzed
         .diagnostics
@@ -3795,18 +3795,21 @@ n + 1"#;
 
 #[test]
 fn v13_strict_mode_blocks_eval_when_spread_lacks_hint() {
-    // v1.3 end-to-end: `#strict\n{ src: 1+2, val: { ...src } }`
-    // is reported by the analyzer with `MissingSpreadTypeHint`; hosts
-    // that gate eval on `analyzed.has_errors()` never reach the
-    // evaluator, the documented contract.
-    let source = "#strict\n{ src: 1 + 2, val: { ...src } }";
+    // v1.3 end-to-end (v2-updated): strict mode flags a spread whose
+    // source's static type is genuinely unknown. The pre-v2 fixture
+    // used `1 + 2` as the source; v2 now flags that case via the
+    // cross-mode `NonSpreadableSource`. An untyped closure parameter
+    // is the canonical "type genuinely unknown" case — analyzer
+    // reports `SpreadSourceTypeUnknown` and hosts that gate eval on
+    // `analyzed.has_errors()` never reach the evaluator.
+    let source = "#strict\n{ f: (n) => { ...n } }";
     let node = parse_doc(source);
     let analyzed = relon_analyzer::analyze(&node);
     assert!(
         analyzed
             .diagnostics
             .iter()
-            .any(|d| matches!(d, relon_analyzer::Diagnostic::MissingSpreadTypeHint { .. })),
+            .any(|d| matches!(d, relon_analyzer::Diagnostic::SpreadSourceTypeUnknown { .. })),
         "{:?}",
         analyzed.diagnostics
     );
@@ -3823,7 +3826,7 @@ fn v13_strict_mode_blocks_eval_when_dynkey_lacks_hint() {
     assert!(
         analyzed.diagnostics.iter().any(|d| matches!(
             d,
-            relon_analyzer::Diagnostic::MissingDynamicKeyTypeHint { .. }
+            relon_analyzer::Diagnostic::DynamicKeyTypeUnknown { .. }
         )),
         "{:?}",
         analyzed.diagnostics

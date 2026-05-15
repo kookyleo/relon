@@ -1,4 +1,8 @@
-// v1.3: a non-strict lib that contains a silent-fallback shape (a
-// non-literal untyped spread). Imported by `entry.relon`, which is
-// strict — contagion makes the analyzer flag this lib's spread.
-{ src: 1 + 2, val: { ...src } }
+// v1.3 (v2-updated): a non-strict lib whose silent-fallback shape
+// requires strict contagion to surface. The previous fixture used
+// `{ src: 1 + 2, val: { ...src } }` — v2 now flags that case
+// cross-mode via `NonSpreadableSource` (no contagion needed), so
+// the contagion test moved to a closure-param spread instead.
+// Imported by `entry.relon`, which is strict — contagion makes the
+// analyzer flag the inner `{ ...n }` whose source type is Any.
+{ f: (n) => { ...n } }

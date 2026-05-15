@@ -94,7 +94,7 @@ spread source:
 ```
 
 Under `#strict` mode, a spread source that isn't a dict literal and
-lacks a `<T>` hint triggers `MissingSpreadTypeHint`.
+lacks a `<T>` hint triggers `SpreadSourceTypeUnknown`.
 
 **v1.3 typed dynamic key**: write `<T>` after `[` to type-hint the
 dynamic key:
@@ -105,7 +105,7 @@ dynamic key:
 ```
 
 Under `#strict` mode, a dynamic key missing `<T>` triggers
-`MissingDynamicKeyTypeHint`.
+`DynamicKeyTypeUnknown`.
 
 #### `Dict<K, V>` generics (formally specified in v1.3)
 
@@ -238,13 +238,13 @@ inference" mode:
 Under strict mode, sites where the analyzer would normally silently
 fall back to `Any` (and defer to runtime) now produce errors:
 
-- A spread without a type hint (`{ ...e }`) → `MissingSpreadTypeHint`.
+- A spread without a type hint (`{ ...e }`) → `SpreadSourceTypeUnknown`.
 - A dynamic key without a type hint (`{ [k]: v }`) →
-  `MissingDynamicKeyTypeHint`.
+  `DynamicKeyTypeUnknown`.
 - A typed spread / dynamic-key `<T>` referencing an undeclared schema
   → `UnresolvedSchema`.
 - A call to a native fn whose return type isn't registered in
-  `host_fn_signatures` → `StrictForbidsNativeReturn`.
+  `host_fn_signatures` → `NativeFnSignatureMissing`.
 
 **Contagion**: strict is decided at the entry. Write `#strict` once at
 the entry, and every imported library (even one that didn't write

@@ -1104,13 +1104,13 @@ fn is_typecheck_owned_diagnostic(d: &Diagnostic) -> bool {
             // walkers. All of them re-derive on each typecheck run,
             // so the import-aware rerun must clear them too.
             | Diagnostic::UnknownReferenceType { .. }
-            | Diagnostic::InferenceLimit { .. }
-            | Diagnostic::MissingSpreadTypeHint { .. }
-            | Diagnostic::MissingDynamicKeyTypeHint { .. }
+            | Diagnostic::ExpressionTypeUnknown { .. }
+            | Diagnostic::SpreadSourceTypeUnknown { .. }
+            | Diagnostic::DynamicKeyTypeUnknown { .. }
             | Diagnostic::DuplicateField { .. }
-            | Diagnostic::StrictForbidsNativeReturn { .. }
-            | Diagnostic::StrictForbidsUntypedClosureParam { .. }
-            | Diagnostic::StrictForbidsUnclassifiedClosureBody { .. }
+            | Diagnostic::NativeFnSignatureMissing { .. }
+            | Diagnostic::ClosureParamTypeMissing { .. }
+            | Diagnostic::ClosureReturnTypeUnknown { .. }
             // Schema-rooted Phase B dispatch diagnostics — re-derived
             // by `check_method_dispatch` on every typecheck run, so
             // they must be cleared too. Otherwise a single-module
@@ -2017,9 +2017,12 @@ mod tests {
     }
 
     /// v1.3 forward: a strict entry catches a silent-fallback in an
-    /// imported module (untyped non-literal spread). The import stamps
-    /// strict_mode=true on the lib, which then runs the spread check
-    /// and emits `MissingSpreadTypeHint`.
+    /// imported module. Pre-v2 the analyzer would only emit
+    /// `SpreadSourceTypeUnknown` under strict contagion; v2 splits the
+    /// spread check so non-dict sources (`1 + 2` → `Int`) fire
+    /// `NonSpreadableSource` cross-mode. This test now verifies the
+    /// cross-mode form fires regardless of contagion, since the
+    /// statically-known non-dict source is wrong in any mode.
     #[test]
     fn v1_3_strict_contagion_catches_lib_silent_fallback() {
         let mut loader = MapLoader::new();
@@ -2034,8 +2037,8 @@ mod tests {
         assert!(
             lib_diags
                 .iter()
-                .any(|d| matches!(d, Diagnostic::MissingSpreadTypeHint { .. })),
-            "lib should report MissingSpreadTypeHint under strict contagion: {:?}",
+                .any(|d| matches!(d, Diagnostic::NonSpreadableSource { .. })),
+            "lib should report NonSpreadableSource: {:?}",
             lib_diags
         );
     }

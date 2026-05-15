@@ -1353,7 +1353,7 @@ pub(crate) fn walk_path(path: &[TokenKey], scope: &TypeScope) -> PathTailOutcome
                 // After v1.6 ban-`Any` and v1.7 ban-bare-generic, the
                 // only path-head that can still land here is a closure
                 // parameter without a `type_hint` under non-strict
-                // mode (strict raises `StrictForbidsUntypedClosureParam`
+                // mode (strict raises `ClosureParamTypeMissing`
                 // and never reaches the walker). Propagate `Any` so
                 // non-strict callers continue to defer to runtime.
                 return PathTailOutcome::Resolved(InferredType::Any);
