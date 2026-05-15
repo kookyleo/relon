@@ -2732,9 +2732,19 @@ watch([files, entry, argsInput], () => {
    the editor's own background, no bordered ribbon, and active items
    carry a 2px coloured underline instead of a filled chip. Inactive
    tabs are bare text; hover gets a soft tone but no border. */
+/* The toolbar row above each editor pane. Both panes use this class;
+   pinning a fixed height here is what keeps the left (editor: file
+   tabs + framed Format button) and right (output: JSON / Rendered
+   tabs) rows visually identical so the editor content below starts at
+   the same y-offset on both sides. Without `min-height` the row
+   collapses to the tallest child, and the framed Format button being
+   ~2px taller than a bare `.rp-tab` left the right pane sitting
+   higher. Children opt out of stretch with `align-self` if they want
+   their own visual height. */
 .rp-tabs {
   display: flex;
   align-items: stretch;
+  min-height: 32px;
   gap: 0;
   padding: 0 8px;
   background: transparent;
