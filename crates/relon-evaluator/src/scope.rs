@@ -8,7 +8,7 @@
 use crate::value::Value;
 use relon_parser::Node;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 /// Iteration context for `&prev` / `&next` / `&index` references inside a list.
 pub struct ListContext {
@@ -53,9 +53,26 @@ impl RootRef {
     }
 }
 
-/// Single environment frame. Cheap to derive (every field is either `Clone` or
-/// already wrapped in `Arc` / `Mutex`); deliberately wrapped in `Arc<Scope>` at
-/// every call site so backtracking through `parent` doesn't require copies.
+/// Type alias for the bindings table. Wrapped in `Mutex` so concurrent
+/// host evaluators sharing a `Scope` across threads stay safe; the
+/// inner `HashMap` starts empty (zero-capacity, no heap allocation)
+/// and only grows when something actually writes a binding.
+pub type Locals = Mutex<HashMap<String, Value>>;
+
+/// Type alias for the thunks table — same shape as [`Locals`].
+pub(crate) type Thunks = Mutex<HashMap<String, Arc<Thunk>>>;
+
+/// Single environment frame. Cheap to derive (every field is either
+/// `Clone` or `Arc`-shared) and wrapped in `Arc<Scope>` at every call
+/// site so backtracking through `parent` stays copy-free.
+///
+/// `locals` and `thunks` are kept as `Mutex<HashMap>` rather than
+/// raw `HashMap` so multiple evaluator threads can share an embedder
+/// scope (e.g. the empty root scope) without external locking. The
+/// inner `HashMap` is constructed empty (`HashMap::new()` does not
+/// allocate until first insert), so hot-loop children that never
+/// register a binding pay no heap cost for these fields beyond the
+/// inline mutex word and the Scope's own `Arc` allocation.
 #[derive(Default)]
 pub struct Scope {
     /// Enclosing scope. `None` only at the document root.
@@ -66,7 +83,7 @@ pub struct Scope {
     pub path_node: Option<String>,
     /// Bindings introduced inside this frame (closure params, comprehension
     /// loop vars, `where` clauses, imported aliases).
-    pub locals: Mutex<HashMap<String, Value>>,
+    pub locals: Locals,
     /// Working directory used when resolving relative `#import` paths.
     pub current_dir: String,
     /// Stable namespace for the path cache; usually the canonical id of the
@@ -82,7 +99,7 @@ pub struct Scope {
     /// Lazily-resolved bindings for the dict that owns this scope. Kept
     /// `pub(crate)` so the evaluator can register and force them, but hidden
     /// from host code.
-    pub(crate) thunks: Mutex<HashMap<String, Arc<Thunk>>>,
+    pub(crate) thunks: Thunks,
 }
 
 impl std::fmt::Debug for Scope {
@@ -138,6 +155,22 @@ impl Scope {
         self.thunks.lock().unwrap().get(name).map(Arc::clone)
     }
 
+    /// Acquire a write lock on this scope's locals.
+    ///
+    /// Centralizes every write-side `scope.locals.lock().unwrap()` so
+    /// the locking strategy can evolve (e.g. swap to a lock-free or
+    /// thread-local representation under a feature) without touching
+    /// every call site. Read paths still go through
+    /// [`Scope::get_local`] which walks the parent chain.
+    pub fn locals_for_write(&self) -> MutexGuard<'_, HashMap<String, Value>> {
+        self.locals.lock().unwrap()
+    }
+
+    /// Same as [`Scope::locals_for_write`] but for the dict thunks table.
+    pub(crate) fn thunks_for_write(&self) -> MutexGuard<'_, HashMap<String, Arc<Thunk>>> {
+        self.thunks.lock().unwrap()
+    }
+
     /// Reconstruct the path from the document root to the current scope by
     /// walking `parent` pointers and collecting `path_node` segments.
     pub fn full_path(&self) -> Vec<String> {
@@ -175,6 +208,10 @@ impl Scope {
     /// This is the workhorse for every new lexical block — Dict body,
     /// comprehension iteration, closure body. The `with_*` methods below all
     /// build on top of it and only differ by which field they override.
+    /// The empty `Mutex<HashMap>` pair doesn't touch the heap until
+    /// somebody actually inserts a binding (zero-capacity HashMap +
+    /// inline mutex), so the comprehension hot loop only pays for the
+    /// Scope's own `Arc` allocation.
     pub fn child(self: &Arc<Self>) -> Arc<Self> {
         Arc::new(Self {
             parent: Some(Arc::clone(self)),
@@ -190,13 +227,20 @@ impl Scope {
 
     pub fn with_local(self: &Arc<Self>, name: String, val: Value) -> Arc<Self> {
         let child = self.child();
-        child.locals.lock().unwrap().insert(name, val);
+        child.locals_for_write().insert(name, val);
         child
     }
 
     pub fn with_locals(self: &Arc<Self>, new_locals: HashMap<String, Value>) -> Arc<Self> {
-        let child = self.child();
-        *child.locals.lock().unwrap() = new_locals;
+        let mut child = self.child();
+        // `child()` returned an Arc with no other strong references yet,
+        // so swap the freshly-built empty mutex for one already
+        // seeded with `new_locals`. Skips the lock+insert round-trip
+        // that a `with_local`-style write would pay on every
+        // comprehension iteration.
+        Arc::get_mut(&mut child)
+            .expect("freshly built child has no aliases")
+            .locals = Mutex::new(new_locals);
         child
     }
 
