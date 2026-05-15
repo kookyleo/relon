@@ -772,6 +772,137 @@ fn goto_definition_internal(
     }
 }
 
+/// Cursor-position hover info. `markdown` is the rendered tooltip
+/// body; `range_*_offset` are byte offsets into the entry source so
+/// the caller can position the tooltip.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HoverResult {
+    pub markdown: String,
+    pub range_start_offset: u32,
+    pub range_end_offset: u32,
+}
+
+/// Cursor-position signature help. `signature` is a rendered string
+/// like `currency(val: String, symbol: String) -> String`;
+/// `active_parameter` indexes which slot the cursor sits in.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignatureHelpResult {
+    pub signature: String,
+    pub active_parameter: u32,
+    pub range_start_offset: u32,
+    pub range_end_offset: u32,
+}
+
+/// Resolve a hover request at `(line, character)`. Returns the
+/// rendered tooltip + the source range it describes, or `null` when
+/// the cursor isn't on a hoverable symbol.
+#[wasm_bindgen]
+pub fn hover(
+    sources: JsValue,
+    entry: &str,
+    line: u32,
+    character: u32,
+) -> Result<JsValue, JsValue> {
+    let sources = decode_sources(sources).map_err(err_to_js)?;
+    let result = match hover_internal(&sources, entry, line, character) {
+        Some(r) => r,
+        None => return Ok(JsValue::NULL),
+    };
+    let serializer = serde_wasm_bindgen::Serializer::new().serialize_maps_as_objects(true);
+    result.serialize(&serializer).map_err(|err| {
+        err_to_js(ErrorReport::invalid_input(format!(
+            "hover result is not JS-serialisable: {err}"
+        )))
+    })
+}
+
+fn hover_internal(
+    sources: &HashMap<String, String>,
+    entry: &str,
+    line: u32,
+    character: u32,
+) -> Option<HoverResult> {
+    let source = sources.get(entry)?;
+    let workspace = build_workspace(sources, entry, source);
+    let tree = workspace.modules.get(entry)?;
+    let root = workspace.nodes.get(entry)?;
+    let info = relon_analyzer::hover::resolve(source, root, tree, line, character)?;
+    Some(HoverResult {
+        markdown: info.markdown,
+        range_start_offset: info.range.start.offset as u32,
+        range_end_offset: info.range.end.offset as u32,
+    })
+}
+
+/// Resolve a signature-help request. Returns the rendered callee
+/// signature + the active parameter index, or `null` when the cursor
+/// isn't inside a function call's argument list.
+#[wasm_bindgen]
+pub fn signature_help(
+    sources: JsValue,
+    entry: &str,
+    line: u32,
+    character: u32,
+) -> Result<JsValue, JsValue> {
+    let sources = decode_sources(sources).map_err(err_to_js)?;
+    let result = match signature_help_internal(&sources, entry, line, character) {
+        Some(r) => r,
+        None => return Ok(JsValue::NULL),
+    };
+    let serializer = serde_wasm_bindgen::Serializer::new().serialize_maps_as_objects(true);
+    result.serialize(&serializer).map_err(|err| {
+        err_to_js(ErrorReport::invalid_input(format!(
+            "signature_help result is not JS-serialisable: {err}"
+        )))
+    })
+}
+
+fn signature_help_internal(
+    sources: &HashMap<String, String>,
+    entry: &str,
+    line: u32,
+    character: u32,
+) -> Option<SignatureHelpResult> {
+    let source = sources.get(entry)?;
+    let workspace = build_workspace(sources, entry, source);
+    let tree = workspace.modules.get(entry)?;
+    let root = workspace.nodes.get(entry)?;
+    let info =
+        relon_analyzer::signature_help::resolve(source, root, tree, line, character)?;
+    Some(SignatureHelpResult {
+        signature: info.signature,
+        active_parameter: info.active_parameter as u32,
+        range_start_offset: info.range.start.offset as u32,
+        range_end_offset: info.range.end.offset as u32,
+    })
+}
+
+/// Build the workspace tree for the given entry using the same
+/// in-memory + std loader chain as `goto_definition` / `complete`.
+/// Pulled out so hover / signature_help share the construction.
+fn build_workspace(
+    sources: &HashMap<String, String>,
+    entry: &str,
+    source: &str,
+) -> relon_analyzer::workspace::WorkspaceTree {
+    let in_memory: Arc<dyn ModuleResolver> =
+        Arc::new(InMemoryModuleResolver::new(sources.clone()));
+    let std_resolver: Arc<dyn ModuleResolver> = Arc::new(StdModuleResolver);
+    let entry_dir = parent_dir(entry);
+    let entry_dir_path = PathBuf::from(if entry_dir.is_empty() {
+        ".".to_string()
+    } else {
+        entry_dir.clone()
+    });
+    let mut loader = ResolverChainLoader::from_resolvers(vec![in_memory, std_resolver]);
+    relon_analyzer::workspace::analyze_entry(
+        entry.to_string(),
+        source,
+        entry_dir_path,
+        &mut loader,
+    )
+}
+
 /// One completion candidate. Sent to JS as a plain object so the
 /// CodeMirror callback can map to `Completion` without parsing
 /// nested shapes.
