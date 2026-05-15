@@ -22,11 +22,9 @@
 //! symbol → usages index in `WorkspaceTree` yet. Cross-file references
 //! remain deferred (see `docs/internal/roadmap.md`).
 
-use crate::features::cursor::{covers, smallest_node_at};
-use crate::position::{position_to_offset, token_range};
+use crate::position::token_range;
 use crate::server::DocumentEntry;
 use lsp_types::{Location, Position, Url};
-use relon_parser::{Expr, Node, NodeId, TokenKey};
 
 /// Resolve `position` to the `NodeId` of the field whose references the
 /// user wants to find, then collect every in-file reference site.
@@ -36,79 +34,33 @@ use relon_parser::{Expr, Node, NodeId, TokenKey};
 /// but currently has no references — the LSP convention is "present
 /// with zero items" rather than "absent" so the client doesn't fall
 /// through to another provider.
+///
+/// Delegates the structural work to `relon_analyzer::references::resolve`;
+/// this function is just the LSP-shaped adapter (Position → line/char,
+/// TokenRange → `lsp_types::Range`, attach `uri`).
 pub fn resolve(
     entry: &DocumentEntry,
     position: Position,
     uri: &Url,
     include_declaration: bool,
 ) -> Option<Vec<Location>> {
-    let offset = position_to_offset(&entry.source, position);
-    let node = smallest_node_at(&entry.root, offset)?;
-
-    let target_id = match &*node.expr {
-        // Cursor on a reference/variable site — forward-resolve to find
-        // the definition, then collect every other reference to it.
-        Expr::Reference { .. } | Expr::Variable(_) => entry.tree.references.get(&node.id)?.target,
-        // Otherwise the cursor could be on a dict key (which is a
-        // `TokenKey::String`, *not* a Node, so `smallest_node_at` only
-        // returns the enclosing dict). Probe the dict's keys: if the
-        // cursor sits inside one, treat the paired value's `NodeId` as
-        // the target. Falling through to the smallest covering node
-        // (typically the value itself) handles "cursor on the value".
-        _ => key_target_at(node, offset).unwrap_or(node.id),
-    };
-
-    let mut locations = collect_references(entry, target_id, uri);
-    if include_declaration {
-        if let Some(decl) = entry.tree.node_index.get(&target_id) {
-            locations.insert(
-                0,
-                Location {
-                    uri: uri.clone(),
-                    range: token_range(decl.range),
-                },
-            );
-        }
-    }
-    Some(locations)
-}
-
-/// If `node` is a dict and `offset` lands inside one of its
-/// `TokenKey::String` keys, return the paired value's `NodeId`. Used
-/// so cursor-on-declaration ("the `a` in `a: 10`") behaves the same
-/// way cursor-on-value does — both kick off a reverse lookup against
-/// the analyzer's reference table.
-fn key_target_at(node: &Node, offset: usize) -> Option<NodeId> {
-    let Expr::Dict(pairs) = &*node.expr else {
-        return None;
-    };
-    for (key, value) in pairs {
-        if let TokenKey::String(_, range, _) = key {
-            if covers(*range, offset) {
-                return Some(value.id);
-            }
-        }
-    }
-    None
-}
-
-/// Walk `tree.references` once and emit a `Location` for every entry
-/// whose `target` matches `target_id`. Order follows hashmap iteration —
-/// LSP doesn't require a particular order, but for determinism in tests
-/// we sort by `(line, character)` of the start position.
-fn collect_references(entry: &DocumentEntry, target_id: NodeId, uri: &Url) -> Vec<Location> {
-    let mut out: Vec<Location> = entry
-        .tree
-        .references
-        .iter()
-        .filter(|(_, resolved)| resolved.target == target_id)
-        .map(|(_, resolved)| Location {
-            uri: uri.clone(),
-            range: token_range(resolved.source_range),
-        })
-        .collect();
-    out.sort_by_key(|loc| (loc.range.start.line, loc.range.start.character));
-    out
+    let ranges = relon_analyzer::references::resolve(
+        &entry.source,
+        &entry.root,
+        &entry.tree,
+        position.line,
+        position.character,
+        include_declaration,
+    )?;
+    Some(
+        ranges
+            .into_iter()
+            .map(|r| Location {
+                uri: uri.clone(),
+                range: token_range(r),
+            })
+            .collect(),
+    )
 }
 
 #[cfg(test)]
