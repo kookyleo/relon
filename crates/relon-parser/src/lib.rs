@@ -133,6 +133,7 @@ pub struct ParsedDocument {
 /// CST `ERROR` spans + lowering misses are collected as
 /// [`ParseDiagnostic`]s with byte-accurate ranges.
 pub fn parse_document_recovering(source: &str) -> ParsedDocument {
+    let _scope = lower::RecoveringScope::enter();
     let parse = cst::parse_cst(source);
     let mut nodes: Vec<Node> = Vec::new();
     let mut diagnostics: Vec<ParseDiagnostic> = Vec::new();
@@ -149,30 +150,61 @@ pub fn parse_document_recovering(source: &str) -> ParsedDocument {
     }
 
     if let Some(doc) = ast::document_of(parse.syntax()) {
-        // Lowering yields a single root Node when it succeeds. We
-        // attempt it unconditionally — `lower_document_node_v2` is
-        // tolerant of mostly-well-formed CSTs (the `parse.errors`
-        // list above already covers the holes) and returns `None`
-        // only when the root expression slot is empty or one of
-        // the sub-lowerings rejects.
+        // Lowering yields a single root Node when it succeeds. The
+        // partial-tolerant lowering already substitutes placeholders
+        // for individual sub-tree failures, so the only remaining
+        // `None` case here is when the CST has no recognizable root
+        // expression at all (e.g. a lone `@` or `#` with nothing
+        // attached). When that happens we still synthesize an empty
+        // top-level Node so IDE callers can attach completion to
+        // whatever cursor context they have.
         if doc.root_expr().is_some() {
             if let Some(node) = lower::lower_document_node_v2(&doc, source) {
                 nodes.push(node);
-            } else if parse.errors.is_empty() {
-                // CST clean but lowering failed — surface as a
-                // diagnostic on the document range so the IDE has
+            } else {
+                // Defensive: with partial-tolerant lowering this should
+                // never trigger, but keep a synthesized empty root and
+                // a diagnostic on the document range so the IDE has
                 // something to attach to.
                 let end_offset = source.len();
-                diagnostics.push(ParseDiagnostic {
-                    message: "could not lower CST to legacy Node".to_string(),
+                nodes.push(Node {
+                    id: NodeId::alloc(),
+                    expr: Box::new(Expr::Null),
+                    decorators: Vec::new(),
+                    directives: Vec::new(),
+                    type_hint: None,
                     range: lower::range_from_offsets(source, 0, end_offset),
+                    doc_comment: None,
+                });
+                if parse.errors.is_empty() {
+                    diagnostics.push(ParseDiagnostic {
+                        message: "could not lower CST to legacy Node".to_string(),
+                        range: lower::range_from_offsets(source, 0, end_offset),
+                    });
+                }
+            }
+        } else {
+            // No root expression slot — e.g. a lone `@`, `#`, or
+            // similar prefix the user is still typing. Synthesize an
+            // empty placeholder root so completion still has a
+            // navigable AST hook to dispatch off; the diagnostics list
+            // already explains the missing piece.
+            let end_offset = source.len();
+            nodes.push(Node {
+                id: NodeId::alloc(),
+                expr: Box::new(Expr::Null),
+                decorators: Vec::new(),
+                directives: Vec::new(),
+                type_hint: None,
+                range: lower::range_from_offsets(source, 0, end_offset),
+                doc_comment: None,
+            });
+            if parse.errors.is_empty() {
+                diagnostics.push(ParseDiagnostic {
+                    message: "empty document".to_string(),
+                    range: lower::range_from_offsets(source, 0, 0),
                 });
             }
-        } else if parse.errors.is_empty() {
-            diagnostics.push(ParseDiagnostic {
-                message: "empty document".to_string(),
-                range: lower::range_from_offsets(source, 0, 0),
-            });
         }
     }
 
@@ -650,7 +682,10 @@ mod tests {
     #[test]
     fn recovering_includes_empty_document_diagnostic() {
         let result = parse_document_recovering("");
-        assert!(result.nodes.is_empty());
+        // Partial-tolerant contract: every input yields at least one
+        // navigable root Node — empty source gets a Null placeholder.
+        assert_eq!(result.nodes.len(), 1);
+        assert!(matches!(&*result.nodes[0].expr, Expr::Null));
         // Either a CST error or our own "empty document" — but
         // diagnostics MUST be non-empty (the caller has nothing to
         // attach a "you must write something" hint to otherwise).
@@ -669,5 +704,43 @@ mod tests {
     fn recovering_completes_partial_for_lone_amp() {
         let result = parse_document_recovering("&");
         assert!(!result.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn recovering_always_yields_at_least_one_node() {
+        // Every input the IDE can hand us — including completely
+        // broken prefixes — must produce a non-empty `nodes` vec so
+        // downstream completion has an AST root to dispatch off.
+        for src in [
+            "@", "#", "&", "{", "{ @", "{ x: 1, @ }", "[", "}",
+            "{ a:", "{ ?", "f\"hi ${", "(", "",
+        ] {
+            let r = parse_document_recovering(src);
+            assert!(
+                !r.nodes.is_empty(),
+                "expected at least one partial node for src {:?}, got 0",
+                src
+            );
+        }
+    }
+
+    #[test]
+    fn recovering_at_decorator_keeps_sibling_fields() {
+        // The smoking-gun case the user filed: a stray `@` between
+        // dict fields should NOT erase the entire dict; the well-
+        // formed siblings must survive so completion can walk them
+        // for decorator suggestions.
+        let r = parse_document_recovering("{ fmt: (v) => v + 1, @ y: 2 }");
+        assert_eq!(r.nodes.len(), 1, "expected partial Dict root");
+        match &*r.nodes[0].expr {
+            Expr::Dict(fields) => {
+                let has_fmt = fields.iter().any(|(k, _)| matches!(
+                    k,
+                    TokenKey::String(s, _, _) if s == "fmt"
+                ));
+                assert!(has_fmt, "expected the `fmt` sibling to survive partial lowering, got {:?}", fields);
+            }
+            other => panic!("expected Dict root, got {:?}", other),
+        }
     }
 }

@@ -70,6 +70,42 @@ use crate::cst::Parse;
 use crate::syntax::{SyntaxKind, SyntaxNode};
 use crate::{position_at_source, Expr, Node, ParseDocumentError, RefBase, TokenKey, TokenRange};
 
+// Strict vs recovering lowering: when a sub-tree fails to lower
+// (malformed DICT_FIELD, rejected schema-method shape, unknown
+// pragma) the strict caller must surface `ParseDocumentError`,
+// while the recovering caller must skip the bad piece and keep the
+// surrounding tree navigable so the IDE can offer completion /
+// hover / goto-def on whatever survived. A thread-local toggle
+// keeps the helper signatures stable instead of threading a mode
+// argument through every `lower_*_v2`.
+thread_local! {
+    static RECOVERING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub(crate) fn is_recovering() -> bool {
+    RECOVERING.with(|c| c.get())
+}
+
+/// RAII guard that flips the recovering flag on for the duration of
+/// the wrapping call. Restoring on drop keeps the flag balanced
+/// even if a downstream helper panics.
+pub(crate) struct RecoveringScope {
+    prev: bool,
+}
+
+impl RecoveringScope {
+    pub(crate) fn enter() -> Self {
+        let prev = RECOVERING.with(|c| c.replace(true));
+        RecoveringScope { prev }
+    }
+}
+
+impl Drop for RecoveringScope {
+    fn drop(&mut self) {
+        RECOVERING.with(|c| c.set(self.prev));
+    }
+}
+
 // =====================================================================
 // P6 progress notes
 // =====================================================================
@@ -2373,12 +2409,22 @@ fn lower_dict_v2(node: &SyntaxNode, source: &str) -> Option<Node> {
                 // Trailing empty field — accept and skip.
                 continue;
             }
-            // Mid-list empty field — malformed (`, ,`).
+            // Mid-list empty field — malformed (`, ,`). Strict mode
+            // bails; recovering mode skips and lets surrounding
+            // fields survive for the IDE.
+            if is_recovering() {
+                continue;
+            }
             return None;
         }
-        match lower_dict_field(&field, source)? {
-            DictFieldOut::Pair(k, v) => pairs.push((k, v)),
-            DictFieldOut::Directives(dirs) => standalone_directives.extend(dirs),
+        match lower_dict_field(&field, source) {
+            Some(DictFieldOut::Pair(k, v)) => pairs.push((k, v)),
+            Some(DictFieldOut::Directives(dirs)) => standalone_directives.extend(dirs),
+            // Recovering mode: skip the bad field so siblings stay
+            // reachable for completion. Strict mode: propagate the
+            // failure as `ParseDocumentError`.
+            None if is_recovering() => continue,
+            None => return None,
         }
     }
 
@@ -2770,17 +2816,41 @@ fn lower_list_v2(node: &SyntaxNode, source: &str) -> Option<Node> {
         match child.kind() {
             SyntaxKind::DECORATOR => {
                 if let Some(d) = ast::Decorator::cast(child.clone()) {
-                    pending_decs.push(lower_decorator_v2(&d, source)?);
+                    match lower_decorator_v2(&d, source) {
+                        Some(dec) => pending_decs.push(dec),
+                        None if is_recovering() => continue,
+                        None => return None,
+                    }
                 }
             }
             SyntaxKind::DIRECTIVE => {
                 if let Some(d) = ast::Directive::cast(child.clone()) {
-                    pending_dirs.push(lower_directive_v2(&d, source)?);
+                    match lower_directive_v2(&d, source) {
+                        Some(dir) => pending_dirs.push(dir),
+                        None if is_recovering() => continue,
+                        None => return None,
+                    }
                 }
             }
             _ => {
-                if let Some(e) = ast::Expr::cast(child) {
-                    let mut item = lower_expr_v2(&e, source)?;
+                if let Some(e) = ast::Expr::cast(child.clone()) {
+                    let item_opt = lower_expr_v2(&e, source);
+                    let mut item = match item_opt {
+                        Some(n) => n,
+                        // Recovering mode: substitute a Null
+                        // placeholder so the list's ordinal positions
+                        // stay stable. Strict mode: bail.
+                        None if is_recovering() => {
+                            let r = child.text_range();
+                            let start_o: usize = r.start().into();
+                            let end_o: usize = r.end().into();
+                            Node::new(
+                                Expr::Null,
+                                range_from_offsets(source, start_o, end_o),
+                            )
+                        }
+                        None => return None,
+                    };
                     if !pending_decs.is_empty() {
                         item.decorators = std::mem::take(&mut pending_decs);
                     }
@@ -3403,16 +3473,41 @@ pub fn lower_document_node_v2(doc: &ast::Document, source: &str) -> Option<Node>
     //    the legacy ordering.
     let mut decorators: Vec<crate::Decorator> = Vec::new();
     for d in doc.decorators() {
-        decorators.push(lower_decorator_v2(&d, source)?);
+        match lower_decorator_v2(&d, source) {
+            Some(dec) => decorators.push(dec),
+            None if is_recovering() => continue,
+            None => return None,
+        }
     }
     let mut directives: Vec<crate::Directive> = Vec::new();
     for d in doc.directives() {
-        directives.push(lower_directive_v2(&d, source)?);
+        match lower_directive_v2(&d, source) {
+            Some(dir) => directives.push(dir),
+            None if is_recovering() => continue,
+            None => return None,
+        }
     }
 
-    // 2. Lower the root expression.
+    // 2. Lower the root expression. Recovering mode falls back to a
+    //    placeholder Node when the root expression lowering fails so
+    //    IDE callers (completion / hover / goto-def) still receive a
+    //    navigable partial AST. Strict mode propagates the failure.
     let root_ast = doc.root_expr()?;
-    let body = lower_expr_v2(&root_ast, source)?;
+    let body = match lower_expr_v2(&root_ast, source) {
+        Some(n) => n,
+        None if is_recovering() => {
+            let r = root_ast.syntax().text_range();
+            let start_o: usize = r.start().into();
+            let end_o: usize = r.end().into();
+            let placeholder_expr = match root_ast.syntax().kind() {
+                SyntaxKind::DICT => Expr::Dict(Vec::new()),
+                SyntaxKind::LIST => Expr::List(Vec::new()),
+                _ => Expr::Null,
+            };
+            Node::new(placeholder_expr, range_from_offsets(source, start_o, end_o))
+        }
+        None => return None,
+    };
 
     // 3. Compute the document-level start_offset before merging the
     //    Dict-hoisted directives. Legacy `parse_base` reads
