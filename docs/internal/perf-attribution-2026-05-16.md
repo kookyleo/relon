@@ -249,6 +249,53 @@ load 该 json 即可交互式查看。
 
 ---
 
+## P1 进展 + 诊断更正（2026-05-16 追加）
+
+### P1-A 已落地（commit `4413295`）
+
+- 路径：scope-narrow (a) —— `Range` 保持 eager（保 `range(n)` 作 List 的下游兼容性），改 `materialize_iterable` 返 `Cow<'a, [Value]>` + comprehension 结果 Vec 用 `Vec::with_capacity(items.len())`
+- agent 自测（atomic-counter bin，非 dhat）：comprehension 1000-iter
+  total_bytes **2.66 GB → 2.34 GB，-326 MB / -12.3%**
+- 注意：agent 测的 corpus 与 dhat baseline 的 100-iter 不一样（1000-iter ×），
+  绝对数字不直接对照；相对比例可信。dhat 复测留给 P1 收尾
+
+### P1-B 已落地（merge `be7db5f`）+ **诊断更正**
+
+> 原归因报告 §"Top-10 alloc site 归类 · comprehension workload" 第 3 行
+> 把 `Scope::child` 的 8.9% / 48 MB 归因为 "`Mutex<HashMap>::new()` × 2"。
+> **这条结论实测错误。**
+
+P1-B 实施时验证了三个方向：
+- 方向 B（`OnceLock<Mutex<HashMap>>` lazy init）：dhat 反向 **+3 MB**
+- 方向 A（`Mutex<Option<HashMap>>`）：同样无收益
+- `Arc<str>` 顺手改：会扩散到 `crates/relon/` / `crates/relon-lsp/`，
+  违反任务范围被否决
+
+最终落地：仅 helper API 重构（`Locals` / `Thunks` 类型别名 +
+`locals_for_write()` / `thunks_for_write()` 入口 + `..Default::default()` seam），
+dhat 数字与 baseline **完全一致（无收益）**。
+
+**真正归因**：48 MB 来自 `Arc::new(Self {...})` 自身的**调用次数**——
+`HashMap::new()` 是零容量、不分配；`Mutex` 是 inline、不分配。
+要砍这 48 MB 必须**减少 `Scope::child` 调用次数**（最直接的钩子：
+comprehension 内层热循环不要每元素都 `with_local` → `child()`，
+而是复用一个外层 frame + 通过 `list_context` 暴露迭代绑定）——
+这是**未来 wave** 的工作，超出 P1 本轮范围。
+
+helper API seam 已在 `scope.rs` 留下，为后续工作减少改造面。
+
+### 对原 §"P1 任务排序建议" 的修正
+
+| 原序 | 项目 | 更正后状态 |
+| --- | --- | --- |
+| 1 | `Scope::child` Mutex 去除 | **判定无效**——alloc 不在 Mutex 上，留 seam 等下一阶段做"hot loop 复用" |
+| 2 | `stdlib::Range` lazy | **降级落地为 narrow path (a)**（P1-A，cherry-pick `4413295`），干掉了 `materialize_iterable` 的中转 clone |
+| 3 | comprehension Vec `with_capacity` | **已落地**（P1-A 同 commit），cap 来自 items.len() |
+| 4 | 字符串 interner | **P1-C 排队中**——comprehension 52% 单项命中 `String::clone` × 10w，仍是 dhat 端实证最大单项 |
+| 5-7 | Context 复用 / BTreeMap→IndexMap / path_cache_key | 不变，等后续 wave |
+
+---
+
 ## 附录 A：dhat 字段速查
 
 - `tb` (total bytes)：该 PP 累计分配字节
