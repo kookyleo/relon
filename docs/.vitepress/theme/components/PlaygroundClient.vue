@@ -2754,6 +2754,21 @@ watch([files, entry, argsInput], () => {
 .rp-tabs {
   display: flex;
   align-items: stretch;
+  /* `height` alone is only a flex-basis hint here. The parent
+     (`.rp-pane`) is `flex-direction: column`, and our sibling
+     `.rp-editor` has `flex: 1 1 auto` — so when the CodeMirror
+     content's intrinsic size exceeds the pane's available height
+     (typical for longer source files like the `workflow` preset),
+     the browser distributes the shortage across every shrinkable
+     flex item, proportional to `flex-shrink * basis`. With the
+     default `flex-shrink: 1`, `.rp-tabs` ate a few pixels of that
+     shortage and compressed below 32px — only on the pane whose
+     content overflows, leaving the two toolbars visibly unequal.
+
+     `flex-shrink: 0` opts this row out of the shortage redistribution
+     entirely. The editor takes the full hit (it already scrolls via
+     `overflow: auto`) and the toolbar stays at exactly `height`. */
+  flex-shrink: 0;
   height: 32px;
   gap: 0;
   padding: 0 8px;
