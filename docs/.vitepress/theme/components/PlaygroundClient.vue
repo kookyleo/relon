@@ -1742,11 +1742,12 @@ watch([files, entry, argsInput], () => {
   <div class="relon-playground">
     <header class="rp-status">
       <a class="rp-brand" href="../" aria-label="Relon home">
-        <!-- Plain `{R}` text instead of the framed SVG. At 20px the
-             inline glyph reads cleaner than the rounded-rect logo,
-             and skips an asset request + per-pixel centring puzzle. -->
-        <span class="rp-brand-logo" aria-hidden="true">{R}</span>
-        <span class="rp-brand-name">Relon</span>
+        <!-- The anchor's aria-label already names the link; the SVGs
+             are decorative so AT only announces "Relon home" once
+             regardless of which breakpoint is showing. -->
+        <img class="rp-brand-pill" :src="withBase('/logo-pill.svg')" alt="" aria-hidden="true" />
+        <img class="rp-brand-mini" :src="withBase('/logo-mini.svg')" alt="" aria-hidden="true" />
+        <span class="rp-brand-stub" aria-hidden="true"></span>
       </a>
       <div ref="sourceMenuRoot" class="rp-source-wrap">
         <button
@@ -2280,19 +2281,16 @@ watch([files, entry, argsInput], () => {
    filled green segment (right). The standalone layout has no
    VitePress navbar, so this is the only path back to the docs root —
    the pill makes the click target obvious. */
-/* Brand palette pinned to the logo.svg artwork (not VitePress brand
-   tokens) so the playground header reads as the same lockup as the
-   home-page hero — cream {R} half + green "Relon" half. */
+/* Brand mounts whichever pre-built SVG fits the current breakpoint;
+   no pill/border/text composition happens in CSS so the asset and
+   the rendered badge stay byte-identical. */
 .rp-brand {
   display: inline-flex;
-  align-items: stretch;
+  align-items: center;
+  flex-shrink: 0;
   height: 28px;
-  border-radius: 6px;
-  border: 1px solid #3E8A50;
-  overflow: hidden;
   text-decoration: none;
   line-height: 1;
-  background: #F3F1ED;
   transition: filter 0.15s ease;
 }
 
@@ -2300,35 +2298,46 @@ watch([files, entry, argsInput], () => {
   filter: brightness(0.97);
 }
 
-.rp-brand-logo {
-  margin: 0 8px;
-  align-self: center;
-  display: inline-flex;
-  align-items: center;
-  /* Use the literal Relon logo green rather than `--vp-c-brand-1`,
-     which the docs theme currently leaves at VitePress's default
-     blue. Matches the colours used inside `logo-mini.svg`. */
-  color: #3e8a50;
-  font-family: var(--vp-font-family-mono);
-  font-weight: 700;
-  font-size: 13px;
-  letter-spacing: -0.02em;
-  line-height: 1;
-  /* Pure decoration; don't snag triple-click selections aimed at the
-     source title beside it. */
-  user-select: none;
+.rp-brand-pill,
+.rp-brand-mini {
+  display: block;
+  width: auto;
+}
+/* Lock the pill to the toolbar's 26 px input/button row — taller
+   than that overpowers the controls, shorter makes the brand look
+   demoted next to a full-height input. */
+.rp-brand-pill { height: 26px; }
+/* Compromise between the natural h=20 (felt overlarge next to the
+   toolbar controls) and the pill's internal `{R}` (~15 px at the
+   current pill render). h=18 keeps mini legible without dominating
+   the row. */
+.rp-brand-mini { height: 18px; }
+
+.rp-brand-stub {
+  display: none;
+  width: 6px;
+  height: 28px;
+  background: #3E8A50;
+  border-radius: 3px;
 }
 
-.rp-brand-name {
-  display: inline-flex;
-  align-items: center;
-  padding: 0 10px;
-  background: #3E8A50;
-  color: #F3F1ED;
-  font-family: var(--vp-font-family-base);
-  font-weight: 700;
-  font-size: 14px;
-  letter-spacing: 0.01em;
+/* Three discrete forms as the viewport narrows:
+     · ≥ 640px: `logo-pill.svg` (full lockup)
+     · 540–639px: `logo-mini.svg` (`{R}` only)
+     · < 540px:   slim green stub (no glyph)
+   The stub threshold is generous because the toolbar's other
+   controls (source dropdown, args input, run, auto-run label)
+   already crowd the row by ~470 px — at < 540 the mini glyph
+   stops earning its 30 px of header rail and the stub keeps the
+   right-side text legible. */
+.rp-brand-mini { display: none; }
+@media (max-width: 639px) {
+  .rp-brand-pill { display: none; }
+  .rp-brand-mini { display: block; }
+}
+@media (max-width: 539px) {
+  .rp-brand-mini { display: none; }
+  .rp-brand-stub { display: block; }
 }
 
 /* Top-bar controls share a single height + radius so the row reads as
@@ -2360,7 +2369,15 @@ watch([files, entry, argsInput], () => {
      Escape are wired up at the window level in onMounted. */
 .rp-source-wrap {
   position: relative;
-  display: inline-block;
+  display: inline-flex;
+  /* Mirror the inner chip's flex profile so the wrap (the actual
+     flex item of `.rp-status`) reserves the same horizontal track
+     as `.rp-source`. Without this, the wrap collapses to its
+     content size at narrow viewports while the chip (with
+     `min-width: 80px`) keeps its full width — the chip then
+     overflows into the next toolbar item and clips "main(". */
+  flex: 0 1 calc(13ch + 28px);
+  min-width: 80px;
 }
 
 .rp-source {
@@ -2379,11 +2396,14 @@ watch([files, entry, argsInput], () => {
   line-height: 1;
   padding: 0 8px;
   cursor: pointer;
-  /* Lock the chip width so switching between short and long names
-     (e.g. "demo" vs "feature_flag") doesn't bounce the surrounding
-     controls. 13ch covers the longest builtin preset; +28px accounts
-     for left/right padding (16) and the caret (10) + gap. */
-  min-width: calc(13ch + 28px);
+  /* Preferred width: 13ch covers the longest builtin preset; +28px
+     accounts for left/right padding (16) and the caret (10) + gap.
+     Switching from `min-width` to a flex-basis lets the chip
+     ellipsis-truncate the current label at narrow widths instead
+     of pushing the auto-run cluster off-screen. */
+  flex: 0 1 calc(13ch + 28px);
+  min-width: 80px;
+  width: 100%;
 }
 
 .rp-source-current {
@@ -2507,20 +2527,47 @@ watch([files, entry, argsInput], () => {
   margin-left: 12px;
 }
 
-/* Force flex only at desktop widths. Below 768px each VitePress
-   navbar component self-hides via its own internal `@media (max-width:
-   767px) { display: none }` rule; without this width-gate, the
-   playground's :deep selector would override that hide and the
-   "Home" link would keep leaking into the narrow-viewport header,
-   even though the right place for it is inside the hamburger
-   drawer (`VPNavScreen`). */
-@media (min-width: 768px) {
+/* Narrow-viewport tightening:
+     · status row drops its outer padding and gap so each control
+       sits closer to its neighbour;
+     · nav cluster sheds its own left margin;
+     · source dropdown and args input shrink their minimums so the
+       row gives up width before the hamburger clips off-screen.
+   The "auto-run on/off" caption stays — it's part of the run-state
+   signal and the user explicitly asked for it to remain visible. */
+@media (max-width: 539px) {
+  .rp-status { padding-right: 0; padding-left: 8px; gap: 8px; }
+  .rp-navbar { margin-left: 4px; }
+  .rp-source-wrap { flex-basis: 70px; min-width: 60px; }
+  .rp-source { min-width: 60px; }
+  .rp-args-input { flex-basis: 80px; min-width: 50px; }
+}
+
+/* The playground header carries a wider left cluster than the
+   docs pages (brand pill + source dropdown + args input + run +
+   auto-run label), so VitePress's stock 768 px collapse point
+   leaves the nav links cropped against the viewport edge.
+   Collapse the menu / translations / appearance / social-links
+   into the hamburger drawer at < 1024 px instead, and force the
+   hamburger visible in the same range. */
+@media (min-width: 1024px) {
   .rp-navbar :deep(.VPNavBarMenu),
   .rp-navbar :deep(.VPNavBarTranslations),
   .rp-navbar :deep(.VPNavBarAppearance),
   .rp-navbar :deep(.VPNavBarSocialLinks) {
     display: flex;
     align-items: center;
+  }
+}
+@media (max-width: 1023px) {
+  .rp-navbar :deep(.VPNavBarMenu),
+  .rp-navbar :deep(.VPNavBarTranslations),
+  .rp-navbar :deep(.VPNavBarAppearance),
+  .rp-navbar :deep(.VPNavBarSocialLinks) {
+    display: none !important;
+  }
+  .rp-navbar-hamburger {
+    display: flex !important;
   }
 }
 
@@ -2533,6 +2580,18 @@ watch([files, entry, argsInput], () => {
    (which we mount with `<dialog>`'s implicit top-layer). */
 :deep(.VPNavScreen) {
   z-index: 60;
+}
+
+/* VPNavScreen self-hides at `min-width: 768px` to match VitePress's
+   stock 768 px hamburger threshold. We collapse the playground's
+   nav at 1024 instead (see the .rp-navbar block above), so the
+   drawer needs to stay reachable up to that same width — otherwise
+   tapping the hamburger between 768–1023 toggles `open` without
+   ever rendering the panel. */
+@media (max-width: 1023px) {
+  :deep(.VPNavScreen) {
+    display: block !important;
+  }
 }
 
 /* The default VPNavBarMenuLink renders at `font-weight: 500` and
@@ -2635,6 +2694,13 @@ watch([files, entry, argsInput], () => {
   display: inline-flex;
   align-items: center;
   gap: 2px;
+  /* `min-width: 0` clears the default flex-item content floor and
+     `flex-shrink: 1` lets the cluster yield to neighbours when the
+     row overflows — without these the cluster keeps its natural
+     `main( + input + )` width and the children of `.rp-status` can
+     overflow at intermediate widths (~600 px). */
+  min-width: 0;
+  flex-shrink: 1;
 }
 
 .rp-args-bracket {
@@ -2648,10 +2714,12 @@ watch([files, entry, argsInput], () => {
 }
 
 .rp-args-input {
-  /* Halved from the original 280px — 140px is enough to scan the
-     compact JSON preview at a glance without crowding out the rest
-     of the header on narrow screens. */
-  width: 140px;
+  /* Preferred 140 px (halved from the original 280 px is enough to
+     scan the compact JSON preview at a glance), but flex-shrinks
+     down to 80 px when the toolbar competes with source/run/auto-run
+     on narrow viewports. */
+  flex: 0 1 140px;
+  min-width: 80px;
   padding: 0 8px;
   font-family: var(--vp-font-family-mono);
   font-size: 13px;

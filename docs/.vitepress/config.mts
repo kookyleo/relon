@@ -147,8 +147,14 @@ export default defineConfig({
   },
 
   themeConfig: {
-    logo: '/logo-mini.svg',
-    siteTitle: 'Relon',
+    // `logo-flat.svg` already includes the "Relon" wordmark, so
+    // `siteTitle: false` keeps VitePress from rendering "Relon" a
+    // second time next to the logo. The object form supplies an
+    // explicit `alt` so the home-link anchor still surfaces an
+    // accessible name to screen readers (without it the `<img alt>`
+    // is empty and the link's siteTitle fallback is suppressed).
+    logo: { src: '/logo-flat.svg', alt: 'Relon' },
+    siteTitle: false,
     socialLinks: [
       { icon: 'github', link: 'https://github.com/kookyleo/relon' }
     ],
