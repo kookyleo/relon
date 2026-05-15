@@ -470,7 +470,7 @@ function selectFile(path: string) {
 
 function setEntry(path: string) {
     entry.value = path;
-    void runEvaluate();
+    runActive();
 }
 
 function openNewFileDialog() {
@@ -648,8 +648,11 @@ function loadPreset(id: string) {
     // Evaluate against the new payload. For non-sandbox-runnable presets
     // this surfaces a genuine `EvalError` / `AnalyzeError`, which is the
     // demo-correct behaviour; the context hint inside the error panel
-    // explains why and points at the CLI.
-    void runEvaluate();
+    // explains why and points at the CLI. Routing through `runActive`
+    // honours the preset's `defaultArgs` — without it, an entry that
+    // declares `#main(...)` always errored with `missing_main_arg`
+    // until the user manually clicked the toolbar Run.
+    runActive();
 }
 
 function selectWorkspace(id: string) {
@@ -667,7 +670,7 @@ function selectWorkspace(id: string) {
             changes: { from: 0, to: view.state.doc.length, insert: files.value[0].content },
         });
     }
-    void runEvaluate();
+    runActive();
 }
 
 function openNewWorkspaceDialog() {
@@ -736,7 +739,7 @@ function removeFile(path: string) {
     files.value.splice(idx, 1);
     if (entry.value === path) entry.value = files.value[0].path;
     if (activeFile.value === path) selectFile(files.value[0].path);
-    void runEvaluate();
+    runActive();
 }
 
 // ---------------- wasm boot ----------------------------------------------
@@ -767,7 +770,7 @@ async function bootWasm() {
         // this nudge the user has to trigger a doc change (typing or
         // Format) before parameter-name ghost text appears.
         editorView.value?.dispatch({ effects: refreshInlayHints.of(null) });
-        await runEvaluate();
+        runActive();
     } catch (err) {
         status.value = `Failed to load wasm runtime: ${err instanceof Error ? err.message : String(err)}`;
         console.error('[playground] wasm boot failed', err);
@@ -782,7 +785,7 @@ function scheduleEvaluate() {
     if (evalTimer !== null) clearTimeout(evalTimer);
     evalTimer = setTimeout(() => {
         evalTimer = null;
-        void runEvaluate();
+        runActive();
     }, 200);
 }
 
@@ -810,9 +813,12 @@ async function runEvaluate() {
 }
 
 /// Run the entry through `evaluate_main`, feeding it the user-supplied
-/// args JSON. Triggered by the explicit Run button — auto-eval keeps
-/// using arg-less `evaluate` so `#main(...)` scripts surface their
-/// missing-arg error live as you type.
+/// args JSON. Called by `runActive` whenever the inline Args field is
+/// non-empty, including from `scheduleEvaluate` after edits — so a
+/// `#main(...)` script that has args declared sees the args path on
+/// every keystroke. When the user clears the field, auto-eval falls
+/// back to the no-arg `runEvaluate`, which lets `missing_main_arg`
+/// surface live as a teaching aid.
 async function runWithArgs() {
     const mod = wasmRef.value;
     if (!mod) return;
