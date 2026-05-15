@@ -433,19 +433,44 @@ export const playgroundHighlightStyle = HighlightStyle.define([
 /// Then dedents the current line one level when it starts with
 /// `}` / `]` / `)`. Mirrors what every JS / Rust / Python IDE does.
 const relonIndent = indentService.of((context, pos) => {
-    const line = context.state.doc.lineAt(pos);
-    const lineText = line.text;
-    if (line.number <= 1) return 0;
+    const doc = context.state.doc;
+    const lineAtPos = doc.lineAt(pos);
 
-    // Walk back to the nearest preceding non-blank line.
-    let prevLineNo = line.number - 1;
-    let prevText = context.state.doc.line(prevLineNo).text;
-    while (prevLineNo > 1 && prevText.trim() === '') {
-        prevLineNo -= 1;
-        prevText = context.state.doc.line(prevLineNo).text;
+    // CM6 calls indent services in two distinct modes:
+    //
+    //  - `simulatedBreak === pos` (the Enter path via
+    //    `insertNewlineAndIndent`): `pos` sits at the end of the line
+    //    the user just pressed Enter on. We're computing the indent
+    //    for the *new* line that will appear below. Treat `lineAtPos`
+    //    itself as the previous line, with no current-line text to
+    //    consider for dedent.
+    //
+    //  - otherwise (Tab / indentSelection / indent-on-input): `pos`
+    //    is on the line to indent. Walk back to find the real
+    //    previous line, and consider `lineAtPos.text` for dedent.
+    //
+    // Conflating the two modes was the original bug: pressing Enter
+    // after `details: {` was reading the line *above* `details: {`,
+    // so the `{` was invisible and the indent never advanced.
+    const isBreak = context.simulatedBreak === pos;
+    let prevText: string;
+    let currentLineText: string;
+    if (isBreak) {
+        prevText = lineAtPos.text;
+        currentLineText = '';
+    } else {
+        if (lineAtPos.number <= 1) return 0;
+        let prevLineNo = lineAtPos.number - 1;
+        let walked = doc.line(prevLineNo).text;
+        while (prevLineNo > 1 && walked.trim() === '') {
+            prevLineNo -= 1;
+            walked = doc.line(prevLineNo).text;
+        }
+        prevText = walked;
+        currentLineText = lineAtPos.text;
     }
-    const prevIndent = prevText.match(/^\s*/)?.[0].length ?? 0;
 
+    const prevIndent = prevText.match(/^\s*/)?.[0].length ?? 0;
     // Strip trailing line comments + whitespace to see the line's
     // last syntactic character.
     const stripped = prevText.replace(/\/\/.*$/, '').trimEnd();
@@ -454,8 +479,7 @@ const relonIndent = indentService.of((context, pos) => {
         target += context.unit;
     }
 
-    // Lines starting with a closing bracket dedent one level.
-    if (/^\s*[}\])]/.test(lineText)) {
+    if (/^\s*[}\])]/.test(currentLineText)) {
         target = Math.max(0, target - context.unit);
     }
     return target;
