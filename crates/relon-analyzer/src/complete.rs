@@ -38,6 +38,13 @@ pub struct CompletionItem {
     /// `"method"`, `"stdlib"`, `"import"`). Optional — clients fall
     /// back to a generic "Identifier" label when absent.
     pub detail: Option<String>,
+    /// Snippet text inserted when the user accepts the suggestion,
+    /// using `${N:placeholder}` tab-stop syntax. `None` means insert
+    /// the bare label. Callable kinds (decorators, methods, stdlib
+    /// functions) populate this so a Tab landing on `@currency`
+    /// expands to `@currency(${1:symbol})` instead of leaving the
+    /// user to type the parens.
+    pub apply_snippet: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -428,6 +435,7 @@ fn walk_scope(node: &Node, offset: usize, items: &mut Vec<CompletionItem>) {
                 label: p.name.clone(),
                 kind: CompletionKind::Parameter,
                 detail: Some("param".to_string()),
+                apply_snippet: None,
             });
         }
         // Closure body might itself contain a Dict / Closure / etc.
@@ -453,7 +461,8 @@ fn walk_scope(node: &Node, offset: usize, items: &mut Vec<CompletionItem>) {
                     label: name.clone(),
                     kind,
                     detail,
-                });
+                apply_snippet: None,
+            });
             }
         }
         // Recurse into whichever pair's value contains the cursor.
@@ -477,7 +486,8 @@ fn walk_scope(node: &Node, offset: usize, items: &mut Vec<CompletionItem>) {
             label: id.clone(),
             kind: CompletionKind::Parameter,
             detail: Some("for-binding".to_string()),
-        });
+                apply_snippet: None,
+            });
         let candidates: [Option<&Node>; 3] = [Some(element), Some(iterable), condition.as_ref()];
         for child in candidates.into_iter().flatten() {
             if contains_offset(child, offset) {
@@ -517,7 +527,8 @@ fn push_type_primitive_candidates(items: &mut Vec<CompletionItem>) {
             label: (*name).into(),
             kind: CompletionKind::Schema,
             detail: Some("primitive".into()),
-        });
+                apply_snippet: None,
+            });
     }
 }
 
@@ -535,7 +546,8 @@ fn push_schema_candidates_partial(items: &mut Vec<CompletionItem>, root: &Node) 
                         label: name.clone(),
                         kind: CompletionKind::Schema,
                         detail: Some("schema".into()),
-                    });
+                apply_snippet: None,
+            });
                 }
             }
         }
@@ -567,7 +579,8 @@ fn push_generic_var_candidates_partial(
                         label: g.clone(),
                         kind: CompletionKind::Schema,
                         detail: Some("type var".into()),
-                    });
+                apply_snippet: None,
+            });
                 }
             }
         }
@@ -579,11 +592,19 @@ fn push_generic_var_candidates_partial(
 }
 
 fn push_stdlib_candidates(items: &mut Vec<CompletionItem>) {
+    use crate::stdlib_signatures::stdlib_signatures;
+    let sigs = stdlib_signatures();
     for name in stdlib_fn_names() {
+        let apply_snippet = sigs.get(name).map(|sig| {
+            let param_names: Vec<String> =
+                sig.params.iter().map(|p| p.name.clone()).collect();
+            call_snippet(name, &param_names)
+        });
         items.push(CompletionItem {
             label: name.to_string(),
             kind: CompletionKind::Stdlib,
             detail: Some("stdlib".to_string()),
+            apply_snippet,
         });
     }
 }
@@ -595,6 +616,7 @@ fn push_schema_candidates(items: &mut Vec<CompletionItem>, tree: &AnalyzedTree) 
                 label: name.clone(),
                 kind: CompletionKind::Schema,
                 detail: Some("schema".to_string()),
+                apply_snippet: None,
             });
         }
     }
@@ -603,7 +625,8 @@ fn push_schema_candidates(items: &mut Vec<CompletionItem>, tree: &AnalyzedTree) 
             label: decl.name.clone(),
             kind: CompletionKind::Schema,
             detail: Some("schema".to_string()),
-        });
+                apply_snippet: None,
+            });
     }
 }
 
@@ -614,6 +637,7 @@ fn push_import_binding_candidates(items: &mut Vec<CompletionItem>, tree: &Analyz
                 label: alias.clone(),
                 kind: CompletionKind::Module,
                 detail: imp.path.clone(),
+                apply_snippet: None,
             });
         }
         for (name, local) in &imp.destructure {
@@ -622,6 +646,7 @@ fn push_import_binding_candidates(items: &mut Vec<CompletionItem>, tree: &Analyz
                 label,
                 kind: CompletionKind::Import,
                 detail: imp.path.clone(),
+                apply_snippet: None,
             });
         }
         // Spread imports are visible by their downstream name; we
@@ -642,7 +667,8 @@ fn push_reference_candidates(items: &mut Vec<CompletionItem>, in_list: bool) {
             label: (*name).into(),
             kind: CompletionKind::Reference,
             detail: Some((*detail).into()),
-        });
+                apply_snippet: None,
+            });
     }
     // Iteration-only refs — only meaningful inside a List or
     // Comprehension. Outside, they always emit an `IterationRefOutside
@@ -657,6 +683,7 @@ fn push_reference_candidates(items: &mut Vec<CompletionItem>, in_list: bool) {
                 label: (*name).into(),
                 kind: CompletionKind::Reference,
                 detail: Some((*detail).into()),
+                apply_snippet: None,
             });
         }
     }
@@ -669,7 +696,8 @@ fn push_directive_candidates(items: &mut Vec<CompletionItem>) {
             label: (*name).into(),
             kind: CompletionKind::Directive,
             detail: Some("directive".into()),
-        });
+                apply_snippet: None,
+            });
     }
     // Pair-level pragmas — same `#` prefix, different positions.
     for name in &[
@@ -685,26 +713,109 @@ fn push_directive_candidates(items: &mut Vec<CompletionItem>) {
             label: (*name).into(),
             kind: CompletionKind::Pragma,
             detail: Some("pragma".into()),
-        });
+                apply_snippet: None,
+            });
     }
 }
 
 fn push_decorator_candidates(items: &mut Vec<CompletionItem>, root: &Node, offset: usize) {
     // No host decorator registry in v1, so we surface every visible
     // closure-valued pair (the user-defined hook shape — `pricing` uses
-    // `@currency(...)` where `currency` is a sibling method). Same
-    // scope walk as the bare path but filtered to Methods only.
-    let mut scope: Vec<CompletionItem> = Vec::new();
-    walk_scope(root, offset, &mut scope);
-    for item in scope {
-        if matches!(item.kind, CompletionKind::Method) {
-            items.push(CompletionItem {
-                label: item.label,
-                kind: CompletionKind::Decorator,
-                detail: Some("decorator".to_string()),
-            });
+    // `@currency(...)` where `currency` is a sibling method).
+    //
+    // Decorators auto-receive the decorated field's value as their
+    // first argument, so the snippet skips the closure's first param
+    // and only exposes the remaining ones as tab stops.
+    let candidates = collect_callable_pairs_in_scope(root, offset);
+    for (name, params) in candidates {
+        let snippet = decorator_snippet(&name, &params);
+        items.push(CompletionItem {
+            label: name,
+            kind: CompletionKind::Decorator,
+            detail: Some("decorator".to_string()),
+            apply_snippet: Some(snippet),
+        });
+    }
+}
+
+/// Walk scope around the cursor collecting `(name, params)` for every
+/// closure-valued Dict pair in scope. Mirrors the Method portion of
+/// `walk_scope` but preserves the param list — needed for snippet
+/// expansion (decorator / member-method completion).
+fn collect_callable_pairs_in_scope(root: &Node, offset: usize) -> Vec<(String, Vec<String>)> {
+    fn visit(node: &Node, offset: usize, out: &mut Vec<(String, Vec<String>)>) {
+        if !contains_offset(node, offset) {
+            return;
+        }
+        if let Expr::Dict(pairs) = &*node.expr {
+            for (key, value) in pairs {
+                if let TokenKey::String(name, _, _) = key {
+                    if let Expr::Closure { params, .. } = &*value.expr {
+                        let param_names: Vec<String> =
+                            params.iter().map(|p| p.name.clone()).collect();
+                        out.push((name.clone(), param_names));
+                    }
+                }
+            }
+            for (_, value) in pairs {
+                if contains_offset(value, offset) {
+                    visit(value, offset, out);
+                }
+            }
+            return;
+        }
+        if let Expr::Closure { body, .. } = &*node.expr {
+            visit(body, offset, out);
+            return;
+        }
+        for child in children_of(node) {
+            if contains_offset(child, offset) {
+                visit(child, offset, out);
+            }
         }
     }
+    let mut out = Vec::new();
+    visit(root, offset, &mut out);
+    out
+}
+
+/// Build a CodeMirror-compatible snippet for a decorator invocation.
+/// Skips the closure's first param (the auto-passed field value);
+/// the remaining params become `${N:name}` tab stops. Zero remaining
+/// params produces `name()` with the final cursor inside the parens.
+fn decorator_snippet(name: &str, params: &[String]) -> String {
+    // Skip the first param (auto-bound to the decorated value).
+    let exposed: &[String] = if params.is_empty() {
+        &[]
+    } else {
+        &params[1..]
+    };
+    if exposed.is_empty() {
+        // No user-facing params — leave cursor between the parens.
+        format!("{}(${{0}})", name)
+    } else {
+        let body: Vec<String> = exposed
+            .iter()
+            .enumerate()
+            .map(|(i, p)| format!("${{{}:{}}}", i + 1, p))
+            .collect();
+        format!("{}({})", name, body.join(", "))
+    }
+}
+
+/// Build a snippet for a regular function/method call (member access,
+/// stdlib). Every param becomes a tab stop with its name as default
+/// placeholder text; the final cursor lands after the closing paren.
+fn call_snippet(name: &str, params: &[String]) -> String {
+    if params.is_empty() {
+        return format!("{}()", name);
+    }
+    let body: Vec<String> = params
+        .iter()
+        .enumerate()
+        .map(|(i, p)| format!("${{{}:{}}}", i + 1, p))
+        .collect();
+    format!("{}({})", name, body.join(", "))
 }
 
 // =====================================================================
@@ -730,20 +841,23 @@ fn push_member_candidates_partial(
         if let Expr::Dict(pairs) = &*target.expr {
             for (key, value) in pairs {
                 if let TokenKey::String(name, _, _) = key {
-                    let kind = if matches!(&*value.expr, Expr::Closure { .. }) {
-                        CompletionKind::Method
-                    } else {
-                        CompletionKind::Field
-                    };
-                    let detail = if matches!(kind, CompletionKind::Method) {
-                        Some("method".to_string())
-                    } else {
-                        Some("field".to_string())
+                    let (kind, detail, apply_snippet) = match &*value.expr {
+                        Expr::Closure { params, .. } => {
+                            let param_names: Vec<String> =
+                                params.iter().map(|p| p.name.clone()).collect();
+                            (
+                                CompletionKind::Method,
+                                Some("method".to_string()),
+                                Some(call_snippet(name, &param_names)),
+                            )
+                        }
+                        _ => (CompletionKind::Field, Some("field".to_string()), None),
                     };
                     items.push(CompletionItem {
                         label: name.clone(),
                         kind,
                         detail,
+                        apply_snippet,
                     });
                 }
             }
@@ -859,6 +973,7 @@ fn push_member_candidates(
                     label: name.clone(),
                     kind,
                     detail: Some(format!("from {}", module_id)),
+                    apply_snippet: None,
                 });
             }
         }

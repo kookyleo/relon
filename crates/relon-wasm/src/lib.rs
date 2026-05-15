@@ -785,6 +785,12 @@ pub struct CompletionResult {
     /// Right-aligned label shown after the suggestion (e.g. file
     /// path of an import). Optional.
     pub detail: Option<String>,
+    /// Snippet template inserted when the user accepts the
+    /// suggestion. Uses CodeMirror / LSP-style `${N:placeholder}`
+    /// tab-stop syntax. `None` means insert the bare `label`.
+    /// Populated for callables (decorators, methods, stdlib fns) so
+    /// `Tab` on `@currency` expands to `@currency(${1:symbol})`.
+    pub apply_snippet: Option<String>,
 }
 
 /// Resolve a cursor position to a list of completion candidates.
@@ -884,6 +890,7 @@ fn into_result(item: relon_analyzer::complete::CompletionItem) -> CompletionResu
         }
         .to_string(),
         detail: item.detail,
+        apply_snippet: item.apply_snippet,
     }
 }
 

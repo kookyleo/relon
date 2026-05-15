@@ -18,6 +18,7 @@
 import {
     acceptCompletion,
     autocompletion,
+    snippet,
     startCompletion,
     type Completion,
     type CompletionContext,
@@ -33,6 +34,12 @@ export interface RelonCompletion {
     label: string;
     kind: string;
     detail?: string | null;
+    /// Snippet template (CodeMirror `${N:placeholder}` syntax) to
+    /// insert instead of the bare label. Populated by the analyzer
+    /// for callable kinds — methods, decorators, stdlib fns — so
+    /// accepting `@currency` expands to `@currency(${1:symbol})`
+    /// with the placeholder pre-selected.
+    apply_snippet?: string | null;
 }
 
 /// Callback the playground supplies. Returns every candidate the
@@ -136,11 +143,22 @@ export function relonAutocomplete(resolver: CompletionResolver): Extension[] {
                     return null;
                 }
 
-                const completions: Completion[] = items.map((item) => ({
-                    label: item.label,
-                    type: KIND_TO_TYPE[item.kind] ?? undefined,
-                    detail: item.detail ?? undefined,
-                }));
+                const completions: Completion[] = items.map((item) => {
+                    const c: Completion = {
+                        label: item.label,
+                        type: KIND_TO_TYPE[item.kind] ?? undefined,
+                        detail: item.detail ?? undefined,
+                    };
+                    // When the Rust side supplied a snippet template,
+                    // expand via CodeMirror's `snippet()` so tab
+                    // stops (`${N:placeholder}`) become real cursor
+                    // jumps. The final stop `${0}` (or end of
+                    // template) is where the cursor lands.
+                    if (item.apply_snippet) {
+                        c.apply = snippet(item.apply_snippet);
+                    }
+                    return c;
+                });
 
                 return {
                     from,
