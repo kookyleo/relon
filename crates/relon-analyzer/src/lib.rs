@@ -44,6 +44,7 @@ pub mod inlay_hints;
 pub mod references;
 pub mod rename;
 pub mod signature_help;
+pub mod symbols;
 pub(crate) mod main_return;
 pub mod main_sig;
 pub mod modules;

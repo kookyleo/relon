@@ -877,6 +877,83 @@ fn signature_help_internal(
     })
 }
 
+/// One outline entry returned by `document_symbols`. `parent` is an
+/// index into the same vector — `None` for top-level entries — so the
+/// caller can rebuild the tree without re-walking source. `kind` is a
+/// short string the IDE maps to its own icon set.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DocumentSymbolWire {
+    pub name: String,
+    pub kind: String,
+    pub parent: Option<u32>,
+    pub doc: Option<String>,
+    pub range_start_line: u32,
+    pub range_start_character: u32,
+    pub range_end_line: u32,
+    pub range_end_character: u32,
+    pub range_start_offset: u32,
+    pub range_end_offset: u32,
+    pub selection_start_line: u32,
+    pub selection_start_character: u32,
+    pub selection_end_line: u32,
+    pub selection_end_character: u32,
+    pub selection_start_offset: u32,
+    pub selection_end_offset: u32,
+}
+
+/// Collect every outline-relevant symbol declared in the entry. Cheap
+/// to call on every keystroke; runs a single AST walk.
+#[wasm_bindgen]
+pub fn document_symbols(sources: JsValue, entry: &str) -> Result<JsValue, JsValue> {
+    let sources = decode_sources(sources).map_err(err_to_js)?;
+    let result = document_symbols_internal(&sources, entry).unwrap_or_default();
+    let serializer = serde_wasm_bindgen::Serializer::new().serialize_maps_as_objects(true);
+    result.serialize(&serializer).map_err(|err| {
+        err_to_js(ErrorReport::invalid_input(format!(
+            "document_symbols result is not JS-serialisable: {err}"
+        )))
+    })
+}
+
+fn document_symbols_internal(
+    sources: &HashMap<String, String>,
+    entry: &str,
+) -> Option<Vec<DocumentSymbolWire>> {
+    let source = sources.get(entry)?;
+    let workspace = build_workspace(sources, entry, source);
+    let tree = workspace.modules.get(entry)?;
+    let root = workspace.nodes.get(entry)?;
+    Some(
+        relon_analyzer::symbols::collect(root, tree)
+            .into_iter()
+            .map(|s| DocumentSymbolWire {
+                name: s.name,
+                kind: match s.kind {
+                    relon_analyzer::symbols::SymbolKind::Schema => "schema".into(),
+                    relon_analyzer::symbols::SymbolKind::Method => "method".into(),
+                    relon_analyzer::symbols::SymbolKind::Field => "field".into(),
+                    relon_analyzer::symbols::SymbolKind::SchemaField => "schema-field".into(),
+                    relon_analyzer::symbols::SymbolKind::Import => "import".into(),
+                },
+                parent: s.parent.map(|p| p as u32),
+                doc: s.doc,
+                range_start_line: s.range.start.line,
+                range_start_character: s.range.start.column as u32,
+                range_end_line: s.range.end.line,
+                range_end_character: s.range.end.column as u32,
+                range_start_offset: s.range.start.offset as u32,
+                range_end_offset: s.range.end.offset as u32,
+                selection_start_line: s.selection_range.start.line,
+                selection_start_character: s.selection_range.start.column as u32,
+                selection_end_line: s.selection_range.end.line,
+                selection_end_character: s.selection_range.end.column as u32,
+                selection_start_offset: s.selection_range.start.offset as u32,
+                selection_end_offset: s.selection_range.end.offset as u32,
+            })
+            .collect(),
+    )
+}
+
 /// One text replacement returned by `rename`. Coordinates are
 /// LSP-style (0-indexed line, UTF-16 character) plus the equivalent
 /// byte offsets so a browser caller can pick whichever it prefers.

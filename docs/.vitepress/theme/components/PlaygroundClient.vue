@@ -135,6 +135,26 @@ interface WasmModule {
         character: number,
         new_name: string
     ) => TextEditWire[];
+    document_symbols: (sources: unknown, entry: string) => DocumentSymbolWire[];
+}
+
+interface DocumentSymbolWire {
+    name: string;
+    kind: 'schema' | 'method' | 'field' | 'schema-field' | 'import';
+    parent: number | null;
+    doc: string | null;
+    range_start_line: number;
+    range_start_character: number;
+    range_end_line: number;
+    range_end_character: number;
+    range_start_offset: number;
+    range_end_offset: number;
+    selection_start_line: number;
+    selection_start_character: number;
+    selection_end_line: number;
+    selection_end_character: number;
+    selection_start_offset: number;
+    selection_end_offset: number;
 }
 
 interface PrepareRenameResult {
@@ -1280,6 +1300,101 @@ function renameAtCursor(view: EditorView): boolean {
     return true;
 }
 
+// ---------- Symbol picker (Cmd-Shift-O / Ctrl-Shift-O) -------------------
+const symbolPickerDialog = ref<HTMLDialogElement | null>(null);
+const symbolPickerQuery = ref<string>('');
+const symbolPickerItems = ref<DocumentSymbolWire[]>([]);
+const symbolPickerActiveIdx = ref<number>(0);
+const symbolPickerInput = ref<HTMLInputElement | null>(null);
+
+const symbolPickerFiltered = computed<DocumentSymbolWire[]>(() => {
+    const q = symbolPickerQuery.value.trim().toLowerCase();
+    if (!q) return symbolPickerItems.value;
+    // Subsequence-style fuzzy match: every char in q must appear in
+    // order in the symbol name (case-insensitive). Cheap and behaves
+    // the way VS Code's command palette / Cmd-T users expect.
+    return symbolPickerItems.value.filter((s) => {
+        const name = s.name.toLowerCase();
+        let j = 0;
+        for (const ch of name) {
+            if (ch === q[j]) j++;
+            if (j === q.length) return true;
+        }
+        return false;
+    });
+});
+
+function openSymbolPicker(view: EditorView): boolean {
+    const mod = wasmRef.value;
+    if (!mod) return false;
+    const sources = files.value.map((f) => ({ path: f.path, content: f.content }));
+    let syms: DocumentSymbolWire[];
+    try {
+        syms = mod.document_symbols(sources, activeFile.value);
+    } catch {
+        return false;
+    }
+    if (syms.length === 0) return true;
+    symbolPickerItems.value = syms;
+    symbolPickerQuery.value = '';
+    symbolPickerActiveIdx.value = 0;
+    const dlg = symbolPickerDialog.value;
+    if (!dlg) return true;
+    if (typeof dlg.showModal === 'function') dlg.showModal();
+    else dlg.setAttribute('open', '');
+    queueMicrotask(() => symbolPickerInput.value?.focus());
+    // Stash the editor view so `jumpToSymbol` can dispatch into it
+    // after the dialog closes. CodeMirror also re-focuses when closed.
+    void view;
+    return true;
+}
+
+function closeSymbolPicker() {
+    const dlg = symbolPickerDialog.value;
+    if (!dlg) return;
+    if (typeof dlg.close === 'function') dlg.close();
+    else dlg.removeAttribute('open');
+}
+
+function jumpToSymbol(sym: DocumentSymbolWire) {
+    closeSymbolPicker();
+    const view = editorView.value;
+    if (!view) return;
+    const startLineNum = sym.selection_start_line + 1;
+    if (startLineNum < 1 || startLineNum > view.state.doc.lines) return;
+    const startLine = view.state.doc.line(startLineNum);
+    const startOffset = Math.min(startLine.from + sym.selection_start_character, startLine.to);
+    const endLineNum = sym.selection_end_line + 1;
+    const endLine =
+        endLineNum >= 1 && endLineNum <= view.state.doc.lines
+            ? view.state.doc.line(endLineNum)
+            : startLine;
+    const endOffset = Math.min(endLine.from + sym.selection_end_character, endLine.to);
+    view.dispatch({
+        selection: { anchor: startOffset, head: endOffset },
+        scrollIntoView: true,
+    });
+    view.focus();
+}
+
+function onSymbolPickerKeydown(e: KeyboardEvent) {
+    const list = symbolPickerFiltered.value;
+    if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        symbolPickerActiveIdx.value = Math.min(symbolPickerActiveIdx.value + 1, list.length - 1);
+    } else if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        symbolPickerActiveIdx.value = Math.max(symbolPickerActiveIdx.value - 1, 0);
+    } else if (e.key === 'Enter') {
+        e.preventDefault();
+        const target = list[symbolPickerActiveIdx.value];
+        if (target) jumpToSymbol(target);
+    } else if (e.key === 'Escape') {
+        e.preventDefault();
+        closeSymbolPicker();
+    }
+}
+
 /// Widget that renders a single inlay hint inline. Atomic so caret
 /// movement crosses it in a single keystroke; not block-level so it
 /// flows with the line.
@@ -1456,6 +1571,11 @@ onMounted(() => {
                     key: 'F2',
                     preventDefault: true,
                     run: renameAtCursor,
+                },
+                {
+                    key: 'Mod-Shift-o',
+                    preventDefault: true,
+                    run: openSymbolPicker,
                 },
             ]),
             referencesField,
@@ -1862,6 +1982,42 @@ watch([files, entry, argsInput], () => {
           <button type="submit" class="rp-dialog-btn rp-dialog-btn-primary">Create</button>
         </div>
       </form>
+    </dialog>
+
+    <dialog
+      ref="symbolPickerDialog"
+      class="rp-dialog rp-symbol-picker"
+      @close="symbolPickerQuery = ''"
+    >
+      <div class="rp-dialog-form" @keydown="onSymbolPickerKeydown">
+        <input
+          ref="symbolPickerInput"
+          v-model="symbolPickerQuery"
+          class="rp-dialog-input rp-symbol-picker-input"
+          type="text"
+          placeholder="Go to symbol…"
+          autocomplete="off"
+          @keydown.esc.prevent="closeSymbolPicker"
+        />
+        <ul class="rp-symbol-picker-list">
+          <li
+            v-for="(sym, idx) in symbolPickerFiltered"
+            :key="idx"
+            class="rp-symbol-picker-item"
+            :class="{ 'is-active': idx === symbolPickerActiveIdx }"
+            :data-kind="sym.kind"
+            @click="jumpToSymbol(sym)"
+            @mouseenter="symbolPickerActiveIdx = idx"
+          >
+            <span class="rp-symbol-picker-kind">{{ sym.kind }}</span>
+            <span class="rp-symbol-picker-name">{{ sym.name }}</span>
+            <span class="rp-symbol-picker-loc">L{{ sym.range_start_line + 1 }}</span>
+          </li>
+          <li v-if="symbolPickerFiltered.length === 0" class="rp-symbol-picker-empty">
+            No matching symbols.
+          </li>
+        </ul>
+      </div>
     </dialog>
 
     <dialog ref="argsDialog" class="rp-dialog rp-args-dialog" @close="argsDraftError = ''">
@@ -3258,6 +3414,78 @@ watch([files, entry, argsInput], () => {
 :deep(.rp-ref-hit) {
   background: color-mix(in srgb, var(--vp-c-brand-1) 22%, transparent);
   border-radius: 2px;
+}
+
+/* Symbol picker (Cmd-Shift-O). Lightweight dialog: search input on
+   top + a flat list of matches below. Reuses the existing dialog
+   chrome (`.rp-dialog`, `.rp-dialog-form`) so it picks up the same
+   backdrop / drag behaviour as the other dialogs. */
+.rp-symbol-picker {
+  min-width: 420px;
+  max-width: 80vw;
+}
+
+.rp-symbol-picker-input {
+  width: 100%;
+  margin-bottom: 8px;
+}
+
+.rp-symbol-picker-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  max-height: 50vh;
+  overflow-y: auto;
+}
+
+.rp-symbol-picker-item {
+  display: grid;
+  grid-template-columns: 80px 1fr auto;
+  gap: 10px;
+  align-items: baseline;
+  padding: 4px 8px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.rp-symbol-picker-item.is-active {
+  background: var(--vp-c-default-soft);
+}
+
+.rp-symbol-picker-kind {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--vp-c-text-3);
+  font-family: var(--vp-font-family-mono);
+}
+
+.rp-symbol-picker-item[data-kind='schema'] .rp-symbol-picker-kind,
+.rp-symbol-picker-item[data-kind='schema-field'] .rp-symbol-picker-kind {
+  color: var(--vp-c-brand-1);
+}
+
+.rp-symbol-picker-item[data-kind='method'] .rp-symbol-picker-kind {
+  color: #c8742c;
+}
+
+.rp-symbol-picker-name {
+  color: var(--vp-c-text-1);
+  font-family: var(--vp-font-family-mono);
+}
+
+.rp-symbol-picker-loc {
+  color: var(--vp-c-text-3);
+  font-size: 11px;
+  font-family: var(--vp-font-family-mono);
+}
+
+.rp-symbol-picker-empty {
+  padding: 12px 8px;
+  color: var(--vp-c-text-3);
+  font-size: 12px;
+  text-align: center;
 }
 
 /* Inlay-hint ghost text. Faded so it doesn't draw the eye away from
