@@ -1,0 +1,4 @@
+// The `#relaxed` opt-out clears the strict_mode bit.
+// EXPECTED: tree.strict_mode == false (no analyzer diagnostics).
+#relaxed
+{ a: 1, b: 2 }

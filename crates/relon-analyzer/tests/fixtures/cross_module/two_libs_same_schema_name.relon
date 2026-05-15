@@ -8,7 +8,6 @@
 //
 // EXPECTED: 0 `UnknownReferenceType` for `u.name` or `v.email`,
 // 0 `MainReturnTypeMismatch` (body is Int matching `-> Int` return).
-#strict
 #import a from "./lib_a.relon"
 #import b from "./lib_b.relon"
 #main(a.User u, b.User v) -> Int

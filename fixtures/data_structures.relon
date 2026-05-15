@@ -1,3 +1,6 @@
+// Showcase fixture under `#relaxed` so the untyped spread sources and
+// dynamic comprehension bindings stay readable.
+#relaxed
 {
     "base": {
         "version": 1,

@@ -1,11 +1,7 @@
-// v1.3 forward (v2-updated): strict mode rejects a spread whose
-// source's static type is genuinely unknown. Pre-v2 this fixture
-// used `1 + 2` as the source; v2 splits that case off into the
-// cross-mode `NonSpreadableSource` because the type is statically
-// known to be non-dict. An untyped closure parameter leaks `Any`
+// Strict (the default) rejects a spread whose source's static type
+// is genuinely unknown. An untyped closure parameter leaks `Any`
 // into the body scope, so the inner spread's source has no static
-// type — strict demands a `<T>` hint.
-// EXPECTED: 1 × SpreadSourceTypeUnknown (plus closure-param
+// type and strict demands a `<T>` hint.
+// EXPECTED: 1 x SpreadSourceTypeUnknown (plus closure-param
 // diagnostics for the untyped `n`).
-#strict
 { f: (n) => { ...n } }

@@ -2,7 +2,6 @@
 // has a typed schema, so an implicit derivation accepts it; an
 // explicit `<Order>` hint is also fine.
 // EXPECTED: no diagnostics.
-#strict
 #schema Order { Int id: *, Float total: * }
 #main(Order o) -> Dict<String, Int>
 { ...<Order> o }

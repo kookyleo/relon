@@ -2,7 +2,10 @@
   Relon Language Demo (Modern Edition)
   - Using @fn for unified logic.
   - Using unquoted keys for cleaner JSON-like structure.
+  - `#relaxed` to keep the untyped closure params and dynamic
+    reference paths as a quick-glance showcase.
 */
+#relaxed
 {
     // --- 1. LOGIC DEFINITIONS ---
     // Define a formatter as a decorator-compatible function

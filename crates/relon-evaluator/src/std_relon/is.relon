@@ -1,3 +1,6 @@
+// Standard library: type predicates. `#relaxed` so the inspector
+// parameters accept anything.
+#relaxed
 {
     int(v): type(v) == "Int",
     string(v): type(v) == "String",

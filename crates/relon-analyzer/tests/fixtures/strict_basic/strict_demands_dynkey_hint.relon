@@ -1,4 +1,3 @@
-// v1.3 forward: strict mode rejects an untyped dynamic key.
-// EXPECTED: 1 × MissingDynamicKeyTypeHint.
-#strict
+// Strict (the default) rejects an untyped dynamic key.
+// EXPECTED: 1 x MissingDynamicKeyTypeHint.
 { k: "key", [k]: 1 }

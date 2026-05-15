@@ -3,7 +3,6 @@
 // specific `UnknownReferenceType` over the generic
 // `MissingSpreadTypeHint`, but at minimum reports the failure.
 // EXPECTED: ≥ 1 × UnknownReferenceType (not just MissingSpreadTypeHint).
-#strict
 #schema Extras { Int a: *, Int b: * }
 #schema Order { Extras extras: *, Int id: * }
 #main(Order o) -> Dict<String, Int>

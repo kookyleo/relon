@@ -3,5 +3,4 @@
 // StrictForbidsUnclassifiedClosureBody (the body's inferred type is
 // Any).
 // EXPECTED: ≥ 1 × StrictForbidsUnclassifiedClosureBody.
-#strict
 { helper: (Int n) => mystery(n) }

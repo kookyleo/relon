@@ -42,18 +42,18 @@ pub mod goto_def;
 pub mod hover;
 pub(crate) mod infer;
 pub mod inlay_hints;
-pub mod references;
-pub mod rename;
-pub mod signature_help;
-pub mod symbols;
 pub(crate) mod main_return;
 pub mod main_sig;
 pub mod modules;
+pub mod references;
+pub mod rename;
 pub mod resolve;
 pub mod root_schemas;
 pub mod schema;
 pub mod sig;
+pub mod signature_help;
 pub mod stdlib_signatures;
+pub mod symbols;
 pub mod tree;
 pub mod typecheck;
 pub mod workspace;
@@ -79,14 +79,15 @@ pub use workspace::{
 use relon_parser::Node;
 use std::collections::{HashMap, HashSet};
 
-/// True when `root` declares a bare `#strict` directive on its
-/// directive stack. Used by [`analyze_with_options`] to enable strict
-/// mode whenever the root opts in directly, regardless of whether the
-/// caller forwarded a strict workspace flag.
-pub(crate) fn has_strict_directive(root: &Node) -> bool {
+/// True when `root` declares a bare `#relaxed` or `#unstrict`
+/// directive on its directive stack. Either spelling opts the module
+/// out of strict inference (the analyzer's default). Used by
+/// [`analyze_with_options`] to disable strict mode whenever the root
+/// opts out, regardless of the workspace flag the caller forwarded.
+pub(crate) fn has_relaxed_directive(root: &Node) -> bool {
     root.directives
         .iter()
-        .any(|d| d.name == directive_names::STRICT)
+        .any(|d| d.name == directive_names::RELAXED || d.name == directive_names::UNSTRICT)
 }
 
 /// v1.8 (C4 audit): walk every host-registered FnSignature and emit
@@ -158,12 +159,14 @@ pub fn analyze_with_options(root: &Node, options: &AnalyzeOptions) -> AnalyzedTr
     // context so the user can pinpoint which host integration is
     // misconfigured.
     audit_host_fn_signatures(&mut tree);
-    // v1.3: strict mode is the OR of (caller-supplied option) ∨ (root's
-    // own `#strict` directive). The OR is what makes the workspace
-    // post-pass's contagion rule work — a non-strict library imported
-    // by a strict entry inherits the bit through `options.strict_mode`,
-    // while a single-file source can still opt in via the directive.
-    tree.strict_mode = options.strict_mode || has_strict_directive(root);
+    // Strict is the default; the source can opt out via `#relaxed` /
+    // `#unstrict`. The caller-supplied `strict_mode` flag is the
+    // workspace-level decision (contagion of the entry's mode to
+    // every reachable import); the per-file directive is the local
+    // override. The AND means a strict workspace can be overridden
+    // by a per-file opt-out (the contagion rule preserves this — a
+    // relaxed entry stamps `strict_mode: false` on every import).
+    tree.strict_mode = options.strict_mode && !has_relaxed_directive(root);
     // Schema-rooted decision 21' (core.relon carrier): install the
     // built-in `String` / `List<T>` / `Dict<K, V>` / `Iter<T>` method
     // tables before any user-source pass. Every subsequent collector
@@ -234,15 +237,19 @@ pub fn analyze_with_options(root: &Node, options: &AnalyzeOptions) -> AnalyzedTr
 /// `UnresolvedReference` when used as a free variable in a closure
 /// body.
 ///
-/// v1.3 adds `strict_mode`: when set, every value must be statically
-/// inferable; sites that the analyzer would otherwise silently fall
-/// back on (uninferrable spread sources, dynamic keys without a `<T>`
-/// type hint, native fn returns whose signature isn't visible) become
-/// errors instead. Strict mode is *contagious* across `#import`s — the
-/// workspace pass propagates it from the entry to every reachable
-/// module so a strict entry can't inherit a non-strict library that
-/// silently leaks `Any` types.
-#[derive(Debug, Default, Clone)]
+/// `strict_mode` defaults to `true`: every value must be statically
+/// inferable, and sites the analyzer can't classify (uninferrable
+/// spread sources, dynamic keys without a `<T>` hint, untyped closure
+/// parameters, native fns with no signature, …) surface as errors.
+/// Files can opt out by writing `#relaxed` (or `#unstrict`) at the
+/// top, in which case those positions stay silent and the runtime
+/// type-checks them on the way through.
+///
+/// The mode is *contagious* across `#import`s — the workspace pass
+/// propagates the entry's mode to every reachable module so a relaxed
+/// entry doesn't accidentally tighten because it imports a strict
+/// library (or vice versa).
+#[derive(Debug, Clone)]
 pub struct AnalyzeOptions {
     /// Names registered with the host's `Context::functions`. Empty by
     /// default — hosts that want their custom fn names recognized must
@@ -266,11 +273,24 @@ pub struct AnalyzeOptions {
     /// check to decide whether a gated fn would be denied at runtime.
     /// Defaults to zero-trust — same as the evaluator default.
     pub caps: cap::Capabilities,
-    /// v1.3: when `true`, the analyzer demands a static type for every
-    /// value. Sites that previously fell back to `Any` produce error-
-    /// severity diagnostics describing what couldn't be inferred. Set
-    /// from the entry's `#strict` directive by the workspace pass and
-    /// propagated to every reachable module so a strict entry can't
-    /// inherit silent fallbacks from a non-strict library.
+    /// `true` (the default) enables strict inference: every value
+    /// must have a statically inferable type. Sites that can't be
+    /// classified produce error-severity diagnostics describing what
+    /// couldn't be inferred. The per-file `#relaxed` / `#unstrict`
+    /// directive overrides this to `false` for that module. The
+    /// workspace pass propagates the entry module's mode to every
+    /// reachable import so the two halves can't disagree.
     pub strict_mode: bool,
+}
+
+impl Default for AnalyzeOptions {
+    fn default() -> Self {
+        Self {
+            host_fn_names: HashSet::new(),
+            host_fn_signatures: HashMap::new(),
+            host_fn_gates: HashMap::new(),
+            caps: cap::Capabilities::default(),
+            strict_mode: true,
+        }
+    }
 }

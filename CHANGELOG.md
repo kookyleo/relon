@@ -2,6 +2,20 @@
 
 ## [Unreleased] — Schema-rooted dispatch (trait-bound foundation)
 
+### Language: strict mode by default, opt out via `#relaxed` / `#unstrict`
+
+Relon's analyzer runs in strict static-inference mode by default.
+Sites where inference can't reach a static type produce error-severity
+diagnostics describing what couldn't be determined. A module opts out
+by writing `#relaxed` (or its synonym `#unstrict`) at the top — both
+spellings are bare directives and exactly equivalent.
+
+Strict mode is decided at the entry. The entry's mode is stamped onto
+every reachable `#import` target so the workspace presents a single
+mode end to end: a strict entry analyses every reachable library
+under strict rules, and a `#relaxed` entry analyses every reachable
+library under relaxed rules.
+
 ### Playground: Mod-click go-to-definition
 
 The browser playground now mirrors VS Code / IntelliJ navigation:

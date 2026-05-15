@@ -92,11 +92,9 @@ pub fn collect_main(root: &Node, tree: &mut AnalyzedTree) {
     // schema pass populates `tree.schemas` before us.
     check_unknown_param_types(tree);
     check_unknown_return_type(tree);
-    // v1.6: ban `Any` (and any nested `Any` inside generics) in
-    // every `#main(...)` parameter type and in the return-type
-    // annotation. Replaces the v1.5 strict-only `Any` head check —
-    // `Any` is now retired from the user-facing surface entirely,
-    // not just under `#strict`.
+    // Ban `Any` (and any nested `Any` inside generics) in every
+    // `#main(...)` parameter type and in the return-type annotation.
+    // `Any` is not part of the user-facing surface regardless of mode.
     check_ban_any_main_signature(tree);
 }
 

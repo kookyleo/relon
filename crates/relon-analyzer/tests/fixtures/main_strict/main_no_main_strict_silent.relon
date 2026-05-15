@@ -1,5 +1,4 @@
 // v1.6 (originally v1.5): a strict library file (no #main) carries
 // no `Any` token, so the v1.6 ban-Any pass is silent.
 // EXPECTED: 0 × ExplicitAnyForbidden.
-#strict
 { Int x: 42 }

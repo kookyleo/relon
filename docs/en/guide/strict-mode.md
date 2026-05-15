@@ -1,23 +1,25 @@
-# Strict mode (`#strict`)
+# Strict mode (`#relaxed`)
 
-Relon's analyzer runs in one of two modes:
+Relon's analyzer is strict by default. Every value must have a
+statically inferable type, and sites where inference can't reach a
+static type produce *error*-severity diagnostics describing what
+couldn't be determined.
 
-- **non-strict** (default) — every value the analyzer fails to type
-  falls back to a runtime-checked dynamic value. The analyzer still
-  reports any error it can *prove* statically (broken paths,
-  undeclared schemas, non-spreadable spread sources, etc.); it only
-  stays silent on sites where inference simply can't reach a static
-  type and there's no proof of a real bug.
-- **strict** — opted in by writing `#strict` at the top of a module.
-  Every value must have a statically inferable type. Sites where the
-  analyzer can't determine the type at all (untyped closure params,
-  unsignatured native fns, opaque expressions) now produce
-  *error*-severity diagnostics describing what couldn't be inferred.
+A module opts out of strict inference with the file-level directive
+`#relaxed` (or its synonym `#unstrict`). Both spellings are exactly
+equivalent — pick whichever reads more naturally next to the rest of
+your directives.
 
 ```relon
-#strict
+#relaxed
 { ... }
 ```
+
+Under `#relaxed`, the analyzer still reports any error it can *prove*
+statically (broken paths, undeclared schemas, non-spreadable spread
+sources, etc.); it only stays silent on sites where inference simply
+can't reach a static type and there's no proof of a real bug. Those
+sites fall back to a runtime-checked dynamic value.
 
 > The two modes share the same parser and the same runtime. They
 > also share every "this is statically wrong" error — strict mode
@@ -25,22 +27,26 @@ Relon's analyzer runs in one of two modes:
 
 ## Contagion across `#import`
 
-Strict mode is decided at the **entry**. A single `#strict` on the
-entry file flips `strict_mode = true` on every reachable `#import`
-target — even libraries that themselves didn't write `#strict`.
-This prevents a strict entry from inheriting silent fallbacks from a
-non-strict library.
+Strict mode is decided at the **entry**. The entry's mode is stamped
+onto every reachable `#import` target, so the workspace presents a
+single mode end to end:
 
-The reverse is **not** true: a strict library imported from a
-non-strict entry does *not* drag strict mode onto the whole
-workspace. Strict is a top-down policy.
+- A strict entry (the default — no directive needed) makes every
+  reachable import strict, even libraries that didn't write
+  `#relaxed` themselves. This prevents the entry from inheriting
+  silent fallbacks from a library that happened to be lax.
+- A `#relaxed` entry stamps the cleared bit on every reachable
+  import. A library that internally would have been strict is
+  analysed in relaxed mode for the duration of this workspace build,
+  so a strict library doesn't tighten a relaxed entry by accident.
+
+Strict is a top-down policy: the entry's mode wins.
 
 ## Cross-mode errors (fire in both modes)
 
 These are facts the analyzer can derive from source + schemas alone.
-The runtime would also fail on them, so v2 promotes them to
-cross-mode error severity — non-strict mode no longer gives them a
-free pass.
+The runtime would also fail on them, so they fire at error severity
+regardless of mode — `#relaxed` does not give them a free pass.
 
 | Scenario | Diagnostic |
 |---|---|
@@ -58,11 +64,11 @@ free pass.
 > analyzer can't see; strict mode upgrades the same site to an
 > `unknown_reference_type` error.
 
-## Strict-only errors (fire only under `#strict`)
+## Strict-only errors (silent under `#relaxed`)
 
 These are sites where the static information is *genuinely* missing.
-The analyzer can't refute or confirm them — it just refuses to keep
-going.
+The analyzer can't refute or confirm them — under strict it refuses
+to keep going; under `#relaxed` it accepts the dynamic fallback.
 
 | Scenario | Diagnostic |
 |---|---|
@@ -84,7 +90,7 @@ lock-step with the analyzer.
 
 ### Spread `{ ...e }`
 
-| Scenario | Non-strict | Strict |
+| Scenario | Relaxed | Strict |
 |---|---|---|
 | Spread a dict literal: `{ ...{a: 1} }` | — | — |
 | Spread a sibling field typed as Schema (`Extra e: {...}` → `{ ...e }`) | — | — |
@@ -95,21 +101,21 @@ lock-step with the analyzer.
 
 ### Dynamic dict key `{ [expr]: ... }`
 
-| Scenario | Non-strict | Strict |
+| Scenario | Relaxed | Strict |
 |---|---|---|
 | `{ [k]: 1 }` without `<T>` hint | — | `dynamic_key_type_unknown` |
 | `{ [<String> k]: 1 }` with hint | — | — |
 
 ### Native fn calls
 
-| Scenario | Non-strict | Strict |
+| Scenario | Relaxed | Strict |
 |---|---|---|
 | Host-registered native fn, **with** signature | — | — |
 | Host-registered native fn, **without** signature | — | `expression_type_unknown` + `native_fn_signature_missing` |
 
 ### Closures
 
-| Scenario | Non-strict | Strict |
+| Scenario | Relaxed | Strict |
 |---|---|---|
 | `(Int n) => n + 1` (typed param) | — | — |
 | `(n) => n + 1` (untyped param) | — | `closure_param_type_missing` + `closure_return_type_unknown` |
@@ -117,7 +123,7 @@ lock-step with the analyzer.
 
 ### Reference paths
 
-| Scenario | Non-strict | Strict |
+| Scenario | Relaxed | Strict |
 |---|---|---|
 | `&sibling.u.name` where `u: User` and `User { String name }` | — | — |
 | `&sibling.u.unknown` (schema field doesn't exist) | `unresolved_reference` + `unknown_reference_type` | `unresolved_reference` + `unknown_reference_type` |
@@ -126,14 +132,26 @@ lock-step with the analyzer.
 
 ### `#main(...)` parameters
 
-| Scenario | Non-strict | Strict |
+| Scenario | Relaxed | Strict |
 |---|---|---|
 | `#main(Int x) -> Dict<String, Int>` | — | — |
 | `#main(x) -> ...` (untyped param) | *(rejected by the parser — `#main` parameters require a type annotation regardless of mode)* | — |
 
 ## When to use which
 
-**Default to non-strict** for:
+**Strict (the default)** is the right choice for:
+
+- Production rule files (pricing, scoring, validation) where you
+  want a build-time guarantee that no value silently lands on `Any`.
+- Workspace libraries imported by strict entries — the contagion
+  rule means a relaxed library still gets analysed strictly when
+  pulled into a strict entry.
+- Code that targets the AOT compilation path: the type-driven
+  optimizations described in the
+  [architecture overview](./architecture.md) only fire when every
+  shape is statically known.
+
+**Opt out with `#relaxed`** for:
 
 - Quick experiments and playground sessions, where you want to type
   one line and see it run.
@@ -141,18 +159,6 @@ lock-step with the analyzer.
   refined the schema.
 - Host integrations during development, before you've registered
   signatures for every native fn.
-
-**Switch to strict** for:
-
-- Production rule files (pricing, scoring, validation) where you
-  want a build-time guarantee that no value silently lands on `Any`.
-- Workspace libraries imported by strict entries — the contagion
-  rule means you can't sneak silent fallbacks past the entry's
-  `#strict`.
-- Code that targets the AOT compilation path: the type-driven
-  optimizations described in the
-  [architecture overview](./architecture.md) only fire when every
-  shape is statically known.
 
 ## Recipes — fixing each diagnostic
 
@@ -164,7 +170,7 @@ lock-step with the analyzer.
 | `unresolved_schema` | Declare the schema before the reference (`#schema Missing { ... }`) or drop the `<Missing>` annotation. |
 | `unknown_reference_type` | Check the path: the named field must exist on the head's schema, and you can't descend past a leaf (`Int.something` etc.). |
 | `expression_type_unknown` | Annotate the surrounding binding so inference has a target, or refactor the expression so its type is derivable. |
-| `native_fn_signature_missing` | Expose the host fn through `host_fn_signatures` with a declared return type, or stop calling it from a strict module. |
+| `native_fn_signature_missing` | Expose the host fn through `host_fn_signatures` with a declared return type, or add `#relaxed` to the module if the dynamic fallback is acceptable. |
 | `closure_param_type_missing` | Annotate the parameter: `(Int n) => ...`. |
 | `closure_return_type_unknown` | Declare `-> ReturnType` on the closure, or refactor the body so its type is reachable from inference. |
 

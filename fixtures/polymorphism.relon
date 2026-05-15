@@ -1,3 +1,6 @@
+// Showcase fixture for match polymorphism; `#relaxed` keeps the
+// untyped `render_item(item)` closure shape concise.
+#relaxed
 {
     #schema Image {
         name: String,

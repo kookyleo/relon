@@ -1,3 +1,6 @@
+// Showcase fixture for closure shapes; `#relaxed` keeps the untyped
+// parameters legible.
+#relaxed
 {
     // High-order function definition
     make_adder(x): (y) => x + y,

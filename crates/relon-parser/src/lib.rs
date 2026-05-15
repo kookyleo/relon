@@ -650,8 +650,7 @@ mod tests {
         // Every one of these inputs would force `parse_document` to
         // surface an `Err`; the recovering API must absorb each one.
         for src in &[
-            "#", "&", "@", "{", "{a:", "{ ?", "}", "[", "(", "f\"hi ${",
-            "", "   ", "\n\t",
+            "#", "&", "@", "{", "{a:", "{ ?", "}", "[", "(", "f\"hi ${", "", "   ", "\n\t",
         ] {
             let result = parse_document_recovering(src);
             // We only assert: never panics, never crashes. Diagnostics
@@ -712,8 +711,19 @@ mod tests {
         // broken prefixes — must produce a non-empty `nodes` vec so
         // downstream completion has an AST root to dispatch off.
         for src in [
-            "@", "#", "&", "{", "{ @", "{ x: 1, @ }", "[", "}",
-            "{ a:", "{ ?", "f\"hi ${", "(", "",
+            "@",
+            "#",
+            "&",
+            "{",
+            "{ @",
+            "{ x: 1, @ }",
+            "[",
+            "}",
+            "{ a:",
+            "{ ?",
+            "f\"hi ${",
+            "(",
+            "",
         ] {
             let r = parse_document_recovering(src);
             assert!(
@@ -734,11 +744,17 @@ mod tests {
         assert_eq!(r.nodes.len(), 1, "expected partial Dict root");
         match &*r.nodes[0].expr {
             Expr::Dict(fields) => {
-                let has_fmt = fields.iter().any(|(k, _)| matches!(
-                    k,
-                    TokenKey::String(s, _, _) if s == "fmt"
-                ));
-                assert!(has_fmt, "expected the `fmt` sibling to survive partial lowering, got {:?}", fields);
+                let has_fmt = fields.iter().any(|(k, _)| {
+                    matches!(
+                        k,
+                        TokenKey::String(s, _, _) if s == "fmt"
+                    )
+                });
+                assert!(
+                    has_fmt,
+                    "expected the `fmt` sibling to survive partial lowering, got {:?}",
+                    fields
+                );
             }
             other => panic!("expected Dict root, got {:?}", other),
         }

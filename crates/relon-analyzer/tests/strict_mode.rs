@@ -1,7 +1,7 @@
 //! Integration tests for strict-mode behavior: the strict bit, demands
-//! around spread / dynamic-key type hints, silent-fallback semantics in
-//! non-strict, head-unresolved escalation, closure parameter / body
-//! constraints, and multi-module strict propagation.
+//! around spread / dynamic-key type hints, silent-fallback semantics
+//! under `#relaxed`, head-unresolved escalation, closure parameter /
+//! body constraints, and multi-module strict propagation.
 
 use relon_analyzer::Diagnostic;
 
@@ -14,6 +14,12 @@ use common::*;
 fn fixture_strict_enables_bit() {
     let tree = analyze_fixture("strict_basic/strict_enables_bit.relon");
     assert!(tree.strict_mode);
+}
+
+#[test]
+fn fixture_relaxed_clears_bit() {
+    let tree = analyze_fixture("strict_basic/relaxed_clears_bit.relon");
+    assert!(!tree.strict_mode);
 }
 
 #[test]
@@ -83,18 +89,16 @@ fn fixture_strict_known_path_silent() {
     assert_eq!(n, 0, "{:?}", tree.diagnostics);
 }
 
-// (v1.4's `fixture_strict_non_strict_silent` retired in v2 — its
-// premise was "non-strict stays silent on `o.unknown`", which v2
-// inverts: the path-tail walker now fires `UnknownReferenceType`
-// cross-mode whenever the analyzer has positive knowledge a step
-// is broken. The replacement assertion lives in
-// `typecheck::tests::non_strict_path_tail_reports_unknown_ref_type`.)
+// Cross-mode path-tail invariant: when the analyzer has positive
+// knowledge a path step is broken (`o.unknown` on a schema with no
+// such field), `UnknownReferenceType` fires regardless of mode. The
+// matching unit test lives in
+// `typecheck::tests::non_strict_path_tail_reports_unknown_ref_type`.
 
 #[test]
 fn fixture_strict_typed_binding_unknown() {
-    // v1.5 reframe: list comprehension is now inferable, so the
-    // previously expected ExpressionTypeUnknown no longer fires. We assert
-    // silence on both ExpressionTypeUnknown and StaticTypeMismatch.
+    // List comprehension inference covers this binding, so neither
+    // `ExpressionTypeUnknown` nor `StaticTypeMismatch` should fire.
     let tree = analyze_fixture("strict_silent_fallback/strict_typed_binding_unknown.relon");
     let il = count(&tree.diagnostics, |d| {
         matches!(d, Diagnostic::ExpressionTypeUnknown { .. })

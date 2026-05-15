@@ -2,6 +2,5 @@
 // hints; inference propagates through the bindings just like any
 // dict literal.
 // EXPECTED: no diagnostics.
-#strict
 #main(Int x) -> Int
 (n + 1) where { Int n: x }

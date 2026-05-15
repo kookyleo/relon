@@ -63,7 +63,12 @@ pub fn collect(root: &Node, _tree: &AnalyzedTree) -> Vec<DocumentSymbol> {
 fn collect_directives(node: &Node, parent: Option<usize>, out: &mut Vec<DocumentSymbol>) {
     for dir in &node.directives {
         match &dir.body {
-            DirectiveBody::NameBody { name, name_range, body, .. } => {
+            DirectiveBody::NameBody {
+                name,
+                name_range,
+                body,
+                ..
+            } => {
                 let idx = out.len();
                 out.push(DocumentSymbol {
                     name: name.clone(),
@@ -89,7 +94,9 @@ fn collect_directives(node: &Node, parent: Option<usize>, out: &mut Vec<Document
                     }
                 }
             }
-            DirectiveBody::Import { path, path_range, .. } => {
+            DirectiveBody::Import {
+                path, path_range, ..
+            } => {
                 out.push(DocumentSymbol {
                     name: path.clone(),
                     kind: SymbolKind::Import,
@@ -139,8 +146,16 @@ fn classify_value(node: &Node) -> SymbolKind {
 }
 
 fn combine_pair_range(a: TokenRange, b: TokenRange) -> TokenRange {
-    let start = if a.start.offset <= b.start.offset { a.start } else { b.start };
-    let end = if a.end.offset >= b.end.offset { a.end } else { b.end };
+    let start = if a.start.offset <= b.start.offset {
+        a.start
+    } else {
+        b.start
+    };
+    let end = if a.end.offset >= b.end.offset {
+        a.end
+    } else {
+        b.end
+    };
     TokenRange { start, end }
 }
 

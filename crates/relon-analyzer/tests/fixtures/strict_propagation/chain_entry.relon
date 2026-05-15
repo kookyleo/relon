@@ -1,4 +1,3 @@
-// v1.3: 2-hop chain — entry → mid → leaf, strict propagates.
-#strict
+// 2-hop chain — entry -> mid -> leaf, strict propagates.
 #import * from "./chain_mid.relon"
 { x: 1 }

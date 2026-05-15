@@ -159,7 +159,10 @@ fn dict_field_span(field: &SyntaxNode) -> Range<usize> {
 /// descendants in source order and returns the start of the first
 /// leaf token whose kind isn't a comment / whitespace.
 fn first_significant_offset(node: &SyntaxNode) -> Option<usize> {
-    for tok in node.descendants_with_tokens().filter_map(|el| el.into_token()) {
+    for tok in node
+        .descendants_with_tokens()
+        .filter_map(|el| el.into_token())
+    {
         if !tok.kind().is_trivia() {
             return Some(usize::from(tok.text_range().start()));
         }
@@ -299,8 +302,7 @@ fn collect_lift_import_edits(doc: &Document, source: &str, edits: &mut Vec<Sourc
     // import could disturb the comment's visual association. Skip.
     let first_directive_start = first_significant_offset(&directives[0])
         .unwrap_or_else(|| usize::from(directives[0].text_range().start()));
-    let last_import_end =
-        usize::from(imports.last().unwrap().text_range().end()).min(source.len());
+    let last_import_end = usize::from(imports.last().unwrap().text_range().end()).min(source.len());
     let inter_block = &source[first_directive_start..last_import_end];
     if inter_block.contains("//") || inter_block.contains("/*") {
         return;
@@ -312,8 +314,8 @@ fn collect_lift_import_edits(doc: &Document, source: &str, edits: &mut Vec<Sourc
     let mut lifted = String::new();
     let mut import_ranges: Vec<Range<usize>> = Vec::with_capacity(imports.len());
     for (i, dir) in imports.iter().enumerate() {
-        let start = first_significant_offset(dir)
-            .unwrap_or_else(|| usize::from(dir.text_range().start()));
+        let start =
+            first_significant_offset(dir).unwrap_or_else(|| usize::from(dir.text_range().start()));
         let r = start..usize::from(dir.text_range().end()).min(source.len());
         if i > 0 {
             lifted.push('\n');
@@ -407,10 +409,8 @@ fn collect_dict_reorder_edits_cst(
         return;
     }
 
-    let classified: Vec<(PairTier, &ast::DictField)> = fields
-        .iter()
-        .map(|f| (classify_dict_field(f), f))
-        .collect();
+    let classified: Vec<(PairTier, &ast::DictField)> =
+        fields.iter().map(|f| (classify_dict_field(f), f)).collect();
 
     if pairs_tier_sorted(&classified) {
         return;
@@ -508,10 +508,8 @@ fn walk_for_break_offsets_cst(
     if fields.len() < 2 {
         return;
     }
-    let classified: Vec<(PairTier, &ast::DictField)> = fields
-        .iter()
-        .map(|f| (classify_dict_field(f), f))
-        .collect();
+    let classified: Vec<(PairTier, &ast::DictField)> =
+        fields.iter().map(|f| (classify_dict_field(f), f)).collect();
     // Break at every upward tier transition (Method→PrivateField,
     // Method→PublicField, PrivateField→PublicField). After the
     // reorder pre-pass, tiers are non-decreasing, so each transition

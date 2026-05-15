@@ -1,4 +1,6 @@
-// v1.5 reverse: non-strict mode keeps the warning-level
-// UnresolvedReference but does NOT push UnknownReferenceType.
+// Reverse pair: under the `#relaxed` opt-out, head-unresolved keeps
+// the warning-level UnresolvedReference but does NOT push
+// UnknownReferenceType.
 // EXPECTED: 0 × UnknownReferenceType.
+#relaxed
 { x: mystery }

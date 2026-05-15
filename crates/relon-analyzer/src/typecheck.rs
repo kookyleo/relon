@@ -442,13 +442,15 @@ impl<'a> Walker<'a> {
                             matches!(t, InferredType::Any)
                         };
                         if any_result {
-                            self.tree.diagnostics.push(Diagnostic::ExpressionTypeUnknown {
-                                reason: format!(
-                                    "dict field `{}` value type is not statically derivable",
-                                    field_name.unwrap_or("_")
-                                ),
-                                range: span_of(value.range),
-                            });
+                            self.tree
+                                .diagnostics
+                                .push(Diagnostic::ExpressionTypeUnknown {
+                                    reason: format!(
+                                        "dict field `{}` value type is not statically derivable",
+                                        field_name.unwrap_or("_")
+                                    ),
+                                    range: span_of(value.range),
+                                });
                         }
                     }
                     self.visit_internal(value, field_name);
@@ -477,12 +479,12 @@ impl<'a> Walker<'a> {
                 if self.tree.strict_mode {
                     for param in params {
                         if param.type_hint.is_none() {
-                            self.tree.diagnostics.push(
-                                Diagnostic::ClosureParamTypeMissing {
+                            self.tree
+                                .diagnostics
+                                .push(Diagnostic::ClosureParamTypeMissing {
                                     param_name: param.name.clone(),
                                     range: span_of(node.range),
-                                },
-                            );
+                                });
                         }
                     }
                 }
@@ -532,12 +534,12 @@ impl<'a> Walker<'a> {
                     let scope = self.build_type_scope_with_closure(params);
                     let body_ty = infer_type(body, &scope).unwrap_or(InferredType::Any);
                     if matches!(body_ty, InferredType::Any) {
-                        self.tree.diagnostics.push(
-                            Diagnostic::ClosureReturnTypeUnknown {
+                        self.tree
+                            .diagnostics
+                            .push(Diagnostic::ClosureReturnTypeUnknown {
                                 role: field_name.unwrap_or("<closure>").to_string(),
                                 range: span_of(body.range),
-                            },
-                        );
+                            });
                     }
                 }
                 self.visit_internal(body, None);
@@ -1642,10 +1644,12 @@ impl<'a> Walker<'a> {
                 // type. Pin the diagnostic on the failing arm body so
                 // the user knows where to add an annotation.
                 if strict {
-                    self.tree.diagnostics.push(Diagnostic::ExpressionTypeUnknown {
-                        reason: "match arm body type is not statically derivable".to_string(),
-                        range: span_of(body.range),
-                    });
+                    self.tree
+                        .diagnostics
+                        .push(Diagnostic::ExpressionTypeUnknown {
+                            reason: "match arm body type is not statically derivable".to_string(),
+                            range: span_of(body.range),
+                        });
                 }
                 return;
             };
@@ -2189,10 +2193,12 @@ impl<'a> Walker<'a> {
                 },
                 _ => "value type is not statically derivable".to_string(),
             };
-            self.tree.diagnostics.push(Diagnostic::ExpressionTypeUnknown {
-                reason,
-                range: span_of(value.range),
-            });
+            self.tree
+                .diagnostics
+                .push(Diagnostic::ExpressionTypeUnknown {
+                    reason,
+                    range: span_of(value.range),
+                });
         }
     }
 
@@ -4055,7 +4061,6 @@ mod tests {
     fn v1_3_strict_spread_without_type_flagged() {
         let tree = analyze_str(
             r#"
-            #strict
             { src: 1 + 2, ...src }
             "#,
         );
@@ -4065,10 +4070,13 @@ mod tests {
         assert_eq!(n, 1, "{:?}", tree.diagnostics);
     }
 
-    /// v1.3 reverse: in non-strict mode, the same spread is silent.
+    /// Reverse: under `#relaxed`, the same spread is silent.
     #[test]
-    fn v1_3_non_strict_spread_silent() {
-        let tree = analyze_str(r#"{ src: 1 + 2, ...src }"#);
+    fn relaxed_spread_silent() {
+        let tree = analyze_str(
+            r#"#relaxed
+            { src: 1 + 2, ...src }"#,
+        );
         let n = count(&tree, |d| {
             matches!(d, Diagnostic::SpreadSourceTypeUnknown { .. })
         });
@@ -4081,7 +4089,6 @@ mod tests {
     fn v1_3_strict_typed_spread_silent() {
         let tree = analyze_str(
             r#"
-            #strict
             #schema Extra { Int a: *, Int b: * }
             { src: { a: 1, b: 2 }, ...<Extra> src }
             "#,
@@ -4098,7 +4105,6 @@ mod tests {
     fn v1_3_strict_dynamic_key_without_type_flagged() {
         let tree = analyze_str(
             r#"
-            #strict
             { k: "key", [k]: 1 }
             "#,
         );
@@ -4113,7 +4119,6 @@ mod tests {
     fn v1_3_strict_typed_dynamic_key_silent() {
         let tree = analyze_str(
             r#"
-            #strict
             { k: "key", [<String> k]: 1 }
             "#,
         );
@@ -4123,10 +4128,13 @@ mod tests {
         assert_eq!(n, 0, "{:?}", tree.diagnostics);
     }
 
-    /// v1.3 reverse: non-strict dynamic key — silent.
+    /// Reverse: under `#relaxed`, an untyped dynamic key is silent.
     #[test]
-    fn v1_3_non_strict_dynamic_key_silent() {
-        let tree = analyze_str(r#"{ k: "key", [k]: 1 }"#);
+    fn relaxed_dynamic_key_silent() {
+        let tree = analyze_str(
+            r#"#relaxed
+            { k: "key", [k]: 1 }"#,
+        );
         let n = count(&tree, |d| {
             matches!(d, Diagnostic::DynamicKeyTypeUnknown { .. })
         });
@@ -4183,7 +4191,6 @@ mod tests {
     fn v1_3_strict_spread_unresolved_schema_flagged() {
         let tree = analyze_str(
             r#"
-            #strict
             { src: 1, ...<Mystery> src }
             "#,
         );
@@ -4200,7 +4207,6 @@ mod tests {
     fn v1_3_strict_spread_known_schema_silent() {
         let tree = analyze_str(
             r#"
-            #strict
             #schema Extra { Int a: * }
             { src: { a: 1 }, ...<Extra> src }
             "#,
@@ -4209,27 +4215,41 @@ mod tests {
         assert_eq!(n, 0, "{:?}", tree.diagnostics);
     }
 
-    /// v1.3: AnalyzedTree carries the strict_mode bit.
+    /// AnalyzedTree carries `strict_mode = true` by default — no
+    /// directive needed.
     #[test]
-    fn v1_3_strict_mode_bit_set_on_tree() {
-        let tree = analyze_str("#strict\n{ a: 1 }");
+    fn strict_mode_bit_set_by_default() {
+        let tree = analyze_str("{ a: 1 }");
         assert!(tree.strict_mode);
     }
 
-    /// v1.3: a non-strict file leaves the bit cleared.
+    /// `#relaxed` clears the strict_mode bit.
     #[test]
-    fn v1_3_strict_mode_bit_cleared() {
-        let tree = analyze_str(r#"{ a: 1 }"#);
+    fn relaxed_directive_clears_strict_mode_bit() {
+        let tree = analyze_str(
+            r#"#relaxed
+            { a: 1 }"#,
+        );
         assert!(!tree.strict_mode);
     }
 
-    /// v1.3: strict + native fn without static signature should report
-    /// `NativeFnSignatureMissing`. We simulate via an
+    /// `#unstrict` is a synonym for `#relaxed`; it also clears the bit.
+    #[test]
+    fn unstrict_directive_clears_strict_mode_bit() {
+        let tree = analyze_str(
+            r#"#unstrict
+            { a: 1 }"#,
+        );
+        assert!(!tree.strict_mode);
+    }
+
+    /// Strict (the default) + native fn without static signature
+    /// should report `NativeFnSignatureMissing`. We simulate via an
     /// `AnalyzeOptions::host_fn_names` entry without a corresponding
     /// signature.
     #[test]
-    fn v1_3_native_fn_signature_missing_without_signature() {
-        let src = "#strict\n{ x: my_native(1, 2) }";
+    fn strict_native_fn_signature_missing_without_signature() {
+        let src = "{ x: my_native(1, 2) }";
         let node = parse_document(src).unwrap();
         let mut names = std::collections::HashSet::new();
         names.insert("my_native".to_string());
@@ -4238,7 +4258,7 @@ mod tests {
             host_fn_signatures: HashMap::new(),
             host_fn_gates: HashMap::new(),
             caps: crate::Capabilities::default(),
-            strict_mode: false,
+            strict_mode: true,
         };
         let tree = crate::analyze_with_options(&node, &opts);
         let n = count(
@@ -4272,7 +4292,7 @@ mod tests {
     /// v1.3: strict + native fn *with* a signature — silent.
     #[test]
     fn v1_3_strict_native_with_signature_silent() {
-        let src = "#strict\n{ x: my_native(1, 2) }";
+        let src = "{ x: my_native(1, 2) }";
         let node = parse_document(src).unwrap();
         let mut names = std::collections::HashSet::new();
         names.insert("my_native".to_string());
@@ -4505,7 +4525,6 @@ mod tests {
     fn v1_3_typed_int_dynkey_silent() {
         let tree = analyze_str(
             r#"
-            #strict
             { idx: 0, [<Int> idx]: "row0" }
             "#,
         );
@@ -4521,7 +4540,6 @@ mod tests {
     fn v1_3_typed_expr_dynkey_silent() {
         let tree = analyze_str(
             r#"
-            #strict
             { a: "x", b: "y", [<String> a + b]: 1 }
             "#,
         );
@@ -4541,7 +4559,6 @@ mod tests {
     fn v1_4_strict_path_tail_unknown_field() {
         let tree = analyze_str(
             r#"
-            #strict
             #schema Order { Int id: *, Float total: * }
             #main(Order o) -> Dict
             { x: o.unknown }
@@ -4568,7 +4585,6 @@ mod tests {
     fn v1_4_strict_path_tail_int_descend() {
         let tree = analyze_str(
             r#"
-            #strict
             #schema Order { Int id: *, Float total: * }
             #main(Order o) -> Dict
             { x: o.id.something }
@@ -4587,7 +4603,6 @@ mod tests {
     fn v1_4_strict_path_tail_known_field_silent() {
         let tree = analyze_str(
             r#"
-            #strict
             #schema Order { Int id: *, Float total: * }
             #main(Order o) -> Dict
             { x: o.id }
@@ -4599,12 +4614,11 @@ mod tests {
         assert_eq!(n, 0, "{:?}", tree.diagnostics);
     }
 
-    /// v2: even without `#strict`, the path-tail walker reports
+    /// Even under `#relaxed`, the path-tail walker reports
     /// `UnknownReferenceType` for a positively-known broken step
     /// (`o.unknown` on `Order` with no such field). The analyzer has
     /// the schema's field index, so the failure is a static error
-    /// regardless of mode. Pre-v2 this case was silent in non-strict
-    /// and only the legacy `UnresolvedReference` warning fired.
+    /// regardless of mode.
     #[test]
     fn non_strict_path_tail_reports_unknown_ref_type() {
         let tree = analyze_str(
@@ -4614,9 +4628,10 @@ mod tests {
             { x: o.unknown }
             "#,
         );
-        let n = count(&tree, |d| {
-            matches!(d, Diagnostic::UnknownReferenceType { name, .. } if name == "unknown")
-        });
+        let n = count(
+            &tree,
+            |d| matches!(d, Diagnostic::UnknownReferenceType { name, .. } if name == "unknown"),
+        );
         assert_eq!(n, 1, "{:?}", tree.diagnostics);
     }
 
@@ -4627,7 +4642,6 @@ mod tests {
     fn v1_4_strict_multi_hop_string_leaf_descend() {
         let tree = analyze_str(
             r#"
-            #strict
             #schema Customer { String name: * }
             #schema Order { Customer customer: *, Int id: * }
             #main(Order o) -> Dict
@@ -4649,7 +4663,6 @@ mod tests {
     fn v1_4_strict_path_spread_schema_silent() {
         let tree = analyze_str(
             r#"
-            #strict
             #schema Extras { Int a: *, Int b: * }
             #schema Order { Extras extras: *, Int id: * }
             #main(Order o) -> Dict
@@ -4669,7 +4682,6 @@ mod tests {
     fn v1_4_strict_path_spread_dict_silent() {
         let tree = analyze_str(
             r#"
-            #strict
             #schema Order { Dict<String, Int> kv: *, Int id: * }
             #main(Order o) -> Dict
             { id: o.id, ...o.kv }
@@ -4689,7 +4701,6 @@ mod tests {
     fn v1_4_strict_fncall_spread_schema_silent() {
         let tree = analyze_str(
             r#"
-            #strict
             #schema Extras { Int a: *, Int b: * }
             {
               Extras src: { a: 1, b: 2 },
@@ -4712,7 +4723,6 @@ mod tests {
     fn v1_4_strict_path_spread_unknown_reports_specific() {
         let tree = analyze_str(
             r#"
-            #strict
             #schema Extras { Int a: *, Int b: * }
             #schema Order { Extras extras: *, Int id: * }
             #main(Order o) -> Dict
@@ -4736,13 +4746,14 @@ mod tests {
     fn v1_5_strict_typed_binding_comprehension_inferable() {
         let tree = analyze_str(
             r#"
-            #strict
             { List<Int> xs: [x * 2 for x in range(5) if x > 0] }
             "#,
         );
         // No ExpressionTypeUnknown / StaticTypeMismatch — strict mode is
         // satisfied by the comprehension's derived element type.
-        let il = count(&tree, |d| matches!(d, Diagnostic::ExpressionTypeUnknown { .. }));
+        let il = count(&tree, |d| {
+            matches!(d, Diagnostic::ExpressionTypeUnknown { .. })
+        });
         let stm = count(&tree, |d| {
             matches!(d, Diagnostic::StaticTypeMismatch { .. })
         });
@@ -4757,11 +4768,12 @@ mod tests {
     fn v1_4_strict_typed_binding_inferrable_silent() {
         let tree = analyze_str(
             r#"
-            #strict
             { Int x: 42 }
             "#,
         );
-        let n = count(&tree, |d| matches!(d, Diagnostic::ExpressionTypeUnknown { .. }));
+        let n = count(&tree, |d| {
+            matches!(d, Diagnostic::ExpressionTypeUnknown { .. })
+        });
         assert_eq!(n, 0, "{:?}", tree.diagnostics);
     }
 
@@ -4771,7 +4783,6 @@ mod tests {
     fn v1_4_strict_match_arm_uninferrable() {
         let tree = analyze_str(
             r#"
-            #strict
             #schema Status Enum<"on", "off">
             #main(Status s) -> Dict
             { result: s match { on: mystery_call(), off: 0 } }
@@ -4791,13 +4802,14 @@ mod tests {
     fn v1_4_strict_match_arms_inferrable_silent() {
         let tree = analyze_str(
             r#"
-            #strict
             #schema Status Enum<"on", "off">
             #main(Status s) -> Dict
             { result: s match { on: 1, off: 0 } }
             "#,
         );
-        let n = count(&tree, |d| matches!(d, Diagnostic::ExpressionTypeUnknown { .. }));
+        let n = count(&tree, |d| {
+            matches!(d, Diagnostic::ExpressionTypeUnknown { .. })
+        });
         assert_eq!(n, 0, "{:?}", tree.diagnostics);
     }
 
@@ -4813,7 +4825,6 @@ mod tests {
     fn v1_8e_strict_dict_typehint_spread_silent() {
         let tree = analyze_str(
             r#"
-            #strict
             #main(Dict<String, Int> kv) -> Dict
             {
               base: 1,
@@ -4841,7 +4852,6 @@ mod tests {
     fn v1_4_strict_fncall_spread_dict_silent() {
         let tree = analyze_str(
             r#"
-            #strict
             {
               Dict<String, Int> seed: { x: 1 },
               load_kv: () -> Dict<String, Int> => seed,
@@ -4864,11 +4874,12 @@ mod tests {
     fn v1_5_strict_comprehension_list_int_silent() {
         let tree = analyze_str(
             r#"
-            #strict
             { List<Int> doubled: [x * 2 for x in range(5)] }
             "#,
         );
-        let il = count(&tree, |d| matches!(d, Diagnostic::ExpressionTypeUnknown { .. }));
+        let il = count(&tree, |d| {
+            matches!(d, Diagnostic::ExpressionTypeUnknown { .. })
+        });
         let stm = count(&tree, |d| {
             matches!(d, Diagnostic::StaticTypeMismatch { .. })
         });
@@ -4884,7 +4895,6 @@ mod tests {
     fn v1_5_strict_comprehension_element_mismatch() {
         let tree = analyze_str(
             r#"
-            #strict
             { List<String> xs: [x * 2 for x in range(5)] }
             "#,
         );
@@ -4901,7 +4911,6 @@ mod tests {
     fn v1_5_strict_where_body_int_silent() {
         let tree = analyze_str(
             r#"
-            #strict
             #main(Int x) -> Int
             (n + 1) where { n: x }
             "#,
@@ -4917,7 +4926,6 @@ mod tests {
     fn v1_5_strict_where_body_string_mismatch() {
         let tree = analyze_str(
             r#"
-            #strict
             #main(Int x) -> String
             (n + 1) where { n: x }
             "#,
@@ -4934,7 +4942,6 @@ mod tests {
     fn v1_5_strict_closure_untyped_param_flagged() {
         let tree = analyze_str(
             r#"
-            #strict
             { f: (n) => n + 1 }
             "#,
         );
@@ -4950,7 +4957,6 @@ mod tests {
     fn v1_5_strict_closure_typed_param_silent() {
         let tree = analyze_str(
             r#"
-            #strict
             { f: (Int n) -> Int => n + 1 }
             "#,
         );
@@ -4967,7 +4973,6 @@ mod tests {
     fn v1_5_strict_closure_unclassified_body_flagged() {
         let tree = analyze_str(
             r#"
-            #strict
             { f: (Int n) => mystery(n) }
             "#,
         );
@@ -4984,7 +4989,6 @@ mod tests {
     fn v1_5_strict_closure_declared_return_silent() {
         let tree = analyze_str(
             r#"
-            #strict
             { f: (Int n) -> Int => mystery(n) }
             "#,
         );
@@ -5001,7 +5005,6 @@ mod tests {
     fn v1_5_strict_head_unresolved_escalation() {
         let tree = analyze_str(
             r#"
-            #strict
             { x: mystery }
             "#,
         );
@@ -5012,12 +5015,14 @@ mod tests {
         assert!(n >= 1, "{:?}", tree.diagnostics);
     }
 
-    /// v1.5 reverse: non-strict mode keeps the legacy
-    /// UnresolvedReference (warning) and does NOT push
-    /// UnknownReferenceType.
+    /// Reverse: `#relaxed` keeps the warning-level UnresolvedReference
+    /// and does NOT push UnknownReferenceType.
     #[test]
-    fn v1_5_non_strict_head_unresolved_no_unknown_ref_type() {
-        let tree = analyze_str(r#"{ x: mystery }"#);
+    fn relaxed_head_unresolved_no_unknown_ref_type() {
+        let tree = analyze_str(
+            r#"#relaxed
+            { x: mystery }"#,
+        );
         let n = count(&tree, |d| {
             matches!(d, Diagnostic::UnknownReferenceType { .. })
         });
@@ -5033,7 +5038,6 @@ mod tests {
     fn v1_6_main_param_any_flagged_under_strict() {
         let tree = analyze_str(
             r#"
-            #strict
             #main(Any x) -> Int
             1
             "#,
@@ -5067,7 +5071,6 @@ mod tests {
     fn v1_6_main_param_typed_silent_under_strict() {
         let tree = analyze_str(
             r#"
-            #strict
             #main(Int x) -> Int
             x + 1
             "#,
@@ -5085,7 +5088,6 @@ mod tests {
     fn v1_5_strict_list_element_uninferable() {
         let tree = analyze_str(
             r#"
-            #strict
             [1, mystery_call(), 3]
             "#,
         );
@@ -5101,11 +5103,12 @@ mod tests {
     fn v1_5_strict_list_of_literals_silent() {
         let tree = analyze_str(
             r#"
-            #strict
             [1, 2, 3]
             "#,
         );
-        let il = count(&tree, |d| matches!(d, Diagnostic::ExpressionTypeUnknown { .. }));
+        let il = count(&tree, |d| {
+            matches!(d, Diagnostic::ExpressionTypeUnknown { .. })
+        });
         assert_eq!(il, 0, "{:?}", tree.diagnostics);
     }
 
@@ -5115,7 +5118,6 @@ mod tests {
     fn v1_5_strict_dict_value_uninferable() {
         let tree = analyze_str(
             r#"
-            #strict
             { x: mystery_fn() }
             "#,
         );
@@ -5133,7 +5135,6 @@ mod tests {
     fn v1_5_strict_comprehension_uses_main_param_path() {
         let tree = analyze_str(
             r#"
-            #strict
             #schema Order { Int id: *, Float total: * }
             #main(Order o) -> List<Int>
             [x + o.id for x in range(o.id)]
@@ -5161,7 +5162,6 @@ mod tests {
         // `...x.y` flows through `Expr::Spread → infer_type(inner)`).
         let tree = analyze_str(
             r#"
-            #strict
             { List<Int> xs: [1, 2, 3] }
             "#,
         );
@@ -5180,7 +5180,6 @@ mod tests {
     fn v1_5_sibling_method_call_still_typechecks() {
         let tree = analyze_str(
             r#"
-            #strict
             {
               ns: {
                 add: (Int a, Int b) -> Int => a + b
@@ -5202,7 +5201,6 @@ mod tests {
     fn v1_5_strict_path_spread_after_typed_closure_silent() {
         let tree = analyze_str(
             r#"
-            #strict
             #schema Extras { Int a: *, Int b: * }
             {
               Extras src: { a: 1, b: 2 },
@@ -5224,7 +5222,6 @@ mod tests {
     fn v1_5_where_nested_list_body() {
         let tree = analyze_str(
             r#"
-            #strict
             #main(Int x) -> List<Int>
             xs where { List<Int> xs: [x, x + 1, x + 2] }
             "#,
@@ -5243,7 +5240,6 @@ mod tests {
     fn v1_5_strict_comprehension_path_two_hops_silent() {
         let tree = analyze_str(
             r#"
-            #strict
             #schema Customer { String name: * }
             #schema Order { Customer customer: *, Int id: * }
             #main(Order o) -> List<String>
@@ -5349,7 +5345,6 @@ mod tests {
     fn v1_6_ban_all_concrete_silent() {
         let tree = analyze_str(
             r#"
-            #strict
             #schema Order { Int id: *, String name: * }
             #main(Order o) -> Int
             {
@@ -5570,7 +5565,6 @@ mod tests {
     fn v1_5_strict_any_coverage_audit() {
         let tree = analyze_str(
             r#"
-            #strict
             #schema Order { Int id: * }
             #main(Order o) -> Dict
             {

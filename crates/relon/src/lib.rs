@@ -448,7 +448,8 @@ mod tests {
     #[test]
     fn deserializes_from_str() {
         let config: ServerConfig = from_str(
-            r#"{
+            r#"#relaxed
+        {
             #private
             format(v): "port=" + v,
             host: "localhost",
@@ -567,9 +568,12 @@ mod tests {
     fn analyze_from_str_returns_tree_without_evaluating() {
         // `analyze_from_str` must not run the evaluator — it should
         // succeed even on programs that would crash at runtime, as long
-        // as the static structure is sound.
+        // as the static structure is sound. The `#relaxed` opt-out keeps
+        // the head-unresolved reference at warning severity instead of
+        // escalating to `UnknownReferenceType`.
         let tree = analyze_from_str(
-            r#"#schema User { String name: * }
+            r#"#relaxed
+#schema User { String name: * }
 { missing: &sibling.does_not_exist }"#,
         )
         .expect("analyze");

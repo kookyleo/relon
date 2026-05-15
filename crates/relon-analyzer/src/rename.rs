@@ -260,8 +260,7 @@ mod tests {
         let tree = analyze(&root);
         let off = src.find("a: 10").unwrap();
         let (line, character) = pos_at(src, off);
-        let edits =
-            execute(src, &root, &tree, line, character, "renamed").expect("rename");
+        let edits = execute(src, &root, &tree, line, character, "renamed").expect("rename");
         assert_eq!(edits.len(), 3, "{edits:?}");
         let updated = apply_edits(src, edits);
         assert!(updated.contains("renamed: 10"), "{updated}");
@@ -298,8 +297,7 @@ mod tests {
         let src = r#"{ a: 10 }"#;
         let root = parse_document(src).unwrap();
         let tree = analyze(&root);
-        let err = execute(src, &root, &tree, 99, 0, "x")
-            .expect_err("out-of-bounds cursor");
+        let err = execute(src, &root, &tree, 99, 0, "x").expect_err("out-of-bounds cursor");
         // Either NoSymbolAtCursor or NoDeclarationRange depending on
         // clamping behaviour; both are sensible failure modes.
         assert!(

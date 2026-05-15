@@ -77,7 +77,7 @@ export default defineConfig({
             text: '参考',
             items: [
               { text: '语言规范 (SPEC)', link: '/zh/guide/spec' },
-              { text: '严格模式 (#strict)', link: '/zh/guide/strict-mode' },
+              { text: '严格模式 (#relaxed)', link: '/zh/guide/strict-mode' },
               { text: '标准库', link: '/zh/guide/stdlib' },
               { text: '架构概览', link: '/zh/guide/architecture' },
             ]
@@ -134,7 +134,7 @@ export default defineConfig({
             text: 'Reference',
             items: [
               { text: 'Language spec', link: '/en/guide/spec' },
-              { text: 'Strict mode (#strict)', link: '/en/guide/strict-mode' },
+              { text: 'Strict mode (#relaxed)', link: '/en/guide/strict-mode' },
               { text: 'Standard library', link: '/en/guide/stdlib' },
               { text: 'Architecture overview', link: '/en/guide/architecture' },
             ]

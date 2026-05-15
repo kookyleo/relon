@@ -1,5 +1,4 @@
 // v1.5 forward: list comprehension `[x*2 for x in range(5)]` produces
 // `List<Int>`, matching the typed `List<Int>` slot — no diagnostic.
 // EXPECTED: no diagnostics.
-#strict
 { List<Int> doubled: [x * 2 for x in range(5) if x > 0] }

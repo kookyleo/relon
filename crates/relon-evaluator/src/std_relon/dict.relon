@@ -1,3 +1,7 @@
+// Standard library: dict helpers. The runtime owns the type-check
+// once values flow through, so the closures take their parameter
+// types from the caller's argument shape rather than the source.
+#relaxed
 {
     merge(a, b): _dict_merge(a, b),
     keys(d): _dict_keys(d),

@@ -9,12 +9,13 @@ assert on it.
 
 ## Layout
 
-- `v1_3/` — v1.3 (`#main` param injection + `#strict` + typed spread /
-  dynamic key + `Dict<K,V>` generics + `DuplicateField`).
+- `v1_3/` — v1.3 (`#main` param injection + strict mode + typed spread
+  / dynamic key + `Dict<K,V>` generics + `DuplicateField`).
   - `main_injection/` — `#main` parameter handling across atomic /
     dict / list / variant root bodies.
-  - `strict_basic/` — basic `#strict` directive on/off behavior.
-  - `strict_propagation/` — multi-module workspaces where `#strict`
+  - `strict_basic/` — strict is the default; the `#relaxed` (alias
+    `#unstrict`) opt-out clears the bit.
+  - `strict_propagation/` — multi-module workspaces where strict-mode
     contagion is verified (1 hop, 2 hops, diamond).
   - `typehint_spread/` — typed spread `...<T> e` rules under strict.
   - `typehint_dynkey/` — typed dynamic key `[<T> expr]: v` rules under

@@ -46,7 +46,7 @@ Relon 的真实目标可以概括为：
 
 - workspace analyzer 能先于 evaluator 捕获 import cycle / missing module / cross-module schema 问题。
 - v1.4-v1.8 已经把 path-tail、closure、comprehension、where、tuple、Result / Option、cross-module schema slot 等大量问题前移到 analyzer。
-- `#strict` 传播到 import 链，避免 strict entry 被非 strict lib 偷渡动态类型。
+- 严格模式（默认行为，模块通过 `#relaxed` / `#unstrict` 退出）传播到 import 链，避免严格 entry 被松弛 lib 偷渡动态类型。
 - host fn signature 也被纳入 `Any` / bare generic 审计。
 
 这和项目“业务逻辑可审计”的目标一致。

@@ -1,3 +1,6 @@
+// Showcase fixture under `#relaxed` so the untyped `classify(w)` and
+// the `match` arms with bareword schema branches stay quick to read.
+#relaxed
 {
     // `#brand Type` is the decorator-position twin of `Type field: { ... }`.
     // Use it where the field-level type-hint syntax can't reach: list elements,

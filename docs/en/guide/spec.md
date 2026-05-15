@@ -202,7 +202,8 @@ table) and is not user-extensible:
 the dict-field grammar, not the directive grammar; semantically it's
 equivalent to `#schema X Body`.
 
-v1.3 adds `#strict` as another `Bare`-shape directive; see §6.6.
+`#relaxed` (synonym `#unstrict`) is the strict-mode opt-out; see
+§6.6. Both are `Bare`-shape directives.
 
 ## 4. Capability model
 
@@ -456,43 +457,46 @@ v1.2-era gap where `#main(Int n) -> String\nn+1` would let the
 mismatch slip through to runtime — `MainReturnTypeMismatch` now
 surfaces statically.
 
-### 6.6 `#strict` — strict static-inference mode
+### 6.6 Strict static-inference mode
 
-`#strict` is a new v1.3 root-level Bare directive. When set, the
-file *and every module its `#import` graph reaches* requires every
-value to have a statically inferable type. Sites the analyzer would
-otherwise let pass with an implicit `Any` fallback now produce
-errors.
+Relon's analyzer is strict by default. The file *and every module
+its `#import` graph reaches* requires every value to have a
+statically inferable type. Sites the analyzer would otherwise let
+pass with an implicit `Any` fallback now produce errors.
+
+A module opts out by writing the file-level `Bare` directive
+`#relaxed` (or its synonym `#unstrict`) at the top:
 
 ```relon
-#strict
+#relaxed
 { ... }
 ```
 
-**Contagion rule**: strict mode is decided at the **entry**. A
-single `#strict` at the entry tells the workspace pass to flip
-`strict_mode=true` on every reachable `#import` target. An imported
-library that itself didn't write `#strict` is still analyzed under
-the strict rules — preventing non-strict libraries from sneaking
-silent fallbacks into a strict entry.
+**Contagion rule**: strict mode is decided at the **entry**. The
+entry's mode is stamped onto every reachable `#import` target, so
+the workspace presents a single mode end to end. A strict entry
+analyses every reachable library under strict rules — preventing a
+relaxed library from sneaking silent fallbacks into a strict entry.
+A `#relaxed` entry stamps the cleared bit on every reachable import,
+so a strict library doesn't tighten a relaxed entry by accident.
 
-**Diagnostic kinds** (all Error severity). v2 split the strict-mode
-checks into *cross-mode* and *strict-only* buckets — see the
+**Diagnostic kinds** (all Error severity). Strict-mode checks split
+into *cross-mode* and *strict-only* buckets — see the
 [strict-mode reference](./strict-mode.md) for the full matrix.
 
-Cross-mode (fire regardless of `#strict`):
+Cross-mode (fire regardless of mode):
 
 | Diagnostic | Trigger |
 |---|---|
 | `NonSpreadableSource { source_type }` | `{ ...e }` where `e`'s static type is known but isn't dict-shaped (e.g. `Int`, `Bool`, `List<T>`). No `<T>` hint can make this valid — the program is wrong in any mode |
 | `UnresolvedSchema` | `<Schema>` annotation (typed spread, dynamic-key hint, etc.) names a schema that isn't declared in the workspace |
-| `UnknownReferenceType { name, path }` | path-tail walker has positive knowledge a step is broken: descend into an undeclared schema field (`o.unknown`), descend past a leaf type (`o.id.something`), or — under strict mode — descend into `Any` |
+| `UnknownReferenceType { name, path }` | path-tail walker has positive knowledge a step is broken: descend into an undeclared schema field (`o.unknown`), descend past a leaf type (`o.id.something`), or — under strict — descend into `Any` |
 | `DuplicateField` | spread contributes a key already declared on the dict, or two spreads contribute the same key |
 | `ExplicitAnyForbidden { context }` | v1.6: user wrote `Any` somewhere in source (including nested `List<Any>` / `Dict<String, Any>`). `Any` is retired from the user-facing surface in every mode |
 | `BareGenericContainer { type_name, context }` | v1.7: user wrote `List` / `Dict` / `Closure` / `Fn` / `Enum` without generic arguments |
 
-Strict-only (fire only when `#strict` is in effect; the underlying
-information is *genuinely* missing rather than statically known):
+Strict-only (silent under `#relaxed`; the underlying information is
+*genuinely* missing rather than statically known):
 
 | Diagnostic | Trigger |
 |---|---|
@@ -742,10 +746,10 @@ also accepted in non-strict mode for opt-in static checking):
 { [<Int> idx]: row }
 ```
 
-In non-strict mode the hints are still recognized — when present,
-the analyzer uses them; when absent, the affected slot falls back to
-`Any` and runtime owns the verdict. Strict mode escalates the absent-
-hint case to an error (`Missing*Hint`).
+Under `#relaxed` the hints are still recognized — when present, the
+analyzer uses them; when absent, the affected slot falls back to
+`Any` and runtime owns the verdict. Strict (the default) escalates
+the absent-hint case to an error (`Missing*Hint`).
 
 **`Dict<K, V>` generics** (formally specified in v1.3): the parser
 accepts `Dict` with one or two generic arguments (mirroring `List<T>`

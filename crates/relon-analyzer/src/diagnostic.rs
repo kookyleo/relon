@@ -419,7 +419,6 @@ pub enum Diagnostic {
     //     strict-only because they describe a genuine inference gap
     //     (the analyzer couldn't determine the source/key type) —
     //     adding a `<T>` hint is the literal fix.
-
     #[error("cannot spread a value of type `{source_type}`; spread requires a dict, schema, or `Dict<K, V>`")]
     #[diagnostic(
         code(relon::analyze::non_spreadable_source),

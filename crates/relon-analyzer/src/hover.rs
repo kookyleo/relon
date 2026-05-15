@@ -52,11 +52,7 @@ fn reference_hover(source: &str, tree: &AnalyzedTree, node: &Node) -> Option<Str
     }
     let resolved = tree.references.get(&node.id)?;
     let target = tree.node_index.get(&resolved.target)?;
-    let snippet = source_slice(
-        source,
-        target.range.start.offset,
-        target.range.end.offset,
-    );
+    let snippet = source_slice(source, target.range.start.offset, target.range.end.offset);
     let mut body = format!(
         "**Resolves to** _(via `{:?}`)_\n\n```relon\n{}\n```",
         resolved.via,

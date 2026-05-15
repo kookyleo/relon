@@ -6,5 +6,4 @@
 // inner spread has no derivable shape, and strict demands a hint.)
 // EXPECTED: 1 × SpreadSourceTypeUnknown (plus the closure-param
 // diagnostics for the untyped `n`).
-#strict
 { f: (n) => { ...n } }

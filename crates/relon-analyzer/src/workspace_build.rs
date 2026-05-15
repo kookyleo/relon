@@ -52,14 +52,15 @@ pub(crate) fn build<L: ModuleLoader>(
     match parse_document(entry_source) {
         Ok(node) => {
             let arc_node = Arc::new(node);
-            // v1.3: strict mode is set when either the caller forwarded
-            // it via `options.strict_mode` *or* the entry source itself
-            // declared `#strict`. Detection looks at the parsed entry
-            // root's directives — a parse-time check. We then build a
-            // mutated `AnalyzeOptions` with the bit so every per-module
-            // analyze call sees the same flag (the workspace-wide
-            // contagion contract).
-            let entry_strict = options.strict_mode || crate::has_strict_directive(&arc_node);
+            // Strict is the default; the entry can opt out via
+            // `#relaxed` / `#unstrict`. The workspace pass stamps the
+            // entry's mode onto every reachable import so the two
+            // halves don't disagree — a relaxed entry imports a
+            // relaxed view of its libraries (so a strict library
+            // doesn't tighten the entry), and a strict entry imports
+            // a strict view (so a relaxed library can't sneak silent
+            // fallbacks past the entry's contract).
+            let entry_strict = options.strict_mode && !crate::has_relaxed_directive(&arc_node);
             ws.strict_mode = entry_strict;
             let mut effective_options = options.clone();
             effective_options.strict_mode = entry_strict;
@@ -1932,30 +1933,13 @@ mod tests {
         );
     }
 
-    // ====== v1.3 strict-mode contagion ======
+    // ====== strict-mode contagion ======
 
-    /// v1.3 forward: a `#strict` entry stamps `strict_mode=true` on
-    /// every reachable module's `AnalyzedTree`, including modules that
-    /// don't declare `#strict` themselves. Demonstrates contagion.
+    /// A strict entry (the default) stamps `strict_mode=true` on every
+    /// reachable module's `AnalyzedTree`. Demonstrates that imports
+    /// inherit the entry's mode when they don't opt out themselves.
     #[test]
-    fn v1_3_strict_entry_propagates_to_imports() {
-        let mut loader = MapLoader::new();
-        loader.add("./lib", "/abs/lib", r#"{ helper(Int x): x + 1 }"#);
-        let ws = build(
-            "/abs/entry".to_string(),
-            "#strict\n#import * from \"./lib\"\n{ x: 1 }",
-            PathBuf::from("/abs"),
-            &mut loader,
-        );
-        assert!(ws.strict_mode);
-        assert!(ws.modules.get("/abs/entry").unwrap().strict_mode);
-        assert!(ws.modules.get("/abs/lib").unwrap().strict_mode);
-    }
-
-    /// v1.3 reverse: a non-strict entry leaves every module's
-    /// strict_mode flag at the default `false`.
-    #[test]
-    fn v1_3_non_strict_entry_does_not_propagate() {
+    fn strict_entry_propagates_to_imports() {
         let mut loader = MapLoader::new();
         loader.add("./lib", "/abs/lib", r#"{ helper(Int x): x + 1 }"#);
         let ws = build(
@@ -1964,14 +1948,32 @@ mod tests {
             PathBuf::from("/abs"),
             &mut loader,
         );
+        assert!(ws.strict_mode);
+        assert!(ws.modules.get("/abs/entry").unwrap().strict_mode);
+        assert!(ws.modules.get("/abs/lib").unwrap().strict_mode);
+    }
+
+    /// Reverse: a `#relaxed` entry propagates the cleared bit to every
+    /// reachable module. The library's own (non-)opt-out is overridden
+    /// by the entry's mode so the workspace presents a single mode.
+    #[test]
+    fn relaxed_entry_propagates_to_imports() {
+        let mut loader = MapLoader::new();
+        loader.add("./lib", "/abs/lib", r#"{ helper(Int x): x + 1 }"#);
+        let ws = build(
+            "/abs/entry".to_string(),
+            "#relaxed\n#import * from \"./lib\"\n{ x: 1 }",
+            PathBuf::from("/abs"),
+            &mut loader,
+        );
         assert!(!ws.strict_mode);
         assert!(!ws.modules.get("/abs/entry").unwrap().strict_mode);
         assert!(!ws.modules.get("/abs/lib").unwrap().strict_mode);
     }
 
-    /// v1.3: contagion through a 2-hop chain (entry → mid → leaf).
+    /// Contagion through a 2-hop chain (entry → mid → leaf).
     #[test]
-    fn v1_3_strict_propagates_two_hops() {
+    fn strict_propagates_two_hops() {
         let mut loader = MapLoader::new();
         loader
             .add(
@@ -1982,7 +1984,7 @@ mod tests {
             .add("./leaf", "/abs/leaf", r#"{ leaf: 1 }"#);
         let ws = build(
             "/abs/entry".to_string(),
-            "#strict\n#import * from \"./mid\"\n{ x: 1 }",
+            "#import * from \"./mid\"\n{ x: 1 }",
             PathBuf::from("/abs"),
             &mut loader,
         );
@@ -1992,10 +1994,10 @@ mod tests {
         assert!(ws.modules.get("/abs/leaf").unwrap().strict_mode);
     }
 
-    /// v1.3: diamond import (entry → b, c; b → d; c → d). Strict mode
+    /// Diamond import (entry → b, c; b → d; c → d). Strict mode
     /// reaches every node — `d` is visited once and stamped strict.
     #[test]
-    fn v1_3_strict_propagates_diamond() {
+    fn strict_propagates_diamond() {
         let mut loader = MapLoader::new();
         loader
             .add("./b", "/abs/b", "#import * from \"./d\"\n{ from_b: 1 }")
@@ -2003,7 +2005,7 @@ mod tests {
             .add("./d", "/abs/d", r#"{ deep: 1 }"#);
         let ws = build(
             "/abs/entry".to_string(),
-            "#strict\n#import * from \"./b\"\n#import * from \"./c\"\n{ x: 1 }",
+            "#import * from \"./b\"\n#import * from \"./c\"\n{ x: 1 }",
             PathBuf::from("/abs"),
             &mut loader,
         );
@@ -2016,20 +2018,17 @@ mod tests {
         }
     }
 
-    /// v1.3 forward: a strict entry catches a silent-fallback in an
-    /// imported module. Pre-v2 the analyzer would only emit
-    /// `SpreadSourceTypeUnknown` under strict contagion; v2 splits the
-    /// spread check so non-dict sources (`1 + 2` → `Int`) fire
-    /// `NonSpreadableSource` cross-mode. This test now verifies the
-    /// cross-mode form fires regardless of contagion, since the
-    /// statically-known non-dict source is wrong in any mode.
+    /// Non-spreadable sources (`1 + 2` → `Int`) fire
+    /// `NonSpreadableSource` regardless of mode — a statically-known
+    /// non-dict spread is wrong in any mode, so the diagnostic surfaces
+    /// in the imported library even without contagion.
     #[test]
-    fn v1_3_strict_contagion_catches_lib_silent_fallback() {
+    fn non_spreadable_source_reported_in_imported_lib() {
         let mut loader = MapLoader::new();
         loader.add("./lib", "/abs/lib", r#"{ src: 1 + 2, val: { ...src } }"#);
         let ws = build(
             "/abs/entry".to_string(),
-            "#strict\n#import * from \"./lib\"\n{ x: 1 }",
+            "#import * from \"./lib\"\n{ x: 1 }",
             PathBuf::from("/abs"),
             &mut loader,
         );

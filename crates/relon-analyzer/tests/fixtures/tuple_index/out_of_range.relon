@@ -2,7 +2,6 @@
 // range. Under strict mode the walker surfaces the failed step
 // as `UnknownReferenceType`.
 // EXPECTED: ≥ 1 × UnknownReferenceType on the `bad` reference.
-#strict
 {
   (Int, String) pair: [42, "hello"],
   Int bad: pair.5

@@ -400,7 +400,7 @@ impl<'a> Parser<'a> {
             .unwrap_or(DirectiveShape::Value)
         {
             DirectiveShape::Bare => {
-                // No body. `#private`, `#strict`, `#native`.
+                // No body. `#private`, `#relaxed`, `#unstrict`, `#native`.
             }
             DirectiveShape::Value => {
                 if self.is_attribute_body_start() {
@@ -1043,7 +1043,7 @@ impl<'a> Parser<'a> {
         // — the attribute decorates whatever expression follows.
         while self.at(SyntaxKind::HASH) || self.at(SyntaxKind::AT) {
             // Guard: when `#` heads a directive whose body is bare
-            // (e.g. `#strict` standing alone at file scope), there's
+            // (e.g. `#relaxed` standing alone at file scope), there's
             // no following expression — `parse_attribute` consumes
             // nothing extra, and the loop would spin. Break out the
             // moment we see no progress.
@@ -1940,7 +1940,10 @@ impl<'a> Parser<'a> {
             // `?.` and `?[` — eat the `?` prefix first, then fall
             // through to the regular dot / bracket handling.
             if self.at(SyntaxKind::QUESTION)
-                && matches!(self.nth(1), Some(SyntaxKind::DOT) | Some(SyntaxKind::L_BRACK))
+                && matches!(
+                    self.nth(1),
+                    Some(SyntaxKind::DOT) | Some(SyntaxKind::L_BRACK)
+                )
             {
                 self.bump(); // ?
             } else if !self.at(SyntaxKind::DOT) && !self.at(SyntaxKind::L_BRACK) {
@@ -2376,7 +2379,7 @@ enum DirectiveShape {
 /// `crate::directive::DIRECTIVE_SHAPES`.
 fn directive_shape(name: &str) -> DirectiveShape {
     match name {
-        "private" | "strict" | "native" => DirectiveShape::Bare,
+        "private" | "relaxed" | "unstrict" | "native" => DirectiveShape::Bare,
         "default" | "expect" | "msg" | "error" | "brand" | "derive" | "no_auto_derive" => {
             DirectiveShape::Value
         }

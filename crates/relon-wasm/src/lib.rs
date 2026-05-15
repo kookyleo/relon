@@ -372,9 +372,8 @@ fn decode_args_json(value: JsValue) -> Result<Option<HashMap<String, Value>>, Er
     if trimmed.is_empty() {
         return Ok(None);
     }
-    let json: serde_json::Value = serde_json::from_str(trimmed).map_err(|err| {
-        ErrorReport::invalid_input(format!("args is not valid JSON: {err}"))
-    })?;
+    let json: serde_json::Value = serde_json::from_str(trimmed)
+        .map_err(|err| ErrorReport::invalid_input(format!("args is not valid JSON: {err}")))?;
     match json {
         serde_json::Value::Object(_) => {
             let map = serde_json::from_value(json).map_err(|err| {
@@ -815,12 +814,7 @@ pub struct SignatureHelpResult {
 /// rendered tooltip + the source range it describes, or `null` when
 /// the cursor isn't on a hoverable symbol.
 #[wasm_bindgen]
-pub fn hover(
-    sources: JsValue,
-    entry: &str,
-    line: u32,
-    character: u32,
-) -> Result<JsValue, JsValue> {
+pub fn hover(sources: JsValue, entry: &str, line: u32, character: u32) -> Result<JsValue, JsValue> {
     let sources = decode_sources(sources).map_err(err_to_js)?;
     let result = match hover_internal(&sources, entry, line, character) {
         Some(r) => r,
@@ -885,8 +879,7 @@ fn signature_help_internal(
     let workspace = build_workspace(sources, entry, source);
     let tree = workspace.modules.get(entry)?;
     let root = workspace.nodes.get(entry)?;
-    let info =
-        relon_analyzer::signature_help::resolve(source, root, tree, line, character)?;
+    let info = relon_analyzer::signature_help::resolve(source, root, tree, line, character)?;
     Some(SignatureHelpResult {
         signature: info.signature,
         active_parameter: info.active_parameter as u32,
@@ -1319,8 +1312,7 @@ fn build_workspace(
     entry: &str,
     source: &str,
 ) -> relon_analyzer::workspace::WorkspaceTree {
-    let in_memory: Arc<dyn ModuleResolver> =
-        Arc::new(InMemoryModuleResolver::new(sources.clone()));
+    let in_memory: Arc<dyn ModuleResolver> = Arc::new(InMemoryModuleResolver::new(sources.clone()));
     let std_resolver: Arc<dyn ModuleResolver> = Arc::new(StdModuleResolver);
     let entry_dir = parent_dir(entry);
     let entry_dir_path = PathBuf::from(if entry_dir.is_empty() {
@@ -1329,12 +1321,7 @@ fn build_workspace(
         entry_dir.clone()
     });
     let mut loader = ResolverChainLoader::from_resolvers(vec![in_memory, std_resolver]);
-    relon_analyzer::workspace::analyze_entry(
-        entry.to_string(),
-        source,
-        entry_dir_path,
-        &mut loader,
-    )
+    relon_analyzer::workspace::analyze_entry(entry.to_string(), source, entry_dir_path, &mut loader)
 }
 
 /// One completion candidate. Sent to JS as a plain object so the
@@ -1488,7 +1475,8 @@ mod tests {
         let mut sources = HashMap::new();
         sources.insert(
             "main.relon".to_string(),
-            r#"#import lib from "./lib.relon"
+            r#"#relaxed
+#import lib from "./lib.relon"
 {
     greeting: lib.hello + ", world"
 }"#

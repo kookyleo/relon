@@ -1,3 +1,6 @@
+// Standard library: generic value helpers. `#relaxed` so the
+// fallback works for any value type.
+#relaxed
 {
     default(v, fallback): v == null ? fallback: v
 }

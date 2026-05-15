@@ -30,14 +30,22 @@ pub const BRAND: &str = "brand";
 pub const SCHEMA: &str = "schema";
 pub const IMPORT: &str = "import";
 pub const MAIN: &str = "main";
-/// v1.3: `#strict` — bare directive at the file level enabling strict
-/// inference mode. Once present, every value must have a statically
-/// inferable type; sites that the analyzer would otherwise silently
-/// fall back on (uninferrable spread sources, dynamic keys without a
-/// type hint, references with no type, native fn returns, …) become
-/// errors. The flag is *contagious*: an entry module marked `#strict`
-/// applies the rule transitively to every reachable `#import` target.
-pub const STRICT: &str = "strict";
+/// `#relaxed` — bare file-level directive that opts the module out
+/// of strict inference. Strict is the analyzer's default: every
+/// value must have a statically inferable type, and sites the
+/// analyzer can't classify (uninferrable spread sources, dynamic
+/// keys without a hint, untyped closure parameters, native fns with
+/// no signature, …) surface as errors. A `#relaxed` directive at
+/// the file level lets those positions stay silent (the runtime
+/// still type-checks them on the way out). The opt-out propagates
+/// across `#import` from the *entry* module: a relaxed entry
+/// analyses every reachable import in relaxed mode too, so a strict
+/// library doesn't tighten a relaxed entry by accident.
+pub const RELAXED: &str = "relaxed";
+/// `#unstrict` — exact synonym for [`RELAXED`]. Both names are
+/// accepted so authors can pick whichever reads more naturally next
+/// to other directives.
+pub const UNSTRICT: &str = "unstrict";
 /// Phase A of the trait-bound / schema-method system: a method-level
 /// pragma `#derive <Constraint>` declares the following method is the
 /// witness for the named built-in constraint (e.g. `Equatable`,
@@ -81,7 +89,8 @@ pub const DIRECTIVE_SHAPES: &[(&str, DirectiveShape)] = &[
     (SCHEMA, DirectiveShape::NameBody),
     (IMPORT, DirectiveShape::Import),
     (MAIN, DirectiveShape::Main),
-    (STRICT, DirectiveShape::Bare),
+    (RELAXED, DirectiveShape::Bare),
+    (UNSTRICT, DirectiveShape::Bare),
     // Trait-bound / schema-method pragmas (Phase A): parsed globally,
     // semantic placement enforced by the analyzer.
     (DERIVE, DirectiveShape::Value),

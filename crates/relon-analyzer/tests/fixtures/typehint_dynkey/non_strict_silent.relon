@@ -1,3 +1,4 @@
-// v1.3 reverse: non-strict mode lets `[k]: 1` go through.
+// Reverse: under `#relaxed`, the untyped dynamic key `[k]: 1` is silent.
 // EXPECTED: no diagnostics.
+#relaxed
 { k: "key", [k]: 1 }

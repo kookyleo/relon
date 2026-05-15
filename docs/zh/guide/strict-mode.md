@@ -1,26 +1,30 @@
-# 严格模式 (`#strict`)
+# 严格模式 (`#relaxed`)
 
-Relon 的 analyzer 有两种工作模式：
+Relon 的 analyzer 默认就是严格模式。所有值必须有静态可推断类型；那些「分析器拿不到信息」的位点（未标类型的 closure 参数、没 signature 的 native fn、不透明表达式等）会以 **error** 级诊断报出来。
 
-- **非严格**（默认）——分析器推不出静态类型的位置默认走运行时检查。但凡分析器能**静态证明**的错误（path 走查失败、未声明 schema、非 dict spread 源等）依然会报；只有「真的推不出来」且没法证明是 bug 的位点才沉默。
-- **严格**——在模块顶端加 `#strict` 启用。所有值必须有静态可推断类型；那些「分析器拿不到信息」的位点（未标类型的 closure 参数、没 signature 的 native fn、不透明表达式等）此时会以 **error** 级诊断报出来。
+模块可以用文件级指令 `#relaxed`（同义词 `#unstrict`）退出严格推断。两种写法完全等价，挑哪个读起来跟你其他指令更协调即可。
 
 ```relon
-#strict
+#relaxed
 { ... }
 ```
 
-> 两种模式共用同一份 parser、同一份 runtime。所有「静态确凿的错误」也共用——`#strict` 只是**额外**追加「信息不足」类的报错。
+写了 `#relaxed` 之后，analyzer 仍然会报所有它能**静态证明**的错误（path 走查失败、未声明 schema、非 dict spread 源等）；只有「真的推不出来」且没法证明是 bug 的位点才沉默——那些位点退回到运行时检查。
+
+> 两种模式共用同一份 parser、同一份 runtime。所有「静态确凿的错误」也共用——严格模式只是**额外**追加「信息不足」类的报错。
 
 ## `#import` 链上的传染规则
 
-严格性由 **入口** 决定。入口写一次 `#strict`，整个 workspace 可达的 `#import` 目标都会被翻成 `strict_mode = true`，包括那些自己没写 `#strict` 的库。这条规则是为了防止严格入口悄悄继承非严格库里的 silent fallback。
+严格性由 **入口** 决定。入口的模式会被印到整条 `#import` 链上每一个可达模块，使 workspace 端到端只呈现一种模式：
 
-**反向不成立**：严格库被一个非严格入口 import 时，**不会**把整个 workspace 拖进严格。严格是自顶向下的策略。
+- 严格入口（默认行为，无需写指令）会让每一个可达 import 都按严格分析——哪怕库自己没写 `#relaxed`。这条规则防止严格入口悄悄继承库里的 silent fallback。
+- `#relaxed` 入口则把「清零位」印到每一个可达 import 上。一个本来会被严格分析的库，在当前 workspace 构建里会按非严格走，避免严格库意外收紧一个 `#relaxed` 入口的契约。
+
+严格是自顶向下的策略：入口的模式说了算。
 
 ## 跨模式错误（两种模式都报）
 
-这些都是 analyzer 仅凭 source + schemas 就能推得出的事实。运行时也会失败，所以 v2 把它们升为跨模式 Error——非严格不再放过它们。
+这些都是 analyzer 仅凭 source + schemas 就能推得出的事实。运行时也会失败，所以它们无论哪种模式都按 error 级触发——`#relaxed` 不会让它们过关。
 
 | 场景 | 诊断 |
 |---|---|
@@ -34,9 +38,9 @@ Relon 的 analyzer 有两种工作模式：
 
 > `unresolved_reference`（warning 级）仍会为「自由标识符没解析到任何 binding」的情况触发。它保留 warning 级是因为这个名字**可能**会被上游的某个 spread 在运行时补上——analyzer 不知道；严格模式则会在同一位点追加一个 `unknown_reference_type` error。
 
-## 仅严格触发的错误（只在 `#strict` 下报）
+## 仅严格触发的错误（`#relaxed` 下沉默）
 
-这些位点是「静态信息**真的缺**」。analyzer 既无法证伪也无法推断，只是拒绝再往下走。
+这些位点是「静态信息**真的缺**」。analyzer 既无法证伪也无法推断——严格模式拒绝再往下走；`#relaxed` 模式接受运行时回退。
 
 | 场景 | 诊断 |
 |---|---|
@@ -103,17 +107,17 @@ Relon 的 analyzer 有两种工作模式：
 
 ## 何时用哪种
 
-**默认用非严格** 的场景：
+**严格（默认）** 适用于：
+
+- 生产用规则文件（定价、风控、校验）——你想要构建期保证「没有任何值悄悄落到 `Any`」。
+- 给严格入口准备的 workspace 库——传染规则会把 `#relaxed` 库也按严格分析，库里不能藏 silent fallback。
+- 走 AOT 编译路径的代码：[架构概览](./architecture.md) 里描述的类型驱动优化，只有「每个形状都静态可知」时才会触发。
+
+**用 `#relaxed` 退出严格** 适用于：
 
 - 快速实验、playground——想写一行立刻能跑。
 - 中间数据形态还在演进的胶水代码。
 - 宿主接入早期，还没来得及把每个 native fn 注册 signature。
-
-**切到严格** 的场景：
-
-- 生产用规则文件（定价、风控、校验）——你想要构建期保证「没有任何值悄悄落到 `Any`」。
-- 给严格入口准备的 workspace 库——传染规则意味着库里不能藏 silent fallback。
-- 走 AOT 编译路径的代码：[架构概览](./architecture.md) 里描述的类型驱动优化，只有「每个形状都静态可知」时才会触发。
 
 ## 修复手册
 
@@ -125,7 +129,7 @@ Relon 的 analyzer 有两种工作模式：
 | `unresolved_schema` | 引用前先声明 schema（`#schema Missing { ... }`），或把 `<Missing>` 标注去掉。 |
 | `unknown_reference_type` | 检查 path：字段必须在 head 的 schema 中声明，且不能越过叶子类型继续 `.x`（`Int.something` 之类）。 |
 | `expression_type_unknown` | 给外层 binding 加类型让推断有目标，或重写表达式让类型可推。 |
-| `native_fn_signature_missing` | 在 `host_fn_signatures` 里给 native fn 注册带返回类型的 signature，或停止在严格模块里调用它。 |
+| `native_fn_signature_missing` | 在 `host_fn_signatures` 里给 native fn 注册带返回类型的 signature，或在该模块加 `#relaxed` 接受动态回退。 |
 | `closure_param_type_missing` | 给参数加类型：`(Int n) => ...`。 |
 | `closure_return_type_unknown` | 在 closure 上声明 `-> ReturnType`，或重写 body 让推断能拿到类型。 |
 

@@ -1,3 +1,7 @@
+// Library fixture: untyped closures showcase. `#relaxed` keeps the
+// param annotations off the example so the structural shape is the
+// only thing being demonstrated.
+#relaxed
 {
     shout(val): val + "!!!",
     sum(a, b): a + b

@@ -4,7 +4,6 @@
 // into the field `Container<T> inner`, then into `T value` on the
 // inner schema. Declared `#main() -> Int` lands cleanly when both
 // substitutions plus the namespace re-qualification fire.
-#strict
 #import pkg from "./lib_with_nested_generic_value.relon"
 #main() -> Int
 pkg.w.inner.value

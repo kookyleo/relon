@@ -5,7 +5,6 @@
 // satisfies `Extras` so we don't conflate the spread test with a
 // closure-return-type mismatch.
 // EXPECTED: no MissingSpreadTypeHint.
-#strict
 #schema Extras { Int a: *, Int b: * }
 {
   Extras src: { a: 1, b: 2 },

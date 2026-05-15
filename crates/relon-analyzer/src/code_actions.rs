@@ -284,5 +284,4 @@ mod tests {
         let actions = at_position(src, &root, &tree, line, character);
         assert!(actions.is_empty(), "{actions:?}");
     }
-
 }

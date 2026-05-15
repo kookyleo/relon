@@ -69,7 +69,7 @@ pub enum CompletionKind {
     /// Top-level `#` directive (`schema`, `extend`, `main`, `import`).
     Directive,
     /// Pair-level `#` pragma (`private`, `expect`, `default`, `brand`,
-    /// `derive`, `strict`).
+    /// `derive`, `native`, …).
     Pragma,
     /// Decorator (just `@name`).
     Decorator,
@@ -461,8 +461,8 @@ fn walk_scope(node: &Node, offset: usize, items: &mut Vec<CompletionItem>) {
                     label: name.clone(),
                     kind,
                     detail,
-                apply_snippet: None,
-            });
+                    apply_snippet: None,
+                });
             }
         }
         // Recurse into whichever pair's value contains the cursor.
@@ -486,8 +486,8 @@ fn walk_scope(node: &Node, offset: usize, items: &mut Vec<CompletionItem>) {
             label: id.clone(),
             kind: CompletionKind::Parameter,
             detail: Some("for-binding".to_string()),
-                apply_snippet: None,
-            });
+            apply_snippet: None,
+        });
         let candidates: [Option<&Node>; 3] = [Some(element), Some(iterable), condition.as_ref()];
         for child in candidates.into_iter().flatten() {
             if contains_offset(child, offset) {
@@ -520,15 +520,13 @@ fn contains_offset(node: &Node, offset: usize) -> bool {
 /// caught the slot — capital-letter prefix filtering on the client
 /// keeps the list focused.
 fn push_type_primitive_candidates(items: &mut Vec<CompletionItem>) {
-    for name in &[
-        "Null", "Bool", "Int", "Float", "String", "List", "Dict",
-    ] {
+    for name in &["Null", "Bool", "Int", "Float", "String", "List", "Dict"] {
         items.push(CompletionItem {
             label: (*name).into(),
             kind: CompletionKind::Schema,
             detail: Some("primitive".into()),
-                apply_snippet: None,
-            });
+            apply_snippet: None,
+        });
     }
 }
 
@@ -546,8 +544,8 @@ fn push_schema_candidates_partial(items: &mut Vec<CompletionItem>, root: &Node) 
                         label: name.clone(),
                         kind: CompletionKind::Schema,
                         detail: Some("schema".into()),
-                apply_snippet: None,
-            });
+                        apply_snippet: None,
+                    });
                 }
             }
         }
@@ -579,8 +577,8 @@ fn push_generic_var_candidates_partial(
                         label: g.clone(),
                         kind: CompletionKind::Schema,
                         detail: Some("type var".into()),
-                apply_snippet: None,
-            });
+                        apply_snippet: None,
+                    });
                 }
             }
         }
@@ -596,8 +594,7 @@ fn push_stdlib_candidates(items: &mut Vec<CompletionItem>) {
     let sigs = stdlib_signatures();
     for name in stdlib_fn_names() {
         let apply_snippet = sigs.get(name).map(|sig| {
-            let param_names: Vec<String> =
-                sig.params.iter().map(|p| p.name.clone()).collect();
+            let param_names: Vec<String> = sig.params.iter().map(|p| p.name.clone()).collect();
             call_snippet(name, &param_names)
         });
         items.push(CompletionItem {
@@ -625,8 +622,8 @@ fn push_schema_candidates(items: &mut Vec<CompletionItem>, tree: &AnalyzedTree) 
             label: decl.name.clone(),
             kind: CompletionKind::Schema,
             detail: Some("schema".to_string()),
-                apply_snippet: None,
-            });
+            apply_snippet: None,
+        });
     }
 }
 
@@ -667,8 +664,8 @@ fn push_reference_candidates(items: &mut Vec<CompletionItem>, in_list: bool) {
             label: (*name).into(),
             kind: CompletionKind::Reference,
             detail: Some((*detail).into()),
-                apply_snippet: None,
-            });
+            apply_snippet: None,
+        });
     }
     // Iteration-only refs — only meaningful inside a List or
     // Comprehension. Outside, they always emit an `IterationRefOutside
@@ -698,7 +695,8 @@ fn push_directive_candidates(items: &mut Vec<CompletionItem>) {
         ("extend", "extend ${1:Target} { ${0} }"),
         ("main", "main(${1:Type param}) -> ${0:Return}"),
         ("import", "import ${1:bindings} from \"${0:path}\""),
-        ("strict", "strict"),
+        ("relaxed", "relaxed"),
+        ("unstrict", "unstrict"),
     ] {
         items.push(CompletionItem {
             label: name.into(),
@@ -795,11 +793,7 @@ fn collect_callable_pairs_in_scope(root: &Node, offset: usize) -> Vec<(String, V
 /// params produces `name()` with the final cursor inside the parens.
 fn decorator_snippet(name: &str, params: &[String]) -> String {
     // Skip the first param (auto-bound to the decorated value).
-    let exposed: &[String] = if params.is_empty() {
-        &[]
-    } else {
-        &params[1..]
-    };
+    let exposed: &[String] = if params.is_empty() { &[] } else { &params[1..] };
     if exposed.is_empty() {
         // No user-facing params — leave cursor between the parens.
         format!("{}(${{0}})", name)
@@ -1269,10 +1263,7 @@ mod tests {
             names.contains(&"String".to_string()),
             "expected primitive `String` in generic args, got {names:?}"
         );
-        assert!(
-            names.contains(&"Int".to_string()),
-            "{names:?}"
-        );
+        assert!(names.contains(&"Int".to_string()), "{names:?}");
     }
 
     #[test]

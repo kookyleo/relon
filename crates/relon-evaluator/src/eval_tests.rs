@@ -3036,8 +3036,7 @@ o.customer.name"#;
 #[test]
 fn v1_4_run_main_strict_path_spread_schema() {
     use std::collections::{BTreeMap, HashMap};
-    let source = r#"#strict
-#schema Extras { Int a: *, Int b: * }
+    let source = r#"#schema Extras { Int a: *, Int b: * }
 #schema Order { Extras extras: *, Int id: * }
 #main(Order o) -> Dict
 { id: o.id, ...o.extras }"#;
@@ -3152,8 +3151,7 @@ fn v1_5_run_main_where_int() {
 /// sibling-callable form runs cleanly.
 #[test]
 fn v1_5_run_strict_closure_typed_param() {
-    let source = r#"#strict
-{ helper: (Int n) -> Int => n * 2, Int doubled: helper(7) }"#;
+    let source = r#"{ helper: (Int n) -> Int => n * 2, Int doubled: helper(7) }"#;
     let node = parse_doc(source);
     let analyzed = std::sync::Arc::new(relon_analyzer::analyze(&node));
     let strict_diags = analyzed
@@ -3174,8 +3172,7 @@ fn v1_5_run_strict_closure_typed_param() {
 /// typed-param test above as a forward / reverse pair.
 #[test]
 fn v1_5_strict_closure_untyped_param_flagged_via_evaluator_pipeline() {
-    let source = r#"#strict
-{ helper: (n) => n + 1 }"#;
+    let source = r#"{ helper: (n) => n + 1 }"#;
     let node = parse_doc(source);
     let analyzed = std::sync::Arc::new(relon_analyzer::analyze(&node));
     let n = analyzed
@@ -3197,8 +3194,7 @@ fn v1_5_strict_closure_untyped_param_flagged_via_evaluator_pipeline() {
 /// silent.
 #[test]
 fn v1_5_strict_typed_list_comp_silent() {
-    let source = r#"#strict
-{ List<Int> doubled: [x * 2 for x in range(5) if x > 0] }"#;
+    let source = r#"{ List<Int> doubled: [x * 2 for x in range(5) if x > 0] }"#;
     let node = parse_doc(source);
     let analyzed = std::sync::Arc::new(relon_analyzer::analyze(&node));
     let il = analyzed
@@ -3802,31 +3798,13 @@ fn v13_strict_mode_blocks_eval_when_spread_lacks_hint() {
     // is the canonical "type genuinely unknown" case — analyzer
     // reports `SpreadSourceTypeUnknown` and hosts that gate eval on
     // `analyzed.has_errors()` never reach the evaluator.
-    let source = "#strict\n{ f: (n) => { ...n } }";
-    let node = parse_doc(source);
-    let analyzed = relon_analyzer::analyze(&node);
-    assert!(
-        analyzed
-            .diagnostics
-            .iter()
-            .any(|d| matches!(d, relon_analyzer::Diagnostic::SpreadSourceTypeUnknown { .. })),
-        "{:?}",
-        analyzed.diagnostics
-    );
-    assert!(analyzed.has_errors());
-}
-
-#[test]
-fn v13_strict_mode_blocks_eval_when_dynkey_lacks_hint() {
-    // v1.3 end-to-end: untyped dynamic key under `#strict`.
-    let source = r#"#strict
-{ k: "key", [k]: 1 }"#;
+    let source = "{ f: (n) => { ...n } }";
     let node = parse_doc(source);
     let analyzed = relon_analyzer::analyze(&node);
     assert!(
         analyzed.diagnostics.iter().any(|d| matches!(
             d,
-            relon_analyzer::Diagnostic::DynamicKeyTypeUnknown { .. }
+            relon_analyzer::Diagnostic::SpreadSourceTypeUnknown { .. }
         )),
         "{:?}",
         analyzed.diagnostics
@@ -3835,11 +3813,27 @@ fn v13_strict_mode_blocks_eval_when_dynkey_lacks_hint() {
 }
 
 #[test]
+fn v13_strict_mode_blocks_eval_when_dynkey_lacks_hint() {
+    // End-to-end: untyped dynamic key under default strict mode.
+    let source = r#"{ k: "key", [k]: 1 }"#;
+    let node = parse_doc(source);
+    let analyzed = relon_analyzer::analyze(&node);
+    assert!(
+        analyzed
+            .diagnostics
+            .iter()
+            .any(|d| matches!(d, relon_analyzer::Diagnostic::DynamicKeyTypeUnknown { .. })),
+        "{:?}",
+        analyzed.diagnostics
+    );
+    assert!(analyzed.has_errors());
+}
+
+#[test]
 fn v13_strict_mode_typed_spread_passes_eval() {
-    // v1.3 end-to-end: when the source provides the typed spread, the
+    // End-to-end: when the source provides the typed spread, the
     // analyzer is silent and evaluation proceeds.
-    let source = r#"#strict
-#schema Extra { Int a: *, Int b: * }
+    let source = r#"#schema Extra { Int a: *, Int b: * }
 { src: { a: 1, b: 2 }, ...<Extra> src }"#;
     let node = parse_doc(source);
     let analyzed = relon_analyzer::analyze(&node);
@@ -3886,9 +3880,8 @@ fn v13_duplicate_field_via_typed_spread_caught_statically() {
 
 #[test]
 fn v13_strict_unresolved_schema_caught_statically() {
-    // v1.3 end-to-end: typed spread whose schema isn't declared.
-    let source = r#"#strict
-{ src: 1, val: { ...<Mystery> src } }"#;
+    // End-to-end: typed spread whose schema isn't declared.
+    let source = r#"{ src: 1, val: { ...<Mystery> src } }"#;
     let node = parse_doc(source);
     let analyzed = relon_analyzer::analyze(&node);
     assert!(
@@ -4395,7 +4388,8 @@ fn operator_ge_synthesized_from_lt_and_eq() {
 #[test]
 fn schema_method_dispatches_with_self_binding() {
     use std::collections::{BTreeMap, HashMap};
-    let source = r#"#schema Money {
+    let source = r#"#relaxed
+#schema Money {
     Int cents: *
 } with {
     cents_value() -> Int: self.cents
@@ -4514,7 +4508,8 @@ fn multi_hop_schema_method_dispatches_through_field() {
     // cover the legacy receiver shape; this test pins the multi-hop
     // generalization end-to-end (analyzer + evaluator).
     use std::collections::{BTreeMap, HashMap};
-    let source = r#"#schema User {
+    let source = r#"#relaxed
+#schema User {
     String name: *
 } with {
     greet() -> String: f"hello ${self.name}"
@@ -4611,7 +4606,8 @@ fn stdlib_method_string_upper_dispatches_via_register_pure_method() {
     // user source. Same `register_pure_method` runtime impl, same
     // method dispatch — minus the boilerplate.
     use std::collections::HashMap;
-    let source = r#"#main(String s)
+    let source = r#"#relaxed
+#main(String s)
 { String shout: s.upper() }"#;
     let node = parse_doc(source);
     let analyzed = std::sync::Arc::new(relon_analyzer::analyze(&node));
@@ -4642,7 +4638,8 @@ fn stdlib_method_list_map_dispatches_via_register_pure_method() {
     // user source no longer needs an `#extend List with { ... }`
     // declaration to invoke it.
     use std::collections::HashMap;
-    let source = r#"#main(List<Int> xs)
+    let source = r#"#relaxed
+#main(List<Int> xs)
 { List<Int> doubled: xs.map((n) => n * 2) }"#;
     let node = parse_doc(source);
     let analyzed = std::sync::Arc::new(relon_analyzer::analyze(&node));
@@ -4678,7 +4675,8 @@ fn stdlib_method_list_map_dispatches_via_register_pure_method() {
 fn stdlib_method_dict_keys_dispatches_via_register_pure_method() {
     // Decision 21' (core.relon carrier): `Dict.keys` is built-in.
     use std::collections::{BTreeMap, HashMap};
-    let source = r#"#main(Dict<String, Int> d)
+    let source = r#"#relaxed
+#main(Dict<String, Int> d)
 { List<String> ks: d.keys() }"#;
     let node = parse_doc(source);
     let analyzed = std::sync::Arc::new(relon_analyzer::analyze(&node));
@@ -4715,7 +4713,8 @@ fn stdlib_method_string_len_matches_free_fn_len() {
     // method on each receiver. Both shapes must return the same value.
     // Decision 21' (core.relon carrier) drops the `#extend` declaration.
     use std::collections::HashMap;
-    let source = r#"#main(String s)
+    let source = r#"#relaxed
+#main(String s)
 {
     Int free: len(s),
     Int method: s.len()
@@ -4750,7 +4749,8 @@ fn stdlib_method_self_contains_in_extend_body() {
     // (previously the test had to repeat `#native contains` to keep
     // the analyzer happy).
     use std::collections::HashMap;
-    let source = r#"#extend String with {
+    let source = r#"#relaxed
+#extend String with {
     is_email() -> Bool: self.contains("@")
 }
 #main(String s)
@@ -5079,7 +5079,8 @@ fn core_string_method_no_extend_needed() {
     // dispatch and the runtime hits `register_pure_method("String",
     // "upper", ...)`.
     use std::collections::HashMap;
-    let source = r#"#main(String s)
+    let source = r#"#relaxed
+#main(String s)
 { String shout: s.upper() }"#;
     let node = parse_doc(source);
     let analyzed = std::sync::Arc::new(relon_analyzer::analyze(&node));
@@ -5106,7 +5107,8 @@ fn core_list_method_no_extend_needed() {
     // `lst.map(...)` against the pre-injected core List schema, again
     // with no user-side `#extend` declaration.
     use std::collections::HashMap;
-    let source = r#"#main(List<Int> xs)
+    let source = r#"#relaxed
+#main(List<Int> xs)
 { List<Int> tripled: xs.map((n) => n * 3) }"#;
     let node = parse_doc(source);
     let analyzed = std::sync::Arc::new(relon_analyzer::analyze(&node));
@@ -5145,7 +5147,8 @@ fn comprehension_over_list_iter() {
     // source. End-to-end check that the iteration produces the same
     // elements as plain-list iteration.
     use std::collections::HashMap;
-    let source = r#"#main(List<Int> xs)
+    let source = r#"#relaxed
+#main(List<Int> xs)
 { List<Int> squared: [n * n for n in xs.iter()] }"#;
     let node = parse_doc(source);
     let analyzed = std::sync::Arc::new(relon_analyzer::analyze(&node));
@@ -5181,7 +5184,8 @@ fn comprehension_over_list_iter() {
 fn comprehension_over_string_iter() {
     // `s.iter()` yields one element per char as a fresh `String`.
     use std::collections::HashMap;
-    let source = r#"#main(String s)
+    let source = r#"#relaxed
+#main(String s)
 { List<String> chars: [c for c in s.iter()] }"#;
     let node = parse_doc(source);
     let analyzed = std::sync::Arc::new(relon_analyzer::analyze(&node));
@@ -5218,7 +5222,8 @@ fn comprehension_over_dict_iter_yields_entries() {
     // below walks `d.iter()` and checks the count rather than the
     // specific (K, V) shape of each element — full tuple
     // destructuring is left for the post-Indexable follow-up.
-    let source = r#"#main(Dict<String, Int> d)
+    let source = r#"#relaxed
+#main(Dict<String, Int> d)
 { Int count: len([kv for kv in d.iter()]) }"#;
     let node = parse_doc(source);
     let analyzed = std::sync::Arc::new(relon_analyzer::analyze(&node));
@@ -5310,7 +5315,8 @@ fn iter_next_on_list_walks_through_then_returns_none() {
     // `core_schemas::merge_core_into`). So we let the iter bindings
     // be inferred — the dispatch path keys off the value's brand
     // (`"Iter"`), not the declared field type.
-    let source = r#"#main(List<Int> xs)
+    let source = r#"#relaxed
+#main(List<Int> xs)
 {
     "it": xs.iter(),
     "first": it.next(),
@@ -5371,7 +5377,8 @@ fn iter_next_on_list_walks_through_then_returns_none() {
 #[test]
 fn iter_next_on_string_advances_per_codepoint() {
     use std::collections::HashMap;
-    let source = r#"#main(String s)
+    let source = r#"#relaxed
+#main(String s)
 {
     "it": s.iter(),
     "first": it.next(),
@@ -5425,7 +5432,8 @@ fn iter_next_on_string_advances_per_codepoint() {
 #[test]
 fn iter_next_on_dict_yields_key_sorted_entries() {
     use std::collections::{BTreeMap, HashMap};
-    let source = r#"#main(Dict<String, Int> d)
+    let source = r#"#relaxed
+#main(Dict<String, Int> d)
 {
     "it": d.iter(),
     "first": it.next(),

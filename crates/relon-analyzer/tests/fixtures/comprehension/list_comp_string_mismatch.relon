@@ -2,5 +2,4 @@
 // declared slot is `List<String>` — strict catches the mismatch
 // statically.
 // EXPECTED: ≥ 1 × StaticTypeMismatch.
-#strict
 { List<String> doubled: [x * 2 for x in range(5)] }

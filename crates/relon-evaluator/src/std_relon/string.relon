@@ -1,3 +1,7 @@
+// Standard library: string helpers. The runtime owns the type-check
+// once values flow through, so the closures take their parameter
+// types from the caller's argument shape rather than the source.
+#relaxed
 {
     split(s, sep): _string_split(s, sep),
     join(l, sep): _string_join(l, sep),

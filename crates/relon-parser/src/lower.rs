@@ -559,11 +559,7 @@ fn lower_reference_expr_v2(node: &SyntaxNode, source: &str) -> Option<Node> {
 /// shape exactly: a `?` is consumed as an optional prefix only when
 /// followed by `.` or `[`; bare `?` would have been emitted as a
 /// ternary operator at a different position in the grammar.
-fn walk_path_tokens(
-    node: &SyntaxNode,
-    source: &str,
-    is_reference: bool,
-) -> Option<Vec<TokenKey>> {
+fn walk_path_tokens(node: &SyntaxNode, source: &str, is_reference: bool) -> Option<Vec<TokenKey>> {
     let mut path: Vec<TokenKey> = Vec::new();
     // Tracks whether we've already consumed the head — either the
     // first IDENT (variable) or the `&` + base IDENT pair
@@ -578,9 +574,9 @@ fn walk_path_tokens(
     for el in node.children_with_tokens() {
         match el {
             rowan::NodeOrToken::Token(t) => match t.kind() {
-                SyntaxKind::WHITESPACE
-                | SyntaxKind::LINE_COMMENT
-                | SyntaxKind::BLOCK_COMMENT => continue,
+                SyntaxKind::WHITESPACE | SyntaxKind::LINE_COMMENT | SyntaxKind::BLOCK_COMMENT => {
+                    continue
+                }
                 SyntaxKind::AMP => continue,
                 SyntaxKind::IDENT => {
                     if !head_done {
@@ -1067,20 +1063,14 @@ fn directive_end_offset(
 }
 
 /// Walk the body expression of a `Value`-shape directive.
-fn lower_directive_value_body(
-    node: &SyntaxNode,
-    source: &str,
-) -> Option<crate::DirectiveBody> {
+fn lower_directive_value_body(node: &SyntaxNode, source: &str) -> Option<crate::DirectiveBody> {
     let body_expr = node.children().find_map(ast::Expr::cast)?;
     let body_node = lower_expr_v2(&body_expr, source)?;
     Some(crate::DirectiveBody::Value(Box::new(body_node)))
 }
 
 /// Walk the body of an `Import`-shape directive: spec + `from` + path.
-fn lower_directive_import_body(
-    node: &SyntaxNode,
-    source: &str,
-) -> Option<crate::DirectiveBody> {
+fn lower_directive_import_body(node: &SyntaxNode, source: &str) -> Option<crate::DirectiveBody> {
     // Children we care about (in source order, after the `#import`
     // tokens): STAR / L_BRACE-block / IDENT (spec), then the `from`
     // IDENT, then the path STRING token.
@@ -1187,10 +1177,7 @@ fn lower_directive_import_body(
 }
 
 /// Walk the body of a `Main`-shape directive: `(typed-params) [-> Ret]`.
-fn lower_directive_main_body(
-    node: &SyntaxNode,
-    source: &str,
-) -> Option<crate::DirectiveBody> {
+fn lower_directive_main_body(node: &SyntaxNode, source: &str) -> Option<crate::DirectiveBody> {
     let mut params: Vec<crate::DirectiveMainParam> = Vec::new();
     let mut return_type: Option<crate::TypeNode> = None;
     // The CST emits CLOSURE_PARAM children for each `Type ident` pair.
@@ -1268,10 +1255,7 @@ struct SchemaColonSplit {
 /// body Expr, with no `with { ... }` block). Returns `None` for any
 /// other directive shape — caller proceeds with the regular
 /// directive walker.
-fn split_schema_colon_directive(
-    node: &SyntaxNode,
-    source: &str,
-) -> Option<SchemaColonSplit> {
+fn split_schema_colon_directive(node: &SyntaxNode, source: &str) -> Option<SchemaColonSplit> {
     // Quick filter: only `#schema` / `#extend` (the NameBody shapes)
     // can take this form. Read the directive name.
     let dir_name = node
@@ -1406,10 +1390,7 @@ fn split_schema_colon_directive(
 
 /// Walk the body of a `NameBody`-shape directive: `<name>[<T, ...>]
 /// <body-expr> [with { methods... }]`.
-fn lower_directive_name_body(
-    node: &SyntaxNode,
-    source: &str,
-) -> Option<crate::DirectiveBody> {
+fn lower_directive_name_body(node: &SyntaxNode, source: &str) -> Option<crate::DirectiveBody> {
     // Children of the DIRECTIVE node:
     //   `#` HASH, name IDENT, optional generics (LT ... GT), optional
     //   body Expr, optional SCHEMA_WITH node.
@@ -1455,10 +1436,8 @@ fn lower_directive_name_body(
                         let tr = t.text_range();
                         let s: usize = tr.start().into();
                         let e: usize = tr.end().into();
-                        declared_name = Some((
-                            t.text().to_string(),
-                            range_from_offsets(source, s, e),
-                        ));
+                        declared_name =
+                            Some((t.text().to_string(), range_from_offsets(source, s, e)));
                         continue;
                     }
                     if in_generics {
@@ -1581,8 +1560,7 @@ fn lower_schema_with(
     for child in node.children() {
         match child.kind() {
             SyntaxKind::SCHEMA_METHOD => {
-                let (method, method_no_auto_derives) =
-                    lower_schema_method(&child, source)?;
+                let (method, method_no_auto_derives) = lower_schema_method(&child, source)?;
                 schema_no_auto_derives.extend(method_no_auto_derives);
                 methods.push(method);
             }
@@ -1683,10 +1661,7 @@ fn lower_schema_method(
                         let tr = t.text_range();
                         let s: usize = tr.start().into();
                         let e: usize = tr.end().into();
-                        name = Some((
-                            t.text().to_string(),
-                            range_from_offsets(source, s, e),
-                        ));
+                        name = Some((t.text().to_string(), range_from_offsets(source, s, e)));
                         after_name = true;
                         continue;
                     }
@@ -1778,10 +1753,7 @@ fn lower_schema_method(
 }
 
 /// One `name: Type` parameter inside a SCHEMA_METHOD's param list.
-fn lower_schema_method_param(
-    node: &SyntaxNode,
-    source: &str,
-) -> Option<crate::SchemaMethodParam> {
+fn lower_schema_method_param(node: &SyntaxNode, source: &str) -> Option<crate::SchemaMethodParam> {
     let name_tok = node
         .children_with_tokens()
         .filter_map(|el| el.into_token())
@@ -1876,9 +1848,9 @@ fn lower_type_node_from_cst(node: &SyntaxNode, source: &str) -> Option<crate::Ty
     for el in node.children_with_tokens() {
         match el {
             rowan::NodeOrToken::Token(t) => match t.kind() {
-                SyntaxKind::WHITESPACE
-                | SyntaxKind::LINE_COMMENT
-                | SyntaxKind::BLOCK_COMMENT => continue,
+                SyntaxKind::WHITESPACE | SyntaxKind::LINE_COMMENT | SyntaxKind::BLOCK_COMMENT => {
+                    continue
+                }
                 SyntaxKind::DOT => continue,
                 SyntaxKind::IDENT | SyntaxKind::STRING if !after_path => {
                     let txt = if t.kind() == SyntaxKind::STRING {
@@ -1904,8 +1876,7 @@ fn lower_type_node_from_cst(node: &SyntaxNode, source: &str) -> Option<crate::Ty
                 _ => continue,
             },
             rowan::NodeOrToken::Node(n) => {
-                if in_generics
-                    && matches!(n.kind(), SyntaxKind::TYPE_NODE | SyntaxKind::TUPLE_TYPE)
+                if in_generics && matches!(n.kind(), SyntaxKind::TYPE_NODE | SyntaxKind::TUPLE_TYPE)
                 {
                     let mut g = lower_type_node_from_cst(&n, source)?;
                     // For Enum heads, a TYPE_NODE followed by a DICT
@@ -1950,14 +1921,14 @@ fn lower_type_node_from_cst(node: &SyntaxNode, source: &str) -> Option<crate::Ty
                                 // `range = start_offset..end_offset`
                                 // where end_offset is after `}`.
                                 let dict_end: usize = next.text_range().end().into();
-                                g.range = range_from_offsets(
-                                    source,
-                                    g.range.start.offset,
-                                    dict_end,
-                                );
+                                g.range =
+                                    range_from_offsets(source, g.range.start.offset, dict_end);
                                 // Walk DICT to extract `(field_name, field_type)` pairs.
                                 let mut fields: Vec<(String, crate::TypeNode)> = Vec::new();
-                                for f in next.children().filter(|c| c.kind() == SyntaxKind::DICT_FIELD) {
+                                for f in next
+                                    .children()
+                                    .filter(|c| c.kind() == SyntaxKind::DICT_FIELD)
+                                {
                                     // Variant fields are emitted as
                                     // `name: Type` shape. The CST may
                                     // emit the type either as a
@@ -1976,38 +1947,36 @@ fn lower_type_node_from_cst(node: &SyntaxNode, source: &str) -> Option<crate::Ty
                                         .filter_map(|el| el.into_token())
                                         .find(|t| t.kind() == SyntaxKind::IDENT)
                                         .map(|t| t.text().to_string());
-                                    let ty = f
-                                        .children()
-                                        .find_map(|c| match c.kind() {
-                                            SyntaxKind::TYPE_NODE | SyntaxKind::TUPLE_TYPE => {
-                                                lower_type_node_from_cst(&c, source)
+                                    let ty = f.children().find_map(|c| match c.kind() {
+                                        SyntaxKind::TYPE_NODE | SyntaxKind::TUPLE_TYPE => {
+                                            lower_type_node_from_cst(&c, source)
+                                        }
+                                        SyntaxKind::VARIABLE_EXPR => {
+                                            // Build a TypeNode from
+                                            // the IDENT-only path.
+                                            let segs: Vec<String> = c
+                                                .children_with_tokens()
+                                                .filter_map(|el| el.into_token())
+                                                .filter(|t| t.kind() == SyntaxKind::IDENT)
+                                                .map(|t| t.text().to_string())
+                                                .collect();
+                                            if segs.is_empty() {
+                                                return None;
                                             }
-                                            SyntaxKind::VARIABLE_EXPR => {
-                                                // Build a TypeNode from
-                                                // the IDENT-only path.
-                                                let segs: Vec<String> = c
-                                                    .children_with_tokens()
-                                                    .filter_map(|el| el.into_token())
-                                                    .filter(|t| t.kind() == SyntaxKind::IDENT)
-                                                    .map(|t| t.text().to_string())
-                                                    .collect();
-                                                if segs.is_empty() {
-                                                    return None;
-                                                }
-                                                let r = c.text_range();
-                                                let s: usize = r.start().into();
-                                                let e: usize = r.end().into();
-                                                Some(crate::TypeNode {
-                                                    path: segs,
-                                                    generics: Vec::new(),
-                                                    is_optional: false,
-                                                    range: range_from_offsets(source, s, e),
-                                                    variant_fields: None,
-                                                    doc_comment: None,
-                                                })
-                                            }
-                                            _ => None,
-                                        });
+                                            let r = c.text_range();
+                                            let s: usize = r.start().into();
+                                            let e: usize = r.end().into();
+                                            Some(crate::TypeNode {
+                                                path: segs,
+                                                generics: Vec::new(),
+                                                is_optional: false,
+                                                range: range_from_offsets(source, s, e),
+                                                variant_fields: None,
+                                                doc_comment: None,
+                                            })
+                                        }
+                                        _ => None,
+                                    });
                                     if let (Some(name), Some(ty)) = (name, ty) {
                                         fields.push((name, ty));
                                     }
@@ -2066,9 +2035,9 @@ fn first_non_trivia_offset(node: &SyntaxNode) -> Option<usize> {
     for el in node.children_with_tokens() {
         match el {
             rowan::NodeOrToken::Token(t) => match t.kind() {
-                SyntaxKind::WHITESPACE
-                | SyntaxKind::LINE_COMMENT
-                | SyntaxKind::BLOCK_COMMENT => continue,
+                SyntaxKind::WHITESPACE | SyntaxKind::LINE_COMMENT | SyntaxKind::BLOCK_COMMENT => {
+                    continue
+                }
                 _ => return Some(t.text_range().start().into()),
             },
             rowan::NodeOrToken::Node(n) => return Some(n.text_range().start().into()),
@@ -2318,7 +2287,12 @@ fn lower_unary_expr_v2(node: &SyntaxNode, source: &str) -> Option<Node> {
     let op_token = node
         .children_with_tokens()
         .filter_map(|el| el.into_token())
-        .find(|t| matches!(t.kind(), SyntaxKind::MINUS | SyntaxKind::BANG | SyntaxKind::PLUS))?;
+        .find(|t| {
+            matches!(
+                t.kind(),
+                SyntaxKind::MINUS | SyntaxKind::BANG | SyntaxKind::PLUS
+            )
+        })?;
     let operand_ast = node.children().find_map(ast::Expr::cast)?;
     let operand = lower_expr_v2(&operand_ast, source)?;
     let op = match op_token.kind() {
@@ -2367,13 +2341,15 @@ fn lower_dict_v2(node: &SyntaxNode, source: &str) -> Option<Node> {
     // that by anchoring to the `{` token's start.
     let start: usize = node
         .children_with_tokens()
-        .find_map(|el| el.into_token().and_then(|t| {
-            if t.kind() == SyntaxKind::L_BRACE {
-                Some(t.text_range().start().into())
-            } else {
-                None
-            }
-        }))
+        .find_map(|el| {
+            el.into_token().and_then(|t| {
+                if t.kind() == SyntaxKind::L_BRACE {
+                    Some(t.text_range().start().into())
+                } else {
+                    None
+                }
+            })
+        })
         .unwrap_or_else(|| node.text_range().start().into());
     let end: usize = node.text_range().end().into();
     let mut pairs: Vec<(TokenKey, Node)> = Vec::new();
@@ -2398,9 +2374,7 @@ fn lower_dict_v2(node: &SyntaxNode, source: &str) -> Option<Node> {
             .all(|t| {
                 matches!(
                     t.kind(),
-                    SyntaxKind::WHITESPACE
-                        | SyntaxKind::LINE_COMMENT
-                        | SyntaxKind::BLOCK_COMMENT
+                    SyntaxKind::WHITESPACE | SyntaxKind::LINE_COMMENT | SyntaxKind::BLOCK_COMMENT
                 )
             })
             && field.children().next().is_none();
@@ -2428,10 +2402,7 @@ fn lower_dict_v2(node: &SyntaxNode, source: &str) -> Option<Node> {
         }
     }
 
-    let mut out = Node::new(
-        Expr::Dict(pairs),
-        range_from_offsets(source, start, end),
-    );
+    let mut out = Node::new(Expr::Dict(pairs), range_from_offsets(source, start, end));
     out.directives = standalone_directives;
     Some(out)
 }
@@ -2461,9 +2432,7 @@ fn lower_dict_field(node: &SyntaxNode, source: &str) -> Option<DictFieldOut> {
             rowan::NodeOrToken::Token(t) => {
                 if matches!(
                     t.kind(),
-                    SyntaxKind::WHITESPACE
-                        | SyntaxKind::LINE_COMMENT
-                        | SyntaxKind::BLOCK_COMMENT
+                    SyntaxKind::WHITESPACE | SyntaxKind::LINE_COMMENT | SyntaxKind::BLOCK_COMMENT
                 ) {
                     continue;
                 }
@@ -2509,9 +2478,9 @@ fn lower_dict_field(node: &SyntaxNode, source: &str) -> Option<DictFieldOut> {
     while let Some(el) = child_iter.next() {
         match el {
             rowan::NodeOrToken::Token(t) => match t.kind() {
-                SyntaxKind::WHITESPACE
-                | SyntaxKind::LINE_COMMENT
-                | SyntaxKind::BLOCK_COMMENT => continue,
+                SyntaxKind::WHITESPACE | SyntaxKind::LINE_COMMENT | SyntaxKind::BLOCK_COMMENT => {
+                    continue
+                }
                 SyntaxKind::L_BRACK => {
                     in_brack = true;
                 }
@@ -2689,7 +2658,9 @@ fn lower_dict_field(node: &SyntaxNode, source: &str) -> Option<DictFieldOut> {
     }
 
     // ---- 4. Attribute-only field (standalone directives). -------------
-    if key_token.is_none() && dynamic_key_node.is_none() && value_expr_ast.is_none()
+    if key_token.is_none()
+        && dynamic_key_node.is_none()
+        && value_expr_ast.is_none()
         && closure_node.is_none()
     {
         if decorators_before.is_empty() {
@@ -2844,10 +2815,7 @@ fn lower_list_v2(node: &SyntaxNode, source: &str) -> Option<Node> {
                             let r = child.text_range();
                             let start_o: usize = r.start().into();
                             let end_o: usize = r.end().into();
-                            Node::new(
-                                Expr::Null,
-                                range_from_offsets(source, start_o, end_o),
-                            )
+                            Node::new(Expr::Null, range_from_offsets(source, start_o, end_o))
                         }
                         None => return None,
                     };
@@ -3016,9 +2984,7 @@ fn lower_fstring_v2(node: &SyntaxNode, source: &str) -> Option<Node> {
                     if decoded.is_empty() {
                         continue;
                     }
-                    if let Some(crate::FStringPart::Literal(ref mut last)) =
-                        parts.last_mut()
-                    {
+                    if let Some(crate::FStringPart::Literal(ref mut last)) = parts.last_mut() {
                         last.push_str(&decoded);
                     } else {
                         parts.push(crate::FStringPart::Literal(decoded));
@@ -3102,12 +3068,14 @@ fn lower_closure_param_v2(node: &SyntaxNode, source: &str) -> Option<crate::Clos
     let start: usize = node
         .children_with_tokens()
         .find_map(|el| match el {
-            rowan::NodeOrToken::Token(t) if matches!(
-                t.kind(),
-                SyntaxKind::WHITESPACE
-                    | SyntaxKind::LINE_COMMENT
-                    | SyntaxKind::BLOCK_COMMENT
-            ) => None,
+            rowan::NodeOrToken::Token(t)
+                if matches!(
+                    t.kind(),
+                    SyntaxKind::WHITESPACE | SyntaxKind::LINE_COMMENT | SyntaxKind::BLOCK_COMMENT
+                ) =>
+            {
+                None
+            }
             rowan::NodeOrToken::Token(t) => Some(t.text_range().start().into()),
             rowan::NodeOrToken::Node(n) => Some(n.text_range().start().into()),
         })
@@ -3359,7 +3327,10 @@ fn lower_match_expr_v2(node: &SyntaxNode, source: &str) -> Option<Node> {
     let scrutinee_ast = node.children().find_map(ast::Expr::cast)?;
     let scrutinee = lower_expr_v2(&scrutinee_ast, source)?;
     let mut arms: Vec<(Node, Node)> = Vec::new();
-    for arm in node.children().filter(|c| c.kind() == SyntaxKind::MATCH_ARM) {
+    for arm in node
+        .children()
+        .filter(|c| c.kind() == SyntaxKind::MATCH_ARM)
+    {
         let mut arm_exprs = arm.children().filter_map(ast::Expr::cast);
         let pat_ast = arm_exprs.next()?;
         let body_ast = arm_exprs.next()?;
@@ -3669,7 +3640,6 @@ fn first_error_offset(node: &SyntaxNode) -> Option<usize> {
         .find(|n| n.kind() == SyntaxKind::ERROR)
         .map(|n| usize::from(n.text_range().start()))
 }
-
 
 #[cfg(test)]
 mod tests {

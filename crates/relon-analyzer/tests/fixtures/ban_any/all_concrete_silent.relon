@@ -1,7 +1,6 @@
 // v1.6 reverse: a fully concrete file — schema fields, #main params,
 // closure params/returns, typed bindings — uses no `Any`.
 // EXPECTED: 0 × ExplicitAnyForbidden.
-#strict
 #schema Order { Int id: *, String name: * }
 #main(Order o) -> Int
 {

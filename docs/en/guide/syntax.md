@@ -93,8 +93,8 @@ spread source:
 { ...<Dict<String, Int>> kv }
 ```
 
-Under `#strict` mode, a spread source that isn't a dict literal and
-lacks a `<T>` hint triggers `SpreadSourceTypeUnknown`.
+Under strict mode (the default), a spread source that isn't a dict
+literal and lacks a `<T>` hint triggers `SpreadSourceTypeUnknown`.
 
 **v1.3 typed dynamic key**: write `<T>` after `[` to type-hint the
 dynamic key:
@@ -104,8 +104,8 @@ dynamic key:
 { idx: 0, [<Int> idx]: "row0" }
 ```
 
-Under `#strict` mode, a dynamic key missing `<T>` triggers
-`DynamicKeyTypeUnknown`.
+Under strict mode (the default), a dynamic key missing `<T>`
+triggers `DynamicKeyTypeUnknown`.
 
 #### `Dict<K, V>` generics (formally specified in v1.3)
 
@@ -179,7 +179,8 @@ namespaces:
 - `#name ...` — **directive**: declaration / structure / metadata.
   The full set is `#main(...)`, `#schema X Body`,
   `#import ... from "..."`, `#private`, `#default`, `#expect`,
-  `#msg`, `#error`, `#brand X`, and `#strict` (since v1.3). Directive
+  `#msg`, `#error`, `#brand X`, `#relaxed` (synonym `#unstrict`),
+  `#derive`, `#no_auto_derive`, `#native`, and `#extend`. Directive
   names are fixed and registered by the runtime — not user-extensible.
 
 > Rule of thumb: if it **changes the value**, it's `@`; if it
@@ -223,20 +224,21 @@ projector automatically filters it out. That's another defense beyond
 > `_list_map`), but it carries no visibility, import, or projection
 > meaning. Use `#private` for visibility.
 
-## Strict mode — `#strict` (v1.3)
+## Strict mode — opt out with `#relaxed`
 
-Writing a single `#strict` at the root puts the file *and every
-module reachable through its `#import` graph* into "strict static
-inference" mode:
+Relon's analyzer is strict by default: the file *and every module
+reachable through its `#import` graph* runs under "strict static
+inference" mode. A module opts out with the file-level directive
+`#relaxed` (or its synonym `#unstrict`):
 
 ```relon
-#strict
+#relaxed
 #import * from "./lib.relon"
 { ok: 1 }
 ```
 
 Under strict mode, sites where the analyzer would normally silently
-fall back to `Any` (and defer to runtime) now produce errors:
+fall back to `Any` (and defer to runtime) produce errors:
 
 - A spread without a type hint (`{ ...e }`) → `SpreadSourceTypeUnknown`.
 - A dynamic key without a type hint (`{ [k]: v }`) →
@@ -246,10 +248,11 @@ fall back to `Any` (and defer to runtime) now produce errors:
 - A call to a native fn whose return type isn't registered in
   `host_fn_signatures` → `NativeFnSignatureMissing`.
 
-**Contagion**: strict is decided at the entry. Write `#strict` once at
-the entry, and every imported library (even one that didn't write
-`#strict` itself) is checked under strict rules. This prevents silent
-fallbacks from non-strict libraries leaking into a strict entry.
+**Contagion**: strict is decided at the entry. A strict entry (the
+default — no directive needed) makes every imported library run under
+strict rules, even one that didn't write `#relaxed` itself. A
+`#relaxed` entry stamps the cleared bit on every reachable import, so
+the workspace presents a single mode end to end.
 
 For the full strict semantics, the complete diagnostic list, `<T>`
 typehint syntax, and `Dict<K, V>` generics, see spec §6.6.

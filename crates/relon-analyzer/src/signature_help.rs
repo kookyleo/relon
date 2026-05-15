@@ -94,7 +94,12 @@ fn render_signature(sig: &FnSignature) -> String {
         Some(t) => format!(", ...{}", format_type(t)),
         None => String::new(),
     };
-    format!("({}{}) -> {}", params.join(", "), tail, format_type(&sig.return_type))
+    format!(
+        "({}{}) -> {}",
+        params.join(", "),
+        tail,
+        format_type(&sig.return_type)
+    )
 }
 
 fn format_type(t: &relon_parser::TypeNode) -> String {

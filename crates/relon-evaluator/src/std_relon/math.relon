@@ -1,3 +1,7 @@
+// Standard library: math helpers. `#relaxed` so the polymorphic
+// numeric parameters stay untyped at the source — the underlying
+// host fns own the typing rules.
+#relaxed
 {
     abs(x): _math_abs(x),
     max(a, b): _math_max(a, b),

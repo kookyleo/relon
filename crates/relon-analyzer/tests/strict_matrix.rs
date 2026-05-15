@@ -294,8 +294,7 @@ fn matrix() {
             .filter_map(|d| d.code().map(|c| c.to_string()))
             .collect();
 
-        let expect_lax: BTreeSet<String> =
-            c.expect_lax.iter().map(|s| s.to_string()).collect();
+        let expect_lax: BTreeSet<String> = c.expect_lax.iter().map(|s| s.to_string()).collect();
         let expect_strict: BTreeSet<String> =
             c.expect_strict.iter().map(|s| s.to_string()).collect();
 
@@ -335,6 +334,10 @@ fn matrix() {
     println!();
 
     if !failures.is_empty() {
-        panic!("{} matrix failures:\n  - {}", failures.len(), failures.join("\n  - "));
+        panic!(
+            "{} matrix failures:\n  - {}",
+            failures.len(),
+            failures.join("\n  - ")
+        );
     }
 }

@@ -126,11 +126,12 @@ pub struct AnalyzedTree {
     /// [`crate::sig::lookup_signature`] to resolve calls to closure
     /// signatures from `#import`ed modules.
     pub workspace_import_index: Option<WorkspaceImportIndex>,
-    /// v1.3: when `true`, this module was analyzed under strict mode.
-    /// Either the module declared `#strict` directly, or the workspace
-    /// pass propagated the flag from a strict entry's `#import` graph
-    /// (transitive). Drives the analyzer's no-silent-fallback policy
-    /// during inference.
+    /// `true` when this module is analyzed under strict mode. Strict
+    /// is the default; the bit is cleared when the module declares
+    /// `#relaxed` (or its synonym `#unstrict`), or when the workspace
+    /// pass propagated the cleared bit from a relaxed entry's
+    /// `#import` graph (transitive). Drives the analyzer's
+    /// no-silent-fallback policy during inference.
     pub strict_mode: bool,
 }
 

@@ -1,6 +1,5 @@
 // v1.6 (originally v1.5): a properly typed `#main` param is silent
 // — no `Any` token to flag.
 // EXPECTED: 0 × ExplicitAnyForbidden.
-#strict
 #main(Int x) -> Int
 x + 1

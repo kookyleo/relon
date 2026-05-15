@@ -9,7 +9,6 @@
 // `infer_path_inferred` returned None, and `check_typed_binding`
 // silently passed — strict mode emitted a generic `InferenceLimit`
 // instead of the precise `MainReturnTypeMismatch`.
-#strict
 #import lib from "./lib_with_value.relon"
 #main() -> Int
 lib.alice.region

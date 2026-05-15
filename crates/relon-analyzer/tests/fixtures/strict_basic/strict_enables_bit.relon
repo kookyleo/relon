@@ -1,4 +1,4 @@
-// v1.3: bare `#strict` directive sets the strict_mode bit.
+// Default-strict baseline: no directive means the analyzer treats
+// the module as strict.
 // EXPECTED: tree.strict_mode == true (no analyzer diagnostics).
-#strict
 { a: 1, b: 2 }

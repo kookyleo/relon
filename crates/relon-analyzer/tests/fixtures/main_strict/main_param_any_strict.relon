@@ -3,6 +3,5 @@
 // (strict only); v1.6 routes through the generic
 // `ExplicitAnyForbidden` so the same fixture still pins the failure.
 // EXPECTED: ≥ 1 × ExplicitAnyForbidden (#main parameter `x`).
-#strict
 #main(Any x) -> Int
 1
