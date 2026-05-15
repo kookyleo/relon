@@ -57,10 +57,17 @@ impl RootRef {
 /// host evaluators sharing a `Scope` across threads stay safe; the
 /// inner `HashMap` starts empty (zero-capacity, no heap allocation)
 /// and only grows when something actually writes a binding.
-pub type Locals = Mutex<HashMap<String, Value>>;
+///
+/// Keys are stored as `Arc<str>` so that the comprehension / closure
+/// hot loops can rebind the same identifier on every iteration via an
+/// `Arc::clone` (refcount bump, no heap touch) instead of a full
+/// `String::clone` (malloc + memcpy). `HashMap` lookup still accepts
+/// `&str` queries through the standard `Borrow<str>` impl on
+/// `Arc<str>`, so read sites are unchanged.
+pub type Locals = Mutex<HashMap<Arc<str>, Value>>;
 
 /// Type alias for the thunks table — same shape as [`Locals`].
-pub(crate) type Thunks = Mutex<HashMap<String, Arc<Thunk>>>;
+pub(crate) type Thunks = Mutex<HashMap<Arc<str>, Arc<Thunk>>>;
 
 /// Single environment frame. Cheap to derive (every field is either
 /// `Clone` or `Arc`-shared) and wrapped in `Arc<Scope>` at every call
@@ -162,12 +169,17 @@ impl Scope {
     /// thread-local representation under a feature) without touching
     /// every call site. Read paths still go through
     /// [`Scope::get_local`] which walks the parent chain.
-    pub fn locals_for_write(&self) -> MutexGuard<'_, HashMap<String, Value>> {
+    ///
+    /// Keys are `Arc<str>`; callers writing a `String` should hand it
+    /// over via `Arc::<str>::from(name)` so the buffer moves into the
+    /// `Arc` allocation once, instead of paying a `String::clone` on
+    /// every rebind.
+    pub fn locals_for_write(&self) -> MutexGuard<'_, HashMap<Arc<str>, Value>> {
         self.locals.lock().unwrap()
     }
 
     /// Same as [`Scope::locals_for_write`] but for the dict thunks table.
-    pub(crate) fn thunks_for_write(&self) -> MutexGuard<'_, HashMap<String, Arc<Thunk>>> {
+    pub(crate) fn thunks_for_write(&self) -> MutexGuard<'_, HashMap<Arc<str>, Arc<Thunk>>> {
         self.thunks.lock().unwrap()
     }
 
@@ -225,13 +237,20 @@ impl Scope {
         })
     }
 
-    pub fn with_local(self: &Arc<Self>, name: String, val: Value) -> Arc<Self> {
+    /// Bind a single `name -> val` in a fresh child frame.
+    ///
+    /// Accepts anything that can be cheaply turned into an `Arc<str>`
+    /// (a `String`, a `&str`, or an already-shared `Arc<str>`) so hot
+    /// paths can hand the key over without an extra clone. Callers
+    /// that already hold an `Arc<str>` should pass `Arc::clone(&id)`
+    /// to skip the heap copy entirely.
+    pub fn with_local(self: &Arc<Self>, name: impl Into<Arc<str>>, val: Value) -> Arc<Self> {
         let child = self.child();
-        child.locals_for_write().insert(name, val);
+        child.locals_for_write().insert(name.into(), val);
         child
     }
 
-    pub fn with_locals(self: &Arc<Self>, new_locals: HashMap<String, Value>) -> Arc<Self> {
+    pub fn with_locals(self: &Arc<Self>, new_locals: HashMap<Arc<str>, Value>) -> Arc<Self> {
         let mut child = self.child();
         // `child()` returned an Arc with no other strong references yet,
         // so swap the freshly-built empty mutex for one already
