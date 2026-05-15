@@ -40,7 +40,7 @@ import VPNavBarAppearance from 'vitepress/dist/client/theme-default/components/V
 import VPNavBarSocialLinks from 'vitepress/dist/client/theme-default/components/VPNavBarSocialLinks.vue';
 
 import { EditorState, Compartment, StateField, StateEffect, EditorSelection } from '@codemirror/state';
-import { EditorView, keymap, lineNumbers, highlightActiveLine, hoverTooltip, type Tooltip, Decoration, type DecorationSet } from '@codemirror/view';
+import { EditorView, keymap, lineNumbers, highlightActiveLine, hoverTooltip, type Tooltip, Decoration, type DecorationSet, ViewPlugin, type ViewUpdate, WidgetType } from '@codemirror/view';
 import { defaultKeymap, history, historyKeymap, indentWithTab } from '@codemirror/commands';
 import { bracketMatching, indentOnInput, syntaxHighlighting, foldGutter, foldKeymap } from '@codemirror/language';
 import { setDiagnostics, type Diagnostic } from '@codemirror/lint';
@@ -121,6 +121,15 @@ interface WasmModule {
         character: number,
         include_declaration: boolean
     ) => ReferenceLocation[] | null;
+    inlay_hints: (sources: unknown, entry: string) => InlayHintWire[];
+}
+
+interface InlayHintWire {
+    line: number;
+    character: number;
+    offset: number;
+    label: string;
+    kind: 'parameter';
 }
 
 interface ReferenceLocation {
@@ -1184,6 +1193,65 @@ function findReferencesAtCursor(view: EditorView): boolean {
     return true;
 }
 
+/// Widget that renders a single inlay hint inline. Atomic so caret
+/// movement crosses it in a single keystroke; not block-level so it
+/// flows with the line.
+class InlayHintWidget extends WidgetType {
+    constructor(readonly label: string) { super(); }
+    eq(other: InlayHintWidget) { return other.label === this.label; }
+    toDOM() {
+        const span = document.createElement('span');
+        span.className = 'rp-inlay-hint';
+        span.textContent = this.label;
+        return span;
+    }
+    ignoreEvent() { return true; }
+}
+
+/// Inlay-hint plugin. Re-runs the wasm `inlay_hints()` export on every
+/// document change and rebuilds the decoration set from scratch — the
+/// hint list for a typical playground file is tiny, so a full rebuild
+/// is cheaper than diffing. Hints sit *before* their argument value, so
+/// the side: -1 places them tight against the existing token.
+const relonInlayHints = ViewPlugin.fromClass(
+    class {
+        decorations: DecorationSet;
+        constructor(view: EditorView) {
+            this.decorations = this.build(view);
+        }
+        update(u: ViewUpdate) {
+            if (u.docChanged || u.viewportChanged) {
+                this.decorations = this.build(u.view);
+            }
+        }
+        build(view: EditorView): DecorationSet {
+            const mod = wasmRef.value;
+            if (!mod) return Decoration.none;
+            const sources = files.value.map((f) => ({
+                path: f.path,
+                content: f.content,
+            }));
+            let hints: InlayHintWire[];
+            try {
+                hints = mod.inlay_hints(sources, activeFile.value);
+            } catch {
+                return Decoration.none;
+            }
+            const docLen = view.state.doc.length;
+            const marks = hints
+                .filter((h) => h.offset <= docLen)
+                .map((h) =>
+                    Decoration.widget({
+                        widget: new InlayHintWidget(h.label),
+                        side: -1,
+                    }).range(h.offset),
+                );
+            return Decoration.set(marks, true);
+        }
+    },
+    { decorations: (v) => v.decorations },
+);
+
 /// Minimal Markdown → HTML for hover tooltips. The analyzer output
 /// uses a small vocabulary — `**bold**`, `_italic_`, fenced code
 /// blocks, and `---` separators. A real parser is overkill; this
@@ -1307,6 +1375,7 @@ onMounted(() => {
             relonAutocomplete(resolveCompletions),
             relonHoverTooltip,
             relonSignatureHelp,
+            relonInlayHints,
             EditorView.lineWrapping,
             viewportPad,
             updateListener,
@@ -3076,5 +3145,21 @@ watch([files, entry, argsInput], () => {
 :deep(.rp-ref-hit) {
   background: color-mix(in srgb, var(--vp-c-brand-1) 22%, transparent);
   border-radius: 2px;
+}
+
+/* Inlay-hint ghost text. Faded so it doesn't draw the eye away from
+   real source — still readable, not noisy. The italic + thin font
+   weight matches VS Code's default inlay-hint style. */
+:deep(.rp-inlay-hint) {
+  color: var(--vp-c-text-3, #999);
+  font-style: italic;
+  font-size: 0.85em;
+  opacity: 0.75;
+  margin-right: 2px;
+  padding: 0 2px;
+  border-radius: 3px;
+  background: var(--vp-c-default-soft);
+  pointer-events: none;
+  user-select: none;
 }
 </style>

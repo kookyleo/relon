@@ -877,6 +877,59 @@ fn signature_help_internal(
     })
 }
 
+/// One inlay-hint to render in the editor gutter / inline.
+/// `position_*` mark where the ghost text should sit; the CodeMirror
+/// playground passes them straight into a `Decoration.widget`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InlayHintWire {
+    pub line: u32,
+    pub character: u32,
+    pub offset: u32,
+    pub label: String,
+    pub kind: String,
+}
+
+/// Collect every inlay hint the analyzer can derive for `entry`.
+/// Cheap to run on every keystroke for typical-sized modules: a single
+/// AST walk + signature lookups. Returns an empty array when the entry
+/// can't be parsed (the playground keeps the previous hints visible
+/// rather than thrashing).
+#[wasm_bindgen]
+pub fn inlay_hints(sources: JsValue, entry: &str) -> Result<JsValue, JsValue> {
+    let sources = decode_sources(sources).map_err(err_to_js)?;
+    let result = inlay_hints_internal(&sources, entry).unwrap_or_default();
+    let serializer = serde_wasm_bindgen::Serializer::new().serialize_maps_as_objects(true);
+    result.serialize(&serializer).map_err(|err| {
+        err_to_js(ErrorReport::invalid_input(format!(
+            "inlay_hints result is not JS-serialisable: {err}"
+        )))
+    })
+}
+
+fn inlay_hints_internal(
+    sources: &HashMap<String, String>,
+    entry: &str,
+) -> Option<Vec<InlayHintWire>> {
+    let source = sources.get(entry)?;
+    let workspace = build_workspace(sources, entry, source);
+    let tree = workspace.modules.get(entry)?;
+    let root = workspace.nodes.get(entry)?;
+    Some(
+        relon_analyzer::inlay_hints::collect(root, tree)
+            .into_iter()
+            .map(|h| InlayHintWire {
+                line: h.line,
+                character: h.character,
+                offset: h.offset as u32,
+                label: h.label,
+                kind: match h.kind {
+                    relon_analyzer::inlay_hints::InlayHintKind::Parameter => "parameter".into(),
+                },
+            })
+            .collect(),
+    )
+}
+
 /// A single find-references hit. `start`/`end` mirror the LSP-style
 /// `Position` shape so the browser caller can highlight or jump
 /// without re-walking the source.

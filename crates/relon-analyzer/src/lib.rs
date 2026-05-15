@@ -40,6 +40,7 @@ pub(crate) mod generics;
 pub mod goto_def;
 pub mod hover;
 pub(crate) mod infer;
+pub mod inlay_hints;
 pub mod references;
 pub mod signature_help;
 pub(crate) mod main_return;
