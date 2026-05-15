@@ -330,9 +330,11 @@ pub fn resolve(
 /// Compute the goto-def target for a Reference's base prefix
 /// (`&root` / `&sibling` / `&uncle`). Each base resolves to a
 /// different scope frame at runtime:
-///   * `&root`    → the document's root Dict
-///   * `&sibling` → the immediately-enclosing Dict
-///   * `&uncle`   → the next Dict out from sibling
+///
+/// * `&root`    → the document's root Dict
+/// * `&sibling` → the immediately-enclosing Dict
+/// * `&uncle`   → the next Dict out from sibling
+///
 /// We mirror the runtime by scanning the AST for every Dict whose
 /// range covers the cursor, outer-to-inner, then picking the right
 /// frame by base. The jump lands on the owning *key* of that Dict

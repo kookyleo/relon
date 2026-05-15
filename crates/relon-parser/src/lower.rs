@@ -1249,7 +1249,7 @@ struct SchemaColonSplit {
 
 /// Detect the schema-colon dict-field shape `#schema Image: { ... }`
 /// (or `#schema Page<T>: { ... }`) and split it into a Bare directive
-/// + a separate `Image: { ... }` dict-field. Returns `Some(...)` when
+/// plus a separate `Image: { ... }` dict-field. Returns `Some(...)` when
 /// the directive has this shape (a NameBody directive whose CST
 /// tokens contain a COLON between the declared name IDENT and the
 /// body Expr, with no `with { ... }` block). Returns `None` for any
@@ -1307,10 +1307,8 @@ fn split_schema_colon_directive(node: &SyntaxNode, source: &str) -> Option<Schem
                     in_generics = false;
                     generics_gt_end = Some(t.text_range().end().into());
                 }
-                SyntaxKind::COLON => {
-                    if declared_name_tok.is_some() && body_expr.is_none() {
-                        saw_colon = true;
-                    }
+                SyntaxKind::COLON if declared_name_tok.is_some() && body_expr.is_none() => {
+                    saw_colon = true;
                 }
                 _ => {}
             },
@@ -2409,6 +2407,11 @@ fn lower_dict_v2(node: &SyntaxNode, source: &str) -> Option<Node> {
 
 /// What a single DICT_FIELD lowered into. Mirrors
 /// [`crate::structure::dict::DictEntry`].
+// `Pair` carries a full `Node` (and a `TokenKey` that itself can carry a
+// `Node`), so this variant dwarfs `Directives`. The enum is a transient
+// return value that's immediately destructured at the call site — boxing
+// would add an alloc per dict field without buying anything in practice.
+#[allow(clippy::large_enum_variant)]
 enum DictFieldOut {
     Pair(TokenKey, Node),
     Directives(Vec<crate::Directive>),
@@ -2474,8 +2477,7 @@ fn lower_dict_field(node: &SyntaxNode, source: &str) -> Option<DictFieldOut> {
     // when the schema name carries generics — `Page<T>` etc.
     let mut prebuilt_key: Option<TokenKey> = None;
 
-    let mut child_iter = node.children_with_tokens().peekable();
-    while let Some(el) = child_iter.next() {
+    for el in node.children_with_tokens() {
         match el {
             rowan::NodeOrToken::Token(t) => match t.kind() {
                 SyntaxKind::WHITESPACE | SyntaxKind::LINE_COMMENT | SyntaxKind::BLOCK_COMMENT => {

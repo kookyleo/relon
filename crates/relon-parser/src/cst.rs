@@ -946,8 +946,7 @@ impl<'a> Parser<'a> {
         let lhs_ck = self.checkpoint();
         self.parse_unary();
 
-        loop {
-            let Some(op) = self.current() else { break };
+        while let Some(op) = self.current() {
             let Some((lbp, rbp)) = infix_bp(op) else {
                 break;
             };
@@ -1654,10 +1653,10 @@ impl<'a> Parser<'a> {
                     | SyntaxKind::LT => {
                         bracket_depth += 1;
                     }
-                    SyntaxKind::R_BRACE | SyntaxKind::R_BRACK | SyntaxKind::GT => {
-                        if bracket_depth > 0 {
-                            bracket_depth -= 1;
-                        }
+                    SyntaxKind::R_BRACE | SyntaxKind::R_BRACK | SyntaxKind::GT
+                        if bracket_depth > 0 =>
+                    {
+                        bracket_depth -= 1;
                     }
                     _ => {}
                 }
@@ -1895,12 +1894,11 @@ impl<'a> Parser<'a> {
 
     /// `(T1, T2, ...)` tuple type. Three shapes:
     ///
-    /// * `()`         — zero-tuple.
-    /// * `(T,)`       — one-tuple (trailing comma is mandatory; without
-    ///                  it the form is a parenthesised type, not used
-    ///                  in the current grammar but still consumed as
-    ///                  a single-element TUPLE_TYPE for forward-compat).
-    /// * `(T1, T2)`   — 2+ tuple, optional trailing comma.
+    /// * `()` — zero-tuple.
+    /// * `(T,)` — one-tuple (trailing comma is mandatory; without it the
+    ///   form is a parenthesised type, not used in the current grammar but
+    ///   still consumed as a single-element TUPLE_TYPE for forward-compat).
+    /// * `(T1, T2)` — 2+ tuple, optional trailing comma.
     ///
     /// Caller has already committed to type-position via `parse_type`,
     /// so we don't have to worry about confusing this with a closure
