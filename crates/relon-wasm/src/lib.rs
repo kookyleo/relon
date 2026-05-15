@@ -302,9 +302,14 @@ fn type_name(v: &serde_json::Value) -> &'static str {
 /// `sources` is either an object `{path: content}` or an array of
 /// `{path, content}` entries. `entry` must be one of the keys. `args`
 /// is optional — pass `null`, `undefined`, omit the parameter, or pass
-/// a JS object `{name: value}` keyed by `#main(...)` parameter names.
-/// Each arg value flows through `Value`'s serde deserialiser, so the
-/// JSON shape is identical to the CLI's `--args`.
+/// a **JSON string** keyed by `#main(...)` parameter names.
+///
+/// The JSON-string shape (rather than a JS object) is deliberate: JS
+/// has only one Number type, so `JSON.parse("100.0")` collapses to the
+/// same value as `JSON.parse("100")`, and the wasm boundary loses the
+/// Int vs Float distinction the `#main(...)` signature relies on.
+/// Parsing on the Rust side with `serde_json::from_str` preserves the
+/// distinction (`100` → `Int`, `100.0` → `Float`).
 ///
 /// One entry covers both no-args scripts (root-expression evaluation)
 /// and `#main(...)` entry programs — the script's declaration is what
@@ -319,15 +324,7 @@ fn type_name(v: &serde_json::Value) -> &'static str {
 #[wasm_bindgen]
 pub fn evaluate(sources: JsValue, entry: &str, args: JsValue) -> Result<JsValue, JsValue> {
     let sources = decode_sources(sources).map_err(err_to_js)?;
-    // `undefined` / `null` → no caller-supplied args; route through
-    // `evaluate_internal` with `None` so scripts without `#main` skip
-    // the entry-bind pass entirely. An empty object behaves the same
-    // as missing for scripts that don't declare `#main`.
-    let args_opt = if args.is_undefined() || args.is_null() {
-        None
-    } else {
-        Some(decode_args(args).map_err(err_to_js)?)
-    };
+    let args_opt = decode_args_json(args).map_err(err_to_js)?;
     match evaluate_internal(&sources, entry, args_opt) {
         Ok(value) => {
             // `serde-wasm-bindgen` defaults to projecting `serde_json`
@@ -348,21 +345,47 @@ pub fn evaluate(sources: JsValue, entry: &str, args: JsValue) -> Result<JsValue,
     }
 }
 
-fn decode_args(value: JsValue) -> Result<HashMap<String, Value>, ErrorReport> {
+/// Decode the `args` parameter into an optional `HashMap`. Accepts:
+///
+///   - `null` / `undefined` / missing → `None` (no caller-supplied args)
+///   - JS string → parsed with `serde_json::from_str`, which preserves
+///     the JSON number's int-vs-float shape (`"100"` → `Int(100)`,
+///     `"100.0"` → `Float(100.0)`). This is the lossless path the
+///     playground uses to round-trip preset `defaultArgs` through to
+///     the evaluator without JS Number collapsing `.0`.
+///   - Anything else → `InvalidInput`. We intentionally don't accept a
+///     JS object here, because object-shaped input would have to pass
+///     through `serde_wasm_bindgen::from_value` and lose the Int/Float
+///     distinction at the boundary.
+fn decode_args_json(value: JsValue) -> Result<Option<HashMap<String, Value>>, ErrorReport> {
     if value.is_undefined() || value.is_null() {
-        return Ok(HashMap::new());
+        return Ok(None);
     }
-    let json: serde_json::Value = serde_wasm_bindgen::from_value(value).map_err(|err| {
-        ErrorReport::invalid_input(format!("args is not JSON-serialisable: {err}"))
+    let text = value.as_string().ok_or_else(|| {
+        ErrorReport::invalid_input(
+            "args must be a JSON string (e.g. `JSON.stringify({...})`) so int/float distinction \
+             isn't lost at the wasm boundary; pass `null` or omit for no args"
+                .to_string(),
+        )
+    })?;
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let json: serde_json::Value = serde_json::from_str(trimmed).map_err(|err| {
+        ErrorReport::invalid_input(format!("args is not valid JSON: {err}"))
     })?;
     match json {
-        serde_json::Value::Object(_) => serde_json::from_value(json).map_err(|err| {
-            ErrorReport::invalid_input(format!(
-                "args must be a JSON object keyed by `#main(...)` parameter names: {err}"
-            ))
-        }),
+        serde_json::Value::Object(_) => {
+            let map = serde_json::from_value(json).map_err(|err| {
+                ErrorReport::invalid_input(format!(
+                    "args must be a JSON object keyed by `#main(...)` parameter names: {err}"
+                ))
+            })?;
+            Ok(Some(map))
+        }
         other => Err(ErrorReport::invalid_input(format!(
-            "args: expected object, got {}",
+            "args: expected JSON object, got {}",
             type_name(&other)
         ))),
     }

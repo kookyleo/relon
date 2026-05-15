@@ -773,20 +773,24 @@ function scheduleEvaluate() {
     }, 200);
 }
 
-/// Single evaluate path. Reads the inline Args field — non-empty JSON
-/// is parsed and forwarded as the third arg; an empty field means the
-/// caller is not supplying args, which the wasm side treats as the
-/// no-args path (root-expression evaluation, or `missing_main_arg` if
-/// the script declared `#main(...)`).
+/// Single evaluate path. Reads the inline Args field and forwards the
+/// raw text (or `undefined` when empty) as the third argument to
+/// `mod.evaluate`. We deliberately do NOT `JSON.parse` here: JS
+/// Numbers have no Int/Float distinction, so `JSON.parse("100.0")`
+/// would collapse to `100` and the wasm-side `#main(Float p)`
+/// signature would reject it as Int. Letting Rust parse the string
+/// keeps the JSON number shape lossless across the boundary.
 async function runEvaluate() {
     const mod = wasmRef.value;
     if (!mod) return;
     const payload = files.value.map((f) => ({ path: f.path, content: f.content }));
-    let parsedArgs: unknown = undefined;
     const text = argsInput.value.trim();
+    // Local JSON sanity-check: catch malformed input before the wasm
+    // round-trip so the error panel shows a parser-style message
+    // pointing at the textual offset, rather than a generic wasm err.
     if (text.length > 0) {
         try {
-            parsedArgs = JSON.parse(text);
+            JSON.parse(text);
         } catch (err) {
             errors.value = [{
                 kind: 'InvalidInput',
@@ -801,7 +805,7 @@ async function runEvaluate() {
         }
     }
     try {
-        const value = mod.evaluate(payload, entry.value, parsedArgs);
+        const value = mod.evaluate(payload, entry.value, text.length > 0 ? text : undefined);
         errors.value = [];
         resultJson.value = JSON.stringify(value, null, 2);
         applyDiagnosticsForActive();
