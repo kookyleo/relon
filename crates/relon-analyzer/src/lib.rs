@@ -28,6 +28,7 @@
 pub(crate) mod ban_unsafe_types;
 pub mod cap;
 pub(crate) mod capability_check;
+pub mod code_actions;
 pub mod complete;
 pub(crate) mod const_fold;
 pub(crate) mod constraints;

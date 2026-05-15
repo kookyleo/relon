@@ -136,6 +136,18 @@ interface WasmModule {
         new_name: string
     ) => TextEditWire[];
     document_symbols: (sources: unknown, entry: string) => DocumentSymbolWire[];
+    code_actions: (
+        sources: unknown,
+        entry: string,
+        line: number,
+        character: number
+    ) => CodeActionWire[];
+}
+
+interface CodeActionWire {
+    title: string;
+    diagnostic_code: string | null;
+    edits: TextEditWire[];
 }
 
 interface DocumentSymbolWire {
@@ -1300,6 +1312,81 @@ function renameAtCursor(view: EditorView): boolean {
     return true;
 }
 
+// ---------- Quick-fix (Cmd-. / Ctrl-.) -----------------------------------
+const quickFixDialog = ref<HTMLDialogElement | null>(null);
+const quickFixItems = ref<CodeActionWire[]>([]);
+const quickFixActiveIdx = ref<number>(0);
+
+function openQuickFix(view: EditorView): boolean {
+    const mod = wasmRef.value;
+    if (!mod) return false;
+    const head = view.state.selection.main.head;
+    const lineObj = view.state.doc.lineAt(head);
+    const line = lineObj.number - 1;
+    const character = head - lineObj.from;
+    const sources = files.value.map((f) => ({ path: f.path, content: f.content }));
+    let actions: CodeActionWire[];
+    try {
+        actions = mod.code_actions(sources, activeFile.value, line, character);
+    } catch {
+        return false;
+    }
+    if (actions.length === 0) {
+        // Silent no-op rather than a noisy "no quick-fixes" toast —
+        // matches VS Code's behaviour when nothing's available.
+        return true;
+    }
+    quickFixItems.value = actions;
+    quickFixActiveIdx.value = 0;
+    const dlg = quickFixDialog.value;
+    if (!dlg) return true;
+    if (typeof dlg.showModal === 'function') dlg.showModal();
+    else dlg.setAttribute('open', '');
+    return true;
+}
+
+function closeQuickFix() {
+    const dlg = quickFixDialog.value;
+    if (!dlg) return;
+    if (typeof dlg.close === 'function') dlg.close();
+    else dlg.removeAttribute('open');
+}
+
+function applyQuickFix(action: CodeActionWire) {
+    closeQuickFix();
+    const view = editorView.value;
+    if (!view) return;
+    const docLen = view.state.doc.length;
+    const changes = action.edits
+        .map((e) => ({
+            from: Math.min(e.start_offset, docLen),
+            to: Math.min(e.end_offset, docLen),
+            insert: e.new_text,
+        }))
+        .filter((c) => c.to >= c.from)
+        .sort((a, b) => b.from - a.from);
+    view.dispatch({ changes, scrollIntoView: true });
+    view.focus();
+}
+
+function onQuickFixKeydown(e: KeyboardEvent) {
+    const list = quickFixItems.value;
+    if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        quickFixActiveIdx.value = Math.min(quickFixActiveIdx.value + 1, list.length - 1);
+    } else if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        quickFixActiveIdx.value = Math.max(quickFixActiveIdx.value - 1, 0);
+    } else if (e.key === 'Enter') {
+        e.preventDefault();
+        const target = list[quickFixActiveIdx.value];
+        if (target) applyQuickFix(target);
+    } else if (e.key === 'Escape') {
+        e.preventDefault();
+        closeQuickFix();
+    }
+}
+
 // ---------- Symbol picker (Cmd-Shift-O / Ctrl-Shift-O) -------------------
 const symbolPickerDialog = ref<HTMLDialogElement | null>(null);
 const symbolPickerQuery = ref<string>('');
@@ -1576,6 +1663,11 @@ onMounted(() => {
                     key: 'Mod-Shift-o',
                     preventDefault: true,
                     run: openSymbolPicker,
+                },
+                {
+                    key: 'Mod-.',
+                    preventDefault: true,
+                    run: openQuickFix,
                 },
             ]),
             referencesField,
@@ -1982,6 +2074,34 @@ watch([files, entry, argsInput], () => {
           <button type="submit" class="rp-dialog-btn rp-dialog-btn-primary">Create</button>
         </div>
       </form>
+    </dialog>
+
+    <dialog
+      ref="quickFixDialog"
+      class="rp-dialog rp-quick-fix"
+      @close="quickFixActiveIdx = 0"
+    >
+      <div class="rp-dialog-form" @keydown="onQuickFixKeydown" tabindex="0">
+        <h3 class="rp-dialog-title">Quick fix</h3>
+        <ul class="rp-quick-fix-list">
+          <li
+            v-for="(action, idx) in quickFixItems"
+            :key="idx"
+            class="rp-quick-fix-item"
+            :class="{ 'is-active': idx === quickFixActiveIdx }"
+            @click="applyQuickFix(action)"
+            @mouseenter="quickFixActiveIdx = idx"
+          >
+            <span class="rp-quick-fix-title">{{ action.title }}</span>
+            <span v-if="action.diagnostic_code" class="rp-quick-fix-code">
+              {{ action.diagnostic_code }}
+            </span>
+          </li>
+        </ul>
+        <div class="rp-dialog-actions">
+          <button type="button" class="rp-dialog-btn" @click="closeQuickFix">Cancel</button>
+        </div>
+      </div>
     </dialog>
 
     <dialog
@@ -3414,6 +3534,47 @@ watch([files, entry, argsInput], () => {
 :deep(.rp-ref-hit) {
   background: color-mix(in srgb, var(--vp-c-brand-1) 22%, transparent);
   border-radius: 2px;
+}
+
+/* Quick-fix dialog (Cmd-. / Ctrl-.). A flat menu of fix candidates
+   returned by `code_actions`. Auto-focusable via tabindex so arrow
+   keys / Enter work as soon as the dialog opens. */
+.rp-quick-fix {
+  min-width: 360px;
+  max-width: 80vw;
+}
+
+.rp-quick-fix-list {
+  list-style: none;
+  margin: 0 0 8px;
+  padding: 0;
+  max-height: 40vh;
+  overflow-y: auto;
+}
+
+.rp-quick-fix-item {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: baseline;
+  padding: 6px 8px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.rp-quick-fix-item.is-active {
+  background: var(--vp-c-default-soft);
+}
+
+.rp-quick-fix-title {
+  color: var(--vp-c-text-1);
+}
+
+.rp-quick-fix-code {
+  color: var(--vp-c-text-3);
+  font-family: var(--vp-font-family-mono);
+  font-size: 11px;
 }
 
 /* Symbol picker (Cmd-Shift-O). Lightweight dialog: search input on

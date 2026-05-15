@@ -877,6 +877,69 @@ fn signature_help_internal(
     })
 }
 
+/// One quick-fix candidate from the analyzer. `edits` reuses the
+/// rename text-edit shape so the JS side has one apply path.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodeActionWire {
+    pub title: String,
+    pub diagnostic_code: Option<String>,
+    pub edits: Vec<TextEditWire>,
+}
+
+/// Collect every quick-fix at `(line, character)`. Returns an empty
+/// array when no diagnostic anchors there or none of the anchored
+/// diagnostics have an automated fix today.
+#[wasm_bindgen]
+pub fn code_actions(
+    sources: JsValue,
+    entry: &str,
+    line: u32,
+    character: u32,
+) -> Result<JsValue, JsValue> {
+    let sources = decode_sources(sources).map_err(err_to_js)?;
+    let result = code_actions_internal(&sources, entry, line, character).unwrap_or_default();
+    let serializer = serde_wasm_bindgen::Serializer::new().serialize_maps_as_objects(true);
+    result.serialize(&serializer).map_err(|err| {
+        err_to_js(ErrorReport::invalid_input(format!(
+            "code_actions result is not JS-serialisable: {err}"
+        )))
+    })
+}
+
+fn code_actions_internal(
+    sources: &HashMap<String, String>,
+    entry: &str,
+    line: u32,
+    character: u32,
+) -> Option<Vec<CodeActionWire>> {
+    let source = sources.get(entry)?;
+    let workspace = build_workspace(sources, entry, source);
+    let tree = workspace.modules.get(entry)?;
+    let root = workspace.nodes.get(entry)?;
+    Some(
+        relon_analyzer::code_actions::at_position(source, root, tree, line, character)
+            .into_iter()
+            .map(|a| CodeActionWire {
+                title: a.title,
+                diagnostic_code: a.diagnostic_code,
+                edits: a
+                    .edits
+                    .into_iter()
+                    .map(|e| TextEditWire {
+                        start_line: e.range.start.line,
+                        start_character: e.range.start.column as u32,
+                        end_line: e.range.end.line,
+                        end_character: e.range.end.column as u32,
+                        start_offset: e.range.start.offset as u32,
+                        end_offset: e.range.end.offset as u32,
+                        new_text: e.new_text,
+                    })
+                    .collect(),
+            })
+            .collect(),
+    )
+}
+
 /// One outline entry returned by `document_symbols`. `parent` is an
 /// index into the same vector — `None` for top-level entries — so the
 /// caller can rebuild the tree without re-walking source. `kind` is a
