@@ -762,6 +762,11 @@ async function bootWasm() {
         wasmVersion.value = mod.version();
         isReady.value = true;
         status.value = `Ready (relon-wasm v${wasmVersion.value})`;
+        // Kick the inlay-hint plugin: it was constructed before wasm
+        // was ready and silently held an empty decoration set. Without
+        // this nudge the user has to trigger a doc change (typing or
+        // Format) before parameter-name ghost text appears.
+        editorView.value?.dispatch({ effects: refreshInlayHints.of(null) });
         await runEvaluate();
     } catch (err) {
         status.value = `Failed to load wasm runtime: ${err instanceof Error ? err.message : String(err)}`;
@@ -1497,6 +1502,12 @@ class InlayHintWidget extends WidgetType {
     ignoreEvent() { return true; }
 }
 
+/// Fires when wasm finishes loading so the inlay-hint plugin (which
+/// runs on construction *before* wasm is ready) can rebuild without
+/// waiting for a doc-change. Without this, hints stayed empty until
+/// the user typed something or hit Format.
+const refreshInlayHints = StateEffect.define<null>();
+
 /// Inlay-hint plugin. Re-runs the wasm `inlay_hints()` export on every
 /// document change and rebuilds the decoration set from scratch — the
 /// hint list for a typical playground file is tiny, so a full rebuild
@@ -1509,7 +1520,10 @@ const relonInlayHints = ViewPlugin.fromClass(
             this.decorations = this.build(view);
         }
         update(u: ViewUpdate) {
-            if (u.docChanged || u.viewportChanged) {
+            const refresh = u.transactions.some((tr) =>
+                tr.effects.some((e) => e.is(refreshInlayHints)),
+            );
+            if (u.docChanged || u.viewportChanged || refresh) {
                 this.decorations = this.build(u.view);
             }
         }
