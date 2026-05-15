@@ -122,6 +122,41 @@ interface WasmModule {
         include_declaration: boolean
     ) => ReferenceLocation[] | null;
     inlay_hints: (sources: unknown, entry: string) => InlayHintWire[];
+    prepare_rename: (
+        sources: unknown,
+        entry: string,
+        line: number,
+        character: number
+    ) => PrepareRenameResult;
+    rename_symbol: (
+        sources: unknown,
+        entry: string,
+        line: number,
+        character: number,
+        new_name: string
+    ) => TextEditWire[];
+}
+
+interface PrepareRenameResult {
+    valid: boolean;
+    error: string | null;
+    placeholder: string | null;
+    start_line: number;
+    start_character: number;
+    end_line: number;
+    end_character: number;
+    start_offset: number;
+    end_offset: number;
+}
+
+interface TextEditWire {
+    start_line: number;
+    start_character: number;
+    end_line: number;
+    end_character: number;
+    start_offset: number;
+    end_offset: number;
+    new_text: string;
 }
 
 interface InlayHintWire {
@@ -1193,6 +1228,58 @@ function findReferencesAtCursor(view: EditorView): boolean {
     return true;
 }
 
+/// F2 rename. Pops a browser `prompt()` seeded with the current
+/// identifier and applies the resulting edit list as a single
+/// transaction. Inline rename UI is a future polish — `prompt()` is
+/// blunt but ships the feature with zero new DOM. Returns true to
+/// swallow the key when the cursor is on a renamable symbol so the
+/// browser's default F2 (cycle through frames) doesn't fire.
+function renameAtCursor(view: EditorView): boolean {
+    const mod = wasmRef.value;
+    if (!mod) return false;
+    const head = view.state.selection.main.head;
+    const lineObj = view.state.doc.lineAt(head);
+    const line = lineObj.number - 1;
+    const character = head - lineObj.from;
+    const sources = files.value.map((f) => ({ path: f.path, content: f.content }));
+    let prep: PrepareRenameResult;
+    try {
+        prep = mod.prepare_rename(sources, activeFile.value, line, character);
+    } catch {
+        return false;
+    }
+    if (!prep.valid) return false;
+    const current = prep.placeholder ?? '';
+    const next = typeof window !== 'undefined'
+        ? window.prompt(`Rename "${current}" to:`, current)
+        : null;
+    if (next === null) return true;
+    const trimmed = next.trim();
+    if (trimmed === '' || trimmed === current) return true;
+    let edits: TextEditWire[];
+    try {
+        edits = mod.rename_symbol(sources, activeFile.value, line, character, trimmed);
+    } catch (err) {
+        if (typeof window !== 'undefined') {
+            window.alert(`Rename failed: ${(err as Error).message ?? err}`);
+        }
+        return true;
+    }
+    if (edits.length === 0) return true;
+    const docLen = view.state.doc.length;
+    const changes = edits
+        .map((e) => ({
+            from: Math.min(e.start_offset, docLen),
+            to: Math.min(e.end_offset, docLen),
+            insert: e.new_text,
+        }))
+        .filter((c) => c.to >= c.from)
+        // Apply in descending order so earlier offsets stay valid.
+        .sort((a, b) => b.from - a.from);
+    view.dispatch({ changes, scrollIntoView: true });
+    return true;
+}
+
 /// Widget that renders a single inlay hint inline. Atomic so caret
 /// movement crosses it in a single keystroke; not block-level so it
 /// flows with the line.
@@ -1364,6 +1451,11 @@ onMounted(() => {
                     key: 'Alt-F8',
                     preventDefault: true,
                     run: findReferencesAtCursor,
+                },
+                {
+                    key: 'F2',
+                    preventDefault: true,
+                    run: renameAtCursor,
                 },
             ]),
             referencesField,

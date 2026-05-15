@@ -877,6 +877,155 @@ fn signature_help_internal(
     })
 }
 
+/// One text replacement returned by `rename`. Coordinates are
+/// LSP-style (0-indexed line, UTF-16 character) plus the equivalent
+/// byte offsets so a browser caller can pick whichever it prefers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TextEditWire {
+    pub start_line: u32,
+    pub start_character: u32,
+    pub end_line: u32,
+    pub end_character: u32,
+    pub start_offset: u32,
+    pub end_offset: u32,
+    pub new_text: String,
+}
+
+/// Result of `prepare_rename`. `valid: false` means the cursor isn't
+/// on a renamable symbol; `error` carries the human-readable reason.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrepareRenameResult {
+    pub valid: bool,
+    pub error: Option<String>,
+    pub placeholder: Option<String>,
+    pub start_line: u32,
+    pub start_character: u32,
+    pub end_line: u32,
+    pub end_character: u32,
+    pub start_offset: u32,
+    pub end_offset: u32,
+}
+
+/// Probe whether the cursor is on a renamable symbol and, if so, return
+/// the range whose text would be replaced. The playground uses this to
+/// seed an inline rename input — failing fast gives clearer UX than a
+/// silent no-op.
+#[wasm_bindgen]
+pub fn prepare_rename(
+    sources: JsValue,
+    entry: &str,
+    line: u32,
+    character: u32,
+) -> Result<JsValue, JsValue> {
+    let sources = decode_sources(sources).map_err(err_to_js)?;
+    let result = prepare_rename_internal(&sources, entry, line, character);
+    let serializer = serde_wasm_bindgen::Serializer::new().serialize_maps_as_objects(true);
+    result.serialize(&serializer).map_err(|err| {
+        err_to_js(ErrorReport::invalid_input(format!(
+            "prepare_rename result is not JS-serialisable: {err}"
+        )))
+    })
+}
+
+fn prepare_rename_internal(
+    sources: &HashMap<String, String>,
+    entry: &str,
+    line: u32,
+    character: u32,
+) -> PrepareRenameResult {
+    let invalid = |msg: String| PrepareRenameResult {
+        valid: false,
+        error: Some(msg),
+        placeholder: None,
+        start_line: 0,
+        start_character: 0,
+        end_line: 0,
+        end_character: 0,
+        start_offset: 0,
+        end_offset: 0,
+    };
+    let Some(source) = sources.get(entry) else {
+        return invalid(format!("entry `{entry}` not found in sources"));
+    };
+    let workspace = build_workspace(sources, entry, source);
+    let (Some(tree), Some(root)) = (workspace.modules.get(entry), workspace.nodes.get(entry))
+    else {
+        return invalid(format!("entry `{entry}` did not analyse"));
+    };
+    match relon_analyzer::rename::prepare(source, root, tree, line, character) {
+        Ok(range) => {
+            let placeholder = source
+                .get(range.start.offset..range.end.offset)
+                .map(|s| s.to_string());
+            PrepareRenameResult {
+                valid: true,
+                error: None,
+                placeholder,
+                start_line: range.start.line,
+                start_character: range.start.column as u32,
+                end_line: range.end.line,
+                end_character: range.end.column as u32,
+                start_offset: range.start.offset as u32,
+                end_offset: range.end.offset as u32,
+            }
+        }
+        Err(err) => invalid(format!("{err:?}")),
+    }
+}
+
+/// Compute the edit list for renaming the symbol at `(line, character)`
+/// to `new_name`. Returns a structured `ErrorReport` (kind = InvalidInput)
+/// on failure so the playground can surface the reason in a toast.
+#[wasm_bindgen]
+pub fn rename_symbol(
+    sources: JsValue,
+    entry: &str,
+    line: u32,
+    character: u32,
+    new_name: &str,
+) -> Result<JsValue, JsValue> {
+    let sources = decode_sources(sources).map_err(err_to_js)?;
+    let source = sources
+        .get(entry)
+        .ok_or_else(|| {
+            err_to_js(ErrorReport::invalid_input(format!(
+                "entry `{entry}` not found in sources"
+            )))
+        })?
+        .clone();
+    let workspace = build_workspace(&sources, entry, &source);
+    let tree = workspace.modules.get(entry).ok_or_else(|| {
+        err_to_js(ErrorReport::invalid_input(format!(
+            "entry `{entry}` did not analyse"
+        )))
+    })?;
+    let root = workspace.nodes.get(entry).ok_or_else(|| {
+        err_to_js(ErrorReport::invalid_input(format!(
+            "entry `{entry}` did not analyse"
+        )))
+    })?;
+    let edits = relon_analyzer::rename::execute(&source, root, tree, line, character, new_name)
+        .map_err(|err| err_to_js(ErrorReport::invalid_input(format!("{err:?}"))))?;
+    let wire: Vec<TextEditWire> = edits
+        .into_iter()
+        .map(|e| TextEditWire {
+            start_line: e.range.start.line,
+            start_character: e.range.start.column as u32,
+            end_line: e.range.end.line,
+            end_character: e.range.end.column as u32,
+            start_offset: e.range.start.offset as u32,
+            end_offset: e.range.end.offset as u32,
+            new_text: e.new_text,
+        })
+        .collect();
+    let serializer = serde_wasm_bindgen::Serializer::new().serialize_maps_as_objects(true);
+    wire.serialize(&serializer).map_err(|err| {
+        err_to_js(ErrorReport::invalid_input(format!(
+            "rename result is not JS-serialisable: {err}"
+        )))
+    })
+}
+
 /// One inlay-hint to render in the editor gutter / inline.
 /// `position_*` mark where the ghost text should sit; the CodeMirror
 /// playground passes them straight into a `Decoration.widget`.

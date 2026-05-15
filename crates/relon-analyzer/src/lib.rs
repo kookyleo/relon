@@ -42,6 +42,7 @@ pub mod hover;
 pub(crate) mod infer;
 pub mod inlay_hints;
 pub mod references;
+pub mod rename;
 pub mod signature_help;
 pub(crate) mod main_return;
 pub mod main_sig;
