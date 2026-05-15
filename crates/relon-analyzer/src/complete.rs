@@ -131,11 +131,9 @@ pub fn resolve_recovering(
             }
         }
         CursorContext::Member { head, .. } => {
-            // Member access without a workspace tree — best we can do
-            // is suggest from any visible Dict pairs whose key matches
-            // the head, but that's noisy. Skip; the workspace-aware
-            // `resolve` handles it once the file parses cleanly.
-            let _ = head;
+            if let Some(root) = partial_root {
+                push_member_candidates_partial(&mut items, root, head, offset);
+            }
         }
         CursorContext::Bare { .. } => {
             if let Some(root) = partial_root {
@@ -550,6 +548,93 @@ fn push_decorator_candidates(items: &mut Vec<CompletionItem>, root: &Node, offse
 /// `lib.X` completion. `head` is the segment before the dot; we look
 /// it up in `tree.imports` and, when it's an alias for another module,
 /// pull that module's top-level dict pair keys out of `workspace`.
+/// Partial-AST member-access completion. When the user types
+/// `name.│`, walk the AST from the root toward the cursor looking
+/// for a Dict pair whose key is `head`. If the matching value is
+/// itself a Dict, surface every key as a Field / Method candidate.
+/// Falls back silently when `head` doesn't resolve — the caller
+/// won't see noise from speculative siblings.
+fn push_member_candidates_partial(
+    items: &mut Vec<CompletionItem>,
+    root: &Node,
+    head: &str,
+    offset: usize,
+) {
+    if let Some(target) = find_named_in_scope(root, head, offset) {
+        if let Expr::Dict(pairs) = &*target.expr {
+            for (key, value) in pairs {
+                if let TokenKey::String(name, _, _) = key {
+                    let kind = if matches!(&*value.expr, Expr::Closure { .. }) {
+                        CompletionKind::Method
+                    } else {
+                        CompletionKind::Field
+                    };
+                    let detail = if matches!(kind, CompletionKind::Method) {
+                        Some("method".to_string())
+                    } else {
+                        Some("field".to_string())
+                    };
+                    items.push(CompletionItem {
+                        label: name.clone(),
+                        kind,
+                        detail,
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// Search the AST from `root` for a Dict pair whose key matches
+/// `name`, visible from the cursor at `offset`. Walks outward from
+/// the innermost enclosing scope so a closer sibling shadows a
+/// farther one — same scoping rules as `walk_scope` reads.
+fn find_named_in_scope<'a>(root: &'a Node, name: &str, offset: usize) -> Option<&'a Node> {
+    // Inner: visit `node` if it covers the cursor, descending into
+    // whichever child contains the offset; on the way back up, check
+    // each enclosing Dict's pairs. Returns the closest matching pair
+    // value.
+    fn visit<'a>(node: &'a Node, name: &str, offset: usize) -> Option<&'a Node> {
+        if !node_covers(node, offset) {
+            return None;
+        }
+        // Descend first so inner scopes return their match before the
+        // outer scope is consulted.
+        if let Expr::Dict(pairs) = &*node.expr {
+            for (_, value) in pairs {
+                if let Some(inner) = visit(value, name, offset) {
+                    return Some(inner);
+                }
+            }
+            for (key, value) in pairs {
+                if let TokenKey::String(k, _, _) = key {
+                    if k == name {
+                        return Some(value);
+                    }
+                }
+            }
+            return None;
+        }
+        if let Expr::Closure { body, .. } = &*node.expr {
+            if let Some(inner) = visit(body, name, offset) {
+                return Some(inner);
+            }
+            return None;
+        }
+        // Generic descent for everything else.
+        for child in children_of(node) {
+            if let Some(inner) = visit(child, name, offset) {
+                return Some(inner);
+            }
+        }
+        None
+    }
+    fn node_covers(node: &Node, offset: usize) -> bool {
+        node.range.start.offset <= offset && offset <= node.range.end.offset
+    }
+    visit(root, name, offset)
+}
+
 fn push_member_candidates(
     items: &mut Vec<CompletionItem>,
     head: &str,
@@ -805,5 +890,93 @@ mod tests {
         assert!(names.contains(&"currency".to_string()), "{names:?}");
         assert!(names.contains(&"a".to_string()), "{names:?}");
         assert!(names.contains(&"b".to_string()), "{names:?}");
+    }
+
+    fn complete_recovering(source: &str, line: u32, character: u32) -> Vec<CompletionItem> {
+        let parsed = relon_parser::parse_document_recovering(source);
+        resolve_recovering(source, &parsed, line, character)
+    }
+
+    #[test]
+    fn recovering_at_decorator_surfaces_sibling_closures() {
+        // The original user complaint: typing `@` inside a dict with
+        // sibling closures should surface those closures as decorator
+        // candidates, not return empty.
+        let src = "{\n    fmt(v): v + 1,\n    @\n    name: \"x\"\n}\n";
+        // Cursor right after the `@` on line 2 (UTF-16 character index).
+        let items = complete_recovering(src, 2, 5);
+        let decorators = labels_with_kind(&items, CompletionKind::Decorator);
+        assert!(
+            decorators.contains(&"fmt".to_string()),
+            "expected `fmt` sibling closure as decorator candidate, got {decorators:?}"
+        );
+    }
+
+    #[test]
+    fn recovering_at_hash_surfaces_directive_names() {
+        // Standalone `#` mid-edit — should always offer the full
+        // directive set even without a partial AST root.
+        let src = "#";
+        let items = complete_recovering(src, 0, 1);
+        let dirs = labels_with_kind(&items, CompletionKind::Directive);
+        assert!(dirs.contains(&"schema".to_string()), "{dirs:?}");
+        assert!(dirs.contains(&"import".to_string()), "{dirs:?}");
+    }
+
+    #[test]
+    fn recovering_at_amp_surfaces_reference_bases() {
+        let src = "&";
+        let items = complete_recovering(src, 0, 1);
+        let refs = labels_with_kind(&items, CompletionKind::Reference);
+        assert!(refs.contains(&"root".to_string()), "{refs:?}");
+        assert!(refs.contains(&"sibling".to_string()), "{refs:?}");
+    }
+
+    #[test]
+    fn recovering_member_dot_surfaces_dict_keys() {
+        // User types `parent.│` where `parent` is a sibling dict.
+        // The partial-AST member walker should surface `parent`'s
+        // keys (one closure → Method, one literal → Field).
+        let src = "{\n    parent: {\n        greet(): \"hi\",\n        nickname: \"jojo\"\n    },\n    child: parent.\n}\n";
+        // Cursor immediately after the `parent.` on line 5 (0-indexed),
+        // character 18 = end of `    child: parent.`.
+        let items = complete_recovering(src, 5, 18);
+        let names = labels(&items);
+        assert!(
+            names.contains(&"greet".to_string()),
+            "expected `greet` method via member access, got {names:?}"
+        );
+        assert!(
+            names.contains(&"nickname".to_string()),
+            "expected `nickname` field via member access, got {names:?}"
+        );
+    }
+
+    #[test]
+    fn recovering_fstring_interp_sees_scope() {
+        // Inside `${...}`, scope candidates (siblings, closure params)
+        // should be available — same as bare context.
+        let src = "{\n    name: \"world\",\n    greeting: f\"hi ${\n}\n";
+        // Cursor right after the `${` on line 2 (UTF-16 index 19).
+        let items = complete_recovering(src, 2, 19);
+        let names = labels(&items);
+        assert!(
+            names.contains(&"name".to_string()),
+            "expected sibling `name` inside f-string interp, got {names:?}"
+        );
+    }
+
+    #[test]
+    fn recovering_bare_inside_dict_surfaces_siblings() {
+        // Mid-edit dict with a partially typed identifier as a value.
+        let src = "{\n    foo: 1,\n    bar: 2,\n    baz: f\n}\n";
+        // Cursor right after the `f` on line 3.
+        let items = complete_recovering(src, 3, 10);
+        let names = labels(&items);
+        assert!(
+            names.contains(&"foo".to_string()),
+            "expected sibling `foo` in bare scope, got {names:?}"
+        );
+        assert!(names.contains(&"bar".to_string()), "{names:?}");
     }
 }
