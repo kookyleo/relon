@@ -92,6 +92,11 @@ enum CursorContext {
     /// Bare identifier completion — the default. `prefix` is the
     /// in-progress word, used only as the human-visible filter hint.
     Bare { prefix: String },
+    /// Cursor sits in a type-expression slot: inside generic args
+    /// (`Foo<│>`), after a closure return arrow (`(p) -> │`), or
+    /// after a typed-spread star (`*│`). Suggest primitive type
+    /// names, in-scope schema names, and visible generic type vars.
+    Type { prefix: String },
 }
 
 /// Partial-AST completion entry point. Drives IDE completion when
@@ -138,8 +143,16 @@ pub fn resolve_recovering(
         CursorContext::Bare { .. } => {
             if let Some(root) = partial_root {
                 push_scope_candidates_partial(&mut items, root, offset);
+                push_schema_candidates_partial(&mut items, root);
             }
             push_stdlib_candidates(&mut items);
+        }
+        CursorContext::Type { .. } => {
+            push_type_primitive_candidates(&mut items);
+            if let Some(root) = partial_root {
+                push_schema_candidates_partial(&mut items, root);
+                push_generic_var_candidates_partial(&mut items, root, offset);
+            }
         }
     }
 
@@ -210,6 +223,11 @@ pub fn resolve(
             push_schema_candidates(&mut items, entry_tree);
             push_import_binding_candidates(&mut items, entry_tree);
         }
+        CursorContext::Type { .. } => {
+            push_type_primitive_candidates(&mut items);
+            push_schema_candidates(&mut items, entry_tree);
+            push_generic_var_candidates_partial(&mut items, entry_root, offset);
+        }
     }
 
     // Dedupe while preserving order — keys may be inserted by multiple
@@ -241,6 +259,15 @@ fn classify_cursor(source: &str, offset: usize) -> CursorContext {
         Some(b'#') => CursorContext::Directive { prefix: suffix },
         Some(b'@') => CursorContext::Decorator { prefix: suffix },
         Some(b'&') => CursorContext::Reference { prefix: suffix },
+        Some(b'<') if preceded_by_type_head(bytes, word_start - 1) => {
+            CursorContext::Type { prefix: suffix }
+        }
+        Some(b',') if inside_generic_args(bytes, word_start - 1) => {
+            CursorContext::Type { prefix: suffix }
+        }
+        Some(b'*') if at_field_start(bytes, word_start - 1) => {
+            CursorContext::Type { prefix: suffix }
+        }
         Some(b'.') => {
             // Walk back past the dot to grab the head identifier.
             let dot_pos = word_start - 1;
@@ -264,8 +291,73 @@ fn classify_cursor(source: &str, offset: usize) -> CursorContext {
                 }
             }
         }
+        _ if after_arrow(bytes, word_start) => CursorContext::Type { prefix: suffix },
         _ => CursorContext::Bare { prefix: suffix },
     }
+}
+
+/// `<` is a generic-args opener when the byte just before it is an
+/// identifier byte. Differentiates `Foo<│>` from `<` as a less-than
+/// operator in arithmetic context — the latter has a number / closing
+/// paren / space + identifier just before, not the bare identifier
+/// tail required for a type head.
+fn preceded_by_type_head(bytes: &[u8], lt_pos: usize) -> bool {
+    if lt_pos == 0 {
+        return false;
+    }
+    is_ident_byte(bytes[lt_pos - 1])
+}
+
+/// Track whether the cursor sits inside an unbalanced `<...>` opened
+/// by a type head. Walks backward balancing `<` / `>` and giving up
+/// when an unrelated delimiter (newline, `{`, `}`, `;`) appears
+/// before finding the opener — those mark a non-generic context.
+fn inside_generic_args(bytes: &[u8], comma_pos: usize) -> bool {
+    let mut depth: i32 = 0;
+    let mut i = comma_pos;
+    while i > 0 {
+        i -= 1;
+        match bytes[i] {
+            b'>' => depth += 1,
+            b'<' => {
+                if depth == 0 {
+                    return preceded_by_type_head(bytes, i);
+                }
+                depth -= 1;
+            }
+            b'\n' | b'{' | b'}' | b';' => return false,
+            _ => {}
+        }
+    }
+    false
+}
+
+/// `*` is a typed-spread marker when it sits at the head of a dict
+/// or list field — i.e. the preceding non-whitespace byte is `,`,
+/// `{`, `[`, or the start of the file. Inside an expression `*`
+/// would be a binary operator and gets routed to Bare context.
+fn at_field_start(bytes: &[u8], star_pos: usize) -> bool {
+    let mut i = star_pos;
+    while i > 0 {
+        i -= 1;
+        match bytes[i] {
+            b' ' | b'\t' | b'\n' | b'\r' => continue,
+            b',' | b'{' | b'[' | b'(' => return true,
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// Detect the `->` arrow position (closure return type). The cursor
+/// has just passed any whitespace following the `->`; we walk back
+/// over that whitespace and look for the two-byte arrow.
+fn after_arrow(bytes: &[u8], word_start: usize) -> bool {
+    let mut i = word_start;
+    while i > 0 && (bytes[i - 1] == b' ' || bytes[i - 1] == b'\t') {
+        i -= 1;
+    }
+    i >= 2 && &bytes[i - 2..i] == b"->"
 }
 
 fn is_ident_byte(b: u8) -> bool {
@@ -411,6 +503,80 @@ fn contains_offset(node: &Node, offset: usize) -> bool {
 // =====================================================================
 // Other category sources.
 // =====================================================================
+
+/// Primitive type names available everywhere. Surfaced in Type
+/// context and as supplementary candidates in Bare so the user gets
+/// type completion regardless of whether the byte-level classifier
+/// caught the slot — capital-letter prefix filtering on the client
+/// keeps the list focused.
+fn push_type_primitive_candidates(items: &mut Vec<CompletionItem>) {
+    for name in &[
+        "Null", "Bool", "Int", "Float", "String", "List", "Dict",
+    ] {
+        items.push(CompletionItem {
+            label: (*name).into(),
+            kind: CompletionKind::Schema,
+            detail: Some("primitive".into()),
+        });
+    }
+}
+
+/// Schema names visible in a partial AST. Walks `node.directives`
+/// for `#schema X[<T, ...>]` declarations and emits each as a Schema
+/// candidate. The strict path uses `push_schema_candidates` against
+/// the workspace-analyzed tree instead.
+fn push_schema_candidates_partial(items: &mut Vec<CompletionItem>, root: &Node) {
+    use relon_parser::DirectiveBody;
+    fn visit(node: &Node, items: &mut Vec<CompletionItem>) {
+        for dir in &node.directives {
+            if dir.name == "schema" {
+                if let DirectiveBody::NameBody { name, .. } = &dir.body {
+                    items.push(CompletionItem {
+                        label: name.clone(),
+                        kind: CompletionKind::Schema,
+                        detail: Some("schema".into()),
+                    });
+                }
+            }
+        }
+        for child in children_of(node) {
+            visit(child, items);
+        }
+    }
+    visit(root, items);
+}
+
+/// Generic type variables visible at the cursor. A `#schema X<T, U>`
+/// puts `T` and `U` in scope inside the schema body; the partial
+/// walker harvests them whenever the cursor sits inside the schema's
+/// range. Helps complete things like `Result<│>`.
+fn push_generic_var_candidates_partial(
+    items: &mut Vec<CompletionItem>,
+    root: &Node,
+    offset: usize,
+) {
+    use relon_parser::DirectiveBody;
+    fn visit(node: &Node, offset: usize, items: &mut Vec<CompletionItem>) {
+        if node.range.start.offset > offset || offset > node.range.end.offset {
+            return;
+        }
+        for dir in &node.directives {
+            if let DirectiveBody::NameBody { generics, .. } = &dir.body {
+                for g in generics {
+                    items.push(CompletionItem {
+                        label: g.clone(),
+                        kind: CompletionKind::Schema,
+                        detail: Some("type var".into()),
+                    });
+                }
+            }
+        }
+        for child in children_of(node) {
+            visit(child, offset, items);
+        }
+    }
+    visit(root, offset, items);
+}
 
 fn push_stdlib_candidates(items: &mut Vec<CompletionItem>) {
     for name in stdlib_fn_names() {
@@ -963,6 +1129,48 @@ mod tests {
         assert!(
             names.contains(&"name".to_string()),
             "expected sibling `name` inside f-string interp, got {names:?}"
+        );
+    }
+
+    #[test]
+    fn recovering_generic_args_surfaces_primitives_and_schemas() {
+        // Cursor inside `Foo<│>` — should surface primitives + any
+        // visible schema names.
+        let src = "#schema Box<T> T\n\n{\n    items: Foo<\n}\n";
+        // Cursor right after the `<` on line 3, character 16.
+        let items = complete_recovering(src, 3, 16);
+        let names = labels(&items);
+        assert!(
+            names.contains(&"String".to_string()),
+            "expected primitive `String` in generic args, got {names:?}"
+        );
+        assert!(
+            names.contains(&"Int".to_string()),
+            "{names:?}"
+        );
+    }
+
+    #[test]
+    fn recovering_closure_return_after_arrow_surfaces_types() {
+        // `(x) -> │` — closure return type position.
+        let src = "{\n    f: (x) -> \n}\n";
+        let items = complete_recovering(src, 1, 16);
+        let names = labels(&items);
+        assert!(
+            names.contains(&"String".to_string()),
+            "expected `String` after `->`, got {names:?}"
+        );
+    }
+
+    #[test]
+    fn recovering_typed_spread_after_star_surfaces_types() {
+        // `{ *│ }` — typed-spread head position.
+        let src = "{\n    *\n}\n";
+        let items = complete_recovering(src, 1, 5);
+        let names = labels(&items);
+        assert!(
+            names.contains(&"Int".to_string()),
+            "expected `Int` after `*`, got {names:?}"
         );
     }
 
