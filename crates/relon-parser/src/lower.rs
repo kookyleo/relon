@@ -1250,11 +1250,11 @@ struct SchemaColonSplit {
 /// Detect the schema-colon dict-field shape `#schema Image: { ... }`
 /// (or `#schema Page<T>: { ... }`) and split it into a Bare directive
 /// + a separate `Image: { ... }` dict-field. Returns `Some(...)` when
-/// the directive has this shape (a NameBody directive whose CST
-/// tokens contain a COLON between the declared name IDENT and the
-/// body Expr, with no `with { ... }` block). Returns `None` for any
-/// other directive shape — caller proceeds with the regular
-/// directive walker.
+///   the directive has this shape (a NameBody directive whose CST
+///   tokens contain a COLON between the declared name IDENT and the
+///   body Expr, with no `with { ... }` block). Returns `None` for any
+///   other directive shape — caller proceeds with the regular
+///   directive walker.
 fn split_schema_colon_directive(node: &SyntaxNode, source: &str) -> Option<SchemaColonSplit> {
     // Quick filter: only `#schema` / `#extend` (the NameBody shapes)
     // can take this form. Read the directive name.
@@ -2409,6 +2409,14 @@ fn lower_dict_v2(node: &SyntaxNode, source: &str) -> Option<Node> {
 
 /// What a single DICT_FIELD lowered into. Mirrors
 /// [`crate::structure::dict::DictEntry`].
+///
+/// The `Pair` variant is intentionally large (TokenKey + full Node tree)
+/// — boxing it would just relocate the heap pressure rather than reduce
+/// total alloc; the enum is only ever held briefly inside
+/// [`lower_dict_field`]'s return and immediately destructured, so the
+/// size difference between variants does not propagate through any
+/// long-lived container.
+#[allow(clippy::large_enum_variant)]
 enum DictFieldOut {
     Pair(TokenKey, Node),
     Directives(Vec<crate::Directive>),
@@ -2474,8 +2482,8 @@ fn lower_dict_field(node: &SyntaxNode, source: &str) -> Option<DictFieldOut> {
     // when the schema name carries generics — `Page<T>` etc.
     let mut prebuilt_key: Option<TokenKey> = None;
 
-    let mut child_iter = node.children_with_tokens().peekable();
-    while let Some(el) = child_iter.next() {
+    let child_iter = node.children_with_tokens();
+    for el in child_iter {
         match el {
             rowan::NodeOrToken::Token(t) => match t.kind() {
                 SyntaxKind::WHITESPACE | SyntaxKind::LINE_COMMENT | SyntaxKind::BLOCK_COMMENT => {
