@@ -86,8 +86,7 @@ interface WasmModule {
     // the legacy positional shape still works but logs a deprecation
     // warning. We pass an object to keep the console clean.
     default: (init?: { module_or_path?: unknown }) => Promise<unknown>;
-    evaluate: (sources: unknown, entry: string) => unknown;
-    evaluate_main: (sources: unknown, entry: string, args: unknown) => unknown;
+    evaluate: (sources: unknown, entry: string, args?: unknown) => unknown;
     format: (content: string) => string;
     version: () => string;
     goto_definition: (
@@ -470,7 +469,7 @@ function selectFile(path: string) {
 
 function setEntry(path: string) {
     entry.value = path;
-    runActive();
+    void runEvaluate();
 }
 
 function openNewFileDialog() {
@@ -596,19 +595,6 @@ function closeArgsDialog() {
     }
 }
 
-// Unified Run entrypoint behind the toolbar button. Any non-empty
-// `argsInput` routes through `runWithArgs` so the committed JSON is
-// honoured — regardless of whether the source is a sandbox preset or
-// a user workspace. Empty args fall back to the no-arg `runEvaluate`
-// path (which is also what auto-run uses on every edit).
-function runActive() {
-    if (argsInput.value.trim()) {
-        void runWithArgs();
-    } else {
-        void runEvaluate();
-    }
-}
-
 function confirmArgs() {
     // Validate parse-ability so the inline field can confidently show
     // the compact projection. Empty draft means "no args" and is fine.
@@ -645,14 +631,12 @@ function loadPreset(id: string) {
             changes: { from: 0, to: view.state.doc.length, insert: preset.files[0].content },
         });
     }
-    // Evaluate against the new payload. For non-sandbox-runnable presets
-    // this surfaces a genuine `EvalError` / `AnalyzeError`, which is the
-    // demo-correct behaviour; the context hint inside the error panel
-    // explains why and points at the CLI. Routing through `runActive`
-    // honours the preset's `defaultArgs` — without it, an entry that
-    // declares `#main(...)` always errored with `missing_main_arg`
-    // until the user manually clicked the toolbar Run.
-    runActive();
+    // Evaluate against the new payload. `runEvaluate` reads the inline
+    // Args field, so a preset with `defaultArgs` populates correctly
+    // without a second dispatch. For non-sandbox-runnable presets this
+    // surfaces a genuine `EvalError` / `AnalyzeError` — demo-correct
+    // behaviour explained by the error panel's context hint.
+    void runEvaluate();
 }
 
 function selectWorkspace(id: string) {
@@ -670,7 +654,7 @@ function selectWorkspace(id: string) {
             changes: { from: 0, to: view.state.doc.length, insert: files.value[0].content },
         });
     }
-    runActive();
+    void runEvaluate();
 }
 
 function openNewWorkspaceDialog() {
@@ -739,7 +723,7 @@ function removeFile(path: string) {
     files.value.splice(idx, 1);
     if (entry.value === path) entry.value = files.value[0].path;
     if (activeFile.value === path) selectFile(files.value[0].path);
-    runActive();
+    void runEvaluate();
 }
 
 // ---------------- wasm boot ----------------------------------------------
@@ -770,7 +754,7 @@ async function bootWasm() {
         // this nudge the user has to trigger a doc change (typing or
         // Format) before parameter-name ghost text appears.
         editorView.value?.dispatch({ effects: refreshInlayHints.of(null) });
-        runActive();
+        void runEvaluate();
     } catch (err) {
         status.value = `Failed to load wasm runtime: ${err instanceof Error ? err.message : String(err)}`;
         console.error('[playground] wasm boot failed', err);
@@ -785,41 +769,16 @@ function scheduleEvaluate() {
     if (evalTimer !== null) clearTimeout(evalTimer);
     evalTimer = setTimeout(() => {
         evalTimer = null;
-        runActive();
+        void runEvaluate();
     }, 200);
 }
 
+/// Single evaluate path. Reads the inline Args field — non-empty JSON
+/// is parsed and forwarded as the third arg; an empty field means the
+/// caller is not supplying args, which the wasm side treats as the
+/// no-args path (root-expression evaluation, or `missing_main_arg` if
+/// the script declared `#main(...)`).
 async function runEvaluate() {
-    const mod = wasmRef.value;
-    if (!mod) return;
-    const payload = files.value.map((f) => ({ path: f.path, content: f.content }));
-    try {
-        const value = mod.evaluate(payload, entry.value);
-        errors.value = [];
-        resultJson.value = JSON.stringify(value, null, 2);
-        applyDiagnosticsForActive();
-    } catch (raw) {
-        const report = coerceErrorReport(raw);
-        errors.value = [report];
-        resultJson.value = '';
-        errorsExpanded.value = true;
-        applyDiagnosticsForActive();
-    }
-    if (jsonView.value) {
-        jsonView.value.dispatch({
-            changes: { from: 0, to: jsonView.value.state.doc.length, insert: resultJson.value },
-        });
-    }
-}
-
-/// Run the entry through `evaluate_main`, feeding it the user-supplied
-/// args JSON. Called by `runActive` whenever the inline Args field is
-/// non-empty, including from `scheduleEvaluate` after edits — so a
-/// `#main(...)` script that has args declared sees the args path on
-/// every keystroke. When the user clears the field, auto-eval falls
-/// back to the no-arg `runEvaluate`, which lets `missing_main_arg`
-/// surface live as a teaching aid.
-async function runWithArgs() {
     const mod = wasmRef.value;
     if (!mod) return;
     const payload = files.value.map((f) => ({ path: f.path, content: f.content }));
@@ -842,7 +801,7 @@ async function runWithArgs() {
         }
     }
     try {
-        const value = mod.evaluate_main(payload, entry.value, parsedArgs);
+        const value = mod.evaluate(payload, entry.value, parsedArgs);
         errors.value = [];
         resultJson.value = JSON.stringify(value, null, 2);
         applyDiagnosticsForActive();
@@ -1842,7 +1801,7 @@ watch([files, entry, argsInput], () => {
           :disabled="!isReady"
           :title="activePreset.runnableInSandbox ? 'Evaluate' : 'Evaluate with the args JSON above'"
           aria-label="Run"
-          @click="runActive"
+          @click="runEvaluate"
         >
           <svg viewBox="0 0 10 10" width="12" height="12" aria-hidden="true" class="rp-run-icon">
             <path

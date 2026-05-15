@@ -300,15 +300,35 @@ fn type_name(v: &serde_json::Value) -> &'static str {
 /// projected JSON result.
 ///
 /// `sources` is either an object `{path: content}` or an array of
-/// `{path, content}` entries. `entry` must be one of the keys.
+/// `{path, content}` entries. `entry` must be one of the keys. `args`
+/// is optional — pass `null`, `undefined`, omit the parameter, or pass
+/// a JS object `{name: value}` keyed by `#main(...)` parameter names.
+/// Each arg value flows through `Value`'s serde deserialiser, so the
+/// JSON shape is identical to the CLI's `--args`.
+///
+/// One entry covers both no-args scripts (root-expression evaluation)
+/// and `#main(...)` entry programs — the script's declaration is what
+/// decides which path runs, not the caller. A script that declares
+/// `#main(...)` and receives no args (or args missing a parameter)
+/// still surfaces `relon::eval::missing_main_arg` as the live teaching
+/// signal it always did.
 ///
 /// Returns a JS value: on success the projected JSON (a plain object /
 /// array / scalar); on failure a JS error whose payload is an
 /// [`ErrorReport`] JSON value.
 #[wasm_bindgen]
-pub fn evaluate(sources: JsValue, entry: &str) -> Result<JsValue, JsValue> {
+pub fn evaluate(sources: JsValue, entry: &str, args: JsValue) -> Result<JsValue, JsValue> {
     let sources = decode_sources(sources).map_err(err_to_js)?;
-    match evaluate_internal(&sources, entry, None) {
+    // `undefined` / `null` → no caller-supplied args; route through
+    // `evaluate_internal` with `None` so scripts without `#main` skip
+    // the entry-bind pass entirely. An empty object behaves the same
+    // as missing for scripts that don't declare `#main`.
+    let args_opt = if args.is_undefined() || args.is_null() {
+        None
+    } else {
+        Some(decode_args(args).map_err(err_to_js)?)
+    };
+    match evaluate_internal(&sources, entry, args_opt) {
         Ok(value) => {
             // `serde-wasm-bindgen` defaults to projecting `serde_json`
             // objects as JS `Map` instances, which surprises every JS
@@ -317,31 +337,6 @@ pub fn evaluate(sources: JsValue, entry: &str) -> Result<JsValue, JsValue> {
             // which is also what the README-documented contract implies
             // ("projected JSON result"). Flip the flag on the serializer
             // so maps round-trip as `{...}`.
-            let serializer = serde_wasm_bindgen::Serializer::new().serialize_maps_as_objects(true);
-            value.serialize(&serializer).map_err(|err| {
-                err_to_js(ErrorReport::invalid_input(format!(
-                    "result is not JS-serialisable: {err}"
-                )))
-            })
-        }
-        Err(report) => Err(err_to_js(report)),
-    }
-}
-
-/// Evaluate `entry` as an entry program: validate `args` against the
-/// file's `#main(...)` signature and bind each parameter before running
-/// the body. Counterpart to the CLI's `--args` path.
-///
-/// `args` accepts either a JS object `{name: value}` (most common, as
-/// JS callers can `JSON.parse` the user's input themselves) or `null`/
-/// `undefined` for an empty map. Each value is fed through `Value`'s
-/// serde deserialiser, so the JSON shape is identical to the CLI.
-#[wasm_bindgen]
-pub fn evaluate_main(sources: JsValue, entry: &str, args: JsValue) -> Result<JsValue, JsValue> {
-    let sources = decode_sources(sources).map_err(err_to_js)?;
-    let args = decode_args(args).map_err(err_to_js)?;
-    match evaluate_internal(&sources, entry, Some(args)) {
-        Ok(value) => {
             let serializer = serde_wasm_bindgen::Serializer::new().serialize_maps_as_objects(true);
             value.serialize(&serializer).map_err(|err| {
                 err_to_js(ErrorReport::invalid_input(format!(
