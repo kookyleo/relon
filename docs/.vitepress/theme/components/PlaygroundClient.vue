@@ -2744,16 +2744,28 @@ watch([files, entry, argsInput], () => {
    collapses to the tallest child, and the framed Format button being
    ~2px taller than a bare `.rp-tab` left the right pane sitting
    higher. Children opt out of stretch with `align-self` if they want
-   their own visual height. */
+   their own visual height.
+
+   The scrollbar is intentionally hidden: `overflow-x: auto` lets the
+   tab row scroll horizontally when many files are open, but a visible
+   scrollbar would also claim some of the row's height — and only do
+   so on the pane whose tabs overflow, leaving the left/right toolbar
+   heights mismatched. Drag / shift-wheel still scrolls the row. */
 .rp-tabs {
   display: flex;
   align-items: stretch;
-  min-height: 32px;
+  height: 32px;
   gap: 0;
   padding: 0 8px;
   background: transparent;
   border-bottom: 1px solid var(--vp-c-divider);
   overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: none;
+}
+
+.rp-tabs::-webkit-scrollbar {
+  display: none;
 }
 
 .rp-spacer { flex: 1 1 auto; }
