@@ -42,8 +42,10 @@ import VPNavBarSocialLinks from 'vitepress/dist/client/theme-default/components/
 import { EditorState, Compartment } from '@codemirror/state';
 import { EditorView, keymap, lineNumbers, highlightActiveLine } from '@codemirror/view';
 import { defaultKeymap, history, historyKeymap, indentWithTab } from '@codemirror/commands';
-import { bracketMatching, indentOnInput, syntaxHighlighting } from '@codemirror/language';
+import { bracketMatching, indentOnInput, syntaxHighlighting, foldGutter, foldKeymap } from '@codemirror/language';
 import { setDiagnostics, type Diagnostic } from '@codemirror/lint';
+import { closeBrackets, closeBracketsKeymap } from '@codemirror/autocomplete';
+import { searchKeymap, highlightSelectionMatches } from '@codemirror/search';
 import { json as jsonLang } from '@codemirror/lang-json';
 
 import { relonLanguage, playgroundHighlightStyle } from './playground/relon-mode';
@@ -1038,12 +1040,35 @@ onMounted(() => {
         doc: startDoc,
         extensions: [
             lineNumbers(),
+            foldGutter(),
             highlightActiveLine(),
+            highlightSelectionMatches(),
             history(),
             bracketMatching(),
+            closeBrackets(),
             indentOnInput(),
             runtimeErrorExtension,
-            keymap.of([...defaultKeymap, ...historyKeymap, indentWithTab]),
+            keymap.of([
+                ...closeBracketsKeymap,
+                ...defaultKeymap,
+                ...historyKeymap,
+                ...foldKeymap,
+                ...searchKeymap,
+                indentWithTab,
+                // Format the current buffer with relon-fmt. Mod-S keeps
+                // Cmd-S from doing nothing in this no-server playground
+                // and matches the "save = canonicalise" convention.
+                {
+                    key: 'Mod-s',
+                    preventDefault: true,
+                    run: () => { runFormat(); return true; },
+                },
+                {
+                    key: 'Mod-Shift-f',
+                    preventDefault: true,
+                    run: () => { runFormat(); return true; },
+                },
+            ]),
             langCompartment.of(relonLanguage()),
             gotoDefinitionExtension({
                 resolve: resolveGotoDef,

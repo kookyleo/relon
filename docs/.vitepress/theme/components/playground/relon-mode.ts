@@ -42,6 +42,8 @@ import {
     HighlightStyle,
     syntaxHighlighting,
     indentService,
+    indentUnit,
+    foldService,
     type StreamParser,
 } from '@codemirror/language';
 import { EditorState } from '@codemirror/state';
@@ -459,15 +461,64 @@ const relonIndent = indentService.of((context, pos) => {
     return target;
 });
 
+/// Code folding driven by bracket pairs. When a line contains an
+/// unbalanced `{`, `[`, or `(`, the fold gutter offers to collapse
+/// from that bracket to its match. Walks the doc one byte at a
+/// time tracking the matching depth — good enough for the kinds
+/// of nested dicts / lists / closures Relon emits.
+const relonFold = foldService.of((state, lineStart, lineEnd) => {
+    const doc = state.doc;
+    const lineText = doc.sliceString(lineStart, lineEnd);
+    // Find the LAST bracket opener on this line — folding starts
+    // there so an opener mid-line still works.
+    let openIdx = -1;
+    let openChar = '';
+    for (let i = lineText.length - 1; i >= 0; i--) {
+        const c = lineText[i];
+        if (c === '{' || c === '[' || c === '(') {
+            openIdx = i;
+            openChar = c;
+            break;
+        }
+    }
+    if (openIdx < 0) return null;
+    const closeChar = openChar === '{' ? '}' : openChar === '[' ? ']' : ')';
+    let depth = 1;
+    const total = doc.length;
+    let pos = lineStart + openIdx + 1;
+    while (pos < total) {
+        const ch = doc.sliceString(pos, pos + 1);
+        if (ch === openChar) depth++;
+        else if (ch === closeChar) {
+            depth--;
+            if (depth === 0) {
+                return { from: lineStart + openIdx + 1, to: pos };
+            }
+        }
+        pos++;
+    }
+    return null;
+});
+
 export function relonLanguage(): LanguageSupport {
     return new LanguageSupport(StreamLanguage.define(parser), [
         syntaxHighlighting(playgroundHighlightStyle),
+        // Relon files indent with 4 spaces; CodeMirror's default is
+        // 2, which clashes visually with the rest of any handwritten
+        // file. Override the facet here so every consumer (the
+        // indent service below, `indentWithTab`, `indentOnInput`)
+        // pulls 4-space units.
+        indentUnit.of('    '),
         relonIndent,
-        // Triggers `indentOnInput()` to re-indent the current line
-        // when one of these characters is typed — so typing `}`
-        // snaps the line back to the matching opener's column.
+        relonFold,
+        // `indentOnInput`, `commentTokens`, and `closeBrackets` are
+        // language-data facets the matching extensions read off the
+        // active language. Setting them here scopes the behavior to
+        // Relon files instead of the whole editor.
         EditorState.languageData.of(() => [{
             indentOnInput: /^\s*[}\])]$/,
+            commentTokens: { line: '//', block: { open: '/*', close: '*/' } },
+            closeBrackets: { brackets: ['(', '[', '{', '"', "'"] },
         }]),
     ]);
 }
