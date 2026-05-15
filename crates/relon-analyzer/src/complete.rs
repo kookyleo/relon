@@ -690,31 +690,41 @@ fn push_reference_candidates(items: &mut Vec<CompletionItem>, in_list: bool) {
 }
 
 fn push_directive_candidates(items: &mut Vec<CompletionItem>) {
-    // Top-level block directives.
-    for name in &["schema", "extend", "main", "import", "strict"] {
-        items.push(CompletionItem {
-            label: (*name).into(),
-            kind: CompletionKind::Directive,
-            detail: Some("directive".into()),
-                apply_snippet: None,
-            });
-    }
-    // Pair-level pragmas — same `#` prefix, different positions.
-    for name in &[
-        "private",
-        "expect",
-        "default",
-        "brand",
-        "derive",
-        "native",
-        "no_auto_derive",
+    // Top-level block directives. Each shape is a fixed grammar so we
+    // can emit canonical snippets with tab stops — Tab on `#schema`
+    // lands the user inside the body, not just on the bare name.
+    for (name, snippet) in [
+        ("schema", "schema ${1:Name} { ${0} }"),
+        ("extend", "extend ${1:Target} { ${0} }"),
+        ("main", "main(${1:Type param}) -> ${0:Return}"),
+        ("import", "import ${1:bindings} from \"${0:path}\""),
+        ("strict", "strict"),
     ] {
         items.push(CompletionItem {
-            label: (*name).into(),
+            label: name.into(),
+            kind: CompletionKind::Directive,
+            detail: Some("directive".into()),
+            apply_snippet: Some(snippet.into()),
+        });
+    }
+    // Pair-level pragmas — same `#` prefix, different positions.
+    // `Bare` shapes don't carry a tab stop; `Value` shapes leave the
+    // cursor at the argument so the user just types the payload.
+    for (name, snippet) in [
+        ("private", "private"),
+        ("expect", "expect ${0:\"message\"}"),
+        ("default", "default ${0:value}"),
+        ("brand", "brand ${0:TypeName}"),
+        ("derive", "derive ${0:Constraint}"),
+        ("native", "native"),
+        ("no_auto_derive", "no_auto_derive"),
+    ] {
+        items.push(CompletionItem {
+            label: name.into(),
             kind: CompletionKind::Pragma,
             detail: Some("pragma".into()),
-                apply_snippet: None,
-            });
+            apply_snippet: Some(snippet.into()),
+        });
     }
 }
 
