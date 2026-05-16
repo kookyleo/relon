@@ -373,7 +373,9 @@ fn bench_method_dispatch(c: &mut Criterion) {
         b.iter_with_large_drop(|| {
             let mut ctx = Context::new().with_root(upper_ast.clone());
             ctx.prepend_module_resolver(Arc::new(StdModuleResolver));
-            let ctx = Arc::new(ctx.with_analyzed(Arc::clone(&upper_analyzed)));
+            let mut ctx = ctx.with_analyzed(Arc::clone(&upper_analyzed));
+            TreeWalkEvaluator::prepare_in_place(&mut ctx);
+            let ctx = Arc::new(ctx);
             let eval = TreeWalkEvaluator::new(Arc::clone(&ctx));
             let scope = Arc::new(Scope::default());
             let mut args = HashMap::with_capacity(1);
@@ -394,7 +396,9 @@ fn bench_method_dispatch(c: &mut Criterion) {
         b.iter_with_large_drop(|| {
             let mut ctx = Context::new().with_root(map_ast.clone());
             ctx.prepend_module_resolver(Arc::new(StdModuleResolver));
-            let ctx = Arc::new(ctx.with_analyzed(Arc::clone(&map_analyzed)));
+            let mut ctx = ctx.with_analyzed(Arc::clone(&map_analyzed));
+            TreeWalkEvaluator::prepare_in_place(&mut ctx);
+            let ctx = Arc::new(ctx);
             let eval = TreeWalkEvaluator::new(Arc::clone(&ctx));
             let scope = Arc::new(Scope::default());
             let mut args = HashMap::with_capacity(1);
