@@ -1803,6 +1803,7 @@ dependencies = [
  "miette",
  "ordered-float",
  "relon-analyzer",
+ "relon-eval-api",
  "relon-parser",
  "thiserror 2.0.18",
 ]
