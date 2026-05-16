@@ -41,8 +41,8 @@ pub use srcmap::{Entry as SrcMapEntry, SrcMap, SrcMapError};
 use relon_eval_api::layout::{OffsetTable, SchemaLayout};
 use relon_eval_api::schema_canonical::{schema_hash, Schema};
 use relon_ir::{
-    builtin_stdlib, Func as IrFunc, IrType, LoweredEntry, Module as IrModule, Op, WASM_LOCAL_IN_LEN,
-    WASM_LOCAL_IN_PTR, WASM_LOCAL_OUT_CAP, WASM_LOCAL_OUT_PTR,
+    builtin_stdlib, Func as IrFunc, IrType, LoweredEntry, Module as IrModule, Op,
+    WASM_LOCAL_IN_LEN, WASM_LOCAL_IN_PTR, WASM_LOCAL_OUT_CAP, WASM_LOCAL_OUT_PTR,
 };
 use relon_parser::TokenRange;
 use std::collections::HashMap;
@@ -1124,7 +1124,7 @@ fn emit_op_seq(
                     });
                 }
                 for ty in param_tys.iter().rev() {
-                    let popped = vstack.pop().ok_or_else(|| CodegenError::CallTypeMismatch {
+                    let popped = vstack.pop().ok_or(CodegenError::CallTypeMismatch {
                         fn_index: *fn_index,
                         arg_count: *arg_count,
                         param_tys_len,
