@@ -1724,6 +1724,8 @@ dependencies = [
  "criterion",
  "dhat",
  "relon-analyzer",
+ "relon-codegen-wasm",
+ "relon-eval-api",
  "relon-evaluator",
  "relon-parser",
 ]
