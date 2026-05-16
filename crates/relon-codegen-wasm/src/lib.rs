@@ -260,9 +260,14 @@ pub fn compile_module_with_host_fns(
         }),
     );
     // Imported globals occupy global indices starting at 0; our own
-    // emitted `relon_data_top` global lands at the next slot.
+    // emitted `relon_data_top` global lands at the next slot. The
+    // `relon_in_ptr` mutable global follows so schema-method bodies
+    // can rebase buffer-relative pointer slots into absolute wasm
+    // addresses without taking `in_ptr` as an explicit method
+    // parameter (entry function writes it at prologue time).
     let caps_avail_global_index: u32 = 0;
     let data_top_global_index: u32 = 1;
+    let in_ptr_global_index: u32 = 2;
 
     // Single shared memory: one page (64 KiB). Host writes the input
     // buffer somewhere inside, hands the pointer to `run_main`, then
@@ -297,6 +302,22 @@ pub fn compile_module_with_host_fns(
         data_top_global_index,
     );
 
+    // `relon_in_ptr` mutable global — caches the entry's `in_ptr`
+    // parameter so non-entry functions (schema-method bodies and
+    // stdlib helpers reached through method dispatch) can rebase
+    // buffer-relative pointer slots without taking `in_ptr` as an
+    // extra param. The entry function writes it at prologue time;
+    // every other body reads via `global.get`. Not exported — the
+    // host SDK has no business poking at this global.
+    globals.global(
+        GlobalType {
+            val_type: ValType::I32,
+            mutable: true,
+            shared: false,
+        },
+        &ConstExpr::i32_const(0),
+    );
+
     let mut per_func_ranges: Vec<(TokenRange, Vec<TokenRange>)> =
         Vec::with_capacity(combined_funcs.len());
     // Phase 7: per-function `unreachable` records, lock-step with
@@ -324,6 +345,7 @@ pub fn compile_module_with_host_fns(
         let emit_cfg = FunctionEmitCfg {
             import_count,
             caps_avail_global_index,
+            in_ptr_global_index,
         };
         let (body, ranges, unreachable_log) = emit_function_body(
             func,
@@ -413,6 +435,13 @@ struct FunctionEmitCfg {
     /// `Op::CheckCap` reads this via `global.get` before emitting the
     /// bit-test.
     caps_avail_global_index: u32,
+    /// Global index of the module-internal mutable `relon_in_ptr`
+    /// i32 cache. The entry function writes its `in_ptr` parameter to
+    /// this global at prologue time so non-entry bodies (schema
+    /// methods, stdlib helpers reached through method dispatch) can
+    /// rebase buffer-relative pointer slots into absolute addresses
+    /// without taking `in_ptr` as an explicit argument.
+    in_ptr_global_index: u32,
 }
 
 /// Look up an existing `(params, ret) -> type index` entry or add a
@@ -907,6 +936,18 @@ fn emit_function_body(
             f.instruction(&Instruction::LocalSet(TAIL_CURSOR_LOCAL_INDEX));
             ranges.push(func.range);
         }
+
+        // Cache `in_ptr` into the module-internal `relon_in_ptr`
+        // mutable global so non-entry bodies (schema methods reached
+        // through method dispatch) can rebase buffer-relative pointer
+        // slots into absolute wasm addresses. The wasm engine guards
+        // against re-entrant `run_main` calls at the host SDK layer;
+        // a single i32 global mirrors the entry's `in_ptr` parameter
+        // for the duration of one invocation.
+        f.instruction(&Instruction::LocalGet(WASM_LOCAL_IN_PTR));
+        ranges.push(func.range);
+        f.instruction(&Instruction::GlobalSet(emit_cfg.in_ptr_global_index));
+        ranges.push(func.range);
     }
 
     // Virtual stack used to validate arithmetic type tags.
@@ -915,6 +956,8 @@ fn emit_function_body(
         record_local_base,
         import_count: emit_cfg.import_count,
         caps_avail_global_index: emit_cfg.caps_avail_global_index,
+        in_ptr_global_index: emit_cfg.in_ptr_global_index,
+        is_entry,
     };
     let _ = return_root_size; // referenced earlier in this function
     emit_op_seq(
@@ -1055,6 +1098,18 @@ struct EmitCtx {
     /// read it via `global.get` before bit-testing the requested
     /// capability slot.
     caps_avail_global_index: u32,
+    /// Global index of the module-internal mutable `relon_in_ptr`
+    /// i32 cache. Set by the entry function prologue from
+    /// `WASM_LOCAL_IN_PTR`; read by non-entry function bodies (schema
+    /// methods etc.) when they rebase buffer-relative pointer slots
+    /// loaded through `LoadFieldAtAbsolute`.
+    in_ptr_global_index: u32,
+    /// True for the entry function only. The entry path always has
+    /// `WASM_LOCAL_IN_PTR` as wasm local 0; non-entry bodies (schema
+    /// methods) have a `self` pointer there instead, so the `+ in_ptr`
+    /// rebase emitted by [`LoadFieldAtAbsolute`] must source the
+    /// pointer from the cached global, not local 0.
+    is_entry: bool,
 }
 
 /// Scan `body` (and any nested if-branches) for the largest
@@ -1537,7 +1592,7 @@ fn emit_op_seq(
                 if popped.wasm_slot() != IrType::I32 {
                     return Err(CodegenError::MixedNumericTypes);
                 }
-                emit_load_field_at_absolute(f, ranges, *offset, *ty, tagged.range)?;
+                emit_load_field_at_absolute(f, ranges, ectx, *offset, *ty, tagged.range)?;
                 vstack.push(load_field_stack_type(*ty));
             }
             Op::LoadSchemaPtr { offset } => {
@@ -1890,11 +1945,28 @@ fn emit_load_field(
 /// stack (an absolute wasm-memory address). Used by
 /// [`Op::LoadFieldAtAbsolute`] for schema-method `self.field` access
 /// and chained-segment reads. The stack-top base is consumed by the
-/// emitted load instruction; no `local.get $in_ptr` is added — that's
-/// the caller's responsibility when sourcing from the in_buf.
+/// emitted load instruction; no `local.get $in_ptr` is added for the
+/// base itself — that's the caller's responsibility when sourcing
+/// from the in_buf.
+///
+/// `String` / `ListInt` fields are pointer-indirect: the 4-byte slot
+/// inside the schema's fixed area holds a **buffer-relative** offset
+/// (relative to the in_buf base), so this helper materialises the
+/// absolute address by adding the cached `in_ptr` after the i32.load.
+/// This mirrors the free-identifier paths [`Op::LoadStringPtr`] /
+/// [`Op::LoadListIntPtr`] emitted by [`emit_load_absolute_pointer`].
+/// Without the rebase the downstream stdlib body would index off the
+/// buffer-relative offset directly and walk arbitrary bytes.
+///
+/// In the entry function the rebase reads from local `WASM_LOCAL_IN_PTR`
+/// (wasm local 0); in non-entry function bodies (schema methods) local
+/// 0 is `self` instead, so the rebase falls back to the
+/// module-internal `relon_in_ptr` global that the entry prologue
+/// caches at invocation start.
 fn emit_load_field_at_absolute(
     f: &mut Function,
     ranges: &mut Vec<TokenRange>,
+    ectx: &EmitCtx,
     offset: u32,
     ty: IrType,
     range: TokenRange,
@@ -1932,7 +2004,7 @@ fn emit_load_field_at_absolute(
             }));
             ranges.push(range);
         }
-        IrType::I32 | IrType::String | IrType::ListInt => {
+        IrType::I32 => {
             f.instruction(&Instruction::I32Load(MemArg {
                 offset: offset as u64,
                 align: 2,
@@ -1940,8 +2012,37 @@ fn emit_load_field_at_absolute(
             }));
             ranges.push(range);
         }
+        IrType::String | IrType::ListInt => {
+            // Pointer-indirect slot: load the buffer-relative offset,
+            // then rebase to absolute by adding the in_buf base.
+            f.instruction(&Instruction::I32Load(MemArg {
+                offset: offset as u64,
+                align: 2,
+                memory_index: 0,
+            }));
+            ranges.push(range);
+            push_in_ptr(f, ranges, ectx, range);
+            f.instruction(&Instruction::I32Add);
+            ranges.push(range);
+        }
     }
     Ok(())
+}
+
+/// Push the in_buf base address onto the operand stack. In the entry
+/// function the value lives in wasm local 0 (`WASM_LOCAL_IN_PTR`); in
+/// non-entry function bodies (schema methods) local 0 is `self`
+/// instead, so we fall back to the module-internal `relon_in_ptr`
+/// global the entry prologue caches at invocation start. Keeping the
+/// choice behind a single helper lets every rebase site stay agnostic
+/// about which function shape is currently being emitted.
+fn push_in_ptr(f: &mut Function, ranges: &mut Vec<TokenRange>, ectx: &EmitCtx, range: TokenRange) {
+    if ectx.is_entry {
+        f.instruction(&Instruction::LocalGet(WASM_LOCAL_IN_PTR));
+    } else {
+        f.instruction(&Instruction::GlobalGet(ectx.in_ptr_global_index));
+    }
+    ranges.push(range);
 }
 
 /// Emit the `StoreField` wasm sequence for `ty` at byte `offset`.
