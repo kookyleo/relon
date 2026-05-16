@@ -197,4 +197,123 @@ pub enum RuntimeError {
         #[label("declared here")]
         range: TokenRange,
     },
+
+    // -----------------------------------------------------------------
+    // Wasm-AOT trap surface (Phase 7).
+    //
+    // These variants are produced exclusively by the wasm backend's
+    // `WasmModule::translate_trap`. The tree-walker emits
+    // `CapabilityDenied { name, reason, range }` / `ValueTooLarge {
+    // limit, actual, range }`; the wasm path loses the names/limits
+    // because the trap fires under a hot-path guard that only carries
+    // a numeric `cap_bit` or buffer size. Keeping the two surfaces
+    // distinct lets the Phase 8 facade route diagnostics correctly
+    // without forcing the wasm backend to fabricate placeholder names.
+    /// Phase 7: wasm trap fired because the granted-capabilities
+    /// bitmap lacks the bit a host-fn call requires. The bit index
+    /// matches the wasm module's `relon.host_fns` entry; the source
+    /// range resolves to the `#native fn` call site via srcmap.
+    #[error("Capability denied: wasm host-fn requires capability bit {cap_bit}")]
+    #[diagnostic(
+        code(relon::eval::wasm_capability_denied),
+        help("The wasm module's `check_cap` prologue tripped because the host's `cap_grants` bitmap did not include this bit. Grant the matching capability before instantiation.")
+    )]
+    WasmCapabilityDenied {
+        /// Bit index in the `relon_caps_avail` bitmap whose absence
+        /// triggered the trap. Mirrors the `cap_bit` on the wasm
+        /// module's host-fn entry.
+        cap_bit: u32,
+        #[label("capability check tripped here")]
+        range: TokenRange,
+    },
+
+    /// Phase 7: wasm trap fired in the entry function's `out_cap`
+    /// guard because the caller's output buffer is smaller than the
+    /// return schema's fixed-area root size. The `needed` field is
+    /// the minimum the wasm module expected; the actual `out_cap` is
+    /// not preserved at the trap site (the guard fires before the
+    /// runtime can capture it, so callers must reconstruct it from
+    /// their own call args if they want a `got` value to report).
+    #[error("output buffer too small: wasm entry expects at least {needed} bytes")]
+    #[diagnostic(
+        code(relon::eval::wasm_out_buf_too_small),
+        help("Raise the `out_cap` you pass to `run_main` to at least the return schema's fixed-area root size (plus any tail-record overhead).")
+    )]
+    WasmOutBufTooSmall {
+        /// Minimum bytes the wasm module's guard required.
+        needed: u32,
+        #[label("entry-function out_cap guard")]
+        range: TokenRange,
+    },
+
+    /// Phase 7: wasm trap fired in the entry function's `in_len`
+    /// guard because the caller's input buffer is smaller than the
+    /// `#main` param schema's fixed-area root size. Mirrors
+    /// `WasmOutBufTooSmall` on the input side.
+    #[error("input buffer too small: wasm entry expects at least {needed} bytes")]
+    #[diagnostic(
+        code(relon::eval::wasm_in_buf_too_small),
+        help("Make sure the `in_buf` you pass to `run_main` was populated by `BufferBuilder` against the same schema the wasm module was compiled for.")
+    )]
+    WasmInBufTooSmall {
+        /// Minimum bytes the wasm module's guard required.
+        needed: u32,
+        #[label("entry-function in_len guard")]
+        range: TokenRange,
+    },
+
+    /// Phase 7: wasm trap fired in a tail-record bounds check
+    /// (`StoreField` of `String` / `List<Int>`, or a sub-record
+    /// `AllocSubRecord`) because the value to be written wouldn't
+    /// fit between the current `tail_cursor` and the caller's
+    /// `out_cap`. The `kind` tag tells the host which shape ran
+    /// over: `"String"`, `"ListInt"`, or `"Record"`.
+    #[error("value too large: wasm tail-cursor overran `out_cap` while writing a {kind}")]
+    #[diagnostic(
+        code(relon::eval::wasm_value_too_large),
+        help("The aggregate return ran past the caller's `out_cap`. Raise the buffer capacity or shrink the produced value.")
+    )]
+    WasmValueTooLarge {
+        /// Static tag identifying the tail-record shape that overran.
+        kind: &'static str,
+        #[label("tail-cursor bounds check tripped here")]
+        range: TokenRange,
+    },
+
+    /// Phase 7 placeholder: wasm step-limit / fuel exhaustion. The
+    /// v1 AOT backend does not emit a step counter, but the variant
+    /// is reserved so Phase 8+ can wire wasmtime's `OutOfFuel` trap
+    /// without churning the enum surface.
+    #[error("wasm step / fuel limit exhausted")]
+    #[diagnostic(
+        code(relon::eval::wasm_step_limit_exceeded),
+        help("The wasm runtime stopped executing because the host's fuel budget hit zero.")
+    )]
+    WasmStepLimitExceeded {
+        #[label("budget exhausted here")]
+        range: Option<TokenRange>,
+    },
+
+    /// Phase 7 catch-all: a wasm trap that doesn't match any
+    /// known Relon-emitted guard. Surfaces the wasmtime trap code
+    /// stringified plus the module-absolute pc so a host can still
+    /// produce a meaningful diagnostic for unexpected shapes
+    /// (memory OOB, stack overflow, indirect-call type mismatch,
+    /// ...). `range` is best-effort — `None` when the trap pc
+    /// falls outside the srcmap's entry table.
+    #[error("unclassified wasm trap `{trap_code}` at pc {pc:#x}")]
+    #[diagnostic(
+        code(relon::eval::wasm_trap_unclassified),
+        help("The wasm runtime reported a trap shape this backend doesn't recognise. Inspect the trap_code and re-run with a debug build for more context.")
+    )]
+    WasmTrapUnclassified {
+        /// Stringified wasmtime trap code (e.g. `"MemoryOutOfBounds"`).
+        trap_code: String,
+        /// Module-absolute byte offset of the trapping instruction,
+        /// or `0` when the runtime didn't surface a pc.
+        pc: u32,
+        /// Source range — `Some` when the srcmap covers `pc`,
+        /// `None` for stdlib / synthetic / out-of-range pcs.
+        range: Option<TokenRange>,
+    },
 }

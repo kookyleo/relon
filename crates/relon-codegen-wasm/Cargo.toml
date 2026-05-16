@@ -34,16 +34,16 @@ wasm-encoder = "0.249"
 # srcmap emit). Pinned to the same minor as `wasm-encoder` so both
 # crates agree on which spec proposals are in scope.
 wasmparser = "0.249"
+# Phase 7: `WasmModule::translate_trap` consumes a `wasmtime::Error`
+# to surface backend-specific `RuntimeError` variants. Promoted from
+# dev-dep to main dep because hosts that hold a `WasmModule` value
+# need the same `wasmtime::Trap` type definition the codegen
+# crate's public surface references. Default features keep the
+# cranelift+runtime combo in scope so production and tests share
+# one trap shape.
+wasmtime = "44"
 
 [dev-dependencies]
-# Reference engine used to instantiate the hardcoded module and
-# round-trip `run_main`. Default features pull in cranelift +
-# wasmtime-runtime — long first build, then cached.
-wasmtime = "44"
 # Source -> AnalyzedTree pipeline driving the Phase 1.beta /
 # Phase 2.b end-to-end test.
-relon-parser = { workspace = true }
 relon-analyzer = { workspace = true }
-# Canonical schema construction + buffer writer/reader for the
-# Phase 2.b binary handshake integration tests.
-relon-eval-api = { workspace = true }
