@@ -2562,8 +2562,9 @@ pub fn compile_hardcoded_double() -> Vec<u8> {
 /// Loaded wasm module surface used by host SDKs.
 ///
 /// Wraps the raw module bytes alongside the parsed `relon.abi` +
-/// `relon.srcmap` sections so a host can keep one value handy for
-/// instantiation, trap translation, and ABI compatibility checks.
+/// `relon.srcmap` + `relon.host_fns` sections so a host can keep one
+/// value handy for instantiation, trap translation, and ABI
+/// compatibility checks.
 #[derive(Debug, Clone)]
 pub struct WasmModule {
     /// Raw module bytes ready to be passed to a wasm engine.
@@ -2572,6 +2573,9 @@ pub struct WasmModule {
     abi: AbiMetadata,
     /// Source map parsed out of `relon.srcmap`.
     srcmap: SrcMap,
+    /// Host-fn table parsed out of `relon.host_fns`. Empty when the
+    /// module declared no `#native` imports.
+    host_fns: host_fns::HostFnTable,
 }
 
 impl WasmModule {
@@ -2590,14 +2594,47 @@ impl WasmModule {
         &self.srcmap
     }
 
+    /// Borrow the parsed host-fn table (declared `#native` imports).
+    /// Empty for modules without host-fn dependencies.
+    pub fn host_fns(&self) -> &host_fns::HostFnTable {
+        &self.host_fns
+    }
+
     /// Parse a wasm module's custom sections and validate the ABI
     /// shape only (versions, magic). Schema-hash validation requires
     /// the caller to supply the expected `#main` / return schemas via
     /// [`Self::from_bytes_with_schema`]; this entry point is for
     /// hosts that don't yet know what they expect (introspection
     /// tools, debug dumps).
+    ///
+    /// Modules with a non-empty `relon.host_fns` table still load
+    /// through this entry point — the host-fn table is exposed
+    /// through [`Self::host_fns`] for inspection but no validation
+    /// runs. Use [`Self::from_bytes_with_host_fns`] to validate the
+    /// declared host fns against the SDK's bindings.
     pub fn from_bytes(bytes: Vec<u8>) -> Result<Self, LoadError> {
         Self::from_bytes_inner(bytes, None)
+    }
+
+    /// Phase 6: parse + validate a wasm module against the host
+    /// SDK's registered `#native` bindings. The supplied table
+    /// describes the host-side bindings the SDK is willing to wire
+    /// into the wasm runtime; the loader rejects mismatches before
+    /// returning the [`WasmModule`].
+    ///
+    /// Failure surface:
+    /// * [`LoadError::MissingHostFn`] — module declared an import
+    ///   the SDK didn't register.
+    /// * [`LoadError::HostFnSignatureDrift`] — SDK has a binding
+    ///   under the matching name, but its canonical signature hash
+    ///   disagrees.
+    pub fn from_bytes_with_host_fns(
+        bytes: Vec<u8>,
+        host_fns: &host_fns::HostFnTable,
+    ) -> Result<Self, LoadError> {
+        let module = Self::from_bytes_inner(bytes, None)?;
+        validate_host_fns(&module.host_fns, host_fns)?;
+        Ok(module)
     }
 
     /// Parse a wasm module and validate it against the supplied
@@ -2620,6 +2657,7 @@ impl WasmModule {
     ) -> Result<Self, LoadError> {
         let mut abi_bytes: Option<Vec<u8>> = None;
         let mut srcmap_bytes: Option<Vec<u8>> = None;
+        let mut host_fns_bytes: Option<Vec<u8>> = None;
 
         for payload in wasmparser::Parser::new(0).parse_all(&bytes) {
             let payload = payload.map_err(|e| LoadError::WasmParse(e.to_string()))?;
@@ -2630,6 +2668,9 @@ impl WasmModule {
                     }
                     name if name == srcmap::SECTION_NAME => {
                         srcmap_bytes = Some(reader.data().to_vec());
+                    }
+                    name if name == host_fns::SECTION_NAME => {
+                        host_fns_bytes = Some(reader.data().to_vec());
                     }
                     _ => {}
                 }
@@ -2654,6 +2695,53 @@ impl WasmModule {
         })?;
         let srcmap = srcmap::decode_from_bytes(&srcmap_bytes)?;
 
-        Ok(Self { bytes, abi, srcmap })
+        // `relon.host_fns` is optional for forward-compat: old codegen
+        // pipelines may not have emitted the section. When present we
+        // decode it; when absent we treat the table as empty.
+        let host_fns_table = match host_fns_bytes {
+            Some(b) => host_fns::decode(&b)?,
+            None => host_fns::HostFnTable::empty(),
+        };
+
+        Ok(Self {
+            bytes,
+            abi,
+            srcmap,
+            host_fns: host_fns_table,
+        })
     }
+}
+
+/// Validate the wasm module's declared `#native` imports against the
+/// host SDK's registered bindings. Position-independent match — the
+/// declared table is keyed on `name`, so the host SDK's table can
+/// list bindings in any order and still link.
+fn validate_host_fns(
+    declared: &host_fns::HostFnTable,
+    supplied: &host_fns::HostFnTable,
+) -> Result<(), LoadError> {
+    for entry in &declared.entries {
+        let Some(supplied_entry) = supplied
+            .entries
+            .iter()
+            .find(|e| e.name == entry.name)
+        else {
+            return Err(LoadError::MissingHostFn {
+                name: entry.name.clone(),
+            });
+        };
+        if supplied_entry.params_canonical_hash != entry.params_canonical_hash {
+            return Err(LoadError::HostFnSignatureDrift {
+                name: entry.name.clone(),
+                which: "params",
+            });
+        }
+        if supplied_entry.ret_canonical_hash != entry.ret_canonical_hash {
+            return Err(LoadError::HostFnSignatureDrift {
+                name: entry.name.clone(),
+                which: "return",
+            });
+        }
+    }
+    Ok(())
 }

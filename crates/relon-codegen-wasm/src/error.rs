@@ -166,4 +166,32 @@ pub enum LoadError {
     /// the srcmap-specific failure variant.
     #[error(transparent)]
     SrcMap(#[from] SrcMapError),
+    /// Phase 6: `relon.host_fns` payload was located but failed to
+    /// decode. Distinct from [`Self::MissingHostFn`] /
+    /// [`Self::HostFnSignatureDrift`] — those fire after a successful
+    /// decode against the supplied [`crate::HostFnTable`].
+    #[error(transparent)]
+    HostFns(#[from] crate::host_fns::HostFnError),
+    /// Phase 6: the wasm module declared a `#native` import the host
+    /// SDK did not register. The host SDK can choose to recover by
+    /// registering the missing fn or refuse-to-load entirely.
+    #[error("host fn `{name}` declared by module but not registered with the host SDK")]
+    MissingHostFn {
+        /// Name of the missing import. Mirrors the `name` field of
+        /// the wasm `(import "env" <name> ...)` line.
+        name: String,
+    },
+    /// Phase 6: the host SDK registered a `#native` fn under the
+    /// matching name, but its canonical signature hash disagrees with
+    /// what the wasm module embedded. Either the host's binding or
+    /// the wasm module's expectation is stale.
+    #[error("host fn `{name}` signature drift")]
+    HostFnSignatureDrift {
+        /// Name of the offending import.
+        name: String,
+        /// `"params"` or `"return"` depending on which hash half
+        /// disagreed. Lets the host SDK surface a more specific
+        /// diagnostic without re-running the comparison.
+        which: &'static str,
+    },
 }
