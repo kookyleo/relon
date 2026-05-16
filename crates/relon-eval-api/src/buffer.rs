@@ -17,7 +17,7 @@
 //! Static enforcement via codegen-generated wrappers is a Phase 3
 //! follow-up.
 
-use crate::layout::OffsetTable;
+use crate::layout::{FieldKind, OffsetTable};
 use crate::schema_canonical::{Field, TypeRepr};
 use thiserror::Error;
 
@@ -56,19 +56,49 @@ pub enum BufferError {
         /// Required length per the offset table.
         need: usize,
     },
+    /// A pointer-indirect payload (String / List<Int>) is larger than
+    /// the `u32` length prefix can describe. Phase 2.c caps each
+    /// payload at `u32::MAX` bytes / elements; longer values surface
+    /// here rather than overflow silently.
+    #[error("payload for field `{name}` is too large: {len} exceeds u32::MAX")]
+    ValueTooLarge {
+        /// Field name carrying the oversized payload.
+        name: String,
+        /// Requested length (bytes for String, elements for List<Int>).
+        len: usize,
+    },
+    /// A pointer-indirect read tripped over a malformed tail-area
+    /// payload — the length prefix points beyond the buffer end, the
+    /// pointer is null when the schema expects a value, or the
+    /// utf-8 bytes inside a `String` payload are invalid.
+    #[error("malformed payload for field `{name}`: {reason}")]
+    MalformedPayload {
+        /// Field name being read.
+        name: String,
+        /// Why the payload couldn't be decoded.
+        reason: &'static str,
+    },
 }
 
-/// Type-checked writer over a fixed-size record buffer.
+/// Type-checked writer over a record buffer with an optional tail
+/// area.
+///
+/// Phase 2.c shape:
+///
+/// * The fixed area is pre-allocated to `layout.root_size` so every
+///   inline scalar slot is well-defined zero bytes per the spec.
+/// * String / List<Int> writes append a `[len: u32 LE][payload]`
+///   record after the fixed area and back-patch the pointer slot in
+///   the fixed area with the tail-record's byte offset (relative to
+///   the buffer start — the wasm side adds `in_ptr` to it).
 ///
 /// Lifetime tie-in: the builder borrows the offset table so the same
 /// layout description can be reused for the matching reader without
-/// reparsing. The internal `bytes: Vec<u8>` is initialised to
-/// `vec![0u8; layout.root_size]` so every field has well-defined
-/// padding bytes (`0x00`) per the spec.
+/// reparsing.
 #[derive(Debug)]
 pub struct BufferBuilder<'a> {
     layout: &'a OffsetTable,
-    field_index: Vec<(String, TypeRepr, usize, usize)>,
+    field_index: Vec<(String, TypeRepr, usize, usize, FieldKind)>,
     bytes: Vec<u8>,
 }
 
@@ -88,7 +118,7 @@ impl<'a> BufferBuilder<'a> {
                 fields
                     .iter()
                     .find(|f| f.name == fo.name)
-                    .map(|f| (fo.name.clone(), f.ty.clone(), fo.offset, fo.size))
+                    .map(|f| (fo.name.clone(), f.ty.clone(), fo.offset, fo.size, fo.kind))
             })
             .collect();
         Self {
@@ -100,21 +130,21 @@ impl<'a> BufferBuilder<'a> {
 
     /// Write a 64-bit signed integer to `field_name`.
     pub fn write_int(&mut self, field_name: &str, value: i64) -> Result<(), BufferError> {
-        let (offset, _) = self.locate(field_name, &TypeRepr::Int, "Int")?;
+        let (offset, _, _) = self.locate(field_name, &TypeRepr::Int, "Int")?;
         self.bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
         Ok(())
     }
 
     /// Write a 64-bit float to `field_name`.
     pub fn write_float(&mut self, field_name: &str, value: f64) -> Result<(), BufferError> {
-        let (offset, _) = self.locate(field_name, &TypeRepr::Float, "Float")?;
+        let (offset, _, _) = self.locate(field_name, &TypeRepr::Float, "Float")?;
         self.bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
         Ok(())
     }
 
     /// Write a boolean to `field_name`. Encoded as `0u8` / `1u8`.
     pub fn write_bool(&mut self, field_name: &str, value: bool) -> Result<(), BufferError> {
-        let (offset, _) = self.locate(field_name, &TypeRepr::Bool, "Bool")?;
+        let (offset, _, _) = self.locate(field_name, &TypeRepr::Bool, "Bool")?;
         self.bytes[offset] = u8::from(value);
         Ok(())
     }
@@ -124,7 +154,88 @@ impl<'a> BufferBuilder<'a> {
     /// surface a `TypeMismatch` early when the host accidentally
     /// nulls a non-Null slot.
     pub fn write_null(&mut self, field_name: &str) -> Result<(), BufferError> {
-        let (_, _) = self.locate(field_name, &TypeRepr::Null, "Null")?;
+        let (_, _, _) = self.locate(field_name, &TypeRepr::Null, "Null")?;
+        Ok(())
+    }
+
+    /// Write a UTF-8 string into `field_name`'s tail-area record.
+    ///
+    /// Appends `[len: u32 LE][bytes]` after the current buffer end,
+    /// padding the cursor up to 4 bytes first so the length prefix is
+    /// naturally aligned. The pointer slot in the fixed area is
+    /// back-patched with the byte offset of the length prefix
+    /// (relative to the buffer base — the wasm side adds `in_ptr` to
+    /// reach absolute memory).
+    pub fn write_string(&mut self, field_name: &str, value: &str) -> Result<(), BufferError> {
+        let (slot_offset, _, kind) = self.locate(field_name, &TypeRepr::String, "String")?;
+        if !matches!(kind, FieldKind::PointerIndirect { .. }) {
+            // Defensive: the layout pass guarantees this, but we keep
+            // the check so a hand-built `OffsetTable` can't sneak an
+            // inline String through and corrupt adjacent slots.
+            return Err(BufferError::TypeMismatch {
+                name: field_name.to_string(),
+                declared: "String",
+                requested: "String",
+            });
+        }
+        let len = value.len();
+        if len > u32::MAX as usize {
+            return Err(BufferError::ValueTooLarge {
+                name: field_name.to_string(),
+                len,
+            });
+        }
+        let payload_offset = self.append_tail_record(4, len, value.as_bytes());
+        let ptr = u32::try_from(payload_offset).map_err(|_| BufferError::ValueTooLarge {
+            name: field_name.to_string(),
+            len: payload_offset,
+        })?;
+        self.bytes[slot_offset..slot_offset + 4].copy_from_slice(&ptr.to_le_bytes());
+        Ok(())
+    }
+
+    /// Write a `List<Int>` into `field_name`'s tail-area record.
+    ///
+    /// Tail layout: `[len: u32 LE][i64 LE x len]`. The length prefix
+    /// is padded up to 8 bytes after itself so the i64 elements sit
+    /// on an 8-byte boundary the way the wasm side will eventually
+    /// expect (Phase 2.c keeps the elements untouched, but later
+    /// phases reading them need the alignment to be honest).
+    pub fn write_list_int(&mut self, field_name: &str, values: &[i64]) -> Result<(), BufferError> {
+        let (slot_offset, _, kind) = self.locate(
+            field_name,
+            &TypeRepr::List {
+                element: Box::new(TypeRepr::Int),
+            },
+            "List<Int>",
+        )?;
+        let FieldKind::PointerIndirect { tail_alignment } = kind else {
+            return Err(BufferError::TypeMismatch {
+                name: field_name.to_string(),
+                declared: "List<Int>",
+                requested: "List<Int>",
+            });
+        };
+        if values.len() > u32::MAX as usize {
+            return Err(BufferError::ValueTooLarge {
+                name: field_name.to_string(),
+                len: values.len(),
+            });
+        }
+        // Materialise elements into a `Vec<u8>` so `append_tail_record`
+        // can copy them in a single slice — avoids reborrowing the
+        // builder mid-write.
+        let mut payload = Vec::with_capacity(values.len() * 8);
+        for v in values {
+            payload.extend_from_slice(&v.to_le_bytes());
+        }
+        let payload_offset =
+            self.append_tail_record_with_inner_alignment(4, tail_alignment, values.len(), &payload);
+        let ptr = u32::try_from(payload_offset).map_err(|_| BufferError::ValueTooLarge {
+            name: field_name.to_string(),
+            len: payload_offset,
+        })?;
+        self.bytes[slot_offset..slot_offset + 4].copy_from_slice(&ptr.to_le_bytes());
         Ok(())
     }
 
@@ -138,11 +249,11 @@ impl<'a> BufferBuilder<'a> {
         field_name: &str,
         expected: &TypeRepr,
         requested_label: &'static str,
-    ) -> Result<(usize, usize), BufferError> {
+    ) -> Result<(usize, usize, FieldKind), BufferError> {
         let entry = self
             .field_index
             .iter()
-            .find(|(name, _, _, _)| name == field_name)
+            .find(|(name, _, _, _, _)| name == field_name)
             .ok_or_else(|| BufferError::UnknownField {
                 name: field_name.to_string(),
             })?;
@@ -153,7 +264,55 @@ impl<'a> BufferBuilder<'a> {
                 requested: requested_label,
             });
         }
-        Ok((entry.2, entry.3))
+        Ok((entry.2, entry.3, entry.4))
+    }
+
+    /// Append a `[len: u32 LE][payload]` record. Pads the buffer up
+    /// to `prefix_alignment` before the length prefix so a future
+    /// reader can dereference the pointer without an unaligned load.
+    ///
+    /// Returns the byte offset of the **length prefix** — the value
+    /// that gets back-patched into the fixed-area pointer slot.
+    fn append_tail_record(&mut self, prefix_alignment: usize, len: usize, payload: &[u8]) -> usize {
+        self.pad_to(prefix_alignment);
+        let record_offset = self.bytes.len();
+        self.bytes.extend_from_slice(&(len as u32).to_le_bytes());
+        self.bytes.extend_from_slice(payload);
+        record_offset
+    }
+
+    /// Variant of [`Self::append_tail_record`] that pads between the
+    /// length prefix and the payload so the payload starts at
+    /// `inner_alignment`. `List<Int>` uses this so the i64 elements
+    /// sit on an 8-byte boundary the wasm side can load aligned.
+    fn append_tail_record_with_inner_alignment(
+        &mut self,
+        prefix_alignment: usize,
+        inner_alignment: usize,
+        len: usize,
+        payload: &[u8],
+    ) -> usize {
+        self.pad_to(prefix_alignment);
+        let record_offset = self.bytes.len();
+        self.bytes.extend_from_slice(&(len as u32).to_le_bytes());
+        if inner_alignment > 1 {
+            self.pad_to(inner_alignment);
+        }
+        self.bytes.extend_from_slice(payload);
+        record_offset
+    }
+
+    /// Grow the buffer with zero bytes until its length is a multiple
+    /// of `align`. No-op when already aligned.
+    fn pad_to(&mut self, align: usize) {
+        if align <= 1 {
+            return;
+        }
+        let rem = self.bytes.len() % align;
+        if rem != 0 {
+            let pad = align - rem;
+            self.bytes.resize(self.bytes.len() + pad, 0);
+        }
     }
 
     /// Read-only accessor used by tests to peek at the layout the
@@ -166,16 +325,17 @@ impl<'a> BufferBuilder<'a> {
     }
 }
 
-/// Type-checked reader over a fixed-size record buffer.
+/// Type-checked reader over a record buffer plus optional tail area.
 ///
-/// The buffer is borrowed (no copy), so reads cost a bounds check
-/// plus a `from_le_bytes`. As with [`BufferBuilder`], the reader
-/// carries a side index of `(name, type, offset, size)` so type
-/// mismatches surface at the call site.
+/// The buffer is borrowed (no copy), so inline reads cost a bounds
+/// check plus a `from_le_bytes`. Pointer-indirect reads follow the
+/// `u32` slot through to the tail-area `[len: u32 LE][payload]`
+/// record, validating the bounds and (for `String`) the utf-8 bytes
+/// against the borrowed buffer.
 #[derive(Debug)]
 pub struct BufferReader<'a> {
     layout: &'a OffsetTable,
-    field_index: Vec<(String, TypeRepr, usize, usize)>,
+    field_index: Vec<(String, TypeRepr, usize, usize, FieldKind)>,
     bytes: &'a [u8],
 }
 
@@ -203,7 +363,7 @@ impl<'a> BufferReader<'a> {
                 fields
                     .iter()
                     .find(|f| f.name == fo.name)
-                    .map(|f| (fo.name.clone(), f.ty.clone(), fo.offset, fo.size))
+                    .map(|f| (fo.name.clone(), f.ty.clone(), fo.offset, fo.size, fo.kind))
             })
             .collect();
         Ok(Self {
@@ -215,7 +375,7 @@ impl<'a> BufferReader<'a> {
 
     /// Read a 64-bit signed integer from `field_name`.
     pub fn read_int(&self, field_name: &str) -> Result<i64, BufferError> {
-        let (offset, _) = self.locate(field_name, &TypeRepr::Int, "Int")?;
+        let (offset, _, _) = self.locate(field_name, &TypeRepr::Int, "Int")?;
         let mut buf = [0u8; 8];
         buf.copy_from_slice(&self.bytes[offset..offset + 8]);
         Ok(i64::from_le_bytes(buf))
@@ -223,7 +383,7 @@ impl<'a> BufferReader<'a> {
 
     /// Read a 64-bit float from `field_name`.
     pub fn read_float(&self, field_name: &str) -> Result<f64, BufferError> {
-        let (offset, _) = self.locate(field_name, &TypeRepr::Float, "Float")?;
+        let (offset, _, _) = self.locate(field_name, &TypeRepr::Float, "Float")?;
         let mut buf = [0u8; 8];
         buf.copy_from_slice(&self.bytes[offset..offset + 8]);
         Ok(f64::from_le_bytes(buf))
@@ -233,7 +393,7 @@ impl<'a> BufferReader<'a> {
     /// as `true` (the layout only writes 0 or 1, but defensive
     /// decoding makes the reader robust against buffer corruption).
     pub fn read_bool(&self, field_name: &str) -> Result<bool, BufferError> {
-        let (offset, _) = self.locate(field_name, &TypeRepr::Bool, "Bool")?;
+        let (offset, _, _) = self.locate(field_name, &TypeRepr::Bool, "Bool")?;
         Ok(self.bytes[offset] != 0)
     }
 
@@ -241,8 +401,146 @@ impl<'a> BufferReader<'a> {
     /// is reachable. The byte value is unused (Null slots are
     /// tag-only), so this only validates the type label.
     pub fn read_null(&self, field_name: &str) -> Result<(), BufferError> {
-        let (_, _) = self.locate(field_name, &TypeRepr::Null, "Null")?;
+        let (_, _, _) = self.locate(field_name, &TypeRepr::Null, "Null")?;
         Ok(())
+    }
+
+    /// Read a UTF-8 string from `field_name`. Follows the fixed-area
+    /// `u32` pointer into the tail area, validates the length prefix
+    /// + payload bounds, and decodes the bytes as utf-8.
+    pub fn read_string(&self, field_name: &str) -> Result<&'a str, BufferError> {
+        let (ptr_offset, _, kind) = self.locate(field_name, &TypeRepr::String, "String")?;
+        if !matches!(kind, FieldKind::PointerIndirect { .. }) {
+            return Err(BufferError::MalformedPayload {
+                name: field_name.to_string(),
+                reason: "expected pointer-indirect kind",
+            });
+        }
+        let (len, payload_start) = self.decode_pointer_header(field_name, ptr_offset, 0)?;
+        let payload_end =
+            payload_start
+                .checked_add(len)
+                .ok_or_else(|| BufferError::MalformedPayload {
+                    name: field_name.to_string(),
+                    reason: "payload end overflows usize",
+                })?;
+        if payload_end > self.bytes.len() {
+            return Err(BufferError::MalformedPayload {
+                name: field_name.to_string(),
+                reason: "payload exceeds buffer end",
+            });
+        }
+        std::str::from_utf8(&self.bytes[payload_start..payload_end]).map_err(|_| {
+            BufferError::MalformedPayload {
+                name: field_name.to_string(),
+                reason: "payload is not valid utf-8",
+            }
+        })
+    }
+
+    /// Read a `List<Int>` from `field_name`. Follows the fixed-area
+    /// `u32` pointer into the tail area and copies the i64 elements
+    /// into a fresh `Vec<i64>` so callers don't have to wrestle with
+    /// alignment of the borrowed slice.
+    pub fn read_list_int(&self, field_name: &str) -> Result<Vec<i64>, BufferError> {
+        let (ptr_offset, _, kind) = self.locate(
+            field_name,
+            &TypeRepr::List {
+                element: Box::new(TypeRepr::Int),
+            },
+            "List<Int>",
+        )?;
+        let FieldKind::PointerIndirect { tail_alignment } = kind else {
+            return Err(BufferError::MalformedPayload {
+                name: field_name.to_string(),
+                reason: "expected pointer-indirect kind",
+            });
+        };
+        let (count, payload_start) =
+            self.decode_pointer_header(field_name, ptr_offset, tail_alignment)?;
+        let byte_len = count
+            .checked_mul(8)
+            .ok_or_else(|| BufferError::MalformedPayload {
+                name: field_name.to_string(),
+                reason: "byte length overflows usize",
+            })?;
+        let payload_end =
+            payload_start
+                .checked_add(byte_len)
+                .ok_or_else(|| BufferError::MalformedPayload {
+                    name: field_name.to_string(),
+                    reason: "payload end overflows usize",
+                })?;
+        if payload_end > self.bytes.len() {
+            return Err(BufferError::MalformedPayload {
+                name: field_name.to_string(),
+                reason: "payload exceeds buffer end",
+            });
+        }
+        let mut out = Vec::with_capacity(count);
+        let mut cursor = payload_start;
+        for _ in 0..count {
+            let mut buf = [0u8; 8];
+            buf.copy_from_slice(&self.bytes[cursor..cursor + 8]);
+            out.push(i64::from_le_bytes(buf));
+            cursor += 8;
+        }
+        Ok(out)
+    }
+
+    /// Resolve a fixed-area `u32` pointer slot into `(payload_count,
+    /// payload_byte_offset)`. `inner_alignment` controls the padding
+    /// between the length prefix and the payload bytes — `String`
+    /// passes `0` (no padding); `List<Int>` passes `8`.
+    fn decode_pointer_header(
+        &self,
+        field_name: &str,
+        ptr_offset: usize,
+        inner_alignment: usize,
+    ) -> Result<(usize, usize), BufferError> {
+        if ptr_offset
+            .checked_add(4)
+            .map(|end| end > self.bytes.len())
+            .unwrap_or(true)
+        {
+            return Err(BufferError::MalformedPayload {
+                name: field_name.to_string(),
+                reason: "pointer slot exceeds buffer end",
+            });
+        }
+        let mut ptr_buf = [0u8; 4];
+        ptr_buf.copy_from_slice(&self.bytes[ptr_offset..ptr_offset + 4]);
+        let record_start = u32::from_le_bytes(ptr_buf) as usize;
+        if record_start
+            .checked_add(4)
+            .map(|end| end > self.bytes.len())
+            .unwrap_or(true)
+        {
+            return Err(BufferError::MalformedPayload {
+                name: field_name.to_string(),
+                reason: "length prefix exceeds buffer end",
+            });
+        }
+        let mut len_buf = [0u8; 4];
+        len_buf.copy_from_slice(&self.bytes[record_start..record_start + 4]);
+        let count = u32::from_le_bytes(len_buf) as usize;
+        let payload_start_raw = record_start + 4;
+        let payload_start = if inner_alignment > 1 {
+            let rem = payload_start_raw % inner_alignment;
+            if rem == 0 {
+                payload_start_raw
+            } else {
+                payload_start_raw
+                    .checked_add(inner_alignment - rem)
+                    .ok_or_else(|| BufferError::MalformedPayload {
+                        name: field_name.to_string(),
+                        reason: "payload start overflows usize",
+                    })?
+            }
+        } else {
+            payload_start_raw
+        };
+        Ok((count, payload_start))
     }
 
     fn locate(
@@ -250,11 +548,11 @@ impl<'a> BufferReader<'a> {
         field_name: &str,
         expected: &TypeRepr,
         requested_label: &'static str,
-    ) -> Result<(usize, usize), BufferError> {
+    ) -> Result<(usize, usize, FieldKind), BufferError> {
         let entry = self
             .field_index
             .iter()
-            .find(|(name, _, _, _)| name == field_name)
+            .find(|(name, _, _, _, _)| name == field_name)
             .ok_or_else(|| BufferError::UnknownField {
                 name: field_name.to_string(),
             })?;
@@ -265,7 +563,7 @@ impl<'a> BufferReader<'a> {
                 requested: requested_label,
             });
         }
-        Ok((entry.2, entry.3))
+        Ok((entry.2, entry.3, entry.4))
     }
 
     /// Read-only access to the layout this reader walks.
@@ -276,16 +574,20 @@ impl<'a> BufferReader<'a> {
 }
 
 /// Compare a schema-declared [`TypeRepr`] against the one a writer /
-/// reader assumed. v1 only ever calls this on scalar leaves, so the
-/// match is exact (no subtype rules).
+/// reader assumed. Phase 2.c keeps the match exact — scalar leaves,
+/// `String`, and `List<Int>` are the supported shapes.
 fn type_matches(declared: &TypeRepr, requested: &TypeRepr) -> bool {
-    matches!(
-        (declared, requested),
+    match (declared, requested) {
         (TypeRepr::Int, TypeRepr::Int)
-            | (TypeRepr::Float, TypeRepr::Float)
-            | (TypeRepr::Bool, TypeRepr::Bool)
-            | (TypeRepr::Null, TypeRepr::Null)
-    )
+        | (TypeRepr::Float, TypeRepr::Float)
+        | (TypeRepr::Bool, TypeRepr::Bool)
+        | (TypeRepr::Null, TypeRepr::Null)
+        | (TypeRepr::String, TypeRepr::String) => true,
+        (TypeRepr::List { element: d }, TypeRepr::List { element: r }) => {
+            matches!((d.as_ref(), r.as_ref()), (TypeRepr::Int, TypeRepr::Int))
+        }
+        _ => false,
+    }
 }
 
 /// Human-readable label for the schema's declared type. Used in the
@@ -429,6 +731,124 @@ mod tests {
         let reader = BufferReader::new(&layout, &schema.fields, &bytes).expect("reader");
         assert_eq!(reader.read_float("mass").expect("read mass"), 1.5);
         reader.read_null("nil").expect("read nil");
+    }
+
+    #[test]
+    fn write_string_then_read_back_roundtrips() {
+        let schema = Schema {
+            name: "Greet".into(),
+            generics: vec![],
+            fields: vec![field("name", TypeRepr::String)],
+        };
+        let layout = SchemaLayout::offsets_for(&schema).expect("layout");
+        let mut builder = BufferBuilder::new(&layout, &schema.fields);
+        builder.write_string("name", "hello").expect("write name");
+        let bytes = builder.finish();
+        let reader = BufferReader::new(&layout, &schema.fields, &bytes).expect("reader");
+        assert_eq!(reader.read_string("name").expect("read name"), "hello");
+    }
+
+    #[test]
+    fn empty_string_roundtrips() {
+        // Zero-byte payload still gets a length prefix, so the reader
+        // must walk through `[len=0][]` without spuriously claiming
+        // out-of-bounds.
+        let schema = Schema {
+            name: "Greet".into(),
+            generics: vec![],
+            fields: vec![field("name", TypeRepr::String)],
+        };
+        let layout = SchemaLayout::offsets_for(&schema).expect("layout");
+        let mut builder = BufferBuilder::new(&layout, &schema.fields);
+        builder.write_string("name", "").expect("write empty");
+        let bytes = builder.finish();
+        let reader = BufferReader::new(&layout, &schema.fields, &bytes).expect("reader");
+        assert_eq!(reader.read_string("name").expect("read name"), "");
+    }
+
+    #[test]
+    fn write_string_then_int_fixed_area_lays_out_correctly() {
+        // Pointer slot at 0..4, padding 4..8, Int slot at 8..16. The
+        // tail-area record sits at offset 16 (or later if padded).
+        // We verify the layout via direct byte inspection so a
+        // regression in the slot order surfaces immediately.
+        let schema = Schema {
+            name: "User".into(),
+            generics: vec![],
+            fields: vec![field("name", TypeRepr::String), field("age", TypeRepr::Int)],
+        };
+        let layout = SchemaLayout::offsets_for(&schema).expect("layout");
+        let mut builder = BufferBuilder::new(&layout, &schema.fields);
+        builder.write_string("name", "ada").expect("write name");
+        builder.write_int("age", 36).expect("write age");
+        let bytes = builder.finish();
+
+        // First 4 bytes hold the tail-area pointer; bytes 8..16 hold
+        // the Int slot regardless of how big the tail record is.
+        let ptr = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
+        assert!(ptr >= layout.root_size);
+        let len_prefix = u32::from_le_bytes(bytes[ptr..ptr + 4].try_into().unwrap()) as usize;
+        assert_eq!(len_prefix, "ada".len());
+        let age = i64::from_le_bytes(bytes[8..16].try_into().unwrap());
+        assert_eq!(age, 36);
+
+        let reader = BufferReader::new(&layout, &schema.fields, &bytes).expect("reader");
+        assert_eq!(reader.read_string("name").expect("read name"), "ada");
+        assert_eq!(reader.read_int("age").expect("read age"), 36);
+    }
+
+    #[test]
+    fn unknown_field_on_write_string_is_rejected() {
+        let schema = Schema {
+            name: "Greet".into(),
+            generics: vec![],
+            fields: vec![field("name", TypeRepr::String)],
+        };
+        let layout = SchemaLayout::offsets_for(&schema).expect("layout");
+        let mut builder = BufferBuilder::new(&layout, &schema.fields);
+        let err = builder
+            .write_string("missing", "x")
+            .expect_err("unknown field must reject");
+        assert!(matches!(err, BufferError::UnknownField { ref name } if name == "missing"));
+    }
+
+    #[test]
+    fn write_list_int_then_read_back_roundtrips() {
+        let schema = Schema {
+            name: "Nums".into(),
+            generics: vec![],
+            fields: vec![field(
+                "nums",
+                TypeRepr::List {
+                    element: Box::new(TypeRepr::Int),
+                },
+            )],
+        };
+        let layout = SchemaLayout::offsets_for(&schema).expect("layout");
+        let mut builder = BufferBuilder::new(&layout, &schema.fields);
+        builder
+            .write_list_int("nums", &[1, -2, 3])
+            .expect("write nums");
+        let bytes = builder.finish();
+        let reader = BufferReader::new(&layout, &schema.fields, &bytes).expect("reader");
+        assert_eq!(
+            reader.read_list_int("nums").expect("read nums"),
+            vec![1, -2, 3]
+        );
+    }
+
+    #[test]
+    fn buffer_too_small_on_string_schema_rejected() {
+        let schema = Schema {
+            name: "Greet".into(),
+            generics: vec![],
+            fields: vec![field("name", TypeRepr::String)],
+        };
+        let layout = SchemaLayout::offsets_for(&schema).expect("layout");
+        let short = vec![0u8; layout.root_size - 1];
+        let err = BufferReader::new(&layout, &schema.fields, &short)
+            .expect_err("short buffer must reject");
+        assert!(matches!(err, BufferError::BufferTooSmall { .. }));
     }
 
     #[test]

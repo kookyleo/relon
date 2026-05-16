@@ -271,21 +271,13 @@ fn emit_function_body(
     main_layout: &OffsetTable,
     return_layout: &OffsetTable,
 ) -> Result<(Function, Vec<TokenRange>), CodegenError> {
-    // Walk the body once up front to determine which wasm value type
-    // the trailing StoreField needs as its spill local. Phase 2.b
-    // emits at most one StoreField, so this is a single-pass scan
-    // looking for the first such op.
-    let store_local_ty = func
-        .body
-        .iter()
-        .find_map(|t| {
-            if let Op::StoreField { ty, .. } = &t.op {
-                Some(store_field_local_valtype(*ty))
-            } else {
-                None
-            }
-        })
-        .unwrap_or(ValType::I64);
+    // Walk the body (recursively into if-branches) to determine
+    // which wasm value type the trailing StoreField needs as its
+    // spill local. Phase 2.c still only emits a single StoreField,
+    // and the lowering pass keeps it at the top-level tail, but
+    // recursing keeps the scan robust if a future phase moves the
+    // store inside a branch.
+    let store_local_ty = find_store_field_local_ty(&func.body).unwrap_or(ValType::I64);
 
     // Declare one scratch local of the right shape so
     // `emit_store_field` can spill the value before pushing
@@ -320,9 +312,31 @@ fn emit_function_body(
 
     // Virtual stack used to validate arithmetic type tags.
     let mut vstack: Vec<IrType> = Vec::new();
-    let param_types = &func.params;
+    emit_op_seq(&mut f, &mut ranges, &mut vstack, &func.body, func)?;
 
-    for tagged in &func.body {
+    // Epilogue: push `bytes_written = return_root_size` and emit the
+    // trailing `End`.
+    f.instruction(&Instruction::I32Const(return_root_size as i32));
+    ranges.push(func.range);
+
+    f.instruction(&Instruction::End);
+    ranges.push(func.range);
+
+    Ok((f, ranges))
+}
+
+/// Emit a sequence of [`TaggedOp`] into `f`, growing `ranges` and
+/// `vstack` in lock-step. Used by [`emit_function_body`] for the top
+/// level body and recursively for the `then`/`else` arms of [`Op::If`].
+fn emit_op_seq(
+    f: &mut Function,
+    ranges: &mut Vec<TokenRange>,
+    vstack: &mut Vec<IrType>,
+    body: &[relon_ir::TaggedOp],
+    func: &relon_ir::Func,
+) -> Result<(), CodegenError> {
+    let param_types = &func.params;
+    for tagged in body {
         match &tagged.op {
             Op::ConstI64(v) => {
                 f.instruction(&Instruction::I64Const(*v));
@@ -346,8 +360,16 @@ fn emit_function_body(
                 ranges.push(tagged.range);
             }
             Op::LoadField { offset, ty } => {
-                emit_load_field(&mut f, &mut ranges, *offset, *ty, tagged.range);
+                emit_load_field(f, ranges, *offset, *ty, tagged.range);
                 vstack.push(load_field_stack_type(*ty));
+            }
+            Op::LoadStringPtr { offset } => {
+                emit_load_pointer(f, ranges, *offset, tagged.range);
+                vstack.push(IrType::String);
+            }
+            Op::LoadListIntPtr { offset } => {
+                emit_load_pointer(f, ranges, *offset, tagged.range);
+                vstack.push(IrType::ListInt);
             }
             Op::StoreField { offset, ty } => {
                 // Store layout: the value to store is currently on
@@ -359,17 +381,6 @@ fn emit_function_body(
                 // need a generic shuffle — we instead spill the
                 // value to a synthesized local just before storing.
                 //
-                // Simpler approach: insert the address push right
-                // before the StoreField op. But the value is already
-                // on the stack — we'd need to swap. Wasm's MVP has
-                // no `swap`, so we spill to a local instead.
-                //
-                // For Phase 2.b we sidestep the shuffle entirely by
-                // requiring the StoreField caller to have already
-                // emitted `local.get $out_ptr` before the value
-                // computation. Lowering does *not* emit that pre-
-                // push, so we must spill here.
-                //
                 // Emit sequence (for non-Null types):
                 //   <value already on stack>
                 //   local.set $tmp
@@ -377,30 +388,70 @@ fn emit_function_body(
                 //   local.get $tmp
                 //   <store>.offset=N
                 let popped = vstack.pop().ok_or(CodegenError::MixedNumericTypes)?;
-                if popped != stack_type_for_storefield(*ty) {
+                if popped.wasm_slot() != stack_type_for_storefield(*ty).wasm_slot() {
                     return Err(CodegenError::MixedNumericTypes);
                 }
-                emit_store_field(&mut f, &mut ranges, *offset, *ty, tagged.range)?;
+                emit_store_field(f, ranges, *offset, *ty, tagged.range)?;
             }
             Op::Add(tag) => {
-                emit_arith(&mut f, &mut vstack, *tag, ArithOp::Add)?;
+                emit_arith(f, vstack, *tag, ArithOp::Add)?;
                 ranges.push(tagged.range);
             }
             Op::Sub(tag) => {
-                emit_arith(&mut f, &mut vstack, *tag, ArithOp::Sub)?;
+                emit_arith(f, vstack, *tag, ArithOp::Sub)?;
                 ranges.push(tagged.range);
             }
             Op::Mul(tag) => {
-                emit_arith(&mut f, &mut vstack, *tag, ArithOp::Mul)?;
+                emit_arith(f, vstack, *tag, ArithOp::Mul)?;
                 ranges.push(tagged.range);
             }
             Op::Div(tag) => {
-                emit_arith(&mut f, &mut vstack, *tag, ArithOp::Div)?;
+                emit_arith(f, vstack, *tag, ArithOp::Div)?;
                 ranges.push(tagged.range);
             }
             Op::Mod(tag) => {
-                emit_arith(&mut f, &mut vstack, *tag, ArithOp::Mod)?;
+                emit_arith(f, vstack, *tag, ArithOp::Mod)?;
                 ranges.push(tagged.range);
+            }
+            Op::Eq(tag) => {
+                emit_cmp(f, vstack, *tag, CmpOp::Eq)?;
+                ranges.push(tagged.range);
+            }
+            Op::Ne(tag) => {
+                emit_cmp(f, vstack, *tag, CmpOp::Ne)?;
+                ranges.push(tagged.range);
+            }
+            Op::Lt(tag) => {
+                emit_cmp(f, vstack, *tag, CmpOp::Lt)?;
+                ranges.push(tagged.range);
+            }
+            Op::Le(tag) => {
+                emit_cmp(f, vstack, *tag, CmpOp::Le)?;
+                ranges.push(tagged.range);
+            }
+            Op::Gt(tag) => {
+                emit_cmp(f, vstack, *tag, CmpOp::Gt)?;
+                ranges.push(tagged.range);
+            }
+            Op::Ge(tag) => {
+                emit_cmp(f, vstack, *tag, CmpOp::Ge)?;
+                ranges.push(tagged.range);
+            }
+            Op::If {
+                result_ty,
+                then_body,
+                else_body,
+            } => {
+                emit_if(
+                    f,
+                    ranges,
+                    vstack,
+                    *result_ty,
+                    then_body,
+                    else_body,
+                    func,
+                    tagged.range,
+                )?;
             }
             Op::Return => {
                 // Wasm encodes "return at end" as a bare `end` —
@@ -411,24 +462,116 @@ fn emit_function_body(
             }
         }
     }
+    Ok(())
+}
 
-    // Epilogue: push `bytes_written = return_root_size` and emit the
-    // trailing `End`.
-    f.instruction(&Instruction::I32Const(return_root_size as i32));
-    ranges.push(func.range);
+/// Emit an `if (result <valtype>) <then> else <else> end` block.
+///
+/// Frame discipline:
+///   - Pops one i32 condition from the vstack before emitting the
+///     `If`. Lowering already restricted condition type to `Bool`,
+///     so we check the slot rather than the exact tag.
+///   - Inside each branch we re-emit the matching ops with a fresh
+///     view of the vstack so frame-leak (e.g. an inner branch
+///     pushing two values where one was promised) surfaces as a
+///     `MixedNumericTypes` rather than corrupting the outer frame.
+///   - Both branches must end with exactly one value of `result_ty`
+///     on top of their local vstack; we then merge them into a
+///     single push on the outer vstack.
+#[allow(clippy::too_many_arguments)]
+fn emit_if(
+    f: &mut Function,
+    ranges: &mut Vec<TokenRange>,
+    vstack: &mut Vec<IrType>,
+    result_ty: IrType,
+    then_body: &[relon_ir::TaggedOp],
+    else_body: &[relon_ir::TaggedOp],
+    func: &relon_ir::Func,
+    range: TokenRange,
+) -> Result<(), CodegenError> {
+    let cond = vstack.pop().ok_or(CodegenError::MixedNumericTypes)?;
+    if cond.wasm_slot() != IrType::I32 {
+        // Condition must occupy an i32 slot (Bool is the canonical
+        // form; the codegen will accept any tag that materialises as
+        // an i32 on the wasm stack since the wasm `if` only inspects
+        // a single i32).
+        return Err(CodegenError::MixedNumericTypes);
+    }
+    let block_type = BlockType::Result(ir_to_val_type(&result_ty));
+    f.instruction(&Instruction::If(block_type));
+    ranges.push(range);
+
+    // `then` arm.
+    let mut then_stack: Vec<IrType> = Vec::new();
+    emit_op_seq(f, ranges, &mut then_stack, then_body, func)?;
+    let then_top = match then_stack.pop() {
+        Some(t) => t,
+        None => return Err(CodegenError::MixedNumericTypes),
+    };
+    if !then_stack.is_empty() {
+        return Err(CodegenError::MixedNumericTypes);
+    }
+    if then_top.wasm_slot() != result_ty.wasm_slot() {
+        return Err(CodegenError::IfBranchTypeMismatch {
+            then_ty: then_top,
+            else_ty: result_ty,
+        });
+    }
+
+    f.instruction(&Instruction::Else);
+    ranges.push(range);
+
+    // `else` arm.
+    let mut else_stack: Vec<IrType> = Vec::new();
+    emit_op_seq(f, ranges, &mut else_stack, else_body, func)?;
+    let else_top = match else_stack.pop() {
+        Some(t) => t,
+        None => return Err(CodegenError::MixedNumericTypes),
+    };
+    if !else_stack.is_empty() {
+        return Err(CodegenError::MixedNumericTypes);
+    }
+    if else_top.wasm_slot() != result_ty.wasm_slot() {
+        return Err(CodegenError::IfBranchTypeMismatch {
+            then_ty: result_ty,
+            else_ty: else_top,
+        });
+    }
 
     f.instruction(&Instruction::End);
-    ranges.push(func.range);
+    ranges.push(range);
+    vstack.push(result_ty);
+    Ok(())
+}
 
-    Ok((f, ranges))
+/// Emit an `i32.load offset=N` pulling a 4-byte pointer out of the
+/// `in_buf`. Used for both `LoadStringPtr` and `LoadListIntPtr`; the
+/// wasm representation is identical (raw i32 pointer) — only the IR
+/// tag differs.
+fn emit_load_pointer(
+    f: &mut Function,
+    ranges: &mut Vec<TokenRange>,
+    offset: u32,
+    range: TokenRange,
+) {
+    f.instruction(&Instruction::LocalGet(WASM_LOCAL_IN_PTR));
+    ranges.push(range);
+    f.instruction(&Instruction::I32Load(MemArg {
+        offset: offset as u64,
+        // 4-byte alignment for u32 (log2 = 2).
+        align: 2,
+        memory_index: 0,
+    }));
+    ranges.push(range);
 }
 
 /// Wasm-side stack representation of a loaded field. `Int` / `Float`
-/// load as `i64` / `f64`; `Bool` / `Null` load as `i32`.
+/// load as `i64` / `f64`; `Bool` / `Null` / `String` / `ListInt`
+/// load as `i32` (a byte tag or a tail-area pointer).
 fn load_field_stack_type(ty: IrType) -> IrType {
     match ty {
         IrType::I64 | IrType::F64 => ty,
-        IrType::Bool | IrType::Null => IrType::I32,
+        IrType::Bool | IrType::Null | IrType::String | IrType::ListInt => IrType::I32,
         // `I32` field reads aren't used in Phase 2.b (the canonical
         // schema doesn't surface a raw i32 leaf), but we keep the
         // arm exhaustive for forward compat.
@@ -514,7 +657,13 @@ fn emit_load_field(
             }));
             ranges.push(range);
         }
-        IrType::I32 => {
+        IrType::I32 | IrType::String | IrType::ListInt => {
+            // `String` / `ListInt` LoadField is rare — lowering
+            // normally emits the explicit `LoadStringPtr` /
+            // `LoadListIntPtr` ops because the IR-level tag carries
+            // forward more diagnostic info. But a hand-built IR
+            // using `LoadField { ty: String }` falls back to the
+            // same 4-byte `i32.load`, so we keep the path open.
             f.instruction(&Instruction::LocalGet(WASM_LOCAL_IN_PTR));
             ranges.push(range);
             f.instruction(&Instruction::I32Load(MemArg {
@@ -576,6 +725,13 @@ fn emit_store_field(
             align: 0,
             memory_index: 0,
         }),
+        // Phase 2.c does not lower `#main` bodies that return
+        // String / List<Int>, so a hand-built IR landing here
+        // would emit a 4-byte pointer store. Reject for now —
+        // upstream lowering already gates this away.
+        IrType::String | IrType::ListInt => {
+            return Err(CodegenError::UnsupportedStoreFieldType { ty });
+        }
     };
     f.instruction(&Instruction::LocalSet(STORE_TMP_LOCAL_INDEX));
     ranges.push(range);
@@ -599,11 +755,44 @@ const STORE_TMP_LOCAL_INDEX: u32 = 4;
 /// an i32 slot. The slot is preallocated by `emit_function_body`
 /// based on the first `StoreField` op in the body — see the call site
 /// for the single-StoreField assumption rationale.
+/// Recursively scan `body` for the first `StoreField` op and return
+/// the wasm value type its spill local should have. Returns `None`
+/// when the body never stores — `emit_function_body` defaults to
+/// `i64` in that case (any wasm valtype keeps the local declaration
+/// well-formed; a never-used local has zero runtime cost).
+fn find_store_field_local_ty(body: &[relon_ir::TaggedOp]) -> Option<ValType> {
+    for tagged in body {
+        match &tagged.op {
+            Op::StoreField { ty, .. } => return Some(store_field_local_valtype(*ty)),
+            Op::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                if let Some(t) = find_store_field_local_ty(then_body) {
+                    return Some(t);
+                }
+                if let Some(t) = find_store_field_local_ty(else_body) {
+                    return Some(t);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 fn store_field_local_valtype(ty: IrType) -> ValType {
     match ty {
         IrType::I64 => ValType::I64,
         IrType::F64 => ValType::F64,
-        IrType::I32 | IrType::Bool | IrType::Null => ValType::I32,
+        // String / ListInt would only ever appear here if a later
+        // phase started writing variable-length data out of `#main`.
+        // Phase 2.c keeps the return surface to Int / Float / Bool
+        // / Null, but the arm stays exhaustive for forward compat.
+        IrType::I32 | IrType::Bool | IrType::Null | IrType::String | IrType::ListInt => {
+            ValType::I32
+        }
     }
 }
 
@@ -613,6 +802,15 @@ enum ArithOp {
     Mul,
     Div,
     Mod,
+}
+
+enum CmpOp {
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
 }
 
 fn emit_arith(
@@ -637,16 +835,86 @@ fn emit_arith(
         (IrType::F64, ArithOp::Mul) => Instruction::F64Mul,
         (IrType::F64, ArithOp::Div) => Instruction::F64Div,
         (IrType::F64, ArithOp::Mod) => return Err(CodegenError::MixedNumericTypes),
-        // Arithmetic on I32 / Bool / Null is not part of the surface
-        // — the lowering pass rejects bodies with these tags. A
-        // hand-crafted IR landing here gets the same treatment as a
-        // mixed-type body.
-        (IrType::I32, _) | (IrType::Bool, _) | (IrType::Null, _) => {
+        // Arithmetic on I32 / Bool / Null / String / ListInt is not
+        // part of the surface — the lowering pass rejects bodies
+        // with these tags. A hand-crafted IR landing here gets the
+        // same treatment as a mixed-type body.
+        (IrType::I32, _)
+        | (IrType::Bool, _)
+        | (IrType::Null, _)
+        | (IrType::String, _)
+        | (IrType::ListInt, _) => {
             return Err(CodegenError::MixedNumericTypes);
         }
     };
     f.instruction(&instr);
     vstack.push(tag);
+    Ok(())
+}
+
+/// Emit one of the six comparison ops (`==`, `!=`, `<`, `<=`, `>`,
+/// `>=`). Pops two operands of the tagged type; pushes a `Bool`
+/// (occupying an i32 wasm slot).
+fn emit_cmp(
+    f: &mut Function,
+    vstack: &mut Vec<IrType>,
+    tag: IrType,
+    op: CmpOp,
+) -> Result<(), CodegenError> {
+    let rhs = vstack.pop().ok_or(CodegenError::MixedNumericTypes)?;
+    let lhs = vstack.pop().ok_or(CodegenError::MixedNumericTypes)?;
+    if lhs.wasm_slot() != tag.wasm_slot() || rhs.wasm_slot() != tag.wasm_slot() {
+        return Err(CodegenError::MixedNumericTypes);
+    }
+    let instr = match (tag, &op) {
+        // Int comparisons — signed.
+        (IrType::I64, CmpOp::Eq) => Instruction::I64Eq,
+        (IrType::I64, CmpOp::Ne) => Instruction::I64Ne,
+        (IrType::I64, CmpOp::Lt) => Instruction::I64LtS,
+        (IrType::I64, CmpOp::Le) => Instruction::I64LeS,
+        (IrType::I64, CmpOp::Gt) => Instruction::I64GtS,
+        (IrType::I64, CmpOp::Ge) => Instruction::I64GeS,
+        // Float comparisons.
+        (IrType::F64, CmpOp::Eq) => Instruction::F64Eq,
+        (IrType::F64, CmpOp::Ne) => Instruction::F64Ne,
+        (IrType::F64, CmpOp::Lt) => Instruction::F64Lt,
+        (IrType::F64, CmpOp::Le) => Instruction::F64Le,
+        (IrType::F64, CmpOp::Gt) => Instruction::F64Gt,
+        (IrType::F64, CmpOp::Ge) => Instruction::F64Ge,
+        // Bool equality / inequality via i32 compare. Ordering on
+        // Bool is rejected — wasm has no defined `<` between Bool
+        // values that matches the surface semantics.
+        (IrType::Bool, CmpOp::Eq) => Instruction::I32Eq,
+        (IrType::Bool, CmpOp::Ne) => Instruction::I32Ne,
+        (IrType::Bool, _) => {
+            return Err(CodegenError::InvalidComparisonOperandType { ty: IrType::Bool });
+        }
+        // `Null == Null` always true / `Null != Null` always false.
+        // Pop the two operands that are already on the wasm stack
+        // (their values are unused) by emitting `i32.eq` over them —
+        // both are zero so the result naturally agrees.
+        (IrType::Null, CmpOp::Eq) => Instruction::I32Eq,
+        (IrType::Null, CmpOp::Ne) => Instruction::I32Ne,
+        (IrType::Null, _) => {
+            return Err(CodegenError::InvalidComparisonOperandType { ty: IrType::Null });
+        }
+        // String / ListInt / I32 comparisons aren't part of the
+        // Phase 2.c surface — lowering rejects upstream; we reject
+        // here too so hand-built IR can't sneak in pointer compares.
+        (IrType::String, _) => {
+            return Err(CodegenError::InvalidComparisonOperandType { ty: IrType::String });
+        }
+        (IrType::ListInt, _) => {
+            return Err(CodegenError::InvalidComparisonOperandType {
+                ty: IrType::ListInt,
+            });
+        }
+        (IrType::I32, _) => {
+            return Err(CodegenError::InvalidComparisonOperandType { ty: IrType::I32 });
+        }
+    };
+    f.instruction(&instr);
+    vstack.push(IrType::Bool);
     Ok(())
 }
 
@@ -658,8 +926,10 @@ fn ir_to_val_type(t: &IrType) -> ValType {
         IrType::F64 => ValType::F64,
         // Bool / Null occupy an i32 slot on the wasm operand stack
         // (they're 1 byte on the wire but always loaded into an i32
-        // via `i32.load8_u` / `i32.const`).
-        IrType::Bool | IrType::Null => ValType::I32,
+        // via `i32.load8_u` / `i32.const`). String / ListInt are
+        // tail-area pointers and ride an i32 slot too — they enter
+        // the wasm stack via `i32.load offset=N`.
+        IrType::Bool | IrType::Null | IrType::String | IrType::ListInt => ValType::I32,
     }
 }
 
