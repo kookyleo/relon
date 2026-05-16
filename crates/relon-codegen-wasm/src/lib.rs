@@ -32,12 +32,14 @@
 
 pub mod abi;
 pub mod error;
+pub mod evaluator;
 pub mod host_fns;
 pub mod srcmap;
 pub mod unreachable_table;
 
 pub use abi::{AbiError, AbiMetadata};
 pub use error::{CodegenError, LoadError};
+pub use evaluator::{BuildError, WasmAotEvaluator};
 pub use host_fns::{
     hash_params, hash_return, HostFnEntry, HostFnError, HostFnTable, NO_CAPABILITY,
 };
@@ -94,7 +96,7 @@ const DEFAULT_MEMORY_PAGES: u64 = 1;
 /// regions don't collide. Hosts that want to write past 4 KiB should
 /// either drop their pointers below it or grow memory; both stay
 /// compatible because the linear memory is host-writable.
-const DATA_SECTION_BASE: u32 = 4096;
+pub(crate) const DATA_SECTION_BASE: u32 = 4096;
 
 /// Exported i32 global telling the host where the codegen-managed
 /// const data section ends. Host SDKs that allocate `in_buf` /

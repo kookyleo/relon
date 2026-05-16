@@ -1699,6 +1699,8 @@ name = "relon"
 version = "0.1.0"
 dependencies = [
  "relon-analyzer",
+ "relon-codegen-wasm",
+ "relon-eval-api",
  "relon-evaluator",
  "relon-parser",
  "serde",
@@ -1736,6 +1738,8 @@ dependencies = [
  "miette",
  "relon",
  "relon-analyzer",
+ "relon-codegen-wasm",
+ "relon-eval-api",
  "relon-evaluator",
  "relon-fmt",
  "relon-lsp",
@@ -1747,8 +1751,10 @@ dependencies = [
 name = "relon-codegen-wasm"
 version = "0.1.0"
 dependencies = [
+ "ordered-float",
  "relon-analyzer",
  "relon-eval-api",
+ "relon-evaluator",
  "relon-ir",
  "relon-parser",
  "sha2",

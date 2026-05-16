@@ -316,4 +316,23 @@ pub enum RuntimeError {
         /// `None` for stdlib / synthetic / out-of-range pcs.
         range: Option<TokenRange>,
     },
+
+    /// Phase 8: the active backend cannot satisfy the requested
+    /// `Evaluator` method. The wasm-AOT backend uses this to refuse
+    /// `eval` / `eval_root` / `force_thunk` / `invoke_closure` because
+    /// its AST is consumed at compile time and the runtime only knows
+    /// how to drive the precompiled `run_main` entry. Host-side hooks
+    /// that depend on lazy / first-class-closure semantics need to
+    /// either switch to the tree-walker or be reformulated.
+    #[error("operation not supported by this backend: {reason}")]
+    #[diagnostic(
+        code(relon::eval::unsupported),
+        help("This backend lacks the runtime structures the operation needs. Switch to the tree-walking backend, or restrict the call to `run_main`.")
+    )]
+    Unsupported {
+        /// Human-readable explanation of why the backend cannot
+        /// honour the call. Free-form so each backend can describe
+        /// its own constraint (e.g. "wasm-aot has no AST at runtime").
+        reason: String,
+    },
 }

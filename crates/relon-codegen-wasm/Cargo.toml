@@ -17,6 +17,15 @@ relon-ir = { workspace = true }
 relon-eval-api = { workspace = true }
 # Source positions for srcmap custom section
 relon-parser = { workspace = true }
+# Phase 8: `WasmAotEvaluator::from_source` runs the per-file analyzer
+# before lowering so the codegen path matches what the tree-walker
+# does. Workspace mode (multi-file `#import`) remains a Phase 9 goal;
+# the single-file form needs only `relon_analyzer::analyze`.
+relon-analyzer = { workspace = true }
+# Phase 8: `Value`-side construction from `BufferReader` output and
+# the `serde_json` interop for argument bridging both live in the
+# evaluator module.
+ordered-float = { workspace = true }
 
 thiserror = { workspace = true }
 # Canonical-signature hashing for `#native` host imports. Same crate
@@ -44,6 +53,8 @@ wasmparser = "0.249"
 wasmtime = "44"
 
 [dev-dependencies]
-# Source -> AnalyzedTree pipeline driving the Phase 1.beta /
-# Phase 2.b end-to-end test.
-relon-analyzer = { workspace = true }
+# Phase 8 parity smoke tests pit the wasm-AOT backend against the
+# tree-walker, so we pull the tree-walker in as a dev-dep. Production
+# users keep the dependency at zero because the parity check only
+# runs under `cargo test`.
+relon-evaluator = { workspace = true }
