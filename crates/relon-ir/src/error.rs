@@ -5,6 +5,8 @@
 //! 1.beta and will land alongside the analyzer-error display
 //! pipeline.
 
+use relon_eval_api::layout::LayoutError;
+use relon_eval_api::schema_lower::SchemaLowerError;
 use relon_parser::{Operator, TokenRange};
 use thiserror::Error;
 
@@ -79,4 +81,16 @@ pub enum LoweringError {
         /// The id the caller passed in.
         module: String,
     },
+    /// Phase 2.b: a `#main` parameter or return type can't be lowered
+    /// to the canonical schema form. Wraps the canonical-side error
+    /// (which already knows the field name and the offending type)
+    /// so callers can match on it without re-deriving the message.
+    #[error(transparent)]
+    SchemaLower(#[from] SchemaLowerError),
+    /// Phase 2.b: the schema laid out fine canonically but the layout
+    /// pass refused to size it (variable-size types, overflow). Wraps
+    /// `relon_eval_api::layout::LayoutError` for the same reason as
+    /// `SchemaLower`.
+    #[error(transparent)]
+    Layout(#[from] LayoutError),
 }
