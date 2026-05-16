@@ -45,9 +45,11 @@ use relon_ir::{
     WASM_LOCAL_OUT_CAP, WASM_LOCAL_OUT_PTR,
 };
 use relon_parser::TokenRange;
+use std::collections::HashMap;
 use wasm_encoder::{
-    BlockType, CodeSection, CustomSection, ExportKind, ExportSection, Function, FunctionSection,
-    Ieee64, Instruction, MemArg, MemorySection, MemoryType, Module, TypeSection, ValType,
+    BlockType, CodeSection, ConstExpr, CustomSection, DataSection, ExportKind, ExportSection,
+    Function, FunctionSection, GlobalSection, GlobalType, Ieee64, Instruction, MemArg,
+    MemorySection, MemoryType, Module, TypeSection, ValType,
 };
 
 /// Memory export name used by the binary handshake.
@@ -57,6 +59,51 @@ const MEMORY_EXPORT_NAME: &str = "memory";
 /// only needs a small staging area for the in/out buffers — the host
 /// places its pointers at whatever offsets it pleases.
 const DEFAULT_MEMORY_PAGES: u64 = 1;
+
+/// Base address of the codegen-owned read-only data section inside
+/// wasm linear memory. Phase 3.a parks `ConstString` / `ConstListInt`
+/// records here so a wasm-side memory.copy can pull bytes into the
+/// caller's `out_buf` tail area at runtime.
+///
+/// Picked well above the host's typical staging area (`in_ptr` /
+/// `out_ptr` at offsets 0 / 256 in the integration tests) so the
+/// regions don't collide. Hosts that want to write past 4 KiB should
+/// either drop their pointers below it or grow memory; both stay
+/// compatible because the linear memory is host-writable.
+const DATA_SECTION_BASE: u32 = 4096;
+
+/// Exported i32 global telling the host where the codegen-managed
+/// const data section ends. Host SDKs that allocate `in_buf` /
+/// `out_buf` dynamically can read this once at instantiation and
+/// place their buffers above it to avoid overwriting const records.
+const DATA_TOP_GLOBAL_EXPORT_NAME: &str = "relon_data_top";
+
+/// Wasm-local index used as the scratch slot for `emit_store_field`
+/// when the value being stored is a scalar (i32 / i64 / f64). Sits
+/// right after the four binary-handshake params; the function
+/// declares one entry of the appropriate value type as part of its
+/// `locals` header.
+const STORE_TMP_LOCAL_INDEX: u32 = 4;
+/// Wasm-local index of the tail-area write cursor (i32). Initialised
+/// to `return_root_size` and bumped after every String / List<Int>
+/// return write so multiple pointer-indirect outputs can coexist in
+/// the same `out_buf`.
+const TAIL_CURSOR_LOCAL_INDEX: u32 = 5;
+/// Wasm-local index of the memcpy source pointer scratch (i32). Used
+/// by [`Op::StoreField`] of pointer-indirect types — we `tee` the
+/// source pointer here, then pull it back out twice (once for the
+/// length read, once for the memory.copy source argument).
+const MEMCPY_SRC_LOCAL_INDEX: u32 = 6;
+/// Wasm-local index of the memcpy record-size scratch (i32). Holds
+/// the total byte count we feed to `memory.copy` for the current
+/// pointer-indirect store; the same value bumps `$tail_cursor` after
+/// the copy completes.
+const MEMCPY_LEN_LOCAL_INDEX: u32 = 7;
+/// First wasm-local index reserved for user-let bindings. Each
+/// `Op::LetSet` allocates a fresh local of the right valtype past
+/// this point; codegen tracks the index map per function in
+/// [`emit_function_body`].
+const FIRST_LET_LOCAL_INDEX: u32 = 8;
 
 /// Lower a [`LoweredEntry`] to a wasm binary.
 ///
@@ -83,10 +130,18 @@ pub fn compile_module(
     let return_layout = SchemaLayout::offsets_for(return_schema)
         .map_err(|e| CodegenError::Layout(e.to_string()))?;
 
+    // Walk every function body up front and lay out the const data
+    // section. Each `ConstString` / `ConstListInt` op gets a stable
+    // absolute address inside `DATA_SECTION_BASE..DATA_SECTION_BASE+
+    // const_pool.bytes.len()` so the runtime emit can hardcode an
+    // `i32.const <addr>` per op.
+    let const_pool = build_const_pool(ir)?;
+
     let mut module = Module::new();
     let mut types = TypeSection::new();
     let mut functions = FunctionSection::new();
     let mut memories = MemorySection::new();
+    let mut globals = GlobalSection::new();
     let mut exports = ExportSection::new();
     let mut codes = CodeSection::new();
 
@@ -101,6 +156,23 @@ pub fn compile_module(
         page_size_log2: None,
     });
     exports.export(MEMORY_EXPORT_NAME, ExportKind::Memory, 0);
+
+    // `relon_data_top` global — high-water mark of the const-data
+    // region. Host SDKs can place their `in_buf` / `out_buf` past
+    // this point at instantiation time without colliding with const
+    // records. We always emit the global (even when the pool is
+    // empty) so a runtime check against it doesn't need to special-
+    // case the missing-export branch.
+    let data_top = DATA_SECTION_BASE + const_pool.total_bytes() as u32;
+    globals.global(
+        GlobalType {
+            val_type: ValType::I32,
+            mutable: false,
+            shared: false,
+        },
+        &ConstExpr::i32_const(data_top as i32),
+    );
+    exports.export(DATA_TOP_GLOBAL_EXPORT_NAME, ExportKind::Global, 0);
 
     let mut type_table: Vec<(Vec<ValType>, ValType, u32)> = Vec::new();
     let mut per_func_ranges: Vec<(TokenRange, Vec<TokenRange>)> =
@@ -127,7 +199,7 @@ pub fn compile_module(
             exports.export(func.name.as_str(), ExportKind::Func, func_index as u32);
         }
 
-        let (body, ranges) = emit_function_body(func, &main_layout, &return_layout)?;
+        let (body, ranges) = emit_function_body(func, &main_layout, &return_layout, &const_pool)?;
         codes.function(&body);
         per_func_ranges.push((func.range, ranges));
     }
@@ -135,8 +207,23 @@ pub fn compile_module(
     module.section(&types);
     module.section(&functions);
     module.section(&memories);
+    module.section(&globals);
     module.section(&exports);
     module.section(&codes);
+
+    // Initialise the const-data region inside linear memory. Active
+    // segment at `DATA_SECTION_BASE`; the body bytes are exactly the
+    // `[len:u32 LE][payload]` records the `Op::StoreField` path will
+    // `memory.copy` into the caller's `out_buf`.
+    if !const_pool.bytes.is_empty() {
+        let mut data = DataSection::new();
+        data.active(
+            0,
+            &ConstExpr::i32_const(DATA_SECTION_BASE as i32),
+            const_pool.bytes.iter().copied(),
+        );
+        module.section(&data);
+    }
 
     let bytes_so_far = module.as_slice().to_vec();
     let srcmap = build_srcmap(&bytes_so_far, &per_func_ranges)?;
@@ -247,6 +334,125 @@ fn token_range_to_entry(pc: u32, range: TokenRange) -> SrcMapEntry {
     }
 }
 
+/// Layout of the per-module read-only const data section.
+///
+/// Every [`Op::ConstString`] and [`Op::ConstListInt`] in the IR maps
+/// to a single record in `bytes`; codegen emits `i32.const <addr>`
+/// at the op's source position, where `<addr>` is
+/// `DATA_SECTION_BASE + offset`. The record layout matches the
+/// host-side `BufferBuilder` so the wasm runtime can `memory.copy`
+/// the bytes verbatim into the caller's `out_buf` tail area without
+/// reformatting.
+///
+/// String record: `[len:u32 LE][utf8 bytes]`, total `4 + value.len()`.
+/// List<Int> record: `[len:u32 LE][pad:u32 zero][i64 elements LE]`,
+/// total `8 + 8 * elements.len()`. The 4-byte pad keeps the elements
+/// at byte offset 8 within the record so the wasm runtime can place
+/// the record at an 8-aligned `out_buf` tail offset (the
+/// `BufferReader` re-aligns past the length prefix the same way).
+#[derive(Debug, Default)]
+struct ConstPool {
+    /// The encoded bytes — passed verbatim to a wasm `Data` section
+    /// initialiser anchored at `DATA_SECTION_BASE`.
+    bytes: Vec<u8>,
+    /// Map from per-module `ConstString` index to byte offset inside
+    /// `bytes`. Absolute memory address = `DATA_SECTION_BASE + offset`.
+    string_offsets: HashMap<u32, u32>,
+    /// Map from per-module `ConstListInt` index to byte offset.
+    list_int_offsets: HashMap<u32, u32>,
+}
+
+impl ConstPool {
+    fn total_bytes(&self) -> usize {
+        self.bytes.len()
+    }
+
+    /// Look up the absolute wasm-memory address of a String const.
+    fn string_addr(&self, idx: u32) -> Result<u32, CodegenError> {
+        self.string_offsets
+            .get(&idx)
+            .map(|off| DATA_SECTION_BASE + off)
+            .ok_or(CodegenError::MixedNumericTypes)
+    }
+
+    /// Look up the absolute wasm-memory address of a List<Int> const.
+    fn list_int_addr(&self, idx: u32) -> Result<u32, CodegenError> {
+        self.list_int_offsets
+            .get(&idx)
+            .map(|off| DATA_SECTION_BASE + off)
+            .ok_or(CodegenError::MixedNumericTypes)
+    }
+}
+
+/// Pre-walk every IR function body and lay out the per-module const
+/// data records. Returns the encoded bytes plus index lookups so the
+/// runtime emit pass can hardcode the matching `i32.const <addr>`.
+fn build_const_pool(ir: &IrModule) -> Result<ConstPool, CodegenError> {
+    let mut pool = ConstPool::default();
+    for func in &ir.funcs {
+        collect_consts(&func.body, &mut pool)?;
+    }
+    Ok(pool)
+}
+
+/// Recursively walk a body (descending into [`Op::If`] arms) and
+/// append const records to the pool. Records are appended in the
+/// order they appear; the offset map is keyed on the IR-level index
+/// so cross-function references still point at the right bytes.
+fn collect_consts(body: &[relon_ir::TaggedOp], pool: &mut ConstPool) -> Result<(), CodegenError> {
+    for tagged in body {
+        match &tagged.op {
+            Op::ConstString { idx, value } => {
+                let value_bytes = value.as_bytes();
+                let len = u32::try_from(value_bytes.len())
+                    .map_err(|_| CodegenError::Layout("string literal exceeds u32".into()))?;
+                let offset = u32::try_from(pool.bytes.len()).map_err(|_| {
+                    CodegenError::Layout("const data section exceeds u32 bytes".into())
+                })?;
+                pool.bytes.extend_from_slice(&len.to_le_bytes());
+                pool.bytes.extend_from_slice(value_bytes);
+                pool.string_offsets.insert(*idx, offset);
+            }
+            Op::ConstListInt { idx, elements } => {
+                // Align the record start to 8 inside the data section
+                // so the in-record `[len:4][pad:4][i64 elements]`
+                // layout is byte-identical to what the host builder
+                // would have written at an 8-aligned offset. Without
+                // this alignment the memory.copy would still produce
+                // correct bytes (memcpy is byte-level), but keeping
+                // the source aligned makes hand-debugging the wasm
+                // module easier.
+                while !pool.bytes.len().is_multiple_of(8) {
+                    pool.bytes.push(0);
+                }
+                let offset = u32::try_from(pool.bytes.len()).map_err(|_| {
+                    CodegenError::Layout("const data section exceeds u32 bytes".into())
+                })?;
+                let count = u32::try_from(elements.len()).map_err(|_| {
+                    CodegenError::Layout("list literal exceeds u32 elements".into())
+                })?;
+                pool.bytes.extend_from_slice(&count.to_le_bytes());
+                // 4-byte pad so the i64 payload sits at record_offset + 8.
+                pool.bytes.extend_from_slice(&[0u8; 4]);
+                for v in elements {
+                    pool.bytes.extend_from_slice(&v.to_le_bytes());
+                }
+                pool.list_int_offsets.insert(*idx, offset);
+            }
+            Op::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                collect_consts(then_body, pool)?;
+                collect_consts(else_body, pool)?;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 /// Translate an IR function body into a `wasm_encoder::Function`,
 /// emitting one wasm instruction per `Op` plus the binary-handshake
 /// prologue / epilogue.
@@ -270,19 +476,65 @@ fn emit_function_body(
     func: &relon_ir::Func,
     main_layout: &OffsetTable,
     return_layout: &OffsetTable,
+    const_pool: &ConstPool,
 ) -> Result<(Function, Vec<TokenRange>), CodegenError> {
     // Walk the body (recursively into if-branches) to determine
     // which wasm value type the trailing StoreField needs as its
-    // spill local. Phase 2.c still only emits a single StoreField,
-    // and the lowering pass keeps it at the top-level tail, but
-    // recursing keeps the scan robust if a future phase moves the
-    // store inside a branch.
+    // spill local. The lowering pass keeps the StoreField at the
+    // top-level tail, but the scan recurses anyway so a future phase
+    // moving the store inside a branch still picks up the right
+    // valtype.
     let store_local_ty = find_store_field_local_ty(&func.body).unwrap_or(ValType::I64);
 
-    // Declare one scratch local of the right shape so
-    // `emit_store_field` can spill the value before pushing
-    // `out_ptr` underneath it.
-    let mut f = Function::new(vec![(1u32, store_local_ty)]);
+    // Discover every user-let-binding referenced in this body so we
+    // can declare matching wasm locals up front. Each `Op::LetSet`
+    // records a `(idx, IrType)` pair; codegen turns the IR-local
+    // index into a wasm-local index at `FIRST_LET_LOCAL_INDEX + idx`.
+    let let_locals = collect_let_locals(&func.body)?;
+    let max_let_idx = let_locals.iter().map(|(idx, _)| *idx).max();
+
+    // Whether the body needs the pointer-indirect store machinery —
+    // tail cursor + memcpy scratch locals plus the `out_cap` runtime
+    // bounds check that traps when the tail area overflows.
+    let needs_tail_cursor = body_needs_tail_cursor(&func.body);
+
+    // Locals layout (positions in the wasm-encoder's `locals` header):
+    //   STORE_TMP_LOCAL_INDEX = 4   (scalar spill, ValType varies)
+    //   TAIL_CURSOR_LOCAL_INDEX = 5 (i32, only when needs_tail_cursor)
+    //   MEMCPY_SRC_LOCAL_INDEX = 6  (i32, only when needs_tail_cursor)
+    //   MEMCPY_LEN_LOCAL_INDEX = 7  (i32, only when needs_tail_cursor)
+    //   FIRST_LET_LOCAL_INDEX..   user-let locals, contiguous
+    let mut locals_header: Vec<(u32, ValType)> = vec![(1, store_local_ty)];
+    if needs_tail_cursor {
+        locals_header.push((3, ValType::I32));
+    } else {
+        // Pad with placeholders so the user-let locals always land at
+        // `FIRST_LET_LOCAL_INDEX`. Declared as i32 with count 0... we
+        // actually need to declare them so the indices align. Reserve
+        // the three i32 slots regardless — unused locals cost nothing.
+        locals_header.push((3, ValType::I32));
+    }
+    if let Some(max_idx) = max_let_idx {
+        // Allocate one local per declared user-let. Grouping by
+        // valtype keeps the locals-header compact, but for simplicity
+        // we emit one entry per local in declaration order — the
+        // encoder collapses adjacent same-valtype entries on its own.
+        let count = max_idx + 1;
+        let mut by_idx: Vec<Option<IrType>> = vec![None; count as usize];
+        for (idx, ty) in &let_locals {
+            by_idx[*idx as usize] = Some(*ty);
+        }
+        for slot in by_idx {
+            let vt = slot
+                .map(|t| ir_to_val_type(&t))
+                // Unused let-local slots default to i32 — the unused
+                // declaration costs zero at runtime and keeps the
+                // index map dense.
+                .unwrap_or(ValType::I32);
+            locals_header.push((1, vt));
+        }
+    }
+    let mut f = Function::new(locals_header);
 
     // Per-emitted-instruction source ranges, lock-step with the
     // wasm op stream the encoder builds.
@@ -310,19 +562,114 @@ fn emit_function_body(
         func.range,
     );
 
+    // Initialise the tail cursor to `return_root_size` so the first
+    // pointer-indirect store lands immediately after the fixed area
+    // inside `out_buf`. Skipped when the body has no String/List
+    // return — leaves `TAIL_CURSOR_LOCAL_INDEX` at its default zero
+    // (and unused in that case).
+    if needs_tail_cursor {
+        f.instruction(&Instruction::I32Const(return_root_size as i32));
+        ranges.push(func.range);
+        f.instruction(&Instruction::LocalSet(TAIL_CURSOR_LOCAL_INDEX));
+        ranges.push(func.range);
+    }
+
     // Virtual stack used to validate arithmetic type tags.
     let mut vstack: Vec<IrType> = Vec::new();
-    emit_op_seq(&mut f, &mut ranges, &mut vstack, &func.body, func)?;
+    emit_op_seq(
+        &mut f,
+        &mut ranges,
+        &mut vstack,
+        &func.body,
+        func,
+        const_pool,
+    )?;
 
-    // Epilogue: push `bytes_written = return_root_size` and emit the
-    // trailing `End`.
-    f.instruction(&Instruction::I32Const(return_root_size as i32));
-    ranges.push(func.range);
+    // Epilogue: push `bytes_written` and emit the trailing `End`.
+    //
+    // When the body ended with a pointer-indirect store, `bytes_written`
+    // is the current tail cursor (covers the fixed area + every tail
+    // record). Pure-scalar bodies keep the v1 shape — push the
+    // constant return root size.
+    if needs_tail_cursor {
+        f.instruction(&Instruction::LocalGet(TAIL_CURSOR_LOCAL_INDEX));
+        ranges.push(func.range);
+    } else {
+        f.instruction(&Instruction::I32Const(return_root_size as i32));
+        ranges.push(func.range);
+    }
 
     f.instruction(&Instruction::End);
     ranges.push(func.range);
 
     Ok((f, ranges))
+}
+
+/// Walk the body (descending into `Op::If` arms) and gather every
+/// `Op::LetSet` so the function header can declare matching wasm
+/// locals. Each unique `idx` is recorded with its `IrType`; a
+/// duplicate idx with a different type is a lowering bug and
+/// surfaces as a codegen error.
+fn collect_let_locals(body: &[relon_ir::TaggedOp]) -> Result<Vec<(u32, IrType)>, CodegenError> {
+    let mut out: Vec<(u32, IrType)> = Vec::new();
+    collect_let_locals_inner(body, &mut out)?;
+    Ok(out)
+}
+
+fn collect_let_locals_inner(
+    body: &[relon_ir::TaggedOp],
+    out: &mut Vec<(u32, IrType)>,
+) -> Result<(), CodegenError> {
+    for tagged in body {
+        match &tagged.op {
+            Op::LetSet { idx, ty } => {
+                if let Some(existing) = out.iter().find(|(i, _)| i == idx) {
+                    if existing.1 != *ty {
+                        return Err(CodegenError::MixedNumericTypes);
+                    }
+                } else {
+                    out.push((*idx, *ty));
+                }
+            }
+            Op::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                collect_let_locals_inner(then_body, out)?;
+                collect_let_locals_inner(else_body, out)?;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// `true` when the function body emits at least one String / List<Int>
+/// store into the `out_buf`. Tail-cursor scratch locals and the
+/// runtime out_cap bounds check only matter for these stores.
+fn body_needs_tail_cursor(body: &[relon_ir::TaggedOp]) -> bool {
+    for tagged in body {
+        match &tagged.op {
+            Op::StoreField {
+                ty: IrType::String | IrType::ListInt,
+                ..
+            } => {
+                return true;
+            }
+            Op::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                if body_needs_tail_cursor(then_body) || body_needs_tail_cursor(else_body) {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 /// Emit a sequence of [`TaggedOp`] into `f`, growing `ranges` and
@@ -334,10 +681,19 @@ fn emit_op_seq(
     vstack: &mut Vec<IrType>,
     body: &[relon_ir::TaggedOp],
     func: &relon_ir::Func,
+    const_pool: &ConstPool,
 ) -> Result<(), CodegenError> {
     let param_types = &func.params;
     for tagged in body {
         match &tagged.op {
+            Op::ConstBool(b) => {
+                // Bool literal materialises as `i32.const 1/0` so
+                // downstream `If` / `i32.eq` see the canonical
+                // 0/1 byte form.
+                f.instruction(&Instruction::I32Const(if *b { 1 } else { 0 }));
+                vstack.push(IrType::Bool);
+                ranges.push(tagged.range);
+            }
             Op::ConstI64(v) => {
                 f.instruction(&Instruction::I64Const(*v));
                 vstack.push(IrType::I64);
@@ -348,10 +704,41 @@ fn emit_op_seq(
                 vstack.push(IrType::F64);
                 ranges.push(tagged.range);
             }
+            Op::ConstString { idx, .. } => {
+                let addr = const_pool.string_addr(*idx)?;
+                f.instruction(&Instruction::I32Const(addr as i32));
+                vstack.push(IrType::String);
+                ranges.push(tagged.range);
+            }
+            Op::ConstListInt { idx, .. } => {
+                let addr = const_pool.list_int_addr(*idx)?;
+                f.instruction(&Instruction::I32Const(addr as i32));
+                vstack.push(IrType::ListInt);
+                ranges.push(tagged.range);
+            }
+            Op::LetGet { idx, ty } => {
+                let local_idx = FIRST_LET_LOCAL_INDEX
+                    .checked_add(*idx)
+                    .ok_or(CodegenError::MixedNumericTypes)?;
+                f.instruction(&Instruction::LocalGet(local_idx));
+                vstack.push(*ty);
+                ranges.push(tagged.range);
+            }
+            Op::LetSet { idx, ty } => {
+                let local_idx = FIRST_LET_LOCAL_INDEX
+                    .checked_add(*idx)
+                    .ok_or(CodegenError::MixedNumericTypes)?;
+                let popped = vstack.pop().ok_or(CodegenError::MixedNumericTypes)?;
+                if popped.wasm_slot() != ty.wasm_slot() {
+                    return Err(CodegenError::MixedNumericTypes);
+                }
+                f.instruction(&Instruction::LocalSet(local_idx));
+                ranges.push(tagged.range);
+            }
             Op::LocalGet(idx) => {
-                // Phase 2.b's `LocalGet` only refers to handshake
-                // slots (the four i32 params). User-facing field
-                // access goes through `LoadField`.
+                // `LocalGet` refers to handshake slots (the four i32
+                // params). User-facing field access goes through
+                // `LoadField`; user-let bindings go through `LetGet`.
                 let ty = *param_types
                     .get(*idx as usize)
                     .ok_or(CodegenError::MixedNumericTypes)?;
@@ -364,34 +751,35 @@ fn emit_op_seq(
                 vstack.push(load_field_stack_type(*ty));
             }
             Op::LoadStringPtr { offset } => {
-                emit_load_pointer(f, ranges, *offset, tagged.range);
+                emit_load_absolute_pointer(f, ranges, *offset, tagged.range);
                 vstack.push(IrType::String);
             }
             Op::LoadListIntPtr { offset } => {
-                emit_load_pointer(f, ranges, *offset, tagged.range);
+                emit_load_absolute_pointer(f, ranges, *offset, tagged.range);
                 vstack.push(IrType::ListInt);
             }
             Op::StoreField { offset, ty } => {
-                // Store layout: the value to store is currently on
-                // top of the stack. Wasm's `<load/store>` op takes
-                // `[addr, value]` (in that order), so we have to
-                // shuffle: emit `local.get $out_ptr` *before* the
-                // value computation. Phase 2.b only ever lowers a
-                // single trailing StoreField per body, so we don't
-                // need a generic shuffle — we instead spill the
-                // value to a synthesized local just before storing.
-                //
-                // Emit sequence (for non-Null types):
-                //   <value already on stack>
-                //   local.set $tmp
-                //   local.get $out_ptr
-                //   local.get $tmp
-                //   <store>.offset=N
                 let popped = vstack.pop().ok_or(CodegenError::MixedNumericTypes)?;
                 if popped.wasm_slot() != stack_type_for_storefield(*ty).wasm_slot() {
                     return Err(CodegenError::MixedNumericTypes);
                 }
-                emit_store_field(f, ranges, *offset, *ty, tagged.range)?;
+                match ty {
+                    IrType::String | IrType::ListInt => {
+                        // Pointer-indirect store. The top-of-stack
+                        // value is the absolute memory address of a
+                        // `[len:u32 LE][...]` record (either a
+                        // ConstString/ConstListInt addr or a
+                        // LoadStringPtr/LoadListIntPtr-lifted in_buf
+                        // pointer). We memcpy the record into the
+                        // out_buf tail area, then store the
+                        // buffer-relative offset of the record to
+                        // the fixed-area slot.
+                        emit_store_pointer_indirect(f, ranges, *offset, *ty, tagged.range)?;
+                    }
+                    _ => {
+                        emit_store_field(f, ranges, *offset, *ty, tagged.range)?;
+                    }
+                }
             }
             Op::Add(tag) => {
                 emit_arith(f, vstack, *tag, ArithOp::Add)?;
@@ -450,6 +838,7 @@ fn emit_op_seq(
                     then_body,
                     else_body,
                     func,
+                    const_pool,
                     tagged.range,
                 )?;
             }
@@ -487,6 +876,7 @@ fn emit_if(
     then_body: &[relon_ir::TaggedOp],
     else_body: &[relon_ir::TaggedOp],
     func: &relon_ir::Func,
+    const_pool: &ConstPool,
     range: TokenRange,
 ) -> Result<(), CodegenError> {
     let cond = vstack.pop().ok_or(CodegenError::MixedNumericTypes)?;
@@ -503,7 +893,7 @@ fn emit_if(
 
     // `then` arm.
     let mut then_stack: Vec<IrType> = Vec::new();
-    emit_op_seq(f, ranges, &mut then_stack, then_body, func)?;
+    emit_op_seq(f, ranges, &mut then_stack, then_body, func, const_pool)?;
     let then_top = match then_stack.pop() {
         Some(t) => t,
         None => return Err(CodegenError::MixedNumericTypes),
@@ -523,7 +913,7 @@ fn emit_if(
 
     // `else` arm.
     let mut else_stack: Vec<IrType> = Vec::new();
-    emit_op_seq(f, ranges, &mut else_stack, else_body, func)?;
+    emit_op_seq(f, ranges, &mut else_stack, else_body, func, const_pool)?;
     let else_top = match else_stack.pop() {
         Some(t) => t,
         None => return Err(CodegenError::MixedNumericTypes),
@@ -544,11 +934,19 @@ fn emit_if(
     Ok(())
 }
 
-/// Emit an `i32.load offset=N` pulling a 4-byte pointer out of the
-/// `in_buf`. Used for both `LoadStringPtr` and `LoadListIntPtr`; the
-/// wasm representation is identical (raw i32 pointer) — only the IR
-/// tag differs.
-fn emit_load_pointer(
+/// Emit the wasm op sequence to load a pointer-indirect field from
+/// the `in_buf` and lift it to an **absolute** linear-memory address.
+///
+/// The host-side `BufferBuilder` writes the pointer slot as a
+/// buffer-relative offset (the byte position of the tail record
+/// counted from `in_ptr`). The wasm representation we hand to
+/// downstream ops (e.g. a `StoreField` echoing the value into
+/// `out_buf`) is an absolute address so it can be consumed uniformly
+/// alongside `ConstString` addresses.
+///
+/// Emitted sequence:
+///   `local.get $in_ptr; i32.load offset=N align=2; local.get $in_ptr; i32.add`
+fn emit_load_absolute_pointer(
     f: &mut Function,
     ranges: &mut Vec<TokenRange>,
     offset: u32,
@@ -562,6 +960,10 @@ fn emit_load_pointer(
         align: 2,
         memory_index: 0,
     }));
+    ranges.push(range);
+    f.instruction(&Instruction::LocalGet(WASM_LOCAL_IN_PTR));
+    ranges.push(range);
+    f.instruction(&Instruction::I32Add);
     ranges.push(range);
 }
 
@@ -725,10 +1127,10 @@ fn emit_store_field(
             align: 0,
             memory_index: 0,
         }),
-        // Phase 2.c does not lower `#main` bodies that return
-        // String / List<Int>, so a hand-built IR landing here
-        // would emit a 4-byte pointer store. Reject for now —
-        // upstream lowering already gates this away.
+        // Pointer-indirect stores route through
+        // `emit_store_pointer_indirect`; falling through here means
+        // a hand-built IR called this helper directly with a pointer
+        // type — refuse rather than emit a half-formed sequence.
         IrType::String | IrType::ListInt => {
             return Err(CodegenError::UnsupportedStoreFieldType { ty });
         }
@@ -744,11 +1146,197 @@ fn emit_store_field(
     Ok(())
 }
 
-/// Wasm-local index used as the scratch slot for `emit_store_field`.
-/// Sits right after the four binary-handshake params; the function
-/// declares one entry of the appropriate value type as part of its
-/// `locals` header.
-const STORE_TMP_LOCAL_INDEX: u32 = 4;
+/// Emit the wasm op sequence for a pointer-indirect store of a
+/// `String` / `List<Int>` value into the `out_buf` tail area.
+///
+/// At entry the top of the wasm stack is an **absolute** linear-
+/// memory address of a `[len:u32 LE][payload]` record (either a
+/// const data-section address or an in_buf record lifted to
+/// absolute by [`emit_load_absolute_pointer`]).
+///
+/// Emit shape (using `memory.copy` from the bulk-memory proposal,
+/// which wasmtime enables by default):
+///
+/// ```text
+/// ;; stack: [src_addr]
+/// local.set $memcpy_src
+/// local.get $memcpy_src
+/// i32.load align=2                           ;; payload length / element count
+/// ;; record_size = 4 + payload_len (String)
+/// ;;           or = 8 + 8*element_count (List<Int>)
+/// <compute record size>
+/// local.set $memcpy_len
+///
+/// ;; align $tail_cursor to 4 (String) or 8 (List<Int>) before the write
+/// <align $tail_cursor>
+///
+/// ;; bounds: tail_cursor + record_size > out_cap → trap
+/// local.get $tail_cursor
+/// local.get $memcpy_len
+/// i32.add
+/// local.get $out_cap
+/// i32.gt_u
+/// if; unreachable; end
+///
+/// ;; memcpy(out_ptr + tail_cursor, src, record_size)
+/// local.get $out_ptr
+/// local.get $tail_cursor
+/// i32.add
+/// local.get $memcpy_src
+/// local.get $memcpy_len
+/// memory.copy 0 0
+///
+/// ;; store fixed-area pointer slot: out_buf[N] = tail_cursor
+/// local.get $out_ptr
+/// local.get $tail_cursor
+/// i32.store offset=N align=2
+///
+/// ;; bump tail cursor: tail_cursor += record_size
+/// local.get $tail_cursor
+/// local.get $memcpy_len
+/// i32.add
+/// local.set $tail_cursor
+/// ```
+fn emit_store_pointer_indirect(
+    f: &mut Function,
+    ranges: &mut Vec<TokenRange>,
+    fixed_offset: u32,
+    ty: IrType,
+    range: TokenRange,
+) -> Result<(), CodegenError> {
+    // Spill the src address into the local — we'll need it twice
+    // (once to read the length prefix, once for memory.copy).
+    f.instruction(&Instruction::LocalSet(MEMCPY_SRC_LOCAL_INDEX));
+    ranges.push(range);
+
+    // Load the length prefix (u32 LE) at src+0.
+    f.instruction(&Instruction::LocalGet(MEMCPY_SRC_LOCAL_INDEX));
+    ranges.push(range);
+    f.instruction(&Instruction::I32Load(MemArg {
+        offset: 0,
+        align: 2,
+        memory_index: 0,
+    }));
+    ranges.push(range);
+
+    // Compute record_size from the loaded length / element count.
+    match ty {
+        IrType::String => {
+            // record_size = payload_len + 4
+            f.instruction(&Instruction::I32Const(4));
+            ranges.push(range);
+            f.instruction(&Instruction::I32Add);
+            ranges.push(range);
+        }
+        IrType::ListInt => {
+            // record_size = 8 + 8 * element_count
+            //            = 8 + (count << 3)
+            f.instruction(&Instruction::I32Const(3));
+            ranges.push(range);
+            f.instruction(&Instruction::I32Shl);
+            ranges.push(range);
+            f.instruction(&Instruction::I32Const(8));
+            ranges.push(range);
+            f.instruction(&Instruction::I32Add);
+            ranges.push(range);
+        }
+        _ => return Err(CodegenError::UnsupportedStoreFieldType { ty }),
+    }
+    f.instruction(&Instruction::LocalSet(MEMCPY_LEN_LOCAL_INDEX));
+    ranges.push(range);
+
+    // Align $tail_cursor before writing the record. String needs
+    // 4-byte alignment so the len prefix is naturally aligned; List<Int>
+    // needs 8-byte alignment so `payload_start = align_up(record_start
+    // + 4, 8) = record_start + 8` matches our in-record layout.
+    let align_mask: i32 = match ty {
+        IrType::String => -4,
+        IrType::ListInt => -8,
+        _ => -4,
+    };
+    let align_add: i32 = match ty {
+        IrType::String => 3,
+        IrType::ListInt => 7,
+        _ => 3,
+    };
+    f.instruction(&Instruction::LocalGet(TAIL_CURSOR_LOCAL_INDEX));
+    ranges.push(range);
+    f.instruction(&Instruction::I32Const(align_add));
+    ranges.push(range);
+    f.instruction(&Instruction::I32Add);
+    ranges.push(range);
+    f.instruction(&Instruction::I32Const(align_mask));
+    ranges.push(range);
+    f.instruction(&Instruction::I32And);
+    ranges.push(range);
+    f.instruction(&Instruction::LocalSet(TAIL_CURSOR_LOCAL_INDEX));
+    ranges.push(range);
+
+    // Bounds: tail_cursor + record_size > out_cap → trap.
+    f.instruction(&Instruction::LocalGet(TAIL_CURSOR_LOCAL_INDEX));
+    ranges.push(range);
+    f.instruction(&Instruction::LocalGet(MEMCPY_LEN_LOCAL_INDEX));
+    ranges.push(range);
+    f.instruction(&Instruction::I32Add);
+    ranges.push(range);
+    f.instruction(&Instruction::LocalGet(WASM_LOCAL_OUT_CAP));
+    ranges.push(range);
+    f.instruction(&Instruction::I32GtU);
+    ranges.push(range);
+    f.instruction(&Instruction::If(BlockType::Empty));
+    ranges.push(range);
+    f.instruction(&Instruction::Unreachable);
+    ranges.push(range);
+    f.instruction(&Instruction::End);
+    ranges.push(range);
+
+    // memory.copy(dst=out_ptr+tail_cursor, src=$memcpy_src, n=$memcpy_len).
+    // Bulk-memory proposal; wasmtime keeps it enabled by default. We
+    // avoid the byte-by-byte loop because the proposal is broadly
+    // supported (Node, browsers, wasmtime) and a single op saves a
+    // dozen instructions per record.
+    f.instruction(&Instruction::LocalGet(WASM_LOCAL_OUT_PTR));
+    ranges.push(range);
+    f.instruction(&Instruction::LocalGet(TAIL_CURSOR_LOCAL_INDEX));
+    ranges.push(range);
+    f.instruction(&Instruction::I32Add);
+    ranges.push(range);
+    f.instruction(&Instruction::LocalGet(MEMCPY_SRC_LOCAL_INDEX));
+    ranges.push(range);
+    f.instruction(&Instruction::LocalGet(MEMCPY_LEN_LOCAL_INDEX));
+    ranges.push(range);
+    f.instruction(&Instruction::MemoryCopy {
+        src_mem: 0,
+        dst_mem: 0,
+    });
+    ranges.push(range);
+
+    // Store the buffer-relative pointer (= tail_cursor) into the
+    // fixed-area slot at `fixed_offset`.
+    f.instruction(&Instruction::LocalGet(WASM_LOCAL_OUT_PTR));
+    ranges.push(range);
+    f.instruction(&Instruction::LocalGet(TAIL_CURSOR_LOCAL_INDEX));
+    ranges.push(range);
+    f.instruction(&Instruction::I32Store(MemArg {
+        offset: fixed_offset as u64,
+        align: 2,
+        memory_index: 0,
+    }));
+    ranges.push(range);
+
+    // Bump tail_cursor by record_size for the next pointer-indirect
+    // write (Phase 3.b dict literal outputs reuse this slot).
+    f.instruction(&Instruction::LocalGet(TAIL_CURSOR_LOCAL_INDEX));
+    ranges.push(range);
+    f.instruction(&Instruction::LocalGet(MEMCPY_LEN_LOCAL_INDEX));
+    ranges.push(range);
+    f.instruction(&Instruction::I32Add);
+    ranges.push(range);
+    f.instruction(&Instruction::LocalSet(TAIL_CURSOR_LOCAL_INDEX));
+    ranges.push(range);
+
+    Ok(())
+}
 
 /// Wasm value type used for the scratch local in `emit_store_field`.
 /// `Int` stores need an i64 slot; `Float` an f64 slot; `Bool` / `Null`
