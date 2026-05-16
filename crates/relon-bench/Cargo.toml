@@ -15,6 +15,15 @@ dhat-heap = ["dep:dhat"]
 [dependencies]
 relon-parser = { workspace = true }
 relon-evaluator = { workspace = true }
+# Phase 9: wasm-AOT comparison bench depends on the codegen crate to
+# drive `WasmAotEvaluator::from_source` + `run_main` directly, so the
+# harness can isolate cold-start (parse + analyze + lower + codegen +
+# wasmtime::Module::new) from warm invoke (instantiate + buffer
+# marshal + wasm execution). Wired as a regular dep, not feature-gated,
+# because the bench crate is host-only (never built for wasm32) and
+# `cargo bench` always wants both backends available.
+relon-codegen-wasm = { workspace = true }
+relon-eval-api = { workspace = true }
 dhat = { version = "0.3", optional = true }
 
 [dev-dependencies]
@@ -38,3 +47,14 @@ relon-analyzer = { workspace = true }
 name = "harness_v1"
 harness = false
 path = "benches/harness_v1.rs"
+
+# Phase 9 closeout: pit the wasm-AOT backend against the tree-walker
+# across four canonical scenarios (arithmetic / dict-literal /
+# stdlib / method-dispatch). Each scenario splits into three probes:
+# `cold_start` (full pipeline), `warm_invoke` (run_main on a
+# preassembled evaluator), `tree_walk_total` (tree-walker single-shot
+# baseline). Run via `cargo bench -p relon-bench --bench wasm_aot_vs_tree_walk`.
+[[bench]]
+name = "wasm_aot_vs_tree_walk"
+harness = false
+path = "benches/wasm_aot_vs_tree_walk.rs"
