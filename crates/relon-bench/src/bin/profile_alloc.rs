@@ -6,9 +6,17 @@
 //!   `cargo run --release -p relon-bench --bin profile_alloc --features dhat-heap`
 //!
 //! Optional CLI argument selects which workload(s) to profile:
-//!   - `simple`         — only the arithmetic workload (1000 iterations)
-//!   - `comprehension`  — only the list comprehension workload (100 iterations)
-//!   - `all` (default)  — run both back-to-back
+//!   - `simple`               — arithmetic workload, fresh `Context` per iteration (1000×)
+//!   - `simple-pooled`        — arithmetic workload, single `Context` reused across 1000 evals
+//!   - `comprehension`        — list-comprehension workload, fresh `Context` per iteration (100×)
+//!   - `comprehension-pooled` — list-comprehension workload, single `Context` reused across 100 evals
+//!   - `all` (default)        — run all four back-to-back
+//!
+//! The pooled modes exercise the "host boots once, evaluates many times"
+//! pattern: the AST is parsed once and a single `Context` + `Evaluator` are
+//! reused. `eval_root` is responsible for resetting `step_counter`,
+//! `path_cache`, and `iter_cursors` between runs; `module_cache` is
+//! deliberately retained (module loads are genuinely cross-run shareable).
 //!
 //! Each run drops a `dhat-heap.json` in the current working directory; load
 //! it into the dhat web viewer (https://nnethercote.github.io/dh_view/dh_view.html)
@@ -76,7 +84,14 @@ fn main() {
         match selection {
             "simple" => {
                 println!("simple workload x{}: {}", SIMPLE_ITERATIONS, SIMPLE_SOURCE);
-                run_workload("simple", SIMPLE_SOURCE, SIMPLE_ITERATIONS);
+                run_workload_oneshot("simple", SIMPLE_SOURCE, SIMPLE_ITERATIONS);
+            }
+            "simple-pooled" => {
+                println!(
+                    "simple-pooled workload x{}: {}",
+                    SIMPLE_ITERATIONS, SIMPLE_SOURCE
+                );
+                run_workload_pooled("simple-pooled", SIMPLE_SOURCE, SIMPLE_ITERATIONS);
             }
             "comprehension" => {
                 println!(
@@ -84,8 +99,20 @@ fn main() {
                     COMPREHENSION_ITERATIONS,
                     COMPREHENSION_SOURCE.replace('\n', " ")
                 );
-                run_workload(
+                run_workload_oneshot(
                     "comprehension",
+                    COMPREHENSION_SOURCE,
+                    COMPREHENSION_ITERATIONS,
+                );
+            }
+            "comprehension-pooled" => {
+                println!(
+                    "comprehension-pooled workload x{}: {}",
+                    COMPREHENSION_ITERATIONS,
+                    COMPREHENSION_SOURCE.replace('\n', " ")
+                );
+                run_workload_pooled(
+                    "comprehension-pooled",
                     COMPREHENSION_SOURCE,
                     COMPREHENSION_ITERATIONS,
                 );
@@ -97,9 +124,15 @@ fn main() {
                     COMPREHENSION_ITERATIONS,
                     COMPREHENSION_SOURCE.replace('\n', " ")
                 );
-                run_workload("simple", SIMPLE_SOURCE, SIMPLE_ITERATIONS);
-                run_workload(
+                run_workload_oneshot("simple", SIMPLE_SOURCE, SIMPLE_ITERATIONS);
+                run_workload_pooled("simple-pooled", SIMPLE_SOURCE, SIMPLE_ITERATIONS);
+                run_workload_oneshot(
                     "comprehension",
+                    COMPREHENSION_SOURCE,
+                    COMPREHENSION_ITERATIONS,
+                );
+                run_workload_pooled(
+                    "comprehension-pooled",
                     COMPREHENSION_SOURCE,
                     COMPREHENSION_ITERATIONS,
                 );
@@ -110,14 +143,11 @@ fn main() {
     }
 }
 
-/// Run the full parse + eval pipeline `iterations` times on `source`.
-///
-/// Each iteration intentionally re-parses and rebuilds the [`Context`] so
-/// the profile reflects what an embedder doing one-shot evaluation pays.
-/// (Context / AST pooling is a P1 optimization candidate; measuring it
-/// here would mask the cost we are trying to attribute.)
+/// One-shot mode: re-parse the AST and rebuild the `Context` + `Evaluator`
+/// for every iteration. Mirrors what an embedder doing one-off evaluation
+/// pays — boot cost is in scope, AST / context pooling is out of scope.
 #[cfg(feature = "dhat-heap")]
-fn run_workload(label: &str, source: &str, iterations: usize) {
+fn run_workload_oneshot(label: &str, source: &str, iterations: usize) {
     for _ in 0..iterations {
         let ast = parse_document(source).expect("parse failed");
         let ctx = {
@@ -131,7 +161,37 @@ fn run_workload(label: &str, source: &str, iterations: usize) {
             .expect("eval failed");
     }
     println!(
-        "  workload `{}` completed: {} iterations",
+        "  workload `{}` (one-shot) completed: {} iterations",
+        label, iterations
+    );
+}
+
+/// Pooled mode: parse the AST once, build a single `Context` + `Evaluator`,
+/// and drive `eval_root` repeatedly against a fresh root scope per call.
+///
+/// `eval_root` resets `step_counter`, `path_cache`, and `iter_cursors`
+/// between invocations (see `eval.rs::Evaluator::eval_root`), so consecutive
+/// runs are isolated except for the deliberately-retained `module_cache`.
+/// This matches the "long-running host, repeated evaluation" pattern and
+/// lets dhat surface the pure per-eval cost with the one-time boot cost
+/// amortized.
+#[cfg(feature = "dhat-heap")]
+fn run_workload_pooled(label: &str, source: &str, iterations: usize) {
+    let ast = parse_document(source).expect("parse failed");
+    let ctx = {
+        let mut ctx = Context::new().with_root(ast.clone());
+        ctx.prepend_module_resolver(Arc::new(relon_evaluator::StdModuleResolver));
+        Arc::new(ctx)
+    };
+    let eval = Evaluator::new(Arc::clone(&ctx));
+    for _ in 0..iterations {
+        // `eval_root` walks the root node attached via `with_root` above,
+        // resetting the per-run state inside `Context` before the walk.
+        let scope = Arc::new(Scope::default());
+        let _result = eval.eval_root(&scope).expect("eval_root failed");
+    }
+    println!(
+        "  workload `{}` (pooled) completed: {} iterations",
         label, iterations
     );
 }
