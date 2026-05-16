@@ -24,11 +24,13 @@
 
 use ordered_float::OrderedFloat;
 use relon_analyzer::main_sig::MainSignature;
+use relon_analyzer::schema::SchemaDef;
 use relon_analyzer::tree::AnalyzedTree;
 use relon_analyzer::workspace::WorkspaceTree;
-use relon_eval_api::layout::{OffsetTable, SchemaLayout};
+use relon_eval_api::layout::{FieldKind, OffsetTable, SchemaLayout};
 use relon_eval_api::schema_canonical::{Field, Schema, TypeRepr};
 use relon_parser::{Expr, Node, Operator, TokenKey, TokenRange, TypeNode};
+use std::collections::HashMap;
 
 use crate::error::LoweringError;
 use crate::ir::{Func, IrType, Module, Op, TaggedOp};
@@ -38,9 +40,10 @@ use crate::ir::{Func, IrType, Module, Op, TaggedOp};
 /// Phase 3.a introduces user-let bindings (`where { name: value }`)
 /// and inline const literals (`true` / `"hello"` / `[1, 2, 3]`); each
 /// of those needs a per-function counter the recursive walker hands
-/// back to codegen. The context bundles them together with the
-/// virtual operand stack so the `lower_expr` family of functions keep
-/// a single tail-call shape.
+/// back to codegen. Phase 3.b extends the context with a record-local
+/// counter (one per dict literal currently being constructed) and a
+/// schema resolver so nested branded dict fields find their canonical
+/// shape without re-walking the analyzer table.
 #[derive(Debug)]
 struct LowerCtx<'a> {
     /// `#main` parameter bindings (offset + IR type) used to resolve
@@ -57,12 +60,62 @@ struct LowerCtx<'a> {
     next_string_idx: u32,
     /// Next per-module constant index for [`Op::ConstListInt`].
     next_list_int_idx: u32,
+    /// Next per-function record-local index. Each
+    /// [`Op::AllocRootRecord`] / [`Op::AllocSubRecord`] hands out a
+    /// fresh local so nested dicts under construction don't clobber
+    /// their parent's base offset.
+    next_record_idx: u32,
     /// Output op stream. Appended to in postfix / stack order.
     out: Vec<TaggedOp>,
     /// Virtual operand stack tracking the IR type each pushed value
     /// has. Lets us validate arithmetic / store tags without a
     /// separate analysis pass.
     tstack: Vec<IrType>,
+    /// Schema-name → analyzer-side `SchemaDef` resolver. Phase 3.b
+    /// dict literal lowering consults it when a field's declared
+    /// type-hint names a user-declared schema (the nested dict
+    /// case).
+    schema_resolver: SchemaResolver<'a>,
+}
+
+/// Name → `SchemaDef` lookup built once per `lower_workspace_*` call
+/// from the analyzer's `tree.root_schemas` + `tree.schemas`. Cheap to
+/// construct — only the schema declarations participate, not every
+/// node in the source tree.
+#[derive(Debug, Clone)]
+struct SchemaResolver<'a> {
+    by_name: HashMap<&'a str, &'a SchemaDef>,
+}
+
+impl<'a> SchemaResolver<'a> {
+    fn new(tree: &'a AnalyzedTree) -> Self {
+        let mut by_name: HashMap<&'a str, &'a SchemaDef> = HashMap::new();
+        // Root-level `#schema X ...` directives are the standard
+        // surface for top-level brand declarations; the schema body
+        // lives in `tree.schemas` keyed by the body node id. We pick
+        // the SchemaDef out of `tree.schemas` to get the analyzed
+        // field shape.
+        for decl in &tree.root_schemas {
+            if let Some(def) = tree.schemas.get(&decl.schema_node.id) {
+                by_name.insert(decl.name.as_str(), def);
+            }
+        }
+        // Dict-field `#schema X { ... }` declarations also surface in
+        // `tree.schemas`. Walk every entry that has a non-None name
+        // and add it to the map (later declarations of the same name
+        // are kept earliest — analyzer-level diagnostics already
+        // catch duplicates).
+        for def in tree.schemas.values() {
+            if let Some(name) = &def.name {
+                by_name.entry(name.as_str()).or_insert(def);
+            }
+        }
+        Self { by_name }
+    }
+
+    fn resolve(&self, name: &str) -> Option<&'a SchemaDef> {
+        self.by_name.get(name).copied()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -73,16 +126,27 @@ struct LetBinding {
 }
 
 impl<'a> LowerCtx<'a> {
-    fn new(params: &'a [LocalBinding]) -> Self {
+    fn new(params: &'a [LocalBinding], schema_resolver: SchemaResolver<'a>) -> Self {
         Self {
             params,
             lets: Vec::new(),
             next_let_idx: 0,
             next_string_idx: 0,
             next_list_int_idx: 0,
+            next_record_idx: 0,
             out: Vec::new(),
             tstack: Vec::new(),
+            schema_resolver,
         }
+    }
+
+    /// Allocate a fresh per-function record-local index used by
+    /// [`Op::AllocRootRecord`] / [`Op::AllocSubRecord`] /
+    /// [`Op::StoreFieldAtRecord`] / [`Op::PushRecordBase`].
+    fn alloc_record_local(&mut self) -> u32 {
+        let idx = self.next_record_idx;
+        self.next_record_idx += 1;
+        idx
     }
 }
 
@@ -169,11 +233,29 @@ fn lower_workspace_single_with_module(
             module: module_id.to_string(),
         })?;
 
+    // Detect whether the return type names a user-declared schema.
+    // When it does, the body must evaluate to a (possibly defaulted)
+    // dict literal whose canonical shape comes from the schema; the
+    // synthesised `Ret` schema in that case is structurally
+    // equivalent to a 1-field record whose `value` is the user
+    // schema, but the wasm-level layout pads the *user schema* into
+    // the root return area directly (no extra pointer slot).
+    let resolver = SchemaResolver::new(tree);
+    let user_return_schema = resolve_return_user_schema(sig.return_type.as_ref(), &resolver)?;
+
     // Build the canonical-form schemas for in_buf and out_buf, then
     // compute the offset table for the param schema so each
     // `Variable(x)` reference can be lowered to a typed LoadField.
     let main_schema = build_main_params_schema(sig)?;
-    let return_schema = build_main_return_schema(sig)?;
+    let return_schema = if let Some(ref user_schema) = user_return_schema {
+        // The dict-return path lays the user schema directly into the
+        // fixed area — the host reads it back with the same
+        // `BufferReader::new(...)` it would use for a hand-built dict
+        // input. No `value` wrapping.
+        user_schema.clone()
+    } else {
+        build_main_return_schema(sig)?
+    };
     let main_layout = SchemaLayout::offsets_for(&main_schema)?;
     let return_layout = SchemaLayout::offsets_for(&return_schema)?;
 
@@ -185,26 +267,62 @@ fn lower_workspace_single_with_module(
     // Walk the body into a single op stream + virtual stack via the
     // per-function lowering context. Phase 3.a's let-bindings + const
     // literals piggy-back on `LowerCtx` for their counters.
-    let mut ctx = LowerCtx::new(&locals);
-    lower_expr(&root.expr, root.range, &mut ctx)?;
+    let mut ctx = LowerCtx::new(&locals, resolver);
 
-    // Trailing StoreField for the single root return value. Pops the
-    // top stack entry — codegen will translate this to `local.get
-    // $out_ptr; <value>; <store>.offset=N`.
-    let ret_offset = return_layout
-        .fields
-        .first()
-        .map(|f| f.offset as u32)
-        .unwrap_or(0);
-    let ret_ir_ty = type_repr_to_ir_type(&return_schema.fields[0].ty)?;
-    ctx.out.push(TaggedOp {
-        op: Op::StoreField {
-            offset: ret_offset,
-            ty: ret_ir_ty,
-        },
-        range: sig.range,
-    });
-    ctx.tstack.pop();
+    if let Some(ref user_schema) = user_return_schema {
+        // Branded dict-return path: emit `AllocRootRecord` + the
+        // per-field stores into the root record, then `Return`.
+        // Top-level dict expression must be a `Expr::Dict(...)` (the
+        // brand is contributed by the return type).
+        let dict_pairs = match &*root.expr {
+            Expr::Dict(pairs) => pairs.as_slice(),
+            _ => {
+                return Err(LoweringError::UnsupportedExpr {
+                    kind: format!(
+                        "Body-of-branded-#main must be a dict literal, got `{}`",
+                        root.expr.kind()
+                    ),
+                    range: root.range,
+                });
+            }
+        };
+        let record_local = ctx.alloc_record_local();
+        ctx.out.push(TaggedOp {
+            op: Op::AllocRootRecord {
+                record_local_idx: record_local,
+            },
+            range: root.range,
+        });
+        lower_dict_into_record(
+            user_schema,
+            &return_layout,
+            dict_pairs,
+            root.range,
+            record_local,
+            &mut ctx,
+        )?;
+    } else {
+        // Scalar-return path: existing v1 shape.
+        lower_expr(&root.expr, root.range, &mut ctx)?;
+
+        // Trailing StoreField for the single root return value. Pops
+        // the top stack entry — codegen will translate this to
+        // `local.get $out_ptr; <value>; <store>.offset=N`.
+        let ret_offset = return_layout
+            .fields
+            .first()
+            .map(|f| f.offset as u32)
+            .unwrap_or(0);
+        let ret_ir_ty = type_repr_to_ir_type(&return_schema.fields[0].ty)?;
+        ctx.out.push(TaggedOp {
+            op: Op::StoreField {
+                offset: ret_offset,
+                ty: ret_ir_ty,
+            },
+            range: sig.range,
+        });
+        ctx.tstack.pop();
+    }
 
     // `Op::Return` keeps its v1.beta meaning: end of function. The
     // codegen pass synthesises the actual wasm `return` (it pushes
@@ -734,6 +852,752 @@ fn arithmetic_op_ctor(op: Operator) -> Option<fn(IrType) -> Op> {
         Operator::Mod => Some(Op::Mod),
         _ => None,
     }
+}
+
+// =====================================================================
+// Phase 3.b: dict-literal lowering helpers.
+// =====================================================================
+
+/// If `return_type` names a user-declared schema (single-segment
+/// TypeNode with no generics), return its canonical-form `Schema`
+/// recursively flattened. Returns `Ok(None)` when the return type is
+/// not a user schema (the v1 scalar-return path stays in effect).
+fn resolve_return_user_schema(
+    return_type: Option<&TypeNode>,
+    resolver: &SchemaResolver<'_>,
+) -> Result<Option<Schema>, LoweringError> {
+    let Some(t) = return_type else {
+        return Ok(None);
+    };
+    if t.path.len() != 1 || !t.generics.is_empty() || t.variant_fields.is_some() {
+        return Ok(None);
+    }
+    let name = &t.path[0];
+    // Built-in scalar / wrapper heads stay on the scalar path even
+    // though they would also fail the user-schema lookup below.
+    if matches!(
+        name.as_str(),
+        "Int" | "Float" | "Bool" | "Null" | "String" | "List" | "Option" | "Result"
+    ) {
+        return Ok(None);
+    }
+    let Some(def) = resolver.resolve(name) else {
+        return Ok(None);
+    };
+    let mut stack: Vec<&str> = Vec::new();
+    let schema = canonical_schema_from_def(def, resolver, &mut stack, t.range)?;
+    Ok(Some(schema))
+}
+
+/// Recursively build a canonical [`Schema`] from a [`SchemaDef`].
+///
+/// `stack` carries the in-progress schema names so a cycle in nested
+/// declarations (`#schema A { B b: * }`, `#schema B { A a: * }`)
+/// surfaces as [`LoweringError::CyclicFieldDependency`] rather than
+/// infinite recursion. Cycles in nested-schema *types* are
+/// independent of the per-schema field-default cycle the topological
+/// emit pass detects later — both surface the same error variant so
+/// users get a uniform diagnostic for either shape.
+fn canonical_schema_from_def<'a>(
+    def: &'a SchemaDef,
+    resolver: &SchemaResolver<'a>,
+    stack: &mut Vec<&'a str>,
+    range: TokenRange,
+) -> Result<Schema, LoweringError> {
+    let name = def
+        .name
+        .as_deref()
+        .ok_or_else(|| LoweringError::UnsupportedExpr {
+            kind: "anonymous-nested-schema".to_string(),
+            range,
+        })?;
+    if stack.contains(&name) {
+        let mut cycle: Vec<String> = stack.iter().map(|s| s.to_string()).collect();
+        cycle.push(name.to_string());
+        return Err(LoweringError::CyclicFieldDependency {
+            schema: name.to_string(),
+            cycle,
+            range,
+        });
+    }
+    stack.push(name);
+    let mut fields = Vec::with_capacity(def.fields.len());
+    for f in &def.fields {
+        let ty_node = f
+            .type_hint
+            .as_ref()
+            .ok_or_else(|| LoweringError::UnsupportedFieldType {
+                schema: name.to_string(),
+                field: f.name.clone(),
+                ty: "<untyped>".to_string(),
+                range: f.value_range,
+            })?;
+        let ty = canonical_type_repr(ty_node, resolver, stack, f.value_range)?;
+        fields.push(Field {
+            name: f.name.clone(),
+            ty,
+            default: None,
+        });
+    }
+    stack.pop();
+    Ok(Schema {
+        name: name.to_string(),
+        generics: def.generics.clone(),
+        fields,
+    })
+}
+
+/// Convert a `TypeNode` into the canonical `TypeRepr`. Supports the
+/// Phase 3.b surface (scalar leaves, `String`, `List<Int>`, nested
+/// user schemas); everything else surfaces
+/// [`LoweringError::UnsupportedFieldType`] at the call site that
+/// owns the field name.
+fn canonical_type_repr<'a>(
+    ty: &TypeNode,
+    resolver: &SchemaResolver<'a>,
+    stack: &mut Vec<&'a str>,
+    range: TokenRange,
+) -> Result<TypeRepr, LoweringError> {
+    if ty.path.len() != 1 || ty.variant_fields.is_some() {
+        return Err(LoweringError::UnsupportedFieldType {
+            schema: stack.last().copied().unwrap_or("?").to_string(),
+            field: "?".to_string(),
+            ty: type_head_for_display(ty),
+            range,
+        });
+    }
+    let head = ty.path[0].as_str();
+    match (head, ty.generics.as_slice()) {
+        ("Int", []) => Ok(TypeRepr::Int),
+        ("Float", []) => Ok(TypeRepr::Float),
+        ("Bool", []) => Ok(TypeRepr::Bool),
+        ("Null", []) => Ok(TypeRepr::Null),
+        ("String", []) => Ok(TypeRepr::String),
+        ("List", [elem]) => {
+            let inner = canonical_type_repr(elem, resolver, stack, range)?;
+            if matches!(inner, TypeRepr::Int) {
+                Ok(TypeRepr::List {
+                    element: Box::new(inner),
+                })
+            } else {
+                Err(LoweringError::UnsupportedFieldType {
+                    schema: stack.last().copied().unwrap_or("?").to_string(),
+                    field: "?".to_string(),
+                    ty: type_head_for_display(ty),
+                    range,
+                })
+            }
+        }
+        _ => {
+            // Treat any single-segment head as a user-schema reference.
+            let Some(def) = resolver.resolve(head) else {
+                return Err(LoweringError::UnsupportedFieldType {
+                    schema: stack.last().copied().unwrap_or("?").to_string(),
+                    field: "?".to_string(),
+                    ty: head.to_string(),
+                    range,
+                });
+            };
+            let sub = canonical_schema_from_def(def, resolver, stack, range)?;
+            Ok(TypeRepr::Schema {
+                schema: Box::new(sub),
+            })
+        }
+    }
+}
+
+/// Decide topological order in which a schema's fields must be
+/// emitted, given the set of user-provided field names. A field
+/// that's user-provided stops dependency tracking for itself (the
+/// user value wins and is independent of the schema default).
+/// Otherwise the default expression's referenced sibling fields
+/// become incoming edges.
+///
+/// Returns `Err(CyclicFieldDependency)` when the dependency graph on
+/// the **needs-defaults** subset has a cycle. User-provided values
+/// can break a cycle: a schema `{ Int a: b, Int b: a }` constructed
+/// as `{ a: 1 }` is fine — only `b` needs defaulting and its
+/// reference to `a` is satisfied by the user value.
+fn topo_order_fields(
+    schema_name: &str,
+    def: &SchemaDef,
+    user_provided: &std::collections::HashSet<&str>,
+    range: TokenRange,
+) -> Result<Vec<usize>, LoweringError> {
+    // Collect per-field referenced sibling field names. Only fields
+    // we'll evaluate via their default expression need this — others
+    // get the user-supplied value and contribute no edges.
+    let mut deps: Vec<Vec<usize>> = vec![Vec::new(); def.fields.len()];
+    let name_to_idx: HashMap<&str, usize> = def
+        .fields
+        .iter()
+        .enumerate()
+        .map(|(i, f)| (f.name.as_str(), i))
+        .collect();
+    for (i, field) in def.fields.iter().enumerate() {
+        if user_provided.contains(field.name.as_str()) {
+            // User-supplied: ignore its default expression.
+            continue;
+        }
+        if field.is_wildcard {
+            // `Int x: *` declares the field with no default value.
+            // The dict literal must provide it.
+            return Err(LoweringError::MissingFieldNoDefault {
+                schema: schema_name.to_string(),
+                field: field.name.clone(),
+                range,
+            });
+        }
+        collect_field_refs(&field.value_node.expr, &name_to_idx, &mut deps[i]);
+        // Sanity: every reference must resolve to a sibling field.
+        // We can't know yet which references are unresolved at this
+        // step — `collect_field_refs` only walks bare-identifier
+        // references; an unresolved one was already a diagnostic at
+        // analyzer time. We still surface the case where a default
+        // expression names a sibling that doesn't exist as
+        // `UnknownFieldReferenceInDefault`. The walk runs the same
+        // resolution again and reports the first miss.
+        check_field_default_refs_resolvable(
+            schema_name,
+            &field.name,
+            &field.value_node.expr,
+            &name_to_idx,
+        )?;
+    }
+    // Kahn-style topological sort. `incoming[i]` = number of edges
+    // pointing into i. A field `j` evaluated from a default that
+    // references `i` requires `i` ready first → edge `i → j`. We
+    // build the graph from `deps[i] = list of i's prerequisite
+    // field indices` ⇒ for every `r ∈ deps[i]` add edge `r → i`,
+    // i.e. incoming[i] += 1 for each ref.
+    let n = def.fields.len();
+    let mut incoming = vec![0usize; n];
+    let mut outgoing: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (i, refs) in deps.iter().enumerate() {
+        for &r in refs {
+            outgoing[r].push(i);
+            incoming[i] += 1;
+        }
+    }
+    let mut order: Vec<usize> = Vec::with_capacity(n);
+    let mut ready: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
+    for (i, &incoming_count) in incoming.iter().enumerate().take(n) {
+        if incoming_count == 0 {
+            ready.push_back(i);
+        }
+    }
+    while let Some(i) = ready.pop_front() {
+        order.push(i);
+        for &j in &outgoing[i] {
+            incoming[j] -= 1;
+            if incoming[j] == 0 {
+                ready.push_back(j);
+            }
+        }
+    }
+    if order.len() != n {
+        // Find one cycle path for the error message via DFS.
+        let cycle = find_cycle_path(&outgoing, def, &incoming);
+        return Err(LoweringError::CyclicFieldDependency {
+            schema: schema_name.to_string(),
+            cycle,
+            range,
+        });
+    }
+    Ok(order)
+}
+
+/// DFS through the remaining (non-zero-incoming) field-default graph
+/// looking for a cycle path. The caller has already established at
+/// least one cycle exists (Kahn's algorithm couldn't drain the
+/// graph); we build a representative path so the user sees the field
+/// chain that participates.
+fn find_cycle_path(outgoing: &[Vec<usize>], def: &SchemaDef, incoming: &[usize]) -> Vec<String> {
+    let n = outgoing.len();
+    let mut visited = vec![false; n];
+    let mut on_stack = vec![false; n];
+    let mut stack: Vec<usize> = Vec::new();
+    for start in 0..n {
+        if visited[start] || incoming[start] == 0 {
+            continue;
+        }
+        if let Some(cycle) =
+            dfs_find_cycle(start, outgoing, &mut visited, &mut on_stack, &mut stack)
+        {
+            return cycle.iter().map(|&i| def.fields[i].name.clone()).collect();
+        }
+    }
+    // Fallback: should never happen given the caller's invariant.
+    Vec::new()
+}
+
+fn dfs_find_cycle(
+    start: usize,
+    outgoing: &[Vec<usize>],
+    visited: &mut [bool],
+    on_stack: &mut [bool],
+    stack: &mut Vec<usize>,
+) -> Option<Vec<usize>> {
+    visited[start] = true;
+    on_stack[start] = true;
+    stack.push(start);
+    for &next in &outgoing[start] {
+        if on_stack[next] {
+            // Cycle: emit the portion of the stack from `next` to the
+            // current node, plus `next` repeated at the end for a
+            // readable arrow chain.
+            let entry = stack.iter().position(|&i| i == next).unwrap_or(0);
+            let mut cycle = stack[entry..].to_vec();
+            cycle.push(next);
+            on_stack[start] = false;
+            stack.pop();
+            return Some(cycle);
+        }
+        if !visited[next] {
+            if let Some(c) = dfs_find_cycle(next, outgoing, visited, on_stack, stack) {
+                on_stack[start] = false;
+                stack.pop();
+                return Some(c);
+            }
+        }
+    }
+    on_stack[start] = false;
+    stack.pop();
+    None
+}
+
+/// Walk a default expression and record any bare-identifier
+/// references whose head matches a sibling field. Multi-segment
+/// references (`a.b.c`) only contribute the head segment — if the
+/// head resolves to a sibling, the rest of the path is treated as a
+/// post-access we don't track.
+fn collect_field_refs(expr: &Expr, name_to_idx: &HashMap<&str, usize>, out: &mut Vec<usize>) {
+    match expr {
+        Expr::Variable(path) | Expr::Reference { path, .. } => {
+            if let Some(TokenKey::String(name, _, _)) = path.first() {
+                if let Some(&idx) = name_to_idx.get(name.as_str()) {
+                    if !out.contains(&idx) {
+                        out.push(idx);
+                    }
+                }
+            }
+        }
+        Expr::Binary(_, a, b) => {
+            collect_field_refs(&a.expr, name_to_idx, out);
+            collect_field_refs(&b.expr, name_to_idx, out);
+        }
+        Expr::Unary(_, inner) => collect_field_refs(&inner.expr, name_to_idx, out),
+        Expr::Ternary { cond, then, els } => {
+            collect_field_refs(&cond.expr, name_to_idx, out);
+            collect_field_refs(&then.expr, name_to_idx, out);
+            collect_field_refs(&els.expr, name_to_idx, out);
+        }
+        Expr::List(items) => {
+            for n in items {
+                collect_field_refs(&n.expr, name_to_idx, out);
+            }
+        }
+        Expr::Dict(pairs) => {
+            for (_, v) in pairs {
+                collect_field_refs(&v.expr, name_to_idx, out);
+            }
+        }
+        Expr::Where { expr, bindings } => {
+            collect_field_refs(&bindings.expr, name_to_idx, out);
+            collect_field_refs(&expr.expr, name_to_idx, out);
+        }
+        Expr::FnCall { args, .. } => {
+            for a in args {
+                collect_field_refs(&a.value.expr, name_to_idx, out);
+            }
+        }
+        // Other shapes don't matter for the Phase 3.b surface (they
+        // either fail to lower upstream or don't reference siblings).
+        _ => {}
+    }
+}
+
+/// Recursive walker mirroring [`collect_field_refs`] that reports the
+/// first bare-identifier reference whose head doesn't resolve to a
+/// sibling field. Lowering uses this to surface
+/// `UnknownFieldReferenceInDefault` instead of letting the inner
+/// `lower_expr` fall through with an `UnresolvedVariable` (which the
+/// user would see as a confusing diagnostic about `#main` params).
+fn check_field_default_refs_resolvable(
+    schema: &str,
+    field: &str,
+    expr: &Expr,
+    name_to_idx: &HashMap<&str, usize>,
+) -> Result<(), LoweringError> {
+    let mut stack: Vec<&Expr> = vec![expr];
+    while let Some(e) = stack.pop() {
+        match e {
+            Expr::Variable(path) | Expr::Reference { path, .. } => {
+                if let Some(TokenKey::String(name, range, _)) = path.first() {
+                    if !name_to_idx.contains_key(name.as_str()) {
+                        return Err(LoweringError::UnknownFieldReferenceInDefault {
+                            schema: schema.to_string(),
+                            field: field.to_string(),
+                            referenced: name.clone(),
+                            range: *range,
+                        });
+                    }
+                }
+            }
+            Expr::Binary(_, a, b) => {
+                stack.push(&a.expr);
+                stack.push(&b.expr);
+            }
+            Expr::Unary(_, inner) => stack.push(&inner.expr),
+            Expr::Ternary { cond, then, els } => {
+                stack.push(&cond.expr);
+                stack.push(&then.expr);
+                stack.push(&els.expr);
+            }
+            Expr::List(items) => {
+                for n in items {
+                    stack.push(&n.expr);
+                }
+            }
+            Expr::Dict(pairs) => {
+                for (_, v) in pairs {
+                    stack.push(&v.expr);
+                }
+            }
+            Expr::Where { expr, bindings } => {
+                stack.push(&expr.expr);
+                stack.push(&bindings.expr);
+            }
+            Expr::FnCall { args, .. } => {
+                for a in args {
+                    stack.push(&a.value.expr);
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Map a Phase 3.b `TypeRepr` to its corresponding `IrType`. Distinct
+/// from [`type_repr_to_ir_type`] above only in that it accepts the
+/// `Schema { ... }` variant (treated as a pointer-indirect i32).
+fn type_repr_to_ir_type_dict(t: &TypeRepr) -> IrType {
+    match t {
+        TypeRepr::Int => IrType::I64,
+        TypeRepr::Float => IrType::F64,
+        TypeRepr::Bool => IrType::Bool,
+        TypeRepr::Null => IrType::Null,
+        TypeRepr::String => IrType::String,
+        TypeRepr::List { .. } => IrType::ListInt,
+        // Nested branded schema rides a pointer slot — same wasm
+        // representation as String / ListInt.
+        TypeRepr::Schema { .. } => IrType::I32,
+        TypeRepr::Option { .. } | TypeRepr::Result { .. } => IrType::I32,
+    }
+}
+
+/// Lower a dict literal into the in-construction record at
+/// `record_local`. The schema describes the record's shape; the
+/// `OffsetTable` carries field offsets; `dict_pairs` are the user-
+/// supplied fields.
+///
+/// Steps:
+///   1. Resolve user pairs to a (name, expr) map.
+///   2. Compute topological emit order from the schema defaults.
+///   3. For each field in topo order, lower the value expression
+///      (either user-provided or schema default) and emit the
+///      matching `StoreFieldAtRecord` op.
+///
+/// Nested branded dicts recurse via the same helper after allocating
+/// a fresh sub-record.
+fn lower_dict_into_record(
+    schema: &Schema,
+    layout: &OffsetTable,
+    dict_pairs: &[(TokenKey, Node)],
+    range: TokenRange,
+    record_local: u32,
+    ctx: &mut LowerCtx<'_>,
+) -> Result<(), LoweringError> {
+    // Resolve the analyzer-side SchemaDef so default expressions can
+    // be lowered. The canonical Schema we have here only carries
+    // field name + type — defaults live on the SchemaDef.
+    let def = ctx.schema_resolver.resolve(&schema.name).ok_or_else(|| {
+        LoweringError::UnknownSchemaBrand {
+            name: schema.name.clone(),
+            range,
+        }
+    })?;
+
+    // Build name → user-expr map. Reject duplicate keys.
+    let mut user_values: HashMap<String, &Node> = HashMap::new();
+    for (key, value) in dict_pairs {
+        let TokenKey::String(name, _, _) = key else {
+            return Err(LoweringError::UnsupportedExpr {
+                kind: format!("Dict(non-string-key in branded dict for `{}`)", schema.name),
+                range,
+            });
+        };
+        // Schema must declare this field.
+        if !schema.fields.iter().any(|f| &f.name == name) {
+            return Err(LoweringError::UnsupportedFieldType {
+                schema: schema.name.clone(),
+                field: name.clone(),
+                ty: format!("(unknown field, not declared on `{}`)", schema.name),
+                range,
+            });
+        }
+        user_values.insert(name.clone(), value);
+    }
+
+    let user_set: std::collections::HashSet<&str> =
+        user_values.keys().map(|s| s.as_str()).collect();
+    let order = topo_order_fields(&schema.name, def, &user_set, range)?;
+
+    for idx in order {
+        let canonical_field = &schema.fields[idx];
+        let layout_field = layout
+            .fields
+            .iter()
+            .find(|fo| fo.name == canonical_field.name)
+            .ok_or_else(|| LoweringError::UnsupportedFieldType {
+                schema: schema.name.clone(),
+                field: canonical_field.name.clone(),
+                ty: "<layout-miss>".to_string(),
+                range,
+            })?;
+        let field_range = def.fields[idx].value_range;
+        // Lower the value expression (user-supplied or schema default).
+        if let Some(user_value) = user_values.get(canonical_field.name.as_str()) {
+            lower_dict_field_value(schema, idx, user_value, user_value.range, ctx)?;
+        } else {
+            // Schema default. Re-bind `#main` params; let-scope is
+            // shared with the surrounding body (defaults sit at the
+            // schema-instantiation site, not inside an isolated
+            // scope, so referenced field names already resolved
+            // through the topo-ordered store ops above are reachable
+            // via `LetGet` over the per-field default-local — see
+            // below for the sibling lookup mechanism).
+            //
+            // For Phase 3.b sibling field references are resolved
+            // through the lowered value expression directly: the
+            // default expression `a + 1` lowers to `LetGet { idx:
+            // sibling_let_of_a }`. That trick requires us to keep a
+            // per-record map from field name → let-local index when
+            // a field's value is consumed by a later default. The
+            // simpler shape: emit a `LetSet` for every default-
+            // evaluated field so the wasm side caches the value and
+            // a later default can read it back via `LetGet`.
+            lower_dict_default(&schema.name, idx, def, ctx, field_range)?;
+        }
+        // Stack now holds the field's value (with type matching the
+        // canonical Field). Emit the StoreFieldAtRecord.
+        let ir_ty = type_repr_to_ir_type_dict(&canonical_field.ty);
+        let store_ty = match layout_field.kind {
+            FieldKind::Inline { .. } => ir_ty,
+            // Pointer-indirect fields all store as an i32 pointer.
+            FieldKind::PointerIndirect { .. } => IrType::I32,
+        };
+        let top = ctx
+            .tstack
+            .pop()
+            .ok_or_else(|| LoweringError::UnsupportedExpr {
+                kind: format!(
+                    "Dict field `{}` of `{}` produced no value",
+                    canonical_field.name, schema.name
+                ),
+                range,
+            })?;
+        if top.wasm_slot() != store_ty.wasm_slot() {
+            return Err(LoweringError::UnsupportedFieldType {
+                schema: schema.name.clone(),
+                field: canonical_field.name.clone(),
+                ty: format!("got {:?}, expected {:?}", top, store_ty),
+                range,
+            });
+        }
+        ctx.out.push(TaggedOp {
+            op: Op::StoreFieldAtRecord {
+                record_local_idx: record_local,
+                offset: layout_field.offset as u32,
+                ty: store_ty,
+            },
+            range: field_range,
+        });
+
+        // Cache the freshly-stored value into a let-local so later
+        // sibling defaults can `LetGet` it. We only do this for
+        // fields the schema's defaults actually reference — but
+        // computing that subset requires a second pass. For the
+        // Phase 3.b surface we cache *every* field, accepting the
+        // unused-local overhead in exchange for simpler bookkeeping.
+        // The wasm engine drops unused locals at JIT time.
+        //
+        // The cache mechanism: re-lower the value into a `LetSet` so
+        // the value lives in a wasm local, then map the field name
+        // to that let-idx. Because the value has already been
+        // consumed by `StoreFieldAtRecord`, we re-emit a `LetGet`
+        // that pulls the *stored slot* back through `LoadField`-like
+        // semantics — but that's expensive. Simpler: stash the
+        // value in a let *before* the StoreFieldAtRecord.
+        //
+        // Reorder: emit value → LetSet (cache) → LetGet (push back)
+        // → StoreFieldAtRecord. The implementation does this by
+        // splicing the LetSet/Get pair just before the store.
+        //
+        // We thread the cache via `ctx`'s let-binding stack so the
+        // existing `Variable(name)` lookup resolves to the cached
+        // value when a later default emits a reference.
+        //
+        // Performed below.
+        let bound_ty = top;
+        let let_idx = ctx.next_let_idx;
+        ctx.next_let_idx += 1;
+        // Reach into the just-emitted op stream: splice
+        // [LetSet, LetGet] right before the trailing
+        // StoreFieldAtRecord. The current top-of-`out` is that
+        // StoreFieldAtRecord (we pushed it just above) — pop, push
+        // the cache pair, push it back. Cheaper than re-walking.
+        let store_op = ctx.out.pop().expect("StoreFieldAtRecord just pushed");
+        ctx.out.push(TaggedOp {
+            op: Op::LetSet {
+                idx: let_idx,
+                ty: bound_ty,
+            },
+            range: field_range,
+        });
+        ctx.out.push(TaggedOp {
+            op: Op::LetGet {
+                idx: let_idx,
+                ty: bound_ty,
+            },
+            range: field_range,
+        });
+        ctx.out.push(store_op);
+        ctx.lets.push(LetBinding {
+            name: canonical_field.name.clone(),
+            idx: let_idx,
+            ty: bound_ty,
+        });
+    }
+
+    // Pop the field-name let bindings we pushed so the surrounding
+    // scope sees its original let stack.
+    let drop_count = schema.fields.len();
+    let new_len = ctx.lets.len().saturating_sub(drop_count);
+    ctx.lets.truncate(new_len);
+
+    Ok(())
+}
+
+/// Lower one user-supplied dict-literal field value. Field `idx`
+/// describes the schema-side canonical type; the value's source-side
+/// expression decides which lowering arm to take.
+fn lower_dict_field_value(
+    schema: &Schema,
+    field_idx: usize,
+    value: &Node,
+    range: TokenRange,
+    ctx: &mut LowerCtx<'_>,
+) -> Result<(), LoweringError> {
+    let canonical = &schema.fields[field_idx];
+    match (&canonical.ty, &*value.expr) {
+        (TypeRepr::Schema { schema: sub_schema }, Expr::Dict(pairs)) => {
+            // Nested branded dict. Allocate a sub-record, recurse,
+            // then push the sub-record's base offset for the parent's
+            // pointer slot.
+            let sub_layout = SchemaLayout::offsets_for(sub_schema)?;
+            let record_local = ctx.alloc_record_local();
+            ctx.out.push(TaggedOp {
+                op: Op::AllocSubRecord {
+                    record_local_idx: record_local,
+                    root_size: sub_layout.root_size as u32,
+                    root_align: sub_layout.root_align as u32,
+                },
+                range,
+            });
+            lower_dict_into_record(sub_schema, &sub_layout, pairs, range, record_local, ctx)?;
+            // Push the sub-record base so the parent's pointer-slot
+            // store can consume it.
+            ctx.out.push(TaggedOp {
+                op: Op::PushRecordBase {
+                    record_local_idx: record_local,
+                },
+                range,
+            });
+            ctx.tstack.push(IrType::I32);
+            Ok(())
+        }
+        (TypeRepr::String, _) | (TypeRepr::List { .. }, _) => {
+            // Recursively lower the value to produce an absolute
+            // pointer (ConstString / ConstListInt / LoadStringPtr /
+            // ...). Then copy the record into the parent's tail
+            // area and push the buffer-relative offset.
+            lower_expr(&value.expr, range, ctx)?;
+            // Top of stack is an absolute address. Emit the tail-
+            // record memcpy.
+            let popped = ctx.tstack.pop().ok_or(LoweringError::UnsupportedExpr {
+                kind: "Dict(field-value-stack-empty)".to_string(),
+                range,
+            })?;
+            // Cross-check the IR type against the declared field
+            // type — saves a confusing codegen-time failure when the
+            // dict field expects a String but the value lowered to
+            // List<Int>.
+            let expected_ir = match &canonical.ty {
+                TypeRepr::String => IrType::String,
+                TypeRepr::List { .. } => IrType::ListInt,
+                _ => unreachable!(),
+            };
+            if popped != expected_ir {
+                return Err(LoweringError::UnsupportedFieldType {
+                    schema: schema.name.clone(),
+                    field: canonical.name.clone(),
+                    ty: format!("expected {expected_ir:?}, got {popped:?}"),
+                    range,
+                });
+            }
+            ctx.out.push(TaggedOp {
+                op: Op::EmitTailRecordFromAbsoluteAddr { ty: expected_ir },
+                range,
+            });
+            ctx.tstack.push(IrType::I32);
+            Ok(())
+        }
+        // Scalar leaves: just lower the value. The
+        // StoreFieldAtRecord ranges already align.
+        _ => lower_expr(&value.expr, range, ctx),
+    }
+}
+
+/// Lower a schema-default expression for field `field_idx`. The
+/// default's body lives on the analyzer-side `SchemaFieldDef::value_node`;
+/// we re-route the existing `lower_expr` recursion at that body so
+/// references to sibling fields hit the just-pushed let-bindings
+/// (we cache each evaluated field into a let-local in
+/// [`lower_dict_into_record`]).
+fn lower_dict_default(
+    schema_name: &str,
+    field_idx: usize,
+    def: &SchemaDef,
+    ctx: &mut LowerCtx<'_>,
+    range: TokenRange,
+) -> Result<(), LoweringError> {
+    let field = &def.fields[field_idx];
+    if field.is_wildcard {
+        return Err(LoweringError::MissingFieldNoDefault {
+            schema: schema_name.to_string(),
+            field: field.name.clone(),
+            range,
+        });
+    }
+    // Lower the default expression with the surrounding lets in
+    // scope. The let-stack already carries `<prior-field-name> →
+    // value` bindings because the topological order placed
+    // dependencies first.
+    let value_node = &field.value_node;
+    lower_expr(&value_node.expr, value_node.range, ctx)?;
+    Ok(())
 }
 
 /// Lower a bare-identifier reference. Phase 3.a checks the user-let

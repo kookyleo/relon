@@ -316,4 +316,97 @@ pub enum Op {
     /// Pop the top value and end the function (wasm `end` does the
     /// implicit return). Must be the last op in `Func::body`.
     Return,
+
+    /// Phase 3.b dict literal construction.
+    ///
+    /// Mark the start of building the **return root** record (the
+    /// dict the `#main` directly returns). The fixed area for the
+    /// root record sits at `out_ptr + 0..return_root_size` — the
+    /// host pre-sized `out_buf` to cover it, so the lowering doesn't
+    /// need to bump `$tail_cursor` for the root itself. Codegen
+    /// stores `0` into the wasm local at `record_local_idx`
+    /// (FIRST_RECORD_LOCAL_INDEX + N) so subsequent
+    /// [`Op::StoreFieldAtRecord`] / [`Op::PushRecordBase`] ops can
+    /// address fields relative to the root base uniformly with sub-
+    /// records.
+    AllocRootRecord {
+        /// Per-function index of the wasm local that holds the
+        /// record's base (out_ptr-relative byte offset). Codegen
+        /// allocates one i32 local per unique index past the
+        /// per-function let-locals area.
+        record_local_idx: u32,
+    },
+    /// Phase 3.b dict literal construction.
+    ///
+    /// Allocate a **nested** sub-record's fixed area in the parent
+    /// buffer's tail area. Aligns `$tail_cursor` up to `root_align`,
+    /// performs the out_cap bounds check, stores the aligned cursor
+    /// into the record local, and bumps `$tail_cursor += root_size`.
+    /// Subsequent [`Op::StoreFieldAtRecord`] ops write into the
+    /// sub-record's fixed area; the parent's pointer slot receives
+    /// the sub-record base via [`Op::PushRecordBase`] +
+    /// [`Op::StoreFieldAtRecord`].
+    AllocSubRecord {
+        /// Per-function local index for the sub-record's base
+        /// offset. Same allocation scheme as
+        /// [`Op::AllocRootRecord::record_local_idx`].
+        record_local_idx: u32,
+        /// Fixed-area size of the sub-schema in bytes.
+        root_size: u32,
+        /// Required alignment of the sub-schema's fixed area in
+        /// bytes — codegen aligns `$tail_cursor` up to this before
+        /// recording the base.
+        root_align: u32,
+    },
+    /// Phase 3.b dict literal construction.
+    ///
+    /// Pop a value off the stack and store it into the in-construction
+    /// record at `out_ptr + $record_local + offset`. The op tag drives
+    /// the wasm store opcode:
+    ///
+    /// * `I64` / `F64` — pop scalar, `i64.store` / `f64.store`.
+    /// * `Bool` / `Null` — pop i32, `i32.store8`.
+    /// * `String` / `ListInt` — pop i32 (an out_ptr-relative offset
+    ///   produced by [`Op::EmitTailRecordFromAbsoluteAddr`] or
+    ///   [`Op::PushRecordBase`]), store as i32 via `i32.store`. The
+    ///   stored value is a buffer-relative pointer the host reader
+    ///   dereferences directly.
+    StoreFieldAtRecord {
+        /// Per-function local index naming the record's base offset.
+        record_local_idx: u32,
+        /// Byte offset of the field inside the record's fixed area.
+        offset: u32,
+        /// Field's IR type. Drives the wasm store-opcode selection.
+        ty: IrType,
+    },
+    /// Phase 3.b dict literal construction.
+    ///
+    /// Push the current value of `$record_local` onto the wasm operand
+    /// stack as an i32. Used when the surrounding parent record needs
+    /// to store the sub-record's base offset into its pointer slot.
+    PushRecordBase {
+        /// Per-function local index naming the sub-record's base
+        /// offset.
+        record_local_idx: u32,
+    },
+    /// Phase 3.b dict literal construction.
+    ///
+    /// Pop an absolute wasm-memory address pointing at a
+    /// `[len:u32 LE][payload]` record (from `ConstString` /
+    /// `ConstListInt` / `LoadStringPtr` / `LoadListIntPtr`), memcpy
+    /// the record into the `out_buf` tail area at `$tail_cursor`,
+    /// bump `$tail_cursor` by the record size, and push the new
+    /// buffer-relative offset of the record onto the stack as i32.
+    ///
+    /// Used for emitting String / List<Int> fields inside a dict
+    /// literal: the resulting offset is what the parent's pointer
+    /// slot stores via [`Op::StoreFieldAtRecord`] with `ty:
+    /// String`/`ListInt`.
+    EmitTailRecordFromAbsoluteAddr {
+        /// IR type of the record. Drives record-size computation
+        /// (String: `len + 4`, ListInt: `8 + 8 * count`) and the
+        /// pre-write alignment of `$tail_cursor` (4 for String,
+        /// 8 for ListInt).
+        ty: IrType,
+    },
 }

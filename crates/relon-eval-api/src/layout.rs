@@ -147,9 +147,8 @@ pub enum LayoutError {
 
 /// Compute the field-kind / fixed-area placement for one [`TypeRepr`].
 ///
-/// Returns `None` only for types Phase 2.c still rejects (`Dict`,
-/// `Option`, `Result`, nested schemas, lists of non-`Int` element
-/// types). The supported set:
+/// Returns `None` only for types still rejected (`Option`, `Result`,
+/// `List<T>` where `T != Int`). The supported set:
 ///
 /// * `Null`, `Bool` → `Inline { size: 1, align: 1 }`.
 /// * `Int`, `Float` → `Inline { size: 8, align: 8 }`.
@@ -158,6 +157,11 @@ pub enum LayoutError {
 ///   4-byte boundary).
 /// * `List<Int>` → `PointerIndirect { tail_alignment: 8 }` (i64
 ///   elements are emitted inline in the tail area).
+/// * Phase 3.b: nested branded `Schema { ... }` → `PointerIndirect`
+///   with `tail_alignment` matching the sub-record's `root_align`.
+///   The sub-record's fixed area lives in the parent buffer's tail
+///   area; the parent's fixed-area slot holds a 4-byte buffer-relative
+///   pointer to it.
 fn field_kind_for(ty: &TypeRepr) -> Option<FieldKind> {
     match ty {
         TypeRepr::Null => Some(FieldKind::Inline { size: 1, align: 1 }),
@@ -168,34 +172,43 @@ fn field_kind_for(ty: &TypeRepr) -> Option<FieldKind> {
         TypeRepr::List { element } if matches!(element.as_ref(), TypeRepr::Int) => {
             Some(FieldKind::PointerIndirect { tail_alignment: 8 })
         }
-        // Phase 2.c still defers nested-schema / option / result /
-        // dict and any `List<T>` where `T != Int` to a later phase.
-        TypeRepr::List { .. }
-        | TypeRepr::Option { .. }
-        | TypeRepr::Result { .. }
-        | TypeRepr::Schema { .. } => None,
+        TypeRepr::Schema { schema } => {
+            // Recursively compute the sub-record's root_align so the
+            // tail-area placement of the sub-record honours its own
+            // alignment requirements (an inner i64 field demands the
+            // sub-record start on an 8-byte boundary).
+            let sub = SchemaLayout::offsets_for(schema).ok()?;
+            Some(FieldKind::PointerIndirect {
+                tail_alignment: sub.root_align,
+            })
+        }
+        // Other variable-length composites still defer to a later
+        // phase.
+        TypeRepr::List { .. } | TypeRepr::Option { .. } | TypeRepr::Result { .. } => None,
     }
 }
 
 /// Human-readable name used in `UnsupportedTypeInLayoutV1`. Returns
-/// `None` for types Phase 2.c does support inline or via pointer
-/// indirection. Used at the call site to detect "we need a kind
-/// label".
+/// `None` for types the layout currently supports inline or via
+/// pointer indirection. Used at the call site to detect "we need a
+/// kind label".
 fn unsupported_kind(ty: &TypeRepr) -> Option<&'static str> {
     match ty {
         TypeRepr::Option { .. } => Some("Option"),
         TypeRepr::Result { .. } => Some("Result"),
-        TypeRepr::Schema { .. } => Some("Schema"),
         // `List<T>` where `T != Int` lands here; the caller has
         // already established `field_kind_for` returned `None` for
         // this exact shape, so emitting "List" is correct.
         TypeRepr::List { .. } => Some("List"),
-        // Scalar leaves + supported pointer-indirect leaves are
-        // supported — caller should not reach the unsupported branch
-        // for these.
-        TypeRepr::Null | TypeRepr::Bool | TypeRepr::Int | TypeRepr::Float | TypeRepr::String => {
-            None
-        }
+        // Scalar leaves + supported pointer-indirect leaves +
+        // Phase 3.b nested schema are supported — caller should not
+        // reach the unsupported branch for these.
+        TypeRepr::Null
+        | TypeRepr::Bool
+        | TypeRepr::Int
+        | TypeRepr::Float
+        | TypeRepr::String
+        | TypeRepr::Schema { .. } => None,
     }
 }
 

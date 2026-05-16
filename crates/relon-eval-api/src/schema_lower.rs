@@ -9,11 +9,11 @@
 //! `(name, type)` pairs the binary layout cares about.
 //!
 //! Phase 2.b scope: only `Int` / `Float` / `Bool` / `Null` field types
-//! are supported. Everything else returns a [`SchemaLowerError`] so
-//! callers fail loudly rather than silently producing the wrong hash.
-//! String / List / Option / Result / Schema-nested fields land in
-//! Phase 2.c when the layout pass grows the pointer-indirection tail
-//! area.
+//! are supported by [`lower_schema_def`]; the function is used to
+//! lower the synthesised `MainParams` schema. Pointer-indirect leaves
+//! (`String`, `List<Int>`) and nested branded schemas are constructed
+//! directly inside the IR lowering pass (it has access to the
+//! analyzer's schema table for cross-schema resolution).
 
 use crate::schema_canonical::{Field, Schema, TypeRepr};
 use relon_analyzer::schema::SchemaDef;
