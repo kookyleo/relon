@@ -470,16 +470,41 @@ fn write_value_into_builder(
                 .write_list_int(&field.name, &ints)
                 .map_err(buffer_to_runtime_error)
         }
-        // Nested branded sub-record: not yet supported on the input
-        // side because BufferBuilder doesn't expose a `sub_record`
-        // writer counterpart. v1 leaves dict-typed `#main` parameters
-        // for Phase 9.
-        (TypeRepr::Schema { .. }, _) => Err(RuntimeError::Unsupported {
-            reason: format!(
-                "wasm-aot backend does not yet support Schema-typed `#main` arg `{field}` (schema `{schema}`)",
-                field = field.name,
-                schema = schema_name,
-            ),
+        // Nested branded sub-record. Phase 9.b-1: BufferBuilder::
+        // sub_record now packs Schema-typed `#main` args by allocating
+        // a detached child builder, recursively writing every field
+        // into it, then committing back through finish_sub_record.
+        // The Value side accepts either a plain dict literal or a
+        // branded dict — both shapes route through the same field walker.
+        (TypeRepr::Schema { schema: sub_schema }, Value::Dict(d)) => {
+            let sub_layout = SchemaLayout::offsets_for(sub_schema).map_err(|e| {
+                RuntimeError::IoError(format!(
+                    "wasm sub-record layout for `{field}`: {e}",
+                    field = field.name,
+                ))
+            })?;
+            let mut child = builder
+                .sub_record(&field.name, &sub_layout, &sub_schema.fields)
+                .map_err(buffer_to_runtime_error)?;
+            for sub_field in &sub_schema.fields {
+                let sub_value =
+                    d.map
+                        .get(&sub_field.name)
+                        .ok_or_else(|| RuntimeError::MissingMainArg {
+                            name: format!("{}.{}", field.name, sub_field.name),
+                            range: relon_parser::TokenRange::default(),
+                        })?;
+                write_value_into_builder(&mut child, sub_field, sub_value, &sub_schema.name)?;
+            }
+            builder
+                .finish_sub_record(&field.name, child)
+                .map_err(buffer_to_runtime_error)
+        }
+        (TypeRepr::Schema { .. }, found) => Err(RuntimeError::MainArgTypeMismatch {
+            name: field.name.clone(),
+            expected: format!("Dict (schema `{schema_name}`)"),
+            found: found.type_name().to_string(),
+            range: relon_parser::TokenRange::default(),
         }),
         (expected, found) => Err(RuntimeError::MainArgTypeMismatch {
             name: field.name.clone(),

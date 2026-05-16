@@ -193,6 +193,84 @@ fn invoke_closure_returns_unsupported() {
 }
 
 #[test]
+fn schema_arg_via_pool() {
+    // Phase 9.b-1: WasmAotEvaluator now accepts Schema-typed `#main`
+    // arguments through `BufferBuilder::sub_record`. The Dict value
+    // mirrors the canonical schema shape — the host passes a
+    // `Value::Dict { x: 21 }` for a `#main(V v) -> Int` whose `V` has
+    // an `Int x` field plus a `doubled()` method. Tree-walker parity
+    // confirms the schema-method dispatch path lights up identically.
+    let src = "#schema V { Int x: * } with {\n  \
+        doubled() -> Int: self.x * 2\n\
+        }\n\
+        #main(V v) -> Int\n\
+        v.doubled()";
+    let aot = WasmAotEvaluator::from_source(src).expect("compile");
+
+    let mut v_map = std::collections::BTreeMap::new();
+    v_map.insert("x".to_string(), Value::Int(21));
+    let mut args = HashMap::new();
+    args.insert("v".to_string(), Value::branded_dict(v_map, Some("V".into())));
+
+    let aot_out = aot.run_main(args.clone()).expect("aot run_main");
+    let walker_out = tree_walk_run(src, args).expect("tree-walk run_main");
+
+    assert_eq!(aot_out, Value::Int(42));
+    assert_eq!(aot_out, walker_out);
+}
+
+#[test]
+fn schema_arg_with_two_int_fields_roundtrips() {
+    // Sub-record arg with two scalar fields — exercises the pointer
+    // slot in MainParams plus the inline-int reads inside the
+    // sub-record. The schema-rooted method runs through the existing
+    // self.field dispatch path, which is the most heavily covered
+    // method_dispatch_smoke shape.
+    let src = "#schema Pair { Int a: *, Int b: * } with {\n  \
+        sum() -> Int: self.a + self.b\n\
+        }\n\
+        #main(Pair p) -> Int\n\
+        p.sum()";
+    let aot = WasmAotEvaluator::from_source(src).expect("compile");
+
+    let mut p_map = std::collections::BTreeMap::new();
+    p_map.insert("a".to_string(), Value::Int(3));
+    p_map.insert("b".to_string(), Value::Int(4));
+    let mut args = HashMap::new();
+    args.insert(
+        "p".to_string(),
+        Value::branded_dict(p_map, Some("Pair".into())),
+    );
+
+    let aot_out = aot.run_main(args.clone()).expect("aot run_main");
+    let walker_out = tree_walk_run(src, args).expect("tree-walk run_main");
+    assert_eq!(aot_out, Value::Int(7));
+    assert_eq!(aot_out, walker_out);
+}
+
+#[test]
+fn schema_arg_missing_inner_field_errors() {
+    // The buffer builder demands every sub-field; surface a clear
+    // MissingMainArg before the wasm side ever runs.
+    let src = "#schema V { Int x: * } with {\n  \
+        doubled() -> Int: self.x * 2\n\
+        }\n\
+        #main(V v) -> Int\n\
+        v.doubled()";
+    let aot = WasmAotEvaluator::from_source(src).expect("compile");
+
+    let v_map = std::collections::BTreeMap::new();
+    let mut args = HashMap::new();
+    args.insert("v".to_string(), Value::branded_dict(v_map, Some("V".into())));
+
+    let err = aot.run_main(args).expect_err("missing inner must error");
+    match err {
+        RuntimeError::MissingMainArg { name, .. } => assert_eq!(name, "v.x"),
+        other => panic!("expected MissingMainArg, got {other:?}"),
+    }
+}
+
+#[test]
 fn run_main_missing_argument_errors() {
     // The buffer builder needs every declared #main param. We
     // surface `MissingMainArg` before the wasm side runs.
