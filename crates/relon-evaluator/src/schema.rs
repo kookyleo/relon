@@ -1,5 +1,5 @@
 use crate::error::RuntimeError;
-use crate::eval::{decorator_name, Evaluator};
+use crate::eval::{decorator_name, TreeWalkEvaluator};
 use crate::native_fn::EvaluatedArg;
 use crate::scope::Scope;
 use crate::value::{SchemaField, Value};
@@ -8,7 +8,7 @@ use relon_parser::{is_builtin_type_name, Expr, Node, TokenKey, TokenRange, TypeN
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-impl Evaluator {
+impl TreeWalkEvaluator {
     pub(crate) fn check_type(
         &self,
         value: &mut Value,

@@ -9,7 +9,7 @@ fn format_chain(chain: &[String]) -> String {
     chain.join(" \u{2192} ")
 }
 
-#[derive(Error, Debug, Diagnostic)]
+#[derive(Error, Debug, Diagnostic, Clone)]
 pub enum RuntimeError {
     #[error("Variable not found: {0}")]
     #[diagnostic(

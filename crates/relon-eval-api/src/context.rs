@@ -30,12 +30,12 @@ use std::sync::{Arc, Mutex};
 /// set here — there is no per-name allowlist or global short-circuit,
 /// so a successful call proves that every bit on its gate was granted.
 ///
-/// `#[non_exhaustive]`: future capability bits are added here without a
-/// breaking semver bump. External callers must construct via
-/// [`Capabilities::default`] / [`Capabilities::all_granted`] and mutate
-/// fields, rather than struct literals.
+/// Future capability bits will be added to this struct. External callers
+/// should prefer constructing via [`Capabilities::default`] /
+/// [`Capabilities::all_granted`] and mutating fields rather than relying
+/// on field-order struct literals, so that adding a bit stays
+/// backwards-compatible for downstream code.
 #[derive(Debug, Clone, Default)]
-#[non_exhaustive]
 pub struct Capabilities {
     /// Filesystem reads (host fn that calls `std::fs::read*`, also the
     /// policy bit consulted by `FilesystemModuleResolver`).
@@ -93,11 +93,10 @@ impl Capabilities {
 /// trivially satisfied by any `Capabilities` value, including a
 /// fully-sandboxed [`Capabilities::default`].
 ///
-/// `#[non_exhaustive]`: future capability bits are added here without a
-/// breaking semver bump. External callers should construct via
-/// `NativeFnGate::default()` and set the bits they need.
+/// Future capability bits will be added to this struct; downstream
+/// code should construct via `NativeFnGate::default()` and set the
+/// bits it needs rather than relying on positional struct literals.
 #[derive(Debug, Clone, Default)]
-#[non_exhaustive]
 pub struct NativeFnGate {
     /// Function reads from the filesystem.
     pub reads_fs: bool,
@@ -219,6 +218,19 @@ pub struct Context {
     /// workspace analysis keep working unchanged.
     pub workspace: Option<Arc<relon_analyzer::WorkspaceTree>>,
     pub capabilities: Capabilities,
+    /// Set by [`Context::sandboxed`] so the backend's deferred setup
+    /// step can attach the default-deny filesystem resolver after the
+    /// stdlib / decorators / prelude registration. Untouched by the
+    /// bare [`Context::new`] constructor.
+    pub sandboxed_flag: bool,
+    /// Tracks whether the backend has already installed its default
+    /// stdlib / decorators / prelude into this context. Flipped from
+    /// `false` to `true` by `TreeWalkEvaluator::new` (and any future
+    /// backend) on first wrap, so a `Context` reused across multiple
+    /// evaluator instances doesn't pay the registration cost twice
+    /// and a host re-registering an intrinsic isn't silently undone
+    /// on a second wrap.
+    pub backend_prepared: bool,
 }
 
 impl Default for Context {
@@ -228,15 +240,12 @@ impl Default for Context {
 }
 
 impl Context {
-    /// Construct an empty [`Context`] with no registered plugins or
-    /// resolvers. Backend crates (`relon-evaluator`) seed their own
-    /// stdlib / decorator / prelude on top of this. Hosts that want
-    /// the "ready-to-use" preset should call the backend's own
-    /// constructor (e.g. `TreeWalkEvaluator`-side helpers re-export
-    /// here through the `relon` facade).
-    ///
-    /// This bare constructor exists so any backend can build a
-    /// `Context` without pulling in the tree-walk evaluator's stdlib.
+    /// Construct a [`Context`] with no plugins / resolvers / stdlib
+    /// pre-registered. Backend crates (e.g. `relon-evaluator`) attach
+    /// their own stdlib + decorators + module resolvers when the host
+    /// constructs an evaluator on top of this context (the tree-walking
+    /// backend does this lazily in `TreeWalkEvaluator::new` so users
+    /// keep the historical "call `Context::new()` then go" ergonomics).
     pub fn new() -> Self {
         Self {
             root_node: None,
@@ -256,7 +265,21 @@ impl Context {
             analyzed: None,
             workspace: None,
             capabilities: Capabilities::default(),
+            sandboxed_flag: false,
+            backend_prepared: false,
         }
+    }
+
+    /// Sandboxed counterpart to [`Self::new`]. The bare construction is
+    /// identical; the only difference is `sandboxed_flag = true`, which
+    /// the active backend reads when it installs its defaults so a
+    /// default-deny filesystem resolver is appended after the standard
+    /// `std/...` resolver. The tree-walking backend implements this
+    /// hook in `TreeWalkEvaluator::new`.
+    pub fn sandboxed() -> Self {
+        let mut this = Self::new();
+        this.sandboxed_flag = true;
+        this
     }
 
     pub fn with_root(mut self, node: Node) -> Self {

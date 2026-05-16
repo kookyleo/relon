@@ -6,7 +6,7 @@
 //! because their evaluation order interacts with the dispatcher.
 
 use crate::error::RuntimeError;
-use crate::eval::Evaluator;
+use crate::eval::TreeWalkEvaluator;
 use crate::scope::Scope;
 use crate::value::Value;
 use ordered_float::OrderedFloat;
@@ -28,7 +28,7 @@ impl NumericValue {
     }
 }
 
-impl Evaluator {
+impl TreeWalkEvaluator {
     pub(crate) fn eval_binary(
         &self,
         op: Operator,

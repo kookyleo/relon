@@ -83,9 +83,5 @@ pub trait Evaluator: Send + Sync {
     /// Invoke a constructed closure value with positional `args`. The
     /// shortest entry point when a host wants to call a Relon closure as a
     /// plain callback.
-    fn invoke_closure(
-        &self,
-        closure: &ClosureData,
-        args: &[Value],
-    ) -> Result<Value, RuntimeError>;
+    fn invoke_closure(&self, closure: &ClosureData, args: &[Value]) -> Result<Value, RuntimeError>;
 }

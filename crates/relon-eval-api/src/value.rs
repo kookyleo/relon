@@ -328,6 +328,25 @@ impl Value {
     }
 }
 
+impl std::fmt::Display for Value {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Value::Null => write!(f, "null"),
+            Value::Bool(b) => write!(f, "{}", b),
+            Value::Int(i) => write!(f, "{}", i),
+            Value::Float(fl) => write!(f, "{}", fl),
+            Value::String(s) => write!(f, "{}", s),
+            Value::List(l) => write!(f, "{:?}", l),
+            Value::Dict(d) => write!(f, "{:?}", d.map),
+            Value::Closure(_) => write!(f, "<closure>"),
+            Value::Schema(_) => write!(f, "<schema>"),
+            Value::EnumSchema(enum_data) => write!(f, "<enum {}>", enum_data.name),
+            Value::Type(t) => write!(f, "Type<{}>", relon_analyzer::format_type(t)),
+            Value::Wildcard => write!(f, "*"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod size_guard {
     use super::Value;

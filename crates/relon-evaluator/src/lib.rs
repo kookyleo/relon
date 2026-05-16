@@ -22,15 +22,21 @@ pub mod scope;
 pub mod stdlib;
 pub mod value;
 
-pub use decorator::{DecoratorPlugin, PreEvalOutcome};
-pub use error::RuntimeError;
-pub use eval::{Capabilities, Context, Evaluator, NativeFnGate};
-pub use module::{FilesystemModuleResolver, ModuleResolver, ModuleSource, StdModuleResolver};
-pub use native_fn::NativeFnCaps;
-pub use native_fn::{EvaluatedArg, NativeArgs, RelonFunction};
+// Re-export the public surface so existing callers writing `use
+// relon_evaluator::Value;` (etc.) keep working after the split: every
+// public type now lives in `relon-eval-api`; this crate only owns the
+// tree-walking backend impl (`TreeWalkEvaluator`) and the in-tree
+// stdlib / decorator registration helpers.
+pub use eval::TreeWalkEvaluator;
+pub use relon_eval_api::{
+    Capabilities, ClosureData, Context, DecoratorPlugin, EnumSchemaData, EvaluatedArg, Evaluator,
+    GatedNativeFn, ListContext, ModuleResolver, ModuleSource, NativeArgs, NativeFn, NativeFnCaps,
+    NativeFnGate, PreEvalOutcome, RelonFunction, RootRef, RuntimeError, SchemaData, SchemaField,
+    Scope, Thunk, Value, ValueDict,
+};
+// Concrete backend-side helpers that are not part of `relon-eval-api`.
+pub use module::{FilesystemModuleResolver, StdModuleResolver};
 pub use relon_analyzer::{MainParam, MainSignature, WorkspaceDiagnostic, WorkspaceTree};
-pub use scope::{ListContext, Scope, Thunk};
-pub use value::{SchemaField, Value, ValueDict};
 
 // Tests live in dedicated files to keep the crate root focused on the
 // public API surface. Each is gated by its own `#![cfg(test)]`.

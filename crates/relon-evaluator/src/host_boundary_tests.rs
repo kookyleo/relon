@@ -7,12 +7,13 @@
 //! The cases below pair a minimal triggering script with assertions
 //! on the variant and on the source-location label.
 
-use crate::eval::{Capabilities, Context, Evaluator};
+use crate::eval::TreeWalkEvaluator;
 use crate::module::FilesystemModuleResolver;
 use crate::native_fn::{NativeArgs, RelonFunction};
 use crate::scope::Scope;
 use crate::value::Value;
 use crate::{NativeFnGate, RuntimeError};
+use relon_eval_api::context::{Capabilities, Context};
 use relon_parser::{parse_document, TokenRange};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -20,14 +21,24 @@ use std::sync::Arc;
 fn run(source: &str) -> Result<Value, RuntimeError> {
     let node = parse_document(source).expect("parse");
     let ctx = Context::new().with_root(node);
-    Evaluator::new(Arc::new(ctx)).eval_root(&Arc::new(Scope::default()))
+    TreeWalkEvaluator::new(Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    }))
+    .eval_root(&Arc::new(Scope::default()))
 }
 
 fn run_with_caps(source: &str, caps: Capabilities) -> Result<Value, RuntimeError> {
     let node = parse_document(source).expect("parse");
     let mut ctx = Context::new().with_root(node);
     ctx.capabilities = caps;
-    Evaluator::new(Arc::new(ctx)).eval_root(&Arc::new(Scope::default()))
+    TreeWalkEvaluator::new(Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    }))
+    .eval_root(&Arc::new(Scope::default()))
 }
 
 /// Exercise miette's `Diagnostic` rendering on the error path so any
@@ -36,106 +47,6 @@ fn run_with_caps(source: &str, caps: Capabilities) -> Result<Value, RuntimeError
 fn render_does_not_panic(err: &RuntimeError) {
     let report = miette::Report::new_boxed(Box::new(err.clone()));
     let _ = format!("{report:?}");
-}
-
-// `miette::Report::new` requires `Diagnostic + Send + Sync + 'static`;
-// `RuntimeError` is `Clone` so we can hand a fresh copy to the report.
-impl Clone for crate::error::RuntimeError {
-    fn clone(&self) -> Self {
-        // Re-roundtrip through Debug + a coarse `From<&str>` is overkill;
-        // RuntimeError is plain data, so a naive recursive clone suffices.
-        // We mark this `Clone` impl as an opt-in helper for tests only —
-        // production code uses references.
-        match self {
-            Self::VariableNotFound(s, r) => Self::VariableNotFound(s.clone(), *r),
-            Self::TypeMismatch {
-                expected,
-                found,
-                range,
-            } => Self::TypeMismatch {
-                expected: expected.clone(),
-                found: found.clone(),
-                range: *range,
-            },
-            Self::ValidationError(s, r) => Self::ValidationError(s.clone(), *r),
-            Self::DivisionByZero(r) => Self::DivisionByZero(*r),
-            Self::FunctionNotFound(s, r) => Self::FunctionNotFound(s.clone(), *r),
-            Self::CircularReference { cycle, range } => Self::CircularReference {
-                cycle: cycle.clone(),
-                range: *range,
-            },
-            Self::UnsupportedOperator(s, r) => Self::UnsupportedOperator(s.clone(), *r),
-            Self::InvalidIdentifier(s, r) => Self::InvalidIdentifier(s.clone(), *r),
-            Self::IoError(s) => Self::IoError(s.clone()),
-            Self::ModuleNotFound(s, r) => Self::ModuleNotFound(s.clone(), *r),
-            Self::ModuleParseError {
-                path,
-                message,
-                range,
-            } => Self::ModuleParseError {
-                path: path.clone(),
-                message: message.clone(),
-                range: *range,
-            },
-            Self::CircularImport(v, r) => Self::CircularImport(v.clone(), *r),
-            Self::NumericOverflow(r) => Self::NumericOverflow(*r),
-            Self::StepLimitExceeded { limit, range } => Self::StepLimitExceeded {
-                limit: *limit,
-                range: *range,
-            },
-            Self::RecursionLimitExceeded { limit, range } => Self::RecursionLimitExceeded {
-                limit: *limit,
-                range: *range,
-            },
-            Self::ValueTooLarge {
-                limit,
-                actual,
-                range,
-            } => Self::ValueTooLarge {
-                limit: *limit,
-                actual: *actual,
-                range: *range,
-            },
-            Self::CapabilityDenied {
-                name,
-                reason,
-                range,
-            } => Self::CapabilityDenied {
-                name: name.clone(),
-                reason: reason.clone(),
-                range: *range,
-            },
-            Self::NoMainSignature { range } => Self::NoMainSignature { range: *range },
-            Self::MissingMainArg { name, range } => Self::MissingMainArg {
-                name: name.clone(),
-                range: *range,
-            },
-            Self::UnexpectedMainArg { name, range } => Self::UnexpectedMainArg {
-                name: name.clone(),
-                range: *range,
-            },
-            Self::MainArgTypeMismatch {
-                name,
-                expected,
-                found,
-                range,
-            } => Self::MainArgTypeMismatch {
-                name: name.clone(),
-                expected: expected.clone(),
-                found: found.clone(),
-                range: *range,
-            },
-            Self::MainReturnTypeMismatch {
-                expected,
-                found,
-                range,
-            } => Self::MainReturnTypeMismatch {
-                expected: expected.clone(),
-                found: found.clone(),
-                range: *range,
-            },
-        }
-    }
 }
 
 fn assert_range_pinned(range: TokenRange, kind: &str) {
@@ -279,7 +190,12 @@ fn host_receives_capability_denied() {
         },
         Arc::new(ReadsFs),
     );
-    let result = Evaluator::new(Arc::new(ctx)).eval_root(&Arc::new(Scope::default()));
+    let result = TreeWalkEvaluator::new(Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    }))
+    .eval_root(&Arc::new(Scope::default()));
 
     let err = result.expect_err("should error");
     let RuntimeError::CapabilityDenied { name, range, .. } = &err else {
@@ -299,8 +215,12 @@ fn host_receives_no_main_signature() {
     let ctx = Context::new()
         .with_root(node)
         .with_analyzed(Arc::clone(&analyzed));
-    let result =
-        Evaluator::new(Arc::new(ctx)).run_main(&Arc::new(Scope::default()), HashMap::new());
+    let result = TreeWalkEvaluator::new(Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    }))
+    .run_main(&Arc::new(Scope::default()), HashMap::new());
 
     let err = result.expect_err("should error");
     let RuntimeError::NoMainSignature { range } = &err else {
@@ -324,7 +244,12 @@ fn host_receives_main_arg_type_mismatch() {
     let ctx = Context::new()
         .with_root(node)
         .with_analyzed(Arc::clone(&analyzed));
-    let result = Evaluator::new(Arc::new(ctx)).run_main(&Arc::new(Scope::default()), args);
+    let result = TreeWalkEvaluator::new(Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    }))
+    .run_main(&Arc::new(Scope::default()), args);
 
     let err = result.expect_err("should error");
     let RuntimeError::MainArgTypeMismatch { name, range, .. } = &err else {
@@ -348,7 +273,12 @@ fn host_receives_main_return_type_mismatch() {
     let ctx = Context::new()
         .with_root(node)
         .with_analyzed(Arc::clone(&analyzed));
-    let result = Evaluator::new(Arc::new(ctx)).run_main(&Arc::new(Scope::default()), args);
+    let result = TreeWalkEvaluator::new(Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    }))
+    .run_main(&Arc::new(Scope::default()), args);
 
     let err = result.expect_err("should error");
     let RuntimeError::MainReturnTypeMismatch {
@@ -381,7 +311,12 @@ fn host_receives_module_not_found() {
         current_dir: dir.to_string_lossy().to_string(),
         ..Default::default()
     });
-    let result = Evaluator::new(Arc::new(ctx)).eval_root(&scope);
+    let result = TreeWalkEvaluator::new(Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    }))
+    .eval_root(&scope);
     let _ = std::fs::remove_dir_all(&dir);
 
     let err = result.expect_err("should error");
@@ -400,9 +335,13 @@ fn host_can_render_diagnostic_with_source_for_user() {
     let source = r#"{ x: undefined }"#;
     let node = parse_document(source).expect("parse");
     let ctx = Context::new().with_root(node);
-    let err = Evaluator::new(Arc::new(ctx))
-        .eval_root(&Arc::new(Scope::default()))
-        .expect_err("should error");
+    let err = TreeWalkEvaluator::new(Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    }))
+    .eval_root(&Arc::new(Scope::default()))
+    .expect_err("should error");
 
     let report = miette::Report::new(err).with_source_code(source.to_string());
     let rendered = format!("{report:?}");
@@ -470,7 +409,12 @@ fn host_receives_capability_denied_for_each_new_bit() {
         let node = parse_document(r#"{ x: f() }"#).expect("parse");
         let mut ctx = Context::sandboxed().with_root(node);
         ctx.register_fn("f", gate, Arc::new(Stub));
-        let result = Evaluator::new(Arc::new(ctx)).eval_root(&Arc::new(Scope::default()));
+        let result = TreeWalkEvaluator::new(Arc::new({
+            let mut ctx = ctx;
+            crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+            ctx
+        }))
+        .eval_root(&Arc::new(Scope::default()));
         let err = result.expect_err(&format!("bit `{bit}` should error"));
         let RuntimeError::CapabilityDenied { name, reason, .. } = &err else {
             panic!("bit `{bit}`: expected CapabilityDenied, got {err:?}");
@@ -508,9 +452,13 @@ fn capability_denied_reports_first_missing_bit() {
         },
         Arc::new(Stub),
     );
-    let err = Evaluator::new(Arc::new(ctx))
-        .eval_root(&Arc::new(Scope::default()))
-        .expect_err("should error on the ungranted bit");
+    let err = TreeWalkEvaluator::new(Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    }))
+    .eval_root(&Arc::new(Scope::default()))
+    .expect_err("should error on the ungranted bit");
     let RuntimeError::CapabilityDenied { reason, .. } = &err else {
         panic!("expected CapabilityDenied, got {err:?}");
     };
@@ -538,9 +486,13 @@ fn pure_fn_passes_under_full_sandbox() {
     let node = parse_document(r#"{ x: deterministic() }"#).expect("parse");
     let mut ctx = Context::sandboxed().with_root(node);
     ctx.register_pure_fn("deterministic", Arc::new(Pure));
-    let result = Evaluator::new(Arc::new(ctx))
-        .eval_root(&Arc::new(Scope::default()))
-        .expect("pure fn should pass under full sandbox");
+    let result = TreeWalkEvaluator::new(Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    }))
+    .eval_root(&Arc::new(Scope::default()))
+    .expect("pure fn should pass under full sandbox");
     let Value::Dict(d) = result else {
         panic!("expected dict")
     };
@@ -572,7 +524,11 @@ fn core_relon_native_slots_match_stdlib_registration() {
     let node = parse_document("{}").expect("parse empty doc");
     let tree = relon_analyzer::analyze(&node);
 
-    let ctx = Context::new();
+    let mut ctx = Context::new();
+    // The native-fn registration happens lazily when a `TreeWalkEvaluator`
+    // wraps a bare context (see `prepare_in_place`); this test inspects
+    // the registration table directly, so prime it explicitly here.
+    crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
 
     let mut missing: Vec<(String, String)> = Vec::new();
     for (schema_name, methods) in tree.schema_methods.iter() {

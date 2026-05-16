@@ -6,43 +6,22 @@
 //! once, caching the result by its [`ModuleSource::canonical_id`].
 //!
 //! Hosts plug in custom resolvers (in-memory modules, registry/URL lookups,
-//! sandbox whitelists) via [`crate::eval::Context::prepend_module_resolver`].
+//! sandbox whitelists) via `Context::prepend_module_resolver`.
+//!
+//! The [`ModuleResolver`] trait and [`ModuleSource`] payload live in
+//! `relon-eval-api` so any evaluator backend can share them; the concrete
+//! resolvers below (`StdModuleResolver`, `FilesystemModuleResolver`)
+//! ship with the tree-walking evaluator because they bake in the in-tree
+//! `std_relon/*.relon` source and the sandbox-aware filesystem traversal
+//! check.
 
-use crate::error::RuntimeError;
-use crate::scope::Scope;
+pub use relon_eval_api::module::{ModuleResolver, ModuleSource};
+
+use relon_eval_api::error::RuntimeError;
+use relon_eval_api::scope::Scope;
 use relon_parser::TokenRange;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-
-/// The source text plus identity of a module produced by a [`ModuleResolver`].
-#[derive(Debug, Clone)]
-pub struct ModuleSource {
-    /// Stable identity for this module — used as the key for the module cache
-    /// and the cycle-detection stack. For filesystem modules this is the
-    /// canonical absolute path; for `std/...` modules it is the virtual path
-    /// itself; for host-provided modules it can be any unique string.
-    pub canonical_id: String,
-    /// The Relon source text to parse and evaluate.
-    pub source: String,
-    /// Working directory used when nested `@import("./relative.relon")` calls
-    /// fire from inside this module. Filesystem resolvers normally set this to
-    /// the parent of `canonical_id`; in-memory modules can leave it empty.
-    pub current_dir: String,
-}
-
-/// A pluggable resolver that answers `@import("path")` requests.
-///
-/// Resolvers are polled in order; the first non-`None` return value is used.
-/// Returning `Ok(None)` defers to the next resolver. Returning `Err(_)` aborts
-/// the import without consulting later resolvers.
-pub trait ModuleResolver: Send + Sync {
-    fn resolve(
-        &self,
-        path: &str,
-        scope: &Arc<Scope>,
-        range: TokenRange,
-    ) -> Result<Option<ModuleSource>, RuntimeError>;
-}
 
 /// Resolves the built-in `std/...` virtual modules whose source is embedded
 /// in the binary via `include_str!`.
@@ -97,7 +76,7 @@ pub struct FilesystemModuleResolver {
     /// Canonicalized root the resolver is allowed to read from. `None` means
     /// "reject everything"; `Some(_)` enables reads constrained to that
     /// subtree. The dedicated [`Self::trusted`] constructor encodes the
-    /// "no root, but allow anything" mode used by the trusted [`Context`].
+    /// "no root, but allow anything" mode used by the trusted `Context`.
     root: Option<PathBuf>,
     /// Bypass the root check entirely. Set only by [`Self::trusted`]; not
     /// reachable from sandboxed code.
@@ -119,8 +98,8 @@ impl FilesystemModuleResolver {
     /// Wide-open resolver — every path is allowed. Used by hosts that
     /// have full FS trust over the running script (CLI, host's own
     /// config files); never use for untrusted scripts. The host must
-    /// also flip [`crate::Capabilities::reads_fs`] for the gate
-    /// machinery to agree.
+    /// also flip `Capabilities::reads_fs` for the gate machinery to
+    /// agree.
     pub fn trusted() -> Self {
         Self {
             root: None,

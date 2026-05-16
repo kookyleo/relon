@@ -28,8 +28,13 @@ fn parse_expr_test(source: &str) -> relon_parser::Node {
 fn eval_doc(source: &str) -> Result<Value, RuntimeError> {
     let node = parse_doc(source);
     let ctx = Context::new().with_root(node);
-    let ctx = std::sync::Arc::new(ctx);
-    Evaluator::new(std::sync::Arc::clone(&ctx)).eval_root(&std::sync::Arc::new(Scope::default()))
+    let ctx = std::sync::Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    });
+    TreeWalkEvaluator::new(std::sync::Arc::clone(&ctx))
+        .eval_root(&std::sync::Arc::new(Scope::default()))
 }
 
 /// Test scaffolding: build a Context with full grants + trusted FS
@@ -73,8 +78,12 @@ fn test_user_defined_meta_logic() {
     }"#,
     );
     let ctx = Context::new().with_root(node.clone());
-    let ctx = std::sync::Arc::new(ctx);
-    let eval = Evaluator::new(std::sync::Arc::clone(&ctx));
+    let ctx = std::sync::Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    });
+    let eval = TreeWalkEvaluator::new(std::sync::Arc::clone(&ctx));
     let scope = std::sync::Arc::new(Scope::default());
 
     let result = eval.eval(&node, &scope).expect("Evaluation failed");
@@ -99,8 +108,12 @@ fn test_invalid_fn_name() {
     );
 
     let ctx = Context::new().with_root(node.clone());
-    let ctx = std::sync::Arc::new(ctx);
-    let eval = Evaluator::new(std::sync::Arc::clone(&ctx));
+    let ctx = std::sync::Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    });
+    let eval = TreeWalkEvaluator::new(std::sync::Arc::clone(&ctx));
     let scope = std::sync::Arc::new(Scope::default());
 
     let result = eval.eval(&node, &scope);
@@ -116,8 +129,12 @@ fn test_invalid_fn_name() {
 fn test_pipe_operator() {
     let node = parse_expr_test(r#"[1, 2, 3] | len()"#);
     let ctx = Context::new();
-    let ctx = std::sync::Arc::new(ctx);
-    let result = Evaluator::new(std::sync::Arc::clone(&ctx))
+    let ctx = std::sync::Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    });
+    let result = TreeWalkEvaluator::new(std::sync::Arc::clone(&ctx))
         .eval(&node, &std::sync::Arc::new(Scope::default()))
         .unwrap();
     assert_eq!(result, Value::Int(3));
@@ -367,8 +384,12 @@ fn test_validation_custom_messages() {
     );
 
     let ctx = Context::new().with_root(node.clone());
-    let ctx = std::sync::Arc::new(ctx);
-    let result = Evaluator::new(std::sync::Arc::clone(&ctx))
+    let ctx = std::sync::Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    });
+    let result = TreeWalkEvaluator::new(std::sync::Arc::clone(&ctx))
         .eval(&node, &std::sync::Arc::new(Scope::default()));
 
     assert!(matches!(
@@ -394,8 +415,12 @@ fn test_cross_field_validation() {
     );
 
     let ctx = Context::new().with_root(node.clone());
-    let ctx = std::sync::Arc::new(ctx);
-    let result = Evaluator::new(std::sync::Arc::clone(&ctx))
+    let ctx = std::sync::Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    });
+    let result = TreeWalkEvaluator::new(std::sync::Arc::clone(&ctx))
         .eval(&node, &std::sync::Arc::new(Scope::default()))
         .unwrap();
 
@@ -419,8 +444,12 @@ fn test_cross_field_validation_custom_message() {
     );
 
     let ctx = Context::new().with_root(node.clone());
-    let ctx = std::sync::Arc::new(ctx);
-    let result = Evaluator::new(std::sync::Arc::clone(&ctx))
+    let ctx = std::sync::Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    });
+    let result = TreeWalkEvaluator::new(std::sync::Arc::clone(&ctx))
         .eval(&node, &std::sync::Arc::new(Scope::default()));
 
     assert!(matches!(
@@ -439,8 +468,12 @@ fn test_spread_operator() {
     }"#,
     );
     let ctx = Context::new().with_root(node.clone());
-    let ctx = std::sync::Arc::new(ctx);
-    let result = Evaluator::new(std::sync::Arc::clone(&ctx))
+    let ctx = std::sync::Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    });
+    let result = TreeWalkEvaluator::new(std::sync::Arc::clone(&ctx))
         .eval(&node, &std::sync::Arc::new(Scope::default()))
         .unwrap();
     if let Value::Dict(map) = result {
@@ -471,8 +504,12 @@ fn test_reference_resolution_sees_spread_keys() {
     );
 
     let ctx = Context::new().with_root(node.clone());
-    let ctx = std::sync::Arc::new(ctx);
-    let result = Evaluator::new(std::sync::Arc::clone(&ctx))
+    let ctx = std::sync::Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    });
+    let result = TreeWalkEvaluator::new(std::sync::Arc::clone(&ctx))
         .eval(&node, &std::sync::Arc::new(Scope::default()))
         .unwrap();
 
@@ -539,8 +576,12 @@ fn test_reference_resolution_caches_resolved_paths() {
     );
 
     let ctx = Context::new().with_root(node.clone());
-    let ctx = std::sync::Arc::new(ctx);
-    let result = Evaluator::new(std::sync::Arc::clone(&ctx))
+    let ctx = std::sync::Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    });
+    let result = TreeWalkEvaluator::new(std::sync::Arc::clone(&ctx))
         .eval(&node, &std::sync::Arc::new(Scope::default()))
         .unwrap();
 
@@ -569,8 +610,12 @@ fn test_circular_reference_with_thunks() {
     );
 
     let ctx = Context::new().with_root(node.clone());
-    let ctx = std::sync::Arc::new(ctx);
-    let result = Evaluator::new(std::sync::Arc::clone(&ctx))
+    let ctx = std::sync::Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    });
+    let result = TreeWalkEvaluator::new(std::sync::Arc::clone(&ctx))
         .eval(&node, &std::sync::Arc::new(Scope::default()));
 
     assert!(matches!(
@@ -583,8 +628,12 @@ fn test_circular_reference_with_thunks() {
 fn test_list_comprehension() {
     let node = parse_expr_test(r#"[x * 2 for x in range(5) if x % 2 == 0]"#);
     let ctx = Context::new();
-    let ctx = std::sync::Arc::new(ctx);
-    let result = Evaluator::new(std::sync::Arc::clone(&ctx))
+    let ctx = std::sync::Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    });
+    let result = TreeWalkEvaluator::new(std::sync::Arc::clone(&ctx))
         .eval(&node, &std::sync::Arc::new(Scope::default()))
         .unwrap();
     assert_eq!(
@@ -606,8 +655,12 @@ fn test_reference_resolution() {
     );
 
     let ctx = Context::new().with_root(node.clone());
-    let ctx = std::sync::Arc::new(ctx);
-    let eval = Evaluator::new(std::sync::Arc::clone(&ctx));
+    let ctx = std::sync::Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    });
+    let eval = TreeWalkEvaluator::new(std::sync::Arc::clone(&ctx));
     let scope = std::sync::Arc::new(Scope::default());
 
     let result = eval.eval(&node, &scope).expect("Evaluation failed");
@@ -630,8 +683,12 @@ fn test_reference_resolution() {
 fn test_circular_import() {
     let node = parse_doc(r#"#import a from "tests_assets/a.relon" {}"#);
     let ctx = fully_granted_ctx().with_root(node.clone());
-    let ctx = std::sync::Arc::new(ctx);
-    let eval = Evaluator::new(std::sync::Arc::clone(&ctx));
+    let ctx = std::sync::Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    });
+    let eval = TreeWalkEvaluator::new(std::sync::Arc::clone(&ctx));
     let scope = std::sync::Arc::new(Scope {
         current_dir: env!("CARGO_MANIFEST_DIR").to_string(),
         ..Default::default()
@@ -659,8 +716,12 @@ fn test_import_cache_uses_canonical_paths() {
         {}"#,
     );
     let ctx = fully_granted_ctx().with_root(node.clone());
-    let ctx = std::sync::Arc::new(ctx);
-    let eval = Evaluator::new(std::sync::Arc::clone(&ctx));
+    let ctx = std::sync::Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    });
+    let eval = TreeWalkEvaluator::new(std::sync::Arc::clone(&ctx));
     let scope = std::sync::Arc::new(Scope {
         current_dir: dir.to_string_lossy().to_string(),
         ..Default::default()
@@ -695,8 +756,12 @@ fn test_imported_module_references_use_module_root() {
         }"#,
     );
     let ctx = fully_granted_ctx().with_root(node.clone());
-    let ctx = std::sync::Arc::new(ctx);
-    let eval = Evaluator::new(std::sync::Arc::clone(&ctx));
+    let ctx = std::sync::Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    });
+    let eval = TreeWalkEvaluator::new(std::sync::Arc::clone(&ctx));
     let scope = std::sync::Arc::new(Scope {
         current_dir: dir.to_string_lossy().to_string(),
         ..Default::default()
@@ -720,8 +785,12 @@ fn test_loading_modules_restored_after_module_parse_error() {
 
     let node = parse_doc(r#"#import bad from "bad.relon" {}"#);
     let ctx = fully_granted_ctx().with_root(node.clone());
-    let ctx = std::sync::Arc::new(ctx);
-    let eval = Evaluator::new(std::sync::Arc::clone(&ctx));
+    let ctx = std::sync::Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    });
+    let eval = TreeWalkEvaluator::new(std::sync::Arc::clone(&ctx));
     let scope = std::sync::Arc::new(Scope {
         current_dir: dir.to_string_lossy().to_string(),
         ..Default::default()
@@ -1407,7 +1476,11 @@ fn test_brand_decorator_at_document_root() {
     }"#,
     );
     let ctx = Context::new().with_root(node);
-    let ctx = std::sync::Arc::new(ctx);
+    let ctx = std::sync::Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    });
     // Synthesize a `Weather` schema and seed it into the surrounding
     // scope so the root-level `#brand` can resolve it.
     let weather_schema = Value::Schema(Box::new(crate::value::SchemaData {
@@ -1454,7 +1527,7 @@ fn test_brand_decorator_at_document_root() {
         .locals_for_write()
         .insert(std::sync::Arc::from("Weather"), weather_schema);
 
-    let result = Evaluator::new(std::sync::Arc::clone(&ctx))
+    let result = TreeWalkEvaluator::new(std::sync::Arc::clone(&ctx))
         .eval_root(&outer_scope)
         .unwrap();
     let Value::Dict(d) = result else {
@@ -1483,8 +1556,12 @@ fn test_brand_directive_stacks_with_inline_schema() {
     }"#;
     let node = parse_doc(src);
     let ctx = fully_granted_ctx().with_root(node);
-    let ctx = std::sync::Arc::new(ctx);
-    let result = Evaluator::new(std::sync::Arc::clone(&ctx))
+    let ctx = std::sync::Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    });
+    let result = TreeWalkEvaluator::new(std::sync::Arc::clone(&ctx))
         .eval_root(&std::sync::Arc::new(Scope::default()))
         .unwrap();
     let Value::Dict(d) = result else {
@@ -1981,8 +2058,12 @@ fn test_analyzer_target_agrees_with_evaluator_resolution() {
     let ctx = Context::new()
         .with_root(node.clone())
         .with_analyzed(analyzed.clone());
-    let ctx = std::sync::Arc::new(ctx);
-    let eval = Evaluator::new(std::sync::Arc::clone(&ctx));
+    let ctx = std::sync::Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    });
+    let eval = TreeWalkEvaluator::new(std::sync::Arc::clone(&ctx));
     let result = eval
         .eval_root(&std::sync::Arc::new(Scope::default()))
         .unwrap();
@@ -2185,9 +2266,13 @@ fn run_main_validates_args_and_fills_defaults() {
     let ctx = Context::new()
         .with_root(node.clone())
         .with_analyzed(std::sync::Arc::clone(&analyzed));
-    let result = Evaluator::new(std::sync::Arc::new(ctx))
-        .run_main(&std::sync::Arc::new(Scope::default()), args)
-        .unwrap();
+    let result = TreeWalkEvaluator::new(std::sync::Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    }))
+    .run_main(&std::sync::Arc::new(Scope::default()), args)
+    .unwrap();
     let Value::Dict(d) = result else { panic!() };
     assert_eq!(
         d.map.get("greeting").unwrap(),
@@ -2220,9 +2305,13 @@ fn run_main_with_multiple_params() {
     let ctx = Context::new()
         .with_root(node.clone())
         .with_analyzed(std::sync::Arc::clone(&analyzed));
-    let result = Evaluator::new(std::sync::Arc::new(ctx))
-        .run_main(&std::sync::Arc::new(Scope::default()), args)
-        .unwrap();
+    let result = TreeWalkEvaluator::new(std::sync::Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    }))
+    .run_main(&std::sync::Arc::new(Scope::default()), args)
+    .unwrap();
     let Value::Dict(d) = result else { panic!() };
     assert_eq!(
         d.map.get("summary").unwrap(),
@@ -2243,8 +2332,12 @@ fn run_main_missing_arg_errors() {
     let ctx = Context::new()
         .with_root(node.clone())
         .with_analyzed(std::sync::Arc::clone(&analyzed));
-    let result = Evaluator::new(std::sync::Arc::new(ctx))
-        .run_main(&std::sync::Arc::new(Scope::default()), HashMap::new());
+    let result = TreeWalkEvaluator::new(std::sync::Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    }))
+    .run_main(&std::sync::Arc::new(Scope::default()), HashMap::new());
     assert!(
         matches!(&result, Err(RuntimeError::MissingMainArg { name, .. }) if name == "req"),
         "expected MissingMainArg(req), got {result:?}"
@@ -2269,8 +2362,12 @@ fn run_main_unexpected_arg_errors() {
     let ctx = Context::new()
         .with_root(node.clone())
         .with_analyzed(std::sync::Arc::clone(&analyzed));
-    let result = Evaluator::new(std::sync::Arc::new(ctx))
-        .run_main(&std::sync::Arc::new(Scope::default()), args);
+    let result = TreeWalkEvaluator::new(std::sync::Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    }))
+    .run_main(&std::sync::Arc::new(Scope::default()), args);
     assert!(
         matches!(&result, Err(RuntimeError::UnexpectedMainArg { name, .. }) if name == "bogus"),
         "expected UnexpectedMainArg(bogus), got {result:?}"
@@ -2292,8 +2389,12 @@ fn run_main_arg_type_mismatch_errors() {
     let ctx = Context::new()
         .with_root(node.clone())
         .with_analyzed(std::sync::Arc::clone(&analyzed));
-    let result = Evaluator::new(std::sync::Arc::new(ctx))
-        .run_main(&std::sync::Arc::new(Scope::default()), args);
+    let result = TreeWalkEvaluator::new(std::sync::Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    }))
+    .run_main(&std::sync::Arc::new(Scope::default()), args);
     assert!(
         matches!(&result, Err(RuntimeError::MainArgTypeMismatch { name, .. }) if name == "n"),
         "expected MainArgTypeMismatch(n), got {result:?}"
@@ -2312,8 +2413,12 @@ fn run_main_without_signature_errors() {
     let ctx = Context::new()
         .with_root(node.clone())
         .with_analyzed(std::sync::Arc::clone(&analyzed));
-    let result = Evaluator::new(std::sync::Arc::new(ctx))
-        .run_main(&std::sync::Arc::new(Scope::default()), HashMap::new());
+    let result = TreeWalkEvaluator::new(std::sync::Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    }))
+    .run_main(&std::sync::Arc::new(Scope::default()), HashMap::new());
     assert!(
         matches!(&result, Err(RuntimeError::NoMainSignature { .. })),
         "expected NoMainSignature, got {result:?}"
@@ -2409,12 +2514,16 @@ fn private_field_is_not_visible_through_alias_import() {
             { leak: lib.secret }"#,
     );
     let ctx = fully_granted_ctx().with_root(node.clone());
-    let ctx = std::sync::Arc::new(ctx);
+    let ctx = std::sync::Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    });
     let scope = std::sync::Arc::new(Scope {
         current_dir: dir.to_string_lossy().to_string(),
         ..Default::default()
     });
-    let result = Evaluator::new(std::sync::Arc::clone(&ctx)).eval_root(&scope);
+    let result = TreeWalkEvaluator::new(std::sync::Arc::clone(&ctx)).eval_root(&scope);
     let _ = std::fs::remove_dir_all(&dir);
 
     assert!(
@@ -2445,12 +2554,16 @@ fn private_field_is_skipped_by_import_spread() {
             { has_exported: exported, has_internal: internal }"#,
     );
     let ctx = fully_granted_ctx().with_root(node.clone());
-    let ctx = std::sync::Arc::new(ctx);
+    let ctx = std::sync::Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    });
     let scope = std::sync::Arc::new(Scope {
         current_dir: dir.to_string_lossy().to_string(),
         ..Default::default()
     });
-    let result = Evaluator::new(std::sync::Arc::clone(&ctx)).eval_root(&scope);
+    let result = TreeWalkEvaluator::new(std::sync::Arc::clone(&ctx)).eval_root(&scope);
     let _ = std::fs::remove_dir_all(&dir);
 
     assert!(
@@ -2531,9 +2644,13 @@ fn root_schema_directive_validates_main_arg() {
     let ctx = Context::new()
         .with_root(node.clone())
         .with_analyzed(std::sync::Arc::clone(&analyzed));
-    let result = Evaluator::new(std::sync::Arc::new(ctx))
-        .run_main(&std::sync::Arc::new(Scope::default()), args)
-        .unwrap();
+    let result = TreeWalkEvaluator::new(std::sync::Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    }))
+    .run_main(&std::sync::Arc::new(Scope::default()), args)
+    .unwrap();
     let Value::Dict(d) = result else { panic!() };
     assert_eq!(
         d.map.get("greeting").unwrap(),
@@ -2565,9 +2682,13 @@ fn root_schema_directive_supports_multiple_declarations() {
     let ctx = Context::new()
         .with_root(node.clone())
         .with_analyzed(std::sync::Arc::clone(&analyzed));
-    let result = Evaluator::new(std::sync::Arc::new(ctx))
-        .run_main(&std::sync::Arc::new(Scope::default()), args)
-        .unwrap();
+    let result = TreeWalkEvaluator::new(std::sync::Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    }))
+    .run_main(&std::sync::Arc::new(Scope::default()), args)
+    .unwrap();
     let Value::Dict(d) = result else { panic!() };
     assert_eq!(
         d.map.get("summary").unwrap(),
@@ -2589,9 +2710,13 @@ fn root_schema_directive_visible_inside_dict_body() {
     let ctx = Context::new()
         .with_root(node.clone())
         .with_analyzed(std::sync::Arc::clone(&analyzed));
-    let result = Evaluator::new(std::sync::Arc::new(ctx))
-        .eval_root(&std::sync::Arc::new(Scope::default()))
-        .unwrap();
+    let result = TreeWalkEvaluator::new(std::sync::Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    }))
+    .eval_root(&std::sync::Arc::new(Scope::default()))
+    .unwrap();
     let Value::Dict(d) = result else { panic!() };
     let Value::Dict(alice) = d.map.get("alice").unwrap() else {
         panic!("expected dict");
@@ -2844,7 +2969,12 @@ fn imported_module_runs_analyzer_and_surfaces_errors() {
         current_dir: dir.to_string_lossy().to_string(),
         ..Default::default()
     });
-    let result = Evaluator::new(std::sync::Arc::new(ctx)).eval_root(&scope);
+    let result = TreeWalkEvaluator::new(std::sync::Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    }))
+    .eval_root(&scope);
     let _ = std::fs::remove_dir_all(&dir);
 
     assert!(
@@ -2865,8 +2995,12 @@ fn step_counter_resets_between_top_level_runs() {
     // Tight budget that fits one such evaluation but would overflow on
     // accumulated steps from two back-to-back runs.
     ctx.capabilities.max_steps = Some(50);
-    let ctx = std::sync::Arc::new(ctx);
-    let eval = Evaluator::new(std::sync::Arc::clone(&ctx));
+    let ctx = std::sync::Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    });
+    let eval = TreeWalkEvaluator::new(std::sync::Arc::clone(&ctx));
     let scope = std::sync::Arc::new(Scope::default());
 
     let r1 = eval.eval_root(&scope);
@@ -2901,8 +3035,12 @@ fn run_main_return_type_mismatch_errors() {
     let ctx = Context::new()
         .with_root(node.clone())
         .with_analyzed(std::sync::Arc::clone(&analyzed));
-    let result = Evaluator::new(std::sync::Arc::new(ctx))
-        .run_main(&std::sync::Arc::new(Scope::default()), args);
+    let result = TreeWalkEvaluator::new(std::sync::Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    }))
+    .run_main(&std::sync::Arc::new(Scope::default()), args);
     assert!(
         matches!(&result, Err(RuntimeError::MainReturnTypeMismatch { expected, .. }) if expected == "String"),
         "expected MainReturnTypeMismatch(String), got {result:?}"
@@ -2924,9 +3062,13 @@ fn run_main_return_type_match_passes() {
     let ctx = Context::new()
         .with_root(node.clone())
         .with_analyzed(std::sync::Arc::clone(&analyzed));
-    let result = Evaluator::new(std::sync::Arc::new(ctx))
-        .run_main(&std::sync::Arc::new(Scope::default()), args)
-        .unwrap();
+    let result = TreeWalkEvaluator::new(std::sync::Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    }))
+    .run_main(&std::sync::Arc::new(Scope::default()), args)
+    .unwrap();
     let Value::Dict(d) = result else { panic!() };
     assert_eq!(d.map.get("result"), Some(&Value::Int(8)));
 }
@@ -2965,9 +3107,13 @@ o.id"#;
     let ctx = Context::new()
         .with_root(node.clone())
         .with_analyzed(std::sync::Arc::clone(&analyzed));
-    let result = Evaluator::new(std::sync::Arc::new(ctx))
-        .run_main(&std::sync::Arc::new(Scope::default()), args)
-        .unwrap();
+    let result = TreeWalkEvaluator::new(std::sync::Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    }))
+    .run_main(&std::sync::Arc::new(Scope::default()), args)
+    .unwrap();
     assert_eq!(result, Value::Int(42));
 }
 
@@ -3022,9 +3168,13 @@ o.customer.name"#;
     let ctx = Context::new()
         .with_root(node.clone())
         .with_analyzed(std::sync::Arc::clone(&analyzed));
-    let result = Evaluator::new(std::sync::Arc::new(ctx))
-        .run_main(&std::sync::Arc::new(Scope::default()), args)
-        .unwrap();
+    let result = TreeWalkEvaluator::new(std::sync::Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    }))
+    .run_main(&std::sync::Arc::new(Scope::default()), args)
+    .unwrap();
     assert_eq!(result, Value::String("Alice".to_string()));
 }
 
@@ -3067,9 +3217,13 @@ fn v1_4_run_main_strict_path_spread_schema() {
     let ctx = Context::new()
         .with_root(node.clone())
         .with_analyzed(std::sync::Arc::clone(&analyzed));
-    let result = Evaluator::new(std::sync::Arc::new(ctx))
-        .run_main(&std::sync::Arc::new(Scope::default()), args)
-        .unwrap();
+    let result = TreeWalkEvaluator::new(std::sync::Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    }))
+    .run_main(&std::sync::Arc::new(Scope::default()), args)
+    .unwrap();
     let Value::Dict(d) = result else {
         panic!("expected dict")
     };
@@ -3106,9 +3260,13 @@ fn v1_5_run_main_comprehension_list_int() {
     let ctx = Context::new()
         .with_root(node.clone())
         .with_analyzed(std::sync::Arc::clone(&analyzed));
-    let result = Evaluator::new(std::sync::Arc::new(ctx))
-        .run_main(&std::sync::Arc::new(Scope::default()), args)
-        .unwrap();
+    let result = TreeWalkEvaluator::new(std::sync::Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    }))
+    .run_main(&std::sync::Arc::new(Scope::default()), args)
+    .unwrap();
     let Value::List(items) = result else {
         panic!("expected list")
     };
@@ -3138,9 +3296,13 @@ fn v1_5_run_main_where_int() {
     let ctx = Context::new()
         .with_root(node.clone())
         .with_analyzed(std::sync::Arc::clone(&analyzed));
-    let result = Evaluator::new(std::sync::Arc::new(ctx))
-        .run_main(&std::sync::Arc::new(Scope::default()), args)
-        .unwrap();
+    let result = TreeWalkEvaluator::new(std::sync::Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    }))
+    .run_main(&std::sync::Arc::new(Scope::default()), args)
+    .unwrap();
     assert_eq!(result, Value::Int(42));
 }
 
@@ -3250,9 +3412,13 @@ fn builtin_result_schema_is_seeded_at_startup() {
     let ctx = Context::new()
         .with_root(node.clone())
         .with_analyzed(std::sync::Arc::clone(&analyzed));
-    let result = Evaluator::new(std::sync::Arc::new(ctx))
-        .run_main(&std::sync::Arc::new(Scope::default()), args)
-        .unwrap();
+    let result = TreeWalkEvaluator::new(std::sync::Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    }))
+    .run_main(&std::sync::Arc::new(Scope::default()), args)
+    .unwrap();
     let Value::Dict(d) = result else { panic!() };
     let Value::Dict(ok) = d.map.get("ok").unwrap() else {
         panic!()
@@ -3391,7 +3557,11 @@ fn run_main_path_cache_isolated_across_invocations() {
     let ctx = Context::new()
         .with_root(node.clone())
         .with_analyzed(std::sync::Arc::clone(&analyzed));
-    let evaluator = Evaluator::new(std::sync::Arc::new(ctx));
+    let evaluator = TreeWalkEvaluator::new(std::sync::Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    }));
 
     let mut args1: HashMap<String, Value> = HashMap::new();
     args1.insert("n".to_string(), Value::Int(1));
@@ -3492,9 +3662,13 @@ fn dynamic_path_segment_is_evaluated_only_once() {
     );
     let mut ctx = Context::new().with_root(node);
     ctx.register_pure_fn("counting_key", Arc::new(CountingKey));
-    let result = Evaluator::new(Arc::new(ctx))
-        .eval_root(&Arc::new(Scope::default()))
-        .unwrap();
+    let result = TreeWalkEvaluator::new(Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    }))
+    .eval_root(&Arc::new(Scope::default()))
+    .unwrap();
     let Value::Dict(d) = result else { panic!() };
     assert_eq!(d.map.get("v"), Some(&Value::Int(1)));
     assert_eq!(
@@ -3590,8 +3764,12 @@ fn workspace_module_lookup_skips_reparse_during_evaluate_module_source() {
         .with_root(entry_node)
         .with_workspace(Arc::new(ws));
     ctx.prepend_module_resolver(Arc::new(StubResolver));
-    let ctx = Arc::new(ctx);
-    let result = Evaluator::new(Arc::clone(&ctx))
+    let ctx = Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    });
+    let result = TreeWalkEvaluator::new(Arc::clone(&ctx))
         .eval_root(&Arc::new(Scope::default()))
         .expect("workspace fast path should bypass the broken source string");
     let Value::Dict(d) = result else {
@@ -3674,9 +3852,13 @@ n + 1"#;
     let ctx = Context::new()
         .with_root(node.clone())
         .with_analyzed(std::sync::Arc::clone(&analyzed));
-    let result = Evaluator::new(std::sync::Arc::new(ctx))
-        .run_main(&std::sync::Arc::new(Scope::default()), args)
-        .unwrap();
+    let result = TreeWalkEvaluator::new(std::sync::Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    }))
+    .run_main(&std::sync::Arc::new(Scope::default()), args)
+    .unwrap();
     assert_eq!(result, Value::Int(6));
 }
 
@@ -3695,9 +3877,13 @@ s"#;
     let ctx = Context::new()
         .with_root(node.clone())
         .with_analyzed(std::sync::Arc::clone(&analyzed));
-    let result = Evaluator::new(std::sync::Arc::new(ctx))
-        .run_main(&std::sync::Arc::new(Scope::default()), args)
-        .unwrap();
+    let result = TreeWalkEvaluator::new(std::sync::Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    }))
+    .run_main(&std::sync::Arc::new(Scope::default()), args)
+    .unwrap();
     assert_eq!(result, Value::String("hi".to_string()));
 }
 
@@ -3726,9 +3912,13 @@ Result.Ok { value: o }"#;
     let ctx = Context::new()
         .with_root(node.clone())
         .with_analyzed(std::sync::Arc::clone(&analyzed));
-    let result = Evaluator::new(std::sync::Arc::new(ctx))
-        .run_main(&std::sync::Arc::new(Scope::default()), args)
-        .unwrap();
+    let result = TreeWalkEvaluator::new(std::sync::Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    }))
+    .run_main(&std::sync::Arc::new(Scope::default()), args)
+    .unwrap();
     // The result is a tagged-enum variant whose dict carries
     // `variant_of=Result` / `brand=Ok` and a `value` field with the
     // pushed Order.
@@ -4102,9 +4292,13 @@ fn register_method_dispatches_to_host_fn() {
     let mut args: HashMap<String, Value> = HashMap::new();
     args.insert("m".to_string(), Value::dict(money));
 
-    let result = Evaluator::new(std::sync::Arc::new(ctx))
-        .run_main(&std::sync::Arc::new(Scope::default()), args)
-        .unwrap();
+    let result = TreeWalkEvaluator::new(std::sync::Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    }))
+    .run_main(&std::sync::Arc::new(Scope::default()), args)
+    .unwrap();
     let Value::Dict(d) = result else { panic!() };
     assert_eq!(d.map.get("s"), Some(&Value::String("$1.99".to_string())));
 }
@@ -4136,9 +4330,13 @@ fn operator_eq_lowers_to_user_method() {
     let ctx = Context::new()
         .with_root(node.clone())
         .with_analyzed(std::sync::Arc::clone(&analyzed));
-    let result = Evaluator::new(std::sync::Arc::new(ctx))
-        .run_main(&std::sync::Arc::new(Scope::default()), args)
-        .unwrap();
+    let result = TreeWalkEvaluator::new(std::sync::Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    }))
+    .run_main(&std::sync::Arc::new(Scope::default()), args)
+    .unwrap();
     let Value::Dict(d) = result else { panic!() };
     assert_eq!(d.map.get("same"), Some(&Value::Bool(true)));
 }
@@ -4165,9 +4363,13 @@ fn operator_lt_lowers_to_user_method() {
     let ctx = Context::new()
         .with_root(node.clone())
         .with_analyzed(std::sync::Arc::clone(&analyzed));
-    let result = Evaluator::new(std::sync::Arc::new(ctx))
-        .run_main(&std::sync::Arc::new(Scope::default()), args)
-        .unwrap();
+    let result = TreeWalkEvaluator::new(std::sync::Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    }))
+    .run_main(&std::sync::Arc::new(Scope::default()), args)
+    .unwrap();
     let Value::Dict(d) = result else { panic!() };
     assert_eq!(d.map.get("less"), Some(&Value::Bool(true)));
 }
@@ -4195,9 +4397,13 @@ fn operator_gt_lowers_to_lt_swapped() {
     let ctx = Context::new()
         .with_root(node.clone())
         .with_analyzed(std::sync::Arc::clone(&analyzed));
-    let result = Evaluator::new(std::sync::Arc::new(ctx))
-        .run_main(&std::sync::Arc::new(Scope::default()), args)
-        .unwrap();
+    let result = TreeWalkEvaluator::new(std::sync::Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    }))
+    .run_main(&std::sync::Arc::new(Scope::default()), args)
+    .unwrap();
     let Value::Dict(d) = result else { panic!() };
     assert_eq!(d.map.get("greater"), Some(&Value::Bool(true)));
 }
@@ -4224,9 +4430,13 @@ fn operator_ne_inverts_user_eq() {
     let ctx = Context::new()
         .with_root(node.clone())
         .with_analyzed(std::sync::Arc::clone(&analyzed));
-    let result = Evaluator::new(std::sync::Arc::new(ctx))
-        .run_main(&std::sync::Arc::new(Scope::default()), args)
-        .unwrap();
+    let result = TreeWalkEvaluator::new(std::sync::Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    }))
+    .run_main(&std::sync::Arc::new(Scope::default()), args)
+    .unwrap();
     let Value::Dict(d) = result else { panic!() };
     assert_eq!(d.map.get("diff"), Some(&Value::Bool(true)));
 }
@@ -4262,9 +4472,13 @@ fn auto_derived_eq_falls_back_to_structural_equality() {
     let ctx = Context::new()
         .with_root(node.clone())
         .with_analyzed(std::sync::Arc::clone(&analyzed));
-    let result = Evaluator::new(std::sync::Arc::new(ctx))
-        .run_main(&std::sync::Arc::new(Scope::default()), args)
-        .unwrap();
+    let result = TreeWalkEvaluator::new(std::sync::Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    }))
+    .run_main(&std::sync::Arc::new(Scope::default()), args)
+    .unwrap();
     let Value::Dict(d) = result else { panic!() };
     assert_eq!(d.map.get("same"), Some(&Value::Bool(true)));
 }
@@ -4297,9 +4511,13 @@ fn no_auto_derive_equatable_still_falls_back_structurally() {
     let ctx = Context::new()
         .with_root(node.clone())
         .with_analyzed(std::sync::Arc::clone(&analyzed));
-    let result = Evaluator::new(std::sync::Arc::new(ctx))
-        .run_main(&std::sync::Arc::new(Scope::default()), args)
-        .unwrap();
+    let result = TreeWalkEvaluator::new(std::sync::Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    }))
+    .run_main(&std::sync::Arc::new(Scope::default()), args)
+    .unwrap();
     let Value::Dict(d) = result else { panic!() };
     assert_eq!(d.map.get("same"), Some(&Value::Bool(true)));
 }
@@ -4335,9 +4553,13 @@ fn operator_le_synthesized_from_lt_and_eq() {
     let ctx = Context::new()
         .with_root(node.clone())
         .with_analyzed(std::sync::Arc::clone(&analyzed));
-    let result = Evaluator::new(std::sync::Arc::new(ctx))
-        .run_main(&std::sync::Arc::new(Scope::default()), args)
-        .unwrap();
+    let result = TreeWalkEvaluator::new(std::sync::Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    }))
+    .run_main(&std::sync::Arc::new(Scope::default()), args)
+    .unwrap();
     let Value::Dict(d) = result else { panic!() };
     assert_eq!(d.map.get("le_lt"), Some(&Value::Bool(true)));
     assert_eq!(d.map.get("le_eq"), Some(&Value::Bool(true)));
@@ -4371,9 +4593,13 @@ fn operator_ge_synthesized_from_lt_and_eq() {
     let ctx = Context::new()
         .with_root(node.clone())
         .with_analyzed(std::sync::Arc::clone(&analyzed));
-    let result = Evaluator::new(std::sync::Arc::new(ctx))
-        .run_main(&std::sync::Arc::new(Scope::default()), args)
-        .unwrap();
+    let result = TreeWalkEvaluator::new(std::sync::Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    }))
+    .run_main(&std::sync::Arc::new(Scope::default()), args)
+    .unwrap();
     let Value::Dict(d) = result else { panic!() };
     assert_eq!(d.map.get("ge_gt"), Some(&Value::Bool(true)));
     assert_eq!(d.map.get("ge_eq"), Some(&Value::Bool(true)));
@@ -4410,9 +4636,13 @@ fn schema_method_dispatches_with_self_binding() {
     let ctx = Context::new()
         .with_root(node.clone())
         .with_analyzed(std::sync::Arc::clone(&analyzed));
-    let result = Evaluator::new(std::sync::Arc::new(ctx))
-        .run_main(&std::sync::Arc::new(Scope::default()), args)
-        .unwrap();
+    let result = TreeWalkEvaluator::new(std::sync::Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    }))
+    .run_main(&std::sync::Arc::new(Scope::default()), args)
+    .unwrap();
     let Value::Dict(d) = result else { panic!() };
     assert_eq!(d.map.get("total"), Some(&Value::Int(199)));
 }
@@ -4437,9 +4667,13 @@ fn extend_user_schema_adds_method() {
     let ctx = Context::new()
         .with_root(node.clone())
         .with_analyzed(std::sync::Arc::clone(&analyzed));
-    let result = Evaluator::new(std::sync::Arc::new(ctx))
-        .run_main(&std::sync::Arc::new(Scope::default()), args)
-        .unwrap();
+    let result = TreeWalkEvaluator::new(std::sync::Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    }))
+    .run_main(&std::sync::Arc::new(Scope::default()), args)
+    .unwrap();
     let Value::Dict(d) = result else { panic!() };
     assert_eq!(d.map.get("admin"), Some(&Value::Bool(true)));
 }
@@ -4464,9 +4698,13 @@ fn schema_method_calls_sibling_method_via_self() {
     let ctx = Context::new()
         .with_root(node.clone())
         .with_analyzed(std::sync::Arc::clone(&analyzed));
-    let result = Evaluator::new(std::sync::Arc::new(ctx))
-        .run_main(&std::sync::Arc::new(Scope::default()), args)
-        .unwrap();
+    let result = TreeWalkEvaluator::new(std::sync::Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    }))
+    .run_main(&std::sync::Arc::new(Scope::default()), args)
+    .unwrap();
     let Value::Dict(d) = result else { panic!() };
     assert_eq!(d.map.get("total"), Some(&Value::Int(28))); // 7 * 2 * 2
 }
@@ -4490,9 +4728,13 @@ fn schema_method_with_arg_dispatches() {
     let ctx = Context::new()
         .with_root(node.clone())
         .with_analyzed(std::sync::Arc::clone(&analyzed));
-    let result = Evaluator::new(std::sync::Arc::new(ctx))
-        .run_main(&std::sync::Arc::new(Scope::default()), args)
-        .unwrap();
+    let result = TreeWalkEvaluator::new(std::sync::Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    }))
+    .run_main(&std::sync::Arc::new(Scope::default()), args)
+    .unwrap();
     let Value::Dict(d) = result else { panic!() };
     assert_eq!(d.map.get("total"), Some(&Value::Int(150)));
 }
@@ -4535,9 +4777,13 @@ fn multi_hop_schema_method_dispatches_through_field() {
     let ctx = Context::new()
         .with_root(node.clone())
         .with_analyzed(std::sync::Arc::clone(&analyzed));
-    let result = Evaluator::new(std::sync::Arc::new(ctx))
-        .run_main(&std::sync::Arc::new(Scope::default()), args)
-        .unwrap();
+    let result = TreeWalkEvaluator::new(std::sync::Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    }))
+    .run_main(&std::sync::Arc::new(Scope::default()), args)
+    .unwrap();
     let Value::Dict(d) = result else { panic!() };
     assert_eq!(
         d.map.get("s"),
@@ -4575,9 +4821,13 @@ fn multi_hop_schema_method_with_arg() {
     let ctx = Context::new()
         .with_root(node.clone())
         .with_analyzed(std::sync::Arc::clone(&analyzed));
-    let result = Evaluator::new(std::sync::Arc::new(ctx))
-        .run_main(&std::sync::Arc::new(Scope::default()), args)
-        .unwrap();
+    let result = TreeWalkEvaluator::new(std::sync::Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    }))
+    .run_main(&std::sync::Arc::new(Scope::default()), args)
+    .unwrap();
     let Value::Dict(d) = result else { panic!() };
     assert_eq!(
         d.map.get("s"),
@@ -4620,9 +4870,13 @@ fn stdlib_method_string_upper_dispatches_via_register_pure_method() {
     let ctx = Context::new()
         .with_root(node.clone())
         .with_analyzed(std::sync::Arc::clone(&analyzed));
-    let result = Evaluator::new(std::sync::Arc::new(ctx))
-        .run_main(&std::sync::Arc::new(Scope::default()), args)
-        .unwrap();
+    let result = TreeWalkEvaluator::new(std::sync::Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    }))
+    .run_main(&std::sync::Arc::new(Scope::default()), args)
+    .unwrap();
     let Value::Dict(d) = result else { panic!() };
     assert_eq!(
         d.map.get("shout"),
@@ -4655,9 +4909,13 @@ fn stdlib_method_list_map_dispatches_via_register_pure_method() {
     let ctx = Context::new()
         .with_root(node.clone())
         .with_analyzed(std::sync::Arc::clone(&analyzed));
-    let result = Evaluator::new(std::sync::Arc::new(ctx))
-        .run_main(&std::sync::Arc::new(Scope::default()), args)
-        .unwrap();
+    let result = TreeWalkEvaluator::new(std::sync::Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    }))
+    .run_main(&std::sync::Arc::new(Scope::default()), args)
+    .unwrap();
     let Value::Dict(d) = result else { panic!() };
     assert_eq!(
         d.map.get("doubled"),
@@ -4692,9 +4950,13 @@ fn stdlib_method_dict_keys_dispatches_via_register_pure_method() {
     let ctx = Context::new()
         .with_root(node.clone())
         .with_analyzed(std::sync::Arc::clone(&analyzed));
-    let result = Evaluator::new(std::sync::Arc::new(ctx))
-        .run_main(&std::sync::Arc::new(Scope::default()), args)
-        .unwrap();
+    let result = TreeWalkEvaluator::new(std::sync::Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    }))
+    .run_main(&std::sync::Arc::new(Scope::default()), args)
+    .unwrap();
     let Value::Dict(out) = result else { panic!() };
     assert_eq!(
         out.map.get("ks"),
@@ -4730,9 +4992,13 @@ fn stdlib_method_string_len_matches_free_fn_len() {
     let ctx = Context::new()
         .with_root(node.clone())
         .with_analyzed(std::sync::Arc::clone(&analyzed));
-    let result = Evaluator::new(std::sync::Arc::new(ctx))
-        .run_main(&std::sync::Arc::new(Scope::default()), args)
-        .unwrap();
+    let result = TreeWalkEvaluator::new(std::sync::Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    }))
+    .run_main(&std::sync::Arc::new(Scope::default()), args)
+    .unwrap();
     let Value::Dict(d) = result else { panic!() };
     assert_eq!(d.map.get("free"), Some(&Value::Int(5)));
     assert_eq!(d.map.get("method"), Some(&Value::Int(5)));
@@ -4766,9 +5032,13 @@ fn stdlib_method_self_contains_in_extend_body() {
     let ctx = Context::new()
         .with_root(node.clone())
         .with_analyzed(std::sync::Arc::clone(&analyzed));
-    let result = Evaluator::new(std::sync::Arc::new(ctx))
-        .run_main(&std::sync::Arc::new(Scope::default()), args)
-        .unwrap();
+    let result = TreeWalkEvaluator::new(std::sync::Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    }))
+    .run_main(&std::sync::Arc::new(Scope::default()), args)
+    .unwrap();
     let Value::Dict(d) = result else { panic!() };
     assert_eq!(d.map.get("ok"), Some(&Value::Bool(true)));
 }
@@ -4803,9 +5073,13 @@ fn operator_add_lowers_to_user_method() {
     let ctx = Context::new()
         .with_root(node.clone())
         .with_analyzed(std::sync::Arc::clone(&analyzed));
-    let result = Evaluator::new(std::sync::Arc::new(ctx))
-        .run_main(&std::sync::Arc::new(Scope::default()), args)
-        .unwrap();
+    let result = TreeWalkEvaluator::new(std::sync::Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    }))
+    .run_main(&std::sync::Arc::new(Scope::default()), args)
+    .unwrap();
     let Value::Dict(d) = result else { panic!() };
     assert_eq!(d.map.get("total"), Some(&Value::Int(225)));
 }
@@ -4832,9 +5106,13 @@ fn operator_sub_lowers_to_user_method() {
     let ctx = Context::new()
         .with_root(node.clone())
         .with_analyzed(std::sync::Arc::clone(&analyzed));
-    let result = Evaluator::new(std::sync::Arc::new(ctx))
-        .run_main(&std::sync::Arc::new(Scope::default()), args)
-        .unwrap();
+    let result = TreeWalkEvaluator::new(std::sync::Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    }))
+    .run_main(&std::sync::Arc::new(Scope::default()), args)
+    .unwrap();
     let Value::Dict(d) = result else { panic!() };
     assert_eq!(d.map.get("diff"), Some(&Value::Int(125)));
 }
@@ -4861,9 +5139,13 @@ fn operator_mul_lowers_to_user_method() {
     let ctx = Context::new()
         .with_root(node.clone())
         .with_analyzed(std::sync::Arc::clone(&analyzed));
-    let result = Evaluator::new(std::sync::Arc::new(ctx))
-        .run_main(&std::sync::Arc::new(Scope::default()), args)
-        .unwrap();
+    let result = TreeWalkEvaluator::new(std::sync::Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    }))
+    .run_main(&std::sync::Arc::new(Scope::default()), args)
+    .unwrap();
     let Value::Dict(d) = result else { panic!() };
     assert_eq!(d.map.get("product"), Some(&Value::Int(42)));
 }
@@ -4890,9 +5172,13 @@ fn operator_div_lowers_to_user_method() {
     let ctx = Context::new()
         .with_root(node.clone())
         .with_analyzed(std::sync::Arc::clone(&analyzed));
-    let result = Evaluator::new(std::sync::Arc::new(ctx))
-        .run_main(&std::sync::Arc::new(Scope::default()), args)
-        .unwrap();
+    let result = TreeWalkEvaluator::new(std::sync::Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    }))
+    .run_main(&std::sync::Arc::new(Scope::default()), args)
+    .unwrap();
     let Value::Dict(d) = result else { panic!() };
     assert_eq!(d.map.get("quotient"), Some(&Value::Int(25)));
 }
@@ -4921,9 +5207,13 @@ fn operator_mod_lowers_to_user_method() {
     let ctx = Context::new()
         .with_root(node.clone())
         .with_analyzed(std::sync::Arc::clone(&analyzed));
-    let result = Evaluator::new(std::sync::Arc::new(ctx))
-        .run_main(&std::sync::Arc::new(Scope::default()), args)
-        .unwrap();
+    let result = TreeWalkEvaluator::new(std::sync::Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    }))
+    .run_main(&std::sync::Arc::new(Scope::default()), args)
+    .unwrap();
     let Value::Dict(d) = result else { panic!() };
     assert_eq!(d.map.get("leftover"), Some(&Value::Int(2)));
 }
@@ -4977,9 +5267,13 @@ fn operator_add_without_add_witness_falls_back_to_numeric() {
     let ctx = Context::new()
         .with_root(node.clone())
         .with_analyzed(std::sync::Arc::clone(&analyzed));
-    let result = Evaluator::new(std::sync::Arc::new(ctx))
-        .run_main(&std::sync::Arc::new(Scope::default()), args)
-        .unwrap();
+    let result = TreeWalkEvaluator::new(std::sync::Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    }))
+    .run_main(&std::sync::Arc::new(Scope::default()), args)
+    .unwrap();
     let Value::Dict(d) = result else { panic!() };
     // `n + 1` is pure-Int — numeric fallback (no Money in the mix).
     assert_eq!(d.map.get("total"), Some(&Value::Int(42)));
@@ -5049,9 +5343,13 @@ fn operator_add_returns_branded_result_from_user_method() {
     let mut args: HashMap<String, Value> = HashMap::new();
     args.insert("a".to_string(), Value::dict(a));
     args.insert("b".to_string(), Value::dict(b));
-    let result = Evaluator::new(std::sync::Arc::new(ctx))
-        .run_main(&std::sync::Arc::new(Scope::default()), args)
-        .unwrap();
+    let result = TreeWalkEvaluator::new(std::sync::Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    }))
+    .run_main(&std::sync::Arc::new(Scope::default()), args)
+    .unwrap();
     let Value::Dict(d) = result else { panic!() };
     let Value::Dict(sum) = d.map.get("sum").expect("sum field") else {
         panic!("sum should be a Dict");
@@ -5093,9 +5391,13 @@ fn core_string_method_no_extend_needed() {
     let ctx = Context::new()
         .with_root(node.clone())
         .with_analyzed(std::sync::Arc::clone(&analyzed));
-    let result = Evaluator::new(std::sync::Arc::new(ctx))
-        .run_main(&std::sync::Arc::new(Scope::default()), args)
-        .unwrap();
+    let result = TreeWalkEvaluator::new(std::sync::Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    }))
+    .run_main(&std::sync::Arc::new(Scope::default()), args)
+    .unwrap();
     let Value::Dict(d) = result else { panic!() };
     assert_eq!(d.map.get("shout"), Some(&Value::String("HI".to_string())));
 }
@@ -5124,9 +5426,13 @@ fn core_list_method_no_extend_needed() {
     let ctx = Context::new()
         .with_root(node.clone())
         .with_analyzed(std::sync::Arc::clone(&analyzed));
-    let result = Evaluator::new(std::sync::Arc::new(ctx))
-        .run_main(&std::sync::Arc::new(Scope::default()), args)
-        .unwrap();
+    let result = TreeWalkEvaluator::new(std::sync::Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    }))
+    .run_main(&std::sync::Arc::new(Scope::default()), args)
+    .unwrap();
     let Value::Dict(d) = result else { panic!() };
     assert_eq!(
         d.map.get("tripled"),
@@ -5164,9 +5470,13 @@ fn comprehension_over_list_iter() {
     let ctx = Context::new()
         .with_root(node.clone())
         .with_analyzed(std::sync::Arc::clone(&analyzed));
-    let result = Evaluator::new(std::sync::Arc::new(ctx))
-        .run_main(&std::sync::Arc::new(Scope::default()), args)
-        .unwrap();
+    let result = TreeWalkEvaluator::new(std::sync::Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    }))
+    .run_main(&std::sync::Arc::new(Scope::default()), args)
+    .unwrap();
     let Value::Dict(d) = result else { panic!() };
     assert_eq!(
         d.map.get("squared"),
@@ -5198,9 +5508,13 @@ fn comprehension_over_string_iter() {
     let ctx = Context::new()
         .with_root(node.clone())
         .with_analyzed(std::sync::Arc::clone(&analyzed));
-    let result = Evaluator::new(std::sync::Arc::new(ctx))
-        .run_main(&std::sync::Arc::new(Scope::default()), args)
-        .unwrap();
+    let result = TreeWalkEvaluator::new(std::sync::Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    }))
+    .run_main(&std::sync::Arc::new(Scope::default()), args)
+    .unwrap();
     let Value::Dict(d) = result else { panic!() };
     assert_eq!(
         d.map.get("chars"),
@@ -5239,9 +5553,13 @@ fn comprehension_over_dict_iter_yields_entries() {
     let ctx = Context::new()
         .with_root(node.clone())
         .with_analyzed(std::sync::Arc::clone(&analyzed));
-    let result = Evaluator::new(std::sync::Arc::new(ctx))
-        .run_main(&std::sync::Arc::new(Scope::default()), args)
-        .unwrap();
+    let result = TreeWalkEvaluator::new(std::sync::Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    }))
+    .run_main(&std::sync::Arc::new(Scope::default()), args)
+    .unwrap();
     let Value::Dict(d) = result else { panic!() };
     assert_eq!(d.map.get("count"), Some(&Value::Int(2)));
 }
@@ -5338,9 +5656,13 @@ fn iter_next_on_list_walks_through_then_returns_none() {
     let ctx = Context::new()
         .with_root(node.clone())
         .with_analyzed(std::sync::Arc::clone(&analyzed));
-    let result = Evaluator::new(std::sync::Arc::new(ctx))
-        .run_main(&std::sync::Arc::new(Scope::default()), args)
-        .unwrap();
+    let result = TreeWalkEvaluator::new(std::sync::Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    }))
+    .run_main(&std::sync::Arc::new(Scope::default()), args)
+    .unwrap();
     let Value::Dict(d) = result else { panic!() };
     let assert_some = |key: &str, expected: i64| {
         let Value::Dict(opt) = d.map.get(key).unwrap_or_else(|| panic!("{key} missing")) else {
@@ -5397,9 +5719,13 @@ fn iter_next_on_string_advances_per_codepoint() {
     let ctx = Context::new()
         .with_root(node.clone())
         .with_analyzed(std::sync::Arc::clone(&analyzed));
-    let result = Evaluator::new(std::sync::Arc::new(ctx))
-        .run_main(&std::sync::Arc::new(Scope::default()), args)
-        .unwrap();
+    let result = TreeWalkEvaluator::new(std::sync::Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    }))
+    .run_main(&std::sync::Arc::new(Scope::default()), args)
+    .unwrap();
     let Value::Dict(d) = result else { panic!() };
     let read_some_string = |key: &str| -> String {
         let Value::Dict(opt) = d.map.get(key).unwrap_or_else(|| panic!("{key} missing")) else {
@@ -5456,9 +5782,13 @@ fn iter_next_on_dict_yields_key_sorted_entries() {
     let ctx = Context::new()
         .with_root(node.clone())
         .with_analyzed(std::sync::Arc::clone(&analyzed));
-    let result = Evaluator::new(std::sync::Arc::new(ctx))
-        .run_main(&std::sync::Arc::new(Scope::default()), args)
-        .unwrap();
+    let result = TreeWalkEvaluator::new(std::sync::Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    }))
+    .run_main(&std::sync::Arc::new(Scope::default()), args)
+    .unwrap();
     let Value::Dict(d) = result else { panic!() };
     let read_some_pair = |key: &str| -> (String, i64) {
         let Value::Dict(opt) = d.map.get(key).unwrap_or_else(|| panic!("{key} missing")) else {
@@ -5544,9 +5874,13 @@ fn indexable_lowering_dispatches_through_index_method() {
     let ctx = Context::new()
         .with_root(node.clone())
         .with_analyzed(std::sync::Arc::clone(&analyzed));
-    let result = Evaluator::new(std::sync::Arc::new(ctx))
-        .run_main(&std::sync::Arc::new(Scope::default()), args)
-        .unwrap();
+    let result = TreeWalkEvaluator::new(std::sync::Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    }))
+    .run_main(&std::sync::Arc::new(Scope::default()), args)
+    .unwrap();
     let Value::Dict(d) = result else { panic!() };
     assert_eq!(d.map.get("first"), Some(&Value::Int(10)));
     assert_eq!(d.map.get("second"), Some(&Value::Int(20)));
@@ -5586,9 +5920,13 @@ fn indexable_lowering_missing_key_without_question_mark_errors() {
     let ctx = Context::new()
         .with_root(node.clone())
         .with_analyzed(std::sync::Arc::clone(&analyzed));
-    let err = Evaluator::new(std::sync::Arc::new(ctx))
-        .run_main(&std::sync::Arc::new(Scope::default()), args)
-        .unwrap_err();
+    let err = TreeWalkEvaluator::new(std::sync::Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    }))
+    .run_main(&std::sync::Arc::new(Scope::default()), args)
+    .unwrap_err();
     // Either VariableNotFound (Indexable-dispatched None without ?) or
     // a TypeMismatch from a downstream schema check; the witness-
     // dispatch path returns VariableNotFound and that's what should
