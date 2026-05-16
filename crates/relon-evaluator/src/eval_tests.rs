@@ -5958,3 +5958,47 @@ fn builtin_dict_and_list_indexing_still_works_without_witness() {
     assert_eq!(d.map.get("from_dict"), Some(&Value::Int(2)));
     assert_eq!(d.map.get("from_list"), Some(&Value::Int(30)));
 }
+
+/// Legal pattern for sharing an `Arc<Context>`: call `prepare_in_place`
+/// first, then `Arc::new`, then clone freely. Subsequent wraps short
+/// circuit because `backend_prepared` is already true. This is the
+/// pattern bench / facade / cli / wasm / lsp / profile_alloc all use.
+#[test]
+fn prepare_in_place_makes_shared_arc_safe() {
+    // `range` is a stdlib free function registered by `prepare_in_place`.
+    // If the registration step were silently skipped we would see
+    // `FunctionNotFound("range")` here.
+    let node = parse_doc(r#"{ xs: range(3) }"#);
+    let mut ctx = Context::new().with_root(node);
+    crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+    let ctx = std::sync::Arc::new(ctx);
+    let cloned = std::sync::Arc::clone(&ctx);
+    assert!(std::sync::Arc::strong_count(&cloned) >= 2);
+    let eval = TreeWalkEvaluator::new(cloned);
+    let result = eval
+        .eval_root(&std::sync::Arc::new(Scope::default()))
+        .expect("eval_root");
+    let Value::Dict(d) = result else { panic!() };
+    let Some(Value::List(xs)) = d.map.get("xs") else {
+        panic!("missing xs")
+    };
+    assert_eq!(xs.len(), 3);
+}
+
+/// Footgun guard: if an unprepared `Arc<Context>` is cloned before
+/// reaching `TreeWalkEvaluator::new` (strong_count > 1), prepare cannot
+/// run and no prior wrap installed the defaults either. The old
+/// behavior silently dropped the registration step and surfaced the
+/// failure much later as `FunctionNotFound` on a stdlib method — very
+/// hard to diagnose. The constructor now panics at the wrap site so
+/// the error points at the actual root cause.
+#[test]
+#[should_panic(expected = "TreeWalkEvaluator::new received an Arc<Context> that is shared")]
+fn unprepared_shared_arc_panics_loudly() {
+    let node = parse_doc(r#"{ s: "abc" }"#);
+    let ctx = Context::new().with_root(node);
+    let ctx = std::sync::Arc::new(ctx);
+    let cloned = std::sync::Arc::clone(&ctx);
+    // strong_count == 2, backend_prepared == false -> must panic.
+    let _ = TreeWalkEvaluator::new(cloned);
+}

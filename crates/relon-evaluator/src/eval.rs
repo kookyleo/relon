@@ -35,15 +35,18 @@ impl TreeWalkEvaluator {
     /// Build a [`TreeWalkEvaluator`] over `context`.
     ///
     /// The first wrap installs the tree-walking backend's default
-    /// stdlib / decorators / prelude (see [`prepare_tree_walk_context`])
-    /// when the `Arc` is uniquely owned. Subsequent wraps short-circuit
-    /// because [`Context::backend_prepared`] stays `true` once flipped.
+    /// stdlib / decorators / prelude (see [`prepare_tree_walk_context`]).
+    /// Subsequent wraps short-circuit because
+    /// [`Context::backend_prepared`] stays `true` once flipped.
     ///
     /// Hosts that build the context inline (`Arc::new(ctx)`) get the
-    /// historical "Context::new() then go" experience for free; hosts
-    /// that hand out the `Arc` early (so the wrap sees a shared Arc)
-    /// can call [`Self::prepare_in_place`] on the bare `Context` first
-    /// to opt in explicitly.
+    /// historical "Context::new() then go" experience for free. Hosts
+    /// that share the `Arc<Context>` (clone it before passing in) MUST
+    /// call [`Self::prepare_in_place`] on the bare `Context` before the
+    /// first `Arc::new`. Otherwise this constructor panics with a clear
+    /// message — silent skip would surface later as
+    /// `RuntimeError::FunctionNotFound` for stdlib methods, which is a
+    /// nightmare to debug.
     pub fn new(context: Arc<Context>) -> Self {
         let context = prepare_tree_walk_context(context);
         Self {
@@ -2506,15 +2509,29 @@ pub(crate) fn is_private_field(node: &Node) -> bool {
 /// `sandboxed_flag` triggers the default-deny `FilesystemModuleResolver`
 /// after the virtual `std/...` resolver, mirroring the pre-split
 /// `Context::sandboxed` behavior.
+///
+/// Panics if the input `Arc` is shared (strong_count > 1) and
+/// `backend_prepared` is still false: there is no way to mutate a shared
+/// `Arc` to install the defaults, so silently skipping would surface
+/// later as `RuntimeError::FunctionNotFound` for stdlib methods. The
+/// fix is for the host to call [`TreeWalkEvaluator::prepare_in_place`]
+/// on the bare `Context` before the first `Arc::new(ctx)`.
 fn prepare_tree_walk_context(mut context: Arc<Context>) -> Arc<Context> {
     if context.backend_prepared {
         return context;
     }
-    if let Some(ctx) = Arc::get_mut(&mut context) {
-        TreeWalkEvaluator::prepare_in_place(ctx);
-    }
-    // If the Arc is shared, somebody else already wrapped the same
-    // context and ran the registration on our behalf; nothing to do.
+    let ctx = Arc::get_mut(&mut context).unwrap_or_else(|| {
+        panic!(
+            "TreeWalkEvaluator::new received an Arc<Context> that is shared \
+             (strong_count > 1) but the tree-walking backend has not been \
+             prepared yet. Either: \
+             (a) build the Arc immediately before constructing the evaluator \
+             (so it is uniquely owned when wrapped), or \
+             (b) call TreeWalkEvaluator::prepare_in_place(&mut ctx) on the \
+             bare Context before the first Arc::new(ctx)."
+        )
+    });
+    TreeWalkEvaluator::prepare_in_place(ctx);
     context
 }
 
