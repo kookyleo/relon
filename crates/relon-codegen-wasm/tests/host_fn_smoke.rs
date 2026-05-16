@@ -782,3 +782,162 @@ fn host_fns_section_present() {
     assert!(saw_section, "relon.host_fns custom section must be emitted");
     assert!(entry_count_check_passed);
 }
+
+// ---------------------------------------------------------------------------
+// Capability bit table — Phase 9.b-2 wires `Capabilities` to the wasm
+// `relon_caps_avail` bitmap. The two tests below mirror the existing
+// `capability_granted_allows_call` / `capability_missing_traps` pair
+// but route the bitmap through `Capabilities::all_granted` /
+// `Capabilities::default` so the host SDK ↔ codegen contract on
+// `CapabilityBit::ReadsFs` is exercised end-to-end.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn capability_via_all_granted_bitmap_runs() {
+    // `write_file` declares `cap_bit = CapabilityBit::ReadsFs (0)`.
+    // Driving the imported `relon_caps_avail` global from
+    // `Capabilities::all_granted` must light up the matching bit so
+    // the codegen `check_cap` prologue passes through.
+    use relon_eval_api::{Capabilities, CapabilityBit};
+
+    let (ir_module, host_fns, main_schema, return_schema, main_layout, return_layout) =
+        write_file_module();
+    assert_eq!(
+        ir_module.imports[0].cap_bit,
+        CapabilityBit::ReadsFs.bit_index(),
+        "fixture must guard write_file behind the ReadsFs bit so the \
+         Capabilities mapping is exercised here"
+    );
+
+    let wasm = compile_module_with_host_fns(&ir_module, &main_schema, &return_schema, &host_fns)
+        .expect("compile");
+
+    let caps_bitmap = Capabilities::all_granted().to_cap_bitmap();
+    assert_ne!(
+        caps_bitmap & CapabilityBit::ReadsFs.mask(),
+        0,
+        "all_granted must publish the ReadsFs bit"
+    );
+
+    let (mut store, mut linker, engine, _caps) = setup_store_with_caps(caps_bitmap as i64);
+    linker
+        .func_wrap(
+            "env",
+            "write_file",
+            |_caller: Caller<'_, ()>, _p: i32, _c: i32| -> i32 { 1 },
+        )
+        .expect("define write_file");
+    let module = Module::new(&engine, &wasm).expect("module load");
+    let instance = linker
+        .instantiate(&mut store, &module)
+        .expect("instantiate");
+    let memory: Memory = instance
+        .get_memory(&mut store, "memory")
+        .expect("memory export");
+    let run_main: TypedFunc<(i32, i32, i32, i32), i32> = instance
+        .get_typed_func(&mut store, "run_main")
+        .expect("run_main");
+
+    let mut builder = BufferBuilder::new(&main_layout, &main_schema.fields);
+    builder.write_string("path", "/tmp/x").expect("write path");
+    builder
+        .write_string("content", "hi")
+        .expect("write content");
+    let in_bytes = builder.finish();
+    memory
+        .write(&mut store, IN_PTR as usize, &in_bytes)
+        .expect("memwrite");
+    let bw = run_main
+        .call(
+            &mut store,
+            (
+                IN_PTR,
+                in_bytes.len() as i32,
+                OUT_PTR,
+                return_layout.root_size as i32,
+            ),
+        )
+        .expect("run_main with all_granted bitmap");
+    assert_eq!(bw as usize, return_layout.root_size);
+    let mut out = vec![0u8; return_layout.root_size];
+    memory
+        .read(&mut store, OUT_PTR as usize, &mut out)
+        .expect("memread");
+    let reader = BufferReader::new(&return_layout, &return_schema.fields, &out).expect("reader");
+    assert!(reader.read_bool("value").expect("read value"));
+}
+
+#[test]
+fn capability_via_default_bitmap_denied() {
+    // Zero-trust default (`Capabilities::default`) publishes a zero
+    // bitmap, so the codegen `check_cap` prologue traps before
+    // write_file ever runs. translate_trap must recover
+    // `WasmCapabilityDenied { cap_bit: 0 }` matching ReadsFs.
+    use relon_eval_api::{Capabilities, CapabilityBit, RuntimeError};
+
+    let (ir_module, host_fns, main_schema, return_schema, main_layout, _return_layout) =
+        write_file_module();
+    let wasm = compile_module_with_host_fns(&ir_module, &main_schema, &return_schema, &host_fns)
+        .expect("compile");
+    let parsed = WasmModule::from_bytes(wasm.clone()).expect("load");
+
+    let caps_bitmap = Capabilities::default().to_cap_bitmap();
+    assert_eq!(
+        caps_bitmap, 0,
+        "default Capabilities must publish a zero-trust bitmap"
+    );
+
+    let (mut store, mut linker, engine, _caps) = setup_store_with_caps(caps_bitmap as i64);
+    let host_call_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let host_call_count_clone = host_call_count.clone();
+    linker
+        .func_wrap(
+            "env",
+            "write_file",
+            move |_caller: Caller<'_, ()>, _p: i32, _c: i32| -> i32 {
+                host_call_count_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                1
+            },
+        )
+        .expect("define write_file");
+    let module = Module::new(&engine, &wasm).expect("module load");
+    let instance = linker
+        .instantiate(&mut store, &module)
+        .expect("instantiate");
+    let memory: Memory = instance
+        .get_memory(&mut store, "memory")
+        .expect("memory export");
+    let run_main: TypedFunc<(i32, i32, i32, i32), i32> = instance
+        .get_typed_func(&mut store, "run_main")
+        .expect("run_main");
+
+    let mut builder = BufferBuilder::new(&main_layout, &main_schema.fields);
+    builder.write_string("path", "/tmp/x").expect("write path");
+    builder
+        .write_string("content", "hi")
+        .expect("write content");
+    let in_bytes = builder.finish();
+    memory
+        .write(&mut store, IN_PTR as usize, &in_bytes)
+        .expect("memwrite");
+    let err = run_main
+        .call(&mut store, (IN_PTR, in_bytes.len() as i32, OUT_PTR, 32))
+        .expect_err("must trap when default Capabilities denies ReadsFs");
+
+    let runtime_err = parsed.translate_trap(&err);
+    match runtime_err {
+        RuntimeError::WasmCapabilityDenied { cap_bit, range: _ } => {
+            assert_eq!(
+                cap_bit,
+                CapabilityBit::ReadsFs.bit_index(),
+                "expected ReadsFs bit, got {cap_bit}"
+            );
+        }
+        other => panic!("expected WasmCapabilityDenied, got {other:?}"),
+    }
+    assert_eq!(
+        host_call_count.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "host fn must not be invoked when capability is denied"
+    );
+}

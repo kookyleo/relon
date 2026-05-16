@@ -27,7 +27,7 @@ use crate::{compile_lowered_entry, WasmModule};
 use relon_eval_api::buffer::{BufferBuilder, BufferError, BufferReader};
 use relon_eval_api::layout::{OffsetTable, SchemaLayout};
 use relon_eval_api::schema_canonical::{Field, Schema, TypeRepr};
-use relon_eval_api::{Evaluator, RuntimeError, Scope, Thunk, Value};
+use relon_eval_api::{Capabilities, Evaluator, RuntimeError, Scope, Thunk, Value};
 use relon_parser::Node;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
@@ -181,6 +181,12 @@ pub struct WasmAotEvaluator {
     /// Out buffer capacity in bytes used for each `run_main` call.
     /// Host can override via [`Self::with_out_cap`] before evaluating.
     out_cap: u32,
+    /// Capability grant bitmap published into the wasm module's
+    /// imported `relon_caps_avail` i64 global at session-build time.
+    /// Bit positions follow [`relon_eval_api::CapabilityBit`]. Defaults
+    /// to the zero-trust grant set (`Capabilities::default`); hosts
+    /// flip on individual bits through [`Self::with_capabilities`].
+    cap_grants: u64,
     /// Free-list of warmed-up [`WasmSession`]s. Per-call cost on a hit
     /// is just the buffer marshal + wasm dispatch; misses pay the
     /// `Store::new` + `Linker::instantiate` price once.
@@ -245,6 +251,12 @@ impl WasmAotEvaluator {
             main_layout,
             return_layout,
             out_cap: DEFAULT_OUT_CAP,
+            // Zero-trust default: every capability bit cleared until
+            // the host explicitly grants one through
+            // `with_capabilities`. The codegen-emitted check_cap
+            // prologue traps with `CapabilityDenied` when a #native
+            // call needs a bit the bitmap doesn't carry.
+            cap_grants: Capabilities::default().to_cap_bitmap(),
             session_pool: Mutex::new(Vec::new()),
         })
     }
@@ -254,6 +266,29 @@ impl WasmAotEvaluator {
     /// tail records (strings / list<Int>) can exceed the budget.
     pub fn with_out_cap(mut self, out_cap: u32) -> Self {
         self.out_cap = out_cap;
+        self
+    }
+
+    /// Replace the capability grant set the wasm side observes through
+    /// its imported `relon_caps_avail` i64 global. Defaults to the
+    /// zero-trust grant (no bits set); hosts that need to invoke
+    /// `#native` functions guarded by a non-zero `cap_bit` must hand
+    /// in a [`Capabilities`] that grants every required bit.
+    ///
+    /// Bit positions follow
+    /// [`relon_eval_api::CapabilityBit`] — the same table the
+    /// host SDK uses when registering a `#native` function's
+    /// `cap_bit` field. Resets the session pool so cached stores
+    /// don't keep the previous bitmap alive.
+    pub fn with_capabilities(mut self, caps: Capabilities) -> Self {
+        self.cap_grants = caps.to_cap_bitmap();
+        // Drop pooled sessions: each session's `relon_caps_avail`
+        // global was built against the old bitmap. Leaving them
+        // around would cause the next call to silently keep observing
+        // the stale grant set.
+        if let Ok(mut pool) = self.session_pool.lock() {
+            pool.clear();
+        }
         self
     }
 
@@ -390,17 +425,17 @@ impl WasmAotEvaluator {
         let mut store: Store<()> = Store::new(&self.engine, ());
 
         // The wasm module imports `(global $relon_caps_avail i64)`.
-        // v1 grants every bit so the `check_cap` prologue never trips;
-        // sandbox tightening lives one phase out. The Global has to
-        // be created against this specific store before the linker can
-        // own it, which is why the InstancePre approach can't span
-        // independent stores in Phase 9.b-1 — the optimisation here
-        // is amortising the cost across calls, not removing the
-        // store-attach step itself.
+        // The bitmap published here is the host's grant set encoded
+        // through `CapabilityBit`; codegen's `check_cap` prologue
+        // tests the relevant bit before every guarded `#native` call
+        // and traps with `CapabilityDenied` on a miss. The Global has
+        // to be created against this specific store before the linker
+        // can own it — that's why we can't share a single Global
+        // across the pool's stores.
         let caps_avail = Global::new(
             &mut store,
             GlobalType::new(ValType::I64, Mutability::Const),
-            Val::I64(i64::MAX),
+            Val::I64(self.cap_grants as i64),
         )
         .map_err(|e| RuntimeError::IoError(format!("wasm caps_avail global: {e}")))?;
 
