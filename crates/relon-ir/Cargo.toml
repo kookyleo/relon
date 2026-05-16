@@ -1,0 +1,22 @@
+[package]
+name = "relon-ir"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Linear-typed IR layer between Relon analyzer and codegen backends (WASM, native, JS, ...)"
+keywords = ["relon", "ir", "compiler", "lowering"]
+categories = ["compilers"]
+
+[dependencies]
+# Source positions for IR ops + diagnostics
+relon-parser = { workspace = true }
+# AnalyzedTree input
+relon-analyzer = { workspace = true }
+# Shared value/scope/error types used in codegen diagnostics
+relon-eval-api = { workspace = true }
+
+thiserror = { workspace = true }
+miette = { workspace = true }

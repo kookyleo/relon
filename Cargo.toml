@@ -34,6 +34,8 @@ relon-analyzer = { path = "crates/relon-analyzer", version = "0.1.0" }
 relon-eval-api = { path = "crates/relon-eval-api", version = "0.1.0" }
 relon-evaluator = { path = "crates/relon-evaluator", version = "0.1.0" }
 relon-fmt = { path = "crates/relon-fmt", version = "0.1.0" }
+relon-ir = { path = "crates/relon-ir", version = "0.1.0" }
+relon-codegen-wasm = { path = "crates/relon-codegen-wasm", version = "0.1.0" }
 relon-lsp = { path = "crates/relon-lsp", version = "0.1.0" }
 relon-wasm = { path = "crates/relon-wasm", version = "0.1.0" }
 

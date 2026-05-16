@@ -1124,6 +1124,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "relon-codegen-wasm"
+version = "0.1.0"
+dependencies = [
+ "relon-eval-api",
+ "relon-ir",
+ "relon-parser",
+ "thiserror",
+]
+
+[[package]]
 name = "relon-eval-api"
 version = "0.1.0"
 dependencies = [
@@ -1157,6 +1167,17 @@ name = "relon-fmt"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "relon-parser",
+ "thiserror",
+]
+
+[[package]]
+name = "relon-ir"
+version = "0.1.0"
+dependencies = [
+ "miette",
+ "relon-analyzer",
+ "relon-eval-api",
  "relon-parser",
  "thiserror",
 ]

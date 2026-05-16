@@ -1,0 +1,21 @@
+[package]
+name = "relon-codegen-wasm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Lower Relon IR to WebAssembly bytecode (AOT backend for the Evaluator trait)"
+keywords = ["relon", "wasm", "codegen", "compiler"]
+categories = ["compilers", "wasm"]
+
+[dependencies]
+# IR input
+relon-ir = { workspace = true }
+# Trait Evaluator + shared value types
+relon-eval-api = { workspace = true }
+# Source positions for srcmap custom section
+relon-parser = { workspace = true }
+
+thiserror = { workspace = true }
