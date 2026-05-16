@@ -32,28 +32,47 @@
 
 pub mod abi;
 pub mod error;
+pub mod host_fns;
 pub mod srcmap;
 
 pub use abi::{AbiError, AbiMetadata};
 pub use error::{CodegenError, LoadError};
+pub use host_fns::{
+    hash_params, hash_return, HostFnEntry, HostFnError, HostFnTable, NO_CAPABILITY,
+};
 pub use srcmap::{Entry as SrcMapEntry, SrcMap, SrcMapError};
 
 use relon_eval_api::layout::{OffsetTable, SchemaLayout};
 use relon_eval_api::schema_canonical::{schema_hash, Schema};
 use relon_ir::{
     builtin_stdlib, Func as IrFunc, IrType, LoweredEntry, Module as IrModule, Op,
-    WASM_LOCAL_IN_LEN, WASM_LOCAL_IN_PTR, WASM_LOCAL_OUT_CAP, WASM_LOCAL_OUT_PTR,
+    NO_CAPABILITY_BIT, WASM_LOCAL_IN_LEN, WASM_LOCAL_IN_PTR, WASM_LOCAL_OUT_CAP,
+    WASM_LOCAL_OUT_PTR,
 };
 use relon_parser::TokenRange;
 use std::collections::HashMap;
 use wasm_encoder::{
-    BlockType, CodeSection, ConstExpr, CustomSection, DataSection, ExportKind, ExportSection,
-    Function, FunctionSection, GlobalSection, GlobalType, Ieee64, Instruction, MemArg,
-    MemorySection, MemoryType, Module, TypeSection, ValType,
+    BlockType, CodeSection, ConstExpr, CustomSection, DataSection, EntityType, ExportKind,
+    ExportSection, Function, FunctionSection, GlobalSection, GlobalType, Ieee64, ImportSection,
+    Instruction, MemArg, MemorySection, MemoryType, Module, TypeSection, ValType,
 };
 
 /// Memory export name used by the binary handshake.
 const MEMORY_EXPORT_NAME: &str = "memory";
+
+/// Module name used for every host-fn import emitted into the wasm
+/// `ImportSection`. Mirrors the convention wasmtime / wasi adopt for
+/// host-provided imports — the host SDK's `Linker::func_wrap("env",
+/// ...)` then naturally lines up with what the wasm runtime asks for.
+const HOST_IMPORT_MODULE: &str = "env";
+
+/// Name of the `i64`-typed global the wasm module imports from the
+/// host SDK to read the granted-capabilities bitmap. Codegen emits
+/// `(import "env" "relon_caps_avail" (global i64))` exactly once per
+/// module; the host SDK provides an immutable global whose value is
+/// the host's `cap_grants` bitmap. Bit `N` set means capability `N`
+/// is granted to the wasm module for this instantiation.
+const CAPS_AVAIL_IMPORT_NAME: &str = "relon_caps_avail";
 
 /// Default initial memory size in wasm pages (64 KiB each). Phase 2.b
 /// only needs a small staging area for the in/out buffers — the host
@@ -125,8 +144,36 @@ pub fn compile_module(
     main_schema: &Schema,
     return_schema: &Schema,
 ) -> Result<Vec<u8>, CodegenError> {
+    // Modules without any `#native` declarations land the empty
+    // host-fns table; codegen still emits the `relon.host_fns`
+    // custom section so host SDKs distinguish "no host fns" from
+    // "stripped section".
+    let host_fns = host_fns::HostFnTable::empty();
+    compile_module_with_host_fns(ir, main_schema, return_schema, &host_fns)
+}
+
+/// Phase 6 entry point. Same as [`compile_module`] but threads a
+/// caller-supplied [`host_fns::HostFnTable`] through so the wasm
+/// module emits matching `ImportSection` entries and the
+/// `relon.host_fns` custom section. The `ir.imports` list must agree
+/// with the host-fns table position-for-position: entry `i` is the
+/// declaration for import `i`. Mismatches surface as
+/// [`CodegenError::HostFnTableArityMismatch`].
+pub fn compile_module_with_host_fns(
+    ir: &IrModule,
+    main_schema: &Schema,
+    return_schema: &Schema,
+    host_fns: &host_fns::HostFnTable,
+) -> Result<Vec<u8>, CodegenError> {
     if ir.funcs.is_empty() {
         return Err(CodegenError::EmptyModule);
+    }
+
+    if ir.imports.len() != host_fns.entries.len() {
+        return Err(CodegenError::HostFnTableArityMismatch {
+            ir_imports: ir.imports.len() as u32,
+            table_entries: host_fns.entries.len() as u32,
+        });
     }
 
     let main_layout =
@@ -136,11 +183,11 @@ pub fn compile_module(
 
     // Phase 4.a: prepend bundled stdlib functions before the user
     // functions. Each stdlib entry contributes one wasm function at
-    // index `0..N`; user functions slide to `N..N+U`. The
-    // `entry_func_index` field on the IR module is an *IR-side*
-    // index (into `ir.funcs`); when we slot the user functions after
-    // the stdlib, we shift it to compute the wasm-level export
-    // target.
+    // index `import_count..import_count+N`; user functions slide to
+    // `import_count+N..import_count+N+U`. The `entry_func_index`
+    // field on the IR module is an *IR-side* index (into
+    // `ir.funcs`); the wasm-level entry index is
+    // `import_count + stdlib_count + entry_func_index`.
     let stdlib_funcs = builtin_stdlib();
     let stdlib_count = stdlib_funcs.len();
     let combined_funcs: Vec<IrFunc> = stdlib_funcs
@@ -148,6 +195,7 @@ pub fn compile_module(
         .map(stdlib_to_ir_func)
         .chain(ir.funcs.iter().cloned())
         .collect();
+    let import_count = ir.imports.len() as u32;
     let combined_entry_index = ir.entry_func_index.map(|i| i + stdlib_count);
 
     // Walk every function body up front and lay out the const data
@@ -162,11 +210,52 @@ pub fn compile_module(
 
     let mut module = Module::new();
     let mut types = TypeSection::new();
+    let mut imports = ImportSection::new();
     let mut functions = FunctionSection::new();
     let mut memories = MemorySection::new();
     let mut globals = GlobalSection::new();
     let mut exports = ExportSection::new();
     let mut codes = CodeSection::new();
+
+    // Type table tracks `(params, return) -> type index` so duplicate
+    // function signatures share a single type entry. Imports register
+    // their types here first so the function-index assignment stays
+    // contiguous.
+    let mut type_table: Vec<(Vec<ValType>, ValType, u32)> = Vec::new();
+
+    // Phase 6: emit one `(import "env" <name> (func ...))` per
+    // declared `#native` import. Position in `ir.imports` matches the
+    // wasm function index — imports always occupy `0..import_count`.
+    for native in &ir.imports {
+        let params_vt: Vec<ValType> = native.param_tys.iter().map(ir_to_val_type).collect();
+        let ret_vt = ir_to_val_type(&native.ret_ty);
+        let type_index = ensure_type(&mut types, &mut type_table, &params_vt, ret_vt);
+        imports.import(
+            HOST_IMPORT_MODULE,
+            native.name.as_str(),
+            EntityType::Function(type_index),
+        );
+    }
+
+    // Always emit the `relon_caps_avail` imported global. The host
+    // SDK supplies its `cap_grants` bitmap as an immutable i64
+    // global; codegen reads it via `global.get` inside the
+    // `check_cap` prologue. Having the global present even for
+    // modules without host fns keeps the import-section shape
+    // predictable so the host SDK can wire it unconditionally.
+    imports.import(
+        HOST_IMPORT_MODULE,
+        CAPS_AVAIL_IMPORT_NAME,
+        EntityType::Global(GlobalType {
+            val_type: ValType::I64,
+            mutable: false,
+            shared: false,
+        }),
+    );
+    // Imported globals occupy global indices starting at 0; our own
+    // emitted `relon_data_top` global lands at the next slot.
+    let caps_avail_global_index: u32 = 0;
+    let data_top_global_index: u32 = 1;
 
     // Single shared memory: one page (64 KiB). Host writes the input
     // buffer somewhere inside, hands the pointer to `run_main`, then
@@ -195,41 +284,48 @@ pub fn compile_module(
         },
         &ConstExpr::i32_const(data_top as i32),
     );
-    exports.export(DATA_TOP_GLOBAL_EXPORT_NAME, ExportKind::Global, 0);
+    exports.export(
+        DATA_TOP_GLOBAL_EXPORT_NAME,
+        ExportKind::Global,
+        data_top_global_index,
+    );
 
-    let mut type_table: Vec<(Vec<ValType>, ValType, u32)> = Vec::new();
     let mut per_func_ranges: Vec<(TokenRange, Vec<TokenRange>)> =
         Vec::with_capacity(combined_funcs.len());
 
     for (func_index, func) in combined_funcs.iter().enumerate() {
         let params_vt: Vec<ValType> = func.params.iter().map(ir_to_val_type).collect();
         let ret_vt = ir_to_val_type(&func.ret);
-        let type_index = match type_table
-            .iter()
-            .find(|(p, r, _)| p == &params_vt && *r == ret_vt)
-        {
-            Some(&(_, _, idx)) => idx,
-            None => {
-                let idx = type_table.len() as u32;
-                types.ty().function(params_vt.clone(), vec![ret_vt]);
-                type_table.push((params_vt, ret_vt, idx));
-                idx
-            }
-        };
+        let type_index = ensure_type(&mut types, &mut type_table, &params_vt, ret_vt);
         functions.function(type_index);
 
+        // Wasm function indices skip past the import functions; the
+        // `combined_funcs` vector is 0-based, so we add `import_count`
+        // to produce the actual wasm function index for exports.
+        let wasm_func_index = func_index as u32 + import_count;
         if Some(func_index) == combined_entry_index {
-            exports.export(func.name.as_str(), ExportKind::Func, func_index as u32);
+            exports.export(func.name.as_str(), ExportKind::Func, wasm_func_index);
         }
 
         let is_entry = Some(func_index) == combined_entry_index;
-        let (body, ranges) =
-            emit_function_body(func, &main_layout, &return_layout, &const_pool, is_entry)?;
+        let emit_cfg = FunctionEmitCfg {
+            import_count,
+            caps_avail_global_index,
+        };
+        let (body, ranges) = emit_function_body(
+            func,
+            &main_layout,
+            &return_layout,
+            &const_pool,
+            is_entry,
+            emit_cfg,
+        )?;
         codes.function(&body);
         per_func_ranges.push((func.range, ranges));
     }
 
     module.section(&types);
+    module.section(&imports);
     module.section(&functions);
     module.section(&memories);
     module.section(&globals);
@@ -264,6 +360,10 @@ pub fn compile_module(
         main_schema_hash: schema_hash(main_schema),
         return_schema_hash: schema_hash(return_schema),
         flags: 0,
+        // Phase 6: collect the OR of every host-fn entry's
+        // `cap_bit`. Empty host-fns table yields zero — the host SDK
+        // skips the subset check entirely.
+        required_capabilities: host_fns.required_capabilities(),
     };
     let abi_bytes = abi::encode(&abi);
     module.section(&CustomSection {
@@ -271,7 +371,47 @@ pub fn compile_module(
         data: (&abi_bytes[..]).into(),
     });
 
+    let host_fns_bytes = host_fns::encode(host_fns);
+    module.section(&CustomSection {
+        name: host_fns::SECTION_NAME.into(),
+        data: (&host_fns_bytes[..]).into(),
+    });
+
     Ok(module.finish())
+}
+
+/// Per-function emit configuration. Threaded through
+/// [`emit_function_body`] so the wasm-side function-index translation
+/// for `Op::Call` and the capability-check prologue for
+/// `Op::CallNative` share a single source of truth.
+#[derive(Debug, Clone, Copy)]
+struct FunctionEmitCfg {
+    /// Number of `#native` imports preceding the stdlib + user
+    /// functions in the wasm function-index space.
+    import_count: u32,
+    /// Global index of the imported `relon_caps_avail` i64 bitmap.
+    /// `Op::CheckCap` reads this via `global.get` before emitting the
+    /// bit-test.
+    caps_avail_global_index: u32,
+}
+
+/// Look up an existing `(params, ret) -> type index` entry or add a
+/// fresh one to the wasm type section. Centralises the de-dup logic
+/// so the import-emit and function-emit paths agree on a single
+/// type-table.
+fn ensure_type(
+    types: &mut TypeSection,
+    table: &mut Vec<(Vec<ValType>, ValType, u32)>,
+    params: &[ValType],
+    ret: ValType,
+) -> u32 {
+    if let Some(&(_, _, idx)) = table.iter().find(|(p, r, _)| p == params && *r == ret) {
+        return idx;
+    }
+    let idx = table.len() as u32;
+    types.ty().function(params.iter().copied(), vec![ret]);
+    table.push((params.to_vec(), ret, idx));
+    idx
 }
 
 /// Convenience wrapper around [`compile_module`] for callers that
@@ -558,6 +698,7 @@ fn emit_function_body(
     return_layout: &OffsetTable,
     const_pool: &ConstPool,
     is_entry: bool,
+    emit_cfg: FunctionEmitCfg,
 ) -> Result<(Function, Vec<TokenRange>), CodegenError> {
     // Walk the body (recursively into if-branches) to determine
     // which wasm value type the trailing StoreField needs as its
@@ -680,7 +821,11 @@ fn emit_function_body(
 
     // Virtual stack used to validate arithmetic type tags.
     let mut vstack: Vec<IrType> = Vec::new();
-    let mut ectx = EmitCtx { record_local_base };
+    let mut ectx = EmitCtx {
+        record_local_base,
+        import_count: emit_cfg.import_count,
+        caps_avail_global_index: emit_cfg.caps_avail_global_index,
+    };
     let _ = return_root_size; // referenced earlier in this function
     emit_op_seq(
         &mut f,
@@ -766,6 +911,18 @@ struct EmitCtx {
     /// function. An IR `record_local_idx` of `n` maps to
     /// `record_local_base + n`.
     record_local_base: u32,
+    /// Number of host-fn imports preceding the stdlib + user
+    /// functions in the wasm function-index space. `Op::Call`'s
+    /// `fn_index` is lowered against the combined stdlib/user table
+    /// (0-based); codegen adds this offset before emitting the wasm
+    /// `call` instruction so the indices line up after the import
+    /// section claims `0..import_count`.
+    import_count: u32,
+    /// Global index of the imported `relon_caps_avail` i64 bitmap.
+    /// `Op::CheckCap` and the inline check inside `Op::CallNative`
+    /// read it via `global.get` before bit-testing the requested
+    /// capability slot.
+    caps_avail_global_index: u32,
 }
 
 /// Scan `body` (and any nested if-branches) for the largest
@@ -1137,9 +1294,77 @@ fn emit_op_seq(
                         });
                     }
                 }
-                f.instruction(&Instruction::Call(*fn_index));
+                // Phase 6: wasm function indices shift up by
+                // `import_count` because the import section claims the
+                // lower slots. The IR-side `fn_index` is 0-based
+                // against the combined stdlib + user function vector.
+                let wasm_fn_index = fn_index.checked_add(ectx.import_count).ok_or(
+                    CodegenError::CallTypeMismatch {
+                        fn_index: *fn_index,
+                        arg_count: *arg_count,
+                        param_tys_len,
+                    },
+                )?;
+                f.instruction(&Instruction::Call(wasm_fn_index));
                 ranges.push(tagged.range);
                 vstack.push(*ret_ty);
+            }
+            Op::CallNative {
+                import_idx,
+                param_tys,
+                ret_ty,
+                cap_bit,
+            } => {
+                // Phase 6 host-fn dispatch. Imports occupy wasm
+                // function indices `0..import_count`, so the IR-side
+                // `import_idx` *is* the wasm function index. We still
+                // validate the bound before emitting so a hand-built
+                // IR with a stale index surfaces deterministically.
+                if *import_idx >= ectx.import_count {
+                    return Err(CodegenError::CallNativeImportOutOfRange {
+                        import_idx: *import_idx,
+                        import_count: ectx.import_count,
+                    });
+                }
+                let param_tys_len = u32::try_from(param_tys.len()).unwrap_or(u32::MAX);
+                if vstack.len() < param_tys.len() {
+                    return Err(CodegenError::CallNativeArgCountMismatch {
+                        import_idx: *import_idx,
+                        param_tys_len,
+                    });
+                }
+                for ty in param_tys.iter().rev() {
+                    let popped = vstack
+                        .pop()
+                        .ok_or(CodegenError::CallNativeArgCountMismatch {
+                            import_idx: *import_idx,
+                            param_tys_len,
+                        })?;
+                    if popped.wasm_slot() != ty.wasm_slot() {
+                        return Err(CodegenError::CallNativeArgCountMismatch {
+                            import_idx: *import_idx,
+                            param_tys_len,
+                        });
+                    }
+                }
+                // Capability prologue: when the entry guards the call
+                // behind a `cap_bit`, emit the bitmap test that traps
+                // (`unreachable`) when the bit is unset. The trap fires
+                // before any argument hits the host fn, so the host
+                // SDK observes a clean "capability denied" trap.
+                emit_check_cap_inline(f, ranges, ectx, *cap_bit, tagged.range);
+                f.instruction(&Instruction::Call(*import_idx));
+                ranges.push(tagged.range);
+                vstack.push(*ret_ty);
+            }
+            Op::CheckCap { cap_bit } => {
+                // Stand-alone capability assertion. Same emit shape as
+                // the inlined version inside `Op::CallNative`, just
+                // without a following `call`. Used when a future
+                // lowering pass wants to pre-flight a capability
+                // without invoking the host fn (e.g. branch on the
+                // result of an analyzer-side cap-grant query).
+                emit_check_cap_inline(f, ranges, ectx, *cap_bit, tagged.range);
             }
             Op::ReadStringLen => {
                 let popped = vstack.pop().ok_or(CodegenError::MixedNumericTypes)?;
@@ -1216,19 +1441,71 @@ fn emit_op_seq(
     Ok(())
 }
 
+/// Emit the wasm sequence guarding a host-fn call (or a stand-alone
+/// `Op::CheckCap`) against the host's granted-capabilities bitmap.
+///
+/// Generated wasm:
+///
+/// ```text
+/// global.get $relon_caps_avail
+/// i64.const (1 << cap_bit)
+/// i64.and
+/// i64.eqz
+/// if
+///   unreachable
+/// end
+/// ```
+///
+/// `cap_bit == NO_CAPABILITY_BIT` is a no-op — the prologue is
+/// elided entirely. `cap_bit >= 64` collapses to "always trap" since
+/// no single-bit shift can land outside the i64 bitmap; codegen
+/// emits the constant zero mask and lets the runtime trap.
+fn emit_check_cap_inline(
+    f: &mut Function,
+    ranges: &mut Vec<TokenRange>,
+    ectx: &EmitCtx,
+    cap_bit: u32,
+    range: TokenRange,
+) {
+    if cap_bit == NO_CAPABILITY_BIT {
+        return;
+    }
+    // Cap_bit >= 64 makes the bitmask zero, so the i64.and result is
+    // always zero and the i64.eqz branch always traps. That's the
+    // intended behaviour for "capability index outside the u64
+    // bitmap" — the host SDK can't grant such a bit, so the wasm
+    // module's call must trap.
+    let mask: i64 = if cap_bit < 64 { 1i64 << cap_bit } else { 0 };
+    f.instruction(&Instruction::GlobalGet(ectx.caps_avail_global_index));
+    ranges.push(range);
+    f.instruction(&Instruction::I64Const(mask));
+    ranges.push(range);
+    f.instruction(&Instruction::I64And);
+    ranges.push(range);
+    f.instruction(&Instruction::I64Eqz);
+    ranges.push(range);
+    f.instruction(&Instruction::If(BlockType::Empty));
+    ranges.push(range);
+    f.instruction(&Instruction::Unreachable);
+    ranges.push(range);
+    f.instruction(&Instruction::End);
+    ranges.push(range);
+}
+
 /// Emit an `if (result <valtype>) <then> else <else> end` block.
 ///
 /// Frame discipline:
-///   - Pops one i32 condition from the vstack before emitting the
-///     `If`. Lowering already restricted condition type to `Bool`,
-///     so we check the slot rather than the exact tag.
-///   - Inside each branch we re-emit the matching ops with a fresh
-///     view of the vstack so frame-leak (e.g. an inner branch
-///     pushing two values where one was promised) surfaces as a
-///     `MixedNumericTypes` rather than corrupting the outer frame.
-///   - Both branches must end with exactly one value of `result_ty`
-///     on top of their local vstack; we then merge them into a
-///     single push on the outer vstack.
+///
+/// * Pops one i32 condition from the vstack before emitting the
+///   `If`. Lowering already restricted condition type to `Bool`, so
+///   we check the slot rather than the exact tag.
+/// * Inside each branch we re-emit the matching ops with a fresh
+///   view of the vstack so frame-leak (e.g. an inner branch pushing
+///   two values where one was promised) surfaces as a
+///   `MixedNumericTypes` rather than corrupting the outer frame.
+/// * Both branches must end with exactly one value of `result_ty`
+///   on top of their local vstack; we then merge them into a single
+///   push on the outer vstack.
 #[allow(clippy::too_many_arguments)]
 fn emit_if(
     f: &mut Function,
@@ -2287,8 +2564,9 @@ pub fn compile_hardcoded_double() -> Vec<u8> {
 /// Loaded wasm module surface used by host SDKs.
 ///
 /// Wraps the raw module bytes alongside the parsed `relon.abi` +
-/// `relon.srcmap` sections so a host can keep one value handy for
-/// instantiation, trap translation, and ABI compatibility checks.
+/// `relon.srcmap` + `relon.host_fns` sections so a host can keep one
+/// value handy for instantiation, trap translation, and ABI
+/// compatibility checks.
 #[derive(Debug, Clone)]
 pub struct WasmModule {
     /// Raw module bytes ready to be passed to a wasm engine.
@@ -2297,6 +2575,9 @@ pub struct WasmModule {
     abi: AbiMetadata,
     /// Source map parsed out of `relon.srcmap`.
     srcmap: SrcMap,
+    /// Host-fn table parsed out of `relon.host_fns`. Empty when the
+    /// module declared no `#native` imports.
+    host_fns: host_fns::HostFnTable,
 }
 
 impl WasmModule {
@@ -2315,14 +2596,47 @@ impl WasmModule {
         &self.srcmap
     }
 
+    /// Borrow the parsed host-fn table (declared `#native` imports).
+    /// Empty for modules without host-fn dependencies.
+    pub fn host_fns(&self) -> &host_fns::HostFnTable {
+        &self.host_fns
+    }
+
     /// Parse a wasm module's custom sections and validate the ABI
     /// shape only (versions, magic). Schema-hash validation requires
     /// the caller to supply the expected `#main` / return schemas via
     /// [`Self::from_bytes_with_schema`]; this entry point is for
     /// hosts that don't yet know what they expect (introspection
     /// tools, debug dumps).
+    ///
+    /// Modules with a non-empty `relon.host_fns` table still load
+    /// through this entry point — the host-fn table is exposed
+    /// through [`Self::host_fns`] for inspection but no validation
+    /// runs. Use [`Self::from_bytes_with_host_fns`] to validate the
+    /// declared host fns against the SDK's bindings.
     pub fn from_bytes(bytes: Vec<u8>) -> Result<Self, LoadError> {
         Self::from_bytes_inner(bytes, None)
+    }
+
+    /// Phase 6: parse + validate a wasm module against the host
+    /// SDK's registered `#native` bindings. The supplied table
+    /// describes the host-side bindings the SDK is willing to wire
+    /// into the wasm runtime; the loader rejects mismatches before
+    /// returning the [`WasmModule`].
+    ///
+    /// Failure surface:
+    /// * [`LoadError::MissingHostFn`] — module declared an import
+    ///   the SDK didn't register.
+    /// * [`LoadError::HostFnSignatureDrift`] — SDK has a binding
+    ///   under the matching name, but its canonical signature hash
+    ///   disagrees.
+    pub fn from_bytes_with_host_fns(
+        bytes: Vec<u8>,
+        host_fns: &host_fns::HostFnTable,
+    ) -> Result<Self, LoadError> {
+        let module = Self::from_bytes_inner(bytes, None)?;
+        validate_host_fns(&module.host_fns, host_fns)?;
+        Ok(module)
     }
 
     /// Parse a wasm module and validate it against the supplied
@@ -2345,6 +2659,7 @@ impl WasmModule {
     ) -> Result<Self, LoadError> {
         let mut abi_bytes: Option<Vec<u8>> = None;
         let mut srcmap_bytes: Option<Vec<u8>> = None;
+        let mut host_fns_bytes: Option<Vec<u8>> = None;
 
         for payload in wasmparser::Parser::new(0).parse_all(&bytes) {
             let payload = payload.map_err(|e| LoadError::WasmParse(e.to_string()))?;
@@ -2355,6 +2670,9 @@ impl WasmModule {
                     }
                     name if name == srcmap::SECTION_NAME => {
                         srcmap_bytes = Some(reader.data().to_vec());
+                    }
+                    name if name == host_fns::SECTION_NAME => {
+                        host_fns_bytes = Some(reader.data().to_vec());
                     }
                     _ => {}
                 }
@@ -2379,6 +2697,49 @@ impl WasmModule {
         })?;
         let srcmap = srcmap::decode_from_bytes(&srcmap_bytes)?;
 
-        Ok(Self { bytes, abi, srcmap })
+        // `relon.host_fns` is optional for forward-compat: old codegen
+        // pipelines may not have emitted the section. When present we
+        // decode it; when absent we treat the table as empty.
+        let host_fns_table = match host_fns_bytes {
+            Some(b) => host_fns::decode(&b)?,
+            None => host_fns::HostFnTable::empty(),
+        };
+
+        Ok(Self {
+            bytes,
+            abi,
+            srcmap,
+            host_fns: host_fns_table,
+        })
     }
+}
+
+/// Validate the wasm module's declared `#native` imports against the
+/// host SDK's registered bindings. Position-independent match — the
+/// declared table is keyed on `name`, so the host SDK's table can
+/// list bindings in any order and still link.
+fn validate_host_fns(
+    declared: &host_fns::HostFnTable,
+    supplied: &host_fns::HostFnTable,
+) -> Result<(), LoadError> {
+    for entry in &declared.entries {
+        let Some(supplied_entry) = supplied.entries.iter().find(|e| e.name == entry.name) else {
+            return Err(LoadError::MissingHostFn {
+                name: entry.name.clone(),
+            });
+        };
+        if supplied_entry.params_canonical_hash != entry.params_canonical_hash {
+            return Err(LoadError::HostFnSignatureDrift {
+                name: entry.name.clone(),
+                which: "params",
+            });
+        }
+        if supplied_entry.ret_canonical_hash != entry.ret_canonical_hash {
+            return Err(LoadError::HostFnSignatureDrift {
+                name: entry.name.clone(),
+                which: "return",
+            });
+        }
+    }
+    Ok(())
 }

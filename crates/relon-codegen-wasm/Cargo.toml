@@ -19,6 +19,10 @@ relon-eval-api = { workspace = true }
 relon-parser = { workspace = true }
 
 thiserror = { workspace = true }
+# Canonical-signature hashing for `#native` host imports. Same crate
+# already used by relon-eval-api so we share one dependency version
+# across the workspace.
+sha2 = { workspace = true }
 
 # Low-level WebAssembly module encoder used by the Phase 1.alpha
 # hardcoded smoke generator. Kept in sync with `wasmparser` /

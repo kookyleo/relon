@@ -18,7 +18,9 @@ use relon_eval_api::buffer::{BufferBuilder, BufferReader};
 use relon_eval_api::layout::{OffsetTable, SchemaLayout};
 use relon_eval_api::schema_canonical::{Schema, TypeRepr};
 use relon_ir::lower_workspace_single;
-use wasmtime::{Engine, Instance, Memory, Module, Store, TypedFunc};
+use wasmtime::{
+    Engine, Global, Instance, Memory, Module, Mutability, Store, TypedFunc, Val, ValType,
+};
 
 /// Pack a schema-typed parameter into a `MainParams`-shaped buffer.
 ///
@@ -101,7 +103,14 @@ impl WasmSession {
         let engine = Engine::default();
         let module = Module::new(&engine, bytes).expect("module load");
         let mut store: Store<()> = Store::new(&engine, ());
-        let instance = Instance::new(&mut store, &module, &[]).expect("instantiate");
+        let caps_avail = Global::new(
+            &mut store,
+            wasmtime::GlobalType::new(ValType::I64, Mutability::Const),
+            Val::I64(i64::MAX),
+        )
+        .expect("create relon_caps_avail global");
+        let instance =
+            Instance::new(&mut store, &module, &[caps_avail.into()]).expect("instantiate");
         let memory = instance
             .get_memory(&mut store, "memory")
             .expect("memory export");

@@ -253,19 +253,24 @@ fn from_bytes_rejects_abi_version_mismatch() {
     let wasm = compile_source("#main(Int x) -> Int\nx * 2");
 
     // Flip the abi_version bytes (offset 5..7 of the payload — see
-    // `abi::encode` layout) from 1 to 2.
+    // `abi::encode` layout) to `CURRENT_ABI_VERSION + 1` so the test
+    // stays useful across future bumps. Stamp the high byte too so
+    // the LE encoding lines up regardless of the literal value.
+    let drift = abi::CURRENT_ABI_VERSION + 1;
+    let drift_lo = (drift & 0xff) as u8;
+    let drift_hi = ((drift >> 8) & 0xff) as u8;
     let bad = rewrite_abi_section(
         &wasm,
         Some(&|payload: &mut [u8]| {
-            payload[5] = 2;
-            payload[6] = 0;
+            payload[5] = drift_lo;
+            payload[6] = drift_hi;
         }),
     );
 
     match WasmModule::from_bytes(bad) {
         Err(LoadError::Abi(AbiError::AbiMismatch { wanted, got })) => {
-            assert_eq!(wanted, 1);
-            assert_eq!(got, 2);
+            assert_eq!(wanted, abi::CURRENT_ABI_VERSION);
+            assert_eq!(got, drift);
         }
         other => panic!("expected LoadError::Abi(AbiMismatch), got {other:?}"),
     }

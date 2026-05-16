@@ -79,8 +79,19 @@ impl IrType {
 /// pointer to the entry. v1.beta only ever populates a single
 /// function (the `#main` body, named `run_main`); the vector form
 /// keeps the data model honest for Phase 2+ multi-function emit.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// Phase 6 adds the `imports` slot: every `#native` declaration in
+/// scope contributes one [`NativeImport`] entry. Codegen emits a
+/// `(import "env" <name> ...)` wasm import per entry **before** any
+/// stdlib / user function so wasm function indices stay stable
+/// (imports first, then stdlib, then user code).
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct Module {
+    /// Host-provided `#native` functions the module needs at
+    /// instantiate time. Each entry becomes one wasm `import` line;
+    /// `Op::CallNative { import_idx }` references the entry by
+    /// position in this vector.
+    pub imports: Vec<NativeImport>,
     /// Lowered functions in declaration order.
     pub funcs: Vec<Func>,
     /// Index into `funcs` of the `#main` entry, when one was lowered.
@@ -89,6 +100,36 @@ pub struct Module {
     /// returning, so the field is informational.
     pub entry_func_index: Option<usize>,
 }
+
+/// One declared `#native` function in the IR module — a host import
+/// the wasm runtime materialises through the `env` module at
+/// instantiate time.
+///
+/// The host SDK validates declared imports against its registered
+/// `Context::functions` table when loading the module; mismatch
+/// surfaces as a load-time error (see `relon-codegen-wasm`'s
+/// `LoadError`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeImport {
+    /// Import name. Must match both the wasm `(import "env" <name>)`
+    /// line and the `relon.host_fns` table entry codegen emits.
+    pub name: String,
+    /// Param types in declaration order. Codegen uses these to
+    /// derive the wasm function signature and to validate
+    /// `Op::CallNative`'s operand discipline.
+    pub param_tys: Vec<IrType>,
+    /// Return type. Single value (no tuples) in v1.
+    pub ret_ty: IrType,
+    /// Capability bit required to invoke this fn. Codegen emits the
+    /// `check_cap` prologue ahead of every `Op::CallNative` whose
+    /// `cap_bit` is anything other than [`NO_CAPABILITY_BIT`].
+    pub cap_bit: u32,
+}
+
+/// Sentinel `cap_bit` meaning "no capability required". Mirrors
+/// `relon-codegen-wasm::host_fns::NO_CAPABILITY` so both crates agree
+/// on the encoding without an explicit cross-dependency.
+pub const NO_CAPABILITY_BIT: u32 = u32::MAX;
 
 /// One lowered function. Stack-based body; locals are addressed by
 /// the function-parameter declaration order index (no separate symbol
@@ -527,5 +568,56 @@ pub enum Op {
     LoadSchemaPtr {
         /// Byte offset of the pointer slot inside the input buffer.
         offset: u32,
+    },
+
+    /// Phase 6 host-fn dispatch.
+    ///
+    /// Invoke a host-provided `#native` function declared in the IR
+    /// module's `imports` table. Pops `param_tys.len()` operands off
+    /// the virtual stack in matching order (last argument pushed
+    /// last) and pushes one value of `ret_ty` back onto the stack.
+    ///
+    /// `import_idx` is the **position** of the matching entry in
+    /// `Module::imports`. Codegen translates the index to the wasm-
+    /// level function index by adding the import-section offset
+    /// (imports always occupy `0..imports.len()` in the combined
+    /// wasm function table). `cap_bit` mirrors the entry's
+    /// `NativeImport::cap_bit`; when it's anything other than
+    /// [`NO_CAPABILITY_BIT`], codegen automatically prepends a
+    /// `check_cap` prologue before the actual `call` so the trap
+    /// fires before the host fn observes any arguments.
+    CallNative {
+        /// Position of the matching entry in `Module::imports`.
+        import_idx: u32,
+        /// Param types expected by the host fn, in declaration order.
+        /// Codegen pops `param_tys.len()` operands off the vstack and
+        /// verifies each one's wasm slot matches the matching entry.
+        param_tys: Vec<IrType>,
+        /// IR type pushed back onto the stack after the call.
+        ret_ty: IrType,
+        /// Capability bit guarding the call. [`NO_CAPABILITY_BIT`]
+        /// means no guard is emitted.
+        cap_bit: u32,
+    },
+
+    /// Phase 6 capability guard.
+    ///
+    /// Emits the wasm sequence
+    /// `global.get $relon_caps_avail; i64.const (1 << cap_bit);
+    /// i64.and; i64.eqz; if; unreachable; end`. The `unreachable`
+    /// trap fires when the requested bit is not set in the host's
+    /// granted bitmap, surfacing as a `CapabilityDenied` runtime
+    /// error after Phase 7 wires the trap-translate path.
+    ///
+    /// Stack effect: `[] -> []`. Normally lowering inlines the check
+    /// into `Op::CallNative` (cheaper to emit + tighter src-map
+    /// locality), but the dedicated op stays available for callers
+    /// that want to assert capability without performing a call —
+    /// e.g. an analyzer that pre-flights a `cap_grants` snapshot.
+    CheckCap {
+        /// Bit position in the `relon_caps_avail` u64 bitmap.
+        /// [`NO_CAPABILITY_BIT`] is a no-op (codegen elides the
+        /// prologue).
+        cap_bit: u32,
     },
 }

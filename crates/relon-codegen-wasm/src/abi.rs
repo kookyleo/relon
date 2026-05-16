@@ -4,14 +4,15 @@
 //! Section 2:
 //!
 //! ```text
-//! payload (76 bytes total):
-//!   magic              = b"RLNA"            (4 bytes)
-//!   format_version     = u8 = 1             (1 byte)
-//!   abi_version        : u16 LE             (2 bytes)
-//!   codegen_version    : u32 LE             (4 bytes)
-//!   main_schema_hash   : [u8; 32]           (32 bytes)
-//!   return_schema_hash : [u8; 32]           (32 bytes)
-//!   flags              : u8                  (1 byte)
+//! payload (84 bytes total):
+//!   magic                  = b"RLNA"            (4 bytes)
+//!   format_version         = u8 = 1             (1 byte)
+//!   abi_version            : u16 LE             (2 bytes)
+//!   codegen_version        : u32 LE             (4 bytes)
+//!   main_schema_hash       : [u8; 32]           (32 bytes)
+//!   return_schema_hash     : [u8; 32]           (32 bytes)
+//!   flags                  : u8                  (1 byte)
+//!   required_capabilities  : u64 LE             (8 bytes)
 //! ```
 //!
 //! Host SDK instantiation flow (per the spec):
@@ -50,7 +51,12 @@ pub const FORMAT_VERSION: u8 = 1;
 /// Current ABI version expected by this codegen / host pair. Bumped
 /// every time the binary handshake layout breaks (e.g. a new tag byte
 /// in the `Option<T>` payload).
-pub const CURRENT_ABI_VERSION: u16 = 1;
+///
+/// Phase 6 bumps from 1 to 2 because [`AbiMetadata`] gained the
+/// `required_capabilities` slot — modules emitted by older codegen
+/// versions can't carry the capability bitset, so host SDKs must
+/// refuse-to-load them rather than silently treat the field as zero.
+pub const CURRENT_ABI_VERSION: u16 = 2;
 
 /// Current codegen version. Advisory marker that bumps for any
 /// observable codegen change so a host can include it in error
@@ -61,7 +67,7 @@ pub const CURRENT_CODEGEN_VERSION: u32 = 0x0001_0000;
 
 /// Total encoded size of an ABI payload in bytes. Matches the layout
 /// laid out at the top of this module.
-pub const PAYLOAD_SIZE: usize = 4 + 1 + 2 + 4 + 32 + 32 + 1;
+pub const PAYLOAD_SIZE: usize = 4 + 1 + 2 + 4 + 32 + 32 + 1 + 8;
 
 /// Parsed / about-to-be-encoded `relon.abi` metadata.
 ///
@@ -87,6 +93,17 @@ pub struct AbiMetadata {
     /// emits `0` and a non-zero value here is a forward-compat
     /// marker the host should pass through, not refuse.
     pub flags: u8,
+    /// Capability bitset the module requires before any `#native`
+    /// import call. Codegen computes this as the OR of every
+    /// `relon.host_fns` entry's `cap_bit`; bit `N` set means the
+    /// module declared a `#native` fn that requires capability `N`.
+    /// Host SDK refuses-to-load when the host's granted bitmap is
+    /// not a superset (`cap_grants & required_capabilities ==
+    /// required_capabilities`). Phase 6 lands the slot uninitialised
+    /// to zero for callers that already build [`AbiMetadata`] by
+    /// hand — `placeholder()` clears it; `compile_module` overwrites
+    /// it with the host-fns table's collected bits.
+    pub required_capabilities: u64,
 }
 
 impl AbiMetadata {
@@ -101,6 +118,7 @@ impl AbiMetadata {
             main_schema_hash: [0u8; 32],
             return_schema_hash: [0u8; 32],
             flags: 0,
+            required_capabilities: 0,
         }
     }
 }
@@ -169,6 +187,7 @@ pub fn encode(meta: &AbiMetadata) -> Vec<u8> {
     out.extend_from_slice(&meta.main_schema_hash);
     out.extend_from_slice(&meta.return_schema_hash);
     out.push(meta.flags);
+    out.extend_from_slice(&meta.required_capabilities.to_le_bytes());
     debug_assert_eq!(out.len(), PAYLOAD_SIZE);
     out
 }
@@ -209,12 +228,17 @@ pub fn decode(bytes: &[u8]) -> Result<AbiMetadata, AbiError> {
 
     let flags = bytes[75];
 
+    let required_capabilities = u64::from_le_bytes([
+        bytes[76], bytes[77], bytes[78], bytes[79], bytes[80], bytes[81], bytes[82], bytes[83],
+    ]);
+
     Ok(AbiMetadata {
         abi_version,
         codegen_version,
         main_schema_hash,
         return_schema_hash,
         flags,
+        required_capabilities,
     })
 }
 
@@ -243,11 +267,12 @@ mod tests {
 
     fn sample_metadata() -> AbiMetadata {
         AbiMetadata {
-            abi_version: 1,
+            abi_version: CURRENT_ABI_VERSION,
             codegen_version: 0x0001_2345,
             main_schema_hash: [0x11u8; 32],
             return_schema_hash: [0x22u8; 32],
             flags: 0,
+            required_capabilities: 0x0000_0000_DEAD_BEEF,
         }
     }
 
@@ -285,16 +310,55 @@ mod tests {
 
     #[test]
     fn abi_mismatch_detected_by_check_versions() {
-        // Decoded metadata with abi_version=2 must surface as
-        // AbiMismatch when validated against the running SDK.
+        // Decoded metadata with an `abi_version` ahead of the SDK
+        // must surface as `AbiMismatch` when validated against the
+        // running SDK. Phase 6 pinned the current version to 2; we
+        // bump the encoded value to `CURRENT_ABI_VERSION + 1` so the
+        // test stays useful across future bumps.
         let mut bytes = encode(&sample_metadata());
+        let drift = CURRENT_ABI_VERSION + 1;
         // abi_version is u16 LE at offset 5..7.
-        bytes[5] = 2;
-        bytes[6] = 0;
+        bytes[5..7].copy_from_slice(&drift.to_le_bytes());
         let meta = decode(&bytes).expect("decode succeeds, version check is separate");
-        assert_eq!(meta.abi_version, 2);
+        assert_eq!(meta.abi_version, drift);
         let err = check_versions(&meta).expect_err("must reject");
-        assert!(matches!(err, AbiError::AbiMismatch { wanted: 1, got: 2 }));
+        assert!(matches!(
+            err,
+            AbiError::AbiMismatch { wanted, got } if wanted == CURRENT_ABI_VERSION && got == drift
+        ));
+    }
+
+    #[test]
+    fn v1_module_rejected_by_v2_host_sdk() {
+        // Phase 6: a wasm module produced by the previous codegen
+        // (`abi_version = 1`) lacks the `required_capabilities`
+        // slot. The host SDK refuses to load such a module because
+        // the binary handshake invariants changed.
+        let mut bytes = encode(&sample_metadata());
+        // Stamp abi_version back to 1.
+        bytes[5..7].copy_from_slice(&1u16.to_le_bytes());
+        let meta = decode(&bytes).expect("decode still succeeds");
+        let err = check_versions(&meta).expect_err("v2 host must reject v1 module");
+        match err {
+            AbiError::AbiMismatch { wanted, got } => {
+                assert_eq!(wanted, CURRENT_ABI_VERSION);
+                assert_eq!(got, 1);
+            }
+            other => panic!("expected AbiMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn required_capabilities_roundtrips() {
+        let mut meta = sample_metadata();
+        meta.required_capabilities = u64::MAX;
+        let bytes = encode(&meta);
+        // Encoded payload size now includes the 8-byte
+        // required_capabilities slot.
+        assert_eq!(bytes.len(), PAYLOAD_SIZE);
+        let decoded = decode(&bytes).expect("decode");
+        assert_eq!(decoded.required_capabilities, u64::MAX);
+        assert_eq!(decoded, meta);
     }
 
     #[test]
@@ -322,6 +386,7 @@ mod tests {
         assert_eq!(meta.main_schema_hash, [0u8; 32]);
         assert_eq!(meta.return_schema_hash, [0u8; 32]);
         assert_eq!(meta.flags, 0);
+        assert_eq!(meta.required_capabilities, 0);
         // Roundtrip the placeholder so the constants encode correctly.
         let bytes = encode(&meta);
         let decoded = decode(&bytes).expect("decode placeholder");
