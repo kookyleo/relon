@@ -17,8 +17,10 @@
 //! `wasm-encoder` + `wasmtime` link in isolation.
 
 pub mod error;
+pub mod srcmap;
 
 pub use error::CodegenError;
+pub use srcmap::{Entry as SrcMapEntry, SrcMap, SrcMapError};
 
 use relon_ir::{IrType, Module as IrModule, Op};
 use wasm_encoder::{
