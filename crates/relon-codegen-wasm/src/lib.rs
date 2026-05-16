@@ -37,7 +37,9 @@ pub mod srcmap;
 
 pub use abi::{AbiError, AbiMetadata};
 pub use error::{CodegenError, LoadError};
-pub use host_fns::{HostFnEntry, HostFnError, HostFnTable, NO_CAPABILITY};
+pub use host_fns::{
+    hash_params, hash_return, HostFnEntry, HostFnError, HostFnTable, NO_CAPABILITY,
+};
 pub use srcmap::{Entry as SrcMapEntry, SrcMap, SrcMapError};
 
 use relon_eval_api::layout::{OffsetTable, SchemaLayout};
@@ -2721,11 +2723,7 @@ fn validate_host_fns(
     supplied: &host_fns::HostFnTable,
 ) -> Result<(), LoadError> {
     for entry in &declared.entries {
-        let Some(supplied_entry) = supplied
-            .entries
-            .iter()
-            .find(|e| e.name == entry.name)
-        else {
+        let Some(supplied_entry) = supplied.entries.iter().find(|e| e.name == entry.name) else {
             return Err(LoadError::MissingHostFn {
                 name: entry.name.clone(),
             });

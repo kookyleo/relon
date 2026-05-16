@@ -1751,6 +1751,7 @@ dependencies = [
  "relon-eval-api",
  "relon-ir",
  "relon-parser",
+ "sha2",
  "thiserror 2.0.18",
  "wasm-encoder 0.249.0",
  "wasmparser 0.249.0",

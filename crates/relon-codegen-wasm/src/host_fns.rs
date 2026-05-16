@@ -5,6 +5,8 @@
 //! load time. See ADR-B (`wasm-adr-B-host-fn-schema-2026-05-16.md`)
 //! for the rationale.
 
+use relon_ir::IrType;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 pub const SECTION_NAME: &str = "relon.host_fns";
@@ -44,6 +46,48 @@ impl HostFnTable {
         }
         bits
     }
+}
+
+/// Canonical 1-byte tag for an [`IrType`]. Stable across host SDK
+/// versions because new `IrType` variants must append rather than
+/// re-use existing bytes — `hash_params` / `hash_return` are part of
+/// the wire format that flows through `relon.host_fns`.
+fn ir_type_tag(ty: IrType) -> u8 {
+    match ty {
+        IrType::I32 => 0x01,
+        IrType::I64 => 0x02,
+        IrType::F64 => 0x03,
+        IrType::Bool => 0x04,
+        IrType::Null => 0x05,
+        IrType::String => 0x06,
+        IrType::ListInt => 0x07,
+    }
+}
+
+/// Compute the canonical sha256 hash of a `#native` fn's parameter
+/// list. Layout: `b"params" || u32 LE count || [u8 tag]*count`. The
+/// fixed `"params"` prefix keeps the params + return hashes distinct
+/// even when their tag bytes happen to coincide (an empty params
+/// list versus an empty return — return is always one value, but the
+/// prefix prevents future surprises).
+pub fn hash_params(param_tys: &[IrType]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"params");
+    hasher.update((param_tys.len() as u32).to_le_bytes());
+    for ty in param_tys {
+        hasher.update([ir_type_tag(*ty)]);
+    }
+    hasher.finalize().into()
+}
+
+/// Compute the canonical sha256 hash of a `#native` fn's return
+/// type. Layout: `b"return" || [u8 tag]`. Mirrors [`hash_params`]
+/// so drift on either side surfaces independently.
+pub fn hash_return(ret_ty: IrType) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"return");
+    hasher.update([ir_type_tag(ret_ty)]);
+    hasher.finalize().into()
 }
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
