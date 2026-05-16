@@ -29,4 +29,7 @@ pub use lowering::{
     MAIN_RETURN_SCHEMA_NAME, RETURN_VALUE_FIELD_NAME, WASM_LOCAL_IN_LEN, WASM_LOCAL_IN_PTR,
     WASM_LOCAL_OUT_CAP, WASM_LOCAL_OUT_PTR,
 };
-pub use stdlib::{builtin_stdlib, stdlib_function_count, stdlib_function_index, StdlibFunction};
+pub use stdlib::{
+    builtin_stdlib, stdlib_function_count, stdlib_function_index, stdlib_method_index,
+    StdlibFunction,
+};
