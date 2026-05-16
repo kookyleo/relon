@@ -1068,24 +1068,42 @@ impl Evaluator {
                 // attribution table).
                 let mut result: Vec<Value> = Vec::with_capacity(items.len());
                 // Intern the loop variable name once: each iteration
-                // rebinds it under a fresh child scope, so without this
+                // rebinds it under the same outer scope, so without this
                 // hoist we were paying one `String::clone` (malloc +
                 // memcpy) per element. After interning, the inner loop
-                // only bumps an `Arc` refcount per element — the
-                // `with_local` call below feeds the cloned `Arc` into
-                // the child scope's bindings table, which is the only
-                // HashMap allocation that survives this loop body.
+                // only bumps an `Arc` refcount per element.
                 let id_arc: Arc<str> = Arc::from(id.as_str());
-                for item in items.iter() {
-                    let iter_scope = current_scope.with_local(Arc::clone(&id_arc), item.clone());
+                // Build the iter-loop frame ONCE outside the body loop.
+                // Previously each iteration called `with_local`, which
+                // allocated a fresh `Arc<Scope>` per element — the
+                // 48 MB / 200 K-block hot site flagged by P1-B's
+                // diagnostic correction. `with_iter_loop` reuses one
+                // frame; `set_iter_binding` refreshes the binding via a
+                // single Mutex peek + Value clone per element. Closure
+                // construction inside the body snapshots the binding
+                // via `Scope::current_iter_binding` (handled in the
+                // `Expr::Closure` branch) so lexical-capture semantics
+                // hold even though the frame is mutated.
+                //
+                // `materialize_iterable` returns a `Cow` borrowed from
+                // the input list when possible; we still need an
+                // `elements` vec of thunks for the `&prev` / `&next`
+                // pathway. For comprehensions over an `Iter`-branded
+                // value the thunks aren't actually used today —
+                // `&prev` / `&next` only fire inside list literals —
+                // so an empty `elements` vec is the cheapest stand-in
+                // and keeps the API uniform.
+                let outer_scope = current_scope.with_iter_loop(Vec::new());
+                for (i, item) in items.iter().enumerate() {
+                    outer_scope.set_iter_binding(Arc::clone(&id_arc), item.clone(), i);
 
                     let should_include = if let Some(cond) = condition {
-                        self.eval(cond, &iter_scope)?.is_truthy()
+                        self.eval(cond, &outer_scope)?.is_truthy()
                     } else {
                         true
                     };
                     if should_include {
-                        result.push(self.eval(element, &iter_scope)?);
+                        result.push(self.eval(element, &outer_scope)?);
                     }
                 }
                 let result = Value::list(result);
@@ -1102,11 +1120,25 @@ impl Evaluator {
                 body,
             } => {
                 let param_names = params.iter().map(|p| p.name.clone()).collect();
-                let captured_env = if scope.path_node.is_some() {
+                let base_env = if scope.path_node.is_some() {
                     scope.parent.clone().unwrap_or_else(|| Arc::clone(scope))
                 } else {
                     Arc::clone(scope)
                 };
+                // Lexical-capture safety: when the closure is constructed
+                // inside a comprehension hot loop, the visible `for x in
+                // xs` binding lives in a shared, mutable `iter_binding`
+                // slot on `list_context`. If we captured the outer scope
+                // by `Arc` only, the *next* iteration would clobber the
+                // value the closure was meant to remember. Snapshot it
+                // into a plain `with_local` child so the closure sees the
+                // bound value the loop body saw at construction time.
+                //
+                // Also walk up the parent chain — nested comprehensions
+                // (`[[y for y in ys] for x in xs]`) park each `for` on
+                // its own `list_context`, and outer bindings need
+                // snapshotting too.
+                let captured_env = snapshot_iter_bindings(&base_env);
 
                 Ok(Value::Closure {
                     params: param_names,
@@ -2667,6 +2699,43 @@ impl Evaluator {
 /// the pre-Stage-0 behavior so single-file consumers (tests that
 /// build a `Context` directly without a workspace, ad-hoc embeddings)
 /// keep working.
+/// Walk the parent chain collecting every active comprehension iter
+/// binding, then materialize them into a `with_local`-style snapshot
+/// scope. Returns `base` unchanged when no iter bindings are visible
+/// — the common "closure defined outside any for-loop" case stays a
+/// pure `Arc::clone`, no allocation.
+///
+/// Why per-walk: nested comprehensions (`[[y for y in ys] for x in xs]`)
+/// place each `for` on its own `list_context`. A closure constructed in
+/// the inner body needs to remember both `x` and `y` — only the inner
+/// `list_context` is reachable via the most recent scope, so we have to
+/// walk up to find outer bindings parked on ancestor scopes.
+fn snapshot_iter_bindings(base: &Arc<Scope>) -> Arc<Scope> {
+    let mut snapshot: Option<HashMap<Arc<str>, Value>> = None;
+    let mut visited: std::collections::HashSet<*const Scope> = std::collections::HashSet::new();
+    let mut current = Some(base.clone());
+    while let Some(scope) = current {
+        // Guard against cycles: parent chains in this codebase are
+        // tree-shaped, but `RootRef::parent_fallback` can introduce a
+        // cross-link in closure-call scopes. A visited-set is the
+        // cheapest belt-and-suspenders.
+        if !visited.insert(Arc::as_ptr(&scope)) {
+            break;
+        }
+        if let Some((name, value)) = scope.current_iter_binding() {
+            let map = snapshot.get_or_insert_with(HashMap::new);
+            // Outer (later-visited) bindings must NOT overwrite an
+            // inner binding of the same name — Rust-like shadowing.
+            map.entry(name).or_insert(value);
+        }
+        current = scope.parent.clone();
+    }
+    match snapshot {
+        Some(locals) if !locals.is_empty() => base.with_locals(locals),
+        _ => Arc::clone(base),
+    }
+}
+
 fn fallback_parse_analyze(
     source: &ModuleSource,
     range: TokenRange,

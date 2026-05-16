@@ -11,9 +11,59 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 /// Iteration context for `&prev` / `&next` / `&index` references inside a list.
+///
+/// Serves two scenarios:
+/// 1. Plain list-literal iteration (`&prev` / `&next` / `&index`) — built by
+///    [`Scope::with_list_context`]. Each element runs under its own child
+///    scope with a fixed `index`; `iter_binding` is always `None`.
+/// 2. Comprehension hot loop (`for x in xs`) — built once by
+///    [`Scope::with_iter_loop`], then the body reuses the same `Arc<Scope>`
+///    across all iterations. [`Scope::set_iter_binding`] refreshes
+///    `iter_binding` + `index` in place per element, eliminating the
+///    `Arc::new(Self {...})` per element flagged by the P1-B diagnostic
+///    correction (48 MB / 200 K blocks). `iter_binding` is `Mutex`-wrapped
+///    so `Scope` stays `Send + Sync` without unsafe interior mutability.
 pub struct ListContext {
-    pub index: usize,
+    pub index: Mutex<usize>,
     pub elements: Vec<Arc<Thunk>>,
+    /// Current named-iteration binding `(name, value)`. `None` for plain
+    /// list iteration. Comprehension hot loops fill this in once per
+    /// element via a lock + write (no allocation, no frame rebuild).
+    ///
+    /// Semantic invariant: when a `Closure` value is constructed inside a
+    /// loop body, the constructor MUST snapshot the current binding into
+    /// `captured_env` (see the `Expr::Closure` branch in `eval.rs`).
+    /// Otherwise a later iteration would mutate the binding the closure
+    /// was meant to capture, breaking lexical-snapshot semantics.
+    pub iter_binding: Mutex<Option<(Arc<str>, Value)>>,
+}
+
+impl ListContext {
+    /// Plain `&prev` / `&next` / `&index` scenario: fixed index, no
+    /// iter binding.
+    pub(crate) fn fixed(index: usize, elements: Vec<Arc<Thunk>>) -> Self {
+        Self {
+            index: Mutex::new(index),
+            elements,
+            iter_binding: Mutex::new(None),
+        }
+    }
+
+    /// Comprehension hot loop entry: starts at index 0 with an empty
+    /// binding slot. [`Scope::set_iter_binding`] fills it per element.
+    pub(crate) fn empty(elements: Vec<Arc<Thunk>>) -> Self {
+        Self {
+            index: Mutex::new(0),
+            elements,
+            iter_binding: Mutex::new(None),
+        }
+    }
+
+    /// Read the current iteration index — used by `&index` / `&prev` /
+    /// `&next`.
+    pub fn current_index(&self) -> usize {
+        *self.index.lock().unwrap()
+    }
 }
 
 /// Anchor for `&root` lookups in a [`Scope`].
@@ -116,7 +166,10 @@ impl std::fmt::Debug for Scope {
             .field("current_dir", &self.current_dir)
             .field("cache_namespace", &self.cache_namespace)
             .field("has_root_ref", &self.root_ref.is_some())
-            .field("index", &self.list_context.as_ref().map(|c| c.index))
+            .field(
+                "index",
+                &self.list_context.as_ref().map(|c| c.current_index()),
+            )
             .finish()
     }
 }
@@ -138,7 +191,20 @@ impl Clone for Scope {
 
 impl Scope {
     /// Look up `name` in this scope's locals, walking up `parent` chain.
+    ///
+    /// Hot path optimization: before the HashMap lookup, peek at
+    /// `list_context.iter_binding`. Comprehension hot loops park the
+    /// active `for x in xs` binding there (no HashMap allocation per
+    /// element), so `x` resolves with a single Mutex peek instead of
+    /// going through `locals`.
     pub fn get_local(&self, name: &str) -> Option<Value> {
+        if let Some(ctx) = &self.list_context {
+            if let Some((bound_name, bound_val)) = ctx.iter_binding.lock().unwrap().as_ref() {
+                if bound_name.as_ref() == name {
+                    return Some(bound_val.clone());
+                }
+            }
+        }
         if let Some(v) = self.locals.lock().unwrap().get(name) {
             Some(v.clone())
         } else if let Some(parent) = &self.parent {
@@ -146,6 +212,16 @@ impl Scope {
         } else {
             None
         }
+    }
+
+    /// Snapshot the active iter binding, if any, into a `(name, value)`
+    /// pair. Closure construction calls this so the captured environment
+    /// holds a value, not a pointer into a mutable iter slot that a
+    /// later iteration would clobber.
+    pub fn current_iter_binding(&self) -> Option<(Arc<str>, Value)> {
+        self.list_context
+            .as_ref()
+            .and_then(|c| c.iter_binding.lock().unwrap().clone())
     }
 
     pub(crate) fn get_thunk(&self, name: &str) -> Option<Arc<Thunk>> {
@@ -281,8 +357,46 @@ impl Scope {
         let mut child = self.child();
         let unique = Arc::get_mut(&mut child).expect("freshly built child has no aliases");
         unique.path_node = Some(index.to_string());
-        unique.list_context = Some(Arc::new(ListContext { index, elements }));
+        unique.list_context = Some(Arc::new(ListContext::fixed(index, elements)));
         child
+    }
+
+    /// Open the outer frame for a comprehension's hot loop.
+    ///
+    /// Unlike [`Scope::with_list_context`], this builds the frame *once*
+    /// per comprehension. The caller then drives the loop with
+    /// [`Scope::set_iter_binding`] which updates the binding + index in
+    /// place — no per-element `Arc<Scope>` allocation, eliminating the
+    /// 48 MB / 200 K-block hot site flagged by P1-B.
+    ///
+    /// Note: the returned `Arc<Scope>` is mutated through the inner
+    /// `Mutex`es on `ListContext`. Callers must NOT alias this scope as
+    /// a closure's captured environment without first snapshotting the
+    /// binding via [`Scope::current_iter_binding`] (see the `Expr::Closure`
+    /// branch in `eval.rs`).
+    pub fn with_iter_loop(self: &Arc<Self>, elements: Vec<Arc<Thunk>>) -> Arc<Self> {
+        let mut child = self.child();
+        let unique = Arc::get_mut(&mut child).expect("freshly built child has no aliases");
+        // `path_node` is set per-iteration by `set_iter_binding` so the
+        // synthesized full_path() still reads the right segment for any
+        // host-side debug formatting that walks it mid-iteration.
+        unique.list_context = Some(Arc::new(ListContext::empty(elements)));
+        child
+    }
+
+    /// Refresh the named iter binding + index on a comprehension outer
+    /// frame previously built by [`Scope::with_iter_loop`].
+    ///
+    /// O(1): one Mutex lock and one `Value` clone — no heap allocation
+    /// for the scope frame itself. The path node is rewritten too so
+    /// `full_path()` reports the right segment if the body asks for it.
+    pub fn set_iter_binding(&self, name: Arc<str>, value: Value, index: usize) {
+        let ctx = self
+            .list_context
+            .as_ref()
+            .expect("set_iter_binding called on a scope without an iter loop");
+        *ctx.iter_binding.lock().unwrap() = Some((name, value));
+        *ctx.index.lock().unwrap() = index;
     }
 }
 

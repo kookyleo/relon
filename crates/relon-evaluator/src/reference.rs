@@ -228,7 +228,7 @@ impl Evaluator {
                         range,
                     )
                 })?;
-                return Ok(Value::Int(context.index as i64));
+                return Ok(Value::Int(context.current_index() as i64));
             }
             RefBase::Prev => {
                 let context = scope.list_context.as_ref().ok_or_else(|| {
@@ -237,10 +237,11 @@ impl Evaluator {
                         range,
                     )
                 })?;
-                if context.index == 0 {
+                let cur_index = context.current_index();
+                if cur_index == 0 {
                     return Ok(Value::Null);
                 }
-                let target_index = context.index - 1;
+                let target_index = cur_index - 1;
                 let thunk = context.elements.get(target_index).unwrap();
                 let target_scope = self.list_element_scope(&thunk.scope, context, target_index);
                 let val = self.force_thunk_with_scope(thunk, &target_scope)?;
@@ -253,10 +254,11 @@ impl Evaluator {
                         range,
                     )
                 })?;
-                if context.index + 1 >= context.elements.len() {
+                let cur_index = context.current_index();
+                if cur_index + 1 >= context.elements.len() {
                     return Ok(Value::Null);
                 }
-                let target_index = context.index + 1;
+                let target_index = cur_index + 1;
                 let thunk = context.elements.get(target_index).unwrap();
                 let target_scope = self.list_element_scope(&thunk.scope, context, target_index);
                 let val = self.force_thunk_with_scope(thunk, &target_scope)?;
@@ -411,10 +413,7 @@ impl Evaluator {
             current_dir: base.current_dir.clone(),
             cache_namespace: base.cache_namespace.clone(),
             root_ref: base.root_ref.clone(),
-            list_context: Some(Arc::new(ListContext {
-                index,
-                elements: context.elements.clone(),
-            })),
+            list_context: Some(Arc::new(ListContext::fixed(index, context.elements.clone()))),
             thunks: Mutex::new(base.thunks.lock().unwrap().clone()),
         })
     }
