@@ -211,6 +211,12 @@ fn build_main_params_schema(sig: &MainSignature) -> Result<Schema, LoweringError
 
 /// Synthesise the [`MAIN_RETURN_SCHEMA_NAME`] canonical schema with a
 /// single `value` field carrying the declared return type.
+///
+/// Phase 2.c keeps the return surface narrow — `String` / `List<Int>`
+/// returns require the wasm side to allocate tail-area bytes in the
+/// `out_buf`, which the current codegen doesn't model. They're
+/// rejected here so the diagnostic surfaces at the lowering phase
+/// rather than as a confusing codegen-side store-type error.
 fn build_main_return_schema(sig: &MainSignature) -> Result<Schema, LoweringError> {
     let rt = sig
         .return_type
@@ -223,6 +229,18 @@ fn build_main_return_schema(sig: &MainSignature) -> Result<Schema, LoweringError
         type_name: type_head_for_display(rt),
         range: rt.range,
     })?;
+    // Belt-and-braces: refuse a pointer-indirect return type up
+    // front. The Phase 2.c `StoreField` path only knows how to
+    // serialise inline scalars, so a String / List<Int> return
+    // would otherwise fail later with `UnsupportedStoreFieldType`
+    // — surfacing as `UnsupportedTypeInMain` gives the caller a
+    // more actionable message.
+    if matches!(ty, TypeRepr::String | TypeRepr::List { .. }) {
+        return Err(LoweringError::UnsupportedTypeInMain {
+            type_name: type_head_for_display(rt),
+            range: rt.range,
+        });
+    }
     Ok(Schema {
         name: MAIN_RETURN_SCHEMA_NAME.to_string(),
         generics: vec![],
@@ -234,17 +252,38 @@ fn build_main_return_schema(sig: &MainSignature) -> Result<Schema, LoweringError
     })
 }
 
-/// Map a parser [`TypeNode`] to a canonical [`TypeRepr`]. Phase 2.b
-/// only supports the four scalar leaves.
+/// Map a parser [`TypeNode`] to a canonical [`TypeRepr`].
+///
+/// Phase 2.c surface:
+///   * `Int` / `Float` / `Bool` / `Null` — the v1 scalar leaves.
+///   * `String` — pointer-indirect leaf.
+///   * `List<Int>` — pointer-indirect leaf with i64 elements. Other
+///     list element types still return `None` so the schema build
+///     rejects them with `UnsupportedTypeInMain`.
 fn type_node_to_canonical(t: &TypeNode) -> Option<TypeRepr> {
-    if t.path.len() != 1 || !t.generics.is_empty() || t.variant_fields.is_some() {
+    if t.path.len() != 1 || t.variant_fields.is_some() {
         return None;
     }
-    match t.path[0].as_str() {
-        "Int" => Some(TypeRepr::Int),
-        "Float" => Some(TypeRepr::Float),
-        "Bool" => Some(TypeRepr::Bool),
-        "Null" => Some(TypeRepr::Null),
+    let head = t.path[0].as_str();
+    match (head, t.generics.as_slice()) {
+        ("Int", []) => Some(TypeRepr::Int),
+        ("Float", []) => Some(TypeRepr::Float),
+        ("Bool", []) => Some(TypeRepr::Bool),
+        ("Null", []) => Some(TypeRepr::Null),
+        ("String", []) => Some(TypeRepr::String),
+        ("List", [elem]) => {
+            // Phase 2.c only opens `List<Int>`; everything else
+            // stays out of the surface so the layout pass doesn't
+            // have to model String / Float / Bool element tail areas.
+            let inner = type_node_to_canonical(elem)?;
+            if matches!(inner, TypeRepr::Int) {
+                Some(TypeRepr::List {
+                    element: Box::new(inner),
+                })
+            } else {
+                None
+            }
+        }
         _ => None,
     }
 }
@@ -258,8 +297,13 @@ fn type_repr_to_ir_type(t: &TypeRepr) -> Result<IrType, LoweringError> {
         TypeRepr::Float => Ok(IrType::F64),
         TypeRepr::Bool => Ok(IrType::Bool),
         TypeRepr::Null => Ok(IrType::Null),
-        // Composite types are rejected upstream during schema build;
-        // this branch fires only for a directly hand-crafted IR.
+        TypeRepr::String => Ok(IrType::String),
+        TypeRepr::List { element } if matches!(element.as_ref(), TypeRepr::Int) => {
+            Ok(IrType::ListInt)
+        }
+        // Composite / list-of-other types are rejected upstream
+        // during schema build; this branch fires only for a directly
+        // hand-crafted IR.
         _ => Err(LoweringError::UnsupportedTypeInMain {
             type_name: format!("{t:?}"),
             range: TokenRange::default(),
@@ -330,6 +374,51 @@ fn lower_expr(
     tstack: &mut Vec<IrType>,
 ) -> Result<(), LoweringError> {
     match expr {
+        Expr::Bool(b) => {
+            // Bool literals lower to `i32.const 0/1` — IR-side we
+            // surface them as `ConstI64(0|1)` plus a Bool tag would be
+            // overkill; we instead use ConstI64 with a Bool wrapping
+            // by going through ConstI64 + i32 reinterpretation. The
+            // simplest stable representation is `Op::ConstI64(0|1)`
+            // promoted to `Bool` via an inserted equality, but that
+            // doubles op count. Instead use a dedicated Bool literal
+            // path: `Op::ConstI64(0|1)` and immediately mark the
+            // virtual-stack type as `Bool` — codegen materialises it
+            // as `i64.const`, which then never participates in
+            // arithmetic (we'd have rejected it). To avoid an i64
+            // appearing on the wasm stack where an i32 is expected,
+            // we route Bool through a dedicated low-cost shape: an
+            // `If`-less constant. Since Phase 2.c only ever uses
+            // Bool literals as a comparison operand or as a body
+            // arm of an `if`, this would be invalid wasm — so we
+            // instead emit `Op::ConstI64(0|1)` but require the
+            // surrounding context to lift it. Lift via the `If`
+            // result-type — no extra plumbing needed.
+            //
+            // Simpler: emit an `i32.const` by reusing the existing
+            // `Op::ConstI64` constructor would push the wrong wasm
+            // type. Lowering bools as `if true { ... }` style is
+            // out of scope until we add `Op::ConstI32`. For now,
+            // reject bare Bool literal usage outside as an `if`
+            // branch — the bodies of `if` carry the Bool literal
+            // through as a one-op leaf, so the codegen lifts via
+            // the If's BlockType::Result.
+            //
+            // ...but we need the simpler "Bool literal anywhere"
+            // path to support `if true { 1 } else { 0 }` style
+            // expressions. Lower as `i64.const 0/1` and tag as
+            // `IrType::I64`; the surrounding context will emit a
+            // comparison if it needs a Bool. Since this phase's
+            // only Bool-literal consumer is the if branches whose
+            // result type is the **non-Bool** value, we don't
+            // actually hit this issue for the smoke tests. Defer
+            // proper Bool-literal handling — currently rejected.
+            let _ = b;
+            Err(LoweringError::UnsupportedExpr {
+                kind: "Bool".to_string(),
+                range,
+            })
+        }
         Expr::Int(i) => {
             out.push(TaggedOp {
                 op: Op::ConstI64(*i),
@@ -347,42 +436,175 @@ fn lower_expr(
             Ok(())
         }
         Expr::Variable(path) => lower_variable(path, range, locals, out, tstack),
-        Expr::Binary(op, lhs, rhs) => {
-            let ir_op_ctor = arithmetic_op_ctor(*op)
-                .ok_or(LoweringError::UnsupportedOperator { op: *op, range })?;
-            lower_expr(&lhs.expr, lhs.range, locals, out, tstack)?;
-            lower_expr(&rhs.expr, rhs.range, locals, out, tstack)?;
-            let rhs_ty = tstack
-                .pop()
-                .ok_or(LoweringError::UnsupportedOperator { op: *op, range })?;
-            let lhs_ty = tstack
-                .pop()
-                .ok_or(LoweringError::UnsupportedOperator { op: *op, range })?;
-            if lhs_ty != rhs_ty {
-                return Err(LoweringError::UnsupportedOperator { op: *op, range });
-            }
-            // Only Int / Float pairs support arithmetic. Bool / Null
-            // / I32 here would be a stage upstream rejecting a body
-            // that the analyzer should have caught; we double-check
-            // so a hand-crafted IR can't sneak through.
-            if !matches!(lhs_ty, IrType::I64 | IrType::F64) {
-                return Err(LoweringError::UnsupportedOperator { op: *op, range });
-            }
-            // Mod on F64 is unsupported (wasm has no `f64.rem`).
-            if lhs_ty == IrType::F64 && matches!(op, Operator::Mod) {
-                return Err(LoweringError::UnsupportedOperator { op: *op, range });
-            }
-            out.push(TaggedOp {
-                op: ir_op_ctor(lhs_ty),
-                range,
-            });
-            tstack.push(lhs_ty);
-            Ok(())
+        Expr::Binary(op, lhs, rhs) => lower_binary(*op, lhs, rhs, range, locals, out, tstack),
+        Expr::Ternary { cond, then, els } => {
+            lower_ternary(cond, then, els, range, locals, out, tstack)
         }
         _ => Err(LoweringError::UnsupportedExpr {
             kind: expr.kind().to_string(),
             range,
         }),
+    }
+}
+
+/// Lower one binary expression. Splits the arithmetic + comparison
+/// paths so each surface keeps its rejection rules explicit.
+fn lower_binary(
+    op: Operator,
+    lhs: &Node,
+    rhs: &Node,
+    range: TokenRange,
+    locals: &[LocalBinding],
+    out: &mut Vec<TaggedOp>,
+    tstack: &mut Vec<IrType>,
+) -> Result<(), LoweringError> {
+    if let Some(ir_op_ctor) = arithmetic_op_ctor(op) {
+        lower_expr(&lhs.expr, lhs.range, locals, out, tstack)?;
+        lower_expr(&rhs.expr, rhs.range, locals, out, tstack)?;
+        let rhs_ty = tstack
+            .pop()
+            .ok_or(LoweringError::UnsupportedOperator { op, range })?;
+        let lhs_ty = tstack
+            .pop()
+            .ok_or(LoweringError::UnsupportedOperator { op, range })?;
+        if lhs_ty != rhs_ty {
+            return Err(LoweringError::UnsupportedOperator { op, range });
+        }
+        // Only Int / Float pairs support arithmetic.
+        if !matches!(lhs_ty, IrType::I64 | IrType::F64) {
+            return Err(LoweringError::UnsupportedOperator { op, range });
+        }
+        // Mod on F64 is unsupported (wasm has no `f64.rem`).
+        if lhs_ty == IrType::F64 && matches!(op, Operator::Mod) {
+            return Err(LoweringError::UnsupportedOperator { op, range });
+        }
+        out.push(TaggedOp {
+            op: ir_op_ctor(lhs_ty),
+            range,
+        });
+        tstack.push(lhs_ty);
+        return Ok(());
+    }
+    if let Some(cmp_ctor) = comparison_op_ctor(op) {
+        lower_expr(&lhs.expr, lhs.range, locals, out, tstack)?;
+        lower_expr(&rhs.expr, rhs.range, locals, out, tstack)?;
+        let rhs_ty = tstack
+            .pop()
+            .ok_or(LoweringError::UnsupportedOperator { op, range })?;
+        let lhs_ty = tstack
+            .pop()
+            .ok_or(LoweringError::UnsupportedOperator { op, range })?;
+        if lhs_ty != rhs_ty {
+            return Err(LoweringError::UnsupportedOperator { op, range });
+        }
+        // Phase 2.c supports comparisons on Int / Float / Bool /
+        // Null. Bool / Null only support `==` / `!=`; ordering
+        // (`<`, `<=`, `>`, `>=`) is rejected at the comparison
+        // codegen layer too, but we surface it here as a lowering
+        // error so the message stays user-facing.
+        match (lhs_ty, op) {
+            (IrType::I64 | IrType::F64, _) => {}
+            (IrType::Bool, Operator::Eq | Operator::Ne) => {}
+            (IrType::Null, Operator::Eq | Operator::Ne) => {}
+            _ => return Err(LoweringError::UnsupportedOperator { op, range }),
+        }
+        out.push(TaggedOp {
+            op: cmp_ctor(lhs_ty),
+            range,
+        });
+        tstack.push(IrType::Bool);
+        return Ok(());
+    }
+    Err(LoweringError::UnsupportedOperator { op, range })
+}
+
+/// Lower a ternary `cond ? then : els` into `Op::If`. The branches
+/// must agree on the IR type they push; the condition must lower to
+/// `IrType::Bool`.
+fn lower_ternary(
+    cond: &Node,
+    then: &Node,
+    els: &Node,
+    range: TokenRange,
+    locals: &[LocalBinding],
+    out: &mut Vec<TaggedOp>,
+    tstack: &mut Vec<IrType>,
+) -> Result<(), LoweringError> {
+    // Lower the condition in the outer tstack so a body like
+    // `(a > 0) ? ... : ...` accurately reports its Bool result.
+    lower_expr(&cond.expr, cond.range, locals, out, tstack)?;
+    let cond_ty = tstack.pop().ok_or(LoweringError::UnsupportedExpr {
+        kind: "Ternary(cond)".to_string(),
+        range,
+    })?;
+    if cond_ty != IrType::Bool {
+        return Err(LoweringError::IfConditionNotBool {
+            got: cond_ty,
+            range,
+        });
+    }
+    // Lower each branch into its own sub-stream + isolated tstack so
+    // an inner expression spilling extra values onto the stack is
+    // caught here rather than leaking into the outer body.
+    let mut then_ops: Vec<TaggedOp> = Vec::new();
+    let mut then_stack: Vec<IrType> = Vec::new();
+    lower_expr(
+        &then.expr,
+        then.range,
+        locals,
+        &mut then_ops,
+        &mut then_stack,
+    )?;
+    if then_stack.len() != 1 {
+        return Err(LoweringError::UnsupportedExpr {
+            kind: format!("Ternary(then-stack={})", then_stack.len()),
+            range,
+        });
+    }
+    let then_ty = then_stack[0];
+
+    let mut else_ops: Vec<TaggedOp> = Vec::new();
+    let mut else_stack: Vec<IrType> = Vec::new();
+    lower_expr(&els.expr, els.range, locals, &mut else_ops, &mut else_stack)?;
+    if else_stack.len() != 1 {
+        return Err(LoweringError::UnsupportedExpr {
+            kind: format!("Ternary(else-stack={})", else_stack.len()),
+            range,
+        });
+    }
+    let else_ty = else_stack[0];
+
+    if then_ty != else_ty {
+        return Err(LoweringError::IfBranchTypeMismatch {
+            then_ty,
+            else_ty,
+            range,
+        });
+    }
+    let result_ty = then_ty;
+    out.push(TaggedOp {
+        op: Op::If {
+            result_ty,
+            then_body: then_ops,
+            else_body: else_ops,
+        },
+        range,
+    });
+    tstack.push(result_ty);
+    Ok(())
+}
+
+/// Map a parser comparison `Operator` to the matching IR op
+/// constructor. Returns `None` for non-comparison ops.
+fn comparison_op_ctor(op: Operator) -> Option<fn(IrType) -> Op> {
+    match op {
+        Operator::Eq => Some(Op::Eq),
+        Operator::Ne => Some(Op::Ne),
+        Operator::Lt => Some(Op::Lt),
+        Operator::Le => Some(Op::Le),
+        Operator::Gt => Some(Op::Gt),
+        Operator::Ge => Some(Op::Ge),
+        _ => None,
     }
 }
 
@@ -429,13 +651,22 @@ fn lower_variable(
             range,
         }
     })?;
-    out.push(TaggedOp {
-        op: Op::LoadField {
+    // Pointer-indirect leaves (`String` / `ListInt`) get their own op
+    // tag so a later phase can hang String / List operations off them
+    // without re-deriving the type from the slot.
+    let op = match binding.ty {
+        IrType::String => Op::LoadStringPtr {
+            offset: binding.offset,
+        },
+        IrType::ListInt => Op::LoadListIntPtr {
+            offset: binding.offset,
+        },
+        _ => Op::LoadField {
             offset: binding.offset,
             ty: binding.ty,
         },
-        range,
-    });
+    };
+    out.push(TaggedOp { op, range });
     tstack.push(binding.ty);
     Ok(())
 }
