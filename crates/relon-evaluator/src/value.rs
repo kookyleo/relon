@@ -79,6 +79,39 @@ pub struct SchemaField {
     pub default_value: Option<Value>,
 }
 
+/// Inline payload for `Value::Closure`, boxed out of the enum so the
+/// `Value` discriminant width is governed by the cheap variants. The
+/// closure body (`Node`) plus captured scope dwarf the other variants
+/// by tens of bytes — keeping them inline widens every `Value` on the
+/// stack, every HashMap bucket holding `Value`, and every list slot.
+#[derive(Debug, Clone)]
+pub struct ClosureData {
+    pub params: Vec<String>,
+    pub body: Node,
+    pub captured_env: Arc<Scope>,
+}
+
+/// Inline payload for `Value::Schema`, boxed for the same reason as
+/// [`ClosureData`]: the inner `HashMap<String, SchemaField>` keeps a
+/// raw-table header that pushes the enum width into the >100-byte
+/// range when stored inline.
+#[derive(Debug, Clone)]
+pub struct SchemaData {
+    pub generics: Vec<String>,
+    pub fields: std::collections::HashMap<String, SchemaField>,
+}
+
+/// Inline payload for `Value::EnumSchema`, boxed for the same reason:
+/// the nested `HashMap<String, HashMap<String, SchemaField>>` is the
+/// largest variant we hold today, and box-indirection collapses it to
+/// a single pointer in the enum layout.
+#[derive(Debug, Clone)]
+pub struct EnumSchemaData {
+    pub name: String,
+    pub generics: Vec<String>,
+    pub variants: std::collections::HashMap<String, std::collections::HashMap<String, SchemaField>>,
+}
+
 /// Aggregate value type produced by the evaluator.
 ///
 /// `List` and `Dict` payloads are reference-counted: cloning a `Value::List`
@@ -89,6 +122,13 @@ pub struct SchemaField {
 /// because the evaluator caches resolved paths and module results in shared
 /// `path_cache`/`module_cache` maps; without `Arc`-sharing every cache hit
 /// would deep-clone the cached structure.
+///
+/// The "heavy" variants (`Closure`, `Schema`, `EnumSchema`) are boxed so
+/// the enum stays narrow: the comprehension hot loop stores `Value`s in
+/// per-iteration scope HashMaps, and the bucket size scales with the enum
+/// width. Boxing trades one allocation at construction (already a cold
+/// path: closures / schemas materialise once and are reused) for a much
+/// cheaper hash table grow path on every iteration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum Value {
@@ -99,31 +139,25 @@ pub enum Value {
     String(String),
     List(Arc<Vec<Value>>),
     Dict(Arc<ValueDict>),
-    /// A unified closure (can be used as a function or a decorator)
+    /// A unified closure (can be used as a function or a decorator).
+    /// Payload is boxed; see [`ClosureData`].
     #[serde(skip)]
-    Closure {
-        params: Vec<String>,
-        body: Node,
-        captured_env: Arc<Scope>,
-    },
-    /// A user-defined type schema: generic params and Key -> SchemaField map
+    Closure(Box<ClosureData>),
+    /// A user-defined type schema. Payload is boxed; see [`SchemaData`].
     #[serde(skip)]
-    Schema {
-        generics: Vec<String>,
-        fields: std::collections::HashMap<String, SchemaField>,
-    },
+    Schema(Box<SchemaData>),
     /// A tagged-enum (sum-type) schema: variants by name, each with its
     /// own field set. Built from `#schema Name: Enum<Var1 { ... }, ...>`.
     /// Construction with `Name.Var1 { ... }` is dispatched via this value.
+    /// Payload is boxed; see [`EnumSchemaData`].
     #[serde(skip)]
-    EnumSchema {
-        name: String,
-        generics: Vec<String>,
-        variants: std::collections::HashMap<String, std::collections::HashMap<String, SchemaField>>,
-    },
-    /// A single type description
+    EnumSchema(Box<EnumSchemaData>),
+    /// A single type description. The payload (`TypeNode`) carries a
+    /// `TokenRange` plus a `Vec<TypeNode>` of generics that together push
+    /// the inline size past 100 bytes; boxing keeps the enum compact
+    /// (matching the rationale for [`ClosureData`] et al.).
     #[serde(skip)]
-    Type(relon_parser::TypeNode),
+    Type(Box<relon_parser::TypeNode>),
     /// A wildcard predicate (*)
     Wildcard,
 }
@@ -138,22 +172,15 @@ impl PartialEq for Value {
             (Self::String(l), Self::String(r)) => l == r,
             (Self::List(l), Self::List(r)) => l == r,
             (Self::Dict(l), Self::Dict(r)) => l == r,
-            (Self::Schema { .. }, Self::Schema { .. }) => false,
-            (Self::EnumSchema { .. }, Self::EnumSchema { .. }) => false,
+            (Self::Schema(_), Self::Schema(_)) => false,
+            (Self::EnumSchema(_), Self::EnumSchema(_)) => false,
             (Self::Type(l), Self::Type(r)) => l == r,
             (Self::Wildcard, Self::Wildcard) => true,
-            (
-                Self::Closure {
-                    params: p1,
-                    body: b1,
-                    captured_env: c1,
-                },
-                Self::Closure {
-                    params: p2,
-                    body: b2,
-                    captured_env: c2,
-                },
-            ) => p1 == p2 && b1 == b2 && Arc::ptr_eq(c1, c2),
+            (Self::Closure(a), Self::Closure(b)) => {
+                a.params == b.params
+                    && a.body == b.body
+                    && Arc::ptr_eq(&a.captured_env, &b.captured_env)
+            }
             _ => false,
         }
     }
@@ -225,9 +252,9 @@ impl Value {
             Value::String(s) => !s.is_empty(),
             Value::List(l) => !l.is_empty(),
             Value::Dict(d) => !d.map.is_empty(),
-            Value::Closure { .. } => true,
-            Value::Schema { .. } => true,
-            Value::EnumSchema { .. } => true,
+            Value::Closure(_) => true,
+            Value::Schema(_) => true,
+            Value::EnumSchema(_) => true,
             Value::Type(_) => true,
             Value::Wildcard => true,
         }
@@ -242,9 +269,9 @@ impl Value {
             Value::String(_) => "String",
             Value::List(_) => "List",
             Value::Dict(_) => "Dict",
-            Value::Closure { .. } => "Closure",
-            Value::Schema { .. } => "Schema",
-            Value::EnumSchema { .. } => "EnumSchema",
+            Value::Closure(_) => "Closure",
+            Value::Schema(_) => "Schema",
+            Value::EnumSchema(_) => "EnumSchema",
             Value::Type(_) => "Type",
             Value::Wildcard => "Wildcard",
         }
@@ -264,16 +291,9 @@ impl Value {
                     }
                 }
             }
-            (
-                Value::Schema {
-                    fields: base_fields,
-                    ..
-                },
-                Value::Schema {
-                    fields: patch_fields,
-                    ..
-                },
-            ) => {
+            (Value::Schema(base), Value::Schema(patch)) => {
+                let base_fields = &mut base.fields;
+                let patch_fields = &patch.fields;
                 for (k, v) in patch_fields {
                     if let Some(base_field) = base_fields.get_mut(k) {
                         base_field.type_hint = v.type_hint.clone();
@@ -295,13 +315,8 @@ impl Value {
                     }
                 }
             }
-            (
-                Value::Schema {
-                    fields: base_fields,
-                    ..
-                },
-                Value::Dict(patch_data),
-            ) => {
+            (Value::Schema(base), Value::Dict(patch_data)) => {
+                let base_fields = &mut base.fields;
                 for (k, v) in &patch_data.map {
                     if let Some(base_field) = base_fields.get_mut(k) {
                         base_field.default_value = Some(v.clone());
@@ -310,5 +325,24 @@ impl Value {
             }
             (b, p) => *b = p.clone(),
         }
+    }
+}
+
+#[cfg(test)]
+mod size_guard {
+    use super::Value;
+
+    /// Hard ceiling on `Value` enum width. The comprehension hot loop
+    /// stores `Value`s in per-iteration scope HashMaps; bucket size scales
+    /// with the enum width, so a regression here translates directly into
+    /// MB-scale waste on the comprehension workload (dhat profile attributes
+    /// it to `HashMap::insert`'s grow path). 48 bytes leaves headroom for
+    /// the existing `String(String)` (24 B) + 1-byte tag, plus a couple of
+    /// future smallvec / cow-string tweaks before we have to rebox.
+    #[test]
+    fn value_enum_is_compact() {
+        let size = std::mem::size_of::<Value>();
+        eprintln!("Value enum size: {} bytes", size);
+        assert!(size <= 48, "Value enum grew: {} bytes", size);
     }
 }

@@ -59,9 +59,9 @@ impl Projector for JsonProjector {
                 for (key, val) in d.map.iter() {
                     if matches!(
                         val,
-                        Value::Closure { .. }
-                            | Value::Schema { .. }
-                            | Value::EnumSchema { .. }
+                        Value::Closure(_)
+                            | Value::Schema(_)
+                            | Value::EnumSchema(_)
                             | Value::Type(_)
                             | Value::Wildcard
                     ) {
@@ -87,8 +87,8 @@ impl Projector for JsonProjector {
                     Ok(inner)
                 }
             }
-            Value::Closure { .. } => Err(crate::Error::UnsupportedClosure),
-            Value::Schema { .. } | Value::EnumSchema { .. } | Value::Type(_) | Value::Wildcard => {
+            Value::Closure(_) => Err(crate::Error::UnsupportedClosure),
+            Value::Schema(_) | Value::EnumSchema(_) | Value::Type(_) | Value::Wildcard => {
                 Err(crate::Error::UnsupportedSchema)
             }
         }

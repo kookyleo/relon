@@ -1410,7 +1410,7 @@ fn test_brand_decorator_at_document_root() {
     let ctx = std::sync::Arc::new(ctx);
     // Synthesize a `Weather` schema and seed it into the surrounding
     // scope so the root-level `#brand` can resolve it.
-    let weather_schema = Value::Schema {
+    let weather_schema = Value::Schema(Box::new(crate::value::SchemaData {
         generics: Vec::new(),
         fields: {
             let mut fields = HashMap::new();
@@ -1448,7 +1448,7 @@ fn test_brand_decorator_at_document_root() {
             );
             fields
         },
-    };
+    }));
     let outer_scope = std::sync::Arc::new(Scope::default());
     outer_scope
         .locals_for_write()

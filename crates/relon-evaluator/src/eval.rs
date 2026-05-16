@@ -776,14 +776,14 @@ impl Evaluator {
             // Same trick `prepare_dict_scope` uses for the field-form.
             scope.locals_for_write().insert(
                 Arc::from(decl.name.as_str()),
-                Value::Schema {
+                Value::Schema(Box::new(crate::value::SchemaData {
                     // v1.8+ fix (issue 4): the placeholder uses the
                     // real generic param names so a recursive body
                     // referring to `Box<T>` already sees the right
                     // shape during predicate building.
                     generics: decl.generics.clone(),
                     fields: HashMap::new(),
-                },
+                })),
             );
             let (lowered, _diags) = relon_analyzer::lower_schema_pure(
                 Some(decl.name.clone()),
@@ -809,10 +809,10 @@ impl Evaluator {
                 self.build_root_enum_schema(&def)
             } else {
                 let fields = self.build_schema_from_def(&def, scope)?;
-                Value::Schema {
+                Value::Schema(Box::new(crate::value::SchemaData {
                     generics: def.generics.clone(),
                     fields,
-                }
+                }))
             };
             scope
                 .locals_for_write()
@@ -851,11 +851,11 @@ impl Evaluator {
             }
             variants.insert(variant.name.clone(), fields);
         }
-        Value::EnumSchema {
+        Value::EnumSchema(Box::new(crate::value::EnumSchemaData {
             name: def.name.clone().unwrap_or_default(),
             generics: def.generics.clone(),
             variants,
-        }
+        }))
     }
 
     pub(crate) fn eval_internal(
@@ -1108,11 +1108,11 @@ impl Evaluator {
                     Arc::clone(scope)
                 };
 
-                Ok(Value::Closure {
+                Ok(Value::Closure(Box::new(crate::value::ClosureData {
                     params: param_names,
                     body: body.clone(),
                     captured_env,
-                })
+                })))
             }
             Expr::FnCall { path, args } => {
                 let mut evaluated_args = Vec::new();
@@ -1139,12 +1139,12 @@ impl Evaluator {
                     }
                     _ => {
                         let right_val = self.eval(right, &current_scope)?;
-                        if let Value::Closure {
-                            params,
-                            body,
-                            captured_env,
-                        } = right_val
-                        {
+                        if let Value::Closure(closure) = right_val {
+                            let crate::value::ClosureData {
+                                params,
+                                body,
+                                captured_env,
+                            } = *closure;
                             self.eval_closure(
                                 &params,
                                 &body,
@@ -1261,7 +1261,7 @@ impl Evaluator {
                 }
                 Ok(Value::String(result))
             }
-            Expr::Type(t) => Ok(Value::Type(t.clone())),
+            Expr::Type(t) => Ok(Value::Type(Box::new(t.clone()))),
             Expr::Wildcard => Ok(Value::Wildcard),
             Expr::VariantCtor {
                 enum_path,
@@ -1348,10 +1348,10 @@ impl Evaluator {
                     return Ok(self.build_root_enum_schema(def));
                 }
                 let fields = self.build_schema_from_def(def, scope)?;
-                return Ok(Value::Schema {
+                return Ok(Value::Schema(Box::new(crate::value::SchemaData {
                     generics: def.generics.clone(),
                     fields,
-                });
+                })));
             }
         }
         let (lowered, _diags) =
@@ -1367,10 +1367,10 @@ impl Evaluator {
             return Ok(self.build_root_enum_schema(&def));
         }
         let fields = self.build_schema_from_def(&def, scope)?;
-        Ok(Value::Schema {
+        Ok(Value::Schema(Box::new(crate::value::SchemaData {
             generics: def.generics.clone(),
             fields,
-        })
+        })))
     }
 
     /// Pre-evaluation directive dispatch.
@@ -1419,10 +1419,10 @@ impl Evaluator {
                                 return Ok(Some(self.build_root_enum_schema(def)));
                             }
                             let fields = self.build_schema_from_def(def, current_scope)?;
-                            return Ok(Some(Value::Schema {
+                            return Ok(Some(Value::Schema(Box::new(crate::value::SchemaData {
                                 generics: def.generics.clone(),
                                 fields,
-                            }));
+                            }))));
                         }
                     }
                     let (lowered, _diags) =
@@ -1432,10 +1432,10 @@ impl Evaluator {
                             return Ok(Some(self.build_root_enum_schema(&def)));
                         }
                         let fields = self.build_schema_from_def(&def, current_scope)?;
-                        return Ok(Some(Value::Schema {
+                        return Ok(Some(Value::Schema(Box::new(crate::value::SchemaData {
                             generics: def.generics.clone(),
                             fields,
-                        }));
+                        }))));
                     }
                 }
                 _ => {}
@@ -1715,10 +1715,10 @@ impl Evaluator {
                                 self.build_root_enum_schema(&def)
                             } else {
                                 let fields = self.build_schema_from_def(&def, &module_scope)?;
-                                Value::Schema {
+                                Value::Schema(Box::new(crate::value::SchemaData {
                                     generics: def.generics.clone(),
                                     fields,
-                                }
+                                }))
                             };
                             d_mut.map.insert(decl.name.clone(), value);
                         }
@@ -1770,18 +1770,18 @@ impl Evaluator {
             }
         }
         let enum_name = enum_path.join(".");
-        let Value::EnumSchema {
-            name,
-            generics,
-            variants,
-        } = current
-        else {
+        let Value::EnumSchema(enum_box) = current else {
             return Err(RuntimeError::TypeMismatch {
                 expected: format!("EnumSchema `{enum_name}`"),
                 found: current.type_name().to_string(),
                 range,
             });
         };
+        let crate::value::EnumSchemaData {
+            name,
+            generics,
+            variants,
+        } = *enum_box;
         let name = if name.is_empty() {
             enum_name.clone()
         } else {
@@ -1842,11 +1842,14 @@ impl Evaluator {
         range: TokenRange,
     ) -> Result<Value, RuntimeError> {
         match func {
-            Value::Closure {
-                params,
-                body,
-                captured_env,
-            } => self.eval_closure(&params, &body, args, &captured_env, range),
+            Value::Closure(closure) => {
+                let crate::value::ClosureData {
+                    params,
+                    body,
+                    captured_env,
+                } = *closure;
+                self.eval_closure(&params, &body, args, &captured_env, range)
+            }
             _ => Err(RuntimeError::TypeMismatch {
                 expected: "Closure".to_string(),
                 found: func.type_name().to_string(),
@@ -1862,12 +1865,12 @@ impl Evaluator {
         scope: &Arc<Scope>,
         range: TokenRange,
     ) -> Result<Value, RuntimeError> {
-        if let Ok(Value::Closure {
-            params,
-            body,
-            captured_env,
-        }) = self.resolve_variable(path, scope, range)
-        {
+        if let Ok(Value::Closure(closure)) = self.resolve_variable(path, scope, range) {
+            let crate::value::ClosureData {
+                params,
+                body,
+                captured_env,
+            } = *closure;
             return self.eval_closure(&params, &body, args, &captured_env, range);
         }
         if let Some(name) = Self::native_function_name(path) {
@@ -2311,10 +2314,7 @@ impl Evaluator {
                 continue;
             }
             if pos_idx < params.len() {
-                bindings.insert(
-                    Arc::from(params[pos_idx].name.as_str()),
-                    arg.value.clone(),
-                );
+                bindings.insert(Arc::from(params[pos_idx].name.as_str()), arg.value.clone());
                 pos_idx += 1;
             }
         }
@@ -2354,12 +2354,12 @@ impl Evaluator {
         scope: &Arc<Scope>,
         range: TokenRange,
     ) -> Result<Value, RuntimeError> {
-        if let Ok(Value::Closure {
-            params,
-            body,
-            captured_env,
-        }) = self.resolve_variable(path, scope, range)
-        {
+        if let Ok(Value::Closure(closure)) = self.resolve_variable(path, scope, range) {
+            let crate::value::ClosureData {
+                params,
+                body,
+                captured_env,
+            } = *closure;
             let mut combined = vec![EvaluatedArg::positional(value)];
             combined.extend(args);
             return self.eval_closure(&params, &body, combined, &captured_env, range);
@@ -2514,10 +2514,10 @@ impl Evaluator {
                     }
                     locals.insert(
                         Arc::from(name.as_str()),
-                        Value::Schema {
+                        Value::Schema(Box::new(crate::value::SchemaData {
                             generics: generics.clone(),
                             fields: HashMap::new(),
-                        },
+                        })),
                     );
                     seeded.insert(name);
                 }
@@ -2591,16 +2591,14 @@ impl Evaluator {
                         }
                         scope.locals_for_write().insert(
                             Arc::from(key_str.as_str()),
-                            Value::Schema {
+                            Value::Schema(Box::new(crate::value::SchemaData {
                                 generics,
                                 fields: HashMap::new(),
-                            },
+                            })),
                         );
                     }
                     let val = self.eval(value_node, scope)?;
-                    scope
-                        .locals_for_write()
-                        .insert(Arc::from(key_str), val);
+                    scope.locals_for_write().insert(Arc::from(key_str), val);
                 }
             }
         }
@@ -2788,7 +2786,7 @@ fn value_schema_tag(v: &Value) -> Option<String> {
         Value::String(_) => Some("String".to_string()),
         Value::List(_) => Some("List".to_string()),
         Value::Null => Some("Null".to_string()),
-        Value::Closure { .. } | Value::Schema { .. } | Value::EnumSchema { .. } => None,
+        Value::Closure(_) | Value::Schema(_) | Value::EnumSchema(_) => None,
         Value::Type(_) | Value::Wildcard => None,
     }
 }
@@ -2860,9 +2858,9 @@ impl std::fmt::Display for Value {
             Value::String(s) => write!(f, "{}", s),
             Value::List(l) => write!(f, "{:?}", l),
             Value::Dict(d) => write!(f, "{:?}", d.map),
-            Value::Closure { .. } => write!(f, "<closure>"),
-            Value::Schema { .. } => write!(f, "<schema>"),
-            Value::EnumSchema { name, .. } => write!(f, "<enum {name}>"),
+            Value::Closure(_) => write!(f, "<closure>"),
+            Value::Schema(_) => write!(f, "<schema>"),
+            Value::EnumSchema(enum_data) => write!(f, "<enum {}>", enum_data.name),
             Value::Type(t) => write!(f, "Type<{}>", relon_analyzer::format_type(t)),
             Value::Wildcard => write!(f, "*"),
         }

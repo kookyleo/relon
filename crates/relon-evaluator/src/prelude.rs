@@ -61,11 +61,11 @@ fn build_result() -> Value {
     err_fields.insert("error".to_string(), wildcard_field(type_var("E")));
     variants.insert("Err".to_string(), err_fields);
 
-    Value::EnumSchema {
+    Value::EnumSchema(Box::new(crate::value::EnumSchemaData {
         name: "Result".to_string(),
         generics: vec!["T".to_string(), "E".to_string()],
         variants,
-    }
+    }))
 }
 
 fn build_option() -> Value {
@@ -78,9 +78,9 @@ fn build_option() -> Value {
     // Unit variant: no fields.
     variants.insert("None".to_string(), HashMap::new());
 
-    Value::EnumSchema {
+    Value::EnumSchema(Box::new(crate::value::EnumSchemaData {
         name: "Option".to_string(),
         generics: vec!["T".to_string()],
         variants,
-    }
+    }))
 }
