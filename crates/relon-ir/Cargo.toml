@@ -15,8 +15,10 @@ categories = ["compilers"]
 relon-parser = { workspace = true }
 # AnalyzedTree input
 relon-analyzer = { workspace = true }
-# Shared value/scope/error types used in codegen diagnostics
-relon-eval-api = { workspace = true }
 
 thiserror = { workspace = true }
 miette = { workspace = true }
+# Float wrapper that derives `Eq` / `Hash` / `PartialEq` so the IR's
+# `Op::ConstF64` can participate in derived comparisons — matches the
+# parser's `Expr::Float` representation so lowering stays a 1:1 copy.
+ordered-float = { workspace = true }

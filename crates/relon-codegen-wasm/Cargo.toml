@@ -35,3 +35,7 @@ wasmparser = "0.249"
 # round-trip `run_main`. Default features pull in cranelift +
 # wasmtime-runtime — long first build, then cached.
 wasmtime = "44"
+# Source -> AnalyzedTree pipeline driving the Phase 1.beta
+# end-to-end test.
+relon-parser = { workspace = true }
+relon-analyzer = { workspace = true }

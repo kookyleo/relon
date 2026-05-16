@@ -1,0 +1,125 @@
+//! Phase 1.beta linear-typed IR.
+//!
+//! The IR is a flat, stack-machine instruction stream — one `Func`
+//! per `#main` (later: per top-level callable). Each op carries the
+//! source [`TokenRange`] so Phase 1.gamma's `relon.srcmap` custom
+//! section can emit a wasm-offset -> source-range table without
+//! re-walking the analyzer tree.
+//!
+//! Stack discipline (v1.beta): `ConstI64` / `ConstF64` / `LocalGet`
+//! push one value of the carried [`IrType`]; the binary arithmetic
+//! ops pop two operands of the same type and push the result of the
+//! same type; `Return` pops the single remaining value and ends the
+//! function. Mixed-type bodies are rejected at codegen — see
+//! `crates/relon-codegen-wasm/src/error.rs`.
+//!
+//! Operand types are recorded on the op itself (the `(IrType)`
+//! suffix on `Add` / `Sub` / `Mul` / `Div` / `Mod`) so the wasm
+//! emitter can pick `i64.add` vs `f64.add` in O(1) per op without
+//! re-running a type-inference pass. The decision was made when
+//! AnalyzerTree was still in scope during lowering; carrying the
+//! type forward is strictly cheaper than re-deriving it from a
+//! virtual stack inside the codegen pass.
+
+use ordered_float::OrderedFloat;
+use relon_parser::TokenRange;
+
+/// Scalar value type in v1.beta. Mirrors the wasm value-type subset
+/// the codegen pass emits — `Int` lowers to `I64`, `Float` lowers to
+/// `F64`. Later phases (composite layouts, host-pointer values)
+/// extend this enum; v1.beta stays minimal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum IrType {
+    /// 64-bit signed integer (Relon `Int`).
+    I64,
+    /// IEEE-754 double-precision float (Relon `Float`).
+    F64,
+}
+
+/// One lowered module — a flat list of functions plus an optional
+/// pointer to the entry. v1.beta only ever populates a single
+/// function (the `#main` body, named `run_main`); the vector form
+/// keeps the data model honest for Phase 2+ multi-function emit.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Module {
+    /// Lowered functions in declaration order.
+    pub funcs: Vec<Func>,
+    /// Index into `funcs` of the `#main` entry, when one was lowered.
+    /// `None` for library modules (no `#main`); v1.beta lowering
+    /// rejects this shape with `LoweringError::MissingMain` before
+    /// returning, so the field is informational.
+    pub entry_func_index: Option<usize>,
+}
+
+/// One lowered function. Stack-based body; locals are addressed by
+/// the parameter's declaration order index (no separate symbol
+/// table — v1.beta only ever sees `#main` params as locals).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Func {
+    /// Wasm export name. v1.beta always emits `"run_main"` for the
+    /// entry function; non-entry functions stay unexported.
+    pub name: String,
+    /// Parameter types in declaration order. Index into this vector
+    /// is the operand of `Op::LocalGet`.
+    pub params: Vec<IrType>,
+    /// Return type. Single-value return only (no tuples) in v1.beta.
+    pub ret: IrType,
+    /// Op stream. Pushes / pops follow the discipline documented at
+    /// the module level.
+    pub body: Vec<TaggedOp>,
+    /// Source range of the function's declaration (the `#main(...)`
+    /// directive range, or the function declaration range in later
+    /// phases). Used by the wasm srcmap section.
+    pub range: TokenRange,
+}
+
+/// One IR op paired with the source range it lowered from. The
+/// range is what Phase 1.gamma's `relon.srcmap` section turns into
+/// per-instruction source positions; v1.beta retains it eagerly so
+/// the gamma pass is a non-breaking emit-only addition.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TaggedOp {
+    /// The actual op.
+    pub op: Op,
+    /// Source range that produced it (literal token, variable token,
+    /// or binary-operator-spanning node range).
+    pub range: TokenRange,
+}
+
+/// Stack-machine ops. Each variant documents its stack effect.
+///
+/// The binary arithmetic ops carry an [`IrType`] tag so the wasm
+/// emitter picks `i64.*` vs `f64.*` without re-deriving types. The
+/// lowering pass guarantees the tag matches the actual operand
+/// types on the virtual stack at emit time; mismatches are caller
+/// bugs and codegen surfaces them via `CodegenError::MixedNumericTypes`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Op {
+    /// Push an `i64` constant. Stack: `[] -> [i64]`.
+    ConstI64(i64),
+    /// Push an `f64` constant. Stack: `[] -> [f64]`.
+    /// `OrderedFloat` so the enum can derive `PartialEq` and `Eq` —
+    /// same trick the parser uses for `Expr::Float`.
+    ConstF64(OrderedFloat<f64>),
+    /// Push the value of local `index`. Stack: `[] -> [T]`.
+    /// `index` is into `Func::params` in v1.beta.
+    LocalGet(u32),
+    /// Pop two operands of the tagged type, push their sum. Stack:
+    /// `[T, T] -> [T]`.
+    Add(IrType),
+    /// Pop two operands of the tagged type, push their difference.
+    Sub(IrType),
+    /// Pop two operands of the tagged type, push their product.
+    Mul(IrType),
+    /// Pop two operands of the tagged type, push their quotient.
+    /// `I64` lowers to `i64.div_s` (signed); `F64` lowers to `f64.div`.
+    Div(IrType),
+    /// Pop two operands of the tagged type, push the remainder.
+    /// `I64` lowers to `i64.rem_s` (signed); `F64` is rejected at
+    /// lowering — wasm has no `f64.rem`, so `LoweringError::UnsupportedOperator`
+    /// fires before this variant is even constructed for floats.
+    Mod(IrType),
+    /// Pop the top value and end the function (wasm `end` does the
+    /// implicit return). Must be the last op in `Func::body`.
+    Return,
+}
