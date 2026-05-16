@@ -16,9 +16,11 @@
 //! reference: it sidesteps the IR entirely and exercises the
 //! `wasm-encoder` + `wasmtime` link in isolation.
 
+pub mod abi;
 pub mod error;
 pub mod srcmap;
 
+pub use abi::{AbiError, AbiMetadata};
 pub use error::CodegenError;
 pub use srcmap::{Entry as SrcMapEntry, SrcMap, SrcMapError};
 
@@ -123,6 +125,17 @@ pub fn compile_module(ir: &IrModule) -> Result<Vec<u8>, CodegenError> {
     module.section(&CustomSection {
         name: srcmap::SECTION_NAME.into(),
         data: (&srcmap_bytes[..]).into(),
+    });
+
+    // Phase 2.a: append `relon.abi`. The codegen pipeline doesn't yet
+    // accept a schema as input, so both hashes go in as 32-byte zero
+    // placeholders. Phase 2.b broadens `compile_module` to take the
+    // schema; until then the host loader treats zero-hash modules as
+    // "ABI shape locked, schema not yet validated".
+    let abi_bytes = abi::encode(&AbiMetadata::placeholder());
+    module.section(&CustomSection {
+        name: abi::SECTION_NAME.into(),
+        data: (&abi_bytes[..]).into(),
     });
 
     Ok(module.finish())
