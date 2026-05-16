@@ -12,6 +12,7 @@
 
 use crate::abi::AbiError;
 use crate::srcmap::SrcMapError;
+use relon_ir::IrType;
 use thiserror::Error;
 
 /// Reasons codegen can fail.
@@ -45,6 +46,39 @@ pub enum CodegenError {
     /// stringified so the public surface stays narrow.
     #[error("layout error: {0}")]
     Layout(String),
+    /// Phase 2.c: a comparison op (`<`, `<=`, `>`, `>=`, `==`, `!=`)
+    /// landed in the codegen with operand types outside the
+    /// `Int`/`Float`/`Bool`/`Null` supported set. Ordering on Bool /
+    /// Null in particular is rejected by upstream type checking, but
+    /// the codegen keeps the gate so a hand-built IR can't sneak it
+    /// in.
+    #[error("invalid comparison operand type: `{ty:?}`")]
+    InvalidComparisonOperandType {
+        /// The IR type the comparison op was tagged with.
+        ty: IrType,
+    },
+    /// Phase 2.c: an `if` (ternary) lowered with branches that
+    /// disagree on their result type. Wasm's `if`-block requires both
+    /// arms to push the same value type, so this surfaces a body the
+    /// lowering pass should have already rejected via
+    /// `LoweringError::IfBranchTypeMismatch`.
+    #[error("if branches disagree on type: then=`{then_ty:?}`, else=`{else_ty:?}`")]
+    IfBranchTypeMismatch {
+        /// IR type the `then` branch produced.
+        then_ty: IrType,
+        /// IR type the `else` branch produced.
+        else_ty: IrType,
+    },
+    /// Phase 2.c: a `StoreField` of a type the wasm side can't emit
+    /// a single-instruction store for (currently `String` /
+    /// `ListInt`). The return surface only covers `Int` / `Float` /
+    /// `Bool` / `Null`; lowering should reject earlier — this is a
+    /// belt-and-braces guard.
+    #[error("unsupported store type: `{ty:?}`")]
+    UnsupportedStoreFieldType {
+        /// The IR type carried on the offending `StoreField`.
+        ty: IrType,
+    },
 }
 
 /// Failure modes when loading an already-compiled wasm module via
