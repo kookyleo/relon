@@ -485,4 +485,47 @@ pub enum Op {
         /// with the matching `ValType`.
         ty: IrType,
     },
+
+    /// Phase 5 schema-method dispatch primitive.
+    ///
+    /// Pop an i32 absolute wasm-memory address pointing at the first
+    /// byte of a schema instance's fixed area; push the field at
+    /// `offset` of type `ty`. Mirrors [`Op::LoadField`] but the base
+    /// address is supplied dynamically by the operand stack rather
+    /// than implicitly read off the `in_ptr` handshake slot.
+    ///
+    /// Stack: `[i32] -> [T]` where `T` is decided by `ty`. Codegen
+    /// emits the matching `i64.load` / `f64.load` / `i32.load*` (with
+    /// `offset = N` baked into the memarg) after popping the address.
+    /// Used both for `self.field` access inside a schema method's body
+    /// and for chained-segment access (`obj.sub.leaf`) when `obj` is
+    /// schema-typed.
+    LoadFieldAtAbsolute {
+        /// Byte offset of the field inside the schema's fixed area.
+        offset: u32,
+        /// Field's IR type — drives the wasm load opcode selection.
+        /// `String` / `ListInt` here load the i32 pointer slot *as
+        /// is* (buffer-relative offset preserved); call sites that
+        /// need an absolute pointer must follow up with a separate
+        /// lift step.
+        ty: IrType,
+    },
+
+    /// Phase 5 schema-method dispatch primitive.
+    ///
+    /// Lift a schema-typed pointer slot in the `in_buf` to an
+    /// absolute wasm-memory address. Stack: `[] -> [i32]`.
+    ///
+    /// Layout: the `in_buf`'s fixed area carries a 4-byte
+    /// buffer-relative offset at `offset`; codegen reads it via
+    /// `local.get $in_ptr; i32.load offset=N`, then adds `in_ptr` to
+    /// produce the absolute address of the schema instance's fixed
+    /// area. Mirrors [`Op::LoadStringPtr`] / [`Op::LoadListIntPtr`]
+    /// but tags the pushed value as a schema instance pointer rather
+    /// than a `[len][payload]` record pointer — the lowering pass
+    /// tracks the schema brand alongside.
+    LoadSchemaPtr {
+        /// Byte offset of the pointer slot inside the input buffer.
+        offset: u32,
+    },
 }

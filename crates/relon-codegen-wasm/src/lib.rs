@@ -1163,6 +1163,29 @@ fn emit_op_seq(
                 ranges.push(tagged.range);
                 vstack.push(IrType::I64);
             }
+            Op::LoadFieldAtAbsolute { offset, ty } => {
+                // Pop the absolute base address, then emit a load with
+                // `offset = N` baked into the memarg. The base must
+                // occupy an i32 slot; mismatches surface as
+                // `MixedNumericTypes` so a hand-built IR with the
+                // wrong receiver shape fails deterministically.
+                let popped = vstack.pop().ok_or(CodegenError::MixedNumericTypes)?;
+                if popped.wasm_slot() != IrType::I32 {
+                    return Err(CodegenError::MixedNumericTypes);
+                }
+                emit_load_field_at_absolute(f, ranges, *offset, *ty, tagged.range)?;
+                vstack.push(load_field_stack_type(*ty));
+            }
+            Op::LoadSchemaPtr { offset } => {
+                // Identical wasm shape to `LoadStringPtr` /
+                // `LoadListIntPtr`: read the 4-byte buffer-relative
+                // pointer at `in_ptr + offset`, add `in_ptr`, push the
+                // resulting absolute address. Tagged separately at the
+                // IR level so the lowering pass can carry a schema
+                // brand for method dispatch.
+                emit_load_absolute_pointer(f, ranges, *offset, tagged.range);
+                vstack.push(IrType::I32);
+            }
             Op::Select { ty } => {
                 // Wasm `select t` pops `[val_true, val_false, cond_i32]`
                 // and pushes one of the two values. The IR pins both
@@ -1432,6 +1455,64 @@ fn emit_load_field(
             ranges.push(range);
         }
     }
+}
+
+/// Emit a load whose base address is already on top of the operand
+/// stack (an absolute wasm-memory address). Used by
+/// [`Op::LoadFieldAtAbsolute`] for schema-method `self.field` access
+/// and chained-segment reads. The stack-top base is consumed by the
+/// emitted load instruction; no `local.get $in_ptr` is added — that's
+/// the caller's responsibility when sourcing from the in_buf.
+fn emit_load_field_at_absolute(
+    f: &mut Function,
+    ranges: &mut Vec<TokenRange>,
+    offset: u32,
+    ty: IrType,
+    range: TokenRange,
+) -> Result<(), CodegenError> {
+    match ty {
+        IrType::Null => {
+            // Null reads as constant zero — drop the address operand
+            // first since the wasm `i32.const` is independent.
+            f.instruction(&Instruction::Drop);
+            ranges.push(range);
+            f.instruction(&Instruction::I32Const(0));
+            ranges.push(range);
+        }
+        IrType::Bool => {
+            f.instruction(&Instruction::I32Load8U(MemArg {
+                offset: offset as u64,
+                align: 0,
+                memory_index: 0,
+            }));
+            ranges.push(range);
+        }
+        IrType::I64 => {
+            f.instruction(&Instruction::I64Load(MemArg {
+                offset: offset as u64,
+                align: 3,
+                memory_index: 0,
+            }));
+            ranges.push(range);
+        }
+        IrType::F64 => {
+            f.instruction(&Instruction::F64Load(MemArg {
+                offset: offset as u64,
+                align: 3,
+                memory_index: 0,
+            }));
+            ranges.push(range);
+        }
+        IrType::I32 | IrType::String | IrType::ListInt => {
+            f.instruction(&Instruction::I32Load(MemArg {
+                offset: offset as u64,
+                align: 2,
+                memory_index: 0,
+            }));
+            ranges.push(range);
+        }
+    }
+    Ok(())
 }
 
 /// Emit the `StoreField` wasm sequence for `ty` at byte `offset`.

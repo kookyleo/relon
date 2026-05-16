@@ -24,7 +24,7 @@
 
 use ordered_float::OrderedFloat;
 use relon_analyzer::main_sig::MainSignature;
-use relon_analyzer::schema::SchemaDef;
+use relon_analyzer::schema::{SchemaDef, SchemaMethodInfo};
 use relon_analyzer::tree::AnalyzedTree;
 use relon_analyzer::workspace::WorkspaceTree;
 use relon_eval_api::layout::{FieldKind, OffsetTable, SchemaLayout};
@@ -34,7 +34,9 @@ use std::collections::HashMap;
 
 use crate::error::LoweringError;
 use crate::ir::{Func, IrType, Module, Op, TaggedOp};
-use crate::stdlib::{builtin_stdlib, stdlib_function_index, stdlib_method_index};
+use crate::stdlib::{
+    builtin_stdlib, stdlib_function_count, stdlib_function_index, stdlib_method_index,
+};
 
 /// Per-function lowering state shared across the recursive walk.
 ///
@@ -77,6 +79,75 @@ struct LowerCtx<'a> {
     /// type-hint names a user-declared schema (the nested dict
     /// case).
     schema_resolver: SchemaResolver<'a>,
+    /// Schema-method registry shared across the whole module. Phase
+    /// 5 method-dispatch consults it when lowering `obj.method(...)`
+    /// to a `Op::Call` whose `fn_index` targets a non-stdlib func.
+    method_registry: SchemaMethodRegistry,
+    /// `Some` when this context is lowering a schema method body —
+    /// carries the `self` receiver's wasm-local index plus the
+    /// schema's canonical shape. The walker uses both to resolve
+    /// `self.field` (chained field loads off the absolute address)
+    /// and `self.other_method()` (schema-method self-dispatch).
+    self_binding: Option<SelfBinding>,
+    /// Method parameters (non-`self`) for the current schema-method
+    /// body. Lowered as wasm function locals — `LocalGet(wasm_idx)`
+    /// pulls them onto the stack. Empty for entry bodies; populated
+    /// only when `self_binding` is `Some`.
+    method_params: Vec<MethodParam>,
+}
+
+/// Information the lowering walker needs when handling `self`-prefixed
+/// expressions inside a schema-method body.
+#[derive(Debug, Clone)]
+struct SelfBinding {
+    /// Wasm-function-local index of the `self` slot. Phase 5 pins it
+    /// to local `0` — the first param of a method's function
+    /// signature — but the field stays explicit so future overhauls
+    /// can shift the slot without touching the lowering walker.
+    wasm_local_idx: u32,
+    /// Canonical schema shape of the receiver. `self.field` resolves
+    /// its offset and IR type from this; `self.other()` keys the
+    /// schema-method registry off the schema's name.
+    schema: Schema,
+}
+
+/// One non-`self` method parameter. Lowered as a wasm function local
+/// referenced via [`Op::LocalGet`].
+#[derive(Debug, Clone)]
+struct MethodParam {
+    /// Source-level parameter name.
+    name: String,
+    /// IR type of the parameter on the wasm operand stack. Schema-typed
+    /// params occupy `I32` and carry `schema` below; scalar params
+    /// match the declared canonical type.
+    ty: IrType,
+    /// Wasm-function-local slot for this parameter (declaration order).
+    wasm_local_idx: u32,
+    /// Canonical schema shape when the param is schema-typed (so
+    /// chained field walks + method dispatch find the layout). `None`
+    /// for scalar / pointer-record params.
+    schema: Option<Schema>,
+}
+
+/// Schema-method dispatch table built once per `lower_workspace_*`
+/// call. Phase 5 wires user-declared `with { ... }` methods into the
+/// IR module's `funcs` list and records the wasm-level function index
+/// each call site should jump to. The wasm-level index is the
+/// **combined** index: `stdlib_count + ir_user_func_index`, so the
+/// emitter can inject the `Op::Call`'s `fn_index` straight into a
+/// wasm `call` instruction without further translation.
+#[derive(Debug, Clone, Default)]
+struct SchemaMethodRegistry {
+    /// `(schema_name, method_name)` -> wasm-level fn_index. The same
+    /// schema name keyed by both the original declaration site and
+    /// any `#extend` contributions is fine — analyzer-level conflict
+    /// detection happens upstream; the IR pass picks whichever lands
+    /// in the table first.
+    lookup: HashMap<(String, String), u32>,
+    /// `(schema_name, method_name)` -> (param IR types, return IR
+    /// type) so call sites can populate `Op::Call`'s `param_tys` /
+    /// `ret_ty` without re-walking the method's declared params.
+    sigs: HashMap<(String, String), (Vec<IrType>, IrType)>,
 }
 
 /// Name → `SchemaDef` lookup built once per `lower_workspace_*` call
@@ -124,10 +195,20 @@ struct LetBinding {
     name: String,
     idx: u32,
     ty: IrType,
+    /// Schema name when the bound value is a schema instance pointer
+    /// (an i32 absolute address tagged at the IR level). Carried so
+    /// downstream `obj.method()` resolution can find the schema's
+    /// method table without re-deriving the type. `None` for plain
+    /// scalar / pointer-record let bindings.
+    schema_brand: Option<String>,
 }
 
 impl<'a> LowerCtx<'a> {
-    fn new(params: &'a [LocalBinding], schema_resolver: SchemaResolver<'a>) -> Self {
+    fn new(
+        params: &'a [LocalBinding],
+        schema_resolver: SchemaResolver<'a>,
+        method_registry: SchemaMethodRegistry,
+    ) -> Self {
         Self {
             params,
             lets: Vec::new(),
@@ -138,6 +219,36 @@ impl<'a> LowerCtx<'a> {
             out: Vec::new(),
             tstack: Vec::new(),
             schema_resolver,
+            method_registry,
+            self_binding: None,
+            method_params: Vec::new(),
+        }
+    }
+
+    /// Variant used when lowering a schema-method body. The walker
+    /// has no `#main` param index (`params` is an empty slice borrow);
+    /// `self_binding` plus `method_params` carry the per-method
+    /// surface instead.
+    fn new_method(
+        params: &'a [LocalBinding],
+        schema_resolver: SchemaResolver<'a>,
+        method_registry: SchemaMethodRegistry,
+        self_binding: SelfBinding,
+        method_params: Vec<MethodParam>,
+    ) -> Self {
+        Self {
+            params,
+            lets: Vec::new(),
+            next_let_idx: 0,
+            next_string_idx: 0,
+            next_list_int_idx: 0,
+            next_record_idx: 0,
+            out: Vec::new(),
+            tstack: Vec::new(),
+            schema_resolver,
+            method_registry,
+            self_binding: Some(self_binding),
+            method_params,
         }
     }
 
@@ -247,7 +358,7 @@ fn lower_workspace_single_with_module(
     // Build the canonical-form schemas for in_buf and out_buf, then
     // compute the offset table for the param schema so each
     // `Variable(x)` reference can be lowered to a typed LoadField.
-    let main_schema = build_main_params_schema(sig)?;
+    let main_schema = build_main_params_schema(sig, &resolver)?;
     let return_schema = if let Some(ref user_schema) = user_return_schema {
         // The dict-return path lays the user schema directly into the
         // fixed area — the host reads it back with the same
@@ -265,10 +376,18 @@ fn lower_workspace_single_with_module(
     // without a second pass over the layout pass.
     let locals = build_local_index(sig, &main_schema, &main_layout)?;
 
+    // Phase 5: enumerate every user-declared schema method, assign
+    // IR-side indices (and through them combined wasm-level
+    // function indices), then lower each method body into a `Func`.
+    // The entry body is appended last so it can resolve
+    // `obj.method()` calls against the populated registry.
+    let (method_funcs, method_registry) = lower_schema_methods(tree, &resolver)?;
+    let entry_ir_idx = method_funcs.len();
+
     // Walk the body into a single op stream + virtual stack via the
     // per-function lowering context. Phase 3.a's let-bindings + const
     // literals piggy-back on `LowerCtx` for their counters.
-    let mut ctx = LowerCtx::new(&locals, resolver);
+    let mut ctx = LowerCtx::new(&locals, resolver, method_registry);
 
     if let Some(ref user_schema) = user_return_schema {
         // Branded dict-return path: emit `AllocRootRecord` + the
@@ -348,10 +467,13 @@ fn lower_workspace_single_with_module(
         range: sig.range,
     };
 
+    let mut funcs = method_funcs;
+    funcs.push(func);
+
     Ok(LoweredEntry {
         module: Module {
-            funcs: vec![func],
-            entry_func_index: Some(0),
+            funcs,
+            entry_func_index: Some(entry_ir_idx),
         },
         main_schema,
         return_schema,
@@ -359,11 +481,18 @@ fn lower_workspace_single_with_module(
 }
 
 /// Synthesise the [`MAIN_PARAMS_SCHEMA_NAME`] canonical schema from
-/// the `#main` parameter list. Rejects any non-scalar parameter type.
-fn build_main_params_schema(sig: &MainSignature) -> Result<Schema, LoweringError> {
+/// the `#main` parameter list. Phase 5 widens the surface so a
+/// user-schema-typed param (`#main(User u) -> ...`) builds a
+/// pointer-indirect field whose payload is the canonical shape of
+/// the named schema; scalar / `String` / `List<Int>` params keep
+/// their existing canonical form.
+fn build_main_params_schema(
+    sig: &MainSignature,
+    resolver: &SchemaResolver<'_>,
+) -> Result<Schema, LoweringError> {
     let mut fields = Vec::with_capacity(sig.params.len());
     for p in &sig.params {
-        let ty = type_node_to_canonical(&p.type_node).ok_or_else(|| {
+        let ty = type_node_to_canonical_with_schemas(&p.type_node, resolver).ok_or_else(|| {
             LoweringError::UnsupportedTypeInMain {
                 type_name: type_head_for_display(&p.type_node),
                 range: p.type_node.range,
@@ -379,6 +508,40 @@ fn build_main_params_schema(sig: &MainSignature) -> Result<Schema, LoweringError
         name: MAIN_PARAMS_SCHEMA_NAME.to_string(),
         generics: vec![],
         fields,
+    })
+}
+
+/// Widened [`type_node_to_canonical`] that also accepts single-segment
+/// references to user-declared schemas. Used by [`build_main_params_schema`]
+/// so `#main(User u)` lowers the `u` param into a pointer-indirect
+/// schema slot. Scalar / String / List<Int> heads still resolve via
+/// the narrower [`type_node_to_canonical`] helper — keeping that path
+/// dependency-free lets the rest of the lowering pass reach for it
+/// without threading the resolver through.
+fn type_node_to_canonical_with_schemas(
+    t: &TypeNode,
+    resolver: &SchemaResolver<'_>,
+) -> Option<TypeRepr> {
+    if let Some(scalar) = type_node_to_canonical(t) {
+        return Some(scalar);
+    }
+    // Only a single-segment, non-variant, non-generic head can name a
+    // user schema. Anything else falls through.
+    if t.path.len() != 1 || !t.generics.is_empty() || t.variant_fields.is_some() {
+        return None;
+    }
+    let head = t.path[0].as_str();
+    if matches!(
+        head,
+        "Int" | "Float" | "Bool" | "Null" | "String" | "List" | "Option" | "Result"
+    ) {
+        return None;
+    }
+    let def = resolver.resolve(head)?;
+    let mut stack: Vec<&str> = Vec::new();
+    let schema = canonical_schema_from_def(def, resolver, &mut stack, t.range).ok()?;
+    Some(TypeRepr::Schema {
+        schema: Box::new(schema),
     })
 }
 
@@ -480,6 +643,18 @@ struct LocalBinding {
     name: String,
     ty: IrType,
     offset: u32,
+    /// Schema name when the param is a schema-typed instance carried
+    /// as a pointer-indirect slot in the `MainParams` fixed area.
+    /// `None` for scalar / String / List<Int> params. Used so a
+    /// `Variable(x)` reference can lift the pointer to an absolute
+    /// address and so `x.method()` resolves through the schema's
+    /// method table.
+    schema_brand: Option<String>,
+    /// When `schema_brand` is set this carries the canonical schema
+    /// shape so multi-segment field walks (`x.a.b`) can find the
+    /// nested field layouts without re-running the type resolver.
+    /// `None` for non-schema bindings.
+    schema: Option<Schema>,
 }
 
 fn build_local_index(
@@ -495,11 +670,24 @@ fn build_local_index(
     debug_assert_eq!(main_schema.fields.len(), sig.params.len());
     let mut out = Vec::with_capacity(sig.params.len());
     for (field, slot) in main_schema.fields.iter().zip(layout.fields.iter()) {
-        let ir_ty = type_repr_to_ir_type(&field.ty)?;
+        let (ir_ty, schema_brand, schema_shape) = match &field.ty {
+            TypeRepr::Schema { schema } => (
+                // Schema-typed params ride a pointer slot in the
+                // fixed area; the IR-level brand stays I32 but the
+                // binding remembers the schema name for method
+                // dispatch + nested field walks.
+                IrType::I32,
+                Some(schema.name.clone()),
+                Some((**schema).clone()),
+            ),
+            other => (type_repr_to_ir_type(other)?, None, None),
+        };
         out.push(LocalBinding {
             name: field.name.clone(),
             ty: ir_ty,
             offset: slot.offset as u32,
+            schema_brand,
+            schema: schema_shape,
         });
     }
     Ok(out)
@@ -740,12 +928,43 @@ fn lower_fn_call(
     }
 
     // Method-call form. Lower the receiver first to surface its IR
-    // type, then dispatch on the (ty, name) pair.
-    lower_method_receiver(receiver_segments, range, ctx)?;
+    // type and schema brand, then route to either schema-rooted
+    // dispatch (when the receiver carries a brand) or the stdlib
+    // method table.
+    let receiver_brand = lower_method_receiver(receiver_segments, range, ctx)?;
     let receiver_ty = *ctx.tstack.last().ok_or(LoweringError::UnsupportedExpr {
         kind: format!("FnCall(receiver-stack-empty for `{}`)", method_name),
         range,
     })?;
+    // Schema-rooted dispatch beats the stdlib table when both could
+    // resolve the call — Phase 5 keeps user methods first-class. The
+    // stdlib path stays available for receivers without a brand
+    // (`String::length`, `List<Int>::length`).
+    if let Some(schema_name) = receiver_brand.as_deref() {
+        if let Some((fn_index, param_tys, ret_ty)) = ctx
+            .method_registry
+            .lookup
+            .get(&(schema_name.to_string(), method_name.to_string()))
+            .copied()
+            .and_then(|idx| {
+                ctx.method_registry
+                    .sigs
+                    .get(&(schema_name.to_string(), method_name.to_string()))
+                    .cloned()
+                    .map(|(p, r)| (idx, p, r))
+            })
+        {
+            return finish_schema_method_call(
+                fn_index,
+                param_tys,
+                ret_ty,
+                args,
+                method_name,
+                range,
+                ctx,
+            );
+        }
+    }
     let Some(fn_index) = stdlib_method_index(receiver_ty, method_name) else {
         return Err(LoweringError::UnknownStdlibMethod {
             name: method_name.to_string(),
@@ -816,37 +1035,206 @@ fn lower_fn_call(
 }
 
 /// Lower the receiver of a method-call into the top of the virtual
-/// stack. Single-segment string receivers go through `lower_variable`
-/// (a bare identifier path); a [`TokenKey::Dynamic`] receiver carries
-/// a full sub-expression we lower recursively.
+/// stack. Returns the schema brand of the receiver (the schema name
+/// the analyzer would dispatch against) when one is statically
+/// resolvable; `None` for scalar / String / List<Int> / sub-expression
+/// receivers. The caller uses the brand to decide whether to route
+/// through the schema-method registry or the stdlib method table.
 fn lower_method_receiver(
     receiver_segments: &[TokenKey],
     range: TokenRange,
     ctx: &mut LowerCtx<'_>,
-) -> Result<(), LoweringError> {
-    // The common Phase 4.a shapes:
-    //   `s.length()`           → segments = [String("s")]
-    //   `("hi").length()`      → segments = [Dynamic(Node(String("hi")))]
-    // Anything else (e.g. dotted multi-segment paths like
-    // `a.b.length()`) is reserved for later phases.
+) -> Result<Option<String>, LoweringError> {
+    // Single-segment receivers: bare identifier (`s.length()`) or
+    // parenthesised sub-expression (`("hi").length()`).
     if receiver_segments.len() == 1 {
         match &receiver_segments[0] {
-            TokenKey::String(_, _, _) => lower_variable(receiver_segments, range, ctx),
-            TokenKey::Dynamic(node, _) => lower_expr(&node.expr, node.range, ctx),
-            _ => Err(LoweringError::UnsupportedExpr {
-                kind: "FnCall(unsupported-receiver-key)".to_string(),
-                range,
-            }),
+            TokenKey::String(name, _, _) => {
+                let brand = resolve_receiver_schema_brand(receiver_segments, ctx);
+                lower_variable(receiver_segments, range, ctx)?;
+                // Source-form check covers static `Schema.method(...)`
+                // — when the head names a schema directly, the brand
+                // returned above is the schema name; no extra work.
+                let _ = name;
+                return Ok(brand);
+            }
+            TokenKey::Dynamic(node, _) => {
+                lower_expr(&node.expr, node.range, ctx)?;
+                return Ok(None);
+            }
+            _ => {
+                return Err(LoweringError::UnsupportedExpr {
+                    kind: "FnCall(unsupported-receiver-key)".to_string(),
+                    range,
+                });
+            }
         }
-    } else {
-        Err(LoweringError::UnsupportedExpr {
-            kind: format!(
-                "FnCall(multi-segment-receiver, segments={})",
-                receiver_segments.len()
-            ),
-            range,
-        })
     }
+    // Multi-segment receivers (`obj.sub.method()` → segments=[obj, sub]).
+    // We route through `lower_variable` so the chained field walk +
+    // schema-brand inheritance kick in. The brand of the final field
+    // segment is the receiver brand; resolving it stays a static walk
+    // so the caller can re-key the registry without extra runtime
+    // information.
+    if receiver_segments
+        .iter()
+        .all(|seg| matches!(seg, TokenKey::String(_, _, _)))
+    {
+        let brand = resolve_receiver_schema_brand(receiver_segments, ctx);
+        lower_variable(receiver_segments, range, ctx)?;
+        return Ok(brand);
+    }
+    Err(LoweringError::UnsupportedExpr {
+        kind: format!(
+            "FnCall(multi-segment-receiver, segments={})",
+            receiver_segments.len()
+        ),
+        range,
+    })
+}
+
+/// Statically inspect the receiver path against the current lowering
+/// context and return the schema brand that the receiver's tail
+/// segment would carry. Used by [`lower_method_receiver`] to decide
+/// whether `obj.method()` should hit the schema-method registry.
+/// Returns `None` when the receiver is not statically schema-typed.
+fn resolve_receiver_schema_brand(
+    receiver_segments: &[TokenKey],
+    ctx: &LowerCtx<'_>,
+) -> Option<String> {
+    let head = match receiver_segments.first()? {
+        TokenKey::String(s, _, _) => s.as_str(),
+        _ => return None,
+    };
+    // Determine the head's schema shape (if any) from the in-scope
+    // bindings: `self`, then let-bindings (innermost first), then
+    // method params, then `#main` params, then a static schema name.
+    let mut current_schema: Option<Schema> = if let Some(self_b) = ctx.self_binding.as_ref() {
+        if head == "self" {
+            Some(self_b.schema.clone())
+        } else if let Some(b) = ctx.lets.iter().rev().find(|b| b.name == head) {
+            b.schema_brand
+                .as_deref()
+                .and_then(|n| ctx.schema_resolver.resolve(n))
+                .and_then(|def| {
+                    let mut stack: Vec<&str> = Vec::new();
+                    canonical_schema_from_def(def, &ctx.schema_resolver, &mut stack, def.range).ok()
+                })
+        } else if let Some(p) = ctx.method_params.iter().find(|p| p.name == head) {
+            p.schema.clone()
+        } else {
+            None
+        }
+    } else if let Some(b) = ctx.lets.iter().rev().find(|b| b.name == head) {
+        b.schema_brand
+            .as_deref()
+            .and_then(|n| ctx.schema_resolver.resolve(n))
+            .and_then(|def| {
+                let mut stack: Vec<&str> = Vec::new();
+                canonical_schema_from_def(def, &ctx.schema_resolver, &mut stack, def.range).ok()
+            })
+    } else if let Some(p) = ctx.params.iter().find(|b| b.name == head) {
+        p.schema.clone()
+    } else {
+        // Static `Schema.method(...)` form: the head names a schema
+        // directly. The walker treats the schema name itself as the
+        // brand; no `self` instance is on the stack so emitting the
+        // call from this form would still need an instance — for
+        // Phase 5 we leave this surface unsupported and return
+        // `None`, falling through to stdlib dispatch.
+        return None;
+    };
+    // Walk any chained field segments to find the brand of the final
+    // segment.
+    for seg in receiver_segments[1..].iter() {
+        let TokenKey::String(name, _, _) = seg else {
+            return None;
+        };
+        let schema = current_schema.take()?;
+        let field = schema.fields.iter().find(|f| &f.name == name)?;
+        current_schema = match &field.ty {
+            TypeRepr::Schema { schema } => Some((**schema).clone()),
+            _ => None,
+        };
+    }
+    current_schema.map(|s| s.name)
+}
+
+/// Finish a schema-method `Op::Call` emit: validate / lower
+/// non-receiver args, type-check each against the method's
+/// signature, then emit the call op with the resolved fn_index.
+/// Assumes the receiver is already on top of the vstack.
+fn finish_schema_method_call(
+    fn_index: u32,
+    param_tys: Vec<IrType>,
+    ret_ty: IrType,
+    args: &[relon_parser::CallArg],
+    method_name: &str,
+    range: TokenRange,
+    ctx: &mut LowerCtx<'_>,
+) -> Result<(), LoweringError> {
+    let arity = param_tys.len() as u32;
+    let expected_args = arity.saturating_sub(1) as usize;
+    if args.len() != expected_args {
+        return Err(LoweringError::UnknownStdlibMethod {
+            name: method_name.to_string(),
+            arity,
+            range,
+        });
+    }
+    // Validate the receiver slot against param[0].
+    let pushed_receiver = ctx.tstack.pop().ok_or(LoweringError::UnsupportedExpr {
+        kind: format!("FnCall(receiver-stack-empty for `{}`)", method_name),
+        range,
+    })?;
+    if pushed_receiver.wasm_slot() != param_tys[0].wasm_slot() {
+        return Err(LoweringError::StdlibArgTypeMismatch {
+            name: method_name.to_string(),
+            arg_idx: 0,
+            got: pushed_receiver,
+            expected: param_tys[0],
+            range,
+        });
+    }
+    ctx.tstack.push(pushed_receiver);
+    for (i, call_arg) in args.iter().enumerate() {
+        if call_arg.name.is_some() {
+            return Err(LoweringError::UnsupportedExpr {
+                kind: format!("FnCall(named-arg `{}` for schema method)", method_name),
+                range,
+            });
+        }
+        lower_expr(&call_arg.value.expr, call_arg.value.range, ctx)?;
+        let pushed = ctx.tstack.pop().ok_or(LoweringError::UnsupportedExpr {
+            kind: format!("FnCall(arg{}-stack-empty for `{}`)", i + 1, method_name),
+            range,
+        })?;
+        let expected = param_tys[i + 1];
+        if pushed.wasm_slot() != expected.wasm_slot() {
+            return Err(LoweringError::StdlibArgTypeMismatch {
+                name: method_name.to_string(),
+                arg_idx: (i + 1) as u32,
+                got: pushed,
+                expected,
+                range,
+            });
+        }
+        ctx.tstack.push(pushed);
+    }
+    for _ in 0..arity {
+        ctx.tstack.pop();
+    }
+    ctx.out.push(TaggedOp {
+        op: Op::Call {
+            fn_index,
+            arg_count: arity,
+            param_tys: param_tys.clone(),
+            ret_ty,
+        },
+        range,
+    });
+    ctx.tstack.push(ret_ty);
+    Ok(())
 }
 
 /// Validate a single argument's IR type against the stdlib
@@ -934,6 +1322,7 @@ fn lower_where(
             name,
             idx,
             ty: value_ty,
+            schema_brand: None,
         });
     }
     lower_expr(&expr.expr, expr.range, ctx)?;
@@ -1751,6 +2140,7 @@ fn lower_dict_into_record(
             name: canonical_field.name.clone(),
             idx: let_idx,
             ty: bound_ty,
+            schema_brand: None,
         });
     }
 
@@ -1877,18 +2267,27 @@ fn lower_dict_default(
 /// scope first (innermost shadow wins) and falls back to the `#main`
 /// parameter index. The let-binding hit emits an [`Op::LetGet`]; the
 /// param hit emits a typed [`Op::LoadField`] reading from the `in_buf`.
+///
+/// Phase 5 extends the surface in two ways:
+///
+/// * `self` (when the lowering context owns a `self_binding`) lowers
+///   to the wasm-local that holds the schema instance's absolute
+///   address.
+/// * Multi-segment paths whose head resolves to a schema-typed
+///   binding chase field offsets through the schema's layout chain,
+///   emitting [`Op::LoadFieldAtAbsolute`] per segment.
 fn lower_variable(
     path: &[TokenKey],
     range: TokenRange,
     ctx: &mut LowerCtx<'_>,
 ) -> Result<(), LoweringError> {
-    if path.len() != 1 {
+    if path.is_empty() {
         return Err(LoweringError::UnsupportedExpr {
-            kind: "Variable(multi-segment)".to_string(),
+            kind: "Variable(empty-path)".to_string(),
             range,
         });
     }
-    let name = match &path[0] {
+    let head = match &path[0] {
         TokenKey::String(s, _, _) => s.as_str(),
         TokenKey::Index(_, _) | TokenKey::Dummy | TokenKey::Spread(_) | TokenKey::Dynamic(_, _) => {
             return Err(LoweringError::UnsupportedExpr {
@@ -1897,9 +2296,50 @@ fn lower_variable(
             });
         }
     };
-    // Let-binding lookup walks innermost-first (`rev`) so a shadowed
-    // name resolves to the most recently pushed binding.
-    if let Some(b) = ctx.lets.iter().rev().find(|b| b.name == name) {
+    // The walker pushes a value onto the vstack representing the
+    // root binding's IR type plus, for schema-typed roots, the
+    // canonical schema shape and brand so chained field offsets can
+    // be resolved deeper down the path.
+    let mut current_schema: Option<Schema>;
+    if let Some(self_b) = ctx.self_binding.clone() {
+        if head == "self" {
+            ctx.out.push(TaggedOp {
+                op: Op::LocalGet(self_b.wasm_local_idx),
+                range,
+            });
+            ctx.tstack.push(IrType::I32);
+            current_schema = Some(self_b.schema.clone());
+        } else if let Some(b) = ctx.lets.iter().rev().find(|b| b.name == head).cloned() {
+            ctx.out.push(TaggedOp {
+                op: Op::LetGet {
+                    idx: b.idx,
+                    ty: b.ty,
+                },
+                range,
+            });
+            ctx.tstack.push(b.ty);
+            current_schema = b
+                .schema_brand
+                .as_deref()
+                .and_then(|n| ctx.schema_resolver.resolve(n))
+                .and_then(|def| {
+                    let mut stack: Vec<&str> = Vec::new();
+                    canonical_schema_from_def(def, &ctx.schema_resolver, &mut stack, range).ok()
+                });
+        } else if let Some(p) = ctx.method_params.iter().find(|p| p.name == head).cloned() {
+            ctx.out.push(TaggedOp {
+                op: Op::LocalGet(p.wasm_local_idx),
+                range,
+            });
+            ctx.tstack.push(p.ty);
+            current_schema = p.schema;
+        } else {
+            return Err(LoweringError::UnresolvedVariable {
+                name: head.to_string(),
+                range,
+            });
+        }
+    } else if let Some(b) = ctx.lets.iter().rev().find(|b| b.name == head).cloned() {
         ctx.out.push(TaggedOp {
             op: Op::LetGet {
                 idx: b.idx,
@@ -1908,30 +2348,395 @@ fn lower_variable(
             range,
         });
         ctx.tstack.push(b.ty);
+        current_schema = b
+            .schema_brand
+            .as_deref()
+            .and_then(|n| ctx.schema_resolver.resolve(n))
+            .and_then(|def| {
+                let mut stack: Vec<&str> = Vec::new();
+                canonical_schema_from_def(def, &ctx.schema_resolver, &mut stack, range).ok()
+            });
+    } else {
+        let binding = ctx
+            .params
+            .iter()
+            .find(|b| b.name == head)
+            .cloned()
+            .ok_or_else(|| LoweringError::UnresolvedVariable {
+                name: head.to_string(),
+                range,
+            })?;
+        // Pointer-indirect leaves (`String` / `ListInt`) get their own
+        // op tag so a later phase can hang String / List operations
+        // off them without re-deriving the type from the slot. Schema
+        // params lift the buffer-relative pointer to an absolute
+        // address via `LoadSchemaPtr`.
+        let op = match (binding.ty, binding.schema_brand.as_deref()) {
+            (IrType::I32, Some(_)) => Op::LoadSchemaPtr {
+                offset: binding.offset,
+            },
+            (IrType::String, _) => Op::LoadStringPtr {
+                offset: binding.offset,
+            },
+            (IrType::ListInt, _) => Op::LoadListIntPtr {
+                offset: binding.offset,
+            },
+            _ => Op::LoadField {
+                offset: binding.offset,
+                ty: binding.ty,
+            },
+        };
+        ctx.out.push(TaggedOp { op, range });
+        ctx.tstack.push(binding.ty);
+        current_schema = binding.schema.clone();
+    }
+
+    // Walk any remaining segments against the schema layout chain.
+    // Each segment pops the i32 absolute address, computes the
+    // field's offset + IR type from the canonical schema, and emits a
+    // matching `LoadFieldAtAbsolute`. The pushed type adopts the
+    // field's IR shape; schema-typed fields preserve the brand for
+    // further chained access.
+    if path.len() == 1 {
         return Ok(());
     }
-    let binding = ctx.params.iter().find(|b| b.name == name).ok_or_else(|| {
-        LoweringError::UnresolvedVariable {
-            name: name.to_string(),
+    for seg in &path[1..] {
+        let field_name = match seg {
+            TokenKey::String(s, _, _) => s.as_str(),
+            _ => {
+                return Err(LoweringError::UnsupportedExpr {
+                    kind: "Variable(non-string-segment)".to_string(),
+                    range,
+                });
+            }
+        };
+        let Some(schema) = current_schema.clone() else {
+            return Err(LoweringError::UnsupportedExpr {
+                kind: format!(
+                    "Variable(field-on-non-schema-base, segment=`{}`)",
+                    field_name
+                ),
+                range,
+            });
+        };
+        // Recompute the layout for the current schema shape. Cached
+        // canonical schemas are reused across calls so the resolver
+        // doesn't repeatedly re-walk the analyzer tree.
+        let layout = SchemaLayout::offsets_for(&schema)?;
+        let field_idx = schema
+            .fields
+            .iter()
+            .position(|f| f.name == field_name)
+            .ok_or_else(|| LoweringError::UnsupportedFieldType {
+                schema: schema.name.clone(),
+                field: field_name.to_string(),
+                ty: "(unknown field)".to_string(),
+                range,
+            })?;
+        let field_meta = &schema.fields[field_idx];
+        let layout_field = &layout.fields[field_idx];
+        // Pop the base address.
+        let popped = ctx.tstack.pop().ok_or(LoweringError::UnsupportedExpr {
+            kind: "Variable(field-load-stack-empty)".to_string(),
             range,
+        })?;
+        if popped.wasm_slot() != IrType::I32 {
+            return Err(LoweringError::UnsupportedExpr {
+                kind: format!("Variable(field-base-not-i32, got={:?})", popped),
+                range,
+            });
         }
-    })?;
-    // Pointer-indirect leaves (`String` / `ListInt`) get their own op
-    // tag so a later phase can hang String / List operations off them
-    // without re-deriving the type from the slot.
-    let op = match binding.ty {
-        IrType::String => Op::LoadStringPtr {
-            offset: binding.offset,
-        },
-        IrType::ListInt => Op::LoadListIntPtr {
-            offset: binding.offset,
-        },
-        _ => Op::LoadField {
-            offset: binding.offset,
-            ty: binding.ty,
-        },
-    };
-    ctx.out.push(TaggedOp { op, range });
-    ctx.tstack.push(binding.ty);
+        let field_ir = type_repr_to_ir_type_dict(&field_meta.ty);
+        ctx.out.push(TaggedOp {
+            op: Op::LoadFieldAtAbsolute {
+                offset: layout_field.offset as u32,
+                ty: field_ir,
+            },
+            range,
+        });
+        ctx.tstack.push(field_ir);
+        // Update walking state for the next segment.
+        current_schema = match &field_meta.ty {
+            TypeRepr::Schema { schema } => Some((**schema).clone()),
+            _ => None,
+        };
+    }
     Ok(())
+}
+
+// =====================================================================
+// Phase 5: schema method lowering.
+// =====================================================================
+
+/// One enumerated user-declared schema method, paired with the
+/// canonical shape of its owning schema. Built by [`enumerate_methods`]
+/// before any body lowering so each method's wasm-level function
+/// index is decided up front — that's the prerequisite for inter-
+/// method calls (`self.other_method()`) and for `obj.method()` calls
+/// from the entry body, both of which resolve through
+/// [`SchemaMethodRegistry`].
+#[derive(Debug, Clone)]
+struct EnumeratedMethod {
+    /// Owning schema name (key into the registry).
+    schema_name: String,
+    /// Canonical shape of the owning schema — supplied to the
+    /// `SelfBinding` so method-body `self.field` walks reuse it.
+    schema_shape: Schema,
+    /// Analyzer-side metadata for the method (param types, body
+    /// node, return type).
+    info: SchemaMethodInfo,
+    /// IR-level index this method occupies in `Module::funcs`.
+    ir_idx: usize,
+}
+
+/// Walk every schema with a non-empty methods list, snapshot the
+/// methods in source order, and assign IR-side indices. Methods with
+/// `is_native` bodies are skipped — Phase 5 does not yet implement
+/// the host-import path; the analyzer would have already accepted
+/// `#native` methods as opaque references.
+fn enumerate_methods<'a>(
+    tree: &'a AnalyzedTree,
+    resolver: &SchemaResolver<'a>,
+) -> Result<Vec<EnumeratedMethod>, LoweringError> {
+    let mut out: Vec<EnumeratedMethod> = Vec::new();
+    // Stable iteration order: schemas appear sorted by name. Without
+    // sorting, the HashMap's iteration order would shift the wasm
+    // function indices across compiles, breaking `relon.srcmap`
+    // determinism the harness relies on.
+    let mut schema_names: Vec<&String> = tree.schema_methods.keys().collect();
+    schema_names.sort();
+    for name in schema_names {
+        let methods = match tree.schema_methods.get(name) {
+            Some(m) if !m.is_empty() => m,
+            _ => continue,
+        };
+        // Resolve the schema definition into a canonical shape so the
+        // method body can walk `self.field` against a stable
+        // `Schema` value. Schemas not in the resolver (e.g. native
+        // carriers, anonymous dict schemas) get skipped — they don't
+        // contribute method bodies the IR can emit.
+        let Some(def) = resolver.resolve(name.as_str()) else {
+            continue;
+        };
+        let mut stack: Vec<&str> = Vec::new();
+        let schema_shape = canonical_schema_from_def(def, resolver, &mut stack, def.range)?;
+        for info in methods {
+            if info.is_native || info.body_node.is_none() {
+                continue;
+            }
+            let ir_idx = out.len();
+            out.push(EnumeratedMethod {
+                schema_name: name.clone(),
+                schema_shape: schema_shape.clone(),
+                info: info.clone(),
+                ir_idx,
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// Lower every enumerated schema method into an IR `Func` and build
+/// the dispatch registry mapping `(schema_name, method_name)` to its
+/// combined wasm-level function index plus signature. Called once per
+/// entry-module lowering, before the entry body walk consumes the
+/// registry.
+fn lower_schema_methods<'a>(
+    tree: &'a AnalyzedTree,
+    resolver: &SchemaResolver<'a>,
+) -> Result<(Vec<Func>, SchemaMethodRegistry), LoweringError> {
+    let enumerated = enumerate_methods(tree, resolver)?;
+    let stdlib_offset = stdlib_function_count();
+    let mut registry = SchemaMethodRegistry::default();
+    // First pass: populate the registry so a method body lowered in
+    // the second pass can self-dispatch to a sibling method whose
+    // body hasn't been emitted yet (`bar()` from inside `foo()`).
+    let mut method_sigs: Vec<MethodSig> = Vec::new();
+    for m in &enumerated {
+        let sig = method_signature_ir_types(&m.info, resolver)?;
+        let wasm_idx = stdlib_offset + m.ir_idx as u32;
+        let key = (m.schema_name.clone(), m.info.name.clone());
+        registry.lookup.insert(key.clone(), wasm_idx);
+        registry
+            .sigs
+            .insert(key, (sig.param_tys.clone(), sig.ret_ty));
+        method_sigs.push(sig);
+    }
+    // Second pass: lower each method's body now that the registry is
+    // fully populated.
+    let mut funcs: Vec<Func> = Vec::with_capacity(enumerated.len());
+    for (m, sig) in enumerated.iter().zip(method_sigs.into_iter()) {
+        let func = lower_one_method(m, &sig, resolver, &registry)?;
+        funcs.push(func);
+    }
+    Ok((funcs, registry))
+}
+
+/// Resolved IR-side signature for one schema method. Built once per
+/// method during the first pass through [`lower_schema_methods`] and
+/// re-used when emitting the body. `param_schemas[i]` is `Some(_)`
+/// when the i-th param (including the leading `self` slot) is schema-
+/// typed and carries the canonical schema shape so chained-segment
+/// reads inside the method body resolve their layouts statically.
+#[derive(Debug, Clone)]
+struct MethodSig {
+    param_tys: Vec<IrType>,
+    ret_ty: IrType,
+    param_schemas: Vec<Option<Schema>>,
+}
+
+/// Translate a `SchemaMethodInfo`'s declared param + return types to
+/// IR-side types plus, for schema-typed params, their canonical shape
+/// (needed so method-body walks can resolve chained field access on
+/// those params). Phase 5 restricts the return surface to scalar /
+/// `Bool` / `Null` types — variable-length return values (`String` /
+/// `List<Int>` / nested dict) require a tail-cursor protocol the
+/// non-entry wasm signature doesn't carry yet.
+fn method_signature_ir_types(
+    info: &SchemaMethodInfo,
+    resolver: &SchemaResolver<'_>,
+) -> Result<MethodSig, LoweringError> {
+    // The receiver `self` is implicit at the source level; the IR
+    // function carries it as an explicit i32 parameter at slot 0.
+    let mut param_tys: Vec<IrType> = vec![IrType::I32];
+    let mut param_schemas: Vec<Option<Schema>> = vec![None];
+    for p in &info.params {
+        let repr =
+            type_node_to_canonical_with_schemas(&p.type_node, resolver).ok_or_else(|| {
+                LoweringError::UnsupportedTypeInMain {
+                    type_name: type_head_for_display(&p.type_node),
+                    range: p.type_node.range,
+                }
+            })?;
+        match repr {
+            TypeRepr::Schema { schema } => {
+                param_tys.push(IrType::I32);
+                param_schemas.push(Some(*schema));
+            }
+            other => {
+                param_tys.push(type_repr_to_ir_type(&other)?);
+                param_schemas.push(None);
+            }
+        }
+    }
+    let ret_repr =
+        type_node_to_canonical_with_schemas(&info.return_type, resolver).ok_or_else(|| {
+            LoweringError::UnsupportedTypeInMain {
+                type_name: type_head_for_display(&info.return_type),
+                range: info.return_type.range,
+            }
+        })?;
+    // Phase 5 scope: only scalar / `Bool` / `Null` returns ride the
+    // wasm function's single-value return slot. Variable-length
+    // returns are deferred — they need a tail-cursor handshake the
+    // non-entry signature doesn't carry yet.
+    let ret_ty = match ret_repr {
+        TypeRepr::Int => IrType::I64,
+        TypeRepr::Float => IrType::F64,
+        TypeRepr::Bool => IrType::Bool,
+        TypeRepr::Null => IrType::Null,
+        _ => {
+            return Err(LoweringError::UnsupportedTypeInMain {
+                type_name: type_head_for_display(&info.return_type),
+                range: info.return_type.range,
+            });
+        }
+    };
+    Ok(MethodSig {
+        param_tys,
+        ret_ty,
+        param_schemas,
+    })
+}
+
+/// Lower one schema method body into a `Func`. Self lives at wasm
+/// local `0`; declared parameters fill locals `1..=N`. The body must
+/// leave exactly one value of the declared return type on the
+/// operand stack — the trailing `Op::Return` marker handles wasm
+/// emission.
+fn lower_one_method<'a>(
+    m: &EnumeratedMethod,
+    sig: &MethodSig,
+    resolver: &SchemaResolver<'a>,
+    registry: &SchemaMethodRegistry,
+) -> Result<Func, LoweringError> {
+    let MethodSig {
+        param_tys,
+        ret_ty,
+        param_schemas,
+    } = sig;
+    let ret_ty = *ret_ty;
+    let body_node = m
+        .info
+        .body_node
+        .as_ref()
+        .ok_or_else(|| LoweringError::UnsupportedExpr {
+            kind: format!("SchemaMethod(no-body for `{}`)", m.info.name),
+            range: m.info.range,
+        })?;
+    // Build the per-param metadata, skipping the leading `self` slot
+    // since the method ctx tracks it separately via `SelfBinding`.
+    let mut method_params: Vec<MethodParam> = Vec::with_capacity(m.info.params.len());
+    for (i, p) in m.info.params.iter().enumerate() {
+        let wasm_local_idx = (i + 1) as u32;
+        // `param_tys[0]` is `self`; the user-declared params start at
+        // index 1.
+        let ty = param_tys[i + 1];
+        let schema = param_schemas.get(i + 1).cloned().unwrap_or(None);
+        method_params.push(MethodParam {
+            name: p.name.clone(),
+            ty,
+            wasm_local_idx,
+            schema,
+        });
+    }
+    let self_binding = SelfBinding {
+        wasm_local_idx: 0,
+        schema: m.schema_shape.clone(),
+    };
+    // `params: &[]` — the method body has no `#main` param surface;
+    // every reference flows through `self_binding` / `method_params`
+    // / `lets`.
+    const EMPTY_PARAMS: &[LocalBinding] = &[];
+    let mut ctx = LowerCtx::new_method(
+        EMPTY_PARAMS,
+        resolver.clone(),
+        registry.clone(),
+        self_binding,
+        method_params,
+    );
+    lower_expr(&body_node.expr, body_node.range, &mut ctx)?;
+    // Validate the body left exactly one value of the declared
+    // return type on the virtual stack.
+    let top = ctx
+        .tstack
+        .last()
+        .copied()
+        .ok_or_else(|| LoweringError::UnsupportedExpr {
+            kind: format!(
+                "SchemaMethod(`{}::{}`) body produced no value",
+                m.schema_name, m.info.name
+            ),
+            range: body_node.range,
+        })?;
+    if top.wasm_slot() != ret_ty.wasm_slot() {
+        return Err(LoweringError::UnsupportedTypeInMain {
+            type_name: format!(
+                "method `{}::{}` returns `{:?}` but body produced `{:?}`",
+                m.schema_name, m.info.name, ret_ty, top
+            ),
+            range: body_node.range,
+        });
+    }
+    ctx.out.push(TaggedOp {
+        op: Op::Return,
+        range: body_node.range,
+    });
+    Ok(Func {
+        name: format!("__method_{}__{}", m.schema_name, m.info.name),
+        params: param_tys.to_vec(),
+        ret: ret_ty,
+        body: ctx.out,
+        range: m.info.range,
+    })
 }
