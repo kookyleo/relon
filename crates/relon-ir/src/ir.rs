@@ -409,4 +409,58 @@ pub enum Op {
         /// 8 for ListInt).
         ty: IrType,
     },
+
+    /// Phase 4.a stdlib dispatch.
+    ///
+    /// Pop `arg_count` operands off the virtual stack in matching
+    /// order (last argument pushed last) and emit a wasm `call
+    /// <fn_index>`. Pushes one value of `ret_ty` back onto the stack.
+    ///
+    /// The `fn_index` is a wasm-level function index — that is, an
+    /// index into the module's combined function table where Phase
+    /// 4.a prepends the bundled stdlib functions before the user
+    /// functions. Codegen does **not** rewrite this index; the
+    /// lowering pass is responsible for picking the correct stdlib
+    /// or user function slot via [`crate::stdlib::stdlib_function_index`].
+    ///
+    /// The lowering pass validates parameter types when it builds
+    /// this op; codegen re-checks the popped operand types match the
+    /// wasm slot of each declared param type so a hand-built IR
+    /// with mismatched arg/ret types surfaces deterministically.
+    Call {
+        /// Combined wasm-module function index of the callee.
+        fn_index: u32,
+        /// Number of arguments to pop off the stack before emitting
+        /// the call. Codegen pops them in reverse-push order and
+        /// validates the wasm slot of each against the callee's
+        /// declared param types.
+        arg_count: u32,
+        /// Argument types expected by the callee, in declaration
+        /// order. Codegen pops `arg_count` operands and verifies
+        /// each one's wasm slot matches the matching `param_tys`
+        /// entry; mismatches surface as
+        /// `CodegenError::CallTypeMismatch`.
+        param_tys: Vec<IrType>,
+        /// IR type pushed back onto the stack after the call.
+        ret_ty: IrType,
+    },
+
+    /// Phase 4.a stdlib primitive.
+    ///
+    /// Pop a `String` pointer (i32 wasm slot, absolute wasm-memory
+    /// address of a `[len:u32 LE][utf8 bytes]` record) and push the
+    /// length as an `I64` value. Codegen lowers to:
+    ///
+    /// ```text
+    /// i32.load offset=0 align=2   ;; u32 LE length prefix
+    /// i64.extend_i32_u            ;; widen to i64 for the IR's Int slot
+    /// ```
+    ///
+    /// Kept as its own op (rather than reusing `LoadField`) because
+    /// the operation isn't field-name-driven: the pointer source is
+    /// the value on top of the stack, and the load offset is fixed
+    /// at zero by the record layout. A dedicated op also keeps
+    /// diagnostics from confusing a stdlib byte-length read with a
+    /// user-facing field load.
+    ReadStringLen,
 }

@@ -20,6 +20,7 @@
 pub mod error;
 pub mod ir;
 pub mod lowering;
+pub mod stdlib;
 
 pub use error::LoweringError;
 pub use ir::{Func, IrType, Module, Op, TaggedOp};
@@ -27,4 +28,7 @@ pub use lowering::{
     lower_workspace, lower_workspace_single, LoweredEntry, MAIN_PARAMS_SCHEMA_NAME,
     MAIN_RETURN_SCHEMA_NAME, RETURN_VALUE_FIELD_NAME, WASM_LOCAL_IN_LEN, WASM_LOCAL_IN_PTR,
     WASM_LOCAL_OUT_CAP, WASM_LOCAL_OUT_PTR,
+};
+pub use stdlib::{
+    builtin_stdlib, stdlib_function_count, stdlib_function_index, StdlibFunction,
 };

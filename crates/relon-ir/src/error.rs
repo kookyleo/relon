@@ -178,6 +178,41 @@ pub enum LoweringError {
         /// Source range of the default expression.
         range: TokenRange,
     },
+    /// Phase 4.a: a call expression names a stdlib method we don't
+    /// (yet) implement, or the receiver / argument shape doesn't fit
+    /// any builtin signature. Carries the unresolved name + arity so
+    /// the diagnostic message points at the missing entry rather
+    /// than failing with a generic UnsupportedExpr.
+    #[error("unknown stdlib method `{name}` (arity={arity}) in lowering")]
+    UnknownStdlibMethod {
+        /// The offending method / function name as written in source.
+        name: String,
+        /// Number of arguments at the call site (including receiver
+        /// when lowered from method-call form).
+        arity: u32,
+        /// Source range of the call expression.
+        range: TokenRange,
+    },
+    /// Phase 4.a: a stdlib call landed with an argument type that
+    /// doesn't match the function's declared signature. Surfaces a
+    /// receiver / argument typing bug that the analyzer hasn't
+    /// caught yet (e.g. `(1).length()` would target the String-only
+    /// `length` overload with an Int receiver).
+    #[error(
+        "stdlib `{name}` got argument of type `{got:?}`, expected `{expected:?}` (arg index {arg_idx})"
+    )]
+    StdlibArgTypeMismatch {
+        /// Stdlib function name.
+        name: String,
+        /// Argument position in the function signature.
+        arg_idx: u32,
+        /// IR type the caller produced.
+        got: IrType,
+        /// IR type the signature requires.
+        expected: IrType,
+        /// Source range of the call expression.
+        range: TokenRange,
+    },
     /// Phase 3.b: cyclic field-default dependencies — the schema's
     /// fields refer to each other in a way the topological emit pass
     /// can't satisfy. The lowering pass reports the cycle even when
