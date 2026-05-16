@@ -34,7 +34,7 @@ use std::collections::HashMap;
 
 use crate::error::LoweringError;
 use crate::ir::{Func, IrType, Module, Op, TaggedOp};
-use crate::stdlib::{builtin_stdlib, stdlib_function_index};
+use crate::stdlib::{builtin_stdlib, stdlib_function_index, stdlib_method_index};
 
 /// Per-function lowering state shared across the recursive walk.
 ///
@@ -657,54 +657,57 @@ fn lower_fn_call(
     let receiver_segments = &path[..path.len() - 1];
     let arity = if receiver_segments.is_empty() {
         // Free-call form. Each `CallArg` value contributes one
-        // argument; named args are rejected here (Phase 4.a stdlib
-        // doesn't take keyword args).
+        // argument; named args are rejected here (Phase 4.a/4.b
+        // stdlib doesn't take keyword args).
         u32::try_from(args.len()).unwrap_or(u32::MAX)
     } else {
         // Method-call form: the receiver becomes argument 0, and any
-        // additional `args` slots become the remaining arguments. For
-        // Phase 4.a only zero-arg methods are accepted; later phases
-        // (concat / substring / ...) will exercise the `1 + args.len()`
-        // path.
+        // additional `args` slots become the remaining arguments.
+        // Phase 4.b method dispatch is limited to single-arg surface
+        // methods (`length` / `is_empty`); later phases (concat /
+        // substring / ...) will exercise the `1 + args.len()` path.
         1u32 + u32::try_from(args.len()).unwrap_or(u32::MAX)
     };
 
-    // Phase 4.a only opens `length` (String -> Int). Everything else
-    // surfaces a deterministic diagnostic — the analyzer reports the
-    // missing name as `UnresolvedReference`, but the lowering pass
-    // still surfaces its own variant so a hand-built AST or future
-    // stdlib-disabled mode hits a stable rejection.
-    let Some(fn_index) = stdlib_function_index(method_name) else {
-        return Err(LoweringError::UnknownStdlibMethod {
-            name: method_name.to_string(),
-            arity,
-            range,
-        });
-    };
-    // Recover the declared signature so we can pin the param/ret
-    // types onto the emitted `Op::Call`. The codegen pass uses
-    // `param_tys` to validate the vstack at emit time; we keep the
-    // declaration single-sourced via `builtin_stdlib()`.
-    let stdlib_meta = builtin_stdlib()
-        .into_iter()
-        .nth(fn_index as usize)
-        .ok_or_else(|| LoweringError::UnknownStdlibMethod {
-            name: method_name.to_string(),
-            arity,
-            range,
-        })?;
-    if (stdlib_meta.params.len() as u32) != arity {
-        return Err(LoweringError::UnknownStdlibMethod {
-            name: method_name.to_string(),
-            arity,
-            range,
-        });
-    }
-
-    // Lower each argument expression in declaration order so the wasm
-    // stack ends up `[arg0, arg1, ...]` before the `call` op fires.
+    // Method-call form (`s.length()`) and free-call form (`length(s)`)
+    // take different dispatch paths:
+    //
+    //   * Method-call: lower the receiver first so we know its IR type,
+    //     then resolve `(receiver_ty, method_name)` via
+    //     `stdlib_method_index`. This lets the same surface name
+    //     (`length`) dispatch to different bodies based on receiver
+    //     (`String` -> `length`, `List<Int>` -> `list_int_length`).
+    //   * Free-call: resolve directly through `stdlib_function_index`
+    //     on the bare name. Free-call form deliberately doesn't go
+    //     through `stdlib_method_index` so e.g. `length(xs)` for a
+    //     `List<Int>` xs surfaces an `StdlibArgTypeMismatch` rather
+    //     than silently routing to `list_int_length` — callers who
+    //     want list length must use `xs.length()` or call
+    //     `list_int_length(xs)` explicitly.
     if receiver_segments.is_empty() {
-        // Free-call form. `arg0..argN` come from `args` in order.
+        // Free-call form.
+        let Some(fn_index) = stdlib_function_index(method_name) else {
+            return Err(LoweringError::UnknownStdlibMethod {
+                name: method_name.to_string(),
+                arity,
+                range,
+            });
+        };
+        let stdlib_meta = builtin_stdlib()
+            .into_iter()
+            .nth(fn_index as usize)
+            .ok_or_else(|| LoweringError::UnknownStdlibMethod {
+                name: method_name.to_string(),
+                arity,
+                range,
+            })?;
+        if (stdlib_meta.params.len() as u32) != arity {
+            return Err(LoweringError::UnknownStdlibMethod {
+                name: method_name.to_string(),
+                arity,
+                range,
+            });
+        }
         for (i, call_arg) in args.iter().enumerate() {
             if call_arg.name.is_some() {
                 return Err(LoweringError::UnsupportedExpr {
@@ -720,42 +723,82 @@ fn lower_fn_call(
             check_stdlib_arg(method_name, i as u32, pushed, &stdlib_meta.params, range)?;
             ctx.tstack.push(pushed);
         }
-    } else {
-        // Method-call form. The receiver becomes arg0.
-        lower_method_receiver(receiver_segments, range, ctx)?;
-        let pushed = ctx.tstack.pop().ok_or(LoweringError::UnsupportedExpr {
-            kind: format!("FnCall(receiver-stack-empty for `{}`)", method_name),
-            range,
-        })?;
-        check_stdlib_arg(method_name, 0, pushed, &stdlib_meta.params, range)?;
-        ctx.tstack.push(pushed);
-        for (i, call_arg) in args.iter().enumerate() {
-            if call_arg.name.is_some() {
-                return Err(LoweringError::UnsupportedExpr {
-                    kind: format!("FnCall(named-arg `{}` for stdlib)", method_name),
-                    range,
-                });
-            }
-            lower_expr(&call_arg.value.expr, call_arg.value.range, ctx)?;
-            let pushed = ctx.tstack.pop().ok_or(LoweringError::UnsupportedExpr {
-                kind: format!("FnCall(arg{}-stack-empty for `{}`)", i + 1, method_name),
-                range,
-            })?;
-            check_stdlib_arg(
-                method_name,
-                (i + 1) as u32,
-                pushed,
-                &stdlib_meta.params,
-                range,
-            )?;
-            ctx.tstack.push(pushed);
+        for _ in 0..arity {
+            ctx.tstack.pop();
         }
+        ctx.out.push(TaggedOp {
+            op: Op::Call {
+                fn_index,
+                arg_count: arity,
+                param_tys: stdlib_meta.params.clone(),
+                ret_ty: stdlib_meta.ret,
+            },
+            range,
+        });
+        ctx.tstack.push(stdlib_meta.ret);
+        return Ok(());
     }
 
-    // Pop the arguments back off the vstack — we kept them around
-    // only so the per-arg type check could re-push the value before
-    // moving on. The Call op below records the actual pops; emit-time
-    // codegen will pop them again from its own vstack.
+    // Method-call form. Lower the receiver first to surface its IR
+    // type, then dispatch on the (ty, name) pair.
+    lower_method_receiver(receiver_segments, range, ctx)?;
+    let receiver_ty = *ctx.tstack.last().ok_or(LoweringError::UnsupportedExpr {
+        kind: format!("FnCall(receiver-stack-empty for `{}`)", method_name),
+        range,
+    })?;
+    let Some(fn_index) = stdlib_method_index(receiver_ty, method_name) else {
+        return Err(LoweringError::UnknownStdlibMethod {
+            name: method_name.to_string(),
+            arity,
+            range,
+        });
+    };
+    let stdlib_meta = builtin_stdlib()
+        .into_iter()
+        .nth(fn_index as usize)
+        .ok_or_else(|| LoweringError::UnknownStdlibMethod {
+            name: method_name.to_string(),
+            arity,
+            range,
+        })?;
+    if (stdlib_meta.params.len() as u32) != arity {
+        return Err(LoweringError::UnknownStdlibMethod {
+            name: method_name.to_string(),
+            arity,
+            range,
+        });
+    }
+    // The receiver already sits on the vstack — re-check that its
+    // slot matches the callee's declared param[0] so a future
+    // dispatch entry that mistypes its receiver surfaces at lowering
+    // rather than at codegen.
+    let pushed_receiver = ctx.tstack.pop().ok_or(LoweringError::UnsupportedExpr {
+        kind: format!("FnCall(receiver-stack-empty for `{}`)", method_name),
+        range,
+    })?;
+    check_stdlib_arg(method_name, 0, pushed_receiver, &stdlib_meta.params, range)?;
+    ctx.tstack.push(pushed_receiver);
+    for (i, call_arg) in args.iter().enumerate() {
+        if call_arg.name.is_some() {
+            return Err(LoweringError::UnsupportedExpr {
+                kind: format!("FnCall(named-arg `{}` for stdlib)", method_name),
+                range,
+            });
+        }
+        lower_expr(&call_arg.value.expr, call_arg.value.range, ctx)?;
+        let pushed = ctx.tstack.pop().ok_or(LoweringError::UnsupportedExpr {
+            kind: format!("FnCall(arg{}-stack-empty for `{}`)", i + 1, method_name),
+            range,
+        })?;
+        check_stdlib_arg(
+            method_name,
+            (i + 1) as u32,
+            pushed,
+            &stdlib_meta.params,
+            range,
+        )?;
+        ctx.tstack.push(pushed);
+    }
     for _ in 0..arity {
         ctx.tstack.pop();
     }

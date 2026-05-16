@@ -1143,13 +1143,16 @@ fn emit_op_seq(
             }
             Op::ReadStringLen => {
                 let popped = vstack.pop().ok_or(CodegenError::MixedNumericTypes)?;
-                // Receiver must occupy the i32 slot (String pointer).
+                // Receiver must occupy the i32 slot (String / ListInt
+                // pointer). Both record layouts open with a `u32 LE`
+                // length prefix, so the same op serves both.
                 if popped.wasm_slot() != IrType::I32 {
                     return Err(CodegenError::MixedNumericTypes);
                 }
                 // `i32.load offset=0 align=2` reads the u32 LE length
                 // prefix; `i64.extend_i32_u` widens to the I64 return
-                // slot Phase 4.a's `length` signature commits to.
+                // slot the `length` / `list_int_length` stdlib bodies
+                // commit to.
                 f.instruction(&Instruction::I32Load(MemArg {
                     offset: 0,
                     align: 2,
@@ -1159,6 +1162,31 @@ fn emit_op_seq(
                 f.instruction(&Instruction::I64ExtendI32U);
                 ranges.push(tagged.range);
                 vstack.push(IrType::I64);
+            }
+            Op::Select { ty } => {
+                // Wasm `select t` pops `[val_true, val_false, cond_i32]`
+                // and pushes one of the two values. The IR pins both
+                // operand slots to the same `ty` so we re-derive the
+                // wasm slot expectations from a single tag.
+                //
+                // Pop order on the vstack is `cond` first (top of
+                // stack), then `val_false`, then `val_true`. We
+                // validate both operands share the declared slot and
+                // the condition occupies an i32 slot before emitting
+                // the typed select.
+                let cond = vstack.pop().ok_or(CodegenError::MixedNumericTypes)?;
+                if cond.wasm_slot() != IrType::I32 {
+                    return Err(CodegenError::MixedNumericTypes);
+                }
+                let val_false = vstack.pop().ok_or(CodegenError::MixedNumericTypes)?;
+                let val_true = vstack.pop().ok_or(CodegenError::MixedNumericTypes)?;
+                if val_true.wasm_slot() != ty.wasm_slot() || val_false.wasm_slot() != ty.wasm_slot()
+                {
+                    return Err(CodegenError::MixedNumericTypes);
+                }
+                f.instruction(&Instruction::TypedSelect(ir_to_val_type(ty)));
+                ranges.push(tagged.range);
+                vstack.push(*ty);
             }
         }
     }
