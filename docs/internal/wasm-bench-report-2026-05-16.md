@@ -433,6 +433,131 @@ threshold / has regressed by < 10%」区间。所有降幅都不是 wasm-aot 这
 数据来源：`target/criterion/{wasm_aot_cold_start, wasm_aot_warm_invoke,
 tree_walk_total, tree_walk_warm_invoke}/scenario/<name>/new/estimate.json`。
 
+## 附录 A.6：v3 disk-backed AOT cache + where-scope fix bench（Phase 9.b-3，2026-05-17）
+
+Phase 9.b-3 落地两件事：
+
+1. analyzer 的 strict-mode `where { ... }` 作用域 bug 修好。多个
+   wasm-aot 测试用 `#relaxed` 临时绕过的 `UnknownReferenceType` 误报
+   消失，对应的 wasm-aot smoke 测试同步去掉 `#relaxed` 仍 pass。
+2. `crates/relon-codegen-wasm/src/cache.rs` + `AotCache` + 新 API
+   `WasmAotEvaluator::from_source_with_cache`：把 codegen 出来的 wasm
+   字节 + canonical schema 持久化到磁盘，下次启动直接从 `.wasm` +
+   `.schemas` 进 `wasmtime::Module::new`，跳过 parse / analyze / lower
+   / codegen。
+
+同一台 bench 笔记本 + 同一 criterion 配置（`sample_size(50)`,
+`measurement_time(8s)`，CLI 跑 `--warm-up-time 1 --measurement-time 3
+--sample-size 50` 加快全 bench wall-time），新增一组
+`wasm_aot_cold_start_cached`，其余四组 v2 数字基本持平。
+
+### wasm-AOT cold start（v1 / v2 / v3 三档对比）
+
+| Scenario        | v1 (μ) | v2 (μ) | v3 cold (μ) | v3 cold cached (μ) | cached 相对 v3 cold |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `arithmetic`    | 2.223 ms | 2.252 ms | 2.339 ms | **1.081 ms** | −53.8 % |
+| `dict_literal`  | 2.305 ms | 2.335 ms | 2.367 ms | **1.070 ms** | −54.8 % |
+| `stdlib_length` | 2.186 ms | 2.211 ms | 2.257 ms | **1.035 ms** | −54.1 % |
+
+v3 cold 路径（`from_source`，无 cache）和 v1 / v2 同档，差异在 criterion
+报告的「Change within noise threshold」区间——9.b-3 没碰 codegen / wasm-
+encoder / wasmtime 路径，只新加了 `AotCache` 文件。
+
+`wasm_aot_cold_start_cached` 把 cache 提前 prime 到一个 `tempdir`，每
+iter 真实地跑 `WasmAotEvaluator::from_source_with_cache(src, &cache)`：
+
+- cache.load 命中 → `wasmtime::Module::new(&engine, &wasm_bytes)` →
+  解 `.schemas` sidecar → `WasmAotEvaluator::from_bytes` 装配 → 返回。
+- 不进 parse / analyze / lower / codegen 路径。
+- 但 cranelift JIT 仍跑（v1 实现明确不缓存 wasmtime native code）。
+
+实测 1.04 – 1.08 ms，比 v3 cold（2.26 – 2.37 ms）快 ≈ 54 %，落到任务
+书里写的 1 – 1.5 ms 目标区间。剩余的 1 ms 几乎全部是 `Module::new`
+里 cranelift 把 wasm bytecode JIT 成原生机器码的成本，跟 body 长度几乎
+无关。
+
+### wasm-AOT warm invoke（v2 → v3，无变化）
+
+| Scenario        | v2 Median | v3 Median | 变化 |
+| --- | ---: | ---: | ---: |
+| `arithmetic`    | 1.108 μs | 1.102 μs | −0.5 %（噪声内） |
+| `dict_literal`  | 1.313 μs | 1.311 μs | −0.2 %（噪声内） |
+| `stdlib_length` | 1.107 μs | 1.114 μs | +0.6 %（噪声内） |
+
+Phase 9.b-3 没动 `run_main_inner` / session pool / buffer marshal，
+warm path 数字与 v2 不可区分。
+
+### tree-walker（对照组，v2 → v3 持平）
+
+| Group / Scenario | v2 Median | v3 Median | 变化 |
+| --- | ---: | ---: | ---: |
+| `tree_walk_total / arithmetic`    | 1.037 ms | 1.064 ms | +2.6 %（噪声内） |
+| `tree_walk_total / dict_literal`  | 1.182 ms | 1.169 ms | −1.1 %（噪声内） |
+| `tree_walk_total / stdlib_length` | 1.014 ms | 1.181 ms | +16.5 % |
+| `tree_walk_warm_invoke / arithmetic`    | 2.803 μs | 2.636 μs | −6.0 % |
+| `tree_walk_warm_invoke / dict_literal`  | 38.77 μs | 36.54 μs | −5.7 % |
+| `tree_walk_warm_invoke / stdlib_length` | 3.371 μs | 3.308 μs | −1.9 % |
+
+`tree_walk_total / stdlib_length` 这一次的样本被 criterion 标了 8 个
+outlier（5 个 low severe），中位数同时比 v2 高出 16.5 %——但其余两个
+scenario 同组没有同方向漂移，所以这是单次采样噪声，不是回归。Phase
+9.b-3 完全没碰 tree-walker。
+
+### v3 总体读数：cache 把"再次启动"成本砍掉一半
+
+| 路径 | scenario | v3 中位数 | 对比 |
+| --- | --- | ---: | --- |
+| wasm-AOT cold（无 cache）   | `arithmetic` | 2.34 ms  | baseline |
+| wasm-AOT cold（命中 cache） | `arithmetic` | **1.08 ms** | −53.8 % |
+| wasm-AOT warm invoke        | `arithmetic` | 1.10 μs  | v2 持平 |
+| tree-walker warm            | `arithmetic` | 2.64 μs  | wasm-AOT v3 warm 仍快 ≈ 2.4× |
+
+任何"host 重启后第一次跑同一脚本"的场景：v3 cache 把 cold start 从
+2.34 ms 砍到 1.08 ms，节省的 1.26 ms 是 parse / analyze / lower /
+codegen 全套——之后 cranelift JIT 那 ~1 ms 留给后续的 v3+ 工作
+（`wasmtime::Module::serialize` + cranelift 版本 lockstep），属于未来
+phase。
+
+### 决策与遗留
+
+- **磁盘 layout**：`<dir>/<source_hash_hex>.{wasm,meta,schemas}` 三个
+  sidecar。`source_hash = sha256(src)`，`schema_hash = sha256(main ||
+  return)`，meta 还塞 `abi_version` + `codegen_version` + 时间戳。任何
+  drift（abi 不一致 / codegen 不一致 / sidecar 截断）都返回 `Ok(None)`
+  当 cache miss，不报错——host 直接 fall back 到 fresh compile。
+- **schema 持久化**：单纯只存 wasm 不够，`WasmAotEvaluator::from_bytes`
+  需要 main / return 两个 `Schema` 重建 layout。新增 `.schemas` JSON
+  sidecar，schema_canonical 三个类型加 `Deserialize` 派生，rehydration
+  走 `serde_json::from_slice`。
+- **invalidation 选 `abi_version` + `codegen_version` 一起**：
+  abi_version 代表 binary handshake 格式，codegen_version 代表
+  wasm-encoder 编码细节。两者任一漂移都让 cache 失效。schema_hash 也存
+  进 meta，host 侧可以再做一层校验（虽然内部 v1 不消费）。
+- **`wasmtime::Module::serialize` 没做**：这条路径能把 cranelift JIT
+  那 1 ms 也省掉，但是 wasmtime 自身的 native blob 跟 cranelift 版本 +
+  目标 CPU 强绑定，跨 SDK rebuild / 跨 host 机型都不安全。下一 v3+
+  子任务再处理。
+- **bench 用临时目录**：bench 启动前
+  `temp_dir / "relon-bench-aot-cache-{pid}-{nanos}"` 开 cache 根，prime
+  一次走完 cold path，每 iter 命中 hit path；bench 结束 best-effort
+  删目录。
+
+数据来源：`target/criterion/{wasm_aot_cold_start, wasm_aot_cold_start_cached,
+wasm_aot_warm_invoke, tree_walk_total, tree_walk_warm_invoke}/scenario/<name>/new/estimates.json`。
+
+### Phase 9.b 子任务收官小结
+
+| 子任务 | merge | 改动核心 | warm cold 变化 |
+| --- | --- | --- | --- |
+| 9.b-1 | Pool-of-Stores | `Mutex<Vec<WasmSession>>` 复用 session | warm −97.5 % |
+| 9.b-2 | LoadFieldAtAbsolute / cap_grants binding | String/ListInt 输入绑 + Capabilities ↔ caps_avail | 功能修复，bench 持平 |
+| 9.b-3 | analyzer where-scope fix + AOT cache | strict-mode where 通过；磁盘 cache + `from_source_with_cache` | cold cached −54 % |
+
+到此 Phase 9.b 三个子任务都收齐——warm invoke 已经从 v1 的 44 μs 量级
+压到 1 μs 量级，cold start 也从 2.3 ms 量级（带 cache）压到 1 ms 量
+级。剩下两块（`Module::serialize` 持久 native code、`InstancePre` 真
+跨 store 复用）跟 wasmtime / cranelift 版本兼容性深度绑定，推到 v3+。
+
 ## 附录 B：每个 phase 的 merge commit
 
 整链路从 wasm-AOT 第一行字节码到 Phase 9 收官，merge 顺序如下：
