@@ -19,3 +19,19 @@ relon-eval-api = { workspace = true }
 relon-parser = { workspace = true }
 
 thiserror = { workspace = true }
+
+# Low-level WebAssembly module encoder used by the Phase 1.alpha
+# hardcoded smoke generator. Kept in sync with `wasmparser` /
+# `wasmtime` versions below so the binary they exchange shares the
+# same spec proposals.
+wasm-encoder = "0.249"
+
+[dev-dependencies]
+# Spec-compliant validator used by the smoke test to confirm the
+# emitted bytes parse as a valid wasm module before we even try to
+# instantiate them.
+wasmparser = "0.249"
+# Reference engine used to instantiate the hardcoded module and
+# round-trip `run_main`. Default features pull in cranelift +
+# wasmtime-runtime — long first build, then cached.
+wasmtime = "44"
