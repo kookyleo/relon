@@ -13,23 +13,24 @@
 //!    reading the result record back via `BufferReader`.
 //!
 //! Coverage:
-//!   * Single-param Int → Int                (`int_unary_doubles`).
-//!   * Two-param Int + Int → Int             (`int_add_two_params`).
-//!   * Schema-hash mismatch refuse-to-load   (`schema_drift_refused`).
-//!   * out_cap-too-small traps               (`out_cap_too_small_traps`).
-//!   * in_len-too-small traps                (`in_len_too_small_traps`).
-//!
-//! The `if`-expression Bool test from the Phase 2.b spec is deferred
-//! to Phase 2.c — codegen has no branch lowering yet, so a body of
-//! `if flag { v } else { -v }` is rejected at the lowering stage.
-//! Once branch codegen lands the test will be reinstated as part of
-//! Phase 3.
+//!   * Single-param Int → Int                  (`int_unary_doubles`).
+//!   * Two-param Int + Int → Int               (`int_add_two_params`).
+//!   * Float param + return                    (`float_param_and_return_roundtrip`).
+//!   * Schema-hash mismatch refuse-to-load     (`schema_drift_refused`).
+//!   * out_cap-too-small traps                 (`out_cap_too_small_traps`).
+//!   * in_len-too-small traps                  (`in_len_too_small_traps`).
+//!   * Phase 2.c: ternary if returning Int     (`if_expression_returns_int`).
+//!   * Phase 2.c: Int comparison returning Bool (`comparison_returns_bool`).
+//!   * Phase 2.c: String field layout pass-through (`string_field_in_buf_loads_pointer`).
+//!   * Phase 2.c: List<Int> field layout pass-through (`list_int_field_in_buf_loads_pointer`).
+//!   * Phase 2.c: ternary branch type mismatch refused at lowering.
+//!   * Phase 2.c: non-Bool condition refused at lowering.
 
 use relon_codegen_wasm::{compile_lowered_entry, AbiError, LoadError, WasmModule};
 use relon_eval_api::buffer::{BufferBuilder, BufferReader};
 use relon_eval_api::layout::SchemaLayout;
 use relon_eval_api::schema_canonical::{Field, Schema, TypeRepr};
-use relon_ir::lower_workspace_single;
+use relon_ir::{lower_workspace_single, LoweringError};
 use wasmtime::{Engine, Instance, Memory, Module, Store, TypedFunc};
 
 /// Compile + lower `src` end-to-end and return the wasm bytes plus
@@ -279,4 +280,195 @@ fn in_len_too_small_traps() {
     // prologue guard must trap.
     let short_len = (in_bytes.len() as i32) - 1;
     session.call_expect_trap(IN_PTR, short_len, OUT_PTR, return_layout.root_size as i32);
+}
+
+/// Compile + lower `src` without panicking on lowering errors —
+/// returns the lowering error so the caller can match on it. Mirrors
+/// [`compile`] but without the `compile_lowered_entry` step.
+fn lower_only(src: &str) -> Result<(), LoweringError> {
+    let ast = relon_parser::parse_document(src).expect("parse");
+    let analyzed = relon_analyzer::analyze(&ast);
+    // Don't bail on analyzer diagnostics — the lowering layer is
+    // what these tests probe. The analyzer might still surface type
+    // errors before lowering refuses; we only assert on the lowering
+    // result here.
+    lower_workspace_single(&analyzed, &ast).map(|_| ())
+}
+
+#[test]
+fn if_expression_returns_int() {
+    // Phase 2.c: ternary lowers to `Op::If { result_ty: Int }`. The
+    // Relon surface uses the ternary form (`cond ? then : else`),
+    // since no `if {} else {}` block syntax exists yet — same IR
+    // shape either way.
+    let (wasm, main_schema, return_schema) =
+        compile("#main(Bool flag, Int v) -> Int\nflag ? v : 0 - v");
+    let main_layout = SchemaLayout::offsets_for(&main_schema).expect("main layout");
+    let return_layout = SchemaLayout::offsets_for(&return_schema).expect("return layout");
+
+    // flag = true → +v
+    {
+        let mut builder = BufferBuilder::new(&main_layout, &main_schema.fields);
+        builder.write_bool("flag", true).expect("write flag");
+        builder.write_int("v", 42).expect("write v");
+        let in_bytes = builder.finish();
+        let mut session = WasmSession::new(&wasm);
+        session.write(IN_PTR as usize, &in_bytes);
+        let bw = session.call(
+            IN_PTR,
+            in_bytes.len() as i32,
+            OUT_PTR,
+            return_layout.root_size as i32,
+        );
+        assert_eq!(bw as usize, return_layout.root_size);
+        let out = session.read(OUT_PTR as usize, return_layout.root_size);
+        let reader =
+            BufferReader::new(&return_layout, &return_schema.fields, &out).expect("reader");
+        assert_eq!(reader.read_int("value").expect("read value"), 42);
+    }
+    // flag = false → 0 - v
+    {
+        let mut builder = BufferBuilder::new(&main_layout, &main_schema.fields);
+        builder.write_bool("flag", false).expect("write flag");
+        builder.write_int("v", 42).expect("write v");
+        let in_bytes = builder.finish();
+        let mut session = WasmSession::new(&wasm);
+        session.write(IN_PTR as usize, &in_bytes);
+        let bw = session.call(
+            IN_PTR,
+            in_bytes.len() as i32,
+            OUT_PTR,
+            return_layout.root_size as i32,
+        );
+        assert_eq!(bw as usize, return_layout.root_size);
+        let out = session.read(OUT_PTR as usize, return_layout.root_size);
+        let reader =
+            BufferReader::new(&return_layout, &return_schema.fields, &out).expect("reader");
+        assert_eq!(reader.read_int("value").expect("read value"), -42);
+    }
+}
+
+#[test]
+fn comparison_returns_bool() {
+    // Phase 2.c: `x > 0` lowers to `Op::Gt(I64)`. The wasm result
+    // type is `i32` (Bool), so the trailing StoreField uses
+    // `i32.store8` and the host reads a single byte back.
+    let (wasm, main_schema, return_schema) = compile("#main(Int x) -> Bool\nx > 0");
+    let main_layout = SchemaLayout::offsets_for(&main_schema).expect("main layout");
+    let return_layout = SchemaLayout::offsets_for(&return_schema).expect("return layout");
+
+    let check = |x: i64, want: bool| {
+        let mut builder = BufferBuilder::new(&main_layout, &main_schema.fields);
+        builder.write_int("x", x).expect("write x");
+        let in_bytes = builder.finish();
+        let mut session = WasmSession::new(&wasm);
+        session.write(IN_PTR as usize, &in_bytes);
+        let bw = session.call(
+            IN_PTR,
+            in_bytes.len() as i32,
+            OUT_PTR,
+            return_layout.root_size as i32,
+        );
+        assert_eq!(bw as usize, return_layout.root_size);
+        let out = session.read(OUT_PTR as usize, return_layout.root_size);
+        let reader =
+            BufferReader::new(&return_layout, &return_schema.fields, &out).expect("reader");
+        assert_eq!(reader.read_bool("value").expect("read value"), want);
+    };
+    check(5, true);
+    check(-3, false);
+}
+
+#[test]
+fn string_field_in_buf_loads_pointer() {
+    // Phase 2.c: layout supports a `String` parameter. The wasm body
+    // never references `name`, so it doesn't need to load the
+    // pointer — the test checks that the **layout** for a
+    // (String, Int) signature still places `x` at the right offset.
+    // A bug in the fixed-area sizing would surface as the codegen
+    // reading garbage out of `in_buf`.
+    let (wasm, main_schema, return_schema) = compile("#main(String name, Int x) -> Int\nx * 2");
+    let main_layout = SchemaLayout::offsets_for(&main_schema).expect("main layout");
+    let return_layout = SchemaLayout::offsets_for(&return_schema).expect("return layout");
+    assert!(main_layout.requires_tail_area());
+
+    let mut builder = BufferBuilder::new(&main_layout, &main_schema.fields);
+    builder.write_string("name", "ada").expect("write name");
+    builder.write_int("x", 21).expect("write x");
+    let in_bytes = builder.finish();
+
+    let mut session = WasmSession::new(&wasm);
+    session.write(IN_PTR as usize, &in_bytes);
+    let bw = session.call(
+        IN_PTR,
+        in_bytes.len() as i32,
+        OUT_PTR,
+        return_layout.root_size as i32,
+    );
+    assert_eq!(bw as usize, return_layout.root_size);
+    let out = session.read(OUT_PTR as usize, return_layout.root_size);
+    let reader = BufferReader::new(&return_layout, &return_schema.fields, &out).expect("reader");
+    assert_eq!(reader.read_int("value").expect("read value"), 42);
+}
+
+#[test]
+fn list_int_field_in_buf_loads_pointer() {
+    // Phase 2.c: same shape as the String test but with a
+    // `List<Int>` parameter. `nums` is unused in the body — the
+    // test pins the layout's tail-area indirection for List<Int>.
+    let (wasm, main_schema, return_schema) = compile("#main(List<Int> nums, Int x) -> Int\nx + 1");
+    let main_layout = SchemaLayout::offsets_for(&main_schema).expect("main layout");
+    let return_layout = SchemaLayout::offsets_for(&return_schema).expect("return layout");
+    assert!(main_layout.requires_tail_area());
+
+    let mut builder = BufferBuilder::new(&main_layout, &main_schema.fields);
+    builder
+        .write_list_int("nums", &[10, 20, 30])
+        .expect("write nums");
+    builder.write_int("x", 41).expect("write x");
+    let in_bytes = builder.finish();
+
+    let mut session = WasmSession::new(&wasm);
+    session.write(IN_PTR as usize, &in_bytes);
+    let bw = session.call(
+        IN_PTR,
+        in_bytes.len() as i32,
+        OUT_PTR,
+        return_layout.root_size as i32,
+    );
+    assert_eq!(bw as usize, return_layout.root_size);
+    let out = session.read(OUT_PTR as usize, return_layout.root_size);
+    let reader = BufferReader::new(&return_layout, &return_schema.fields, &out).expect("reader");
+    assert_eq!(reader.read_int("value").expect("read value"), 42);
+}
+
+#[test]
+fn if_branch_type_mismatch_rejected_at_lowering() {
+    // `b ? x : true` — `x` lowers to Int, `true` is a Bool literal
+    // (which Phase 2.c doesn't yet lower as a bare expression), so
+    // we expect a lowering error rather than a successful build.
+    // The exact diagnostic depends on which check fires first; we
+    // accept either the branch-mismatch variant or the bare-Bool
+    // rejection, since both surface the same surface intent.
+    let err = lower_only("#main(Bool b, Int x) -> Int\nb ? x : true")
+        .expect_err("if branch mismatch must reject");
+    assert!(
+        matches!(
+            err,
+            LoweringError::IfBranchTypeMismatch { .. } | LoweringError::UnsupportedExpr { .. }
+        ),
+        "expected branch mismatch or Bool-literal rejection, got {err:?}"
+    );
+}
+
+#[test]
+fn if_condition_not_bool_rejected_at_lowering() {
+    // `x ? 1 : 0` — `x` is Int, not Bool, so lowering must reject
+    // the ternary's condition.
+    let err =
+        lower_only("#main(Int x) -> Int\nx ? 1 : 0").expect_err("non-bool condition must reject");
+    assert!(
+        matches!(err, LoweringError::IfConditionNotBool { .. }),
+        "expected IfConditionNotBool, got {err:?}"
+    );
 }
