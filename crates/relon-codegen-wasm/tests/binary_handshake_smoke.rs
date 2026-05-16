@@ -526,13 +526,12 @@ fn let_binding_via_where_clause() {
     // binding. The bound value rides in a dedicated wasm local so a
     // body that reuses `y` twice computes `x * 2` once.
     //
-    // `#relaxed` opts the source out of strict-mode resolution — the
-    // analyzer otherwise reports `UnknownReferenceType` for the
-    // where-bound name because its `typecheck::check_unresolved_ref`
-    // pass doesn't yet model the body's extended scope. Lowering
-    // does, so the wasm output is well-formed regardless.
+    // Phase 9.b-3: the strict-mode where-scope fix means the analyzer
+    // sees `y` resolve against the binding frame, so this test no
+    // longer needs the `#relaxed` opt-out it carried during the early
+    // Phase 3.a work.
     let (wasm, main_schema, return_schema) =
-        compile("#relaxed\n#main(Int x) -> Int\n(y + y) where { y: x * 2 }");
+        compile("#main(Int x) -> Int\n(y + y) where { y: x * 2 }");
     let main_layout = SchemaLayout::offsets_for(&main_schema).expect("main layout");
     let return_layout = SchemaLayout::offsets_for(&return_schema).expect("return layout");
 
@@ -559,11 +558,11 @@ fn let_binding_via_where_clause() {
 fn let_binding_multiple_names() {
     // Two let bindings in the same `where` block. Each one gets a
     // fresh wasm local; the body references both alongside the
-    // `#main` param. `#relaxed` opts out of strict-mode analyzer
-    // resolution (see `let_binding_via_where_clause` for the same
-    // workaround rationale).
+    // `#main` param. Phase 9.b-3 removes the previous `#relaxed`
+    // workaround now that strict-mode resolution sees where-binding
+    // scope.
     let (wasm, main_schema, return_schema) =
-        compile("#relaxed\n#main(Int x) -> Int\n(a + b + x) where { a: 1, b: 2 }");
+        compile("#main(Int x) -> Int\n(a + b + x) where { a: 1, b: 2 }");
     let main_layout = SchemaLayout::offsets_for(&main_schema).expect("main layout");
     let return_layout = SchemaLayout::offsets_for(&return_schema).expect("return layout");
 

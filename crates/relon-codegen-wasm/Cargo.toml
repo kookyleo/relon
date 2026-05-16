@@ -32,6 +32,11 @@ thiserror = { workspace = true }
 # already used by relon-eval-api so we share one dependency version
 # across the workspace.
 sha2 = { workspace = true }
+# Phase 9.b-3: AOT cache schemas sidecar uses serde_json so the
+# rehydration path can pull back `Schema` / `TypeRepr` values without
+# hand-rolling a binary format.
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
 
 # Low-level WebAssembly module encoder used by the Phase 1.alpha
 # hardcoded smoke generator. Kept in sync with `wasmparser` /

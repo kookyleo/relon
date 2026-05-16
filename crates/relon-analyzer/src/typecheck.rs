@@ -638,6 +638,24 @@ impl<'a> Walker<'a> {
                     self.visit_internal(&arg.value, None);
                 }
             }
+            Expr::Where { expr, bindings } => {
+                // Phase 9.b-3: mirror the resolve.rs walker so the body
+                // expression's strict-mode path walker (`check_strict_path`
+                // → `TypeScope::lookup`) sees where-bound names through
+                // `scope_stack`. Without the push the body's references
+                // miss the binding frame and `check_strict_path`
+                // false-positives `UnknownReferenceType` on every
+                // where-bound name under `#strict`.
+                self.visit_internal(bindings, None);
+                if let Expr::Dict(pairs) = &*bindings.expr {
+                    let frame = build_frame(pairs);
+                    self.scope_stack.push(frame);
+                    self.visit_internal(expr, None);
+                    self.scope_stack.pop();
+                } else {
+                    self.visit_internal(expr, None);
+                }
+            }
             _ => {
                 for child in child_nodes(node) {
                     self.visit_internal(child, None);
@@ -5611,6 +5629,128 @@ mod tests {
             )) >= 1,
             "untyped param ClosureParamTypeMissing missing: {:?}",
             tree.diagnostics
+        );
+    }
+
+    /// Phase 9.b-3: a single where-binding's body reference must
+    /// resolve under strict mode. Before the fix, `check_unresolved_var`
+    /// reached `x` without seeing a binding frame on `scope_stack`,
+    /// escalated the head-unresolved case to
+    /// `UnknownReferenceType { name: "x", ... }`, and broke every
+    /// strict-mode where-clause. The fix in `resolve.rs` and the visit
+    /// arm here pushes a binding frame derived from the dict before
+    /// walking the body.
+    #[test]
+    fn phase9_b3_strict_where_simple_binding_resolves() {
+        let tree = analyze_str(
+            r#"
+            #main(Int seed) -> Int
+            (x + 2) where { x: seed }
+            "#,
+        );
+        let leaks = count(
+            &tree,
+            |d| matches!(d, Diagnostic::UnknownReferenceType { name, .. } if name == "x"),
+        );
+        assert_eq!(
+            leaks, 0,
+            "where-bound `x` leaked under strict mode: {:?}",
+            tree.diagnostics
+        );
+        let unresolved = count(
+            &tree,
+            |d| matches!(d, Diagnostic::UnresolvedReference { name, .. } if name == "x"),
+        );
+        assert_eq!(
+            unresolved, 0,
+            "where-bound `x` flagged as UnresolvedReference: {:?}",
+            tree.diagnostics
+        );
+    }
+
+    /// Phase 9.b-3: nested where-clauses stack binding frames so the
+    /// inner body still sees the outer binding. `(x + y) where { y: x + 1 }`
+    /// embedded under an outer `where { x: 1 }` must resolve both names
+    /// under strict mode.
+    #[test]
+    fn phase9_b3_strict_where_nested_bindings_resolve() {
+        let tree = analyze_str(
+            r#"
+            #main(Int seed) -> Int
+            (
+              ((x + y) where { y: x + 1 })
+              where { x: seed }
+            )
+            "#,
+        );
+        let leaks: Vec<_> = tree
+            .diagnostics
+            .iter()
+            .filter(|d| {
+                matches!(
+                    d,
+                    Diagnostic::UnknownReferenceType { name, .. } if name == "x" || name == "y"
+                )
+            })
+            .collect();
+        assert!(
+            leaks.is_empty(),
+            "nested where bindings leaked under strict mode: {:?}",
+            leaks
+        );
+        let unresolved: Vec<_> = tree
+            .diagnostics
+            .iter()
+            .filter(|d| {
+                matches!(
+                    d,
+                    Diagnostic::UnresolvedReference { name, .. } if name == "x" || name == "y"
+                )
+            })
+            .collect();
+        assert!(
+            unresolved.is_empty(),
+            "nested where bindings flagged as UnresolvedReference: {:?}",
+            unresolved
+        );
+    }
+
+    /// Phase 9.b-3: a where binding may shadow an outer name. The body
+    /// must observe the inner shadow under strict mode, not the outer
+    /// binding (or worse, the outer name's type via an opaque fallback).
+    /// The inner `x` is computed from the outer `x + 1`, so the inner
+    /// binding's *value* still references the outer `x` via the
+    /// `bindings` dict's normal scope walk.
+    #[test]
+    fn phase9_b3_strict_where_binding_shadows_outer() {
+        let tree = analyze_str(
+            r#"
+            #main(Int seed) -> Int
+            (
+              (x * 2 where { x: x + 1 })
+              where { x: seed }
+            )
+            "#,
+        );
+        let leaks: Vec<_> = tree
+            .diagnostics
+            .iter()
+            .filter(|d| matches!(d, Diagnostic::UnknownReferenceType { name, .. } if name == "x"))
+            .collect();
+        assert!(
+            leaks.is_empty(),
+            "shadowed where binding leaked under strict mode: {:?}",
+            leaks
+        );
+        let unresolved: Vec<_> = tree
+            .diagnostics
+            .iter()
+            .filter(|d| matches!(d, Diagnostic::UnresolvedReference { name, .. } if name == "x"))
+            .collect();
+        assert!(
+            unresolved.is_empty(),
+            "shadowed where binding flagged as UnresolvedReference: {:?}",
+            unresolved
         );
     }
 }

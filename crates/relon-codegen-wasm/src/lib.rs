@@ -31,6 +31,7 @@
 //! reject schema drift at load time.
 
 pub mod abi;
+pub mod cache;
 pub mod error;
 pub mod evaluator;
 pub mod host_fns;
@@ -38,6 +39,7 @@ pub mod srcmap;
 pub mod unreachable_table;
 
 pub use abi::{AbiError, AbiMetadata};
+pub use cache::{AotCache, CacheError, CachedModule};
 pub use error::{CodegenError, LoadError};
 pub use evaluator::{BuildError, WasmAotEvaluator};
 pub use host_fns::{
