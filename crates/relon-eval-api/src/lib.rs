@@ -35,7 +35,9 @@ pub mod schema_lower;
 pub mod scope;
 pub mod value;
 
-pub use context::{Capabilities, Context, GatedNativeFn, LoadingModuleGuard, NativeFnGate};
+pub use context::{
+    Capabilities, CapabilityBit, Context, GatedNativeFn, LoadingModuleGuard, NativeFnGate,
+};
 pub use decorator::{DecoratorPlugin, PreEvalOutcome};
 pub use error::RuntimeError;
 pub use module::{ModuleResolver, ModuleSource};
