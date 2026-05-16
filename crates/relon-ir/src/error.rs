@@ -121,4 +121,81 @@ pub enum LoweringError {
         /// Source range of the `if` (ternary) expression.
         range: TokenRange,
     },
+    /// Phase 3.b: a dict-literal field type can't be lowered to the
+    /// Phase 3.b canonical surface. Either the schema declares a type
+    /// the layout pass refuses (e.g. `Option<T>`, `List<String>`) or
+    /// the dict carries no static brand — the latter is screened
+    /// upstream by the analyzer, this variant is the codegen-side
+    /// belt-and-braces.
+    #[error("unsupported dict field type `{ty}` in field `{field}` of schema `{schema}`")]
+    UnsupportedFieldType {
+        /// Schema the offending field belongs to.
+        schema: String,
+        /// Field name that triggered the error.
+        field: String,
+        /// Human-readable rendering of the offending type.
+        ty: String,
+        /// Source range of the field's value expression.
+        range: TokenRange,
+    },
+    /// Phase 3.b: a branded dict literal omitted a field that has no
+    /// schema-side default expression, so the lowering pass has no
+    /// value to write into the slot.
+    #[error("dict literal missing field `{field}` for schema `{schema}` (no default declared)")]
+    MissingFieldNoDefault {
+        /// Schema name the missing field belongs to.
+        schema: String,
+        /// Field name with no user-supplied value nor default.
+        field: String,
+        /// Source range of the dict literal expression.
+        range: TokenRange,
+    },
+    /// Phase 3.b: a dict literal references an unknown brand — the
+    /// outer `type_hint` names a schema not present in the analyzed
+    /// tree.
+    #[error("unknown schema brand `{name}` in dict literal")]
+    UnknownSchemaBrand {
+        /// Schema name that failed to resolve.
+        name: String,
+        /// Source range of the dict literal expression.
+        range: TokenRange,
+    },
+    /// Phase 3.b: a dict literal's default expression refers to a
+    /// field name that doesn't exist in the schema. Surfaces as a
+    /// codegen-side error because the analyzer still has limited
+    /// dependency tracking on inter-field references inside default
+    /// expressions.
+    #[error(
+        "default expression for field `{field}` of schema `{schema}` references unknown field `{referenced}`"
+    )]
+    UnknownFieldReferenceInDefault {
+        /// Schema name that owns the offending default expression.
+        schema: String,
+        /// Field name whose default refers to a non-existent sibling.
+        field: String,
+        /// Sibling field name that doesn't exist on the schema.
+        referenced: String,
+        /// Source range of the default expression.
+        range: TokenRange,
+    },
+    /// Phase 3.b: cyclic field-default dependencies — the schema's
+    /// fields refer to each other in a way the topological emit pass
+    /// can't satisfy. The lowering pass reports the cycle even when
+    /// the user-supplied dict happens to provide every field that
+    /// participates in the cycle so a future schema-level lint can
+    /// hook the same diagnostic.
+    #[error(
+        "cyclic field-default dependency in schema `{schema}`: {}",
+        .cycle.join(" -> ")
+    )]
+    CyclicFieldDependency {
+        /// Schema whose default expressions form the cycle.
+        schema: String,
+        /// Field names in the order they participate in the cycle,
+        /// repeating the first name at the end (e.g. `["a", "b", "a"]`).
+        cycle: Vec<String>,
+        /// Source range of the dict literal where the cycle was
+        /// detected.
+        range: TokenRange,
+    },
 }
