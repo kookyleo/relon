@@ -215,28 +215,22 @@ impl WasmAotEvaluator {
     /// Returns the same [`WasmAotEvaluator`] shape as [`Self::from_source`]
     /// so callers can drop the cache in front of an existing call site
     /// without touching the post-construction surface.
-    pub fn from_source_with_cache(
-        src: &str,
-        cache: &AotCache,
-    ) -> Result<Self, BuildError> {
+    pub fn from_source_with_cache(src: &str, cache: &AotCache) -> Result<Self, BuildError> {
         let source_hash = AotCache::source_hash(src);
         // Cache hit short-circuits the entire compile pipeline. The
         // cached entry carries the canonical `(main, return)` schemas
         // it was originally compiled against, so the rehydration path
         // pulls them straight off disk instead of re-running parse /
         // analyze / lowering.
-        match cache.load(source_hash).map_err(cache_err)? {
-            Some(entry) => {
-                if let Some(schemas) = entry.schemas {
-                    return Self::from_bytes(entry.wasm_bytes, schemas.main, schemas.return_);
-                }
-                // The cached `.meta` was written by a schemaless `store`
-                // call. We have wasm bytes but no schemas — fall through
-                // to the full pipeline so we still produce a valid
-                // evaluator. The fresh `store_with_schemas` writes the
-                // sidecar so the next call hits the fast path.
+        if let Some(entry) = cache.load(source_hash).map_err(cache_err)? {
+            if let Some(schemas) = entry.schemas {
+                return Self::from_bytes(entry.wasm_bytes, schemas.main, schemas.return_);
             }
-            None => {}
+            // The cached `.meta` was written by a schemaless `store`
+            // call. We have wasm bytes but no schemas — fall through
+            // to the full pipeline so we still produce a valid
+            // evaluator. The fresh `store_with_schemas` writes the
+            // sidecar so the next call hits the fast path.
         }
         let (lowered, bytes) = Self::compile_source(src)?;
         let main_schema = lowered.main_schema;

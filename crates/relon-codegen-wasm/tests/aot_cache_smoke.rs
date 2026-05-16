@@ -75,12 +75,16 @@ fn evaluator_uses_cache() {
         .map(|e| e.file_name())
         .collect();
     assert!(
-        entries.iter().any(|n| n.to_string_lossy().ends_with(".wasm")),
+        entries
+            .iter()
+            .any(|n| n.to_string_lossy().ends_with(".wasm")),
         "expected .wasm artifact in cache: {:?}",
         entries
     );
     assert!(
-        entries.iter().any(|n| n.to_string_lossy().ends_with(".meta")),
+        entries
+            .iter()
+            .any(|n| n.to_string_lossy().ends_with(".meta")),
         "expected .meta sidecar in cache: {:?}",
         entries
     );

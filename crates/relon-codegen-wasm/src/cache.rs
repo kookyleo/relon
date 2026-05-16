@@ -221,12 +221,8 @@ impl AotCache {
         if abi_version != CURRENT_ABI_VERSION {
             return Ok(None);
         }
-        let codegen_version = u32::from_le_bytes([
-            meta_bytes[7],
-            meta_bytes[8],
-            meta_bytes[9],
-            meta_bytes[10],
-        ]);
+        let codegen_version =
+            u32::from_le_bytes([meta_bytes[7], meta_bytes[8], meta_bytes[9], meta_bytes[10]]);
         if codegen_version != CURRENT_CODEGEN_VERSION {
             return Ok(None);
         }
@@ -297,7 +293,7 @@ impl AotCache {
             source: err,
         })?;
         let meta = encode_meta(schema_hash);
-        fs::write(&meta_path, &meta).map_err(|err| CacheError::Io {
+        fs::write(&meta_path, meta).map_err(|err| CacheError::Io {
             path: meta_path,
             source: err,
         })?;
@@ -328,14 +324,14 @@ impl AotCache {
             path: wasm_path.clone(),
             source: err,
         })?;
-        let schemas_json = serde_json::to_vec(schemas)
-            .map_err(|e| CacheError::SchemaSerde(e.to_string()))?;
+        let schemas_json =
+            serde_json::to_vec(schemas).map_err(|e| CacheError::SchemaSerde(e.to_string()))?;
         fs::write(&schemas_path, &schemas_json).map_err(|err| CacheError::Io {
             path: schemas_path,
             source: err,
         })?;
         let meta = encode_meta(schema_hash);
-        fs::write(&meta_path, &meta).map_err(|err| CacheError::Io {
+        fs::write(&meta_path, meta).map_err(|err| CacheError::Io {
             path: meta_path,
             source: err,
         })?;
@@ -420,7 +416,9 @@ mod tests {
             .map(|d| d.as_nanos())
             .unwrap_or(0);
         let mut path = std::env::temp_dir();
-        path.push(format!("relon-aot-cache-test-{pid}-{nanos}-{counter}-{tag}"));
+        path.push(format!(
+            "relon-aot-cache-test-{pid}-{nanos}-{counter}-{tag}"
+        ));
         path
     }
 
@@ -446,13 +444,8 @@ mod tests {
         let source_hash = AotCache::source_hash("dummy source");
         let wasm = vec![0u8, 1, 2, 3, 4, 5, 6, 7];
         let schema_hash = [42u8; 32];
-        cache
-            .store(source_hash, &wasm, schema_hash)
-            .expect("store");
-        let loaded = cache
-            .load(source_hash)
-            .expect("load Ok")
-            .expect("load hit");
+        cache.store(source_hash, &wasm, schema_hash).expect("store");
+        let loaded = cache.load(source_hash).expect("load Ok").expect("load hit");
         assert_eq!(loaded.wasm_bytes, wasm);
         assert_eq!(loaded.schema_hash, schema_hash);
         // Plain `store` does not write the schemas sidecar.
@@ -493,10 +486,7 @@ mod tests {
         cache
             .store_with_schemas(source_hash, &wasm, schema_hash, &schemas)
             .expect("store_with_schemas");
-        let loaded = cache
-            .load(source_hash)
-            .expect("load Ok")
-            .expect("load hit");
+        let loaded = cache.load(source_hash).expect("load Ok").expect("load hit");
         assert_eq!(loaded.wasm_bytes, wasm);
         assert_eq!(loaded.schema_hash, schema_hash);
         assert_eq!(loaded.schemas.expect("schemas survived"), schemas);
@@ -535,10 +525,7 @@ mod tests {
         meta[5..7].copy_from_slice(&bogus.to_le_bytes());
         fs::write(&meta_path, &meta).expect("rewrite meta");
         let result = cache.load(source_hash).expect("load Ok");
-        assert!(
-            result.is_none(),
-            "abi_version drift must invalidate cache"
-        );
+        assert!(result.is_none(), "abi_version drift must invalidate cache");
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -573,13 +560,11 @@ mod tests {
         let dir = temp_cache_dir("truncated");
         let cache = AotCache::open(&dir).expect("open");
         let source_hash = AotCache::source_hash("truncated source");
-        cache
-            .store(source_hash, &[9u8], [3u8; 32])
-            .expect("store");
+        cache.store(source_hash, &[9u8], [3u8; 32]).expect("store");
         let hex = hex_encode(&source_hash);
         let mut meta_path = dir.clone();
         meta_path.push(format!("{hex}.meta"));
-        fs::write(&meta_path, &[0u8; 4]).expect("truncate meta");
+        fs::write(&meta_path, [0u8; 4]).expect("truncate meta");
         let result = cache.load(source_hash).expect("load Ok");
         assert!(result.is_none(), "truncated meta must be a miss");
         let _ = fs::remove_dir_all(&dir);

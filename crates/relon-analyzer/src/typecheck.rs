@@ -5648,17 +5648,19 @@ mod tests {
             (x + 2) where { x: seed }
             "#,
         );
-        let leaks = count(&tree, |d| {
-            matches!(d, Diagnostic::UnknownReferenceType { name, .. } if name == "x")
-        });
+        let leaks = count(
+            &tree,
+            |d| matches!(d, Diagnostic::UnknownReferenceType { name, .. } if name == "x"),
+        );
         assert_eq!(
             leaks, 0,
             "where-bound `x` leaked under strict mode: {:?}",
             tree.diagnostics
         );
-        let unresolved = count(&tree, |d| {
-            matches!(d, Diagnostic::UnresolvedReference { name, .. } if name == "x")
-        });
+        let unresolved = count(
+            &tree,
+            |d| matches!(d, Diagnostic::UnresolvedReference { name, .. } if name == "x"),
+        );
         assert_eq!(
             unresolved, 0,
             "where-bound `x` flagged as UnresolvedReference: {:?}",
