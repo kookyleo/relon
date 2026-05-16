@@ -263,22 +263,22 @@ impl<'a> BufferBuilder<'a> {
     /// independently), and the parent has a single commit step that
     /// also enforces the field-name → pointer-slot binding the layout
     /// pass guarantees.
-    pub fn sub_record(
+    pub fn sub_record<'b>(
         &mut self,
         field_name: &str,
-        sub_layout: &'a OffsetTable,
+        sub_layout: &'b OffsetTable,
         sub_fields: &[Field],
-    ) -> Result<BufferBuilder<'a>, BufferError> {
+    ) -> Result<BufferBuilder<'b>, BufferError> {
         // Validate the parent slot is a Schema-typed pointer-indirect
         // entry. Anything else would corrupt adjacent fields once we
         // back-patched the (wrong) slot.
-        let entry =
-            self.field_index
-                .iter()
-                .find(|(name, _, _, _, _)| name == field_name)
-                .ok_or_else(|| BufferError::UnknownField {
-                    name: field_name.to_string(),
-                })?;
+        let entry = self
+            .field_index
+            .iter()
+            .find(|(name, _, _, _, _)| name == field_name)
+            .ok_or_else(|| BufferError::UnknownField {
+                name: field_name.to_string(),
+            })?;
         if !matches!(entry.1, TypeRepr::Schema { .. }) {
             return Err(BufferError::TypeMismatch {
                 name: field_name.to_string(),
@@ -320,13 +320,13 @@ impl<'a> BufferBuilder<'a> {
         field_name: &str,
         child: BufferBuilder<'_>,
     ) -> Result<(), BufferError> {
-        let entry =
-            self.field_index
-                .iter()
-                .find(|(name, _, _, _, _)| name == field_name)
-                .ok_or_else(|| BufferError::UnknownField {
-                    name: field_name.to_string(),
-                })?;
+        let entry = self
+            .field_index
+            .iter()
+            .find(|(name, _, _, _, _)| name == field_name)
+            .ok_or_else(|| BufferError::UnknownField {
+                name: field_name.to_string(),
+            })?;
         if !matches!(entry.1, TypeRepr::Schema { .. }) {
             return Err(BufferError::TypeMismatch {
                 name: field_name.to_string(),
@@ -365,11 +365,12 @@ impl<'a> BufferBuilder<'a> {
         })?;
         // Rebase every pointer slot inside the child so it's
         // parent-relative once we paste the child bytes.
-        relocate_pointers(&mut child_bytes, child_layout, &child_fields, 0, ptr)
-            .map_err(|reason| BufferError::MalformedPayload {
+        relocate_pointers(&mut child_bytes, child_layout, &child_fields, 0, ptr).map_err(
+            |reason| BufferError::MalformedPayload {
                 name: field_name.to_string(),
                 reason,
-            })?;
+            },
+        )?;
         self.bytes.extend_from_slice(&child_bytes);
         self.bytes[slot_offset..slot_offset + 4].copy_from_slice(&ptr.to_le_bytes());
         Ok(())
@@ -482,7 +483,11 @@ fn relocate_pointers(
         let slot_abs = record_base
             .checked_add(fo.offset)
             .ok_or("pointer slot offset overflows usize")?;
-        if slot_abs.checked_add(4).map(|end| end > bytes.len()).unwrap_or(true) {
+        if slot_abs
+            .checked_add(4)
+            .map(|end| end > bytes.len())
+            .unwrap_or(true)
+        {
             return Err("pointer slot exceeds buffer end");
         }
         let mut ptr_buf = [0u8; 4];
