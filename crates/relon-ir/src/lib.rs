@@ -19,12 +19,8 @@
 
 pub mod error;
 pub mod ir;
+pub mod lowering;
 
 pub use error::LoweringError;
 pub use ir::{Func, IrType, Module, Op, TaggedOp};
-
-// `relon-analyzer` is consumed by the lowering module that lands in
-// the next commit; keep it imported so the unused-crate-dependencies
-// lint stays silent between the two halves.
-#[allow(unused_imports)]
-use relon_analyzer as _;
+pub use lowering::{lower_workspace, lower_workspace_single};
