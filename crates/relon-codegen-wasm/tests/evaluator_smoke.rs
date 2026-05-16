@@ -101,10 +101,7 @@ fn parity_dict_literal_return() {
             assert_eq!(a.map.get("age"), b.map.get("age"));
             assert_eq!(a.map.get("name"), b.map.get("name"));
             assert_eq!(a.map.get("age"), Some(&Value::Int(36)));
-            assert_eq!(
-                a.map.get("name"),
-                Some(&Value::String("ada".to_string()))
-            );
+            assert_eq!(a.map.get("name"), Some(&Value::String("ada".to_string())));
         }
         other => panic!("expected matching Dict pair, got {other:?}"),
     }

@@ -278,8 +278,10 @@ fn main() -> miette::Result<()> {
                     })?;
                 match backend {
                     BackendArg::TreeWalk => evaluator.run_main(&scope, args_map).map_err(|e| {
-                        Report::new(e)
-                            .with_source_code(NamedSource::new(file.to_string_lossy(), content.clone()))
+                        Report::new(e).with_source_code(NamedSource::new(
+                            file.to_string_lossy(),
+                            content.clone(),
+                        ))
                     })?,
                     BackendArg::WasmAot => {
                         // wasm-AOT compiles the single entry file

@@ -10,7 +10,11 @@ keywords = ["cli", "config", "dsl", "json", "sandboxed"]
 categories = ["command-line-utilities", "config"]
 
 [dependencies]
-relon = { workspace = true }
+# The CLI ships both backends so `--backend wasm-aot` is always
+# available. The library facade keeps the wasm-AOT bridge gated
+# behind the matching feature so `relon-wasm` (browser playground)
+# stays clean of wasmtime.
+relon = { workspace = true, features = ["wasm-aot"] }
 relon-parser = { workspace = true }
 relon-evaluator = { workspace = true }
 relon-eval-api = { workspace = true }

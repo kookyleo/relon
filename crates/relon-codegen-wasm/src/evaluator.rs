@@ -130,7 +130,8 @@ impl WasmAotEvaluator {
     /// `relon_ir::lower_workspace_single` → `compile_lowered_entry` →
     /// `WasmModule::from_bytes` → `wasmtime::Module::new`.
     pub fn from_source(src: &str) -> Result<Self, BuildError> {
-        let ast = relon_parser::parse_document(src).map_err(|e| BuildError::ParseError(e.to_string()))?;
+        let ast =
+            relon_parser::parse_document(src).map_err(|e| BuildError::ParseError(e.to_string()))?;
         let analyzed = relon_analyzer::analyze(&ast);
         if analyzed.has_errors() {
             let joined = analyzed
@@ -144,8 +145,8 @@ impl WasmAotEvaluator {
         }
         let lowered = relon_ir::lower_workspace_single(&analyzed, &ast)
             .map_err(|e| BuildError::LoweringError(e.to_string()))?;
-        let bytes = compile_lowered_entry(&lowered)
-            .map_err(|e| BuildError::CodegenError(e.to_string()))?;
+        let bytes =
+            compile_lowered_entry(&lowered).map_err(|e| BuildError::CodegenError(e.to_string()))?;
         Self::from_bytes(bytes, lowered.main_schema, lowered.return_schema)
     }
 
@@ -165,7 +166,8 @@ impl WasmAotEvaluator {
         let return_layout = SchemaLayout::offsets_for(&return_schema)
             .map_err(|e| BuildError::LoweringError(format!("return schema layout: {e}")))?;
 
-        let module = WasmModule::from_bytes(bytes).map_err(|e| BuildError::WasmLoadError(e.to_string()))?;
+        let module =
+            WasmModule::from_bytes(bytes).map_err(|e| BuildError::WasmLoadError(e.to_string()))?;
         let engine = Engine::default();
         let compiled = WtModule::new(&engine, module.bytes())
             .map_err(|e| BuildError::WasmInstantiateError(e.to_string()))?;
@@ -222,7 +224,11 @@ impl WasmAotEvaluator {
 
     fn check_type_repr(field: &str, ty: &TypeRepr) -> Result<(), BuildError> {
         match ty {
-            TypeRepr::Int | TypeRepr::Float | TypeRepr::Bool | TypeRepr::Null | TypeRepr::String => Ok(()),
+            TypeRepr::Int
+            | TypeRepr::Float
+            | TypeRepr::Bool
+            | TypeRepr::Null
+            | TypeRepr::String => Ok(()),
             TypeRepr::List { element } => {
                 if matches!(element.as_ref(), TypeRepr::Int) {
                     Ok(())
@@ -280,9 +286,9 @@ impl WasmAotEvaluator {
         let instance = linker
             .instantiate(&mut store, &self.compiled)
             .map_err(|e| self.module.translate_trap(&e))?;
-        let memory: Memory = instance
-            .get_memory(&mut store, "memory")
-            .ok_or_else(|| RuntimeError::IoError("wasm module missing `memory` export".to_string()))?;
+        let memory: Memory = instance.get_memory(&mut store, "memory").ok_or_else(|| {
+            RuntimeError::IoError("wasm module missing `memory` export".to_string())
+        })?;
         let run_main: TypedFunc<(i32, i32, i32, i32), i32> = instance
             .get_typed_func(&mut store, "run_main")
             .map_err(|e| RuntimeError::IoError(format!("wasm `run_main` export: {e}")))?;
@@ -383,7 +389,10 @@ impl WasmAotEvaluator {
         } else {
             // Treat as a branded record matching `return_schema.name`.
             let map = read_record_into_map(&reader, &self.return_schema)?;
-            Ok(Value::branded_dict(map, Some(self.return_schema.name.clone())))
+            Ok(Value::branded_dict(
+                map,
+                Some(self.return_schema.name.clone()),
+            ))
         }
     }
 }
@@ -634,5 +643,4 @@ mod tests {
         assert_eq!(align_up(7, 8), 8);
         assert_eq!(align_up(9, 8), 16);
     }
-
 }

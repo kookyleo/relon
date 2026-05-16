@@ -16,6 +16,7 @@ use std::sync::Arc;
 
 pub use projector::{JsonProjector, Projector};
 pub use relon_analyzer;
+#[cfg(feature = "wasm-aot")]
 pub use relon_codegen_wasm;
 pub use relon_eval_api;
 pub use relon_evaluator;
@@ -487,18 +488,27 @@ pub enum BackendError {
 /// does internally: workspace analysis runs first, the default
 /// sandboxed `Context` is assembled, and the resulting evaluator is
 /// boxed as `dyn Evaluator`. The wasm-AOT variant compiles the source
-/// down to wasm via [`relon_codegen_wasm::WasmAotEvaluator::from_source`].
+/// down to wasm via `relon_codegen_wasm::WasmAotEvaluator::from_source`
+/// (requires the `wasm-aot` cargo feature; default-on for native
+/// builds, off for `wasm32-unknown-unknown` because wasmtime doesn't
+/// run there).
 pub fn new_evaluator(
     source: &str,
     backend: Backend,
 ) -> std::result::Result<Box<dyn relon_eval_api::Evaluator>, BackendError> {
     match backend {
         Backend::TreeWalk => Ok(Box::new(build_tree_walk_evaluator(source)?)),
+        #[cfg(feature = "wasm-aot")]
         Backend::WasmAot => {
             let aot = relon_codegen_wasm::WasmAotEvaluator::from_source(source)
                 .map_err(|e| BackendError::WasmAot(e.to_string()))?;
             Ok(Box::new(aot))
         }
+        #[cfg(not(feature = "wasm-aot"))]
+        Backend::WasmAot => Err(BackendError::WasmAot(
+            "this build was compiled without the `wasm-aot` feature; rebuild with `--features wasm-aot` to enable the backend"
+                .to_string(),
+        )),
     }
 }
 
