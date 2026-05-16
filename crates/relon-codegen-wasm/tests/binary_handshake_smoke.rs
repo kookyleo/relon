@@ -444,21 +444,206 @@ fn list_int_field_in_buf_loads_pointer() {
 
 #[test]
 fn if_branch_type_mismatch_rejected_at_lowering() {
-    // `b ? x : true` — `x` lowers to Int, `true` is a Bool literal
-    // (which Phase 2.c doesn't yet lower as a bare expression), so
-    // we expect a lowering error rather than a successful build.
-    // The exact diagnostic depends on which check fires first; we
-    // accept either the branch-mismatch variant or the bare-Bool
-    // rejection, since both surface the same surface intent.
+    // `b ? x : true` — `x` lowers to Int, `true` is a Bool, so
+    // lowering must report the branch-type mismatch rather than a
+    // successful build.
     let err = lower_only("#main(Bool b, Int x) -> Int\nb ? x : true")
         .expect_err("if branch mismatch must reject");
     assert!(
-        matches!(
-            err,
-            LoweringError::IfBranchTypeMismatch { .. } | LoweringError::UnsupportedExpr { .. }
-        ),
-        "expected branch mismatch or Bool-literal rejection, got {err:?}"
+        matches!(err, LoweringError::IfBranchTypeMismatch { .. }),
+        "expected IfBranchTypeMismatch, got {err:?}"
     );
+}
+
+#[test]
+fn bool_literal_true_returns_true() {
+    // Phase 3.a: `true` as the only body expression. Returns a 1-byte
+    // Bool with value 1.
+    let (wasm, main_schema, return_schema) = compile("#main(Int x) -> Bool\ntrue");
+    let main_layout = SchemaLayout::offsets_for(&main_schema).expect("main layout");
+    let return_layout = SchemaLayout::offsets_for(&return_schema).expect("return layout");
+
+    let mut builder = BufferBuilder::new(&main_layout, &main_schema.fields);
+    builder.write_int("x", 5).expect("write x");
+    let in_bytes = builder.finish();
+
+    let mut session = WasmSession::new(&wasm);
+    session.write(IN_PTR as usize, &in_bytes);
+    let bw = session.call(
+        IN_PTR,
+        in_bytes.len() as i32,
+        OUT_PTR,
+        return_layout.root_size as i32,
+    );
+    assert_eq!(bw as usize, return_layout.root_size);
+    let out = session.read(OUT_PTR as usize, return_layout.root_size);
+    let reader = BufferReader::new(&return_layout, &return_schema.fields, &out).expect("reader");
+    assert!(reader.read_bool("value").expect("read value"));
+}
+
+#[test]
+fn bool_literal_false_returns_false() {
+    let (wasm, main_schema, return_schema) = compile("#main(Int x) -> Bool\nfalse");
+    let main_layout = SchemaLayout::offsets_for(&main_schema).expect("main layout");
+    let return_layout = SchemaLayout::offsets_for(&return_schema).expect("return layout");
+
+    let mut builder = BufferBuilder::new(&main_layout, &main_schema.fields);
+    builder.write_int("x", 5).expect("write x");
+    let in_bytes = builder.finish();
+
+    let mut session = WasmSession::new(&wasm);
+    session.write(IN_PTR as usize, &in_bytes);
+    let bw = session.call(
+        IN_PTR,
+        in_bytes.len() as i32,
+        OUT_PTR,
+        return_layout.root_size as i32,
+    );
+    assert_eq!(bw as usize, return_layout.root_size);
+    let out = session.read(OUT_PTR as usize, return_layout.root_size);
+    let reader = BufferReader::new(&return_layout, &return_schema.fields, &out).expect("reader");
+    assert!(!reader.read_bool("value").expect("read value"));
+}
+
+#[test]
+fn let_binding_via_where_clause() {
+    // Phase 3.a: `<expr> where { name: value }` introduces a user-let
+    // binding. The bound value rides in a dedicated wasm local so a
+    // body that reuses `y` twice computes `x * 2` once.
+    //
+    // `#relaxed` opts the source out of strict-mode resolution — the
+    // analyzer otherwise reports `UnknownReferenceType` for the
+    // where-bound name because its `typecheck::check_unresolved_ref`
+    // pass doesn't yet model the body's extended scope. Lowering
+    // does, so the wasm output is well-formed regardless.
+    let (wasm, main_schema, return_schema) =
+        compile("#relaxed\n#main(Int x) -> Int\n(y + y) where { y: x * 2 }");
+    let main_layout = SchemaLayout::offsets_for(&main_schema).expect("main layout");
+    let return_layout = SchemaLayout::offsets_for(&return_schema).expect("return layout");
+
+    let mut builder = BufferBuilder::new(&main_layout, &main_schema.fields);
+    builder.write_int("x", 5).expect("write x");
+    let in_bytes = builder.finish();
+
+    let mut session = WasmSession::new(&wasm);
+    session.write(IN_PTR as usize, &in_bytes);
+    let bw = session.call(
+        IN_PTR,
+        in_bytes.len() as i32,
+        OUT_PTR,
+        return_layout.root_size as i32,
+    );
+    assert_eq!(bw as usize, return_layout.root_size);
+    let out = session.read(OUT_PTR as usize, return_layout.root_size);
+    let reader = BufferReader::new(&return_layout, &return_schema.fields, &out).expect("reader");
+    // y = 5 * 2 = 10 ; y + y = 20.
+    assert_eq!(reader.read_int("value").expect("read value"), 20);
+}
+
+#[test]
+fn let_binding_multiple_names() {
+    // Two let bindings in the same `where` block. Each one gets a
+    // fresh wasm local; the body references both alongside the
+    // `#main` param. `#relaxed` opts out of strict-mode analyzer
+    // resolution (see `let_binding_via_where_clause` for the same
+    // workaround rationale).
+    let (wasm, main_schema, return_schema) =
+        compile("#relaxed\n#main(Int x) -> Int\n(a + b + x) where { a: 1, b: 2 }");
+    let main_layout = SchemaLayout::offsets_for(&main_schema).expect("main layout");
+    let return_layout = SchemaLayout::offsets_for(&return_schema).expect("return layout");
+
+    let mut builder = BufferBuilder::new(&main_layout, &main_schema.fields);
+    builder.write_int("x", 100).expect("write x");
+    let in_bytes = builder.finish();
+
+    let mut session = WasmSession::new(&wasm);
+    session.write(IN_PTR as usize, &in_bytes);
+    let bw = session.call(
+        IN_PTR,
+        in_bytes.len() as i32,
+        OUT_PTR,
+        return_layout.root_size as i32,
+    );
+    assert_eq!(bw as usize, return_layout.root_size);
+    let out = session.read(OUT_PTR as usize, return_layout.root_size);
+    let reader = BufferReader::new(&return_layout, &return_schema.fields, &out).expect("reader");
+    assert_eq!(reader.read_int("value").expect("read value"), 103);
+}
+
+#[test]
+fn string_literal_output_roundtrips() {
+    // Phase 3.a: returning a String literal. The wasm module owns a
+    // `[len:u32][utf8]` record inside its const data section; the
+    // body memcpy's that record into the caller's `out_buf` tail
+    // area at runtime and writes the buffer-relative offset to the
+    // fixed-area pointer slot.
+    let (wasm, main_schema, return_schema) = compile("#main(Int x) -> String\n\"hi\"");
+    let main_layout = SchemaLayout::offsets_for(&main_schema).expect("main layout");
+    let return_layout = SchemaLayout::offsets_for(&return_schema).expect("return layout");
+
+    let mut builder = BufferBuilder::new(&main_layout, &main_schema.fields);
+    builder.write_int("x", 7).expect("write x");
+    let in_bytes = builder.finish();
+
+    // Allocate plenty of out_cap so the tail record fits.
+    let out_cap: i32 = 64;
+    let mut session = WasmSession::new(&wasm);
+    session.write(IN_PTR as usize, &in_bytes);
+    let bw = session.call(IN_PTR, in_bytes.len() as i32, OUT_PTR, out_cap);
+    assert!(bw as usize >= return_layout.root_size);
+
+    // Read enough bytes to cover the fixed area + the worst-case
+    // record. `bytes_written` tells us exactly how many.
+    let out = session.read(OUT_PTR as usize, bw as usize);
+    let reader = BufferReader::new(&return_layout, &return_schema.fields, &out).expect("reader");
+    assert_eq!(reader.read_string("value").expect("read value"), "hi");
+}
+
+#[test]
+fn list_int_literal_output_roundtrips() {
+    // Phase 3.a: returning a List<Int> literal. The data section
+    // record carries the `[len:u32][pad:u32][i64 elements]` shape so
+    // the wasm-side memory.copy lands at an 8-aligned tail offset
+    // with the element bytes intact.
+    let (wasm, main_schema, return_schema) = compile("#main(Int x) -> List<Int>\n[10, 20, 30]");
+    let main_layout = SchemaLayout::offsets_for(&main_schema).expect("main layout");
+    let return_layout = SchemaLayout::offsets_for(&return_schema).expect("return layout");
+
+    let mut builder = BufferBuilder::new(&main_layout, &main_schema.fields);
+    builder.write_int("x", 0).expect("write x");
+    let in_bytes = builder.finish();
+
+    let out_cap: i32 = 128;
+    let mut session = WasmSession::new(&wasm);
+    session.write(IN_PTR as usize, &in_bytes);
+    let bw = session.call(IN_PTR, in_bytes.len() as i32, OUT_PTR, out_cap);
+    assert!(bw as usize >= return_layout.root_size);
+
+    let out = session.read(OUT_PTR as usize, bw as usize);
+    let reader = BufferReader::new(&return_layout, &return_schema.fields, &out).expect("reader");
+    assert_eq!(
+        reader.read_list_int("value").expect("read value"),
+        vec![10, 20, 30]
+    );
+}
+
+#[test]
+fn string_return_out_cap_too_small_traps() {
+    // out_cap covers the 4-byte fixed-area pointer slot but is too
+    // small to fit the tail record — the runtime bounds check inside
+    // `emit_store_pointer_indirect` must trap.
+    let (wasm, main_schema, _return_schema) = compile("#main(Int x) -> String\n\"x\"");
+    let main_layout = SchemaLayout::offsets_for(&main_schema).expect("main layout");
+
+    let mut builder = BufferBuilder::new(&main_layout, &main_schema.fields);
+    builder.write_int("x", 1).expect("write x");
+    let in_bytes = builder.finish();
+
+    let mut session = WasmSession::new(&wasm);
+    session.write(IN_PTR as usize, &in_bytes);
+    // 4-byte fixed area + 1 padding byte = 5; the record needs `4 + "x".len()` = 5
+    // more bytes, so out_cap=8 trips the tail-area bounds guard.
+    session.call_expect_trap(IN_PTR, in_bytes.len() as i32, OUT_PTR, 8);
 }
 
 #[test]
