@@ -23,6 +23,7 @@
 //!   [`BuildError::UnsupportedFieldType`] up front (matching the IR
 //!   lowering's own supported leaves).
 
+use crate::cache::{AotCache, CacheError, CachedSchemas};
 use crate::{compile_lowered_entry, WasmModule};
 use relon_eval_api::buffer::{BufferBuilder, BufferError, BufferReader};
 use relon_eval_api::layout::{OffsetTable, SchemaLayout};
@@ -92,6 +93,12 @@ pub enum BuildError {
         /// Human-readable type label (`"Option"`, `"Result"`, ...).
         type_label: &'static str,
     },
+    /// On-disk AOT cache I/O / serialisation failure. Distinguished
+    /// from [`BuildError::WasmLoadError`] because the cache failure
+    /// is recoverable — callers can drop the cache and retry from a
+    /// clean compile if the host wants to.
+    #[error("cache error: {0}")]
+    CacheError(String),
 }
 
 /// A fully prepared wasmtime session — store, instance, exported
@@ -194,12 +201,81 @@ pub struct WasmAotEvaluator {
 }
 
 impl WasmAotEvaluator {
+    /// Compile `src` through a disk-backed [`AotCache`]. On a cache hit
+    /// the pipeline skips parse / analyze / lower / codegen and goes
+    /// straight from cached wasm bytes into `wasmtime::Module::new`.
+    /// On a miss the full compile runs and the result is stored back
+    /// into the cache before being returned.
+    ///
+    /// The cache key is `sha256(src)`, computed inline so callers can
+    /// hand in any source string without pre-hashing. Cache validity is
+    /// gated by the persisted `abi_version` + `codegen_version` — see
+    /// [`crate::cache`] for the full invalidation matrix.
+    ///
+    /// Returns the same [`WasmAotEvaluator`] shape as [`Self::from_source`]
+    /// so callers can drop the cache in front of an existing call site
+    /// without touching the post-construction surface.
+    pub fn from_source_with_cache(
+        src: &str,
+        cache: &AotCache,
+    ) -> Result<Self, BuildError> {
+        let source_hash = AotCache::source_hash(src);
+        // Cache hit short-circuits the entire compile pipeline. The
+        // cached entry carries the canonical `(main, return)` schemas
+        // it was originally compiled against, so the rehydration path
+        // pulls them straight off disk instead of re-running parse /
+        // analyze / lowering.
+        match cache.load(source_hash).map_err(cache_err)? {
+            Some(entry) => {
+                if let Some(schemas) = entry.schemas {
+                    return Self::from_bytes(entry.wasm_bytes, schemas.main, schemas.return_);
+                }
+                // The cached `.meta` was written by a schemaless `store`
+                // call. We have wasm bytes but no schemas — fall through
+                // to the full pipeline so we still produce a valid
+                // evaluator. The fresh `store_with_schemas` writes the
+                // sidecar so the next call hits the fast path.
+            }
+            None => {}
+        }
+        let (lowered, bytes) = Self::compile_source(src)?;
+        let main_schema = lowered.main_schema;
+        let return_schema = lowered.return_schema;
+        let schema_hash = combined_schema_hash(&main_schema, &return_schema);
+        // Persist the freshly compiled module + schemas before handing
+        // the evaluator back. A failure here is a hard error: the host
+        // explicitly asked for a cache, and silently dropping the write
+        // would hide a misconfigured cache directory.
+        cache
+            .store_with_schemas(
+                source_hash,
+                &bytes,
+                schema_hash,
+                &CachedSchemas {
+                    main: main_schema.clone(),
+                    return_: return_schema.clone(),
+                },
+            )
+            .map_err(cache_err)?;
+        Self::from_bytes(bytes, main_schema, return_schema)
+    }
+
     /// Compile `src` end-to-end and return a ready-to-call evaluator.
     ///
     /// Pipeline: `parse_document` → `relon_analyzer::analyze` →
     /// `relon_ir::lower_workspace_single` → `compile_lowered_entry` →
     /// `WasmModule::from_bytes` → `wasmtime::Module::new`.
     pub fn from_source(src: &str) -> Result<Self, BuildError> {
+        let (lowered, bytes) = Self::compile_source(src)?;
+        Self::from_bytes(bytes, lowered.main_schema, lowered.return_schema)
+    }
+
+    /// Run parse / analyze / lower / codegen on `src` and return the
+    /// `LoweredEntry` (for schemas) alongside the emitted wasm bytes.
+    /// Shared between [`Self::from_source`] and
+    /// [`Self::from_source_with_cache`] so both paths report identical
+    /// errors and stay in lockstep when the pipeline changes.
+    fn compile_source(src: &str) -> Result<(relon_ir::LoweredEntry, Vec<u8>), BuildError> {
         let ast =
             relon_parser::parse_document(src).map_err(|e| BuildError::ParseError(e.to_string()))?;
         let analyzed = relon_analyzer::analyze(&ast);
@@ -217,7 +293,7 @@ impl WasmAotEvaluator {
             .map_err(|e| BuildError::LoweringError(e.to_string()))?;
         let bytes =
             compile_lowered_entry(&lowered).map_err(|e| BuildError::CodegenError(e.to_string()))?;
-        Self::from_bytes(bytes, lowered.main_schema, lowered.return_schema)
+        Ok((lowered, bytes))
     }
 
     /// Build an evaluator from already-emitted wasm bytes plus the
@@ -620,6 +696,27 @@ impl WasmAotEvaluator {
             ))
         }
     }
+}
+
+/// Lift an [`AotCache`] [`CacheError`] into a [`BuildError::CacheError`]
+/// stringification. The cache itself owns its own enum surface; the
+/// evaluator's `BuildError` enum exposes a single cache slot so callers
+/// don't need to learn two error vocabularies.
+fn cache_err(e: CacheError) -> BuildError {
+    BuildError::CacheError(e.to_string())
+}
+
+/// Combine the main and return schemas into a single 32-byte schema
+/// fingerprint stored in the AOT cache meta. We sha256 the
+/// concatenation of the two per-schema canonical hashes so the cache
+/// can detect drift on either side without needing two hash slots.
+fn combined_schema_hash(main: &Schema, return_: &Schema) -> [u8; 32] {
+    use relon_eval_api::schema_canonical::schema_hash;
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(schema_hash(main));
+    hasher.update(schema_hash(return_));
+    hasher.finalize().into()
 }
 
 /// Round `value` up to the next multiple of `align`. `align` is
