@@ -36,7 +36,10 @@ wasmparser = "0.249"
 # round-trip `run_main`. Default features pull in cranelift +
 # wasmtime-runtime — long first build, then cached.
 wasmtime = "44"
-# Source -> AnalyzedTree pipeline driving the Phase 1.beta
-# end-to-end test.
+# Source -> AnalyzedTree pipeline driving the Phase 1.beta /
+# Phase 2.b end-to-end test.
 relon-parser = { workspace = true }
 relon-analyzer = { workspace = true }
+# Canonical schema construction + buffer writer/reader for the
+# Phase 2.b binary handshake integration tests.
+relon-eval-api = { workspace = true }

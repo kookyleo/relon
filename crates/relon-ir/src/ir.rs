@@ -24,16 +24,28 @@
 use ordered_float::OrderedFloat;
 use relon_parser::TokenRange;
 
-/// Scalar value type in v1.beta. Mirrors the wasm value-type subset
-/// the codegen pass emits — `Int` lowers to `I64`, `Float` lowers to
-/// `F64`. Later phases (composite layouts, host-pointer values)
-/// extend this enum; v1.beta stays minimal.
+/// Scalar value type in v1.beta / Phase 2.b. Mirrors the wasm
+/// value-type subset the codegen pass emits — `Int` lowers to `I64`,
+/// `Float` lowers to `F64`, `Bool` and `Null` lower to `I32` (a single
+/// byte on the wire but loaded into an i32 wasm slot). Later phases
+/// (composite layouts, host-pointer values) extend this enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum IrType {
+    /// 32-bit signed integer. Used for wasm-level handshake slots
+    /// only — `in_ptr` / `in_len` / `out_ptr` / `out_cap` parameters
+    /// and the `bytes_written` return. Not surfaced as a user-facing
+    /// Relon scalar.
+    I32,
     /// 64-bit signed integer (Relon `Int`).
     I64,
     /// IEEE-754 double-precision float (Relon `Float`).
     F64,
+    /// Boolean (Relon `Bool`). 1 byte on the wire, lifted to `i32` on
+    /// the wasm operand stack via `i32.load8_u`.
+    Bool,
+    /// Unit / `Null` placeholder. 1 byte on the wire (always `0`); the
+    /// codegen path emits `i32.const 0` rather than reading memory.
+    Null,
 }
 
 /// One lowered module — a flat list of functions plus an optional
@@ -52,17 +64,23 @@ pub struct Module {
 }
 
 /// One lowered function. Stack-based body; locals are addressed by
-/// the parameter's declaration order index (no separate symbol
-/// table — v1.beta only ever sees `#main` params as locals).
+/// the function-parameter declaration order index (no separate symbol
+/// table — v1.beta only ever sees the wasm-side handshake params).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Func {
-    /// Wasm export name. v1.beta always emits `"run_main"` for the
+    /// Wasm export name. Phase 2.b always emits `"run_main"` for the
     /// entry function; non-entry functions stay unexported.
     pub name: String,
-    /// Parameter types in declaration order. Index into this vector
-    /// is the operand of `Op::LocalGet`.
+    /// Wasm function-parameter types in declaration order. Phase 2.b
+    /// pins these to the four binary-handshake slots
+    /// `(in_ptr i32, in_len i32, out_ptr i32, out_cap i32)` for the
+    /// entry function; user-declared `#main` parameters are surfaced
+    /// via [`Op::LoadField`]. Index into this vector is the operand
+    /// of `Op::LocalGet`.
     pub params: Vec<IrType>,
-    /// Return type. Single-value return only (no tuples) in v1.beta.
+    /// Wasm return type. Phase 2.b pins this to `I64` — the
+    /// `bytes_written` count returned by the binary handshake. Single
+    /// value (no tuples) in this phase.
     pub ret: IrType,
     /// Op stream. Pushes / pops follow the discipline documented at
     /// the module level.
@@ -102,8 +120,36 @@ pub enum Op {
     /// same trick the parser uses for `Expr::Float`.
     ConstF64(OrderedFloat<f64>),
     /// Push the value of local `index`. Stack: `[] -> [T]`.
-    /// `index` is into `Func::params` in v1.beta.
+    /// `index` is a wasm function-local slot index. In Phase 2.b the
+    /// `run_main` signature is `(in_ptr, in_len, out_ptr, out_cap)`,
+    /// so the locals here are the four i32 handshake slots; user
+    /// fields are loaded via [`Op::LoadField`].
     LocalGet(u32),
+    /// Load a single field from the input buffer at `offset` bytes.
+    /// Stack: `[] -> [T]` where `T` is dictated by `ty`. Codegen emits
+    /// `local.get $in_ptr; <load>.offset=N` — `i64.load` for `I64`,
+    /// `f64.load` for `F64`, `i32.load8_u` for `Bool`, and a literal
+    /// `i32.const 0` for `Null` (no memory read needed for the unit
+    /// placeholder).
+    LoadField {
+        /// Byte offset of the field inside the input buffer, supplied
+        /// by `relon_eval_api::layout::OffsetTable`.
+        offset: u32,
+        /// Field's IR type. Determines which wasm load opcode the
+        /// codegen pass picks.
+        ty: IrType,
+    },
+    /// Store the top stack value to the output buffer at `offset`
+    /// bytes. Stack: `[T] -> []`. Phase 2.b emits a single trailing
+    /// `StoreField` per `run_main` body (one root return value); later
+    /// phases extend this to multi-field record returns.
+    StoreField {
+        /// Byte offset of the slot inside the output buffer.
+        offset: u32,
+        /// Slot type. Determines the wasm store opcode (`i64.store`,
+        /// `f64.store`, `i32.store8`).
+        ty: IrType,
+    },
     /// Pop two operands of the tagged type, push their sum. Stack:
     /// `[T, T] -> [T]`.
     Add(IrType),

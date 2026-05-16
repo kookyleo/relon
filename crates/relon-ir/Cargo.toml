@@ -15,6 +15,10 @@ categories = ["compilers"]
 relon-parser = { workspace = true }
 # AnalyzedTree input
 relon-analyzer = { workspace = true }
+# Schema canonical form, layout, and SchemaDef -> Schema lowering used
+# by Phase 2.b to package `#main` params into a 1-record schema and
+# resolve field offsets for `Op::LoadField` / `Op::StoreField`.
+relon-eval-api = { workspace = true }
 
 thiserror = { workspace = true }
 miette = { workspace = true }

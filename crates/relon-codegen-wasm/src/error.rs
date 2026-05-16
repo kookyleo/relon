@@ -38,6 +38,13 @@ pub enum CodegenError {
     /// trigger from a `lower_workspace_*` produced IR.
     #[error("srcmap pass failed: {0}")]
     SrcMapEncode(String),
+    /// Phase 2.b: the canonical schema's offset table couldn't be
+    /// computed (variable-size leaf, overflow, ...) or one of the
+    /// derived sizes overflowed the u32 slot width used by the
+    /// binary handshake size guards. Wraps the layout-side error
+    /// stringified so the public surface stays narrow.
+    #[error("layout error: {0}")]
+    Layout(String),
 }
 
 /// Failure modes when loading an already-compiled wasm module via
