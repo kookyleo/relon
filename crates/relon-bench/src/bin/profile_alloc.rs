@@ -30,7 +30,7 @@
 
 use std::sync::Arc;
 
-use relon_evaluator::{Context, Evaluator, Scope};
+use relon_evaluator::{Context, Scope, TreeWalkEvaluator};
 use relon_parser::parse_document;
 
 #[cfg(feature = "dhat-heap")]
@@ -90,7 +90,10 @@ fn main() {
             run_workload_oneshot("simple", SIMPLE_SOURCE, simple_iters);
         }
         "simple-pooled" => {
-            println!("simple-pooled workload x{}: {}", simple_iters, SIMPLE_SOURCE);
+            println!(
+                "simple-pooled workload x{}: {}",
+                simple_iters, SIMPLE_SOURCE
+            );
             run_workload_pooled("simple-pooled", SIMPLE_SOURCE, simple_iters);
         }
         "comprehension" => {
@@ -130,9 +133,13 @@ fn run_workload_oneshot(label: &str, source: &str, iterations: usize) {
         let ctx = {
             let mut ctx = Context::new().with_root(ast.clone());
             ctx.prepend_module_resolver(Arc::new(relon_evaluator::StdModuleResolver));
-            Arc::new(ctx)
+            Arc::new({
+                let mut ctx = ctx;
+                relon_evaluator::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+                ctx
+            })
         };
-        let eval = Evaluator::new(Arc::clone(&ctx));
+        let eval = TreeWalkEvaluator::new(Arc::clone(&ctx));
         let _result = eval
             .eval(&ast, &Arc::new(Scope::default()))
             .expect("eval failed");
@@ -156,9 +163,13 @@ fn run_workload_pooled(label: &str, source: &str, iterations: usize) {
     let ctx = {
         let mut ctx = Context::new().with_root(ast.clone());
         ctx.prepend_module_resolver(Arc::new(relon_evaluator::StdModuleResolver));
-        Arc::new(ctx)
+        Arc::new({
+            let mut ctx = ctx;
+            relon_evaluator::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+            ctx
+        })
     };
-    let eval = Evaluator::new(Arc::clone(&ctx));
+    let eval = TreeWalkEvaluator::new(Arc::clone(&ctx));
     for _ in 0..iterations {
         let scope = Arc::new(Scope::default());
         let _result = eval.eval_root(&scope).expect("eval_root failed");

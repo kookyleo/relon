@@ -5,7 +5,7 @@ use miette::{IntoDiagnostic, LabeledSpan, NamedSource, Report};
 use relon::ResolverChainLoader;
 use relon_analyzer::analyze_entry;
 use relon_evaluator::module::FilesystemModuleResolver;
-use relon_evaluator::{Capabilities, Context, Evaluator, Scope, Value};
+use relon_evaluator::{Capabilities, Context, Scope, TreeWalkEvaluator, Value};
 use relon_parser::{parse_document, ParseDocumentError};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -192,19 +192,24 @@ fn main() -> miette::Result<()> {
                     ctx.capabilities = Capabilities::all_granted();
                     ctx.prepend_module_resolver(Arc::new(FilesystemModuleResolver::trusted()));
                 }
-                Arc::new(ctx)
+                Arc::new({
+                    let mut ctx = ctx;
+                    relon_evaluator::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+                    ctx
+                })
             };
             let _root_loading_guard = ctx.enter_loading_module(cache_namespace.clone());
-            let evaluator = Evaluator::new(Arc::clone(&ctx));
+            let evaluator = TreeWalkEvaluator::new(Arc::clone(&ctx));
 
-            let mut root_scope = Scope::default();
-            root_scope.current_dir = canonical_file
-                .parent()
-                .unwrap_or(std::path::Path::new("."))
-                .to_string_lossy()
-                .to_string();
-            root_scope.cache_namespace = cache_namespace.clone();
-            let scope = std::sync::Arc::new(root_scope);
+            let scope = std::sync::Arc::new(Scope {
+                current_dir: canonical_file
+                    .parent()
+                    .unwrap_or(std::path::Path::new("."))
+                    .to_string_lossy()
+                    .to_string(),
+                cache_namespace: cache_namespace.clone(),
+                ..Scope::default()
+            });
 
             // Branch on whether the file declares `#main(...)`. With a
             // signature, hosts push args; without one, we walk the body

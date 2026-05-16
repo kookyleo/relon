@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use relon_evaluator::{Context, Evaluator, Scope};
+use relon_evaluator::{Context, Scope, TreeWalkEvaluator};
 use relon_parser::parse_document;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -51,9 +51,13 @@ fn bench_once(source: &str) -> (Duration, Duration) {
     let ctx = {
         let mut ctx = Context::new().with_root(ast.clone());
         ctx.prepend_module_resolver(Arc::new(relon_evaluator::StdModuleResolver));
-        Arc::new(ctx)
+        Arc::new({
+            let mut ctx = ctx;
+            relon_evaluator::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+            ctx
+        })
     };
-    let eval = Evaluator::new(Arc::clone(&ctx));
+    let eval = TreeWalkEvaluator::new(Arc::clone(&ctx));
     let _result = eval
         .eval(&ast, &Arc::new(Scope::default()))
         .expect("Eval failed");

@@ -24,7 +24,7 @@ use miette::Diagnostic as MietteDiagnostic;
 use relon::ResolverChainLoader;
 use relon_analyzer::{analyze_entry, Severity};
 use relon_evaluator::module::{ModuleResolver, ModuleSource, StdModuleResolver};
-use relon_evaluator::{Context, Evaluator, RuntimeError, Scope, Value};
+use relon_evaluator::{Context, RuntimeError, Scope, TreeWalkEvaluator, Value};
 use relon_parser::{parse_document, parse_document_recovering, TokenRange};
 use serde::{Deserialize, Serialize};
 // Re-imported below where `value.serialize(&serializer)` is invoked; the
@@ -455,17 +455,21 @@ fn evaluate_internal(
         .with_root(entry_node)
         .with_workspace(Arc::clone(&workspace_arc));
     ctx.prepend_module_resolver(in_memory);
-    let ctx = Arc::new(ctx);
+    let ctx = Arc::new({
+        let mut ctx = ctx;
+        relon_evaluator::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    });
 
     let _root_loading_guard = ctx.enter_loading_module(entry.to_string());
 
-    let evaluator = Evaluator::new(Arc::clone(&ctx));
+    let evaluator = TreeWalkEvaluator::new(Arc::clone(&ctx));
 
-    let mut root_scope = Scope::default();
-    root_scope.current_dir = entry_dir;
-    root_scope.cache_namespace = entry.to_string();
-
-    let scope_arc = Arc::new(root_scope);
+    let scope_arc = Arc::new(Scope {
+        current_dir: entry_dir,
+        cache_namespace: entry.to_string(),
+        ..Scope::default()
+    });
     let value = match args {
         Some(args_map) => evaluator
             .run_main(&scope_arc, args_map)

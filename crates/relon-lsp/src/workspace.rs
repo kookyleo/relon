@@ -52,9 +52,10 @@ impl ModuleLoader for LspLoader {
         // facade / CLI loaders use to bridge the analyzer trait (which
         // doesn't know about `Scope`) to the evaluator-side resolver
         // chain (which reads `current_dir` off the scope).
-        let mut scope = Scope::default();
-        scope.current_dir = current_dir.to_string_lossy().to_string();
-        let scope = Arc::new(scope);
+        let scope = Arc::new(Scope {
+            current_dir: current_dir.to_string_lossy().to_string(),
+            ..Scope::default()
+        });
         for resolver in &self.resolvers {
             match resolver.resolve(path, &scope, TokenRange::default()) {
                 Ok(Some(ModuleSource {
