@@ -140,12 +140,79 @@ pub struct TaggedOp {
 /// bugs and codegen surfaces them via `CodegenError::MixedNumericTypes`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Op {
+    /// Push a Bool literal. Stack: `[] -> [Bool]`. Codegen emits
+    /// `i32.const 1` for `true` and `i32.const 0` for `false`.
+    /// Carries its own constructor (rather than reusing `ConstI64`)
+    /// so the virtual stack tracks the result as `Bool` — that lets
+    /// downstream comparison / `if` paths refuse mismatched arms
+    /// without re-deriving types.
+    ConstBool(bool),
     /// Push an `i64` constant. Stack: `[] -> [i64]`.
     ConstI64(i64),
     /// Push an `f64` constant. Stack: `[] -> [f64]`.
     /// `OrderedFloat` so the enum can derive `PartialEq` and `Eq` —
     /// same trick the parser uses for `Expr::Float`.
     ConstF64(OrderedFloat<f64>),
+    /// Push an absolute wasm linear-memory address of a constant
+    /// String record laid out in the data section. Stack: `[] -> [String]`.
+    ///
+    /// The address points at the first byte of a `[len: u32 LE][utf8 bytes]`
+    /// record; the record itself is materialised in a wasm `Data`
+    /// section by the codegen pass. Codegen collects every
+    /// `ConstString` op when scanning the IR module and emits a single
+    /// passive-style initialiser at module load time.
+    ///
+    /// The `idx` is an arbitrary per-module identifier; codegen maps
+    /// it to a concrete memory offset.
+    ConstString {
+        /// Per-module identifier the codegen layout pass uses to look
+        /// up the record's absolute memory offset.
+        idx: u32,
+        /// The string bytes themselves — codegen copies these into
+        /// the data section verbatim.
+        value: String,
+    },
+    /// Push an absolute wasm linear-memory address of a constant
+    /// List<Int> record. Stack: `[] -> [ListInt]`.
+    ///
+    /// Record layout in the data section: `[len: u32 LE][pad: u32 zero][i64 elements]`.
+    /// Total size: `8 + 8 * elements.len()` bytes. The 4-byte pad
+    /// keeps the elements 8-aligned **inside the record** when the
+    /// record itself is placed at an 8-aligned absolute address. The
+    /// codegen layout pass aligns each List<Int> data-section entry
+    /// to 8 to satisfy that invariant.
+    ConstListInt {
+        /// Per-module identifier the codegen layout pass uses to look
+        /// up the record's absolute memory offset.
+        idx: u32,
+        /// The i64 elements — codegen materialises them into the
+        /// data section in little-endian order.
+        elements: Vec<i64>,
+    },
+    /// Push a user-let-binding local. Stack: `[] -> [ty]`.
+    ///
+    /// The `idx` is a per-function local index for `let`-bound names
+    /// — distinct from the wasm-handshake slots that [`Op::LocalGet`]
+    /// addresses. Codegen allocates a wasm local of the matching
+    /// `ValType` for each unique `idx` it sees and translates
+    /// `LetGet { idx }` to `local.get $(WASM_FIRST_LET_LOCAL + idx)`.
+    LetGet {
+        /// Per-function let-local index.
+        idx: u32,
+        /// IR type of the bound value. Determines the wasm valtype
+        /// of the underlying local declaration.
+        ty: IrType,
+    },
+    /// Pop the top of the stack into a user-let-binding local.
+    /// Stack: `[ty] -> []`. See [`Op::LetGet`] for the local-index
+    /// semantics.
+    LetSet {
+        /// Per-function let-local index.
+        idx: u32,
+        /// IR type of the value being stored. Codegen uses this to
+        /// pick the matching wasm valtype for the local declaration.
+        ty: IrType,
+    },
     /// Push the value of local `index`. Stack: `[] -> [T]`.
     /// `index` is a wasm function-local slot index. In Phase 2.b the
     /// `run_main` signature is `(in_ptr, in_len, out_ptr, out_cap)`,

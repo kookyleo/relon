@@ -29,7 +29,11 @@ fn missing_main_reports_error() {
 
 #[test]
 fn unsupported_type_in_main_reports_error() {
-    let source = "#main(String s) -> String\ns";
+    // `Any` isn't part of the Phase 3.a lowering surface (we lower
+    // Int / Float / Bool / Null / String / List<Int>), so a `#main`
+    // parameter declared as `Any` still bounces with the structured
+    // `UnsupportedTypeInMain` diagnostic rather than panicking.
+    let source = "#main(Any a) -> Int\n1";
     let ast = relon_parser::parse_document(source).expect("parse");
     let analyzed = relon_analyzer::analyze(&ast);
     let err = lower_workspace_single(&analyzed, &ast).expect_err("lowering should reject");
