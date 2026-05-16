@@ -229,8 +229,7 @@ pub fn decode(bytes: &[u8]) -> Result<AbiMetadata, AbiError> {
     let flags = bytes[75];
 
     let required_capabilities = u64::from_le_bytes([
-        bytes[76], bytes[77], bytes[78], bytes[79],
-        bytes[80], bytes[81], bytes[82], bytes[83],
+        bytes[76], bytes[77], bytes[78], bytes[79], bytes[80], bytes[81], bytes[82], bytes[83],
     ]);
 
     Ok(AbiMetadata {

@@ -27,7 +27,9 @@ pub struct HostFnTable {
 
 impl HostFnTable {
     pub fn empty() -> Self {
-        Self { entries: Vec::new() }
+        Self {
+            entries: Vec::new(),
+        }
     }
 
     pub fn required_capabilities(&self) -> u64 {
@@ -81,14 +83,19 @@ pub fn decode(bytes: &[u8]) -> Result<HostFnTable, HostFnError> {
     }
     let format_version = bytes[4];
     if format_version != FORMAT_VERSION {
-        return Err(HostFnError::FutureFormat { got: format_version });
+        return Err(HostFnError::FutureFormat {
+            got: format_version,
+        });
     }
     let mut cur = 5usize;
     let entry_count = read_varuint32(bytes, &mut cur)?;
     let mut entries = Vec::with_capacity(entry_count as usize);
     for _ in 0..entry_count {
         let name_len = read_varuint32(bytes, &mut cur)? as usize;
-        if cur.checked_add(name_len).is_none_or(|end| end > bytes.len()) {
+        if cur
+            .checked_add(name_len)
+            .is_none_or(|end| end > bytes.len())
+        {
             return Err(HostFnError::Truncated);
         }
         let name_slice = &bytes[cur..cur + name_len];

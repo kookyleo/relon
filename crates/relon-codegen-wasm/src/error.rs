@@ -95,6 +95,44 @@ pub enum CodegenError {
         /// The IR type carried on the offending `StoreField`.
         ty: IrType,
     },
+    /// Phase 6: the caller-supplied [`crate::HostFnTable`] doesn't
+    /// agree with the IR module's `imports` list. The position-by-
+    /// position correspondence is part of the wire format (each
+    /// `Op::CallNative { import_idx }` targets the matching entry
+    /// in both vectors); mismatched lengths break that invariant
+    /// before codegen even attempts to emit.
+    #[error(
+        "host-fns table arity mismatch: ir_imports={ir_imports}, table_entries={table_entries}"
+    )]
+    HostFnTableArityMismatch {
+        /// Number of `NativeImport` entries in the IR module.
+        ir_imports: u32,
+        /// Number of `HostFnEntry` rows in the supplied table.
+        table_entries: u32,
+    },
+    /// Phase 6: an `Op::CallNative` references an import index past
+    /// the imports the IR module declared. Surfaces a hand-built IR
+    /// bug — `lower_workspace_*` keeps the two in sync by design.
+    #[error("Op::CallNative import_idx={import_idx} out of range (import_count={import_count})")]
+    CallNativeImportOutOfRange {
+        /// Offending `import_idx` value on the op.
+        import_idx: u32,
+        /// Number of imports the IR module declared.
+        import_count: u32,
+    },
+    /// Phase 6: an `Op::CallNative` arrived at codegen with operand
+    /// types or counts that disagree with the declared host-fn
+    /// signature. Lowering is responsible for matching them — this
+    /// is the codegen belt-and-braces.
+    #[error(
+        "Op::CallNative arg mismatch: import_idx={import_idx} param_tys.len()={param_tys_len}"
+    )]
+    CallNativeArgCountMismatch {
+        /// Import index whose signature was violated.
+        import_idx: u32,
+        /// Length of the op's `param_tys` vector.
+        param_tys_len: u32,
+    },
 }
 
 /// Failure modes when loading an already-compiled wasm module via
