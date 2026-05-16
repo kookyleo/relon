@@ -447,9 +447,9 @@ pub enum Op {
 
     /// Phase 4.a stdlib primitive.
     ///
-    /// Pop a `String` pointer (i32 wasm slot, absolute wasm-memory
-    /// address of a `[len:u32 LE][utf8 bytes]` record) and push the
-    /// length as an `I64` value. Codegen lowers to:
+    /// Pop a pointer-indirect record pointer (i32 wasm slot, absolute
+    /// wasm-memory address of a `[len:u32 LE][payload]` record) and
+    /// push the length as an `I64` value. Codegen lowers to:
     ///
     /// ```text
     /// i32.load offset=0 align=2   ;; u32 LE length prefix
@@ -462,5 +462,27 @@ pub enum Op {
     /// at zero by the record layout. A dedicated op also keeps
     /// diagnostics from confusing a stdlib byte-length read with a
     /// user-facing field load.
+    ///
+    /// Reused across both pointer-indirect leaves whose tail-area
+    /// layout starts with a `u32 LE` length prefix: `String`
+    /// (`[len][utf8...]`) and `ListInt` (`[len][pad][i64...]`). The
+    /// name is kept for backward compatibility — semantically it now
+    /// reads the leading u32 of any such record.
     ReadStringLen,
+
+    /// Phase 4.b stdlib primitive.
+    ///
+    /// Wasm `select` / `select t` operator: pop `[a, b, cond_i32]` and
+    /// push `a` if `cond` is non-zero, else `b`. Both `a` and `b` must
+    /// share the same wasm slot; the op carries the result type so
+    /// codegen can emit the typed `select t` form and validate
+    /// branches at IR-level without re-deriving types.
+    ///
+    /// Stack effect: `[T, T, i32] -> [T]`.
+    Select {
+        /// IR type of both operands and the resulting value. Codegen
+        /// translates this to a single `wasm-encoder::Instruction::TypedSelect`
+        /// with the matching `ValType`.
+        ty: IrType,
+    },
 }
