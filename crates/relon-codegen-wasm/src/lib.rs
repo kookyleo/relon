@@ -693,10 +693,7 @@ fn collect_max_record_idx(body: &[relon_ir::TaggedOp]) -> Option<u32> {
     let mut update = |idx: u32| {
         max = Some(max.map_or(idx, |m| m.max(idx)));
     };
-    fn walk(
-        body: &[relon_ir::TaggedOp],
-        update: &mut impl FnMut(u32),
-    ) {
+    fn walk(body: &[relon_ir::TaggedOp], update: &mut impl FnMut(u32)) {
         for tagged in body {
             match &tagged.op {
                 Op::AllocRootRecord { record_local_idx }
@@ -1058,7 +1055,15 @@ fn emit_if(
 
     // `then` arm.
     let mut then_stack: Vec<IrType> = Vec::new();
-    emit_op_seq(f, ranges, &mut then_stack, then_body, func, const_pool, ectx)?;
+    emit_op_seq(
+        f,
+        ranges,
+        &mut then_stack,
+        then_body,
+        func,
+        const_pool,
+        ectx,
+    )?;
     let then_top = match then_stack.pop() {
         Some(t) => t,
         None => return Err(CodegenError::MixedNumericTypes),
@@ -1078,7 +1083,15 @@ fn emit_if(
 
     // `else` arm.
     let mut else_stack: Vec<IrType> = Vec::new();
-    emit_op_seq(f, ranges, &mut else_stack, else_body, func, const_pool, ectx)?;
+    emit_op_seq(
+        f,
+        ranges,
+        &mut else_stack,
+        else_body,
+        func,
+        const_pool,
+        ectx,
+    )?;
     let else_top = match else_stack.pop() {
         Some(t) => t,
         None => return Err(CodegenError::MixedNumericTypes),

@@ -285,6 +285,12 @@ fn in_len_too_small_traps() {
 /// Compile + lower `src` without panicking on lowering errors —
 /// returns the lowering error so the caller can match on it. Mirrors
 /// [`compile`] but without the `compile_lowered_entry` step.
+//
+// Phase 3.b's dict-construction variants pushed `LoweringError` over
+// the clippy `result_large_err` default threshold; the test fn keeps
+// the `Result<(), LoweringError>` shape for matching ergonomics and
+// scopes the allow tightly so future variants stay visible.
+#[allow(clippy::result_large_err)]
 fn lower_only(src: &str) -> Result<(), LoweringError> {
     let ast = relon_parser::parse_document(src).expect("parse");
     let analyzed = relon_analyzer::analyze(&ast);
@@ -644,6 +650,190 @@ fn string_return_out_cap_too_small_traps() {
     // 4-byte fixed area + 1 padding byte = 5; the record needs `4 + "x".len()` = 5
     // more bytes, so out_cap=8 trips the tail-area bounds guard.
     session.call_expect_trap(IN_PTR, in_bytes.len() as i32, OUT_PTR, 8);
+}
+
+// =====================================================================
+// Phase 3.b: branded dict literal output.
+// =====================================================================
+
+#[test]
+fn dict_literal_with_user_provided_fields() {
+    // `#main(Int x) -> User` packages the body as a User-branded dict
+    // whose `name` is a const string and whose `age` reads from the
+    // `#main` parameter. The host reads the User record back via
+    // BufferReader using the same canonical schema codegen used.
+    let (wasm, main_schema, return_schema) = compile(
+        r#"#schema User { String name: *, Int age: * }
+#main(Int x) -> User
+{ name: "Alice", age: x }
+"#,
+    );
+    let main_layout = SchemaLayout::offsets_for(&main_schema).expect("main");
+    let return_layout = SchemaLayout::offsets_for(&return_schema).expect("return");
+
+    let mut builder = BufferBuilder::new(&main_layout, &main_schema.fields);
+    builder.write_int("x", 42).expect("write x");
+    let in_bytes = builder.finish();
+
+    let out_cap: i32 = 128;
+    let mut session = WasmSession::new(&wasm);
+    session.write(IN_PTR as usize, &in_bytes);
+    let bw = session.call(IN_PTR, in_bytes.len() as i32, OUT_PTR, out_cap);
+    assert!(bw as usize >= return_layout.root_size);
+    let out = session.read(OUT_PTR as usize, bw as usize);
+    let reader = BufferReader::new(&return_layout, &return_schema.fields, &out).expect("reader");
+    assert_eq!(reader.read_string("name").expect("name"), "Alice");
+    assert_eq!(reader.read_int("age").expect("age"), 42);
+}
+
+#[test]
+fn dict_literal_with_schema_default() {
+    // Schema field `Int b: a + 1` declares a default expression. The
+    // dict literal supplies `a` only; lowering picks the topological
+    // order `[a, b]` and emits `b = a + 1` via a sibling reference.
+    let (wasm, main_schema, return_schema) = compile(
+        r#"#schema X { Int a: *, Int b: a + 1 }
+#main(Int v) -> X
+{ a: v }
+"#,
+    );
+    let main_layout = SchemaLayout::offsets_for(&main_schema).expect("main");
+    let return_layout = SchemaLayout::offsets_for(&return_schema).expect("return");
+
+    let mut builder = BufferBuilder::new(&main_layout, &main_schema.fields);
+    builder.write_int("v", 10).expect("write v");
+    let in_bytes = builder.finish();
+
+    let out_cap: i32 = 64;
+    let mut session = WasmSession::new(&wasm);
+    session.write(IN_PTR as usize, &in_bytes);
+    let bw = session.call(IN_PTR, in_bytes.len() as i32, OUT_PTR, out_cap);
+    let out = session.read(OUT_PTR as usize, bw as usize);
+    let reader = BufferReader::new(&return_layout, &return_schema.fields, &out).expect("reader");
+    assert_eq!(reader.read_int("a").expect("a"), 10);
+    assert_eq!(reader.read_int("b").expect("b"), 11);
+}
+
+#[test]
+fn dict_literal_topo_sort() {
+    // Schema declares `c, b, a` in source order with defaults that
+    // refer backwards. The topological sort picks `[a, b, c]` so each
+    // dependency is ready when its consumer evaluates.
+    let (wasm, main_schema, return_schema) = compile(
+        r#"#schema Y { Int c: b + 1, Int a: 1, Int b: a + 10 }
+#main(Int dummy) -> Y
+{ }
+"#,
+    );
+    let main_layout = SchemaLayout::offsets_for(&main_schema).expect("main");
+    let return_layout = SchemaLayout::offsets_for(&return_schema).expect("return");
+
+    let mut builder = BufferBuilder::new(&main_layout, &main_schema.fields);
+    builder.write_int("dummy", 0).expect("write dummy");
+    let in_bytes = builder.finish();
+
+    let out_cap: i32 = 64;
+    let mut session = WasmSession::new(&wasm);
+    session.write(IN_PTR as usize, &in_bytes);
+    let bw = session.call(IN_PTR, in_bytes.len() as i32, OUT_PTR, out_cap);
+    let out = session.read(OUT_PTR as usize, bw as usize);
+    let reader = BufferReader::new(&return_layout, &return_schema.fields, &out).expect("reader");
+    assert_eq!(reader.read_int("a").expect("a"), 1);
+    assert_eq!(reader.read_int("b").expect("b"), 11);
+    assert_eq!(reader.read_int("c").expect("c"), 12);
+}
+
+#[test]
+fn dict_literal_cycle_detected() {
+    // `#schema Z { Int a: b, Int b: a }` is a default-default cycle.
+    // The lowering pass reports `CyclicFieldDependency` rather than
+    // compiling a wasm module that would loop at runtime.
+    let err = lower_only(
+        r#"#schema Z { Int a: b, Int b: a }
+#main(Int dummy) -> Z
+{ }
+"#,
+    )
+    .expect_err("cycle must be rejected");
+    assert!(
+        matches!(err, LoweringError::CyclicFieldDependency { ref schema, .. } if schema == "Z"),
+        "expected CyclicFieldDependency for schema Z, got {err:?}"
+    );
+}
+
+#[test]
+fn dict_literal_user_value_breaks_cycle() {
+    // Same schema as the cycle test, but the dict literal supplies
+    // `a` explicitly — `b`'s default `a` is satisfied without
+    // re-entering the cycle. Lowering accepts and codegen produces a
+    // working module.
+    let (wasm, main_schema, return_schema) = compile(
+        r#"#schema Z { Int a: b, Int b: a }
+#main(Int dummy) -> Z
+{ a: 1 }
+"#,
+    );
+    let main_layout = SchemaLayout::offsets_for(&main_schema).expect("main");
+    let return_layout = SchemaLayout::offsets_for(&return_schema).expect("return");
+    let mut builder = BufferBuilder::new(&main_layout, &main_schema.fields);
+    builder.write_int("dummy", 0).expect("write dummy");
+    let in_bytes = builder.finish();
+    let out_cap: i32 = 64;
+    let mut session = WasmSession::new(&wasm);
+    session.write(IN_PTR as usize, &in_bytes);
+    let bw = session.call(IN_PTR, in_bytes.len() as i32, OUT_PTR, out_cap);
+    let out = session.read(OUT_PTR as usize, bw as usize);
+    let reader = BufferReader::new(&return_layout, &return_schema.fields, &out).expect("reader");
+    assert_eq!(reader.read_int("a").expect("a"), 1);
+    assert_eq!(reader.read_int("b").expect("b"), 1);
+}
+
+#[test]
+fn nested_dict() {
+    // Nested branded dict: the outer `Usr` carries an `Addr` sub-
+    // record. Codegen allocates the sub-record's fixed area in the
+    // tail, writes its `city` / `zip` fields, then stores the
+    // sub-record's tail offset into the outer's pointer slot.
+    let (wasm, main_schema, return_schema) = compile(
+        r#"#schema Addr { String city: *, Int zip: * }
+#schema Usr { Addr addr: *, String name: * }
+#main(Int dummy) -> Usr
+{ Addr addr: { city: "BJ", zip: 100000 }, name: "Bob" }
+"#,
+    );
+    let main_layout = SchemaLayout::offsets_for(&main_schema).expect("main");
+    let return_layout = SchemaLayout::offsets_for(&return_schema).expect("return");
+
+    let mut builder = BufferBuilder::new(&main_layout, &main_schema.fields);
+    builder.write_int("dummy", 0).expect("write dummy");
+    let in_bytes = builder.finish();
+
+    let out_cap: i32 = 256;
+    let mut session = WasmSession::new(&wasm);
+    session.write(IN_PTR as usize, &in_bytes);
+    let bw = session.call(IN_PTR, in_bytes.len() as i32, OUT_PTR, out_cap);
+    let out = session.read(OUT_PTR as usize, bw as usize);
+    let reader = BufferReader::new(&return_layout, &return_schema.fields, &out).expect("reader");
+    assert_eq!(reader.read_string("name").expect("name"), "Bob");
+
+    // Look up the nested Addr layout dynamically from the parent
+    // schema (its `addr` field's TypeRepr::Schema carries the inner
+    // canonical form).
+    let addr_field = return_schema
+        .fields
+        .iter()
+        .find(|f| f.name == "addr")
+        .expect("addr field");
+    let inner_schema = match &addr_field.ty {
+        relon_eval_api::schema_canonical::TypeRepr::Schema { schema } => schema.as_ref().clone(),
+        other => panic!("expected nested schema, got {other:?}"),
+    };
+    let inner_layout = SchemaLayout::offsets_for(&inner_schema).expect("inner");
+    let addr_reader = reader
+        .sub_record("addr", &inner_layout, &inner_schema.fields)
+        .expect("sub reader");
+    assert_eq!(addr_reader.read_string("city").expect("city"), "BJ");
+    assert_eq!(addr_reader.read_int("zip").expect("zip"), 100000);
 }
 
 #[test]

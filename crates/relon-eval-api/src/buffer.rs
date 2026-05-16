@@ -551,13 +551,12 @@ impl<'a> BufferReader<'a> {
         let mut ptr_buf = [0u8; 4];
         ptr_buf.copy_from_slice(&self.bytes[ptr_offset..ptr_offset + 4]);
         let sub_base = u32::from_le_bytes(ptr_buf) as usize;
-        let sub_end =
-            sub_base
-                .checked_add(sub_layout.root_size)
-                .ok_or_else(|| BufferError::MalformedPayload {
-                    name: field_name.to_string(),
-                    reason: "sub-record end overflows usize",
-                })?;
+        let sub_end = sub_base.checked_add(sub_layout.root_size).ok_or_else(|| {
+            BufferError::MalformedPayload {
+                name: field_name.to_string(),
+                reason: "sub-record end overflows usize",
+            }
+        })?;
         if sub_end > self.bytes.len() {
             return Err(BufferError::MalformedPayload {
                 name: field_name.to_string(),

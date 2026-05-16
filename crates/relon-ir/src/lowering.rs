@@ -241,8 +241,7 @@ fn lower_workspace_single_with_module(
     // schema, but the wasm-level layout pads the *user schema* into
     // the root return area directly (no extra pointer slot).
     let resolver = SchemaResolver::new(tree);
-    let user_return_schema =
-        resolve_return_user_schema(sig.return_type.as_ref(), &resolver)?;
+    let user_return_schema = resolve_return_user_schema(sig.return_type.as_ref(), &resolver)?;
 
     // Build the canonical-form schemas for in_buf and out_buf, then
     // compute the offset table for the param schema so each
@@ -912,7 +911,7 @@ fn canonical_schema_from_def<'a>(
             kind: "anonymous-nested-schema".to_string(),
             range,
         })?;
-    if stack.iter().any(|n| *n == name) {
+    if stack.contains(&name) {
         let mut cycle: Vec<String> = stack.iter().map(|s| s.to_string()).collect();
         cycle.push(name.to_string());
         return Err(LoweringError::CyclicFieldDependency {
@@ -1082,8 +1081,8 @@ fn topo_order_fields(
     }
     let mut order: Vec<usize> = Vec::with_capacity(n);
     let mut ready: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
-    for i in 0..n {
-        if incoming[i] == 0 {
+    for (i, &incoming_count) in incoming.iter().enumerate().take(n) {
+        if incoming_count == 0 {
             ready.push_back(i);
         }
     }
@@ -1113,11 +1112,7 @@ fn topo_order_fields(
 /// least one cycle exists (Kahn's algorithm couldn't drain the
 /// graph); we build a representative path so the user sees the field
 /// chain that participates.
-fn find_cycle_path(
-    outgoing: &[Vec<usize>],
-    def: &SchemaDef,
-    incoming: &[usize],
-) -> Vec<String> {
+fn find_cycle_path(outgoing: &[Vec<usize>], def: &SchemaDef, incoming: &[usize]) -> Vec<String> {
     let n = outgoing.len();
     let mut visited = vec![false; n];
     let mut on_stack = vec![false; n];
@@ -1126,12 +1121,10 @@ fn find_cycle_path(
         if visited[start] || incoming[start] == 0 {
             continue;
         }
-        if let Some(cycle) = dfs_find_cycle(start, outgoing, &mut visited, &mut on_stack, &mut stack)
+        if let Some(cycle) =
+            dfs_find_cycle(start, outgoing, &mut visited, &mut on_stack, &mut stack)
         {
-            return cycle
-                .iter()
-                .map(|&i| def.fields[i].name.clone())
-                .collect();
+            return cycle.iter().map(|&i| def.fields[i].name.clone()).collect();
         }
     }
     // Fallback: should never happen given the caller's invariant.
@@ -1363,24 +1356,20 @@ fn lower_dict_into_record(
 
     for idx in order {
         let canonical_field = &schema.fields[idx];
-        let layout_field = layout.fields.iter().find(|fo| fo.name == canonical_field.name).ok_or_else(|| {
-            LoweringError::UnsupportedFieldType {
+        let layout_field = layout
+            .fields
+            .iter()
+            .find(|fo| fo.name == canonical_field.name)
+            .ok_or_else(|| LoweringError::UnsupportedFieldType {
                 schema: schema.name.clone(),
                 field: canonical_field.name.clone(),
                 ty: "<layout-miss>".to_string(),
                 range,
-            }
-        })?;
+            })?;
         let field_range = def.fields[idx].value_range;
         // Lower the value expression (user-supplied or schema default).
         if let Some(user_value) = user_values.get(canonical_field.name.as_str()) {
-            lower_dict_field_value(
-                schema,
-                idx,
-                user_value,
-                user_value.range,
-                ctx,
-            )?;
+            lower_dict_field_value(schema, idx, user_value, user_value.range, ctx)?;
         } else {
             // Schema default. Re-bind `#main` params; let-scope is
             // shared with the surrounding body (defaults sit at the
@@ -1399,13 +1388,7 @@ fn lower_dict_into_record(
             // simpler shape: emit a `LetSet` for every default-
             // evaluated field so the wasm side caches the value and
             // a later default can read it back via `LetGet`.
-            lower_dict_default(
-                &schema.name,
-                idx,
-                def,
-                ctx,
-                field_range,
-            )?;
+            lower_dict_default(&schema.name, idx, def, ctx, field_range)?;
         }
         // Stack now holds the field's value (with type matching the
         // canonical Field). Emit the StoreFieldAtRecord.
@@ -1415,13 +1398,16 @@ fn lower_dict_into_record(
             // Pointer-indirect fields all store as an i32 pointer.
             FieldKind::PointerIndirect { .. } => IrType::I32,
         };
-        let top = ctx.tstack.pop().ok_or_else(|| LoweringError::UnsupportedExpr {
-            kind: format!(
-                "Dict field `{}` of `{}` produced no value",
-                canonical_field.name, schema.name
-            ),
-            range,
-        })?;
+        let top = ctx
+            .tstack
+            .pop()
+            .ok_or_else(|| LoweringError::UnsupportedExpr {
+                kind: format!(
+                    "Dict field `{}` of `{}` produced no value",
+                    canonical_field.name, schema.name
+                ),
+                range,
+            })?;
         if top.wasm_slot() != store_ty.wasm_slot() {
             return Err(LoweringError::UnsupportedFieldType {
                 schema: schema.name.clone(),
@@ -1530,14 +1516,7 @@ fn lower_dict_field_value(
                 },
                 range,
             });
-            lower_dict_into_record(
-                sub_schema,
-                &sub_layout,
-                pairs,
-                range,
-                record_local,
-                ctx,
-            )?;
+            lower_dict_into_record(sub_schema, &sub_layout, pairs, range, record_local, ctx)?;
             // Push the sub-record base so the parent's pointer-slot
             // store can consume it.
             ctx.out.push(TaggedOp {
