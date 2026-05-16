@@ -16,17 +16,18 @@
 //!
 //! User-definable decorators (`@f`, `@f(args)` where `f` resolves to a
 //! callable in scope) are handled by the fallback path in
-//! `Evaluator::fallback_decorator`; no built-in registration entry is
+//! `TreeWalkEvaluator::fallback_decorator`; no built-in registration entry is
 //! needed for them.
 
 use crate::decorator::DecoratorPlugin;
 use crate::decorator_names::{DEFAULT, ERROR, EXPECT, MSG, VALUE};
 use crate::error::RuntimeError;
-use crate::eval::{Context, Evaluator};
 use crate::native_fn::EvaluatedArg;
 use crate::scope::Scope;
 use crate::value::{SchemaField, Value};
 use relon_analyzer::format_type;
+use relon_eval_api::context::Context;
+use relon_eval_api::Evaluator;
 use relon_parser::{is_builtin_type_name, TokenRange, TypeNode};
 use std::sync::Arc;
 
@@ -45,7 +46,7 @@ struct ValueDecorator;
 impl DecoratorPlugin for ValueDecorator {
     fn wrap(
         &self,
-        _eval: &Evaluator,
+        _eval: &dyn Evaluator,
         value: Value,
         _scope: &Arc<Scope>,
         args: &[EvaluatedArg],
@@ -67,7 +68,7 @@ struct MessageDecorator;
 impl DecoratorPlugin for MessageDecorator {
     fn schema_field_meta(
         &self,
-        _eval: &Evaluator,
+        _eval: &dyn Evaluator,
         field: &mut SchemaField,
         _scope: &Arc<Scope>,
         args: &[EvaluatedArg],
@@ -87,7 +88,7 @@ struct DefaultDecorator;
 impl DecoratorPlugin for DefaultDecorator {
     fn schema_field_meta(
         &self,
-        _eval: &Evaluator,
+        _eval: &dyn Evaluator,
         field: &mut SchemaField,
         _scope: &Arc<Scope>,
         args: &[EvaluatedArg],

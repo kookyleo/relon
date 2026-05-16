@@ -12,6 +12,7 @@ categories = ["compilers", "config"]
 [dependencies]
 relon-parser = { workspace = true }
 relon-analyzer = { workspace = true }
+relon-eval-api = { workspace = true }
 ordered-float.workspace = true
 # `rc` enables `serde::Serialize`/`Deserialize` for `Arc<T>` so that
 # `Value::List(Arc<Vec<Value>>)` and `Value::Dict(Arc<ValueDict>)` can

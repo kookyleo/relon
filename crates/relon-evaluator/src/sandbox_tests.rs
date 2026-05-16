@@ -16,8 +16,12 @@ fn parse(source: &str) -> relon_parser::Node {
 fn eval_with(ctx: Context, source: &str) -> Result<Value, RuntimeError> {
     let node = parse(source);
     let ctx = ctx.with_root(node);
-    let ctx = std::sync::Arc::new(ctx);
-    Evaluator::new(std::sync::Arc::clone(&ctx)).eval_root(&Arc::new(Scope::default()))
+    let ctx = std::sync::Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    });
+    TreeWalkEvaluator::new(std::sync::Arc::clone(&ctx)).eval_root(&Arc::new(Scope::default()))
 }
 
 #[test]
@@ -31,12 +35,16 @@ fn sandboxed_context_rejects_default_filesystem_imports() {
 
     let node = parse(r#"#import lib from "lib.relon" { x: lib.secret }"#);
     let ctx = Context::sandboxed().with_root(node);
-    let ctx = std::sync::Arc::new(ctx);
+    let ctx = std::sync::Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    });
     let scope = Arc::new(Scope {
         current_dir: dir.to_string_lossy().to_string(),
         ..Default::default()
     });
-    let result = Evaluator::new(std::sync::Arc::clone(&ctx)).eval_root(&scope);
+    let result = TreeWalkEvaluator::new(std::sync::Arc::clone(&ctx)).eval_root(&scope);
     let _ = std::fs::remove_dir_all(&dir);
 
     assert!(
@@ -59,13 +67,17 @@ fn filesystem_resolver_with_root_dir_allows_paths_under_root() {
     ];
     let node = parse(r#"#import lib from "lib.relon" { v: lib.value }"#);
     let ctx = ctx.with_root(node);
-    let ctx = std::sync::Arc::new(ctx);
+    let ctx = std::sync::Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    });
     let scope = Arc::new(Scope {
         current_dir: dir.to_string_lossy().to_string(),
         ..Default::default()
     });
 
-    let result = Evaluator::new(std::sync::Arc::clone(&ctx))
+    let result = TreeWalkEvaluator::new(std::sync::Arc::clone(&ctx))
         .eval_root(&scope)
         .unwrap();
     let _ = std::fs::remove_dir_all(&dir);
@@ -92,12 +104,16 @@ fn filesystem_resolver_rejects_traversal_outside_root() {
     ];
     let node = parse(r#"#import x from "../escape.relon" { y: x.leak }"#);
     let ctx = ctx.with_root(node);
-    let ctx = std::sync::Arc::new(ctx);
+    let ctx = std::sync::Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    });
     let scope = Arc::new(Scope {
         current_dir: inner.to_string_lossy().to_string(),
         ..Default::default()
     });
-    let result = Evaluator::new(std::sync::Arc::clone(&ctx)).eval_root(&scope);
+    let result = TreeWalkEvaluator::new(std::sync::Arc::clone(&ctx)).eval_root(&scope);
     let _ = std::fs::remove_dir_all(&outer);
 
     assert!(
@@ -126,12 +142,16 @@ fn filesystem_resolver_rejects_symlink_escape() {
     ];
     let node = parse(r#"#import x from "link.relon" { y: x.leak }"#);
     let ctx = ctx.with_root(node);
-    let ctx = std::sync::Arc::new(ctx);
+    let ctx = std::sync::Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    });
     let scope = Arc::new(Scope {
         current_dir: inner.to_string_lossy().to_string(),
         ..Default::default()
     });
-    let result = Evaluator::new(std::sync::Arc::clone(&ctx)).eval_root(&scope);
+    let result = TreeWalkEvaluator::new(std::sync::Arc::clone(&ctx)).eval_root(&scope);
     let _ = std::fs::remove_dir_all(&outer);
 
     assert!(
@@ -503,8 +523,13 @@ fn max_value_elements_rejects_receiver_method_intrinsic() {
     let mut ctx = Context::sandboxed();
     ctx.capabilities.max_value_elements = Some(4);
     let ctx = ctx.with_root(node).with_analyzed(Arc::new(analyzed));
-    let ctx = std::sync::Arc::new(ctx);
-    let result = Evaluator::new(std::sync::Arc::clone(&ctx)).eval_root(&Arc::new(Scope::default()));
+    let ctx = std::sync::Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    });
+    let result =
+        TreeWalkEvaluator::new(std::sync::Arc::clone(&ctx)).eval_root(&Arc::new(Scope::default()));
     assert!(
         matches!(result, Err(RuntimeError::ValueTooLarge { limit: 4, .. })),
         "expected ValueTooLarge at receiver path, got {result:?}"
@@ -522,8 +547,13 @@ fn max_value_elements_rejects_receiver_method_intrinsic() {
     let mut ctx = Context::sandboxed();
     ctx.capabilities.max_value_elements = Some(5);
     let ctx = ctx.with_root(node).with_analyzed(Arc::new(analyzed));
-    let ctx = std::sync::Arc::new(ctx);
-    let result = Evaluator::new(std::sync::Arc::clone(&ctx)).eval_root(&Arc::new(Scope::default()));
+    let ctx = std::sync::Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    });
+    let result =
+        TreeWalkEvaluator::new(std::sync::Arc::clone(&ctx)).eval_root(&Arc::new(Scope::default()));
     assert!(
         result.is_ok(),
         "expected receiver-side success at cap=5, got {result:?}"
@@ -686,8 +716,12 @@ fn test_parameterized_schema() {
     let ctx = Context::default()
         .with_root(node)
         .with_analyzed(Arc::new(analyzed));
-    let ctx = std::sync::Arc::new(ctx);
-    let evaluator = Evaluator::new(std::sync::Arc::clone(&ctx));
+    let ctx = std::sync::Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    });
+    let evaluator = TreeWalkEvaluator::new(std::sync::Arc::clone(&ctx));
     let err = evaluator
         .eval_root(&Arc::new(Scope::default()))
         .unwrap_err();
@@ -743,9 +777,13 @@ fn iter_cursor_state_is_isolated_between_contexts() {
     let ctx_a = Context::new()
         .with_root(node.clone())
         .with_analyzed(std::sync::Arc::clone(&analyzed));
-    let result_a = Evaluator::new(std::sync::Arc::new(ctx_a))
-        .run_main(&Arc::new(Scope::default()), make_args())
-        .expect("ctx A run_main");
+    let result_a = TreeWalkEvaluator::new(std::sync::Arc::new({
+        let mut ctx = ctx_a;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    }))
+    .run_main(&Arc::new(Scope::default()), make_args())
+    .expect("ctx A run_main");
     assert_eq!(read_some_int(&result_a, "first"), 10);
     assert_eq!(read_some_int(&result_a, "second"), 20);
 
@@ -755,9 +793,13 @@ fn iter_cursor_state_is_isolated_between_contexts() {
     let ctx_b = Context::new()
         .with_root(node.clone())
         .with_analyzed(std::sync::Arc::clone(&analyzed));
-    let result_b = Evaluator::new(std::sync::Arc::new(ctx_b))
-        .run_main(&Arc::new(Scope::default()), make_args())
-        .expect("ctx B run_main");
+    let result_b = TreeWalkEvaluator::new(std::sync::Arc::new({
+        let mut ctx = ctx_b;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    }))
+    .run_main(&Arc::new(Scope::default()), make_args())
+    .expect("ctx B run_main");
     assert_eq!(read_some_int(&result_b, "first"), 10);
     assert_eq!(read_some_int(&result_b, "second"), 20);
 }
@@ -788,7 +830,11 @@ fn iter_cursor_cross_context_iter_reads_as_exhausted() {
     let ctx_a = Context::new()
         .with_root(mint_node.clone())
         .with_analyzed(std::sync::Arc::clone(&mint_analyzed));
-    let evaluator_a = Evaluator::new(std::sync::Arc::new(ctx_a));
+    let evaluator_a = TreeWalkEvaluator::new(std::sync::Arc::new({
+        let mut ctx = ctx_a;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    }));
     let minted = evaluator_a
         .run_main(&Arc::new(Scope::default()), mint_args)
         .expect("ctx A mint");
@@ -817,9 +863,13 @@ fn iter_cursor_cross_context_iter_reads_as_exhausted() {
         .with_root(use_node.clone())
         .with_analyzed(std::sync::Arc::clone(&use_analyzed));
     let scope_b = Arc::new(Scope::default()).with_local("foreign".to_string(), foreign_iter);
-    let result_b = Evaluator::new(std::sync::Arc::new(ctx_b))
-        .eval_root(&scope_b)
-        .expect("ctx B eval");
+    let result_b = TreeWalkEvaluator::new(std::sync::Arc::new({
+        let mut ctx = ctx_b;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    }))
+    .eval_root(&scope_b)
+    .expect("ctx B eval");
     let Value::Dict(rb) = result_b else { panic!() };
     for key in ["first", "second"] {
         let Value::Dict(opt) = rb.map.get(key).expect("missing") else {
@@ -873,7 +923,11 @@ fn iter_cursor_clears_between_top_level_runs() {
     let ctx = Context::new()
         .with_root(node.clone())
         .with_analyzed(std::sync::Arc::clone(&analyzed));
-    let evaluator = Evaluator::new(std::sync::Arc::new(ctx));
+    let evaluator = TreeWalkEvaluator::new(std::sync::Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    }));
     // Run 1: walks the first two elements.
     let r1 = evaluator
         .run_main(&Arc::new(Scope::default()), make_args())
@@ -924,9 +978,13 @@ fn iter_cursor_concurrent_contexts_do_not_deadlock() {
                 "xs".to_string(),
                 Value::list(vec![Value::Int(1), Value::Int(2), Value::Int(3)]),
             );
-            let result = Evaluator::new(std::sync::Arc::new(ctx))
-                .run_main(&Arc::new(Scope::default()), args)
-                .unwrap_or_else(|e| panic!("{label}: {e:?}"));
+            let result = TreeWalkEvaluator::new(std::sync::Arc::new({
+                let mut ctx = ctx;
+                crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+                ctx
+            }))
+            .run_main(&Arc::new(Scope::default()), args)
+            .unwrap_or_else(|e| panic!("{label}: {e:?}"));
             let Value::Dict(d) = result else {
                 panic!("{label}: not a dict")
             };

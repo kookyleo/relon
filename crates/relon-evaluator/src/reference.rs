@@ -10,7 +10,7 @@
 //! both halves easier to follow.
 
 use crate::error::RuntimeError;
-use crate::eval::{is_private_field, Evaluator};
+use crate::eval::{is_private_field, TreeWalkEvaluator};
 use crate::scope::{ListContext, Scope, Thunk};
 use crate::value::Value;
 use relon_parser::{Expr, Node, RefBase, TokenKey, TokenRange};
@@ -42,7 +42,7 @@ pub(crate) enum DictStepResult {
 
 /// Decrement `owning_depth` for the next step, or convert it to `None`
 /// once we've descended past the owning dict. See the docstring on
-/// `Evaluator::resolve_reference` for the meaning of the counter.
+/// `TreeWalkEvaluator::resolve_reference` for the meaning of the counter.
 fn child_owning_depth(d: Option<usize>) -> Option<usize> {
     match d {
         Some(n) if n > 0 => Some(n - 1),
@@ -50,7 +50,7 @@ fn child_owning_depth(d: Option<usize>) -> Option<usize> {
     }
 }
 
-impl Evaluator {
+impl TreeWalkEvaluator {
     pub(crate) fn resolve_variable(
         &self,
         path: &[TokenKey],

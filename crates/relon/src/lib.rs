@@ -7,7 +7,7 @@ use relon_analyzer::{
     WorkspaceDiagnostic,
 };
 use relon_evaluator::module::{FilesystemModuleResolver, ModuleResolver, StdModuleResolver};
-use relon_evaluator::{Capabilities, Context, Evaluator, RuntimeError, Scope, Value};
+use relon_evaluator::{Capabilities, Context, RuntimeError, Scope, TreeWalkEvaluator, Value};
 use relon_parser::parse_document;
 use relon_parser::TokenRange;
 use serde::de::DeserializeOwned;
@@ -283,9 +283,10 @@ impl ModuleLoader for ResolverChainLoader {
         // `current_dir`. Build a synthetic scope that carries just
         // that field, since none of the resolvers we mount in the
         // facade consult any of the others.
-        let mut scope = Scope::default();
-        scope.current_dir = current_dir.to_string_lossy().to_string();
-        let scope = Arc::new(scope);
+        let scope = Arc::new(Scope {
+            current_dir: current_dir.to_string_lossy().to_string(),
+            ..Scope::default()
+        });
         for resolver in &self.resolvers {
             match resolver.resolve(path, &scope, TokenRange::default()) {
                 Ok(Some(source)) => {
@@ -403,6 +404,11 @@ fn evaluate_source(
         let mut ctx = Context::sandboxed()
             .with_root(entry_node)
             .with_workspace(Arc::clone(&workspace));
+        // Install stdlib / decorators / prelude / std-resolver before
+        // taking the Arc, so later code paths that hand the shared Arc
+        // around (loading-module guard, `Arc::clone`, ...) never race
+        // the lazy backend setup in `TreeWalkEvaluator::new`.
+        TreeWalkEvaluator::prepare_in_place(&mut ctx);
         if matches!(trust, TrustMode::Trusted) {
             ctx.capabilities = Capabilities::all_granted();
             ctx.prepend_module_resolver(Arc::new(FilesystemModuleResolver::trusted()));
@@ -415,11 +421,13 @@ fn evaluate_source(
     } else {
         Some(ctx.enter_loading_module(cache_namespace.clone()))
     };
-    let evaluator = Evaluator::new(Arc::clone(&ctx));
+    let evaluator = TreeWalkEvaluator::new(Arc::clone(&ctx));
 
-    let mut root_scope = Scope::default();
-    root_scope.current_dir = current_dir;
-    root_scope.cache_namespace = cache_namespace;
+    let root_scope = Scope {
+        current_dir,
+        cache_namespace,
+        ..Scope::default()
+    };
     Ok(evaluator.eval_root(&Arc::new(root_scope))?)
 }
 
@@ -746,7 +754,7 @@ mod tests {
                 .with_root(node)
                 .with_analyzed(Arc::clone(&analyzed));
             setup(&mut ctx);
-            let evaluator = Evaluator::new(Arc::new(ctx));
+            let evaluator = TreeWalkEvaluator::new(Arc::new(ctx));
             let value = evaluator
                 .run_main(&Arc::new(Scope::default()), args)
                 .unwrap_or_else(|e| panic!("{rel_path}: run_main: {e:?}"));

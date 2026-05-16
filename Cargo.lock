@@ -1124,6 +1124,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "relon-eval-api"
+version = "0.1.0"
+dependencies = [
+ "miette",
+ "ordered-float",
+ "relon-analyzer",
+ "relon-parser",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "relon-evaluator"
 version = "0.1.0"
 dependencies = [
@@ -1131,6 +1144,7 @@ dependencies = [
  "ordered-float",
  "proptest",
  "relon-analyzer",
+ "relon-eval-api",
  "relon-fmt",
  "relon-parser",
  "serde",

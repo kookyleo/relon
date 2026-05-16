@@ -35,7 +35,7 @@ use std::sync::Arc;
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 
-use relon_evaluator::{Context, Evaluator, Scope, StdModuleResolver, Value};
+use relon_evaluator::{Context, Scope, StdModuleResolver, TreeWalkEvaluator, Value};
 use relon_parser::{parse_document, Node};
 
 // ---------------------------------------------------------------------------
@@ -150,7 +150,11 @@ fn build_method_map_src(n: usize) -> String {
 fn fresh_context_with_root(node: Node) -> Arc<Context> {
     let mut ctx = Context::new().with_root(node);
     ctx.prepend_module_resolver(Arc::new(StdModuleResolver));
-    Arc::new(ctx)
+    Arc::new({
+        let mut ctx = ctx;
+        relon_evaluator::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    })
 }
 
 /// Re-parse + rebuild a fresh `(Arc<Context>, root Node, fresh Scope)` for
@@ -213,7 +217,7 @@ fn bench_eval_cold(c: &mut Criterion) {
     group.bench_function(BenchmarkId::new("source", "simple"), |b| {
         b.iter_with_large_drop(|| {
             let (ctx, node, scope) = full_setup(SIMPLE_SRC);
-            let eval = Evaluator::new(Arc::clone(&ctx));
+            let eval = TreeWalkEvaluator::new(Arc::clone(&ctx));
             let result = eval.eval(&node, &scope).expect("eval");
             black_box((ctx, result))
         });
@@ -222,7 +226,7 @@ fn bench_eval_cold(c: &mut Criterion) {
     group.bench_function(BenchmarkId::new("source", "medium"), |b| {
         b.iter_with_large_drop(|| {
             let (ctx, node, scope) = full_setup(MEDIUM_SRC);
-            let eval = Evaluator::new(Arc::clone(&ctx));
+            let eval = TreeWalkEvaluator::new(Arc::clone(&ctx));
             let result = eval.eval(&node, &scope).expect("eval");
             black_box((ctx, result))
         });
@@ -243,7 +247,7 @@ fn bench_eval_steady(c: &mut Criterion) {
     // (cheap, dwarfed by interpreter dispatch).
     let ast = parse_document(SIMPLE_SRC).expect("parse");
     let ctx = fresh_context_with_root(ast.clone());
-    let eval = Evaluator::new(Arc::clone(&ctx));
+    let eval = TreeWalkEvaluator::new(Arc::clone(&ctx));
 
     group.bench_function(BenchmarkId::new("source", "simple"), |b| {
         b.iter(|| {
@@ -273,7 +277,7 @@ fn bench_comprehension(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("elements", n), &ast, |b, ast| {
             b.iter_with_large_drop(|| {
                 let ctx = fresh_context_with_root(ast.clone());
-                let eval = Evaluator::new(Arc::clone(&ctx));
+                let eval = TreeWalkEvaluator::new(Arc::clone(&ctx));
                 let scope = Arc::new(Scope::default());
                 let r = eval.eval(black_box(ast), &scope).expect("eval");
                 black_box((ctx, r))
@@ -300,7 +304,7 @@ fn bench_reference(c: &mut Criterion) {
     group.bench_function(BenchmarkId::new("depth", "shallow_1"), |b| {
         b.iter_with_large_drop(|| {
             let ctx = fresh_context_with_root(shallow.clone());
-            let eval = Evaluator::new(Arc::clone(&ctx));
+            let eval = TreeWalkEvaluator::new(Arc::clone(&ctx));
             let scope = Arc::new(Scope::default());
             let r = eval.eval(black_box(&shallow), &scope).expect("eval");
             black_box((ctx, r))
@@ -310,7 +314,7 @@ fn bench_reference(c: &mut Criterion) {
     group.bench_function(BenchmarkId::new("depth", "nested_5"), |b| {
         b.iter_with_large_drop(|| {
             let ctx = fresh_context_with_root(nested.clone());
-            let eval = Evaluator::new(Arc::clone(&ctx));
+            let eval = TreeWalkEvaluator::new(Arc::clone(&ctx));
             let scope = Arc::new(Scope::default());
             let r = eval.eval(black_box(&nested), &scope).expect("eval");
             black_box((ctx, r))
@@ -336,7 +340,7 @@ fn bench_schema_validate(c: &mut Criterion) {
     group.bench_function(BenchmarkId::new("schema", "user_2fields"), |b| {
         b.iter_with_large_drop(|| {
             let ctx = fresh_context_with_root(ast.clone());
-            let eval = Evaluator::new(Arc::clone(&ctx));
+            let eval = TreeWalkEvaluator::new(Arc::clone(&ctx));
             let scope = Arc::new(Scope::default());
             let r = eval.eval(black_box(&ast), &scope).expect("eval");
             black_box((ctx, r))
@@ -370,7 +374,7 @@ fn bench_method_dispatch(c: &mut Criterion) {
             let mut ctx = Context::new().with_root(upper_ast.clone());
             ctx.prepend_module_resolver(Arc::new(StdModuleResolver));
             let ctx = Arc::new(ctx.with_analyzed(Arc::clone(&upper_analyzed)));
-            let eval = Evaluator::new(Arc::clone(&ctx));
+            let eval = TreeWalkEvaluator::new(Arc::clone(&ctx));
             let scope = Arc::new(Scope::default());
             let mut args = HashMap::with_capacity(1);
             args.insert("s".to_string(), Value::String("abc".to_string()));
@@ -391,7 +395,7 @@ fn bench_method_dispatch(c: &mut Criterion) {
             let mut ctx = Context::new().with_root(map_ast.clone());
             ctx.prepend_module_resolver(Arc::new(StdModuleResolver));
             let ctx = Arc::new(ctx.with_analyzed(Arc::clone(&map_analyzed)));
-            let eval = Evaluator::new(Arc::clone(&ctx));
+            let eval = TreeWalkEvaluator::new(Arc::clone(&ctx));
             let scope = Arc::new(Scope::default());
             let mut args = HashMap::with_capacity(1);
             args.insert("xs".to_string(), Value::list(xs_payload.clone()));

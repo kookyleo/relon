@@ -1,7 +1,7 @@
 use crate::error::RuntimeError;
-use crate::eval::Context;
 use crate::native_fn::{NativeArgs, NativeFnCaps, RelonFunction};
 use crate::value::{Value, ValueDict};
+use relon_eval_api::context::Context;
 use std::sync::Arc;
 
 pub fn register_to(ctx: &mut Context) {
@@ -81,7 +81,7 @@ pub fn register_to(ctx: &mut Context) {
     // through the receiver-side `native_methods` table.
     //
     // Each handler accepts `(self, ...args)` as positional values; the
-    // method-dispatch path in `Evaluator::try_call_native_method`
+    // method-dispatch path in `TreeWalkEvaluator::try_call_native_method`
     // prepends the receiver before invoking, so the same `Arc<dyn
     // RelonFunction>` instance services both call shapes — no
     // adapter, no duplicate code path.
@@ -361,7 +361,7 @@ impl RelonFunction for Range {
         // before the cap fires. Compare the requested length (saturating
         // to handle inverted ranges and `i64` underflow) against the cap
         // up front and refuse early. The post-call catch-all in
-        // `Evaluator::call_function` is still the authority for the
+        // `TreeWalkEvaluator::call_function` is still the authority for the
         // narrow `actual == limit + 1` race; this check just stops the
         // allocator from being weaponized.
         if let Some(limit) = caps_max {

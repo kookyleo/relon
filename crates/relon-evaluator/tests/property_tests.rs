@@ -16,7 +16,7 @@
 
 use proptest::collection::hash_map as proptest_hash_map;
 use proptest::prelude::*;
-use relon_evaluator::{Context, Evaluator, RuntimeError, Scope, Value};
+use relon_evaluator::{Context, RuntimeError, Scope, TreeWalkEvaluator, Value};
 use relon_parser::parse_document;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -43,8 +43,12 @@ where
     let mut ctx = Context::sandboxed();
     mutate(&mut ctx);
     let ctx = ctx.with_root(node).with_analyzed(analyzed);
-    let ctx = Arc::new(ctx);
-    Evaluator::new(Arc::clone(&ctx)).eval_root(&Arc::new(Scope::default()))
+    let ctx = Arc::new({
+        let mut ctx = ctx;
+        relon_evaluator::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    });
+    TreeWalkEvaluator::new(Arc::clone(&ctx)).eval_root(&Arc::new(Scope::default()))
 }
 
 /// Render an `i64` as a Relon source literal that the parser will round-
@@ -320,7 +324,7 @@ proptest! {
             let ctx = Context::new()
                 .with_root(node.clone())
                 .with_analyzed(Arc::clone(&analyzed));
-            Evaluator::new(Arc::new(ctx))
+            TreeWalkEvaluator::new(Arc::new({ let mut ctx = ctx; relon_evaluator::TreeWalkEvaluator::prepare_in_place(&mut ctx); ctx }))
                 .run_main(&Arc::new(Scope::default()), input_args.clone())
         };
 
