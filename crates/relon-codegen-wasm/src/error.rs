@@ -12,6 +12,7 @@
 
 use crate::abi::AbiError;
 use crate::srcmap::SrcMapError;
+use crate::unreachable_table::UnreachableTableError;
 use relon_ir::IrType;
 use thiserror::Error;
 
@@ -172,6 +173,15 @@ pub enum LoadError {
     /// decode against the supplied [`crate::HostFnTable`].
     #[error(transparent)]
     HostFns(#[from] crate::host_fns::HostFnError),
+    /// Phase 7: `relon.uctab` payload was located but failed to
+    /// decode (bad magic, future format version, unknown kind_tag,
+    /// ...). The translator can survive without this table — it
+    /// just falls through to `WasmTrapUnclassified` — but a present-
+    /// but-malformed section is a stronger signal than a missing one
+    /// and we surface it explicitly so host SDKs don't silently
+    /// degrade trap diagnostics.
+    #[error(transparent)]
+    UnreachableTable(#[from] UnreachableTableError),
     /// Phase 6: the wasm module declared a `#native` import the host
     /// SDK did not register. The host SDK can choose to recover by
     /// registering the missing fn or refuse-to-load entirely.

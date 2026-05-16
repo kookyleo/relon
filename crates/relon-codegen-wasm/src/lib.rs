@@ -34,6 +34,7 @@ pub mod abi;
 pub mod error;
 pub mod host_fns;
 pub mod srcmap;
+pub mod unreachable_table;
 
 pub use abi::{AbiError, AbiMetadata};
 pub use error::{CodegenError, LoadError};
@@ -41,9 +42,13 @@ pub use host_fns::{
     hash_params, hash_return, HostFnEntry, HostFnError, HostFnTable, NO_CAPABILITY,
 };
 pub use srcmap::{Entry as SrcMapEntry, SrcMap, SrcMapError};
+pub use unreachable_table::{
+    UnreachableEntry, UnreachableKind, UnreachableTable, UnreachableTableError,
+};
 
 use relon_eval_api::layout::{OffsetTable, SchemaLayout};
 use relon_eval_api::schema_canonical::{schema_hash, Schema};
+use relon_eval_api::RuntimeError;
 use relon_ir::{
     builtin_stdlib, Func as IrFunc, IrType, LoweredEntry, Module as IrModule, Op,
     NO_CAPABILITY_BIT, WASM_LOCAL_IN_LEN, WASM_LOCAL_IN_PTR, WASM_LOCAL_OUT_CAP,
@@ -292,6 +297,12 @@ pub fn compile_module_with_host_fns(
 
     let mut per_func_ranges: Vec<(TokenRange, Vec<TokenRange>)> =
         Vec::with_capacity(combined_funcs.len());
+    // Phase 7: per-function `unreachable` records, lock-step with
+    // `per_func_ranges`. The `build_uctab` pass below pairs each
+    // record's op-index with the matching pc from a wasmparser
+    // re-scan of the code section.
+    let mut per_func_unreachables: Vec<Vec<RecordedUnreachable>> =
+        Vec::with_capacity(combined_funcs.len());
 
     for (func_index, func) in combined_funcs.iter().enumerate() {
         let params_vt: Vec<ValType> = func.params.iter().map(ir_to_val_type).collect();
@@ -312,7 +323,7 @@ pub fn compile_module_with_host_fns(
             import_count,
             caps_avail_global_index,
         };
-        let (body, ranges) = emit_function_body(
+        let (body, ranges, unreachable_log) = emit_function_body(
             func,
             &main_layout,
             &return_layout,
@@ -322,6 +333,7 @@ pub fn compile_module_with_host_fns(
         )?;
         codes.function(&body);
         per_func_ranges.push((func.range, ranges));
+        per_func_unreachables.push(unreachable_log);
     }
 
     module.section(&types);
@@ -347,11 +359,17 @@ pub fn compile_module_with_host_fns(
     }
 
     let bytes_so_far = module.as_slice().to_vec();
-    let srcmap = build_srcmap(&bytes_so_far, &per_func_ranges)?;
+    let (srcmap, uctab) =
+        build_srcmap_and_uctab(&bytes_so_far, &per_func_ranges, &per_func_unreachables)?;
     let srcmap_bytes = srcmap::encode_to_bytes(&srcmap);
     module.section(&CustomSection {
         name: srcmap::SECTION_NAME.into(),
         data: (&srcmap_bytes[..]).into(),
+    });
+    let uctab_bytes = unreachable_table::encode_to_bytes(&uctab);
+    module.section(&CustomSection {
+        name: unreachable_table::SECTION_NAME.into(),
+        data: (&uctab_bytes[..]).into(),
     });
 
     let abi = AbiMetadata {
@@ -422,22 +440,45 @@ pub fn compile_lowered_entry(entry: &LoweredEntry) -> Result<Vec<u8>, CodegenErr
     compile_module(&entry.module, &entry.main_schema, &entry.return_schema)
 }
 
-fn build_srcmap(
+/// Phase 7: build the `relon.srcmap` table *and* the `relon.uctab`
+/// table in one wasmparser re-scan of the code section. Walking the
+/// section once keeps the cost down (one O(N) parse instead of two)
+/// and guarantees both tables observe identical pc semantics — if a
+/// future emit pass slips an extra op between the wasm encoder and
+/// the secondary scan it shows up as an error here, not as a silent
+/// drift between sections.
+fn build_srcmap_and_uctab(
     module_bytes: &[u8],
     per_func: &[(TokenRange, Vec<TokenRange>)],
-) -> Result<SrcMap, CodegenError> {
-    let mut entries: Vec<SrcMapEntry> = Vec::new();
-    let mut func_iter = per_func.iter();
+    per_func_unreachables: &[Vec<RecordedUnreachable>],
+) -> Result<(SrcMap, UnreachableTable), CodegenError> {
+    if per_func.len() != per_func_unreachables.len() {
+        return Err(CodegenError::SrcMapEncode(format!(
+            "per_func ({}) and per_func_unreachables ({}) length mismatch",
+            per_func.len(),
+            per_func_unreachables.len()
+        )));
+    }
+
+    let mut srcmap_entries: Vec<SrcMapEntry> = Vec::new();
+    let mut uctab_entries: Vec<UnreachableEntry> = Vec::new();
+    let mut func_iter = per_func.iter().zip(per_func_unreachables.iter());
 
     for payload in wasmparser::Parser::new(0).parse_all(module_bytes) {
         let payload =
             payload.map_err(|e| CodegenError::SrcMapEncode(format!("wasmparser error: {e}")))?;
         if let wasmparser::Payload::CodeSectionEntry(body) = payload {
-            let (func_range, op_ranges) = func_iter.next().ok_or_else(|| {
+            let ((func_range, op_ranges), unreachable_log) = func_iter.next().ok_or_else(|| {
                 CodegenError::SrcMapEncode("more wasm function bodies than IR funcs".into())
             })?;
             let body_start = body.range().start as u32;
-            entries.push(token_range_to_entry(body_start, *func_range));
+            srcmap_entries.push(token_range_to_entry(body_start, *func_range));
+
+            // Pre-index the unreachable log by op_idx so the
+            // per-instruction walk below can do a single lookup
+            // without a linear scan per op.
+            let log_by_op: HashMap<usize, UnreachableKind> =
+                unreachable_log.iter().map(|r| (r.op_idx, r.kind)).collect();
 
             let ops_reader = body
                 .get_operators_reader()
@@ -453,7 +494,13 @@ fn build_srcmap(
                         op_ranges.len()
                     ))
                 })?;
-                entries.push(token_range_to_entry(offset as u32, range));
+                srcmap_entries.push(token_range_to_entry(offset as u32, range));
+                if let Some(kind) = log_by_op.get(&op_idx).copied() {
+                    uctab_entries.push(UnreachableEntry {
+                        pc: offset as u32,
+                        kind,
+                    });
+                }
                 op_idx += 1;
             }
             if op_idx != op_ranges.len() {
@@ -472,15 +519,43 @@ fn build_srcmap(
         ));
     }
 
-    entries.sort_by_key(|e| e.pc);
+    srcmap_entries.sort_by_key(|e| e.pc);
+    uctab_entries.sort_by_key(|e| e.pc);
 
-    Ok(SrcMap {
-        files: vec![SRCMAP_PLACEHOLDER_FILE.to_string()],
-        entries,
-    })
+    Ok((
+        SrcMap {
+            files: vec![SRCMAP_PLACEHOLDER_FILE.to_string()],
+            entries: srcmap_entries,
+        },
+        UnreachableTable {
+            entries: uctab_entries,
+        },
+    ))
 }
 
 const SRCMAP_PLACEHOLDER_FILE: &str = "<entry>";
+
+/// Reverse of [`token_range_to_entry`]: rebuild a [`TokenRange`] from
+/// a srcmap [`SrcMapEntry`]. The offset field is lossy because the
+/// encoder only stores `range_len` (in characters); we surface
+/// `start.offset = 0` / `end.offset = range_len` as a best-effort
+/// reconstruction so the resulting `TokenRange` keeps the `line` /
+/// `col` Phase 7 trap diagnostics actually care about. Host SDKs
+/// that need exact byte offsets should re-tokenise the source.
+fn token_range_from_srcmap(entry: &SrcMapEntry) -> TokenRange {
+    TokenRange {
+        start: relon_parser::TokenPosition {
+            line: entry.line,
+            column: entry.col as usize,
+            offset: 0,
+        },
+        end: relon_parser::TokenPosition {
+            line: entry.line,
+            column: entry.col as usize + entry.range_len as usize,
+            offset: entry.range_len as usize,
+        },
+    }
+}
 
 fn token_range_to_entry(pc: u32, range: TokenRange) -> SrcMapEntry {
     let line = range.start.line;
@@ -699,7 +774,7 @@ fn emit_function_body(
     const_pool: &ConstPool,
     is_entry: bool,
     emit_cfg: FunctionEmitCfg,
-) -> Result<(Function, Vec<TokenRange>), CodegenError> {
+) -> Result<(Function, Vec<TokenRange>, Vec<RecordedUnreachable>), CodegenError> {
     // Walk the body (recursively into if-branches) to determine
     // which wasm value type the trailing StoreField needs as its
     // spill local. The lowering pass keeps the StoreField at the
@@ -780,6 +855,11 @@ fn emit_function_body(
     // Per-emitted-instruction source ranges, lock-step with the
     // wasm op stream the encoder builds.
     let mut ranges: Vec<TokenRange> = Vec::with_capacity(func.body.len() * 2 + 16);
+    // Phase 7: every codegen-emitted `unreachable` registers its
+    // op-index here so the surrounding `compile_module_with_host_fns`
+    // pass can map it to a module-absolute pc when emitting the
+    // `relon.uctab` custom section.
+    let mut unreachable_log: Vec<RecordedUnreachable> = Vec::new();
 
     // Prologue (entry-only): binary-handshake size guards + tail-
     // cursor init. Stdlib functions don't run this — they have a
@@ -794,16 +874,24 @@ fn emit_function_body(
         emit_size_guard(
             &mut f,
             &mut ranges,
+            &mut unreachable_log,
             WASM_LOCAL_IN_LEN,
             main_root_size,
             func.range,
+            UnreachableKind::InBufTooSmall {
+                needed: main_root_size,
+            },
         );
         emit_size_guard(
             &mut f,
             &mut ranges,
+            &mut unreachable_log,
             WASM_LOCAL_OUT_CAP,
             return_root_size,
             func.range,
+            UnreachableKind::OutBufTooSmall {
+                needed: return_root_size,
+            },
         );
 
         // Initialise the tail cursor to `return_root_size` so the
@@ -830,6 +918,7 @@ fn emit_function_body(
     emit_op_seq(
         &mut f,
         &mut ranges,
+        &mut unreachable_log,
         &mut vstack,
         &func.body,
         func,
@@ -858,7 +947,7 @@ fn emit_function_body(
     f.instruction(&Instruction::End);
     ranges.push(func.range);
 
-    Ok((f, ranges))
+    Ok((f, ranges, unreachable_log))
 }
 
 /// Walk the body (descending into `Op::If` arms) and gather every
@@ -899,6 +988,47 @@ fn collect_let_locals_inner(
         }
     }
     Ok(())
+}
+
+/// Phase 7: paired-with-`ranges` recorder for every `unreachable`
+/// instruction the codegen emits. Each entry stores the position in
+/// the per-function `ranges` vector at which the `Unreachable` op
+/// was pushed, alongside the semantic intent of the guard. The
+/// secondary wasmparser walk inside [`build_srcmap`] turns this
+/// op-index into a module-absolute pc so the resulting
+/// [`UnreachableTable`] can be wired straight into the
+/// `relon.uctab` section.
+#[derive(Debug, Clone, Copy)]
+struct RecordedUnreachable {
+    /// Index inside the per-function `ranges` vector at the point
+    /// the `Instruction::Unreachable` was pushed. The companion
+    /// `op_iter` walk in [`build_srcmap`] reads operands in the
+    /// same order so the pc lookup is a single counter.
+    op_idx: usize,
+    /// Semantic intent of the guard whose `unreachable` this is.
+    kind: UnreachableKind,
+}
+
+/// Emit `Instruction::Unreachable`, push its source range, and
+/// record the kind into `log` so the parent function body's
+/// uctab pass can map the op-index to a module-absolute pc.
+///
+/// Why a helper: the same three-line sequence appeared at every
+/// guard emit site. Centralising it makes "every codegen-emitted
+/// `unreachable` is logged" an enforceable invariant — adding a
+/// new guard shape is a single call to this helper rather than
+/// three discrete pushes that must agree on the op_idx.
+fn emit_recorded_unreachable(
+    f: &mut Function,
+    ranges: &mut Vec<TokenRange>,
+    log: &mut Vec<RecordedUnreachable>,
+    range: TokenRange,
+    kind: UnreachableKind,
+) {
+    let op_idx = ranges.len();
+    f.instruction(&Instruction::Unreachable);
+    ranges.push(range);
+    log.push(RecordedUnreachable { op_idx, kind });
 }
 
 /// Per-function emit-side context threaded through the recursive
@@ -1004,9 +1134,15 @@ fn body_needs_tail_cursor(body: &[relon_ir::TaggedOp]) -> bool {
 /// Emit a sequence of [`TaggedOp`] into `f`, growing `ranges` and
 /// `vstack` in lock-step. Used by [`emit_function_body`] for the top
 /// level body and recursively for the `then`/`else` arms of [`Op::If`].
+///
+/// Phase 7: every codegen-emitted `unreachable` records its op-index
+/// into `log` so the surrounding pass can wire the matching
+/// [`UnreachableKind`] into the `relon.uctab` section.
+#[allow(clippy::too_many_arguments)]
 fn emit_op_seq(
     f: &mut Function,
     ranges: &mut Vec<TokenRange>,
+    log: &mut Vec<RecordedUnreachable>,
     vstack: &mut Vec<IrType>,
     body: &[relon_ir::TaggedOp],
     func: &relon_ir::Func,
@@ -1104,7 +1240,7 @@ fn emit_op_seq(
                         // out_buf tail area, then store the
                         // buffer-relative offset of the record to
                         // the fixed-area slot.
-                        emit_store_pointer_indirect(f, ranges, *offset, *ty, tagged.range)?;
+                        emit_store_pointer_indirect(f, ranges, log, *offset, *ty, tagged.range)?;
                     }
                     _ => {
                         emit_store_field(f, ranges, *offset, *ty, tagged.range)?;
@@ -1163,6 +1299,7 @@ fn emit_op_seq(
                 emit_if(
                     f,
                     ranges,
+                    log,
                     vstack,
                     *result_ty,
                     then_body,
@@ -1202,7 +1339,7 @@ fn emit_op_seq(
                 // by `root_size`.
                 let wasm_local = ectx.record_local_base + record_local_idx;
                 emit_align_tail_cursor(f, ranges, *root_align, tagged.range);
-                emit_tail_bounds_check(f, ranges, *root_size, tagged.range);
+                emit_tail_bounds_check(f, ranges, log, *root_size, tagged.range);
                 // local_record = $tail_cursor
                 f.instruction(&Instruction::LocalGet(TAIL_CURSOR_LOCAL_INDEX));
                 ranges.push(tagged.range);
@@ -1247,7 +1384,7 @@ fn emit_op_seq(
                 if popped.wasm_slot() != IrType::I32 {
                     return Err(CodegenError::MixedNumericTypes);
                 }
-                emit_tail_record_from_absolute(f, ranges, *ty, tagged.range)?;
+                emit_tail_record_from_absolute(f, ranges, log, *ty, tagged.range)?;
                 // Pushes the buffer-relative offset of the
                 // newly-written record.
                 vstack.push(IrType::I32);
@@ -1352,7 +1489,7 @@ fn emit_op_seq(
                 // (`unreachable`) when the bit is unset. The trap fires
                 // before any argument hits the host fn, so the host
                 // SDK observes a clean "capability denied" trap.
-                emit_check_cap_inline(f, ranges, ectx, *cap_bit, tagged.range);
+                emit_check_cap_inline(f, ranges, log, ectx, *cap_bit, tagged.range);
                 f.instruction(&Instruction::Call(*import_idx));
                 ranges.push(tagged.range);
                 vstack.push(*ret_ty);
@@ -1364,7 +1501,7 @@ fn emit_op_seq(
                 // lowering pass wants to pre-flight a capability
                 // without invoking the host fn (e.g. branch on the
                 // result of an analyzer-side cap-grant query).
-                emit_check_cap_inline(f, ranges, ectx, *cap_bit, tagged.range);
+                emit_check_cap_inline(f, ranges, log, ectx, *cap_bit, tagged.range);
             }
             Op::ReadStringLen => {
                 let popped = vstack.pop().ok_or(CodegenError::MixedNumericTypes)?;
@@ -1463,6 +1600,7 @@ fn emit_op_seq(
 fn emit_check_cap_inline(
     f: &mut Function,
     ranges: &mut Vec<TokenRange>,
+    log: &mut Vec<RecordedUnreachable>,
     ectx: &EmitCtx,
     cap_bit: u32,
     range: TokenRange,
@@ -1486,8 +1624,13 @@ fn emit_check_cap_inline(
     ranges.push(range);
     f.instruction(&Instruction::If(BlockType::Empty));
     ranges.push(range);
-    f.instruction(&Instruction::Unreachable);
-    ranges.push(range);
+    emit_recorded_unreachable(
+        f,
+        ranges,
+        log,
+        range,
+        UnreachableKind::CapabilityDenied { cap_bit },
+    );
     f.instruction(&Instruction::End);
     ranges.push(range);
 }
@@ -1510,6 +1653,7 @@ fn emit_check_cap_inline(
 fn emit_if(
     f: &mut Function,
     ranges: &mut Vec<TokenRange>,
+    log: &mut Vec<RecordedUnreachable>,
     vstack: &mut Vec<IrType>,
     result_ty: IrType,
     then_body: &[relon_ir::TaggedOp],
@@ -1536,6 +1680,7 @@ fn emit_if(
     emit_op_seq(
         f,
         ranges,
+        log,
         &mut then_stack,
         then_body,
         func,
@@ -1564,6 +1709,7 @@ fn emit_if(
     emit_op_seq(
         f,
         ranges,
+        log,
         &mut else_stack,
         else_body,
         func,
@@ -1647,13 +1793,18 @@ fn stack_type_for_storefield(ty: IrType) -> IrType {
 /// Emit `local.get $slot; i32.const limit; i32.lt_u; if; unreachable; end`.
 /// Records six srcmap entries — one per emitted instruction — anchored
 /// at the function's declaration range so a trap inside the guard
-/// resolves to the `#main(...)` line.
+/// resolves to the `#main(...)` line. The Phase 7 `kind` parameter
+/// tells the uctab recorder which buffer-too-small variant this
+/// guard represents (in_len vs. out_cap); the trap translator pulls
+/// the matching `RuntimeError` shape on hit.
 fn emit_size_guard(
     f: &mut Function,
     ranges: &mut Vec<TokenRange>,
+    log: &mut Vec<RecordedUnreachable>,
     slot: u32,
     limit: u32,
     range: TokenRange,
+    kind: UnreachableKind,
 ) {
     f.instruction(&Instruction::LocalGet(slot));
     ranges.push(range);
@@ -1663,8 +1814,7 @@ fn emit_size_guard(
     ranges.push(range);
     f.instruction(&Instruction::If(BlockType::Empty));
     ranges.push(range);
-    f.instruction(&Instruction::Unreachable);
-    ranges.push(range);
+    emit_recorded_unreachable(f, ranges, log, range, kind);
     f.instruction(&Instruction::End);
     ranges.push(range);
 }
@@ -1914,6 +2064,7 @@ fn emit_store_field(
 fn emit_store_pointer_indirect(
     f: &mut Function,
     ranges: &mut Vec<TokenRange>,
+    log: &mut Vec<RecordedUnreachable>,
     fixed_offset: u32,
     ty: IrType,
     range: TokenRange,
@@ -1999,8 +2150,18 @@ fn emit_store_pointer_indirect(
     ranges.push(range);
     f.instruction(&Instruction::If(BlockType::Empty));
     ranges.push(range);
-    f.instruction(&Instruction::Unreachable);
-    ranges.push(range);
+    let value_kind = match ty {
+        IrType::String => "String",
+        IrType::ListInt => "ListInt",
+        _ => "String",
+    };
+    emit_recorded_unreachable(
+        f,
+        ranges,
+        log,
+        range,
+        UnreachableKind::ValueTooLarge { kind: value_kind },
+    );
     f.instruction(&Instruction::End);
     ranges.push(range);
 
@@ -2088,6 +2249,7 @@ fn emit_align_tail_cursor(
 fn emit_tail_bounds_check(
     f: &mut Function,
     ranges: &mut Vec<TokenRange>,
+    log: &mut Vec<RecordedUnreachable>,
     size: u32,
     range: TokenRange,
 ) {
@@ -2103,8 +2265,13 @@ fn emit_tail_bounds_check(
     ranges.push(range);
     f.instruction(&Instruction::If(BlockType::Empty));
     ranges.push(range);
-    f.instruction(&Instruction::Unreachable);
-    ranges.push(range);
+    emit_recorded_unreachable(
+        f,
+        ranges,
+        log,
+        range,
+        UnreachableKind::ValueTooLarge { kind: "Record" },
+    );
     f.instruction(&Instruction::End);
     ranges.push(range);
 }
@@ -2227,6 +2394,7 @@ fn emit_record_dest_addr(
 fn emit_tail_record_from_absolute(
     f: &mut Function,
     ranges: &mut Vec<TokenRange>,
+    log: &mut Vec<RecordedUnreachable>,
     ty: IrType,
     range: TokenRange,
 ) -> Result<(), CodegenError> {
@@ -2288,8 +2456,18 @@ fn emit_tail_record_from_absolute(
     ranges.push(range);
     f.instruction(&Instruction::If(BlockType::Empty));
     ranges.push(range);
-    f.instruction(&Instruction::Unreachable);
-    ranges.push(range);
+    let value_kind = match ty {
+        IrType::String => "String",
+        IrType::ListInt => "ListInt",
+        _ => "String",
+    };
+    emit_recorded_unreachable(
+        f,
+        ranges,
+        log,
+        range,
+        UnreachableKind::ValueTooLarge { kind: value_kind },
+    );
     f.instruction(&Instruction::End);
     ranges.push(range);
 
@@ -2564,9 +2742,9 @@ pub fn compile_hardcoded_double() -> Vec<u8> {
 /// Loaded wasm module surface used by host SDKs.
 ///
 /// Wraps the raw module bytes alongside the parsed `relon.abi` +
-/// `relon.srcmap` + `relon.host_fns` sections so a host can keep one
-/// value handy for instantiation, trap translation, and ABI
-/// compatibility checks.
+/// `relon.srcmap` + `relon.host_fns` + `relon.uctab` sections so a
+/// host can keep one value handy for instantiation, trap translation,
+/// and ABI compatibility checks.
 #[derive(Debug, Clone)]
 pub struct WasmModule {
     /// Raw module bytes ready to be passed to a wasm engine.
@@ -2578,6 +2756,10 @@ pub struct WasmModule {
     /// Host-fn table parsed out of `relon.host_fns`. Empty when the
     /// module declared no `#native` imports.
     host_fns: host_fns::HostFnTable,
+    /// Phase 7: per-`unreachable` semantic-intent table parsed out
+    /// of `relon.uctab`. Empty for modules emitted by a Phase 1-6
+    /// codegen that predates the section.
+    unreachable_table: UnreachableTable,
 }
 
 impl WasmModule {
@@ -2600,6 +2782,126 @@ impl WasmModule {
     /// Empty for modules without host-fn dependencies.
     pub fn host_fns(&self) -> &host_fns::HostFnTable {
         &self.host_fns
+    }
+
+    /// Borrow the parsed `relon.uctab` table. Empty for modules
+    /// emitted by a Phase 1-6 codegen that predates the section.
+    pub fn unreachable_table(&self) -> &UnreachableTable {
+        &self.unreachable_table
+    }
+
+    /// Phase 7: convenience lookup that maps a module-absolute pc
+    /// to the source `TokenRange` of the wasm instruction at that
+    /// offset. Wraps [`SrcMap::lookup`]; exposed on the module
+    /// surface because the Phase 8 facade and host SDKs frequently
+    /// want a single-call API for traceback rendering.
+    pub fn lookup_pc(&self, pc: u32) -> Option<TokenRange> {
+        self.srcmap.lookup(pc).map(token_range_from_srcmap)
+    }
+
+    /// Phase 7: turn a wasmtime trap error into a Relon
+    /// [`RuntimeError`]. The translator inspects the
+    /// [`wasmtime::Trap`] code, walks the attached
+    /// [`wasmtime::WasmBacktrace`] to find the trapping pc, and
+    /// then either:
+    ///
+    /// * looks the pc up in the `relon.uctab` table to recover the
+    ///   semantic intent of the guard that fired (capability denied
+    ///   / buffer too small / tail-cursor overflow), or
+    /// * falls through to [`RuntimeError::WasmTrapUnclassified`]
+    ///   when the trap doesn't match any codegen-emitted guard
+    ///   shape (memory OOB, stack overflow, indirect-call type
+    ///   mismatch, ...).
+    ///
+    /// `err` is the value `wasmtime::Func::call` (or any other
+    /// invocation) returned. Callers don't need to downcast it
+    /// themselves — the function pulls out the trap code and
+    /// backtrace via [`wasmtime::Error::downcast_ref`].
+    pub fn translate_trap(&self, err: &wasmtime::Error) -> RuntimeError {
+        // Pull the trap code and trapping pc out of the wasmtime
+        // error. `Trap` is the canonical wasm trap discriminator;
+        // `WasmBacktrace` carries the frame chain whose topmost
+        // frame has the module-absolute pc we feed to srcmap /
+        // uctab.
+        let trap_code = err.downcast_ref::<wasmtime::Trap>().copied();
+        let backtrace = err.downcast_ref::<wasmtime::WasmBacktrace>();
+        let pc = backtrace
+            .and_then(|bt| bt.frames().first().and_then(|f| f.module_offset()))
+            .map(|p| p as u32)
+            .unwrap_or(0);
+        let range = self.srcmap.lookup(pc).map(token_range_from_srcmap);
+
+        match trap_code {
+            Some(wasmtime::Trap::IntegerDivisionByZero) => {
+                // Tree-walker variant is `DivisionByZero(range)`;
+                // we keep the same shape on the wasm side so Phase 8
+                // surfaces a single, consistent error for both
+                // backends. A missing srcmap range collapses to a
+                // synthetic `TokenRange::default()` rather than
+                // pretending the trap was un-classified — division
+                // by zero in wasm can only come from the i64/i32.div
+                // op which we emit straight from `Op::Div`/`Op::Mod`,
+                // so a srcmap hit is the common case.
+                RuntimeError::DivisionByZero(range.unwrap_or_default())
+            }
+            Some(wasmtime::Trap::IntegerOverflow) => {
+                // Wasm `i32/i64.div_s` traps on `INT_MIN / -1`;
+                // route through the existing tree-walker variant
+                // so the host SDK doesn't need to special-case it.
+                RuntimeError::NumericOverflow(range.unwrap_or_default())
+            }
+            Some(wasmtime::Trap::UnreachableCodeReached) => {
+                // The interesting path: look the pc up in the
+                // uctab and dispatch on the recorded `UnreachableKind`.
+                match self.unreachable_table.lookup(pc) {
+                    Some(UnreachableKind::CapabilityDenied { cap_bit }) => {
+                        RuntimeError::WasmCapabilityDenied {
+                            cap_bit,
+                            range: range.unwrap_or_default(),
+                        }
+                    }
+                    Some(UnreachableKind::OutBufTooSmall { needed }) => {
+                        RuntimeError::WasmOutBufTooSmall {
+                            needed,
+                            range: range.unwrap_or_default(),
+                        }
+                    }
+                    Some(UnreachableKind::InBufTooSmall { needed }) => {
+                        RuntimeError::WasmInBufTooSmall {
+                            needed,
+                            range: range.unwrap_or_default(),
+                        }
+                    }
+                    Some(UnreachableKind::ValueTooLarge { kind }) => {
+                        RuntimeError::WasmValueTooLarge {
+                            kind,
+                            range: range.unwrap_or_default(),
+                        }
+                    }
+                    None => RuntimeError::WasmTrapUnclassified {
+                        trap_code: "UnreachableCodeReached".to_string(),
+                        pc,
+                        range,
+                    },
+                }
+            }
+            Some(other) => RuntimeError::WasmTrapUnclassified {
+                trap_code: format!("{other:?}"),
+                pc,
+                range,
+            },
+            None => {
+                // No `wasmtime::Trap` attached — likely a host fn
+                // returned an error of its own, or wasmtime couldn't
+                // categorise the fault. Surface the error's display
+                // form so the host SDK still gets a useful string.
+                RuntimeError::WasmTrapUnclassified {
+                    trap_code: format!("{err}"),
+                    pc,
+                    range,
+                }
+            }
+        }
     }
 
     /// Parse a wasm module's custom sections and validate the ABI
@@ -2660,6 +2962,7 @@ impl WasmModule {
         let mut abi_bytes: Option<Vec<u8>> = None;
         let mut srcmap_bytes: Option<Vec<u8>> = None;
         let mut host_fns_bytes: Option<Vec<u8>> = None;
+        let mut uctab_bytes: Option<Vec<u8>> = None;
 
         for payload in wasmparser::Parser::new(0).parse_all(&bytes) {
             let payload = payload.map_err(|e| LoadError::WasmParse(e.to_string()))?;
@@ -2673,6 +2976,9 @@ impl WasmModule {
                     }
                     name if name == host_fns::SECTION_NAME => {
                         host_fns_bytes = Some(reader.data().to_vec());
+                    }
+                    name if name == unreachable_table::SECTION_NAME => {
+                        uctab_bytes = Some(reader.data().to_vec());
                     }
                     _ => {}
                 }
@@ -2705,11 +3011,24 @@ impl WasmModule {
             None => host_fns::HostFnTable::empty(),
         };
 
+        // Phase 7: `relon.uctab` is optional too. Modules produced
+        // before this phase shipped don't carry the section; the
+        // trap translator then falls through to
+        // `WasmTrapUnclassified` for every `unreachable` it sees.
+        // We treat decode failure as fatal (`LoadError::UnreachableTable`)
+        // because a stale magic / version is a known-bad payload
+        // rather than a forward-compat extension.
+        let unreachable_table = match uctab_bytes {
+            Some(b) => unreachable_table::decode_from_bytes(&b)?,
+            None => UnreachableTable::default(),
+        };
+
         Ok(Self {
             bytes,
             abi,
             srcmap,
             host_fns: host_fns_table,
+            unreachable_table,
         })
     }
 }
