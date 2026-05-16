@@ -292,6 +292,73 @@ fn schema_arg_with_two_int_fields_roundtrips() {
 }
 
 #[test]
+fn schema_arg_with_string_field() {
+    // `self.name.length()` chains a pointer-indirect String load
+    // through `LoadFieldAtAbsolute`. The field's 4-byte slot inside
+    // the sub-record's fixed area holds a buffer-relative offset; the
+    // codegen path must rebase it to absolute by adding `in_ptr` so
+    // the stdlib `String::length` body sees a real `[len][bytes]`
+    // record. Without the rebase the load walks arbitrary bytes and
+    // returns garbage.
+    //
+    // Tree-walk parity is skipped here: the surface stdlib name for
+    // String length is `len` on the walker side and `length` on the
+    // wasm-AOT side — bringing those into parity is a separate task.
+    let src = "#schema P { Int x: *, String name: * } with {\n  \
+        hello() -> Int: self.name.length()\n\
+        }\n\
+        #main(P p) -> Int\n\
+        p.hello()";
+    let aot = WasmAotEvaluator::from_source(src).expect("compile");
+
+    let mut p_map = std::collections::BTreeMap::new();
+    p_map.insert("x".to_string(), Value::Int(0));
+    p_map.insert("name".to_string(), Value::String("world".to_string()));
+    let mut args = HashMap::new();
+    args.insert(
+        "p".to_string(),
+        Value::branded_dict(p_map, Some("P".into())),
+    );
+
+    let aot_out = aot.run_main(args).expect("aot run_main");
+    assert_eq!(aot_out, Value::Int(5));
+}
+
+#[test]
+fn schema_arg_with_list_int_field() {
+    // Same pointer-indirect rebase contract as `schema_arg_with_
+    // string_field`, but for `List<Int>` slots. `self.xs.length()`
+    // routes through the `ListInt` arm of `LoadFieldAtAbsolute`; the
+    // codegen path must add `in_ptr` to the loaded buffer-relative
+    // offset so the stdlib body reads the element count from the
+    // real tail record.
+    let src = "#schema Q { List<Int> xs: * } with {\n  \
+        size() -> Int: self.xs.length()\n\
+        }\n\
+        #main(Q q) -> Int\n\
+        q.size()";
+    let aot = WasmAotEvaluator::from_source(src).expect("compile");
+
+    let mut q_map = std::collections::BTreeMap::new();
+    q_map.insert(
+        "xs".to_string(),
+        Value::List(Arc::new(vec![
+            Value::Int(10),
+            Value::Int(20),
+            Value::Int(30),
+        ])),
+    );
+    let mut args = HashMap::new();
+    args.insert(
+        "q".to_string(),
+        Value::branded_dict(q_map, Some("Q".into())),
+    );
+
+    let aot_out = aot.run_main(args).expect("aot run_main");
+    assert_eq!(aot_out, Value::Int(3));
+}
+
+#[test]
 fn schema_arg_missing_inner_field_errors() {
     // The buffer builder demands every sub-field; surface a clear
     // MissingMainArg before the wasm side ever runs.
