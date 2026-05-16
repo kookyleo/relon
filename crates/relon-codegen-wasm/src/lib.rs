@@ -16,10 +16,12 @@
 //! reference: it sidesteps the IR entirely and exercises the
 //! `wasm-encoder` + `wasmtime` link in isolation.
 
+pub mod abi;
 pub mod error;
 pub mod srcmap;
 
-pub use error::CodegenError;
+pub use abi::{AbiError, AbiMetadata};
+pub use error::{CodegenError, LoadError};
 pub use srcmap::{Entry as SrcMapEntry, SrcMap, SrcMapError};
 
 use relon_ir::{IrType, Module as IrModule, Op};
@@ -123,6 +125,17 @@ pub fn compile_module(ir: &IrModule) -> Result<Vec<u8>, CodegenError> {
     module.section(&CustomSection {
         name: srcmap::SECTION_NAME.into(),
         data: (&srcmap_bytes[..]).into(),
+    });
+
+    // Phase 2.a: append `relon.abi`. The codegen pipeline doesn't yet
+    // accept a schema as input, so both hashes go in as 32-byte zero
+    // placeholders. Phase 2.b broadens `compile_module` to take the
+    // schema; until then the host loader treats zero-hash modules as
+    // "ABI shape locked, schema not yet validated".
+    let abi_bytes = abi::encode(&AbiMetadata::placeholder());
+    module.section(&CustomSection {
+        name: abi::SECTION_NAME.into(),
+        data: (&abi_bytes[..]).into(),
     });
 
     Ok(module.finish())
@@ -414,4 +427,90 @@ pub fn compile_hardcoded_double() -> Vec<u8> {
     module.section(&codes);
 
     module.finish()
+}
+
+/// Loaded wasm module surface used by host SDKs.
+///
+/// Wraps the raw module bytes alongside the parsed `relon.abi` +
+/// `relon.srcmap` sections so a host can keep one value handy for
+/// instantiation, trap translation, and ABI compatibility checks.
+/// Phase 2.a only fills the loader path — Phase 7 wires up the
+/// `translate_trap` helper that turns a wasmtime trap into a
+/// `RuntimeError` with a `TokenRange`.
+#[derive(Debug, Clone)]
+pub struct WasmModule {
+    /// Raw module bytes ready to be passed to a wasm engine.
+    bytes: Vec<u8>,
+    /// ABI metadata parsed out of `relon.abi`. The loader checks
+    /// `abi_version` against [`abi::CURRENT_ABI_VERSION`] so callers
+    /// receive an already-validated record.
+    abi: AbiMetadata,
+    /// Source map parsed out of `relon.srcmap`. Available for the
+    /// future `translate_trap` helper plus any host-side tooling
+    /// that wants to surface source positions.
+    srcmap: SrcMap,
+}
+
+impl WasmModule {
+    /// Borrow the raw module bytes.
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Borrow the parsed ABI metadata.
+    pub fn abi(&self) -> &AbiMetadata {
+        &self.abi
+    }
+
+    /// Borrow the parsed source map.
+    pub fn srcmap(&self) -> &SrcMap {
+        &self.srcmap
+    }
+
+    /// Parse a wasm module's custom sections and validate the ABI.
+    ///
+    /// Errors fall into three buckets, in order of detection:
+    ///
+    /// 1. [`LoadError::WasmParse`] — the wasm binary itself is malformed.
+    /// 2. [`LoadError::MissingCustomSection`] — required Relon custom
+    ///    section is absent (always `relon.abi` first; `relon.srcmap`
+    ///    is also required so trap translation works in Phase 7).
+    /// 3. [`LoadError::Abi`] / [`LoadError::SrcMap`] — section payload
+    ///    decoded but failed semantic validation (e.g. ABI version
+    ///    mismatch).
+    pub fn from_bytes(bytes: Vec<u8>) -> Result<Self, LoadError> {
+        let mut abi_bytes: Option<Vec<u8>> = None;
+        let mut srcmap_bytes: Option<Vec<u8>> = None;
+
+        for payload in wasmparser::Parser::new(0).parse_all(&bytes) {
+            let payload = payload.map_err(|e| LoadError::WasmParse(e.to_string()))?;
+            if let wasmparser::Payload::CustomSection(reader) = payload {
+                match reader.name() {
+                    name if name == abi::SECTION_NAME => {
+                        abi_bytes = Some(reader.data().to_vec());
+                    }
+                    name if name == srcmap::SECTION_NAME => {
+                        srcmap_bytes = Some(reader.data().to_vec());
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // Schedule the abi check first: if the host SDK was built for a
+        // different ABI version, refusing-to-load before parsing srcmap
+        // gives the user a clearer diagnostic ("abi mismatch" beats
+        // "srcmap section missing" when the real problem is an
+        // outdated wasm blob).
+        let abi_bytes = abi_bytes.ok_or(LoadError::Abi(AbiError::AbiSectionMissing))?;
+        let abi = abi::decode(&abi_bytes)?;
+        abi::check_versions(&abi)?;
+
+        let srcmap_bytes = srcmap_bytes.ok_or(LoadError::MissingCustomSection {
+            name: srcmap::SECTION_NAME,
+        })?;
+        let srcmap = srcmap::decode_from_bytes(&srcmap_bytes)?;
+
+        Ok(Self { bytes, abi, srcmap })
+    }
 }

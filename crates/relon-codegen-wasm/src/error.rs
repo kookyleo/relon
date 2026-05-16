@@ -4,7 +4,14 @@
 //! mixed-type arithmetic (which can survive lowering when both
 //! sides happen to type-check individually but disagree on the
 //! arithmetic flavor).
+//!
+//! Phase 2.a adds [`LoadError`] for the loader-side surface
+//! ([`crate::WasmModule::from_bytes`]) — distinct from `CodegenError`
+//! because the load path can fail in shapes the codegen path
+//! cannot (e.g. a third-party stripped the `relon.abi` section).
 
+use crate::abi::AbiError;
+use crate::srcmap::SrcMapError;
 use thiserror::Error;
 
 /// Reasons codegen can fail.
@@ -31,4 +38,37 @@ pub enum CodegenError {
     /// trigger from a `lower_workspace_*` produced IR.
     #[error("srcmap pass failed: {0}")]
     SrcMapEncode(String),
+}
+
+/// Failure modes when loading an already-compiled wasm module via
+/// [`crate::WasmModule::from_bytes`].
+///
+/// The loader walks the module's custom sections to extract the
+/// `relon.abi` + `relon.srcmap` payloads. Any shape failure surfaces
+/// here so host SDKs can map each variant to a stable user-facing
+/// `RuntimeError` (Phase 7).
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum LoadError {
+    /// The wasm parse itself failed (truncated module, bad section
+    /// header, ...). Carries the wasmparser error stringified so the
+    /// dependency surface stays narrow on the public re-exports.
+    #[error("wasm parse failed: {0}")]
+    WasmParse(String),
+    /// Couldn't locate one of the custom sections required by the
+    /// Relon ABI. Distinct from [`Self::Abi`] / [`Self::SrcMap`]
+    /// because those variants only fire after the section was
+    /// located and its payload turned out to be malformed.
+    #[error("expected custom section `{name}` is missing")]
+    MissingCustomSection {
+        /// Section name the loader was looking for.
+        name: &'static str,
+    },
+    /// `relon.abi` payload was located but failed validation. Wraps
+    /// the abi-specific failure variant so callers can match on it.
+    #[error(transparent)]
+    Abi(#[from] AbiError),
+    /// `relon.srcmap` payload was located but failed parse. Wraps
+    /// the srcmap-specific failure variant.
+    #[error(transparent)]
+    SrcMap(#[from] SrcMapError),
 }

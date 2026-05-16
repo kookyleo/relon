@@ -23,11 +23,14 @@
 // evaluator crate's allow and drop it once the rustc fix lands.
 #![allow(unused_assignments)]
 
+pub mod buffer;
 pub mod context;
 pub mod decorator;
 pub mod error;
+pub mod layout;
 pub mod module;
 pub mod native_fn;
+pub mod schema_canonical;
 pub mod scope;
 pub mod value;
 
