@@ -398,3 +398,152 @@ fn run_main_missing_argument_errors() {
         other => panic!("expected MissingMainArg, got {other:?}"),
     }
 }
+
+/// Build a hand-rolled IR module that drops an `Op::CheckCap` (the
+/// stand-alone capability assertion) at the start of `run_main`. The
+/// body is otherwise trivial: a constant store + return. Used by the
+/// `WasmAotEvaluator::with_capabilities` tests below — the IR has no
+/// `#native fn` imports so the evaluator's linker can instantiate the
+/// module without help, yet the body still trips the `check_cap`
+/// prologue path when the host's `Capabilities` lack `ReadsFs`.
+fn build_check_cap_module(cap_bit: u32) -> (Vec<u8>, relon_eval_api::schema_canonical::Schema) {
+    use relon_eval_api::schema_canonical::{Field, Schema, TypeRepr};
+    use relon_ir::{Func, IrType, Module as IrModule, Op, TaggedOp};
+    use relon_parser::TokenRange;
+
+    let synth_range = TokenRange {
+        start: relon_parser::TokenPosition {
+            line: 1,
+            column: 1,
+            offset: 0,
+        },
+        end: relon_parser::TokenPosition {
+            line: 1,
+            column: 1,
+            offset: 0,
+        },
+    };
+    let t = |op: Op| TaggedOp {
+        op,
+        range: synth_range,
+    };
+
+    let main_schema = Schema {
+        name: "MainParams".into(),
+        generics: vec![],
+        fields: vec![Field {
+            name: "x".into(),
+            ty: TypeRepr::Int,
+            default: None,
+        }],
+    };
+    let return_schema = Schema {
+        name: "Ret".into(),
+        generics: vec![],
+        fields: vec![Field {
+            name: "value".into(),
+            ty: TypeRepr::Int,
+            default: None,
+        }],
+    };
+    let return_layout =
+        relon_eval_api::layout::SchemaLayout::offsets_for(&return_schema).expect("return layout");
+    let value_offset = return_layout
+        .fields
+        .iter()
+        .find(|f| f.name == "value")
+        .map(|f| f.offset as u32)
+        .expect("value offset");
+
+    let ir_module = IrModule {
+        imports: vec![],
+        funcs: vec![Func {
+            name: "run_main".into(),
+            params: vec![IrType::I32, IrType::I32, IrType::I32, IrType::I32],
+            ret: IrType::I32,
+            range: synth_range,
+            body: vec![
+                t(Op::CheckCap { cap_bit }),
+                t(Op::ConstI64(42)),
+                t(Op::StoreField {
+                    offset: value_offset,
+                    ty: IrType::I64,
+                }),
+                t(Op::Return),
+            ],
+        }],
+        entry_func_index: Some(0),
+    };
+
+    let wasm = relon_codegen_wasm::compile_module(&ir_module, &main_schema, &return_schema)
+        .expect("compile check-cap module");
+    (wasm, main_schema)
+}
+
+#[test]
+fn with_capabilities_default_denies_cap_check() {
+    // Default Capabilities publish a zero-trust bitmap, so the
+    // codegen `check_cap` prologue must trap with
+    // `WasmCapabilityDenied { cap_bit: 0 }` (`CapabilityBit::ReadsFs`).
+    use relon_eval_api::{Capabilities, CapabilityBit};
+
+    let cap_bit = CapabilityBit::ReadsFs.bit_index();
+    let (wasm, main_schema) = build_check_cap_module(cap_bit);
+    let return_schema = relon_eval_api::schema_canonical::Schema {
+        name: "Ret".into(),
+        generics: vec![],
+        fields: vec![relon_eval_api::schema_canonical::Field {
+            name: "value".into(),
+            ty: relon_eval_api::schema_canonical::TypeRepr::Int,
+            default: None,
+        }],
+    };
+    let aot = WasmAotEvaluator::from_bytes(wasm, main_schema, return_schema)
+        .expect("from_bytes")
+        .with_capabilities(Capabilities::default());
+
+    let mut args = HashMap::new();
+    args.insert("x".to_string(), Value::Int(0));
+
+    let err = aot
+        .run_main(args)
+        .expect_err("zero-trust caps must deny the cap check");
+    match err {
+        RuntimeError::WasmCapabilityDenied { cap_bit: bit, .. } => {
+            assert_eq!(bit, cap_bit, "cap_bit must match the declared check");
+        }
+        other => panic!("expected WasmCapabilityDenied, got {other:?}"),
+    }
+}
+
+#[test]
+fn with_capabilities_all_granted_allows_cap_check() {
+    // `Capabilities::all_granted` lights up every declared bit, so
+    // the same module's `check_cap` prologue passes through and the
+    // body's constant store reaches the return slot.
+    use relon_eval_api::{Capabilities, CapabilityBit};
+
+    let cap_bit = CapabilityBit::ReadsFs.bit_index();
+    let (wasm, main_schema) = build_check_cap_module(cap_bit);
+    let return_schema = relon_eval_api::schema_canonical::Schema {
+        name: "Ret".into(),
+        generics: vec![],
+        fields: vec![relon_eval_api::schema_canonical::Field {
+            name: "value".into(),
+            ty: relon_eval_api::schema_canonical::TypeRepr::Int,
+            default: None,
+        }],
+    };
+    let aot = WasmAotEvaluator::from_bytes(wasm, main_schema, return_schema)
+        .expect("from_bytes")
+        .with_capabilities(Capabilities::all_granted());
+
+    let mut args = HashMap::new();
+    args.insert("x".to_string(), Value::Int(0));
+
+    let out = aot.run_main(args).expect("all_granted caps must allow");
+    // The single-field return schema flattens to the inner Int value
+    // when read back through `BufferReader`. The 42 here is the
+    // `Op::ConstI64(42)` the body stored after the cap-check passed.
+    assert_eq!(out, Value::Int(42));
+}
