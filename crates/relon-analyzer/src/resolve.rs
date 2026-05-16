@@ -326,6 +326,27 @@ impl<'a> Walker<'a> {
                 self.visit(body);
                 self.scope_stack.pop();
             }
+            Expr::Where { expr, bindings } => {
+                // Phase 9.b-3: `expr where { a: va, b: vb }` extends the
+                // body's scope with the binding names. Without the push
+                // below, strict-mode resolution doesn't see `a` / `b`
+                // inside `expr` and `check_unresolved_var` escalates to a
+                // false-positive `UnknownReferenceType`. The bindings
+                // node is itself a Dict — visiting it via the normal arm
+                // pushes its own frame, which lets one binding's value
+                // reference an earlier sibling binding (matching the
+                // evaluator's dict-frame semantics for the bindings
+                // dict).
+                self.visit(bindings);
+                if let Expr::Dict(pairs) = &*bindings.expr {
+                    let frame = build_frame(pairs);
+                    self.scope_stack.push(frame);
+                    self.visit(expr);
+                    self.scope_stack.pop();
+                } else {
+                    self.visit(expr);
+                }
+            }
             Expr::Reference { base, path } => {
                 // List-iteration bases used outside a list / list-
                 // comprehension are statically wrong: `&prev / &next /
