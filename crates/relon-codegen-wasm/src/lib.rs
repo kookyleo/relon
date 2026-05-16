@@ -23,19 +23,18 @@ pub use error::CodegenError;
 pub use srcmap::{Entry as SrcMapEntry, SrcMap, SrcMapError};
 
 use relon_ir::{IrType, Module as IrModule, Op};
+use relon_parser::TokenRange;
 use wasm_encoder::{
-    CodeSection, ExportKind, ExportSection, Function, FunctionSection, Ieee64, Instruction, Module,
-    TypeSection, ValType,
+    CodeSection, CustomSection, ExportKind, ExportSection, Function, FunctionSection, Ieee64,
+    Instruction, Module, TypeSection, ValType,
 };
 
-// `relon-parser` participates in the codegen surface via `TokenRange`
-// (carried by every `TaggedOp` for the Phase 1.gamma srcmap pass);
-// stay imported so the unused-crate-dependencies lint doesn't trip
-// before that pass lands.
+// `relon-eval-api` participates in the codegen surface via the
+// `Evaluator` trait wiring (see `relon-host`). Keep imported as `_`
+// so the unused-crate-dependencies lint doesn't trip before the
+// wasm-backed adapter lands.
 #[allow(unused_imports)]
 use relon_eval_api as _;
-#[allow(unused_imports)]
-use relon_parser as _;
 
 /// Lower an IR [`Module`] to a wasm binary.
 ///
@@ -50,8 +49,12 @@ use relon_parser as _;
 /// * Bodies emit one wasm instruction per IR `Op`, plus the trailing
 ///   `end` that wasm requires.
 ///
-/// Source map / ABI custom sections are deferred — Phase 1.gamma
-/// adds `relon.srcmap`, Phase 2 adds `relon.abi`.
+/// Phase 1.gamma additionally appends a `relon.srcmap` custom section
+/// after the code section. The section maps every emitted wasm
+/// instruction's module-absolute byte offset to the source
+/// [`TokenRange`] it lowered from, plus a leading entry per function
+/// pinning the function prologue to the `#main(...)` declaration
+/// range. The `relon.abi` section is still deferred to Phase 2.
 pub fn compile_module(ir: &IrModule) -> Result<Vec<u8>, CodegenError> {
     if ir.funcs.is_empty() {
         return Err(CodegenError::EmptyModule);
@@ -67,6 +70,13 @@ pub fn compile_module(ir: &IrModule) -> Result<Vec<u8>, CodegenError> {
     // Kept as a Vec because v1.beta only has a single function — O(n²)
     // is irrelevant and avoids dragging a hashing dep in.
     let mut type_table: Vec<(Vec<ValType>, ValType, u32)> = Vec::new();
+
+    // Per-function: the source ranges that produced each emitted wasm
+    // instruction, in emit order. Length equals the number of wasm ops
+    // wasmparser will read out of the function body (final `End`
+    // included). We keep `Func::range` separately so the prologue
+    // (locals header) maps to the function declaration.
+    let mut per_func_ranges: Vec<(TokenRange, Vec<TokenRange>)> = Vec::with_capacity(ir.funcs.len());
 
     for (func_index, func) in ir.funcs.iter().enumerate() {
         let params_vt: Vec<ValType> = func.params.iter().map(ir_to_val_type).collect();
@@ -92,20 +102,151 @@ pub fn compile_module(ir: &IrModule) -> Result<Vec<u8>, CodegenError> {
             exports.export(func.name.as_str(), ExportKind::Func, func_index as u32);
         }
 
-        codes.function(&emit_function_body(func)?);
+        let (body, ranges) = emit_function_body(func)?;
+        codes.function(&body);
+        per_func_ranges.push((func.range, ranges));
     }
 
     module.section(&types);
     module.section(&functions);
     module.section(&exports);
     module.section(&codes);
+
+    // Snapshot the module-so-far so wasmparser can resolve module-
+    // absolute byte offsets for every emitted wasm instruction. The
+    // custom section appended below sits after the code section, so
+    // none of the offsets shift on the second pass.
+    let bytes_so_far = module.as_slice().to_vec();
+    let srcmap = build_srcmap(&bytes_so_far, &per_func_ranges)?;
+    let srcmap_bytes = srcmap::encode_to_bytes(&srcmap);
+    module.section(&CustomSection {
+        name: srcmap::SECTION_NAME.into(),
+        data: (&srcmap_bytes[..]).into(),
+    });
+
     Ok(module.finish())
+}
+
+/// Walk the emitted module's code section with `wasmparser`, line up
+/// each wasm instruction with the [`TokenRange`] it lowered from, and
+/// produce a sorted [`SrcMap`] ready for encoding.
+///
+/// The file table holds a single placeholder entry — v1.beta doesn't
+/// thread source paths through IR lowering yet (the lowering pass
+/// uses a hard-coded `"main"` module name for diagnostics; see
+/// [`relon_ir::lower_workspace_single`]). Phase 2+ widens the
+/// pipeline to multi-file workspaces, at which point this becomes a
+/// real path table.
+fn build_srcmap(
+    module_bytes: &[u8],
+    per_func: &[(TokenRange, Vec<TokenRange>)],
+) -> Result<SrcMap, CodegenError> {
+    let mut entries: Vec<SrcMapEntry> = Vec::new();
+    let mut func_iter = per_func.iter();
+
+    for payload in wasmparser::Parser::new(0).parse_all(module_bytes) {
+        let payload = payload
+            .map_err(|e| CodegenError::SrcMapEncode(format!("wasmparser error: {e}")))?;
+        if let wasmparser::Payload::CodeSectionEntry(body) = payload {
+            let (func_range, op_ranges) = func_iter.next().ok_or_else(|| {
+                CodegenError::SrcMapEncode("more wasm function bodies than IR funcs".into())
+            })?;
+
+            // The function body's `range()` starts at the byte just
+            // after the body's length prefix and covers locals + ops.
+            // Pin the function declaration range there so any trap
+            // landing inside the prologue resolves to the `#main(...)`
+            // line rather than to the first user op.
+            let body_start = body.range().start as u32;
+            entries.push(token_range_to_entry(body_start, *func_range));
+
+            let ops_reader = body.get_operators_reader().map_err(|e| {
+                CodegenError::SrcMapEncode(format!("operators reader: {e}"))
+            })?;
+            let mut op_idx = 0usize;
+            for item in ops_reader.into_iter_with_offsets() {
+                let (_op, offset) = item
+                    .map_err(|e| CodegenError::SrcMapEncode(format!("op decode: {e}")))?;
+                let range = op_ranges.get(op_idx).copied().ok_or_else(|| {
+                    CodegenError::SrcMapEncode(format!(
+                        "wasm body has more operators ({}) than IR op-ranges ({}) recorded",
+                        op_idx + 1,
+                        op_ranges.len()
+                    ))
+                })?;
+                entries.push(token_range_to_entry(offset as u32, range));
+                op_idx += 1;
+            }
+            if op_idx != op_ranges.len() {
+                return Err(CodegenError::SrcMapEncode(format!(
+                    "wasm body produced {} operators but IR recorded {} ranges",
+                    op_idx,
+                    op_ranges.len()
+                )));
+            }
+        }
+    }
+
+    if func_iter.next().is_some() {
+        return Err(CodegenError::SrcMapEncode(
+            "fewer wasm function bodies than IR funcs".into(),
+        ));
+    }
+
+    // Entries arrive already in pc-ascending order (wasmparser walks
+    // the code section in declaration order, and within a body in
+    // offset order). Belt-and-braces sort here so a future emitter
+    // change can't silently break delta encoding.
+    entries.sort_by_key(|e| e.pc);
+
+    Ok(SrcMap {
+        files: vec![SRCMAP_PLACEHOLDER_FILE.to_string()],
+        entries,
+    })
+}
+
+/// Placeholder file path used in the srcmap file table while the IR
+/// doesn't yet thread real source paths through to codegen. Replaced
+/// in Phase 2 once workspace lowering carries file ids.
+const SRCMAP_PLACEHOLDER_FILE: &str = "<entry>";
+
+/// Project a parser [`TokenRange`] to a srcmap [`SrcMapEntry`] anchored
+/// at `pc`. Uses the range's start position; the closing position is
+/// summarised as a character count in `range_len`.
+fn token_range_to_entry(pc: u32, range: TokenRange) -> SrcMapEntry {
+    let line = range.start.line;
+    // `column` is `usize` in the parser; wasm srcmap stores u32. Cast
+    // is safe in practice (line widths well below `u32::MAX`) and
+    // matches what the parser already enforces in its own diagnostics.
+    let col = range.start.column as u32;
+    let range_len = range
+        .end
+        .offset
+        .saturating_sub(range.start.offset)
+        .min(u32::MAX as usize) as u32;
+    SrcMapEntry {
+        pc,
+        // v1.beta has a single placeholder file entry; multi-file
+        // support is Phase 2.
+        file_idx: 0,
+        line,
+        col,
+        range_len,
+    }
 }
 
 /// Translate an IR function body into a `wasm_encoder::Function`,
 /// emitting one wasm instruction per `Op` and validating the
 /// per-op type tag against a virtual value stack.
-fn emit_function_body(func: &relon_ir::Func) -> Result<Function, CodegenError> {
+///
+/// Returns the encoded body plus the parallel vector of source
+/// [`TokenRange`]s — one per emitted wasm instruction in emit order,
+/// including the trailing `End`. The srcmap pass zips this vector
+/// against `wasmparser`'s post-finish offset stream to build the
+/// per-instruction `pc → range` table.
+fn emit_function_body(
+    func: &relon_ir::Func,
+) -> Result<(Function, Vec<TokenRange>), CodegenError> {
     // No locals beyond the parameters — v1.beta has no let / where /
     // closure body, so the wasm `locals` vector stays empty.
     let mut f = Function::new(Vec::<(u32, ValType)>::new());
@@ -118,15 +259,23 @@ fn emit_function_body(func: &relon_ir::Func) -> Result<Function, CodegenError> {
     let mut vstack: Vec<IrType> = Vec::new();
     let param_types = &func.params;
 
+    // Per-emitted-instruction source ranges, lock-step with the
+    // wasm op stream the encoder builds. `Op::Return` emits no wasm
+    // op so we deliberately skip it here; the trailing implicit
+    // `End` records its own entry below.
+    let mut ranges: Vec<TokenRange> = Vec::with_capacity(func.body.len() + 1);
+
     for tagged in &func.body {
         match &tagged.op {
             Op::ConstI64(v) => {
                 f.instruction(&Instruction::I64Const(*v));
                 vstack.push(IrType::I64);
+                ranges.push(tagged.range);
             }
             Op::ConstF64(v) => {
                 f.instruction(&Instruction::F64Const(Ieee64::from(v.into_inner())));
                 vstack.push(IrType::F64);
+                ranges.push(tagged.range);
             }
             Op::LocalGet(idx) => {
                 let ty = *param_types
@@ -134,27 +283,46 @@ fn emit_function_body(func: &relon_ir::Func) -> Result<Function, CodegenError> {
                     .ok_or(CodegenError::MixedNumericTypes)?;
                 f.instruction(&Instruction::LocalGet(*idx));
                 vstack.push(ty);
+                ranges.push(tagged.range);
             }
-            Op::Add(tag) => emit_arith(&mut f, &mut vstack, *tag, ArithOp::Add)?,
-            Op::Sub(tag) => emit_arith(&mut f, &mut vstack, *tag, ArithOp::Sub)?,
-            Op::Mul(tag) => emit_arith(&mut f, &mut vstack, *tag, ArithOp::Mul)?,
-            Op::Div(tag) => emit_arith(&mut f, &mut vstack, *tag, ArithOp::Div)?,
-            Op::Mod(tag) => emit_arith(&mut f, &mut vstack, *tag, ArithOp::Mod)?,
+            Op::Add(tag) => {
+                emit_arith(&mut f, &mut vstack, *tag, ArithOp::Add)?;
+                ranges.push(tagged.range);
+            }
+            Op::Sub(tag) => {
+                emit_arith(&mut f, &mut vstack, *tag, ArithOp::Sub)?;
+                ranges.push(tagged.range);
+            }
+            Op::Mul(tag) => {
+                emit_arith(&mut f, &mut vstack, *tag, ArithOp::Mul)?;
+                ranges.push(tagged.range);
+            }
+            Op::Div(tag) => {
+                emit_arith(&mut f, &mut vstack, *tag, ArithOp::Div)?;
+                ranges.push(tagged.range);
+            }
+            Op::Mod(tag) => {
+                emit_arith(&mut f, &mut vstack, *tag, ArithOp::Mod)?;
+                ranges.push(tagged.range);
+            }
             Op::Return => {
                 // Wasm encodes "return at end" as a bare `end` —
                 // the last value on the stack is the function's
-                // result. We just emit `end` after every op stream
-                // outside this match (see below).
+                // result. The implicit final `End` below carries
+                // the function's declaration range so srcmap can
+                // pin a trap-at-return to the right source span.
             }
         }
     }
 
-    // Every wasm function body ends with `end`. The IR's `Op::Return`
-    // is a no-op at emit time (the trailing `end` does the work);
-    // we still want it in the IR so srcmap can pin "return" to a
-    // source range later.
+    // Every wasm function body ends with `end`. We tag it with the
+    // function's declaration range (rather than the last op's range)
+    // so a trap that lands on the terminator resolves to "the
+    // function's exit", not to whatever the last computed value was.
     f.instruction(&Instruction::End);
-    Ok(f)
+    ranges.push(func.range);
+
+    Ok((f, ranges))
 }
 
 enum ArithOp {

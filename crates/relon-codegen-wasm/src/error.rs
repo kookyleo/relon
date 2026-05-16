@@ -23,4 +23,12 @@ pub enum CodegenError {
     /// `lower_workspace` / `lower_workspace_single`.
     #[error("IR module has no functions to emit")]
     EmptyModule,
+    /// Phase 1.gamma srcmap pass disagreed with the emitted code
+    /// section — usually because the IR-recorded op count drifted
+    /// from what wasmparser reads back out of the same module, or
+    /// the secondary scan failed to parse. Surfaces an internal
+    /// invariant rather than a user-facing shape; should never
+    /// trigger from a `lower_workspace_*` produced IR.
+    #[error("srcmap pass failed: {0}")]
+    SrcMapEncode(String),
 }
