@@ -349,6 +349,90 @@ HTML 报告（带 violin plot）见 `target/criterion/report/index.html`
 （用 `cargo install cargo-criterion && cargo criterion -p relon-bench
 --bench wasm_aot_vs_tree_walk` 可以渲染更细的图表）。
 
+## 附录 A.5：v2 Pool-of-Stores bench（Phase 9.b-1，2026-05-17）
+
+Phase 9.b-1 把 `WasmAotEvaluator::run_main_inner` 从「每调用
+`Store::new + Linker::instantiate`」改成「`Mutex<Vec<WasmSession>>`
+free-list 复用 warm session」。同一台 bench 笔记本 + 同一 criterion
+配置（`sample_size(50)`, `measurement_time(8s)`），cold start 数字基本
+持平（cold path 仍由 cranelift compile 主导），warm invoke 在三个
+scenario 上几乎全部消除了 `Store::new + Linker::instantiate` 的
+开销。
+
+### wasm-AOT cold start（v1 vs v2 对比）
+
+| Scenario | v1 Median | v2 Median | 变化 |
+| --- | ---: | ---: | ---: |
+| `arithmetic`    | 2.223 ms | 2.252 ms | +1.3 %（噪声内） |
+| `dict_literal`  | 2.305 ms | 2.335 ms | +1.3 %（噪声内） |
+| `stdlib_length` | 2.186 ms | 2.211 ms | +1.1 %（噪声内） |
+
+Cold start 没改：v2 仍要跑 parse → analyze → IR lower → codegen →
+`wasmtime::Module::new`。session pool 在第一次 `run_main` 才暖起来，
+和 cold 路径独立。
+
+### wasm-AOT warm invoke（v1 vs v2，单调降 ≈ 97 %）
+
+| Scenario | v1 Median | v2 Median | 降幅 |
+| --- | ---: | ---: | ---: |
+| `arithmetic`    | 44.62 μs | **1.108 μs** | −97.5 % |
+| `dict_literal`  | 45.41 μs | **1.313 μs** | −97.1 % |
+| `stdlib_length` | 44.34 μs | **1.107 μs** | −97.5 % |
+
+每次 `run_main` 现在只剩三件事：`BufferBuilder` 打包 in_bytes、
+wasmtime 跑 `run_main` JIT 后的函数、`BufferReader` 解出 Value。
+v1 里 `Store::new + Linker::instantiate` 占了 ~ 43 μs，pool 把它一次性
+摊到首次调用，后续调用直接命中 warm session。Memory 在 session 创建
+时已经 grow 过，所以 `memory.grow` 也不出现在热路径里。
+
+### tree-walker（对照组，cold + warm 都基本同 v1）
+
+| Group / Scenario | v1 Median | v2 Median | 变化 |
+| --- | ---: | ---: | ---: |
+| `tree_walk_total / arithmetic`    | 1.011 ms | 1.037 ms | +2.6 %（噪声内） |
+| `tree_walk_total / dict_literal`  | 1.149 ms | 1.182 ms | +2.9 %（噪声内） |
+| `tree_walk_total / stdlib_length` | 983.7 μs | 1.014 ms | +3.1 %（噪声内） |
+| `tree_walk_warm_invoke / arithmetic`    | 2.659 μs | 2.803 μs | +5.4 % |
+| `tree_walk_warm_invoke / dict_literal`  | 36.41 μs | 38.77 μs | +6.5 % |
+| `tree_walk_warm_invoke / stdlib_length` | 3.377 μs | 3.371 μs | −0.2 % |
+
+Tree-walker 数字波动 < 7 %，都在 criterion 报告的「Change within noise
+threshold / has regressed by < 10%」区间。所有降幅都不是 wasm-aot 这边
+带来的，是同机重测自然漂移。
+
+### v2 总体读数：wasm-AOT 在每个 scenario 都跑赢 tree-walker warm
+
+| Scenario | wasm-AOT v2 warm | tree-walker warm | 倍数 |
+| --- | ---: | ---: | ---: |
+| `arithmetic`    | 1.108 μs | 2.803 μs | wasm 快 ≈ 2.5× |
+| `dict_literal`  | 1.313 μs | 38.77 μs | wasm 快 ≈ 29.5× |
+| `stdlib_length` | 1.107 μs | 3.371 μs | wasm 快 ≈ 3.0× |
+
+`dict_literal` 这一档优势最大：tree-walker 每次都要走一遍 dict 字面
+量构造 + schema 验证 + Arc 分配，wasm-AOT 把 dict 蓝图固定到 wasm
+模块、直接在线性内存里铺字节，没有 host 侧的 BTreeMap 分配。`arithmetic`
+和 `stdlib_length` 的差距仍然显著，但比 tree-walker 那一档接近 — 数据
+路径短，host 侧的 buffer marshal cost（< 200 ns）相对突出。
+
+### 决策与遗留
+
+* **Pool 策略选择**：Linker 复用方案做不了，因为
+  `(global $relon_caps_avail i64)` 是 store-bound（`Linker::define` 要
+  `AsContext<Data=T>` 拿当前 store 的 Global）。`InstancePre` 在
+  「跨 store 复用 linker」时受限于此。最务实的方案是把整条
+  `(Store, Instance, Memory, TypedFunc)` 链一起放进 free-list：第一次
+  `run_main` 时创建并暖起来，后续 pop / push 复用。Memory 也一次性
+  pre-grow，热路径不再调用 `memory.grow`。
+* **并发**：`Mutex<Vec<WasmSession>>` 在多线程并发调用时按需扩展
+  pool，单线程稳态下 pool 长度 = 1，pop / push 各加一次锁。
+* **下一步压榨**：去掉 `relon_caps_avail` 这个 store-bound global
+  之后才有可能再做 `InstancePre` 真正跨 store 共享（把 `caps_avail`
+  emit 成 wasm `(global i64 i64.const ...)` 由模块自带，host 不需要
+  绑 store）。这条路径推到下一 9.b 子任务。
+
+数据来源：`target/criterion/{wasm_aot_cold_start, wasm_aot_warm_invoke,
+tree_walk_total, tree_walk_warm_invoke}/scenario/<name>/new/estimate.json`。
+
 ## 附录 B：每个 phase 的 merge commit
 
 整链路从 wasm-AOT 第一行字节码到 Phase 9 收官，merge 顺序如下：

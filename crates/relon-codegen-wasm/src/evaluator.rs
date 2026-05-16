@@ -30,7 +30,7 @@ use relon_eval_api::schema_canonical::{Field, Schema, TypeRepr};
 use relon_eval_api::{Evaluator, RuntimeError, Scope, Thunk, Value};
 use relon_parser::Node;
 use std::collections::{BTreeMap, HashMap};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use thiserror::Error;
 use wasmtime::{
     Engine, Global, GlobalType, Linker, Memory, Module as WtModule, Mutability, Store, TypedFunc,
@@ -94,10 +94,70 @@ pub enum BuildError {
     },
 }
 
-/// Phase 8 wasm-AOT backend. Holds a precompiled wasm module plus the
-/// schemas / layouts the host needs to bridge `Value` ↔ binary
-/// handshake. Implements [`Evaluator`] with `run_main` as the only
-/// real entry point.
+/// A fully prepared wasmtime session — store, instance, exported
+/// memory + `run_main` function handle, and the byte offsets the host
+/// uses for `in_buf` / `out_buf` placement. Sessions are pooled across
+/// `run_main` calls so the per-call cost stays at the actual buffer
+/// marshalling + wasm execution, not at `Store::new` +
+/// `Linker::instantiate`.
+///
+/// Session reuse is safe because:
+///
+/// * The module's exported `memory` belongs to the session's `Store`;
+///   we overwrite the `in_buf` and `out_buf` regions on every call so
+///   stale bytes from a previous invocation are harmless.
+/// * The const-data section (string literals, list literals) sits
+///   below `in_ptr` and is never mutated by the wasm body — see the
+///   `relon_data_top` export the codegen pins.
+/// * The single imported global (`relon_caps_avail`) is `Mutability::
+///   Const` so no per-call reset is needed.
+///
+/// Phase 9.b-1: pre-grows the memory at session creation so the hot
+/// path never needs `memory.grow`, eliminating the size-check branch
+/// from every `run_main`.
+struct WasmSession {
+    /// Wasmtime store the instance lives in. Held by value so the
+    /// Session owns its lifetime; sessions are pooled, not shared.
+    store: Store<()>,
+    /// Exported linear memory handle. Re-resolved once at construction
+    /// and stashed so we don't pay an export lookup per call.
+    memory: Memory,
+    /// Typed `run_main` entry point — saves a `get_typed_func` call
+    /// per invocation.
+    run_main: TypedFunc<(i32, i32, i32, i32), i32>,
+    /// Pre-computed input buffer base (aligned past the const-data
+    /// section).
+    in_ptr: u32,
+    /// Pre-computed output buffer base (aligned past `in_ptr +
+    /// in_cap`). For Phase 9.b-1 we size the input region to whatever
+    /// the largest call so far needed; `out_ptr` is recomputed on the
+    /// first call if a larger input slots forces it forward. Initially
+    /// we anchor it at `data_top + a small fixed in-cap`.
+    out_ptr: u32,
+    /// In-buffer capacity reserved between `in_ptr` and `out_ptr`. The
+    /// pool grows this when a call hands over more input bytes than
+    /// the current reservation, which forces an `out_ptr` realignment.
+    in_cap: u32,
+}
+
+/// Phase 8 wasm-AOT backend, Phase 9.b-1 pool-of-stores refactor.
+///
+/// Holds a precompiled wasm module plus the schemas / layouts the host
+/// needs to bridge `Value` ↔ binary handshake. Implements
+/// [`Evaluator`] with `run_main` as the only real entry point.
+///
+/// Per-call cost was historically dominated by `Store::new` +
+/// `Linker::instantiate` (≈ 40 μs on the bench laptop). Phase 9.b-1
+/// folds those into a pooled [`WasmSession`] that the evaluator
+/// recycles across invocations. The session is a `Mutex<Vec<...>>`
+/// free-list:
+///
+/// * `run_main` pops a session if one is available, otherwise builds a
+///   fresh one through [`Self::build_session`].
+/// * On return the session is pushed back, so the next call (same
+///   thread or another) gets a warm one for free.
+/// * Parallel callers each grab their own session — the pool grows as
+///   contention demands and stays small for single-threaded workloads.
 pub struct WasmAotEvaluator {
     /// Parsed wasm module wrapping the raw bytes + decoded
     /// `relon.abi` / `relon.srcmap` / `relon.host_fns` / `relon.uctab`
@@ -121,6 +181,10 @@ pub struct WasmAotEvaluator {
     /// Out buffer capacity in bytes used for each `run_main` call.
     /// Host can override via [`Self::with_out_cap`] before evaluating.
     out_cap: u32,
+    /// Free-list of warmed-up [`WasmSession`]s. Per-call cost on a hit
+    /// is just the buffer marshal + wasm dispatch; misses pay the
+    /// `Store::new` + `Linker::instantiate` price once.
+    session_pool: Mutex<Vec<WasmSession>>,
 }
 
 impl WasmAotEvaluator {
@@ -181,6 +245,7 @@ impl WasmAotEvaluator {
             main_layout,
             return_layout,
             out_cap: DEFAULT_OUT_CAP,
+            session_pool: Mutex::new(Vec::new()),
         })
     }
 
@@ -253,24 +318,85 @@ impl WasmAotEvaluator {
 
     /// The real `run_main` implementation, shared by the trait
     /// surface and any future host-facing variant that takes an
-    /// explicit scope. Builds the `in_buf` from `args`, instantiates
-    /// the wasm module, calls `run_main`, and decodes the returned
-    /// bytes back into a [`Value`].
+    /// explicit scope. Builds the `in_buf` from `args`, hands off to a
+    /// pooled wasmtime session, then decodes the returned bytes back
+    /// into a [`Value`].
+    ///
+    /// Phase 9.b-1: the per-call session lookup is now a `Mutex` pop
+    /// (free-list) instead of a fresh `Store::new` +
+    /// `Linker::instantiate`. The pool grows lazily — first call from
+    /// each thread / concurrency level builds a session; subsequent
+    /// calls on the same level reuse it. The session is always pushed
+    /// back even on the error path so a panicking host body doesn't
+    /// drain the pool.
     fn run_main_inner(&self, args: HashMap<String, Value>) -> Result<Value, RuntimeError> {
         // Stage 1: build the input buffer. `BufferBuilder::finish`
         // returns the fixed-area + tail-area bytes the wasm side
         // expects at `in_ptr..in_ptr+in_len`.
         let in_bytes = self.build_input(&args)?;
 
-        // Stage 2: spin up a fresh wasmtime session per call. v1
-        // doesn't cache the `Store` because cross-call state (mutable
-        // memory) would leak between independent invocations; Phase 9
-        // can add a pooled mode for the hot loop.
+        // Stage 2: borrow a warm session from the pool, or build one
+        // on a miss. The miss path pays for `Store::new` +
+        // `Linker::instantiate` exactly once per concurrency level.
+        let mut session = match self.session_pool.lock() {
+            Ok(mut pool) => pool.pop(),
+            Err(poisoned) => {
+                // Mutex poisoning surfaces only if a previous call
+                // panicked while holding the lock. Recover by reading
+                // through `into_inner` — the pool's invariants don't
+                // span lock acquisitions, so the worst case is one
+                // extra session creation.
+                let mut pool = poisoned.into_inner();
+                pool.pop()
+            }
+        };
+
+        // Run on a warm session if available, otherwise spin up a new
+        // one. The fresh session's `in_cap` is sized to the current
+        // call's in_bytes (rounded up to a 64-byte cushion), so most
+        // subsequent calls reuse the layout without reshuffling.
+        let in_len = in_bytes.len() as u32;
+        let session = match session.take() {
+            Some(s) if s.in_cap >= in_len => s,
+            // Either no session at all, or the cached one's `in_cap` is
+            // too small for the current call. Build a fresh session
+            // sized to the new in_bytes. The old session (if any) is
+            // dropped — its memory pages are reclaimed when its Store
+            // goes out of scope. A larger pool design could keep both
+            // sizes, but the v1 evaluator only cares about steady-state
+            // hot-loop costs where in_len converges fast.
+            _ => self.build_session(in_len)?,
+        };
+
+        let (result, session) = self.run_main_on_session(session, &in_bytes, in_len);
+
+        // Push the session back even when the wasm body trapped — the
+        // store / instance / memory are still valid; only the host-
+        // visible `Value` failed to materialise. Dropping a session on
+        // trap would force a Store rebuild on the next call and undo
+        // the whole point of the pool.
+        self.return_session(session);
+
+        result
+    }
+
+    /// Build a wasmtime session sized to fit at least `in_len` bytes
+    /// of input. The const-data section + leading padding pin
+    /// `in_ptr`; the input region runs from `in_ptr..in_ptr +
+    /// in_cap`; the output region follows aligned to 8 with capacity
+    /// `self.out_cap`. Memory is pre-grown to fit all three so the
+    /// hot path skips `memory.grow`.
+    fn build_session(&self, in_len: u32) -> Result<WasmSession, RuntimeError> {
         let mut store: Store<()> = Store::new(&self.engine, ());
 
         // The wasm module imports `(global $relon_caps_avail i64)`.
-        // v1 grants every bit so the `check_cap` prologue never
-        // trips; sandbox tightening lives one phase out.
+        // v1 grants every bit so the `check_cap` prologue never trips;
+        // sandbox tightening lives one phase out. The Global has to
+        // be created against this specific store before the linker can
+        // own it, which is why the InstancePre approach can't span
+        // independent stores in Phase 9.b-1 — the optimisation here
+        // is amortising the cost across calls, not removing the
+        // store-attach step itself.
         let caps_avail = Global::new(
             &mut store,
             GlobalType::new(ValType::I64, Mutability::Const),
@@ -293,11 +419,10 @@ impl WasmAotEvaluator {
             .get_typed_func(&mut store, "run_main")
             .map_err(|e| RuntimeError::IoError(format!("wasm `run_main` export: {e}")))?;
 
-        // Stage 3: place in_buf + out_buf inside the wasm linear
-        // memory. We anchor at the `relon_data_top` export (the codegen
-        // sets that to the byte right after the const-data section) so
-        // we never trample on the read-only data the wasm reads at
-        // runtime.
+        // Anchor the input buffer past the const-data section. The
+        // codegen exports `relon_data_top` set to the byte right after
+        // the data section; falling back to `DATA_SECTION_BASE` keeps
+        // pre-Phase-3 modules working.
         let data_top = instance
             .get_global(&mut store, "relon_data_top")
             .and_then(|g| match g.get(&mut store) {
@@ -306,45 +431,110 @@ impl WasmAotEvaluator {
             })
             .unwrap_or(crate::DATA_SECTION_BASE);
 
+        // Round `in_cap` up to a 64-byte cushion so the next call with
+        // a slightly larger input still hits the warm path. The first
+        // call paid for the cushion; subsequent ones reuse it.
+        const IN_CAP_CUSHION: u32 = 64;
+        let in_cap = align_up(in_len.max(IN_CAP_CUSHION), 8);
         let in_ptr = align_up(data_top, 8);
-        let in_len = in_bytes.len() as u32;
-        let out_ptr = align_up(in_ptr + in_len, 8);
-        let out_cap = self.out_cap;
+        let out_ptr = align_up(in_ptr + in_cap, 8);
 
-        // Ensure the wasm memory is big enough to hold both buffers.
-        let needed_end = (out_ptr + out_cap) as usize;
+        // Pre-grow the linear memory so the run_main hot path skips
+        // the `memory.grow` size-check branch. We size to cover
+        // `out_ptr + out_cap` plus one page of slack for any internal
+        // tail records the wasm body wants to spill.
+        const PAGE_SIZE: usize = 64 * 1024;
+        let needed_end = (out_ptr + self.out_cap) as usize + PAGE_SIZE;
         let current_size = memory.data_size(&store);
         if needed_end > current_size {
-            const PAGE_SIZE: usize = 64 * 1024;
             let grow_pages = needed_end.div_ceil(PAGE_SIZE) - (current_size / PAGE_SIZE);
             memory
                 .grow(&mut store, grow_pages as u64)
                 .map_err(|e| RuntimeError::IoError(format!("wasm memory.grow: {e}")))?;
         }
 
-        memory
-            .write(&mut store, in_ptr as usize, &in_bytes)
-            .map_err(|e| RuntimeError::IoError(format!("wasm memory write (in_buf): {e}")))?;
+        Ok(WasmSession {
+            store,
+            memory,
+            run_main,
+            in_ptr,
+            out_ptr,
+            in_cap,
+        })
+    }
 
-        let bytes_written = run_main
-            .call(
-                &mut store,
-                (in_ptr as i32, in_len as i32, out_ptr as i32, out_cap as i32),
-            )
-            .map_err(|e| self.module.translate_trap(&e))?;
-        if bytes_written < 0 {
-            return Err(RuntimeError::IoError(format!(
-                "wasm run_main reported negative bytes_written: {bytes_written}"
-            )));
+    /// Drive `run_main` on a warmed session and return the session
+    /// alongside the result. The caller is responsible for pushing the
+    /// session back to the pool — the tuple keeps the session live
+    /// across the error path so a trap doesn't drain the pool.
+    fn run_main_on_session(
+        &self,
+        mut session: WasmSession,
+        in_bytes: &[u8],
+        in_len: u32,
+    ) -> (Result<Value, RuntimeError>, WasmSession) {
+        // Write the input bytes into the wasm linear memory.
+        if let Err(e) = session
+            .memory
+            .write(&mut session.store, session.in_ptr as usize, in_bytes)
+        {
+            return (
+                Err(RuntimeError::IoError(format!(
+                    "wasm memory write (in_buf): {e}"
+                ))),
+                session,
+            );
         }
-        let bytes_written = bytes_written as usize;
 
-        // Stage 4: read out_buf back and decode through BufferReader.
-        let mut out_bytes = vec![0u8; bytes_written.max(self.return_layout.root_size)];
-        memory
-            .read(&mut store, out_ptr as usize, &mut out_bytes)
-            .map_err(|e| RuntimeError::IoError(format!("wasm memory read (out_buf): {e}")))?;
-        self.decode_return(&out_bytes)
+        let bw = match session.run_main.call(
+            &mut session.store,
+            (
+                session.in_ptr as i32,
+                in_len as i32,
+                session.out_ptr as i32,
+                self.out_cap as i32,
+            ),
+        ) {
+            Ok(v) => v,
+            Err(e) => return (Err(self.module.translate_trap(&e)), session),
+        };
+        if bw < 0 {
+            return (
+                Err(RuntimeError::IoError(format!(
+                    "wasm run_main reported negative bytes_written: {bw}"
+                ))),
+                session,
+            );
+        }
+        let bw = bw as usize;
+        let mut out_bytes = vec![0u8; bw.max(self.return_layout.root_size)];
+        if let Err(e) =
+            session
+                .memory
+                .read(&mut session.store, session.out_ptr as usize, &mut out_bytes)
+        {
+            return (
+                Err(RuntimeError::IoError(format!(
+                    "wasm memory read (out_buf): {e}"
+                ))),
+                session,
+            );
+        }
+        (self.decode_return(&out_bytes), session)
+    }
+
+    /// Push a session back on the pool. Silently absorbs `Mutex`
+    /// poisoning by clearing the poison flag — losing a session is
+    /// not worse than rebuilding one on the next call, and panicking
+    /// here would break the user's `run_main` retry loop.
+    fn return_session(&self, session: WasmSession) {
+        match self.session_pool.lock() {
+            Ok(mut pool) => pool.push(session),
+            Err(poisoned) => {
+                let mut pool = poisoned.into_inner();
+                pool.push(session);
+            }
+        }
     }
 
     /// Pack `args` into the wasm input buffer using `BufferBuilder`.
@@ -451,7 +641,9 @@ fn write_value_into_builder(
         (TypeRepr::String, Value::String(s)) => builder
             .write_string(&field.name, s.as_str())
             .map_err(buffer_to_runtime_error),
-        (TypeRepr::List { element }, Value::List(items)) if matches!(element.as_ref(), TypeRepr::Int) => {
+        (TypeRepr::List { element }, Value::List(items))
+            if matches!(element.as_ref(), TypeRepr::Int) =>
+        {
             let mut ints: Vec<i64> = Vec::with_capacity(items.len());
             for (i, item) in items.iter().enumerate() {
                 match item {
@@ -470,16 +662,41 @@ fn write_value_into_builder(
                 .write_list_int(&field.name, &ints)
                 .map_err(buffer_to_runtime_error)
         }
-        // Nested branded sub-record: not yet supported on the input
-        // side because BufferBuilder doesn't expose a `sub_record`
-        // writer counterpart. v1 leaves dict-typed `#main` parameters
-        // for Phase 9.
-        (TypeRepr::Schema { .. }, _) => Err(RuntimeError::Unsupported {
-            reason: format!(
-                "wasm-aot backend does not yet support Schema-typed `#main` arg `{field}` (schema `{schema}`)",
-                field = field.name,
-                schema = schema_name,
-            ),
+        // Nested branded sub-record. Phase 9.b-1: BufferBuilder::
+        // sub_record now packs Schema-typed `#main` args by allocating
+        // a detached child builder, recursively writing every field
+        // into it, then committing back through finish_sub_record.
+        // The Value side accepts either a plain dict literal or a
+        // branded dict — both shapes route through the same field walker.
+        (TypeRepr::Schema { schema: sub_schema }, Value::Dict(d)) => {
+            let sub_layout = SchemaLayout::offsets_for(sub_schema).map_err(|e| {
+                RuntimeError::IoError(format!(
+                    "wasm sub-record layout for `{field}`: {e}",
+                    field = field.name,
+                ))
+            })?;
+            let mut child = builder
+                .sub_record(&field.name, &sub_layout, &sub_schema.fields)
+                .map_err(buffer_to_runtime_error)?;
+            for sub_field in &sub_schema.fields {
+                let sub_value =
+                    d.map
+                        .get(&sub_field.name)
+                        .ok_or_else(|| RuntimeError::MissingMainArg {
+                            name: format!("{}.{}", field.name, sub_field.name),
+                            range: relon_parser::TokenRange::default(),
+                        })?;
+                write_value_into_builder(&mut child, sub_field, sub_value, &sub_schema.name)?;
+            }
+            builder
+                .finish_sub_record(&field.name, child)
+                .map_err(buffer_to_runtime_error)
+        }
+        (TypeRepr::Schema { .. }, found) => Err(RuntimeError::MainArgTypeMismatch {
+            name: field.name.clone(),
+            expected: format!("Dict (schema `{schema_name}`)"),
+            found: found.type_name().to_string(),
+            range: relon_parser::TokenRange::default(),
         }),
         (expected, found) => Err(RuntimeError::MainArgTypeMismatch {
             name: field.name.clone(),

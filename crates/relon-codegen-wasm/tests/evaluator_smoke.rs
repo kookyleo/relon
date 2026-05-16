@@ -193,6 +193,130 @@ fn invoke_closure_returns_unsupported() {
 }
 
 #[test]
+fn pool_reuse_repeated_invocations_stay_consistent() {
+    // Phase 9.b-1: the WasmAotEvaluator pools warmed wasm sessions
+    // across invocations. Run the same source many times and confirm
+    // each call returns the canonical value — a pool that leaked
+    // stale `in_buf` bytes from a previous call would surface as a
+    // wrong-answer regression here.
+    let src = "#main(Int x, Int y) -> Int\nx * y + 1";
+    let aot = WasmAotEvaluator::from_source(src).expect("compile");
+    for i in 0..50 {
+        let mut args = HashMap::new();
+        args.insert("x".to_string(), Value::Int(i));
+        args.insert("y".to_string(), Value::Int(i + 1));
+        let out = aot.run_main(args).expect("run_main");
+        assert_eq!(out, Value::Int(i * (i + 1) + 1), "iteration {i}");
+    }
+}
+
+#[test]
+fn pool_reuse_after_trap_still_works() {
+    // A wasm trap (division by zero here) must not poison the pool —
+    // the session goes back so the next call still hits the warm
+    // path. Drive a trap followed by a clean call and confirm both
+    // resolve as expected.
+    let src = "#main(Int x, Int y) -> Int\nx / y";
+    let aot = WasmAotEvaluator::from_source(src).expect("compile");
+
+    let mut bad = HashMap::new();
+    bad.insert("x".to_string(), Value::Int(1));
+    bad.insert("y".to_string(), Value::Int(0));
+    let err = aot.run_main(bad).expect_err("must trap");
+    assert!(matches!(err, RuntimeError::DivisionByZero(_)));
+
+    let mut good = HashMap::new();
+    good.insert("x".to_string(), Value::Int(10));
+    good.insert("y".to_string(), Value::Int(2));
+    let out = aot.run_main(good).expect("clean call after trap");
+    assert_eq!(out, Value::Int(5));
+}
+
+#[test]
+fn schema_arg_via_pool() {
+    // Phase 9.b-1: WasmAotEvaluator now accepts Schema-typed `#main`
+    // arguments through `BufferBuilder::sub_record`. The Dict value
+    // mirrors the canonical schema shape — the host passes a
+    // `Value::Dict { x: 21 }` for a `#main(V v) -> Int` whose `V` has
+    // an `Int x` field plus a `doubled()` method. Tree-walker parity
+    // confirms the schema-method dispatch path lights up identically.
+    let src = "#schema V { Int x: * } with {\n  \
+        doubled() -> Int: self.x * 2\n\
+        }\n\
+        #main(V v) -> Int\n\
+        v.doubled()";
+    let aot = WasmAotEvaluator::from_source(src).expect("compile");
+
+    let mut v_map = std::collections::BTreeMap::new();
+    v_map.insert("x".to_string(), Value::Int(21));
+    let mut args = HashMap::new();
+    args.insert(
+        "v".to_string(),
+        Value::branded_dict(v_map, Some("V".into())),
+    );
+
+    let aot_out = aot.run_main(args.clone()).expect("aot run_main");
+    let walker_out = tree_walk_run(src, args).expect("tree-walk run_main");
+
+    assert_eq!(aot_out, Value::Int(42));
+    assert_eq!(aot_out, walker_out);
+}
+
+#[test]
+fn schema_arg_with_two_int_fields_roundtrips() {
+    // Sub-record arg with two scalar fields — exercises the pointer
+    // slot in MainParams plus the inline-int reads inside the
+    // sub-record. The schema-rooted method runs through the existing
+    // self.field dispatch path, which is the most heavily covered
+    // method_dispatch_smoke shape.
+    let src = "#schema Pair { Int a: *, Int b: * } with {\n  \
+        sum() -> Int: self.a + self.b\n\
+        }\n\
+        #main(Pair p) -> Int\n\
+        p.sum()";
+    let aot = WasmAotEvaluator::from_source(src).expect("compile");
+
+    let mut p_map = std::collections::BTreeMap::new();
+    p_map.insert("a".to_string(), Value::Int(3));
+    p_map.insert("b".to_string(), Value::Int(4));
+    let mut args = HashMap::new();
+    args.insert(
+        "p".to_string(),
+        Value::branded_dict(p_map, Some("Pair".into())),
+    );
+
+    let aot_out = aot.run_main(args.clone()).expect("aot run_main");
+    let walker_out = tree_walk_run(src, args).expect("tree-walk run_main");
+    assert_eq!(aot_out, Value::Int(7));
+    assert_eq!(aot_out, walker_out);
+}
+
+#[test]
+fn schema_arg_missing_inner_field_errors() {
+    // The buffer builder demands every sub-field; surface a clear
+    // MissingMainArg before the wasm side ever runs.
+    let src = "#schema V { Int x: * } with {\n  \
+        doubled() -> Int: self.x * 2\n\
+        }\n\
+        #main(V v) -> Int\n\
+        v.doubled()";
+    let aot = WasmAotEvaluator::from_source(src).expect("compile");
+
+    let v_map = std::collections::BTreeMap::new();
+    let mut args = HashMap::new();
+    args.insert(
+        "v".to_string(),
+        Value::branded_dict(v_map, Some("V".into())),
+    );
+
+    let err = aot.run_main(args).expect_err("missing inner must error");
+    match err {
+        RuntimeError::MissingMainArg { name, .. } => assert_eq!(name, "v.x"),
+        other => panic!("expected MissingMainArg, got {other:?}"),
+    }
+}
+
+#[test]
 fn run_main_missing_argument_errors() {
     // The buffer builder needs every declared #main param. We
     // surface `MissingMainArg` before the wasm side runs.
