@@ -29,7 +29,7 @@
 //! `relon.abi` section can be emitted with placeholder zeros until
 //! the codegen pass starts accepting schema input.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 /// Logical type description used by canonical serialisation.
@@ -43,7 +43,7 @@ use sha2::{Digest, Sha256};
 /// Variants mirror the v1 binary layout's leaf-type table; extending
 /// the layout in a later phase (e.g. `Bytes`, `Tuple<...>`) requires
 /// adding the variant here so the hash distinguishes the new shape.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind")]
 pub enum TypeRepr {
     /// `Null` — the unit type.
@@ -89,7 +89,7 @@ pub enum TypeRepr {
 /// declared; it's serialised as raw JSON so the hash is sensitive to
 /// `1` vs `1.0` vs `"1"` distinctions without needing a separate
 /// canonical-value encoder.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Field {
     /// Field name as declared in source.
     pub name: String,
@@ -104,7 +104,7 @@ pub struct Field {
 
 /// Canonical schema description. Field order is preserved exactly as
 /// declared; see the module docs for the rationale.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Schema {
     /// Schema name. Anonymous schemas declared inline carry an empty
     /// string so the canonical form remains deterministic even when

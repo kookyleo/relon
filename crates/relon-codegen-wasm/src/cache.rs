@@ -8,6 +8,8 @@
 //! ```text
 //! <dir>/<source_hash_hex>.wasm     - raw codegen output
 //! <dir>/<source_hash_hex>.meta     - magic + versions + schema hash
+//! <dir>/<source_hash_hex>.schemas  - canonical main/return schemas (JSON,
+//!                                    only written by `store_with_schemas`)
 //! ```
 //!
 //! Cache validity rules (every mismatch returns `None`, not an error,
@@ -27,6 +29,7 @@
 //!  * Per-call session pool warmup — strictly an in-process artifact.
 
 use crate::abi::{CURRENT_ABI_VERSION, CURRENT_CODEGEN_VERSION};
+use relon_eval_api::schema_canonical::Schema;
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::io;
@@ -80,6 +83,13 @@ pub enum CacheError {
         #[source]
         source: io::Error,
     },
+    /// `store_with_schemas` failed to serialise the schemas to JSON,
+    /// or `load_with_schemas` failed to parse the schemas sidecar.
+    /// Surfaces as a hard error (not a miss) because the host asked for
+    /// schemas explicitly — silently dropping back to "no schemas
+    /// cached" would hide a real bug in the producer.
+    #[error("schema sidecar serde error: {0}")]
+    SchemaSerde(String),
 }
 
 /// One cached compilation, as returned by [`AotCache::load`].
@@ -94,6 +104,25 @@ pub struct CachedModule {
     /// cached wasm was compiled against; mismatches are treated as
     /// host-level drift (the host re-compiles), not as cache corruption.
     pub schema_hash: [u8; 32],
+    /// Optional canonical `(main, return)` schemas, populated only when
+    /// the entry was written through [`AotCache::store_with_schemas`].
+    /// `from_source_with_cache` needs both schemas on a hit to bypass
+    /// re-running the analyzer / lowering pipeline, so the convenience
+    /// constructor pairs the wasm bytes with the canonical schemas in
+    /// one go.
+    pub schemas: Option<CachedSchemas>,
+}
+
+/// Canonical `(main, return)` schema pair persisted alongside the wasm
+/// bytes. Stored as JSON in a separate sidecar so the binary `.meta`
+/// shape stays fixed-size and the parser side stays simple.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CachedSchemas {
+    /// Canonical `#main` parameter schema as recorded by the codegen
+    /// pipeline at store time.
+    pub main: Schema,
+    /// Canonical return schema.
+    pub return_: Schema,
 }
 
 /// A directory-backed AOT compile cache.
@@ -206,9 +235,30 @@ impl AotCache {
         // stored_at unix timestamp at offset 43..51 is advisory only —
         // we don't use it for invalidation. Future eviction passes can
         // read it without changing the cache surface.
+
+        // The schemas sidecar is optional. Producers that only know the
+        // hash (e.g. tooling that fingerprints third-party wasm) skip
+        // the file; `from_source_with_cache`-style consumers write it
+        // so a hit can short-circuit parse / analyze / lowering.
+        let schemas_path = self.schemas_path(&source_hash);
+        let schemas = match fs::read(&schemas_path) {
+            Ok(bytes) => Some(
+                serde_json::from_slice::<CachedSchemas>(&bytes)
+                    .map_err(|e| CacheError::SchemaSerde(e.to_string()))?,
+            ),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => None,
+            Err(err) => {
+                return Err(CacheError::Io {
+                    path: schemas_path,
+                    source: err,
+                })
+            }
+        };
+
         Ok(Some(CachedModule {
             wasm_bytes,
             schema_hash,
+            schemas,
         }))
     }
 
@@ -228,8 +278,60 @@ impl AotCache {
         schema_hash: [u8; 32],
     ) -> Result<(), CacheError> {
         let (wasm_path, meta_path) = self.paths(&source_hash);
+        // Delete any stale `.schemas` sidecar so a subsequent
+        // schema-less `store` followed by `load` does not silently
+        // return mismatched schemas from a previous run.
+        let schemas_path = self.schemas_path(&source_hash);
+        match fs::remove_file(&schemas_path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(CacheError::Io {
+                    path: schemas_path,
+                    source: err,
+                })
+            }
+        }
         fs::write(&wasm_path, wasm_bytes).map_err(|err| CacheError::Io {
             path: wasm_path.clone(),
+            source: err,
+        })?;
+        let meta = encode_meta(schema_hash);
+        fs::write(&meta_path, &meta).map_err(|err| CacheError::Io {
+            path: meta_path,
+            source: err,
+        })?;
+        Ok(())
+    }
+
+    /// Persist `wasm_bytes` + `schema_hash` + canonical `(main, return)`
+    /// schemas under `source_hash`. Mirrors [`Self::store`] but
+    /// additionally writes a `.schemas` JSON sidecar so
+    /// `WasmAotEvaluator::from_source_with_cache` can rebuild the
+    /// evaluator on a hit without re-running the analyzer / lowering
+    /// pipeline.
+    ///
+    /// Write order: wasm → schemas → meta. A torn write that drops
+    /// the meta sidecar surfaces as a miss (per `load`'s rules), so
+    /// the cache transparently re-stores rather than handing back a
+    /// half-written entry.
+    pub fn store_with_schemas(
+        &self,
+        source_hash: [u8; 32],
+        wasm_bytes: &[u8],
+        schema_hash: [u8; 32],
+        schemas: &CachedSchemas,
+    ) -> Result<(), CacheError> {
+        let (wasm_path, meta_path) = self.paths(&source_hash);
+        let schemas_path = self.schemas_path(&source_hash);
+        fs::write(&wasm_path, wasm_bytes).map_err(|err| CacheError::Io {
+            path: wasm_path.clone(),
+            source: err,
+        })?;
+        let schemas_json = serde_json::to_vec(schemas)
+            .map_err(|e| CacheError::SchemaSerde(e.to_string()))?;
+        fs::write(&schemas_path, &schemas_json).map_err(|err| CacheError::Io {
+            path: schemas_path,
             source: err,
         })?;
         let meta = encode_meta(schema_hash);
@@ -256,6 +358,16 @@ impl AotCache {
         let mut meta = self.dir.clone();
         meta.push(format!("{hex}.meta"));
         (wasm, meta)
+    }
+
+    /// Compute the schemas sidecar path for a given source hash. The
+    /// sidecar is optional — only producers that need to rehydrate the
+    /// canonical schemas at load time write it.
+    fn schemas_path(&self, source_hash: &[u8; 32]) -> PathBuf {
+        let hex = hex_encode(source_hash);
+        let mut p = self.dir.clone();
+        p.push(format!("{hex}.schemas"));
+        p
     }
 }
 
@@ -343,6 +455,51 @@ mod tests {
             .expect("load hit");
         assert_eq!(loaded.wasm_bytes, wasm);
         assert_eq!(loaded.schema_hash, schema_hash);
+        // Plain `store` does not write the schemas sidecar.
+        assert!(loaded.schemas.is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cache_roundtrip_with_schemas() {
+        // store_with_schemas additionally persists canonical (main,
+        // return) schemas so `load` returns Some(CachedSchemas).
+        use relon_eval_api::schema_canonical::{Field, Schema, TypeRepr};
+        let dir = temp_cache_dir("roundtrip-schemas");
+        let cache = AotCache::open(&dir).expect("open");
+        let source_hash = AotCache::source_hash("schema source");
+        let wasm = vec![1u8, 2, 3, 4];
+        let schema_hash = [5u8; 32];
+        let schemas = CachedSchemas {
+            main: Schema {
+                name: "MainParams".into(),
+                generics: vec![],
+                fields: vec![Field {
+                    name: "x".into(),
+                    ty: TypeRepr::Int,
+                    default: None,
+                }],
+            },
+            return_: Schema {
+                name: "MainReturn".into(),
+                generics: vec![],
+                fields: vec![Field {
+                    name: "value".into(),
+                    ty: TypeRepr::Int,
+                    default: None,
+                }],
+            },
+        };
+        cache
+            .store_with_schemas(source_hash, &wasm, schema_hash, &schemas)
+            .expect("store_with_schemas");
+        let loaded = cache
+            .load(source_hash)
+            .expect("load Ok")
+            .expect("load hit");
+        assert_eq!(loaded.wasm_bytes, wasm);
+        assert_eq!(loaded.schema_hash, schema_hash);
+        assert_eq!(loaded.schemas.expect("schemas survived"), schemas);
         let _ = fs::remove_dir_all(&dir);
     }
 
