@@ -138,7 +138,11 @@ pub enum SrcMapError {
     /// Encoded payloads are validated against this on the way in so the
     /// in-memory `Vec<Entry>` always has monotonically increasing pcs.
     #[error("pc delta at entry {index} overflows u32 (prev_pc={prev_pc}, delta={delta})")]
-    PcOverflow { index: usize, prev_pc: u32, delta: u32 },
+    PcOverflow {
+        index: usize,
+        prev_pc: u32,
+        delta: u32,
+    },
     /// `file_idx` on an entry exceeds the declared `files.len()`. This
     /// is decoder-side because we want to fail fast at parse time
     /// rather than at lookup time.
@@ -200,12 +204,10 @@ pub fn decode_varu32(bytes: &[u8], cursor: &mut usize) -> Result<u32, SrcMapErro
                 reason: "value exceeds u32 range",
             });
         }
-        result |= low7
-            .checked_shl(shift)
-            .ok_or(SrcMapError::InvalidVarint {
-                at,
-                reason: "shift overflow",
-            })?;
+        result |= low7.checked_shl(shift).ok_or(SrcMapError::InvalidVarint {
+            at,
+            reason: "shift overflow",
+        })?;
         if byte & 0x80 == 0 {
             return Ok(result);
         }
@@ -233,7 +235,8 @@ pub fn encode_to_bytes(srcmap: &SrcMap) -> Vec<u8> {
     // Rough sizing: header (6 bytes) + file table + entries. Each
     // entry is ~5 fields * ~2 bytes average = 10 bytes. Pre-allocate
     // so most realistic modules don't re-grow the vec.
-    let cap = 6 + srcmap.files.iter().map(|s| s.len() + 2).sum::<usize>() + srcmap.entries.len() * 12;
+    let cap =
+        6 + srcmap.files.iter().map(|s| s.len() + 2).sum::<usize>() + srcmap.entries.len() * 12;
     let mut out = Vec::with_capacity(cap);
 
     // Header.
@@ -343,13 +346,11 @@ pub fn decode_from_bytes(bytes: &[u8]) -> Result<SrcMap, SrcMapError> {
     let mut prev_pc: u32 = 0;
     for index in 0..entry_count as usize {
         let delta = decode_varu32(bytes, &mut cursor)?;
-        let pc = prev_pc
-            .checked_add(delta)
-            .ok_or(SrcMapError::PcOverflow {
-                index,
-                prev_pc,
-                delta,
-            })?;
+        let pc = prev_pc.checked_add(delta).ok_or(SrcMapError::PcOverflow {
+            index,
+            prev_pc,
+            delta,
+        })?;
         let file_idx = decode_varu32(bytes, &mut cursor)?;
         let line = decode_varu32(bytes, &mut cursor)?;
         let col = decode_varu32(bytes, &mut cursor)?;
@@ -489,7 +490,7 @@ mod tests {
     fn header_too_short() {
         let err = decode_from_bytes(&[]).expect_err("must reject");
         assert!(matches!(err, SrcMapError::Truncated { .. }));
-        let err = decode_from_bytes(&[b'R', b'L', b'N']).expect_err("must reject");
+        let err = decode_from_bytes(b"RLN").expect_err("must reject");
         assert!(matches!(err, SrcMapError::Truncated { .. }));
     }
 
@@ -581,6 +582,10 @@ mod tests {
         assert_eq!(srcmap.lookup(10).map(|e| e.line), Some(1));
         assert_eq!(srcmap.lookup(15).map(|e| e.line), Some(1));
         assert_eq!(srcmap.lookup(20).map(|e| e.line), Some(2));
-        assert_eq!(srcmap.lookup(100).map(|e| e.line), Some(3), "past last entry sticks to last");
+        assert_eq!(
+            srcmap.lookup(100).map(|e| e.line),
+            Some(3),
+            "past last entry sticks to last"
+        );
     }
 }

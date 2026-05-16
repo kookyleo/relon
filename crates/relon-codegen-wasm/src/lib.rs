@@ -76,7 +76,8 @@ pub fn compile_module(ir: &IrModule) -> Result<Vec<u8>, CodegenError> {
     // wasmparser will read out of the function body (final `End`
     // included). We keep `Func::range` separately so the prologue
     // (locals header) maps to the function declaration.
-    let mut per_func_ranges: Vec<(TokenRange, Vec<TokenRange>)> = Vec::with_capacity(ir.funcs.len());
+    let mut per_func_ranges: Vec<(TokenRange, Vec<TokenRange>)> =
+        Vec::with_capacity(ir.funcs.len());
 
     for (func_index, func) in ir.funcs.iter().enumerate() {
         let params_vt: Vec<ValType> = func.params.iter().map(ir_to_val_type).collect();
@@ -145,8 +146,8 @@ fn build_srcmap(
     let mut func_iter = per_func.iter();
 
     for payload in wasmparser::Parser::new(0).parse_all(module_bytes) {
-        let payload = payload
-            .map_err(|e| CodegenError::SrcMapEncode(format!("wasmparser error: {e}")))?;
+        let payload =
+            payload.map_err(|e| CodegenError::SrcMapEncode(format!("wasmparser error: {e}")))?;
         if let wasmparser::Payload::CodeSectionEntry(body) = payload {
             let (func_range, op_ranges) = func_iter.next().ok_or_else(|| {
                 CodegenError::SrcMapEncode("more wasm function bodies than IR funcs".into())
@@ -160,13 +161,13 @@ fn build_srcmap(
             let body_start = body.range().start as u32;
             entries.push(token_range_to_entry(body_start, *func_range));
 
-            let ops_reader = body.get_operators_reader().map_err(|e| {
-                CodegenError::SrcMapEncode(format!("operators reader: {e}"))
-            })?;
+            let ops_reader = body
+                .get_operators_reader()
+                .map_err(|e| CodegenError::SrcMapEncode(format!("operators reader: {e}")))?;
             let mut op_idx = 0usize;
             for item in ops_reader.into_iter_with_offsets() {
-                let (_op, offset) = item
-                    .map_err(|e| CodegenError::SrcMapEncode(format!("op decode: {e}")))?;
+                let (_op, offset) =
+                    item.map_err(|e| CodegenError::SrcMapEncode(format!("op decode: {e}")))?;
                 let range = op_ranges.get(op_idx).copied().ok_or_else(|| {
                     CodegenError::SrcMapEncode(format!(
                         "wasm body has more operators ({}) than IR op-ranges ({}) recorded",
@@ -244,9 +245,7 @@ fn token_range_to_entry(pc: u32, range: TokenRange) -> SrcMapEntry {
 /// including the trailing `End`. The srcmap pass zips this vector
 /// against `wasmparser`'s post-finish offset stream to build the
 /// per-instruction `pc → range` table.
-fn emit_function_body(
-    func: &relon_ir::Func,
-) -> Result<(Function, Vec<TokenRange>), CodegenError> {
+fn emit_function_body(func: &relon_ir::Func) -> Result<(Function, Vec<TokenRange>), CodegenError> {
     // No locals beyond the parameters — v1.beta has no let / where /
     // closure body, so the wasm `locals` vector stays empty.
     let mut f = Function::new(Vec::<(u32, ValType)>::new());
