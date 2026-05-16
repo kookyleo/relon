@@ -25,3 +25,13 @@ thiserror = { workspace = true }
 # `wasmtime` versions below so the binary they exchange shares the
 # same spec proposals.
 wasm-encoder = "0.249"
+
+[dev-dependencies]
+# Spec-compliant validator used by the smoke test to confirm the
+# emitted bytes parse as a valid wasm module before we even try to
+# instantiate them.
+wasmparser = "0.249"
+# Reference engine used to instantiate the hardcoded module and
+# round-trip `run_main`. Default features pull in cranelift +
+# wasmtime-runtime — long first build, then cached.
+wasmtime = "44"
