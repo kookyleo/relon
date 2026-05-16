@@ -10,6 +10,8 @@ use relon_eval_api::schema_lower::SchemaLowerError;
 use relon_parser::{Operator, TokenRange};
 use thiserror::Error;
 
+use crate::ir::IrType;
+
 /// Reasons lowering can fail. The IR rejects, on principle, anything
 /// outside the Phase 1.beta surface (Int / Float literals, the
 /// arithmetic operators, and `#main` parameter references); the
@@ -93,4 +95,30 @@ pub enum LoweringError {
     /// `SchemaLower`.
     #[error(transparent)]
     Layout(#[from] LayoutError),
+    /// Phase 2.c: the `cond` slot of an `if` (ternary) expression
+    /// lowered to a non-`Bool` IR type. The codegen path can only
+    /// branch on a 0/1 byte; numeric / pointer truthiness is not part
+    /// of the surface, so the front end is responsible for inserting
+    /// an explicit comparison first.
+    #[error("if condition must be Bool, got `{got:?}`")]
+    IfConditionNotBool {
+        /// The IR type the condition produced.
+        got: IrType,
+        /// Source range of the `if` (ternary) expression.
+        range: TokenRange,
+    },
+    /// Phase 2.c: the `then` and `else` arms of an `if` (ternary)
+    /// expression lowered to incompatible IR types. The wasm `if`
+    /// block's result-type slot demands both branches push the same
+    /// value type; lowering refuses the body rather than synthesising
+    /// a silent coercion.
+    #[error("if branches disagree on type: then={then_ty:?}, else={else_ty:?}")]
+    IfBranchTypeMismatch {
+        /// IR type the `then` branch produced.
+        then_ty: IrType,
+        /// IR type the `else` branch produced.
+        else_ty: IrType,
+        /// Source range of the `if` (ternary) expression.
+        range: TokenRange,
+    },
 }

@@ -24,11 +24,13 @@
 use ordered_float::OrderedFloat;
 use relon_parser::TokenRange;
 
-/// Scalar value type in v1.beta / Phase 2.b. Mirrors the wasm
+/// Scalar value type in v1.beta / Phase 2.c. Mirrors the wasm
 /// value-type subset the codegen pass emits — `Int` lowers to `I64`,
 /// `Float` lowers to `F64`, `Bool` and `Null` lower to `I32` (a single
-/// byte on the wire but loaded into an i32 wasm slot). Later phases
-/// (composite layouts, host-pointer values) extend this enum.
+/// byte on the wire but loaded into an i32 wasm slot). Phase 2.c adds
+/// the variable-length leaves `String` / `ListInt` as i32 pointers on
+/// the wasm operand stack (the pointer points at the tail-area record
+/// `[len: u32 LE][bytes...]`). Later phases extend this enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum IrType {
     /// 32-bit signed integer. Used for wasm-level handshake slots
@@ -46,6 +48,31 @@ pub enum IrType {
     /// Unit / `Null` placeholder. 1 byte on the wire (always `0`); the
     /// codegen path emits `i32.const 0` rather than reading memory.
     Null,
+    /// Pointer to a tail-area `[len: u32 LE][utf8 bytes]` record. The
+    /// pointer is a wasm `i32` (relative to the linear memory base);
+    /// the IR keeps a distinct tag so diagnostics + srcmap can tell a
+    /// raw `i32` slot apart from a String pointer.
+    String,
+    /// Pointer to a tail-area `[len: u32 LE][i64 elements]` record.
+    /// Same wasm-side representation as `String` (an `i32` pointer),
+    /// but tagged separately at IR-level so we can later distinguish
+    /// `List<Int>` operations from raw byte pointers.
+    ListInt,
+}
+
+impl IrType {
+    /// Wasm operand-stack representation. `Int`/`Float` keep their
+    /// `i64`/`f64` shape; `Bool`/`Null`/`String`/`ListInt` all occupy
+    /// an `i32` slot (a 0/1 byte, a 0 tag, or a pointer). Used by the
+    /// codegen vstack to compare across-branch frame types in `If`.
+    pub fn wasm_slot(self) -> IrType {
+        match self {
+            IrType::I64 | IrType::F64 => self,
+            IrType::I32 | IrType::Bool | IrType::Null | IrType::String | IrType::ListInt => {
+                IrType::I32
+            }
+        }
+    }
 }
 
 /// One lowered module — a flat list of functions plus an optional
@@ -165,6 +192,60 @@ pub enum Op {
     /// lowering — wasm has no `f64.rem`, so `LoweringError::UnsupportedOperator`
     /// fires before this variant is even constructed for floats.
     Mod(IrType),
+    /// Pop two operands of the tagged type, push the boolean result.
+    /// Stack: `[T, T] -> [Bool]`. Lowers to `i64.eq` / `f64.eq` /
+    /// `i32.eq` depending on `T`'s wasm slot. `Null == Null` always
+    /// emits `i32.const 1` (no operand consumed from memory).
+    Eq(IrType),
+    /// Pop two operands of the tagged type, push the negated boolean
+    /// result. Stack: `[T, T] -> [Bool]`.
+    Ne(IrType),
+    /// Pop two operands, push `lhs < rhs`. Stack: `[T, T] -> [Bool]`.
+    /// Signed comparison for `I64`. Rejected at codegen for `Bool`
+    /// / `Null` / `String` / `ListInt` — those types have no defined
+    /// ordering relation at the wasm layer.
+    Lt(IrType),
+    /// Pop two operands, push `lhs <= rhs`. See [`Op::Lt`] for the
+    /// type constraints; ordering rules mirror `Lt`.
+    Le(IrType),
+    /// Pop two operands, push `lhs > rhs`.
+    Gt(IrType),
+    /// Pop two operands, push `lhs >= rhs`.
+    Ge(IrType),
+    /// Conditional. Stack effect: `[Bool] -> [result_ty]`.
+    ///
+    /// Codegen emits `if (result <ty>) <then_body> else <else_body>
+    /// end`. The `then_body` and `else_body` each leave one value of
+    /// `result_ty` on the operand stack. Frame validation pairs the
+    /// pop of the condition with the entry depth so a body that
+    /// inadvertently grows the stack mid-branch surfaces at emit
+    /// rather than producing an invalid wasm module.
+    If {
+        /// Type both branches push at the end. Codegen translates to
+        /// `BlockType::Result(<valtype>)`.
+        result_ty: IrType,
+        /// Body executed when the condition is non-zero.
+        then_body: Vec<TaggedOp>,
+        /// Body executed when the condition is zero.
+        else_body: Vec<TaggedOp>,
+    },
+    /// Load a `[len: u32 LE][utf8 bytes]` pointer from the input
+    /// buffer at `offset` bytes. Stack: `[] -> [String]`. Codegen
+    /// emits `local.get $in_ptr; i32.load offset=N` — the pointer
+    /// value loaded is itself a wasm-linear-memory address (the host
+    /// writes the pointer when building the in_buf).
+    LoadStringPtr {
+        /// Byte offset of the pointer slot inside the input buffer.
+        offset: u32,
+    },
+    /// Load a `[len: u32 LE][i64 elements]` pointer from the input
+    /// buffer at `offset` bytes. Stack: `[] -> [ListInt]`. Same wasm
+    /// emission shape as [`Op::LoadStringPtr`]; the distinct IR tag
+    /// lets later phases dispatch on element type.
+    LoadListIntPtr {
+        /// Byte offset of the pointer slot inside the input buffer.
+        offset: u32,
+    },
     /// Pop the top value and end the function (wasm `end` does the
     /// implicit return). Must be the last op in `Func::body`.
     Return,
