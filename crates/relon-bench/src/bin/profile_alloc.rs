@@ -75,10 +75,7 @@ fn main() {
 
         match selection {
             "simple" => {
-                println!(
-                    "simple workload x{}: {}",
-                    SIMPLE_ITERATIONS, SIMPLE_SOURCE
-                );
+                println!("simple workload x{}: {}", SIMPLE_ITERATIONS, SIMPLE_SOURCE);
                 run_workload("simple", SIMPLE_SOURCE, SIMPLE_ITERATIONS);
             }
             "comprehension" => {
@@ -94,10 +91,7 @@ fn main() {
                 );
             }
             _ => {
-                println!(
-                    "simple workload x{}: {}",
-                    SIMPLE_ITERATIONS, SIMPLE_SOURCE
-                );
+                println!("simple workload x{}: {}", SIMPLE_ITERATIONS, SIMPLE_SOURCE);
                 println!(
                     "comprehension workload x{}: {}",
                     COMPREHENSION_ITERATIONS,
@@ -136,5 +130,8 @@ fn run_workload(label: &str, source: &str, iterations: usize) {
             .eval(&ast, &Arc::new(Scope::default()))
             .expect("eval failed");
     }
-    println!("  workload `{}` completed: {} iterations", label, iterations);
+    println!(
+        "  workload `{}` completed: {} iterations",
+        label, iterations
+    );
 }

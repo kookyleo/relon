@@ -413,7 +413,10 @@ impl Evaluator {
             current_dir: base.current_dir.clone(),
             cache_namespace: base.cache_namespace.clone(),
             root_ref: base.root_ref.clone(),
-            list_context: Some(Arc::new(ListContext::fixed(index, context.elements.clone()))),
+            list_context: Some(Arc::new(ListContext::fixed(
+                index,
+                context.elements.clone(),
+            ))),
             thunks: Mutex::new(base.thunks.lock().unwrap().clone()),
         })
     }
