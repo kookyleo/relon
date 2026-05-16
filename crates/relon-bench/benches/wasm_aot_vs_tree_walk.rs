@@ -57,7 +57,7 @@ use std::time::Duration;
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 
-use relon_codegen_wasm::WasmAotEvaluator;
+use relon_codegen_wasm::{AotCache, WasmAotEvaluator};
 use relon_eval_api::Evaluator;
 use relon_evaluator::{Context, Scope, StdModuleResolver, TreeWalkEvaluator, Value};
 
@@ -206,6 +206,59 @@ fn bench_cold_start(c: &mut Criterion) {
 }
 
 // ---------------------------------------------------------------------------
+// Cold start with disk cache: wasm-AOT only — re-build from cache per iter.
+// ---------------------------------------------------------------------------
+
+fn bench_cold_start_cached(c: &mut Criterion) {
+    let mut group = c.benchmark_group("wasm_aot_cold_start_cached");
+    // Same measurement budget as the bare cold-start group: we still
+    // pay `wasmtime::Module::new` (cranelift JIT) on every iter, just
+    // skip the parse / analyze / lower / codegen steps via the cache.
+    // The expected reduction is the codegen pipeline cost; target
+    // landing zone is in the 1-1.5 ms range vs the ~2.2 ms uncached
+    // baseline.
+    group.sample_size(50);
+    group.measurement_time(Duration::from_secs(8));
+
+    // Phase 9.b-3 cache rebuild path: each scenario gets its own temp
+    // cache directory (so reruns of the bench start fresh). Prime the
+    // cache once outside the timed region so the per-iter measurement
+    // is a pure hit-path workload.
+    let temp_root = std::env::temp_dir().join(format!(
+        "relon-bench-aot-cache-{pid}-{nanos}",
+        pid = std::process::id(),
+        nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&temp_root).expect("create bench cache root");
+
+    for sc in SCENARIOS {
+        let dir = temp_root.join(sc.name);
+        let cache = AotCache::open(&dir).expect("open bench cache");
+        // Prime: first call populates the cache so every measured iter
+        // hits the fast path.
+        let _primed =
+            WasmAotEvaluator::from_source_with_cache(sc.wasm_source, &cache).expect("prime cache");
+        group.bench_function(BenchmarkId::new("scenario", sc.name), |b| {
+            b.iter_with_large_drop(|| {
+                WasmAotEvaluator::from_source_with_cache(
+                    black_box(sc.wasm_source),
+                    black_box(&cache),
+                )
+                .expect("wasm-aot from_source_with_cache")
+            });
+        });
+    }
+
+    group.finish();
+    // Best-effort cleanup. Failures are silent because criterion has
+    // already finished reporting and the cache lives in /tmp.
+    let _ = std::fs::remove_dir_all(&temp_root);
+}
+
+// ---------------------------------------------------------------------------
 // Warm invoke: wasm-AOT only — reuse compiled evaluator across iters.
 // ---------------------------------------------------------------------------
 
@@ -288,6 +341,7 @@ fn bench_tree_walk_warm(c: &mut Criterion) {
 criterion_group!(
     benches,
     bench_cold_start,
+    bench_cold_start_cached,
     bench_warm_invoke,
     bench_tree_walk_total,
     bench_tree_walk_warm,
