@@ -28,6 +28,7 @@ pub mod decorator;
 pub mod error;
 pub mod module;
 pub mod native_fn;
+pub mod schema_canonical;
 pub mod scope;
 pub mod value;
 

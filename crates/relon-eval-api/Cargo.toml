@@ -17,5 +17,10 @@ ordered-float.workspace = true
 # `Value::Dict` payloads (see `value.rs` for the design rationale).
 serde = { workspace = true, features = ["derive", "rc"] }
 serde_json = { workspace = true }
+# Used by `schema_canonical` to compute a deterministic 32-byte digest of
+# every `#main` schema. Host and wasm codegen both call into this module
+# so they agree on the schema hash carried in the `relon.abi` custom
+# section.
+sha2 = { workspace = true }
 thiserror = { workspace = true }
 miette = { workspace = true, features = ["derive"] }
