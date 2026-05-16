@@ -35,3 +35,9 @@ docs/public/wasm/
 
 # Working notes (analysis drafts, scratch files)
 tmp/
+
+# perf record artifacts from cargo flamegraph (see scripts/perf-flamegraph.sh).
+# SVG outputs live under target/flamegraph/ which is already covered by
+# the `target` rule above.
+perf.data
+perf.data.old
