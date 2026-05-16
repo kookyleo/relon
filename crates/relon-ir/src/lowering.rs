@@ -472,6 +472,7 @@ fn lower_workspace_single_with_module(
 
     Ok(LoweredEntry {
         module: Module {
+            imports: Vec::new(),
             funcs,
             entry_func_index: Some(entry_ir_idx),
         },
