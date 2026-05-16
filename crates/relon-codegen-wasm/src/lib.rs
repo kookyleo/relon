@@ -266,6 +266,11 @@ pub fn compile_module(
         main_schema_hash: schema_hash(main_schema),
         return_schema_hash: schema_hash(return_schema),
         flags: 0,
+        // Phase 6 placeholder: lowering doesn't yet feed `#native`
+        // declarations through `compile_module`, so the bitset stays
+        // zero. The dedicated host-fn smoke tests build the
+        // `HostFnTable` by hand and call `compile_module_with_host_fns`.
+        required_capabilities: 0,
     };
     let abi_bytes = abi::encode(&abi);
     module.section(&CustomSection {
