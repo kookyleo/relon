@@ -293,11 +293,27 @@ fn main() -> miette::Result<()> {
                         // workspace tree: the codegen path wants the
                         // single-file analyzer output, and folding
                         // workspace mode into v1 is a Phase 9 goal.
-                        let aot = WasmAotEvaluator::from_source(&content).map_err(|e| {
-                            miette::miette!("wasm-aot backend setup: {e}").with_source_code(
-                                NamedSource::new(file.to_string_lossy(), content.clone()),
-                            )
-                        })?;
+                        //
+                        // `--trust` flips the wasm side's
+                        // `relon_caps_avail` bitmap from the
+                        // zero-trust default to `Capabilities::
+                        // all_granted` so guarded `#native` calls
+                        // pass the codegen-emitted `check_cap`
+                        // prologue. Without it the prologue traps
+                        // with `WasmCapabilityDenied { cap_bit }`,
+                        // matching the tree-walker's sandbox shape.
+                        let caps = if trust {
+                            relon_eval_api::Capabilities::all_granted()
+                        } else {
+                            relon_eval_api::Capabilities::default()
+                        };
+                        let aot = WasmAotEvaluator::from_source(&content)
+                            .map_err(|e| {
+                                miette::miette!("wasm-aot backend setup: {e}").with_source_code(
+                                    NamedSource::new(file.to_string_lossy(), content.clone()),
+                                )
+                            })?
+                            .with_capabilities(caps);
                         EvaluatorTrait::run_main(&aot, args_map).map_err(|e| {
                             Report::new(e).with_source_code(NamedSource::new(
                                 file.to_string_lossy(),
