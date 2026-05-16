@@ -33,6 +33,59 @@ use relon_parser::{Expr, Node, Operator, TokenKey, TokenRange, TypeNode};
 use crate::error::LoweringError;
 use crate::ir::{Func, IrType, Module, Op, TaggedOp};
 
+/// Per-function lowering state shared across the recursive walk.
+///
+/// Phase 3.a introduces user-let bindings (`where { name: value }`)
+/// and inline const literals (`true` / `"hello"` / `[1, 2, 3]`); each
+/// of those needs a per-function counter the recursive walker hands
+/// back to codegen. The context bundles them together with the
+/// virtual operand stack so the `lower_expr` family of functions keep
+/// a single tail-call shape.
+#[derive(Debug)]
+struct LowerCtx<'a> {
+    /// `#main` parameter bindings (offset + IR type) used to resolve
+    /// bare identifier references.
+    params: &'a [LocalBinding],
+    /// Stack of in-scope let bindings. Pushed when entering a
+    /// `where { ... }` block and popped after the inner expression
+    /// lowers — gives us lexical scoping for free.
+    lets: Vec<LetBinding>,
+    /// Next per-function let-local index. Stable across `where`
+    /// blocks so a shadowed name still picks up a fresh wasm local.
+    next_let_idx: u32,
+    /// Next per-module constant index for [`Op::ConstString`].
+    next_string_idx: u32,
+    /// Next per-module constant index for [`Op::ConstListInt`].
+    next_list_int_idx: u32,
+    /// Output op stream. Appended to in postfix / stack order.
+    out: Vec<TaggedOp>,
+    /// Virtual operand stack tracking the IR type each pushed value
+    /// has. Lets us validate arithmetic / store tags without a
+    /// separate analysis pass.
+    tstack: Vec<IrType>,
+}
+
+#[derive(Debug, Clone)]
+struct LetBinding {
+    name: String,
+    idx: u32,
+    ty: IrType,
+}
+
+impl<'a> LowerCtx<'a> {
+    fn new(params: &'a [LocalBinding]) -> Self {
+        Self {
+            params,
+            lets: Vec::new(),
+            next_let_idx: 0,
+            next_string_idx: 0,
+            next_list_int_idx: 0,
+            out: Vec::new(),
+            tstack: Vec::new(),
+        }
+    }
+}
+
 /// Wasm-side handshake parameter index — `in_ptr` is local 0.
 pub const WASM_LOCAL_IN_PTR: u32 = 0;
 /// Wasm-side handshake parameter index — `in_len` is local 1.
@@ -129,11 +182,11 @@ fn lower_workspace_single_with_module(
     // without a second pass over the layout pass.
     let locals = build_local_index(sig, &main_schema, &main_layout)?;
 
-    // Virtual stack mirroring the wasm value stack at lowering time.
-    // Each entry records the IR type that op produced.
-    let mut body = Vec::new();
-    let mut tstack: Vec<IrType> = Vec::new();
-    lower_expr(&root.expr, root.range, &locals, &mut body, &mut tstack)?;
+    // Walk the body into a single op stream + virtual stack via the
+    // per-function lowering context. Phase 3.a's let-bindings + const
+    // literals piggy-back on `LowerCtx` for their counters.
+    let mut ctx = LowerCtx::new(&locals);
+    lower_expr(&root.expr, root.range, &mut ctx)?;
 
     // Trailing StoreField for the single root return value. Pops the
     // top stack entry — codegen will translate this to `local.get
@@ -144,22 +197,23 @@ fn lower_workspace_single_with_module(
         .map(|f| f.offset as u32)
         .unwrap_or(0);
     let ret_ir_ty = type_repr_to_ir_type(&return_schema.fields[0].ty)?;
-    body.push(TaggedOp {
+    ctx.out.push(TaggedOp {
         op: Op::StoreField {
             offset: ret_offset,
             ty: ret_ir_ty,
         },
         range: sig.range,
     });
-    tstack.pop();
+    ctx.tstack.pop();
 
     // `Op::Return` keeps its v1.beta meaning: end of function. The
     // codegen pass synthesises the actual wasm `return` (it pushes
     // `bytes_written` and emits the implicit `end`).
-    body.push(TaggedOp {
+    ctx.out.push(TaggedOp {
         op: Op::Return,
         range: sig.range,
     });
+    let body = ctx.out;
 
     let func = Func {
         name: "run_main".to_string(),
@@ -212,11 +266,11 @@ fn build_main_params_schema(sig: &MainSignature) -> Result<Schema, LoweringError
 /// Synthesise the [`MAIN_RETURN_SCHEMA_NAME`] canonical schema with a
 /// single `value` field carrying the declared return type.
 ///
-/// Phase 2.c keeps the return surface narrow — `String` / `List<Int>`
-/// returns require the wasm side to allocate tail-area bytes in the
-/// `out_buf`, which the current codegen doesn't model. They're
-/// rejected here so the diagnostic surfaces at the lowering phase
-/// rather than as a confusing codegen-side store-type error.
+/// Phase 3.a widens the return surface to `String` / `List<Int>`
+/// alongside the v1 scalars. The codegen pass copies the tail-area
+/// record bytes into `out_buf` at a `$tail_cursor` past the fixed
+/// area; the fixed-area pointer slot stores a buffer-relative
+/// offset so the host's `BufferReader` can decode it uniformly.
 fn build_main_return_schema(sig: &MainSignature) -> Result<Schema, LoweringError> {
     let rt = sig
         .return_type
@@ -229,18 +283,6 @@ fn build_main_return_schema(sig: &MainSignature) -> Result<Schema, LoweringError
         type_name: type_head_for_display(rt),
         range: rt.range,
     })?;
-    // Belt-and-braces: refuse a pointer-indirect return type up
-    // front. The Phase 2.c `StoreField` path only knows how to
-    // serialise inline scalars, so a String / List<Int> return
-    // would otherwise fail later with `UnsupportedStoreFieldType`
-    // — surfacing as `UnsupportedTypeInMain` gives the caller a
-    // more actionable message.
-    if matches!(ty, TypeRepr::String | TypeRepr::List { .. }) {
-        return Err(LoweringError::UnsupportedTypeInMain {
-            type_name: type_head_for_display(rt),
-            range: rt.range,
-        });
-    }
     Ok(Schema {
         name: MAIN_RETURN_SCHEMA_NAME.to_string(),
         generics: vec![],
@@ -364,87 +406,150 @@ fn type_head_for_display(t: &TypeNode) -> String {
     s
 }
 
-/// Recursive expression lowering. Appends ops to `out` in postfix /
+/// Recursive expression lowering. Appends ops to `ctx.out` in postfix /
 /// stack order.
-fn lower_expr(
-    expr: &Expr,
-    range: TokenRange,
-    locals: &[LocalBinding],
-    out: &mut Vec<TaggedOp>,
-    tstack: &mut Vec<IrType>,
-) -> Result<(), LoweringError> {
+fn lower_expr(expr: &Expr, range: TokenRange, ctx: &mut LowerCtx<'_>) -> Result<(), LoweringError> {
     match expr {
         Expr::Bool(b) => {
-            // Bool literals lower to `i32.const 0/1` — IR-side we
-            // surface them as `ConstI64(0|1)` plus a Bool tag would be
-            // overkill; we instead use ConstI64 with a Bool wrapping
-            // by going through ConstI64 + i32 reinterpretation. The
-            // simplest stable representation is `Op::ConstI64(0|1)`
-            // promoted to `Bool` via an inserted equality, but that
-            // doubles op count. Instead use a dedicated Bool literal
-            // path: `Op::ConstI64(0|1)` and immediately mark the
-            // virtual-stack type as `Bool` — codegen materialises it
-            // as `i64.const`, which then never participates in
-            // arithmetic (we'd have rejected it). To avoid an i64
-            // appearing on the wasm stack where an i32 is expected,
-            // we route Bool through a dedicated low-cost shape: an
-            // `If`-less constant. Since Phase 2.c only ever uses
-            // Bool literals as a comparison operand or as a body
-            // arm of an `if`, this would be invalid wasm — so we
-            // instead emit `Op::ConstI64(0|1)` but require the
-            // surrounding context to lift it. Lift via the `If`
-            // result-type — no extra plumbing needed.
-            //
-            // Simpler: emit an `i32.const` by reusing the existing
-            // `Op::ConstI64` constructor would push the wrong wasm
-            // type. Lowering bools as `if true { ... }` style is
-            // out of scope until we add `Op::ConstI32`. For now,
-            // reject bare Bool literal usage outside as an `if`
-            // branch — the bodies of `if` carry the Bool literal
-            // through as a one-op leaf, so the codegen lifts via
-            // the If's BlockType::Result.
-            //
-            // ...but we need the simpler "Bool literal anywhere"
-            // path to support `if true { 1 } else { 0 }` style
-            // expressions. Lower as `i64.const 0/1` and tag as
-            // `IrType::I64`; the surrounding context will emit a
-            // comparison if it needs a Bool. Since this phase's
-            // only Bool-literal consumer is the if branches whose
-            // result type is the **non-Bool** value, we don't
-            // actually hit this issue for the smoke tests. Defer
-            // proper Bool-literal handling — currently rejected.
-            let _ = b;
-            Err(LoweringError::UnsupportedExpr {
-                kind: "Bool".to_string(),
+            ctx.out.push(TaggedOp {
+                op: Op::ConstBool(*b),
                 range,
-            })
+            });
+            ctx.tstack.push(IrType::Bool);
+            Ok(())
         }
         Expr::Int(i) => {
-            out.push(TaggedOp {
+            ctx.out.push(TaggedOp {
                 op: Op::ConstI64(*i),
                 range,
             });
-            tstack.push(IrType::I64);
+            ctx.tstack.push(IrType::I64);
             Ok(())
         }
         Expr::Float(f) => {
-            out.push(TaggedOp {
+            ctx.out.push(TaggedOp {
                 op: Op::ConstF64(OrderedFloat::from(f.into_inner())),
                 range,
             });
-            tstack.push(IrType::F64);
+            ctx.tstack.push(IrType::F64);
             Ok(())
         }
-        Expr::Variable(path) => lower_variable(path, range, locals, out, tstack),
-        Expr::Binary(op, lhs, rhs) => lower_binary(*op, lhs, rhs, range, locals, out, tstack),
-        Expr::Ternary { cond, then, els } => {
-            lower_ternary(cond, then, els, range, locals, out, tstack)
+        Expr::String(s) => {
+            // Each ConstString gets a fresh module-unique index the
+            // codegen layout pass uses to look up its absolute
+            // memory offset. The bytes ride along on the op so a
+            // future cross-function dedup pass can hash them; for
+            // Phase 3.a we keep it simple and let codegen materialise
+            // every occurrence.
+            let idx = ctx.next_string_idx;
+            ctx.next_string_idx += 1;
+            ctx.out.push(TaggedOp {
+                op: Op::ConstString {
+                    idx,
+                    value: s.clone(),
+                },
+                range,
+            });
+            ctx.tstack.push(IrType::String);
+            Ok(())
         }
+        Expr::List(items) => {
+            // Phase 3.a only opens List<Int> literals — everything
+            // else falls through to the generic "unsupported" branch.
+            // We inspect each element's expression up front; any
+            // non-Int literal rejects the list, so a hand-written
+            // `[1, 2.0, 3]` surfaces as a lowering error rather than
+            // as a confusing type mismatch at codegen.
+            let mut elements: Vec<i64> = Vec::with_capacity(items.len());
+            for node in items {
+                match &*node.expr {
+                    Expr::Int(v) => elements.push(*v),
+                    _ => {
+                        return Err(LoweringError::UnsupportedExpr {
+                            kind: format!("List(non-Int element `{}`)", node.expr.kind()),
+                            range: node.range,
+                        });
+                    }
+                }
+            }
+            let idx = ctx.next_list_int_idx;
+            ctx.next_list_int_idx += 1;
+            ctx.out.push(TaggedOp {
+                op: Op::ConstListInt { idx, elements },
+                range,
+            });
+            ctx.tstack.push(IrType::ListInt);
+            Ok(())
+        }
+        Expr::Variable(path) => lower_variable(path, range, ctx),
+        Expr::Binary(op, lhs, rhs) => lower_binary(*op, lhs, rhs, range, ctx),
+        Expr::Ternary { cond, then, els } => lower_ternary(cond, then, els, range, ctx),
+        Expr::Where { expr, bindings } => lower_where(expr, bindings, range, ctx),
         _ => Err(LoweringError::UnsupportedExpr {
             kind: expr.kind().to_string(),
             range,
         }),
     }
+}
+
+/// Lower a `<expr> where { name: value, ... }` form by emitting one
+/// `LetSet` per binding (in declaration order) and then lowering
+/// `expr` with the names in scope.
+///
+/// Each binding picks up a fresh per-function let-local index;
+/// shadowing is supported (a re-declared name uses a new index, and
+/// the outer binding becomes unreachable inside the inner expression
+/// but stays valid after). We restore the outer scope after the
+/// inner body lowers so the trailing `StoreField` sees a clean
+/// virtual stack.
+fn lower_where(
+    expr: &Node,
+    bindings: &Node,
+    range: TokenRange,
+    ctx: &mut LowerCtx<'_>,
+) -> Result<(), LoweringError> {
+    let pairs = match &*bindings.expr {
+        Expr::Dict(pairs) => pairs,
+        _ => {
+            return Err(LoweringError::UnsupportedExpr {
+                kind: format!("Where(bindings={})", bindings.expr.kind()),
+                range,
+            });
+        }
+    };
+    let saved_lets_len = ctx.lets.len();
+    for (key, value) in pairs {
+        let name = match key {
+            TokenKey::String(s, _, _) => s.clone(),
+            _ => {
+                return Err(LoweringError::UnsupportedExpr {
+                    kind: "Where(non-string-binding-key)".to_string(),
+                    range,
+                });
+            }
+        };
+        lower_expr(&value.expr, value.range, ctx)?;
+        let value_ty = ctx.tstack.pop().ok_or(LoweringError::UnsupportedExpr {
+            kind: "Where(binding-empty-stack)".to_string(),
+            range: value.range,
+        })?;
+        let idx = ctx.next_let_idx;
+        ctx.next_let_idx += 1;
+        ctx.out.push(TaggedOp {
+            op: Op::LetSet { idx, ty: value_ty },
+            range: value.range,
+        });
+        ctx.lets.push(LetBinding {
+            name,
+            idx,
+            ty: value_ty,
+        });
+    }
+    lower_expr(&expr.expr, expr.range, ctx)?;
+    // Pop only the bindings we pushed in this frame — preserves
+    // outer-scope lets for sibling expressions.
+    ctx.lets.truncate(saved_lets_len);
+    Ok(())
 }
 
 /// Lower one binary expression. Splits the arithmetic + comparison
@@ -454,17 +559,17 @@ fn lower_binary(
     lhs: &Node,
     rhs: &Node,
     range: TokenRange,
-    locals: &[LocalBinding],
-    out: &mut Vec<TaggedOp>,
-    tstack: &mut Vec<IrType>,
+    ctx: &mut LowerCtx<'_>,
 ) -> Result<(), LoweringError> {
     if let Some(ir_op_ctor) = arithmetic_op_ctor(op) {
-        lower_expr(&lhs.expr, lhs.range, locals, out, tstack)?;
-        lower_expr(&rhs.expr, rhs.range, locals, out, tstack)?;
-        let rhs_ty = tstack
+        lower_expr(&lhs.expr, lhs.range, ctx)?;
+        lower_expr(&rhs.expr, rhs.range, ctx)?;
+        let rhs_ty = ctx
+            .tstack
             .pop()
             .ok_or(LoweringError::UnsupportedOperator { op, range })?;
-        let lhs_ty = tstack
+        let lhs_ty = ctx
+            .tstack
             .pop()
             .ok_or(LoweringError::UnsupportedOperator { op, range })?;
         if lhs_ty != rhs_ty {
@@ -478,20 +583,22 @@ fn lower_binary(
         if lhs_ty == IrType::F64 && matches!(op, Operator::Mod) {
             return Err(LoweringError::UnsupportedOperator { op, range });
         }
-        out.push(TaggedOp {
+        ctx.out.push(TaggedOp {
             op: ir_op_ctor(lhs_ty),
             range,
         });
-        tstack.push(lhs_ty);
+        ctx.tstack.push(lhs_ty);
         return Ok(());
     }
     if let Some(cmp_ctor) = comparison_op_ctor(op) {
-        lower_expr(&lhs.expr, lhs.range, locals, out, tstack)?;
-        lower_expr(&rhs.expr, rhs.range, locals, out, tstack)?;
-        let rhs_ty = tstack
+        lower_expr(&lhs.expr, lhs.range, ctx)?;
+        lower_expr(&rhs.expr, rhs.range, ctx)?;
+        let rhs_ty = ctx
+            .tstack
             .pop()
             .ok_or(LoweringError::UnsupportedOperator { op, range })?;
-        let lhs_ty = tstack
+        let lhs_ty = ctx
+            .tstack
             .pop()
             .ok_or(LoweringError::UnsupportedOperator { op, range })?;
         if lhs_ty != rhs_ty {
@@ -508,11 +615,11 @@ fn lower_binary(
             (IrType::Null, Operator::Eq | Operator::Ne) => {}
             _ => return Err(LoweringError::UnsupportedOperator { op, range }),
         }
-        out.push(TaggedOp {
+        ctx.out.push(TaggedOp {
             op: cmp_ctor(lhs_ty),
             range,
         });
-        tstack.push(IrType::Bool);
+        ctx.tstack.push(IrType::Bool);
         return Ok(());
     }
     Err(LoweringError::UnsupportedOperator { op, range })
@@ -526,14 +633,12 @@ fn lower_ternary(
     then: &Node,
     els: &Node,
     range: TokenRange,
-    locals: &[LocalBinding],
-    out: &mut Vec<TaggedOp>,
-    tstack: &mut Vec<IrType>,
+    ctx: &mut LowerCtx<'_>,
 ) -> Result<(), LoweringError> {
     // Lower the condition in the outer tstack so a body like
     // `(a > 0) ? ... : ...` accurately reports its Bool result.
-    lower_expr(&cond.expr, cond.range, locals, out, tstack)?;
-    let cond_ty = tstack.pop().ok_or(LoweringError::UnsupportedExpr {
+    lower_expr(&cond.expr, cond.range, ctx)?;
+    let cond_ty = ctx.tstack.pop().ok_or(LoweringError::UnsupportedExpr {
         kind: "Ternary(cond)".to_string(),
         range,
     })?;
@@ -545,34 +650,18 @@ fn lower_ternary(
     }
     // Lower each branch into its own sub-stream + isolated tstack so
     // an inner expression spilling extra values onto the stack is
-    // caught here rather than leaking into the outer body.
-    let mut then_ops: Vec<TaggedOp> = Vec::new();
-    let mut then_stack: Vec<IrType> = Vec::new();
-    lower_expr(
-        &then.expr,
-        then.range,
-        locals,
-        &mut then_ops,
-        &mut then_stack,
-    )?;
-    if then_stack.len() != 1 {
-        return Err(LoweringError::UnsupportedExpr {
-            kind: format!("Ternary(then-stack={})", then_stack.len()),
-            range,
-        });
-    }
-    let then_ty = then_stack[0];
+    // caught here rather than leaking into the outer body. The
+    // branch sub-ctx inherits the outer `lets` scope + counters so
+    // a `let`-bound name remains visible inside the arm and any
+    // const-literal index issued by the arm doesn't collide with
+    // the outer module.
+    let then_ops = lower_branch(then, range, ctx)?;
+    let then_ty = then_ops.1;
+    let then_body = then_ops.0;
 
-    let mut else_ops: Vec<TaggedOp> = Vec::new();
-    let mut else_stack: Vec<IrType> = Vec::new();
-    lower_expr(&els.expr, els.range, locals, &mut else_ops, &mut else_stack)?;
-    if else_stack.len() != 1 {
-        return Err(LoweringError::UnsupportedExpr {
-            kind: format!("Ternary(else-stack={})", else_stack.len()),
-            range,
-        });
-    }
-    let else_ty = else_stack[0];
+    let else_ops = lower_branch(els, range, ctx)?;
+    let else_ty = else_ops.1;
+    let else_body = else_ops.0;
 
     if then_ty != else_ty {
         return Err(LoweringError::IfBranchTypeMismatch {
@@ -582,16 +671,43 @@ fn lower_ternary(
         });
     }
     let result_ty = then_ty;
-    out.push(TaggedOp {
+    ctx.out.push(TaggedOp {
         op: Op::If {
             result_ty,
-            then_body: then_ops,
-            else_body: else_ops,
+            then_body,
+            else_body,
         },
         range,
     });
-    tstack.push(result_ty);
+    ctx.tstack.push(result_ty);
     Ok(())
+}
+
+/// Lower one branch of a ternary into a self-contained op stream +
+/// the type it leaves on top of its private virtual stack.
+///
+/// The branch shares the outer `LowerCtx`'s let-local counter / const
+/// indices so a const literal inside the branch picks up a unique
+/// per-module index. Only the `out` stream is rerouted; the `tstack`
+/// is replaced with a fresh one so the branch can be checked in
+/// isolation.
+fn lower_branch(
+    node: &Node,
+    range: TokenRange,
+    parent: &mut LowerCtx<'_>,
+) -> Result<(Vec<TaggedOp>, IrType), LoweringError> {
+    let saved_out = std::mem::take(&mut parent.out);
+    let saved_stack = std::mem::take(&mut parent.tstack);
+    lower_expr(&node.expr, node.range, parent)?;
+    let branch_ops = std::mem::replace(&mut parent.out, saved_out);
+    let branch_stack = std::mem::replace(&mut parent.tstack, saved_stack);
+    if branch_stack.len() != 1 {
+        return Err(LoweringError::UnsupportedExpr {
+            kind: format!("Ternary(branch-stack={})", branch_stack.len()),
+            range,
+        });
+    }
+    Ok((branch_ops, branch_stack[0]))
 }
 
 /// Map a parser comparison `Operator` to the matching IR op
@@ -620,15 +736,14 @@ fn arithmetic_op_ctor(op: Operator) -> Option<fn(IrType) -> Op> {
     }
 }
 
-/// Lower a bare-identifier reference. Phase 2.b looks the name up in
-/// the `#main` parameter index and emits a typed [`Op::LoadField`]
-/// reading from the `in_buf`.
+/// Lower a bare-identifier reference. Phase 3.a checks the user-let
+/// scope first (innermost shadow wins) and falls back to the `#main`
+/// parameter index. The let-binding hit emits an [`Op::LetGet`]; the
+/// param hit emits a typed [`Op::LoadField`] reading from the `in_buf`.
 fn lower_variable(
     path: &[TokenKey],
     range: TokenRange,
-    locals: &[LocalBinding],
-    out: &mut Vec<TaggedOp>,
-    tstack: &mut Vec<IrType>,
+    ctx: &mut LowerCtx<'_>,
 ) -> Result<(), LoweringError> {
     if path.len() != 1 {
         return Err(LoweringError::UnsupportedExpr {
@@ -645,7 +760,20 @@ fn lower_variable(
             });
         }
     };
-    let binding = locals.iter().find(|b| b.name == name).ok_or_else(|| {
+    // Let-binding lookup walks innermost-first (`rev`) so a shadowed
+    // name resolves to the most recently pushed binding.
+    if let Some(b) = ctx.lets.iter().rev().find(|b| b.name == name) {
+        ctx.out.push(TaggedOp {
+            op: Op::LetGet {
+                idx: b.idx,
+                ty: b.ty,
+            },
+            range,
+        });
+        ctx.tstack.push(b.ty);
+        return Ok(());
+    }
+    let binding = ctx.params.iter().find(|b| b.name == name).ok_or_else(|| {
         LoweringError::UnresolvedVariable {
             name: name.to_string(),
             range,
@@ -666,7 +794,7 @@ fn lower_variable(
             ty: binding.ty,
         },
     };
-    out.push(TaggedOp { op, range });
-    tstack.push(binding.ty);
+    ctx.out.push(TaggedOp { op, range });
+    ctx.tstack.push(binding.ty);
     Ok(())
 }
