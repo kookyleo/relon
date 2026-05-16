@@ -16,6 +16,8 @@ use std::sync::Arc;
 
 pub use projector::{JsonProjector, Projector};
 pub use relon_analyzer;
+pub use relon_codegen_wasm;
+pub use relon_eval_api;
 pub use relon_evaluator;
 pub use relon_parser;
 
@@ -438,6 +440,80 @@ fn evaluate_source(
 pub fn analyze_from_str(source: &str) -> Result<AnalyzedTree> {
     let node = parse_document(source).map_err(|err| Error::Parse(err.to_string()))?;
     Ok(analyze(&node))
+}
+
+/// Phase 8 backend selector. Lets a host swap the default tree-walking
+/// runtime for the wasm-AOT backend without rewriting its evaluation
+/// site. Hosts that don't care keep using the existing
+/// `value_from_str` / `from_str` entry points; the backend selection
+/// only surfaces through [`new_evaluator`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Backend {
+    /// Tree-walking interpreter (default). Supports the full surface:
+    /// lazy thunks, first-class closures, `eval` on arbitrary nodes,
+    /// host-registered native fns with capability gating.
+    #[default]
+    TreeWalk,
+    /// Wasm AOT backend. Compiles the entry document into a wasm
+    /// module at construction time and dispatches `run_main`
+    /// invocations through a wasmtime engine. The four
+    /// non-`run_main` `Evaluator` methods surface
+    /// `RuntimeError::Unsupported`.
+    WasmAot,
+}
+
+/// Errors specific to the backend factory. Distinct from
+/// [`crate::Error`] because the wasm-AOT path can fail before the
+/// runtime ever starts (codegen / instantiate) and we don't want to
+/// stuff those shapes into the tree-walker's existing error enum.
+#[derive(Debug, thiserror::Error)]
+pub enum BackendError {
+    /// Parser rejected the source.
+    #[error("parse error: {0}")]
+    Parse(String),
+    /// Wasm-AOT pipeline failed (analyzer / lowering / codegen /
+    /// instantiate). Wraps the codegen-wasm error stringified so the
+    /// facade surface stays narrow.
+    #[error("wasm-aot backend setup failed: {0}")]
+    WasmAot(String),
+}
+
+/// Construct an [`relon_eval_api::Evaluator`] over `source` using the
+/// requested [`Backend`]. The returned trait object can drive
+/// `run_main` (both backends) plus — for [`Backend::TreeWalk`] — the
+/// full `Evaluator` surface.
+///
+/// The tree-walking variant deliberately mirrors what `value_from_str`
+/// does internally: workspace analysis runs first, the default
+/// sandboxed `Context` is assembled, and the resulting evaluator is
+/// boxed as `dyn Evaluator`. The wasm-AOT variant compiles the source
+/// down to wasm via [`relon_codegen_wasm::WasmAotEvaluator::from_source`].
+pub fn new_evaluator(
+    source: &str,
+    backend: Backend,
+) -> std::result::Result<Box<dyn relon_eval_api::Evaluator>, BackendError> {
+    match backend {
+        Backend::TreeWalk => Ok(Box::new(build_tree_walk_evaluator(source)?)),
+        Backend::WasmAot => {
+            let aot = relon_codegen_wasm::WasmAotEvaluator::from_source(source)
+                .map_err(|e| BackendError::WasmAot(e.to_string()))?;
+            Ok(Box::new(aot))
+        }
+    }
+}
+
+/// Assemble a [`TreeWalkEvaluator`] from `source` using the sandboxed
+/// posture the default `value_from_str` entry point uses. Pulled out
+/// of [`new_evaluator`] so future tests / hosts can wire a tree-walker
+/// without re-running parse + analyze.
+fn build_tree_walk_evaluator(source: &str) -> std::result::Result<TreeWalkEvaluator, BackendError> {
+    let node = parse_document(source).map_err(|e| BackendError::Parse(e.to_string()))?;
+    let analyzed = Arc::new(relon_analyzer::analyze(&node));
+    let mut ctx = Context::new()
+        .with_root(node)
+        .with_analyzed(Arc::clone(&analyzed));
+    TreeWalkEvaluator::prepare_in_place(&mut ctx);
+    Ok(TreeWalkEvaluator::new(Arc::new(ctx)))
 }
 
 #[cfg(test)]

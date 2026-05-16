@@ -13,6 +13,12 @@ categories = ["config", "parsing", "compilers"]
 relon-evaluator = { workspace = true }
 relon-parser = { workspace = true }
 relon-analyzer = { workspace = true }
+# Phase 8: facade Backend enum needs the wasm-AOT evaluator to wire
+# `Backend::WasmAot` through `new_evaluator`. Tree-walk-only hosts
+# still pay the dependency, but the cost is a wasmtime link only at
+# build time — runtime selection stays a single enum match.
+relon-codegen-wasm = { workspace = true }
+relon-eval-api = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

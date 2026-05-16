@@ -1699,6 +1699,8 @@ name = "relon"
 version = "0.1.0"
 dependencies = [
  "relon-analyzer",
+ "relon-codegen-wasm",
+ "relon-eval-api",
  "relon-evaluator",
  "relon-parser",
  "serde",
