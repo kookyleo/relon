@@ -50,19 +50,16 @@ impl Evaluator {
         // `lower_schema_pure` so the same desugar logic that powers
         // `#schema X: Base + { ... }` applies here too.
         if matches!(op, Operator::Add)
-            && matches!(&l, Value::Schema { .. })
+            && matches!(&l, Value::Schema(_))
             && matches!(
                 right.expr.as_ref(),
                 Expr::Dict(_) | Expr::Binary(Operator::Add, _, _)
             )
         {
-            let Value::Schema {
-                fields: base_fields,
-                ..
-            } = l
-            else {
+            let Value::Schema(base_box) = l else {
                 unreachable!()
             };
+            let base_fields = base_box.fields;
             let merged_fields = match right.expr.as_ref() {
                 Expr::Dict(pairs) => {
                     self.merge_schema_with_dict_pairs(base_fields, pairs, scope)?
@@ -87,10 +84,10 @@ impl Evaluator {
                     merged
                 }
             };
-            return Ok(Value::Schema {
+            return Ok(Value::Schema(Box::new(crate::value::SchemaData {
                 generics: Vec::new(),
                 fields: merged_fields,
-            });
+            })));
         }
 
         let r = self.eval(right, scope)?;
@@ -113,7 +110,7 @@ impl Evaluator {
 
                 if let Value::Dict(ref d) = merged {
                     if let Some(ref brand_name) = d.brand {
-                        if let Some(Value::Schema { .. }) = scope.get_local(brand_name) {
+                        if let Some(Value::Schema(_)) = scope.get_local(brand_name) {
                             let mut to_check = merged.clone();
                             let type_node = TypeNode {
                                 path: vec![brand_name.clone()],
@@ -130,7 +127,7 @@ impl Evaluator {
                 }
                 Ok(merged)
             }
-            (Operator::Add, Value::Schema { .. }, Value::Schema { .. }) => {
+            (Operator::Add, Value::Schema(_), Value::Schema(_)) => {
                 let mut merged = l.clone();
                 merged.deep_merge(&r);
                 Ok(merged)

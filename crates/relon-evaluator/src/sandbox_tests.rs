@@ -972,7 +972,7 @@ fn iter_cursor_concurrent_contexts_do_not_deadlock() {
 fn test_brand_registry() {
     let mut ctx = Context::default();
     // Register a schema 'Email' globally
-    let email_schema = Value::Schema {
+    let email_schema = Value::Schema(Box::new(crate::value::SchemaData {
         generics: Vec::new(),
         fields: {
             let mut fields = std::collections::HashMap::new();
@@ -994,7 +994,7 @@ fn test_brand_registry() {
             );
             fields
         },
-    };
+    }));
     ctx.register_schema("Email", email_schema);
 
     // Usage site doesn't define 'Email', but uses it via #brand

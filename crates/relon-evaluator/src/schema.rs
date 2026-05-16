@@ -182,7 +182,8 @@ impl Evaluator {
         }
 
         match schema_val {
-            Value::Schema { generics, fields } => {
+            Value::Schema(schema_box) => {
+                let crate::value::SchemaData { generics, fields } = *schema_box;
                 let mut subst_map = HashMap::new();
                 for (i, gname) in generics.iter().enumerate() {
                     if let Some(gtype) = type_hint.generics.get(i) {
@@ -217,9 +218,10 @@ impl Evaluator {
                 }
                 Ok(())
             }
-            Value::EnumSchema {
-                generics, variants, ..
-            } => {
+            Value::EnumSchema(enum_box) => {
+                let crate::value::EnumSchemaData {
+                    generics, variants, ..
+                } = *enum_box;
                 let variant_name = match value {
                     Value::Dict(d) => d.brand.clone(),
                     _ => {
@@ -312,7 +314,7 @@ impl Evaluator {
             ("Bool", Value::Bool(_)) => Some(true),
             ("List", Value::List(_)) => Some(true),
             ("Dict", Value::Dict(_)) => Some(true),
-            ("Closure" | "Fn", Value::Closure { .. }) => Some(true),
+            ("Closure" | "Fn", Value::Closure(_)) => Some(true),
             _ if is_builtin_type_name(p) => Some(false),
             _ => None,
         };
@@ -376,7 +378,7 @@ impl Evaluator {
                     depth,
                 )?;
                 for predicate in &field.predicates {
-                    if !matches!(predicate, Value::Closure { .. }) {
+                    if !matches!(predicate, Value::Closure(_)) {
                         continue;
                     }
                     let result = self.call_function_by_value(
@@ -398,7 +400,7 @@ impl Evaluator {
                     }
                 }
             } else if let Some(ref def) = field.default_value {
-                if matches!(def, Value::Closure { .. }) {
+                if matches!(def, Value::Closure(_)) {
                     deferred_closures.push((field_name.clone(), def.clone()));
                 } else {
                     d.map.insert(field_name.clone(), def.clone());
@@ -505,18 +507,14 @@ impl Evaluator {
         let mut fields: HashMap<String, SchemaField> = HashMap::new();
         for base in &def.bases {
             let base_value = self.eval_internal(&base.node, scope, false)?;
-            let Value::Schema {
-                fields: base_fields,
-                ..
-            } = base_value
-            else {
+            let Value::Schema(base_schema) = base_value else {
                 return Err(RuntimeError::TypeMismatch {
                     expected: "Schema".to_string(),
                     found: base_value.type_name().to_string(),
                     range: base.node.range,
                 });
             };
-            merge_schema_fields(&mut fields, base_fields);
+            merge_schema_fields(&mut fields, base_schema.fields);
         }
         for field_def in &def.fields {
             self.apply_field_def(field_def, &mut fields, scope)?;
@@ -620,7 +618,7 @@ impl Evaluator {
                 ))
             }
             _ => match self.eval_internal(value_node, scope, true)? {
-                Value::Type(t) => Ok((t, Value::Wildcard)),
+                Value::Type(t) => Ok((*t, Value::Wildcard)),
                 other => Err(RuntimeError::TypeMismatch {
                     expected: "Type or Type Prefix".to_string(),
                     found: other.type_name().to_string(),
