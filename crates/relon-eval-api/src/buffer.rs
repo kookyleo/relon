@@ -17,7 +17,7 @@
 //! Static enforcement via codegen-generated wrappers is a Phase 3
 //! follow-up.
 
-use crate::layout::{FieldKind, OffsetTable};
+use crate::layout::{FieldKind, OffsetTable, SchemaLayout};
 use crate::schema_canonical::{Field, TypeRepr};
 use thiserror::Error;
 
@@ -244,6 +244,137 @@ impl<'a> BufferBuilder<'a> {
         self.bytes
     }
 
+    /// Allocate a nested branded sub-record under `field_name` and
+    /// return a detached child [`BufferBuilder`] sized to the sub
+    /// schema's fixed area.
+    ///
+    /// Phase 9.b-1: mirrors [`BufferReader::sub_record`] on the writer
+    /// side so a host can pack Schema-typed `#main` args without
+    /// reaching for hand-rolled byte arithmetic. The returned builder
+    /// is *detached* — it owns its own `Vec<u8>` pre-sized to
+    /// `sub_layout.root_size`. The parent's pointer slot stays zero
+    /// until the caller hands the child back via
+    /// [`Self::finish_sub_record`], which appends the child's bytes to
+    /// the parent's tail area (aligning to `sub_layout.root_align`) and
+    /// back-patches the slot.
+    ///
+    /// Detached children keep the writer simple: they don't borrow the
+    /// parent (so multiple sibling sub-records can be authored
+    /// independently), and the parent has a single commit step that
+    /// also enforces the field-name → pointer-slot binding the layout
+    /// pass guarantees.
+    pub fn sub_record(
+        &mut self,
+        field_name: &str,
+        sub_layout: &'a OffsetTable,
+        sub_fields: &[Field],
+    ) -> Result<BufferBuilder<'a>, BufferError> {
+        // Validate the parent slot is a Schema-typed pointer-indirect
+        // entry. Anything else would corrupt adjacent fields once we
+        // back-patched the (wrong) slot.
+        let entry =
+            self.field_index
+                .iter()
+                .find(|(name, _, _, _, _)| name == field_name)
+                .ok_or_else(|| BufferError::UnknownField {
+                    name: field_name.to_string(),
+                })?;
+        if !matches!(entry.1, TypeRepr::Schema { .. }) {
+            return Err(BufferError::TypeMismatch {
+                name: field_name.to_string(),
+                declared: type_label(&entry.1),
+                requested: "Schema",
+            });
+        }
+        if !matches!(entry.4, FieldKind::PointerIndirect { .. }) {
+            return Err(BufferError::TypeMismatch {
+                name: field_name.to_string(),
+                declared: "Schema",
+                requested: "Schema",
+            });
+        }
+        Ok(BufferBuilder::new(sub_layout, sub_fields))
+    }
+
+    /// Commit a detached sub-record produced by [`Self::sub_record`].
+    ///
+    /// Appends the child's byte buffer to the parent's tail area
+    /// (padded up to the sub schema's root alignment) and writes the
+    /// resulting buffer-relative offset into the parent's pointer slot
+    /// for `field_name`. The child is consumed.
+    ///
+    /// Pointer relocation: the child built its `String` / `List<Int>` /
+    /// nested-`Schema` slots with offsets relative to the **child's**
+    /// buffer base (0). Once the child is pasted into the parent at
+    /// `sub_base`, every such pointer slot needs `+ sub_base` to become
+    /// parent-relative again — otherwise the wasm side / reader walks
+    /// the wrong bytes. We walk the child's field layout recursively
+    /// and rewrite each u32 pointer in place before appending.
+    ///
+    /// Errors mirror the parent's other writers: an unknown field name
+    /// or a type-shape mismatch surfaces before any bytes are moved.
+    /// An oversized child (offset doesn't fit in `u32`) surfaces as
+    /// [`BufferError::ValueTooLarge`].
+    pub fn finish_sub_record(
+        &mut self,
+        field_name: &str,
+        child: BufferBuilder<'_>,
+    ) -> Result<(), BufferError> {
+        let entry =
+            self.field_index
+                .iter()
+                .find(|(name, _, _, _, _)| name == field_name)
+                .ok_or_else(|| BufferError::UnknownField {
+                    name: field_name.to_string(),
+                })?;
+        if !matches!(entry.1, TypeRepr::Schema { .. }) {
+            return Err(BufferError::TypeMismatch {
+                name: field_name.to_string(),
+                declared: type_label(&entry.1),
+                requested: "Schema",
+            });
+        }
+        let FieldKind::PointerIndirect { tail_alignment } = entry.4 else {
+            return Err(BufferError::TypeMismatch {
+                name: field_name.to_string(),
+                declared: "Schema",
+                requested: "Schema",
+            });
+        };
+        let slot_offset = entry.2;
+        let child_align = child.layout.root_align.max(tail_alignment).max(1);
+        let child_layout = child.layout;
+        // Resolve the child's field type list from its own field_index
+        // so the relocation walker has the same canonical TypeRepr
+        // information the writer used at construction time.
+        let child_fields: Vec<Field> = child
+            .field_index
+            .iter()
+            .map(|(name, ty, _, _, _)| Field {
+                name: name.clone(),
+                ty: ty.clone(),
+                default: None,
+            })
+            .collect();
+        let mut child_bytes = child.finish();
+        self.pad_to(child_align);
+        let sub_base = self.bytes.len();
+        let ptr = u32::try_from(sub_base).map_err(|_| BufferError::ValueTooLarge {
+            name: field_name.to_string(),
+            len: sub_base,
+        })?;
+        // Rebase every pointer slot inside the child so it's
+        // parent-relative once we paste the child bytes.
+        relocate_pointers(&mut child_bytes, child_layout, &child_fields, 0, ptr)
+            .map_err(|reason| BufferError::MalformedPayload {
+                name: field_name.to_string(),
+                reason,
+            })?;
+        self.bytes.extend_from_slice(&child_bytes);
+        self.bytes[slot_offset..slot_offset + 4].copy_from_slice(&ptr.to_le_bytes());
+        Ok(())
+    }
+
     fn locate(
         &self,
         field_name: &str,
@@ -323,6 +454,65 @@ impl<'a> BufferBuilder<'a> {
     pub(crate) fn layout(&self) -> &OffsetTable {
         self.layout
     }
+}
+
+/// Rebase every pointer-indirect slot inside `bytes` so the offsets
+/// are valid once the whole buffer is pasted at `paste_base` of a
+/// parent buffer. `record_base` is the byte offset of the record's
+/// fixed area inside `bytes` (0 for the root call); recursion walks
+/// nested `Schema` sub-records by following the slot's pre-relocation
+/// value to find the inner fixed area.
+///
+/// All pointer slots in the input are expected to carry offsets
+/// relative to `bytes`'s own base — i.e. the values a freshly built
+/// child [`BufferBuilder`] would have written. After this routine each
+/// slot is updated to `original_value + paste_base`, which matches the
+/// parent buffer's coordinate system.
+fn relocate_pointers(
+    bytes: &mut [u8],
+    layout: &OffsetTable,
+    fields: &[Field],
+    record_base: usize,
+    paste_base: u32,
+) -> Result<(), &'static str> {
+    for fo in &layout.fields {
+        if !matches!(fo.kind, FieldKind::PointerIndirect { .. }) {
+            continue;
+        }
+        let slot_abs = record_base
+            .checked_add(fo.offset)
+            .ok_or("pointer slot offset overflows usize")?;
+        if slot_abs.checked_add(4).map(|end| end > bytes.len()).unwrap_or(true) {
+            return Err("pointer slot exceeds buffer end");
+        }
+        let mut ptr_buf = [0u8; 4];
+        ptr_buf.copy_from_slice(&bytes[slot_abs..slot_abs + 4]);
+        let original = u32::from_le_bytes(ptr_buf);
+        let relocated = original
+            .checked_add(paste_base)
+            .ok_or("relocated pointer overflows u32")?;
+        bytes[slot_abs..slot_abs + 4].copy_from_slice(&relocated.to_le_bytes());
+        // For nested Schema fields, the pre-relocation pointer named
+        // the inner record's fixed-area base inside `bytes`. Recurse
+        // there so the inner record's own pointer-indirect slots get
+        // rebased too — without recursion the wasm reader walking the
+        // grand-child's String slot would fall off the parent buffer
+        // by `paste_base` bytes.
+        if let Some(field) = fields.iter().find(|f| f.name == fo.name) {
+            if let TypeRepr::Schema { schema } = &field.ty {
+                let sub_layout = SchemaLayout::offsets_for(schema)
+                    .map_err(|_| "nested schema layout failed during relocation")?;
+                relocate_pointers(
+                    bytes,
+                    &sub_layout,
+                    &schema.fields,
+                    original as usize,
+                    paste_base,
+                )?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Type-checked reader over a record buffer plus optional tail area.
@@ -1102,6 +1292,206 @@ mod tests {
         assert!(matches!(
             kind,
             FieldKind::PointerIndirect { tail_alignment: 8 }
+        ));
+    }
+
+    #[test]
+    fn write_sub_record_simple_schema_arg_roundtrips() {
+        // `Wrap { User u }` where User { Int age } — writer fills the
+        // parent's pointer slot via `sub_record`, reader walks back via
+        // `BufferReader::sub_record` and reads the inner `age`.
+        let user_schema = Schema {
+            name: "User".into(),
+            generics: vec![],
+            fields: vec![field("age", TypeRepr::Int)],
+        };
+        let wrap_schema = Schema {
+            name: "Wrap".into(),
+            generics: vec![],
+            fields: vec![field(
+                "u",
+                TypeRepr::Schema {
+                    schema: Box::new(user_schema.clone()),
+                },
+            )],
+        };
+        let wrap_layout = SchemaLayout::offsets_for(&wrap_schema).expect("wrap layout");
+        let user_layout = SchemaLayout::offsets_for(&user_schema).expect("user layout");
+
+        let mut wrap_builder = BufferBuilder::new(&wrap_layout, &wrap_schema.fields);
+        let mut user_builder = wrap_builder
+            .sub_record("u", &user_layout, &user_schema.fields)
+            .expect("sub_record");
+        user_builder.write_int("age", 42).expect("write age");
+        wrap_builder
+            .finish_sub_record("u", user_builder)
+            .expect("finish_sub_record");
+        let bytes = wrap_builder.finish();
+
+        let reader = BufferReader::new(&wrap_layout, &wrap_schema.fields, &bytes).expect("reader");
+        let sub = reader
+            .sub_record("u", &user_layout, &user_schema.fields)
+            .expect("sub");
+        assert_eq!(sub.read_int("age").expect("read age"), 42);
+    }
+
+    #[test]
+    fn write_sub_record_nested_with_string_field() {
+        // `Usr { Addr addr, String name }` — exercises both the
+        // sub_record writer and the surrounding parent-area String slot
+        // sharing the same tail area.
+        let addr_schema = Schema {
+            name: "Addr".into(),
+            generics: vec![],
+            fields: vec![field("city", TypeRepr::String), field("zip", TypeRepr::Int)],
+        };
+        let usr_schema = Schema {
+            name: "Usr".into(),
+            generics: vec![],
+            fields: vec![
+                field(
+                    "addr",
+                    TypeRepr::Schema {
+                        schema: Box::new(addr_schema.clone()),
+                    },
+                ),
+                field("name", TypeRepr::String),
+            ],
+        };
+        let usr_layout = SchemaLayout::offsets_for(&usr_schema).expect("usr layout");
+        let addr_layout = SchemaLayout::offsets_for(&addr_schema).expect("addr layout");
+
+        let mut usr_builder = BufferBuilder::new(&usr_layout, &usr_schema.fields);
+        let mut addr_builder = usr_builder
+            .sub_record("addr", &addr_layout, &addr_schema.fields)
+            .expect("sub_record");
+        addr_builder.write_string("city", "BJ").expect("write city");
+        addr_builder.write_int("zip", 100000).expect("write zip");
+        usr_builder
+            .finish_sub_record("addr", addr_builder)
+            .expect("finish_sub_record");
+        usr_builder.write_string("name", "Bob").expect("write name");
+        let bytes = usr_builder.finish();
+
+        let reader = BufferReader::new(&usr_layout, &usr_schema.fields, &bytes).expect("reader");
+        let sub = reader
+            .sub_record("addr", &addr_layout, &addr_schema.fields)
+            .expect("sub");
+        assert_eq!(sub.read_string("city").expect("city"), "BJ");
+        assert_eq!(sub.read_int("zip").expect("zip"), 100000);
+        assert_eq!(reader.read_string("name").expect("name"), "Bob");
+    }
+
+    #[test]
+    fn write_sub_record_inner_list_int_roundtrips() {
+        // Mixed Schema arg: parent has the sub-record + a top-level
+        // List<Int>; the sub-record itself has a String. Confirms the
+        // tail-area cursor advances correctly across multiple
+        // heterogenous appends.
+        let inner_schema = Schema {
+            name: "Inner".into(),
+            generics: vec![],
+            fields: vec![field("tag", TypeRepr::String)],
+        };
+        let outer_schema = Schema {
+            name: "Outer".into(),
+            generics: vec![],
+            fields: vec![
+                field(
+                    "child",
+                    TypeRepr::Schema {
+                        schema: Box::new(inner_schema.clone()),
+                    },
+                ),
+                field(
+                    "nums",
+                    TypeRepr::List {
+                        element: Box::new(TypeRepr::Int),
+                    },
+                ),
+            ],
+        };
+        let outer_layout = SchemaLayout::offsets_for(&outer_schema).expect("outer layout");
+        let inner_layout = SchemaLayout::offsets_for(&inner_schema).expect("inner layout");
+
+        let mut outer = BufferBuilder::new(&outer_layout, &outer_schema.fields);
+        let mut inner = outer
+            .sub_record("child", &inner_layout, &inner_schema.fields)
+            .expect("sub_record");
+        inner.write_string("tag", "hello").expect("write tag");
+        outer
+            .finish_sub_record("child", inner)
+            .expect("finish_sub_record");
+        outer
+            .write_list_int("nums", &[10, 20, 30])
+            .expect("write nums");
+        let bytes = outer.finish();
+
+        let reader =
+            BufferReader::new(&outer_layout, &outer_schema.fields, &bytes).expect("reader");
+        let sub = reader
+            .sub_record("child", &inner_layout, &inner_schema.fields)
+            .expect("sub");
+        assert_eq!(sub.read_string("tag").expect("tag"), "hello");
+        assert_eq!(
+            reader.read_list_int("nums").expect("nums"),
+            vec![10, 20, 30]
+        );
+    }
+
+    #[test]
+    fn write_sub_record_unknown_field_rejected() {
+        let inner_schema = Schema {
+            name: "Inner".into(),
+            generics: vec![],
+            fields: vec![field("x", TypeRepr::Int)],
+        };
+        let outer_schema = Schema {
+            name: "Outer".into(),
+            generics: vec![],
+            fields: vec![field(
+                "child",
+                TypeRepr::Schema {
+                    schema: Box::new(inner_schema.clone()),
+                },
+            )],
+        };
+        let outer_layout = SchemaLayout::offsets_for(&outer_schema).expect("outer layout");
+        let inner_layout = SchemaLayout::offsets_for(&inner_schema).expect("inner layout");
+        let mut outer = BufferBuilder::new(&outer_layout, &outer_schema.fields);
+        let err = outer
+            .sub_record("missing", &inner_layout, &inner_schema.fields)
+            .expect_err("missing field must reject");
+        assert!(matches!(err, BufferError::UnknownField { ref name } if name == "missing"));
+    }
+
+    #[test]
+    fn write_sub_record_on_non_schema_slot_rejected() {
+        // `name` is a String — sub_record must refuse rather than
+        // patch a 4-byte pointer into a slot the layout reserved for
+        // a String tail-record offset.
+        let inner_schema = Schema {
+            name: "Inner".into(),
+            generics: vec![],
+            fields: vec![field("x", TypeRepr::Int)],
+        };
+        let mixed = Schema {
+            name: "Mixed".into(),
+            generics: vec![],
+            fields: vec![field("name", TypeRepr::String)],
+        };
+        let mixed_layout = SchemaLayout::offsets_for(&mixed).expect("mixed layout");
+        let inner_layout = SchemaLayout::offsets_for(&inner_schema).expect("inner layout");
+        let mut builder = BufferBuilder::new(&mixed_layout, &mixed.fields);
+        let err = builder
+            .sub_record("name", &inner_layout, &inner_schema.fields)
+            .expect_err("non-schema slot must reject");
+        assert!(matches!(
+            err,
+            BufferError::TypeMismatch {
+                requested: "Schema",
+                ..
+            }
         ));
     }
 
