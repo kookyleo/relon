@@ -69,6 +69,22 @@ pub enum CodegenError {
         /// IR type the `else` branch produced.
         else_ty: IrType,
     },
+    /// Phase 4.a: an `Op::Call` arrived with operand types that don't
+    /// match the callee's declared parameter signature, or the
+    /// `arg_count` disagrees with `param_tys.len()`. Surfaces a
+    /// lowering-side bug (the lowering pass already verified the
+    /// shape; this is the codegen belt-and-braces).
+    #[error(
+        "call type mismatch: callee fn_index={fn_index} arg_count={arg_count} param_tys.len()={param_tys_len}"
+    )]
+    CallTypeMismatch {
+        /// Combined wasm-module function index of the callee.
+        fn_index: u32,
+        /// Argument count declared on the op.
+        arg_count: u32,
+        /// Length of the op's `param_tys` vector.
+        param_tys_len: u32,
+    },
     /// Phase 2.c: a `StoreField` of a type the wasm side can't emit
     /// a single-instruction store for (currently `String` /
     /// `ListInt`). The return surface only covers `Int` / `Float` /

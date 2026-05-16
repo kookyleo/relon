@@ -41,8 +41,8 @@ pub use srcmap::{Entry as SrcMapEntry, SrcMap, SrcMapError};
 use relon_eval_api::layout::{OffsetTable, SchemaLayout};
 use relon_eval_api::schema_canonical::{schema_hash, Schema};
 use relon_ir::{
-    IrType, LoweredEntry, Module as IrModule, Op, WASM_LOCAL_IN_LEN, WASM_LOCAL_IN_PTR,
-    WASM_LOCAL_OUT_CAP, WASM_LOCAL_OUT_PTR,
+    builtin_stdlib, Func as IrFunc, IrType, LoweredEntry, Module as IrModule, Op,
+    WASM_LOCAL_IN_LEN, WASM_LOCAL_IN_PTR, WASM_LOCAL_OUT_CAP, WASM_LOCAL_OUT_PTR,
 };
 use relon_parser::TokenRange;
 use std::collections::HashMap;
@@ -134,12 +134,31 @@ pub fn compile_module(
     let return_layout = SchemaLayout::offsets_for(return_schema)
         .map_err(|e| CodegenError::Layout(e.to_string()))?;
 
+    // Phase 4.a: prepend bundled stdlib functions before the user
+    // functions. Each stdlib entry contributes one wasm function at
+    // index `0..N`; user functions slide to `N..N+U`. The
+    // `entry_func_index` field on the IR module is an *IR-side*
+    // index (into `ir.funcs`); when we slot the user functions after
+    // the stdlib, we shift it to compute the wasm-level export
+    // target.
+    let stdlib_funcs = builtin_stdlib();
+    let stdlib_count = stdlib_funcs.len();
+    let combined_funcs: Vec<IrFunc> = stdlib_funcs
+        .into_iter()
+        .map(stdlib_to_ir_func)
+        .chain(ir.funcs.iter().cloned())
+        .collect();
+    let combined_entry_index = ir.entry_func_index.map(|i| i + stdlib_count);
+
     // Walk every function body up front and lay out the const data
     // section. Each `ConstString` / `ConstListInt` op gets a stable
     // absolute address inside `DATA_SECTION_BASE..DATA_SECTION_BASE+
     // const_pool.bytes.len()` so the runtime emit can hardcode an
-    // `i32.const <addr>` per op.
-    let const_pool = build_const_pool(ir)?;
+    // `i32.const <addr>` per op. The walk covers both stdlib and
+    // user funcs so a stdlib body using a `ConstString` (none in
+    // Phase 4.a, but the framework stays uniform) gets its data
+    // laid out alongside the user records.
+    let const_pool = build_const_pool_for_funcs(&combined_funcs)?;
 
     let mut module = Module::new();
     let mut types = TypeSection::new();
@@ -180,9 +199,9 @@ pub fn compile_module(
 
     let mut type_table: Vec<(Vec<ValType>, ValType, u32)> = Vec::new();
     let mut per_func_ranges: Vec<(TokenRange, Vec<TokenRange>)> =
-        Vec::with_capacity(ir.funcs.len());
+        Vec::with_capacity(combined_funcs.len());
 
-    for (func_index, func) in ir.funcs.iter().enumerate() {
+    for (func_index, func) in combined_funcs.iter().enumerate() {
         let params_vt: Vec<ValType> = func.params.iter().map(ir_to_val_type).collect();
         let ret_vt = ir_to_val_type(&func.ret);
         let type_index = match type_table
@@ -199,11 +218,13 @@ pub fn compile_module(
         };
         functions.function(type_index);
 
-        if Some(func_index) == ir.entry_func_index {
+        if Some(func_index) == combined_entry_index {
             exports.export(func.name.as_str(), ExportKind::Func, func_index as u32);
         }
 
-        let (body, ranges) = emit_function_body(func, &main_layout, &return_layout, &const_pool)?;
+        let is_entry = Some(func_index) == combined_entry_index;
+        let (body, ranges) =
+            emit_function_body(func, &main_layout, &return_layout, &const_pool, is_entry)?;
         codes.function(&body);
         per_func_ranges.push((func.range, ranges));
     }
@@ -391,12 +412,67 @@ impl ConstPool {
 /// Pre-walk every IR function body and lay out the per-module const
 /// data records. Returns the encoded bytes plus index lookups so the
 /// runtime emit pass can hardcode the matching `i32.const <addr>`.
-fn build_const_pool(ir: &IrModule) -> Result<ConstPool, CodegenError> {
+fn build_const_pool_for_funcs(funcs: &[IrFunc]) -> Result<ConstPool, CodegenError> {
     let mut pool = ConstPool::default();
-    for func in &ir.funcs {
+    for func in funcs {
         collect_consts(&func.body, &mut pool)?;
     }
     Ok(pool)
+}
+
+/// Translate a [`relon_ir::StdlibFunction`] into a wasm-codegen-ready
+/// [`IrFunc`]. The stdlib body uses the same IR op stream as user
+/// functions; only the synthetic `name` distinguishes a stdlib entry
+/// from a user `#main` function in diagnostics.
+///
+/// Synthetic source range: stdlib functions don't appear in user
+/// source, but the srcmap section's invariant is `line >= 1` /
+/// `col >= 1` (1-based positions). We anchor every stdlib op at
+/// `(line=1, col=1)` with `file_idx=0` (the placeholder file slot);
+/// a host translating a trap inside a stdlib body still gets a
+/// non-degenerate position to surface, and the srcmap roundtrip
+/// invariants stay intact.
+fn stdlib_to_ir_func(f: relon_ir::StdlibFunction) -> IrFunc {
+    let synthetic_range = synthetic_stdlib_range();
+    let body = f
+        .body
+        .into_iter()
+        .map(|mut t| {
+            // Stdlib bodies are hand-written with `TokenRange::default()`
+            // ranges; rewrite them so the srcmap pass sees the
+            // 1-based synthetic range uniformly.
+            t.range = synthetic_range;
+            t
+        })
+        .collect();
+    IrFunc {
+        name: format!("__relon_stdlib_{}", f.name),
+        params: f.params,
+        ret: f.ret,
+        body,
+        range: synthetic_range,
+    }
+}
+
+/// 1-based synthetic source position used for every stdlib op range.
+/// Pinning the `line` / `col` to `1` keeps the srcmap encoder's
+/// 1-based invariant true; a host that translates a trap inside a
+/// stdlib body still surfaces a well-formed position (the host's
+/// renderer can recognise the synthetic anchor and append a
+/// "in stdlib" marker if it wants).
+fn synthetic_stdlib_range() -> TokenRange {
+    TokenRange {
+        start: relon_parser::TokenPosition {
+            line: 1,
+            column: 1,
+            offset: 0,
+        },
+        end: relon_parser::TokenPosition {
+            line: 1,
+            column: 1,
+            offset: 0,
+        },
+    }
 }
 
 /// Recursively walk a body (descending into [`Op::If`] arms) and
@@ -481,6 +557,7 @@ fn emit_function_body(
     main_layout: &OffsetTable,
     return_layout: &OffsetTable,
     const_pool: &ConstPool,
+    is_entry: bool,
 ) -> Result<(Function, Vec<TokenRange>), CodegenError> {
     // Walk the body (recursively into if-branches) to determine
     // which wasm value type the trailing StoreField needs as its
@@ -563,38 +640,42 @@ fn emit_function_body(
     // wasm op stream the encoder builds.
     let mut ranges: Vec<TokenRange> = Vec::with_capacity(func.body.len() * 2 + 16);
 
-    // Prologue: in_len guard. `local.get in_len; i32.const N;
-    // i32.lt_u; if; unreachable; end`. Total: 6 wasm ops.
+    // Prologue (entry-only): binary-handshake size guards + tail-
+    // cursor init. Stdlib functions don't run this — they have a
+    // bespoke `(param) -> ret` signature and rely on the engine to
+    // type-check arguments at the call site.
     let main_root_size = u32::try_from(main_layout.root_size)
         .map_err(|_| CodegenError::Layout("main schema root_size exceeds u32".into()))?;
     let return_root_size = u32::try_from(return_layout.root_size)
         .map_err(|_| CodegenError::Layout("return schema root_size exceeds u32".into()))?;
 
-    emit_size_guard(
-        &mut f,
-        &mut ranges,
-        WASM_LOCAL_IN_LEN,
-        main_root_size,
-        func.range,
-    );
-    emit_size_guard(
-        &mut f,
-        &mut ranges,
-        WASM_LOCAL_OUT_CAP,
-        return_root_size,
-        func.range,
-    );
+    if is_entry {
+        emit_size_guard(
+            &mut f,
+            &mut ranges,
+            WASM_LOCAL_IN_LEN,
+            main_root_size,
+            func.range,
+        );
+        emit_size_guard(
+            &mut f,
+            &mut ranges,
+            WASM_LOCAL_OUT_CAP,
+            return_root_size,
+            func.range,
+        );
 
-    // Initialise the tail cursor to `return_root_size` so the first
-    // pointer-indirect store lands immediately after the fixed area
-    // inside `out_buf`. Skipped when the body has no String/List
-    // return — leaves `TAIL_CURSOR_LOCAL_INDEX` at its default zero
-    // (and unused in that case).
-    if needs_tail_cursor {
-        f.instruction(&Instruction::I32Const(return_root_size as i32));
-        ranges.push(func.range);
-        f.instruction(&Instruction::LocalSet(TAIL_CURSOR_LOCAL_INDEX));
-        ranges.push(func.range);
+        // Initialise the tail cursor to `return_root_size` so the
+        // first pointer-indirect store lands immediately after the
+        // fixed area inside `out_buf`. Skipped when the body has no
+        // String/List return — leaves `TAIL_CURSOR_LOCAL_INDEX` at
+        // its default zero (and unused in that case).
+        if needs_tail_cursor {
+            f.instruction(&Instruction::I32Const(return_root_size as i32));
+            ranges.push(func.range);
+            f.instruction(&Instruction::LocalSet(TAIL_CURSOR_LOCAL_INDEX));
+            ranges.push(func.range);
+        }
     }
 
     // Virtual stack used to validate arithmetic type tags.
@@ -611,18 +692,22 @@ fn emit_function_body(
         &mut ectx,
     )?;
 
-    // Epilogue: push `bytes_written` and emit the trailing `End`.
+    // Epilogue.
     //
-    // When the body ended with a pointer-indirect store, `bytes_written`
-    // is the current tail cursor (covers the fixed area + every tail
-    // record). Pure-scalar bodies keep the v1 shape — push the
-    // constant return root size.
-    if needs_tail_cursor {
-        f.instruction(&Instruction::LocalGet(TAIL_CURSOR_LOCAL_INDEX));
-        ranges.push(func.range);
-    } else {
-        f.instruction(&Instruction::I32Const(return_root_size as i32));
-        ranges.push(func.range);
+    // Entry function: push `bytes_written` (the tail cursor when the
+    // body emitted pointer-indirect stores, otherwise the fixed-area
+    // return root size) then emit the trailing `End`. Stdlib functions
+    // leave their single result value on top of the operand stack —
+    // wasm's implicit return rule turns the trailing `end` into the
+    // function's return.
+    if is_entry {
+        if needs_tail_cursor {
+            f.instruction(&Instruction::LocalGet(TAIL_CURSOR_LOCAL_INDEX));
+            ranges.push(func.range);
+        } else {
+            f.instruction(&Instruction::I32Const(return_root_size as i32));
+            ranges.push(func.range);
+        }
     }
 
     f.instruction(&Instruction::End);
@@ -1009,6 +1094,71 @@ fn emit_op_seq(
                 // Pushes the buffer-relative offset of the
                 // newly-written record.
                 vstack.push(IrType::I32);
+            }
+            Op::Call {
+                fn_index,
+                arg_count,
+                param_tys,
+                ret_ty,
+            } => {
+                // Sanity: declared param_tys count must match the op's
+                // arg_count. Lowering keeps these in sync, but a hand-
+                // built IR could disagree.
+                let param_tys_len = u32::try_from(param_tys.len()).unwrap_or(u32::MAX);
+                if param_tys_len != *arg_count {
+                    return Err(CodegenError::CallTypeMismatch {
+                        fn_index: *fn_index,
+                        arg_count: *arg_count,
+                        param_tys_len,
+                    });
+                }
+                // Pop arguments off the vstack in reverse declaration
+                // order — the last-pushed argument sits on top — and
+                // verify each one occupies the callee's matching
+                // wasm slot.
+                if vstack.len() < param_tys.len() {
+                    return Err(CodegenError::CallTypeMismatch {
+                        fn_index: *fn_index,
+                        arg_count: *arg_count,
+                        param_tys_len,
+                    });
+                }
+                for ty in param_tys.iter().rev() {
+                    let popped = vstack.pop().ok_or(CodegenError::CallTypeMismatch {
+                        fn_index: *fn_index,
+                        arg_count: *arg_count,
+                        param_tys_len,
+                    })?;
+                    if popped.wasm_slot() != ty.wasm_slot() {
+                        return Err(CodegenError::CallTypeMismatch {
+                            fn_index: *fn_index,
+                            arg_count: *arg_count,
+                            param_tys_len,
+                        });
+                    }
+                }
+                f.instruction(&Instruction::Call(*fn_index));
+                ranges.push(tagged.range);
+                vstack.push(*ret_ty);
+            }
+            Op::ReadStringLen => {
+                let popped = vstack.pop().ok_or(CodegenError::MixedNumericTypes)?;
+                // Receiver must occupy the i32 slot (String pointer).
+                if popped.wasm_slot() != IrType::I32 {
+                    return Err(CodegenError::MixedNumericTypes);
+                }
+                // `i32.load offset=0 align=2` reads the u32 LE length
+                // prefix; `i64.extend_i32_u` widens to the I64 return
+                // slot Phase 4.a's `length` signature commits to.
+                f.instruction(&Instruction::I32Load(MemArg {
+                    offset: 0,
+                    align: 2,
+                    memory_index: 0,
+                }));
+                ranges.push(tagged.range);
+                f.instruction(&Instruction::I64ExtendI32U);
+                ranges.push(tagged.range);
+                vstack.push(IrType::I64);
             }
         }
     }

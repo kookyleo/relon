@@ -34,6 +34,7 @@ use std::collections::HashMap;
 
 use crate::error::LoweringError;
 use crate::ir::{Func, IrType, Module, Op, TaggedOp};
+use crate::stdlib::{builtin_stdlib, stdlib_function_index};
 
 /// Per-function lowering state shared across the recursive walk.
 ///
@@ -603,11 +604,240 @@ fn lower_expr(expr: &Expr, range: TokenRange, ctx: &mut LowerCtx<'_>) -> Result<
         Expr::Binary(op, lhs, rhs) => lower_binary(*op, lhs, rhs, range, ctx),
         Expr::Ternary { cond, then, els } => lower_ternary(cond, then, els, range, ctx),
         Expr::Where { expr, bindings } => lower_where(expr, bindings, range, ctx),
+        Expr::FnCall { path, args } => lower_fn_call(path, args, range, ctx),
         _ => Err(LoweringError::UnsupportedExpr {
             kind: expr.kind().to_string(),
             range,
         }),
     }
+}
+
+/// Phase 4.a: lower an [`Expr::FnCall`] into a stdlib dispatch.
+///
+/// Accepts two forms:
+///
+/// * **Free call**: `path = ["length"]`, `args = [single_value]`. The
+///   value is treated as the lone argument; codegen pops it before
+///   emitting the wasm `call`.
+/// * **Method call**: `path = [<receiver_segments..>, "length"]`,
+///   `args = []`. The leading path segments name the receiver — a
+///   bare identifier (`s.length()`) carries the segments as
+///   `TokenKey::String(name)`, while a parenthesised expression
+///   (`("a").length()`) wraps the receiver in a `TokenKey::Dynamic`.
+///   Both shapes lower the receiver onto the stack as the call's
+///   single argument.
+///
+/// Any other name / arity surfaces as
+/// [`LoweringError::UnknownStdlibMethod`]; argument-type mismatches
+/// surface as [`LoweringError::StdlibArgTypeMismatch`].
+fn lower_fn_call(
+    path: &[TokenKey],
+    args: &[relon_parser::CallArg],
+    range: TokenRange,
+    ctx: &mut LowerCtx<'_>,
+) -> Result<(), LoweringError> {
+    if path.is_empty() {
+        return Err(LoweringError::UnsupportedExpr {
+            kind: "FnCall(empty-path)".to_string(),
+            range,
+        });
+    }
+    // Final path segment is the method / function name. Earlier
+    // segments either form the receiver (method-call form) or are
+    // unused (free-call form has exactly one path segment).
+    let method_name = match path.last().unwrap() {
+        TokenKey::String(name, _, _) => name.as_str(),
+        _ => {
+            return Err(LoweringError::UnsupportedExpr {
+                kind: "FnCall(non-string-tail-segment)".to_string(),
+                range,
+            });
+        }
+    };
+    let receiver_segments = &path[..path.len() - 1];
+    let arity = if receiver_segments.is_empty() {
+        // Free-call form. Each `CallArg` value contributes one
+        // argument; named args are rejected here (Phase 4.a stdlib
+        // doesn't take keyword args).
+        u32::try_from(args.len()).unwrap_or(u32::MAX)
+    } else {
+        // Method-call form: the receiver becomes argument 0, and any
+        // additional `args` slots become the remaining arguments. For
+        // Phase 4.a only zero-arg methods are accepted; later phases
+        // (concat / substring / ...) will exercise the `1 + args.len()`
+        // path.
+        1u32 + u32::try_from(args.len()).unwrap_or(u32::MAX)
+    };
+
+    // Phase 4.a only opens `length` (String -> Int). Everything else
+    // surfaces a deterministic diagnostic — the analyzer reports the
+    // missing name as `UnresolvedReference`, but the lowering pass
+    // still surfaces its own variant so a hand-built AST or future
+    // stdlib-disabled mode hits a stable rejection.
+    let Some(fn_index) = stdlib_function_index(method_name) else {
+        return Err(LoweringError::UnknownStdlibMethod {
+            name: method_name.to_string(),
+            arity,
+            range,
+        });
+    };
+    // Recover the declared signature so we can pin the param/ret
+    // types onto the emitted `Op::Call`. The codegen pass uses
+    // `param_tys` to validate the vstack at emit time; we keep the
+    // declaration single-sourced via `builtin_stdlib()`.
+    let stdlib_meta = builtin_stdlib()
+        .into_iter()
+        .nth(fn_index as usize)
+        .ok_or_else(|| LoweringError::UnknownStdlibMethod {
+            name: method_name.to_string(),
+            arity,
+            range,
+        })?;
+    if (stdlib_meta.params.len() as u32) != arity {
+        return Err(LoweringError::UnknownStdlibMethod {
+            name: method_name.to_string(),
+            arity,
+            range,
+        });
+    }
+
+    // Lower each argument expression in declaration order so the wasm
+    // stack ends up `[arg0, arg1, ...]` before the `call` op fires.
+    if receiver_segments.is_empty() {
+        // Free-call form. `arg0..argN` come from `args` in order.
+        for (i, call_arg) in args.iter().enumerate() {
+            if call_arg.name.is_some() {
+                return Err(LoweringError::UnsupportedExpr {
+                    kind: format!("FnCall(named-arg `{}` for stdlib)", method_name),
+                    range,
+                });
+            }
+            lower_expr(&call_arg.value.expr, call_arg.value.range, ctx)?;
+            let pushed = ctx.tstack.pop().ok_or(LoweringError::UnsupportedExpr {
+                kind: format!("FnCall(arg{i}-stack-empty for `{}`)", method_name),
+                range,
+            })?;
+            check_stdlib_arg(method_name, i as u32, pushed, &stdlib_meta.params, range)?;
+            ctx.tstack.push(pushed);
+        }
+    } else {
+        // Method-call form. The receiver becomes arg0.
+        lower_method_receiver(receiver_segments, range, ctx)?;
+        let pushed = ctx.tstack.pop().ok_or(LoweringError::UnsupportedExpr {
+            kind: format!("FnCall(receiver-stack-empty for `{}`)", method_name),
+            range,
+        })?;
+        check_stdlib_arg(method_name, 0, pushed, &stdlib_meta.params, range)?;
+        ctx.tstack.push(pushed);
+        for (i, call_arg) in args.iter().enumerate() {
+            if call_arg.name.is_some() {
+                return Err(LoweringError::UnsupportedExpr {
+                    kind: format!("FnCall(named-arg `{}` for stdlib)", method_name),
+                    range,
+                });
+            }
+            lower_expr(&call_arg.value.expr, call_arg.value.range, ctx)?;
+            let pushed = ctx.tstack.pop().ok_or(LoweringError::UnsupportedExpr {
+                kind: format!("FnCall(arg{}-stack-empty for `{}`)", i + 1, method_name),
+                range,
+            })?;
+            check_stdlib_arg(
+                method_name,
+                (i + 1) as u32,
+                pushed,
+                &stdlib_meta.params,
+                range,
+            )?;
+            ctx.tstack.push(pushed);
+        }
+    }
+
+    // Pop the arguments back off the vstack — we kept them around
+    // only so the per-arg type check could re-push the value before
+    // moving on. The Call op below records the actual pops; emit-time
+    // codegen will pop them again from its own vstack.
+    for _ in 0..arity {
+        ctx.tstack.pop();
+    }
+    ctx.out.push(TaggedOp {
+        op: Op::Call {
+            fn_index,
+            arg_count: arity,
+            param_tys: stdlib_meta.params.clone(),
+            ret_ty: stdlib_meta.ret,
+        },
+        range,
+    });
+    ctx.tstack.push(stdlib_meta.ret);
+    Ok(())
+}
+
+/// Lower the receiver of a method-call into the top of the virtual
+/// stack. Single-segment string receivers go through `lower_variable`
+/// (a bare identifier path); a [`TokenKey::Dynamic`] receiver carries
+/// a full sub-expression we lower recursively.
+fn lower_method_receiver(
+    receiver_segments: &[TokenKey],
+    range: TokenRange,
+    ctx: &mut LowerCtx<'_>,
+) -> Result<(), LoweringError> {
+    // The common Phase 4.a shapes:
+    //   `s.length()`           → segments = [String("s")]
+    //   `("hi").length()`      → segments = [Dynamic(Node(String("hi")))]
+    // Anything else (e.g. dotted multi-segment paths like
+    // `a.b.length()`) is reserved for later phases.
+    if receiver_segments.len() == 1 {
+        match &receiver_segments[0] {
+            TokenKey::String(_, _, _) => lower_variable(receiver_segments, range, ctx),
+            TokenKey::Dynamic(node, _) => lower_expr(&node.expr, node.range, ctx),
+            _ => Err(LoweringError::UnsupportedExpr {
+                kind: "FnCall(unsupported-receiver-key)".to_string(),
+                range,
+            }),
+        }
+    } else {
+        Err(LoweringError::UnsupportedExpr {
+            kind: format!(
+                "FnCall(multi-segment-receiver, segments={})",
+                receiver_segments.len()
+            ),
+            range,
+        })
+    }
+}
+
+/// Validate a single argument's IR type against the stdlib
+/// function's declared signature. We compare the **wasm slot** rather
+/// than the exact IR type so a `String` argument (i32 slot) doesn't
+/// require the caller to disambiguate from other i32-shaped types
+/// upstream — the analyzer already enforces stronger typing, and the
+/// codegen layer treats slot equivalence as the bytecode-correctness
+/// invariant.
+fn check_stdlib_arg(
+    name: &str,
+    arg_idx: u32,
+    got: IrType,
+    param_tys: &[IrType],
+    range: TokenRange,
+) -> Result<(), LoweringError> {
+    let expected =
+        *param_tys
+            .get(arg_idx as usize)
+            .ok_or_else(|| LoweringError::UnknownStdlibMethod {
+                name: name.to_string(),
+                arity: param_tys.len() as u32,
+                range,
+            })?;
+    if got.wasm_slot() != expected.wasm_slot() {
+        return Err(LoweringError::StdlibArgTypeMismatch {
+            name: name.to_string(),
+            arg_idx,
+            got,
+            expected,
+            range,
+        });
+    }
+    Ok(())
 }
 
 /// Lower a `<expr> where { name: value, ... }` form by emitting one
