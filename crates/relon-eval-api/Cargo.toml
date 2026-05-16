@@ -1,0 +1,21 @@
+[package]
+name = "relon-eval-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Public types and Evaluator trait shared across Relon evaluation backends"
+keywords = ["evaluator", "api", "dsl", "config", "trait"]
+categories = ["compilers", "config"]
+
+[dependencies]
+relon-parser = { workspace = true }
+relon-analyzer = { workspace = true }
+ordered-float.workspace = true
+# `rc` enables serde derive support for the Arc-wrapped `Value::List` /
+# `Value::Dict` payloads (see `value.rs` for the design rationale).
+serde = { workspace = true, features = ["derive", "rc"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+miette = { workspace = true, features = ["derive"] }
