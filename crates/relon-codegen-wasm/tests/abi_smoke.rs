@@ -16,7 +16,8 @@
 //! accept a schema input (both hashes encode as 32 zero bytes). That
 //! shape comes online in Phase 2.b.
 
-use relon_codegen_wasm::{abi, compile_module, AbiError, LoadError, WasmModule};
+use relon_codegen_wasm::{abi, compile_lowered_entry, AbiError, LoadError, WasmModule};
+use relon_eval_api::schema_canonical::schema_hash;
 use relon_ir::lower_workspace_single;
 use wasmparser::{Parser, Payload};
 
@@ -32,7 +33,28 @@ fn compile_source(src: &str) -> Vec<u8> {
         analyzed.diagnostics
     );
     let ir = lower_workspace_single(&analyzed, &ast).expect("lower");
-    compile_module(&ir).expect("compile")
+    compile_lowered_entry(&ir).expect("compile")
+}
+
+/// Same compile path but also expose the canonical schemas so tests
+/// can hash them independently and confirm the embedded values match.
+fn compile_source_with_schemas(
+    src: &str,
+) -> (
+    Vec<u8>,
+    relon_eval_api::schema_canonical::Schema,
+    relon_eval_api::schema_canonical::Schema,
+) {
+    let ast = relon_parser::parse_document(src).expect("parse");
+    let analyzed = relon_analyzer::analyze(&ast);
+    assert!(
+        !analyzed.has_errors(),
+        "analyzer reported errors: {:?}",
+        analyzed.diagnostics
+    );
+    let ir = lower_workspace_single(&analyzed, &ast).expect("lower");
+    let bytes = compile_lowered_entry(&ir).expect("compile");
+    (bytes, ir.main_schema, ir.return_schema)
 }
 
 /// Closure type used to mutate the abi section's payload in-place.
@@ -131,25 +153,25 @@ fn rewrite_abi_section(bytes: &[u8], mutate: Option<AbiMutator<'_>>) -> Vec<u8> 
 }
 
 #[test]
-fn from_bytes_parses_placeholder_abi_metadata() {
-    // `#main(Int x) -> Int : x * 2` lowers to a Phase 1.beta IR that
-    // codegen handles end-to-end. The compiled module must carry an
-    // abi section with the Phase 2.a placeholder shape.
-    let wasm = compile_source("#main(Int x) -> Int\nx * 2");
+fn from_bytes_carries_real_schema_hashes() {
+    // Phase 2.b: the abi section now embeds the sha256 of the
+    // canonical `#main` schema (params + return) rather than zero
+    // placeholders. The loader must round-trip those hashes byte-for-
+    // byte, and they must match what the host computes from the same
+    // canonical schemas the lowering pass produced.
+    let (wasm, main_schema, return_schema) =
+        compile_source_with_schemas("#main(Int x) -> Int\nx * 2");
     let module = WasmModule::from_bytes(wasm).expect("load");
 
     assert_eq!(module.abi().abi_version, abi::CURRENT_ABI_VERSION);
     assert_eq!(module.abi().codegen_version, abi::CURRENT_CODEGEN_VERSION);
-    assert_eq!(
+    assert_ne!(
         module.abi().main_schema_hash,
         [0u8; 32],
-        "Phase 2.a emits zero placeholder for main_schema_hash"
+        "Phase 2.b emits a real main_schema hash"
     );
-    assert_eq!(
-        module.abi().return_schema_hash,
-        [0u8; 32],
-        "Phase 2.a emits zero placeholder for return_schema_hash"
-    );
+    assert_eq!(module.abi().main_schema_hash, schema_hash(&main_schema));
+    assert_eq!(module.abi().return_schema_hash, schema_hash(&return_schema));
     assert_eq!(module.abi().flags, 0);
 
     // The srcmap section must also be readable — Phase 1.gamma
@@ -159,6 +181,71 @@ fn from_bytes_parses_placeholder_abi_metadata() {
         !module.srcmap().entries.is_empty(),
         "loader must parse the srcmap section alongside abi"
     );
+}
+
+#[test]
+fn from_bytes_with_schema_accepts_matching_pair() {
+    // Host knows the expected `#main` shape — `from_bytes_with_schema`
+    // recomputes the canonical hash and compares against the
+    // embedded value, returning Ok when they match.
+    let (wasm, main_schema, return_schema) =
+        compile_source_with_schemas("#main(Int x) -> Int\nx * 2");
+    let module = WasmModule::from_bytes_with_schema(wasm, &main_schema, &return_schema)
+        .expect("matching schemas must load");
+    assert_eq!(module.abi().main_schema_hash, schema_hash(&main_schema));
+}
+
+#[test]
+fn from_bytes_with_schema_rejects_main_drift() {
+    // A reordered field set produces a different canonical hash, so
+    // the loader must surface SchemaDrift { which: "main" }.
+    let (wasm, _orig_main, return_schema) =
+        compile_source_with_schemas("#main(Int a, Float b) -> Int\na");
+
+    // Construct an "expected" schema with the params swapped.
+    let drifted_main = relon_eval_api::schema_canonical::Schema {
+        name: "MainParams".to_string(),
+        generics: vec![],
+        fields: vec![
+            relon_eval_api::schema_canonical::Field {
+                name: "b".to_string(),
+                ty: relon_eval_api::schema_canonical::TypeRepr::Float,
+                default: None,
+            },
+            relon_eval_api::schema_canonical::Field {
+                name: "a".to_string(),
+                ty: relon_eval_api::schema_canonical::TypeRepr::Int,
+                default: None,
+            },
+        ],
+    };
+
+    match WasmModule::from_bytes_with_schema(wasm, &drifted_main, &return_schema) {
+        Err(LoadError::Abi(AbiError::SchemaDrift { which: "main" })) => {}
+        other => panic!("expected SchemaDrift on main, got {other:?}"),
+    }
+}
+
+#[test]
+fn from_bytes_with_schema_rejects_return_drift() {
+    // Same module, but the caller claims the return field is Float.
+    let (wasm, main_schema, _orig_return) =
+        compile_source_with_schemas("#main(Int x) -> Int\nx * 2");
+
+    let drifted_return = relon_eval_api::schema_canonical::Schema {
+        name: "Ret".to_string(),
+        generics: vec![],
+        fields: vec![relon_eval_api::schema_canonical::Field {
+            name: "value".to_string(),
+            ty: relon_eval_api::schema_canonical::TypeRepr::Float,
+            default: None,
+        }],
+    };
+
+    match WasmModule::from_bytes_with_schema(wasm, &main_schema, &drifted_return) {
+        Err(LoadError::Abi(AbiError::SchemaDrift { which: "return" })) => {}
+        other => panic!("expected SchemaDrift on return, got {other:?}"),
+    }
 }
 
 #[test]

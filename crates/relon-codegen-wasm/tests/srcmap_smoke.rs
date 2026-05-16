@@ -18,7 +18,7 @@
 //! the section before the code section (and thus end up with stale
 //! offsets) fail loudly here rather than silently in production.
 
-use relon_codegen_wasm::{compile_module, srcmap, SrcMap, SrcMapEntry, SrcMapError};
+use relon_codegen_wasm::{compile_lowered_entry, srcmap, SrcMap, SrcMapEntry, SrcMapError};
 use relon_ir::lower_workspace_single;
 use wasmparser::{Parser, Payload};
 
@@ -36,7 +36,7 @@ fn compile_source(src: &str) -> Vec<u8> {
         analyzed.diagnostics
     );
     let ir = lower_workspace_single(&analyzed, &ast).expect("lower");
-    compile_module(&ir).expect("compile")
+    compile_lowered_entry(&ir).expect("compile")
 }
 
 /// Pull the raw `relon.srcmap` custom section bytes out of a wasm
@@ -74,15 +74,21 @@ fn code_section_bounds(bytes: &[u8]) -> (u32, u32) {
 
 #[test]
 fn srcmap_section_present_and_decodes_with_entries_inside_code_section() {
-    // `x * 2 + 1` lowers to:
-    //   local.get 0  (x)
-    //   i64.const 2  (2)
-    //   i64.mul      (x * 2)
-    //   i64.const 1  (1)
-    //   i64.add      (x*2 + 1)
-    //   end          (function exit)
-    // Plus one srcmap entry pinning the function prologue. Six ops
-    // + one prologue = seven entries minimum.
+    // Phase 2.b `x * 2 + 1` lowers to:
+    //   in_len guard       (6 ops)
+    //   out_cap guard      (6 ops)
+    //   load_field x       (2 ops: local.get + i64.load)
+    //   i64.const 2
+    //   i64.mul
+    //   i64.const 1
+    //   i64.add
+    //   store_field ret    (4 ops: local.set tmp; local.get out_ptr;
+    //                       local.get tmp; i64.store)
+    //   i32.const ret_size (bytes_written)
+    //   end
+    // Plus one prologue srcmap entry pinning the function header.
+    // That comes out to roughly 26 entries; assert `>= 20` to allow
+    // future codegen tweaks without making the test brittle.
     let source = "#main(Int x) -> Int\nx * 2 + 1";
     let wasm = compile_source(source);
 
@@ -94,8 +100,8 @@ fn srcmap_section_present_and_decodes_with_entries_inside_code_section() {
         "srcmap should contain at least one entry"
     );
     assert!(
-        srcmap.entries.len() >= 7,
-        "expected >= 7 entries (1 prologue + 5 ops + 1 trailing end), got {}",
+        srcmap.entries.len() >= 20,
+        "expected >= 20 entries (handshake guards + body + epilogue + prologue), got {}",
         srcmap.entries.len()
     );
 
