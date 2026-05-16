@@ -1,15 +1,37 @@
 #![forbid(unsafe_code)]
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use miette::{IntoDiagnostic, LabeledSpan, NamedSource, Report};
 use relon::ResolverChainLoader;
 use relon_analyzer::analyze_entry;
+use relon_codegen_wasm::WasmAotEvaluator;
+use relon_eval_api::Evaluator as EvaluatorTrait;
 use relon_evaluator::module::FilesystemModuleResolver;
 use relon_evaluator::{Capabilities, Context, Scope, TreeWalkEvaluator, Value};
 use relon_parser::{parse_document, ParseDocumentError};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+/// Mirror of [`relon::Backend`] surfaced as a clap-friendly enum so the
+/// CLI accepts `--backend=tree-walk` / `--backend=wasm-aot`. Kept
+/// separate from the public type so the rename / display knobs stay
+/// CLI-only — the library facade picks ergonomic Rust names while the
+/// CLI sticks with kebab-case for muscle-memory.
+#[derive(Debug, Clone, Copy, Default, ValueEnum)]
+enum BackendArg {
+    /// Tree-walking interpreter (default). Supports the full
+    /// `Evaluator` surface including arbitrary `eval` on AST nodes
+    /// and host-registered native fns.
+    #[default]
+    #[value(name = "tree-walk")]
+    TreeWalk,
+    /// Wasm AOT backend. Pre-compiles the entry into wasm and
+    /// dispatches `run_main` through wasmtime. Library-mode
+    /// `eval_root` is rejected — wasm-AOT only ships entries.
+    #[value(name = "wasm-aot")]
+    WasmAot,
+}
 
 #[derive(Parser)]
 #[command(name = "relon")]
@@ -46,6 +68,14 @@ enum Commands {
         /// HTTP / FS helpers).
         #[arg(long)]
         trust: bool,
+        /// Evaluation backend. `tree-walk` (default) runs the original
+        /// interpreter; `wasm-aot` pre-compiles the entry into a
+        /// wasm module via `relon-codegen-wasm` and dispatches
+        /// `run_main` through wasmtime. The wasm-aot backend only
+        /// supports `#main(...)` entries and rejects library-mode
+        /// (no-#main) sources.
+        #[arg(long, value_enum, default_value_t = BackendArg::TreeWalk)]
+        backend: BackendArg,
     },
 
     /// Format or check Relon files. Equivalent to the standalone
@@ -77,6 +107,7 @@ fn main() -> miette::Result<()> {
             pretty,
             args,
             trust,
+            backend,
         } => {
             let canonical_file = std::fs::canonicalize(&file)
                 .into_diagnostic()
@@ -245,14 +276,44 @@ fn main() -> miette::Result<()> {
                         )
                         .with_source_code(NamedSource::new(file.to_string_lossy(), content.clone()))
                     })?;
-                evaluator.run_main(&scope, args_map).map_err(|e| {
-                    Report::new(e)
-                        .with_source_code(NamedSource::new(file.to_string_lossy(), content.clone()))
-                })?
+                match backend {
+                    BackendArg::TreeWalk => evaluator.run_main(&scope, args_map).map_err(|e| {
+                        Report::new(e)
+                            .with_source_code(NamedSource::new(file.to_string_lossy(), content.clone()))
+                    })?,
+                    BackendArg::WasmAot => {
+                        // wasm-AOT compiles the single entry file
+                        // (no transitive imports in v1) through
+                        // codegen + wasmtime and dispatches the same
+                        // host-args HashMap through `run_main`. We
+                        // intentionally re-parse / re-analyze inside
+                        // `from_source` rather than reusing the
+                        // workspace tree: the codegen path wants the
+                        // single-file analyzer output, and folding
+                        // workspace mode into v1 is a Phase 9 goal.
+                        let aot = WasmAotEvaluator::from_source(&content).map_err(|e| {
+                            miette::miette!("wasm-aot backend setup: {e}").with_source_code(
+                                NamedSource::new(file.to_string_lossy(), content.clone()),
+                            )
+                        })?;
+                        EvaluatorTrait::run_main(&aot, args_map).map_err(|e| {
+                            Report::new(e).with_source_code(NamedSource::new(
+                                file.to_string_lossy(),
+                                content.clone(),
+                            ))
+                        })?
+                    }
+                }
             } else {
                 if args.is_some() {
                     return Err(miette::miette!(
                         "--args was provided but the file has no `#main(...)` signature"
+                    )
+                    .with_source_code(NamedSource::new(file.to_string_lossy(), content)));
+                }
+                if matches!(backend, BackendArg::WasmAot) {
+                    return Err(miette::miette!(
+                        "wasm-aot backend only supports `#main(...)` entries; the file declares no signature"
                     )
                     .with_source_code(NamedSource::new(file.to_string_lossy(), content)));
                 }

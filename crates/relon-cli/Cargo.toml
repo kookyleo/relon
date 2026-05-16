@@ -13,7 +13,9 @@ categories = ["command-line-utilities", "config"]
 relon = { workspace = true }
 relon-parser = { workspace = true }
 relon-evaluator = { workspace = true }
+relon-eval-api = { workspace = true }
 relon-analyzer = { workspace = true }
+relon-codegen-wasm = { workspace = true }
 relon-fmt = { workspace = true }
 relon-lsp = { workspace = true }
 clap = { workspace = true, features = ["derive"] }

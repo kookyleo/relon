@@ -1738,6 +1738,8 @@ dependencies = [
  "miette",
  "relon",
  "relon-analyzer",
+ "relon-codegen-wasm",
+ "relon-eval-api",
  "relon-evaluator",
  "relon-fmt",
  "relon-lsp",
