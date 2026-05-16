@@ -488,6 +488,111 @@ impl<'a> BufferReader<'a> {
         Ok(out)
     }
 
+    /// Decode the buffer-relative pointer slot for a nested branded
+    /// dict field. Returns a fresh [`BufferReader`] anchored at the
+    /// sub-record's fixed-area base, sharing the parent's underlying
+    /// byte buffer.
+    ///
+    /// Phase 3.b: branded dict fields lay their fixed area in the
+    /// parent's tail area, addressed through a 4-byte pointer slot in
+    /// the parent's fixed area. The sub-record's own pointer-indirect
+    /// children (its String / List<Int> / nested Dict slots) keep
+    /// pointing into the same shared buffer — `sub_record` borrows the
+    /// parent bytes verbatim, so a subsequent `read_string` on the
+    /// sub-reader resolves through the same tail area without copying.
+    ///
+    /// `sub_layout` is the [`OffsetTable`] for the sub-schema (e.g.
+    /// computed via [`crate::layout::SchemaLayout::offsets_for`]).
+    /// `sub_fields` is the schema-declared field list — pass
+    /// `sub_schema.fields.as_slice()` so the returned reader can
+    /// type-check its own field accesses.
+    pub fn sub_record(
+        &self,
+        field_name: &str,
+        sub_layout: &'a OffsetTable,
+        sub_fields: &[Field],
+    ) -> Result<BufferReader<'a>, BufferError> {
+        // Locate the parent's pointer slot. We don't constrain the
+        // declared `TypeRepr` here because the caller already knows
+        // the sub-schema — re-matching it would duplicate the schema
+        // walker. Use a wildcard type check via an opt-in helper to
+        // get the offset + kind back.
+        let entry = self
+            .field_index
+            .iter()
+            .find(|(name, _, _, _, _)| name == field_name)
+            .ok_or_else(|| BufferError::UnknownField {
+                name: field_name.to_string(),
+            })?;
+        if !matches!(entry.1, TypeRepr::Schema { .. }) {
+            return Err(BufferError::TypeMismatch {
+                name: field_name.to_string(),
+                declared: type_label(&entry.1),
+                requested: "Schema",
+            });
+        }
+        if !matches!(entry.4, FieldKind::PointerIndirect { .. }) {
+            return Err(BufferError::MalformedPayload {
+                name: field_name.to_string(),
+                reason: "expected pointer-indirect kind",
+            });
+        }
+        let ptr_offset = entry.2;
+        if ptr_offset
+            .checked_add(4)
+            .map(|end| end > self.bytes.len())
+            .unwrap_or(true)
+        {
+            return Err(BufferError::MalformedPayload {
+                name: field_name.to_string(),
+                reason: "pointer slot exceeds buffer end",
+            });
+        }
+        let mut ptr_buf = [0u8; 4];
+        ptr_buf.copy_from_slice(&self.bytes[ptr_offset..ptr_offset + 4]);
+        let sub_base = u32::from_le_bytes(ptr_buf) as usize;
+        let sub_end =
+            sub_base
+                .checked_add(sub_layout.root_size)
+                .ok_or_else(|| BufferError::MalformedPayload {
+                    name: field_name.to_string(),
+                    reason: "sub-record end overflows usize",
+                })?;
+        if sub_end > self.bytes.len() {
+            return Err(BufferError::MalformedPayload {
+                name: field_name.to_string(),
+                reason: "sub-record exceeds buffer end",
+            });
+        }
+        // The sub-reader walks the **same** underlying buffer slice —
+        // not a slice starting at `sub_base`. Its `bytes` covers the
+        // whole parent buffer because the sub-record's own pointer-
+        // indirect slots store offsets relative to the buffer base.
+        // We instead re-base each field by adding `sub_base` to the
+        // declared offset, which `BufferReader::new` doesn't do for
+        // us — so we build the field-index manually.
+        let field_index = sub_layout
+            .fields
+            .iter()
+            .filter_map(|fo| {
+                sub_fields.iter().find(|f| f.name == fo.name).map(|f| {
+                    (
+                        fo.name.clone(),
+                        f.ty.clone(),
+                        sub_base + fo.offset,
+                        fo.size,
+                        fo.kind,
+                    )
+                })
+            })
+            .collect();
+        Ok(BufferReader {
+            layout: sub_layout,
+            field_index,
+            bytes: self.bytes,
+        })
+    }
+
     /// Resolve a fixed-area `u32` pointer slot into `(payload_count,
     /// payload_byte_offset)`. `inner_alignment` controls the padding
     /// between the length prefix and the payload bytes — `String`
@@ -574,8 +679,9 @@ impl<'a> BufferReader<'a> {
 }
 
 /// Compare a schema-declared [`TypeRepr`] against the one a writer /
-/// reader assumed. Phase 2.c keeps the match exact — scalar leaves,
-/// `String`, and `List<Int>` are the supported shapes.
+/// reader assumed. Phase 3.b extends the match set to include nested
+/// branded `Schema { ... }` slots — the sub-record reader compares
+/// schemas by structural equality of the canonical form.
 fn type_matches(declared: &TypeRepr, requested: &TypeRepr) -> bool {
     match (declared, requested) {
         (TypeRepr::Int, TypeRepr::Int)
@@ -586,6 +692,7 @@ fn type_matches(declared: &TypeRepr, requested: &TypeRepr) -> bool {
         (TypeRepr::List { element: d }, TypeRepr::List { element: r }) => {
             matches!((d.as_ref(), r.as_ref()), (TypeRepr::Int, TypeRepr::Int))
         }
+        (TypeRepr::Schema { schema: d }, TypeRepr::Schema { schema: r }) => d == r,
         _ => false,
     }
 }
@@ -849,6 +956,154 @@ mod tests {
         let err = BufferReader::new(&layout, &schema.fields, &short)
             .expect_err("short buffer must reject");
         assert!(matches!(err, BufferError::BufferTooSmall { .. }));
+    }
+
+    /// Hand-build a buffer matching the host->wasm wire shape for an
+    /// outer `Usr { Addr addr, String name }` record so the
+    /// `sub_record` reader test exercises both a nested record and a
+    /// trailing String alongside it. Keeps the layout details in one
+    /// place — the asserts focus on the reader returning the right
+    /// values rather than the exact tail-area byte arithmetic.
+    fn build_usr_buffer() -> (Schema, Schema, Vec<u8>) {
+        let addr_schema = Schema {
+            name: "Addr".into(),
+            generics: vec![],
+            fields: vec![field("city", TypeRepr::String), field("zip", TypeRepr::Int)],
+        };
+        let usr_schema = Schema {
+            name: "Usr".into(),
+            generics: vec![],
+            fields: vec![
+                field(
+                    "addr",
+                    TypeRepr::Schema {
+                        schema: Box::new(addr_schema.clone()),
+                    },
+                ),
+                field("name", TypeRepr::String),
+            ],
+        };
+        let usr_layout = SchemaLayout::offsets_for(&usr_schema).expect("usr layout");
+        let addr_layout = SchemaLayout::offsets_for(&addr_schema).expect("addr layout");
+
+        // Fixed area sizes: Usr.root_size = 8 (two 4-byte pointers);
+        // Addr.root_size = 16 (4-byte ptr + 4 pad + 8 int). Bytes are
+        // assembled by hand so the layout invariants stay visible at
+        // the call site of the test.
+        let usr_root = usr_layout.root_size;
+        assert_eq!(usr_root, 8);
+        assert_eq!(addr_layout.root_size, 16);
+
+        let mut bytes = vec![0u8; usr_root];
+
+        // Sub-record Addr fixed area lives in the tail at offset =
+        // usr_root, padded up to addr_layout.root_align (=8). 8 is
+        // already aligned.
+        let addr_base = bytes.len();
+        bytes.resize(addr_base + addr_layout.root_size, 0);
+
+        // String "BJ" tail record at offset following Addr.
+        let bj_offset = bytes.len();
+        bytes.extend_from_slice(&(2u32).to_le_bytes());
+        bytes.extend_from_slice(b"BJ");
+        // Patch Addr.city pointer (offset 0 inside Addr).
+        let bj_ptr = bj_offset as u32;
+        bytes[addr_base..addr_base + 4].copy_from_slice(&bj_ptr.to_le_bytes());
+        // Patch Addr.zip = 100000 at offset 8 inside Addr.
+        bytes[addr_base + 8..addr_base + 16].copy_from_slice(&100000i64.to_le_bytes());
+
+        // String "Bob" tail record. Pad up to 4-byte boundary first
+        // since the previous "BJ" ended at an odd byte position.
+        while !bytes.len().is_multiple_of(4) {
+            bytes.push(0);
+        }
+        let bob_offset = bytes.len();
+        bytes.extend_from_slice(&(3u32).to_le_bytes());
+        bytes.extend_from_slice(b"Bob");
+
+        // Patch the Usr fixed area: addr pointer slot at offset 0,
+        // name pointer slot at offset 4.
+        let addr_ptr = addr_base as u32;
+        bytes[0..4].copy_from_slice(&addr_ptr.to_le_bytes());
+        bytes[4..8].copy_from_slice(&(bob_offset as u32).to_le_bytes());
+
+        (usr_schema, addr_schema, bytes)
+    }
+
+    #[test]
+    fn sub_record_reads_nested_dict_fields() {
+        let (usr_schema, addr_schema, bytes) = build_usr_buffer();
+        let usr_layout = SchemaLayout::offsets_for(&usr_schema).expect("usr layout");
+        let addr_layout = SchemaLayout::offsets_for(&addr_schema).expect("addr layout");
+        let reader = BufferReader::new(&usr_layout, &usr_schema.fields, &bytes).expect("usr");
+
+        let sub = reader
+            .sub_record("addr", &addr_layout, &addr_schema.fields)
+            .expect("sub");
+        assert_eq!(sub.read_string("city").expect("city"), "BJ");
+        assert_eq!(sub.read_int("zip").expect("zip"), 100000);
+        // Parent reader still reaches the trailing top-level String.
+        assert_eq!(reader.read_string("name").expect("name"), "Bob");
+    }
+
+    #[test]
+    fn sub_record_rejects_non_schema_field() {
+        // `name` is a String, not a sub-schema — sub_record must
+        // refuse rather than read random bytes out of the buffer.
+        let (usr_schema, addr_schema, bytes) = build_usr_buffer();
+        let usr_layout = SchemaLayout::offsets_for(&usr_schema).expect("usr layout");
+        let addr_layout = SchemaLayout::offsets_for(&addr_schema).expect("addr layout");
+        let reader = BufferReader::new(&usr_layout, &usr_schema.fields, &bytes).expect("usr");
+        let err = reader
+            .sub_record("name", &addr_layout, &addr_schema.fields)
+            .expect_err("non-schema slot");
+        assert!(matches!(
+            err,
+            BufferError::TypeMismatch {
+                requested: "Schema",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn sub_record_unknown_field_rejected() {
+        let (usr_schema, addr_schema, bytes) = build_usr_buffer();
+        let usr_layout = SchemaLayout::offsets_for(&usr_schema).expect("usr layout");
+        let addr_layout = SchemaLayout::offsets_for(&addr_schema).expect("addr layout");
+        let reader = BufferReader::new(&usr_layout, &usr_schema.fields, &bytes).expect("usr");
+        let err = reader
+            .sub_record("missing", &addr_layout, &addr_schema.fields)
+            .expect_err("missing");
+        assert!(matches!(err, BufferError::UnknownField { .. }));
+    }
+
+    #[test]
+    fn nested_schema_layout_picks_inner_alignment() {
+        // Schema { String s, Int i } pulls root_align up to 8, so a
+        // parent slot referencing it lays out as a pointer-indirect
+        // field with `tail_alignment: 8`.
+        let inner = Schema {
+            name: "Inner".into(),
+            generics: vec![],
+            fields: vec![field("s", TypeRepr::String), field("i", TypeRepr::Int)],
+        };
+        let outer = Schema {
+            name: "Outer".into(),
+            generics: vec![],
+            fields: vec![field(
+                "child",
+                TypeRepr::Schema {
+                    schema: Box::new(inner),
+                },
+            )],
+        };
+        let table = SchemaLayout::offsets_for(&outer).expect("layout");
+        let kind = table.fields[0].kind;
+        assert!(matches!(
+            kind,
+            FieldKind::PointerIndirect { tail_alignment: 8 }
+        ));
     }
 
     #[test]
