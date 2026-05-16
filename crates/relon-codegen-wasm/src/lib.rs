@@ -31,11 +31,13 @@
 //! reject schema drift at load time.
 
 pub mod abi;
+pub mod host_fns;
 pub mod error;
 pub mod srcmap;
 
 pub use abi::{AbiError, AbiMetadata};
 pub use error::{CodegenError, LoadError};
+pub use host_fns::{HostFnEntry, HostFnError, HostFnTable, NO_CAPABILITY};
 pub use srcmap::{Entry as SrcMapEntry, SrcMap, SrcMapError};
 
 use relon_eval_api::layout::{OffsetTable, SchemaLayout};
