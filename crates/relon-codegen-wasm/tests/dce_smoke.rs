@@ -25,11 +25,11 @@ fn compile_wasm(src: &str) -> Vec<u8> {
     compile_lowered_entry(&ir).expect("compile")
 }
 
-/// Inspect a wasm module's structural counts (function section count
-/// + element-section funcref slot count + whether a table section
-/// was emitted). Used by the DCE assertions to verify the post-DCE
-/// binary is the expected shape without having to crack open every
-/// section.
+/// Inspect a wasm module's structural counts (function section
+/// count + element-section funcref slot count + whether a table
+/// section was emitted). Used by the DCE assertions to verify the
+/// post-DCE binary is the expected shape without having to crack
+/// open every section.
 #[derive(Debug, Default)]
 struct ModuleShape {
     /// Number of entries in the module's `FunctionSection` — i.e.
@@ -110,9 +110,7 @@ fn dce_lambda_kept() {
     // but the assertion is shape-tolerant). The exact count varies
     // with the bundled stdlib's reach graph; pin `>= 3` so the test
     // stays robust against future helpers without losing its punch.
-    let wasm = compile_wasm(
-        "#main(List<Int> xs) -> Int\nxs.fold(0, (Int acc, Int x) => acc + x)",
-    );
+    let wasm = compile_wasm("#main(List<Int> xs) -> Int\nxs.fold(0, (Int acc, Int x) => acc + x)");
     let shape = inspect_module(&wasm);
     assert!(
         shape.fn_section_count >= 3,

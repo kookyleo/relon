@@ -149,9 +149,9 @@ where
     // also ensures schema methods (callable through Op::Call from
     // #main or sibling methods) keep their stdlib callees alive
     // even if #main itself never reaches that callee.
-    for idx in stdlib_count..total {
-        if !visited[idx] {
-            visited[idx] = true;
+    for (idx, slot) in visited.iter_mut().enumerate().skip(stdlib_count) {
+        if !*slot {
+            *slot = true;
             work.push(idx);
         }
     }
@@ -190,8 +190,8 @@ where
     let stdlib_count_after = reachable_stdlib.len();
     // User slots are always kept; remap by appending after the
     // reachable stdlib prefix.
-    for old_idx in stdlib_count..total {
-        remap[old_idx] = new_idx;
+    for slot in remap.iter_mut().skip(stdlib_count) {
+        *slot = new_idx;
         new_idx += 1;
     }
 
@@ -316,11 +316,11 @@ mod tests {
         // calling stdlib 1; user 2 = unused user fn.
         // closure_table = [1] (the lambda's user index).
         let funcs = vec![
-            empty(),         // stdlib 0
-            empty(),         // stdlib 1
-            empty(),         // user 0 (#main)
+            empty(),          // stdlib 0
+            empty(),          // stdlib 1
+            empty(),          // user 0 (#main)
             with_calls(&[1]), // user 1 (lambda)
-            empty(),         // user 2
+            empty(),          // user 2
         ];
         let plan = compute_plan(&funcs, 2, Some(2), &[1]);
         // stdlib 1 reachable through lambda; stdlib 0 not.
