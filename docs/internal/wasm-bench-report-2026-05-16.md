@@ -553,6 +553,116 @@ wasm_aot_warm_invoke, tree_walk_total, tree_walk_warm_invoke}/scenario/<name>/ne
 | 9.b-2 | LoadFieldAtAbsolute / cap_grants binding | String/ListInt 输入绑 + Capabilities ↔ caps_avail | 功能修复，bench 持平 |
 | 9.b-3 | analyzer where-scope fix + AOT cache | strict-mode where 通过；磁盘 cache + `from_source_with_cache` | cold cached −54 % |
 
+## 附录 A.7：v4 native code cache bench（Phase 9.c-1，2026-05-17）
+
+Phase 9.c-1 把 v3 留给"下一阶段"的 cranelift native code 缓存补齐：
+`AotCache` 新增 `.native` sidecar 存 `wasmtime::Module::serialize` 的输
+出，下次启动时 `WasmAotEvaluator::from_source_with_cache` 通过
+`unsafe { Module::deserialize(&engine, &native_bytes) }` 直接吃机器
+码，**跳过 cranelift JIT**。
+
+`.meta` 同步升到 format v2，多塞一个 `native_compat_hash`（sha256 over
+`wasmtime-44` tag + `std::env::consts::{ARCH, OS, FAMILY}` + `usize::
+BITS`）。`load_native` 在读盘前先做一道 compat hash 校验：版本 / 目标
+机型一漂 → 直接返 `None`，wasm 侧仍可用，host 重新 JIT 后 best-effort
+覆写一份新的 `.native`。这一步让 cache 跨 wasmtime 升级 / 跨机器型号
+自动自愈，不需要 host 手动清缓存。
+
+同一台 bench 笔记本 + 同一 criterion 配置（`sample_size(50)`,
+`measurement_time(8s)`），`wasm_aot_cold_start_cached` 是这一阶段唯一
+显著变动的 group，其余四组（`wasm_aot_cold_start`，
+`wasm_aot_warm_invoke`，`tree_walk_total`，`tree_walk_warm_invoke`）
+与 v3 持平（噪声内）。
+
+### wasm-AOT cached cold start（v3 → v4）
+
+| Scenario        | v3 cached (μ) | v4 cached (μ) | v4 / v3 | v4 / v3 cold（2.34 ms baseline） |
+| --- | ---: | ---: | ---: | ---: |
+| `arithmetic`    | 1.081 ms | **169.2 μs** | −84.3 % | −92.8 % |
+| `dict_literal`  | 1.070 ms | **172.0 μs** | −83.9 % | −92.7 % |
+| `stdlib_length` | 1.035 ms | **171.9 μs** | −83.4 % | −92.4 % |
+
+v4 cached cold start 落到 ~170 μs，比 v3 cached（~1.07 ms）再降 ≈ 6.3×，
+比 v3 无 cache cold（~2.34 ms）总共降 ≈ 13.8×。
+
+剩余 ~170 μs 的成本结构（粗估，没做 perf annotate）：
+
+- `Engine::default()`：wasmtime 内部 Arc 池 + cranelift fixture init，
+  ~50-100 μs 量级。这部分是任务书里 < 100 μs 目标没拿下的主要原因，
+  下一 9.c-2 / 9.c-3 子任务可以考虑把 `Engine` 池化到 evaluator 外
+  层（wasmtime 的 `Engine` 本身是 `Clone` + 内部 Arc）。
+- `Module::deserialize`：~20-30 μs，纯 memcpy + 头部校验，几乎不可压。
+- 磁盘 IO：`.wasm`（几 KB）+ `.meta`（83 B）+ `.schemas`（~200 B）+
+  `.native`（~50 KB），按系统 page cache 命中估 ~10-30 μs。
+- `WasmModule::from_bytes`：parse `relon.abi` / `relon.srcmap` /
+  `relon.uctab` 三个 custom section，~10-20 μs。
+- `serde_json::from_slice::<CachedSchemas>`：~5-10 μs。
+
+任务书要求 < 100 μs 没完全达到（实测 ~170 μs），但比 v3 (1.07 ms) 已
+经下降 ≈ 84 %，把 9.b-3 / 9.c-1 两阶段合并算就是 cold cached 从
+v2 没 cache 的 2.25 ms 降到 v4 cached + native 的 170 μs，**总共
+−92.4 %**。下一 9.c-2 agent 接 Engine 池化能继续往 < 100 μs 推。
+
+### wasm-AOT cold start / warm invoke / tree-walker（v3 → v4 持平）
+
+Phase 9.c-1 没动 `from_source` / `run_main_inner` / tree-walker / 任
+何 codegen 路径，所以这四个 group 的中位数与 v3 在噪声带内一致。
+v4 实测：
+
+| Group | Scenario | v3 Median | v4 Median |
+| --- | --- | ---: | ---: |
+| `wasm_aot_cold_start` | `arithmetic`    | 2.339 ms | 2.260 ms |
+| `wasm_aot_cold_start` | `dict_literal`  | 2.367 ms | 2.344 ms |
+| `wasm_aot_cold_start` | `stdlib_length` | 2.257 ms | 2.314 ms |
+| `wasm_aot_warm_invoke`| `arithmetic`    | 1.102 μs | 1.101 μs |
+| `wasm_aot_warm_invoke`| `dict_literal`  | 1.311 μs | 1.280 μs |
+| `wasm_aot_warm_invoke`| `stdlib_length` | 1.114 μs | 1.105 μs |
+
+`wasm_aot_cold_start` 的小幅波动跟过去三个版本一样落在 ±3 %，与本
+phase 改动无关。
+
+### 决策与遗留
+
+- **`.native` sidecar 的安全模型**：`Module::deserialize` 在 wasmtime
+  44 是 unsafe 函数（"trivially execute arbitrary code if fed forged
+  bytes"）。我们用三层防护把 unsafe surface 收到一行：
+  1. crate-level lint 从 `forbid(unsafe_code)` 改成 `deny`，单点
+     `#[allow(unsafe_code)]` 标在 `cache::deserialize_native` 这个
+     专用 helper 上，注释明确 SAFETY 契约。
+  2. `load_native` 在 reader 端用 `native_compat_hash` 做强校验，跨版
+     本 / 跨架构的 blob 不会进 unsafe 区。
+  3. wasmtime 自己在 deserialize 内部还有一层 magic / 版本校验，本
+     工程的 compat hash 算 pre-load 快速拒绝。
+- **version drift 选 wasmtime tag + 主机 triple**：用 `wasmtime-44`
+  这个字面常量代替运行时去抓 wasmtime crate 版本（macro 抓不到
+  dependency crate 版本，build script 又不想加）。每次 bump wasmtime
+  major 都得手动改 `WASMTIME_VERSION_TAG`——这是显式 invalidation，
+  比 silently mis-comparing 安全。
+- **corrupted `.native` 自动 fallback**：deserialize 失败 → evaluator
+  内部静默回退到 `Module::new` JIT path，并且 best-effort 覆写一份
+  全新的 `.native`，让下一次 cold start 重新命中 fast path。这套自
+  愈逻辑让 cache 对 partial write / NFS 截断这类瞬时 FS 错误鲁棒。
+- **没拿下 < 100 μs 的根因**：`Engine::default()` 占了剩余 170 μs 的
+  大头。`Engine` 是 wasmtime 的 Arc 容器，跨 `WasmAotEvaluator` 池化
+  即可干掉这部分常数，但要改的接口面比 9.c-1 任务书要求的"只动
+  cache"更宽——推到 9.c-2。
+- **bench 数据持久化**：`target/criterion/wasm_aot_cold_start_cached/
+  scenario/*/new/estimates.json`。所有 v4 数字均来自此次 bench
+  本机（`Linux 6.8.0-110-generic`），未做多机或多次平均。
+
+### Phase 9.c-1 阶段读数
+
+| 路径 | scenario | v4 中位数 | 对比 v3 cached | 对比 v3 cold (无 cache) |
+| --- | --- | ---: | --- | --- |
+| wasm-AOT cold（命中 cache + native）| `arithmetic` | **169 μs** | −84 % | −93 % |
+| wasm-AOT cold（无 cache）           | `arithmetic` | 2.26 ms | 持平 | baseline |
+| wasm-AOT warm invoke                | `arithmetic` | 1.10 μs | 持平 | — |
+| tree-walker warm                    | `arithmetic` | ~2.64 μs | 持平 | wasm-AOT v4 warm 仍快 ≈ 2.4× |
+
+"host 重启后第一次跑同一脚本"的 cold-cached 路径：v4 把数字从 v3
+的 1.08 ms 一路压到 169 μs。后续工作（Engine 池化 / `InstancePre`
+跨 store / Phase 4.c stdlib allocator）由下一 phase 接力。
+
 到此 Phase 9.b 三个子任务都收齐——warm invoke 已经从 v1 的 44 μs 量级
 压到 1 μs 量级，cold start 也从 2.3 ms 量级（带 cache）压到 1 ms 量
 级。剩下两块（`Module::serialize` 持久 native code、`InstancePre` 真
