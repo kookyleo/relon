@@ -1,9 +1,3 @@
-// Wired up in the follow-up commit that threads `ReachabilityPlan`
-// through `compile_module_with_host_fns`. This module ships first
-// (with its own unit tests) so the BFS implementation can be
-// reviewed in isolation before the codegen integration lands.
-#![allow(dead_code)]
-
 //! Phase v3+ a-2 stdlib dead-code elimination.
 //!
 //! Walks the combined `[stdlib | user]` function table starting from
