@@ -800,6 +800,23 @@ fn type_node_to_canonical_with_schemas(
     if let Some(scalar) = type_node_to_canonical(t) {
         return Some(scalar);
     }
+    // Phase 10-c: `List<User>` — the head is `List` with a single
+    // generic naming a user schema. Recurse into the generic via
+    // `with_schemas` so the inner schema lookup succeeds, then wrap
+    // it in a List variant.
+    if t.path.len() == 1
+        && t.path[0].as_str() == "List"
+        && t.generics.len() == 1
+        && t.variant_fields.is_none()
+    {
+        let inner = type_node_to_canonical_with_schemas(&t.generics[0], resolver)?;
+        if matches!(inner, TypeRepr::Schema { .. }) {
+            return Some(TypeRepr::List {
+                element: Box::new(inner),
+            });
+        }
+        return None;
+    }
     // Only a single-segment, non-variant, non-generic head can name a
     // user schema. Anything else falls through.
     if t.path.len() != 1 || !t.generics.is_empty() || t.variant_fields.is_some() {
@@ -871,11 +888,14 @@ fn type_node_to_canonical(t: &TypeNode) -> Option<TypeRepr> {
         ("Null", []) => Some(TypeRepr::Null),
         ("String", []) => Some(TypeRepr::String),
         ("List", [elem]) => {
-            // Phase 2.c only opens `List<Int>`; everything else
-            // stays out of the surface so the layout pass doesn't
-            // have to model String / Float / Bool element tail areas.
+            // Phase 10-c: `List<T>` with T in `{Int, Float, Bool,
+            // String}` is supported via the matching IR / layout
+            // paths. Nested lists / Option / Result still reject.
             let inner = type_node_to_canonical(elem)?;
-            if matches!(inner, TypeRepr::Int) {
+            if matches!(
+                inner,
+                TypeRepr::Int | TypeRepr::Float | TypeRepr::Bool | TypeRepr::String
+            ) {
                 Some(TypeRepr::List {
                     element: Box::new(inner),
                 })

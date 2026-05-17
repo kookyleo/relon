@@ -1685,7 +1685,13 @@ fn body_needs_tail_cursor(body: &[relon_ir::TaggedOp]) -> bool {
     for tagged in body {
         match &tagged.op {
             Op::StoreField {
-                ty: IrType::String | IrType::ListInt,
+                ty:
+                    IrType::String
+                    | IrType::ListInt
+                    | IrType::ListFloat
+                    | IrType::ListBool
+                    | IrType::ListString
+                    | IrType::ListSchema,
                 ..
             } => {
                 return true;
