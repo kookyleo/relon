@@ -188,6 +188,14 @@ pub enum Op {
     /// downstream comparison / `if` paths refuse mismatched arms
     /// without re-deriving types.
     ConstBool(bool),
+    /// Push an `i32` constant. Stack: `[] -> [i32]`. Phase 4.c-2:
+    /// added so stdlib bodies that perform pointer / length
+    /// arithmetic can materialise immediate sizes without going
+    /// through the i64 slot (which would force wrap/extend
+    /// conversions on every use). Not surfaced as a user-facing
+    /// literal — `Int` literals still lower through
+    /// [`Op::ConstI64`].
+    ConstI32(i32),
     /// Push an `i64` constant. Stack: `[] -> [i64]`.
     ConstI64(i64),
     /// Push an `f64` constant. Stack: `[] -> [f64]`.
@@ -300,6 +308,14 @@ pub enum Op {
     /// lowering — wasm has no `f64.rem`, so `LoweringError::UnsupportedOperator`
     /// fires before this variant is even constructed for floats.
     Mod(IrType),
+    /// Phase 4.c-2: bitwise AND on two operands of the tagged type.
+    /// Stack effect: `[T, T] -> [T]`. Only `I32` / `I64` are valid;
+    /// other tags surface as `CodegenError::MixedNumericTypes`.
+    ///
+    /// Not part of the user-facing surface (Relon-level boolean `and`
+    /// short-circuits); stdlib bodies use it for power-of-two
+    /// alignment masks (e.g. `(x + 7) & -8` to round up to 8).
+    BitAnd(IrType),
     /// Pop two operands of the tagged type, push the boolean result.
     /// Stack: `[T, T] -> [Bool]`. Lowers to `i64.eq` / `f64.eq` /
     /// `i32.eq` depending on `T`'s wasm slot. `Null == Null` always
@@ -834,4 +850,69 @@ pub enum Op {
     /// the wasm bulk-memory proposal which wasmtime keeps enabled
     /// by default, so no engine feature gate is required.
     MemcpyAtAbsolute,
+
+    /// Phase 4.c-2 raw-memory primitive.
+    ///
+    /// Pop an `i32` absolute address and push the unsigned byte at
+    /// `addr + offset` widened to `i32`. Stack effect: `[i32] -> [i32]`.
+    /// Lowers to `i32.load8_u offset=N align=0`.
+    ///
+    /// Used by ASCII case-fold stdlib bodies (`upper` / `lower`)
+    /// and prefix predicates (`starts_with`) to read one byte at a
+    /// time without bitmasking a wider load.
+    LoadI8UAtAbsolute {
+        /// Byte offset added to the popped base address before the
+        /// load.
+        offset: u32,
+    },
+
+    /// Phase 4.c-2 raw-memory primitive.
+    ///
+    /// Pop an `i32` value and an `i32` absolute address, then store
+    /// the value's low byte at `addr + offset`. Stack discipline
+    /// mirrors `i32.store8`: `[addr, value] -> []`. Codegen lowers
+    /// to `i32.store8 offset=N align=0`.
+    ///
+    /// Mirror of [`Op::LoadI8UAtAbsolute`] on the store side.
+    StoreI8AtAbsolute {
+        /// Byte offset added to the address operand before the
+        /// store.
+        offset: u32,
+    },
+
+    /// Phase 4.c-2: emit a wasm `unreachable` whose
+    /// `relon.uctab` entry tags the trap kind. Codegen routes the
+    /// runtime trap through `WasmModule::translate_trap` so the
+    /// surfaced [`relon_eval_api::RuntimeError`] picks up the
+    /// matching tag (`WasmIndexOutOfBounds`, `WasmEmptyList`).
+    /// Stack effect: `[] -> [...]` — the wasm verifier treats every
+    /// op after a `Trap` as unreachable.
+    ///
+    /// Reserved for stdlib bodies and future analyzer-driven
+    /// invariant checks; user-surface lowering currently does not
+    /// emit this op directly. The `kind` is restricted to the
+    /// trap variants that have no semantic payload — capability /
+    /// scratch / value-too-large traps still go through their own
+    /// codegen helpers.
+    Trap {
+        /// Tag the codegen records in `relon.uctab` for this trap.
+        /// Restricted to [`TrapKind::IndexOutOfBounds`] and
+        /// [`TrapKind::EmptyList`] in this phase.
+        kind: TrapKind,
+    },
+}
+
+/// Phase 4.c-2 stdlib trap discriminator. Mirrors the relevant
+/// [`relon_codegen_wasm::UnreachableKind`] variants but stays
+/// independent of the codegen crate so the IR has no upward
+/// dependency. Codegen maps each variant 1:1 to the matching
+/// `UnreachableKind`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TrapKind {
+    /// `substring` / future `xs[i]` accessors tripped because the
+    /// requested range walks past the receiver's end.
+    IndexOutOfBounds,
+    /// A reducer that requires at least one element (`list_int_max`)
+    /// was called on an empty receiver.
+    EmptyList,
 }

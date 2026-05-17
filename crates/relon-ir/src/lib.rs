@@ -23,7 +23,7 @@ pub mod lowering;
 pub mod stdlib;
 
 pub use error::LoweringError;
-pub use ir::{Func, IrType, Module, NativeImport, Op, TaggedOp, NO_CAPABILITY_BIT};
+pub use ir::{Func, IrType, Module, NativeImport, Op, TaggedOp, TrapKind, NO_CAPABILITY_BIT};
 pub use lowering::{
     lower_workspace, lower_workspace_single, LoweredEntry, MAIN_PARAMS_SCHEMA_NAME,
     MAIN_RETURN_SCHEMA_NAME, RETURN_VALUE_FIELD_NAME, WASM_LOCAL_IN_LEN, WASM_LOCAL_IN_PTR,
