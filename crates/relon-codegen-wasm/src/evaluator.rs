@@ -266,6 +266,22 @@ pub struct WasmAotEvaluator {
     /// [`relon_eval_api::CapabilityBit`]. Defaults to the zero-trust
     /// grant set (`Capabilities::default`).
     cap_grants: u64,
+    /// Phase a-1: per-`run_main` wasm step budget enforced via
+    /// wasmtime's `Store::set_fuel`. `0` means unlimited — the hot
+    /// path skips the `set_fuel` call entirely so non-budgeted hosts
+    /// keep their previous overhead. A non-zero value re-stamps the
+    /// session's store with that fuel count before every dispatch, so
+    /// each `run_main` gets a fresh budget independent of prior calls
+    /// (wasmtime decrements fuel monotonically — without a reset the
+    /// pool's second call would inherit whatever the first call left
+    /// behind, which is almost never what a host wants).
+    ///
+    /// Bit positions: 1 fuel unit ≈ 1 wasm instruction; `nop` / `drop`
+    /// / `block` / `loop` are free. See wasmtime's `Store::set_fuel`
+    /// docs for the full table. The unit is **not** wall-clock time
+    /// nor cycles — choose a limit that matches the entry's wasm
+    /// instruction count, not its expected latency.
+    fuel_limit: u64,
     /// Free-list of warmed-up [`WasmSession`]s. Per-call cost on a hit
     /// is just the buffer marshal + wasm dispatch; misses pay the
     /// `Store::new` + `InstancePre::instantiate` price once.
@@ -446,6 +462,7 @@ impl WasmAotEvaluator {
             return_layout,
             out_cap: DEFAULT_OUT_CAP,
             cap_grants: Capabilities::default().to_cap_bitmap(),
+            fuel_limit: 0,
             session_pool: Mutex::new(Vec::new()),
         })
     }
@@ -589,6 +606,7 @@ impl WasmAotEvaluator {
             // prologue traps with `CapabilityDenied` when a #native
             // call needs a bit the bitmap doesn't carry.
             cap_grants: Capabilities::default().to_cap_bitmap(),
+            fuel_limit: 0,
             session_pool: Mutex::new(Vec::new()),
         })
     }
@@ -617,6 +635,45 @@ impl WasmAotEvaluator {
     pub fn with_capabilities(mut self, caps: Capabilities) -> Self {
         self.cap_grants = caps.to_cap_bitmap();
         self
+    }
+
+    /// Phase a-1: cap per-`run_main` wasm execution at `limit` fuel
+    /// units (≈ one unit per wasm instruction; `nop` / `drop` /
+    /// `block` / `loop` are free — see wasmtime's `Store::set_fuel`
+    /// docs for the precise table).
+    ///
+    /// `limit = 0` disables the budget entirely: the hot path skips
+    /// `set_fuel` so non-budgeted hosts keep their previous overhead.
+    /// A non-zero value re-stamps the session's store with that fuel
+    /// count on every dispatch, so each call starts with a fresh
+    /// budget independent of what previous calls consumed (wasmtime
+    /// decrements fuel monotonically — without a per-call reset the
+    /// second call out of the pool would inherit a near-zero
+    /// remainder).
+    ///
+    /// When the budget runs out wasmtime traps with
+    /// [`wasmtime::Trap::OutOfFuel`]; the trap translator maps it to
+    /// [`RuntimeError::WasmStepLimitExceeded`]. The `range` field is
+    /// best-effort — when the trap's pc lands inside the codegen's
+    /// srcmap the original span is attached, otherwise the variant
+    /// surfaces with `range = None`.
+    ///
+    /// The budget is **not** wall-clock time nor cycles: a tight
+    /// arithmetic loop and a heavy stdlib call can have wildly
+    /// different fuel costs at the same wall-clock budget. Tune
+    /// against the entry's expected instruction count, not its
+    /// latency.
+    pub fn with_fuel_limit(mut self, limit: u64) -> Self {
+        self.fuel_limit = limit;
+        self
+    }
+
+    /// Borrow the configured per-call fuel budget. Hosts that want to
+    /// double-check what the evaluator will enforce on the next
+    /// `run_main` can read this before dispatching. `0` means
+    /// unlimited (the default).
+    pub fn fuel_limit(&self) -> u64 {
+        self.fuel_limit
     }
 
     /// Borrow the wrapped [`WasmModule`] — useful for hosts that
@@ -831,6 +888,25 @@ impl WasmAotEvaluator {
                 ))),
                 session,
             );
+        }
+
+        // Phase a-1: re-stamp the per-call fuel budget. wasmtime
+        // decrements fuel monotonically, so without a fresh `set_fuel`
+        // the second call out of the pool would inherit whatever the
+        // first call left behind. `0` (the default) is the "unlimited"
+        // shorthand — skip the call entirely so non-budgeted hosts
+        // don't pay the syscall-style cross-call cost on every
+        // dispatch.
+        if self.fuel_limit > 0 {
+            if let Err(e) = session.store.set_fuel(self.fuel_limit) {
+                return (
+                    Err(RuntimeError::IoError(format!(
+                        "wasm set_fuel({}): {e}",
+                        self.fuel_limit
+                    ))),
+                    session,
+                );
+            }
         }
 
         let bw = match session.run_main.call(
