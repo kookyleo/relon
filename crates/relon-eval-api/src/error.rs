@@ -417,4 +417,86 @@ pub enum RuntimeError {
         /// its own constraint (e.g. "wasm-aot has no AST at runtime").
         reason: String,
     },
+
+    /// v3+ a-3: remote `#import "https://..."` resolved an URL but the
+    /// HTTP fetch (DNS / connect / TLS / non-2xx status / body read)
+    /// failed. The payload is boxed so the variant does not bloat the
+    /// `RuntimeError` enum past clippy's `result_large_err` threshold —
+    /// callers should use the `url()` / `cause()` accessors below, or
+    /// destructure `*payload`.
+    #[error("remote import {}: {}", payload.url, payload.cause)]
+    #[diagnostic(
+        code(relon::eval::remote_import_failed),
+        help("The host could not retrieve the remote module. Check connectivity, the URL, and that the server returns a 2xx response with a Relon source body.")
+    )]
+    RemoteImportFailed {
+        payload: Box<RemoteImportFailure>,
+        #[label("remote import failed")]
+        range: TokenRange,
+    },
+
+    /// v3+ a-3: remote `#import "https://..."` was rejected before the
+    /// fetch ran because the active sandbox forbids network egress
+    /// (no `--trust` / no `Capabilities::network`).
+    #[error("remote import {} denied: {}", payload.url, payload.reason)]
+    #[diagnostic(
+        code(relon::eval::remote_import_denied),
+        help("Remote `#import` is a network operation. Run the host with `--trust` (CLI) or grant `Capabilities::network` to allow it.")
+    )]
+    RemoteImportDenied {
+        payload: Box<RemoteImportDenial>,
+        #[label("remote import rejected by sandbox")]
+        range: TokenRange,
+    },
+
+    /// v3+ a-3: an explicit integrity hash was supplied alongside a
+    /// remote `#import`, and the fetched body's sha256 did not match.
+    /// The pinning syntax itself is **not** wired in this phase, but
+    /// the variant ships so future syntax work (or an out-of-band
+    /// lockfile) can reuse the error surface without churning the
+    /// enum.
+    #[error(
+        "remote import {} hash mismatch: expected {}, got {}",
+        payload.url,
+        payload.expected,
+        payload.got
+    )]
+    #[diagnostic(
+        code(relon::eval::remote_import_hash_mismatch),
+        help("The remote source's sha256 differs from the pinned hash. Either update the pin or refuse to load the module.")
+    )]
+    RemoteImportHashMismatch {
+        payload: Box<RemoteImportHashMismatchDetail>,
+        #[label("hash mismatch on remote import")]
+        range: TokenRange,
+    },
+}
+
+/// Boxed payload for [`RuntimeError::RemoteImportFailed`]. Holds the
+/// URL the host attempted to fetch plus a free-form cause string so
+/// the per-host fetch error type does not leak into the enum surface.
+#[derive(Debug, Clone)]
+pub struct RemoteImportFailure {
+    pub url: String,
+    pub cause: String,
+}
+
+/// Boxed payload for [`RuntimeError::RemoteImportDenied`]. Holds the
+/// URL the script attempted to import plus the human-readable reason
+/// the sandbox refused it.
+#[derive(Debug, Clone)]
+pub struct RemoteImportDenial {
+    pub url: String,
+    pub reason: String,
+}
+
+/// Boxed payload for [`RuntimeError::RemoteImportHashMismatch`]. The
+/// hash-pinning syntax is not wired yet (see the variant doc), but
+/// the type ships so the eventual lockfile / inline-pin work can
+/// produce it without churning the error enum's layout.
+#[derive(Debug, Clone)]
+pub struct RemoteImportHashMismatchDetail {
+    pub url: String,
+    pub expected: String,
+    pub got: String,
 }

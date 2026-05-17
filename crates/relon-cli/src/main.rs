@@ -237,6 +237,13 @@ fn main() -> miette::Result<()> {
                 if trust {
                     ctx.capabilities = Capabilities::all_granted();
                     ctx.prepend_module_resolver(Arc::new(FilesystemModuleResolver::trusted()));
+                    // v3+ a-3: --trust opens remote `#import "https://..."`
+                    // resolution. Resolver lives on native targets only;
+                    // the CLI never runs on wasm32 so an unconditional
+                    // mount is safe.
+                    ctx.prepend_module_resolver(Arc::new(
+                        relon_evaluator::module::RemoteHttpResolver::new(),
+                    ));
                 }
                 Arc::new({
                     let mut ctx = ctx;
