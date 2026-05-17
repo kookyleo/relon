@@ -34,17 +34,34 @@
 //!   * `is_empty(s: String) -> Bool` — zero-length predicate, reusing
 //!     [`Op::ReadStringLen`] + [`Op::Eq`].
 //!
-//! Out of scope (deferred to 4.c+):
-//!   * String mutators / builders (`concat`, `upper`, `lower`,
-//!     `substring`) — require a wasm-side scratch heap allocator.
-//!   * `List<Int>` aggregations (`sum`, `map`, `filter`, `fold`) —
-//!     require wasm loop ops (`Block` / `Loop` / `Br` / `BrIf`).
-//!   * Capability-gated stdlib, closures.
+//! Phase 4.c-2 scope (this phase):
+//!   * `concat(a: String, b: String) -> String` — allocate scratch,
+//!     write the combined record, return the new pointer.
+//!   * `upper(s: String) -> String` / `lower(s: String) -> String` —
+//!     ASCII-only case fold; multi-byte UTF-8 sequences pass through
+//!     untouched (a fuller Unicode pass is on the v3+ roadmap).
+//!   * `substring(s: String, start: Int, len: Int) -> String` —
+//!     bounds-checked slice; out-of-range bounds trap as
+//!     `IndexOutOfBounds`.
+//!   * `starts_with(s: String, prefix: String) -> Bool` — short-
+//!     circuit prefix predicate.
+//!   * `list_int_sum(xs: List<Int>) -> Int` — count + iterate +
+//!     accumulate.
+//!   * `list_int_max(xs: List<Int>) -> Int` — same shape; empty list
+//!     traps as `EmptyList` (call-site protected; surfaces a
+//!     diagnostic instead of a meaningless i64 minimum).
+//!
+//! Out of scope (deferred to Phase 10-a closure work):
+//!   * `fold(xs, init, f)` / `map(xs, f)` / `filter(xs, p)` — require
+//!     first-class closures on the wasm side.
+//!   * Multi-byte UTF-8 aware `upper` / `lower` — needs a
+//!     codepoint-level walker; the ASCII fast path covers the v1
+//!     surface.
 //!
 //! See `docs/internal/wasm-backend-design-draft.md` Section 4 for the
 //! bundling rationale.
 
-use crate::ir::{IrType, Op, TaggedOp};
+use crate::ir::{IrType, Op, TaggedOp, TrapKind};
 use relon_parser::TokenRange;
 
 /// One bundled stdlib function — name, signature, and IR body.
@@ -80,6 +97,16 @@ pub struct StdlibFunction {
 ///   * `3` — `min(Int, Int) -> Int` (Phase 4.b).
 ///   * `4` — `max(Int, Int) -> Int` (Phase 4.b).
 ///   * `5` — `is_empty(String) -> Bool` (Phase 4.b).
+///   * `6` — `concat(String, String) -> String` (Phase 4.c-2).
+///   * `7` — `upper(String) -> String` (Phase 4.c-2, ASCII fast path).
+///   * `8` — `lower(String) -> String` (Phase 4.c-2, ASCII fast path).
+///   * `9` — `substring(String, Int, Int) -> String` (Phase 4.c-2;
+///     traps as `IndexOutOfBounds` when the slice walks past the
+///     receiver).
+///   * `10` — `starts_with(String, String) -> Bool` (Phase 4.c-2).
+///   * `11` — `list_int_sum(List<Int>) -> Int` (Phase 4.c-2).
+///   * `12` — `list_int_max(List<Int>) -> Int` (Phase 4.c-2; traps
+///     as `EmptyList` on a zero-length receiver).
 pub fn builtin_stdlib() -> Vec<StdlibFunction> {
     vec![
         length_string_to_int(),
@@ -88,6 +115,13 @@ pub fn builtin_stdlib() -> Vec<StdlibFunction> {
         min_int(),
         max_int(),
         is_empty_string(),
+        concat_string_string(),
+        upper_string(),
+        lower_string(),
+        substring_string(),
+        starts_with_string(),
+        list_int_sum(),
+        list_int_max(),
     ]
 }
 
@@ -353,9 +387,342 @@ fn is_empty_string() -> StdlibFunction {
     }
 }
 
-/// Resolve a stdlib function name to its wasm-level function index in
-/// the combined module. Returns `None` for unknown names; callers
-/// surface the lowering-level error themselves.
+// ---------------------------------------------------------------------------
+// Phase 4.c-2 stdlib bodies.
+//
+// Conventions shared by every body below:
+//
+// * `t(op)` shorthand pairs an [`Op`] with a synthetic
+//   [`TokenRange::default()`]. The codegen srcmap collapses the entries
+//   to a `(0, 0)` source position; stdlib traps surface as
+//   `range: TokenRange::default()` at the trap-translate site (the
+//   call-site srcmap lookup falls through to the call op's user range
+//   in the caller).
+// * String record layout: `[len: u32 LE at +0][utf8 bytes from +4]`.
+// * List<Int> record layout: `[len: u32 LE at +0][pad: u32 at +4]
+//   [i64 elements from +8]`.
+// * Bodies that build a new record use `Op::AllocScratchDyn` to
+//   reserve space in the module-internal bump heap; the returned
+//   address is the absolute wasm-memory base of the new record. No
+//   tail-cursor protocol — scratch addresses live outside the
+//   `out_buf` and the caller-side `EmitTailRecordFromAbsoluteAddr`
+//   handles eventual memcpy into `out_buf` if a Phase 3.b dict
+//   literal stores the returned String / List pointer.
+// ---------------------------------------------------------------------------
+
+/// Phase 4.c-2 helper: pair an [`Op`] with a synthetic
+/// [`TokenRange`]. Keeps the hand-written bodies readable.
+fn tt(op: Op) -> TaggedOp {
+    TaggedOp {
+        op,
+        range: TokenRange::default(),
+    }
+}
+
+/// Hand-written body for `concat(a: String, b: String) -> String`.
+///
+/// Algorithm:
+///   1. Load `len_a = i32.load(a + 0)` and `len_b = i32.load(b + 0)`.
+///   2. `total_payload = len_a + len_b`; `record_size = total_payload + 4`.
+///   3. `base = alloc_scratch_dyn(record_size)`.
+///   4. Write the header: `i32.store(base + 0, total_payload)`.
+///   5. `memory.copy(base + 4, a + 4, len_a)`.
+///   6. `memory.copy(base + 4 + len_a, b + 4, len_b)`.
+///   7. Return `base`.
+///
+/// Locals (indices relative to the stdlib body's let-area):
+///   * 0 — `len_a: I32`
+///   * 1 — `len_b: I32`
+///   * 2 — `base:  I32`
+fn concat_string_string() -> StdlibFunction {
+    const LEN_A: u32 = 0;
+    const LEN_B: u32 = 1;
+    const BASE: u32 = 2;
+    StdlibFunction {
+        name: "concat",
+        params: vec![IrType::String, IrType::String],
+        ret: IrType::String,
+        body: vec![
+            // len_a = load_i32(a, 0)
+            tt(Op::LocalGet(0)),
+            tt(Op::LoadI32AtAbsolute { offset: 0 }),
+            tt(Op::LetSet {
+                idx: LEN_A,
+                ty: IrType::I32,
+            }),
+            // len_b = load_i32(b, 0)
+            tt(Op::LocalGet(1)),
+            tt(Op::LoadI32AtAbsolute { offset: 0 }),
+            tt(Op::LetSet {
+                idx: LEN_B,
+                ty: IrType::I32,
+            }),
+            // record_size = len_a + len_b + 4
+            tt(Op::LetGet {
+                idx: LEN_A,
+                ty: IrType::I32,
+            }),
+            tt(Op::LetGet {
+                idx: LEN_B,
+                ty: IrType::I32,
+            }),
+            tt(Op::Add(IrType::I32)),
+            tt(Op::ConstI32(4)),
+            tt(Op::Add(IrType::I32)),
+            // base = alloc_scratch_dyn(record_size)
+            tt(Op::AllocScratchDyn),
+            tt(Op::LetSet {
+                idx: BASE,
+                ty: IrType::I32,
+            }),
+            // store header: i32.store(base + 0, len_a + len_b)
+            tt(Op::LetGet {
+                idx: BASE,
+                ty: IrType::I32,
+            }),
+            tt(Op::LetGet {
+                idx: LEN_A,
+                ty: IrType::I32,
+            }),
+            tt(Op::LetGet {
+                idx: LEN_B,
+                ty: IrType::I32,
+            }),
+            tt(Op::Add(IrType::I32)),
+            tt(Op::StoreI32AtAbsolute { offset: 0 }),
+            // memcpy(base + 4, a + 4, len_a)
+            tt(Op::LetGet {
+                idx: BASE,
+                ty: IrType::I32,
+            }),
+            tt(Op::ConstI32(4)),
+            tt(Op::Add(IrType::I32)),
+            tt(Op::LocalGet(0)),
+            tt(Op::ConstI32(4)),
+            tt(Op::Add(IrType::I32)),
+            tt(Op::LetGet {
+                idx: LEN_A,
+                ty: IrType::I32,
+            }),
+            tt(Op::MemcpyAtAbsolute),
+            // memcpy(base + 4 + len_a, b + 4, len_b)
+            tt(Op::LetGet {
+                idx: BASE,
+                ty: IrType::I32,
+            }),
+            tt(Op::ConstI32(4)),
+            tt(Op::Add(IrType::I32)),
+            tt(Op::LetGet {
+                idx: LEN_A,
+                ty: IrType::I32,
+            }),
+            tt(Op::Add(IrType::I32)),
+            tt(Op::LocalGet(1)),
+            tt(Op::ConstI32(4)),
+            tt(Op::Add(IrType::I32)),
+            tt(Op::LetGet {
+                idx: LEN_B,
+                ty: IrType::I32,
+            }),
+            tt(Op::MemcpyAtAbsolute),
+            // return base
+            tt(Op::LetGet {
+                idx: BASE,
+                ty: IrType::I32,
+            }),
+            tt(Op::Return),
+        ],
+    }
+}
+
+/// Hand-written body for `upper(s: String) -> String`. Returns a
+/// fresh scratch record with the ASCII lowercase letters folded to
+/// uppercase; bytes outside `0x61..=0x7a` (`'a'..='z'`) pass through
+/// unchanged, so multi-byte UTF-8 sequences are preserved bit-for-bit
+/// even though they don't get codepoint-aware case folding.
+fn upper_string() -> StdlibFunction {
+    case_fold_body("upper", /* to_upper = */ true)
+}
+
+/// Mirror of [`upper_string`] folding `'A'..='Z'` to lowercase.
+fn lower_string() -> StdlibFunction {
+    case_fold_body("lower", /* to_upper = */ false)
+}
+
+/// Shared body generator for `upper` / `lower`. The `to_upper`
+/// boolean flips the byte range we touch (`0x61..=0x7a` for upper,
+/// `0x41..=0x5a` for lower) and the delta applied (`-0x20` for
+/// upper, `+0x20` for lower — flipping bit 5 of the ASCII codepoint).
+///
+/// Algorithm: alloc a scratch record sized like the input, write the
+/// length prefix, then walk i = 0..len with a single `Block { Loop }`
+/// stack-machine pattern, reading each byte with `i32.load8_u`, case-
+/// folding via an `if (b in [lo, hi]) { b + delta } else { b }`
+/// branch, and storing the result with `i32.store8`.
+///
+/// Locals:
+///   * 0 — `len:  I32`
+///   * 1 — `base: I32`
+///   * 2 — `i:    I32`
+fn case_fold_body(name: &'static str, to_upper: bool) -> StdlibFunction {
+    const LEN: u32 = 0;
+    const BASE: u32 = 1;
+    const I: u32 = 2;
+    let (lo, hi, delta): (i32, i32, i32) = if to_upper {
+        (0x61, 0x7a, -0x20)
+    } else {
+        (0x41, 0x5a, 0x20)
+    };
+    StdlibFunction {
+        name,
+        params: vec![IrType::String],
+        ret: IrType::String,
+        body: vec![
+            // len = load_i32(s, 0)
+            tt(Op::LocalGet(0)),
+            tt(Op::LoadI32AtAbsolute { offset: 0 }),
+            tt(Op::LetSet {
+                idx: LEN,
+                ty: IrType::I32,
+            }),
+            // base = alloc_scratch_dyn(len + 4)
+            tt(Op::LetGet {
+                idx: LEN,
+                ty: IrType::I32,
+            }),
+            tt(Op::ConstI32(4)),
+            tt(Op::Add(IrType::I32)),
+            tt(Op::AllocScratchDyn),
+            tt(Op::LetSet {
+                idx: BASE,
+                ty: IrType::I32,
+            }),
+            // store header: i32.store(base + 0, len)
+            tt(Op::LetGet {
+                idx: BASE,
+                ty: IrType::I32,
+            }),
+            tt(Op::LetGet {
+                idx: LEN,
+                ty: IrType::I32,
+            }),
+            tt(Op::StoreI32AtAbsolute { offset: 0 }),
+            // i = 0
+            tt(Op::ConstI32(0)),
+            tt(Op::LetSet {
+                idx: I,
+                ty: IrType::I32,
+            }),
+            // block { loop { ... } }
+            tt(Op::Block {
+                result_ty: None,
+                body: vec![tt(Op::Loop {
+                    result_ty: None,
+                    body: vec![
+                        // if i >= len { br 1 } (exit the outer block)
+                        tt(Op::LetGet {
+                            idx: I,
+                            ty: IrType::I32,
+                        }),
+                        tt(Op::LetGet {
+                            idx: LEN,
+                            ty: IrType::I32,
+                        }),
+                        tt(Op::Ge(IrType::I32)),
+                        tt(Op::BrIf { label_depth: 1 }),
+                        // dst = base + 4 + i (pushed first for the store)
+                        tt(Op::LetGet {
+                            idx: BASE,
+                            ty: IrType::I32,
+                        }),
+                        tt(Op::ConstI32(4)),
+                        tt(Op::Add(IrType::I32)),
+                        tt(Op::LetGet {
+                            idx: I,
+                            ty: IrType::I32,
+                        }),
+                        tt(Op::Add(IrType::I32)),
+                        // b = i32.load8_u(s + 4 + i)
+                        tt(Op::LocalGet(0)),
+                        tt(Op::ConstI32(4)),
+                        tt(Op::Add(IrType::I32)),
+                        tt(Op::LetGet {
+                            idx: I,
+                            ty: IrType::I32,
+                        }),
+                        tt(Op::Add(IrType::I32)),
+                        tt(Op::LoadI8UAtAbsolute { offset: 0 }),
+                        // folded = if b >= lo && b <= hi { b + delta } else { b }
+                        //
+                        // We use a nested If on a single condition
+                        // (`b >= lo && b <= hi`) computed as
+                        // `(b - lo) <= (hi - lo)` so the branch
+                        // collapses to one wasm `if`. We need `b`
+                        // again on both arms, so stash it into the
+                        // STORE_TMP via tee-ish pattern: actually we
+                        // recompute b from the load. The chain is:
+                        //   stack: [dst, b]
+                        //   tee to a tmp ⇒ we don't have a tee op.
+                        // Simpler: spill b into a fresh let-local
+                        // (`B`, idx 3) before the branch so each arm
+                        // can use it.
+                        tt(Op::LetSet {
+                            idx: 3,
+                            ty: IrType::I32,
+                        }),
+                        // cond = (b - lo) <= (hi - lo)
+                        tt(Op::LetGet {
+                            idx: 3,
+                            ty: IrType::I32,
+                        }),
+                        tt(Op::ConstI32(lo)),
+                        tt(Op::Sub(IrType::I32)),
+                        tt(Op::ConstI32(hi - lo)),
+                        tt(Op::Le(IrType::I32)),
+                        // if cond { b + delta } else { b }
+                        tt(Op::If {
+                            result_ty: IrType::I32,
+                            then_body: vec![
+                                tt(Op::LetGet {
+                                    idx: 3,
+                                    ty: IrType::I32,
+                                }),
+                                tt(Op::ConstI32(delta)),
+                                tt(Op::Add(IrType::I32)),
+                            ],
+                            else_body: vec![tt(Op::LetGet {
+                                idx: 3,
+                                ty: IrType::I32,
+                            })],
+                        }),
+                        // i32.store8(dst, folded)  (dst is the first
+                        // operand pushed at the top of this iter)
+                        tt(Op::StoreI8AtAbsolute { offset: 0 }),
+                        // i = i + 1
+                        tt(Op::LetGet {
+                            idx: I,
+                            ty: IrType::I32,
+                        }),
+                        tt(Op::ConstI32(1)),
+                        tt(Op::Add(IrType::I32)),
+                        tt(Op::LetSet {
+                            idx: I,
+                            ty: IrType::I32,
+                        }),
+                        // br 0 — continue the inner loop
+                        tt(Op::Br { label_depth: 0 }),
+                    ],
+                })],
+            }),
+            // return base
+            tt(Op::LetGet {
+                idx: BASE,
+                ty: IrType::I32,
+            }),
+            tt(Op::Return),
+        ],
+    }
+}
 ///
 /// The index is determined by [`builtin_stdlib`]'s declaration order
 /// — see the module-level comment for why that order is part of the
@@ -394,7 +761,705 @@ pub fn stdlib_method_index(receiver_ty: IrType, name: &str) -> Option<u32> {
         (IrType::String, "length") => stdlib_function_index("length"),
         (IrType::ListInt, "length") => stdlib_function_index("list_int_length"),
         (IrType::String, "is_empty") => stdlib_function_index("is_empty"),
+        // Phase 4.c-2: String / List<Int> method-form dispatch.
+        // Free-call form (`concat(a, b)` / `list_int_sum(xs)`) still
+        // routes through `stdlib_function_index` directly; method
+        // form (`a.concat(b)` / `xs.sum()`) goes through this table
+        // so the same surface name resolves against the receiver's
+        // IR type.
+        (IrType::String, "concat") => stdlib_function_index("concat"),
+        (IrType::String, "upper") => stdlib_function_index("upper"),
+        (IrType::String, "lower") => stdlib_function_index("lower"),
+        (IrType::String, "substring") => stdlib_function_index("substring"),
+        (IrType::String, "starts_with") => stdlib_function_index("starts_with"),
+        (IrType::ListInt, "sum") => stdlib_function_index("list_int_sum"),
+        (IrType::ListInt, "max") => stdlib_function_index("list_int_max"),
         _ => None,
+    }
+}
+
+/// Hand-written body for `substring(s: String, start: Int, len: Int) -> String`.
+///
+/// Bounds check: traps with [`crate::TrapKind::IndexOutOfBounds`]
+/// when `start < 0`, `len < 0`, or `start + len > s.len`. The Int
+/// params arrive as i64; we narrow to i32 (since the scratch heap
+/// can only address i32 offsets) by exploiting the i64-to-i32 wrap
+/// via comparison-and-truncate: any value outside `0..=u32::MAX` is
+/// caught by the bounds check before the wrap matters in practice.
+///
+/// Algorithm:
+///   1. Read `s_len = i32.load(s, 0)`.
+///   2. Compare `start` and `len` (i64) against zero and against
+///      `s_len + start` (signed). On failure, trap.
+///   3. `record_size = len + 4`; allocate scratch.
+///   4. Write header `i32.store(base + 0, len)`.
+///   5. `memory.copy(base + 4, s + 4 + start, len)`.
+///   6. Return `base`.
+///
+/// Locals:
+///   * 0 — `s_len:     I32`
+///   * 1 — `start_i32: I32` (narrowed)
+///   * 2 — `len_i32:   I32` (narrowed)
+///   * 3 — `base:      I32`
+fn substring_string() -> StdlibFunction {
+    const S_LEN: u32 = 0;
+    const START_I32: u32 = 1;
+    const LEN_I32: u32 = 2;
+    const BASE: u32 = 3;
+    StdlibFunction {
+        name: "substring",
+        params: vec![IrType::String, IrType::I64, IrType::I64],
+        ret: IrType::String,
+        body: vec![
+            // s_len = load_i32(s, 0)
+            tt(Op::LocalGet(0)),
+            tt(Op::LoadI32AtAbsolute { offset: 0 }),
+            tt(Op::LetSet {
+                idx: S_LEN,
+                ty: IrType::I32,
+            }),
+            // -----------------------------------------------------
+            // Bounds check (all in i64 space against zero and s_len)
+            //   if start < 0           => trap
+            //   if len < 0             => trap
+            //   if start + len > s_len => trap  (signed compare)
+            // -----------------------------------------------------
+            // if start < 0 { trap }
+            tt(Op::LocalGet(1)),
+            tt(Op::ConstI64(0)),
+            tt(Op::Lt(IrType::I64)),
+            tt(Op::If {
+                result_ty: IrType::I32,
+                then_body: vec![
+                    tt(Op::Trap {
+                        kind: TrapKind::IndexOutOfBounds,
+                    }),
+                    // Unreachable but needed to satisfy the wasm
+                    // verifier's both-arms-typed contract — push a
+                    // placeholder i32 the outer code drops.
+                    tt(Op::ConstI32(0)),
+                ],
+                else_body: vec![tt(Op::ConstI32(0))],
+            }),
+            tt(Op::LetSet {
+                idx: BASE, /* reuse BASE as a scratch sink */
+                ty: IrType::I32,
+            }),
+            // if len < 0 { trap }
+            tt(Op::LocalGet(2)),
+            tt(Op::ConstI64(0)),
+            tt(Op::Lt(IrType::I64)),
+            tt(Op::If {
+                result_ty: IrType::I32,
+                then_body: vec![
+                    tt(Op::Trap {
+                        kind: TrapKind::IndexOutOfBounds,
+                    }),
+                    tt(Op::ConstI32(0)),
+                ],
+                else_body: vec![tt(Op::ConstI32(0))],
+            }),
+            tt(Op::LetSet {
+                idx: BASE,
+                ty: IrType::I32,
+            }),
+            // if start + len > s_len { trap }
+            //   compute `start + len` in i64 then compare against
+            //   the i64-extended s_len. We extend s_len by going
+            //   through a let-set/get into an i32 then promoting via
+            //   `i64.extend_i32_u`-style. Without a direct extend
+            //   op we go through ReadStringLen (which extends), but
+            //   that requires re-loading s. Simpler: compute
+            //   `start + len` in i64 then compare against
+            //   `ReadStringLen(s)` which already returns i64.
+            tt(Op::LocalGet(1)),
+            tt(Op::LocalGet(2)),
+            tt(Op::Add(IrType::I64)),
+            // s.length as i64
+            tt(Op::LocalGet(0)),
+            tt(Op::ReadStringLen),
+            tt(Op::Gt(IrType::I64)),
+            tt(Op::If {
+                result_ty: IrType::I32,
+                then_body: vec![
+                    tt(Op::Trap {
+                        kind: TrapKind::IndexOutOfBounds,
+                    }),
+                    tt(Op::ConstI32(0)),
+                ],
+                else_body: vec![tt(Op::ConstI32(0))],
+            }),
+            tt(Op::LetSet {
+                idx: BASE,
+                ty: IrType::I32,
+            }),
+            // -----------------------------------------------------
+            // Bounds-check survived; narrow start / len to i32.
+            //   We could go through a dedicated `WrapI64` op; lacking
+            //   one, the bounds check above guarantees `0 <= v <= s_len`
+            //   and the string layout caps `s_len` at u32, so the
+            //   high i32 of each value is zero. We use a wasm `select`
+            //   round-trip: `select(v_low, 0, v != 0)` — but that
+            //   only preserves zero/nonzero. Cleanest: route through
+            //   a `Sub` between the i64 value and its high half (0)
+            //   to coerce to i32. We instead leverage the fact that
+            //   the surface signature for substring intends i32 lengths
+            //   in practice; we introduce two helper sub-ops below.
+            //
+            // Pragmatic narrowing: cast via i64 -> i32 by computing
+            //   v_i32 = (v_i64 + 0) and then a Lt(I64) trap above
+            //   guarantees fit. Without a dedicated wrap op the
+            //   stdlib can't do it; we add the wrap as an
+            //   AllocScratchDyn-friendly path: store v into a wide
+            //   slot, then read the low i32. Use the scratch heap
+            //   as a temporary u64-to-u32 conversion:
+            //     allocate 8 scratch bytes
+            //     store_i64(scratch, 0, v_i64)
+            //     load_i32(scratch, 0)  -> low i32
+            // -----------------------------------------------------
+            // Narrow start.
+            tt(Op::ConstI32(8)),
+            tt(Op::AllocScratchDyn),
+            tt(Op::LetSet {
+                idx: BASE, /* reuse as narrow_scratch */
+                ty: IrType::I32,
+            }),
+            tt(Op::LetGet {
+                idx: BASE,
+                ty: IrType::I32,
+            }),
+            tt(Op::LocalGet(1)),
+            tt(Op::StoreI64AtAbsolute { offset: 0 }),
+            tt(Op::LetGet {
+                idx: BASE,
+                ty: IrType::I32,
+            }),
+            tt(Op::LoadI32AtAbsolute { offset: 0 }),
+            tt(Op::LetSet {
+                idx: START_I32,
+                ty: IrType::I32,
+            }),
+            // Narrow len (reuse the same scratch slot).
+            tt(Op::LetGet {
+                idx: BASE,
+                ty: IrType::I32,
+            }),
+            tt(Op::LocalGet(2)),
+            tt(Op::StoreI64AtAbsolute { offset: 0 }),
+            tt(Op::LetGet {
+                idx: BASE,
+                ty: IrType::I32,
+            }),
+            tt(Op::LoadI32AtAbsolute { offset: 0 }),
+            tt(Op::LetSet {
+                idx: LEN_I32,
+                ty: IrType::I32,
+            }),
+            // -----------------------------------------------------
+            // Build the result record.
+            // -----------------------------------------------------
+            // record_size = len + 4
+            tt(Op::LetGet {
+                idx: LEN_I32,
+                ty: IrType::I32,
+            }),
+            tt(Op::ConstI32(4)),
+            tt(Op::Add(IrType::I32)),
+            tt(Op::AllocScratchDyn),
+            tt(Op::LetSet {
+                idx: BASE,
+                ty: IrType::I32,
+            }),
+            // store header
+            tt(Op::LetGet {
+                idx: BASE,
+                ty: IrType::I32,
+            }),
+            tt(Op::LetGet {
+                idx: LEN_I32,
+                ty: IrType::I32,
+            }),
+            tt(Op::StoreI32AtAbsolute { offset: 0 }),
+            // memcpy(base + 4, s + 4 + start, len)
+            tt(Op::LetGet {
+                idx: BASE,
+                ty: IrType::I32,
+            }),
+            tt(Op::ConstI32(4)),
+            tt(Op::Add(IrType::I32)),
+            tt(Op::LocalGet(0)),
+            tt(Op::ConstI32(4)),
+            tt(Op::Add(IrType::I32)),
+            tt(Op::LetGet {
+                idx: START_I32,
+                ty: IrType::I32,
+            }),
+            tt(Op::Add(IrType::I32)),
+            tt(Op::LetGet {
+                idx: LEN_I32,
+                ty: IrType::I32,
+            }),
+            tt(Op::MemcpyAtAbsolute),
+            // return base
+            tt(Op::LetGet {
+                idx: BASE,
+                ty: IrType::I32,
+            }),
+            tt(Op::Return),
+        ],
+    }
+}
+
+/// Hand-written body for `starts_with(s: String, prefix: String) -> Bool`.
+///
+/// Algorithm:
+///   1. Read `s_len` and `p_len`.
+///   2. If `p_len > s_len`, return false.
+///   3. Loop i = 0..p_len: if `byte(s, 4+i) != byte(p, 4+i)` return false.
+///   4. After the loop completes, return true.
+///
+/// Returns the result via a scratch i32 cell that captures the
+/// short-circuit decision; we lean on a let-local instead.
+///
+/// Locals:
+///   * 0 — `s_len: I32`
+///   * 1 — `p_len: I32`
+///   * 2 — `i:     I32`
+///   * 3 — `acc:   I32` (running result; 1 = still matches, 0 = miss)
+fn starts_with_string() -> StdlibFunction {
+    const S_LEN: u32 = 0;
+    const P_LEN: u32 = 1;
+    const I: u32 = 2;
+    const ACC: u32 = 3;
+    StdlibFunction {
+        name: "starts_with",
+        params: vec![IrType::String, IrType::String],
+        ret: IrType::Bool,
+        body: vec![
+            // s_len = load_i32(s)
+            tt(Op::LocalGet(0)),
+            tt(Op::LoadI32AtAbsolute { offset: 0 }),
+            tt(Op::LetSet {
+                idx: S_LEN,
+                ty: IrType::I32,
+            }),
+            // p_len = load_i32(p)
+            tt(Op::LocalGet(1)),
+            tt(Op::LoadI32AtAbsolute { offset: 0 }),
+            tt(Op::LetSet {
+                idx: P_LEN,
+                ty: IrType::I32,
+            }),
+            // if p_len > s_len { return false }
+            //   We express the early-out via an if/else producing
+            //   the final Bool. Both arms must produce a value of
+            //   the same type; the false arm returns 0, the true arm
+            //   runs the loop and returns the final acc.
+            tt(Op::LetGet {
+                idx: P_LEN,
+                ty: IrType::I32,
+            }),
+            tt(Op::LetGet {
+                idx: S_LEN,
+                ty: IrType::I32,
+            }),
+            tt(Op::Gt(IrType::I32)),
+            tt(Op::If {
+                result_ty: IrType::Bool,
+                then_body: vec![tt(Op::ConstBool(false))],
+                else_body: vec![
+                    // acc = 1 (true so far)
+                    tt(Op::ConstI32(1)),
+                    tt(Op::LetSet {
+                        idx: ACC,
+                        ty: IrType::I32,
+                    }),
+                    // i = 0
+                    tt(Op::ConstI32(0)),
+                    tt(Op::LetSet {
+                        idx: I,
+                        ty: IrType::I32,
+                    }),
+                    // block { loop { ... } }
+                    tt(Op::Block {
+                        result_ty: None,
+                        body: vec![tt(Op::Loop {
+                            result_ty: None,
+                            body: vec![
+                                // exit when i >= p_len
+                                tt(Op::LetGet {
+                                    idx: I,
+                                    ty: IrType::I32,
+                                }),
+                                tt(Op::LetGet {
+                                    idx: P_LEN,
+                                    ty: IrType::I32,
+                                }),
+                                tt(Op::Ge(IrType::I32)),
+                                tt(Op::BrIf { label_depth: 1 }),
+                                // sb = i32.load8_u(s + 4 + i)
+                                tt(Op::LocalGet(0)),
+                                tt(Op::ConstI32(4)),
+                                tt(Op::Add(IrType::I32)),
+                                tt(Op::LetGet {
+                                    idx: I,
+                                    ty: IrType::I32,
+                                }),
+                                tt(Op::Add(IrType::I32)),
+                                tt(Op::LoadI8UAtAbsolute { offset: 0 }),
+                                // pb = i32.load8_u(p + 4 + i)
+                                tt(Op::LocalGet(1)),
+                                tt(Op::ConstI32(4)),
+                                tt(Op::Add(IrType::I32)),
+                                tt(Op::LetGet {
+                                    idx: I,
+                                    ty: IrType::I32,
+                                }),
+                                tt(Op::Add(IrType::I32)),
+                                tt(Op::LoadI8UAtAbsolute { offset: 0 }),
+                                // if sb != pb { acc = 0; br 1 }
+                                tt(Op::Ne(IrType::I32)),
+                                tt(Op::If {
+                                    result_ty: IrType::I32,
+                                    then_body: vec![
+                                        tt(Op::ConstI32(0)),
+                                        tt(Op::LetSet {
+                                            idx: ACC,
+                                            ty: IrType::I32,
+                                        }),
+                                        // Use a sentinel i32 to keep the
+                                        // arm typed; the Br exits before
+                                        // any caller observes it.
+                                        tt(Op::ConstI32(0)),
+                                        tt(Op::Br { label_depth: 2 }),
+                                    ],
+                                    else_body: vec![tt(Op::ConstI32(0))],
+                                }),
+                                // Drop the i32 the If produced
+                                // (codegen has no Drop op; instead we
+                                // sink it into a let we ignore).
+                                tt(Op::LetSet {
+                                    idx: ACC, /* harmlessly overwritten next iter */
+                                    ty: IrType::I32,
+                                }),
+                                // Restore acc to its earlier value
+                                // (it was 1 entering this iteration
+                                // and we just clobbered it). Cheaper:
+                                // hoist the sink to a scratch local.
+                                tt(Op::ConstI32(1)),
+                                tt(Op::LetSet {
+                                    idx: ACC,
+                                    ty: IrType::I32,
+                                }),
+                                // i = i + 1
+                                tt(Op::LetGet {
+                                    idx: I,
+                                    ty: IrType::I32,
+                                }),
+                                tt(Op::ConstI32(1)),
+                                tt(Op::Add(IrType::I32)),
+                                tt(Op::LetSet {
+                                    idx: I,
+                                    ty: IrType::I32,
+                                }),
+                                tt(Op::Br { label_depth: 0 }),
+                            ],
+                        })],
+                    }),
+                    // Result = acc != 0
+                    tt(Op::LetGet {
+                        idx: ACC,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::ConstI32(0)),
+                    tt(Op::Ne(IrType::I32)),
+                ],
+            }),
+            tt(Op::Return),
+        ],
+    }
+}
+
+/// Hand-written body for `list_int_sum(xs: List<Int>) -> Int`.
+///
+/// Record layout: `[len: u32 @0][...optional 4-byte pad to align
+/// payload up to 8][i64 elements]`. The host's `BufferBuilder` lays
+/// out tail records at a 4-byte prefix-alignment so the record
+/// start is only 4-aligned; whether the i64 payload sits at
+/// `xs + 4` or `xs + 8` depends on the receiver's absolute parity.
+/// We replicate the host's `align_up(xs + 4, 8)` rule via the bit
+/// trick `(xs + 4 + 7) & -8`, computed once before the loop.
+///
+/// Locals:
+///   * 0 — `n:       I32` (element count)
+///   * 1 — `i:       I32`
+///   * 2 — `acc:     I64` (running sum)
+///   * 3 — `payload: I32` (absolute address of element 0)
+fn list_int_sum() -> StdlibFunction {
+    const N: u32 = 0;
+    const I: u32 = 1;
+    const ACC: u32 = 2;
+    const PAYLOAD: u32 = 3;
+    StdlibFunction {
+        name: "list_int_sum",
+        params: vec![IrType::ListInt],
+        ret: IrType::I64,
+        body: vec![
+            // n = load_i32(xs, 0)
+            tt(Op::LocalGet(0)),
+            tt(Op::LoadI32AtAbsolute { offset: 0 }),
+            tt(Op::LetSet {
+                idx: N,
+                ty: IrType::I32,
+            }),
+            // payload = (xs + 4 + 7) & -8
+            tt(Op::LocalGet(0)),
+            tt(Op::ConstI32(4 + 7)),
+            tt(Op::Add(IrType::I32)),
+            tt(Op::ConstI32(-8)),
+            tt(Op::BitAnd(IrType::I32)),
+            tt(Op::LetSet {
+                idx: PAYLOAD,
+                ty: IrType::I32,
+            }),
+            // acc = 0; i = 0
+            tt(Op::ConstI64(0)),
+            tt(Op::LetSet {
+                idx: ACC,
+                ty: IrType::I64,
+            }),
+            tt(Op::ConstI32(0)),
+            tt(Op::LetSet {
+                idx: I,
+                ty: IrType::I32,
+            }),
+            // block { loop { ... } }
+            tt(Op::Block {
+                result_ty: None,
+                body: vec![tt(Op::Loop {
+                    result_ty: None,
+                    body: vec![
+                        // exit when i >= n
+                        tt(Op::LetGet {
+                            idx: I,
+                            ty: IrType::I32,
+                        }),
+                        tt(Op::LetGet {
+                            idx: N,
+                            ty: IrType::I32,
+                        }),
+                        tt(Op::Ge(IrType::I32)),
+                        tt(Op::BrIf { label_depth: 1 }),
+                        // acc += i64.load(payload + i * 8)
+                        tt(Op::LetGet {
+                            idx: ACC,
+                            ty: IrType::I64,
+                        }),
+                        tt(Op::LetGet {
+                            idx: PAYLOAD,
+                            ty: IrType::I32,
+                        }),
+                        tt(Op::LetGet {
+                            idx: I,
+                            ty: IrType::I32,
+                        }),
+                        tt(Op::ConstI32(8)),
+                        tt(Op::Mul(IrType::I32)),
+                        tt(Op::Add(IrType::I32)),
+                        tt(Op::LoadI64AtAbsolute { offset: 0 }),
+                        tt(Op::Add(IrType::I64)),
+                        tt(Op::LetSet {
+                            idx: ACC,
+                            ty: IrType::I64,
+                        }),
+                        // i = i + 1
+                        tt(Op::LetGet {
+                            idx: I,
+                            ty: IrType::I32,
+                        }),
+                        tt(Op::ConstI32(1)),
+                        tt(Op::Add(IrType::I32)),
+                        tt(Op::LetSet {
+                            idx: I,
+                            ty: IrType::I32,
+                        }),
+                        tt(Op::Br { label_depth: 0 }),
+                    ],
+                })],
+            }),
+            // return acc
+            tt(Op::LetGet {
+                idx: ACC,
+                ty: IrType::I64,
+            }),
+            tt(Op::Return),
+        ],
+    }
+}
+
+/// Hand-written body for `list_int_max(xs: List<Int>) -> Int`.
+///
+/// Trap discipline: an empty receiver triggers
+/// [`TrapKind::EmptyList`] before any iteration runs. Picking a
+/// finite default (e.g. `i64::MIN`) would surface as a silent
+/// surprise — every other reducer in the Phase 4.c-2 set assumes
+/// at least one element to fold over.
+///
+/// Payload-start calculation mirrors [`list_int_sum`]: align
+/// `xs + 4` up to 8 with `(x + 7) & -8` so the loop indexes into
+/// the real i64 payload regardless of the receiver's parity.
+///
+/// Locals:
+///   * 0 — `n:       I32`
+///   * 1 — `i:       I32`
+///   * 2 — `acc:     I64`
+///   * 3 — `payload: I32`
+///   * 4 — `val:     I64` (per-iter scratch for `max(acc, val)`)
+fn list_int_max() -> StdlibFunction {
+    const N: u32 = 0;
+    const I: u32 = 1;
+    const ACC: u32 = 2;
+    const PAYLOAD: u32 = 3;
+    const VAL: u32 = 4;
+    StdlibFunction {
+        name: "list_int_max",
+        params: vec![IrType::ListInt],
+        ret: IrType::I64,
+        body: vec![
+            // n = load_i32(xs, 0)
+            tt(Op::LocalGet(0)),
+            tt(Op::LoadI32AtAbsolute { offset: 0 }),
+            tt(Op::LetSet {
+                idx: N,
+                ty: IrType::I32,
+            }),
+            // if n == 0 { trap }
+            tt(Op::LetGet {
+                idx: N,
+                ty: IrType::I32,
+            }),
+            tt(Op::ConstI32(0)),
+            tt(Op::Eq(IrType::I32)),
+            tt(Op::If {
+                result_ty: IrType::I32,
+                then_body: vec![
+                    tt(Op::Trap {
+                        kind: TrapKind::EmptyList,
+                    }),
+                    tt(Op::ConstI32(0)),
+                ],
+                else_body: vec![tt(Op::ConstI32(0))],
+            }),
+            // Sink the i32 placeholder produced by the If.
+            tt(Op::LetSet {
+                idx: I, /* harmless: I is overwritten just below */
+                ty: IrType::I32,
+            }),
+            // payload = (xs + 4 + 7) & -8
+            tt(Op::LocalGet(0)),
+            tt(Op::ConstI32(4 + 7)),
+            tt(Op::Add(IrType::I32)),
+            tt(Op::ConstI32(-8)),
+            tt(Op::BitAnd(IrType::I32)),
+            tt(Op::LetSet {
+                idx: PAYLOAD,
+                ty: IrType::I32,
+            }),
+            // acc = i64.load(payload + 0) (the first element)
+            tt(Op::LetGet {
+                idx: PAYLOAD,
+                ty: IrType::I32,
+            }),
+            tt(Op::LoadI64AtAbsolute { offset: 0 }),
+            tt(Op::LetSet {
+                idx: ACC,
+                ty: IrType::I64,
+            }),
+            // i = 1
+            tt(Op::ConstI32(1)),
+            tt(Op::LetSet {
+                idx: I,
+                ty: IrType::I32,
+            }),
+            // block { loop { ... } }
+            tt(Op::Block {
+                result_ty: None,
+                body: vec![tt(Op::Loop {
+                    result_ty: None,
+                    body: vec![
+                        // exit when i >= n
+                        tt(Op::LetGet {
+                            idx: I,
+                            ty: IrType::I32,
+                        }),
+                        tt(Op::LetGet {
+                            idx: N,
+                            ty: IrType::I32,
+                        }),
+                        tt(Op::Ge(IrType::I32)),
+                        tt(Op::BrIf { label_depth: 1 }),
+                        // val = i64.load(payload + i * 8)
+                        tt(Op::LetGet {
+                            idx: PAYLOAD,
+                            ty: IrType::I32,
+                        }),
+                        tt(Op::LetGet {
+                            idx: I,
+                            ty: IrType::I32,
+                        }),
+                        tt(Op::ConstI32(8)),
+                        tt(Op::Mul(IrType::I32)),
+                        tt(Op::Add(IrType::I32)),
+                        tt(Op::LoadI64AtAbsolute { offset: 0 }),
+                        tt(Op::LetSet {
+                            idx: VAL,
+                            ty: IrType::I64,
+                        }),
+                        // acc = select(val, acc, val > acc)
+                        tt(Op::LetGet {
+                            idx: VAL,
+                            ty: IrType::I64,
+                        }),
+                        tt(Op::LetGet {
+                            idx: ACC,
+                            ty: IrType::I64,
+                        }),
+                        tt(Op::LetGet {
+                            idx: VAL,
+                            ty: IrType::I64,
+                        }),
+                        tt(Op::LetGet {
+                            idx: ACC,
+                            ty: IrType::I64,
+                        }),
+                        tt(Op::Gt(IrType::I64)),
+                        tt(Op::Select { ty: IrType::I64 }),
+                        tt(Op::LetSet {
+                            idx: ACC,
+                            ty: IrType::I64,
+                        }),
+                        // i = i + 1
+                        tt(Op::LetGet {
+                            idx: I,
+                            ty: IrType::I32,
+                        }),
+                        tt(Op::ConstI32(1)),
+                        tt(Op::Add(IrType::I32)),
+                        tt(Op::LetSet {
+                            idx: I,
+                            ty: IrType::I32,
+                        }),
+                        tt(Op::Br { label_depth: 0 }),
+                    ],
+                })],
+            }),
+            // return acc
+            tt(Op::LetGet {
+                idx: ACC,
+                ty: IrType::I64,
+            }),
+            tt(Op::Return),
+        ],
     }
 }
 

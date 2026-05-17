@@ -60,6 +60,12 @@ const TAG_VALUE_TOO_LARGE: u32 = 3;
 /// memory size. Codegen emits this guard before every
 /// `relon_scratch_cursor` bump (static or dynamic).
 const TAG_SCRATCH_OOM: u32 = 4;
+/// Phase 4.c-2: stdlib bounds check (`substring(...)` etc.) tripped
+/// because the caller-supplied range walks past the receiver's end.
+const TAG_INDEX_OUT_OF_BOUNDS: u32 = 5;
+/// Phase 4.c-2: an empty-list-requires-element reducer
+/// (`list_int_max`) was called with a zero-length receiver.
+const TAG_EMPTY_LIST: u32 = 6;
 
 // Indexes into the static "kind" tag table used by [`UnreachableKind::ValueTooLarge`].
 // New tags append; the existing indices are part of the on-disk format.
@@ -117,6 +123,18 @@ pub enum UnreachableKind {
         /// for the dynamic-size variant.
         needed: u32,
     },
+
+    /// Phase 4.c-2: a stdlib bounds check (`substring` /
+    /// future `xs[i]` accessors) tripped because the requested
+    /// range walks past the receiver's length. Carries no payload —
+    /// the trap site's srcmap range surfaces the call site, and the
+    /// run-time pre-trap values are not snapshot.
+    IndexOutOfBounds,
+
+    /// Phase 4.c-2: a reducer that needs at least one element
+    /// (`list_int_max`) tripped on an empty receiver. Carries no
+    /// payload; the call-site source range comes from the srcmap.
+    EmptyList,
 }
 
 impl UnreachableKind {
@@ -142,6 +160,8 @@ impl UnreachableKind {
                 (TAG_VALUE_TOO_LARGE, idx)
             }
             UnreachableKind::ScratchOOM { needed } => (TAG_SCRATCH_OOM, *needed),
+            UnreachableKind::IndexOutOfBounds => (TAG_INDEX_OUT_OF_BOUNDS, 0),
+            UnreachableKind::EmptyList => (TAG_EMPTY_LIST, 0),
         }
     }
 }
@@ -334,6 +354,8 @@ pub fn decode_from_bytes(bytes: &[u8]) -> Result<UnreachableTable, UnreachableTa
                 UnreachableKind::ValueTooLarge { kind: kind_str }
             }
             TAG_SCRATCH_OOM => UnreachableKind::ScratchOOM { needed: payload },
+            TAG_INDEX_OUT_OF_BOUNDS => UnreachableKind::IndexOutOfBounds,
+            TAG_EMPTY_LIST => UnreachableKind::EmptyList,
             other => return Err(UnreachableTableError::UnknownKindTag { index, tag: other }),
         };
         entries.push(UnreachableEntry { pc, kind });

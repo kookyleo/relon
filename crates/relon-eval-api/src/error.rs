@@ -133,6 +133,37 @@ pub enum RuntimeError {
         range: TokenRange,
     },
 
+    /// Phase 4.c-2: an index / range operation walked off the end of
+    /// a String / List receiver. Both backends share this variant —
+    /// the tree-walker raises it from `xs[i]` style accessors, the
+    /// wasm AOT path raises it from `substring` / similar stdlib
+    /// builders when the caller-supplied bounds exceed the
+    /// receiver's length.
+    #[error("Index out of bounds")]
+    #[diagnostic(
+        code(relon::eval::index_out_of_bounds),
+        help("Inspect the receiver's length before indexing, or clamp the offset / length arguments so the slice stays inside the value.")
+    )]
+    IndexOutOfBounds {
+        #[label("index walked past the receiver length")]
+        range: TokenRange,
+    },
+
+    /// Phase 4.c-2: a reducer that requires at least one element
+    /// (`list_int_max`, future `head` / `last`, ...) was called on
+    /// an empty list. Carries the call-site source range so the
+    /// diagnostic points at the offending expression rather than at
+    /// the stdlib body itself.
+    #[error("Operation on empty list has no defined result")]
+    #[diagnostic(
+        code(relon::eval::empty_list),
+        help("Reducers like `list_int_max` need at least one element. Check the list isn't empty before calling, or supply an explicit fallback value.")
+    )]
+    EmptyList {
+        #[label("called on an empty list here")]
+        range: TokenRange,
+    },
+
     #[error("Capability denied: native function `{name}` ({reason})")]
     #[diagnostic(
         code(relon::eval::capability_denied),
@@ -277,6 +308,37 @@ pub enum RuntimeError {
         /// Static tag identifying the tail-record shape that overran.
         kind: &'static str,
         #[label("tail-cursor bounds check tripped here")]
+        range: TokenRange,
+    },
+
+    /// Phase 4.c-2: wasm trap fired in a stdlib bounds check
+    /// (`substring(s, start, len)` and similar) because the requested
+    /// slice walks past the receiver's end. Mirrors
+    /// [`Self::IndexOutOfBounds`] but is emitted from the wasm
+    /// translate_trap path so the wasm srcmap can decorate the call
+    /// site.
+    #[error("wasm trap: index walked past receiver length")]
+    #[diagnostic(
+        code(relon::eval::wasm_index_out_of_bounds),
+        help(
+            "Check the bounds you pass to substring / slice stdlib helpers before invoking them."
+        )
+    )]
+    WasmIndexOutOfBounds {
+        #[label("index out of bounds here")]
+        range: TokenRange,
+    },
+
+    /// Phase 4.c-2: wasm trap fired in a reducer body that requires
+    /// at least one element (`list_int_max`) when invoked on an
+    /// empty list. Mirrors [`Self::EmptyList`] on the wasm side.
+    #[error("wasm trap: reducer invoked on an empty list")]
+    #[diagnostic(
+        code(relon::eval::wasm_empty_list),
+        help("Guard the reducer call with a non-emptiness check, or pick a stdlib variant that accepts an explicit fallback.")
+    )]
+    WasmEmptyList {
+        #[label("empty list reducer tripped here")]
         range: TokenRange,
     },
 

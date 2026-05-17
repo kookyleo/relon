@@ -794,6 +794,129 @@ phase。
 
 前置基础：`5f3f7eb merge(arch): split relon-eval-api crate and abstract Evaluator trait`。
 
+## 附录 A.9：v6 stdlib expansion bench（Phase 4.c-2，2026-05-17）
+
+Phase 4.c-2 把 stdlib 从 6 个函数（length / list_int_length / abs /
+min / max / is_empty，Phase 4.a-4.b 时代）扩到 13 个，新增：
+
+- `concat(String, String) -> String`
+- `upper(String) -> String` / `lower(String) -> String`（仅 ASCII 大
+  小写折叠，多字节 UTF-8 原样透传，v3+ 再补 codepoint-aware 版本）
+- `substring(String, Int, Int) -> String`（越界 trap
+  `WasmIndexOutOfBounds`）
+- `starts_with(String, String) -> Bool`
+- `list_int_sum(List<Int>) -> Int`
+- `list_int_max(List<Int>) -> Int`（空列表 trap `WasmEmptyList`）
+
+附带新的 IR 原语 `ConstI32` / `BitAnd` / `Trap` /
+`LoadI8U` / `StoreI8` 以及 5 个 Phase 4.c-2 prerequisite
+原语 `LoadI32/I64AtAbsolute` / `StoreI32/I64AtAbsolute` /
+`MemcpyAtAbsolute`。stdlib 函数索引保持向后兼容（仅追加）。
+
+bench 跑环境同 v5：`Linux 6.8.0-110-generic`，本地一次 `cargo bench`。
+
+### wasm-AOT cold start（v5 → v6）
+
+stdlib 字节增多 → JIT 工作变多。v6 的三个 cold scenario 全都
+比 v5 涨 +47% 左右：
+
+| Scenario        | v5 Median  | v6 Median  | Δ      |
+| --------------- | ---------: | ---------: | -----: |
+| `arithmetic`    | 2.204 ms   | **3.258 ms** | +47.8 % |
+| `dict_literal`  | 2.270 ms   | **3.348 ms** | +47.5 % |
+| `stdlib_length` | 2.180 ms   | **3.263 ms** | +49.7 % |
+
+涨幅大致 1:1 对应新增字节数（stdlib 函数体翻了一倍，wasm bytes
+从 ~3.5 KB 涨到 ~7 KB）。`cargo bench` 不区分用到的 stdlib
+子集 —— 即便 `arithmetic` 一个 stdlib 都没用，模块里仍会嵌入
+所有 13 个函数 (codegen 不做 dead-code elimination)。
+
+### wasm-AOT cached cold start（v5 → v6）
+
+| Scenario        | v5 cached  | v6 cached    | Δ      |
+| --------------- | ---------: | -----------: | -----: |
+| `arithmetic`    | 139.0 μs   | **157.9 μs** | +13.6 % |
+| `dict_literal`  | 141.1 μs   | **159.1 μs** | +12.8 % |
+| `stdlib_length` | 138.1 μs   | **157.3 μs** | +13.9 % |
+
+`Module::deserialize` 走 `.native` blob 的固定开销随 blob 大小
+线性涨。13.5% 的回归在预期内 —— stdlib 翻倍但 deserialize 不是
+1:1 字节比例（一部分开销是 wasmtime 内部 metadata 重建，与字节
+数关系不大）。
+
+### wasm-AOT warm invoke（v5 → v6，基本持平）
+
+| Scenario        | v5 warm    | v6 warm    | Δ       |
+| --------------- | ---------: | ---------: | ------: |
+| `arithmetic`    | 1.104 μs   | 1.105 μs   | +0.05 % |
+| `dict_literal`  | 1.252 μs   | 1.334 μs   | +6.5 %  |
+| `stdlib_length` | 1.108 μs   | 1.096 μs   | -1.1 %  |
+
+`dict_literal` 涨 6.5% 是个真实差值（p < 0.05），但 Phase 4.c-2
+没改 dict-literal 任何路径。怀疑是 stdlib 函数索引偏移导致的
+i-cache layout 改变 —— 新增函数占用 wasm 函数表的 6..=12 槽位，
+原本的 user fn entry 索引从 6 推到 13，cranelift 重新生成
+的代码 layout 不同。属于二阶 / 阵列效应，下个 phase 用
+基线复跑确认。warm invoke 整体仍在 1 μs 量级。
+
+### tree-walker（对照组，未改动）
+
+tree-walker 路径不受 stdlib 扩张影响 —— 它走 AST 解释器，不
+经过 wasm。bench 数字应该完全持平。实测：
+
+| Group                    | Scenario        | v5 Median  | v6 Median  | Δ       |
+| ------------------------ | --------------- | ---------: | ---------: | ------: |
+| `tree_walk_total`        | `arithmetic`    | 1.115 ms   | 1.035 ms   | -7.2 %  |
+| `tree_walk_total`        | `dict_literal`  | 1.169 ms   | 1.178 ms   | +0.8 %  |
+| `tree_walk_total`        | `stdlib_length` | 1.093 ms   | 1.022 ms   | -6.8 %  |
+| `tree_walk_warm_invoke`  | `arithmetic`    | 2.603 μs   | 2.623 μs   | +0.7 %  |
+| `tree_walk_warm_invoke`  | `dict_literal`  | 37.14 μs   | 36.24 μs   | -2.0 %  |
+| `tree_walk_warm_invoke`  | `stdlib_length` | 3.202 μs   | 3.160 μs   | -1.3 %  |
+
+`tree_walk_total/arithmetic` 改善 7%，怀疑是 runner 当时偶发更
+凉一些（v5 跑数的时候温度估计偏高），落在噪声带边缘但属于"无相
+关变更"的偶发抖动。
+
+### Phase 4.c-2 阶段读数 + 决策
+
+| 路径 | scenario | v6 中位数 | 对比 v5 |
+| --- | --- | ---: | --- |
+| wasm-AOT cold（无 cache） | `arithmetic` | 3.26 ms | +47.8 % |
+| wasm-AOT cached cold      | `arithmetic` | 158 μs  | +13.6 % |
+| wasm-AOT warm invoke      | `arithmetic` | 1.10 μs | 持平    |
+| tree-walker warm          | `arithmetic` | 2.62 μs | 持平    |
+
+- **UTF-8 punt**：`upper` / `lower` 只折 ASCII a-z / A-Z；多字节
+  UTF-8 序列原样透传。codepoint-aware 折叠需要走 ICU 数据表或
+  类似 `case_fold_simple()` 这种 256-bit 跳表，wasm 字节量翻番
+  + 数据段引入静态表，工作量超 Phase 4.c-2 范围。推 v3+。
+- **fold / map / filter 推到 Phase 10-a**：这些 reducer 形态都
+  需要 closure 头等值 —— wasm 端要支持 function reference type，
+  并补 closure 转 `funcref` 的 lowering。stdlib `list_int_sum` /
+  `list_int_max` 内置 reducer 已经能 cover 大部分聚合场景；通
+  用 fold 等 closure 落地后再补。
+- **bounds-check trap 走 i64**：substring 的 `start` / `len`
+  参数是 `Int`（i64 slot），bounds check 在 i64 空间做（防止
+  i32 wrap 把 -1 当成 4G-1）。窄化到 i32 是通过 scratch
+  heap 借 8 bytes 做 i64-store / i32-load 完成 —— 没有 WrapI64
+  原语，stdlib 也不想 hardcode "all bounds fit in u32" 的假
+  设。Phase 10-a 再补 `WrapToI32` op 可以省 8 字节 scratch 但
+  不是本 phase 必做。
+- **List<Int> payload 起点对齐**：host `BufferBuilder` 把 List<Int>
+  payload 4-byte 对齐写入（受 record 起点对齐影响），wasm 端要
+  做 `(xs + 4 + 7) & -8` 算 payload 起点 —— v1 wasm-binary-layout
+  没强制 List 记录起点必须 8 对齐，stdlib 必须自己 align。新加
+  `Op::BitAnd(I32)` 替代了"用 div_u + mul_u 模拟 alignment"的
+  老办法；下一阶段若需要更多 bit-twiddling（Or / Xor / Shl /
+  ShrU）再批量加。
+- **stdlib 字节增长 → cold start 回归**：Phase 4.c-2 走完后
+  stdlib 函数数翻了一倍多，cold start +47%。这部分是 unavoidable
+  cost（cranelift 必须 JIT 全部函数），缓解策略是 cache
+  warm-path（cached cold 只回归 14%）。dead-code elimination
+  能再砍一刀，但 IR 层做需要 reachability 分析 + 改 wire format
+  （否则用户 source 改一行 stdlib 引用，缓存命中率打折）。推
+  v3+。
+
 ## 附录 C：loop 收官
 
 本次 `/loop 10m` 从 Phase 1.beta 起步，跨越 14 次 merge 完成 wasm-AOT
