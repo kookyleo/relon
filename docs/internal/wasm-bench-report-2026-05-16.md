@@ -929,3 +929,41 @@ backend 全链路：parser/analyzer 复用 → IR lowering → wasm 字节码 em
 到此 wasm-AOT backend 的 JIT + AOT 主链路完成，后续工作进入"语言子集
 拓展 + 性能精调 + 沙箱细化"阶段（详见第六节），不再属于 `/loop` 单次
 拉通的范畴。
+
+## 附录 A.10：v7 closure + higher-order stdlib bench（Phase 10-a，2026-05-17）
+
+Phase 10-a 落地三件事：
+
+1. `IrType::Closure` + `Op::MakeClosure` / `Op::CallClosure` + wasm
+   funcref Table + ElementSection + `call_indirect` 整套头等闭包 IR。
+2. lambda 表达式 lowering：free-var analysis + closure conversion，
+   captured vars 显式打包成 8-byte `[fn_table_idx][captures_ptr]` 结构
+   到 scratch heap。
+3. 三个 higher-order stdlib：`list_int_map / list_int_filter /
+   list_int_fold`，body 内通过 `call_indirect` 调用用户传入的 closure。
+
+bench 配置：32 元素 List<Int> 入参，criterion `sample_size(50)` +
+`measurement_time(8s)`。
+
+| Scenario | wasm-AOT cold | cached | warm | tree-walk total | tree-walk warm |
+|---|---:|---:|---:|---:|---:|
+| `list_int_map`    | 4.22 ms | 190 μs | **2.63 μs** | 1.19 ms | 102 μs |
+| `list_int_filter` | 4.18 ms | 188 μs | **2.55 μs** | 1.18 ms | 101 μs |
+| `list_int_fold`   | 4.22 ms | 185 μs | **2.00 μs** | 1.21 ms | 117 μs |
+
+**warm invoke** wasm-AOT 比 tree-walker 快 **40-60×**——闭包通过
+`call_indirect` 在 wasm 内零拷贝调用，tree-walker 走的是 dynamic dispatch
++ scope frame 分配，差异主要来自这两层。
+
+**cold start** ~4.2 ms（vs 之前 arithmetic 的 3.26 ms），多出的部分是
+stdlib 多了 3 个 higher-order functions + funcref Table + ElementSection
+拉大 wasm module 字节数，cranelift JIT 时间相应增长。后续优化方向是
+dead-code elimination（用户没调用 list_int_map 时不该编进 wasm）。
+
+**cached cold start** ~188 μs（vs Phase 9.c-2 的 139 μs，+35%）——同样
+是 module 大小增长导致 `Module::deserialize` 多读字节。Phase 11 的
+`InstancePre` 跨 store 复用做完，cached cold 路径可以再下一档。
+
+Phase 10-a 实测时所有 closure 跨 `#main` 边界的调用都被 lowering 拒绝
+（`LoweringError::ClosureAcrossBoundary`），符合 `wasm-adr-A` 决策——
+closure value 仅在 wasm 模块内部有效，host 只能传 plain values。
