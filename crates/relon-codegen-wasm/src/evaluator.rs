@@ -397,8 +397,48 @@ impl WasmAotEvaluator {
     /// Pipeline: `parse_document` → `relon_analyzer::analyze` →
     /// `relon_ir::lower_workspace_single` → `compile_lowered_entry` →
     /// `WasmModule::from_bytes` → `wasmtime::Module::new`.
+    ///
+    /// Single-file path: any `#import` in `src` is rejected because the
+    /// pipeline never opens its target. Use [`Self::from_workspace`]
+    /// when the entry pulls in transitive modules.
     pub fn from_source(src: &str) -> Result<Self, BuildError> {
         let (lowered, bytes) = Self::compile_source(src)?;
+        Self::from_bytes(bytes, lowered.main_schema, lowered.return_schema)
+    }
+
+    /// Phase 10-b: compile a workspace whose entry file pulls in
+    /// transitive `#import "./..."` modules.
+    ///
+    /// The caller (typically the CLI / facade) is expected to have
+    /// driven the analyzer through `relon_analyzer::analyze_entry` so
+    /// every reachable module is parsed + analyzed and the workspace's
+    /// `has_errors()` gate is clean. This entry then:
+    ///
+    /// 1. Looks up `entry_module` in `ws.modules` / `ws.nodes`.
+    /// 2. Calls `relon_ir::lower_workspace` which now merges every
+    ///    reachable module's `#schema` declarations into one cross-file
+    ///    resolver so `#main(User u)` resolves `User` from
+    ///    `./util.relon`.
+    /// 3. Hands the resulting IR + canonical schemas off to the same
+    ///    codegen + wasmtime pipeline `from_source` uses.
+    ///
+    /// Errors surface as the same `BuildError` shape `from_source`
+    /// returns; `LoweringError::DuplicateSchemaAcrossFiles` /
+    /// `MultipleMainDirectives` lift into `BuildError::LoweringError`
+    /// so callers route them through one display path.
+    pub fn from_workspace(
+        ws: &relon_analyzer::workspace::WorkspaceTree,
+        entry_module: &str,
+    ) -> Result<Self, BuildError> {
+        if !ws.modules.contains_key(entry_module) {
+            return Err(BuildError::LoweringError(format!(
+                "entry module `{entry_module}` not found in workspace"
+            )));
+        }
+        let lowered = relon_ir::lower_workspace(ws, entry_module)
+            .map_err(|e| BuildError::LoweringError(e.to_string()))?;
+        let bytes =
+            compile_lowered_entry(&lowered).map_err(|e| BuildError::CodegenError(e.to_string()))?;
         Self::from_bytes(bytes, lowered.main_schema, lowered.return_schema)
     }
 

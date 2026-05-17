@@ -284,15 +284,15 @@ fn main() -> miette::Result<()> {
                         ))
                     })?,
                     BackendArg::WasmAot => {
-                        // wasm-AOT compiles the single entry file
-                        // (no transitive imports in v1) through
+                        // wasm-AOT compiles the entry file through
                         // codegen + wasmtime and dispatches the same
-                        // host-args HashMap through `run_main`. We
-                        // intentionally re-parse / re-analyze inside
-                        // `from_source` rather than reusing the
-                        // workspace tree: the codegen path wants the
-                        // single-file analyzer output, and folding
-                        // workspace mode into v1 is a Phase 9 goal.
+                        // host-args HashMap through `run_main`. Phase
+                        // 10-b: we reuse the already-built `workspace`
+                        // instead of calling `from_source(content)`
+                        // so transitive `#import "./util.relon"`
+                        // resolves the same way the tree-walker does
+                        // — single-file entries are just the
+                        // degenerate one-module workspace.
                         //
                         // `--trust` flips the wasm side's
                         // `relon_caps_avail` bitmap from the
@@ -307,7 +307,7 @@ fn main() -> miette::Result<()> {
                         } else {
                             relon_eval_api::Capabilities::default()
                         };
-                        let aot = WasmAotEvaluator::from_source(&content)
+                        let aot = WasmAotEvaluator::from_workspace(&workspace, &cache_namespace)
                             .map_err(|e| {
                                 miette::miette!("wasm-aot backend setup: {e}").with_source_code(
                                     NamedSource::new(file.to_string_lossy(), content.clone()),

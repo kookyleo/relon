@@ -162,6 +162,15 @@ struct SchemaMethodRegistry {
 /// from the analyzer's `tree.root_schemas` + `tree.schemas`. Cheap to
 /// construct — only the schema declarations participate, not every
 /// node in the source tree.
+///
+/// Phase 10-b: the resolver may aggregate schemas from multiple
+/// reachable modules so a `#main(User u)` in the entry file can
+/// resolve `User` when it lives in an imported file. The first tree
+/// passed to `new_multi` wins on a name clash (entry first), matching
+/// the analyzer's source-order import dedup; conflicting same-name
+/// schemas across files are surfaced upstream by
+/// `detect_cross_file_schema_conflicts` so the IR pass never silently
+/// picks a "wrong" shape here.
 #[derive(Debug, Clone)]
 struct SchemaResolver<'a> {
     by_name: HashMap<&'a str, &'a SchemaDef>,
@@ -169,25 +178,40 @@ struct SchemaResolver<'a> {
 
 impl<'a> SchemaResolver<'a> {
     fn new(tree: &'a AnalyzedTree) -> Self {
+        Self::new_multi(std::slice::from_ref(&tree))
+    }
+
+    /// Aggregate schema declarations from every `tree` in order. Used
+    /// by [`lower_workspace`] so `#main(User u)` can resolve `User`
+    /// when it is declared in an imported module — the entry tree
+    /// alone has no `SchemaDef` for it. The first tree's declarations
+    /// take precedence on collision, matching the analyzer's
+    /// source-order import semantics; the IR pass relies on
+    /// [`collect_cross_file_schema_conflicts`] to have raised
+    /// `LoweringError::DuplicateSchemaAcrossFiles` already when two
+    /// files disagree on a schema's shape.
+    fn new_multi(trees: &[&'a AnalyzedTree]) -> Self {
         let mut by_name: HashMap<&'a str, &'a SchemaDef> = HashMap::new();
-        // Root-level `#schema X ...` directives are the standard
-        // surface for top-level brand declarations; the schema body
-        // lives in `tree.schemas` keyed by the body node id. We pick
-        // the SchemaDef out of `tree.schemas` to get the analyzed
-        // field shape.
-        for decl in &tree.root_schemas {
-            if let Some(def) = tree.schemas.get(&decl.schema_node.id) {
-                by_name.insert(decl.name.as_str(), def);
+        for tree in trees {
+            // Root-level `#schema X ...` directives are the standard
+            // surface for top-level brand declarations; the schema body
+            // lives in `tree.schemas` keyed by the body node id. We pick
+            // the SchemaDef out of `tree.schemas` to get the analyzed
+            // field shape.
+            for decl in &tree.root_schemas {
+                if let Some(def) = tree.schemas.get(&decl.schema_node.id) {
+                    by_name.entry(decl.name.as_str()).or_insert(def);
+                }
             }
-        }
-        // Dict-field `#schema X { ... }` declarations also surface in
-        // `tree.schemas`. Walk every entry that has a non-None name
-        // and add it to the map (later declarations of the same name
-        // are kept earliest — analyzer-level diagnostics already
-        // catch duplicates).
-        for def in tree.schemas.values() {
-            if let Some(name) = &def.name {
-                by_name.entry(name.as_str()).or_insert(def);
+            // Dict-field `#schema X { ... }` declarations also surface in
+            // `tree.schemas`. Walk every entry that has a non-None name
+            // and add it to the map (later declarations of the same name
+            // are kept earliest — analyzer-level diagnostics already
+            // catch duplicates).
+            for def in tree.schemas.values() {
+                if let Some(name) = &def.name {
+                    by_name.entry(name.as_str()).or_insert(def);
+                }
             }
         }
         Self { by_name }
@@ -310,28 +334,98 @@ pub struct LoweredEntry {
     pub return_schema: Schema,
 }
 
-/// Lower the entry module of a workspace.
+/// Lower the entry module of a workspace, inlining every reachable
+/// module's `#schema` / `#extend` contributions so a `#main(User u)`
+/// in the entry file resolves `User` even when it lives in an
+/// imported file.
 ///
-/// Looks up `entry_module` in `ws.modules` and the matching root
-/// node in `ws.nodes`, then delegates to [`lower_workspace_single`].
-/// Phase 2.b still only handles single-entry workspaces.
+/// Phase 10-b: prior to this, `lower_workspace` was a thin wrapper
+/// around the single-file `lower_workspace_single` and the IR pass
+/// could not see cross-file schemas at all. The new implementation:
+///
+/// 1. Walks `ws.import_graph` BFS-from-entry to collect every
+///    reachable module's analyzed tree (the same set the evaluator
+///    side loads for runtime `#import`).
+/// 2. Rejects the workspace when two modules declare the same
+///    top-level schema name with structurally different bodies
+///    (`LoweringError::DuplicateSchemaAcrossFiles`) — wasm-AOT
+///    cannot pick non-deterministically between two `User`
+///    definitions without breaking canonical-hash determinism.
+/// 3. Rejects the workspace when more than one reachable module
+///    carries a `#main` directive (`LoweringError::MultipleMainDirectives`).
+/// 4. Builds a multi-tree [`SchemaResolver`] so the entry's
+///    parameter / body lowering walks see every reachable schema
+///    declaration.
+/// 5. Delegates to the existing entry-body lowering against the
+///    merged resolver. `schema_methods` on the entry tree is already
+///    cross-file thanks to the analyzer's
+///    `propagate_schema_methods_across_imports` pass — the IR side
+///    just consumes it.
 pub fn lower_workspace(
     ws: &WorkspaceTree,
     entry_module: &str,
 ) -> Result<LoweredEntry, LoweringError> {
-    let tree = ws
-        .modules
-        .get(entry_module)
-        .ok_or_else(|| LoweringError::EntryModuleNotFound {
-            module: entry_module.to_string(),
-        })?;
-    let root = ws
-        .nodes
-        .get(entry_module)
-        .ok_or_else(|| LoweringError::EntryModuleNotFound {
-            module: entry_module.to_string(),
-        })?;
-    lower_workspace_single_with_module(tree.as_ref(), root.as_ref(), entry_module)
+    let entry_tree =
+        ws.modules
+            .get(entry_module)
+            .ok_or_else(|| LoweringError::EntryModuleNotFound {
+                module: entry_module.to_string(),
+            })?;
+    let entry_root =
+        ws.nodes
+            .get(entry_module)
+            .ok_or_else(|| LoweringError::EntryModuleNotFound {
+                module: entry_module.to_string(),
+            })?;
+
+    // Reachable modules, BFS from the entry. Entry first so it wins
+    // on a schema-name collision (the conflict detection below catches
+    // structurally-different duplicates; identical bodies fall through
+    // silently, matching the analyzer's diamond-import dedup).
+    let reachable_ids = reachable_modules(ws, entry_module);
+    let mut reachable_trees: Vec<&AnalyzedTree> = Vec::with_capacity(reachable_ids.len());
+    let mut reachable_pairs: Vec<(&str, &AnalyzedTree)> = Vec::with_capacity(reachable_ids.len());
+    for id in &reachable_ids {
+        if let Some(arc) = ws.modules.get(id) {
+            reachable_trees.push(arc.as_ref());
+            reachable_pairs.push((id.as_str(), arc.as_ref()));
+        }
+    }
+
+    // (a) Surface cross-file `#schema` shape conflicts before the
+    // resolver silently picks one — the entry-first ordering would
+    // otherwise mask the conflict and produce a wasm module whose
+    // canonical hash agrees with the entry but disagrees with the
+    // imported file's expectation.
+    detect_cross_file_schema_conflicts(&reachable_pairs)?;
+
+    // (b) Only the entry file may carry `#main`. Imported libraries
+    // accidentally tagged `#main(...)` would otherwise have their
+    // signature silently dropped here.
+    for (id, tree) in &reachable_pairs {
+        if *id == entry_module {
+            continue;
+        }
+        if tree.main_signature.is_some() {
+            return Err(LoweringError::MultipleMainDirectives {
+                entry_module: entry_module.to_string(),
+                other_module: (*id).to_string(),
+            });
+        }
+    }
+
+    // (c) Cross-file resolver. `new_multi` keeps the first-seen
+    // SchemaDef per name so the entry's own declarations stay
+    // authoritative — important for diagnostics that print the
+    // entry-file source span.
+    let resolver = SchemaResolver::new_multi(&reachable_trees);
+
+    lower_entry_with_resolver(
+        entry_tree.as_ref(),
+        entry_root.as_ref(),
+        entry_module,
+        resolver,
+    )
 }
 
 /// Single-file lowering convenience. Treats the supplied `(tree,
@@ -347,6 +441,105 @@ fn lower_workspace_single_with_module(
     tree: &AnalyzedTree,
     root: &Node,
     module_id: &str,
+) -> Result<LoweredEntry, LoweringError> {
+    let resolver = SchemaResolver::new(tree);
+    lower_entry_with_resolver(tree, root, module_id, resolver)
+}
+
+/// BFS over `ws.import_graph` starting from `entry_module`. Returns
+/// every module id reachable through `#import` edges (including the
+/// entry), deduplicated, in BFS visit order. Modules whose canonical
+/// id appears in `import_graph` edges but not in `ws.modules`
+/// (failed-to-load slots) are skipped; the workspace pass already
+/// surfaced their `ModuleNotFound` diagnostic.
+fn reachable_modules(ws: &WorkspaceTree, entry_module: &str) -> Vec<String> {
+    use std::collections::{HashSet, VecDeque};
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut queue: VecDeque<String> = VecDeque::new();
+    let mut out: Vec<String> = Vec::new();
+    queue.push_back(entry_module.to_string());
+    seen.insert(entry_module.to_string());
+    while let Some(id) = queue.pop_front() {
+        out.push(id.clone());
+        if let Some(edges) = ws.import_graph.get(&id) {
+            for edge in edges {
+                // Only follow edges whose target was actually analyzed
+                // — the entry's `import_graph` slot lists raw paths
+                // when resolution fails, but those never land in
+                // `ws.modules`.
+                if !ws.modules.contains_key(edge) {
+                    continue;
+                }
+                if seen.insert(edge.clone()) {
+                    queue.push_back(edge.clone());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Compare each pair of reachable modules' top-level schemas; emit
+/// `LoweringError::DuplicateSchemaAcrossFiles` when the same name
+/// names structurally-different bodies. Identical bodies (diamond
+/// imports re-exporting the same definition) pass through.
+fn detect_cross_file_schema_conflicts(
+    reachable: &[(&str, &AnalyzedTree)],
+) -> Result<(), LoweringError> {
+    // First sighting wins: record `(module_id, canonical_schema)` so
+    // the second sighting can compare. Schemas the IR can't even
+    // canonicalize (variant / unsized) are skipped — the entry body's
+    // own lowering walk will reject them with a precise error if it
+    // ends up reaching for one. Anonymous (None-name) schemas live in
+    // `tree.schemas` too but cannot collide cross-file.
+    let mut first_seen: HashMap<String, (String, Schema)> = HashMap::new();
+    for (id, tree) in reachable {
+        // Build a per-module resolver so canonicalization can chase
+        // inline references inside the schema's own body. The
+        // cross-file resolver isn't valid yet — we'd be using it to
+        // detect the very conflict it would silently paper over.
+        let local_resolver = SchemaResolver::new(tree);
+        for decl in &tree.root_schemas {
+            let Some(def) = tree.schemas.get(&decl.schema_node.id) else {
+                continue;
+            };
+            let mut stack: Vec<&str> = Vec::new();
+            let Ok(canonical) =
+                canonical_schema_from_def(def, &local_resolver, &mut stack, def.range)
+            else {
+                continue;
+            };
+            let name = decl.name.clone();
+            if let Some((other_id, other_schema)) = first_seen.get(&name) {
+                if schema_hashes_differ(other_schema, &canonical) {
+                    return Err(LoweringError::DuplicateSchemaAcrossFiles {
+                        name,
+                        first_module: other_id.clone(),
+                        second_module: (*id).to_string(),
+                    });
+                }
+            } else {
+                first_seen.insert(name, ((*id).to_string(), canonical));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Byte-compare two canonical schemas. We piggy-back on the
+/// canonical-hash helper rather than implementing a structural
+/// equality walk — the canonical form already collapses every
+/// representation difference that the wasm-AOT pipeline cares about.
+fn schema_hashes_differ(a: &Schema, b: &Schema) -> bool {
+    use relon_eval_api::schema_canonical::schema_hash;
+    schema_hash(a) != schema_hash(b)
+}
+
+fn lower_entry_with_resolver<'a>(
+    tree: &'a AnalyzedTree,
+    root: &Node,
+    module_id: &str,
+    resolver: SchemaResolver<'a>,
 ) -> Result<LoweredEntry, LoweringError> {
     let sig = tree
         .main_signature
@@ -385,7 +578,11 @@ fn lower_workspace_single_with_module(
     // equivalent to a 1-field record whose `value` is the user
     // schema, but the wasm-level layout pads the *user schema* into
     // the root return area directly (no extra pointer slot).
-    let resolver = SchemaResolver::new(tree);
+    //
+    // Phase 10-b: `resolver` is supplied by the caller so the
+    // `lower_workspace` cross-file aggregate is consulted here; for
+    // single-file builds the helper still constructs a one-tree
+    // resolver before delegating.
     let user_return_schema = resolve_return_user_schema(sig.return_type.as_ref(), &resolver)?;
 
     // Build the canonical-form schemas for in_buf and out_buf, then
