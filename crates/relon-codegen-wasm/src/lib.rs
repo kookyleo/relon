@@ -731,23 +731,61 @@ fn build_const_pool_for_funcs(funcs: &[IrFunc]) -> Result<ConstPool, CodegenErro
 /// invariants stay intact.
 fn stdlib_to_ir_func(f: relon_ir::StdlibFunction) -> IrFunc {
     let synthetic_range = synthetic_stdlib_range();
-    let body = f
-        .body
-        .into_iter()
-        .map(|mut t| {
-            // Stdlib bodies are hand-written with `TokenRange::default()`
-            // ranges; rewrite them so the srcmap pass sees the
-            // 1-based synthetic range uniformly.
-            t.range = synthetic_range;
-            t
-        })
-        .collect();
+    let body = rewrite_synthetic_ranges(f.body, synthetic_range);
     IrFunc {
         name: format!("__relon_stdlib_{}", f.name),
         params: f.params,
         ret: f.ret,
         body,
         range: synthetic_range,
+    }
+}
+
+/// Phase 4.c-2: rewrite every nested op's `TokenRange` to the
+/// synthetic 1-based stdlib anchor. Stdlib bodies are hand-written
+/// with `TokenRange::default()` ranges (line = 0, col = 0), which
+/// would break the srcmap encoder's 1-based invariant if it ever
+/// surfaced through `relon.srcmap`. The pre-Phase-4.c-2 path only
+/// rewrote the top-level ops; the new loop bodies (Block / Loop /
+/// If arms) carry nested ranges that the rewrite must traverse.
+fn rewrite_synthetic_ranges(
+    body: Vec<relon_ir::TaggedOp>,
+    synthetic_range: TokenRange,
+) -> Vec<relon_ir::TaggedOp> {
+    body.into_iter()
+        .map(|t| relon_ir::TaggedOp {
+            op: rewrite_op_ranges(t.op, synthetic_range),
+            range: synthetic_range,
+        })
+        .collect()
+}
+
+/// Recursive helper for [`rewrite_synthetic_ranges`]. Walks the
+/// nested op bodies of [`Op::If`] / [`Op::Block`] / [`Op::Loop`] and
+/// returns a fresh `Op` whose carried `TaggedOp`s all use
+/// `synthetic_range`.
+fn rewrite_op_ranges(op: Op, synthetic_range: TokenRange) -> Op {
+    match op {
+        Op::If {
+            result_ty,
+            then_body,
+            else_body,
+        } => Op::If {
+            result_ty,
+            then_body: rewrite_synthetic_ranges(then_body, synthetic_range),
+            else_body: rewrite_synthetic_ranges(else_body, synthetic_range),
+        },
+        Op::Block { result_ty, body } => Op::Block {
+            result_ty,
+            body: rewrite_synthetic_ranges(body, synthetic_range),
+        },
+        Op::Loop { result_ty, body } => Op::Loop {
+            result_ty,
+            body: rewrite_synthetic_ranges(body, synthetic_range),
+        },
+        // All other ops carry no nested TaggedOp lists; pass
+        // through unchanged.
+        other => other,
     }
 }
 
@@ -944,9 +982,8 @@ fn emit_function_body(
     // the wasm-declared params; pre-Phase-4.c-2 the constant assumed
     // the entry function's four-param layout, which broke stdlib
     // bodies that declare fewer params.
-    let params_count = u32::try_from(func.params.len()).map_err(|_| {
-        CodegenError::Layout("function declares more than u32::MAX params".into())
-    })?;
+    let params_count = u32::try_from(func.params.len())
+        .map_err(|_| CodegenError::Layout("function declares more than u32::MAX params".into()))?;
     let record_local_base = params_count + FIRST_LET_LOCAL_OFFSET + let_locals_count;
     let mut f = Function::new(locals_header);
 
@@ -1415,6 +1452,11 @@ fn emit_op_seq(
                 vstack.push(IrType::Bool);
                 ranges.push(tagged.range);
             }
+            Op::ConstI32(v) => {
+                f.instruction(&Instruction::I32Const(*v));
+                vstack.push(IrType::I32);
+                ranges.push(tagged.range);
+            }
             Op::ConstI64(v) => {
                 f.instruction(&Instruction::I64Const(*v));
                 vstack.push(IrType::I64);
@@ -1530,6 +1572,10 @@ fn emit_op_seq(
             }
             Op::Mod(tag) => {
                 emit_arith(f, vstack, *tag, ArithOp::Mod)?;
+                ranges.push(tagged.range);
+            }
+            Op::BitAnd(tag) => {
+                emit_arith(f, vstack, *tag, ArithOp::BitAnd)?;
                 ranges.push(tagged.range);
             }
             Op::Eq(tag) => {
@@ -1991,6 +2037,49 @@ fn emit_op_seq(
                     dst_mem: 0,
                 });
                 ranges.push(tagged.range);
+            }
+            Op::LoadI8UAtAbsolute { offset } => {
+                // Pop the absolute base address and emit
+                // `i32.load8_u`. The result occupies an i32 slot
+                // (the high three bytes are zero by definition).
+                let popped = vstack.pop().ok_or(CodegenError::MixedNumericTypes)?;
+                if popped.wasm_slot() != IrType::I32 {
+                    return Err(CodegenError::MixedNumericTypes);
+                }
+                f.instruction(&Instruction::I32Load8U(MemArg {
+                    offset: *offset as u64,
+                    align: 0,
+                    memory_index: 0,
+                }));
+                ranges.push(tagged.range);
+                vstack.push(IrType::I32);
+            }
+            Op::StoreI8AtAbsolute { offset } => {
+                // Pop value then address, mirroring wasm `i32.store8`
+                // stack shape.
+                let value = vstack.pop().ok_or(CodegenError::MixedNumericTypes)?;
+                let addr = vstack.pop().ok_or(CodegenError::MixedNumericTypes)?;
+                if value.wasm_slot() != IrType::I32 || addr.wasm_slot() != IrType::I32 {
+                    return Err(CodegenError::MixedNumericTypes);
+                }
+                f.instruction(&Instruction::I32Store8(MemArg {
+                    offset: *offset as u64,
+                    align: 0,
+                    memory_index: 0,
+                }));
+                ranges.push(tagged.range);
+            }
+            Op::Trap { kind } => {
+                // Map the IR-level trap kind to the matching uctab
+                // discriminant and emit a recorded `unreachable`.
+                // Codegen does not pop or push any operands — the
+                // wasm verifier treats the rest of the surrounding
+                // block as unreachable after the trap.
+                let uctab_kind = match kind {
+                    relon_ir::TrapKind::IndexOutOfBounds => UnreachableKind::IndexOutOfBounds,
+                    relon_ir::TrapKind::EmptyList => UnreachableKind::EmptyList,
+                };
+                emit_recorded_unreachable(f, ranges, log, tagged.range, uctab_kind);
             }
         }
     }
@@ -3309,6 +3398,9 @@ enum ArithOp {
     Mul,
     Div,
     Mod,
+    /// Phase 4.c-2: bitwise AND. Restricted to i32 / i64 — every
+    /// other type tag falls through to `MixedNumericTypes`.
+    BitAnd,
 }
 
 enum CmpOp {
@@ -3328,7 +3420,15 @@ fn emit_arith(
 ) -> Result<(), CodegenError> {
     let rhs = vstack.pop().ok_or(CodegenError::MixedNumericTypes)?;
     let lhs = vstack.pop().ok_or(CodegenError::MixedNumericTypes)?;
-    if lhs != tag || rhs != tag {
+    // Phase 4.c-2: slot-equality instead of strict tag-equality. Pre-
+    // refactor we rejected `Add(I32)` between a String pointer and a
+    // raw i32 because String != I32; stdlib bodies that do pointer
+    // arithmetic on String / ListInt receivers need the relaxation so
+    // they can add a byte offset to a record base without a tag-cast
+    // op. The wasm-level type is still pinned by the tag, so an
+    // i64 vs i32 mismatch still trips the guard (their slots
+    // disagree).
+    if lhs.wasm_slot() != tag.wasm_slot() || rhs.wasm_slot() != tag.wasm_slot() {
         return Err(CodegenError::MixedNumericTypes);
     }
     let instr = match (tag, op) {
@@ -3342,15 +3442,27 @@ fn emit_arith(
         (IrType::F64, ArithOp::Mul) => Instruction::F64Mul,
         (IrType::F64, ArithOp::Div) => Instruction::F64Div,
         (IrType::F64, ArithOp::Mod) => return Err(CodegenError::MixedNumericTypes),
-        // Arithmetic on I32 / Bool / Null / String / ListInt is not
-        // part of the surface — the lowering pass rejects bodies
-        // with these tags. A hand-crafted IR landing here gets the
-        // same treatment as a mixed-type body.
-        (IrType::I32, _)
-        | (IrType::Bool, _)
-        | (IrType::Null, _)
-        | (IrType::String, _)
-        | (IrType::ListInt, _) => {
+        // Phase 4.c-2: enable i32 arithmetic so stdlib bodies can
+        // compute pointer / length offsets without round-tripping
+        // through the i64 slot. User-surface arithmetic still
+        // lowers to `Add(I64)` / `Add(F64)`; the I32 path is
+        // reachable only from hand-built stdlib bodies.
+        (IrType::I32, ArithOp::Add) => Instruction::I32Add,
+        (IrType::I32, ArithOp::Sub) => Instruction::I32Sub,
+        (IrType::I32, ArithOp::Mul) => Instruction::I32Mul,
+        (IrType::I32, ArithOp::Div) => Instruction::I32DivS,
+        (IrType::I32, ArithOp::Mod) => Instruction::I32RemS,
+        // Phase 4.c-2: bitwise AND for the power-of-two alignment
+        // masks stdlib bodies use to round addresses up to the
+        // next 8-byte boundary.
+        (IrType::I32, ArithOp::BitAnd) => Instruction::I32And,
+        (IrType::I64, ArithOp::BitAnd) => Instruction::I64And,
+        (IrType::F64, ArithOp::BitAnd) => return Err(CodegenError::MixedNumericTypes),
+        // Arithmetic on Bool / Null / String / ListInt is not part
+        // of the surface — the lowering pass rejects bodies with
+        // these tags. A hand-crafted IR landing here gets the same
+        // treatment as a mixed-type body.
+        (IrType::Bool, _) | (IrType::Null, _) | (IrType::String, _) | (IrType::ListInt, _) => {
             return Err(CodegenError::MixedNumericTypes);
         }
     };
@@ -3416,9 +3528,16 @@ fn emit_cmp(
                 ty: IrType::ListInt,
             });
         }
-        (IrType::I32, _) => {
-            return Err(CodegenError::InvalidComparisonOperandType { ty: IrType::I32 });
-        }
+        // Phase 4.c-2: unsigned i32 comparisons so stdlib bodies can
+        // compare pointer / length offsets directly (signed wrap on
+        // a 31-bit max heap layout would still be safe, but unsigned
+        // matches wasm's preferred address arithmetic shape).
+        (IrType::I32, CmpOp::Eq) => Instruction::I32Eq,
+        (IrType::I32, CmpOp::Ne) => Instruction::I32Ne,
+        (IrType::I32, CmpOp::Lt) => Instruction::I32LtU,
+        (IrType::I32, CmpOp::Le) => Instruction::I32LeU,
+        (IrType::I32, CmpOp::Gt) => Instruction::I32GtU,
+        (IrType::I32, CmpOp::Ge) => Instruction::I32GeU,
     };
     f.instruction(&instr);
     vstack.push(IrType::Bool);

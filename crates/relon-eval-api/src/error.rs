@@ -320,7 +320,9 @@ pub enum RuntimeError {
     #[error("wasm trap: index walked past receiver length")]
     #[diagnostic(
         code(relon::eval::wasm_index_out_of_bounds),
-        help("Check the bounds you pass to substring / slice stdlib helpers before invoking them.")
+        help(
+            "Check the bounds you pass to substring / slice stdlib helpers before invoking them."
+        )
     )]
     WasmIndexOutOfBounds {
         #[label("index out of bounds here")]
