@@ -417,4 +417,56 @@ pub enum RuntimeError {
         /// its own constraint (e.g. "wasm-aot has no AST at runtime").
         reason: String,
     },
+
+    /// v3+ a-3: remote `#import "https://..."` resolved an URL but the
+    /// HTTP fetch (DNS / connect / TLS / non-2xx status / body read)
+    /// failed. `cause` is a free-form, host-rendered description; the
+    /// span points at the offending `#import` directive in the importer.
+    #[error("remote import {url}: {cause}")]
+    #[diagnostic(
+        code(relon::eval::remote_import_failed),
+        help("The host could not retrieve the remote module. Check connectivity, the URL, and that the server returns a 2xx response with a Relon source body.")
+    )]
+    RemoteImportFailed {
+        url: String,
+        cause: String,
+        #[label("remote import failed")]
+        range: TokenRange,
+    },
+
+    /// v3+ a-3: remote `#import "https://..."` was rejected before the
+    /// fetch ran because the active sandbox forbids network egress
+    /// (no `--trust` / no `Capabilities::network`). Carries the URL
+    /// for the diagnostic and a host-supplied reason explaining the
+    /// policy bit that blocked the call.
+    #[error("remote import {url} denied: {reason}")]
+    #[diagnostic(
+        code(relon::eval::remote_import_denied),
+        help("Remote `#import` is a network operation. Run the host with `--trust` (CLI) or grant `Capabilities::network` to allow it.")
+    )]
+    RemoteImportDenied {
+        url: String,
+        reason: String,
+        #[label("remote import rejected by sandbox")]
+        range: TokenRange,
+    },
+
+    /// v3+ a-3: an explicit integrity hash was supplied alongside a
+    /// remote `#import`, and the fetched body's sha256 did not match.
+    /// The pinning syntax itself is **not** wired in this phase, but
+    /// the variant ships so future syntax work (or an out-of-band
+    /// lockfile) can reuse the error surface without churning the
+    /// enum.
+    #[error("remote import {url} hash mismatch: expected {expected}, got {got}")]
+    #[diagnostic(
+        code(relon::eval::remote_import_hash_mismatch),
+        help("The remote source's sha256 differs from the pinned hash. Either update the pin or refuse to load the module.")
+    )]
+    RemoteImportHashMismatch {
+        url: String,
+        expected: String,
+        got: String,
+        #[label("hash mismatch on remote import")]
+        range: TokenRange,
+    },
 }
