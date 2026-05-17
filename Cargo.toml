@@ -24,6 +24,12 @@ sha2 = "0.10"
 clap = "4.4"
 anyhow = "1.0"
 proptest = "1"
+# v3+ a-3: HTTPS fetch for remote `#import "https://..."`.
+# Pure-Rust, sync-only, TLS via rustls so we don't pull native-tls /
+# OpenSSL into the host build. Feature-gated to non-wasm32 targets in
+# `relon-evaluator` so the browser playground does not link it.
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+hex = "0.4"
 
 # Internal crates declared with both `path` and `version` so each can
 # be published to crates.io independently while local builds keep

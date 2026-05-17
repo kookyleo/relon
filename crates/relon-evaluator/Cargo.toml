@@ -23,6 +23,15 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 miette = { workspace = true, features = ["derive"] }
 
+# v3+ a-3: HTTPS fetch for remote `#import "https://..."` modules.
+# Restricted to native hosts so the browser playground build of
+# `relon-wasm` (which depends on this crate) keeps compiling against
+# `wasm32-unknown-unknown` without dragging in native sockets / TLS.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+ureq = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+
 [dev-dependencies]
 proptest = { workspace = true }
 # `relon-fmt` is pulled in only for the fmt round-trip property in

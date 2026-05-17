@@ -36,6 +36,8 @@ pub use relon_eval_api::{
 };
 // Concrete backend-side helpers that are not part of `relon-eval-api`.
 pub use module::{FilesystemModuleResolver, StdModuleResolver};
+#[cfg(not(target_arch = "wasm32"))]
+pub use module::{RemoteHttpResolver, RemoteImportCache};
 pub use relon_analyzer::{MainParam, MainSignature, WorkspaceDiagnostic, WorkspaceTree};
 
 // Tests live in dedicated files to keep the crate root focused on the
