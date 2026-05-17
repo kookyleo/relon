@@ -1,0 +1,197 @@
+name: Bench
+
+# Runs the wasm-AOT vs tree-walk criterion bench on every pull request
+# (against the PR base branch) and on pushes to main (against the prior
+# main commit). The job runs criterion twice on the same runner:
+#
+#   1. Check out the base ref, run with `--save-baseline base`. The
+#      resulting estimates land in `target/criterion/<group>/<id>/base`.
+#   2. Check out the head ref (back to the originally-fetched workspace),
+#      run with `--baseline base`. Criterion compares head vs base and
+#      reports any statistically significant regression / improvement.
+#
+# CI bench numbers are noisy by design (shared CPU, no SMT pinning, no
+# cgroup isolation). The job therefore widens criterion's
+# `--noise-threshold` to 10 % so only meaningful regressions trip the
+# `Performance has regressed` line. Final perf numbers still come from
+# the local perf-runner; CI bench output is a guard rail, not a
+# tracking signal.
+#
+# The job uploads criterion's HTML / JSON reports as a workflow
+# artifact so reviewers can drill into per-iteration data without
+# pulling the runner image apart.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+# Avoid stacking bench runs when commits land back-to-back; the
+# previous run is cancelled when a fresh push supersedes it.
+concurrency:
+  group: bench-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  bench:
+    name: criterion baseline diff
+    runs-on: ubuntu-latest
+    # Bench is a guard rail, not a release gate. Mark continue-on-error
+    # so flaky CI runs do not block PR merges; reviewers still see the
+    # red check and the artifact for diagnosis.
+    continue-on-error: true
+    timeout-minutes: 60
+    env:
+      # Bench binary name in `crates/relon-bench/benches/`. Pinned so a
+      # future bench addition does not silently get pulled into the CI
+      # budget without an explicit edit here.
+      BENCH_NAME: wasm_aot_vs_tree_walk
+      # Criterion noise threshold (relative). 10 % is wider than the
+      # default 1 % to absorb shared-runner jitter. Override per-bench
+      # via `--noise-threshold` if a specific group needs a tighter
+      # bar.
+      CRITERION_NOISE_THRESHOLD: "0.10"
+      # Base ref for the comparison. Defaults to the PR base branch on
+      # pull_request events; falls back to the previous commit on main
+      # for push events.
+      BASE_REF: ${{ github.event.pull_request.base.ref || 'HEAD~1' }}
+    steps:
+      - name: Checkout head
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: bench-${{ runner.os }}
+
+      - name: Resolve base SHA
+        id: base
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            base_sha="${{ github.event.pull_request.base.sha }}"
+          else
+            # Push to main: compare against the previous commit on this
+            # ref. `before` is the SHA of the commit replaced by the push.
+            base_sha="${{ github.event.before }}"
+            if [ -z "$base_sha" ] || [ "$base_sha" = "0000000000000000000000000000000000000000" ]; then
+              # First push to a new branch, or no prior ref. Use the
+              # parent of HEAD as a best-effort baseline.
+              base_sha="$(git rev-parse HEAD^ 2>/dev/null || git rev-parse HEAD)"
+            fi
+          fi
+          echo "sha=$base_sha" >> "$GITHUB_OUTPUT"
+          echo "Base SHA: $base_sha"
+
+      - name: Build bench binary (current)
+        run: cargo bench -p relon-bench --bench "$BENCH_NAME" --no-run
+
+      - name: Save current SHA
+        id: head
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Run baseline (base ref)
+        run: |
+          set -euo pipefail
+          # Stash the head workspace state and check out the base SHA.
+          # We deliberately do not `git stash` because the only thing
+          # that changed is the workspace metadata; checkout reverts
+          # everything in tree.
+          git checkout "${{ steps.base.outputs.sha }}"
+          # Build + run criterion against the base ref, saving the
+          # estimates under the `base` baseline.
+          cargo bench -p relon-bench --bench "$BENCH_NAME" -- \
+            --save-baseline base \
+            --noise-threshold "$CRITERION_NOISE_THRESHOLD"
+
+      - name: Restore head workspace
+        run: git checkout "${{ steps.head.outputs.sha }}"
+
+      - name: Run diff (head vs base)
+        id: diff
+        run: |
+          set -euo pipefail
+          # Re-run criterion with --baseline base. Criterion writes the
+          # comparison to stdout (`change` block with t-test verdict)
+          # and to `target/criterion/<...>/change/`.
+          set +e
+          cargo bench -p relon-bench --bench "$BENCH_NAME" -- \
+            --baseline base \
+            --noise-threshold "$CRITERION_NOISE_THRESHOLD" \
+            | tee bench-output.txt
+          status=${PIPESTATUS[0]}
+          set -e
+          # Surface any "Performance has regressed" line as a job
+          # failure. Criterion reports this verdict on stderr/stdout
+          # when the post-test confidence interval lies wholly above
+          # the noise threshold.
+          if grep -q "Performance has regressed" bench-output.txt; then
+            echo "regressed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "regressed=false" >> "$GITHUB_OUTPUT"
+          fi
+          exit $status
+
+      - name: Upload criterion report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: criterion-report
+          path: |
+            target/criterion
+            bench-output.txt
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Post bench summary to PR
+        if: github.event_name == 'pull_request' && always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            let body;
+            try {
+              const raw = fs.readFileSync('bench-output.txt', 'utf8');
+              // Trim to keep the PR comment readable; criterion can
+              // emit hundreds of lines on a multi-scenario bench.
+              const tail = raw.split('\n').slice(-200).join('\n');
+              const regressed = '${{ steps.diff.outputs.regressed }}' === 'true';
+              const verdict = regressed
+                ? 'Possible regression detected (criterion confidence interval above threshold).'
+                : 'No statistically significant regression vs the base ref.';
+              body = [
+                '### Bench diff vs `${{ steps.base.outputs.sha }}`',
+                '',
+                verdict,
+                '',
+                'CI bench numbers carry significant noise (shared runner,',
+                'no CPU pinning). Use the local perf-runner for the',
+                'numbers of record; the CI signal is a regression guard',
+                'only.',
+                '',
+                '<details><summary>criterion output (tail)</summary>',
+                '',
+                '```',
+                tail,
+                '```',
+                '',
+                '</details>',
+              ].join('\n');
+            } catch (err) {
+              body = `Bench job did not produce output: ${err.message}`;
+            }
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body,
+            });

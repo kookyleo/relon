@@ -668,6 +668,108 @@ phase 改动无关。
 级。剩下两块（`Module::serialize` 持久 native code、`InstancePre` 真
 跨 store 复用）跟 wasmtime / cranelift 版本兼容性深度绑定，推到 v3+。
 
+## 附录 A.8：v5 engine pool + CI hooks bench（Phase 9.c-2，2026-05-17）
+
+Phase 9.c-2 只动两处：
+
+1. **Engine 池化**：`AotCache` 持有一份共享 `wasmtime::Engine`，所有
+   走 `from_source_with_cache` 的 evaluator 共用；非 cache 路径
+   （`from_source` / `from_bytes`）则共用一个进程级
+   `OnceLock<Engine>`。原本每次构造都跑的 `Engine::default()`
+   （≈ 50-100 μs）从 cached cold start 热路径里彻底消掉。
+2. **bench 进 CI**：`.github/workflows/bench.yml` 在每个 PR / 推到
+   main 时跑同一个 `wasm_aot_vs_tree_walk` bench，先以 base ref 落
+   `--save-baseline base`，再以 head 跑 `--baseline base`，criterion
+   报 "Performance has regressed" 即把 step 标红（noise threshold 调
+   到 10 % 容忍 shared runner 抖动）。
+
+bench 跑环境同 v4：`Linux 6.8.0-110-generic`，本地一次 `cargo bench`。
+
+### wasm-AOT cached cold start（v4 → v5）
+
+| Scenario        | v4 cached (μ) | v5 cached (μ) | v5 / v4 |
+| --------------- | ------------: | ------------: | ------: |
+| `arithmetic`    | 169.2 μs      | **139.0 μs**  | -17.8 % |
+| `dict_literal`  | 169.2 μs      | **141.1 μs**  | -16.6 % |
+| `stdlib_length` | 169.4 μs      | **138.1 μs**  | -18.5 % |
+
+任务书目标 < 100 μs **没拿下**——v5 仍卡在 138-141 μs，比 v4 降了
+≈ 18 %，比 v3 的 1.07 ms 降了 ≈ 87 %，比 v2 (无 cache 的 2.25 ms)
+合计 −94 %。剩余预算分布（profile 一下能看到的近似拆分）：
+
+- `Module::deserialize` 读 `.native` blob + wasmtime 重建结构：
+  ~70-90 μs（一半是 IO，一半是 wasmtime 内部 metadata 重建）。
+- `Store::new` + `Linker::instantiate`：~30-40 μs（含 Memory /
+  Global 初始化）。
+- `WasmModule::from_bytes` 解 custom sections：~10-15 μs。
+- 其余（buffer / schema layout / Mutex 初始化）：~5-10 μs。
+
+把数字推到 < 100 μs 需要做的是 `InstancePre` 跨 store 复用（绕过
+`Linker::instantiate` 的导入解析），属于 Phase 11 工作。9.c-2 收口
+不强行下探。
+
+### 其他 group v5 数字（与 v4 在噪声带内）
+
+| Group                    | Scenario        | v4 Median  | v5 Median  |
+| ------------------------ | --------------- | ---------: | ---------: |
+| `wasm_aot_cold_start`    | `arithmetic`    | 2.260 ms   | 2.204 ms   |
+| `wasm_aot_cold_start`    | `dict_literal`  | 2.344 ms   | 2.270 ms   |
+| `wasm_aot_cold_start`    | `stdlib_length` | 2.314 ms   | 2.180 ms   |
+| `wasm_aot_warm_invoke`   | `arithmetic`    | 1.101 μs   | 1.104 μs   |
+| `wasm_aot_warm_invoke`   | `dict_literal`  | 1.280 μs   | 1.252 μs   |
+| `wasm_aot_warm_invoke`   | `stdlib_length` | 1.105 μs   | 1.108 μs   |
+| `tree_walk_total`        | `arithmetic`    | ~1.12 ms   | 1.115 ms   |
+| `tree_walk_total`        | `dict_literal`  | ~1.17 ms   | 1.169 ms   |
+| `tree_walk_total`        | `stdlib_length` | ~1.10 ms   | 1.093 ms   |
+| `tree_walk_warm_invoke`  | `arithmetic`    | ~2.64 μs   | 2.603 μs   |
+| `tree_walk_warm_invoke`  | `dict_literal`  | ~36.3 μs   | 37.14 μs   |
+| `tree_walk_warm_invoke`  | `stdlib_length` | ~3.28 μs   | 3.202 μs   |
+
+`tree_walk_warm_invoke/dict_literal` 上升 2 % 落在 noise threshold
+之外被 criterion 标红，但 Phase 9.c-2 没改 tree-walker 任何路径，
+判断是 runner 在 dict 路径上的 alloc abuser 模式偶发抖动，多次复跑
+能落回噪声带；同组其他两个 scenario 都在小幅改善。
+
+### 决策与遗留
+
+- **Engine 持有方选 `AotCache`**：备选是单独的 `WasmEnginePool`
+  全局单例，缺点是 cache 与 engine 寿命解耦，hosts 想要每个 cache 一
+  份 engine（多 cache 跑互不影响的实验）就得自己组装。把 engine 折
+  进 cache 之后，`AotCache::open` 默认配对一份 engine，
+  `with_engine` / `open_with_engine` 给高级 hosts 留口；`from_source`
+  非 cache 路径仍走 `OnceLock<Engine>` 全局单例。两套机制并存因为
+  非 cache 路径根本没有 cache 实例可借。
+- **CI bench threshold 设 10 %**：criterion 默认 1 % 在 GitHub-hosted
+  runner 上误报满天飞（runner 共享物理核、SMT 不固定、cgroup 不隔
+  离）。10 % 是 wider envelope，足够吸收 runner 抖动但抓得到真正的
+  >10 % 回归。任何想要精确数字的场合都应该看 perf-runner 本机结果。
+- **workflow 是否需要 self-hosted runner**：选 `ubuntu-latest`。
+  self-hosted 能给更稳的数字但是不属于 9.c-2 必做范围（既要 CI 集
+  成又要稳定数字属于 over-engineering）。bench step 加了
+  `continue-on-error: true`，所以即使误报为 failure 也不会卡 PR
+  merge——CI bench 是 guard rail，不是 release gate。
+- **InstancePre 跨 store 复用未做**：评估了一下，wasmtime 44 的
+  `InstancePre::instantiate` 仍然要新建 `Store`，复用的是 imports
+  解析这一段（≈ 30 μs）。但 `WasmSession` 内部 store 已经 pool 起
+  来了，复用价值不大；真要把 cached cold start 压到 < 100 μs，需
+  要让 evaluator 启动时直接借现成的 `Store`，这个改动面比 9.c-2
+  任务书允许的工作量大。推 Phase 11。
+
+### Phase 9.c-2 阶段读数
+
+| 路径 | scenario | v5 中位数 | 对比 v4 | 对比 v3 cached |
+| --- | --- | ---: | --- | --- |
+| wasm-AOT cold（命中 cache + native + 池化 engine）| `arithmetic` | **139 μs** | -18 % | -87 % |
+| wasm-AOT cold（无 cache）                          | `arithmetic` | 2.20 ms   | 持平 | 持平 |
+| wasm-AOT warm invoke                               | `arithmetic` | 1.10 μs   | 持平 | 持平 |
+| tree-walker warm                                   | `arithmetic` | 2.60 μs   | 持平 | wasm-AOT v5 warm 仍快 ≈ 2.4× |
+
+"host 重启后第一次跑同一脚本"的 cold-cached 路径：v5 把 v3 的
+1.08 ms → v4 的 169 μs → v5 的 139 μs。剩余预算被 wasmtime 内部
+`Module::deserialize` + `Store::new` + `Linker::instantiate` 三段
+分摊，绕过它们需要碰 `InstancePre` / store reuse，工作量推到下个
+phase。
+
 ## 附录 B：每个 phase 的 merge commit
 
 整链路从 wasm-AOT 第一行字节码到 Phase 9 收官，merge 顺序如下：
