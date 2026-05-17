@@ -436,7 +436,7 @@ impl<'a> BufferBuilder<'a> {
     /// the parent's `field_index`. Hosts that don't need the full
     /// step-by-step control can use the [`Self::write_list_record`]
     /// convenience wrapper which takes a slice of pre-built dicts.
-    fn list_record_writer<'b>(
+    pub fn list_record_writer<'b>(
         &self,
         field_name: &str,
         elem_layout: &'b OffsetTable,
@@ -521,7 +521,7 @@ impl<'a> BufferBuilder<'a> {
     /// Commit a [`ListRecordWriter`] — emit the list header into the
     /// tail area (aligned to 4) and patch the field's pointer slot
     /// with the header offset.
-    fn finish_list_record(&mut self, writer: ListRecordWriter<'_>) -> Result<(), BufferError> {
+    pub fn finish_list_record(&mut self, writer: ListRecordWriter<'_>) -> Result<(), BufferError> {
         let count = writer.entry_offsets.len();
         if count > u32::MAX as usize {
             return Err(BufferError::ValueTooLarge {

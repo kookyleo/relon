@@ -67,6 +67,15 @@ fn ir_type_tag(ty: IrType) -> u8 {
         // `LoweringError::ClosureAcrossBoundary`, so the tag is
         // purely a forward-compatible placeholder.
         IrType::Closure => 0x08,
+        // Phase 10-c list element pointer tags. Appended to keep the
+        // hash of any pre-Phase-10-c `#native` signature unchanged.
+        // `#native` declarations using these param types still flow
+        // through the same lowering / codegen path; the host SDK
+        // validates the hashes match across both sides.
+        IrType::ListFloat => 0x09,
+        IrType::ListBool => 0x0A,
+        IrType::ListString => 0x0B,
+        IrType::ListSchema => 0x0C,
     }
 }
 

@@ -776,6 +776,14 @@ struct ConstPool {
     string_offsets: HashMap<u32, u32>,
     /// Map from per-module `ConstListInt` index to byte offset.
     list_int_offsets: HashMap<u32, u32>,
+    /// Phase 10-c: per-module `ConstListFloat` byte offsets.
+    list_float_offsets: HashMap<u32, u32>,
+    /// Phase 10-c: per-module `ConstListBool` byte offsets.
+    list_bool_offsets: HashMap<u32, u32>,
+    /// Phase 10-c: per-module `ConstListString` byte offsets — points
+    /// at the list header (`[len: u32][off_0]...`). Each entry's
+    /// per-String tail record was emitted earlier in `bytes`.
+    list_string_offsets: HashMap<u32, u32>,
 }
 
 impl ConstPool {
@@ -794,6 +802,26 @@ impl ConstPool {
     /// Look up the absolute wasm-memory address of a List<Int> const.
     fn list_int_addr(&self, idx: u32) -> Result<u32, CodegenError> {
         self.list_int_offsets
+            .get(&idx)
+            .map(|off| DATA_SECTION_BASE + off)
+            .ok_or(CodegenError::MixedNumericTypes)
+    }
+
+    /// Phase 10-c: lookup helpers for the new const-list shapes.
+    fn list_float_addr(&self, idx: u32) -> Result<u32, CodegenError> {
+        self.list_float_offsets
+            .get(&idx)
+            .map(|off| DATA_SECTION_BASE + off)
+            .ok_or(CodegenError::MixedNumericTypes)
+    }
+    fn list_bool_addr(&self, idx: u32) -> Result<u32, CodegenError> {
+        self.list_bool_offsets
+            .get(&idx)
+            .map(|off| DATA_SECTION_BASE + off)
+            .ok_or(CodegenError::MixedNumericTypes)
+    }
+    fn list_string_addr(&self, idx: u32) -> Result<u32, CodegenError> {
+        self.list_string_offsets
             .get(&idx)
             .map(|off| DATA_SECTION_BASE + off)
             .ok_or(CodegenError::MixedNumericTypes)
@@ -947,6 +975,87 @@ fn collect_consts(body: &[relon_ir::TaggedOp], pool: &mut ConstPool) -> Result<(
                     pool.bytes.extend_from_slice(&v.to_le_bytes());
                 }
                 pool.list_int_offsets.insert(*idx, offset);
+            }
+            Op::ConstListFloat { idx, elements } => {
+                // Same `[len:4][pad:4][f64 elements]` shape as
+                // ConstListInt — f64 has identical alignment / size to
+                // i64 on the wasm side. The pad ensures the `memory.copy`
+                // into the out_buf's tail area matches what the host
+                // BufferBuilder::write_list_float would have produced.
+                while !pool.bytes.len().is_multiple_of(8) {
+                    pool.bytes.push(0);
+                }
+                let offset = u32::try_from(pool.bytes.len()).map_err(|_| {
+                    CodegenError::Layout("const data section exceeds u32 bytes".into())
+                })?;
+                let count = u32::try_from(elements.len()).map_err(|_| {
+                    CodegenError::Layout("list literal exceeds u32 elements".into())
+                })?;
+                pool.bytes.extend_from_slice(&count.to_le_bytes());
+                pool.bytes.extend_from_slice(&[0u8; 4]);
+                for bits in elements {
+                    pool.bytes.extend_from_slice(&bits.to_le_bytes());
+                }
+                pool.list_float_offsets.insert(*idx, offset);
+            }
+            Op::ConstListBool { idx, elements } => {
+                // List<Bool> record: `[len:4][u8 booleans...]`. No
+                // post-len padding per spec; the booleans pack tightly.
+                // Record start aligned to 4 so the len prefix loads
+                // cleanly.
+                while !pool.bytes.len().is_multiple_of(4) {
+                    pool.bytes.push(0);
+                }
+                let offset = u32::try_from(pool.bytes.len()).map_err(|_| {
+                    CodegenError::Layout("const data section exceeds u32 bytes".into())
+                })?;
+                let count = u32::try_from(elements.len()).map_err(|_| {
+                    CodegenError::Layout("list literal exceeds u32 elements".into())
+                })?;
+                pool.bytes.extend_from_slice(&count.to_le_bytes());
+                for b in elements {
+                    pool.bytes.push(u8::from(*b));
+                }
+                pool.list_bool_offsets.insert(*idx, offset);
+            }
+            Op::ConstListString { idx, elements } => {
+                // Emit each per-String tail record first, capturing
+                // its absolute offset. Then emit the list header
+                // `[len:4][off_0:4]...` pointing at the per-entry
+                // records. Records are byte-relative to
+                // `DATA_SECTION_BASE`; the wasm runtime's memory.copy
+                // path expects buffer-relative offsets, so we store
+                // **absolute** wasm-memory addresses (= DATA_SECTION_BASE
+                // + offset) here — matching how the host writer would
+                // have built the same list inside the out_buf.
+                let mut per_string_addrs: Vec<u32> = Vec::with_capacity(elements.len());
+                for s in elements {
+                    while !pool.bytes.len().is_multiple_of(4) {
+                        pool.bytes.push(0);
+                    }
+                    let str_offset = u32::try_from(pool.bytes.len()).map_err(|_| {
+                        CodegenError::Layout("const data section exceeds u32 bytes".into())
+                    })?;
+                    let len = u32::try_from(s.len())
+                        .map_err(|_| CodegenError::Layout("string literal exceeds u32".into()))?;
+                    pool.bytes.extend_from_slice(&len.to_le_bytes());
+                    pool.bytes.extend_from_slice(s.as_bytes());
+                    per_string_addrs.push(DATA_SECTION_BASE + str_offset);
+                }
+                while !pool.bytes.len().is_multiple_of(4) {
+                    pool.bytes.push(0);
+                }
+                let header_offset = u32::try_from(pool.bytes.len()).map_err(|_| {
+                    CodegenError::Layout("const data section exceeds u32 bytes".into())
+                })?;
+                let count = u32::try_from(elements.len()).map_err(|_| {
+                    CodegenError::Layout("list literal exceeds u32 elements".into())
+                })?;
+                pool.bytes.extend_from_slice(&count.to_le_bytes());
+                for addr in &per_string_addrs {
+                    pool.bytes.extend_from_slice(&addr.to_le_bytes());
+                }
+                pool.list_string_offsets.insert(*idx, header_offset);
             }
             Op::If {
                 then_body,
@@ -1669,6 +1778,24 @@ fn emit_op_seq(
                 vstack.push(IrType::ListInt);
                 ranges.push(tagged.range);
             }
+            Op::ConstListFloat { idx, .. } => {
+                let addr = const_pool.list_float_addr(*idx)?;
+                f.instruction(&Instruction::I32Const(addr as i32));
+                vstack.push(IrType::ListFloat);
+                ranges.push(tagged.range);
+            }
+            Op::ConstListBool { idx, .. } => {
+                let addr = const_pool.list_bool_addr(*idx)?;
+                f.instruction(&Instruction::I32Const(addr as i32));
+                vstack.push(IrType::ListBool);
+                ranges.push(tagged.range);
+            }
+            Op::ConstListString { idx, .. } => {
+                let addr = const_pool.list_string_addr(*idx)?;
+                f.instruction(&Instruction::I32Const(addr as i32));
+                vstack.push(IrType::ListString);
+                ranges.push(tagged.range);
+            }
             Op::LetGet { idx, ty } => {
                 let local_idx = ectx
                     .first_let_local()
@@ -1713,13 +1840,34 @@ fn emit_op_seq(
                 emit_load_absolute_pointer(f, ranges, *offset, tagged.range);
                 vstack.push(IrType::ListInt);
             }
+            Op::LoadListFloatPtr { offset } => {
+                emit_load_absolute_pointer(f, ranges, *offset, tagged.range);
+                vstack.push(IrType::ListFloat);
+            }
+            Op::LoadListBoolPtr { offset } => {
+                emit_load_absolute_pointer(f, ranges, *offset, tagged.range);
+                vstack.push(IrType::ListBool);
+            }
+            Op::LoadListStringPtr { offset } => {
+                emit_load_absolute_pointer(f, ranges, *offset, tagged.range);
+                vstack.push(IrType::ListString);
+            }
+            Op::LoadListSchemaPtr { offset } => {
+                emit_load_absolute_pointer(f, ranges, *offset, tagged.range);
+                vstack.push(IrType::ListSchema);
+            }
             Op::StoreField { offset, ty } => {
                 let popped = vstack.pop().ok_or(CodegenError::MixedNumericTypes)?;
                 if popped.wasm_slot() != stack_type_for_storefield(*ty).wasm_slot() {
                     return Err(CodegenError::MixedNumericTypes);
                 }
                 match ty {
-                    IrType::String | IrType::ListInt => {
+                    IrType::String
+                    | IrType::ListInt
+                    | IrType::ListFloat
+                    | IrType::ListBool
+                    | IrType::ListString
+                    | IrType::ListSchema => {
                         // Pointer-indirect store. The top-of-stack
                         // value is the absolute memory address of a
                         // `[len:u32 LE][...]` record (either a
@@ -2721,7 +2869,15 @@ fn emit_make_closure(
                         memory_index: 0,
                     }));
                 }
-                IrType::I32 | IrType::Null | IrType::String | IrType::ListInt | IrType::Closure => {
+                IrType::I32
+                | IrType::Null
+                | IrType::String
+                | IrType::ListInt
+                | IrType::ListFloat
+                | IrType::ListBool
+                | IrType::ListString
+                | IrType::ListSchema
+                | IrType::Closure => {
                     f.instruction(&Instruction::I32Store(MemArg {
                         offset: cap.offset as u64,
                         align: 2,
@@ -3027,9 +3183,15 @@ fn emit_load_absolute_pointer(
 fn load_field_stack_type(ty: IrType) -> IrType {
     match ty {
         IrType::I64 | IrType::F64 => ty,
-        IrType::Bool | IrType::Null | IrType::String | IrType::ListInt | IrType::Closure => {
-            IrType::I32
-        }
+        IrType::Bool
+        | IrType::Null
+        | IrType::String
+        | IrType::ListInt
+        | IrType::ListFloat
+        | IrType::ListBool
+        | IrType::ListString
+        | IrType::ListSchema
+        | IrType::Closure => IrType::I32,
         // `I32` field reads aren't used in Phase 2.b (the canonical
         // schema doesn't surface a raw i32 leaf), but we keep the
         // arm exhaustive for forward compat.
@@ -3119,7 +3281,14 @@ fn emit_load_field(
             }));
             ranges.push(range);
         }
-        IrType::I32 | IrType::String | IrType::ListInt | IrType::Closure => {
+        IrType::I32
+        | IrType::String
+        | IrType::ListInt
+        | IrType::ListFloat
+        | IrType::ListBool
+        | IrType::ListString
+        | IrType::ListSchema
+        | IrType::Closure => {
             // `String` / `ListInt` / `Closure` LoadField is rare —
             // lowering normally emits the explicit `LoadStringPtr` /
             // `LoadListIntPtr` ops because the IR-level tag carries
@@ -3211,7 +3380,12 @@ fn emit_load_field_at_absolute(
             }));
             ranges.push(range);
         }
-        IrType::String | IrType::ListInt => {
+        IrType::String
+        | IrType::ListInt
+        | IrType::ListFloat
+        | IrType::ListBool
+        | IrType::ListString
+        | IrType::ListSchema => {
             // Pointer-indirect slot: load the buffer-relative offset,
             // then rebase to absolute by adding the in_buf base.
             f.instruction(&Instruction::I32Load(MemArg {
@@ -3309,7 +3483,13 @@ fn emit_store_field(
         // `emit_store_pointer_indirect`; falling through here means
         // a hand-built IR called this helper directly with a pointer
         // type — refuse rather than emit a half-formed sequence.
-        IrType::String | IrType::ListInt | IrType::Closure => {
+        IrType::String
+        | IrType::ListInt
+        | IrType::ListFloat
+        | IrType::ListBool
+        | IrType::ListString
+        | IrType::ListSchema
+        | IrType::Closure => {
             return Err(CodegenError::UnsupportedStoreFieldType { ty });
         }
     };
@@ -3413,9 +3593,11 @@ fn emit_store_pointer_indirect(
             f.instruction(&Instruction::I32Add);
             ranges.push(range);
         }
-        IrType::ListInt => {
+        IrType::ListInt | IrType::ListFloat => {
             // record_size = 8 + 8 * element_count
             //            = 8 + (count << 3)
+            // ListFloat shares the same `[len:4][pad:4][f64 elements]`
+            // shape — the f64s have identical size / alignment to i64.
             f.instruction(&Instruction::I32Const(3));
             ranges.push(range);
             f.instruction(&Instruction::I32Shl);
@@ -3425,23 +3607,39 @@ fn emit_store_pointer_indirect(
             f.instruction(&Instruction::I32Add);
             ranges.push(range);
         }
+        IrType::ListBool => {
+            // record_size = 4 + count (1 byte per bool, no padding).
+            f.instruction(&Instruction::I32Const(4));
+            ranges.push(range);
+            f.instruction(&Instruction::I32Add);
+            ranges.push(range);
+        }
+        IrType::ListString | IrType::ListSchema => {
+            // Phase 10-c: pointer-array record. Storing it via the
+            // simple memcpy path here would NOT relocate the inner
+            // per-entry offsets, so the host reader would resolve
+            // them against the wrong base. We refuse the simple
+            // path; outputting these list shapes requires per-entry
+            // relocation (deferred to a follow-up phase).
+            return Err(CodegenError::UnsupportedStoreFieldType { ty });
+        }
         _ => return Err(CodegenError::UnsupportedStoreFieldType { ty }),
     }
     f.instruction(&Instruction::LocalSet(memcpy_len));
     ranges.push(range);
 
-    // Align $tail_cursor before writing the record. String needs
-    // 4-byte alignment so the len prefix is naturally aligned; List<Int>
-    // needs 8-byte alignment so `payload_start = align_up(record_start
-    // + 4, 8) = record_start + 8` matches our in-record layout.
+    // Align $tail_cursor before writing the record. String / ListBool
+    // need 4-byte alignment so the len prefix is naturally aligned;
+    // ListInt / ListFloat need 8-byte alignment so the post-len
+    // padding matches our in-record layout.
     let align_mask: i32 = match ty {
-        IrType::String => -4,
-        IrType::ListInt => -8,
+        IrType::String | IrType::ListBool => -4,
+        IrType::ListInt | IrType::ListFloat => -8,
         _ => -4,
     };
     let align_add: i32 = match ty {
-        IrType::String => 3,
-        IrType::ListInt => 7,
+        IrType::String | IrType::ListBool => 3,
+        IrType::ListInt | IrType::ListFloat => 7,
         _ => 3,
     };
     f.instruction(&Instruction::LocalGet(tail_cursor));
@@ -3473,6 +3671,10 @@ fn emit_store_pointer_indirect(
     let value_kind = match ty {
         IrType::String => "String",
         IrType::ListInt => "ListInt",
+        IrType::ListFloat => "ListFloat",
+        IrType::ListBool => "ListBool",
+        IrType::ListString => "ListString",
+        IrType::ListSchema => "ListSchema",
         _ => "String",
     };
     emit_recorded_unreachable(
@@ -3663,7 +3865,14 @@ fn emit_store_field_at_record(
             }));
             ranges.push(range);
         }
-        IrType::String | IrType::ListInt | IrType::I32 | IrType::Closure => {
+        IrType::String
+        | IrType::ListInt
+        | IrType::ListFloat
+        | IrType::ListBool
+        | IrType::ListString
+        | IrType::ListSchema
+        | IrType::I32
+        | IrType::Closure => {
             // Pointer slot — store the i32 (which is either a
             // pointer offset produced by EmitTailRecordFromAbsoluteAddr
             // / PushRecordBase, an arbitrary i32, or a closure
@@ -3751,7 +3960,7 @@ fn emit_tail_record_from_absolute(
             f.instruction(&Instruction::I32Add);
             ranges.push(range);
         }
-        IrType::ListInt => {
+        IrType::ListInt | IrType::ListFloat => {
             // record_size = 8 + 8 * count = 8 + (count << 3)
             f.instruction(&Instruction::I32Const(3));
             ranges.push(range);
@@ -3762,16 +3971,29 @@ fn emit_tail_record_from_absolute(
             f.instruction(&Instruction::I32Add);
             ranges.push(range);
         }
+        IrType::ListBool => {
+            // record_size = 4 + count (1 byte per bool).
+            f.instruction(&Instruction::I32Const(4));
+            ranges.push(range);
+            f.instruction(&Instruction::I32Add);
+            ranges.push(range);
+        }
+        IrType::ListString | IrType::ListSchema => {
+            // Pointer-array shapes need per-entry relocation when
+            // pasted into the out_buf tail area; refused here.
+            return Err(CodegenError::UnsupportedStoreFieldType { ty });
+        }
         _ => return Err(CodegenError::UnsupportedStoreFieldType { ty }),
     }
     f.instruction(&Instruction::LocalSet(memcpy_len));
     ranges.push(range);
 
     // Align $tail_cursor before the write. Same alignment rules as
-    // the simple-return path: 4 for String, 8 for ListInt.
+    // the simple-return path: 4 for String / ListBool, 8 for
+    // ListInt / ListFloat.
     let align: u32 = match ty {
-        IrType::String => 4,
-        IrType::ListInt => 8,
+        IrType::String | IrType::ListBool => 4,
+        IrType::ListInt | IrType::ListFloat => 8,
         _ => 4,
     };
     emit_align_tail_cursor(f, ranges, ectx, align, range);
@@ -3792,6 +4014,10 @@ fn emit_tail_record_from_absolute(
     let value_kind = match ty {
         IrType::String => "String",
         IrType::ListInt => "ListInt",
+        IrType::ListFloat => "ListFloat",
+        IrType::ListBool => "ListBool",
+        IrType::ListString => "ListString",
+        IrType::ListSchema => "ListSchema",
         _ => "String",
     };
     emit_recorded_unreachable(
@@ -3900,6 +4126,10 @@ fn store_field_local_valtype(ty: IrType) -> ValType {
         | IrType::Null
         | IrType::String
         | IrType::ListInt
+        | IrType::ListFloat
+        | IrType::ListBool
+        | IrType::ListString
+        | IrType::ListSchema
         | IrType::Closure => ValType::I32,
     }
 }
@@ -3978,6 +4208,10 @@ fn emit_arith(
         | (IrType::Null, _)
         | (IrType::String, _)
         | (IrType::ListInt, _)
+        | (IrType::ListFloat, _)
+        | (IrType::ListBool, _)
+        | (IrType::ListString, _)
+        | (IrType::ListSchema, _)
         | (IrType::Closure, _) => {
             return Err(CodegenError::MixedNumericTypes);
         }
@@ -4044,6 +4278,26 @@ fn emit_cmp(
                 ty: IrType::ListInt,
             });
         }
+        (IrType::ListFloat, _) => {
+            return Err(CodegenError::InvalidComparisonOperandType {
+                ty: IrType::ListFloat,
+            });
+        }
+        (IrType::ListBool, _) => {
+            return Err(CodegenError::InvalidComparisonOperandType {
+                ty: IrType::ListBool,
+            });
+        }
+        (IrType::ListString, _) => {
+            return Err(CodegenError::InvalidComparisonOperandType {
+                ty: IrType::ListString,
+            });
+        }
+        (IrType::ListSchema, _) => {
+            return Err(CodegenError::InvalidComparisonOperandType {
+                ty: IrType::ListSchema,
+            });
+        }
         // Closure handles are pointer slots; comparing two closures
         // structurally is meaningless (two `|x| x` lambdas at
         // different call sites get different handles), so the
@@ -4080,9 +4334,15 @@ fn ir_to_val_type(t: &IrType) -> ValType {
         // via `i32.load8_u` / `i32.const`). String / ListInt /
         // Closure are pointers and ride an i32 slot too — they
         // enter the wasm stack via `i32.load offset=N`.
-        IrType::Bool | IrType::Null | IrType::String | IrType::ListInt | IrType::Closure => {
-            ValType::I32
-        }
+        IrType::Bool
+        | IrType::Null
+        | IrType::String
+        | IrType::ListInt
+        | IrType::ListFloat
+        | IrType::ListBool
+        | IrType::ListString
+        | IrType::ListSchema
+        | IrType::Closure => ValType::I32,
     }
 }
 

@@ -602,16 +602,14 @@ impl WasmAotEvaluator {
             | TypeRepr::Bool
             | TypeRepr::Null
             | TypeRepr::String => Ok(()),
-            TypeRepr::List { element } => {
-                if matches!(element.as_ref(), TypeRepr::Int) {
-                    Ok(())
-                } else {
-                    Err(BuildError::UnsupportedFieldType {
-                        field: field.to_string(),
-                        type_label: "List (non-Int element)",
-                    })
-                }
-            }
+            TypeRepr::List { element } => match element.as_ref() {
+                TypeRepr::Int | TypeRepr::Float | TypeRepr::Bool | TypeRepr::String => Ok(()),
+                TypeRepr::Schema { schema } => Self::reject_unsupported_fields(schema),
+                _ => Err(BuildError::UnsupportedFieldType {
+                    field: field.to_string(),
+                    type_label: "List (unsupported element)",
+                }),
+            },
             TypeRepr::Schema { schema } => Self::reject_unsupported_fields(schema),
             TypeRepr::Option { .. } => Err(BuildError::UnsupportedFieldType {
                 field: field.to_string(),
@@ -1001,26 +999,142 @@ fn write_value_into_builder(
         (TypeRepr::String, Value::String(s)) => builder
             .write_string(&field.name, s.as_str())
             .map_err(buffer_to_runtime_error),
-        (TypeRepr::List { element }, Value::List(items))
-            if matches!(element.as_ref(), TypeRepr::Int) =>
-        {
-            let mut ints: Vec<i64> = Vec::with_capacity(items.len());
-            for (i, item) in items.iter().enumerate() {
-                match item {
-                    Value::Int(n) => ints.push(*n),
-                    other => {
-                        return Err(RuntimeError::MainArgTypeMismatch {
-                            name: format!("{}[{}]", field.name, i),
-                            expected: "Int".to_string(),
-                            found: other.type_name().to_string(),
-                            range: relon_parser::TokenRange::default(),
-                        });
+        (TypeRepr::List { element }, Value::List(items)) => {
+            match element.as_ref() {
+                TypeRepr::Int => {
+                    let mut ints: Vec<i64> = Vec::with_capacity(items.len());
+                    for (i, item) in items.iter().enumerate() {
+                        match item {
+                            Value::Int(n) => ints.push(*n),
+                            other => {
+                                return Err(RuntimeError::MainArgTypeMismatch {
+                                    name: format!("{}[{}]", field.name, i),
+                                    expected: "Int".to_string(),
+                                    found: other.type_name().to_string(),
+                                    range: relon_parser::TokenRange::default(),
+                                });
+                            }
+                        }
                     }
+                    builder
+                        .write_list_int(&field.name, &ints)
+                        .map_err(buffer_to_runtime_error)
                 }
+                TypeRepr::Float => {
+                    let mut floats: Vec<f64> = Vec::with_capacity(items.len());
+                    for (i, item) in items.iter().enumerate() {
+                        match item {
+                            Value::Float(f) => floats.push(f.into_inner()),
+                            Value::Int(n) => floats.push(*n as f64),
+                            other => {
+                                return Err(RuntimeError::MainArgTypeMismatch {
+                                    name: format!("{}[{}]", field.name, i),
+                                    expected: "Float".to_string(),
+                                    found: other.type_name().to_string(),
+                                    range: relon_parser::TokenRange::default(),
+                                });
+                            }
+                        }
+                    }
+                    builder
+                        .write_list_float(&field.name, &floats)
+                        .map_err(buffer_to_runtime_error)
+                }
+                TypeRepr::Bool => {
+                    let mut bools: Vec<bool> = Vec::with_capacity(items.len());
+                    for (i, item) in items.iter().enumerate() {
+                        match item {
+                            Value::Bool(b) => bools.push(*b),
+                            other => {
+                                return Err(RuntimeError::MainArgTypeMismatch {
+                                    name: format!("{}[{}]", field.name, i),
+                                    expected: "Bool".to_string(),
+                                    found: other.type_name().to_string(),
+                                    range: relon_parser::TokenRange::default(),
+                                });
+                            }
+                        }
+                    }
+                    builder
+                        .write_list_bool(&field.name, &bools)
+                        .map_err(buffer_to_runtime_error)
+                }
+                TypeRepr::String => {
+                    let mut strs: Vec<&str> = Vec::with_capacity(items.len());
+                    for (i, item) in items.iter().enumerate() {
+                        match item {
+                            Value::String(s) => strs.push(s.as_str()),
+                            other => {
+                                return Err(RuntimeError::MainArgTypeMismatch {
+                                    name: format!("{}[{}]", field.name, i),
+                                    expected: "String".to_string(),
+                                    found: other.type_name().to_string(),
+                                    range: relon_parser::TokenRange::default(),
+                                });
+                            }
+                        }
+                    }
+                    builder
+                        .write_list_string(&field.name, &strs)
+                        .map_err(buffer_to_runtime_error)
+                }
+                TypeRepr::Schema { schema: sub_schema } => {
+                    let sub_layout = SchemaLayout::offsets_for(sub_schema).map_err(|e| {
+                        RuntimeError::IoError(format!(
+                            "wasm list-sub-record layout for `{field}`: {e}",
+                            field = field.name,
+                        ))
+                    })?;
+                    // Borrow the sub_schema reference for the writer's
+                    // lifetime — `list_record_writer` requires both the
+                    // layout and the schema. Wrap the per-entry write
+                    // loop in a closure to keep the per-iteration error
+                    // path clean.
+                    let mut writer = builder
+                        .list_record_writer(&field.name, &sub_layout, sub_schema.as_ref())
+                        .map_err(buffer_to_runtime_error)?;
+                    for (i, item) in items.iter().enumerate() {
+                        let dict = match item {
+                            Value::Dict(d) => d,
+                            other => {
+                                return Err(RuntimeError::MainArgTypeMismatch {
+                                    name: format!("{}[{}]", field.name, i),
+                                    expected: format!("Dict (schema `{}`)", sub_schema.name),
+                                    found: other.type_name().to_string(),
+                                    range: relon_parser::TokenRange::default(),
+                                });
+                            }
+                        };
+                        let mut child = writer.start_entry();
+                        for sub_field in &sub_schema.fields {
+                            let sub_value = dict.map.get(&sub_field.name).ok_or_else(|| {
+                                RuntimeError::MissingMainArg {
+                                    name: format!("{}[{}].{}", field.name, i, sub_field.name),
+                                    range: relon_parser::TokenRange::default(),
+                                }
+                            })?;
+                            write_value_into_builder(
+                                &mut child,
+                                sub_field,
+                                sub_value,
+                                &sub_schema.name,
+                            )?;
+                        }
+                        writer
+                            .finish_entry(builder, child)
+                            .map_err(buffer_to_runtime_error)?;
+                    }
+                    builder
+                        .finish_list_record(writer)
+                        .map_err(buffer_to_runtime_error)
+                }
+                other => Err(RuntimeError::MainArgTypeMismatch {
+                    name: field.name.clone(),
+                    expected: format!("List<{other:?}>"),
+                    found: "List".to_string(),
+                    range: relon_parser::TokenRange::default(),
+                }),
             }
-            builder
-                .write_list_int(&field.name, &ints)
-                .map_err(buffer_to_runtime_error)
         }
         // Nested branded sub-record. Phase 9.b-1: BufferBuilder::
         // sub_record now packs Schema-typed `#main` args by allocating
@@ -1096,10 +1210,53 @@ fn read_value_from_reader(
             .read_string(&field.name)
             .map(|s| Value::String(s.to_string()))
             .map_err(buffer_to_runtime_error),
-        TypeRepr::List { element } if matches!(element.as_ref(), TypeRepr::Int) => reader
-            .read_list_int(&field.name)
-            .map(|v| Value::list(v.into_iter().map(Value::Int).collect()))
-            .map_err(buffer_to_runtime_error),
+        TypeRepr::List { element } => match element.as_ref() {
+            TypeRepr::Int => reader
+                .read_list_int(&field.name)
+                .map(|v| Value::list(v.into_iter().map(Value::Int).collect()))
+                .map_err(buffer_to_runtime_error),
+            TypeRepr::Float => reader
+                .read_list_float(&field.name)
+                .map(|v| {
+                    Value::list(
+                        v.into_iter()
+                            .map(|f| Value::Float(ordered_float::OrderedFloat(f)))
+                            .collect(),
+                    )
+                })
+                .map_err(buffer_to_runtime_error),
+            TypeRepr::Bool => reader
+                .read_list_bool(&field.name)
+                .map(|v| Value::list(v.into_iter().map(Value::Bool).collect()))
+                .map_err(buffer_to_runtime_error),
+            TypeRepr::String => reader
+                .read_list_string(&field.name)
+                .map(|v| {
+                    Value::list(v.into_iter().map(|s| Value::String(s.to_string())).collect())
+                })
+                .map_err(buffer_to_runtime_error),
+            TypeRepr::Schema { schema: elem_schema } => {
+                let elem_layout = SchemaLayout::offsets_for(elem_schema).map_err(|e| {
+                    RuntimeError::IoError(format!("wasm list-sub-record layout: {e}"))
+                })?;
+                let entries = reader
+                    .read_list_record(&field.name, &elem_layout, elem_schema.as_ref())
+                    .map_err(buffer_to_runtime_error)?;
+                let mut out: Vec<Value> = Vec::with_capacity(entries.len());
+                for sub in &entries {
+                    let map = read_record_into_map(sub, elem_schema)?;
+                    out.push(Value::branded_dict(map, Some(elem_schema.name.clone())));
+                }
+                Ok(Value::list(out))
+            }
+            other => Err(RuntimeError::Unsupported {
+                reason: format!(
+                    "wasm-aot backend cannot read field `{field}` with list element `{ty:?}`",
+                    field = field.name,
+                    ty = other,
+                ),
+            }),
+        },
         TypeRepr::Schema { schema } => {
             // Borrow the sub-record reader anchored at the parent's
             // pointer slot, then walk every field of the nested schema.
