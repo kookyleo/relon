@@ -106,6 +106,25 @@ fn string_args() -> HashMap<String, Value> {
     m
 }
 
+/// v3+ a-4 `stdlib_upper` payload. Longer + ASCII-only so the
+/// bench surfaces the UTF-8 decode/encode loop overhead per byte
+/// without spending most cycles in the case-folding-table binary
+/// search (which fast-returns on a miss for non-letter ASCII). The
+/// input is exactly 100 bytes — the wasm body's per-codepoint
+/// overhead times 100 gives a stable signal in the microsecond
+/// range that comfortably differentiates the new pipeline from
+/// the Phase 4.c-2 byte-flip fast path.
+fn string_upper_args() -> HashMap<String, Value> {
+    let mut m = HashMap::with_capacity(1);
+    // 100-byte ASCII payload — five repeats of a 20-byte sentence.
+    // Keeps the worst-case scratch growth at 4x = 400 bytes which
+    // is well inside the default test out_cap.
+    let s = "the quick brown fox ".repeat(5);
+    debug_assert_eq!(s.len(), 100);
+    m.insert("s".to_string(), Value::String(s));
+    m
+}
+
 /// Phase 10-a scenarios: a 32-element `List<Int>` driving the
 /// higher-order `map` / `filter` / `fold` stdlib bodies. The list
 /// length is chosen large enough that per-iteration `call_indirect`
@@ -151,6 +170,21 @@ const SCENARIOS: &[Scenario] = &[
         wasm_source: "#main(String s) -> Int\ns.length()",
         tree_source: "#main(String s) -> Int\ns.len()",
         args: string_args,
+    },
+    // v3+ a-4: drives the Unicode-aware `upper` stdlib body. The
+    // wasm side decodes each UTF-8 codepoint, binary-searches the
+    // simple upper-folding table, and re-encodes — so the bench
+    // surfaces per-codepoint UTF-8 overhead, the table-lookup cost,
+    // and the cold-start data-section bytes (~12 KB upper table).
+    // The 100-byte ASCII payload keeps the steady-state byte count
+    // predictable and avoids tripping the multi-byte UTF-8 paths so
+    // the cold-start numbers measure only the table-emit overhead,
+    // not also per-codepoint multi-byte work.
+    Scenario {
+        name: "stdlib_upper",
+        wasm_source: "#main(String s) -> String\ns.upper()",
+        tree_source: "#main(String s) -> String\ns.upper()",
+        args: string_upper_args,
     },
     // Phase 10-a closure surfaces. Each scenario runs the same
     // higher-order body on both backends; the wasm side exercises
