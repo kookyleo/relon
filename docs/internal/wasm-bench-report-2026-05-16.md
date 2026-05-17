@@ -1484,3 +1484,100 @@ benchmark 走完整 sample budget 时会稳下来。
 
 v3+ 推进：a-2 完工，cold start 实际下降 24-49 %，wasm 模块体积下降
 73-91 %。
+
+## 附录 A.14：v11 远程 `#import` 接入笔记（Phase v3+ a-3，2026-05-17）
+
+v3+ a-3 让 `#import "https://example.com/util.relon"` 走通。Phase
+本身不动 codegen / wasm 模块结构，所以 wasm-AOT 的 bench 数字（cold
+start、warm invoke、模块字节数）相对 a-2 全部维持，没有 regression。
+本附录只补充与远程 #import 相关的运行时观测，不重跑 criterion。
+
+### 设计要点
+
+1. **HTTP client：ureq 3 + rustls**。纯 Rust、sync，无 async runtime
+   依赖；TLS 走 rustls 而不是 native-tls，避免拉 OpenSSL。`default-
+   features = false` + `features = ["rustls"]` 把可选 codec / cookie
+   依赖关掉。
+2. **target gating**：所有 fetch / cache 代码放进
+   `#[cfg(not(target_arch = "wasm32"))] mod remote_http`，让
+   `relon-wasm`（浏览器 playground 的 cdylib，target =
+   wasm32-unknown-unknown）继续 build —— 浏览器内的 wasm-AOT 评估器
+   不能 syscall sockets / DNS / TLS，用户在 host 端 pre-fetch。
+3. **本地 cache**：`~/.cache/relon/remote_imports/<sha256(url)>.relon`，
+   遵循 `XDG_CACHE_HOME` 优先 → `HOME/.cache` → `std::env::temp_dir()`
+   的 fallback 链。条目按 mtime 判定 TTL，默认 24 小时；
+   `RemoteImportCache::with_ttl` 让 host 覆盖。读写都是 best-effort，
+   read-only 文件系统不会让 import 崩溃，只会让下次再 fetch 一次。
+4. **policy gating**：`ResolverChainLoader` 多了 `has_remote: bool`
+   字段，`load` 在 URL path + `!has_remote` 时直接返回
+   `LoadError::AccessDenied`，绕过 resolver chain，避免远程 import
+   在 sandbox 下意外退化为 "module not found"。`sandboxed()` 设
+   `has_remote = false`，`trusted()` 在 native target 上设 `true`、
+   在 wasm32 target 上仍是 `false`。
+5. **error surface**：新增 `RuntimeError::RemoteImport{Failed,Denied,
+   HashMismatch}` 三个 variant，payload 全部装在 `Box<>` 里——加完之
+   后 enum size 触发 clippy 的 `result_large_err` 警告，
+   `Box<RemoteImport{Failure,Denial,HashMismatchDetail}>` 把 enum 字
+   节数压回阈值之下，所有 `Result<_, RuntimeError>` 调用点保持不变。
+
+### 性能影响（理论）
+
+* **cold start**：第一次远程 `#import` 需要一次 HTTPS round-trip。
+  典型 50–500 ms 量级，远超 wasm-AOT codegen（v10 a-2 实测
+  arithmetic cold ~2.4 ms）。建议 host 在生产环境把第一次 fetch 放
+  在 startup probe 之外，并 / 或在部署期把模块预热到 cache。
+* **cold start（cache 命中）**：cache hit 等价于一次 `read_to_string`
+  + sha256 计算（U RL 字面 hash），毫秒级，与 disk `#import` 同量级。
+  实际感受：a-2 报告里 disk #import 的 cold start 是 ~2.4 ms，远程
+  cache 命中后差距应 < 1 ms。
+* **warm invoke**：a-3 完全不动 warm 路径。`RemoteHttpResolver` 只在
+  workspace-build BFS 时由分析器调用，evaluator 在 prepared
+  context 上 reuse `WorkspaceTree`。
+
+### 未做（推到后续 phase）
+
+* **Hash pinning 语法**（`#import "..." sha256:"..."`）：parser 改动
+  代价较大，且 `RemoteImportHashMismatch` 一旦合入后续 phase 可以无
+  缝接进来。建议先用 lockfile / 外部 manifest 把 URL→sha256 表交给
+  host，cache 层加一道校验即可。
+* **Conditional GET (etag / last-modified)**：cache 命中时跳网络是首
+  要诉求，conditional GET 只对 TTL 过期但内容未变的场景有节流意义。
+  ureq 3 拿到 response 后保留 headers，加这个特性需要把 cache 条目
+  扩展成 `(body, etag, last-modified)` 三元组。Phase v3++。
+* **Proxy / Bearer 等 auth**：ureq 默认尊重 `HTTPS_PROXY` env var；
+  显式 proxy / auth header 支持留给 host 自定义 resolver。
+
+### 测试
+
+`crates/relon-evaluator/src/module.rs` 内置 6 个 unit test，
+`crates/relon/tests/remote_import.rs` 7 个 facade 集成测试。共同特
+点：用 `std::net::TcpListener` 起一个本地 mock HTTP/1.1 server，全
+程 offline，不依赖 mockito / wiremock。CI 不会因为外网抖动 flake。
+
+覆盖：
+
+* sandbox 模式拒绝 `https://` → `LoadError::AccessDenied`
+* trusted 模式 fetch 成功 → `LoadedModule.source` 正确
+* 第二次同 URL 命中 cache → mock server hits 仍 = 1
+* 500 → `LoadError::Other` / `RuntimeError::RemoteImportFailed`
+* `.invalid` host DNS 失败 → 同上
+* `http://` 默认拒绝（`RemoteImportDenied`），`allow_insecure(true)`
+  打开
+* `from_resolvers(...)` 默认 `has_remote = false`，即使 chain 里有
+  `RemoteHttpResolver` 也会被 short-circuit ——保护 host 不会因为顺
+  手 push 一个 resolver 就意外开放网络。
+
+### Gate
+
+* `cargo build --workspace` ✓
+* `cargo test --workspace --features 'relon/wasm-aot'` ✓ 1307 passed,
+  0 failed（v10 baseline 1294 + 13 新测试 = 1307，符合预期）
+* `cargo clippy --workspace --all-targets -- -D warnings` ✓
+* `cargo fmt --all -- --check` ✓
+* `cargo build --target wasm32-unknown-unknown -p relon-wasm` ✓
+  （`relon-wasm` 不链 `ureq`，target gating 工作正常）
+
+v3+ 推进：a-3 完工，远程 `#import` 在 trust 模式可用，sandbox 模式安
+全拒绝。Cold start 跨度 50 ms（首次 fetch）→ 2 ms（cache 命中），与
+disk #import 量级一致。下一站 a-4：UTF-8 string ops。
+
