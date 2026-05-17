@@ -1134,3 +1134,168 @@ warm invoke 现在的瓶颈：
 后续工作转入 v3+：wasm threads / fuel 接入、DCE for stdlib、
 wasmtime trampoline 直调、多线程 Engine 实战 benchmark。
 
+## 附录 A.12：v9 wasmtime fuel 接入 bench（Phase v3+ a-1，2026-05-17）
+
+v3+ a-1 给 wasm-AOT backend 接入了 wasmtime 的 fuel API，目标是让
+host 能给一次 `run_main` 设一个 wasm-step 预算（防死循环 / 恶意
+.relon 把 host CPU 吃干）。两层改动：
+
+1. `wasmtime::Engine` 构造时统一走 `Config::consume_fuel(true)`。
+   `shared_default_engine` + `AotCache::open` 两条路径都改了，
+   `open_with_engine` 这条 host-supplied 路径不动 —— 如果 host 给一个
+   非 fuel 的 engine，`with_fuel_limit` 必须保持默认 `0`，不然
+   `Store::set_fuel` 会直接 err。
+2. `WasmAotEvaluator::with_fuel_limit(u64)` builder + `fuel_limit`
+   字段。**每次** `run_main` 在 wasm 调用前 `Store::set_fuel(...)`：
+   * `fuel_limit > 0`：直接用这个预算。
+   * `fuel_limit == 0`：dispatcher 改写成 `u64::MAX`（按 ~1 unit /
+     wasm 指令 的 drain rate，单次调用算下来够跑数千年，host
+     拿到的行为仍是"无限"）。
+   * 必须每次都 set 的原因：`consume_fuel(true)` 引擎里 `Store::new`
+     默认起 0 fuel，**第一条** wasm 指令就会 trap。session pool 也救
+     不了 —— pool 里第二个 call 继承前一个调用残留的 fuel 量，
+     绝大多数情况都是个意外值。
+
+trap 翻译：`wasmtime::Trap::OutOfFuel` → `RuntimeError::
+WasmStepLimitExceeded { range }`（range 走 srcmap lookup，命中
+codegen-emitted code 的时候有源码 span；stdlib / synthetic 帧
+fallback 到 `None`）。Phase 7 留的 placeholder 第一次有了产生路径。
+
+CLI：`relon run --backend wasm-aot --fuel-limit N`，默认 `0`。
+`--backend tree-walk` 下 flag 静默无效（tree-walker 自己有
+`Context::step_limit` 走另一条 sandbox 入口）。
+
+bench 配置同 v7/v8：6 个 scenario × 5 个 group，criterion
+`sample_size(50)` + `measurement_time(8s)`。
+
+### wasm-AOT cold start（v8 → v9）
+
+| Scenario          | v8 cold（A.11） | v9 cold       | Δ      |
+| ----------------- | --------------: | ------------: | -----: |
+| `arithmetic`      |  4.10 ms        | **4.713 ms**  | +15.0 % |
+| `dict_literal`    |  4.25 ms        | **4.847 ms**  | +14.0 % |
+| `stdlib_length`   |  4.18 ms        | **4.839 ms**  | +15.8 % |
+| `list_int_map`    |  4.30 ms        | **4.985 ms**  | +15.9 % |
+| `list_int_filter` |  4.31 ms        | **4.953 ms**  | +14.9 % |
+| `list_int_fold`   |  4.31 ms        | **5.185 ms**  | +20.3 % |
+
+cold start 走 `parse → analyze → lower → codegen → wasmtime::
+Module::new`，几乎所有时间都在 cranelift JIT。开启 `consume_fuel(true)`
+之后 cranelift 需要在 backend 每条 wasm 指令前面插一个
+"`fuel -= cost; if (fuel < 0) trap`" 的 prologue，IR 节点数线性
+增长，JIT 时间整体抬了 +15-20 %。这个开销付一次，cache 命中之后
+反序列化路径完全不感知（见下表）。
+
+### wasm-AOT cached cold start（v8 → v9）
+
+| Scenario          | v8 cached（A.11） | v9 cached    | Δ      |
+| ----------------- | ----------------: | -----------: | -----: |
+| `arithmetic`      |  185.4 μs         | **185.4 μs** | +0.0 % |
+| `dict_literal`    |  186.2 μs         | **189.7 μs** | +1.9 % |
+| `stdlib_length`   |  184.9 μs         | **188.8 μs** | +2.1 % |
+| `list_int_map`    |  191.0 μs         | **197.4 μs** | +3.4 % |
+| `list_int_filter` |  191.0 μs         | **195.6 μs** | +2.4 % |
+| `list_int_fold`   |  189.5 μs         | **188.9 μs** | -0.3 % |
+
+cached cold 主要由 `Module::deserialize` + `InstancePre::new` 组成。
+fuel-aware 模块的 `.native` blob 比 v8 略大（每条 wasm 指令的 fuel
+decrement 已经被 cranelift 烤进 native code），反序列化时间偏移在
+噪声带内（+2-3 %）。
+
+### wasm-AOT warm invoke（v8 → v9，**fuel 开销在这里**）
+
+| Scenario          | v8 warm（A.11） | v9 warm       | Δ      |
+| ----------------- | ---------------: | ------------: | -----: |
+| `arithmetic`      |  1.121 μs       | **1.136 μs**  | +1.3 % |
+| `dict_literal`    |  1.228 μs       | **1.270 μs**  | +3.4 % |
+| `stdlib_length`   |  1.111 μs       | **1.147 μs**  | +3.2 % |
+| `list_int_map`    |  2.877 μs       | **2.897 μs**  | +0.7 % |
+| `list_int_filter` |  2.583 μs       | **2.779 μs**  | +7.6 % |
+| `list_int_fold`   |  2.060 μs       | **2.259 μs**  | +9.7 % |
+
+warm invoke 路径上 fuel 开销分两段：
+
+1. **每次 `set_fuel` 调用**：~50 ns 级别，单次。不管 `fuel_limit`
+   是 0 还是有限值都要付（前文解释为什么 unlimited 模式也必须
+   reset 而不是 skip）。
+2. **每条 fuel-consuming 指令的运行时减法**：cranelift 烤进 native
+   code 的 "`fuel -= cost; if (fuel < 0) trap`"，一条 wasm 指令多
+   一个 load+sub+branch，对长 hot loop 影响最大。
+
+arithmetic / stdlib_length / dict_literal / list_int_map 在 +1-3 %
+噪声带，主要是 `set_fuel` 的固定开销，wasm body 太短，per-instruction
+开销被摊薄到看不见。
+
+list_int_filter / list_int_fold 的 +7-10 % 是真实增加 ——
+这两个 scenario 在 list 上跑 closure，wasm 指令数最多
+（filter 内层 `call_indirect` + 元素比较，fold 内层 `call_indirect`
++ acc 累加），fuel decrement 在每条指令前面都要跑一次。
+list_int_map 的 +0.7 % 偏低是因为它的 inner closure 几乎只有一条
+`i64.mul`（`x * 2`），fuel decrement 摊到长 list-walk overhead
+里看不太出来。
+
+**target 期望** ("warm 上涨 < 20 % 否则要让 fuel_limit 默认 0 + 用户
+显式开启路径")：上涨最严重的 list_int_fold 是 +9.7 %，远在 20 %
+警戒线之内。`fuel_limit = 0` 是 default、且 dispatcher 内部走
+`u64::MAX` 而不是 skip set_fuel，是设计取舍 —— skip set_fuel 在
+`consume_fuel(true)` 引擎里直接 trap，唯一的备选是给两套 engine（一
+套有 fuel 一套没有），那会显著拉宽 host-side 控制面，得不偿失。
+
+### tree-walker（对照组，未改动）
+
+| Group                    | Scenario        | v9 Median  |
+| ------------------------ | --------------- | ---------: |
+| `tree_walk_total`        | `arithmetic`    | 1.011 ms   |
+| `tree_walk_total`        | `dict_literal`  | 1.172 ms   |
+| `tree_walk_total`        | `stdlib_length` | 0.996 ms   |
+| `tree_walk_total`        | `list_int_map`  | 1.160 ms   |
+| `tree_walk_total`        | `list_int_filter` | 1.162 ms |
+| `tree_walk_total`        | `list_int_fold` | 1.195 ms   |
+| `tree_walk_warm_invoke`  | `arithmetic`    | 2.641 μs   |
+| `tree_walk_warm_invoke`  | `dict_literal`  | 36.32 μs   |
+| `tree_walk_warm_invoke`  | `stdlib_length` | 3.230 μs   |
+| `tree_walk_warm_invoke`  | `list_int_map`  | 110.6 μs   |
+| `tree_walk_warm_invoke`  | `list_int_filter` | 108.7 μs |
+| `tree_walk_warm_invoke`  | `list_int_fold` | 120.2 μs   |
+
+对照组与 v8 持平 —— Phase a-1 不动 tree-walk 任何路径。
+
+### Phase a-1 阶段读数 + 决策
+
+* **abi 不需要 bump**：fuel 是 wasmtime engine 配置 + per-store 运行
+  时状态，wasm 模块本身的 binary handshake 不变，`relon.abi` /
+  `relon.host_fns` / `relon.srcmap` / `relon.uctab` 都未动。已有的
+  v8 cache 全部继续可用。
+* **warm 增加 +1-10 % 是可接受成本**：fuel 不是性能 feature，是
+  sandbox feature；这点开销换的是 host 抗 DoS。
+* **cold +15-20 % 是 cranelift JIT 路径的代价**：每条 wasm 指令多一个
+  fuel decrement 的 IR 节点，cranelift 优化层全要走一遍。cache 之后
+  反序列化路径无感知，这是设计上能接受的：cold start 只付一次，
+  warm invoke 才是 hot path。
+* **`fuel_limit = 0` 默认值**：保持向后兼容，host 不显式 opt-in 就跑
+  unlimited（dispatcher 改写到 `u64::MAX`）。host 想沙箱化第三方
+  .relon 只要 `with_fuel_limit(N)` 一行。
+
+### 决策 + 留给 v3+ a-2 / a-3 / a-4
+
+* **fuel 单位**：1 fuel ≈ 1 wasm 指令（`nop` / `drop` / `block` /
+  `loop` 免费）。**不是** wall-clock，**不是** cycle。host 调
+  `fuel_limit` 要按预期指令数调，不能按预期延迟调。
+* **TrapCode 识别方式**：`wasmtime::Trap::OutOfFuel`（44.0.1 该
+  variant 仍然存在；future wasmtime bump 时 v8 cache 也会失效，
+  所以这条耦合是可接受的）。
+* **`fuel_limit = 0` 怎么实现**：dispatcher 把它改写成 `u64::MAX`
+  并仍然 set_fuel。skip set_fuel 在 `consume_fuel(true)` 引擎里
+  第一条指令就 trap，无可救药。
+* **遗留 todo**：
+  * 多线程并发场景下 `set_fuel` 是否有可见 contention？目前测试都是
+    单线程 hot loop，多 evaluator 共享 pool 还没测。
+  * stdlib 函数（map/filter/fold/length …）的 fuel 成本目前是
+    cranelift 自动加的；如果未来要给 host 一份"这个 .relon 大概要
+    花多少 fuel"的静态预算工具，得在 codegen 层把 stdlib 调用边界
+    显式记一笔 fuel cost。这条留给 v3+ a-2（stdlib DCE）顺手处理。
+  * 远程 `#import`（v3+ a-3）和 UTF-8 string ops（v3+ a-4）都不依赖
+    fuel；fuel 接入并未给后续 phase 添新约束。
+
+v3+ 起步：a-1 完工。
+
