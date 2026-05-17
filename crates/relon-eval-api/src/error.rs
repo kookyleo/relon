@@ -342,6 +342,29 @@ pub enum RuntimeError {
         range: TokenRange,
     },
 
+    /// v3+ a-4: wasm trap fired inside the Unicode-aware `upper` /
+    /// `lower` stdlib bodies because the receiver String contained a
+    /// byte sequence that does not decode as valid UTF-8 (a truncated
+    /// trailing continuation byte, a lone continuation byte, or a
+    /// leading byte with an illegal high-bit pattern).
+    ///
+    /// In production the host SDK's `BufferBuilder::write_string`
+    /// rejects non-UTF-8 inputs at write time so this trap is mostly
+    /// a defensive surface — it can still fire when a host hand-
+    /// crafts a String record into linear memory and skips the
+    /// builder. Routing through a dedicated variant lets the host
+    /// distinguish "invalid encoding" from "ran out of memory" or
+    /// "tail-cursor overrun".
+    #[error("wasm trap: stdlib walker hit invalid UTF-8 in the input string")]
+    #[diagnostic(
+        code(relon::eval::wasm_invalid_utf8),
+        help("Use `BufferBuilder::write_string` (or another validated path) to populate String fields the wasm module reads — that path rejects ill-formed UTF-8 before the trap can fire.")
+    )]
+    WasmInvalidUtf8 {
+        #[label("invalid UTF-8 byte sequence")]
+        range: TokenRange,
+    },
+
     /// Phase 4.c-1: wasm trap fired because the scratch bump allocator
     /// (`Op::AllocScratch` / `Op::AllocScratchDyn`) would have pushed
     /// the `relon_scratch_cursor` global past the end of wasm linear

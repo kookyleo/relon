@@ -157,21 +157,14 @@ where
     }
 
     // BFS / worklist sweep. Stdlib-to-stdlib calls are transitively
-    // followed; today none exist in the bundled bodies, but the
-    // walker is shape-agnostic so a future stdlib body that wraps
-    // another stdlib (e.g. `trim` calling `substring`) stays
-    // correct without any DCE-side changes.
+    // followed — v3+ a-4's `upper` / `lower` bodies are the first
+    // shape to do this in practice (`upper` -> `__casefold_lookup`),
+    // and the call site lives inside a `Op::Loop` nested in a
+    // `Op::Block`, so the walker has to descend through structured
+    // control-flow op bodies as well as the top-level sequence.
     while let Some(fn_idx) = work.pop() {
         let body = combined_funcs[fn_idx].body();
-        for tagged in body {
-            if let Op::Call { fn_index, .. } = &tagged.op {
-                let callee = *fn_index as usize;
-                if callee < total && !visited[callee] {
-                    visited[callee] = true;
-                    work.push(callee);
-                }
-            }
-        }
+        visit_calls(body, total, &mut visited, &mut work);
     }
 
     // Build the remap. Stdlib slots collapse into a dense prefix
@@ -200,6 +193,39 @@ where
         stdlib_count_after,
         remap,
         reachable_stdlib,
+    }
+}
+
+/// Recursively walk an op sequence, marking every `Op::Call` target
+/// as reachable and pushing newly-reachable callees onto the worklist.
+/// Descends through `Op::Block` / `Op::Loop` / `Op::If` bodies so
+/// stdlib bodies that wrap their `Op::Call`s in structured
+/// control flow (v3+ a-4 `upper` / `lower`, which call
+/// `__casefold_lookup` from inside a `Op::Loop`) still have their
+/// callees marked alive.
+fn visit_calls(body: &[TaggedOp], total: usize, visited: &mut [bool], work: &mut Vec<usize>) {
+    for tagged in body {
+        match &tagged.op {
+            Op::Call { fn_index, .. } => {
+                let callee = *fn_index as usize;
+                if callee < total && !visited[callee] {
+                    visited[callee] = true;
+                    work.push(callee);
+                }
+            }
+            Op::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                visit_calls(then_body, total, visited, work);
+                visit_calls(else_body, total, visited, work);
+            }
+            Op::Block { body, .. } | Op::Loop { body, .. } => {
+                visit_calls(body, total, visited, work);
+            }
+            _ => {}
+        }
     }
 }
 

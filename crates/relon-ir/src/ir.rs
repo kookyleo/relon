@@ -1149,6 +1149,31 @@ pub enum Op {
         /// IR type pushed back onto the stack after the call.
         ret_ty: IrType,
     },
+
+    /// v3+ a-4 Unicode case-folding primitive.
+    ///
+    /// Push the absolute wasm-memory address of one of the two
+    /// codegen-managed simple case-folding tables. Stack effect:
+    /// `[] -> [i32]`. Codegen lowers to `i32.const <table_addr>`
+    /// where `<table_addr>` is the wasm-memory location of the
+    /// `[count: u32 LE][(input_cp: u32, output_cp: u32) × count]`
+    /// blob the codegen pass laid out in the const data section.
+    ///
+    /// The op only appears inside the bundled `upper` / `lower`
+    /// stdlib bodies (and the shared `__casefold_lookup` helper they
+    /// call). It is **not** part of the user-facing surface — there is
+    /// no Relon-level syntax that lowers to it.
+    ///
+    /// The pre-DCE codegen scan treats this op the same way as
+    /// `Op::ConstString`: when present in a reachable function body,
+    /// the matching table is added to the const pool so the embedded
+    /// `i32.const` resolves to a valid address. Unreachable
+    /// upper/lower bodies stay pruned and the table is never emitted.
+    CaseFoldTableAddr {
+        /// `true` selects the upper-mapping table (lowercase ->
+        /// uppercase), `false` selects the lower-mapping table.
+        upper: bool,
+    },
 }
 
 /// Phase 10-a closure-capture record. One per captured variable on a
@@ -1195,4 +1220,12 @@ pub enum TrapKind {
     /// A reducer that requires at least one element (`list_int_max`)
     /// was called on an empty receiver.
     EmptyList,
+    /// v3+ a-4: the Unicode-aware `upper` / `lower` stdlib body
+    /// encountered a byte sequence that does not decode as valid
+    /// UTF-8 (truncated continuation, lone continuation byte, etc.).
+    /// In practice the host SDK validates input via
+    /// `BufferBuilder::write_string` so this trap should only fire on
+    /// modules with hand-crafted byte buffers; the variant ships so
+    /// the diagnostic surface stays honest.
+    InvalidUtf8,
 }
