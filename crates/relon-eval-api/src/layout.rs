@@ -51,6 +51,46 @@ pub enum FieldKind {
     },
 }
 
+/// Phase 10-c: per-element layout descriptor for a `List<T>` field.
+///
+/// Carried as a sidecar on [`FieldOffset`] for any pointer-indirect
+/// slot whose declared type is a `List<T>`. The buffer writer / reader
+/// dispatches on this to pick the right tail-area shape:
+///
+/// * `InlineFixed { elem_size, elem_align }` — fixed-stride payload
+///   laid out as `[len: u32][padding to elem_align][elem_0][elem_1]...`.
+///   Used by `List<Int>` (`8/8`), `List<Float>` (`8/8`) and
+///   `List<Bool>` (`1/1`, no inter-element padding per spec).
+/// * `PointerArray { elem_alignment }` — variable-stride payload laid
+///   out as `[len: u32][off_0: u32][off_1: u32]...` followed by each
+///   element's own tail record in the same buffer. `elem_alignment` is
+///   the alignment the inner records demand when emitted (`4` for
+///   `String` len-prefixes; `root_align` for sub-record fixed areas).
+///   Used by `List<String>` and `List<branded Schema>`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListElementKind {
+    /// Fixed-size inline elements. The list record's shape is
+    /// `[len: u32][pad to elem_align][elem_0 ..]`; the pad is `0`
+    /// bytes for 1-aligned elements (booleans) and `4` bytes for
+    /// 8-aligned elements (i64 / f64).
+    InlineFixed {
+        /// Element size in bytes.
+        elem_size: usize,
+        /// Element alignment in bytes. Drives the post-`len` padding
+        /// the builder inserts before the first element.
+        elem_align: usize,
+    },
+    /// Variable-size elements addressed through a buffer-relative
+    /// `u32` pointer array immediately after the `len` prefix.
+    PointerArray {
+        /// Alignment required by each inner element record when the
+        /// builder emits it in the tail area. `String` elements pass
+        /// `4` (len-prefix alignment); branded `Schema` elements pass
+        /// the sub-schema's `root_align`.
+        elem_alignment: usize,
+    },
+}
+
 /// One field's slot inside a record.
 ///
 /// `offset` is the byte position relative to the buffer base. For
@@ -77,6 +117,12 @@ pub struct FieldOffset {
     /// the fixed area (`Inline`), or through a tail-area pointer
     /// (`PointerIndirect`).
     pub kind: FieldKind,
+    /// Phase 10-c: per-element layout for `List<T>` fields. `None` for
+    /// non-list fields; `Some` when the field's declared `TypeRepr` is
+    /// `List<T>` and the v1 layout supports `T`. Carried alongside
+    /// [`FieldKind`] so the buffer writer / reader can dispatch on the
+    /// element shape without re-walking the schema.
+    pub list_element: Option<ListElementKind>,
 }
 
 /// Computed offset table for a schema's flat record area.
@@ -133,6 +179,17 @@ pub enum LayoutError {
         /// Human-readable type kind (`"String"`, `"List"`, ...).
         kind: &'static str,
     },
+    /// Phase 10-c: `List<T>` with an element type the v1 layout
+    /// declines. Currently covers `List<List<...>>`, `List<Option<T>>`,
+    /// and `List<Result<T, E>>`. The error spells out the inner kind
+    /// so the host SDK can surface a precise message.
+    #[error("layout v1 does not yet support list element `{inner}` in field `{field}`")]
+    UnsupportedListElement {
+        /// Field name that triggered the error.
+        field: String,
+        /// Human-readable name of the inner type.
+        inner: &'static str,
+    },
     /// Cumulative offset overflowed `usize`. Astronomically unlikely
     /// on 64-bit hosts but cheap to model so the layout pass never
     /// quietly wraps.
@@ -145,70 +202,156 @@ pub enum LayoutError {
     },
 }
 
+/// Per-field layout decision. Carries the fixed-area slot description
+/// plus the optional element-shape sidecar `List<T>` fields need.
+struct FieldLayoutDecision {
+    kind: FieldKind,
+    list_element: Option<ListElementKind>,
+}
+
 /// Compute the field-kind / fixed-area placement for one [`TypeRepr`].
 ///
-/// Returns `None` only for types still rejected (`Option`, `Result`,
-/// `List<T>` where `T != Int`). The supported set:
+/// Returns `Ok(decision)` on success. `Err(label)` carries the human-
+/// readable kind label for [`LayoutError::UnsupportedTypeInLayoutV1`]
+/// when the v1 layout still declines the type at the field level
+/// (`Option`, `Result`). `List<T>` element rejection routes through
+/// a different error variant ([`LayoutError::UnsupportedListElement`])
+/// — those failures bubble up from this function as their own error,
+/// returned in the `Err` arm tagged with the `"List"` label and a
+/// nested cause via the field name (caller assembles the precise
+/// message).
+///
+/// Supported set:
 ///
 /// * `Null`, `Bool` → `Inline { size: 1, align: 1 }`.
 /// * `Int`, `Float` → `Inline { size: 8, align: 8 }`.
-/// * `String` → `PointerIndirect { tail_alignment: 1 }` (utf-8 bytes
-///   need no alignment beyond the leading `[len: u32]`'s implicit
-///   4-byte boundary).
-/// * `List<Int>` → `PointerIndirect { tail_alignment: 8 }` (i64
-///   elements are emitted inline in the tail area).
-/// * Phase 3.b: nested branded `Schema { ... }` → `PointerIndirect`
-///   with `tail_alignment` matching the sub-record's `root_align`.
-///   The sub-record's fixed area lives in the parent buffer's tail
-///   area; the parent's fixed-area slot holds a 4-byte buffer-relative
-///   pointer to it.
-fn field_kind_for(ty: &TypeRepr) -> Option<FieldKind> {
+/// * `String` → `PointerIndirect { tail_alignment: 1 }`.
+/// * `List<Int>` / `List<Float>` → `PointerIndirect { tail_alignment: 8 }`
+///   with `InlineFixed { elem_size: 8, elem_align: 8 }`.
+/// * `List<Bool>` → `PointerIndirect { tail_alignment: 4 }` with
+///   `InlineFixed { elem_size: 1, elem_align: 1 }` (booleans pack
+///   tightly per spec, no inter-element padding).
+/// * `List<String>` → `PointerIndirect { tail_alignment: 4 }` with
+///   `PointerArray { elem_alignment: 4 }`.
+/// * `List<Schema>` → `PointerIndirect { tail_alignment: 4 }` with
+///   `PointerArray { elem_alignment: sub.root_align }`.
+/// * `Schema { ... }` → `PointerIndirect { tail_alignment: sub.root_align }`.
+fn field_layout_decision_for(
+    field_name: &str,
+    ty: &TypeRepr,
+) -> Result<FieldLayoutDecision, LayoutError> {
     match ty {
-        TypeRepr::Null => Some(FieldKind::Inline { size: 1, align: 1 }),
-        TypeRepr::Bool => Some(FieldKind::Inline { size: 1, align: 1 }),
-        TypeRepr::Int => Some(FieldKind::Inline { size: 8, align: 8 }),
-        TypeRepr::Float => Some(FieldKind::Inline { size: 8, align: 8 }),
-        TypeRepr::String => Some(FieldKind::PointerIndirect { tail_alignment: 1 }),
-        TypeRepr::List { element } if matches!(element.as_ref(), TypeRepr::Int) => {
-            Some(FieldKind::PointerIndirect { tail_alignment: 8 })
-        }
+        TypeRepr::Null => Ok(FieldLayoutDecision {
+            kind: FieldKind::Inline { size: 1, align: 1 },
+            list_element: None,
+        }),
+        TypeRepr::Bool => Ok(FieldLayoutDecision {
+            kind: FieldKind::Inline { size: 1, align: 1 },
+            list_element: None,
+        }),
+        TypeRepr::Int => Ok(FieldLayoutDecision {
+            kind: FieldKind::Inline { size: 8, align: 8 },
+            list_element: None,
+        }),
+        TypeRepr::Float => Ok(FieldLayoutDecision {
+            kind: FieldKind::Inline { size: 8, align: 8 },
+            list_element: None,
+        }),
+        TypeRepr::String => Ok(FieldLayoutDecision {
+            kind: FieldKind::PointerIndirect { tail_alignment: 1 },
+            list_element: None,
+        }),
+        TypeRepr::List { element } => list_layout_decision(field_name, element.as_ref()),
         TypeRepr::Schema { schema } => {
             // Recursively compute the sub-record's root_align so the
             // tail-area placement of the sub-record honours its own
             // alignment requirements (an inner i64 field demands the
             // sub-record start on an 8-byte boundary).
-            let sub = SchemaLayout::offsets_for(schema).ok()?;
-            Some(FieldKind::PointerIndirect {
-                tail_alignment: sub.root_align,
+            let sub = SchemaLayout::offsets_for(schema)?;
+            Ok(FieldLayoutDecision {
+                kind: FieldKind::PointerIndirect {
+                    tail_alignment: sub.root_align,
+                },
+                list_element: None,
             })
         }
-        // Other variable-length composites still defer to a later
-        // phase.
-        TypeRepr::List { .. } | TypeRepr::Option { .. } | TypeRepr::Result { .. } => None,
+        TypeRepr::Option { .. } => Err(LayoutError::UnsupportedTypeInLayoutV1 {
+            field: field_name.to_string(),
+            kind: "Option",
+        }),
+        TypeRepr::Result { .. } => Err(LayoutError::UnsupportedTypeInLayoutV1 {
+            field: field_name.to_string(),
+            kind: "Result",
+        }),
     }
 }
 
-/// Human-readable name used in `UnsupportedTypeInLayoutV1`. Returns
-/// `None` for types the layout currently supports inline or via
-/// pointer indirection. Used at the call site to detect "we need a
-/// kind label".
-fn unsupported_kind(ty: &TypeRepr) -> Option<&'static str> {
-    match ty {
-        TypeRepr::Option { .. } => Some("Option"),
-        TypeRepr::Result { .. } => Some("Result"),
-        // `List<T>` where `T != Int` lands here; the caller has
-        // already established `field_kind_for` returned `None` for
-        // this exact shape, so emitting "List" is correct.
-        TypeRepr::List { .. } => Some("List"),
-        // Scalar leaves + supported pointer-indirect leaves +
-        // Phase 3.b nested schema are supported — caller should not
-        // reach the unsupported branch for these.
-        TypeRepr::Null
-        | TypeRepr::Bool
-        | TypeRepr::Int
-        | TypeRepr::Float
-        | TypeRepr::String
-        | TypeRepr::Schema { .. } => None,
+/// Decide layout for a `List<element>` field. v1 supports the
+/// fixed-stride scalar elements (`Int`, `Float`, `Bool`) inline and
+/// the variable-stride elements (`String`, branded `Schema`) through
+/// a per-element pointer array. Other element shapes route to
+/// [`LayoutError::UnsupportedListElement`].
+fn list_layout_decision(
+    field_name: &str,
+    element: &TypeRepr,
+) -> Result<FieldLayoutDecision, LayoutError> {
+    match element {
+        TypeRepr::Int => Ok(FieldLayoutDecision {
+            kind: FieldKind::PointerIndirect { tail_alignment: 8 },
+            list_element: Some(ListElementKind::InlineFixed {
+                elem_size: 8,
+                elem_align: 8,
+            }),
+        }),
+        TypeRepr::Float => Ok(FieldLayoutDecision {
+            kind: FieldKind::PointerIndirect { tail_alignment: 8 },
+            list_element: Some(ListElementKind::InlineFixed {
+                elem_size: 8,
+                elem_align: 8,
+            }),
+        }),
+        TypeRepr::Bool => Ok(FieldLayoutDecision {
+            // Bool elements are 1-aligned; the record still needs a
+            // 4-byte aligned start so the `[len:u32]` prefix is
+            // naturally aligned. Builder pads to 4 before writing the
+            // record, then writes the len + booleans tightly per spec.
+            kind: FieldKind::PointerIndirect { tail_alignment: 4 },
+            list_element: Some(ListElementKind::InlineFixed {
+                elem_size: 1,
+                elem_align: 1,
+            }),
+        }),
+        TypeRepr::String => Ok(FieldLayoutDecision {
+            kind: FieldKind::PointerIndirect { tail_alignment: 4 },
+            list_element: Some(ListElementKind::PointerArray { elem_alignment: 4 }),
+        }),
+        TypeRepr::Schema { schema } => {
+            let sub = SchemaLayout::offsets_for(schema)?;
+            Ok(FieldLayoutDecision {
+                kind: FieldKind::PointerIndirect { tail_alignment: 4 },
+                list_element: Some(ListElementKind::PointerArray {
+                    elem_alignment: sub.root_align,
+                }),
+            })
+        }
+        // Reject nested lists / options / results / nulls — v1 doesn't
+        // model these element shapes.
+        TypeRepr::List { .. } => Err(LayoutError::UnsupportedListElement {
+            field: field_name.to_string(),
+            inner: "List",
+        }),
+        TypeRepr::Option { .. } => Err(LayoutError::UnsupportedListElement {
+            field: field_name.to_string(),
+            inner: "Option",
+        }),
+        TypeRepr::Result { .. } => Err(LayoutError::UnsupportedListElement {
+            field: field_name.to_string(),
+            inner: "Result",
+        }),
+        TypeRepr::Null => Err(LayoutError::UnsupportedListElement {
+            field: field_name.to_string(),
+            inner: "Null",
+        }),
     }
 }
 
@@ -247,17 +390,8 @@ impl SchemaLayout {
         let mut max_align: usize = 1;
 
         for field in &schema.fields {
-            let kind = match field_kind_for(&field.ty) {
-                Some(k) => k,
-                None => {
-                    let kind = unsupported_kind(&field.ty)
-                        .expect("field_kind_for returned None only for unsupported variants");
-                    return Err(LayoutError::UnsupportedTypeInLayoutV1 {
-                        field: field.name.clone(),
-                        kind,
-                    });
-                }
-            };
+            let decision = field_layout_decision_for(&field.name, &field.ty)?;
+            let kind = decision.kind;
 
             let (size, align) = match kind {
                 FieldKind::Inline { size, align } => (size, align),
@@ -287,6 +421,7 @@ impl SchemaLayout {
                 size,
                 align,
                 kind,
+                list_element: decision.list_element,
             });
         }
 
@@ -458,9 +593,11 @@ mod tests {
     }
 
     #[test]
-    fn list_of_string_is_rejected_in_phase_2c() {
-        // Lists are gated on element type — Phase 2.c only opens up
-        // `List<Int>`. `List<String>` waits for Phase 3.
+    fn list_of_string_takes_pointer_array_layout() {
+        // Phase 10-c: List<String> is supported through a pointer
+        // array. The fixed-area slot is the standard 4-byte pointer;
+        // the element kind records `PointerArray { elem_alignment: 4 }`
+        // so the builder pads each String len-prefix to 4 bytes.
         let schema = Schema {
             name: "Names".into(),
             generics: vec![],
@@ -471,10 +608,122 @@ mod tests {
                 },
             )],
         };
+        let table = SchemaLayout::offsets_for(&schema).expect("layout");
+        assert_eq!(table.fields[0].offset, 0);
+        assert_eq!(table.fields[0].size, 4);
+        assert_eq!(table.fields[0].align, 4);
+        assert!(matches!(
+            table.fields[0].kind,
+            FieldKind::PointerIndirect { tail_alignment: 4 }
+        ));
+        assert!(matches!(
+            table.fields[0].list_element,
+            Some(ListElementKind::PointerArray { elem_alignment: 4 })
+        ));
+    }
+
+    #[test]
+    fn list_of_float_takes_inline_eight_byte_elements() {
+        let schema = Schema {
+            name: "Speeds".into(),
+            generics: vec![],
+            fields: vec![field(
+                "xs",
+                TypeRepr::List {
+                    element: Box::new(TypeRepr::Float),
+                },
+            )],
+        };
+        let table = SchemaLayout::offsets_for(&schema).expect("layout");
+        assert!(matches!(
+            table.fields[0].kind,
+            FieldKind::PointerIndirect { tail_alignment: 8 }
+        ));
+        assert!(matches!(
+            table.fields[0].list_element,
+            Some(ListElementKind::InlineFixed {
+                elem_size: 8,
+                elem_align: 8
+            })
+        ));
+    }
+
+    #[test]
+    fn list_of_bool_packs_one_byte_per_element() {
+        let schema = Schema {
+            name: "Flags".into(),
+            generics: vec![],
+            fields: vec![field(
+                "xs",
+                TypeRepr::List {
+                    element: Box::new(TypeRepr::Bool),
+                },
+            )],
+        };
+        let table = SchemaLayout::offsets_for(&schema).expect("layout");
+        assert!(matches!(
+            table.fields[0].kind,
+            FieldKind::PointerIndirect { tail_alignment: 4 }
+        ));
+        assert!(matches!(
+            table.fields[0].list_element,
+            Some(ListElementKind::InlineFixed {
+                elem_size: 1,
+                elem_align: 1
+            })
+        ));
+    }
+
+    #[test]
+    fn list_of_nested_list_is_rejected() {
+        // List<List<Int>> waits for v3+. The error surfaces via the
+        // dedicated UnsupportedListElement variant so the host SDK can
+        // distinguish a top-level rejection from an element-level one.
+        let schema = Schema {
+            name: "Nested".into(),
+            generics: vec![],
+            fields: vec![field(
+                "xs",
+                TypeRepr::List {
+                    element: Box::new(TypeRepr::List {
+                        element: Box::new(TypeRepr::Int),
+                    }),
+                },
+            )],
+        };
         let err = SchemaLayout::offsets_for(&schema).expect_err("must reject");
         assert!(matches!(
             err,
-            LayoutError::UnsupportedTypeInLayoutV1 { kind: "List", .. }
+            LayoutError::UnsupportedListElement { inner: "List", .. }
+        ));
+    }
+
+    #[test]
+    fn list_of_schema_picks_subrecord_alignment() {
+        // Sub-schema with an Int field demands 8-byte alignment for
+        // its fixed area, so the pointer-array elements need 8-byte
+        // alignment when the builder lays them out.
+        let inner = Schema {
+            name: "Inner".into(),
+            generics: vec![],
+            fields: vec![field("v", TypeRepr::Int)],
+        };
+        let schema = Schema {
+            name: "Outer".into(),
+            generics: vec![],
+            fields: vec![field(
+                "xs",
+                TypeRepr::List {
+                    element: Box::new(TypeRepr::Schema {
+                        schema: Box::new(inner),
+                    }),
+                },
+            )],
+        };
+        let table = SchemaLayout::offsets_for(&schema).expect("layout");
+        assert!(matches!(
+            table.fields[0].list_element,
+            Some(ListElementKind::PointerArray { elem_alignment: 8 })
         ));
     }
 

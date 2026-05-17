@@ -17,9 +17,23 @@
 //! Static enforcement via codegen-generated wrappers is a Phase 3
 //! follow-up.
 
-use crate::layout::{FieldKind, OffsetTable, SchemaLayout};
-use crate::schema_canonical::{Field, TypeRepr};
+use crate::layout::{FieldKind, ListElementKind, OffsetTable, SchemaLayout};
+use crate::schema_canonical::{Field, Schema, TypeRepr};
 use thiserror::Error;
+
+/// One row in the per-builder / per-reader field index. Carries the
+/// declared schema type alongside the offset-table data so writers
+/// and readers can dispatch on declared shape without re-walking the
+/// schema. Phase 10-c added `list_element` for `List<T>` dispatch.
+#[derive(Debug, Clone)]
+struct FieldEntry {
+    name: String,
+    ty: TypeRepr,
+    offset: usize,
+    size: usize,
+    kind: FieldKind,
+    list_element: Option<ListElementKind>,
+}
 
 /// Failure modes when writing / reading typed fields against a buffer.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -98,7 +112,7 @@ pub enum BufferError {
 #[derive(Debug)]
 pub struct BufferBuilder<'a> {
     layout: &'a OffsetTable,
-    field_index: Vec<(String, TypeRepr, usize, usize, FieldKind)>,
+    field_index: Vec<FieldEntry>,
     bytes: Vec<u8>,
 }
 
@@ -118,7 +132,14 @@ impl<'a> BufferBuilder<'a> {
                 fields
                     .iter()
                     .find(|f| f.name == fo.name)
-                    .map(|f| (fo.name.clone(), f.ty.clone(), fo.offset, fo.size, fo.kind))
+                    .map(|f| FieldEntry {
+                        name: fo.name.clone(),
+                        ty: f.ty.clone(),
+                        offset: fo.offset,
+                        size: fo.size,
+                        kind: fo.kind,
+                        list_element: fo.list_element,
+                    })
             })
             .collect();
         Self {
@@ -239,6 +260,291 @@ impl<'a> BufferBuilder<'a> {
         Ok(())
     }
 
+    /// Write a `List<Float>` into `field_name`'s tail-area record.
+    ///
+    /// Phase 10-c: tail layout mirrors `List<Int>` — `[len: u32 LE]
+    /// [pad to 8][f64 LE x len]`. The post-len pad keeps the f64
+    /// payload on an 8-byte boundary so the wasm side can issue
+    /// `f64.load align=3` against the element stream.
+    pub fn write_list_float(
+        &mut self,
+        field_name: &str,
+        values: &[f64],
+    ) -> Result<(), BufferError> {
+        let (slot_offset, kind, _elem) =
+            self.locate_list(field_name, &TypeRepr::Float, "List<Float>")?;
+        let FieldKind::PointerIndirect { tail_alignment } = kind else {
+            return Err(BufferError::TypeMismatch {
+                name: field_name.to_string(),
+                declared: "List<Float>",
+                requested: "List<Float>",
+            });
+        };
+        if values.len() > u32::MAX as usize {
+            return Err(BufferError::ValueTooLarge {
+                name: field_name.to_string(),
+                len: values.len(),
+            });
+        }
+        let mut payload = Vec::with_capacity(values.len() * 8);
+        for v in values {
+            payload.extend_from_slice(&v.to_le_bytes());
+        }
+        let payload_offset =
+            self.append_tail_record_with_inner_alignment(4, tail_alignment, values.len(), &payload);
+        let ptr = u32::try_from(payload_offset).map_err(|_| BufferError::ValueTooLarge {
+            name: field_name.to_string(),
+            len: payload_offset,
+        })?;
+        self.bytes[slot_offset..slot_offset + 4].copy_from_slice(&ptr.to_le_bytes());
+        Ok(())
+    }
+
+    /// Write a `List<Bool>` into `field_name`'s tail-area record.
+    ///
+    /// Phase 10-c: tail layout `[len: u32 LE][u8 x len]` — booleans
+    /// pack tightly with no inter-element padding per spec. The
+    /// record start is 4-byte aligned so the len prefix loads cleanly;
+    /// each element is one byte (`0` for false, `1` for true).
+    pub fn write_list_bool(
+        &mut self,
+        field_name: &str,
+        values: &[bool],
+    ) -> Result<(), BufferError> {
+        let (slot_offset, kind, _elem) =
+            self.locate_list(field_name, &TypeRepr::Bool, "List<Bool>")?;
+        if !matches!(kind, FieldKind::PointerIndirect { .. }) {
+            return Err(BufferError::TypeMismatch {
+                name: field_name.to_string(),
+                declared: "List<Bool>",
+                requested: "List<Bool>",
+            });
+        }
+        if values.len() > u32::MAX as usize {
+            return Err(BufferError::ValueTooLarge {
+                name: field_name.to_string(),
+                len: values.len(),
+            });
+        }
+        let payload: Vec<u8> = values.iter().map(|&b| u8::from(b)).collect();
+        let payload_offset = self.append_tail_record(4, values.len(), &payload);
+        let ptr = u32::try_from(payload_offset).map_err(|_| BufferError::ValueTooLarge {
+            name: field_name.to_string(),
+            len: payload_offset,
+        })?;
+        self.bytes[slot_offset..slot_offset + 4].copy_from_slice(&ptr.to_le_bytes());
+        Ok(())
+    }
+
+    /// Write a `List<String>` into `field_name`'s tail-area record.
+    ///
+    /// Phase 10-c: header `[len: u32 LE][off_0: u32 LE]...[off_(n-1)]`
+    /// followed by per-string `[len: u32 LE][utf8 bytes]` tail records.
+    /// Each `off_i` is the buffer-relative byte offset of the matching
+    /// String's len prefix; the writer pads each String header to a
+    /// 4-byte boundary so the reader can dereference without an
+    /// unaligned load.
+    pub fn write_list_string<S: AsRef<str>>(
+        &mut self,
+        field_name: &str,
+        values: &[S],
+    ) -> Result<(), BufferError> {
+        let (slot_offset, kind, _elem) =
+            self.locate_list(field_name, &TypeRepr::String, "List<String>")?;
+        if !matches!(kind, FieldKind::PointerIndirect { .. }) {
+            return Err(BufferError::TypeMismatch {
+                name: field_name.to_string(),
+                declared: "List<String>",
+                requested: "List<String>",
+            });
+        }
+        let count = values.len();
+        if count > u32::MAX as usize {
+            return Err(BufferError::ValueTooLarge {
+                name: field_name.to_string(),
+                len: count,
+            });
+        }
+        // Allocate the header `[len][off_0]...[off_(n-1)]` first, with
+        // zeroed entries we'll back-patch as each String tail record
+        // lands. The header itself is 4-byte aligned.
+        self.pad_to(4);
+        let header_offset = self.bytes.len();
+        self.bytes
+            .extend_from_slice(&u32::try_from(count).unwrap().to_le_bytes());
+        let entries_start = self.bytes.len();
+        self.bytes.resize(entries_start + count * 4, 0);
+        // Append each String tail record, capturing its offset.
+        let mut offsets: Vec<u32> = Vec::with_capacity(count);
+        for (i, s) in values.iter().enumerate() {
+            let bytes = s.as_ref().as_bytes();
+            if bytes.len() > u32::MAX as usize {
+                return Err(BufferError::ValueTooLarge {
+                    name: format!("{field_name}[{i}]"),
+                    len: bytes.len(),
+                });
+            }
+            let entry_offset = self.append_tail_record(4, bytes.len(), bytes);
+            let entry_u32 =
+                u32::try_from(entry_offset).map_err(|_| BufferError::ValueTooLarge {
+                    name: field_name.to_string(),
+                    len: entry_offset,
+                })?;
+            offsets.push(entry_u32);
+        }
+        // Back-patch the pointer-array entries with the actual offsets.
+        for (i, off) in offsets.iter().enumerate() {
+            let dst = entries_start + i * 4;
+            self.bytes[dst..dst + 4].copy_from_slice(&off.to_le_bytes());
+        }
+        // Back-patch the field's pointer slot to the list-header
+        // offset (the `len` prefix).
+        let ptr = u32::try_from(header_offset).map_err(|_| BufferError::ValueTooLarge {
+            name: field_name.to_string(),
+            len: header_offset,
+        })?;
+        self.bytes[slot_offset..slot_offset + 4].copy_from_slice(&ptr.to_le_bytes());
+        Ok(())
+    }
+
+    /// Start writing a `List<Schema>` element. Returns a list-record
+    /// writer the caller drives one entry at a time; the actual list
+    /// header pointer is patched into the parent slot when
+    /// [`Self::finish_list_record`] is called.
+    ///
+    /// Phase 10-c: each element is a branded sub-record (the inner
+    /// `TypeRepr::Schema { schema }`) whose fixed area lives in the
+    /// parent buffer's tail area, addressed by a `u32` entry in the
+    /// pointer array. The parent's pointer slot in turn holds the
+    /// buffer-relative offset of the list header (`[len: u32][off_0]
+    /// ...`).
+    ///
+    /// Workflow:
+    ///
+    /// ```ignore
+    /// let mut lw = parent.list_record(&field_name, &elem_layout, &elem_schema.fields)?;
+    /// for entry in entries {
+    ///     let mut child = lw.start_entry(&parent_builder)?;
+    ///     // ... write_int / write_string into `child` ...
+    ///     lw.finish_entry(&mut parent_builder, child)?;
+    /// }
+    /// parent.finish_list_record(&field_name, lw)?;
+    /// ```
+    ///
+    /// The split workflow keeps the parent buffer mutable for the
+    /// per-entry tail copy without aliasing the child borrow against
+    /// the parent's `field_index`. Hosts that don't need the full
+    /// step-by-step control can use the [`Self::write_list_record`]
+    /// convenience wrapper which takes a slice of pre-built dicts.
+    fn list_record_writer<'b>(
+        &self,
+        field_name: &str,
+        elem_layout: &'b OffsetTable,
+        elem_schema: &'b Schema,
+    ) -> Result<ListRecordWriter<'b>, BufferError> {
+        let entry = self
+            .field_index
+            .iter()
+            .find(|e| e.name == field_name)
+            .ok_or_else(|| BufferError::UnknownField {
+                name: field_name.to_string(),
+            })?;
+        match &entry.ty {
+            TypeRepr::List { element } => match element.as_ref() {
+                TypeRepr::Schema { schema } => {
+                    if schema.as_ref() != elem_schema {
+                        return Err(BufferError::TypeMismatch {
+                            name: field_name.to_string(),
+                            declared: type_label(&entry.ty),
+                            requested: "List<Schema>",
+                        });
+                    }
+                }
+                _ => {
+                    return Err(BufferError::TypeMismatch {
+                        name: field_name.to_string(),
+                        declared: type_label(&entry.ty),
+                        requested: "List<Schema>",
+                    });
+                }
+            },
+            other => {
+                return Err(BufferError::TypeMismatch {
+                    name: field_name.to_string(),
+                    declared: type_label(other),
+                    requested: "List<Schema>",
+                });
+            }
+        };
+        if !matches!(entry.kind, FieldKind::PointerIndirect { .. }) {
+            return Err(BufferError::TypeMismatch {
+                name: field_name.to_string(),
+                declared: "List<Schema>",
+                requested: "List<Schema>",
+            });
+        }
+        Ok(ListRecordWriter {
+            field_name: field_name.to_string(),
+            slot_offset: entry.offset,
+            elem_layout,
+            elem_schema,
+            entry_offsets: Vec::new(),
+            elem_align: elem_layout.root_align.max(1),
+        })
+    }
+
+    /// Convenience writer for `List<Schema>` that builds each entry
+    /// from a pre-prepared `Vec<(field_name, write_callback)>` shape.
+    /// Phase 10-c: tests use the longer-form [`Self::list_record_writer`]
+    /// for full control; this wrapper accepts a list of buffer-builder
+    /// "actions" so simple cases don't need to spell out the start /
+    /// finish dance.
+    pub fn write_list_record<'b, F>(
+        &mut self,
+        field_name: &str,
+        elem_layout: &'b OffsetTable,
+        elem_schema: &'b Schema,
+        entries: &[F],
+    ) -> Result<(), BufferError>
+    where
+        F: Fn(&mut BufferBuilder<'b>) -> Result<(), BufferError>,
+    {
+        let mut writer = self.list_record_writer(field_name, elem_layout, elem_schema)?;
+        for action in entries {
+            let mut child = writer.start_entry();
+            action(&mut child)?;
+            writer.finish_entry(self, child)?;
+        }
+        self.finish_list_record(writer)
+    }
+
+    /// Commit a [`ListRecordWriter`] — emit the list header into the
+    /// tail area (aligned to 4) and patch the field's pointer slot
+    /// with the header offset.
+    fn finish_list_record(&mut self, writer: ListRecordWriter<'_>) -> Result<(), BufferError> {
+        let count = writer.entry_offsets.len();
+        if count > u32::MAX as usize {
+            return Err(BufferError::ValueTooLarge {
+                name: writer.field_name,
+                len: count,
+            });
+        }
+        self.pad_to(4);
+        let header_offset = self.bytes.len();
+        self.bytes
+            .extend_from_slice(&u32::try_from(count).unwrap().to_le_bytes());
+        for off in &writer.entry_offsets {
+            self.bytes.extend_from_slice(&off.to_le_bytes());
+        }
+        let ptr = u32::try_from(header_offset).map_err(|_| BufferError::ValueTooLarge {
+            name: writer.field_name.clone(),
+            len: header_offset,
+        })?;
+        let slot_offset = writer.slot_offset;
+        self.bytes[slot_offset..slot_offset + 4].copy_from_slice(&ptr.to_le_bytes());
+        Ok(())
+    }
+
     /// Consume the builder and return the underlying byte buffer.
     pub fn finish(self) -> Vec<u8> {
         self.bytes
@@ -275,18 +581,18 @@ impl<'a> BufferBuilder<'a> {
         let entry = self
             .field_index
             .iter()
-            .find(|(name, _, _, _, _)| name == field_name)
+            .find(|e| e.name == field_name)
             .ok_or_else(|| BufferError::UnknownField {
                 name: field_name.to_string(),
             })?;
-        if !matches!(entry.1, TypeRepr::Schema { .. }) {
+        if !matches!(entry.ty, TypeRepr::Schema { .. }) {
             return Err(BufferError::TypeMismatch {
                 name: field_name.to_string(),
-                declared: type_label(&entry.1),
+                declared: type_label(&entry.ty),
                 requested: "Schema",
             });
         }
-        if !matches!(entry.4, FieldKind::PointerIndirect { .. }) {
+        if !matches!(entry.kind, FieldKind::PointerIndirect { .. }) {
             return Err(BufferError::TypeMismatch {
                 name: field_name.to_string(),
                 declared: "Schema",
@@ -323,25 +629,25 @@ impl<'a> BufferBuilder<'a> {
         let entry = self
             .field_index
             .iter()
-            .find(|(name, _, _, _, _)| name == field_name)
+            .find(|e| e.name == field_name)
             .ok_or_else(|| BufferError::UnknownField {
                 name: field_name.to_string(),
             })?;
-        if !matches!(entry.1, TypeRepr::Schema { .. }) {
+        if !matches!(entry.ty, TypeRepr::Schema { .. }) {
             return Err(BufferError::TypeMismatch {
                 name: field_name.to_string(),
-                declared: type_label(&entry.1),
+                declared: type_label(&entry.ty),
                 requested: "Schema",
             });
         }
-        let FieldKind::PointerIndirect { tail_alignment } = entry.4 else {
+        let FieldKind::PointerIndirect { tail_alignment } = entry.kind else {
             return Err(BufferError::TypeMismatch {
                 name: field_name.to_string(),
                 declared: "Schema",
                 requested: "Schema",
             });
         };
-        let slot_offset = entry.2;
+        let slot_offset = entry.offset;
         let child_align = child.layout.root_align.max(tail_alignment).max(1);
         let child_layout = child.layout;
         // Resolve the child's field type list from its own field_index
@@ -350,9 +656,9 @@ impl<'a> BufferBuilder<'a> {
         let child_fields: Vec<Field> = child
             .field_index
             .iter()
-            .map(|(name, ty, _, _, _)| Field {
-                name: name.clone(),
-                ty: ty.clone(),
+            .map(|e| Field {
+                name: e.name.clone(),
+                ty: e.ty.clone(),
                 default: None,
             })
             .collect();
@@ -385,18 +691,61 @@ impl<'a> BufferBuilder<'a> {
         let entry = self
             .field_index
             .iter()
-            .find(|(name, _, _, _, _)| name == field_name)
+            .find(|e| e.name == field_name)
             .ok_or_else(|| BufferError::UnknownField {
                 name: field_name.to_string(),
             })?;
-        if !type_matches(&entry.1, expected) {
+        if !type_matches(&entry.ty, expected) {
             return Err(BufferError::TypeMismatch {
                 name: field_name.to_string(),
-                declared: type_label(&entry.1),
+                declared: type_label(&entry.ty),
                 requested: requested_label,
             });
         }
-        Ok((entry.2, entry.3, entry.4))
+        Ok((entry.offset, entry.size, entry.kind))
+    }
+
+    /// Locate a list-typed field by name, validating that the
+    /// declared element type matches `expected_element`. Returns the
+    /// pointer slot offset, the `FieldKind` for sanity-checking the
+    /// pointer-indirect shape, and the [`ListElementKind`] sidecar.
+    fn locate_list(
+        &self,
+        field_name: &str,
+        expected_element: &TypeRepr,
+        requested_label: &'static str,
+    ) -> Result<(usize, FieldKind, ListElementKind), BufferError> {
+        let entry = self
+            .field_index
+            .iter()
+            .find(|e| e.name == field_name)
+            .ok_or_else(|| BufferError::UnknownField {
+                name: field_name.to_string(),
+            })?;
+        let declared_elem = match &entry.ty {
+            TypeRepr::List { element } => element.as_ref(),
+            other => {
+                return Err(BufferError::TypeMismatch {
+                    name: field_name.to_string(),
+                    declared: type_label(other),
+                    requested: requested_label,
+                });
+            }
+        };
+        if !type_matches(declared_elem, expected_element) {
+            return Err(BufferError::TypeMismatch {
+                name: field_name.to_string(),
+                declared: type_label(&entry.ty),
+                requested: requested_label,
+            });
+        }
+        let list_elem = entry
+            .list_element
+            .ok_or_else(|| BufferError::MalformedPayload {
+                name: field_name.to_string(),
+                reason: "list field missing element layout",
+            })?;
+        Ok((entry.offset, entry.kind, list_elem))
     }
 
     /// Append a `[len: u32 LE][payload]` record. Pads the buffer up
@@ -457,6 +806,73 @@ impl<'a> BufferBuilder<'a> {
     }
 }
 
+/// Phase 10-c: in-flight `List<Schema>` element writer.
+///
+/// Buffered between [`BufferBuilder::list_record_writer`] and
+/// [`BufferBuilder::finish_list_record`]. Each `start_entry` allocates
+/// a detached child builder; `finish_entry` rebases the child's
+/// internal pointers, appends the bytes to the parent's tail area,
+/// and records the per-entry offset. The list header is written
+/// only when the writer is finished, so the entry pointer array can
+/// be filled with the final per-entry offsets without back-patches.
+pub struct ListRecordWriter<'b> {
+    field_name: String,
+    slot_offset: usize,
+    elem_layout: &'b OffsetTable,
+    elem_schema: &'b Schema,
+    entry_offsets: Vec<u32>,
+    elem_align: usize,
+}
+
+impl<'b> ListRecordWriter<'b> {
+    /// Allocate a fresh entry builder. The caller drives it with
+    /// `write_int` / `write_string` / nested `sub_record` and hands
+    /// it back via [`Self::finish_entry`].
+    pub fn start_entry(&self) -> BufferBuilder<'b> {
+        BufferBuilder::new(self.elem_layout, &self.elem_schema.fields)
+    }
+
+    /// Commit a previously-started entry into the parent buffer.
+    ///
+    /// Pads the parent tail area up to the schema's `root_align`,
+    /// rebases the child's pointer-indirect slots through
+    /// [`relocate_pointers`], appends the bytes, and records the
+    /// entry's offset for the eventual list header.
+    pub fn finish_entry(
+        &mut self,
+        parent: &mut BufferBuilder<'_>,
+        child: BufferBuilder<'_>,
+    ) -> Result<(), BufferError> {
+        if self.entry_offsets.len() >= u32::MAX as usize {
+            return Err(BufferError::ValueTooLarge {
+                name: self.field_name.clone(),
+                len: self.entry_offsets.len() + 1,
+            });
+        }
+        let mut child_bytes = child.finish();
+        parent.pad_to(self.elem_align);
+        let entry_offset = parent.bytes.len();
+        let ptr = u32::try_from(entry_offset).map_err(|_| BufferError::ValueTooLarge {
+            name: self.field_name.clone(),
+            len: entry_offset,
+        })?;
+        relocate_pointers(
+            &mut child_bytes,
+            self.elem_layout,
+            &self.elem_schema.fields,
+            0,
+            ptr,
+        )
+        .map_err(|reason| BufferError::MalformedPayload {
+            name: self.field_name.clone(),
+            reason,
+        })?;
+        parent.bytes.extend_from_slice(&child_bytes);
+        self.entry_offsets.push(ptr);
+        Ok(())
+    }
+}
+
 /// Rebase every pointer-indirect slot inside `bytes` so the offsets
 /// are valid once the whole buffer is pasted at `paste_base` of a
 /// parent buffer. `record_base` is the byte offset of the record's
@@ -504,18 +920,93 @@ fn relocate_pointers(
         // grand-child's String slot would fall off the parent buffer
         // by `paste_base` bytes.
         if let Some(field) = fields.iter().find(|f| f.name == fo.name) {
-            if let TypeRepr::Schema { schema } = &field.ty {
-                let sub_layout = SchemaLayout::offsets_for(schema)
-                    .map_err(|_| "nested schema layout failed during relocation")?;
-                relocate_pointers(
-                    bytes,
-                    &sub_layout,
-                    &schema.fields,
-                    original as usize,
-                    paste_base,
-                )?;
+            match &field.ty {
+                TypeRepr::Schema { schema } => {
+                    let sub_layout = SchemaLayout::offsets_for(schema)
+                        .map_err(|_| "nested schema layout failed during relocation")?;
+                    relocate_pointers(
+                        bytes,
+                        &sub_layout,
+                        &schema.fields,
+                        original as usize,
+                        paste_base,
+                    )?;
+                }
+                TypeRepr::List { element } => {
+                    // Phase 10-c: `List<String>` / `List<Schema>` payloads
+                    // are pointer arrays whose entries also reference
+                    // tail-area records. Each entry needs `+ paste_base`
+                    // so the reader can still resolve through them.
+                    // `List<Int>` / `List<Float>` / `List<Bool>` are
+                    // inline-fixed and need no per-element rebase.
+                    if let Some(ListElementKind::PointerArray { .. }) = fo.list_element {
+                        relocate_list_pointer_array(
+                            bytes,
+                            original as usize,
+                            element.as_ref(),
+                            paste_base,
+                        )?;
+                    }
+                }
+                _ => {}
             }
         }
+    }
+    Ok(())
+}
+
+/// Rebase every entry of a `List<String>` / `List<Schema>` pointer
+/// array. `record_start` is the byte offset of the list's tail record
+/// (the `[len: u32][off_0: u32]...` header). Walks the `len` entries,
+/// adds `paste_base` to each, and — for Schema element types — recurses
+/// into the per-element sub-record so its own pointer slots are
+/// rebased too.
+fn relocate_list_pointer_array(
+    bytes: &mut [u8],
+    record_start: usize,
+    element: &TypeRepr,
+    paste_base: u32,
+) -> Result<(), &'static str> {
+    if record_start
+        .checked_add(4)
+        .map(|end| end > bytes.len())
+        .unwrap_or(true)
+    {
+        return Err("list length prefix exceeds buffer end");
+    }
+    let mut len_buf = [0u8; 4];
+    len_buf.copy_from_slice(&bytes[record_start..record_start + 4]);
+    let count = u32::from_le_bytes(len_buf) as usize;
+    let mut cursor = record_start + 4;
+    let sub_layout_cached = match element {
+        TypeRepr::Schema { schema } => Some((
+            SchemaLayout::offsets_for(schema)
+                .map_err(|_| "nested list schema layout failed during relocation")?,
+            schema.fields.clone(),
+        )),
+        _ => None,
+    };
+    for _ in 0..count {
+        if cursor
+            .checked_add(4)
+            .map(|end| end > bytes.len())
+            .unwrap_or(true)
+        {
+            return Err("list pointer array entry exceeds buffer end");
+        }
+        let mut entry_buf = [0u8; 4];
+        entry_buf.copy_from_slice(&bytes[cursor..cursor + 4]);
+        let original = u32::from_le_bytes(entry_buf);
+        let relocated = original
+            .checked_add(paste_base)
+            .ok_or("relocated list-entry pointer overflows u32")?;
+        bytes[cursor..cursor + 4].copy_from_slice(&relocated.to_le_bytes());
+        // Recurse into Schema entries so their own pointer-indirect
+        // slots (e.g. an inner String) get rebased.
+        if let Some((sub_layout, sub_fields)) = &sub_layout_cached {
+            relocate_pointers(bytes, sub_layout, sub_fields, original as usize, paste_base)?;
+        }
+        cursor += 4;
     }
     Ok(())
 }
@@ -530,7 +1021,7 @@ fn relocate_pointers(
 #[derive(Debug)]
 pub struct BufferReader<'a> {
     layout: &'a OffsetTable,
-    field_index: Vec<(String, TypeRepr, usize, usize, FieldKind)>,
+    field_index: Vec<FieldEntry>,
     bytes: &'a [u8],
 }
 
@@ -558,7 +1049,14 @@ impl<'a> BufferReader<'a> {
                 fields
                     .iter()
                     .find(|f| f.name == fo.name)
-                    .map(|f| (fo.name.clone(), f.ty.clone(), fo.offset, fo.size, fo.kind))
+                    .map(|f| FieldEntry {
+                        name: fo.name.clone(),
+                        ty: f.ty.clone(),
+                        offset: fo.offset,
+                        size: fo.size,
+                        kind: fo.kind,
+                        list_element: fo.list_element,
+                    })
             })
             .collect();
         Ok(Self {
@@ -683,6 +1181,274 @@ impl<'a> BufferReader<'a> {
         Ok(out)
     }
 
+    /// Read a `List<Float>` from `field_name`. Tail layout mirrors
+    /// `List<Int>` — `[len: u32][pad to 8][f64 elements]`.
+    pub fn read_list_float(&self, field_name: &str) -> Result<Vec<f64>, BufferError> {
+        let entry = self.find_entry(field_name)?;
+        let elem = match &entry.ty {
+            TypeRepr::List { element } if matches!(element.as_ref(), TypeRepr::Float) => {
+                element.as_ref()
+            }
+            _ => {
+                return Err(BufferError::TypeMismatch {
+                    name: field_name.to_string(),
+                    declared: type_label(&entry.ty),
+                    requested: "List<Float>",
+                });
+            }
+        };
+        let _ = elem;
+        let FieldKind::PointerIndirect { tail_alignment } = entry.kind else {
+            return Err(BufferError::MalformedPayload {
+                name: field_name.to_string(),
+                reason: "expected pointer-indirect kind",
+            });
+        };
+        let (count, payload_start) =
+            self.decode_pointer_header(field_name, entry.offset, tail_alignment)?;
+        let byte_len = count
+            .checked_mul(8)
+            .ok_or_else(|| BufferError::MalformedPayload {
+                name: field_name.to_string(),
+                reason: "byte length overflows usize",
+            })?;
+        let payload_end =
+            payload_start
+                .checked_add(byte_len)
+                .ok_or_else(|| BufferError::MalformedPayload {
+                    name: field_name.to_string(),
+                    reason: "payload end overflows usize",
+                })?;
+        if payload_end > self.bytes.len() {
+            return Err(BufferError::MalformedPayload {
+                name: field_name.to_string(),
+                reason: "payload exceeds buffer end",
+            });
+        }
+        let mut out = Vec::with_capacity(count);
+        let mut cursor = payload_start;
+        for _ in 0..count {
+            let mut buf = [0u8; 8];
+            buf.copy_from_slice(&self.bytes[cursor..cursor + 8]);
+            out.push(f64::from_le_bytes(buf));
+            cursor += 8;
+        }
+        Ok(out)
+    }
+
+    /// Read a `List<Bool>` from `field_name`. Tail layout `[len: u32]
+    /// [u8 booleans]`. Non-zero bytes decode as `true` — defensive,
+    /// the writer always emits `0` / `1`.
+    pub fn read_list_bool(&self, field_name: &str) -> Result<Vec<bool>, BufferError> {
+        let entry = self.find_entry(field_name)?;
+        match &entry.ty {
+            TypeRepr::List { element } if matches!(element.as_ref(), TypeRepr::Bool) => {}
+            _ => {
+                return Err(BufferError::TypeMismatch {
+                    name: field_name.to_string(),
+                    declared: type_label(&entry.ty),
+                    requested: "List<Bool>",
+                });
+            }
+        }
+        if !matches!(entry.kind, FieldKind::PointerIndirect { .. }) {
+            return Err(BufferError::MalformedPayload {
+                name: field_name.to_string(),
+                reason: "expected pointer-indirect kind",
+            });
+        }
+        let (count, payload_start) = self.decode_pointer_header(field_name, entry.offset, 0)?;
+        let payload_end =
+            payload_start
+                .checked_add(count)
+                .ok_or_else(|| BufferError::MalformedPayload {
+                    name: field_name.to_string(),
+                    reason: "payload end overflows usize",
+                })?;
+        if payload_end > self.bytes.len() {
+            return Err(BufferError::MalformedPayload {
+                name: field_name.to_string(),
+                reason: "payload exceeds buffer end",
+            });
+        }
+        let mut out = Vec::with_capacity(count);
+        for i in 0..count {
+            out.push(self.bytes[payload_start + i] != 0);
+        }
+        Ok(out)
+    }
+
+    /// Read a `List<String>` from `field_name`. Walks the pointer
+    /// array, then decodes each per-entry `[len: u32][bytes]` record
+    /// as UTF-8 borrowed from the underlying buffer.
+    pub fn read_list_string(&self, field_name: &str) -> Result<Vec<&'a str>, BufferError> {
+        let entry = self.find_entry(field_name)?;
+        match &entry.ty {
+            TypeRepr::List { element } if matches!(element.as_ref(), TypeRepr::String) => {}
+            _ => {
+                return Err(BufferError::TypeMismatch {
+                    name: field_name.to_string(),
+                    declared: type_label(&entry.ty),
+                    requested: "List<String>",
+                });
+            }
+        }
+        if !matches!(entry.kind, FieldKind::PointerIndirect { .. }) {
+            return Err(BufferError::MalformedPayload {
+                name: field_name.to_string(),
+                reason: "expected pointer-indirect kind",
+            });
+        }
+        // `decode_pointer_header` with `inner_alignment = 0` keeps the
+        // payload start at `header + 4` (no extra pad), which is the
+        // pointer-array start. Each entry is a u32 buffer-relative
+        // offset pointing at a String `[len: u32][bytes]` record.
+        let (count, entries_start) = self.decode_pointer_header(field_name, entry.offset, 0)?;
+        let mut out = Vec::with_capacity(count);
+        for i in 0..count {
+            let cursor = entries_start + i * 4;
+            if cursor + 4 > self.bytes.len() {
+                return Err(BufferError::MalformedPayload {
+                    name: field_name.to_string(),
+                    reason: "list entry pointer exceeds buffer end",
+                });
+            }
+            let mut entry_buf = [0u8; 4];
+            entry_buf.copy_from_slice(&self.bytes[cursor..cursor + 4]);
+            let record_start = u32::from_le_bytes(entry_buf) as usize;
+            if record_start + 4 > self.bytes.len() {
+                return Err(BufferError::MalformedPayload {
+                    name: field_name.to_string(),
+                    reason: "list string len prefix exceeds buffer end",
+                });
+            }
+            let mut len_buf = [0u8; 4];
+            len_buf.copy_from_slice(&self.bytes[record_start..record_start + 4]);
+            let str_len = u32::from_le_bytes(len_buf) as usize;
+            let payload_start = record_start + 4;
+            let payload_end = payload_start.checked_add(str_len).ok_or_else(|| {
+                BufferError::MalformedPayload {
+                    name: field_name.to_string(),
+                    reason: "list string payload end overflows usize",
+                }
+            })?;
+            if payload_end > self.bytes.len() {
+                return Err(BufferError::MalformedPayload {
+                    name: field_name.to_string(),
+                    reason: "list string payload exceeds buffer end",
+                });
+            }
+            let s = std::str::from_utf8(&self.bytes[payload_start..payload_end]).map_err(|_| {
+                BufferError::MalformedPayload {
+                    name: field_name.to_string(),
+                    reason: "list string payload is not valid utf-8",
+                }
+            })?;
+            out.push(s);
+        }
+        Ok(out)
+    }
+
+    /// Read a `List<Schema>` from `field_name`. Returns a vector of
+    /// [`BufferReader`]s, one per entry, each anchored at the
+    /// matching sub-record's fixed area. The readers share the parent
+    /// buffer slice so subsequent String / Int / Schema reads through
+    /// them resolve back into the same tail area.
+    pub fn read_list_record<'b>(
+        &self,
+        field_name: &str,
+        elem_layout: &'b OffsetTable,
+        elem_schema: &'b Schema,
+    ) -> Result<Vec<BufferReader<'a>>, BufferError>
+    where
+        'b: 'a,
+    {
+        let entry = self.find_entry(field_name)?;
+        match &entry.ty {
+            TypeRepr::List { element } => match element.as_ref() {
+                TypeRepr::Schema { schema } => {
+                    if schema.as_ref() != elem_schema {
+                        return Err(BufferError::TypeMismatch {
+                            name: field_name.to_string(),
+                            declared: type_label(&entry.ty),
+                            requested: "List<Schema>",
+                        });
+                    }
+                }
+                _ => {
+                    return Err(BufferError::TypeMismatch {
+                        name: field_name.to_string(),
+                        declared: type_label(&entry.ty),
+                        requested: "List<Schema>",
+                    });
+                }
+            },
+            _ => {
+                return Err(BufferError::TypeMismatch {
+                    name: field_name.to_string(),
+                    declared: type_label(&entry.ty),
+                    requested: "List<Schema>",
+                });
+            }
+        }
+        if !matches!(entry.kind, FieldKind::PointerIndirect { .. }) {
+            return Err(BufferError::MalformedPayload {
+                name: field_name.to_string(),
+                reason: "expected pointer-indirect kind",
+            });
+        }
+        let (count, entries_start) = self.decode_pointer_header(field_name, entry.offset, 0)?;
+        let mut out: Vec<BufferReader<'a>> = Vec::with_capacity(count);
+        for i in 0..count {
+            let cursor = entries_start + i * 4;
+            if cursor + 4 > self.bytes.len() {
+                return Err(BufferError::MalformedPayload {
+                    name: field_name.to_string(),
+                    reason: "list entry pointer exceeds buffer end",
+                });
+            }
+            let mut entry_buf = [0u8; 4];
+            entry_buf.copy_from_slice(&self.bytes[cursor..cursor + 4]);
+            let sub_base = u32::from_le_bytes(entry_buf) as usize;
+            let sub_end = sub_base.checked_add(elem_layout.root_size).ok_or_else(|| {
+                BufferError::MalformedPayload {
+                    name: field_name.to_string(),
+                    reason: "list sub-record end overflows usize",
+                }
+            })?;
+            if sub_end > self.bytes.len() {
+                return Err(BufferError::MalformedPayload {
+                    name: field_name.to_string(),
+                    reason: "list sub-record exceeds buffer end",
+                });
+            }
+            let field_index = elem_layout
+                .fields
+                .iter()
+                .filter_map(|fo| {
+                    elem_schema
+                        .fields
+                        .iter()
+                        .find(|f| f.name == fo.name)
+                        .map(|f| FieldEntry {
+                            name: fo.name.clone(),
+                            ty: f.ty.clone(),
+                            offset: sub_base + fo.offset,
+                            size: fo.size,
+                            kind: fo.kind,
+                            list_element: fo.list_element,
+                        })
+                })
+                .collect();
+            out.push(BufferReader {
+                layout: elem_layout,
+                field_index,
+                bytes: self.bytes,
+            });
+        }
+        Ok(out)
+    }
+
     /// Decode the buffer-relative pointer slot for a nested branded
     /// dict field. Returns a fresh [`BufferReader`] anchored at the
     /// sub-record's fixed-area base, sharing the parent's underlying
@@ -715,24 +1481,24 @@ impl<'a> BufferReader<'a> {
         let entry = self
             .field_index
             .iter()
-            .find(|(name, _, _, _, _)| name == field_name)
+            .find(|e| e.name == field_name)
             .ok_or_else(|| BufferError::UnknownField {
                 name: field_name.to_string(),
             })?;
-        if !matches!(entry.1, TypeRepr::Schema { .. }) {
+        if !matches!(entry.ty, TypeRepr::Schema { .. }) {
             return Err(BufferError::TypeMismatch {
                 name: field_name.to_string(),
-                declared: type_label(&entry.1),
+                declared: type_label(&entry.ty),
                 requested: "Schema",
             });
         }
-        if !matches!(entry.4, FieldKind::PointerIndirect { .. }) {
+        if !matches!(entry.kind, FieldKind::PointerIndirect { .. }) {
             return Err(BufferError::MalformedPayload {
                 name: field_name.to_string(),
                 reason: "expected pointer-indirect kind",
             });
         }
-        let ptr_offset = entry.2;
+        let ptr_offset = entry.offset;
         if ptr_offset
             .checked_add(4)
             .map(|end| end > self.bytes.len())
@@ -769,15 +1535,17 @@ impl<'a> BufferReader<'a> {
             .fields
             .iter()
             .filter_map(|fo| {
-                sub_fields.iter().find(|f| f.name == fo.name).map(|f| {
-                    (
-                        fo.name.clone(),
-                        f.ty.clone(),
-                        sub_base + fo.offset,
-                        fo.size,
-                        fo.kind,
-                    )
-                })
+                sub_fields
+                    .iter()
+                    .find(|f| f.name == fo.name)
+                    .map(|f| FieldEntry {
+                        name: fo.name.clone(),
+                        ty: f.ty.clone(),
+                        offset: sub_base + fo.offset,
+                        size: fo.size,
+                        kind: fo.kind,
+                        list_element: fo.list_element,
+                    })
             })
             .collect();
         Ok(BufferReader {
@@ -851,18 +1619,29 @@ impl<'a> BufferReader<'a> {
         let entry = self
             .field_index
             .iter()
-            .find(|(name, _, _, _, _)| name == field_name)
+            .find(|e| e.name == field_name)
             .ok_or_else(|| BufferError::UnknownField {
                 name: field_name.to_string(),
             })?;
-        if !type_matches(&entry.1, expected) {
+        if !type_matches(&entry.ty, expected) {
             return Err(BufferError::TypeMismatch {
                 name: field_name.to_string(),
-                declared: type_label(&entry.1),
+                declared: type_label(&entry.ty),
                 requested: requested_label,
             });
         }
-        Ok((entry.2, entry.3, entry.4))
+        Ok((entry.offset, entry.size, entry.kind))
+    }
+
+    /// Find an entry by name. Used by the list readers when they need
+    /// the carried `list_element` sidecar alongside the offset.
+    fn find_entry(&self, field_name: &str) -> Result<&FieldEntry, BufferError> {
+        self.field_index
+            .iter()
+            .find(|e| e.name == field_name)
+            .ok_or_else(|| BufferError::UnknownField {
+                name: field_name.to_string(),
+            })
     }
 
     /// Read-only access to the layout this reader walks.
@@ -884,7 +1663,14 @@ fn type_matches(declared: &TypeRepr, requested: &TypeRepr) -> bool {
         | (TypeRepr::Null, TypeRepr::Null)
         | (TypeRepr::String, TypeRepr::String) => true,
         (TypeRepr::List { element: d }, TypeRepr::List { element: r }) => {
-            matches!((d.as_ref(), r.as_ref()), (TypeRepr::Int, TypeRepr::Int))
+            match (d.as_ref(), r.as_ref()) {
+                (TypeRepr::Int, TypeRepr::Int)
+                | (TypeRepr::Float, TypeRepr::Float)
+                | (TypeRepr::Bool, TypeRepr::Bool)
+                | (TypeRepr::String, TypeRepr::String) => true,
+                (TypeRepr::Schema { schema: ds }, TypeRepr::Schema { schema: rs }) => ds == rs,
+                _ => false,
+            }
         }
         (TypeRepr::Schema { schema: d }, TypeRepr::Schema { schema: r }) => d == r,
         _ => false,
@@ -1516,6 +2302,191 @@ mod tests {
             BufferError::TypeMismatch {
                 declared: "Int",
                 requested: "Bool",
+                ..
+            }
+        ));
+    }
+
+    // =================================================================
+    // Phase 10-c: List<Float / Bool / String / Schema> roundtrips.
+    // =================================================================
+
+    fn list_schema(name: &str, elem: TypeRepr) -> Schema {
+        Schema {
+            name: "Wrap".into(),
+            generics: vec![],
+            fields: vec![field(
+                name,
+                TypeRepr::List {
+                    element: Box::new(elem),
+                },
+            )],
+        }
+    }
+
+    #[test]
+    fn write_list_float_then_read_back_roundtrips() {
+        let schema = list_schema("xs", TypeRepr::Float);
+        let layout = SchemaLayout::offsets_for(&schema).expect("layout");
+        let mut b = BufferBuilder::new(&layout, &schema.fields);
+        b.write_list_float("xs", &[1.5, -2.25, 3.125])
+            .expect("write");
+        let bytes = b.finish();
+        let r = BufferReader::new(&layout, &schema.fields, &bytes).expect("reader");
+        assert_eq!(
+            r.read_list_float("xs").expect("read"),
+            vec![1.5, -2.25, 3.125]
+        );
+    }
+
+    #[test]
+    fn write_list_bool_then_read_back_roundtrips() {
+        let schema = list_schema("xs", TypeRepr::Bool);
+        let layout = SchemaLayout::offsets_for(&schema).expect("layout");
+        let mut b = BufferBuilder::new(&layout, &schema.fields);
+        b.write_list_bool("xs", &[true, false, true, true])
+            .expect("write");
+        let bytes = b.finish();
+        let r = BufferReader::new(&layout, &schema.fields, &bytes).expect("reader");
+        assert_eq!(
+            r.read_list_bool("xs").expect("read"),
+            vec![true, false, true, true]
+        );
+    }
+
+    #[test]
+    fn empty_list_bool_roundtrips() {
+        // Zero-element payload still needs a valid `[len=0]` prefix
+        // the reader can walk through without OOB checks tripping.
+        let schema = list_schema("xs", TypeRepr::Bool);
+        let layout = SchemaLayout::offsets_for(&schema).expect("layout");
+        let mut b = BufferBuilder::new(&layout, &schema.fields);
+        b.write_list_bool("xs", &[]).expect("write");
+        let bytes = b.finish();
+        let r = BufferReader::new(&layout, &schema.fields, &bytes).expect("reader");
+        assert!(r.read_list_bool("xs").expect("read").is_empty());
+    }
+
+    #[test]
+    fn write_list_string_then_read_back_roundtrips() {
+        let schema = list_schema("xs", TypeRepr::String);
+        let layout = SchemaLayout::offsets_for(&schema).expect("layout");
+        let mut b = BufferBuilder::new(&layout, &schema.fields);
+        b.write_list_string("xs", &["alpha", "beta", "", "gamma"])
+            .expect("write");
+        let bytes = b.finish();
+        let r = BufferReader::new(&layout, &schema.fields, &bytes).expect("reader");
+        assert_eq!(
+            r.read_list_string("xs").expect("read"),
+            vec!["alpha", "beta", "", "gamma"]
+        );
+    }
+
+    #[test]
+    fn empty_list_string_roundtrips() {
+        let schema = list_schema("xs", TypeRepr::String);
+        let layout = SchemaLayout::offsets_for(&schema).expect("layout");
+        let mut b = BufferBuilder::new(&layout, &schema.fields);
+        b.write_list_string::<&str>("xs", &[]).expect("write");
+        let bytes = b.finish();
+        let r = BufferReader::new(&layout, &schema.fields, &bytes).expect("reader");
+        assert!(r.read_list_string("xs").expect("read").is_empty());
+    }
+
+    #[test]
+    fn mixed_record_and_list_string_roundtrip() {
+        // Phase 10-c: a top-level Int + a List<String> share the tail
+        // area. Verifies the cursor advances correctly across heterogeneous
+        // tail appends.
+        let schema = Schema {
+            name: "Mixed".into(),
+            generics: vec![],
+            fields: vec![
+                field("n", TypeRepr::Int),
+                field(
+                    "xs",
+                    TypeRepr::List {
+                        element: Box::new(TypeRepr::String),
+                    },
+                ),
+                field("name", TypeRepr::String),
+            ],
+        };
+        let layout = SchemaLayout::offsets_for(&schema).expect("layout");
+        let mut b = BufferBuilder::new(&layout, &schema.fields);
+        b.write_int("n", 7).expect("write n");
+        b.write_list_string("xs", &["ada", "bob"])
+            .expect("write xs");
+        b.write_string("name", "ada").expect("write name");
+        let bytes = b.finish();
+        let r = BufferReader::new(&layout, &schema.fields, &bytes).expect("reader");
+        assert_eq!(r.read_int("n").expect("n"), 7);
+        assert_eq!(r.read_list_string("xs").expect("xs"), vec!["ada", "bob"]);
+        assert_eq!(r.read_string("name").expect("name"), "ada");
+    }
+
+    #[test]
+    fn write_list_record_with_nested_string_roundtrip() {
+        // `List<User>` where User { String name, Int age }. Verifies
+        // both the per-entry pointer array and the inner string
+        // payload's relocation through the parent buffer.
+        let user_schema = Schema {
+            name: "User".into(),
+            generics: vec![],
+            fields: vec![field("name", TypeRepr::String), field("age", TypeRepr::Int)],
+        };
+        let outer = Schema {
+            name: "Group".into(),
+            generics: vec![],
+            fields: vec![field(
+                "users",
+                TypeRepr::List {
+                    element: Box::new(TypeRepr::Schema {
+                        schema: Box::new(user_schema.clone()),
+                    }),
+                },
+            )],
+        };
+        let outer_layout = SchemaLayout::offsets_for(&outer).expect("outer layout");
+        let user_layout = SchemaLayout::offsets_for(&user_schema).expect("user layout");
+
+        let mut b = BufferBuilder::new(&outer_layout, &outer.fields);
+        let users_data: Vec<(&str, i64)> = vec![("ada", 36), ("bob", 41), ("zoe", 19)];
+        let mut writer = b
+            .list_record_writer("users", &user_layout, &user_schema)
+            .expect("list_record_writer");
+        for (name, age) in &users_data {
+            let mut child = writer.start_entry();
+            child.write_string("name", name).expect("write name");
+            child.write_int("age", *age).expect("write age");
+            writer.finish_entry(&mut b, child).expect("finish entry");
+        }
+        b.finish_list_record(writer).expect("finish list");
+        let bytes = b.finish();
+
+        let r = BufferReader::new(&outer_layout, &outer.fields, &bytes).expect("reader");
+        let entries = r
+            .read_list_record("users", &user_layout, &user_schema)
+            .expect("read list");
+        assert_eq!(entries.len(), 3);
+        for (sub, (name, age)) in entries.iter().zip(users_data.iter()) {
+            assert_eq!(sub.read_string("name").expect("name"), *name);
+            assert_eq!(sub.read_int("age").expect("age"), *age);
+        }
+    }
+
+    #[test]
+    fn list_string_type_mismatch_rejected() {
+        let schema = list_schema("xs", TypeRepr::Int);
+        let layout = SchemaLayout::offsets_for(&schema).expect("layout");
+        let mut b = BufferBuilder::new(&layout, &schema.fields);
+        let err = b
+            .write_list_string("xs", &["nope"])
+            .expect_err("must reject");
+        assert!(matches!(
+            err,
+            BufferError::TypeMismatch {
+                requested: "List<String>",
                 ..
             }
         ));
