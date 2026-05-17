@@ -4531,6 +4531,24 @@ impl WasmModule {
                 // so the host SDK doesn't need to special-case it.
                 RuntimeError::NumericOverflow(range.unwrap_or_default())
             }
+            Some(wasmtime::Trap::OutOfFuel) => {
+                // Phase a-1: wasmtime drains the per-store fuel
+                // budget the host stamped via `Store::set_fuel`;
+                // when it hits zero the runtime injects an
+                // `OutOfFuel` trap on the next fuel-consuming
+                // instruction. Route through the placeholder enum
+                // variant Phase 7 reserved for this exact case so
+                // a single host code path handles "step / fuel
+                // exhausted" without needing to know which backend
+                // ran the budget.
+                //
+                // `range` is best-effort: the trap pc lands on the
+                // instruction that *would* have run had fuel been
+                // available, so a srcmap hit is the common case
+                // when the budget runs out inside compiled user
+                // code; stdlib / synthetic frames surface as `None`.
+                RuntimeError::WasmStepLimitExceeded { range }
+            }
             Some(wasmtime::Trap::UnreachableCodeReached) => {
                 // The interesting path: look the pc up in the
                 // uctab and dispatch on the recorded `UnreachableKind`.
