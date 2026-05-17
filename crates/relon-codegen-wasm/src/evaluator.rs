@@ -31,12 +31,27 @@ use relon_eval_api::schema_canonical::{Field, Schema, TypeRepr};
 use relon_eval_api::{Capabilities, Evaluator, RuntimeError, Scope, Thunk, Value};
 use relon_parser::Node;
 use std::collections::{BTreeMap, HashMap};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use thiserror::Error;
 use wasmtime::{
     Engine, Global, GlobalType, Linker, Memory, Module as WtModule, Mutability, Store, TypedFunc,
     Val, ValType,
 };
+
+/// Process-wide [`wasmtime::Engine`] used by [`WasmAotEvaluator::
+/// from_source`] and [`WasmAotEvaluator::from_bytes`] — i.e. the
+/// non-cache paths. Phase 9.c-2: avoids re-paying the ~50-100 μs
+/// `Engine::default()` setup on every evaluator construction.
+///
+/// `wasmtime::Engine` clones are cheap `Arc` bumps and the engine is
+/// `Send + Sync`, so sharing one across threads is safe. Hosts that
+/// need a custom `wasmtime::Config` should drive the cache path
+/// (`AotCache::open_with_engine`) instead — touching the global engine
+/// would surprise unrelated callers that also use the default path.
+fn shared_default_engine() -> &'static Engine {
+    static SHARED: OnceLock<Engine> = OnceLock::new();
+    SHARED.get_or_init(Engine::default)
+}
 
 /// Default `out_cap` (in bytes) when a host doesn't override it.
 /// 4 KiB matches the codegen's `DATA_SECTION_BASE` and is plenty for
@@ -239,7 +254,12 @@ impl WasmAotEvaluator {
                 // triple, so we can hand the bytes straight to
                 // `Module::deserialize` and skip the JIT entirely.
                 let native = cache.load_native(source_hash).map_err(cache_err)?;
-                let engine = Engine::default();
+                // Phase 9.c-2: borrow the cache-owned engine instead
+                // of paying `Engine::default()` again. Engine clone is
+                // a cheap Arc bump; the actual cranelift / target ISA
+                // state stays shared. This is the change that pushes
+                // cached cold start under 100 μs.
+                let engine = cache.engine().clone();
                 // Three-way decision tree:
                 //   * native blob present + deserialise OK  → no JIT, no write-back.
                 //   * native blob present + deserialise Err → silently
@@ -314,7 +334,15 @@ impl WasmAotEvaluator {
                 },
             )
             .map_err(cache_err)?;
-        let evaluator = Self::from_bytes(bytes, main_schema, return_schema)?;
+        // Build the evaluator off the cache's shared engine so the
+        // miss path matches the hit path's engine identity. Engine
+        // clone is an Arc bump — cheap, no cranelift re-setup.
+        let evaluator = Self::from_bytes_with_engine(
+            cache.engine().clone(),
+            bytes,
+            main_schema,
+            return_schema,
+        )?;
         // Best-effort: persist the cranelift-emitted native code so the
         // *next* cold start of this same source skips the JIT entirely
         // through `Module::deserialize`. Write failures are silent
@@ -403,7 +431,33 @@ impl WasmAotEvaluator {
     /// Build an evaluator from already-emitted wasm bytes plus the
     /// canonical schemas they were compiled against. Useful when a
     /// host caches the compiled output and re-loads it from disk.
+    ///
+    /// Phase 9.c-2: borrows the process-wide shared
+    /// [`wasmtime::Engine`] returned by `shared_default_engine` so
+    /// repeated `from_bytes` (or `from_source`) calls don't pay the
+    /// `Engine::default()` setup cost more than once. Hosts that need
+    /// a custom engine should go through
+    /// [`Self::from_bytes_with_engine`] / the [`AotCache`] surface.
     pub fn from_bytes(
+        bytes: Vec<u8>,
+        main_schema: Schema,
+        return_schema: Schema,
+    ) -> Result<Self, BuildError> {
+        Self::from_bytes_with_engine(
+            shared_default_engine().clone(),
+            bytes,
+            main_schema,
+            return_schema,
+        )
+    }
+
+    /// Build an evaluator from already-emitted wasm bytes against a
+    /// caller-supplied [`wasmtime::Engine`]. Cache-aware constructors
+    /// route through here so every evaluator built off the same
+    /// [`AotCache`] shares a single engine — the change that lifts
+    /// cached cold start under 100 μs.
+    pub fn from_bytes_with_engine(
+        engine: Engine,
         bytes: Vec<u8>,
         main_schema: Schema,
         return_schema: Schema,
@@ -418,7 +472,6 @@ impl WasmAotEvaluator {
 
         let module =
             WasmModule::from_bytes(bytes).map_err(|e| BuildError::WasmLoadError(e.to_string()))?;
-        let engine = Engine::default();
         let compiled = WtModule::new(&engine, module.bytes())
             .map_err(|e| BuildError::WasmInstantiateError(e.to_string()))?;
 
@@ -1126,5 +1179,69 @@ mod tests {
         assert_eq!(align_up(1, 8), 8);
         assert_eq!(align_up(7, 8), 8);
         assert_eq!(align_up(9, 8), 16);
+    }
+
+    /// Phase 9.c-2: two evaluators built off the same [`AotCache`]
+    /// must share a single wasmtime [`Engine`]. Catching engine drift
+    /// here is the lightweight guard that lets us drop the per-call
+    /// `Engine::default()` from the cached cold-start budget — if a
+    /// future refactor accidentally re-introduces a per-evaluator
+    /// engine the bench numbers regress silently, but `Engine::same`
+    /// gives us a deterministic test signal.
+    #[test]
+    fn cache_engine_is_shared_across_evaluators() {
+        use crate::cache::AotCache;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        // Distinct temp dir per run so concurrent test invocations do
+        // not stomp each other's cache state.
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let pid = std::process::id();
+        let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let mut dir = std::env::temp_dir();
+        dir.push(format!(
+            "relon-aot-engine-pool-test-{pid}-{nanos}-{counter}"
+        ));
+        let cache = AotCache::open(&dir).expect("open cache");
+
+        let src = "#main(Int x, Int y) -> Int\nx + y";
+        let a = WasmAotEvaluator::from_source_with_cache(src, &cache)
+            .expect("first build (miss → store)");
+        let b = WasmAotEvaluator::from_source_with_cache(src, &cache)
+            .expect("second build (hit + deserialize)");
+
+        assert!(
+            Engine::same(&a.engine, &b.engine),
+            "evaluators built off the same cache must share an Engine"
+        );
+        assert!(
+            Engine::same(cache.engine(), &a.engine),
+            "evaluator engine must match cache.engine()"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Two `from_source` calls (no cache) must reuse the
+    /// process-wide [`shared_default_engine`] so the non-cache path
+    /// also avoids paying `Engine::default()` repeatedly.
+    #[test]
+    fn shared_engine_reused_across_from_source() {
+        let src = "#main(Int x) -> Int\nx + 1";
+        let a = WasmAotEvaluator::from_source(src).expect("first build");
+        let b = WasmAotEvaluator::from_source(src).expect("second build");
+        assert!(
+            Engine::same(&a.engine, &b.engine),
+            "from_source must reuse the process-wide shared Engine"
+        );
+        assert!(
+            Engine::same(shared_default_engine(), &a.engine),
+            "from_source engine must match shared_default_engine()"
+        );
     }
 }
