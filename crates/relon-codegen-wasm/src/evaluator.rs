@@ -33,7 +33,43 @@ use relon_parser::Node;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, OnceLock};
 use thiserror::Error;
-use wasmtime::{Engine, InstancePre, Linker, Memory, Module as WtModule, Store, TypedFunc, Val};
+use wasmtime::{
+    Config, Engine, InstancePre, Linker, Memory, Module as WtModule, Store, TypedFunc, Val,
+};
+
+/// Build the default [`wasmtime::Config`] used by every engine this
+/// crate constructs internally. The single switch the host cares about
+/// at this layer is fuel consumption: v3+ a-1 wires
+/// [`WasmAotEvaluator::with_fuel_limit`] so a host can cap how much
+/// wasm work a single `run_main` is allowed to perform. Fuel is opt-in
+/// per evaluator (default budget `0` = unlimited, see
+/// [`WasmAotEvaluator::fuel_limit`]) but the engine has to be primed
+/// with `consume_fuel(true)` at construction time — wasmtime injects
+/// the per-instruction fuel-decrement bookkeeping at compile time, so
+/// flipping the bit later would be a no-op for already-compiled
+/// modules.
+///
+/// Keeping the bookkeeping on unconditionally costs a single extra
+/// load+subtract per wasm instruction. The Phase a-1 bench shows the
+/// hot-path overhead is well under one percent for the warm-invoke
+/// scenarios; preserving a single engine-shape across "limit / no
+/// limit" callers is the simpler contract.
+fn make_fuel_aware_config() -> Config {
+    let mut cfg = Config::default();
+    cfg.consume_fuel(true);
+    cfg
+}
+
+/// Build a fresh [`wasmtime::Engine`] with fuel consumption enabled.
+/// Used by [`AotCache::open`] and [`shared_default_engine`] so every
+/// evaluator the host constructs through the public surface has the
+/// same fuel-aware engine shape.
+pub(crate) fn make_fuel_aware_engine() -> Engine {
+    Engine::new(&make_fuel_aware_config()).expect(
+        "wasmtime engine with fuel consumption enabled must construct; \
+         default Config is always valid",
+    )
+}
 
 /// Process-wide [`wasmtime::Engine`] used by [`WasmAotEvaluator::
 /// from_source`] and [`WasmAotEvaluator::from_bytes`] — i.e. the
@@ -45,9 +81,14 @@ use wasmtime::{Engine, InstancePre, Linker, Memory, Module as WtModule, Store, T
 /// need a custom `wasmtime::Config` should drive the cache path
 /// (`AotCache::open_with_engine`) instead — touching the global engine
 /// would surprise unrelated callers that also use the default path.
+///
+/// Phase a-1: built with [`make_fuel_aware_engine`] so the
+/// `with_fuel_limit` switch can take effect without rebuilding the
+/// engine (wasmtime would otherwise refuse `set_fuel` on a non-fuel
+/// engine).
 fn shared_default_engine() -> &'static Engine {
     static SHARED: OnceLock<Engine> = OnceLock::new();
-    SHARED.get_or_init(Engine::default)
+    SHARED.get_or_init(make_fuel_aware_engine)
 }
 
 /// Default `out_cap` (in bytes) when a host doesn't override it.

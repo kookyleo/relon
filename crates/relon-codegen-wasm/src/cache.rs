@@ -210,8 +210,15 @@ impl AotCache {
     ///
     /// Pairs the cache with a default-configured [`wasmtime::Engine`].
     /// Use [`Self::with_engine`] to supply a host-tuned engine.
+    ///
+    /// Phase a-1: the default engine has `Config::consume_fuel(true)`
+    /// enabled so [`crate::WasmAotEvaluator::with_fuel_limit`] can
+    /// budget per-call step counts. Hosts that explicitly want a
+    /// non-fuel engine should construct one with
+    /// [`Self::open_with_engine`] (note that `set_fuel` then errors out
+    /// — `with_fuel_limit` must stay at the default `0`).
     pub fn open(dir: impl AsRef<Path>) -> Result<Self, CacheError> {
-        Self::open_with_engine(dir, Engine::default())
+        Self::open_with_engine(dir, crate::evaluator::make_fuel_aware_engine())
     }
 
     /// Open (creating if absent) the cache directory at `dir`, binding
