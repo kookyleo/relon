@@ -6,9 +6,9 @@ use relon_analyzer::{
     analyze, analyze_entry, AnalyzedTree, Diagnostic, LoadError, LoadedModule, ModuleLoader,
     WorkspaceDiagnostic,
 };
-use relon_evaluator::module::{FilesystemModuleResolver, ModuleResolver, StdModuleResolver};
 #[cfg(not(target_arch = "wasm32"))]
 use relon_evaluator::module::RemoteHttpResolver;
+use relon_evaluator::module::{FilesystemModuleResolver, ModuleResolver, StdModuleResolver};
 use relon_evaluator::{Capabilities, Context, RuntimeError, Scope, TreeWalkEvaluator, Value};
 use relon_parser::parse_document;
 use relon_parser::TokenRange;
@@ -389,8 +389,8 @@ impl ModuleLoader for ResolverChainLoader {
                 Err(RuntimeError::ModuleNotFound(_, _)) => {
                     return Err(LoadError::NotFound);
                 }
-                Err(RuntimeError::RemoteImportDenied { reason, .. }) => {
-                    return Err(LoadError::AccessDenied(reason));
+                Err(RuntimeError::RemoteImportDenied { payload, .. }) => {
+                    return Err(LoadError::AccessDenied(payload.reason));
                 }
                 Err(other) => {
                     return Err(LoadError::Other(other.to_string()));

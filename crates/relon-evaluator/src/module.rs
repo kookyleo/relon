@@ -190,9 +190,11 @@ impl ModuleResolver for FilesystemModuleResolver {
     }
 }
 
-/// v3+ a-3: HTTPS fetch resolver for `#import "https://..."`. Gated to
-/// non-wasm32 targets so the browser playground build of `relon-wasm`
-/// does not link `ureq` (no sockets / TLS / DNS in `wasm32-unknown-unknown`).
+/// v3+ a-3 remote `#import` machinery.
+///
+/// HTTPS fetch resolver for `#import "https://..."`. Gated to non-wasm32
+/// targets so the browser playground build of `relon-wasm` does not link
+/// `ureq` (no sockets / TLS / DNS in `wasm32-unknown-unknown`).
 ///
 /// Mount it manually on hosts that want remote modules; the default
 /// chains (`StdModuleResolver`, sandboxed / trusted filesystem) ignore
@@ -202,18 +204,17 @@ impl ModuleResolver for FilesystemModuleResolver {
 /// `http://` is rejected unless the host explicitly opted in via
 /// [`RemoteHttpResolver::allow_insecure`], so the default posture refuses
 /// plaintext code fetches over the wire.
+///
+/// Internally the module wraps a sync `ureq` agent plus a local on-disk
+/// cache (`~/.cache/relon/remote_imports/<sha256_hex>.relon`,
+/// configurable by the host). Cache entries carry an mtime-based TTL so
+/// repeated runs of the same script do not hit the network on every
+/// cold start. The TTL defaults to 24h and is host-overridable.
 #[cfg(not(target_arch = "wasm32"))]
 mod remote_http {
-    //! v3+ a-3 remote `#import` machinery.
-    //!
-    //! The module wraps a sync `ureq` agent plus a local on-disk cache
-    //! (`~/.cache/relon/remote_imports/<sha256_hex>.relon`, configurable
-    //! by the host). Cache entries carry an mtime-based TTL so repeated
-    //! runs of the same script do not hit the network on every cold
-    //! start. The TTL defaults to 24h and is host-overridable.
 
     use super::{ModuleResolver, ModuleSource};
-    use relon_eval_api::error::RuntimeError;
+    use relon_eval_api::error::{RemoteImportDenial, RemoteImportFailure, RuntimeError};
     use relon_eval_api::scope::Scope;
     use relon_parser::TokenRange;
     use sha2::{Digest, Sha256};
@@ -372,27 +373,34 @@ mod remote_http {
                 }
             }
 
-            let response = ureq::get(url).call().map_err(|err| {
-                RuntimeError::RemoteImportFailed {
-                    url: url.to_string(),
-                    cause: err.to_string(),
-                    range,
-                }
-            })?;
+            let response =
+                ureq::get(url)
+                    .call()
+                    .map_err(|err| RuntimeError::RemoteImportFailed {
+                        payload: Box::new(RemoteImportFailure {
+                            url: url.to_string(),
+                            cause: err.to_string(),
+                        }),
+                        range,
+                    })?;
 
             let status = response.status();
             if !status.is_success() {
                 return Err(RuntimeError::RemoteImportFailed {
-                    url: url.to_string(),
-                    cause: format!("HTTP status {}", status.as_u16()),
+                    payload: Box::new(RemoteImportFailure {
+                        url: url.to_string(),
+                        cause: format!("HTTP status {}", status.as_u16()),
+                    }),
                     range,
                 });
             }
 
             let body = response.into_body().read_to_string().map_err(|err| {
                 RuntimeError::RemoteImportFailed {
-                    url: url.to_string(),
-                    cause: format!("body read failed: {err}"),
+                    payload: Box::new(RemoteImportFailure {
+                        url: url.to_string(),
+                        cause: format!("body read failed: {err}"),
+                    }),
                     range,
                 }
             })?;
@@ -424,9 +432,12 @@ mod remote_http {
             }
             if is_http && !self.allow_insecure {
                 return Err(RuntimeError::RemoteImportDenied {
-                    url: path.to_string(),
-                    reason: "plaintext http:// disabled; use https:// or opt in via allow_insecure"
-                        .to_string(),
+                    payload: Box::new(RemoteImportDenial {
+                        url: path.to_string(),
+                        reason:
+                            "plaintext http:// disabled; use https:// or opt in via allow_insecure"
+                                .to_string(),
+                    }),
                     range,
                 });
             }
@@ -530,7 +541,11 @@ mod remote_http {
             let resolver = RemoteHttpResolver::new().without_cache();
             let scope = Arc::new(Scope::default());
             let err = resolver
-                .resolve("http://example.com/foo.relon", &scope, TokenRange::default())
+                .resolve(
+                    "http://example.com/foo.relon",
+                    &scope,
+                    TokenRange::default(),
+                )
                 .unwrap_err();
             assert!(matches!(err, RuntimeError::RemoteImportDenied { .. }));
         }
@@ -586,9 +601,9 @@ mod remote_http {
                 .resolve(&url, &scope, TokenRange::default())
                 .unwrap_err();
             match err {
-                RuntimeError::RemoteImportFailed { url: u, cause, .. } => {
-                    assert_eq!(u, url);
-                    assert!(cause.contains("500"), "cause was {cause}");
+                RuntimeError::RemoteImportFailed { payload, .. } => {
+                    assert_eq!(payload.url, url);
+                    assert!(payload.cause.contains("500"), "cause was {}", payload.cause);
                 }
                 other => panic!("unexpected error variant: {other:?}"),
             }
