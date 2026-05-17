@@ -49,6 +49,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
+use wasmtime::Engine;
 
 /// 4-byte magic prefix identifying a Relon AOT cache meta file. Distinct
 /// from `relon.abi`'s `RLNA` magic so a stray AOT cache file dropped
@@ -181,16 +182,51 @@ pub struct CachedSchemas {
 /// sharding because the source hash already disperses uniformly across
 /// the 16^N keyspace and typical hosts cache fewer than a few hundred
 /// modules.
+///
+/// Phase 9.c-2: the cache also owns a [`wasmtime::Engine`]. wasmtime's
+/// `Engine` is reference-counted internally (clone is a cheap `Arc`
+/// bump), and constructing one runs a non-trivial amount of setup
+/// (Config defaults, cranelift settings, target ISA detection) that
+/// historically dominated the cached cold-start budget at ~50-100 μs
+/// per construction. Folding the engine into the cache lets every
+/// evaluator built through this cache share the same Engine without
+/// adding a separate global. Hosts that want a custom Config can
+/// supply their own engine through [`Self::with_engine`].
 #[derive(Debug, Clone)]
 pub struct AotCache {
     dir: PathBuf,
+    /// Shared wasmtime compilation engine. Cloning an `Engine` is a
+    /// cheap `Arc::clone` — the actual cranelift / Config state lives
+    /// in a single shared allocation. Held by value because every
+    /// `Engine::clone` callsite needs an `Engine`, not an `&Engine`,
+    /// to feed `wasmtime::Module::new` / `Store::new`.
+    engine: Engine,
 }
 
 impl AotCache {
     /// Open (creating if absent) the cache directory at `dir`. Fails
     /// when the path exists but is not a directory, or when the host
     /// cannot create the directory (permissions, parent missing, …).
+    ///
+    /// Pairs the cache with a default-configured [`wasmtime::Engine`].
+    /// Use [`Self::with_engine`] to supply a host-tuned engine.
     pub fn open(dir: impl AsRef<Path>) -> Result<Self, CacheError> {
+        Self::open_with_engine(dir, Engine::default())
+    }
+
+    /// Open (creating if absent) the cache directory at `dir`, binding
+    /// the cache to a caller-supplied [`wasmtime::Engine`]. Useful when
+    /// the host needs a non-default `wasmtime::Config` (custom
+    /// allocator, profiling hooks, …) — all evaluators built through
+    /// this cache will share that engine.
+    ///
+    /// Wasmtime requires that `Module::deserialize` and `Module::new`
+    /// be paired with the same engine that produced the bytes. The
+    /// cache itself does not stamp engine fingerprints (only the
+    /// wasmtime version + host triple via `native_compat_hash`), so
+    /// hosts that swap engine config across cache writers and readers
+    /// must invalidate the on-disk `.native` sidecars themselves.
+    pub fn open_with_engine(dir: impl AsRef<Path>, engine: Engine) -> Result<Self, CacheError> {
         let path = dir.as_ref().to_path_buf();
         if let Err(err) = fs::create_dir_all(&path) {
             return Err(CacheError::DirectoryUnusable { path, source: err });
@@ -212,7 +248,28 @@ impl AotCache {
                 ),
             });
         }
-        Ok(Self { dir: path })
+        Ok(Self { dir: path, engine })
+    }
+
+    /// Replace the wasmtime engine bound to this cache. Returns the
+    /// updated cache so the builder pattern composes with `open`.
+    ///
+    /// Note: existing evaluators already constructed off this cache
+    /// hold their own engine clone, so swapping the engine here does
+    /// not retroactively retarget them. Use this hook before the first
+    /// `WasmAotEvaluator::from_source_with_cache` call.
+    pub fn with_engine(mut self, engine: Engine) -> Self {
+        self.engine = engine;
+        self
+    }
+
+    /// Borrow the wasmtime engine the cache shares with every
+    /// evaluator built through it. Hosts that need to instantiate a
+    /// `Module` outside `WasmAotEvaluator` (custom embedding,
+    /// diagnostic dumps) can reuse the same engine and avoid paying
+    /// the engine setup cost twice.
+    pub fn engine(&self) -> &Engine {
+        &self.engine
     }
 
     /// Compute the canonical content-addressed key for `src`. Public
