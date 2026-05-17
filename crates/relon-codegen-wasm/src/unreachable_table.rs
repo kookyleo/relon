@@ -56,6 +56,10 @@ const TAG_CAPABILITY_DENIED: u32 = 0;
 const TAG_OUT_BUF_TOO_SMALL: u32 = 1;
 const TAG_IN_BUF_TOO_SMALL: u32 = 2;
 const TAG_VALUE_TOO_LARGE: u32 = 3;
+/// Phase 4.c-1: scratch bump allocator overran the wasm linear
+/// memory size. Codegen emits this guard before every
+/// `relon_scratch_cursor` bump (static or dynamic).
+const TAG_SCRATCH_OOM: u32 = 4;
 
 // Indexes into the static "kind" tag table used by [`UnreachableKind::ValueTooLarge`].
 // New tags append; the existing indices are part of the on-disk format.
@@ -97,6 +101,22 @@ pub enum UnreachableKind {
         /// Stable `'static` tag from [`VALUE_KIND_TAGS`].
         kind: &'static str,
     },
+    /// Phase 4.c-1: a scratch bump-allocator (`Op::AllocScratch` /
+    /// `Op::AllocScratchDyn`) would have pushed the scratch cursor
+    /// past the end of wasm linear memory. The host cannot recover
+    /// at runtime — raising memory.grow ceiling or shrinking the
+    /// stdlib request are the only fixes — so the trap is fatal.
+    ///
+    /// `needed` is `0` for the dynamic-size variant (the actual
+    /// requested size lives on the operand stack at trap time and is
+    /// not snapshotted into the entry). For the static-size variant
+    /// the codegen embeds the requested byte count so the trap
+    /// translator can render a precise diagnostic.
+    ScratchOOM {
+        /// Static byte count requested by `Op::AllocScratch`, or `0`
+        /// for the dynamic-size variant.
+        needed: u32,
+    },
 }
 
 impl UnreachableKind {
@@ -121,6 +141,7 @@ impl UnreachableKind {
                     .unwrap_or(0) as u32;
                 (TAG_VALUE_TOO_LARGE, idx)
             }
+            UnreachableKind::ScratchOOM { needed } => (TAG_SCRATCH_OOM, *needed),
         }
     }
 }
@@ -312,6 +333,7 @@ pub fn decode_from_bytes(bytes: &[u8]) -> Result<UnreachableTable, UnreachableTa
                         })?;
                 UnreachableKind::ValueTooLarge { kind: kind_str }
             }
+            TAG_SCRATCH_OOM => UnreachableKind::ScratchOOM { needed: payload },
             other => return Err(UnreachableTableError::UnknownKindTag { index, tag: other }),
         };
         entries.push(UnreachableEntry { pc, kind });
@@ -398,6 +420,36 @@ mod tests {
             err,
             UnreachableTableError::UnknownKindTag { tag: 99, .. }
         ));
+    }
+
+    #[test]
+    fn scratch_oom_roundtrip() {
+        // Phase 4.c-1: ensure the new kind tag survives encode/decode
+        // and the static-size payload (needed bytes) round-trips
+        // verbatim.
+        let table = UnreachableTable {
+            entries: vec![
+                UnreachableEntry {
+                    pc: 8,
+                    kind: UnreachableKind::ScratchOOM { needed: 32 },
+                },
+                UnreachableEntry {
+                    pc: 16,
+                    kind: UnreachableKind::ScratchOOM { needed: 0 },
+                },
+            ],
+        };
+        let bytes = encode_to_bytes(&table);
+        let decoded = decode_from_bytes(&bytes).expect("decode");
+        assert_eq!(decoded, table);
+        assert_eq!(
+            decoded.lookup(8),
+            Some(UnreachableKind::ScratchOOM { needed: 32 })
+        );
+        assert_eq!(
+            decoded.lookup(16),
+            Some(UnreachableKind::ScratchOOM { needed: 0 })
+        );
     }
 
     #[test]
