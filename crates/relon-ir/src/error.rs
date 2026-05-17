@@ -268,4 +268,40 @@ pub enum LoweringError {
         /// offending capture.
         range: TokenRange,
     },
+    /// Phase 10-b: the same top-level schema name is declared in two
+    /// reachable modules with structurally different bodies. The
+    /// wasm-AOT pipeline merges every reachable module's `#schema`
+    /// table into one resolver; without rejecting this here a `#main`
+    /// signature that names `User` would non-deterministically pick up
+    /// one of the two definitions depending on the import-graph BFS
+    /// order, which would silently break canonical-hash determinism.
+    #[error(
+        "schema `{name}` is declared in `{first_module}` and `{second_module}` with different shapes — wasm-AOT requires a single canonical definition"
+    )]
+    DuplicateSchemaAcrossFiles {
+        /// Schema name in conflict.
+        name: String,
+        /// First reachable module that declared the schema.
+        first_module: String,
+        /// Second reachable module that re-declared the same name with
+        /// a different shape.
+        second_module: String,
+    },
+    /// Phase 10-b: more than one reachable module declares a `#main`
+    /// directive. wasm-AOT lowers exactly one entry per build; an
+    /// imported library accidentally tagging its top-level expression
+    /// `#main(...)` would otherwise compete with the entry's signature
+    /// and silently shadow it on a hash collision. The IR pass rejects
+    /// the workspace and points at the second offender so the user can
+    /// decide which file is meant to be the entry.
+    #[error(
+        "multiple `#main` directives in workspace: entry `{entry_module}` and imported `{other_module}` — only the entry file may declare `#main`"
+    )]
+    MultipleMainDirectives {
+        /// Canonical id of the entry module the host asked to lower.
+        entry_module: String,
+        /// Canonical id of the imported module that also carries a
+        /// `#main` directive.
+        other_module: String,
+    },
 }
