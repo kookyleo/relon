@@ -33,7 +33,43 @@ use relon_parser::Node;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, OnceLock};
 use thiserror::Error;
-use wasmtime::{Engine, InstancePre, Linker, Memory, Module as WtModule, Store, TypedFunc, Val};
+use wasmtime::{
+    Config, Engine, InstancePre, Linker, Memory, Module as WtModule, Store, TypedFunc, Val,
+};
+
+/// Build the default [`wasmtime::Config`] used by every engine this
+/// crate constructs internally. The single switch the host cares about
+/// at this layer is fuel consumption: v3+ a-1 wires
+/// [`WasmAotEvaluator::with_fuel_limit`] so a host can cap how much
+/// wasm work a single `run_main` is allowed to perform. Fuel is opt-in
+/// per evaluator (default budget `0` = unlimited, see
+/// [`WasmAotEvaluator::fuel_limit`]) but the engine has to be primed
+/// with `consume_fuel(true)` at construction time — wasmtime injects
+/// the per-instruction fuel-decrement bookkeeping at compile time, so
+/// flipping the bit later would be a no-op for already-compiled
+/// modules.
+///
+/// Keeping the bookkeeping on unconditionally costs a single extra
+/// load+subtract per wasm instruction. The Phase a-1 bench shows the
+/// hot-path overhead is well under one percent for the warm-invoke
+/// scenarios; preserving a single engine-shape across "limit / no
+/// limit" callers is the simpler contract.
+fn make_fuel_aware_config() -> Config {
+    let mut cfg = Config::default();
+    cfg.consume_fuel(true);
+    cfg
+}
+
+/// Build a fresh [`wasmtime::Engine`] with fuel consumption enabled.
+/// Used by [`AotCache::open`] and [`shared_default_engine`] so every
+/// evaluator the host constructs through the public surface has the
+/// same fuel-aware engine shape.
+pub(crate) fn make_fuel_aware_engine() -> Engine {
+    Engine::new(&make_fuel_aware_config()).expect(
+        "wasmtime engine with fuel consumption enabled must construct; \
+         default Config is always valid",
+    )
+}
 
 /// Process-wide [`wasmtime::Engine`] used by [`WasmAotEvaluator::
 /// from_source`] and [`WasmAotEvaluator::from_bytes`] — i.e. the
@@ -45,9 +81,14 @@ use wasmtime::{Engine, InstancePre, Linker, Memory, Module as WtModule, Store, T
 /// need a custom `wasmtime::Config` should drive the cache path
 /// (`AotCache::open_with_engine`) instead — touching the global engine
 /// would surprise unrelated callers that also use the default path.
+///
+/// Phase a-1: built with [`make_fuel_aware_engine`] so the
+/// `with_fuel_limit` switch can take effect without rebuilding the
+/// engine (wasmtime would otherwise refuse `set_fuel` on a non-fuel
+/// engine).
 fn shared_default_engine() -> &'static Engine {
     static SHARED: OnceLock<Engine> = OnceLock::new();
-    SHARED.get_or_init(Engine::default)
+    SHARED.get_or_init(make_fuel_aware_engine)
 }
 
 /// Default `out_cap` (in bytes) when a host doesn't override it.
@@ -225,6 +266,30 @@ pub struct WasmAotEvaluator {
     /// [`relon_eval_api::CapabilityBit`]. Defaults to the zero-trust
     /// grant set (`Capabilities::default`).
     cap_grants: u64,
+    /// Phase a-1: per-`run_main` wasm step budget enforced via
+    /// wasmtime's `Store::set_fuel`. `0` is the host-facing
+    /// "unlimited" shorthand; the dispatcher maps it to `u64::MAX`
+    /// (drain rate ~1 unit per instruction, so the budget is good for
+    /// thousands of years on any realistic CPU) and reissues
+    /// `set_fuel` on every call because:
+    ///
+    /// * The engine has `consume_fuel(true)`, so a fresh `Store`
+    ///   starts at zero fuel — without our per-call reset every
+    ///   evaluator built off this crate would trap on the very first
+    ///   instruction.
+    /// * wasmtime decrements fuel monotonically, so without a reset
+    ///   the pool's second call would inherit whatever the first
+    ///   call left behind — almost never what a host wants.
+    ///
+    /// A non-zero value applies that budget directly; running out
+    /// surfaces as `Trap::OutOfFuel` → `WasmStepLimitExceeded`.
+    ///
+    /// Unit: 1 fuel ≈ 1 wasm instruction; `nop` / `drop` / `block` /
+    /// `loop` are free. See wasmtime's `Store::set_fuel` docs for the
+    /// full table. The unit is **not** wall-clock time nor cycles —
+    /// choose a limit that matches the entry's wasm instruction
+    /// count, not its expected latency.
+    fuel_limit: u64,
     /// Free-list of warmed-up [`WasmSession`]s. Per-call cost on a hit
     /// is just the buffer marshal + wasm dispatch; misses pay the
     /// `Store::new` + `InstancePre::instantiate` price once.
@@ -405,6 +470,7 @@ impl WasmAotEvaluator {
             return_layout,
             out_cap: DEFAULT_OUT_CAP,
             cap_grants: Capabilities::default().to_cap_bitmap(),
+            fuel_limit: 0,
             session_pool: Mutex::new(Vec::new()),
         })
     }
@@ -548,6 +614,7 @@ impl WasmAotEvaluator {
             // prologue traps with `CapabilityDenied` when a #native
             // call needs a bit the bitmap doesn't carry.
             cap_grants: Capabilities::default().to_cap_bitmap(),
+            fuel_limit: 0,
             session_pool: Mutex::new(Vec::new()),
         })
     }
@@ -576,6 +643,46 @@ impl WasmAotEvaluator {
     pub fn with_capabilities(mut self, caps: Capabilities) -> Self {
         self.cap_grants = caps.to_cap_bitmap();
         self
+    }
+
+    /// Phase a-1: cap per-`run_main` wasm execution at `limit` fuel
+    /// units (≈ one unit per wasm instruction; `nop` / `drop` /
+    /// `block` / `loop` are free — see wasmtime's `Store::set_fuel`
+    /// docs for the precise table).
+    ///
+    /// `limit = 0` is the host-facing "unlimited" shorthand: the
+    /// dispatcher rewrites it to `u64::MAX` (good for thousands of
+    /// years at ~1 unit per instruction) and reissues `set_fuel` on
+    /// every call. A reissue is mandatory because the engine has
+    /// `consume_fuel(true)` — a fresh store would otherwise start at
+    /// zero fuel and trap on the first instruction. A non-zero value
+    /// applies that budget directly; both modes pay the same single
+    /// `set_fuel` per dispatch, so toggling the cap on a hot
+    /// evaluator does not introduce a perf cliff.
+    ///
+    /// When the budget runs out wasmtime traps with
+    /// [`wasmtime::Trap::OutOfFuel`]; the trap translator maps it to
+    /// [`RuntimeError::WasmStepLimitExceeded`]. The `range` field is
+    /// best-effort — when the trap's pc lands inside the codegen's
+    /// srcmap the original span is attached, otherwise the variant
+    /// surfaces with `range = None`.
+    ///
+    /// The budget is **not** wall-clock time nor cycles: a tight
+    /// arithmetic loop and a heavy stdlib call can have wildly
+    /// different fuel costs at the same wall-clock budget. Tune
+    /// against the entry's expected instruction count, not its
+    /// latency.
+    pub fn with_fuel_limit(mut self, limit: u64) -> Self {
+        self.fuel_limit = limit;
+        self
+    }
+
+    /// Borrow the configured per-call fuel budget. Hosts that want to
+    /// double-check what the evaluator will enforce on the next
+    /// `run_main` can read this before dispatching. `0` means
+    /// unlimited (the default).
+    pub fn fuel_limit(&self) -> u64 {
+        self.fuel_limit
     }
 
     /// Borrow the wrapped [`WasmModule`] — useful for hosts that
@@ -787,6 +894,31 @@ impl WasmAotEvaluator {
             return (
                 Err(RuntimeError::IoError(format!(
                     "wasm memory write (in_buf): {e}"
+                ))),
+                session,
+            );
+        }
+
+        // Phase a-1: re-stamp the per-call fuel budget. wasmtime
+        // decrements fuel monotonically and a store opened against a
+        // `consume_fuel(true)` engine starts at zero, so we have to
+        // hand the next call a fresh budget every time — even in the
+        // "unlimited" mode. `fuel_limit = 0` is the host-facing
+        // shorthand for that case; we map it to `u64::MAX` so the
+        // wasm side runs effectively forever (drain rate ~1 unit per
+        // instruction → u64::MAX is good for ~thousands of years on
+        // any realistic CPU). A non-zero `fuel_limit` budgets the
+        // call directly; running out surfaces as
+        // `Trap::OutOfFuel` → `WasmStepLimitExceeded`.
+        let per_call_fuel = if self.fuel_limit == 0 {
+            u64::MAX
+        } else {
+            self.fuel_limit
+        };
+        if let Err(e) = session.store.set_fuel(per_call_fuel) {
+            return (
+                Err(RuntimeError::IoError(format!(
+                    "wasm set_fuel({per_call_fuel}): {e}"
                 ))),
                 session,
             );

@@ -105,3 +105,97 @@ fn wasm_aot_backend_resolves_cross_file_schema() {
     let stdout = String::from_utf8(output.stdout).expect("utf-8 stdout");
     assert_eq!(stdout.trim(), "42", "wasm-aot stdout was: {stdout:?}");
 }
+
+/// Phase a-1 CLI surface: `--fuel-limit 0` (the default) must not
+/// change the answer the wasm-aot backend produces for a fold over a
+/// 1000-element list. The point of the test is to lock down the
+/// "unlimited" mode at the CLI layer — the per-call set_fuel reset
+/// logic is exercised by the codegen-wasm smoke tests; here we only
+/// want to catch a future refactor that accidentally clamps the limit
+/// at the CLI boundary.
+#[test]
+fn fuel_limit_zero_completes_via_cli() {
+    let path = std::env::temp_dir().join(format!(
+        "relon-cli-fuel-limit-zero-{}.relon",
+        std::process::id(),
+    ));
+    std::fs::write(
+        &path,
+        "#main(List<Int> xs) -> Int\nxs.fold(0, (Int acc, Int x) => acc + x)\n",
+    )
+    .expect("write fixture");
+
+    let xs: Vec<i64> = (1..=1000).collect();
+    let xs_json = serde_json::to_string(&xs).expect("encode xs");
+    let args = format!("{{\"xs\": {xs_json}}}");
+
+    let output = Command::new(BINARY)
+        .arg("run")
+        .arg(&path)
+        .arg("--backend")
+        .arg("wasm-aot")
+        .arg("--fuel-limit")
+        .arg("0")
+        .arg("--args")
+        .arg(&args)
+        .output()
+        .expect("spawn relon CLI");
+
+    let _ = std::fs::remove_file(&path);
+
+    assert!(
+        output.status.success(),
+        "CLI exited with non-zero status: stderr={}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8(output.stdout).expect("utf-8 stdout");
+    // 1 + 2 + ... + 1000 = 500500
+    assert_eq!(stdout.trim(), "500500", "stdout was: {stdout:?}");
+}
+
+/// Phase a-1: `--fuel-limit 10` against the same fold must fail —
+/// the CLI must surface a non-zero exit and a `WasmStepLimitExceeded`
+/// diagnostic on stderr. Catches a future refactor that silently
+/// drops the flag or fails to wire it into `with_fuel_limit`.
+#[test]
+fn fuel_limit_tight_traps_via_cli() {
+    let path = std::env::temp_dir().join(format!(
+        "relon-cli-fuel-limit-tight-{}.relon",
+        std::process::id(),
+    ));
+    std::fs::write(
+        &path,
+        "#main(List<Int> xs) -> Int\nxs.fold(0, (Int acc, Int x) => acc + x)\n",
+    )
+    .expect("write fixture");
+
+    let xs: Vec<i64> = (1..=1000).collect();
+    let xs_json = serde_json::to_string(&xs).expect("encode xs");
+    let args = format!("{{\"xs\": {xs_json}}}");
+
+    let output = Command::new(BINARY)
+        .arg("run")
+        .arg(&path)
+        .arg("--backend")
+        .arg("wasm-aot")
+        .arg("--fuel-limit")
+        .arg("10")
+        .arg("--args")
+        .arg(&args)
+        .output()
+        .expect("spawn relon CLI");
+
+    let _ = std::fs::remove_file(&path);
+
+    assert!(
+        !output.status.success(),
+        "CLI must exit non-zero on fuel exhaustion; stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("step") || stderr.contains("fuel"),
+        "stderr should mention step / fuel exhaustion: {stderr}"
+    );
+}
