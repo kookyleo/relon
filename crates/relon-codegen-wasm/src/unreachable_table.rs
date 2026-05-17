@@ -69,7 +69,22 @@ const TAG_EMPTY_LIST: u32 = 6;
 
 // Indexes into the static "kind" tag table used by [`UnreachableKind::ValueTooLarge`].
 // New tags append; the existing indices are part of the on-disk format.
-const VALUE_KIND_TAGS: &[&str] = &["String", "ListInt", "Record"];
+//
+// Phase 10-c appended the four new list element-type tags so the
+// trap translator can render a precise `RuntimeError::WasmValueTooLarge`
+// label when an output `List<Float / Bool / String / Schema>` would
+// have overrun the caller's `out_cap`. ListString / ListSchema entries
+// stay reserved for the future relocating-store path — the simple
+// memcpy in `emit_store_pointer_indirect` refuses these types today.
+const VALUE_KIND_TAGS: &[&str] = &[
+    "String",
+    "ListInt",
+    "Record",
+    "ListFloat",
+    "ListBool",
+    "ListString",
+    "ListSchema",
+];
 
 /// Semantic intent of a wasm `unreachable` instruction emitted by
 /// the Relon codegen. Each enumerated variant corresponds to exactly

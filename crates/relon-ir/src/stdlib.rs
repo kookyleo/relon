@@ -113,6 +113,10 @@ pub struct StdlibFunction {
 ///     (Phase 10-a).
 ///   * `15` — `list_int_fold(List<Int>, Int, Closure<(Int, Int) -> Int>) -> Int`
 ///     (Phase 10-a).
+///   * `16` — `list_float_length(List<Float>) -> Int` (Phase 10-c).
+///   * `17` — `list_bool_length(List<Bool>) -> Int` (Phase 10-c).
+///   * `18` — `list_string_length(List<String>) -> Int` (Phase 10-c).
+///   * `19` — `list_schema_length(List<Schema>) -> Int` (Phase 10-c).
 pub fn builtin_stdlib() -> Vec<StdlibFunction> {
     vec![
         length_string_to_int(),
@@ -131,6 +135,10 @@ pub fn builtin_stdlib() -> Vec<StdlibFunction> {
         list_int_map(),
         list_int_filter(),
         list_int_fold(),
+        list_float_length(),
+        list_bool_length(),
+        list_string_length(),
+        list_schema_length(),
     ]
 }
 
@@ -183,6 +191,105 @@ fn list_int_length_to_int() -> StdlibFunction {
     StdlibFunction {
         name: "list_int_length",
         params: vec![IrType::ListInt],
+        ret: IrType::I64,
+        body: vec![
+            TaggedOp {
+                op: Op::LocalGet(0),
+                range,
+            },
+            TaggedOp {
+                op: Op::ReadStringLen,
+                range,
+            },
+            TaggedOp {
+                op: Op::Return,
+                range,
+            },
+        ],
+    }
+}
+
+/// Phase 10-c length bodies for the new list types.
+///
+/// Every list record carries the same `[len: u32 LE]` prefix at offset
+/// 0 (the trailing payload differs by element type but the header
+/// shape is uniform). So the body is byte-identical to
+/// [`list_int_length_to_int`] — only the param type tag changes, which
+/// drives the IR-level dispatch in [`stdlib_method_index`].
+fn list_float_length() -> StdlibFunction {
+    let range = TokenRange::default();
+    StdlibFunction {
+        name: "list_float_length",
+        params: vec![IrType::ListFloat],
+        ret: IrType::I64,
+        body: vec![
+            TaggedOp {
+                op: Op::LocalGet(0),
+                range,
+            },
+            TaggedOp {
+                op: Op::ReadStringLen,
+                range,
+            },
+            TaggedOp {
+                op: Op::Return,
+                range,
+            },
+        ],
+    }
+}
+
+fn list_bool_length() -> StdlibFunction {
+    let range = TokenRange::default();
+    StdlibFunction {
+        name: "list_bool_length",
+        params: vec![IrType::ListBool],
+        ret: IrType::I64,
+        body: vec![
+            TaggedOp {
+                op: Op::LocalGet(0),
+                range,
+            },
+            TaggedOp {
+                op: Op::ReadStringLen,
+                range,
+            },
+            TaggedOp {
+                op: Op::Return,
+                range,
+            },
+        ],
+    }
+}
+
+fn list_string_length() -> StdlibFunction {
+    let range = TokenRange::default();
+    StdlibFunction {
+        name: "list_string_length",
+        params: vec![IrType::ListString],
+        ret: IrType::I64,
+        body: vec![
+            TaggedOp {
+                op: Op::LocalGet(0),
+                range,
+            },
+            TaggedOp {
+                op: Op::ReadStringLen,
+                range,
+            },
+            TaggedOp {
+                op: Op::Return,
+                range,
+            },
+        ],
+    }
+}
+
+fn list_schema_length() -> StdlibFunction {
+    let range = TokenRange::default();
+    StdlibFunction {
+        name: "list_schema_length",
+        params: vec![IrType::ListSchema],
         ret: IrType::I64,
         body: vec![
             TaggedOp {
@@ -789,6 +896,15 @@ pub fn stdlib_method_index(receiver_ty: IrType, name: &str) -> Option<u32> {
         (IrType::ListInt, "map") => stdlib_function_index("list_int_map"),
         (IrType::ListInt, "filter") => stdlib_function_index("list_int_filter"),
         (IrType::ListInt, "fold") => stdlib_function_index("list_int_fold"),
+        // Phase 10-c length dispatch for the new list types. Each
+        // length body just reads the leading `[len: u32 LE]` of the
+        // record (all list shapes share the same header), but routes
+        // through a distinct stdlib slot so the IR-level param type
+        // check stays honest.
+        (IrType::ListFloat, "length") => stdlib_function_index("list_float_length"),
+        (IrType::ListBool, "length") => stdlib_function_index("list_bool_length"),
+        (IrType::ListString, "length") => stdlib_function_index("list_string_length"),
+        (IrType::ListSchema, "length") => stdlib_function_index("list_schema_length"),
         _ => None,
     }
 }

@@ -58,6 +58,26 @@ pub enum IrType {
     /// but tagged separately at IR-level so we can later distinguish
     /// `List<Int>` operations from raw byte pointers.
     ListInt,
+    /// Phase 10-c: pointer to a `[len: u32 LE][pad to 8][f64 elements]`
+    /// record. Same wasm-side representation as `ListInt` — the
+    /// distinct tag drives `length` / future map-/fold-style
+    /// dispatch.
+    ListFloat,
+    /// Phase 10-c: pointer to a `[len: u32 LE][u8 booleans]` record.
+    /// Booleans pack tightly per spec (no inter-element padding).
+    /// Same wasm slot shape as the other list pointers.
+    ListBool,
+    /// Phase 10-c: pointer to a `[len: u32 LE][off_0: u32 LE]...`
+    /// record whose entries each name a buffer-relative String
+    /// `[len: u32 LE][utf8 bytes]` payload. Same wasm slot shape as
+    /// the other list pointers.
+    ListString,
+    /// Phase 10-c: pointer to a `[len: u32 LE][off_0: u32 LE]...`
+    /// record whose entries each name a buffer-relative sub-record
+    /// fixed-area base. Carries no schema info on the IR-level tag —
+    /// the lowering / codegen pass tracks the schema separately
+    /// through the field's declared `TypeRepr`.
+    ListSchema,
     /// Phase 10-a: pointer to an 8-byte closure handle record laid
     /// out in scratch memory as `[fn_table_idx: u32 LE][captures_ptr:
     /// u32 LE]`. Same wasm-side representation as `String` /
@@ -82,8 +102,26 @@ impl IrType {
             | IrType::Null
             | IrType::String
             | IrType::ListInt
+            | IrType::ListFloat
+            | IrType::ListBool
+            | IrType::ListString
+            | IrType::ListSchema
             | IrType::Closure => IrType::I32,
         }
+    }
+
+    /// `true` when the IR type is a pointer-indirect list. Used by
+    /// the codegen pass when it needs to detect "any list pointer"
+    /// without enumerating every concrete element-tagged variant.
+    pub fn is_list_pointer(self) -> bool {
+        matches!(
+            self,
+            IrType::ListInt
+                | IrType::ListFloat
+                | IrType::ListBool
+                | IrType::ListString
+                | IrType::ListSchema
+        )
     }
 }
 
@@ -257,6 +295,55 @@ pub enum Op {
         /// data section in little-endian order.
         elements: Vec<i64>,
     },
+    /// Phase 10-c: push an absolute wasm linear-memory address of a
+    /// constant `List<Float>` record. Stack: `[] -> [ListFloat]`.
+    ///
+    /// Data-section layout mirrors `ConstListInt`:
+    /// `[len: u32 LE][pad: u32 zero][f64 elements]`. Codegen aligns
+    /// the record start to 8 so the f64 payload sits on an 8-byte
+    /// boundary, matching what `BufferBuilder::write_list_float`
+    /// would have produced for the same value.
+    ConstListFloat {
+        /// Per-module identifier mapped to the record's absolute
+        /// memory offset by the codegen layout pass.
+        idx: u32,
+        /// The f64 elements — codegen materialises them into the
+        /// data section in little-endian order. Stored as `u64`
+        /// bitwise so the op can derive `Eq` / `Hash` alongside the
+        /// rest of the IR variants.
+        elements: Vec<u64>,
+    },
+    /// Phase 10-c: push an absolute wasm linear-memory address of a
+    /// constant `List<Bool>` record. Stack: `[] -> [ListBool]`.
+    ///
+    /// Data-section layout: `[len: u32 LE][u8 booleans]`. The booleans
+    /// pack tightly per spec, no padding between elements.
+    ConstListBool {
+        /// Per-module identifier mapped to the record's absolute
+        /// memory offset by the codegen layout pass.
+        idx: u32,
+        /// The boolean elements — codegen materialises them as
+        /// `0u8` / `1u8` bytes.
+        elements: Vec<bool>,
+    },
+    /// Phase 10-c: push an absolute wasm linear-memory address of a
+    /// constant `List<String>` record. Stack: `[] -> [ListString]`.
+    ///
+    /// Data-section layout: each entry's String `[len: u32 LE][utf8]`
+    /// record is emitted into the data section first; then the list
+    /// header `[len: u32 LE][off_0: u32 LE]...` is emitted afterwards,
+    /// with each `off_i` resolved to the absolute address of the
+    /// matching String record. The op's `idx` lookup returns the
+    /// header offset (= the pushed pointer value).
+    ConstListString {
+        /// Per-module identifier mapped to the header record's
+        /// absolute memory offset by the codegen layout pass.
+        idx: u32,
+        /// The string elements — codegen materialises each into its
+        /// own data-section record (no dedup with `ConstString`
+        /// occurrences in v1, kept simple).
+        elements: Vec<String>,
+    },
     /// Push a user-let-binding local. Stack: `[] -> [ty]`.
     ///
     /// The `idx` is a per-function local index for `let`-bound names
@@ -386,6 +473,36 @@ pub enum Op {
     /// emission shape as [`Op::LoadStringPtr`]; the distinct IR tag
     /// lets later phases dispatch on element type.
     LoadListIntPtr {
+        /// Byte offset of the pointer slot inside the input buffer.
+        offset: u32,
+    },
+    /// Phase 10-c: load a `[len: u32 LE][pad][f64 elements]` pointer
+    /// from the input buffer at `offset` bytes. Stack: `[] -> [ListFloat]`.
+    /// Same wasm emission shape as [`Op::LoadListIntPtr`] — the IR
+    /// keeps the tag distinct so downstream dispatch is unambiguous.
+    LoadListFloatPtr {
+        /// Byte offset of the pointer slot inside the input buffer.
+        offset: u32,
+    },
+    /// Phase 10-c: load a `[len: u32 LE][u8 booleans]` pointer from
+    /// the input buffer at `offset` bytes. Stack: `[] -> [ListBool]`.
+    LoadListBoolPtr {
+        /// Byte offset of the pointer slot inside the input buffer.
+        offset: u32,
+    },
+    /// Phase 10-c: load a `[len: u32 LE][off_0: u32]...` pointer
+    /// from the input buffer at `offset` bytes. Stack: `[] -> [ListString]`.
+    /// Pulls the list header pointer; each per-entry String payload
+    /// stays in tail memory until the host (or future stdlib body)
+    /// dereferences the pointer-array entries.
+    LoadListStringPtr {
+        /// Byte offset of the pointer slot inside the input buffer.
+        offset: u32,
+    },
+    /// Phase 10-c: load a `[len: u32 LE][off_0: u32]...` pointer
+    /// from the input buffer at `offset` bytes for a list of branded
+    /// sub-records. Stack: `[] -> [ListSchema]`.
+    LoadListSchemaPtr {
         /// Byte offset of the pointer slot inside the input buffer.
         offset: u32,
     },
