@@ -307,7 +307,7 @@ fn main() -> miette::Result<()> {
                         } else {
                             relon_eval_api::Capabilities::default()
                         };
-                        let aot = WasmAotEvaluator::from_workspace(&*workspace, &cache_namespace)
+                        let aot = WasmAotEvaluator::from_workspace(&workspace, &cache_namespace)
                             .map_err(|e| {
                                 miette::miette!("wasm-aot backend setup: {e}").with_source_code(
                                     NamedSource::new(file.to_string_lossy(), content.clone()),

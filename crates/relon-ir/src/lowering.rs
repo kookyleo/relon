@@ -420,7 +420,12 @@ pub fn lower_workspace(
     // entry-file source span.
     let resolver = SchemaResolver::new_multi(&reachable_trees);
 
-    lower_entry_with_resolver(entry_tree.as_ref(), entry_root.as_ref(), entry_module, resolver)
+    lower_entry_with_resolver(
+        entry_tree.as_ref(),
+        entry_root.as_ref(),
+        entry_module,
+        resolver,
+    )
 }
 
 /// Single-file lowering convenience. Treats the supplied `(tree,
