@@ -24,8 +24,7 @@ fn list_of(n: i64) -> Value {
     Value::list((1..=n).map(Value::Int).collect())
 }
 
-const SUM_FOLD_SRC: &str =
-    "#main(List<Int> xs) -> Int\nxs.fold(0, (Int acc, Int x) => acc + x)";
+const SUM_FOLD_SRC: &str = "#main(List<Int> xs) -> Int\nxs.fold(0, (Int acc, Int x) => acc + x)";
 
 #[test]
 fn fuel_limit_zero_is_unlimited() {
@@ -60,9 +59,7 @@ fn fuel_limit_exceeded_traps() {
 
     let mut args = HashMap::new();
     args.insert("xs".to_string(), list_of(1000));
-    let err = aot
-        .run_main(args)
-        .expect_err("tight fuel budget must trap");
+    let err = aot.run_main(args).expect_err("tight fuel budget must trap");
     match err {
         RuntimeError::WasmStepLimitExceeded { .. } => {}
         other => panic!("expected WasmStepLimitExceeded, got {other:?}"),
