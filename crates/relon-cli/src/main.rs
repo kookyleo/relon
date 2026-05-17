@@ -76,6 +76,20 @@ enum Commands {
         /// (no-#main) sources.
         #[arg(long, value_enum, default_value_t = BackendArg::TreeWalk)]
         backend: BackendArg,
+        /// Per-`run_main` wasm step budget for the wasm-aot backend.
+        /// One unit corresponds roughly to one wasm instruction (with
+        /// `nop` / `drop` / `block` / `loop` free — see wasmtime's
+        /// `Store::set_fuel` docs for the full table). When the budget
+        /// runs out the runtime traps with
+        /// `WasmStepLimitExceeded`, mirroring the tree-walker's
+        /// `StepLimitExceeded` sandbox shape.
+        ///
+        /// `0` (the default) means unlimited and skips the per-call
+        /// `set_fuel` syscall entirely. Ignored when `--backend
+        /// tree-walk` is in effect — the tree-walker has its own
+        /// `step_limit` knob driven through `Context`.
+        #[arg(long, default_value_t = 0)]
+        fuel_limit: u64,
     },
 
     /// Format or check Relon files. Equivalent to the standalone
@@ -108,6 +122,7 @@ fn main() -> miette::Result<()> {
             args,
             trust,
             backend,
+            fuel_limit,
         } => {
             let canonical_file = std::fs::canonicalize(&file)
                 .into_diagnostic()
@@ -313,7 +328,8 @@ fn main() -> miette::Result<()> {
                                     NamedSource::new(file.to_string_lossy(), content.clone()),
                                 )
                             })?
-                            .with_capabilities(caps);
+                            .with_capabilities(caps)
+                            .with_fuel_limit(fuel_limit);
                         EvaluatorTrait::run_main(&aot, args_map).map_err(|e| {
                             Report::new(e).with_source_code(NamedSource::new(
                                 file.to_string_lossy(),
