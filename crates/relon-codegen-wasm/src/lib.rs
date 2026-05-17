@@ -46,6 +46,7 @@ pub mod cache;
 pub mod error;
 pub mod evaluator;
 pub mod host_fns;
+mod reachability;
 pub mod srcmap;
 pub mod unreachable_table;
 
