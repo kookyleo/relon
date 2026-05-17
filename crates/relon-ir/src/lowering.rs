@@ -29,13 +29,14 @@ use relon_analyzer::tree::AnalyzedTree;
 use relon_analyzer::workspace::WorkspaceTree;
 use relon_eval_api::layout::{FieldKind, OffsetTable, SchemaLayout};
 use relon_eval_api::schema_canonical::{Field, Schema, TypeRepr};
-use relon_parser::{Expr, Node, Operator, TokenKey, TokenRange, TypeNode};
+use relon_parser::{ClosureParam, Expr, Node, Operator, TokenKey, TokenRange, TypeNode};
 use std::collections::HashMap;
 
 use crate::error::LoweringError;
-use crate::ir::{Func, IrType, Module, Op, TaggedOp};
+use crate::ir::{ClosureCapture, Func, IrType, Module, Op, TaggedOp};
 use crate::stdlib::{
-    builtin_stdlib, stdlib_function_count, stdlib_function_index, stdlib_method_index,
+    builtin_stdlib, stdlib_closure_arg_signature, stdlib_function_count, stdlib_function_index,
+    stdlib_method_index,
 };
 
 /// Per-function lowering state shared across the recursive walk.
@@ -94,6 +95,13 @@ struct LowerCtx<'a> {
     /// pulls them onto the stack. Empty for entry bodies; populated
     /// only when `self_binding` is `Some`.
     method_params: Vec<MethodParam>,
+    /// Phase 10-a: lambda functions emitted in this lowering pass.
+    /// Each entry is a fully-lowered closure body with the implicit
+    /// `captures_ptr: i32` as its first parameter; the closure-table
+    /// emit step picks the entries up in declaration order. Shared
+    /// across nested closure sites so the table assignment stays
+    /// stable.
+    lambda_funcs: Vec<Func>,
 }
 
 /// Information the lowering walker needs when handling `self`-prefixed
@@ -222,6 +230,7 @@ impl<'a> LowerCtx<'a> {
             method_registry,
             self_binding: None,
             method_params: Vec::new(),
+            lambda_funcs: Vec::new(),
         }
     }
 
@@ -249,6 +258,7 @@ impl<'a> LowerCtx<'a> {
             method_registry,
             self_binding: Some(self_binding),
             method_params,
+            lambda_funcs: Vec::new(),
         }
     }
 
@@ -344,6 +354,29 @@ fn lower_workspace_single_with_module(
         .ok_or_else(|| LoweringError::MissingMain {
             module: module_id.to_string(),
         })?;
+
+    // Phase 10-a: reject closure-typed `#main` params + return type
+    // up front. Wasm-side closure values are scratch-heap pointers
+    // whose lifetime ends at `run_main` return — carrying one
+    // through the binary handshake would dangle. Detected here so the
+    // diagnostic message points at the directive declaration rather
+    // than at a downstream schema-build failure.
+    for p in &sig.params {
+        if type_node_names_closure(&p.type_node) {
+            return Err(LoweringError::ClosureAcrossBoundary {
+                context: format!("`#main` parameter `{}`", p.name),
+                range: p.type_node.range,
+            });
+        }
+    }
+    if let Some(rt) = sig.return_type.as_ref() {
+        if type_node_names_closure(rt) {
+            return Err(LoweringError::ClosureAcrossBoundary {
+                context: "`#main` return type".to_string(),
+                range: rt.range,
+            });
+        }
+    }
 
     // Detect whether the return type names a user-declared schema.
     // When it does, the body must evaluate to a (possibly defaulted)
@@ -452,6 +485,9 @@ fn lower_workspace_single_with_module(
         range: sig.range,
     });
     let body = ctx.out;
+    // Hoist the lambda funcs emitted by the entry body's lowering
+    // pass; the entry context is consumed by the move below.
+    let entry_lambda_funcs = ctx.lambda_funcs;
 
     let func = Func {
         name: "run_main".to_string(),
@@ -470,11 +506,26 @@ fn lower_workspace_single_with_module(
     let mut funcs = method_funcs;
     funcs.push(func);
 
+    // Phase 10-a: stitch the closure table together. The lowering
+    // pass attached each emitted lambda to the body-walking context;
+    // we lift them out here and translate the per-lambda local idx
+    // (relative to the lambdas emitted **inside** the entry body)
+    // into the combined IR-func-index space. Lambdas appear after the
+    // entry function in the final `funcs` vec, so the closure table
+    // entries point at `funcs.len() - lambda_count + i`.
+    let lambda_count = entry_lambda_funcs.len();
+    let entry_funcs_len = funcs.len(); // method_funcs + entry, no lambdas yet
+    funcs.extend(entry_lambda_funcs);
+    let closure_table: Vec<u32> = (0..lambda_count as u32)
+        .map(|i| (entry_funcs_len as u32) + i)
+        .collect();
+
     Ok(LoweredEntry {
         module: Module {
             imports: Vec::new(),
             funcs,
             entry_func_index: Some(entry_ir_idx),
+            closure_table,
         },
         main_schema,
         return_schema,
@@ -694,6 +745,15 @@ fn build_local_index(
     Ok(out)
 }
 
+/// Phase 10-a: shallow predicate over a `TypeNode` head.
+/// Returns `true` when the head names a closure type (`Closure<...>`
+/// or `Fn<...>`); used by the entry-signature validator to reject
+/// closure-typed `#main` params / returns before the schema-build
+/// pass even runs.
+fn type_node_names_closure(t: &TypeNode) -> bool {
+    t.path.len() == 1 && (t.path[0] == "Closure" || t.path[0] == "Fn")
+}
+
 /// Format a `TypeNode`'s head + generics for the error message
 /// without dragging the analyzer's full `format_type` in.
 fn type_head_for_display(t: &TypeNode) -> String {
@@ -794,11 +854,420 @@ fn lower_expr(expr: &Expr, range: TokenRange, ctx: &mut LowerCtx<'_>) -> Result<
         Expr::Ternary { cond, then, els } => lower_ternary(cond, then, els, range, ctx),
         Expr::Where { expr, bindings } => lower_where(expr, bindings, range, ctx),
         Expr::FnCall { path, args } => lower_fn_call(path, args, range, ctx),
+        Expr::Closure { .. } => Err(LoweringError::ClosureAcrossBoundary {
+            context: "closure used in a non-higher-order position".to_string(),
+            range,
+        }),
         _ => Err(LoweringError::UnsupportedExpr {
             kind: expr.kind().to_string(),
             range,
         }),
     }
+}
+
+// =====================================================================
+// Phase 10-a: closure-conversion helpers.
+// =====================================================================
+
+/// Walk a lambda's body expression and collect identifiers that
+/// reference a name not bound by the lambda's own param list. The
+/// scan is heuristic — it counts every bare-identifier head segment
+/// once and treats it as a potential free variable; spurious entries
+/// (names that don't actually resolve in the enclosing scope) are
+/// filtered out later by [`resolve_capture`]. The lambda's own params
+/// are excluded so they don't pollute the captures list.
+fn collect_free_vars(expr: &Expr, lambda_params: &[ClosureParam]) -> Vec<String> {
+    let mut found: Vec<String> = Vec::new();
+    let mut visit = |s: &str| {
+        if lambda_params.iter().any(|p| p.name == s) {
+            return;
+        }
+        if !found.iter().any(|n| n == s) {
+            found.push(s.to_string());
+        }
+    };
+    fn walk_expr(expr: &Expr, lambda_params: &[ClosureParam], visit: &mut dyn FnMut(&str)) {
+        match expr {
+            Expr::Variable(path) | Expr::Reference { path, .. } => {
+                if let Some(TokenKey::String(name, _, _)) = path.first() {
+                    visit(name);
+                }
+            }
+            Expr::Binary(_, a, b) => {
+                walk_expr(&a.expr, lambda_params, visit);
+                walk_expr(&b.expr, lambda_params, visit);
+            }
+            Expr::Unary(_, n) => walk_expr(&n.expr, lambda_params, visit),
+            Expr::Ternary { cond, then, els } => {
+                walk_expr(&cond.expr, lambda_params, visit);
+                walk_expr(&then.expr, lambda_params, visit);
+                walk_expr(&els.expr, lambda_params, visit);
+            }
+            Expr::List(items) => {
+                for n in items {
+                    walk_expr(&n.expr, lambda_params, visit);
+                }
+            }
+            Expr::Dict(pairs) => {
+                for (_, v) in pairs {
+                    walk_expr(&v.expr, lambda_params, visit);
+                }
+            }
+            Expr::Where { expr, bindings } => {
+                walk_expr(&bindings.expr, lambda_params, visit);
+                walk_expr(&expr.expr, lambda_params, visit);
+            }
+            Expr::FnCall { path, args } => {
+                // Method-call form (`xs.length()`) carries the
+                // receiver in the path's leading segments; treat the
+                // head segment as a potential free var.
+                if let Some(TokenKey::String(name, _, _)) = path.first() {
+                    if path.len() > 1 {
+                        visit(name);
+                    }
+                }
+                for a in args {
+                    walk_expr(&a.value.expr, lambda_params, visit);
+                }
+            }
+            Expr::Closure { body, params, .. } => {
+                // Nested lambda: the inner lambda's own params shadow
+                // outer ones, but anything else escapes.
+                let mut combined: Vec<ClosureParam> = lambda_params.to_vec();
+                combined.extend(params.iter().cloned());
+                walk_expr(&body.expr, &combined, visit);
+            }
+            _ => {}
+        }
+    }
+    walk_expr(expr, lambda_params, &mut visit);
+    found
+}
+
+/// Find a name in the enclosing scope and return its `(IrType,
+/// outer_let_idx)`. If the binding is currently a `#main` /
+/// method-param (i.e. not yet in a let-local), the helper materialises
+/// a fresh let-local, emits a `LetSet` that captures the value, and
+/// returns the new index — so a captured `#main` param participates
+/// in the closure capture protocol just like any user-let.
+fn resolve_capture(
+    name: &str,
+    range: TokenRange,
+    ctx: &mut LowerCtx<'_>,
+) -> Result<Option<(IrType, u32)>, LoweringError> {
+    // Innermost-first: let-bindings shadow params.
+    if let Some(b) = ctx.lets.iter().rev().find(|b| b.name == name).cloned() {
+        return Ok(Some((b.ty, b.idx)));
+    }
+    // Method params / `#main` params — lift the value into a fresh
+    // let-local so the capture protocol has a uniform source.
+    if let Some(p) = ctx.method_params.iter().find(|p| p.name == name).cloned() {
+        ctx.out.push(TaggedOp {
+            op: Op::LocalGet(p.wasm_local_idx),
+            range,
+        });
+        let idx = ctx.next_let_idx;
+        ctx.next_let_idx += 1;
+        ctx.out.push(TaggedOp {
+            op: Op::LetSet { idx, ty: p.ty },
+            range,
+        });
+        ctx.lets.push(LetBinding {
+            name: name.to_string(),
+            idx,
+            ty: p.ty,
+            schema_brand: None,
+        });
+        return Ok(Some((p.ty, idx)));
+    }
+    if let Some(p) = ctx.params.iter().find(|p| p.name == name).cloned() {
+        // For scalar / pointer params, emit a `LoadField` + `LetSet`.
+        // Schema-typed `#main` params are intentionally NOT captureable
+        // by Phase 10-a — closure values cannot carry the analyzer's
+        // brand machinery yet.
+        if p.schema_brand.is_some() {
+            return Err(LoweringError::UnsupportedClosureCapture {
+                name: name.to_string(),
+                ty: p.ty,
+                range,
+            });
+        }
+        // Use the matching load shape for the param's IR type.
+        let load_op = match p.ty {
+            IrType::String => Op::LoadStringPtr { offset: p.offset },
+            IrType::ListInt => Op::LoadListIntPtr { offset: p.offset },
+            other => Op::LoadField {
+                offset: p.offset,
+                ty: other,
+            },
+        };
+        ctx.out.push(TaggedOp { op: load_op, range });
+        let idx = ctx.next_let_idx;
+        ctx.next_let_idx += 1;
+        ctx.out.push(TaggedOp {
+            op: Op::LetSet { idx, ty: p.ty },
+            range,
+        });
+        ctx.lets.push(LetBinding {
+            name: name.to_string(),
+            idx,
+            ty: p.ty,
+            schema_brand: None,
+        });
+        return Ok(Some((p.ty, idx)));
+    }
+    // Not in scope — the name might refer to a parser-level construct
+    // (e.g. a stdlib free-call head, a schema name) that doesn't
+    // contribute a capture. Let the lambda body's own
+    // `lower_variable` handle the diagnostic later.
+    Ok(None)
+}
+
+/// Lay out a captures struct: place 8-aligned fields first, then 4-/
+/// 1-byte fields. Returns the per-field byte offsets in the same
+/// order as the input plus the total struct size (rounded up to 8).
+fn layout_captures(captures: &[(String, IrType, u32)]) -> (Vec<u32>, u32) {
+    // Two passes: 8-byte slots, then everything else. Keeps the
+    // total size aligned at 8 without complex packing logic.
+    let mut offsets = vec![0u32; captures.len()];
+    let mut cursor: u32 = 0;
+    for (i, (_, ty, _)) in captures.iter().enumerate() {
+        if matches!(ty.wasm_slot(), IrType::I64 | IrType::F64)
+            || matches!(ty, IrType::I64 | IrType::F64)
+        {
+            offsets[i] = cursor;
+            cursor += 8;
+        }
+    }
+    for (i, (_, ty, _)) in captures.iter().enumerate() {
+        if !matches!(ty, IrType::I64 | IrType::F64) {
+            offsets[i] = cursor;
+            cursor += 4;
+        }
+    }
+    // Round up the total size to 8 so the next scratch alloc starts
+    // at an 8-aligned boundary.
+    let total = (cursor + 7) & !7u32;
+    (offsets, total)
+}
+
+/// Phase 10-a: lower one [`Expr::Closure`] argument and emit a
+/// `MakeClosure` op leaving an `IrType::Closure` value on top of the
+/// vstack. The lambda's body becomes a fresh `Func` appended to
+/// `ctx.lambda_funcs`; its wasm-side function index is communicated
+/// to `MakeClosure` via the closure-table slot `lambda_funcs.len() - 1`.
+///
+/// `expected_param_tys` and `expected_ret_ty` describe the surface
+/// the higher-order caller (stdlib `list_int_map` / `filter` /
+/// `fold`) expects from the closure body. Mismatches between these
+/// and the inferred body type surface as
+/// [`LoweringError::UnsupportedExpr`] — the lambda surface in this
+/// phase is closed to user-defined higher-order shapes, so we keep
+/// the diagnostics terse.
+fn lower_closure_arg(
+    closure_expr: &Expr,
+    closure_range: TokenRange,
+    expected_param_tys: &[IrType],
+    expected_ret_ty: IrType,
+    ctx: &mut LowerCtx<'_>,
+) -> Result<(), LoweringError> {
+    let Expr::Closure {
+        params: lambda_params,
+        body: lambda_body,
+        ..
+    } = closure_expr
+    else {
+        return Err(LoweringError::UnsupportedExpr {
+            kind: format!("lower_closure_arg(non-closure `{}`)", closure_expr.kind()),
+            range: closure_range,
+        });
+    };
+    if lambda_params.len() != expected_param_tys.len() {
+        return Err(LoweringError::UnsupportedExpr {
+            kind: format!(
+                "Closure(arity-mismatch: expected {}, got {})",
+                expected_param_tys.len(),
+                lambda_params.len()
+            ),
+            range: closure_range,
+        });
+    }
+
+    // -----------------------------------------------------------------
+    // Free-var analysis + capture resolution.
+    // -----------------------------------------------------------------
+    let free_vars = collect_free_vars(&lambda_body.expr, lambda_params);
+    let mut resolved: Vec<(String, IrType, u32)> = Vec::new();
+    for name in free_vars {
+        if let Some((ty, outer_idx)) = resolve_capture(&name, lambda_body.range, ctx)? {
+            resolved.push((name, ty, outer_idx));
+        }
+    }
+    let (offsets, captures_size) = layout_captures(&resolved);
+    let captures: Vec<ClosureCapture> = resolved
+        .iter()
+        .zip(offsets.iter())
+        .map(|((_, ty, let_idx), offset)| ClosureCapture {
+            let_idx: *let_idx,
+            ty: *ty,
+            offset: *offset,
+        })
+        .collect();
+
+    // -----------------------------------------------------------------
+    // Build the lambda Func.
+    //
+    // Signature: `(captures_ptr: i32, ...lambda_params) -> ret_ty`.
+    // Body prologue: for each capture, emit `LocalGet(0);
+    // LoadXxxAtAbsolute { offset }; LetSet { fresh_idx, ty }`. The
+    // lambda body's lowering ctx sees each capture as a let-binding
+    // under its source-level name; the body lowers normally.
+    // -----------------------------------------------------------------
+    let mut lambda_param_tys: Vec<IrType> = Vec::with_capacity(1 + expected_param_tys.len());
+    lambda_param_tys.push(IrType::I32);
+    lambda_param_tys.extend(expected_param_tys.iter().copied());
+
+    // Use a fresh LowerCtx — captures + lambda params become its let
+    // bindings. Cloning the schema resolver / method registry is a
+    // cheap re-use of the outer-side shared maps; the inner walk
+    // never mutates them.
+    const EMPTY_PARAMS: &[LocalBinding] = &[];
+    let mut inner = LowerCtx::new(
+        EMPTY_PARAMS,
+        ctx.schema_resolver.clone(),
+        ctx.method_registry.clone(),
+    );
+
+    // Prologue: load each capture into a fresh inner let-local.
+    let mut inner_let_idx: u32 = 0;
+    for ((name, ty, _outer_idx), offset) in resolved.iter().zip(offsets.iter()) {
+        // Push captures_ptr (local 0), then emit the type-driven load
+        // followed by a LetSet under the source-level name.
+        inner.out.push(TaggedOp {
+            op: Op::LocalGet(0),
+            range: lambda_body.range,
+        });
+        match ty {
+            IrType::I64 => inner.out.push(TaggedOp {
+                op: Op::LoadI64AtAbsolute { offset: *offset },
+                range: lambda_body.range,
+            }),
+            IrType::F64 => inner.out.push(TaggedOp {
+                op: Op::LoadF64AtAbsolute { offset: *offset },
+                range: lambda_body.range,
+            }),
+            IrType::Bool => inner.out.push(TaggedOp {
+                op: Op::LoadI8UAtAbsolute { offset: *offset },
+                range: lambda_body.range,
+            }),
+            IrType::I32 | IrType::Null | IrType::String | IrType::ListInt | IrType::Closure => {
+                inner.out.push(TaggedOp {
+                    op: Op::LoadI32AtAbsolute { offset: *offset },
+                    range: lambda_body.range,
+                })
+            }
+        }
+        inner.out.push(TaggedOp {
+            op: Op::LetSet {
+                idx: inner_let_idx,
+                ty: *ty,
+            },
+            range: lambda_body.range,
+        });
+        inner.lets.push(LetBinding {
+            name: name.clone(),
+            idx: inner_let_idx,
+            ty: *ty,
+            schema_brand: None,
+        });
+        inner_let_idx += 1;
+    }
+    // Lambda's own params: stash each wasm local into a let-local
+    // bound under the source-level name so the body's
+    // `lower_variable` lookup just works.
+    for (i, lp) in lambda_params.iter().enumerate() {
+        let wasm_local_idx = (i + 1) as u32;
+        let ty = expected_param_tys[i];
+        inner.out.push(TaggedOp {
+            op: Op::LocalGet(wasm_local_idx),
+            range: lambda_body.range,
+        });
+        inner.out.push(TaggedOp {
+            op: Op::LetSet {
+                idx: inner_let_idx,
+                ty,
+            },
+            range: lambda_body.range,
+        });
+        inner.lets.push(LetBinding {
+            name: lp.name.clone(),
+            idx: inner_let_idx,
+            ty,
+            schema_brand: None,
+        });
+        inner_let_idx += 1;
+    }
+    inner.next_let_idx = inner_let_idx;
+
+    // Body lowering.
+    lower_expr(&lambda_body.expr, lambda_body.range, &mut inner)?;
+    let body_ty = inner
+        .tstack
+        .last()
+        .copied()
+        .ok_or_else(|| LoweringError::UnsupportedExpr {
+            kind: "Closure(empty-body-stack)".to_string(),
+            range: lambda_body.range,
+        })?;
+    if body_ty.wasm_slot() != expected_ret_ty.wasm_slot() {
+        return Err(LoweringError::StdlibArgTypeMismatch {
+            name: "closure-return".to_string(),
+            arg_idx: 0,
+            got: body_ty,
+            expected: expected_ret_ty,
+            range: lambda_body.range,
+        });
+    }
+    inner.out.push(TaggedOp {
+        op: Op::Return,
+        range: lambda_body.range,
+    });
+
+    // Nested lambdas inside `inner` would land in `inner.lambda_funcs`;
+    // append them after the outer body so the closure table stays
+    // contiguous. (Phase 10-a doesn't surface nested lambdas through
+    // the user-facing stdlib calls, but the recursion stays sound.)
+    let nested_lambdas = std::mem::take(&mut inner.lambda_funcs);
+
+    // -----------------------------------------------------------------
+    // Outer-side: emit the MakeClosure op. The closure-table slot is
+    // determined by the lambda's position in `ctx.lambda_funcs` —
+    // appending below makes the slot a deterministic index from
+    // source order.
+    // -----------------------------------------------------------------
+    let fn_table_idx = ctx.lambda_funcs.len() as u32;
+    let lambda_func = Func {
+        name: format!("__closure_{}", fn_table_idx),
+        params: lambda_param_tys,
+        ret: expected_ret_ty,
+        body: inner.out,
+        range: closure_range,
+    };
+    ctx.lambda_funcs.push(lambda_func);
+    // Append nested lambdas (if any) immediately after — they'll get
+    // table slots `fn_table_idx + 1..N`.
+    ctx.lambda_funcs.extend(nested_lambdas);
+
+    ctx.out.push(TaggedOp {
+        op: Op::MakeClosure {
+            fn_table_idx,
+            captures,
+            captures_size,
+        },
+        range: closure_range,
+    });
+    ctx.tstack.push(IrType::Closure);
+    Ok(())
 }
 
 /// Phase 4.a: lower an [`Expr::FnCall`] into a stdlib dispatch.
@@ -904,13 +1373,14 @@ fn lower_fn_call(
                     range,
                 });
             }
-            lower_expr(&call_arg.value.expr, call_arg.value.range, ctx)?;
-            let pushed = ctx.tstack.pop().ok_or(LoweringError::UnsupportedExpr {
-                kind: format!("FnCall(arg{i}-stack-empty for `{}`)", method_name),
+            lower_stdlib_arg(
+                stdlib_meta.name,
+                i as u32,
+                &call_arg.value,
+                &stdlib_meta.params,
+                ctx,
                 range,
-            })?;
-            check_stdlib_arg(method_name, i as u32, pushed, &stdlib_meta.params, range)?;
-            ctx.tstack.push(pushed);
+            )?;
         }
         for _ in 0..arity {
             ctx.tstack.pop();
@@ -1005,19 +1475,14 @@ fn lower_fn_call(
                 range,
             });
         }
-        lower_expr(&call_arg.value.expr, call_arg.value.range, ctx)?;
-        let pushed = ctx.tstack.pop().ok_or(LoweringError::UnsupportedExpr {
-            kind: format!("FnCall(arg{}-stack-empty for `{}`)", i + 1, method_name),
-            range,
-        })?;
-        check_stdlib_arg(
-            method_name,
+        lower_stdlib_arg(
+            stdlib_meta.name,
             (i + 1) as u32,
-            pushed,
+            &call_arg.value,
             &stdlib_meta.params,
+            ctx,
             range,
         )?;
-        ctx.tstack.push(pushed);
     }
     for _ in 0..arity {
         ctx.tstack.pop();
@@ -1032,6 +1497,69 @@ fn lower_fn_call(
         range,
     });
     ctx.tstack.push(stdlib_meta.ret);
+    Ok(())
+}
+
+/// Phase 10-a: lower one argument to a stdlib call, routing closure
+/// expressions through `lower_closure_arg` when the matching param
+/// slot is `IrType::Closure`. Validates the resulting IR slot against
+/// the callee's declared param type and surfaces a
+/// `StdlibArgTypeMismatch` when the slots disagree.
+fn lower_stdlib_arg(
+    name: &str,
+    arg_idx: u32,
+    value: &Node,
+    param_tys: &[IrType],
+    ctx: &mut LowerCtx<'_>,
+    call_range: TokenRange,
+) -> Result<(), LoweringError> {
+    let expected =
+        *param_tys
+            .get(arg_idx as usize)
+            .ok_or_else(|| LoweringError::UnknownStdlibMethod {
+                name: name.to_string(),
+                arity: param_tys.len() as u32,
+                range: call_range,
+            })?;
+    if expected == IrType::Closure {
+        // Closure surface: the value expression must be a literal
+        // lambda. Any other shape (a Variable referencing a closure,
+        // a stdlib-returned closure) is out of scope for Phase 10-a.
+        if let Expr::Closure { .. } = &*value.expr {
+            let (param_tys_c, ret_ty_c) =
+                stdlib_closure_arg_signature(name, arg_idx).ok_or_else(|| {
+                    LoweringError::UnsupportedExpr {
+                        kind: format!(
+                            "FnCall(`{}`) arg {} is Closure but no signature side-table entry",
+                            name, arg_idx
+                        ),
+                        range: call_range,
+                    }
+                })?;
+            lower_closure_arg(&value.expr, value.range, &param_tys_c, ret_ty_c, ctx)?;
+        } else {
+            return Err(LoweringError::UnsupportedExpr {
+                kind: format!(
+                    "FnCall(`{}`) arg {} expected Closure literal, got `{}`",
+                    name,
+                    arg_idx,
+                    value.expr.kind()
+                ),
+                range: value.range,
+            });
+        }
+    } else {
+        lower_expr(&value.expr, value.range, ctx)?;
+    }
+    let pushed = ctx
+        .tstack
+        .pop()
+        .ok_or_else(|| LoweringError::UnsupportedExpr {
+            kind: format!("FnCall(arg{}-stack-empty for `{}`)", arg_idx, name),
+            range: call_range,
+        })?;
+    check_stdlib_arg(name, arg_idx, pushed, param_tys, call_range)?;
+    ctx.tstack.push(pushed);
     Ok(())
 }
 
