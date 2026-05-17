@@ -751,4 +751,87 @@ pub enum Op {
     /// Stack effect: `[i32] -> [i32]`. The pre-bump cursor is pushed
     /// after the dynamic size is consumed.
     AllocScratchDyn,
+
+    /// Phase 4.c-2 raw-memory primitive.
+    ///
+    /// Pop an `i32` absolute wasm-memory address and load the
+    /// little-endian `i32` value at `addr + offset`. Stack effect:
+    /// `[i32] -> [i32]`. Lowers to `i32.load offset=N align=2` after
+    /// the address is consumed from the stack.
+    ///
+    /// Distinct from [`Op::LoadField`] / [`Op::LoadFieldAtAbsolute`]
+    /// because the base is supplied by an arbitrary expression (e.g.
+    /// the return of [`Op::AllocScratch`] / [`Op::AllocScratchDyn`])
+    /// rather than the `in_buf` handshake or a schema-instance
+    /// pointer. Stdlib bodies that walk freshly-allocated scratch
+    /// buffers use this op together with [`Op::StoreI32AtAbsolute`]
+    /// to read/write u32 length prefixes without going through the
+    /// fixed-area record machinery.
+    LoadI32AtAbsolute {
+        /// Byte offset added to the popped base address before the
+        /// load. Encoded as the wasm `memarg.offset` immediate.
+        offset: u32,
+    },
+
+    /// Phase 4.c-2 raw-memory primitive.
+    ///
+    /// Pop an `i32` absolute wasm-memory address and load the
+    /// little-endian `i64` value at `addr + offset`. Stack effect:
+    /// `[i32] -> [i64]`. Lowers to `i64.load offset=N align=3`.
+    ///
+    /// Used by stdlib reducers (`list_int_sum`, `list_int_max`) when
+    /// they index into a `List<Int>` record's i64 payload area.
+    LoadI64AtAbsolute {
+        /// Byte offset added to the popped base address before the
+        /// load.
+        offset: u32,
+    },
+
+    /// Phase 4.c-2 raw-memory primitive.
+    ///
+    /// Pop an `i32` value and an `i32` absolute wasm-memory address,
+    /// then store the value at `addr + offset` as a little-endian
+    /// `i32`. Stack discipline mirrors wasm `i32.store`:
+    /// `[addr, value] -> []` (address pushed first, value pushed on
+    /// top). Lowers to `i32.store offset=N align=2`.
+    ///
+    /// Stdlib bodies that build a fresh `String` / `List<Int>`
+    /// record in scratch space use this op to write the leading
+    /// `u32 LE` length prefix.
+    StoreI32AtAbsolute {
+        /// Byte offset added to the address operand before the
+        /// store.
+        offset: u32,
+    },
+
+    /// Phase 4.c-2 raw-memory primitive.
+    ///
+    /// Pop an `i64` value and an `i32` absolute wasm-memory address,
+    /// then store the value at `addr + offset` as a little-endian
+    /// `i64`. Stack discipline: `[addr, value] -> []`. Lowers to
+    /// `i64.store offset=N align=3`.
+    ///
+    /// Used by stdlib reducers when writing `i64` payload elements
+    /// into a freshly allocated `List<Int>` record's payload area.
+    StoreI64AtAbsolute {
+        /// Byte offset added to the address operand before the
+        /// store.
+        offset: u32,
+    },
+
+    /// Phase 4.c-2 raw-memory primitive.
+    ///
+    /// Pop three `i32` values — destination address, source address,
+    /// and byte length — and emit a wasm `memory.copy` instruction.
+    /// Stack discipline mirrors the wasm instruction:
+    /// `[dst, src, len] -> []` (dst pushed first, src next, len on
+    /// top). Codegen lowers to `memory.copy dst_mem=0 src_mem=0`.
+    ///
+    /// Used by stdlib bodies that splice bytes between scratch
+    /// buffers and existing String / List<Int> records without
+    /// going through the tail-record machinery (`concat`,
+    /// `substring`, ...). The `MemoryCopy` instruction is part of
+    /// the wasm bulk-memory proposal which wasmtime keeps enabled
+    /// by default, so no engine feature gate is required.
+    MemcpyAtAbsolute,
 }
