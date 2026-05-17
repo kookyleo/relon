@@ -17,6 +17,7 @@
 //! See `docs/internal/wasm-crate-structure-2026-05-16.md` for the
 //! IR-first crate split rationale.
 
+pub mod case_folding;
 pub mod error;
 pub mod ir;
 pub mod lowering;
