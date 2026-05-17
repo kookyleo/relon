@@ -201,20 +201,29 @@ pub struct WasmAotEvaluator {
 }
 
 impl WasmAotEvaluator {
-    /// Compile `src` through a disk-backed [`AotCache`]. On a cache hit
-    /// the pipeline skips parse / analyze / lower / codegen and goes
-    /// straight from cached wasm bytes into `wasmtime::Module::new`.
-    /// On a miss the full compile runs and the result is stored back
-    /// into the cache before being returned.
+    /// Compile `src` through a disk-backed [`AotCache`]. The fast path
+    /// avoids both the codegen pipeline (parse / analyze / lower /
+    /// codegen) *and* cranelift JIT when the cache holds a matching
+    /// `.native` sidecar:
     ///
-    /// The cache key is `sha256(src)`, computed inline so callers can
-    /// hand in any source string without pre-hashing. Cache validity is
-    /// gated by the persisted `abi_version` + `codegen_version` — see
-    /// [`crate::cache`] for the full invalidation matrix.
+    ///  * three-way hit (`.wasm` + `.schemas` + matching `.native`)
+    ///    → `wasmtime::Module::deserialize`, no JIT.
+    ///  * partial hit (`.wasm` + `.schemas`, no native or drifted
+    ///    native) → `wasmtime::Module::new` (JIT) + write a fresh
+    ///    `.native` sidecar for the next call.
+    ///  * full miss → run the codegen pipeline, write all sidecars,
+    ///    return the evaluator.
     ///
-    /// Returns the same [`WasmAotEvaluator`] shape as [`Self::from_source`]
-    /// so callers can drop the cache in front of an existing call site
-    /// without touching the post-construction surface.
+    /// The cache key is `sha256(src)`. Cache validity is gated by the
+    /// persisted `abi_version` + `codegen_version` for the wasm side
+    /// and by the host's wasmtime version + target triple for the
+    /// native side — see [`crate::cache`] for the full invalidation
+    /// matrix.
+    ///
+    /// Returns the same [`WasmAotEvaluator`] shape as
+    /// [`Self::from_source`] so callers can drop the cache in front of
+    /// an existing call site without touching the post-construction
+    /// surface.
     pub fn from_source_with_cache(src: &str, cache: &AotCache) -> Result<Self, BuildError> {
         let source_hash = AotCache::source_hash(src);
         // Cache hit short-circuits the entire compile pipeline. The
@@ -224,7 +233,61 @@ impl WasmAotEvaluator {
         // analyze / lowering.
         if let Some(entry) = cache.load(source_hash).map_err(cache_err)? {
             if let Some(schemas) = entry.schemas {
-                return Self::from_bytes(entry.wasm_bytes, schemas.main, schemas.return_);
+                // The `.native` sidecar is independent of `.schemas` —
+                // a hit there means cranelift already JIT'd this exact
+                // wasm under the current wasmtime version + target
+                // triple, so we can hand the bytes straight to
+                // `Module::deserialize` and skip the JIT entirely.
+                let native = cache.load_native(source_hash).map_err(cache_err)?;
+                let engine = Engine::default();
+                // Three-way decision tree:
+                //   * native blob present + deserialise OK  → no JIT, no write-back.
+                //   * native blob present + deserialise Err → silently
+                //     fall back to JIT (the on-disk blob is corrupted
+                //     or somehow slipped past the compat hash check);
+                //     write a fresh blob back so the next call hits
+                //     the fast path.
+                //   * no native blob                        → JIT +
+                //     write the blob for the next call.
+                // The corruption fallback is what makes the cache
+                // self-healing: hosts that hit transient FS issues
+                // (partial write, NFS truncation) recover on the
+                // following run rather than panicking forever.
+                let (compiled, write_back_native) = match native {
+                    Some(blob) => match deserialize_native(&engine, &blob.bytes) {
+                        Ok(m) => (m, false),
+                        Err(_) => (
+                            WtModule::new(&engine, &entry.wasm_bytes)
+                                .map_err(|e| BuildError::WasmInstantiateError(e.to_string()))?,
+                            true,
+                        ),
+                    },
+                    None => (
+                        WtModule::new(&engine, &entry.wasm_bytes)
+                            .map_err(|e| BuildError::WasmInstantiateError(e.to_string()))?,
+                        true,
+                    ),
+                };
+                // Best-effort: write the freshly JIT'd native blob
+                // back so the next cold start hits the deserialize
+                // fast path. A serialise / write failure is logged
+                // via the error path rather than fatal because the
+                // evaluator is already fully constructed at this
+                // point — falling over on a cache write would surprise
+                // hosts that happen to evaluate from a read-only
+                // mount.
+                if write_back_native {
+                    if let Ok(native_bytes) = compiled.serialize() {
+                        let _ = cache.store_native(source_hash, &native_bytes);
+                    }
+                }
+                return Self::from_parts(
+                    engine,
+                    compiled,
+                    entry.wasm_bytes,
+                    schemas.main,
+                    schemas.return_,
+                );
             }
             // The cached `.meta` was written by a schemaless `store`
             // call. We have wasm bytes but no schemas — fall through
@@ -251,7 +314,54 @@ impl WasmAotEvaluator {
                 },
             )
             .map_err(cache_err)?;
-        Self::from_bytes(bytes, main_schema, return_schema)
+        let evaluator = Self::from_bytes(bytes, main_schema, return_schema)?;
+        // Best-effort: persist the cranelift-emitted native code so the
+        // *next* cold start of this same source skips the JIT entirely
+        // through `Module::deserialize`. Write failures are silent
+        // (read-only mount, transient ENOSPC, …); they leave the
+        // existing `.wasm` / `.schemas` sidecars in place, so a
+        // subsequent run still hits the partial-hit JIT-then-save path
+        // and gets another chance to produce the sidecar.
+        if let Ok(native_bytes) = evaluator.compiled.serialize() {
+            let _ = cache.store_native(source_hash, &native_bytes);
+        }
+        Ok(evaluator)
+    }
+
+    /// Build an evaluator from an already-prepared engine / compiled
+    /// module pair plus the canonical schemas. Used by the cache-hit
+    /// fast path so it can hand in a `Module::deserialize`-rehydrated
+    /// module without paying for JIT compilation a second time. Wasm
+    /// bytes are still required for `WasmModule::from_bytes` (which
+    /// parses the `relon.abi` / `relon.srcmap` / `relon.uctab` custom
+    /// sections we need at runtime).
+    fn from_parts(
+        engine: Engine,
+        compiled: WtModule,
+        wasm_bytes: Vec<u8>,
+        main_schema: Schema,
+        return_schema: Schema,
+    ) -> Result<Self, BuildError> {
+        Self::reject_unsupported_fields(&main_schema)?;
+        Self::reject_unsupported_fields(&return_schema)?;
+        let main_layout = SchemaLayout::offsets_for(&main_schema)
+            .map_err(|e| BuildError::LoweringError(format!("main schema layout: {e}")))?;
+        let return_layout = SchemaLayout::offsets_for(&return_schema)
+            .map_err(|e| BuildError::LoweringError(format!("return schema layout: {e}")))?;
+        let module = WasmModule::from_bytes(wasm_bytes)
+            .map_err(|e| BuildError::WasmLoadError(e.to_string()))?;
+        Ok(Self {
+            module,
+            engine,
+            compiled,
+            main_schema,
+            return_schema,
+            main_layout,
+            return_layout,
+            out_cap: DEFAULT_OUT_CAP,
+            cap_grants: Capabilities::default().to_cap_bitmap(),
+            session_pool: Mutex::new(Vec::new()),
+        })
     }
 
     /// Compile `src` end-to-end and return a ready-to-call evaluator.
@@ -698,6 +808,37 @@ impl WasmAotEvaluator {
 /// don't need to learn two error vocabularies.
 fn cache_err(e: CacheError) -> BuildError {
     BuildError::CacheError(e.to_string())
+}
+
+/// Hand a previously-serialised cranelift blob back to wasmtime,
+/// skipping the JIT pass.
+///
+/// The function exists as a tiny dedicated wrapper so the unsafe
+/// invocation has exactly one source-level location and one
+/// SAFETY comment to audit. Callers must ensure `native_bytes`
+/// came from a matching `AotCache::load_native` call — that's the
+/// codepath that gates the read on the wasmtime version + target
+/// triple stamp recorded in the meta sidecar.
+#[allow(unsafe_code)]
+fn deserialize_native(engine: &Engine, native_bytes: &[u8]) -> Result<WtModule, String> {
+    // SAFETY: `native_bytes` is the verbatim output of
+    // `wasmtime::Module::serialize` written by this crate's
+    // `AotCache::store_native`. `AotCache::load_native` already
+    // rejected any blob whose meta sidecar's `native_compat_hash`
+    // disagrees with the current host's wasmtime version + target
+    // triple fingerprint, so we never feed `deserialize` cross-
+    // version or cross-architecture bytes. wasmtime additionally
+    // performs its own version + magic check inside
+    // `Module::deserialize` (cf. its docs: "this function is designed
+    // to be safe receiving output from *any* compiled version of
+    // wasmtime itself"), so a forged blob that slipped past our
+    // compat hash would still surface as `Err`, not UB. The unsafe
+    // contract we have to uphold is therefore: read bytes only from
+    // the cache directory the host configured, and stamp the meta on
+    // every write — both invariants live in `cache.rs`.
+    let module = unsafe { WtModule::deserialize(engine, native_bytes) }
+        .map_err(|e| format!("wasm deserialize: {e}"))?;
+    Ok(module)
 }
 
 /// Combine the main and return schemas into a single 32-byte schema
