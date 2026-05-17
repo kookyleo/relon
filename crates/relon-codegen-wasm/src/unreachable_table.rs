@@ -66,6 +66,9 @@ const TAG_INDEX_OUT_OF_BOUNDS: u32 = 5;
 /// Phase 4.c-2: an empty-list-requires-element reducer
 /// (`list_int_max`) was called with a zero-length receiver.
 const TAG_EMPTY_LIST: u32 = 6;
+/// v3+ a-4: Unicode-aware `upper` / `lower` stdlib bodies hit a byte
+/// sequence that does not decode as valid UTF-8.
+const TAG_INVALID_UTF8: u32 = 7;
 
 // Indexes into the static "kind" tag table used by [`UnreachableKind::ValueTooLarge`].
 // New tags append; the existing indices are part of the on-disk format.
@@ -150,6 +153,13 @@ pub enum UnreachableKind {
     /// (`list_int_max`) tripped on an empty receiver. Carries no
     /// payload; the call-site source range comes from the srcmap.
     EmptyList,
+
+    /// v3+ a-4: the Unicode-aware `upper` / `lower` stdlib bodies
+    /// rejected a malformed UTF-8 byte sequence in the receiver
+    /// string. Carries no payload; the call-site srcmap range carries
+    /// the source location of the surface call (`s.upper()` /
+    /// `upper(s)`).
+    InvalidUtf8,
 }
 
 impl UnreachableKind {
@@ -177,6 +187,7 @@ impl UnreachableKind {
             UnreachableKind::ScratchOOM { needed } => (TAG_SCRATCH_OOM, *needed),
             UnreachableKind::IndexOutOfBounds => (TAG_INDEX_OUT_OF_BOUNDS, 0),
             UnreachableKind::EmptyList => (TAG_EMPTY_LIST, 0),
+            UnreachableKind::InvalidUtf8 => (TAG_INVALID_UTF8, 0),
         }
     }
 }
@@ -371,6 +382,7 @@ pub fn decode_from_bytes(bytes: &[u8]) -> Result<UnreachableTable, UnreachableTa
             TAG_SCRATCH_OOM => UnreachableKind::ScratchOOM { needed: payload },
             TAG_INDEX_OUT_OF_BOUNDS => UnreachableKind::IndexOutOfBounds,
             TAG_EMPTY_LIST => UnreachableKind::EmptyList,
+            TAG_INVALID_UTF8 => UnreachableKind::InvalidUtf8,
             other => return Err(UnreachableTableError::UnknownKindTag { index, tag: other }),
         };
         entries.push(UnreachableEntry { pc, kind });

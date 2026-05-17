@@ -836,6 +836,14 @@ struct ConstPool {
     /// at the list header (`[len: u32][off_0]...`). Each entry's
     /// per-String tail record was emitted earlier in `bytes`.
     list_string_offsets: HashMap<u32, u32>,
+    /// v3+ a-4: byte offset of the simple Unicode upper-folding table.
+    /// `Some(off)` only when at least one reachable function body
+    /// references `Op::CaseFoldTableAddr { upper: true }`. Layout:
+    /// `[count: u32 LE][(input_cp: u32, output_cp: u32) × count]`.
+    case_fold_upper_offset: Option<u32>,
+    /// v3+ a-4: byte offset of the simple Unicode lower-folding table.
+    /// Mirrors `case_fold_upper_offset` on the lowercase side.
+    case_fold_lower_offset: Option<u32>,
 }
 
 impl ConstPool {
@@ -876,6 +884,20 @@ impl ConstPool {
         self.list_string_offsets
             .get(&idx)
             .map(|off| DATA_SECTION_BASE + off)
+            .ok_or(CodegenError::MixedNumericTypes)
+    }
+
+    /// v3+ a-4: lookup the absolute address of the simple upper or
+    /// lower case-folding table. Errors when no reachable function
+    /// body referenced the matching `Op::CaseFoldTableAddr` — which is
+    /// a codegen invariant violation if the collector ran first.
+    fn case_fold_addr(&self, upper: bool) -> Result<u32, CodegenError> {
+        let off = if upper {
+            self.case_fold_upper_offset
+        } else {
+            self.case_fold_lower_offset
+        };
+        off.map(|o| DATA_SECTION_BASE + o)
             .ok_or(CodegenError::MixedNumericTypes)
     }
 }
@@ -1108,6 +1130,43 @@ fn collect_consts(body: &[relon_ir::TaggedOp], pool: &mut ConstPool) -> Result<(
                     pool.bytes.extend_from_slice(&addr.to_le_bytes());
                 }
                 pool.list_string_offsets.insert(*idx, header_offset);
+            }
+            Op::CaseFoldTableAddr { upper } => {
+                // v3+ a-4: lay out the simple Unicode case-folding
+                // tables on first reference. Layout matches what the
+                // wasm body binary-search expects:
+                // `[count: u32 LE][(in: u32, out: u32) × count]`.
+                // Each entry is 8 bytes — a single sorted-array stride
+                // the loop body can rebase against `mid * 8 + 4`.
+                //
+                // The collector runs over every emitted function body
+                // (stdlib + user) so the table lands in the const pool
+                // exactly when at least one reachable upper/lower
+                // body remains after DCE.
+                let slot = if *upper {
+                    &mut pool.case_fold_upper_offset
+                } else {
+                    &mut pool.case_fold_lower_offset
+                };
+                if slot.is_none() {
+                    // 4-byte alignment so the leading u32 count loads
+                    // cleanly; each entry is 8 bytes so subsequent
+                    // (k, v) pairs stay naturally aligned.
+                    while !pool.bytes.len().is_multiple_of(4) {
+                        pool.bytes.push(0);
+                    }
+                    let offset = u32::try_from(pool.bytes.len()).map_err(|_| {
+                        CodegenError::Layout("const data section exceeds u32 bytes".into())
+                    })?;
+                    let table: &[(u32, u32)] = if *upper {
+                        relon_ir::case_folding::simple_upper_folding()
+                    } else {
+                        relon_ir::case_folding::simple_lower_folding()
+                    };
+                    let bytes = relon_ir::case_folding::encode_table_bytes(table);
+                    pool.bytes.extend_from_slice(&bytes);
+                    *slot = Some(offset);
+                }
             }
             Op::If {
                 then_body,
@@ -1873,6 +1932,17 @@ fn emit_op_seq(
                 vstack.push(IrType::ListString);
                 ranges.push(tagged.range);
             }
+            Op::CaseFoldTableAddr { upper } => {
+                // v3+ a-4: emit `i32.const <table_addr>` — the absolute
+                // wasm-memory address of the matching simple case
+                // folding table. The const pool collector guaranteed
+                // the table was emitted before code emit ran, so the
+                // lookup never errors in practice.
+                let addr = const_pool.case_fold_addr(*upper)?;
+                f.instruction(&Instruction::I32Const(addr as i32));
+                vstack.push(IrType::I32);
+                ranges.push(tagged.range);
+            }
             Op::LetGet { idx, ty } => {
                 let local_idx = ectx
                     .first_let_local()
@@ -2569,6 +2639,7 @@ fn emit_op_seq(
                 let uctab_kind = match kind {
                     relon_ir::TrapKind::IndexOutOfBounds => UnreachableKind::IndexOutOfBounds,
                     relon_ir::TrapKind::EmptyList => UnreachableKind::EmptyList,
+                    relon_ir::TrapKind::InvalidUtf8 => UnreachableKind::InvalidUtf8,
                 };
                 emit_recorded_unreachable(f, ranges, log, tagged.range, uctab_kind);
             }
@@ -4651,6 +4722,9 @@ impl WasmModule {
                         range: range.unwrap_or_default(),
                     },
                     Some(UnreachableKind::EmptyList) => RuntimeError::WasmEmptyList {
+                        range: range.unwrap_or_default(),
+                    },
+                    Some(UnreachableKind::InvalidUtf8) => RuntimeError::WasmInvalidUtf8 {
                         range: range.unwrap_or_default(),
                     },
                     None => RuntimeError::WasmTrapUnclassified {
