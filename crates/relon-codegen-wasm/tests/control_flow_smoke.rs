@@ -247,6 +247,7 @@ fn loop_sum_module() -> (Vec<u8>, Schema, Schema, OffsetTable, OffsetTable) {
             body,
         }],
         entry_func_index: Some(0),
+        closure_table: vec![],
     };
 
     let bytes = compile_module(&ir, &main_schema, &return_schema).expect("compile");
@@ -409,6 +410,7 @@ fn scratch_loop_module() -> (Vec<u8>, Schema, Schema, OffsetTable, OffsetTable) 
             body,
         }],
         entry_func_index: Some(0),
+        closure_table: vec![],
     };
 
     let bytes = compile_module(&ir, &main_schema, &return_schema).expect("compile");
@@ -496,6 +498,7 @@ fn alloc_scratch_oom_traps_with_scratch_oom_kind() {
             body,
         }],
         entry_func_index: Some(0),
+        closure_table: vec![],
     };
     let wasm = compile_module(&ir, &main_schema, &return_schema).expect("compile");
     let module = WasmModule::from_bytes(wasm.clone()).expect("load");
@@ -577,6 +580,7 @@ fn alloc_scratch_dyn_with_in_len_succeeds() {
             body,
         }],
         entry_func_index: Some(0),
+        closure_table: vec![],
     };
     let wasm = compile_module(&ir, &main_schema, &return_schema).expect("compile");
 

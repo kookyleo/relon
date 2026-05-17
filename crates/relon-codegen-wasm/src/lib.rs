@@ -68,9 +68,10 @@ use relon_ir::{
 use relon_parser::TokenRange;
 use std::collections::HashMap;
 use wasm_encoder::{
-    BlockType, CodeSection, ConstExpr, CustomSection, DataSection, EntityType, ExportKind,
-    ExportSection, Function, FunctionSection, GlobalSection, GlobalType, Ieee64, ImportSection,
-    Instruction, MemArg, MemorySection, MemoryType, Module, TypeSection, ValType,
+    BlockType, CodeSection, ConstExpr, CustomSection, DataSection, ElementSection, Elements,
+    EntityType, ExportKind, ExportSection, Function, FunctionSection, GlobalSection, GlobalType,
+    Ieee64, ImportSection, Instruction, MemArg, MemorySection, MemoryType, Module, RefType,
+    TableSection, TableType, TypeSection, ValType,
 };
 
 /// Memory export name used by the binary handshake.
@@ -141,12 +142,29 @@ const TAIL_CURSOR_LOCAL_OFFSET: u32 = 1;
 const MEMCPY_SRC_LOCAL_OFFSET: u32 = 2;
 const MEMCPY_LEN_LOCAL_OFFSET: u32 = 3;
 const RECORD_STORE_TMP_LOCAL_OFFSET: u32 = 4;
+/// Phase 10-a: closure-call argument spill slots. `Op::CallClosure`
+/// needs to reorder the operand stack before emitting `call_indirect`
+/// (the wasm side wants `[captures_ptr, ...args, fn_table_idx]`, but
+/// the IR delivers `[closure, ...args]`). Codegen pops the args into
+/// these reserved slots, then re-pushes in the correct order. Three
+/// slots cover every Phase-10-a higher-order stdlib body (`map` /
+/// `filter` use a single i64 arg; `fold` uses two i64 args; the i32
+/// slot is reserved for future closure shapes that take a pointer
+/// argument such as `find` or `any`).
+const CLOSURE_ARG_I32_LOCAL_OFFSET: u32 = 5;
+const CLOSURE_ARG_I64_A_LOCAL_OFFSET: u32 = 6;
+const CLOSURE_ARG_I64_B_LOCAL_OFFSET: u32 = 7;
+/// Phase 10-a: scratch slot for the closure handle pointer while
+/// `Op::CallClosure` pops the args off the operand stack. The handle
+/// is the bottom of the call's operand window (`[closure, arg0, ...]`)
+/// so we spill it after popping the args.
+const CLOSURE_HANDLE_LOCAL_OFFSET: u32 = 8;
 /// First local-area slot reserved for user-let bindings (immediately
-/// past the five scratch slots above). `Op::LetSet`/`Op::LetGet`'s
+/// past the eight scratch slots above). `Op::LetSet`/`Op::LetGet`'s
 /// `idx` is added on top of this offset, then the per-function
 /// `params.len()` is added at emit time to produce the absolute wasm
 /// local index.
-const FIRST_LET_LOCAL_OFFSET: u32 = 5;
+const FIRST_LET_LOCAL_OFFSET: u32 = 9;
 
 /// Lower a [`LoweredEntry`] to a wasm binary.
 ///
@@ -363,6 +381,28 @@ pub fn compile_module_with_host_fns(
     let mut per_func_unreachables: Vec<Vec<RecordedUnreachable>> =
         Vec::with_capacity(combined_funcs.len());
 
+    // Phase 10-a: register wasm type-indices for every closure
+    // signature observed in any function body's `Op::CallClosure`.
+    // The implicit leading `captures_ptr: i32` is prepended to each
+    // signature when emitting the wasm type. The table is filled
+    // before the function-emit loop so `emit_call_closure` can look
+    // up its `call_indirect` type immediate cheaply.
+    let mut closure_signatures: Vec<(Vec<IrType>, IrType)> = Vec::new();
+    for func in &combined_funcs {
+        collect_closure_call_signatures(&func.body, &mut closure_signatures);
+    }
+    let mut closure_type_table: Vec<(Vec<IrType>, IrType, u32)> =
+        Vec::with_capacity(closure_signatures.len());
+    for (param_tys, ret_ty) in &closure_signatures {
+        // Pre-pend the implicit captures_ptr slot.
+        let mut params_vt: Vec<ValType> = Vec::with_capacity(param_tys.len() + 1);
+        params_vt.push(ValType::I32);
+        params_vt.extend(param_tys.iter().map(ir_to_val_type));
+        let ret_vt = ir_to_val_type(ret_ty);
+        let type_index = ensure_type(&mut types, &mut type_table, &params_vt, ret_vt);
+        closure_type_table.push((param_tys.clone(), *ret_ty, type_index));
+    }
+
     for (func_index, func) in combined_funcs.iter().enumerate() {
         let params_vt: Vec<ValType> = func.params.iter().map(ir_to_val_type).collect();
         let ret_vt = ir_to_val_type(&func.ret);
@@ -384,6 +424,7 @@ pub fn compile_module_with_host_fns(
             in_ptr_global_index,
             scratch_cursor_global_index,
             data_top,
+            closure_type_table: &closure_type_table,
         };
         let (body, ranges, unreachable_log) = emit_function_body(
             func,
@@ -398,12 +439,59 @@ pub fn compile_module_with_host_fns(
         per_func_unreachables.push(unreachable_log);
     }
 
+    // Phase 10-a: emit the wasm `funcref` table backing closure
+    // call sites. One slot per entry in `ir.closure_table`; the
+    // matching `ElementSection` (emitted after exports per the
+    // wasm canonical section order) initialises each slot with the
+    // wasm-level function index of the lambda's body.
+    //
+    // The table is emitted whenever the module contains any
+    // `Op::CallClosure` instructions — even when no user code
+    // produces lambdas. Bundled stdlib bodies (`list_int_map`,
+    // `list_int_filter`, `list_int_fold`) always emit
+    // `call_indirect` against table 0, so the table must exist
+    // for the module to load even when no lambdas were actually
+    // emitted by the lowering pass. Size = max(closure_table.len(),
+    // 1) so empty tables still create a valid `table 0` import for
+    // the call_indirect immediates.
+    let needs_table = !closure_signatures.is_empty();
+    let closure_table_entries: Vec<u32> = ir
+        .closure_table
+        .iter()
+        .map(|&ir_fn_idx| ir_fn_idx + stdlib_count as u32 + import_count)
+        .collect();
+    let table_size = closure_table_entries
+        .len()
+        .max(if needs_table { 1 } else { 0 }) as u64;
+    let mut tables = TableSection::new();
+    if needs_table {
+        tables.table(TableType {
+            element_type: RefType::FUNCREF,
+            table64: false,
+            minimum: table_size,
+            maximum: Some(table_size),
+            shared: false,
+        });
+    }
+
     module.section(&types);
     module.section(&imports);
     module.section(&functions);
+    if needs_table {
+        module.section(&tables);
+    }
     module.section(&memories);
     module.section(&globals);
     module.section(&exports);
+    if needs_table && !closure_table_entries.is_empty() {
+        let mut elements = ElementSection::new();
+        elements.active(
+            Some(0),
+            &ConstExpr::i32_const(0),
+            Elements::Functions(closure_table_entries.as_slice().into()),
+        );
+        module.section(&elements);
+    }
     module.section(&codes);
 
     // Initialise the const-data region inside linear memory. Active
@@ -464,8 +552,8 @@ pub fn compile_module_with_host_fns(
 /// [`emit_function_body`] so the wasm-side function-index translation
 /// for `Op::Call` and the capability-check prologue for
 /// `Op::CallNative` share a single source of truth.
-#[derive(Debug, Clone, Copy)]
-struct FunctionEmitCfg {
+#[derive(Debug, Clone)]
+struct FunctionEmitCfg<'a> {
     /// Number of `#native` imports preceding the stdlib + user
     /// functions in the wasm function-index space.
     import_count: u32,
@@ -493,6 +581,12 @@ struct FunctionEmitCfg {
     /// initial value so it never overlaps with the read-only data
     /// region.
     data_top: u32,
+    /// Phase 10-a: pre-computed wasm type indices for every observed
+    /// closure signature in the module. Codegen `Op::CallClosure`
+    /// looks up `(user-param_tys, ret_ty)` here to find the matching
+    /// `call_indirect` type immediate. Empty when the module has no
+    /// lambdas / closure call sites.
+    closure_type_table: &'a [(Vec<IrType>, IrType, u32)],
 }
 
 /// Look up an existing `(params, ret) -> type index` entry or add a
@@ -945,9 +1039,17 @@ fn emit_function_body(
     // only lined up for the entry function's four-param prologue.
     let mut locals_header: Vec<(u32, ValType)> = vec![(1, store_local_ty)];
     // Reserve TAIL_CURSOR / MEMCPY_SRC / MEMCPY_LEN / RECORD_STORE_TMP
-    // (4 contiguous i32 slots so the let-locals always start at
-    // relative offset `FIRST_LET_LOCAL_OFFSET = 5`).
+    // (4 contiguous i32 slots).
     locals_header.push((4, ValType::I32));
+    // Phase 10-a: closure-call spill slots — one i32, two i64s, and
+    // the i32 closure-handle slot — reserved unconditionally so the
+    // let-local numbering stays stable across bodies that do and
+    // don't issue `Op::CallClosure`. Wasm validators accept unused
+    // local declarations; the per-function cost is one extra LEB128
+    // count entry in the function's locals header.
+    locals_header.push((1, ValType::I32)); // CLOSURE_ARG_I32
+    locals_header.push((2, ValType::I64)); // CLOSURE_ARG_I64_A / _B
+    locals_header.push((1, ValType::I32)); // CLOSURE_HANDLE
     let mut let_locals_count: u32 = 0;
     if let Some(max_idx) = max_let_idx {
         // Allocate one local per declared user-let. Grouping by
@@ -1128,6 +1230,7 @@ fn emit_function_body(
         scratch_cursor_global_index: emit_cfg.scratch_cursor_global_index,
         is_entry,
         params_count,
+        closure_type_table: emit_cfg.closure_type_table.to_vec(),
     };
     let _ = return_root_size; // referenced earlier in this function
     emit_op_seq(
@@ -1210,6 +1313,39 @@ fn collect_let_locals_inner(
     Ok(())
 }
 
+/// Phase 10-a: walk a body (descending into structured-control
+/// children) and dedup-record every `(user-visible param_tys, ret_ty)`
+/// pair appearing on an `Op::CallClosure`. The caller registers one
+/// wasm type per recorded shape so `call_indirect` can reference it
+/// via the matching type-index immediate.
+fn collect_closure_call_signatures(
+    body: &[relon_ir::TaggedOp],
+    out: &mut Vec<(Vec<IrType>, IrType)>,
+) {
+    for tagged in body {
+        match &tagged.op {
+            Op::CallClosure { param_tys, ret_ty } => {
+                let key = (param_tys.clone(), *ret_ty);
+                if !out.iter().any(|entry| entry == &key) {
+                    out.push(key);
+                }
+            }
+            Op::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                collect_closure_call_signatures(then_body, out);
+                collect_closure_call_signatures(else_body, out);
+            }
+            Op::Block { body, .. } | Op::Loop { body, .. } => {
+                collect_closure_call_signatures(body, out);
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Phase 7: paired-with-`ranges` recorder for every `unreachable`
 /// instruction the codegen emits. Each entry stores the position in
 /// the per-function `ranges` vector at which the `Unreachable` op
@@ -1255,7 +1391,7 @@ fn emit_recorded_unreachable(
 /// op walker. Carries the indices / sizes the dict-construction ops
 /// need at every emit site without copying them through every
 /// helper signature.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct EmitCtx {
     /// Wasm-local index of the first record-base local in the
     /// function. An IR `record_local_idx` of `n` maps to
@@ -1300,6 +1436,15 @@ struct EmitCtx {
     /// function uses four (the binary-handshake slots); stdlib
     /// bodies use whatever their declared signature pins them at.
     params_count: u32,
+    /// Phase 10-a: pre-registered wasm `type` indices for every
+    /// closure signature observed across the module. Built once by
+    /// `compile_module_with_host_fns` from a scan of all
+    /// `Op::CallClosure` ops + every lambda func signature; codegen
+    /// `Op::CallClosure` looks up the matching type by linear-scanning
+    /// this slice. The keying is `(user-visible param_tys, ret_ty)`
+    /// — the implicit leading `captures_ptr` slot is part of the
+    /// registered type but not stored in the key.
+    closure_type_table: Vec<(Vec<IrType>, IrType, u32)>,
 }
 
 impl EmitCtx {
@@ -1336,6 +1481,51 @@ impl EmitCtx {
     /// Absolute wasm-local index of the first user-let slot.
     fn first_let_local(&self) -> u32 {
         self.params_count + FIRST_LET_LOCAL_OFFSET
+    }
+
+    /// Phase 10-a: absolute wasm-local index of the i32 closure-call
+    /// arg spill slot. Used by `Op::CallClosure` codegen when one of
+    /// the user-visible args is an i32 (Bool, String, ListInt,
+    /// Closure, Null).
+    fn closure_arg_i32_local(&self) -> u32 {
+        self.params_count + CLOSURE_ARG_I32_LOCAL_OFFSET
+    }
+
+    /// Phase 10-a: absolute wasm-local index of the first i64
+    /// closure-call arg spill slot.
+    fn closure_arg_i64_a_local(&self) -> u32 {
+        self.params_count + CLOSURE_ARG_I64_A_LOCAL_OFFSET
+    }
+
+    /// Phase 10-a: absolute wasm-local index of the second i64
+    /// closure-call arg spill slot. Only consumed by stdlib bodies
+    /// that pass two i64 args through a closure (e.g.
+    /// `list_int_fold`'s `(acc, x)` shape).
+    fn closure_arg_i64_b_local(&self) -> u32 {
+        self.params_count + CLOSURE_ARG_I64_B_LOCAL_OFFSET
+    }
+
+    /// Phase 10-a: absolute wasm-local index of the closure-handle
+    /// spill slot. The op codegen stashes the closure handle here
+    /// after popping the args, then re-reads both halves
+    /// (captures_ptr at +4, fn_table_idx at +0) when arranging the
+    /// `call_indirect` operand stack.
+    fn closure_handle_local(&self) -> u32 {
+        self.params_count + CLOSURE_HANDLE_LOCAL_OFFSET
+    }
+
+    /// Phase 10-a: look up the wasm type-index for a closure
+    /// signature. The lookup compares the user-visible param tys +
+    /// ret_ty against the pre-registered entries built by
+    /// `compile_module_with_host_fns`. Returns `None` when the
+    /// signature isn't known — codegen surfaces that as a layout
+    /// error so a hand-built IR with an unregistered closure
+    /// signature fails deterministically.
+    fn closure_type_index(&self, param_tys: &[IrType], ret_ty: IrType) -> Option<u32> {
+        self.closure_type_table
+            .iter()
+            .find(|(p, r, _)| p.as_slice() == param_tys && *r == ret_ty)
+            .map(|(_, _, idx)| *idx)
     }
 }
 
@@ -2069,6 +2259,59 @@ fn emit_op_seq(
                 }));
                 ranges.push(tagged.range);
             }
+            Op::LoadF64AtAbsolute { offset } => {
+                // Pop an i32 base address, load 8 raw bytes as f64.
+                // Used by the closure-conversion prologue to read an
+                // F64 capture from the scratch-allocated captures
+                // struct without going through the `LoadFieldAtAbsolute`
+                // path (which rebases through `in_ptr`).
+                let popped = vstack.pop().ok_or(CodegenError::MixedNumericTypes)?;
+                if popped.wasm_slot() != IrType::I32 {
+                    return Err(CodegenError::MixedNumericTypes);
+                }
+                f.instruction(&Instruction::F64Load(MemArg {
+                    offset: *offset as u64,
+                    align: 3,
+                    memory_index: 0,
+                }));
+                ranges.push(tagged.range);
+                vstack.push(IrType::F64);
+            }
+            Op::StoreF64AtAbsolute { offset } => {
+                // Pop value (f64) then address (i32). Mirror of the
+                // `StoreI64AtAbsolute` shape.
+                let value = vstack.pop().ok_or(CodegenError::MixedNumericTypes)?;
+                let addr = vstack.pop().ok_or(CodegenError::MixedNumericTypes)?;
+                if value.wasm_slot() != IrType::F64 || addr.wasm_slot() != IrType::I32 {
+                    return Err(CodegenError::MixedNumericTypes);
+                }
+                f.instruction(&Instruction::F64Store(MemArg {
+                    offset: *offset as u64,
+                    align: 3,
+                    memory_index: 0,
+                }));
+                ranges.push(tagged.range);
+            }
+            Op::MakeClosure {
+                fn_table_idx,
+                captures,
+                captures_size,
+            } => {
+                emit_make_closure(
+                    f,
+                    ranges,
+                    log,
+                    ectx,
+                    *fn_table_idx,
+                    captures,
+                    *captures_size,
+                    tagged.range,
+                )?;
+                vstack.push(IrType::Closure);
+            }
+            Op::CallClosure { param_tys, ret_ty } => {
+                emit_call_closure(f, ranges, vstack, ectx, param_tys, *ret_ty, tagged.range)?;
+            }
             Op::Trap { kind } => {
                 // Map the IR-level trap kind to the matching uctab
                 // discriminant and emit a recorded `unreachable`.
@@ -2395,6 +2638,255 @@ fn emit_check_cap_inline(
     ranges.push(range);
 }
 
+/// Phase 10-a: emit a `MakeClosure` op into the function body. The
+/// generated wasm sequence allocates an 8-byte handle in the scratch
+/// heap (`[fn_table_idx: u32 LE][captures_ptr: u32 LE]`), populates a
+/// captures struct sized to fit the listed captures, and leaves the
+/// handle pointer on the operand stack.
+///
+/// ```text
+/// ;; allocate captures struct (skipped when captures_size == 0)
+/// alloc_scratch(captures_size)         ;; -> [captures_ptr]
+/// local.set $closure_arg_i32           ;; stash captures_ptr
+///
+/// ;; per-capture stores: local.get $captures_let; store at offset
+/// local.get $closure_arg_i32
+/// local.get $(first_let + cap.let_idx)
+/// <store at cap.offset>
+/// ...
+///
+/// ;; allocate handle (always 8 bytes)
+/// alloc_scratch(8)                     ;; -> [handle_ptr]
+/// local.tee $closure_handle            ;; keep handle_ptr on stack
+/// i32.const <fn_table_idx>
+/// i32.store offset=0
+/// local.get $closure_handle
+/// local.get $closure_arg_i32           ;; captures_ptr (or 0)
+/// i32.store offset=4
+/// local.get $closure_handle            ;; result on stack
+/// ```
+#[allow(clippy::too_many_arguments)]
+fn emit_make_closure(
+    f: &mut Function,
+    ranges: &mut Vec<TokenRange>,
+    log: &mut Vec<RecordedUnreachable>,
+    ectx: &EmitCtx,
+    fn_table_idx: u32,
+    captures: &[relon_ir::ClosureCapture],
+    captures_size: u32,
+    range: TokenRange,
+) -> Result<(), CodegenError> {
+    let captures_ptr_slot = ectx.closure_arg_i32_local();
+    let handle_slot = ectx.closure_handle_local();
+
+    if captures_size > 0 {
+        emit_alloc_scratch_static(f, ranges, log, ectx, captures_size, range);
+        // Stack: [captures_ptr]
+        f.instruction(&Instruction::LocalSet(captures_ptr_slot));
+        ranges.push(range);
+
+        for cap in captures {
+            // Push captures_ptr, then the captured value, then the
+            // store opcode picks based on `cap.ty`.
+            f.instruction(&Instruction::LocalGet(captures_ptr_slot));
+            ranges.push(range);
+            // Read the captured value from the let-local. The let
+            // local index is the source-level `let_idx` plus the
+            // function's first-let-local base.
+            let src_local = ectx
+                .first_let_local()
+                .checked_add(cap.let_idx)
+                .ok_or(CodegenError::MixedNumericTypes)?;
+            f.instruction(&Instruction::LocalGet(src_local));
+            ranges.push(range);
+            match cap.ty {
+                IrType::I64 => {
+                    f.instruction(&Instruction::I64Store(MemArg {
+                        offset: cap.offset as u64,
+                        align: 3,
+                        memory_index: 0,
+                    }));
+                }
+                IrType::F64 => {
+                    f.instruction(&Instruction::F64Store(MemArg {
+                        offset: cap.offset as u64,
+                        align: 3,
+                        memory_index: 0,
+                    }));
+                }
+                IrType::Bool => {
+                    f.instruction(&Instruction::I32Store8(MemArg {
+                        offset: cap.offset as u64,
+                        align: 0,
+                        memory_index: 0,
+                    }));
+                }
+                IrType::I32 | IrType::Null | IrType::String | IrType::ListInt | IrType::Closure => {
+                    f.instruction(&Instruction::I32Store(MemArg {
+                        offset: cap.offset as u64,
+                        align: 2,
+                        memory_index: 0,
+                    }));
+                }
+            }
+            ranges.push(range);
+        }
+    } else {
+        // No captures — write a zero into the captures_ptr scratch
+        // slot so the handle's second i32 field stays well-defined.
+        f.instruction(&Instruction::I32Const(0));
+        ranges.push(range);
+        f.instruction(&Instruction::LocalSet(captures_ptr_slot));
+        ranges.push(range);
+    }
+
+    // Allocate the 8-byte handle and populate it.
+    emit_alloc_scratch_static(f, ranges, log, ectx, 8, range);
+    // Stack: [handle_ptr]
+    f.instruction(&Instruction::LocalTee(handle_slot));
+    ranges.push(range);
+    // fn_table_idx at offset 0
+    f.instruction(&Instruction::I32Const(fn_table_idx as i32));
+    ranges.push(range);
+    f.instruction(&Instruction::I32Store(MemArg {
+        offset: 0,
+        align: 2,
+        memory_index: 0,
+    }));
+    ranges.push(range);
+    // captures_ptr at offset 4
+    f.instruction(&Instruction::LocalGet(handle_slot));
+    ranges.push(range);
+    f.instruction(&Instruction::LocalGet(captures_ptr_slot));
+    ranges.push(range);
+    f.instruction(&Instruction::I32Store(MemArg {
+        offset: 4,
+        align: 2,
+        memory_index: 0,
+    }));
+    ranges.push(range);
+    // Push the handle pointer as the result.
+    f.instruction(&Instruction::LocalGet(handle_slot));
+    ranges.push(range);
+    Ok(())
+}
+
+/// Phase 10-a: emit an `Op::CallClosure` into the function body. The
+/// generated wasm sequence pops the user-visible args + closure
+/// handle off the operand stack, then rearranges them into the
+/// `[captures_ptr, ...args, fn_table_idx]` shape `call_indirect`
+/// requires.
+fn emit_call_closure(
+    f: &mut Function,
+    ranges: &mut Vec<TokenRange>,
+    vstack: &mut Vec<IrType>,
+    ectx: &EmitCtx,
+    param_tys: &[IrType],
+    ret_ty: IrType,
+    range: TokenRange,
+) -> Result<(), CodegenError> {
+    if param_tys.len() > 2 {
+        // Phase 10-a reserves three closure-arg spill slots (one i32,
+        // two i64). User-visible parameter shapes up to two args
+        // cover every stdlib higher-order body shipped this phase
+        // (`map` / `filter` take one; `fold` takes two). A future
+        // surface that needs more would either grow the reserved
+        // spill area or thread the type-index through dynamically
+        // allocated locals.
+        return Err(CodegenError::Layout(format!(
+            "Op::CallClosure with {} user args exceeds the Phase 10-a spill budget (max 2)",
+            param_tys.len()
+        )));
+    }
+    // Pop args in reverse order and spill into the matching scratch
+    // local. Track the spill slot for each arg so we can re-push in
+    // declaration order below.
+    let mut spill_slots: Vec<u32> = Vec::with_capacity(param_tys.len());
+    let mut i64_slots_used: u32 = 0;
+    for ty in param_tys.iter().rev() {
+        let popped = vstack.pop().ok_or(CodegenError::MixedNumericTypes)?;
+        if popped.wasm_slot() != ty.wasm_slot() {
+            return Err(CodegenError::MixedNumericTypes);
+        }
+        let slot = match ty.wasm_slot() {
+            IrType::I64 => {
+                let s = if i64_slots_used == 0 {
+                    ectx.closure_arg_i64_a_local()
+                } else if i64_slots_used == 1 {
+                    ectx.closure_arg_i64_b_local()
+                } else {
+                    return Err(CodegenError::Layout(
+                        "Op::CallClosure: too many i64 args (Phase 10-a allows up to 2)".into(),
+                    ));
+                };
+                i64_slots_used += 1;
+                s
+            }
+            IrType::F64 => {
+                return Err(CodegenError::Layout(
+                    "Op::CallClosure: F64 user args are not in the Phase 10-a spill budget".into(),
+                ));
+            }
+            _ => ectx.closure_arg_i32_local(),
+        };
+        f.instruction(&Instruction::LocalSet(slot));
+        ranges.push(range);
+        spill_slots.push(slot);
+    }
+    spill_slots.reverse();
+
+    // Pop the closure handle and spill into the dedicated slot.
+    let popped_closure = vstack.pop().ok_or(CodegenError::MixedNumericTypes)?;
+    if popped_closure.wasm_slot() != IrType::I32 {
+        return Err(CodegenError::MixedNumericTypes);
+    }
+    let handle_slot = ectx.closure_handle_local();
+    f.instruction(&Instruction::LocalSet(handle_slot));
+    ranges.push(range);
+
+    // Push captures_ptr = i32.load(handle + 4).
+    f.instruction(&Instruction::LocalGet(handle_slot));
+    ranges.push(range);
+    f.instruction(&Instruction::I32Load(MemArg {
+        offset: 4,
+        align: 2,
+        memory_index: 0,
+    }));
+    ranges.push(range);
+
+    // Re-push each user-visible arg in original declaration order.
+    for slot in &spill_slots {
+        f.instruction(&Instruction::LocalGet(*slot));
+        ranges.push(range);
+    }
+
+    // Push fn_table_idx = i32.load(handle + 0).
+    f.instruction(&Instruction::LocalGet(handle_slot));
+    ranges.push(range);
+    f.instruction(&Instruction::I32Load(MemArg {
+        offset: 0,
+        align: 2,
+        memory_index: 0,
+    }));
+    ranges.push(range);
+
+    // Look up the wasm type-index for this closure signature.
+    let type_index = ectx
+        .closure_type_index(param_tys, ret_ty)
+        .ok_or(CodegenError::Layout(format!(
+            "Op::CallClosure: no registered wasm type for closure signature `(captures_ptr, {:?}) -> {:?}`",
+            param_tys, ret_ty
+        )))?;
+
+    f.instruction(&Instruction::CallIndirect {
+        type_index,
+        table_index: 0,
+    });
+    ranges.push(range);
+    vstack.push(ret_ty);
+    Ok(())
+}
+
 /// Emit an `if (result <valtype>) <then> else <else> end` block.
 ///
 /// Frame discipline:
@@ -2535,7 +3027,9 @@ fn emit_load_absolute_pointer(
 fn load_field_stack_type(ty: IrType) -> IrType {
     match ty {
         IrType::I64 | IrType::F64 => ty,
-        IrType::Bool | IrType::Null | IrType::String | IrType::ListInt => IrType::I32,
+        IrType::Bool | IrType::Null | IrType::String | IrType::ListInt | IrType::Closure => {
+            IrType::I32
+        }
         // `I32` field reads aren't used in Phase 2.b (the canonical
         // schema doesn't surface a raw i32 leaf), but we keep the
         // arm exhaustive for forward compat.
@@ -2625,13 +3119,15 @@ fn emit_load_field(
             }));
             ranges.push(range);
         }
-        IrType::I32 | IrType::String | IrType::ListInt => {
-            // `String` / `ListInt` LoadField is rare — lowering
-            // normally emits the explicit `LoadStringPtr` /
+        IrType::I32 | IrType::String | IrType::ListInt | IrType::Closure => {
+            // `String` / `ListInt` / `Closure` LoadField is rare —
+            // lowering normally emits the explicit `LoadStringPtr` /
             // `LoadListIntPtr` ops because the IR-level tag carries
-            // forward more diagnostic info. But a hand-built IR
-            // using `LoadField { ty: String }` falls back to the
-            // same 4-byte `i32.load`, so we keep the path open.
+            // forward more diagnostic info. A hand-built IR using
+            // `LoadField { ty: String }` falls back to the same
+            // 4-byte `i32.load`. `Closure` is included for type-tag
+            // completeness; the binary handshake rejects closure
+            // values upstream so the path stays unreached at runtime.
             f.instruction(&Instruction::LocalGet(WASM_LOCAL_IN_PTR));
             ranges.push(range);
             f.instruction(&Instruction::I32Load(MemArg {
@@ -2728,6 +3224,17 @@ fn emit_load_field_at_absolute(
             f.instruction(&Instruction::I32Add);
             ranges.push(range);
         }
+        IrType::Closure => {
+            // Closure handles are never carried inside the input
+            // buffer (the binary handshake rejects them per
+            // `LoweringError::ClosureAcrossBoundary`). Surface the
+            // codegen-level failure deterministically rather than
+            // silently emitting an i32 load of an arbitrary slot.
+            return Err(CodegenError::Layout(
+                "LoadFieldAtAbsolute with `Closure` field type is unsupported (closures cannot cross the wasm boundary)"
+                    .into(),
+            ));
+        }
     }
     Ok(())
 }
@@ -2802,7 +3309,7 @@ fn emit_store_field(
         // `emit_store_pointer_indirect`; falling through here means
         // a hand-built IR called this helper directly with a pointer
         // type — refuse rather than emit a half-formed sequence.
-        IrType::String | IrType::ListInt => {
+        IrType::String | IrType::ListInt | IrType::Closure => {
             return Err(CodegenError::UnsupportedStoreFieldType { ty });
         }
     };
@@ -3156,10 +3663,11 @@ fn emit_store_field_at_record(
             }));
             ranges.push(range);
         }
-        IrType::String | IrType::ListInt | IrType::I32 => {
+        IrType::String | IrType::ListInt | IrType::I32 | IrType::Closure => {
             // Pointer slot — store the i32 (which is either a
             // pointer offset produced by EmitTailRecordFromAbsoluteAddr
-            // / PushRecordBase, or an arbitrary i32).
+            // / PushRecordBase, an arbitrary i32, or a closure
+            // handle pointer — all of them share the wasm i32 slot).
             f.instruction(&Instruction::LocalSet(record_store_tmp));
             ranges.push(range);
             emit_record_dest_addr(f, ranges, record_wasm_local, offset, range);
@@ -3382,13 +3890,17 @@ fn store_field_local_valtype(ty: IrType) -> ValType {
     match ty {
         IrType::I64 => ValType::I64,
         IrType::F64 => ValType::F64,
-        // String / ListInt would only ever appear here if a later
-        // phase started writing variable-length data out of `#main`.
-        // Phase 2.c keeps the return surface to Int / Float / Bool
-        // / Null, but the arm stays exhaustive for forward compat.
-        IrType::I32 | IrType::Bool | IrType::Null | IrType::String | IrType::ListInt => {
-            ValType::I32
-        }
+        // String / ListInt / Closure would only ever appear here if a
+        // later phase started writing variable-length data or
+        // closure handles out of `#main`. Phase 2.c keeps the return
+        // surface to Int / Float / Bool / Null, but the arm stays
+        // exhaustive for forward compat.
+        IrType::I32
+        | IrType::Bool
+        | IrType::Null
+        | IrType::String
+        | IrType::ListInt
+        | IrType::Closure => ValType::I32,
     }
 }
 
@@ -3458,11 +3970,15 @@ fn emit_arith(
         (IrType::I32, ArithOp::BitAnd) => Instruction::I32And,
         (IrType::I64, ArithOp::BitAnd) => Instruction::I64And,
         (IrType::F64, ArithOp::BitAnd) => return Err(CodegenError::MixedNumericTypes),
-        // Arithmetic on Bool / Null / String / ListInt is not part
-        // of the surface — the lowering pass rejects bodies with
-        // these tags. A hand-crafted IR landing here gets the same
-        // treatment as a mixed-type body.
-        (IrType::Bool, _) | (IrType::Null, _) | (IrType::String, _) | (IrType::ListInt, _) => {
+        // Arithmetic on Bool / Null / String / ListInt / Closure is
+        // not part of the surface — the lowering pass rejects bodies
+        // with these tags. A hand-crafted IR landing here gets the
+        // same treatment as a mixed-type body.
+        (IrType::Bool, _)
+        | (IrType::Null, _)
+        | (IrType::String, _)
+        | (IrType::ListInt, _)
+        | (IrType::Closure, _) => {
             return Err(CodegenError::MixedNumericTypes);
         }
     };
@@ -3528,6 +4044,15 @@ fn emit_cmp(
                 ty: IrType::ListInt,
             });
         }
+        // Closure handles are pointer slots; comparing two closures
+        // structurally is meaningless (two `|x| x` lambdas at
+        // different call sites get different handles), so the
+        // codegen path stays closed.
+        (IrType::Closure, _) => {
+            return Err(CodegenError::InvalidComparisonOperandType {
+                ty: IrType::Closure,
+            });
+        }
         // Phase 4.c-2: unsigned i32 comparisons so stdlib bodies can
         // compare pointer / length offsets directly (signed wrap on
         // a 31-bit max heap layout would still be safe, but unsigned
@@ -3552,10 +4077,12 @@ fn ir_to_val_type(t: &IrType) -> ValType {
         IrType::F64 => ValType::F64,
         // Bool / Null occupy an i32 slot on the wasm operand stack
         // (they're 1 byte on the wire but always loaded into an i32
-        // via `i32.load8_u` / `i32.const`). String / ListInt are
-        // tail-area pointers and ride an i32 slot too — they enter
-        // the wasm stack via `i32.load offset=N`.
-        IrType::Bool | IrType::Null | IrType::String | IrType::ListInt => ValType::I32,
+        // via `i32.load8_u` / `i32.const`). String / ListInt /
+        // Closure are pointers and ride an i32 slot too — they
+        // enter the wasm stack via `i32.load offset=N`.
+        IrType::Bool | IrType::Null | IrType::String | IrType::ListInt | IrType::Closure => {
+            ValType::I32
+        }
     }
 }
 

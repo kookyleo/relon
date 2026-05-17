@@ -225,6 +225,7 @@ fn echo_string_roundtrip() {
             ],
         }],
         entry_func_index: Some(0),
+        closure_table: vec![],
     };
 
     let host_fns = HostFnTable {
@@ -329,6 +330,7 @@ fn multi_param_native_add() {
             ],
         }],
         entry_func_index: Some(0),
+        closure_table: vec![],
     };
 
     let host_fns = HostFnTable {
@@ -439,6 +441,7 @@ fn write_file_module() -> (
             ],
         }],
         entry_func_index: Some(0),
+        closure_table: vec![],
     };
 
     let host_fns = HostFnTable {
@@ -619,6 +622,7 @@ fn missing_host_fn_rejected() {
             ],
         }],
         entry_func_index: Some(0),
+        closure_table: vec![],
     };
 
     let declared_table = HostFnTable {
@@ -681,6 +685,7 @@ fn signature_drift_rejected() {
             ],
         }],
         entry_func_index: Some(0),
+        closure_table: vec![],
     };
 
     let declared_table = HostFnTable {
@@ -753,6 +758,7 @@ fn host_fns_section_present() {
             ],
         }],
         entry_func_index: Some(0),
+        closure_table: vec![],
     };
     let host_fns = HostFnTable {
         entries: vec![HostFnEntry {
