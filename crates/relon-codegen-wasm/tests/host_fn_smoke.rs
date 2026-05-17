@@ -34,9 +34,7 @@ use relon_eval_api::schema_canonical::{Field, Schema, TypeRepr};
 use relon_ir::{Func, IrType, Module as IrModule, NativeImport, Op, TaggedOp};
 use relon_parser::TokenRange;
 use wasmparser::{Parser, Payload};
-use wasmtime::{
-    Caller, Engine, Global, Linker, Memory, Module, Mutability, Store, TypedFunc, Val, ValType,
-};
+use wasmtime::{Caller, Engine, Linker, Memory, Module, Store, TypedFunc};
 
 /// Canonical entry-fn synthetic source range. Stdlib bodies use the
 /// same `(1, 1, 0)` anchor so the srcmap encoder's 1-based invariant
@@ -164,23 +162,15 @@ fn offset_of(layout: &relon_eval_api::layout::OffsetTable, field: &str) -> u32 {
 const IN_PTR: i32 = 0;
 const OUT_PTR: i32 = 1024;
 
-/// Build the wasmtime store + linker pair plus the imported
-/// `relon_caps_avail` global. Centralises the boilerplate every test
-/// would otherwise repeat.
-fn setup_store_with_caps(caps_avail: i64) -> (Store<()>, Linker<()>, Engine, Global) {
+/// Build the wasmtime store + linker pair. Phase 11 removed the
+/// imported `relon_caps_avail` global; tests now hand the capability
+/// bitmap to each `run_main` call as the fifth (`i64`) argument and
+/// the helper just centralises the engine / store / linker plumbing.
+fn setup_store_with_caps() -> (Store<()>, Linker<()>, Engine) {
     let engine = Engine::default();
-    let mut store: Store<()> = Store::new(&engine, ());
-    let caps_avail_global = Global::new(
-        &mut store,
-        wasmtime::GlobalType::new(ValType::I64, Mutability::Const),
-        Val::I64(caps_avail),
-    )
-    .expect("create relon_caps_avail global");
-    let mut linker: Linker<()> = Linker::new(&engine);
-    linker
-        .define(&mut store, "env", "relon_caps_avail", caps_avail_global)
-        .expect("define caps_avail import");
-    (store, linker, engine, caps_avail_global)
+    let store: Store<()> = Store::new(&engine, ());
+    let linker: Linker<()> = Linker::new(&engine);
+    (store, linker, engine)
 }
 
 #[test]
@@ -206,7 +196,13 @@ fn echo_string_roundtrip() {
         }],
         funcs: vec![Func {
             name: "run_main".to_string(),
-            params: vec![IrType::I32, IrType::I32, IrType::I32, IrType::I32],
+            params: vec![
+                IrType::I32,
+                IrType::I32,
+                IrType::I32,
+                IrType::I32,
+                IrType::I64,
+            ],
             ret: IrType::I32,
             range: synth_range(),
             body: vec![
@@ -242,7 +238,8 @@ fn echo_string_roundtrip() {
 
     // Host fn body: identity — return the input pointer unchanged so
     // the wasm side memcpys the same record into the out_buf.
-    let (mut store, mut linker, engine, _caps) = setup_store_with_caps(i64::MAX);
+    let caps_avail: i64 = i64::MAX;
+    let (mut store, mut linker, engine) = setup_store_with_caps();
     linker
         .func_wrap("env", "echo", |_caller: Caller<'_, ()>, ptr: i32| -> i32 {
             ptr
@@ -256,7 +253,7 @@ fn echo_string_roundtrip() {
     let memory: Memory = instance
         .get_memory(&mut store, "memory")
         .expect("memory export");
-    let run_main: TypedFunc<(i32, i32, i32, i32), i32> = instance
+    let run_main: TypedFunc<(i32, i32, i32, i32, i64), i32> = instance
         .get_typed_func(&mut store, "run_main")
         .expect("run_main");
 
@@ -271,7 +268,7 @@ fn echo_string_roundtrip() {
     let bytes_written = run_main
         .call(
             &mut store,
-            (IN_PTR, in_bytes.len() as i32, OUT_PTR, out_cap),
+            (IN_PTR, in_bytes.len() as i32, OUT_PTR, out_cap, caps_avail),
         )
         .expect("run_main");
     assert!(bytes_written > return_layout.root_size as i32);
@@ -307,7 +304,13 @@ fn multi_param_native_add() {
         }],
         funcs: vec![Func {
             name: "run_main".to_string(),
-            params: vec![IrType::I32, IrType::I32, IrType::I32, IrType::I32],
+            params: vec![
+                IrType::I32,
+                IrType::I32,
+                IrType::I32,
+                IrType::I32,
+                IrType::I64,
+            ],
             ret: IrType::I32,
             range: synth_range(),
             body: vec![
@@ -345,7 +348,8 @@ fn multi_param_native_add() {
     let wasm = compile_module_with_host_fns(&ir_module, &main_schema, &return_schema, &host_fns)
         .expect("compile");
 
-    let (mut store, mut linker, engine, _caps) = setup_store_with_caps(i64::MAX);
+    let caps_avail: i64 = i64::MAX;
+    let (mut store, mut linker, engine) = setup_store_with_caps();
     linker
         .func_wrap(
             "env",
@@ -360,7 +364,7 @@ fn multi_param_native_add() {
     let memory: Memory = instance
         .get_memory(&mut store, "memory")
         .expect("memory export");
-    let run_main: TypedFunc<(i32, i32, i32, i32), i32> = instance
+    let run_main: TypedFunc<(i32, i32, i32, i32, i64), i32> = instance
         .get_typed_func(&mut store, "run_main")
         .expect("run_main");
 
@@ -378,6 +382,7 @@ fn multi_param_native_add() {
                 in_bytes.len() as i32,
                 OUT_PTR,
                 return_layout.root_size as i32,
+                caps_avail,
             ),
         )
         .expect("run_main");
@@ -417,7 +422,13 @@ fn write_file_module() -> (
         }],
         funcs: vec![Func {
             name: "run_main".to_string(),
-            params: vec![IrType::I32, IrType::I32, IrType::I32, IrType::I32],
+            params: vec![
+                IrType::I32,
+                IrType::I32,
+                IrType::I32,
+                IrType::I32,
+                IrType::I64,
+            ],
             ret: IrType::I32,
             range: synth_range(),
             body: vec![
@@ -477,7 +488,8 @@ fn capability_granted_allows_call() {
     let module = WasmModule::from_bytes(wasm.clone()).expect("load");
     assert_eq!(module.abi().required_capabilities, 0b1);
 
-    let (mut store, mut linker, engine, _caps) = setup_store_with_caps(0b1);
+    let caps_avail: i64 = 0b1;
+    let (mut store, mut linker, engine) = setup_store_with_caps();
     linker
         .func_wrap(
             "env",
@@ -492,7 +504,7 @@ fn capability_granted_allows_call() {
     let memory: Memory = instance
         .get_memory(&mut store, "memory")
         .expect("memory export");
-    let run_main: TypedFunc<(i32, i32, i32, i32), i32> = instance
+    let run_main: TypedFunc<(i32, i32, i32, i32, i64), i32> = instance
         .get_typed_func(&mut store, "run_main")
         .expect("run_main");
 
@@ -513,6 +525,7 @@ fn capability_granted_allows_call() {
                 in_bytes.len() as i32,
                 OUT_PTR,
                 return_layout.root_size as i32,
+                caps_avail,
             ),
         )
         .expect("run_main");
@@ -535,7 +548,8 @@ fn capability_missing_traps() {
 
     // `caps_avail = 0` — wasm-side `check_cap` must trap before the
     // host fn ever executes.
-    let (mut store, mut linker, engine, _caps) = setup_store_with_caps(0);
+    let caps_avail: i64 = 0;
+    let (mut store, mut linker, engine) = setup_store_with_caps();
     let host_call_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let host_call_count_clone = host_call_count.clone();
     linker
@@ -555,7 +569,7 @@ fn capability_missing_traps() {
     let memory: Memory = instance
         .get_memory(&mut store, "memory")
         .expect("memory export");
-    let run_main: TypedFunc<(i32, i32, i32, i32), i32> = instance
+    let run_main: TypedFunc<(i32, i32, i32, i32, i64), i32> = instance
         .get_typed_func(&mut store, "run_main")
         .expect("run_main");
 
@@ -569,7 +583,10 @@ fn capability_missing_traps() {
         .write(&mut store, IN_PTR as usize, &in_bytes)
         .expect("memwrite");
     let err = run_main
-        .call(&mut store, (IN_PTR, in_bytes.len() as i32, OUT_PTR, 32))
+        .call(
+            &mut store,
+            (IN_PTR, in_bytes.len() as i32, OUT_PTR, 32, caps_avail),
+        )
         .expect_err("must trap when capability is missing");
     let msg = format!("{err:?}");
     assert!(
@@ -603,7 +620,13 @@ fn missing_host_fn_rejected() {
         }],
         funcs: vec![Func {
             name: "run_main".to_string(),
-            params: vec![IrType::I32, IrType::I32, IrType::I32, IrType::I32],
+            params: vec![
+                IrType::I32,
+                IrType::I32,
+                IrType::I32,
+                IrType::I32,
+                IrType::I64,
+            ],
             ret: IrType::I32,
             range: synth_range(),
             body: vec![
@@ -666,7 +689,13 @@ fn signature_drift_rejected() {
         }],
         funcs: vec![Func {
             name: "run_main".to_string(),
-            params: vec![IrType::I32, IrType::I32, IrType::I32, IrType::I32],
+            params: vec![
+                IrType::I32,
+                IrType::I32,
+                IrType::I32,
+                IrType::I32,
+                IrType::I64,
+            ],
             ret: IrType::I32,
             range: synth_range(),
             body: vec![
@@ -739,7 +768,13 @@ fn host_fns_section_present() {
         }],
         funcs: vec![Func {
             name: "run_main".to_string(),
-            params: vec![IrType::I32, IrType::I32, IrType::I32, IrType::I32],
+            params: vec![
+                IrType::I32,
+                IrType::I32,
+                IrType::I32,
+                IrType::I32,
+                IrType::I64,
+            ],
             ret: IrType::I32,
             range: synth_range(),
             body: vec![
@@ -825,7 +860,8 @@ fn capability_via_all_granted_bitmap_runs() {
         "all_granted must publish the ReadsFs bit"
     );
 
-    let (mut store, mut linker, engine, _caps) = setup_store_with_caps(caps_bitmap as i64);
+    let caps_avail: i64 = caps_bitmap as i64;
+    let (mut store, mut linker, engine) = setup_store_with_caps();
     linker
         .func_wrap(
             "env",
@@ -840,7 +876,7 @@ fn capability_via_all_granted_bitmap_runs() {
     let memory: Memory = instance
         .get_memory(&mut store, "memory")
         .expect("memory export");
-    let run_main: TypedFunc<(i32, i32, i32, i32), i32> = instance
+    let run_main: TypedFunc<(i32, i32, i32, i32, i64), i32> = instance
         .get_typed_func(&mut store, "run_main")
         .expect("run_main");
 
@@ -861,6 +897,7 @@ fn capability_via_all_granted_bitmap_runs() {
                 in_bytes.len() as i32,
                 OUT_PTR,
                 return_layout.root_size as i32,
+                caps_avail,
             ),
         )
         .expect("run_main with all_granted bitmap");
@@ -893,7 +930,8 @@ fn capability_via_default_bitmap_denied() {
         "default Capabilities must publish a zero-trust bitmap"
     );
 
-    let (mut store, mut linker, engine, _caps) = setup_store_with_caps(caps_bitmap as i64);
+    let caps_avail: i64 = caps_bitmap as i64;
+    let (mut store, mut linker, engine) = setup_store_with_caps();
     let host_call_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let host_call_count_clone = host_call_count.clone();
     linker
@@ -913,7 +951,7 @@ fn capability_via_default_bitmap_denied() {
     let memory: Memory = instance
         .get_memory(&mut store, "memory")
         .expect("memory export");
-    let run_main: TypedFunc<(i32, i32, i32, i32), i32> = instance
+    let run_main: TypedFunc<(i32, i32, i32, i32, i64), i32> = instance
         .get_typed_func(&mut store, "run_main")
         .expect("run_main");
 
@@ -927,7 +965,10 @@ fn capability_via_default_bitmap_denied() {
         .write(&mut store, IN_PTR as usize, &in_bytes)
         .expect("memwrite");
     let err = run_main
-        .call(&mut store, (IN_PTR, in_bytes.len() as i32, OUT_PTR, 32))
+        .call(
+            &mut store,
+            (IN_PTR, in_bytes.len() as i32, OUT_PTR, 32, caps_avail),
+        )
         .expect_err("must trap when default Capabilities denies ReadsFs");
 
     let runtime_err = parsed.translate_trap(&err);

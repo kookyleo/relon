@@ -17,17 +17,21 @@
 //!      (see `wasm-srcmap-section-v1-2026-05-16.md`)
 //!   4. Static topological eager evaluation for dict fields
 //!
-//! Phase 2.b flips the entry function signature from the v1.beta
-//! scalar form (`(i64) -> i64`) to the real handshake form:
+//! Phase 2.b flipped the entry function signature from the v1.beta
+//! scalar form (`(i64) -> i64`) to the real handshake form. Phase 11
+//! extended it with a fifth `caps_arg: i64` parameter so the
+//! capability bitmap no longer needs an imported `relon_caps_avail`
+//! global (which forced the wasmtime linker to be store-bound):
 //!
 //! ```text
 //! (memory 1)                                  ;; 1 page (64 KiB)
 //! (export "memory" (memory 0))
 //! (export "run_main" (func 0))
-//! (func (param i32 i32 i32 i32) (result i32)
-//!     ;; in_ptr, in_len, out_ptr, out_cap → bytes_written
+//! (func (param i32 i32 i32 i32 i64) (result i32)
+//!     ;; in_ptr, in_len, out_ptr, out_cap, caps_arg → bytes_written
 //!     ;; guard: in_len < main_root_size  → unreachable
 //!     ;; guard: out_cap < return_root_size → unreachable
+//!     ;; global.set $relon_caps_avail = local.get $caps_arg
 //!     <body>                                  ;; LoadField / StoreField
 //!     i32.const <return_root_size>            ;; bytes_written
 //! )
@@ -62,8 +66,8 @@ use relon_eval_api::schema_canonical::{schema_hash, Schema};
 use relon_eval_api::RuntimeError;
 use relon_ir::{
     builtin_stdlib, Func as IrFunc, IrType, LoweredEntry, Module as IrModule, Op,
-    NO_CAPABILITY_BIT, WASM_LOCAL_IN_LEN, WASM_LOCAL_IN_PTR, WASM_LOCAL_OUT_CAP,
-    WASM_LOCAL_OUT_PTR,
+    NO_CAPABILITY_BIT, WASM_LOCAL_CAPS_ARG, WASM_LOCAL_IN_LEN, WASM_LOCAL_IN_PTR,
+    WASM_LOCAL_OUT_CAP, WASM_LOCAL_OUT_PTR,
 };
 use relon_parser::TokenRange;
 use std::collections::HashMap;
@@ -83,13 +87,12 @@ const MEMORY_EXPORT_NAME: &str = "memory";
 /// ...)` then naturally lines up with what the wasm runtime asks for.
 const HOST_IMPORT_MODULE: &str = "env";
 
-/// Name of the `i64`-typed global the wasm module imports from the
-/// host SDK to read the granted-capabilities bitmap. Codegen emits
-/// `(import "env" "relon_caps_avail" (global i64))` exactly once per
-/// module; the host SDK provides an immutable global whose value is
-/// the host's `cap_grants` bitmap. Bit `N` set means capability `N`
-/// is granted to the wasm module for this instantiation.
-const CAPS_AVAIL_IMPORT_NAME: &str = "relon_caps_avail";
+// Phase 11: the `relon_caps_avail` symbol is no longer an imported
+// global. It is now a module-internal mutable i64 global that the
+// entry function writes from its `caps_arg: i64` parameter at
+// prologue time. The previous import name constant is retired so
+// host SDKs cannot keep wiring a stale `Linker::define` and silently
+// observe an always-zero bitmap.
 
 /// Default initial memory size in wasm pages (64 KiB each). Phase 2.b
 /// only needs a small staging area for the in/out buffers — the host
@@ -275,36 +278,48 @@ pub fn compile_module_with_host_fns(
         );
     }
 
-    // Always emit the `relon_caps_avail` imported global. The host
-    // SDK supplies its `cap_grants` bitmap as an immutable i64
-    // global; codegen reads it via `global.get` inside the
-    // `check_cap` prologue. Having the global present even for
-    // modules without host fns keeps the import-section shape
-    // predictable so the host SDK can wire it unconditionally.
-    imports.import(
-        HOST_IMPORT_MODULE,
-        CAPS_AVAIL_IMPORT_NAME,
-        EntityType::Global(GlobalType {
-            val_type: ValType::I64,
-            mutable: false,
-            shared: false,
-        }),
-    );
-    // Imported globals occupy global indices starting at 0; our own
-    // emitted `relon_data_top` global lands at the next slot. The
-    // `relon_in_ptr` mutable global follows so schema-method bodies
-    // can rebase buffer-relative pointer slots into absolute wasm
-    // addresses without taking `in_ptr` as an explicit method
-    // parameter (entry function writes it at prologue time). Phase
-    // 4.c-1 appends the `relon_scratch_cursor` mutable i32 global,
-    // initialised at entry prologue time to the byte just past the
-    // caller's out_buf so the bump allocator can grow into the
-    // remainder of linear memory without colliding with the const
-    // data section / in_buf / out_buf regions.
+    // Phase 11: `relon_caps_avail` is now a module-internal mutable
+    // i64 global, no longer imported from `"env"`. The entry function
+    // writes its `caps_arg: i64` parameter into this global at
+    // prologue time so `Op::CheckCap` (and the codegen-emitted
+    // `check_cap` prologue) keeps reading the bitmap through
+    // `global.get`. Moving the bitmap out of the import section is
+    // what lets the host SDK build a single `wasmtime::InstancePre`
+    // and reuse it across stores — the prior import forced the
+    // linker to be bound to a specific store.
+    //
+    // Section / index layout (no imported globals anymore):
+    //
+    //   global 0 → `relon_caps_avail`     (mut i64, body-only)
+    //   global 1 → `relon_data_top`       (i32, exported)
+    //   global 2 → `relon_in_ptr`         (mut i32, body-only)
+    //   global 3 → `relon_scratch_cursor` (mut i32, body-only)
+    //
+    // The `relon_data_top` export keeps its previous slot offset
+    // semantics from the host's point of view because the export
+    // points at a global index rather than a section index.
     let caps_avail_global_index: u32 = 0;
     let data_top_global_index: u32 = 1;
     let in_ptr_global_index: u32 = 2;
     let scratch_cursor_global_index: u32 = 3;
+
+    // Phase 11: module-internal mutable i64 global holding the host's
+    // capability grant bitmap. The entry prologue copies `caps_arg`
+    // (run_main local 4) into this global; every other body reads it
+    // via `global.get` exactly like it did under the imported-global
+    // layout. Initialised to 0 so a stray `check_cap` issued before
+    // the entry prologue (impossible in well-formed modules — the
+    // entry function is the only public surface) deterministically
+    // traps with `CapabilityDenied` rather than silently allowing
+    // through whatever bits the wasm engine left on the wire.
+    globals.global(
+        GlobalType {
+            val_type: ValType::I64,
+            mutable: true,
+            shared: false,
+        },
+        &ConstExpr::i64_const(0),
+    );
 
     // Single shared memory: one page (64 KiB). Host writes the input
     // buffer somewhere inside, hands the pointer to `run_main`, then
@@ -1264,6 +1279,19 @@ fn emit_function_body(
         f.instruction(&Instruction::LocalGet(WASM_LOCAL_IN_PTR));
         ranges.push(func.range);
         f.instruction(&Instruction::GlobalSet(emit_cfg.in_ptr_global_index));
+        ranges.push(func.range);
+
+        // Phase 11: forward the entry's `caps_arg` (i64 local 4) into
+        // the module-internal mutable `relon_caps_avail` global so
+        // `Op::CheckCap` keeps reading the bitmap through `global.get`
+        // exactly like it did under the imported-global layout. The
+        // global was demoted from import to internal mutable so the
+        // host SDK can build a single `wasmtime::InstancePre` and
+        // reuse it across stores — the prior import forced the linker
+        // to be bound to a specific store.
+        f.instruction(&Instruction::LocalGet(WASM_LOCAL_CAPS_ARG));
+        ranges.push(func.range);
+        f.instruction(&Instruction::GlobalSet(emit_cfg.caps_avail_global_index));
         ranges.push(func.range);
 
         // Phase 4.c-1: initialise the scratch bump cursor.

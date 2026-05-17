@@ -33,10 +33,7 @@ use relon_parser::Node;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, OnceLock};
 use thiserror::Error;
-use wasmtime::{
-    Engine, Global, GlobalType, Linker, Memory, Module as WtModule, Mutability, Store, TypedFunc,
-    Val, ValType,
-};
+use wasmtime::{Engine, InstancePre, Linker, Memory, Module as WtModule, Store, TypedFunc, Val};
 
 /// Process-wide [`wasmtime::Engine`] used by [`WasmAotEvaluator::
 /// from_source`] and [`WasmAotEvaluator::from_bytes`] — i.e. the
@@ -121,7 +118,7 @@ pub enum BuildError {
 /// uses for `in_buf` / `out_buf` placement. Sessions are pooled across
 /// `run_main` calls so the per-call cost stays at the actual buffer
 /// marshalling + wasm execution, not at `Store::new` +
-/// `Linker::instantiate`.
+/// `InstancePre::instantiate`.
 ///
 /// Session reuse is safe because:
 ///
@@ -131,8 +128,12 @@ pub enum BuildError {
 /// * The const-data section (string literals, list literals) sits
 ///   below `in_ptr` and is never mutated by the wasm body — see the
 ///   `relon_data_top` export the codegen pins.
-/// * The single imported global (`relon_caps_avail`) is `Mutability::
-///   Const` so no per-call reset is needed.
+/// * The capability bitmap is now passed through the run_main `i64`
+///   argument (Phase 11) instead of an imported global, so the
+///   session does not snapshot the host's grant set at construction
+///   time and the same session safely serves calls under different
+///   bitmaps when `Self::with_capabilities` swaps the evaluator's
+///   `cap_grants` mid-life.
 ///
 /// Phase 9.b-1: pre-grows the memory at session creation so the hot
 /// path never needs `memory.grow`, eliminating the size-check branch
@@ -145,8 +146,10 @@ struct WasmSession {
     /// and stashed so we don't pay an export lookup per call.
     memory: Memory,
     /// Typed `run_main` entry point — saves a `get_typed_func` call
-    /// per invocation.
-    run_main: TypedFunc<(i32, i32, i32, i32), i32>,
+    /// per invocation. Phase 11 signature: the trailing i64 is the
+    /// per-call capability bitmap the wasm side forwards into its
+    /// internal `relon_caps_avail` global.
+    run_main: TypedFunc<(i32, i32, i32, i32, i64), i32>,
     /// Pre-computed input buffer base (aligned past the const-data
     /// section).
     in_ptr: u32,
@@ -162,7 +165,8 @@ struct WasmSession {
     in_cap: u32,
 }
 
-/// Phase 8 wasm-AOT backend, Phase 9.b-1 pool-of-stores refactor.
+/// Phase 8 wasm-AOT backend, Phase 9.b-1 pool-of-stores refactor,
+/// Phase 11 cross-store `InstancePre` reuse.
 ///
 /// Holds a precompiled wasm module plus the schemas / layouts the host
 /// needs to bridge `Value` ↔ binary handshake. Implements
@@ -170,9 +174,14 @@ struct WasmSession {
 ///
 /// Per-call cost was historically dominated by `Store::new` +
 /// `Linker::instantiate` (≈ 40 μs on the bench laptop). Phase 9.b-1
-/// folds those into a pooled [`WasmSession`] that the evaluator
-/// recycles across invocations. The session is a `Mutex<Vec<...>>`
-/// free-list:
+/// folded those into a pooled [`WasmSession`] that the evaluator
+/// recycles across invocations. Phase 11 then lifted the
+/// `Linker`-built [`wasmtime::InstancePre`] onto the evaluator itself
+/// so a fresh session only pays for `Store::new` + a single
+/// `InstancePre::instantiate`; the linker's import-resolution work is
+/// amortised across every store the evaluator ever opens.
+///
+/// The session is a `Mutex<Vec<...>>` free-list:
 ///
 /// * `run_main` pops a session if one is available, otherwise builds a
 ///   fresh one through [`Self::build_session`].
@@ -188,9 +197,12 @@ pub struct WasmAotEvaluator {
     /// Wasmtime compilation engine. Kept on the evaluator so per-call
     /// `instantiate` doesn't pay for engine setup.
     engine: Engine,
-    /// JIT-compiled module ready for instantiation. One per evaluator;
-    /// reused across `run_main` calls.
-    compiled: WtModule,
+    /// Phase 11: pre-validated linker → module binding, ready to
+    /// stamp into any [`Store`] the evaluator opens. The wasm module
+    /// no longer imports `relon_caps_avail`, so the linker's
+    /// import-resolution state is now fully store-independent and a
+    /// single `InstancePre` serves every pooled session.
+    instance_pre: InstancePre<()>,
     /// Canonical `#main` param schema. Used for `BufferBuilder`
     /// construction.
     main_schema: Schema,
@@ -203,15 +215,19 @@ pub struct WasmAotEvaluator {
     /// Out buffer capacity in bytes used for each `run_main` call.
     /// Host can override via [`Self::with_out_cap`] before evaluating.
     out_cap: u32,
-    /// Capability grant bitmap published into the wasm module's
-    /// imported `relon_caps_avail` i64 global at session-build time.
-    /// Bit positions follow [`relon_eval_api::CapabilityBit`]. Defaults
-    /// to the zero-trust grant set (`Capabilities::default`); hosts
-    /// flip on individual bits through [`Self::with_capabilities`].
+    /// Capability grant bitmap forwarded into the wasm module's
+    /// internal `relon_caps_avail` global through the `run_main` i64
+    /// argument. Phase 11 demoted the bitmap from an imported global
+    /// to a per-call argument; this field is read fresh on every
+    /// `run_main` call (no per-session snapshot) so
+    /// [`Self::with_capabilities`] takes effect without resetting the
+    /// session pool. Bit positions follow
+    /// [`relon_eval_api::CapabilityBit`]. Defaults to the zero-trust
+    /// grant set (`Capabilities::default`).
     cap_grants: u64,
     /// Free-list of warmed-up [`WasmSession`]s. Per-call cost on a hit
     /// is just the buffer marshal + wasm dispatch; misses pay the
-    /// `Store::new` + `Linker::instantiate` price once.
+    /// `Store::new` + `InstancePre::instantiate` price once.
     session_pool: Mutex<Vec<WasmSession>>,
 }
 
@@ -350,7 +366,7 @@ impl WasmAotEvaluator {
         // existing `.wasm` / `.schemas` sidecars in place, so a
         // subsequent run still hits the partial-hit JIT-then-save path
         // and gets another chance to produce the sidecar.
-        if let Ok(native_bytes) = evaluator.compiled.serialize() {
+        if let Ok(native_bytes) = evaluator.instance_pre.module().serialize() {
             let _ = cache.store_native(source_hash, &native_bytes);
         }
         Ok(evaluator)
@@ -378,10 +394,11 @@ impl WasmAotEvaluator {
             .map_err(|e| BuildError::LoweringError(format!("return schema layout: {e}")))?;
         let module = WasmModule::from_bytes(wasm_bytes)
             .map_err(|e| BuildError::WasmLoadError(e.to_string()))?;
+        let instance_pre = build_instance_pre(&engine, &compiled)?;
         Ok(Self {
             module,
             engine,
-            compiled,
+            instance_pre,
             main_schema,
             return_schema,
             main_layout,
@@ -514,11 +531,12 @@ impl WasmAotEvaluator {
             WasmModule::from_bytes(bytes).map_err(|e| BuildError::WasmLoadError(e.to_string()))?;
         let compiled = WtModule::new(&engine, module.bytes())
             .map_err(|e| BuildError::WasmInstantiateError(e.to_string()))?;
+        let instance_pre = build_instance_pre(&engine, &compiled)?;
 
         Ok(Self {
             module,
             engine,
-            compiled,
+            instance_pre,
             main_schema,
             return_schema,
             main_layout,
@@ -543,7 +561,7 @@ impl WasmAotEvaluator {
     }
 
     /// Replace the capability grant set the wasm side observes through
-    /// its imported `relon_caps_avail` i64 global. Defaults to the
+    /// its internal `relon_caps_avail` i64 global. Defaults to the
     /// zero-trust grant (no bits set); hosts that need to invoke
     /// `#native` functions guarded by a non-zero `cap_bit` must hand
     /// in a [`Capabilities`] that grants every required bit.
@@ -551,17 +569,12 @@ impl WasmAotEvaluator {
     /// Bit positions follow
     /// [`relon_eval_api::CapabilityBit`] — the same table the
     /// host SDK uses when registering a `#native` function's
-    /// `cap_bit` field. Resets the session pool so cached stores
-    /// don't keep the previous bitmap alive.
+    /// `cap_bit` field. Phase 11: the bitmap is forwarded through the
+    /// `run_main` argument on every call, so updating
+    /// `cap_grants` takes effect on the next call without flushing
+    /// the session pool.
     pub fn with_capabilities(mut self, caps: Capabilities) -> Self {
         self.cap_grants = caps.to_cap_bitmap();
-        // Drop pooled sessions: each session's `relon_caps_avail`
-        // global was built against the old bitmap. Leaving them
-        // around would cause the next call to silently keep observing
-        // the stale grant set.
-        if let Ok(mut pool) = self.session_pool.lock() {
-            pool.clear();
-        }
         self
     }
 
@@ -692,36 +705,23 @@ impl WasmAotEvaluator {
     /// in_cap`; the output region follows aligned to 8 with capacity
     /// `self.out_cap`. Memory is pre-grown to fit all three so the
     /// hot path skips `memory.grow`.
+    ///
+    /// Phase 11: the shared `InstancePre` on the evaluator owns the
+    /// linker-resolved bindings, so building a session is just
+    /// `Store::new` + `InstancePre::instantiate` — the linker's
+    /// `define` / validate work is amortised across every store the
+    /// evaluator ever opens.
     fn build_session(&self, in_len: u32) -> Result<WasmSession, RuntimeError> {
         let mut store: Store<()> = Store::new(&self.engine, ());
 
-        // The wasm module imports `(global $relon_caps_avail i64)`.
-        // The bitmap published here is the host's grant set encoded
-        // through `CapabilityBit`; codegen's `check_cap` prologue
-        // tests the relevant bit before every guarded `#native` call
-        // and traps with `CapabilityDenied` on a miss. The Global has
-        // to be created against this specific store before the linker
-        // can own it — that's why we can't share a single Global
-        // across the pool's stores.
-        let caps_avail = Global::new(
-            &mut store,
-            GlobalType::new(ValType::I64, Mutability::Const),
-            Val::I64(self.cap_grants as i64),
-        )
-        .map_err(|e| RuntimeError::IoError(format!("wasm caps_avail global: {e}")))?;
-
-        let mut linker: Linker<()> = Linker::new(&self.engine);
-        linker
-            .define(&mut store, "env", "relon_caps_avail", caps_avail)
-            .map_err(|e| RuntimeError::IoError(format!("wasm linker define: {e}")))?;
-
-        let instance = linker
-            .instantiate(&mut store, &self.compiled)
+        let instance = self
+            .instance_pre
+            .instantiate(&mut store)
             .map_err(|e| self.module.translate_trap(&e))?;
         let memory: Memory = instance.get_memory(&mut store, "memory").ok_or_else(|| {
             RuntimeError::IoError("wasm module missing `memory` export".to_string())
         })?;
-        let run_main: TypedFunc<(i32, i32, i32, i32), i32> = instance
+        let run_main: TypedFunc<(i32, i32, i32, i32, i64), i32> = instance
             .get_typed_func(&mut store, "run_main")
             .map_err(|e| RuntimeError::IoError(format!("wasm `run_main` export: {e}")))?;
 
@@ -799,6 +799,7 @@ impl WasmAotEvaluator {
                 in_len as i32,
                 session.out_ptr as i32,
                 self.out_cap as i32,
+                self.cap_grants as i64,
             ),
         ) {
             Ok(v) => v,
@@ -899,6 +900,22 @@ impl WasmAotEvaluator {
 /// don't need to learn two error vocabularies.
 fn cache_err(e: CacheError) -> BuildError {
     BuildError::CacheError(e.to_string())
+}
+
+/// Phase 11: build a store-independent
+/// [`wasmtime::InstancePre`] from the compiled module. The wasm
+/// modules emitted by this codegen no longer import any global
+/// (`relon_caps_avail` was demoted to a module-internal mutable
+/// global), and the evaluator does not bridge `#native` host fns at
+/// the SDK layer — the `Linker` therefore stays empty. The resulting
+/// pre is cached on the evaluator so every pooled session can stamp
+/// itself with a single `InstancePre::instantiate` call without
+/// re-paying the validation work.
+fn build_instance_pre(engine: &Engine, compiled: &WtModule) -> Result<InstancePre<()>, BuildError> {
+    let linker: Linker<()> = Linker::new(engine);
+    linker
+        .instantiate_pre(compiled)
+        .map_err(|e| BuildError::WasmInstantiateError(format!("wasm instance_pre: {e}")))
 }
 
 /// Hand a previously-serialised cranelift blob back to wasmtime,
@@ -1440,5 +1457,183 @@ mod tests {
             Engine::same(shared_default_engine(), &a.engine),
             "from_source engine must match shared_default_engine()"
         );
+    }
+
+    /// Phase 11: the evaluator builds a single `InstancePre` at
+    /// construction time and reuses it across every pooled session
+    /// the pool ever opens. Driving many `run_main` calls back-to-back
+    /// must surface the same answer the first call produced; the new
+    /// instantiate path (`InstancePre::instantiate` instead of
+    /// `Linker::instantiate`) is otherwise transparent to the host.
+    /// The capability bitmap is now routed through the trailing i64
+    /// argument of `run_main`, so the per-call grant set takes effect
+    /// without flushing the session pool.
+    #[test]
+    fn instance_pre_reused_across_many_run_main_calls() {
+        let src = "#main(Int x) -> Int\nx * 2";
+        let aot = WasmAotEvaluator::from_source(src).expect("compile");
+
+        for x in 0..32_i64 {
+            let mut args = HashMap::new();
+            args.insert("x".to_string(), Value::Int(x));
+            let v = aot.run_main(args).expect("run_main");
+            match v {
+                Value::Int(n) => assert_eq!(n, x * 2, "run_main(x) must return 2*x for x={x}"),
+                other => panic!("expected Value::Int, got {other:?}"),
+            }
+        }
+
+        // The pool should never grow past a single session under
+        // serial driving — each call pops the same session and pushes
+        // it back. Catching pool growth here would surface a
+        // regression where `build_session` is called more than once.
+        let pool_len = aot.session_pool.lock().expect("pool lock").len();
+        assert_eq!(
+            pool_len, 1,
+            "single-threaded driving must reuse one pooled session"
+        );
+    }
+
+    /// Phase 11: `with_capabilities` must take effect on the next
+    /// `run_main` call without flushing the session pool — the
+    /// capability bitmap is now a per-call argument rather than a
+    /// per-session imported global. We pre-warm the pool by running
+    /// once with `all_granted`, flip to a zero-trust grant, and expect
+    /// the same pooled session to surface the cap-denied trap on the
+    /// follow-up call.
+    #[test]
+    fn capabilities_swap_uses_pooled_session() {
+        use relon_eval_api::{Capabilities, CapabilityBit};
+
+        let cap_bit = CapabilityBit::ReadsFs.bit_index();
+        let (wasm, main_schema) = super::tests::build_check_cap_module_for_test(cap_bit);
+        let return_schema = Schema {
+            name: "Ret".into(),
+            generics: vec![],
+            fields: vec![relon_eval_api::schema_canonical::Field {
+                name: "value".into(),
+                ty: relon_eval_api::schema_canonical::TypeRepr::Int,
+                default: None,
+            }],
+        };
+        let aot = WasmAotEvaluator::from_bytes(wasm, main_schema, return_schema)
+            .expect("from_bytes")
+            .with_capabilities(Capabilities::all_granted());
+
+        // Warm path: capability granted → the body's constant store
+        // reaches the return slot and the session lands in the pool.
+        let mut args = HashMap::new();
+        args.insert("x".to_string(), Value::Int(0));
+        let v = aot.run_main(args.clone()).expect("granted run_main");
+        match v {
+            Value::Int(n) => assert_eq!(n, 42),
+            other => panic!("expected 42, got {other:?}"),
+        }
+        let pool_len_after_grant = aot.session_pool.lock().expect("pool lock").len();
+        assert_eq!(pool_len_after_grant, 1, "granted call must pool a session");
+
+        // Flip to zero-trust without flushing the pool; the next call
+        // must trap on the same reused session.
+        let aot = aot.with_capabilities(Capabilities::default());
+        assert_eq!(
+            aot.session_pool.lock().expect("pool lock").len(),
+            1,
+            "with_capabilities must not drop pooled sessions in Phase 11"
+        );
+        let err = aot
+            .run_main(args)
+            .expect_err("zero-trust must trap on cap check");
+        match err {
+            RuntimeError::WasmCapabilityDenied { cap_bit: bit, .. } => {
+                assert_eq!(bit, cap_bit);
+            }
+            other => panic!("expected WasmCapabilityDenied, got {other:?}"),
+        }
+    }
+
+    /// Construct a small wasm module guarding the entry body behind a
+    /// stand-alone `Op::CheckCap`. Mirrors the helper in
+    /// `tests/evaluator_smoke.rs` but lives next to the
+    /// `instance_pre_reused_*` / `capabilities_swap_*` unit tests so
+    /// they don't need to reach into a sibling integration test.
+    pub(super) fn build_check_cap_module_for_test(
+        cap_bit: u32,
+    ) -> (Vec<u8>, relon_eval_api::schema_canonical::Schema) {
+        use relon_eval_api::schema_canonical::{Field, Schema, TypeRepr};
+        use relon_ir::{Func, IrType, Module as IrModule, Op, TaggedOp};
+        use relon_parser::TokenRange;
+
+        let synth_range = TokenRange {
+            start: relon_parser::TokenPosition {
+                line: 1,
+                column: 1,
+                offset: 0,
+            },
+            end: relon_parser::TokenPosition {
+                line: 1,
+                column: 1,
+                offset: 0,
+            },
+        };
+        let t = |op: Op| TaggedOp {
+            op,
+            range: synth_range,
+        };
+        let main_schema = Schema {
+            name: "MainParams".into(),
+            generics: vec![],
+            fields: vec![Field {
+                name: "x".into(),
+                ty: TypeRepr::Int,
+                default: None,
+            }],
+        };
+        let return_schema = Schema {
+            name: "Ret".into(),
+            generics: vec![],
+            fields: vec![Field {
+                name: "value".into(),
+                ty: TypeRepr::Int,
+                default: None,
+            }],
+        };
+        let return_layout =
+            relon_eval_api::layout::SchemaLayout::offsets_for(&return_schema).expect("layout");
+        let value_offset = return_layout
+            .fields
+            .iter()
+            .find(|f| f.name == "value")
+            .map(|f| f.offset as u32)
+            .expect("value offset");
+
+        let ir_module = IrModule {
+            imports: vec![],
+            funcs: vec![Func {
+                name: "run_main".into(),
+                params: vec![
+                    IrType::I32,
+                    IrType::I32,
+                    IrType::I32,
+                    IrType::I32,
+                    IrType::I64,
+                ],
+                ret: IrType::I32,
+                range: synth_range,
+                body: vec![
+                    t(Op::CheckCap { cap_bit }),
+                    t(Op::ConstI64(42)),
+                    t(Op::StoreField {
+                        offset: value_offset,
+                        ty: IrType::I64,
+                    }),
+                    t(Op::Return),
+                ],
+            }],
+            entry_func_index: Some(0),
+            closure_table: vec![],
+        };
+        let wasm = crate::compile_module(&ir_module, &main_schema, &return_schema)
+            .expect("compile check-cap module");
+        (wasm, main_schema)
     }
 }

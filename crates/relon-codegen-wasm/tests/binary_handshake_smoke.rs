@@ -31,9 +31,7 @@ use relon_eval_api::buffer::{BufferBuilder, BufferReader};
 use relon_eval_api::layout::SchemaLayout;
 use relon_eval_api::schema_canonical::{Field, Schema, TypeRepr};
 use relon_ir::{lower_workspace_single, LoweringError};
-use wasmtime::{
-    Engine, Global, Instance, Memory, Module, Mutability, Store, TypedFunc, Val, ValType,
-};
+use wasmtime::{Engine, Instance, Memory, Module, Store, TypedFunc};
 
 /// Compile + lower `src` end-to-end and return the wasm bytes plus
 /// the canonical schemas the codegen passed through. Mirrors the
@@ -58,29 +56,24 @@ fn compile(src: &str) -> (Vec<u8>, Schema, Schema) {
 struct WasmSession {
     store: Store<()>,
     memory: Memory,
-    run_main: TypedFunc<(i32, i32, i32, i32), i32>,
+    run_main: TypedFunc<(i32, i32, i32, i32, i64), i32>,
 }
 
 impl WasmSession {
     /// Instantiate `bytes` and grab the `run_main` typed view + the
-    /// exported linear memory.
+    /// exported linear memory. Phase 11: the wasm module no longer
+    /// imports `relon_caps_avail`; the bitmap arrives through the
+    /// fifth `run_main` argument instead.
     fn new(bytes: &[u8]) -> Self {
         let engine = Engine::default();
         let module = Module::new(&engine, bytes).expect("module load");
         let mut store: Store<()> = Store::new(&engine, ());
-        let caps_avail = Global::new(
-            &mut store,
-            wasmtime::GlobalType::new(ValType::I64, Mutability::Const),
-            Val::I64(i64::MAX),
-        )
-        .expect("create relon_caps_avail global");
-        let instance =
-            Instance::new(&mut store, &module, &[caps_avail.into()]).expect("instantiate");
+        let instance = Instance::new(&mut store, &module, &[]).expect("instantiate");
         let memory = instance
             .get_memory(&mut store, "memory")
             .expect("memory export");
         let run_main = instance
-            .get_typed_func::<(i32, i32, i32, i32), i32>(&mut store, "run_main")
+            .get_typed_func::<(i32, i32, i32, i32, i64), i32>(&mut store, "run_main")
             .expect("run_main typed view");
         Self {
             store,
@@ -106,18 +99,24 @@ impl WasmSession {
     }
 
     /// Convenience for the canonical `run_main(in_ptr, in_len,
-    /// out_ptr, out_cap)` call shape.
+    /// out_ptr, out_cap, caps)` call shape. Tests in this file don't
+    /// touch capability-guarded host functions, so the caller-supplied
+    /// `caps_avail` always falls back to `i64::MAX` (every bit set).
     fn call(&mut self, in_ptr: i32, in_len: i32, out_ptr: i32, out_cap: i32) -> i32 {
         self.run_main
-            .call(&mut self.store, (in_ptr, in_len, out_ptr, out_cap))
+            .call(
+                &mut self.store,
+                (in_ptr, in_len, out_ptr, out_cap, i64::MAX),
+            )
             .expect("run_main call should not trap")
     }
 
     /// Same as [`Self::call`] but expects the wasm to trap.
     fn call_expect_trap(&mut self, in_ptr: i32, in_len: i32, out_ptr: i32, out_cap: i32) {
-        let res = self
-            .run_main
-            .call(&mut self.store, (in_ptr, in_len, out_ptr, out_cap));
+        let res = self.run_main.call(
+            &mut self.store,
+            (in_ptr, in_len, out_ptr, out_cap, i64::MAX),
+        );
         assert!(
             res.is_err(),
             "run_main was expected to trap, got Ok({:?})",

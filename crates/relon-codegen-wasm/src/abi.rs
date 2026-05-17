@@ -52,11 +52,18 @@ pub const FORMAT_VERSION: u8 = 1;
 /// every time the binary handshake layout breaks (e.g. a new tag byte
 /// in the `Option<T>` payload).
 ///
-/// Phase 6 bumps from 1 to 2 because [`AbiMetadata`] gained the
+/// Phase 6 bumped from 1 to 2 because [`AbiMetadata`] gained the
 /// `required_capabilities` slot — modules emitted by older codegen
 /// versions can't carry the capability bitset, so host SDKs must
 /// refuse-to-load them rather than silently treat the field as zero.
-pub const CURRENT_ABI_VERSION: u16 = 2;
+///
+/// Phase 11 bumps from 2 to 3 because `run_main` gained a fifth
+/// parameter (`caps_arg: i64`) and the imported `relon_caps_avail`
+/// global was demoted to a module-internal mutable global. Old hosts
+/// still call `run_main(in_ptr, in_len, out_ptr, out_cap)` — the
+/// missing i64 would surface as a wasmtime arity mismatch, but
+/// rejecting the load at the ABI gate gives a clean diagnostic.
+pub const CURRENT_ABI_VERSION: u16 = 3;
 
 /// Current codegen version. Advisory marker that bumps for any
 /// observable codegen change so a host can include it in error
@@ -329,22 +336,27 @@ mod tests {
     }
 
     #[test]
-    fn v1_module_rejected_by_v2_host_sdk() {
-        // Phase 6: a wasm module produced by the previous codegen
-        // (`abi_version = 1`) lacks the `required_capabilities`
-        // slot. The host SDK refuses to load such a module because
-        // the binary handshake invariants changed.
-        let mut bytes = encode(&sample_metadata());
-        // Stamp abi_version back to 1.
-        bytes[5..7].copy_from_slice(&1u16.to_le_bytes());
-        let meta = decode(&bytes).expect("decode still succeeds");
-        let err = check_versions(&meta).expect_err("v2 host must reject v1 module");
-        match err {
-            AbiError::AbiMismatch { wanted, got } => {
-                assert_eq!(wanted, CURRENT_ABI_VERSION);
-                assert_eq!(got, 1);
+    fn older_module_rejected_by_current_host_sdk() {
+        // Every prior `abi_version` (1 = pre-Phase-6, 2 = pre-Phase-11)
+        // describes a binary handshake the current host SDK no longer
+        // speaks. Phase 6 added the `required_capabilities` slot;
+        // Phase 11 moved the capability bitmap from an imported global
+        // into a fifth `run_main` argument. Modules emitted by either
+        // older codegen must refuse-to-load with `AbiMismatch` rather
+        // than silently roundtripping through a half-compatible host.
+        for older in 1u16..CURRENT_ABI_VERSION {
+            let mut bytes = encode(&sample_metadata());
+            bytes[5..7].copy_from_slice(&older.to_le_bytes());
+            let meta = decode(&bytes).expect("decode still succeeds");
+            let err = check_versions(&meta)
+                .expect_err("current host must reject older abi_version modules");
+            match err {
+                AbiError::AbiMismatch { wanted, got } => {
+                    assert_eq!(wanted, CURRENT_ABI_VERSION);
+                    assert_eq!(got, older);
+                }
+                other => panic!("expected AbiMismatch, got {other:?}"),
             }
-            other => panic!("expected AbiMismatch, got {other:?}"),
         }
     }
 
