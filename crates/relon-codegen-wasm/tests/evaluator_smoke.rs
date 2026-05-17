@@ -459,7 +459,13 @@ fn build_check_cap_module(cap_bit: u32) -> (Vec<u8>, relon_eval_api::schema_cano
         imports: vec![],
         funcs: vec![Func {
             name: "run_main".into(),
-            params: vec![IrType::I32, IrType::I32, IrType::I32, IrType::I32],
+            params: vec![
+                IrType::I32,
+                IrType::I32,
+                IrType::I32,
+                IrType::I32,
+                IrType::I64,
+            ],
             ret: IrType::I32,
             range: synth_range,
             body: vec![

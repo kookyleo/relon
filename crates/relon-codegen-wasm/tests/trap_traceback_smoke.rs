@@ -36,7 +36,7 @@ use relon_ir::{
     lower_workspace_single, Func, IrType, Module as IrModule, NativeImport, Op, TaggedOp,
 };
 use relon_parser::TokenRange;
-use wasmtime::{Caller, Engine, Global, Linker, Memory, Module, Mutability, Store, TypedFunc, Val};
+use wasmtime::{Caller, Engine, Linker, Memory, Module, Store, TypedFunc};
 
 const IN_PTR: i32 = 0;
 const OUT_PTR: i32 = 256;
@@ -68,28 +68,21 @@ fn t(op: Op) -> TaggedOp {
 
 /// Compact alias for the typed-view of the `run_main` export every
 /// test instantiates. Kept here so the helper signatures stay
-/// inside the clippy `type_complexity` budget.
-type RunMainView = TypedFunc<(i32, i32, i32, i32), i32>;
+/// inside the clippy `type_complexity` budget. Phase 11 added the
+/// trailing `i64` capability argument.
+type RunMainView = TypedFunc<(i32, i32, i32, i32, i64), i32>;
 
-/// Build a wasmtime session with a caller-supplied caps_avail
-/// bitmap and an optional host-fn registration callback.
-fn build_session_with_caps(
+/// Build a wasmtime session with an optional host-fn registration
+/// callback. Phase 11: the imported `relon_caps_avail` global is gone
+/// — callers hand the capability bitmap to each `run_main.call` site
+/// as the fifth (i64) argument instead.
+fn build_session(
     wasm: &[u8],
-    caps_avail: i64,
     register: impl FnOnce(&mut Linker<()>, &mut Store<()>),
 ) -> (Store<()>, Memory, RunMainView) {
     let engine = Engine::default();
     let mut store: Store<()> = Store::new(&engine, ());
-    let caps_avail_global = Global::new(
-        &mut store,
-        wasmtime::GlobalType::new(wasmtime::ValType::I64, Mutability::Const),
-        Val::I64(caps_avail),
-    )
-    .expect("caps_avail global");
     let mut linker: Linker<()> = Linker::new(&engine);
-    linker
-        .define(&mut store, "env", "relon_caps_avail", caps_avail_global)
-        .expect("define caps_avail");
     register(&mut linker, &mut store);
     let module = Module::new(&engine, wasm).expect("module load");
     let instance = linker
@@ -99,7 +92,7 @@ fn build_session_with_caps(
         .get_memory(&mut store, "memory")
         .expect("memory export");
     let run_main = instance
-        .get_typed_func::<(i32, i32, i32, i32), i32>(&mut store, "run_main")
+        .get_typed_func::<(i32, i32, i32, i32, i64), i32>(&mut store, "run_main")
         .expect("run_main typed view");
     (store, memory, run_main)
 }
@@ -133,7 +126,7 @@ fn div_by_zero_traceback() {
     let module = WasmModule::from_bytes(wasm.clone()).expect("load");
     let main_layout = SchemaLayout::offsets_for(&main_schema).expect("main layout");
 
-    let (mut store, memory, run_main) = build_session_with_caps(&wasm, i64::MAX, |_, _| {});
+    let (mut store, memory, run_main) = build_session(&wasm, |_, _| {});
 
     let mut builder = BufferBuilder::new(&main_layout, &main_schema.fields);
     builder.write_int("x", 10).expect("write x");
@@ -144,7 +137,10 @@ fn div_by_zero_traceback() {
         .expect("memwrite");
 
     let err = run_main
-        .call(&mut store, (IN_PTR, in_bytes.len() as i32, OUT_PTR, 16))
+        .call(
+            &mut store,
+            (IN_PTR, in_bytes.len() as i32, OUT_PTR, 16, i64::MAX),
+        )
         .expect_err("must trap on x / 0");
 
     let runtime_err = module.translate_trap(&err);
@@ -167,7 +163,7 @@ fn out_buf_too_small_traceback() {
     let main_layout = SchemaLayout::offsets_for(&main_schema).expect("main layout");
     let return_layout = SchemaLayout::offsets_for(&return_schema).expect("return layout");
 
-    let (mut store, memory, run_main) = build_session_with_caps(&wasm, i64::MAX, |_, _| {});
+    let (mut store, memory, run_main) = build_session(&wasm, |_, _| {});
 
     let mut builder = BufferBuilder::new(&main_layout, &main_schema.fields);
     builder.write_int("x", 7).expect("write x");
@@ -181,7 +177,7 @@ fn out_buf_too_small_traceback() {
     let err = run_main
         .call(
             &mut store,
-            (IN_PTR, in_bytes.len() as i32, OUT_PTR, short_cap),
+            (IN_PTR, in_bytes.len() as i32, OUT_PTR, short_cap, i64::MAX),
         )
         .expect_err("must trap on short out_cap");
 
@@ -210,7 +206,7 @@ fn in_buf_too_small_traceback() {
     let main_layout = SchemaLayout::offsets_for(&main_schema).expect("main layout");
     let return_layout = SchemaLayout::offsets_for(&return_schema).expect("return layout");
 
-    let (mut store, memory, run_main) = build_session_with_caps(&wasm, i64::MAX, |_, _| {});
+    let (mut store, memory, run_main) = build_session(&wasm, |_, _| {});
 
     let mut builder = BufferBuilder::new(&main_layout, &main_schema.fields);
     builder.write_int("x", 7).expect("write x");
@@ -223,7 +219,13 @@ fn in_buf_too_small_traceback() {
     let err = run_main
         .call(
             &mut store,
-            (IN_PTR, short_len, OUT_PTR, return_layout.root_size as i32),
+            (
+                IN_PTR,
+                short_len,
+                OUT_PTR,
+                return_layout.root_size as i32,
+                i64::MAX,
+            ),
         )
         .expect_err("must trap on short in_len");
 
@@ -305,7 +307,13 @@ fn capability_denied_traceback() {
         }],
         funcs: vec![Func {
             name: "run_main".into(),
-            params: vec![IrType::I32, IrType::I32, IrType::I32, IrType::I32],
+            params: vec![
+                IrType::I32,
+                IrType::I32,
+                IrType::I32,
+                IrType::I32,
+                IrType::I64,
+            ],
             ret: IrType::I32,
             range: synth_range(),
             body: vec![
@@ -345,8 +353,10 @@ fn capability_denied_traceback() {
     let module = WasmModule::from_bytes(wasm.clone()).expect("load");
 
     // caps_avail = 0 — `check_cap` must trap before the host fn
-    // would run.
-    let (mut store, memory, run_main) = build_session_with_caps(&wasm, 0, |linker, store| {
+    // would run. Phase 11 routes the bitmap through the run_main
+    // argument list instead of the imported global.
+    let caps_avail: i64 = 0;
+    let (mut store, memory, run_main) = build_session(&wasm, |linker, store| {
         linker
             .func_wrap(
                 "env",
@@ -375,6 +385,7 @@ fn capability_denied_traceback() {
                 in_bytes.len() as i32,
                 OUT_PTR,
                 return_layout.root_size as i32,
+                caps_avail,
             ),
         )
         .expect_err("must trap when capability is missing");
@@ -446,7 +457,7 @@ fn unclassified_trap_falls_through() {
     let module = WasmModule::from_bytes(wasm.clone()).expect("load");
     let main_layout = SchemaLayout::offsets_for(&main_schema).expect("main layout");
 
-    let (mut store, memory, run_main) = build_session_with_caps(&wasm, i64::MAX, |_, _| {});
+    let (mut store, memory, run_main) = build_session(&wasm, |_, _| {});
     let mut builder = BufferBuilder::new(&main_layout, &main_schema.fields);
     builder.write_string("s", "hello").expect("write s");
     let in_bytes = builder.finish();
@@ -462,7 +473,13 @@ fn unclassified_trap_falls_through() {
     let err = run_main
         .call(
             &mut store,
-            (IN_PTR, in_bytes.len() as i32, large_negative_out_ptr, 4096),
+            (
+                IN_PTR,
+                in_bytes.len() as i32,
+                large_negative_out_ptr,
+                4096,
+                i64::MAX,
+            ),
         )
         .expect_err("must trap on out-of-bounds memcpy");
 

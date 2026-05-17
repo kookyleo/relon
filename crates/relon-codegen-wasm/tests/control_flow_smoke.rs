@@ -28,9 +28,7 @@ use relon_eval_api::schema_canonical::{Field, Schema, TypeRepr};
 use relon_eval_api::RuntimeError;
 use relon_ir::{Func, IrType, Module as IrModule, Op, TaggedOp};
 use relon_parser::TokenRange;
-use wasmtime::{
-    Engine, Global, Instance, Memory, Module, Mutability, Store, TypedFunc, Val, ValType,
-};
+use wasmtime::{Engine, Instance, Memory, Module, Store, TypedFunc};
 
 const IN_PTR: i32 = 0;
 const OUT_PTR: i32 = 256;
@@ -95,7 +93,7 @@ fn field_offset(layout: &OffsetTable, name: &str) -> u32 {
 struct WasmSession {
     store: Store<()>,
     memory: Memory,
-    run_main: TypedFunc<(i32, i32, i32, i32), i32>,
+    run_main: TypedFunc<(i32, i32, i32, i32, i64), i32>,
 }
 
 /// Spin up a wasmtime session for `wasm` with all capabilities granted.
@@ -103,18 +101,12 @@ fn build_session(wasm: &[u8]) -> WasmSession {
     let engine = Engine::default();
     let module = Module::new(&engine, wasm).expect("module load");
     let mut store: Store<()> = Store::new(&engine, ());
-    let caps_avail = Global::new(
-        &mut store,
-        wasmtime::GlobalType::new(ValType::I64, Mutability::Const),
-        Val::I64(i64::MAX),
-    )
-    .expect("caps_avail global");
-    let instance = Instance::new(&mut store, &module, &[caps_avail.into()]).expect("instantiate");
+    let instance = Instance::new(&mut store, &module, &[]).expect("instantiate");
     let memory = instance
         .get_memory(&mut store, "memory")
         .expect("memory export");
     let run_main = instance
-        .get_typed_func::<(i32, i32, i32, i32), i32>(&mut store, "run_main")
+        .get_typed_func::<(i32, i32, i32, i32, i64), i32>(&mut store, "run_main")
         .expect("run_main typed view");
     WasmSession {
         store,
@@ -241,7 +233,13 @@ fn loop_sum_module() -> (Vec<u8>, Schema, Schema, OffsetTable, OffsetTable) {
         imports: vec![],
         funcs: vec![Func {
             name: "run_main".into(),
-            params: vec![IrType::I32, IrType::I32, IrType::I32, IrType::I32],
+            params: vec![
+                IrType::I32,
+                IrType::I32,
+                IrType::I32,
+                IrType::I32,
+                IrType::I64,
+            ],
             ret: IrType::I32,
             range: synth_range(),
             body,
@@ -279,6 +277,7 @@ fn block_loop_brif_counting_sum() {
                 in_bytes.len() as i32,
                 OUT_PTR,
                 return_layout.root_size as i32,
+                i64::MAX,
             ),
         )
         .expect("run_main call");
@@ -311,6 +310,7 @@ fn block_loop_brif_zero_iterations() {
                 in_bytes.len() as i32,
                 OUT_PTR,
                 return_layout.root_size as i32,
+                i64::MAX,
             ),
         )
         .expect("run_main call");
@@ -404,7 +404,13 @@ fn scratch_loop_module() -> (Vec<u8>, Schema, Schema, OffsetTable, OffsetTable) 
         imports: vec![],
         funcs: vec![Func {
             name: "run_main".into(),
-            params: vec![IrType::I32, IrType::I32, IrType::I32, IrType::I32],
+            params: vec![
+                IrType::I32,
+                IrType::I32,
+                IrType::I32,
+                IrType::I32,
+                IrType::I64,
+            ],
             ret: IrType::I32,
             range: synth_range(),
             body,
@@ -442,6 +448,7 @@ fn scratch_alloc_inside_loop_completes_eight_iterations() {
                 in_bytes.len() as i32,
                 OUT_PTR,
                 return_layout.root_size as i32,
+                i64::MAX,
             ),
         )
         .expect("run_main call");
@@ -492,7 +499,13 @@ fn alloc_scratch_oom_traps_with_scratch_oom_kind() {
         imports: vec![],
         funcs: vec![Func {
             name: "run_main".into(),
-            params: vec![IrType::I32, IrType::I32, IrType::I32, IrType::I32],
+            params: vec![
+                IrType::I32,
+                IrType::I32,
+                IrType::I32,
+                IrType::I32,
+                IrType::I64,
+            ],
             ret: IrType::I32,
             range: synth_range(),
             body,
@@ -518,6 +531,7 @@ fn alloc_scratch_oom_traps_with_scratch_oom_kind() {
                 in_bytes.len() as i32,
                 OUT_PTR,
                 return_layout.root_size as i32,
+                i64::MAX,
             ),
         )
         .expect_err("must trap");
@@ -574,7 +588,13 @@ fn alloc_scratch_dyn_with_in_len_succeeds() {
         imports: vec![],
         funcs: vec![Func {
             name: "run_main".into(),
-            params: vec![IrType::I32, IrType::I32, IrType::I32, IrType::I32],
+            params: vec![
+                IrType::I32,
+                IrType::I32,
+                IrType::I32,
+                IrType::I32,
+                IrType::I64,
+            ],
             ret: IrType::I32,
             range: synth_range(),
             body,
@@ -599,6 +619,7 @@ fn alloc_scratch_dyn_with_in_len_succeeds() {
                 in_bytes.len() as i32,
                 OUT_PTR,
                 return_layout.root_size as i32,
+                i64::MAX,
             ),
         )
         .expect("run_main call");

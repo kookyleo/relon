@@ -21,9 +21,7 @@ use relon_eval_api::buffer::{BufferBuilder, BufferReader};
 use relon_eval_api::layout::SchemaLayout;
 use relon_eval_api::schema_canonical::Schema;
 use relon_ir::lower_workspace_single;
-use wasmtime::{
-    Engine, Global, Instance, Memory, Module, Mutability, Store, TypedFunc, Val, ValType,
-};
+use wasmtime::{Engine, Instance, Memory, Module, Store, TypedFunc};
 
 fn compile(src: &str) -> (Vec<u8>, Schema, Schema) {
     let ast = relon_parser::parse_document(src).expect("parse");
@@ -45,7 +43,7 @@ const OUT_CAP: i32 = 512;
 struct WasmSession {
     store: Store<()>,
     memory: Memory,
-    run_main: TypedFunc<(i32, i32, i32, i32), i32>,
+    run_main: TypedFunc<(i32, i32, i32, i32, i64), i32>,
 }
 
 impl WasmSession {
@@ -53,19 +51,12 @@ impl WasmSession {
         let engine = Engine::default();
         let module = Module::new(&engine, bytes).expect("module load");
         let mut store: Store<()> = Store::new(&engine, ());
-        let caps_avail = Global::new(
-            &mut store,
-            wasmtime::GlobalType::new(ValType::I64, Mutability::Const),
-            Val::I64(i64::MAX),
-        )
-        .expect("create caps_avail global");
-        let instance =
-            Instance::new(&mut store, &module, &[caps_avail.into()]).expect("instantiate");
+        let instance = Instance::new(&mut store, &module, &[]).expect("instantiate");
         let memory = instance
             .get_memory(&mut store, "memory")
             .expect("memory export");
         let run_main = instance
-            .get_typed_func::<(i32, i32, i32, i32), i32>(&mut store, "run_main")
+            .get_typed_func::<(i32, i32, i32, i32, i64), i32>(&mut store, "run_main")
             .expect("run_main typed view");
         Self {
             store,
@@ -88,9 +79,14 @@ impl WasmSession {
         out
     }
 
+    /// Phase 11: closures in this file don't touch capability-guarded
+    /// host fns, so `caps_avail` is always `i64::MAX`.
     fn call(&mut self, in_ptr: i32, in_len: i32, out_ptr: i32, out_cap: i32) -> i32 {
         self.run_main
-            .call(&mut self.store, (in_ptr, in_len, out_ptr, out_cap))
+            .call(
+                &mut self.store,
+                (in_ptr, in_len, out_ptr, out_cap, i64::MAX),
+            )
             .expect("run_main call must not trap")
     }
 }

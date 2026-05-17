@@ -330,6 +330,14 @@ pub const WASM_LOCAL_IN_LEN: u32 = 1;
 pub const WASM_LOCAL_OUT_PTR: u32 = 2;
 /// Wasm-side handshake parameter index — `out_cap` is local 3.
 pub const WASM_LOCAL_OUT_CAP: u32 = 3;
+/// Phase 11 handshake parameter — capability grant bitmap, `caps_arg`
+/// is local 4 (i64). The entry prologue forwards it into the module-
+/// internal mutable `relon_caps_avail` global so the codegen-emitted
+/// `check_cap` prologue can keep reading through `global.get`. Moving
+/// the bitmap from an imported global to a run_main argument is what
+/// lets the host SDK build a single `wasmtime::InstancePre` and reuse
+/// it across stores — the prior import made the linker store-bound.
+pub const WASM_LOCAL_CAPS_ARG: u32 = 4;
 
 /// Canonical name used for the synthesised `#main` parameter schema.
 /// Phase 2.b packages the parameter list into a single record under
@@ -715,9 +723,19 @@ fn lower_entry_with_resolver<'a>(
     let func = Func {
         name: "run_main".to_string(),
         // Wasm-level binary handshake signature: four i32 slots
-        // (in_ptr, in_len, out_ptr, out_cap). User-declared params
-        // reach the body through `LoadField`.
-        params: vec![IrType::I32, IrType::I32, IrType::I32, IrType::I32],
+        // (in_ptr, in_len, out_ptr, out_cap) plus the Phase-11
+        // capability bitmap (`caps_arg: i64`). User-declared params
+        // reach the body through `LoadField`. `caps_arg` is forwarded
+        // into the module-internal mutable `relon_caps_avail` global
+        // by the entry prologue so `check_cap` keeps reading through
+        // `global.get`.
+        params: vec![
+            IrType::I32,
+            IrType::I32,
+            IrType::I32,
+            IrType::I32,
+            IrType::I64,
+        ],
         // `bytes_written` returned as i32. Phase 2.b never returns
         // anything else from the wasm function itself; user-side
         // return values live in `out_buf`.
