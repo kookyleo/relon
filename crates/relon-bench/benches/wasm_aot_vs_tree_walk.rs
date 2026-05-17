@@ -106,6 +106,19 @@ fn string_args() -> HashMap<String, Value> {
     m
 }
 
+/// Phase 10-a scenarios: a 32-element `List<Int>` driving the
+/// higher-order `map` / `filter` / `fold` stdlib bodies. The list
+/// length is chosen large enough that per-iteration `call_indirect`
+/// overhead dominates the per-iter cost (so the bench surfaces the
+/// closure-dispatch path) but small enough to keep criterion's
+/// sample-size budget reasonable.
+fn list_int_args() -> HashMap<String, Value> {
+    let mut m = HashMap::with_capacity(1);
+    let xs: Vec<Value> = (1..=32).map(Value::Int).collect();
+    m.insert("xs".to_string(), Value::List(xs.into()));
+    m
+}
+
 const SCENARIOS: &[Scenario] = &[
     Scenario {
         name: "arithmetic",
@@ -138,6 +151,36 @@ const SCENARIOS: &[Scenario] = &[
         wasm_source: "#main(String s) -> Int\ns.length()",
         tree_source: "#main(String s) -> Int\ns.len()",
         args: string_args,
+    },
+    // Phase 10-a closure surfaces. Each scenario runs the same
+    // higher-order body on both backends; the wasm side exercises
+    // the freshly added `list_int_map` / `_filter` / `_fold`
+    // stdlib bodies through the closure conversion + `call_indirect`
+    // path. The tree-walker's bundled `List<Int>` schema accepts
+    // `map` / `filter` / `fold` natively, so the surface stays
+    // identical between the two backends.
+    Scenario {
+        name: "list_int_map",
+        wasm_source: "#main(List<Int> xs) -> List<Int>\nxs.map((Int x) => x * 2)",
+        tree_source: "#main(List<Int> xs) -> List<Int>\nxs.map((Int x) => x * 2)",
+        args: list_int_args,
+    },
+    Scenario {
+        name: "list_int_filter",
+        wasm_source: "#main(List<Int> xs) -> List<Int>\nxs.filter((Int x) => x > 16)",
+        tree_source: "#main(List<Int> xs) -> List<Int>\nxs.filter((Int x) => x > 16)",
+        args: list_int_args,
+    },
+    // `fold` is the wasm-AOT IR's name for the left-fold reducer;
+    // the tree-walker's bundled `List<T>` schema (see
+    // `crates/relon-analyzer/src/core/list.relon`) exports it as
+    // `reduce`. Same semantics, surface-name drift documented for
+    // the existing `length` / `len` pair just below.
+    Scenario {
+        name: "list_int_fold",
+        wasm_source: "#main(List<Int> xs) -> Int\nxs.fold(0, (Int acc, Int x) => acc + x)",
+        tree_source: "#main(List<Int> xs) -> Int\nxs.reduce(0, (Int acc, Int x) => acc + x)",
+        args: list_int_args,
     },
 ];
 
