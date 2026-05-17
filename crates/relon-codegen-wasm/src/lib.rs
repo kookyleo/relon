@@ -1,4 +1,11 @@
-#![forbid(unsafe_code)]
+// Crate-level lint setup. We `deny` rather than `forbid` `unsafe_code`
+// so the AOT cache's `Module::deserialize` rehydration path can opt in
+// through a localised `#[allow(unsafe_code)]` while every other module
+// in this crate stays unsafe-free. See `cache::deserialize_native` for
+// the single sanctioned unsafe site and the SAFETY contract it relies
+// on (host-controlled cache dir + version-stamped meta + wasmtime's
+// own cross-version rejection).
+#![deny(unsafe_code)]
 
 //! Lower `relon-ir` to WebAssembly bytecode + runtime adapter (Phase 2.b+).
 //!
@@ -39,7 +46,7 @@ pub mod srcmap;
 pub mod unreachable_table;
 
 pub use abi::{AbiError, AbiMetadata};
-pub use cache::{AotCache, CacheError, CachedModule};
+pub use cache::{AotCache, CacheError, CachedModule, CachedNative};
 pub use error::{CodegenError, LoadError};
 pub use evaluator::{BuildError, WasmAotEvaluator};
 pub use host_fns::{

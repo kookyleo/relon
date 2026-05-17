@@ -1,15 +1,22 @@
-//! Phase 9.b-3: on-disk AOT cache for compiled wasm modules.
+//! Phase 9.b-3 / 9.c-1: on-disk AOT cache for compiled wasm modules.
 //!
-//! Persists the codegen pass's `.wasm` byte output (plus a tiny `.meta`
+//! Persists the codegen pass's `.wasm` byte output (plus a `.meta`
 //! sidecar) so the next host startup can skip parse / analyze / lower
-//! / codegen and go straight to `wasmtime::Module::new`. The cache
-//! is content-addressed by the sha256 of the source string:
+//! / codegen and go straight to `wasmtime::Module::new`. Phase 9.c-1
+//! adds an optional `.native` sidecar that stores
+//! `wasmtime::Module::serialize`'s cranelift-compiled blob so the
+//! load path can call `Module::deserialize` and skip the JIT entirely.
+//!
+//! The cache is content-addressed by the sha256 of the source string:
 //!
 //! ```text
 //! <dir>/<source_hash_hex>.wasm     - raw codegen output
 //! <dir>/<source_hash_hex>.meta     - magic + versions + schema hash
+//!                                    + native-compat stamp (v2)
 //! <dir>/<source_hash_hex>.schemas  - canonical main/return schemas (JSON,
 //!                                    only written by `store_with_schemas`)
+//! <dir>/<source_hash_hex>.native   - wasmtime serialized native code
+//!                                    (only written by `store_native`)
 //! ```
 //!
 //! Cache validity rules (every mismatch returns `None`, not an error,
@@ -19,14 +26,20 @@
 //!  * `magic` mismatch → corrupted / unrelated file, treat as miss.
 //!  * `format_version` mismatch → forward-compat skip.
 //!  * `abi_version` / `codegen_version` mismatch → SDK drift, miss.
+//!  * `native_compat_hash` mismatch → wasmtime / target drift, miss
+//!    on the `.native` sidecar only (`.wasm` + `.schemas` still load).
 //!
-//! Not stored (v1 explicit non-goals):
+//! Native code blob is feature-gated by `Module::deserialize`'s safety
+//! requirements:
 //!
-//!  * `wasmtime::Module::serialize` native blobs — those depend on the
-//!    cranelift version and target CPU, so caching them across SDK
-//!    rebuilds is unsafe. v2 will gate the native blob behind an
-//!    "SDK lockstep" handshake.
-//!  * Per-call session pool warmup — strictly an in-process artifact.
+//!  * Only written by `store_native`, which always pairs a serialised
+//!    blob with the `native_compat_hash` covering wasmtime version +
+//!    host triple. A mismatching reader returns `None` so the
+//!    deserialize path never sees cross-version / cross-arch bytes.
+//!  * Loaded through `load_native`, which re-checks the compat hash
+//!    before handing the bytes back. Callers wrap the resulting
+//!    `Vec<u8>` in an explicit unsafe block when feeding it to
+//!    `Module::deserialize`.
 
 use crate::abi::{CURRENT_ABI_VERSION, CURRENT_CODEGEN_VERSION};
 use relon_eval_api::schema_canonical::Schema;
@@ -43,10 +56,11 @@ use thiserror::Error;
 pub const META_MAGIC: [u8; 4] = *b"RLAC";
 
 /// Current binary shape version of the `.meta` file. Bumped whenever the
-/// layout below changes; mismatches surface as cache misses.
-pub const META_FORMAT_VERSION: u8 = 1;
+/// layout below changes; mismatches surface as cache misses. v1 → v2
+/// added the `native_compat_hash` slot for the `.native` sidecar.
+pub const META_FORMAT_VERSION: u8 = 2;
 
-/// Total encoded size of a `.meta` file in bytes:
+/// Total encoded size of a `.meta` file in bytes (format v2):
 ///
 /// ```text
 /// magic              : [u8; 4]                  (4 bytes)
@@ -55,8 +69,21 @@ pub const META_FORMAT_VERSION: u8 = 1;
 /// codegen_version    : u32 LE                   (4 bytes)
 /// schema_hash        : [u8; 32]                 (32 bytes)
 /// stored_at_unix     : u64 LE                   (8 bytes)
+/// native_compat_hash : [u8; 32]                 (32 bytes)
 /// ```
-pub const META_SIZE: usize = 4 + 1 + 2 + 4 + 32 + 8;
+///
+/// Offsets:
+///
+/// ```text
+///  0..4   magic
+///  4..5   format_version
+///  5..7   abi_version
+///  7..11  codegen_version
+/// 11..43  schema_hash
+/// 43..51  stored_at_unix
+/// 51..83  native_compat_hash
+/// ```
+pub const META_SIZE: usize = 4 + 1 + 2 + 4 + 32 + 8 + 32;
 
 /// Errors raised by [`AotCache`] operations. Read failures that mean
 /// "no cached entry" never surface here — `load` returns `Ok(None)` in
@@ -97,7 +124,8 @@ pub enum CacheError {
 pub struct CachedModule {
     /// The exact wasm bytes the codegen pass emitted on the original
     /// store. Re-feed these into `wasmtime::Module::new` to skip the
-    /// codegen pipeline; cranelift JIT still runs.
+    /// codegen pipeline; cranelift JIT still runs unless the native
+    /// sidecar is also available.
     pub wasm_bytes: Vec<u8>,
     /// Schema fingerprint the host supplied at store time. Hosts use
     /// this to decide whether their current schema matches what the
@@ -111,6 +139,27 @@ pub struct CachedModule {
     /// constructor pairs the wasm bytes with the canonical schemas in
     /// one go.
     pub schemas: Option<CachedSchemas>,
+    /// Native-compatibility stamp persisted in the meta sidecar. Carries
+    /// the wasmtime version + target triple fingerprint the entry was
+    /// originally stored under. Consumers use this to decide whether a
+    /// `.native` sidecar (loaded separately via
+    /// [`AotCache::load_native`]) is usable on the current host.
+    pub native_compat_hash: [u8; 32],
+}
+
+/// A pre-validated chunk of cranelift-serialised native code returned
+/// by [`AotCache::load_native`]. Holding this value means the meta
+/// sidecar's `native_compat_hash` matched the current host's
+/// fingerprint at read time — the bytes are still untrusted input from
+/// the caller's perspective (corruption, hostile editing) so feeding
+/// them to `wasmtime::Module::deserialize` remains an `unsafe`
+/// operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CachedNative {
+    /// Output of `wasmtime::Module::serialize` written by
+    /// [`AotCache::store_native`]. Treat as opaque bytes — the format
+    /// is wasmtime-private and we never inspect it.
+    pub bytes: Vec<u8>,
 }
 
 /// Canonical `(main, return)` schema pair persisted alongside the wasm
@@ -207,30 +256,10 @@ impl AotCache {
                 })
             }
         };
-        if meta_bytes.len() != META_SIZE {
-            // Truncated / oversized meta — treat as drift.
+        let Some(parsed) = parse_meta(&meta_bytes) else {
+            // Truncated / oversized / drifted meta — treat as miss.
             return Ok(None);
-        }
-        if meta_bytes[..4] != META_MAGIC {
-            return Ok(None);
-        }
-        if meta_bytes[4] != META_FORMAT_VERSION {
-            return Ok(None);
-        }
-        let abi_version = u16::from_le_bytes([meta_bytes[5], meta_bytes[6]]);
-        if abi_version != CURRENT_ABI_VERSION {
-            return Ok(None);
-        }
-        let codegen_version =
-            u32::from_le_bytes([meta_bytes[7], meta_bytes[8], meta_bytes[9], meta_bytes[10]]);
-        if codegen_version != CURRENT_CODEGEN_VERSION {
-            return Ok(None);
-        }
-        let mut schema_hash = [0u8; 32];
-        schema_hash.copy_from_slice(&meta_bytes[11..43]);
-        // stored_at unix timestamp at offset 43..51 is advisory only —
-        // we don't use it for invalidation. Future eviction passes can
-        // read it without changing the cache surface.
+        };
 
         // The schemas sidecar is optional. Producers that only know the
         // hash (e.g. tooling that fingerprints third-party wasm) skip
@@ -253,8 +282,63 @@ impl AotCache {
 
         Ok(Some(CachedModule {
             wasm_bytes,
-            schema_hash,
+            schema_hash: parsed.schema_hash,
             schemas,
+            native_compat_hash: parsed.native_compat_hash,
+        }))
+    }
+
+    /// Look up the cranelift native-code sidecar for `source_hash`.
+    /// Returns `Ok(None)` on:
+    ///
+    ///  * no `.native` file present (entry was stored before native
+    ///    caching kicked in, or `store_native` was never called),
+    ///  * meta sidecar missing / drifted (treated as a clean miss),
+    ///  * meta sidecar's `native_compat_hash` does not match the
+    ///    current host's fingerprint — i.e. the binary was produced
+    ///    by a wasmtime version or for a target that the running
+    ///    process cannot safely consume.
+    ///
+    /// On success the returned [`CachedNative`] wraps the raw bytes
+    /// suitable to hand to `wasmtime::Module::deserialize`. The caller
+    /// is still responsible for the `unsafe` invocation — this method
+    /// only guarantees the bytes were produced under the same
+    /// wasmtime version and host triple as the current process.
+    pub fn load_native(&self, source_hash: [u8; 32]) -> Result<Option<CachedNative>, CacheError> {
+        let meta_path = self.meta_path(&source_hash);
+        let meta_bytes = match fs::read(&meta_path) {
+            Ok(b) => b,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => {
+                return Err(CacheError::Io {
+                    path: meta_path,
+                    source: err,
+                })
+            }
+        };
+        let Some(parsed) = parse_meta(&meta_bytes) else {
+            return Ok(None);
+        };
+        // Native-compat drift: wasmtime version / target triple
+        // mismatch. Surface as a clean miss so the caller falls back
+        // to JIT'ing the wasm side without distinguishing "never had
+        // a native sidecar" from "had one but invalidated".
+        if parsed.native_compat_hash != current_native_compat_hash() {
+            return Ok(None);
+        }
+        let native_path = self.native_path(&source_hash);
+        let native_bytes = match fs::read(&native_path) {
+            Ok(b) => b,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => {
+                return Err(CacheError::Io {
+                    path: native_path,
+                    source: err,
+                })
+            }
+        };
+        Ok(Some(CachedNative {
+            bytes: native_bytes,
         }))
     }
 
@@ -274,20 +358,14 @@ impl AotCache {
         schema_hash: [u8; 32],
     ) -> Result<(), CacheError> {
         let (wasm_path, meta_path) = self.paths(&source_hash);
-        // Delete any stale `.schemas` sidecar so a subsequent
-        // schema-less `store` followed by `load` does not silently
-        // return mismatched schemas from a previous run.
+        // Delete any stale `.schemas` / `.native` sidecars so a
+        // subsequent schemaless `store` followed by `load` does not
+        // silently return mismatched schemas / pre-existing native code
+        // tied to the previous wasm content.
         let schemas_path = self.schemas_path(&source_hash);
-        match fs::remove_file(&schemas_path) {
-            Ok(()) => {}
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-            Err(err) => {
-                return Err(CacheError::Io {
-                    path: schemas_path,
-                    source: err,
-                })
-            }
-        }
+        remove_if_present(&schemas_path)?;
+        let native_path = self.native_path(&source_hash);
+        remove_if_present(&native_path)?;
         fs::write(&wasm_path, wasm_bytes).map_err(|err| CacheError::Io {
             path: wasm_path.clone(),
             source: err,
@@ -320,6 +398,13 @@ impl AotCache {
     ) -> Result<(), CacheError> {
         let (wasm_path, meta_path) = self.paths(&source_hash);
         let schemas_path = self.schemas_path(&source_hash);
+        // Clear any stale `.native` for the previous content under the
+        // same key. Re-stamping `.wasm` invalidates any previously
+        // compiled native blob anyway, and leaving it around would
+        // create a window where `load_native` returns bytes that
+        // disagree with the freshly stored wasm.
+        let native_path = self.native_path(&source_hash);
+        remove_if_present(&native_path)?;
         fs::write(&wasm_path, wasm_bytes).map_err(|err| CacheError::Io {
             path: wasm_path.clone(),
             source: err,
@@ -338,6 +423,30 @@ impl AotCache {
         Ok(())
     }
 
+    /// Persist `native_bytes` (output of `wasmtime::Module::serialize`)
+    /// as the `.native` sidecar for `source_hash`. The meta sidecar
+    /// stamped by an earlier `store_*` call already carries the host's
+    /// native-compat hash; this method only writes the binary blob, so
+    /// it presumes the caller has already produced a matching
+    /// `.wasm` / `.meta` pair (otherwise `load_native` would surface
+    /// `None` on the next read).
+    ///
+    /// The write is best-effort idempotent: callers that race to write
+    /// the same key both end up with byte-identical content because
+    /// `Module::serialize` is deterministic for a given
+    /// (wasmtime version, target, wasm input) triple.
+    pub fn store_native(
+        &self,
+        source_hash: [u8; 32],
+        native_bytes: &[u8],
+    ) -> Result<(), CacheError> {
+        let native_path = self.native_path(&source_hash);
+        fs::write(&native_path, native_bytes).map_err(|err| CacheError::Io {
+            path: native_path,
+            source: err,
+        })
+    }
+
     /// Borrow the cache root path. Useful for diagnostics and tests
     /// that want to inspect the on-disk layout.
     pub fn dir(&self) -> &Path {
@@ -348,12 +457,21 @@ impl AotCache {
     /// so future layout changes (sharding, sub-directories) have a
     /// single touch point.
     fn paths(&self, source_hash: &[u8; 32]) -> (PathBuf, PathBuf) {
+        (self.wasm_path(source_hash), self.meta_path(source_hash))
+    }
+
+    fn wasm_path(&self, source_hash: &[u8; 32]) -> PathBuf {
         let hex = hex_encode(source_hash);
-        let mut wasm = self.dir.clone();
-        wasm.push(format!("{hex}.wasm"));
-        let mut meta = self.dir.clone();
-        meta.push(format!("{hex}.meta"));
-        (wasm, meta)
+        let mut p = self.dir.clone();
+        p.push(format!("{hex}.wasm"));
+        p
+    }
+
+    fn meta_path(&self, source_hash: &[u8; 32]) -> PathBuf {
+        let hex = hex_encode(source_hash);
+        let mut p = self.dir.clone();
+        p.push(format!("{hex}.meta"));
+        p
     }
 
     /// Compute the schemas sidecar path for a given source hash. The
@@ -365,12 +483,66 @@ impl AotCache {
         p.push(format!("{hex}.schemas"));
         p
     }
+
+    /// Compute the native-code sidecar path for a given source hash.
+    /// Carries `wasmtime::Module::serialize` output when the producer
+    /// invoked [`Self::store_native`]; otherwise absent.
+    fn native_path(&self, source_hash: &[u8; 32]) -> PathBuf {
+        let hex = hex_encode(source_hash);
+        let mut p = self.dir.clone();
+        p.push(format!("{hex}.native"));
+        p
+    }
+}
+
+/// Decoded view of a `.meta` sidecar. Internal only; the public surface
+/// returns the relevant pieces through [`CachedModule`] /
+/// [`AotCache::load_native`].
+struct ParsedMeta {
+    schema_hash: [u8; 32],
+    native_compat_hash: [u8; 32],
+}
+
+/// Parse `bytes` as a meta sidecar, returning `None` for any drift /
+/// corruption signal. Centralised so `load` and `load_native` apply
+/// identical validity rules.
+fn parse_meta(bytes: &[u8]) -> Option<ParsedMeta> {
+    if bytes.len() != META_SIZE {
+        return None;
+    }
+    if bytes[..4] != META_MAGIC {
+        return None;
+    }
+    if bytes[4] != META_FORMAT_VERSION {
+        return None;
+    }
+    let abi_version = u16::from_le_bytes([bytes[5], bytes[6]]);
+    if abi_version != CURRENT_ABI_VERSION {
+        return None;
+    }
+    let codegen_version = u32::from_le_bytes([bytes[7], bytes[8], bytes[9], bytes[10]]);
+    if codegen_version != CURRENT_CODEGEN_VERSION {
+        return None;
+    }
+    let mut schema_hash = [0u8; 32];
+    schema_hash.copy_from_slice(&bytes[11..43]);
+    // stored_at unix timestamp at offset 43..51 is advisory only —
+    // we don't use it for invalidation. Future eviction passes can
+    // read it without changing the cache surface.
+    let mut native_compat_hash = [0u8; 32];
+    native_compat_hash.copy_from_slice(&bytes[51..83]);
+    Some(ParsedMeta {
+        schema_hash,
+        native_compat_hash,
+    })
 }
 
 /// Encode a `.meta` payload for the given schema hash. Stamps the
-/// current ABI / codegen versions and the host's wall-clock time at
-/// store. Inlined so callers can match against the exact byte layout
-/// described in the module docs.
+/// current ABI / codegen versions, the host's wall-clock time at
+/// store, and the native-compat hash (wasmtime version + target triple)
+/// so consumers can decide whether a `.native` sidecar is usable.
+/// Inlined so callers can match against the exact byte layout described
+/// in the module docs.
 fn encode_meta(schema_hash: [u8; 32]) -> [u8; META_SIZE] {
     let mut out = [0u8; META_SIZE];
     out[..4].copy_from_slice(&META_MAGIC);
@@ -383,7 +555,57 @@ fn encode_meta(schema_hash: [u8; 32]) -> [u8; META_SIZE] {
         .map(|d| d.as_secs())
         .unwrap_or(0);
     out[43..51].copy_from_slice(&stored_at.to_le_bytes());
+    out[51..83].copy_from_slice(&current_native_compat_hash());
     out
+}
+
+/// Wasmtime crate version string the cache was compiled against.
+/// Stamped into the native-compat hash so a host built against a
+/// newer wasmtime can never deserialise a blob produced by an older
+/// one (wasmtime itself also rejects cross-version blobs at the
+/// `Module::deserialize` boundary; the stamp gives us a fast pre-load
+/// reject so we don't pay for the deserialize attempt).
+const WASMTIME_VERSION_TAG: &str = "wasmtime-44";
+
+/// Compose the 32-byte fingerprint that gates `.native` sidecar reuse.
+/// Inputs:
+///
+///  * `WASMTIME_VERSION_TAG` — pinned in-tree so a wasmtime bump
+///    invalidates every cached native blob without needing a separate
+///    schema migration.
+///  * `std::env::consts::ARCH` / `OS` / `FAMILY` — host triple
+///    components available without a build-time `cargo:rerun-if`
+///    plumbing. Cranelift-emitted code is ISA + ABI specific, so a
+///    cache directory shared across machines (e.g. NFS-mounted) must
+///    differentiate per host shape.
+///  * `usize::BITS` — guards against 32-bit / 64-bit confusion in the
+///    unlikely event the triple components alone aren't enough.
+fn current_native_compat_hash() -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(WASMTIME_VERSION_TAG.as_bytes());
+    hasher.update(b"|arch=");
+    hasher.update(std::env::consts::ARCH.as_bytes());
+    hasher.update(b"|os=");
+    hasher.update(std::env::consts::OS.as_bytes());
+    hasher.update(b"|family=");
+    hasher.update(std::env::consts::FAMILY.as_bytes());
+    hasher.update(b"|bits=");
+    hasher.update((usize::BITS).to_le_bytes());
+    hasher.finalize().into()
+}
+
+/// Remove a cache sidecar if it exists, treating NotFound as success.
+/// Surfaces any other I/O failure as [`CacheError::Io`] so half-written
+/// states caused by transient filesystem errors don't go unnoticed.
+fn remove_if_present(path: &Path) -> Result<(), CacheError> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(CacheError::Io {
+            path: path.to_path_buf(),
+            source: err,
+        }),
+    }
 }
 
 /// Lowercase hex-encode `bytes` without pulling in an extra dependency.
@@ -450,6 +672,10 @@ mod tests {
         assert_eq!(loaded.schema_hash, schema_hash);
         // Plain `store` does not write the schemas sidecar.
         assert!(loaded.schemas.is_none());
+        // But meta always carries the current host's native-compat
+        // stamp so subsequent `store_native` / `load_native` calls can
+        // round-trip a cranelift blob without re-writing the meta.
+        assert_eq!(loaded.native_compat_hash, current_native_compat_hash());
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -502,6 +728,9 @@ mod tests {
         let key = AotCache::source_hash("missing source");
         let result = cache.load(key).expect("load Ok");
         assert!(result.is_none(), "cache miss must be None");
+        // load_native on a missing key must also be Ok(None), not Err.
+        let nat = cache.load_native(key).expect("load_native Ok");
+        assert!(nat.is_none(), "native miss must be None");
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -579,5 +808,108 @@ mod tests {
         let c = AotCache::source_hash("beta");
         assert_eq!(a, b);
         assert_ne!(a, c);
+    }
+
+    #[test]
+    fn native_roundtrip_basic() {
+        // store_native writes the `.native` sidecar; load_native
+        // reads it back when the meta's compat hash matches the
+        // current host (which it does for any sidecar produced by
+        // this process — encode_meta stamps the live hash).
+        let dir = temp_cache_dir("native");
+        let cache = AotCache::open(&dir).expect("open");
+        let source_hash = AotCache::source_hash("native source");
+        cache
+            .store(source_hash, &[1u8, 2, 3, 4], [9u8; 32])
+            .expect("store");
+        let blob = vec![0xde, 0xad, 0xbe, 0xef, 0x42, 0x42];
+        cache
+            .store_native(source_hash, &blob)
+            .expect("store_native");
+        let loaded = cache
+            .load_native(source_hash)
+            .expect("load_native Ok")
+            .expect("native hit");
+        assert_eq!(loaded.bytes, blob);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn native_invalidated_by_compat_hash_drift() {
+        // Tamper with the meta's native_compat_hash so load_native
+        // returns None on a still-present .native sidecar. The .wasm
+        // path stays loadable — only the native side is invalidated.
+        let dir = temp_cache_dir("native-drift");
+        let cache = AotCache::open(&dir).expect("open");
+        let source_hash = AotCache::source_hash("native drift source");
+        cache
+            .store(source_hash, &[5u8, 5, 5], [1u8; 32])
+            .expect("store");
+        cache
+            .store_native(source_hash, &[0xaa; 16])
+            .expect("store_native");
+        // Rewrite the native_compat_hash slot to zero — a guaranteed
+        // mismatch against the current host.
+        let hex = hex_encode(&source_hash);
+        let mut meta_path = dir.clone();
+        meta_path.push(format!("{hex}.meta"));
+        let mut meta = fs::read(&meta_path).expect("read meta");
+        for byte in meta[51..83].iter_mut() {
+            *byte = 0;
+        }
+        fs::write(&meta_path, &meta).expect("rewrite meta");
+        let nat = cache.load_native(source_hash).expect("load_native Ok");
+        assert!(nat.is_none(), "compat drift must invalidate native cache");
+        // The .wasm side is still loadable — only the native sidecar
+        // got invalidated. The schema-hash equality survives intact.
+        let module = cache.load(source_hash).expect("load Ok").expect("hit");
+        assert_eq!(module.schema_hash, [1u8; 32]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn native_missing_returns_none() {
+        // store (no native) → load_native must report None without
+        // reading any phantom sidecar.
+        let dir = temp_cache_dir("native-missing");
+        let cache = AotCache::open(&dir).expect("open");
+        let source_hash = AotCache::source_hash("native missing source");
+        cache.store(source_hash, &[7u8], [2u8; 32]).expect("store");
+        let nat = cache.load_native(source_hash).expect("load_native Ok");
+        assert!(nat.is_none(), "no .native sidecar → miss");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn store_clears_stale_native_sidecar() {
+        // Re-storing the wasm bytes under a key must drop any
+        // previously written `.native` sidecar so a subsequent
+        // load_native does not feed wasmtime stale machine code.
+        let dir = temp_cache_dir("native-clear");
+        let cache = AotCache::open(&dir).expect("open");
+        let source_hash = AotCache::source_hash("native clear source");
+        cache.store(source_hash, &[1u8], [4u8; 32]).expect("store");
+        cache
+            .store_native(source_hash, &[0xbb; 8])
+            .expect("store_native");
+        // Re-issue `store` — the prior `.native` blob must be cleared.
+        cache
+            .store(source_hash, &[2u8], [4u8; 32])
+            .expect("re-store");
+        let nat = cache.load_native(source_hash).expect("load_native Ok");
+        assert!(
+            nat.is_none(),
+            "re-store must drop the stale .native sidecar"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn current_native_compat_hash_is_deterministic() {
+        // Repeated calls inside one process must agree, otherwise we'd
+        // invalidate every cache entry across two reads.
+        let a = current_native_compat_hash();
+        let b = current_native_compat_hash();
+        assert_eq!(a, b);
     }
 }
