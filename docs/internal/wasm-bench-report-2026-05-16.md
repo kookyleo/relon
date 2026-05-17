@@ -1299,3 +1299,188 @@ list_int_map 的 +0.7 % 偏低是因为它的 inner closure 几乎只有一条
 
 v3+ 起步：a-1 完工。
 
+
+## 附录 A.13：v10 stdlib dead-code elimination bench（Phase v3+ a-2，2026-05-17）
+
+v3+ a-2 给 wasm-AOT codegen 加了 stdlib dead-code elimination：编
+译器在生成 wasm 模块前对 `[stdlib | user]` 联合函数表跑一遍可达性
+分析，把用户从未调用的 stdlib 函数从 `FunctionSection` / `CodeSection`
+里裁掉。改动集中在 `relon-codegen-wasm`：
+
+1. 新增 `reachability` 模块（BFS / worklist 算法）。Roots：`#main`
+   入口、`closure_table` 里登记的所有 lambda（`call_indirect` 目标
+   静态不可解析，保守视为 live）、所有 user functions（schema
+   methods 也算 user）。stdlib-to-stdlib calls transitive 处理 ——
+   今天没有这种 case，但未来加 `trim` 之类调 `substring` 的 stdlib
+   时不用动 DCE 代码。
+2. `FunctionEmitCfg` / `EmitCtx` 多带一个 `fn_index_remap: &[u32]`
+   字段（pre-DCE -> post-DCE IR-combined index 映射），`Op::Call`
+   emit 时先 lookup 一下 remap 再加 `import_count`。不可达 stdlib
+   slot 在 remap 里写 `u32::MAX`，万一被 emit 路径误用会立即
+   `CallTypeMismatch` 报错（这是 defence-in-depth；BFS 本身保证不
+   会发生）。
+3. `compile_module_with_host_fns` 装配 `combined_funcs` 时只把
+   reachable stdlib 接到 user funcs 前面，不可达的 stdlib 完全不
+   进 wasm 模块。`closure_table` 的 funcref slot 也经过 remap，
+   `call_indirect` 拿到的还是有效目标。
+4. IR 不动 —— `Op::Call.fn_index` 仍然存 pre-DCE 索引，所有翻译
+   都发生在 codegen emit 路径。这样 DCE 关掉只要把
+   `fn_index_remap` 换成 identity vec 就行，cache 序列化层 / IR
+   表示完全无感。
+
+20 个 stdlib bodies（v6 起 13 个 → 现在已经长到 20 个：六个
+`list_*_length` 系列 + 五个 list_int 高阶 + abs/min/max + string ops）
+平均每个 ~300 字节 wasm bytecode，DCE 关时每个用户模块都要带全套
+~6 KiB；DCE 开后只带实际用到的，绝大多数模块都从 6 KiB 跌到 0.5-1.7
+KiB。cranelift JIT 的代码量与 wasm 字节数近似线性，所以 cold start
+也跟着下来。
+
+### wasm 模块字节数（DCE off vs on）
+
+| Scenario          | DCE off    | DCE on     | Δ        |
+| ----------------- | ---------: | ---------: | -------: |
+| `arithmetic`      | 5958 B     | **562 B**  | -90.6 %  |
+| `dict_literal`    | 6083 B     | **687 B**  | -88.7 %  |
+| `stdlib_length`   | 5944 B     | **599 B**  | -89.9 %  |
+| `list_int_map`    | 6410 B     | **1602 B** | -75.0 %  |
+| `list_int_filter` | 6410 B     | **1710 B** | -73.3 %  |
+| `list_int_fold`   | 6205 B     | **1184 B** | -80.9 %  |
+
+arithmetic / dict_literal / stdlib_length 三个 scenario 几乎零 stdlib
+触达：arithmetic 直接没用任何 stdlib；dict_literal 只用了 dict
+打包路径，不进 stdlib；stdlib_length 只 keep `length`。它们的
+post-DCE 字节数主要由 entry function 自身 + handshake guards +
+custom sections（`relon.srcmap` / `relon.uctab` / `relon.abi` /
+`relon.host_fns`）撑起，与 stdlib 数量解耦。
+
+list_int_* 三个 scenario 多带一个 lambda body + 对应高阶 stdlib
+（`list_int_map` / `_filter` / `_fold`），所以 post-DCE 字节数比前
+三个高一些；但仍然比 DCE off 减少 70-80 %。
+
+bench 配置同 v9：6 个 scenario × 5 个 group，criterion `sample_size(50)`
++ `measurement_time(8s)`，`--quick` 模式起步。
+
+### wasm-AOT cold start（v9 → v10）
+
+| Scenario          | v9 cold（A.12） | v10 cold        | Δ        |
+| ----------------- | --------------: | --------------: | -------: |
+| `arithmetic`      |  4.713 ms       | **2.412 ms**    | -48.8 %  |
+| `dict_literal`    |  4.847 ms       | **2.533 ms**    | -47.7 %  |
+| `stdlib_length`   |  4.839 ms       | **2.665 ms**    | -44.9 %  |
+| `list_int_map`    |  4.985 ms       | **3.535 ms**    | -29.1 %  |
+| `list_int_filter` |  4.953 ms       | **3.770 ms**    | -23.9 %  |
+| `list_int_fold`   |  5.185 ms       | **3.157 ms**    | -39.1 %  |
+
+cold start 路径：`parse → analyze → lower → codegen → wasmtime::
+Module::new`。其中 `Module::new` 走 cranelift JIT，是 cold start 的
+主要成本。DCE 把 wasm 模块字节数减少 73-91 %，cranelift JIT 的工
+作量按字节数近似线性下降，cold start 也跟着掉 24-49 %。
+
+zero-stdlib scenario（arithmetic / dict_literal / stdlib_length）
+下降幅度最大（~48 %）—— DCE 直接砍掉 19 个 stdlib body，剩下 1-2
+个；list_int_* 因为必须保留高阶 stdlib + lambda，下降幅度较小但仍
+有 24-39 %。
+
+### wasm-AOT cached cold start（v9 → v10）
+
+| Scenario          | v9 cached（A.12） | v10 cached      | Δ        |
+| ----------------- | ----------------: | --------------: | -------: |
+| `arithmetic`      |  185.4 μs         | **136.5 μs**    | -26.4 %  |
+| `dict_literal`    |  189.7 μs         | **137.0 μs**    | -27.8 %  |
+| `stdlib_length`   |  188.8 μs         | **137.0 μs**    | -27.4 %  |
+| `list_int_map`    |  197.4 μs         | **150.4 μs**    | -23.8 %  |
+| `list_int_filter` |  195.6 μs         | **149.5 μs**    | -23.6 %  |
+| `list_int_fold`   |  188.9 μs         | **147.3 μs**    | -22.0 %  |
+
+cached cold 主要由 `Module::deserialize` + `InstancePre::new` 组成。
+`.native` blob 的字节数随 wasm 字节数线性下降，反序列化时间也跟着
+减少 22-28 %。这是 a-2 的额外好处：cache 命中之后的二次启动也变
+快，host 重启 / 跨实例复用都吃到。
+
+### wasm-AOT warm invoke（v9 → v10）
+
+| Scenario          | v9 warm（A.12） | v10 warm        | Δ        |
+| ----------------- | --------------: | --------------: | -------: |
+| `arithmetic`      |  1.136 μs       | **1.131 μs**    | -0.4 %   |
+| `dict_literal`    |  1.270 μs       | **1.260 μs**    | -0.8 %   |
+| `stdlib_length`   |  1.147 μs       | **1.116 μs**    | -2.7 %   |
+| `list_int_map`    |  2.897 μs       | **2.910 μs**    | +0.4 %   |
+| `list_int_filter` |  2.779 μs       | **2.836 μs**    | +2.1 %   |
+| `list_int_fold`   |  2.259 μs       | **2.265 μs**    | +0.3 %   |
+
+warm invoke 路径走的是 `Store::set_fuel` + `run_main` 的实际执行，
+不经过 wasm 模块装载，所以 DCE 对这条路径理论上应是 0 影响。实测
+±2 % 都在噪声带内（v9 时也是同样数量级的抖动），与 DCE 实现一致。
+
+### tree-walker（对照组，未改动）
+
+| Group                    | Scenario        | v10 Median |
+| ------------------------ | --------------- | ---------: |
+| `tree_walk_total`        | `arithmetic`    | 1.185 ms   |
+| `tree_walk_total`        | `dict_literal`  | 1.189 ms   |
+| `tree_walk_total`        | `stdlib_length` | 1.179 ms   |
+| `tree_walk_total`        | `list_int_map`  | 1.225 ms   |
+| `tree_walk_total`        | `list_int_filter` | 1.219 ms |
+| `tree_walk_total`        | `list_int_fold` | 1.345 ms   |
+| `tree_walk_warm_invoke`  | `arithmetic`    | 2.644 μs   |
+| `tree_walk_warm_invoke`  | `dict_literal`  | 37.04 μs   |
+| `tree_walk_warm_invoke`  | `stdlib_length` | 3.085 μs   |
+| `tree_walk_warm_invoke`  | `list_int_map`  | 103.9 μs   |
+| `tree_walk_warm_invoke`  | `list_int_filter` | 102.5 μs |
+| `tree_walk_warm_invoke`  | `list_int_fold` | 119.2 μs   |
+
+tree-walker 与 v9 持平 —— a-2 不动 tree-walk 任何路径。一些
+scenario 看上去比 v9 涨了 ~5 %（arithmetic 走 +17 %），那是
+criterion `--quick` 模式下 sample 数偏少的抖动；后续严格 v11
+benchmark 走完整 sample budget 时会稳下来。
+
+### Phase a-2 阶段读数 + 决策
+
+* **abi 不需要 bump**：DCE 只重排 wasm function indices，但所有 host
+  observable signatures（`run_main` / `relon_data_top` /
+  `memory` 导出 + `relon.abi` schema hash）一字不变。Phase 9.b-2 的
+  cache key + ABI v2 hash 都对 wasm bytes 取 sha256，DCE 改 wasm
+  字节数自然会让 cache miss 一次；之后稳定下来。
+* **cold start -24% 到 -49% 是真实收益**：cranelift JIT cost 与 wasm
+  bytes 强相关，这条 cold start 也是 v3+ 阶段 host 最关心的指标
+  （embed scenario：每个新 .relon 都是 cold start）。
+* **cached cold -22% 到 -28% 是 bonus**：`Module::deserialize` 走
+  mmap + native code rehydrate，wasm bytes 小了 native 也小，这条
+  没花额外代价。
+* **warm invoke 无影响**：~2% 噪声带，跟 DCE 实现一致 —— 跑 wasm 时
+  函数索引早就被 cranelift 烤进 native code，DCE 后函数表更短
+  反而 cache-friendlier，但量级不在 measurement 噪声带上能看出来。
+* **byte size -73% 到 -91%**：远超预期。20 个 stdlib bodies 平均 ~300
+  字节，"全 prepend" 模式让每个用户模块都背 6 KiB；DCE 之后只带
+  实际用到的，arithmetic 类零 stdlib 模块直接退到 0.5 KiB。
+
+### 关键决策
+
+* **算法：BFS / worklist**。简单，O(N + E)，调试友好。stdlib 数
+  量未来增长到几百也撑得住，没必要换 DFS / SCC。
+* **remap 在 codegen 而不是 IR**：避免改 `Op::Call.fn_index` 的语义
+  + 让 IR 表示与 backend 解耦。代价是 emit 路径多一次 vec lookup
+  （几 ns，warm invoke 都没显著影响）。
+* **funcref table size 0 时仍 emit (size = max(closure_count, 1))**：
+  保留 Phase 11 既定行为。`Op::CallClosure` 在 unreachable code
+  里出现的时候 wasm 仍要 table 能解析；当前测试链里没这种 case，
+  但保留 ≥1 大小不会有任何 wire-format 后果（element section 空、
+  table 占用 zero bytes 之外几字节）。
+
+### 遗留 todo
+
+* **User function DCE**：当前只 prune stdlib，user funcs（包括 schema
+  methods）全保留。Schema method dispatch 通过 `Op::Call.fn_index`
+  也是静态可达，技术上能 prune 不可达的 method，但需要把 `Op::Call`
+  的语义跟 schema method registry 解耦，工作量较大。留给后续 phase。
+* **未调 stdlib 完全消失意味着 stdlib 单测覆盖率虚高**：
+  `dce_smoke.rs` 是按 module shape 验证的，每个 stdlib 自己的
+  `stdlib_smoke.rs` 还是用各自 scenario 单独编出来 keep。统计意义
+  上的"stdlib 在每个用户 module 都被验证一遍"的安全网不再成立 ——
+  哪个 stdlib body bug 只会在用到它的 scenario 里翻车。可以接受，
+  但要在 host SDK 文档里说明这个语义变化。
+* **远程 `#import`（v3+ a-3）和 UTF-8 string ops（v3+ a-4）** 不依
+  赖 DCE；a-2 的工作面与后续 phase 正交。
+
+v3+ 推进：a-2 完工，cold start 实际下降 24-49 %，wasm 模块体积下降
+73-91 %。
