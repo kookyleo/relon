@@ -113,36 +113,40 @@ pub(crate) const DATA_SECTION_BASE: u32 = 4096;
 /// place their buffers above it to avoid overwriting const records.
 const DATA_TOP_GLOBAL_EXPORT_NAME: &str = "relon_data_top";
 
-/// Wasm-local index used as the scratch slot for `emit_store_field`
-/// when the value being stored is a scalar (i32 / i64 / f64). Sits
-/// right after the four binary-handshake params; the function
-/// declares one entry of the appropriate value type as part of its
-/// `locals` header.
-const STORE_TMP_LOCAL_INDEX: u32 = 4;
-/// Wasm-local index of the tail-area write cursor (i32). Initialised
-/// to `return_root_size` and bumped after every String / List<Int>
-/// return write so multiple pointer-indirect outputs can coexist in
-/// the same `out_buf`.
-const TAIL_CURSOR_LOCAL_INDEX: u32 = 5;
-/// Wasm-local index of the memcpy source pointer scratch (i32). Used
-/// by [`Op::StoreField`] of pointer-indirect types — we `tee` the
-/// source pointer here, then pull it back out twice (once for the
-/// length read, once for the memory.copy source argument).
-const MEMCPY_SRC_LOCAL_INDEX: u32 = 6;
-/// Wasm-local index of the memcpy record-size scratch (i32). Holds
-/// the total byte count we feed to `memory.copy` for the current
-/// pointer-indirect store; the same value bumps `$tail_cursor` after
-/// the copy completes.
-const MEMCPY_LEN_LOCAL_INDEX: u32 = 7;
-/// Scratch i32 local used as a generic spill for the new pointer-
-/// store-at-record path (Phase 3.b). Holds the popped record-relative
-/// address before the i32.store instruction consumes it.
-const RECORD_STORE_TMP_LOCAL_INDEX: u32 = 8;
-/// First wasm-local index reserved for user-let bindings. Each
-/// `Op::LetSet` allocates a fresh local of the right valtype past
-/// this point; codegen tracks the index map per function in
-/// [`emit_function_body`].
-const FIRST_LET_LOCAL_INDEX: u32 = 9;
+// ---------------------------------------------------------------------------
+// Per-function local-area layout.
+//
+// Each compiled wasm function carries five reserved scratch slots at the
+// start of its locals area (after the function-declared params):
+//
+//   relative slot 0 → STORE_TMP            (scalar spill, valtype varies)
+//   relative slot 1 → TAIL_CURSOR          (i32)
+//   relative slot 2 → MEMCPY_SRC           (i32)
+//   relative slot 3 → MEMCPY_LEN           (i32)
+//   relative slot 4 → RECORD_STORE_TMP     (i32)
+//   relative slot 5..    user-let bindings + record bases
+//
+// Absolute wasm-local indices are `params.len() + relative_slot`. Phase
+// 4.c-2 refactored the previously-hardcoded `_LOCAL_INDEX = 4..=9`
+// constants into per-function offsets because stdlib bodies declare
+// fewer than four params (`length(String) -> Int` has one), so the
+// fixed numbering produced out-of-range LocalGet ops as soon as a
+// stdlib body started using let-locals or scratch slots.
+//
+// The relative-offset constants below are tied to the locals header
+// shape `emit_function_body` builds; reordering / extending that
+// header must update them in lock-step.
+const STORE_TMP_LOCAL_OFFSET: u32 = 0;
+const TAIL_CURSOR_LOCAL_OFFSET: u32 = 1;
+const MEMCPY_SRC_LOCAL_OFFSET: u32 = 2;
+const MEMCPY_LEN_LOCAL_OFFSET: u32 = 3;
+const RECORD_STORE_TMP_LOCAL_OFFSET: u32 = 4;
+/// First local-area slot reserved for user-let bindings (immediately
+/// past the five scratch slots above). `Op::LetSet`/`Op::LetGet`'s
+/// `idx` is added on top of this offset, then the per-function
+/// `params.len()` is added at emit time to produce the absolute wasm
+/// local index.
+const FIRST_LET_LOCAL_OFFSET: u32 = 5;
 
 /// Lower a [`LoweredEntry`] to a wasm binary.
 ///
@@ -867,7 +871,8 @@ fn emit_function_body(
     // Discover every user-let-binding referenced in this body so we
     // can declare matching wasm locals up front. Each `Op::LetSet`
     // records a `(idx, IrType)` pair; codegen turns the IR-local
-    // index into a wasm-local index at `FIRST_LET_LOCAL_INDEX + idx`.
+    // index into a wasm-local index at
+    // `params_count + FIRST_LET_LOCAL_OFFSET + idx`.
     let let_locals = collect_let_locals(&func.body)?;
     let max_let_idx = let_locals.iter().map(|(idx, _)| *idx).max();
 
@@ -883,23 +888,27 @@ fn emit_function_body(
     // bounds check that traps when the tail area overflows.
     let needs_tail_cursor = body_needs_tail_cursor(&func.body);
 
-    // Locals layout (positions in the wasm-encoder's `locals` header):
-    //   STORE_TMP_LOCAL_INDEX = 4         (scalar spill, ValType varies)
-    //   TAIL_CURSOR_LOCAL_INDEX = 5       (i32)
-    //   MEMCPY_SRC_LOCAL_INDEX = 6        (i32)
-    //   MEMCPY_LEN_LOCAL_INDEX = 7        (i32)
-    //   RECORD_STORE_TMP_LOCAL_INDEX = 8  (i32, Phase 3.b)
-    //   FIRST_LET_LOCAL_INDEX..           user-let locals, contiguous
+    // Locals layout (relative to the start of the per-function locals
+    // area — absolute wasm-local indices add `params_count`):
+    //   STORE_TMP_LOCAL_OFFSET = 0        (scalar spill, ValType varies)
+    //   TAIL_CURSOR_LOCAL_OFFSET = 1      (i32)
+    //   MEMCPY_SRC_LOCAL_OFFSET = 2       (i32)
+    //   MEMCPY_LEN_LOCAL_OFFSET = 3       (i32)
+    //   RECORD_STORE_TMP_LOCAL_OFFSET = 4 (i32, Phase 3.b)
+    //   FIRST_LET_LOCAL_OFFSET..          user-let locals, contiguous
     //   ..record-base locals              i32, one per AllocRootRecord/
     //                                      AllocSubRecord op (Phase 3.b)
     //
     // Even when `needs_tail_cursor` is false (a pure-scalar return
     // body) we still reserve the slots so the contiguous let-local
-    // numbering stays stable across body shapes.
+    // numbering stays stable across body shapes. Phase 4.c-2 made the
+    // offsets relative because stdlib bodies declare fewer than four
+    // params; the pre-refactor hardcoded `_INDEX = 4..=9` constants
+    // only lined up for the entry function's four-param prologue.
     let mut locals_header: Vec<(u32, ValType)> = vec![(1, store_local_ty)];
     // Reserve TAIL_CURSOR / MEMCPY_SRC / MEMCPY_LEN / RECORD_STORE_TMP
     // (4 contiguous i32 slots so the let-locals always start at
-    // `FIRST_LET_LOCAL_INDEX = 9`).
+    // relative offset `FIRST_LET_LOCAL_OFFSET = 5`).
     locals_header.push((4, ValType::I32));
     let mut let_locals_count: u32 = 0;
     if let Some(max_idx) = max_let_idx {
@@ -929,8 +938,16 @@ fn emit_function_body(
         locals_header.push((max_rec + 1, ValType::I32));
     }
     // Pass record-local base index so the op-walker can compute its
-    // matching wasm-local index without re-deriving the offset.
-    let record_local_base = FIRST_LET_LOCAL_INDEX + let_locals_count;
+    // matching wasm-local index without re-deriving the offset. The
+    // base is `params_count + FIRST_LET_LOCAL_OFFSET + let_locals_count`
+    // because the per-function locals area starts immediately after
+    // the wasm-declared params; pre-Phase-4.c-2 the constant assumed
+    // the entry function's four-param layout, which broke stdlib
+    // bodies that declare fewer params.
+    let params_count = u32::try_from(func.params.len()).map_err(|_| {
+        CodegenError::Layout("function declares more than u32::MAX params".into())
+    })?;
+    let record_local_base = params_count + FIRST_LET_LOCAL_OFFSET + let_locals_count;
     let mut f = Function::new(locals_header);
 
     // Per-emitted-instruction source ranges, lock-step with the
@@ -978,12 +995,14 @@ fn emit_function_body(
         // Initialise the tail cursor to `return_root_size` so the
         // first pointer-indirect store lands immediately after the
         // fixed area inside `out_buf`. Skipped when the body has no
-        // String/List return — leaves `TAIL_CURSOR_LOCAL_INDEX` at
-        // its default zero (and unused in that case).
+        // String/List return — leaves the tail-cursor slot at its
+        // default zero (and unused in that case).
         if needs_tail_cursor {
             f.instruction(&Instruction::I32Const(return_root_size as i32));
             ranges.push(func.range);
-            f.instruction(&Instruction::LocalSet(TAIL_CURSOR_LOCAL_INDEX));
+            f.instruction(&Instruction::LocalSet(
+                params_count + TAIL_CURSOR_LOCAL_OFFSET,
+            ));
             ranges.push(func.range);
         }
 
@@ -1038,13 +1057,17 @@ fn emit_function_body(
         ranges.push(func.range);
         // tee: leave (out_ptr+out_cap) on the stack as val_true while
         // also storing into the spill local.
-        f.instruction(&Instruction::LocalTee(RECORD_STORE_TMP_LOCAL_INDEX));
+        f.instruction(&Instruction::LocalTee(
+            params_count + RECORD_STORE_TMP_LOCAL_OFFSET,
+        ));
         ranges.push(func.range);
         // val_false = data_top
         f.instruction(&Instruction::I32Const(emit_cfg.data_top as i32));
         ranges.push(func.range);
         // cond = (out_ptr+out_cap) >= data_top
-        f.instruction(&Instruction::LocalGet(RECORD_STORE_TMP_LOCAL_INDEX));
+        f.instruction(&Instruction::LocalGet(
+            params_count + RECORD_STORE_TMP_LOCAL_OFFSET,
+        ));
         ranges.push(func.range);
         f.instruction(&Instruction::I32Const(emit_cfg.data_top as i32));
         ranges.push(func.range);
@@ -1067,6 +1090,7 @@ fn emit_function_body(
         in_ptr_global_index: emit_cfg.in_ptr_global_index,
         scratch_cursor_global_index: emit_cfg.scratch_cursor_global_index,
         is_entry,
+        params_count,
     };
     let _ = return_root_size; // referenced earlier in this function
     emit_op_seq(
@@ -1090,7 +1114,9 @@ fn emit_function_body(
     // function's return.
     if is_entry {
         if needs_tail_cursor {
-            f.instruction(&Instruction::LocalGet(TAIL_CURSOR_LOCAL_INDEX));
+            f.instruction(&Instruction::LocalGet(
+                params_count + TAIL_CURSOR_LOCAL_OFFSET,
+            ));
             ranges.push(func.range);
         } else {
             f.instruction(&Instruction::I32Const(return_root_size as i32));
@@ -1229,6 +1255,51 @@ struct EmitCtx {
     /// `memory.size_in_pages << 16` so an overflow surfaces as a
     /// `ScratchOOM` trap rather than memory-OOB.
     scratch_cursor_global_index: u32,
+    /// Phase 4.c-2: number of wasm-level params declared by the
+    /// current function. Added to every relative-local offset
+    /// (`STORE_TMP_LOCAL_OFFSET`, `FIRST_LET_LOCAL_OFFSET + idx`,
+    /// ...) so the resulting absolute wasm-local index lines up
+    /// regardless of how many params the function takes. The entry
+    /// function uses four (the binary-handshake slots); stdlib
+    /// bodies use whatever their declared signature pins them at.
+    params_count: u32,
+}
+
+impl EmitCtx {
+    /// Absolute wasm-local index of the function's scalar-spill
+    /// slot. Reserved as the first entry in the locals header so
+    /// stores can stash a value before computing the destination
+    /// address.
+    fn store_tmp_local(&self) -> u32 {
+        self.params_count + STORE_TMP_LOCAL_OFFSET
+    }
+
+    /// Absolute wasm-local index of the tail-area write cursor.
+    fn tail_cursor_local(&self) -> u32 {
+        self.params_count + TAIL_CURSOR_LOCAL_OFFSET
+    }
+
+    /// Absolute wasm-local index of the memcpy source-pointer
+    /// scratch slot.
+    fn memcpy_src_local(&self) -> u32 {
+        self.params_count + MEMCPY_SRC_LOCAL_OFFSET
+    }
+
+    /// Absolute wasm-local index of the memcpy length scratch slot.
+    fn memcpy_len_local(&self) -> u32 {
+        self.params_count + MEMCPY_LEN_LOCAL_OFFSET
+    }
+
+    /// Absolute wasm-local index of the record-store i32 spill
+    /// slot.
+    fn record_store_tmp_local(&self) -> u32 {
+        self.params_count + RECORD_STORE_TMP_LOCAL_OFFSET
+    }
+
+    /// Absolute wasm-local index of the first user-let slot.
+    fn first_let_local(&self) -> u32 {
+        self.params_count + FIRST_LET_LOCAL_OFFSET
+    }
 }
 
 /// Scan `body` (and any nested if-branches) for the largest
@@ -1367,7 +1438,8 @@ fn emit_op_seq(
                 ranges.push(tagged.range);
             }
             Op::LetGet { idx, ty } => {
-                let local_idx = FIRST_LET_LOCAL_INDEX
+                let local_idx = ectx
+                    .first_let_local()
                     .checked_add(*idx)
                     .ok_or(CodegenError::MixedNumericTypes)?;
                 f.instruction(&Instruction::LocalGet(local_idx));
@@ -1375,7 +1447,8 @@ fn emit_op_seq(
                 ranges.push(tagged.range);
             }
             Op::LetSet { idx, ty } => {
-                let local_idx = FIRST_LET_LOCAL_INDEX
+                let local_idx = ectx
+                    .first_let_local()
                     .checked_add(*idx)
                     .ok_or(CodegenError::MixedNumericTypes)?;
                 let popped = vstack.pop().ok_or(CodegenError::MixedNumericTypes)?;
@@ -1424,10 +1497,18 @@ fn emit_op_seq(
                         // out_buf tail area, then store the
                         // buffer-relative offset of the record to
                         // the fixed-area slot.
-                        emit_store_pointer_indirect(f, ranges, log, *offset, *ty, tagged.range)?;
+                        emit_store_pointer_indirect(
+                            f,
+                            ranges,
+                            log,
+                            ectx,
+                            *offset,
+                            *ty,
+                            tagged.range,
+                        )?;
                     }
                     _ => {
-                        emit_store_field(f, ranges, *offset, *ty, tagged.range)?;
+                        emit_store_field(f, ranges, ectx, *offset, *ty, tagged.range)?;
                     }
                 }
             }
@@ -1522,21 +1603,22 @@ fn emit_op_seq(
                 // into the record-base local, then bump the cursor
                 // by `root_size`.
                 let wasm_local = ectx.record_local_base + record_local_idx;
-                emit_align_tail_cursor(f, ranges, *root_align, tagged.range);
-                emit_tail_bounds_check(f, ranges, log, *root_size, tagged.range);
+                let tail_cursor = ectx.tail_cursor_local();
+                emit_align_tail_cursor(f, ranges, ectx, *root_align, tagged.range);
+                emit_tail_bounds_check(f, ranges, log, ectx, *root_size, tagged.range);
                 // local_record = $tail_cursor
-                f.instruction(&Instruction::LocalGet(TAIL_CURSOR_LOCAL_INDEX));
+                f.instruction(&Instruction::LocalGet(tail_cursor));
                 ranges.push(tagged.range);
                 f.instruction(&Instruction::LocalSet(wasm_local));
                 ranges.push(tagged.range);
                 // $tail_cursor += root_size
-                f.instruction(&Instruction::LocalGet(TAIL_CURSOR_LOCAL_INDEX));
+                f.instruction(&Instruction::LocalGet(tail_cursor));
                 ranges.push(tagged.range);
                 f.instruction(&Instruction::I32Const(*root_size as i32));
                 ranges.push(tagged.range);
                 f.instruction(&Instruction::I32Add);
                 ranges.push(tagged.range);
-                f.instruction(&Instruction::LocalSet(TAIL_CURSOR_LOCAL_INDEX));
+                f.instruction(&Instruction::LocalSet(tail_cursor));
                 ranges.push(tagged.range);
             }
             Op::PushRecordBase { record_local_idx } => {
@@ -1557,6 +1639,7 @@ fn emit_op_seq(
                 emit_store_field_at_record(
                     f,
                     ranges,
+                    ectx,
                     ectx.record_local_base + record_local_idx,
                     *offset,
                     *ty,
@@ -1568,7 +1651,7 @@ fn emit_op_seq(
                 if popped.wasm_slot() != IrType::I32 {
                     return Err(CodegenError::MixedNumericTypes);
                 }
-                emit_tail_record_from_absolute(f, ranges, log, *ty, tagged.range)?;
+                emit_tail_record_from_absolute(f, ranges, log, ectx, *ty, tagged.range)?;
                 // Pushes the buffer-relative offset of the
                 // newly-written record.
                 vstack.push(IrType::I32);
@@ -1822,6 +1905,93 @@ fn emit_op_seq(
                 emit_alloc_scratch_dynamic(f, ranges, log, ectx, tagged.range);
                 vstack.push(IrType::I32);
             }
+            Op::LoadI32AtAbsolute { offset } => {
+                // Pop the absolute base address, then emit `i32.load`
+                // with the static `offset` baked into the memarg.
+                // 4-byte alignment (log2 = 2) keeps the load aligned
+                // when the base is a record start or a 4-aligned
+                // scratch offset; codegen does not detect 1/2-byte
+                // alignment specially because wasm runtimes treat
+                // the alignment hint as a hint, not a constraint.
+                let popped = vstack.pop().ok_or(CodegenError::MixedNumericTypes)?;
+                if popped.wasm_slot() != IrType::I32 {
+                    return Err(CodegenError::MixedNumericTypes);
+                }
+                f.instruction(&Instruction::I32Load(MemArg {
+                    offset: *offset as u64,
+                    align: 2,
+                    memory_index: 0,
+                }));
+                ranges.push(tagged.range);
+                vstack.push(IrType::I32);
+            }
+            Op::LoadI64AtAbsolute { offset } => {
+                let popped = vstack.pop().ok_or(CodegenError::MixedNumericTypes)?;
+                if popped.wasm_slot() != IrType::I32 {
+                    return Err(CodegenError::MixedNumericTypes);
+                }
+                f.instruction(&Instruction::I64Load(MemArg {
+                    offset: *offset as u64,
+                    align: 3,
+                    memory_index: 0,
+                }));
+                ranges.push(tagged.range);
+                vstack.push(IrType::I64);
+            }
+            Op::StoreI32AtAbsolute { offset } => {
+                // Wasm `i32.store` consumes `[addr, value]` (address
+                // pushed first, value on top). We pop the value tag
+                // first, then the address, validating both occupy
+                // an i32 slot.
+                let value = vstack.pop().ok_or(CodegenError::MixedNumericTypes)?;
+                let addr = vstack.pop().ok_or(CodegenError::MixedNumericTypes)?;
+                if value.wasm_slot() != IrType::I32 || addr.wasm_slot() != IrType::I32 {
+                    return Err(CodegenError::MixedNumericTypes);
+                }
+                f.instruction(&Instruction::I32Store(MemArg {
+                    offset: *offset as u64,
+                    align: 2,
+                    memory_index: 0,
+                }));
+                ranges.push(tagged.range);
+            }
+            Op::StoreI64AtAbsolute { offset } => {
+                // Mirror of `StoreI32AtAbsolute` but the value slot
+                // is i64 (Int payload). Address still occupies an
+                // i32 slot.
+                let value = vstack.pop().ok_or(CodegenError::MixedNumericTypes)?;
+                let addr = vstack.pop().ok_or(CodegenError::MixedNumericTypes)?;
+                if value.wasm_slot() != IrType::I64 || addr.wasm_slot() != IrType::I32 {
+                    return Err(CodegenError::MixedNumericTypes);
+                }
+                f.instruction(&Instruction::I64Store(MemArg {
+                    offset: *offset as u64,
+                    align: 3,
+                    memory_index: 0,
+                }));
+                ranges.push(tagged.range);
+            }
+            Op::MemcpyAtAbsolute => {
+                // Wasm `memory.copy` consumes `[dst, src, len]` (in
+                // that pushed order, len on top). All three slots are
+                // i32; mismatches surface as `MixedNumericTypes` so a
+                // hand-built IR with the wrong operand shape fails
+                // deterministically.
+                let len = vstack.pop().ok_or(CodegenError::MixedNumericTypes)?;
+                let src = vstack.pop().ok_or(CodegenError::MixedNumericTypes)?;
+                let dst = vstack.pop().ok_or(CodegenError::MixedNumericTypes)?;
+                if len.wasm_slot() != IrType::I32
+                    || src.wasm_slot() != IrType::I32
+                    || dst.wasm_slot() != IrType::I32
+                {
+                    return Err(CodegenError::MixedNumericTypes);
+                }
+                f.instruction(&Instruction::MemoryCopy {
+                    src_mem: 0,
+                    dst_mem: 0,
+                });
+                ranges.push(tagged.range);
+            }
         }
     }
     Ok(())
@@ -2009,10 +2179,10 @@ fn emit_alloc_scratch_static(
 
 /// Phase 4.c-1: emit the dynamic-size scratch bump sequence. The size
 /// is consumed from the top of the operand stack before this helper
-/// runs; the helper spills it into `MEMCPY_LEN_LOCAL_INDEX` (re-using
-/// the function-internal i32 scratch slot) so the bounds-check
-/// arithmetic and the bump arithmetic can both reference the same
-/// value.
+/// runs; the helper spills it into the function's memcpy-length slot
+/// (re-using one of the per-function i32 scratch locals) so the
+/// bounds-check arithmetic and the bump arithmetic can both reference
+/// the same value.
 ///
 /// Stack (assumed at entry): `[size: i32]`
 /// Stack (at exit):           `[pre_bump_cursor: i32]`
@@ -2024,17 +2194,18 @@ fn emit_alloc_scratch_dynamic(
     range: TokenRange,
 ) {
     // Spill size into a local — we need it three times (bounds check,
-    // bump, push offset). `MEMCPY_LEN_LOCAL_INDEX` is i32 and isn't
+    // bump, push offset). The memcpy-length slot is i32 and isn't
     // live at the call sites that lower stdlib bodies emitting
     // scratch (those bodies don't simultaneously emit
     // tail-cursor-bearing stores).
-    f.instruction(&Instruction::LocalSet(MEMCPY_LEN_LOCAL_INDEX));
+    let memcpy_len = ectx.memcpy_len_local();
+    f.instruction(&Instruction::LocalSet(memcpy_len));
     ranges.push(range);
 
     // Bounds: cursor + size > memory.size << 16 → trap.
     f.instruction(&Instruction::GlobalGet(ectx.scratch_cursor_global_index));
     ranges.push(range);
-    f.instruction(&Instruction::LocalGet(MEMCPY_LEN_LOCAL_INDEX));
+    f.instruction(&Instruction::LocalGet(memcpy_len));
     ranges.push(range);
     f.instruction(&Instruction::I32Add);
     ranges.push(range);
@@ -2070,7 +2241,7 @@ fn emit_alloc_scratch_dynamic(
     // Update cursor: new = cursor + size.
     f.instruction(&Instruction::GlobalGet(ectx.scratch_cursor_global_index));
     ranges.push(range);
-    f.instruction(&Instruction::LocalGet(MEMCPY_LEN_LOCAL_INDEX));
+    f.instruction(&Instruction::LocalGet(memcpy_len));
     ranges.push(range);
     f.instruction(&Instruction::I32Add);
     ranges.push(range);
@@ -2510,6 +2681,7 @@ fn push_in_ptr(f: &mut Function, ranges: &mut Vec<TokenRange>, ectx: &EmitCtx, r
 fn emit_store_field(
     f: &mut Function,
     ranges: &mut Vec<TokenRange>,
+    ectx: &EmitCtx,
     offset: u32,
     ty: IrType,
     range: TokenRange,
@@ -2520,7 +2692,7 @@ fn emit_store_field(
     //   - f64 for Float
     //   - i32 for Bool / Null
     // The body always uses exactly one; emit_function_body declares
-    // the matching local up front (see STORE_TMP_LOCAL_INDEX).
+    // the matching local up front (see STORE_TMP_LOCAL_OFFSET).
     let store_op = match ty {
         IrType::I64 => Instruction::I64Store(MemArg {
             offset: offset as u64,
@@ -2545,11 +2717,12 @@ fn emit_store_field(
             return Err(CodegenError::UnsupportedStoreFieldType { ty });
         }
     };
-    f.instruction(&Instruction::LocalSet(STORE_TMP_LOCAL_INDEX));
+    let store_tmp = ectx.store_tmp_local();
+    f.instruction(&Instruction::LocalSet(store_tmp));
     ranges.push(range);
     f.instruction(&Instruction::LocalGet(WASM_LOCAL_OUT_PTR));
     ranges.push(range);
-    f.instruction(&Instruction::LocalGet(STORE_TMP_LOCAL_INDEX));
+    f.instruction(&Instruction::LocalGet(store_tmp));
     ranges.push(range);
     f.instruction(&store_op);
     ranges.push(range);
@@ -2611,17 +2784,22 @@ fn emit_store_pointer_indirect(
     f: &mut Function,
     ranges: &mut Vec<TokenRange>,
     log: &mut Vec<RecordedUnreachable>,
+    ectx: &EmitCtx,
     fixed_offset: u32,
     ty: IrType,
     range: TokenRange,
 ) -> Result<(), CodegenError> {
+    let memcpy_src = ectx.memcpy_src_local();
+    let memcpy_len = ectx.memcpy_len_local();
+    let tail_cursor = ectx.tail_cursor_local();
+
     // Spill the src address into the local — we'll need it twice
     // (once to read the length prefix, once for memory.copy).
-    f.instruction(&Instruction::LocalSet(MEMCPY_SRC_LOCAL_INDEX));
+    f.instruction(&Instruction::LocalSet(memcpy_src));
     ranges.push(range);
 
     // Load the length prefix (u32 LE) at src+0.
-    f.instruction(&Instruction::LocalGet(MEMCPY_SRC_LOCAL_INDEX));
+    f.instruction(&Instruction::LocalGet(memcpy_src));
     ranges.push(range);
     f.instruction(&Instruction::I32Load(MemArg {
         offset: 0,
@@ -2653,7 +2831,7 @@ fn emit_store_pointer_indirect(
         }
         _ => return Err(CodegenError::UnsupportedStoreFieldType { ty }),
     }
-    f.instruction(&Instruction::LocalSet(MEMCPY_LEN_LOCAL_INDEX));
+    f.instruction(&Instruction::LocalSet(memcpy_len));
     ranges.push(range);
 
     // Align $tail_cursor before writing the record. String needs
@@ -2670,7 +2848,7 @@ fn emit_store_pointer_indirect(
         IrType::ListInt => 7,
         _ => 3,
     };
-    f.instruction(&Instruction::LocalGet(TAIL_CURSOR_LOCAL_INDEX));
+    f.instruction(&Instruction::LocalGet(tail_cursor));
     ranges.push(range);
     f.instruction(&Instruction::I32Const(align_add));
     ranges.push(range);
@@ -2680,13 +2858,13 @@ fn emit_store_pointer_indirect(
     ranges.push(range);
     f.instruction(&Instruction::I32And);
     ranges.push(range);
-    f.instruction(&Instruction::LocalSet(TAIL_CURSOR_LOCAL_INDEX));
+    f.instruction(&Instruction::LocalSet(tail_cursor));
     ranges.push(range);
 
     // Bounds: tail_cursor + record_size > out_cap → trap.
-    f.instruction(&Instruction::LocalGet(TAIL_CURSOR_LOCAL_INDEX));
+    f.instruction(&Instruction::LocalGet(tail_cursor));
     ranges.push(range);
-    f.instruction(&Instruction::LocalGet(MEMCPY_LEN_LOCAL_INDEX));
+    f.instruction(&Instruction::LocalGet(memcpy_len));
     ranges.push(range);
     f.instruction(&Instruction::I32Add);
     ranges.push(range);
@@ -2718,13 +2896,13 @@ fn emit_store_pointer_indirect(
     // dozen instructions per record.
     f.instruction(&Instruction::LocalGet(WASM_LOCAL_OUT_PTR));
     ranges.push(range);
-    f.instruction(&Instruction::LocalGet(TAIL_CURSOR_LOCAL_INDEX));
+    f.instruction(&Instruction::LocalGet(tail_cursor));
     ranges.push(range);
     f.instruction(&Instruction::I32Add);
     ranges.push(range);
-    f.instruction(&Instruction::LocalGet(MEMCPY_SRC_LOCAL_INDEX));
+    f.instruction(&Instruction::LocalGet(memcpy_src));
     ranges.push(range);
-    f.instruction(&Instruction::LocalGet(MEMCPY_LEN_LOCAL_INDEX));
+    f.instruction(&Instruction::LocalGet(memcpy_len));
     ranges.push(range);
     f.instruction(&Instruction::MemoryCopy {
         src_mem: 0,
@@ -2736,7 +2914,7 @@ fn emit_store_pointer_indirect(
     // fixed-area slot at `fixed_offset`.
     f.instruction(&Instruction::LocalGet(WASM_LOCAL_OUT_PTR));
     ranges.push(range);
-    f.instruction(&Instruction::LocalGet(TAIL_CURSOR_LOCAL_INDEX));
+    f.instruction(&Instruction::LocalGet(tail_cursor));
     ranges.push(range);
     f.instruction(&Instruction::I32Store(MemArg {
         offset: fixed_offset as u64,
@@ -2747,13 +2925,13 @@ fn emit_store_pointer_indirect(
 
     // Bump tail_cursor by record_size for the next pointer-indirect
     // write (Phase 3.b dict literal outputs reuse this slot).
-    f.instruction(&Instruction::LocalGet(TAIL_CURSOR_LOCAL_INDEX));
+    f.instruction(&Instruction::LocalGet(tail_cursor));
     ranges.push(range);
-    f.instruction(&Instruction::LocalGet(MEMCPY_LEN_LOCAL_INDEX));
+    f.instruction(&Instruction::LocalGet(memcpy_len));
     ranges.push(range);
     f.instruction(&Instruction::I32Add);
     ranges.push(range);
-    f.instruction(&Instruction::LocalSet(TAIL_CURSOR_LOCAL_INDEX));
+    f.instruction(&Instruction::LocalSet(tail_cursor));
     ranges.push(range);
 
     Ok(())
@@ -2766,17 +2944,19 @@ fn emit_store_pointer_indirect(
 fn emit_align_tail_cursor(
     f: &mut Function,
     ranges: &mut Vec<TokenRange>,
+    ectx: &EmitCtx,
     align: u32,
     range: TokenRange,
 ) {
     if align <= 1 {
         return;
     }
+    let tail_cursor = ectx.tail_cursor_local();
     // `$tail_cursor = ($tail_cursor + (align - 1)) & ~(align - 1)`.
     // Works for any power-of-two align ≤ 8 — the only values the
     // layout pass emits.
     let mask = !(align as i32 - 1);
-    f.instruction(&Instruction::LocalGet(TAIL_CURSOR_LOCAL_INDEX));
+    f.instruction(&Instruction::LocalGet(tail_cursor));
     ranges.push(range);
     f.instruction(&Instruction::I32Const(align as i32 - 1));
     ranges.push(range);
@@ -2786,7 +2966,7 @@ fn emit_align_tail_cursor(
     ranges.push(range);
     f.instruction(&Instruction::I32And);
     ranges.push(range);
-    f.instruction(&Instruction::LocalSet(TAIL_CURSOR_LOCAL_INDEX));
+    f.instruction(&Instruction::LocalSet(tail_cursor));
     ranges.push(range);
 }
 
@@ -2796,10 +2976,11 @@ fn emit_tail_bounds_check(
     f: &mut Function,
     ranges: &mut Vec<TokenRange>,
     log: &mut Vec<RecordedUnreachable>,
+    ectx: &EmitCtx,
     size: u32,
     range: TokenRange,
 ) {
-    f.instruction(&Instruction::LocalGet(TAIL_CURSOR_LOCAL_INDEX));
+    f.instruction(&Instruction::LocalGet(ectx.tail_cursor_local()));
     ranges.push(range);
     f.instruction(&Instruction::I32Const(size as i32));
     ranges.push(range);
@@ -2828,6 +3009,7 @@ fn emit_tail_bounds_check(
 fn emit_store_field_at_record(
     f: &mut Function,
     ranges: &mut Vec<TokenRange>,
+    ectx: &EmitCtx,
     record_wasm_local: u32,
     offset: u32,
     ty: IrType,
@@ -2843,12 +3025,14 @@ fn emit_store_field_at_record(
     // STORE_TMP local (typed to the value's slot). Pointer-indirect
     // store (`String` / `ListInt`) uses the i32-typed
     // RECORD_STORE_TMP since they all ride i32 wasm slots.
+    let store_tmp = ectx.store_tmp_local();
+    let record_store_tmp = ectx.record_store_tmp_local();
     match ty {
         IrType::I64 => {
-            f.instruction(&Instruction::LocalSet(STORE_TMP_LOCAL_INDEX));
+            f.instruction(&Instruction::LocalSet(store_tmp));
             ranges.push(range);
             emit_record_dest_addr(f, ranges, record_wasm_local, offset, range);
-            f.instruction(&Instruction::LocalGet(STORE_TMP_LOCAL_INDEX));
+            f.instruction(&Instruction::LocalGet(store_tmp));
             ranges.push(range);
             f.instruction(&Instruction::I64Store(MemArg {
                 offset: 0,
@@ -2858,10 +3042,10 @@ fn emit_store_field_at_record(
             ranges.push(range);
         }
         IrType::F64 => {
-            f.instruction(&Instruction::LocalSet(STORE_TMP_LOCAL_INDEX));
+            f.instruction(&Instruction::LocalSet(store_tmp));
             ranges.push(range);
             emit_record_dest_addr(f, ranges, record_wasm_local, offset, range);
-            f.instruction(&Instruction::LocalGet(STORE_TMP_LOCAL_INDEX));
+            f.instruction(&Instruction::LocalGet(store_tmp));
             ranges.push(range);
             f.instruction(&Instruction::F64Store(MemArg {
                 offset: 0,
@@ -2871,10 +3055,10 @@ fn emit_store_field_at_record(
             ranges.push(range);
         }
         IrType::Bool | IrType::Null => {
-            f.instruction(&Instruction::LocalSet(RECORD_STORE_TMP_LOCAL_INDEX));
+            f.instruction(&Instruction::LocalSet(record_store_tmp));
             ranges.push(range);
             emit_record_dest_addr(f, ranges, record_wasm_local, offset, range);
-            f.instruction(&Instruction::LocalGet(RECORD_STORE_TMP_LOCAL_INDEX));
+            f.instruction(&Instruction::LocalGet(record_store_tmp));
             ranges.push(range);
             f.instruction(&Instruction::I32Store8(MemArg {
                 offset: 0,
@@ -2887,10 +3071,10 @@ fn emit_store_field_at_record(
             // Pointer slot — store the i32 (which is either a
             // pointer offset produced by EmitTailRecordFromAbsoluteAddr
             // / PushRecordBase, or an arbitrary i32).
-            f.instruction(&Instruction::LocalSet(RECORD_STORE_TMP_LOCAL_INDEX));
+            f.instruction(&Instruction::LocalSet(record_store_tmp));
             ranges.push(range);
             emit_record_dest_addr(f, ranges, record_wasm_local, offset, range);
-            f.instruction(&Instruction::LocalGet(RECORD_STORE_TMP_LOCAL_INDEX));
+            f.instruction(&Instruction::LocalGet(record_store_tmp));
             ranges.push(range);
             f.instruction(&Instruction::I32Store(MemArg {
                 offset: 0,
@@ -2941,14 +3125,20 @@ fn emit_tail_record_from_absolute(
     f: &mut Function,
     ranges: &mut Vec<TokenRange>,
     log: &mut Vec<RecordedUnreachable>,
+    ectx: &EmitCtx,
     ty: IrType,
     range: TokenRange,
 ) -> Result<(), CodegenError> {
+    let memcpy_src = ectx.memcpy_src_local();
+    let memcpy_len = ectx.memcpy_len_local();
+    let tail_cursor = ectx.tail_cursor_local();
+    let record_store_tmp = ectx.record_store_tmp_local();
+
     // Spill source so we can use it twice.
-    f.instruction(&Instruction::LocalSet(MEMCPY_SRC_LOCAL_INDEX));
+    f.instruction(&Instruction::LocalSet(memcpy_src));
     ranges.push(range);
     // Load length prefix.
-    f.instruction(&Instruction::LocalGet(MEMCPY_SRC_LOCAL_INDEX));
+    f.instruction(&Instruction::LocalGet(memcpy_src));
     ranges.push(range);
     f.instruction(&Instruction::I32Load(MemArg {
         offset: 0,
@@ -2977,7 +3167,7 @@ fn emit_tail_record_from_absolute(
         }
         _ => return Err(CodegenError::UnsupportedStoreFieldType { ty }),
     }
-    f.instruction(&Instruction::LocalSet(MEMCPY_LEN_LOCAL_INDEX));
+    f.instruction(&Instruction::LocalSet(memcpy_len));
     ranges.push(range);
 
     // Align $tail_cursor before the write. Same alignment rules as
@@ -2987,12 +3177,12 @@ fn emit_tail_record_from_absolute(
         IrType::ListInt => 8,
         _ => 4,
     };
-    emit_align_tail_cursor(f, ranges, align, range);
+    emit_align_tail_cursor(f, ranges, ectx, align, range);
 
     // Bounds: tail_cursor + record_size > out_cap → trap.
-    f.instruction(&Instruction::LocalGet(TAIL_CURSOR_LOCAL_INDEX));
+    f.instruction(&Instruction::LocalGet(tail_cursor));
     ranges.push(range);
-    f.instruction(&Instruction::LocalGet(MEMCPY_LEN_LOCAL_INDEX));
+    f.instruction(&Instruction::LocalGet(memcpy_len));
     ranges.push(range);
     f.instruction(&Instruction::I32Add);
     ranges.push(range);
@@ -3020,24 +3210,24 @@ fn emit_tail_record_from_absolute(
     // Push the pre-bump tail cursor (= the buffer-relative offset
     // of the record about to be written) onto the stack. We grab
     // this BEFORE bumping the cursor and BEFORE calling memcpy.
-    f.instruction(&Instruction::LocalGet(TAIL_CURSOR_LOCAL_INDEX));
+    f.instruction(&Instruction::LocalGet(tail_cursor));
     ranges.push(range);
     // Stash that into RECORD_STORE_TMP so we can do the memcpy with
     // a fresh address computation and then reload the offset for the
     // outer code's stack push.
-    f.instruction(&Instruction::LocalSet(RECORD_STORE_TMP_LOCAL_INDEX));
+    f.instruction(&Instruction::LocalSet(record_store_tmp));
     ranges.push(range);
 
     // memory.copy(dst = out_ptr + tail_cursor, src = $memcpy_src, n = $memcpy_len)
     f.instruction(&Instruction::LocalGet(WASM_LOCAL_OUT_PTR));
     ranges.push(range);
-    f.instruction(&Instruction::LocalGet(TAIL_CURSOR_LOCAL_INDEX));
+    f.instruction(&Instruction::LocalGet(tail_cursor));
     ranges.push(range);
     f.instruction(&Instruction::I32Add);
     ranges.push(range);
-    f.instruction(&Instruction::LocalGet(MEMCPY_SRC_LOCAL_INDEX));
+    f.instruction(&Instruction::LocalGet(memcpy_src));
     ranges.push(range);
-    f.instruction(&Instruction::LocalGet(MEMCPY_LEN_LOCAL_INDEX));
+    f.instruction(&Instruction::LocalGet(memcpy_len));
     ranges.push(range);
     f.instruction(&Instruction::MemoryCopy {
         src_mem: 0,
@@ -3046,17 +3236,17 @@ fn emit_tail_record_from_absolute(
     ranges.push(range);
 
     // $tail_cursor += $memcpy_len
-    f.instruction(&Instruction::LocalGet(TAIL_CURSOR_LOCAL_INDEX));
+    f.instruction(&Instruction::LocalGet(tail_cursor));
     ranges.push(range);
-    f.instruction(&Instruction::LocalGet(MEMCPY_LEN_LOCAL_INDEX));
+    f.instruction(&Instruction::LocalGet(memcpy_len));
     ranges.push(range);
     f.instruction(&Instruction::I32Add);
     ranges.push(range);
-    f.instruction(&Instruction::LocalSet(TAIL_CURSOR_LOCAL_INDEX));
+    f.instruction(&Instruction::LocalSet(tail_cursor));
     ranges.push(range);
 
     // Push the saved pre-bump offset as the result.
-    f.instruction(&Instruction::LocalGet(RECORD_STORE_TMP_LOCAL_INDEX));
+    f.instruction(&Instruction::LocalGet(record_store_tmp));
     ranges.push(range);
 
     Ok(())
@@ -3431,6 +3621,12 @@ impl WasmModule {
                     }
                     Some(UnreachableKind::ScratchOOM { needed }) => RuntimeError::WasmScratchOOM {
                         needed,
+                        range: range.unwrap_or_default(),
+                    },
+                    Some(UnreachableKind::IndexOutOfBounds) => RuntimeError::WasmIndexOutOfBounds {
+                        range: range.unwrap_or_default(),
+                    },
+                    Some(UnreachableKind::EmptyList) => RuntimeError::WasmEmptyList {
                         range: range.unwrap_or_default(),
                     },
                     None => RuntimeError::WasmTrapUnclassified {
