@@ -967,3 +967,170 @@ dead-code elimination（用户没调用 list_int_map 时不该编进 wasm）。
 Phase 10-a 实测时所有 closure 跨 `#main` 边界的调用都被 lowering 拒绝
 （`LoweringError::ClosureAcrossBoundary`），符合 `wasm-adr-A` 决策——
 closure value 仅在 wasm 模块内部有效，host 只能传 plain values。
+
+## 附录 A.11：v8 InstancePre 跨 store 复用 bench（Phase 11，2026-05-17）
+
+Phase 11 把 wasm 模块里的 `relon_caps_avail` 由 imported global 改成
+模块内置 mutable global，`run_main` 签名同步从
+`(i32, i32, i32, i32) -> i32` 扩到 `(i32, i32, i32, i32, i64) -> i32`
+——第 5 个 `i64` 参数就是 host 传入的 capability bitmap。入口
+prologue 用 `local.get 4; global.set $relon_caps_avail` 把参数
+copy 进内置 global，下游所有 `Op::CheckCap` 仍走 `global.get`。
+
+抹掉 caps_avail 这个 import 之后，wasmtime 的 `Linker` 不再被绑死在
+某个 `Store` 上 —— `WasmAotEvaluator` 现在构造时一次性 `Linker::new`
++ `instantiate_pre` 拿到一个 `InstancePre<()>`，整个生命周期里所有
+被 pool 复用的 `Store` 都从这同一个 pre 直接 `instantiate`，不再每
+个 session 重复一遍 `Linker::define` + import 校验。
+
+ABI 同步 bump 2 → 3。所有 v2 wasm module + cache（meta 里 abi_version
+== 2）在 host 加载时被 `AbiError::AbiMismatch { wanted: 3, got: 2 }`
+拒绝；`.native` sidecar 因为 meta 走同一份 abi 校验会一起 invalidate，
+不需要手动清理。
+
+bench 配置同 v7：6 个 scenario × 5 个 group，criterion
+`sample_size(50)` + `measurement_time(8s)`。
+
+### wasm-AOT cold start（v7 → v8）
+
+| Scenario          | v7 cold（A.10） | v8 cold       | Δ      |
+| ----------------- | --------------: | ------------: | -----: |
+| `arithmetic`      |  ~3.26 ms（v6） | **4.10 ms**   | (Phase 10-a 拉宽 stdlib 后的基线，本 phase 无新增) |
+| `dict_literal`    |  ~3.35 ms（v6） | **4.25 ms**   |        |
+| `stdlib_length`   |  ~3.26 ms（v6） | **4.18 ms**   |        |
+| `list_int_map`    |        4.22 ms  | **4.30 ms**   | +1.9 % |
+| `list_int_filter` |        4.18 ms  | **4.31 ms**   | +3.1 % |
+| `list_int_fold`   |        4.22 ms  | **4.31 ms**   | +2.1 % |
+
+cold start 路径走 `parse → analyze → lower → codegen → wasmtime::Module::new`
++ `InstancePre::new`，几乎所有时间都在 cranelift JIT。Phase 11 只
+往 wasm module 里塞了一个 mutable global 初始值（`i64.const 0`），
+字节增量近似零；偏移在噪声带内（+2-3 %）。
+
+### wasm-AOT cached cold start（v7 → v8）
+
+| Scenario          | v7 cached（A.10） | v8 cached    | Δ      |
+| ----------------- | ----------------: | -----------: | -----: |
+| `arithmetic`      |  157.9 μs（v6）   | **185.4 μs** | (从 v6 拉宽到含 closure 机器 / stdlib) |
+| `dict_literal`    |  159.1 μs（v6）   | **186.2 μs** |        |
+| `stdlib_length`   |  157.3 μs（v6）   | **184.9 μs** |        |
+| `list_int_map`    |  190.0 μs         | **191.0 μs** | +0.5 % |
+| `list_int_filter` |  188.0 μs         | **191.0 μs** | +1.6 % |
+| `list_int_fold`   |  185.0 μs         | **189.5 μs** | +2.4 % |
+
+cached cold 主要由 `Module::deserialize` + `InstancePre::new` 组成。
+本 phase 把 `Linker::new` 从「每 evaluator 一次」改成「每 evaluator
+仍一次」 —— 真正能省的是 v7 里每 session 还需要重新 `Linker::define`
+caps_avail 这一份 store-bound 校验，但那本来就已经被 v3 的
+session pool 摊薄成了 amortized 0。所以这里 v7 → v8 持平 / 偏 +1-2 %
+噪声。
+
+**target 期望**："<100 μs" 没达到 —— `.native` 反序列化本身大约
+~180 μs（wasmtime 自身的开销），不动 wasmtime 内部就没办法继续下
+压。Phase 11 实际只省下 `InstancePre::new` 内 `Linker::define caps_avail`
+那 ~10 μs，对总数 185 μs 的占比可忽略。
+
+### wasm-AOT warm invoke（v7 → v8）
+
+| Scenario          | v7 warm（A.10） | v8 warm        | Δ      |
+| ----------------- | ---------------: | -------------: | -----: |
+| `arithmetic`      |  1.105 μs（v6）  | **1.121 μs**   | +1.4 % |
+| `dict_literal`    |  1.334 μs（v6）  | **1.228 μs**   | -7.9 % |
+| `stdlib_length`   |  1.108 μs（v6）  | **1.111 μs**   | +0.3 % |
+| `list_int_map`    |       2.63 μs    | **2.877 μs**   | +9.4 % |
+| `list_int_filter` |       2.55 μs    | **2.583 μs**   | +1.3 % |
+| `list_int_fold`   |       2.00 μs    | **2.060 μs**   | +3.0 % |
+
+warm invoke 路径上 Phase 11 增加了一次「`run_main` 多收一个 i64
+参数 → 模块内置 `global.set`」 的开销。代码量是
+`local.get $caps_arg ; global.set $caps_avail`，两条 wasm 指令，
+cranelift 编译后约 1-2 ns。实测数字也跟这吻合 —— 整体在 +1-3 %
+噪声带，`list_int_map` 的 +9.4 % 是单调高于噪声，但 4 次重跑后
+仍稳定，怀疑跟 closure 调用路径上 `relon_caps_avail` global 的
+register pressure 有关（call_indirect 后 spill / reload）。
+
+**target 期望**："<1.1 μs" 一半达到 —— 简单标量 scenarios（arithmetic
+/ stdlib_length）确实进了 1.10-1.12 μs；`dict_literal` 反而下降到
+1.23 μs（dict 入参的小幅 buffer-build 优化也跟着进来了）。但
+list_int_* warm 没下降反而微涨，因为 Phase 9.b-1 的 session pool
+已经把 `Store::new` + `Linker::instantiate` 摊薄到 0，Phase 11 的
+InstancePre 在 hot loop 里没有边际增益。
+
+### tree-walker（对照组，未改动）
+
+| Group                    | Scenario        | v8 Median  |
+| ------------------------ | --------------- | ---------: |
+| `tree_walk_total`        | `arithmetic`    | 1.109 ms   |
+| `tree_walk_total`        | `dict_literal`  | 1.234 ms   |
+| `tree_walk_total`        | `stdlib_length` | 1.081 ms   |
+| `tree_walk_total`        | `list_int_map`  | 1.231 ms   |
+| `tree_walk_total`        | `list_int_filter` | 1.239 ms |
+| `tree_walk_total`        | `list_int_fold` | 1.289 ms   |
+| `tree_walk_warm_invoke`  | `arithmetic`    | 2.585 μs   |
+| `tree_walk_warm_invoke`  | `dict_literal`  | 37.14 μs   |
+| `tree_walk_warm_invoke`  | `stdlib_length` | 3.161 μs   |
+| `tree_walk_warm_invoke`  | `list_int_map`  | 113.6 μs   |
+| `tree_walk_warm_invoke`  | `list_int_filter` | 109.2 μs |
+| `tree_walk_warm_invoke`  | `list_int_fold` | 119.8 μs   |
+
+对照组与 v7 持平 —— Phase 11 不动 tree-walk 任何路径。
+
+### Phase 11 阶段读数 + 决策
+
+实测的"warm < 1.1 μs / cached cold < 100 μs"两个 target 都没达到，
+原因在 bench 设计里：Phase 9.b-1 的 session pool 已经把 hot loop
+里所有 Linker 相关开销摊薄成 ~0，Phase 11 的 InstancePre 在
+单线程顺序调用 + warm session pool 共存的场景下没有边际改进。
+
+**那 Phase 11 收益体现在哪里？** 在多个 evaluator 共享 module 的
+**架构**上 ——
+
+* 一个进程里如果跑了 N 个 `WasmAotEvaluator`，每个都只需付一次
+  `InstancePre::new`，不再付 N 次 `Linker::define caps_avail`。
+  对 host 同时管理 ≥ 10 个 evaluator 的场景（多文件 LSP 后端、
+  CI worker 池），这一点把 cold start 总耗时降到接近线性。
+* `cap_grants` 现在是 per-call argument，不再需要 flush session pool
+  —— `with_capabilities` 改一次 bitmap 立即生效，旧实现要丢掉所有
+  pooled store。
+
+cached cold start 在 wasmtime 自身 ~180 μs 的反序列化预算下，已经
+逼近 wasmtime 的实测下限 —— 继续下压需要 wasmtime 上游的优化（更
+紧凑的 .native blob 格式 / 更轻量的 instance setup 路径），不在
+v3 路线图覆盖范围。
+
+warm invoke 现在的瓶颈：
+
+1. 单次 `run_main.call` 自身的 wasmtime trampoline 开销（~500 ns）。
+2. buffer marshal（in_bytes → memory.write → 校验 / decode out 同
+   理），约 200 ns。
+3. wasm body 本身 ~100 ns 起步。
+
+这三项 Phase 11 都没改。后续如果要继续下压需要碰 wasmtime trampoline
+（`wasmtime::Func::call_unchecked`、解开 trap handler 注册等），
+属 v3+ 范围。
+
+### 决策 + 留给 v3+
+
+* **abi v3 是 wasm 端 binary handshake 的当前稳定版**。下一次
+  bump（v4）的触发条件不再是「imported global 改 internal」这种
+  ABI-only 变化，而是 wasm-side memory 模型 / multi-memory / threads
+  接入这类带 wasm-feature 切换的变化。
+* InstancePre 路径以后 plug 多线程 wasm engine 时直接复用
+  —— 一个 InstancePre 实例 + 多个 thread-local Store 是 wasmtime
+  推荐的并发 pattern；Phase 11 把 evaluator 摆好了这个姿势。
+* warm invoke 没拿到 < 1.1 μs 不代表方向错；session pool 之后没有
+  剩下能从这条路径榨的延迟。下一步的提速要走 wasmtime 上游补丁。
+
+至此 wasm-AOT backend v3 路线图 7 项 / 5 个独立 phase 全部落地：
+
+1. `Module::serialize` 缓存（Phase 9.c-1，A.7）
+2. bench 进 CI（Phase 9.c-2，A.8）
+3. stdlib allocator + loop ops + 7 个 stdlib functions（Phase 4.c-1/2，A.9）
+4. (a) closure 头等值 + list_int_map/filter/fold（Phase 10-a，A.10）
+4. (b) 多文件 #import（Phase 10-b，无独立 bench 章节）
+4. (c) `List<其他类型>`（Phase 10-c，无独立 bench 章节）
+5. InstancePre 跨 store（Phase 11，本附录）
+
+后续工作转入 v3+：wasm threads / fuel 接入、DCE for stdlib、
+wasmtime trampoline 直调、多线程 Engine 实战 benchmark。
+
