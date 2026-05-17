@@ -273,10 +273,16 @@ pub fn compile_module_with_host_fns(
     // `relon_in_ptr` mutable global follows so schema-method bodies
     // can rebase buffer-relative pointer slots into absolute wasm
     // addresses without taking `in_ptr` as an explicit method
-    // parameter (entry function writes it at prologue time).
+    // parameter (entry function writes it at prologue time). Phase
+    // 4.c-1 appends the `relon_scratch_cursor` mutable i32 global,
+    // initialised at entry prologue time to the byte just past the
+    // caller's out_buf so the bump allocator can grow into the
+    // remainder of linear memory without colliding with the const
+    // data section / in_buf / out_buf regions.
     let caps_avail_global_index: u32 = 0;
     let data_top_global_index: u32 = 1;
     let in_ptr_global_index: u32 = 2;
+    let scratch_cursor_global_index: u32 = 3;
 
     // Single shared memory: one page (64 KiB). Host writes the input
     // buffer somewhere inside, hands the pointer to `run_main`, then
@@ -327,6 +333,23 @@ pub fn compile_module_with_host_fns(
         &ConstExpr::i32_const(0),
     );
 
+    // Phase 4.c-1: `relon_scratch_cursor` — module-internal bump
+    // allocator cursor used by `Op::AllocScratch` / `Op::AllocScratchDyn`.
+    // Initialised by the entry prologue to a byte past the caller's
+    // out_buf (and at least past the const data section), so stdlib
+    // bodies that allocate temporaries (concat, upper, fold, ...)
+    // can grow into the remainder of linear memory without
+    // overlapping with in_buf / out_buf / data section regions. Not
+    // exported — host code never reads or writes it directly.
+    globals.global(
+        GlobalType {
+            val_type: ValType::I32,
+            mutable: true,
+            shared: false,
+        },
+        &ConstExpr::i32_const(0),
+    );
+
     let mut per_func_ranges: Vec<(TokenRange, Vec<TokenRange>)> =
         Vec::with_capacity(combined_funcs.len());
     // Phase 7: per-function `unreachable` records, lock-step with
@@ -355,6 +378,8 @@ pub fn compile_module_with_host_fns(
             import_count,
             caps_avail_global_index,
             in_ptr_global_index,
+            scratch_cursor_global_index,
+            data_top,
         };
         let (body, ranges, unreachable_log) = emit_function_body(
             func,
@@ -451,6 +476,19 @@ struct FunctionEmitCfg {
     /// rebase buffer-relative pointer slots into absolute addresses
     /// without taking `in_ptr` as an explicit argument.
     in_ptr_global_index: u32,
+    /// Phase 4.c-1: global index of the module-internal mutable
+    /// `relon_scratch_cursor` i32. The entry prologue initialises it
+    /// to `max(out_ptr + out_cap, data_top)` so a scratch alloc can
+    /// grow into linear memory past the caller's out_buf without
+    /// colliding with any pre-existing region. Stdlib bodies that
+    /// allocate scratch (`Op::AllocScratch` / `Op::AllocScratchDyn`)
+    /// read + bump this global.
+    scratch_cursor_global_index: u32,
+    /// Phase 4.c-1: high-water mark of the const data section. Used
+    /// by the entry prologue to clamp the scratch-cursor's
+    /// initial value so it never overlaps with the read-only data
+    /// region.
+    data_top: u32,
 }
 
 /// Look up an existing `(params, ret) -> type index` entry or add a
@@ -782,6 +820,9 @@ fn collect_consts(body: &[relon_ir::TaggedOp], pool: &mut ConstPool) -> Result<(
                 collect_consts(then_body, pool)?;
                 collect_consts(else_body, pool)?;
             }
+            Op::Block { body, .. } | Op::Loop { body, .. } => {
+                collect_consts(body, pool)?;
+            }
             _ => {}
         }
     }
@@ -957,6 +998,64 @@ fn emit_function_body(
         ranges.push(func.range);
         f.instruction(&Instruction::GlobalSet(emit_cfg.in_ptr_global_index));
         ranges.push(func.range);
+
+        // Phase 4.c-1: initialise the scratch bump cursor.
+        //
+        // Start = `max(out_ptr + out_cap, data_top)`.
+        //
+        // `out_ptr + out_cap` is the first byte past the caller's
+        // output region; any scratch alloc beginning there will not
+        // collide with the tail-cursor protocol (which writes inside
+        // `[out_ptr, out_ptr + out_cap)`). The `max(..., data_top)`
+        // clamp matters when the host parks `out_buf` below the
+        // const data section — we then start the scratch past the
+        // read-only data instead of overwriting it.
+        //
+        // Emitted sequence (spills the computed `out_ptr+out_cap`
+        // into the function-internal `RECORD_STORE_TMP` local — at
+        // entry-prologue time none of the tail-cursor / record-store
+        // scratch slots are live yet, so they can double as free
+        // i32 temporaries):
+        //
+        //   ;; tmp = out_ptr + out_cap
+        //   local.get $out_ptr
+        //   local.get $out_cap
+        //   i32.add
+        //   local.tee $tmp
+        //   ;; val_false = data_top
+        //   i32.const <data_top>
+        //   ;; cond = tmp >= data_top  → pick tmp
+        //   local.get $tmp
+        //   i32.const <data_top>
+        //   i32.ge_u
+        //   select
+        //   global.set $relon_scratch_cursor
+        f.instruction(&Instruction::LocalGet(WASM_LOCAL_OUT_PTR));
+        ranges.push(func.range);
+        f.instruction(&Instruction::LocalGet(WASM_LOCAL_OUT_CAP));
+        ranges.push(func.range);
+        f.instruction(&Instruction::I32Add);
+        ranges.push(func.range);
+        // tee: leave (out_ptr+out_cap) on the stack as val_true while
+        // also storing into the spill local.
+        f.instruction(&Instruction::LocalTee(RECORD_STORE_TMP_LOCAL_INDEX));
+        ranges.push(func.range);
+        // val_false = data_top
+        f.instruction(&Instruction::I32Const(emit_cfg.data_top as i32));
+        ranges.push(func.range);
+        // cond = (out_ptr+out_cap) >= data_top
+        f.instruction(&Instruction::LocalGet(RECORD_STORE_TMP_LOCAL_INDEX));
+        ranges.push(func.range);
+        f.instruction(&Instruction::I32Const(emit_cfg.data_top as i32));
+        ranges.push(func.range);
+        f.instruction(&Instruction::I32GeU);
+        ranges.push(func.range);
+        f.instruction(&Instruction::TypedSelect(ValType::I32));
+        ranges.push(func.range);
+        f.instruction(&Instruction::GlobalSet(
+            emit_cfg.scratch_cursor_global_index,
+        ));
+        ranges.push(func.range);
     }
 
     // Virtual stack used to validate arithmetic type tags.
@@ -966,6 +1065,7 @@ fn emit_function_body(
         import_count: emit_cfg.import_count,
         caps_avail_global_index: emit_cfg.caps_avail_global_index,
         in_ptr_global_index: emit_cfg.in_ptr_global_index,
+        scratch_cursor_global_index: emit_cfg.scratch_cursor_global_index,
         is_entry,
     };
     let _ = return_root_size; // referenced earlier in this function
@@ -1037,6 +1137,9 @@ fn collect_let_locals_inner(
             } => {
                 collect_let_locals_inner(then_body, out)?;
                 collect_let_locals_inner(else_body, out)?;
+            }
+            Op::Block { body, .. } | Op::Loop { body, .. } => {
+                collect_let_locals_inner(body, out)?;
             }
             _ => {}
         }
@@ -1119,6 +1222,13 @@ struct EmitCtx {
     /// rebase emitted by [`LoadFieldAtAbsolute`] must source the
     /// pointer from the cached global, not local 0.
     is_entry: bool,
+    /// Phase 4.c-1: global index of the module-internal mutable
+    /// `relon_scratch_cursor` i32. `Op::AllocScratch` /
+    /// `Op::AllocScratchDyn` reads + bumps it; the bounds check
+    /// before each bump compares against the current
+    /// `memory.size_in_pages << 16` so an overflow surfaces as a
+    /// `ScratchOOM` trap rather than memory-OOB.
+    scratch_cursor_global_index: u32,
 }
 
 /// Scan `body` (and any nested if-branches) for the largest
@@ -1149,6 +1259,9 @@ fn collect_max_record_idx(body: &[relon_ir::TaggedOp]) -> Option<u32> {
                 } => {
                     walk(then_body, update);
                     walk(else_body, update);
+                }
+                Op::Block { body: inner, .. } | Op::Loop { body: inner, .. } => {
+                    walk(inner, update);
                 }
                 _ => {}
             }
@@ -1188,6 +1301,11 @@ fn body_needs_tail_cursor(body: &[relon_ir::TaggedOp]) -> bool {
                 ..
             } => {
                 if body_needs_tail_cursor(then_body) || body_needs_tail_cursor(else_body) {
+                    return true;
+                }
+            }
+            Op::Block { body, .. } | Op::Loop { body, .. } => {
+                if body_needs_tail_cursor(body) {
                     return true;
                 }
             }
@@ -1639,9 +1757,325 @@ fn emit_op_seq(
                 ranges.push(tagged.range);
                 vstack.push(*ty);
             }
+            Op::Block { result_ty, body } => {
+                emit_block_or_loop(
+                    f,
+                    ranges,
+                    log,
+                    vstack,
+                    *result_ty,
+                    body,
+                    func,
+                    const_pool,
+                    ectx,
+                    tagged.range,
+                    BlockKind::Block,
+                )?;
+            }
+            Op::Loop { result_ty, body } => {
+                emit_block_or_loop(
+                    f,
+                    ranges,
+                    log,
+                    vstack,
+                    *result_ty,
+                    body,
+                    func,
+                    const_pool,
+                    ectx,
+                    tagged.range,
+                    BlockKind::Loop,
+                )?;
+            }
+            Op::Br { label_depth } => {
+                // Unconditional branch — pops nothing from the IR
+                // stack (verifier-side dead-code rule handles the
+                // remainder of the surrounding frame).
+                f.instruction(&Instruction::Br(*label_depth));
+                ranges.push(tagged.range);
+            }
+            Op::BrIf { label_depth } => {
+                let cond = vstack.pop().ok_or(CodegenError::MixedNumericTypes)?;
+                if cond.wasm_slot() != IrType::I32 {
+                    return Err(CodegenError::MixedNumericTypes);
+                }
+                f.instruction(&Instruction::BrIf(*label_depth));
+                ranges.push(tagged.range);
+            }
+            Op::BrTable { default, targets } => {
+                let idx = vstack.pop().ok_or(CodegenError::MixedNumericTypes)?;
+                if idx.wasm_slot() != IrType::I32 {
+                    return Err(CodegenError::MixedNumericTypes);
+                }
+                f.instruction(&Instruction::BrTable(targets.to_vec().into(), *default));
+                ranges.push(tagged.range);
+            }
+            Op::AllocScratch { size_bytes } => {
+                emit_alloc_scratch_static(f, ranges, log, ectx, *size_bytes, tagged.range);
+                vstack.push(IrType::I32);
+            }
+            Op::AllocScratchDyn => {
+                let size = vstack.pop().ok_or(CodegenError::MixedNumericTypes)?;
+                if size.wasm_slot() != IrType::I32 {
+                    return Err(CodegenError::MixedNumericTypes);
+                }
+                emit_alloc_scratch_dynamic(f, ranges, log, ectx, tagged.range);
+                vstack.push(IrType::I32);
+            }
         }
     }
     Ok(())
+}
+
+/// Phase 4.c-1: which wasm structured-control instruction backs a
+/// given [`Op::Block`] / [`Op::Loop`]. The two share their stack-frame
+/// validation and result-type plumbing, only the opening opcode
+/// differs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BlockKind {
+    /// Forward-exit block. `br` jumps past the matching `end`.
+    Block,
+    /// Backward-jump loop. `br` jumps back to the `loop` header.
+    Loop,
+}
+
+/// Phase 4.c-1: emit a structured `block`/`loop ... end` pair with a
+/// fresh vstack frame for the body. Frame discipline mirrors
+/// [`emit_if`]: the inner ops cannot leak operands out through the
+/// surrounding frame, and an optional `result_ty` requires the body
+/// to leave exactly one matching value on the inner stack at the
+/// closing `end`.
+///
+/// Why share between Block and Loop: the only divergence is the
+/// opening opcode (`Block(bt)` vs `Loop(bt)`) and the meaning of a
+/// `br` inside the body (forward exit vs back-to-header). Both
+/// behaviours are wasm-runtime concerns — the codegen treats them
+/// identically up to the opcode choice.
+#[allow(clippy::too_many_arguments)]
+fn emit_block_or_loop(
+    f: &mut Function,
+    ranges: &mut Vec<TokenRange>,
+    log: &mut Vec<RecordedUnreachable>,
+    vstack: &mut Vec<IrType>,
+    result_ty: Option<IrType>,
+    body: &[relon_ir::TaggedOp],
+    func: &relon_ir::Func,
+    const_pool: &ConstPool,
+    ectx: &mut EmitCtx,
+    range: TokenRange,
+    kind: BlockKind,
+) -> Result<(), CodegenError> {
+    let block_type = match result_ty {
+        None => BlockType::Empty,
+        Some(t) => BlockType::Result(ir_to_val_type(&t)),
+    };
+    let opening = match kind {
+        BlockKind::Block => Instruction::Block(block_type),
+        BlockKind::Loop => Instruction::Loop(block_type),
+    };
+    f.instruction(&opening);
+    ranges.push(range);
+
+    // Fresh vstack frame so inner ops can't observe / mutate operands
+    // from the surrounding scope. Br / BrIf inside the body target
+    // wasm labels by depth — the verifier checks operand-stack shape
+    // at branch points, so a frame-leak surfaces as a wasm validation
+    // failure rather than corrupting our IR-side bookkeeping.
+    let mut inner_stack: Vec<IrType> = Vec::new();
+    emit_op_seq(
+        f,
+        ranges,
+        log,
+        &mut inner_stack,
+        body,
+        func,
+        const_pool,
+        ectx,
+    )?;
+
+    match result_ty {
+        None => {
+            // Stack-neutral block: inner_stack must be empty at end.
+            // We accept a non-empty inner_stack only when the body
+            // exits via a `br` (verifier handles the unreachable
+            // tail); the IR-level check can't tell the two apart
+            // without dataflow, so we relax to "either empty, or
+            // ended with a Br". The wasm validator catches a real
+            // stack imbalance at module-validate time, which is the
+            // canonical line of defence.
+            let body_exits = body
+                .last()
+                .map(|t| matches!(t.op, Op::Br { .. } | Op::BrTable { .. }))
+                .unwrap_or(false);
+            if !inner_stack.is_empty() && !body_exits {
+                return Err(CodegenError::MixedNumericTypes);
+            }
+        }
+        Some(t) => {
+            let top = inner_stack.pop().ok_or(CodegenError::MixedNumericTypes)?;
+            if !inner_stack.is_empty() {
+                return Err(CodegenError::MixedNumericTypes);
+            }
+            if top.wasm_slot() != t.wasm_slot() {
+                return Err(CodegenError::IfBranchTypeMismatch {
+                    then_ty: top,
+                    else_ty: t,
+                });
+            }
+            vstack.push(t);
+        }
+    }
+
+    f.instruction(&Instruction::End);
+    ranges.push(range);
+    Ok(())
+}
+
+/// Phase 4.c-1: emit the static-size scratch bump sequence.
+///
+/// Generated wasm:
+///
+/// ```text
+/// ;; bounds: cursor + size > (memory.size << 16) → trap
+/// global.get $relon_scratch_cursor
+/// i32.const <size>
+/// i32.add
+/// memory.size
+/// i32.const 16
+/// i32.shl
+/// i32.gt_u
+/// if; unreachable; end
+///
+/// ;; push pre-bump cursor; bump global by size
+/// global.get $relon_scratch_cursor
+/// global.get $relon_scratch_cursor
+/// i32.const <size>
+/// i32.add
+/// global.set $relon_scratch_cursor
+/// ```
+///
+/// Note the bump completes by leaving the pre-bump cursor on the
+/// operand stack — the caller receives the base address of the
+/// reserved region. `size == 0` is allowed (no bytes reserved, but
+/// the cursor stays valid as a marker); codegen does not special-case
+/// it.
+fn emit_alloc_scratch_static(
+    f: &mut Function,
+    ranges: &mut Vec<TokenRange>,
+    log: &mut Vec<RecordedUnreachable>,
+    ectx: &EmitCtx,
+    size_bytes: u32,
+    range: TokenRange,
+) {
+    // Bounds check.
+    f.instruction(&Instruction::GlobalGet(ectx.scratch_cursor_global_index));
+    ranges.push(range);
+    f.instruction(&Instruction::I32Const(size_bytes as i32));
+    ranges.push(range);
+    f.instruction(&Instruction::I32Add);
+    ranges.push(range);
+    f.instruction(&Instruction::MemorySize(0));
+    ranges.push(range);
+    f.instruction(&Instruction::I32Const(16));
+    ranges.push(range);
+    f.instruction(&Instruction::I32Shl);
+    ranges.push(range);
+    f.instruction(&Instruction::I32GtU);
+    ranges.push(range);
+    f.instruction(&Instruction::If(BlockType::Empty));
+    ranges.push(range);
+    emit_recorded_unreachable(
+        f,
+        ranges,
+        log,
+        range,
+        UnreachableKind::ScratchOOM { needed: size_bytes },
+    );
+    f.instruction(&Instruction::End);
+    ranges.push(range);
+
+    // Push pre-bump cursor and update cursor.
+    f.instruction(&Instruction::GlobalGet(ectx.scratch_cursor_global_index));
+    ranges.push(range);
+    f.instruction(&Instruction::GlobalGet(ectx.scratch_cursor_global_index));
+    ranges.push(range);
+    f.instruction(&Instruction::I32Const(size_bytes as i32));
+    ranges.push(range);
+    f.instruction(&Instruction::I32Add);
+    ranges.push(range);
+    f.instruction(&Instruction::GlobalSet(ectx.scratch_cursor_global_index));
+    ranges.push(range);
+}
+
+/// Phase 4.c-1: emit the dynamic-size scratch bump sequence. The size
+/// is consumed from the top of the operand stack before this helper
+/// runs; the helper spills it into `MEMCPY_LEN_LOCAL_INDEX` (re-using
+/// the function-internal i32 scratch slot) so the bounds-check
+/// arithmetic and the bump arithmetic can both reference the same
+/// value.
+///
+/// Stack (assumed at entry): `[size: i32]`
+/// Stack (at exit):           `[pre_bump_cursor: i32]`
+fn emit_alloc_scratch_dynamic(
+    f: &mut Function,
+    ranges: &mut Vec<TokenRange>,
+    log: &mut Vec<RecordedUnreachable>,
+    ectx: &EmitCtx,
+    range: TokenRange,
+) {
+    // Spill size into a local — we need it three times (bounds check,
+    // bump, push offset). `MEMCPY_LEN_LOCAL_INDEX` is i32 and isn't
+    // live at the call sites that lower stdlib bodies emitting
+    // scratch (those bodies don't simultaneously emit
+    // tail-cursor-bearing stores).
+    f.instruction(&Instruction::LocalSet(MEMCPY_LEN_LOCAL_INDEX));
+    ranges.push(range);
+
+    // Bounds: cursor + size > memory.size << 16 → trap.
+    f.instruction(&Instruction::GlobalGet(ectx.scratch_cursor_global_index));
+    ranges.push(range);
+    f.instruction(&Instruction::LocalGet(MEMCPY_LEN_LOCAL_INDEX));
+    ranges.push(range);
+    f.instruction(&Instruction::I32Add);
+    ranges.push(range);
+    f.instruction(&Instruction::MemorySize(0));
+    ranges.push(range);
+    f.instruction(&Instruction::I32Const(16));
+    ranges.push(range);
+    f.instruction(&Instruction::I32Shl);
+    ranges.push(range);
+    f.instruction(&Instruction::I32GtU);
+    ranges.push(range);
+    f.instruction(&Instruction::If(BlockType::Empty));
+    ranges.push(range);
+    // Dynamic-size variant reports `needed = 0` because the actual
+    // size lives on the operand stack at trap time and we cannot
+    // snapshot it into the uctab entry (the entry only carries a
+    // u32 immediate). Trap diagnostics still surface the kind tag,
+    // so the host can render a meaningful "scratch heap exhausted"
+    // message.
+    emit_recorded_unreachable(
+        f,
+        ranges,
+        log,
+        range,
+        UnreachableKind::ScratchOOM { needed: 0 },
+    );
+    f.instruction(&Instruction::End);
+    ranges.push(range);
+
+    // Push pre-bump cursor onto the stack (the returned base address).
+    f.instruction(&Instruction::GlobalGet(ectx.scratch_cursor_global_index));
+    ranges.push(range);
+    // Update cursor: new = cursor + size.
+    f.instruction(&Instruction::GlobalGet(ectx.scratch_cursor_global_index));
+    ranges.push(range);
+    f.instruction(&Instruction::LocalGet(MEMCPY_LEN_LOCAL_INDEX));
+    ranges.push(range);
+    f.instruction(&Instruction::I32Add);
+    ranges.push(range);
+    f.instruction(&Instruction::GlobalSet(ectx.scratch_cursor_global_index));
+    ranges.push(range);
 }
 
 /// Emit the wasm sequence guarding a host-fn call (or a stand-alone
@@ -2654,6 +3088,11 @@ fn find_store_field_local_ty(body: &[relon_ir::TaggedOp]) -> Option<ValType> {
                     return Some(t);
                 }
             }
+            Op::Block { body, .. } | Op::Loop { body, .. } => {
+                if let Some(t) = find_store_field_local_ty(body) {
+                    return Some(t);
+                }
+            }
             _ => {}
         }
     }
@@ -2990,6 +3429,10 @@ impl WasmModule {
                             range: range.unwrap_or_default(),
                         }
                     }
+                    Some(UnreachableKind::ScratchOOM { needed }) => RuntimeError::WasmScratchOOM {
+                        needed,
+                        range: range.unwrap_or_default(),
+                    },
                     None => RuntimeError::WasmTrapUnclassified {
                         trap_code: "UnreachableCodeReached".to_string(),
                         pc,

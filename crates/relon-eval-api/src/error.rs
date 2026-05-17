@@ -280,6 +280,26 @@ pub enum RuntimeError {
         range: TokenRange,
     },
 
+    /// Phase 4.c-1: wasm trap fired because the scratch bump allocator
+    /// (`Op::AllocScratch` / `Op::AllocScratchDyn`) would have pushed
+    /// the `relon_scratch_cursor` global past the end of wasm linear
+    /// memory. The `needed` field is the byte count the failing alloc
+    /// requested when the size was statically known; the dynamic-size
+    /// variant reports `0` because the operand-stack size is consumed
+    /// by the bump check before the trap fires.
+    #[error("wasm scratch heap exhausted (alloc requested {needed} bytes)")]
+    #[diagnostic(
+        code(relon::eval::wasm_scratch_oom),
+        help("The wasm module's internal bump scratch overran linear memory. Pass a larger `out_cap` to leave room for stdlib scratch, or split the request into smaller chunks.")
+    )]
+    WasmScratchOOM {
+        /// Byte count the trapping alloc requested. `0` when the
+        /// size came from the operand stack (dynamic variant).
+        needed: u32,
+        #[label("scratch bump tripped here")]
+        range: TokenRange,
+    },
+
     /// Phase 7 placeholder: wasm step-limit / fuel exhaustion. The
     /// v1 AOT backend does not emit a step counter, but the variant
     /// is reserved so Phase 8+ can wire wasmtime's `OutOfFuel` trap

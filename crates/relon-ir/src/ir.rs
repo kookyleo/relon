@@ -620,4 +620,135 @@ pub enum Op {
         /// prologue).
         cap_bit: u32,
     },
+
+    /// Phase 4.c-1 control flow primitive.
+    ///
+    /// Emit a wasm `block <blocktype>` containing `body`, followed by
+    /// the matching `end`. The `block` form does not loop — a `br`
+    /// inside `body` jumps past the closing `end` (i.e. forward exit).
+    ///
+    /// Stack effect: when `result_ty` is `None` the block is
+    /// stack-neutral (`[] -> []` after the body, modulo any side
+    /// effects). When `result_ty` is `Some(t)`, the body must end with
+    /// one value of `t` on top of the operand stack and the block
+    /// pushes that value into the outer stack (`[] -> [t]`). Codegen
+    /// emits the matching `BlockType::Empty` or
+    /// `BlockType::Result(<valtype>)` form respectively.
+    ///
+    /// Nested [`Op::Block`] / [`Op::Loop`] enter a new vstack frame —
+    /// inner branches cannot leak intermediate operands out through
+    /// the surrounding block. The frame discipline is enforced by
+    /// codegen via the same `emit_op_seq` recursion used for
+    /// [`Op::If`].
+    Block {
+        /// Optional result type. `None` for stack-neutral blocks
+        /// (the common shape for loop carriers); `Some(t)` for blocks
+        /// that produce a single value on exit.
+        result_ty: Option<IrType>,
+        /// Op stream forming the block body. Lowering / codegen
+        /// recursively walks the body with a fresh vstack frame.
+        body: Vec<TaggedOp>,
+    },
+
+    /// Phase 4.c-1 control flow primitive.
+    ///
+    /// Emit a wasm `loop <blocktype>` containing `body`, followed by
+    /// the matching `end`. A `br` inside `body` targeting this loop
+    /// jumps **back** to the `loop` header (i.e. continue); to exit
+    /// the loop the body must `br` to an enclosing [`Op::Block`]
+    /// (forward exit pattern).
+    ///
+    /// Stack effect mirrors [`Op::Block`] — `result_ty == None` for
+    /// stack-neutral bodies (the iteration carrier lives in locals);
+    /// `result_ty == Some(t)` for loops that yield a single value.
+    /// Most loop shapes use `None` and stash the running aggregate in
+    /// a wasm local declared via [`Op::LetSet`].
+    Loop {
+        /// Optional loop-block result type. See [`Op::Block`] for
+        /// the stack-effect semantics.
+        result_ty: Option<IrType>,
+        /// Op stream forming the loop body.
+        body: Vec<TaggedOp>,
+    },
+
+    /// Phase 4.c-1 control flow primitive.
+    ///
+    /// Unconditional branch to the enclosing labelled construct at
+    /// `label_depth` (0 = innermost). For a [`Op::Block`] the branch
+    /// jumps past the matching `end`; for a [`Op::Loop`] the branch
+    /// jumps back to the `loop` header. Stack effect: `[] -> []` from
+    /// the IR's point of view, but the wasm verifier treats the
+    /// remainder of the surrounding block as unreachable after a
+    /// `br` — codegen relies on the verifier rather than tracking
+    /// dead code in the IR.
+    Br {
+        /// Label depth: 0 names the innermost enclosing block/loop.
+        label_depth: u32,
+    },
+
+    /// Phase 4.c-1 control flow primitive.
+    ///
+    /// Conditional branch — pop one `i32` (Bool) and, if non-zero,
+    /// branch to the construct at `label_depth`. The stack effect is
+    /// `[Bool] -> []`. As with [`Op::Br`], the wasm verifier handles
+    /// the branched-out arm; ops after a `br_if` that fires are
+    /// reached only when the condition was zero.
+    BrIf {
+        /// Label depth: 0 names the innermost enclosing block/loop.
+        label_depth: u32,
+    },
+
+    /// Phase 4.c-1 control flow primitive.
+    ///
+    /// Indirect branch — pop one `i32` index `n`. When `n < targets.len()`
+    /// branch to `targets[n]`; otherwise branch to `default`. Useful
+    /// for jump tables (`match` on a small-cardinality discriminant);
+    /// not used by any current lowering but exposed so a future
+    /// `match` lowering can hand the discriminant straight to wasm
+    /// without manual chained `BrIf` cascades.
+    ///
+    /// Stack effect: `[i32] -> []` (verifier-side, like [`Op::Br`]).
+    BrTable {
+        /// Default label depth used when the index is out of range.
+        default: u32,
+        /// Per-index label depths.
+        targets: Vec<u32>,
+    },
+
+    /// Phase 4.c-1 wasm-internal bump allocator.
+    ///
+    /// Reserve `size_bytes` of scratch space starting at the current
+    /// value of the module-internal `relon_scratch_cursor` global,
+    /// bump the cursor by `size_bytes`, and push the **pre-bump**
+    /// cursor value (the allocated region's base wasm-memory address)
+    /// onto the operand stack as an `i32`.
+    ///
+    /// Stack effect: `[] -> [i32]`.
+    ///
+    /// Trap discipline: codegen emits a `cursor + size_bytes >
+    /// memory.size_in_bytes` bounds check before bumping; overflow
+    /// surfaces as a wasm `unreachable` recorded as
+    /// `UnreachableKind::ScratchOOM` so the trap translator can
+    /// produce a `RuntimeError::WasmScratchOOM`.
+    ///
+    /// The scratch region is owned by the wasm module — host SDKs
+    /// do not need to allocate it, and the region is reset to the
+    /// post-out_buf base on every entry-function invocation (the
+    /// prologue writes `out_ptr + out_cap` into the cursor before
+    /// the body runs). The single-threaded execution model means the
+    /// bump itself does not need atomic semantics.
+    AllocScratch {
+        /// Static byte count to reserve. Codegen emits this as an
+        /// immediate `i32.const` in the bump sequence.
+        size_bytes: u32,
+    },
+
+    /// Phase 4.c-1 wasm-internal bump allocator — dynamic size form.
+    ///
+    /// Same shape as [`Op::AllocScratch`] but the size is taken from
+    /// the top of the operand stack instead of an op immediate.
+    ///
+    /// Stack effect: `[i32] -> [i32]`. The pre-bump cursor is pushed
+    /// after the dynamic size is consumed.
+    AllocScratchDyn,
 }
