@@ -58,19 +58,31 @@ pub enum IrType {
     /// but tagged separately at IR-level so we can later distinguish
     /// `List<Int>` operations from raw byte pointers.
     ListInt,
+    /// Phase 10-a: pointer to an 8-byte closure handle record laid
+    /// out in scratch memory as `[fn_table_idx: u32 LE][captures_ptr:
+    /// u32 LE]`. Same wasm-side representation as `String` /
+    /// `ListInt` (an `i32` pointer), but tagged at IR-level so the
+    /// lowering pass can dispatch higher-order argument shapes
+    /// (`xs.map(|x| ...)`) and codegen can route them through
+    /// `call_indirect`.
+    Closure,
 }
 
 impl IrType {
     /// Wasm operand-stack representation. `Int`/`Float` keep their
-    /// `i64`/`f64` shape; `Bool`/`Null`/`String`/`ListInt` all occupy
-    /// an `i32` slot (a 0/1 byte, a 0 tag, or a pointer). Used by the
-    /// codegen vstack to compare across-branch frame types in `If`.
+    /// `i64`/`f64` shape; `Bool`/`Null`/`String`/`ListInt`/`Closure`
+    /// all occupy an `i32` slot (a 0/1 byte, a 0 tag, or a pointer).
+    /// Used by the codegen vstack to compare across-branch frame
+    /// types in `If`.
     pub fn wasm_slot(self) -> IrType {
         match self {
             IrType::I64 | IrType::F64 => self,
-            IrType::I32 | IrType::Bool | IrType::Null | IrType::String | IrType::ListInt => {
-                IrType::I32
-            }
+            IrType::I32
+            | IrType::Bool
+            | IrType::Null
+            | IrType::String
+            | IrType::ListInt
+            | IrType::Closure => IrType::I32,
         }
     }
 }
@@ -99,6 +111,13 @@ pub struct Module {
     /// rejects this shape with `LoweringError::MissingMain` before
     /// returning, so the field is informational.
     pub entry_func_index: Option<usize>,
+    /// Phase 10-a: IR-side function indices the codegen must place
+    /// into the module's `funcref` table. Each entry's position in
+    /// this vector is the closure's wasm `Table` slot, which
+    /// `Op::MakeClosure` stores into its handle's `fn_table_idx`
+    /// field. Empty when the module contains no lambdas — codegen
+    /// then skips the table / element sections entirely.
+    pub closure_table: Vec<u32>,
 }
 
 /// One declared `#native` function in the IR module — a host import
@@ -880,6 +899,39 @@ pub enum Op {
         offset: u32,
     },
 
+    /// Phase 10-a raw-memory primitive.
+    ///
+    /// Pop an `i32` absolute address and load the little-endian
+    /// `f64` value at `addr + offset`. Stack effect: `[i32] -> [f64]`.
+    /// Lowers to `f64.load offset=N align=3`.
+    ///
+    /// Added alongside the closure-capture machinery so an `F64`
+    /// captured into a lambda struct can be read back into the
+    /// lambda's body without going through the `LoadFieldAtAbsolute`
+    /// path (which rebases `in_ptr` and is the wrong shape for
+    /// scratch-allocated captures).
+    LoadF64AtAbsolute {
+        /// Byte offset added to the popped base address before the
+        /// load.
+        offset: u32,
+    },
+
+    /// Phase 10-a raw-memory primitive.
+    ///
+    /// Pop an `f64` value and an `i32` absolute address, then store
+    /// the value at `addr + offset` as little-endian `f64`. Stack
+    /// discipline: `[addr, value] -> []`. Lowers to
+    /// `f64.store offset=N align=3`.
+    ///
+    /// Mirror of [`Op::LoadF64AtAbsolute`] on the store side; used
+    /// by the closure-conversion pass when writing an `F64` capture
+    /// into the freshly allocated captures struct.
+    StoreF64AtAbsolute {
+        /// Byte offset added to the address operand before the
+        /// store.
+        offset: u32,
+    },
+
     /// Phase 4.c-2: emit a wasm `unreachable` whose
     /// `relon.uctab` entry tags the trap kind. Codegen routes the
     /// runtime trap through `WasmModule::translate_trap` so the
@@ -900,6 +952,117 @@ pub enum Op {
         /// [`TrapKind::EmptyList`] in this phase.
         kind: TrapKind,
     },
+
+    /// Phase 10-a closure construction.
+    ///
+    /// Build an 8-byte closure handle in scratch memory:
+    /// `[fn_table_idx: u32 LE][captures_ptr: u32 LE]`. Stack effect:
+    /// `[] -> [Closure]`. Captures are read by codegen via
+    /// `local.get $(first_let_local + capture.let_idx)`; the lowering
+    /// pass pre-binds every captured value into a let-local before
+    /// emitting this op.
+    ///
+    /// `fn_table_idx` is the wasm `Table` slot for the lambda's
+    /// compiled function. The lowering pass assigns slots in source
+    /// order; codegen materialises a `funcref` table sized to cover
+    /// every emitted lambda and populates it via an
+    /// `ElementSection`.
+    ///
+    /// When `captures` is empty the captures_ptr field is zero — the
+    /// handle still allocates 8 bytes so the load discipline at the
+    /// call site stays uniform.
+    MakeClosure {
+        /// Wasm `Table` slot for the lambda function. Codegen stores
+        /// this index verbatim in the handle's first i32 field; the
+        /// `call_indirect` at the call site picks the function up
+        /// from `table[fn_table_idx]`.
+        fn_table_idx: u32,
+        /// Captured values laid out in the captures struct, in field
+        /// order matching the operand-stack push order. Each entry
+        /// carries the IR type (which drives the wasm store opcode)
+        /// and a precomputed byte offset inside the captures struct.
+        captures: Vec<ClosureCapture>,
+        /// Total size of the captures struct in bytes. Codegen passes
+        /// this to `Op::AllocScratch` so the alloc happens in a
+        /// single wasm bump. Zero when `captures` is empty (codegen
+        /// then skips the captures alloc entirely and writes 0 to
+        /// the handle's captures_ptr slot).
+        captures_size: u32,
+    },
+
+    /// Phase 10-a closure invocation.
+    ///
+    /// Indirect call through a closure handle. Stack discipline:
+    /// `[Closure, arg0, arg1, ...] -> [ret_ty]`. The closure handle
+    /// is pushed first, the user-visible arguments follow in
+    /// declaration order. Codegen rearranges the operand stack so
+    /// the wasm `call_indirect` sees `[captures_ptr, arg0, ..., argN,
+    /// fn_table_idx]`:
+    ///
+    /// 1. Pop user-visible args off the operand stack in reverse and
+    ///    spill them into the per-function closure-arg scratch
+    ///    locals (`closure_arg_i32`, `closure_arg_i64_a`,
+    ///    `closure_arg_i64_b`).
+    /// 2. Pop the closure handle and stash it into the
+    ///    `closure_handle` scratch local.
+    /// 3. Re-push: `closure_handle`, then `i32.load(closure_handle +
+    ///    4)` for captures_ptr, then each spilled arg in original
+    ///    order, then `i32.load(closure_handle + 0)` for
+    ///    fn_table_idx.
+    /// 4. Emit `call_indirect` against the wasm type
+    ///    `(captures_ptr, ...param_tys) -> ret_ty`.
+    ///
+    /// `param_tys` describes the *user-visible* arguments — the
+    /// implicit captures_ptr first parameter is not included. Codegen
+    /// prepends it when computing the wasm `call_indirect` type
+    /// signature.
+    ///
+    /// Phase 10-a only emits this op from stdlib higher-order bodies
+    /// (`list_int_map`, `list_int_filter`, `list_int_fold`) where the
+    /// arg shape is statically known to fit the three reserved
+    /// scratch slots. Future user-facing closure invocations may
+    /// need a dynamically-sized spill area; the op's contract stays
+    /// the same.
+    CallClosure {
+        /// User-visible parameter types in declaration order. Codegen
+        /// pops `param_tys.len()` operands plus the closure handle
+        /// before emitting `call_indirect`, then verifies each
+        /// popped operand's wasm slot matches the matching entry.
+        param_tys: Vec<IrType>,
+        /// IR type pushed back onto the stack after the call.
+        ret_ty: IrType,
+    },
+}
+
+/// Phase 10-a closure-capture record. One per captured variable on a
+/// `MakeClosure` op.
+///
+/// Each capture references a per-function let-local the lowering pass
+/// stashed the captured value into before emitting `MakeClosure`.
+/// Codegen reads each value via `local.get $(first_let_local +
+/// let_idx)` and stores it at its declared offset inside the freshly
+/// allocated captures struct.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClosureCapture {
+    /// Per-function let-local index holding the captured value. The
+    /// lowering pass pre-binds every captured variable to a fresh
+    /// let-local immediately before emitting `MakeClosure`, even
+    /// when the captured value was already in a let-local at source
+    /// level — this keeps the codegen pass agnostic about whether
+    /// the source-level identifier is a let-binding, a `#main`
+    /// param, or a method-bound parameter.
+    pub let_idx: u32,
+    /// IR type of the captured value. Drives both the read opcode
+    /// (`local.get` + the value type) and the store opcode
+    /// (`i64.store` for `I64`, `i32.store` for pointer / `I32`
+    /// slots, `f64.store` for `F64`) when materialising the captures
+    /// struct.
+    pub ty: IrType,
+    /// Byte offset of the field inside the captures struct. The
+    /// lowering pass picks offsets so each field is naturally aligned
+    /// (8 for `I64` / `F64`, 4 for everything else); codegen trusts
+    /// the precomputed offset and emits the matching store opcode.
+    pub offset: u32,
 }
 
 /// Phase 4.c-2 stdlib trap discriminator. Mirrors the relevant
