@@ -419,6 +419,15 @@ pub fn compile_module_with_host_fns(
         closure_type_table.push((param_tys.clone(), *ret_ty, type_index));
     }
 
+    // Phase v3+ a-2 scaffolding: codegen will eventually translate
+    // every `Op::Call { fn_index }` through a pre-DCE -> post-DCE
+    // remap so unreachable stdlib slots can be dropped from the
+    // emitted module. The remap is wired into `FunctionEmitCfg` /
+    // `EmitCtx` now (identity vector here) so the follow-up commit
+    // can swap in the real reachability plan without touching any
+    // emit-side call sites.
+    let fn_index_remap: Vec<u32> = (0..combined_funcs.len() as u32).collect();
+
     for (func_index, func) in combined_funcs.iter().enumerate() {
         let params_vt: Vec<ValType> = func.params.iter().map(ir_to_val_type).collect();
         let ret_vt = ir_to_val_type(&func.ret);
@@ -441,6 +450,7 @@ pub fn compile_module_with_host_fns(
             scratch_cursor_global_index,
             data_top,
             closure_type_table: &closure_type_table,
+            fn_index_remap: &fn_index_remap,
         };
         let (body, ranges, unreachable_log) = emit_function_body(
             func,
@@ -603,6 +613,17 @@ struct FunctionEmitCfg<'a> {
     /// `call_indirect` type immediate. Empty when the module has no
     /// lambdas / closure call sites.
     closure_type_table: &'a [(Vec<IrType>, IrType, u32)],
+    /// Phase v3+ a-2: pre-DCE -> post-DCE IR-combined function index
+    /// remap. Every `Op::Call { fn_index }` looks up the post-DCE
+    /// index here before adding `import_count` to produce the final
+    /// wasm function index. Length matches the pre-DCE combined
+    /// function table (`stdlib_count + user_count`). Slots for
+    /// unreachable stdlib bodies are `u32::MAX` and must never be
+    /// consulted — the reachability pass guarantees no live body
+    /// references one. The first commit wiring this field through
+    /// passes an identity vector; the follow-up commit swaps in the
+    /// real reachability plan output.
+    fn_index_remap: &'a [u32],
 }
 
 /// Look up an existing `(params, ret) -> type index` entry or add a
@@ -1369,6 +1390,7 @@ fn emit_function_body(
         is_entry,
         params_count,
         closure_type_table: emit_cfg.closure_type_table.to_vec(),
+        fn_index_remap: emit_cfg.fn_index_remap.to_vec(),
     };
     let _ = return_root_size; // referenced earlier in this function
     emit_op_seq(
@@ -1583,6 +1605,11 @@ struct EmitCtx {
     /// — the implicit leading `captures_ptr` slot is part of the
     /// registered type but not stored in the key.
     closure_type_table: Vec<(Vec<IrType>, IrType, u32)>,
+    /// Phase v3+ a-2: pre-DCE -> post-DCE IR-combined function index
+    /// remap. `Op::Call` translates its IR `fn_index` through this
+    /// slice before adding `import_count` to land at the final wasm
+    /// function index.
+    fn_index_remap: Vec<u32>,
 }
 
 impl EmitCtx {
@@ -2121,7 +2148,30 @@ fn emit_op_seq(
                 // `import_count` because the import section claims the
                 // lower slots. The IR-side `fn_index` is 0-based
                 // against the combined stdlib + user function vector.
-                let wasm_fn_index = fn_index.checked_add(ectx.import_count).ok_or(
+                //
+                // Phase v3+ a-2: translate the IR-combined index
+                // through the DCE remap first so a `call` against
+                // pruned stdlib slot N becomes a `call` against its
+                // new compacted slot. Reachability guarantees a live
+                // body never references a pruned slot — a `u32::MAX`
+                // hit here surfaces as `CallTypeMismatch` rather than
+                // a silent wrong-call. The first wiring commit passes
+                // an identity remap, so this lookup is a no-op until
+                // the follow-up DCE commit lands.
+                let pre_idx = *fn_index as usize;
+                let mapped = ectx
+                    .fn_index_remap
+                    .get(pre_idx)
+                    .copied()
+                    .unwrap_or(u32::MAX);
+                if mapped == u32::MAX {
+                    return Err(CodegenError::CallTypeMismatch {
+                        fn_index: *fn_index,
+                        arg_count: *arg_count,
+                        param_tys_len,
+                    });
+                }
+                let wasm_fn_index = mapped.checked_add(ectx.import_count).ok_or(
                     CodegenError::CallTypeMismatch {
                         fn_index: *fn_index,
                         arg_count: *arg_count,
