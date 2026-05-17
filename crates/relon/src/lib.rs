@@ -7,6 +7,8 @@ use relon_analyzer::{
     WorkspaceDiagnostic,
 };
 use relon_evaluator::module::{FilesystemModuleResolver, ModuleResolver, StdModuleResolver};
+#[cfg(not(target_arch = "wasm32"))]
+use relon_evaluator::module::RemoteHttpResolver;
 use relon_evaluator::{Capabilities, Context, RuntimeError, Scope, TreeWalkEvaluator, Value};
 use relon_parser::parse_document;
 use relon_parser::TokenRange;
@@ -243,36 +245,98 @@ pub enum ProjectError<P> {
 /// [`trusted`]: ResolverChainLoader::trusted
 pub struct ResolverChainLoader {
     resolvers: Vec<Arc<dyn ModuleResolver>>,
+    /// Whether the chain mounts a resolver that can fetch remote
+    /// `#import "https://..."` URLs. Set by the constructors; the
+    /// `load` adapter consults it to short-circuit sandboxed remote
+    /// imports with a dedicated `RemoteImportDenied`-shaped
+    /// `LoadError` rather than a confusing `NotFound`.
+    has_remote: bool,
 }
 
 impl ResolverChainLoader {
     /// Sandboxed posture: only `std/*` virtual modules resolve. Local
     /// `#import "./foo.relon"` paths get no resolver and surface as
     /// `ModuleNotFound`, mirroring the default `Capabilities` (no
-    /// `reads_fs`).
+    /// `reads_fs`). Remote `https://` URLs are rejected up front by
+    /// the `load` adapter (`has_remote = false`) so the host renders
+    /// a clean `RemoteImportDenied`-shaped diagnostic instead of the
+    /// generic "module not found" the resolver chain would emit.
     pub fn sandboxed() -> Self {
         Self {
             resolvers: vec![Arc::new(StdModuleResolver)],
+            has_remote: false,
         }
     }
 
-    /// Trusted posture: `std/*` + trusted filesystem fallback. Any
-    /// host change to this chain has to mirror the `Context` assembly
-    /// in [`evaluate_source`].
+    /// Trusted posture: `std/*` + trusted filesystem fallback +
+    /// the `RemoteHttpResolver` for `https://` (and, by default, *not*
+    /// `http://`) URLs. Any host change to this chain has to mirror
+    /// the `Context` assembly in [`evaluate_source`].
+    ///
+    /// On `wasm32-unknown-unknown` the remote resolver is unavailable
+    /// (no sockets / TLS); the chain falls back to `std/*` + trusted
+    /// filesystem only. `https://` `#import` from inside the browser
+    /// playground therefore continues to surface as
+    /// `RemoteImportDenied` — the host is expected to pre-fetch and
+    /// install a virtual resolver.
     pub fn trusted() -> Self {
-        Self {
-            resolvers: vec![
-                Arc::new(StdModuleResolver),
-                Arc::new(FilesystemModuleResolver::trusted()),
-            ],
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            Self {
+                resolvers: vec![
+                    Arc::new(StdModuleResolver),
+                    Arc::new(FilesystemModuleResolver::trusted()),
+                    Arc::new(RemoteHttpResolver::new()),
+                ],
+                has_remote: true,
+            }
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            Self {
+                resolvers: vec![
+                    Arc::new(StdModuleResolver),
+                    Arc::new(FilesystemModuleResolver::trusted()),
+                ],
+                has_remote: false,
+            }
         }
     }
 
     /// Custom posture: pass your own resolver chain (for hosts that
     /// install virtual file systems, registry resolvers, etc.).
+    /// Defaults `has_remote = false`; use
+    /// [`Self::from_resolvers_with_remote`] when the supplied chain
+    /// already answers `https://` / `http://` paths.
     pub fn from_resolvers(resolvers: Vec<Arc<dyn ModuleResolver>>) -> Self {
-        Self { resolvers }
+        Self {
+            resolvers,
+            has_remote: false,
+        }
     }
+
+    /// Same as [`Self::from_resolvers`] but lets the caller advertise
+    /// remote-URL support. Hosts that mount their own remote /
+    /// registry resolver pass `true` to suppress the default
+    /// "remote `#import` denied" short-circuit in
+    /// [`ModuleLoader::load`].
+    pub fn from_resolvers_with_remote(
+        resolvers: Vec<Arc<dyn ModuleResolver>>,
+        has_remote: bool,
+    ) -> Self {
+        Self {
+            resolvers,
+            has_remote,
+        }
+    }
+}
+
+/// True when `path` looks like an URL the remote resolver knows how to
+/// handle. Mirrors `RemoteHttpResolver::is_url` but lives here so the
+/// wasm32 build (which never links the resolver) can still classify
+/// paths.
+fn is_remote_url(path: &str) -> bool {
+    path.starts_with("https://") || path.starts_with("http://")
 }
 
 impl ModuleLoader for ResolverChainLoader {
@@ -281,6 +345,20 @@ impl ModuleLoader for ResolverChainLoader {
         path: &str,
         current_dir: &Path,
     ) -> std::result::Result<LoadedModule, LoadError> {
+        // Sandboxed-posture short-circuit for remote `#import` URLs:
+        // when no `RemoteHttpResolver` is mounted (which is the
+        // sandboxed default and the wasm32 target's only option),
+        // an `https://` / `http://` path would otherwise fall
+        // through the chain and surface as a confusing "module not
+        // found". Detect it here and emit a dedicated capability
+        // denial so the host renders the right diagnostic
+        // (`RemoteImportDenied` analog).
+        if is_remote_url(path) && !self.has_remote {
+            return Err(LoadError::AccessDenied(
+                "remote `#import` requires --trust (or Capabilities::network)".to_string(),
+            ));
+        }
+
         // The analyzer-side trait is independent of `Scope` — the
         // evaluator-side resolvers want a `Scope` so they can read
         // `current_dir`. Build a synthetic scope that carries just
@@ -310,6 +388,9 @@ impl ModuleLoader for ResolverChainLoader {
                 }
                 Err(RuntimeError::ModuleNotFound(_, _)) => {
                     return Err(LoadError::NotFound);
+                }
+                Err(RuntimeError::RemoteImportDenied { reason, .. }) => {
+                    return Err(LoadError::AccessDenied(reason));
                 }
                 Err(other) => {
                     return Err(LoadError::Other(other.to_string()));
@@ -415,6 +496,13 @@ fn evaluate_source(
         if matches!(trust, TrustMode::Trusted) {
             ctx.capabilities = Capabilities::all_granted();
             ctx.prepend_module_resolver(Arc::new(FilesystemModuleResolver::trusted()));
+            // v3+ a-3: mirror the workspace-analyzer chain on the
+            // evaluator side. The resolver only ships on native
+            // targets; on `wasm32-unknown-unknown` the runtime
+            // cannot fetch (no sockets / TLS) so we keep the
+            // browser playground free of the dependency.
+            #[cfg(not(target_arch = "wasm32"))]
+            ctx.prepend_module_resolver(Arc::new(RemoteHttpResolver::new()));
         }
         Arc::new(ctx)
     };
