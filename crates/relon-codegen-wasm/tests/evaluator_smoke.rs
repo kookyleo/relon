@@ -473,6 +473,7 @@ fn build_check_cap_module(cap_bit: u32) -> (Vec<u8>, relon_eval_api::schema_cano
             ],
         }],
         entry_func_index: Some(0),
+        closure_table: vec![],
     };
 
     let wasm = relon_codegen_wasm::compile_module(&ir_module, &main_schema, &return_schema)

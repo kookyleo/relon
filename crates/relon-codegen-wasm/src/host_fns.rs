@@ -61,6 +61,12 @@ fn ir_type_tag(ty: IrType) -> u8 {
         IrType::Null => 0x05,
         IrType::String => 0x06,
         IrType::ListInt => 0x07,
+        // Phase 10-a closure handle. Reserved for future surfaces
+        // that thread closure values through `#native` signatures;
+        // the host SDK currently rejects this shape upstream via
+        // `LoweringError::ClosureAcrossBoundary`, so the tag is
+        // purely a forward-compatible placeholder.
+        IrType::Closure => 0x08,
     }
 }
 

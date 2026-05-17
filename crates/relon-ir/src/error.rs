@@ -233,4 +233,39 @@ pub enum LoweringError {
         /// detected.
         range: TokenRange,
     },
+    /// Phase 10-a: a closure value was used in a position that escapes
+    /// the wasm module boundary. Wasm-side closures are represented as
+    /// scratch-heap pointers whose lifetime ends when `run_main`
+    /// returns and the scratch cursor resets; carrying one through the
+    /// binary handshake (a `#main` parameter or return value) would
+    /// dangle. Detected at lowering when:
+    /// * the `#main` signature declares a `Closure<...>` / `Fn<...>`
+    ///   parameter or return type, or
+    /// * a `#main` body returns an expression whose IR type is
+    ///   [`crate::IrType::Closure`].
+    #[error("closure value cannot cross the wasm module boundary: {context}")]
+    ClosureAcrossBoundary {
+        /// Human-readable description of where the closure surfaced
+        /// (e.g. `"#main parameter `f`"`, `"#main return type"`).
+        context: String,
+        /// Source range of the offending declaration / expression.
+        range: TokenRange,
+    },
+    /// Phase 10-a: a closure body references a captured value whose
+    /// IR type the closure-conversion pass refuses to put into the
+    /// captures struct. Reserved for types that have no static byte
+    /// layout (e.g. `Null`); the lowering pass surfaces this rather
+    /// than emitting a malformed scratch alloc.
+    #[error(
+        "closure capture `{name}` has unsupported type `{ty:?}` (Phase 10-a captures must be sized scalars or pointer slots)"
+    )]
+    UnsupportedClosureCapture {
+        /// Name of the captured variable as written in source.
+        name: String,
+        /// IR type the resolver assigned to the capture.
+        ty: IrType,
+        /// Source range of the lambda expression that owns the
+        /// offending capture.
+        range: TokenRange,
+    },
 }

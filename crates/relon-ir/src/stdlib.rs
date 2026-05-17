@@ -107,6 +107,12 @@ pub struct StdlibFunction {
 ///   * `11` — `list_int_sum(List<Int>) -> Int` (Phase 4.c-2).
 ///   * `12` — `list_int_max(List<Int>) -> Int` (Phase 4.c-2; traps
 ///     as `EmptyList` on a zero-length receiver).
+///   * `13` — `list_int_map(List<Int>, Closure<Int -> Int>) -> List<Int>`
+///     (Phase 10-a).
+///   * `14` — `list_int_filter(List<Int>, Closure<Int -> Bool>) -> List<Int>`
+///     (Phase 10-a).
+///   * `15` — `list_int_fold(List<Int>, Int, Closure<(Int, Int) -> Int>) -> Int`
+///     (Phase 10-a).
 pub fn builtin_stdlib() -> Vec<StdlibFunction> {
     vec![
         length_string_to_int(),
@@ -122,6 +128,9 @@ pub fn builtin_stdlib() -> Vec<StdlibFunction> {
         starts_with_string(),
         list_int_sum(),
         list_int_max(),
+        list_int_map(),
+        list_int_filter(),
+        list_int_fold(),
     ]
 }
 
@@ -774,6 +783,33 @@ pub fn stdlib_method_index(receiver_ty: IrType, name: &str) -> Option<u32> {
         (IrType::String, "starts_with") => stdlib_function_index("starts_with"),
         (IrType::ListInt, "sum") => stdlib_function_index("list_int_sum"),
         (IrType::ListInt, "max") => stdlib_function_index("list_int_max"),
+        // Phase 10-a higher-order List<Int> methods. Dispatch covers
+        // the `xs.map(|x| ...)` / `xs.filter(|x| ...)` /
+        // `xs.fold(init, |acc, x| ...)` surfaces.
+        (IrType::ListInt, "map") => stdlib_function_index("list_int_map"),
+        (IrType::ListInt, "filter") => stdlib_function_index("list_int_filter"),
+        (IrType::ListInt, "fold") => stdlib_function_index("list_int_fold"),
+        _ => None,
+    }
+}
+
+/// Phase 10-a: side-table describing the expected closure signature
+/// for each `Op::Call` arg slot of a stdlib function. Returns `Some`
+/// only for entries where slot `arg_idx` is a `Closure` parameter
+/// (so the caller can run free-variable analysis + closure
+/// conversion against the matching shape).
+///
+/// Keyed off the stdlib function's surface name; this stays in
+/// `stdlib.rs` so the lowering pass has a single source of truth for
+/// closure surfaces.
+pub fn stdlib_closure_arg_signature(name: &str, arg_idx: u32) -> Option<(Vec<IrType>, IrType)> {
+    match (name, arg_idx) {
+        // `xs.map(|x| ...)` — closure param at arg index 1.
+        ("list_int_map", 1) => Some((vec![IrType::I64], IrType::I64)),
+        // `xs.filter(|x| ...)` — closure param at arg index 1.
+        ("list_int_filter", 1) => Some((vec![IrType::I64], IrType::Bool)),
+        // `xs.fold(init, |acc, x| ...)` — closure param at arg index 2.
+        ("list_int_fold", 2) => Some((vec![IrType::I64, IrType::I64], IrType::I64)),
         _ => None,
     }
 }
@@ -1434,6 +1470,524 @@ fn list_int_max() -> StdlibFunction {
                         }),
                         tt(Op::Gt(IrType::I64)),
                         tt(Op::Select { ty: IrType::I64 }),
+                        tt(Op::LetSet {
+                            idx: ACC,
+                            ty: IrType::I64,
+                        }),
+                        // i = i + 1
+                        tt(Op::LetGet {
+                            idx: I,
+                            ty: IrType::I32,
+                        }),
+                        tt(Op::ConstI32(1)),
+                        tt(Op::Add(IrType::I32)),
+                        tt(Op::LetSet {
+                            idx: I,
+                            ty: IrType::I32,
+                        }),
+                        tt(Op::Br { label_depth: 0 }),
+                    ],
+                })],
+            }),
+            // return acc
+            tt(Op::LetGet {
+                idx: ACC,
+                ty: IrType::I64,
+            }),
+            tt(Op::Return),
+        ],
+    }
+}
+
+/// Phase 10-a body for `list_int_map(xs: List<Int>, f: Closure) -> List<Int>`.
+///
+/// Algorithm:
+///   1. Read `n = xs[0]`.
+///   2. Allocate `8 + 8*n + 8` scratch bytes for the result record
+///      (the trailing `+8` is alignment slop so the dynamic
+///      `(base + 4 + 7) & -8` payload pointer stays inside the
+///      reserved region for any `base` mod 8).
+///   3. Write the length prefix.
+///   4. `src_payload = (xs + 4 + 7) & -8`.
+///   5. `dst_payload = (new_base + 4 + 7) & -8`.
+///   6. Loop `i = 0..n`: load `x = src_payload[i]`, invoke the
+///      closure via `Op::CallClosure { [I64] -> I64 }`, store the
+///      result at `dst_payload[i]`.
+///   7. Return `new_base`.
+///
+/// Locals:
+///   * 0 — `n:           I32`
+///   * 1 — `i:           I32`
+///   * 2 — `src_payload: I32`
+///   * 3 — `dst_payload: I32`
+///   * 4 — `new_base:    I32`
+fn list_int_map() -> StdlibFunction {
+    const N: u32 = 0;
+    const I: u32 = 1;
+    const SRC_PAYLOAD: u32 = 2;
+    const DST_PAYLOAD: u32 = 3;
+    const NEW_BASE: u32 = 4;
+    StdlibFunction {
+        name: "list_int_map",
+        params: vec![IrType::ListInt, IrType::Closure],
+        ret: IrType::ListInt,
+        body: vec![
+            // n = i32.load(xs, 0)
+            tt(Op::LocalGet(0)),
+            tt(Op::LoadI32AtAbsolute { offset: 0 }),
+            tt(Op::LetSet {
+                idx: N,
+                ty: IrType::I32,
+            }),
+            // record_size = 8 + 8*n + 8
+            tt(Op::ConstI32(16)),
+            tt(Op::LetGet {
+                idx: N,
+                ty: IrType::I32,
+            }),
+            tt(Op::ConstI32(8)),
+            tt(Op::Mul(IrType::I32)),
+            tt(Op::Add(IrType::I32)),
+            tt(Op::AllocScratchDyn),
+            tt(Op::LetSet {
+                idx: NEW_BASE,
+                ty: IrType::I32,
+            }),
+            // store header: i32.store(new_base, n)
+            tt(Op::LetGet {
+                idx: NEW_BASE,
+                ty: IrType::I32,
+            }),
+            tt(Op::LetGet {
+                idx: N,
+                ty: IrType::I32,
+            }),
+            tt(Op::StoreI32AtAbsolute { offset: 0 }),
+            // src_payload = (xs + 4 + 7) & -8
+            tt(Op::LocalGet(0)),
+            tt(Op::ConstI32(4 + 7)),
+            tt(Op::Add(IrType::I32)),
+            tt(Op::ConstI32(-8)),
+            tt(Op::BitAnd(IrType::I32)),
+            tt(Op::LetSet {
+                idx: SRC_PAYLOAD,
+                ty: IrType::I32,
+            }),
+            // dst_payload = (new_base + 4 + 7) & -8
+            tt(Op::LetGet {
+                idx: NEW_BASE,
+                ty: IrType::I32,
+            }),
+            tt(Op::ConstI32(4 + 7)),
+            tt(Op::Add(IrType::I32)),
+            tt(Op::ConstI32(-8)),
+            tt(Op::BitAnd(IrType::I32)),
+            tt(Op::LetSet {
+                idx: DST_PAYLOAD,
+                ty: IrType::I32,
+            }),
+            // i = 0
+            tt(Op::ConstI32(0)),
+            tt(Op::LetSet {
+                idx: I,
+                ty: IrType::I32,
+            }),
+            // block { loop { ... } }
+            tt(Op::Block {
+                result_ty: None,
+                body: vec![tt(Op::Loop {
+                    result_ty: None,
+                    body: vec![
+                        // exit when i >= n
+                        tt(Op::LetGet {
+                            idx: I,
+                            ty: IrType::I32,
+                        }),
+                        tt(Op::LetGet {
+                            idx: N,
+                            ty: IrType::I32,
+                        }),
+                        tt(Op::Ge(IrType::I32)),
+                        tt(Op::BrIf { label_depth: 1 }),
+                        // dst_addr = dst_payload + i * 8 (pushed first
+                        // so the i64.store sees [addr, value] at end)
+                        tt(Op::LetGet {
+                            idx: DST_PAYLOAD,
+                            ty: IrType::I32,
+                        }),
+                        tt(Op::LetGet {
+                            idx: I,
+                            ty: IrType::I32,
+                        }),
+                        tt(Op::ConstI32(8)),
+                        tt(Op::Mul(IrType::I32)),
+                        tt(Op::Add(IrType::I32)),
+                        // push closure handle (param 1)
+                        tt(Op::LocalGet(1)),
+                        // push the source element: i64.load(src_payload + i*8)
+                        tt(Op::LetGet {
+                            idx: SRC_PAYLOAD,
+                            ty: IrType::I32,
+                        }),
+                        tt(Op::LetGet {
+                            idx: I,
+                            ty: IrType::I32,
+                        }),
+                        tt(Op::ConstI32(8)),
+                        tt(Op::Mul(IrType::I32)),
+                        tt(Op::Add(IrType::I32)),
+                        tt(Op::LoadI64AtAbsolute { offset: 0 }),
+                        // call_indirect via Op::CallClosure
+                        tt(Op::CallClosure {
+                            param_tys: vec![IrType::I64],
+                            ret_ty: IrType::I64,
+                        }),
+                        // i64.store: stack is [dst_addr, result_i64]
+                        tt(Op::StoreI64AtAbsolute { offset: 0 }),
+                        // i = i + 1
+                        tt(Op::LetGet {
+                            idx: I,
+                            ty: IrType::I32,
+                        }),
+                        tt(Op::ConstI32(1)),
+                        tt(Op::Add(IrType::I32)),
+                        tt(Op::LetSet {
+                            idx: I,
+                            ty: IrType::I32,
+                        }),
+                        tt(Op::Br { label_depth: 0 }),
+                    ],
+                })],
+            }),
+            // return new_base
+            tt(Op::LetGet {
+                idx: NEW_BASE,
+                ty: IrType::I32,
+            }),
+            tt(Op::Return),
+        ],
+    }
+}
+
+/// Phase 10-a body for `list_int_filter(xs: List<Int>, f: Closure) -> List<Int>`.
+///
+/// Algorithm:
+///   1. Read `n = xs[0]`. Allocate a worst-case-sized result buffer
+///      (same shape as `list_int_map` since at most `n` elements
+///      survive the filter).
+///   2. `src_payload = (xs + 4 + 7) & -8`.
+///   3. `dst_payload = (new_base + 4 + 7) & -8`.
+///   4. `out_count = 0`.
+///   5. Loop `i = 0..n`: load `x`, invoke the closure with `(x)`
+///      (`Op::CallClosure { [I64] -> Bool }`); when the predicate
+///      returns non-zero, copy `x` into `dst_payload[out_count]`
+///      and increment `out_count`.
+///   6. Write the actual count into the header at the end.
+///   7. Return `new_base`.
+///
+/// Locals:
+///   * 0 — `n:           I32`
+///   * 1 — `i:           I32`
+///   * 2 — `src_payload: I32`
+///   * 3 — `dst_payload: I32`
+///   * 4 — `new_base:    I32`
+///   * 5 — `out_count:   I32`
+///   * 6 — `cur_val:     I64`
+fn list_int_filter() -> StdlibFunction {
+    const N: u32 = 0;
+    const I: u32 = 1;
+    const SRC_PAYLOAD: u32 = 2;
+    const DST_PAYLOAD: u32 = 3;
+    const NEW_BASE: u32 = 4;
+    const OUT_COUNT: u32 = 5;
+    const CUR_VAL: u32 = 6;
+    /// Dedicated sink local for the `If` sentinel i32 produced by
+    /// the filter's per-iteration predicate branch — keeps the loop
+    /// counter `I` from being clobbered by the sink. The wasm
+    /// `if (result i32) ... end` shape requires both arms to leave
+    /// a value behind; we route an `i32.const 0` sentinel through
+    /// the sink, then ignore it.
+    const SINK: u32 = 7;
+    StdlibFunction {
+        name: "list_int_filter",
+        params: vec![IrType::ListInt, IrType::Closure],
+        ret: IrType::ListInt,
+        body: vec![
+            tt(Op::LocalGet(0)),
+            tt(Op::LoadI32AtAbsolute { offset: 0 }),
+            tt(Op::LetSet {
+                idx: N,
+                ty: IrType::I32,
+            }),
+            // record_size = 8 + 8*n + 8
+            tt(Op::ConstI32(16)),
+            tt(Op::LetGet {
+                idx: N,
+                ty: IrType::I32,
+            }),
+            tt(Op::ConstI32(8)),
+            tt(Op::Mul(IrType::I32)),
+            tt(Op::Add(IrType::I32)),
+            tt(Op::AllocScratchDyn),
+            tt(Op::LetSet {
+                idx: NEW_BASE,
+                ty: IrType::I32,
+            }),
+            // src_payload = (xs + 4 + 7) & -8
+            tt(Op::LocalGet(0)),
+            tt(Op::ConstI32(4 + 7)),
+            tt(Op::Add(IrType::I32)),
+            tt(Op::ConstI32(-8)),
+            tt(Op::BitAnd(IrType::I32)),
+            tt(Op::LetSet {
+                idx: SRC_PAYLOAD,
+                ty: IrType::I32,
+            }),
+            // dst_payload = (new_base + 4 + 7) & -8
+            tt(Op::LetGet {
+                idx: NEW_BASE,
+                ty: IrType::I32,
+            }),
+            tt(Op::ConstI32(4 + 7)),
+            tt(Op::Add(IrType::I32)),
+            tt(Op::ConstI32(-8)),
+            tt(Op::BitAnd(IrType::I32)),
+            tt(Op::LetSet {
+                idx: DST_PAYLOAD,
+                ty: IrType::I32,
+            }),
+            // i = 0; out_count = 0
+            tt(Op::ConstI32(0)),
+            tt(Op::LetSet {
+                idx: I,
+                ty: IrType::I32,
+            }),
+            tt(Op::ConstI32(0)),
+            tt(Op::LetSet {
+                idx: OUT_COUNT,
+                ty: IrType::I32,
+            }),
+            tt(Op::Block {
+                result_ty: None,
+                body: vec![tt(Op::Loop {
+                    result_ty: None,
+                    body: vec![
+                        // exit when i >= n
+                        tt(Op::LetGet {
+                            idx: I,
+                            ty: IrType::I32,
+                        }),
+                        tt(Op::LetGet {
+                            idx: N,
+                            ty: IrType::I32,
+                        }),
+                        tt(Op::Ge(IrType::I32)),
+                        tt(Op::BrIf { label_depth: 1 }),
+                        // cur_val = i64.load(src_payload + i*8)
+                        tt(Op::LetGet {
+                            idx: SRC_PAYLOAD,
+                            ty: IrType::I32,
+                        }),
+                        tt(Op::LetGet {
+                            idx: I,
+                            ty: IrType::I32,
+                        }),
+                        tt(Op::ConstI32(8)),
+                        tt(Op::Mul(IrType::I32)),
+                        tt(Op::Add(IrType::I32)),
+                        tt(Op::LoadI64AtAbsolute { offset: 0 }),
+                        tt(Op::LetSet {
+                            idx: CUR_VAL,
+                            ty: IrType::I64,
+                        }),
+                        // closure(cur_val) -> bool
+                        tt(Op::LocalGet(1)),
+                        tt(Op::LetGet {
+                            idx: CUR_VAL,
+                            ty: IrType::I64,
+                        }),
+                        tt(Op::CallClosure {
+                            param_tys: vec![IrType::I64],
+                            ret_ty: IrType::Bool,
+                        }),
+                        // if cond { dst[out_count] = cur_val; out_count++ }
+                        tt(Op::If {
+                            result_ty: IrType::I32,
+                            then_body: vec![
+                                // dst_addr = dst_payload + out_count*8
+                                tt(Op::LetGet {
+                                    idx: DST_PAYLOAD,
+                                    ty: IrType::I32,
+                                }),
+                                tt(Op::LetGet {
+                                    idx: OUT_COUNT,
+                                    ty: IrType::I32,
+                                }),
+                                tt(Op::ConstI32(8)),
+                                tt(Op::Mul(IrType::I32)),
+                                tt(Op::Add(IrType::I32)),
+                                tt(Op::LetGet {
+                                    idx: CUR_VAL,
+                                    ty: IrType::I64,
+                                }),
+                                tt(Op::StoreI64AtAbsolute { offset: 0 }),
+                                // out_count = out_count + 1
+                                tt(Op::LetGet {
+                                    idx: OUT_COUNT,
+                                    ty: IrType::I32,
+                                }),
+                                tt(Op::ConstI32(1)),
+                                tt(Op::Add(IrType::I32)),
+                                tt(Op::LetSet {
+                                    idx: OUT_COUNT,
+                                    ty: IrType::I32,
+                                }),
+                                // sentinel for the if's i32 result
+                                tt(Op::ConstI32(0)),
+                            ],
+                            else_body: vec![tt(Op::ConstI32(0))],
+                        }),
+                        // Sink the i32 placeholder produced by the If
+                        // into a dedicated local so the loop counter
+                        // stays intact.
+                        tt(Op::LetSet {
+                            idx: SINK,
+                            ty: IrType::I32,
+                        }),
+                        // i = i + 1
+                        tt(Op::LetGet {
+                            idx: I,
+                            ty: IrType::I32,
+                        }),
+                        tt(Op::ConstI32(1)),
+                        tt(Op::Add(IrType::I32)),
+                        tt(Op::LetSet {
+                            idx: I,
+                            ty: IrType::I32,
+                        }),
+                        tt(Op::Br { label_depth: 0 }),
+                    ],
+                })],
+            }),
+            // store header: i32.store(new_base, out_count)
+            tt(Op::LetGet {
+                idx: NEW_BASE,
+                ty: IrType::I32,
+            }),
+            tt(Op::LetGet {
+                idx: OUT_COUNT,
+                ty: IrType::I32,
+            }),
+            tt(Op::StoreI32AtAbsolute { offset: 0 }),
+            // return new_base
+            tt(Op::LetGet {
+                idx: NEW_BASE,
+                ty: IrType::I32,
+            }),
+            tt(Op::Return),
+        ],
+    }
+}
+
+/// Phase 10-a body for `list_int_fold(xs: List<Int>, init: Int, f: Closure) -> Int`.
+///
+/// Algorithm:
+///   1. Read `n = xs[0]`. `acc = init` (the second positional param).
+///   2. `src_payload = (xs + 4 + 7) & -8`.
+///   3. Loop `i = 0..n`: load `x`; invoke the closure with
+///      `(acc, x)` (`Op::CallClosure { [I64, I64] -> I64 }`);
+///      assign the result back to `acc`.
+///   4. Return `acc`.
+///
+/// Locals:
+///   * 0 — `n:           I32`
+///   * 1 — `i:           I32`
+///   * 2 — `src_payload: I32`
+///   * 3 — `acc:         I64`
+fn list_int_fold() -> StdlibFunction {
+    const N: u32 = 0;
+    const I: u32 = 1;
+    const SRC_PAYLOAD: u32 = 2;
+    const ACC: u32 = 3;
+    StdlibFunction {
+        name: "list_int_fold",
+        // Param ordering matches the user-facing surface:
+        //   `xs.fold(init, |acc, x| ...)` lowers to
+        //   `list_int_fold(xs, init, f)`.
+        params: vec![IrType::ListInt, IrType::I64, IrType::Closure],
+        ret: IrType::I64,
+        body: vec![
+            // n = i32.load(xs, 0)
+            tt(Op::LocalGet(0)),
+            tt(Op::LoadI32AtAbsolute { offset: 0 }),
+            tt(Op::LetSet {
+                idx: N,
+                ty: IrType::I32,
+            }),
+            // src_payload = (xs + 4 + 7) & -8
+            tt(Op::LocalGet(0)),
+            tt(Op::ConstI32(4 + 7)),
+            tt(Op::Add(IrType::I32)),
+            tt(Op::ConstI32(-8)),
+            tt(Op::BitAnd(IrType::I32)),
+            tt(Op::LetSet {
+                idx: SRC_PAYLOAD,
+                ty: IrType::I32,
+            }),
+            // acc = init
+            tt(Op::LocalGet(1)),
+            tt(Op::LetSet {
+                idx: ACC,
+                ty: IrType::I64,
+            }),
+            // i = 0
+            tt(Op::ConstI32(0)),
+            tt(Op::LetSet {
+                idx: I,
+                ty: IrType::I32,
+            }),
+            tt(Op::Block {
+                result_ty: None,
+                body: vec![tt(Op::Loop {
+                    result_ty: None,
+                    body: vec![
+                        // exit when i >= n
+                        tt(Op::LetGet {
+                            idx: I,
+                            ty: IrType::I32,
+                        }),
+                        tt(Op::LetGet {
+                            idx: N,
+                            ty: IrType::I32,
+                        }),
+                        tt(Op::Ge(IrType::I32)),
+                        tt(Op::BrIf { label_depth: 1 }),
+                        // push closure (param 2)
+                        tt(Op::LocalGet(2)),
+                        // push acc
+                        tt(Op::LetGet {
+                            idx: ACC,
+                            ty: IrType::I64,
+                        }),
+                        // push x = i64.load(src_payload + i*8)
+                        tt(Op::LetGet {
+                            idx: SRC_PAYLOAD,
+                            ty: IrType::I32,
+                        }),
+                        tt(Op::LetGet {
+                            idx: I,
+                            ty: IrType::I32,
+                        }),
+                        tt(Op::ConstI32(8)),
+                        tt(Op::Mul(IrType::I32)),
+                        tt(Op::Add(IrType::I32)),
+                        tt(Op::LoadI64AtAbsolute { offset: 0 }),
+                        // call closure
+                        tt(Op::CallClosure {
+                            param_tys: vec![IrType::I64, IrType::I64],
+                            ret_ty: IrType::I64,
+                        }),
+                        // acc = result
                         tt(Op::LetSet {
                             idx: ACC,
                             ty: IrType::I64,

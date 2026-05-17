@@ -329,6 +329,7 @@ fn capability_denied_traceback() {
             ],
         }],
         entry_func_index: Some(0),
+        closure_table: vec![],
     };
     let host_fns = HostFnTable {
         entries: vec![HostFnEntry {

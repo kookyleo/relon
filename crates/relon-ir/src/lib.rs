@@ -23,13 +23,15 @@ pub mod lowering;
 pub mod stdlib;
 
 pub use error::LoweringError;
-pub use ir::{Func, IrType, Module, NativeImport, Op, TaggedOp, TrapKind, NO_CAPABILITY_BIT};
+pub use ir::{
+    ClosureCapture, Func, IrType, Module, NativeImport, Op, TaggedOp, TrapKind, NO_CAPABILITY_BIT,
+};
 pub use lowering::{
     lower_workspace, lower_workspace_single, LoweredEntry, MAIN_PARAMS_SCHEMA_NAME,
     MAIN_RETURN_SCHEMA_NAME, RETURN_VALUE_FIELD_NAME, WASM_LOCAL_IN_LEN, WASM_LOCAL_IN_PTR,
     WASM_LOCAL_OUT_CAP, WASM_LOCAL_OUT_PTR,
 };
 pub use stdlib::{
-    builtin_stdlib, stdlib_function_count, stdlib_function_index, stdlib_method_index,
-    StdlibFunction,
+    builtin_stdlib, stdlib_closure_arg_signature, stdlib_function_count, stdlib_function_index,
+    stdlib_method_index, StdlibFunction,
 };
