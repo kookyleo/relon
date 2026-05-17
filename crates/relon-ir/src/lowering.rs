@@ -64,6 +64,12 @@ struct LowerCtx<'a> {
     next_string_idx: u32,
     /// Next per-module constant index for [`Op::ConstListInt`].
     next_list_int_idx: u32,
+    /// Phase 10-c: per-module constant index for [`Op::ConstListFloat`].
+    next_list_float_idx: u32,
+    /// Phase 10-c: per-module constant index for [`Op::ConstListBool`].
+    next_list_bool_idx: u32,
+    /// Phase 10-c: per-module constant index for [`Op::ConstListString`].
+    next_list_string_idx: u32,
     /// Next per-function record-local index. Each
     /// [`Op::AllocRootRecord`] / [`Op::AllocSubRecord`] hands out a
     /// fresh local so nested dicts under construction don't clobber
@@ -247,6 +253,9 @@ impl<'a> LowerCtx<'a> {
             next_let_idx: 0,
             next_string_idx: 0,
             next_list_int_idx: 0,
+            next_list_float_idx: 0,
+            next_list_bool_idx: 0,
+            next_list_string_idx: 0,
             next_record_idx: 0,
             out: Vec::new(),
             tstack: Vec::new(),
@@ -275,6 +284,9 @@ impl<'a> LowerCtx<'a> {
             next_let_idx: 0,
             next_string_idx: 0,
             next_list_int_idx: 0,
+            next_list_float_idx: 0,
+            next_list_bool_idx: 0,
+            next_list_string_idx: 0,
             next_record_idx: 0,
             out: Vec::new(),
             tstack: Vec::new(),
@@ -294,6 +306,20 @@ impl<'a> LowerCtx<'a> {
         self.next_record_idx += 1;
         idx
     }
+}
+
+/// Phase 10-c: detected element shape of a `[...]` literal. Used by
+/// the lowering pass to pick between `ConstListInt` / `ConstListFloat`
+/// / `ConstListBool` / `ConstListString` after sniffing the first
+/// element. The shape gates further elements — a mixed literal
+/// (`[1, 2.0]` outside the Int-promotes-to-Float path) surfaces as
+/// `LoweringError::UnsupportedExpr`.
+#[derive(Debug, Clone, Copy)]
+enum ConstListKind {
+    Int,
+    Float,
+    Bool,
+    String,
 }
 
 /// Wasm-side handshake parameter index — `in_ptr` is local 0.
@@ -871,9 +897,17 @@ fn type_repr_to_ir_type(t: &TypeRepr) -> Result<IrType, LoweringError> {
         TypeRepr::Bool => Ok(IrType::Bool),
         TypeRepr::Null => Ok(IrType::Null),
         TypeRepr::String => Ok(IrType::String),
-        TypeRepr::List { element } if matches!(element.as_ref(), TypeRepr::Int) => {
-            Ok(IrType::ListInt)
-        }
+        TypeRepr::List { element } => match element.as_ref() {
+            TypeRepr::Int => Ok(IrType::ListInt),
+            TypeRepr::Float => Ok(IrType::ListFloat),
+            TypeRepr::Bool => Ok(IrType::ListBool),
+            TypeRepr::String => Ok(IrType::ListString),
+            TypeRepr::Schema { .. } => Ok(IrType::ListSchema),
+            _ => Err(LoweringError::UnsupportedTypeInMain {
+                type_name: format!("{t:?}"),
+                range: TokenRange::default(),
+            }),
+        },
         // Composite / list-of-other types are rejected upstream
         // during schema build; this branch fires only for a directly
         // hand-crafted IR.
@@ -1019,31 +1053,138 @@ fn lower_expr(expr: &Expr, range: TokenRange, ctx: &mut LowerCtx<'_>) -> Result<
             Ok(())
         }
         Expr::List(items) => {
-            // Phase 3.a only opens List<Int> literals — everything
-            // else falls through to the generic "unsupported" branch.
-            // We inspect each element's expression up front; any
-            // non-Int literal rejects the list, so a hand-written
-            // `[1, 2.0, 3]` surfaces as a lowering error rather than
-            // as a confusing type mismatch at codegen.
-            let mut elements: Vec<i64> = Vec::with_capacity(items.len());
-            for node in items {
-                match &*node.expr {
-                    Expr::Int(v) => elements.push(*v),
-                    _ => {
-                        return Err(LoweringError::UnsupportedExpr {
-                            kind: format!("List(non-Int element `{}`)", node.expr.kind()),
-                            range: node.range,
-                        });
+            // Phase 10-c: list literals dispatch on the first element's
+            // shape — `[1, 2, 3]` → `Op::ConstListInt`; `[1.0, 2.0]` →
+            // `Op::ConstListFloat`; `[true, false]` → `Op::ConstListBool`;
+            // `["a", "b"]` → `Op::ConstListString`. Empty list is
+            // ambiguous; reject for now (callers that need an empty
+            // typed list build it via the buffer writer instead).
+            //
+            // Mixed-shape literals (e.g. `[1, 2.0]`) reject with a
+            // lowering error so a hand-written program surfaces the
+            // mistake clearly rather than crashing at codegen.
+            if items.is_empty() {
+                return Err(LoweringError::UnsupportedExpr {
+                    kind: "List(empty literal)".to_string(),
+                    range,
+                });
+            }
+            // Detect the shape from the first element.
+            let kind = match &*items[0].expr {
+                Expr::Int(_) => ConstListKind::Int,
+                Expr::Float(_) => ConstListKind::Float,
+                Expr::Bool(_) => ConstListKind::Bool,
+                Expr::String(_) => ConstListKind::String,
+                other => {
+                    return Err(LoweringError::UnsupportedExpr {
+                        kind: format!("List(non-literal element `{}`)", other.kind()),
+                        range: items[0].range,
+                    });
+                }
+            };
+            match kind {
+                ConstListKind::Int => {
+                    let mut elements: Vec<i64> = Vec::with_capacity(items.len());
+                    for node in items {
+                        match &*node.expr {
+                            Expr::Int(v) => elements.push(*v),
+                            _ => {
+                                return Err(LoweringError::UnsupportedExpr {
+                                    kind: format!(
+                                        "List<Int>(non-Int element `{}`)",
+                                        node.expr.kind()
+                                    ),
+                                    range: node.range,
+                                });
+                            }
+                        }
                     }
+                    let idx = ctx.next_list_int_idx;
+                    ctx.next_list_int_idx += 1;
+                    ctx.out.push(TaggedOp {
+                        op: Op::ConstListInt { idx, elements },
+                        range,
+                    });
+                    ctx.tstack.push(IrType::ListInt);
+                }
+                ConstListKind::Float => {
+                    let mut elements: Vec<u64> = Vec::with_capacity(items.len());
+                    for node in items {
+                        match &*node.expr {
+                            Expr::Float(v) => elements.push(v.into_inner().to_bits()),
+                            // Accept Int promotion so `[1, 2.0, 3]` lowers
+                            // through this arm without forcing the
+                            // caller to spell every literal with a
+                            // decimal point.
+                            Expr::Int(v) => elements.push((*v as f64).to_bits()),
+                            _ => {
+                                return Err(LoweringError::UnsupportedExpr {
+                                    kind: format!(
+                                        "List<Float>(non-Float element `{}`)",
+                                        node.expr.kind()
+                                    ),
+                                    range: node.range,
+                                });
+                            }
+                        }
+                    }
+                    let idx = ctx.next_list_float_idx;
+                    ctx.next_list_float_idx += 1;
+                    ctx.out.push(TaggedOp {
+                        op: Op::ConstListFloat { idx, elements },
+                        range,
+                    });
+                    ctx.tstack.push(IrType::ListFloat);
+                }
+                ConstListKind::Bool => {
+                    let mut elements: Vec<bool> = Vec::with_capacity(items.len());
+                    for node in items {
+                        match &*node.expr {
+                            Expr::Bool(v) => elements.push(*v),
+                            _ => {
+                                return Err(LoweringError::UnsupportedExpr {
+                                    kind: format!(
+                                        "List<Bool>(non-Bool element `{}`)",
+                                        node.expr.kind()
+                                    ),
+                                    range: node.range,
+                                });
+                            }
+                        }
+                    }
+                    let idx = ctx.next_list_bool_idx;
+                    ctx.next_list_bool_idx += 1;
+                    ctx.out.push(TaggedOp {
+                        op: Op::ConstListBool { idx, elements },
+                        range,
+                    });
+                    ctx.tstack.push(IrType::ListBool);
+                }
+                ConstListKind::String => {
+                    let mut elements: Vec<String> = Vec::with_capacity(items.len());
+                    for node in items {
+                        match &*node.expr {
+                            Expr::String(v) => elements.push(v.clone()),
+                            _ => {
+                                return Err(LoweringError::UnsupportedExpr {
+                                    kind: format!(
+                                        "List<String>(non-String element `{}`)",
+                                        node.expr.kind()
+                                    ),
+                                    range: node.range,
+                                });
+                            }
+                        }
+                    }
+                    let idx = ctx.next_list_string_idx;
+                    ctx.next_list_string_idx += 1;
+                    ctx.out.push(TaggedOp {
+                        op: Op::ConstListString { idx, elements },
+                        range,
+                    });
+                    ctx.tstack.push(IrType::ListString);
                 }
             }
-            let idx = ctx.next_list_int_idx;
-            ctx.next_list_int_idx += 1;
-            ctx.out.push(TaggedOp {
-                op: Op::ConstListInt { idx, elements },
-                range,
-            });
-            ctx.tstack.push(IrType::ListInt);
             Ok(())
         }
         Expr::Variable(path) => lower_variable(path, range, ctx),
@@ -1193,6 +1334,10 @@ fn resolve_capture(
         let load_op = match p.ty {
             IrType::String => Op::LoadStringPtr { offset: p.offset },
             IrType::ListInt => Op::LoadListIntPtr { offset: p.offset },
+            IrType::ListFloat => Op::LoadListFloatPtr { offset: p.offset },
+            IrType::ListBool => Op::LoadListBoolPtr { offset: p.offset },
+            IrType::ListString => Op::LoadListStringPtr { offset: p.offset },
+            IrType::ListSchema => Op::LoadListSchemaPtr { offset: p.offset },
             other => Op::LoadField {
                 offset: p.offset,
                 ty: other,
@@ -1357,12 +1502,18 @@ fn lower_closure_arg(
                 op: Op::LoadI8UAtAbsolute { offset: *offset },
                 range: lambda_body.range,
             }),
-            IrType::I32 | IrType::Null | IrType::String | IrType::ListInt | IrType::Closure => {
-                inner.out.push(TaggedOp {
-                    op: Op::LoadI32AtAbsolute { offset: *offset },
-                    range: lambda_body.range,
-                })
-            }
+            IrType::I32
+            | IrType::Null
+            | IrType::String
+            | IrType::ListInt
+            | IrType::ListFloat
+            | IrType::ListBool
+            | IrType::ListString
+            | IrType::ListSchema
+            | IrType::Closure => inner.out.push(TaggedOp {
+                op: Op::LoadI32AtAbsolute { offset: *offset },
+                range: lambda_body.range,
+            }),
         }
         inner.out.push(TaggedOp {
             op: Op::LetSet {
@@ -2677,7 +2828,18 @@ fn type_repr_to_ir_type_dict(t: &TypeRepr) -> IrType {
         TypeRepr::Bool => IrType::Bool,
         TypeRepr::Null => IrType::Null,
         TypeRepr::String => IrType::String,
-        TypeRepr::List { .. } => IrType::ListInt,
+        TypeRepr::List { element } => match element.as_ref() {
+            TypeRepr::Int => IrType::ListInt,
+            TypeRepr::Float => IrType::ListFloat,
+            TypeRepr::Bool => IrType::ListBool,
+            TypeRepr::String => IrType::ListString,
+            TypeRepr::Schema { .. } => IrType::ListSchema,
+            // Fallback: treat unknown element types as the i32 pointer
+            // slot. Layout pass will already have rejected these at
+            // schema build time, so this branch fires only for hand-
+            // crafted ill-formed schemas.
+            _ => IrType::ListInt,
+        },
         // Nested branded schema rides a pointer slot — same wasm
         // representation as String / ListInt.
         TypeRepr::Schema { .. } => IrType::I32,
@@ -2935,7 +3097,14 @@ fn lower_dict_field_value(
             // List<Int>.
             let expected_ir = match &canonical.ty {
                 TypeRepr::String => IrType::String,
-                TypeRepr::List { .. } => IrType::ListInt,
+                TypeRepr::List { element } => match element.as_ref() {
+                    TypeRepr::Int => IrType::ListInt,
+                    TypeRepr::Float => IrType::ListFloat,
+                    TypeRepr::Bool => IrType::ListBool,
+                    TypeRepr::String => IrType::ListString,
+                    TypeRepr::Schema { .. } => IrType::ListSchema,
+                    _ => IrType::ListInt,
+                },
                 _ => unreachable!(),
             };
             if popped != expected_ir {
@@ -3105,6 +3274,18 @@ fn lower_variable(
                 offset: binding.offset,
             },
             (IrType::ListInt, _) => Op::LoadListIntPtr {
+                offset: binding.offset,
+            },
+            (IrType::ListFloat, _) => Op::LoadListFloatPtr {
+                offset: binding.offset,
+            },
+            (IrType::ListBool, _) => Op::LoadListBoolPtr {
+                offset: binding.offset,
+            },
+            (IrType::ListString, _) => Op::LoadListStringPtr {
+                offset: binding.offset,
+            },
+            (IrType::ListSchema, _) => Op::LoadListSchemaPtr {
                 offset: binding.offset,
             },
             _ => Op::LoadField {
