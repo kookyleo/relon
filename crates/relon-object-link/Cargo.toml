@@ -1,0 +1,40 @@
+[package]
+name = "relon-object-link"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "ET_REL -> ET_DYN link pass used by the v5-gamma native AOT pipeline before handing bytes to relon-object-cache"
+keywords = ["relon", "linker", "elf", "cranelift", "dlopen"]
+categories = ["compilers"]
+
+[dependencies]
+# Public error surface follows the workspace `thiserror` policy.
+thiserror = { workspace = true }
+# Tempfiles for the subprocess linker — input `.o` and output `.so`
+# both need real paths that `ld` can mmap. Same workspace version
+# `relon-object-cache` already pulls in, so no extra resolver branch.
+tempfile = "3"
+
+[dev-dependencies]
+# End-to-end fixture: build a relocatable `.o` with cranelift-object,
+# pipe it through `link_to_dyn`, then load the result via
+# `relon-object-cache` and actually call the exported symbol. Same
+# 0.131 cranelift channel the rest of the workspace pins.
+cranelift-codegen = "0.131"
+cranelift-frontend = "0.131"
+cranelift-module = "0.131"
+cranelift-object = "0.131"
+cranelift-native = "0.131"
+target-lexicon = "0.13"
+relon-object-cache = { workspace = true }
+
+[features]
+# In-process lld linker. Default off because `lld-sys` / `lld` crates
+# are not on a stable release channel as of v5-gamma planning; the
+# stub returns `LinkError::FeatureNotImplemented` until a phase
+# decision picks one. See `src/linker_lld.rs` for the rationale.
+default = []
+lld-inproc = []
