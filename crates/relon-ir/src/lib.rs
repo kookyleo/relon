@@ -18,10 +18,12 @@
 //! IR-first crate split rationale.
 
 pub mod case_folding;
+pub mod combining_marks;
 pub mod error;
 pub mod ir;
 pub mod lowering;
 pub mod stdlib;
+pub mod whitespace;
 
 pub use error::LoweringError;
 pub use ir::{

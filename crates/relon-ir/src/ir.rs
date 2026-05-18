@@ -1174,6 +1174,40 @@ pub enum Op {
         /// uppercase), `false` selects the lower-mapping table.
         upper: bool,
     },
+
+    /// v3++ b-4 grapheme-awareness primitive.
+    ///
+    /// Push the absolute wasm-memory address of the embedded Unicode
+    /// `Mark` (Mn + Mc + Me) range table. Stack effect: `[] -> [i32]`.
+    /// Codegen lowers to `i32.const <table_addr>` where `<table_addr>`
+    /// is the wasm-memory location of the `[count: u32 LE][(start: u32,
+    /// end: u32) × count]` blob the codegen pass laid out in the const
+    /// data section.
+    ///
+    /// The op only appears inside the bundled `title` / `upper` /
+    /// `lower` stdlib bodies (and the shared `__is_combining_mark`
+    /// helper they call). Not surfaced through user-facing syntax —
+    /// `at_word_start` / grapheme-aware case-folding decisions are
+    /// implementation details of the case-folding bodies.
+    ///
+    /// The pre-DCE codegen collector treats this op the same way as
+    /// `Op::CaseFoldTableAddr`: when present in a reachable body, the
+    /// matching table is added to the const pool so the embedded
+    /// `i32.const` resolves to a valid address. Unreachable bodies
+    /// keep the table out of the data section entirely.
+    CombiningMarkRangesAddr,
+
+    /// v3++ b-4 word-boundary primitive.
+    ///
+    /// Push the absolute wasm-memory address of the embedded non-ASCII
+    /// Unicode whitespace range table. Stack effect: `[] -> [i32]`.
+    /// Codegen lowers to `i32.const <table_addr>` with the same
+    /// `[count: u32 LE][(start: u32, end: u32) × count]` layout as
+    /// [`Op::CombiningMarkRangesAddr`]. ASCII whitespace is checked via
+    /// a direct comparison in the `title` body so the common case
+    /// avoids the table lookup entirely; only non-ASCII codepoints
+    /// fall through to the binary search.
+    WhitespaceRangesAddr,
 }
 
 /// Phase 10-a closure-capture record. One per captured variable on a
