@@ -20,6 +20,7 @@
 pub mod case_folding;
 pub mod combining_marks;
 pub mod error;
+pub mod full_case_folding;
 pub mod ir;
 pub mod lowering;
 pub mod normalization;

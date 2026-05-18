@@ -2570,3 +2570,195 @@ v3++ 推进：b-5 完工，Unicode normalization 在 wasm-AOT + tree-walk
 case folding + 完整 UAX #29 word boundary）或 b-7（normalization
 性能优化：Quick_Check 表 + insertion sort + pool 瘦身）。
 
+## 附录 A.20：v17 full case folding（Phase v3++ b-6，2026-05-18）
+
+### 背景
+
+v3+ a-4 落了 simple 1:1 case folding，遗留三大缺口：
+
+1. **Multi-codepoint mappings**：`ß → SS`、`ﬁ → FI`、`ﬂ → FL`、
+   `İ → i + U+0307` 等 SpecialCasing.txt 中 unconditional 多 cp 映射，
+   build.rs 的 `collect_mapping` 一律 skip，跑到这些 cp 走 identity
+   passthrough，结果错误。
+2. **Greek final sigma 上下文**：`Σ` (U+03A3) 在词末小写应该是 `ς`
+   (U+03C2)，词中是 `σ` (U+03C3)。需要 right-scan 跳过
+   Case_Ignorable 看下一个 Cased，结合 left-side 检查决定 final 形态。
+3. **Turkish / Azerbaijani locale**：`I`/`İ`/`ı`/`i` 四联体在 `tr`/`az`
+   locale 下覆盖默认 SpecialCasing 行为，BCP-47 标签需要正确解析。
+
+### 实现要点
+
+#### 数据层
+
+* `crates/relon-ir/data/SpecialCasing.txt`（UCD 14.0.0，~16 KB）+
+  `DerivedCoreProperties.txt`（~1 MB，只读取 `Cased` 与
+  `Case_Ignorable` 两个属性）入仓，跟 normalization 走同样的
+  vendoring 模式。
+* `tools/gen_full_case_folding.py` 从这两个 UCD 文件生成
+  `crates/relon-ir/src/full_case_folding_data.rs`：
+  - `FULL_UPPER_FOLDING`：102 entries
+    `(u32 in, u32 out0, u32 out1, u32 out2, u8 out_len)`，
+    最长 out_len = 3（如 `0x0390 → 0399 0308 0301`）。
+  - `FULL_LOWER_FOLDING`：1 entry（`U+0130 → i + U+0307`）。
+  - `CASED_RANGES`：155 ranges。
+  - `CASE_IGNORABLE_RANGES`：427 ranges。
+  - `TURKISH_UPPER_FOLDING` / `TURKISH_LOWER_FOLDING`：各 2 entries
+    （手维护常量，由生成脚本写入以便 review）。
+
+#### Rust 公共层（`crates/relon-ir/src/full_case_folding.rs`）
+
+* `full_upper_entry(cp) -> Option<(u8, [u32; 3])>`、`full_lower_entry`
+  二分查找 FULL 表，命中返回长度 + 内联三槽。
+* `is_cased(cp) / is_case_ignorable(cp)` 在 ranges 表上做
+  `binary_search_by` 比较。
+* `is_final_sigma_context(cps, anchor)` 实现 UAX #21 Final_Sigma：
+  既看 anchor 左侧（必须有 cased，跳过 case-ignorable），又看右侧
+  （遇到 cased 就返回 false；遇到非 cased 非 ignorable 就停止），
+  与 ICU 行为一致。
+* `is_turkish_locale(locale)` 两字母 ASCII 前缀比较 + 边界检查
+  （`-` / `_` / EOS），覆盖 `tr` / `TR` / `tr-TR` / `tr_TR` / `az` /
+  `az-AZ` 等所有 BCP-47-ish 写法，拒绝 `tron`（无边界）。
+* `encode_full_table_bytes` / `encode_simple_view_bytes` 两套编码器：
+  前者 20-byte stride 给 FULL 表，后者把 Turkish 表压成 8-byte
+  stride 共用 `__casefold_lookup`（4 entries 都是 1:1 所以视图无损）。
+
+#### Tree-walk evaluator（完整三特性）
+
+`crates/relon-evaluator/src/stdlib.rs::fold_string(s, mode,
+locale_turkish)` 一份循环：
+
+1. 解码 cp。
+2. 组合标记直接透传。
+3. Title 模式遇到 whitespace 重置 word boundary，否则按
+   `at_word_start` 决定 effective_mode = Upper / Lower。
+4. **Final sigma**：`mode == Lower && cp == 0x03A3` 时调用
+   `is_final_sigma_context` 决定 `ς` 或 `σ`。
+5. **Turkish locale**：locale_turkish 命中先查 Turkish 表。
+6. **FULL 表**：再查 unconditional 多 cp 表。
+7. **回退 Rust `char::to_uppercase` / `to_lowercase`**：覆盖剩余
+   simple cases（Rust stdlib 自带 UCD 数据）。
+
+新加 `StringUpperLocale / StringLowerLocale / StringTitleLocale`
+三个 native fn，注册为 `_string_*_locale` + 同名 String 方法。
+
+#### Wasm-AOT（locale dispatch 落地，multi-cp/sigma 留 b-7）
+
+考虑到 `case_fold_body` 已 700+ LOC、加多 cp emit 需要重写 encode 循环、
+sigma right-scan 需要在 wasm body 里做 UTF-8 反向解码，本次 b-6
+**先把 locale dispatch 在 wasm-AOT 落地**，FULL multi-cp 与 sigma
+context 的 wasm-AOT 实现挂到 b-7：
+
+* 新 IR Op：`FullCaseFoldTableAddr { upper }`、`CasedRangesAddr`、
+  `CaseIgnorableRangesAddr`、`TurkishCaseFoldTableAddr { upper }`。
+  codegen-wasm 的 ConstPool 加 6 个 offset slot；本期实际只用了
+  Turkish 两张。
+* `case_fold_body_inner(name, mode, locale_aware)`：locale_aware 走
+  prelude 解码 locale 字符串前 2 字节，做 case-insensitive 双向比较
+  + 边界检查（位置 2 必须是 `-` / `_` 或 EOS），写入 `IS_TURKISH`
+  local。
+* `lookup_through_table` 变成 locale-aware 版本：`IS_TURKISH == 1`
+  时先查 Turkish 表（8-byte stride，复用 `__casefold_lookup`），命中
+  即用，否则回落默认 simple 表。
+* 三个新 stdlib slot 31 / 32 / 33：`upper_locale(s, locale)` /
+  `lower_locale(s, locale)` / `title_locale(s, locale)`。
+* `stdlib_method_index` 加三对 `(String, *_locale)` 派发。
+* `core/string.relon` 注册 `#native upper_locale(locale: String) -> String`
+  等三方法。
+
+### 表大小
+
+* `SpecialCasing.txt`：~16 KB（vendored，非运行时数据）。
+* `DerivedCoreProperties.txt`：~1 MB（vendored，仅 build-time 读取
+  Cased / Case_Ignorable）。
+* `FULL_UPPER_FOLDING`：102 × 20 + 4 = 2044 bytes。
+* `FULL_LOWER_FOLDING`：1 × 20 + 4 = 24 bytes。
+* `CASED_RANGES`：155 × 8 + 4 = 1244 bytes。
+* `CASE_IGNORABLE_RANGES`：427 × 8 + 4 = 3420 bytes。
+* `TURKISH_*_FOLDING`（simple view，8-byte stride）：2 × 8 + 4 = 20
+  bytes each，本期 wasm 端实际嵌入。
+* 冷启动数据段额外开销：locale-aware bodies 触发 → +40 bytes（两张
+  Turkish 表）。FULL / CASED / CASE_IGNORABLE 在 wasm 端目前 DCE
+  掉了（无 reachable body 调用），所以 wasm module size 几乎无变化。
+
+### Bench
+
+`crates/relon-bench/benches/wasm_aot_vs_tree_walk.rs` 新增四个
+scenario：
+
+* `stdlib_full_case_folding_ascii`：100-byte ASCII × 3 重复，
+  upper。两端走 fast path，差距应在 sub-microsecond 量级。
+* `stdlib_full_case_folding_greek`：`ΟΔΥΣΣΕΥΣ`，lower。tree-walk
+  端走 final-sigma right-scan；wasm-AOT 端只走 simple table，输出
+  与 tree-walk 末位有 `σ` vs `ς` 差异（不影响 bench 自身，只反映
+  当前 wasm-AOT 不支持 sigma 上下文）。
+* `stdlib_full_case_folding_sharp_s`：`straße ﬁrst ﬂow`，upper。
+  tree-walk 走 FULL 表得正确 `STRASSE FIRST FLOW`；wasm-AOT 端
+  identity passthrough 得 `STRAßE FIRST FLOW`（同样反映 b-6 未完
+  覆盖 wasm-AOT）。
+* `stdlib_full_case_folding_turkish`：`istanbul izmir` +
+  `locale="tr"`，upper_locale。两端都走 Turkish 覆盖表，输出
+  `İSTANBUL İZMİR` byte-identical。
+
+### 测试
+
+* 单元测试 +13（relon-ir / full_case_folding）：FULL 表查表、CASED
+  / CASE_IGNORABLE 命中、final sigma 三态、locale 匹配边界。
+* 单元测试 +18（relon-evaluator / fold_string）：UAX #21 三特性
+  + roundtrip / idempotence + combining-mark word-boundary 守门。
+* wasm-AOT smoke +19（stdlib_full_case_folding_smoke）：locale
+  dispatch（tr/az/uppercase/边界）、默认 fallback、method-form
+  派发、wasm-AOT 已实现路径的端到端验证。
+
+合计 +50 个测试，workspace 总测试数 1439 → 1489。
+
+### 关键决策
+
+1. **Tree-walk 全功能，wasm-AOT 分两期**：FULL multi-cp 的 wasm
+   实现需要重写 encode 循环 + 3-slot scratch buffer + 1..=3 cp emit
+   循环，单次 PR 风险高。先把 IR Op + ConstPool + locale dispatch
+   落定，余下 b-7 用相同 helper / 数据。
+2. **Turkish 表 8-byte stride**：四条 entry 都是 1:1，压成 simple 视图
+   能复用现有 `__casefold_lookup`，省一个新 helper。FULL 表那 102
+   条多 cp entries 走独立 20-byte stride（b-7 接入 wasm 时用）。
+3. **Locale 解析在 wasm body 内联**：而不是写新 helper，避免
+   `__locale_check` 之类的 cycle 问题。代价是每个 `*_locale` body
+   多出 ~50 op，但只跑一次（在 loop 外）。
+4. **BCP-47 仅前两字母 + boundary**：完整 BCP-47 解析（regions、
+   variants、private-use subtags）暂不做。`tr-TR` / `az_AZ` /
+   `tr-x-foo` 都按 Turkish 处理；`tro` / `azerbaijani` 走默认分支。
+   未来若引入 Lithuanian (`lt`) / Armenian (`hy`) 等需要 locale-
+   specific 处理的语言，重用同一个 prefix 解析框架。
+
+### 遗留 todo
+
+* **wasm-AOT 落 FULL multi-cp emit**：现成的 `FullCaseFoldTableAddr`
+  Op 已在 IR + codegen 备好；body 需要在 fold lookup 后写
+  out_len + 3-slot scratch，encode 循环按 out_len 跑 1..=3 次。
+* **wasm-AOT 落 sigma right-scan**：需要新 helper
+  `__final_sigma_check(s_ptr, byte_offset, s_len) -> i32`，body 在
+  decode 后调用决定 ς/σ。IR Op `CasedRangesAddr` /
+  `CaseIgnorableRangesAddr` 已备好。
+* **Lithuanian / Armenian locale**：`lt`、`hy` 在 SpecialCasing 也有
+  特殊行为（`After_Soft_Dotted`、Armenian ligatures），同模式扩展
+  Turkish 实现。
+* **BCP-47 完整解析**：region (`tr-TR`)、variant (`hy-arevmda`)、
+  Unicode extension (`tr-u-cf-lower`) 等场景。
+* **Σ 上下文 in `title` mode**：当前 tree-walk `title` 在 Lower 分支
+  也会触发 sigma context，匹配 ICU；wasm-AOT 一并补齐。
+* **Quick_Check 表**：若整串都是 ASCII 且无 cased letters，integers
+  fast path 直接 memcpy，省 per-cp decode。
+
+### Gate
+
+* `cargo build --workspace` ✓
+* `cargo test --workspace` ✓ 1489 passed, 0 failed（b-5 baseline 1439
+  + 50 个新增 ≥ 16 目标）
+* `cargo clippy --workspace --all-targets -- -D warnings` ✓
+* `cargo fmt --all -- --check` ✓
+* `cargo build --target wasm32-unknown-unknown -p relon-wasm` ✓
+
+v3++ 推进：b-6 部分落定，tree-walk 完成 UAX #21 三特性、wasm-AOT
+locale dispatch 落地。FULL multi-cp emit 与 sigma right-scan 的
+wasm-AOT 实现挂到 b-7（IR Op + ConstPool + Cased/CaseIgnorable
+ranges 都已备好，body 需要 ~600 行 rewrite encode 循环 + 新 helper）。
+

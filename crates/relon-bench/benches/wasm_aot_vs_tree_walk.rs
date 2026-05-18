@@ -195,6 +195,57 @@ fn string_normalization_args() -> HashMap<String, Value> {
     m
 }
 
+/// v3++ b-6 `stdlib_full_case_folding` payloads. Multiple shapes
+/// exercise the new UAX #21 paths the wasm-AOT and tree-walk bodies
+/// share:
+///
+///   * **ASCII fast path** — pure Latin text isolates the per-cp
+///     UTF-8 decode + simple-fold table lookup overhead with zero
+///     multi-cp / locale work, so the baseline number is stable.
+///   * **Greek** — a sentence with multiple `Σ` codepoints, the last
+///     of which sits at a word boundary, so the tree-walk path drives
+///     the final-sigma right-scan (Cased + Case_Ignorable lookups).
+///     The wasm-AOT body skips the right-scan in v3++ b-6 but still
+///     walks the simple-fold tables for the rest of the codepoints.
+///   * **Sharp s + ligatures** — `ß` plus the Latin ligatures `ﬁ` /
+///     `ﬂ` exercise the FULL multi-codepoint upper mappings on the
+///     tree-walk side. The wasm-AOT body leaves these as identity
+///     today.
+///   * **Turkish locale** — a Turkish-flavoured sentence driving the
+///     locale dispatch on both backends. Wasm-AOT consults the
+///     Turkish override table inline; tree-walk does the same plus
+///     the FULL fallback.
+fn string_case_fold_ascii_args() -> HashMap<String, Value> {
+    let mut m = HashMap::with_capacity(1);
+    let s = "the quick brown fox jumps over the lazy dog ".repeat(3);
+    m.insert("s".to_string(), Value::String(s));
+    m
+}
+
+fn string_case_fold_greek_args() -> HashMap<String, Value> {
+    let mut m = HashMap::with_capacity(1);
+    // ΟΔΥΣΣΕΥΣ — ends with a word-final Σ, lights up the right-scan.
+    let s = "\u{039F}\u{0394}\u{03A5}\u{03A3}\u{03A3}\u{0395}\u{03A5}\u{03A3}".to_string();
+    m.insert("s".to_string(), Value::String(s));
+    m
+}
+
+fn string_case_fold_sharp_s_args() -> HashMap<String, Value> {
+    let mut m = HashMap::with_capacity(1);
+    // German `Straße` + ligature `ﬁ` `ﬂ`.
+    let s = "stra\u{00DF}e \u{FB01}rst \u{FB02}ow".to_string();
+    m.insert("s".to_string(), Value::String(s));
+    m
+}
+
+fn string_case_fold_turkish_args() -> HashMap<String, Value> {
+    let mut m = HashMap::with_capacity(2);
+    let s = "istanbul izmir".to_string();
+    m.insert("s".to_string(), Value::String(s));
+    m.insert("locale".to_string(), Value::String("tr".to_string()));
+    m
+}
+
 /// Phase 10-a scenarios: a 32-element `List<Int>` driving the
 /// higher-order `map` / `filter` / `fold` stdlib bodies. The list
 /// length is chosen large enough that per-iteration `call_indirect`
@@ -304,6 +355,37 @@ const SCENARIOS: &[Scenario] = &[
         wasm_source: "#main(String s) -> String\ns.nfkd()",
         tree_source: "#main(String s) -> String\ns.nfkd()",
         args: string_normalization_args,
+    },
+    // v3++ b-6: drives the full case folding pipeline. Four payload
+    // shapes light up distinct paths:
+    //   * ASCII fast path — per-cp decode + simple-fold table cost.
+    //   * Greek — exercises the final-sigma right-scan on tree-walk.
+    //   * `ß` + Latin ligatures — multi-cp output on tree-walk.
+    //   * Turkish — locale dispatch + Turkish override on both
+    //     backends.
+    Scenario {
+        name: "stdlib_full_case_folding_ascii",
+        wasm_source: "#main(String s) -> String\ns.upper()",
+        tree_source: "#main(String s) -> String\ns.upper()",
+        args: string_case_fold_ascii_args,
+    },
+    Scenario {
+        name: "stdlib_full_case_folding_greek",
+        wasm_source: "#main(String s) -> String\ns.lower()",
+        tree_source: "#main(String s) -> String\ns.lower()",
+        args: string_case_fold_greek_args,
+    },
+    Scenario {
+        name: "stdlib_full_case_folding_sharp_s",
+        wasm_source: "#main(String s) -> String\ns.upper()",
+        tree_source: "#main(String s) -> String\ns.upper()",
+        args: string_case_fold_sharp_s_args,
+    },
+    Scenario {
+        name: "stdlib_full_case_folding_turkish",
+        wasm_source: "#main(String s, String locale) -> String\ns.upper_locale(locale)",
+        tree_source: "#main(String s, String locale) -> String\ns.upper_locale(locale)",
+        args: string_case_fold_turkish_args,
     },
     // Phase 10-a closure surfaces. Each scenario runs the same
     // higher-order body on both backends; the wasm side exercises

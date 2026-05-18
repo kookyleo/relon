@@ -903,6 +903,24 @@ struct ConstPool {
     ccc_offset: Option<u32>,
     /// v3++ b-5: byte offset of the canonical composition pair table.
     composition_offset: Option<u32>,
+    /// v3++ b-6: byte offset of the FULL multi-codepoint upper-folding
+    /// table. `Some(off)` only when at least one reachable body
+    /// references `Op::FullCaseFoldTableAddr { upper: true }`.
+    full_case_fold_upper_offset: Option<u32>,
+    /// v3++ b-6: byte offset of the FULL multi-codepoint lower-folding
+    /// table.
+    full_case_fold_lower_offset: Option<u32>,
+    /// v3++ b-6: byte offset of the UCD Cased property range table.
+    cased_ranges_offset: Option<u32>,
+    /// v3++ b-6: byte offset of the UCD Case_Ignorable property
+    /// range table.
+    case_ignorable_ranges_offset: Option<u32>,
+    /// v3++ b-6: byte offset of the Turkish / Azerbaijani upper-folding
+    /// override table.
+    turkish_upper_offset: Option<u32>,
+    /// v3++ b-6: byte offset of the Turkish / Azerbaijani lower-folding
+    /// override table.
+    turkish_lower_offset: Option<u32>,
 }
 
 impl ConstPool {
@@ -1003,6 +1021,46 @@ impl ConstPool {
     fn composition_addr(&self) -> Result<u32, CodegenError> {
         self.composition_offset
             .map(|o| DATA_SECTION_BASE + o)
+            .ok_or(CodegenError::MixedNumericTypes)
+    }
+
+    /// v3++ b-6: lookup the absolute address of the FULL upper / lower
+    /// folding table.
+    fn full_case_fold_addr(&self, upper: bool) -> Result<u32, CodegenError> {
+        let off = if upper {
+            self.full_case_fold_upper_offset
+        } else {
+            self.full_case_fold_lower_offset
+        };
+        off.map(|o| DATA_SECTION_BASE + o)
+            .ok_or(CodegenError::MixedNumericTypes)
+    }
+
+    /// v3++ b-6: lookup the absolute address of the UCD Cased property
+    /// range table.
+    fn cased_ranges_addr(&self) -> Result<u32, CodegenError> {
+        self.cased_ranges_offset
+            .map(|o| DATA_SECTION_BASE + o)
+            .ok_or(CodegenError::MixedNumericTypes)
+    }
+
+    /// v3++ b-6: lookup the absolute address of the Case_Ignorable
+    /// range table.
+    fn case_ignorable_ranges_addr(&self) -> Result<u32, CodegenError> {
+        self.case_ignorable_ranges_offset
+            .map(|o| DATA_SECTION_BASE + o)
+            .ok_or(CodegenError::MixedNumericTypes)
+    }
+
+    /// v3++ b-6: lookup the absolute address of the Turkish /
+    /// Azerbaijani override table.
+    fn turkish_addr(&self, upper: bool) -> Result<u32, CodegenError> {
+        let off = if upper {
+            self.turkish_upper_offset
+        } else {
+            self.turkish_lower_offset
+        };
+        off.map(|o| DATA_SECTION_BASE + o)
             .ok_or(CodegenError::MixedNumericTypes)
     }
 }
@@ -1375,6 +1433,90 @@ fn collect_consts(body: &[relon_ir::TaggedOp], pool: &mut ConstPool) -> Result<(
                     );
                     pool.bytes.extend_from_slice(&bytes);
                     pool.composition_offset = Some(offset);
+                }
+            }
+            Op::FullCaseFoldTableAddr { upper } => {
+                // v3++ b-6: lay out the FULL multi-codepoint
+                // case-folding table on first reference. Entry stride
+                // is 20 bytes; output codepoints inlined up to 3 per
+                // entry per UAX #21's longest unconditional mapping.
+                let slot = if *upper {
+                    &mut pool.full_case_fold_upper_offset
+                } else {
+                    &mut pool.full_case_fold_lower_offset
+                };
+                if slot.is_none() {
+                    while !pool.bytes.len().is_multiple_of(4) {
+                        pool.bytes.push(0);
+                    }
+                    let offset = u32::try_from(pool.bytes.len()).map_err(|_| {
+                        CodegenError::Layout("const data section exceeds u32 bytes".into())
+                    })?;
+                    let table = if *upper {
+                        relon_ir::full_case_folding::full_upper_folding()
+                    } else {
+                        relon_ir::full_case_folding::full_lower_folding()
+                    };
+                    let bytes = relon_ir::full_case_folding::encode_full_table_bytes(table);
+                    pool.bytes.extend_from_slice(&bytes);
+                    *slot = Some(offset);
+                }
+            }
+            Op::CasedRangesAddr => {
+                if pool.cased_ranges_offset.is_none() {
+                    while !pool.bytes.len().is_multiple_of(4) {
+                        pool.bytes.push(0);
+                    }
+                    let offset = u32::try_from(pool.bytes.len()).map_err(|_| {
+                        CodegenError::Layout("const data section exceeds u32 bytes".into())
+                    })?;
+                    let table = relon_ir::full_case_folding::cased_ranges();
+                    let bytes = relon_ir::full_case_folding::encode_ranges_bytes(table);
+                    pool.bytes.extend_from_slice(&bytes);
+                    pool.cased_ranges_offset = Some(offset);
+                }
+            }
+            Op::CaseIgnorableRangesAddr => {
+                if pool.case_ignorable_ranges_offset.is_none() {
+                    while !pool.bytes.len().is_multiple_of(4) {
+                        pool.bytes.push(0);
+                    }
+                    let offset = u32::try_from(pool.bytes.len()).map_err(|_| {
+                        CodegenError::Layout("const data section exceeds u32 bytes".into())
+                    })?;
+                    let table = relon_ir::full_case_folding::case_ignorable_ranges();
+                    let bytes = relon_ir::full_case_folding::encode_ranges_bytes(table);
+                    pool.bytes.extend_from_slice(&bytes);
+                    pool.case_ignorable_ranges_offset = Some(offset);
+                }
+            }
+            Op::TurkishCaseFoldTableAddr { upper } => {
+                // v3++ b-6: lay out the Turkish / Azerbaijani override
+                // table on first reference. Encoded with the same
+                // 8-byte stride as `SIMPLE_*_FOLDING` so the existing
+                // `__casefold_lookup` helper can binary-search both
+                // tables — the four Turkish entries all happen to be
+                // 1:1 mappings (`I` <-> `ı`, `İ` <-> `i`).
+                let slot = if *upper {
+                    &mut pool.turkish_upper_offset
+                } else {
+                    &mut pool.turkish_lower_offset
+                };
+                if slot.is_none() {
+                    while !pool.bytes.len().is_multiple_of(4) {
+                        pool.bytes.push(0);
+                    }
+                    let offset = u32::try_from(pool.bytes.len()).map_err(|_| {
+                        CodegenError::Layout("const data section exceeds u32 bytes".into())
+                    })?;
+                    let table = if *upper {
+                        relon_ir::full_case_folding::turkish_upper_folding()
+                    } else {
+                        relon_ir::full_case_folding::turkish_lower_folding()
+                    };
+                    let bytes = relon_ir::full_case_folding::encode_simple_view_bytes(table);
+                    pool.bytes.extend_from_slice(&bytes);
+                    *slot = Some(offset);
                 }
             }
             Op::If {
@@ -2194,6 +2336,32 @@ fn emit_op_seq(
                 // v3++ b-5: emit `i32.const <table_addr>` for the
                 // canonical composition pair table.
                 let addr = const_pool.composition_addr()?;
+                f.instruction(&Instruction::I32Const(addr as i32));
+                vstack.push(IrType::I32);
+                ranges.push(tagged.range);
+            }
+            Op::FullCaseFoldTableAddr { upper } => {
+                // v3++ b-6: emit address of the FULL upper / lower
+                // multi-codepoint folding table.
+                let addr = const_pool.full_case_fold_addr(*upper)?;
+                f.instruction(&Instruction::I32Const(addr as i32));
+                vstack.push(IrType::I32);
+                ranges.push(tagged.range);
+            }
+            Op::CasedRangesAddr => {
+                let addr = const_pool.cased_ranges_addr()?;
+                f.instruction(&Instruction::I32Const(addr as i32));
+                vstack.push(IrType::I32);
+                ranges.push(tagged.range);
+            }
+            Op::CaseIgnorableRangesAddr => {
+                let addr = const_pool.case_ignorable_ranges_addr()?;
+                f.instruction(&Instruction::I32Const(addr as i32));
+                vstack.push(IrType::I32);
+                ranges.push(tagged.range);
+            }
+            Op::TurkishCaseFoldTableAddr { upper } => {
+                let addr = const_pool.turkish_addr(*upper)?;
                 f.instruction(&Instruction::I32Const(addr as i32));
                 vstack.push(IrType::I32);
                 ranges.push(tagged.range);
