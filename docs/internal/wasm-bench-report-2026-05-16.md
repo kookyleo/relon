@@ -2053,3 +2053,146 @@ walk，每次 invoke 都要付 schema setup 那部分。
 v3++ 推进：b-1 完工，user-fn DCE 把 schema methods + lambdas 也
 纳入 reachability 算法。下一站 b-2（远程 `#import` hash pinning）。
 
+## 附录 A.17：v14 remote `#import` conditional GET 笔记（Phase v3++ b-3，2026-05-18）
+
+v3++ b-3 给 v3+ a-3 已落地的远程 `#import` 拉取 + 24h 磁盘缓存补
+上一条 conditional GET 通道：cache 命中 TTL 时仍走 fast path（不
+摸网络），TTL 过期但 server 在上一次响应里给过 `ETag` 或 `Last-
+Modified` 时，resolver 改发 `If-None-Match` / `If-Modified-Since`
+头让 origin 用 `304 Not Modified` 短路。bench scenario 不引入 b-3
+路径（避免 mock server 抖动），但下面把关键数字 + 决策记下来，
+方便 b-4 起回看。
+
+### Cache schema 调整
+
+a-3 的单文件 `<sha256(url)>.relon` 升级为双文件：
+
+```
+~/.cache/relon/remote_imports/<digest>.body   ← body bytes（保持
+                                                 与 a-3 等价的纯文
+                                                 本，cat 即可看）
+~/.cache/relon/remote_imports/<digest>.meta   ← JSON sidecar，schema:
+{
+  "etag": Option<String>,
+  "last_modified": Option<String>,
+  "fetched_at": u64 (unix seconds),
+  "body_sha256": "<lower-case hex>"
+}
+```
+
+- 关键字段：`etag` / `last_modified` 用于下一次的 conditional GET；
+  `fetched_at` 取代了 a-3 用 mtime 取龄的隐式契约（mtime 容易被
+  备份 / rsync 抹掉，显式 u64 更稳）；`body_sha256` 给后续 b-2
+  哈希钉绑路径做 cache 完整性自检留口子，b-3 本身不消费。
+- **Legacy 兼容**：首次 `load` 看到 `<digest>.relon` 时，把它当
+  body 读入并即刻 materialise `.body` + `.meta`（meta etag /
+  last_modified 都设 `None`）。旧文件保留不删，便于回滚到 a-3
+  binary。后续 `load` 命中新 schema 即可，不再触碰 legacy 路径。
+
+### 取舍
+
+* **TTL 仍保留 24h**：把 conditional GET 作为 TTL 过期后的省带宽
+  路径，而不是 TTL 替代品。原因：每次 conditional GET 仍有一次
+  TCP+TLS+HTTP roundtrip（典型 50–200ms），TTL fast path 是真正
+  的零延迟。两层缓存独立，host 想要 "always revalidate" 也可用
+  `with_ttl(Duration::ZERO)`。
+* **多文件 vs 单文件 header**：选多文件。理由：body 保持 raw
+  utf-8，`cat <digest>.body` 即可肉眼检查 / 调试 / 直接 `relon
+  fmt`；meta 走 JSON 可以扩字段（下次加 `content_type` /
+  `weak_etag` flag 也不破文件格式）。代价是 disk inode 翻倍，对
+  典型几十个 cache 条目可忽略。
+* **ureq 3 304 处理**：ureq 3 默认 `http_status_as_error` 只对
+  `4xx` / `5xx` 抛 Err，304 是 `Ok(http::Response)`。所以 fetch
+  路径里 `response.status().as_u16() == 304` 自然走分支，不需要
+  额外 `.unwrap_or_else` 或 typestate 兜底。这条解了原先 plan 担
+  心的 "ureq 把 304 当 error" 情况。
+
+### 流程图
+
+```
+fetch(url):
+  cached = cache.load(url)         // 含 legacy → 新 schema 迁移
+  if cached.fresh:
+    return cached.body             // 0 RTT，0 字节
+  headers = {}
+  if cached: 把 etag / last_modified 翻成请求头
+  resp = ureq.get(url).headers(headers).call()
+  if resp.status == 304:
+    cache.refresh(url, cached.meta, new_etag, new_lm)
+    return cached.body             // 1 RTT，0 body 字节
+  if resp.status == 200:
+    cache.store(url, new_body, new_etag, new_lm)
+    return new_body                // 1 RTT，全 body 字节
+  else: RemoteImportFailed
+```
+
+### 估算性收益
+
+假设一个远程模块 body 5–50 KB，origin 稳定（每天最多 1–2 次
+真实变更）：
+
+| 路径           | 频率（每天）| 带宽 / 调用 | 延迟 / 调用 |
+| -------------- | ----------: | ----------: | ----------: |
+| TTL fast path  | 大多数       | 0           | 0           |
+| 304 revalidate | TTL 边界 1×  | ~200–500 B（请求 + 响应 header）| 1 RTT |
+| 200 full fetch | 0–2          | body size   | 1 RTT       |
+
+24h TTL + 1× 真实变更 = 每天最多 1 次 200 fetch，剩下 1 次跨日
+revalidate 走 304。**净节省 vs a-3：每天 1 × body size 字节 +
+节省一个完整的 body read 反序列化（对几十 KB JSON / Relon 源是
+明显的 cold start 延迟差）**。具体数字依 host 网络 / origin 行
+为；CI 场景把 TTL 调短到分钟级时收益更明显。
+
+### 测试
+
+5 个新 unit test（`crates/relon-evaluator/src/module.rs::tests`）：
+
+1. `conditional_get_304_reuses_cache`：第一次 200 + `ETag: "abc"`
+   写 cache；TTL=0 强制第二次走 conditional GET，server 看到匹
+   配的 `If-None-Match` 改回 304；assert 第二次仍拿到 v1 body +
+   `meta.etag` 仍为 `"abc"`。
+2. `conditional_get_200_replaces_cache`：server 不 honor 条件请
+   求，第二次直接返 ETag `"new"` + 新 body；assert cache.load 后
+   body / etag 都被替换。
+3. `conditional_get_no_etag_falls_back_to_last_modified`：只配
+   `Last-Modified` header，验证 `If-Modified-Since` 被发出来。
+4. `conditional_get_no_validators_does_full_refetch`：origin 不发
+   任何 validator，两次都走完整 200 fetch，request 里没有任何
+   `If-*` header。
+5. `legacy_cache_format_migrated`：人工写一份 a-3 单文件 cache，
+   首次 `load` 后 `.body` + `.meta` sidecar 落盘，body 内容守恒。
+
+支撑这 5 个 case 的 `ScriptedServer` 是个极简的 in-process
+TCP listener，每次 accept 取下一个 scripted reply，能根据请求
+里出现的 `If-None-Match` / `If-Modified-Since` 自动把 200 改写
+成 304（无 body）。所有 mock 都对 `http://`，靠 resolver 的
+`allow_insecure(true)` 让连接通过。
+
+### 遗留 todo（推到 v3++ b-4 起）
+
+* **title case + grapheme**：b-4。
+* **Unicode normalization**：b-5。
+* **full case folding + locale**：b-6。
+* **SIMD v128**：b-7。
+* **proxy support / Bearer auth**：v3+++。
+* **HTTP/2 / HTTP/3**：v3+++。
+* **cache 整理**：legacy `<digest>.relon` 文件在 b-3 后还留着，
+  下次 cache cleanup（应在 host 侧而非 resolver 里）顺手删。
+* **bench scenario**：conditional GET 暂不进 criterion，避免
+  mock server 引入抖动；下次有 host-side 真实远程模块时再加。
+
+### Gate
+
+* `cargo build --workspace` ✓
+* `cargo test --workspace --features 'relon/wasm-aot'` ✓ 1367
+  passed, 0 failed（b-2 baseline 1362 + 5 个 conditional GET /
+  legacy 迁移测）
+* `cargo clippy --workspace --all-targets -- -D warnings` ✓
+* `cargo fmt --all -- --check` ✓
+* `cargo build --target wasm32-unknown-unknown -p relon-wasm` ✓
+  （`ureq` / `sha2` / `hex` / `serde_json` 全部 gated
+  在 `cfg(not(target_arch = "wasm32"))`，wasm 端零影响）
+
+v3++ 推进：b-3 完工，远程 `#import` 在 TTL 过期后走 conditional
+GET，省一次 body 下载。下一站 b-4（title case + grapheme）。
+
