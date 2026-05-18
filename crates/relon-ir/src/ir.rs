@@ -1390,3 +1390,257 @@ pub enum TrapKind {
     /// the diagnostic surface stays honest.
     InvalidUtf8,
 }
+
+/// v5-β-2 + v6-γ trace JIT hook: per-Op effect classification.
+///
+/// Each `Op` variant returns one of these so the v6-γ trace recorder
+/// can decide whether to keep recording, ABORT the trace, or schedule
+/// a side-effect replay in the deopt path. See
+/// `docs/internal/v6-gamma-trace-jit-design.md` §3.3 for the
+/// rationale.
+///
+/// The classification is conservative: when uncertain, surface the
+/// stricter class (a `Pure` op miscategorised as
+/// `UnrecoverableEffect` only loses optimization opportunity; the
+/// reverse risks correctness).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum EffectClass {
+    /// No side effects; pure function of operands. Trace optimizer
+    /// is free to reorder / eliminate / hoist across other Pure or
+    /// ReadOnly ops.
+    Pure,
+    /// Reads side-effecting state (memory, host clock, capability
+    /// vtable) but does not mutate it. Safe to reorder with other
+    /// Pure / ReadOnly ops, but **not** with any Write op against
+    /// the same backing store.
+    ReadOnly,
+    /// Mutates state, but the mutation is recoverable: the trace
+    /// optimizer records sufficient deopt state to undo / replay the
+    /// mutation if a guard later fires. Scratch arena cursor
+    /// mutation, sub-record allocation, and bump-allocated string
+    /// writes fall into this class.
+    RecoverableWrite,
+    /// Mutates externally-visible state in a way the trace optimizer
+    /// cannot replay (host fn call into user-provided
+    /// `register_pure_fn`, IO, etc). Encountering an Unrecoverable op
+    /// during trace recording **must** ABORT the trace.
+    UnrecoverableEffect,
+}
+
+impl Op {
+    /// Return the [`EffectClass`] of this op. Conservative when in
+    /// doubt — see the type's doc-comment for rationale.
+    ///
+    /// v5-β-2 establishes this classification ahead of v6-γ trace
+    /// JIT work so the IR's surface is frozen against trace recorder
+    /// expectations before the recorder lands.
+    pub fn effect_class(&self) -> EffectClass {
+        use EffectClass::*;
+        match self {
+            // Pure compute / loads of immediate constants: zero
+            // observable effect.
+            Op::ConstBool(_)
+            | Op::ConstI32(_)
+            | Op::ConstI64(_)
+            | Op::ConstF64(_)
+            | Op::ConstString { .. }
+            | Op::ConstListInt { .. }
+            | Op::ConstListFloat { .. }
+            | Op::ConstListBool { .. }
+            | Op::ConstListString { .. }
+            | Op::LocalGet(_)
+            | Op::LetGet { .. }
+            | Op::Add(_)
+            | Op::Sub(_)
+            | Op::Mul(_)
+            | Op::Div(_)
+            | Op::Mod(_)
+            | Op::BitAnd(_)
+            | Op::Eq(_)
+            | Op::Ne(_)
+            | Op::Lt(_)
+            | Op::Le(_)
+            | Op::Gt(_)
+            | Op::Ge(_)
+            | Op::Select { .. }
+            | Op::CaseFoldTableAddr { .. }
+            | Op::CombiningMarkRangesAddr
+            | Op::WhitespaceRangesAddr
+            | Op::DecompTableAddr { .. }
+            | Op::CccTableAddr
+            | Op::CompositionTableAddr
+            | Op::FullCaseFoldTableAddr { .. }
+            | Op::CasedRangesAddr
+            | Op::CaseIgnorableRangesAddr
+            | Op::TurkishCaseFoldTableAddr { .. } => Pure,
+
+            // Variable writes: scoped to the executing function;
+            // recoverable via a pre-write snapshot if needed.
+            Op::LetSet { .. } => RecoverableWrite,
+
+            // Memory loads from input buffer / record bases — read
+            // side-effecting state but do not mutate it. The bounds
+            // check itself can trap, but read-only ops are still safe
+            // to record so long as the trap path is part of the
+            // recorded trace.
+            Op::LoadField { .. }
+            | Op::LoadStringPtr { .. }
+            | Op::LoadListIntPtr { .. }
+            | Op::LoadListFloatPtr { .. }
+            | Op::LoadListBoolPtr { .. }
+            | Op::LoadListStringPtr { .. }
+            | Op::LoadListSchemaPtr { .. }
+            | Op::LoadFieldAtAbsolute { .. }
+            | Op::LoadSchemaPtr { .. }
+            | Op::LoadI32AtAbsolute { .. }
+            | Op::LoadI64AtAbsolute { .. }
+            | Op::LoadI8UAtAbsolute { .. }
+            | Op::LoadF64AtAbsolute { .. }
+            | Op::ReadStringLen => ReadOnly,
+
+            // Output buffer writes — RecoverableWrite because trace
+            // optimizer can stash the prior cursor value (or the
+            // initial `out_ptr`) and unwind.
+            Op::StoreField { .. }
+            | Op::StoreFieldAtRecord { .. }
+            | Op::StoreI32AtAbsolute { .. }
+            | Op::StoreI64AtAbsolute { .. }
+            | Op::StoreI8AtAbsolute { .. }
+            | Op::StoreF64AtAbsolute { .. }
+            | Op::AllocScratch { .. }
+            | Op::AllocScratchDyn
+            | Op::AllocRootRecord { .. }
+            | Op::AllocSubRecord { .. }
+            | Op::PushRecordBase { .. }
+            | Op::EmitTailRecordFromAbsoluteAddr { .. }
+            | Op::MemcpyAtAbsolute
+            | Op::MakeClosure { .. } => RecoverableWrite,
+
+            // Control flow + intra-function ops — pure from the
+            // recorder's perspective (no externally visible mutation;
+            // child bodies are walked recursively when the recorder
+            // expands the op).
+            Op::Return
+            | Op::If { .. }
+            | Op::Block { .. }
+            | Op::Loop { .. }
+            | Op::Br { .. }
+            | Op::BrIf { .. }
+            | Op::BrTable { .. }
+            | Op::CheckCap { .. } => Pure,
+
+            // Trap is terminal — the trace ends at this point; the
+            // recorder treats Trap as a guard fail rather than a
+            // forward-progress op. Classifying as Pure keeps the
+            // recorder honest without unnecessary aborts.
+            Op::Trap { .. } => Pure,
+
+            // Calls into stdlib bodies (`Op::Call`) and closures
+            // (`Op::CallClosure`): the callee's effect class is the
+            // composition of its body's ops. Conservative default is
+            // UnrecoverableEffect because the recorder can't see
+            // through the dispatch without inlining; stdlib bodies
+            // that are known pure-or-recoverable will be inlined by
+            // the recorder before this classification matters.
+            Op::Call { .. } | Op::CallClosure { .. } => UnrecoverableEffect,
+
+            // Native imports — opaque to the trace recorder by
+            // construction. Always ABORTs the trace.
+            Op::CallNative { .. } => UnrecoverableEffect,
+        }
+    }
+}
+
+#[cfg(test)]
+mod effect_tests {
+    use super::*;
+    use ordered_float::OrderedFloat;
+
+    #[test]
+    fn arith_ops_are_pure() {
+        assert_eq!(Op::Add(IrType::I64).effect_class(), EffectClass::Pure);
+        assert_eq!(Op::Sub(IrType::I64).effect_class(), EffectClass::Pure);
+        assert_eq!(Op::Mul(IrType::I64).effect_class(), EffectClass::Pure);
+        assert_eq!(Op::Div(IrType::I64).effect_class(), EffectClass::Pure);
+        assert_eq!(Op::Mod(IrType::I64).effect_class(), EffectClass::Pure);
+        assert_eq!(Op::ConstI64(42).effect_class(), EffectClass::Pure);
+        assert_eq!(
+            Op::ConstF64(OrderedFloat(1.5)).effect_class(),
+            EffectClass::Pure
+        );
+        assert_eq!(Op::Eq(IrType::I64).effect_class(), EffectClass::Pure);
+        assert_eq!(Op::LocalGet(0).effect_class(), EffectClass::Pure);
+    }
+
+    #[test]
+    fn load_ops_are_read_only() {
+        assert_eq!(
+            Op::LoadField {
+                offset: 0,
+                ty: IrType::I64
+            }
+            .effect_class(),
+            EffectClass::ReadOnly
+        );
+        assert_eq!(Op::ReadStringLen.effect_class(), EffectClass::ReadOnly);
+        assert_eq!(
+            Op::LoadStringPtr { offset: 0 }.effect_class(),
+            EffectClass::ReadOnly
+        );
+    }
+
+    #[test]
+    fn store_and_alloc_ops_are_recoverable_write() {
+        assert_eq!(
+            Op::StoreField {
+                offset: 0,
+                ty: IrType::I64
+            }
+            .effect_class(),
+            EffectClass::RecoverableWrite
+        );
+        assert_eq!(
+            Op::AllocScratch { size_bytes: 16 }.effect_class(),
+            EffectClass::RecoverableWrite
+        );
+        assert_eq!(
+            Op::LetSet {
+                idx: 0,
+                ty: IrType::I64
+            }
+            .effect_class(),
+            EffectClass::RecoverableWrite
+        );
+    }
+
+    #[test]
+    fn call_native_is_unrecoverable() {
+        assert_eq!(
+            Op::CallNative {
+                import_idx: 0,
+                param_tys: vec![IrType::I64],
+                ret_ty: IrType::I64,
+                cap_bit: NO_CAPABILITY_BIT,
+            }
+            .effect_class(),
+            EffectClass::UnrecoverableEffect
+        );
+    }
+
+    #[test]
+    fn checkcap_and_control_flow_are_pure() {
+        assert_eq!(
+            Op::CheckCap { cap_bit: 0 }.effect_class(),
+            EffectClass::Pure
+        );
+        assert_eq!(
+            Op::Block {
+                result_ty: None,
+                body: vec![]
+            }
+            .effect_class(),
+            EffectClass::Pure
+        );
+        assert_eq!(Op::Br { label_depth: 0 }.effect_class(), EffectClass::Pure);
+    }
+}

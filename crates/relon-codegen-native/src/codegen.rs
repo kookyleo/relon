@@ -259,6 +259,7 @@ pub fn compile_module(
             stack: Vec::new(),
             ir,
             trap_block: Some(trap_block),
+            label_stack: Vec::new(),
         };
 
         codegen.emit_prologue();
@@ -332,6 +333,36 @@ struct Codegen<'a, 'b> {
     /// when `SandboxConfig` disables every guard, in which case
     /// cranelift's dead-block elimination removes it.
     trap_block: Option<cranelift_codegen::ir::Block>,
+
+    /// v5-β-2 widen: label stack so `Op::Br { label_depth }` /
+    /// `Op::BrIf` / `Op::BrTable` can resolve to the matching
+    /// cranelift target block.
+    ///
+    /// Each entry carries the `(target_block, is_loop)` pair where
+    /// `target_block` is:
+    ///   * for `Op::Block { ... }`: the **exit** block (forward
+    ///     branch — `Br N` jumps past the matching End).
+    ///   * for `Op::Loop { ... }`: the **header** block (back
+    ///     branch — `Br N` re-enters the loop, equivalent to
+    ///     `continue`).
+    ///
+    /// `label_depth = 0` selects the innermost (top of stack)
+    /// label; higher depths walk outwards.
+    label_stack: Vec<LabelFrame>,
+}
+
+/// One label frame for the `Op::Br` / `Op::BrIf` / `Op::BrTable`
+/// target resolution.
+struct LabelFrame {
+    /// The cranelift block this label resolves to (loop header for
+    /// `Op::Loop`, exit block for `Op::Block`).
+    target_block: cranelift_codegen::ir::Block,
+    /// `true` for `Op::Loop` (back-edge); `false` for `Op::Block`
+    /// (forward-edge). Informational today — used by future trace
+    /// recorder integration to identify loop back-edges as hot
+    /// counter sites.
+    #[allow(dead_code)]
+    is_loop: bool,
 }
 
 impl<'a, 'b> Codegen<'a, 'b> {
@@ -543,12 +574,90 @@ impl<'a, 'b> Codegen<'a, 'b> {
                 else_body,
             } => self.emit_if(*result_ty, then_body, else_body)?,
             Op::CheckCap { cap_bit } => self.emit_check_cap(*cap_bit)?,
-            // v5-beta-1: every other op surfaces as Codegen failure so
-            // the auto-tier wrapper can fall back to the wasm-AOT or
-            // tree-walking tier instead of producing wrong answers.
+
+            // v5-β-2 widen: `select` for the simple stdlib bodies
+            // (`abs` / `min` / `max`) and any user expression the
+            // lowering pass emits via a ternary. Stack discipline
+            // mirrors wasm: pop `[val_true, val_false, cond]`,
+            // push `val_true` when `cond` is non-zero, else
+            // `val_false`. cranelift's `select` takes
+            // `(cond, val_if_true, val_if_false)` so the operand
+            // order is straightforward.
+            Op::Select { ty } => {
+                let cond = self.pop()?;
+                let val_false = self.pop()?;
+                let val_true = self.pop()?;
+                // Sanity: the IR pass guarantees both arms share the
+                // same wasm slot; we don't need to inspect the tag
+                // beyond a sanity-check trap if a future bug feeds
+                // mismatched widths.
+                let _ = ty;
+                let r = self.builder.ins().select(cond, val_true, val_false);
+                self.push(r);
+            }
+
+            // v5-β-2 widen: structured block forms. cranelift's
+            // CFG is flat blocks + terminators, but the wasm-style
+            // `Block` / `Loop` here only ever appear in stdlib
+            // bodies the cranelift backend will inline; emit them
+            // as nested cranelift blocks with a basic label depth
+            // stack so `Br` / `BrIf` find the right target. For
+            // now we route them through helpers that the next
+            // tranche (stdlib body inlining) will exercise.
+            Op::Block { result_ty, body } => self.emit_block(*result_ty, body, false)?,
+            Op::Loop { result_ty, body } => self.emit_block(*result_ty, body, true)?,
+            Op::Br { label_depth } => self.emit_br(*label_depth, /*conditional=*/ false)?,
+            Op::BrIf { label_depth } => self.emit_br(*label_depth, /*conditional=*/ true)?,
+
+            // v5-β-2 widen: arithmetic on `I32` slot (used by stdlib
+            // bodies for pointer / length arithmetic against the
+            // wasm linear-memory model). Same semantics as the I64
+            // variants but on cranelift's `I32` type.
+            Op::Add(IrType::I32) => {
+                let b = self.pop()?;
+                let a = self.pop()?;
+                let r = self.builder.ins().iadd(a, b);
+                self.push(r);
+            }
+            Op::Sub(IrType::I32) => {
+                let b = self.pop()?;
+                let a = self.pop()?;
+                let r = self.builder.ins().isub(a, b);
+                self.push(r);
+            }
+            Op::Mul(IrType::I32) => {
+                let b = self.pop()?;
+                let a = self.pop()?;
+                let r = self.builder.ins().imul(a, b);
+                self.push(r);
+            }
+            Op::BitAnd(IrType::I32) => {
+                let b = self.pop()?;
+                let a = self.pop()?;
+                let r = self.builder.ins().band(a, b);
+                self.push(r);
+            }
+            Op::BitAnd(IrType::I64) => {
+                let b = self.pop()?;
+                let a = self.pop()?;
+                let r = self.builder.ins().band(a, b);
+                self.push(r);
+            }
+            Op::Lt(IrType::I32) => self.emit_cmp_i32(IntCC::SignedLessThan)?,
+            Op::Le(IrType::I32) => self.emit_cmp_i32(IntCC::SignedLessThanOrEqual)?,
+            Op::Gt(IrType::I32) => self.emit_cmp_i32(IntCC::SignedGreaterThan)?,
+            Op::Ge(IrType::I32) => self.emit_cmp_i32(IntCC::SignedGreaterThanOrEqual)?,
+
+            // v5-β-2: every other op still surfaces as Codegen
+            // failure. Items #1-#6 in the v5-β-2 plan (LoadField,
+            // StoreField, scratch alloc, stdlib inlining, full
+            // CallNative dispatch, real sigsetjmp) widen this list
+            // incrementally — each widening is paired with a
+            // corpus tier transition from CraneliftUnsupported
+            // to MatchOk.
             other => {
                 return Err(CraneliftError::Codegen(format!(
-                    "unsupported op in v5-beta-1: {:?}",
+                    "unsupported op in v5-beta-2: {:?}",
                     std::mem::discriminant(other)
                 )))
             }
@@ -573,6 +682,116 @@ impl<'a, 'b> Codegen<'a, 'b> {
         let r = self.builder.ins().icmp(cc, a, b);
         let r = self.builder.ins().uextend(I32, r);
         self.push(r);
+        Ok(())
+    }
+
+    /// Lower a wasm `Block` (forward exit) or `Loop` (back edge) into
+    /// cranelift's flat-CFG block form.
+    ///
+    /// For both shapes we create a cranelift block ahead of the body
+    /// and push a `LabelFrame` onto `label_stack`; `Op::Br` /
+    /// `Op::BrIf` resolve to that block by depth-counting from the
+    /// top of the stack.
+    ///
+    /// * `is_loop = false` (wasm `Block`): the `target_block` is the
+    ///   **continuation** block reached after the body terminates;
+    ///   `Br 0` jumps forward past the body's End.
+    /// * `is_loop = true` (wasm `Loop`): the `target_block` is the
+    ///   loop **header**; `Br 0` jumps back to re-enter the loop
+    ///   (equivalent to `continue`). The block exits by falling
+    ///   through its End.
+    ///
+    /// v5-β-2 limitation: `result_ty != None` (block-yields-value)
+    /// is **not** yet supported because the codegen still needs to
+    /// thread the yielded value through block params. Stdlib bodies
+    /// in practice always use `result_ty = None`; surfacing the
+    /// unsupported case as Codegen failure keeps the safety net.
+    fn emit_block(
+        &mut self,
+        result_ty: Option<IrType>,
+        body: &[TaggedOp],
+        is_loop: bool,
+    ) -> Result<(), CraneliftError> {
+        if result_ty.is_some() {
+            return Err(CraneliftError::Codegen(
+                "Block / Loop with result_ty != None not yet supported on cranelift".to_string(),
+            ));
+        }
+
+        if is_loop {
+            // Loop: branch into a fresh header block, lower the
+            // body inside it. The body's terminator (Br / fallthrough
+            // / Return) decides whether the loop exits or re-enters.
+            let header = self.builder.create_block();
+            self.builder.ins().jump(header, &[]);
+            self.builder.switch_to_block(header);
+            // Loops with no other entry edge get sealed once the body
+            // lowers — cranelift seals retroactively for blocks with
+            // forward branches, so we leave it unsealed during the
+            // body walk and seal at the end.
+            self.label_stack.push(LabelFrame {
+                target_block: header,
+                is_loop: true,
+            });
+            self.emit_body(body)?;
+            self.label_stack.pop();
+            self.builder.seal_block(header);
+        } else {
+            // Block (forward exit): allocate a continuation block,
+            // lower the body, then switch to the continuation. A
+            // `Br 0` inside the body jumps forward to `cont`.
+            let cont = self.builder.create_block();
+            self.label_stack.push(LabelFrame {
+                target_block: cont,
+                is_loop: false,
+            });
+            self.emit_body(body)?;
+            self.label_stack.pop();
+            // Fallthrough to cont when the body doesn't explicitly
+            // branch out. The builder's `is_filled` API would let us
+            // skip this when the body already terminated, but
+            // emitting an extra `jump` is cheap and keeps the cranelift
+            // verifier happy.
+            self.builder.ins().jump(cont, &[]);
+            self.builder.seal_block(cont);
+            self.builder.switch_to_block(cont);
+        }
+        Ok(())
+    }
+
+    /// Lower `Op::Br { label_depth }` (unconditional) or
+    /// `Op::BrIf { label_depth }` (conditional, popping the
+    /// condition off the stack).
+    fn emit_br(&mut self, label_depth: u32, conditional: bool) -> Result<(), CraneliftError> {
+        let depth = label_depth as usize;
+        if depth >= self.label_stack.len() {
+            return Err(CraneliftError::Codegen(format!(
+                "Br/BrIf label_depth {label_depth} out of range — only {} frame(s) on stack",
+                self.label_stack.len()
+            )));
+        }
+        let target = self.label_stack[self.label_stack.len() - 1 - depth].target_block;
+
+        if conditional {
+            // Pop the i32 condition. cranelift `brif(cond, then,
+            // else)` needs both arms; for the "fallthrough" arm we
+            // create a fresh block and switch into it after the
+            // branch so subsequent ops land somewhere valid.
+            let cond = self.pop()?;
+            let fallthrough = self.builder.create_block();
+            self.builder.ins().brif(cond, target, &[], fallthrough, &[]);
+            self.builder.seal_block(fallthrough);
+            self.builder.switch_to_block(fallthrough);
+        } else {
+            self.builder.ins().jump(target, &[]);
+            // After an unconditional branch, the rest of the basic
+            // block is unreachable. Create a fresh dummy block so
+            // subsequent op emission lands somewhere; cranelift's
+            // dead-block elimination will prune it.
+            let dummy = self.builder.create_block();
+            self.builder.seal_block(dummy);
+            self.builder.switch_to_block(dummy);
+        }
         Ok(())
     }
 

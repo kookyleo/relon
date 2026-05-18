@@ -1,0 +1,28 @@
+[package]
+name = "relon-test-harness"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Differential test harness for the Relon backends (tree-walk vs cranelift-AOT)"
+keywords = ["relon", "testing", "differential", "evaluator"]
+categories = ["development-tools::testing"]
+publish = false
+
+[dependencies]
+# Tree-walk reference evaluator + shared Value / RuntimeError surface.
+relon = { workspace = true, features = ["cranelift-aot"] }
+relon-eval-api = { workspace = true }
+relon-parser = { workspace = true }
+relon-analyzer = { workspace = true }
+relon-evaluator = { workspace = true }
+relon-ir = { workspace = true }
+relon-codegen-native = { workspace = true }
+
+thiserror = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+relon-parser = { workspace = true }
