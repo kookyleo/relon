@@ -242,11 +242,7 @@ impl TraceJitState {
     /// Install a freshly-compiled trace. Returns the previous trace
     /// for the same `fn_id` if any (caller may keep the `Arc` alive
     /// to drain in-flight invocations).
-    pub fn install_trace(
-        &self,
-        fn_id: u32,
-        trace_fn: JITedTraceFn,
-    ) -> Option<Arc<JITedTraceFn>> {
+    pub fn install_trace(&self, fn_id: u32, trace_fn: JITedTraceFn) -> Option<Arc<JITedTraceFn>> {
         let mut guard = self.trace_fns.write().expect("trace_fns lock poisoned");
         guard.insert(fn_id, Arc::new(trace_fn))
     }
@@ -260,14 +256,27 @@ impl TraceJitState {
         fn_id: u32,
         recorder_state: RecorderState,
     ) -> Result<JITedTraceFn, TraceJitError> {
+        // 1. Finalise recorder → TraceBuffer.
+        let buffer = recorder_state
+            .finalize()
+            .map_err(TraceJitError::RecorderAbort)?;
+        self.jit_compile_buffer_for_fn(fn_id, buffer)
+    }
+
+    /// Compile a pre-built [`TraceBuffer`] (skipping the recorder
+    /// finalize step). Used by tests that need to construct a trace
+    /// without going through the recorder lowering rules — useful for
+    /// pinning emitter / optimiser behaviour on synthetic ops. The
+    /// production pipeline always goes through
+    /// [`Self::jit_compile_trace_for_fn`].
+    pub fn jit_compile_buffer_for_fn(
+        &self,
+        fn_id: u32,
+        mut buffer: relon_trace_jit::TraceBuffer,
+    ) -> Result<JITedTraceFn, TraceJitError> {
         if (fn_id as usize) >= MAX_FN_ID {
             return Err(TraceJitError::FnIdOutOfRange(fn_id));
         }
-
-        // 1. Finalise recorder → TraceBuffer.
-        let mut buffer = recorder_state
-            .finalize()
-            .map_err(TraceJitError::RecorderAbort)?;
 
         // 2. Run the optimizer pipeline (six passes).
         let _reports = OptimizerPipeline::default_pipeline().run(&mut buffer);

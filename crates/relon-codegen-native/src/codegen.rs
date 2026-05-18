@@ -909,13 +909,7 @@ fn lower_module_into<M: CrModule>(
         // leaves the builder positioned on `normal_block` so the rest
         // of the entry codegen flows unchanged.
         if let Some(fn_id) = sandbox.trace_jit_fn_id {
-            emit_hot_counter_inject(
-                &mut builder,
-                pointer_ty,
-                entry_shape,
-                fn_id,
-                &arg_values,
-            );
+            emit_hot_counter_inject(&mut builder, pointer_ty, entry_shape, fn_id, &arg_values);
         }
 
         // v5-γ stage 2: import the capability vtable as a GlobalValue
@@ -1179,9 +1173,7 @@ fn emit_hot_counter_inject(
     let counter_ptr = builder.ins().iconst(pointer_ty, counter_addr);
 
     // load.i32 / iadd_imm.i32 / store.i32 (non-atomic per design).
-    let cur = builder
-        .ins()
-        .load(I32, MemFlags::trusted(), counter_ptr, 0);
+    let cur = builder.ins().load(I32, MemFlags::trusted(), counter_ptr, 0);
     let inc = builder.ins().iadd_imm(cur, 1);
     builder
         .ins()
