@@ -181,7 +181,78 @@ v5 在 v4 之上启动，按 ROI 取舍。
 | +v5-α | **0.3-0.5 μs** | 80 μs | 2-8 ms |
 | +v5-β / γ | **0.3-0.5 μs** | **~10 μs** (γ) | 100 μs (γ) |
 
-到 v5-β/γ 已经物理跨过 LuaJIT trace JIT 的 cold start 优势线；warm invoke 仍是 LuaJIT 微胜（JIT trace 在 hot loop 里 sub-ns/op）。要追平 hot loop 需要自实现 trace JIT —— 在 v5 之后看必要性决定。
+到 v5-β/γ 已经物理跨过 LuaJIT trace JIT 的 cold start 优势线 + 对齐 LuaJIT function call tier；hot loop sub-ns/op 仍要 v6 系列 trace JIT 追。
+
+## v6 系列：trace JIT，追 LuaJIT hot loop sub-ns/op
+
+**触发场景**：用户 2026-05-18 指出 "高频流 ETL 完全可能" —— 同一段 lambda 在 stream pipeline 上对 10⁵+ 条记录跑相同 transform。当前 wasm-AOT 单 invoke 7-12 μs，10⁵ 条记录 = 700 ms ~ 1.2 s，stream throughput bottleneck。LuaJIT trace JIT 同负载 < 10 ms。
+
+**前置**：v5-β（cranelift-only AOT）完成。trace JIT 工作在 cranelift IR 之上，wasmtime / wasm 形式已退出。
+
+### v6-α：PGO / type profile-guided specialization（最简方案）
+
+**改动**：在 cranelift AOT 出第一份 generic code 之外，第一次 invoke 时记录类型 trace（每个 `Op` 入参的实际 `Value` tag）。第 N 次 invoke 后用 trace 触发 second compile pass，emit 专门按已观察类型分支的 code（generic 分支替换为直接 op；嵌入 guard 比较 tag，guard 失败 bail-out 回 generic）。Cache to disk。
+
+**ROI**：tight loop（同一段算术 / 字段访问 chain 重复跑）warm invoke **-30 ~ -50%**。0.3 μs → 0.15-0.2 μs。对纯 ETL pipeline 累积 throughput **× 2-3**。
+
+**工程量**：M（3-5 周）。Trace 记录只需要 instrument 入口 + 几个 hot ops（`LoadField*`, `Call`, `BitAnd` 等）；二轮 codegen 复用 v5-β 的 cranelift backend；guard 失败 deoptimization 走 cranelift trap → host Rust fallback。
+
+**不是 trace JIT**：v6-α 是离线 specialization（profile → recompile，写入 AOT cache），不是 runtime recording。简洁、debuggable、且 cache 命中后零额外开销。
+
+### v6-β：polymorphic inline cache (PIC) for method dispatch
+
+**改动**：当前 `s.upper()` / `xs.length()` 等 method 调用通过 `stdlib_method_index(receiver_ty, name)` 静态查表 + indirect call。如果 receiver type 在运行时单态（绝大多数 Relon 程序如此），cranelift 出的 indirect call 还是要走 vtable load + jmp。PIC：在 call site 缓存最近 N 个 receiver type / function pair，hit 时 inline 直接 jmp 跳过 vtable 查表。
+
+**ROI**：stdlib heavy 程序（如 string transform pipeline）warm invoke **-20-30%**。
+
+**工程量**：S-M（2-3 周）。Cranelift 已有 inline-cache primitive (`call_indirect` 配合 `select`)；需要 host-side 维护 cache miss → backfill 逻辑。
+
+### v6-γ：完整 trace JIT（LuaJIT-style）
+
+**改动**：
+
+1. **Hot detection**：在 cranelift 出的 fn entry + back-edge 处 emit increment counter；阈值（如 10）触发 trace mode。
+2. **Trace recording**：执行模式从"跑 cranelift 出的 native"切到 "interpreted with trace recorder"。Recorder 接收每个 Relon IR op 的执行，linearize 成一条 trace（跨 branch 时只记录 taken 分支，未走的分支变 guard）。
+3. **Trace optimization**：Trace IR 上做 constant folding / load forwarding / dead store elim / type specialization / loop invariant code motion。这部分对 Relon IR / cranelift IR 的设计要求最高。
+4. **Trace compilation**：优化后的 trace → cranelift IR → native code。Trace 入口替换 hot function 的 dispatch table。
+5. **Guard / bail-out**：每个 guard 失败时 deopt：跳回原 cranelift code 重新执行该 IR op 的 generic 分支。
+6. **Trace cache + invalidation**：trace 缓存到内存，hot 程度统计；invalidate 时（如 type instability）evict。
+
+**ROI**：hot loop（同 fn 反复跑相同 op chain）**sub-ns/op**。10⁵ 条记录 ETL：1.2 s → ~10 ms。
+
+**工程量**：XL（8-12 周）。LuaJIT 用 ~10000 行 C 实现 trace JIT；我们走 Rust + cranelift，估计 5000-8000 行 + 大量调试。最大风险是 guard 失败 deopt 路径正确性 —— 任何 bug 会导致 trace 出错误结果或 panic。
+
+**Sandbox**：trace 模式跑的也是 cranelift 出的 native code，沿用 v5-β 的 4 项 sandbox 实现。guard 失败 bail-out 是 controlled deopt，不破坏 trap handler / capability gating。
+
+### v6 路线累计估算
+
+| 阶段叠加 | warm invoke (single) | hot loop op (10⁵ iters) |
+| --- | ---: | ---: |
+| v5-β / γ 全做完 | 0.3-0.5 μs | ~30-100 ns/op |
+| +v6-α (PGO) | 0.15-0.3 μs | ~10-30 ns/op |
+| +v6-β (PIC) | 同 α | ~5-15 ns/op |
+| **+v6-γ (trace JIT)** | 同 | **~1-5 ns/op** （**LuaJIT trace tier**） |
+
+stream ETL 1M 记录的端到端 throughput 估算（同一 transform 重复）：
+
+| 阶段 | 单条 cost | 1M throughput |
+| --- | ---: | ---: |
+| 当前 (v15 b-5) | 7 μs | 143 K rps |
+| v5-β | 0.3 μs | 3.3 M rps |
+| +v6-α | 0.15 μs | 6.7 M rps |
+| +v6-γ | < 0.01 μs (hot trace) | **> 100 M rps** |
+
+100 M rps 量级在 LuaJIT 同负载实测里也是物理上限，对应 single-core ETL pipeline 用满。
+
+### v6 启动顺序
+
+1. **v6-α (PGO) 先做**：单点 ROI 高 + 工程量小 + 不动 sandbox 模型。3-5 周。
+2. **v6-β (PIC) 随后**：在 α 数据反馈之后决定 —— stdlib heavy workload 占比高就做，否则跳过。
+3. **v6-γ (trace JIT) 最后**：α + β 之后如 hot loop benchmark 仍在 30 ns/op 以上、且 stream ETL 是高优先 use case，启动。否则暂停在 v6-β 也已经对齐 LuaJIT 大部分场景。
+
+### 并行机会
+
+v6-α 和 v6-β 改动文件无 overlap（α 在 profile + AOT cache + 二轮 codegen；β 在 cranelift inline cache infra）。可以并行派两个 agent。v6-γ 必须等 α/β 稳定后串行启动（trace recorder 需要看到 α 的 type 信息 + β 的 PIC 数据来决定哪些 op 值得 trace）。
 
 ### 启动门槛
 
