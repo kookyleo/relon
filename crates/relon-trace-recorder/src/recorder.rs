@@ -162,6 +162,13 @@ impl RecorderState {
         self.aborted.is_some()
     }
 
+    /// Returns the sticky abort reason, if any. v6-γ M4 exposes this
+    /// so the IR-walker driver can decide whether to fall back to
+    /// the generic backend immediately or keep trying.
+    pub fn abort_reason(&self) -> Option<AbortReason> {
+        self.aborted
+    }
+
     /// True when the recorder has observed a terminator
     /// (`Op::Return`) and the trace can be finalised.
     pub fn is_terminated(&self) -> bool {

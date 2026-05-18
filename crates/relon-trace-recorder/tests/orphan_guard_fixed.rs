@@ -52,10 +52,7 @@ fn add_overflow_guard_has_matching_site() {
         1,
         "Add(I64) emits exactly one ArithOverflow guard"
     );
-    assert!(matches!(
-        buf.guards[0].kind,
-        GuardKind::ArithOverflow(_)
-    ));
+    assert!(matches!(buf.guards[0].kind, GuardKind::ArithOverflow(_)));
 }
 
 #[test]

@@ -78,6 +78,7 @@ pub mod object_cache_integration;
 pub mod sandbox;
 pub mod schema_cache;
 pub mod trace_install;
+pub mod trace_recording;
 pub mod trap_handler;
 pub mod vtable;
 
@@ -98,3 +99,4 @@ pub use trace_install::{
     reset_jump_helper_call_count, JITedTraceFn, TraceJitError, TraceJitState, HOT_COUNTERS_SYMBOL,
     MAX_FN_ID, RELON_HOT_THRESHOLD,
 };
+pub use trace_recording::{RecordingOutcome, StackCell, TraceRecordingEvaluator};
