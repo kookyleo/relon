@@ -35,6 +35,14 @@ pub fn register_to(ctx: &mut Context) {
     let string_upper: Arc<dyn RelonFunction> = Arc::new(StringUpper);
     let string_lower: Arc<dyn RelonFunction> = Arc::new(StringLower);
     let string_title: Arc<dyn RelonFunction> = Arc::new(StringTitle);
+    // v3++ b-5: Unicode normalization (UAX #15). All four arcs delegate
+    // to `relon_ir::normalization`, the shared algorithm the wasm-AOT
+    // backend also embeds — so both executors stay byte-for-byte in
+    // lock-step against UCD 14.0.0.
+    let string_nfc: Arc<dyn RelonFunction> = Arc::new(StringNfc);
+    let string_nfd: Arc<dyn RelonFunction> = Arc::new(StringNfd);
+    let string_nfkc: Arc<dyn RelonFunction> = Arc::new(StringNfkc);
+    let string_nfkd: Arc<dyn RelonFunction> = Arc::new(StringNfkd);
     let string_contains: Arc<dyn RelonFunction> = Arc::new(StringContains);
     ctx.register_pure_fn("_string_split", Arc::clone(&string_split));
     ctx.register_pure_fn("_string_join", Arc::clone(&string_join));
@@ -42,6 +50,10 @@ pub fn register_to(ctx: &mut Context) {
     ctx.register_pure_fn("_string_upper", Arc::clone(&string_upper));
     ctx.register_pure_fn("_string_lower", Arc::clone(&string_lower));
     ctx.register_pure_fn("_string_title", Arc::clone(&string_title));
+    ctx.register_pure_fn("_string_nfc", Arc::clone(&string_nfc));
+    ctx.register_pure_fn("_string_nfd", Arc::clone(&string_nfd));
+    ctx.register_pure_fn("_string_nfkc", Arc::clone(&string_nfkc));
+    ctx.register_pure_fn("_string_nfkd", Arc::clone(&string_nfkd));
     ctx.register_pure_fn("_string_contains", Arc::clone(&string_contains));
 
     let dict_merge: Arc<dyn RelonFunction> = Arc::new(DictMerge);
@@ -109,6 +121,14 @@ pub fn register_to(ctx: &mut Context) {
     // codepoint of each word, lower-case the rest, and keep
     // combining marks attached to their base cluster.
     ctx.register_pure_method("String", "title", string_title);
+    // v3++ b-5: Unicode normalization forms. Each method delegates to
+    // the shared `relon_ir::normalization` algorithm; the wasm-AOT body
+    // walks the same data tables so backend tests can compare results
+    // byte-for-byte.
+    ctx.register_pure_method("String", "nfc", string_nfc);
+    ctx.register_pure_method("String", "nfd", string_nfd);
+    ctx.register_pure_method("String", "nfkc", string_nfkc);
+    ctx.register_pure_method("String", "nfkd", string_nfkd);
     ctx.register_pure_method("String", "contains", Arc::clone(&string_contains));
     ctx.register_pure_method("String", "len", Arc::clone(&len));
 
@@ -850,6 +870,79 @@ impl RelonFunction for StringTitle {
             at_word_start = false;
         }
         Ok(Value::String(out))
+    }
+}
+
+/// v3++ b-5: Unicode normalization (UAX #15) — Canonical Composition.
+///
+/// Calls into [`relon_ir::normalization::to_nfc`], which shares its
+/// data tables (`NFD_INDEX` / `NFD_POOL` / `CCC_TABLE` /
+/// `COMPOSITION_PAIRS`) with the wasm-AOT backend body in
+/// `crates/relon-ir/src/stdlib.rs`. Both executors therefore see the
+/// same byte-for-byte UCD 14.0.0 data, ensuring no silent drift.
+///
+/// Hangul syllables are decomposed and composed algorithmically per
+/// UAX #15 section 16; the rest of the input runs through the shared
+/// `decompose -> reorder -> compose` pipeline.
+struct StringNfc;
+impl RelonFunction for StringNfc {
+    fn call(
+        &self,
+        args: NativeArgs,
+        range: relon_parser::TokenRange,
+    ) -> Result<Value, RuntimeError> {
+        let args = args.into_positional();
+        expect_arg_count(&args, 1, range)?;
+        let s = expect_string(&args[0], range)?;
+        Ok(Value::String(relon_ir::normalization::to_nfc(s)))
+    }
+}
+
+/// v3++ b-5: Unicode normalization — Canonical Decomposition.
+/// Mirrors the wasm-AOT body; same shared data tables.
+struct StringNfd;
+impl RelonFunction for StringNfd {
+    fn call(
+        &self,
+        args: NativeArgs,
+        range: relon_parser::TokenRange,
+    ) -> Result<Value, RuntimeError> {
+        let args = args.into_positional();
+        expect_arg_count(&args, 1, range)?;
+        let s = expect_string(&args[0], range)?;
+        Ok(Value::String(relon_ir::normalization::to_nfd(s)))
+    }
+}
+
+/// v3++ b-5: Unicode normalization — Compatibility Composition.
+/// Mirrors the wasm-AOT body; same shared data tables.
+struct StringNfkc;
+impl RelonFunction for StringNfkc {
+    fn call(
+        &self,
+        args: NativeArgs,
+        range: relon_parser::TokenRange,
+    ) -> Result<Value, RuntimeError> {
+        let args = args.into_positional();
+        expect_arg_count(&args, 1, range)?;
+        let s = expect_string(&args[0], range)?;
+        Ok(Value::String(relon_ir::normalization::to_nfkc(s)))
+    }
+}
+
+/// v3++ b-5: Unicode normalization — Compatibility Decomposition.
+/// Mirrors the wasm-AOT body; same shared data tables.
+struct StringNfkd;
+impl RelonFunction for StringNfkd {
+    fn call(
+        &self,
+        args: NativeArgs,
+        range: relon_parser::TokenRange,
+    ) -> Result<Value, RuntimeError> {
+        let args = args.into_positional();
+        expect_arg_count(&args, 1, range)?;
+        let s = expect_string(&args[0], range)?;
+        Ok(Value::String(relon_ir::normalization::to_nfkd(s)))
     }
 }
 

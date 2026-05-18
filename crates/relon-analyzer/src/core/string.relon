@@ -12,6 +12,10 @@
     #native upper() -> String
     #native lower() -> String
     #native title() -> String
+    #native nfc() -> String
+    #native nfd() -> String
+    #native nfkc() -> String
+    #native nfkd() -> String
     #native split(sep: String) -> List<String>
     #native replace(from: String, to: String) -> String
     #native contains(sub: String) -> Bool
