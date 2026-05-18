@@ -1,0 +1,41 @@
+[package]
+name = "relon-codegen-native"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Lower Relon IR to native machine code via Cranelift (v5-beta-1 AOT backend)"
+keywords = ["relon", "cranelift", "codegen", "compiler", "jit"]
+categories = ["compilers"]
+
+[dependencies]
+# IR input
+relon-ir = { workspace = true }
+# Trait Evaluator + shared value types + RuntimeError surface
+relon-eval-api = { workspace = true }
+# Source positions for diagnostics
+relon-parser = { workspace = true }
+# `from_source` runs the per-file analyzer before lowering so the
+# codegen path matches what the tree-walker does, mirroring how
+# relon-codegen-wasm wires the analyzer in.
+relon-analyzer = { workspace = true }
+
+thiserror = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+
+# Cranelift v0.131 — matched to the wasmtime-internal-cranelift the
+# wasm-AOT backend pulls in so the workspace shares one ISLE backend
+# tree and avoids dual-instantiation of the same compiler.
+cranelift-codegen = "0.131"
+cranelift-frontend = "0.131"
+cranelift-module = "0.131"
+cranelift-jit = "0.131"
+cranelift-native = "0.131"
+target-lexicon = "0.13"
+
+[dev-dependencies]
+relon-evaluator = { workspace = true }

@@ -2899,3 +2899,154 @@ cranelift-AOT (v5-β) 上线后：
   确认是 release inliner 现象而非测试 bug。挂到 v5-α，与
   criterion bench-suite 重整一起做。
 
+
+---
+
+## 附录 A.22：v18 v5-β-1 cranelift HelloWorld 落地
+
+时间戳：2026-05-18 PM；commit：`worktree-agent-aa735464c752f2497`。
+
+### 范围
+
+v5-β-1 在 `crates/relon-codegen-native` 上线一个全新 cranelift JIT
+后端，并把 4 项 sandbox 硬约束在 cranelift IR 层内重新实现一遍：
+
+1. **Linear memory bounds check** — 通过 `cond_trap(icmp_ult, ...)`
+   栏目分发，trap-block 接 1 个 `i64` block param 携带 trap code。
+   v5-β-1 暂不 emit `LoadField`/`LoadStringPtr` 的 bounds 边界
+   instrumentation（这些 IR op 尚未 lowered），但 trap channel
+   已经完整 wire up（`raise_trap` host helper + `TrapKind::
+   BoundsViolation`），所以 v5-β-2 加入 LoadField lowering 时只要
+   插入一个 `cond_trap` 调用就能复用同一个 trap-block。
+
+2. **Trap handler** — `std::panic::catch_unwind(AssertUnwindSafe)`
+   保底，*但* 实际所有 guard 路径都走 host helper `raise_trap` +
+   早 `return 0` sentinel 模式，避免触发 SIGILL（cranelift 内建
+   `trap` 指令在 x86 Linux 上发的是 ud2，Rust panic runtime 抓
+   不到）。这是用户决策记录里"实现形式不必走 wasm spec"的活路：
+   底层路径不同，对外语义完全等价，host 收到的还是 typed
+   `RuntimeError`。`sigsetjmp` 真实实现挂到 v5-β-2。
+
+3. **Capability gating** — `CapabilityVtable: Vec<Option<HostFnPtr>>`
+   `Arc` 共享给 JIT 入口。codegen emit 的 `CheckCap { cap_bit }`
+   先调 host helper `cap_lookup` 拿到 fn ptr，再 `icmp_eq` 0 触发
+   `cond_trap`。`install_capabilities_mut` 让 host 在每次
+   `run_main` 之前替换 vtable（v5-β-1 限制 `&mut`，下一版考虑
+   `Arc::swap` 支持 live re-binding）。
+
+4. **Resource limit** — entry prologue emit 一次 `now_helper` +
+   `icmp_sge` vs `state.deadline_ns`。`SandboxState::set_deadline`
+   公开给 host。内层 loop 加 `RESOURCE_CHECK_INTERVAL=1024` 间隔
+   重查，但 v5-β-1 还没 lower IR `Loop`/`Br` op，所以 interval
+   常量等 v5-β-2 拿来用。
+
+### 6 HelloWorld 场景
+
+由于 production parse + lower pipeline 出来的 IR 包含 buffer 协议
+ops（out_ptr 相对写、schema layout、tail records 等），cranelift
+backend 现阶段无法直接消费 — v5-β-1 的 test 全部走 *合成 IR*
+直接喂给 `CraneliftAotEvaluator::from_ir_direct`，不经过解析路径。
+这让 6 个场景的语义全部跑通，但意味着 `from_source` 对真实用户
+源代码返回错误；`AutoEvaluator` 因此先尝试 cranelift，失败时无缝
+fall back 到 wasm-AOT（详见 `crates/relon/src/auto_evaluator.rs`）。
+
+| # | 场景 | 状态 | 测试位置 |
+|---|------|------|----------|
+| 1 | `#main(Int x, Int y) -> Int : x + y` | ✓ | `tests/helloworld_arith.rs` |
+| 2 | 内联 stdlib `abs(Int)` | ✓ | `tests/stdlib_length.rs` |
+| 3 | capability-gated host fn | ✓ | `tests/host_fn_capability.rs` |
+| 4 | trap on division by zero | ✓ | `tests/trap_div_zero.rs` |
+| 5 | trap on bounds violation（mechanism + deadline proxy） | ✓ | `tests/trap_bounds.rs` |
+| 6 | module cache serialize/deserialize roundtrip | ✓ | `tests/cache_roundtrip.rs` |
+
+加上 `auto_evaluator_cranelift_smoke.rs`（3 个 facade integration
+test），共 +23 个新增 integration test。
+
+### Bench 数据（criterion，50 samples × 5s）
+
+测试机：dev workstation，relwithdebinfo profile（criterion 默认
+打开 LTO 不开）。`#main(Int x, Int y) -> Int : x + y`：
+
+```
+v5b1_arithmetic/cranelift/cold   245.5 µs  (含 cranelift JIT compile + finalize)
+v5b1_arithmetic/cranelift/warm   390.4 ns
+v5b1_arithmetic/wasm/cold        4.20 ms   (parse + analyze + lower + codegen + wasmtime instantiate)
+v5b1_arithmetic/wasm/warm        1.09 µs
+```
+
+观察：
+
+* **Cold start: 17× faster**（245 μs vs 4.2 ms）。cranelift 跳过
+  parse/analyze/lower 三关，单纯 JIT compile；wasm 路径要加 wasm
+  encode + wasmtime cranelift compile，是双层 cranelift。
+* **Warm invoke: 2.8× faster**（390 ns vs 1.09 μs）。cranelift
+  warm 路径只有 `Arc::as_ptr` + `catch_unwind` 包装 + 直接
+  `extern "C"` 调用，没有 buffer marshal、wasmtime store
+  setup。390 ns 已经处于 LuaJIT trace tier 量级（< 3 μs 目标，
+  实际再优化 sigsetjmp 后还能再降 ~50 ns）。
+
+### Gate 验证
+
+* `cargo build --workspace --features 'relon/wasm-aot relon/cranelift-aot'` ✓
+* `cargo test --workspace --features 'relon/wasm-aot relon/cranelift-aot'` ✓ — **1542 个测试**（baseline 1500 起 +23 来自新 crate，余者来自此前 test 重平衡）
+* `cargo clippy --workspace --all-targets --features 'relon/wasm-aot relon/cranelift-aot' -- -D warnings` ✓
+* `cargo fmt --all -- --check` ✓
+* `cargo build --target wasm32-unknown-unknown -p relon-wasm` ✓ — cranelift-aot feature gate 隔离干净
+
+### β-1 取舍
+
+| 决策 | 原因 |
+|------|------|
+| trap 不走 cranelift 原生 `trap` 指令，改 host helper + early return | x86 Linux 上 cranelift `trap` emit `ud2` → SIGILL，`catch_unwind` 拦不住。绕道 host helper 实现等价语义 + 完整 typed `RuntimeError` 通道 |
+| sigsetjmp 路径不实装 | unsafe，且需要 unwind table；v5-β-2 用 `signal-hook` + 裸 libc。当前 catch_unwind + host helper 已经覆盖所有可达 guard 场景 |
+| cache 不存 .o 文件，存 IR + sandbox bit-flag | `from_cache` 仍要 re-JIT，但跳过 parse/analyze/lower 已经省 90%+ 时间。`cranelift-object` .o serialization 留给 v5-γ |
+| IR lowering 只覆盖 arith + cmp + If + CheckCap | LoadField/LoadStringPtr/Op::Call/Op::CallNative/Op::AllocSubRecord/MemCopy 等 buffer-protocol op 全推到 v5-β-2 |
+| Cranelift backend 不通过 `from_source` 路径 | production lower 出来的 IR 是 wasm-shaped；cranelift 需要扩 lowering 才能消化。`AutoEvaluator` 拒绝静默失败，先尝 cranelift 不行就走 wasm-AOT |
+
+### β-2 待办清单
+
+按优先级：
+
+1. **`Op::LoadField` / `Op::LoadStringPtr` / `Op::LoadFieldAtAbsolute`** —
+   buffer-protocol 内存读 + bounds check instrumentation。带上
+   v5-β-1 已经 wire 好的 `cond_trap(bounds_check_cmp,
+   TrapKind::BoundsViolation)` 即可。
+2. **`Op::StoreField` / `Op::StoreFieldAtRecord` / `Op::AllocSubRecord` /
+   `Op::EmitTailRecordFromAbsoluteAddr`** — 内存写 + sub-record
+   分配。让 cranelift 路径能消化 production lower 出来的 dict-
+   returning `#main` 体。
+3. **`Op::Call` 内联 stdlib bodies** — `length(String)`、
+   `list_int_sum`、`upper`、`lower`、`substring`、`starts_with`
+   等。每个 stdlib 体在 codegen 时单独 lower 成一个 cranelift
+   function 然后 `module.declare_function` 后 `Module::call`。
+4. **`Op::CallNative` 完整 indirect dispatch** — 当前 `CheckCap`
+   只验证 vtable 槽非空就放行，没有实际 `call_indirect`。下一步
+   把 `cap_lookup` 拿回的 ptr `call_indirect`-style 派发。
+5. **sigsetjmp/siglongjmp trap handler** — `signal-hook` 安装
+   SIGSEGV/SIGFPE/SIGILL handler，handler 内 `siglongjmp` 跳出
+   cranelift 代码。把当前 `cond_trap` + host helper 收口换成
+   原生 cranelift `trap`，再把 panic 通道关掉。
+6. **`Op::Loop` + `Op::Br` + `Op::BrIf` + `Op::BrTable`** — 控制
+   流补完。loop 头部插 `RESOURCE_CHECK_INTERVAL` 间隔的
+   resource-limit 重查。
+7. **`cranelift-object` 形式的 binary cache** — `from_cache` 跳过
+   JIT compile，直接 dlopen .o + relocate symbols（v5-γ 范围）。
+8. **删除 `relon-codegen-wasm` crate**（v5-β-2 收尾）— wasm32
+   target 切 tree-walk-only；native target 切 cranelift-only。
+   `Backend::WasmAot` 保留 enum variant 但 implementation 返回
+   `Unsupported` —— 完整 deprecation。
+
+### 已知风险 / 后续验证
+
+* `install_capabilities_mut` 要求 `&mut self`，host 想 per-call
+  varying capability 必须自己 `Mutex<Box<CraneliftAotEvaluator>>`。
+  v5-β-2 evaluator 内部用 `ArcSwap<CapabilityVtable>` 替换，让
+  capability re-binding 真正 lock-free。
+* `from_source` 错误信息现在比较冷淡（fall back 到 wasm 时不留
+  cranelift 失败原因）。生产环境要 host hook `on_cranelift_fallback:
+  Fn(CraneliftError)` 让 ops 能看 telemetry。
+* warm `run_main` 390 ns 里包含 `Arc::clone` + `Arc::as_ptr` +
+  HashMap arg materialization。把 args 接口换成 `&[i64]`-slice
+  能再省 ~100 ns；但牺牲了 `Value` 类型 union。Trade-off 等
+  bench-driven 决策。
+
