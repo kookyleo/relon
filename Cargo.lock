@@ -1983,6 +1983,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "relon-trace-recorder"
+version = "0.1.0"
+dependencies = [
+ "ordered-float",
+ "relon-eval-api",
+ "relon-ir",
+ "relon-trace-jit",
+]
+
+[[package]]
 name = "relon-wasm"
 version = "0.1.0"
 dependencies = [
