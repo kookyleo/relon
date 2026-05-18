@@ -60,3 +60,54 @@ fn observed_type_and_effect_class_are_shared() {
         TypeId::of::<abi::EffectClass>()
     );
 }
+
+#[test]
+fn trace_context_layout_pins_ssa_slots_first() {
+    use relon_trace_jit::TraceContext;
+
+    // The emitter assumes `ssa_slots` is at byte offset 0 and
+    // `result_slot` follows immediately after the Box fat pointer
+    // (16 bytes on every supported target). v6-γ M2+ codegen relies
+    // on this invariant; if a reviewer reorders the trace-abi struct
+    // this test fires before any IR is emitted.
+    let ctx = TraceContext::with_capacity(4);
+    let base = (&ctx as *const TraceContext) as usize;
+    let ssa_slots_addr = (&ctx.ssa_slots as *const _) as usize;
+    let result_slot_addr = (&ctx.result_slot as *const _) as usize;
+    assert_eq!(
+        ssa_slots_addr - base,
+        0,
+        "ssa_slots must be at offset 0 (zero-offset load in hot path)"
+    );
+    assert_eq!(
+        result_slot_addr - base,
+        16,
+        "result_slot must follow the Box<[u64]> fat pointer at byte 16"
+    );
+}
+
+#[test]
+fn deopt_snapshot_apply_round_trips_through_trace_abi() {
+    // Exercise the shared `DeoptStateSnapshot::apply(&mut TraceContext)`
+    // path that lives in `relon-trace-abi` now. This pins the API
+    // surface so subsequent v6-γ milestones don't accidentally fork it
+    // back into trace-jit-private code.
+    use relon_trace_jit::{DeoptStateSnapshot, RecoverableWriteRecord, TraceContext};
+
+    let mut ctx = TraceContext::with_capacity(3);
+    ctx.ssa_slots[0] = 1;
+    ctx.ssa_slots[1] = 2;
+    ctx.ssa_slots[2] = 3;
+
+    let snap = DeoptStateSnapshot {
+        guard_pc: 4,
+        external_pc: 0x5000,
+        ssa_slots_copy: vec![100u64, 200, 300].into_boxed_slice(),
+        recoverable_writes: Vec::<RecoverableWriteRecord>::new(),
+    };
+    // SAFETY: empty recoverable_writes => no raw memory writes.
+    unsafe {
+        snap.apply(&mut ctx);
+    }
+    assert_eq!(&*ctx.ssa_slots, &[100u64, 200, 300]);
+}
