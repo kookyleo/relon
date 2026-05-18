@@ -71,7 +71,7 @@
 #![allow(unused_assignments)]
 
 pub mod cache;
-mod codegen;
+pub(crate) mod codegen;
 pub mod error;
 pub mod evaluator;
 pub mod object_cache_integration;
@@ -83,8 +83,8 @@ pub use cache::{deserialize as deserialize_cache, serialize as serialize_cache, 
 pub use error::CraneliftError;
 pub use evaluator::CraneliftAotEvaluator;
 pub use object_cache_integration::{
-    compute_source_hash, default_cache_dir, host_target_triple, ir_cache_path_for, LoadedCache,
-    GENERATOR_VERSION,
+    compute_source_hash, default_cache_dir, emit_module_object_bytes, host_target_triple,
+    ir_cache_path_for, LoadedCache, GENERATOR_VERSION,
 };
 pub use sandbox::{
     CapabilityVtable, HostFnPtr, SandboxConfig, SandboxState, TrapKind, STATE_OFFSET_ARENA_BASE,

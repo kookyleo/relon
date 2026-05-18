@@ -599,7 +599,199 @@ pub fn compile_module_with(
     let jit_builder = JITBuilder::with_isa(isa.clone(), cranelift_module::default_libcall_names());
     let mut module = JITModule::new(jit_builder);
 
-    let vtable_data_id = declare_vtable_data(&mut module)?;
+    let LoweredArtifacts {
+        entry_fn_id,
+        vtable_data_id,
+        closure_func_ids,
+    } = lower_module_into(
+        &mut module,
+        ir,
+        entry,
+        entry_shape,
+        sandbox,
+        return_root_size,
+        &const_pool,
+    )?;
+
+    module
+        .finalize_definitions()
+        .map_err(|e| CraneliftError::ModuleDefine(format!("finalize: {e}")))?;
+
+    Ok(CompiledModule {
+        module,
+        entry_fn_id,
+        entry_arity: entry.params.len(),
+        entry_range: entry.range,
+        entry_shape,
+        const_data: const_pool.bytes,
+        closure_func_ids,
+        vtable_data_id,
+    })
+}
+
+/// Output of [`compile_module_to_object_bytes`].
+pub struct ObjectArtifact {
+    /// ET_REL ELF bytes ready for `relon-object-link::link_to_dyn`.
+    pub et_rel_bytes: Vec<u8>,
+    /// Entry shape detected from the IR — the loader uses this to
+    /// pick the right calling-convention shim.
+    pub entry_shape: EntryShape,
+    /// Entry arity (number of IR-declared `#main` params; doesn't
+    /// count the implicit sandbox-state pointer).
+    pub entry_arity: usize,
+    /// Source range of the lowered `#main` directive — used by the
+    /// runtime to attach trap diagnostics.
+    pub entry_range: relon_parser::TokenRange,
+    /// Const-data bytes the entry references through `ConstString` /
+    /// `ConstList*`. The host trampoline copies these into the arena
+    /// prefix before each invocation (identical to the JIT path).
+    pub const_data: Vec<u8>,
+    /// Symbol name the host `dlsym`s to find the entry function. The
+    /// `lower_module_into` driver always declares this as
+    /// `Linkage::Export run_main`.
+    pub entry_symbol: &'static str,
+    /// Symbol name the host `dlsym`s to find the capability vtable
+    /// data slot. The host writes its function pointers into the
+    /// vtable after `dlopen` returns.
+    pub vtable_symbol: &'static str,
+    /// `__closure_<N>` symbol names paired with their original IR
+    /// `closure_table` index. The host `dlsym`s each one after
+    /// `dlopen` so `SandboxState::closure_table_base` resolves to the
+    /// loaded ET_DYN's function pointers.
+    pub closure_symbols: Vec<String>,
+}
+
+/// v5-γ stage 2: emit the full module via `cranelift-object` for the
+/// dlopen-execution cache path. Mirrors [`compile_module_with`] but
+/// targets a `cranelift_object::ObjectModule` so the output is an
+/// ET_REL ready for `relon-object-link::link_to_dyn`. The dlopen'd
+/// ET_DYN imports only the [`crate::vtable::VTABLE_SYMBOL`] data
+/// slot; every host helper call indirects through that table.
+pub fn compile_module_to_object_bytes(
+    ir: &IrModule,
+    sandbox: &SandboxConfig,
+    return_root_size: u32,
+) -> Result<ObjectArtifact, CraneliftError> {
+    use cranelift_object::{ObjectBuilder, ObjectModule};
+
+    let entry_idx = ir
+        .entry_func_index
+        .ok_or_else(|| CraneliftError::Codegen("module has no entry function".into()))?;
+    let entry = &ir.funcs[entry_idx];
+    let const_pool = ConstPool::from_module(ir)?;
+
+    let entry_shape = if is_buffer_protocol_signature(&entry.params, entry.ret) {
+        EntryShape::BufferProtocol
+    } else {
+        for (i, param) in entry.params.iter().enumerate() {
+            if !matches!(param, IrType::I64) {
+                return Err(CraneliftError::UnsupportedSignature(format!(
+                    "cranelift-native: param #{i} is {param:?} (expected I64 or buffer-protocol shape)"
+                )));
+            }
+        }
+        if !matches!(entry.ret, IrType::I64) {
+            return Err(CraneliftError::UnsupportedSignature(format!(
+                "cranelift-native: return is {:?} (expected I64 or buffer-protocol I32)",
+                entry.ret
+            )));
+        }
+        EntryShape::LegacyI64Args
+    };
+
+    // `is_pic = true` is required for ELF SHARED objects — the dynamic
+    // linker `ld.so` refuses to load non-PIC `.so` files. The verifier
+    // stays on in debug builds for the same reason as the JIT path.
+    let mut flag_builder = settings::builder();
+    flag_builder
+        .set("is_pic", "true")
+        .map_err(|e| CraneliftError::JitSetup(format!("is_pic flag: {e}")))?;
+    flag_builder
+        .set("opt_level", "speed")
+        .map_err(|e| CraneliftError::JitSetup(format!("opt_level flag: {e}")))?;
+    #[cfg(debug_assertions)]
+    flag_builder
+        .set("enable_verifier", "true")
+        .map_err(|e| CraneliftError::JitSetup(format!("enable_verifier flag: {e}")))?;
+    let flags = settings::Flags::new(flag_builder);
+
+    let isa_builder = cranelift_native::builder()
+        .map_err(|e| CraneliftError::HostTarget(format!("cranelift-native: {e}")))?;
+    let isa = isa_builder
+        .finish(flags)
+        .map_err(|e| CraneliftError::JitSetup(format!("isa finish: {e}")))?;
+
+    let obj_builder =
+        ObjectBuilder::new(isa, "relon-native-cache", cranelift_module::default_libcall_names())
+            .map_err(|e| CraneliftError::JitSetup(format!("object builder: {e}")))?;
+    let mut module = ObjectModule::new(obj_builder);
+
+    let LoweredArtifacts {
+        entry_fn_id: _,
+        vtable_data_id: _,
+        closure_func_ids,
+    } = lower_module_into(
+        &mut module,
+        ir,
+        entry,
+        entry_shape,
+        sandbox,
+        return_root_size,
+        &const_pool,
+    )?;
+
+    // Collect the closure symbol names so the host can `dlsym` each
+    // after `dlopen`. The lambda declarations inside
+    // `lower_module_into` use the deterministic `__closure_<N>` name
+    // scheme; we just regenerate the list here so the loader doesn't
+    // have to parse the ET_DYN's `.dynsym` table.
+    let closure_symbols = (0..closure_func_ids.len())
+        .map(|i| format!("__closure_{i}"))
+        .collect::<Vec<_>>();
+
+    let product = module.finish();
+    let et_rel_bytes = product
+        .emit()
+        .map_err(|e| CraneliftError::Codegen(format!("object emit: {e}")))?;
+
+    Ok(ObjectArtifact {
+        et_rel_bytes,
+        entry_shape,
+        entry_arity: entry.params.len(),
+        entry_range: entry.range,
+        const_data: const_pool.bytes,
+        entry_symbol: "run_main",
+        vtable_symbol: VTABLE_SYMBOL,
+        closure_symbols,
+    })
+}
+
+/// Artefacts returned by [`lower_module_into`]. The caller owns the
+/// `Module`-flavoured finalize step (`JITModule::finalize_definitions`
+/// vs `ObjectModule::finish().emit()`) so this struct only carries
+/// the IDs the runtime resolves post-finalize.
+struct LoweredArtifacts {
+    entry_fn_id: cranelift_module::FuncId,
+    vtable_data_id: DataId,
+    closure_func_ids: Vec<cranelift_module::FuncId>,
+}
+
+/// v5-γ stage 2: shared lowering pass for both `JITModule` (live
+/// in-process JIT) and `ObjectModule` (cranelift-object emit ->
+/// dlopen). Declares the vtable data symbol, the entry function, and
+/// every closure-table lambda; lowers each body via the same
+/// [`Codegen`] state machine; defines the cranelift IR into the
+/// module. The caller drives the per-backend finalize step.
+fn lower_module_into<M: CrModule>(
+    module: &mut M,
+    ir: &IrModule,
+    entry: &relon_ir::ir::Func,
+    entry_shape: EntryShape,
+    sandbox: &SandboxConfig,
+    return_root_size: u32,
+    const_pool: &ConstPool,
+) -> Result<LoweredArtifacts, CraneliftError> {
+    let vtable_data_id = declare_vtable_data(module)?;
 
     // Pre-compute the three host-fn signatures the codegen indirects
     // through. The signatures match the slot ABI documented in
@@ -903,19 +1095,10 @@ pub fn compile_module_with(
             .map_err(|e| CraneliftError::ModuleDefine(format!("define __closure_{slot}: {e}")))?;
     }
 
-    module
-        .finalize_definitions()
-        .map_err(|e| CraneliftError::ModuleDefine(format!("finalize: {e}")))?;
-
-    Ok(CompiledModule {
-        module,
+    Ok(LoweredArtifacts {
         entry_fn_id,
-        entry_arity: entry.params.len(),
-        entry_range: entry.range,
-        entry_shape,
-        const_data: const_pool.bytes,
-        closure_func_ids,
         vtable_data_id,
+        closure_func_ids,
     })
 }
 

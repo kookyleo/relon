@@ -338,12 +338,18 @@ impl CraneliftAotEvaluator {
         };
 
         // 2. Emit ET_REL bytes via cranelift-object for the dlopen-
-        // load half. Failure here skips just the object cache; the
-        // IR cache still goes through so the fast-restore path
-        // remains useful on next cold start.
+        // load half. v5-γ stage 2 lowers the **full** module (not the
+        // stage 1 stub) so the dlopen path can execute real compiled
+        // code. Failure here skips just the object cache; the IR
+        // cache still goes through so the fast-restore path remains
+        // useful on next cold start.
         let metadata = Self::expected_metadata_for_source(source, sandbox);
-        let et_rel_bytes = match cache_int::emit_entry_stub_object() {
-            Ok(b) => b,
+        // Synthesise the same `return_root_size` the JIT path uses so
+        // pointer-indirect-returning bodies emit identical
+        // `bytes_written` epilogues in both backends.
+        let return_root_size = Self::return_root_size_for_source(source).unwrap_or(0);
+        let artifact = match cache_int::emit_module_object_bytes(ir_module, sandbox, return_root_size) {
+            Ok(a) => a,
             Err(e) => {
                 tracing::warn!(
                     target: "relon::object_cache",
@@ -362,7 +368,7 @@ impl CraneliftAotEvaluator {
         if let Err(e) = cache_int::try_store_to_cache(
             cache_dir,
             source_hash,
-            &et_rel_bytes,
+            &artifact.et_rel_bytes,
             &metadata,
             &ir_bytes,
         ) {
@@ -371,6 +377,21 @@ impl CraneliftAotEvaluator {
                 "cache write returned unexpected error: {e}"
             );
         }
+    }
+
+    /// Lift `lower_workspace_single` for the cache-write side so the
+    /// `return_root_size` fed to `emit_module_object_bytes` matches
+    /// the JIT path's. Returns `None` when the source fails to lower
+    /// — the caller falls back to the IR-only cache write.
+    fn return_root_size_for_source(source: &str) -> Option<u32> {
+        let ast = relon_parser::parse_document(source).ok()?;
+        let analyzed = relon_analyzer::analyze(&ast);
+        if analyzed.has_errors() {
+            return None;
+        }
+        let lowered = relon_ir::lower_workspace_single(&analyzed, &ast).ok()?;
+        let return_layout = SchemaLayout::offsets_for(&lowered.return_schema).ok()?;
+        Some(return_layout.root_size as u32)
     }
 
     /// Fallback path: persist just the IR-cache half when the
