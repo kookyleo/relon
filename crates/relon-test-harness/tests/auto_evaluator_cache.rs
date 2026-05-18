@@ -20,10 +20,7 @@ use relon_test_harness::corpus::all_cases;
 /// Compare two `relon_eval_api::Value`s for bit-identical equality.
 /// Mirrors the helper in `relon_test_harness::lib::value_bit_eq` so
 /// the differential ignores HashMap iteration order for `Dict`s.
-fn value_bit_eq(
-    a: &relon_eval_api::Value,
-    b: &relon_eval_api::Value,
-) -> bool {
+fn value_bit_eq(a: &relon_eval_api::Value, b: &relon_eval_api::Value) -> bool {
     relon_test_harness::value_bit_eq(a, b)
 }
 
@@ -80,10 +77,7 @@ fn corpus_round_trips_through_cache_hit_path() {
         let auto_first = match new_evaluator(case.source, Backend::Auto) {
             Ok(ev) => ev,
             Err(e) => {
-                failures.push((
-                    case.name.to_string(),
-                    format!("first new_evaluator: {e}"),
-                ));
+                failures.push((case.name.to_string(), format!("first new_evaluator: {e}")));
                 continue;
             }
         };
@@ -95,10 +89,7 @@ fn corpus_round_trips_through_cache_hit_path() {
         let auto_second = match new_evaluator(case.source, Backend::Auto) {
             Ok(ev) => ev,
             Err(e) => {
-                failures.push((
-                    case.name.to_string(),
-                    format!("second new_evaluator: {e}"),
-                ));
+                failures.push((case.name.to_string(), format!("second new_evaluator: {e}")));
                 continue;
             }
         };
@@ -161,7 +152,10 @@ fn corpus_round_trips_through_cache_hit_path() {
         for (name, msg) in &failures {
             eprintln!("[auto-cache] FAIL {name}: {msg}");
         }
-        panic!("{} cases drifted between first and second invoke", failures.len());
+        panic!(
+            "{} cases drifted between first and second invoke",
+            failures.len()
+        );
     }
 }
 

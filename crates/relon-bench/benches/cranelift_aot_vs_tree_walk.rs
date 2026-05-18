@@ -190,8 +190,8 @@ fn bench_cached_cold_start(c: &mut Criterion) {
     // Pre-warm: drive `from_source_with_cache` once to populate
     // the cache pair. The first call's time is *not* measured —
     // this bench is about the *cached* cold-start path.
-    let warm = CraneliftAotEvaluator::from_source_with_cache(src, cache_root.path())
-        .expect("pre-warm");
+    let warm =
+        CraneliftAotEvaluator::from_source_with_cache(src, cache_root.path()).expect("pre-warm");
     drop(warm);
 
     group.bench_function(BenchmarkId::new("cranelift_cached", "cold"), |b| {
