@@ -1975,6 +1975,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "relon-trace-emitter"
+version = "0.1.0"
+dependencies = [
+ "cranelift-codegen",
+ "cranelift-frontend",
+ "relon-trace-jit",
+]
+
+[[package]]
 name = "relon-trace-jit"
 version = "0.1.0"
 dependencies = [

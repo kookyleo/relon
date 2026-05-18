@@ -1,0 +1,36 @@
+[package]
+name = "relon-trace-emitter"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "v6-gamma trace JIT emitter: lowers OptimizedTrace's TraceOp stream into cranelift IR Functions ready for the host backend to compile + install (pre-integration)."
+keywords = ["relon", "trace", "jit", "cranelift", "emitter"]
+categories = ["compilers"]
+
+# This crate is the third piece of the v6-gamma trace JIT (after
+# `relon-trace-jit` scaffolding + `relon-trace-recorder`). It owns the
+# `OptimizedTrace -> cranelift::ir::Function` translation, including
+# guard / deopt block emission and the cross-boundary trace entry ABI.
+#
+# Dependencies are intentionally narrow: we only need the
+# `relon-trace-jit` data structures and cranelift's frontend + codegen
+# (matched to the version `relon-codegen-native` uses so the workspace
+# shares one ISLE backend tree). The recorder is *not* a dependency —
+# this crate consumes the already-optimised trace, not the recording
+# pipeline.
+[dependencies]
+relon-trace-jit = { workspace = true }
+
+# Cranelift v0.131 — kept in lock-step with relon-codegen-native so we
+# don't dual-instantiate the same backend in a downstream binary.
+cranelift-codegen = "0.131"
+cranelift-frontend = "0.131"
+
+[dev-dependencies]
+# Tests roundtrip ops through the emitter and then run cranelift's
+# function-level verifier on the produced IR. No JIT compilation +
+# execution happens here — that lives in the v6-gamma integration
+# phase, where the host's backend module + ISA handles installation.

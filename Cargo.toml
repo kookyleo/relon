@@ -46,6 +46,7 @@ relon-codegen-wasm = { path = "crates/relon-codegen-wasm", version = "0.1.0" }
 relon-codegen-native = { path = "crates/relon-codegen-native", version = "0.1.0" }
 relon-trace-jit = { path = "crates/relon-trace-jit", version = "0.1.0" }
 relon-trace-recorder = { path = "crates/relon-trace-recorder", version = "0.1.0" }
+relon-trace-emitter = { path = "crates/relon-trace-emitter", version = "0.1.0" }
 relon-lsp = { path = "crates/relon-lsp", version = "0.1.0" }
 relon-wasm = { path = "crates/relon-wasm", version = "0.1.0" }
 relon-test-harness = { path = "crates/relon-test-harness", version = "0.1.0" }
