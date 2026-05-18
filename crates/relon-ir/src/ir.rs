@@ -1282,6 +1282,59 @@ pub enum Op {
     /// Only the bundled `nfc` / `nfkc` stdlib bodies reference this
     /// op.
     CompositionTableAddr,
+
+    /// v3++ b-6 full Unicode case folding (UAX #21) primitive.
+    ///
+    /// Push the absolute wasm-memory address of the embedded FULL
+    /// multi-codepoint upper or lower folding table. Stack effect:
+    /// `[] -> [i32]`. Codegen lowers to `i32.const <table_addr>`
+    /// where the layout is
+    /// `[count: u32 LE][(input_cp: u32, out0: u32, out1: u32, out2: u32, out_len: u32) × count]`
+    /// — 20 bytes per entry so the runtime helper can rebase against
+    /// `table_addr + 4 + mid * 20`. The output codepoints are
+    /// inlined (max 3 per UAX #21) so the helper avoids a
+    /// payload-pool indirection.
+    ///
+    /// Used by `upper` / `lower` / `title` / `upper_locale` /
+    /// `lower_locale` / `title_locale` for the multi-codepoint cases
+    /// (`ß` -> `SS`, `ﬁ` -> `FI`, `İ` -> `i` + combining-dot-above, …).
+    /// Simple 1:1 mappings stay with `Op::CaseFoldTableAddr`.
+    FullCaseFoldTableAddr {
+        /// `true` selects the FULL upper mapping table; `false`
+        /// selects the FULL lower table.
+        upper: bool,
+    },
+
+    /// v3++ b-6 cased / case-ignorable property primitive.
+    ///
+    /// Push the absolute wasm-memory address of the UCD Cased ranges
+    /// table. Stack effect: `[] -> [i32]`. Layout matches the
+    /// combining-mark range tables — `[count: u32 LE][(start: u32,
+    /// end: u32) × count]` — so the runtime helper reuses the
+    /// `table_addr + 4 + mid * 8` rebase arithmetic.
+    ///
+    /// Used by the final-sigma right-scan inside the `lower` body to
+    /// decide whether `Σ` (U+03A3) maps to `ς` (word-final) or `σ`
+    /// (otherwise).
+    CasedRangesAddr,
+
+    /// v3++ b-6 case-ignorable range primitive. Mirrors
+    /// [`Op::CasedRangesAddr`]; layout and rebase arithmetic match.
+    CaseIgnorableRangesAddr,
+
+    /// v3++ b-6 locale-specific override primitive.
+    ///
+    /// Push the absolute wasm-memory address of the Turkish /
+    /// Azerbaijani upper or lower folding override table. Stack
+    /// effect: `[] -> [i32]`. Layout matches
+    /// [`Op::FullCaseFoldTableAddr`]; the locale-aware stdlib bodies
+    /// consult this table before falling back to the default FULL /
+    /// SIMPLE chain.
+    TurkishCaseFoldTableAddr {
+        /// `true` selects the Turkish upper table; `false` selects
+        /// the Turkish lower table.
+        upper: bool,
+    },
 }
 
 /// Phase 10-a closure-capture record. One per captured variable on a

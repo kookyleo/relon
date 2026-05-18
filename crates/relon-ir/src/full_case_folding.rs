@@ -191,10 +191,7 @@ pub fn turkish_lower_entry(cp: u32) -> Option<(u8, [u32; 3])> {
     entry_for(TURKISH_LOWER_FOLDING, cp)
 }
 
-fn entry_for(
-    table: &'static [(u32, u32, u32, u32, u8)],
-    cp: u32,
-) -> Option<(u8, [u32; 3])> {
+fn entry_for(table: &'static [(u32, u32, u32, u32, u8)], cp: u32) -> Option<(u8, [u32; 3])> {
     let idx = table.binary_search_by_key(&cp, |&(k, _, _, _, _)| k).ok()?;
     let (_, a, b, c, n) = table[idx];
     Some((n, [a, b, c]))
@@ -228,6 +225,26 @@ pub fn encode_full_table_bytes(table: &[(u32, u32, u32, u32, u8)]) -> Vec<u8> {
 /// entry. Codegen uses this to pre-size the data section.
 pub fn encoded_full_table_size(table: &[(u32, u32, u32, u32, u8)]) -> usize {
     4 + table.len() * 20
+}
+
+/// Encode a FULL table into the simple 8-byte stride layout the
+/// `__casefold_lookup` helper expects (one input cp -> one output cp).
+/// Multi-codepoint entries (out_len > 1) emit the FIRST output slot
+/// only — caller-side logic is expected to detect this case via a
+/// parallel `out_len` check, or to use the full 20-byte encoder when
+/// the trailing codepoints matter.
+///
+/// Used by the wasm-AOT locale-aware bodies to share the existing
+/// `__casefold_lookup` helper while still consulting the Turkish
+/// override entries (which today happen to all be 1:1 mappings).
+pub fn encode_simple_view_bytes(table: &[(u32, u32, u32, u32, u8)]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(4 + table.len() * 8);
+    bytes.extend_from_slice(&(table.len() as u32).to_le_bytes());
+    for (k, a, _b, _c, _n) in table {
+        bytes.extend_from_slice(&k.to_le_bytes());
+        bytes.extend_from_slice(&a.to_le_bytes());
+    }
+    bytes
 }
 
 /// Encode a range table (`[count: u32 LE][(start: u32, end: u32) ×
@@ -327,9 +344,7 @@ mod tests {
 
     #[test]
     fn encode_full_table_layout() {
-        let toy: &[(u32, u32, u32, u32, u8)] = &[
-            (0x00DF, 0x0053, 0x0053, 0x0000, 2),
-        ];
+        let toy: &[(u32, u32, u32, u32, u8)] = &[(0x00DF, 0x0053, 0x0053, 0x0000, 2)];
         let bytes = encode_full_table_bytes(toy);
         assert_eq!(bytes.len(), 4 + 20);
         assert_eq!(&bytes[0..4], &1u32.to_le_bytes());

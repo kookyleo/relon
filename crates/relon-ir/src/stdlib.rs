@@ -260,6 +260,14 @@ pub fn builtin_stdlib() -> Vec<StdlibFunction> {
         nfkd_string(),
         nfc_string(),
         nfkc_string(),
+        // v3++ b-6: locale-aware case folding bodies. Each accepts
+        // `(String s, String locale) -> String`; the body parses the
+        // leading two ASCII letters of `locale` and dispatches to the
+        // Turkish / Azerbaijani override table when they match
+        // `tr` / `az` (case-insensitive, BCP-47-ish boundary check).
+        upper_locale_string(),
+        lower_locale_string(),
+        title_locale_string(),
     ]
 }
 
@@ -804,6 +812,36 @@ fn lower_string() -> StdlibFunction {
     case_fold_body("lower", CaseFoldMode::Lower)
 }
 
+/// v3++ b-6 locale-aware variant: `upper_locale(s, locale) -> String`.
+///
+/// Body wraps [`case_fold_body`] with a runtime locale dispatch. When
+/// the second parameter (a `String` holding the locale tag) starts
+/// with `tr` / `TR` / `az` / `AZ`, the per-codepoint fold consults
+/// the Turkish / Azerbaijani override table before falling back to
+/// the default simple folding chain. All other locale values
+/// degenerate to the default UAX #21 behaviour.
+///
+/// The full multi-codepoint Unicode mappings (`ß` -> `SS`, ligatures,
+/// `İ` -> `i\u{0307}`) and the Greek final-sigma context are handled
+/// on the tree-walk evaluator side; the wasm-AOT body keeps the v3+
+/// a-4 simple-folding contract for the moment, with the locale
+/// extension layered on top. See the `crates/relon-evaluator/src/stdlib.rs`
+/// `fold_string` helper for the reference behaviour the wasm-AOT
+/// future-pass aligns with.
+fn upper_locale_string() -> StdlibFunction {
+    locale_aware_case_fold_body("upper_locale", CaseFoldMode::Upper)
+}
+
+/// Mirror of [`upper_locale_string`] for lowercasing.
+fn lower_locale_string() -> StdlibFunction {
+    locale_aware_case_fold_body("lower_locale", CaseFoldMode::Lower)
+}
+
+/// Mirror of [`upper_locale_string`] for title-casing.
+fn title_locale_string() -> StdlibFunction {
+    locale_aware_case_fold_body("title_locale", CaseFoldMode::Title)
+}
+
 /// v3++ b-4 word-boundary aware body for `title(s: String) -> String`.
 ///
 /// Splits the input on Unicode whitespace; the first codepoint of
@@ -886,6 +924,43 @@ fn title_string() -> StdlibFunction {
 // produces a `Vec<TaggedOp>` it appends to by-line.
 #[allow(clippy::vec_init_then_push)]
 pub(crate) fn case_fold_body(name: &'static str, mode: CaseFoldMode) -> StdlibFunction {
+    case_fold_body_inner(name, mode, false)
+}
+
+/// v3++ b-6 locale-aware variant of [`case_fold_body`]. Same single-
+/// codepoint fold pipeline, but the body takes a second `String`
+/// parameter (the locale tag); when the first two bytes match
+/// `tr` / `TR` / `az` / `AZ`, the per-cp lookup first consults the
+/// Turkish / Azerbaijani override table before falling back to the
+/// default simple folding table.
+///
+/// Limitations vs the tree-walk reference (`fold_string` in
+/// `crates/relon-evaluator/src/stdlib.rs`):
+///
+///   * Multi-codepoint outputs (e.g. `ß` -> `SS`, `ﬁ` -> `FI`, the
+///     Turkish `I` -> `i\u{0307}` form) are not yet emitted by the
+///     wasm-AOT body — those cases pass through identity for now.
+///   * Greek final-sigma context (`Σ` -> `ς` vs `σ`) is similarly
+///     deferred on the wasm-AOT side.
+///
+/// Both follow-ups are tracked as v3++ b-6 wasm-AOT items; the
+/// tree-walk evaluator handles them correctly today so functional
+/// tests that exercise those paths pass when run through the host
+/// evaluator.
+#[allow(clippy::vec_init_then_push)]
+pub(crate) fn locale_aware_case_fold_body(
+    name: &'static str,
+    mode: CaseFoldMode,
+) -> StdlibFunction {
+    case_fold_body_inner(name, mode, true)
+}
+
+#[allow(clippy::vec_init_then_push)]
+fn case_fold_body_inner(
+    name: &'static str,
+    mode: CaseFoldMode,
+    locale_aware: bool,
+) -> StdlibFunction {
     const S_LEN: u32 = 0;
     const BASE: u32 = 1;
     const I: u32 = 2;
@@ -910,6 +985,19 @@ pub(crate) fn case_fold_body(name: &'static str, mode: CaseFoldMode) -> StdlibFu
     // current codepoint. Kept in a let-local so the encode step can
     // re-use the same i32 without re-running the binary search.
     const IS_MARK: u32 = 11;
+    // v3++ b-6: locale-aware dispatch flag. `1` when the caller-
+    // supplied locale tag is `tr` / `TR` / `az` / `AZ` (case-
+    // insensitive two-letter prefix matching, with optional `-` /
+    // `_` subtag separator). The per-cp fold consults the Turkish
+    // override table first when this flag is set; otherwise it
+    // shortcircuits straight to the default simple folding table.
+    const IS_TURKISH: u32 = 12;
+    // Scratch for the Turkish-lookup hit detection: we call the
+    // standard `__casefold_lookup` helper against the Turkish table
+    // and stash the result; if the result differs from the input cp
+    // we know we hit the override, otherwise we fall back to the
+    // default table.
+    const TURKISH_RESULT: u32 = 13;
 
     // Helper: load the `i`-th byte of the input payload. Pushes one
     // i32 onto the stack.
@@ -1295,8 +1383,8 @@ pub(crate) fn case_fold_body(name: &'static str, mode: CaseFoldMode) -> StdlibFu
     };
 
     let lookup_through_table = |upper: bool| -> Vec<TaggedOp> {
-        // FOLDED = __casefold_lookup(cp, upper-or-lower-table-addr)
-        vec![
+        // Default path: FOLDED = __casefold_lookup(cp, default-table-addr)
+        let default_seq: Vec<TaggedOp> = vec![
             tt(Op::LetGet {
                 idx: CP,
                 ty: IrType::I32,
@@ -1313,7 +1401,89 @@ pub(crate) fn case_fold_body(name: &'static str, mode: CaseFoldMode) -> StdlibFu
                 ty: IrType::I32,
             }),
             tt(Op::ConstI32(0)),
-        ]
+        ];
+
+        if !locale_aware {
+            return default_seq;
+        }
+
+        // Locale-aware path: when IS_TURKISH == 1, consult the
+        // Turkish / Azerbaijani override table first; on a miss the
+        // helper returns the input cp unchanged, in which case we
+        // fall back to the default table. The detection is purely
+        // arithmetic — the override table never maps a codepoint to
+        // itself, so `result != cp` exactly distinguishes hit from
+        // miss without needing a separate found flag.
+        let mut v: Vec<TaggedOp> = Vec::new();
+        v.push(tt(Op::LetGet {
+            idx: IS_TURKISH,
+            ty: IrType::I32,
+        }));
+        v.push(tt(Op::ConstI32(1)));
+        v.push(tt(Op::Eq(IrType::I32)));
+        v.push(tt(Op::If {
+            result_ty: IrType::I32,
+            then_body: {
+                let mut t: Vec<TaggedOp> = Vec::new();
+                // turkish_result = __casefold_lookup(cp, turkish_addr)
+                t.push(tt(Op::LetGet {
+                    idx: CP,
+                    ty: IrType::I32,
+                }));
+                t.push(tt(Op::TurkishCaseFoldTableAddr { upper }));
+                t.push(tt(Op::Call {
+                    fn_index: casefold_idx,
+                    arg_count: 2,
+                    param_tys: vec![IrType::I32, IrType::I32],
+                    ret_ty: IrType::I32,
+                }));
+                t.push(tt(Op::LetSet {
+                    idx: TURKISH_RESULT,
+                    ty: IrType::I32,
+                }));
+                // if turkish_result != cp { FOLDED = turkish_result }
+                // else { fall through to default lookup }
+                t.push(tt(Op::LetGet {
+                    idx: TURKISH_RESULT,
+                    ty: IrType::I32,
+                }));
+                t.push(tt(Op::LetGet {
+                    idx: CP,
+                    ty: IrType::I32,
+                }));
+                t.push(tt(Op::Eq(IrType::I32)));
+                t.push(tt(Op::If {
+                    result_ty: IrType::I32,
+                    then_body: default_seq.clone(),
+                    else_body: {
+                        let mut inner = Vec::new();
+                        inner.push(tt(Op::LetGet {
+                            idx: TURKISH_RESULT,
+                            ty: IrType::I32,
+                        }));
+                        inner.push(tt(Op::LetSet {
+                            idx: FOLDED,
+                            ty: IrType::I32,
+                        }));
+                        inner.push(tt(Op::ConstI32(0)));
+                        inner
+                    },
+                }));
+                t.push(tt(Op::LetSet {
+                    idx: SINK,
+                    ty: IrType::I32,
+                }));
+                t.push(tt(Op::ConstI32(0)));
+                t
+            },
+            else_body: default_seq,
+        }));
+        v.push(tt(Op::LetSet {
+            idx: SINK,
+            ty: IrType::I32,
+        }));
+        v.push(tt(Op::ConstI32(0)));
+        v
     };
 
     // The `if is_mark == 1 { FOLDED = cp } else { <mode-specific> }`
@@ -1670,6 +1840,189 @@ pub(crate) fn case_fold_body(name: &'static str, mode: CaseFoldMode) -> StdlibFu
         idx: AT_WORD_START,
         ty: IrType::I32,
     }));
+    // v3++ b-6: when the body is locale-aware, decode the leading two
+    // ASCII letters of the locale parameter and set IS_TURKISH to 1
+    // iff they spell `tr`/`TR`/`az`/`AZ` (with optional `-` / `_`
+    // subtag separator after position 2). Empty / single-byte / non-
+    // ASCII locales fall through to IS_TURKISH = 0, matching the
+    // tree-walk evaluator's `is_turkish_locale` helper.
+    if locale_aware {
+        // Default IS_TURKISH = 0; the conditionals below flip to 1
+        // when the locale tag matches.
+        body.push(tt(Op::ConstI32(0)));
+        body.push(tt(Op::LetSet {
+            idx: IS_TURKISH,
+            ty: IrType::I32,
+        }));
+        // locale_len = i32.load(locale_ptr + 0)
+        body.push(tt(Op::LocalGet(1)));
+        body.push(tt(Op::LoadI32AtAbsolute { offset: 0 }));
+        body.push(tt(Op::LetSet {
+            idx: TURKISH_RESULT, /* scratch: locale_len */
+            ty: IrType::I32,
+        }));
+        // if locale_len >= 2 { check first two bytes }
+        body.push(tt(Op::LetGet {
+            idx: TURKISH_RESULT,
+            ty: IrType::I32,
+        }));
+        body.push(tt(Op::ConstI32(2)));
+        body.push(tt(Op::Ge(IrType::I32)));
+        body.push(tt(Op::If {
+            result_ty: IrType::I32,
+            then_body: {
+                let mut t: Vec<TaggedOp> = Vec::new();
+                // Boundary check: when locale_len > 2 the third byte
+                // must be `-` (0x2D) or `_` (0x5F), otherwise the
+                // two-letter prefix is just a prefix of a longer
+                // language code (e.g. `tron`).
+                // boundary_ok = (locale_len == 2) || (byte2 == '-') || (byte2 == '_')
+                t.push(tt(Op::LetGet {
+                    idx: TURKISH_RESULT,
+                    ty: IrType::I32,
+                }));
+                t.push(tt(Op::ConstI32(2)));
+                t.push(tt(Op::Eq(IrType::I32)));
+                t.push(tt(Op::If {
+                    result_ty: IrType::I32,
+                    then_body: vec![tt(Op::ConstI32(1))],
+                    else_body: {
+                        let mut e: Vec<TaggedOp> = Vec::new();
+                        // byte2 = i32.load_u8(locale_ptr + 4 + 2)
+                        e.push(tt(Op::LocalGet(1)));
+                        e.push(tt(Op::ConstI32(6)));
+                        e.push(tt(Op::Add(IrType::I32)));
+                        e.push(tt(Op::LoadI8UAtAbsolute { offset: 0 }));
+                        e.push(tt(Op::LetSet {
+                            idx: B0,
+                            ty: IrType::I32,
+                        }));
+                        // (byte2 == 0x2D) || (byte2 == 0x5F)
+                        // Encoded as (a + b) where a, b ∈ {0, 1} are
+                        // disjoint Eq results — the sum is the OR.
+                        e.push(tt(Op::LetGet {
+                            idx: B0,
+                            ty: IrType::I32,
+                        }));
+                        e.push(tt(Op::ConstI32(0x2D)));
+                        e.push(tt(Op::Eq(IrType::I32)));
+                        e.push(tt(Op::LetGet {
+                            idx: B0,
+                            ty: IrType::I32,
+                        }));
+                        e.push(tt(Op::ConstI32(0x5F)));
+                        e.push(tt(Op::Eq(IrType::I32)));
+                        e.push(tt(Op::Add(IrType::I32)));
+                        e
+                    },
+                }));
+                t.push(tt(Op::LetSet {
+                    idx: B_TMP, /* scratch for boundary_ok */
+                    ty: IrType::I32,
+                }));
+                // Load byte0 and byte1 raw. We compare each against
+                // both lowercase and uppercase forms directly (rather
+                // than normalising via `| 0x20`, since the IR has no
+                // BitOr op today).
+                t.push(tt(Op::LocalGet(1)));
+                t.push(tt(Op::ConstI32(4)));
+                t.push(tt(Op::Add(IrType::I32)));
+                t.push(tt(Op::LoadI8UAtAbsolute { offset: 0 }));
+                t.push(tt(Op::LetSet {
+                    idx: B0,
+                    ty: IrType::I32,
+                }));
+                t.push(tt(Op::LocalGet(1)));
+                t.push(tt(Op::ConstI32(5)));
+                t.push(tt(Op::Add(IrType::I32)));
+                t.push(tt(Op::LoadI8UAtAbsolute { offset: 0 }));
+                t.push(tt(Op::LetSet {
+                    idx: CP,
+                    ty: IrType::I32,
+                }));
+                // is_tr = (b0 == 't' || b0 == 'T') && (b1 == 'r' || b1 == 'R')
+                //
+                // Each clause is an Eq returning 0/1, summed via Add to
+                // emulate OR over disjoint booleans. Then BitAnd
+                // multiplies the two clause results into the final
+                // 0/1 outcome.
+                t.push(tt(Op::LetGet {
+                    idx: B0,
+                    ty: IrType::I32,
+                }));
+                t.push(tt(Op::ConstI32(b't' as i32)));
+                t.push(tt(Op::Eq(IrType::I32)));
+                t.push(tt(Op::LetGet {
+                    idx: B0,
+                    ty: IrType::I32,
+                }));
+                t.push(tt(Op::ConstI32(b'T' as i32)));
+                t.push(tt(Op::Eq(IrType::I32)));
+                t.push(tt(Op::Add(IrType::I32)));
+                t.push(tt(Op::LetGet {
+                    idx: CP,
+                    ty: IrType::I32,
+                }));
+                t.push(tt(Op::ConstI32(b'r' as i32)));
+                t.push(tt(Op::Eq(IrType::I32)));
+                t.push(tt(Op::LetGet {
+                    idx: CP,
+                    ty: IrType::I32,
+                }));
+                t.push(tt(Op::ConstI32(b'R' as i32)));
+                t.push(tt(Op::Eq(IrType::I32)));
+                t.push(tt(Op::Add(IrType::I32)));
+                t.push(tt(Op::BitAnd(IrType::I32)));
+                // is_az = (b0 == 'a' || b0 == 'A') && (b1 == 'z' || b1 == 'Z')
+                t.push(tt(Op::LetGet {
+                    idx: B0,
+                    ty: IrType::I32,
+                }));
+                t.push(tt(Op::ConstI32(b'a' as i32)));
+                t.push(tt(Op::Eq(IrType::I32)));
+                t.push(tt(Op::LetGet {
+                    idx: B0,
+                    ty: IrType::I32,
+                }));
+                t.push(tt(Op::ConstI32(b'A' as i32)));
+                t.push(tt(Op::Eq(IrType::I32)));
+                t.push(tt(Op::Add(IrType::I32)));
+                t.push(tt(Op::LetGet {
+                    idx: CP,
+                    ty: IrType::I32,
+                }));
+                t.push(tt(Op::ConstI32(b'z' as i32)));
+                t.push(tt(Op::Eq(IrType::I32)));
+                t.push(tt(Op::LetGet {
+                    idx: CP,
+                    ty: IrType::I32,
+                }));
+                t.push(tt(Op::ConstI32(b'Z' as i32)));
+                t.push(tt(Op::Eq(IrType::I32)));
+                t.push(tt(Op::Add(IrType::I32)));
+                t.push(tt(Op::BitAnd(IrType::I32)));
+                // is_tr OR is_az — both are {0,1} so Add gives the OR.
+                t.push(tt(Op::Add(IrType::I32)));
+                // (is_tr || is_az) && boundary_ok
+                t.push(tt(Op::LetGet {
+                    idx: B_TMP,
+                    ty: IrType::I32,
+                }));
+                t.push(tt(Op::BitAnd(IrType::I32)));
+                t.push(tt(Op::LetSet {
+                    idx: IS_TURKISH,
+                    ty: IrType::I32,
+                }));
+                t.push(tt(Op::ConstI32(0)));
+                t
+            },
+            else_body: vec![tt(Op::ConstI32(0))],
+        }));
+        body.push(tt(Op::LetSet {
+            idx: SINK,
+            ty: IrType::I32,
+        }));
+    }
     // block { loop { ... } }
     let mut loop_body: Vec<TaggedOp> = Vec::new();
     // exit when i >= s_len
@@ -1726,9 +2079,14 @@ pub(crate) fn case_fold_body(name: &'static str, mode: CaseFoldMode) -> StdlibFu
     }));
     body.push(tt(Op::Return));
 
+    let params = if locale_aware {
+        vec![IrType::String, IrType::String]
+    } else {
+        vec![IrType::String]
+    };
     StdlibFunction {
         name,
-        params: vec![IrType::String],
+        params,
         ret: IrType::String,
         body,
     }
@@ -5172,6 +5530,12 @@ pub fn stdlib_method_index(receiver_ty: IrType, name: &str) -> Option<u32> {
         (IrType::String, "nfd") => stdlib_function_index("nfd"),
         (IrType::String, "nfkc") => stdlib_function_index("nfkc"),
         (IrType::String, "nfkd") => stdlib_function_index("nfkd"),
+        // v3++ b-6: locale-aware case folding. `s.upper_locale("tr")`
+        // and the free-call form `upper_locale(s, "tr")` both route
+        // through the same stdlib body.
+        (IrType::String, "upper_locale") => stdlib_function_index("upper_locale"),
+        (IrType::String, "lower_locale") => stdlib_function_index("lower_locale"),
+        (IrType::String, "title_locale") => stdlib_function_index("title_locale"),
         (IrType::String, "substring") => stdlib_function_index("substring"),
         (IrType::String, "starts_with") => stdlib_function_index("starts_with"),
         (IrType::ListInt, "sum") => stdlib_function_index("list_int_sum"),

@@ -1640,3 +1640,167 @@ mod purity_guard {
         }
     }
 }
+
+#[cfg(test)]
+mod full_case_folding_tests {
+    //! v3++ b-6 tree-walk smoke tests for UAX #21 full case folding.
+    //!
+    //! These cover the three behaviours wired into the host
+    //! `fold_string` helper: unconditional multi-codepoint mappings
+    //! (`ß` -> `SS`, ligatures, `İ` -> `i\u{0307}`), Greek final-sigma
+    //! context (`Σ` -> `ς` vs `σ`), and Turkish / Azerbaijani locale
+    //! overrides (`I` <-> `ı` / `İ` <-> `i`).
+    //!
+    //! The wasm-AOT backend currently provides locale dispatch only;
+    //! multi-cp and final-sigma are deferred there. The same UAX #21
+    //! reference data backs both executors so they will converge once
+    //! the wasm body gains multi-cp output emission.
+
+    use super::{fold_string, CaseFoldMode};
+
+    fn upper(s: &str) -> String {
+        fold_string(s, CaseFoldMode::Upper, false)
+    }
+    fn lower(s: &str) -> String {
+        fold_string(s, CaseFoldMode::Lower, false)
+    }
+    fn title(s: &str) -> String {
+        fold_string(s, CaseFoldMode::Title, false)
+    }
+    fn upper_tr(s: &str) -> String {
+        fold_string(s, CaseFoldMode::Upper, true)
+    }
+    fn lower_tr(s: &str) -> String {
+        fold_string(s, CaseFoldMode::Lower, true)
+    }
+    fn title_tr(s: &str) -> String {
+        fold_string(s, CaseFoldMode::Title, true)
+    }
+
+    // ----- Unconditional multi-codepoint mappings -----
+
+    #[test]
+    fn sharp_s_uppercases_to_ss() {
+        assert_eq!(upper("stra\u{00DF}e"), "STRASSE");
+    }
+
+    #[test]
+    fn fi_ligature_uppercases_to_fi() {
+        assert_eq!(upper("\u{FB01}ne"), "FINE");
+    }
+
+    #[test]
+    fn fl_ligature_uppercases_to_fl() {
+        assert_eq!(upper("\u{FB02}ow"), "FLOW");
+    }
+
+    // ----- Greek final-sigma context -----
+
+    #[test]
+    fn final_sigma_at_word_end_uses_curly_form() {
+        // ΟΔΥΣΣΕΥΣ — last Σ is final, middle Σ are not.
+        // Greek `Υ` (U+03A5) lowercases to `υ` (U+03C5).
+        // The middle "ΣΣ" pair: first sigma is not final (followed by
+        // cased letters), second is also not final.
+        assert_eq!(
+            lower("\u{039F}\u{0394}\u{03A5}\u{03A3}\u{03A3}\u{0395}\u{03A5}\u{03A3}"),
+            "\u{03BF}\u{03B4}\u{03C5}\u{03C3}\u{03C3}\u{03B5}\u{03C5}\u{03C2}"
+        );
+    }
+
+    #[test]
+    fn non_final_sigma_followed_by_cased_letter() {
+        // "ΣΑ" — Σ at index 0 is followed by Α (cased), so it must
+        // lower to σ (non-final).
+        assert_eq!(lower("\u{03A3}\u{0391}"), "\u{03C3}\u{03B1}");
+    }
+
+    #[test]
+    fn isolated_sigma_lowercases_to_curly_when_no_preceding_cased() {
+        // UAX #21: Final_Sigma requires a preceding cased letter. A
+        // standalone Σ has no preceding cased context, so it falls
+        // through to σ (non-final). This matches ICU.
+        assert_eq!(lower("\u{03A3}"), "\u{03C3}");
+    }
+
+    #[test]
+    fn final_sigma_with_intervening_case_ignorable() {
+        // "OΣ'" — apostrophe is case-ignorable, so Σ at index 1 sees
+        // no following cased codepoint and uses the final form.
+        assert_eq!(lower("O\u{03A3}'"), "o\u{03C2}'");
+    }
+
+    // ----- Default Σ / İ behaviour without locale -----
+
+    #[test]
+    fn upper_istanbul_keeps_capital_dotted_i() {
+        // Default upper-case of "İstanbul" preserves U+0130 and
+        // uppercases the rest.
+        assert_eq!(upper("\u{0130}stanbul"), "\u{0130}STANBUL");
+    }
+
+    #[test]
+    fn lower_capital_i_with_dot_decomposes_to_i_plus_combining_dot() {
+        // The unconditional FULL_LOWER entry for U+0130 is the
+        // multi-codepoint `i\u{0307}` form per SpecialCasing.txt.
+        assert_eq!(lower("\u{0130}"), "i\u{0307}");
+    }
+
+    // ----- Turkish / Azerbaijani locale overrides -----
+
+    #[test]
+    fn upper_locale_tr_lowercase_i_to_dotted_i() {
+        assert_eq!(upper_tr("istanbul"), "\u{0130}STANBUL");
+    }
+
+    #[test]
+    fn lower_locale_tr_capital_i_to_dotless() {
+        assert_eq!(lower_tr("ISTANBUL"), "\u{0131}stanbul");
+    }
+
+    #[test]
+    fn lower_locale_default_capital_i_to_lowercase_i() {
+        assert_eq!(lower("I"), "i");
+    }
+
+    #[test]
+    fn title_locale_tr_first_letter_dotted() {
+        assert_eq!(title_tr("istanbul"), "\u{0130}stanbul");
+    }
+
+    // ----- Roundtrip / idempotence -----
+
+    #[test]
+    fn upper_idempotent_on_latin() {
+        let s = "HELLO WORLD";
+        assert_eq!(upper(s), s);
+    }
+
+    #[test]
+    fn lower_idempotent_on_latin() {
+        let s = "hello world";
+        assert_eq!(lower(s), s);
+    }
+
+    #[test]
+    fn title_roundtrip_two_words() {
+        assert_eq!(title("hello world"), "Hello World");
+    }
+
+    // ----- Combining mark handling -----
+
+    #[test]
+    fn combining_mark_does_not_break_word_boundary() {
+        // "cafe\u{0301} bar" — `e\u{0301}` is a single cluster. After
+        // the space, `b` is the new word-start. Tree-walk emits
+        // "Cafe\u{0301} Bar".
+        assert_eq!(title("cafe\u{0301} bar"), "Cafe\u{0301} Bar");
+    }
+
+    #[test]
+    fn combining_mark_after_sigma_does_not_break_final_sigma() {
+        // "OΣ\u{0301}" — combining acute is case-ignorable, so Σ at
+        // index 1 still qualifies as word-final.
+        assert_eq!(lower("O\u{03A3}\u{0301}"), "o\u{03C2}\u{0301}");
+    }
+}
