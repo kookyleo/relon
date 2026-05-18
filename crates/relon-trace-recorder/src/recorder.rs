@@ -156,6 +156,36 @@ impl RecorderState {
         self.next_external_pc = pc;
     }
 
+    /// Emit a branch-direction guard against `cond_ssa`.
+    ///
+    /// v6-γ M5: the trace-recording IR walker decides at recording
+    /// time which arm of an `Op::If` / `Op::Select` to follow. The
+    /// emitter still needs a deopt site for the **other** arm so a
+    /// future invocation with the opposite condition kicks back to
+    /// the generic backend instead of executing recorded-arm code
+    /// against the wrong branch.
+    ///
+    /// `taken_truthy` is informational — both `true` and `false`
+    /// arms get the same `NotNull(cond_ssa)` guard; the recorder
+    /// only follows the taken arm, so the guard's polarity is
+    /// implicit in which path the walker actually recorded.
+    ///
+    /// Returns `None` if the recorder is already aborted / terminated;
+    /// `Some(GuardKind::NotNull(_))` on the happy path.
+    pub fn emit_branch_guard(
+        &mut self,
+        cond_ssa: SsaVar,
+        _taken_truthy: bool,
+    ) -> Option<GuardKind> {
+        if self.aborted.is_some() || self.terminated {
+            return None;
+        }
+        if cond_ssa == SsaVar::NONE {
+            return None;
+        }
+        self.emit_guard(GuardKind::NotNull(cond_ssa))
+    }
+
     /// True when the recorder has accepted an abort decision and is
     /// no longer touching the buffer.
     pub fn is_aborted(&self) -> bool {
@@ -383,6 +413,12 @@ impl RecorderState {
     /// [`RecordResult::NeedsGuard`]; returns `None` when no guard was
     /// emitted (first-seen observation).
     fn maybe_emit_type_guard(&mut self, var: SsaVar, ty: ObservedType) -> Option<GuardKind> {
+        // v6-γ M5 fix: mirror the observation into the buffer's
+        // shared `type_info` table so the emitter's guard predicate
+        // builder can resolve `TypeCheck(var, _)` / `ArithOverflow(var)`
+        // sites. Without this, traces with any TypeCheck-eligible
+        // op fail to install with `EmitError::Guard(MissingTypeInfo)`.
+        self.buffer.record_type(var, ty);
         let prev = self.type_obs.insert(var, ty);
         match classify_observation(prev, ty) {
             TypeObsDecision::FirstSeen => None,
