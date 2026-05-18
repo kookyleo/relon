@@ -889,5 +889,398 @@ mod remote_http {
                 cache.meta_path("https://example.com/util.relon")
             );
         }
+
+        // -------- v3++ b-3: conditional GET tests --------
+        //
+        // The tests below use a scripted in-process HTTP server that
+        // peeks at the request headers (`If-None-Match`,
+        // `If-Modified-Since`) and emits the configured response
+        // (status + optional `ETag` / `Last-Modified` + body). That's
+        // enough to drive the conditional-GET decision tree without
+        // pulling in `hyper` or `mockito`.
+
+        /// One scripted reply. `body_when_full` is the body served on
+        /// 200 responses. 304 responses always have an empty body, as
+        /// per RFC 7232 §4.1.
+        #[derive(Clone)]
+        struct ScriptedReply {
+            status: u16,
+            etag: Option<&'static str>,
+            last_modified: Option<&'static str>,
+            body_when_full: &'static str,
+            /// When `true`, the server obeys conditional-request
+            /// headers: if `If-None-Match` matches `etag` (or
+            /// `If-Modified-Since` matches `last_modified`), the
+            /// response is rewritten to a 304 with no body.
+            honors_conditional: bool,
+        }
+
+        struct ScriptedServer {
+            addr: String,
+            hits: StdArc<AtomicUsize>,
+            last_request_headers: StdArc<std::sync::Mutex<Vec<String>>>,
+            _join: thread::JoinHandle<()>,
+        }
+
+        impl ScriptedServer {
+            fn start(replies: Vec<ScriptedReply>) -> Self {
+                let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+                let addr = listener.local_addr().expect("local_addr").to_string();
+                let hits = StdArc::new(AtomicUsize::new(0));
+                let hits_clone = hits.clone();
+                let last_headers = StdArc::new(std::sync::Mutex::new(Vec::<String>::new()));
+                let last_headers_clone = last_headers.clone();
+                let join = thread::spawn(move || {
+                    for (idx, stream) in listener.incoming().enumerate() {
+                        let mut stream = match stream {
+                            Ok(s) => s,
+                            Err(_) => break,
+                        };
+                        hits_clone.fetch_add(1, Ordering::SeqCst);
+                        use std::io::{Read, Write};
+                        let mut buf = [0u8; 2048];
+                        let read_len = stream.read(&mut buf).unwrap_or(0);
+                        let request = String::from_utf8_lossy(&buf[..read_len]).to_string();
+                        last_headers_clone.lock().unwrap().push(request.clone());
+
+                        let reply = replies.get(idx).cloned().unwrap_or_else(|| {
+                            replies.last().cloned().expect("at least one reply")
+                        });
+
+                        // Conditional-GET emulation: a server that
+                        // honors validators rewrites 200 → 304 when the
+                        // client's validator matches the one this reply
+                        // would have sent.
+                        let mut effective_status = reply.status;
+                        if reply.honors_conditional && reply.status == 200 {
+                            let if_none_match =
+                                extract_header(&request, "if-none-match").map(|s| s.to_string());
+                            let if_modified_since = extract_header(&request, "if-modified-since")
+                                .map(|s| s.to_string());
+                            let etag_matches = matches!(
+                                (if_none_match.as_deref(), reply.etag),
+                                (Some(c), Some(s)) if c.trim() == s.trim()
+                            );
+                            let date_matches = matches!(
+                                (if_modified_since.as_deref(), reply.last_modified),
+                                (Some(c), Some(s)) if c.trim() == s.trim()
+                            );
+                            if etag_matches || date_matches {
+                                effective_status = 304;
+                            }
+                        }
+
+                        let reason = match effective_status {
+                            200 => "OK",
+                            304 => "Not Modified",
+                            500 => "Internal Server Error",
+                            _ => "Status",
+                        };
+                        let body = if effective_status == 304 {
+                            ""
+                        } else {
+                            reply.body_when_full
+                        };
+                        let mut header_block = format!("HTTP/1.1 {effective_status} {reason}\r\n");
+                        if let Some(etag) = reply.etag {
+                            header_block.push_str(&format!("ETag: {etag}\r\n"));
+                        }
+                        if let Some(lm) = reply.last_modified {
+                            header_block.push_str(&format!("Last-Modified: {lm}\r\n"));
+                        }
+                        // A 304 carries no body, and per RFC 7230
+                        // §3.3.2 must not advertise Content-Length
+                        // either when the field would imply a body.
+                        // Origins in the wild send `Content-Length: 0`
+                        // or skip the header — we omit it to keep the
+                        // wire short.
+                        if effective_status != 304 {
+                            header_block.push_str(&format!("Content-Length: {}\r\n", body.len()));
+                        }
+                        header_block.push_str("Connection: close\r\n\r\n");
+                        let mut response_bytes = header_block.into_bytes();
+                        if effective_status != 304 {
+                            response_bytes.extend_from_slice(body.as_bytes());
+                        }
+                        let _ = stream.write_all(&response_bytes);
+                    }
+                });
+                Self {
+                    addr,
+                    hits,
+                    last_request_headers: last_headers,
+                    _join: join,
+                }
+            }
+
+            fn url(&self, path: &str) -> String {
+                format!("http://{}{}", self.addr, path)
+            }
+
+            fn hit_count(&self) -> usize {
+                self.hits.load(Ordering::SeqCst)
+            }
+
+            fn last_request(&self) -> Option<String> {
+                self.last_request_headers.lock().unwrap().last().cloned()
+            }
+        }
+
+        /// Tiny case-insensitive `header: value` extractor. Returns
+        /// the value of the *first* match, trimmed.
+        fn extract_header<'a>(request: &'a str, name: &str) -> Option<&'a str> {
+            for line in request.lines() {
+                if let Some((k, v)) = line.split_once(':') {
+                    if k.trim().eq_ignore_ascii_case(name) {
+                        return Some(v.trim());
+                    }
+                }
+            }
+            None
+        }
+
+        fn zero_ttl_cache(root: &PathBuf) -> RemoteImportCache {
+            // A TTL of zero forces every resolve past the freshness
+            // gate so the conditional-GET branch is exercised on the
+            // very first follow-up call.
+            RemoteImportCache::new(root).with_ttl(Duration::from_secs(0))
+        }
+
+        #[test]
+        fn conditional_get_304_reuses_cache() {
+            let server = ScriptedServer::start(vec![
+                ScriptedReply {
+                    status: 200,
+                    etag: Some("\"abc\""),
+                    last_modified: None,
+                    body_when_full: "{ value: \"v1\" }",
+                    honors_conditional: true,
+                },
+                // Every subsequent request honors the conditional
+                // headers, so the second resolve rewrites itself to
+                // 304 once `If-None-Match: "abc"` lands.
+                ScriptedReply {
+                    status: 200,
+                    etag: Some("\"abc\""),
+                    last_modified: None,
+                    body_when_full: "{ value: \"v1\" }",
+                    honors_conditional: true,
+                },
+            ]);
+
+            let cache_root = temp_cache_dir();
+            let cache = zero_ttl_cache(&cache_root);
+            let resolver = RemoteHttpResolver::with_cache(cache.clone()).allow_insecure(true);
+            let scope = Arc::new(Scope::default());
+            let url = server.url("/util.relon");
+
+            let first = resolver
+                .resolve(&url, &scope, TokenRange::default())
+                .expect("first fetch should succeed")
+                .expect("Some(source)");
+            assert_eq!(first.source, "{ value: \"v1\" }");
+            assert_eq!(server.hit_count(), 1);
+
+            let second = resolver
+                .resolve(&url, &scope, TokenRange::default())
+                .expect("revalidation should succeed")
+                .expect("Some(source)");
+            assert_eq!(
+                second.source, "{ value: \"v1\" }",
+                "304 path must serve the cached body verbatim"
+            );
+            assert_eq!(server.hit_count(), 2, "revalidation still issues a request");
+            let last = server.last_request().expect("captured request");
+            assert!(
+                last.to_ascii_lowercase().contains("if-none-match: \"abc\""),
+                "expected If-None-Match in conditional GET, got:\n{last}"
+            );
+
+            // The 304 must bump `fetched_at` so the next call is now
+            // inside the (zero-second) TTL window only by the slim
+            // race margin — practically the meta has been rewritten.
+            let entry = cache.load(&url).expect("entry must still be cached");
+            assert_eq!(entry.body, "{ value: \"v1\" }");
+            assert_eq!(entry.meta.etag.as_deref(), Some("\"abc\""));
+
+            let _ = std::fs::remove_dir_all(&cache_root);
+        }
+
+        #[test]
+        fn conditional_get_200_replaces_cache() {
+            let server = ScriptedServer::start(vec![
+                ScriptedReply {
+                    status: 200,
+                    etag: Some("\"old\""),
+                    last_modified: None,
+                    body_when_full: "{ value: \"v1\" }",
+                    honors_conditional: false,
+                },
+                ScriptedReply {
+                    status: 200,
+                    etag: Some("\"new\""),
+                    last_modified: None,
+                    body_when_full: "{ value: \"v2\" }",
+                    honors_conditional: false,
+                },
+            ]);
+
+            let cache_root = temp_cache_dir();
+            let cache = zero_ttl_cache(&cache_root);
+            let resolver = RemoteHttpResolver::with_cache(cache.clone()).allow_insecure(true);
+            let scope = Arc::new(Scope::default());
+            let url = server.url("/util.relon");
+
+            let first = resolver
+                .resolve(&url, &scope, TokenRange::default())
+                .expect("first fetch")
+                .expect("Some");
+            assert_eq!(first.source, "{ value: \"v1\" }");
+
+            let second = resolver
+                .resolve(&url, &scope, TokenRange::default())
+                .expect("revalidation hits 200")
+                .expect("Some");
+            assert_eq!(
+                second.source, "{ value: \"v2\" }",
+                "200 path must replace the cached body"
+            );
+
+            let entry = cache.load(&url).expect("cache must hold the new body");
+            assert_eq!(entry.body, "{ value: \"v2\" }");
+            assert_eq!(entry.meta.etag.as_deref(), Some("\"new\""));
+
+            let _ = std::fs::remove_dir_all(&cache_root);
+        }
+
+        #[test]
+        fn conditional_get_no_etag_falls_back_to_last_modified() {
+            let server = ScriptedServer::start(vec![
+                ScriptedReply {
+                    status: 200,
+                    etag: None,
+                    last_modified: Some("Wed, 21 Oct 2015 07:28:00 GMT"),
+                    body_when_full: "{ value: \"date-anchored\" }",
+                    honors_conditional: true,
+                },
+                ScriptedReply {
+                    status: 200,
+                    etag: None,
+                    last_modified: Some("Wed, 21 Oct 2015 07:28:00 GMT"),
+                    body_when_full: "{ value: \"date-anchored\" }",
+                    honors_conditional: true,
+                },
+            ]);
+
+            let cache_root = temp_cache_dir();
+            let cache = zero_ttl_cache(&cache_root);
+            let resolver = RemoteHttpResolver::with_cache(cache).allow_insecure(true);
+            let scope = Arc::new(Scope::default());
+            let url = server.url("/util.relon");
+
+            let _ = resolver
+                .resolve(&url, &scope, TokenRange::default())
+                .expect("cold fetch");
+            let second = resolver
+                .resolve(&url, &scope, TokenRange::default())
+                .expect("revalidate")
+                .expect("Some");
+            assert_eq!(second.source, "{ value: \"date-anchored\" }");
+
+            let last = server.last_request().expect("captured");
+            assert!(
+                last.to_ascii_lowercase().contains("if-modified-since:"),
+                "expected If-Modified-Since fallback when no ETag was seen, got:\n{last}"
+            );
+
+            let _ = std::fs::remove_dir_all(&cache_root);
+        }
+
+        #[test]
+        fn conditional_get_no_validators_does_full_refetch() {
+            // No `ETag`, no `Last-Modified` — the resolver cannot ask
+            // the origin to short-circuit, so a TTL-expired entry
+            // simply falls back to the original a-3 behaviour: full
+            // refetch on every miss.
+            let server = ScriptedServer::start(vec![
+                ScriptedReply {
+                    status: 200,
+                    etag: None,
+                    last_modified: None,
+                    body_when_full: "{ value: \"validator-less\" }",
+                    honors_conditional: false,
+                },
+                ScriptedReply {
+                    status: 200,
+                    etag: None,
+                    last_modified: None,
+                    body_when_full: "{ value: \"validator-less\" }",
+                    honors_conditional: false,
+                },
+            ]);
+            let cache_root = temp_cache_dir();
+            let cache = zero_ttl_cache(&cache_root);
+            let resolver = RemoteHttpResolver::with_cache(cache).allow_insecure(true);
+            let scope = Arc::new(Scope::default());
+            let url = server.url("/util.relon");
+
+            let _ = resolver
+                .resolve(&url, &scope, TokenRange::default())
+                .expect("first");
+            let _ = resolver
+                .resolve(&url, &scope, TokenRange::default())
+                .expect("second");
+            assert_eq!(
+                server.hit_count(),
+                2,
+                "without validators the resolver still issues a full GET each miss"
+            );
+            let last = server.last_request().expect("request");
+            assert!(
+                !last.to_ascii_lowercase().contains("if-none-match"),
+                "no validator means no conditional headers, got:\n{last}"
+            );
+            assert!(
+                !last.to_ascii_lowercase().contains("if-modified-since"),
+                "no validator means no conditional headers, got:\n{last}"
+            );
+
+            let _ = std::fs::remove_dir_all(&cache_root);
+        }
+
+        #[test]
+        fn legacy_cache_format_migrated() {
+            // Hand-write the pre-b-3 schema: just `<digest>.relon`,
+            // no `.meta` sidecar. The next `load` must observe the
+            // body, materialise a `.meta` (with no validators), and
+            // leave subsequent resolves wired into the new schema.
+            let cache_root = temp_cache_dir();
+            std::fs::create_dir_all(&cache_root).expect("mkdir cache root");
+            let cache = RemoteImportCache::new(&cache_root);
+            let url = "https://example.com/legacy.relon";
+            let legacy = cache.legacy_path(url);
+            std::fs::write(&legacy, "{ legacy: true }").expect("seed legacy entry");
+
+            let entry = cache.load(url).expect("legacy entry must load");
+            assert_eq!(entry.body, "{ legacy: true }");
+            assert!(entry.meta.etag.is_none());
+            assert!(entry.meta.last_modified.is_none());
+            assert!(
+                cache.body_path(url).exists(),
+                "load() should have rewritten to the new schema"
+            );
+            assert!(
+                cache.meta_path(url).exists(),
+                "load() should have synthesised a .meta sidecar"
+            );
+
+            // Second load is now a pure new-schema read; the legacy
+            // file is left in place (downgrade safety) but no longer
+            // consulted.
+            let again = cache.load(url).expect("re-load after migration");
+            assert_eq!(again.body, "{ legacy: true }");
+
+            let _ = std::fs::remove_dir_all(&cache_root);
+        }
     }
 }
