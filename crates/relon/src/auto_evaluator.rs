@@ -1,10 +1,10 @@
 //! Auto-tier evaluator wrapper.
 //!
-//! v4-e landing surface for `Backend::Auto`. An [`AutoEvaluator`]
+//! Landing surface for [`crate::Backend::Auto`]. An [`AutoEvaluator`]
 //! eagerly constructs a [`TreeWalkEvaluator`] (cheap, ~1 ms) and
-//! lazily initialises the wasm-AOT backend only when a host first
-//! calls [`relon_eval_api::Evaluator::run_main`]. The other four
-//! `Evaluator` methods (`eval`, `eval_root`, `force_thunk`,
+//! lazily initialises the cranelift-AOT backend only when a host
+//! first calls [`relon_eval_api::Evaluator::run_main`]. The other
+//! four `Evaluator` methods (`eval`, `eval_root`, `force_thunk`,
 //! `invoke_closure`) always go through the tree-walker — which is
 //! also the only backend that supports them today.
 //!
@@ -12,26 +12,23 @@
 //!
 //! * **Lazy AOT init** keeps the wasted-work scenario (host parses,
 //!   reads static config via `eval_root`, never calls `run_main`)
-//!   free of any wasm-AOT compile / wasmtime cold-start cost. The
-//!   benchmark numbers in `docs/internal/wasm-bench-report-...`
-//!   appendix A.21 show the AOT setup runs ~2 ms uncached / ~190 μs
-//!   cached on the current shared engine.
+//!   free of any AOT compile cost.
 //! * **Thread-safe + cache-once.** Both the success and failure
 //!   paths are cached in `OnceLock`s, so concurrent `run_main`
 //!   callers only ever drive the AOT pipeline once.
-//! * **AOT setup failure isolation.** If the wasm-AOT pipeline fails
-//!   (build compiled without `wasm-aot`, source uses constructs the
-//!   AOT backend rejects, ...), only `run_main` returns an error;
-//!   `eval` / `eval_root` / `force_thunk` / `invoke_closure` keep
-//!   working off the tree-walker.
+//! * **AOT setup failure isolation.** If the cranelift-AOT pipeline
+//!   fails (build compiled without `cranelift-aot`, source uses a
+//!   construct the AOT backend rejects, ...), only `run_main`
+//!   returns an error; `eval` / `eval_root` / `force_thunk` /
+//!   `invoke_closure` keep working off the tree-walker.
 //! * **`Box<dyn Evaluator>`** is stored rather than the concrete
-//!   `WasmAotEvaluator` so v5-β can swap the cranelift-AOT backend
-//!   in without changing this file's surface.
+//!   `CraneliftAotEvaluator` so future backends can swap in without
+//!   changing this file's surface.
 //!
-//! v5-β note: the body of [`AutoEvaluator::build_aot`] is the only
-//! v4-e site that hard-codes the wasm-AOT backend. Swapping it for a
-//! cranelift-AOT call is a localized change; the wrapper structure
-//! and the public `Backend::Auto` API stay frozen.
+//! v5-β-2 stage 4: wasm-AOT retired here. The fallback path that
+//! used to try cranelift then drop to wasm-AOT is gone — the
+//! cranelift backend now covers every IR op the corpus exercises,
+//! so wasm-AOT was dead weight.
 
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
@@ -43,9 +40,9 @@ use relon_parser::Node;
 use crate::{build_tree_walk_evaluator, BackendError};
 
 /// Wrapper [`Evaluator`] that routes the four AST-aware methods
-/// through a tree-walker and lazily spins up the wasm-AOT backend on
-/// first `run_main`. Constructed via [`AutoEvaluator::new`] or
-/// [`crate::new_evaluator`] with [`crate::Backend::Auto`].
+/// through a tree-walker and lazily spins up the cranelift-AOT
+/// backend on first `run_main`. Constructed via [`AutoEvaluator::new`]
+/// or [`crate::new_evaluator`] with [`crate::Backend::Auto`].
 pub struct AutoEvaluator {
     /// Source kept around so we can drive the AOT pipeline on first
     /// `run_main`. Owned rather than borrowed so the wrapper outlives
@@ -55,10 +52,10 @@ pub struct AutoEvaluator {
     /// wrapper stays `Send + Sync` without bounding `TreeWalkEvaluator`
     /// generics into this file.
     tree_walk: Box<TreeWalkEvaluator>,
-    /// Lazy wasm-AOT backend; once the first `run_main` runs the
-    /// codegen pipeline successfully, every subsequent call reuses
-    /// this slot. Stored as `Box<dyn Evaluator>` so v5-β can swap the
-    /// concrete backend without touching this struct's layout.
+    /// Lazy cranelift-AOT backend; once the first `run_main` runs
+    /// the codegen pipeline successfully, every subsequent call
+    /// reuses this slot. Stored as `Box<dyn Evaluator>` so future
+    /// backends can swap in without touching this struct's layout.
     aot: OnceLock<Box<dyn Evaluator>>,
     /// Mirror slot for the failure path. If the AOT pipeline fails
     /// once we cache the error so repeated `run_main` calls don't
@@ -70,7 +67,7 @@ impl AutoEvaluator {
     /// Build an [`AutoEvaluator`] over `source`. The tree-walker is
     /// constructed eagerly — same pipeline `Backend::TreeWalk`
     /// uses — so the wrapper is immediately ready to serve `eval` /
-    /// `eval_root` / `force_thunk` / `invoke_closure`. The wasm-AOT
+    /// `eval_root` / `force_thunk` / `invoke_closure`. The AOT
     /// half stays unbuilt until the first `run_main` invocation.
     pub fn new(source: &str) -> std::result::Result<Self, BackendError> {
         let tree_walk = build_tree_walk_evaluator(source)?;
@@ -82,10 +79,11 @@ impl AutoEvaluator {
         })
     }
 
-    /// Returns `true` if the wasm-AOT backend has been constructed
-    /// (either successfully or with a cached error). Exposed for
-    /// tests / observability so a host can assert that lazy init
-    /// actually stayed lazy across an `eval` / `eval_root` path.
+    /// Returns `true` if the cranelift-AOT backend has been
+    /// constructed (either successfully or with a cached error).
+    /// Exposed for tests / observability so a host can assert that
+    /// lazy init actually stayed lazy across an `eval` / `eval_root`
+    /// path.
     pub fn is_aot_initialised(&self) -> bool {
         self.aot.get().is_some() || self.aot_init_err.get().is_some()
     }
@@ -133,42 +131,25 @@ impl AutoEvaluator {
         }
     }
 
-    /// Drive the preferred AOT pipeline over `source`.
+    /// Drive the AOT pipeline over `source`.
     ///
-    /// v5-beta-1: when the `cranelift-aot` feature is enabled the
-    /// auto-tier wrapper tries the cranelift-native backend first;
-    /// any setup failure (e.g. the source uses ops the cranelift
-    /// path doesn't yet lower) falls back to the wasm-AOT backend.
-    /// If both are off (or both fail) the slot caches the error
-    /// string and `run_main` returns `RuntimeError::Unsupported`.
+    /// v5-β-2 stage 4: cranelift-AOT is the only AOT backend left.
+    /// When the `cranelift-aot` feature is enabled this returns the
+    /// boxed evaluator; otherwise the slot caches a "feature off"
+    /// error and `run_main` returns `RuntimeError::Unsupported`.
+    #[cfg(feature = "cranelift-aot")]
     fn build_aot(source: &str) -> Result<Box<dyn Evaluator>, String> {
-        // Try cranelift-aot first when enabled. The narrow v5-beta-1
-        // envelope means most production sources will fail this path
-        // and fall back to wasm-AOT below; that's expected.
-        #[cfg(feature = "cranelift-aot")]
-        if let Ok(aot) = relon_codegen_native::CraneliftAotEvaluator::from_source(source) {
-            return Ok(Box::new(aot) as Box<dyn Evaluator>);
-        }
-        Self::build_aot_wasm(source)
-    }
-
-    /// Wasm-AOT fallback path used by [`Self::build_aot`] once the
-    /// cranelift attempt (if enabled) has either succeeded or
-    /// failed-and-fallen-through.
-    #[cfg(feature = "wasm-aot")]
-    fn build_aot_wasm(source: &str) -> Result<Box<dyn Evaluator>, String> {
-        relon_codegen_wasm::WasmAotEvaluator::from_source(source)
+        relon_codegen_native::CraneliftAotEvaluator::from_source(source)
             .map(|aot| Box::new(aot) as Box<dyn Evaluator>)
             .map_err(|e| e.to_string())
     }
 
-    /// Stub for builds compiled without `wasm-aot` (e.g. wasm32 hosts).
-    /// The cranelift-aot feature can still satisfy `run_main` for the
-    /// narrow envelope it supports; everything else surfaces this
-    /// error.
-    #[cfg(not(feature = "wasm-aot"))]
-    fn build_aot_wasm(_source: &str) -> Result<Box<dyn Evaluator>, String> {
-        Err("this build was compiled without the `wasm-aot` feature and the cranelift-aot backend cannot handle this source; rebuild with `--features wasm-aot` to widen AOT run_main coverage"
+    /// Stub for builds compiled without `cranelift-aot` (e.g. wasm32
+    /// hosts). `run_main` surfaces the cached error; the tree-walker
+    /// surface keeps working.
+    #[cfg(not(feature = "cranelift-aot"))]
+    fn build_aot(_source: &str) -> Result<Box<dyn Evaluator>, String> {
+        Err("this build was compiled without the `cranelift-aot` feature; rebuild with `--features cranelift-aot` to enable the AOT backend"
             .to_string())
     }
 }
@@ -190,7 +171,7 @@ impl Evaluator for AutoEvaluator {
         match self.aot() {
             Ok(aot) => aot.run_main(args),
             Err(msg) => Err(RuntimeError::Unsupported {
-                reason: format!("auto backend: wasm-AOT setup failed: {msg}"),
+                reason: format!("auto backend: cranelift-AOT setup failed: {msg}"),
             }),
         }
     }

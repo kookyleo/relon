@@ -35,14 +35,18 @@ hex = "0.4"
 # be published to crates.io independently while local builds keep
 # using the in-tree source. A version-less path dependency is a
 # `cargo publish` blocker.
-relon = { path = "crates/relon", version = "0.1.0" }
+# v5-β-2 stage 4: workspace-level default-features = false lets the
+# wasm32-targeting `relon-wasm` opt out of the cranelift-aot default
+# without pulling cranelift-jit / region into a target where neither
+# builds. Native consumers (relon-cli, relon-bench, downstream hosts)
+# re-enable `default-features = true` in their own dependency entries.
+relon = { path = "crates/relon", version = "0.1.0", default-features = false }
 relon-parser = { path = "crates/relon-parser", version = "0.1.0" }
 relon-analyzer = { path = "crates/relon-analyzer", version = "0.1.0" }
 relon-eval-api = { path = "crates/relon-eval-api", version = "0.1.0" }
 relon-evaluator = { path = "crates/relon-evaluator", version = "0.1.0" }
 relon-fmt = { path = "crates/relon-fmt", version = "0.1.0" }
 relon-ir = { path = "crates/relon-ir", version = "0.1.0" }
-relon-codegen-wasm = { path = "crates/relon-codegen-wasm", version = "0.1.0" }
 relon-codegen-native = { path = "crates/relon-codegen-native", version = "0.1.0" }
 relon-trace-jit = { path = "crates/relon-trace-jit", version = "0.1.0" }
 relon-trace-recorder = { path = "crates/relon-trace-recorder", version = "0.1.0" }

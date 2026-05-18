@@ -32,6 +32,12 @@ wasm-opt = ["-O", "--enable-bulk-memory", "--enable-nontrapping-float-to-int"]
 wasm-opt = ["-O", "--enable-bulk-memory", "--enable-nontrapping-float-to-int"]
 
 [dependencies]
+# v5-β-2 stage 4: the workspace-level `relon` dep already declares
+# `default-features = false` so wasm32 builds (browser playground)
+# don't pull cranelift-jit / region (neither builds on wasm32).
+# Native consumers re-enable `cranelift-aot` explicitly; this crate
+# is wasm32-only at the build target so the tree-walker is the only
+# evaluator we need.
 relon = { workspace = true }
 relon-parser = { workspace = true }
 relon-evaluator = { workspace = true }

@@ -1,8 +1,9 @@
 name: Bench
 
-# Runs the wasm-AOT vs tree-walk criterion bench on every pull request
-# (against the PR base branch) and on pushes to main (against the prior
-# main commit). The job runs criterion twice on the same runner:
+# Runs the cranelift-AOT vs tree-walk criterion bench on every pull
+# request (against the PR base branch) and on pushes to main (against
+# the prior main commit). The job runs criterion twice on the same
+# runner:
 #
 #   1. Check out the base ref, run with `--save-baseline base`. The
 #      resulting estimates land in `target/criterion/<group>/<id>/base`.
@@ -49,7 +50,7 @@ jobs:
       # Bench binary name in `crates/relon-bench/benches/`. Pinned so a
       # future bench addition does not silently get pulled into the CI
       # budget without an explicit edit here.
-      BENCH_NAME: wasm_aot_vs_tree_walk
+      BENCH_NAME: cranelift_aot_vs_tree_walk
       # Criterion noise threshold (relative). 10 % is wider than the
       # default 1 % to absorb shared-runner jitter. Override per-bench
       # via `--noise-threshold` if a specific group needs a tighter

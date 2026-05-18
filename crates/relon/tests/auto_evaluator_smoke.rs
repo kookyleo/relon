@@ -1,13 +1,14 @@
-//! v4-e smoke tests for [`relon::AutoEvaluator`] and `Backend::Auto`.
+//! Smoke tests for [`relon::AutoEvaluator`] and `Backend::Auto`.
 //!
-//! Covers the routing contract laid out in the perf v4-e plan:
+//! v5-β-2 stage 4: wasm-AOT retired; the AOT path is cranelift only.
+//! The routing contract this file covers:
 //!
 //! * Default backend is `Auto`.
 //! * Tree-walker-only methods (`eval`, `eval_root`, `force_thunk`,
 //!   `invoke_closure`) succeed without ever constructing the
-//!   wasm-AOT backend.
-//! * `run_main` routes through wasm-AOT and produces the same value
-//!   as the tree-walker.
+//!   cranelift-AOT backend.
+//! * `run_main` routes through cranelift-AOT and produces the same
+//!   value as the tree-walker.
 //! * `run_main` failure does not poison `eval` / `eval_root`.
 //! * Concurrent `run_main` calls share one AOT build via `OnceLock`.
 //! * `Backend::Auto` and `Backend::default()` agree.
@@ -29,11 +30,11 @@ const LIB_SOURCE: &str = r#"{ host: "localhost", port: 8080 }"#;
 /// `x * 2` so `run_main(args={x:21})` produces `Value::Int(42)`.
 const MAIN_SOURCE: &str = "#main(Int x) -> Int\nx * 2";
 
-/// A `#main(...)` shape the wasm-AOT backend rejects (Phase 1.beta
-/// only supports `Int` / `Float` return shapes) while the
-/// tree-walker keeps working. Exercises the failure-isolation
-/// invariant for the AOT init slot.
-const AOT_REJECTED_MAIN: &str = "#main(Int x) -> Dict<String, Int>\n{ a: x }";
+/// A `#main(...)` shape the cranelift-AOT backend currently rejects
+/// (closure-bearing higher-order list op — `Op::CallClosure` is
+/// Phase C.4 deferred) while the tree-walker keeps working.
+/// Exercises the failure-isolation invariant for the AOT init slot.
+const AOT_REJECTED_MAIN: &str = "#main(List<Int> xs) -> List<Int>\nxs.map((Int n) => n * 2)";
 
 #[test]
 fn backend_default_is_auto() {
@@ -122,10 +123,11 @@ fn aot_init_failure_does_not_poison_tree_walk_surface() {
     args.insert("x".to_string(), Value::Int(7));
 
     // First `run_main` triggers the AOT pipeline and fails because
-    // `Dict<String, Int>` is outside the AOT v1 leaf set.
+    // closure-typed returns are outside the cranelift AOT envelope
+    // today (Phase C.4 deferred work).
     let err = evaluator
         .run_main(args.clone())
-        .expect_err("AOT rejects Dict<String, Int> return today");
+        .expect_err("AOT rejects closure-typed return today");
     assert!(matches!(err, RuntimeError::Unsupported { .. }));
     assert!(
         evaluator.is_aot_initialised(),
@@ -161,13 +163,16 @@ fn explicit_backend_treewalk_skips_auto_wrapper() {
     assert_eq!(out, Value::Int(4));
 }
 
-#[cfg(feature = "wasm-aot")]
+#[cfg(feature = "cranelift-aot")]
 #[test]
 fn run_main_value_parity_auto_vs_tree_walk() {
-    // `Auto::run_main` (via AOT) and `TreeWalk::run_main` must agree
-    // on the exact `Value` for the v1 leaf-type matrix. Loop a
-    // handful of (Int, Bool, String) cases to keep the matrix
-    // honest without dragging in criterion.
+    // `Auto::run_main` (via cranelift AOT) and `TreeWalk::run_main`
+    // must agree on the exact `Value` for the Int-leaf matrix the
+    // cranelift backend covers today. String pass-through
+    // (`return s`) needs `Op::LoadStringPtr`, which is deferred to
+    // v5-γ along with `Op::CallNative` / `Op::CallClosure` — so we
+    // restrict the parity cases to Int / arithmetic shapes the
+    // current AOT envelope handles.
     let cases: &[(&str, HashMap<String, Value>, Value)] = &[
         (
             "#main(Int x) -> Int\nx * 3",
@@ -179,13 +184,14 @@ fn run_main_value_parity_auto_vs_tree_walk() {
             Value::Int(21),
         ),
         (
-            "#main(String s) -> String\ns",
+            "#main(Int x, Int y) -> Int\nx + y",
             {
                 let mut m = HashMap::new();
-                m.insert("s".into(), Value::String("relon".into()));
+                m.insert("x".into(), Value::Int(40));
+                m.insert("y".into(), Value::Int(2));
                 m
             },
-            Value::String("relon".into()),
+            Value::Int(42),
         ),
     ];
 
@@ -231,7 +237,7 @@ fn concurrent_run_main_only_builds_aot_once() {
 #[test]
 fn force_thunk_and_invoke_closure_route_through_tree_walk() {
     // Build a thunk + closure directly via the eval-api types, then
-    // drive them through the auto wrapper. The wasm-AOT backend
+    // drive them through the auto wrapper. The cranelift-AOT backend
     // returns `Unsupported` for these; `AutoEvaluator` must route
     // through the tree-walker.
     //
@@ -254,8 +260,8 @@ fn force_thunk_and_invoke_closure_route_through_tree_walk() {
     let res = evaluator.force_thunk(&thunk);
     if let Err(RuntimeError::Unsupported { reason }) = &res {
         assert!(
-            !reason.contains("wasm-aot"),
-            "force_thunk must not route through wasm-AOT; got: {reason}"
+            !reason.contains("cranelift-AOT"),
+            "force_thunk must not route through cranelift-AOT; got: {reason}"
         );
     }
 
@@ -267,8 +273,8 @@ fn force_thunk_and_invoke_closure_route_through_tree_walk() {
     let res = evaluator.invoke_closure(&closure, &[]);
     if let Err(RuntimeError::Unsupported { reason }) = &res {
         assert!(
-            !reason.contains("wasm-aot"),
-            "invoke_closure must not route through wasm-AOT; got: {reason}"
+            !reason.contains("cranelift-AOT"),
+            "invoke_closure must not route through cranelift-AOT; got: {reason}"
         );
     }
     // Even after exercising every tree-walker-only path the AOT

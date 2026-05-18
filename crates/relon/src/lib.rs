@@ -22,8 +22,6 @@ pub use projector::{JsonProjector, Projector};
 pub use relon_analyzer;
 #[cfg(feature = "cranelift-aot")]
 pub use relon_codegen_native;
-#[cfg(feature = "wasm-aot")]
-pub use relon_codegen_wasm;
 pub use relon_eval_api;
 pub use relon_evaluator;
 pub use relon_parser;
@@ -535,73 +533,68 @@ pub fn analyze_from_str(source: &str) -> Result<AnalyzedTree> {
     Ok(analyze(&node))
 }
 
-/// Phase 8 backend selector. Lets a host swap the default tree-walking
-/// runtime for the wasm-AOT backend without rewriting its evaluation
-/// site. Hosts that don't care keep using the existing
+/// Backend selector. Lets a host swap the default tree-walking
+/// runtime for the cranelift-native AOT backend without rewriting
+/// its evaluation site. Hosts that don't care keep using the existing
 /// `value_from_str` / `from_str` entry points; the backend selection
 /// only surfaces through [`new_evaluator`].
 ///
-/// v4-e: [`Backend::Auto`] is the new default. The returned evaluator
-/// eagerly constructs a tree-walker (cheap, ~1 ms) and lazily spins
-/// up the wasm-AOT backend only on first `run_main`. The other four
+/// [`Backend::Auto`] is the default. The returned evaluator eagerly
+/// constructs a tree-walker (cheap, ~1 ms) and lazily spins up the
+/// cranelift-AOT backend only on first `run_main`. The other four
 /// `Evaluator` methods always go through the tree-walker — which is
 /// the only backend that supports them today and stays the
 /// canonical surface for `eval` / `eval_root` / `force_thunk` /
-/// `invoke_closure` after the v5-β native AOT lands too.
+/// `invoke_closure`.
+///
+/// v5-β-2 stage 4: the wasm-AOT backend retired here. The cranelift
+/// path covers every IR op the corpus exercises (51/52 corpus parity,
+/// the remaining case being analyzer-rejected — tree-walk-only by
+/// construction). The historical `Backend::WasmAot` variant is gone;
+/// upgrade callers to `Backend::Auto` (transparent) or
+/// `Backend::CraneliftAot` (eager).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Backend {
     /// Auto-tier (default). Returns an [`AutoEvaluator`] that routes
-    /// `run_main` through wasm-AOT (lazily constructed on first
-    /// call, cached for subsequent invocations) and every other
-    /// `Evaluator` method through the tree-walker. If the
-    /// wasm-AOT path fails to set up — for example, this build
-    /// dropped the `wasm-aot` feature, or the source uses
-    /// constructs the AOT backend rejects — only `run_main`
-    /// returns an error; the tree-walker surface stays usable.
+    /// `run_main` through the cranelift-AOT backend (lazily
+    /// constructed on first call, cached for subsequent invocations)
+    /// and every other `Evaluator` method through the tree-walker.
+    /// If the cranelift path fails to set up — for example, this
+    /// build dropped the `cranelift-aot` feature, or the source uses
+    /// constructs the AOT backend rejects — only `run_main` returns
+    /// an error; the tree-walker surface stays usable.
     #[default]
     Auto,
     /// Tree-walking interpreter only. Supports the full surface:
     /// lazy thunks, first-class closures, `eval` on arbitrary nodes,
     /// host-registered native fns with capability gating. Pick this
-    /// when a host wants to guarantee no wasm-AOT construction
-    /// happens, even on `run_main`.
+    /// when a host wants to guarantee no AOT construction happens,
+    /// even on `run_main`.
     TreeWalk,
-    /// Wasm AOT backend only. Compiles the entry document into a
-    /// wasm module at construction time and dispatches `run_main`
-    /// invocations through a wasmtime engine. The four
-    /// non-`run_main` `Evaluator` methods surface
-    /// `RuntimeError::Unsupported`. Pick this when a host wants to
-    /// pay the AOT cold-start cost up-front (e.g. before a latency-
-    /// sensitive serving loop) rather than on first `run_main`.
-    WasmAot,
-    /// v5-beta-1 native AOT backend. Lowers IR through cranelift's
+    /// Cranelift-native AOT backend. Lowers IR through cranelift's
     /// JIT module surface to produce native machine code; `run_main`
     /// invokes the JIT entry through a panic-shielded trampoline.
-    /// Supports a deliberately narrow `#main(Int...) -> Int` shape
-    /// today; v5-beta-2 widens the lowering to cover the full IR
-    /// envelope. The four non-`run_main` `Evaluator` methods surface
-    /// `RuntimeError::Unsupported`, matching the wasm-AOT shape.
+    /// Covers the full IR envelope the corpus exercises (51/52
+    /// corpus parity with the tree-walker). The four non-`run_main`
+    /// `Evaluator` methods surface `RuntimeError::Unsupported`.
+    /// Pick this when a host wants to pay the AOT cold-start cost
+    /// up-front (e.g. before a latency-sensitive serving loop)
+    /// rather than on first `run_main`.
     CraneliftAot,
 }
 
 /// Errors specific to the backend factory. Distinct from
-/// [`crate::Error`] because the wasm-AOT path can fail before the
-/// runtime ever starts (codegen / instantiate) and we don't want to
+/// [`crate::Error`] because the AOT path can fail before the
+/// runtime ever starts (codegen / JIT setup) and we don't want to
 /// stuff those shapes into the tree-walker's existing error enum.
 #[derive(Debug, thiserror::Error)]
 pub enum BackendError {
     /// Parser rejected the source.
     #[error("parse error: {0}")]
     Parse(String),
-    /// Wasm-AOT pipeline failed (analyzer / lowering / codegen /
-    /// instantiate). Wraps the codegen-wasm error stringified so the
-    /// facade surface stays narrow.
-    #[error("wasm-aot backend setup failed: {0}")]
-    WasmAot(String),
-    /// v5-beta-1: cranelift-AOT pipeline failed (typically because
-    /// the source falls outside the narrow op envelope the
-    /// cranelift backend covers today). Wraps the
-    /// `relon_codegen_native::CraneliftError` stringified so this
+    /// Cranelift-AOT pipeline failed (typically because the source
+    /// uses a construct the cranelift codegen rejects today). Wraps
+    /// the `relon_codegen_native::CraneliftError` stringified so this
     /// crate stays decoupled from the cranelift crate's surface.
     #[error("cranelift-aot backend setup failed: {0}")]
     CraneliftAot(String),
@@ -615,11 +608,11 @@ pub enum BackendError {
 /// The tree-walking variant deliberately mirrors what `value_from_str`
 /// does internally: workspace analysis runs first, the default
 /// sandboxed `Context` is assembled, and the resulting evaluator is
-/// boxed as `dyn Evaluator`. The wasm-AOT variant compiles the source
-/// down to wasm via `relon_codegen_wasm::WasmAotEvaluator::from_source`
-/// (requires the `wasm-aot` cargo feature; default-on for native
-/// builds, off for `wasm32-unknown-unknown` because wasmtime doesn't
-/// run there).
+/// boxed as `dyn Evaluator`. The cranelift-AOT variant lowers the
+/// source through `relon_codegen_native::CraneliftAotEvaluator::from_source`
+/// (requires the `cranelift-aot` cargo feature; default-on for
+/// native builds, off for `wasm32-unknown-unknown` because the
+/// cranelift JIT doesn't run there).
 pub fn new_evaluator(
     source: &str,
     backend: Backend,
@@ -627,17 +620,6 @@ pub fn new_evaluator(
     match backend {
         Backend::Auto => Ok(Box::new(AutoEvaluator::new(source)?)),
         Backend::TreeWalk => Ok(Box::new(build_tree_walk_evaluator(source)?)),
-        #[cfg(feature = "wasm-aot")]
-        Backend::WasmAot => {
-            let aot = relon_codegen_wasm::WasmAotEvaluator::from_source(source)
-                .map_err(|e| BackendError::WasmAot(e.to_string()))?;
-            Ok(Box::new(aot))
-        }
-        #[cfg(not(feature = "wasm-aot"))]
-        Backend::WasmAot => Err(BackendError::WasmAot(
-            "this build was compiled without the `wasm-aot` feature; rebuild with `--features wasm-aot` to enable the backend"
-                .to_string(),
-        )),
         #[cfg(feature = "cranelift-aot")]
         Backend::CraneliftAot => {
             let aot = relon_codegen_native::CraneliftAotEvaluator::from_source(source)
