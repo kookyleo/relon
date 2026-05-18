@@ -721,9 +721,12 @@ pub fn compile_module_to_object_bytes(
         .finish(flags)
         .map_err(|e| CraneliftError::JitSetup(format!("isa finish: {e}")))?;
 
-    let obj_builder =
-        ObjectBuilder::new(isa, "relon-native-cache", cranelift_module::default_libcall_names())
-            .map_err(|e| CraneliftError::JitSetup(format!("object builder: {e}")))?;
+    let obj_builder = ObjectBuilder::new(
+        isa,
+        "relon-native-cache",
+        cranelift_module::default_libcall_names(),
+    )
+    .map_err(|e| CraneliftError::JitSetup(format!("object builder: {e}")))?;
     let mut module = ObjectModule::new(obj_builder);
 
     let LoweredArtifacts {
@@ -928,7 +931,7 @@ fn lower_module_into<M: CrModule>(
             trap_block: Some(trap_block),
             label_stack: Vec::new(),
             inline_frames: Vec::new(),
-            const_pool: &const_pool,
+            const_pool,
             record_locals: HashMap::new(),
             needs_tail_cursor: matches!(entry_shape, EntryShape::BufferProtocol)
                 && body_needs_tail_cursor(&entry.body),
@@ -1053,7 +1056,7 @@ fn lower_module_into<M: CrModule>(
                 trap_block: Some(trap_block),
                 label_stack: Vec::new(),
                 inline_frames: Vec::new(),
-                const_pool: &const_pool,
+                const_pool,
                 record_locals: HashMap::new(),
                 needs_tail_cursor: false,
                 return_root_size: 0,
