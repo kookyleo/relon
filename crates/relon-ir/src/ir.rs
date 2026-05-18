@@ -1208,6 +1208,80 @@ pub enum Op {
     /// avoids the table lookup entirely; only non-ASCII codepoints
     /// fall through to the binary search.
     WhitespaceRangesAddr,
+
+    /// v3++ b-5 Unicode normalization primitive.
+    ///
+    /// Push the absolute wasm-memory address of the embedded
+    /// canonical (`upper = false` -> NFD) or compatibility
+    /// (`upper = true` -> NFKD) decomposition table. Stack effect:
+    /// `[] -> [i32]`. The boolean flag is reused for "table family"
+    /// even though "upper" semantically does not apply here — the
+    /// alternative would be a second variant, but the runtime body
+    /// already toggles the table address through a flag, so we keep
+    /// the same pattern.
+    ///
+    /// Layout in the const data section (see
+    /// [`crate::normalization::encode_decomp_table_bytes`]):
+    ///
+    /// ```text
+    /// [index_count: u32 LE]
+    /// [(cp: u32 LE, pool_off: u32 LE, pool_len: u32 LE) x index_count]
+    /// [pool_count: u32 LE]
+    /// [cp: u32 LE x pool_count]
+    /// ```
+    ///
+    /// Surfaces only inside the bundled `nfd` / `nfkd` / `nfc` / `nfkc`
+    /// stdlib bodies and the shared `__decomp_lookup` helper they call.
+    /// The DCE-friendly const-pool collector treats the op identically
+    /// to [`Op::CaseFoldTableAddr`]: the matching table is laid out
+    /// exactly when at least one reachable body references it.
+    DecompTableAddr {
+        /// `true` selects the compatibility (NFKD) decomposition
+        /// table, `false` selects the canonical (NFD) table.
+        compatibility: bool,
+    },
+
+    /// v3++ b-5 Unicode normalization primitive.
+    ///
+    /// Push the absolute wasm-memory address of the embedded
+    /// Canonical_Combining_Class table. Stack effect: `[] -> [i32]`.
+    /// Layout (see
+    /// [`crate::normalization::encode_ccc_table_bytes`]):
+    ///
+    /// ```text
+    /// [count: u32 LE]
+    /// [(cp: u32 LE, ccc: u32 LE) x count]
+    /// ```
+    ///
+    /// The CCC value is widened from `u8` to `u32` on the wire so the
+    /// per-entry stride stays at 8 bytes — same arithmetic shape as
+    /// the case-folding helper, allowing `(table_addr + 4 + mid * 8)`
+    /// rebasing.
+    ///
+    /// Only the bundled normalization bodies reference this op.
+    CccTableAddr,
+
+    /// v3++ b-5 Unicode normalization primitive.
+    ///
+    /// Push the absolute wasm-memory address of the embedded canonical
+    /// composition pair table. Stack effect: `[] -> [i32]`.
+    /// Layout (see
+    /// [`crate::normalization::encode_composition_table_bytes`]):
+    ///
+    /// ```text
+    /// [count: u32 LE]
+    /// [(first: u32 LE, second: u32 LE, composed: u32 LE) x count]
+    /// ```
+    ///
+    /// Each entry is 12 bytes; the runtime helper binary-searches by
+    /// the `(first, second)` lexicographic key. Composition exclusions
+    /// (Full_Composition_Exclusion + CompositionExclusions.txt) are
+    /// filtered at table-generation time, so the runtime never
+    /// re-checks.
+    ///
+    /// Only the bundled `nfc` / `nfkc` stdlib bodies reference this
+    /// op.
+    CompositionTableAddr,
 }
 
 /// Phase 10-a closure-capture record. One per captured variable on a
