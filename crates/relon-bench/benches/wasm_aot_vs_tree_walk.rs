@@ -136,6 +136,38 @@ fn string_upper_args() -> HashMap<String, Value> {
     m
 }
 
+/// v3++ b-4 `stdlib_title` payload. Exercises the three new code
+/// paths the title body adds on top of the v3+ a-4 case-fold
+/// pipeline:
+///
+///   * Latin segment with a combining mark: the wasm body must
+///     binary-search the combining-mark range table for every
+///     codepoint and skip the case fold on a hit. The `cafe + U+0301`
+///     fragment lands a mark on the per-codepoint hot path.
+///   * CJK + ideographic space (U+3000): non-ASCII whitespace pushes
+///     the title body through its non-ASCII-whitespace branch
+///     instead of the ASCII fast path, so the bench surfaces both
+///     paths.
+///   * Emoji ZWJ sequence: the family-emoji `MAN + ZWJ + WOMAN +
+///     ZWJ + GIRL + ZWJ + BOY` covers the 4-byte UTF-8 decode arm
+///     plus the ZWJ (U+200D Format char, not Mark) passthrough.
+///
+/// Total byte length stays under 256 so the wasm scratch alloc
+/// (4 + len * 4 = ~1 KB worst case) sits well inside the default
+/// out_cap.
+fn string_title_args() -> HashMap<String, Value> {
+    let mut m = HashMap::with_capacity(1);
+    // ASCII multi-word + combining mark + CJK + ideographic-space +
+    // ZWJ family emoji. Stays UTF-8 valid; the wasm body's invalid-
+    // UTF-8 trap path is exercised by the smoke tests, not bench.
+    let s = "the quick brown fox cafe\u{0301} bar \
+             \u{4F60}\u{597D}\u{3000}hello \
+             \u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}\u{200D}\u{1F466}"
+        .to_string();
+    m.insert("s".to_string(), Value::String(s));
+    m
+}
+
 /// Phase 10-a scenarios: a 32-element `List<Int>` driving the
 /// higher-order `map` / `filter` / `fold` stdlib bodies. The list
 /// length is chosen large enough that per-iteration `call_indirect`
@@ -196,6 +228,21 @@ const SCENARIOS: &[Scenario] = &[
         wasm_source: "#main(String s) -> String\ns.upper()",
         tree_source: "#main(String s) -> String\ns.upper()",
         args: string_upper_args,
+    },
+    // v3++ b-4: drives the new title-case body. The payload mixes
+    // ASCII whitespace, a combining mark, an ideographic space
+    // (U+3000), and an emoji ZWJ sequence so all three new code
+    // paths the title body adds on top of upper/lower (combining
+    // mark skip, non-ASCII whitespace branch, word-boundary state
+    // machine) light up under the per-iter measurement. The
+    // cold-start number also captures the two new data-section
+    // tables (combining marks + non-ASCII whitespace ranges) the
+    // wasm module now embeds.
+    Scenario {
+        name: "stdlib_title",
+        wasm_source: "#main(String s) -> String\ns.title()",
+        tree_source: "#main(String s) -> String\ns.title()",
+        args: string_title_args,
     },
     // Phase 10-a closure surfaces. Each scenario runs the same
     // higher-order body on both backends; the wasm side exercises
