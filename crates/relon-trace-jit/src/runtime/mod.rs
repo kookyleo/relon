@@ -61,6 +61,14 @@
 //!   that the caller owns; `InlineCache` itself uses `Cell<...>` for
 //!   non-atomic single-threaded interior mutability.
 
+pub mod call_table;
 pub mod deopt;
 
-pub use deopt::{DeoptStateSnapshot, GenericState, RecoverableWriteRecord, TraceContext};
+pub use call_table::{
+    register_external_call, resolve_external_call, with_call_table, ExternalCallTable,
+    __relon_trace_resolve_call,
+};
+pub use deopt::{
+    DeoptStateSnapshot, GenericState, RecoverableWriteRecord, TraceContext,
+    __relon_trace_save_deopt,
+};
