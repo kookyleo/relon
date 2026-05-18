@@ -201,7 +201,15 @@ impl CraneliftAotEvaluator {
         param_names: Vec<String>,
         buffer_schema: Option<BufferSchema>,
     ) -> Result<Self, CraneliftError> {
-        let compiled = codegen::compile_module(&ir, &sandbox_cfg)?;
+        // The codegen's tail-cursor protocol needs the return record's
+        // fixed-area size up front to seed the cursor past the root.
+        // Direct-IR / legacy callers without schema metadata pass 0;
+        // their bodies don't emit tail records.
+        let return_root_size = buffer_schema
+            .as_ref()
+            .map(|bs| bs.return_layout.root_size as u32)
+            .unwrap_or(0);
+        let compiled = codegen::compile_module_with(&ir, &sandbox_cfg, return_root_size)?;
         let CompiledModule {
             module,
             entry_fn_id,
@@ -679,10 +687,12 @@ fn write_value_into_builder(
     }
 }
 
-/// Decode a single field via [`BufferReader`]. Scalar coverage only
-/// for stage 2; pointer-indirect leaves (String / List*) surface as
-/// `Unsupported` so the corpus harness routes them to
-/// `CraneliftUnsupported` rather than miscomparing.
+/// Decode a single field via [`BufferReader`]. Stage 3 widens this to
+/// cover `String` / `List<Int>` / `List<Float>` / `List<Bool>` —
+/// pointer-indirect leaves whose payload lives in the out_buf tail
+/// area at the offset stored in the fixed-area slot. `List<String>` /
+/// `List<Schema>` still surface as `Unsupported` because the codegen
+/// can't yet emit them on the cranelift side.
 fn read_value_from_reader(
     reader: &BufferReader<'_>,
     field: &Field,
@@ -705,6 +715,38 @@ fn read_value_from_reader(
             .read_null(&field.name)
             .map(|()| Value::Null)
             .map_err(buffer_to_runtime_error),
+        TypeRepr::String => reader
+            .read_string(&field.name)
+            .map(|s| Value::String(s.to_string()))
+            .map_err(buffer_to_runtime_error),
+        TypeRepr::List { element } => match element.as_ref() {
+            TypeRepr::Int => reader
+                .read_list_int(&field.name)
+                .map(|v| Value::List(Arc::new(v.into_iter().map(Value::Int).collect())))
+                .map_err(buffer_to_runtime_error),
+            TypeRepr::Float => reader
+                .read_list_float(&field.name)
+                .map(|v| {
+                    Value::List(Arc::new(
+                        v.into_iter()
+                            .map(|f| Value::Float(ordered_float_wrap(f)))
+                            .collect(),
+                    ))
+                })
+                .map_err(buffer_to_runtime_error),
+            TypeRepr::Bool => reader
+                .read_list_bool(&field.name)
+                .map(|v| Value::List(Arc::new(v.into_iter().map(Value::Bool).collect())))
+                .map_err(buffer_to_runtime_error),
+            other => Err(RuntimeError::Unsupported {
+                reason: format!(
+                    "cranelift-native: cannot decode list field `{field}` of element type `{ty:?}` in schema `{schema}`",
+                    field = field.name,
+                    ty = other,
+                    schema = parent_schema.name,
+                ),
+            }),
+        },
         other => Err(RuntimeError::Unsupported {
             reason: format!(
                 "cranelift-native: cannot decode field `{field}` of type `{ty:?}` in schema `{schema}`",

@@ -274,9 +274,26 @@ fn trap_code(kind: TrapKind) -> TrapCode {
 /// into it. v5-beta-1 only emits one function (the `#main` entry);
 /// auxiliary stdlib bodies the IR references are lowered as inline
 /// helpers via the `Call` path.
+#[cfg(test)]
 pub fn compile_module(
     ir: &IrModule,
     sandbox: &SandboxConfig,
+) -> Result<CompiledModule, CraneliftError> {
+    compile_module_with(ir, sandbox, /* return_root_size= */ 0)
+}
+
+/// Same as [`compile_module`], but with an explicit `return_root_size`
+/// hint. The hint is consumed by the buffer-protocol epilogue when the
+/// body emits no pointer-indirect stores (in that case the JIT returns
+/// `return_root_size` as `bytes_written` so the host trampoline reads
+/// the full fixed-area record). Callers that don't have schema
+/// metadata pass `0`; the trampoline already reads `max(bw,
+/// return_root_size)` so a zero hint only affects pointer-indirect-
+/// returning bodies, which the from_ir_direct path doesn't use.
+pub fn compile_module_with(
+    ir: &IrModule,
+    sandbox: &SandboxConfig,
+    return_root_size: u32,
 ) -> Result<CompiledModule, CraneliftError> {
     let entry_idx = ir
         .entry_func_index
@@ -478,6 +495,7 @@ pub fn compile_module(
             now_ref,
             cap_lookup_ref,
             pointer_ty,
+            frontend_config: module.target_config(),
             entry_shape,
             locals: HashMap::new(),
             let_locals: HashMap::new(),
@@ -488,6 +506,10 @@ pub fn compile_module(
             label_stack: Vec::new(),
             inline_frames: Vec::new(),
             const_pool: &const_pool,
+            record_locals: HashMap::new(),
+            needs_tail_cursor: matches!(entry_shape, EntryShape::BufferProtocol)
+                && body_needs_tail_cursor(&entry.body),
+            return_root_size,
         };
 
         codegen.emit_prologue();
@@ -569,16 +591,88 @@ fn field_load_shape(
         IrType::F64 => Ok((cranelift_codegen::ir::types::F64, 8, IrType::F64)),
         IrType::I32 => Ok((I32, 4, IrType::I32)),
         IrType::Bool | IrType::Null => Ok((cranelift_codegen::ir::types::I8, 1, IrType::Bool)),
-        // Pointer-indirect leaves; layered support arrives with the
-        // tail-cursor + scratch-arena tranche.
+        // Pointer-indirect leaves: the fixed-area slot holds a single
+        // i32 buffer-relative offset. Loads / stores against the slot
+        // therefore use an `i32` access width — the IR-visible value
+        // is treated as `IrType::I32` so subsequent ops (Add / memcpy
+        // arithmetic / etc.) can manipulate it as a pointer.
         IrType::String
         | IrType::ListInt
         | IrType::ListFloat
         | IrType::ListBool
         | IrType::ListString
         | IrType::ListSchema
-        | IrType::Closure => Err(CraneliftError::Codegen(format!(
-            "LoadField/StoreField with pointer-indirect type {ty:?} not yet supported"
+        | IrType::Closure => Ok((I32, 4, IrType::I32)),
+    }
+}
+
+/// Walk the body to decide whether it allocates anything inside the
+/// `out_buf` tail area (pointer-indirect StoreField, dict-construction
+/// ops, `EmitTailRecordFromAbsoluteAddr`).
+///
+/// When `true`, the entry prologue must initialise `state.tail_cursor`
+/// to `return_root_size` so the first tail allocation lands
+/// immediately past the fixed area; the epilogue then returns the
+/// post-bump cursor as `bytes_written`. When `false`, the cursor stays
+/// at 0 and the epilogue returns `return_root_size` (the host
+/// trampoline reads at least that many bytes either way, so the value
+/// only matters when the body actually wrote past the fixed area).
+fn body_needs_tail_cursor(body: &[TaggedOp]) -> bool {
+    for tagged in body {
+        match &tagged.op {
+            Op::StoreField {
+                ty:
+                    IrType::String
+                    | IrType::ListInt
+                    | IrType::ListFloat
+                    | IrType::ListBool
+                    | IrType::ListString
+                    | IrType::ListSchema,
+                ..
+            } => return true,
+            Op::AllocRootRecord { .. }
+            | Op::AllocSubRecord { .. }
+            | Op::EmitTailRecordFromAbsoluteAddr { .. } => return true,
+            Op::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                if body_needs_tail_cursor(then_body) || body_needs_tail_cursor(else_body) {
+                    return true;
+                }
+            }
+            Op::Block { body, .. } | Op::Loop { body, .. } => {
+                if body_needs_tail_cursor(body) {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Alignment + tag a pointer-indirect record needs when copied into
+/// the tail area.
+///
+/// Mirrors `relon_codegen_wasm`'s record-size / alignment table:
+///
+/// * `String` / `ListBool` — 4-byte aligned `[len:4][bytes]`.
+/// * `ListInt` / `ListFloat` — 8-byte aligned `[len:4][pad:4][i64/f64 ×n]`.
+/// * `ListString` / `ListSchema` — pointer-array shapes that need
+///   per-entry relocation. We refuse them on this path; codegen
+///   surfaces `UnsupportedStoreFieldType` so the harness reports
+///   `CraneliftUnsupported` rather than miscompiling.
+fn pointer_indirect_record_align(ty: IrType) -> Result<u32, CraneliftError> {
+    match ty {
+        IrType::String | IrType::ListBool => Ok(4),
+        IrType::ListInt | IrType::ListFloat => Ok(8),
+        IrType::ListString | IrType::ListSchema | IrType::Closure => Err(CraneliftError::Codegen(
+            format!("pointer-indirect record alignment for {ty:?} not yet supported"),
+        )),
+        _ => Err(CraneliftError::Codegen(format!(
+            "type {ty:?} is not pointer-indirect"
         ))),
     }
 }
@@ -599,6 +693,10 @@ struct Codegen<'a, 'b> {
     now_ref: cranelift_codegen::ir::FuncRef,
     cap_lookup_ref: cranelift_codegen::ir::FuncRef,
     pointer_ty: cranelift_codegen::ir::Type,
+    /// Target frontend config (pointer width / default call conv).
+    /// Threaded through so helpers that call `call_memcpy` get the
+    /// right libcall signature without re-deriving it from primitives.
+    frontend_config: cranelift_codegen::isa::TargetFrontendConfig,
     /// Calling-convention shape picked at compile time. Drives the
     /// `LocalGet` type (i32 vs i64), `Return` epilogue, and the
     /// buffer-protocol load / store address computation.
@@ -652,6 +750,26 @@ struct Codegen<'a, 'b> {
     /// const-data bytes live in the host arena's prefix (the host
     /// trampoline copies them in before each call).
     const_pool: &'a ConstPool,
+
+    /// Cranelift `Variable` per `record_local_idx` allocated by
+    /// `Op::AllocRootRecord` / `Op::AllocSubRecord`. Each variable
+    /// holds an `i32` out_ptr-relative offset; subsequent
+    /// `Op::StoreFieldAtRecord` / `Op::PushRecordBase` ops read it to
+    /// compute the in-construction record's destination address.
+    record_locals: HashMap<u32, Variable>,
+    /// `true` when the entry's body touches the tail-cursor (either
+    /// emits pointer-indirect StoreField or uses the
+    /// AllocSubRecord / EmitTailRecordFromAbsoluteAddr dict-construction
+    /// ops). Drives the prologue init (`tail_cursor = return_root_size`)
+    /// and the epilogue return shape (`bytes_written = tail_cursor`
+    /// vs constant `return_root_size`).
+    needs_tail_cursor: bool,
+    /// Pre-computed fixed-area size of the entry's return record.
+    /// When `needs_tail_cursor` is `false` and the entry is buffer-
+    /// protocol, the epilogue returns this as `bytes_written`. The
+    /// prologue uses the same value to bias `tail_cursor` to the
+    /// first byte past the fixed area when tail records are present.
+    return_root_size: u32,
 }
 
 /// One inline-frame entry for a stdlib body lowered through
@@ -693,10 +811,26 @@ struct LabelFrame {
 
 impl<'a, 'b> Codegen<'a, 'b> {
     /// Emit the entry prologue: resource-limit check (one wall-clock
-    /// read + comparison) plus any other one-shot setup.
+    /// read + comparison) plus any other one-shot setup. For buffer-
+    /// protocol entries whose body emits pointer-indirect stores or
+    /// dict-construction ops, also initialise `state.tail_cursor` to
+    /// `return_root_size` so the first tail allocation lands
+    /// immediately past the fixed area.
     fn emit_prologue(&mut self) {
         if self.sandbox.deadline_check {
             self.emit_resource_check();
+        }
+        if self.needs_tail_cursor {
+            let init = self
+                .builder
+                .ins()
+                .iconst(I32, i64::from(self.return_root_size));
+            self.builder.ins().store(
+                MemFlags::trusted(),
+                init,
+                self.state_ptr,
+                STATE_OFFSET_TAIL_CURSOR,
+            );
         }
     }
 
@@ -834,10 +968,15 @@ impl<'a, 'b> Codegen<'a, 'b> {
 
     /// Lower `Op::StoreField { offset, ty }`. Pops the top of the
     /// virtual stack and writes it into `out_ptr + offset` (wasm slot
-    /// 2). v5-β-2 supports scalar (I64 / F64 / I32 / Bool / Null)
-    /// stores; pointer-indirect stores (String / List*) trip the
-    /// "unsupported" arm so the harness reports `CraneliftUnsupported`
-    /// rather than miscompiling.
+    /// 2). Scalar (I64 / F64 / I32 / Bool / Null) stores go through a
+    /// direct cranelift `store`. Pointer-indirect stores (String /
+    /// ListInt / ListFloat / ListBool) route through
+    /// [`emit_store_pointer_indirect`], which mirrors the wasm-side
+    /// tail-cursor protocol: pop the source pointer, memcpy the
+    /// `[len:4][payload]` record into `out_ptr + tail_cursor`, store
+    /// `tail_cursor` (the new buffer-relative offset) into the fixed-
+    /// area slot, and bump `tail_cursor`. ListString / ListSchema
+    /// stay unsupported because they need per-entry relocation.
     fn emit_store_field(&mut self, offset: u32, ty: IrType) -> Result<(), CraneliftError> {
         if !matches!(self.entry_shape, EntryShape::BufferProtocol) {
             return Err(CraneliftError::Codegen(
@@ -846,15 +985,13 @@ impl<'a, 'b> Codegen<'a, 'b> {
         }
         if matches!(
             ty,
-            IrType::String
-                | IrType::ListInt
-                | IrType::ListFloat
-                | IrType::ListBool
-                | IrType::ListString
-                | IrType::ListSchema
+            IrType::String | IrType::ListInt | IrType::ListFloat | IrType::ListBool
         ) {
+            return self.emit_store_pointer_indirect(offset, ty);
+        }
+        if matches!(ty, IrType::ListString | IrType::ListSchema) {
             return Err(CraneliftError::Codegen(format!(
-                "StoreField pointer-indirect type {ty:?} not yet supported on cranelift",
+                "StoreField pointer-indirect type {ty:?} (pointer-array) not yet supported",
             )));
         }
         let (cr_ty, size, _push_ty) = field_load_shape(ty)?;
@@ -877,6 +1014,368 @@ impl<'a, 'b> Codegen<'a, 'b> {
         self.builder
             .ins()
             .store(MemFlags::trusted(), store_val, addr, 0);
+        Ok(())
+    }
+
+    /// Bump-allocate `size` bytes inside the output buffer's tail
+    /// region.
+    ///
+    /// Mirrors the wasm-side `emit_tail_alloc` helper:
+    ///
+    /// 1. Align `state.tail_cursor` up to `align` (must be a power of
+    ///    two — typical values are 4 / 8).
+    /// 2. Bounds-check `aligned_cursor + size <= arena_len -
+    ///    out_ptr`. We fold `out_ptr` into the comparison by
+    ///    comparing `out_ptr + aligned_cursor + size` against
+    ///    `arena_len`.
+    /// 3. Record the new cursor in `state.tail_cursor`.
+    /// 4. Return the **pre-bump** cursor — the slot the caller will
+    ///    write into. The caller adds `out_ptr` (and optionally
+    ///    `arena_base`) to materialise an absolute address.
+    ///
+    /// Returns the pre-bump cursor as an `i32` cranelift value (i.e.
+    /// the buffer-relative offset of the freshly reserved region).
+    /// The bump cursor is written back to `state.tail_cursor` so the
+    /// next `emit_tail_alloc` (or the trampoline reading
+    /// `tail_cursor()`) sees the post-bump value.
+    fn emit_tail_alloc(&mut self, size: CValue, align: u32) -> Result<CValue, CraneliftError> {
+        // Read current cursor.
+        let cur = self.builder.ins().load(
+            I32,
+            MemFlags::trusted(),
+            self.state_ptr,
+            STATE_OFFSET_TAIL_CURSOR,
+        );
+        // Align up to `align`. `align <= 1` keeps the cursor as-is.
+        let aligned = if align <= 1 {
+            cur
+        } else {
+            let add = self.builder.ins().iconst(I32, i64::from(align as i32 - 1));
+            let mask = self
+                .builder
+                .ins()
+                .iconst(I32, i64::from(!(align as i32 - 1)));
+            let sum = self.builder.ins().iadd(cur, add);
+            self.builder.ins().band(sum, mask)
+        };
+        // Bounds-check: out_ptr + aligned + size <= arena_len.
+        // The out_ptr we use is the wasm-side handshake slot (local
+        // 2), holding the absolute offset into the arena where the
+        // out_buf starts.
+        if self.sandbox.bounds_check {
+            let out_ptr = self.get_local(2)?;
+            let arena_len = self.builder.ins().load(
+                I32,
+                MemFlags::trusted(),
+                self.state_ptr,
+                STATE_OFFSET_ARENA_LEN,
+            );
+            let end0 = self.builder.ins().iadd(out_ptr, aligned);
+            let end = self.builder.ins().iadd(end0, size);
+            let cmp = self
+                .builder
+                .ins()
+                .icmp(IntCC::UnsignedGreaterThan, end, arena_len);
+            self.cond_trap(cmp, TrapKind::BoundsViolation);
+        }
+        // Bump and persist the new cursor.
+        let new_cur = self.builder.ins().iadd(aligned, size);
+        self.builder.ins().store(
+            MemFlags::trusted(),
+            new_cur,
+            self.state_ptr,
+            STATE_OFFSET_TAIL_CURSOR,
+        );
+        Ok(aligned)
+    }
+
+    /// Lower `Op::StoreField { ty }` for a pointer-indirect type
+    /// (`String` / `ListInt` / `ListFloat` / `ListBool`). Pops the
+    /// source pointer (an arena-relative i32 offset where a
+    /// `[len:u32 LE][payload]` record lives), memcpies the record into
+    /// `out_ptr + tail_cursor`, writes `tail_cursor` (the buffer-
+    /// relative offset of the just-written record) into the fixed-
+    /// area slot at `offset`, and bumps `tail_cursor`.
+    fn emit_store_pointer_indirect(
+        &mut self,
+        offset: u32,
+        ty: IrType,
+    ) -> Result<(), CraneliftError> {
+        let src_off_i32 = self.pop()?;
+        // Compute record_size from the in-record length prefix.
+        let arena_base = self.builder.ins().load(
+            self.pointer_ty,
+            MemFlags::trusted(),
+            self.state_ptr,
+            STATE_OFFSET_ARENA_BASE,
+        );
+        let src_off_p = self.builder.ins().uextend(self.pointer_ty, src_off_i32);
+        let src_abs = self.builder.ins().iadd(arena_base, src_off_p);
+        // Load element / byte count from src+0.
+        let len_i32 = self
+            .builder
+            .ins()
+            .load(I32, MemFlags::trusted(), src_abs, 0);
+        let record_size = match ty {
+            IrType::String => {
+                // record_size = payload_len + 4
+                let four = self.builder.ins().iconst(I32, 4);
+                self.builder.ins().iadd(len_i32, four)
+            }
+            IrType::ListInt | IrType::ListFloat => {
+                // record_size = 8 + 8 * element_count
+                let three = self.builder.ins().iconst(I32, 3);
+                let shifted = self.builder.ins().ishl(len_i32, three);
+                let eight = self.builder.ins().iconst(I32, 8);
+                self.builder.ins().iadd(shifted, eight)
+            }
+            IrType::ListBool => {
+                // record_size = 4 + element_count
+                let four = self.builder.ins().iconst(I32, 4);
+                self.builder.ins().iadd(len_i32, four)
+            }
+            _ => {
+                return Err(CraneliftError::Codegen(format!(
+                    "emit_store_pointer_indirect: unsupported {ty:?}"
+                )));
+            }
+        };
+        let align = pointer_indirect_record_align(ty)?;
+        // Reserve the tail slot.
+        let pre_cursor = self.emit_tail_alloc(record_size, align)?;
+        // Compute absolute dest = arena_base + out_ptr + pre_cursor.
+        let out_ptr_i32 = self.get_local(2)?;
+        let out_ptr = self.builder.ins().uextend(self.pointer_ty, out_ptr_i32);
+        let pre_cursor_p = self.builder.ins().uextend(self.pointer_ty, pre_cursor);
+        let dest0 = self.builder.ins().iadd(arena_base, out_ptr);
+        let dest = self.builder.ins().iadd(dest0, pre_cursor_p);
+        // memcpy(dest, src_abs, record_size).
+        let size_p = self.builder.ins().uextend(self.pointer_ty, record_size);
+        self.builder
+            .call_memcpy(self.frontend_config, dest, src_abs, size_p);
+        // Store pre_cursor (the buffer-relative offset) at the fixed-
+        // area slot `out_ptr + offset`.
+        let slot_addr = self.buffer_field_addr(2 /* out_ptr */, offset, 4)?;
+        self.builder
+            .ins()
+            .store(MemFlags::trusted(), pre_cursor, slot_addr, 0);
+        Ok(())
+    }
+
+    /// Lower `Op::EmitTailRecordFromAbsoluteAddr { ty }`. Pops an
+    /// arena-relative source pointer (an `i32` offset where a
+    /// `[len:u32 LE][payload]` record lives), memcpies the record
+    /// into the output buffer's tail area at `tail_cursor`, bumps the
+    /// cursor past the record, and pushes the pre-bump cursor (= the
+    /// buffer-relative offset of the just-written record) onto the
+    /// virtual stack as an `i32`. The pushed value is what subsequent
+    /// `Op::StoreFieldAtRecord { ty: String / ListInt / ... }` stores
+    /// into a parent record's pointer slot.
+    fn emit_tail_record_from_absolute(&mut self, ty: IrType) -> Result<(), CraneliftError> {
+        let src_off_i32 = self.pop()?;
+        let arena_base = self.builder.ins().load(
+            self.pointer_ty,
+            MemFlags::trusted(),
+            self.state_ptr,
+            STATE_OFFSET_ARENA_BASE,
+        );
+        let src_off_p = self.builder.ins().uextend(self.pointer_ty, src_off_i32);
+        let src_abs = self.builder.ins().iadd(arena_base, src_off_p);
+        let len_i32 = self
+            .builder
+            .ins()
+            .load(I32, MemFlags::trusted(), src_abs, 0);
+        let record_size = match ty {
+            IrType::String => {
+                let four = self.builder.ins().iconst(I32, 4);
+                self.builder.ins().iadd(len_i32, four)
+            }
+            IrType::ListInt | IrType::ListFloat => {
+                let three = self.builder.ins().iconst(I32, 3);
+                let shifted = self.builder.ins().ishl(len_i32, three);
+                let eight = self.builder.ins().iconst(I32, 8);
+                self.builder.ins().iadd(shifted, eight)
+            }
+            IrType::ListBool => {
+                let four = self.builder.ins().iconst(I32, 4);
+                self.builder.ins().iadd(len_i32, four)
+            }
+            IrType::ListString | IrType::ListSchema => {
+                return Err(CraneliftError::Codegen(format!(
+                    "EmitTailRecordFromAbsoluteAddr {ty:?} (pointer-array) not yet supported"
+                )));
+            }
+            _ => {
+                return Err(CraneliftError::Codegen(format!(
+                    "EmitTailRecordFromAbsoluteAddr unsupported {ty:?}"
+                )));
+            }
+        };
+        let align = pointer_indirect_record_align(ty)?;
+        let pre_cursor = self.emit_tail_alloc(record_size, align)?;
+        let out_ptr_i32 = self.get_local(2)?;
+        let out_ptr = self.builder.ins().uextend(self.pointer_ty, out_ptr_i32);
+        let pre_cursor_p = self.builder.ins().uextend(self.pointer_ty, pre_cursor);
+        let dest0 = self.builder.ins().iadd(arena_base, out_ptr);
+        let dest = self.builder.ins().iadd(dest0, pre_cursor_p);
+        let size_p = self.builder.ins().uextend(self.pointer_ty, record_size);
+        self.builder
+            .call_memcpy(self.frontend_config, dest, src_abs, size_p);
+        // Push the pre-bump cursor.
+        self.push(pre_cursor);
+        Ok(())
+    }
+
+    /// Resolve / create the cranelift variable that backs an
+    /// `Op::AllocRootRecord` / `Op::AllocSubRecord` record-local
+    /// index. Each variable holds an `i32` out_ptr-relative offset.
+    fn get_or_create_record_local(&mut self, idx: u32) -> Variable {
+        if let Some(v) = self.record_locals.get(&idx).copied() {
+            return v;
+        }
+        let v = self.builder.declare_var(I32);
+        self.record_locals.insert(idx, v);
+        v
+    }
+
+    /// Lower `Op::AllocRootRecord { record_local_idx }`. The root
+    /// record sits at `out_ptr + 0` so we just bind the record-local
+    /// to a constant `i32 0`. Subsequent `Op::StoreFieldAtRecord` /
+    /// `Op::PushRecordBase` ops uniformly compute `out_ptr +
+    /// record_local + offset`.
+    fn emit_alloc_root_record(&mut self, idx: u32) {
+        let var = self.get_or_create_record_local(idx);
+        let zero = self.builder.ins().iconst(I32, 0);
+        self.builder.def_var(var, zero);
+    }
+
+    /// Lower `Op::AllocSubRecord { record_local_idx, root_size,
+    /// root_align }`. Aligns `tail_cursor` up to `root_align`,
+    /// bounds-checks against `arena_len - out_ptr`, stores the
+    /// aligned cursor into the record-local, then bumps
+    /// `tail_cursor` by `root_size`.
+    fn emit_alloc_sub_record(
+        &mut self,
+        idx: u32,
+        root_size: u32,
+        root_align: u32,
+    ) -> Result<(), CraneliftError> {
+        let size_v = self.builder.ins().iconst(I32, i64::from(root_size));
+        let pre_cursor = self.emit_tail_alloc(size_v, root_align)?;
+        let var = self.get_or_create_record_local(idx);
+        self.builder.def_var(var, pre_cursor);
+        Ok(())
+    }
+
+    /// Lower `Op::PushRecordBase { record_local_idx }`. Reads the
+    /// record-local and pushes its current value onto the stack so
+    /// the surrounding parent record can store the sub-record's
+    /// base offset into its pointer slot.
+    fn emit_push_record_base(&mut self, idx: u32) -> Result<(), CraneliftError> {
+        let var = *self.record_locals.get(&idx).ok_or_else(|| {
+            CraneliftError::Codegen(format!(
+                "PushRecordBase({idx}) before matching AllocRootRecord / AllocSubRecord"
+            ))
+        })?;
+        let v = self.builder.use_var(var);
+        self.push(v);
+        Ok(())
+    }
+
+    /// Lower `Op::StoreFieldAtRecord { record_local_idx, offset, ty
+    /// }`. Pops the top of the virtual stack and writes it into
+    /// `out_ptr + record_local + offset`.
+    fn emit_store_field_at_record(
+        &mut self,
+        idx: u32,
+        offset: u32,
+        ty: IrType,
+    ) -> Result<(), CraneliftError> {
+        let value = self.pop()?;
+        let var = *self.record_locals.get(&idx).ok_or_else(|| {
+            CraneliftError::Codegen(format!(
+                "StoreFieldAtRecord({idx}) before matching AllocRootRecord / AllocSubRecord"
+            ))
+        })?;
+        let record_base_i32 = self.builder.use_var(var);
+        // Compute absolute dest = arena_base + out_ptr + record_base
+        // + offset. Bounds-check via the same arena_len comparison
+        // `buffer_field_addr` uses, but parameterised by
+        // `record_base + offset` instead of a fixed compile-time
+        // offset.
+        let arena_base = self.builder.ins().load(
+            self.pointer_ty,
+            MemFlags::trusted(),
+            self.state_ptr,
+            STATE_OFFSET_ARENA_BASE,
+        );
+        let out_ptr_i32 = self.get_local(2)?;
+        let off_v = self.builder.ins().iconst(I32, i64::from(offset));
+        let slot_off_i32 = self.builder.ins().iadd(record_base_i32, off_v);
+        // Slot size for the bounds check: scalar -> {1, 4, 8};
+        // pointer-indirect -> 4 (the slot stores an i32 offset).
+        let slot_size = match ty {
+            IrType::I64 | IrType::F64 => 8,
+            IrType::I32
+            | IrType::String
+            | IrType::ListInt
+            | IrType::ListFloat
+            | IrType::ListBool
+            | IrType::ListString
+            | IrType::ListSchema
+            | IrType::Closure => 4,
+            IrType::Bool | IrType::Null => 1,
+        };
+        if self.sandbox.bounds_check {
+            let arena_len = self.builder.ins().load(
+                I32,
+                MemFlags::trusted(),
+                self.state_ptr,
+                STATE_OFFSET_ARENA_LEN,
+            );
+            let size_v = self.builder.ins().iconst(I32, i64::from(slot_size));
+            let off_total = self.builder.ins().iadd(out_ptr_i32, slot_off_i32);
+            let end = self.builder.ins().iadd(off_total, size_v);
+            let cmp = self
+                .builder
+                .ins()
+                .icmp(IntCC::UnsignedGreaterThan, end, arena_len);
+            self.cond_trap(cmp, TrapKind::BoundsViolation);
+        }
+        // Build absolute pointer.
+        let out_ptr = self.builder.ins().uextend(self.pointer_ty, out_ptr_i32);
+        let slot_off_p = self.builder.ins().uextend(self.pointer_ty, slot_off_i32);
+        let dest0 = self.builder.ins().iadd(arena_base, out_ptr);
+        let dest = self.builder.ins().iadd(dest0, slot_off_p);
+        // Emit the store. For `Bool` / `Null`, the stack slot is i32
+        // but the underlying record stores i8. For pointer-indirect
+        // types the value is already an i32 buffer-relative offset.
+        match ty {
+            IrType::I64 | IrType::F64 => {
+                self.builder
+                    .ins()
+                    .store(MemFlags::trusted(), value, dest, 0);
+            }
+            IrType::I32
+            | IrType::String
+            | IrType::ListInt
+            | IrType::ListFloat
+            | IrType::ListBool
+            | IrType::ListString
+            | IrType::ListSchema
+            | IrType::Closure => {
+                self.builder
+                    .ins()
+                    .store(MemFlags::trusted(), value, dest, 0);
+            }
+            IrType::Bool | IrType::Null => {
+                let v8 = self
+                    .builder
+                    .ins()
+                    .ireduce(cranelift_codegen::ir::types::I8, value);
+                self.builder.ins().store(MemFlags::trusted(), v8, dest, 0);
+            }
+        }
         Ok(())
     }
 
@@ -948,18 +1447,24 @@ impl<'a, 'b> Codegen<'a, 'b> {
                 self.builder.ins().return_(&[v]);
             }
             EntryShape::BufferProtocol => {
-                // The host trampoline reads back the actual
-                // `state.tail_cursor()` slot, which the lowering
-                // updates as pointer-indirect stores run. For pure
-                // scalar bodies the tail-cursor stays at 0; the host
-                // falls back to `return_root_size`.
-                let tail = self.builder.ins().load(
-                    I32,
-                    MemFlags::trusted(),
-                    self.state_ptr,
-                    STATE_OFFSET_TAIL_CURSOR,
-                );
-                self.builder.ins().return_(&[tail]);
+                // Mirrors the wasm-side epilogue: for bodies that
+                // touched the tail-cursor (pointer-indirect stores /
+                // dict construction) return the post-bump cursor;
+                // otherwise return the precomputed `return_root_size`
+                // so the host trampoline reads the full fixed area.
+                let value = if self.needs_tail_cursor {
+                    self.builder.ins().load(
+                        I32,
+                        MemFlags::trusted(),
+                        self.state_ptr,
+                        STATE_OFFSET_TAIL_CURSOR,
+                    )
+                } else {
+                    self.builder
+                        .ins()
+                        .iconst(I32, i64::from(self.return_root_size))
+                };
+                self.builder.ins().return_(&[value]);
             }
         }
         Ok(())
@@ -1428,6 +1933,33 @@ impl<'a, 'b> Codegen<'a, 'b> {
             Op::Le(IrType::I32) => self.emit_cmp_i32(IntCC::SignedLessThanOrEqual)?,
             Op::Gt(IrType::I32) => self.emit_cmp_i32(IntCC::SignedGreaterThan)?,
             Op::Ge(IrType::I32) => self.emit_cmp_i32(IntCC::SignedGreaterThanOrEqual)?,
+
+            // v5-β-2 stage 3: dict-return / tail-cursor protocol.
+            // Each op runs against the per-function record-local map
+            // and the shared `state.tail_cursor` slot.
+            Op::AllocRootRecord { record_local_idx } => {
+                self.emit_alloc_root_record(*record_local_idx);
+            }
+            Op::AllocSubRecord {
+                record_local_idx,
+                root_size,
+                root_align,
+            } => {
+                self.emit_alloc_sub_record(*record_local_idx, *root_size, *root_align)?;
+            }
+            Op::PushRecordBase { record_local_idx } => {
+                self.emit_push_record_base(*record_local_idx)?;
+            }
+            Op::StoreFieldAtRecord {
+                record_local_idx,
+                offset,
+                ty,
+            } => {
+                self.emit_store_field_at_record(*record_local_idx, *offset, *ty)?;
+            }
+            Op::EmitTailRecordFromAbsoluteAddr { ty } => {
+                self.emit_tail_record_from_absolute(*ty)?;
+            }
 
             // v5-β-2: every other op still surfaces as Codegen
             // failure. Items #1-#6 in the v5-β-2 plan (LoadField,
