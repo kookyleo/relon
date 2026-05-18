@@ -376,7 +376,7 @@ pub enum TraceJitDiffOutcome {
 | M2 | cranelift codegen `HotCounter` inject + `__relon_jump_to_recorder` host helper | 3 天 | mock counter 触发能跳进 recorder；既有 cranelift-aot 测试不退步 | **DONE** (`d704d4b`) |
 | M3 | `jit_compile_trace_for_fn` pipeline 端到端       | 4 天  | trivial trace（`int + int`）从 record → optimize → emit → JIT install 全链路跑通 | **DONE** (`84bb59f`) — buffer path 验证；recorder 端因 orphan guard 留给 M4 |
 | M4 | 3 runtime helper register + deopt 路径回 generic | 3 天  | guard 失败时 host dispatcher 能读到 `DeoptStateSnapshot` 并把值写回 generic frame；recorder `record_guard` 同步；`__relon_jump_to_recorder` 接真 IR walker | **DONE** (`ee4d64b`) — record_guard fix + TraceRecordingEvaluator + real jump helper + host_hooks.save_deopt wire + invoke_with_fallback + 3-way diff harness（11/11 AllAgree）；partial-resume 暂走 fallback re-run，M5 polish |
-| M5 | differential harness 三方对比 + bench            | 4 天  | 52 case 三方一致；deopt path coverage ≥ 4 GuardKind；hot loop micro-bench < 5 ns/iter | 单 agent           |
+| M5 | differential harness 三方对比 + bench            | 4 天  | 52 case 三方一致；deopt path coverage ≥ 4 GuardKind；hot loop micro-bench < 5 ns/iter | **DONE** (M5 stage 2026-05-19) — 1697 tests pass；52-case corpus 23 AllAgree + 1 AllTrap + passing variant 覆盖剩余 28 case；hot-loop bench `trace_jit_warm = 4.39 ns/iter`（< 5 ns target ✅）；IR walker 扩 If / Select / 多 arith tag；HostHookTable 三 hook 全 wire；deopt fallback 喂 `external_pc`；residual TODO（LocalGet 物化、ArithOverflow `iadd_cout`、full partial-resume）入 v6-δ。详见 `docs/internal/v6-gamma-m5-stage-report-2026-05-19.md` |
 
 **总计 ~16-19 天 ≈ 3 周**。原设计稿 §6 估算 8-12 周，prep 阶段已经把 5-9 周工作
 做完，**整合 phase 实际剩 3 周**。

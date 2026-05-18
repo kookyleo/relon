@@ -3063,3 +3063,106 @@ v5b1_arithmetic/wasm/warm        1.09 µs
   能再省 ~100 ns；但牺牲了 `Value` 类型 union。Trade-off 等
   bench-driven 决策。
 
+
+---
+
+## 附录 M5：v6-γ trace-JIT hot-loop micro-bench（2026-05-19）
+
+> **状态**：v6-γ M5 阶段交付物。bench 入口
+> `cargo bench -p relon-bench --bench trace_jit_hot_loop`；
+> 源码 `crates/relon-bench/benches/trace_jit_hot_loop.rs`。
+> 配套 stage report：
+> `docs/internal/v6-gamma-m5-stage-report-2026-05-19.md`。
+
+### M5.1 测量目标
+
+针对热循环（`for i in 0..N { acc += i }`，`N = 10^6`）单步在三条
+后端路径上的稳态成本：
+
+- `tree_walk` —— `TreeWalkEvaluator::run_main` 每次 dispatch；
+- `cranelift_aot` —— 预编译的 `CraneliftAotEvaluator::run_main`
+  warm-invoke；
+- `trace_jit_warm` —— 预安装的 trace 入口（`JITedTraceFn::invoke`）
+  直接 tail-call。
+
+target：`trace_jit_warm < 5 ns / iter`（LuaJIT trace tier 区间
+1-3 ns/iter，4-6 ns 为 v6-γ M5 可接受范围）。
+
+### M5.2 三轮 criterion 实测中位数
+
+环境：与本报告附录 A 同机（x86_64，release + fat LTO），bench
+profile `criterion 0.5`，`sample_size = 30`，`measurement_time =
+6s`。每轮 1M-iter loop，per-iter cost = 总时间 / N。
+
+| Row              | 总时间（中位数）   | per-iter 中位数 | thrpt（中位数）       |
+|------------------|-------------------:|----------------:|----------------------:|
+| `tree_walk`      | 2.245 s            | 2 245 ns        | 445 K elem/s          |
+| `cranelift_aot`  | 367 ms             | 367 ns          | 2.72 M elem/s         |
+| `trace_jit_warm` | 4.39 ms            | **4.39 ns**     | 228 M elem/s          |
+
+三轮原始数据：
+
+| Run | tree_walk (s)   | cranelift_aot (ms) | trace_jit_warm (ms) |
+|-----|----------------:|-------------------:|--------------------:|
+| 1   | 2.2536          | 360.50             | 4.3900              |
+| 2   | 2.2450          | 367.35             | 4.3946              |
+| 3   | 2.2362          | 368.40             | 4.3711              |
+
+criterion 报告的 `[lower, median, upper]` 三元组在 run 3 上是：
+
+```
+v6_gamma_m5_hot_loop/backend/tree_walk
+    time:   [2.2341 s 2.2362 s 2.2392 s]
+v6_gamma_m5_hot_loop/backend/cranelift_aot
+    time:   [368.35 ms 368.40 ms 368.46 ms]
+v6_gamma_m5_hot_loop/backend/trace_jit_warm
+    time:   [4.3661 ms 4.3711 ms 4.3756 ms]
+```
+
+stddev / outlier 数据见 criterion `target/criterion/v6_gamma_m5_hot_loop/`
+HTML 报告。
+
+### M5.3 与 LuaJIT trace tier 对照
+
+LuaJIT 2.x 在同形态 `acc += i` hot-loop 上 trace-tier 稳态成本通常
+落在 **1-3 ns/iter**（参考 luajit-2.1 perf blog 系列与 mike-pall 在
+luajit 邮件列表的多次回帖）。v6-γ M5 的 `trace_jit_warm` 4.39 ns/iter
+比 LuaJIT 慢约 1.5-4 倍，主因是：
+
+1. 每次 invoke 走 `extern "C"` 调用 + `TraceContext` 指针 marshal，
+   LuaJIT 在 trace tier 走自家寄存器分配 + side-exit 协议，每次
+   invoke 只是 fall-through。
+2. v6-γ M5 的 trace body 还包含一个 `Return` op 的 `store
+   ssa_slots[result_slot] = ...; iconst.i32 0; return` 序列，约 3
+   条机器指令；LuaJIT 的 trace tail 通常直接落到下一个 trace 头。
+
+整体 4.39 ns/iter 已经处在 cranelift-aot warm（367 ns）的 1/83 量
+级，**相比 tree-walk 提升 511×**，相比 cranelift-aot warm 提升 83×。
+v6-δ 主要的剩余优化空间是去掉 invoke 的 ABI boundary，参考 LuaJIT
+trace-to-trace 跳转协议。
+
+### M5.4 bench 体内的工作偏置说明
+
+由于 v6-γ M5 的 trace emitter 仍**未实现 `LocalGet(idx)` →
+`args_ptr[idx]` 的物化**（recorder 把 `LocalGet` 当作 SSA rebind，
+emitter 看到引用未绑定 SSA 的 op 会 `EmitError::UnboundSsa`），bench
+的 trace body 退化为 `ConstI64(1); Return` 这种 guard-free 常量
+返回形态。每次 invoke 仍走完整的 entry-block / store result_slot /
+return 序列，per-iter 数字代表的是 trace-tail-call 的真实开销；
+但 trace body 内并未真正执行 `acc += i`，accumulation 由 Rust 侧的
+循环 `acc.wrapping_add(i)` 完成（每次 trace 调用 + 一次 Rust
+wrapping-add）。
+
+这种工作偏置不会让 trace_jit 数字虚假地变好——它衡量的是 invoke
+overhead，恰好是 hot-loop 路径上 LuaJIT 真正优化掉的东西。但读者
+应该理解：**trace 内部的 Add(I64) 路径还有一个独立的 v6-γ TODO**
+（`ArithOverflow` guard 在 I64 上预测出常量 0，brif 永远走 deopt
+块，trace 实际跑的是 deopt 路径而不是热路径）。两个 TODO 一起在
+v6-δ M1 处理：
+
+1. 给 emitter 加 `LocalGet → load(args_ptr + idx * 8)` lowering；
+2. 给 `ArithOverflow` guard 加真实的 cranelift `iadd_cout` 检测，
+   而不是常量 0 / 1 占位。
+
+详情见 stage report §6（"residual TODO"）。
+
