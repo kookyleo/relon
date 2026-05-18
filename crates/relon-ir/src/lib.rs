@@ -22,6 +22,8 @@ pub mod combining_marks;
 pub mod error;
 pub mod ir;
 pub mod lowering;
+pub mod normalization;
+pub mod normalization_data;
 pub mod stdlib;
 pub mod whitespace;
 
