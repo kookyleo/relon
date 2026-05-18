@@ -80,13 +80,14 @@ fn call_op_records_inputs() {
 }
 
 #[test]
-fn default_pipeline_runs_three_passes_clean_buffer() {
+fn default_pipeline_runs_all_passes_clean_buffer() {
     let mut b = TraceBuffer::new();
     let x = b.fresh_ssa();
     b.append(TraceOp::ConstI64(x, 10));
     let p = OptimizerPipeline::default_pipeline();
     let reports = p.run(&mut b);
-    assert_eq!(reports.len(), 3);
+    // const_fold + load_forward + dead_store + type_spec
+    assert_eq!(reports.len(), 4);
     // Nothing to fold / spec / DSE in this trivial trace.
     for (_, r) in reports {
         assert!(!r.touched());

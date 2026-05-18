@@ -39,7 +39,10 @@ pub use buffer::{OptimizedTrace, SerializableSideTables, TraceBuffer};
 pub use counter::{HotCounter, RecordResult, COUNTER_SATURATED};
 pub use effect::EffectClass;
 pub use guard::{DeoptState, GuardSite, RecoverableWrite};
-pub use optimizer::{OptimizerPass, OptimizerPipeline, PassReport};
+pub use optimizer::{
+    const_fold::ConstFold, dead_store::DeadStoreElim, load_forward::LoadForwarding,
+    type_spec::TypeSpec, OptimizerPass, OptimizerPipeline, PassReport,
+};
 pub use trace_ir::{
     CmpKind, ExternalAddr, ExternalPc, ExternalSlot, FuncId, GuardKind, ObservedType, Offset,
     SsaVar, TraceConst, TraceOp,
