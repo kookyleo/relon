@@ -126,7 +126,7 @@ dependencies = [
  "cfg-if",
  "libc",
  "miniz_oxide",
- "object",
+ "object 0.37.3",
  "rustc-demangle",
  "windows-link",
 ]
@@ -478,10 +478,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "cranelift-object"
+version = "0.131.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5f6cfa3a6ed5cc9a616cd5ef5dd4d26f683175737b1541679214da7ca12c2b43"
+dependencies = [
+ "anyhow",
+ "cranelift-codegen",
+ "cranelift-control",
+ "cranelift-module",
+ "log",
+ "object 0.39.1",
+ "target-lexicon",
+]
+
+[[package]]
 name = "cranelift-srcgen"
 version = "0.131.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d5a8f82fd5124f009f72167e60139245cd3b56cfd4b53050f22110c48c5f4da1"
+
+[[package]]
+name = "crc32fast"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9481c1c90cbf2ac953f07c8d4a58aa3945c425b7185c9154d67a65e4230da511"
+dependencies = [
+ "cfg-if",
+]
 
 [[package]]
 name = "criterion"
@@ -572,6 +596,7 @@ checksum = "9ed9a281f7bc9b7576e61468ba615a66a5c8cfdff42420a70aa82701a3b1e292"
 dependencies = [
  "block-buffer",
  "crypto-common",
+ "subtle",
 ]
 
 [[package]]
@@ -774,6 +799,9 @@ name = "hashbrown"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
+dependencies = [
+ "foldhash 0.2.0",
+]
 
 [[package]]
 name = "heck"
@@ -792,6 +820,15 @@ name = "hex"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
+
+[[package]]
+name = "hmac"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6c49c37c09c17a53d937dfbb742eb3a961d65a994e6bcdcf37e7399d0cc8ab5e"
+dependencies = [
+ "digest",
+]
 
 [[package]]
 name = "http"
@@ -1141,6 +1178,18 @@ version = "0.37.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ff76201f031d8863c38aa7f905eca4f53abbfa15f609db4277d44cd8938f33fe"
 dependencies = [
+ "memchr",
+]
+
+[[package]]
+name = "object"
+version = "0.39.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2e5a6c098c7a3b6547378093f5cc30bc54fd361ce711e05293a5cc589562739b"
+dependencies = [
+ "crc32fast",
+ "hashbrown 0.17.1",
+ "indexmap",
  "memchr",
 ]
 
@@ -1581,6 +1630,26 @@ dependencies = [
  "relon-parser",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "relon-object-cache"
+version = "0.1.0"
+dependencies = [
+ "bincode",
+ "cranelift-codegen",
+ "cranelift-frontend",
+ "cranelift-module",
+ "cranelift-native",
+ "cranelift-object",
+ "getrandom 0.2.17",
+ "hmac",
+ "libc",
+ "serde",
+ "sha2",
+ "target-lexicon",
+ "tempfile",
+ "thiserror",
 ]
 
 [[package]]
