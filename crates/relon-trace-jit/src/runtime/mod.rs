@@ -21,32 +21,19 @@
 //!     -> i32   // 0 = Hit, 1 = Miss (matches CacheResult)
 //! ```
 //!
-//! ## Why redeclare `TraceContext` here?
+//! ## Shared ABI (v6-γ M1)
 //!
-//! The emitter pins a concrete `#[repr(C)] TraceContext` layout in
-//! `relon_trace_emitter::abi::TraceContext`. This crate has **no
-//! dependency** on `relon-trace-emitter` (and must not — the dep
-//! direction is host -> jit -> emitter, never the reverse). To keep
-//! that invariant we redeclare a **layout-compatible** view of the
-//! parts we touch via the FFI boundary.
+//! The trace ABI types — `TraceContext`, `DeoptStateSnapshot`,
+//! `RecoverableWriteRecord` — live in `relon-trace-abi`. Both the
+//! emitter and this runtime crate import the canonical definitions
+//! from there, so the byte layout is a single source of truth and
+//! the host can hand a `TraceContext` allocated through any of the
+//! three sibling crates into a JIT-emitted trace without manual
+//! marshalling.
 //!
-//! ### Known ABI divergence (TODO v6-gamma phase)
-//!
-//! The emitter's `TraceContext::deopt_state` is typed as
-//! `Option<EmitterSnapshot>` where its snapshot only carries
-//! `guard_trace_pc` + `external_pc`. The runtime needs more state —
-//! a copy of `ssa_slots` at the deopt point and a drained list of
-//! recoverable writes. We therefore declare a **richer**
-//! [`deopt::DeoptStateSnapshot`] here and a `TraceContext` view
-//! whose `deopt_state` field is of the **same shape** but is the
-//! runtime's version, not the emitter's.
-//!
-//! As long as the host wires its `*mut TraceContext` to the
-//! runtime's redeclared type when invoking the JIT trace, the layouts
-//! match. The integration phase will reconcile both definitions into
-//! a single source of truth (most likely living in a shared
-//! `relon-trace-abi` crate that both `relon-trace-emitter` and
-//! `relon-trace-jit::runtime` depend on).
+//! The dep direction is `host -> trace-jit -> trace-abi` and
+//! `host -> trace-emitter -> trace-abi`; the two consumer crates
+//! never see each other.
 //!
 //! ## Concurrency
 //!
