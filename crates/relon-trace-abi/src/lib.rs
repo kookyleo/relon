@@ -52,6 +52,10 @@
 
 pub mod context;
 pub mod deopt;
+pub mod entry;
+pub mod external;
 
 pub use context::{HostHookTable, TraceContext};
 pub use deopt::{DeoptStateSnapshot, RecoverableWriteRecord};
+pub use entry::{AbiSignature, AbiType, TraceEntryStatus, TRACE_ENTRY_SIG};
+pub use external::{ExternalAddr, ExternalPc, ExternalSlot};
