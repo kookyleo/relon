@@ -2107,6 +2107,12 @@ impl<'a, 'b> Codegen<'a, 'b> {
                 else_body,
             } => self.emit_if(*result_ty, then_body, else_body)?,
             Op::CheckCap { cap_bit } => self.emit_check_cap(*cap_bit)?,
+            Op::CallNative {
+                import_idx,
+                param_tys,
+                ret_ty,
+                cap_bit,
+            } => self.emit_call_native(*import_idx, param_tys, *ret_ty, *cap_bit)?,
 
             // v5-β-2 widen: `select` for the simple stdlib bodies
             // (`abs` / `min` / `max`) and any user expression the
@@ -2935,6 +2941,122 @@ impl<'a, 'b> Codegen<'a, 'b> {
         let zero = self.builder.ins().iconst(self.pointer_ty, 0);
         let cmp = self.builder.ins().icmp(IntCC::Equal, fn_ptr, zero);
         self.cond_trap(cmp, TrapKind::CapabilityDenied);
+        Ok(())
+    }
+
+    /// Lower `Op::CallNative { import_idx, param_tys, ret_ty, cap_bit }`.
+    /// Stage 5 Phase C.1: full indirect dispatch via the capability
+    /// vtable.
+    ///
+    /// Sequence:
+    ///   1. (cap_bit != NO_CAPABILITY_BIT, capability_check on)
+    ///      call `cap_lookup(state, cap_bit)` to materialise the host
+    ///      fn pointer.
+    ///   2. Trap with `CapabilityDenied` when the returned pointer is
+    ///      null (slot not registered or denied by the host posture).
+    ///   3. Build a cranelift `Signature` matching the IR-declared
+    ///      `(param_tys) -> ret_ty` shape; install it as a SigRef on
+    ///      the current function.
+    ///   4. Pop `param_tys.len()` operands off the virtual stack and
+    ///      `call_indirect(sig_ref, fn_ptr, args)`.
+    ///   5. Push the (single) return value if `ret_ty != Null`.
+    ///
+    /// ABI: every host fn is exposed as `extern "C"` (`SystemV` calling
+    /// convention) — host SDKs that register fns must transmute their
+    /// concrete signature to [`crate::sandbox::HostFnPtr`] (a type-
+    /// erased pointer); the cranelift call-site re-shapes the slot
+    /// signature based on the IR's `param_tys + ret_ty` tag. Pointer-
+    /// indirect arg types (String / List*) flow through as i32 arena
+    /// offsets — the host fn is responsible for re-deriving the
+    /// arena base via the sandbox state pointer if it needs the raw
+    /// buffer.
+    fn emit_call_native(
+        &mut self,
+        import_idx: u32,
+        param_tys: &[IrType],
+        ret_ty: IrType,
+        cap_bit: u32,
+    ) -> Result<(), CraneliftError> {
+        // Validate the import index. Helps surface IR-pass bugs early.
+        let import = self.ir.imports.get(import_idx as usize).ok_or_else(|| {
+            CraneliftError::Codegen(format!(
+                "CallNative import_idx {import_idx} out of range (module has {} imports)",
+                self.ir.imports.len()
+            ))
+        })?;
+        if import.param_tys != param_tys {
+            return Err(CraneliftError::Codegen(format!(
+                "CallNative import #{import_idx} param shape disagreement: IR call has {:?}, import declares {:?}",
+                param_tys, import.param_tys
+            )));
+        }
+        if import.ret_ty != ret_ty {
+            return Err(CraneliftError::Codegen(format!(
+                "CallNative import #{import_idx} ret_ty disagreement: IR call has {:?}, import declares {:?}",
+                ret_ty, import.ret_ty
+            )));
+        }
+
+        // 1. cap_lookup -> fn_ptr (or null when the slot is empty).
+        // Even when capability_check is OFF on the sandbox config, we
+        // still need the fn pointer for the indirect call, so the
+        // lookup always runs; only the null-check is gated.
+        let effective_cap_bit = if cap_bit == relon_ir::ir::NO_CAPABILITY_BIT {
+            // The host SDK convention is to register host fns at the
+            // import's `import_idx` when no capability is required.
+            // Mirror that: use `import_idx` as the lookup key so an
+            // unguarded `#native` resolves to the same slot the SDK
+            // populated. The vtable's `register(import_idx, fn_ptr)`
+            // path is the canonical call-shape today; future host
+            // SDKs may grow a separate "default cap" slot system.
+            import_idx
+        } else {
+            cap_bit
+        };
+        let cap_bit_v = self.builder.ins().iconst(I32, i64::from(effective_cap_bit));
+        let inst = self
+            .builder
+            .ins()
+            .call(self.cap_lookup_ref, &[self.state_ptr, cap_bit_v]);
+        let fn_ptr = self.builder.inst_results(inst)[0];
+
+        // 2. Null-check (always emitted: even with capability_check off
+        //    we still need to refuse the call when the host never
+        //    registered any fn at this slot; a null `call_indirect`
+        //    would segfault).
+        let zero = self.builder.ins().iconst(self.pointer_ty, 0);
+        let cmp = self.builder.ins().icmp(IntCC::Equal, fn_ptr, zero);
+        self.cond_trap(cmp, TrapKind::CapabilityDenied);
+
+        // 3. Build the call signature mirroring (param_tys) -> ret_ty.
+        let mut sig = Signature::new(CallConv::SystemV);
+        for ty in param_tys {
+            let cl_ty = ir_ty_to_cl(*ty)?;
+            sig.params.push(AbiParam::new(cl_ty));
+        }
+        // Null return type means "no return value"; everything else
+        // gets one return slot.
+        if !matches!(ret_ty, IrType::Null) {
+            let cl_ret = ir_ty_to_cl(ret_ty)?;
+            sig.returns.push(AbiParam::new(cl_ret));
+        }
+        let sig_ref = self.builder.import_signature(sig);
+
+        // 4. Pop args off the virtual stack (last-pushed = last arg).
+        let mut args: Vec<CValue> = Vec::with_capacity(param_tys.len());
+        for _ in 0..param_tys.len() {
+            args.push(self.pop()?);
+        }
+        args.reverse();
+
+        let call_inst = self.builder.ins().call_indirect(sig_ref, fn_ptr, &args);
+
+        // 5. Push the return value (if any).
+        if !matches!(ret_ty, IrType::Null) {
+            let result = self.builder.inst_results(call_inst)[0];
+            self.push(result);
+        }
+
         Ok(())
     }
 
