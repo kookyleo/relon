@@ -469,7 +469,24 @@ impl CraneliftAotEvaluator {
             entry_shape,
             const_data,
             closure_func_ids,
+            vtable_data_id,
         } = compiled;
+
+        // v5-γ stage 2: populate the JIT-resolved capability vtable.
+        // `JITModule::get_finalized_data` returns the live pointer +
+        // length the codegen reserved via `declare_vtable_data`; we
+        // write the host helper fn pointers into the slots before any
+        // entry call runs so the emitted `call_indirect`s land on
+        // valid targets.
+        unsafe {
+            let (ptr, len) = module.get_finalized_data(vtable_data_id);
+            debug_assert!(
+                len >= crate::vtable::VTABLE_BYTES,
+                "JIT vtable data section is too small: {len} < {}",
+                crate::vtable::VTABLE_BYTES
+            );
+            crate::vtable::populate_vtable(ptr as *mut u8);
+        }
 
         // Cross-check: buffer schema metadata must agree with the IR
         // shape the codegen picked. A mismatch here is a programming

@@ -159,11 +159,15 @@ mod tests {
 
     #[test]
     fn reserved_slots_dwarf_active_slot_count() {
+        // Sanity-check at runtime so a future variant addition that
+        // also bumps `COUNT` past `RESERVED_SLOTS` surfaces here. The
+        // const arithmetic stops clippy's
+        // `assertions_on_constants` lint from firing.
+        let reserved = RESERVED_SLOTS;
+        let count = VtableSlot::COUNT;
         assert!(
-            RESERVED_SLOTS >= VtableSlot::COUNT,
-            "RESERVED_SLOTS={} must cover COUNT={}",
-            RESERVED_SLOTS,
-            VtableSlot::COUNT
+            reserved >= count,
+            "RESERVED_SLOTS={reserved} must cover COUNT={count}",
         );
     }
 

@@ -32,23 +32,24 @@ use std::collections::HashMap;
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::types::{I32, I64};
 use cranelift_codegen::ir::{
-    AbiParam, BlockArg, BlockCall, Function, InstBuilder, JumpTableData, MemFlags, Signature,
-    TrapCode, UserFuncName, Value as CValue,
+    AbiParam, BlockArg, BlockCall, Function, GlobalValue, Inst, InstBuilder, JumpTableData,
+    MemFlags, SigRef, Signature, TrapCode, UserFuncName, Value as CValue,
 };
 use cranelift_codegen::isa::CallConv;
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_codegen::Context as CodegenContext;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_jit::{JITBuilder, JITModule};
-use cranelift_module::{Linkage, Module as CrModule};
+use cranelift_module::{DataDescription, DataId, Linkage, Module as CrModule};
 
 use relon_ir::ir::{IrType, Module as IrModule, Op, TaggedOp};
 
 use crate::error::CraneliftError;
 use crate::sandbox::{
-    SandboxConfig, SandboxState, TrapKind, STATE_OFFSET_ARENA_BASE, STATE_OFFSET_ARENA_LEN,
+    SandboxConfig, TrapKind, STATE_OFFSET_ARENA_BASE, STATE_OFFSET_ARENA_LEN,
     STATE_OFFSET_SCRATCH_BASE, STATE_OFFSET_SCRATCH_CURSOR, STATE_OFFSET_TAIL_CURSOR,
 };
+use crate::vtable::{VtableSlot, VTABLE_BYTES, VTABLE_SYMBOL};
 
 /// Output of a successful compile: a JIT module plus the entry's
 /// function ID so the host can resolve a raw function pointer through
@@ -79,6 +80,12 @@ pub struct CompiledModule {
     /// fn pointer through that table, indexed by the closure handle's
     /// `fn_table_idx` field.
     pub closure_func_ids: Vec<cranelift_module::FuncId>,
+    /// v5-γ stage 2: data symbol holding the `__relon_capability_vtable`
+    /// slot array. The JIT pipeline populates it post-finalize via
+    /// `JITModule::get_finalized_data(vtable_data_id)`; the
+    /// `cranelift-object` pipeline emits the symbol as `Linkage::Export`
+    /// so the host's `dlsym` round-trip resolves it after `dlopen`.
+    pub vtable_data_id: cranelift_module::DataId,
 }
 
 /// Per-module const-pool layout. Maps each IR-level `idx` referenced
@@ -583,59 +590,23 @@ pub fn compile_module_with(
         .finish(flags)
         .map_err(|e| CraneliftError::JitSetup(format!("isa finish: {e}")))?;
 
-    // Build a JIT module with the default symbol set. We register the
-    // sandbox helper functions ahead of `JITBuilder::build` so the
-    // compiled module can resolve them via `declare_function`.
-    let mut jit_builder =
-        JITBuilder::with_isa(isa.clone(), cranelift_module::default_libcall_names());
-    // Register host symbols by their address (libcalls would also be
-    // valid here, but the sandbox helpers have unique non-libcall
-    // names so we use the direct-symbol path).
-    jit_builder.symbol("relon_now", SandboxState::now_helper as *const u8);
-    jit_builder.symbol("relon_raise_trap", SandboxState::raise_trap as *const u8);
-    jit_builder.symbol("relon_cap_lookup", SandboxState::cap_lookup as *const u8);
-
+    // Build a JIT module with the default symbol set. v5-γ stage 2:
+    // we no longer register host helper symbols by address here.
+    // Instead, every helper call indirects through the
+    // `__relon_capability_vtable` data symbol (see crate::vtable); the
+    // post-finalize step (in `evaluator.rs`) writes the live host fn
+    // pointers into the table.
+    let jit_builder = JITBuilder::with_isa(isa.clone(), cranelift_module::default_libcall_names());
     let mut module = JITModule::new(jit_builder);
 
-    // Declare the sandbox helpers up front. We need their `FuncId`s
-    // so the codegen pass can emit `call_indirect`-style references.
-    let raise_trap_sig = {
-        let mut sig = module.make_signature();
-        sig.params
-            .push(AbiParam::new(module.target_config().pointer_type()));
-        sig.params.push(AbiParam::new(I64));
-        sig.call_conv = CallConv::SystemV;
-        sig
-    };
-    let raise_trap_id = module
-        .declare_function("relon_raise_trap", Linkage::Import, &raise_trap_sig)
-        .map_err(|e| CraneliftError::ModuleDefine(format!("declare raise_trap: {e}")))?;
+    let vtable_data_id = declare_vtable_data(&mut module)?;
 
-    let now_sig = {
-        let mut sig = module.make_signature();
-        sig.params
-            .push(AbiParam::new(module.target_config().pointer_type()));
-        sig.returns.push(AbiParam::new(I64));
-        sig.call_conv = CallConv::SystemV;
-        sig
-    };
-    let now_id = module
-        .declare_function("relon_now", Linkage::Import, &now_sig)
-        .map_err(|e| CraneliftError::ModuleDefine(format!("declare now: {e}")))?;
-
-    let cap_lookup_sig = {
-        let mut sig = module.make_signature();
-        sig.params
-            .push(AbiParam::new(module.target_config().pointer_type()));
-        sig.params.push(AbiParam::new(I32));
-        sig.returns
-            .push(AbiParam::new(module.target_config().pointer_type()));
-        sig.call_conv = CallConv::SystemV;
-        sig
-    };
-    let cap_lookup_id = module
-        .declare_function("relon_cap_lookup", Linkage::Import, &cap_lookup_sig)
-        .map_err(|e| CraneliftError::ModuleDefine(format!("declare cap_lookup: {e}")))?;
+    // Pre-compute the three host-fn signatures the codegen indirects
+    // through. The signatures match the slot ABI documented in
+    // `crate::vtable::VtableSlot`.
+    let raise_trap_sig = make_raise_trap_signature(module.target_config().pointer_type());
+    let now_sig = make_now_signature(module.target_config().pointer_type());
+    let cap_lookup_sig = make_cap_lookup_signature(module.target_config().pointer_type());
 
     // Build the entry signature. The exact shape depends on
     // `entry_shape`: legacy IR carries `I64...` user args, while the
@@ -725,11 +696,15 @@ pub fn compile_module_with(
         let state_ptr = block_params[0];
         let arg_values: Vec<CValue> = block_params[1..].to_vec();
 
-        // Reference declarations into the function so the lowering
-        // pass can emit direct calls to them.
-        let raise_trap_ref = module.declare_func_in_func(raise_trap_id, builder.func);
-        let now_ref = module.declare_func_in_func(now_id, builder.func);
-        let cap_lookup_ref = module.declare_func_in_func(cap_lookup_id, builder.func);
+        // v5-γ stage 2: import the capability vtable as a GlobalValue
+        // on the current function. Every host-helper call indirects
+        // through `load(vtable_base + slot_offset) -> fn_ptr` followed
+        // by `call_indirect(sig, fn_ptr, args)` — see
+        // `Codegen::emit_host_fn_call`.
+        let vtable_gv = module.declare_data_in_func(vtable_data_id, builder.func);
+        let raise_trap_sig_ref = builder.import_signature(raise_trap_sig.clone());
+        let now_sig_ref = builder.import_signature(now_sig.clone());
+        let cap_lookup_sig_ref = builder.import_signature(cap_lookup_sig.clone());
 
         // Pre-allocate the trap block + a block param that carries
         // the i64 trap code. Every guard branches here with its
@@ -746,9 +721,10 @@ pub fn compile_module_with(
             builder: &mut builder,
             sandbox,
             state_ptr,
-            raise_trap_ref,
-            now_ref,
-            cap_lookup_ref,
+            vtable_gv,
+            raise_trap_sig_ref,
+            now_sig_ref,
+            cap_lookup_sig_ref,
             pointer_ty,
             frontend_config: module.target_config(),
             entry_shape,
@@ -774,12 +750,19 @@ pub fn compile_module_with(
 
         // Now fill the trap block body. Every guard branched in with
         // its `TrapKind as i64` as the block param; we call
-        // `relon_raise_trap(state, code)` and return a sentinel zero
-        // of the entry's return type so the host trampoline can
-        // detect the trap via `state.trap_code()`.
+        // `relon_raise_trap(state, code)` (via vtable indirection) and
+        // return a sentinel zero of the entry's return type so the
+        // host trampoline can detect the trap via `state.trap_code()`.
         builder.switch_to_block(trap_block);
         let code = builder.block_params(trap_block)[0];
-        builder.ins().call(raise_trap_ref, &[state_ptr, code]);
+        emit_indirect_host_call(
+            &mut builder,
+            vtable_gv,
+            pointer_ty,
+            VtableSlot::RelonRaiseTrap,
+            raise_trap_sig_ref,
+            &[state_ptr, code],
+        );
         let zero = match entry_shape {
             EntryShape::LegacyI64Args => builder.ins().iconst(I64, 0),
             EntryShape::BufferProtocol => builder.ins().iconst(I32, 0),
@@ -831,9 +814,14 @@ pub fn compile_module_with(
             let captures_ptr = block_params[1];
             let lambda_arg_values: Vec<CValue> = block_params[2..].to_vec();
 
-            let raise_trap_ref = module.declare_func_in_func(raise_trap_id, builder.func);
-            let now_ref = module.declare_func_in_func(now_id, builder.func);
-            let cap_lookup_ref = module.declare_func_in_func(cap_lookup_id, builder.func);
+            // v5-γ stage 2: import the capability vtable as a
+            // GlobalValue on this lambda. Each helper call indirects
+            // through `vtable_base + slot_offset` (see
+            // `Codegen::emit_host_fn_call`).
+            let vtable_gv = module.declare_data_in_func(vtable_data_id, builder.func);
+            let raise_trap_sig_ref = builder.import_signature(raise_trap_sig.clone());
+            let now_sig_ref = builder.import_signature(now_sig.clone());
+            let cap_lookup_sig_ref = builder.import_signature(cap_lookup_sig.clone());
 
             let trap_block = builder.create_block();
             builder.append_block_param(trap_block, I64);
@@ -852,9 +840,10 @@ pub fn compile_module_with(
                 builder: &mut builder,
                 sandbox,
                 state_ptr: lambda_state_ptr,
-                raise_trap_ref,
-                now_ref,
-                cap_lookup_ref,
+                vtable_gv,
+                raise_trap_sig_ref,
+                now_sig_ref,
+                cap_lookup_sig_ref,
                 pointer_ty,
                 frontend_config: module.target_config(),
                 // Lambdas use the LegacyI64Args entry shape for
@@ -885,9 +874,14 @@ pub fn compile_module_with(
 
             builder.switch_to_block(trap_block);
             let code = builder.block_params(trap_block)[0];
-            builder
-                .ins()
-                .call(raise_trap_ref, &[lambda_state_ptr, code]);
+            emit_indirect_host_call(
+                &mut builder,
+                vtable_gv,
+                pointer_ty,
+                VtableSlot::RelonRaiseTrap,
+                raise_trap_sig_ref,
+                &[lambda_state_ptr, code],
+            );
             // Lambdas always return a typed value (the IR-declared
             // ret_ty). On trap-block exit we emit a typed zero so the
             // verifier accepts the synthetic return.
@@ -921,7 +915,96 @@ pub fn compile_module_with(
         entry_shape,
         const_data: const_pool.bytes,
         closure_func_ids,
+        vtable_data_id,
     })
+}
+
+/// Build the cranelift signature for the `RelonRaiseTrap` vtable
+/// slot: `extern "C" fn(state: *const SandboxState, code: i64)`.
+fn make_raise_trap_signature(pointer_ty: cranelift_codegen::ir::Type) -> Signature {
+    let mut sig = Signature::new(CallConv::SystemV);
+    sig.params.push(AbiParam::new(pointer_ty));
+    sig.params.push(AbiParam::new(I64));
+    sig
+}
+
+/// Build the cranelift signature for the `RelonNow` vtable slot:
+/// `extern "C" fn(state: *const SandboxState) -> i64`.
+fn make_now_signature(pointer_ty: cranelift_codegen::ir::Type) -> Signature {
+    let mut sig = Signature::new(CallConv::SystemV);
+    sig.params.push(AbiParam::new(pointer_ty));
+    sig.returns.push(AbiParam::new(I64));
+    sig
+}
+
+/// Build the cranelift signature for the `RelonCapLookup` vtable
+/// slot: `extern "C" fn(state: *const SandboxState, cap_bit: i32) ->
+/// *const u8`.
+fn make_cap_lookup_signature(pointer_ty: cranelift_codegen::ir::Type) -> Signature {
+    let mut sig = Signature::new(CallConv::SystemV);
+    sig.params.push(AbiParam::new(pointer_ty));
+    sig.params.push(AbiParam::new(I32));
+    sig.returns.push(AbiParam::new(pointer_ty));
+    sig
+}
+
+/// Declare the `__relon_capability_vtable` data symbol on the given
+/// module. Reserves [`VTABLE_BYTES`] of zero-initialised space so the
+/// host can populate the slots post-finalize (JIT) or post-dlopen
+/// (cranelift-object).
+///
+/// Linkage rules:
+/// - `JITModule`: `Linkage::Local` — the JIT resolves the symbol by
+///   `DataId` rather than by name, so the linkage is advisory.
+/// - `ObjectModule`: `Linkage::Export` — the ELF needs the symbol in
+///   `.dynsym` so `dlsym` can find it from the host side.
+///
+/// We pick `Export` here because both backends accept it; the JIT's
+/// `get_finalized_data` works either way.
+fn declare_vtable_data<M: CrModule>(module: &mut M) -> Result<DataId, CraneliftError> {
+    // `writable = true` because the host populates the slots
+    // post-link. `tls = false` — single-process shared vtable.
+    let data_id = module
+        .declare_data(
+            VTABLE_SYMBOL,
+            Linkage::Export,
+            /*writable=*/ true,
+            /*tls=*/ false,
+        )
+        .map_err(|e| CraneliftError::ModuleDefine(format!("declare vtable data: {e}")))?;
+    let mut desc = DataDescription::new();
+    desc.define_zeroinit(VTABLE_BYTES);
+    module
+        .define_data(data_id, &desc)
+        .map_err(|e| CraneliftError::ModuleDefine(format!("define vtable data: {e}")))?;
+    Ok(data_id)
+}
+
+/// Emit an indirect host-helper call: load the function pointer from
+/// the vtable slot, then `call_indirect` with the supplied signature.
+///
+/// Used both inside `Codegen` (for body-level helper calls) and in
+/// the `compile_module_with` driver (to lower the trap_block tail).
+/// Centralising the load sequence keeps the codegen output uniform
+/// across entry / lambda / trap-block call sites.
+fn emit_indirect_host_call(
+    builder: &mut FunctionBuilder<'_>,
+    vtable_gv: GlobalValue,
+    pointer_ty: cranelift_codegen::ir::Type,
+    slot: VtableSlot,
+    sig_ref: SigRef,
+    args: &[CValue],
+) -> Inst {
+    // Materialise the vtable base address in the function.
+    let vtable_base = builder.ins().global_value(pointer_ty, vtable_gv);
+    // Load the slot's host fn pointer.
+    let fn_ptr = builder.ins().load(
+        pointer_ty,
+        MemFlags::trusted(),
+        vtable_base,
+        slot.offset_bytes(),
+    );
+    builder.ins().call_indirect(sig_ref, fn_ptr, args)
 }
 
 /// Map a generic IR type to its cranelift slot type. Used by the
@@ -1053,15 +1136,25 @@ struct Codegen<'a, 'b> {
     builder: &'a mut FunctionBuilder<'b>,
     sandbox: &'a SandboxConfig,
     state_ptr: CValue,
+    /// v5-γ stage 2: GlobalValue for the `__relon_capability_vtable`
+    /// data symbol. Every host-helper call indirects through this
+    /// base + a per-slot byte offset; see [`VtableSlot`].
+    vtable_gv: GlobalValue,
+    /// Pre-built cranelift signature for `relon_raise_trap`. Imported
+    /// into the current function once during `compile_module_with`
+    /// and reused for every `Op::RaiseTrap` lowering.
+    ///
     /// Reserved for future op coverage. v5-beta-1 doesn't emit
     /// `raise_trap` directly — every guard uses cranelift's intrinsic
     /// `trap` / `trapnz`, which delivers the trap-code byte through
-    /// the runtime's panic path — but holding the FuncRef ready
+    /// the runtime's panic path — but holding the SigRef ready
     /// avoids a second pass for v5-beta-2 to wire in.
     #[allow(dead_code)]
-    raise_trap_ref: cranelift_codegen::ir::FuncRef,
-    now_ref: cranelift_codegen::ir::FuncRef,
-    cap_lookup_ref: cranelift_codegen::ir::FuncRef,
+    raise_trap_sig_ref: SigRef,
+    /// Pre-built cranelift signature for `relon_now`.
+    now_sig_ref: SigRef,
+    /// Pre-built cranelift signature for `relon_cap_lookup`.
+    cap_lookup_sig_ref: SigRef,
     pointer_ty: cranelift_codegen::ir::Type,
     /// Target frontend config (pointer width / default call conv).
     /// Threaded through so helpers that call `call_memcpy` get the
@@ -1220,6 +1313,26 @@ struct LabelFrame {
 }
 
 impl<'a, 'b> Codegen<'a, 'b> {
+    /// v5-γ stage 2: emit an indirect call to the host helper at
+    /// `slot`. Loads the function pointer from
+    /// `__relon_capability_vtable[slot]` and `call_indirect`s with the
+    /// matching pre-built signature.
+    fn emit_host_fn_call(&mut self, slot: VtableSlot, args: &[CValue]) -> Inst {
+        let sig_ref = match slot {
+            VtableSlot::RelonNow => self.now_sig_ref,
+            VtableSlot::RelonRaiseTrap => self.raise_trap_sig_ref,
+            VtableSlot::RelonCapLookup => self.cap_lookup_sig_ref,
+        };
+        emit_indirect_host_call(
+            self.builder,
+            self.vtable_gv,
+            self.pointer_ty,
+            slot,
+            sig_ref,
+            args,
+        )
+    }
+
     /// Emit the entry prologue: resource-limit check (one wall-clock
     /// read + comparison) plus any other one-shot setup. For buffer-
     /// protocol entries whose body emits pointer-indirect stores or
@@ -1266,8 +1379,8 @@ impl<'a, 'b> Codegen<'a, 'b> {
     /// `state.epoch.elapsed().as_nanos()` via the host helper and
     /// traps when the result is past `state.deadline_ns`.
     fn emit_resource_check(&mut self) {
-        // call relon_now(state) -> i64
-        let inst = self.builder.ins().call(self.now_ref, &[self.state_ptr]);
+        // call relon_now(state) -> i64 via the capability vtable.
+        let inst = self.emit_host_fn_call(VtableSlot::RelonNow, &[self.state_ptr]);
         let elapsed = self.builder.inst_results(inst)[0];
 
         // Load deadline_ns from state. The offset lives in
@@ -3139,10 +3252,7 @@ impl<'a, 'b> Codegen<'a, 'b> {
             return Ok(());
         }
         let cap_bit_v = self.builder.ins().iconst(I32, i64::from(cap_bit));
-        let inst = self
-            .builder
-            .ins()
-            .call(self.cap_lookup_ref, &[self.state_ptr, cap_bit_v]);
+        let inst = self.emit_host_fn_call(VtableSlot::RelonCapLookup, &[self.state_ptr, cap_bit_v]);
         let fn_ptr = self.builder.inst_results(inst)[0];
         let zero = self.builder.ins().iconst(self.pointer_ty, 0);
         let cmp = self.builder.ins().icmp(IntCC::Equal, fn_ptr, zero);
@@ -3220,10 +3330,7 @@ impl<'a, 'b> Codegen<'a, 'b> {
             cap_bit
         };
         let cap_bit_v = self.builder.ins().iconst(I32, i64::from(effective_cap_bit));
-        let inst = self
-            .builder
-            .ins()
-            .call(self.cap_lookup_ref, &[self.state_ptr, cap_bit_v]);
+        let inst = self.emit_host_fn_call(VtableSlot::RelonCapLookup, &[self.state_ptr, cap_bit_v]);
         let fn_ptr = self.builder.inst_results(inst)[0];
 
         // 2. Null-check (always emitted: even with capability_check off
