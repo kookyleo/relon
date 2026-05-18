@@ -16,7 +16,10 @@ fn abi_types_are_now_shared() {
     use relon_trace_abi as abi;
     use relon_trace_jit::{DeoptStateSnapshot, RecoverableWriteRecord, TraceContext};
 
-    assert_eq!(TypeId::of::<TraceContext>(), TypeId::of::<abi::TraceContext>());
+    assert_eq!(
+        TypeId::of::<TraceContext>(),
+        TypeId::of::<abi::TraceContext>()
+    );
     assert_eq!(
         TypeId::of::<DeoptStateSnapshot>(),
         TypeId::of::<abi::DeoptStateSnapshot>()
@@ -52,5 +55,8 @@ fn observed_type_and_effect_class_are_shared() {
         TypeId::of::<ObservedType>(),
         TypeId::of::<abi::ObservedType>()
     );
-    assert_eq!(TypeId::of::<EffectClass>(), TypeId::of::<abi::EffectClass>());
+    assert_eq!(
+        TypeId::of::<EffectClass>(),
+        TypeId::of::<abi::EffectClass>()
+    );
 }

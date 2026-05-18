@@ -17,7 +17,10 @@ fn abi_types_match_trace_abi() {
         RecoverableWriteRecord, TraceContext,
     };
 
-    assert_eq!(TypeId::of::<TraceContext>(), TypeId::of::<abi::TraceContext>());
+    assert_eq!(
+        TypeId::of::<TraceContext>(),
+        TypeId::of::<abi::TraceContext>()
+    );
     assert_eq!(
         TypeId::of::<DeoptStateSnapshot>(),
         TypeId::of::<abi::DeoptStateSnapshot>()
@@ -39,7 +42,10 @@ fn abi_types_match_trace_abi() {
         TypeId::of::<ObservedType>(),
         TypeId::of::<abi::ObservedType>()
     );
-    assert_eq!(TypeId::of::<EffectClass>(), TypeId::of::<abi::EffectClass>());
+    assert_eq!(
+        TypeId::of::<EffectClass>(),
+        TypeId::of::<abi::EffectClass>()
+    );
 }
 
 #[test]

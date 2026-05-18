@@ -68,10 +68,7 @@ impl GenericState {
     /// Read `slot` if present.
     pub fn slot(&self, slot: ExternalSlot) -> Option<u64> {
         let key = slot.0 as u64;
-        self.slots
-            .iter()
-            .find(|(s, _)| *s == key)
-            .map(|(_, v)| *v)
+        self.slots.iter().find(|(s, _)| *s == key).map(|(_, v)| *v)
     }
 
     /// Apply a [`DeoptStateSnapshot`] into this generic frame via the

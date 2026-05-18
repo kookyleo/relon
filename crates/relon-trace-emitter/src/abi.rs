@@ -28,9 +28,9 @@
 use cranelift_codegen::ir;
 
 pub use relon_trace_abi::{
-    AbiSignature, AbiType, DeoptStateSnapshot, EffectClass, ExternalAddr, ExternalPc,
-    ExternalSlot, HostHookTable, ObservedType, RecoverableWriteRecord, TraceContext,
-    TraceEntryStatus, TRACE_ENTRY_SIG,
+    AbiSignature, AbiType, DeoptStateSnapshot, EffectClass, ExternalAddr, ExternalPc, ExternalSlot,
+    HostHookTable, ObservedType, RecoverableWriteRecord, TraceContext, TraceEntryStatus,
+    TRACE_ENTRY_SIG,
 };
 
 /// Backwards-compatible alias for the old emitter-local `CraneliftType`
