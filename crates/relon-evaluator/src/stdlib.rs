@@ -34,12 +34,14 @@ pub fn register_to(ctx: &mut Context) {
     let string_replace: Arc<dyn RelonFunction> = Arc::new(StringReplace);
     let string_upper: Arc<dyn RelonFunction> = Arc::new(StringUpper);
     let string_lower: Arc<dyn RelonFunction> = Arc::new(StringLower);
+    let string_title: Arc<dyn RelonFunction> = Arc::new(StringTitle);
     let string_contains: Arc<dyn RelonFunction> = Arc::new(StringContains);
     ctx.register_pure_fn("_string_split", Arc::clone(&string_split));
     ctx.register_pure_fn("_string_join", Arc::clone(&string_join));
     ctx.register_pure_fn("_string_replace", Arc::clone(&string_replace));
     ctx.register_pure_fn("_string_upper", Arc::clone(&string_upper));
     ctx.register_pure_fn("_string_lower", Arc::clone(&string_lower));
+    ctx.register_pure_fn("_string_title", Arc::clone(&string_title));
     ctx.register_pure_fn("_string_contains", Arc::clone(&string_contains));
 
     let dict_merge: Arc<dyn RelonFunction> = Arc::new(DictMerge);
@@ -101,6 +103,12 @@ pub fn register_to(ctx: &mut Context) {
     ctx.register_pure_method("String", "replace", string_replace);
     ctx.register_pure_method("String", "upper", string_upper);
     ctx.register_pure_method("String", "lower", string_lower);
+    // v3++ b-4: word-boundary aware title case. Mirrors the
+    // wasm-AOT body (`crates/relon-ir/src/stdlib.rs::title_string`)
+    // — split on Unicode whitespace, upper-case the first cased
+    // codepoint of each word, lower-case the rest, and keep
+    // combining marks attached to their base cluster.
+    ctx.register_pure_method("String", "title", string_title);
     ctx.register_pure_method("String", "contains", Arc::clone(&string_contains));
     ctx.register_pure_method("String", "len", Arc::clone(&len));
 
@@ -787,6 +795,61 @@ impl RelonFunction for StringLower {
         Ok(Value::String(
             expect_string(&args[0], range)?.to_lowercase(),
         ))
+    }
+}
+
+/// v3++ b-4: word-boundary aware case fold mirroring the wasm-AOT
+/// `title` body in `crates/relon-ir/src/stdlib.rs`.
+///
+/// Algorithm:
+///   * Walk the input codepoint-by-codepoint.
+///   * Whitespace (`char::is_whitespace`) passes through unchanged and
+///     resets the `at_word_start` flag.
+///   * Unicode combining marks
+///     (`crates/relon-ir/src/combining_marks.rs::is_combining_mark`)
+///     pass through unchanged and do **not** flip `at_word_start` — a
+///     mark belongs to its base codepoint's cluster.
+///   * Every other codepoint is upper-cased when `at_word_start` is
+///     set, otherwise lower-cased. The flag clears after the first
+///     such codepoint of each word.
+///
+/// Stays in lock-step with the wasm-AOT body's behaviour so backend
+/// tests can compare results bit-for-bit.
+struct StringTitle;
+impl RelonFunction for StringTitle {
+    fn call(
+        &self,
+        args: NativeArgs,
+        range: relon_parser::TokenRange,
+    ) -> Result<Value, RuntimeError> {
+        let args = args.into_positional();
+        expect_arg_count(&args, 1, range)?;
+        let s = expect_string(&args[0], range)?;
+        let mut out = String::with_capacity(s.len());
+        let mut at_word_start = true;
+        for cp in s.chars() {
+            if relon_ir::combining_marks::is_combining_mark(cp as u32) {
+                // Mark — pass through and leave the boundary flag alone.
+                out.push(cp);
+                continue;
+            }
+            if cp.is_whitespace() {
+                out.push(cp);
+                at_word_start = true;
+                continue;
+            }
+            if at_word_start {
+                for c in cp.to_uppercase() {
+                    out.push(c);
+                }
+            } else {
+                for c in cp.to_lowercase() {
+                    out.push(c);
+                }
+            }
+            at_word_start = false;
+        }
+        Ok(Value::String(out))
     }
 }
 

@@ -1825,6 +1825,7 @@ dependencies = [
  "relon-analyzer",
  "relon-eval-api",
  "relon-fmt",
+ "relon-ir",
  "relon-parser",
  "serde",
  "serde_json",
