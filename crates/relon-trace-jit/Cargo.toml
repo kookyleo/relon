@@ -1,0 +1,24 @@
+[package]
+name = "relon-trace-jit"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "v6-gamma trace JIT scaffolding: self-contained trace IR, hot counters, deopt protocol, and optimizer passes (pre-integration)."
+keywords = ["relon", "trace", "jit", "deopt", "optimizer"]
+categories = ["compilers"]
+
+# This crate intentionally has no dependency on `relon-ir`,
+# `relon-codegen-native`, or other in-tree crates. It defines a
+# self-contained low-level `TraceOp` IR + optimizer + data structures
+# that v6-gamma phase will glue to Relon IR / Cranelift via a separate
+# lowering layer. Keeping the dependency graph empty lets us iterate on
+# trace algorithms in isolation and unit-test deterministically.
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+bincode = "1.3"
+
+[dev-dependencies]
+serde_json = { workspace = true }
