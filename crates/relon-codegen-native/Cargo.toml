@@ -23,13 +23,19 @@ relon-parser = { workspace = true }
 # used to wire the analyzer the same way; this is the only AOT path
 # left.
 relon-analyzer = { workspace = true }
-# Shared trace JIT ABI types. Pulled in by v6-γ M1 ahead of the M2-M5
-# integration milestones so the dep edge is in place when codegen-native
-# starts injecting `HotCounter` increments and dispatching into JIT
-# traces — see `docs/internal/v6-gamma-integration-plan-2026-05-18.md`.
-# No source files in this crate import from it yet; the milestones land
-# the usage one stage at a time.
+# Shared trace JIT ABI types. v6-γ M2/M3: codegen-native now injects
+# HotCounter prologues at every cranelift entry function and the
+# `trace_install` module drives the
+# `recorder → optimizer → emitter → JIT install` pipeline. See
+# `docs/internal/v6-gamma-integration-plan-2026-05-18.md` §3 + §4.
 relon-trace-abi = { workspace = true }
+# v6-γ M2/M3: recorder + optimizer + emitter pulled in so the trace
+# install pipeline can be driven entirely from the codegen-native
+# layer. Each crate keeps its own test surface; the integration tests
+# live under `tests/trace_jit_smoke.rs`.
+relon-trace-jit = { workspace = true }
+relon-trace-recorder = { workspace = true }
+relon-trace-emitter = { workspace = true }
 
 thiserror = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
