@@ -346,11 +346,21 @@ pub fn compile_module_with_host_fns(
         &ConstExpr::i64_const(0),
     );
 
-    // Single shared memory: one page (64 KiB). Host writes the input
-    // buffer somewhere inside, hands the pointer to `run_main`, then
-    // reads `out_buf` back out from the same memory.
+    // Shared memory sized to cover the const-data section plus a
+    // small headroom for in/out buffers and bump-allocated scratch.
+    // Default is one page (64 KiB); the v3++ b-5 normalization tables
+    // alone exceed that (NFKD index roughly 70 KiB), so we always
+    // round up to fit the laid-out data section plus a 64 KiB
+    // headroom for scratch. Host SDKs can still grow further at
+    // runtime via `memory.grow`.
+    const HEADROOM_BYTES: u64 = 64 * 1024;
+    const PAGE_BYTES: u64 = 64 * 1024;
+    let data_bytes = (DATA_SECTION_BASE as u64) + const_pool.total_bytes() as u64;
+    let required_bytes = data_bytes + HEADROOM_BYTES;
+    let required_pages = required_bytes.div_ceil(PAGE_BYTES);
+    let min_pages = required_pages.max(DEFAULT_MEMORY_PAGES);
     memories.memory(MemoryType {
-        minimum: DEFAULT_MEMORY_PAGES,
+        minimum: min_pages,
         maximum: None,
         memory64: false,
         shared: false,
@@ -880,6 +890,19 @@ struct ConstPool {
     /// whitespace is checked via a direct comparison in the `title`
     /// body so the common case avoids touching the table.
     whitespace_offset: Option<u32>,
+    /// v3++ b-5: byte offset of the canonical (NFD) decomposition
+    /// table. `Some(off)` only when at least one reachable body
+    /// references `Op::DecompTableAddr { compatibility: false }`.
+    /// Layout combines an index plus a payload pool — see
+    /// [`relon_ir::normalization::encode_decomp_table_bytes`].
+    decomp_nfd_offset: Option<u32>,
+    /// v3++ b-5: byte offset of the compatibility (NFKD)
+    /// decomposition table. Mirrors `decomp_nfd_offset`.
+    decomp_nfkd_offset: Option<u32>,
+    /// v3++ b-5: byte offset of the Canonical_Combining_Class table.
+    ccc_offset: Option<u32>,
+    /// v3++ b-5: byte offset of the canonical composition pair table.
+    composition_offset: Option<u32>,
 }
 
 impl ConstPool {
@@ -951,6 +974,34 @@ impl ConstPool {
     /// non-ASCII Unicode whitespace ranges table.
     fn whitespace_addr(&self) -> Result<u32, CodegenError> {
         self.whitespace_offset
+            .map(|o| DATA_SECTION_BASE + o)
+            .ok_or(CodegenError::MixedNumericTypes)
+    }
+
+    /// v3++ b-5: lookup the absolute address of the canonical (NFD)
+    /// or compatibility (NFKD) decomposition table.
+    fn decomp_addr(&self, compatibility: bool) -> Result<u32, CodegenError> {
+        let off = if compatibility {
+            self.decomp_nfkd_offset
+        } else {
+            self.decomp_nfd_offset
+        };
+        off.map(|o| DATA_SECTION_BASE + o)
+            .ok_or(CodegenError::MixedNumericTypes)
+    }
+
+    /// v3++ b-5: lookup the absolute address of the
+    /// Canonical_Combining_Class table.
+    fn ccc_addr(&self) -> Result<u32, CodegenError> {
+        self.ccc_offset
+            .map(|o| DATA_SECTION_BASE + o)
+            .ok_or(CodegenError::MixedNumericTypes)
+    }
+
+    /// v3++ b-5: lookup the absolute address of the canonical
+    /// composition pair table.
+    fn composition_addr(&self) -> Result<u32, CodegenError> {
+        self.composition_offset
             .map(|o| DATA_SECTION_BASE + o)
             .ok_or(CodegenError::MixedNumericTypes)
     }
@@ -1256,6 +1307,74 @@ fn collect_consts(body: &[relon_ir::TaggedOp], pool: &mut ConstPool) -> Result<(
                     let bytes = relon_ir::whitespace::encode_ranges_bytes(table);
                     pool.bytes.extend_from_slice(&bytes);
                     pool.whitespace_offset = Some(offset);
+                }
+            }
+            Op::DecompTableAddr { compatibility } => {
+                // v3++ b-5: lay out the canonical / compatibility
+                // decomposition table on first reference. The
+                // encoded blob is `index_count + 12*index_count +
+                // pool_count + 4*pool_count` bytes. The byte layout
+                // is documented on `Op::DecompTableAddr`.
+                let slot = if *compatibility {
+                    &mut pool.decomp_nfkd_offset
+                } else {
+                    &mut pool.decomp_nfd_offset
+                };
+                if slot.is_none() {
+                    while !pool.bytes.len().is_multiple_of(4) {
+                        pool.bytes.push(0);
+                    }
+                    let offset = u32::try_from(pool.bytes.len()).map_err(|_| {
+                        CodegenError::Layout("const data section exceeds u32 bytes".into())
+                    })?;
+                    let (index, payload) = if *compatibility {
+                        (
+                            relon_ir::normalization_data::NFKD_INDEX,
+                            relon_ir::normalization_data::NFKD_POOL,
+                        )
+                    } else {
+                        (
+                            relon_ir::normalization_data::NFD_INDEX,
+                            relon_ir::normalization_data::NFD_POOL,
+                        )
+                    };
+                    let bytes = relon_ir::normalization::encode_decomp_table_bytes(index, payload);
+                    pool.bytes.extend_from_slice(&bytes);
+                    *slot = Some(offset);
+                }
+            }
+            Op::CccTableAddr => {
+                // v3++ b-5: lay out the Canonical_Combining_Class
+                // table on first reference.
+                if pool.ccc_offset.is_none() {
+                    while !pool.bytes.len().is_multiple_of(4) {
+                        pool.bytes.push(0);
+                    }
+                    let offset = u32::try_from(pool.bytes.len()).map_err(|_| {
+                        CodegenError::Layout("const data section exceeds u32 bytes".into())
+                    })?;
+                    let bytes = relon_ir::normalization::encode_ccc_table_bytes(
+                        relon_ir::normalization_data::CCC_TABLE,
+                    );
+                    pool.bytes.extend_from_slice(&bytes);
+                    pool.ccc_offset = Some(offset);
+                }
+            }
+            Op::CompositionTableAddr => {
+                // v3++ b-5: lay out the canonical composition pair
+                // table on first reference.
+                if pool.composition_offset.is_none() {
+                    while !pool.bytes.len().is_multiple_of(4) {
+                        pool.bytes.push(0);
+                    }
+                    let offset = u32::try_from(pool.bytes.len()).map_err(|_| {
+                        CodegenError::Layout("const data section exceeds u32 bytes".into())
+                    })?;
+                    let bytes = relon_ir::normalization::encode_composition_table_bytes(
+                        relon_ir::normalization_data::COMPOSITION_PAIRS,
+                    );
+                    pool.bytes.extend_from_slice(&bytes);
+                    pool.composition_offset = Some(offset);
                 }
             }
             Op::If {
@@ -2051,6 +2170,30 @@ fn emit_op_seq(
                 // v3++ b-4: emit `i32.const <table_addr>` for the
                 // non-ASCII whitespace ranges table.
                 let addr = const_pool.whitespace_addr()?;
+                f.instruction(&Instruction::I32Const(addr as i32));
+                vstack.push(IrType::I32);
+                ranges.push(tagged.range);
+            }
+            Op::DecompTableAddr { compatibility } => {
+                // v3++ b-5: emit `i32.const <table_addr>` for the
+                // canonical or compatibility decomposition table.
+                let addr = const_pool.decomp_addr(*compatibility)?;
+                f.instruction(&Instruction::I32Const(addr as i32));
+                vstack.push(IrType::I32);
+                ranges.push(tagged.range);
+            }
+            Op::CccTableAddr => {
+                // v3++ b-5: emit `i32.const <table_addr>` for the
+                // Canonical_Combining_Class table.
+                let addr = const_pool.ccc_addr()?;
+                f.instruction(&Instruction::I32Const(addr as i32));
+                vstack.push(IrType::I32);
+                ranges.push(tagged.range);
+            }
+            Op::CompositionTableAddr => {
+                // v3++ b-5: emit `i32.const <table_addr>` for the
+                // canonical composition pair table.
+                let addr = const_pool.composition_addr()?;
                 f.instruction(&Instruction::I32Const(addr as i32));
                 vstack.push(IrType::I32);
                 ranges.push(tagged.range);
