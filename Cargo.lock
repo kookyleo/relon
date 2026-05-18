@@ -1695,6 +1695,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "relon-trace-abi"
+version = "0.1.0"
+dependencies = [
+ "bincode",
+ "serde",
+]
+
+[[package]]
 name = "relon-trace-emitter"
 version = "0.1.0"
 dependencies = [
