@@ -3,7 +3,7 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use miette::{IntoDiagnostic, LabeledSpan, NamedSource, Report};
 use relon::ResolverChainLoader;
-use relon_analyzer::analyze_entry;
+use relon_analyzer::{analyze_entry_with_options, AnalyzeOptions};
 use relon_codegen_wasm::WasmAotEvaluator;
 use relon_eval_api::Evaluator as EvaluatorTrait;
 use relon_evaluator::module::FilesystemModuleResolver;
@@ -90,6 +90,16 @@ enum Commands {
         /// `step_limit` knob driven through `Context`.
         #[arg(long, default_value_t = 0)]
         fuel_limit: u64,
+        /// v3++ b-2: when set, every `#import` whose path looks remote
+        /// (`https://`, `http://`) MUST carry an inline integrity pin
+        /// (e.g. `sha256:"<hex>"`). Missing pins surface as
+        /// `ImportHashRequired` *before* the loader fetches anything,
+        /// so a CI gate can refuse unpinned dependencies without
+        /// touching the network. Local-path imports are exempt — the
+        /// supply-chain risk targeted here is wire-time, not source-
+        /// tree-time. Default off preserves the v3+ a-3 behavior.
+        #[arg(long, default_value_t = false)]
+        require_hash: bool,
     },
 
     /// Format or check Relon files. Equivalent to the standalone
@@ -123,6 +133,7 @@ fn main() -> miette::Result<()> {
             trust,
             backend,
             fuel_limit,
+            require_hash,
         } => {
             let canonical_file = std::fs::canonicalize(&file)
                 .into_diagnostic()
@@ -151,8 +162,21 @@ fn main() -> miette::Result<()> {
             } else {
                 ResolverChainLoader::sandboxed()
             };
-            let workspace =
-                analyze_entry(cache_namespace.clone(), &content, entry_dir, &mut loader);
+            // v3++ b-2: forward the `--require-hash` policy so the
+            // workspace pass can flag unpinned remote imports up front
+            // (before the loader runs). All other analyzer knobs stay
+            // at their defaults so this branch keeps its prior behavior.
+            let analyze_options = AnalyzeOptions {
+                require_hash,
+                ..AnalyzeOptions::default()
+            };
+            let workspace = analyze_entry_with_options(
+                cache_namespace.clone(),
+                &content,
+                entry_dir,
+                &mut loader,
+                &analyze_options,
+            );
             if workspace.has_errors() {
                 // Surface entry parse errors with the same labelled
                 // span treatment the CLI used to give pre-workspace,
