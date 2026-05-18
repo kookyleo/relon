@@ -734,6 +734,26 @@ impl<'a> Parser<'a> {
             self.bump();
         } else {
             self.error_at_current("expected path string in #import");
+            return;
+        }
+        // Optional integrity pin `<algo>:"<hex>"`. Accept anything of
+        // the shape `IDENT COLON STRING`; the algorithm name and hex
+        // are validated by the analyzer so the diagnostic span lands
+        // on the real source position rather than on the parser's
+        // current cursor.
+        if self.at(SyntaxKind::IDENT) {
+            self.bump();
+            if self.at(SyntaxKind::COLON) {
+                self.bump();
+            } else {
+                self.error_at_current("expected `:` in #import integrity pin");
+                return;
+            }
+            if self.at(SyntaxKind::STRING) {
+                self.bump();
+            } else {
+                self.error_at_current("expected hex string in #import integrity pin");
+            }
         }
     }
 
@@ -2570,6 +2590,27 @@ mod tests {
     fn import_directive_round_trip() {
         let parsed = parse_round_trip("#import string from \"std/string\"\n{ x: 1 }");
         assert!(!parsed.has_errors(), "errors: {:?}", parsed.errors);
+    }
+
+    #[test]
+    fn import_with_sha256_integrity_round_trip() {
+        let parsed = parse_round_trip(
+            "#import lib from \"./lib.relon\" sha256:\"deadbeef\"\n{ x: 1 }",
+        );
+        assert!(!parsed.has_errors(), "errors: {:?}", parsed.errors);
+    }
+
+    #[test]
+    fn import_with_missing_hex_string_reports_error() {
+        // `sha256:` followed by something that is not a STRING should
+        // raise a parse error (rather than silently consume tokens).
+        let parsed = parse_round_trip(
+            "#import lib from \"./lib.relon\" sha256: bad\n{ x: 1 }",
+        );
+        assert!(
+            parsed.has_errors(),
+            "expected parse error for malformed integrity pin"
+        );
     }
 
     #[test]

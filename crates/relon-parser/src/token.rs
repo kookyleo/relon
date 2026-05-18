@@ -171,6 +171,13 @@ pub enum DirectiveBody {
         spec: DirectiveImportSpec,
         path: String,
         path_range: TokenRange,
+        /// Optional integrity pin: `#import <spec> from "path" sha256:"..."`.
+        /// When present, the workspace loader verifies the loaded source's
+        /// digest against this value and refuses the import on mismatch.
+        /// v3++ b-2 wires sha256 only; the [`HashAlgorithm`] enum reserves
+        /// space for additional algorithms (sha512, blake3, ...) without
+        /// churning the AST surface again.
+        integrity: Option<IntegrityHash>,
     },
     Main {
         params: Vec<DirectiveMainParam>,
@@ -178,6 +185,69 @@ pub enum DirectiveBody {
         /// `None`, the entry's return value is left unchecked.
         return_type: Option<TypeNode>,
     },
+}
+
+/// Hash algorithm used by an [`IntegrityHash`] pin on `#import`. Only
+/// `Sha256` is wired in v3++ b-2; the enum exists so future agents can
+/// add `Sha512` / `Blake3` (or SRI multi-algo) without an AST shape
+/// change.
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
+pub enum HashAlgorithm {
+    Sha256,
+}
+
+impl HashAlgorithm {
+    /// Canonical lowercase identifier as it appears in source
+    /// (`sha256:"..."`). Lookups in the parser / analyzer compare
+    /// against this so the casing is fixed in one place.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            HashAlgorithm::Sha256 => "sha256",
+        }
+    }
+
+    /// Reverse of [`HashAlgorithm::as_str`]. Returns `None` for unknown
+    /// names so the caller can emit a position-aware parse / analyzer
+    /// diagnostic.
+    pub fn from_ident(name: &str) -> Option<Self> {
+        match name {
+            "sha256" => Some(HashAlgorithm::Sha256),
+            _ => None,
+        }
+    }
+
+    /// Expected hex-digest length (one byte = two hex chars) for the
+    /// algorithm. Used by the analyzer to reject obvious typos before
+    /// it tries to verify the import.
+    pub fn hex_len(&self) -> usize {
+        match self {
+            HashAlgorithm::Sha256 => 64,
+        }
+    }
+}
+
+/// Inline integrity pin on a `#import` directive. The source form is
+/// `<algorithm>:"<hex>"` (e.g. `sha256:"abc..."`); the parser does not
+/// validate the hex string itself — that work happens in the analyzer
+/// so the diagnostic carries a real source span. The algorithm name
+/// is preserved verbatim alongside the parsed [`HashAlgorithm`] enum
+/// so the analyzer can render the offending identifier when it does
+/// not match any known algorithm.
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub struct IntegrityHash {
+    /// Parsed algorithm. `None` when the source identifier did not
+    /// match any known algorithm — the analyzer surfaces the typo /
+    /// unsupported-algo diagnostic before the loader is consulted.
+    pub algorithm: Option<HashAlgorithm>,
+    /// Verbatim source identifier (`sha256`, `sha512`, ...). Kept
+    /// alongside [`Self::algorithm`] so error messages can echo the
+    /// exact spelling the author used.
+    pub algorithm_text: String,
+    pub hex: String,
+    /// Full source range covering `<algorithm>:"<hex>"` so analyzer
+    /// diagnostics (`unknown algorithm`, `hex length mismatch`, …) can
+    /// point at the right span.
+    pub range: TokenRange,
 }
 
 /// Bindspec for `#import <spec> from "path"`.
