@@ -1,4 +1,4 @@
-//! `relon-trace-emitter` -- v6-gamma trace JIT emitter (skeleton).
+//! `relon-trace-emitter` -- v6-gamma trace JIT emitter.
 //!
 //! Third piece of the v6-gamma trace JIT. After `relon-trace-jit`
 //! provides the self-contained trace IR + optimiser and
@@ -8,6 +8,17 @@
 //! for the host backend to compile + install in a hot function's
 //! dispatch slot.
 //!
-//! This commit lands the workspace registration + crate skeleton.
-//! The ABI surface, emitter, and guard-emission paths arrive in the
-//! follow-up commits.
+//! ## Surface
+//!
+//! This commit lands the ABI module: the fixed trace-entry
+//! signature, `TraceContext` shape, and concrete bindings for the
+//! opaque `ExternalPc / ExternalSlot / ExternalAddr` newtypes from
+//! `relon-trace-jit`. The full emitter + guard emission paths arrive
+//! in follow-up commits.
+
+pub mod abi;
+
+pub use abi::{
+    AbiSignature, CraneliftType, ExternalAddrRepr, ExternalPcRepr, ExternalSlotRepr, HostHookTable,
+    TraceContext, TraceEntryStatus, TRACE_ENTRY_SIG,
+};
