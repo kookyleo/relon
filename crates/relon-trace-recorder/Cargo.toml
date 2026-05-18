@@ -1,0 +1,21 @@
+[package]
+name = "relon-trace-recorder"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "v6-gamma trace recorder: lowers Relon IR Op execution history into the trace-jit op stream + observed-type sidetables + guards (pre-integration)."
+keywords = ["relon", "trace", "jit", "recorder", "lowering"]
+categories = ["compilers"]
+
+# Self-contained recorder wiring `relon-ir` (Op + EffectClass) to
+# `relon-trace-jit` (TraceBuffer + TraceOp + ObservedType). No
+# dependency on the cranelift backend yet — that glue lives in the
+# v6-gamma codegen wiring phase.
+[dependencies]
+relon-ir = { workspace = true }
+relon-trace-jit = { workspace = true }
+relon-eval-api = { workspace = true }
+ordered-float = { workspace = true }
