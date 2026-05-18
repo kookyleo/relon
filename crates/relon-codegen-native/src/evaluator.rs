@@ -104,6 +104,17 @@ pub struct CraneliftAotEvaluator {
     /// cranelift code can dereference `ConstString { idx }` offsets
     /// directly without a runtime lookup.
     const_data: Vec<u8>,
+    /// Stage 5 Phase C.4: closure fn-pointer table. One `usize` per
+    /// `IrModule::closure_table` entry; populated after JIT finalize
+    /// by resolving each lambda `FuncId` through
+    /// `JITModule::get_finalized_function`. The sandbox state's
+    /// `closure_table_base` is installed to point at this vec's
+    /// element zero so `Op::CallClosure` can dereference the slot.
+    ///
+    /// Wrapped in `Box<[usize]>` so the address is stable for the
+    /// evaluator's lifetime (we install a raw pointer into the
+    /// sandbox state). Empty when the module has no lambdas.
+    closure_table: Box<[usize]>,
 }
 
 // SAFETY: The JIT-emitted code is reentrant and the `SandboxState`
@@ -217,6 +228,7 @@ impl CraneliftAotEvaluator {
             entry_range,
             entry_shape,
             const_data,
+            closure_func_ids,
         } = compiled;
 
         // Cross-check: buffer schema metadata must agree with the IR
@@ -254,12 +266,35 @@ impl CraneliftAotEvaluator {
             }),
         };
 
+        // Stage 5 Phase C.4: resolve each closure fn id to its host
+        // address. We keep the resulting Box<[usize]> alive on the
+        // evaluator so the sandbox state's closure_table_base pointer
+        // stays valid. The slot order matches `IrModule::closure_table`
+        // — fn_table_idx `i` resolves to `closure_table[i]`.
+        let closure_table: Box<[usize]> = closure_func_ids
+            .iter()
+            .map(|fid| module.get_finalized_function(*fid) as usize)
+            .collect();
+
         // cap_bit width 64 mirrors the wasm-AOT side's
         // `relon_caps_avail` u64 bitmap shape. Hosts that register a
         // higher cap_bit cause `register` to grow the vector.
         let capabilities = Arc::new(CapabilityVtable::with_capacity(64));
         let sandbox_state = Arc::new(SandboxState::new(capabilities));
         sandbox_state.entry_range.set(entry_range);
+        // SAFETY: closure_table is Box-allocated and lives on the
+        // evaluator; the raw pointer stays valid for the evaluator's
+        // lifetime. When the table is empty we install 0 (cranelift
+        // never reads through it because no Op::CallClosure was
+        // emitted).
+        unsafe {
+            let base = if closure_table.is_empty() {
+                0
+            } else {
+                closure_table.as_ptr() as usize
+            };
+            sandbox_state.install_closure_table(base);
+        }
 
         // Buffer-protocol arity equals the user-field count when we
         // have a schema; fall back to the IR-param count for legacy
@@ -278,6 +313,7 @@ impl CraneliftAotEvaluator {
             sandbox_state,
             buffer_schema,
             const_data,
+            closure_table,
         })
     }
 
@@ -293,6 +329,19 @@ impl CraneliftAotEvaluator {
     pub fn install_capabilities_mut(&mut self, capabilities: Arc<CapabilityVtable>) {
         let new_state = SandboxState::new(capabilities);
         new_state.entry_range.set(self.entry_range);
+        // Stage 5 Phase C.4: re-install the closure table pointer
+        // onto the fresh state so `Op::CallClosure` keeps resolving.
+        // SAFETY: the closure_table allocation lives on the
+        // evaluator; its raw pointer remains valid for the
+        // evaluator's lifetime.
+        unsafe {
+            let base = if self.closure_table.is_empty() {
+                0
+            } else {
+                self.closure_table.as_ptr() as usize
+            };
+            new_state.install_closure_table(base);
+        }
         self.sandbox_state = Arc::new(new_state);
     }
 
@@ -317,8 +366,13 @@ impl CraneliftAotEvaluator {
 
     /// Internal: invoke the legacy-shape JIT entry with the supplied
     /// i64 args. Uses `catch_unwind` to convert panics raised by
-    /// cranelift trap instructions into typed `RuntimeError`s.
+    /// cranelift trap instructions into typed `RuntimeError`s. The
+    /// stage 5 signal-hook handler (installed process-wide once)
+    /// intercepts SIGSEGV / SIGFPE / SIGILL into the thread-local
+    /// trap slot as a defense-in-depth measure.
     fn invoke_legacy_entry(&self, args: [i64; 4]) -> Result<i64, RuntimeError> {
+        crate::trap_handler::install_global_signal_handler();
+        crate::trap_handler::reset_thread_signal_slot();
         self.sandbox_state.reset_trap();
         let state_ptr: *const SandboxState = Arc::as_ptr(&self.sandbox_state);
         let entry = match self.entry_fn {
@@ -372,6 +426,8 @@ impl CraneliftAotEvaluator {
         scratch_base: u32,
         caps: u64,
     ) -> Result<i32, RuntimeError> {
+        crate::trap_handler::install_global_signal_handler();
+        crate::trap_handler::reset_thread_signal_slot();
         self.sandbox_state.reset_trap();
         // SAFETY: `arena` is borrowed mutably here and stays valid
         // through the JIT call's lifetime (`arena` outlives this
@@ -409,7 +465,23 @@ impl CraneliftAotEvaluator {
 
     /// Post-process a JIT-call result: surface typed traps recorded in
     /// `state.trap_code`, otherwise pass the raw return value through.
+    ///
+    /// Stage 5 Phase C.3: also consults the thread-local signal slot
+    /// populated by `crate::trap_handler` when a SIGSEGV / SIGFPE /
+    /// SIGILL fired during the JIT call. Signal-side traps take
+    /// precedence over the JIT-recorded trap code because the
+    /// signal observation came from the hardware / OS layer which
+    /// our codegen guards can't intercept.
     fn dispatch_post<T>(&self, result: std::thread::Result<T>) -> Result<T, RuntimeError> {
+        // Check the signal-hook slot first — a SIGSEGV during JIT
+        // body execution should surface as a typed trap even if the
+        // JIT-side `cond_trap` sequence never ran.
+        let signal_code = crate::trap_handler::read_thread_signal_slot();
+        if signal_code != 0 {
+            if let Some(kind) = crate::trap_handler::signal_to_trap_kind(signal_code) {
+                return Err(kind.to_runtime_error(self.entry_range));
+            }
+        }
         match result {
             Ok(v) => {
                 let code = self.sandbox_state.trap_code();

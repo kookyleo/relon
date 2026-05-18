@@ -32,7 +32,8 @@ use std::collections::HashMap;
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::types::{I32, I64};
 use cranelift_codegen::ir::{
-    AbiParam, Function, InstBuilder, MemFlags, Signature, TrapCode, UserFuncName, Value as CValue,
+    AbiParam, BlockArg, BlockCall, Function, InstBuilder, JumpTableData, MemFlags, Signature,
+    TrapCode, UserFuncName, Value as CValue,
 };
 use cranelift_codegen::isa::CallConv;
 use cranelift_codegen::settings::{self, Configurable};
@@ -70,6 +71,14 @@ pub struct CompiledModule {
     /// them through hardcoded `[len:u32 LE][payload]` record
     /// offsets emitted at compile time.
     pub const_data: Vec<u8>,
+    /// Stage 5 Phase C.4: per-module closure table. Each entry is the
+    /// `FuncId` of a lambda the lowering pass emitted; the host
+    /// resolves each id through `get_finalized_function` after JIT
+    /// finalize and installs the resulting `Vec<usize>` into the
+    /// `SandboxState`. The `Op::CallClosure` lowering reads the host-
+    /// fn pointer through that table, indexed by the closure handle's
+    /// `fn_table_idx` field.
+    pub closure_func_ids: Vec<cranelift_module::FuncId>,
 }
 
 /// Per-module const-pool layout. Maps each IR-level `idx` referenced
@@ -663,6 +672,41 @@ pub fn compile_module_with(
         .declare_function("run_main", Linkage::Export, &entry_sig)
         .map_err(|e| CraneliftError::ModuleDefine(format!("declare run_main: {e}")))?;
 
+    // Stage 5 Phase C.4: declare every lambda func referenced by the
+    // module's `closure_table` *before* lowering the entry body so the
+    // entry's `Op::MakeClosure` lowering can capture each lambda's
+    // `FuncId` for the runtime closure-table population step. Each
+    // lambda has the cranelift signature
+    //   (state, captures_ptr: i32, params...) -> ret_ty
+    // — the captures_ptr is prepended to the IR-declared param list
+    // and points at the captures struct the call site materialised in
+    // the scratch arena.
+    let mut closure_func_ids: Vec<cranelift_module::FuncId> = Vec::new();
+    let mut closure_signatures: Vec<Signature> = Vec::new();
+    for (slot, &func_idx) in ir.closure_table.iter().enumerate() {
+        let lambda = ir.funcs.get(func_idx as usize).ok_or_else(|| {
+            CraneliftError::Codegen(format!(
+                "closure_table[{slot}] -> funcs[{func_idx}] out of range (module has {} funcs)",
+                ir.funcs.len()
+            ))
+        })?;
+        let mut sig = Signature::new(CallConv::SystemV);
+        sig.params.push(AbiParam::new(pointer_ty)); // state pointer
+        sig.params.push(AbiParam::new(I32)); // captures_ptr
+        for p in &lambda.params {
+            sig.params.push(AbiParam::new(ir_ty_to_cl(*p)?));
+        }
+        if !matches!(lambda.ret, IrType::Null) {
+            sig.returns.push(AbiParam::new(ir_ty_to_cl(lambda.ret)?));
+        }
+        let name = format!("__closure_{slot}");
+        let id = module
+            .declare_function(&name, Linkage::Local, &sig)
+            .map_err(|e| CraneliftError::ModuleDefine(format!("declare {name}: {e}")))?;
+        closure_func_ids.push(id);
+        closure_signatures.push(sig);
+    }
+
     // Emit the function body.
     let mut ctx = CodegenContext::new();
     ctx.func = Function::with_name_signature(UserFuncName::user(0, 0), entry_sig);
@@ -721,6 +765,8 @@ pub fn compile_module_with(
             needs_tail_cursor: matches!(entry_shape, EntryShape::BufferProtocol)
                 && body_needs_tail_cursor(&entry.body),
             return_root_size,
+            captures_ptr: None,
+            lambda_param_tys: None,
         };
 
         codegen.emit_prologue();
@@ -751,6 +797,118 @@ pub fn compile_module_with(
     module
         .define_function(entry_fn_id, &mut ctx)
         .map_err(|e| CraneliftError::ModuleDefine(format!("define run_main: {e}")))?;
+
+    // Stage 5 Phase C.4: compile each lambda function. Each one uses
+    // the cranelift signature `(state, captures_ptr, params...) -> ret`
+    // — the captures_ptr is the first user-visible local (slot 0 in
+    // the cranelift block-param sense, but the IR's `LocalGet` slots
+    // start at 1 because the IR pass numbers user params from 1 onward
+    // when a captures arg precedes them... actually the IR pass keeps
+    // user params at `LocalGet 0..N`, so we need to shift the
+    // cranelift slot map at the body entry to "skip" the captures
+    // slot when resolving `LocalGet(idx)`).
+    for (slot, (func_id, sig)) in closure_func_ids
+        .iter()
+        .copied()
+        .zip(closure_signatures.iter())
+        .enumerate()
+    {
+        let lambda_idx = ir.closure_table[slot] as usize;
+        let lambda = &ir.funcs[lambda_idx];
+        let mut lambda_ctx = CodegenContext::new();
+        lambda_ctx.func =
+            Function::with_name_signature(UserFuncName::user(0, (slot as u32) + 1), sig.clone());
+        let mut lambda_builder_ctx = FunctionBuilderContext::new();
+        {
+            let mut builder = FunctionBuilder::new(&mut lambda_ctx.func, &mut lambda_builder_ctx);
+            let entry_block = builder.create_block();
+            builder.append_block_params_for_function_params(entry_block);
+            builder.switch_to_block(entry_block);
+            builder.seal_block(entry_block);
+
+            let block_params: Vec<_> = builder.block_params(entry_block).to_vec();
+            let lambda_state_ptr = block_params[0];
+            let captures_ptr = block_params[1];
+            let lambda_arg_values: Vec<CValue> = block_params[2..].to_vec();
+
+            let raise_trap_ref = module.declare_func_in_func(raise_trap_id, builder.func);
+            let now_ref = module.declare_func_in_func(now_id, builder.func);
+            let cap_lookup_ref = module.declare_func_in_func(cap_lookup_id, builder.func);
+
+            let trap_block = builder.create_block();
+            builder.append_block_param(trap_block, I64);
+
+            // Lambdas use the same entry shape as the entry function
+            // for the purposes of `LocalGet` typing — but since each
+            // lambda's params are IR-declared independently, we
+            // override the entry-shape-derived local typing through
+            // `lambda_param_tys`. The Codegen looks up `LocalGet(idx)`
+            // against `arg_values` first; we've already routed the
+            // captures_ptr to a dedicated slot so the IR-side
+            // `LocalGet(idx)` resolves to `arg_values[idx]` which is
+            // the user param at position `idx + 1` in the cranelift
+            // block-params (we sliced past the captures_ptr).
+            let mut codegen = Codegen {
+                builder: &mut builder,
+                sandbox,
+                state_ptr: lambda_state_ptr,
+                raise_trap_ref,
+                now_ref,
+                cap_lookup_ref,
+                pointer_ty,
+                frontend_config: module.target_config(),
+                // Lambdas use the LegacyI64Args entry shape for
+                // `LocalGet` typing because their params are
+                // IR-declared (i64 / i32 / ...) rather than the
+                // buffer-handshake fixed shape. The `lambda_param_tys`
+                // field carries the per-param typing so the
+                // `LocalGet` resolution matches.
+                entry_shape: EntryShape::LegacyI64Args,
+                locals: HashMap::new(),
+                let_locals: HashMap::new(),
+                arg_values: &lambda_arg_values,
+                stack: Vec::new(),
+                ir,
+                trap_block: Some(trap_block),
+                label_stack: Vec::new(),
+                inline_frames: Vec::new(),
+                const_pool: &const_pool,
+                record_locals: HashMap::new(),
+                needs_tail_cursor: false,
+                return_root_size: 0,
+                captures_ptr: Some(captures_ptr),
+                lambda_param_tys: Some(&lambda.params),
+            };
+
+            codegen.emit_prologue();
+            codegen.emit_body(&lambda.body)?;
+
+            builder.switch_to_block(trap_block);
+            let code = builder.block_params(trap_block)[0];
+            builder
+                .ins()
+                .call(raise_trap_ref, &[lambda_state_ptr, code]);
+            // Lambdas always return a typed value (the IR-declared
+            // ret_ty). On trap-block exit we emit a typed zero so the
+            // verifier accepts the synthetic return.
+            let zero_v = if matches!(lambda.ret, IrType::I64) {
+                builder.ins().iconst(I64, 0)
+            } else if matches!(lambda.ret, IrType::F64) {
+                builder.ins().f64const(0.0)
+            } else {
+                builder.ins().iconst(I32, 0)
+            };
+            builder.ins().return_(&[zero_v]);
+            builder.seal_block(trap_block);
+
+            builder.finalize();
+        }
+
+        module
+            .define_function(func_id, &mut lambda_ctx)
+            .map_err(|e| CraneliftError::ModuleDefine(format!("define __closure_{slot}: {e}")))?;
+    }
+
     module
         .finalize_definitions()
         .map_err(|e| CraneliftError::ModuleDefine(format!("finalize: {e}")))?;
@@ -762,6 +920,7 @@ pub fn compile_module_with(
         entry_range: entry.range,
         entry_shape,
         const_data: const_pool.bytes,
+        closure_func_ids,
     })
 }
 
@@ -981,6 +1140,19 @@ struct Codegen<'a, 'b> {
     /// prologue uses the same value to bias `tail_cursor` to the
     /// first byte past the fixed area when tail records are present.
     return_root_size: u32,
+    /// Stage 5 Phase C.4: when this Codegen is lowering a *lambda*
+    /// body (not the entry function), `captures_ptr` carries the
+    /// cranelift `i32` block-param the lambda received as its
+    /// captures argument. `Op::LoadField` against an offset inside
+    /// the captures struct resolves through this pointer (added to
+    /// `arena_base`); `Op::LocalGet` continues to address the
+    /// IR-declared params via `arg_values`.
+    captures_ptr: Option<CValue>,
+    /// When set (lambda mode), supplies the per-param IR types so
+    /// `LocalGet(idx)` resolves to the correct cranelift slot type.
+    /// `None` when lowering the entry function (which derives types
+    /// from `entry_shape`).
+    lambda_param_tys: Option<&'a [IrType]>,
 }
 
 /// One inline-frame entry for a stdlib body lowered through
@@ -1013,11 +1185,38 @@ struct LabelFrame {
     /// `Op::Loop`, exit block for `Op::Block`).
     target_block: cranelift_codegen::ir::Block,
     /// `true` for `Op::Loop` (back-edge); `false` for `Op::Block`
-    /// (forward-edge). Informational today — used by future trace
-    /// recorder integration to identify loop back-edges as hot
-    /// counter sites.
-    #[allow(dead_code)]
+    /// (forward-edge). Used by [`Codegen::emit_loop_back_resource_check`]
+    /// to recognise loop back-edges as the right site for inserting
+    /// the [`crate::sandbox::RESOURCE_CHECK_INTERVAL`] cadence guard.
     is_loop: bool,
+    /// When the labelled construct yields a typed value (`Op::Loop`
+    /// or `Op::Block` with `result_ty = Some(_)`), this slot holds
+    /// the cranelift type the matching block-param accepts. `Br` /
+    /// `BrIf` / `BrTable` targeting this frame pops one operand from
+    /// the virtual stack and forwards it as the block-param.
+    ///
+    /// For `Op::Loop` with a yield, the block-param sits on the loop
+    /// header and represents the loop-carried accumulator (each back-
+    /// edge supplies the next iteration's value); the loop exits by
+    /// falling through to the continuation block which inherits the
+    /// final value.
+    ///
+    /// For `Op::Block` with a yield, the block-param sits on the
+    /// continuation block. `Br N` inside the body pops the yield
+    /// value and forwards it as the continuation arg.
+    result_cl_ty: Option<cranelift_codegen::ir::Type>,
+    /// When the frame is a `Op::Loop` with `result_ty != None`, this
+    /// is the continuation block that receives the loop's final
+    /// value via fallthrough. `None` for blocks / yield-less loops.
+    loop_cont_block: Option<cranelift_codegen::ir::Block>,
+    /// Per-loop back-edge counter variable used to space the
+    /// resource-deadline guard at [`crate::sandbox::RESOURCE_CHECK_INTERVAL`]
+    /// cadence inside long-running loops. `None` for blocks (which
+    /// have no back-edge) and when the sandbox's deadline check is
+    /// disabled. The counter is an `I64` increment-and-mask Variable;
+    /// `emit_loop_back_resource_check` reads / updates it on every
+    /// back-edge.
+    back_edge_counter: Option<Variable>,
 }
 
 impl<'a, 'b> Codegen<'a, 'b> {
@@ -1157,14 +1356,27 @@ impl<'a, 'b> Codegen<'a, 'b> {
     /// Lower `Op::LoadField { offset, ty }`. Reads from
     /// `in_ptr + offset` (wasm slot 0) and pushes the value onto the
     /// virtual stack.
+    ///
+    /// In lambda mode (Stage 5 Phase C.4 closure body), the base
+    /// pointer is the captures struct base (`captures_ptr` block-
+    /// param) rather than `in_ptr` — this matches the wasm-side
+    /// closure ABI which reuses `LoadField` for "read this captured
+    /// value at this offset".
     fn emit_load_field(&mut self, offset: u32, ty: IrType) -> Result<(), CraneliftError> {
-        if !matches!(self.entry_shape, EntryShape::BufferProtocol) {
-            return Err(CraneliftError::Codegen(
-                "LoadField outside buffer-protocol entry shape".into(),
-            ));
-        }
         let (cr_ty, size, push_ty) = field_load_shape(ty)?;
-        let addr = self.buffer_field_addr(0 /* in_ptr */, offset, size)?;
+        let addr = if let Some(captures_ptr) = self.captures_ptr {
+            // Lambda mode: arena_base + captures_ptr + offset.
+            let off_v = self.builder.ins().iconst(I32, i64::from(offset));
+            let composed = self.builder.ins().iadd(captures_ptr, off_v);
+            self.arena_addr(composed, size)?
+        } else {
+            if !matches!(self.entry_shape, EntryShape::BufferProtocol) {
+                return Err(CraneliftError::Codegen(
+                    "LoadField outside buffer-protocol entry shape".into(),
+                ));
+            }
+            self.buffer_field_addr(0 /* in_ptr */, offset, size)?
+        };
         let loaded = self.builder.ins().load(cr_ty, MemFlags::trusted(), addr, 0);
         // For `Bool` / `Null` the IR's virtual stack expects an i32
         // slot — widen the loaded byte to i32 zero-extended.
@@ -1654,6 +1866,11 @@ impl<'a, 'b> Codegen<'a, 'b> {
         }
         match self.entry_shape {
             EntryShape::LegacyI64Args => {
+                // In lambda mode (lambda_param_tys is set) the return
+                // value's IR type isn't always I64 — the lambda's
+                // `ret` could be I64 / Bool / String / etc. We just
+                // pop one operand and return it; cranelift's verifier
+                // catches type-width mismatches before finalize.
                 let v = self.pop()?;
                 self.builder.ins().return_(&[v]);
             }
@@ -1678,6 +1895,14 @@ impl<'a, 'b> Codegen<'a, 'b> {
                 self.builder.ins().return_(&[value]);
             }
         }
+        // After the explicit return, the current block is filled.
+        // Switch to a fresh dummy block so any subsequent ops the
+        // body emits land somewhere valid; cranelift's DCE prunes
+        // the now-dead dummy. Mirrors the post-Br / post-BrTable
+        // dummy pattern.
+        let dummy = self.builder.create_block();
+        self.builder.seal_block(dummy);
+        self.builder.switch_to_block(dummy);
         Ok(())
     }
 
@@ -1822,17 +2047,28 @@ impl<'a, 'b> Codegen<'a, 'b> {
                 self.arg_values.len()
             )));
         }
-        let cr_ty = match self.entry_shape {
-            EntryShape::LegacyI64Args => I64,
-            EntryShape::BufferProtocol => match idx {
-                0..=3 => I32,
-                4 => I64,
-                _ => {
-                    return Err(CraneliftError::Codegen(format!(
-                        "LocalGet({idx}) out of range for buffer-protocol entry (5 locals)"
-                    )));
-                }
-            },
+        let cr_ty = if let Some(param_tys) = self.lambda_param_tys {
+            // Lambda mode: types come from the IR-declared param list.
+            let ir_ty = param_tys.get(arg_idx).copied().ok_or_else(|| {
+                CraneliftError::Codegen(format!(
+                    "LocalGet({idx}) out of range — lambda has {} declared params",
+                    param_tys.len()
+                ))
+            })?;
+            ir_ty_to_cl(ir_ty)?
+        } else {
+            match self.entry_shape {
+                EntryShape::LegacyI64Args => I64,
+                EntryShape::BufferProtocol => match idx {
+                    0..=3 => I32,
+                    4 => I64,
+                    _ => {
+                        return Err(CraneliftError::Codegen(format!(
+                            "LocalGet({idx}) out of range for buffer-protocol entry (5 locals)"
+                        )));
+                    }
+                },
+            }
         };
         // Mirror the arg value into a Variable so future LocalSet
         // (if we ever support it) writes go through SSA cleanly.
@@ -2071,6 +2307,18 @@ impl<'a, 'b> Codegen<'a, 'b> {
                 else_body,
             } => self.emit_if(*result_ty, then_body, else_body)?,
             Op::CheckCap { cap_bit } => self.emit_check_cap(*cap_bit)?,
+            Op::CallNative {
+                import_idx,
+                param_tys,
+                ret_ty,
+                cap_bit,
+            } => self.emit_call_native(*import_idx, param_tys, *ret_ty, *cap_bit)?,
+            Op::MakeClosure {
+                fn_table_idx,
+                captures,
+                captures_size,
+            } => self.emit_make_closure(*fn_table_idx, captures, *captures_size)?,
+            Op::CallClosure { param_tys, ret_ty } => self.emit_call_closure(param_tys, *ret_ty)?,
 
             // v5-β-2 widen: `select` for the simple stdlib bodies
             // (`abs` / `min` / `max`) and any user expression the
@@ -2105,6 +2353,7 @@ impl<'a, 'b> Codegen<'a, 'b> {
             Op::Loop { result_ty, body } => self.emit_block(*result_ty, body, true)?,
             Op::Br { label_depth } => self.emit_br(*label_depth, /*conditional=*/ false)?,
             Op::BrIf { label_depth } => self.emit_br(*label_depth, /*conditional=*/ true)?,
+            Op::BrTable { default, targets } => self.emit_br_table(*default, targets)?,
 
             // v5-β-2 widen: arithmetic on `I32` slot (used by stdlib
             // bodies for pointer / length arithmetic against the
@@ -2384,41 +2633,93 @@ impl<'a, 'b> Codegen<'a, 'b> {
     ///
     /// For both shapes we create a cranelift block ahead of the body
     /// and push a `LabelFrame` onto `label_stack`; `Op::Br` /
-    /// `Op::BrIf` resolve to that block by depth-counting from the
-    /// top of the stack.
+    /// `Op::BrIf` / `Op::BrTable` resolve to that block by depth-
+    /// counting from the top of the stack.
     ///
     /// * `is_loop = false` (wasm `Block`): the `target_block` is the
     ///   **continuation** block reached after the body terminates;
-    ///   `Br 0` jumps forward past the body's End.
+    ///   `Br 0` jumps forward past the body's End. When `result_ty =
+    ///   Some(t)`, the continuation has one block-param of type `t`;
+    ///   fallthrough at body end pops the top of the operand stack
+    ///   and forwards it as the continuation arg.
     /// * `is_loop = true` (wasm `Loop`): the `target_block` is the
     ///   loop **header**; `Br 0` jumps back to re-enter the loop
-    ///   (equivalent to `continue`). The block exits by falling
-    ///   through its End.
+    ///   (equivalent to `continue`). When `result_ty = Some(t)`, the
+    ///   header has one block-param of type `t` representing the
+    ///   loop-carried accumulator. Each back-edge re-supplies the
+    ///   next iteration's value; the loop "exits" through fall-
+    ///   through to a continuation block which inherits the final
+    ///   value. The loop's seed value is popped off the operand
+    ///   stack before entering the header (wasm semantics).
     ///
-    /// v5-β-2 limitation: `result_ty != None` (block-yields-value)
-    /// is **not** yet supported because the codegen still needs to
-    /// thread the yielded value through block params. Stdlib bodies
-    /// in practice always use `result_ty = None`; surfacing the
-    /// unsupported case as Codegen failure keeps the safety net.
+    /// v5-β-2 stage 5 widens this to handle `result_ty != None` via
+    /// cranelift block-parameter threading. Stdlib bodies in practice
+    /// still use `result_ty = None`, but the yield-shape variant
+    /// surfaces clean via `Op::Loop { result_ty: Some(_) }` for hand-
+    /// rolled IR + the BrTable test suite.
     fn emit_block(
         &mut self,
         result_ty: Option<IrType>,
         body: &[TaggedOp],
         is_loop: bool,
     ) -> Result<(), CraneliftError> {
-        if result_ty.is_some() {
-            return Err(CraneliftError::Codegen(
-                "Block / Loop with result_ty != None not yet supported on cranelift".to_string(),
-            ));
-        }
+        let result_cl_ty = match result_ty {
+            None => None,
+            Some(ty) => Some(ir_ty_to_cl(ty)?),
+        };
 
         if is_loop {
             // Loop: branch into a fresh header block, lower the
             // body inside it. The body's terminator (Br / fallthrough
             // / Return) decides whether the loop exits or re-enters.
             let header = self.builder.create_block();
-            self.builder.ins().jump(header, &[]);
+            // Loop header carries the loop-carried accumulator as a
+            // block parameter when the loop yields a value. The seed
+            // value is the top of the operand stack at loop entry.
+            let seed = if let Some(cl_ty) = result_cl_ty {
+                self.builder.append_block_param(header, cl_ty);
+                Some(self.pop()?)
+            } else {
+                None
+            };
+            let seed_args: Vec<BlockArg> = seed.into_iter().map(BlockArg::from).collect();
+            self.builder.ins().jump(header, &seed_args);
             self.builder.switch_to_block(header);
+            // Push the header block-param onto the operand stack so
+            // the body's first op consumes the loop-carried value
+            // (wasm-Loop semantics: the yield value re-enters the
+            // operand stack each iteration). The body is responsible
+            // for stashing / using / re-yielding it before the back-
+            // edge.
+            if result_cl_ty.is_some() {
+                let v = self.builder.block_params(header)[0];
+                self.push(v);
+            }
+            // For yielding loops, prepare a continuation block. The
+            // loop's normal fallthrough lands there carrying the
+            // final accumulator as a block-param. The frame remembers
+            // the continuation so back-edges can re-enter while non-
+            // looping `Br N` past the loop's enclosing label still
+            // lands at the right place.
+            let loop_cont_block = if result_cl_ty.is_some() {
+                Some(self.builder.create_block())
+            } else {
+                None
+            };
+            if let (Some(cl_ty), Some(cont)) = (result_cl_ty, loop_cont_block) {
+                self.builder.append_block_param(cont, cl_ty);
+            }
+            // Allocate a back-edge counter if the sandbox deadline
+            // check is on. Initialised to 0 here; each back-edge
+            // bumps + checks at the `RESOURCE_CHECK_INTERVAL` cadence.
+            let back_edge_counter = if self.sandbox.deadline_check {
+                let var = self.builder.declare_var(I64);
+                let zero = self.builder.ins().iconst(I64, 0);
+                self.builder.def_var(var, zero);
+                Some(var)
+            } else {
+                None
+            };
             // Loops with no other entry edge get sealed once the body
             // lowers — cranelift seals retroactively for blocks with
             // forward branches, so we leave it unsealed during the
@@ -2426,31 +2727,117 @@ impl<'a, 'b> Codegen<'a, 'b> {
             self.label_stack.push(LabelFrame {
                 target_block: header,
                 is_loop: true,
+                result_cl_ty,
+                loop_cont_block,
+                back_edge_counter,
             });
             self.emit_body(body)?;
-            self.label_stack.pop();
+            let frame = self.label_stack.pop().expect("just pushed");
             self.builder.seal_block(header);
+            if let Some(cont) = frame.loop_cont_block {
+                // Fall through to cont with the current top-of-stack
+                // as the final loop value. Skip the fall-through
+                // jump when the body already terminated (the body
+                // always Br-back-edged); cranelift's DCE handles
+                // the dead exit path.
+                if !self.builder.is_unreachable() {
+                    let cont_arg = if let Some(cl_ty) = result_cl_ty {
+                        if self.stack.is_empty() {
+                            self.placeholder_for(cl_ty)
+                        } else {
+                            self.pop()?
+                        }
+                    } else {
+                        self.builder.ins().iconst(I32, 0)
+                    };
+                    self.builder.ins().jump(cont, &[cont_arg.into()]);
+                }
+                self.builder.seal_block(cont);
+                self.builder.switch_to_block(cont);
+                // The continuation block-param is the loop's result;
+                // push it onto the operand stack.
+                let v = self.builder.block_params(cont)[0];
+                self.push(v);
+            }
         } else {
             // Block (forward exit): allocate a continuation block,
             // lower the body, then switch to the continuation. A
             // `Br 0` inside the body jumps forward to `cont`.
             let cont = self.builder.create_block();
+            if let Some(cl_ty) = result_cl_ty {
+                self.builder.append_block_param(cont, cl_ty);
+            }
             self.label_stack.push(LabelFrame {
                 target_block: cont,
                 is_loop: false,
+                result_cl_ty,
+                loop_cont_block: None,
+                back_edge_counter: None,
             });
             self.emit_body(body)?;
             self.label_stack.pop();
             // Fallthrough to cont when the body doesn't explicitly
-            // branch out. The builder's `is_filled` API would let us
-            // skip this when the body already terminated, but
-            // emitting an extra `jump` is cheap and keeps the cranelift
-            // verifier happy.
-            self.builder.ins().jump(cont, &[]);
+            // branch out. We forward the top-of-stack value as the
+            // continuation block-param when the block yields. Skip
+            // the jump entirely if the body already terminated (the
+            // current block is unreachable / already filled by a Br
+            // / BrTable / Return / Trap).
+            if !self.builder.is_unreachable() {
+                let fall_args: Vec<BlockArg> = if let Some(cl_ty) = result_cl_ty {
+                    let v = if !self.stack.is_empty() {
+                        self.pop()?
+                    } else {
+                        self.placeholder_for(cl_ty)
+                    };
+                    vec![v.into()]
+                } else {
+                    Vec::new()
+                };
+                self.builder.ins().jump(cont, &fall_args);
+            }
             self.builder.seal_block(cont);
             self.builder.switch_to_block(cont);
+            // When the block yields, expose the block-param to the
+            // surrounding code via the operand stack.
+            if result_cl_ty.is_some() {
+                let v = self.builder.block_params(cont)[0];
+                self.push(v);
+            }
         }
         Ok(())
+    }
+
+    /// Emit the periodic deadline guard at a loop back-edge. Bumps
+    /// the frame's per-loop counter; when `(counter &
+    /// (RESOURCE_CHECK_INTERVAL - 1)) == 0`, emits a resource-check
+    /// guard (one host clock read + comparison). `RESOURCE_CHECK_INTERVAL`
+    /// is a power of two so the modulus is cheap.
+    fn emit_loop_back_resource_check(&mut self, counter_var: Variable) {
+        let cur = self.builder.use_var(counter_var);
+        let one = self.builder.ins().iconst(I64, 1);
+        let next = self.builder.ins().iadd(cur, one);
+        self.builder.def_var(counter_var, next);
+        let mask = self
+            .builder
+            .ins()
+            .iconst(I64, (crate::sandbox::RESOURCE_CHECK_INTERVAL as i64) - 1);
+        let masked = self.builder.ins().band(next, mask);
+        // Branch to a fresh deadline-check block when masked == 0;
+        // otherwise just skip. Use brif + a tiny block layout so the
+        // common (non-zero) case stays branch-predicted.
+        let check_block = self.builder.create_block();
+        let after_block = self.builder.create_block();
+        let zero = self.builder.ins().iconst(I64, 0);
+        let cmp = self.builder.ins().icmp(IntCC::Equal, masked, zero);
+        self.builder
+            .ins()
+            .brif(cmp, check_block, &[], after_block, &[]);
+        self.builder.seal_block(check_block);
+        self.builder.switch_to_block(check_block);
+        self.emit_resource_check();
+        self.builder.ins().jump(after_block, &[]);
+        self.builder.seal_block(after_block);
+        self.builder.switch_to_block(after_block);
     }
 
     /// Lower `Op::Br { label_depth }` (unconditional) or
@@ -2464,7 +2851,24 @@ impl<'a, 'b> Codegen<'a, 'b> {
                 self.label_stack.len()
             )));
         }
-        let target = self.label_stack[self.label_stack.len() - 1 - depth].target_block;
+        let frame_idx = self.label_stack.len() - 1 - depth;
+        let target = self.label_stack[frame_idx].target_block;
+        let result_cl_ty = self.label_stack[frame_idx].result_cl_ty;
+        let is_loop = self.label_stack[frame_idx].is_loop;
+        let back_edge_counter = self.label_stack[frame_idx].back_edge_counter;
+
+        // For yielded targets, pop the top-of-stack and forward as
+        // the block-arg. We do this once for both branch shapes.
+        let block_args: Vec<BlockArg> = if let Some(cl_ty) = result_cl_ty {
+            let v = if !self.builder.is_unreachable() && !self.stack.is_empty() {
+                self.pop()?
+            } else {
+                self.placeholder_for(cl_ty)
+            };
+            vec![v.into()]
+        } else {
+            Vec::new()
+        };
 
         if conditional {
             // Pop the i32 condition. cranelift `brif(cond, then,
@@ -2473,11 +2877,43 @@ impl<'a, 'b> Codegen<'a, 'b> {
             // branch so subsequent ops land somewhere valid.
             let cond = self.pop()?;
             let fallthrough = self.builder.create_block();
-            self.builder.ins().brif(cond, target, &[], fallthrough, &[]);
+            // RESOURCE_CHECK_INTERVAL cadence: if this branch is a
+            // loop back-edge, emit the periodic deadline check
+            // before the brif. We use the "then" arm (jump-to-loop-
+            // header) as the loop continuation, so the check fires
+            // only when the loop actually iterates.
+            if is_loop {
+                if let Some(counter_var) = back_edge_counter {
+                    // The check needs to run conditionally — we need
+                    // a separate then-arm block that holds the
+                    // counter bump + check, then jumps to the loop
+                    // header. The else-arm falls through unchanged.
+                    let take_branch = self.builder.create_block();
+                    self.builder
+                        .ins()
+                        .brif(cond, take_branch, &[], fallthrough, &[]);
+                    self.builder.seal_block(take_branch);
+                    self.builder.switch_to_block(take_branch);
+                    self.emit_loop_back_resource_check(counter_var);
+                    self.builder.ins().jump(target, &block_args);
+                    self.builder.seal_block(fallthrough);
+                    self.builder.switch_to_block(fallthrough);
+                    return Ok(());
+                }
+            }
+            self.builder
+                .ins()
+                .brif(cond, target, &block_args, fallthrough, &[]);
             self.builder.seal_block(fallthrough);
             self.builder.switch_to_block(fallthrough);
         } else {
-            self.builder.ins().jump(target, &[]);
+            // Unconditional back-edge: also gets the cadence guard.
+            if is_loop {
+                if let Some(counter_var) = back_edge_counter {
+                    self.emit_loop_back_resource_check(counter_var);
+                }
+            }
+            self.builder.ins().jump(target, &block_args);
             // After an unconditional branch, the rest of the basic
             // block is unreachable. Create a fresh dummy block so
             // subsequent op emission lands somewhere; cranelift's
@@ -2486,6 +2922,97 @@ impl<'a, 'b> Codegen<'a, 'b> {
             self.builder.seal_block(dummy);
             self.builder.switch_to_block(dummy);
         }
+        Ok(())
+    }
+
+    /// Lower `Op::BrTable { default, targets }`. Pops one `i32` index
+    /// from the stack; when `index < targets.len()` jumps to
+    /// `targets[index]`, otherwise jumps to `default`. The label
+    /// depths resolve against the same `label_stack` as `Br` / `BrIf`.
+    ///
+    /// Yield-typed targets are supported only when every target (incl.
+    /// default) shares the same `result_cl_ty`. The IR shape
+    /// guarantees this: `Op::BrTable` is a single discriminant
+    /// dispatch where every arm produces a value of the same type.
+    /// Mismatch surfaces as Codegen.
+    fn emit_br_table(&mut self, default: u32, targets: &[u32]) -> Result<(), CraneliftError> {
+        // Pop the discriminant; we'll feed it directly to br_table.
+        let idx_val = self.pop()?;
+        let default_depth = default as usize;
+        if default_depth >= self.label_stack.len() {
+            return Err(CraneliftError::Codegen(format!(
+                "BrTable default depth {default} out of range — only {} frame(s) on stack",
+                self.label_stack.len()
+            )));
+        }
+        let default_frame_idx = self.label_stack.len() - 1 - default_depth;
+        let default_target = self.label_stack[default_frame_idx].target_block;
+        let yield_ty = self.label_stack[default_frame_idx].result_cl_ty;
+        // Validate every target depth + cross-check yield types.
+        for (i, depth) in targets.iter().enumerate() {
+            let d = *depth as usize;
+            if d >= self.label_stack.len() {
+                return Err(CraneliftError::Codegen(format!(
+                    "BrTable target #{i} depth {depth} out of range — only {} frame(s) on stack",
+                    self.label_stack.len()
+                )));
+            }
+            let frame = &self.label_stack[self.label_stack.len() - 1 - d];
+            if frame.result_cl_ty != yield_ty {
+                return Err(CraneliftError::Codegen(format!(
+                    "BrTable target #{i} yield type {:?} disagrees with default {:?}",
+                    frame.result_cl_ty, yield_ty
+                )));
+            }
+        }
+        // If any of the targets is a loop back-edge with a back-edge
+        // counter, we can't directly weave the resource check into
+        // br_table — the cadence guard belongs on the actual taken
+        // arm. v5-β-2 stage 5 takes the safe approach: emit the
+        // br_table without per-arm cadence, and rely on the prologue
+        // + outer-loop guard for the bound. (Inner `BrIf` back-edges
+        // still benefit from the cadence.) The single-deadline
+        // safety net stays intact because the prologue's check
+        // runs on every entry call.
+        // Pop the yield value (if any) — every arm receives the same
+        // value (wasm semantics: the operand stack at the BrTable
+        // point is shared by every arm).
+        let yield_arg: Option<CValue> = if let Some(cl_ty) = yield_ty {
+            Some(
+                if !self.builder.is_unreachable() && !self.stack.is_empty() {
+                    self.pop()?
+                } else {
+                    self.placeholder_for(cl_ty)
+                },
+            )
+        } else {
+            None
+        };
+
+        // Build the BlockCalls + JumpTable. Each call carries the
+        // optional yield value as its block-arg.
+        let yield_args_slice: Vec<BlockArg> = yield_arg.iter().map(|v| (*v).into()).collect();
+        let default_call = self
+            .builder
+            .func
+            .dfg
+            .block_call(default_target, &yield_args_slice);
+        let target_calls: Vec<BlockCall> = targets
+            .iter()
+            .map(|depth| {
+                let d = *depth as usize;
+                let tgt = self.label_stack[self.label_stack.len() - 1 - d].target_block;
+                self.builder.func.dfg.block_call(tgt, &yield_args_slice)
+            })
+            .collect();
+        let jt_data = JumpTableData::new(default_call, &target_calls);
+        let jt = self.builder.create_jump_table(jt_data);
+        self.builder.ins().br_table(idx_val, jt);
+        // After br_table the rest of the block is unreachable. Create
+        // a dummy fallthrough so subsequent op emission lands somewhere.
+        let dummy = self.builder.create_block();
+        self.builder.seal_block(dummy);
+        self.builder.switch_to_block(dummy);
         Ok(())
     }
 
@@ -2524,9 +3051,18 @@ impl<'a, 'b> Codegen<'a, 'b> {
         // whose break target is the matching `End`.
         self.builder.switch_to_block(then_block);
         let stack_before_then = self.stack.len();
+        // `If` is treated as a labelled block whose break target is the
+        // matching End — but the result value is consumed via the
+        // join-block phi (the explicit `If` lowering pattern) rather
+        // than via the label-frame yield path. So we leave
+        // `result_cl_ty = None` on the frame to avoid double-popping
+        // the yield value.
         self.label_stack.push(LabelFrame {
             target_block: join_block,
             is_loop: false,
+            result_cl_ty: None,
+            loop_cont_block: None,
+            back_edge_counter: None,
         });
         self.emit_body(then_body)?;
         self.label_stack.pop();
@@ -2559,6 +3095,9 @@ impl<'a, 'b> Codegen<'a, 'b> {
         self.label_stack.push(LabelFrame {
             target_block: join_block,
             is_loop: false,
+            result_cl_ty: None,
+            loop_cont_block: None,
+            back_edge_counter: None,
         });
         self.emit_body(else_body)?;
         self.label_stack.pop();
@@ -2608,6 +3147,290 @@ impl<'a, 'b> Codegen<'a, 'b> {
         let zero = self.builder.ins().iconst(self.pointer_ty, 0);
         let cmp = self.builder.ins().icmp(IntCC::Equal, fn_ptr, zero);
         self.cond_trap(cmp, TrapKind::CapabilityDenied);
+        Ok(())
+    }
+
+    /// Lower `Op::CallNative { import_idx, param_tys, ret_ty, cap_bit }`.
+    /// Stage 5 Phase C.1: full indirect dispatch via the capability
+    /// vtable.
+    ///
+    /// Sequence:
+    ///   1. (cap_bit != NO_CAPABILITY_BIT, capability_check on)
+    ///      call `cap_lookup(state, cap_bit)` to materialise the host
+    ///      fn pointer.
+    ///   2. Trap with `CapabilityDenied` when the returned pointer is
+    ///      null (slot not registered or denied by the host posture).
+    ///   3. Build a cranelift `Signature` matching the IR-declared
+    ///      `(param_tys) -> ret_ty` shape; install it as a SigRef on
+    ///      the current function.
+    ///   4. Pop `param_tys.len()` operands off the virtual stack and
+    ///      `call_indirect(sig_ref, fn_ptr, args)`.
+    ///   5. Push the (single) return value if `ret_ty != Null`.
+    ///
+    /// ABI: every host fn is exposed as `extern "C"` (`SystemV` calling
+    /// convention) — host SDKs that register fns must transmute their
+    /// concrete signature to [`crate::sandbox::HostFnPtr`] (a type-
+    /// erased pointer); the cranelift call-site re-shapes the slot
+    /// signature based on the IR's `param_tys + ret_ty` tag. Pointer-
+    /// indirect arg types (String / List*) flow through as i32 arena
+    /// offsets — the host fn is responsible for re-deriving the
+    /// arena base via the sandbox state pointer if it needs the raw
+    /// buffer.
+    fn emit_call_native(
+        &mut self,
+        import_idx: u32,
+        param_tys: &[IrType],
+        ret_ty: IrType,
+        cap_bit: u32,
+    ) -> Result<(), CraneliftError> {
+        // Validate the import index. Helps surface IR-pass bugs early.
+        let import = self.ir.imports.get(import_idx as usize).ok_or_else(|| {
+            CraneliftError::Codegen(format!(
+                "CallNative import_idx {import_idx} out of range (module has {} imports)",
+                self.ir.imports.len()
+            ))
+        })?;
+        if import.param_tys != param_tys {
+            return Err(CraneliftError::Codegen(format!(
+                "CallNative import #{import_idx} param shape disagreement: IR call has {:?}, import declares {:?}",
+                param_tys, import.param_tys
+            )));
+        }
+        if import.ret_ty != ret_ty {
+            return Err(CraneliftError::Codegen(format!(
+                "CallNative import #{import_idx} ret_ty disagreement: IR call has {:?}, import declares {:?}",
+                ret_ty, import.ret_ty
+            )));
+        }
+
+        // 1. cap_lookup -> fn_ptr (or null when the slot is empty).
+        // Even when capability_check is OFF on the sandbox config, we
+        // still need the fn pointer for the indirect call, so the
+        // lookup always runs; only the null-check is gated.
+        let effective_cap_bit = if cap_bit == relon_ir::ir::NO_CAPABILITY_BIT {
+            // The host SDK convention is to register host fns at the
+            // import's `import_idx` when no capability is required.
+            // Mirror that: use `import_idx` as the lookup key so an
+            // unguarded `#native` resolves to the same slot the SDK
+            // populated. The vtable's `register(import_idx, fn_ptr)`
+            // path is the canonical call-shape today; future host
+            // SDKs may grow a separate "default cap" slot system.
+            import_idx
+        } else {
+            cap_bit
+        };
+        let cap_bit_v = self.builder.ins().iconst(I32, i64::from(effective_cap_bit));
+        let inst = self
+            .builder
+            .ins()
+            .call(self.cap_lookup_ref, &[self.state_ptr, cap_bit_v]);
+        let fn_ptr = self.builder.inst_results(inst)[0];
+
+        // 2. Null-check (always emitted: even with capability_check off
+        //    we still need to refuse the call when the host never
+        //    registered any fn at this slot; a null `call_indirect`
+        //    would segfault).
+        let zero = self.builder.ins().iconst(self.pointer_ty, 0);
+        let cmp = self.builder.ins().icmp(IntCC::Equal, fn_ptr, zero);
+        self.cond_trap(cmp, TrapKind::CapabilityDenied);
+
+        // 3. Build the call signature mirroring (param_tys) -> ret_ty.
+        let mut sig = Signature::new(CallConv::SystemV);
+        for ty in param_tys {
+            let cl_ty = ir_ty_to_cl(*ty)?;
+            sig.params.push(AbiParam::new(cl_ty));
+        }
+        // Null return type means "no return value"; everything else
+        // gets one return slot.
+        if !matches!(ret_ty, IrType::Null) {
+            let cl_ret = ir_ty_to_cl(ret_ty)?;
+            sig.returns.push(AbiParam::new(cl_ret));
+        }
+        let sig_ref = self.builder.import_signature(sig);
+
+        // 4. Pop args off the virtual stack (last-pushed = last arg).
+        let mut args: Vec<CValue> = Vec::with_capacity(param_tys.len());
+        for _ in 0..param_tys.len() {
+            args.push(self.pop()?);
+        }
+        args.reverse();
+
+        let call_inst = self.builder.ins().call_indirect(sig_ref, fn_ptr, &args);
+
+        // 5. Push the return value (if any).
+        if !matches!(ret_ty, IrType::Null) {
+            let result = self.builder.inst_results(call_inst)[0];
+            self.push(result);
+        }
+
+        Ok(())
+    }
+
+    /// Lower `Op::MakeClosure { fn_table_idx, captures, captures_size }`.
+    /// Stage 5 Phase C.4.
+    ///
+    /// Closure handle layout (8 bytes total):
+    ///   `[fn_table_idx: u32 LE][captures_ptr: u32 LE]`
+    ///
+    /// Layout in scratch:
+    ///   1. Alloc 8 bytes for the handle (arena-relative ptr →
+    ///      `handle_ptr`).
+    ///   2. If `captures_size > 0`: alloc `captures_size` bytes for
+    ///      the captures struct (→ `captures_ptr`); write each capture
+    ///      from its let-local into the struct at the declared offset.
+    ///   3. Store `fn_table_idx` at `handle_ptr + 0`.
+    ///   4. Store `captures_ptr` (or 0) at `handle_ptr + 4`.
+    ///   5. Push `handle_ptr` as i32 onto the operand stack.
+    fn emit_make_closure(
+        &mut self,
+        fn_table_idx: u32,
+        captures: &[relon_ir::ir::ClosureCapture],
+        captures_size: u32,
+    ) -> Result<(), CraneliftError> {
+        // 1. Alloc 8 bytes for the handle.
+        let handle_size = self.builder.ins().iconst(I32, 8);
+        self.emit_alloc_scratch(handle_size)?;
+        let handle_ptr = self.pop()?;
+
+        // 2. Alloc captures struct if non-empty.
+        let captures_ptr = if captures_size > 0 {
+            let cs = self.builder.ins().iconst(I32, i64::from(captures_size));
+            self.emit_alloc_scratch(cs)?;
+            self.pop()?
+        } else {
+            self.builder.ins().iconst(I32, 0)
+        };
+
+        // 3. Store fn_table_idx at handle_ptr + 0.
+        let fn_idx_v = self.builder.ins().iconst(I32, i64::from(fn_table_idx));
+        // Use the StoreI32AtAbsolute pattern: arena_base + handle_ptr.
+        let abs_handle = self.arena_addr(handle_ptr, 8)?;
+        self.builder
+            .ins()
+            .store(MemFlags::trusted(), fn_idx_v, abs_handle, 0);
+        // 4. Store captures_ptr at handle_ptr + 4.
+        self.builder
+            .ins()
+            .store(MemFlags::trusted(), captures_ptr, abs_handle, 4);
+
+        // 5. Write each capture from its let-local into the captures
+        //    struct.
+        if captures_size > 0 {
+            let captures_abs = self.arena_addr(captures_ptr, captures_size)?;
+            for cap in captures {
+                let mapped_idx = self.remap_let_idx(cap.let_idx);
+                let value = self.get_let(mapped_idx, cap.ty)?;
+                let offset = i32::try_from(cap.offset).map_err(|_| {
+                    CraneliftError::Codegen(format!(
+                        "MakeClosure capture offset {} exceeds i32 range",
+                        cap.offset
+                    ))
+                })?;
+                self.builder
+                    .ins()
+                    .store(MemFlags::trusted(), value, captures_abs, offset);
+            }
+        }
+
+        // 6. Push the handle_ptr onto the operand stack as the Closure
+        //    i32 value.
+        self.push(handle_ptr);
+        Ok(())
+    }
+
+    /// Lower `Op::CallClosure { param_tys, ret_ty }`. Stage 5 Phase C.4.
+    ///
+    /// Stack discipline: `[Closure, arg0, arg1, ...] -> [ret_ty]`. We
+    /// pop the user-visible args (in reverse), pop the closure
+    /// handle, materialise the captures_ptr + fn_table_idx from the
+    /// handle, look up the host fn pointer through
+    /// `state.closure_table_base[fn_table_idx]`, then `call_indirect`
+    /// with the prepended `(state, captures_ptr, args...)` signature.
+    fn emit_call_closure(
+        &mut self,
+        param_tys: &[IrType],
+        ret_ty: IrType,
+    ) -> Result<(), CraneliftError> {
+        // Pop user args in reverse.
+        let mut user_args: Vec<CValue> = Vec::with_capacity(param_tys.len());
+        for _ in 0..param_tys.len() {
+            user_args.push(self.pop()?);
+        }
+        user_args.reverse();
+
+        // Pop the closure handle (arena-relative i32 ptr).
+        let handle_ptr = self.pop()?;
+
+        // Load fn_table_idx + captures_ptr through the handle.
+        let abs_handle = self.arena_addr(handle_ptr, 8)?;
+        let fn_table_idx = self
+            .builder
+            .ins()
+            .load(I32, MemFlags::trusted(), abs_handle, 0);
+        let captures_ptr = self
+            .builder
+            .ins()
+            .load(I32, MemFlags::trusted(), abs_handle, 4);
+
+        // Look up host fn pointer through
+        // state.closure_table_base[fn_table_idx]. Each slot is a
+        // `usize` (host pointer size).
+        let table_base = self.builder.ins().load(
+            self.pointer_ty,
+            MemFlags::trusted(),
+            self.state_ptr,
+            crate::sandbox::STATE_OFFSET_CLOSURE_TABLE_BASE,
+        );
+        let idx_p = self.builder.ins().uextend(self.pointer_ty, fn_table_idx);
+        let stride_bits = match self.pointer_ty.bits() {
+            64 => 3, // log2(8) = 3
+            32 => 2, // log2(4) = 2
+            _ => {
+                return Err(CraneliftError::Codegen(
+                    "unsupported pointer width for closure table".into(),
+                ))
+            }
+        };
+        let off = self.builder.ins().ishl_imm(idx_p, stride_bits);
+        let slot_addr = self.builder.ins().iadd(table_base, off);
+        let fn_ptr = self
+            .builder
+            .ins()
+            .load(self.pointer_ty, MemFlags::trusted(), slot_addr, 0);
+        // Null-check the resolved fn pointer (defensive: a
+        // misconfigured closure_table_base would point at zero-filled
+        // memory; a null call_indirect would segfault).
+        let zero = self.builder.ins().iconst(self.pointer_ty, 0);
+        let cmp = self.builder.ins().icmp(IntCC::Equal, fn_ptr, zero);
+        self.cond_trap(cmp, TrapKind::CapabilityDenied);
+
+        // Build call signature: (state, captures_ptr, params...) -> ret_ty.
+        let mut sig = Signature::new(CallConv::SystemV);
+        sig.params.push(AbiParam::new(self.pointer_ty));
+        sig.params.push(AbiParam::new(I32));
+        for ty in param_tys {
+            sig.params.push(AbiParam::new(ir_ty_to_cl(*ty)?));
+        }
+        if !matches!(ret_ty, IrType::Null) {
+            sig.returns.push(AbiParam::new(ir_ty_to_cl(ret_ty)?));
+        }
+        let sig_ref = self.builder.import_signature(sig);
+
+        // Assemble args: [state, captures_ptr, user_args...].
+        let mut call_args: Vec<CValue> = Vec::with_capacity(user_args.len() + 2);
+        call_args.push(self.state_ptr);
+        call_args.push(captures_ptr);
+        call_args.extend(user_args);
+
+        let inst = self
+            .builder
+            .ins()
+            .call_indirect(sig_ref, fn_ptr, &call_args);
+
+        if !matches!(ret_ty, IrType::Null) {
+            let r = self.builder.inst_results(inst)[0];
+            self.push(r);
+        }
         Ok(())
     }
 

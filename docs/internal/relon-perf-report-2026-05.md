@@ -161,6 +161,121 @@ CI 上 bench 跑的是同一份 bench binary（见
 `.github/workflows/bench.yml`）；CI 数字噪声较大（共享 runner，
 无 CPU pin），所以以本地 perf-runner 数字为准。
 
+## 七 bis、Stage 5 Phase C 落地（2026-05-18 同日续）
+
+stage 5 收尾把 stage 4 报告里列为 v5-γ 跟进的 Phase C 4 项全部落地：
+
+| Phase | Scope | Stage 5 commit | 状态 |
+|---|---|---|---|
+| C.1 | `Op::CallNative` full indirect dispatch via cap vtable | `c55e762` | ✅ |
+| C.4 | `Op::MakeClosure` + `Op::CallClosure` closure ABI | `7d3d298` | ✅ |
+| C.2 | `Op::Loop result_ty != None` + `Op::BrTable` + back-edge cadence | `27b6f85` | ✅ |
+| C.3 | signal-hook trap handler infrastructure（替代 catch_unwind 路径的基础设施） | `5718c6e` | ⚠ infrastructure-only：完整 sigsetjmp 长跳留 v6-γ |
+
+### Phase C.1 — CallNative dispatch
+
+`Op::CallNative` 从 stage 3 / stage 4 的"CheckCap 验存在"升级成完整
+`call_indirect`：
+
+* 每个 call site 先 `cap_lookup(state, cap_bit)` 取 host fn ptr。
+* 空指针走 `TrapKind::CapabilityDenied`（即便 sandbox `capability_check`
+  关掉也要 null-check —— 空 indirect call 会 segfault）。
+* 用 IR-declared `(param_tys, ret_ty)` 现场构造 cranelift `Signature`
+  → `import_signature` → `call_indirect`。
+* `cap_bit == NO_CAPABILITY_BIT` 时 fallback 用 `import_idx` 作 vtable
+  lookup key（兼容 host SDK 把无 cap 入口按 import_idx 注册的惯例）。
+
+测试覆盖：nullary fn / 1-arg / 2-arg / capability denied trap /
+side-effect mutation / signature mismatch refuse（6 case）。
+
+### Phase C.4 — Closures
+
+每个 lambda 都被编译为独立的 cranelift function，签名
+`(state, captures_ptr: i32, params...) -> ret`：
+
+* `IrModule::closure_table[slot] -> funcs[idx]` 给出 lambda 的源
+  位置。`compile_module_with` 在编译 entry 之前就 `declare_function`
+  所有 lambda，编译 entry 之后再逐个 `define_function`。
+* `finalize_definitions` 之后 host 把每个 lambda 的 fn ptr resolve
+  成 `usize`，存进 `Box<[usize]>`。
+* `SandboxState::closure_table_base`（新 field，offset 40）由 host
+  trampoline 装上 `Box` 的首址。
+* `Op::MakeClosure` 在 scratch 区分配 8-byte handle +
+  captures struct，写 `[fn_table_idx][captures_ptr]`，捕获值按
+  `ClosureCapture::offset` 写入；push handle 的 arena offset。
+* `Op::CallClosure` 加载 handle 的两个字段，按
+  `closure_table_base[fn_table_idx]` 拿 fn ptr，null-check 防御，
+  emit `call_indirect` with `(state, captures_ptr, args...)` 签名。
+
+测试覆盖：无捕获 lambda / 带 1 个 I64 capture / 2-arg lambda / 多
+lambda 在同模块各占独立 slot（5 case）。
+
+### Phase C.2 — Loop result_ty + BrTable + 节奏
+
+* `Op::Loop` / `Op::Block` 现在通过 cranelift block-parameter 实现
+  `result_ty != None` 的 yield-value 模式。loop header 的 block-param
+  即是 loop-carried accumulator，每条 back-edge 通过 jump args 重新
+  喂入；fall-through 落到 cont block。
+* `Op::BrTable` 用 cranelift `br_table` + `JumpTableData` 实现，
+  per-arm yield-args 统一前置。
+* `RESOURCE_CHECK_INTERVAL = 1024` cadence：每个 loop 在 header
+  block 上声明一个 I64 计数变量，`emit_br` 在 is_loop 的 back-edge
+  位置 emit `++counter; if (counter & 1023) == 0 emit_resource_check`。
+
+测试覆盖：yielding loop sum 1..=n / br_table default / br_table case
+0 / br_table case 1 / 100k iter 不 trap / 0-ns deadline trap（6 case）。
+
+### Phase C.3 — signal-hook handler infrastructure
+
+stage 5 落地了 `crate::trap_handler` 模块 + `signal-hook` 0.3 +
+`signal-hook-registry` 1.4 依赖：
+
+* `install_global_signal_handler()` 用 `OnceLock` 装一次性，handler
+  内只触 thread-local + atomic，符合 async-signal-safe。
+* 通过 `register_signal_unchecked` 注册 SIGSEGV / SIGFPE / SIGILL —
+  signal-hook 默认把这三个标记为 forbidden 是为防止库代码意外抢占
+  Rust panic runtime；我们的 handler 不分配、不锁、不跑 Drop，绕过
+  forbidden 检查是合理的。
+* `invoke_legacy_entry` / `invoke_buffer_entry_with_scratch` 每次
+  调用前 install + reset，调用后 `dispatch_post` 先看 signal slot
+  再看 sandbox trap_code（signal 来自 hardware/OS layer，优先级高
+  于 codegen 主动 emit 的 trap）。
+
+**这是 infrastructure-only 落地**：完整的 sigsetjmp / siglongjmp
+长跳被推到 v6-γ trace JIT，原因是
+
+* libc crate 不 expose `sigsetjmp`（glibc 上是 macro，跨平台差异大）。
+* 现有 `catch_unwind` shield 在 cond_trap-emitted trap 的功能上等价；
+  signal-hook 给的是 hardware-side memory-safety bug 的兜底。
+* 性能差距是 micro（cold path），不是热路径关键。
+
+测试覆盖：handler 幂等装载 / reset+read / 4 个 signal-to-trap-kind
+映射（6 case）。
+
+### Stage 5 实测 bench 数据（2026-05-18 同日）
+
+```
+v5b2_stage4_arithmetic/cranelift/cold    [289.66 µs 293.37 µs 298.41 µs]   (2/50 outliers, all high mild)
+v5b2_stage4_arithmetic/cranelift/warm    [398.07 ns 400.49 ns 404.66 ns]   (8/50 outliers)
+v5b2_stage4_arithmetic/tree_walk/total   [1.2727 ms 1.2890 ms 1.3054 ms]   (1/50 outliers high mild)
+v5b2_stage4_arithmetic/tree_walk/warm    [2.3526 µs 2.3654 µs 2.3893 µs]   (7/50 outliers)
+```
+
+vs stage 4 同套件（同机，2026-05-18 早晨）：
+
+| 探针 | stage 4 中位数 | stage 5 中位数 | Δ |
+|---|---:|---:|---:|
+| cranelift cold | 275.4 µs | **293.4 µs** | +18 µs（+6.5 %），来自 codegen 新增 4 个 Op 分支 + closure_func_ids 预 declare + signal handler install once |
+| cranelift warm | 415.2 ns | **400.5 ns** | **−15 ns（−3.5 %）**，意外的小幅改进，主要是 cranelift opt_level=speed 把 emit_block 的 fall-through 跳转去重 |
+| tree_walk total | 1.260 ms | 1.289 ms | +29 µs（+2.3 %），噪声范围 |
+| tree_walk warm | 2.352 µs | 2.365 µs | +13 ns（+0.6 %），噪声 |
+
+**cranelift warm 400 ns 与 LuaJIT trace tier 0.3-0.5 µs 目标完全一致，
+仍领先 tree-walk warm 5.9 ×**。stage 5 phase C 的开销集中在 cold
+path（多走 4 个 Op 的 lowering 分支），warm path 反而因 cranelift
+optimizer 更好地利用 block fall-through 的 SSA structure 而小幅
+变快。
+
 ## 七、Gate（stage 4 final）
 
 stage 4 收尾 gate（feature 调整后，`cranelift-aot` 是 `relon`

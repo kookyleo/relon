@@ -299,6 +299,22 @@ pub struct SandboxState {
     /// reads this to produce `scratch_base + scratch_cursor` as the
     /// arena-relative i32 pointer returned to the stdlib body.
     scratch_base: UnsafeCell<u32>,
+    /// Pointer to the start of the closure-table: an array of host-
+    /// address-sized fn pointers, indexed by the `fn_table_idx` field
+    /// of the per-closure handle. The cranelift `Op::CallClosure`
+    /// sequence reads `closure_table_base + sizeof(usize) *
+    /// fn_table_idx` to materialise the lambda's host fn pointer and
+    /// `call_indirect`s through it.
+    ///
+    /// `0` when the module has no lambda funcs; the cranelift code
+    /// never reads through it in that shape because no `Op::CallClosure`
+    /// is emitted.
+    ///
+    /// Stored as `UnsafeCell<usize>` because the host populates the
+    /// table after JIT finalize but before any JIT call; once the
+    /// table is installed it remains valid for the SandboxState's
+    /// lifetime.
+    closure_table_base: UnsafeCell<usize>,
     /// Reference start time for the deadline check. Set once at
     /// construction; the entry computes elapsed nanos against this.
     epoch: Instant,
@@ -342,6 +358,12 @@ pub const STATE_OFFSET_SCRATCH_CURSOR: i32 = 32;
 /// `scratch_base + scratch_cursor` as the i32 pointer the stdlib body
 /// then dereferences via `LoadI32AtAbsolute` / `MemcpyAtAbsolute` etc.
 pub const STATE_OFFSET_SCRATCH_BASE: i32 = 36;
+/// Byte offset of [`SandboxState::closure_table_base`]. The host
+/// installs the per-module closure fn pointer table here after JIT
+/// finalize; cranelift `Op::CallClosure` reads through this address
+/// `+ sizeof(usize) * fn_table_idx` to materialise the lambda's host
+/// fn pointer.
+pub const STATE_OFFSET_CLOSURE_TABLE_BASE: i32 = 40;
 
 // SAFETY: `Cell<TokenRange>` is not `Sync`, but we only hand
 // `&SandboxState` to single-threaded cranelift code; the typed
@@ -365,6 +387,7 @@ impl SandboxState {
             tail_cursor: UnsafeCell::new(0),
             scratch_cursor: UnsafeCell::new(0),
             scratch_base: UnsafeCell::new(0),
+            closure_table_base: UnsafeCell::new(0),
             epoch: Instant::now(),
             capabilities,
             entry_range: Cell::new(TokenRange::default()),
@@ -410,6 +433,28 @@ impl SandboxState {
     pub unsafe fn install_scratch_base(&self, scratch_base: u32) {
         unsafe {
             *self.scratch_base.get() = scratch_base;
+        }
+    }
+
+    /// Point the JIT-visible closure table at `table_base` — the
+    /// address of an array of host-fn pointers, indexed by the
+    /// `fn_table_idx` field of a closure handle. The cranelift
+    /// `Op::CallClosure` lowering reads through this address.
+    ///
+    /// `0` means "no closure table" (the module has no lambdas).
+    /// Hosts install the address once per evaluator construction,
+    /// after JIT finalize resolves the lambda func pointers.
+    ///
+    /// # Safety
+    ///
+    /// `table_base` must point at a properly aligned `usize` array of
+    /// length at least `closure_table.len()` from the IR module the
+    /// JIT entry was compiled against. The pointer must remain valid
+    /// for the SandboxState's lifetime; once installed the host must
+    /// not reallocate / mutate the table.
+    pub unsafe fn install_closure_table(&self, table_base: usize) {
+        unsafe {
+            *self.closure_table_base.get() = table_base;
         }
     }
 
@@ -601,6 +646,10 @@ mod tests {
         assert_eq!(
             (state.scratch_base.get() as usize) - base,
             STATE_OFFSET_SCRATCH_BASE as usize
+        );
+        assert_eq!(
+            (state.closure_table_base.get() as usize) - base,
+            STATE_OFFSET_CLOSURE_TABLE_BASE as usize
         );
     }
 
