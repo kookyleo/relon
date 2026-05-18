@@ -201,7 +201,15 @@ impl CraneliftAotEvaluator {
         param_names: Vec<String>,
         buffer_schema: Option<BufferSchema>,
     ) -> Result<Self, CraneliftError> {
-        let compiled = codegen::compile_module(&ir, &sandbox_cfg)?;
+        // The codegen's tail-cursor protocol needs the return record's
+        // fixed-area size up front to seed the cursor past the root.
+        // Direct-IR / legacy callers without schema metadata pass 0;
+        // their bodies don't emit tail records.
+        let return_root_size = buffer_schema
+            .as_ref()
+            .map(|bs| bs.return_layout.root_size as u32)
+            .unwrap_or(0);
+        let compiled = codegen::compile_module_with(&ir, &sandbox_cfg, return_root_size)?;
         let CompiledModule {
             module,
             entry_fn_id,
@@ -330,11 +338,10 @@ impl CraneliftAotEvaluator {
         self.dispatch_post(result)
     }
 
-    /// Internal: invoke the buffer-protocol JIT entry. Caller owns
-    /// the arena bytes (already populated with the input buffer);
-    /// this helper installs them into the sandbox state, kicks off
-    /// the JIT, and reports either the `bytes_written` from `run_main`
-    /// or a typed trap.
+    /// Same as [`Self::invoke_buffer_entry_with_scratch`] without an
+    /// explicit scratch base — defaults to `0`. Kept for direct-IR
+    /// tests that don't route through the schema-aware trampoline.
+    #[allow(dead_code)]
     fn invoke_buffer_entry(
         &self,
         arena: &mut [u8],
@@ -342,6 +349,27 @@ impl CraneliftAotEvaluator {
         in_len: u32,
         out_ptr: u32,
         out_cap: u32,
+        caps: u64,
+    ) -> Result<i32, RuntimeError> {
+        self.invoke_buffer_entry_with_scratch(
+            arena, in_ptr, in_len, out_ptr, out_cap, /*scratch_base=*/ 0, caps,
+        )
+    }
+
+    /// Internal: invoke the buffer-protocol JIT entry. Caller owns
+    /// the arena bytes (already populated with the input buffer);
+    /// this helper installs them into the sandbox state, kicks off
+    /// the JIT, and reports either the `bytes_written` from `run_main`
+    /// or a typed trap.
+    #[allow(clippy::too_many_arguments)]
+    fn invoke_buffer_entry_with_scratch(
+        &self,
+        arena: &mut [u8],
+        in_ptr: u32,
+        in_len: u32,
+        out_ptr: u32,
+        out_cap: u32,
+        scratch_base: u32,
         caps: u64,
     ) -> Result<i32, RuntimeError> {
         self.sandbox_state.reset_trap();
@@ -353,6 +381,7 @@ impl CraneliftAotEvaluator {
         unsafe {
             self.sandbox_state
                 .install_arena(arena.as_mut_ptr(), arena.len() as u32);
+            self.sandbox_state.install_scratch_base(scratch_base);
         }
         let state_ptr: *const SandboxState = Arc::as_ptr(&self.sandbox_state);
         let entry = match self.entry_fn {
@@ -437,8 +466,16 @@ impl CraneliftAotEvaluator {
         })?;
         let in_ptr = align_up(const_data_len, 8);
         let out_ptr = align_up(in_ptr + in_len, 8);
-        let arena_size = out_ptr
-            .checked_add(out_cap)
+        // Reserve a scratch region past the output buffer for the
+        // memory stdlib (`concat` / `substring` / …) to bump-allocate
+        // temporary records. 64 KiB matches the wasm side's typical
+        // growth before it has to grow `memory`. The size is fixed
+        // for now; later v5-γ work can pool / size it from the source
+        // when stdlib usage gets bigger.
+        let scratch_size: u32 = 65_536;
+        let scratch_base = align_up(out_ptr + out_cap, 8);
+        let arena_size = scratch_base
+            .checked_add(scratch_size)
             .ok_or_else(|| RuntimeError::IoError("cranelift arena size overflow".into()))?;
 
         let mut arena = vec![0u8; arena_size as usize];
@@ -448,8 +485,14 @@ impl CraneliftAotEvaluator {
         arena[in_ptr as usize..in_ptr as usize + in_bytes.len()].copy_from_slice(&in_bytes);
 
         // 3. Invoke the JIT.
-        let bytes_written = self.invoke_buffer_entry(
-            &mut arena, in_ptr, in_len, out_ptr, out_cap, /*caps=*/ 0,
+        let bytes_written = self.invoke_buffer_entry_with_scratch(
+            &mut arena,
+            in_ptr,
+            in_len,
+            out_ptr,
+            out_cap,
+            scratch_base,
+            /*caps=*/ 0,
         )?;
         if bytes_written < 0 {
             return Err(RuntimeError::IoError(format!(
@@ -679,10 +722,12 @@ fn write_value_into_builder(
     }
 }
 
-/// Decode a single field via [`BufferReader`]. Scalar coverage only
-/// for stage 2; pointer-indirect leaves (String / List*) surface as
-/// `Unsupported` so the corpus harness routes them to
-/// `CraneliftUnsupported` rather than miscomparing.
+/// Decode a single field via [`BufferReader`]. Stage 3 widens this to
+/// cover `String` / `List<Int>` / `List<Float>` / `List<Bool>` —
+/// pointer-indirect leaves whose payload lives in the out_buf tail
+/// area at the offset stored in the fixed-area slot. `List<String>` /
+/// `List<Schema>` still surface as `Unsupported` because the codegen
+/// can't yet emit them on the cranelift side.
 fn read_value_from_reader(
     reader: &BufferReader<'_>,
     field: &Field,
@@ -705,6 +750,38 @@ fn read_value_from_reader(
             .read_null(&field.name)
             .map(|()| Value::Null)
             .map_err(buffer_to_runtime_error),
+        TypeRepr::String => reader
+            .read_string(&field.name)
+            .map(|s| Value::String(s.to_string()))
+            .map_err(buffer_to_runtime_error),
+        TypeRepr::List { element } => match element.as_ref() {
+            TypeRepr::Int => reader
+                .read_list_int(&field.name)
+                .map(|v| Value::List(Arc::new(v.into_iter().map(Value::Int).collect())))
+                .map_err(buffer_to_runtime_error),
+            TypeRepr::Float => reader
+                .read_list_float(&field.name)
+                .map(|v| {
+                    Value::List(Arc::new(
+                        v.into_iter()
+                            .map(|f| Value::Float(ordered_float_wrap(f)))
+                            .collect(),
+                    ))
+                })
+                .map_err(buffer_to_runtime_error),
+            TypeRepr::Bool => reader
+                .read_list_bool(&field.name)
+                .map(|v| Value::List(Arc::new(v.into_iter().map(Value::Bool).collect())))
+                .map_err(buffer_to_runtime_error),
+            other => Err(RuntimeError::Unsupported {
+                reason: format!(
+                    "cranelift-native: cannot decode list field `{field}` of element type `{ty:?}` in schema `{schema}`",
+                    field = field.name,
+                    ty = other,
+                    schema = parent_schema.name,
+                ),
+            }),
+        },
         other => Err(RuntimeError::Unsupported {
             reason: format!(
                 "cranelift-native: cannot decode field `{field}` of type `{ty:?}` in schema `{schema}`",
