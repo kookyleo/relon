@@ -63,6 +63,7 @@
 
 pub mod call_table;
 pub mod deopt;
+pub mod ic_lookup;
 
 pub use call_table::{
     register_external_call, resolve_external_call, with_call_table, ExternalCallTable,
@@ -72,3 +73,4 @@ pub use deopt::{
     DeoptStateSnapshot, GenericState, RecoverableWriteRecord, TraceContext,
     __relon_trace_save_deopt,
 };
+pub use ic_lookup::{__relon_trace_inline_cache_lookup, ic_storage_size, write_ic_header};
