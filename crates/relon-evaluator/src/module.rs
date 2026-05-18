@@ -190,7 +190,7 @@ impl ModuleResolver for FilesystemModuleResolver {
     }
 }
 
-/// v3+ a-3 remote `#import` machinery.
+/// v3+ a-3 / v3++ b-3 remote `#import` machinery.
 ///
 /// HTTPS fetch resolver for `#import "https://..."`. Gated to non-wasm32
 /// targets so the browser playground build of `relon-wasm` does not link
@@ -206,10 +206,16 @@ impl ModuleResolver for FilesystemModuleResolver {
 /// plaintext code fetches over the wire.
 ///
 /// Internally the module wraps a sync `ureq` agent plus a local on-disk
-/// cache (`~/.cache/relon/remote_imports/<sha256_hex>.relon`,
+/// cache (`~/.cache/relon/remote_imports/<sha256_hex>.{body,meta}`,
 /// configurable by the host). Cache entries carry an mtime-based TTL so
 /// repeated runs of the same script do not hit the network on every
 /// cold start. The TTL defaults to 24h and is host-overridable.
+///
+/// v3++ b-3: when a TTL-expired entry still carries server-supplied
+/// validators (`ETag` or `Last-Modified`), the resolver issues a
+/// conditional `GET` and treats a `304 Not Modified` response as
+/// "reuse the cached body and bump TTL" — saving the entire body's
+/// bandwidth on the network round-trip.
 #[cfg(not(target_arch = "wasm32"))]
 mod remote_http {
 
@@ -217,24 +223,67 @@ mod remote_http {
     use relon_eval_api::error::{RemoteImportDenial, RemoteImportFailure, RuntimeError};
     use relon_eval_api::scope::Scope;
     use relon_parser::TokenRange;
+    use serde::{Deserialize, Serialize};
     use sha2::{Digest, Sha256};
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
-    use std::time::{Duration, SystemTime};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     /// Default cache lifetime for a fetched module before the resolver
-    /// re-issues an HTTP request.
+    /// re-issues an HTTP request. Expired entries still try a
+    /// conditional `GET` first (when validators exist) before paying
+    /// for a full body download.
     pub const DEFAULT_CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
+    /// On-disk sidecar metadata that lives next to a cached body. The
+    /// schema is the contract for the `.meta` file format and must
+    /// stay backwards-compatible with any older entries on disk.
+    ///
+    /// `body_sha256` is stored so a future integrity audit (or the
+    /// hash-pinning path) can verify the cache is not corrupt without
+    /// re-downloading.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub(super) struct RemoteCacheMeta {
+        /// `ETag` header echoed back from the previous response, if any.
+        pub etag: Option<String>,
+        /// `Last-Modified` header echoed back from the previous
+        /// response, if any.
+        pub last_modified: Option<String>,
+        /// Unix timestamp (seconds since epoch) of the last successful
+        /// fetch or revalidation. Drives the TTL gate.
+        pub fetched_at: u64,
+        /// SHA-256 of the cached body bytes. Lower-case hex.
+        pub body_sha256: String,
+    }
+
     /// Local on-disk cache for remote `#import` bodies. Each entry is
-    /// keyed by `sha256(url)` so URLs longer than the OS filename limit
-    /// still serialise cleanly. Reads are cheap (a `read_to_string`);
-    /// writes are best-effort — a cache miss after a successful fetch
-    /// is non-fatal, the next run simply re-fetches.
+    /// keyed by `sha256(url)` and lives in two sibling files
+    /// (`<digest>.body` + `<digest>.meta`) so the body bytes stay
+    /// raw and the validator metadata can grow without re-encoding
+    /// the payload. Reads are cheap; writes are best-effort — a cache
+    /// miss after a successful fetch is non-fatal, the next run
+    /// simply re-fetches.
+    ///
+    /// Legacy v3+ a-3 single-file entries (`<digest>.relon`) are
+    /// transparently migrated to the new layout on first access:
+    /// the body is rewritten as `<digest>.body`, a fresh `.meta`
+    /// with no validators is written, and the legacy file is left
+    /// alone so a downgrade path stays viable.
     #[derive(Debug, Clone)]
     pub struct RemoteImportCache {
         root: PathBuf,
         ttl: Duration,
+    }
+
+    /// Snapshot returned by [`RemoteImportCache::load`]. Lets the
+    /// resolver decide between the fast path (TTL hit, no network),
+    /// the revalidation path (TTL expired but validators present), and
+    /// the cold fetch path (no entry at all).
+    pub(super) struct CachedEntry {
+        pub body: String,
+        pub meta: RemoteCacheMeta,
+        /// `true` when the entry is still inside its TTL window.
+        pub fresh: bool,
     }
 
     impl RemoteImportCache {
@@ -267,45 +316,191 @@ mod remote_http {
         }
 
         /// Override the freshness window. Entries older than `ttl` are
-        /// treated as misses and trigger a re-fetch.
+        /// treated as candidates for conditional revalidation (or a
+        /// full re-fetch when no validators are recorded).
         pub fn with_ttl(mut self, ttl: Duration) -> Self {
             self.ttl = ttl;
             self
         }
 
-        /// Filesystem path that would hold `url`'s cached body.
-        fn path_for(&self, url: &str) -> PathBuf {
+        /// Hex digest of `sha256(url)`. Stable filename stem for both
+        /// `<stem>.body` and `<stem>.meta`.
+        fn digest_for(url: &str) -> String {
             let mut h = Sha256::new();
             h.update(url.as_bytes());
-            let digest = hex::encode(h.finalize());
-            self.root.join(format!("{digest}.relon"))
+            hex::encode(h.finalize())
         }
 
-        /// Read a fresh cached body, if any. Returns `None` on missing
-        /// file, expired mtime, or any I/O error — callers always have
-        /// the option to fall through to the network fetch.
-        fn read(&self, url: &str) -> Option<String> {
-            let path = self.path_for(url);
-            let meta = std::fs::metadata(&path).ok()?;
-            if let Ok(mtime) = meta.modified() {
-                if let Ok(age) = SystemTime::now().duration_since(mtime) {
-                    if age > self.ttl {
-                        return None;
-                    }
-                }
+        /// Path to the body file under the new (v3++ b-3) schema.
+        fn body_path(&self, url: &str) -> PathBuf {
+            self.root.join(format!("{}.body", Self::digest_for(url)))
+        }
+
+        /// Path to the meta sidecar under the new schema.
+        fn meta_path(&self, url: &str) -> PathBuf {
+            self.root.join(format!("{}.meta", Self::digest_for(url)))
+        }
+
+        /// Path to the legacy v3+ a-3 body-only file. Kept around so
+        /// existing on-disk caches are not invalidated on upgrade.
+        fn legacy_path(&self, url: &str) -> PathBuf {
+            self.root.join(format!("{}.relon", Self::digest_for(url)))
+        }
+
+        /// Compute SHA-256 (lower-case hex) of a body. Shared with the
+        /// hash-pinning code path so legacy migrations get the same
+        /// digest as a fresh fetch.
+        fn body_digest(body: &str) -> String {
+            let mut h = Sha256::new();
+            h.update(body.as_bytes());
+            hex::encode(h.finalize())
+        }
+
+        /// Current unix time in seconds. Clock skew (system clock
+        /// moved backwards) is tolerated by saturating to 0.
+        fn now_unix() -> u64 {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0)
+        }
+
+        /// Best-effort load of a cached entry. Migrates legacy bodies
+        /// in place when needed. Returns `None` when nothing is
+        /// cached for `url` or any I/O error short-circuits the load.
+        pub(super) fn load(&self, url: &str) -> Option<CachedEntry> {
+            let body_path = self.body_path(url);
+            let meta_path = self.meta_path(url);
+
+            if body_path.exists() {
+                let body = std::fs::read_to_string(&body_path).ok()?;
+                let meta = Self::read_meta(&meta_path).unwrap_or_else(|| {
+                    // Body without meta: synthesise a meta carrying the
+                    // current body digest so future revalidation has
+                    // *something* to anchor on (still no validators).
+                    self.synth_meta(&body, &meta_path)
+                });
+                let fresh = self.is_fresh(meta.fetched_at);
+                return Some(CachedEntry { body, meta, fresh });
             }
-            std::fs::read_to_string(&path).ok()
+
+            // Legacy fallback: a pre-b-3 cache only has the `.relon`
+            // file. Migrate to the new layout so subsequent loads are
+            // identical to a freshly-written entry.
+            let legacy = self.legacy_path(url);
+            if legacy.exists() {
+                let body = std::fs::read_to_string(&legacy).ok()?;
+                // Use the legacy file's mtime as the "fetched_at"
+                // anchor so TTL semantics are preserved across the
+                // upgrade boundary.
+                let fetched_at = std::fs::metadata(&legacy)
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs())
+                    .unwrap_or_else(Self::now_unix);
+                let meta = RemoteCacheMeta {
+                    etag: None,
+                    last_modified: None,
+                    fetched_at,
+                    body_sha256: Self::body_digest(&body),
+                };
+                self.write_body(&body_path, &body);
+                Self::write_meta(&meta_path, &meta);
+                let fresh = self.is_fresh(meta.fetched_at);
+                return Some(CachedEntry { body, meta, fresh });
+            }
+
+            None
         }
 
-        /// Store `body` for `url`. Best-effort — directory creation and
-        /// write failures are silently swallowed so a read-only cache
-        /// directory does not crash the import.
-        fn write(&self, url: &str, body: &str) {
-            let path = self.path_for(url);
+        /// `true` when an entry stamped at `fetched_at` is still within
+        /// the TTL window. The comparison is strict so a TTL of zero
+        /// always re-validates (useful for hosts that want "cache for
+        /// 304s only" semantics). Clock-skew safe — a `fetched_at`
+        /// that lies in the future saturates to age 0, which still
+        /// counts as fresh under any positive TTL.
+        fn is_fresh(&self, fetched_at: u64) -> bool {
+            let now = Self::now_unix();
+            let age = now.saturating_sub(fetched_at);
+            Duration::from_secs(age) < self.ttl
+        }
+
+        fn read_meta(path: &Path) -> Option<RemoteCacheMeta> {
+            let raw = std::fs::read_to_string(path).ok()?;
+            serde_json::from_str(&raw).ok()
+        }
+
+        fn write_meta(path: &Path, meta: &RemoteCacheMeta) {
             if let Some(parent) = path.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
-            let _ = std::fs::write(&path, body);
+            if let Ok(encoded) = serde_json::to_string(meta) {
+                let _ = std::fs::write(path, encoded);
+            }
+        }
+
+        fn write_body(&self, path: &Path, body: &str) {
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::write(path, body);
+        }
+
+        /// Materialise a meta sidecar from a body-only entry. The
+        /// returned value is what an in-memory caller sees; the sync
+        /// write to disk is best-effort.
+        fn synth_meta(&self, body: &str, meta_path: &Path) -> RemoteCacheMeta {
+            let meta = RemoteCacheMeta {
+                etag: None,
+                last_modified: None,
+                fetched_at: Self::now_unix(),
+                body_sha256: Self::body_digest(body),
+            };
+            Self::write_meta(meta_path, &meta);
+            meta
+        }
+
+        /// Persist a freshly-fetched body + validator metadata. Caller
+        /// supplies the headers it observed; either or both may be
+        /// `None` when the origin omitted them.
+        pub(super) fn store(
+            &self,
+            url: &str,
+            body: &str,
+            etag: Option<String>,
+            last_modified: Option<String>,
+        ) {
+            let body_path = self.body_path(url);
+            let meta_path = self.meta_path(url);
+            self.write_body(&body_path, body);
+            let meta = RemoteCacheMeta {
+                etag,
+                last_modified,
+                fetched_at: Self::now_unix(),
+                body_sha256: Self::body_digest(body),
+            };
+            Self::write_meta(&meta_path, &meta);
+        }
+
+        /// Mark an existing entry as freshly revalidated (HTTP 304
+        /// path). Body bytes are not touched; the `fetched_at`
+        /// timestamp is bumped and any newly-observed validator is
+        /// folded in so subsequent revalidations stay accurate.
+        pub(super) fn refresh(
+            &self,
+            url: &str,
+            existing: &RemoteCacheMeta,
+            new_etag: Option<String>,
+            new_last_modified: Option<String>,
+        ) {
+            let meta = RemoteCacheMeta {
+                etag: new_etag.or_else(|| existing.etag.clone()),
+                last_modified: new_last_modified.or_else(|| existing.last_modified.clone()),
+                fetched_at: Self::now_unix(),
+                body_sha256: existing.body_sha256.clone(),
+            };
+            Self::write_meta(&self.meta_path(url), &meta);
         }
     }
 
@@ -364,27 +559,63 @@ mod remote_http {
         }
 
         fn fetch(&self, url: &str, range: TokenRange) -> Result<String, RuntimeError> {
-            // Cache hit short-circuits the network entirely. The hash
-            // pinning variant (`RemoteImportHashMismatch`) is reserved
-            // but not produced yet — see the error enum doc.
-            if let Some(cache) = &self.cache {
-                if let Some(body) = cache.read(url) {
-                    return Ok(body);
+            // Fast path: a still-fresh cache entry never touches the
+            // network. Stale entries (TTL expired) fall through to
+            // the conditional-GET path below so the server can confirm
+            // the body is unchanged without re-sending it.
+            let cached = self.cache.as_ref().and_then(|c| c.load(url));
+            if let Some(entry) = &cached {
+                if entry.fresh {
+                    return Ok(entry.body.clone());
                 }
             }
 
-            let response =
-                ureq::get(url)
-                    .call()
-                    .map_err(|err| RuntimeError::RemoteImportFailed {
-                        payload: Box::new(RemoteImportFailure {
-                            url: url.to_string(),
-                            cause: err.to_string(),
-                        }),
-                        range,
-                    })?;
+            // Build the request. When we have a stale entry with at
+            // least one validator, ask the origin to short-circuit
+            // with `304 Not Modified` instead of resending the body.
+            let mut req = ureq::get(url);
+            if let Some(entry) = &cached {
+                if let Some(etag) = &entry.meta.etag {
+                    req = req.header("If-None-Match", etag.as_str());
+                }
+                if let Some(last_modified) = &entry.meta.last_modified {
+                    req = req.header("If-Modified-Since", last_modified.as_str());
+                }
+            }
+
+            let response = req.call().map_err(|err| RuntimeError::RemoteImportFailed {
+                payload: Box::new(RemoteImportFailure {
+                    url: url.to_string(),
+                    cause: err.to_string(),
+                }),
+                range,
+            })?;
 
             let status = response.status();
+
+            // 304 Not Modified: the cached body is still authoritative.
+            // ureq 3's default `http_status_as_error` only flags 4xx /
+            // 5xx, so 304 lands here as a regular Ok response.
+            if status.as_u16() == 304 {
+                if let (Some(cache), Some(entry)) = (self.cache.as_ref(), cached.as_ref()) {
+                    let new_etag = header_string(&response, "ETag");
+                    let new_last_modified = header_string(&response, "Last-Modified");
+                    cache.refresh(url, &entry.meta, new_etag, new_last_modified);
+                    return Ok(entry.body.clone());
+                }
+                // 304 without a cached body is a server bug — surface
+                // it cleanly so the caller does not silently load an
+                // empty module.
+                return Err(RuntimeError::RemoteImportFailed {
+                    payload: Box::new(RemoteImportFailure {
+                        url: url.to_string(),
+                        cause: "server replied 304 Not Modified but no cached body was available"
+                            .to_string(),
+                    }),
+                    range,
+                });
+            }
+
             if !status.is_success() {
                 return Err(RuntimeError::RemoteImportFailed {
                     payload: Box::new(RemoteImportFailure {
@@ -394,6 +625,11 @@ mod remote_http {
                     range,
                 });
             }
+
+            // 200 path: snapshot validators *before* consuming the
+            // body, since `into_body` takes the response by value.
+            let new_etag = header_string(&response, "ETag");
+            let new_last_modified = header_string(&response, "Last-Modified");
 
             let body = response.into_body().read_to_string().map_err(|err| {
                 RuntimeError::RemoteImportFailed {
@@ -406,7 +642,7 @@ mod remote_http {
             })?;
 
             if let Some(cache) = &self.cache {
-                cache.write(url, &body);
+                cache.store(url, &body, new_etag, new_last_modified);
             }
             Ok(body)
         }
@@ -416,6 +652,21 @@ mod remote_http {
         fn default() -> Self {
             Self::new()
         }
+    }
+
+    /// Pull a header value out of an `http::Response<Body>` as an owned
+    /// `String`, dropping anything that is not valid UTF-8. Validator
+    /// headers (`ETag`, `Last-Modified`) are spec'd as ASCII so the
+    /// lossy conversion is observable only against misconfigured
+    /// origins — in which case dropping the header degrades cleanly
+    /// to "no validator", and the next revalidation just falls back to
+    /// a full fetch.
+    fn header_string<B>(response: &ureq::http::Response<B>, name: &str) -> Option<String> {
+        response
+            .headers()
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string())
     }
 
     impl ModuleResolver for RemoteHttpResolver {
@@ -626,11 +877,17 @@ mod remote_http {
         #[test]
         fn cache_path_is_stable_for_url() {
             let cache = RemoteImportCache::new("/tmp/relon-remote-import");
-            let p1 = cache.path_for("https://example.com/util.relon");
-            let p2 = cache.path_for("https://example.com/util.relon");
+            let p1 = cache.body_path("https://example.com/util.relon");
+            let p2 = cache.body_path("https://example.com/util.relon");
             assert_eq!(p1, p2);
-            let p3 = cache.path_for("https://example.com/other.relon");
+            let p3 = cache.body_path("https://example.com/other.relon");
             assert_ne!(p1, p3);
+            // The meta sidecar shares the digest stem so a single
+            // digest collision audit covers both halves of the entry.
+            assert_eq!(
+                p1.with_extension("meta"),
+                cache.meta_path("https://example.com/util.relon")
+            );
         }
     }
 }
