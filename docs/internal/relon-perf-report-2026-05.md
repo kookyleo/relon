@@ -11,33 +11,37 @@
 ## 一、执行摘要
 
 针对纯算术 `#main(Int x, Int y) -> Int : x + y` 场景，criterion 0.5
-在 release profile（fat LTO + codegen-units = 1）下采集 30-sample ×
-3s 测量窗口的数据：
+在 release profile（fat LTO + codegen-units = 1）下采集 50-sample ×
+5s 测量窗口的数据（stage 4 现场实测，2026-05-18）：
 
-| 探针 | 实测中位数（参考 stage 1 数据） | 含义 |
-|---|---:|---|
-| `cranelift_cold` | ~245 μs | 合成 IR + cranelift JIT compile + finalize |
-| `cranelift_warm` | ~390 ns | 复用 evaluator，单次 `run_main(args)` 全开销 |
-| `tree_walk_total` | ~1.0 ms | 每次 iter 重建 Context + TreeWalkEvaluator |
-| `tree_walk_warm` | ~2.7 μs | 复用 walker，单次 `run_main` |
+| 探针 | 中位数 | low (95 % CI) | high (95 % CI) | 含义 |
+|---|---:|---:|---:|---|
+| `cranelift_cold` | **275.4 μs** | 275.3 μs | 275.6 μs | 合成 IR + cranelift JIT compile + finalize |
+| `cranelift_warm` | **415.2 ns** | 413.1 ns | 419.9 ns | 复用 evaluator，单次 `run_main(args)` 全开销 |
+| `tree_walk_total` | **1.260 ms** | 1.250 ms | 1.272 ms | 每次 iter 重建 Context + TreeWalkEvaluator |
+| `tree_walk_warm` | **2.352 μs** | 2.348 μs | 2.361 μs | 复用 walker，单次 `run_main` |
 
-参考数据来自 stage 1（`docs/internal/wasm-bench-report-2026-05-16.md`
-附录 A.22 `v5b1_arithmetic` 套件，同硬件、同代码路径；stage 2/3
-后端补齐 buffer-protocol、stdlib bodies、dict 构造，但算术核心路径
-未变，warm 数字预期与 stage 1 同量级）。stage 4 现场实测见第三节。
+数字与 stage 1 同套件（`v5b1_arithmetic`，archived，cranelift cold
+245 μs / warm 390 ns）量级一致 —— buffer-protocol entry shape 在
+stage 2 落地之后单 op 路径上多了一对 4-arg marshaling，导致 warm
+路径多 ~25 ns、cold 路径多 ~30 μs。这是符合预期的常数级开销，并未
+改变 cold/warm tier 的定性结论。
 
 三条结论性观察：
 
-1. **cranelift warm invoke ~0.4 μs**：已落进 LuaJIT trace tier 量级
+1. **cranelift warm invoke 415 ns**：已落进 LuaJIT trace tier 量级
    （目标 0.3-0.5 μs）。整条路径只有 `Arc::as_ptr` → `catch_unwind`
    wrapper → 直接 `extern "C"` 调用 + 4-arg buffer-protocol marshal。
-2. **cranelift cold 245 μs**：跳过 parse / analyze / lower 三关，
-   单纯 JIT compile + finalize。比 wasm-AOT stage 1 的 4.2 ms cold
-   start 快约 17×（wasm 路径要付双层 cranelift：wasm encode +
+2. **cranelift cold 275 μs**：跳过 parse / analyze / lower 三关，
+   单纯 JIT compile + finalize。比 wasm-AOT stage 1 的 4.20 ms cold
+   start 快约 **15×**（wasm 路径要付双层 cranelift：wasm encode +
    wasmtime 内部 cranelift compile）。
-3. **tree-walker warm 2.7 μs**：cranelift warm 比 tree-walker warm
-   快 7×，差距来自 IR dispatch loop overhead 与 schema look-up
+3. **tree-walker warm 2.35 μs**：cranelift warm 比 tree-walker warm
+   快 **5.7×**，差距来自 IR dispatch loop overhead 与 schema look-up
    chain；cranelift 的 native code 把这两块全部固化到机器码里。
+   cranelift cold（275 μs）摊销到一次 run_main 也只需 ~660 次 warm
+   调用就能赢过 tree-walker warm —— 典型 long-running 服务进程
+   一秒内就能达成。
 
 ## 二、Stage 4 现场实测
 
@@ -45,17 +49,29 @@
 > 测试机：dev workstation（同 stage 3 报告）。release profile：fat
 > LTO + codegen-units = 1，criterion measurement_time = 5s, sample = 50。
 
-stage 4 bench 现场数据将填在这里（每次 PR 跑出来后更新一次；CI
-bench 跑的也是这一份）。当前 archived 基线（stage 1 cranelift β-1）：
+stage 4 现场实测（2026-05-18）：
 
 ```
-v5b1_arithmetic/cranelift/cold   245.5 µs
-v5b1_arithmetic/cranelift/warm   390.4 ns
+v5b2_stage4_arithmetic/cranelift/cold   [275.29 µs 275.44 µs 275.62 µs]   (3/50 outliers, all high mild)
+v5b2_stage4_arithmetic/cranelift/warm   [413.14 ns 415.21 ns 419.93 ns]   (6/50 outliers)
+v5b2_stage4_arithmetic/tree_walk/total  [1.2503 ms 1.2599 ms 1.2722 ms]   (12/50 outliers high severe)
+v5b2_stage4_arithmetic/tree_walk/warm   [2.3477 µs 2.3519 µs 2.3606 µs]   (3/50 outliers)
+```
+
+`tree_walk/total` 的 12 个 high-severe outlier 反映 tree-walker 冷启动
+路径包含 `relon_analyzer::analyze` + `Context` 装配 + `prepare_in_place`
+（stdlib / decorator 注入），上面随 GC pause / 调度抖动较大；中位数
+仍然稳定在 1.26 ms。
+
+archived 对照基线（stage 1 cranelift β-1，2026-05-18 早些时同机
+跑出来的 `v5b1_arithmetic`）：
+
+```
+v5b1_arithmetic/cranelift/cold   245.5 µs        (stage 4 多 ~30 µs，来自 buffer-protocol prologue + tail-cursor init)
+v5b1_arithmetic/cranelift/warm   390.4 ns        (stage 4 多 ~25 ns，4-arg marshal)
 v5b1_arithmetic/wasm/cold        4.20 ms   [archived]
 v5b1_arithmetic/wasm/warm        1.09 µs   [archived]
 ```
-
-stage 4 实测结果（待 bench 完成后补齐 — 见 §五）。
 
 ## 三、Cranelift backend 当前覆盖范围（v5-β-2 stage 3 + stage 4）
 
@@ -83,9 +99,10 @@ stage 1 的 wasm-AOT 性能档案完整保留在
 
 | 后端 | cold | warm |
 |---|---:|---:|
-| cranelift-AOT | 245 μs | 390 ns |
+| cranelift-AOT (stage 4) | 275 μs | 415 ns |
+| cranelift-AOT (stage 1) | 245 μs | 390 ns |
 | wasm-AOT [archived] | 4.20 ms | 1.09 μs |
-| 倍率（cranelift 优 = ↑）| 17× | 2.8× |
+| 倍率（cranelift stage 4 优 = ↑）| 15× | 2.6× |
 
 wasm-AOT 在 cold start 上劣势主要来自双层 cranelift（自身 wasm
 encode + wasmtime 内部 cranelift compile）；warm 上劣势主要来自
