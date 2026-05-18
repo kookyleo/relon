@@ -1740,8 +1740,10 @@ dependencies = [
 name = "relon-analyzer"
 version = "0.1.0"
 dependencies = [
+ "hex",
  "miette",
  "relon-parser",
+ "sha2",
  "thiserror 2.0.18",
 ]
 

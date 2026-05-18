@@ -281,6 +281,14 @@ pub struct AnalyzeOptions {
     /// workspace pass propagates the entry module's mode to every
     /// reachable import so the two halves can't disagree.
     pub strict_mode: bool,
+    /// v3++ b-2: when `true`, every `#import` whose path looks remote
+    /// (`https://`, `http://`) must carry an inline integrity pin
+    /// (`sha256:"..."`). Missing pins surface as
+    /// [`crate::WorkspaceDiagnostic::ImportHashRequired`] before the
+    /// loader is given a chance to fetch. Local-path imports are
+    /// unaffected — the supply-chain risk model targets the network.
+    /// Default `false` preserves the v3+ a-3 behavior.
+    pub require_hash: bool,
 }
 
 impl Default for AnalyzeOptions {
@@ -291,6 +299,7 @@ impl Default for AnalyzeOptions {
             host_fn_gates: HashMap::new(),
             caps: cap::Capabilities::default(),
             strict_mode: true,
+            require_hash: false,
         }
     }
 }

@@ -9,7 +9,8 @@ use crate::sig::FnSignature;
 use crate::tree::AnalyzedTree;
 use crate::workspace::{LoadError, ModuleLoader, WorkspaceDiagnostic, WorkspaceTree};
 use miette::SourceSpan;
-use relon_parser::{parse_document, Expr, Node, TokenKey, TokenRange, TypeNode};
+use relon_parser::{parse_document, Expr, IntegrityHash, Node, TokenKey, TokenRange, TypeNode};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -28,6 +29,12 @@ struct PendingImport {
     /// `WorkspaceDiagnostic`s that surface here are reported against
     /// the importer's source.
     range: TokenRange,
+    /// v3++ b-2: optional integrity pin lifted off the directive. The
+    /// workspace pass verifies the loaded source's digest before the
+    /// module enters the analyzed module table; `None` skips
+    /// verification (preserving the v3+ a-3 default for unpinned
+    /// imports unless `AnalyzeOptions::require_hash` is set).
+    integrity: Option<IntegrityHash>,
 }
 
 pub(crate) fn build<L: ModuleLoader>(
@@ -343,8 +350,81 @@ fn process_import<L: ModuleLoader>(
     options: &crate::AnalyzeOptions,
 ) {
     let span = SourceSpan::from(item.range);
+    // v3++ b-2: enforce `--require-hash` *before* the loader runs.
+    // Missing pins on remote paths surface here so the operator sees a
+    // dedicated diagnostic rather than a successful fetch followed by
+    // an unrelated workspace error. Local-path imports are exempt:
+    // the supply-chain threat model targets the network, and forcing
+    // hashes on every `./util.relon` would penalize day-to-day iteration.
+    if options.require_hash
+        && item.integrity.is_none()
+        && looks_remote(&item.raw_path)
+    {
+        ws.workspace_diagnostics
+            .push(WorkspaceDiagnostic::ImportHashRequired {
+                path: item.raw_path.clone(),
+                range: span,
+            });
+        return;
+    }
+    // Catch pin-shape mistakes (unknown algorithm, wrong hex length)
+    // before we ever ask the loader for the body. Lets the operator
+    // fix the directive without an extra fetch.
+    if let Some(int) = item.integrity.as_ref() {
+        let pin_span = SourceSpan::from(int.range);
+        let Some(algo) = int.algorithm else {
+            ws.workspace_diagnostics
+                .push(WorkspaceDiagnostic::ImportHashUnknownAlgorithm {
+                    path: item.raw_path.clone(),
+                    algorithm: int.algorithm_text.clone(),
+                    range: pin_span,
+                });
+            return;
+        };
+        let algo_str = algo.as_str();
+        let expected_len = algo.hex_len();
+        if int.hex.len() != expected_len
+            || !int.hex.chars().all(|c| c.is_ascii_hexdigit())
+        {
+            ws.workspace_diagnostics
+                .push(WorkspaceDiagnostic::ImportHashInvalidHex {
+                    path: item.raw_path.clone(),
+                    algorithm: algo_str.to_string(),
+                    expected: expected_len,
+                    got: int.hex.len(),
+                    range: pin_span,
+                });
+            return;
+        }
+    }
     match loader.load(&item.raw_path, &item.importer_dir) {
         Ok(loaded) => {
+            // v3++ b-2: verify the loaded source against the pinned
+            // digest before the module enters analysis. A mismatch is
+            // a workspace-level error and the module is dropped — the
+            // body never reaches `parse_document`, so a poisoned remote
+            // cannot influence later passes.
+            if let Some(int) = item.integrity.as_ref() {
+                let pin_span = SourceSpan::from(int.range);
+                // Algorithm was validated above; `unwrap` is unreachable
+                // because the early return on `None` would have fired.
+                let algo = int
+                    .algorithm
+                    .expect("unknown-algorithm pin filtered by earlier branch");
+                let algo_str = algo.as_str();
+                let computed = compute_digest(algo, loaded.source.as_bytes());
+                if !digest_matches(&int.hex, &computed) {
+                    ws.workspace_diagnostics
+                        .push(WorkspaceDiagnostic::ImportHashMismatch {
+                            path: item.raw_path.clone(),
+                            algorithm: algo_str.to_string(),
+                            expected: int.hex.clone(),
+                            got: computed,
+                            range: pin_span,
+                        });
+                    return;
+                }
+            }
             // Wire `importer -> loaded.canonical_id` into the import
             // graph (replacing the raw_path edge that was provisionally
             // recorded earlier so cycle detection has canonical ids).
@@ -424,6 +504,34 @@ fn process_import<L: ModuleLoader>(
     }
 }
 
+/// True for paths that resolve via the network resolver chain. Used by
+/// `--require-hash` to scope the enforcement to remote `#import`s; the
+/// local-path supply-chain story is the source repository itself, not
+/// inline pins.
+fn looks_remote(path: &str) -> bool {
+    path.starts_with("https://") || path.starts_with("http://")
+}
+
+/// Compute the hex-encoded digest of `bytes` under `algo`. Centralised
+/// so the analyzer-side check and any future runtime re-verification
+/// agree on byte order and casing.
+fn compute_digest(algo: relon_parser::HashAlgorithm, bytes: &[u8]) -> String {
+    match algo {
+        relon_parser::HashAlgorithm::Sha256 => {
+            let mut h = Sha256::new();
+            h.update(bytes);
+            hex::encode(h.finalize())
+        }
+    }
+}
+
+/// Case-insensitive hex digest comparison. The pin and the computed
+/// value are compared as ASCII so a copy-pasted upper-case digest
+/// still verifies cleanly.
+fn digest_matches(pinned: &str, computed: &str) -> bool {
+    pinned.eq_ignore_ascii_case(computed)
+}
+
 /// Pull `#import` directives out of an analyzed tree, packaged into
 /// `PendingImport` entries the BFS queue understands. Imports without a
 /// static path (`path == None`) are skipped — they're a parser-side
@@ -444,6 +552,7 @@ fn collect_import_targets(
             importer_dir: importer_dir.to_path_buf(),
             raw_path: path,
             range: imp.range,
+            integrity: imp.integrity.clone(),
         });
     }
     out
@@ -2240,5 +2349,193 @@ mod tests {
             "destructured_closures should expose `add`: {:?}",
             idx
         );
+    }
+
+    /// Compute the sha256 hex of `body` so the tests can pin imports
+    /// without hard-coding digests in the source.
+    fn sha256_hex(body: &str) -> String {
+        let mut h = Sha256::new();
+        h.update(body.as_bytes());
+        hex::encode(h.finalize())
+    }
+
+    #[test]
+    fn import_with_matching_hash_succeeds() {
+        let lib_src = "{ value: 42 }";
+        let digest = sha256_hex(lib_src);
+        let entry_src = format!(
+            "#import lib from \"./lib\" sha256:\"{digest}\"\n{{ v: lib.value }}"
+        );
+        let mut loader = MapLoader::new();
+        loader.add("./lib", "/abs/lib", lib_src);
+        let ws = build(
+            "/abs/entry".to_string(),
+            &entry_src,
+            PathBuf::from("/abs"),
+            &mut loader,
+        );
+        assert!(
+            !ws.workspace_diagnostics.iter().any(|d| matches!(
+                d,
+                WorkspaceDiagnostic::ImportHashMismatch { .. }
+                    | WorkspaceDiagnostic::ImportHashRequired { .. }
+                    | WorkspaceDiagnostic::ImportHashInvalidHex { .. }
+                    | WorkspaceDiagnostic::ImportHashUnknownAlgorithm { .. }
+            )),
+            "expected no hash diagnostic, got {:?}",
+            ws.workspace_diagnostics
+        );
+        assert!(ws.modules.contains_key("/abs/lib"));
+    }
+
+    #[test]
+    fn import_with_mismatched_hash_reports_diagnostic() {
+        let lib_src = "{ value: 42 }";
+        // Flip the last hex digit so the digest definitely differs.
+        let mut digest = sha256_hex(lib_src);
+        let last = digest.pop().unwrap();
+        let flipped = if last == '0' { '1' } else { '0' };
+        digest.push(flipped);
+        let entry_src = format!(
+            "#import lib from \"./lib\" sha256:\"{digest}\"\n{{ v: 1 }}"
+        );
+        let mut loader = MapLoader::new();
+        loader.add("./lib", "/abs/lib", lib_src);
+        let ws = build(
+            "/abs/entry".to_string(),
+            &entry_src,
+            PathBuf::from("/abs"),
+            &mut loader,
+        );
+        let mismatches: Vec<_> = ws
+            .workspace_diagnostics
+            .iter()
+            .filter(|d| matches!(d, WorkspaceDiagnostic::ImportHashMismatch { .. }))
+            .collect();
+        assert_eq!(mismatches.len(), 1, "{:?}", ws.workspace_diagnostics);
+        // Poisoned module never reaches the modules table.
+        assert!(!ws.modules.contains_key("/abs/lib"));
+    }
+
+    #[test]
+    fn import_with_unknown_algorithm_reports_diagnostic() {
+        let lib_src = "{ value: 1 }";
+        let entry_src =
+            "#import lib from \"./lib\" sha512:\"deadbeef\"\n{ v: 1 }".to_string();
+        let mut loader = MapLoader::new();
+        loader.add("./lib", "/abs/lib", lib_src);
+        let ws = build(
+            "/abs/entry".to_string(),
+            &entry_src,
+            PathBuf::from("/abs"),
+            &mut loader,
+        );
+        let kinds: Vec<_> = ws
+            .workspace_diagnostics
+            .iter()
+            .filter(|d| matches!(d, WorkspaceDiagnostic::ImportHashUnknownAlgorithm { .. }))
+            .collect();
+        assert_eq!(kinds.len(), 1, "{:?}", ws.workspace_diagnostics);
+    }
+
+    #[test]
+    fn import_with_invalid_hex_reports_diagnostic() {
+        // Right algorithm, wrong hex length (and a non-hex char) — the
+        // analyzer catches both before the loader runs.
+        let lib_src = "{ value: 1 }";
+        let entry_src = "#import lib from \"./lib\" sha256:\"ZZ\"\n{ v: 1 }".to_string();
+        let mut loader = MapLoader::new();
+        loader.add("./lib", "/abs/lib", lib_src);
+        let ws = build(
+            "/abs/entry".to_string(),
+            &entry_src,
+            PathBuf::from("/abs"),
+            &mut loader,
+        );
+        let kinds: Vec<_> = ws
+            .workspace_diagnostics
+            .iter()
+            .filter(|d| matches!(d, WorkspaceDiagnostic::ImportHashInvalidHex { .. }))
+            .collect();
+        assert_eq!(kinds.len(), 1, "{:?}", ws.workspace_diagnostics);
+    }
+
+    #[test]
+    fn require_hash_flags_unpinned_remote_import() {
+        let lib_src = "{ value: 1 }";
+        let entry_src =
+            "#import lib from \"https://example.com/lib.relon\"\n{ v: 1 }".to_string();
+        let mut loader = MapLoader::new();
+        loader.add("https://example.com/lib.relon", "/canon/lib", lib_src);
+        let opts = crate::AnalyzeOptions {
+            require_hash: true,
+            ..crate::AnalyzeOptions::default()
+        };
+        let ws = super::build(
+            "/abs/entry".to_string(),
+            &entry_src,
+            PathBuf::from("/abs"),
+            &mut loader,
+            &opts,
+        );
+        let kinds: Vec<_> = ws
+            .workspace_diagnostics
+            .iter()
+            .filter(|d| matches!(d, WorkspaceDiagnostic::ImportHashRequired { .. }))
+            .collect();
+        assert_eq!(kinds.len(), 1, "{:?}", ws.workspace_diagnostics);
+    }
+
+    #[test]
+    fn require_hash_does_not_flag_local_unpinned_import() {
+        // Local paths are exempt — `--require-hash` is a network
+        // supply-chain knob, not a blanket policy.
+        let lib_src = "{ value: 1 }";
+        let entry_src = "#import lib from \"./lib\"\n{ v: 1 }".to_string();
+        let mut loader = MapLoader::new();
+        loader.add("./lib", "/abs/lib", lib_src);
+        let opts = crate::AnalyzeOptions {
+            require_hash: true,
+            ..crate::AnalyzeOptions::default()
+        };
+        let ws = super::build(
+            "/abs/entry".to_string(),
+            &entry_src,
+            PathBuf::from("/abs"),
+            &mut loader,
+            &opts,
+        );
+        assert!(!ws
+            .workspace_diagnostics
+            .iter()
+            .any(|d| matches!(d, WorkspaceDiagnostic::ImportHashRequired { .. })));
+    }
+
+    #[test]
+    fn require_hash_accepts_pinned_remote_import() {
+        let lib_src = "{ value: 1 }";
+        let digest = sha256_hex(lib_src);
+        let entry_src = format!(
+            "#import lib from \"https://example.com/lib.relon\" sha256:\"{digest}\"\n{{ v: 1 }}"
+        );
+        let mut loader = MapLoader::new();
+        loader.add("https://example.com/lib.relon", "/canon/lib", lib_src);
+        let opts = crate::AnalyzeOptions {
+            require_hash: true,
+            ..crate::AnalyzeOptions::default()
+        };
+        let ws = super::build(
+            "/abs/entry".to_string(),
+            &entry_src,
+            PathBuf::from("/abs"),
+            &mut loader,
+            &opts,
+        );
+        assert!(!ws.workspace_diagnostics.iter().any(|d| matches!(
+            d,
+            WorkspaceDiagnostic::ImportHashRequired { .. }
+                | WorkspaceDiagnostic::ImportHashMismatch { .. }
+        )));
+        assert!(ws.modules.contains_key("/canon/lib"));
     }
 }
