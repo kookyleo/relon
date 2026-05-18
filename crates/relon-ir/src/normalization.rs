@@ -260,8 +260,7 @@ pub fn compose(buf: Vec<u32>) -> Vec<u32> {
             let starter_cp = out[last_starter];
             // Try Hangul composition first - pure algorithm, no table
             // hit at all.
-            let composed =
-                hangul_compose(starter_cp, cp).or_else(|| compose_pair(starter_cp, cp));
+            let composed = hangul_compose(starter_cp, cp).or_else(|| compose_pair(starter_cp, cp));
             if let Some(comp) = composed {
                 // The composition is only valid if `cp` is not
                 // "blocked" by a preceding non-starter of equal or
@@ -456,7 +455,12 @@ mod tests {
 
     #[test]
     fn nfd_idempotence() {
-        for s in ["", "caf\u{00E9}", "\u{D55C}\u{AD6D}\u{C5B4}", "a\u{0307}\u{0323}b"] {
+        for s in [
+            "",
+            "caf\u{00E9}",
+            "\u{D55C}\u{AD6D}\u{C5B4}",
+            "a\u{0307}\u{0323}b",
+        ] {
             let once = to_nfd(s);
             assert_eq!(to_nfd(&once), once, "NFD idempotence fail on {s:?}");
         }
@@ -464,7 +468,13 @@ mod tests {
 
     #[test]
     fn nfkc_idempotence() {
-        for s in ["", "caf\u{00E9}", "\u{D55C}\u{AD6D}\u{C5B4}", "\u{00BD}", "\u{FB01}le"] {
+        for s in [
+            "",
+            "caf\u{00E9}",
+            "\u{D55C}\u{AD6D}\u{C5B4}",
+            "\u{00BD}",
+            "\u{FB01}le",
+        ] {
             let once = to_nfkc(s);
             assert_eq!(to_nfkc(&once), once, "NFKC idempotence fail on {s:?}");
         }
@@ -472,7 +482,13 @@ mod tests {
 
     #[test]
     fn nfkd_idempotence() {
-        for s in ["", "caf\u{00E9}", "\u{D55C}\u{AD6D}\u{C5B4}", "\u{00BD}", "\u{FB01}le"] {
+        for s in [
+            "",
+            "caf\u{00E9}",
+            "\u{D55C}\u{AD6D}\u{C5B4}",
+            "\u{00BD}",
+            "\u{FB01}le",
+        ] {
             let once = to_nfkd(s);
             assert_eq!(to_nfkd(&once), once, "NFKD idempotence fail on {s:?}");
         }
@@ -559,8 +575,10 @@ mod tests {
             assert!(a < b, "COMPOSITION_PAIRS must be sorted: {a:?} >= {b:?}");
         }
         // Sanity: U+212A is excluded.
-        let kelvin_idx =
-            COMPOSITION_PAIRS.binary_search_by(|t| (t.0, t.1).cmp(&(0x004B, 0)));
-        assert!(kelvin_idx.is_err(), "U+212A should be excluded from COMPOSITION_PAIRS");
+        let kelvin_idx = COMPOSITION_PAIRS.binary_search_by(|t| (t.0, t.1).cmp(&(0x004B, 0)));
+        assert!(
+            kelvin_idx.is_err(),
+            "U+212A should be excluded from COMPOSITION_PAIRS"
+        );
     }
 }
