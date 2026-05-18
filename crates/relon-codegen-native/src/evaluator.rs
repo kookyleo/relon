@@ -192,8 +192,7 @@ impl CraneliftAotEvaluator {
             .map_err(|e| CraneliftError::Lowering(format!("main schema layout: {e}")))?;
         let return_layout = SchemaLayout::offsets_for(&return_schema)
             .map_err(|e| CraneliftError::Lowering(format!("return schema layout: {e}")))?;
-        let param_names: Vec<String> =
-            main_schema.fields.iter().map(|f| f.name.clone()).collect();
+        let param_names: Vec<String> = main_schema.fields.iter().map(|f| f.name.clone()).collect();
         let buffer_schema = BufferSchema {
             main_schema: main_schema.clone(),
             return_schema: return_schema.clone(),
@@ -207,33 +206,38 @@ impl CraneliftAotEvaluator {
         // codegen path doesn't leave a stale cache file behind from
         // a stray previous run.
         let source_hash = cache_int::compute_source_hash(source, &sandbox_cfg);
-        Self::write_cache_pair_best_effort(source, &ir_module, &sandbox_cfg, source_hash, cache_dir);
+        Self::write_cache_pair_best_effort(
+            source,
+            &ir_module,
+            &sandbox_cfg,
+            source_hash,
+            cache_dir,
+        );
 
         // 3. Build the live JIT-backed evaluator.
         Self::from_ir_inner(ir_module, sandbox_cfg, param_names, Some(buffer_schema))
     }
 
-    /// v5-γ: load a paired cache entry from disk and reconstruct an
-    /// evaluator from it. Returns `Ok(None)` on a clean cache miss
-    /// (file absent, integrity failure, metadata mismatch), so the
-    /// caller can fall back to `from_source_with_cache`.
+    /// v5-γ: validate an on-disk cache pair against `source` and
+    /// reconstruct an evaluator. Returns `Ok(None)` on a clean miss
+    /// (cache absent, integrity failure, metadata mismatch).
     ///
-    /// The current v5-γ implementation re-JITs from the IR-cache
-    /// half of the pair (skipping parse + analyze + lower). The
-    /// object-cache half is validated end-to-end (HMAC + integrity)
-    /// but the dlopen execution path is deferred until the codegen
-    /// helper-call vtable indirection lands — see the
-    /// `object_cache_integration` module docs for the rationale.
-    pub fn from_cache_dir(
-        source: &str,
-        cache_dir: &Path,
-    ) -> Result<Option<Self>, CraneliftError> {
+    /// Until the codegen-helper-call vtable indirection lands (see
+    /// `object_cache_integration` module docs), the reconstructed
+    /// evaluator still drives parse + analyze + lower + JIT in
+    /// memory. The cache files are validated end-to-end (HMAC +
+    /// integrity + metadata) so a corrupt or mismatched cache is
+    /// detected and removed; the production hot path then writes a
+    /// fresh pair. The dlopen-execution shortcut activates in a
+    /// follow-up phase once cranelift codegen routes
+    /// `relon_now` / `relon_raise_trap` / `relon_cap_lookup` through
+    /// a `__relon_capability_vtable` indirection.
+    pub fn from_cache_dir(source: &str, cache_dir: &Path) -> Result<Option<Self>, CraneliftError> {
         let sandbox_cfg = SandboxConfig::default();
         let source_hash = cache_int::compute_source_hash(source, &sandbox_cfg);
 
-        // Compute the metadata the host expects to see in the file
-        // trailer. Mismatches surface as `Ok(None)` after the cache
-        // pair gets invalidated on disk.
+        // Metadata fingerprint: a cache file targeting a different
+        // generator / cap_bitmap / signature is invalidated below.
         let expected = Self::expected_metadata_for_source(source, &sandbox_cfg);
 
         let loaded = match cache_int::try_load_from_cache(cache_dir, source_hash, &expected)? {
@@ -241,43 +245,52 @@ impl CraneliftAotEvaluator {
             None => return Ok(None),
         };
 
-        // Sanity: the IR-cache sandbox config must match the one we
-        // derived from the runtime side, otherwise we'd risk
-        // resurrecting a different sandbox shape than the cache
-        // expects. Mismatch invalidates the pair and returns miss.
+        // Cross-check the IR-cache sandbox config against the
+        // runtime sandbox; drift invalidates the pair.
         if !sandbox_matches(&loaded.ir_entry.sandbox, &sandbox_cfg) {
             tracing::warn!(
                 target: "relon::object_cache",
                 "ir-cache sandbox config drift; invalidating pair"
             );
             let _ = std::fs::remove_file(cache_int::ir_cache_path_for(cache_dir, source_hash));
-            let _ = std::fs::remove_file(
-                relon_object_cache::storage::cache_path_for(cache_dir, source_hash),
-            );
+            let _ = std::fs::remove_file(relon_object_cache::storage::cache_path_for(
+                cache_dir,
+                source_hash,
+            ));
             return Ok(None);
         }
 
-        // For now reconstruct via the legacy IR-cache path. Param
-        // names from the IR-cache are synthetic; that matches what
-        // `from_cache(CacheEntry)` does today.
-        let arity = ir_param_count(&loaded.ir_entry.ir)?;
-        // The object_bytes round-trip exercises HMAC + integrity but
-        // isn't used by the runtime yet — keep a reference alive so
-        // the compiler doesn't warn about an unused capture.
-        let _bytes_len = loaded.object_bytes.len();
-        Self::from_ir_inner(
-            loaded.ir_entry.ir,
-            loaded.ir_entry.sandbox,
-            default_param_names_for(arity),
-            None,
-        )
-        .map(Some)
+        // The object-cache bytes round-trip exercises HMAC +
+        // integrity; we keep them alive so a future dlopen-exec
+        // wiring change has the bytes ready in memory.
+        tracing::debug!(
+            target: "relon::object_cache",
+            "cache validated: {} object bytes available for dlopen-exec follow-up",
+            loaded.object_bytes.len()
+        );
+
+        // Re-drive parse + analyze + lower because the IR-cache
+        // shape is too narrow for the buffer-protocol module the
+        // production pipeline now emits (v5-β-2 stage 2 widened the
+        // IR surface past what `crate::cache::serialize` covers).
+        // Restoring straight from the IR-cache trips a stack-machine
+        // underflow because the partial serde representation drops
+        // ops it doesn't recognise. Until the IR-cache grows full
+        // serde coverage (a relon-ir-wide change), the fast-restore
+        // path stays gated; this branch still demonstrates the
+        // cache files are well-formed end-to-end.
+        let _arity = ir_param_count(&loaded.ir_entry.ir)?;
+        let fresh = Self::from_source(source)?;
+        Ok(Some(fresh))
     }
 
     /// Compute the expected metadata fingerprint for a (source,
     /// sandbox) pair. Centralised here so `from_source_with_cache`
     /// and `from_cache_dir` agree on what counts as a match.
-    fn expected_metadata_for_source(source: &str, sandbox: &SandboxConfig) -> relon_object_cache::Metadata {
+    fn expected_metadata_for_source(
+        source: &str,
+        sandbox: &SandboxConfig,
+    ) -> relon_object_cache::Metadata {
         // Hash the source bytes into a 32-byte signature stamp so a
         // drift in source text surfaces as a metadata mismatch
         // distinct from the filename-level source-hash drift. We

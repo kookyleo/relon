@@ -391,15 +391,19 @@ pub fn try_load_from_cache(
     let triple = host_target_triple();
     let hmac_key = relon_object_cache::ensure_key().ok();
 
-    // 1. Object-cache lookup. Any soft miss (file absent, corrupt,
-    // HMAC mismatch) returns Ok(None) after best-effort cleanup so
-    // the next call rewrites.
+    // 1. Object-cache lookup. Use `TrustOnWrite` integrity mode
+    // because our `source_sha256` is the SHA-256 of the *source*
+    // text (canonical key), not the SHA-256 of the linked object
+    // body — the relon-object-cache `Strict` mode would reject the
+    // file otherwise. Tamper detection is still covered by the
+    // HMAC tag on the trailer (HMAC over the entire blob, including
+    // object bytes), which the loader verifies inside `load`.
     let object_entry = match relon_object_cache::load(
         cache_dir,
         source_sha256,
         triple,
         hmac_key.as_ref(),
-        IntegrityMode::Strict,
+        IntegrityMode::TrustOnWrite,
     ) {
         Ok(Some(e)) => e,
         Ok(None) => {
@@ -529,7 +533,11 @@ pub fn load_object_bytes(
     object_bytes: &[u8],
     expected_symbols: &[&str],
 ) -> Result<relon_object_cache::LoadedObject, relon_object_cache::LoaderError> {
-    relon_object_cache::LoadedObject::from_bytes(object_bytes, host_target_triple(), expected_symbols)
+    relon_object_cache::LoadedObject::from_bytes(
+        object_bytes,
+        host_target_triple(),
+        expected_symbols,
+    )
 }
 
 /// Build a minimal `relon_main_entry` ET_REL via cranelift-object so
@@ -565,11 +573,16 @@ pub fn emit_entry_stub_object() -> Result<Vec<u8>, CraneliftError> {
     let pointer_ty = module.target_config().pointer_type();
     let mut sig = Signature::new(CallConv::SystemV);
     sig.params.push(AbiParam::new(pointer_ty)); // state ptr
-    sig.params.push(AbiParam::new(cranelift_codegen::ir::types::I32)); // in_ptr
-    sig.params.push(AbiParam::new(cranelift_codegen::ir::types::I32)); // in_len
-    sig.params.push(AbiParam::new(cranelift_codegen::ir::types::I32)); // out_ptr
-    sig.params.push(AbiParam::new(cranelift_codegen::ir::types::I32)); // out_cap
-    sig.params.push(AbiParam::new(cranelift_codegen::ir::types::I64)); // caps
+    sig.params
+        .push(AbiParam::new(cranelift_codegen::ir::types::I32)); // in_ptr
+    sig.params
+        .push(AbiParam::new(cranelift_codegen::ir::types::I32)); // in_len
+    sig.params
+        .push(AbiParam::new(cranelift_codegen::ir::types::I32)); // out_ptr
+    sig.params
+        .push(AbiParam::new(cranelift_codegen::ir::types::I32)); // out_cap
+    sig.params
+        .push(AbiParam::new(cranelift_codegen::ir::types::I64)); // caps
     sig.returns
         .push(AbiParam::new(cranelift_codegen::ir::types::I32));
 
@@ -586,9 +599,7 @@ pub fn emit_entry_stub_object() -> Result<Vec<u8>, CraneliftError> {
         builder.append_block_params_for_function_params(block);
         builder.switch_to_block(block);
         builder.seal_block(block);
-        let zero = builder
-            .ins()
-            .iconst(cranelift_codegen::ir::types::I32, 0);
+        let zero = builder.ins().iconst(cranelift_codegen::ir::types::I32, 0);
         builder.ins().return_(&[zero]);
         builder.finalize();
     }

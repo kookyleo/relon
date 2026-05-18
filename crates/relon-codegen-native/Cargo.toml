@@ -80,3 +80,11 @@ libc = "0.2"
 
 [dev-dependencies]
 relon-evaluator = { workspace = true }
+# v5-γ object-cache integration tests need isolated cache dirs so
+# concurrent cargo-test threads do not stomp on each other.
+tempfile = "3"
+# Tests inspect the relon-object-cache file path / HMAC envelope
+# directly so a tamper-detection assertion can prove the file got
+# unlinked. dev-dep only — production code does not touch the
+# object-cache crate's internal storage module.
+relon-object-cache = { workspace = true }
