@@ -50,7 +50,8 @@
 #![deny(missing_docs)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-// Subsequent commits in the v6-γ M1 prep series add the actual
-// `#[repr(C)]` ABI types here. This stub keeps the crate buildable
-// at the workspace-registration step so the dep graph never goes
-// through a broken intermediate state.
+pub mod context;
+pub mod deopt;
+
+pub use context::{HostHookTable, TraceContext};
+pub use deopt::{DeoptStateSnapshot, RecoverableWriteRecord};
