@@ -16,8 +16,13 @@
 //! - [`integrity`] — strict vs trust-on-write SHA-256 modes. Default
 //!   is strict; the host can opt into the faster path once it has
 //!   audited the cache directory permissions.
-//! - [`error`] — the public [`CacheError`] / [`HmacError`] enums
-//!   (loader-side errors land alongside the loader module).
+//! - [`loader`] — Linux `memfd_create` + `/proc/self/fd/<n>` dlopen +
+//!   dlsym path that turns cached bytes back into callable function
+//!   pointers without touching disk on the warm path. macOS / Windows
+//!   error with [`LoaderError::UnsupportedPlatform`] for now (gamma
+//!   phase is Linux-only).
+//! - [`error`] — the public [`CacheError`] / [`LoaderError`] /
+//!   [`HmacError`] enums.
 //!
 //! See `docs/internal/v5-gamma-cranelift-object-cache-design.md` for
 //! the full file-format and threat-model rationale.
@@ -27,9 +32,11 @@
 pub mod error;
 pub mod hmac;
 pub mod integrity;
+pub mod loader;
 pub mod storage;
 
 pub use error::{CacheError, HmacError, LoaderError};
 pub use hmac::{compute_hmac, ensure_key, hmac_key_path, verify_hmac};
 pub use integrity::IntegrityMode;
+pub use loader::{LoadedObject, ObjectHandle};
 pub use storage::{load, store, CacheEntry, HostFnImport, Metadata, SignatureHash};
