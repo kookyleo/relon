@@ -32,7 +32,8 @@ use std::collections::HashMap;
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::types::{I32, I64};
 use cranelift_codegen::ir::{
-    AbiParam, Function, InstBuilder, MemFlags, Signature, TrapCode, UserFuncName, Value as CValue,
+    AbiParam, BlockArg, BlockCall, Function, InstBuilder, JumpTableData, MemFlags, Signature,
+    TrapCode, UserFuncName, Value as CValue,
 };
 use cranelift_codegen::isa::CallConv;
 use cranelift_codegen::settings::{self, Configurable};
@@ -1013,11 +1014,38 @@ struct LabelFrame {
     /// `Op::Loop`, exit block for `Op::Block`).
     target_block: cranelift_codegen::ir::Block,
     /// `true` for `Op::Loop` (back-edge); `false` for `Op::Block`
-    /// (forward-edge). Informational today — used by future trace
-    /// recorder integration to identify loop back-edges as hot
-    /// counter sites.
-    #[allow(dead_code)]
+    /// (forward-edge). Used by [`Codegen::emit_loop_back_resource_check`]
+    /// to recognise loop back-edges as the right site for inserting
+    /// the [`crate::sandbox::RESOURCE_CHECK_INTERVAL`] cadence guard.
     is_loop: bool,
+    /// When the labelled construct yields a typed value (`Op::Loop`
+    /// or `Op::Block` with `result_ty = Some(_)`), this slot holds
+    /// the cranelift type the matching block-param accepts. `Br` /
+    /// `BrIf` / `BrTable` targeting this frame pops one operand from
+    /// the virtual stack and forwards it as the block-param.
+    ///
+    /// For `Op::Loop` with a yield, the block-param sits on the loop
+    /// header and represents the loop-carried accumulator (each back-
+    /// edge supplies the next iteration's value); the loop exits by
+    /// falling through to the continuation block which inherits the
+    /// final value.
+    ///
+    /// For `Op::Block` with a yield, the block-param sits on the
+    /// continuation block. `Br N` inside the body pops the yield
+    /// value and forwards it as the continuation arg.
+    result_cl_ty: Option<cranelift_codegen::ir::Type>,
+    /// When the frame is a `Op::Loop` with `result_ty != None`, this
+    /// is the continuation block that receives the loop's final
+    /// value via fallthrough. `None` for blocks / yield-less loops.
+    loop_cont_block: Option<cranelift_codegen::ir::Block>,
+    /// Per-loop back-edge counter variable used to space the
+    /// resource-deadline guard at [`crate::sandbox::RESOURCE_CHECK_INTERVAL`]
+    /// cadence inside long-running loops. `None` for blocks (which
+    /// have no back-edge) and when the sandbox's deadline check is
+    /// disabled. The counter is an `I64` increment-and-mask Variable;
+    /// `emit_loop_back_resource_check` reads / updates it on every
+    /// back-edge.
+    back_edge_counter: Option<Variable>,
 }
 
 impl<'a, 'b> Codegen<'a, 'b> {
@@ -1678,6 +1706,14 @@ impl<'a, 'b> Codegen<'a, 'b> {
                 self.builder.ins().return_(&[value]);
             }
         }
+        // After the explicit return, the current block is filled.
+        // Switch to a fresh dummy block so any subsequent ops the
+        // body emits land somewhere valid; cranelift's DCE prunes
+        // the now-dead dummy. Mirrors the post-Br / post-BrTable
+        // dummy pattern.
+        let dummy = self.builder.create_block();
+        self.builder.seal_block(dummy);
+        self.builder.switch_to_block(dummy);
         Ok(())
     }
 
@@ -2105,6 +2141,7 @@ impl<'a, 'b> Codegen<'a, 'b> {
             Op::Loop { result_ty, body } => self.emit_block(*result_ty, body, true)?,
             Op::Br { label_depth } => self.emit_br(*label_depth, /*conditional=*/ false)?,
             Op::BrIf { label_depth } => self.emit_br(*label_depth, /*conditional=*/ true)?,
+            Op::BrTable { default, targets } => self.emit_br_table(*default, targets)?,
 
             // v5-β-2 widen: arithmetic on `I32` slot (used by stdlib
             // bodies for pointer / length arithmetic against the
@@ -2384,41 +2421,93 @@ impl<'a, 'b> Codegen<'a, 'b> {
     ///
     /// For both shapes we create a cranelift block ahead of the body
     /// and push a `LabelFrame` onto `label_stack`; `Op::Br` /
-    /// `Op::BrIf` resolve to that block by depth-counting from the
-    /// top of the stack.
+    /// `Op::BrIf` / `Op::BrTable` resolve to that block by depth-
+    /// counting from the top of the stack.
     ///
     /// * `is_loop = false` (wasm `Block`): the `target_block` is the
     ///   **continuation** block reached after the body terminates;
-    ///   `Br 0` jumps forward past the body's End.
+    ///   `Br 0` jumps forward past the body's End. When `result_ty =
+    ///   Some(t)`, the continuation has one block-param of type `t`;
+    ///   fallthrough at body end pops the top of the operand stack
+    ///   and forwards it as the continuation arg.
     /// * `is_loop = true` (wasm `Loop`): the `target_block` is the
     ///   loop **header**; `Br 0` jumps back to re-enter the loop
-    ///   (equivalent to `continue`). The block exits by falling
-    ///   through its End.
+    ///   (equivalent to `continue`). When `result_ty = Some(t)`, the
+    ///   header has one block-param of type `t` representing the
+    ///   loop-carried accumulator. Each back-edge re-supplies the
+    ///   next iteration's value; the loop "exits" through fall-
+    ///   through to a continuation block which inherits the final
+    ///   value. The loop's seed value is popped off the operand
+    ///   stack before entering the header (wasm semantics).
     ///
-    /// v5-β-2 limitation: `result_ty != None` (block-yields-value)
-    /// is **not** yet supported because the codegen still needs to
-    /// thread the yielded value through block params. Stdlib bodies
-    /// in practice always use `result_ty = None`; surfacing the
-    /// unsupported case as Codegen failure keeps the safety net.
+    /// v5-β-2 stage 5 widens this to handle `result_ty != None` via
+    /// cranelift block-parameter threading. Stdlib bodies in practice
+    /// still use `result_ty = None`, but the yield-shape variant
+    /// surfaces clean via `Op::Loop { result_ty: Some(_) }` for hand-
+    /// rolled IR + the BrTable test suite.
     fn emit_block(
         &mut self,
         result_ty: Option<IrType>,
         body: &[TaggedOp],
         is_loop: bool,
     ) -> Result<(), CraneliftError> {
-        if result_ty.is_some() {
-            return Err(CraneliftError::Codegen(
-                "Block / Loop with result_ty != None not yet supported on cranelift".to_string(),
-            ));
-        }
+        let result_cl_ty = match result_ty {
+            None => None,
+            Some(ty) => Some(ir_ty_to_cl(ty)?),
+        };
 
         if is_loop {
             // Loop: branch into a fresh header block, lower the
             // body inside it. The body's terminator (Br / fallthrough
             // / Return) decides whether the loop exits or re-enters.
             let header = self.builder.create_block();
-            self.builder.ins().jump(header, &[]);
+            // Loop header carries the loop-carried accumulator as a
+            // block parameter when the loop yields a value. The seed
+            // value is the top of the operand stack at loop entry.
+            let seed = if let Some(cl_ty) = result_cl_ty {
+                self.builder.append_block_param(header, cl_ty);
+                Some(self.pop()?)
+            } else {
+                None
+            };
+            let seed_args: Vec<BlockArg> = seed.into_iter().map(BlockArg::from).collect();
+            self.builder.ins().jump(header, &seed_args);
             self.builder.switch_to_block(header);
+            // Push the header block-param onto the operand stack so
+            // the body's first op consumes the loop-carried value
+            // (wasm-Loop semantics: the yield value re-enters the
+            // operand stack each iteration). The body is responsible
+            // for stashing / using / re-yielding it before the back-
+            // edge.
+            if result_cl_ty.is_some() {
+                let v = self.builder.block_params(header)[0];
+                self.push(v);
+            }
+            // For yielding loops, prepare a continuation block. The
+            // loop's normal fallthrough lands there carrying the
+            // final accumulator as a block-param. The frame remembers
+            // the continuation so back-edges can re-enter while non-
+            // looping `Br N` past the loop's enclosing label still
+            // lands at the right place.
+            let loop_cont_block = if result_cl_ty.is_some() {
+                Some(self.builder.create_block())
+            } else {
+                None
+            };
+            if let (Some(cl_ty), Some(cont)) = (result_cl_ty, loop_cont_block) {
+                self.builder.append_block_param(cont, cl_ty);
+            }
+            // Allocate a back-edge counter if the sandbox deadline
+            // check is on. Initialised to 0 here; each back-edge
+            // bumps + checks at the `RESOURCE_CHECK_INTERVAL` cadence.
+            let back_edge_counter = if self.sandbox.deadline_check {
+                let var = self.builder.declare_var(I64);
+                let zero = self.builder.ins().iconst(I64, 0);
+                self.builder.def_var(var, zero);
+                Some(var)
+            } else {
+                None
+            };
             // Loops with no other entry edge get sealed once the body
             // lowers — cranelift seals retroactively for blocks with
             // forward branches, so we leave it unsealed during the
@@ -2426,31 +2515,117 @@ impl<'a, 'b> Codegen<'a, 'b> {
             self.label_stack.push(LabelFrame {
                 target_block: header,
                 is_loop: true,
+                result_cl_ty,
+                loop_cont_block,
+                back_edge_counter,
             });
             self.emit_body(body)?;
-            self.label_stack.pop();
+            let frame = self.label_stack.pop().expect("just pushed");
             self.builder.seal_block(header);
+            if let Some(cont) = frame.loop_cont_block {
+                // Fall through to cont with the current top-of-stack
+                // as the final loop value. Skip the fall-through
+                // jump when the body already terminated (the body
+                // always Br-back-edged); cranelift's DCE handles
+                // the dead exit path.
+                if !self.builder.is_unreachable() {
+                    let cont_arg = if let Some(cl_ty) = result_cl_ty {
+                        if self.stack.is_empty() {
+                            self.placeholder_for(cl_ty)
+                        } else {
+                            self.pop()?
+                        }
+                    } else {
+                        self.builder.ins().iconst(I32, 0)
+                    };
+                    self.builder.ins().jump(cont, &[cont_arg.into()]);
+                }
+                self.builder.seal_block(cont);
+                self.builder.switch_to_block(cont);
+                // The continuation block-param is the loop's result;
+                // push it onto the operand stack.
+                let v = self.builder.block_params(cont)[0];
+                self.push(v);
+            }
         } else {
             // Block (forward exit): allocate a continuation block,
             // lower the body, then switch to the continuation. A
             // `Br 0` inside the body jumps forward to `cont`.
             let cont = self.builder.create_block();
+            if let Some(cl_ty) = result_cl_ty {
+                self.builder.append_block_param(cont, cl_ty);
+            }
             self.label_stack.push(LabelFrame {
                 target_block: cont,
                 is_loop: false,
+                result_cl_ty,
+                loop_cont_block: None,
+                back_edge_counter: None,
             });
             self.emit_body(body)?;
             self.label_stack.pop();
             // Fallthrough to cont when the body doesn't explicitly
-            // branch out. The builder's `is_filled` API would let us
-            // skip this when the body already terminated, but
-            // emitting an extra `jump` is cheap and keeps the cranelift
-            // verifier happy.
-            self.builder.ins().jump(cont, &[]);
+            // branch out. We forward the top-of-stack value as the
+            // continuation block-param when the block yields. Skip
+            // the jump entirely if the body already terminated (the
+            // current block is unreachable / already filled by a Br
+            // / BrTable / Return / Trap).
+            if !self.builder.is_unreachable() {
+                let fall_args: Vec<BlockArg> = if let Some(cl_ty) = result_cl_ty {
+                    let v = if !self.stack.is_empty() {
+                        self.pop()?
+                    } else {
+                        self.placeholder_for(cl_ty)
+                    };
+                    vec![v.into()]
+                } else {
+                    Vec::new()
+                };
+                self.builder.ins().jump(cont, &fall_args);
+            }
             self.builder.seal_block(cont);
             self.builder.switch_to_block(cont);
+            // When the block yields, expose the block-param to the
+            // surrounding code via the operand stack.
+            if result_cl_ty.is_some() {
+                let v = self.builder.block_params(cont)[0];
+                self.push(v);
+            }
         }
         Ok(())
+    }
+
+    /// Emit the periodic deadline guard at a loop back-edge. Bumps
+    /// the frame's per-loop counter; when `(counter &
+    /// (RESOURCE_CHECK_INTERVAL - 1)) == 0`, emits a resource-check
+    /// guard (one host clock read + comparison). `RESOURCE_CHECK_INTERVAL`
+    /// is a power of two so the modulus is cheap.
+    fn emit_loop_back_resource_check(&mut self, counter_var: Variable) {
+        let cur = self.builder.use_var(counter_var);
+        let one = self.builder.ins().iconst(I64, 1);
+        let next = self.builder.ins().iadd(cur, one);
+        self.builder.def_var(counter_var, next);
+        let mask = self
+            .builder
+            .ins()
+            .iconst(I64, (crate::sandbox::RESOURCE_CHECK_INTERVAL as i64) - 1);
+        let masked = self.builder.ins().band(next, mask);
+        // Branch to a fresh deadline-check block when masked == 0;
+        // otherwise just skip. Use brif + a tiny block layout so the
+        // common (non-zero) case stays branch-predicted.
+        let check_block = self.builder.create_block();
+        let after_block = self.builder.create_block();
+        let zero = self.builder.ins().iconst(I64, 0);
+        let cmp = self.builder.ins().icmp(IntCC::Equal, masked, zero);
+        self.builder
+            .ins()
+            .brif(cmp, check_block, &[], after_block, &[]);
+        self.builder.seal_block(check_block);
+        self.builder.switch_to_block(check_block);
+        self.emit_resource_check();
+        self.builder.ins().jump(after_block, &[]);
+        self.builder.seal_block(after_block);
+        self.builder.switch_to_block(after_block);
     }
 
     /// Lower `Op::Br { label_depth }` (unconditional) or
@@ -2464,7 +2639,24 @@ impl<'a, 'b> Codegen<'a, 'b> {
                 self.label_stack.len()
             )));
         }
-        let target = self.label_stack[self.label_stack.len() - 1 - depth].target_block;
+        let frame_idx = self.label_stack.len() - 1 - depth;
+        let target = self.label_stack[frame_idx].target_block;
+        let result_cl_ty = self.label_stack[frame_idx].result_cl_ty;
+        let is_loop = self.label_stack[frame_idx].is_loop;
+        let back_edge_counter = self.label_stack[frame_idx].back_edge_counter;
+
+        // For yielded targets, pop the top-of-stack and forward as
+        // the block-arg. We do this once for both branch shapes.
+        let block_args: Vec<BlockArg> = if let Some(cl_ty) = result_cl_ty {
+            let v = if !self.builder.is_unreachable() && !self.stack.is_empty() {
+                self.pop()?
+            } else {
+                self.placeholder_for(cl_ty)
+            };
+            vec![v.into()]
+        } else {
+            Vec::new()
+        };
 
         if conditional {
             // Pop the i32 condition. cranelift `brif(cond, then,
@@ -2473,11 +2665,43 @@ impl<'a, 'b> Codegen<'a, 'b> {
             // branch so subsequent ops land somewhere valid.
             let cond = self.pop()?;
             let fallthrough = self.builder.create_block();
-            self.builder.ins().brif(cond, target, &[], fallthrough, &[]);
+            // RESOURCE_CHECK_INTERVAL cadence: if this branch is a
+            // loop back-edge, emit the periodic deadline check
+            // before the brif. We use the "then" arm (jump-to-loop-
+            // header) as the loop continuation, so the check fires
+            // only when the loop actually iterates.
+            if is_loop {
+                if let Some(counter_var) = back_edge_counter {
+                    // The check needs to run conditionally — we need
+                    // a separate then-arm block that holds the
+                    // counter bump + check, then jumps to the loop
+                    // header. The else-arm falls through unchanged.
+                    let take_branch = self.builder.create_block();
+                    self.builder
+                        .ins()
+                        .brif(cond, take_branch, &[], fallthrough, &[]);
+                    self.builder.seal_block(take_branch);
+                    self.builder.switch_to_block(take_branch);
+                    self.emit_loop_back_resource_check(counter_var);
+                    self.builder.ins().jump(target, &block_args);
+                    self.builder.seal_block(fallthrough);
+                    self.builder.switch_to_block(fallthrough);
+                    return Ok(());
+                }
+            }
+            self.builder
+                .ins()
+                .brif(cond, target, &block_args, fallthrough, &[]);
             self.builder.seal_block(fallthrough);
             self.builder.switch_to_block(fallthrough);
         } else {
-            self.builder.ins().jump(target, &[]);
+            // Unconditional back-edge: also gets the cadence guard.
+            if is_loop {
+                if let Some(counter_var) = back_edge_counter {
+                    self.emit_loop_back_resource_check(counter_var);
+                }
+            }
+            self.builder.ins().jump(target, &block_args);
             // After an unconditional branch, the rest of the basic
             // block is unreachable. Create a fresh dummy block so
             // subsequent op emission lands somewhere; cranelift's
@@ -2486,6 +2710,97 @@ impl<'a, 'b> Codegen<'a, 'b> {
             self.builder.seal_block(dummy);
             self.builder.switch_to_block(dummy);
         }
+        Ok(())
+    }
+
+    /// Lower `Op::BrTable { default, targets }`. Pops one `i32` index
+    /// from the stack; when `index < targets.len()` jumps to
+    /// `targets[index]`, otherwise jumps to `default`. The label
+    /// depths resolve against the same `label_stack` as `Br` / `BrIf`.
+    ///
+    /// Yield-typed targets are supported only when every target (incl.
+    /// default) shares the same `result_cl_ty`. The IR shape
+    /// guarantees this: `Op::BrTable` is a single discriminant
+    /// dispatch where every arm produces a value of the same type.
+    /// Mismatch surfaces as Codegen.
+    fn emit_br_table(&mut self, default: u32, targets: &[u32]) -> Result<(), CraneliftError> {
+        // Pop the discriminant; we'll feed it directly to br_table.
+        let idx_val = self.pop()?;
+        let default_depth = default as usize;
+        if default_depth >= self.label_stack.len() {
+            return Err(CraneliftError::Codegen(format!(
+                "BrTable default depth {default} out of range — only {} frame(s) on stack",
+                self.label_stack.len()
+            )));
+        }
+        let default_frame_idx = self.label_stack.len() - 1 - default_depth;
+        let default_target = self.label_stack[default_frame_idx].target_block;
+        let yield_ty = self.label_stack[default_frame_idx].result_cl_ty;
+        // Validate every target depth + cross-check yield types.
+        for (i, depth) in targets.iter().enumerate() {
+            let d = *depth as usize;
+            if d >= self.label_stack.len() {
+                return Err(CraneliftError::Codegen(format!(
+                    "BrTable target #{i} depth {depth} out of range — only {} frame(s) on stack",
+                    self.label_stack.len()
+                )));
+            }
+            let frame = &self.label_stack[self.label_stack.len() - 1 - d];
+            if frame.result_cl_ty != yield_ty {
+                return Err(CraneliftError::Codegen(format!(
+                    "BrTable target #{i} yield type {:?} disagrees with default {:?}",
+                    frame.result_cl_ty, yield_ty
+                )));
+            }
+        }
+        // If any of the targets is a loop back-edge with a back-edge
+        // counter, we can't directly weave the resource check into
+        // br_table — the cadence guard belongs on the actual taken
+        // arm. v5-β-2 stage 5 takes the safe approach: emit the
+        // br_table without per-arm cadence, and rely on the prologue
+        // + outer-loop guard for the bound. (Inner `BrIf` back-edges
+        // still benefit from the cadence.) The single-deadline
+        // safety net stays intact because the prologue's check
+        // runs on every entry call.
+        // Pop the yield value (if any) — every arm receives the same
+        // value (wasm semantics: the operand stack at the BrTable
+        // point is shared by every arm).
+        let yield_arg: Option<CValue> = if let Some(cl_ty) = yield_ty {
+            Some(
+                if !self.builder.is_unreachable() && !self.stack.is_empty() {
+                    self.pop()?
+                } else {
+                    self.placeholder_for(cl_ty)
+                },
+            )
+        } else {
+            None
+        };
+
+        // Build the BlockCalls + JumpTable. Each call carries the
+        // optional yield value as its block-arg.
+        let yield_args_slice: Vec<BlockArg> = yield_arg.iter().map(|v| (*v).into()).collect();
+        let default_call = self
+            .builder
+            .func
+            .dfg
+            .block_call(default_target, &yield_args_slice);
+        let target_calls: Vec<BlockCall> = targets
+            .iter()
+            .map(|depth| {
+                let d = *depth as usize;
+                let tgt = self.label_stack[self.label_stack.len() - 1 - d].target_block;
+                self.builder.func.dfg.block_call(tgt, &yield_args_slice)
+            })
+            .collect();
+        let jt_data = JumpTableData::new(default_call, &target_calls);
+        let jt = self.builder.create_jump_table(jt_data);
+        self.builder.ins().br_table(idx_val, jt);
+        // After br_table the rest of the block is unreachable. Create
+        // a dummy fallthrough so subsequent op emission lands somewhere.
+        let dummy = self.builder.create_block();
+        self.builder.seal_block(dummy);
+        self.builder.switch_to_block(dummy);
         Ok(())
     }
 
@@ -2524,9 +2839,18 @@ impl<'a, 'b> Codegen<'a, 'b> {
         // whose break target is the matching `End`.
         self.builder.switch_to_block(then_block);
         let stack_before_then = self.stack.len();
+        // `If` is treated as a labelled block whose break target is the
+        // matching End — but the result value is consumed via the
+        // join-block phi (the explicit `If` lowering pattern) rather
+        // than via the label-frame yield path. So we leave
+        // `result_cl_ty = None` on the frame to avoid double-popping
+        // the yield value.
         self.label_stack.push(LabelFrame {
             target_block: join_block,
             is_loop: false,
+            result_cl_ty: None,
+            loop_cont_block: None,
+            back_edge_counter: None,
         });
         self.emit_body(then_body)?;
         self.label_stack.pop();
@@ -2559,6 +2883,9 @@ impl<'a, 'b> Codegen<'a, 'b> {
         self.label_stack.push(LabelFrame {
             target_block: join_block,
             is_loop: false,
+            result_cl_ty: None,
+            loop_cont_block: None,
+            back_edge_counter: None,
         });
         self.emit_body(else_body)?;
         self.label_stack.pop();
