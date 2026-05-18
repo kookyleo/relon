@@ -4,24 +4,31 @@
 //! mutates a [`crate::TraceBuffer`] in place and returns a
 //! [`PassReport`] for diagnostics.
 //!
-//! Pass ordering matters. The pipeline runs:
+//! Pass ordering matters. The default pipeline runs:
 //!
 //! 1. [`const_fold::ConstFold`] -- collapse arithmetic on captured
-//!    constants. Must run first so later passes see propagated
-//!    literals.
-//! 2. [`type_spec::TypeSpec`] -- replace generic ops with
-//!    type-specialised variants and insert
-//!    `Guard(TypeCheck(...))` ops.
-//! 3. [`dead_store::DeadStoreElim`] -- remove writes whose target is
-//!    overwritten later in the same trace and never read in between.
+//!    constants. Runs first so later passes see propagated literals.
+//! 2. [`load_forward::LoadForwarding`] -- alias `Load(addr)` results
+//!    to the value most recently `Store`d at the same slot, when no
+//!    intervening op clobbers it.
+//! 3. [`dead_store::DeadStoreElim`] (round 1) -- drop the loads
+//!    forwarded above plus any plain redundant stores.
+//! 4. [`type_spec::TypeSpec`] -- insert `Guard(TypeCheck(...))`
+//!    ops in front of generic call sites with observed types.
+//! 5. [`licm::LICM`] -- hoist `MarkLoopHead`-bracketed pure
+//!    invariants to the loop entry.
+//! 6. [`dead_store::DeadStoreElim`] (round 2) -- pick up any stores
+//!    that became dead after type specialisation / LICM moved
+//!    guards around.
 //!
-//! This order keeps dead-store elimination conservative: it runs
-//! after type specialisation so that the inserted type-check guards
-//! are already in place (a `RecoverableWrite` op cannot move across
-//! them).
+//! Two rounds of `DeadStoreElim` are explicit: round 1 cleans up
+//! forwarded loads (cheap), round 2 cleans up the trailing effects
+//! of `type_spec` / `licm` (rarely needed, but cheap to keep).
 
 pub mod const_fold;
 pub mod dead_store;
+pub mod licm;
+pub mod load_forward;
 pub mod type_spec;
 
 use crate::buffer::TraceBuffer;
@@ -58,7 +65,10 @@ impl OptimizerPipeline {
         Self {
             passes: vec![
                 Box::new(const_fold::ConstFold),
+                Box::new(load_forward::LoadForwarding),
+                Box::new(dead_store::DeadStoreElim),
                 Box::new(type_spec::TypeSpec),
+                Box::new(licm::LICM),
                 Box::new(dead_store::DeadStoreElim),
             ],
         }
@@ -94,9 +104,9 @@ mod tests {
     }
 
     #[test]
-    fn default_pipeline_has_three_passes() {
+    fn default_pipeline_has_six_passes() {
         let p = OptimizerPipeline::default_pipeline();
-        assert_eq!(p.passes.len(), 3);
+        assert_eq!(p.passes.len(), 6);
     }
 
     #[test]

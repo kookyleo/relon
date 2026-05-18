@@ -168,6 +168,20 @@ pub enum TraceOp {
 
     /// Return from the trace.
     Return(SsaVar),
+
+    // ---- Loop markers -----------------------------------------------
+    /// Marks the entry of a recorded loop. `loop_id` distinguishes
+    /// nested loops; the same id pairs `MarkLoopHead` with its matching
+    /// `MarkLoopBack`. Pure marker op, no SSA effect, used exclusively
+    /// by the LICM pass to identify hoistable regions.
+    MarkLoopHead {
+        loop_id: u32,
+    },
+    /// Marks the back-edge / exit of the loop with the matching
+    /// `loop_id`. See [`TraceOp::MarkLoopHead`].
+    MarkLoopBack {
+        loop_id: u32,
+    },
 }
 
 /// Inline guard kind. Mirrors the design doc §2 enum without the
@@ -200,7 +214,9 @@ impl TraceOp {
             | TraceOp::ConstI32(_, _)
             | TraceOp::ConstI64(_, _)
             | TraceOp::Guard(_, _)
-            | TraceOp::Return(_) => EffectClass::Pure,
+            | TraceOp::Return(_)
+            | TraceOp::MarkLoopHead { .. }
+            | TraceOp::MarkLoopBack { .. } => EffectClass::Pure,
 
             TraceOp::Load(_, _, _) => EffectClass::ReadOnly,
 
@@ -210,8 +226,8 @@ impl TraceOp {
         }
     }
 
-    /// SSA var produced by this op, if any. `Return`, `Store`, and
-    /// `Guard` produce no SSA value.
+    /// SSA var produced by this op, if any. `Return`, `Store`,
+    /// `Guard`, and the loop markers produce no SSA value.
     pub fn output(&self) -> Option<SsaVar> {
         match self {
             TraceOp::Add(dst, _, _)
@@ -224,7 +240,11 @@ impl TraceOp {
             | TraceOp::ConstI64(dst, _)
             | TraceOp::Call(dst, _, _, _) => Some(*dst),
 
-            TraceOp::Store(_, _, _) | TraceOp::Guard(_, _) | TraceOp::Return(_) => None,
+            TraceOp::Store(_, _, _)
+            | TraceOp::Guard(_, _)
+            | TraceOp::Return(_)
+            | TraceOp::MarkLoopHead { .. }
+            | TraceOp::MarkLoopBack { .. } => None,
         }
     }
 
@@ -248,12 +268,39 @@ impl TraceOp {
             },
             TraceOp::Call(_, _, args, _) => args.clone(),
             TraceOp::Return(v) => vec![*v],
+            TraceOp::MarkLoopHead { .. } | TraceOp::MarkLoopBack { .. } => vec![],
         }
     }
 
     /// Is this op a guard?
     pub fn is_guard(&self) -> bool {
         matches!(self, TraceOp::Guard(_, _))
+    }
+
+    /// Is this op a `MarkLoopHead` marker?
+    pub fn is_loop_head(&self) -> bool {
+        matches!(self, TraceOp::MarkLoopHead { .. })
+    }
+
+    /// Is this op a `MarkLoopBack` marker?
+    pub fn is_loop_back(&self) -> bool {
+        matches!(self, TraceOp::MarkLoopBack { .. })
+    }
+
+    /// Returns `Some(loop_id)` if this is a loop head marker.
+    pub fn loop_head_id(&self) -> Option<u32> {
+        match self {
+            TraceOp::MarkLoopHead { loop_id } => Some(*loop_id),
+            _ => None,
+        }
+    }
+
+    /// Returns `Some(loop_id)` if this is a loop back marker.
+    pub fn loop_back_id(&self) -> Option<u32> {
+        match self {
+            TraceOp::MarkLoopBack { loop_id } => Some(*loop_id),
+            _ => None,
+        }
     }
 }
 
@@ -310,6 +357,22 @@ mod tests {
         assert!(CmpKind::Le.apply_i64(2, 2));
         assert!(CmpKind::Gt.apply_i64(3, 2));
         assert!(CmpKind::Ge.apply_i64(3, 3));
+    }
+
+    #[test]
+    fn loop_markers_are_pure_and_outputless() {
+        let head = TraceOp::MarkLoopHead { loop_id: 3 };
+        let back = TraceOp::MarkLoopBack { loop_id: 3 };
+        assert!(head.is_loop_head());
+        assert!(back.is_loop_back());
+        assert_eq!(head.loop_head_id(), Some(3));
+        assert_eq!(back.loop_back_id(), Some(3));
+        assert_eq!(head.effect_class(), EffectClass::Pure);
+        assert_eq!(back.effect_class(), EffectClass::Pure);
+        assert_eq!(head.output(), None);
+        assert_eq!(back.output(), None);
+        assert!(head.inputs().is_empty());
+        assert!(back.inputs().is_empty());
     }
 
     #[test]
