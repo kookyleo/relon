@@ -867,6 +867,19 @@ struct ConstPool {
     /// v3+ a-4: byte offset of the simple Unicode lower-folding table.
     /// Mirrors `case_fold_upper_offset` on the lowercase side.
     case_fold_lower_offset: Option<u32>,
+    /// v3++ b-4: byte offset of the Unicode combining-mark ranges
+    /// table. `Some(off)` only when at least one reachable body
+    /// references `Op::CombiningMarkRangesAddr`. Layout matches the
+    /// case-folding table shape so the runtime helper can reuse the
+    /// same `(table_addr + 4 + mid * 8)` rebase arithmetic — entries
+    /// are `(start: u32 LE, end: u32 LE)` ranges instead of mapping
+    /// pairs.
+    combining_marks_offset: Option<u32>,
+    /// v3++ b-4: byte offset of the non-ASCII Unicode whitespace
+    /// ranges table. Same shape as `combining_marks_offset`. ASCII
+    /// whitespace is checked via a direct comparison in the `title`
+    /// body so the common case avoids touching the table.
+    whitespace_offset: Option<u32>,
 }
 
 impl ConstPool {
@@ -921,6 +934,24 @@ impl ConstPool {
             self.case_fold_lower_offset
         };
         off.map(|o| DATA_SECTION_BASE + o)
+            .ok_or(CodegenError::MixedNumericTypes)
+    }
+
+    /// v3++ b-4: lookup the absolute address of the embedded Unicode
+    /// combining-mark ranges table. Errors when no reachable function
+    /// body referenced `Op::CombiningMarkRangesAddr` — the collector
+    /// must run first.
+    fn combining_marks_addr(&self) -> Result<u32, CodegenError> {
+        self.combining_marks_offset
+            .map(|o| DATA_SECTION_BASE + o)
+            .ok_or(CodegenError::MixedNumericTypes)
+    }
+
+    /// v3++ b-4: lookup the absolute address of the embedded
+    /// non-ASCII Unicode whitespace ranges table.
+    fn whitespace_addr(&self) -> Result<u32, CodegenError> {
+        self.whitespace_offset
+            .map(|o| DATA_SECTION_BASE + o)
             .ok_or(CodegenError::MixedNumericTypes)
     }
 }
@@ -1189,6 +1220,42 @@ fn collect_consts(body: &[relon_ir::TaggedOp], pool: &mut ConstPool) -> Result<(
                     let bytes = relon_ir::case_folding::encode_table_bytes(table);
                     pool.bytes.extend_from_slice(&bytes);
                     *slot = Some(offset);
+                }
+            }
+            Op::CombiningMarkRangesAddr => {
+                // v3++ b-4: lay out the Unicode combining-mark ranges
+                // table on first reference. Shape mirrors the case
+                // folding table — `[count: u32 LE][(start: u32, end: u32) × count]`
+                // — so the runtime helper can reuse the same
+                // `(table_addr + 4 + mid * 8)` rebase arithmetic.
+                if pool.combining_marks_offset.is_none() {
+                    while !pool.bytes.len().is_multiple_of(4) {
+                        pool.bytes.push(0);
+                    }
+                    let offset = u32::try_from(pool.bytes.len()).map_err(|_| {
+                        CodegenError::Layout("const data section exceeds u32 bytes".into())
+                    })?;
+                    let table = relon_ir::combining_marks::combining_mark_ranges();
+                    let bytes = relon_ir::combining_marks::encode_ranges_bytes(table);
+                    pool.bytes.extend_from_slice(&bytes);
+                    pool.combining_marks_offset = Some(offset);
+                }
+            }
+            Op::WhitespaceRangesAddr => {
+                // v3++ b-4: lay out the non-ASCII whitespace ranges
+                // table on first reference. Same shape as the
+                // combining-mark table.
+                if pool.whitespace_offset.is_none() {
+                    while !pool.bytes.len().is_multiple_of(4) {
+                        pool.bytes.push(0);
+                    }
+                    let offset = u32::try_from(pool.bytes.len()).map_err(|_| {
+                        CodegenError::Layout("const data section exceeds u32 bytes".into())
+                    })?;
+                    let table = relon_ir::whitespace::non_ascii_whitespace_ranges();
+                    let bytes = relon_ir::whitespace::encode_ranges_bytes(table);
+                    pool.bytes.extend_from_slice(&bytes);
+                    pool.whitespace_offset = Some(offset);
                 }
             }
             Op::If {
@@ -1968,6 +2035,22 @@ fn emit_op_seq(
                 // the table was emitted before code emit ran, so the
                 // lookup never errors in practice.
                 let addr = const_pool.case_fold_addr(*upper)?;
+                f.instruction(&Instruction::I32Const(addr as i32));
+                vstack.push(IrType::I32);
+                ranges.push(tagged.range);
+            }
+            Op::CombiningMarkRangesAddr => {
+                // v3++ b-4: emit `i32.const <table_addr>` for the
+                // combining-mark range table.
+                let addr = const_pool.combining_marks_addr()?;
+                f.instruction(&Instruction::I32Const(addr as i32));
+                vstack.push(IrType::I32);
+                ranges.push(tagged.range);
+            }
+            Op::WhitespaceRangesAddr => {
+                // v3++ b-4: emit `i32.const <table_addr>` for the
+                // non-ASCII whitespace ranges table.
+                let addr = const_pool.whitespace_addr()?;
                 f.instruction(&Instruction::I32Const(addr as i32));
                 vstack.push(IrType::I32);
                 ranges.push(tagged.range);

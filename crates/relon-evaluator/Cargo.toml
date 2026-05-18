@@ -13,6 +13,11 @@ categories = ["compilers", "config"]
 relon-parser = { workspace = true }
 relon-analyzer = { workspace = true }
 relon-eval-api = { workspace = true }
+# v3++ b-4: pulled in so the tree-walk `title()` body shares the
+# same Unicode combining-mark detection table as the wasm-AOT body.
+# Keeping the table in one place avoids the two backends drifting
+# apart on grapheme-cluster semantics.
+relon-ir = { workspace = true }
 ordered-float.workspace = true
 # `rc` enables `serde::Serialize`/`Deserialize` for `Arc<T>` so that
 # `Value::List(Arc<Vec<Value>>)` and `Value::Dict(Arc<ValueDict>)` can

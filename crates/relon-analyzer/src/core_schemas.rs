@@ -135,7 +135,7 @@ mod tests {
     fn core_schemas_install_string_methods() {
         let names = core_methods_for("String");
         for expected in [
-            "upper", "lower", "split", "replace", "contains", "len", "iter",
+            "upper", "lower", "title", "split", "replace", "contains", "len", "iter",
         ] {
             assert!(
                 names.iter().any(|n| n == expected),

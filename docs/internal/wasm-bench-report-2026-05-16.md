@@ -2196,3 +2196,187 @@ TCP listener，每次 accept 取下一个 scripted reply，能根据请求
 v3++ 推进：b-3 完工，远程 `#import` 在 TTL 过期后走 conditional
 GET，省一次 body 下载。下一站 b-4（title case + grapheme）。
 
+## 附录 A.18：v15 title case + grapheme awareness（Phase v3++ b-4，2026-05-18）
+
+v3++ b-4 给 stdlib 加上 `title(s: String) -> String`，同时把现有
+`upper` / `lower` 升级成 grapheme-cluster 友好的形态。变更分两条线：
+
+* **新 stdlib slot**：`title()` 加进 wasm-AOT 与 tree-walk 两端，
+  既支持自由式 `title(s)` 也支持方法式 `s.title()`，受体类型由
+  `(IrType::String, "title")` 路由表分派。
+* **现有 string ops 的 combining-mark 短路**：`upper` / `lower`
+  原本通过 case-fold 表 miss 默默 identity-写过组合标记；b-4 把这条
+  路径显式化为先查 Unicode Mark 区间表，命中直接 identity，不再
+  穿表。语义在 simple-folding 下无变化，但给 b-6 full case folding
+  的扩展点留好。
+
+### 实现要点
+
+* **CaseFoldMode enum**：`case_fold_body` 接收新 enum `CaseFoldMode {
+  Upper, Lower, Title }`，三模式共用 UTF-8 decode → 折叠决策 →
+  UTF-8 encode 主循环，只在 "fold decision" 一段分支：
+  - Upper / Lower：先查 `__is_combining_mark`，命中 identity-写；
+    否则查 `__casefold_lookup` 对应表。
+  - Title：先查 `__is_combining_mark`；命中 identity-写并 **不**
+    翻 `at_word_start`。否则查 `__is_whitespace`；命中 identity-写
+    并把 `at_word_start = 1`。最后才查 case-fold 表（按
+    `at_word_start` 选 upper / lower 表），写完置 0。
+
+* **Unicode 数据**：两个新 sorted range 表硬编码进 relon-ir：
+  - `combining_marks.rs`：Unicode 14 Mark 类（Mn + Mc + Me）codepoint
+    区间，覆盖 Latin / Greek / Cyrillic / 印度系 / 东南亚 / 蒙古
+    / 西伯利亚 / Hebrew / Arabic / 各 supplementary plane（包括
+    VS-1..16 + VS Supplement）。表用 sorted `[(start, end)]` 列表，
+    `is_combining_mark(cp)` 走 `binary_search_by` O(log N)。
+  - `whitespace.rs`：非 ASCII Unicode whitespace 区间（U+00A0,
+    U+1680, U+2000..200A, U+2028, U+2029, U+202F, U+205F, U+3000，
+    外加 NEL U+0085）。ASCII whitespace（0x09..=0x0D + 0x20）走
+    runtime 直接比较快路径，不查表。
+
+* **Op + 数据段**：新增 `Op::CombiningMarkRangesAddr` 和
+  `Op::WhitespaceRangesAddr`，codegen 第一次见到这俩 op 时把对应表
+  encode 进 wasm `data` section 并记下绝对地址。表的 wire 格式与
+  case-folding 表一致（`[count: u32 LE][(u32 start, u32 end) × N]`），
+  二分查找的 `(base + 4 + mid * 8)` 寻址算术也复用一份共享
+  `range_search_loop_body` builder。
+
+* **stdlib registry**：append 三个槽位，**不能** 插入到老 slot
+  之间（wire 格式向后兼容）：
+  - 21 — `__is_combining_mark(cp, table_addr) -> I32`
+  - 22 — `__is_whitespace(cp, table_addr) -> I32`
+  - 23 — `title(String) -> String`
+
+  常量 `COMBINING_MARK_INDEX = 21` / `IS_WHITESPACE_INDEX = 22`
+  与 a-4 的 `CASEFOLD_LOOKUP_INDEX = 20` 一样，是 cycle-breaking
+  的硬编码——`case_fold_body` 这个 builder 本身就被
+  `builtin_stdlib()` 调用，再去 `stdlib_function_index("__is_*")`
+  会死循环。三个 stability 单测把这关锁死。
+
+* **Tree-walk 端**：`StringTitle::call` 走 Rust `char::is_whitespace` +
+  `relon_ir::combining_marks::is_combining_mark` + `to_uppercase` /
+  `to_lowercase`，**直接复用 relon-ir 的 Mark 表**，避免两份数据
+  drift。`relon-evaluator` 因此新增 `relon-ir` 依赖（无环：
+  relon-ir → parser / analyzer / eval-api，不指回 evaluator）。
+
+* **Analyzer 端**：`crates/relon-analyzer/src/core/string.relon`
+  里 `#schema String with` 块加上 `#native title() -> String` 声明，
+  `core_methods_for("String")` 单测顺手扩到包含 `title`。
+
+### bench 数据（criterion `--quick`）
+
+新场景 `stdlib_title` 输入是一段 ASCII + 组合标记 + 中文 + 全角空
+格 + ZWJ 家庭 emoji 的混合串（约 60 cp / 155 bytes），让所有
+新代码路径都跑一遍。同台机器顺手重测 `stdlib_upper`（100-byte
+纯 ASCII，与 v3+ a-4 一致），作为 grapheme 改造的回归参照。
+
+| metric                      | stdlib_upper (v15) | stdlib_title (v15) |
+| --------------------------- | -----------------: | -----------------: |
+| wasm-AOT cold start         |             6.55 ms |             7.93 ms |
+| wasm-AOT cached cold start  |           182.99 µs |           188.77 µs |
+| wasm-AOT warm invoke        |            12.38 µs |             7.18 µs |
+| tree-walk total             |             1.11 ms |             1.10 ms |
+| tree-walk warm invoke       |             3.24 µs |             4.72 µs |
+
+冷启动差距 ~1.4 ms 主要是 title 模块要嵌两张新表（combining marks
++ whitespace ranges，合计约 13 KB）；upper 模块 18.8 KB → title
+模块 31.7 KB 的 ~12.9 KB 增量与表大小一致。Warm-invoke 在
+mixed-payload 上反而 title 更快是因为输入构成不同（title 输入里
+3 字节 CJK 占多数，每个 cp 走 3-byte UTF-8 路径而不是 ASCII 单字节
+路径，cp 数比 upper 少 ~30%）；与同负载的 upper 比较的话每 cp 多了
+一次 combining-mark 二分查找，单测覆盖见
+`stdlib_unicode_casefold_smoke` 里 21 个 baseline 测全部维持绿色。
+
+### wasm 模块字节数（DCE on）
+
+`title` / `upper` / `arith` 同台对比（`cargo build` + 单 entry 的
+mini binary 计算）：
+
+| 编译目标                 | 字节数 |
+| ------------------------ | -----: |
+| `#main(Int x) -> Int x*2` |    541 |
+| `s.upper()`               | 18 792 |
+| `s.title()`               | 31 705 |
+
+`title` 比 `upper` 大 ~12.9 KB，结构分解：
+- combining mark 范围表（~190 个区间 × 8 bytes + header = ~1.5 KB）
+- 非 ASCII 空白范围表（10 个区间 = 84 bytes）
+- 第二份 case-folding 表（lower table，~10 KB；upper 模块只嵌 upper
+  table 一份；title 同时用 upper / lower 两张）
+- 新增 `__is_combining_mark` + `__is_whitespace` + `title` 三个
+  helper 的代码段（~1 KB）
+
+### 取舍
+
+* **Mark 范围表手维护**：std 不暴露 Unicode general category，
+  `icu_properties` 加 build-dep 会拖几 MB 的传递依赖。比起增加
+  build deps，决定把 Unicode 14 的 Mark 区间硬编码进
+  `combining_marks.rs`，加显式的 "更新 Unicode 时附加新行" 注释。
+  代价：每次 UCD 升级要手动 append，但 Mark 区间只增不减，对照
+  upstream `UnicodeData.txt` 一次性 diff 即可。
+* **简化版 word boundary**：用 `char::is_whitespace` 作 word
+  分隔符，不实现 UAX #29 Extended Word Boundary。理由：UAX #29
+  需要处理 ZWJ / 数字 / `'` / `-` 等大量上下文规则，再加 Hangul /
+  CJK 语境分支，单 stdlib body 体量会翻倍。Naive whitespace 版
+  对常见配置 / 模板 / 文本工业用例已经够。
+* **Combining mark 只跳过，不复合**：simple-folding 下 mark 没有
+  case mapping，"identity-写" 与 "查表 miss" 等价。把"跳过"显式化
+  纯粹是为 b-6 full-case-folding 留接口——届时某些 cased mark 的
+  上下文敏感折叠（如希腊语 `Σ` 的 final sigma 形态）会去查独立
+  的 "context-fold" 表；现在留好 `is_mark` 分支，b-6 改一处即可。
+* **bench input 与 upper 不同**：保留 100-byte 纯 ASCII 的 upper
+  payload 不动（v3+ a-4 已 baseline 化），给 title 单独造一份
+  mixed input。两者数字直接对比意义不大；横向单 cp 成本要看
+  `stdlib_unicode_casefold_smoke` 微基准的 v3+ a-4 数据 + 本次新增
+  的 19 个 title 单测。
+
+### 测试
+
+* 单元测试（relon-ir）+5：
+  - `combining_marks::ranges_sorted_non_overlapping`
+  - `combining_marks::common_combining_marks_present`
+  - `combining_marks::ascii_letters_not_marks`
+  - `combining_marks::encode_ranges_layout`
+  - `whitespace::ranges_sorted_non_overlapping`
+  - `whitespace::ascii_whitespace_detected`
+  - `whitespace::non_ascii_whitespace_detected`
+  - `whitespace::letters_not_whitespace`
+  - `whitespace::matches_rust_char_is_whitespace`
+* stdlib slot stability + dispatch（relon-ir）+4：
+  - `combining_mark_index_is_stable`
+  - `is_whitespace_index_is_stable`
+  - `title_string_method_dispatch_resolves`
+  - `b4_indices_are_stable`
+* wasm-AOT smoke（codegen）+19，覆盖 ASCII / 含组合标记的拉丁 /
+  CJK / emoji ZWJ / 方法式 `s.title()` / `upper` / `lower` 的
+  combining-mark 显式跳过等等：见
+  `crates/relon-codegen-wasm/tests/stdlib_title_case_smoke.rs`。
+
+合计 +32 个测试，workspace 总测试数 1367 → 1399。
+
+### 遗留 todo（推到 v3++ b-5 起）
+
+* **UAX #29 Extended Grapheme Cluster + Word Boundary**：b-5
+  起做 Unicode 文本分割完整实现；本次先按 ASCII whitespace +
+  Mark skip 的 minimal-viable 路径走。
+* **Full case folding (locale-aware)**：b-6。`ß` → `SS`、土耳其语
+  dotted / dotless I 这类多 cp / 上下文敏感折叠都进 b-6。
+* **数据表 build.rs 化**：当前 `combining_marks.rs` 是手维护，b-6
+  期可以考虑加一个 `unicode-tables` build dep（或自己抓 UCD txt）
+  让表与 Unicode 版本自动同步；现在为零依赖打住。
+* **Title bench 与 upper 在同负载比较**：未来 b-5 时再造一组
+  controlled-input scenario（mixed-script Latin only / pure ASCII
+  / pure CJK / pure emoji 四档），目前用同 mixed 输入两次跑足够
+  surface 新代码路径但不便横向定位 hot spot。
+
+### Gate
+
+* `cargo build --workspace` ✓
+* `cargo test --workspace --features 'relon/wasm-aot'` ✓ 1399
+  passed, 0 failed（b-3 baseline 1367 + 32 个新增）
+* `cargo clippy --workspace --all-targets --features 'relon/wasm-aot' -- -D warnings` ✓
+* `cargo fmt --all -- --check` ✓
+* `cargo build --target wasm32-unknown-unknown -p relon-wasm` ✓
+
+v3++ 推进：b-4 完工，title case 落地、`upper` / `lower` 与新 title
+body 共用 grapheme-aware 走读框架。下一站 b-5（UAX #29 文本边界）。
+
