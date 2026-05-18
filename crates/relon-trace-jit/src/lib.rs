@@ -34,6 +34,7 @@ pub mod effect;
 pub mod guard;
 pub mod inline_cache;
 pub mod optimizer;
+pub mod runtime;
 pub mod trace_ir;
 
 pub use buffer::{OptimizedTrace, SerializableSideTables, TraceBuffer};
@@ -45,6 +46,7 @@ pub use optimizer::{
     const_fold::ConstFold, dead_store::DeadStoreElim, licm::LICM, load_forward::LoadForwarding,
     type_spec::TypeSpec, OptimizerPass, OptimizerPipeline, PassReport,
 };
+pub use runtime::{DeoptStateSnapshot, GenericState, RecoverableWriteRecord, TraceContext};
 pub use trace_ir::{
     CmpKind, ExternalAddr, ExternalPc, ExternalSlot, FuncId, GuardKind, ObservedType, Offset,
     SsaVar, TraceConst, TraceOp,
