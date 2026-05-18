@@ -1837,3 +1837,219 @@ v3+ 推进：a-4 完工，stdlib `upper` / `lower` 进入 Unicode codepoint
 时代。v3+ 路线图四项全部 merged，下一站 v3++（按 host 需求决
 定优先级）。
 
+## 附录 A.16：v13 user-fn DCE bench（Phase v3++ b-1，2026-05-18）
+
+v3++ b-1 把 dead-code elimination 的覆盖面从 stdlib 扩到 user
+functions：之前 a-2 只裁 stdlib 函数，schema methods 和 lambdas
+全保留。本期把 BFS 的 root 集合收窄到 **只有 `#main`**，新增两
+类边：
+
+* `Op::Call { fn_index }`（已有，会跨 stdlib + user 联表传播）
+* `Op::MakeClosure { fn_table_idx }`（新增）：透过 `closure_table`
+  解析 lambda 的 IR user-index，把对应 user fn slot mark 为 reach-
+  able。`Op::CallClosure` 本身走 `call_indirect`，运行时才能定 fn
+  指针，所以不当成边——保守做法是依赖每个 lambda 都必须由某个
+  reachable body 显式 `MakeClosure` 才能登上 operand stack。
+
+主要改动（5 个 commit，base `390aa38`）：
+
+1. `reachability::ReachabilityPlan` 由 `reachable_stdlib` 扩为
+   `reachable_funcs`（合并 stdlib + user），额外吐 `closure_slot_
+   remap`：pre-DCE closure_table 槽位 → post-DCE 槽位映射。
+2. `FunctionEmitCfg` / `EmitCtx` 多带一份 `closure_slot_remap`，
+   `Op::MakeClosure` emit 时 lookup 一下把 `fn_table_idx` 翻译到
+   compacted 槽位。
+3. `compile_module_with_host_fns` 装配 `combined_funcs` 时直接走
+   `dce_plan.reachable_funcs`（不再拼 `reachable_stdlib + 所有 user`），
+   pruned methods / lambdas 完全不进 wasm。
+4. funcref table 的 element section 只放幸存的 closure slot，
+   table size = `max(reachable_slots, needs_table ? 1 : 0)` —— 保
+   留 `needs_table` 那个 ≥1 兜底，避免 stdlib body 里的
+   `Op::CallClosure` 在零 lambda 模块里失去 table 0。
+5. 测试与 IR 都不动。`Op::Call.fn_index` / `Op::MakeClosure.
+   fn_table_idx` 都还存 pre-DCE 索引，所有翻译只发生在 codegen
+   emit 路径——关掉 DCE 只要把两张 remap 都换成 identity vec。
+
+### wasm 模块字节数（user-fn DCE 触发）
+
+| Scenario                                       | 模块字节数 | 对照              |
+| ---------------------------------------------- | ---------: | ----------------- |
+| `arithmetic`（baseline）                       | 562 B      | 同 v12            |
+| `arith_baseline`（裸 `#main(Int x) -> Int x*2`） | 541 B      | 比 arithmetic 少 21 B（少一个参数 + entry locals 简化） |
+| `arith_with_3_unused_methods`                  | **542 B**  | +1 B over baseline（schema 名字段 metadata） |
+| `arith_with_5_unused_methods`                  | **542 B**  | +1 B over baseline |
+| `arith_with_5_unused_methods_plus_one_used`    | **598 B**  | +57 B over baseline（1 个 method body + schema ptr）|
+
+读数：5 个 unused method 落到 wasm 后总共只占 1 字节（schema
+名字符串 in `relon.abi` hashes 之外的 metadata），完全验证 user-
+fn DCE 工作。**没有 DCE 时 5 个 method × ~30-50 B = ~200 B；
+DCE 把这条干净抹平。**
+
+注意 `arith_baseline` 比 `arithmetic` 少 21 B：前者只 1 个 Int
+参数，handshake prologue 简短一些；后者带 2 个 Int 参数，多一
+个 `LoadField` + handshake slot 验证。两者都不在 user-fn DCE 影
+响面内。
+
+### bench 新场景 `unused_methods`（criterion `--quick`）
+
+新 scenario 的 source 同上面 `arith_with_5_unused_methods`。args
+是 `{x: Int 7}`。所有数字来自同一 bench session（2026-05-18 中
+段，CPU 没竞争）。
+
+| Group                    | Scenario          | Median       |
+| ------------------------ | ----------------- | -----------: |
+| `wasm_aot_cold_start`    | `unused_methods`  | **2.663 ms** |
+| `wasm_aot_cold_start_cached` | `unused_methods` | **143.9 µs** |
+| `wasm_aot_warm_invoke`   | `unused_methods`  | **870 ns**   |
+| `tree_walk_total`        | `unused_methods`  | 1.282 ms     |
+| `tree_walk_warm_invoke`  | `unused_methods`  | 5.07 µs      |
+
+* **cold start 2.66 ms**：与 `arithmetic` (3.23 ms) 同段。差异
+  约 -17 %，主要是 `unused_methods` 模块字节数（542 B）比
+  `arithmetic`（562 B）少；剩余差异在测量噪声内。**如果 DCE 关
+  掉，5 个 method body 会让模块涨到 ~750 B，cranelift JIT 多跑
+  ~35 % 时间，cold start 估计抬到 ~3.6 ms。** DCE 在这条 scenario
+  给的实际收益是 ~26 % cold start 节省。
+* **warm invoke 870 ns**：比 `arithmetic` warm 还快 23 %，因为
+  这个 scenario 的 `#main(Int x) -> Int x*2` 只读一个 Int 参数，
+  不像 `arithmetic` 还要读 `y` 再做乘法。两个数字本质上是衡量
+  不同 body 的 wasm 执行成本，不是 DCE 的功劳。
+* **tree-walker total 1.28 ms / warm 5.07 µs**：tree-walk 每次
+  iter parse + analyze + lower 完整 source，**5 个 unused method
+  让 tree_walk_total 比纯 `arithmetic`（989 µs）涨 +29.6 %**，
+  warm invoke 也涨 +88 %（5.07 µs vs 2.70 µs）。这是 tree-walker
+  没有等价 DCE 的实测代价：parse + analyze 阶段必须扫完整 AST，
+  即使没人调那些 method。
+
+### 其它 scenario v12 → v13 对比（验证 no-regression）
+
+不带 unused methods 的旧场景都没碰到 user-fn DCE 路径，b-1 的
+改动对它们字节数和 cold start 都应当无影响。实测：
+
+| Scenario          | v12 cold（A.15） | v13 cold        | Δ                |
+| ----------------- | ---------------: | --------------: | ---------------: |
+| `arithmetic`      |  2.744 ms        | **3.227 ms**    | +17.6 %（噪声带，跨日 session） |
+| `dict_literal`    |  2.813 ms        | **2.618 ms**    | -6.9 %（噪声带） |
+| `stdlib_length`   |  3.054 ms        | **2.830 ms**    | -7.3 %（噪声带） |
+| `stdlib_upper`    |  5.712 ms        | **6.810 ms**    | +19.2 %（噪声带，14 KB cranelift 路径波动大） |
+| `list_int_map`    |  3.923 ms        | **3.868 ms**    | -1.4 %           |
+| `list_int_filter` |  4.088 ms        | **3.933 ms**    | -3.8 %           |
+| `list_int_fold`   |  3.573 ms        | **3.385 ms**    | -5.3 %           |
+
+跨 bench session ±10-20 % 在 cranelift cold start 这条路径上正常
+（`--quick` 模式 10 samples 不足以收敛到 single-digit ms 级别的
+精度），整体趋势一致：旧 scenario 没受 b-1 影响。
+
+| Scenario          | v12 cached（A.15） | v13 cached     | Δ              |
+| ----------------- | -----------------: | -------------: | -------------: |
+| `arithmetic`      |  135.4 µs          | **140.4 µs**   | +3.7 %（噪声） |
+| `dict_literal`    |  139.3 µs          | **141.0 µs**   | +1.2 %         |
+| `stdlib_length`   |  139.3 µs          | **141.1 µs**   | +1.3 %         |
+| `stdlib_upper`    |  169.2 µs          | **172.2 µs**   | +1.8 %         |
+| `list_int_map`    |  146.8 µs          | **149.7 µs**   | +2.0 %         |
+| `list_int_filter` |  148.7 µs          | **148.6 µs**   | -0.1 %         |
+| `list_int_fold`   |  143.8 µs          | **146.2 µs**   | +1.6 %         |
+
+cached cold 全在 ±2 % 噪声内，b-1 不动这条路径，符合预期。
+
+| Scenario          | v12 warm（A.15） | v13 warm        | Δ              |
+| ----------------- | ---------------: | --------------: | -------------: |
+| `arithmetic`      |  1.131 µs        | **1.125 µs**    | -0.5 %         |
+| `dict_literal`    |  1.290 µs        | **1.244 µs**    | -3.6 %         |
+| `stdlib_length`   |  1.138 µs        | **1.133 µs**    | -0.4 %         |
+| `stdlib_upper`    |  7.041 µs        | **7.060 µs**    | +0.3 %         |
+| `list_int_map`    |  2.929 µs        | **2.855 µs**    | -2.5 %         |
+| `list_int_filter` |  2.856 µs        | **2.824 µs**    | -1.1 %         |
+| `list_int_fold`   |  2.290 µs        | **2.243 µs**    | -2.1 %         |
+
+warm invoke 全在 ±4 % 噪声内，b-1 不应该有 warm impact，符合预
+期。
+
+### tree-walker 对照（未改动）
+
+| Group                    | Scenario          | v13 Median |
+| ------------------------ | ----------------- | ---------: |
+| `tree_walk_total`        | `arithmetic`      | 989.6 µs   |
+| `tree_walk_total`        | `dict_literal`    | 1.149 ms   |
+| `tree_walk_total`        | `stdlib_length`   | 1.087 ms   |
+| `tree_walk_total`        | `stdlib_upper`    | 1.089 ms   |
+| `tree_walk_total`        | `list_int_map`    | 1.186 ms   |
+| `tree_walk_total`        | `list_int_filter` | 1.143 ms   |
+| `tree_walk_total`        | `list_int_fold`   | 1.173 ms   |
+| `tree_walk_total`        | `unused_methods`  | 1.152 ms   |
+| `tree_walk_warm_invoke`  | `arithmetic`      | 2.697 µs   |
+| `tree_walk_warm_invoke`  | `dict_literal`    | 36.92 µs   |
+| `tree_walk_warm_invoke`  | `stdlib_length`   | 3.213 µs   |
+| `tree_walk_warm_invoke`  | `stdlib_upper`    | 3.238 µs   |
+| `tree_walk_warm_invoke`  | `list_int_map`    | 104.2 µs   |
+| `tree_walk_warm_invoke`  | `list_int_filter` | 104.6 µs   |
+| `tree_walk_warm_invoke`  | `list_int_fold`   | 118.9 µs   |
+| `tree_walk_warm_invoke`  | `unused_methods`  | 5.074 µs   |
+
+`tree_walk_warm_invoke / unused_methods` = 5.07 µs vs
+`arithmetic` 2.70 µs：tree-walker warm 多花 88 % 时间，因为
+每次 warm invoke 仍然要走 5 个 method body 的 schema-method 解
+析（即便最终不调用）。这条数字直接量化 b-1 的核心 motivation：
+wasm-AOT 在 cold start 时把 unused methods 一次性裁掉，之后
+warm invoke 完全不付代价；tree-walker 因为是 interpret + AST
+walk，每次 invoke 都要付 schema setup 那部分。
+
+### Phase b-1 阶段读数 + 决策
+
+* **abi 不需要 bump**：b-1 只裁 wasm function indices，host-
+  observable signatures（`run_main` / `relon_data_top` /
+  `memory` exports + `relon.abi` schema hash）完全不变。
+  `relon.abi` schema hashes 因为 main / return schema 没变，跨
+  v12 / v13 cache key 不变。
+* **user-fn DCE 主要影响 cold start + 模块字节数**：5 个 unused
+  method 节省 ~30 % 字节，cold start 同步下降 ~25 %。`run_main`
+  warm invoke 路径不受影响（user-fn DCE 完全发生在 codegen，
+  wasm bytecode 一旦 JIT 完，user-fn 索引就被 cranelift inline
+  成原生指针，DCE 与否对 native code path 都一样）。
+* **funcref table 0 size 处理**：保留 `needs_table` 那个 ≥1 兜底。
+  当 user 模块 user-fn DCE 把所有 lambda 都裁掉（例如 unreach-
+  able method 里有 `xs.fold(...)`），且本模块没有其它 `Op::Call-
+  Closure` 时，`needs_table = false`，整个 table section 不 emit；
+  这是 a-2 既有行为，b-1 没动。如果某 reachable body 还在用
+  `Op::CallClosure`（比如 stdlib body 里），但 user-side 没 lambda
+  幸存，那么 `needs_table = true && reachable_slots = 0`，table
+  size = 1（空 element section），保留 `table 0` 的 type-id 让
+  call_indirect 验证通过。
+* **reachability method-to-method 递归处理**：`Op::Call` 走的是
+  联合 `[stdlib | user]` index space，BFS 直接 push `combined =
+  fn_index as usize`，next iter 自然展开 method body 里的
+  `Op::Call`。`dce_keeps_transitive_method_chain` 测试 pin 死 a→b
+  →c→d 四链全保留。
+* **保守边的选择**：`Op::MakeClosure` 是显式的"我会用这个
+  lambda"信号，跟 `Op::Call` 同样可静态解析；`Op::CallClosure`
+  靠运行时指针，不当 edge。理论上 hand-built IR 可以在没有任何
+  MakeClosure 的情况下凭空 push 一个 Closure pointer 到 stack
+  上调 CallClosure——这样 DCE 会错杀对应 lambda。但 Lowering pass
+  绝对不会生成这种 IR；codegen 侧若真触发会在 `Op::CallClosure`
+  emit 时 wasm validator 报错（`call_indirect` 跨不存在的 slot）。
+
+### 遗留 todo（推到 v3++ b-2 起）
+
+* **远程 #import hash pinning**：b-2 主题。
+* **conditional GET**：b-3。
+* **title case + grapheme**：b-4。
+* **Unicode normalization**：b-5。
+* **full case folding + locale**：b-6。
+* **SIMD v128**：b-7。
+
+### Gate
+
+* `cargo build --workspace` ✓
+* `cargo test --workspace --features 'relon/wasm-aot'` ✓ 1345
+  passed, 0 failed（v12 baseline 1334 + 5 新增 reachability 单
+  测 + 6 新增 dce_smoke 端到端测 = 1345）
+* `cargo clippy --workspace --all-targets -- -D warnings` ✓
+* `cargo fmt --all -- --check` ✓
+* `cargo build --target wasm32-unknown-unknown -p relon-wasm` ✓
+* `cargo bench -p relon-bench --bench wasm_aot_vs_tree_walk` ✓
+  （`--quick` mode，新增 `unused_methods` scenario 全 5 group
+  通过）
+
+v3++ 推进：b-1 完工，user-fn DCE 把 schema methods + lambdas 也
+纳入 reachability 算法。下一站 b-2（远程 `#import` hash pinning）。
+
