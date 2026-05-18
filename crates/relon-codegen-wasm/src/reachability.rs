@@ -1,11 +1,15 @@
-//! Phase v3+ a-2 stdlib dead-code elimination.
+//! Phase v3+ b-1 whole-program dead-code elimination.
 //!
 //! Walks the combined `[stdlib | user]` function table starting from
-//! the entry function plus every lambda referenced by
-//! [`relon_ir::Module::closure_table`], marking every callee transitively
-//! reached through `Op::Call { fn_index }`. The unreachable stdlib
-//! slots are then dropped from the wasm module so a user that never
-//! invokes e.g. `length` does not pay for `length` in the JIT'd binary.
+//! the entry function alone (`#main`), marking every callee reached
+//! transitively through `Op::Call { fn_index }` (direct dispatch into
+//! stdlib bodies or user schema methods) and `Op::MakeClosure {
+//! fn_table_idx }` (indirect dispatch into lambdas registered in the
+//! IR module's `closure_table`). Schema methods that nobody invokes
+//! and lambdas that nobody constructs are pruned from the wasm
+//! module so a user with five method declarations but only one
+//! reachable call site does not pay for the other four in the JIT'd
+//! binary.
 //!
 //! ## Index spaces
 //!
@@ -19,17 +23,34 @@
 //!   index, but shifted up by `import_count` to account for host
 //!   imports occupying `0..import_count`.
 //! * **Wasm function index (post-DCE)** — what we actually emit. Only
-//!   reachable stdlib bodies appear; user functions stay at the same
-//!   IR-combined ordering (we do not prune user funcs). The remap
+//!   reachable stdlib **and** user bodies appear; both are compacted
+//!   in their original ordering with stdlib slots first. The remap
 //!   produced here is from IR-combined → new-IR-combined; the
 //!   `import_count` shift still happens on the emit path.
 //!
-//! ## Why only stdlib
+//! ## Closure-table slot remap
 //!
-//! Phase v3+ a-2 scope only covers stdlib pruning. User functions
-//! (including schema methods) are kept whole. Trimming user funcs
-//! would require coupling closure_table rewrites against schema
-//! method dispatch sites; that is left for a later phase.
+//! Phase b-1 also prunes the wasm `funcref` table backing closure
+//! dispatch. Each entry in [`relon_ir::Module::closure_table`] names a
+//! lambda's IR user index; entries whose lambda is unreachable are
+//! dropped, and the rest are compacted into a dense `0..k` range.
+//! [`ReachabilityPlan::closure_slot_remap`] turns pre-DCE
+//! `Op::MakeClosure::fn_table_idx` values into the post-DCE slot
+//! before codegen materialises the handle's `fn_table_idx` field.
+//!
+//! ## Why entry-only roots
+//!
+//! Phase a-2 marked every user function (and every lambda in the
+//! closure table) as a root, which kept the DCE strictly stdlib-only.
+//! Phase b-1 narrows the root set to `#main` and walks edges through
+//! both direct `Op::Call` and the closure-construction edge —
+//! `MakeClosure` literally embeds the closure table slot in the
+//! handle, so the lambda is reachable iff that slot is reachable.
+//! `Op::CallClosure` itself goes through `call_indirect` against a
+//! runtime-loaded slot and is therefore conservative: it requires no
+//! extra edge, because every lambda that can land on the operand
+//! stack at a `CallClosure` site must have been built by some
+//! statically-visible `MakeClosure`.
 
 use relon_ir::{Module as IrModule, Op, TaggedOp};
 
@@ -43,22 +64,34 @@ pub(crate) struct ReachabilityPlan {
     #[allow(dead_code)]
     pub(crate) stdlib_count_before: usize,
     /// Stdlib slots kept after pruning (count of reachable bundled
-    /// functions). User funcs are always kept whole. Read by the
-    /// in-tree tests and externalised through future bench wiring
-    /// (Phase v3+ a-2 bench v10).
+    /// functions). Read by the in-tree tests and externalised through
+    /// future bench wiring (Phase v3+ a-2 bench v10 / b-1 bench v13).
     #[allow(dead_code)]
     pub(crate) stdlib_count_after: usize,
+    /// User function slots kept after pruning (count of reachable
+    /// schema methods, the entry, and lambdas combined). The pre-DCE
+    /// count is implicit — `remap.len() - stdlib_count_before`.
+    #[allow(dead_code)]
+    pub(crate) user_count_after: usize,
     /// Maps IR-combined index (pre-DCE) to the new IR-combined index
-    /// (post-DCE). Length = `stdlib_count_before + user_count`.
-    /// Unreachable stdlib entries map to `u32::MAX` and must never be
-    /// looked up by the emit path (they correspond to functions that
-    /// were also pruned from the wasm module).
+    /// (post-DCE). Length = `stdlib_count_before + user_count_before`.
+    /// Unreachable entries map to `u32::MAX` and must never be looked
+    /// up by the emit path (they correspond to functions that were
+    /// also pruned from the wasm module).
     pub(crate) remap: Vec<u32>,
-    /// IR-combined indices of the reachable stdlib slots, in the
-    /// original order. Length = `stdlib_count_after`. The combined
-    /// emit path iterates this list to assemble the new
+    /// IR-combined indices of every reachable function in the
+    /// original (pre-DCE) order — stdlib slots first, then user
+    /// slots. Length = `stdlib_count_after + user_count_after`. The
+    /// codegen emit path iterates this list to assemble the new
     /// `combined_funcs` vector.
-    pub(crate) reachable_stdlib: Vec<usize>,
+    pub(crate) reachable_funcs: Vec<usize>,
+    /// Maps pre-DCE closure-table slot index to post-DCE slot index.
+    /// Length matches the pre-DCE `Module::closure_table`. Entries
+    /// whose lambda became unreachable map to `u32::MAX` — codegen
+    /// must never see a `Op::MakeClosure` with such an index in a
+    /// reachable body (the lambda being unreachable implies no
+    /// reachable construction site, by induction on the BFS).
+    pub(crate) closure_slot_remap: Vec<u32>,
 }
 
 impl ReachabilityPlan {
@@ -79,36 +112,73 @@ impl ReachabilityPlan {
         debug_assert_ne!(
             mapped,
             u32::MAX,
-            "fn_index {} pointed at a pruned stdlib slot",
+            "fn_index {} pointed at a pruned slot",
             pre_idx
+        );
+        mapped
+    }
+
+    /// Look up the post-DCE closure-table slot for a pre-DCE
+    /// `Op::MakeClosure::fn_table_idx`. Panics in debug builds when
+    /// the slot is unreachable; release builds return `u32::MAX` for
+    /// caller-side diagnostics.
+    ///
+    /// Kept for diagnostic / external-tooling use even though the
+    /// codegen emit path reads the remap slice directly through
+    /// `closure_slot_remap` — the helper keeps the panic discipline
+    /// uniform with `translate`.
+    #[inline]
+    #[allow(dead_code)]
+    pub(crate) fn translate_closure_slot(&self, pre_slot: u32) -> u32 {
+        debug_assert!(
+            (pre_slot as usize) < self.closure_slot_remap.len(),
+            "fn_table_idx {} out of range (closure_table size {})",
+            pre_slot,
+            self.closure_slot_remap.len()
+        );
+        let mapped = self.closure_slot_remap[pre_slot as usize];
+        debug_assert_ne!(
+            mapped,
+            u32::MAX,
+            "fn_table_idx {} pointed at a pruned closure slot",
+            pre_slot
         );
         mapped
     }
 }
 
-/// Compute the reachable-stdlib plan over the combined `[stdlib | user]`
+/// Compute the reachable-funcs plan over the combined `[stdlib | user]`
 /// IR function table.
 ///
 /// `combined_funcs` must be the same vector codegen would build
 /// without DCE: stdlib functions first (`0..stdlib_count`), then
 /// user functions (`stdlib_count..stdlib_count + user_count`). The
 /// returned plan is consumed by the codegen path to (a) skip
-/// unreachable stdlib bodies when emitting the function + code
-/// sections and (b) translate every `Op::Call { fn_index }` and
-/// `closure_table` entry to the post-DCE index.
+/// unreachable bodies when emitting the function + code sections,
+/// (b) translate every `Op::Call { fn_index }` to the post-DCE
+/// IR-combined index, and (c) translate every
+/// `Op::MakeClosure { fn_table_idx }` to the post-DCE closure-table
+/// slot.
 ///
-/// Entry roots:
+/// Roots:
 ///
-/// * `entry_func_index` — the IR-combined index of `#main`.
-/// * Every entry of `closure_table` (user-visible lambdas). These
-///   are funcref-table targets and are reachable through
-///   `call_indirect`, which we cannot statically resolve, so we
-///   conservatively mark them live.
+/// * `entry_combined_index` — the IR-combined index of `#main`. When
+///   the module is library-shaped (`None`), every user function stays
+///   reachable for backward compatibility with the v3+ a-2 contract;
+///   stdlib bodies are still pruned through the BFS sweep below.
 ///
-/// User functions reachable from those roots stay reachable (and
-/// we already keep all user funcs unconditionally, so this is mostly
-/// for ensuring their callees are also kept). Stdlib-to-stdlib calls
-/// are handled transitively in case future bodies grow them.
+/// Edges followed by the BFS:
+///
+/// * `Op::Call { fn_index }` — direct dispatch into a stdlib body
+///   or user schema method. The combined index is added to the
+///   worklist as-is.
+/// * `Op::MakeClosure { fn_table_idx }` — closure construction;
+///   resolves the slot through `closure_table_user_indices` to find
+///   the lambda's user-IR-index, shifts by `stdlib_count`, then
+///   adds the combined index. The slot itself is recorded so the
+///   closure-table remap can pin down which entries survive.
+/// * `Op::CallClosure` — no specific target; relies on the matching
+///   construction site having been visited already.
 pub(crate) fn compute_plan<F>(
     combined_funcs: &[F],
     stdlib_count: usize,
@@ -121,89 +191,123 @@ where
     let total = combined_funcs.len();
     let mut visited = vec![false; total];
     let mut work: Vec<usize> = Vec::new();
+    let mut closure_slot_visited = vec![false; closure_table_user_indices.len()];
 
-    // Root 1: the entry function (#main). When the module has no
-    // entry (library shape), nothing else is reachable from the
-    // top — but we still keep every user func and treat lambda
-    // entries as roots.
-    if let Some(idx) = entry_combined_index {
-        if idx < total && !visited[idx] {
+    match entry_combined_index {
+        Some(idx) if idx < total => {
             visited[idx] = true;
             work.push(idx);
         }
-    }
-
-    // Root 2: every lambda registered in the closure_table. The
-    // table entries are user-IR indices; shift by stdlib_count to
-    // get the combined index.
-    for &ir_user_idx in closure_table_user_indices {
-        let combined = stdlib_count + ir_user_idx as usize;
-        if combined < total && !visited[combined] {
-            visited[combined] = true;
-            work.push(combined);
+        Some(_) => {
+            // Out-of-range entry — leave the visited set untouched
+            // and fall through to an empty BFS. The plan will end up
+            // with zero reachable funcs which the emit path treats
+            // as a hard error elsewhere.
+        }
+        None => {
+            // Library-shaped module: no entry, no statically-known
+            // root. Keep every user function alive (matches the
+            // v3+ a-2 behaviour). Stdlib slots are still pruned
+            // because the BFS only reaches one if a kept user body
+            // calls it. Closure-table entries are seeded as roots so
+            // lambdas declared at library scope stay live.
+            for (idx, slot) in visited.iter_mut().enumerate().skip(stdlib_count) {
+                if !*slot {
+                    *slot = true;
+                    work.push(idx);
+                }
+            }
+            for (slot_idx, &ir_user_idx) in closure_table_user_indices.iter().enumerate() {
+                closure_slot_visited[slot_idx] = true;
+                let combined = stdlib_count + ir_user_idx as usize;
+                if combined < total && !visited[combined] {
+                    visited[combined] = true;
+                    work.push(combined);
+                }
+            }
         }
     }
 
-    // Root 3: every user function. We do not prune user funcs in
-    // this phase, so all of `stdlib_count..total` are roots. This
-    // also ensures schema methods (callable through Op::Call from
-    // #main or sibling methods) keep their stdlib callees alive
-    // even if #main itself never reaches that callee.
-    for (idx, slot) in visited.iter_mut().enumerate().skip(stdlib_count) {
-        if !*slot {
-            *slot = true;
-            work.push(idx);
-        }
-    }
-
-    // BFS / worklist sweep. Stdlib-to-stdlib calls are transitively
-    // followed — v3+ a-4's `upper` / `lower` bodies are the first
-    // shape to do this in practice (`upper` -> `__casefold_lookup`),
-    // and the call site lives inside a `Op::Loop` nested in a
-    // `Op::Block`, so the walker has to descend through structured
-    // control-flow op bodies as well as the top-level sequence.
+    // BFS / worklist sweep. The visitor descends through structured
+    // control-flow children (`Op::Block`, `Op::Loop`, `Op::If`) and
+    // walks two distinct edge kinds — direct `Op::Call` targets and
+    // `Op::MakeClosure` slots resolved through the closure table.
     while let Some(fn_idx) = work.pop() {
         let body = combined_funcs[fn_idx].body();
-        visit_calls(body, total, &mut visited, &mut work);
+        visit_edges(
+            body,
+            total,
+            stdlib_count,
+            closure_table_user_indices,
+            &mut visited,
+            &mut closure_slot_visited,
+            &mut work,
+        );
     }
 
-    // Build the remap. Stdlib slots collapse into a dense prefix
-    // matching `reachable_stdlib`; user slots shift down by the
-    // pruned count.
+    // Build the function-index remap. Stdlib slots collapse into a
+    // dense prefix matching the reachable stdlib slots; reachable
+    // user slots follow in their original order.
     let mut remap = vec![u32::MAX; total];
-    let mut reachable_stdlib: Vec<usize> = Vec::new();
+    let mut reachable_funcs: Vec<usize> = Vec::new();
     let mut new_idx: u32 = 0;
-    for old_idx in 0..stdlib_count {
-        if visited[old_idx] {
+    for (old_idx, slot) in visited.iter().enumerate().take(stdlib_count) {
+        if *slot {
             remap[old_idx] = new_idx;
-            reachable_stdlib.push(old_idx);
+            reachable_funcs.push(old_idx);
             new_idx += 1;
         }
     }
-    let stdlib_count_after = reachable_stdlib.len();
-    // User slots are always kept; remap by appending after the
-    // reachable stdlib prefix.
-    for slot in remap.iter_mut().skip(stdlib_count) {
-        *slot = new_idx;
-        new_idx += 1;
+    let stdlib_count_after = reachable_funcs.len();
+    for (old_idx, slot) in visited.iter().enumerate().skip(stdlib_count) {
+        if *slot {
+            remap[old_idx] = new_idx;
+            reachable_funcs.push(old_idx);
+            new_idx += 1;
+        }
+    }
+    let user_count_after = reachable_funcs.len() - stdlib_count_after;
+
+    // Build the closure-slot remap. Entries whose lambda became
+    // unreachable map to `u32::MAX`; surviving entries are compacted
+    // in their original pre-DCE order so the funcref table emission
+    // stays deterministic.
+    let mut closure_slot_remap = vec![u32::MAX; closure_table_user_indices.len()];
+    let mut next_slot: u32 = 0;
+    for (slot_idx, &live) in closure_slot_visited.iter().enumerate() {
+        if live {
+            closure_slot_remap[slot_idx] = next_slot;
+            next_slot += 1;
+        }
     }
 
     ReachabilityPlan {
         stdlib_count_before: stdlib_count,
         stdlib_count_after,
+        user_count_after,
         remap,
-        reachable_stdlib,
+        reachable_funcs,
+        closure_slot_remap,
     }
 }
 
 /// Recursively walk an op sequence, marking every `Op::Call` target
-/// as reachable and pushing newly-reachable callees onto the worklist.
-/// Descends through `Op::Block` / `Op::Loop` / `Op::If` bodies so
-/// stdlib bodies that wrap their `Op::Call`s in structured
-/// control flow (v3+ a-4 `upper` / `lower`, which call
-/// `__casefold_lookup` from inside a `Op::Loop`) still have their
-/// callees marked alive.
-fn visit_calls(body: &[TaggedOp], total: usize, visited: &mut [bool], work: &mut Vec<usize>) {
+/// and every `Op::MakeClosure`-referenced lambda as reachable, then
+/// pushing newly-reachable callees onto the worklist. Descends
+/// through `Op::Block` / `Op::Loop` / `Op::If` bodies so callees
+/// nested inside structured control flow (v3+ a-4 `upper` / `lower`
+/// call `__casefold_lookup` from inside a `Op::Loop`) still get
+/// picked up.
+#[allow(clippy::too_many_arguments)]
+fn visit_edges(
+    body: &[TaggedOp],
+    total: usize,
+    stdlib_count: usize,
+    closure_table_user_indices: &[u32],
+    visited: &mut [bool],
+    closure_slot_visited: &mut [bool],
+    work: &mut Vec<usize>,
+) {
     for tagged in body {
         match &tagged.op {
             Op::Call { fn_index, .. } => {
@@ -213,16 +317,52 @@ fn visit_calls(body: &[TaggedOp], total: usize, visited: &mut [bool], work: &mut
                     work.push(callee);
                 }
             }
+            Op::MakeClosure { fn_table_idx, .. } => {
+                let slot = *fn_table_idx as usize;
+                if slot < closure_table_user_indices.len() && !closure_slot_visited[slot] {
+                    closure_slot_visited[slot] = true;
+                    let ir_user_idx = closure_table_user_indices[slot];
+                    let combined = stdlib_count + ir_user_idx as usize;
+                    if combined < total && !visited[combined] {
+                        visited[combined] = true;
+                        work.push(combined);
+                    }
+                }
+            }
             Op::If {
                 then_body,
                 else_body,
                 ..
             } => {
-                visit_calls(then_body, total, visited, work);
-                visit_calls(else_body, total, visited, work);
+                visit_edges(
+                    then_body,
+                    total,
+                    stdlib_count,
+                    closure_table_user_indices,
+                    visited,
+                    closure_slot_visited,
+                    work,
+                );
+                visit_edges(
+                    else_body,
+                    total,
+                    stdlib_count,
+                    closure_table_user_indices,
+                    visited,
+                    closure_slot_visited,
+                    work,
+                );
             }
             Op::Block { body, .. } | Op::Loop { body, .. } => {
-                visit_calls(body, total, visited, work);
+                visit_edges(
+                    body,
+                    total,
+                    stdlib_count,
+                    closure_table_user_indices,
+                    visited,
+                    closure_slot_visited,
+                    work,
+                );
             }
             _ => {}
         }
@@ -258,7 +398,7 @@ pub(crate) fn compute_plan_for_module(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use relon_ir::{IrType, TaggedOp};
+    use relon_ir::{ClosureCapture, IrType, TaggedOp};
     use relon_parser::TokenRange;
 
     /// Minimal stand-in body used by the unit tests below.
@@ -283,6 +423,17 @@ mod tests {
         }
     }
 
+    fn make_closure(fn_table_idx: u32) -> TaggedOp {
+        TaggedOp {
+            op: Op::MakeClosure {
+                fn_table_idx,
+                captures: Vec::<ClosureCapture>::new(),
+                captures_size: 0,
+            },
+            range: TokenRange::default(),
+        }
+    }
+
     fn empty() -> FakeFn {
         FakeFn { body: vec![] }
     }
@@ -299,7 +450,8 @@ mod tests {
         let funcs = vec![empty(), empty(), empty(), empty()];
         let plan = compute_plan(&funcs, 3, Some(3), &[]);
         assert_eq!(plan.stdlib_count_after, 0);
-        assert_eq!(plan.reachable_stdlib, Vec::<usize>::new());
+        assert_eq!(plan.user_count_after, 1);
+        assert_eq!(plan.reachable_funcs, vec![3]);
         // User slot 3 collapses down to new index 0.
         assert_eq!(plan.remap[3], 0);
     }
@@ -310,7 +462,8 @@ mod tests {
         let funcs = vec![empty(), empty(), empty(), with_calls(&[1])];
         let plan = compute_plan(&funcs, 3, Some(3), &[]);
         assert_eq!(plan.stdlib_count_after, 1);
-        assert_eq!(plan.reachable_stdlib, vec![1]);
+        assert_eq!(plan.user_count_after, 1);
+        assert_eq!(plan.reachable_funcs, vec![1, 3]);
         assert_eq!(plan.remap[0], u32::MAX);
         assert_eq!(plan.remap[1], 0);
         assert_eq!(plan.remap[2], u32::MAX);
@@ -329,7 +482,7 @@ mod tests {
         ];
         let plan = compute_plan(&funcs, 3, Some(3), &[]);
         assert_eq!(plan.stdlib_count_after, 2);
-        assert_eq!(plan.reachable_stdlib, vec![0, 2]);
+        assert_eq!(plan.reachable_funcs, vec![0, 2, 3]);
         assert_eq!(plan.remap[0], 0);
         assert_eq!(plan.remap[1], u32::MAX);
         assert_eq!(plan.remap[2], 1);
@@ -337,26 +490,108 @@ mod tests {
     }
 
     #[test]
-    fn lambda_root_kept_with_its_stdlib_callee() {
-        // 2 stdlib + 3 user. User 0 = #main (empty); user 1 = lambda
-        // calling stdlib 1; user 2 = unused user fn.
-        // closure_table = [1] (the lambda's user index).
+    fn unused_user_method_pruned() {
+        // 0 stdlib + 3 user. User 0 = #main, user 1 = unused method,
+        // user 2 = another unused method. Entry is user 0.
+        let funcs = vec![empty(), empty(), empty()];
+        let plan = compute_plan(&funcs, 0, Some(0), &[]);
+        assert_eq!(plan.stdlib_count_after, 0);
+        assert_eq!(plan.user_count_after, 1);
+        assert_eq!(plan.reachable_funcs, vec![0]);
+        assert_eq!(plan.remap[0], 0);
+        assert_eq!(plan.remap[1], u32::MAX);
+        assert_eq!(plan.remap[2], u32::MAX);
+    }
+
+    #[test]
+    fn transitive_method_call_chain_kept() {
+        // 0 stdlib + 4 user. user 0 = #main calls user 1; user 1
+        // calls user 2; user 2 calls user 3. Entire chain must
+        // survive — pruning any breaks the dispatch.
         let funcs = vec![
-            empty(),          // stdlib 0
-            empty(),          // stdlib 1
-            empty(),          // user 0 (#main)
-            with_calls(&[1]), // user 1 (lambda)
-            empty(),          // user 2
+            with_calls(&[1]),
+            with_calls(&[2]),
+            with_calls(&[3]),
+            empty(),
         ];
-        let plan = compute_plan(&funcs, 2, Some(2), &[1]);
-        // stdlib 1 reachable through lambda; stdlib 0 not.
+        let plan = compute_plan(&funcs, 0, Some(0), &[]);
+        assert_eq!(plan.user_count_after, 4);
+        assert_eq!(plan.reachable_funcs, vec![0, 1, 2, 3]);
+        for (i, slot) in plan.remap.iter().enumerate() {
+            assert_eq!(*slot, i as u32, "remap[{}] should be {} (got {})", i, i, *slot);
+        }
+    }
+
+    #[test]
+    fn unreached_method_pruned_while_sibling_kept() {
+        // 0 stdlib + 3 user. user 0 = #main calls user 1 only;
+        // user 2 sits unreferenced. user 1 must survive, user 2 must
+        // drop.
+        let funcs = vec![with_calls(&[1]), empty(), empty()];
+        let plan = compute_plan(&funcs, 0, Some(0), &[]);
+        assert_eq!(plan.user_count_after, 2);
+        assert_eq!(plan.reachable_funcs, vec![0, 1]);
+        assert_eq!(plan.remap[0], 0);
+        assert_eq!(plan.remap[1], 1);
+        assert_eq!(plan.remap[2], u32::MAX);
+    }
+
+    #[test]
+    fn lambda_root_dropped_when_no_make_closure() {
+        // 2 stdlib + 3 user. User 0 = #main (empty); user 1 = lambda
+        // body; user 2 = another lambda body. closure_table = [1, 2].
+        // No MakeClosure construction anywhere -> both lambdas dead
+        // and both closure slots dropped.
+        let funcs = vec![empty(), empty(), empty(), empty(), empty()];
+        let plan = compute_plan(&funcs, 2, Some(2), &[1, 2]);
+        assert_eq!(plan.stdlib_count_after, 0);
+        assert_eq!(plan.user_count_after, 1);
+        assert_eq!(plan.reachable_funcs, vec![2]);
+        assert_eq!(plan.closure_slot_remap, vec![u32::MAX, u32::MAX]);
+    }
+
+    #[test]
+    fn lambda_kept_when_make_closure_in_entry() {
+        // 2 stdlib + 3 user. Combined layout:
+        //   funcs[0..2] = stdlib bystanders
+        //   funcs[2]    = user 0 = lambda body (calls stdlib 1)
+        //   funcs[3]    = user 1 = unused lambda
+        //   funcs[4]    = user 2 = #main, MakeClosure slot 0
+        // closure_table = [0, 1] (lambda IR user indices). Entry =
+        // combined index 4. Only slot 0 is constructed -> lambda 0
+        // and stdlib 1 survive, lambda 1 is pruned.
+        let funcs = vec![
+            empty(),                                // stdlib 0
+            empty(),                                // stdlib 1
+            with_calls(&[1]),                       // user 0 = lambda body, calls stdlib 1
+            empty(),                                // user 1 = unused lambda
+            FakeFn {
+                body: vec![make_closure(0)],
+            }, // user 2 = #main constructs slot 0
+        ];
+        let plan = compute_plan(&funcs, 2, Some(4), &[0, 1]);
+        // Lambda 0 (combined 2) reachable through MakeClosure(0);
+        // stdlib 1 reachable through lambda 0's body.
         assert_eq!(plan.stdlib_count_after, 1);
-        assert_eq!(plan.reachable_stdlib, vec![1]);
+        assert_eq!(plan.reachable_funcs, vec![1, 2, 4]);
         assert_eq!(plan.remap[0], u32::MAX);
         assert_eq!(plan.remap[1], 0);
-        // User funcs preserved.
         assert_eq!(plan.remap[2], 1);
-        assert_eq!(plan.remap[3], 2);
-        assert_eq!(plan.remap[4], 3);
+        assert_eq!(plan.remap[3], u32::MAX);
+        assert_eq!(plan.remap[4], 2);
+        // Closure-slot remap compacts slot 0 to 0 and drops slot 1.
+        assert_eq!(plan.closure_slot_remap, vec![0, u32::MAX]);
+    }
+
+    #[test]
+    fn library_module_keeps_all_user_funcs() {
+        // No entry — library shape. Every user func stays reachable
+        // for backward compatibility; stdlib is still pruned through
+        // the BFS (no roots reach it).
+        let funcs = vec![empty(), empty(), empty(), empty()];
+        let plan = compute_plan(&funcs, 2, None, &[]);
+        assert_eq!(plan.user_count_after, 2);
+        assert_eq!(plan.stdlib_count_after, 0);
+        assert_eq!(plan.reachable_funcs, vec![2, 3]);
     }
 }

@@ -231,10 +231,13 @@ pub fn compile_module_with_host_fns(
     // `ir.funcs`); the wasm-level entry index is
     // `import_count + stdlib_count + entry_func_index`.
     //
-    // Phase v3+ a-2: a reachability pass over the combined table
-    // prunes stdlib bodies the user never reaches. The plan's remap
-    // feeds `FunctionEmitCfg::fn_index_remap` so every `Op::Call`
-    // lands at the post-DCE slot, and only reachable stdlib bodies
+    // Phase v3+ b-1: a whole-program reachability pass over the
+    // combined table prunes both stdlib bodies the user never
+    // reaches **and** user functions (schema methods, lambdas) that
+    // are unreachable from `#main`. The plan's remap feeds
+    // `FunctionEmitCfg::fn_index_remap` so every `Op::Call` lands at
+    // the post-DCE slot; the closure-slot remap retranslates
+    // `Op::MakeClosure { fn_table_idx }`; and only reachable bodies
     // are appended to the actually-emitted `combined_funcs` vector.
     let stdlib_funcs = builtin_stdlib();
     let stdlib_count = stdlib_funcs.len();
@@ -245,14 +248,14 @@ pub fn compile_module_with_host_fns(
         .collect();
     let import_count = ir.imports.len() as u32;
     let dce_plan = reachability::compute_plan_for_module(ir, &combined_funcs_full, stdlib_count);
-    // Post-DCE combined function vector: reachable stdlib bodies in
-    // their original ordering, then every user function (we do not
-    // prune user funcs in this phase).
+    // Post-DCE combined function vector: only reachable bodies, in
+    // their original (pre-DCE) ordering — stdlib slots first, then
+    // user slots. Built directly from the plan's `reachable_funcs`
+    // list so the lookup is a single pass through the pre-DCE table.
     let combined_funcs: Vec<IrFunc> = dce_plan
-        .reachable_stdlib
+        .reachable_funcs
         .iter()
         .map(|&idx| combined_funcs_full[idx].clone())
-        .chain(ir.funcs.iter().cloned())
         .collect();
     // Translate the entry's pre-DCE combined index through the plan
     // so the export and the entry-detection branch in the emit loop
@@ -463,6 +466,7 @@ pub fn compile_module_with_host_fns(
             data_top,
             closure_type_table: &closure_type_table,
             fn_index_remap: &dce_plan.remap,
+            closure_slot_remap: &dce_plan.closure_slot_remap,
         };
         let (body, ranges, unreachable_log) = emit_function_body(
             func,
@@ -478,30 +482,41 @@ pub fn compile_module_with_host_fns(
     }
 
     // Phase 10-a: emit the wasm `funcref` table backing closure
-    // call sites. One slot per entry in `ir.closure_table`; the
-    // matching `ElementSection` (emitted after exports per the
-    // wasm canonical section order) initialises each slot with the
-    // wasm-level function index of the lambda's body.
+    // call sites. One slot per **reachable** entry in
+    // `ir.closure_table`; the matching `ElementSection` (emitted
+    // after exports per the wasm canonical section order)
+    // initialises each slot with the wasm-level function index of
+    // the lambda's body.
     //
     // The table is emitted whenever the module contains any
-    // `Op::CallClosure` instructions — even when no user code
-    // produces lambdas. Bundled stdlib bodies (`list_int_map`,
-    // `list_int_filter`, `list_int_fold`) always emit
-    // `call_indirect` against table 0, so the table must exist
-    // for the module to load even when no lambdas were actually
-    // emitted by the lowering pass. Size = max(closure_table.len(),
-    // 1) so empty tables still create a valid `table 0` import for
-    // the call_indirect immediates.
+    // reachable `Op::CallClosure` instruction — even when no
+    // user code produces lambdas. Bundled stdlib bodies
+    // (`list_int_map`, `list_int_filter`, `list_int_fold`) emit
+    // `call_indirect` against table 0, so the table must exist for
+    // the module to load even when DCE pruned every lambda.
+    // Size = max(reachable_closure_slot_count, 1) so empty tables
+    // still produce a valid `table 0` for the call_indirect
+    // immediates.
+    //
+    // Phase v3+ b-1: DCE prunes closure_table entries whose lambda
+    // became unreachable. The `closure_slot_remap` produced by the
+    // reachability pass identifies which pre-DCE slots survived;
+    // iterate it in pre-DCE order so the post-DCE slot indices
+    // (0..k) stay aligned with `Op::MakeClosure` after the
+    // closure-slot-remap translation runs at emit time.
     let needs_table = !closure_signatures.is_empty();
-    // Phase v3+ a-2: closure_table entries reference user lambda
-    // functions by IR user index. The pre-DCE combined index is
-    // `stdlib_count + ir_fn_idx`; remap through the DCE plan to the
-    // post-DCE combined index, then shift past `import_count` so the
-    // value is a valid wasm function index for the funcref table.
     let closure_table_entries: Vec<u32> = ir
         .closure_table
         .iter()
-        .map(|&ir_fn_idx| dce_plan.translate(ir_fn_idx + stdlib_count as u32) + import_count)
+        .enumerate()
+        .filter_map(|(pre_slot, &ir_fn_idx)| {
+            let new_slot = dce_plan.closure_slot_remap.get(pre_slot).copied()?;
+            if new_slot == u32::MAX {
+                return None;
+            }
+            let post_idx = dce_plan.translate(ir_fn_idx + stdlib_count as u32);
+            Some(post_idx + import_count)
+        })
         .collect();
     let table_size = closure_table_entries
         .len()
@@ -639,6 +654,14 @@ struct FunctionEmitCfg<'a> {
     /// stdlib bodies are `u32::MAX` and must never be consulted —
     /// the reachability pass guarantees no live body references one.
     fn_index_remap: &'a [u32],
+    /// Phase v3+ b-1: pre-DCE -> post-DCE closure-table slot remap.
+    /// Every `Op::MakeClosure { fn_table_idx }` looks up the
+    /// post-DCE slot here before materialising the closure handle's
+    /// `fn_table_idx` field. Length matches the pre-DCE
+    /// `Module::closure_table`. Slots for unreachable lambdas are
+    /// `u32::MAX`; the reachability pass guarantees no reachable
+    /// `Op::MakeClosure` references one.
+    closure_slot_remap: &'a [u32],
 }
 
 /// Look up an existing `(params, ret) -> type index` entry or add a
@@ -1465,6 +1488,7 @@ fn emit_function_body(
         params_count,
         closure_type_table: emit_cfg.closure_type_table.to_vec(),
         fn_index_remap: emit_cfg.fn_index_remap.to_vec(),
+        closure_slot_remap: emit_cfg.closure_slot_remap.to_vec(),
     };
     let _ = return_root_size; // referenced earlier in this function
     emit_op_seq(
@@ -1684,6 +1708,11 @@ struct EmitCtx {
     /// slice before adding `import_count` to land at the final wasm
     /// function index.
     fn_index_remap: Vec<u32>,
+    /// Phase v3+ b-1: pre-DCE -> post-DCE closure-table slot remap.
+    /// `Op::MakeClosure` translates its IR `fn_table_idx` through
+    /// this slice before storing it into the closure handle so the
+    /// embedded slot index matches the compacted funcref table.
+    closure_slot_remap: Vec<u32>,
 }
 
 impl EmitCtx {
@@ -2615,12 +2644,31 @@ fn emit_op_seq(
                 captures,
                 captures_size,
             } => {
+                // Phase v3+ b-1: translate the pre-DCE closure-table
+                // slot to its post-DCE position. The reachability
+                // pass guarantees every `MakeClosure` reached here
+                // resolves to a kept slot; a `u32::MAX` lookup means
+                // the lowering pass produced a stale slot index and
+                // surfaces deterministically as `CallTypeMismatch`.
+                let pre_slot = *fn_table_idx as usize;
+                let mapped_slot = ectx
+                    .closure_slot_remap
+                    .get(pre_slot)
+                    .copied()
+                    .unwrap_or(u32::MAX);
+                if mapped_slot == u32::MAX {
+                    return Err(CodegenError::CallTypeMismatch {
+                        fn_index: *fn_table_idx,
+                        arg_count: 0,
+                        param_tys_len: 0,
+                    });
+                }
                 emit_make_closure(
                     f,
                     ranges,
                     log,
                     ectx,
-                    *fn_table_idx,
+                    mapped_slot,
                     captures,
                     *captures_size,
                     tagged.range,
