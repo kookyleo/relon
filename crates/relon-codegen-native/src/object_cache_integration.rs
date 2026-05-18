@@ -50,25 +50,24 @@
 
 use std::path::{Path, PathBuf};
 
-use cranelift_codegen::ir::{AbiParam, Function, InstBuilder, Signature, UserFuncName};
-use cranelift_codegen::isa::CallConv;
-use cranelift_codegen::settings::{self, Configurable};
-use cranelift_codegen::Context as CodegenContext;
-use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
-use cranelift_module::{default_libcall_names, Linkage, Module as CrModule};
-use cranelift_object::{ObjectBuilder, ObjectModule};
-
 use relon_object_cache::{HostFnImport, IntegrityMode, Metadata, SignatureHash};
 use sha2::{Digest, Sha256};
 
 use crate::cache::{self, CacheEntry as IrCacheEntry};
+use crate::codegen::{compile_module_to_object_bytes, ObjectArtifact};
 use crate::error::CraneliftError;
 use crate::sandbox::SandboxConfig;
 
 /// Generator stamp embedded in cache metadata. Bump when an
 /// incompatible codegen change lands so older cache files self-
 /// invalidate via the `generator_version` check.
-pub const GENERATOR_VERSION: &str = "relon-codegen-native v5-gamma 1";
+///
+/// `v5-gamma 2` = stage 2 vtable indirection (host helper calls
+/// route through `__relon_capability_vtable` instead of direct
+/// `Linkage::Import` references). Cache files from stage 1 are
+/// emitted against the stub `relon_main_entry` and would deadlock
+/// the dlopen-exec path; the version bump self-invalidates them.
+pub const GENERATOR_VERSION: &str = "relon-codegen-native v5-gamma 2";
 
 /// Filename suffix for the legacy IR cache (paired with the
 /// relon-object-cache `<hash>.relon-native-v1` blob).
@@ -540,15 +539,38 @@ pub fn load_object_bytes(
     )
 }
 
-/// Build a minimal `relon_main_entry` ET_REL via cranelift-object so
-/// the v5-γ cache write path has something concrete to persist. The
-/// stub function takes the same shape as the buffer-protocol entry
-/// (`(state*, i32, i32, i32, i32, i64) -> i32`) but returns `0` — its
-/// presence in the cache lets the loader exercise dlopen + dlsym
-/// round-trips while the indirect-call vtable refactor is in flight.
+/// v5-γ stage 2: emit a full module ET_REL via cranelift-object so
+/// the dlopen-execution path can load real compiled code. The output
+/// imports only the `__relon_capability_vtable` data symbol — every
+/// host helper call indirects through the vtable, which the host
+/// populates after `dlopen` returns (see [`crate::vtable`]).
 ///
-/// Returns the ET_REL bytes ready for [`relon_object_link::link_to_dyn`].
+/// Returns the ET_REL bytes ready for
+/// [`relon_object_link::link_to_dyn`].
+pub fn emit_module_object_bytes(
+    ir: &relon_ir::ir::Module,
+    sandbox: &SandboxConfig,
+    return_root_size: u32,
+) -> Result<ObjectArtifact, CraneliftError> {
+    compile_module_to_object_bytes(ir, sandbox, return_root_size)
+}
+
+/// Backwards-compatible shim: v5-γ stage 1 callers asked for a stub
+/// `relon_main_entry` to round-trip the dlopen loader. Stage 2 emits
+/// the full module instead — but the IR / sandbox / return_root_size
+/// inputs aren't available at every call site, so this thin helper
+/// builds a buffer-protocol "return 0" stub the same way stage 1 did.
+/// Used by smoke tests that want the loader pipeline without
+/// reaching for the full lowering surface.
 pub fn emit_entry_stub_object() -> Result<Vec<u8>, CraneliftError> {
+    use cranelift_codegen::ir::{AbiParam, Function, InstBuilder, Signature, UserFuncName};
+    use cranelift_codegen::isa::CallConv;
+    use cranelift_codegen::settings::{self, Configurable};
+    use cranelift_codegen::Context as CodegenContext;
+    use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
+    use cranelift_module::{default_libcall_names, DataDescription, Linkage, Module as CrModule};
+    use cranelift_object::{ObjectBuilder, ObjectModule};
+
     let mut flag_builder = settings::builder();
     flag_builder
         .set("is_pic", "true")
@@ -558,8 +580,6 @@ pub fn emit_entry_stub_object() -> Result<Vec<u8>, CraneliftError> {
         .map_err(|e| CraneliftError::JitSetup(format!("opt_level flag: {e}")))?;
     let flags = settings::Flags::new(flag_builder);
 
-    // Cranelift's `isa::lookup_by_name` would also work but we use
-    // `cranelift-native` so the bytes are tagged for the host CPU.
     let isa_builder = cranelift_native::builder()
         .map_err(|e| CraneliftError::HostTarget(format!("cranelift-native: {e}")))?;
     let isa = isa_builder
@@ -572,17 +592,17 @@ pub fn emit_entry_stub_object() -> Result<Vec<u8>, CraneliftError> {
 
     let pointer_ty = module.target_config().pointer_type();
     let mut sig = Signature::new(CallConv::SystemV);
-    sig.params.push(AbiParam::new(pointer_ty)); // state ptr
+    sig.params.push(AbiParam::new(pointer_ty));
     sig.params
-        .push(AbiParam::new(cranelift_codegen::ir::types::I32)); // in_ptr
+        .push(AbiParam::new(cranelift_codegen::ir::types::I32));
     sig.params
-        .push(AbiParam::new(cranelift_codegen::ir::types::I32)); // in_len
+        .push(AbiParam::new(cranelift_codegen::ir::types::I32));
     sig.params
-        .push(AbiParam::new(cranelift_codegen::ir::types::I32)); // out_ptr
+        .push(AbiParam::new(cranelift_codegen::ir::types::I32));
     sig.params
-        .push(AbiParam::new(cranelift_codegen::ir::types::I32)); // out_cap
+        .push(AbiParam::new(cranelift_codegen::ir::types::I32));
     sig.params
-        .push(AbiParam::new(cranelift_codegen::ir::types::I64)); // caps
+        .push(AbiParam::new(cranelift_codegen::ir::types::I64));
     sig.returns
         .push(AbiParam::new(cranelift_codegen::ir::types::I32));
 
@@ -607,21 +627,10 @@ pub fn emit_entry_stub_object() -> Result<Vec<u8>, CraneliftError> {
         .define_function(func_id, &mut ctx)
         .map_err(|e| CraneliftError::ModuleDefine(format!("define relon_main_entry: {e}")))?;
 
-    // Also export `__relon_capability_vtable` as a writable zero-init
-    // data slot so the loader has a symbol to dlsym before the host
-    // populates it. Same idea as the design doc §2.3 vtable; for v5-γ
-    // we just reserve space — the host-side wiring lands when the
-    // codegen.rs refactor routes calls through the vtable.
-    let mut data_desc = cranelift_module::DataDescription::new();
-    // Reserve 32 pointer-sized slots — enough headroom for the four
-    // current helpers (`relon_now`, `relon_raise_trap`,
-    // `relon_cap_lookup`, plus a future closure-table base) and the
-    // capability dispatcher entries below.
-    let slot_count = 32usize;
-    let slot_bytes = slot_count * std::mem::size_of::<usize>();
-    data_desc.define_zeroinit(slot_bytes);
+    let mut data_desc = DataDescription::new();
+    data_desc.define_zeroinit(crate::vtable::VTABLE_BYTES);
     let data_id = module
-        .declare_data("__relon_capability_vtable", Linkage::Export, true, false)
+        .declare_data(crate::vtable::VTABLE_SYMBOL, Linkage::Export, true, false)
         .map_err(|e| CraneliftError::ModuleDefine(format!("declare vtable: {e}")))?;
     module
         .define_data(data_id, &data_desc)

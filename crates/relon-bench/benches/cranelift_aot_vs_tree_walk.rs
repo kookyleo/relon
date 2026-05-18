@@ -173,12 +173,11 @@ fn bench_arithmetic(c: &mut Criterion) {
 /// a tempfile cache once, then each iter calls
 /// `from_cache_dir(src, cache_dir)` and measures wall-clock.
 ///
-/// Until the dlopen execution path activates (vtable-indirection
-/// refactor in a follow-up phase) the reported number stays in
-/// the same ballpark as `cranelift_cold` because `from_cache_dir`
-/// currently delegates to `from_source` after validating the cache
-/// pair. Once the dlopen-exec switch lands the bench retains the
-/// same shape and the number should drop to ~10-15 us.
+/// v5-γ stage 2 activated the dlopen-exec switch (vtable
+/// indirection): `from_cache_dir` now memfd+dlopens the cached
+/// ET_DYN and resolves entry / vtable / closure symbols via
+/// dlsym, skipping JIT compilation entirely. Strict-mode target is
+/// ≤ 15 µs.
 fn bench_cached_cold_start(c: &mut Criterion) {
     let mut group = c.benchmark_group("v5_gamma_cached_cold_start");
     group.sample_size(50);
@@ -199,8 +198,8 @@ fn bench_cached_cold_start(c: &mut Criterion) {
             let opt = CraneliftAotEvaluator::from_cache_dir(src, cache_root.path())
                 .expect("from_cache_dir");
             // Force evaluator materialisation so the bench measures
-            // load + verify + (currently) re-JIT, not just the
-            // option-discrimination cost.
+            // dlopen + dlsym + vtable populate, not just the option-
+            // discrimination cost.
             black_box(opt);
         });
     });
@@ -208,5 +207,38 @@ fn bench_cached_cold_start(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_arithmetic, bench_cached_cold_start);
+/// v5-γ stage 2: cached cold-start path *plus* first invocation.
+/// Mirrors a real cold-launch workload where the host instantiates
+/// the evaluator once and runs `#main` once before disposing of it.
+fn bench_cached_cold_start_full(c: &mut Criterion) {
+    let mut group = c.benchmark_group("v5_gamma_cached_cold_start_full");
+    group.sample_size(50);
+    group.measurement_time(Duration::from_secs(5));
+
+    let cache_root = tempfile::tempdir().expect("tempdir for cache");
+    let src = tree_walk_src();
+
+    let warm =
+        CraneliftAotEvaluator::from_source_with_cache(src, cache_root.path()).expect("pre-warm");
+    drop(warm);
+
+    group.bench_function(BenchmarkId::new("cranelift_cached", "cold_full"), |b| {
+        b.iter(|| {
+            let opt = CraneliftAotEvaluator::from_cache_dir(src, cache_root.path())
+                .expect("from_cache_dir");
+            let ev = opt.expect("cache hit");
+            let out = ev.run_main(args_with(3, 4)).expect("run_main");
+            black_box(out);
+        });
+    });
+
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_arithmetic,
+    bench_cached_cold_start,
+    bench_cached_cold_start_full
+);
 criterion_main!(benches);

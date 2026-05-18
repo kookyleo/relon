@@ -72,12 +72,38 @@ struct BufferSchema {
     return_layout: OffsetTable,
 }
 
-/// AOT evaluator backed by a cranelift JIT module.
+/// Backing storage that keeps the entry's machine code mapped for the
+/// evaluator's lifetime. v5-γ stage 2 unifies the in-process JIT path
+/// with the dlopen'd ET_DYN path under a single enum so the rest of
+/// the runtime stays backend-agnostic.
+#[allow(dead_code, clippy::large_enum_variant)] // each variant owns
+                                                // a resource kept alive purely for `Drop`; the runtime never reads
+                                                // the payload. `Box<JITModule>` would lose the JIT path's stable
+                                                // data pointer for `get_finalized_data`, which we rely on for the
+                                                // vtable populate step.
+enum EntryBacking {
+    /// Live JIT module the codegen pass finalized. We never tear this
+    /// down at run time; one module per evaluator is enough.
+    Jit(JITModule),
+    /// `relon-object-cache` loader handle holding the dlopen'd ET_DYN
+    /// mmap'd and `dlsym`-resolved. Dropping this releases the
+    /// `dlclose` + memfd cleanup.
+    Dlopen(relon_object_cache::LoadedObject),
+}
+
+// SAFETY: both variants are `Send + Sync` in their own crates. The
+// enum carries no shared mutable state of its own.
+unsafe impl Send for EntryBacking {}
+unsafe impl Sync for EntryBacking {}
+
+/// AOT evaluator backed by a cranelift JIT module or a dlopen'd
+/// cached object (v5-γ stage 2).
 pub struct CraneliftAotEvaluator {
-    /// JIT module kept alive so the entry's machine code stays mapped.
-    /// We never tear this down at run time; one module per evaluator
-    /// is enough for v5-beta-1.
-    _module: JITModule,
+    /// Backing storage for the entry's machine code (JIT module or
+    /// dlopen'd cache object). Kept alive for the evaluator's
+    /// lifetime so the function pointers in `entry_fn` /
+    /// `closure_table` stay valid.
+    _module: EntryBacking,
     /// Raw function pointer to the JIT'd `run_main`. The exact shape
     /// is tracked in [`EntryPtr`].
     entry_fn: EntryPtr,
@@ -204,11 +230,18 @@ impl CraneliftAotEvaluator {
         // 2. Persist the cache pair in parallel. We do this *before*
         // building the evaluator so a corrupt-IR panic in the
         // codegen path doesn't leave a stale cache file behind from
-        // a stray previous run.
+        // a stray previous run. The schema cache feeds the dlopen-
+        // exec fast-restore path so `from_cache_dir` can skip parse
+        // + analyze + lower entirely.
         let source_hash = cache_int::compute_source_hash(source, &sandbox_cfg);
+        let return_root_size = buffer_schema.return_layout.root_size as u32;
         Self::write_cache_pair_best_effort(
             source,
             &ir_module,
+            &main_schema,
+            &return_schema,
+            &param_names,
+            return_root_size,
             &sandbox_cfg,
             source_hash,
             cache_dir,
@@ -252,36 +285,226 @@ impl CraneliftAotEvaluator {
                 target: "relon::object_cache",
                 "ir-cache sandbox config drift; invalidating pair"
             );
-            let _ = std::fs::remove_file(cache_int::ir_cache_path_for(cache_dir, source_hash));
-            let _ = std::fs::remove_file(relon_object_cache::storage::cache_path_for(
-                cache_dir,
-                source_hash,
-            ));
+            Self::invalidate_cache_triple(cache_dir, source_hash);
             return Ok(None);
         }
 
-        // The object-cache bytes round-trip exercises HMAC +
-        // integrity; we keep them alive so a future dlopen-exec
-        // wiring change has the bytes ready in memory.
-        tracing::debug!(
-            target: "relon::object_cache",
-            "cache validated: {} object bytes available for dlopen-exec follow-up",
-            loaded.object_bytes.len()
-        );
+        // v5-γ stage 2: load the schema cache so the trampoline can
+        // skip parse + analyze + lower. Without it, the dlopen path
+        // would have to re-derive schemas from source on every cold
+        // start — blowing the 15 µs strict-mode budget.
+        let schema_path = crate::schema_cache::schema_cache_path_for(cache_dir, source_hash);
+        let schema_bytes = match std::fs::read(&schema_path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                tracing::debug!(
+                    target: "relon::object_cache",
+                    "schema cache miss at {}; falling back to source",
+                    schema_path.display()
+                );
+                Self::invalidate_cache_triple(cache_dir, source_hash);
+                return Ok(None);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "relon::object_cache",
+                    "schema cache read failed: {e}"
+                );
+                return Ok(None);
+            }
+        };
+        let schema_entry = match crate::schema_cache::deserialize(&schema_bytes) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(
+                    target: "relon::object_cache",
+                    "schema cache decode failed: {e}; invalidating triple"
+                );
+                Self::invalidate_cache_triple(cache_dir, source_hash);
+                return Ok(None);
+            }
+        };
 
-        // Re-drive parse + analyze + lower because the IR-cache
-        // shape is too narrow for the buffer-protocol module the
-        // production pipeline now emits (v5-β-2 stage 2 widened the
-        // IR surface past what `crate::cache::serialize` covers).
-        // Restoring straight from the IR-cache trips a stack-machine
-        // underflow because the partial serde representation drops
-        // ops it doesn't recognise. Until the IR-cache grows full
-        // serde coverage (a relon-ir-wide change), the fast-restore
-        // path stays gated; this branch still demonstrates the
-        // cache files are well-formed end-to-end.
-        let _arity = ir_param_count(&loaded.ir_entry.ir)?;
-        let fresh = Self::from_source(source)?;
-        Ok(Some(fresh))
+        // Build the dlopen + dlsym symbol set. We resolve `run_main`
+        // + the capability vtable + every closure-table symbol up
+        // front so the trampoline can dispatch without a second
+        // dlsym round-trip.
+        let mut symbols: Vec<String> = Vec::with_capacity(2 + schema_entry.closure_count as usize);
+        symbols.push("run_main".to_string());
+        symbols.push(crate::vtable::VTABLE_SYMBOL.to_string());
+        for i in 0..schema_entry.closure_count {
+            symbols.push(format!("__closure_{i}"));
+        }
+        let sym_refs: Vec<&str> = symbols.iter().map(|s| s.as_str()).collect();
+        let loaded_object = match relon_object_cache::LoadedObject::from_bytes(
+            &loaded.object_bytes,
+            cache_int::host_target_triple(),
+            &sym_refs,
+        ) {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::warn!(
+                    target: "relon::object_cache",
+                    "dlopen of cached object failed: {e}; falling back to source"
+                );
+                Self::invalidate_cache_triple(cache_dir, source_hash);
+                return Ok(None);
+            }
+        };
+
+        // Resolve the entry + vtable + closure symbol addresses.
+        let entry_ptr = match loaded_object.resolve("run_main") {
+            Some(p) if !p.is_null() => p,
+            _ => {
+                tracing::warn!(
+                    target: "relon::object_cache",
+                    "cached object missing `run_main` symbol; invalidating"
+                );
+                Self::invalidate_cache_triple(cache_dir, source_hash);
+                return Ok(None);
+            }
+        };
+        let vtable_ptr = match loaded_object.resolve(crate::vtable::VTABLE_SYMBOL) {
+            Some(p) if !p.is_null() => p,
+            _ => {
+                tracing::warn!(
+                    target: "relon::object_cache",
+                    "cached object missing `{}` symbol; invalidating",
+                    crate::vtable::VTABLE_SYMBOL
+                );
+                Self::invalidate_cache_triple(cache_dir, source_hash);
+                return Ok(None);
+            }
+        };
+
+        // v5-γ stage 2: populate the dlopen'd vtable so the
+        // host helper pointers are valid before the first call.
+        unsafe {
+            crate::vtable::populate_vtable(vtable_ptr as *mut u8);
+        }
+
+        // Resolve closure-table symbols. The order must match the
+        // codegen's deterministic `__closure_<N>` naming so the
+        // sandbox state's `closure_table_base` indexes line up.
+        let mut closure_table: Vec<usize> = Vec::with_capacity(schema_entry.closure_count as usize);
+        for i in 0..schema_entry.closure_count {
+            let name = format!("__closure_{i}");
+            match loaded_object.resolve(&name) {
+                Some(p) => closure_table.push(p as usize),
+                None => {
+                    tracing::warn!(
+                        target: "relon::object_cache",
+                        "cached object missing closure symbol `{}`; invalidating",
+                        name
+                    );
+                    Self::invalidate_cache_triple(cache_dir, source_hash);
+                    return Ok(None);
+                }
+            }
+        }
+
+        let evaluator =
+            Self::from_loaded_object(loaded_object, entry_ptr, schema_entry, closure_table)?;
+        Ok(Some(evaluator))
+    }
+
+    /// Drop all three cache files (object + IR + schema). Used when
+    /// any single file fails integrity / decode so the next cold
+    /// start re-emits a consistent triple.
+    fn invalidate_cache_triple(cache_dir: &Path, source_hash: [u8; 32]) {
+        let _ = std::fs::remove_file(cache_int::ir_cache_path_for(cache_dir, source_hash));
+        let _ = std::fs::remove_file(crate::schema_cache::schema_cache_path_for(
+            cache_dir,
+            source_hash,
+        ));
+        let _ = std::fs::remove_file(relon_object_cache::storage::cache_path_for(
+            cache_dir,
+            source_hash,
+        ));
+    }
+
+    /// v5-γ stage 2: build a `CraneliftAotEvaluator` whose entry
+    /// function lives inside a dlopen'd ET_DYN (rather than a live
+    /// JIT module). The caller has already resolved the entry +
+    /// vtable + closure-table addresses via `dlsym`; we just wire
+    /// them into the runtime structures.
+    fn from_loaded_object(
+        loaded: relon_object_cache::LoadedObject,
+        entry_ptr: *const u8,
+        schema_entry: crate::schema_cache::SchemaCacheEntry,
+        closure_table_vec: Vec<usize>,
+    ) -> Result<Self, CraneliftError> {
+        let entry_shape = match schema_entry.entry_shape {
+            crate::schema_cache::SerEntryShape::LegacyI64Args => EntryShape::LegacyI64Args,
+            crate::schema_cache::SerEntryShape::BufferProtocol => EntryShape::BufferProtocol,
+        };
+        // SAFETY: the function pointer comes from dlsym on a freshly
+        // dlopen'd ET_DYN and remains valid for the lifetime of
+        // `loaded`, which we move into the evaluator below.
+        let entry_fn = match entry_shape {
+            EntryShape::LegacyI64Args => EntryPtr::Legacy(unsafe {
+                std::mem::transmute::<*const u8, LegacyEntryFn>(entry_ptr)
+            }),
+            EntryShape::BufferProtocol => EntryPtr::Buffer(unsafe {
+                std::mem::transmute::<*const u8, BufferEntryFn>(entry_ptr)
+            }),
+        };
+
+        // Build buffer schema metadata when the dlopen'd entry uses
+        // the buffer-protocol shape (the default for any source that
+        // came through `from_source_with_cache`). Layouts are
+        // recomputed from the cached schemas — cheap because schema
+        // sizes are bounded.
+        let buffer_schema = match entry_shape {
+            EntryShape::BufferProtocol => {
+                let main_layout = SchemaLayout::offsets_for(&schema_entry.main_schema)
+                    .map_err(|e| CraneliftError::Lowering(format!("main layout: {e}")))?;
+                let return_layout = SchemaLayout::offsets_for(&schema_entry.return_schema)
+                    .map_err(|e| CraneliftError::Lowering(format!("return layout: {e}")))?;
+                Some(BufferSchema {
+                    main_schema: schema_entry.main_schema.clone(),
+                    return_schema: schema_entry.return_schema.clone(),
+                    main_layout,
+                    return_layout,
+                })
+            }
+            EntryShape::LegacyI64Args => None,
+        };
+
+        let entry_range: TokenRange = schema_entry.entry_range.into();
+        let closure_table: Box<[usize]> = closure_table_vec.into_boxed_slice();
+
+        let capabilities = Arc::new(CapabilityVtable::with_capacity(64));
+        let sandbox_state = Arc::new(SandboxState::new(capabilities));
+        sandbox_state.entry_range.set(entry_range);
+        // SAFETY: closure_table is Box-allocated and lives on the
+        // evaluator; the raw pointer stays valid for the evaluator's
+        // lifetime.
+        unsafe {
+            let base = if closure_table.is_empty() {
+                0
+            } else {
+                closure_table.as_ptr() as usize
+            };
+            sandbox_state.install_closure_table(base);
+        }
+
+        let arity = buffer_schema
+            .as_ref()
+            .map(|bs| bs.main_schema.fields.len())
+            .unwrap_or(schema_entry.entry_arity as usize);
+
+        Ok(Self {
+            _module: EntryBacking::Dlopen(loaded),
+            entry_fn,
+            entry_arity: arity,
+            param_names: schema_entry.param_names,
+            entry_range,
+            sandbox_state,
+            buffer_schema,
+            const_data: schema_entry.const_data,
+            closure_table,
+        })
     }
 
     /// Compute the expected metadata fingerprint for a (source,
@@ -310,12 +533,22 @@ impl CraneliftAotEvaluator {
         cache_int::build_metadata(sandbox, /*cap_bitmap=*/ 0, sig, Vec::new())
     }
 
-    /// Persist the (object-cache + IR-cache) pair for a successful
-    /// source build. All failures are swallowed at the
+    /// Persist the (object-cache, IR-cache, schema-cache) triple for
+    /// a successful source build. All failures are swallowed at the
     /// `object_cache_integration` layer — caller does not propagate.
+    ///
+    /// The schema cache lets `from_cache_dir` skip parse, analyze,
+    /// and lower on the next cold start: it round-trips the main and
+    /// return schemas plus the entry shape and the closure count so
+    /// the dlopen path can wire the trampoline directly.
+    #[allow(clippy::too_many_arguments)]
     fn write_cache_pair_best_effort(
         source: &str,
         ir_module: &relon_ir::ir::Module,
+        main_schema: &Schema,
+        return_schema: &Schema,
+        param_names: &[String],
+        return_root_size: u32,
         sandbox: &SandboxConfig,
         source_hash: [u8; 32],
         cache_dir: &Path,
@@ -338,23 +571,66 @@ impl CraneliftAotEvaluator {
         };
 
         // 2. Emit ET_REL bytes via cranelift-object for the dlopen-
-        // load half. Failure here skips just the object cache; the
-        // IR cache still goes through so the fast-restore path
-        // remains useful on next cold start.
+        // load half. v5-γ stage 2 lowers the **full** module (not the
+        // stage 1 stub) so the dlopen path can execute real compiled
+        // code. Failure here skips just the object cache; the IR
+        // cache still goes through so the fast-restore path remains
+        // useful on next cold start.
         let metadata = Self::expected_metadata_for_source(source, sandbox);
-        let et_rel_bytes = match cache_int::emit_entry_stub_object() {
+        let artifact =
+            match cache_int::emit_module_object_bytes(ir_module, sandbox, return_root_size) {
+                Ok(a) => a,
+                Err(e) => {
+                    tracing::warn!(
+                        target: "relon::object_cache",
+                        "cranelift-object emit failed: {e}; skipping object cache"
+                    );
+                    Self::write_ir_only(cache_dir, source_hash, &ir_bytes);
+                    return;
+                }
+            };
+
+        // 3. Persist the schema cache so `from_cache_dir` can rebuild
+        // the trampoline without re-parsing.
+        let schema_entry = crate::schema_cache::SchemaCacheEntry {
+            main_schema: main_schema.clone(),
+            return_schema: return_schema.clone(),
+            param_names: param_names.to_vec(),
+            const_data: artifact.const_data.clone(),
+            closure_count: artifact.closure_symbols.len() as u32,
+            entry_shape: match artifact.entry_shape {
+                crate::codegen::EntryShape::LegacyI64Args => {
+                    crate::schema_cache::SerEntryShape::LegacyI64Args
+                }
+                crate::codegen::EntryShape::BufferProtocol => {
+                    crate::schema_cache::SerEntryShape::BufferProtocol
+                }
+            },
+            entry_arity: artifact.entry_arity as u32,
+            entry_range: artifact.entry_range.into(),
+        };
+        let schema_bytes = match crate::schema_cache::serialize(&schema_entry) {
             Ok(b) => b,
             Err(e) => {
                 tracing::warn!(
                     target: "relon::object_cache",
-                    "cranelift-object emit failed: {e}; skipping object cache"
+                    "schema cache serialise failed: {e}; skipping schema cache write"
                 );
-                // Still write the IR-cache half via the integration
-                // helper which writes both files — pass an empty
-                // ET_REL stand-in that the layer will short-circuit
-                // on (no linker invocation, just IR write). We do
-                // that by writing the IR file directly here instead.
-                Self::write_ir_only(cache_dir, source_hash, &ir_bytes);
+                // Still try to persist object + ir for forward
+                // compatibility; without schema cache, from_cache_dir
+                // will fall back to from_source.
+                if let Err(e) = cache_int::try_store_to_cache(
+                    cache_dir,
+                    source_hash,
+                    &artifact.et_rel_bytes,
+                    &metadata,
+                    &ir_bytes,
+                ) {
+                    tracing::warn!(
+                        target: "relon::object_cache",
+                        "cache write returned unexpected error: {e}"
+                    );
+                }
                 return;
             }
         };
@@ -362,13 +638,55 @@ impl CraneliftAotEvaluator {
         if let Err(e) = cache_int::try_store_to_cache(
             cache_dir,
             source_hash,
-            &et_rel_bytes,
+            &artifact.et_rel_bytes,
             &metadata,
             &ir_bytes,
         ) {
             tracing::warn!(
                 target: "relon::object_cache",
                 "cache write returned unexpected error: {e}"
+            );
+            return;
+        }
+
+        // Schema cache write is best-effort, but its absence forces a
+        // fallback so we surface failures at `info`.
+        let schema_path = crate::schema_cache::schema_cache_path_for(cache_dir, source_hash);
+        if let Err(e) = std::fs::create_dir_all(cache_dir) {
+            tracing::warn!(
+                target: "relon::object_cache",
+                "schema cache create_dir_all failed: {e}"
+            );
+            return;
+        }
+        let tmp = schema_path.with_extension(format!(
+            "tmp.{}.{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(0)
+        ));
+        if let Err(e) = std::fs::write(&tmp, &schema_bytes) {
+            tracing::warn!(
+                target: "relon::object_cache",
+                "schema cache tmp write failed: {e}"
+            );
+            let _ = std::fs::remove_file(&tmp);
+            return;
+        }
+        if let Err(e) = std::fs::rename(&tmp, &schema_path) {
+            tracing::warn!(
+                target: "relon::object_cache",
+                "schema cache rename failed: {e}"
+            );
+            let _ = std::fs::remove_file(&tmp);
+        } else {
+            tracing::debug!(
+                target: "relon::object_cache",
+                "schema cache wrote {} bytes to {}",
+                schema_bytes.len(),
+                schema_path.display()
             );
         }
     }
@@ -469,7 +787,24 @@ impl CraneliftAotEvaluator {
             entry_shape,
             const_data,
             closure_func_ids,
+            vtable_data_id,
         } = compiled;
+
+        // v5-γ stage 2: populate the JIT-resolved capability vtable.
+        // `JITModule::get_finalized_data` returns the live pointer +
+        // length the codegen reserved via `declare_vtable_data`; we
+        // write the host helper fn pointers into the slots before any
+        // entry call runs so the emitted `call_indirect`s land on
+        // valid targets.
+        unsafe {
+            let (ptr, len) = module.get_finalized_data(vtable_data_id);
+            debug_assert!(
+                len >= crate::vtable::VTABLE_BYTES,
+                "JIT vtable data section is too small: {len} < {}",
+                crate::vtable::VTABLE_BYTES
+            );
+            crate::vtable::populate_vtable(ptr as *mut u8);
+        }
 
         // Cross-check: buffer schema metadata must agree with the IR
         // shape the codegen picked. A mismatch here is a programming
@@ -545,7 +880,7 @@ impl CraneliftAotEvaluator {
             .unwrap_or(entry_arity);
 
         Ok(Self {
-            _module: module,
+            _module: EntryBacking::Jit(module),
             entry_fn,
             entry_arity: arity,
             param_names,
