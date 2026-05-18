@@ -32,6 +32,7 @@ pub mod buffer;
 pub mod counter;
 pub mod effect;
 pub mod guard;
+pub mod inline_cache;
 pub mod optimizer;
 pub mod trace_ir;
 
@@ -39,6 +40,7 @@ pub use buffer::{OptimizedTrace, SerializableSideTables, TraceBuffer};
 pub use counter::{HotCounter, RecordResult, COUNTER_SATURATED};
 pub use effect::EffectClass;
 pub use guard::{DeoptState, GuardSite, RecoverableWrite};
+pub use inline_cache::{CacheResult, InlineCache};
 pub use optimizer::{
     const_fold::ConstFold, dead_store::DeadStoreElim, licm::LICM, load_forward::LoadForwarding,
     type_spec::TypeSpec, OptimizerPass, OptimizerPipeline, PassReport,
