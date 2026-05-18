@@ -1405,6 +1405,20 @@ mod tests {
     }
 
     #[test]
+    fn import_with_sha256_integrity_idempotent() {
+        // v3++ b-2: integrity pin `<algo>:"<hex>"` survives a format
+        // pass intact and stays on one line with the rest of the
+        // import directive. The formatter normalises the colon to
+        // `<ident>: "<hex>"` (with a space), so the round-trip
+        // converges to the spaced form after one pass.
+        let canonical = "#import lib from \"./lib.relon\" sha256: \"abc\"\n\n{\n    x: 1\n}\n";
+        let formatted = format_source(canonical).unwrap();
+        assert_eq!(formatted, canonical);
+        // Second pass: idempotent.
+        assert_eq!(format_source(&formatted).unwrap(), canonical);
+    }
+
+    #[test]
     fn preset_demo_idempotent() {
         assert_preset(presets::DEMO);
     }

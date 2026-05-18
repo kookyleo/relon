@@ -854,10 +854,19 @@ fn translate_directive_offsets(dir: &mut crate::Directive, base_offset: usize, s
                 }
             }
         }
-        crate::DirectiveBody::Import { path_range, .. } => {
+        crate::DirectiveBody::Import {
+            path_range,
+            integrity,
+            ..
+        } => {
             let ps = path_range.start.offset + base_offset;
             let pe = path_range.end.offset + base_offset;
             *path_range = range_from_offsets(source, ps, pe);
+            if let Some(int) = integrity.as_mut() {
+                let s = int.range.start.offset + base_offset;
+                let e = int.range.end.offset + base_offset;
+                int.range = range_from_offsets(source, s, e);
+            }
         }
         crate::DirectiveBody::Main {
             params,
@@ -1069,11 +1078,13 @@ fn lower_directive_value_body(node: &SyntaxNode, source: &str) -> Option<crate::
     Some(crate::DirectiveBody::Value(Box::new(body_node)))
 }
 
-/// Walk the body of an `Import`-shape directive: spec + `from` + path.
+/// Walk the body of an `Import`-shape directive: spec + `from` + path
+/// + optional integrity pin `<algo>:"<hex>"`.
 fn lower_directive_import_body(node: &SyntaxNode, source: &str) -> Option<crate::DirectiveBody> {
     // Children we care about (in source order, after the `#import`
     // tokens): STAR / L_BRACE-block / IDENT (spec), then the `from`
-    // IDENT, then the path STRING token.
+    // IDENT, then the path STRING token, then optionally
+    // `<algo>:"<hex>"` integrity pin.
     let mut after_hash_name = false; // have we passed the `#import` name?
     let mut spec: Option<crate::DirectiveImportSpec> = None;
     let mut path_string: Option<(String, TokenRange)> = None;
@@ -1081,6 +1092,15 @@ fn lower_directive_import_body(node: &SyntaxNode, source: &str) -> Option<crate:
     let mut destructure_entries: Vec<(String, Option<String>)> = Vec::new();
     let mut pending_name: Option<String> = None;
     let mut expect_as_alias = false;
+
+    // Integrity-pin tracking. The pin's source form is `<ident>:"<hex>"`
+    // and may follow the path STRING. We walk through the three pieces
+    // (`integrity_algo` IDENT → `:` COLON → STRING) keeping a small
+    // state machine so the cluttered overall traversal does not need
+    // to grow a second pass.
+    let mut integrity_algo: Option<(String, usize)> = None; // (text, start offset)
+    let mut integrity_saw_colon = false;
+    let mut integrity: Option<crate::IntegrityHash> = None;
 
     for el in node.children_with_tokens() {
         match el {
@@ -1121,6 +1141,13 @@ fn lower_directive_import_body(node: &SyntaxNode, source: &str) -> Option<crate:
                             // After `from` we expect the path STRING.
                             continue;
                         }
+                        // After the path STRING the only well-formed
+                        // IDENT is the integrity-pin algorithm name.
+                        if path_string.is_some() && integrity_algo.is_none() {
+                            let start: usize = t.text_range().start().into();
+                            integrity_algo = Some((text.to_string(), start));
+                            continue;
+                        }
                         // Alias-shape spec: the bare IDENT is the alias.
                         if spec.is_none() {
                             spec = Some(crate::DirectiveImportSpec::Alias(text.to_string()));
@@ -1152,13 +1179,35 @@ fn lower_directive_import_body(node: &SyntaxNode, source: &str) -> Option<crate:
                             }
                         }
                     }
+                    SyntaxKind::COLON => {
+                        if integrity_algo.is_some() && !integrity_saw_colon {
+                            integrity_saw_colon = true;
+                        }
+                    }
                     SyntaxKind::STRING => {
                         let tr = t.text_range();
                         let s: usize = tr.start().into();
                         let e: usize = tr.end().into();
                         let raw = source.get(s..e)?;
                         let decoded = parse_string_text(raw)?;
-                        path_string = Some((decoded, range_from_offsets(source, s, e)));
+                        if path_string.is_none() {
+                            path_string = Some((decoded, range_from_offsets(source, s, e)));
+                        } else if integrity_algo.is_some() && integrity_saw_colon {
+                            // Found the hex STRING that completes the
+                            // integrity pin. Defer algorithm validation
+                            // to the analyzer so the diagnostic carries
+                            // a real span; here we only stash what the
+                            // source provided.
+                            let (algo_text, algo_start) = integrity_algo.take().unwrap();
+                            let algo = crate::HashAlgorithm::from_ident(&algo_text);
+                            integrity = Some(crate::IntegrityHash {
+                                algorithm: algo,
+                                algorithm_text: algo_text,
+                                hex: decoded,
+                                range: range_from_offsets(source, algo_start, e),
+                            });
+                            integrity_saw_colon = false;
+                        }
                     }
                     _ => continue,
                 }
@@ -1173,6 +1222,7 @@ fn lower_directive_import_body(node: &SyntaxNode, source: &str) -> Option<crate:
         spec,
         path,
         path_range,
+        integrity,
     })
 }
 
@@ -3855,6 +3905,77 @@ mod tests {
         let node = lower_document(&parse, src).expect("schema-colon shape lowers cleanly");
         assert!(matches!(*node.expr, Expr::Dict(_)));
         assert!(!parse.has_errors(), "no CST errors: {:?}", parse.errors);
+    }
+
+    #[test]
+    fn parse_import_with_sha256_integrity() {
+        let src = "#import lib from \"./lib.relon\" sha256:\"abcd1234\"\n{ x: 1 }";
+        let node = parse_document(src).expect("parse #import with sha256");
+        let dir = node
+            .directives
+            .iter()
+            .find(|d| d.name == "import")
+            .expect("import directive present");
+        match &dir.body {
+            crate::DirectiveBody::Import {
+                path,
+                integrity: Some(int),
+                ..
+            } => {
+                assert_eq!(path, "./lib.relon");
+                assert_eq!(int.algorithm, Some(crate::HashAlgorithm::Sha256));
+                assert_eq!(int.algorithm_text, "sha256");
+                assert_eq!(int.hex, "abcd1234");
+                // Range must cover the algorithm IDENT through the hex
+                // STRING (inclusive of quotes), not the path string.
+                assert!(int.range.start.offset > 0);
+                assert!(int.range.end.offset > int.range.start.offset);
+            }
+            other => panic!("unexpected import body shape: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_import_without_hash_is_unpinned() {
+        let src = "#import lib from \"./lib.relon\"\n{ x: 1 }";
+        let node = parse_document(src).expect("parse plain #import");
+        let dir = node
+            .directives
+            .iter()
+            .find(|d| d.name == "import")
+            .expect("import directive present");
+        match &dir.body {
+            crate::DirectiveBody::Import { integrity, .. } => {
+                assert!(integrity.is_none(), "expected no integrity pin");
+            }
+            other => panic!("unexpected import body shape: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_import_integrity_keeps_unknown_algorithm_in_ast() {
+        // Unknown algorithms keep `algorithm = None` and preserve the
+        // verbatim identifier in `algorithm_text` so the analyzer (not
+        // the parser) can attach a span-aware diagnostic. What we
+        // exercise here is that the *parser* lowers the directive
+        // cleanly and the unknown name survives intact.
+        let src = "#import lib from \"./lib.relon\" sha512:\"deadbeef\"\n{ x: 1 }";
+        let node = parse_document(src).expect("parser accepts unknown algorithm");
+        let dir = node
+            .directives
+            .iter()
+            .find(|d| d.name == "import")
+            .expect("import directive present");
+        match &dir.body {
+            crate::DirectiveBody::Import {
+                integrity: Some(int),
+                ..
+            } => {
+                assert_eq!(int.algorithm, None);
+                assert_eq!(int.algorithm_text, "sha512");
+            }
+            other => panic!("expected integrity pin to be parsed, got {other:?}"),
+        }
     }
 
     #[test]

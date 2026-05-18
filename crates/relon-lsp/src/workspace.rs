@@ -285,7 +285,11 @@ fn attach_workspace_diag(
         }
         WorkspaceDiagnostic::ModuleNotFound { .. }
         | WorkspaceDiagnostic::ModuleParseError { .. }
-        | WorkspaceDiagnostic::CrossModuleSchemaCollision { .. } => {
+        | WorkspaceDiagnostic::CrossModuleSchemaCollision { .. }
+        | WorkspaceDiagnostic::ImportHashMismatch { .. }
+        | WorkspaceDiagnostic::ImportHashRequired { .. }
+        | WorkspaceDiagnostic::ImportHashUnknownAlgorithm { .. }
+        | WorkspaceDiagnostic::ImportHashInvalidHex { .. } => {
             // Find the module whose imports list owns this diagnostic's
             // range. Match by exact `(start, end)` byte equality —
             // every `WorkspaceDiagnostic` we currently emit was built
@@ -313,6 +317,18 @@ fn attach_workspace_diag(
                 WorkspaceDiagnostic::CrossModuleSchemaCollision { .. } => {
                     "relon::workspace::cross_module_schema_collision"
                 }
+                WorkspaceDiagnostic::ImportHashMismatch { .. } => {
+                    "relon::workspace::import_hash_mismatch"
+                }
+                WorkspaceDiagnostic::ImportHashRequired { .. } => {
+                    "relon::workspace::import_hash_required"
+                }
+                WorkspaceDiagnostic::ImportHashUnknownAlgorithm { .. } => {
+                    "relon::workspace::import_hash_unknown_algorithm"
+                }
+                WorkspaceDiagnostic::ImportHashInvalidHex { .. } => {
+                    "relon::workspace::import_hash_invalid_hex"
+                }
                 _ => unreachable!(),
             };
             out.entry(uri.clone()).or_default().push(LspDiagnostic {
@@ -339,6 +355,10 @@ fn primary_span(diag: &WorkspaceDiagnostic) -> (usize, usize) {
         WorkspaceDiagnostic::ModuleNotFound { range, .. } => *range,
         WorkspaceDiagnostic::ModuleParseError { range, .. } => *range,
         WorkspaceDiagnostic::CrossModuleSchemaCollision { range, .. } => *range,
+        WorkspaceDiagnostic::ImportHashMismatch { range, .. } => *range,
+        WorkspaceDiagnostic::ImportHashRequired { range, .. } => *range,
+        WorkspaceDiagnostic::ImportHashUnknownAlgorithm { range, .. } => *range,
+        WorkspaceDiagnostic::ImportHashInvalidHex { range, .. } => *range,
     };
     (span.offset(), span.offset() + span.len())
 }

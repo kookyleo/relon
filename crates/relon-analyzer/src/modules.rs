@@ -8,7 +8,7 @@
 
 use crate::directive_names::IMPORT;
 use crate::tree::AnalyzedTree;
-use relon_parser::{DirectiveBody, DirectiveImportSpec, Expr, Node, TokenRange};
+use relon_parser::{DirectiveBody, DirectiveImportSpec, Expr, IntegrityHash, Node, TokenRange};
 
 /// Information about a single `#import` site.
 #[derive(Debug, Clone)]
@@ -30,6 +30,12 @@ pub struct ModuleImport {
     pub destructure: Vec<(String, Option<String>)>,
     /// Source range of the `#import ...` directive.
     pub range: TokenRange,
+    /// Optional integrity pin parsed off the directive
+    /// (`sha256:"..."`). The workspace pass verifies the loaded
+    /// source against this digest before the module enters the
+    /// analyzed module table; `None` skips verification (which
+    /// preserves the v3+ a-3 behavior for unpinned imports).
+    pub integrity: Option<IntegrityHash>,
 }
 
 /// Walk the document for `#import` directives and record them. Nested
@@ -42,8 +48,15 @@ pub fn collect_imports(root: &Node, tree: &mut AnalyzedTree) {
 fn visit(node: &Node, tree: &mut AnalyzedTree) {
     for dir in &node.directives {
         if dir.name == IMPORT {
-            if let DirectiveBody::Import { spec, path, .. } = &dir.body {
-                tree.imports.push(lower_import(spec, path, dir.range));
+            if let DirectiveBody::Import {
+                spec,
+                path,
+                integrity,
+                ..
+            } = &dir.body
+            {
+                tree.imports
+                    .push(lower_import(spec, path, integrity.clone(), dir.range));
             }
         }
     }
@@ -62,7 +75,12 @@ fn visit(node: &Node, tree: &mut AnalyzedTree) {
     }
 }
 
-fn lower_import(spec: &DirectiveImportSpec, path: &str, range: TokenRange) -> ModuleImport {
+fn lower_import(
+    spec: &DirectiveImportSpec,
+    path: &str,
+    integrity: Option<IntegrityHash>,
+    range: TokenRange,
+) -> ModuleImport {
     let (alias, spread, destructure) = match spec {
         DirectiveImportSpec::Alias(name) => (Some(name.clone()), false, Vec::new()),
         DirectiveImportSpec::Spread => (None, true, Vec::new()),
@@ -77,6 +95,7 @@ fn lower_import(spec: &DirectiveImportSpec, path: &str, range: TokenRange) -> Mo
         spread,
         destructure,
         range,
+        integrity,
     }
 }
 

@@ -181,6 +181,80 @@ pub enum WorkspaceDiagnostic {
         #[label("conflict surfaces here")]
         range: SourceSpan,
     },
+
+    /// v3++ b-2: the loaded source for an `#import` whose directive
+    /// carries `<algo>:"<hex>"` did not match the pinned digest.
+    /// Surfaced before the module enters the workspace so a poisoned
+    /// upstream cannot reach analysis or evaluation.
+    #[error("import `{path}` hash mismatch: expected {expected}, got {got}")]
+    #[diagnostic(
+        code(relon::workspace::import_hash_mismatch),
+        help(
+            "The loaded module's digest differs from the pinned hash on the `#import` directive. Either update the pin to the new digest after auditing the change, or refuse to load the module."
+        )
+    )]
+    ImportHashMismatch {
+        path: String,
+        algorithm: String,
+        expected: String,
+        got: String,
+        #[label("pinned import does not match the loaded source")]
+        range: SourceSpan,
+    },
+
+    /// v3++ b-2: `--require-hash` (or the equivalent host-side knob)
+    /// was set and an `#import` was missing the integrity pin. Emitted
+    /// for every unpinned import so the operator sees the full list
+    /// in one analyzer pass rather than one error per re-run.
+    #[error("import `{path}` is missing a required integrity hash")]
+    #[diagnostic(
+        code(relon::workspace::import_hash_required),
+        help(
+            "`--require-hash` enforces pinned `#import`s. Add an inline pin like `#import x from \"...\" sha256:\"<hex>\"`, or rerun without `--require-hash` for an unpinned environment."
+        )
+    )]
+    ImportHashRequired {
+        path: String,
+        #[label("missing integrity pin")]
+        range: SourceSpan,
+    },
+
+    /// v3++ b-2: the directive carried an integrity pin but the
+    /// algorithm identifier was not one the analyzer knows about.
+    /// Distinct from `ImportHashMismatch` so the operator can tell
+    /// "typo / unsupported algo" from "content drift".
+    #[error("import `{path}` uses unknown integrity algorithm `{algorithm}`")]
+    #[diagnostic(
+        code(relon::workspace::import_hash_unknown_algorithm),
+        help(
+            "Supported algorithms: sha256. Future versions may add sha512 / blake3; until then, replace the pin with `sha256:\"<hex>\"`."
+        )
+    )]
+    ImportHashUnknownAlgorithm {
+        path: String,
+        algorithm: String,
+        #[label("unknown integrity algorithm")]
+        range: SourceSpan,
+    },
+
+    /// v3++ b-2: the integrity hex string did not match the expected
+    /// length for the declared algorithm (e.g. `sha256:"abc"`). Caught
+    /// up front so the loader never compares against a partial digest.
+    #[error("import `{path}` integrity hex length is {got}, expected {expected} for {algorithm}")]
+    #[diagnostic(
+        code(relon::workspace::import_hash_invalid_hex),
+        help(
+            "Integrity hex must be exactly the algorithm's digest length (sha256 = 64 hex chars). Re-generate the pin from the actual file digest."
+        )
+    )]
+    ImportHashInvalidHex {
+        path: String,
+        algorithm: String,
+        expected: usize,
+        got: usize,
+        #[label("malformed integrity hex")]
+        range: SourceSpan,
+    },
 }
 
 impl WorkspaceDiagnostic {

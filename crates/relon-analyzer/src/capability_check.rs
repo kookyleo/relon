@@ -242,6 +242,7 @@ mod tests {
             host_fn_gates: gates,
             caps,
             strict_mode: false,
+            ..AnalyzeOptions::default()
         }
     }
 
@@ -373,6 +374,7 @@ mod tests {
             host_fn_gates: HashMap::new(),
             caps: Capabilities::default(),
             strict_mode: false,
+            ..AnalyzeOptions::default()
         };
         let mut loader = MapLoader::new();
         let ws = build_with_options(

@@ -4277,6 +4277,7 @@ mod tests {
             host_fn_gates: HashMap::new(),
             caps: crate::Capabilities::default(),
             strict_mode: true,
+            ..crate::AnalyzeOptions::default()
         };
         let tree = crate::analyze_with_options(&node, &opts);
         let n = count(
@@ -4299,6 +4300,7 @@ mod tests {
             host_fn_gates: HashMap::new(),
             caps: crate::Capabilities::default(),
             strict_mode: false,
+            ..crate::AnalyzeOptions::default()
         };
         let tree = crate::analyze_with_options(&node, &opts);
         let n = count(&tree, |d| {
@@ -4342,6 +4344,7 @@ mod tests {
             host_fn_gates: HashMap::new(),
             caps: crate::Capabilities::default(),
             strict_mode: false,
+            ..crate::AnalyzeOptions::default()
         };
         let tree = crate::analyze_with_options(&node, &opts);
         let n = count(&tree, |d| {
@@ -4376,6 +4379,7 @@ mod tests {
             host_fn_gates: HashMap::new(),
             caps: crate::Capabilities::default(),
             strict_mode: false,
+            ..crate::AnalyzeOptions::default()
         };
         let tree = crate::analyze_with_options(&node, &opts);
         let n = count(&tree, |d| {
@@ -4415,6 +4419,7 @@ mod tests {
             host_fn_gates: HashMap::new(),
             caps: crate::Capabilities::default(),
             strict_mode: false,
+            ..crate::AnalyzeOptions::default()
         };
         let tree = crate::analyze_with_options(&node, &opts);
         let n = count(&tree, |d| {
@@ -4454,6 +4459,7 @@ mod tests {
             host_fn_gates: HashMap::new(),
             caps: crate::Capabilities::default(),
             strict_mode: false,
+            ..crate::AnalyzeOptions::default()
         };
         let tree = crate::analyze_with_options(&node, &opts);
         let n = count(&tree, |d| {
@@ -4487,6 +4493,7 @@ mod tests {
             host_fn_gates: HashMap::new(),
             caps: crate::Capabilities::default(),
             strict_mode: false,
+            ..crate::AnalyzeOptions::default()
         };
         let tree = crate::analyze_with_options(&node, &opts);
         let n = count(&tree, |d| {
@@ -4525,6 +4532,7 @@ mod tests {
             host_fn_gates: HashMap::new(),
             caps: crate::Capabilities::default(),
             strict_mode: false,
+            ..crate::AnalyzeOptions::default()
         };
         let tree = crate::analyze_with_options(&node, &opts);
         let n = count(&tree, |d| {
