@@ -1,4 +1,4 @@
-//! `__relon_trace_save_deopt` + [`DeoptStateSnapshot`].
+//! `__relon_trace_save_deopt` + `DeoptStateSnapshot` runtime helpers.
 //!
 //! On a guard failure the cranelift-emitted trace tail calls
 //! `__relon_trace_save_deopt(ctx, guard_pc, external_pc)` and then
@@ -7,203 +7,92 @@
 //! here) and applies it to the generic-backend's stack frame before
 //! resuming execution at `external_pc`.
 //!
-//! ## Field semantics
+//! ## Shared ABI
 //!
-//! - `guard_pc` — `trace_pc` of the guard that fired. The host uses
-//!   it to find the matching [`GuardSite`](crate::GuardSite) in the
-//!   trace's side tables and discover the `ssa_to_external_slot`
-//!   mapping needed by [`DeoptStateSnapshot::apply`].
-//! - `external_pc` — the `*const u8` instruction pointer (cast to
-//!   `u64` for FFI portability) the generic backend must resume at.
-//! - `ssa_slots_copy` — a *snapshot* of `ctx.ssa_slots` taken at the
-//!   instant the guard fired. Cloned (not aliased) so the dispatcher
-//!   can free or reuse the original `ctx.ssa_slots` Box without
-//!   invalidating the deopt info.
-//! - `recoverable_writes` — drained out of `ctx.pending_recoverable_writes`
-//!   in observed order; replayed by `apply` before the slot
-//!   restoration.
+//! v6-γ M1 promotes [`TraceContext`], [`DeoptStateSnapshot`] and
+//! [`RecoverableWriteRecord`] to the shared `relon-trace-abi` crate.
+//! This module re-exports the canonical definitions and supplies the
+//! cranelift-side runtime helper [`__relon_trace_save_deopt`] plus
+//! the tests-only [`GenericState`] frame mock. Reviewers MUST NOT
+//! redeclare these ABI types here — there is **one** layout.
 //!
 //! ## Apply ordering
 //!
-//! The convention (mirroring [`crate::DeoptState::apply`]):
-//! 1. First replay every recoverable write (so memory that fused ops
-//!    skipped is back to its pre-fusion state).
-//! 2. Then write SSA slot values back into the generic frame's slots
-//!    via the caller-supplied `slot_mappings`.
-//!
-//! ## Why redeclare `TraceContext`?
-//!
-//! See the module-level docs on [`crate::runtime`]. TL;DR: the
-//! emitter crate also defines a `TraceContext` (with a slightly
-//! poorer `DeoptStateSnapshot`); we must not depend on that crate
-//! from here, so we keep a layout-compatible view local. Reconciling
-//! the two definitions is on the v6-gamma integration TODO list.
+//! When the host applies a snapshot back into a generic frame (the
+//! mock here, the cranelift-generic backend in production) the
+//! convention is:
+//! 1. Replay every recoverable write (so memory the trace fused away
+//!    is back to its pre-fusion state).
+//! 2. Restore SSA slot values into the generic frame's slots via the
+//!    guard's `(SsaVar, ExternalSlot)` mapping table.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::trace_ir::{ExternalSlot, SsaVar};
 
-/// One recoverable write captured before a fused / dead-store-elim'd
-/// store executed. On a guard failure we replay these in observed
-/// order so the generic backend sees the same memory it would have
-/// seen if no fusion happened.
-#[repr(C)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RecoverableWriteRecord {
-    /// `*mut u8` cast to `u64`. Treated as an opaque address; the
-    /// host knows how to interpret it (typically a scratch arena
-    /// cursor or a list-append length slot).
-    pub addr: u64,
-    /// Value to restore at `addr`. Width-agnostic; the deopt path
-    /// either widens narrower stores up to u64 or relies on the host
-    /// knowing the width per address.
-    pub before_value: u64,
-}
-
-/// Populated by `__relon_trace_save_deopt`; consumed by the host's
-/// deopt dispatcher.
-#[repr(C)]
-#[derive(Debug)]
-pub struct DeoptStateSnapshot {
-    /// `trace_pc` of the failed guard. Index into the trace's
-    /// side-table list of [`GuardSite`](crate::GuardSite).
-    pub guard_pc: u32,
-    /// Instruction pointer (cast to `u64`) the generic backend must
-    /// resume at.
-    pub external_pc: u64,
-    /// Copy of `TraceContext.ssa_slots` at the deopt point. Owned by
-    /// the snapshot; safe to outlive the originating context.
-    pub ssa_slots_copy: Box<[u64]>,
-    /// Recoverable writes drained out of the context's pending list,
-    /// in the order they were recorded.
-    pub recoverable_writes: Vec<RecoverableWriteRecord>,
-}
-
-impl DeoptStateSnapshot {
-    /// Convenience constructor used in tests; production code populates
-    /// via [`__relon_trace_save_deopt`].
-    pub fn new(guard_pc: u32, external_pc: u64) -> Self {
-        Self {
-            guard_pc,
-            external_pc,
-            ssa_slots_copy: Vec::new().into_boxed_slice(),
-            recoverable_writes: Vec::new(),
-        }
-    }
-
-    /// Replay this snapshot onto a caller-supplied generic-state
-    /// view. `slot_mappings` carries the `(SsaVar, ExternalSlot)`
-    /// pairs that the matching [`GuardSite`](crate::GuardSite) holds;
-    /// callers typically zip the snapshot's `ssa_slots_copy` with
-    /// `slot_mappings` by SSA index.
-    ///
-    /// Ordering:
-    /// 1. Recoverable writes replayed first (memory back to pre-fusion).
-    /// 2. SSA slots restored into the generic frame second.
-    pub fn apply(&self, slot_mappings: &[(SsaVar, ExternalSlot)], state: &mut GenericState) {
-        for w in &self.recoverable_writes {
-            state.replay_write(w.addr, w.before_value);
-        }
-        for (ssa, ext_slot) in slot_mappings {
-            // `ssa_slots_copy` is indexed by ssa-var raw id; out-of-range
-            // mappings are silently skipped so a stale GuardSite cannot
-            // poison the deopt path.
-            let idx = ssa.raw() as usize;
-            if let Some(&val) = self.ssa_slots_copy.get(idx) {
-                state.write_slot(*ext_slot, val);
-            }
-        }
-    }
-}
-
-/// Layout-compatible view of `relon_trace_emitter::abi::TraceContext`.
-///
-/// **Field order is load-bearing**: the cranelift emitter reads /
-/// writes these fields by byte offset. Any reorder here without a
-/// matching change in the emitter crate **will** corrupt the deopt
-/// path.
-///
-/// ## TODO (v6-gamma phase decision)
-///
-/// The emitter currently types `deopt_state` as `Option<EmitterSnapshot>`
-/// where its snapshot lacks `ssa_slots_copy` / `recoverable_writes`.
-/// The two definitions need to be reconciled (likely by promoting
-/// this richer snapshot into a shared `relon-trace-abi` crate). Until
-/// the reconcile lands the host **must** allocate `TraceContext`s
-/// through this redeclared type when calling into a JIT-emitted
-/// trace, otherwise the layouts won't match.
-#[repr(C)]
-pub struct TraceContext {
-    /// Result slot the trace writes its return value into on success.
-    pub result_slot: u64,
-    /// One slot per SSA var the trace produced. The emitter writes
-    /// here via the offset arithmetic in
-    /// `ExternalSlotRepr::byte_offset` (= `index * 8`).
-    pub ssa_slots: Box<[u64]>,
-    /// Populated by [`__relon_trace_save_deopt`] on guard failure.
-    /// `None` while the trace is mid-execution.
-    pub deopt_state: Option<DeoptStateSnapshot>,
-    /// Pending recoverable writes; populated by store fusion / DSE
-    /// passes that emit `RecoverableWrite` ops at codegen time. The
-    /// deopt path drains the whole vector into
-    /// `deopt_state.recoverable_writes` and clears it.
-    ///
-    /// **Not present in the emitter's `TraceContext` today** — see
-    /// the TODO above.
-    pub pending_recoverable_writes: Vec<RecoverableWriteRecord>,
-}
-
-impl TraceContext {
-    /// Allocate a context with `slot_count` SSA slots zeroed.
-    pub fn with_capacity(slot_count: usize) -> Self {
-        Self {
-            result_slot: 0,
-            ssa_slots: vec![0u64; slot_count].into_boxed_slice(),
-            deopt_state: None,
-            pending_recoverable_writes: Vec::new(),
-        }
-    }
-
-    /// Push a recoverable-write record onto the pending list. The
-    /// emitter will eventually emit cranelift IR that calls a host
-    /// helper to do this; the standalone API is kept available for
-    /// unit tests and host-side fallbacks.
-    pub fn record_pending_write(&mut self, addr: u64, before_value: u64) {
-        self.pending_recoverable_writes
-            .push(RecoverableWriteRecord { addr, before_value });
-    }
-}
+pub use relon_trace_abi::{DeoptStateSnapshot, RecoverableWriteRecord, TraceContext};
 
 /// Tiny in-memory model of the generic-backend frame the deopt path
 /// restores into. Real codegen uses cranelift slots / stack frames;
 /// this model gives unit tests a deterministic verification target.
 #[derive(Debug, Default)]
 pub struct GenericState {
-    /// `slot_id -> value` map. Keyed on `ExternalSlot.0`.
+    /// `slot_id -> value` map. Keyed on `ExternalSlot.0` widened to
+    /// `u64` for storage compactness.
     pub slots: Vec<(u64, u64)>,
     /// `addr -> value` replay log. Keyed on the raw `u64` addr.
     pub memory_replays: Vec<(u64, u64)>,
 }
 
 impl GenericState {
+    /// Fresh empty frame mock.
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// Write (or overwrite) the value at `slot`.
     pub fn write_slot(&mut self, slot: ExternalSlot, value: u64) {
-        if let Some(entry) = self.slots.iter_mut().find(|(s, _)| *s == slot.0) {
+        let key = slot.0 as u64;
+        if let Some(entry) = self.slots.iter_mut().find(|(s, _)| *s == key) {
             entry.1 = value;
         } else {
-            self.slots.push((slot.0, value));
+            self.slots.push((key, value));
         }
     }
+
+    /// Record a recoverable-write replay.
     pub fn replay_write(&mut self, addr: u64, before_value: u64) {
         self.memory_replays.push((addr, before_value));
     }
+
+    /// Read `slot` if present.
     pub fn slot(&self, slot: ExternalSlot) -> Option<u64> {
-        self.slots
-            .iter()
-            .find(|(s, _)| *s == slot.0)
-            .map(|(_, v)| *v)
+        let key = slot.0 as u64;
+        self.slots.iter().find(|(s, _)| *s == key).map(|(_, v)| *v)
+    }
+
+    /// Apply a [`DeoptStateSnapshot`] into this generic frame via the
+    /// supplied `(SsaVar, ExternalSlot)` mapping table.
+    ///
+    /// Mirrors the deopt protocol the cranelift-generic backend will
+    /// follow in production: memory replays first, slot writes second.
+    /// `ssa_slots_copy` is indexed by `SsaVar::raw()`; out-of-range
+    /// mappings are silently skipped so a stale guard site cannot
+    /// poison the test path.
+    pub fn apply_snapshot(
+        &mut self,
+        snap: &DeoptStateSnapshot,
+        slot_mappings: &[(SsaVar, ExternalSlot)],
+    ) {
+        for w in &snap.recoverable_writes {
+            self.replay_write(w.addr, w.before_value);
+        }
+        for (ssa, ext_slot) in slot_mappings {
+            let idx = ssa.raw() as usize;
+            if let Some(&val) = snap.ssa_slots_copy.get(idx) {
+                self.write_slot(*ext_slot, val);
+            }
+        }
     }
 }
 
@@ -367,7 +256,7 @@ mod tests {
             (SsaVar(2), ExternalSlot(1002)),
         ];
         let mut state = GenericState::new();
-        snap.apply(&mappings, &mut state);
+        state.apply_snapshot(&snap, &mappings);
         // Memory replay happens first, slot writes second.
         assert_eq!(state.memory_replays, vec![(0x100, 0xabc), (0x200, 0xdef)]);
         assert_eq!(state.slot(ExternalSlot(1000)), Some(10));
@@ -418,7 +307,7 @@ mod tests {
         // SsaVar(99) is out of range of the 2-slot copy.
         let mappings = vec![(SsaVar(99), ExternalSlot(0))];
         let mut state = GenericState::new();
-        snap.apply(&mappings, &mut state);
+        state.apply_snapshot(&snap, &mappings);
         assert_eq!(state.slot(ExternalSlot(0)), None);
     }
 

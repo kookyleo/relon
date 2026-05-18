@@ -39,7 +39,7 @@ use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 
 use relon_trace_jit::{EffectClass, GuardSite, OptimizedTrace, SsaVar, TraceOp};
 
-use crate::abi::{HostHookId, TraceEntryStatus, TRACE_ENTRY_SIG};
+use crate::abi::{AbiSignatureExt, HostHookId, TraceEntryStatus, TRACE_ENTRY_SIG};
 use crate::guard_emit::{emit_guard, GuardEmitCtx, GuardEmitError};
 
 /// Public entry point. Builds the trace entry's cranelift IR into
@@ -358,10 +358,16 @@ impl<'a, 'b> TraceEmitterState<'a, 'b> {
     fn emit_return(&mut self, var: SsaVar) -> Result<(), EmitError> {
         let v = self.lookup(var)?;
         let v = self.widen_to_i64(v);
-        // Store into TraceContext::result_slot (offset 0).
-        self.builder
-            .ins()
-            .store(MemFlags::trusted(), v, self.trace_ctx_ptr, 0);
+        // Store into `TraceContext::result_slot`. The byte offset is
+        // sourced from `relon-trace-abi` so the emitter and the runtime
+        // helpers always agree on the layout — see
+        // `crate::abi::result_slot_offset` for the invariant.
+        self.builder.ins().store(
+            MemFlags::trusted(),
+            v,
+            self.trace_ctx_ptr,
+            crate::abi::result_slot_offset(),
+        );
         let success = self
             .builder
             .ins()

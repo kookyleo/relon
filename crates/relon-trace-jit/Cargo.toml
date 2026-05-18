@@ -10,13 +10,21 @@ description = "v6-gamma trace JIT scaffolding: self-contained trace IR, hot coun
 keywords = ["relon", "trace", "jit", "deopt", "optimizer"]
 categories = ["compilers"]
 
-# This crate intentionally has no dependency on `relon-ir`,
-# `relon-codegen-native`, or other in-tree crates. It defines a
-# self-contained low-level `TraceOp` IR + optimizer + data structures
-# that v6-gamma phase will glue to Relon IR / Cranelift via a separate
-# lowering layer. Keeping the dependency graph empty lets us iterate on
-# trace algorithms in isolation and unit-test deterministically.
+# Apart from the shared `relon-trace-abi` (which has zero inbound deps
+# itself, by design), this crate intentionally has no other in-tree
+# dependency. It defines a self-contained low-level `TraceOp` IR +
+# optimizer + data structures that v6-gamma phase will glue to Relon
+# IR / Cranelift via a separate lowering layer. Keeping the dependency
+# graph minimal lets us iterate on trace algorithms in isolation and
+# unit-test deterministically.
 [dependencies]
+# Shared ABI types: TraceContext / DeoptStateSnapshot /
+# RecoverableWriteRecord / ExternalPc / ExternalSlot / ExternalAddr /
+# ObservedType / EffectClass. The `serde` feature is enabled because
+# trace-jit serialises `SerializableSideTables` through bincode and the
+# ABI types appear inside it.
+relon-trace-abi = { workspace = true, features = ["serde"] }
+
 serde = { workspace = true, features = ["derive"] }
 bincode = "1.3"
 

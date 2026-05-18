@@ -9,18 +9,17 @@
 //!
 //! ## Opaque ids
 //!
-//! The scaffolding deliberately keeps the integration boundary opaque.
-//! Three newtypes — [`ExternalPc`], [`ExternalSlot`], [`ExternalAddr`]
-//! — are placeholders for handles into the surrounding cranelift /
-//! Relon-IR world. They are NOT wired to a concrete representation;
-//! today they are unit-like u64 tokens that the deopt machinery
-//! treats as black boxes. **TODO (v6-gamma phase decision)**: replace
-//! with concrete `*const u8` / IR slot ids once the codegen-native
-//! side exposes them.
+//! v6-γ M1 promotes [`ExternalPc`], [`ExternalSlot`], [`ExternalAddr`]
+//! and [`ObservedType`] to the shared `relon-trace-abi` crate. This
+//! module re-exports them so existing `relon_trace_jit::ExternalPc`
+//! call sites keep compiling, but the layout invariants live there.
+//! Reviewers MUST NOT redeclare these types here.
 
 use serde::{Deserialize, Serialize};
 
 use crate::effect::EffectClass;
+
+pub use relon_trace_abi::{ExternalAddr, ExternalPc, ExternalSlot, ObservedType};
 
 /// Dense SSA variable id local to a single trace. 32-bit so trace
 /// buffers stay cache friendly (LuaJIT uses the same width).
@@ -37,30 +36,6 @@ impl SsaVar {
     }
 }
 
-/// Opaque program-counter handle into the cranelift-generic backend
-/// where a trace must "deopt out to". Today an opaque token; v6-gamma
-/// phase will likely back this with a `*const u8` instruction pointer.
-///
-/// TODO (v6-gamma phase decision): pin the representation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct ExternalPc(pub u64);
-
-/// Opaque handle into the cranelift-generic backend's value-slot
-/// table. Used to map trace-local SSA values back to generic-code
-/// slots during a deopt.
-///
-/// TODO (v6-gamma phase decision): pin the representation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct ExternalSlot(pub u64);
-
-/// Opaque handle into memory whose mutation must be undone on deopt.
-/// Typically a scratch arena cursor address or a list-append length
-/// slot. Treated as a plain identifier inside this crate.
-///
-/// TODO (v6-gamma phase decision): pin the representation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct ExternalAddr(pub u64);
-
 /// Identifier for a callee referenced by [`TraceOp::Call`]. Opaque
 /// token — the trace recorder learns the symbol id from the host.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -69,18 +44,6 @@ pub struct FuncId(pub u32);
 /// Byte offset used by load/store ops.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Offset(pub i32);
-
-/// Concrete observed type for a SSA value. The trace recorder learns
-/// these by spying on the cranelift-generic backend's tagged values.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum ObservedType {
-    I32,
-    I64,
-    F64,
-    Bool,
-    /// Pointer-like tag. Opaque to the optimizer; treated as `!= I32`.
-    Ptr,
-}
 
 /// Comparison kind used by [`TraceOp::Cmp`]. Maps 1:1 to the integer
 /// compare operators we'll emit cranelift IR for during the v6-gamma

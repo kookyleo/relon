@@ -1556,6 +1556,7 @@ dependencies = [
  "relon-evaluator",
  "relon-ir",
  "relon-parser",
+ "relon-trace-abi",
  "serde",
  "serde_json",
  "sha2",
@@ -1711,6 +1712,7 @@ version = "0.1.0"
 dependencies = [
  "cranelift-codegen",
  "cranelift-frontend",
+ "relon-trace-abi",
  "relon-trace-jit",
 ]
 
@@ -1719,6 +1721,7 @@ name = "relon-trace-jit"
 version = "0.1.0"
 dependencies = [
  "bincode",
+ "relon-trace-abi",
  "serde",
  "serde_json",
 ]
