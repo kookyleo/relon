@@ -10,32 +10,25 @@ keywords = ["config", "dsl", "json", "sandboxed", "embedded"]
 categories = ["config", "parsing", "compilers"]
 
 [features]
-# `wasm-aot` is off by default so the freestanding wasm builds
-# (`relon-wasm`, browser playground) stay clean of wasmtime. Native
-# hosts that want the wasm-AOT backend opt in explicitly:
-# `relon = { version = "...", features = ["wasm-aot"] }`. The CLI
-# always enables it; the workspace-wide `cargo build` picks the
-# feature up through that path so day-to-day developer flows still
-# see both backends.
-wasm-aot = ["dep:relon-codegen-wasm"]
-# v5-beta-1: `cranelift-aot` toggles the cranelift-backed native AOT
-# evaluator. Off by default — and excluded entirely from wasm32 targets
-# below — so the freestanding wasm playground stays free of the
-# cranelift dependency tree.
+# v5-β-2 stage 4: `cranelift-aot` toggles the cranelift-backed native
+# AOT evaluator. Default-on for native hosts (the cranelift backend
+# is the only AOT path after wasm-AOT retirement); excluded entirely
+# from wasm32 targets through the absence of `relon-codegen-native`
+# under `target.'cfg(target_arch = "wasm32")'.dependencies`, which
+# keeps `relon-wasm` (browser playground) free of the cranelift
+# dependency tree.
+default = ["cranelift-aot"]
 cranelift-aot = ["dep:relon-codegen-native"]
 
 [dependencies]
 relon-evaluator = { workspace = true }
 relon-parser = { workspace = true }
 relon-analyzer = { workspace = true }
-# Phase 8: facade Backend enum needs the wasm-AOT evaluator to wire
-# `Backend::WasmAot` through `new_evaluator`. The dependency is
-# feature-gated so wasm32 hosts that can't link wasmtime still
-# compile against the tree-walker.
-relon-codegen-wasm = { workspace = true, optional = true }
-# v5-beta-1: cranelift-AOT backend lives in a separate crate so the
-# wasm32 target (`relon-wasm`, browser playground) can opt out via the
-# absence of the `cranelift-aot` feature.
+# v5-β-2 stage 4: cranelift-AOT backend lives in a separate crate so
+# the wasm32 target (`relon-wasm`, browser playground) can opt out via
+# the absence of the `cranelift-aot` feature. Since the wasm-AOT
+# backend retired in stage 4 this is the only AOT path; default-on
+# above means native hosts get it without opting in.
 relon-codegen-native = { workspace = true, optional = true }
 relon-eval-api = { workspace = true }
 serde = { workspace = true, features = ["derive"] }

@@ -1,14 +1,13 @@
-//! Cranelift-backed native AOT evaluator for Relon — v5-beta-1
-//! HelloWorld tier.
+//! Cranelift-backed native AOT evaluator for Relon.
 //!
-//! The crate sits alongside `relon-codegen-wasm` as a second AOT
-//! backend behind the [`relon_eval_api::Evaluator`] trait. The
-//! cranelift path produces native machine code via the in-process JIT
-//! and runs it directly, without going through wasmtime. The
-//! single-call latency is roughly an order of magnitude lower than
-//! the wasm-AOT path; in exchange the codegen surface is narrower
-//! (v5-beta-1 covers integer arithmetic + a small slice of stdlib
-//! calls only).
+//! v5-β-2 stage 4 made this the only AOT backend in the workspace
+//! — the wasm-AOT path (`relon-codegen-wasm`) retired here because
+//! the cranelift path covers the full IR corpus the tree-walker
+//! exercises (51/52 corpus parity, the missing case being analyzer-
+//! rejected). The cranelift JIT produces native machine code in
+//! the host process and dispatches `run_main` through a panic-
+//! shielded trampoline; single-call latency targets LuaJIT trace
+//! tier (sub-microsecond warm).
 //!
 //! ## Architecture
 //!
@@ -48,22 +47,26 @@
 //!   `RESOURCE_CHECK_INTERVAL` documents the cadence for inner
 //!   loop rechecks once the IR's loop ops are lowered (v5-beta-2).
 //!
-//! ## v5-beta-2 follow-up
+//! ## v5-γ follow-up
 //!
-//! Items deliberately *not* in this crate's scope today, tracked in
-//! `docs/internal/wasm-aot-v4-roadmap-sandbox-safe.md`:
+//! Items deliberately *not* in this crate's scope today (deferred
+//! from v5-β-2 stage 4):
 //!
 //! * Real `sigsetjmp` / `siglongjmp` trap handler (today we lean on
 //!   `catch_unwind`; the typed `RuntimeError` payload makes the
 //!   difference invisible to callers but the JIT pays the cost of a
 //!   panic unwind on hot paths).
-//! * Full IR-op coverage (`Op::LoadStringPtr`, the dict / record
-//!   builders, the stdlib bodies that walk strings byte-by-byte).
+//! * `Op::CallNative` full indirect dispatch via the capability
+//!   vtable + per-sig marshalling.
+//! * `Op::CallClosure` + closure-bearing higher-order list ops.
+//! * `Op::Loop` with `result_ty != None` (block-param threading) +
+//!   `Op::BrTable` jump tables.
+//! * `RESOURCE_CHECK_INTERVAL` cadence on inner-loop back-edges.
 //! * Module cache backed by `cranelift-object` so the cold-start path
 //!   skips the JIT entirely.
 //!
-//! See `tests/` for end-to-end smoke runs against each of the six
-//! HelloWorld scenarios.
+//! See `tests/` for end-to-end smoke runs against the corpus
+//! scenarios.
 
 #![allow(unused_assignments)]
 

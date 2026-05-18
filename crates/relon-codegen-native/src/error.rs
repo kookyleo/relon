@@ -1,9 +1,9 @@
 //! Error surface for the cranelift-native AOT backend.
 //!
 //! Split out of `lib.rs` so the public re-exports stay narrow. The
-//! enum mirrors `relon_codegen_wasm::BuildError` in shape so the
-//! `AutoEvaluator::build_aot` site can adopt either backend without
-//! reshaping its `String`-stringified pipeline.
+//! enum's shape mirrors the retired `relon_codegen_wasm::BuildError`
+//! so the `AutoEvaluator::build_aot` site keeps its
+//! `String`-stringified pipeline ergonomic.
 
 use thiserror::Error;
 

@@ -1368,11 +1368,11 @@ pub struct ClosureCapture {
     pub offset: u32,
 }
 
-/// Phase 4.c-2 stdlib trap discriminator. Mirrors the relevant
-/// [`relon_codegen_wasm::UnreachableKind`] variants but stays
-/// independent of the codegen crate so the IR has no upward
-/// dependency. Codegen maps each variant 1:1 to the matching
-/// `UnreachableKind`.
+/// Phase 4.c-2 stdlib trap discriminator. Independent of the
+/// codegen crate so the IR has no upward dependency. The
+/// cranelift-native codegen maps each variant onto its sandbox-side
+/// `TrapKind` (see `relon-codegen-native/src/sandbox.rs`); the
+/// retired wasm-AOT backend used to mirror the same enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TrapKind {
     /// `substring` / future `xs[i]` accessors tripped because the

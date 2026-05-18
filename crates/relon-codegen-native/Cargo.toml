@@ -18,8 +18,10 @@ relon-eval-api = { workspace = true }
 # Source positions for diagnostics
 relon-parser = { workspace = true }
 # `from_source` runs the per-file analyzer before lowering so the
-# codegen path matches what the tree-walker does, mirroring how
-# relon-codegen-wasm wires the analyzer in.
+# codegen path matches what the tree-walker does. The retired
+# wasm-AOT crate (`relon-codegen-wasm`, removed in v5-β-2 stage 4)
+# used to wire the analyzer the same way; this is the only AOT path
+# left.
 relon-analyzer = { workspace = true }
 
 thiserror = { workspace = true }

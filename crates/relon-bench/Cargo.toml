@@ -15,17 +15,11 @@ dhat-heap = ["dep:dhat"]
 [dependencies]
 relon-parser = { workspace = true }
 relon-evaluator = { workspace = true }
-# Phase 9: wasm-AOT comparison bench depends on the codegen crate to
-# drive `WasmAotEvaluator::from_source` + `run_main` directly, so the
-# harness can isolate cold-start (parse + analyze + lower + codegen +
-# wasmtime::Module::new) from warm invoke (instantiate + buffer
-# marshal + wasm execution). Wired as a regular dep, not feature-gated,
-# because the bench crate is host-only (never built for wasm32) and
-# `cargo bench` always wants both backends available.
-relon-codegen-wasm = { workspace = true }
-# v5-beta-1: cranelift-AOT comparison bench. Mirrors the wasm-AOT
-# wiring shape; bench crate is host-only so we can pull both backends
-# unconditionally.
+# v5-β-2 stage 4: cranelift-AOT comparison bench. The wasm-AOT
+# backend retired here; the bench crate now only depends on the
+# cranelift-native AOT crate for cold/warm measurement against the
+# tree-walker baseline. Bench is host-only so we pull the cranelift
+# dep unconditionally.
 relon-codegen-native = { workspace = true }
 relon-ir = { workspace = true }
 relon-eval-api = { workspace = true }
@@ -53,23 +47,15 @@ name = "harness_v1"
 harness = false
 path = "benches/harness_v1.rs"
 
-# Phase 9 closeout: pit the wasm-AOT backend against the tree-walker
-# across four canonical scenarios (arithmetic / dict-literal /
-# stdlib / method-dispatch). Each scenario splits into three probes:
-# `cold_start` (full pipeline), `warm_invoke` (run_main on a
-# preassembled evaluator), `tree_walk_total` (tree-walker single-shot
-# baseline). Run via `cargo bench -p relon-bench --bench wasm_aot_vs_tree_walk`.
+# v5-β-2 stage 4: cranelift-AOT cold/warm comparison against the
+# tree-walker baseline. Two probes per scenario: `cold` (synthetic
+# IR build + cranelift JIT finalize) and `warm` (preassembled
+# evaluator, only `run_main(args)`). The warm probe is the
+# "LuaJIT trace tier" target (sub-microsecond per call). The
+# tree-walker baseline is the apples-to-apples competitor against
+# `cold` for the typical configuration-reload workload. Run via
+# `cargo bench -p relon-bench --bench cranelift_aot_vs_tree_walk`.
 [[bench]]
-name = "wasm_aot_vs_tree_walk"
+name = "cranelift_aot_vs_tree_walk"
 harness = false
-path = "benches/wasm_aot_vs_tree_walk.rs"
-
-# v5-beta-1 cranelift-AOT vs wasm-AOT cold/warm comparison. Uses
-# synthetic IR for the arithmetic scenario because the cranelift
-# backend doesn't yet drive the analyzer / lower pipeline through
-# `from_source` for buffer-protocol bodies. Run via
-# `cargo bench -p relon-bench --bench cranelift_aot_vs_wasm_aot`.
-[[bench]]
-name = "cranelift_aot_vs_wasm_aot"
-harness = false
-path = "benches/cranelift_aot_vs_wasm_aot.rs"
+path = "benches/cranelift_aot_vs_tree_walk.rs"

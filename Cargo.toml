@@ -42,7 +42,6 @@ relon-eval-api = { path = "crates/relon-eval-api", version = "0.1.0" }
 relon-evaluator = { path = "crates/relon-evaluator", version = "0.1.0" }
 relon-fmt = { path = "crates/relon-fmt", version = "0.1.0" }
 relon-ir = { path = "crates/relon-ir", version = "0.1.0" }
-relon-codegen-wasm = { path = "crates/relon-codegen-wasm", version = "0.1.0" }
 relon-codegen-native = { path = "crates/relon-codegen-native", version = "0.1.0" }
 relon-trace-jit = { path = "crates/relon-trace-jit", version = "0.1.0" }
 relon-trace-recorder = { path = "crates/relon-trace-recorder", version = "0.1.0" }

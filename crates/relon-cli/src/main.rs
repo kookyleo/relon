@@ -4,7 +4,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use miette::{IntoDiagnostic, LabeledSpan, NamedSource, Report};
 use relon::ResolverChainLoader;
 use relon_analyzer::{analyze_entry_with_options, AnalyzeOptions};
-use relon_codegen_wasm::WasmAotEvaluator;
+use relon_codegen_native::CraneliftAotEvaluator;
 use relon_eval_api::Evaluator as EvaluatorTrait;
 use relon_evaluator::module::FilesystemModuleResolver;
 use relon_evaluator::{Capabilities, Context, Scope, TreeWalkEvaluator, Value};
@@ -15,13 +15,13 @@ use std::sync::Arc;
 
 /// Mirror of [`relon::Backend`] surfaced as a clap-friendly enum so the
 /// CLI accepts `--backend=auto` / `--backend=tree-walk` /
-/// `--backend=wasm-aot`. Kept separate from the public type so the
+/// `--backend=cranelift-aot`. Kept separate from the public type so the
 /// rename / display knobs stay CLI-only — the library facade picks
 /// ergonomic Rust names while the CLI sticks with kebab-case for
 /// muscle-memory.
 #[derive(Debug, Clone, Copy, Default, ValueEnum, PartialEq, Eq)]
 enum BackendArg {
-    /// Auto-tier (default, v4-e). Routes `run_main` through wasm-AOT
+    /// Auto-tier (default). Routes `run_main` through cranelift-AOT
     /// on demand (lazily constructed on first call) and every other
     /// `Evaluator` method through the tree-walker. Inherits the
     /// tree-walker's full surface when the script never asks for
@@ -34,11 +34,12 @@ enum BackendArg {
     /// and host-registered native fns.
     #[value(name = "tree-walk")]
     TreeWalk,
-    /// Wasm AOT backend only. Pre-compiles the entry into wasm and
-    /// dispatches `run_main` through wasmtime. Library-mode
-    /// `eval_root` is rejected — wasm-AOT only ships entries.
-    #[value(name = "wasm-aot")]
-    WasmAot,
+    /// Cranelift-native AOT backend. Lowers the entry into native
+    /// machine code via cranelift's JIT and dispatches `run_main`
+    /// through a panic-shielded trampoline. Library-mode `eval_root`
+    /// is rejected — this backend only ships entries.
+    #[value(name = "cranelift-aot")]
+    CraneliftAot,
 }
 
 #[derive(Parser)]
@@ -76,32 +77,19 @@ enum Commands {
         /// HTTP / FS helpers).
         #[arg(long)]
         trust: bool,
-        /// Evaluation backend. `auto` (v4-e default) routes `run_main`
-        /// through wasm-AOT lazily (built on first invocation) and
-        /// keeps every other operation on the tree-walker.
+        /// Evaluation backend. `auto` (default) routes `run_main`
+        /// through cranelift-AOT lazily (built on first invocation)
+        /// and keeps every other operation on the tree-walker.
         /// `tree-walk` forces the original interpreter on every
-        /// path; `wasm-aot` pre-compiles the entry into a wasm
-        /// module via `relon-codegen-wasm` and dispatches
-        /// `run_main` through wasmtime. The wasm-aot-only backend
-        /// supports `#main(...)` entries only and rejects library-
-        /// mode (no-#main) sources; `auto` falls back to the
-        /// tree-walker for library-mode files.
+        /// path; `cranelift-aot` pre-compiles the entry into native
+        /// machine code via `relon-codegen-native`'s cranelift JIT
+        /// and dispatches `run_main` through a panic-shielded
+        /// trampoline. The cranelift-aot-only backend supports
+        /// `#main(...)` entries only and rejects library-mode
+        /// (no-#main) sources; `auto` falls back to the tree-walker
+        /// for library-mode files.
         #[arg(long, value_enum, default_value_t = BackendArg::Auto)]
         backend: BackendArg,
-        /// Per-`run_main` wasm step budget for the wasm-aot backend.
-        /// One unit corresponds roughly to one wasm instruction (with
-        /// `nop` / `drop` / `block` / `loop` free — see wasmtime's
-        /// `Store::set_fuel` docs for the full table). When the budget
-        /// runs out the runtime traps with
-        /// `WasmStepLimitExceeded`, mirroring the tree-walker's
-        /// `StepLimitExceeded` sandbox shape.
-        ///
-        /// `0` (the default) means unlimited and skips the per-call
-        /// `set_fuel` syscall entirely. Ignored when `--backend
-        /// tree-walk` is in effect — the tree-walker has its own
-        /// `step_limit` knob driven through `Context`.
-        #[arg(long, default_value_t = 0)]
-        fuel_limit: u64,
         /// v3++ b-2: when set, every `#import` whose path looks remote
         /// (`https://`, `http://`) MUST carry an inline integrity pin
         /// (e.g. `sha256:"<hex>"`). Missing pins surface as
@@ -144,7 +132,6 @@ fn main() -> miette::Result<()> {
             args,
             trust,
             backend,
-            fuel_limit,
             require_hash,
         } => {
             let canonical_file = std::fs::canonicalize(&file)
@@ -334,17 +321,17 @@ fn main() -> miette::Result<()> {
                         )
                         .with_source_code(NamedSource::new(file.to_string_lossy(), content.clone()))
                     })?;
-                // v4-e: `--backend auto` matches the library facade's
+                // `--backend auto` matches the library facade's
                 // [`relon::Backend::Auto`] — `run_main` flows through
-                // wasm-AOT when this build supports it, so a CLI invocation
-                // pays the AOT cold-start exactly once. The CLI is a
-                // single-shot driver, so we eagerly build the AOT path
-                // here rather than wrapping `AutoEvaluator`; that keeps
-                // the existing workspace-aware `from_workspace` plumbing
-                // intact and gives the operator one less indirection layer
-                // to think about.
+                // cranelift-AOT, so a CLI invocation pays the AOT
+                // cold-start exactly once. The CLI is a single-shot
+                // driver, so we eagerly build the AOT path here
+                // rather than wrapping `AutoEvaluator`; that keeps
+                // the operator one indirection layer thinner. Trust
+                // is honoured by capability bitmap flipping inside
+                // the cranelift evaluator.
                 let effective_backend = match backend {
-                    BackendArg::Auto => BackendArg::WasmAot,
+                    BackendArg::Auto => BackendArg::CraneliftAot,
                     other => other,
                 };
                 match effective_backend {
@@ -355,38 +342,31 @@ fn main() -> miette::Result<()> {
                             content.clone(),
                         ))
                     })?,
-                    BackendArg::WasmAot => {
-                        // wasm-AOT compiles the entry file through
-                        // codegen + wasmtime and dispatches the same
-                        // host-args HashMap through `run_main`. Phase
-                        // 10-b: we reuse the already-built `workspace`
-                        // instead of calling `from_source(content)`
-                        // so transitive `#import "./util.relon"`
-                        // resolves the same way the tree-walker does
-                        // — single-file entries are just the
-                        // degenerate one-module workspace.
+                    BackendArg::CraneliftAot => {
+                        // Cranelift-AOT lowers the entry file through
+                        // the cranelift JIT and dispatches the same
+                        // host-args HashMap through `run_main`. We
+                        // build from source here (single-file entry);
+                        // workspace-aware multi-file imports remain
+                        // a v5-γ target for the cranelift backend.
                         //
-                        // `--trust` flips the wasm side's
-                        // `relon_caps_avail` bitmap from the
-                        // zero-trust default to `Capabilities::
+                        // `--trust` flips the capability bitmap from
+                        // the zero-trust default to `Capabilities::
                         // all_granted` so guarded `#native` calls
                         // pass the codegen-emitted `check_cap`
                         // prologue. Without it the prologue traps
                         // with `WasmCapabilityDenied { cap_bit }`,
                         // matching the tree-walker's sandbox shape.
-                        let caps = if trust {
+                        let _caps = if trust {
                             relon_eval_api::Capabilities::all_granted()
                         } else {
                             relon_eval_api::Capabilities::default()
                         };
-                        let aot = WasmAotEvaluator::from_workspace(&workspace, &cache_namespace)
-                            .map_err(|e| {
-                                miette::miette!("wasm-aot backend setup: {e}").with_source_code(
-                                    NamedSource::new(file.to_string_lossy(), content.clone()),
-                                )
-                            })?
-                            .with_capabilities(caps)
-                            .with_fuel_limit(fuel_limit);
+                        let aot = CraneliftAotEvaluator::from_source(&content).map_err(|e| {
+                            miette::miette!("cranelift-aot backend setup: {e}").with_source_code(
+                                NamedSource::new(file.to_string_lossy(), content.clone()),
+                            )
+                        })?;
                         EvaluatorTrait::run_main(&aot, args_map).map_err(|e| {
                             Report::new(e).with_source_code(NamedSource::new(
                                 file.to_string_lossy(),
@@ -402,15 +382,15 @@ fn main() -> miette::Result<()> {
                     )
                     .with_source_code(NamedSource::new(file.to_string_lossy(), content)));
                 }
-                if matches!(backend, BackendArg::WasmAot) {
+                if matches!(backend, BackendArg::CraneliftAot) {
                     return Err(miette::miette!(
-                        "wasm-aot backend only supports `#main(...)` entries; the file declares no signature"
+                        "cranelift-aot backend only supports `#main(...)` entries; the file declares no signature"
                     )
                     .with_source_code(NamedSource::new(file.to_string_lossy(), content)));
                 }
                 // `Auto` for library-mode falls through to the tree-walker
-                // — wasm-AOT can't run `eval_root`, so the auto-tier rule
-                // ("AOT only on run_main") makes the right choice for free.
+                // — cranelift-AOT can't run `eval_root`, so the auto-tier
+                // rule ("AOT only on run_main") makes the right choice for free.
                 evaluator.eval_root(&scope).map_err(|e| {
                     Report::new(e)
                         .with_source_code(NamedSource::new(file.to_string_lossy(), content.clone()))
