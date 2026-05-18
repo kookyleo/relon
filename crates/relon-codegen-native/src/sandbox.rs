@@ -78,6 +78,18 @@ pub struct SandboxConfig {
     /// on hardware that traps natively because Rust's panic surface
     /// on SIGFPE is not portable across all targets.
     pub div_check: bool,
+    /// v6-γ M2: when `Some(fn_id)`, the codegen emits a HotCounter
+    /// prologue at the entry block. Every invocation atomically (per
+    /// design § 3, non-atomic) bumps slot `fn_id` of the global
+    /// `__relon_hot_counters` table; when the slot crosses
+    /// [`crate::trace_install::RELON_HOT_THRESHOLD`], the prologue
+    /// calls [`crate::trace_install::__relon_jump_to_recorder`] and
+    /// returns a sentinel so the host can install a JIT-compiled
+    /// trace fn.
+    ///
+    /// `None` (default) elides the prologue entirely — backward-
+    /// compatible with the v5-γ stage 2 code path.
+    pub trace_jit_fn_id: Option<u32>,
 }
 
 impl Default for SandboxConfig {
@@ -87,6 +99,7 @@ impl Default for SandboxConfig {
             deadline_check: true,
             capability_check: true,
             div_check: true,
+            trace_jit_fn_id: None,
         }
     }
 }
@@ -100,6 +113,7 @@ impl SandboxConfig {
             deadline_check: false,
             capability_check: false,
             div_check: false,
+            trace_jit_fn_id: None,
         }
     }
 }
