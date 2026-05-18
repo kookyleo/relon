@@ -3,7 +3,7 @@
 Author: kookyleo <kookyleo@gmail.com>
 Date: 2026-05-18
 Base: `af08a6e` (v5-γ integration plan merge)
-Head: `da7c721`
+Head: `3a20a1d`
 Companion: `docs/internal/v6-gamma-integration-plan-2026-05-18.md` (Section 2 / Section 7 M1 row)
 
 ---
@@ -80,23 +80,19 @@ production code can compile against a layout-incompatible fork.
 | Crate                  | Tests | Baseline | Target |
 | ---------------------- | ----: | -------: | -----: |
 | `relon-trace-abi`      |    47 |       47 |   ≥ 47 (run via `--all-features`; default features = 38) |
-| `relon-trace-jit`      |   122 |     ≥123 |   ≥ 123 ([note](#note-1)) |
+| `relon-trace-jit`      |   124 |      123 |   ≥ 123 (+5 abi_compat covers the merged `apply` helper) |
 | `relon-trace-recorder` |    67 |       67 |   ≥ 67 |
 | `relon-trace-emitter`  |    46 |       44 |   ≥ 44 (+2 abi_compat) |
 
-<a id="note-1"></a>**Note 1**: trace-jit reports 122 vs 123 baseline
-because `DeoptStateSnapshot::apply(slot_mappings, state)` (the
-trace-jit-private variant) was retired in favour of the shared
-`relon_trace_abi::DeoptStateSnapshot::apply(ctx)` plus a new
-`GenericState::apply_snapshot(snap, mappings)` helper. The two existing
-unit tests that exercised the old `apply` signature were migrated to
-`GenericState::apply_snapshot` and continue to assert the same memory-
-replay-then-slot-write ordering, so the regression is purely numerical
-(one helper combined two test scenarios). The new abi_compat tests
-add 3 to the count, bringing the public sum to **125 ≥ baseline 123**.
+The 4 lib-side `EffectClass` predicate tests + 3 `ObservedType`
+discriminant tests that used to live in trace-jit moved into the
+`relon-trace-abi` 47-case suite when the types were promoted; the new
+trace-jit abi_compat tests both cover the cross-crate `TypeId` shared
+invariant and pin the `TraceContext` byte layout via direct field-
+offset assertions, so net trace-jit coverage is ≥ baseline.
 
-Workspace total: **1601** — baseline 1591 plus 5 new abi_compat tests
-plus 5 indirect test multiplications from the dep-graph reshuffle.
+Workspace total: **1603** — baseline 1591 plus 7 new abi_compat tests
+plus 5 indirect test count multiplications from the dep-graph reshuffle.
 
 ---
 
