@@ -26,3 +26,6 @@ serde_json = { workspace = true }
 
 [dev-dependencies]
 relon-parser = { workspace = true }
+# v5-γ tests isolate the on-disk cache to a tempfile-rooted directory
+# so concurrent cargo-test threads cannot stomp on each other.
+tempfile = "3"
