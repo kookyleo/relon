@@ -1653,6 +1653,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "relon-object-link"
+version = "0.1.0"
+dependencies = [
+ "cranelift-codegen",
+ "cranelift-frontend",
+ "cranelift-module",
+ "cranelift-native",
+ "cranelift-object",
+ "relon-object-cache",
+ "target-lexicon",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "relon-parser"
 version = "0.1.0"
 dependencies = [
