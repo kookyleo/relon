@@ -48,6 +48,7 @@ relon-evaluator = { path = "crates/relon-evaluator", version = "0.1.0" }
 relon-fmt = { path = "crates/relon-fmt", version = "0.1.0" }
 relon-ir = { path = "crates/relon-ir", version = "0.1.0" }
 relon-codegen-native = { path = "crates/relon-codegen-native", version = "0.1.0" }
+relon-object-cache = { path = "crates/relon-object-cache", version = "0.1.0" }
 relon-trace-jit = { path = "crates/relon-trace-jit", version = "0.1.0" }
 relon-trace-recorder = { path = "crates/relon-trace-recorder", version = "0.1.0" }
 relon-trace-emitter = { path = "crates/relon-trace-emitter", version = "0.1.0" }
