@@ -33,6 +33,9 @@
 //!   not pull `object` / `goblin` for ~20 bytes of header.
 //! - [`linker_subproc`] — default linker. Shells out to system `ld`
 //!   (or `cc -shared`) via `Command`, captures stderr on failure.
+//! - `linker_lld` — feature-gated (`lld-inproc`) in-process `lld`
+//!   linker stub. Currently returns [`LinkError::FeatureNotImplemented`]
+//!   because the `lld-sys` crate is not yet on a stable release.
 //! - [`error`] — the public [`LinkError`] enum.
 //!
 //! ## Platform support
@@ -48,9 +51,15 @@ pub mod elf_check;
 pub mod error;
 pub mod linker_subproc;
 
+#[cfg(feature = "lld-inproc")]
+pub mod linker_lld;
+
 pub use elf_check::{is_et_dyn, is_et_rel, parse_elf_type, ElfType};
 pub use error::LinkError;
 pub use linker_subproc::SubprocLinker;
+
+#[cfg(feature = "lld-inproc")]
+pub use linker_lld::LldLinker;
 
 /// Top-level entry point: link an `ET_REL` relocatable object into an
 /// `ET_DYN` shared object using the default (subprocess) backend.
