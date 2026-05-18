@@ -240,9 +240,7 @@ pub enum WorkspaceDiagnostic {
     /// v3++ b-2: the integrity hex string did not match the expected
     /// length for the declared algorithm (e.g. `sha256:"abc"`). Caught
     /// up front so the loader never compares against a partial digest.
-    #[error(
-        "import `{path}` integrity hex length is {got}, expected {expected} for {algorithm}"
-    )]
+    #[error("import `{path}` integrity hex length is {got}, expected {expected} for {algorithm}")]
     #[diagnostic(
         code(relon::workspace::import_hash_invalid_hex),
         help(

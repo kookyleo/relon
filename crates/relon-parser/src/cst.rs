@@ -2594,9 +2594,8 @@ mod tests {
 
     #[test]
     fn import_with_sha256_integrity_round_trip() {
-        let parsed = parse_round_trip(
-            "#import lib from \"./lib.relon\" sha256:\"deadbeef\"\n{ x: 1 }",
-        );
+        let parsed =
+            parse_round_trip("#import lib from \"./lib.relon\" sha256:\"deadbeef\"\n{ x: 1 }");
         assert!(!parsed.has_errors(), "errors: {:?}", parsed.errors);
     }
 
@@ -2604,9 +2603,7 @@ mod tests {
     fn import_with_missing_hex_string_reports_error() {
         // `sha256:` followed by something that is not a STRING should
         // raise a parse error (rather than silently consume tokens).
-        let parsed = parse_round_trip(
-            "#import lib from \"./lib.relon\" sha256: bad\n{ x: 1 }",
-        );
+        let parsed = parse_round_trip("#import lib from \"./lib.relon\" sha256: bad\n{ x: 1 }");
         assert!(
             parsed.has_errors(),
             "expected parse error for malformed integrity pin"

@@ -356,10 +356,7 @@ fn process_import<L: ModuleLoader>(
     // an unrelated workspace error. Local-path imports are exempt:
     // the supply-chain threat model targets the network, and forcing
     // hashes on every `./util.relon` would penalize day-to-day iteration.
-    if options.require_hash
-        && item.integrity.is_none()
-        && looks_remote(&item.raw_path)
-    {
+    if options.require_hash && item.integrity.is_none() && looks_remote(&item.raw_path) {
         ws.workspace_diagnostics
             .push(WorkspaceDiagnostic::ImportHashRequired {
                 path: item.raw_path.clone(),
@@ -383,9 +380,7 @@ fn process_import<L: ModuleLoader>(
         };
         let algo_str = algo.as_str();
         let expected_len = algo.hex_len();
-        if int.hex.len() != expected_len
-            || !int.hex.chars().all(|c| c.is_ascii_hexdigit())
-        {
+        if int.hex.len() != expected_len || !int.hex.chars().all(|c| c.is_ascii_hexdigit()) {
             ws.workspace_diagnostics
                 .push(WorkspaceDiagnostic::ImportHashInvalidHex {
                     path: item.raw_path.clone(),
@@ -2363,9 +2358,8 @@ mod tests {
     fn import_with_matching_hash_succeeds() {
         let lib_src = "{ value: 42 }";
         let digest = sha256_hex(lib_src);
-        let entry_src = format!(
-            "#import lib from \"./lib\" sha256:\"{digest}\"\n{{ v: lib.value }}"
-        );
+        let entry_src =
+            format!("#import lib from \"./lib\" sha256:\"{digest}\"\n{{ v: lib.value }}");
         let mut loader = MapLoader::new();
         loader.add("./lib", "/abs/lib", lib_src);
         let ws = build(
@@ -2396,9 +2390,7 @@ mod tests {
         let last = digest.pop().unwrap();
         let flipped = if last == '0' { '1' } else { '0' };
         digest.push(flipped);
-        let entry_src = format!(
-            "#import lib from \"./lib\" sha256:\"{digest}\"\n{{ v: 1 }}"
-        );
+        let entry_src = format!("#import lib from \"./lib\" sha256:\"{digest}\"\n{{ v: 1 }}");
         let mut loader = MapLoader::new();
         loader.add("./lib", "/abs/lib", lib_src);
         let ws = build(
@@ -2420,8 +2412,7 @@ mod tests {
     #[test]
     fn import_with_unknown_algorithm_reports_diagnostic() {
         let lib_src = "{ value: 1 }";
-        let entry_src =
-            "#import lib from \"./lib\" sha512:\"deadbeef\"\n{ v: 1 }".to_string();
+        let entry_src = "#import lib from \"./lib\" sha512:\"deadbeef\"\n{ v: 1 }".to_string();
         let mut loader = MapLoader::new();
         loader.add("./lib", "/abs/lib", lib_src);
         let ws = build(
@@ -2463,8 +2454,7 @@ mod tests {
     #[test]
     fn require_hash_flags_unpinned_remote_import() {
         let lib_src = "{ value: 1 }";
-        let entry_src =
-            "#import lib from \"https://example.com/lib.relon\"\n{ v: 1 }".to_string();
+        let entry_src = "#import lib from \"https://example.com/lib.relon\"\n{ v: 1 }".to_string();
         let mut loader = MapLoader::new();
         loader.add("https://example.com/lib.relon", "/canon/lib", lib_src);
         let opts = crate::AnalyzeOptions {

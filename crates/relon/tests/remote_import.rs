@@ -261,9 +261,8 @@ mod hash_pinning {
         let server = MockServer::start(body, 200);
         let url = server.url("/lib.relon");
         let digest = sha256_hex(body);
-        let entry = format!(
-            "#import lib from \"{url}\" sha256:\"{digest}\"\n{{ v: lib.remote_value }}"
-        );
+        let entry =
+            format!("#import lib from \"{url}\" sha256:\"{digest}\"\n{{ v: lib.remote_value }}");
 
         let mut loader = trusted_loader(temp_cache_dir("hash-match"));
         let ws = analyze_entry_with_options(
@@ -295,9 +294,7 @@ mod hash_pinning {
         let mut digest = sha256_hex(body);
         let last = digest.pop().unwrap();
         digest.push(if last == '0' { '1' } else { '0' });
-        let entry = format!(
-            "#import lib from \"{url}\" sha256:\"{digest}\"\n{{ v: 1 }}"
-        );
+        let entry = format!("#import lib from \"{url}\" sha256:\"{digest}\"\n{{ v: 1 }}");
 
         let mut loader = trusted_loader(temp_cache_dir("hash-mismatch"));
         let ws = analyze_entry_with_options(
@@ -334,9 +331,7 @@ mod hash_pinning {
         let cache_dir = temp_cache_dir("cache-then-mismatch");
 
         // Warm the cache with the correct pin.
-        let entry_ok = format!(
-            "#import lib from \"{url}\" sha256:\"{digest}\"\n{{ v: 1 }}"
-        );
+        let entry_ok = format!("#import lib from \"{url}\" sha256:\"{digest}\"\n{{ v: 1 }}");
         {
             let mut loader = trusted_loader(cache_dir.clone());
             let ws = analyze_entry_with_options(
@@ -347,10 +342,9 @@ mod hash_pinning {
                 &AnalyzeOptions::default(),
             );
             assert!(
-                !ws.workspace_diagnostics.iter().any(|d| matches!(
-                    d,
-                    WorkspaceDiagnostic::ImportHashMismatch { .. }
-                )),
+                !ws.workspace_diagnostics
+                    .iter()
+                    .any(|d| matches!(d, WorkspaceDiagnostic::ImportHashMismatch { .. })),
                 "warm pass should not flag mismatch"
             );
         }
@@ -362,9 +356,7 @@ mod hash_pinning {
         let mut bad_digest = digest.clone();
         let last = bad_digest.pop().unwrap();
         bad_digest.push(if last == '0' { '1' } else { '0' });
-        let entry_bad = format!(
-            "#import lib from \"{url}\" sha256:\"{bad_digest}\"\n{{ v: 1 }}"
-        );
+        let entry_bad = format!("#import lib from \"{url}\" sha256:\"{bad_digest}\"\n{{ v: 1 }}");
         let mut loader = trusted_loader(cache_dir.clone());
         let ws = analyze_entry_with_options(
             "entry".to_string(),
@@ -379,11 +371,7 @@ mod hash_pinning {
                 .any(|d| matches!(d, WorkspaceDiagnostic::ImportHashMismatch { .. })),
             "cache hit must still verify integrity"
         );
-        assert_eq!(
-            server.hit_count(),
-            after_warm,
-            "cache hit must not refetch"
-        );
+        assert_eq!(server.hit_count(), after_warm, "cache hit must not refetch");
 
         let _ = std::fs::remove_dir_all(&cache_dir);
     }
@@ -392,8 +380,7 @@ mod hash_pinning {
     fn require_hash_flag_rejects_unpinned_remote_import() {
         // No mock server needed — the unpinned-import gate fires
         // before the loader is asked anything.
-        let entry =
-            "#import lib from \"https://example.com/util.relon\"\n{ v: 1 }".to_string();
+        let entry = "#import lib from \"https://example.com/util.relon\"\n{ v: 1 }".to_string();
         let mut loader = trusted_loader(temp_cache_dir("require-hash"));
         let opts = AnalyzeOptions {
             require_hash: true,
