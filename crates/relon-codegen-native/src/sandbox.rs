@@ -287,6 +287,18 @@ pub struct SandboxState {
     /// emitter can read / write it through a stable offset rather
     /// than threading a wasm-style "spare local" through every IR op.
     tail_cursor: UnsafeCell<u32>,
+    /// Scratch bump cursor used by stdlib bodies that allocate
+    /// temporary records (memory stdlib `concat` / `substring` etc.)
+    /// inside the arena's scratch region. Counts bytes from
+    /// `scratch_base`. Reset by `install_arena` to 0 so each call
+    /// starts with a clean scratch heap.
+    scratch_cursor: UnsafeCell<u32>,
+    /// Arena-relative byte offset at which the scratch region starts.
+    /// Always equals `out_ptr + out_cap` for the current call. The
+    /// cranelift `Op::AllocScratch` / `Op::AllocScratchDyn` sequence
+    /// reads this to produce `scratch_base + scratch_cursor` as the
+    /// arena-relative i32 pointer returned to the stdlib body.
+    scratch_base: UnsafeCell<u32>,
     /// Reference start time for the deadline check. Set once at
     /// construction; the entry computes elapsed nanos against this.
     epoch: Instant,
@@ -321,6 +333,15 @@ pub const STATE_OFFSET_ARENA_LEN: i32 = 24;
 /// writes this from `Op::AllocSubRecord` / `Op::EmitTailRecord*` to
 /// bump-allocate inside the output buffer's tail region.
 pub const STATE_OFFSET_TAIL_CURSOR: i32 = 28;
+/// Byte offset of [`SandboxState::scratch_cursor`]. Codegen uses this
+/// for the `Op::AllocScratch` / `Op::AllocScratchDyn` bump path the
+/// memory stdlib (`concat` / `substring` / …) relies on.
+pub const STATE_OFFSET_SCRATCH_CURSOR: i32 = 32;
+/// Byte offset of [`SandboxState::scratch_base`]. The arena-relative
+/// start of the scratch region; the cranelift bump-allocator returns
+/// `scratch_base + scratch_cursor` as the i32 pointer the stdlib body
+/// then dereferences via `LoadI32AtAbsolute` / `MemcpyAtAbsolute` etc.
+pub const STATE_OFFSET_SCRATCH_BASE: i32 = 36;
 
 // SAFETY: `Cell<TokenRange>` is not `Sync`, but we only hand
 // `&SandboxState` to single-threaded cranelift code; the typed
@@ -342,6 +363,8 @@ impl SandboxState {
             arena_base: UnsafeCell::new(0),
             arena_len: UnsafeCell::new(0),
             tail_cursor: UnsafeCell::new(0),
+            scratch_cursor: UnsafeCell::new(0),
+            scratch_base: UnsafeCell::new(0),
             epoch: Instant::now(),
             capabilities,
             entry_range: Cell::new(TokenRange::default()),
@@ -367,6 +390,26 @@ impl SandboxState {
             *self.arena_base.get() = base as usize;
             *self.arena_len.get() = len;
             *self.tail_cursor.get() = 0;
+            *self.scratch_cursor.get() = 0;
+            *self.scratch_base.get() = 0;
+        }
+    }
+
+    /// Set the arena-relative start of the scratch region. The
+    /// trampoline calls this immediately after `install_arena` (and
+    /// before invoking the JIT entry) so the scratch bump allocator
+    /// reads a meaningful base. Setting it separately keeps
+    /// `install_arena`'s `(base, len)` envelope source-of-truth for
+    /// "what the JIT sees as linear memory" while the scratch base is
+    /// a derived address chosen by the trampoline based on the input
+    /// / output buffer layout.
+    ///
+    /// # Safety
+    ///
+    /// Must be called strictly before the JIT entry begins running.
+    pub unsafe fn install_scratch_base(&self, scratch_base: u32) {
+        unsafe {
+            *self.scratch_base.get() = scratch_base;
         }
     }
 
@@ -550,6 +593,14 @@ mod tests {
         assert_eq!(
             (state.tail_cursor.get() as usize) - base,
             STATE_OFFSET_TAIL_CURSOR as usize
+        );
+        assert_eq!(
+            (state.scratch_cursor.get() as usize) - base,
+            STATE_OFFSET_SCRATCH_CURSOR as usize
+        );
+        assert_eq!(
+            (state.scratch_base.get() as usize) - base,
+            STATE_OFFSET_SCRATCH_BASE as usize
         );
     }
 

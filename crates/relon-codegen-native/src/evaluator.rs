@@ -338,11 +338,10 @@ impl CraneliftAotEvaluator {
         self.dispatch_post(result)
     }
 
-    /// Internal: invoke the buffer-protocol JIT entry. Caller owns
-    /// the arena bytes (already populated with the input buffer);
-    /// this helper installs them into the sandbox state, kicks off
-    /// the JIT, and reports either the `bytes_written` from `run_main`
-    /// or a typed trap.
+    /// Same as [`Self::invoke_buffer_entry_with_scratch`] without an
+    /// explicit scratch base — defaults to `0`. Kept for direct-IR
+    /// tests that don't route through the schema-aware trampoline.
+    #[allow(dead_code)]
     fn invoke_buffer_entry(
         &self,
         arena: &mut [u8],
@@ -350,6 +349,27 @@ impl CraneliftAotEvaluator {
         in_len: u32,
         out_ptr: u32,
         out_cap: u32,
+        caps: u64,
+    ) -> Result<i32, RuntimeError> {
+        self.invoke_buffer_entry_with_scratch(
+            arena, in_ptr, in_len, out_ptr, out_cap, /*scratch_base=*/ 0, caps,
+        )
+    }
+
+    /// Internal: invoke the buffer-protocol JIT entry. Caller owns
+    /// the arena bytes (already populated with the input buffer);
+    /// this helper installs them into the sandbox state, kicks off
+    /// the JIT, and reports either the `bytes_written` from `run_main`
+    /// or a typed trap.
+    #[allow(clippy::too_many_arguments)]
+    fn invoke_buffer_entry_with_scratch(
+        &self,
+        arena: &mut [u8],
+        in_ptr: u32,
+        in_len: u32,
+        out_ptr: u32,
+        out_cap: u32,
+        scratch_base: u32,
         caps: u64,
     ) -> Result<i32, RuntimeError> {
         self.sandbox_state.reset_trap();
@@ -361,6 +381,7 @@ impl CraneliftAotEvaluator {
         unsafe {
             self.sandbox_state
                 .install_arena(arena.as_mut_ptr(), arena.len() as u32);
+            self.sandbox_state.install_scratch_base(scratch_base);
         }
         let state_ptr: *const SandboxState = Arc::as_ptr(&self.sandbox_state);
         let entry = match self.entry_fn {
@@ -445,8 +466,16 @@ impl CraneliftAotEvaluator {
         })?;
         let in_ptr = align_up(const_data_len, 8);
         let out_ptr = align_up(in_ptr + in_len, 8);
-        let arena_size = out_ptr
-            .checked_add(out_cap)
+        // Reserve a scratch region past the output buffer for the
+        // memory stdlib (`concat` / `substring` / …) to bump-allocate
+        // temporary records. 64 KiB matches the wasm side's typical
+        // growth before it has to grow `memory`. The size is fixed
+        // for now; later v5-γ work can pool / size it from the source
+        // when stdlib usage gets bigger.
+        let scratch_size: u32 = 65_536;
+        let scratch_base = align_up(out_ptr + out_cap, 8);
+        let arena_size = scratch_base
+            .checked_add(scratch_size)
             .ok_or_else(|| RuntimeError::IoError("cranelift arena size overflow".into()))?;
 
         let mut arena = vec![0u8; arena_size as usize];
@@ -456,8 +485,14 @@ impl CraneliftAotEvaluator {
         arena[in_ptr as usize..in_ptr as usize + in_bytes.len()].copy_from_slice(&in_bytes);
 
         // 3. Invoke the JIT.
-        let bytes_written = self.invoke_buffer_entry(
-            &mut arena, in_ptr, in_len, out_ptr, out_cap, /*caps=*/ 0,
+        let bytes_written = self.invoke_buffer_entry_with_scratch(
+            &mut arena,
+            in_ptr,
+            in_len,
+            out_ptr,
+            out_cap,
+            scratch_base,
+            /*caps=*/ 0,
         )?;
         if bytes_written < 0 {
             return Err(RuntimeError::IoError(format!(

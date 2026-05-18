@@ -46,7 +46,7 @@ use relon_ir::ir::{IrType, Module as IrModule, Op, TaggedOp};
 use crate::error::CraneliftError;
 use crate::sandbox::{
     SandboxConfig, SandboxState, TrapKind, STATE_OFFSET_ARENA_BASE, STATE_OFFSET_ARENA_LEN,
-    STATE_OFFSET_TAIL_CURSOR,
+    STATE_OFFSET_SCRATCH_BASE, STATE_OFFSET_SCRATCH_CURSOR, STATE_OFFSET_TAIL_CURSOR,
 };
 
 /// Output of a successful compile: a JIT module plus the entry's
@@ -1961,6 +1961,56 @@ impl<'a, 'b> Codegen<'a, 'b> {
                 self.emit_tail_record_from_absolute(*ty)?;
             }
 
+            // v5-β-2 stage 3: memory stdlib + scratch primitives.
+            Op::AllocScratch { size_bytes } => {
+                self.emit_alloc_scratch_static(*size_bytes)?;
+            }
+            Op::AllocScratchDyn => {
+                self.emit_alloc_scratch_dyn()?;
+            }
+            Op::LoadI32AtAbsolute { offset } => {
+                self.emit_load_i32_at_absolute(*offset)?;
+            }
+            Op::LoadI64AtAbsolute { offset } => {
+                self.emit_load_i64_at_absolute(*offset)?;
+            }
+            Op::LoadF64AtAbsolute { offset } => {
+                self.emit_load_f64_at_absolute(*offset)?;
+            }
+            Op::LoadI8UAtAbsolute { offset } => {
+                self.emit_load_i8u_at_absolute(*offset)?;
+            }
+            Op::StoreI32AtAbsolute { offset } => {
+                self.emit_store_i32_at_absolute(*offset)?;
+            }
+            Op::StoreI64AtAbsolute { offset } => {
+                self.emit_store_i64_at_absolute(*offset)?;
+            }
+            Op::StoreF64AtAbsolute { offset } => {
+                self.emit_store_f64_at_absolute(*offset)?;
+            }
+            Op::StoreI8AtAbsolute { offset } => {
+                self.emit_store_i8_at_absolute(*offset)?;
+            }
+            Op::MemcpyAtAbsolute => {
+                self.emit_memcpy_at_absolute()?;
+            }
+            Op::Trap { kind } => {
+                // `relon_ir::TrapKind` covers stdlib-domain failures
+                // (`IndexOutOfBounds`, `EmptyList`, `InvalidUtf8`).
+                // Map them all into the sandbox-side BoundsViolation
+                // / Unreachable surface until v6-γ widens the trap
+                // taxonomy. The harness's `trap_equivalent` already
+                // accepts the converged shape.
+                let mapped = match kind {
+                    relon_ir::TrapKind::IndexOutOfBounds | relon_ir::TrapKind::EmptyList => {
+                        TrapKind::BoundsViolation
+                    }
+                    relon_ir::TrapKind::InvalidUtf8 => TrapKind::Unreachable,
+                };
+                self.emit_trap(mapped)?;
+            }
+
             // v5-β-2: every other op still surfaces as Codegen
             // failure. Items #1-#6 in the v5-β-2 plan (LoadField,
             // StoreField, scratch alloc, stdlib inlining, full
@@ -2137,29 +2187,61 @@ impl<'a, 'b> Codegen<'a, 'b> {
         self.builder.seal_block(then_block);
         self.builder.seal_block(else_block);
 
-        // Then-arm
+        // Then-arm. Push the join block as a label frame so a nested
+        // `Br 0` (or higher depths threading through `If`) finds the
+        // right target — wasm semantics treat `If` as a labeled block
+        // whose break target is the matching `End`.
         self.builder.switch_to_block(then_block);
-        let stack_before = self.stack.len();
+        let stack_before_then = self.stack.len();
+        self.label_stack.push(LabelFrame {
+            target_block: join_block,
+            is_loop: false,
+        });
         self.emit_body(then_body)?;
-        if self.stack.len() != stack_before + 1 {
+        self.label_stack.pop();
+        // The arm may have terminated early (Br / Trap) and switched
+        // to a dummy unreachable block. In that case any "value left
+        // on the stack" is stale — we ignore the stack-discipline
+        // check and feed cranelift a placeholder undef-like value so
+        // the unreachable block still jumps to join_block with a
+        // typed arg. The DCE pass drops the dummy on the floor.
+        let then_result = if self.stack.len() == stack_before_then + 1 {
+            self.stack.pop().unwrap()
+        } else if self.stack.len() < stack_before_then {
             return Err(CraneliftError::Codegen(
-                "If then-body must leave one value on the stack".into(),
+                "If then-body underflowed the stack".into(),
             ));
-        }
-        let then_result = self.stack.pop().unwrap();
+        } else {
+            // Stack drifted (e.g. Br/Trap terminated early without
+            // pushing); emit an iconst placeholder so the join_block
+            // edge stays typed. Codegen of subsequent ops uses the
+            // join_block param, never this placeholder.
+            self.placeholder_for(cr_ty)
+        };
         self.builder.ins().jump(join_block, &[then_result.into()]);
+        // Drop anything else the arm leaked.
+        self.stack.truncate(stack_before_then);
 
-        // Else-arm
+        // Else-arm.
         self.builder.switch_to_block(else_block);
-        let stack_before = self.stack.len();
+        let stack_before_else = self.stack.len();
+        self.label_stack.push(LabelFrame {
+            target_block: join_block,
+            is_loop: false,
+        });
         self.emit_body(else_body)?;
-        if self.stack.len() != stack_before + 1 {
+        self.label_stack.pop();
+        let else_result = if self.stack.len() == stack_before_else + 1 {
+            self.stack.pop().unwrap()
+        } else if self.stack.len() < stack_before_else {
             return Err(CraneliftError::Codegen(
-                "If else-body must leave one value on the stack".into(),
+                "If else-body underflowed the stack".into(),
             ));
-        }
-        let else_result = self.stack.pop().unwrap();
+        } else {
+            self.placeholder_for(cr_ty)
+        };
         self.builder.ins().jump(join_block, &[else_result.into()]);
+        self.stack.truncate(stack_before_else);
 
         self.builder.seal_block(join_block);
         self.builder.switch_to_block(join_block);
@@ -2196,6 +2278,280 @@ impl<'a, 'b> Codegen<'a, 'b> {
         let cmp = self.builder.ins().icmp(IntCC::Equal, fn_ptr, zero);
         self.cond_trap(cmp, TrapKind::CapabilityDenied);
         Ok(())
+    }
+
+    /// Bump-allocate `size_bytes` inside the scratch region of the
+    /// arena. Mirrors the wasm-side `emit_alloc_scratch_static`:
+    ///
+    /// 1. Read `state.scratch_cursor`.
+    /// 2. Bounds-check `scratch_base + cursor + size <= arena_len`.
+    /// 3. Bump the cursor.
+    /// 4. Push the **arena-relative** offset `scratch_base + pre_cursor`
+    ///    onto the virtual stack as an `i32`.
+    ///
+    /// The pushed value is an arena-relative i32 pointer the stdlib
+    /// body's `LoadI32AtAbsolute` / `StoreI32AtAbsolute` /
+    /// `MemcpyAtAbsolute` ops can dereference.
+    fn emit_alloc_scratch(&mut self, size: CValue) -> Result<(), CraneliftError> {
+        let cur = self.builder.ins().load(
+            I32,
+            MemFlags::trusted(),
+            self.state_ptr,
+            STATE_OFFSET_SCRATCH_CURSOR,
+        );
+        let scratch_base = self.builder.ins().load(
+            I32,
+            MemFlags::trusted(),
+            self.state_ptr,
+            STATE_OFFSET_SCRATCH_BASE,
+        );
+        let arena_len = self.builder.ins().load(
+            I32,
+            MemFlags::trusted(),
+            self.state_ptr,
+            STATE_OFFSET_ARENA_LEN,
+        );
+        // Bounds: scratch_base + cur + size <= arena_len.
+        if self.sandbox.bounds_check {
+            let base_plus_cur = self.builder.ins().iadd(scratch_base, cur);
+            let end = self.builder.ins().iadd(base_plus_cur, size);
+            let cmp = self
+                .builder
+                .ins()
+                .icmp(IntCC::UnsignedGreaterThan, end, arena_len);
+            self.cond_trap(cmp, TrapKind::BoundsViolation);
+        }
+        // Push the arena-relative offset (scratch_base + pre_cursor).
+        let off = self.builder.ins().iadd(scratch_base, cur);
+        // Bump.
+        let new_cur = self.builder.ins().iadd(cur, size);
+        self.builder.ins().store(
+            MemFlags::trusted(),
+            new_cur,
+            self.state_ptr,
+            STATE_OFFSET_SCRATCH_CURSOR,
+        );
+        self.push(off);
+        Ok(())
+    }
+
+    /// Lower `Op::AllocScratchDyn`. The size is popped from the
+    /// virtual stack (must be an `i32`).
+    fn emit_alloc_scratch_dyn(&mut self) -> Result<(), CraneliftError> {
+        let size = self.pop()?;
+        self.emit_alloc_scratch(size)
+    }
+
+    /// Lower `Op::AllocScratch { size_bytes }`. The size is a
+    /// compile-time constant.
+    fn emit_alloc_scratch_static(&mut self, size_bytes: u32) -> Result<(), CraneliftError> {
+        let size = self.builder.ins().iconst(I32, i64::from(size_bytes));
+        self.emit_alloc_scratch(size)
+    }
+
+    /// Translate an arena-relative `i32` offset (top of stack) to its
+    /// absolute host address. Performs the standard `arena_base + off`
+    /// computation plus an optional bounds check against `arena_len`.
+    /// Pushes nothing — the caller decides what to do with the
+    /// returned cranelift value.
+    fn arena_addr(&mut self, off_i32: CValue, slot_size: u32) -> Result<CValue, CraneliftError> {
+        let arena_base = self.builder.ins().load(
+            self.pointer_ty,
+            MemFlags::trusted(),
+            self.state_ptr,
+            STATE_OFFSET_ARENA_BASE,
+        );
+        if self.sandbox.bounds_check {
+            let arena_len = self.builder.ins().load(
+                I32,
+                MemFlags::trusted(),
+                self.state_ptr,
+                STATE_OFFSET_ARENA_LEN,
+            );
+            let size = self.builder.ins().iconst(I32, i64::from(slot_size));
+            let end = self.builder.ins().iadd(off_i32, size);
+            let cmp = self
+                .builder
+                .ins()
+                .icmp(IntCC::UnsignedGreaterThan, end, arena_len);
+            self.cond_trap(cmp, TrapKind::BoundsViolation);
+        }
+        let off_p = self.builder.ins().uextend(self.pointer_ty, off_i32);
+        Ok(self.builder.ins().iadd(arena_base, off_p))
+    }
+
+    /// Lower `Op::LoadI32AtAbsolute { offset }`. Pops an arena-
+    /// relative i32 base, adds `offset`, performs the bounds check
+    /// (`base + offset + 4 <= arena_len`), loads 4 bytes, and pushes
+    /// the resulting i32.
+    fn emit_load_i32_at_absolute(&mut self, offset: u32) -> Result<(), CraneliftError> {
+        let base = self.pop()?;
+        let off_v = self.builder.ins().iconst(I32, i64::from(offset));
+        let composed = self.builder.ins().iadd(base, off_v);
+        let abs = self.arena_addr(composed, 4)?;
+        let v = self.builder.ins().load(I32, MemFlags::trusted(), abs, 0);
+        self.push(v);
+        Ok(())
+    }
+
+    /// Lower `Op::LoadI64AtAbsolute { offset }`.
+    fn emit_load_i64_at_absolute(&mut self, offset: u32) -> Result<(), CraneliftError> {
+        let base = self.pop()?;
+        let off_v = self.builder.ins().iconst(I32, i64::from(offset));
+        let composed = self.builder.ins().iadd(base, off_v);
+        let abs = self.arena_addr(composed, 8)?;
+        let v = self.builder.ins().load(I64, MemFlags::trusted(), abs, 0);
+        self.push(v);
+        Ok(())
+    }
+
+    /// Lower `Op::LoadF64AtAbsolute { offset }`.
+    fn emit_load_f64_at_absolute(&mut self, offset: u32) -> Result<(), CraneliftError> {
+        let base = self.pop()?;
+        let off_v = self.builder.ins().iconst(I32, i64::from(offset));
+        let composed = self.builder.ins().iadd(base, off_v);
+        let abs = self.arena_addr(composed, 8)?;
+        let v = self.builder.ins().load(
+            cranelift_codegen::ir::types::F64,
+            MemFlags::trusted(),
+            abs,
+            0,
+        );
+        self.push(v);
+        Ok(())
+    }
+
+    /// Lower `Op::LoadI8UAtAbsolute { offset }`. Loads a single byte
+    /// and zero-extends to i32.
+    fn emit_load_i8u_at_absolute(&mut self, offset: u32) -> Result<(), CraneliftError> {
+        let base = self.pop()?;
+        let off_v = self.builder.ins().iconst(I32, i64::from(offset));
+        let composed = self.builder.ins().iadd(base, off_v);
+        let abs = self.arena_addr(composed, 1)?;
+        let b = self.builder.ins().load(
+            cranelift_codegen::ir::types::I8,
+            MemFlags::trusted(),
+            abs,
+            0,
+        );
+        let v = self.builder.ins().uextend(I32, b);
+        self.push(v);
+        Ok(())
+    }
+
+    /// Lower `Op::StoreI32AtAbsolute { offset }`. Stack:
+    /// `[base: i32, value: i32]`. Pops value first, then base.
+    fn emit_store_i32_at_absolute(&mut self, offset: u32) -> Result<(), CraneliftError> {
+        let value = self.pop()?;
+        let base = self.pop()?;
+        let off_v = self.builder.ins().iconst(I32, i64::from(offset));
+        let composed = self.builder.ins().iadd(base, off_v);
+        let abs = self.arena_addr(composed, 4)?;
+        self.builder.ins().store(MemFlags::trusted(), value, abs, 0);
+        Ok(())
+    }
+
+    /// Lower `Op::StoreI64AtAbsolute { offset }`.
+    fn emit_store_i64_at_absolute(&mut self, offset: u32) -> Result<(), CraneliftError> {
+        let value = self.pop()?;
+        let base = self.pop()?;
+        let off_v = self.builder.ins().iconst(I32, i64::from(offset));
+        let composed = self.builder.ins().iadd(base, off_v);
+        let abs = self.arena_addr(composed, 8)?;
+        self.builder.ins().store(MemFlags::trusted(), value, abs, 0);
+        Ok(())
+    }
+
+    /// Lower `Op::StoreF64AtAbsolute { offset }`.
+    fn emit_store_f64_at_absolute(&mut self, offset: u32) -> Result<(), CraneliftError> {
+        let value = self.pop()?;
+        let base = self.pop()?;
+        let off_v = self.builder.ins().iconst(I32, i64::from(offset));
+        let composed = self.builder.ins().iadd(base, off_v);
+        let abs = self.arena_addr(composed, 8)?;
+        self.builder.ins().store(MemFlags::trusted(), value, abs, 0);
+        Ok(())
+    }
+
+    /// Lower `Op::StoreI8AtAbsolute { offset }`. Pops i32 value;
+    /// stores its low byte.
+    fn emit_store_i8_at_absolute(&mut self, offset: u32) -> Result<(), CraneliftError> {
+        let value = self.pop()?;
+        let base = self.pop()?;
+        let off_v = self.builder.ins().iconst(I32, i64::from(offset));
+        let composed = self.builder.ins().iadd(base, off_v);
+        let abs = self.arena_addr(composed, 1)?;
+        let v8 = self
+            .builder
+            .ins()
+            .ireduce(cranelift_codegen::ir::types::I8, value);
+        self.builder.ins().store(MemFlags::trusted(), v8, abs, 0);
+        Ok(())
+    }
+
+    /// Lower `Op::MemcpyAtAbsolute`. Stack: `[dest: i32, src: i32,
+    /// len: i32]`. Translates each pointer through `arena_addr` and
+    /// invokes libc memcpy via cranelift's `call_memcpy` helper.
+    fn emit_memcpy_at_absolute(&mut self) -> Result<(), CraneliftError> {
+        let len = self.pop()?;
+        let src_off = self.pop()?;
+        let dest_off = self.pop()?;
+        // Bounds-check both pointers using the len.
+        if self.sandbox.bounds_check {
+            let arena_len = self.builder.ins().load(
+                I32,
+                MemFlags::trusted(),
+                self.state_ptr,
+                STATE_OFFSET_ARENA_LEN,
+            );
+            let dest_end = self.builder.ins().iadd(dest_off, len);
+            let cmp_d = self
+                .builder
+                .ins()
+                .icmp(IntCC::UnsignedGreaterThan, dest_end, arena_len);
+            self.cond_trap(cmp_d, TrapKind::BoundsViolation);
+            let src_end = self.builder.ins().iadd(src_off, len);
+            let cmp_s = self
+                .builder
+                .ins()
+                .icmp(IntCC::UnsignedGreaterThan, src_end, arena_len);
+            self.cond_trap(cmp_s, TrapKind::BoundsViolation);
+        }
+        let arena_base = self.builder.ins().load(
+            self.pointer_ty,
+            MemFlags::trusted(),
+            self.state_ptr,
+            STATE_OFFSET_ARENA_BASE,
+        );
+        let dest_p = self.builder.ins().uextend(self.pointer_ty, dest_off);
+        let src_p = self.builder.ins().uextend(self.pointer_ty, src_off);
+        let dest = self.builder.ins().iadd(arena_base, dest_p);
+        let src = self.builder.ins().iadd(arena_base, src_p);
+        let len_p = self.builder.ins().uextend(self.pointer_ty, len);
+        self.builder
+            .call_memcpy(self.frontend_config, dest, src, len_p);
+        Ok(())
+    }
+
+    /// Lower `Op::Trap { kind }`. Unconditional branch to the trap
+    /// block with the supplied kind code.
+    fn emit_trap(&mut self, kind: TrapKind) -> Result<(), CraneliftError> {
+        let one = self.builder.ins().iconst(I32, 1);
+        self.cond_trap(one, kind);
+        Ok(())
+    }
+
+    /// Emit a zero placeholder of the given cranelift type. Used to
+    /// keep dead `If` arms typed when the body branched out early
+    /// (Br / Trap) and didn't leave a real value on the stack.
+    fn placeholder_for(&mut self, ty: cranelift_codegen::ir::Type) -> CValue {
+        if ty == I64 {
+            self.builder.ins().iconst(I64, 0)
+        } else if ty == cranelift_codegen::ir::types::F64 {
+            self.builder.ins().f64const(0.0)
+        } else {
+            self.builder.ins().iconst(I32, 0)
+        }
     }
 }
 
