@@ -392,6 +392,119 @@ metadata mismatch / concurrent hit / loader smoke 等场景。
 
 ---
 
-**Author**: Relon perf 直路 v5-γ implementer agent
-**Date**: 2026-05-18
+## 九、v5-γ stage 2 — vtable indirection + dlopen-exec（2026-05-19）
+
+stage 1 留的最大 follow-up（dlopen-exec 短路）此阶段落地。
+
+### 9.1 改动概览
+
+1. **`crates/relon-codegen-native/src/vtable.rs`** 新增模块定义
+   `VtableSlot` enum（RelonNow / RelonRaiseTrap / RelonCapLookup，
+   总 3 slot，reserve 32 slot 占位），`__relon_capability_vtable`
+   symbol 名，以及 `populate_vtable` 把 host fn 指针写进 slot 的
+   `unsafe fn`。
+2. **`codegen.rs` 改造**：所有 host helper 调用从 `Linkage::Import` +
+   `call FuncRef` 改成 `__relon_capability_vtable` data symbol +
+   `load(vtable_base + slot_offset)` + `call_indirect(sig, fn_ptr,
+   args)`。entry / lambda / trap_block tail 三个调用站点共享同一
+   `emit_indirect_host_call` helper；`Codegen` 结构体加
+   `emit_host_fn_call(slot, args)` 方法。
+3. **拆出 `lower_module_into<M: CrModule>`** 让 JIT 路径（`JITModule`）
+   与 cranelift-object 路径（`ObjectModule`）共用同一份 lowering。
+4. **`compile_module_to_object_bytes`**：parallels JIT 路径，产出
+   ET_REL bytes 给 `relon-object-link::link_to_dyn`。dlopen 后 ET_DYN
+   只引用 `__relon_capability_vtable` 一个外部 symbol。
+5. **`schema_cache.rs` 新模块**：side-loaded `.relon-schema-v1` 文件
+   持 (main_schema, return_schema, param_names, const_data,
+   closure_count, entry_shape, entry_arity, entry_range)；
+   `from_cache_dir` 用它跳过 parse + analyze + lower。
+6. **`from_cache_dir` 改造**：命中后走 `LoadedObject::from_bytes`
+   memfd + dlopen + dlsym(run_main / vtable / __closure_N) →
+   `populate_vtable` → 构造 `CraneliftAotEvaluator { _module:
+   EntryBacking::Dlopen(loaded), ... }`。完全 skip JIT。
+7. **GENERATOR_VERSION** 升到 `"relon-codegen-native v5-gamma 2"`，
+   stage 1 cache 文件自失效。
+
+### 9.2 实测数字（criterion `--quick`，host: linux x86_64）
+
+| 场景 | stage 1 (2026-05-18) | stage 2 (2026-05-19) | 变化 |
+|---|---|---|---|
+| `cranelift_cold`（synthetic IR + JIT） | ~275 µs | ~278 µs | 持平（vtable 间接调用对 cold 无影响） |
+| `cranelift_warm`（preassembled） | ~391 ns | ~398 ns | 持平（warm 路径多一次 vtable load，~7ns） |
+| `v5_gamma_cached_cold_start/cold` | ~2.68 ms | **~339 µs** | **−7.9×** |
+| `v5_gamma_cached_cold_start_full/cold_full` | — | **~350 µs** | 新增（cached cold start + 1 invoke） |
+| `tree_walk_warm` | ~2.37 µs | ~2.38 µs | 持平 |
+
+### 9.3 与 15 µs 目标的差距 — 分阶段 latency 表
+
+`tests/vtable_latency_breakdown.rs`（release profile）打出的细分：
+
+| 阶段 | 时长 | 占比 | 备注 |
+|---|---|---|---|
+| `cache_load` | ~259 µs | 52% | 读 ELF bytes from disk + HMAC verify。冷文件系统 + sha256(每文件) 是大头 |
+| `dlopen+dlsym` | ~179 µs | 36% | `memfd_create` + write + `/proc/self/fd/N` dlopen + ld.so 重定位 + 3 次 dlsym |
+| `schema_decode` | ~52 µs | 10% | `serde_json::from_slice` ~500 字节 |
+| `vtable_populate` | ~6 µs | 1% | 3 次 8-byte 写 |
+| **total** | ~496 µs | 100% | warm FS cache 下 criterion 取得 ~340 µs |
+
+stage 2 把 cached cold start 从 2.68 ms 降到 ~340 µs，但仍然
+比 15 µs 目标高 ~22×。要继续推到 ≤ 15 µs 需要 stage 3 级别的
+架构改动：
+
+- **mmap + RELRO**：把 cache file mmap 进内存而非每次 read，
+  避免冷 fs 读 + HMAC 重算（如果 host trust on cache_dir
+  ownership）。预期省 ~200 µs。
+- **avoid dlopen**：自己写一个最小 ELF loader 走 mmap +
+  in-process relocation（cranelift 已知它发的是 PIC RIP-relative
+  + GOT/PLT-less code，loader 不需要做太多 work），跳过 ld.so 的
+  通用-purpose codepath。预期省 ~120 µs。
+- **schema cache 二进制化**：换掉 serde_json 用 bincode + 手写
+  custom format（绕开 `TypeRepr` 的 `tag = "kind"` 限制）。预期
+  省 ~40 µs。
+
+合起来理论上能进到 < 30 µs，但 stage 3 不是这一轮的范畴；本
+stage 的核心交付是 vtable indirection + dlopen-exec 真的能跑
+（5 个新 vtable_indirection 测试 + 10 个原 object_cache_integration
+测试全过）。
+
+### 9.4 关键决策
+
+1. **vtable 间接，不 -rdynamic**。stage 1 报告里列了 `-rdynamic`
+   作为备选；本 stage 拒绝它，因为 `cargo test` 默认不带，embedded
+   host 也不可能控制 build flag。
+2. **schema cache 用 serde_json，不 bincode**。`TypeRepr` 是
+   `#[serde(tag = "kind")]` 内部 tag，bincode 1.x 不支持
+   `deserialize_any`。换 bincode 要么改 TypeRepr 的 serde（污染
+   `relon-eval-api`），要么手写 encoder。serde_json 在 ~50 µs 这
+   一段不是 critical。
+3. **closure-table dispatch 保留间接基址**。`Op::CallClosure` 已
+   经走 `state.closure_table_base[idx]` 间接，与 vtable 间接是相同
+   pattern；不需要让它经过 vtable，dlopen 后 host 用 dlsym 重新
+   resolve 每个 `__closure_N` 即可。
+
+### 9.5 v5-γ stage 2 Gate
+
+| Gate | 命令 | 结果 |
+|---|---|---|
+| build | `cargo build --workspace` | ✓ |
+| test | `cargo test --workspace` | 1632 passed / 0 failed |
+| clippy | `cargo clippy --workspace --all-targets -- -D warnings` | ✓ |
+| fmt | `cargo fmt --all -- --check` | ✓ |
+| wasm32 | `cargo build --target wasm32-unknown-unknown -p relon-wasm` | ✓ |
+
+1607 (stage 1) → 1632 (stage 2) = +25 tests。新增覆盖：
+- `vtable.rs` 4 个 unit tests（slot offset / count / reserved
+  headroom / populate_vtable smoke）。
+- `tests/vtable_indirection.rs` 5 个集成测试（cached cold start
+  through dlopen-exec for + / - / div-by-zero 三种 entry body）。
+- `tests/vtable_latency_breakdown.rs` 1 个 prof probe（不算
+  Gate 数字，但保留在 tree 里方便回归）。
+- `schema_cache.rs` 3 个 unit tests（round-trip / magic / digest）。
+- 已有 `object_cache_integration.rs` 10 个测试全继续通过（schema
+  cache 副 file 加进流程后没动它们）。
+
+---
+
+**Author**: Relon perf 直路 v5-γ stage 2 implementer
+**Date**: 2026-05-19
 **License**: Apache-2
