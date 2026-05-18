@@ -23,6 +23,11 @@ relon-evaluator = { workspace = true }
 # because the bench crate is host-only (never built for wasm32) and
 # `cargo bench` always wants both backends available.
 relon-codegen-wasm = { workspace = true }
+# v5-beta-1: cranelift-AOT comparison bench. Mirrors the wasm-AOT
+# wiring shape; bench crate is host-only so we can pull both backends
+# unconditionally.
+relon-codegen-native = { workspace = true }
+relon-ir = { workspace = true }
 relon-eval-api = { workspace = true }
 dhat = { version = "0.3", optional = true }
 
@@ -58,3 +63,13 @@ path = "benches/harness_v1.rs"
 name = "wasm_aot_vs_tree_walk"
 harness = false
 path = "benches/wasm_aot_vs_tree_walk.rs"
+
+# v5-beta-1 cranelift-AOT vs wasm-AOT cold/warm comparison. Uses
+# synthetic IR for the arithmetic scenario because the cranelift
+# backend doesn't yet drive the analyzer / lower pipeline through
+# `from_source` for buffer-protocol bodies. Run via
+# `cargo bench -p relon-bench --bench cranelift_aot_vs_wasm_aot`.
+[[bench]]
+name = "cranelift_aot_vs_wasm_aot"
+harness = false
+path = "benches/cranelift_aot_vs_wasm_aot.rs"
