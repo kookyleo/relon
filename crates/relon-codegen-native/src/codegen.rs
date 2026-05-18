@@ -340,6 +340,7 @@ pub fn compile_module(
             ir,
             trap_block: Some(trap_block),
             label_stack: Vec::new(),
+            inline_frames: Vec::new(),
         };
 
         codegen.emit_prologue();
@@ -380,6 +381,27 @@ pub fn compile_module(
         entry_arity: entry.params.len(),
         entry_range: entry.range,
         entry_shape,
+    })
+}
+
+/// Map a generic IR type to its cranelift slot type. Used by the
+/// inline `Op::Call` lowering to size the exit block-param of an
+/// inlined callee.
+fn ir_ty_to_cl(ty: IrType) -> Result<cranelift_codegen::ir::Type, CraneliftError> {
+    Ok(match ty {
+        IrType::I64 => I64,
+        IrType::F64 => cranelift_codegen::ir::types::F64,
+        IrType::I32 | IrType::Bool | IrType::Null => I32,
+        // Pointer-indirect leaves carry an i32 buffer-relative
+        // offset in the IR's wasm-shaped slot model. Cranelift
+        // mirrors that as a plain i32.
+        IrType::String
+        | IrType::ListInt
+        | IrType::ListFloat
+        | IrType::ListBool
+        | IrType::ListString
+        | IrType::ListSchema
+        | IrType::Closure => I32,
     })
 }
 
@@ -469,6 +491,36 @@ struct Codegen<'a, 'b> {
     /// `label_depth = 0` selects the innermost (top of stack)
     /// label; higher depths walk outwards.
     label_stack: Vec<LabelFrame>,
+
+    /// Inline-frame stack for stdlib `Op::Call` lowering. When we
+    /// inline a callee body, we push a frame here so the callee's
+    /// `LocalGet(idx)` / `LetGet/LetSet` / `Op::Return` resolve
+    /// against the call site rather than the entry function. See
+    /// [`InlineFrame`] for fields.
+    inline_frames: Vec<InlineFrame>,
+}
+
+/// One inline-frame entry for a stdlib body lowered through
+/// `Op::Call`. See `Codegen::inline_frames` for usage.
+struct InlineFrame {
+    /// Cranelift values bound to the callee's declared parameters.
+    /// `LocalGet(idx)` reads from this slice while the frame is
+    /// active.
+    params: Vec<CValue>,
+    /// Block the callee's `Op::Return` jumps to. The exit block has
+    /// one block-param carrying the typed return value.
+    exit_block: cranelift_codegen::ir::Block,
+    /// Result type of the callee. Informational today (block-param
+    /// already carries the cranelift type); kept for the future
+    /// trace-recorder hook that wants the IR-side tag for guard
+    /// emission.
+    #[allow(dead_code)]
+    ret_ty: IrType,
+    /// Caller's `let_locals` size at the moment the inline frame
+    /// was pushed. The callee's `LetSet { idx }` rewrites to
+    /// `let_offset + idx`, keeping each inlined frame's let
+    /// bindings in a private namespace.
+    let_offset: u32,
 }
 
 /// One label frame for the `Op::Br` / `Op::BrIf` / `Op::BrTable`
@@ -675,30 +727,41 @@ impl<'a, 'b> Codegen<'a, 'b> {
     }
 
     /// Emit the function's `Return`:
-    ///   * LegacyI64Args — pop the top of the virtual stack and emit
-    ///     `return v: i64`.
-    ///   * BufferProtocol — the wasm-side semantics push `i32
-    ///     bytes_written` (the tail cursor when the body emitted
-    ///     pointer-indirect stores, else `return_root_size`) and end
-    ///     the function. v5-β-2 only handles scalar returns; the
-    ///     `Op::Return` here loads the tail cursor (currently 0) from
-    ///     state and writes the return-root size as the count.
+    ///   * Inline frame active — pop the top of the virtual stack
+    ///     and `jump exit_block(v)`, finishing the callee body.
+    ///   * LegacyI64Args (no inline) — pop the top of the virtual
+    ///     stack and emit `return v: i64`.
+    ///   * BufferProtocol (no inline) — the wasm-side semantics
+    ///     push `i32 bytes_written` (the tail cursor when the body
+    ///     emitted pointer-indirect stores, else `return_root_size`)
+    ///     and end the function.
     fn emit_return(&mut self) -> Result<(), CraneliftError> {
+        if let Some(exit) = self.inline_frames.last().map(|f| f.exit_block) {
+            // Inline-frame return: jump to the exit block with the
+            // popped value as the block param. The caller's
+            // `emit_call_stdlib` continues from there.
+            let v = self.pop()?;
+            self.builder.ins().jump(exit, &[v.into()]);
+            // After the unconditional jump, the rest of the basic
+            // block is unreachable. Provide a dummy block so any
+            // subsequent ops emitted before the inline frame is
+            // popped land somewhere valid.
+            let dummy = self.builder.create_block();
+            self.builder.seal_block(dummy);
+            self.builder.switch_to_block(dummy);
+            return Ok(());
+        }
         match self.entry_shape {
             EntryShape::LegacyI64Args => {
                 let v = self.pop()?;
                 self.builder.ins().return_(&[v]);
             }
             EntryShape::BufferProtocol => {
-                // The host trampoline knows the canonical return-root
-                // size from the lowered schema; we report a sentinel
-                // tail-cursor value here that says "use the canonical
-                // size". Picking u32::MAX would collide with overflow
-                // checks; the host instead reads back the actual
-                // `state.tail_cursor()` slot, which the lowering only
-                // updates when pointer-indirect stores run. For pure
-                // scalar bodies, returning 0 leaves the host's
-                // fallback (`return_root_size`) intact.
+                // The host trampoline reads back the actual
+                // `state.tail_cursor()` slot, which the lowering
+                // updates as pointer-indirect stores run. For pure
+                // scalar bodies the tail-cursor stays at 0; the host
+                // falls back to `return_root_size`.
                 let tail = self.builder.ins().load(
                     I32,
                     MemFlags::trusted(),
@@ -711,6 +774,111 @@ impl<'a, 'b> Codegen<'a, 'b> {
         Ok(())
     }
 
+    /// Translate a stdlib `Op::Call` by inlining the callee's body.
+    ///
+    /// The IR's `Op::Call { fn_index, arg_count, param_tys, ret_ty }`
+    /// is the surface for stdlib dispatch (and, in the future,
+    /// user-function dispatch). The wasm backend resolves `fn_index`
+    /// against the bundled stdlib + user functions and emits a wasm
+    /// `call` instruction. The cranelift backend has no separate
+    /// callee compilation unit yet, so v5-β-2 inlines the body in
+    /// place: pop `arg_count` cranelift values off the operand
+    /// stack, bind them to the callee's `params` slots, lower the
+    /// callee body with an active `InlineFrame`, and continue at the
+    /// exit block carrying the typed return value.
+    fn emit_call_stdlib(
+        &mut self,
+        fn_index: u32,
+        arg_count: u32,
+        param_tys: &[IrType],
+        ret_ty: IrType,
+    ) -> Result<(), CraneliftError> {
+        // Resolve the callee. The IR pass uses `fn_index = stdlib idx`
+        // for bundled stdlib calls and `fn_index = N + user_fn_idx`
+        // for user-defined. v5-β-2 only inlines bundled stdlib bodies
+        // — fn_index that exceeds the bundled stdlib's length surfaces
+        // as Codegen failure so the harness routes the case to
+        // `CraneliftUnsupported`.
+        let stdlib = relon_ir::stdlib::builtin_stdlib();
+        let callee = stdlib.get(fn_index as usize).ok_or_else(|| {
+            CraneliftError::Codegen(format!(
+                "Op::Call fn_index {fn_index} outside bundled stdlib (max {})",
+                stdlib.len()
+            ))
+        })?;
+
+        // Sanity-check arity + param shapes against the IR's tag.
+        if callee.params.len() != arg_count as usize {
+            return Err(CraneliftError::Codegen(format!(
+                "Op::Call to `{}` declares {} args but callee has {}",
+                callee.name,
+                arg_count,
+                callee.params.len()
+            )));
+        }
+        for (i, (declared, expected)) in callee.params.iter().zip(param_tys.iter()).enumerate() {
+            if declared != expected {
+                return Err(CraneliftError::Codegen(format!(
+                    "Op::Call to `{}` arg #{i}: callee expects {declared:?}, IR tags {expected:?}",
+                    callee.name
+                )));
+            }
+        }
+
+        // Pop the arguments off the operand stack. The IR pushes
+        // them in declaration order, so the last-pushed value is the
+        // last param.
+        let mut args = Vec::with_capacity(arg_count as usize);
+        for _ in 0..arg_count {
+            args.push(self.pop()?);
+        }
+        args.reverse();
+
+        // Allocate the exit block + result-carrier param.
+        let exit_block = self.builder.create_block();
+        let exit_ty = ir_ty_to_cl(ret_ty)?;
+        self.builder.append_block_param(exit_block, exit_ty);
+
+        // Capture the let_locals "next free slot" snapshot. Stdlib
+        // bodies don't typically declare let bindings, but the
+        // namespace separation is cheap and future-proofs the
+        // inlining once larger callees come online. We use the max
+        // currently-used index + 1; if the caller has no let
+        // bindings yet, the offset is 0 and the callee's `LetSet 0`
+        // maps to caller slot 0 — collision-free because no caller
+        // op has run yet that touches let_locals at this nesting.
+        let let_offset = self
+            .let_locals
+            .keys()
+            .copied()
+            .max()
+            .map(|m| m + 1)
+            .unwrap_or(0);
+
+        // Push the inline frame and lower the callee body. We clone
+        // the body out of the stdlib vector because `emit_body`
+        // takes &self mut and we can't simultaneously hold a borrow
+        // into stdlib.
+        let body = callee.body.clone();
+        self.inline_frames.push(InlineFrame {
+            params: args,
+            exit_block,
+            ret_ty,
+            let_offset,
+        });
+        let result = self.emit_body(&body);
+        let frame = self.inline_frames.pop().expect("we just pushed one");
+        result?;
+
+        // Switch to the exit block; its block-param is the typed
+        // return value, push it onto the caller's stack.
+        self.builder.seal_block(frame.exit_block);
+        self.builder.switch_to_block(frame.exit_block);
+        let ret_val = self.builder.block_params(frame.exit_block)[0];
+        self.push(ret_val);
+        Ok(())
+    }
+
     /// Materialise a cranelift `Variable` for a `LocalGet` slot the
     /// IR references. Slot 0 corresponds to `arg_values[0]`, slot 1
     /// to `arg_values[1]`, and so on. The variable's type tracks the
@@ -720,7 +888,23 @@ impl<'a, 'b> Codegen<'a, 'b> {
     /// * `BufferProtocol` — locals 0..=3 are `i32` (the handshake
     ///   slots `in_ptr`, `in_len`, `out_ptr`, `out_cap`), local 4 is
     ///   `i64` (`caps_arg`).
+    ///
+    /// When an inline frame is active (we're lowering the body of a
+    /// stdlib callee inlined through `Op::Call`), `LocalGet(idx)`
+    /// resolves to the matching slot of the topmost inline frame
+    /// instead of the entry's locals — preserving the wasm semantics
+    /// where the callee sees its own `params` as locals `0..N`.
     fn get_local(&mut self, idx: u32) -> Result<CValue, CraneliftError> {
+        if let Some(frame) = self.inline_frames.last() {
+            let arg_idx = idx as usize;
+            if arg_idx >= frame.params.len() {
+                return Err(CraneliftError::Codegen(format!(
+                    "LocalGet({idx}) out of range — inlined frame has {} params",
+                    frame.params.len()
+                )));
+            }
+            return Ok(frame.params[arg_idx]);
+        }
         if let Some(var) = self.locals.get(&idx).copied() {
             return Ok(self.builder.use_var(var));
         }
@@ -749,6 +933,17 @@ impl<'a, 'b> Codegen<'a, 'b> {
         self.builder.def_var(var, self.arg_values[arg_idx]);
         self.locals.insert(idx, var);
         Ok(self.builder.use_var(var))
+    }
+
+    /// Translate a callee `LetGet/LetSet` index into the caller's
+    /// flat let-locals namespace. Each inline frame reserves a
+    /// fresh window `let_offset..` so concurrent inlined frames
+    /// don't clobber each other's bindings.
+    fn remap_let_idx(&self, idx: u32) -> u32 {
+        match self.inline_frames.last() {
+            Some(frame) => frame.let_offset + idx,
+            None => idx,
+        }
     }
 
     /// Resolve / create a `let`-binding slot.
@@ -818,12 +1013,14 @@ impl<'a, 'b> Codegen<'a, 'b> {
                 self.push(v);
             }
             Op::LetGet { idx, ty } => {
-                let v = self.get_let(*idx, *ty)?;
+                let mapped = self.remap_let_idx(*idx);
+                let v = self.get_let(mapped, *ty)?;
                 self.push(v);
             }
             Op::LetSet { idx, ty } => {
+                let mapped = self.remap_let_idx(*idx);
                 let v = self.pop()?;
-                self.set_let(*idx, *ty, v);
+                self.set_let(mapped, *ty, v);
             }
             Op::Add(IrType::I64) => {
                 let b = self.pop()?;
@@ -888,6 +1085,12 @@ impl<'a, 'b> Codegen<'a, 'b> {
             Op::Return => self.emit_return()?,
             Op::LoadField { offset, ty } => self.emit_load_field(*offset, *ty)?,
             Op::StoreField { offset, ty } => self.emit_store_field(*offset, *ty)?,
+            Op::Call {
+                fn_index,
+                arg_count,
+                param_tys,
+                ret_ty,
+            } => self.emit_call_stdlib(*fn_index, *arg_count, param_tys, *ret_ty)?,
             Op::If {
                 result_ty,
                 then_body,
