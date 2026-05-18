@@ -468,3 +468,149 @@ fn make_const_recorder(v: i64) -> RecorderState {
     assert!(matches!(term, RecordResult::Terminated));
     recorder
 }
+
+// ---- v6-γ M4: real `__relon_jump_to_recorder` driver tests ----
+
+use relon_codegen_native::{
+    clear_recording, recording_registration_count, register_recording, RecordingRegistration,
+};
+
+#[test]
+fn jump_helper_no_registration_is_noop() {
+    // fn_id not in the recording registry → helper logs + returns
+    // without installing anything. We can't observe the log without
+    // a subscriber, but the global state must stay clean.
+    let state = global_trace_jit_state();
+    let pre_installed = state.installed_count();
+    // Pick a fn_id that no other test uses.
+    let fn_id = 700u32;
+    let _ = clear_recording(fn_id);
+    reset_jump_helper_call_count();
+    unsafe {
+        relon_codegen_native::trace_install::__relon_jump_to_recorder(fn_id, std::ptr::null());
+    }
+    assert_eq!(jump_helper_call_count(), 1);
+    assert_eq!(state.installed_count(), pre_installed);
+}
+
+#[test]
+fn jump_helper_installs_const_trace_from_registry() {
+    // Register a (#main() -> Int : 99) body. The helper should walk
+    // it via TraceRecordingEvaluator, drive the install pipeline,
+    // and end up with a trace installed for the fn_id. Subsequent
+    // invocations of the helper short-circuit.
+    let fn_id = 701u32;
+    let _ = clear_recording(fn_id);
+    let state = global_trace_jit_state();
+    // Bench-style: install_trace doesn't expose an uninstall API
+    // today; skip the test if a previous run left state behind.
+    if state.lookup_trace(fn_id).is_some() {
+        // Best-effort cleanup is unavailable; skip rather than fail.
+        return;
+    }
+
+    register_recording(
+        fn_id,
+        RecordingRegistration {
+            body: vec![
+                TaggedOp {
+                    op: Op::ConstI64(99),
+                    range: TokenRange::default(),
+                },
+                TaggedOp {
+                    op: Op::Return,
+                    range: TokenRange::default(),
+                },
+            ],
+            param_tys: vec![],
+        },
+    );
+    reset_jump_helper_call_count();
+    unsafe {
+        relon_codegen_native::trace_install::__relon_jump_to_recorder(fn_id, std::ptr::null());
+    }
+    assert_eq!(jump_helper_call_count(), 1);
+    let installed = state.lookup_trace(fn_id).expect("trace installed");
+    let mut ctx = TraceContext::with_capacity(64);
+    let status = unsafe { installed.invoke(&mut ctx as *mut _, std::ptr::null()) };
+    assert_eq!(status, TraceEntryStatus::Success);
+    assert_eq!(ctx.result_slot, 99);
+
+    // A second helper invocation must short-circuit (trace already
+    // installed); the diagnostic counter still bumps because the
+    // entry path is unchanged.
+    let pre_installed = state.installed_count();
+    unsafe {
+        relon_codegen_native::trace_install::__relon_jump_to_recorder(fn_id, std::ptr::null());
+    }
+    assert_eq!(jump_helper_call_count(), 2);
+    assert_eq!(
+        state.installed_count(),
+        pre_installed,
+        "second hot trigger must not double-install"
+    );
+
+    let _ = clear_recording(fn_id);
+}
+
+#[test]
+fn recording_registry_round_trip() {
+    let fn_id = 702u32;
+    let pre = recording_registration_count();
+    let prev = register_recording(
+        fn_id,
+        RecordingRegistration {
+            body: vec![],
+            param_tys: vec![IrType::I64],
+        },
+    );
+    assert!(prev.is_none(), "fresh fn_id had no prior registration");
+    assert_eq!(recording_registration_count(), pre + 1);
+    let removed = clear_recording(fn_id).expect("must have been registered");
+    assert_eq!(removed.param_tys, vec![IrType::I64]);
+    assert_eq!(recording_registration_count(), pre);
+}
+
+#[test]
+fn jump_helper_aborts_recording_for_unsupported_op() {
+    // Register a body containing an op outside the recorder's
+    // accepted envelope. The helper should walk in, abort, and not
+    // install any trace.
+    let fn_id = 703u32;
+    let _ = clear_recording(fn_id);
+    let state = global_trace_jit_state();
+    if state.lookup_trace(fn_id).is_some() {
+        return;
+    }
+    register_recording(
+        fn_id,
+        RecordingRegistration {
+            body: vec![
+                // `CallNative` always classifies as Unrecoverable in
+                // the recorder's lowering rule, so this aborts on
+                // the first op.
+                TaggedOp {
+                    op: Op::CallNative {
+                        import_idx: 0,
+                        param_tys: vec![],
+                        ret_ty: IrType::I64,
+                        cap_bit: 0,
+                    },
+                    range: TokenRange::default(),
+                },
+                TaggedOp {
+                    op: Op::Return,
+                    range: TokenRange::default(),
+                },
+            ],
+            param_tys: vec![],
+        },
+    );
+    let pre_installed = state.installed_count();
+    unsafe {
+        relon_codegen_native::trace_install::__relon_jump_to_recorder(fn_id, std::ptr::null());
+    }
+    assert!(state.lookup_trace(fn_id).is_none(), "aborted → no install");
+    assert_eq!(state.installed_count(), pre_installed);
+    let _ = clear_recording(fn_id);
+}

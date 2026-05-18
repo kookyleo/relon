@@ -94,9 +94,10 @@ pub use sandbox::{
     STATE_OFFSET_ARENA_LEN, STATE_OFFSET_DEADLINE_NS, STATE_OFFSET_TAIL_CURSOR,
 };
 pub use trace_install::{
-    global_trace_jit_state, hot_counter_peek, hot_counter_reset, hot_counter_reset_all,
-    hot_counters_base, jump_helper_call_count, register_trace_runtime_symbols,
-    reset_jump_helper_call_count, JITedTraceFn, TraceJitError, TraceJitState, HOT_COUNTERS_SYMBOL,
-    MAX_FN_ID, RELON_HOT_THRESHOLD,
+    clear_recording, global_trace_jit_state, hot_counter_peek, hot_counter_reset,
+    hot_counter_reset_all, hot_counters_base, jump_helper_call_count, recording_registration_count,
+    register_recording, register_trace_runtime_symbols, reset_jump_helper_call_count, JITedTraceFn,
+    RecordingRegistration, TraceJitError, TraceJitState, HOT_COUNTERS_SYMBOL, MAX_FN_ID,
+    RELON_HOT_THRESHOLD,
 };
 pub use trace_recording::{RecordingOutcome, StackCell, TraceRecordingEvaluator};
