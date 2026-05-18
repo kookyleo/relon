@@ -47,7 +47,12 @@
 //! with the corpus at "arith / cmp / control flow" tier; future
 //! tranches widen it.
 
-#![forbid(unsafe_code)]
+// Cannot `#![forbid(unsafe_code)]` here because the v6-γ M4 trace-JIT
+// driver in `three_way` needs to call the `__relon_jump_to_recorder`
+// host helper and invoke JIT-emitted traces through raw fn pointers.
+// The `unsafe` blocks are confined to that one module; the rest of
+// the harness stays unsafe-free.
+#![deny(unsafe_op_in_unsafe_fn)]
 
 use std::collections::HashMap;
 
@@ -55,6 +60,7 @@ use relon::{new_evaluator, Backend, BackendError};
 use relon_eval_api::{Evaluator, RuntimeError, Value};
 
 pub mod corpus;
+pub mod three_way;
 
 /// Outcome of one differential test run.
 #[derive(Debug)]

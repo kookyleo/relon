@@ -41,7 +41,7 @@
 //!   stage; the public surface used by the smoke tests today feeds
 //!   the recorder an explicit `Op` stream.
 
-use std::cell::UnsafeCell;
+use std::cell::{RefCell, UnsafeCell};
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock, RwLock};
 
@@ -50,11 +50,62 @@ use cranelift_codegen::Context as CodegenContext;
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{Linkage, Module as _};
 
-use relon_ir::Op;
-use relon_trace_abi::{ObservedType, TraceContext, TraceEntryStatus};
+use relon_ir::{IrType, Op, TaggedOp};
+use relon_trace_abi::{HostHookTable, ObservedType, TraceContext, TraceEntryStatus};
 use relon_trace_emitter::TraceEmitter;
 use relon_trace_jit::{OptimizerPipeline, SsaVar};
 use relon_trace_recorder::{RecordResult, RecorderState};
+
+use crate::trace_recording::{RecordingOutcome, TraceRecordingEvaluator};
+
+/// Construct a [`HostHookTable`] pre-populated with `save_deopt`
+/// wired to the v6-γ runtime helper.
+///
+/// Hosts that want to invoke a JIT-emitted trace and observe deopt
+/// telemetry through the table indirection (rather than relying on
+/// JITBuilder's symbol resolution) build their `TraceContext` with
+/// this table.
+///
+/// Phase v6-γ M4 keeps the cranelift emitter using direct extern
+/// symbols (resolved at JIT-finalize time); the table is kept in
+/// parallel so:
+///
+/// 1. Hosts that want a stable read of "did this trace deopt?" can
+///    inspect `ctx.host_hooks.save_deopt.is_some()` instead of
+///    re-deriving the symbol from the JIT module.
+/// 2. A future emitter revision can switch the deopt path to
+///    `call_indirect` through `ctx.host_hooks.save_deopt` without
+///    an ABI break.
+///
+/// `resolve_call` / `inline_cache_lookup` are intentionally left
+/// `None`: their runtime helpers have wider signatures (extra args
+/// plus non-void return values) than the uniform `TraceHookFn`
+/// shape; widening the hook signatures is a v6-γ M5 decision. The
+/// cranelift emitter still resolves both via their canonical
+/// symbols today so this gap is invisible at runtime.
+pub fn default_host_hooks() -> HostHookTable {
+    use relon_trace_abi::TraceHookFn;
+
+    // The hook table's TraceHookFn signature is
+    // `(*mut TraceContext, u32)`; `__relon_trace_save_deopt` takes
+    // a third u64 external_pc arg. We wrap it in a shim that drops
+    // the surplus arg so the table slot type-checks.
+    unsafe extern "C" fn save_deopt_shim(ctx: *mut TraceContext, guard_pc: u32) {
+        // SAFETY: the underlying helper accepts
+        // (ctx, guard_pc, external_pc); when the dispatcher invokes
+        // through the table we have no external_pc handy, so pass 0.
+        // Hosts that need a real external_pc go through the direct
+        // extern symbol (still wired via JITBuilder).
+        unsafe { relon_trace_jit::runtime::__relon_trace_save_deopt(ctx, guard_pc, 0) };
+    }
+
+    HostHookTable {
+        on_trap: None,
+        save_deopt: Some(save_deopt_shim as TraceHookFn),
+        resolve_call: None,
+        inline_cache_lookup: None,
+    }
+}
 
 /// Counter table capacity. Each entry is a `u32` cell indexed by
 /// `fn_id`; the cranelift prologue derives the slot address as
@@ -247,6 +298,88 @@ impl TraceJitState {
         guard.insert(fn_id, Arc::new(trace_fn))
     }
 
+    /// Drop the installed trace for `fn_id`, returning it if any. A
+    /// caller may invoke this when a deopt makes the trace
+    /// unsalvageable (e.g. a type-check guard fired and the recorder's
+    /// observed-type assumption is no longer valid).
+    pub fn invalidate_trace(&self, fn_id: u32) -> Option<Arc<JITedTraceFn>> {
+        let mut guard = self.trace_fns.write().expect("trace_fns lock poisoned");
+        guard.remove(&fn_id)
+    }
+
+    /// Invoke the installed trace for `fn_id` if any, falling back to
+    /// `fallback` on guard failure / abort / no-trace-installed.
+    ///
+    /// ## Deopt protocol (v6-γ M4 cut)
+    ///
+    /// 1. Look up the trace fn. If absent, return `fallback(args_ptr)`.
+    /// 2. Build a `TraceContext` sized to fit the trace's
+    ///    `ssa_high_water` (caller supplies `slot_count`).
+    /// 3. Invoke the trace via [`JITedTraceFn::invoke`].
+    /// 4. On `TraceEntryStatus::Success`: return `ctx.result_slot`.
+    /// 5. On `TraceEntryStatus::GuardFailed`: the snapshot is in
+    ///    `ctx.deopt_state`; we currently just re-run the function
+    ///    from the top via `fallback(args_ptr)`. The plan calls for
+    ///    a real partial-resume from `snapshot.external_pc`; v6-γ
+    ///    M4 takes the conservative approach (re-run guarantees
+    ///    correctness, optimal partial-resume lands in M5).
+    /// 6. On `TraceEntryStatus::Aborted`: invalidate the trace +
+    ///    fallback.
+    ///
+    /// ## Safety
+    ///
+    /// `args_ptr` is forwarded unchanged into both the trace and the
+    /// fallback. The caller pins its lifetime + validity.
+    ///
+    /// `slot_count` must be ≥ the trace's `ssa_high_water`; passing
+    /// a smaller value yields undefined behaviour (cranelift writes
+    /// past the slot array). The trace install pipeline records the
+    /// high-water mark on the `JITedTraceFn`; this API takes the
+    /// number as an explicit param so the caller can size the
+    /// context once per fn and re-use it.
+    pub unsafe fn invoke_with_fallback<F>(
+        &self,
+        fn_id: u32,
+        args_ptr: *const u64,
+        slot_count: usize,
+        fallback: F,
+    ) -> u64
+    where
+        F: FnOnce(*const u64) -> u64,
+    {
+        let trace_fn = match self.lookup_trace(fn_id) {
+            Some(t) => t,
+            None => return fallback(args_ptr),
+        };
+
+        let mut ctx = TraceContext::with_hooks(slot_count, default_host_hooks());
+        let status = unsafe { trace_fn.invoke(&mut ctx as *mut _, args_ptr) };
+        match status {
+            TraceEntryStatus::Success => ctx.result_slot,
+            TraceEntryStatus::GuardFailed => {
+                tracing::debug!(
+                    target: "relon::trace_install",
+                    fn_id,
+                    deopt_recorded = ctx.deopt_state.is_some(),
+                    "trace GuardFailed; falling back to generic backend"
+                );
+                // v6-γ M4 conservative cut: re-run from the top.
+                // M5 polishes partial-resume via
+                // `snapshot.external_pc`.
+                fallback(args_ptr)
+            }
+            TraceEntryStatus::Aborted => {
+                tracing::warn!(
+                    target: "relon::trace_install",
+                    fn_id,
+                    "trace Aborted; invalidating + falling back"
+                );
+                self.invalidate_trace(fn_id);
+                fallback(args_ptr)
+            }
+        }
+    }
+
     /// Drive the full pipeline `recorder → optimizer → emitter →
     /// cranelift JIT` for a single fn_id and return the installable
     /// trace fn. The caller decides whether to install it via
@@ -332,18 +465,90 @@ pub fn global_trace_jit_state() -> &'static TraceJitState {
     GLOBAL_TRACE_JIT_STATE.get_or_init(TraceJitState::new)
 }
 
+/// IR registration entry the [`__relon_jump_to_recorder`] helper
+/// consults when its counter saturates. The cranelift evaluator
+/// installs one of these per fn_id before invoking the entry
+/// function so the recording driver can find the IR body + arg
+/// layout it needs to drive a real trace recording.
+#[derive(Debug, Clone)]
+pub struct RecordingRegistration {
+    /// Cloned IR op stream for the function. Cheaper to clone than
+    /// to thread an Arc through the recording driver — the body is
+    /// only the Phase-1 hot subset and the install path is a slow
+    /// path anyway.
+    pub body: Vec<TaggedOp>,
+    /// Parameter types, in declaration order. The helper combines
+    /// these with the slot values read from `args_ptr` to produce
+    /// the `(u64, IrType)` pairs the [`TraceRecordingEvaluator`]
+    /// expects.
+    pub param_tys: Vec<IrType>,
+}
+
+thread_local! {
+    /// Per-thread map `fn_id -> RecordingRegistration`. The
+    /// cranelift evaluator installs an entry before calling its JIT
+    /// entry function so the helper can fall back into a real
+    /// recording driver when the prologue's counter saturates.
+    ///
+    /// Thread-local rather than process-global because the design
+    /// (`v6-gamma-integration-plan-2026-05-18.md` §3.4) explicitly
+    /// keeps the recorder state machine per-thread; using a thread-
+    /// local registry mirrors that decision without needing an
+    /// additional lock.
+    pub static RECORDING_REGISTRY: RefCell<HashMap<u32, RecordingRegistration>> =
+        RefCell::new(HashMap::new());
+}
+
+/// Register an IR body for `fn_id` so the next
+/// [`__relon_jump_to_recorder`] call can drive a real recording
+/// pass. Returns the previous registration if any.
+pub fn register_recording(fn_id: u32, reg: RecordingRegistration) -> Option<RecordingRegistration> {
+    RECORDING_REGISTRY.with(|r| r.borrow_mut().insert(fn_id, reg))
+}
+
+/// Remove the recording registration for `fn_id`. Used by hosts that
+/// invalidate a compiled fn (e.g. on schema change).
+pub fn clear_recording(fn_id: u32) -> Option<RecordingRegistration> {
+    RECORDING_REGISTRY.with(|r| r.borrow_mut().remove(&fn_id))
+}
+
+/// Number of installed recording registrations on the current thread
+/// (mainly for tests asserting the registry is in the expected state).
+pub fn recording_registration_count() -> usize {
+    RECORDING_REGISTRY.with(|r| r.borrow().len())
+}
+
 /// `extern "C"` host helper invoked from the cranelift entry-fn
-/// prologue when its counter saturates. Real implementations will
-/// drive the IR walker into a recording mode; the v6-γ M2/M3 cut
-/// just records the crossing in a debug-trace log and returns. The
-/// trace install pipeline is exercised programmatically via
-/// [`TraceJitState::jit_compile_trace_for_fn`] in the smoke tests.
+/// prologue when its counter saturates. v6-γ M4 wires this into a
+/// real recording driver:
+///
+/// 1. Bump the diagnostic counter so smoke tests can prove the
+///    prologue path fired.
+/// 2. Look up the IR registration for `fn_id`. If none is present
+///    (e.g. the host never registered a body, or `fn_id` falls
+///    outside the prepared set) the helper returns immediately and
+///    the cranelift-generic backend handles the cold path.
+/// 3. Unpack the IR-declared param types against the host-supplied
+///    `args_ptr` (each slot is one `u64`).
+/// 4. Spin up a fresh [`RecorderState`] + [`TraceRecordingEvaluator`]
+///    and walk the IR body, recording every op into the buffer as
+///    the walker executes it for real.
+/// 5. On `RecordingOutcome::Recorded`: drive the buffer through the
+///    `optimizer → emitter → JIT install` pipeline and store the
+///    resulting [`JITedTraceFn`] in [`global_trace_jit_state`].
+/// 6. On `RecordingOutcome::Aborted`: log the reason and bail — the
+///    counter stays saturated so subsequent hot crossings keep
+///    invoking the helper, but the install never happens. Future
+///    iterations may add a sticky-abort bit to short-circuit this.
 ///
 /// # Safety
 ///
-/// `args_ptr` is interpreted purely as an opaque pointer; the
-/// helper does not dereference it. Future versions reading the
-/// fn's actual args will document the layout contract here.
+/// `args_ptr` must point at a contiguous array of `u64`s with at
+/// least `param_tys.len()` elements, **OR** be null (in which case
+/// the helper synthesises a zeroed slot vector). Both shapes are
+/// load-bearing: the cranelift prologue currently always passes
+/// null (per `codegen::emit_hot_counter_inject`) but the registry
+/// API will hand-roll real arg ptrs in a later stage.
 #[no_mangle]
 pub unsafe extern "C" fn __relon_jump_to_recorder(fn_id: u32, args_ptr: *const u64) {
     // Bump a debug counter so smoke tests can confirm the
@@ -357,15 +562,105 @@ pub unsafe extern "C" fn __relon_jump_to_recorder(fn_id: u32, args_ptr: *const u
         "hot trigger: __relon_jump_to_recorder invoked"
     );
 
-    // M2/M3 v1 scope: leave the actual IR-walk-into-recorder lifting
-    // for a follow-up. The full pipeline (recorder + optimizer +
-    // emitter + install) is callable directly via
-    // `TraceJitState::jit_compile_trace_for_fn`, exercised by
-    // `tests/trace_jit_smoke.rs`. The cranelift prologue's only
-    // observable side effect here is this counter bump, which lets
-    // the smoke tests assert that the prologue path executed without
-    // requiring a full recorder-driven trace.
-    let _ = (fn_id, args_ptr);
+    // Short-circuit: if a trace is already installed for this fn_id
+    // we have nothing to do. The cranelift prologue keeps saturating
+    // the counter and re-firing the helper because the hot-block
+    // emit returns sentinel zero on every iteration — until the
+    // host dispatcher learns to route through the installed trace
+    // (v6-γ M5), the install is idempotent.
+    let state = global_trace_jit_state();
+    if state.lookup_trace(fn_id).is_some() {
+        tracing::debug!(
+            target: "relon::trace_install",
+            fn_id,
+            "hot trigger: trace already installed, skipping"
+        );
+        return;
+    }
+
+    let registration = RECORDING_REGISTRY.with(|r| r.borrow().get(&fn_id).cloned());
+    let Some(registration) = registration else {
+        tracing::debug!(
+            target: "relon::trace_install",
+            fn_id,
+            "hot trigger: no IR registration, falling back to generic backend"
+        );
+        return;
+    };
+
+    // Materialise the (u64 value, IrType) pairs the walker expects.
+    // When the cranelift prologue passes a null ptr (today's shape)
+    // we substitute zeroed slots so the walker can still run; the
+    // recorder will then abort on the first arith op that needs a
+    // typed input. This is a known imprecision while the prologue
+    // still ignores its arg ptr; the recording will install when
+    // the host bumps the prologue to thread real args through.
+    let args: Vec<(u64, IrType)> = if args_ptr.is_null() {
+        registration
+            .param_tys
+            .iter()
+            .map(|ty| (0u64, *ty))
+            .collect()
+    } else {
+        registration
+            .param_tys
+            .iter()
+            .enumerate()
+            .map(|(i, ty)| {
+                // SAFETY: caller contract — args_ptr is a packed u64 array
+                // with len >= param_tys.len().
+                let v = unsafe { *args_ptr.add(i) };
+                (v, *ty)
+            })
+            .collect()
+    };
+
+    let mut recorder = RecorderState::new();
+    let outcome = TraceRecordingEvaluator::record_and_run(&mut recorder, &args, &registration.body);
+
+    match outcome {
+        RecordingOutcome::Recorded {
+            recorder: boxed,
+            result,
+        } => {
+            tracing::debug!(
+                target: "relon::trace_install",
+                fn_id,
+                result,
+                "recording succeeded; driving install pipeline"
+            );
+            match state.jit_compile_trace_for_fn(fn_id, *boxed) {
+                Ok(trace_fn) => {
+                    state.install_trace(fn_id, trace_fn);
+                    tracing::debug!(
+                        target: "relon::trace_install",
+                        fn_id,
+                        "trace installed successfully"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "relon::trace_install",
+                        fn_id,
+                        error = %e,
+                        "JIT compile failed; trace not installed"
+                    );
+                }
+            }
+        }
+        RecordingOutcome::Aborted {
+            reason,
+            partial_result,
+        } => {
+            tracing::debug!(
+                target: "relon::trace_install",
+                fn_id,
+                ?reason,
+                partial_result,
+                "recording aborted; trace not installed"
+            );
+        }
+    }
 }
 
 thread_local! {
