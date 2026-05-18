@@ -71,6 +71,14 @@ pub struct CompiledModule {
     /// them through hardcoded `[len:u32 LE][payload]` record
     /// offsets emitted at compile time.
     pub const_data: Vec<u8>,
+    /// Stage 5 Phase C.4: per-module closure table. Each entry is the
+    /// `FuncId` of a lambda the lowering pass emitted; the host
+    /// resolves each id through `get_finalized_function` after JIT
+    /// finalize and installs the resulting `Vec<usize>` into the
+    /// `SandboxState`. The `Op::CallClosure` lowering reads the host-
+    /// fn pointer through that table, indexed by the closure handle's
+    /// `fn_table_idx` field.
+    pub closure_func_ids: Vec<cranelift_module::FuncId>,
 }
 
 /// Per-module const-pool layout. Maps each IR-level `idx` referenced
@@ -664,6 +672,41 @@ pub fn compile_module_with(
         .declare_function("run_main", Linkage::Export, &entry_sig)
         .map_err(|e| CraneliftError::ModuleDefine(format!("declare run_main: {e}")))?;
 
+    // Stage 5 Phase C.4: declare every lambda func referenced by the
+    // module's `closure_table` *before* lowering the entry body so the
+    // entry's `Op::MakeClosure` lowering can capture each lambda's
+    // `FuncId` for the runtime closure-table population step. Each
+    // lambda has the cranelift signature
+    //   (state, captures_ptr: i32, params...) -> ret_ty
+    // — the captures_ptr is prepended to the IR-declared param list
+    // and points at the captures struct the call site materialised in
+    // the scratch arena.
+    let mut closure_func_ids: Vec<cranelift_module::FuncId> = Vec::new();
+    let mut closure_signatures: Vec<Signature> = Vec::new();
+    for (slot, &func_idx) in ir.closure_table.iter().enumerate() {
+        let lambda = ir.funcs.get(func_idx as usize).ok_or_else(|| {
+            CraneliftError::Codegen(format!(
+                "closure_table[{slot}] -> funcs[{func_idx}] out of range (module has {} funcs)",
+                ir.funcs.len()
+            ))
+        })?;
+        let mut sig = Signature::new(CallConv::SystemV);
+        sig.params.push(AbiParam::new(pointer_ty)); // state pointer
+        sig.params.push(AbiParam::new(I32)); // captures_ptr
+        for p in &lambda.params {
+            sig.params.push(AbiParam::new(ir_ty_to_cl(*p)?));
+        }
+        if !matches!(lambda.ret, IrType::Null) {
+            sig.returns.push(AbiParam::new(ir_ty_to_cl(lambda.ret)?));
+        }
+        let name = format!("__closure_{slot}");
+        let id = module
+            .declare_function(&name, Linkage::Local, &sig)
+            .map_err(|e| CraneliftError::ModuleDefine(format!("declare {name}: {e}")))?;
+        closure_func_ids.push(id);
+        closure_signatures.push(sig);
+    }
+
     // Emit the function body.
     let mut ctx = CodegenContext::new();
     ctx.func = Function::with_name_signature(UserFuncName::user(0, 0), entry_sig);
@@ -722,6 +765,8 @@ pub fn compile_module_with(
             needs_tail_cursor: matches!(entry_shape, EntryShape::BufferProtocol)
                 && body_needs_tail_cursor(&entry.body),
             return_root_size,
+            captures_ptr: None,
+            lambda_param_tys: None,
         };
 
         codegen.emit_prologue();
@@ -752,6 +797,118 @@ pub fn compile_module_with(
     module
         .define_function(entry_fn_id, &mut ctx)
         .map_err(|e| CraneliftError::ModuleDefine(format!("define run_main: {e}")))?;
+
+    // Stage 5 Phase C.4: compile each lambda function. Each one uses
+    // the cranelift signature `(state, captures_ptr, params...) -> ret`
+    // — the captures_ptr is the first user-visible local (slot 0 in
+    // the cranelift block-param sense, but the IR's `LocalGet` slots
+    // start at 1 because the IR pass numbers user params from 1 onward
+    // when a captures arg precedes them... actually the IR pass keeps
+    // user params at `LocalGet 0..N`, so we need to shift the
+    // cranelift slot map at the body entry to "skip" the captures
+    // slot when resolving `LocalGet(idx)`).
+    for (slot, (func_id, sig)) in closure_func_ids
+        .iter()
+        .copied()
+        .zip(closure_signatures.iter())
+        .enumerate()
+    {
+        let lambda_idx = ir.closure_table[slot] as usize;
+        let lambda = &ir.funcs[lambda_idx];
+        let mut lambda_ctx = CodegenContext::new();
+        lambda_ctx.func =
+            Function::with_name_signature(UserFuncName::user(0, (slot as u32) + 1), sig.clone());
+        let mut lambda_builder_ctx = FunctionBuilderContext::new();
+        {
+            let mut builder = FunctionBuilder::new(&mut lambda_ctx.func, &mut lambda_builder_ctx);
+            let entry_block = builder.create_block();
+            builder.append_block_params_for_function_params(entry_block);
+            builder.switch_to_block(entry_block);
+            builder.seal_block(entry_block);
+
+            let block_params: Vec<_> = builder.block_params(entry_block).to_vec();
+            let lambda_state_ptr = block_params[0];
+            let captures_ptr = block_params[1];
+            let lambda_arg_values: Vec<CValue> = block_params[2..].to_vec();
+
+            let raise_trap_ref = module.declare_func_in_func(raise_trap_id, builder.func);
+            let now_ref = module.declare_func_in_func(now_id, builder.func);
+            let cap_lookup_ref = module.declare_func_in_func(cap_lookup_id, builder.func);
+
+            let trap_block = builder.create_block();
+            builder.append_block_param(trap_block, I64);
+
+            // Lambdas use the same entry shape as the entry function
+            // for the purposes of `LocalGet` typing — but since each
+            // lambda's params are IR-declared independently, we
+            // override the entry-shape-derived local typing through
+            // `lambda_param_tys`. The Codegen looks up `LocalGet(idx)`
+            // against `arg_values` first; we've already routed the
+            // captures_ptr to a dedicated slot so the IR-side
+            // `LocalGet(idx)` resolves to `arg_values[idx]` which is
+            // the user param at position `idx + 1` in the cranelift
+            // block-params (we sliced past the captures_ptr).
+            let mut codegen = Codegen {
+                builder: &mut builder,
+                sandbox,
+                state_ptr: lambda_state_ptr,
+                raise_trap_ref,
+                now_ref,
+                cap_lookup_ref,
+                pointer_ty,
+                frontend_config: module.target_config(),
+                // Lambdas use the LegacyI64Args entry shape for
+                // `LocalGet` typing because their params are
+                // IR-declared (i64 / i32 / ...) rather than the
+                // buffer-handshake fixed shape. The `lambda_param_tys`
+                // field carries the per-param typing so the
+                // `LocalGet` resolution matches.
+                entry_shape: EntryShape::LegacyI64Args,
+                locals: HashMap::new(),
+                let_locals: HashMap::new(),
+                arg_values: &lambda_arg_values,
+                stack: Vec::new(),
+                ir,
+                trap_block: Some(trap_block),
+                label_stack: Vec::new(),
+                inline_frames: Vec::new(),
+                const_pool: &const_pool,
+                record_locals: HashMap::new(),
+                needs_tail_cursor: false,
+                return_root_size: 0,
+                captures_ptr: Some(captures_ptr),
+                lambda_param_tys: Some(&lambda.params),
+            };
+
+            codegen.emit_prologue();
+            codegen.emit_body(&lambda.body)?;
+
+            builder.switch_to_block(trap_block);
+            let code = builder.block_params(trap_block)[0];
+            builder
+                .ins()
+                .call(raise_trap_ref, &[lambda_state_ptr, code]);
+            // Lambdas always return a typed value (the IR-declared
+            // ret_ty). On trap-block exit we emit a typed zero so the
+            // verifier accepts the synthetic return.
+            let zero_v = if matches!(lambda.ret, IrType::I64) {
+                builder.ins().iconst(I64, 0)
+            } else if matches!(lambda.ret, IrType::F64) {
+                builder.ins().f64const(0.0)
+            } else {
+                builder.ins().iconst(I32, 0)
+            };
+            builder.ins().return_(&[zero_v]);
+            builder.seal_block(trap_block);
+
+            builder.finalize();
+        }
+
+        module
+            .define_function(func_id, &mut lambda_ctx)
+            .map_err(|e| CraneliftError::ModuleDefine(format!("define __closure_{slot}: {e}")))?;
+    }
+
     module
         .finalize_definitions()
         .map_err(|e| CraneliftError::ModuleDefine(format!("finalize: {e}")))?;
@@ -763,6 +920,7 @@ pub fn compile_module_with(
         entry_range: entry.range,
         entry_shape,
         const_data: const_pool.bytes,
+        closure_func_ids,
     })
 }
 
@@ -982,6 +1140,19 @@ struct Codegen<'a, 'b> {
     /// prologue uses the same value to bias `tail_cursor` to the
     /// first byte past the fixed area when tail records are present.
     return_root_size: u32,
+    /// Stage 5 Phase C.4: when this Codegen is lowering a *lambda*
+    /// body (not the entry function), `captures_ptr` carries the
+    /// cranelift `i32` block-param the lambda received as its
+    /// captures argument. `Op::LoadField` against an offset inside
+    /// the captures struct resolves through this pointer (added to
+    /// `arena_base`); `Op::LocalGet` continues to address the
+    /// IR-declared params via `arg_values`.
+    captures_ptr: Option<CValue>,
+    /// When set (lambda mode), supplies the per-param IR types so
+    /// `LocalGet(idx)` resolves to the correct cranelift slot type.
+    /// `None` when lowering the entry function (which derives types
+    /// from `entry_shape`).
+    lambda_param_tys: Option<&'a [IrType]>,
 }
 
 /// One inline-frame entry for a stdlib body lowered through
@@ -1185,14 +1356,27 @@ impl<'a, 'b> Codegen<'a, 'b> {
     /// Lower `Op::LoadField { offset, ty }`. Reads from
     /// `in_ptr + offset` (wasm slot 0) and pushes the value onto the
     /// virtual stack.
+    ///
+    /// In lambda mode (Stage 5 Phase C.4 closure body), the base
+    /// pointer is the captures struct base (`captures_ptr` block-
+    /// param) rather than `in_ptr` — this matches the wasm-side
+    /// closure ABI which reuses `LoadField` for "read this captured
+    /// value at this offset".
     fn emit_load_field(&mut self, offset: u32, ty: IrType) -> Result<(), CraneliftError> {
-        if !matches!(self.entry_shape, EntryShape::BufferProtocol) {
-            return Err(CraneliftError::Codegen(
-                "LoadField outside buffer-protocol entry shape".into(),
-            ));
-        }
         let (cr_ty, size, push_ty) = field_load_shape(ty)?;
-        let addr = self.buffer_field_addr(0 /* in_ptr */, offset, size)?;
+        let addr = if let Some(captures_ptr) = self.captures_ptr {
+            // Lambda mode: arena_base + captures_ptr + offset.
+            let off_v = self.builder.ins().iconst(I32, i64::from(offset));
+            let composed = self.builder.ins().iadd(captures_ptr, off_v);
+            self.arena_addr(composed, size)?
+        } else {
+            if !matches!(self.entry_shape, EntryShape::BufferProtocol) {
+                return Err(CraneliftError::Codegen(
+                    "LoadField outside buffer-protocol entry shape".into(),
+                ));
+            }
+            self.buffer_field_addr(0 /* in_ptr */, offset, size)?
+        };
         let loaded = self.builder.ins().load(cr_ty, MemFlags::trusted(), addr, 0);
         // For `Bool` / `Null` the IR's virtual stack expects an i32
         // slot — widen the loaded byte to i32 zero-extended.
@@ -1682,6 +1866,11 @@ impl<'a, 'b> Codegen<'a, 'b> {
         }
         match self.entry_shape {
             EntryShape::LegacyI64Args => {
+                // In lambda mode (lambda_param_tys is set) the return
+                // value's IR type isn't always I64 — the lambda's
+                // `ret` could be I64 / Bool / String / etc. We just
+                // pop one operand and return it; cranelift's verifier
+                // catches type-width mismatches before finalize.
                 let v = self.pop()?;
                 self.builder.ins().return_(&[v]);
             }
@@ -1858,17 +2047,28 @@ impl<'a, 'b> Codegen<'a, 'b> {
                 self.arg_values.len()
             )));
         }
-        let cr_ty = match self.entry_shape {
-            EntryShape::LegacyI64Args => I64,
-            EntryShape::BufferProtocol => match idx {
-                0..=3 => I32,
-                4 => I64,
-                _ => {
-                    return Err(CraneliftError::Codegen(format!(
-                        "LocalGet({idx}) out of range for buffer-protocol entry (5 locals)"
-                    )));
-                }
-            },
+        let cr_ty = if let Some(param_tys) = self.lambda_param_tys {
+            // Lambda mode: types come from the IR-declared param list.
+            let ir_ty = param_tys.get(arg_idx).copied().ok_or_else(|| {
+                CraneliftError::Codegen(format!(
+                    "LocalGet({idx}) out of range — lambda has {} declared params",
+                    param_tys.len()
+                ))
+            })?;
+            ir_ty_to_cl(ir_ty)?
+        } else {
+            match self.entry_shape {
+                EntryShape::LegacyI64Args => I64,
+                EntryShape::BufferProtocol => match idx {
+                    0..=3 => I32,
+                    4 => I64,
+                    _ => {
+                        return Err(CraneliftError::Codegen(format!(
+                            "LocalGet({idx}) out of range for buffer-protocol entry (5 locals)"
+                        )));
+                    }
+                },
+            }
         };
         // Mirror the arg value into a Variable so future LocalSet
         // (if we ever support it) writes go through SSA cleanly.
@@ -2113,6 +2313,12 @@ impl<'a, 'b> Codegen<'a, 'b> {
                 ret_ty,
                 cap_bit,
             } => self.emit_call_native(*import_idx, param_tys, *ret_ty, *cap_bit)?,
+            Op::MakeClosure {
+                fn_table_idx,
+                captures,
+                captures_size,
+            } => self.emit_make_closure(*fn_table_idx, captures, *captures_size)?,
+            Op::CallClosure { param_tys, ret_ty } => self.emit_call_closure(param_tys, *ret_ty)?,
 
             // v5-β-2 widen: `select` for the simple stdlib bodies
             // (`abs` / `min` / `max`) and any user expression the
@@ -3057,6 +3263,174 @@ impl<'a, 'b> Codegen<'a, 'b> {
             self.push(result);
         }
 
+        Ok(())
+    }
+
+    /// Lower `Op::MakeClosure { fn_table_idx, captures, captures_size }`.
+    /// Stage 5 Phase C.4.
+    ///
+    /// Closure handle layout (8 bytes total):
+    ///   `[fn_table_idx: u32 LE][captures_ptr: u32 LE]`
+    ///
+    /// Layout in scratch:
+    ///   1. Alloc 8 bytes for the handle (arena-relative ptr →
+    ///      `handle_ptr`).
+    ///   2. If `captures_size > 0`: alloc `captures_size` bytes for
+    ///      the captures struct (→ `captures_ptr`); write each capture
+    ///      from its let-local into the struct at the declared offset.
+    ///   3. Store `fn_table_idx` at `handle_ptr + 0`.
+    ///   4. Store `captures_ptr` (or 0) at `handle_ptr + 4`.
+    ///   5. Push `handle_ptr` as i32 onto the operand stack.
+    fn emit_make_closure(
+        &mut self,
+        fn_table_idx: u32,
+        captures: &[relon_ir::ir::ClosureCapture],
+        captures_size: u32,
+    ) -> Result<(), CraneliftError> {
+        // 1. Alloc 8 bytes for the handle.
+        let handle_size = self.builder.ins().iconst(I32, 8);
+        self.emit_alloc_scratch(handle_size)?;
+        let handle_ptr = self.pop()?;
+
+        // 2. Alloc captures struct if non-empty.
+        let captures_ptr = if captures_size > 0 {
+            let cs = self.builder.ins().iconst(I32, i64::from(captures_size));
+            self.emit_alloc_scratch(cs)?;
+            self.pop()?
+        } else {
+            self.builder.ins().iconst(I32, 0)
+        };
+
+        // 3. Store fn_table_idx at handle_ptr + 0.
+        let fn_idx_v = self.builder.ins().iconst(I32, i64::from(fn_table_idx));
+        // Use the StoreI32AtAbsolute pattern: arena_base + handle_ptr.
+        let abs_handle = self.arena_addr(handle_ptr, 8)?;
+        self.builder
+            .ins()
+            .store(MemFlags::trusted(), fn_idx_v, abs_handle, 0);
+        // 4. Store captures_ptr at handle_ptr + 4.
+        self.builder
+            .ins()
+            .store(MemFlags::trusted(), captures_ptr, abs_handle, 4);
+
+        // 5. Write each capture from its let-local into the captures
+        //    struct.
+        if captures_size > 0 {
+            let captures_abs = self.arena_addr(captures_ptr, captures_size)?;
+            for cap in captures {
+                let mapped_idx = self.remap_let_idx(cap.let_idx);
+                let value = self.get_let(mapped_idx, cap.ty)?;
+                let offset = i32::try_from(cap.offset).map_err(|_| {
+                    CraneliftError::Codegen(format!(
+                        "MakeClosure capture offset {} exceeds i32 range",
+                        cap.offset
+                    ))
+                })?;
+                self.builder
+                    .ins()
+                    .store(MemFlags::trusted(), value, captures_abs, offset);
+            }
+        }
+
+        // 6. Push the handle_ptr onto the operand stack as the Closure
+        //    i32 value.
+        self.push(handle_ptr);
+        Ok(())
+    }
+
+    /// Lower `Op::CallClosure { param_tys, ret_ty }`. Stage 5 Phase C.4.
+    ///
+    /// Stack discipline: `[Closure, arg0, arg1, ...] -> [ret_ty]`. We
+    /// pop the user-visible args (in reverse), pop the closure
+    /// handle, materialise the captures_ptr + fn_table_idx from the
+    /// handle, look up the host fn pointer through
+    /// `state.closure_table_base[fn_table_idx]`, then `call_indirect`
+    /// with the prepended `(state, captures_ptr, args...)` signature.
+    fn emit_call_closure(
+        &mut self,
+        param_tys: &[IrType],
+        ret_ty: IrType,
+    ) -> Result<(), CraneliftError> {
+        // Pop user args in reverse.
+        let mut user_args: Vec<CValue> = Vec::with_capacity(param_tys.len());
+        for _ in 0..param_tys.len() {
+            user_args.push(self.pop()?);
+        }
+        user_args.reverse();
+
+        // Pop the closure handle (arena-relative i32 ptr).
+        let handle_ptr = self.pop()?;
+
+        // Load fn_table_idx + captures_ptr through the handle.
+        let abs_handle = self.arena_addr(handle_ptr, 8)?;
+        let fn_table_idx = self
+            .builder
+            .ins()
+            .load(I32, MemFlags::trusted(), abs_handle, 0);
+        let captures_ptr = self
+            .builder
+            .ins()
+            .load(I32, MemFlags::trusted(), abs_handle, 4);
+
+        // Look up host fn pointer through
+        // state.closure_table_base[fn_table_idx]. Each slot is a
+        // `usize` (host pointer size).
+        let table_base = self.builder.ins().load(
+            self.pointer_ty,
+            MemFlags::trusted(),
+            self.state_ptr,
+            crate::sandbox::STATE_OFFSET_CLOSURE_TABLE_BASE,
+        );
+        let idx_p = self.builder.ins().uextend(self.pointer_ty, fn_table_idx);
+        let stride_bits = match self.pointer_ty.bits() {
+            64 => 3, // log2(8) = 3
+            32 => 2, // log2(4) = 2
+            _ => {
+                return Err(CraneliftError::Codegen(
+                    "unsupported pointer width for closure table".into(),
+                ))
+            }
+        };
+        let off = self.builder.ins().ishl_imm(idx_p, stride_bits);
+        let slot_addr = self.builder.ins().iadd(table_base, off);
+        let fn_ptr = self
+            .builder
+            .ins()
+            .load(self.pointer_ty, MemFlags::trusted(), slot_addr, 0);
+        // Null-check the resolved fn pointer (defensive: a
+        // misconfigured closure_table_base would point at zero-filled
+        // memory; a null call_indirect would segfault).
+        let zero = self.builder.ins().iconst(self.pointer_ty, 0);
+        let cmp = self.builder.ins().icmp(IntCC::Equal, fn_ptr, zero);
+        self.cond_trap(cmp, TrapKind::CapabilityDenied);
+
+        // Build call signature: (state, captures_ptr, params...) -> ret_ty.
+        let mut sig = Signature::new(CallConv::SystemV);
+        sig.params.push(AbiParam::new(self.pointer_ty));
+        sig.params.push(AbiParam::new(I32));
+        for ty in param_tys {
+            sig.params.push(AbiParam::new(ir_ty_to_cl(*ty)?));
+        }
+        if !matches!(ret_ty, IrType::Null) {
+            sig.returns.push(AbiParam::new(ir_ty_to_cl(ret_ty)?));
+        }
+        let sig_ref = self.builder.import_signature(sig);
+
+        // Assemble args: [state, captures_ptr, user_args...].
+        let mut call_args: Vec<CValue> = Vec::with_capacity(user_args.len() + 2);
+        call_args.push(self.state_ptr);
+        call_args.push(captures_ptr);
+        call_args.extend(user_args);
+
+        let inst = self
+            .builder
+            .ins()
+            .call_indirect(sig_ref, fn_ptr, &call_args);
+
+        if !matches!(ret_ty, IrType::Null) {
+            let r = self.builder.inst_results(inst)[0];
+            self.push(r);
+        }
         Ok(())
     }
 

@@ -104,6 +104,17 @@ pub struct CraneliftAotEvaluator {
     /// cranelift code can dereference `ConstString { idx }` offsets
     /// directly without a runtime lookup.
     const_data: Vec<u8>,
+    /// Stage 5 Phase C.4: closure fn-pointer table. One `usize` per
+    /// `IrModule::closure_table` entry; populated after JIT finalize
+    /// by resolving each lambda `FuncId` through
+    /// `JITModule::get_finalized_function`. The sandbox state's
+    /// `closure_table_base` is installed to point at this vec's
+    /// element zero so `Op::CallClosure` can dereference the slot.
+    ///
+    /// Wrapped in `Box<[usize]>` so the address is stable for the
+    /// evaluator's lifetime (we install a raw pointer into the
+    /// sandbox state). Empty when the module has no lambdas.
+    closure_table: Box<[usize]>,
 }
 
 // SAFETY: The JIT-emitted code is reentrant and the `SandboxState`
@@ -217,6 +228,7 @@ impl CraneliftAotEvaluator {
             entry_range,
             entry_shape,
             const_data,
+            closure_func_ids,
         } = compiled;
 
         // Cross-check: buffer schema metadata must agree with the IR
@@ -254,12 +266,35 @@ impl CraneliftAotEvaluator {
             }),
         };
 
+        // Stage 5 Phase C.4: resolve each closure fn id to its host
+        // address. We keep the resulting Box<[usize]> alive on the
+        // evaluator so the sandbox state's closure_table_base pointer
+        // stays valid. The slot order matches `IrModule::closure_table`
+        // — fn_table_idx `i` resolves to `closure_table[i]`.
+        let closure_table: Box<[usize]> = closure_func_ids
+            .iter()
+            .map(|fid| module.get_finalized_function(*fid) as usize)
+            .collect();
+
         // cap_bit width 64 mirrors the wasm-AOT side's
         // `relon_caps_avail` u64 bitmap shape. Hosts that register a
         // higher cap_bit cause `register` to grow the vector.
         let capabilities = Arc::new(CapabilityVtable::with_capacity(64));
         let sandbox_state = Arc::new(SandboxState::new(capabilities));
         sandbox_state.entry_range.set(entry_range);
+        // SAFETY: closure_table is Box-allocated and lives on the
+        // evaluator; the raw pointer stays valid for the evaluator's
+        // lifetime. When the table is empty we install 0 (cranelift
+        // never reads through it because no Op::CallClosure was
+        // emitted).
+        unsafe {
+            let base = if closure_table.is_empty() {
+                0
+            } else {
+                closure_table.as_ptr() as usize
+            };
+            sandbox_state.install_closure_table(base);
+        }
 
         // Buffer-protocol arity equals the user-field count when we
         // have a schema; fall back to the IR-param count for legacy
@@ -278,6 +313,7 @@ impl CraneliftAotEvaluator {
             sandbox_state,
             buffer_schema,
             const_data,
+            closure_table,
         })
     }
 
@@ -293,6 +329,19 @@ impl CraneliftAotEvaluator {
     pub fn install_capabilities_mut(&mut self, capabilities: Arc<CapabilityVtable>) {
         let new_state = SandboxState::new(capabilities);
         new_state.entry_range.set(self.entry_range);
+        // Stage 5 Phase C.4: re-install the closure table pointer
+        // onto the fresh state so `Op::CallClosure` keeps resolving.
+        // SAFETY: the closure_table allocation lives on the
+        // evaluator; its raw pointer remains valid for the
+        // evaluator's lifetime.
+        unsafe {
+            let base = if self.closure_table.is_empty() {
+                0
+            } else {
+                self.closure_table.as_ptr() as usize
+            };
+            new_state.install_closure_table(base);
+        }
         self.sandbox_state = Arc::new(new_state);
     }
 
