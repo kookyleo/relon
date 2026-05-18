@@ -89,6 +89,13 @@ struct ConstPool {
     /// `i32.const <offset>` so the value at runtime is the buffer-
     /// relative address.
     bytes: Vec<u8>,
+    /// Lazily-laid-out Unicode case-fold tables. Each entry is set
+    /// when the body references `Op::CaseFoldTableAddr { upper }`.
+    case_fold_upper_offset: Option<u32>,
+    case_fold_lower_offset: Option<u32>,
+    /// Lazily-laid-out combining-mark + whitespace ranges tables.
+    combining_marks_offset: Option<u32>,
+    whitespace_offset: Option<u32>,
 }
 
 impl ConstPool {
@@ -176,6 +183,55 @@ impl ConstPool {
                 }
                 self.list_bool_offsets.insert(*idx, off);
             }
+            Op::CaseFoldTableAddr { upper } => {
+                let slot = if *upper {
+                    &mut self.case_fold_upper_offset
+                } else {
+                    &mut self.case_fold_lower_offset
+                };
+                if slot.is_none() {
+                    self.align_to(4);
+                    let off = u32::try_from(self.bytes.len()).map_err(|_| {
+                        CraneliftError::Codegen("const pool exceeds u32 range".into())
+                    })?;
+                    let table: &[(u32, u32)] = if *upper {
+                        relon_ir::case_folding::simple_upper_folding()
+                    } else {
+                        relon_ir::case_folding::simple_lower_folding()
+                    };
+                    let bytes = relon_ir::case_folding::encode_table_bytes(table);
+                    self.bytes.extend_from_slice(&bytes);
+                    if *upper {
+                        self.case_fold_upper_offset = Some(off);
+                    } else {
+                        self.case_fold_lower_offset = Some(off);
+                    }
+                }
+            }
+            Op::CombiningMarkRangesAddr => {
+                if self.combining_marks_offset.is_none() {
+                    self.align_to(4);
+                    let off = u32::try_from(self.bytes.len()).map_err(|_| {
+                        CraneliftError::Codegen("const pool exceeds u32 range".into())
+                    })?;
+                    let table = relon_ir::combining_marks::combining_mark_ranges();
+                    let bytes = relon_ir::combining_marks::encode_ranges_bytes(table);
+                    self.bytes.extend_from_slice(&bytes);
+                    self.combining_marks_offset = Some(off);
+                }
+            }
+            Op::WhitespaceRangesAddr => {
+                if self.whitespace_offset.is_none() {
+                    self.align_to(4);
+                    let off = u32::try_from(self.bytes.len()).map_err(|_| {
+                        CraneliftError::Codegen("const pool exceeds u32 range".into())
+                    })?;
+                    let table = relon_ir::whitespace::non_ascii_whitespace_ranges();
+                    let bytes = relon_ir::whitespace::encode_ranges_bytes(table);
+                    self.bytes.extend_from_slice(&bytes);
+                    self.whitespace_offset = Some(off);
+                }
+            }
             // Recurse into structured bodies so nested ConstStrings
             // (e.g. inside If arms or Block / Loop bodies) get
             // picked up too.
@@ -189,6 +245,16 @@ impl ConstPool {
             }
             Op::Block { body, .. } | Op::Loop { body, .. } => {
                 self.collect_body(body)?;
+            }
+            Op::Call { fn_index, .. } => {
+                // The cranelift backend inlines bundled stdlib bodies.
+                // Recurse into the callee so its `ConstString` /
+                // `CaseFoldTableAddr` references contribute to the
+                // pool before the entry body is lowered.
+                let stdlib = relon_ir::stdlib::builtin_stdlib();
+                if let Some(callee) = stdlib.get(*fn_index as usize) {
+                    self.collect_body(&callee.body)?;
+                }
             }
             _ => {}
         }
@@ -1923,6 +1989,28 @@ impl<'a, 'b> Codegen<'a, 'b> {
                 let r = self.builder.ins().band(a, b);
                 self.push(r);
             }
+            Op::Div(IrType::I32) => {
+                let b = self.pop()?;
+                let a = self.pop()?;
+                if self.sandbox.div_check {
+                    let zero = self.builder.ins().iconst(I32, 0);
+                    let cmp = self.builder.ins().icmp(IntCC::Equal, b, zero);
+                    self.cond_trap(cmp, TrapKind::DivisionByZero);
+                }
+                let r = self.builder.ins().sdiv(a, b);
+                self.push(r);
+            }
+            Op::Mod(IrType::I32) => {
+                let b = self.pop()?;
+                let a = self.pop()?;
+                if self.sandbox.div_check {
+                    let zero = self.builder.ins().iconst(I32, 0);
+                    let cmp = self.builder.ins().icmp(IntCC::Equal, b, zero);
+                    self.cond_trap(cmp, TrapKind::DivisionByZero);
+                }
+                let r = self.builder.ins().srem(a, b);
+                self.push(r);
+            }
             Op::BitAnd(IrType::I64) => {
                 let b = self.pop()?;
                 let a = self.pop()?;
@@ -1995,6 +2083,34 @@ impl<'a, 'b> Codegen<'a, 'b> {
             Op::MemcpyAtAbsolute => {
                 self.emit_memcpy_at_absolute()?;
             }
+            Op::CaseFoldTableAddr { upper } => {
+                let off = if *upper {
+                    self.const_pool.case_fold_upper_offset
+                } else {
+                    self.const_pool.case_fold_lower_offset
+                };
+                let off = off.ok_or_else(|| {
+                    CraneliftError::Codegen("CaseFoldTableAddr missing from const pool".into())
+                })?;
+                let v = self.builder.ins().iconst(I32, i64::from(off));
+                self.push(v);
+            }
+            Op::CombiningMarkRangesAddr => {
+                let off = self.const_pool.combining_marks_offset.ok_or_else(|| {
+                    CraneliftError::Codegen(
+                        "CombiningMarkRangesAddr missing from const pool".into(),
+                    )
+                })?;
+                let v = self.builder.ins().iconst(I32, i64::from(off));
+                self.push(v);
+            }
+            Op::WhitespaceRangesAddr => {
+                let off = self.const_pool.whitespace_offset.ok_or_else(|| {
+                    CraneliftError::Codegen("WhitespaceRangesAddr missing from const pool".into())
+                })?;
+                let v = self.builder.ins().iconst(I32, i64::from(off));
+                self.push(v);
+            }
             Op::Trap { kind } => {
                 // `relon_ir::TrapKind` covers stdlib-domain failures
                 // (`IndexOutOfBounds`, `EmptyList`, `InvalidUtf8`).
@@ -2020,8 +2136,7 @@ impl<'a, 'b> Codegen<'a, 'b> {
             // to MatchOk.
             other => {
                 return Err(CraneliftError::Codegen(format!(
-                    "unsupported op in v5-beta-2: {:?}",
-                    std::mem::discriminant(other)
+                    "unsupported op in v5-beta-2 stage 3: {other:?}"
                 )))
             }
         }
