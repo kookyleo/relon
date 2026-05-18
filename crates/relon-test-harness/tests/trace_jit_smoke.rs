@@ -572,6 +572,75 @@ fn recording_registry_round_trip() {
 }
 
 #[test]
+fn invoke_with_fallback_returns_trace_result_on_success() {
+    let state = TraceJitState::new();
+    let mut buffer = TraceBuffer::new();
+    let v = buffer.fresh_ssa();
+    buffer.append(TraceOp::ConstI64(v, 0x77));
+    buffer.append(TraceOp::Return(v));
+    let trace_fn = state
+        .jit_compile_buffer_for_fn(801, buffer)
+        .expect("compile");
+    state.install_trace(801, trace_fn);
+
+    let fallback_called = std::cell::Cell::new(false);
+    let result = unsafe {
+        state.invoke_with_fallback(801, std::ptr::null(), 32, |_| {
+            fallback_called.set(true);
+            0
+        })
+    };
+    assert_eq!(result, 0x77);
+    assert!(!fallback_called.get(), "trace Success must skip fallback");
+}
+
+#[test]
+fn invoke_with_fallback_runs_fallback_when_no_trace() {
+    let state = TraceJitState::new();
+    let fallback_called = std::cell::Cell::new(false);
+    let result = unsafe {
+        state.invoke_with_fallback(802, std::ptr::null(), 32, |_| {
+            fallback_called.set(true);
+            0x123
+        })
+    };
+    assert_eq!(result, 0x123);
+    assert!(fallback_called.get());
+}
+
+#[test]
+fn invalidate_trace_drops_the_install() {
+    let state = TraceJitState::new();
+    let mut buffer = TraceBuffer::new();
+    let v = buffer.fresh_ssa();
+    buffer.append(TraceOp::ConstI64(v, 1));
+    buffer.append(TraceOp::Return(v));
+    let trace_fn = state
+        .jit_compile_buffer_for_fn(803, buffer)
+        .expect("compile");
+    state.install_trace(803, trace_fn);
+    assert!(state.lookup_trace(803).is_some());
+    let dropped = state.invalidate_trace(803);
+    assert!(dropped.is_some());
+    assert!(state.lookup_trace(803).is_none());
+}
+
+#[test]
+fn default_host_hooks_populates_save_deopt_slot() {
+    use relon_codegen_native::default_host_hooks;
+    let hooks = default_host_hooks();
+    assert!(hooks.save_deopt.is_some(), "save_deopt must be wired");
+    let mut ctx = TraceContext::with_hooks(8, hooks);
+    assert!(ctx.host_hooks.save_deopt.is_some());
+    // Confirm we can call through the table without crashing the
+    // host. The shim records a snapshot into ctx.deopt_state.
+    let f = ctx.host_hooks.save_deopt.expect("populated");
+    unsafe { f(&mut ctx as *mut _, 42) };
+    let snap = ctx.deopt_state.as_ref().expect("snapshot populated");
+    assert_eq!(snap.guard_pc, 42);
+}
+
+#[test]
 fn jump_helper_aborts_recording_for_unsupported_op() {
     // Register a body containing an op outside the recorder's
     // accepted envelope. The helper should walk in, abort, and not

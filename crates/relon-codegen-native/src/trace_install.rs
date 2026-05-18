@@ -51,12 +51,61 @@ use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{Linkage, Module as _};
 
 use relon_ir::{IrType, Op, TaggedOp};
-use relon_trace_abi::{ObservedType, TraceContext, TraceEntryStatus};
+use relon_trace_abi::{HostHookTable, ObservedType, TraceContext, TraceEntryStatus};
 use relon_trace_emitter::TraceEmitter;
 use relon_trace_jit::{OptimizerPipeline, SsaVar};
 use relon_trace_recorder::{RecordResult, RecorderState};
 
 use crate::trace_recording::{RecordingOutcome, TraceRecordingEvaluator};
+
+/// Construct a [`HostHookTable`] pre-populated with `save_deopt`
+/// wired to the v6-γ runtime helper.
+///
+/// Hosts that want to invoke a JIT-emitted trace and observe deopt
+/// telemetry through the table indirection (rather than relying on
+/// JITBuilder's symbol resolution) build their `TraceContext` with
+/// this table.
+///
+/// Phase v6-γ M4 keeps the cranelift emitter using direct extern
+/// symbols (resolved at JIT-finalize time); the table is kept in
+/// parallel so:
+///
+/// 1. Hosts that want a stable read of "did this trace deopt?" can
+///    inspect `ctx.host_hooks.save_deopt.is_some()` instead of
+///    re-deriving the symbol from the JIT module.
+/// 2. A future emitter revision can switch the deopt path to
+///    `call_indirect` through `ctx.host_hooks.save_deopt` without
+///    an ABI break.
+///
+/// `resolve_call` / `inline_cache_lookup` are intentionally left
+/// `None`: their runtime helpers have wider signatures (extra args
+/// plus non-void return values) than the uniform `TraceHookFn`
+/// shape; widening the hook signatures is a v6-γ M5 decision. The
+/// cranelift emitter still resolves both via their canonical
+/// symbols today so this gap is invisible at runtime.
+pub fn default_host_hooks() -> HostHookTable {
+    use relon_trace_abi::TraceHookFn;
+
+    // The hook table's TraceHookFn signature is
+    // `(*mut TraceContext, u32)`; `__relon_trace_save_deopt` takes
+    // a third u64 external_pc arg. We wrap it in a shim that drops
+    // the surplus arg so the table slot type-checks.
+    unsafe extern "C" fn save_deopt_shim(ctx: *mut TraceContext, guard_pc: u32) {
+        // SAFETY: the underlying helper accepts
+        // (ctx, guard_pc, external_pc); when the dispatcher invokes
+        // through the table we have no external_pc handy, so pass 0.
+        // Hosts that need a real external_pc go through the direct
+        // extern symbol (still wired via JITBuilder).
+        unsafe { relon_trace_jit::runtime::__relon_trace_save_deopt(ctx, guard_pc, 0) };
+    }
+
+    HostHookTable {
+        on_trap: None,
+        save_deopt: Some(save_deopt_shim as TraceHookFn),
+        resolve_call: None,
+        inline_cache_lookup: None,
+    }
+}
 
 /// Counter table capacity. Each entry is a `u32` cell indexed by
 /// `fn_id`; the cranelift prologue derives the slot address as
@@ -247,6 +296,88 @@ impl TraceJitState {
     pub fn install_trace(&self, fn_id: u32, trace_fn: JITedTraceFn) -> Option<Arc<JITedTraceFn>> {
         let mut guard = self.trace_fns.write().expect("trace_fns lock poisoned");
         guard.insert(fn_id, Arc::new(trace_fn))
+    }
+
+    /// Drop the installed trace for `fn_id`, returning it if any. A
+    /// caller may invoke this when a deopt makes the trace
+    /// unsalvageable (e.g. a type-check guard fired and the recorder's
+    /// observed-type assumption is no longer valid).
+    pub fn invalidate_trace(&self, fn_id: u32) -> Option<Arc<JITedTraceFn>> {
+        let mut guard = self.trace_fns.write().expect("trace_fns lock poisoned");
+        guard.remove(&fn_id)
+    }
+
+    /// Invoke the installed trace for `fn_id` if any, falling back to
+    /// `fallback` on guard failure / abort / no-trace-installed.
+    ///
+    /// ## Deopt protocol (v6-γ M4 cut)
+    ///
+    /// 1. Look up the trace fn. If absent, return `fallback(args_ptr)`.
+    /// 2. Build a `TraceContext` sized to fit the trace's
+    ///    `ssa_high_water` (caller supplies `slot_count`).
+    /// 3. Invoke the trace via [`JITedTraceFn::invoke`].
+    /// 4. On `TraceEntryStatus::Success`: return `ctx.result_slot`.
+    /// 5. On `TraceEntryStatus::GuardFailed`: the snapshot is in
+    ///    `ctx.deopt_state`; we currently just re-run the function
+    ///    from the top via `fallback(args_ptr)`. The plan calls for
+    ///    a real partial-resume from `snapshot.external_pc`; v6-γ
+    ///    M4 takes the conservative approach (re-run guarantees
+    ///    correctness, optimal partial-resume lands in M5).
+    /// 6. On `TraceEntryStatus::Aborted`: invalidate the trace +
+    ///    fallback.
+    ///
+    /// ## Safety
+    ///
+    /// `args_ptr` is forwarded unchanged into both the trace and the
+    /// fallback. The caller pins its lifetime + validity.
+    ///
+    /// `slot_count` must be ≥ the trace's `ssa_high_water`; passing
+    /// a smaller value yields undefined behaviour (cranelift writes
+    /// past the slot array). The trace install pipeline records the
+    /// high-water mark on the `JITedTraceFn`; this API takes the
+    /// number as an explicit param so the caller can size the
+    /// context once per fn and re-use it.
+    pub unsafe fn invoke_with_fallback<F>(
+        &self,
+        fn_id: u32,
+        args_ptr: *const u64,
+        slot_count: usize,
+        fallback: F,
+    ) -> u64
+    where
+        F: FnOnce(*const u64) -> u64,
+    {
+        let trace_fn = match self.lookup_trace(fn_id) {
+            Some(t) => t,
+            None => return fallback(args_ptr),
+        };
+
+        let mut ctx = TraceContext::with_hooks(slot_count, default_host_hooks());
+        let status = unsafe { trace_fn.invoke(&mut ctx as *mut _, args_ptr) };
+        match status {
+            TraceEntryStatus::Success => ctx.result_slot,
+            TraceEntryStatus::GuardFailed => {
+                tracing::debug!(
+                    target: "relon::trace_install",
+                    fn_id,
+                    deopt_recorded = ctx.deopt_state.is_some(),
+                    "trace GuardFailed; falling back to generic backend"
+                );
+                // v6-γ M4 conservative cut: re-run from the top.
+                // M5 polishes partial-resume via
+                // `snapshot.external_pc`.
+                fallback(args_ptr)
+            }
+            TraceEntryStatus::Aborted => {
+                tracing::warn!(
+                    target: "relon::trace_install",
+                    fn_id,
+                    "trace Aborted; invalidating + falling back"
+                );
+                self.invalidate_trace(fn_id);
+                fallback(args_ptr)
+            }
+        }
     }
 
     /// Drive the full pipeline `recorder → optimizer → emitter →

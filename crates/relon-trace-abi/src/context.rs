@@ -136,6 +136,27 @@ impl TraceContext {
         }
     }
 
+    /// Allocate a context with `slot_count` slots and the supplied
+    /// [`HostHookTable`] pre-populated. Used by hosts that wire up
+    /// `save_deopt` / `resolve_call` / `inline_cache_lookup` before
+    /// invoking the trace.
+    ///
+    /// v6-γ M4: the cranelift emitter still resolves the hook
+    /// symbols through `JITBuilder` (so the hooks live in the JIT
+    /// module's symbol table, not in this `HostHookTable`). The
+    /// table is kept populated in parallel so future emitter
+    /// revisions that prefer indirect dispatch through the context
+    /// can drop the symbol-resolution step without an ABI break.
+    pub fn with_hooks(slot_count: usize, host_hooks: HostHookTable) -> Self {
+        Self {
+            ssa_slots: vec![0u64; slot_count].into_boxed_slice(),
+            result_slot: 0,
+            deopt_state: None,
+            host_hooks,
+            pending_recoverable_writes: Vec::new(),
+        }
+    }
+
     /// Push a recoverable-write record onto the pending list. The
     /// emitter will eventually emit cranelift IR that calls a host
     /// helper to do this; the direct API is kept available for unit
