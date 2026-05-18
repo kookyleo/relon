@@ -33,7 +33,8 @@ use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::types::{I32, I64};
 use cranelift_codegen::ir::{
     AbiParam, BlockArg, BlockCall, Function, GlobalValue, Inst, InstBuilder, JumpTableData,
-    MemFlags, SigRef, Signature, TrapCode, UserFuncName, Value as CValue,
+    MemFlags, SigRef, Signature, StackSlotData, StackSlotKind, TrapCode, UserFuncName,
+    Value as CValue,
 };
 use cranelift_codegen::isa::CallConv;
 use cranelift_codegen::settings::{self, Configurable};
@@ -1161,7 +1162,7 @@ fn emit_hot_counter_inject(
     pointer_ty: cranelift_codegen::ir::Type,
     entry_shape: EntryShape,
     fn_id: u32,
-    _arg_values: &[CValue],
+    arg_values: &[CValue],
 ) {
     let hot_block = builder.create_block();
     let normal_block = builder.create_block();
@@ -1197,7 +1198,57 @@ fn emit_hot_counter_inject(
     builder.switch_to_block(hot_block);
     builder.seal_block(hot_block);
     let fn_id_val = builder.ins().iconst(I32, fn_id as i64);
-    let args_ptr_val = builder.ins().iconst(pointer_ty, 0); // null — helper ignores
+
+    // v6-γ M5: pack the entry's runtime arg values into a
+    // stack-allocated `u64[]` and pass the address to the helper.
+    // Earlier stages passed `null` here; the recorder then drove the
+    // walker with zeroed slots, which made guard-laden ops abort
+    // immediately because the IR walker had no real type
+    // observations to feed the recorder. With real args the walker
+    // pulls the live values via `LocalGet(idx)` and the recorder
+    // sees concrete types, which is what M5's corpus harness depends
+    // on. Each arg is widened to i64 — narrower args (i32 / bool /
+    // ptr) are extended with `uextend` or stored at i32 width and
+    // then i64-zeroed by the slot's prior init.
+    let args_ptr_val = if arg_values.is_empty() {
+        builder.ins().iconst(pointer_ty, 0)
+    } else {
+        let slot_count = arg_values.len();
+        let slot_bytes = (slot_count as u32) * 8;
+        let stack_slot = builder.create_sized_stack_slot(StackSlotData::new(
+            StackSlotKind::ExplicitSlot,
+            slot_bytes,
+            3, // 8-byte align (2^3); i64 store needs it.
+        ));
+        for (i, v) in arg_values.iter().enumerate() {
+            // Widen any narrower-than-i64 arg to i64. cranelift's
+            // `uextend` accepts the actual underlying width without
+            // needing us to plumb the IR type here.
+            let widened = match builder.func.dfg.value_type(*v) {
+                t if t == I64 => *v,
+                t if t == I32 => builder.ins().uextend(I64, *v),
+                t => {
+                    // Floats / bool / pointer: bitcast through an
+                    // ireduce/uextend chain into i64. For F64 we
+                    // bitcast to I64 directly; for boolean / i32 we
+                    // uextend. Anything else is unexpected for the
+                    // entry shapes we support today, so we
+                    // conservatively spill a zero so the slot stays
+                    // a valid u64.
+                    if t == cranelift_codegen::ir::types::F64 {
+                        builder.ins().bitcast(I64, MemFlags::trusted(), *v)
+                    } else {
+                        builder.ins().iconst(I64, 0)
+                    }
+                }
+            };
+            builder
+                .ins()
+                .stack_store(widened, stack_slot, (i as i32) * 8);
+        }
+        builder.ins().stack_addr(pointer_ty, stack_slot, 0)
+    };
+
     let mut jump_sig = Signature::new(CallConv::SystemV);
     jump_sig.params.push(AbiParam::new(I32));
     jump_sig.params.push(AbiParam::new(pointer_ty));
