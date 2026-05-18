@@ -46,7 +46,7 @@
 
 use relon_eval_api::RuntimeError;
 use relon_parser::TokenRange;
-use std::cell::Cell;
+use std::cell::{Cell, UnsafeCell};
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -127,6 +127,11 @@ pub enum TrapKind {
     /// Unsupported / unreachable op landed in the lowered IR. Never
     /// produced by valid IR but kept as a defensive catch-all.
     Unreachable = 5,
+    /// Signed integer overflow on `Op::Add` / `Op::Sub` / `Op::Mul`.
+    /// Cranelift uses `sadd_overflow` / `ssub_overflow` /
+    /// `smul_overflow` so the trap mirrors the tree-walker's strict
+    /// `RuntimeError::NumericOverflow` semantics.
+    NumericOverflow = 6,
 }
 
 impl TrapKind {
@@ -139,6 +144,7 @@ impl TrapKind {
             2 => TrapKind::BoundsViolation,
             3 => TrapKind::CapabilityDenied,
             4 => TrapKind::ResourceExhausted,
+            6 => TrapKind::NumericOverflow,
             _ => TrapKind::Unreachable,
         }
     }
@@ -160,6 +166,7 @@ impl TrapKind {
             TrapKind::Unreachable => RuntimeError::Unsupported {
                 reason: "cranelift-native: lowered IR contained an unreachable op".to_string(),
             },
+            TrapKind::NumericOverflow => RuntimeError::NumericOverflow(range),
         }
     }
 }
@@ -228,13 +235,26 @@ impl CapabilityVtable {
 }
 
 /// Per-`run_main` mutable state passed to the JIT entry. Carries the
-/// deadline, the trap-cause slot, and a pointer to the active
-/// capability vtable. Cranelift loads each field by offset relative
-/// to a base pointer the entry receives as its first parameter.
+/// deadline, the trap-cause slot, the linear-memory arena base, and a
+/// pointer to the active capability vtable. Cranelift loads each
+/// field by offset relative to a base pointer the entry receives as
+/// its first parameter.
 ///
 /// Field ordering is part of the cranelift ABI: do not reorder
-/// without updating the corresponding `gv_load` offsets in
-/// `codegen::Codegen::emit_resource_check` / `emit_capability_call`.
+/// without updating the [`STATE_OFFSET_*`] constants in this module —
+/// the codegen pass reads each field via `load.<ty>` against the
+/// state pointer using these offsets.
+///
+/// ## v5-β-2: arena fields for buffer protocol
+///
+/// `arena_base` + `arena_len` form a flat "linear memory" the JIT
+/// code accesses through the `in_ptr` / `in_len` / `out_ptr` /
+/// `out_cap` arguments the lowered `run_main` receives. The arena
+/// is allocated host-side per call (or pooled across calls) and
+/// holds the `BufferBuilder`-serialised input region followed by an
+/// uninitialised output region. Cranelift code emits `LoadField` /
+/// `StoreField` as `arena_base + in_or_out_ptr + offset` with an
+/// `arena_len`-relative bounds check.
 #[repr(C)]
 pub struct SandboxState {
     /// Deadline as nanos since `Instant::now()` at session start. The
@@ -246,6 +266,27 @@ pub struct SandboxState {
     /// store without going through a wider cell type. Value 0 means
     /// "no trap".
     trap_code: AtomicU64,
+    /// Base pointer of the "linear memory" arena. Cranelift code
+    /// computes addresses as `arena_base + buf_ptr + field_offset`
+    /// for every `LoadField` / `StoreField` it emits. Re-pointed by
+    /// the host trampoline before each `run_main` invocation; see
+    /// [`SandboxState::install_arena`].
+    ///
+    /// Stored as `UnsafeCell<usize>` so the JIT thread can read
+    /// through a stable offset without going through a Rust borrow
+    /// — the host holds the only `&mut` access via `install_arena`,
+    /// and that happens strictly before the JIT call begins.
+    arena_base: UnsafeCell<usize>,
+    /// Length in bytes of the arena pointed to by `arena_base`. Used
+    /// by the cranelift bounds-check sequence to trap before any
+    /// load / store walks past the host-owned region.
+    arena_len: UnsafeCell<u32>,
+    /// Tail cursor used by `Op::AllocSubRecord` /
+    /// `Op::EmitTailRecordFromAbsoluteAddr` for record-building
+    /// inside the output buffer. Lives on the state so the cranelift
+    /// emitter can read / write it through a stable offset rather
+    /// than threading a wasm-style "spare local" through every IR op.
+    tail_cursor: UnsafeCell<u32>,
     /// Reference start time for the deadline check. Set once at
     /// construction; the entry computes elapsed nanos against this.
     epoch: Instant,
@@ -259,6 +300,28 @@ pub struct SandboxState {
     pub(crate) entry_range: Cell<TokenRange>,
 }
 
+/// Byte offset of [`SandboxState::deadline_ns`] inside the
+/// `#[repr(C)]` layout. Cranelift's resource-check sequence reads at
+/// this offset; mirrored here as a const so both the codegen and the
+/// runtime stay in sync.
+pub const STATE_OFFSET_DEADLINE_NS: i32 = 0;
+/// Byte offset of [`SandboxState::trap_code`]. Not currently read
+/// from cranelift IR (the trap path uses the `raise_trap` host helper
+/// indirectly) but documented for completeness.
+#[allow(dead_code)]
+pub const STATE_OFFSET_TRAP_CODE: i32 = 8;
+/// Byte offset of [`SandboxState::arena_base`]. Cranelift code emits
+/// `load.<pointer_ty>` at this offset to materialise the arena base
+/// before computing absolute field addresses.
+pub const STATE_OFFSET_ARENA_BASE: i32 = 16;
+/// Byte offset of [`SandboxState::arena_len`]. Codegen consults this
+/// for the per-load / per-store bounds check.
+pub const STATE_OFFSET_ARENA_LEN: i32 = 24;
+/// Byte offset of [`SandboxState::tail_cursor`]. Codegen reads /
+/// writes this from `Op::AllocSubRecord` / `Op::EmitTailRecord*` to
+/// bump-allocate inside the output buffer's tail region.
+pub const STATE_OFFSET_TAIL_CURSOR: i32 = 28;
+
 // SAFETY: `Cell<TokenRange>` is not `Sync`, but we only hand
 // `&SandboxState` to single-threaded cranelift code; the typed
 // atomics serialise across threads when the host shares an `Arc<>`.
@@ -269,15 +332,51 @@ unsafe impl Sync for SandboxState {}
 impl SandboxState {
     /// Build a fresh sandbox state with an effectively-infinite
     /// deadline. Hosts that want a real deadline call
-    /// [`Self::set_deadline`] before invoking the JIT entry.
+    /// [`Self::set_deadline`] before invoking the JIT entry. The
+    /// arena starts unpopulated; the host trampoline calls
+    /// [`Self::install_arena`] before invoking the JIT entry.
     pub fn new(capabilities: Arc<CapabilityVtable>) -> Self {
         Self {
             deadline_ns: AtomicI64::new(i64::MAX),
             trap_code: AtomicU64::new(0),
+            arena_base: UnsafeCell::new(0),
+            arena_len: UnsafeCell::new(0),
+            tail_cursor: UnsafeCell::new(0),
             epoch: Instant::now(),
             capabilities,
             entry_range: Cell::new(TokenRange::default()),
         }
+    }
+
+    /// Point the JIT-visible arena at `(base, len)`. Called by the
+    /// host trampoline immediately before invoking the JIT entry, and
+    /// before [`Self::reset_trap`] clears the trap slot. The pointer
+    /// must remain valid for the duration of the entry call.
+    ///
+    /// # Safety
+    ///
+    /// The caller guarantees `base` points at an allocation of at
+    /// least `len` bytes, and the allocation outlives the JIT call.
+    /// `tail_cursor` is reset to 0 so each invocation starts with a
+    /// clean bump cursor.
+    pub unsafe fn install_arena(&self, base: *mut u8, len: u32) {
+        // SAFETY: the JIT thread is not yet running (this is called
+        // strictly before the entry invocation), so the UnsafeCell
+        // contents are unaliased.
+        unsafe {
+            *self.arena_base.get() = base as usize;
+            *self.arena_len.get() = len;
+            *self.tail_cursor.get() = 0;
+        }
+    }
+
+    /// Read back the tail cursor after a JIT call returns. The host
+    /// uses this to size the output-buffer read on the
+    /// pointer-indirect-store path.
+    pub fn tail_cursor(&self) -> u32 {
+        // SAFETY: the JIT call has returned, so the UnsafeCell is
+        // unaliased; the read is plain.
+        unsafe { *self.tail_cursor.get() }
     }
 
     /// Configure the per-call deadline. Pass `Duration::MAX` (or any
@@ -423,6 +522,46 @@ mod tests {
         state.set_deadline(Duration::from_secs(u64::MAX));
         // Should not panic; should clamp to i64::MAX.
         assert_eq!(state.deadline_ns.load(Ordering::Relaxed), i64::MAX);
+    }
+
+    #[test]
+    fn sandbox_state_state_offsets_match_repr_c_layout() {
+        // Sanity check: if the struct layout drifts (e.g. someone
+        // reorders fields), the codegen pass will silently read the
+        // wrong bytes; this asserts the offsets up front.
+        let state = SandboxState::new(Arc::new(CapabilityVtable::with_capacity(0)));
+        let base = &state as *const _ as usize;
+        assert_eq!(
+            (&state.deadline_ns as *const _ as usize) - base,
+            STATE_OFFSET_DEADLINE_NS as usize
+        );
+        assert_eq!(
+            (&state.trap_code as *const _ as usize) - base,
+            STATE_OFFSET_TRAP_CODE as usize
+        );
+        assert_eq!(
+            (state.arena_base.get() as usize) - base,
+            STATE_OFFSET_ARENA_BASE as usize
+        );
+        assert_eq!(
+            (state.arena_len.get() as usize) - base,
+            STATE_OFFSET_ARENA_LEN as usize
+        );
+        assert_eq!(
+            (state.tail_cursor.get() as usize) - base,
+            STATE_OFFSET_TAIL_CURSOR as usize
+        );
+    }
+
+    #[test]
+    fn sandbox_state_install_arena_round_trips() {
+        let state = SandboxState::new(Arc::new(CapabilityVtable::with_capacity(0)));
+        let mut buf = vec![0u8; 64];
+        // SAFETY: `buf` outlives the read below.
+        unsafe { state.install_arena(buf.as_mut_ptr(), 64) };
+        assert_eq!(unsafe { *state.arena_base.get() }, buf.as_ptr() as usize);
+        assert_eq!(unsafe { *state.arena_len.get() }, 64);
+        assert_eq!(state.tail_cursor(), 0);
     }
 
     #[test]

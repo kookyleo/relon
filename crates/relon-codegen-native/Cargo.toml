@@ -26,6 +26,7 @@ thiserror = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
+ordered-float = { workspace = true }
 
 # Cranelift v0.131 — matched to the wasmtime-internal-cranelift the
 # wasm-AOT backend pulls in so the workspace shares one ISLE backend

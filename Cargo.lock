@@ -1845,6 +1845,7 @@ dependencies = [
  "cranelift-jit",
  "cranelift-module",
  "cranelift-native",
+ "ordered-float",
  "relon-analyzer",
  "relon-eval-api",
  "relon-evaluator",

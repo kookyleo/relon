@@ -76,4 +76,7 @@ pub mod sandbox;
 pub use cache::{deserialize as deserialize_cache, serialize as serialize_cache, CacheEntry};
 pub use error::CraneliftError;
 pub use evaluator::CraneliftAotEvaluator;
-pub use sandbox::{CapabilityVtable, HostFnPtr, SandboxConfig, SandboxState, TrapKind};
+pub use sandbox::{
+    CapabilityVtable, HostFnPtr, SandboxConfig, SandboxState, TrapKind, STATE_OFFSET_ARENA_BASE,
+    STATE_OFFSET_ARENA_LEN, STATE_OFFSET_DEADLINE_NS, STATE_OFFSET_TAIL_CURSOR,
+};
