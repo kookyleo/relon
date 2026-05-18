@@ -12,6 +12,9 @@
     #native upper() -> String
     #native lower() -> String
     #native title() -> String
+    #native upper_locale(locale: String) -> String
+    #native lower_locale(locale: String) -> String
+    #native title_locale(locale: String) -> String
     #native nfc() -> String
     #native nfd() -> String
     #native nfkc() -> String

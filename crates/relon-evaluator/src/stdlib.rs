@@ -35,6 +35,13 @@ pub fn register_to(ctx: &mut Context) {
     let string_upper: Arc<dyn RelonFunction> = Arc::new(StringUpper);
     let string_lower: Arc<dyn RelonFunction> = Arc::new(StringLower);
     let string_title: Arc<dyn RelonFunction> = Arc::new(StringTitle);
+    // v3++ b-6: locale-aware case folding. Surface names mirror the
+    // wasm-AOT stdlib slots; the dispatch path inside `fold_string`
+    // honours the Turkish / Azerbaijani overrides via the second
+    // `String` parameter.
+    let string_upper_locale: Arc<dyn RelonFunction> = Arc::new(StringUpperLocale);
+    let string_lower_locale: Arc<dyn RelonFunction> = Arc::new(StringLowerLocale);
+    let string_title_locale: Arc<dyn RelonFunction> = Arc::new(StringTitleLocale);
     // v3++ b-5: Unicode normalization (UAX #15). All four arcs delegate
     // to `relon_ir::normalization`, the shared algorithm the wasm-AOT
     // backend also embeds — so both executors stay byte-for-byte in
@@ -50,6 +57,9 @@ pub fn register_to(ctx: &mut Context) {
     ctx.register_pure_fn("_string_upper", Arc::clone(&string_upper));
     ctx.register_pure_fn("_string_lower", Arc::clone(&string_lower));
     ctx.register_pure_fn("_string_title", Arc::clone(&string_title));
+    ctx.register_pure_fn("_string_upper_locale", Arc::clone(&string_upper_locale));
+    ctx.register_pure_fn("_string_lower_locale", Arc::clone(&string_lower_locale));
+    ctx.register_pure_fn("_string_title_locale", Arc::clone(&string_title_locale));
     ctx.register_pure_fn("_string_nfc", Arc::clone(&string_nfc));
     ctx.register_pure_fn("_string_nfd", Arc::clone(&string_nfd));
     ctx.register_pure_fn("_string_nfkc", Arc::clone(&string_nfkc));
@@ -121,6 +131,14 @@ pub fn register_to(ctx: &mut Context) {
     // codepoint of each word, lower-case the rest, and keep
     // combining marks attached to their base cluster.
     ctx.register_pure_method("String", "title", string_title);
+    // v3++ b-6: locale-aware case folding methods. Surface names
+    // `upper_locale` / `lower_locale` / `title_locale` accept the
+    // locale string as the second argument; method-form
+    // `s.upper_locale("tr")` and free-form `upper_locale(s, "tr")`
+    // both route through the same handler.
+    ctx.register_pure_method("String", "upper_locale", string_upper_locale);
+    ctx.register_pure_method("String", "lower_locale", string_lower_locale);
+    ctx.register_pure_method("String", "title_locale", string_title_locale);
     // v3++ b-5: Unicode normalization forms. Each method delegates to
     // the shared `relon_ir::normalization` algorithm; the wasm-AOT body
     // walks the same data tables so backend tests can compare results
@@ -788,6 +806,128 @@ impl RelonFunction for StringReplace {
     }
 }
 
+/// v3++ b-6: shared case-fold engine used by `upper` / `lower` /
+/// `title` / `upper_locale` / `lower_locale` / `title_locale`.
+///
+/// Walks the input codepoint-by-codepoint and emits one of the
+/// following per cp, in priority order:
+///
+///   1. Turkish / Azerbaijani override (only when `locale_turkish`).
+///   2. Final-sigma context (only for lower mode, when cp == U+03A3).
+///   3. FULL multi-codepoint folding (UAX #21 unconditional table).
+///   4. Rust stdlib full case mapping (`char::to_uppercase` /
+///      `char::to_lowercase`) — already pulls UCD data, gives us the
+///      remaining simple + multi-cp behaviour for free.
+///   5. Identity (combining marks pass through unchanged when not
+///      `at_word_start` for the title flow).
+fn fold_string(s: &str, mode: CaseFoldMode, locale_turkish: bool) -> String {
+    let cps: Vec<u32> = s.chars().map(|c| c as u32).collect();
+    let mut out = String::with_capacity(s.len());
+    let mut at_word_start = true;
+    for (i, &cp) in cps.iter().enumerate() {
+        let is_mark = relon_ir::combining_marks::is_combining_mark(cp);
+        if is_mark {
+            // Combining marks: pass through unchanged. The word-boundary
+            // flag stays as-is because marks belong to their base
+            // codepoint's grapheme cluster.
+            if let Some(c) = char::from_u32(cp) {
+                out.push(c);
+            }
+            continue;
+        }
+
+        if mode == CaseFoldMode::Title {
+            if let Some(c) = char::from_u32(cp) {
+                if c.is_whitespace() {
+                    out.push(c);
+                    at_word_start = true;
+                    continue;
+                }
+            }
+        }
+
+        let effective_mode = match mode {
+            CaseFoldMode::Upper => CaseFoldMode::Upper,
+            CaseFoldMode::Lower => CaseFoldMode::Lower,
+            CaseFoldMode::Title => {
+                if at_word_start {
+                    CaseFoldMode::Upper
+                } else {
+                    CaseFoldMode::Lower
+                }
+            }
+        };
+        at_word_start = false;
+
+        // Final sigma context — only when lowering Σ (U+03A3).
+        if effective_mode == CaseFoldMode::Lower && cp == 0x03A3 {
+            let final_form = relon_ir::full_case_folding::is_final_sigma_context(&cps, i);
+            let mapped = if final_form { 0x03C2 } else { 0x03C3 };
+            if let Some(c) = char::from_u32(mapped) {
+                out.push(c);
+            }
+            continue;
+        }
+
+        // Turkish locale overrides take precedence over default tables.
+        if locale_turkish {
+            let entry = match effective_mode {
+                CaseFoldMode::Upper => relon_ir::full_case_folding::turkish_upper_entry(cp),
+                CaseFoldMode::Lower => relon_ir::full_case_folding::turkish_lower_entry(cp),
+                CaseFoldMode::Title => unreachable!("normalised above"),
+            };
+            if let Some((len, slots)) = entry {
+                for &m in &slots[..len as usize] {
+                    if let Some(c) = char::from_u32(m) {
+                        out.push(c);
+                    }
+                }
+                continue;
+            }
+        }
+
+        // FULL multi-codepoint mappings (e.g. ß -> SS, ﬁ -> FI).
+        let full_entry = match effective_mode {
+            CaseFoldMode::Upper => relon_ir::full_case_folding::full_upper_entry(cp),
+            CaseFoldMode::Lower => relon_ir::full_case_folding::full_lower_entry(cp),
+            CaseFoldMode::Title => unreachable!("normalised above"),
+        };
+        if let Some((len, slots)) = full_entry {
+            for &m in &slots[..len as usize] {
+                if let Some(c) = char::from_u32(m) {
+                    out.push(c);
+                }
+            }
+            continue;
+        }
+
+        // Fall back to Rust's char API for the simple 1:1 cases.
+        if let Some(c) = char::from_u32(cp) {
+            match effective_mode {
+                CaseFoldMode::Upper => {
+                    for u in c.to_uppercase() {
+                        out.push(u);
+                    }
+                }
+                CaseFoldMode::Lower => {
+                    for u in c.to_lowercase() {
+                        out.push(u);
+                    }
+                }
+                CaseFoldMode::Title => unreachable!("normalised above"),
+            }
+        }
+    }
+    out
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CaseFoldMode {
+    Upper,
+    Lower,
+    Title,
+}
+
 struct StringUpper;
 impl RelonFunction for StringUpper {
     fn call(
@@ -797,9 +937,8 @@ impl RelonFunction for StringUpper {
     ) -> Result<Value, RuntimeError> {
         let args = args.into_positional();
         expect_arg_count(&args, 1, range)?;
-        Ok(Value::String(
-            expect_string(&args[0], range)?.to_uppercase(),
-        ))
+        let s = expect_string(&args[0], range)?;
+        Ok(Value::String(fold_string(s, CaseFoldMode::Upper, false)))
     }
 }
 
@@ -812,9 +951,62 @@ impl RelonFunction for StringLower {
     ) -> Result<Value, RuntimeError> {
         let args = args.into_positional();
         expect_arg_count(&args, 1, range)?;
-        Ok(Value::String(
-            expect_string(&args[0], range)?.to_lowercase(),
-        ))
+        let s = expect_string(&args[0], range)?;
+        Ok(Value::String(fold_string(s, CaseFoldMode::Lower, false)))
+    }
+}
+
+/// v3++ b-6: locale-aware case folding. Surface names
+/// `upper_locale` / `lower_locale` / `title_locale`. The locale string
+/// is parsed via [`relon_ir::full_case_folding::is_turkish_locale`] —
+/// only `tr` / `az` (with optional `-XX` / `_XX` region) flips into
+/// the Turkish override branch; every other locale falls back to the
+/// default UAX #21 behaviour.
+struct StringUpperLocale;
+impl RelonFunction for StringUpperLocale {
+    fn call(
+        &self,
+        args: NativeArgs,
+        range: relon_parser::TokenRange,
+    ) -> Result<Value, RuntimeError> {
+        let args = args.into_positional();
+        expect_arg_count(&args, 2, range)?;
+        let s = expect_string(&args[0], range)?;
+        let locale = expect_string(&args[1], range)?;
+        let tr = relon_ir::full_case_folding::is_turkish_locale(locale);
+        Ok(Value::String(fold_string(s, CaseFoldMode::Upper, tr)))
+    }
+}
+
+struct StringLowerLocale;
+impl RelonFunction for StringLowerLocale {
+    fn call(
+        &self,
+        args: NativeArgs,
+        range: relon_parser::TokenRange,
+    ) -> Result<Value, RuntimeError> {
+        let args = args.into_positional();
+        expect_arg_count(&args, 2, range)?;
+        let s = expect_string(&args[0], range)?;
+        let locale = expect_string(&args[1], range)?;
+        let tr = relon_ir::full_case_folding::is_turkish_locale(locale);
+        Ok(Value::String(fold_string(s, CaseFoldMode::Lower, tr)))
+    }
+}
+
+struct StringTitleLocale;
+impl RelonFunction for StringTitleLocale {
+    fn call(
+        &self,
+        args: NativeArgs,
+        range: relon_parser::TokenRange,
+    ) -> Result<Value, RuntimeError> {
+        let args = args.into_positional();
+        expect_arg_count(&args, 2, range)?;
+        let s = expect_string(&args[0], range)?;
+        let locale = expect_string(&args[1], range)?;
+        let tr = relon_ir::full_case_folding::is_turkish_locale(locale);
+        Ok(Value::String(fold_string(s, CaseFoldMode::Title, tr)))
     }
 }
 
@@ -845,31 +1037,7 @@ impl RelonFunction for StringTitle {
         let args = args.into_positional();
         expect_arg_count(&args, 1, range)?;
         let s = expect_string(&args[0], range)?;
-        let mut out = String::with_capacity(s.len());
-        let mut at_word_start = true;
-        for cp in s.chars() {
-            if relon_ir::combining_marks::is_combining_mark(cp as u32) {
-                // Mark — pass through and leave the boundary flag alone.
-                out.push(cp);
-                continue;
-            }
-            if cp.is_whitespace() {
-                out.push(cp);
-                at_word_start = true;
-                continue;
-            }
-            if at_word_start {
-                for c in cp.to_uppercase() {
-                    out.push(c);
-                }
-            } else {
-                for c in cp.to_lowercase() {
-                    out.push(c);
-                }
-            }
-            at_word_start = false;
-        }
-        Ok(Value::String(out))
+        Ok(Value::String(fold_string(s, CaseFoldMode::Title, false)))
     }
 }
 
