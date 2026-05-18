@@ -183,10 +183,7 @@ fn title_latin_with_combining_acute_grapheme_aware() {
     // do nothing (mark has no upper/lower mapping). The grapheme-
     // aware path here additionally leaves at_word_start untouched
     // across the mark, so the *next* word still title-cases.
-    assert_eq!(
-        fold_once("title", "cafe\u{0301} bar"),
-        "Cafe\u{0301} Bar"
-    );
+    assert_eq!(fold_once("title", "cafe\u{0301} bar"), "Cafe\u{0301} Bar");
 }
 
 #[test]
@@ -242,8 +239,7 @@ fn title_emoji_zwj_sequence_preserved() {
     // ZWJ (U+200D) is a Format char, NOT a Mark. The body emits each
     // cp verbatim (emoji are non-cased), so the entire sequence
     // round-trips. The flanking "hi" titles to "Hi".
-    let zwj_family =
-        "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}\u{200D}\u{1F466}";
+    let zwj_family = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}\u{200D}\u{1F466}";
     let input = format!("hi {zwj_family}");
     let expected = format!("Hi {zwj_family}");
     assert_eq!(fold_once("title", &input), expected);
@@ -273,10 +269,7 @@ fn title_method_form() {
     session.write(IN_PTR as usize, &in_bytes);
     let bw = session.call(IN_PTR, in_bytes.len() as i32, OUT_PTR, OUT_CAP);
     let out = session.read(OUT_PTR as usize, bw as usize);
-    assert_eq!(
-        read_string_return(&return_schema, &out),
-        "The Quick Brown"
-    );
+    assert_eq!(read_string_return(&return_schema, &out), "The Quick Brown");
 }
 
 // ---------------------------------------------------------------------------

@@ -808,9 +808,10 @@ fn title_string() -> StdlibFunction {
 ///           in the upper table when `at_word_start == 1` (first
 ///           cased cp of the word) or the lower table otherwise; then
 ///           clear `at_word_start`.
+///
 ///      (c) encode the resolved (possibly folded) codepoint back into
-///      UTF-8 starting at `base + 4 + j` and advance `j` by the byte
-///      count.
+///      UTF-8 starting at `base + 4 + j` and advance `j` by the
+///      byte count.
 ///   4. Once `i == s_len`, store the final `j` into the record's
 ///      length prefix and return the record pointer.
 ///
@@ -3692,7 +3693,10 @@ mod tests {
     #[test]
     fn title_string_method_dispatch_resolves() {
         let title_idx = stdlib_function_index("title").expect("title stdlib slot");
-        assert_eq!(stdlib_method_index(IrType::String, "title"), Some(title_idx));
+        assert_eq!(
+            stdlib_method_index(IrType::String, "title"),
+            Some(title_idx)
+        );
     }
 
     /// v3++ b-4: the post-b-4 stdlib list appends `__is_combining_mark`,

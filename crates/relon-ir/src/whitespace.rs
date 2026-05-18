@@ -120,7 +120,9 @@ mod tests {
 
     #[test]
     fn non_ascii_whitespace_detected() {
-        for cp in [0x00A0u32, 0x1680, 0x2000, 0x200A, 0x2028, 0x2029, 0x202F, 0x205F, 0x3000] {
+        for cp in [
+            0x00A0u32, 0x1680, 0x2000, 0x200A, 0x2028, 0x2029, 0x202F, 0x205F, 0x3000,
+        ] {
             assert!(is_unicode_whitespace(cp), "cp {cp:#x} should be whitespace");
         }
     }
@@ -128,7 +130,10 @@ mod tests {
     #[test]
     fn letters_not_whitespace() {
         for cp in [b'a' as u32, b'Z' as u32, 0x00E9, 0x4F60, 0x1F30D] {
-            assert!(!is_unicode_whitespace(cp), "cp {cp:#x} must not be whitespace");
+            assert!(
+                !is_unicode_whitespace(cp),
+                "cp {cp:#x} must not be whitespace"
+            );
         }
     }
 
