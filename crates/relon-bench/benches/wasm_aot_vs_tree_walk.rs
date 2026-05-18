@@ -91,6 +91,17 @@ fn arith_args() -> HashMap<String, Value> {
     m
 }
 
+/// v3+ b-1 user-fn DCE scenario payload. Same shape as `arith_args`
+/// minus the unused `y` slot — the entry only reads `x` so the
+/// host side keeps the args minimal. The schema declared on the
+/// source has five methods that DCE prunes; the `args` here mirror
+/// only what `#main(Int x)` actually consumes.
+fn arith_single_int_args() -> HashMap<String, Value> {
+    let mut m = HashMap::with_capacity(1);
+    m.insert("x".to_string(), Value::Int(7));
+    m
+}
+
 fn dict_args() -> HashMap<String, Value> {
     let mut m = HashMap::with_capacity(1);
     m.insert("x".to_string(), Value::Int(42));
@@ -215,6 +226,34 @@ const SCENARIOS: &[Scenario] = &[
         wasm_source: "#main(List<Int> xs) -> Int\nxs.fold(0, (Int acc, Int x) => acc + x)",
         tree_source: "#main(List<Int> xs) -> Int\nxs.reduce(0, (Int acc, Int x) => acc + x)",
         args: list_int_args,
+    },
+    // v3+ b-1 user-fn DCE surface. Five schema methods declared,
+    // none referenced from the entry. wasm-AOT prunes all five
+    // method bodies post-DCE so the resulting module is the same
+    // size as the `arithmetic` baseline; the bench picks up the
+    // cold-start reduction relative to a build that kept every
+    // declared method. The tree-walker pays a tiny per-iter
+    // overhead from parsing the larger source but does not call
+    // any of the pruned methods either.
+    Scenario {
+        name: "unused_methods",
+        wasm_source: "#schema U { Int x: * } with {\n  \
+            a() -> Int: self.x\n  \
+            b() -> Int: self.x * 2\n  \
+            c() -> Int: self.x + 1\n  \
+            d() -> Int: self.x - 1\n  \
+            e() -> Int: self.x * self.x\n\
+         }\n\
+         #main(Int x) -> Int\nx * 2",
+        tree_source: "#schema U { Int x: * } with {\n  \
+            a() -> Int: self.x\n  \
+            b() -> Int: self.x * 2\n  \
+            c() -> Int: self.x + 1\n  \
+            d() -> Int: self.x - 1\n  \
+            e() -> Int: self.x * self.x\n\
+         }\n\
+         #main(Int x) -> Int\nx * 2",
+        args: arith_single_int_args,
     },
 ];
 

@@ -158,6 +158,151 @@ fn dce_off_vs_on_byte_size() {
 }
 
 #[test]
+fn dce_unused_method_pruned() {
+    // Three schema methods, the entry invokes one. The other two
+    // method bodies are unreachable and must not appear in the
+    // emitted wasm. Post-DCE function count = 1 method body + 1
+    // entry = 2.
+    let wasm = compile_wasm(
+        "#schema U { Int x: * } with {\n  \
+            a() -> Int: self.x\n  \
+            b() -> Int: self.x * 2\n  \
+            c() -> Int: self.x + 1\n\
+         }\n\
+         #main(U u) -> Int\nu.a()",
+    );
+    let shape = inspect_module(&wasm);
+    assert_eq!(
+        shape.fn_section_count, 2,
+        "expected `a()` + #main only (got {})",
+        shape.fn_section_count
+    );
+    assert!(!shape.has_table, "no closures means no funcref table");
+}
+
+#[test]
+fn dce_method_to_method_kept() {
+    // a() calls self.b(); c() is unreachable. Post-DCE function
+    // count = a + b + #main = 3.
+    let wasm = compile_wasm(
+        "#schema U { Int x: * } with {\n  \
+            a() -> Int: self.b() + 1\n  \
+            b() -> Int: self.x * 2\n  \
+            c() -> Int: self.x + 100\n\
+         }\n\
+         #main(U u) -> Int\nu.a()",
+    );
+    let shape = inspect_module(&wasm);
+    assert_eq!(
+        shape.fn_section_count, 3,
+        "expected `a()` + `b()` + #main (got {})",
+        shape.fn_section_count
+    );
+}
+
+#[test]
+fn dce_keeps_transitive_method_chain() {
+    // a() -> b() -> c() -> d(); only a is called from #main. All
+    // four method bodies + #main = 5 wasm funcs.
+    let wasm = compile_wasm(
+        "#schema U { Int x: * } with {\n  \
+            a() -> Int: self.b() + 1\n  \
+            b() -> Int: self.c() + 2\n  \
+            c() -> Int: self.d() + 4\n  \
+            d() -> Int: self.x\n\
+         }\n\
+         #main(U u) -> Int\nu.a()",
+    );
+    let shape = inspect_module(&wasm);
+    assert_eq!(
+        shape.fn_section_count, 5,
+        "expected a+b+c+d+#main = 5 wasm funcs (got {})",
+        shape.fn_section_count
+    );
+}
+
+#[test]
+fn dce_method_pruning_shrinks_module() {
+    // The same entry body with three extra unreferenced methods on
+    // the receiving schema should produce a strictly smaller wasm
+    // module than the variant where each method ends up reachable
+    // (via direct call from main). This pins the operational signal
+    // user-fn DCE is supposed to provide.
+    let pruned = compile_wasm(
+        "#schema U { Int x: * } with {\n  \
+            a() -> Int: self.x\n  \
+            b() -> Int: self.x * 2\n  \
+            c() -> Int: self.x + 3\n\
+         }\n\
+         #main(U u) -> Int\nu.a()",
+    );
+    let kept = compile_wasm(
+        "#schema U { Int x: * } with {\n  \
+            a() -> Int: self.x\n  \
+            b() -> Int: self.x * 2\n  \
+            c() -> Int: self.x + 3\n\
+         }\n\
+         #main(U u) -> Int\nu.a() + u.b() + u.c()",
+    );
+    assert!(
+        pruned.len() < kept.len(),
+        "DCE'd module should be smaller (pruned={}, kept={})",
+        pruned.len(),
+        kept.len()
+    );
+}
+
+#[test]
+fn dce_unreachable_method_with_lambda_prunes_lambda() {
+    // Schema method `b()` is never called and its body uses a
+    // lambda through `fold`. DCE drops the method, its inner
+    // `list_int_fold` import need, and the lambda itself. The
+    // reachable shape: only #main (which calls `a()`) + `a()`
+    // body. No closure call sites remain reachable, so no
+    // funcref table.
+    let wasm = compile_wasm(
+        "#schema U { List<Int> xs: * } with {\n  \
+            a() -> Int: 42\n  \
+            b() -> Int: self.xs.fold(0, (Int acc, Int x) => acc + x)\n\
+         }\n\
+         #main(U u) -> Int\nu.a()",
+    );
+    let shape = inspect_module(&wasm);
+    assert_eq!(
+        shape.fn_section_count, 2,
+        "expected only `a()` + #main; `b()` + lambda + fold pruned (got {})",
+        shape.fn_section_count
+    );
+    assert!(
+        !shape.has_table,
+        "no reachable closure call sites means no funcref table"
+    );
+    assert_eq!(
+        shape.element_fn_count, 0,
+        "pruned lambda must not reach the element section"
+    );
+}
+
+#[test]
+fn dce_pruned_method_does_not_count_as_funcref_slot() {
+    // Even when the schema has unused methods, the funcref table is
+    // not emitted (no closure call sites). This catches a regression
+    // where pruned schema methods leak into the closure-table emit
+    // path.
+    let wasm = compile_wasm(
+        "#schema U { Int x: * } with {\n  \
+            a() -> Int: self.x\n  \
+            b() -> Int: self.x * 2\n\
+         }\n\
+         #main(U u) -> Int\nu.a()",
+    );
+    let shape = inspect_module(&wasm);
+    assert_eq!(shape.fn_section_count, 2);
+    assert!(!shape.has_table);
+    assert_eq!(shape.element_fn_count, 0);
+}
+
+#[test]
 fn dce_keeps_each_stdlib_independently() {
     // Each surface call kicks in exactly its own stdlib body. The
     // module shape lets us pin "user picks N stdlib bodies -> N+1
