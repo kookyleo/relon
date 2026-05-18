@@ -23,6 +23,13 @@ categories = ["compilers"]
 # pipeline.
 [dependencies]
 relon-trace-jit = { workspace = true }
+# Shared ABI types: TraceContext / DeoptStateSnapshot / TRACE_ENTRY_SIG /
+# AbiSignature / AbiType / TraceEntryStatus / HostHookTable / EffectClass
+# / ObservedType / ExternalPc / ExternalSlot / ExternalAddr. The emitter
+# imports these instead of redeclaring layout-compatible views so the
+# cranelift IR it generates and the trace-jit runtime helpers agree
+# byte-for-byte.
+relon-trace-abi = { workspace = true }
 
 # Cranelift v0.131 — kept in lock-step with relon-codegen-native so we
 # don't dual-instantiate the same backend in a downstream binary.
