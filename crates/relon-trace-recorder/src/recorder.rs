@@ -21,7 +21,8 @@ use std::collections::HashMap;
 
 use relon_ir::Op;
 use relon_trace_jit::{
-    EffectClass as TraceEffect, GuardKind, ObservedType, SsaVar, TraceBuffer, TraceOp,
+    EffectClass as TraceEffect, ExternalPc, GuardKind, GuardSite, ObservedType, SsaVar,
+    TraceBuffer, TraceOp,
 };
 
 use crate::abort::AbortReason;
@@ -112,6 +113,12 @@ pub struct RecorderState {
     /// Maximum number of ops the buffer may collect before the
     /// recorder aborts with `TraceTooLong`.
     capacity: usize,
+    /// Synthetic external PC the recorder stamps on each emitted
+    /// `GuardSite`. The cranelift-generic backend supplies a real
+    /// instruction pointer; until the IR walker wires that through,
+    /// we use a monotone counter so the emitter's guard lookup keeps
+    /// finding a matching site for every `TraceOp::Guard` it sees.
+    next_external_pc: u64,
     aborted: Option<AbortReason>,
     terminated: bool,
 }
@@ -133,9 +140,20 @@ impl RecorderState {
             loop_depth: 0,
             next_loop_id: 0,
             capacity,
+            next_external_pc: 0,
             aborted: None,
             terminated: false,
         }
+    }
+
+    /// Override the next-external-PC the recorder stamps on its
+    /// emitted [`GuardSite`]s. Used by hosts (the cranelift-generic
+    /// backend driving the IR walker) that have a real resume PC
+    /// available; the default monotone counter just keeps each guard
+    /// site's `external_pc` unique so the emitter / deopt path can
+    /// still tell them apart.
+    pub fn set_next_external_pc(&mut self, pc: u64) {
+        self.next_external_pc = pc;
     }
 
     /// True when the recorder has accepted an abort decision and is
@@ -368,7 +386,7 @@ impl RecorderState {
                 }
                 self.guarded_vars.insert(var, ty);
                 let kind = GuardKind::TypeCheck(var, ty);
-                self.buffer.append(TraceOp::Guard(kind, var));
+                self.append_guard_with_site(kind, var);
                 Some(kind)
             }
             TypeObsDecision::Mismatch { .. } => {
@@ -392,8 +410,29 @@ impl RecorderState {
             | GuardKind::BoundsCheck(v, _)
             | GuardKind::ArithOverflow(v) => v,
         };
-        self.buffer.append(TraceOp::Guard(kind, payload));
+        self.append_guard_with_site(kind, payload);
         Some(kind)
+    }
+
+    /// Append a `TraceOp::Guard(kind, payload)` to the buffer *and*
+    /// record the matching [`GuardSite`] in the buffer's side-table.
+    ///
+    /// v6-γ M4 fix: previously only the linear op was appended; the
+    /// emitter's per-pc guard lookup then surfaced
+    /// `EmitError::OrphanGuardOp`. The side-table entry carries the
+    /// trace_pc + a synthetic external_pc so deopt dispatch keeps a
+    /// stable id even before the IR walker wires through a real
+    /// resume IP.
+    ///
+    /// `deopt_state` is left empty here. The recorder doesn't see the
+    /// generic-frame slot mapping; the cranelift-generic backend
+    /// fills it in via [`TraceBuffer::guards`] post-recording.
+    fn append_guard_with_site(&mut self, kind: GuardKind, payload: SsaVar) {
+        let trace_pc = self.buffer.append(TraceOp::Guard(kind, payload));
+        let external_pc = ExternalPc(self.next_external_pc);
+        self.next_external_pc = self.next_external_pc.wrapping_add(1);
+        self.buffer
+            .record_guard(GuardSite::new(trace_pc, external_pc, kind));
     }
 }
 
