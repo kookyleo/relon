@@ -96,6 +96,20 @@ struct ConstPool {
     /// Lazily-laid-out combining-mark + whitespace ranges tables.
     combining_marks_offset: Option<u32>,
     whitespace_offset: Option<u32>,
+    /// Unicode normalization tables (NFD / NFKD decompositions,
+    /// Canonical_Combining_Class, canonical composition pairs).
+    decomp_nfd_offset: Option<u32>,
+    decomp_nfkd_offset: Option<u32>,
+    ccc_offset: Option<u32>,
+    composition_offset: Option<u32>,
+    /// Full multi-codepoint case-folding tables (UAX #21).
+    full_case_fold_upper_offset: Option<u32>,
+    full_case_fold_lower_offset: Option<u32>,
+    cased_ranges_offset: Option<u32>,
+    case_ignorable_ranges_offset: Option<u32>,
+    /// Locale-aware Turkish / Azerbaijani override tables.
+    turkish_upper_offset: Option<u32>,
+    turkish_lower_offset: Option<u32>,
 }
 
 impl ConstPool {
@@ -230,6 +244,137 @@ impl ConstPool {
                     let bytes = relon_ir::whitespace::encode_ranges_bytes(table);
                     self.bytes.extend_from_slice(&bytes);
                     self.whitespace_offset = Some(off);
+                }
+            }
+            Op::DecompTableAddr { compatibility } => {
+                let slot = if *compatibility {
+                    &mut self.decomp_nfkd_offset
+                } else {
+                    &mut self.decomp_nfd_offset
+                };
+                if slot.is_none() {
+                    self.align_to(4);
+                    let off = u32::try_from(self.bytes.len()).map_err(|_| {
+                        CraneliftError::Codegen("const pool exceeds u32 range".into())
+                    })?;
+                    let (index, payload) = if *compatibility {
+                        (
+                            relon_ir::normalization_data::NFKD_INDEX,
+                            relon_ir::normalization_data::NFKD_POOL,
+                        )
+                    } else {
+                        (
+                            relon_ir::normalization_data::NFD_INDEX,
+                            relon_ir::normalization_data::NFD_POOL,
+                        )
+                    };
+                    let bytes = relon_ir::normalization::encode_decomp_table_bytes(index, payload);
+                    self.bytes.extend_from_slice(&bytes);
+                    if *compatibility {
+                        self.decomp_nfkd_offset = Some(off);
+                    } else {
+                        self.decomp_nfd_offset = Some(off);
+                    }
+                }
+            }
+            Op::CccTableAddr => {
+                if self.ccc_offset.is_none() {
+                    self.align_to(4);
+                    let off = u32::try_from(self.bytes.len()).map_err(|_| {
+                        CraneliftError::Codegen("const pool exceeds u32 range".into())
+                    })?;
+                    let bytes = relon_ir::normalization::encode_ccc_table_bytes(
+                        relon_ir::normalization_data::CCC_TABLE,
+                    );
+                    self.bytes.extend_from_slice(&bytes);
+                    self.ccc_offset = Some(off);
+                }
+            }
+            Op::CompositionTableAddr => {
+                if self.composition_offset.is_none() {
+                    self.align_to(4);
+                    let off = u32::try_from(self.bytes.len()).map_err(|_| {
+                        CraneliftError::Codegen("const pool exceeds u32 range".into())
+                    })?;
+                    let bytes = relon_ir::normalization::encode_composition_table_bytes(
+                        relon_ir::normalization_data::COMPOSITION_PAIRS,
+                    );
+                    self.bytes.extend_from_slice(&bytes);
+                    self.composition_offset = Some(off);
+                }
+            }
+            Op::FullCaseFoldTableAddr { upper } => {
+                let slot = if *upper {
+                    &mut self.full_case_fold_upper_offset
+                } else {
+                    &mut self.full_case_fold_lower_offset
+                };
+                if slot.is_none() {
+                    self.align_to(4);
+                    let off = u32::try_from(self.bytes.len()).map_err(|_| {
+                        CraneliftError::Codegen("const pool exceeds u32 range".into())
+                    })?;
+                    let table = if *upper {
+                        relon_ir::full_case_folding::full_upper_folding()
+                    } else {
+                        relon_ir::full_case_folding::full_lower_folding()
+                    };
+                    let bytes = relon_ir::full_case_folding::encode_full_table_bytes(table);
+                    self.bytes.extend_from_slice(&bytes);
+                    if *upper {
+                        self.full_case_fold_upper_offset = Some(off);
+                    } else {
+                        self.full_case_fold_lower_offset = Some(off);
+                    }
+                }
+            }
+            Op::CasedRangesAddr => {
+                if self.cased_ranges_offset.is_none() {
+                    self.align_to(4);
+                    let off = u32::try_from(self.bytes.len()).map_err(|_| {
+                        CraneliftError::Codegen("const pool exceeds u32 range".into())
+                    })?;
+                    let table = relon_ir::full_case_folding::cased_ranges();
+                    let bytes = relon_ir::full_case_folding::encode_ranges_bytes(table);
+                    self.bytes.extend_from_slice(&bytes);
+                    self.cased_ranges_offset = Some(off);
+                }
+            }
+            Op::CaseIgnorableRangesAddr => {
+                if self.case_ignorable_ranges_offset.is_none() {
+                    self.align_to(4);
+                    let off = u32::try_from(self.bytes.len()).map_err(|_| {
+                        CraneliftError::Codegen("const pool exceeds u32 range".into())
+                    })?;
+                    let table = relon_ir::full_case_folding::case_ignorable_ranges();
+                    let bytes = relon_ir::full_case_folding::encode_ranges_bytes(table);
+                    self.bytes.extend_from_slice(&bytes);
+                    self.case_ignorable_ranges_offset = Some(off);
+                }
+            }
+            Op::TurkishCaseFoldTableAddr { upper } => {
+                let slot = if *upper {
+                    &mut self.turkish_upper_offset
+                } else {
+                    &mut self.turkish_lower_offset
+                };
+                if slot.is_none() {
+                    self.align_to(4);
+                    let off = u32::try_from(self.bytes.len()).map_err(|_| {
+                        CraneliftError::Codegen("const pool exceeds u32 range".into())
+                    })?;
+                    let table = if *upper {
+                        relon_ir::full_case_folding::turkish_upper_folding()
+                    } else {
+                        relon_ir::full_case_folding::turkish_lower_folding()
+                    };
+                    let bytes = relon_ir::full_case_folding::encode_simple_view_bytes(table);
+                    self.bytes.extend_from_slice(&bytes);
+                    if *upper {
+                        self.turkish_upper_offset = Some(off);
+                    } else {
+                        self.turkish_lower_offset = Some(off);
+                    }
                 }
             }
             // Recurse into structured bodies so nested ConstStrings
@@ -2107,6 +2252,77 @@ impl<'a, 'b> Codegen<'a, 'b> {
             Op::WhitespaceRangesAddr => {
                 let off = self.const_pool.whitespace_offset.ok_or_else(|| {
                     CraneliftError::Codegen("WhitespaceRangesAddr missing from const pool".into())
+                })?;
+                let v = self.builder.ins().iconst(I32, i64::from(off));
+                self.push(v);
+            }
+            Op::DecompTableAddr { compatibility } => {
+                let off = if *compatibility {
+                    self.const_pool.decomp_nfkd_offset
+                } else {
+                    self.const_pool.decomp_nfd_offset
+                };
+                let off = off.ok_or_else(|| {
+                    CraneliftError::Codegen("DecompTableAddr missing from const pool".into())
+                })?;
+                let v = self.builder.ins().iconst(I32, i64::from(off));
+                self.push(v);
+            }
+            Op::CccTableAddr => {
+                let off = self.const_pool.ccc_offset.ok_or_else(|| {
+                    CraneliftError::Codegen("CccTableAddr missing from const pool".into())
+                })?;
+                let v = self.builder.ins().iconst(I32, i64::from(off));
+                self.push(v);
+            }
+            Op::CompositionTableAddr => {
+                let off = self.const_pool.composition_offset.ok_or_else(|| {
+                    CraneliftError::Codegen("CompositionTableAddr missing from const pool".into())
+                })?;
+                let v = self.builder.ins().iconst(I32, i64::from(off));
+                self.push(v);
+            }
+            Op::FullCaseFoldTableAddr { upper } => {
+                let off = if *upper {
+                    self.const_pool.full_case_fold_upper_offset
+                } else {
+                    self.const_pool.full_case_fold_lower_offset
+                };
+                let off = off.ok_or_else(|| {
+                    CraneliftError::Codegen("FullCaseFoldTableAddr missing from const pool".into())
+                })?;
+                let v = self.builder.ins().iconst(I32, i64::from(off));
+                self.push(v);
+            }
+            Op::CasedRangesAddr => {
+                let off = self.const_pool.cased_ranges_offset.ok_or_else(|| {
+                    CraneliftError::Codegen("CasedRangesAddr missing from const pool".into())
+                })?;
+                let v = self.builder.ins().iconst(I32, i64::from(off));
+                self.push(v);
+            }
+            Op::CaseIgnorableRangesAddr => {
+                let off = self
+                    .const_pool
+                    .case_ignorable_ranges_offset
+                    .ok_or_else(|| {
+                        CraneliftError::Codegen(
+                            "CaseIgnorableRangesAddr missing from const pool".into(),
+                        )
+                    })?;
+                let v = self.builder.ins().iconst(I32, i64::from(off));
+                self.push(v);
+            }
+            Op::TurkishCaseFoldTableAddr { upper } => {
+                let off = if *upper {
+                    self.const_pool.turkish_upper_offset
+                } else {
+                    self.const_pool.turkish_lower_offset
+                };
+                let off = off.ok_or_else(|| {
+                    CraneliftError::Codegen(
+                        "TurkishCaseFoldTableAddr missing from const pool".into(),
+                    )
                 })?;
                 let v = self.builder.ins().iconst(I32, i64::from(off));
                 self.push(v);
