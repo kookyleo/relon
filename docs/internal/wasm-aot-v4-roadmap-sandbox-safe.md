@@ -107,14 +107,117 @@ LuaJIT sub-μs warm 来自 trace JIT 出 native code，函数调用 = `call rax`
 - 换 runtime（Wasmer headless mode / 自己包 cranelift 出的 .o + 自己实现 trap handler）
 - 或者放弃 wasm 作中间表示，Relon IR 直出 cranelift IR + 自己实现 linear memory bound check
 
-两条都**动 sandbox**，明确不在 v4 范围。如未来要追，单立 v5 系列。
+两条都**动 sandbox**，明确不在 v4 范围。落到 v5 系列推（用户已授权）。
 
-## 启动顺序建议
+## v5 系列：放下 wasmtime / wasm，物理逼近 LuaJIT
 
-1. **v4-e**（auto-tier）+ **v4-d**（mmap）—— 两个独立的快胜利，一周内能 ship。
-2. **v4-a**（dirty-leave）—— 单点 ROI 最高，但工程量最大。优先于 b/c。
-3. **v4-b**（参数 specialization）→ **v4-c**（helper inline）—— b 拿 1.5 μs，c 再拿 1 μs，叠加后看 criterion 数字定 v4-f 优先级。
-4. **v4-f**（SIMD）——v3++ b-7 落地后的延续，看 ASCII workload 比重决定值不值得做完整版还是只做 16-byte chunk。
+**用户授权**：2026-05-18 明确 "wasmtime 包括 wasm 都不用守，看需要" + "但沙箱是需要的，恰当的形式"。
+
+**硬约束**：sandbox 语义**必须**保留，但**实现形式不限于 wasmtime + wasm spec**。等价语义可由 cranelift bounds check + Rust signal handler + capability bitmap 等组合提供。具体来说必须有：
+
+1. Linear memory bounds check（每次内存访问越界 trap）
+2. Trap handler（除零、未定义、bounds violation 等捕获并安全退出，不破坏 host 进程）
+3. Capability gating（受控的 host fn 调用 + 远程 import 闸门）
+4. Resource limit（fuel / epoch / deadline，可缩减但不能完全去）
+
+放弃下列保留是允许的（按需）：
+- spectre mitigation（hardware speculative bounds check）—— 关闭可 -100 ns/loop iter
+- Rust backtrace / unwind info emission —— 关闭可 -200 ns/invoke
+- 完整 wasm spec compliance —— 不需要外部 wasm runtime 加载我们的输出
+- 标准 wasmtime 抽象（Store / Instance / Func）—— 可重写
+
+v5 在 v4 之上启动，按 ROI 取舍。
+
+### v5-α：Wasmer headless mode
+
+**改动**：用 Wasmer 的预编译模式替换 wasmtime —— compile-time 把 wasm 模块编译成静态链接的 native code + 最小 runtime，省 wasmtime 的 per-invoke `Store::new` / `Instance::new` 重逻辑。仍走 wasm spec，linear memory bounds 仍有，但 trap handler / fuel / spectre mitigation 走 Wasmer 简化实现。
+
+**ROI**：warm invoke **-1 ~ -2 μs**（绕过 wasmtime store 抽象，直接调 native code）。
+
+**工程量**：M（替换 codegen-wasm 的 runtime 部分；Wasmer + wasmtime API 不完全 compat，要适配 `Module::serialize` / `Func::call` / capability import wiring）。
+
+**风险**：Wasmer 生态弱于 wasmtime，未来升级跟随成本未知。建议作 feature flag 而非默认。
+
+### v5-β：cranelift-only AOT（绕开 wasm IR）
+
+**改动**：放弃 wasm 作中间表示。Relon IR 直接 lower 到 cranelift IR（`cranelift-frontend`），通过 `cranelift-jit` 生成 x86 / aarch64 native code。Linear memory bounds 检查手工 emit（只 emit 实际需要的），trap handler 用 Rust signal handling（libc `sigaction` + `sigsetjmp/siglongjmp`），capability gating 走 Rust 端的 capability bitmap match。
+
+**ROI**：warm invoke **0.3-0.5 μs**（cranelift fn call 本身 ~100 ns，加最小 trampoline ~200 ns）。Cold start uncached 不变（cranelift 编译时间和 wasmtime cranelift 后端相同）。Cached cold start **~50 μs**（仅 mmap + relocate）。
+
+**工程量**：XL（5-8 周）。codegen-wasm 完全重写到 codegen-cranelift；stdlib body 全部重新 lower（现有的 wasm IR Op stream 不复用）；trap unwind 全自己实现。
+
+**安全（硬约束 sandbox 必备，按 v5 序言条款）**：
+- Linear memory：用 Rust `Box<[u8]>` managed buffer，每次访问 emit cranelift `bounds_check` 指令（cranelift 原生支持 trap-on-OOB），等价 wasm memory.* 的 bounds 语义。
+- Trap handler：Rust 端注册 SIGSEGV / SIGFPE handler，捕获 cranelift emit 的 bounds-trap / div-by-zero / unreachable，转 `Result<_, RuntimeError>` 返回。`sigsetjmp/siglongjmp` 跨 native code 边界回到 host。
+- Capability gating：cranelift codegen 时把 host fn 调用走 indirect call 通过 capability bitmap 验过的 vtable，绕过等于 unreachable。
+- Resource limit：cranelift 入口 prologue emit 一段 `cmp + cond_br trap` 对照 epoch deadline，比 wasmtime fuel 廉价。
+- Spectre mitigation：默认开（cranelift 已支持 `enable_jump_tables=false` + bounds check 不 fold），高信任场景 feature flag 关，-100 ns/loop iter。
+
+**ROI 后**：触达 LuaJIT trace JIT 同档（PUC Lua 是 sub-μs/op interpreter；LuaJIT trace JIT 是 sub-ns/op JIT trace）。具体落到哪档看是否做 trace recording —— Relon 当前是 AOT（编译一次跑多次），与 LuaJIT 的 hot loop tracing 模型不同，对 hot loop heavy 场景仍输 LuaJIT，但对 "cold start + 一次 invoke" 场景反胜。
+
+### v5-γ：cranelift-object pre-AOT
+
+**改动**：v5-β 的离线版。`relon-cli` 启动时 cranelift 输出 `.o` 目标文件，缓存到磁盘。运行时 `dlopen` + resolve symbol + `call $sym`。完全跳过 codegen 阶段。
+
+**ROI**：cold start uncached **2-8 ms → 100 μs**（dlopen + reloc）；cached cold start **~10 μs**；warm invoke **0.3-0.5 μs**（同 β）。
+
+**工程量**：v5-β 之上 +1 周（dlopen + symbol relocation 包装）。
+
+**安全**：和 v5-β 同，但 cache 文件本身需要更严格 hash + signature 验证（dlopen 等于加载执行 unverified native code，比 wasm 危险得多）。
+
+### v5-δ：**OUT OF SCOPE**（drops sandbox）
+
+原版设想：检测高频 `#main(...)` 在 AOT 阶段输出 Rust 源码 + `cargo build` 集成到 host 二进制。`run_main` 走纯 Rust extern call。
+
+**为何出局**：纯 Rust extern call 等于把脚本代码当 native code 直接执行，**违反 v5 序言的硬 sandbox 约束**（没有 bounds check、没有 trap 捕获、没有 capability 拦截）。要安全运行 untrusted Relon 脚本，这条路彻底不通。
+
+如果未来出现 "host 完全信任 Relon source + sub-100 ns warm 是刚需" 的真实场景，单立 v6 系列，明确仅对 trusted source 启用 + 加 explicit opt-in flag + 文档警告。当前不规划。
+
+### v5 路线累计估算
+
+| 阶段叠加 | warm invoke | cached cold start | uncached cold |
+| --- | ---: | ---: | ---: |
+| v4 全做完 | 0.5-1 μs | 80 μs | 2-8 ms |
+| +v5-α | **0.3-0.5 μs** | 80 μs | 2-8 ms |
+| +v5-β / γ | **0.3-0.5 μs** | **~10 μs** (γ) | 100 μs (γ) |
+
+到 v5-β/γ 已经物理跨过 LuaJIT trace JIT 的 cold start 优势线；warm invoke 仍是 LuaJIT 微胜（JIT trace 在 hot loop 里 sub-ns/op）。要追平 hot loop 需要自实现 trace JIT —— 在 v5 之后看必要性决定。
+
+### 启动门槛
+
+- v4 全做完是 v5 的前置（v4-e auto-tier 后才知道 wasm-AOT 哪些 workload 仍是瓶颈）
+- v5-α / β / γ **不需全做**。看 v4 数据 + 用户场景：若 cold start 是痛点 → γ 优先；若 warm 是痛点 → β 优先；α 是低风险中等收益的过渡。
+- 每个 v5 阶段也是 fresh agent + worktree isolation + 严格不砍 scope + sandbox 4 项硬约束（bounds check / trap / capability / resource limit）保留。
+
+## 启动顺序 + 并行机会
+
+各 phase 文件接触面分析（用于决定能否并行派 agent）：
+
+| Phase | 主要 touch | 与谁冲突 |
+| --- | --- | --- |
+| v3++ b-7 SIMD ASCII | `crates/relon-codegen-wasm/src/lib.rs` + `crates/relon-ir/src/stdlib.rs`（upper/lower/title body） | v4-b, v4-c（同 stdlib.rs） |
+| v4-d mmap cache | `crates/relon-codegen-wasm/src/cache.rs` 单文件 | 无 |
+| v4-e auto-tier | `crates/relon/src/lib.rs` + `crates/relon-cli/src/main.rs` + `crates/relon-evaluator/src/lib.rs` | 无（独立 SDK 层） |
+| v4-a dirty-leave | `crates/relon-codegen-wasm/src/evaluator.rs` (Pool-of-Stores) | v4-b 部分 overlap |
+| v4-b arg specialization | `crates/relon-codegen-wasm/src/evaluator.rs` + `crates/relon-codegen-wasm/src/lib.rs` | v4-a, b-7, v4-c |
+| v4-c stdlib helper inline | `crates/relon-codegen-wasm/src/lib.rs` + `crates/relon-ir/src/stdlib.rs` | b-7, v4-b |
+
+**派 agent 顺序**（每次最多 2 个 in-flight）：
+
+1. **当前**：v3++ b-6-tail (sequential，已 in_flight)。
+2. **b-6-tail merge 后**：派 b-7 SIMD ASCII。**单 agent 跑**（stdlib bodies 高频改动，risk 大）。
+3. **b-7 merge 后**：**并行**派 v4-d (mmap) + v4-e (auto-tier)。两 phase 文件无 overlap，独立 commit，两边都用 host-baseRef worktree。等待两份 task-notification 后顺序 merge（v4-d 先因为 cache.rs 较稳定）。
+4. **v4-d + v4-e merge 后**：派 v4-a (dirty-leave) 单跑。Pool-of-Stores 改动跨多文件，慎并行。
+5. **v4-a merge 后**：派 v4-b (arg specialization) 单跑。
+6. **v4-b merge 后**：派 v4-c (helper inline) 单跑。
+7. **v4-c merge 后**：v3++ + v4 完整收官，bench 全量更新 + 报告附录 A.26 总结。停在这里看用户决定是否开 v5。
+
+**v5 阶段并行机会**：
+
+v5-α (Wasmer headless) 是 runtime 替换，全局动；v5-β (cranelift-only) 是新 crate `relon-codegen-native`，与现有 codegen-wasm 完全独立但功能竞争；v5-γ 依赖 v5-β。
+
+- v5-α + v5-β **可以并行**派两个 agent：α 在现 codegen-wasm 加 feature flag 切 Wasmer；β 在新 crate `relon-codegen-native` 起步。两边各自实现 4 项 sandbox 硬约束。等两份数据出来后用户决策 ship 哪条线（α 是 wasm 生态兼容路线，β 是 native code 极限路线）。
+- v5-γ 必须等 v5-β 稳定后启动。
 
 ## Bench 落地条款
 
