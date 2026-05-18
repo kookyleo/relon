@@ -133,22 +133,42 @@ impl AutoEvaluator {
         }
     }
 
-    /// Drive the wasm-AOT pipeline over `source`. Kept as an
-    /// associated fn so the v5-β rewire only touches one site.
-    #[cfg(feature = "wasm-aot")]
+    /// Drive the preferred AOT pipeline over `source`.
+    ///
+    /// v5-beta-1: when the `cranelift-aot` feature is enabled the
+    /// auto-tier wrapper tries the cranelift-native backend first;
+    /// any setup failure (e.g. the source uses ops the cranelift
+    /// path doesn't yet lower) falls back to the wasm-AOT backend.
+    /// If both are off (or both fail) the slot caches the error
+    /// string and `run_main` returns `RuntimeError::Unsupported`.
     fn build_aot(source: &str) -> Result<Box<dyn Evaluator>, String> {
+        // Try cranelift-aot first when enabled. The narrow v5-beta-1
+        // envelope means most production sources will fail this path
+        // and fall back to wasm-AOT below; that's expected.
+        #[cfg(feature = "cranelift-aot")]
+        if let Ok(aot) = relon_codegen_native::CraneliftAotEvaluator::from_source(source) {
+            return Ok(Box::new(aot) as Box<dyn Evaluator>);
+        }
+        Self::build_aot_wasm(source)
+    }
+
+    /// Wasm-AOT fallback path used by [`Self::build_aot`] once the
+    /// cranelift attempt (if enabled) has either succeeded or
+    /// failed-and-fallen-through.
+    #[cfg(feature = "wasm-aot")]
+    fn build_aot_wasm(source: &str) -> Result<Box<dyn Evaluator>, String> {
         relon_codegen_wasm::WasmAotEvaluator::from_source(source)
             .map(|aot| Box::new(aot) as Box<dyn Evaluator>)
             .map_err(|e| e.to_string())
     }
 
-    /// Stub fallback for builds compiled without the `wasm-aot`
-    /// feature (e.g. the `wasm32-unknown-unknown` target). The
-    /// tree-walker surface stays usable; only `run_main` will
-    /// surface this error.
+    /// Stub for builds compiled without `wasm-aot` (e.g. wasm32 hosts).
+    /// The cranelift-aot feature can still satisfy `run_main` for the
+    /// narrow envelope it supports; everything else surfaces this
+    /// error.
     #[cfg(not(feature = "wasm-aot"))]
-    fn build_aot(_source: &str) -> Result<Box<dyn Evaluator>, String> {
-        Err("this build was compiled without the `wasm-aot` feature; rebuild with `--features wasm-aot` to enable AOT run_main"
+    fn build_aot_wasm(_source: &str) -> Result<Box<dyn Evaluator>, String> {
+        Err("this build was compiled without the `wasm-aot` feature and the cranelift-aot backend cannot handle this source; rebuild with `--features wasm-aot` to widen AOT run_main coverage"
             .to_string())
     }
 }

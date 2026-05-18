@@ -20,6 +20,8 @@ use std::sync::Arc;
 pub use auto_evaluator::AutoEvaluator;
 pub use projector::{JsonProjector, Projector};
 pub use relon_analyzer;
+#[cfg(feature = "cranelift-aot")]
+pub use relon_codegen_native;
 #[cfg(feature = "wasm-aot")]
 pub use relon_codegen_wasm;
 pub use relon_eval_api;
@@ -572,6 +574,14 @@ pub enum Backend {
     /// pay the AOT cold-start cost up-front (e.g. before a latency-
     /// sensitive serving loop) rather than on first `run_main`.
     WasmAot,
+    /// v5-beta-1 native AOT backend. Lowers IR through cranelift's
+    /// JIT module surface to produce native machine code; `run_main`
+    /// invokes the JIT entry through a panic-shielded trampoline.
+    /// Supports a deliberately narrow `#main(Int...) -> Int` shape
+    /// today; v5-beta-2 widens the lowering to cover the full IR
+    /// envelope. The four non-`run_main` `Evaluator` methods surface
+    /// `RuntimeError::Unsupported`, matching the wasm-AOT shape.
+    CraneliftAot,
 }
 
 /// Errors specific to the backend factory. Distinct from
@@ -588,6 +598,13 @@ pub enum BackendError {
     /// facade surface stays narrow.
     #[error("wasm-aot backend setup failed: {0}")]
     WasmAot(String),
+    /// v5-beta-1: cranelift-AOT pipeline failed (typically because
+    /// the source falls outside the narrow op envelope the
+    /// cranelift backend covers today). Wraps the
+    /// `relon_codegen_native::CraneliftError` stringified so this
+    /// crate stays decoupled from the cranelift crate's surface.
+    #[error("cranelift-aot backend setup failed: {0}")]
+    CraneliftAot(String),
 }
 
 /// Construct an [`relon_eval_api::Evaluator`] over `source` using the
@@ -619,6 +636,17 @@ pub fn new_evaluator(
         #[cfg(not(feature = "wasm-aot"))]
         Backend::WasmAot => Err(BackendError::WasmAot(
             "this build was compiled without the `wasm-aot` feature; rebuild with `--features wasm-aot` to enable the backend"
+                .to_string(),
+        )),
+        #[cfg(feature = "cranelift-aot")]
+        Backend::CraneliftAot => {
+            let aot = relon_codegen_native::CraneliftAotEvaluator::from_source(source)
+                .map_err(|e| BackendError::CraneliftAot(e.to_string()))?;
+            Ok(Box::new(aot))
+        }
+        #[cfg(not(feature = "cranelift-aot"))]
+        Backend::CraneliftAot => Err(BackendError::CraneliftAot(
+            "this build was compiled without the `cranelift-aot` feature; rebuild with `--features cranelift-aot` to enable the backend"
                 .to_string(),
         )),
     }

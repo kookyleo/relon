@@ -18,6 +18,11 @@ categories = ["config", "parsing", "compilers"]
 # feature up through that path so day-to-day developer flows still
 # see both backends.
 wasm-aot = ["dep:relon-codegen-wasm"]
+# v5-beta-1: `cranelift-aot` toggles the cranelift-backed native AOT
+# evaluator. Off by default — and excluded entirely from wasm32 targets
+# below — so the freestanding wasm playground stays free of the
+# cranelift dependency tree.
+cranelift-aot = ["dep:relon-codegen-native"]
 
 [dependencies]
 relon-evaluator = { workspace = true }
@@ -28,6 +33,10 @@ relon-analyzer = { workspace = true }
 # feature-gated so wasm32 hosts that can't link wasmtime still
 # compile against the tree-walker.
 relon-codegen-wasm = { workspace = true, optional = true }
+# v5-beta-1: cranelift-AOT backend lives in a separate crate so the
+# wasm32 target (`relon-wasm`, browser playground) can opt out via the
+# absence of the `cranelift-aot` feature.
+relon-codegen-native = { workspace = true, optional = true }
 relon-eval-api = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
