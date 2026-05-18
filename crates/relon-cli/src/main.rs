@@ -14,19 +14,27 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// Mirror of [`relon::Backend`] surfaced as a clap-friendly enum so the
-/// CLI accepts `--backend=tree-walk` / `--backend=wasm-aot`. Kept
-/// separate from the public type so the rename / display knobs stay
-/// CLI-only — the library facade picks ergonomic Rust names while the
-/// CLI sticks with kebab-case for muscle-memory.
-#[derive(Debug, Clone, Copy, Default, ValueEnum)]
+/// CLI accepts `--backend=auto` / `--backend=tree-walk` /
+/// `--backend=wasm-aot`. Kept separate from the public type so the
+/// rename / display knobs stay CLI-only — the library facade picks
+/// ergonomic Rust names while the CLI sticks with kebab-case for
+/// muscle-memory.
+#[derive(Debug, Clone, Copy, Default, ValueEnum, PartialEq, Eq)]
 enum BackendArg {
-    /// Tree-walking interpreter (default). Supports the full
+    /// Auto-tier (default, v4-e). Routes `run_main` through wasm-AOT
+    /// on demand (lazily constructed on first call) and every other
+    /// `Evaluator` method through the tree-walker. Inherits the
+    /// tree-walker's full surface when the script never asks for
+    /// `run_main`; pays the AOT cold-start exactly when needed.
+    #[default]
+    #[value(name = "auto")]
+    Auto,
+    /// Tree-walking interpreter only. Supports the full
     /// `Evaluator` surface including arbitrary `eval` on AST nodes
     /// and host-registered native fns.
-    #[default]
     #[value(name = "tree-walk")]
     TreeWalk,
-    /// Wasm AOT backend. Pre-compiles the entry into wasm and
+    /// Wasm AOT backend only. Pre-compiles the entry into wasm and
     /// dispatches `run_main` through wasmtime. Library-mode
     /// `eval_root` is rejected — wasm-AOT only ships entries.
     #[value(name = "wasm-aot")]
@@ -68,13 +76,17 @@ enum Commands {
         /// HTTP / FS helpers).
         #[arg(long)]
         trust: bool,
-        /// Evaluation backend. `tree-walk` (default) runs the original
-        /// interpreter; `wasm-aot` pre-compiles the entry into a
-        /// wasm module via `relon-codegen-wasm` and dispatches
-        /// `run_main` through wasmtime. The wasm-aot backend only
-        /// supports `#main(...)` entries and rejects library-mode
-        /// (no-#main) sources.
-        #[arg(long, value_enum, default_value_t = BackendArg::TreeWalk)]
+        /// Evaluation backend. `auto` (v4-e default) routes `run_main`
+        /// through wasm-AOT lazily (built on first invocation) and
+        /// keeps every other operation on the tree-walker.
+        /// `tree-walk` forces the original interpreter on every
+        /// path; `wasm-aot` pre-compiles the entry into a wasm
+        /// module via `relon-codegen-wasm` and dispatches
+        /// `run_main` through wasmtime. The wasm-aot-only backend
+        /// supports `#main(...)` entries only and rejects library-
+        /// mode (no-#main) sources; `auto` falls back to the
+        /// tree-walker for library-mode files.
+        #[arg(long, value_enum, default_value_t = BackendArg::Auto)]
         backend: BackendArg,
         /// Per-`run_main` wasm step budget for the wasm-aot backend.
         /// One unit corresponds roughly to one wasm instruction (with
@@ -322,7 +334,21 @@ fn main() -> miette::Result<()> {
                         )
                         .with_source_code(NamedSource::new(file.to_string_lossy(), content.clone()))
                     })?;
-                match backend {
+                // v4-e: `--backend auto` matches the library facade's
+                // [`relon::Backend::Auto`] — `run_main` flows through
+                // wasm-AOT when this build supports it, so a CLI invocation
+                // pays the AOT cold-start exactly once. The CLI is a
+                // single-shot driver, so we eagerly build the AOT path
+                // here rather than wrapping `AutoEvaluator`; that keeps
+                // the existing workspace-aware `from_workspace` plumbing
+                // intact and gives the operator one less indirection layer
+                // to think about.
+                let effective_backend = match backend {
+                    BackendArg::Auto => BackendArg::WasmAot,
+                    other => other,
+                };
+                match effective_backend {
+                    BackendArg::Auto => unreachable!("normalised above"),
                     BackendArg::TreeWalk => evaluator.run_main(&scope, args_map).map_err(|e| {
                         Report::new(e).with_source_code(NamedSource::new(
                             file.to_string_lossy(),
@@ -382,6 +408,9 @@ fn main() -> miette::Result<()> {
                     )
                     .with_source_code(NamedSource::new(file.to_string_lossy(), content)));
                 }
+                // `Auto` for library-mode falls through to the tree-walker
+                // — wasm-AOT can't run `eval_root`, so the auto-tier rule
+                // ("AOT only on run_main") makes the right choice for free.
                 evaluator.eval_root(&scope).map_err(|e| {
                     Report::new(e)
                         .with_source_code(NamedSource::new(file.to_string_lossy(), content.clone()))

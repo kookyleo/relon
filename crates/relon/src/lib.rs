@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+pub mod auto_evaluator;
 pub mod projector;
 
 use relon_analyzer::{
@@ -16,6 +17,7 @@ use serde::de::DeserializeOwned;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+pub use auto_evaluator::AutoEvaluator;
 pub use projector::{JsonProjector, Projector};
 pub use relon_analyzer;
 #[cfg(feature = "wasm-aot")]
@@ -536,18 +538,39 @@ pub fn analyze_from_str(source: &str) -> Result<AnalyzedTree> {
 /// site. Hosts that don't care keep using the existing
 /// `value_from_str` / `from_str` entry points; the backend selection
 /// only surfaces through [`new_evaluator`].
+///
+/// v4-e: [`Backend::Auto`] is the new default. The returned evaluator
+/// eagerly constructs a tree-walker (cheap, ~1 ms) and lazily spins
+/// up the wasm-AOT backend only on first `run_main`. The other four
+/// `Evaluator` methods always go through the tree-walker — which is
+/// the only backend that supports them today and stays the
+/// canonical surface for `eval` / `eval_root` / `force_thunk` /
+/// `invoke_closure` after the v5-β native AOT lands too.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Backend {
-    /// Tree-walking interpreter (default). Supports the full surface:
-    /// lazy thunks, first-class closures, `eval` on arbitrary nodes,
-    /// host-registered native fns with capability gating.
+    /// Auto-tier (default). Returns an [`AutoEvaluator`] that routes
+    /// `run_main` through wasm-AOT (lazily constructed on first
+    /// call, cached for subsequent invocations) and every other
+    /// `Evaluator` method through the tree-walker. If the
+    /// wasm-AOT path fails to set up — for example, this build
+    /// dropped the `wasm-aot` feature, or the source uses
+    /// constructs the AOT backend rejects — only `run_main`
+    /// returns an error; the tree-walker surface stays usable.
     #[default]
+    Auto,
+    /// Tree-walking interpreter only. Supports the full surface:
+    /// lazy thunks, first-class closures, `eval` on arbitrary nodes,
+    /// host-registered native fns with capability gating. Pick this
+    /// when a host wants to guarantee no wasm-AOT construction
+    /// happens, even on `run_main`.
     TreeWalk,
-    /// Wasm AOT backend. Compiles the entry document into a wasm
-    /// module at construction time and dispatches `run_main`
+    /// Wasm AOT backend only. Compiles the entry document into a
+    /// wasm module at construction time and dispatches `run_main`
     /// invocations through a wasmtime engine. The four
     /// non-`run_main` `Evaluator` methods surface
-    /// `RuntimeError::Unsupported`.
+    /// `RuntimeError::Unsupported`. Pick this when a host wants to
+    /// pay the AOT cold-start cost up-front (e.g. before a latency-
+    /// sensitive serving loop) rather than on first `run_main`.
     WasmAot,
 }
 
@@ -585,6 +608,7 @@ pub fn new_evaluator(
     backend: Backend,
 ) -> std::result::Result<Box<dyn relon_eval_api::Evaluator>, BackendError> {
     match backend {
+        Backend::Auto => Ok(Box::new(AutoEvaluator::new(source)?)),
         Backend::TreeWalk => Ok(Box::new(build_tree_walk_evaluator(source)?)),
         #[cfg(feature = "wasm-aot")]
         Backend::WasmAot => {
@@ -604,7 +628,9 @@ pub fn new_evaluator(
 /// posture the default `value_from_str` entry point uses. Pulled out
 /// of [`new_evaluator`] so future tests / hosts can wire a tree-walker
 /// without re-running parse + analyze.
-fn build_tree_walk_evaluator(source: &str) -> std::result::Result<TreeWalkEvaluator, BackendError> {
+pub(crate) fn build_tree_walk_evaluator(
+    source: &str,
+) -> std::result::Result<TreeWalkEvaluator, BackendError> {
     let node = parse_document(source).map_err(|e| BackendError::Parse(e.to_string()))?;
     let analyzed = Arc::new(relon_analyzer::analyze(&node));
     let mut ctx = Context::new()
