@@ -32,3 +32,13 @@ relon-eval-api = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+# v3++ b-2: integration tests for `#import` hash pinning need to
+# compute a sha256 over a mock-server body and check it against the
+# directive's inline pin. The runtime deps for sha2 / hex are already
+# pulled in transitively through `relon-evaluator` and
+# `relon-analyzer`; we re-declare them here so the test file can use
+# them directly without relying on dependency inheritance.
+sha2 = { workspace = true }
+hex = { workspace = true }

@@ -1726,6 +1726,7 @@ checksum = "dc897dd8d9e8bd1ed8cdad82b5966c3e0ecae09fb1907d58efaa013543185d0a"
 name = "relon"
 version = "0.1.0"
 dependencies = [
+ "hex",
  "relon-analyzer",
  "relon-codegen-wasm",
  "relon-eval-api",
@@ -1733,6 +1734,7 @@ dependencies = [
  "relon-parser",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 2.0.18",
 ]
 

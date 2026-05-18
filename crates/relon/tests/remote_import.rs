@@ -228,6 +228,193 @@ fn facade_value_from_str_denies_remote_url_by_default() {
     }
 }
 
+/// v3++ b-2: end-to-end coverage for `#import` hash pinning.
+///
+/// The tests below drive the public facade's
+/// `analyze_entry_with_options` so the parser → analyzer → loader
+/// chain is exercised through the same surface CLI / LSP use. Network
+/// fetches are mocked through the in-process TCP listener defined
+/// at the top of this file.
+mod hash_pinning {
+    use super::*;
+    use relon_analyzer::{analyze_entry_with_options, AnalyzeOptions, WorkspaceDiagnostic};
+    use sha2::{Digest, Sha256};
+
+    fn sha256_hex(body: &str) -> String {
+        let mut h = Sha256::new();
+        h.update(body.as_bytes());
+        hex::encode(h.finalize())
+    }
+
+    fn trusted_loader(cache_dir: PathBuf) -> ResolverChainLoader {
+        let cache = RemoteImportCache::new(cache_dir);
+        let resolvers: Vec<Arc<dyn ModuleResolver>> = vec![
+            Arc::new(StdModuleResolver),
+            Arc::new(RemoteHttpResolver::with_cache(cache).allow_insecure(true)),
+        ];
+        ResolverChainLoader::from_resolvers_with_remote(resolvers, true)
+    }
+
+    #[test]
+    fn matching_hash_lets_remote_import_through() {
+        let body = "{ remote_value: 42 }";
+        let server = MockServer::start(body, 200);
+        let url = server.url("/lib.relon");
+        let digest = sha256_hex(body);
+        let entry = format!(
+            "#import lib from \"{url}\" sha256:\"{digest}\"\n{{ v: lib.remote_value }}"
+        );
+
+        let mut loader = trusted_loader(temp_cache_dir("hash-match"));
+        let ws = analyze_entry_with_options(
+            "entry".to_string(),
+            &entry,
+            std::path::PathBuf::from("."),
+            &mut loader,
+            &AnalyzeOptions::default(),
+        );
+        assert!(
+            !ws.workspace_diagnostics.iter().any(|d| matches!(
+                d,
+                WorkspaceDiagnostic::ImportHashMismatch { .. }
+                    | WorkspaceDiagnostic::ImportHashInvalidHex { .. }
+                    | WorkspaceDiagnostic::ImportHashUnknownAlgorithm { .. }
+            )),
+            "expected no hash diagnostic, got {:?}",
+            ws.workspace_diagnostics
+        );
+        assert_eq!(server.hit_count(), 1);
+    }
+
+    #[test]
+    fn mismatched_hash_blocks_the_module() {
+        let body = "{ remote_value: 42 }";
+        let server = MockServer::start(body, 200);
+        let url = server.url("/lib.relon");
+        // Wrong digest (last hex flipped) — must trip ImportHashMismatch.
+        let mut digest = sha256_hex(body);
+        let last = digest.pop().unwrap();
+        digest.push(if last == '0' { '1' } else { '0' });
+        let entry = format!(
+            "#import lib from \"{url}\" sha256:\"{digest}\"\n{{ v: 1 }}"
+        );
+
+        let mut loader = trusted_loader(temp_cache_dir("hash-mismatch"));
+        let ws = analyze_entry_with_options(
+            "entry".to_string(),
+            &entry,
+            std::path::PathBuf::from("."),
+            &mut loader,
+            &AnalyzeOptions::default(),
+        );
+        let mismatches: Vec<_> = ws
+            .workspace_diagnostics
+            .iter()
+            .filter(|d| matches!(d, WorkspaceDiagnostic::ImportHashMismatch { .. }))
+            .collect();
+        assert_eq!(
+            mismatches.len(),
+            1,
+            "diagnostics: {:?}",
+            ws.workspace_diagnostics
+        );
+    }
+
+    #[test]
+    fn cache_hit_still_runs_hash_check() {
+        // First analyze warms the on-disk cache. The second analyze uses
+        // the same cache directory but a *different* pinned hash; the
+        // cache hit short-circuits the network but the integrity gate
+        // must still trip ImportHashMismatch — so a poisoned cache
+        // cannot bypass the pin.
+        let body = "{ remote_value: 1 }";
+        let server = MockServer::start(body, 200);
+        let url = server.url("/cache.relon");
+        let digest = sha256_hex(body);
+        let cache_dir = temp_cache_dir("cache-then-mismatch");
+
+        // Warm the cache with the correct pin.
+        let entry_ok = format!(
+            "#import lib from \"{url}\" sha256:\"{digest}\"\n{{ v: 1 }}"
+        );
+        {
+            let mut loader = trusted_loader(cache_dir.clone());
+            let ws = analyze_entry_with_options(
+                "entry".to_string(),
+                &entry_ok,
+                std::path::PathBuf::from("."),
+                &mut loader,
+                &AnalyzeOptions::default(),
+            );
+            assert!(
+                !ws.workspace_diagnostics.iter().any(|d| matches!(
+                    d,
+                    WorkspaceDiagnostic::ImportHashMismatch { .. }
+                )),
+                "warm pass should not flag mismatch"
+            );
+        }
+        let after_warm = server.hit_count();
+        assert_eq!(after_warm, 1, "warm pass should fetch once");
+
+        // Second analyze: cache is warm, network must NOT be hit. Pin
+        // is wrong, so analyzer must still flag mismatch.
+        let mut bad_digest = digest.clone();
+        let last = bad_digest.pop().unwrap();
+        bad_digest.push(if last == '0' { '1' } else { '0' });
+        let entry_bad = format!(
+            "#import lib from \"{url}\" sha256:\"{bad_digest}\"\n{{ v: 1 }}"
+        );
+        let mut loader = trusted_loader(cache_dir.clone());
+        let ws = analyze_entry_with_options(
+            "entry".to_string(),
+            &entry_bad,
+            std::path::PathBuf::from("."),
+            &mut loader,
+            &AnalyzeOptions::default(),
+        );
+        assert!(
+            ws.workspace_diagnostics
+                .iter()
+                .any(|d| matches!(d, WorkspaceDiagnostic::ImportHashMismatch { .. })),
+            "cache hit must still verify integrity"
+        );
+        assert_eq!(
+            server.hit_count(),
+            after_warm,
+            "cache hit must not refetch"
+        );
+
+        let _ = std::fs::remove_dir_all(&cache_dir);
+    }
+
+    #[test]
+    fn require_hash_flag_rejects_unpinned_remote_import() {
+        // No mock server needed — the unpinned-import gate fires
+        // before the loader is asked anything.
+        let entry =
+            "#import lib from \"https://example.com/util.relon\"\n{ v: 1 }".to_string();
+        let mut loader = trusted_loader(temp_cache_dir("require-hash"));
+        let opts = AnalyzeOptions {
+            require_hash: true,
+            ..AnalyzeOptions::default()
+        };
+        let ws = analyze_entry_with_options(
+            "entry".to_string(),
+            &entry,
+            std::path::PathBuf::from("."),
+            &mut loader,
+            &opts,
+        );
+        let required: Vec<_> = ws
+            .workspace_diagnostics
+            .iter()
+            .filter(|d| matches!(d, WorkspaceDiagnostic::ImportHashRequired { .. }))
+            .collect();
+        assert_eq!(required.len(), 1, "{:?}", ws.workspace_diagnostics);
+    }
+}
+
 #[test]
 fn from_resolvers_default_keeps_sandbox_short_circuit() {
     // A custom chain that *happens* to include the RemoteHttpResolver
