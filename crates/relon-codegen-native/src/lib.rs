@@ -74,12 +74,17 @@ pub mod cache;
 mod codegen;
 pub mod error;
 pub mod evaluator;
+pub mod object_cache_integration;
 pub mod sandbox;
 pub mod trap_handler;
 
 pub use cache::{deserialize as deserialize_cache, serialize as serialize_cache, CacheEntry};
 pub use error::CraneliftError;
 pub use evaluator::CraneliftAotEvaluator;
+pub use object_cache_integration::{
+    compute_source_hash, default_cache_dir, host_target_triple, ir_cache_path_for, LoadedCache,
+    GENERATOR_VERSION,
+};
 pub use sandbox::{
     CapabilityVtable, HostFnPtr, SandboxConfig, SandboxState, TrapKind, STATE_OFFSET_ARENA_BASE,
     STATE_OFFSET_ARENA_LEN, STATE_OFFSET_DEADLINE_NS, STATE_OFFSET_TAIL_CURSOR,

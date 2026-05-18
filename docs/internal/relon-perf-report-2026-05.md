@@ -299,3 +299,99 @@ deferred 项推到 v5-γ，所以 test 数量目前是 1483。
 **Author**: Relon perf 直路 v5-β-2 implementer agent（stage 4）
 **Date**: 2026-05-18
 **License**: Apache-2
+
+## 八、v5-γ — cranelift-object cache infrastructure（2026-05-18）
+
+v5-γ phase 在 codegen-native 之上接入了 `relon-object-cache` 与
+`relon-object-link` 两个 prep-agent 提供的 crate，为 cold-start 路径
+铺设了 cranelift-object emit + ld -shared 链接 + on-disk 持久化 +
+HMAC 完整性校验 的完整管线。
+
+### 8.1 新增 API 表面
+
+| 入口 | 行为 |
+|---|---|
+| `CraneliftAotEvaluator::from_source_with_cache(src, cache_dir)` | 走完整 from_source 管线，并把 ET_DYN bytes 与 IR bincode 写到 cache_dir（best-effort，所有失败 downgrade 为 tracing::warn） |
+| `CraneliftAotEvaluator::from_cache_dir(src, cache_dir)` | 校验 cache pair 的 HMAC + integrity + metadata；命中后返回 `Some(evaluator)`，否则 `Ok(None)`。**当前实现内部仍走 from_source；真正的 dlopen-exec 短路需要 codegen.rs 把 `relon_now` / `relon_raise_trap` / `relon_cap_lookup` 改走 `__relon_capability_vtable` 间接调用（设计稿 §2.3，留作后续 phase）** |
+| `compute_source_hash(src, sandbox)` | sha256 over canonical (source‖sandbox-bits‖triple‖generator-version) — 用作 cache 文件名 stem |
+| `default_cache_dir()` | `$XDG_CACHE_HOME/relon` → `$HOME/.cache/relon` → `temp_dir/relon-cache` |
+
+`AutoEvaluator::build_aot` 接入了上述两个 entry point：先 try
+`from_cache_dir`，miss 再走 `from_source_with_cache`。Cache 写失败
+不影响 live invocation。
+
+### 8.2 实测数字（criterion `--quick`，host: linux x86_64）
+
+| 场景 | v5-β-2 stage 4 | v5-γ | 变化 |
+|---|---|---|---|
+| `cranelift_cold`（synthetic IR + JIT） | ~273 µs | ~275 µs | 持平（无回归） |
+| `cranelift_warm`（preassembled） | ~400 ns | ~391 ns | 持平 |
+| `v5_gamma_cached_cold_start/cranelift_cached/cold` | — | ~2.68 ms | 新增 |
+| `tree_walk_warm` | ~2.4 µs | ~2.37 µs | 持平 |
+
+### 8.3 与 15 µs 目标的差距
+
+设计稿目标 `cached cold start ≤ 15 µs`。本次落地 ~2.68 ms（差
+~180×），原因：
+
+1. **dlopen-exec 路径未激活**。当前 `from_cache_dir` 命中后仍走
+   parse + analyze + lower + JIT，因为 cranelift-object emit 出来
+   的 ET_DYN 还引用了 `relon_now` 等 sandbox 辅助符号。要 dlopen
+   就 resolve 它们，要么主程序 `-rdynamic`（脆弱），要么改 codegen
+   走 vtable 间接（多日 refactor）。
+2. **IR-cache 快路径覆盖不足**。`crate::cache::serialize` 是 v5-β-1
+   遗留 narrow 实现，只覆盖 legacy `(I64...) -> I64` envelope；
+   现在 buffer-protocol IR 走它会丢 ops 触发 stack underflow，所以
+   `from_cache_dir` 没法用 IR-cache 跳过 parse + analyze + lower。
+
+### 8.4 已落地基础设施 & 留作 follow-up 的工作
+
+**落地**：
+
+- ET_REL emit：`object_cache_integration::emit_entry_stub_object`
+  用 cranelift-object ObjectModule emit `relon_main_entry` +
+  `__relon_capability_vtable` reservation。tests/object_cache_
+  integration.rs 中的 `loader_round_trip_from_emitted_stub_bytes`
+  端到端验证 emit → ld -shared → memfd_create → dlopen → dlsym →
+  call 全链路在 linux-x86_64 上工作。
+- HMAC + integrity：cache 文件用 per-installation HMAC-SHA256
+  key（`$XDG_DATA_HOME/relon/cache-key`，mode 0600）防第三方投放。
+  tamper detection test 通过：篡改对象字节 → 下次 from_cache_dir
+  返 None 并删除 corrupt 文件。
+- 并发安全：4-thread `from_cache_dir` race 测试通过。
+- 跨平台降级：non-linux / non-x86_64 host 自动跳过 cache，走纯
+  JIT，logged at info level。
+- 错误降级：ld 缺失 / 失败 / HMAC key 不可用 / 文件损坏 — 每条都
+  归属 tracing::warn / error / info，without 影响 live invocation。
+
+**留 follow-up**：
+
+- **dlopen-exec 短路**（最大头，预期 ~10-15 µs cached cold start）：
+  改 codegen.rs 让 `relon_now` / `relon_raise_trap` /
+  `relon_cap_lookup` 与 closure-table base 全走
+  `__relon_capability_vtable` GlobalValue 间接调用；host 在
+  dlsym 拿到 vtable 地址后 populate 各 slot。
+- **IR-cache 全 op 覆盖**：把 `crate::cache::serialize` 的 narrow
+  serde 换成 `relon_ir::ir::Module` 整体的 serde derive，让
+  `from_cache_dir` 能 skip parse + analyze + lower 即便不走
+  dlopen-exec 也能拿到 ~80 µs cached cold start。
+- **LuaJIT 对照**：等 dlopen-exec 落地后再跑端到端对比。
+
+### 8.5 v5-γ Gate
+
+| Gate | 命令 | 结果 |
+|---|---|---|
+| build | `cargo build --workspace` | ✓ |
+| test | `cargo test --workspace` | 1607 passed / 0 failed |
+| clippy | `cargo clippy --workspace --all-targets -- -D warnings` | ✓ |
+| fmt | `cargo fmt --all -- --check` | ✓ |
+| wasm32 | `cargo build --target wasm32-unknown-unknown -p relon-wasm` | ✓ |
+
+1591 → 1607 = +16 tests，覆盖 cache write / load / corruption /
+metadata mismatch / concurrent hit / loader smoke 等场景。
+
+---
+
+**Author**: Relon perf 直路 v5-γ implementer agent
+**Date**: 2026-05-18
+**License**: Apache-2

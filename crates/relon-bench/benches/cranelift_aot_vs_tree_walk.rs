@@ -169,5 +169,44 @@ fn bench_arithmetic(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_arithmetic);
+/// v5-γ: time the cached cold-start path end-to-end. We pre-warm
+/// a tempfile cache once, then each iter calls
+/// `from_cache_dir(src, cache_dir)` and measures wall-clock.
+///
+/// Until the dlopen execution path activates (vtable-indirection
+/// refactor in a follow-up phase) the reported number stays in
+/// the same ballpark as `cranelift_cold` because `from_cache_dir`
+/// currently delegates to `from_source` after validating the cache
+/// pair. Once the dlopen-exec switch lands the bench retains the
+/// same shape and the number should drop to ~10-15 us.
+fn bench_cached_cold_start(c: &mut Criterion) {
+    let mut group = c.benchmark_group("v5_gamma_cached_cold_start");
+    group.sample_size(50);
+    group.measurement_time(Duration::from_secs(5));
+
+    let cache_root = tempfile::tempdir().expect("tempdir for cache");
+    let src = tree_walk_src();
+
+    // Pre-warm: drive `from_source_with_cache` once to populate
+    // the cache pair. The first call's time is *not* measured —
+    // this bench is about the *cached* cold-start path.
+    let warm =
+        CraneliftAotEvaluator::from_source_with_cache(src, cache_root.path()).expect("pre-warm");
+    drop(warm);
+
+    group.bench_function(BenchmarkId::new("cranelift_cached", "cold"), |b| {
+        b.iter(|| {
+            let opt = CraneliftAotEvaluator::from_cache_dir(src, cache_root.path())
+                .expect("from_cache_dir");
+            // Force evaluator materialisation so the bench measures
+            // load + verify + (currently) re-JIT, not just the
+            // option-discrimination cost.
+            black_box(opt);
+        });
+    });
+
+    group.finish();
+}
+
+criterion_group!(benches, bench_arithmetic, bench_cached_cold_start);
 criterion_main!(benches);

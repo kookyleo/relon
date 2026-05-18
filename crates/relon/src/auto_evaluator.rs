@@ -137,9 +137,42 @@ impl AutoEvaluator {
     /// When the `cranelift-aot` feature is enabled this returns the
     /// boxed evaluator; otherwise the slot caches a "feature off"
     /// error and `run_main` returns `RuntimeError::Unsupported`.
+    ///
+    /// v5-γ: try the on-disk cache first (saves parse + analyze +
+    /// lower on the second cold start), then fall back to
+    /// `from_source_with_cache` which writes a fresh cache as a
+    /// side-effect. Cache directory is selected via
+    /// `relon_codegen_native::default_cache_dir()`; hosts that want
+    /// to override (test isolation, embedded targets) can override
+    /// the `XDG_CACHE_HOME` / `HOME` env vars before constructing
+    /// the evaluator.
     #[cfg(feature = "cranelift-aot")]
     fn build_aot(source: &str) -> Result<Box<dyn Evaluator>, String> {
-        relon_codegen_native::CraneliftAotEvaluator::from_source(source)
+        let cache_dir = relon_codegen_native::default_cache_dir();
+
+        // 1. Cache-hit fast path: pull a (source, sandbox)-keyed
+        // pair off disk and reconstruct the JIT module from the IR
+        // half. Any soft miss (file absent, integrity failure,
+        // metadata mismatch) surfaces as `Ok(None)`; only an
+        // unexpected I/O failure escapes here.
+        match relon_codegen_native::CraneliftAotEvaluator::from_cache_dir(source, &cache_dir) {
+            Ok(Some(aot)) => return Ok(Box::new(aot) as Box<dyn Evaluator>),
+            Ok(None) => {} // cache miss — proceed to source build
+            Err(e) => {
+                // Cache load infrastructure problem (not a miss).
+                // Log via tracing and continue to the source path so
+                // a transient cache issue doesn't break the live
+                // invocation.
+                tracing::warn!(
+                    target: "relon::auto_evaluator",
+                    "cache load failed: {e}; falling back to from_source"
+                );
+            }
+        }
+
+        // 2. Cache-miss path: full pipeline, writes fresh cache pair
+        // as a side-effect so the *next* cold start can hit.
+        relon_codegen_native::CraneliftAotEvaluator::from_source_with_cache(source, &cache_dir)
             .map(|aot| Box::new(aot) as Box<dyn Evaluator>)
             .map_err(|e| e.to_string())
     }

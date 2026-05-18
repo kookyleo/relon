@@ -30,6 +30,9 @@ dhat = { version = "0.3", optional = true }
 # corpus + statistical report (mean / median / stddev / outliers).
 # Pinned to 0.5 to avoid upstream churn (0.6+ API / wasm tweaks).
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+# v5-γ cached-cold-start bench writes its cache pair into a per-run
+# tempdir so concurrent bench threads stay isolated from each other.
+tempfile = "3"
 
 # Method-dispatch group uses `#main(List<Int> xs) ... xs.map((n) => n * 2)`
 # so the receiver type is known statically — that requires the analyzer to
