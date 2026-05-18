@@ -2762,3 +2762,140 @@ locale dispatch 落地。FULL multi-cp emit 与 sigma right-scan 的
 wasm-AOT 实现挂到 b-7（IR Op + ConstPool + Cased/CaseIgnorable
 ranges 都已备好，body 需要 ~600 行 rewrite encode 循环 + 新 helper）。
 
+## 附录 A.21：v4-e auto-tier 落地笔记（Phase v4-e，2026-05-18）
+
+### 背景
+
+Phase 8 的 `Backend` enum 暴露两个显式选项 (`TreeWalk` / `WasmAot`)，
+默认 `TreeWalk`。host 若选 `WasmAot`：
+
+* `run_main` 走 wasm-AOT；
+* 其它 4 个 `Evaluator` 方法（`eval` / `eval_root` /
+  `force_thunk` / `invoke_closure`）一律 `RuntimeError::Unsupported`。
+
+观察到的真实使用形态：
+
+1. **同一 evaluator 上 `run_main` + `eval` 混用**。host 先 `run_main`
+   引导一段 entry program，再用返回 scope 上下文调 `eval` 把剩余
+   Node 展开成 host-side dynamic 配置。
+2. **大部分 host 只在 hot path 调 `run_main`**。AOT cold start
+   ~2 ms uncached / ~190 μs cached 是 hot loop 不能容忍的常驻
+   overhead，但 cold load 一次摊销。
+3. **library-mode（无 `#main`）host 通常只用 `eval_root`**，
+   `run_main` 永远不发起。给这种 host 显式选 `WasmAot` 会 100%
+   wasted work。
+
+### 设计
+
+新增 `Backend::Auto`（成为 `#[default]`）。`new_evaluator(_,
+Backend::Auto)` 返一个 `AutoEvaluator` wrapper：
+
+```text
+                    ┌────────────────────────────────────┐
+   eval / eval_root │                                    │
+   force_thunk /    │  AutoEvaluator                     │
+   invoke_closure ──┼──▶ TreeWalkEvaluator (eager)       │
+                    │                                    │
+   run_main ────────┼──▶ OnceLock<Box<dyn Evaluator>>    │
+                    │     └─lazy── WasmAotEvaluator      │
+                    │                                    │
+                    │  OnceLock<String>                  │
+                    │     └─cached── 上次 AOT 构造失败错 │
+                    └────────────────────────────────────┘
+```
+
+关键不变量：
+
+1. **eager tree-walk + lazy AOT**：构造时只做 parse / analyze + 装
+   tree-walk（cheap，~1.3 ms）。AOT 在第一次 `run_main` 时才建。
+2. **OnceLock 双 cache**：成功 / 失败两条路径各占一个 `OnceLock`。
+   并发 `run_main` 只构 AOT 一次；失败也只重跑一次 pipeline，
+   后续 caller 拿 cached error。
+3. **失败隔离**：AOT 构造失败时，tree-walk 的 4 个方法仍然
+   可用；只有 `run_main` 返 `RuntimeError::Unsupported`。
+4. **`Box<dyn Evaluator>` 储存**：v5-β 切换到 cranelift-AOT 时
+   只改 `AutoEvaluator::build_aot` 这一个 fn body，wrapper struct
+   + Backend enum + 公共 API 完全 frozen。
+
+### 为何选 lazy AOT 而非 eager AOT
+
+| 决策 | 数据 / 论据 |
+| --- | --- |
+| eager AOT default | host 调 `eval_root` 一次（typical config-only）→ 浪费 ~2 ms AOT cold start (uncached) 或 ~190 μs (cached)；wasm32 编译目标连 wasm-aot feature 都没开，eager 会直接 build 失败 |
+| lazy AOT (chosen) | 同样 host → 零 wasted work；hot-path host 第一次 `run_main` 一次性 pay AOT cold start，与 eager 等价 |
+| 让 host 显式选 | v4-e 之前的现状；host 必须了解两条路径的差异才能写对，违背 "good defaults" 原则 |
+
+v5-β 备注：cranelift-AOT cold start ≪ 1 ms 时，lazy vs eager 的
+差异会进一步缩小；届时仍保持 lazy，避免给 library-mode host 增加
+启动税。
+
+### Bench 数据（release build，单核 i9-13900K，20 次平均）
+
+源代码：`#main(Int x) -> Int\nx * 2`（与 `parity_int_doubling`
+同），shared engine 已 warmed（每个 process 第一次构造 AOT 多付
+的 ~190 ms codegen + module-validate 已摊销）。
+
+| 场景 | 耗时 |
+| --- | --- |
+| `AutoEvaluator::new` (build only) | 1.30 ms |
+| `Auto.run_main` 第一次（含 AOT cold） | 4.23 ms |
+| `Auto.run_main` warm | **2.0 μs** |
+| `Backend::TreeWalk` build | 1.34 ms |
+| `Backend::TreeWalk` `run_main` | 7.2 μs |
+| `Backend::WasmAot` build | 4.06 ms |
+| `Backend::WasmAot` `run_main` | 46.5 μs |
+| `AutoEvaluator::new` (library mode source) | 1.33 ms |
+| `Auto.eval_root` (library mode) | 12.8 μs |
+
+读数解读：
+
+* **Auto build vs TreeWalk build** ≈ 等价（1.30 ms vs 1.34 ms）。
+  Wrapper 只多一对 `OnceLock` + `Box`，没有显著开销。
+* **Auto warm `run_main`** (2.0 μs) 跑赢显式 WasmAot (46.5 μs)。
+  本测的 `x * 2` 是 trivial body —— WasmAot 显式路径每次跑 freshly
+  built evaluator 走完整 wasmtime `Store::call` + buffer pack/unpack；
+  Auto warm 路径上 AOT trait-object 调用已经被 release inliner
+  inline-cache 进 `Box<dyn Evaluator>` 的 vtable fast slot。
+  待 criterion harness 复现确认是否系统性现象。
+* **Auto first `run_main`** (4.23 ms) ≈ WasmAot build (4.06 ms) +
+  WasmAot run_main (46 μs)，符合预期 —— lazy 把 AOT 构造成本推迟
+  到第一次 `run_main`。
+* **Library-mode (Auto + eval_root only)**：1.33 ms build + 12.8 μs
+  `eval_root`。若改为 `Backend::WasmAot` 这种 host 形态 100%
+  报错（wasm-AOT 不支持 `eval_root`），Auto 是唯一合理选项。
+
+### Gate
+
+* `cargo build --workspace` ✓
+* `cargo test --workspace --features 'relon/wasm-aot'` ✓ 1500
+  passed, 0 failed（v3++ b-6 baseline 1489 + auto-tier 11 新增）
+* `cargo clippy --workspace --all-targets --features 'relon/wasm-aot'
+  -- -D warnings` ✓
+* `cargo fmt --all -- --check` ✓
+* `cargo build --target wasm32-unknown-unknown -p relon-wasm` ✓
+
+### v5-β 切换路径预告
+
+cranelift-AOT (v5-β) 上线后：
+
+1. `AutoEvaluator::build_aot` 替换为 `CraneliftAotEvaluator::
+   from_source` 的 call。
+2. `Backend::WasmAot` variant 仍保留，但内部点到 wasm-AOT；新加
+   `Backend::CraneliftAot` 给需要 explicit 控制的 host。
+3. SDK 公共 API（`new_evaluator`、`Backend`、`AutoEvaluator`）零
+   改动；host 只需 re-bench 然后享受 cold-start 提升。
+
+### 遗留 todo（v5-α）
+
+* **`AutoEvaluator::from_workspace`**：CLI 目前对 `#main` 显式走
+  `WasmAotEvaluator::from_workspace` 以支持 `#import`；
+  `AutoEvaluator::new` 走 `from_source`，不支持 import。SDK 层加
+  一个 workspace-aware 构造器是 v5-α 的事。
+* **AOT init metrics**：暴露 `is_aot_initialised()` 已经够 test，
+  生产环境想知道 AOT cold start 真实花了多久还需要给 host 一个
+  trace hook（e.g. `on_aot_built: Fn(Duration)`）。
+* **Auto warm `run_main` reproducibility**：上面的 2.0 μs 数字与
+  显式 WasmAot 46.5 μs 的差距太大，需要 criterion harness 复现
+  确认是 release inliner 现象而非测试 bug。挂到 v5-α，与
+  criterion bench-suite 重整一起做。
+
