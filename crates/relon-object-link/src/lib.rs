@@ -31,17 +31,35 @@
 //!
 //! - [`elf_check`] — hand-rolled 64-bit ELF header parser so we do
 //!   not pull `object` / `goblin` for ~20 bytes of header.
+//! - [`linker_subproc`] — default linker. Shells out to system `ld`
+//!   (or `cc -shared`) via `Command`, captures stderr on failure.
 //! - [`error`] — the public [`LinkError`] enum.
 //!
-//! Subsequent commits in this series wire in the subprocess linker
-//! (`linker_subproc`) and the feature-gated in-process lld stub
-//! (`linker_lld`), along with the top-level [`link_to_dyn`] entry
-//! point.
+//! ## Platform support
+//!
+//! Linux x86_64 is the only tier-1 platform for v5-gamma. The
+//! subprocess linker is gated on `cfg(unix)`; macOS / Windows will
+//! need their own backends (`ld64`, `link.exe`) and surface
+//! [`LinkError::UnsupportedTriple`] from `link_to_dyn` for now.
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
 pub mod elf_check;
 pub mod error;
+pub mod linker_subproc;
 
 pub use elf_check::{is_et_dyn, is_et_rel, parse_elf_type, ElfType};
 pub use error::LinkError;
+pub use linker_subproc::SubprocLinker;
+
+/// Top-level entry point: link an `ET_REL` relocatable object into an
+/// `ET_DYN` shared object using the default (subprocess) backend.
+///
+/// `target_triple` follows the cranelift / `target-lexicon` form
+/// (`x86_64-unknown-linux-gnu`, …). Only `x86_64-*-linux-*` triples
+/// are accepted today; everything else returns
+/// [`LinkError::UnsupportedTriple`].
+pub fn link_to_dyn(et_rel_bytes: &[u8], target_triple: &str) -> Result<Vec<u8>, LinkError> {
+    let linker = SubprocLinker::new()?;
+    linker.link(et_rel_bytes, target_triple)
+}
