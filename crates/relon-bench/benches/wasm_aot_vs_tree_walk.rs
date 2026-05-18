@@ -168,6 +168,33 @@ fn string_title_args() -> HashMap<String, Value> {
     m
 }
 
+/// v3++ b-5 `string_normalization` payload. Exercises the four UAX
+/// #15 stdlib bodies (`nfc` / `nfd` / `nfkc` / `nfkd`) on a mixed
+/// input that lights up every code path the bodies care about:
+///
+///   * Latin segment with **pre-composed** combining-mark accents
+///     (cafe + U+0301 stays decomposable for NFD; NFC must compose
+///     it back when fed already-decomposed input).
+///   * **Hangul** syllables that take the algorithmic decompose +
+///     compose fast path instead of a table hit (the syllable block
+///     is left out of the data tables on purpose to save ~88 KB).
+///   * **Half-width fraction** (U+00BD) that only NFKD / NFKC touch
+///     via the compatibility table - drives the NFKD pool which is
+///     larger than the NFD pool.
+///   * **Emoji ZWJ sequence** that round-trips unchanged in all
+///     forms (cps are non-decomposable, non-composable).
+///
+/// Input length stays under 256 bytes so the per-cp 4-byte scratch
+/// allocations stay well inside one wasm page.
+fn string_normalization_args() -> HashMap<String, Value> {
+    let mut m = HashMap::with_capacity(1);
+    let s = "cafe\u{0301} bar \u{D55C}\u{AD6D}\u{C5B4} \u{00BD} \
+             \u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}\u{200D}\u{1F466}"
+        .to_string();
+    m.insert("s".to_string(), Value::String(s));
+    m
+}
+
 /// Phase 10-a scenarios: a 32-element `List<Int>` driving the
 /// higher-order `map` / `filter` / `fold` stdlib bodies. The list
 /// length is chosen large enough that per-iteration `call_indirect`
@@ -243,6 +270,40 @@ const SCENARIOS: &[Scenario] = &[
         wasm_source: "#main(String s) -> String\ns.title()",
         tree_source: "#main(String s) -> String\ns.title()",
         args: string_title_args,
+    },
+    // v3++ b-5: drives the four UAX #15 normalization bodies. The
+    // wasm side walks the input through decompose -> canonical
+    // reorder -> (NFC/NFKC only) compose -> re-encode, against the
+    // embedded UCD 14.0.0 tables. Hangul syllables in the payload
+    // exercise the algorithmic decompose / compose path; the
+    // half-width fraction (U+00BD) drives the NFKD compatibility
+    // pool which is roughly 4x the size of the NFD pool. Cold-start
+    // numbers also capture the four new data-section tables
+    // (NFD index/pool, NFKD index/pool, CCC, composition pairs)
+    // the wasm module now embeds.
+    Scenario {
+        name: "stdlib_nfc",
+        wasm_source: "#main(String s) -> String\ns.nfc()",
+        tree_source: "#main(String s) -> String\ns.nfc()",
+        args: string_normalization_args,
+    },
+    Scenario {
+        name: "stdlib_nfd",
+        wasm_source: "#main(String s) -> String\ns.nfd()",
+        tree_source: "#main(String s) -> String\ns.nfd()",
+        args: string_normalization_args,
+    },
+    Scenario {
+        name: "stdlib_nfkc",
+        wasm_source: "#main(String s) -> String\ns.nfkc()",
+        tree_source: "#main(String s) -> String\ns.nfkc()",
+        args: string_normalization_args,
+    },
+    Scenario {
+        name: "stdlib_nfkd",
+        wasm_source: "#main(String s) -> String\ns.nfkd()",
+        tree_source: "#main(String s) -> String\ns.nfkd()",
+        args: string_normalization_args,
     },
     // Phase 10-a closure surfaces. Each scenario runs the same
     // higher-order body on both backends; the wasm side exercises
