@@ -1,4 +1,42 @@
-# wasm-AOT v4 路线图（sandbox-safe，2026-05-18）
+# Relon 性能路线图（v4-e → v5-β/γ → v6-γ，2026-05-18 终稿）
+
+> **2026-05-18 第二轮规划修订**：用户决策规则 "与最终有益就留，纯中间过程临时产物就丢" + "目前项目没有包袱尚未发布"。
+> 砍掉 9 个 phase（b-6-tail / b-7 / v4-a/b/c/d/f / v5-α / v6-α/β），保留 4 个 phase 直奔 LuaJIT trace tier。
+> 路径估算 3-5 个月，相比原全顺序 6-9 个月省 3-4 个月。
+
+## 直路 phase（按时序，2026-05-18 ultrathink 复核后）
+
+| 序号 | Phase | 落点 | ETA |
+| --- | --- | --- | ---: |
+| 1 | v4-e auto-tier | IR op 数阈值切换 tree-walk / native-AOT；SDK 层 final-shape | 1 周 |
+| 2a | v5-β-1 cranelift codegen infra + sandbox | 新 crate `relon-codegen-native`，cranelift-frontend / cranelift-jit 接入；4 项 sandbox 硬约束自实现（bounds check / trap handler / capability gating / resource limit）；HelloWorld `#main(Int)` 跑通；module cache 格式 + serialize / deserialize | 3-4 周 |
+| 2b | v5-β-2 stdlib body re-lower + evaluator | 把 `crates/relon-ir/src/stdlib.rs` 所有 stdlib body builder 从 wasm IR Op stream 转成 cranelift IR；evaluator 集成（替代 wasm-AOT Pool-of-Stores）；wasm32 target 切换为 tree-walk-only；`relon-codegen-wasm` crate 从依赖图中拔除 | 3-4 周 |
+| 3 | v5-γ cranelift-object cache | .o 文件 emit + dlopen + relocation；cached cold start 80→10 μs；cache 完整性 sha256（取代 wasmtime serialize 内部 hash） | 2 周 |
+| 4 | v6-γ 完整 trace JIT | hot detection counter + trace recorder + trace IR optimizer + trace→cranelift IR + guard insertion + deopt machinery；differential testing 强制开启对照 cranelift-AOT baseline | 8-12 周 |
+
+### Ultrathink 关键发现
+
+1. **wasm32 target 问题**：`crates/relon-wasm` 是 browser playground 的 JS 绑定，需要 wasm 输出。v5-β cranelift-AOT 出 native code，不出 wasm。**决策**：wasm32 build target 使用 tree-walk-only，cranelift-AOT 仅 native target。Browser playground 性能不是关键路径，可接受。`relon-codegen-wasm` crate 在 v5-β-2 完成后**整个删除**，省双 backend 维护。
+
+2. **v5-β 拆 β-1 + β-2**：原 6-8 周大块改动风险高。拆 codegen infra（HelloWorld 跑通）vs stdlib body 移植，每个 3-4 周可独立 ship + bench，β-1 完成后即可对照测试 deopt 接口（v6-γ 关键依赖）。
+
+3. **v6-γ 最大风险是 deopt 正确性**。Trace 优化时假设某 type，guard 失败 deopt 必须正确还原 state 回 generic code。任何 bug 静默 corrupt 用户数据。**Mitigation**：v5-β-2 落地起立刻建 differential test harness：同一组 `#main` + args，分别跑 tree-walk / cranelift-AOT，输出必须 bit-identical。trace JIT 在此 baseline 上再增 deopt 路径全用例覆盖。
+
+## 被砍掉的 phase（纯中间产物）
+
+| 砍掉的 phase | 砍因 |
+| --- | --- |
+| v3++ b-7 SIMD ASCII（wasm v128） | v5-β cranelift 直出 native SIMD，更快且跨平台 |
+| v4-a Pool-of-Stores dirty-leave | v5-β 无 wasmtime Store 概念，整套 pool 销毁 |
+| v4-b 参数 bridge specialization (wasm 端) | v5-β cranelift codegen 同等机制，更直接 |
+| v4-c stdlib helper 内联 | v5-β cranelift inliner 默认开 |
+| v4-d mmap cache | v5-γ cranelift-object dlopen 是更原生的 cache 路径 |
+| v4-f SIMD (wasm 端) | 同 b-7，cranelift native SIMD 接管 |
+| v5-α Wasmer headless | 保留 wasm spec 的中间过渡，v5-β 直接跳过 wasm 整层 |
+| v6-α PGO type specialization | v6-γ trace JIT in-runtime type recording 是 PGO 的超集 |
+| v6-β PIC method dispatch | 同上，v6-γ 的 type specialization 自然处理单态 dispatch |
+
+## 现状基线（main HEAD 截至 b-6-tail）
 
 > 目标：warm invoke 7-12 μs → **1-3 μs**，摸到 PUC Lua interpreter 上限。
 > 约束：**不动 wasmtime sandbox**（linear memory bounds + trap handler + capability gating + spectre mitigation 全保留）。
