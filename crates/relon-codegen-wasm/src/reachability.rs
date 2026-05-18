@@ -518,7 +518,11 @@ mod tests {
         assert_eq!(plan.user_count_after, 4);
         assert_eq!(plan.reachable_funcs, vec![0, 1, 2, 3]);
         for (i, slot) in plan.remap.iter().enumerate() {
-            assert_eq!(*slot, i as u32, "remap[{}] should be {} (got {})", i, i, *slot);
+            assert_eq!(
+                *slot, i as u32,
+                "remap[{}] should be {} (got {})",
+                i, i, *slot
+            );
         }
     }
 
@@ -561,10 +565,10 @@ mod tests {
         // combined index 4. Only slot 0 is constructed -> lambda 0
         // and stdlib 1 survive, lambda 1 is pruned.
         let funcs = vec![
-            empty(),                                // stdlib 0
-            empty(),                                // stdlib 1
-            with_calls(&[1]),                       // user 0 = lambda body, calls stdlib 1
-            empty(),                                // user 1 = unused lambda
+            empty(),          // stdlib 0
+            empty(),          // stdlib 1
+            with_calls(&[1]), // user 0 = lambda body, calls stdlib 1
+            empty(),          // user 1 = unused lambda
             FakeFn {
                 body: vec![make_closure(0)],
             }, // user 2 = #main constructs slot 0

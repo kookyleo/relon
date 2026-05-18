@@ -177,10 +177,7 @@ fn dce_unused_method_pruned() {
         "expected `a()` + #main only (got {})",
         shape.fn_section_count
     );
-    assert!(
-        !shape.has_table,
-        "no closures means no funcref table"
-    );
+    assert!(!shape.has_table, "no closures means no funcref table");
 }
 
 #[test]
