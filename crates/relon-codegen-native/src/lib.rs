@@ -77,6 +77,7 @@ pub mod evaluator;
 pub mod object_cache_integration;
 pub mod sandbox;
 pub mod trap_handler;
+pub mod vtable;
 
 pub use cache::{deserialize as deserialize_cache, serialize as serialize_cache, CacheEntry};
 pub use error::CraneliftError;
