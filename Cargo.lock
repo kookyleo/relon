@@ -1950,6 +1950,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "relon-test-harness"
+version = "0.1.0"
+dependencies = [
+ "relon",
+ "relon-analyzer",
+ "relon-codegen-native",
+ "relon-eval-api",
+ "relon-evaluator",
+ "relon-ir",
+ "relon-parser",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "relon-wasm"
 version = "0.1.0"
 dependencies = [
