@@ -18,17 +18,27 @@
 //! ## Scope
 //!
 //! The IR walker handles the **Phase-1 hot subset** the recorder's
-//! lowering rules accept today:
+//! lowering rules accept today, **plus v6-γ M5 widening**:
 //!
 //! - Const ops: `ConstI32` / `ConstI64` / `ConstBool`.
 //! - Arithmetic: `Add` / `Sub` / `Mul` / `Div` (I64 only; the recorder
-//!   aborts on float arith).
+//!   aborts on float arith). `Mod` is recognised but the recorder
+//!   lowering surfaces it as `UnsupportedOp("Mod")` — the walker
+//!   forwards the abort so the corpus harness sees the correct
+//!   reason rather than a silent skip.
 //! - Comparisons: `Eq` / `Ne` / `Lt` / `Le` / `Gt` / `Ge`.
 //! - Locals: `LocalGet` / `LetGet` / `LetSet`.
+//! - Control flow: `Op::If { result_ty, then_body, else_body }` and
+//!   `Op::Select { ty }`. The walker follows the **taken** branch
+//!   based on the runtime value of the condition operand, emits a
+//!   `Guard NotNull(cond_ssa)` so the trace deopts if a future
+//!   invocation's condition flips, and recurses into the taken body.
+//!   Trace-IR has no native `If` op; this single-arm specialisation
+//!   matches the LuaJIT-style trace-tier philosophy.
 //! - Terminator: `Return`.
 //!
-//! Anything outside this set (strings, list ops, calls, control flow)
-//! aborts the recording with `AbortReason::UnsupportedOp`. The
+//! Anything outside this set (strings, list ops, calls, loops) aborts
+//! the recording with `AbortReason::UnsupportedOp`. The
 //! cranelift-generic backend then keeps handling the cold path; the
 //! HotCounter saturates so the helper won't retry until reset.
 //!
@@ -142,15 +152,24 @@ impl<'a> TraceRecordingEvaluator<'a> {
     /// the caller can still inspect it.
     pub fn run(mut self, body: &[TaggedOp]) -> u64 {
         let mut result_value: u64 = 0;
+        self.walk_body(body, &mut result_value);
+        result_value
+    }
+
+    /// Walk `body` in place against the current operand stack /
+    /// recorder state. Updates `result_value` on `Return`. Used both
+    /// for the outer function body and for the recursive `Op::If`
+    /// taken-branch traversal.
+    fn walk_body(&mut self, body: &[TaggedOp], result_value: &mut u64) -> WalkExit {
         for tagged in body {
             if self.recorder.is_aborted() || self.recorder.is_terminated() {
-                break;
+                return WalkExit::Aborted;
             }
             match self.step_one(&tagged.op) {
                 StepOutcome::Continue => {}
                 StepOutcome::Return(v) => {
-                    result_value = v;
-                    break;
+                    *result_value = v;
+                    return WalkExit::Returned;
                 }
                 StepOutcome::Abort => {
                     // Recorder has already flipped its sticky abort
@@ -159,13 +178,13 @@ impl<'a> TraceRecordingEvaluator<'a> {
                     // to the generic path with at least one valid
                     // value.
                     if let Some(top) = self.operand_stack.last() {
-                        result_value = top.value;
+                        *result_value = top.value;
                     }
-                    break;
+                    return WalkExit::Aborted;
                 }
             }
         }
-        result_value
+        WalkExit::Fallthrough
     }
 
     /// Run the walker against `body`, returning a [`RecordingOutcome`]
@@ -200,27 +219,55 @@ impl<'a> TraceRecordingEvaluator<'a> {
             Op::ConstI64(v) => self.step_const(*v as u64, ObservedType::I64, op),
             Op::ConstBool(v) => self.step_const(u64::from(*v), ObservedType::Bool, op),
 
-            Op::Add(IrType::I64) => {
+            // Integer arithmetic: I32 / I64 / Bool widths all pass
+            // through the recorder lowering as cranelift int ops
+            // (`binary_arith` rejects only F64). The walker performs
+            // the arithmetic in i64 wrapping space regardless of the
+            // declared tag — sufficient because the corpus's Int
+            // values fit i64 and the cranelift backend itself widens
+            // narrower types to i64 at emit time.
+            Op::Add(ty) if !matches!(ty, IrType::F64) => {
                 self.step_arith(op, |a, b| (a as i64).wrapping_add(b as i64) as u64)
             }
-            Op::Sub(IrType::I64) => {
+            Op::Sub(ty) if !matches!(ty, IrType::F64) => {
                 self.step_arith(op, |a, b| (a as i64).wrapping_sub(b as i64) as u64)
             }
-            Op::Mul(IrType::I64) => {
+            Op::Mul(ty) if !matches!(ty, IrType::F64) => {
                 self.step_arith(op, |a, b| (a as i64).wrapping_mul(b as i64) as u64)
             }
-            Op::Div(IrType::I64) => self.step_div(op),
+            Op::Div(ty) if !matches!(ty, IrType::F64) => self.step_div(op),
 
-            Op::Eq(IrType::I64) => self.step_cmp(op, |a, b| a == b),
-            Op::Ne(IrType::I64) => self.step_cmp(op, |a, b| a != b),
-            Op::Lt(IrType::I64) => self.step_cmp(op, |a, b| (a as i64) < (b as i64)),
-            Op::Le(IrType::I64) => self.step_cmp(op, |a, b| (a as i64) <= (b as i64)),
-            Op::Gt(IrType::I64) => self.step_cmp(op, |a, b| (a as i64) > (b as i64)),
-            Op::Ge(IrType::I64) => self.step_cmp(op, |a, b| (a as i64) >= (b as i64)),
+            // Comparisons: same envelope as arith. Walker forwards
+            // the op verbatim so the recorder's `binary_cmp` rule
+            // accepts each numeric tag.
+            Op::Eq(_) => self.step_cmp(op, |a, b| a == b),
+            Op::Ne(_) => self.step_cmp(op, |a, b| a != b),
+            Op::Lt(_) => self.step_cmp(op, |a, b| (a as i64) < (b as i64)),
+            Op::Le(_) => self.step_cmp(op, |a, b| (a as i64) <= (b as i64)),
+            Op::Gt(_) => self.step_cmp(op, |a, b| (a as i64) > (b as i64)),
+            Op::Ge(_) => self.step_cmp(op, |a, b| (a as i64) >= (b as i64)),
 
             Op::LocalGet(idx) => self.step_local_get(*idx, op),
             Op::LetGet { idx, ty } => self.step_let_get(*idx, *ty, op),
             Op::LetSet { idx, .. } => self.step_let_set(*idx, op),
+
+            // v6-γ M5: `Op::If` taken-branch specialisation. We pop
+            // the boolean condition (already recorded as a `Cmp`
+            // result), emit a `NotNull(cond)` branch guard so the
+            // installed trace deopts if a future invocation flips
+            // the branch, then recurse into the taken body. The
+            // trace-IR has no native If op; we never call
+            // `record_op(&Op::If, ...)` (which would abort).
+            Op::If {
+                result_ty: _,
+                then_body,
+                else_body,
+            } => self.step_if(then_body, else_body),
+
+            // v6-γ M5: `Op::Select` — `[val_true, val_false, cond] -> result`.
+            // Same taken-branch specialisation as `If` but inline
+            // (no nested body).
+            Op::Select { ty: _ } => self.step_select(),
 
             Op::Return => {
                 let v = self.operand_stack.last().map(|c| c.value).unwrap_or(0);
@@ -251,6 +298,51 @@ impl<'a> TraceRecordingEvaluator<'a> {
                 StepOutcome::Abort
             }
         }
+    }
+
+    /// v6-γ M5: walker side of `Op::If`. The cranelift backend's IR
+    /// emits the cond op into the same body before the `Op::If`, so
+    /// the condition's SSA / runtime value already sits on the
+    /// operand stack. We pop, guard, and recurse.
+    fn step_if(&mut self, then_body: &[TaggedOp], else_body: &[TaggedOp]) -> StepOutcome {
+        let cond = match self.operand_stack.pop() {
+            Some(c) => c,
+            None => {
+                self.recorder
+                    .abort(AbortReason::UnsupportedOp("IfUnderflow"));
+                return StepOutcome::Abort;
+            }
+        };
+        // Bool is non-zero-truthy at the wasm slot level; non-zero
+        // means take the `then` arm.
+        let taken_truthy = cond.value != 0;
+        let _guard = self.recorder.emit_branch_guard(cond.ssa, taken_truthy);
+        let arm = if taken_truthy { then_body } else { else_body };
+        let mut result = 0u64;
+        match self.walk_body(arm, &mut result) {
+            WalkExit::Fallthrough => StepOutcome::Continue,
+            WalkExit::Returned => StepOutcome::Return(result),
+            WalkExit::Aborted => StepOutcome::Abort,
+        }
+    }
+
+    /// v6-γ M5: walker side of `Op::Select`. Pops `(cond, false_val,
+    /// true_val)` (top first → cond), emits the same branch guard as
+    /// `step_if`, and pushes the chosen value.
+    fn step_select(&mut self) -> StepOutcome {
+        if self.operand_stack.len() < 3 {
+            self.recorder
+                .abort(AbortReason::UnsupportedOp("SelectUnderflow"));
+            return StepOutcome::Abort;
+        }
+        let cond = self.operand_stack.pop().expect("checked above");
+        let val_false = self.operand_stack.pop().expect("checked above");
+        let val_true = self.operand_stack.pop().expect("checked above");
+        let taken_truthy = cond.value != 0;
+        let _guard = self.recorder.emit_branch_guard(cond.ssa, taken_truthy);
+        let chosen = if taken_truthy { val_true } else { val_false };
+        self.operand_stack.push(chosen);
+        StepOutcome::Continue
     }
 
     fn step_const(&mut self, raw: u64, ty: ObservedType, op: &Op) -> StepOutcome {
@@ -421,6 +513,20 @@ enum StepOutcome {
     /// The walker / recorder aborted; the caller should fall back to
     /// the generic backend.
     Abort,
+}
+
+/// Outcome of `walk_body`: either the body fell off the end (no
+/// terminator), hit a `Return`, or aborted. Used by `step_if`'s
+/// nested-body recursion to decide whether to keep walking the
+/// outer body or propagate the exit up.
+#[derive(Debug, Clone, Copy)]
+enum WalkExit {
+    /// Body finished without `Return` — the outer walker keeps going.
+    Fallthrough,
+    /// Body produced a `Return`; the caller should propagate.
+    Returned,
+    /// Body aborted; caller should propagate.
+    Aborted,
 }
 
 fn observed_from_ir(ty: IrType) -> ObservedType {
