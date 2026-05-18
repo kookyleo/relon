@@ -1520,6 +1520,7 @@ dependencies = [
  "relon-evaluator",
  "relon-ir",
  "relon-parser",
+ "tempfile",
 ]
 
 [[package]]
