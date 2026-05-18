@@ -596,7 +596,18 @@ pub fn compile_module_with(
     // `__relon_capability_vtable` data symbol (see crate::vtable); the
     // post-finalize step (in `evaluator.rs`) writes the live host fn
     // pointers into the table.
-    let jit_builder = JITBuilder::with_isa(isa.clone(), cranelift_module::default_libcall_names());
+    //
+    // v6-γ M2/M3: in addition we pre-register the four trace JIT
+    // runtime helpers (`__relon_trace_save_deopt`,
+    // `__relon_trace_resolve_call`, `__relon_trace_inline_cache_lookup`
+    // and the codegen-native-side `__relon_jump_to_recorder`) so that
+    // (a) HotCounter prologues injected into entry functions can call
+    // into the recorder helper and (b) JIT-installed trace fns can
+    // call the trace runtime helpers without a separate symbol
+    // resolution step.
+    let mut jit_builder =
+        JITBuilder::with_isa(isa.clone(), cranelift_module::default_libcall_names());
+    crate::trace_install::register_trace_runtime_symbols(&mut jit_builder);
     let mut module = JITModule::new(jit_builder);
 
     let LoweredArtifacts {
@@ -891,6 +902,16 @@ fn lower_module_into<M: CrModule>(
         let state_ptr = block_params[0];
         let arg_values: Vec<CValue> = block_params[1..].to_vec();
 
+        // v6-γ M2: optionally emit a HotCounter prologue. The helper
+        // creates two new blocks (`hot_block` / `normal_block`),
+        // branches between them, fills the hot path with a
+        // `__relon_jump_to_recorder` call + sentinel return, and
+        // leaves the builder positioned on `normal_block` so the rest
+        // of the entry codegen flows unchanged.
+        if let Some(fn_id) = sandbox.trace_jit_fn_id {
+            emit_hot_counter_inject(&mut builder, pointer_ty, entry_shape, fn_id, &arg_values);
+        }
+
         // v5-γ stage 2: import the capability vtable as a GlobalValue
         // on the current function. Every host-helper call indirects
         // through `load(vtable_base + slot_offset) -> fn_ptr` followed
@@ -1103,6 +1124,100 @@ fn lower_module_into<M: CrModule>(
         vtable_data_id,
         closure_func_ids,
     })
+}
+
+/// v6-γ M2: emit a HotCounter prologue at the current entry block.
+///
+/// On entry the builder must already be positioned at a freshly-built
+/// entry block whose function-param values have been extracted. On
+/// return the builder is positioned at a sealed `normal_block` that
+/// continues the original entry-block control flow; the hot path
+/// branches to a sealed `hot_block` that calls
+/// `__relon_jump_to_recorder` and returns a sentinel zero.
+///
+/// IR shape (`pointer_ty == I64`):
+///
+/// ```text
+/// entry_block:
+///     %base    = iconst.i64 <hot_counters_base()>
+///     %slot    = iadd_imm %base, fn_id * 4
+///     %v       = load.i32 trusted %slot
+///     %v1      = iadd_imm.i32 %v, 1
+///                store.i32 trusted %v1, %slot
+///     %hot     = icmp_imm.i32 uge %v1, RELON_HOT_THRESHOLD
+///     brif %hot, hot_block, normal_block
+///
+/// hot_block:
+///     %fn_id_const = iconst.i32 fn_id
+///     %args_ptr    = iconst.i64 0    ; v6-γ M2: helper ignores arg ptr
+///     call_indirect (sig=jump_sig) %jump_ptr (%fn_id_const, %args_ptr)
+///     return  <zero of entry return ty>
+///
+/// normal_block:
+///     ;; existing entry-block continuation
+/// ```
+fn emit_hot_counter_inject(
+    builder: &mut FunctionBuilder<'_>,
+    pointer_ty: cranelift_codegen::ir::Type,
+    entry_shape: EntryShape,
+    fn_id: u32,
+    _arg_values: &[CValue],
+) {
+    let hot_block = builder.create_block();
+    let normal_block = builder.create_block();
+
+    // Counter slot address = base + fn_id * sizeof(u32).
+    let base_addr = crate::trace_install::hot_counters_base() as i64;
+    let slot_offset = (fn_id as i64) * 4;
+    let counter_addr = base_addr.wrapping_add(slot_offset);
+    let counter_ptr = builder.ins().iconst(pointer_ty, counter_addr);
+
+    // load.i32 / iadd_imm.i32 / store.i32 (non-atomic per design).
+    let cur = builder.ins().load(I32, MemFlags::trusted(), counter_ptr, 0);
+    let inc = builder.ins().iadd_imm(cur, 1);
+    builder
+        .ins()
+        .store(MemFlags::trusted(), inc, counter_ptr, 0);
+
+    // icmp uge against the threshold; branch on the result.
+    let hot = builder.ins().icmp_imm(
+        IntCC::UnsignedGreaterThanOrEqual,
+        inc,
+        crate::trace_install::RELON_HOT_THRESHOLD as i64,
+    );
+    let empty: [BlockArg; 0] = [];
+    builder
+        .ins()
+        .brif(hot, hot_block, empty.iter(), normal_block, empty.iter());
+
+    // Fill the hot block: call the recorder jump helper, then return a
+    // sentinel zero of the entry's return type. The helper is invoked
+    // by raw fn pointer (iconst -> call_indirect) so we don't have to
+    // declare an external symbol on the per-fn cranelift module.
+    builder.switch_to_block(hot_block);
+    builder.seal_block(hot_block);
+    let fn_id_val = builder.ins().iconst(I32, fn_id as i64);
+    let args_ptr_val = builder.ins().iconst(pointer_ty, 0); // null — helper ignores
+    let mut jump_sig = Signature::new(CallConv::SystemV);
+    jump_sig.params.push(AbiParam::new(I32));
+    jump_sig.params.push(AbiParam::new(pointer_ty));
+    let jump_sig_ref = builder.import_signature(jump_sig);
+    let jump_target = builder.ins().iconst(
+        pointer_ty,
+        crate::trace_install::__relon_jump_to_recorder as *const () as i64,
+    );
+    builder
+        .ins()
+        .call_indirect(jump_sig_ref, jump_target, &[fn_id_val, args_ptr_val]);
+    let zero = match entry_shape {
+        EntryShape::LegacyI64Args => builder.ins().iconst(I64, 0),
+        EntryShape::BufferProtocol => builder.ins().iconst(I32, 0),
+    };
+    builder.ins().return_(&[zero]);
+
+    // Continue with the normal block.
+    builder.switch_to_block(normal_block);
+    builder.seal_block(normal_block);
 }
 
 /// Build the cranelift signature for the `RelonRaiseTrap` vtable

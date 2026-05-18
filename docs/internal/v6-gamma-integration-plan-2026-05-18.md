@@ -373,9 +373,9 @@ pub enum TraceJitDiffOutcome {
 | M  | 工作                                              | 估算  | 验证                                                      | Dispatch 建议      |
 | -- | ------------------------------------------------- | :---: | --------------------------------------------------------- | ------------------ |
 | M1 | ABI 调和（Option A：`relon-trace-abi` crate）     | 2-3 天| 既有 234 tests 全绿；emitter / runtime 都 import 新 crate | **DONE** (`da7c721`) |
-| M2 | cranelift codegen `HotCounter` inject + `__relon_jump_to_recorder` host helper | 3 天 | mock counter 触发能跳进 recorder；既有 cranelift-aot 测试不退步 | 与 M3 合派         |
-| M3 | `jit_compile_trace_for_fn` pipeline 端到端       | 4 天  | trivial trace（`int + int`）从 record → optimize → emit → JIT install 全链路跑通 | 同上               |
-| M4 | 3 runtime helper register + deopt 路径回 generic | 3 天  | guard 失败时 host dispatcher 能读到 `DeoptStateSnapshot` 并把值写回 generic frame | 单 agent           |
+| M2 | cranelift codegen `HotCounter` inject + `__relon_jump_to_recorder` host helper | 3 天 | mock counter 触发能跳进 recorder；既有 cranelift-aot 测试不退步 | **DONE** (`d704d4b`) |
+| M3 | `jit_compile_trace_for_fn` pipeline 端到端       | 4 天  | trivial trace（`int + int`）从 record → optimize → emit → JIT install 全链路跑通 | **DONE** (`84bb59f`) — buffer path 验证；recorder 端因 orphan guard 留给 M4 |
+| M4 | 3 runtime helper register + deopt 路径回 generic | 3 天  | guard 失败时 host dispatcher 能读到 `DeoptStateSnapshot` 并把值写回 generic frame；recorder `record_guard` 同步；`__relon_jump_to_recorder` 接真 IR walker | 单 agent           |
 | M5 | differential harness 三方对比 + bench            | 4 天  | 52 case 三方一致；deopt path coverage ≥ 4 GuardKind；hot loop micro-bench < 5 ns/iter | 单 agent           |
 
 **总计 ~16-19 天 ≈ 3 周**。原设计稿 §6 估算 8-12 周，prep 阶段已经把 5-9 周工作

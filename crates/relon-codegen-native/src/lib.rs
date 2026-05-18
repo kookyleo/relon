@@ -77,6 +77,7 @@ pub mod evaluator;
 pub mod object_cache_integration;
 pub mod sandbox;
 pub mod schema_cache;
+pub mod trace_install;
 pub mod trap_handler;
 pub mod vtable;
 
@@ -90,4 +91,10 @@ pub use object_cache_integration::{
 pub use sandbox::{
     CapabilityVtable, HostFnPtr, SandboxConfig, SandboxState, TrapKind, STATE_OFFSET_ARENA_BASE,
     STATE_OFFSET_ARENA_LEN, STATE_OFFSET_DEADLINE_NS, STATE_OFFSET_TAIL_CURSOR,
+};
+pub use trace_install::{
+    global_trace_jit_state, hot_counter_peek, hot_counter_reset, hot_counter_reset_all,
+    hot_counters_base, jump_helper_call_count, register_trace_runtime_symbols,
+    reset_jump_helper_call_count, JITedTraceFn, TraceJitError, TraceJitState, HOT_COUNTERS_SYMBOL,
+    MAX_FN_ID, RELON_HOT_THRESHOLD,
 };

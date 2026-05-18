@@ -20,6 +20,12 @@ relon-analyzer = { workspace = true }
 relon-evaluator = { workspace = true }
 relon-ir = { workspace = true }
 relon-codegen-native = { workspace = true }
+# v6-γ M2/M3: trace recorder + trace IR types are reachable through
+# `relon-codegen-native` re-exports, but tests want the canonical
+# names too so the assertion vocabulary matches the design doc.
+relon-trace-abi = { workspace = true }
+relon-trace-jit = { workspace = true }
+relon-trace-recorder = { workspace = true }
 
 thiserror = { workspace = true }
 serde_json = { workspace = true }
