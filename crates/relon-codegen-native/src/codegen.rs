@@ -44,7 +44,10 @@ use cranelift_module::{Linkage, Module as CrModule};
 use relon_ir::ir::{IrType, Module as IrModule, Op, TaggedOp};
 
 use crate::error::CraneliftError;
-use crate::sandbox::{SandboxConfig, SandboxState, TrapKind};
+use crate::sandbox::{
+    SandboxConfig, SandboxState, TrapKind, STATE_OFFSET_ARENA_BASE, STATE_OFFSET_ARENA_LEN,
+    STATE_OFFSET_TAIL_CURSOR,
+};
 
 /// Output of a successful compile: a JIT module plus the entry's
 /// function ID so the host can resolve a raw function pointer through
@@ -59,6 +62,51 @@ pub struct CompiledModule {
     /// Source range of the lowered `#main` directive — used by the
     /// runtime to attach trap diagnostics.
     pub entry_range: relon_parser::TokenRange,
+    /// Calling convention shape the host trampoline must match.
+    pub entry_shape: EntryShape,
+}
+
+/// How the host trampoline talks to the JIT entry.
+///
+/// v5-β-2 lands two shapes side-by-side:
+///
+/// * `LegacyI64Args` — the original v5-β-1 envelope: every IR param
+///   is `I64`, return is `I64`. Used by direct-IR callers and the
+///   existing codegen unit tests.
+/// * `BufferProtocol` — matches the wasm-AOT `run_main` signature
+///   (`fn run_main(in_ptr: i32, in_len: i32, out_ptr: i32, out_cap:
+///   i32, caps: i64) -> i32`). Selected when the IR's entry
+///   parameters match `[I32, I32, I32, I32, I64]` — the canonical
+///   shape `lower_workspace_single` emits for every user source.
+///
+/// Selecting the shape from the IR rather than a separate flag keeps
+/// the API surface narrow: the lowering pass is the source of truth
+/// on whether the body speaks buffer protocol or raw i64s.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntryShape {
+    /// Legacy: `(*state, i64...) -> i64`. v5-β-1 shape.
+    LegacyI64Args,
+    /// Buffer protocol: `(*state, i32 in_ptr, i32 in_len, i32 out_ptr,
+    /// i32 out_cap, i64 caps) -> i32`. v5-β-2 shape that matches the
+    /// wasm-AOT side. Loads + stores against the in/out buffer go
+    /// through the `arena_base + buf_ptr + offset` formula.
+    BufferProtocol,
+}
+
+/// IR param signature that triggers [`EntryShape::BufferProtocol`].
+/// Mirrors the locals layout `lower_workspace_single` synthesises for
+/// every user `#main` source.
+fn is_buffer_protocol_signature(params: &[IrType], ret: IrType) -> bool {
+    matches!(
+        params,
+        [
+            IrType::I32,
+            IrType::I32,
+            IrType::I32,
+            IrType::I32,
+            IrType::I64
+        ]
+    ) && matches!(ret, IrType::I32)
 }
 
 /// Trap codes the cranelift lowering emits via `trap` /
@@ -98,23 +146,33 @@ pub fn compile_module(
         .ok_or_else(|| CraneliftError::Codegen("module has no entry function".into()))?;
     let entry = &ir.funcs[entry_idx];
 
-    // Validate the entry signature against our v5-beta-1 envelope:
-    // every parameter must be I64, return must be I64. Anything else
-    // (string args, dict returns, ...) is currently out of scope.
-    for (i, param) in entry.params.iter().enumerate() {
-        if !matches!(param, IrType::I64) {
+    // Detect the entry shape. v5-β-2 supports two:
+    //   - Legacy `(I64, ..., I64) -> I64` — direct-IR test path.
+    //   - Buffer-protocol `(I32, I32, I32, I32, I64) -> I32` — what
+    //     `lower_workspace_single` synthesises for every user source.
+    // Anything else falls back to the legacy-shape gate and surfaces
+    // as `UnsupportedSignature` so the host can pick a different
+    // backend.
+    let entry_shape = if is_buffer_protocol_signature(&entry.params, entry.ret) {
+        EntryShape::BufferProtocol
+    } else {
+        // Legacy validation: every param must be I64, return must be
+        // I64.
+        for (i, param) in entry.params.iter().enumerate() {
+            if !matches!(param, IrType::I64) {
+                return Err(CraneliftError::UnsupportedSignature(format!(
+                    "cranelift-native: param #{i} is {param:?} (expected I64 or buffer-protocol shape)"
+                )));
+            }
+        }
+        if !matches!(entry.ret, IrType::I64) {
             return Err(CraneliftError::UnsupportedSignature(format!(
-                "cranelift-native v5-beta-1 only supports Int params; param #{i} is {:?}",
-                param
+                "cranelift-native: return is {:?} (expected I64 or buffer-protocol I32)",
+                entry.ret
             )));
         }
-    }
-    if !matches!(entry.ret, IrType::I64) {
-        return Err(CraneliftError::UnsupportedSignature(format!(
-            "cranelift-native v5-beta-1 only supports Int return; got {:?}",
-            entry.ret
-        )));
-    }
+        EntryShape::LegacyI64Args
+    };
 
     // Cranelift ISA + flag setup. We pin `is_pic = false` because the
     // JIT loads code into heap-allocated executable pages and never
@@ -196,15 +254,36 @@ pub fn compile_module(
         .declare_function("relon_cap_lookup", Linkage::Import, &cap_lookup_sig)
         .map_err(|e| CraneliftError::ModuleDefine(format!("declare cap_lookup: {e}")))?;
 
-    // Build the entry signature:
-    //   fn run_main(state: *const SandboxState, args...: i64) -> i64
+    // Build the entry signature. The exact shape depends on
+    // `entry_shape`: legacy IR carries `I64...` user args, while the
+    // buffer-protocol IR carries the four wasm handshake i32 slots +
+    // the i64 capabilities argument.
     let pointer_ty = module.target_config().pointer_type();
     let mut entry_sig = Signature::new(CallConv::SystemV);
     entry_sig.params.push(AbiParam::new(pointer_ty)); // state pointer
-    for _ in &entry.params {
-        entry_sig.params.push(AbiParam::new(I64));
+    match entry_shape {
+        EntryShape::LegacyI64Args => {
+            for _ in &entry.params {
+                entry_sig.params.push(AbiParam::new(I64));
+            }
+            entry_sig.returns.push(AbiParam::new(I64));
+        }
+        EntryShape::BufferProtocol => {
+            for p in &entry.params {
+                let ty = match p {
+                    IrType::I32 => I32,
+                    IrType::I64 => I64,
+                    other => {
+                        return Err(CraneliftError::Codegen(format!(
+                            "buffer-protocol entry param {other:?} unsupported"
+                        )));
+                    }
+                };
+                entry_sig.params.push(AbiParam::new(ty));
+            }
+            entry_sig.returns.push(AbiParam::new(I32));
+        }
     }
-    entry_sig.returns.push(AbiParam::new(I64));
 
     let entry_fn_id = module
         .declare_function("run_main", Linkage::Export, &entry_sig)
@@ -253,6 +332,7 @@ pub fn compile_module(
             now_ref,
             cap_lookup_ref,
             pointer_ty,
+            entry_shape,
             locals: HashMap::new(),
             let_locals: HashMap::new(),
             arg_values: &arg_values,
@@ -267,11 +347,16 @@ pub fn compile_module(
 
         // Now fill the trap block body. Every guard branched in with
         // its `TrapKind as i64` as the block param; we call
-        // `relon_raise_trap(state, code)` and return 0.
+        // `relon_raise_trap(state, code)` and return a sentinel zero
+        // of the entry's return type so the host trampoline can
+        // detect the trap via `state.trap_code()`.
         builder.switch_to_block(trap_block);
         let code = builder.block_params(trap_block)[0];
         builder.ins().call(raise_trap_ref, &[state_ptr, code]);
-        let zero = builder.ins().iconst(I64, 0);
+        let zero = match entry_shape {
+            EntryShape::LegacyI64Args => builder.ins().iconst(I64, 0),
+            EntryShape::BufferProtocol => builder.ins().iconst(I32, 0),
+        };
         builder.ins().return_(&[zero]);
         builder.seal_block(trap_block);
 
@@ -294,7 +379,38 @@ pub fn compile_module(
         entry_fn_id,
         entry_arity: entry.params.len(),
         entry_range: entry.range,
+        entry_shape,
     })
+}
+
+/// Map an IR `LoadField` / `StoreField` `ty` to the cranelift load
+/// type, byte width, and stack tag.
+///
+/// Returns `(cranelift_load_type, byte_width, virtual_stack_ty)`.
+/// `cranelift_load_type` is what cranelift's `load`/`store` opcode
+/// width key cares about; `byte_width` is consumed by the bounds
+/// check; `virtual_stack_ty` documents what the IR-side stack
+/// expects after the load.
+fn field_load_shape(
+    ty: IrType,
+) -> Result<(cranelift_codegen::ir::Type, u32, IrType), CraneliftError> {
+    match ty {
+        IrType::I64 => Ok((I64, 8, IrType::I64)),
+        IrType::F64 => Ok((cranelift_codegen::ir::types::F64, 8, IrType::F64)),
+        IrType::I32 => Ok((I32, 4, IrType::I32)),
+        IrType::Bool | IrType::Null => Ok((cranelift_codegen::ir::types::I8, 1, IrType::Bool)),
+        // Pointer-indirect leaves; layered support arrives with the
+        // tail-cursor + scratch-arena tranche.
+        IrType::String
+        | IrType::ListInt
+        | IrType::ListFloat
+        | IrType::ListBool
+        | IrType::ListString
+        | IrType::ListSchema
+        | IrType::Closure => Err(CraneliftError::Codegen(format!(
+            "LoadField/StoreField with pointer-indirect type {ty:?} not yet supported"
+        ))),
+    }
 }
 
 /// Per-function lowering state. Owns the cranelift builder and tracks
@@ -313,6 +429,10 @@ struct Codegen<'a, 'b> {
     now_ref: cranelift_codegen::ir::FuncRef,
     cap_lookup_ref: cranelift_codegen::ir::FuncRef,
     pointer_ty: cranelift_codegen::ir::Type,
+    /// Calling-convention shape picked at compile time. Drives the
+    /// `LocalGet` type (i32 vs i64), `Return` epilogue, and the
+    /// buffer-protocol load / store address computation.
+    entry_shape: EntryShape,
     /// `LocalGet` slot index -> cranelift `Variable`.
     locals: HashMap<u32, Variable>,
     /// `LetGet/LetSet` slot index -> cranelift `Variable`.
@@ -400,13 +520,15 @@ impl<'a, 'b> Codegen<'a, 'b> {
         let inst = self.builder.ins().call(self.now_ref, &[self.state_ptr]);
         let elapsed = self.builder.inst_results(inst)[0];
 
-        // Load deadline_ns from state. Offset 0 because we placed the
-        // field first in the `#[repr(C)] SandboxState`. We must keep
-        // this in sync with the struct layout in `sandbox.rs`.
-        let deadline = self
-            .builder
-            .ins()
-            .load(I64, MemFlags::trusted(), self.state_ptr, 0);
+        // Load deadline_ns from state. The offset lives in
+        // `STATE_OFFSET_DEADLINE_NS`; the codegen and sandbox must
+        // agree on it.
+        let deadline = self.builder.ins().load(
+            I64,
+            MemFlags::trusted(),
+            self.state_ptr,
+            crate::sandbox::STATE_OFFSET_DEADLINE_NS,
+        );
 
         // Trap when elapsed >= deadline.
         let cmp = self
@@ -416,9 +538,188 @@ impl<'a, 'b> Codegen<'a, 'b> {
         self.cond_trap(cmp, TrapKind::ResourceExhausted);
     }
 
+    /// Buffer-protocol mode: compute the absolute host address for a
+    /// `(buf_local_idx, byte_offset, slot_size)` triple, after a
+    /// bounds check against `state.arena_len`. Returns the absolute
+    /// pointer-typed cranelift value, suitable for direct
+    /// `load`/`store` with `MemFlags::trusted()` and zero immediate
+    /// offset.
+    ///
+    /// `buf_local_idx` is the IR's wasm-local slot — 0 for `in_ptr`,
+    /// 2 for `out_ptr` — read through `get_local`. `slot_size` is
+    /// the byte width the caller is about to touch; the bounds check
+    /// verifies `buf_ptr + byte_offset + slot_size <= arena_len`.
+    fn buffer_field_addr(
+        &mut self,
+        buf_local_idx: u32,
+        byte_offset: u32,
+        slot_size: u32,
+    ) -> Result<CValue, CraneliftError> {
+        // buf_ptr is i32 (the wasm handshake slot).
+        let buf_ptr_i32 = self.get_local(buf_local_idx)?;
+        // Widen to pointer-sized arithmetic so we never lose bits on
+        // 64-bit hosts. `uextend` because the wasm-side semantics
+        // treat the i32 as an unsigned byte offset.
+        let buf_ptr = self.builder.ins().uextend(self.pointer_ty, buf_ptr_i32);
+
+        // arena_base: load pointer-sized field from state.
+        let arena_base = self.builder.ins().load(
+            self.pointer_ty,
+            MemFlags::trusted(),
+            self.state_ptr,
+            STATE_OFFSET_ARENA_BASE,
+        );
+        let arena_len_i32 = self.builder.ins().load(
+            I32,
+            MemFlags::trusted(),
+            self.state_ptr,
+            STATE_OFFSET_ARENA_LEN,
+        );
+
+        // Bounds: required_end = byte_offset + slot_size; trap when
+        // (buf_ptr + required_end) > arena_len. Doing the add as i32
+        // mirrors the wasm-side semantics where the in/out pointer
+        // is itself an i32 offset.
+        if self.sandbox.bounds_check {
+            let required_end = byte_offset
+                .checked_add(slot_size)
+                .ok_or_else(|| CraneliftError::Codegen("buffer field offset overflow".into()))?;
+            let req_v = self.builder.ins().iconst(I32, i64::from(required_end));
+            let end_i32 = self.builder.ins().iadd(buf_ptr_i32, req_v);
+            let cmp = self
+                .builder
+                .ins()
+                .icmp(IntCC::UnsignedGreaterThan, end_i32, arena_len_i32);
+            self.cond_trap(cmp, TrapKind::BoundsViolation);
+        }
+
+        // Compute absolute address = arena_base + buf_ptr + offset.
+        let abs0 = self.builder.ins().iadd(arena_base, buf_ptr);
+        let off_v = self
+            .builder
+            .ins()
+            .iconst(self.pointer_ty, i64::from(byte_offset));
+        let abs = self.builder.ins().iadd(abs0, off_v);
+        Ok(abs)
+    }
+
+    /// Lower `Op::LoadField { offset, ty }`. Reads from
+    /// `in_ptr + offset` (wasm slot 0) and pushes the value onto the
+    /// virtual stack.
+    fn emit_load_field(&mut self, offset: u32, ty: IrType) -> Result<(), CraneliftError> {
+        if !matches!(self.entry_shape, EntryShape::BufferProtocol) {
+            return Err(CraneliftError::Codegen(
+                "LoadField outside buffer-protocol entry shape".into(),
+            ));
+        }
+        let (cr_ty, size, push_ty) = field_load_shape(ty)?;
+        let addr = self.buffer_field_addr(0 /* in_ptr */, offset, size)?;
+        let loaded = self.builder.ins().load(cr_ty, MemFlags::trusted(), addr, 0);
+        // For `Bool` / `Null` the IR's virtual stack expects an i32
+        // slot — widen the loaded byte to i32 zero-extended.
+        let val = match ty {
+            IrType::Bool | IrType::Null => self.builder.ins().uextend(I32, loaded),
+            _ => loaded,
+        };
+        let _ = push_ty;
+        self.push(val);
+        Ok(())
+    }
+
+    /// Lower `Op::StoreField { offset, ty }`. Pops the top of the
+    /// virtual stack and writes it into `out_ptr + offset` (wasm slot
+    /// 2). v5-β-2 supports scalar (I64 / F64 / I32 / Bool / Null)
+    /// stores; pointer-indirect stores (String / List*) trip the
+    /// "unsupported" arm so the harness reports `CraneliftUnsupported`
+    /// rather than miscompiling.
+    fn emit_store_field(&mut self, offset: u32, ty: IrType) -> Result<(), CraneliftError> {
+        if !matches!(self.entry_shape, EntryShape::BufferProtocol) {
+            return Err(CraneliftError::Codegen(
+                "StoreField outside buffer-protocol entry shape".into(),
+            ));
+        }
+        if matches!(
+            ty,
+            IrType::String
+                | IrType::ListInt
+                | IrType::ListFloat
+                | IrType::ListBool
+                | IrType::ListString
+                | IrType::ListSchema
+        ) {
+            return Err(CraneliftError::Codegen(format!(
+                "StoreField pointer-indirect type {ty:?} not yet supported on cranelift",
+            )));
+        }
+        let (cr_ty, size, _push_ty) = field_load_shape(ty)?;
+        let value = self.pop()?;
+        // For `Bool` / `Null` the stack slot is i32 but the store
+        // width is i8.
+        let store_val = match ty {
+            IrType::Bool | IrType::Null => self
+                .builder
+                .ins()
+                .ireduce(cranelift_codegen::ir::types::I8, value),
+            _ => value,
+        };
+        let store_ty = match ty {
+            IrType::Bool | IrType::Null => cranelift_codegen::ir::types::I8,
+            _ => cr_ty,
+        };
+        let addr = self.buffer_field_addr(2 /* out_ptr */, offset, size)?;
+        let _ = store_ty; // cranelift `store` infers width from value type
+        self.builder
+            .ins()
+            .store(MemFlags::trusted(), store_val, addr, 0);
+        Ok(())
+    }
+
+    /// Emit the function's `Return`:
+    ///   * LegacyI64Args — pop the top of the virtual stack and emit
+    ///     `return v: i64`.
+    ///   * BufferProtocol — the wasm-side semantics push `i32
+    ///     bytes_written` (the tail cursor when the body emitted
+    ///     pointer-indirect stores, else `return_root_size`) and end
+    ///     the function. v5-β-2 only handles scalar returns; the
+    ///     `Op::Return` here loads the tail cursor (currently 0) from
+    ///     state and writes the return-root size as the count.
+    fn emit_return(&mut self) -> Result<(), CraneliftError> {
+        match self.entry_shape {
+            EntryShape::LegacyI64Args => {
+                let v = self.pop()?;
+                self.builder.ins().return_(&[v]);
+            }
+            EntryShape::BufferProtocol => {
+                // The host trampoline knows the canonical return-root
+                // size from the lowered schema; we report a sentinel
+                // tail-cursor value here that says "use the canonical
+                // size". Picking u32::MAX would collide with overflow
+                // checks; the host instead reads back the actual
+                // `state.tail_cursor()` slot, which the lowering only
+                // updates when pointer-indirect stores run. For pure
+                // scalar bodies, returning 0 leaves the host's
+                // fallback (`return_root_size`) intact.
+                let tail = self.builder.ins().load(
+                    I32,
+                    MemFlags::trusted(),
+                    self.state_ptr,
+                    STATE_OFFSET_TAIL_CURSOR,
+                );
+                self.builder.ins().return_(&[tail]);
+            }
+        }
+        Ok(())
+    }
+
     /// Materialise a cranelift `Variable` for a `LocalGet` slot the
     /// IR references. Slot 0 corresponds to `arg_values[0]`, slot 1
-    /// to `arg_values[1]`, and so on.
+    /// to `arg_values[1]`, and so on. The variable's type tracks the
+    /// entry's calling convention:
+    ///
+    /// * `LegacyI64Args` — every local is `i64`.
+    /// * `BufferProtocol` — locals 0..=3 are `i32` (the handshake
+    ///   slots `in_ptr`, `in_len`, `out_ptr`, `out_cap`), local 4 is
+    ///   `i64` (`caps_arg`).
     fn get_local(&mut self, idx: u32) -> Result<CValue, CraneliftError> {
         if let Some(var) = self.locals.get(&idx).copied() {
             return Ok(self.builder.use_var(var));
@@ -430,9 +731,21 @@ impl<'a, 'b> Codegen<'a, 'b> {
                 self.arg_values.len()
             )));
         }
+        let cr_ty = match self.entry_shape {
+            EntryShape::LegacyI64Args => I64,
+            EntryShape::BufferProtocol => match idx {
+                0..=3 => I32,
+                4 => I64,
+                _ => {
+                    return Err(CraneliftError::Codegen(format!(
+                        "LocalGet({idx}) out of range for buffer-protocol entry (5 locals)"
+                    )));
+                }
+            },
+        };
         // Mirror the arg value into a Variable so future LocalSet
         // (if we ever support it) writes go through SSA cleanly.
-        let var = self.builder.declare_var(I64);
+        let var = self.builder.declare_var(cr_ty);
         self.builder.def_var(var, self.arg_values[arg_idx]);
         self.locals.insert(idx, var);
         Ok(self.builder.use_var(var))
@@ -515,19 +828,27 @@ impl<'a, 'b> Codegen<'a, 'b> {
             Op::Add(IrType::I64) => {
                 let b = self.pop()?;
                 let a = self.pop()?;
-                let r = self.builder.ins().iadd(a, b);
+                // Use sadd_overflow + cond_trap so signed overflow
+                // surfaces as `NumericOverflow` (matching the tree-
+                // walker's strict semantics). The wasm-AOT backend
+                // wraps silently — cranelift differs deliberately to
+                // close the differential corpus.
+                let (r, of) = self.builder.ins().sadd_overflow(a, b);
+                self.cond_trap(of, TrapKind::NumericOverflow);
                 self.push(r);
             }
             Op::Sub(IrType::I64) => {
                 let b = self.pop()?;
                 let a = self.pop()?;
-                let r = self.builder.ins().isub(a, b);
+                let (r, of) = self.builder.ins().ssub_overflow(a, b);
+                self.cond_trap(of, TrapKind::NumericOverflow);
                 self.push(r);
             }
             Op::Mul(IrType::I64) => {
                 let b = self.pop()?;
                 let a = self.pop()?;
-                let r = self.builder.ins().imul(a, b);
+                let (r, of) = self.builder.ins().smul_overflow(a, b);
+                self.cond_trap(of, TrapKind::NumericOverflow);
                 self.push(r);
             }
             Op::Div(IrType::I64) => {
@@ -564,10 +885,9 @@ impl<'a, 'b> Codegen<'a, 'b> {
             Op::Ge(IrType::I64) => self.emit_cmp(IntCC::SignedGreaterThanOrEqual)?,
             Op::Eq(IrType::Bool) | Op::Eq(IrType::I32) => self.emit_cmp_i32(IntCC::Equal)?,
             Op::Ne(IrType::Bool) | Op::Ne(IrType::I32) => self.emit_cmp_i32(IntCC::NotEqual)?,
-            Op::Return => {
-                let v = self.pop()?;
-                self.builder.ins().return_(&[v]);
-            }
+            Op::Return => self.emit_return()?,
+            Op::LoadField { offset, ty } => self.emit_load_field(*offset, *ty)?,
+            Op::StoreField { offset, ty } => self.emit_store_field(*offset, *ty)?,
             Op::If {
                 result_ty,
                 then_body,

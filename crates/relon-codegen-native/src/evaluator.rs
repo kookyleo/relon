@@ -15,24 +15,60 @@
 //! `relon` facade keeps the tree-walker available for those code
 //! paths, so callers never see a hard failure outside `run_main`.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use cranelift_jit::JITModule;
 
+use relon_eval_api::buffer::{BufferBuilder, BufferError, BufferReader};
+use relon_eval_api::layout::{OffsetTable, SchemaLayout};
+use relon_eval_api::schema_canonical::{Field, Schema, TypeRepr};
 use relon_eval_api::{ClosureData, Evaluator, RuntimeError, Scope, Thunk, Value};
 use relon_parser::{Node, TokenRange};
 
 use crate::cache::CacheEntry;
-use crate::codegen::{self, CompiledModule};
+use crate::codegen::{self, CompiledModule, EntryShape};
 use crate::error::CraneliftError;
 use crate::sandbox::{CapabilityVtable, SandboxConfig, SandboxState, TrapKind};
 
-/// Type alias for the raw `extern "C"` entry the JIT produced. Five
-/// args fit our v5-beta-1 envelope (`#main(Int x, Int y, Int z, Int w)`);
-/// callers that need more arity than that surface
-/// `UnsupportedSignature` long before the dispatch tries to call this.
-type EntryFn = unsafe extern "C" fn(*const SandboxState, i64, i64, i64, i64) -> i64;
+/// Type alias for the raw `extern "C"` entry the JIT produced when
+/// the entry shape is [`EntryShape::LegacyI64Args`]. Five i64s cover
+/// the v5-β-1 `#main(Int x, Int y, Int z, Int w)` envelope; longer
+/// arities surface as `UnsupportedSignature` before the trampoline
+/// tries to dispatch.
+type LegacyEntryFn = unsafe extern "C" fn(*const SandboxState, i64, i64, i64, i64) -> i64;
+
+/// Type alias for the raw `extern "C"` entry the JIT produced when
+/// the entry shape is [`EntryShape::BufferProtocol`]. The signature
+/// mirrors the wasm-AOT side's `run_main`: four i32 buffer-handshake
+/// slots plus the i64 capability bitmap, returning the i32
+/// `bytes_written`.
+type BufferEntryFn = unsafe extern "C" fn(
+    *const SandboxState,
+    i32, // in_ptr (byte offset inside arena)
+    i32, // in_len
+    i32, // out_ptr (byte offset inside arena)
+    i32, // out_cap
+    i64, // caps
+) -> i32;
+
+/// Discriminated entry pointer covering both calling-convention
+/// shapes. The choice is fixed at compile time by [`EntryShape`].
+#[derive(Clone, Copy)]
+enum EntryPtr {
+    Legacy(LegacyEntryFn),
+    Buffer(BufferEntryFn),
+}
+
+/// Optional schema metadata kept alive for buffer-protocol modules
+/// — populated from `lower_workspace_single` via [`Self::from_source`].
+#[derive(Clone)]
+struct BufferSchema {
+    main_schema: Schema,
+    return_schema: Schema,
+    main_layout: OffsetTable,
+    return_layout: OffsetTable,
+}
 
 /// AOT evaluator backed by a cranelift JIT module.
 pub struct CraneliftAotEvaluator {
@@ -40,15 +76,17 @@ pub struct CraneliftAotEvaluator {
     /// We never tear this down at run time; one module per evaluator
     /// is enough for v5-beta-1.
     _module: JITModule,
-    /// Raw function pointer to the JIT'd `run_main`.
-    entry_fn: EntryFn,
-    /// Number of `Int` arguments the entry expects (i.e. the
-    /// `#main(...)` arity).
+    /// Raw function pointer to the JIT'd `run_main`. The exact shape
+    /// is tracked in [`EntryPtr`].
+    entry_fn: EntryPtr,
+    /// Number of declared `#main` parameters. For the buffer-protocol
+    /// shape this counts user fields (matching
+    /// `main_schema.fields.len()`); for the legacy shape it counts
+    /// I64 args directly. Hosts use this as a fast arity sanity check.
     entry_arity: usize,
-    /// Parameter names in declaration order. v5-beta-1 doesn't have
-    /// the analyzer / parser hooked all the way through, so we fall
-    /// back to synthetic names (`arg0` / `arg1` / ...) when the IR
-    /// path can't surface real names.
+    /// Parameter names in declaration order. For buffer-protocol
+    /// modules these come from `main_schema.fields`; for legacy
+    /// modules they're synthetic `arg0`/`arg1`/...
     param_names: Vec<String>,
     /// Source range of the entry `#main` directive.
     entry_range: TokenRange,
@@ -57,6 +95,9 @@ pub struct CraneliftAotEvaluator {
     /// the same pointer without contention on the underlying
     /// allocation; the few atomic fields synchronise updates.
     sandbox_state: Arc<SandboxState>,
+    /// Schema descriptors for the buffer-protocol path. `None` for
+    /// legacy direct-IR modules.
+    buffer_schema: Option<BufferSchema>,
 }
 
 // SAFETY: The JIT-emitted code is reentrant and the `SandboxState`
@@ -69,26 +110,54 @@ unsafe impl Sync for CraneliftAotEvaluator {}
 impl CraneliftAotEvaluator {
     /// Drive the full pipeline: parse + analyze + lower + cranelift
     /// codegen + JIT finalize.
+    ///
+    /// v5-β-2 widens this from a thin stub to the real end-to-end
+    /// path. The lowering pass produces a buffer-protocol shaped IR
+    /// (`#main` signature = `(I32, I32, I32, I32, I64) -> I32`) plus
+    /// the canonical main / return schemas; both are captured on the
+    /// evaluator so `run_main` can serialise / deserialise the
+    /// buffers through the same `BufferBuilder` / `BufferReader`
+    /// helpers the wasm-AOT backend uses.
     pub fn from_source(src: &str) -> Result<Self, CraneliftError> {
-        let ir = Self::lower_source(src)?;
-        let arity = ir_param_count(&ir)?;
+        let (ir_module, main_schema, return_schema) = Self::lower_source(src)?;
+        let main_layout = SchemaLayout::offsets_for(&main_schema)
+            .map_err(|e| CraneliftError::Lowering(format!("main schema layout: {e}")))?;
+        let return_layout = SchemaLayout::offsets_for(&return_schema)
+            .map_err(|e| CraneliftError::Lowering(format!("return schema layout: {e}")))?;
+        let param_names: Vec<String> = main_schema.fields.iter().map(|f| f.name.clone()).collect();
+        let buffer_schema = BufferSchema {
+            main_schema,
+            return_schema,
+            main_layout,
+            return_layout,
+        };
         let sandbox_cfg = SandboxConfig::default();
-        Self::from_ir(ir, sandbox_cfg, default_param_names_for(arity))
+        Self::from_ir_inner(ir_module, sandbox_cfg, param_names, Some(buffer_schema))
     }
 
     /// Skip parse + analyze + lower; rebuild a JIT module from the
     /// cached IR. Slower than a true binary cache (we still re-JIT)
     /// but already much faster than `from_source` because parse +
     /// analyze + lower commonly dominate cold-start.
+    ///
+    /// Today the cache only ever holds legacy-shape modules; buffer-
+    /// protocol caches arrive alongside the schema serialisation
+    /// work scheduled for stage 3.
     pub fn from_cache(entry: CacheEntry) -> Result<Self, CraneliftError> {
         let arity = ir_param_count(&entry.ir)?;
-        Self::from_ir(entry.ir, entry.sandbox, default_param_names_for(arity))
+        Self::from_ir_inner(
+            entry.ir,
+            entry.sandbox,
+            default_param_names_for(arity),
+            None,
+        )
     }
 
-    /// Internal helper: lower a source string into an IR module. Mirrors
-    /// `relon_codegen_wasm::WasmAotEvaluator::compile_source` minus the
-    /// schema layout step.
-    fn lower_source(src: &str) -> Result<relon_ir::ir::Module, CraneliftError> {
+    /// Internal helper: lower a source string into an IR module and
+    /// surface the canonical main / return schemas the buffer
+    /// protocol talks against. Mirrors
+    /// `relon_codegen_wasm::WasmAotEvaluator::compile_source`.
+    fn lower_source(src: &str) -> Result<(relon_ir::ir::Module, Schema, Schema), CraneliftError> {
         let ast =
             relon_parser::parse_document(src).map_err(|e| CraneliftError::Parse(e.to_string()))?;
         let analyzed = relon_analyzer::analyze(&ast);
@@ -102,28 +171,29 @@ impl CraneliftAotEvaluator {
         }
         let lowered = relon_ir::lower_workspace_single(&analyzed, &ast)
             .map_err(|e| CraneliftError::Lowering(e.to_string()))?;
-        Ok(lowered.module)
+        Ok((lowered.module, lowered.main_schema, lowered.return_schema))
     }
 
-    /// Compile from a pre-lowered IR module. Public for v5-beta-1
-    /// because the existing IR-emit pipeline assumes a wasm-side
-    /// buffer + schema protocol the cranelift backend doesn't speak
-    /// yet; tests and benchmarks therefore hand-build narrow IR
-    /// modules and feed them in directly. v5-beta-2 wires the
-    /// per-file analyzer / lowering pipeline through `from_source`.
+    /// Compile from a pre-lowered IR module. Public for direct-IR
+    /// callers (tests / benchmarks); the buffer-protocol metadata
+    /// path is internal.
     pub fn from_ir_direct(
         ir: relon_ir::ir::Module,
         sandbox_cfg: SandboxConfig,
         param_names: Vec<String>,
     ) -> Result<Self, CraneliftError> {
-        Self::from_ir(ir, sandbox_cfg, param_names)
+        Self::from_ir_inner(ir, sandbox_cfg, param_names, None)
     }
 
-    /// Compile from a pre-lowered IR module.
-    fn from_ir(
+    /// Compile from a pre-lowered IR module, optionally annotated
+    /// with the buffer-protocol schemas. `buffer_schema = Some(_)`
+    /// when the source went through `lower_workspace_single` (the
+    /// `from_source` path); `None` for legacy direct-IR construction.
+    fn from_ir_inner(
         ir: relon_ir::ir::Module,
         sandbox_cfg: SandboxConfig,
         param_names: Vec<String>,
+        buffer_schema: Option<BufferSchema>,
     ) -> Result<Self, CraneliftError> {
         let compiled = codegen::compile_module(&ir, &sandbox_cfg)?;
         let CompiledModule {
@@ -131,27 +201,67 @@ impl CraneliftAotEvaluator {
             entry_fn_id,
             entry_arity,
             entry_range,
+            entry_shape,
         } = compiled;
+
+        // Cross-check: buffer schema metadata must agree with the IR
+        // shape the codegen picked. A mismatch here is a programming
+        // error in `from_source` rather than a user-visible
+        // condition.
+        match (entry_shape, &buffer_schema) {
+            (EntryShape::BufferProtocol, None) => {
+                // The legacy path doesn't speak buffer protocol;
+                // surface as Codegen because the only way to land
+                // here is to hand the buffer-shape IR into
+                // `from_ir_direct`, which isn't a public guarantee
+                // today. We accept it and let `run_main` reject the
+                // call at dispatch time.
+            }
+            (EntryShape::LegacyI64Args, Some(_)) => {
+                return Err(CraneliftError::Codegen(
+                    "buffer-protocol schema metadata supplied with legacy-i64 entry shape".into(),
+                ));
+            }
+            _ => {}
+        }
 
         let raw_ptr = module.get_finalized_function(entry_fn_id);
         // SAFETY: JIT-finalized function pointers are stable for the
         // module's lifetime; we keep the module alive on `Self`.
-        let entry_fn: EntryFn = unsafe { std::mem::transmute(raw_ptr) };
+        // Picking the right `EntryPtr` variant is gated on the
+        // compiler's `entry_shape`, which is the source of truth.
+        let entry_fn = match entry_shape {
+            EntryShape::LegacyI64Args => EntryPtr::Legacy(unsafe {
+                std::mem::transmute::<*const u8, LegacyEntryFn>(raw_ptr)
+            }),
+            EntryShape::BufferProtocol => EntryPtr::Buffer(unsafe {
+                std::mem::transmute::<*const u8, BufferEntryFn>(raw_ptr)
+            }),
+        };
 
-        // v5-beta-1: cap_bit width 64 mirrors the wasm-AOT side's
+        // cap_bit width 64 mirrors the wasm-AOT side's
         // `relon_caps_avail` u64 bitmap shape. Hosts that register a
         // higher cap_bit cause `register` to grow the vector.
         let capabilities = Arc::new(CapabilityVtable::with_capacity(64));
         let sandbox_state = Arc::new(SandboxState::new(capabilities));
         sandbox_state.entry_range.set(entry_range);
 
+        // Buffer-protocol arity equals the user-field count when we
+        // have a schema; fall back to the IR-param count for legacy
+        // / orphaned buffer modules.
+        let arity = buffer_schema
+            .as_ref()
+            .map(|bs| bs.main_schema.fields.len())
+            .unwrap_or(entry_arity);
+
         Ok(Self {
             _module: module,
             entry_fn,
-            entry_arity,
+            entry_arity: arity,
             param_names,
             entry_range,
             sandbox_state,
+            buffer_schema,
         })
     }
 
@@ -189,26 +299,80 @@ impl CraneliftAotEvaluator {
         &self.param_names
     }
 
-    /// Internal: invoke the JIT entry with the supplied i64 args.
-    /// Uses `catch_unwind` to convert panics raised by cranelift
-    /// trap instructions into typed `RuntimeError`s.
-    fn invoke_entry(&self, args: [i64; 4]) -> Result<i64, RuntimeError> {
+    /// Internal: invoke the legacy-shape JIT entry with the supplied
+    /// i64 args. Uses `catch_unwind` to convert panics raised by
+    /// cranelift trap instructions into typed `RuntimeError`s.
+    fn invoke_legacy_entry(&self, args: [i64; 4]) -> Result<i64, RuntimeError> {
         self.sandbox_state.reset_trap();
         let state_ptr: *const SandboxState = Arc::as_ptr(&self.sandbox_state);
-        let entry = self.entry_fn;
+        let entry = match self.entry_fn {
+            EntryPtr::Legacy(f) => f,
+            EntryPtr::Buffer(_) => {
+                return Err(RuntimeError::Unsupported {
+                    reason: "cranelift-native: invoke_legacy_entry called on buffer-protocol shape"
+                        .into(),
+                });
+            }
+        };
 
-        // `catch_unwind` requires `UnwindSafe`; raw pointers + i64s
-        // are inherently safe, and the JIT entry has no Rust state
-        // tied to it. The `Cell<TokenRange>` field inside
-        // `SandboxState` makes the type `!UnwindSafe`, so we wrap
-        // the closure in `AssertUnwindSafe` — we set the entry_range
-        // at construction time and don't mutate it from the JIT, so
-        // a panic mid-call can't leave the Cell in an inconsistent
-        // intermediate state.
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
             entry(state_ptr, args[0], args[1], args[2], args[3])
         }));
 
+        self.dispatch_post(result)
+    }
+
+    /// Internal: invoke the buffer-protocol JIT entry. Caller owns
+    /// the arena bytes (already populated with the input buffer);
+    /// this helper installs them into the sandbox state, kicks off
+    /// the JIT, and reports either the `bytes_written` from `run_main`
+    /// or a typed trap.
+    fn invoke_buffer_entry(
+        &self,
+        arena: &mut [u8],
+        in_ptr: u32,
+        in_len: u32,
+        out_ptr: u32,
+        out_cap: u32,
+        caps: u64,
+    ) -> Result<i32, RuntimeError> {
+        self.sandbox_state.reset_trap();
+        // SAFETY: `arena` is borrowed mutably here and stays valid
+        // through the JIT call's lifetime (`arena` outlives this
+        // function); the JIT side reads / writes through the pointer
+        // we install. Both the host trampoline and the cranelift
+        // emitter respect the `arena_len` field for bounds.
+        unsafe {
+            self.sandbox_state
+                .install_arena(arena.as_mut_ptr(), arena.len() as u32);
+        }
+        let state_ptr: *const SandboxState = Arc::as_ptr(&self.sandbox_state);
+        let entry = match self.entry_fn {
+            EntryPtr::Buffer(f) => f,
+            EntryPtr::Legacy(_) => {
+                return Err(RuntimeError::Unsupported {
+                    reason: "cranelift-native: invoke_buffer_entry called on legacy shape".into(),
+                });
+            }
+        };
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            entry(
+                state_ptr,
+                in_ptr as i32,
+                in_len as i32,
+                out_ptr as i32,
+                out_cap as i32,
+                caps as i64,
+            )
+        }));
+
+        self.dispatch_post(result)
+    }
+
+    /// Post-process a JIT-call result: surface typed traps recorded in
+    /// `state.trap_code`, otherwise pass the raw return value through.
+    fn dispatch_post<T>(&self, result: std::thread::Result<T>) -> Result<T, RuntimeError> {
         match result {
             Ok(v) => {
                 let code = self.sandbox_state.trap_code();
@@ -218,9 +382,6 @@ impl CraneliftAotEvaluator {
                 Ok(v)
             }
             Err(payload) => {
-                // The cranelift trap path on unix raises SIGILL ->
-                // panic via the runtime's signal handler. Try to
-                // surface the captured TrapCode.
                 let code = self.sandbox_state.trap_code();
                 let _ = payload;
                 if code != 0 {
@@ -232,6 +393,80 @@ impl CraneliftAotEvaluator {
                     })
                 }
             }
+        }
+    }
+
+    /// Buffer-protocol `run_main`: serialise the args dict into an
+    /// arena, invoke the JIT, deserialise the return record.
+    fn run_main_buffer(&self, args: HashMap<String, Value>) -> Result<Value, RuntimeError> {
+        let bs = self.buffer_schema.as_ref().expect("checked by caller");
+
+        // 1. Build the input buffer using `BufferBuilder`.
+        let mut builder = BufferBuilder::new(&bs.main_layout, &bs.main_schema.fields);
+        for field in &bs.main_schema.fields {
+            let value = args
+                .get(&field.name)
+                .ok_or_else(|| RuntimeError::MissingMainArg {
+                    name: field.name.clone(),
+                    range: self.entry_range,
+                })?;
+            write_value_into_builder(&mut builder, field, value, &bs.main_schema.name)?;
+        }
+        let in_bytes = builder.finish();
+
+        // 2. Lay out the arena: [in_bytes | padding | out_buf]. Size
+        // out_buf at the schema's root size plus a 1 KiB cushion for
+        // potential tail records (substring / concat etc. land here
+        // once stage 2.5 widens StoreField).
+        let in_len = in_bytes.len() as u32;
+        let out_cap_min = bs.return_layout.root_size as u32;
+        let out_cap_cushion: u32 = 1024;
+        let out_cap = align_up(out_cap_min.max(64) + out_cap_cushion, 8);
+
+        let in_ptr: u32 = 0;
+        let pad_to_8 = align_up(in_len, 8);
+        let out_ptr = pad_to_8;
+        let arena_size = out_ptr
+            .checked_add(out_cap)
+            .ok_or_else(|| RuntimeError::IoError("cranelift arena size overflow".into()))?;
+
+        let mut arena = vec![0u8; arena_size as usize];
+        arena[in_ptr as usize..in_ptr as usize + in_bytes.len()].copy_from_slice(&in_bytes);
+
+        // 3. Invoke the JIT.
+        let bytes_written = self.invoke_buffer_entry(
+            &mut arena, in_ptr, in_len, out_ptr, out_cap, /*caps=*/ 0,
+        )?;
+        if bytes_written < 0 {
+            return Err(RuntimeError::IoError(format!(
+                "cranelift run_main reported negative bytes_written: {bytes_written}"
+            )));
+        }
+        let bw = bytes_written as usize;
+
+        // 4. Decode the output region back to a `Value`. We always
+        // give the reader at least `return_root_size` bytes — the
+        // wasm side does the same.
+        let read_len = bw.max(bs.return_layout.root_size);
+        let read_end = out_ptr as usize + read_len;
+        if read_end > arena.len() {
+            return Err(RuntimeError::IoError(
+                "cranelift arena too small for return decode".into(),
+            ));
+        }
+        let out_bytes = &arena[out_ptr as usize..read_end];
+
+        let reader = BufferReader::new(&bs.return_layout, &bs.return_schema.fields, out_bytes)
+            .map_err(buffer_to_runtime_error)?;
+        if is_single_value_wrapper(&bs.return_schema) {
+            let field = &bs.return_schema.fields[0];
+            read_value_from_reader(&reader, field, &bs.return_schema)
+        } else {
+            let map = read_record_into_map(&reader, &bs.return_schema)?;
+            Ok(Value::branded_dict(
+                map,
+                Some(bs.return_schema.name.clone()),
+            ))
         }
     }
 }
@@ -270,10 +505,19 @@ impl Evaluator for CraneliftAotEvaluator {
     }
 
     fn run_main(&self, args: HashMap<String, Value>) -> Result<Value, RuntimeError> {
+        // Buffer-protocol path: schema-driven serialisation through
+        // `BufferBuilder` / `BufferReader`. Selected when the source
+        // came in via `from_source`.
+        if self.buffer_schema.is_some() {
+            return self.run_main_buffer(args);
+        }
+
+        // Legacy direct-IR path: pack i64 args into the JIT's
+        // `extern "C"` slot.
         if args.len() > 4 {
             return Err(RuntimeError::Unsupported {
                 reason: format!(
-                    "cranelift-native v5-beta-1 supports up to 4 #main args; got {}",
+                    "cranelift-native legacy entry supports up to 4 args; got {}",
                     args.len()
                 ),
             });
@@ -288,17 +532,9 @@ impl Evaluator for CraneliftAotEvaluator {
             });
         }
 
-        // Materialise args into a fixed [i64; 4] array, padding with
-        // zero. v5-beta-1 only accepts `Int` arguments; other shapes
-        // surface as `MainArgTypeMismatch` so the diagnostic mirrors
-        // the tree-walker's.
         let mut argv = [0i64; 4];
         for (i, name) in self.param_names.iter().enumerate() {
-            let value = args.get(name).or_else(|| {
-                // Hosts that don't know the synthetic names can also
-                // pass keyed by positional `argN`.
-                args.get(&format!("arg{i}"))
-            });
+            let value = args.get(name).or_else(|| args.get(&format!("arg{i}")));
             let value = value.ok_or_else(|| RuntimeError::MissingMainArg {
                 name: name.clone(),
                 range: self.entry_range,
@@ -316,7 +552,7 @@ impl Evaluator for CraneliftAotEvaluator {
             }
         }
 
-        let result_i64 = self.invoke_entry(argv)?;
+        let result_i64 = self.invoke_legacy_entry(argv)?;
         Ok(Value::Int(result_i64))
     }
 
@@ -337,6 +573,154 @@ impl Evaluator for CraneliftAotEvaluator {
                 .to_string(),
         })
     }
+}
+
+/// Round `value` up to the next multiple of `align`. `align` is
+/// expected to be a power of two.
+fn align_up(value: u32, align: u32) -> u32 {
+    let rem = value % align;
+    if rem == 0 {
+        value
+    } else {
+        value + (align - rem)
+    }
+}
+
+/// Detect the IR-synthesised `Ret { value: T }` wrapper. Matches when
+/// the schema's name is exactly [`relon_ir::MAIN_RETURN_SCHEMA_NAME`]
+/// and it carries a single field named
+/// [`relon_ir::RETURN_VALUE_FIELD_NAME`].
+fn is_single_value_wrapper(schema: &Schema) -> bool {
+    schema.name == relon_ir::MAIN_RETURN_SCHEMA_NAME
+        && schema.fields.len() == 1
+        && schema.fields[0].name == relon_ir::RETURN_VALUE_FIELD_NAME
+}
+
+/// Convert a [`BufferError`] into a [`RuntimeError::IoError`] with a
+/// `cranelift buffer:` prefix so the diagnostic clearly attributes
+/// the failure to the AOT backend.
+fn buffer_to_runtime_error(e: BufferError) -> RuntimeError {
+    RuntimeError::IoError(format!("cranelift buffer: {e}"))
+}
+
+/// Write `value` into the matching slot of `builder`. Mirrors
+/// `relon_codegen_wasm::write_value_into_builder` but operates on the
+/// cranelift backend's own arena — the layout is identical.
+fn write_value_into_builder(
+    builder: &mut BufferBuilder<'_>,
+    field: &Field,
+    value: &Value,
+    schema_name: &str,
+) -> Result<(), RuntimeError> {
+    match (&field.ty, value) {
+        (TypeRepr::Int, Value::Int(v)) => builder
+            .write_int(&field.name, *v)
+            .map_err(buffer_to_runtime_error),
+        (TypeRepr::Float, Value::Float(v)) => builder
+            .write_float(&field.name, v.into_inner())
+            .map_err(buffer_to_runtime_error),
+        // Accept Int → Float promotion so JSON `1` flows into a Float
+        // slot without forcing the caller to spell `1.0`. Mirrors the
+        // tree-walker's leniency.
+        (TypeRepr::Float, Value::Int(v)) => {
+            let f = *v as f64;
+            builder
+                .write_float(&field.name, f)
+                .map_err(buffer_to_runtime_error)
+        }
+        (TypeRepr::Bool, Value::Bool(v)) => builder
+            .write_bool(&field.name, *v)
+            .map_err(buffer_to_runtime_error),
+        (TypeRepr::Null, Value::Null) => builder
+            .write_null(&field.name)
+            .map_err(buffer_to_runtime_error),
+        (TypeRepr::String, Value::String(s)) => builder
+            .write_string(&field.name, s.as_str())
+            .map_err(buffer_to_runtime_error),
+        _ => Err(RuntimeError::MainArgTypeMismatch {
+            name: field.name.clone(),
+            expected: format!("{:?}", field.ty),
+            found: value.type_name().to_string(),
+            range: TokenRange::default(),
+        })
+        .map_err(|e| {
+            // Attach schema context for clearer diagnostics.
+            if let RuntimeError::MainArgTypeMismatch {
+                name,
+                expected,
+                found,
+                range,
+            } = e
+            {
+                RuntimeError::MainArgTypeMismatch {
+                    name: format!("{schema_name}.{name}"),
+                    expected,
+                    found,
+                    range,
+                }
+            } else {
+                e
+            }
+        }),
+    }
+}
+
+/// Decode a single field via [`BufferReader`]. Scalar coverage only
+/// for stage 2; pointer-indirect leaves (String / List*) surface as
+/// `Unsupported` so the corpus harness routes them to
+/// `CraneliftUnsupported` rather than miscomparing.
+fn read_value_from_reader(
+    reader: &BufferReader<'_>,
+    field: &Field,
+    parent_schema: &Schema,
+) -> Result<Value, RuntimeError> {
+    match &field.ty {
+        TypeRepr::Int => reader
+            .read_int(&field.name)
+            .map(Value::Int)
+            .map_err(buffer_to_runtime_error),
+        TypeRepr::Float => reader
+            .read_float(&field.name)
+            .map(|f| Value::Float(ordered_float_wrap(f)))
+            .map_err(buffer_to_runtime_error),
+        TypeRepr::Bool => reader
+            .read_bool(&field.name)
+            .map(Value::Bool)
+            .map_err(buffer_to_runtime_error),
+        TypeRepr::Null => reader
+            .read_null(&field.name)
+            .map(|()| Value::Null)
+            .map_err(buffer_to_runtime_error),
+        other => Err(RuntimeError::Unsupported {
+            reason: format!(
+                "cranelift-native: cannot decode field `{field}` of type `{ty:?}` in schema `{schema}`",
+                field = field.name,
+                ty = other,
+                schema = parent_schema.name,
+            ),
+        }),
+    }
+}
+
+/// Borrow `ordered_float::OrderedFloat` without the bound's crate
+/// dependency leaking out of the helper — keeps the eval-api surface
+/// of the cranelift backend narrow.
+fn ordered_float_wrap(f: f64) -> ordered_float::OrderedFloat<f64> {
+    ordered_float::OrderedFloat(f)
+}
+
+/// Drain every field of `schema` into a sorted `BTreeMap<String,
+/// Value>`. Mirrors `relon_codegen_wasm::read_record_into_map`.
+fn read_record_into_map(
+    reader: &BufferReader<'_>,
+    schema: &Schema,
+) -> Result<BTreeMap<String, Value>, RuntimeError> {
+    let mut map = BTreeMap::new();
+    for field in &schema.fields {
+        let value = read_value_from_reader(reader, field, schema)?;
+        map.insert(field.name.clone(), value);
+    }
+    Ok(map)
 }
 
 #[cfg(test)]
