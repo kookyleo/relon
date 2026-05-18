@@ -14,7 +14,7 @@ categories = ["command-line-utilities", "config"]
 # `--backend cranelift-aot` (and as the default `--backend auto`'s
 # run_main path). The facade's `cranelift-aot` feature is default-on
 # so we don't have to enable it explicitly here.
-relon = { workspace = true }
+relon = { workspace = true, features = ["cranelift-aot"] }
 relon-parser = { workspace = true }
 relon-evaluator = { workspace = true }
 relon-eval-api = { workspace = true }
