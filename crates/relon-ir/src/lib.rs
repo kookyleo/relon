@@ -30,7 +30,8 @@ pub mod whitespace;
 
 pub use error::LoweringError;
 pub use ir::{
-    ClosureCapture, Func, IrType, Module, NativeImport, Op, TaggedOp, TrapKind, NO_CAPABILITY_BIT,
+    ClosureCapture, EffectClass, Func, IrType, Module, NativeImport, Op, TaggedOp, TrapKind,
+    NO_CAPABILITY_BIT,
 };
 pub use lowering::{
     lower_workspace, lower_workspace_single, LoweredEntry, MAIN_PARAMS_SCHEMA_NAME,
