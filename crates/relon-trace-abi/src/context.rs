@@ -32,18 +32,39 @@
 
 use crate::deopt::{DeoptStateSnapshot, RecoverableWriteRecord};
 
-/// `extern "C"` function pointer type used by every entry of
-/// [`HostHookTable`].
+/// `extern "C"` function pointer type used by `on_trap` /
+/// `save_deopt` entries of [`HostHookTable`].
 ///
 /// The two-argument shape — `(*mut TraceContext, u32)` — is shared
-/// across every hook so the emitter can dispatch through a single
+/// across these hooks so the emitter can dispatch through a single
 /// indirect call instruction without per-hook signature shuffling.
-/// Hooks needing extra args bundle them through the
-/// `TraceContext::pending_recoverable_writes` / `ssa_slots` side
-/// channels (the recorded address + before-value already covers the
-/// recoverable-write hook; the IC lookup hook reads its key out of
-/// a designated slot index passed as the `u32` payload).
+/// Hooks needing extra args (i.e. `resolve_call` /
+/// `inline_cache_lookup`) use the dedicated fn-pointer types below;
+/// see [`TraceResolveCallFn`] / [`TraceIcLookupFn`].
 pub type TraceHookFn = unsafe extern "C" fn(*mut TraceContext, u32);
+
+/// `extern "C"` fn-pointer signature for the `resolve_call` slot.
+///
+/// Matches `__relon_trace_resolve_call(ctx, external_addr_raw) ->
+/// *const u8`. The cranelift emitter resolves the canonical symbol
+/// via `JITBuilder::symbol`, but hosts (and v6-γ M5 partial-resume)
+/// also need to indirect through the table to inspect / log call
+/// resolution without re-deriving the symbol address. Keeping the
+/// signature distinct from [`TraceHookFn`] lets the table populate
+/// the slot without a lossy void-return shim.
+pub type TraceResolveCallFn = unsafe extern "C" fn(*mut TraceContext, u64) -> *const u8;
+
+/// `extern "C"` fn-pointer signature for the `inline_cache_lookup`
+/// slot.
+///
+/// Matches `__relon_trace_inline_cache_lookup(ic_ptr, observed_type)
+/// -> i32`. The IC fast path expects a raw `*mut u8` IC storage
+/// pointer plus the observed-type discriminant; the return code
+/// encodes `CacheResult::{Hit, Miss}` as `i32`. As with
+/// [`TraceResolveCallFn`], the signature is kept distinct from the
+/// uniform `TraceHookFn` shape so the table can carry the real fn
+/// pointer without a shim that throws away the return value.
+pub type TraceIcLookupFn = unsafe extern "C" fn(*mut u8, u8) -> i32;
 
 /// Indirection table of host-side runtime helpers a trace may call
 /// into.
@@ -80,10 +101,16 @@ pub struct HostHookTable {
     pub on_trap: Option<TraceHookFn>,
     /// `__relon_trace_save_deopt` host symbol address.
     pub save_deopt: Option<TraceHookFn>,
-    /// `__relon_trace_resolve_call` host symbol address.
-    pub resolve_call: Option<TraceHookFn>,
+    /// `__relon_trace_resolve_call` host symbol address. v6-γ M5
+    /// widened the signature from the uniform `TraceHookFn` to the
+    /// helper's real shape — `(*mut TraceContext, u64) -> *const u8`
+    /// — so populating the slot doesn't require a lossy void-return
+    /// shim.
+    pub resolve_call: Option<TraceResolveCallFn>,
     /// `__relon_trace_inline_cache_lookup` host symbol address.
-    pub inline_cache_lookup: Option<TraceHookFn>,
+    /// Widened in v6-γ M5 to the helper's real shape — `(*mut u8,
+    /// u8) -> i32` — for the same reason as `resolve_call`.
+    pub inline_cache_lookup: Option<TraceIcLookupFn>,
 }
 
 // SAFETY: `HostHookTable` only holds `Option<extern "C" fn>`
