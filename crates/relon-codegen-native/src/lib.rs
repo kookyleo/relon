@@ -75,6 +75,7 @@ mod codegen;
 pub mod error;
 pub mod evaluator;
 pub mod sandbox;
+pub mod trap_handler;
 
 pub use cache::{deserialize as deserialize_cache, serialize as serialize_cache, CacheEntry};
 pub use error::CraneliftError;

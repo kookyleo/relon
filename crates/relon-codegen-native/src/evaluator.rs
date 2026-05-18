@@ -366,8 +366,13 @@ impl CraneliftAotEvaluator {
 
     /// Internal: invoke the legacy-shape JIT entry with the supplied
     /// i64 args. Uses `catch_unwind` to convert panics raised by
-    /// cranelift trap instructions into typed `RuntimeError`s.
+    /// cranelift trap instructions into typed `RuntimeError`s. The
+    /// stage 5 signal-hook handler (installed process-wide once)
+    /// intercepts SIGSEGV / SIGFPE / SIGILL into the thread-local
+    /// trap slot as a defense-in-depth measure.
     fn invoke_legacy_entry(&self, args: [i64; 4]) -> Result<i64, RuntimeError> {
+        crate::trap_handler::install_global_signal_handler();
+        crate::trap_handler::reset_thread_signal_slot();
         self.sandbox_state.reset_trap();
         let state_ptr: *const SandboxState = Arc::as_ptr(&self.sandbox_state);
         let entry = match self.entry_fn {
@@ -421,6 +426,8 @@ impl CraneliftAotEvaluator {
         scratch_base: u32,
         caps: u64,
     ) -> Result<i32, RuntimeError> {
+        crate::trap_handler::install_global_signal_handler();
+        crate::trap_handler::reset_thread_signal_slot();
         self.sandbox_state.reset_trap();
         // SAFETY: `arena` is borrowed mutably here and stays valid
         // through the JIT call's lifetime (`arena` outlives this
@@ -458,7 +465,23 @@ impl CraneliftAotEvaluator {
 
     /// Post-process a JIT-call result: surface typed traps recorded in
     /// `state.trap_code`, otherwise pass the raw return value through.
+    ///
+    /// Stage 5 Phase C.3: also consults the thread-local signal slot
+    /// populated by `crate::trap_handler` when a SIGSEGV / SIGFPE /
+    /// SIGILL fired during the JIT call. Signal-side traps take
+    /// precedence over the JIT-recorded trap code because the
+    /// signal observation came from the hardware / OS layer which
+    /// our codegen guards can't intercept.
     fn dispatch_post<T>(&self, result: std::thread::Result<T>) -> Result<T, RuntimeError> {
+        // Check the signal-hook slot first — a SIGSEGV during JIT
+        // body execution should surface as a typed trap even if the
+        // JIT-side `cond_trap` sequence never ran.
+        let signal_code = crate::trap_handler::read_thread_signal_slot();
+        if signal_code != 0 {
+            if let Some(kind) = crate::trap_handler::signal_to_trap_kind(signal_code) {
+                return Err(kind.to_runtime_error(self.entry_range));
+            }
+        }
         match result {
             Ok(v) => {
                 let code = self.sandbox_state.trap_code();
