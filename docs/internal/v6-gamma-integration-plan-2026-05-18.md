@@ -372,7 +372,7 @@ pub enum TraceJitDiffOutcome {
 
 | M  | 工作                                              | 估算  | 验证                                                      | Dispatch 建议      |
 | -- | ------------------------------------------------- | :---: | --------------------------------------------------------- | ------------------ |
-| M1 | ABI 调和（Option A：`relon-trace-abi` crate）     | 2-3 天| 既有 234 tests 全绿；emitter / runtime 都 import 新 crate | 单 agent           |
+| M1 | ABI 调和（Option A：`relon-trace-abi` crate）     | 2-3 天| 既有 234 tests 全绿；emitter / runtime 都 import 新 crate | **DONE** (`da7c721`) |
 | M2 | cranelift codegen `HotCounter` inject + `__relon_jump_to_recorder` host helper | 3 天 | mock counter 触发能跳进 recorder；既有 cranelift-aot 测试不退步 | 与 M3 合派         |
 | M3 | `jit_compile_trace_for_fn` pipeline 端到端       | 4 天  | trivial trace（`int + int`）从 record → optimize → emit → JIT install 全链路跑通 | 同上               |
 | M4 | 3 runtime helper register + deopt 路径回 generic | 3 天  | guard 失败时 host dispatcher 能读到 `DeoptStateSnapshot` 并把值写回 generic frame | 单 agent           |
