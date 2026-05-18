@@ -23,6 +23,12 @@ relon-evaluator = { workspace = true }
 relon-codegen-native = { workspace = true }
 relon-ir = { workspace = true }
 relon-eval-api = { workspace = true }
+# v6-γ M5 trace-JIT hot-loop bench: depends on the trace-abi
+# `TraceContext` / `TraceEntryStatus` and the trace-jit `TraceBuffer`
+# types so the bench can drive an installed trace directly through
+# `JITedTraceFn::invoke` without going through `run_main`.
+relon-trace-abi = { workspace = true }
+relon-trace-jit = { workspace = true }
 dhat = { version = "0.3", optional = true }
 
 [dev-dependencies]
@@ -62,3 +68,12 @@ path = "benches/harness_v1.rs"
 name = "cranelift_aot_vs_tree_walk"
 harness = false
 path = "benches/cranelift_aot_vs_tree_walk.rs"
+
+# v6-γ M5: trace-JIT hot-loop micro-bench. Three rows (tree_walk,
+# cranelift_aot, trace_jit_warm) on a million-iter `acc += i` loop.
+# Target for the trace-JIT row: < 5 ns / iter (LuaJIT trace tier).
+# Run via `cargo bench -p relon-bench --bench trace_jit_hot_loop`.
+[[bench]]
+name = "trace_jit_hot_loop"
+harness = false
+path = "benches/trace_jit_hot_loop.rs"
