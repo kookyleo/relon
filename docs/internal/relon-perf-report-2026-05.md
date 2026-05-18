@@ -505,6 +505,70 @@ stage 的核心交付是 vtable indirection + dlopen-exec 真的能跑
 
 ---
 
+## 十、v6-γ M4 (trace JIT recording + deopt machinery)
+
+### 10.1 范围
+
+M4 把 v6-γ trace JIT pipeline 从 "可以手工 build buffer → install" 推进
+到 "IR walker 边走边录 → 自动 install → guard 失败回 generic"。具体落地
+（详见 `docs/internal/v6-gamma-m4-stage-report-2026-05-19.md`）：
+
+1. `record_guard` 同步到 buffer 侧表（修 `EmitError::OrphanGuardOp`）。
+2. `TraceRecordingEvaluator` IR walker 覆盖 Phase-1 hot subset（const +
+   arith + cmp + locals + return on I64）。
+3. `__relon_jump_to_recorder` 真正实现：thread-local
+   `RecordingRegistration` 注册 → walker 边录边跑 → optimizer →
+   emitter → JIT install。
+4. `HostHookTable::save_deopt` 通过 `default_host_hooks()` wire（emitter
+   仍用 extern symbol，table 平行保留供 host 查 deopt 状态）。
+5. `TraceJitState::invoke_with_fallback` deopt protocol：success 返
+   `ctx.result_slot`；GuardFailed → fallback；Aborted → invalidate +
+   fallback。M4 保守版直接 re-run，partial-resume 留 M5。
+6. `diff_test_3way` + `tests/three_way_smoke.rs` 11 cases（tw / aot /
+   trace 三方对比，arith 路 100 % AllAgree）。
+
+### 10.2 v6-γ M4 Gate
+
+| Gate | 命令 | 结果 |
+|---|---|---|
+| build | `cargo build --workspace` | ✓ |
+| test | `cargo test --workspace` | 1693 passed / 0 failed |
+| clippy | `cargo clippy --workspace --all-targets -- -D warnings` | ✓ |
+| fmt | `cargo fmt --all -- --check` | ✓ |
+| wasm32 | `cargo build --target wasm32-unknown-unknown -p relon-wasm` | ✓ |
+
+1654 (M2+M3) → 1693 (M4) = +39 tests。新增覆盖：
+
+- `relon-trace-recorder/tests/orphan_guard_fixed.rs` —— 7 case，确认
+  Add/Sub/Mul/Div 的 ArithOverflow guard 都进 `buf.guards` 表。
+- `relon-codegen-native/src/trace_recording.rs` —— 8 unit test 覆盖
+  const / arith / cmp / local / let / return + div-by-zero + float-
+  arith abort。
+- `relon-test-harness/tests/trace_jit_smoke.rs` —— 8 个新 case
+  （registry round-trip / `invoke_with_fallback` 成功 / no-trace
+  fallback / invalidate / save_deopt slot populated / abort on
+  unsupported op / install via real helper / no-registration noop）。
+- `relon-test-harness/src/three_way.rs` —— 5 unit test。
+- `relon-test-harness/tests/three_way_smoke.rs` —— 11 集成 case，三方
+  全 `AllAgree`。
+
+### 10.3 性能数字
+
+M4 不涉及 bench。HotCounter prologue 的 ~3-5 ns / warm-invoke 数字
+M2+M3 已记录；trace fn 装上后 hot-path 走 trace 而非 generic 的 bench
+延后到 M5（需要长跑 entry 才有意义）。
+
+### 10.4 遗留 todo（M5）
+
+- 全 corpus 52-case 三方 differential 跑通。
+- Partial-resume from `snapshot.external_pc`。
+- 热循环 10^6 iter < 5 ns / iter bench。
+- Prologue 真带 args ptr（今天传 null）。
+- `TraceHookFn` 加宽版以让 `resolve_call` / `inline_cache_lookup`
+  也能进 host hooks table。
+
+---
+
 **Author**: Relon perf 直路 v5-γ stage 2 implementer
 **Date**: 2026-05-19
 **License**: Apache-2
