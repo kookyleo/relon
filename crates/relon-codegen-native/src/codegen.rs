@@ -64,6 +64,143 @@ pub struct CompiledModule {
     pub entry_range: relon_parser::TokenRange,
     /// Calling convention shape the host trampoline must match.
     pub entry_shape: EntryShape,
+    /// Const-data bytes the entry references through `ConstString` /
+    /// `ConstList*`. The host trampoline copies these into the arena
+    /// prefix before each invocation; the cranelift code refers to
+    /// them through hardcoded `[len:u32 LE][payload]` record
+    /// offsets emitted at compile time.
+    pub const_data: Vec<u8>,
+}
+
+/// Per-module const-pool layout. Maps each IR-level `idx` referenced
+/// by `Op::ConstString` / `Op::ConstList*` to its byte offset inside
+/// the const-data blob shipped on the [`CompiledModule`].
+#[derive(Debug, Default, Clone)]
+struct ConstPool {
+    /// String pool: `idx -> byte offset within `bytes`.
+    string_offsets: HashMap<u32, u32>,
+    /// List<Int> pool.
+    list_int_offsets: HashMap<u32, u32>,
+    /// List<Float> pool.
+    list_float_offsets: HashMap<u32, u32>,
+    /// List<Bool> pool.
+    list_bool_offsets: HashMap<u32, u32>,
+    /// Materialised bytes in record order. Cranelift code emits
+    /// `i32.const <offset>` so the value at runtime is the buffer-
+    /// relative address.
+    bytes: Vec<u8>,
+}
+
+impl ConstPool {
+    /// Build the pool from a scan of the entry's IR body. Each unique
+    /// `idx` ends up with a `[len:u32 LE][payload]` record laid out
+    /// in declaration order, aligned to 8 to match the wasm side.
+    fn from_module(module: &IrModule) -> Result<Self, CraneliftError> {
+        let mut pool = ConstPool::default();
+        for func in &module.funcs {
+            pool.collect_body(&func.body)?;
+        }
+        Ok(pool)
+    }
+
+    fn collect_body(&mut self, body: &[TaggedOp]) -> Result<(), CraneliftError> {
+        for tagged in body {
+            self.collect_op(&tagged.op)?;
+        }
+        Ok(())
+    }
+
+    fn collect_op(&mut self, op: &Op) -> Result<(), CraneliftError> {
+        match op {
+            Op::ConstString { idx, value } => {
+                if self.string_offsets.contains_key(idx) {
+                    return Ok(());
+                }
+                self.align_to(4);
+                let off = u32::try_from(self.bytes.len())
+                    .map_err(|_| CraneliftError::Codegen("const pool exceeds u32 range".into()))?;
+                let len = u32::try_from(value.len()).map_err(|_| {
+                    CraneliftError::Codegen("ConstString length exceeds u32 range".into())
+                })?;
+                self.bytes.extend_from_slice(&len.to_le_bytes());
+                self.bytes.extend_from_slice(value.as_bytes());
+                self.string_offsets.insert(*idx, off);
+            }
+            Op::ConstListInt { idx, elements } => {
+                if self.list_int_offsets.contains_key(idx) {
+                    return Ok(());
+                }
+                self.align_to(8);
+                let off = u32::try_from(self.bytes.len())
+                    .map_err(|_| CraneliftError::Codegen("const pool exceeds u32 range".into()))?;
+                let len = u32::try_from(elements.len()).map_err(|_| {
+                    CraneliftError::Codegen("ConstListInt length exceeds u32 range".into())
+                })?;
+                self.bytes.extend_from_slice(&len.to_le_bytes());
+                self.bytes.extend_from_slice(&[0u8; 4]); // pad to 8
+                for e in elements {
+                    self.bytes.extend_from_slice(&e.to_le_bytes());
+                }
+                self.list_int_offsets.insert(*idx, off);
+            }
+            Op::ConstListFloat { idx, elements } => {
+                if self.list_float_offsets.contains_key(idx) {
+                    return Ok(());
+                }
+                self.align_to(8);
+                let off = u32::try_from(self.bytes.len())
+                    .map_err(|_| CraneliftError::Codegen("const pool exceeds u32 range".into()))?;
+                let len = u32::try_from(elements.len()).map_err(|_| {
+                    CraneliftError::Codegen("ConstListFloat length exceeds u32 range".into())
+                })?;
+                self.bytes.extend_from_slice(&len.to_le_bytes());
+                self.bytes.extend_from_slice(&[0u8; 4]); // pad to 8
+                for e in elements {
+                    self.bytes.extend_from_slice(&e.to_le_bytes());
+                }
+                self.list_float_offsets.insert(*idx, off);
+            }
+            Op::ConstListBool { idx, elements } => {
+                if self.list_bool_offsets.contains_key(idx) {
+                    return Ok(());
+                }
+                self.align_to(4);
+                let off = u32::try_from(self.bytes.len())
+                    .map_err(|_| CraneliftError::Codegen("const pool exceeds u32 range".into()))?;
+                let len = u32::try_from(elements.len()).map_err(|_| {
+                    CraneliftError::Codegen("ConstListBool length exceeds u32 range".into())
+                })?;
+                self.bytes.extend_from_slice(&len.to_le_bytes());
+                for e in elements {
+                    self.bytes.push(if *e { 1 } else { 0 });
+                }
+                self.list_bool_offsets.insert(*idx, off);
+            }
+            // Recurse into structured bodies so nested ConstStrings
+            // (e.g. inside If arms or Block / Loop bodies) get
+            // picked up too.
+            Op::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                self.collect_body(then_body)?;
+                self.collect_body(else_body)?;
+            }
+            Op::Block { body, .. } | Op::Loop { body, .. } => {
+                self.collect_body(body)?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn align_to(&mut self, align: usize) {
+        let rem = self.bytes.len() % align;
+        if rem != 0 {
+            self.bytes.resize(self.bytes.len() + (align - rem), 0);
+        }
+    }
 }
 
 /// How the host trampoline talks to the JIT entry.
@@ -145,6 +282,15 @@ pub fn compile_module(
         .entry_func_index
         .ok_or_else(|| CraneliftError::Codegen("module has no entry function".into()))?;
     let entry = &ir.funcs[entry_idx];
+
+    // Scan the entry body for ConstString / ConstList* ops and build
+    // the per-module const-data pool. We pass the resolved
+    // `idx -> offset` map into the Codegen so `ConstString { idx }`
+    // can lower to a plain `iconst(I32, offset)`. The const-data
+    // bytes themselves ride along on `CompiledModule.const_data` —
+    // the host trampoline copies them into the arena prefix before
+    // each invocation.
+    let const_pool = ConstPool::from_module(ir)?;
 
     // Detect the entry shape. v5-β-2 supports two:
     //   - Legacy `(I64, ..., I64) -> I64` — direct-IR test path.
@@ -341,6 +487,7 @@ pub fn compile_module(
             trap_block: Some(trap_block),
             label_stack: Vec::new(),
             inline_frames: Vec::new(),
+            const_pool: &const_pool,
         };
 
         codegen.emit_prologue();
@@ -381,6 +528,7 @@ pub fn compile_module(
         entry_arity: entry.params.len(),
         entry_range: entry.range,
         entry_shape,
+        const_data: const_pool.bytes,
     })
 }
 
@@ -498,6 +646,12 @@ struct Codegen<'a, 'b> {
     /// against the call site rather than the entry function. See
     /// [`InlineFrame`] for fields.
     inline_frames: Vec<InlineFrame>,
+    /// Pre-computed offset table for const-data records the entry
+    /// references through `Op::ConstString` / `Op::ConstList*`.
+    /// Cranelift emits `iconst(I32, offset)` for each reference; the
+    /// const-data bytes live in the host arena's prefix (the host
+    /// trampoline copies them in before each call).
+    const_pool: &'a ConstPool,
 }
 
 /// One inline-frame entry for a stdlib body lowered through
@@ -723,6 +877,43 @@ impl<'a, 'b> Codegen<'a, 'b> {
         self.builder
             .ins()
             .store(MemFlags::trusted(), store_val, addr, 0);
+        Ok(())
+    }
+
+    /// Lower `Op::ReadStringLen`. Pops an i32 arena-relative pointer
+    /// (a String or List* record's base), loads the leading 4-byte
+    /// length prefix, and pushes it widened to i64. The bounds check
+    /// verifies the 4 bytes fit inside the arena.
+    fn emit_read_string_len(&mut self) -> Result<(), CraneliftError> {
+        let ptr_i32 = self.pop()?;
+        // Widen ptr to host pointer width.
+        let ptr = self.builder.ins().uextend(self.pointer_ty, ptr_i32);
+        let arena_base = self.builder.ins().load(
+            self.pointer_ty,
+            MemFlags::trusted(),
+            self.state_ptr,
+            STATE_OFFSET_ARENA_BASE,
+        );
+        let arena_len_i32 = self.builder.ins().load(
+            I32,
+            MemFlags::trusted(),
+            self.state_ptr,
+            STATE_OFFSET_ARENA_LEN,
+        );
+        // Bounds: ptr + 4 <= arena_len.
+        if self.sandbox.bounds_check {
+            let four = self.builder.ins().iconst(I32, 4);
+            let end_i32 = self.builder.ins().iadd(ptr_i32, four);
+            let cmp = self
+                .builder
+                .ins()
+                .icmp(IntCC::UnsignedGreaterThan, end_i32, arena_len_i32);
+            self.cond_trap(cmp, TrapKind::BoundsViolation);
+        }
+        let abs = self.builder.ins().iadd(arena_base, ptr);
+        let len_i32 = self.builder.ins().load(I32, MemFlags::trusted(), abs, 0);
+        let len_i64 = self.builder.ins().uextend(I64, len_i32);
+        self.push(len_i64);
         Ok(())
     }
 
@@ -1091,6 +1282,73 @@ impl<'a, 'b> Codegen<'a, 'b> {
                 param_tys,
                 ret_ty,
             } => self.emit_call_stdlib(*fn_index, *arg_count, param_tys, *ret_ty)?,
+
+            // Const-data records: each `Op::ConstString` / `Op::ConstList*`
+            // pushes the arena-relative i32 offset the host placed the
+            // record at. The pool was scanned + laid out at compile
+            // time; here we just resolve the `idx` to its offset and
+            // push a constant.
+            Op::ConstString { idx, .. } => {
+                let off = self
+                    .const_pool
+                    .string_offsets
+                    .get(idx)
+                    .copied()
+                    .ok_or_else(|| {
+                        CraneliftError::Codegen(format!(
+                            "ConstString idx {idx} not in pre-computed pool"
+                        ))
+                    })?;
+                let v = self.builder.ins().iconst(I32, i64::from(off));
+                self.push(v);
+            }
+            Op::ConstListInt { idx, .. } => {
+                let off = self
+                    .const_pool
+                    .list_int_offsets
+                    .get(idx)
+                    .copied()
+                    .ok_or_else(|| {
+                        CraneliftError::Codegen(format!(
+                            "ConstListInt idx {idx} not in pre-computed pool"
+                        ))
+                    })?;
+                let v = self.builder.ins().iconst(I32, i64::from(off));
+                self.push(v);
+            }
+            Op::ConstListFloat { idx, .. } => {
+                let off = self
+                    .const_pool
+                    .list_float_offsets
+                    .get(idx)
+                    .copied()
+                    .ok_or_else(|| {
+                        CraneliftError::Codegen(format!(
+                            "ConstListFloat idx {idx} not in pre-computed pool"
+                        ))
+                    })?;
+                let v = self.builder.ins().iconst(I32, i64::from(off));
+                self.push(v);
+            }
+            Op::ConstListBool { idx, .. } => {
+                let off = self
+                    .const_pool
+                    .list_bool_offsets
+                    .get(idx)
+                    .copied()
+                    .ok_or_else(|| {
+                        CraneliftError::Codegen(format!(
+                            "ConstListBool idx {idx} not in pre-computed pool"
+                        ))
+                    })?;
+                let v = self.builder.ins().iconst(I32, i64::from(off));
+                self.push(v);
+            }
+
+            // Pop an i32 arena-relative pointer, push the leading
+            // `[len: u32 LE]` widened to i64. Mirrors the wasm side's
+            // `i32.load offset=0 align=2; i64.extend_i32_u` pair.
+            Op::ReadStringLen => self.emit_read_string_len()?,
             Op::If {
                 result_ty,
                 then_body,

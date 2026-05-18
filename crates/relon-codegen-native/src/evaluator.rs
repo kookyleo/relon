@@ -98,6 +98,12 @@ pub struct CraneliftAotEvaluator {
     /// Schema descriptors for the buffer-protocol path. `None` for
     /// legacy direct-IR modules.
     buffer_schema: Option<BufferSchema>,
+    /// Const-data bytes (string / list literals) the entry references
+    /// via fixed arena-relative offsets. Empty when the entry uses no
+    /// constants. Copied into the arena prefix at each call so the
+    /// cranelift code can dereference `ConstString { idx }` offsets
+    /// directly without a runtime lookup.
+    const_data: Vec<u8>,
 }
 
 // SAFETY: The JIT-emitted code is reentrant and the `SandboxState`
@@ -202,6 +208,7 @@ impl CraneliftAotEvaluator {
             entry_arity,
             entry_range,
             entry_shape,
+            const_data,
         } = compiled;
 
         // Cross-check: buffer schema metadata must agree with the IR
@@ -262,6 +269,7 @@ impl CraneliftAotEvaluator {
             entry_range,
             sandbox_state,
             buffer_schema,
+            const_data,
         })
     }
 
@@ -414,23 +422,29 @@ impl CraneliftAotEvaluator {
         }
         let in_bytes = builder.finish();
 
-        // 2. Lay out the arena: [in_bytes | padding | out_buf]. Size
-        // out_buf at the schema's root size plus a 1 KiB cushion for
-        // potential tail records (substring / concat etc. land here
-        // once stage 2.5 widens StoreField).
+        // 2. Lay out the arena: [const_data | pad | in_buf | pad |
+        // out_buf]. The const-data section holds string / list
+        // literals at compile-time-known offsets; cranelift code
+        // dereferences them through fixed `iconst(I32, offset)`
+        // values. The host copies the bytes verbatim at the prefix.
         let in_len = in_bytes.len() as u32;
         let out_cap_min = bs.return_layout.root_size as u32;
         let out_cap_cushion: u32 = 1024;
         let out_cap = align_up(out_cap_min.max(64) + out_cap_cushion, 8);
 
-        let in_ptr: u32 = 0;
-        let pad_to_8 = align_up(in_len, 8);
-        let out_ptr = pad_to_8;
+        let const_data_len = u32::try_from(self.const_data.len()).map_err(|_| {
+            RuntimeError::IoError("cranelift const-data section exceeds u32 range".into())
+        })?;
+        let in_ptr = align_up(const_data_len, 8);
+        let out_ptr = align_up(in_ptr + in_len, 8);
         let arena_size = out_ptr
             .checked_add(out_cap)
             .ok_or_else(|| RuntimeError::IoError("cranelift arena size overflow".into()))?;
 
         let mut arena = vec![0u8; arena_size as usize];
+        if !self.const_data.is_empty() {
+            arena[..self.const_data.len()].copy_from_slice(&self.const_data);
+        }
         arena[in_ptr as usize..in_ptr as usize + in_bytes.len()].copy_from_slice(&in_bytes);
 
         // 3. Invoke the JIT.
