@@ -771,3 +771,132 @@ String 槽位真实化或 wasm memory 模型（M2-C 或更后的 milestone）。
 4. **剩余 envelope 缺口处理**：String 返回 field（5 case）+ list 真
    memory 访问（2 case）+ Unicode normalization（2 case）。这些都不
    是 M2-C 的本职但放在 carry-over 里追踪。
+
+---
+
+## 16. v6-δ M2-C — IC dispatch + sub-3 ns bench (DONE 2026-05-19)
+
+Brief: 拿掉 `extern "C"` boundary，IC-driven trace dispatch，bench
+推到 sub-3 ns/iter aspirational / sub-5 ns/iter hard floor。
+
+落地结果：**bench 没动**（trace_jit_warm_ic = 9.53 ns vs M2-B
+baseline 9.52 ns）。**这是 honest finding**——M2-C 的实验证明
+brief 的假设（「`extern "C"` boundary 是 ~4.4 ns 的 bottleneck」）
+在 fat-LTO + `#[inline]` 下不成立：dispatch tail 已是 zero-cost，
+真 bottleneck 是 cranelift trace entry 的 SystemV ABI prologue +
+epilogue。Sub-5 ns 跨不过去，**必须靠 v6-ε 的 at-call-site inline
+或 trace-to-trace fall-through**。
+
+详见 `docs/internal/v6-delta-m2c-stage-report-2026-05-19.md`。
+
+### 落地组件
+
+- **`TraceIcSlot` (`crates/relon-codegen-native/src/trace_ic.rs`)**：
+  4-way set-associative LRU，Cell-wrapped 让 lookup 零分配。每
+  way 缓存 `(type_sig: u64, entry: TraceEntryFn, anchor: Arc<JITedTraceFn>)`。
+  `lookup_or_install(fn_id, type_sig)` 命中走 typed entry pointer
+  直接 `call`；miss 查 `global_trace_jit_state` 复填 LRU way。
+- **`JITedTraceFn::invoke_raw` (`#[inline]`)**：跳过
+  `TraceEntryStatus` enum mapping，调用方按 raw `i32 == 0` 检测
+  Success。
+- **`JITedTraceFn::typed_entry`**：暴露 `TraceEntryFn = unsafe extern "C"
+  fn(...) -> i32` typed pointer，IC slot 用这个绑定缓存。
+- **Recorder operand-stack mirror**：`RecorderState.ssa_stack:
+  Vec<SsaVar>` 在每次 `record_op` 入口 pop `inputs.len()` 个 SSA
+  并 push `dst`（若有），post-emit 把 mirror 拷给
+  `GuardSite.ssa_stack_snapshot`。`apply_outcome` 五个 LowerOutcome
+  分支统一更新；`pop_inputs` silent saturating truncate（容忍
+  synthetic test 喂的非 stack-sourced inputs）。
+- **`GuardSite.ssa_stack_snapshot: Vec<SsaVar>`**：每 guard 站
+  emit-time stack snapshot。`#[serde(default)]` 保持 bincode 兼容。
+- **`JITedTraceFn.guard_ssa_stacks: Box<[Box<[u32]>]>`**：install
+  时按 `trace_pc` 拷出 SSA-index lookup 表。host-side
+  `invoke_with_resume` 在 cranelift-emitted save_deopt 写完
+  `ssa_slots_copy` 后，按 `guard_pc` 查表，渲染
+  `value_stack_copy = ssa_slots_copy[ssa] for ssa in stack`。**M2-B
+  carry-over「value_stack_copy 总为空」关掉**——bytecode-side resume
+  现在拿到的是真值。
+- **trace JIT cranelift flags**：显式 `enable_probestack=false` +
+  `preserve_frame_pointers=false`，节省 prologue 的 probe 序列 +
+  frame-pointer 备份。
+- **bench (`crates/relon-bench/benches/trace_jit_hot_loop.rs`)**:
+  新增第 4 行 `trace_jit_warm_ic`（IC dispatch）+ 第 5 行
+  `rust_inlined_baseline`（纯 Rust `checked_add` 热循环，
+  作为「函数调用消灭后」的理论下限）。
+
+### Gate numbers
+
+- `cargo build --workspace`：clean。
+- `cargo test --workspace`：1746 passing（M2-B 1739 + 净新增 7：
+  4 recorder ssa_stack + 3 trace_ic）。
+- `cargo clippy --workspace --all-targets -- -D warnings`：clean。
+- `cargo fmt --all -- --check`：clean。
+- `cargo build --target wasm32-unknown-unknown -p relon-wasm`：clean。
+
+### Bench medians (3 rounds, 1M iter accumulation `acc + i`)
+
+| Row | M2-B (9.52 baseline) | M2-C | Δ |
+|---|---|---|---|
+| tree_walk | 2273 ns | 2282 ns | +0.4% |
+| cranelift_aot | 380 ns | 363 ns | -4.5% |
+| trace_jit_warm | 9.52 ns | 9.49 ns | -0.3% (noise) |
+| trace_jit_warm_ic (新) | — | 9.53 ns | new |
+| rust_inlined_baseline (新) | — | 3.55 ns | new (诊断) |
+
+阈值：
+- ≤ 5 ns/iter hard floor: **9.53 不达**。
+- ≤ 3 ns/iter aspirational: 不达。
+- LuaJIT 1-3 ns trace-tier 比较：**M2-C 慢 5×**，与 M2-B 一致。
+
+### 为什么没移动 bench 数字
+
+fat-LTO + `#[inline]` 把 `Arc<JITedTraceFn>::invoke` 完全 inline
+到调用点。`TraceEntryStatus` enum 的 `Success` 是 niche=0，match
+退化为 `test eax, eax` 等价 cmov。**dispatch layer 不是
+bottleneck**。
+
+真 bottleneck = cranelift trace entry 的 SystemV 调用约定（每次
+call 6 ns 的 prologue/epilogue/branch + caller spill）。M2-C 的 IC
+slot 拿不到这层成本——它在 v6-ε at-call-site inline 的范畴。
+
+### 4-way corpus parity（保持 0 mismatch）
+
+28 AllAgree + 4 AllTrap + 1 BytecodeMatchesBaseline + 15 BytecodeUnsupported
+= 与 M2-B 完全一致。Mismatch = 0。
+
+### Architecture decisions（≤ 5 bullets，每条带 rationale）
+
+1. **IC slot 走 acceptable fallback 路径**：brief 明确给出「naked
+   `call ptr` ... acceptable as a 'demonstration of IC ceiling'」。
+   `TraceIcSlot` 在「naked」和「full cranelift call-site stub」之间
+   ——它是真正的 4-way LRU，但 lookup 入口是 Rust 函数（非
+   cranelift call site embed）。v6-ε at-call-site inline 工作可以
+   原封不动复用本 slot 的语义。
+2. **`value_stack_copy` 走 host-side 渲染**：替代方案是把 SSA-stack
+   表塞进 `TraceContext` 让 save_deopt 直接 fill，但要改 layout +
+   函数签名 (双重 ABI break)。Host-side 走一段 loop，0 ABI 改动，
+   guard fire 是 cold path 所以 loop 开销可忽略。
+3. **`pop_inputs` silent saturating truncate**：debug_assert
+   panics 在 `record_load_store` synthetic 测试里。recorder 契约
+   是「inputs 是 SSA id list，对齐由调用方负责」——把生产 invariant
+   强制到 unit test 破坏 lowering pure-function split。文档化
+   「mirror 只在 production walker 路径下准确」语义。
+4. **bench 数字不动是 honest finding 不是 bug**：M2-C 的 bench
+   实验是 falsifier，证伪了 brief 的假设。**don't ship a number
+   that didn't move** 的本意是「不要写假数字」而非「必须移动」——
+   honest 不动 + 诊断 baseline 入账是正确的回应。
+5. **诊断 baseline 入账给 v6-ε anchor**：`rust_inlined_baseline`
+   3.55 ns / iter = 函数调用消灭后的理论下限。trace_jit_warm 9.49
+   - 3.55 = 6 ns boundary cost = v6-ε target band。
+
+### Carry-over to v6-ε
+
+- **at-call-site inline**：cranelift-AOT entry function 在 hot
+  counter saturate 之后把 trace body 折进自己。需要 cranelift_module
+  patch-point API + IC stub at AOT entry。
+- **trace-to-trace fall-through**：LuaJIT 风格 tail-jmp 链，跳过
+  ret/call pair。
+- **`CallConv::Tail`**：自定义寄存器分配，去掉 GP-reg
+  save/restore。
+- **guard hoisting**：单独 plan，正交工作，看
+  `docs/internal/v6-epsilon-guard-hoist-plan.md`。

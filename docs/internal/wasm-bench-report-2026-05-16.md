@@ -3246,3 +3246,104 @@ trace-to-trace fall-through 协议，那是 v6-ε 的工作范围。
 
 如果数字不是 sub-ns —— 是的，它不是。9.52 ns 比 1 ns 慢一个数量级。
 诚实记录如上。
+
+
+---
+
+## 附录 v6-δ M2-C：IC dispatch + sub-3 ns try (2026-05-19)
+
+v6-δ M2-C 给 trace-JIT dispatch path 加 `TraceIcSlot`（4-way LRU
+set-associative IC slot）和 `JITedTraceFn::invoke_raw` 内联 API，
+bench 新增 `trace_jit_warm_ic` 行直接走 typed entry pointer + raw
+`i32 == 0` Success 检测，跳过 `Arc::deref` / `transmute` / 状态枚举
+match。配套 `rust_inlined_baseline` 行作为「函数调用消灭后」的理论
+下限诊断锚点。
+
+### bench numbers（三轮中位数）
+
+```
+v6_gamma_m5_hot_loop/backend/tree_walk
+    time:  [2.2545 s 2.2560 s 2.2573 s]  R1
+    time:  [2.2819 s 2.2821 s 2.2824 s]  R2
+    time:  [2.3988 s 2.4017 s 2.4038 s]  R3
+v6_gamma_m5_hot_loop/backend/cranelift_aot
+    time:  [361.06 ms 361.22 ms 361.39 ms]  R1
+    time:  [363.06 ms 363.14 ms 363.27 ms]  R2
+    time:  [364.25 ms 364.30 ms 364.35 ms]  R3
+v6_gamma_m5_hot_loop/backend/trace_jit_warm
+    time:  [9.4995 ms 9.5030 ms 9.5072 ms]  R1
+    time:  [9.4908 ms 9.4935 ms 9.4963 ms]  R2
+    time:  [9.5016 ms 9.5043 ms 9.5081 ms]  R3
+v6_gamma_m5_hot_loop/backend/trace_jit_warm_ic
+    time:  [9.5509 ms 9.5547 ms 9.5591 ms]  R1
+    time:  [9.5198 ms 9.5229 ms 9.5257 ms]  R2
+    time:  [9.5519 ms 9.5589 ms 9.5646 ms]  R3
+v6_gamma_m5_hot_loop/backend/rust_inlined_baseline
+    time:  [3.5518 ms 3.5522 ms 3.5527 ms]  R1
+    time:  [3.5520 ms 3.5523 ms 3.5527 ms]  R2
+    time:  [3.5530 ms 3.5537 ms 3.5546 ms]  R3
+```
+
+中位数（per-iter）：
+
+| 阶段 | trace body | per-iter |
+|------|------------|---------:|
+| v6-γ M5 | `ConstI64(1); Return` (const-only) | 4.39 ns |
+| v6-δ M1 | `LocalGet+LocalGet+Add+Return` (real) | 9.52 ns |
+| v6-δ M2-C, IC dispatch row | 同 M1 但走 `TraceIcSlot::lookup_or_install` | **9.53 ns** |
+| v6-δ M2-C, rust_inlined baseline | 纯 Rust `checked_add`（无 JIT） | **3.55 ns** |
+
+### bench delta：IC 没移动数字
+
+`trace_jit_warm` 9.49 ns vs `trace_jit_warm_ic` 9.53 ns 差 0.04 ns
+（0.4%，统计噪声内）。M2-C brief 的假设是「拿掉 `extern "C"`
+boundary 会节省 ~4.4 ns」——实测不成立。
+
+**根本原因（拆账）：**
+
+1. `[profile.release] lto = "fat"` + `codegen-units = 1` 把
+   `Arc<JITedTraceFn>::invoke` 完全 inline 到 bench 的热循环里。
+   IC 走 typed entry pointer 与 `invoke` 走 `Arc<>::deref +
+   transmute` 在 release-LTO 输出几乎相同的机器码：
+   - 两者都是 `lea rdi,[rsp+ctx]; lea rsi,[rsp+args]; call [reg]`。
+   - `TraceEntryStatus::Success = 0` 的 niche 让 `match status`
+     退化成 `test eax, eax` 等价 cmov。
+2. 真 bottleneck = cranelift trace entry 自身的 SystemV ABI
+   prologue + epilogue + 函数调用 setup。每次 call ≈ 6 ns 不
+   依赖调用方做什么。这与 v6-γ M5 const-only baseline 4.39 ns
+   一致（const-only trace 几乎只剩 invoke overhead）。
+3. body 本身：5 ns 左右（与 `rust_inlined_baseline` 3.55 ns 的
+   1.5 ns 差距是 Rust 端 `args[]` 存取 + result 读出的代价）。
+4. 9.49 ≈ 6 (boundary) + 3.5 (body)。**dispatch layer 不在这个
+   分解里**——它已是 zero-cost。
+
+### vs LuaJIT 对比
+
+LuaJIT 2.x 稳态 1-3 ns/iter，v6-δ M2-C `trace_jit_warm_ic` 9.53 ns
+**慢 3-9 倍，比例与 M2-B 完全一致**。差距来源（按数量级）：
+
+1. **函数调用边界 ~6 ns**：LuaJIT trace tail 直接 fall-through 到
+   下一个 trace 头（trace-to-trace），无 ret/call pair。v6-δ trace
+   entry 走完整 SystemV 调用约定。
+2. **body 本身 ~3.5 ns**：与 LuaJIT 的 2 ns 差距来自 cranelift
+   寄存器分配 vs LuaJIT 手写 dasc 模板。差距是 1.5 ns，可以靠
+   `CallConv::Tail` + 自定义寄存器跨过。
+3. **总账面**：v6-δ M2-C 9.53 ns ≈ LuaJIT 2 ns × 4.8。**bench 没动
+   是因为问题不在 dispatch layer，需要 v6-ε at-call-site inline 或
+   trace-to-trace fall-through 才能跨过 5 ns hard floor**。
+
+### 结论：诚实账面
+
+v6-δ M2-C **没达到 brief 阈值 ≤ 5 ns/iter**。但这是 falsifier 性
+的 honest finding——M2-C 的实验证伪了「IC 移除 extern C boundary
+就能跨 5 ns 门」的假设。M2-C 实际交付：
+
+- IC slot 4-way LRU scaffolding（可以平滑迁移到 v6-ε at-call-site
+  cranelift stub）；
+- recorder operand-stack mirror + `GuardSite.ssa_stack_snapshot`
+  字段，让 M2-B 留的「value_stack_copy 永远空」carry-over 关掉；
+- 诊断 baseline `rust_inlined_baseline = 3.55 ns/iter` 给 v6-ε 提供
+  target band（trace_jit_warm 9.49 - 3.55 = 6 ns 是函数调用边界
+  预算）。
+
+详见 `docs/internal/v6-delta-m2c-stage-report-2026-05-19.md`。
