@@ -192,6 +192,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "bstr"
+version = "1.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "63044e1ae8e69f3b5a92c736ca6269b8d12fa7efe39bf34ddb06d102cf0e2cab"
+dependencies = [
+ "memchr",
+ "serde",
+]
+
+[[package]]
 name = "bumpalo"
 version = "3.20.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -519,7 +529,7 @@ dependencies = [
  "clap",
  "criterion-plot",
  "is-terminal",
- "itertools",
+ "itertools 0.10.5",
  "num-traits",
  "once_cell",
  "oorandom",
@@ -538,7 +548,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6b50826342786a51a89e2da3a28f1c32b06e387201bc2d19791f622c673706b1"
 dependencies = [
  "cast",
- "itertools",
+ "itertools 0.10.5",
 ]
 
 [[package]]
@@ -615,6 +625,12 @@ name = "either"
 version = "1.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "48c757948c5ede0e46177b7add2e67155f70e33c07fea8284df6576da70b3719"
+
+[[package]]
+name = "env_home"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c7f84e12ccf0a7ddc17a6c41c93326024c42920d7ee630d04950e6926645c0fe"
 
 [[package]]
 name = "equivalent"
@@ -1000,6 +1016,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "itertools"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "413ee7dfc52ee1a4949ceeb7dbc8a33f2d6c088194d9f922fb8318faf1f01186"
+dependencies = [
+ "either",
+]
+
+[[package]]
 name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1095,6 +1120,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "lua-src"
+version = "547.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1edaf29e3517b49b8b746701e5648ccb5785cde1c119062cbabbc5d5cd115e42"
+dependencies = [
+ "cc",
+]
+
+[[package]]
+name = "luajit-src"
+version = "210.5.12+a4f56a4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b3a8e7962a5368d5f264d045a5a255e90f9aa3fc1941ae15a8d2940d42cac671"
+dependencies = [
+ "cc",
+ "which",
+]
+
+[[package]]
 name = "mach2"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1162,6 +1206,50 @@ name = "mintex"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c505b3e17ed6b70a7ed2e67fbb2c560ee327353556120d6e72f5232b6880d536"
+
+[[package]]
+name = "mlua"
+version = "0.10.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c1f5f8fbebc7db5f671671134b9321c4b9aa9adeafccfd9a8c020ae45c6a35d0"
+dependencies = [
+ "bstr",
+ "either",
+ "mlua-sys",
+ "mlua_derive",
+ "num-traits",
+ "parking_lot",
+ "rustc-hash 2.1.2",
+ "rustversion",
+]
+
+[[package]]
+name = "mlua-sys"
+version = "0.6.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "380c1f7e2099cafcf40e51d3a9f20a346977587aa4d012eae1f043149a728a93"
+dependencies = [
+ "cc",
+ "cfg-if",
+ "lua-src",
+ "luajit-src",
+ "pkg-config",
+]
+
+[[package]]
+name = "mlua_derive"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "870d71c172fcf491c6b5fb4c04160619a2ee3e5a42a1402269c66bcbf1dd4deb"
+dependencies = [
+ "itertools 0.13.0",
+ "once_cell",
+ "proc-macro-error2",
+ "proc-macro2",
+ "quote",
+ "regex",
+ "syn",
+]
 
 [[package]]
 name = "num-traits"
@@ -1264,6 +1352,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
+name = "pkg-config"
+version = "0.3.33"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
+
+[[package]]
 name = "potential_utf"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1288,6 +1382,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "479ca8adacdd7ce8f1fb39ce9ecccbfe93a3f1344b3d0d97f20bc0196208f62b"
 dependencies = [
  "proc-macro2",
+ "syn",
+]
+
+[[package]]
+name = "proc-macro-error-attr2"
+version = "2.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "96de42df36bb9bba5542fe9f1a054b8cc87e172759a1868aa05c1f3acc89dfc5"
+dependencies = [
+ "proc-macro2",
+ "quote",
+]
+
+[[package]]
+name = "proc-macro-error2"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "11ec05c52be0a07b08061f7dd003e7d7092e0472bc731b4af7bb1ef876109802"
+dependencies = [
+ "proc-macro-error-attr2",
+ "proc-macro2",
+ "quote",
  "syn",
 ]
 
@@ -1520,6 +1636,7 @@ dependencies = [
  "cranelift-native",
  "criterion",
  "dhat",
+ "mlua",
  "relon-analyzer",
  "relon-codegen-native",
  "relon-eval-api",
@@ -2489,6 +2606,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "which"
+version = "7.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "24d643ce3fd3e5b54854602a080f34fb10ab75e0b813ee32d00ca2b44fa74762"
+dependencies = [
+ "either",
+ "env_home",
+ "rustix",
+ "winsafe",
+]
+
+[[package]]
 name = "winapi-util"
 version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2584,6 +2713,12 @@ name = "windows_x86_64_msvc"
 version = "0.52.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "589f6da84c646204747d1270a2a5661ea66ed1cced2631d546fdfb155959f9ec"
+
+[[package]]
+name = "winsafe"
+version = "0.0.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d135d17ab770252ad95e9a872d365cf3090e3be864a34ab46f48555993efc904"
 
 [[package]]
 name = "wit-bindgen"
