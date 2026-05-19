@@ -20,6 +20,8 @@
     --args '{"state": "shipped", "event": "deliver"}'   // happy path
     --args '{"state": "placed",  "event": "deliver"}'   // unhandled
 */
+#relaxed
+
 #schema Transition {
     #expect "from must be a known state"
     String from: (s) => s == "placed" || s == "paid" || s == "shipped",

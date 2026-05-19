@@ -21,6 +21,8 @@
   like 0.08 * 460.0. Real billing systems keep money in integer cents;
   this toy uses Float for readability and leaves rounding to the host.
 */
+#relaxed
+
 #schema LineItem {
     String sku: * ,
     #expect "qty must be > 0"
@@ -28,6 +30,8 @@
     #expect "unit_price must be >= 0"
     Float unit_price: (p) => p >= 0
 }
+#relaxed
+
 #schema Order {
     List<LineItem> items: * ,
     #expect "tier must be one of: standard / gold"

@@ -27,6 +27,8 @@
     cargo run -q -p relon-cli -- run examples/feature_flag.relon \
         --args '{"user": {"id": "alice-42", "region": "eu", "plan": "pro"}}'
 */
+#relaxed
+
 #schema User {
     String id: * ,
     #expect "region must be one of: us / eu / apac"

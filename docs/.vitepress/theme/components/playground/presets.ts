@@ -53,7 +53,12 @@ const DEMO_MAIN = `// Try editing me - evaluate runs automatically.
 const PRICING_MAIN = `/*
   Invoice pricing with tiered discounts and tax.
   See examples/pricing.relon in the repo for the full annotated source.
+
+  Uses #relaxed to keep the existing untyped closure params in the
+  helper functions; analyzer strict mode would otherwise demand
+  explicit closure-parameter types.
 */
+#relaxed
 #schema LineItem {
     String sku: * ,
     #expect "qty must be > 0"
@@ -94,7 +99,12 @@ const FEATURE_FLAG_MAIN = `/*
 
   Percentage rollouts need a host-registered \`native_hash(s) -> Int\`.
   See examples/feature_flag.relon for the full annotated source.
+
+  #relaxed lets the demo keep its untyped closure params in
+  schema validators / helper fns; analyzer strict mode would
+  otherwise require explicit parameter types.
 */
+#relaxed
 #schema User {
     String id: * ,
     String region: (r) => r == "us" || r == "eu" || r == "apac",
@@ -128,7 +138,11 @@ const WORKFLOW_MAIN = `/*
   Try via the CLI:
     cargo run -q -p relon-cli -- run examples/workflow.relon \\
         --args '{"state": "placed", "event": "pay"}'
+
+  #relaxed lets the schema validators use untyped closure
+  params; strict mode by default would error otherwise.
 */
+#relaxed
 #schema Transition {
     String from: (s) => s == "placed" || s == "paid" || s == "shipped",
     String on: * ,
@@ -161,6 +175,11 @@ const WORKFLOW_MAIN = `/*
 // place and compare them.
 const MODULES_MAIN = `// Three #import shapes — try Mod-clicking any imported name to
 // jump across files.
+//
+// #relaxed propagates from the entry to every reachable #import target,
+// so lib.relon's untyped closure params (with_tax / format_price / discount)
+// are accepted without explicit type annotations.
+#relaxed
 #import lib from "./lib.relon"
 #import { format_price } from "./lib.relon"
 #import * from "./lib.relon"
