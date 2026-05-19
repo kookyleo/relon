@@ -1513,6 +1513,7 @@ dependencies = [
 name = "relon-bench"
 version = "0.1.0"
 dependencies = [
+ "cranelift-codegen",
  "criterion",
  "dhat",
  "relon-analyzer",

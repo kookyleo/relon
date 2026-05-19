@@ -577,6 +577,13 @@ impl TraceJitState {
     /// cranelift JIT` for a single fn_id and return the installable
     /// trace fn. The caller decides whether to install it via
     /// [`TraceJitState::install_trace`].
+    ///
+    /// Uses the host's default trace entry calling convention picked
+    /// by [`relon_trace_emitter::trace_entry_call_conv`] — i.e.
+    /// `CallConv::Tail` on x86_64 / aarch64 (v6-ε-0-C) and
+    /// `CallConv::SystemV` elsewhere. Tests / benches that need a
+    /// specific conv go through
+    /// [`Self::jit_compile_buffer_for_fn_with_call_conv`] directly.
     pub fn jit_compile_trace_for_fn(
         &self,
         fn_id: u32,
@@ -595,10 +602,46 @@ impl TraceJitState {
     /// pinning emitter / optimiser behaviour on synthetic ops. The
     /// production pipeline always goes through
     /// [`Self::jit_compile_trace_for_fn`].
+    ///
+    /// Uses the host's default trace entry calling convention; see
+    /// [`Self::jit_compile_buffer_for_fn_with_call_conv`] for an
+    /// explicit-conv variant.
     pub fn jit_compile_buffer_for_fn(
         &self,
         fn_id: u32,
+        buffer: relon_trace_jit::TraceBuffer,
+    ) -> Result<JITedTraceFn, TraceJitError> {
+        self.jit_compile_buffer_for_fn_with_call_conv(
+            fn_id,
+            buffer,
+            relon_trace_emitter::trace_entry_call_conv(),
+        )
+    }
+
+    /// v6-ε-0-C: same as [`Self::jit_compile_buffer_for_fn`] but with
+    /// an explicit cranelift calling convention for the trace entry
+    /// function.
+    ///
+    /// Production callers should use [`Self::jit_compile_buffer_for_fn`]
+    /// (which picks the optimal conv per host arch via
+    /// [`relon_trace_emitter::trace_entry_call_conv`]). This variant
+    /// exists so the v6-ε-0-C bench can install a SystemV-conv trace
+    /// and a Tail-conv trace side-by-side for direct comparison
+    /// (`trace_jit_warm_ic` vs `trace_jit_warm_tail` rows).
+    ///
+    /// **Note on `extern "C"` interop**: Rust callers that go through
+    /// [`JITedTraceFn::invoke`] / [`Self::typed_entry`] declare the
+    /// entry pointer as `unsafe extern "C" fn(...) -> i32`. On
+    /// x86_64 + aarch64 the wire-level register layout for the
+    /// `TRACE_ENTRY_SIG` shape (2 ptr args + i32 return) is identical
+    /// between `CallConv::Tail` and `CallConv::SystemV`, so the
+    /// cross-conv call works. See
+    /// `relon-trace-emitter/src/call_conv.rs` for the analysis.
+    pub fn jit_compile_buffer_for_fn_with_call_conv(
+        &self,
+        fn_id: u32,
         mut buffer: relon_trace_jit::TraceBuffer,
+        entry_call_conv: cranelift_codegen::isa::CallConv,
     ) -> Result<JITedTraceFn, TraceJitError> {
         if (fn_id as usize) >= MAX_FN_ID {
             return Err(TraceJitError::FnIdOutOfRange(fn_id));
@@ -703,11 +746,18 @@ impl TraceJitState {
         };
 
         let mut ctx = CodegenContext::new();
-        TraceEmitter::emit_with_hooks(&optimized, &mut ctx, pointer_ty, hook_func_ids)
-            .map_err(TraceJitError::Emit)?;
+        TraceEmitter::emit_with_hooks_and_call_conv(
+            &optimized,
+            &mut ctx,
+            pointer_ty,
+            hook_func_ids,
+            entry_call_conv,
+        )
+        .map_err(TraceJitError::Emit)?;
         tracing::trace!(
             target: "relon::trace_install",
             fn_id,
+            call_conv = %entry_call_conv,
             ir = %ctx.func.display(),
             "trace cranelift IR ready for module install"
         );
