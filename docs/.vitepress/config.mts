@@ -17,6 +17,16 @@ export default defineConfig({
   description: "A production-grade, strongly-typed configuration language.",
   base: "/relon/",
 
+  // Internal phase reports / roadmaps / plans under `docs/internal/` are
+  // raw engineering notes that frequently contain literal `<` / `>` in
+  // code excerpts (generic types, HTML inside fenced blocks, commit-message
+  // snippets). The Vue SFC compiler that VitePress runs on every .md
+  // treats these as element tags and aborts the build with
+  // "Element is missing end tag." Excluding the directory keeps those
+  // notes in-tree (useful for grep / git history) while preventing them
+  // from breaking the published site. Vitepress >= 1.6 honors srcExclude.
+  srcExclude: ['**/internal/**'],
+
   // Register the Relon TextMate grammar so shiki highlights every
   // ```relon ...``` block instead of falling back to `txt` (which used
   // to emit one "language not loaded" warning per code fence at dev
