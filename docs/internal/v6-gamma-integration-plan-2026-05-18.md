@@ -377,9 +377,11 @@ pub enum TraceJitDiffOutcome {
 | M3 | `jit_compile_trace_for_fn` pipeline 端到端       | 4 天  | trivial trace（`int + int`）从 record → optimize → emit → JIT install 全链路跑通 | **DONE** (`84bb59f`) — buffer path 验证；recorder 端因 orphan guard 留给 M4 |
 | M4 | 3 runtime helper register + deopt 路径回 generic | 3 天  | guard 失败时 host dispatcher 能读到 `DeoptStateSnapshot` 并把值写回 generic frame；recorder `record_guard` 同步；`__relon_jump_to_recorder` 接真 IR walker | **DONE** (`ee4d64b`) — record_guard fix + TraceRecordingEvaluator + real jump helper + host_hooks.save_deopt wire + invoke_with_fallback + 3-way diff harness（11/11 AllAgree）；partial-resume 暂走 fallback re-run，M5 polish |
 | M5 | differential harness 三方对比 + bench            | 4 天  | 52 case 三方一致；deopt path coverage ≥ 4 GuardKind；hot loop micro-bench < 5 ns/iter | **DONE** (M5 stage 2026-05-19) — 1697 tests pass；52-case corpus 23 AllAgree + 1 AllTrap + passing variant 覆盖剩余 28 case；hot-loop bench `trace_jit_warm = 4.39 ns/iter`（< 5 ns target ✅）；IR walker 扩 If / Select / 多 arith tag；HostHookTable 三 hook 全 wire；deopt fallback 喂 `external_pc`；residual TODO（LocalGet 物化、ArithOverflow `iadd_cout`、full partial-resume）入 v6-δ。详见 `docs/internal/v6-gamma-m5-stage-report-2026-05-19.md` |
+| v6-δ M1 | 5-residual sweep（R1 LocalGet 物化 + R2 真 ArithOverflow + R3 resume_from_pc surface + R4 stdlib free-fn 拓宽 + R5 host_hooks call_indirect） | 1 天 | 5 residual 全部 land；52-case corpus ≥ 40 AllAgree；real hot-loop bench number 记录 | **DONE** (v6-δ M1 stage 2026-05-19) — 1703 tests pass；corpus 45/52 AllAgree（gate >= 40 ✅）；real hot-loop bench `trace_jit_warm = 9.52 ns/iter`（const-only 4.39 ns 换成 LocalGet+Add+Return 真实 body）；R3 PARTIAL（trait surface 落地 + invoke_with_resume；tree-walker default forward 到 run_main，4-prong 沙箱在 run_main 路径仍 fire）；pre-existing deopt-block fn0 SIGSEGV bug 修复（jit_compile_buffer_for_fn 预声明三 helper）。详见 `docs/internal/v6-delta-m1-stage-report-2026-05-19.md` |
 
-**总计 ~16-19 天 ≈ 3 周**。原设计稿 §6 估算 8-12 周，prep 阶段已经把 5-9 周工作
-做完，**整合 phase 实际剩 3 周**。
+**总计 ~17-20 天 ≈ 3 周 + 1 天 v6-δ M1 sweep**。原设计稿 §6 估算
+8-12 周，prep + γ 已经做完核心 5-9 周工作，δ M1 把 γ 留的尾巴清完，
+**整合 phase 实际 ≈ 3 周完成，δ M2/M3 进入纯优化阶段**。
 
 ---
 
@@ -487,3 +489,62 @@ v6-γ phase 真启动时建议**按 milestone 拆 4 个 sequential agent**（M2 
 
 - 2026-05-18 草案 v1：合 prep 阶段已落地形状 + 整合 milestone；ABI 调和推荐
   Option A；3 周时间盒。
+- 2026-05-19 v2：M5 stage DONE；附录 v6-δ residual TODO 入 v6-δ phase。
+- 2026-05-19 v3：§13 "v6-δ M1 — Residual sweep" 落地（**DONE**）。
+
+---
+
+## 13. v6-δ M1 — Residual sweep (DONE 2026-05-19)
+
+v6-γ M5 stage report §6 列了 5 个 residual TODO；M1 一天 sweep
+全部 land + 修一个 pre-existing SIGSEGV bug。详细 stage report 在
+`docs/internal/v6-delta-m1-stage-report-2026-05-19.md`。
+
+### 5 residual 收尾状态
+
+| Residual | Status | Key change |
+|----------|--------|------------|
+| R1 emitter LocalGet 物化 | DONE | `TraceOp::LocalGet(dst, slot_idx)` + emitter `emit_local_get` (load.i64 args_ptr + slot * 8) + recorder 首次发射 |
+| R2 真 ArithOverflow guard | DONE | emitter binop 改 `sadd_overflow` / `ssub_overflow` / `smul_overflow`；per-SSA `overflow_bits` map；guard predicate brif on carry==0 |
+| R3 完整 partial-resume from external_pc | PARTIAL | `Evaluator::resume_from_pc(args, external_pc, local_snapshot)` trait surface 落地；`TraceJitState::invoke_with_resume` 暴露完整 `&DeoptStateSnapshot` 给 fallback；tree-walker default 仍 forward 到 run_main（4-prong 沙箱语义在 run_main 路径仍 fire，div-by-zero 测验证；其它 prong 走同一路径降级 PASS） |
+| R4 widen recorder envelope for stdlib | DONE | tree-walker 端：abs/min/max/clamp 注 free fn，length/is_empty/concat/substring/starts_with/sum/max 注 String/List method，try_call_schema_method 接 Dynamic head；synth 端：StdlibAbs/Min/Max recipe + StdlibConst 17 个常量形态 |
+| R5 emitter call_indirect through host_hooks | DONE | save_deopt 走 `ctx.host_hooks.save_deopt` indirect dispatch（保留 null fallback 给 hand-rolled buffer 测试）；新 `TraceSaveDeoptFn = (ctx, u32, u64)` 类型让 external_pc 不再被丢；resolve_call / inline_cache_lookup 暂留 direct extern（v6-δ M2 一起做） |
+
+### Pre-existing bug 修复
+
+- **deopt 块的 fn0 自递归 SIGSEGV**：emitter `declare_imported_user_function`
+  用 `UserExternalName(0, 0)` 给 SaveDeopt 编号，而 cranelift-module
+  给 trace_fn 自己分配的 FuncId 也是 0（trace_fn 是 module 第一个
+  declare）。运行时 deopt 块的 `call fn0` 落到 trace_fn 自己 →
+  SIGSEGV。v6-γ 没观察到是因为既有测试要么不进 deopt 块（const-only
+  bench / pipeline_compiles_add_trace 的 add 被 const_fold 折掉），
+  要么 ArithOverflow predicate 编常量 0 直接 deopt 但 const-only
+  bench body 没 arith。R2 第一次让真 guard 跑起来才暴露。
+- **修**：`jit_compile_buffer_for_fn` 先 `Linkage::Import` 声明三个
+  helper 拿稳定 FuncId（0/1/2），trace_fn 拿 FuncId 3；新公开
+  `HostHookFuncIds` API 让 emitter 拿到稳定的 FuncId.as_u32() 列表。
+
+### Gate numbers
+
+- `cargo test --workspace` —— **1703 passing**（M5 baseline 1697 + 6 新）。
+- corpus `corpus_three_way_diff_aggregates` —— **45 / 52 AllAgree**
+  （gate `>= 40`）。0 mismatches；6 not_applicable（4 arith trap +
+  2 dict_return envelope gap）；1 CraneliftUnsupported（let_chain）。
+- bench `trace_jit_warm` —— **9.52 ns / iter**（real LocalGet + Add
+  + Return；M5 const-only 4.39 ns 不对等可比）；vs LuaJIT 1-3 ns/iter
+  慢 3-9 倍，v6-δ M2 inline-cache 路线图目标 3-5 ns/iter。
+- clippy / fmt / wasm32 build —— all clean。
+
+### v6-δ M2 入口
+
+3 个剩余 follow-up 进入 v6-δ M2 + 后续 minor sweep：
+
+1. **R3 完整 partial-resume**：bytecode VM backend 实现 IR-PC 表 +
+   override `resume_from_pc`，拿到真正"deopt 重入到 op X + locals = {..}"
+   的 pixel-perfect 语义。
+2. **4-prong sandbox 重入测试覆盖度**：当前只覆盖 div-by-zero
+   (1/4)，补 bounds-check / capability / resource-limit 三 prong 的
+   resume-from-trace-deopt 重入回归（设计上走相同 run_main 路径，
+   但要显式 case 锁定）。
+3. **resolve_call / inline_cache_lookup 也切 call_indirect**：和
+   R5 save_deopt 同形，预期一次性扫掉。
