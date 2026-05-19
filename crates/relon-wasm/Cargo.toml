@@ -26,10 +26,10 @@ crate-type = ["cdylib", "rlib"]
 # enable the feature so optimisation succeeds. Bulk-memory is supported by
 # every evergreen browser since 2021, so this widens nothing in practice.
 [package.metadata.wasm-pack.profile.release]
-wasm-opt = ["-O", "--enable-bulk-memory", "--enable-nontrapping-float-to-int"]
+wasm-opt = ["-O", "--enable-bulk-memory", "--enable-nontrapping-float-to-int", "--enable-simd"]
 
 [package.metadata.wasm-pack.profile.profiling]
-wasm-opt = ["-O", "--enable-bulk-memory", "--enable-nontrapping-float-to-int"]
+wasm-opt = ["-O", "--enable-bulk-memory", "--enable-nontrapping-float-to-int", "--enable-simd"]
 
 [dependencies]
 # v5-β-2 stage 4: the workspace-level `relon` dep already declares
