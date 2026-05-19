@@ -1420,3 +1420,69 @@ wasm build / bench / validators / lua_smoke）通过。
 
 - ITERATE 维度的 targeted fix plan 在 final report §7 附录
 - D5 p99.9 需要 sample_size >= 500 + 1M invoke：今日 sample_size=100，p99.9 只有 0.1 sample，作为下一轮 targeted measurement 任务
+
+---
+
+## 24. F-D7 (字符串 op 进 trace JIT) — 2026-05-19 落地
+
+详细 stage report：`docs/internal/v6-fix-d7-string-trace-jit-2026-05-19.md`。
+
+### 24.1 落地范围
+
+| 组件 | 改动 |
+|---|---|
+| `relon-trace-jit::trace_ir` | 新增 `TraceOp::StrConcat / StrContains / StrFind / StrSubstring`，全部 `EffectClass::Pure`；`output` / `inputs` / `defs` 对齐 |
+| `relon-trace-jit::runtime::str_ops` | 4 个 `#[no_mangle] unsafe extern "C"` 实现 + `StringRef` opaque box + 单槽 thread-local IC + 8 单测 |
+| `relon-trace-jit::optimizer::load_forward` | 给 4 个新变体追加 SSA-rewrite 分支 |
+| `relon-trace-recorder::lowering` | `Op::Call { fn_index = 6 (concat) / 9 (substring) }` 短路到 TraceOp::Str* + NotNull guard，generic Call 路径保留；5 单测 |
+| `relon-trace-emitter::abi::HostHookId` | 新增 4 个 `Str*` 符号；`host_hook_slot_offset` 对 Str* 主动 panic（不走 hook table） |
+| `relon-trace-emitter::emitter` | `HostHookFuncIds` 加 4 字段；emitter `declare_host_hook` 预声明四个 shim FuncRef，每个 TraceOp::Str* 走单条 `call` |
+| `relon-codegen-native::trace_install` | `module.declare_function(Import)` 给 4 个 `__relon_str_*` 上号；`register_trace_runtime_symbols` 绑定函数指针 |
+
+### 24.2 测试 / lint / wasm
+
+`cargo test --workspace`：1825 PASS（baseline 1808 + 17 new）。`cargo
+clippy --workspace --all-targets -- -D warnings` + `cargo fmt --check`
++ `cargo build --target wasm32-unknown-unknown -p relon-wasm` 全绿。
+
+### 24.3 cmp_lua W3 / W4 (实测 + 阻塞器)
+
+| 工作负载 | Relon p50 | LuaJIT p50 | Ratio | Baseline | Δ |
+|---|---|---|---|---|---|
+| W3 string concat | 12.34 ms | 1.39 ms | 8.9× | 9.1× | -0.2 |
+| W4 string contains | 62.97 ms | 17.89 μs | 3520× | 3556× | -36 |
+
+变化全在噪声范围内 —— **阻塞器是 cmp_lua 用的 `walker.run_main` 跑
+tree-walker，不经过 trace JIT counter**。本 stage 实现的 recorder /
+emitter 改动对 W3 / W4 不可见。
+
+要让 W3 ratio 降到 ≤ 2.0×（任务目标）必须额外完成：
+
+1. cmp_lua 的 W3/W4 入口换成 trace-JIT-enabled evaluator（**F-D9**
+   范围，不在 F-D7 文件边界里）；
+2. `s.contains` 进 IR `Op::Call` stdlib table（当前只有 tree-walker
+   `register_pure_method` 注册）；
+3. `StringRef` arena 接入 `TraceContext::pending_recoverable_writes`，
+   把 leak 改成 deopt-aware drop；
+4. `StrConcat` rope / interned 路径，让短串避开每次 alloc。
+
+### 24.4 Realistic floor 重估
+
+W4 的 LuaJIT 路径是把 `string.find(s, "x", 1, true)` 直接 fold 进 trace
+（needle / haystack 全静态），实测 1.8 ns / iter。我们的 shim 命中 IC
+后仍需 ≈ 3 ns（2 个指针比较 + 1 个 i32 load），所以**W4 现实下限约 10×**
+而非任务文档里的 2×。这条 floor 在 F-D7 的 boundary case 里已经预先声明，
+此处补充：要打穿 W4 = 5× 需要 trace 录制时识别字面量参数并把 shim 调用
+替换为编译期 fold 后的 const，落到 `TraceConst::Bool(true)`。这是后续
+F-D7-B 的工作，不在本 stage 范围。
+
+### 24.5 边界声明
+
+本 stage 严格遵循 F-D7 task 的 boundary case：
+
+- "File-disjoint expected" — 只触碰 trace-recorder / -emitter / -jit
+  string ops，dict/list 完全未改，F-D8 可并行。
+- "≥ 3 commits" — 3 commits (trace-jit shims / recorder+emitter
+  lowering / bench-rerun+docs)。
+- "Honest stuck" — W3/W4 ratio 未达 2.0× 目标，stuck 原因 = bench 入口
+  绕过 trace JIT，已记录到 stage report §4。

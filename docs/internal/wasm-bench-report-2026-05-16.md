@@ -3753,3 +3753,40 @@ post-process: `cargo run --release -p relon-bench --bin bench_stats -- target/cr
 - criterion bench × 2 row（relon_tree_walk + luajit）
 
 完整结果详 `docs/internal/relon-vs-luajit-final-report-2026-05-19.md` 决策矩阵 §3。
+
+
+---
+
+## v6 fix-D7 string TraceOp 落地 (2026-05-19) — cmp_lua W3/W4 rerun
+
+详 `docs/internal/v6-fix-d7-string-trace-jit-2026-05-19.md`。
+
+stage 范围：trace JIT 侧追加 `TraceOp::Str{Concat,Contains,Find,Substring}` +
+`#[no_mangle] unsafe extern "C"` shim + recorder lowering + emitter `call`
+下沉 + thread-local IC（W4 命中槽）。1825 PASS（baseline +17 new tests）。
+
+### W3 / W4 rerun（本 stage 改完 + tree-walker bench 入口）
+
+| Workload | Relon p50 | LuaJIT p50 | Ratio | Baseline (λ-2) | Δ |
+|---|---|---|---|---|---|
+| W3 string concat | 12.34 ms | 1.39 ms | 8.9× | 9.1× | -0.2 |
+| W4 string contains | 62.97 ms | 17.89 μs | 3520× | 3556× | -36 |
+
+变化在 +-10% 噪声范围内 —— **阻塞器 = cmp_lua 走 `walker.run_main`
+（tree-walker），不经过 trace JIT counter**。本 stage 的所有改动对该
+bench 入口不可见；要测到改善需要先完成 F-D9 (cmp_lua 接 trace JIT 入口)。
+
+### Realistic floor
+
+| 阶段 | W3 expected | W4 expected |
+|---|---|---|
+| Now (tree-walker entry) | 8.9× | 3520× |
+| F-D9 + 简易 fold | 4-5× | 30-50× |
+| + StringRef arena + SSO | 2-3× | 10-15× |
+| + intern / rope / const-fold of trace literals | 1.5-2× | 5-10× |
+
+W4 的 LuaJIT 路径已经 constant-folded（needle / haystack 全静态进
+trace），现实下限 ≈ **10×**；要打到 2× 需要 trace 录制时 const-prop
+字面量参数并 fold shim 调用，属于 F-D7-B / F-D9 sub-phase 范围。
+
+stage report § 5 给出完整 floor 估计与后续 sub-phase 优先级清单。
