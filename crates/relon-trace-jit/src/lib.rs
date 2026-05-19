@@ -50,6 +50,6 @@ pub use runtime::{
     DeoptStateSnapshot, ExternalCallTable, GenericState, RecoverableWriteRecord, TraceContext,
 };
 pub use trace_ir::{
-    CmpKind, ExternalAddr, ExternalPc, ExternalSlot, FuncId, GuardKind, ObservedType, Offset,
-    SsaVar, TraceConst, TraceOp,
+    CmpKind, ExternalAddr, ExternalPc, ExternalSlot, FuncId, GuardKind, LoopPhi, ObservedType,
+    Offset, SsaVar, TraceConst, TraceOp,
 };

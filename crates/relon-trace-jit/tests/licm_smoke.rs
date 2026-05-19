@@ -28,9 +28,15 @@ fn simple_hoistable_add_lifts_out_of_loop() {
     let c = b.fresh_ssa();
     b.append(TraceOp::ConstI32(a, 3));
     b.append(TraceOp::ConstI32(bb, 4));
-    b.append(TraceOp::MarkLoopHead { loop_id: 0 });
+    b.append(TraceOp::MarkLoopHead {
+        loop_id: 0,
+        phis: vec![],
+    });
     b.append(TraceOp::Add(c, a, bb));
-    b.append(TraceOp::MarkLoopBack { loop_id: 0 });
+    b.append(TraceOp::MarkLoopBack {
+        loop_id: 0,
+        next_values: vec![],
+    });
 
     let r = LICM.run(&mut b);
     let head_idx = position(&b.ops, |o| o.is_loop_head()).expect("loop head missing");
@@ -51,10 +57,16 @@ fn loop_variant_op_stays_inside() {
     let inside_load = b.fresh_ssa();
     let res = b.fresh_ssa();
     b.append(TraceOp::ConstI32(pre_c, 5));
-    b.append(TraceOp::MarkLoopHead { loop_id: 0 });
+    b.append(TraceOp::MarkLoopHead {
+        loop_id: 0,
+        phis: vec![],
+    });
     b.append(TraceOp::Load(inside_load, base, Offset(0)));
     b.append(TraceOp::Add(res, inside_load, pre_c));
-    b.append(TraceOp::MarkLoopBack { loop_id: 0 });
+    b.append(TraceOp::MarkLoopBack {
+        loop_id: 0,
+        next_values: vec![],
+    });
 
     LICM.run(&mut b);
     let head_idx = position(&b.ops, |o| o.is_loop_head()).unwrap();
@@ -72,9 +84,15 @@ fn recoverable_write_is_not_hoisted() {
     let base = b.fresh_ssa();
     let val = b.fresh_ssa();
     b.append(TraceOp::ConstI64(val, 1));
-    b.append(TraceOp::MarkLoopHead { loop_id: 0 });
+    b.append(TraceOp::MarkLoopHead {
+        loop_id: 0,
+        phis: vec![],
+    });
     b.append(TraceOp::Store(base, Offset(0), val));
-    b.append(TraceOp::MarkLoopBack { loop_id: 0 });
+    b.append(TraceOp::MarkLoopBack {
+        loop_id: 0,
+        next_values: vec![],
+    });
 
     LICM.run(&mut b);
     let head_idx = position(&b.ops, |o| o.is_loop_head()).unwrap();
@@ -92,12 +110,18 @@ fn guard_is_not_hoisted() {
     let mut b = TraceBuffer::new();
     let v = b.fresh_ssa();
     b.append(TraceOp::ConstI64(v, 7));
-    b.append(TraceOp::MarkLoopHead { loop_id: 0 });
+    b.append(TraceOp::MarkLoopHead {
+        loop_id: 0,
+        phis: vec![],
+    });
     b.append(TraceOp::Guard(
         GuardKind::TypeCheck(v, ObservedType::I64),
         v,
     ));
-    b.append(TraceOp::MarkLoopBack { loop_id: 0 });
+    b.append(TraceOp::MarkLoopBack {
+        loop_id: 0,
+        next_values: vec![],
+    });
 
     LICM.run(&mut b);
     let head_idx = position(&b.ops, |o| o.is_loop_head()).unwrap();
@@ -122,11 +146,23 @@ fn nested_loops_lift_innermost_first() {
     let a = b.fresh_ssa();
     let c = b.fresh_ssa();
     b.append(TraceOp::ConstI32(a, 1));
-    b.append(TraceOp::MarkLoopHead { loop_id: 0 });
-    b.append(TraceOp::MarkLoopHead { loop_id: 1 });
+    b.append(TraceOp::MarkLoopHead {
+        loop_id: 0,
+        phis: vec![],
+    });
+    b.append(TraceOp::MarkLoopHead {
+        loop_id: 1,
+        phis: vec![],
+    });
     b.append(TraceOp::Mul(c, a, a));
-    b.append(TraceOp::MarkLoopBack { loop_id: 1 });
-    b.append(TraceOp::MarkLoopBack { loop_id: 0 });
+    b.append(TraceOp::MarkLoopBack {
+        loop_id: 1,
+        next_values: vec![],
+    });
+    b.append(TraceOp::MarkLoopBack {
+        loop_id: 0,
+        next_values: vec![],
+    });
 
     LICM.run(&mut b);
     let outer_head = b
@@ -160,12 +196,24 @@ fn nested_loops_partial_invariant_hoists_to_inner_head_only() {
     let bb = b.fresh_ssa();
     let c = b.fresh_ssa();
     b.append(TraceOp::ConstI32(a, 1));
-    b.append(TraceOp::MarkLoopHead { loop_id: 0 });
+    b.append(TraceOp::MarkLoopHead {
+        loop_id: 0,
+        phis: vec![],
+    });
     b.append(TraceOp::Load(bb, base, Offset(0)));
-    b.append(TraceOp::MarkLoopHead { loop_id: 1 });
+    b.append(TraceOp::MarkLoopHead {
+        loop_id: 1,
+        phis: vec![],
+    });
     b.append(TraceOp::Add(c, a, bb));
-    b.append(TraceOp::MarkLoopBack { loop_id: 1 });
-    b.append(TraceOp::MarkLoopBack { loop_id: 0 });
+    b.append(TraceOp::MarkLoopBack {
+        loop_id: 1,
+        next_values: vec![],
+    });
+    b.append(TraceOp::MarkLoopBack {
+        loop_id: 0,
+        next_values: vec![],
+    });
 
     LICM.run(&mut b);
     let outer_head = b
@@ -194,9 +242,15 @@ fn unrelated_loop_with_no_invariants_leaves_trace_unchanged() {
     let mut b = TraceBuffer::new();
     let base = b.fresh_ssa();
     let inside_load = b.fresh_ssa();
-    b.append(TraceOp::MarkLoopHead { loop_id: 0 });
+    b.append(TraceOp::MarkLoopHead {
+        loop_id: 0,
+        phis: vec![],
+    });
     b.append(TraceOp::Load(inside_load, base, Offset(0)));
-    b.append(TraceOp::MarkLoopBack { loop_id: 0 });
+    b.append(TraceOp::MarkLoopBack {
+        loop_id: 0,
+        next_values: vec![],
+    });
     let before = b.ops.len();
     let r = LICM.run(&mut b);
     assert_eq!(b.ops.len(), before, "no-op LICM must not shrink trace");
@@ -211,9 +265,15 @@ fn pure_call_with_external_args_is_hoistable() {
     let arg = b.fresh_ssa();
     let ret = b.fresh_ssa();
     b.append(TraceOp::ConstI32(arg, 5));
-    b.append(TraceOp::MarkLoopHead { loop_id: 0 });
+    b.append(TraceOp::MarkLoopHead {
+        loop_id: 0,
+        phis: vec![],
+    });
     b.append(TraceOp::Call(ret, FuncId(11), vec![arg], EffectClass::Pure));
-    b.append(TraceOp::MarkLoopBack { loop_id: 0 });
+    b.append(TraceOp::MarkLoopBack {
+        loop_id: 0,
+        next_values: vec![],
+    });
     LICM.run(&mut b);
     let head_idx = position(&b.ops, |o| o.is_loop_head()).unwrap();
     let call_idx = position(&b.ops, |o| matches!(o, TraceOp::Call(_, _, _, _))).unwrap();
@@ -227,14 +287,20 @@ fn readonly_call_is_not_hoisted() {
     let arg = b.fresh_ssa();
     let ret = b.fresh_ssa();
     b.append(TraceOp::ConstI32(arg, 5));
-    b.append(TraceOp::MarkLoopHead { loop_id: 0 });
+    b.append(TraceOp::MarkLoopHead {
+        loop_id: 0,
+        phis: vec![],
+    });
     b.append(TraceOp::Call(
         ret,
         FuncId(11),
         vec![arg],
         EffectClass::ReadOnly,
     ));
-    b.append(TraceOp::MarkLoopBack { loop_id: 0 });
+    b.append(TraceOp::MarkLoopBack {
+        loop_id: 0,
+        next_values: vec![],
+    });
     LICM.run(&mut b);
     let head_idx = position(&b.ops, |o| o.is_loop_head()).unwrap();
     let call_idx = position(&b.ops, |o| matches!(o, TraceOp::Call(_, _, _, _))).unwrap();

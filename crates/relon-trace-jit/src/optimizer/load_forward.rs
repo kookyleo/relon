@@ -188,6 +188,7 @@ fn rewrite_inputs(op: &mut TraceOp, alias: &HashMap<SsaVar, SsaVar>) -> usize {
                     swap!(limit);
                 }
                 GuardKind::ArithOverflow(v) => swap!(v),
+                GuardKind::IsZero(v) => swap!(v),
             }
         }
         TraceOp::Call(_dst, _, args, _) => {

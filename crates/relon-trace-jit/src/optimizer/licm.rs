@@ -144,11 +144,17 @@ fn hoist_one_loop(trace: &mut TraceBuffer, lp: &LoopRange, report: &mut PassRepo
         return false;
     }
 
-    // Set of SSA ids defined inside this loop body. An op whose
-    // inputs are all *outside* this set is invariant.
-    let inside_defs: HashSet<SsaVar> = (body_start..body_end)
-        .filter_map(|i| trace.ops[i].output())
+    // Set of SSA ids defined inside this loop body OR by the loop
+    // header's φ pairs. An op whose inputs are all *outside* this set
+    // is invariant. The φ SSAs are technically defined by the
+    // [`TraceOp::MarkLoopHead`] op AT `head_pc`, but for LICM purposes
+    // they behave like loop-local definitions: their value changes
+    // every iteration (driven by `MarkLoopBack::next_values`), so any
+    // op consuming them must stay inside the loop body.
+    let mut inside_defs: HashSet<SsaVar> = (body_start..body_end)
+        .flat_map(|i| trace.ops[i].defs())
         .collect();
+    inside_defs.extend(trace.ops[lp.head_pc].defs());
 
     // Collect candidate indices in order.
     let mut hoist_pcs: Vec<usize> = Vec::new();
