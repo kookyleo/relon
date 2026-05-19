@@ -145,6 +145,18 @@ name = "cmp_lua_dict_list_trace"
 harness = false
 path = "benches/cmp_lua_dict_list_trace.rs"
 
+# v3++ item 4 (2026-05-20): SIMD ASCII fast-path throughput. Compares
+# the new `relon_ir::ascii_fold_simd` helper against a scalar
+# `char::to_uppercase` / `to_lowercase` baseline across 100 B / 1 KB /
+# 10 KB ASCII inputs and Upper / Lower / Title modes. Native bench
+# runs exercise the autovec scalar path; wasm32 + simd128 numbers
+# live in `docs/internal/wasm-bench-report-2026-05-16.md` appendix
+# A.24. Run via `cargo bench -p relon-bench --bench ascii_case_fold`.
+[[bench]]
+name = "ascii_case_fold"
+harness = false
+path = "benches/ascii_case_fold.rs"
+
 # v6-λ-0 (bench methodology hardening, 2026-05-19): post-processor for
 # criterion's per-sample `sample.json` outputs. Walks
 # `target/criterion/<group>/<dim>/<row>/new/sample.json` and prints a

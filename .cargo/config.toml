@@ -16,4 +16,13 @@
 # benign no-op flag (e.g. `--cap-lints=warn`, which is the default
 # anyway) is enough to anchor this as a non-empty override and shadow
 # the host's mold link-arg.
-rustflags = ["--cap-lints=warn"]
+#
+# `+simd128` enables the WebAssembly fixed-width SIMD proposal so the
+# v128 intrinsics in `relon-ir/src/ascii_fold_simd.rs` (v3++ item 4)
+# compile into wasm SIMD opcodes instead of scalar fallbacks. Every
+# evergreen browser since 2023 (Safari 16.4 +) ships v128 support,
+# so this widens nothing in practice; wasmtime / wasmer / Node ≥ 16
+# all enable it by default too. Without this flag the `cfg(target_feature
+# = "simd128")` arm is gated out and the autovectorised scalar
+# path takes over — still correct, just slower.
+rustflags = ["--cap-lints=warn", "-Ctarget-feature=+simd128"]

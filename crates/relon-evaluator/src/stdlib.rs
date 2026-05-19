@@ -855,10 +855,56 @@ impl RelonFunction for StringReplace {
 ///   5. Identity (combining marks pass through unchanged when not
 ///      `at_word_start` for the title flow).
 fn fold_string(s: &str, mode: CaseFoldMode, locale_turkish: bool) -> String {
-    let cps: Vec<u32> = s.chars().map(|c| c as u32).collect();
     let mut out = String::with_capacity(s.len());
     let mut at_word_start = true;
-    for (i, &cp) in cps.iter().enumerate() {
+
+    // v3++ item 4: SIMD ASCII fast-path. ASCII letters fold by
+    // mask-and-xor (b ^ 0x20) and the FULL / Σ / combining-mark
+    // tables only contain non-ASCII inputs, so for the (very
+    // frequent) all-ASCII case we can skip the per-cp decode + table
+    // lookup entirely. Turkish locale is opted out because its
+    // overrides `I <-> ı` / `i <-> İ` produce 2-byte UTF-8 output
+    // from ASCII input, which the byte-in / byte-out fast path can't
+    // express.
+    //
+    // The fast path appends folded bytes directly into `out`'s UTF-8
+    // buffer (every byte is `< 0x80`, hence a 1-byte UTF-8 codepoint).
+    // It returns the number of *bytes* consumed and the updated
+    // `at_word_start` flag. Because the prefix is ASCII, byte index
+    // == codepoint index, so the slow loop below resumes at
+    // codepoint index `consumed` with no re-decoding.
+    let fast_mode = match mode {
+        CaseFoldMode::Upper => Some(relon_ir::ascii_fold_simd::AsciiFoldMode::Upper),
+        CaseFoldMode::Lower => Some(relon_ir::ascii_fold_simd::AsciiFoldMode::Lower),
+        CaseFoldMode::Title => Some(relon_ir::ascii_fold_simd::AsciiFoldMode::Title),
+    };
+    let fast_consumed = if !locale_turkish {
+        if let Some(fm) = fast_mode {
+            let r = relon_ir::ascii_fold_simd::fold_ascii_prefix_into_string(
+                s.as_bytes(),
+                fm,
+                at_word_start,
+                &mut out,
+            );
+            at_word_start = r.at_word_start;
+            r.consumed
+        } else {
+            0
+        }
+    } else {
+        0
+    };
+    if fast_consumed == s.len() {
+        // Whole input was ASCII — fast path produced byte-identical
+        // output; skip the cp-decode loop entirely.
+        return out;
+    }
+
+    // Slow path: cp-by-cp from `fast_consumed`. ASCII bytes count
+    // 1:1 against codepoints, so the cp index also starts at
+    // `fast_consumed`.
+    let cps: Vec<u32> = s.chars().map(|c| c as u32).collect();
+    for (i, &cp) in cps.iter().enumerate().skip(fast_consumed) {
         let is_mark = relon_ir::combining_marks::is_combining_mark(cp);
         if is_mark {
             // Combining marks: pass through unchanged. The word-boundary

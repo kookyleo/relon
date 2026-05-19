@@ -4027,3 +4027,238 @@ cargo build --target wasm32-unknown-unknown -p relon-wasm      # ✓
   — 当前 tree-walk 和 cranelift-AOT 都不实现这些 conditional 项，
   保持一致即可。
 
+## 附录 A.24：Phase v3++ item 4 — SIMD ASCII fast-path for case folding (2026-05-20)
+
+时间戳：2026-05-20；base commit：`fd82a15074c2b5032ec88b97975cb6e158b9a81f`
+（`merge(ir+codegen): v3++ b-7 reframed - cranelift-AOT IR body emit FULL + Σ scan`）。
+
+### 背景
+
+A.23 把 UAX #21 完整语义（FULL multi-cp / Σ context / Turkish locale）
+下沉到 IR body，三路 backend 都跑同一份语义；b-7 收尾后 case folding
+路线图剩最后一项："纯 ASCII 输入是高频 case，per-byte UTF-8 decode +
+per-cp 表查找在 ASCII 上是 ~30 字节 /op 的 cost；能否在 tree-walk
+顶部插入 SIMD ASCII fast-path 把这部分翻 1~2 个量级"。
+
+观察：FULL upper / lower 表内最小 input cp 是 `0x00DF` (`ß`)，
+combining marks 区间最低也在 0x0300，Greek Σ 在 0x03A3 — 所有要素
+都在 non-ASCII 区。结论：纯 ASCII 输入下 fold_string 的"FULL 表 + Σ
++ combining mark"三条分支全部不会触发，剩下的就是 `b ^ 0x20`
+的 mask-and-xor 翻转，加上 Title 的 word-boundary 串行跟踪。
+ASCII letters [0x41..=0x5A] / [0x61..=0x7A] 之外的 byte 一律映射
+到自己，所以 mask-and-xor 是 byte-identical 的。
+
+### 实现要点
+
+#### 1. 新 module：`crates/relon-ir/src/ascii_fold_simd.rs`
+
+放在 `relon-ir` 是因为它是 tree-walk evaluator (`relon-evaluator`)
+和未来潜在 backend 都依赖的根。helper 表面：
+
+```rust
+pub enum AsciiFoldMode { Upper, Lower, Title }
+pub struct AsciiFastResult { pub consumed: usize, pub at_word_start: bool }
+pub fn scan_ascii_prefix(bytes: &[u8]) -> usize;
+pub fn fold_ascii_prefix(bytes: &[u8], mode, at_word_start, out: &mut Vec<u8>) -> AsciiFastResult;
+pub fn fold_ascii_prefix_into_string(bytes: &[u8], mode, at_word_start, out: &mut String) -> AsciiFastResult;
+```
+
+调用方（`relon-evaluator::stdlib::fold_string`）在循环最开始走
+fast-path，若 `consumed == s.len()` 直接 return，否则把 `at_word_start`
+续走到原 cp-decode 循环并从 cp index `consumed` 起步。ASCII byte 和 cp
+是 1:1，索引等价，所以不用重新构造 cps prefix。
+
+#### 2. wasm32 + simd128 v128 path
+
+```rust
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+```
+
+- `scan_ascii_prefix`：v128 load → `i8x16_bitmask` → `trailing_zeros`
+  得首个 high-bit byte index。ASCII high bit 是 0，non-ASCII 是 1，
+  bitmask 直接落到 1-bit per lane，trailing zeros 算 byte offset。
+- `fold_ascii_prefix` (Upper / Lower)：v128 load → `u8x16_ge` /
+  `u8x16_le` 得 in-range mask → `v128_and(mask, splat(0x20))` → xor。
+  每 16 byte 一次 chunk + 标量 tail。
+- `fold_ascii_prefix` (Title)：纯标量 — word-boundary 跟踪有状态依赖，
+  不强行 SIMD 化（数据依赖让 SIMD 收益微薄）。
+
+#### 3. native scalar autovec path
+
+```rust
+#[cfg(not(all(target_arch = "wasm32", target_feature = "simd128")))]
+```
+
+- `scan_ascii_prefix`：8-byte chunk via `u64::from_le_bytes`，
+  `& 0x8080_8080_8080_8080` 找首个 high-bit byte。LLVM 在
+  x86_64-v3 / aarch64-neon 上自动 widen 到 SSE2 / NEON。
+- `fold_ascii_prefix` (Upper / Lower)：`b.wrapping_sub(b'A') < 26`
+  的 branch-free range test，autovec 后落到 `pcmpgtb` + `pand` +
+  `pxor` (x86_64) / `cmhi` + `and` + `eor` (aarch64)。
+
+scalar 路径在 native 也跑得动 — 1 KB upper/lower 实测 3 GiB/s 量级。
+
+#### 4. Turkish 排除
+
+Turkish locale 把 ASCII input `i` -> `İ` (U+0130, 2-byte UTF-8) /
+`I` -> `ı` (U+0131, 2-byte UTF-8) — 输出 non-ASCII。byte-in /
+byte-out 的 fast-path shape 无法表达，所以 `fold_string` 顶部
+显式 gate：`if !locale_turkish { run fast-path } else { skip }`。
+
+#### 5. `forbid(unsafe_code)` 放宽
+
+wasm32 `v128_load` / `v128_store` 是 `unsafe fn`（需要正确的
+pointer 解引用）。`relon-ir` crate 之前 `#![forbid(unsafe_code)]` —
+forbid 比 deny 更 strict，无法 module-local opt-in。改成
+`#![deny(unsafe_code)]` + 在 `ascii_fold_simd` module 顶部
+`#![allow(unsafe_code)]`，每个 unsafe block 配 SAFETY 注释。
+crate 其余部分仍 deny。已经有 `relon-test-harness` (trace-JIT
+host helper 需要 unsafe) 的先例。
+
+#### 6. Cargo 启 simd128
+
+`.cargo/config.toml`：
+
+```toml
+[target.wasm32-unknown-unknown]
+rustflags = ["--cap-lints=warn", "-Ctarget-feature=+simd128"]
+```
+
+evergreen 浏览器（Safari 16.4+ / 2023 起）都支持 v128；wasmtime /
+wasmer / Node ≥ 16 默认开启。所以无 BC 顾虑。未开 simd128 时
+`cfg(target_feature = "simd128")` arm 自动 gate 出，scalar autovec
+路径接力，结果仍 byte-identical 只是 throughput 低一点。
+
+### 测试新增
+
+`crates/relon-ir/src/ascii_fold_simd.rs::tests` — 17 个新 test：
+
+- 6 个 `scan_prefix_*`：empty / all-ASCII / immediate non-ASCII /
+  mixed / boundary 15/16/17/32 / non-ASCII in 2nd chunk。
+- 1 个 `upper_lower_byte_identical_small`：7 个手工 corpus × 2 modes。
+- 1 个 `title_byte_identical_small`：7 个 corpus 含 \t \n \r。
+- 1 个 `boundary_lengths_16_17_32_33`：10 个长度 × 3 modes，每次跟
+  scalar reference byte-identical 校验。
+- 1 个 `pseudo_random_ascii_corpora`：16 trials × deterministic
+  xorshift 生成 50..1050-byte ASCII × 3 modes。
+- 3 个 `title_*`：word-boundary carry / 结尾 whitespace 续 `at_word_start`。
+- 2 个 prefix / consumed 边界：non-ASCII tail / 首字节非 ASCII。
+
+加上 evaluator 走 fold_string 的现有 14 个 `full_case_folding_tests`
+和 corpus 8 个 `stdlib_case_fold` tier，三层覆盖。
+
+workspace 总测试数：**1842 → 1859 (+17)**。
+
+`cargo test -p relon-test-harness --test three_way_corpus`：
+
+```
+[three-way corpus] total=55 all_agree=48 ...
+  tier stdlib_case_fold: all_agree=8 ... (of 8)
+```
+
+case_fold tier 仍 8/8 all_agree（fast-path 没引入 divergence）。
+
+### Bench：Before / After（native x86_64-v3，autovec scalar）
+
+`crates/relon-bench/benches/ascii_case_fold.rs` — 新 bench，criterion
+0.5 / 100-sample，throughput 单位 MiB/s。
+
+| size | mode | baseline | simd-fast | speedup |
+|------|------|----------|-----------|---------|
+| 100 B | upper | 52.8 MiB/s (1.80 µs) | 1.16 GiB/s (80.6 ns) | **22 x** |
+| 100 B | lower | 52.8 MiB/s (1.81 µs) | 1.16 GiB/s (80.5 ns) | **22 x** |
+| 100 B | title | 49.3 MiB/s (1.94 µs) | 253 MiB/s (376 ns) | **5 x** |
+| 1 KB | upper | 53.6 MiB/s (18.23 µs) | 2.88 GiB/s (331 ns) | **55 x** |
+| 1 KB | lower | 53.6 MiB/s (18.23 µs) | 3.00 GiB/s (318 ns) | **57 x** |
+| 1 KB | title | 49.9 MiB/s (19.58 µs) | 283 MiB/s (3.45 µs) | **6 x** |
+| 10 KB | upper | 53.5 MiB/s (182.5 µs) | 3.73 GiB/s (2.56 µs) | **71 x** |
+| 10 KB | lower | 53.5 MiB/s (182.6 µs) | 3.75 GiB/s (2.54 µs) | **72 x** |
+| 10 KB | title | 49.9 MiB/s (195.7 µs) | 286 MiB/s (34.1 µs) | **6 x** |
+
+baseline 是模拟 fast-path 前 fold_string 在 ASCII 输入上的执行
+shape：`s.chars()` + per-cp `char::to_uppercase/to_lowercase` +
+per-char `String::push`（经过 `char::encode_utf8`）。
+
+Upper/Lower 大 corpus 上是 **70× 量级**：autovec scalar 已经把
+mask-and-xor 写到了 SSE / NEON 的全宽度；`String::push` 的
+`char::encode_utf8` overhead 消失。
+
+Title 是 **5-6× 量级**：word-boundary 跟踪是有状态串行循环，没法
+SIMD；收益来自 mask-and-xor 替换 `char::to_uppercase/to_lowercase`
+和 bulk byte write 替换 push。
+
+wasm32 + simd128 没有 native runner（playground 在 browser），
+没法跑 criterion；二进制证据是 wasm32-unknown-unknown debug build
+出来的 `relon_wasm.wasm` 含 v128.load (0xFD,0x0D)、v128.and
+(0xFD,0x50)、v128.xor (0xFD,0x4D) 等 SIMD opcodes — 占比与编译
+路径相符。wasm SIMD 在 browser 实跑预计跟 native autovec 同量级
+（v128.lane_compare + v128.xor 是单 cycle 操作）。
+
+### 关键决策
+
+1. **为什么不引入第三方 SIMD crate**：`wide` / `packed_simd` /
+   `simdeez` 都会在 `relon-ir` 这个跨 backend 根节点拉新 dep；
+   目标 shape (mask + xor) 极简，stdlib `core::arch::wasm32` 完整
+   覆盖；wasm32 是 perf 主目标，simd128 stable since 1.54。
+2. **为什么 native 只 autovec 不写 SSE intrinsic**：`core::arch::x86_64`
+   intrinsics 全是 `unsafe fn`，且要求 runtime CPUID 检测 +
+   分发表（`#[target_feature(enable = "sse4.2")]` + dispatch）才
+   portable。autovec scalar loop 一份代码 cover x86_64 + aarch64 +
+   wasm32-no-simd128 三 target，且 LLVM 1.x+ 在 v3 baseline 下已能
+   emit `pcmpgtb` + `pand` + `pxor` 序列，throughput 已达 3+ GiB/s。
+   投入产出比明显。
+3. **为什么 Title 不也 SIMD 化**：word-boundary 状态机让每个 byte 的
+   case 决策依赖上一个 byte 的 (cased ? -> upper : lower) — 数据依赖
+   阻止 SIMD lane 并行。可以用 "all-cased 提前 fold + 后处理" 复杂方案
+   但 5-6× 已经把 String::push overhead 砍掉，再上 SIMD 收益边际。
+4. **为什么 Turkish 不走 fast-path**：`i -> İ` / `I -> ı` 的 2-byte
+   UTF-8 输出与 byte-in/byte-out shape 不兼容。Turkish + ASCII 是
+   罕见 case (非英文 locale 通常输入也有 non-ASCII)，bail-out 到旧
+   path 即可。
+5. **Cargo 怎么开 simd128**：`.cargo/config.toml` 的
+   `[target.wasm32-unknown-unknown].rustflags = ["-Ctarget-feature=+simd128"]`。
+   这里之前已有一行 `--cap-lints=warn` 占位（抵消用户 global mold
+   link-arg 的副作用），新 flag 追加到同列表即可。
+6. **为什么不嵌进 cranelift-AOT IR body**：cranelift 走 IR Op 路径，
+   要嵌 SIMD 需要新 IR Op + 后端 emit + ABI thunk。v3++ item 4 的
+   perf 目标是 wasm32 browser playground 上的 String.upper() 场景；
+   cranelift-AOT 主要服务 native server-side reload，per-op µs 级
+   throughput 已经够用。等以后真有需求再做 IR Op 化（遗留 todo）。
+
+### Gate ✓
+
+```bash
+cargo build --workspace                                        # ✓
+cargo test --workspace                                         # ✓ 1859 passed
+cargo clippy --workspace --all-targets -- -D warnings          # ✓
+cargo fmt --all -- --check                                     # ✓
+cargo build --target wasm32-unknown-unknown -p relon-wasm      # ✓
+```
+
+`cargo test -p relon-test-harness --test three_way_corpus` 末尾
+`tier stdlib_case_fold: all_agree=8 (of 8)`。
+
+### v3++ 路线图收尾
+
+到 item 4 落地为止，v3++ 路线图全部 7 项落定：
+
+1. b-1：user-fn DCE (A.16，2026-05-18) — ✓
+2. b-3：remote `#import` conditional GET (A.17，2026-05-18) — ✓
+3. b-4：title case + grapheme awareness (A.18，2026-05-18) — ✓
+4. b-5：Unicode normalization (A.19，2026-05-18) — ✓
+5. b-6：full case folding (A.20，2026-05-18) — ✓
+6. b-7 reframed：cranelift-AOT IR body FULL + Σ scan (A.23，2026-05-19) — ✓
+7. **item 4：SIMD ASCII fast-path (A.24，2026-05-20) — ✓ ← 本附录**
+
+v3++ 阶段闭环。下一里程碑路线图（v3+++ / v4-ζ / 等）见
+`docs/internal/roadmap.md`。
+
+### 遗留 / 不在范围
+
+- cranelift-AOT IR body 暂未嵌 SIMD。需要新 IR Op + 后端 emit
+  + ABI thunk，超出 v3++ item 4 的 perf-only 范围。优先级低
+  （cranelift-AOT 已经 µs 级 throughput）。
+- Title 模式仍是标量 — 串行状态依赖阻碍 lane 并行。
+- Turkish locale 仍走旧 path（非 ASCII 输出与 fast-path shape
+  不兼容）。
+

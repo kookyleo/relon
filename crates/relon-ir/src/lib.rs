@@ -1,4 +1,11 @@
-#![forbid(unsafe_code)]
+// Relaxed from `forbid` to `deny` so the v3++ item 4 SIMD ASCII fast
+// path (`ascii_fold_simd`) can use wasm32 `v128_load` / `v128_store`
+// intrinsics, both of which are `unsafe fn` in `core::arch::wasm32`.
+// The `unsafe` blocks are confined to that single module behind a
+// `#[allow(unsafe_code)]` and each has a SAFETY comment; the rest of
+// the crate stays unsafe-free.
+#![deny(unsafe_code)]
+#![deny(unsafe_op_in_unsafe_fn)]
 
 //! Linear-typed IR between `relon-analyzer`'s `AnalyzedTree` and
 //! codegen backends (WASM, future native / JS).
@@ -17,6 +24,7 @@
 //! See `docs/internal/wasm-crate-structure-2026-05-16.md` for the
 //! IR-first crate split rationale.
 
+pub mod ascii_fold_simd;
 pub mod case_folding;
 pub mod combining_marks;
 pub mod error;
