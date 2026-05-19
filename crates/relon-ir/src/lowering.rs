@@ -3510,7 +3510,7 @@ fn lower_schema_methods<'a>(
     // Second pass: lower each method's body now that the registry is
     // fully populated.
     let mut funcs: Vec<Func> = Vec::with_capacity(enumerated.len());
-    for (m, sig) in enumerated.iter().zip(method_sigs.into_iter()) {
+    for (m, sig) in enumerated.iter().zip(method_sigs) {
         let func = lower_one_method(m, &sig, resolver, &registry)?;
         funcs.push(func);
     }

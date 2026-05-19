@@ -1357,10 +1357,8 @@ fn split_schema_colon_directive(node: &SyntaxNode, source: &str) -> Option<Schem
                     in_generics = false;
                     generics_gt_end = Some(t.text_range().end().into());
                 }
-                SyntaxKind::COLON => {
-                    if declared_name_tok.is_some() && body_expr.is_none() {
-                        saw_colon = true;
-                    }
+                SyntaxKind::COLON if declared_name_tok.is_some() && body_expr.is_none() => {
+                    saw_colon = true;
                 }
                 _ => {}
             },

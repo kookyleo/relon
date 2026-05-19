@@ -239,29 +239,23 @@ impl ConstPool {
                     }
                 }
             }
-            Op::CombiningMarkRangesAddr => {
-                if self.combining_marks_offset.is_none() {
-                    self.align_to(4);
-                    let off = u32::try_from(self.bytes.len()).map_err(|_| {
-                        CraneliftError::Codegen("const pool exceeds u32 range".into())
-                    })?;
-                    let table = relon_ir::combining_marks::combining_mark_ranges();
-                    let bytes = relon_ir::combining_marks::encode_ranges_bytes(table);
-                    self.bytes.extend_from_slice(&bytes);
-                    self.combining_marks_offset = Some(off);
-                }
+            Op::CombiningMarkRangesAddr if self.combining_marks_offset.is_none() => {
+                self.align_to(4);
+                let off = u32::try_from(self.bytes.len())
+                    .map_err(|_| CraneliftError::Codegen("const pool exceeds u32 range".into()))?;
+                let table = relon_ir::combining_marks::combining_mark_ranges();
+                let bytes = relon_ir::combining_marks::encode_ranges_bytes(table);
+                self.bytes.extend_from_slice(&bytes);
+                self.combining_marks_offset = Some(off);
             }
-            Op::WhitespaceRangesAddr => {
-                if self.whitespace_offset.is_none() {
-                    self.align_to(4);
-                    let off = u32::try_from(self.bytes.len()).map_err(|_| {
-                        CraneliftError::Codegen("const pool exceeds u32 range".into())
-                    })?;
-                    let table = relon_ir::whitespace::non_ascii_whitespace_ranges();
-                    let bytes = relon_ir::whitespace::encode_ranges_bytes(table);
-                    self.bytes.extend_from_slice(&bytes);
-                    self.whitespace_offset = Some(off);
-                }
+            Op::WhitespaceRangesAddr if self.whitespace_offset.is_none() => {
+                self.align_to(4);
+                let off = u32::try_from(self.bytes.len())
+                    .map_err(|_| CraneliftError::Codegen("const pool exceeds u32 range".into()))?;
+                let table = relon_ir::whitespace::non_ascii_whitespace_ranges();
+                let bytes = relon_ir::whitespace::encode_ranges_bytes(table);
+                self.bytes.extend_from_slice(&bytes);
+                self.whitespace_offset = Some(off);
             }
             Op::DecompTableAddr { compatibility } => {
                 let slot = if *compatibility {
@@ -294,31 +288,25 @@ impl ConstPool {
                     }
                 }
             }
-            Op::CccTableAddr => {
-                if self.ccc_offset.is_none() {
-                    self.align_to(4);
-                    let off = u32::try_from(self.bytes.len()).map_err(|_| {
-                        CraneliftError::Codegen("const pool exceeds u32 range".into())
-                    })?;
-                    let bytes = relon_ir::normalization::encode_ccc_table_bytes(
-                        relon_ir::normalization_data::CCC_TABLE,
-                    );
-                    self.bytes.extend_from_slice(&bytes);
-                    self.ccc_offset = Some(off);
-                }
+            Op::CccTableAddr if self.ccc_offset.is_none() => {
+                self.align_to(4);
+                let off = u32::try_from(self.bytes.len())
+                    .map_err(|_| CraneliftError::Codegen("const pool exceeds u32 range".into()))?;
+                let bytes = relon_ir::normalization::encode_ccc_table_bytes(
+                    relon_ir::normalization_data::CCC_TABLE,
+                );
+                self.bytes.extend_from_slice(&bytes);
+                self.ccc_offset = Some(off);
             }
-            Op::CompositionTableAddr => {
-                if self.composition_offset.is_none() {
-                    self.align_to(4);
-                    let off = u32::try_from(self.bytes.len()).map_err(|_| {
-                        CraneliftError::Codegen("const pool exceeds u32 range".into())
-                    })?;
-                    let bytes = relon_ir::normalization::encode_composition_table_bytes(
-                        relon_ir::normalization_data::COMPOSITION_PAIRS,
-                    );
-                    self.bytes.extend_from_slice(&bytes);
-                    self.composition_offset = Some(off);
-                }
+            Op::CompositionTableAddr if self.composition_offset.is_none() => {
+                self.align_to(4);
+                let off = u32::try_from(self.bytes.len())
+                    .map_err(|_| CraneliftError::Codegen("const pool exceeds u32 range".into()))?;
+                let bytes = relon_ir::normalization::encode_composition_table_bytes(
+                    relon_ir::normalization_data::COMPOSITION_PAIRS,
+                );
+                self.bytes.extend_from_slice(&bytes);
+                self.composition_offset = Some(off);
             }
             Op::FullCaseFoldTableAddr { upper } => {
                 let slot = if *upper {
@@ -345,29 +333,23 @@ impl ConstPool {
                     }
                 }
             }
-            Op::CasedRangesAddr => {
-                if self.cased_ranges_offset.is_none() {
-                    self.align_to(4);
-                    let off = u32::try_from(self.bytes.len()).map_err(|_| {
-                        CraneliftError::Codegen("const pool exceeds u32 range".into())
-                    })?;
-                    let table = relon_ir::full_case_folding::cased_ranges();
-                    let bytes = relon_ir::full_case_folding::encode_ranges_bytes(table);
-                    self.bytes.extend_from_slice(&bytes);
-                    self.cased_ranges_offset = Some(off);
-                }
+            Op::CasedRangesAddr if self.cased_ranges_offset.is_none() => {
+                self.align_to(4);
+                let off = u32::try_from(self.bytes.len())
+                    .map_err(|_| CraneliftError::Codegen("const pool exceeds u32 range".into()))?;
+                let table = relon_ir::full_case_folding::cased_ranges();
+                let bytes = relon_ir::full_case_folding::encode_ranges_bytes(table);
+                self.bytes.extend_from_slice(&bytes);
+                self.cased_ranges_offset = Some(off);
             }
-            Op::CaseIgnorableRangesAddr => {
-                if self.case_ignorable_ranges_offset.is_none() {
-                    self.align_to(4);
-                    let off = u32::try_from(self.bytes.len()).map_err(|_| {
-                        CraneliftError::Codegen("const pool exceeds u32 range".into())
-                    })?;
-                    let table = relon_ir::full_case_folding::case_ignorable_ranges();
-                    let bytes = relon_ir::full_case_folding::encode_ranges_bytes(table);
-                    self.bytes.extend_from_slice(&bytes);
-                    self.case_ignorable_ranges_offset = Some(off);
-                }
+            Op::CaseIgnorableRangesAddr if self.case_ignorable_ranges_offset.is_none() => {
+                self.align_to(4);
+                let off = u32::try_from(self.bytes.len())
+                    .map_err(|_| CraneliftError::Codegen("const pool exceeds u32 range".into()))?;
+                let table = relon_ir::full_case_folding::case_ignorable_ranges();
+                let bytes = relon_ir::full_case_folding::encode_ranges_bytes(table);
+                self.bytes.extend_from_slice(&bytes);
+                self.case_ignorable_ranges_offset = Some(off);
             }
             Op::TurkishCaseFoldTableAddr { upper } => {
                 let slot = if *upper {
@@ -1442,15 +1424,11 @@ fn body_needs_tail_cursor(body: &[TaggedOp]) -> bool {
                 then_body,
                 else_body,
                 ..
-            } => {
-                if body_needs_tail_cursor(then_body) || body_needs_tail_cursor(else_body) {
-                    return true;
-                }
+            } if body_needs_tail_cursor(then_body) || body_needs_tail_cursor(else_body) => {
+                return true;
             }
-            Op::Block { body, .. } | Op::Loop { body, .. } => {
-                if body_needs_tail_cursor(body) {
-                    return true;
-                }
+            Op::Block { body, .. } | Op::Loop { body, .. } if body_needs_tail_cursor(body) => {
+                return true;
             }
             _ => {}
         }

@@ -1673,10 +1673,10 @@ impl<'a> Parser<'a> {
                     | SyntaxKind::LT => {
                         bracket_depth += 1;
                     }
-                    SyntaxKind::R_BRACE | SyntaxKind::R_BRACK | SyntaxKind::GT => {
-                        if bracket_depth > 0 {
-                            bracket_depth -= 1;
-                        }
+                    SyntaxKind::R_BRACE | SyntaxKind::R_BRACK | SyntaxKind::GT
+                        if bracket_depth > 0 =>
+                    {
+                        bracket_depth -= 1;
                     }
                     _ => {}
                 }

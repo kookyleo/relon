@@ -807,10 +807,8 @@ fn collect_let_set_slots(body: &[TaggedOp]) -> Vec<u32> {
 fn walk_let_set(body: &[TaggedOp], out: &mut Vec<u32>, seen: &mut std::collections::HashSet<u32>) {
     for tagged in body {
         match &tagged.op {
-            Op::LetSet { idx, .. } => {
-                if seen.insert(*idx) {
-                    out.push(*idx);
-                }
+            Op::LetSet { idx, .. } if seen.insert(*idx) => {
+                out.push(*idx);
             }
             Op::Block { body, .. } | Op::Loop { body, .. } => {
                 walk_let_set(body, out, seen);
