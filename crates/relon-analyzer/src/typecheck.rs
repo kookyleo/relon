@@ -2301,20 +2301,21 @@ impl<'a> Walker<'a> {
                     }
                 }
             }
-            Expr::Dict(pairs) => {
-                if expected.path == vec!["Dict"] && expected.generics.len() == 2 {
-                    // We only check if Key is String for now (common case)
-                    if expected.generics[0].path == vec!["String"] {
-                        let inner_expected = &expected.generics[1];
-                        for (key, val) in pairs {
-                            if let TokenKey::String(k, _, _) = key {
-                                self.check_typed_binding(
-                                    inner_expected,
-                                    val,
-                                    &format!("{}.{}", field_name, k),
-                                );
-                            }
-                        }
+            // Only the common `Dict<String, V>` shape is descended into;
+            // other key types are deferred to the runtime checker.
+            Expr::Dict(pairs)
+                if expected.path == vec!["Dict"]
+                    && expected.generics.len() == 2
+                    && expected.generics[0].path == vec!["String"] =>
+            {
+                let inner_expected = &expected.generics[1];
+                for (key, val) in pairs {
+                    if let TokenKey::String(k, _, _) = key {
+                        self.check_typed_binding(
+                            inner_expected,
+                            val,
+                            &format!("{}.{}", field_name, k),
+                        );
                     }
                 }
             }
