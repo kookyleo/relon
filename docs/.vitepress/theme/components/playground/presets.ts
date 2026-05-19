@@ -31,6 +31,10 @@ export interface Preset {
 }
 
 const DEMO_MAIN = `// Try editing me - evaluate runs automatically.
+//
+// #relaxed keeps the untyped closure params in the helper functions;
+// strict mode by default would require explicit parameter types.
+#relaxed
 {
     currency(val, symbol): val + " " + symbol,
     multiply(a, b): a * b,
