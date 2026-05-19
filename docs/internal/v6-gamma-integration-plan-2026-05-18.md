@@ -1318,3 +1318,59 @@ recorder 侧的覆盖（5/5 shape 全部录制成功，markers + φ 配对正确
   Lua 出对照表。
 - 每次 λ-fix-* 改 perf 路径必跑 hardened bench + validators 通过 才能进下一 phase。
 
+---
+
+## 22. v6-λ-机器 quiescence + λ-1 LuaJIT install（DONE-MET-TARGET 2026-05-19）
+
+把 rigorous plan §6 的机器 quiescence 要求落成可执行 + 自检模块，并接入 mlua /
+LuaJIT 2.1 为 λ-2 paired workload 阶段做好依赖。
+
+### 22.1 λ-机器 quiescence
+
+| 交付 | 文件 | 角色 |
+|---|---|---|
+| 用户脚本（privileged） | `scripts/bench_quiescence.sh` | 设 performance governor / no_turbo / 报 thermal / 5s perf-stat noise check |
+| Rust 自检（read-only） | `crates/relon-bench/src/quiescence.rs` | bench 启动 `verify_quiescence()`；非 quiescent panic（`RELON_BENCH_FORCE_RUN=1` 覆盖） |
+| Integration test | `crates/relon-bench/tests/quiescence_check.rs` | `#[ignore]`-gated 手动跑：`cargo test -p relon-bench --test quiescence_check -- --ignored` |
+
+bench `trace_jit_hot_loop` 入口现在 `panic!("machine not quiescent")` 除非
+环境变量 override。3 个新 unit test 覆盖 collect_report / force-run env /
+failure Display。
+
+### 22.2 λ-1 LuaJIT install
+
+| 交付 | 文件 | 角色 |
+|---|---|---|
+| 用户脚本（非交互式 / 无 sudo） | `scripts/install_luajit_2_1.sh` | 克隆 LuaJIT v2.1 → /tmp/luajit-2.1，可选 system mode；mlua vendored 已自带 LuaJIT 所以该脚本对 bench crate 非必需 |
+| mlua dev-dep | `crates/relon-bench/Cargo.toml` | `mlua = { version = "0.10", features = ["luajit", "vendored", "macros"] }`；vendored 自带 LuaJIT，无 system 依赖 |
+| Smoke test | `crates/relon-bench/tests/lua_smoke.rs` | 2 gated test（1+1=2，sum 0..99=4950）+ 1 ignore boundary ballpark |
+| Boundary calibrate bench 行 | `crates/relon-bench/benches/trace_jit_hot_loop.rs` | `lua_boundary_calibrate` — mlua → LuaJIT noop 调用 × HOT_LOOP_N，作为 λ-2 减除基线 |
+
+### 22.3 实测 lua_boundary_calibrate（dev-box smoke）
+
+dev box（schedutil governor，load 4.47，`RELON_BENCH_FORCE_RUN=1` 强跑，quick 模式 2 samples）：
+
+| Row | p50 | p99 | max | tag |
+|---|---|---|---|---|
+| `lua_boundary_calibrate` | **94.90 ns/iter** | 94.92 | 94.92 | per_iter_alloc |
+
+在 task brief 预期的 50-200 ns 区间内；λ-2 跑前需在 quiescent 机上重测 200 sample。
+
+### 22.4 Gates
+
+`cargo test --workspace = 1798 passed`（λ-0 基线 1793 + 5：3 quiescence unit
+test + 2 lua smoke），全 6 个 gate（build / test / clippy -D warnings / fmt /
+wasm build / bench / validators / lua_smoke）通过。
+
+详 `docs/internal/v6-lambda-machine-luajit-stage-report-2026-05-19.md`。
+
+### 22.5 Carry-over
+
+- **λ-2**（12 workload paired bench）：W1-W12 各写 Relon 版 + Lua 版，
+  跨 backend × Lua 共 50 个 measurement。boundary cost 用本阶段 calibrate
+  数据从所有 Lua row 里减除。
+- **λ-3**（跑全 50 + 分析）：4-way Relon backend × LuaJIT 出 ratio 表 + 8
+  维度归因。
+- **本阶段已知 limitation**：dev box 不能锁 governor（schedutil 持久），
+  λ-2 / λ-3 必须在 quiescent 机上跑或显式 force-run 并在报告里说明。
+

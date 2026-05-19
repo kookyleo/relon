@@ -29,6 +29,7 @@
 //! | `trace_jit_loop_recorded` | same as `trace_jit_loop` plus the recorder-side invoke path's bookkeeping. | `#[zero_alloc]` (hot path) |
 //! | `rust_native_loop` | none. | `#[zero_alloc]` |
 //! | `dispatch_*` (all 7) | `TraceContext::with_capacity(64)` once per outer closure invocation; the inner Rust loop is `#[zero_alloc]`. | `#[zero_alloc]` (hot path) |
+//! | `lua_boundary_calibrate` (λ-1) | `mlua::Lua` + `mlua::Function` allocated ONCE per criterion bench fn (outside `iter_custom`); each `Function::call(())` does stack-balance work but no Lua-GC alloc on the hot path under LuaJIT. | `#[per_iter_alloc]` (LuaJIT stack frame; not heap-alloc but not strict zero) |
 //!
 //! ## Background — why the v6-γ / v6-δ shape was misleading
 //!
@@ -159,6 +160,7 @@ use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{Linkage, Module as _};
 
+use relon_bench::quiescence::verify_quiescence;
 use relon_codegen_native::{
     clear_recording, compile_inline_host_fn, global_trace_jit_state, register_recording,
     register_trace_runtime_symbols, trace_install::TraceJitState, CraneliftAotEvaluator,
@@ -893,6 +895,24 @@ fn args_acc_i_step_eval(acc: i64, i: i64) -> HashMap<String, Value> {
 // =====================================================================
 
 fn bench_hot_loop(c: &mut Criterion) {
+    // v6-λ-machine (2026-05-19): refuse to run the LuaJIT-comparison-ready
+    // bench on a non-quiescent machine. Override with
+    // `RELON_BENCH_FORCE_RUN=1` for dev iteration on locked-down boxes
+    // (CI, containers). `scripts/bench_quiescence.sh` performs the
+    // privileged setup; this self-check is read-only.
+    match verify_quiescence() {
+        Ok(report) => {
+            eprintln!("[bench] {}", report.summary());
+        }
+        Err(err) => {
+            // Print the full report to stderr so the user sees exactly
+            // what's missing before the panic message.
+            eprintln!("[bench] {err}");
+            eprintln!("[bench] {}", err.report.summary());
+            panic!("machine not quiescent; set RELON_BENCH_FORCE_RUN=1 to override");
+        }
+    }
+
     let mut group = c.benchmark_group("v6_epsilon_hot_loop");
     // v6-λ-0 trap F: sample_size = 200 (was 30 in v6-ε). The
     // bench_stats post-processor (`crates/relon-bench/src/bin/`)
@@ -1247,6 +1267,44 @@ fn bench_hot_loop(c: &mut Criterion) {
             });
         },
     );
+
+    // ---------------- λ-1 LuaJIT boundary calibrate ----------------
+    //
+    // v6-λ-1 (2026-05-19): mlua → LuaJIT call boundary cost. Sets up one
+    // Lua state, defines a Lua fn that returns a constant (`return 42`),
+    // then drives `HOT_LOOP_N` Rust-side calls through `mlua::Function::call`.
+    //
+    // This is the LuaJIT equivalent of the `dispatch_*` rows above:
+    // measures the Rust → LuaJIT boundary alone. Used by λ-2 paired
+    // workloads to subtract the boundary baseline from any Lua-side
+    // result.
+    //
+    // Expected envelope: 50-200 ns/iter — slower than the Relon dispatch
+    // rows (9.5 ns) because LuaJIT's `lua_pcall` carries a stack-balance
+    // check, error handler push, and a longjmp anchor on the C side.
+    //
+    // Trap E annotation: `#[per_iter_alloc]` (mlua's `call` packs
+    // argments into a Lua-side stack frame; LuaJIT can recycle without
+    // GC pressure on a tight loop but it's not strict zero-alloc).
+    let lua = mlua::Lua::new();
+    let lua_noop: mlua::Function = lua
+        .load("return function() return 42 end")
+        .eval()
+        .expect("Lua noop fn must compile");
+    group.bench_function(BenchmarkId::new("backend", "lua_boundary_calibrate"), |b| {
+        b.iter_custom(|iters| {
+            timed_with_warmup(iters, || {
+                let mut acc: i64 = 0;
+                for _ in 0..HOT_LOOP_N {
+                    let r: i64 = lua_noop.call(()).expect("Lua noop call");
+                    acc = acc.wrapping_add(black_box(r));
+                }
+                black_box(acc);
+            })
+        });
+    });
+    drop(lua_noop);
+    drop(lua);
 
     group.finish();
 }

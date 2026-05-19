@@ -97,8 +97,8 @@ fn trap_a_black_box_present_in_every_closure() {
     let src = bench_source();
     let closures = measurement_closures(&src);
     assert!(
-        closures.len() >= 11,
-        "expected ≥ 11 measurement closures (5 loop-INSIDE + 7 dispatch including baseline), got {}",
+        closures.len() >= 12,
+        "expected ≥ 12 measurement closures (5 loop-INSIDE + 7 dispatch including baseline + λ-1 lua_boundary_calibrate), got {}",
         closures.len()
     );
     for (label, body) in &closures {

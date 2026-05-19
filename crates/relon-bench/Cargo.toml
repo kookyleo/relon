@@ -78,6 +78,15 @@ relon-analyzer = { workspace = true }
 # read absolute magnitudes without spinning up the full criterion sampler.
 # For serious measurement run `cargo bench -p relon-bench` (group below).
 
+# v6-λ-1 (2026-05-19): mlua + LuaJIT for the Relon vs LuaJIT comparison
+# rounds. `vendored` lets mlua bundle its own LuaJIT 2.1 source, so neither
+# `scripts/install_luajit_2_1.sh` nor a system LuaJIT install is required for
+# the bench crate to build. The `luajit` feature pins the trace-JIT-class
+# runtime (vs the pure Lua interpreter). `macros` is needed for the
+# `#[mlua::lua_module]` / `lua.create_function` ergonomics the smoke test
+# exercises. Kept as a dev-dep so non-test consumers don't pull LuaJIT.
+mlua = { version = "0.10", features = ["luajit", "vendored", "macros"] }
+
 [[bench]]
 name = "harness_v1"
 harness = false
