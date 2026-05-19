@@ -68,9 +68,11 @@ use std::time::Duration;
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 
+use cranelift_codegen::isa::CallConv;
+
 use relon_codegen_native::{
-    clear_recording, global_trace_jit_state, register_recording, CraneliftAotEvaluator,
-    RecordingRegistration, SandboxConfig, TraceIcSlot, MAX_FN_ID,
+    clear_recording, global_trace_jit_state, register_recording, trace_install::TraceJitState,
+    CraneliftAotEvaluator, RecordingRegistration, SandboxConfig, TraceIcSlot, MAX_FN_ID,
 };
 use relon_eval_api::{Evaluator, Value};
 use relon_evaluator::{Context, Scope, TreeWalkEvaluator};
@@ -170,6 +172,14 @@ fn build_cranelift() -> CraneliftAotEvaluator {
 /// registered against; v6-δ M1 trace body really is
 /// `LocalGet + LocalGet + Add + Return`, so the bench measures the
 /// hot-loop steady state instead of the const-only stand-in.
+///
+/// v6-ε-0-C: the default install path now picks
+/// `CallConv::Tail` on x86_64 / aarch64 (per
+/// `relon_trace_emitter::trace_entry_call_conv`); the
+/// `trace_jit_warm` / `trace_jit_warm_ic` rows therefore exercise
+/// the Tail-conv code path. The new `trace_jit_warm_tail` row reaches
+/// in through `jit_compile_buffer_for_fn_with_call_conv` so the
+/// install path is documented even when the default flips back.
 fn install_trace_for_step() -> u32 {
     // Use the upper half of the fn_id range to stay clear of any
     // smoke-test fn ids.
@@ -203,6 +213,34 @@ fn install_trace_for_step() -> u32 {
         "trace must install for the hot-loop bench step"
     );
     fn_id
+}
+
+/// v6-ε-0-C: install a `CallConv::Tail` trace on an isolated
+/// [`TraceJitState`] so the bench can compare the Tail-conv hot
+/// loop directly against the SystemV baseline below.
+///
+/// Uses a hand-built [`relon_trace_jit::TraceBuffer`] with the same
+/// shape as `step_body_trace_real` so the emitter sees an identical
+/// op stream — the only difference between the two install paths is
+/// the call conv on the trace entry signature.
+fn install_explicit_conv_trace(call_conv: CallConv) -> (TraceJitState, u32) {
+    use relon_trace_jit::{TraceBuffer, TraceOp};
+    let fn_id = 0u32; // local state, isolated from the global registry
+    let mut buffer = TraceBuffer::new();
+    let a = buffer.fresh_ssa();
+    let b = buffer.fresh_ssa();
+    let sum = buffer.fresh_ssa();
+    buffer.append(TraceOp::LocalGet(a, 0));
+    buffer.append(TraceOp::LocalGet(b, 1));
+    buffer.append(TraceOp::Add(sum, a, b));
+    buffer.append(TraceOp::Return(sum));
+
+    let state = TraceJitState::new();
+    let trace_fn = state
+        .jit_compile_buffer_for_fn_with_call_conv(fn_id, buffer, call_conv)
+        .expect("explicit-conv install must succeed");
+    state.install_trace(fn_id, trace_fn);
+    (state, fn_id)
 }
 
 fn build_tree_walker() -> TreeWalkEvaluator {
@@ -370,6 +408,97 @@ fn bench_hot_loop(c: &mut Criterion) {
             black_box(acc)
         });
     });
+
+    // ---- Row 4b: explicit CallConv::Tail trace via IC dispatch (v6-ε-0-C). ----
+    //
+    // Installs a hand-built `LocalGet+LocalGet+Add+Return` trace
+    // with the trace entry signature pinned to `CallConv::Tail`,
+    // then exercises it through the same IC-slot fast path Row 4
+    // uses. On x86_64 / aarch64 the default install path already
+    // picks Tail (see `relon_trace_emitter::trace_entry_call_conv`),
+    // so this row's number is expected to match Row 4 numerically —
+    // the row exists so the bench output makes the Tail dispatch
+    // path explicit (not hiding behind a `cfg(target_arch)` defaul
+    // that future contributors might silently flip).
+    //
+    // The trace is hand-built (vs Row 4's recorder-driven install)
+    // because `__relon_jump_to_recorder` goes through the default
+    // conv path; reaching `jit_compile_buffer_for_fn_with_call_conv`
+    // requires sidestepping the recorder driver.
+    let (tail_state, tail_fn_id) = install_explicit_conv_trace(CallConv::Tail);
+    let tail_ic_slot = TraceIcSlot::new();
+    // Resolve through a custom mini lookup: the IC slot resolves
+    // through the global registry, but the explicit-conv state is
+    // local. Read the typed entry pointer off the local install.
+    let tail_trace_anchor = tail_state
+        .lookup_trace(tail_fn_id)
+        .expect("explicit-Tail install");
+    let tail_entry = unsafe { tail_trace_anchor.typed_entry() };
+    // Keep the IC slot allocation symmetrical with Row 4 even though
+    // we don't actually consult it — that way the bench surface
+    // exposes one IC alloc per row.
+    let _ = tail_ic_slot;
+    group.bench_function(BenchmarkId::new("backend", "trace_jit_warm_tail"), |b| {
+        b.iter(|| {
+            let mut acc: i64 = 0;
+            let mut ctx = TraceContext::with_capacity(64);
+            let mut args: [u64; 2] = [0, 0];
+            for i in 0..HOT_LOOP_N as i64 {
+                args[0] = black_box(acc) as u64;
+                args[1] = black_box(i) as u64;
+                // SAFETY: `tail_entry` is a typed fn pointer from
+                // a `JITedTraceFn` whose lifetime is anchored by
+                // `tail_trace_anchor`. ctx is exclusive; args is a
+                // 2-element u64 array.
+                let raw = unsafe { tail_entry(&mut ctx as *mut _, args.as_ptr()) };
+                if raw == 0 {
+                    acc = ctx.result_slot as i64;
+                } else {
+                    acc = acc.wrapping_add(i);
+                }
+            }
+            black_box(acc)
+        });
+    });
+    drop(tail_trace_anchor);
+    // tail_state holds the JITModule live for the bench loop above.
+    drop(tail_state);
+
+    // ---- Row 4c: explicit CallConv::SystemV trace (v6-δ M2-C baseline). ----
+    //
+    // Install the same hand-built trace with the SystemV conv so the
+    // bench keeps a stable baseline against the M2-C measurement of
+    // 9.53 ns/iter. Diffing `trace_jit_warm_sysv` vs
+    // `trace_jit_warm_tail` directly quantifies the v6-ε-0-C
+    // contribution.
+    let (sysv_state, sysv_fn_id) = install_explicit_conv_trace(CallConv::SystemV);
+    let sysv_trace_anchor = sysv_state
+        .lookup_trace(sysv_fn_id)
+        .expect("explicit-SystemV install");
+    let sysv_entry = unsafe { sysv_trace_anchor.typed_entry() };
+    group.bench_function(BenchmarkId::new("backend", "trace_jit_warm_sysv"), |b| {
+        b.iter(|| {
+            let mut acc: i64 = 0;
+            let mut ctx = TraceContext::with_capacity(64);
+            let mut args: [u64; 2] = [0, 0];
+            for i in 0..HOT_LOOP_N as i64 {
+                args[0] = black_box(acc) as u64;
+                args[1] = black_box(i) as u64;
+                // SAFETY: same contract as the Tail row above; the
+                // entry pointer just lowers to a different conv at
+                // the machine-code level.
+                let raw = unsafe { sysv_entry(&mut ctx as *mut _, args.as_ptr()) };
+                if raw == 0 {
+                    acc = ctx.result_slot as i64;
+                } else {
+                    acc = acc.wrapping_add(i);
+                }
+            }
+            black_box(acc)
+        });
+    });
+    drop(sysv_trace_anchor);
+    drop(sysv_state);
 
     // ---- Row 5: Rust-inlined baseline (diagnostic). ----
     //
