@@ -287,8 +287,11 @@ impl<'a, 'b> InlineEmitterState<'a, 'b> {
                 Err(InlineEmitError::CallNotSupportedInInline)
             }
             TraceOp::Return(v) => self.emit_return(*v),
-            TraceOp::MarkLoopHead { loop_id } => self.emit_loop_head(*loop_id),
-            TraceOp::MarkLoopBack { loop_id } => self.emit_loop_back(*loop_id),
+            TraceOp::MarkLoopHead { loop_id, phis } => self.emit_loop_head(*loop_id, phis),
+            TraceOp::MarkLoopBack {
+                loop_id,
+                next_values,
+            } => self.emit_loop_back(*loop_id, next_values),
         }
     }
 
@@ -442,20 +445,48 @@ impl<'a, 'b> InlineEmitterState<'a, 'b> {
         Ok(())
     }
 
-    fn emit_loop_head(&mut self, loop_id: u32) -> Result<(), InlineEmitError> {
+    fn emit_loop_head(
+        &mut self,
+        loop_id: u32,
+        phis: &[relon_trace_jit::LoopPhi],
+    ) -> Result<(), InlineEmitError> {
         let header = self.builder.create_block();
-        self.builder.ins().jump(header, &[]);
+
+        let mut init_vals: Vec<ir::Value> = Vec::with_capacity(phis.len());
+        for phi in phis {
+            let v = self.lookup(phi.init)?;
+            let widened = self.widen_to_i64(v);
+            init_vals.push(widened);
+        }
+        for phi in phis {
+            let bp = self.builder.append_block_param(header, I64);
+            self.bind(phi.phi, bp);
+        }
+
+        let init_args: Vec<BlockArg> = init_vals.iter().map(|v| BlockArg::Value(*v)).collect();
+        self.builder.ins().jump(header, &init_args);
         self.builder.switch_to_block(header);
         self.loop_head_blocks.insert(loop_id, header);
         Ok(())
     }
 
-    fn emit_loop_back(&mut self, loop_id: u32) -> Result<(), InlineEmitError> {
+    fn emit_loop_back(
+        &mut self,
+        loop_id: u32,
+        next_values: &[SsaVar],
+    ) -> Result<(), InlineEmitError> {
         let header = *self
             .loop_head_blocks
             .get(&loop_id)
             .ok_or(InlineEmitError::UnmatchedLoopBack(loop_id))?;
-        self.builder.ins().jump(header, &[]);
+        let mut args_vals: Vec<ir::Value> = Vec::with_capacity(next_values.len());
+        for v in next_values {
+            let val = self.lookup(*v)?;
+            let widened = self.widen_to_i64(val);
+            args_vals.push(widened);
+        }
+        let args: Vec<BlockArg> = args_vals.iter().map(|v| BlockArg::Value(*v)).collect();
+        self.builder.ins().jump(header, &args);
         self.builder.seal_block(header);
         let after = self.builder.create_block();
         self.builder.seal_block(after);

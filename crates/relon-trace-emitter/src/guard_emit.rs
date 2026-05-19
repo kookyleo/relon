@@ -62,27 +62,67 @@ pub fn emit_guard(
     site: &GuardSite,
     ssa_to_value: &HashMap<SsaVar, ir::Value>,
 ) -> Result<(), GuardEmitError> {
-    let cond = build_guard_predicate(ctx, &site.kind, ssa_to_value)?;
-    // brif: branch to `deopt_block` when the predicate is *false*
-    // (i.e. the guard fired). The deopt block takes two params:
-    //   - guard_trace_pc (i32)
-    //   - external_pc   (i64; truncated host pointer)
-    // We pass these in directly so the host helper signature can be
-    // a stable 3-arg shape `(ctx_ptr, pc, external_pc)`.
+    // ε-M0 fast paths: guard kinds whose predicate is already a
+    // single SSA bool value emit `brif` directly, skipping the
+    // synthetic icmp+uextend chain `build_guard_predicate` would
+    // otherwise produce. This saves ~1 ns/iter on the recorded
+    // hot-loop bench row where the same cmp result feeds an
+    // adjacent guard.
     let guard_pc = ctx
         .builder
         .ins()
         .iconst(I32, i64::from(site.trace_pc as i32));
     let external_pc = ctx.builder.ins().iconst(I64, site.deopt_pc.0 as i64);
-
     let ok_block = ctx.builder.create_block();
-    ctx.builder.ins().brif(
-        cond,
-        ok_block,
-        &[],
-        ctx.deopt_block,
-        &[BlockArg::Value(guard_pc), BlockArg::Value(external_pc)],
-    );
+
+    match &site.kind {
+        GuardKind::NotNull(var) => {
+            let v = ssa_to_value
+                .get(var)
+                .copied()
+                .ok_or(GuardEmitError::UnboundSsa(*var))?;
+            // Branch to ok when v != 0, deopt when v == 0.
+            ctx.builder.ins().brif(
+                v,
+                ok_block,
+                &[],
+                ctx.deopt_block,
+                &[BlockArg::Value(guard_pc), BlockArg::Value(external_pc)],
+            );
+        }
+        GuardKind::IsZero(var) => {
+            let v = ssa_to_value
+                .get(var)
+                .copied()
+                .ok_or(GuardEmitError::UnboundSsa(*var))?;
+            // Branch to deopt when v != 0, ok when v == 0. Swapping
+            // the target order on `brif` mirrors the IsZero polarity
+            // without an extra icmp.
+            ctx.builder.ins().brif(
+                v,
+                ctx.deopt_block,
+                &[BlockArg::Value(guard_pc), BlockArg::Value(external_pc)],
+                ok_block,
+                &[],
+            );
+        }
+        _ => {
+            let cond = build_guard_predicate(ctx, &site.kind, ssa_to_value)?;
+            // brif: branch to `deopt_block` when the predicate is
+            // *false* (i.e. the guard fired). The deopt block takes
+            // two params: (guard_trace_pc: i32, external_pc: i64);
+            // we pass these in directly so the host helper signature
+            // can be a stable 3-arg shape `(ctx_ptr, pc, external_pc)`.
+            ctx.builder.ins().brif(
+                cond,
+                ok_block,
+                &[],
+                ctx.deopt_block,
+                &[BlockArg::Value(guard_pc), BlockArg::Value(external_pc)],
+            );
+        }
+    }
+
     ctx.builder.seal_block(ok_block);
     ctx.builder.switch_to_block(ok_block);
     Ok(())
@@ -136,6 +176,21 @@ fn build_guard_predicate(
             // pattern). Matches the recorder's `Op::ReadStringByte`
             // pre-condition.
             let r = ctx.builder.ins().icmp(IntCC::UnsignedLessThan, v, l);
+            Ok(widen_to_i32(ctx, r))
+        }
+        GuardKind::IsZero(var) => {
+            // ε-M0 dual of `NotNull`: predicate is `(v == 0)` →
+            // passes (1) when v is zero, deopts when v becomes
+            // non-zero. Used for the BrIf fall-through arm in
+            // recorded loops where the recorded path requires cond=0
+            // to stay in the loop.
+            let v = ssa_to_value
+                .get(var)
+                .copied()
+                .ok_or(GuardEmitError::UnboundSsa(*var))?;
+            let ty = ctx.builder.func.dfg.value_type(v);
+            let zero = ctx.builder.ins().iconst(ty, 0);
+            let r = ctx.builder.ins().icmp(IntCC::Equal, v, zero);
             Ok(widen_to_i32(ctx, r))
         }
         GuardKind::ArithOverflow(var) => {
