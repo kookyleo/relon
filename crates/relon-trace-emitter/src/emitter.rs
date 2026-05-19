@@ -116,7 +116,40 @@ impl TraceEmitter {
         pointer_ty: ir::Type,
         hook_func_ids: HostHookFuncIds,
     ) -> Result<(), EmitError> {
-        let signature = TRACE_ENTRY_SIG.to_cranelift(pointer_ty, CallConv::SystemV);
+        Self::emit_with_hooks_and_call_conv(
+            trace,
+            ctx,
+            pointer_ty,
+            hook_func_ids,
+            crate::call_conv::trace_entry_call_conv(),
+        )
+    }
+
+    /// v6-ε-0-C: same as [`TraceEmitter::emit_with_hooks`] but with an
+    /// explicit calling convention for the trace entry function.
+    ///
+    /// Defaults via [`crate::call_conv::trace_entry_call_conv`] route
+    /// here picking [`CallConv::Tail`] on x86_64 + aarch64 and
+    /// [`CallConv::SystemV`] elsewhere. Tests / benches that want to
+    /// pin a specific conv (e.g. the comparison bench row that
+    /// installs both a Tail and a SystemV trace side-by-side) call
+    /// this variant directly.
+    ///
+    /// **Host hook helpers** (`save_deopt`, `resolve_call`,
+    /// `inline_cache_lookup`) keep their [`CallConv::SystemV`]
+    /// signatures regardless of the trace-entry conv: they're
+    /// implemented as Rust `extern "C"` functions which always use
+    /// the platform SysV/Fastcall ABI. Cranelift handles the
+    /// cross-conv `call` correctly because the clobber set is
+    /// computed from `call_conv_of_callee`.
+    pub fn emit_with_hooks_and_call_conv(
+        trace: &OptimizedTrace,
+        ctx: &mut CodegenContext,
+        pointer_ty: ir::Type,
+        hook_func_ids: HostHookFuncIds,
+        entry_call_conv: CallConv,
+    ) -> Result<(), EmitError> {
+        let signature = TRACE_ENTRY_SIG.to_cranelift(pointer_ty, entry_call_conv);
         ctx.func = Function::with_name_signature(UserFuncName::user(0, 0), signature.clone());
 
         let mut builder_ctx = FunctionBuilderContext::new();

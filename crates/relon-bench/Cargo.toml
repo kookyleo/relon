@@ -29,6 +29,12 @@ relon-eval-api = { workspace = true }
 # `JITedTraceFn::invoke` without going through `run_main`.
 relon-trace-abi = { workspace = true }
 relon-trace-jit = { workspace = true }
+# v6-ε-0-C: the `trace_jit_warm_tail` bench row installs a
+# `CallConv::Tail` trace explicitly (vs the default-conv install path
+# the `trace_jit_warm` / `trace_jit_warm_ic` rows go through) so the
+# comparison is direct. Pulling cranelift-codegen here only exposes
+# the `CallConv` enum to the bench surface.
+cranelift-codegen = "0.131"
 dhat = { version = "0.3", optional = true }
 
 [dev-dependencies]

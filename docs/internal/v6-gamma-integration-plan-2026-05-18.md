@@ -900,3 +900,97 @@ slot 拿不到这层成本——它在 v6-ε at-call-site inline 的范畴。
   save/restore。
 - **guard hoisting**：单独 plan，正交工作，看
   `docs/internal/v6-epsilon-guard-hoist-plan.md`。
+
+## 17. v6-ε-0-C — Tail call dispatch (DONE 2026-05-19, honest no-delta)
+
+详细见 `docs/internal/v6-epsilon-0c-stage-report-2026-05-19.md`。
+
+### 落地组件
+
+- `relon-trace-emitter::call_conv` 新模块：cfg-gated
+  `trace_entry_call_conv()` 返回 `Tail` (x86_64 + aarch64) /
+  `SystemV` (其他)。
+- `TraceEmitter::emit_with_hooks_and_call_conv` + 默认走 helper：
+  trace entry 默认 conv 切换。
+- `TraceJitState::jit_compile_buffer_for_fn_with_call_conv`：bench /
+  test 显式 pin conv 的入口。Default 路径 (`jit_compile_buffer_for_fn`)
+  代理调用，conv 由 `trace_entry_call_conv()` 决定。
+- Bench 新增 `trace_jit_warm_tail` + `trace_jit_warm_sysv` 行，
+  独立 `TraceJitState`，hand-built buffer 显式 conv，3 轮 criterion
+  对比。
+- Smoke test `tests/trace_jit_tail_smoke.rs` 4 case 包括 cross-conv
+  deopt path。
+
+### Gate numbers
+
+- `cargo build --workspace` clean。
+- `cargo test --workspace` **1751 passing** = 1746 (M2-C) + 5
+  (1 call_conv unit + 4 tail_smoke)。
+- `cargo clippy --workspace --all-targets -- -D warnings` clean。
+- `cargo fmt --all -- --check` clean。
+- `cargo build --target wasm32-unknown-unknown -p relon-wasm` clean。
+
+### Bench medians (3 rounds, R3)
+
+| row | ns/iter | vs M2-C 9.53 |
+|---|---|---|
+| trace_jit_warm | 9.49 | -0.04（噪声） |
+| trace_jit_warm_ic | 9.56 | +0.03（噪声） |
+| trace_jit_warm_tail | 9.54 | +0.01（噪声） |
+| trace_jit_warm_sysv | 9.53 | 0（基准对照） |
+| rust_inlined_baseline | 3.55 | 不变 |
+
+**Tail vs SysV 差距 = 0.01 ns ≈ criterion noise (< 0.1%)**。
+brief target ≤ 5 ns / aspirational ≤ 4 ns 均不达。
+
+### 4-way corpus parity
+
+52 case: 32 AllAgree + 4 AllTrap + 1 BytecodeMatchesBaseline +
+15 BytecodeUnsupported = **0 mismatch**（保持 M2-C clean envelope）。
+AllAgree +4 是 corpus 内部演化与本 phase 因果无关。
+
+### 关键 honest finding
+
+**M2-C 的「SystemV ABI prologue/epilogue = 6 ns 瓶颈」假设被
+falsified**。三轮实验显示 Tail vs SysV 数字几乎相同。
+
+诊断 (详见 stage report §5)：
+
+- Cranelift `CallConv::Tail` 与 `SystemV` 在 x86_64 上：同 callee-save
+  filter、同 clobber set、同 arg/ret reg。差别只在「callee pops
+  stack args」位——trace fn 零 stack args 时这位无操作。
+- M2-C 提到的「callee prologue 6 ns」实际是 cranelift leaf-fn
+  优化（`enable_probestack=false` + `preserve_frame_pointers=false`）
+  之后**接近 0 ns**。
+- 真 boundary cost = **call/ret pair + indirect call branch
+  predict + arg marshall + result read** = ~6 ns 固定 overhead，
+  **不能靠 conv 选择消除**。
+- 只能靠 **ε-0-A (at-call-site inline) 把整个 trace body 折进
+  host fn** 才能跨过 5 ns 门 → 进 LuaJIT 同 class。
+
+### Architecture decisions（≤ 5 bullets）
+
+1. **`CallConv::Tail` 默认 on supported targets, SystemV
+   fallback**：cfg-gated 静态分发，与
+   `cranelift_native::builder` 选的 ISA 永远一致。
+2. **Host hook helpers 保留 SystemV**：它们是 Rust `extern "C"`
+   fn，cranelift cross-conv `call` 通过 callee 侧 clobber lookup
+   自动正确处理（smoke test 走 deopt path 验证）。
+3. **Explicit-conv 入口而非全局 default 切换**：bench 需要并排
+   比 Tail vs SysV，只暴露 default 就只能跑一种。`_with_call_conv`
+   入口 + 默认走它的代理 = clean layering。
+4. **不删 `_warm` / `_ic` rows**：M2-C 提到的 fat-LTO inline 论证
+   仍需要 baseline diff。
+5. **No-delta 不当 blocker**：按 brief「Honest 'still doesn't
+   move'」执行。本 phase 实验 falsify M2-C 假设，给 ε-0-A 提供
+   anchor。
+
+### Carry-over to v6-ε-0-A
+
+- ε-0-A 现在是 **唯一可信攻略**——boundary cost 在 call/ret + arg
+  marshall + result read 三件套，只能 inline 消除。
+- `rust_inlined_baseline = 3.55 ns` 仍是 target band 最佳估计。
+  trace_jit_warm 9.54 − 3.55 = **5.99 ns 是 ε-0-A 的 budget**。
+- ε-0-B (trace-to-trace fall-through) 单 trace 场景不会动 bench，
+  转为 ε-1 之后再说。
+- Host hook helpers 仍保留 SystemV，ε-0-A 不应改这点。
