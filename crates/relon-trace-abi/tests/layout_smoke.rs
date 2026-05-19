@@ -85,18 +85,20 @@ fn trace_context_size_is_stable() {
     // Pinned size = sum of field widths:
     //   ssa_slots                       16 (Box fat ptr)
     //   result_slot                      8
-    //   deopt_state (Option<DSS>)       56 (rustc niches the None
+    //   deopt_state (Option<DSS>)       72 (rustc niches the None
     //                                       discriminant into the Box
     //                                       inside DSS so the option
-    //                                       is the same width as DSS)
+    //                                       is the same width as DSS;
+    //                                       v6-δ M2-B widened DSS to
+    //                                       carry `value_stack_copy`)
     //   host_hooks                      32 (4 x Option<fn ptr>)
     //   pending_recoverable_writes      24 (Vec<T> = (ptr, len, cap))
-    // Total: 136 bytes on 64-bit targets.
+    // Total: 152 bytes on 64-bit targets.
     //
     // If this assertion trips, *figure out which field grew* and
     // bump the expected size here AND update every emitter constant
     // that reads past the growing field.
-    assert_eq!(size_of::<TraceContext>(), 136);
+    assert_eq!(size_of::<TraceContext>(), 152);
 }
 
 #[test]
@@ -105,10 +107,11 @@ fn deopt_state_snapshot_size_is_stable() {
     //   guard_pc      4
     //   (padding)     4
     //   external_pc   8
-    //   ssa_slots_copy   16 (Box fat ptr)
+    //   ssa_slots_copy     16 (Box fat ptr)
     //   recoverable_writes 24 (Vec fat ptr)
-    // Total: 56 bytes on 64-bit targets.
-    assert_eq!(size_of::<DeoptStateSnapshot>(), 56);
+    //   value_stack_copy   16 (Box fat ptr; v6-δ M2-B widening)
+    // Total: 72 bytes on 64-bit targets.
+    assert_eq!(size_of::<DeoptStateSnapshot>(), 72);
 }
 
 #[test]

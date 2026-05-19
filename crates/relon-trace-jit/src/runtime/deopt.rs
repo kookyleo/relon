@@ -161,11 +161,20 @@ pub unsafe extern "C" fn __relon_trace_save_deopt(
         std::mem::take(&mut ctx.pending_recoverable_writes);
 
     // 3. Compose the snapshot and stash it on the context.
+    //
+    // v6-δ M2-B: `value_stack_copy` is empty here — the trace JIT
+    // operand model is purely SSA, so there is no per-step operand
+    // stack to drain at guard-fire time. Mid-expression operand stack
+    // rehydration happens host-side: backends that maintain an
+    // operand-stack-aware resume index (today only the bytecode VM)
+    // synthesise the value stack from the SSA snapshot + compile-time
+    // "stack-recipe" metadata at resume entry.
     ctx.deopt_state = Some(DeoptStateSnapshot {
         guard_pc,
         external_pc,
         ssa_slots_copy,
         recoverable_writes,
+        value_stack_copy: Vec::new().into_boxed_slice(),
     });
 }
 
@@ -250,6 +259,7 @@ mod tests {
                     before_value: 0xdef,
                 },
             ],
+            value_stack_copy: Vec::new().into_boxed_slice(),
         };
         let mappings = vec![
             (SsaVar(0), ExternalSlot(1000)),
@@ -303,6 +313,7 @@ mod tests {
             external_pc: 0,
             ssa_slots_copy: vec![7u64; 2].into_boxed_slice(),
             recoverable_writes: vec![],
+            value_stack_copy: Vec::new().into_boxed_slice(),
         };
         // SsaVar(99) is out of range of the 2-slot copy.
         let mappings = vec![(SsaVar(99), ExternalSlot(0))];

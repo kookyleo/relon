@@ -104,6 +104,7 @@ fn deopt_snapshot_apply_round_trips_through_trace_abi() {
         external_pc: 0x5000,
         ssa_slots_copy: vec![100u64, 200, 300].into_boxed_slice(),
         recoverable_writes: Vec::<RecoverableWriteRecord>::new(),
+        value_stack_copy: Vec::new().into_boxed_slice(),
     };
     // SAFETY: empty recoverable_writes => no raw memory writes.
     unsafe {

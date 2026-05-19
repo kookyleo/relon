@@ -66,10 +66,21 @@ pub struct RecoverableWriteRecord {
 /// `#[repr(C)]` is load-bearing: the cranelift emitter writes
 /// `guard_pc` and `external_pc` through this struct by raw byte
 /// offset before tail-calling `__relon_trace_save_deopt` to populate
-/// the heap-backed fields (`ssa_slots_copy`, `recoverable_writes`).
+/// the heap-backed fields (`ssa_slots_copy`, `recoverable_writes`,
+/// `value_stack_copy`).
 ///
 /// Reviewers: any field reorder/insert here **MUST** be matched in
 /// `relon-trace-emitter`'s lowering and in the layout smoke tests.
+///
+/// v6-δ M2-B widens the snapshot with `value_stack_copy` —
+/// the mid-expression operand-stack snapshot the bytecode VM consults
+/// during partial-resume. The trace JIT itself is purely SSA-based
+/// (no stack), so the field stays empty on guards taken at non-stack
+/// points; mid-expression deopts on the cranelift-AOT side will
+/// populate it through the recorder-driven `value_stack_at_pc`
+/// metadata once the recorder gains operand-stack tracking. Today the
+/// field is populated **only** by the bytecode-side partial-resume
+/// tests and the host's bytecode-driven deopt fallback.
 #[repr(C)]
 #[derive(Debug)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
@@ -86,6 +97,16 @@ pub struct DeoptStateSnapshot {
     /// Recoverable writes drained out of the context's pending list,
     /// in the order they were recorded.
     pub recoverable_writes: Vec<RecoverableWriteRecord>,
+    /// v6-δ M2-B: mid-expression operand-stack snapshot.
+    ///
+    /// Each entry is a single 64-bit value the generic backend (today
+    /// the bytecode VM) should push onto its operand stack **in order**
+    /// before resuming at `external_pc`. The trace emitter populates
+    /// this via the recorder's `value_stack_at_pc` side-table when the
+    /// guard fires at a mid-expression PC (operand-stack-non-empty);
+    /// guards taken at expression boundaries leave the slice empty,
+    /// matching the M2-A behaviour.
+    pub value_stack_copy: Box<[u64]>,
 }
 
 impl DeoptStateSnapshot {
@@ -98,6 +119,28 @@ impl DeoptStateSnapshot {
             external_pc,
             ssa_slots_copy: Vec::new().into_boxed_slice(),
             recoverable_writes: Vec::new(),
+            value_stack_copy: Vec::new().into_boxed_slice(),
+        }
+    }
+
+    /// v6-δ M2-B constructor for tests / hosts that already hold the
+    /// value-stack contents. Production code populates via
+    /// `__relon_trace_save_deopt` once the recorder grows
+    /// operand-stack tracking; the direct constructor remains
+    /// available so unit tests can pin partial-resume semantics
+    /// without spinning up the trace recorder.
+    pub fn with_value_stack(
+        guard_pc: u32,
+        external_pc: u64,
+        ssa_slots_copy: Box<[u64]>,
+        value_stack_copy: Box<[u64]>,
+    ) -> Self {
+        Self {
+            guard_pc,
+            external_pc,
+            ssa_slots_copy,
+            recoverable_writes: Vec::new(),
+            value_stack_copy,
         }
     }
 
@@ -202,6 +245,7 @@ mod tests {
             external_pc: 0,
             ssa_slots_copy: vec![11u64, 22, 33].into_boxed_slice(),
             recoverable_writes: vec![],
+            value_stack_copy: Vec::new().into_boxed_slice(),
         };
         // SAFETY: empty recoverable_writes => no raw memory writes.
         unsafe {
@@ -229,6 +273,7 @@ mod tests {
                 addr,
                 before_value: 0xdead_beef,
             }],
+            value_stack_copy: Vec::new().into_boxed_slice(),
         };
         // SAFETY: `addr` points to `storage` which is live for the
         // duration of the test.
@@ -250,6 +295,7 @@ mod tests {
             external_pc: 0,
             ssa_slots_copy: vec![1u64, 2, 3, 4, 5].into_boxed_slice(),
             recoverable_writes: vec![],
+            value_stack_copy: Vec::new().into_boxed_slice(),
         };
         unsafe {
             snap.apply(&mut ctx);
