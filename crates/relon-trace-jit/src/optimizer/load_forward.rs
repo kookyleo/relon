@@ -196,6 +196,21 @@ fn rewrite_inputs(op: &mut TraceOp, alias: &HashMap<SsaVar, SsaVar>) -> usize {
                 swap!(a);
             }
         }
+        // F-D7 string ops carry SSA inputs that may shadow a load
+        // the forwarding pass replaced earlier. Swap each input slot
+        // so a `StrContains(haystack=load_dst, needle=...)` re-uses
+        // the forwarded source if the underlying load was DCE-d.
+        TraceOp::StrConcat(_dst, a, b)
+        | TraceOp::StrContains(_dst, a, b)
+        | TraceOp::StrFind(_dst, a, b) => {
+            swap!(a);
+            swap!(b);
+        }
+        TraceOp::StrSubstring(_dst, s, start, len) => {
+            swap!(s);
+            swap!(start);
+            swap!(len);
+        }
         TraceOp::Return(v) => {
             swap!(v);
         }
