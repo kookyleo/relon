@@ -65,8 +65,13 @@ const TREE_WALK_N: u64 = 10_000;
 /// W3 (string concat) Lua / Relon are O(N^2) under naive concat; smaller N
 /// keeps the bench wall-clock bounded.
 const STRING_CONCAT_N: u64 = 2_000;
-/// W7 (fib recursion) — fib(28) is a reasonable depth for both runtimes.
-const FIB_N: u64 = 28;
+/// W7 (fib recursion) — fib(22) keeps tree-walker stack under the default
+/// thread limit (~2 MB); the tree-walker's per-frame stack cost is high
+/// because every call clones a Scope. LuaJIT handles fib(28) without
+/// issue but to keep the consistency check fair (same N for both), we
+/// cap at 22 here. The criterion main thread default stack is enough
+/// for fib(22) tree-walking; fib(28) overflows.
+const FIB_N: u64 = 22;
 /// W10 (config eval) — number of access-control queries per call.
 const CONFIG_QUERIES_N: u64 = 1_000;
 
@@ -95,13 +100,17 @@ fn timed_with_warmup<F: FnMut()>(iters: u64, mut routine: F) -> Duration {
 
 /// Build a tree-walking evaluator from Relon source.
 fn build_tree_walker(src: &str) -> (TreeWalkEvaluator, Arc<Scope>) {
-    let node = parse_document(src).unwrap_or_else(|e| panic!("parse failed for source:\n{src}\nerror: {e:?}"));
+    let node = parse_document(src)
+        .unwrap_or_else(|e| panic!("parse failed for source:\n{src}\nerror: {e:?}"));
     let analyzed = Arc::new(relon_analyzer::analyze(&node));
     let mut ctx = Context::new()
         .with_root(node)
         .with_analyzed(Arc::clone(&analyzed));
     TreeWalkEvaluator::prepare_in_place(&mut ctx);
-    (TreeWalkEvaluator::new(Arc::new(ctx)), Arc::new(Scope::default()))
+    (
+        TreeWalkEvaluator::new(Arc::new(ctx)),
+        Arc::new(Scope::default()),
+    )
 }
 
 /// Build a Lua function from source: the source must be a `return function(...) ... end`
@@ -154,17 +163,12 @@ fn w1_expected() -> i64 {
 const W2_N: i64 = 1_000;
 
 fn w2_relon_src() -> &'static str {
-    // Build two lists deterministically via map+range, then fold a + b sum.
-    // Use Int arithmetic (Relon Float dot via map/reduce is supported but
-    // slower); the key adversarial point is list[i] access pattern.
+    // Inline form: sum (i+1)*(i+2) for i in 0..n via map+sum.
+    // Avoids local-let dict bindings (Relon's #private only works in the
+    // top-level main body, not inside arbitrary expressions).
     "#import list from \"std/list\"\n\
      #main(Int n) -> Int\n\
-     {\n\
-       #private xs: range(n).map((i) => i + 1),\n\
-       #private ys: range(n).map((i) => i + 2),\n\
-       #private pairs: range(n).map((i) => xs[i] * ys[i]),\n\
-       list.sum(pairs)\n\
-     }.value"
+     list.sum(range(n).map((i) => (i + 1) * (i + 2)))"
 }
 
 fn w2_lua_src() -> String {
@@ -271,14 +275,17 @@ fn w4_expected() -> i64 {
 // Build a fixed 10-entry dict, sum values across a key list of length n.
 
 fn w5_relon_src() -> &'static str {
+    // Top-level dict body with #private bindings, returning .result.
+    // Dict body is the only place #private is legal.
     "#import list from \"std/list\"\n\
-     #main(Int n) -> Int\n\
+     #main(Int n) -> Dict\n\
      {\n\
-       #private d: { a: 1, b: 2, c: 3, d: 4, e: 5, f: 6, g: 7, h: 8, i: 9, j: 10 },\n\
-       #private keys: [\"a\", \"b\", \"c\", \"d\", \"e\", \"f\", \"g\", \"h\", \"i\", \"j\"],\n\
-       #private picks: range(n).map((i) => keys[i % 10]),\n\
-       list.sum(picks.map((k) => d[k]))\n\
-     }.value"
+       #private\n\
+       d: { a: 1, b: 2, c: 3, d: 4, e: 5, f: 6, g: 7, h: 8, i: 9, j: 10 },\n\
+       #private\n\
+       keys: [\"a\", \"b\", \"c\", \"d\", \"e\", \"f\", \"g\", \"h\", \"i\", \"j\"],\n\
+       result: list.sum(range(n).map((i) => d[keys[i % 10]]))\n\
+     }"
 }
 
 fn w5_lua_src() -> String {
@@ -320,13 +327,10 @@ fn w5_expected() -> i64 {
 
 fn w6_relon_src() -> &'static str {
     // Relon dicts are string-keyed; we approximate "dense numeric key"
-    // via a List<Int> instead, which IS the LuaJIT array-part comparison.
+    // via a List<Int>, which IS the LuaJIT array-part comparison.
     "#import list from \"std/list\"\n\
      #main(Int n) -> Int\n\
-     {\n\
-       #private arr: range(n).map((i) => i + 1),\n\
-       list.sum(arr)\n\
-     }.value"
+     list.sum(range(n).map((i) => i + 1))"
 }
 
 fn w6_lua_src() -> String {
@@ -355,11 +359,15 @@ fn w6_expected() -> i64 {
 // D1 + call ABI + recursion. fib(N) where N=28 ~ 317k calls.
 
 fn w7_relon_src() -> &'static str {
-    "#main(Int n) -> Int\n\
+    // Recursive closure defined at top-level dict-body scope; returns
+    // the value via the `result` key. Pulled out of `.value` because
+    // member-access on dict-body is the only public selector.
+    "#main(Int n) -> Dict\n\
      {\n\
-       #private fib: (k) => k < 2 ? k : fib(k - 1) + fib(k - 2),\n\
-       fib(n)\n\
-     }.value"
+       #private\n\
+       fib: (k) => k < 2 ? k : fib(k - 1) + fib(k - 2),\n\
+       result: fib(n)\n\
+     }"
 }
 
 fn w7_lua_src() -> String {
@@ -396,20 +404,15 @@ fn w7_expected() -> i64 {
 // polymorphism?
 
 fn w8_relon_src() -> &'static str {
-    // Tree-walker can dispatch a closure across types via runtime checks.
-    // Use a simpler proxy: build a list with rotating wrapped variants and
-    // dispatch a function-by-tag. Relon doesn't have anonymous unions easily,
-    // so we use an Int-tag approach.
+    // Relon doesn't have anonymous unions easily, so we use an Int-tag
+    // approach. Closure body is defined at the top-level dict scope.
     "#import list from \"std/list\"\n\
-     #main(Int n) -> Int\n\
+     #main(Int n) -> Dict\n\
      {\n\
-       #private dispatch: (tag) =>\n\
-         tag == 0 ? 1 :\n\
-         tag == 1 ? 2 :\n\
-         tag == 2 ? 3 : 4,\n\
-       #private tags: range(n).map((i) => i % 4),\n\
-       list.sum(tags.map((t) => dispatch(t)))\n\
-     }.value"
+       #private\n\
+       dispatch: (tag) => tag == 0 ? 1 : tag == 1 ? 2 : tag == 2 ? 3 : 4,\n\
+       result: list.sum(range(n).map((i) => dispatch(i % 4)))\n\
+     }"
 }
 
 fn w8_lua_src() -> String {
@@ -460,14 +463,13 @@ fn w9_relon_src() -> &'static str {
     // Relon doesn't have efficient 2D arrays; we approximate with
     // nested list.reduce. Use smaller N internally.
     "#import list from \"std/list\"\n\
-     #main(Int n) -> Int\n\
+     #main(Int n) -> Dict\n\
      {\n\
-       #private rows: range(n).map((i) => range(n).map((j) => i * n + j)),\n\
-       #private transposed_sum: range(n).reduce(0, (acc, j) =>\n\
-         acc + range(n).reduce(0, (inner, i) => inner + rows[i][j])\n\
-       ),\n\
-       transposed_sum\n\
-     }.value"
+       #private\n\
+       rows: range(n).map((i) => range(n).map((j) => i * n + j)),\n\
+       result: range(n).reduce(0, (acc, j) =>\n\
+         acc + range(n).reduce(0, (inner, i) => inner + rows[i][j]))\n\
+     }"
 }
 
 fn w9_lua_src() -> String {
@@ -487,7 +489,7 @@ fn w9_lua_src() -> String {
             end
             return sum
         end"#,
-        n = 32  // intentionally small for tree-walker
+        n = 32 // intentionally small for tree-walker
     )
 }
 
@@ -519,22 +521,20 @@ fn w9_relon_n_arg() -> HashMap<String, Value> {
 // resource. Combination of role-check, region-check, time-check.
 
 fn w10_relon_src() -> &'static str {
-    // 10-rule access control. user = {role, region, hour, plan}.
-    // Each call evaluates 10 rules and returns count of allowed.
+    // 10-rule access control. Inline the role/region/hour predicates
+    // into a single boolean expression so we don't need nested
+    // dict-body scopes (Relon parser rejects #private outside the
+    // top-level main dict body).
     "#import list from \"std/list\"\n\
-     #main(Int n) -> Int\n\
+     #main(Int n) -> Dict\n\
      {\n\
-       #private check: (i) => {\n\
-         #private role: i % 3 == 0 ? \"admin\" : i % 3 == 1 ? \"user\" : \"guest\",\n\
-         #private region: i % 4 == 0 ? \"us\" : i % 4 == 1 ? \"eu\" : i % 4 == 2 ? \"apac\" : \"other\",\n\
-         #private hour: i % 24,\n\
-         #private allow_role: role == \"admin\" || role == \"user\",\n\
-         #private allow_region: region == \"us\" || region == \"eu\",\n\
-         #private allow_hour: hour >= 8 && hour < 18,\n\
-         allow_role && allow_region && allow_hour ? 1 : 0\n\
-       }.value,\n\
-       list.sum(range(n).map(check))\n\
-     }.value"
+       #private\n\
+       allow: (i) =>\n\
+         (i % 3 == 0 || i % 3 == 1) &&\n\
+         (i % 4 == 0 || i % 4 == 1) &&\n\
+         (i % 24 >= 8 && i % 24 < 18) ? 1 : 0,\n\
+       result: list.sum(range(n).map(allow))\n\
+     }"
 }
 
 fn w10_lua_src() -> String {
@@ -641,6 +641,19 @@ fn assert_relon_lua_consistent(w: &str, relon_v: i64, lua_v: i64, expected: i64)
     );
 }
 
+/// Extract an Int value from a Relon `Value`. For Dict-returning workloads
+/// we look up `result`; for Int-returning workloads the value itself.
+fn relon_int_result(w: &str, v: Value) -> i64 {
+    match v {
+        Value::Int(n) => n,
+        Value::Dict(d) => match d.map.get("result") {
+            Some(Value::Int(n)) => *n,
+            other => panic!("{w}: dict.result is not Int: {other:?}"),
+        },
+        other => panic!("{w}: Relon result not Int or Dict: {other:?}"),
+    }
+}
+
 // =====================================================================
 // =====  bench entry  =================================================
 // =====================================================================
@@ -736,7 +749,10 @@ fn bench_cmp_lua(c: &mut Criterion) {
         let lua_fn_w3 = lua_fn(&lua, &w3_lua_src());
 
         // Relon returns a String of length STRING_CONCAT_N; Lua returns #s.
-        let relon_v = match walker.run_main(&scope, args_w_n(STRING_CONCAT_N as i64)).unwrap() {
+        let relon_v = match walker
+            .run_main(&scope, args_w_n(STRING_CONCAT_N as i64))
+            .unwrap()
+        {
             Value::String(s) => s.len() as i64,
             other => panic!("W3 Relon non-string: {other:?}"),
         };
@@ -744,15 +760,18 @@ fn bench_cmp_lua(c: &mut Criterion) {
         assert_relon_lua_consistent("W3", relon_v, lua_v, w3_expected_relon_len());
 
         group.throughput(Throughput::Elements(STRING_CONCAT_N));
-        group.bench_function(BenchmarkId::new("W3_string_concat", "relon_tree_walk"), |b| {
-            b.iter_custom(|iters| {
-                let n_in = black_box(STRING_CONCAT_N as i64);
-                timed_with_warmup(iters, || {
-                    let v = walker.run_main(&scope, args_w_n(black_box(n_in))).unwrap();
-                    black_box(v);
-                })
-            });
-        });
+        group.bench_function(
+            BenchmarkId::new("W3_string_concat", "relon_tree_walk"),
+            |b| {
+                b.iter_custom(|iters| {
+                    let n_in = black_box(STRING_CONCAT_N as i64);
+                    timed_with_warmup(iters, || {
+                        let v = walker.run_main(&scope, args_w_n(black_box(n_in))).unwrap();
+                        black_box(v);
+                    })
+                });
+            },
+        );
         group.bench_function(BenchmarkId::new("W3_string_concat", "luajit"), |b| {
             b.iter_custom(|iters| {
                 timed_with_warmup(iters, || {
@@ -768,7 +787,10 @@ fn bench_cmp_lua(c: &mut Criterion) {
         let (walker, scope) = build_tree_walker(w4_relon_src());
         let lua_fn_w4 = lua_fn(&lua, &w4_lua_src());
 
-        let relon_v = match walker.run_main(&scope, args_w_n(TREE_WALK_N as i64)).unwrap() {
+        let relon_v = match walker
+            .run_main(&scope, args_w_n(TREE_WALK_N as i64))
+            .unwrap()
+        {
             Value::Int(v) => v,
             other => panic!("W4 Relon non-int: {other:?}"),
         };
@@ -776,15 +798,18 @@ fn bench_cmp_lua(c: &mut Criterion) {
         assert_relon_lua_consistent("W4", relon_v, lua_v, w4_expected());
 
         group.throughput(Throughput::Elements(TREE_WALK_N));
-        group.bench_function(BenchmarkId::new("W4_string_contains", "relon_tree_walk"), |b| {
-            b.iter_custom(|iters| {
-                let n_in = black_box(TREE_WALK_N as i64);
-                timed_with_warmup(iters, || {
-                    let v = walker.run_main(&scope, args_w_n(black_box(n_in))).unwrap();
-                    black_box(v);
-                })
-            });
-        });
+        group.bench_function(
+            BenchmarkId::new("W4_string_contains", "relon_tree_walk"),
+            |b| {
+                b.iter_custom(|iters| {
+                    let n_in = black_box(TREE_WALK_N as i64);
+                    timed_with_warmup(iters, || {
+                        let v = walker.run_main(&scope, args_w_n(black_box(n_in))).unwrap();
+                        black_box(v);
+                    })
+                });
+            },
+        );
         group.bench_function(BenchmarkId::new("W4_string_contains", "luajit"), |b| {
             b.iter_custom(|iters| {
                 timed_with_warmup(iters, || {
@@ -800,23 +825,28 @@ fn bench_cmp_lua(c: &mut Criterion) {
         let (walker, scope) = build_tree_walker(w5_relon_src());
         let lua_fn_w5 = lua_fn(&lua, &w5_lua_src());
 
-        let relon_v = match walker.run_main(&scope, args_w_n(TREE_WALK_N as i64)).unwrap() {
-            Value::Int(v) => v,
-            other => panic!("W5 Relon non-int: {other:?}"),
-        };
+        let relon_v = relon_int_result(
+            "W5",
+            walker
+                .run_main(&scope, args_w_n(TREE_WALK_N as i64))
+                .unwrap(),
+        );
         let lua_v: i64 = lua_fn_w5.call(()).unwrap();
         assert_relon_lua_consistent("W5", relon_v, lua_v, w5_expected());
 
         group.throughput(Throughput::Elements(TREE_WALK_N));
-        group.bench_function(BenchmarkId::new("W5_dict_str_key", "relon_tree_walk"), |b| {
-            b.iter_custom(|iters| {
-                let n_in = black_box(TREE_WALK_N as i64);
-                timed_with_warmup(iters, || {
-                    let v = walker.run_main(&scope, args_w_n(black_box(n_in))).unwrap();
-                    black_box(v);
-                })
-            });
-        });
+        group.bench_function(
+            BenchmarkId::new("W5_dict_str_key", "relon_tree_walk"),
+            |b| {
+                b.iter_custom(|iters| {
+                    let n_in = black_box(TREE_WALK_N as i64);
+                    timed_with_warmup(iters, || {
+                        let v = walker.run_main(&scope, args_w_n(black_box(n_in))).unwrap();
+                        black_box(v);
+                    })
+                });
+            },
+        );
         group.bench_function(BenchmarkId::new("W5_dict_str_key", "luajit"), |b| {
             b.iter_custom(|iters| {
                 timed_with_warmup(iters, || {
@@ -832,7 +862,10 @@ fn bench_cmp_lua(c: &mut Criterion) {
         let (walker, scope) = build_tree_walker(w6_relon_src());
         let lua_fn_w6 = lua_fn(&lua, &w6_lua_src());
 
-        let relon_v = match walker.run_main(&scope, args_w_n(TREE_WALK_N as i64)).unwrap() {
+        let relon_v = match walker
+            .run_main(&scope, args_w_n(TREE_WALK_N as i64))
+            .unwrap()
+        {
             Value::Int(v) => v,
             other => panic!("W6 Relon non-int: {other:?}"),
         };
@@ -840,15 +873,18 @@ fn bench_cmp_lua(c: &mut Criterion) {
         assert_relon_lua_consistent("W6", relon_v, lua_v, w6_expected());
 
         group.throughput(Throughput::Elements(TREE_WALK_N));
-        group.bench_function(BenchmarkId::new("W6_dict_num_key", "relon_tree_walk"), |b| {
-            b.iter_custom(|iters| {
-                let n_in = black_box(TREE_WALK_N as i64);
-                timed_with_warmup(iters, || {
-                    let v = walker.run_main(&scope, args_w_n(black_box(n_in))).unwrap();
-                    black_box(v);
-                })
-            });
-        });
+        group.bench_function(
+            BenchmarkId::new("W6_dict_num_key", "relon_tree_walk"),
+            |b| {
+                b.iter_custom(|iters| {
+                    let n_in = black_box(TREE_WALK_N as i64);
+                    timed_with_warmup(iters, || {
+                        let v = walker.run_main(&scope, args_w_n(black_box(n_in))).unwrap();
+                        black_box(v);
+                    })
+                });
+            },
+        );
         group.bench_function(BenchmarkId::new("W6_dict_num_key", "luajit"), |b| {
             b.iter_custom(|iters| {
                 timed_with_warmup(iters, || {
@@ -864,10 +900,10 @@ fn bench_cmp_lua(c: &mut Criterion) {
         let (walker, scope) = build_tree_walker(w7_relon_src());
         let lua_fn_w7 = lua_fn(&lua, &w7_lua_src());
 
-        let relon_v = match walker.run_main(&scope, args_w_n(FIB_N as i64)).unwrap() {
-            Value::Int(v) => v,
-            other => panic!("W7 Relon non-int: {other:?}"),
-        };
+        let relon_v = relon_int_result(
+            "W7",
+            walker.run_main(&scope, args_w_n(FIB_N as i64)).unwrap(),
+        );
         let lua_v: i64 = lua_fn_w7.call(()).unwrap();
         assert_relon_lua_consistent("W7", relon_v, lua_v, w7_expected());
 
@@ -897,23 +933,28 @@ fn bench_cmp_lua(c: &mut Criterion) {
         let (walker, scope) = build_tree_walker(w8_relon_src());
         let lua_fn_w8 = lua_fn(&lua, &w8_lua_src());
 
-        let relon_v = match walker.run_main(&scope, args_w_n(TREE_WALK_N as i64)).unwrap() {
-            Value::Int(v) => v,
-            other => panic!("W8 Relon non-int: {other:?}"),
-        };
+        let relon_v = relon_int_result(
+            "W8",
+            walker
+                .run_main(&scope, args_w_n(TREE_WALK_N as i64))
+                .unwrap(),
+        );
         let lua_v: i64 = lua_fn_w8.call(()).unwrap();
         assert_relon_lua_consistent("W8", relon_v, lua_v, w8_expected());
 
         group.throughput(Throughput::Elements(TREE_WALK_N));
-        group.bench_function(BenchmarkId::new("W8_poly_callsite", "relon_tree_walk"), |b| {
-            b.iter_custom(|iters| {
-                let n_in = black_box(TREE_WALK_N as i64);
-                timed_with_warmup(iters, || {
-                    let v = walker.run_main(&scope, args_w_n(black_box(n_in))).unwrap();
-                    black_box(v);
-                })
-            });
-        });
+        group.bench_function(
+            BenchmarkId::new("W8_poly_callsite", "relon_tree_walk"),
+            |b| {
+                b.iter_custom(|iters| {
+                    let n_in = black_box(TREE_WALK_N as i64);
+                    timed_with_warmup(iters, || {
+                        let v = walker.run_main(&scope, args_w_n(black_box(n_in))).unwrap();
+                        black_box(v);
+                    })
+                });
+            },
+        );
         group.bench_function(BenchmarkId::new("W8_poly_callsite", "luajit"), |b| {
             b.iter_custom(|iters| {
                 timed_with_warmup(iters, || {
@@ -929,23 +970,23 @@ fn bench_cmp_lua(c: &mut Criterion) {
         let (walker, scope) = build_tree_walker(w9_relon_src());
         let lua_fn_w9 = lua_fn(&lua, &w9_lua_src());
 
-        let relon_v = match walker.run_main(&scope, w9_relon_n_arg()).unwrap() {
-            Value::Int(v) => v,
-            other => panic!("W9 Relon non-int: {other:?}"),
-        };
+        let relon_v = relon_int_result("W9", walker.run_main(&scope, w9_relon_n_arg()).unwrap());
         let lua_v: i64 = lua_fn_w9.call(()).unwrap();
         assert_relon_lua_consistent("W9", relon_v, lua_v, w9_expected());
 
         let inner = (W9_N as u64) * (W9_N as u64);
         group.throughput(Throughput::Elements(inner));
-        group.bench_function(BenchmarkId::new("W9_nested_matrix", "relon_tree_walk"), |b| {
-            b.iter_custom(|iters| {
-                timed_with_warmup(iters, || {
-                    let v = walker.run_main(&scope, w9_relon_n_arg()).unwrap();
-                    black_box(v);
-                })
-            });
-        });
+        group.bench_function(
+            BenchmarkId::new("W9_nested_matrix", "relon_tree_walk"),
+            |b| {
+                b.iter_custom(|iters| {
+                    timed_with_warmup(iters, || {
+                        let v = walker.run_main(&scope, w9_relon_n_arg()).unwrap();
+                        black_box(v);
+                    })
+                });
+            },
+        );
         group.bench_function(BenchmarkId::new("W9_nested_matrix", "luajit"), |b| {
             b.iter_custom(|iters| {
                 timed_with_warmup(iters, || {
@@ -961,23 +1002,28 @@ fn bench_cmp_lua(c: &mut Criterion) {
         let (walker, scope) = build_tree_walker(w10_relon_src());
         let lua_fn_w10 = lua_fn(&lua, &w10_lua_src());
 
-        let relon_v = match walker.run_main(&scope, args_w_n(CONFIG_QUERIES_N as i64)).unwrap() {
-            Value::Int(v) => v,
-            other => panic!("W10 Relon non-int: {other:?}"),
-        };
+        let relon_v = relon_int_result(
+            "W10",
+            walker
+                .run_main(&scope, args_w_n(CONFIG_QUERIES_N as i64))
+                .unwrap(),
+        );
         let lua_v: i64 = lua_fn_w10.call(()).unwrap();
         assert_relon_lua_consistent("W10", relon_v, lua_v, w10_expected());
 
         group.throughput(Throughput::Elements(CONFIG_QUERIES_N));
-        group.bench_function(BenchmarkId::new("W10_config_eval", "relon_tree_walk"), |b| {
-            b.iter_custom(|iters| {
-                let n_in = black_box(CONFIG_QUERIES_N as i64);
-                timed_with_warmup(iters, || {
-                    let v = walker.run_main(&scope, args_w_n(black_box(n_in))).unwrap();
-                    black_box(v);
-                })
-            });
-        });
+        group.bench_function(
+            BenchmarkId::new("W10_config_eval", "relon_tree_walk"),
+            |b| {
+                b.iter_custom(|iters| {
+                    let n_in = black_box(CONFIG_QUERIES_N as i64);
+                    timed_with_warmup(iters, || {
+                        let v = walker.run_main(&scope, args_w_n(black_box(n_in))).unwrap();
+                        black_box(v);
+                    })
+                });
+            },
+        );
         group.bench_function(BenchmarkId::new("W10_config_eval", "luajit"), |b| {
             b.iter_custom(|iters| {
                 timed_with_warmup(iters, || {
@@ -1006,7 +1052,9 @@ fn bench_cmp_lua(c: &mut Criterion) {
         group.throughput(Throughput::Elements(1));
         group.bench_function(BenchmarkId::new("W12_p99_tail", "relon_tree_walk"), |b| {
             b.iter(|| {
-                let v = walker.run_main(&scope, w12_relon_args(black_box(7))).unwrap();
+                let v = walker
+                    .run_main(&scope, w12_relon_args(black_box(7)))
+                    .unwrap();
                 black_box(v);
             });
         });
@@ -1040,10 +1088,7 @@ fn bench_cmp_lua(c: &mut Criterion) {
 
     let relon_bin = std::env::var("RELON_CLI_BIN").unwrap_or_else(|_| {
         // Try a few likely locations; falls back to PATH lookup.
-        let candidates = [
-            "target/release/relon-cli",
-            "target/debug/relon-cli",
-        ];
+        let candidates = ["target/release/relon-cli", "target/debug/relon-cli"];
         for c in candidates {
             if std::path::Path::new(c).exists() {
                 return c.to_string();
@@ -1054,8 +1099,8 @@ fn bench_cmp_lua(c: &mut Criterion) {
     let relon_args_json = "{\"x\": 41}";
 
     // Check binary actually exists, otherwise skip Relon side gracefully.
-    let relon_present = std::path::Path::new(&relon_bin).exists()
-        || which_binary(&relon_bin).is_some();
+    let relon_present =
+        std::path::Path::new(&relon_bin).exists() || which_binary(&relon_bin).is_some();
 
     if relon_present {
         cold_group.bench_function(
@@ -1077,23 +1122,28 @@ fn bench_cmp_lua(c: &mut Criterion) {
             },
         );
     } else {
-        eprintln!("[cmp_lua W11] relon-cli not found at {relon_bin}; skipping Relon cold-start row");
+        eprintln!(
+            "[cmp_lua W11] relon-cli not found at {relon_bin}; skipping Relon cold-start row"
+        );
     }
 
     let luajit_bin = std::env::var("RELON_LUAJIT_BIN").unwrap_or_else(|_| "luajit".to_string());
     let lua_present = which_binary(&luajit_bin).is_some();
     if lua_present {
-        cold_group.bench_function(BenchmarkId::new("W11_cold_start", "luajit_fresh_proc"), |b| {
-            b.iter(|| {
-                let out = Command::new(&luajit_bin)
-                    .arg("-e")
-                    .arg(W11_LUA_SRC)
-                    .output();
-                if let Ok(o) = &out {
-                    black_box(o.stdout.len());
-                }
-            });
-        });
+        cold_group.bench_function(
+            BenchmarkId::new("W11_cold_start", "luajit_fresh_proc"),
+            |b| {
+                b.iter(|| {
+                    let out = Command::new(&luajit_bin)
+                        .arg("-e")
+                        .arg(W11_LUA_SRC)
+                        .output();
+                    if let Ok(o) = &out {
+                        black_box(o.stdout.len());
+                    }
+                });
+            },
+        );
     } else {
         eprintln!("[cmp_lua W11] luajit not found in PATH (set RELON_LUAJIT_BIN); skipping Lua cold-start row");
     }
