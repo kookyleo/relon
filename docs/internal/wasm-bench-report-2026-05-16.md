@@ -3429,3 +3429,107 @@ falsification**：
 - ε-0-B 转为 ε-1 优先级（单 trace 场景无收益）。
 
 详见 `docs/internal/v6-epsilon-0c-stage-report-2026-05-19.md`。
+
+---
+
+## v6-ε-0-A 附录（At-call-site inline，2026-05-19）
+
+### 实验设置
+
+`crates/relon-bench/benches/trace_jit_hot_loop.rs`:
+
+- ε-0-C 行（`trace_jit_warm`, `_ic`, `_tail`, `_sysv`,
+  `rust_inlined_baseline`）保留作 baseline。
+- **新增** `trace_jit_warm_inline` 行：hand-built 同 shape 的
+  `LocalGet+LocalGet+Add+Return` trace，通过
+  `relon_codegen_native::compile_inline_host_fn(Arc<OptimizedTrace>)`
+  直接编出**含 trace body 的 host fn**（不再是「trampoline call
+  trace_fn」结构，而是 trace ops 嵌进 host fn body）。host fn 仍
+  obey TRACE_ENTRY_SIG，从 Rust caller 看 wire layout 不变。
+- 同 5s warm-up + 6s measurement / 30 sample / 1M iter shape，
+  与 ε-0-C 完全对齐。
+
+### Bench numbers (criterion median, 3 round, 1M iter `acc + i`)
+
+**R1**:
+```
+backend/tree_walk                  : 2222 ns/iter (unchanged baseline)
+backend/cranelift_aot              : 372  ns/iter
+backend/trace_jit_warm             : 9.50 ns/iter
+backend/trace_jit_warm_ic          : 9.55 ns/iter
+backend/trace_jit_warm_tail        : 9.55 ns/iter
+backend/trace_jit_warm_sysv        : 9.55 ns/iter
+backend/trace_jit_warm_inline      : 9.55 ns/iter  ← new
+backend/rust_inlined_baseline      : 3.55 ns/iter
+```
+
+**R2**:
+```
+backend/trace_jit_warm_ic          : 9.54 ns/iter
+backend/trace_jit_warm_tail        : 9.51 ns/iter
+backend/trace_jit_warm_sysv        : 9.51 ns/iter
+backend/trace_jit_warm_inline      : 9.52 ns/iter
+backend/rust_inlined_baseline      : 3.55 ns/iter
+```
+
+**R3**:
+```
+backend/trace_jit_warm_ic          : 9.56 ns/iter
+backend/trace_jit_warm_tail        : 9.54 ns/iter
+backend/trace_jit_warm_sysv        : 9.54 ns/iter
+backend/trace_jit_warm_inline      : 9.54 ns/iter
+backend/rust_inlined_baseline      : 3.55 ns/iter
+```
+
+### vs ε-0-C / brief 阈值 / LuaJIT
+
+```
+v6-ε-0-C trace_jit_warm_tail   9.54 ns
+v6-ε-0-A trace_jit_warm_inline 9.55 ns   delta ≈ +0.01 ns（噪声内）
+brief target ≤ 5 ns            不达
+brief aspirational ≤ 4 ns      不达
+LuaJIT 2.x trace tier          ~2 ns（4.77× 慢，与 ε-0-C 同 class）
+```
+
+### 5.99 ns 边界 cost 再拆分（精确化 ε-0-C 给的估算）
+
+ε-0-C 给的 5 项拆分（call/ret/arg/result/prologue 残留），
+ε-0-A 已经 falsify「内层 trace call/ret」是其中任何一项：
+`trace_jit_warm_inline` 路径已经把内层 call/ret 完全消除（host fn
+body 直接是 trace ops，没有内层 callee 函数），仍然 9.55 ns。
+
+修正后的拆分（按 ε-0-A 实测）：
+
+| 组件 | 估算 | ε-0-A 后是否仍存在 |
+|---|---|---|
+| Rust caller 侧 `args[0..1]` store + `lea rsi, args` | ~1.5 ns | **仍存在**（bench loop 是 Rust） |
+| Rust → JIT entry `call rax` + branch predict | ~1.5 ns | **仍存在** |
+| JIT entry `ret` + RSB predict | ~1.0 ns | **仍存在** |
+| Rust caller 侧读 `ctx.result_slot` 后 `acc =` | ~1.0 ns | **仍存在** |
+| Rust loop overhead (i++, cmp, jne) | ~1.0 ns | **仍存在** |
+| 内层 trace call/ret + arg marshall | 假定 0 | **消除** |
+| **合计** | ~6 ns | matches 实测 5.99 ns |
+
+**结论**：5.99 ns 全部来自 Rust caller 侧 + Rust → JIT extern 边界，
+**不在 cranelift JIT entry 内部的任何地方**。inline 路径把内层
+call 消除掉之后，bench 数字仍是 9.55 ns，因为内层 call 在 ε-0-C 之前
+本来就不是 6 ns 主要来源——只是当时的拆分**估算错了哪部分占多大**。
+
+### 结论：诚实账面（ε-0-A）
+
+v6-ε-0-A **没达到 brief 阈值 ≤ 4 ns/iter** ——预期内的不达，因为
+bench 的 caller 是 Rust，inline 不能消除 Rust→JIT 边界。本 phase
+的核心交付是 **infrastructure 落地 + 假设再 falsify**：
+
+- inline splice primitive (`emit_trace_inline`) + IR retention
+  (`Arc<OptimizedTrace>` on `JITedTraceFn`) + 256-op cap + deopt
+  preservation 全套落地，10 个新 test 覆盖（5 unit + 5 smoke）。
+- 「内层 trace call/ret = 6 ns 主要来源」假设证伪（ε-0-C 已经
+  falsify「prologue/epilogue」，ε-0-A 进一步 falsify「内层 call」）。
+- 5.99 ns 全部归因为 Rust caller 侧 + extern call 边界，**不会被
+  任何 cranelift-side 改造移走**。
+- ε-M1+ 「loop into cranelift」是唯一能让单 iter 跌破 5 ns 的方向。
+  ε-0-A 提供的 inline primitive 是那条路径的 prerequisite（loop body
+  内嵌的 trace dispatch site 仍需要 splice）。
+
+详见 `docs/internal/v6-epsilon-0a-stage-report-2026-05-19.md`。

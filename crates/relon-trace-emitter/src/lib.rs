@@ -34,13 +34,18 @@ pub mod abi;
 pub mod call_conv;
 pub mod emitter;
 pub mod guard_emit;
+pub mod inline_emit;
 
 pub use abi::{
-    abi_type_to_cranelift, AbiSignature, AbiSignatureExt, AbiType, CraneliftType,
-    DeoptStateSnapshot, EffectClass, ExternalAddr, ExternalAddrRepr, ExternalPc, ExternalPcRepr,
-    ExternalSlot, ExternalSlotRepr, HostHookId, HostHookTable, ObservedType,
-    RecoverableWriteRecord, TraceContext, TraceEntryStatus, TRACE_ENTRY_SIG,
+    abi_type_to_cranelift, host_hook_slot_offset, host_hooks_offset, result_slot_offset,
+    AbiSignature, AbiSignatureExt, AbiType, CraneliftType, DeoptStateSnapshot, EffectClass,
+    ExternalAddr, ExternalAddrRepr, ExternalPc, ExternalPcRepr, ExternalSlot, ExternalSlotRepr,
+    HostHookId, HostHookTable, ObservedType, RecoverableWriteRecord, TraceContext,
+    TraceEntryStatus, TRACE_ENTRY_SIG,
 };
 pub use call_conv::{trace_entry_call_conv, trace_entry_uses_tail};
 pub use emitter::{EmitError, HostHookFuncIds, TraceEmitter};
 pub use guard_emit::{emit_guard, GuardEmitCtx};
+pub use inline_emit::{
+    emit_trace_inline, should_inline_trace, InlineEmitError, InlineEmitHandles, MAX_INLINE_OPS,
+};

@@ -78,6 +78,7 @@ pub mod object_cache_integration;
 pub mod sandbox;
 pub mod schema_cache;
 pub mod trace_ic;
+pub mod trace_inline;
 pub mod trace_install;
 pub mod trace_recording;
 pub mod trap_handler;
@@ -95,6 +96,7 @@ pub use sandbox::{
     STATE_OFFSET_ARENA_LEN, STATE_OFFSET_DEADLINE_NS, STATE_OFFSET_TAIL_CURSOR,
 };
 pub use trace_ic::{TraceIcSlot, IC_WAYS};
+pub use trace_inline::{compile_inline_host_fn, InlineHostFn, InlineHostFnError};
 pub use trace_install::{
     clear_recording, default_host_hooks, global_trace_jit_state, hot_counter_peek,
     hot_counter_reset, hot_counter_reset_all, hot_counters_base, jump_helper_call_count,
