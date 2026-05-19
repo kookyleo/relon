@@ -130,6 +130,21 @@ name = "cmp_lua"
 harness = false
 path = "benches/cmp_lua.rs"
 
+# F-D8 (2026-05-19): trace-JIT companion to W5 + W6 in `cmp_lua`. Runs
+# the dict-string-key and list-numeric-key hot loops through hand-built
+# cranelift JIT traces that exercise the new TraceOp::DictLookup +
+# TraceOp::ListGet lowerings, plus a tree-walker baseline row for in-
+# bench ratio context. Recorder integration is deferred — the IR walker
+# does not yet recognise the source-side `d[keys[i]]` / `arr[i]`
+# patterns; this bench's row demonstrates the emitter + runtime path
+# is wired end-to-end so the recorder extension lands against a
+# pre-validated lower-half.
+# Run via `cargo bench -p relon-bench --bench cmp_lua_dict_list_trace`.
+[[bench]]
+name = "cmp_lua_dict_list_trace"
+harness = false
+path = "benches/cmp_lua_dict_list_trace.rs"
+
 # v6-λ-0 (bench methodology hardening, 2026-05-19): post-processor for
 # criterion's per-sample `sample.json` outputs. Walks
 # `target/criterion/<group>/<dim>/<row>/new/sample.json` and prints a
