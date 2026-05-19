@@ -275,9 +275,7 @@ pub fn collect_group_stats(group_root: &Path) -> Result<Vec<RowStats>, BenchStat
 /// Otherwise columns are per closure call.
 pub fn render_markdown_table(rows: &[RowStats]) -> String {
     let mut out = String::new();
-    out.push_str(
-        "| Row | p50 (ns/elem) | p90 | p99 | p99.9 | max | samples | elements/call |\n",
-    );
+    out.push_str("| Row | p50 (ns/elem) | p90 | p99 | p99.9 | max | samples | elements/call |\n");
     out.push_str("|---|---|---|---|---|---|---|---|\n");
     for row in rows {
         let p50 = row.per_element_percentile(0.50);

@@ -127,9 +127,12 @@ impl fmt::Display for QuiescenceFailure {
 
 /// Top-level error wrapping a [`QuiescenceReport`] that failed at least
 /// one gate. `Display`s as a multi-line summary suitable for `panic!`.
+///
+/// Boxed to keep `Result<QuiescenceReport, _>` small (the report itself
+/// is multi-kilobyte once every CPU governor is enumerated).
 #[derive(Debug)]
 pub struct QuiescenceError {
-    pub report: QuiescenceReport,
+    pub report: Box<QuiescenceReport>,
 }
 
 impl fmt::Display for QuiescenceError {
@@ -158,7 +161,9 @@ pub fn verify_quiescence() -> Result<QuiescenceReport, QuiescenceError> {
     if report.errors.is_empty() || force_run {
         Ok(report)
     } else {
-        Err(QuiescenceError { report })
+        Err(QuiescenceError {
+            report: Box::new(report),
+        })
     }
 }
 

@@ -160,12 +160,12 @@ use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{Linkage, Module as _};
 
+use relon_bench::quiescence::verify_quiescence;
 use relon_codegen_native::{
     clear_recording, compile_inline_host_fn, global_trace_jit_state, register_recording,
     register_trace_runtime_symbols, trace_install::TraceJitState, CraneliftAotEvaluator,
     RecordingRegistration, SandboxConfig, TraceIcSlot, MAX_FN_ID,
 };
-use relon_bench::quiescence::verify_quiescence;
 use relon_eval_api::{Evaluator, Value};
 use relon_evaluator::{Context, Scope, TreeWalkEvaluator};
 use relon_ir::ir::{Func, IrType, Module as IrModule, Op, TaggedOp};
@@ -1291,21 +1291,18 @@ fn bench_hot_loop(c: &mut Criterion) {
         .load("return function() return 42 end")
         .eval()
         .expect("Lua noop fn must compile");
-    group.bench_function(
-        BenchmarkId::new("backend", "lua_boundary_calibrate"),
-        |b| {
-            b.iter_custom(|iters| {
-                timed_with_warmup(iters, || {
-                    let mut acc: i64 = 0;
-                    for _ in 0..HOT_LOOP_N {
-                        let r: i64 = lua_noop.call(()).expect("Lua noop call");
-                        acc = acc.wrapping_add(black_box(r));
-                    }
-                    black_box(acc);
-                })
-            });
-        },
-    );
+    group.bench_function(BenchmarkId::new("backend", "lua_boundary_calibrate"), |b| {
+        b.iter_custom(|iters| {
+            timed_with_warmup(iters, || {
+                let mut acc: i64 = 0;
+                for _ in 0..HOT_LOOP_N {
+                    let r: i64 = lua_noop.call(()).expect("Lua noop call");
+                    acc = acc.wrapping_add(black_box(r));
+                }
+                black_box(acc);
+            })
+        });
+    });
     drop(lua_noop);
     drop(lua);
 

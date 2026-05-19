@@ -80,15 +80,13 @@ fn lua_boundary_cost_in_ballpark() {
     }
     let elapsed = start.elapsed();
     let ns_per_call = elapsed.as_nanos() as f64 / f64::from(n);
-    eprintln!(
-        "lua_boundary_cost_in_ballpark: {n} calls in {elapsed:?} → {ns_per_call:.1} ns/call"
-    );
+    eprintln!("lua_boundary_cost_in_ballpark: {n} calls in {elapsed:?} → {ns_per_call:.1} ns/call");
     // The mlua→Lua boundary on x86_64 lands around 50-200 ns/call when
     // the host machine is quiescent. We widen the upper bound to 1000 ns
     // here because this test is `#[ignore]`d for general use and the
     // assertion only fires when someone explicitly runs `--ignored`.
     assert!(
-        ns_per_call >= 20.0 && ns_per_call <= 1000.0,
+        (20.0..=1000.0).contains(&ns_per_call),
         "expected 20-1000 ns/call (LuaJIT boundary baseline); got {ns_per_call:.1} ns/call"
     );
 }
