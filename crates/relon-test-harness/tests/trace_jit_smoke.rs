@@ -635,7 +635,9 @@ fn default_host_hooks_populates_save_deopt_slot() {
     // Confirm we can call through the table without crashing the
     // host. The shim records a snapshot into ctx.deopt_state.
     let f = ctx.host_hooks.save_deopt.expect("populated");
-    unsafe { f(&mut ctx as *mut _, 42) };
+    // v6-δ M1 R5: save_deopt slot now carries the full
+    // (ctx, guard_pc, external_pc) signature.
+    unsafe { f(&mut ctx as *mut _, 42, 0xfeedbeef) };
     let snap = ctx.deopt_state.as_ref().expect("snapshot populated");
     assert_eq!(snap.guard_pc, 42);
 }
@@ -862,6 +864,91 @@ fn invoke_with_resume_exposes_deopt_snapshot_to_fallback() {
     // monotone counter); we don't pin the exact value. The
     // important property is that the snapshot is populated and the
     // slots survived the trace -> fallback boundary.
+
+    let _ = clear_recording(fn_id);
+    let _ = state.invalidate_trace(fn_id);
+}
+
+/// v6-δ M1 R5: deopt path now dispatches `save_deopt` through
+/// `ctx.host_hooks.save_deopt` via `call_indirect`. A test that stubs
+/// the slot with a custom function observes the call (and confirms
+/// the indirect dispatch path is hot, not the legacy direct extern
+/// call).
+#[test]
+fn save_deopt_dispatches_through_host_hooks_table() {
+    use relon_trace_abi::{HostHookTable, TraceSaveDeoptFn};
+
+    // Per-thread observation slot the custom save_deopt writes into.
+    thread_local! {
+        static CUSTOM_OBSERVED: std::cell::Cell<(u32, u64)> = const {
+            std::cell::Cell::new((0, 0))
+        };
+    }
+    unsafe extern "C" fn custom_save_deopt(
+        ctx: *mut TraceContext,
+        guard_pc: u32,
+        external_pc: u64,
+    ) {
+        // Record into thread-local + also populate ctx.deopt_state
+        // so the trace's return path keeps observing the snapshot.
+        CUSTOM_OBSERVED.with(|c| c.set((guard_pc, external_pc)));
+        unsafe {
+            relon_trace_jit::runtime::__relon_trace_save_deopt(ctx, guard_pc, external_pc);
+        }
+    }
+
+    let fn_id = 723u32;
+    let _ = clear_recording(fn_id);
+    let state = global_trace_jit_state();
+    let _ = state.invalidate_trace(fn_id);
+    register_recording(
+        fn_id,
+        RecordingRegistration {
+            body: vec![
+                TaggedOp {
+                    op: Op::LocalGet(0),
+                    range: TokenRange::default(),
+                },
+                TaggedOp {
+                    op: Op::LocalGet(1),
+                    range: TokenRange::default(),
+                },
+                TaggedOp {
+                    op: Op::Add(IrType::I64),
+                    range: TokenRange::default(),
+                },
+                TaggedOp {
+                    op: Op::Return,
+                    range: TokenRange::default(),
+                },
+            ],
+            param_tys: vec![IrType::I32, IrType::I32],
+        },
+    );
+    let warm: [u64; 2] = [1, 2];
+    unsafe {
+        relon_codegen_native::trace_install::__relon_jump_to_recorder(fn_id, warm.as_ptr());
+    }
+    let trace_fn = state.lookup_trace(fn_id).expect("trace");
+
+    // Trigger overflow with a custom HostHookTable that observes the
+    // call. The trace's deopt block dispatches through this slot.
+    let mut hooks = HostHookTable::default();
+    hooks.save_deopt = Some(custom_save_deopt as TraceSaveDeoptFn);
+    let mut ctx = TraceContext::with_hooks(32, hooks);
+    let of_args: [u64; 2] = [i64::MAX as u64, 1];
+    CUSTOM_OBSERVED.with(|c| c.set((0, 0)));
+    let status = unsafe { trace_fn.invoke(&mut ctx as *mut _, of_args.as_ptr()) };
+    assert!(matches!(status, TraceEntryStatus::GuardFailed));
+    let (observed_pc, observed_external_pc) = CUSTOM_OBSERVED.with(|c| c.get());
+    assert!(
+        observed_pc != 0 || observed_external_pc != 0,
+        "custom save_deopt must have been called via call_indirect through ctx.host_hooks"
+    );
+    assert!(
+        ctx.deopt_state.is_some(),
+        "custom save_deopt should still populate ctx.deopt_state"
+    );
 
     let _ = clear_recording(fn_id);
     let _ = state.invalidate_trace(fn_id);

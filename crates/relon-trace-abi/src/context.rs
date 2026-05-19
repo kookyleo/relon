@@ -32,16 +32,25 @@
 
 use crate::deopt::{DeoptStateSnapshot, RecoverableWriteRecord};
 
-/// `extern "C"` function pointer type used by `on_trap` /
-/// `save_deopt` entries of [`HostHookTable`].
+/// `extern "C"` function pointer type used by `on_trap` entries of
+/// [`HostHookTable`].
 ///
-/// The two-argument shape — `(*mut TraceContext, u32)` — is shared
-/// across these hooks so the emitter can dispatch through a single
-/// indirect call instruction without per-hook signature shuffling.
-/// Hooks needing extra args (i.e. `resolve_call` /
-/// `inline_cache_lookup`) use the dedicated fn-pointer types below;
-/// see [`TraceResolveCallFn`] / [`TraceIcLookupFn`].
+/// The two-argument shape — `(*mut TraceContext, u32)` — is the
+/// minimum surface for hooks that only need the context + a
+/// classification id. `save_deopt` previously shared this shape with
+/// a shim that dropped its `external_pc` arg; v6-δ M1 R5 introduces
+/// the dedicated [`TraceSaveDeoptFn`] so the emitter can call the
+/// helper without losing the resume PC.
 pub type TraceHookFn = unsafe extern "C" fn(*mut TraceContext, u32);
+
+/// `extern "C"` fn-pointer signature for the `save_deopt` slot.
+///
+/// Matches `__relon_trace_save_deopt(ctx, guard_pc, external_pc)`.
+/// v6-δ M1 R5: the emitter dispatches through this typed slot via
+/// `call_indirect`, threading the real `external_pc` through to the
+/// host without the lossy void-return shim the v6-γ HostHookTable
+/// used to wire here.
+pub type TraceSaveDeoptFn = unsafe extern "C" fn(*mut TraceContext, u32, u64);
 
 /// `extern "C"` fn-pointer signature for the `resolve_call` slot.
 ///
@@ -99,8 +108,11 @@ pub struct HostHookTable {
     /// hosts may override to integrate with their own panic /
     /// telemetry pipeline.
     pub on_trap: Option<TraceHookFn>,
-    /// `__relon_trace_save_deopt` host symbol address.
-    pub save_deopt: Option<TraceHookFn>,
+    /// `__relon_trace_save_deopt` host symbol address. v6-δ M1 R5
+    /// widened to [`TraceSaveDeoptFn`] so the emitter's
+    /// `call_indirect` carries the real `external_pc` arg through
+    /// instead of dropping it via a shim.
+    pub save_deopt: Option<TraceSaveDeoptFn>,
     /// `__relon_trace_resolve_call` host symbol address. v6-γ M5
     /// widened the signature from the uniform `TraceHookFn` to the
     /// helper's real shape — `(*mut TraceContext, u64) -> *const u8`

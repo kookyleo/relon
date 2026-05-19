@@ -86,27 +86,18 @@ use crate::trace_recording::{RecordingOutcome, TraceRecordingEvaluator};
 ///    `call_indirect` through `ctx.host_hooks.<slot>` without an
 ///    ABI break.
 pub fn default_host_hooks() -> HostHookTable {
-    use relon_trace_abi::{TraceHookFn, TraceIcLookupFn, TraceResolveCallFn};
-
-    // The hook table's TraceHookFn signature is
-    // `(*mut TraceContext, u32)`; `__relon_trace_save_deopt` takes
-    // a third u64 external_pc arg. We wrap it in a shim that drops
-    // the surplus arg so the table slot type-checks.
-    unsafe extern "C" fn save_deopt_shim(ctx: *mut TraceContext, guard_pc: u32) {
-        // SAFETY: the underlying helper accepts
-        // (ctx, guard_pc, external_pc); when the dispatcher invokes
-        // through the table we have no external_pc handy, so pass 0.
-        // Hosts that need a real external_pc go through the direct
-        // extern symbol (still wired via JITBuilder).
-        unsafe { relon_trace_jit::runtime::__relon_trace_save_deopt(ctx, guard_pc, 0) };
-    }
+    use relon_trace_abi::{TraceIcLookupFn, TraceResolveCallFn, TraceSaveDeoptFn};
 
     HostHookTable {
         on_trap: None,
-        save_deopt: Some(save_deopt_shim as TraceHookFn),
-        // resolve_call and inline_cache_lookup carry their full
-        // signatures; no shim needed since v6-γ M5 widened
-        // HostHookTable to carry typed fn-pointers for both.
+        // v6-δ M1 R5: save_deopt carries its full 3-arg signature now
+        // (TraceSaveDeoptFn). The emitter's deopt block dispatches via
+        // `call_indirect` through `ctx.host_hooks.save_deopt`, so the
+        // historical void-returning shim that dropped `external_pc` is
+        // gone — hosts get the real resume PC.
+        save_deopt: Some(
+            relon_trace_jit::runtime::__relon_trace_save_deopt as TraceSaveDeoptFn,
+        ),
         resolve_call: Some(
             relon_trace_jit::runtime::__relon_trace_resolve_call as TraceResolveCallFn,
         ),

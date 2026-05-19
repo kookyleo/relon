@@ -534,17 +534,61 @@ impl<'a, 'b> TraceEmitterState<'a, 'b> {
         let guard_pc = self.builder.block_params(self.deopt_block)[0];
         let external_pc = self.builder.block_params(self.deopt_block)[1];
 
-        // call save_deopt(ctx, guard_pc, external_pc)
+        // v6-δ M1 R5: dispatch through `ctx.host_hooks.save_deopt`
+        // via `call_indirect`. The slot pointer is loaded fresh on
+        // every deopt — hosts that hot-swap helpers (profile-guided
+        // / instrumented variants) take effect without recompiling
+        // the trace. Falls back to the historical direct extern
+        // call when the slot is null so traces installed before the
+        // host wires a HostHookTable keep working.
+        let hook_off = crate::abi::host_hooks_offset()
+            + crate::abi::host_hook_slot_offset(HostHookId::SaveDeopt);
+        let hook_ptr =
+            self.builder
+                .ins()
+                .load(self.pointer_ty, MemFlags::trusted(), self.trace_ctx_ptr, hook_off);
+        let null = self.builder.ins().iconst(self.pointer_ty, 0);
+        let has_hook = self.builder.ins().icmp(IntCC::NotEqual, hook_ptr, null);
+        let indirect_block = self.builder.create_block();
+        let direct_block = self.builder.create_block();
+        self.builder
+            .ins()
+            .brif(has_hook, indirect_block, &[], direct_block, &[]);
+        self.builder.seal_block(indirect_block);
+        self.builder.seal_block(direct_block);
+
+        // Indirect dispatch arm.
+        self.builder.switch_to_block(indirect_block);
+        // Build a fresh signature ref matching TraceSaveDeoptFn:
+        // `unsafe extern "C" fn(*mut TraceContext, u32, u64)`.
+        let mut sig = Signature::new(CallConv::SystemV);
+        sig.params.push(AbiParam::new(self.pointer_ty));
+        sig.params.push(AbiParam::new(I32));
+        sig.params.push(AbiParam::new(I64));
+        let sig_ref = self.builder.func.import_signature(sig);
+        self.builder.ins().call_indirect(
+            sig_ref,
+            hook_ptr,
+            &[self.trace_ctx_ptr, guard_pc, external_pc],
+        );
+        let failed_i = self
+            .builder
+            .ins()
+            .iconst(I32, i64::from(TraceEntryStatus::GuardFailed.as_i32()));
+        self.builder.ins().return_(&[failed_i]);
+
+        // Direct (fallback) arm — preserves pre-R5 behaviour when a
+        // host invokes the trace with an empty HostHookTable.
+        self.builder.switch_to_block(direct_block);
         self.builder.ins().call(
             self.save_deopt,
             &[self.trace_ctx_ptr, guard_pc, external_pc],
         );
-
-        let failed = self
+        let failed_d = self
             .builder
             .ins()
             .iconst(I32, i64::from(TraceEntryStatus::GuardFailed.as_i32()));
-        self.builder.ins().return_(&[failed]);
+        self.builder.ins().return_(&[failed_d]);
         self.builder.seal_block(self.deopt_block);
     }
 
