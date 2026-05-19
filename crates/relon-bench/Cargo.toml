@@ -119,6 +119,17 @@ name = "trace_jit_hot_loop"
 harness = false
 path = "benches/trace_jit_hot_loop.rs"
 
+# v6-lambda-2/3 (2026-05-19): Relon vs LuaJIT 12-workload paired bench.
+# Implements the 12 adversarial workloads from
+# `docs/internal/relon-vs-luajit-rigorous-plan.md` §3, with a Relon source
+# + an equivalent Lua 5.1 source per workload. Same 6-trap hardening as
+# `trace_jit_hot_loop`. Run via
+# `cargo bench --bench cmp_lua` then post-process via `bench_stats`.
+[[bench]]
+name = "cmp_lua"
+harness = false
+path = "benches/cmp_lua.rs"
+
 # v6-λ-0 (bench methodology hardening, 2026-05-19): post-processor for
 # criterion's per-sample `sample.json` outputs. Walks
 # `target/criterion/<group>/<dim>/<row>/new/sample.json` and prints a
