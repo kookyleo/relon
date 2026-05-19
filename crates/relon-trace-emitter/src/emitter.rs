@@ -61,6 +61,12 @@ pub struct HostHookFuncIds {
     pub save_deopt: u32,
     pub resolve_call: u32,
     pub inline_cache_lookup: u32,
+    /// F-D7 string fast-path hooks. Indices match the host module's
+    /// declared FuncIds for the four `__relon_str_*` shims.
+    pub str_concat: u32,
+    pub str_contains: u32,
+    pub str_find: u32,
+    pub str_substring: u32,
 }
 
 impl Default for HostHookFuncIds {
@@ -72,6 +78,10 @@ impl Default for HostHookFuncIds {
             save_deopt: 0,
             resolve_call: 1,
             inline_cache_lookup: 2,
+            str_concat: 3,
+            str_contains: 4,
+            str_find: 5,
+            str_substring: 6,
         }
     }
 }
@@ -199,6 +209,46 @@ impl TraceEmitter {
             hook_func_ids.inline_cache_lookup,
         );
 
+        // F-D7 string hooks. Each takes/returns opaque `*const StringRef`
+        // pointers carried in pointer-typed slots; the shim resolves to
+        // a Rust `&Arc<str>`-style payload at the host boundary.
+        // - concat: (ptr, ptr) -> ptr
+        // - contains: (ptr, ptr) -> i32
+        // - find: (ptr, ptr) -> i64
+        // - substring: (ptr, i64, i64) -> ptr
+        let str_concat = declare_host_hook(
+            builder.func,
+            HostHookId::StrConcat,
+            &[pointer_ty, pointer_ty],
+            &[pointer_ty],
+            pointer_ty,
+            hook_func_ids.str_concat,
+        );
+        let str_contains = declare_host_hook(
+            builder.func,
+            HostHookId::StrContains,
+            &[pointer_ty, pointer_ty],
+            &[I32],
+            pointer_ty,
+            hook_func_ids.str_contains,
+        );
+        let str_find = declare_host_hook(
+            builder.func,
+            HostHookId::StrFind,
+            &[pointer_ty, pointer_ty],
+            &[I64],
+            pointer_ty,
+            hook_func_ids.str_find,
+        );
+        let str_substring = declare_host_hook(
+            builder.func,
+            HostHookId::StrSubstring,
+            &[pointer_ty, I64, I64],
+            &[pointer_ty],
+            pointer_ty,
+            hook_func_ids.str_substring,
+        );
+
         let mut emitter = TraceEmitterState {
             builder: &mut builder,
             trace,
@@ -208,6 +258,10 @@ impl TraceEmitter {
             deopt_block,
             save_deopt,
             resolve_call,
+            str_concat,
+            str_contains,
+            str_find,
+            str_substring,
             ssa_to_value: HashMap::new(),
             overflow_bits: HashMap::new(),
             loop_head_blocks: HashMap::new(),
@@ -259,6 +313,13 @@ struct TraceEmitterState<'a, 'b> {
     deopt_block: ir::Block,
     save_deopt: ir::FuncRef,
     resolve_call: ir::FuncRef,
+    /// F-D7 string fast-path FuncRefs. Pre-declared at emit-time so a
+    /// `TraceOp::StrConcat`-style op lowers to a single `call` without
+    /// the per-op `resolve_call` round-trip.
+    str_concat: ir::FuncRef,
+    str_contains: ir::FuncRef,
+    str_find: ir::FuncRef,
+    str_substring: ir::FuncRef,
     ssa_to_value: HashMap<SsaVar, ir::Value>,
     /// v6-δ M1: overflow bits surfaced by `Add` / `Sub` / `Mul`
     /// lowering. The matching `Guard(ArithOverflow(dst))` predicate
@@ -293,6 +354,12 @@ impl<'a, 'b> TraceEmitterState<'a, 'b> {
                 loop_id,
                 next_values,
             } => self.emit_loop_back(*loop_id, next_values),
+            TraceOp::StrConcat(dst, a, b) => self.emit_str_concat(*dst, *a, *b),
+            TraceOp::StrContains(dst, a, b) => self.emit_str_contains(*dst, *a, *b),
+            TraceOp::StrFind(dst, a, b) => self.emit_str_find(*dst, *a, *b),
+            TraceOp::StrSubstring(dst, s, start, len) => {
+                self.emit_str_substring(*dst, *s, *start, *len)
+            }
         }
     }
 
@@ -495,6 +562,83 @@ impl<'a, 'b> TraceEmitterState<'a, 'b> {
         }
 
         let inst = self.builder.ins().call_indirect(sig_ref, target, &arg_vals);
+        let r = self.builder.inst_results(inst)[0];
+        self.bind(dst, r);
+        Ok(())
+    }
+
+    /// F-D7 `StrConcat(dst, a, b)` lowers to:
+    ///
+    /// ```text
+    ///     dst = call __relon_str_concat(a, b)
+    /// ```
+    ///
+    /// Both `a` and `b` are pointer-typed SSAs (i64) pointing at an
+    /// opaque `StringRef` host struct. The shim allocates a fresh
+    /// `Arc<str>` on the host side and returns its payload pointer.
+    fn emit_str_concat(&mut self, dst: SsaVar, a: SsaVar, b: SsaVar) -> Result<(), EmitError> {
+        let va = self.lookup(a)?;
+        let vb = self.lookup(b)?;
+        let va = self.widen_to_i64(va);
+        let vb = self.widen_to_i64(vb);
+        let inst = self.builder.ins().call(self.str_concat, &[va, vb]);
+        let r = self.builder.inst_results(inst)[0];
+        self.bind(dst, r);
+        Ok(())
+    }
+
+    /// F-D7 `StrContains(dst, haystack, needle)` lowers to a direct
+    /// `call __relon_str_contains(haystack, needle) -> i32`.
+    ///
+    /// The result is a 0/1 i32 bool packed into the i32 SSA slot so
+    /// downstream `Cmp` / `Guard(NotNull(dst))` ops see the same
+    /// representation as a `ConstBool` value.
+    fn emit_str_contains(&mut self, dst: SsaVar, a: SsaVar, b: SsaVar) -> Result<(), EmitError> {
+        let va = self.lookup(a)?;
+        let vb = self.lookup(b)?;
+        let va = self.widen_to_i64(va);
+        let vb = self.widen_to_i64(vb);
+        let inst = self.builder.ins().call(self.str_contains, &[va, vb]);
+        let r = self.builder.inst_results(inst)[0];
+        self.bind(dst, r);
+        Ok(())
+    }
+
+    /// F-D7 `StrFind(dst, haystack, needle)` lowers to a direct
+    /// `call __relon_str_find(haystack, needle) -> i64`. Returns
+    /// `-1` on miss; callers wrap with a `Cmp(Ne, dst, -1)` to
+    /// branch on found-ness.
+    fn emit_str_find(&mut self, dst: SsaVar, a: SsaVar, b: SsaVar) -> Result<(), EmitError> {
+        let va = self.lookup(a)?;
+        let vb = self.lookup(b)?;
+        let va = self.widen_to_i64(va);
+        let vb = self.widen_to_i64(vb);
+        let inst = self.builder.ins().call(self.str_find, &[va, vb]);
+        let r = self.builder.inst_results(inst)[0];
+        self.bind(dst, r);
+        Ok(())
+    }
+
+    /// F-D7 `StrSubstring(dst, s, start, length)` lowers to
+    /// `call __relon_str_substring(s, start, length) -> ptr`. The
+    /// shim clamps `start` and `length` into `[0, len(s)]`.
+    fn emit_str_substring(
+        &mut self,
+        dst: SsaVar,
+        s: SsaVar,
+        start: SsaVar,
+        length: SsaVar,
+    ) -> Result<(), EmitError> {
+        let vs = self.lookup(s)?;
+        let vstart = self.lookup(start)?;
+        let vlength = self.lookup(length)?;
+        let vs = self.widen_to_i64(vs);
+        let vstart = self.widen_to_i64(vstart);
+        let vlength = self.widen_to_i64(vlength);
+        let inst = self
+            .builder
+            .ins()
+            .call(self.str_substring, &[vs, vstart, vlength]);
         let r = self.builder.inst_results(inst)[0];
         self.bind(dst, r);
         Ok(())

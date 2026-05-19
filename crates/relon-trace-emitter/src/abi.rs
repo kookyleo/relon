@@ -138,6 +138,16 @@ pub fn host_hook_slot_offset(hook: HostHookId) -> i32 {
         HostHookId::SaveDeopt => std::mem::offset_of!(HostHookTable, save_deopt),
         HostHookId::ResolveCall => std::mem::offset_of!(HostHookTable, resolve_call),
         HostHookId::InlineCacheLookup => std::mem::offset_of!(HostHookTable, inline_cache_lookup),
+        // F-D7 str hooks are NOT routed through the `HostHookTable`
+        // — they're imported directly via [`HostHookFuncIds`] so the
+        // emitter can `call` them without a per-op pointer load.
+        // Callers that ask for an offset have a bug.
+        HostHookId::StrConcat
+        | HostHookId::StrContains
+        | HostHookId::StrFind
+        | HostHookId::StrSubstring => {
+            panic!("host_hook_slot_offset called for F-D7 str hook {:?}; str hooks do not sit in HostHookTable", hook)
+        }
     };
     off as i32
 }
@@ -157,6 +167,19 @@ pub enum HostHookId {
     ResolveCall,
     /// `__relon_trace_inline_cache_lookup`.
     InlineCacheLookup,
+    /// F-D7: `__relon_str_concat(*const u8, usize, *const u8, usize, *mut StrRet)`.
+    /// String shim helpers are imported through the same hook table
+    /// machinery so the emitter can issue a direct `call` to them
+    /// without an `__relon_trace_resolve_call` round-trip on every
+    /// op. Resolution is performed once at install time via
+    /// [`HostHookFuncIds`].
+    StrConcat,
+    /// F-D7: `__relon_str_contains(*const u8, usize, *const u8, usize) -> i32`.
+    StrContains,
+    /// F-D7: `__relon_str_find(*const u8, usize, *const u8, usize) -> i64`.
+    StrFind,
+    /// F-D7: `__relon_str_substring(*const u8, usize, i64, i64, *mut StrRet)`.
+    StrSubstring,
 }
 
 impl HostHookId {
@@ -168,6 +191,10 @@ impl HostHookId {
             HostHookId::SaveDeopt => "__relon_trace_save_deopt",
             HostHookId::ResolveCall => "__relon_trace_resolve_call",
             HostHookId::InlineCacheLookup => "__relon_trace_inline_cache_lookup",
+            HostHookId::StrConcat => "__relon_str_concat",
+            HostHookId::StrContains => "__relon_str_contains",
+            HostHookId::StrFind => "__relon_str_find",
+            HostHookId::StrSubstring => "__relon_str_substring",
         }
     }
 }

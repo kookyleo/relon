@@ -144,6 +144,51 @@ pub enum TraceOp {
     /// (and asserting) the callee's effect class — opaque here.
     Call(SsaVar, FuncId, Vec<SsaVar>, EffectClass),
 
+    // ---- F-D7 string fast path --------------------------------------
+    /// `dst = StrConcat(lhs, rhs)` — `lhs` and `rhs` are opaque
+    /// string pointers (the recorder passes them through as i64
+    /// SSAs holding the `Arc<str>` payload pointer). The emitter
+    /// lowers this to a direct `call __relon_str_concat(lhs, rhs)`
+    /// — pure (no host-visible side effect) and the result is a
+    /// freshly-owned `Arc<str>` whose payload pointer is returned
+    /// in `dst`.
+    ///
+    /// Effect: `Pure`. The shim drops the result pointer's
+    /// allocation tracking into the surrounding `TraceContext`
+    /// memory budget so a runaway concat trace is bounded by the
+    /// host's sandbox quota.
+    StrConcat(SsaVar, SsaVar, SsaVar),
+
+    /// `dst = StrContains(haystack, needle) -> i32 (0/1)` — typed
+    /// as `i32` so callers can branch on the result with the
+    /// existing `Guard(NotNull(dst))` / `Cmp` machinery. The
+    /// emitter lowers this to `call __relon_str_contains(haystack,
+    /// needle)`; the recorder may set an inline cache slot keyed
+    /// on `(haystack, needle)` so a repeated probe with the same
+    /// args (W4's pattern) skips the call entirely.
+    ///
+    /// Effect: `Pure`.
+    StrContains(SsaVar, SsaVar, SsaVar),
+
+    /// `dst = StrFind(haystack, needle) -> i64` returning the
+    /// byte index of the first match, or `-1` on miss. Maps to
+    /// `call __relon_str_find(haystack, needle)`.
+    ///
+    /// Effect: `Pure`.
+    StrFind(SsaVar, SsaVar, SsaVar),
+
+    /// `dst = StrSubstring(s, start, length)` — byte-indexed
+    /// substring. Both `start` and `length` are i64 SSAs; the
+    /// shim clamps them into `[0, len(s)]` and returns a freshly
+    /// owned `Arc<str>` whose payload pointer is returned in
+    /// `dst`. The emitter emits a `BoundsCheck(start, str_len)`
+    /// guard before the call when the recorder has observed a
+    /// `start <= len` invariant; absence of the guard falls back
+    /// to the shim's runtime clamp.
+    ///
+    /// Effect: `Pure`.
+    StrSubstring(SsaVar, SsaVar, SsaVar, SsaVar),
+
     /// Return from the trace.
     Return(SsaVar),
 
@@ -237,7 +282,17 @@ impl TraceOp {
             | TraceOp::Guard(_, _)
             | TraceOp::Return(_)
             | TraceOp::MarkLoopHead { .. }
-            | TraceOp::MarkLoopBack { .. } => EffectClass::Pure,
+            | TraceOp::MarkLoopBack { .. }
+            // F-D7 string ops are referentially transparent: input
+            // `Arc<str>` pointers are immutable, the shim allocates a
+            // fresh result, and there is no host-visible side effect.
+            // Classifying as `Pure` lets the optimiser hoist a
+            // `StrContains(s, "x")` out of an inner loop when `s` is
+            // loop-invariant (W4's hot pattern).
+            | TraceOp::StrConcat(_, _, _)
+            | TraceOp::StrContains(_, _, _)
+            | TraceOp::StrFind(_, _, _)
+            | TraceOp::StrSubstring(_, _, _, _) => EffectClass::Pure,
 
             TraceOp::Load(_, _, _) | TraceOp::LocalGet(_, _) => EffectClass::ReadOnly,
 
@@ -260,7 +315,11 @@ impl TraceOp {
             | TraceOp::ConstI32(dst, _)
             | TraceOp::ConstI64(dst, _)
             | TraceOp::LocalGet(dst, _)
-            | TraceOp::Call(dst, _, _, _) => Some(*dst),
+            | TraceOp::Call(dst, _, _, _)
+            | TraceOp::StrConcat(dst, _, _)
+            | TraceOp::StrContains(dst, _, _)
+            | TraceOp::StrFind(dst, _, _)
+            | TraceOp::StrSubstring(dst, _, _, _) => Some(*dst),
 
             TraceOp::Store(_, _, _)
             | TraceOp::Guard(_, _)
@@ -290,6 +349,10 @@ impl TraceOp {
                 GuardKind::IsZero(v) => vec![v],
             },
             TraceOp::Call(_, _, args, _) => args.clone(),
+            TraceOp::StrConcat(_, a, b)
+            | TraceOp::StrContains(_, a, b)
+            | TraceOp::StrFind(_, a, b) => vec![*a, *b],
+            TraceOp::StrSubstring(_, s, start, len) => vec![*s, *start, *len],
             TraceOp::Return(v) => vec![*v],
             // ε-M0: loop markers consume / produce φ pairs. The head
             // reads the `init` SSA (defined before the loop) for each

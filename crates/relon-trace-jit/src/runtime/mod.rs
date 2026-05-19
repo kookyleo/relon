@@ -51,6 +51,7 @@
 pub mod call_table;
 pub mod deopt;
 pub mod ic_lookup;
+pub mod str_ops;
 
 pub use call_table::{
     register_external_call, resolve_external_call, with_call_table, ExternalCallTable,
@@ -61,3 +62,7 @@ pub use deopt::{
     __relon_trace_save_deopt,
 };
 pub use ic_lookup::{__relon_trace_inline_cache_lookup, ic_storage_size, write_ic_header};
+pub use str_ops::{
+    reset_str_contains_ic, str_contains_ic_counts, StringRef, __relon_str_concat,
+    __relon_str_contains, __relon_str_find, __relon_str_substring,
+};

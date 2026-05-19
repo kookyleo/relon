@@ -66,8 +66,13 @@ fn recoverable_write_call_records() {
 
 #[test]
 fn unrecoverable_call_aborts_even_with_override() {
+    // F-D7 specializes stdlib indices 6 (concat) and 9 (substring)
+    // onto the dedicated `TraceOp::Str*` fast path before the effect
+    // check kicks in, so this regression test uses an index outside
+    // the specialised set to keep exercising the
+    // `UnrecoverableEffect` abort gate.
     let mut r = RecorderState::new();
-    let res = r.record_op_with_call_effect(&call_op(9), &[], None, EffectClass::Unrecoverable);
+    let res = r.record_op_with_call_effect(&call_op(100), &[], None, EffectClass::Unrecoverable);
     assert!(matches!(
         res,
         RecordResult::Abort(AbortReason::UnrecoverableEffect)

@@ -775,10 +775,64 @@ impl TraceJitState {
                 &ic_lookup_sig,
             )
             .map_err(|e| TraceJitError::Module(format!("declare ic_lookup: {e}")))?;
+        // F-D7 string shims: import the four `__relon_str_*` helpers
+        // up-front so the emitter can target them by FuncId. All four
+        // use `(ptr,ptr) -> ptr`-shaped signatures except contains
+        // (returns i32), find (returns i64), and substring (takes an
+        // extra start+length pair).
+        let str_concat_sig = build_host_helper_signature(&[pointer_ty, pointer_ty], &[pointer_ty]);
+        let str_contains_sig = build_host_helper_signature(
+            &[pointer_ty, pointer_ty],
+            &[cranelift_codegen::ir::types::I32],
+        );
+        let str_find_sig = build_host_helper_signature(
+            &[pointer_ty, pointer_ty],
+            &[cranelift_codegen::ir::types::I64],
+        );
+        let str_substring_sig = build_host_helper_signature(
+            &[
+                pointer_ty,
+                cranelift_codegen::ir::types::I64,
+                cranelift_codegen::ir::types::I64,
+            ],
+            &[pointer_ty],
+        );
+        let str_concat_id = module
+            .declare_function(
+                relon_trace_emitter::HostHookId::StrConcat.symbol(),
+                Linkage::Import,
+                &str_concat_sig,
+            )
+            .map_err(|e| TraceJitError::Module(format!("declare str_concat: {e}")))?;
+        let str_contains_id = module
+            .declare_function(
+                relon_trace_emitter::HostHookId::StrContains.symbol(),
+                Linkage::Import,
+                &str_contains_sig,
+            )
+            .map_err(|e| TraceJitError::Module(format!("declare str_contains: {e}")))?;
+        let str_find_id = module
+            .declare_function(
+                relon_trace_emitter::HostHookId::StrFind.symbol(),
+                Linkage::Import,
+                &str_find_sig,
+            )
+            .map_err(|e| TraceJitError::Module(format!("declare str_find: {e}")))?;
+        let str_substring_id = module
+            .declare_function(
+                relon_trace_emitter::HostHookId::StrSubstring.symbol(),
+                Linkage::Import,
+                &str_substring_sig,
+            )
+            .map_err(|e| TraceJitError::Module(format!("declare str_substring: {e}")))?;
         let hook_func_ids = HostHookFuncIds {
             save_deopt: save_deopt_id.as_u32(),
             resolve_call: resolve_call_id.as_u32(),
             inline_cache_lookup: ic_lookup_id.as_u32(),
+            str_concat: str_concat_id.as_u32(),
+            str_contains: str_contains_id.as_u32(),
+            str_find: str_find_id.as_u32(),
+            str_substring: str_substring_id.as_u32(),
         };
 
         let mut ctx = CodegenContext::new();
@@ -1149,6 +1203,23 @@ pub fn register_trace_runtime_symbols(builder: &mut JITBuilder) {
     builder.symbol(
         relon_trace_emitter::HostHookId::InlineCacheLookup.symbol(),
         relon_trace_jit::runtime::__relon_trace_inline_cache_lookup as *const u8,
+    );
+    // F-D7 string shims. Symbols match `HostHookId::Str*.symbol()`.
+    builder.symbol(
+        relon_trace_emitter::HostHookId::StrConcat.symbol(),
+        relon_trace_jit::runtime::__relon_str_concat as *const u8,
+    );
+    builder.symbol(
+        relon_trace_emitter::HostHookId::StrContains.symbol(),
+        relon_trace_jit::runtime::__relon_str_contains as *const u8,
+    );
+    builder.symbol(
+        relon_trace_emitter::HostHookId::StrFind.symbol(),
+        relon_trace_jit::runtime::__relon_str_find as *const u8,
+    );
+    builder.symbol(
+        relon_trace_emitter::HostHookId::StrSubstring.symbol(),
+        relon_trace_jit::runtime::__relon_str_substring as *const u8,
     );
     builder.symbol(
         "__relon_jump_to_recorder",
