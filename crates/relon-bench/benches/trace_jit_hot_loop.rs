@@ -164,6 +164,7 @@ use relon_codegen_native::{
     register_trace_runtime_symbols, trace_install::TraceJitState, CraneliftAotEvaluator,
     RecordingRegistration, SandboxConfig, TraceIcSlot, MAX_FN_ID,
 };
+use relon_bench::quiescence::verify_quiescence;
 use relon_eval_api::{Evaluator, Value};
 use relon_evaluator::{Context, Scope, TreeWalkEvaluator};
 use relon_ir::ir::{Func, IrType, Module as IrModule, Op, TaggedOp};
@@ -893,6 +894,24 @@ fn args_acc_i_step_eval(acc: i64, i: i64) -> HashMap<String, Value> {
 // =====================================================================
 
 fn bench_hot_loop(c: &mut Criterion) {
+    // v6-λ-machine (2026-05-19): refuse to run the LuaJIT-comparison-ready
+    // bench on a non-quiescent machine. Override with
+    // `RELON_BENCH_FORCE_RUN=1` for dev iteration on locked-down boxes
+    // (CI, containers). `scripts/bench_quiescence.sh` performs the
+    // privileged setup; this self-check is read-only.
+    match verify_quiescence() {
+        Ok(report) => {
+            eprintln!("[bench] {}", report.summary());
+        }
+        Err(err) => {
+            // Print the full report to stderr so the user sees exactly
+            // what's missing before the panic message.
+            eprintln!("[bench] {err}");
+            eprintln!("[bench] {}", err.report.summary());
+            panic!("machine not quiescent; set RELON_BENCH_FORCE_RUN=1 to override");
+        }
+    }
+
     let mut group = c.benchmark_group("v6_epsilon_hot_loop");
     // v6-λ-0 trap F: sample_size = 200 (was 30 in v6-ε). The
     // bench_stats post-processor (`crates/relon-bench/src/bin/`)
