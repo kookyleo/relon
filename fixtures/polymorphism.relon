@@ -23,8 +23,9 @@
     render_item(item): item match {
         Image: "IMG(" + item.url + ")",
         Text: "TXT(" + item.content + ")",
-        * : "UNKNOWN"
+        *: "UNKNOWN"
     },
+
     display: [
         render_item(x) for x in &sibling.items
     ]

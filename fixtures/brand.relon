@@ -7,7 +7,7 @@
     // values built up by other decorators, or wherever a bareword key isn't
     // already declaring a type.
     #schema Weather {
-        String location: * ,
+        String location: *,
         Int temperature: *
     },
     // Field-level form (existing syntax) — the baseline this mirrors.
@@ -40,8 +40,9 @@
     // entry points (typed_field vs decorated) compare equal at this level.
     classify(w): w match {
         Weather: "is_weather",
-        * : "other"
+        *: "other"
     },
+
     typed_kind: classify(&sibling.typed_field),
     decorated_kind: classify(&sibling.decorated),
     // Generic argument: `Dict<String, Int>` drives `check_dict` so every
@@ -61,7 +62,7 @@
     // mirror of `X field: *`. Both declare the field's type; the analyzer
     // flags using both at once on the same field.
     #schema Place {
-        #brand String name: * ,
+        #brand String name: *,
         #brand Dict<String, Int> tags: *
     },
     Place origin: {

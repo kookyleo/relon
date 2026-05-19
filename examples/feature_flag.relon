@@ -30,12 +30,13 @@
 #relaxed
 
 #schema User {
-    String id: * ,
+    String id: *,
     #expect "region must be one of: us / eu / apac"
     String region: (r) => r == "us" || r == "eu" || r == "apac",
     #expect "plan must be one of: free / pro / enterprise"
     String plan: (p) => p == "free" || p == "pro" || p == "enterprise"
 }
+
 #main(User user) -> Dict<String, Dict<String, Bool>>
 {
     // Maps a user id to a stable bucket 0..99. Backed by a
@@ -47,6 +48,7 @@
     hash_mod_100(s): native_hash(s) % 100,
     // Each flag returns a Bool given the User. Keeping them as
     // closures lets the rollout table below stay tabular.
+
     #private
     rules: {
         // 1. Hard-off — kill switch for a half-shipped experiment.
@@ -60,6 +62,7 @@
         // 5. Percentage rollout — 25% of users see the new search.
         new_search: (u) => hash_mod_100(u.id) < 25
     },
+
     flags: {
         legacy_checkout: rules.legacy_checkout(user),
         dark_mode: rules.dark_mode(user),

@@ -24,7 +24,7 @@
 #relaxed
 
 #schema LineItem {
-    String sku: * ,
+    String sku: *,
     #expect "qty must be > 0"
     Int qty: (n) => n > 0,
     #expect "unit_price must be >= 0"
@@ -33,10 +33,11 @@
 #relaxed
 
 #schema Order {
-    List<LineItem> items: * ,
+    List<LineItem> items: *,
     #expect "tier must be one of: standard / gold"
     String tier: (t) => t == "standard" || t == "gold"
 }
+
 #main(Order order)
 {
     // Currency formatter — used as a decorator below. Two positional
@@ -51,11 +52,13 @@
     // Loyalty discount stacks on top of volume.
     #private
     loyalty_rate(tier): tier == "gold" ? 0.03: 0.0,
+
     #private
     tax_rate: 0.08,
     // Pure aggregation over the line items.
     #private
     sum_floats(xs): _list_reduce(xs, 0.0, (a, x) => a + x),
+
     subtotal: sum_floats([
         it.qty * it.unit_price for it in order.items
     ]),

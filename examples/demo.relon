@@ -13,6 +13,7 @@
     // Define a simple math function
     multiply(a, b): a * b,
     // --- 2. DATA STRUCTURE ---
+
     project: {
         name: "Relon Modern",
         details: {

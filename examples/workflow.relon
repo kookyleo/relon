@@ -25,11 +25,12 @@
 #schema Transition {
     #expect "from must be a known state"
     String from: (s) => s == "placed" || s == "paid" || s == "shipped",
-    String on: * ,
+    String on: *,
     #expect "to must be a known state"
     String to: (s) => s == "paid" || s == "shipped" || s == "delivered" || s == "cancelled",
     List<String> emit: *
 }
+
 #main(String state, String event)
 {
     // The table is the contract. Adding a new edge means appending a
@@ -82,8 +83,10 @@
     // hash table would be overkill.
     #private
     match_one(t): t.from == state && t.on == event,
+
     #private
     matched: _list_filter(&sibling.transitions, &sibling.match_one),
+
     next_state: len(matched) > 0 ? matched[0].to: state,
     emit: len(matched) > 0 ? matched[0].emit: [
         "unhandled_event"

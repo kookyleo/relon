@@ -5,10 +5,12 @@
     // High-order function definition
     make_adder(x): (y) => x + y,
     // Partial application
+
     add_10: make_adder(10),
     // Execution showing captured environment 'x'
     result: add_10(5), // 15
     // Recursive closure
     factorial(n): n <= 1 ? 1: n * factorial(n - 1),
+
     fact_5: factorial(5) // 120
 }
