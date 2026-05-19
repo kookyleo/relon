@@ -102,6 +102,37 @@ pub enum BcTrapKind {
     CapabilityDenied,
 }
 
+/// Recipe describing how to materialise a single operand-stack slot
+/// at resume time. The bytecode compiler emits a recipe per stack
+/// slot at each bytecode index; the
+/// [`crate::evaluator::BytecodeEvaluator::resume_from_pc`] consults
+/// the recipe array for the target `bc_idx` to rebuild the operand
+/// stack before continuing dispatch.
+///
+/// The recipe taxonomy is deliberately narrow — three variants cover
+/// every stack slot the bytecode compiler can statically reconstruct
+/// from compile-time + snapshot data. Arith / cmp result values can't
+/// be reconstructed from locals alone, so the compiler emits
+/// [`StackOrigin::Snapshot`] for those; the caller's
+/// `DeoptStateSnapshot::value_stack_copy` carries the runtime
+/// payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StackOrigin {
+    /// Materialise this stack slot by reading `locals[slot]` at
+    /// resume entry. Used for every operand-stack value produced by
+    /// a `LocalGet` / `LetGet` (and the offset-rewritten `LoadField`).
+    Local(u32),
+    /// Materialise this stack slot by pushing the embedded constant.
+    /// Used for `ConstI64` / `ConstI32` / `ConstBool` producers.
+    Const(u64),
+    /// Materialise this stack slot by reading the supplied
+    /// `value_stack_copy[idx]` at resume entry. Used for any stack
+    /// slot whose producer is an arith / cmp op — the runtime value
+    /// can't be re-derived without re-executing the producer, so the
+    /// snapshot carries it inline.
+    Snapshot(u32),
+}
+
 /// One compiled function. The op stream is dense (no `TaggedOp`
 /// wrapper) because the bytecode VM doesn't carry source ranges on
 /// every dispatch — the range comes back via `ir_pc_map` when the
@@ -119,6 +150,20 @@ pub struct BcFunction {
     /// `Evaluator::resume_from_pc` consults when the trace-JIT
     /// deopts and asks for "next op past the failing guard".
     pub ir_pc_map: Vec<ExternalPc>,
+    /// v6-δ M2-B: operand-stack recipe per bytecode index.
+    ///
+    /// `stack_recipe[bc_idx]` is the bottom-up list of
+    /// [`StackOrigin`] entries the VM should push onto its operand
+    /// stack **before** dispatching op `bc_idx` at resume time.
+    ///
+    /// Producer ops (LocalGet, ConstI64, Add, ...) extend the recipe
+    /// by appending one entry; consumer ops (LocalSet, Return, Add's
+    /// rhs+lhs pops) shrink it. Branch targets get the recipe of the
+    /// dominator point — for the bytecode compiler's straight-line
+    /// envelope this is sufficient because every branch target is
+    /// either an empty-stack boundary (post-LocalSet) or a join
+    /// point of the same depth coming from both arms.
+    pub stack_recipe: Vec<Vec<StackOrigin>>,
 }
 
 impl BcFunction {
@@ -136,5 +181,11 @@ impl BcFunction {
     /// harness to assert the compiler emitted a non-empty body.
     pub fn op_count(&self) -> usize {
         self.ops.len()
+    }
+
+    /// Expected operand-stack depth right before op `bc_idx` runs.
+    /// `None` for out-of-range indices.
+    pub fn stack_depth_at(&self, bc_idx: usize) -> Option<usize> {
+        self.stack_recipe.get(bc_idx).map(|v| v.len())
     }
 }

@@ -90,10 +90,14 @@ fn run_main_let_then_add() {
 
 #[test]
 fn unsupported_source_returns_error() {
-    // Stdlib calls aren't yet on the bytecode VM's surface; the
-    // compile pass surfaces `Unsupported` rather than silently
-    // accepting + producing garbage.
-    let err = BytecodeEvaluator::from_source("#main(Int x) -> Int\nabs(x)").unwrap_err();
+    // v6-δ M2-B widened the bytecode envelope to inline simple
+    // stdlib bodies + length-style queries on constant strings /
+    // lists. Pick a construct the M2-B envelope still bounces — a
+    // String return type can't survive the scalar-only schema
+    // check in `from_source` (no String marshalling), so
+    // `concat`-shaped sources fail at entry validation.
+    let err =
+        BytecodeEvaluator::from_source("#main() -> String\n\"foo\".concat(\"bar\")").unwrap_err();
     assert!(
         matches!(
             err,
@@ -101,6 +105,37 @@ fn unsupported_source_returns_error() {
         ),
         "{err:?}"
     );
+}
+
+#[test]
+fn run_main_abs_inlined() {
+    // v6-δ M2-B widening: the bytecode VM inlines bundled stdlib
+    // bodies that fit the arith-control envelope. `abs(x)` resolves
+    // to the `abs_int` body which uses `Select`; the bytecode
+    // compile pass lowers it via the new `compile_select` helper.
+    let ev = BytecodeEvaluator::from_source("#main(Int x) -> Int\nabs(x)").unwrap();
+    let mut m = HashMap::new();
+    m.insert("x".to_string(), Value::Int(-42));
+    assert_eq!(ev.run_main(m).unwrap(), Value::Int(42));
+
+    let mut m = HashMap::new();
+    m.insert("x".to_string(), Value::Int(7));
+    assert_eq!(ev.run_main(m).unwrap(), Value::Int(7));
+}
+
+#[test]
+fn run_main_min_max_inlined() {
+    let ev = BytecodeEvaluator::from_source("#main(Int x, Int y) -> Int\nmin(x, y)").unwrap();
+    let mut m = HashMap::new();
+    m.insert("x".to_string(), Value::Int(17));
+    m.insert("y".to_string(), Value::Int(5));
+    assert_eq!(ev.run_main(m).unwrap(), Value::Int(5));
+
+    let ev = BytecodeEvaluator::from_source("#main(Int x, Int y) -> Int\nmax(x, y)").unwrap();
+    let mut m = HashMap::new();
+    m.insert("x".to_string(), Value::Int(17));
+    m.insert("y".to_string(), Value::Int(5));
+    assert_eq!(ev.run_main(m).unwrap(), Value::Int(17));
 }
 
 #[test]

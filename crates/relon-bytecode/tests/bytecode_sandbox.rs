@@ -137,6 +137,7 @@ fn sandbox_capability_denied_via_trap_op() {
         ops: vec![BcOp::Trap(BcTrapKind::CapabilityDenied), BcOp::Return],
         locals: 1,
         ir_pc_map: vec![1, 2],
+        stack_recipe: vec![vec![], vec![]],
     };
     let cfg = BcVmConfig {
         cap_vtable: CapabilityVtable::default(),

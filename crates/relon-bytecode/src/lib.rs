@@ -63,6 +63,6 @@ pub mod op;
 pub mod vm;
 
 pub use compile::{compile_function, BcCompileError};
-pub use evaluator::{BytecodeError, BytecodeEvaluator};
-pub use op::{BcFunction, BcOp, ExternalPc};
+pub use evaluator::{BytecodeError, BytecodeEvaluator, ResumeMetrics};
+pub use op::{BcFunction, BcOp, ExternalPc, StackOrigin};
 pub use vm::{BcVmConfig, BcVmError, BytecodeVm, VmValue};

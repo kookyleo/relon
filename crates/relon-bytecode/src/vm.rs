@@ -264,6 +264,36 @@ impl BytecodeVm {
         extra_locals: &[VmValue],
         return_slot_count: u32,
     ) -> BcRunOutcome {
+        self.invoke_from_with_stack(
+            func,
+            args,
+            start_bc_idx,
+            extra_locals,
+            return_slot_count,
+            /*initial_stack=*/ &[],
+        )
+    }
+
+    /// v6-δ M2-B partial-resume entry: same as
+    /// [`Self::invoke_from_with_locals`] but pre-seeds the operand
+    /// stack with `initial_stack` (bottom-up) before dispatching.
+    /// This is the path
+    /// [`crate::evaluator::BytecodeEvaluator::resume_from_pc`] uses
+    /// to rehydrate mid-expression deopts: the recipe in
+    /// `BcFunction::stack_recipe[start_bc_idx]` tells the evaluator
+    /// what values to push (locals / consts / snapshot slots), the
+    /// evaluator materialises them into a `Vec<u64>`, and the VM
+    /// continues dispatch at `start_bc_idx` exactly where the trace
+    /// would have been.
+    pub fn invoke_from_with_stack(
+        &self,
+        func: &BcFunction,
+        args: &[VmValue],
+        start_bc_idx: usize,
+        extra_locals: &[VmValue],
+        return_slot_count: u32,
+        initial_stack: &[VmValue],
+    ) -> BcRunOutcome {
         let needed = (func.locals as usize)
             .max(args.len() + return_slot_count as usize + extra_locals.len());
         let mut locals = vec![0u64; needed];
@@ -283,7 +313,8 @@ impl BytecodeVm {
                 locals[idx] = *v;
             }
         }
-        let mut stack: Vec<VmValue> = Vec::with_capacity(16);
+        let mut stack: Vec<VmValue> = Vec::with_capacity(16.max(initial_stack.len()));
+        stack.extend_from_slice(initial_stack);
         let mut pc = start_bc_idx;
         let mut steps: u64 = 0;
         let mut last_bc_idx = pc;

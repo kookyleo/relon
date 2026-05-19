@@ -28,8 +28,10 @@ use relon_ir::IrType;
 use relon_parser::{Node, TokenRange};
 use thiserror::Error;
 
-use crate::compile::{build_offset_to_local, compile_function, BcCompileError};
-use crate::op::{BcFunction, ExternalPc};
+use crate::compile::{
+    build_offset_to_local, compile_function, compile_function_in_module, BcCompileError,
+};
+use crate::op::{BcFunction, ExternalPc, StackOrigin};
 use crate::vm::{BcVmConfig, BytecodeVm, VmValue};
 
 /// Construction-time errors specific to the bytecode evaluator.
@@ -199,7 +201,10 @@ impl BytecodeEvaluator {
         let entry_idx = module.entry_func_index.ok_or(BytecodeError::NoEntry)?;
         let func = &module.funcs[entry_idx];
         let entry_range = func.range;
-        let compiled = compile_function(func, in_map, out_map)?;
+        // v6-δ M2-B: thread the full `funcs` slice through so the
+        // bytecode compile pass can inline simple callees
+        // (`Op::Call`) the M2-A scaffold rejected.
+        let compiled = compile_function_in_module(func, &module.funcs, in_map, out_map)?;
         Ok(Self {
             func: compiled,
             entry_range,
@@ -273,10 +278,11 @@ impl BytecodeEvaluator {
         args: &HashMap<String, Value>,
         start_bc_idx: usize,
         extra_locals: &[VmValue],
+        initial_stack: &[VmValue],
     ) -> Result<Value, RuntimeError> {
         let packed = self.pack_args(args)?;
         let vm = BytecodeVm::new(self.default_config.clone());
-        let outcome = vm.invoke_from_with_locals(
+        let outcome = vm.invoke_from_with_stack(
             &self.func,
             &packed,
             start_bc_idx,
@@ -286,6 +292,7 @@ impl BytecodeEvaluator {
                 .as_ref()
                 .map(|s| s.fields.len() as u32)
                 .unwrap_or(0),
+            initial_stack,
         );
         if let Some(err) = outcome.error {
             return Err(err.into_runtime_error(self.entry_range));
@@ -294,6 +301,63 @@ impl BytecodeEvaluator {
         // bytes_written placeholder (not used by the bytecode VM);
         // the actual return data lives in the virtual return slots.
         Ok(self.unpack_return_slots(&outcome.final_locals))
+    }
+
+    /// Rebuild the operand stack at `bc_idx` from the compile-time
+    /// recipe + the supplied snapshot fragments.
+    ///
+    /// Each [`StackOrigin`] is materialised independently:
+    ///
+    /// - `Local(slot)` — read `args[slot]` (for the input-arg span)
+    ///   or `extra_locals[slot - overlay_base]` for let-bound slots.
+    ///   When the slot points past the args **and** the snapshot
+    ///   doesn't carry that local (extra_locals shorter than the
+    ///   referenced let-slot), the recipe slot falls back to `0` —
+    ///   the M2-B trade-off: deep mid-expression resumes without a
+    ///   matching local snapshot still produce a defined value, but
+    ///   may diverge from the original computation. Tests cover the
+    ///   common shapes (input-arg only / single let).
+    /// - `Const(v)` — push the literal.
+    /// - `Snapshot(idx)` — read `value_stack_copy[idx]`; if absent,
+    ///   fall back to `0` so the resume never panics.
+    fn materialise_stack(
+        &self,
+        bc_idx: usize,
+        args_packed: &[VmValue],
+        extra_locals: &[VmValue],
+        value_stack_copy: &[u64],
+    ) -> Vec<VmValue> {
+        let recipe = match self.func.stack_recipe.get(bc_idx) {
+            Some(r) => r,
+            None => return Vec::new(),
+        };
+        let overlay_base = args_packed.len()
+            + self
+                .return_schema
+                .as_ref()
+                .map(|s| s.fields.len())
+                .unwrap_or(0);
+        let mut out = Vec::with_capacity(recipe.len());
+        for entry in recipe {
+            let v = match entry {
+                StackOrigin::Local(slot) => {
+                    let idx = *slot as usize;
+                    if idx < args_packed.len() {
+                        args_packed[idx]
+                    } else if idx >= overlay_base && idx - overlay_base < extra_locals.len() {
+                        extra_locals[idx - overlay_base]
+                    } else {
+                        0
+                    }
+                }
+                StackOrigin::Const(v) => *v,
+                StackOrigin::Snapshot(idx) => {
+                    value_stack_copy.get(*idx as usize).copied().unwrap_or(0)
+                }
+            };
+            out.push(v);
+        }
+        out
     }
 }
 
@@ -383,7 +447,7 @@ impl Evaluator for BytecodeEvaluator {
     }
 
     fn run_main(&self, args: HashMap<String, Value>) -> Result<Value, RuntimeError> {
-        self.run_main_inner(&args, /*start_bc_idx=*/ 0, &[])
+        self.run_main_inner(&args, /*start_bc_idx=*/ 0, &[], &[])
     }
 
     fn force_thunk(&self, _thunk: &Arc<Thunk>) -> Result<Value, RuntimeError> {
@@ -402,23 +466,38 @@ impl Evaluator for BytecodeEvaluator {
         })
     }
 
-    /// v6-δ M2-A core deliverable: route a deopt'd trace's
-    /// `external_pc` through the `ir_pc_map` table and resume the VM
-    /// at the matching bytecode index. `local_snapshot` is overlaid
-    /// past the `#main` args slots so let-bound values the trace
-    /// observed are restored before dispatch picks back up.
+    /// v6-δ M2-B: real partial-resume entry point.
     ///
-    /// ## M2-A scope
+    /// Routes the trace-side `external_pc` to a bytecode index via
+    /// [`BcFunction::bc_index_for_pc`], rebuilds the operand stack
+    /// from the compile-time [`StackOrigin`] recipe + the supplied
+    /// snapshot fragments, then continues dispatch.
     ///
-    /// - **Trap PCs**: the VM re-runs the op the deopt fired on. The
-    ///   trap fires again with the same `RuntimeError` shape; the
-    ///   resume_from_pc_after_each_prong test pins this.
-    /// - **Non-trap PCs**: routing is wired but the operand stack is
-    ///   restored as empty — the M2-B work widens the
-    ///   `DeoptStateSnapshot` payload so the SSA value stack rebuilds
-    ///   without re-running the producer ops.
-    /// - **Unknown PCs**: gracefully fall back to restarting from
-    ///   entry, preserving the args + slot overlay.
+    /// ## Snapshot layout convention
+    ///
+    /// `local_snapshot` carries — concatenated — the
+    /// `DeoptStateSnapshot::ssa_slots_copy` followed by an optional
+    /// `value_stack_copy`. We split the slice at the recipe's
+    /// expected `Snapshot` count: every `StackOrigin::Snapshot(idx)`
+    /// in the recipe consults `value_stack_copy[idx]`. Hosts that
+    /// only own an `ssa_slots_copy` (M2-A behaviour) pass it as the
+    /// full `local_snapshot`; recipes that need value-stack data will
+    /// see zeroes there and fall back gracefully.
+    ///
+    /// The deopt-driver variant
+    /// [`Self::resume_from_snapshot`] supplies the split arms
+    /// directly so the host doesn't have to flatten them.
+    ///
+    /// ## Behaviour
+    ///
+    /// - `external_pc == 0`: replay from entry (matches `run_main`).
+    /// - Known PC at empty-stack boundary: dispatch resumes from
+    ///   `bc_idx` directly. The 4-prong sandbox prong tests cover
+    ///   this path.
+    /// - Known PC mid-expression: the stack recipe rebuilds the
+    ///   operand stack; values fall back to `0` for missing recipe
+    ///   data (Snapshot indices the host didn't carry).
+    /// - Unknown PC: graceful fallback to entry (run_main).
     fn resume_from_pc(
         &self,
         args: HashMap<String, Value>,
@@ -429,6 +508,222 @@ impl Evaluator for BytecodeEvaluator {
             .func
             .bc_index_for_pc(external_pc as ExternalPc)
             .unwrap_or(0);
-        self.run_main_inner(&args, start_bc_idx, local_snapshot)
+        if start_bc_idx == 0 {
+            return self.run_main_inner(&args, /*start_bc_idx=*/ 0, local_snapshot, &[]);
+        }
+        // Split `local_snapshot` into ssa_slots_copy (used as
+        // extra_locals overlay) and value_stack_copy (used for
+        // Snapshot recipe entries). M2-B convention: split at the
+        // last Snapshot index referenced by the recipe.
+        let max_snapshot = self
+            .func
+            .stack_recipe
+            .get(start_bc_idx)
+            .map(|recipe| {
+                recipe
+                    .iter()
+                    .filter_map(|o| match o {
+                        StackOrigin::Snapshot(i) => Some(*i as usize + 1),
+                        _ => None,
+                    })
+                    .max()
+                    .unwrap_or(0)
+            })
+            .unwrap_or(0);
+        let (extra_locals, value_stack_copy): (&[u64], &[u64]) =
+            if local_snapshot.len() >= max_snapshot {
+                let split = local_snapshot.len() - max_snapshot;
+                (&local_snapshot[..split], &local_snapshot[split..])
+            } else {
+                (&[][..], local_snapshot)
+            };
+        let packed = self.pack_args(&args)?;
+        let initial_stack =
+            self.materialise_stack(start_bc_idx, &packed, extra_locals, value_stack_copy);
+        self.run_main_inner_with_packed(&packed, start_bc_idx, extra_locals, &initial_stack)
     }
+}
+
+impl BytecodeEvaluator {
+    /// Variant of [`Self::run_main_inner`] that takes pre-packed
+    /// args. The resume path goes through here because it already
+    /// packed the args while materialising the stack recipe; using
+    /// this method avoids re-packing.
+    fn run_main_inner_with_packed(
+        &self,
+        packed: &[VmValue],
+        start_bc_idx: usize,
+        extra_locals: &[VmValue],
+        initial_stack: &[VmValue],
+    ) -> Result<Value, RuntimeError> {
+        let vm = BytecodeVm::new(self.default_config.clone());
+        let outcome = vm.invoke_from_with_stack(
+            &self.func,
+            packed,
+            start_bc_idx,
+            extra_locals,
+            self.return_schema
+                .as_ref()
+                .map(|s| s.fields.len() as u32)
+                .unwrap_or(0),
+            initial_stack,
+        );
+        if let Some(err) = outcome.error {
+            return Err(err.into_runtime_error(self.entry_range));
+        }
+        Ok(self.unpack_return_slots(&outcome.final_locals))
+    }
+
+    /// Deopt-driver-facing API: rehydrate from an explicit
+    /// `DeoptStateSnapshot` directly. Callers that hold the snapshot
+    /// (typically `TraceJitState::invoke_with_resume`) use this
+    /// instead of flattening through `resume_from_pc`.
+    pub fn resume_from_snapshot(
+        &self,
+        args: HashMap<String, Value>,
+        snapshot: &relon_trace_abi::DeoptStateSnapshot,
+    ) -> Result<Value, RuntimeError> {
+        let (value, _) = self.resume_from_snapshot_with_metrics(args, snapshot)?;
+        Ok(value)
+    }
+
+    /// Same as [`Self::resume_from_snapshot`] but also returns
+    /// instrumentation metrics — total ops dispatched and the last
+    /// bytecode index visited. Used by the M2-B integration test that
+    /// asserts the resume path is strictly shorter than the full
+    /// entry-to-trap path.
+    pub fn resume_from_snapshot_with_metrics(
+        &self,
+        args: HashMap<String, Value>,
+        snapshot: &relon_trace_abi::DeoptStateSnapshot,
+    ) -> Result<(Value, ResumeMetrics), RuntimeError> {
+        let (outcome, metrics) = self.resume_via_vm(&args, snapshot)?;
+        if let Some(err) = outcome.error {
+            return Err(err.into_runtime_error(self.entry_range));
+        }
+        Ok((self.unpack_return_slots(&outcome.final_locals), metrics))
+    }
+
+    /// Companion to [`Self::resume_from_snapshot_with_metrics`] that
+    /// surfaces the [`ResumeMetrics`] even when the VM re-traps. The
+    /// caller has to interpret the trap on its own; we never return
+    /// the raw `Value` because the VM didn't produce one. M2-B
+    /// integration tests use this to verify the resume's start
+    /// `bc_idx` lines up with the trap PC even when the trap re-fires.
+    pub fn resume_from_snapshot_metrics_only(
+        &self,
+        snapshot: &relon_trace_abi::DeoptStateSnapshot,
+    ) -> Result<(Option<Value>, ResumeMetrics), RuntimeError> {
+        // Pack args as zeros — caller already proved the trap is the
+        // expected envelope; we only need the metrics here.
+        let args = HashMap::new();
+        match self.resume_via_vm(&args, snapshot) {
+            Ok((outcome, metrics)) => {
+                if outcome.error.is_some() {
+                    Ok((None, metrics))
+                } else {
+                    Ok((
+                        Some(self.unpack_return_slots(&outcome.final_locals)),
+                        metrics,
+                    ))
+                }
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    fn resume_via_vm(
+        &self,
+        args: &HashMap<String, Value>,
+        snapshot: &relon_trace_abi::DeoptStateSnapshot,
+    ) -> Result<(crate::vm::BcRunOutcome, ResumeMetrics), RuntimeError> {
+        let start_bc_idx = self
+            .func
+            .bc_index_for_pc(snapshot.external_pc as ExternalPc)
+            .unwrap_or(0);
+        // Pack args best-effort: the metrics-only variant supplies an
+        // empty map and we tolerate `MissingMainArg` by falling back
+        // to a zeroed `packed` vector (the trap is what we're after
+        // anyway, not the value). The full-resume variant goes
+        // through `pack_args` strictly.
+        let packed = match self.pack_args(args) {
+            Ok(p) => p,
+            Err(_) if args.is_empty() => vec![0u64; self.param_names.len()],
+            Err(e) => return Err(e),
+        };
+        let initial_stack = if start_bc_idx == 0 {
+            Vec::new()
+        } else {
+            self.materialise_stack(
+                start_bc_idx,
+                &packed,
+                &snapshot.ssa_slots_copy,
+                &snapshot.value_stack_copy,
+            )
+        };
+        let vm = BytecodeVm::new(self.default_config.clone());
+        let outcome = vm.invoke_from_with_stack(
+            &self.func,
+            &packed,
+            start_bc_idx,
+            &snapshot.ssa_slots_copy,
+            self.return_schema
+                .as_ref()
+                .map(|s| s.fields.len() as u32)
+                .unwrap_or(0),
+            &initial_stack,
+        );
+        let metrics = ResumeMetrics {
+            steps: outcome.steps,
+            last_bc_idx: outcome.last_bc_idx,
+            start_bc_idx,
+        };
+        Ok((outcome, metrics))
+    }
+
+    /// Run `args` through the full pipeline starting at entry and
+    /// return the metrics; companion to
+    /// [`Self::resume_from_snapshot_with_metrics`] so tests can prove
+    /// the resume path is strictly shorter than the full path.
+    pub fn run_main_with_metrics(
+        &self,
+        args: HashMap<String, Value>,
+    ) -> Result<(Value, ResumeMetrics), RuntimeError> {
+        let packed = self.pack_args(&args)?;
+        let vm = BytecodeVm::new(self.default_config.clone());
+        let outcome = vm.invoke_from_with_stack(
+            &self.func,
+            &packed,
+            0,
+            &[],
+            self.return_schema
+                .as_ref()
+                .map(|s| s.fields.len() as u32)
+                .unwrap_or(0),
+            &[],
+        );
+        let metrics = ResumeMetrics {
+            steps: outcome.steps,
+            last_bc_idx: outcome.last_bc_idx,
+            start_bc_idx: 0,
+        };
+        if let Some(err) = outcome.error {
+            return Err(err.into_runtime_error(self.entry_range));
+        }
+        Ok((self.unpack_return_slots(&outcome.final_locals), metrics))
+    }
+}
+
+/// Instrumentation surface for the M2-B partial-resume integration
+/// tests. The numbers are diagnostic only — they're not part of the
+/// production path and the host should not condition behaviour on
+/// them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ResumeMetrics {
+    /// Total ops dispatched (including the trapping op).
+    pub steps: u64,
+    /// Last bytecode index visited before exit.
+    pub last_bc_idx: usize,
+    /// Bytecode index the run started at (`0` for `run_main`).
+    pub start_bc_idx: usize,
 }

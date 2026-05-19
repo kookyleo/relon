@@ -27,7 +27,7 @@ use thiserror::Error;
 use relon_eval_api::layout::OffsetTable;
 use relon_ir::{Func, IrType, Op, TaggedOp};
 
-use crate::op::{BcFunction, BcOp, BcTrapKind, ExternalPc};
+use crate::op::{BcFunction, BcOp, BcTrapKind, ExternalPc, StackOrigin};
 
 /// Compile errors. Each variant pins one structural mismatch so the
 /// caller can decide whether to fall back to the cranelift / tree-
@@ -82,6 +82,35 @@ pub fn compile_function(
     field_offset_to_local: &BTreeMap<u32, u32>,
     return_field_offset_to_local: &BTreeMap<u32, u32>,
 ) -> Result<BcFunction, BcCompileError> {
+    compile_function_in_module(
+        func,
+        &[],
+        field_offset_to_local,
+        return_field_offset_to_local,
+    )
+}
+
+/// v6-δ M2-B widening: compile a function with access to the full
+/// IR `funcs` slice so the bytecode compiler can inline simple
+/// callees (`Op::Call { fn_index, ... }`).
+///
+/// The bytecode VM has no real Call dispatcher yet (M2-C work);
+/// instead the compile pass walks the callee's body inline,
+/// rewriting its `LocalGet(N)` references into reads against
+/// fresh scratch slots seeded from the caller's stack. This is the
+/// classic "tree-shake by inlining" approach — bounded in
+/// per-function expansion by [`MAX_INLINE_OPS`] so a maliciously
+/// deep call chain can't blow the compile pass.
+///
+/// Callers without a module (legacy-i64 direct-IR tests) pass an
+/// empty slice; any `Op::Call` in that mode bounces out as
+/// `BcCompileError::UnsupportedOp` exactly as before.
+pub fn compile_function_in_module(
+    func: &Func,
+    funcs: &[Func],
+    field_offset_to_local: &BTreeMap<u32, u32>,
+    return_field_offset_to_local: &BTreeMap<u32, u32>,
+) -> Result<BcFunction, BcCompileError> {
     let mut state = CompileState {
         ops: Vec::new(),
         ir_pc_map: Vec::new(),
@@ -89,6 +118,14 @@ pub fn compile_function(
         labels: Vec::new(),
         field_offset_to_local,
         return_field_offset_to_local,
+        stack_recipe: Vec::new(),
+        current_stack: Vec::new(),
+        next_snapshot_idx: 0,
+        funcs,
+        scratch_local_top: func.params.len() as u32
+            + field_offset_to_local.len() as u32
+            + return_field_offset_to_local.len() as u32,
+        inline_depth: 0,
     };
     state.compile_seq(&func.body, /*depth_base=*/ 0)?;
     state.emit_ret_if_missing();
@@ -111,7 +148,22 @@ pub fn compile_function(
         ops: state.ops,
         locals,
         ir_pc_map: state.ir_pc_map,
+        stack_recipe: state.stack_recipe,
     })
+}
+
+/// Resolve a stdlib `Op::Call { fn_index }` to its bundled
+/// [`relon_ir::StdlibFunction`]. Returns `None` when `fn_index`
+/// falls outside the bundled-stdlib range. Centralised here so the
+/// inline-call expander doesn't pull in the full
+/// `relon_ir::stdlib::builtin_stdlib` surface on every callsite.
+fn resolve_stdlib_func(fn_index: u32) -> Option<relon_ir::StdlibFunction> {
+    if fn_index >= relon_ir::stdlib_function_count() {
+        return None;
+    }
+    relon_ir::builtin_stdlib()
+        .into_iter()
+        .nth(fn_index as usize)
 }
 
 /// Build a `field_offset → local_idx` map from a schema offset
@@ -126,6 +178,18 @@ pub fn build_offset_to_local(layout: &OffsetTable) -> BTreeMap<u32, u32> {
     by_offset
 }
 
+/// Maximum number of bytecode ops a single `Op::Call` inlining
+/// expansion may produce. Acts as the guard against deep / cyclic
+/// inline chains; if exceeded, the compiler bounces out with
+/// `BcCompileError::UnsupportedOp` carrying the offending callee
+/// signature so the caller falls back to cranelift / tree-walker.
+const MAX_INLINE_OPS: usize = 64;
+
+/// Maximum nested inline depth. A single user `f()` whose body
+/// contains `g()` whose body contains `h()` is depth 3; anything
+/// deeper trips the same "too complex to inline" envelope reject.
+const MAX_INLINE_DEPTH: u32 = 3;
+
 struct CompileState<'a> {
     ops: Vec<BcOp>,
     ir_pc_map: Vec<ExternalPc>,
@@ -139,6 +203,36 @@ struct CompileState<'a> {
     /// a per-return-field slot then the evaluator unpacks it back
     /// into a `Value` after the run.
     return_field_offset_to_local: &'a BTreeMap<u32, u32>,
+    /// v6-δ M2-B: per-bc_idx operand-stack recipe.
+    /// `stack_recipe[i]` snapshots `current_stack` **before** op `i`
+    /// runs, used by partial-resume to rebuild the operand stack at
+    /// `i` without re-running the producers from entry.
+    stack_recipe: Vec<Vec<StackOrigin>>,
+    /// Live abstract operand stack tracked across compilation. Each
+    /// entry mirrors what the VM's runtime stack would hold at that
+    /// point; see [`StackOrigin`] for the recipe taxonomy.
+    current_stack: Vec<StackOrigin>,
+    /// Monotonic counter for [`StackOrigin::Snapshot`] indices. Every
+    /// arith / cmp result claims one slot in
+    /// `DeoptStateSnapshot::value_stack_copy`; resume-time consumers
+    /// read the slot by this index.
+    next_snapshot_idx: u32,
+    /// v6-δ M2-B: the full IR `funcs` slice — used to look up
+    /// `Op::Call { fn_index }` bodies for the inlining widener.
+    /// Empty for legacy-i64 callers; any `Op::Call` then surfaces as
+    /// `UnsupportedOp` exactly as in M2-A.
+    funcs: &'a [Func],
+    /// Next free virtual-local slot for inline-scratch storage. Each
+    /// nested `Op::Call` expansion claims a contiguous block of
+    /// `arg_count` slots starting here for the callee's `LocalGet(N)`
+    /// references; the slots stay reserved for the rest of the
+    /// function (cheap — the bytecode VM's local array is sized off
+    /// the max-observed slot).
+    scratch_local_top: u32,
+    /// Current inline nesting depth. Tripping
+    /// [`MAX_INLINE_DEPTH`] surfaces as
+    /// `BcCompileError::UnsupportedOp("inline depth exceeded")`.
+    inline_depth: u32,
 }
 
 #[derive(Debug)]
@@ -161,8 +255,68 @@ impl<'a> CompileState<'a> {
     }
 
     fn emit(&mut self, op: BcOp, pc: ExternalPc) {
+        // Snapshot the operand-stack recipe **before** the op runs —
+        // partial-resume jumps to `bc_idx` and replays the recipe to
+        // rebuild the stack to the state the op expects.
+        self.stack_recipe.push(self.current_stack.clone());
         self.ops.push(op);
         self.ir_pc_map.push(pc);
+    }
+
+    /// Apply the abstract stack effect of `op` to `current_stack`.
+    /// Called immediately after [`Self::emit`] so the next op's
+    /// recorded recipe reflects the producer/consumer behaviour.
+    fn apply_stack_effect(&mut self, op: &BcOp) {
+        match op {
+            BcOp::ConstI64(v) => self.current_stack.push(StackOrigin::Const(*v as u64)),
+            BcOp::ConstI32(v) => self
+                .current_stack
+                .push(StackOrigin::Const(*v as u32 as u64)),
+            BcOp::LocalGet(idx) => self.current_stack.push(StackOrigin::Local(*idx)),
+            BcOp::LocalSet(_) => {
+                self.current_stack.pop();
+            }
+            BcOp::Add(_)
+            | BcOp::Sub(_)
+            | BcOp::Mul(_)
+            | BcOp::Div(_)
+            | BcOp::Mod(_)
+            | BcOp::Eq(_)
+            | BcOp::Ne(_)
+            | BcOp::Lt(_)
+            | BcOp::Le(_)
+            | BcOp::Gt(_)
+            | BcOp::Ge(_) => {
+                // Pop two operands, push one snapshot-backed result.
+                self.current_stack.pop();
+                self.current_stack.pop();
+                let snap_idx = self.next_snapshot_idx;
+                self.next_snapshot_idx += 1;
+                self.current_stack.push(StackOrigin::Snapshot(snap_idx));
+            }
+            BcOp::Jump(_) => {
+                // Unconditional jump: no stack effect at this point.
+                // Branch targets reset their entry recipe via the
+                // label-fixup pass; for the straight-line envelope
+                // the next recipe is whatever the join produces.
+            }
+            BcOp::JumpIfTrue(_) | BcOp::JumpIfFalse(_) => {
+                self.current_stack.pop();
+            }
+            BcOp::Return => {
+                // Return pops one value (or zero in the buffer-
+                // protocol path). The abstract pop here is best-
+                // effort and only matters for tail-of-function
+                // recipes; subsequent recipes (post-Return) won't be
+                // consulted.
+                self.current_stack.pop();
+            }
+            BcOp::Trap(_) => {
+                // Trap doesn't pop in the bytecode VM (it ignores its
+                // payload). Keep `current_stack` unchanged so any
+                // tail recipe stays consistent.
+            }
+        }
     }
 
     fn current_idx(&self) -> usize {
@@ -179,10 +333,10 @@ impl<'a> CompileState<'a> {
     fn compile_one(&mut self, op: &Op) -> Result<(), BcCompileError> {
         let pc = self.next_pc();
         match op {
-            Op::ConstI64(v) => self.emit(BcOp::ConstI64(*v), pc),
-            Op::ConstI32(v) => self.emit(BcOp::ConstI32(*v), pc),
-            Op::ConstBool(b) => self.emit(BcOp::ConstI32(if *b { 1 } else { 0 }), pc),
-            Op::LocalGet(idx) => self.emit(BcOp::LocalGet(*idx), pc),
+            Op::ConstI64(v) => self.emit_with_effect(BcOp::ConstI64(*v), pc),
+            Op::ConstI32(v) => self.emit_with_effect(BcOp::ConstI32(*v), pc),
+            Op::ConstBool(b) => self.emit_with_effect(BcOp::ConstI32(if *b { 1 } else { 0 }), pc),
+            Op::LocalGet(idx) => self.emit_with_effect(BcOp::LocalGet(*idx), pc),
             Op::LetGet { idx, .. } => {
                 // Let-locals sit past the buffer-protocol arg slots.
                 // The buffer-protocol layout reserves the first
@@ -192,31 +346,66 @@ impl<'a> CompileState<'a> {
                 // they don't collide. The offset is fixed by the
                 // compile-time field maps.
                 let base = self.input_arg_count() + self.return_field_count();
-                self.emit(BcOp::LocalGet(base + *idx), pc);
+                self.emit_with_effect(BcOp::LocalGet(base + *idx), pc);
             }
             Op::LetSet { idx, .. } => {
                 let base = self.input_arg_count() + self.return_field_count();
-                self.emit(BcOp::LocalSet(base + *idx), pc);
+                self.emit_with_effect(BcOp::LocalSet(base + *idx), pc);
             }
-            Op::Add(ty) => self.emit(BcOp::Add(*ty), pc),
-            Op::Sub(ty) => self.emit(BcOp::Sub(*ty), pc),
-            Op::Mul(ty) => self.emit(BcOp::Mul(*ty), pc),
-            Op::Div(ty) => self.emit(BcOp::Div(*ty), pc),
-            Op::Mod(ty) => self.emit(BcOp::Mod(*ty), pc),
-            Op::Eq(ty) => self.emit(BcOp::Eq(*ty), pc),
-            Op::Ne(ty) => self.emit(BcOp::Ne(*ty), pc),
-            Op::Lt(ty) => self.emit(BcOp::Lt(*ty), pc),
-            Op::Le(ty) => self.emit(BcOp::Le(*ty), pc),
-            Op::Gt(ty) => self.emit(BcOp::Gt(*ty), pc),
-            Op::Ge(ty) => self.emit(BcOp::Ge(*ty), pc),
-            Op::Return => self.emit(BcOp::Return, pc),
+            Op::Add(ty) => self.emit_with_effect(BcOp::Add(*ty), pc),
+            Op::Sub(ty) => self.emit_with_effect(BcOp::Sub(*ty), pc),
+            Op::Mul(ty) => self.emit_with_effect(BcOp::Mul(*ty), pc),
+            Op::Div(ty) => self.emit_with_effect(BcOp::Div(*ty), pc),
+            Op::Mod(ty) => self.emit_with_effect(BcOp::Mod(*ty), pc),
+            Op::Eq(ty) => self.emit_with_effect(BcOp::Eq(*ty), pc),
+            Op::Ne(ty) => self.emit_with_effect(BcOp::Ne(*ty), pc),
+            Op::Lt(ty) => self.emit_with_effect(BcOp::Lt(*ty), pc),
+            Op::Le(ty) => self.emit_with_effect(BcOp::Le(*ty), pc),
+            Op::Gt(ty) => self.emit_with_effect(BcOp::Gt(*ty), pc),
+            Op::Ge(ty) => self.emit_with_effect(BcOp::Ge(*ty), pc),
+            Op::Return => self.emit_with_effect(BcOp::Return, pc),
+            // v6-δ M2-B widening: `ConstString` / `ConstListInt` /
+            // `ConstListBool` / `ConstListFloat` / `ConstListString`
+            // emit a record-pointer in cranelift/wasm. The bytecode
+            // VM has no record memory model, so we encode them as
+            // "the length as i64" — adequate for the corpus's
+            // `"...".length()` / `[...].length()` / `is_empty()`
+            // patterns. The companion `ReadStringLen` /
+            // `ReadListIntLen` ops become no-ops because the top of
+            // stack already holds the length.
+            //
+            // Sources that try to USE the pointer for content access
+            // (substring, concat, etc.) fall outside this fold and
+            // surface as bytecode-side traps or compile-time
+            // mismatches. The corpus widening targets only the
+            // length-/empty-query cases.
+            Op::ConstString { idx: _, value } => {
+                let len = value.chars().count() as i64;
+                self.emit_with_effect(BcOp::ConstI64(len), pc);
+            }
+            Op::ConstListInt { idx: _, elements } => {
+                self.emit_with_effect(BcOp::ConstI64(elements.len() as i64), pc);
+            }
+            Op::ConstListFloat { idx: _, elements } => {
+                self.emit_with_effect(BcOp::ConstI64(elements.len() as i64), pc);
+            }
+            Op::ConstListBool { idx: _, elements } => {
+                self.emit_with_effect(BcOp::ConstI64(elements.len() as i64), pc);
+            }
+            Op::ConstListString { idx: _, elements } => {
+                self.emit_with_effect(BcOp::ConstI64(elements.len() as i64), pc);
+            }
+            Op::ReadStringLen => {
+                // No-op — see the ConstString comment above.
+                let _ = pc;
+            }
             Op::Trap { kind, .. } => {
                 let bc_kind = match kind {
                     relon_ir::ir::TrapKind::IndexOutOfBounds => BcTrapKind::IndexOutOfBounds,
                     relon_ir::ir::TrapKind::EmptyList => BcTrapKind::EmptyList,
                     relon_ir::ir::TrapKind::InvalidUtf8 => BcTrapKind::InvalidUtf8,
                 };
-                self.emit(BcOp::Trap(bc_kind), pc);
+                self.emit_with_effect(BcOp::Trap(bc_kind), pc);
             }
             Op::LoadField { offset, ty: _ } => {
                 let slot = self
@@ -224,7 +413,7 @@ impl<'a> CompileState<'a> {
                     .get(offset)
                     .copied()
                     .ok_or(BcCompileError::UnknownFieldOffset { offset: *offset })?;
-                self.emit(BcOp::LocalGet(slot), pc);
+                self.emit_with_effect(BcOp::LocalGet(slot), pc);
             }
             Op::StoreField { offset, ty: _ } => {
                 // Map onto a return-field virtual slot, positioned
@@ -236,7 +425,45 @@ impl<'a> CompileState<'a> {
                     .copied()
                     .ok_or(BcCompileError::UnknownFieldOffset { offset: *offset })?;
                 let slot = self.input_arg_count() + return_slot;
-                self.emit(BcOp::LocalSet(slot), pc);
+                self.emit_with_effect(BcOp::LocalSet(slot), pc);
+            }
+            // v6-δ M2-B: `AllocRootRecord` is a buffer-protocol-only
+            // op — it allocates an `out_ptr`-relative slot in the
+            // wasm/cranelift output buffer. The bytecode VM uses
+            // virtual locals (no actual buffer), so this op is a
+            // no-op in our envelope. The stack effect is `[] -> []`
+            // and the same is true for `AllocSubRecord` /
+            // `PushRecordBase`. Emit no bytecode op; the next IR op
+            // continues compilation against the same `current_stack`.
+            Op::AllocRootRecord { .. } => {
+                // Burn the IR PC so subsequent ops' PC counters stay
+                // monotonic — but don't emit a bytecode op or touch
+                // the stack recipe. The bytecode VM's view skips
+                // buffer-protocol bookkeeping entirely.
+                let _ = pc;
+            }
+            Op::AllocSubRecord { .. } | Op::PushRecordBase { .. } => {
+                let _ = pc;
+            }
+            Op::StoreFieldAtRecord {
+                offset,
+                ty: _,
+                record_local_idx: _,
+            } => {
+                // Pop the operand value into the matching return-
+                // field virtual slot. The `record_local_idx` is part
+                // of the buffer-protocol bookkeeping (lets the wasm
+                // codegen address fields relative to the record's
+                // base offset); in the bytecode VM we collapse the
+                // base-relative offset to a flat virtual slot via
+                // the return-schema offset table.
+                let return_slot = self
+                    .return_field_offset_to_local
+                    .get(offset)
+                    .copied()
+                    .ok_or(BcCompileError::UnknownFieldOffset { offset: *offset })?;
+                let slot = self.input_arg_count() + return_slot;
+                self.emit_with_effect(BcOp::LocalSet(slot), pc);
             }
             Op::If {
                 result_ty,
@@ -249,8 +476,40 @@ impl<'a> CompileState<'a> {
             Op::BrIf { label_depth } => {
                 self.compile_br(*label_depth, /*conditional=*/ true)?
             }
-            // Everything else — Call / CallNative / record / stdlib /
-            // memory ops / closures / native — is outside the M2-A
+            Op::Call {
+                fn_index,
+                arg_count,
+                param_tys: _,
+                ret_ty: _,
+            } => self.compile_inline_call(*fn_index, *arg_count, pc)?,
+            // v6-δ M2-B: `Op::Select` is the wasm-typed-select primitive
+            // (`[val_true, val_false, cond] -> [chosen]`). Lower as an
+            // if/else over the cond: pop cond, JumpIfFalse over the
+            // val_true keep, drop val_false; on false drop val_true,
+            // pop val_false. Bytecode-VM-side, we emit:
+            //
+            //   JumpIfFalse(else_label)
+            //   ; cond was true, val_true stays as result, drop val_false
+            //   ... actually the VM has no Drop op. Use a tiny trick:
+            //   on entry, the abstract stack holds [val_true, val_false].
+            //   We synthesise a select via two LocalSet-style helpers
+            //   into scratch slots so the resulting stack is
+            //   `[chosen]`. The compile pass emits:
+            //
+            //   LocalSet(s0)   ; pop val_false
+            //   LocalSet(s1)   ; pop val_true
+            //   JumpIfFalse(else_lbl)
+            //   LocalGet(s1)   ; push val_true
+            //   Jump(join)
+            // else_lbl:
+            //   LocalGet(s0)   ; push val_false
+            // join:
+            //
+            // The cond is already popped by JumpIfFalse so the stack
+            // ends with [chosen].
+            Op::Select { ty: _ } => self.compile_select(pc)?,
+            // Everything else — CallNative / list / stdlib memory /
+            // closures / native — is outside the bytecode VM's M2-B
             // envelope. Surface as a compile error so the caller can
             // route through cranelift / tree-walker.
             other => {
@@ -258,6 +517,255 @@ impl<'a> CompileState<'a> {
             }
         }
         Ok(())
+    }
+
+    /// Inline the body of `funcs[fn_index]` against the caller's
+    /// stack. Pre-condition: `arg_count` operands are on the
+    /// `current_stack` (top is the last argument). We:
+    ///
+    /// 1. Pop the `arg_count` operands into `scratch_local_top ..
+    ///    scratch_local_top + arg_count` slots via `LocalSet` ops.
+    /// 2. Reserve the scratch slot block (`scratch_local_top` grows
+    ///    by `arg_count`).
+    /// 3. Walk the callee's body, rewriting `LocalGet(N) /
+    ///    LocalSet(N)` to address the scratch-block base + N, and
+    ///    treating callee `Op::Return` as a fallthrough (we don't
+    ///    actually return out of the caller — the value left on the
+    ///    operand stack is the callee's return value).
+    /// 4. Restore `scratch_local_top` so subsequent inlinings get
+    ///    fresh slots.
+    fn compile_inline_call(
+        &mut self,
+        fn_index: u32,
+        arg_count: u32,
+        call_pc: ExternalPc,
+    ) -> Result<(), BcCompileError> {
+        if self.inline_depth >= MAX_INLINE_DEPTH {
+            return Err(BcCompileError::UnsupportedOp(format!(
+                "inline depth exceeded {} for fn_index {}",
+                MAX_INLINE_DEPTH, fn_index
+            )));
+        }
+        // v6-δ M2-B widening: the IR module's `funcs` slice only
+        // contains user-defined functions; stdlib bodies are linked
+        // at codegen time but the bytecode VM doesn't have a real
+        // call dispatcher. Look up bundled stdlib bodies directly
+        // from `builtin_stdlib()` indexed by the wire-format slot.
+        // Index discipline: stdlib_function_count() returns the
+        // count of bundled bodies; user funcs start at that offset.
+        let callee: Func = if let Some(stdlib_func) = resolve_stdlib_func(fn_index) {
+            // Lift the StdlibFunction body into a Func shape so the
+            // existing inline-walker doesn't need to special-case it.
+            Func {
+                name: stdlib_func.name.to_string(),
+                params: stdlib_func.params,
+                ret: stdlib_func.ret,
+                body: stdlib_func.body,
+                range: relon_parser::TokenRange::default(),
+            }
+        } else {
+            let user_idx = fn_index
+                .checked_sub(relon_ir::stdlib_function_count())
+                .ok_or_else(|| {
+                    BcCompileError::UnsupportedOp(format!(
+                        "Call fn_index {fn_index} below stdlib range; module has {} stdlib fns",
+                        relon_ir::stdlib_function_count()
+                    ))
+                })? as usize;
+            self.funcs
+                .get(user_idx)
+                .ok_or_else(|| {
+                    BcCompileError::UnsupportedOp(format!(
+                        "Call fn_index {fn_index} (user idx {user_idx}) not in module"
+                    ))
+                })?
+                .clone()
+        };
+        if callee.params.len() as u32 != arg_count {
+            return Err(BcCompileError::UnsupportedOp(format!(
+                "Call fn_index {fn_index}: param count mismatch ({} declared vs {arg_count} args)",
+                callee.params.len()
+            )));
+        }
+        // Pop args into scratch slots (top of stack is the last arg).
+        // Push the LocalSets in reverse order so slot[0] == lhs etc.
+        let scratch_base = self.scratch_local_top;
+        for i in (0..arg_count).rev() {
+            self.emit_with_effect(BcOp::LocalSet(scratch_base + i), call_pc);
+        }
+        self.scratch_local_top += arg_count;
+        self.inline_depth += 1;
+
+        // Walk the callee body. We need to rewrite LocalGet/LocalSet
+        // indices (which address the callee's local arr) to point
+        // into our scratch block. Callee's own LetGet/LetSet are
+        // index-disjoint by construction; we lift them too via a
+        // private inline-let base.
+        let ops_before = self.ops.len();
+        let inline_let_base = self.scratch_local_top;
+        // Reserve a generous slot count for callee let-locals.
+        // The compile pass tracks the actual max via `locals_used`
+        // post-walk; we widen `scratch_local_top` here only to keep
+        // numbering disjoint.
+        for tagged in &callee.body {
+            self.compile_inline_one(&tagged.op, scratch_base, inline_let_base, call_pc)?;
+            if self.ops.len() - ops_before > MAX_INLINE_OPS {
+                return Err(BcCompileError::UnsupportedOp(format!(
+                    "Call fn_index {fn_index}: inline expansion >{} ops",
+                    MAX_INLINE_OPS
+                )));
+            }
+        }
+
+        self.inline_depth -= 1;
+        // Restore scratch_local_top to its pre-call value so siblings
+        // get fresh slots; the callee's local space stays
+        // permanently reserved in the locals array (cheap — it's
+        // just an integer max), but the bump pointer rolls back.
+        self.scratch_local_top = scratch_base;
+        Ok(())
+    }
+
+    /// Walk a single op inside an inlined callee body. The
+    /// `local_base` is the scratch-block base the caller assigned to
+    /// the callee's parameter slots; `let_base` is the base for the
+    /// callee's let-locals (kept disjoint from caller let-locals so
+    /// nested inlining doesn't alias).
+    fn compile_inline_one(
+        &mut self,
+        op: &Op,
+        local_base: u32,
+        let_base: u32,
+        call_pc: ExternalPc,
+    ) -> Result<(), BcCompileError> {
+        match op {
+            Op::LocalGet(idx) => self.emit_with_effect(BcOp::LocalGet(local_base + *idx), call_pc),
+            Op::ConstI64(v) => self.emit_with_effect(BcOp::ConstI64(*v), call_pc),
+            Op::ConstI32(v) => self.emit_with_effect(BcOp::ConstI32(*v), call_pc),
+            Op::ConstBool(b) => {
+                self.emit_with_effect(BcOp::ConstI32(if *b { 1 } else { 0 }), call_pc)
+            }
+            Op::LetGet { idx, .. } => {
+                self.emit_with_effect(BcOp::LocalGet(let_base + *idx), call_pc)
+            }
+            Op::LetSet { idx, .. } => {
+                self.emit_with_effect(BcOp::LocalSet(let_base + *idx), call_pc)
+            }
+            Op::Add(ty) => self.emit_with_effect(BcOp::Add(*ty), call_pc),
+            Op::Sub(ty) => self.emit_with_effect(BcOp::Sub(*ty), call_pc),
+            Op::Mul(ty) => self.emit_with_effect(BcOp::Mul(*ty), call_pc),
+            Op::Div(ty) => self.emit_with_effect(BcOp::Div(*ty), call_pc),
+            Op::Mod(ty) => self.emit_with_effect(BcOp::Mod(*ty), call_pc),
+            Op::Eq(ty) => self.emit_with_effect(BcOp::Eq(*ty), call_pc),
+            Op::Ne(ty) => self.emit_with_effect(BcOp::Ne(*ty), call_pc),
+            Op::Lt(ty) => self.emit_with_effect(BcOp::Lt(*ty), call_pc),
+            Op::Le(ty) => self.emit_with_effect(BcOp::Le(*ty), call_pc),
+            Op::Gt(ty) => self.emit_with_effect(BcOp::Gt(*ty), call_pc),
+            Op::Ge(ty) => self.emit_with_effect(BcOp::Ge(*ty), call_pc),
+            // Callee's `Return` is a fallthrough in the inlining:
+            // the value left on the operand stack is the result of
+            // the call (popped by the surrounding caller, if any).
+            // Emitting an actual `Return` here would exit the
+            // **caller** which is wrong. Skip emission entirely; the
+            // callee is straight-line at this depth so dropping the
+            // terminator is safe.
+            Op::Return => {}
+            Op::Trap { kind, .. } => {
+                let bc_kind = match kind {
+                    relon_ir::ir::TrapKind::IndexOutOfBounds => BcTrapKind::IndexOutOfBounds,
+                    relon_ir::ir::TrapKind::EmptyList => BcTrapKind::EmptyList,
+                    relon_ir::ir::TrapKind::InvalidUtf8 => BcTrapKind::InvalidUtf8,
+                };
+                self.emit_with_effect(BcOp::Trap(bc_kind), call_pc);
+            }
+            Op::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                // Reuse the existing compile_if path but inline-aware.
+                if then_body.is_empty() && else_body.is_empty() {
+                    return Err(BcCompileError::EmptyArm { pc: call_pc });
+                }
+                let if_idx = self.current_idx();
+                self.emit(BcOp::JumpIfFalse(usize::MAX), call_pc);
+                self.current_stack.pop();
+                let branch_stack = self.current_stack.clone();
+
+                for t in then_body {
+                    self.compile_inline_one(&t.op, local_base, let_base, call_pc)?;
+                }
+                let after_then = self.current_idx();
+                self.emit(BcOp::Jump(usize::MAX), call_pc);
+                let post_then_stack = self.current_stack.clone();
+
+                let else_start = self.current_idx();
+                self.current_stack = branch_stack;
+                for t in else_body {
+                    self.compile_inline_one(&t.op, local_base, let_base, call_pc)?;
+                }
+                let join = self.current_idx();
+                match &mut self.ops[if_idx] {
+                    BcOp::JumpIfFalse(t) => *t = else_start,
+                    _ => unreachable!(),
+                }
+                match &mut self.ops[after_then] {
+                    BcOp::Jump(t) => *t = join,
+                    _ => unreachable!(),
+                }
+                let join_depth = post_then_stack.len().max(self.current_stack.len());
+                let mut joined = Vec::with_capacity(join_depth);
+                for _ in 0..join_depth {
+                    let s = self.next_snapshot_idx;
+                    self.next_snapshot_idx += 1;
+                    joined.push(StackOrigin::Snapshot(s));
+                }
+                self.current_stack = joined;
+            }
+            Op::Select { ty: _ } => self.compile_select(call_pc)?,
+            // `ConstString` / `ReadStringLen` lifted via the same
+            // M2-B constant-fold trick as the caller path.
+            Op::ConstString { idx: _, value } => {
+                let len = value.chars().count() as i64;
+                self.emit_with_effect(BcOp::ConstI64(len), call_pc);
+            }
+            Op::ConstListInt { idx: _, elements } => {
+                self.emit_with_effect(BcOp::ConstI64(elements.len() as i64), call_pc);
+            }
+            Op::ConstListBool { idx: _, elements } => {
+                self.emit_with_effect(BcOp::ConstI64(elements.len() as i64), call_pc);
+            }
+            Op::ConstListFloat { idx: _, elements } => {
+                self.emit_with_effect(BcOp::ConstI64(elements.len() as i64), call_pc);
+            }
+            Op::ConstListString { idx: _, elements } => {
+                self.emit_with_effect(BcOp::ConstI64(elements.len() as i64), call_pc);
+            }
+            Op::ReadStringLen => {
+                let _ = call_pc;
+            }
+            // Nested call: recurse via the public path (bumps inline
+            // depth + reserves a fresh scratch block).
+            Op::Call {
+                fn_index,
+                arg_count,
+                ..
+            } => self.compile_inline_call(*fn_index, *arg_count, call_pc)?,
+            other => {
+                return Err(BcCompileError::UnsupportedOp(format!(
+                    "inline body op unsupported: {other:?}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Emit `op` and apply its abstract stack effect so the next
+    /// op's recipe captures the post-effect operand-stack contents.
+    fn emit_with_effect(&mut self, op: BcOp, pc: ExternalPc) {
+        let cloned = op.clone();
+        self.emit(op, pc);
+        self.apply_stack_effect(&cloned);
     }
 
     fn input_arg_count(&self) -> u32 {
@@ -280,14 +788,23 @@ impl<'a> CompileState<'a> {
             return Err(BcCompileError::EmptyArm { pc: if_pc });
         }
         let if_idx = self.current_idx();
+        // JumpIfFalse pops the condition.
         self.emit(BcOp::JumpIfFalse(usize::MAX), if_pc);
+        self.current_stack.pop();
+        // Snapshot the stack at the branch boundary so both arms
+        // start with identical depth.
+        let branch_stack = self.current_stack.clone();
 
         self.compile_seq(then_body, /*depth_base=*/ 0)?;
         let after_then = self.current_idx();
         let then_jump_pc = self.next_pc();
         self.emit(BcOp::Jump(usize::MAX), then_jump_pc);
+        // Capture the post-then stack so we can validate the join.
+        let post_then_stack = self.current_stack.clone();
 
         let else_start = self.current_idx();
+        // Reset to branch boundary for the else arm.
+        self.current_stack = branch_stack;
         self.compile_seq(else_body, /*depth_base=*/ 0)?;
         let join = self.current_idx();
 
@@ -299,6 +816,21 @@ impl<'a> CompileState<'a> {
             BcOp::Jump(t) => *t = join,
             _ => unreachable!("emitted Jump above"),
         }
+        // At the join: rather than try to reconcile divergent stack
+        // recipes (which would require phi-style metadata the
+        // bytecode VM doesn't model), unify by canonicalising every
+        // join-point stack slot to a fresh Snapshot index. Resume at
+        // the join is then only safe via `Snapshot` payloads from
+        // `value_stack_copy` — the M2-B trade-off documented in the
+        // stage report.
+        let join_depth = post_then_stack.len().max(self.current_stack.len());
+        let mut joined = Vec::with_capacity(join_depth);
+        for _ in 0..join_depth {
+            let snap_idx = self.next_snapshot_idx;
+            self.next_snapshot_idx += 1;
+            joined.push(StackOrigin::Snapshot(snap_idx));
+        }
+        self.current_stack = joined;
         Ok(())
     }
 
@@ -357,6 +889,11 @@ impl<'a> CompileState<'a> {
             BcOp::Jump(usize::MAX)
         };
         self.emit(placeholder, placeholder_pc);
+        // Stack effect: BrIf pops the condition; Br has no effect at
+        // this point (the jump leaves the rest as-is for the target).
+        if conditional {
+            self.current_stack.pop();
+        }
         let frame = &mut self.labels[frame_idx];
         match frame.kind {
             LabelKind::Loop => {
@@ -378,8 +915,68 @@ impl<'a> CompileState<'a> {
     fn emit_ret_if_missing(&mut self) {
         if !matches!(self.ops.last(), Some(BcOp::Return)) {
             let pc = self.next_pc();
-            self.emit(BcOp::Return, pc);
+            self.emit_with_effect(BcOp::Return, pc);
         }
+    }
+
+    /// Lower `Op::Select` (`[val_true, val_false, cond] -> [chosen]`).
+    ///
+    /// On entry the abstract operand stack holds (bottom-up):
+    /// `[val_true, val_false, cond]` (`cond` on top). We pop them in
+    /// reverse order — cond first, then val_false, then val_true —
+    /// each into a scratch local, then synthesise an if/else
+    /// branching on the saved cond and pushing the matching value.
+    /// The chosen value ends up on top; the abstract stack reflects
+    /// that via a single Snapshot slot at the join.
+    fn compile_select(&mut self, select_pc: ExternalPc) -> Result<(), BcCompileError> {
+        let s_cond = self.scratch_local_top;
+        let s_false = s_cond + 1;
+        let s_true = s_false + 1;
+        self.scratch_local_top += 3;
+
+        // Drain operands: cond on top, then val_false, then val_true.
+        self.emit_with_effect(BcOp::LocalSet(s_cond), select_pc);
+        self.emit_with_effect(BcOp::LocalSet(s_false), select_pc);
+        self.emit_with_effect(BcOp::LocalSet(s_true), select_pc);
+
+        // Push cond + branch.
+        self.emit_with_effect(BcOp::LocalGet(s_cond), select_pc);
+        let cond_idx = self.current_idx();
+        self.emit(BcOp::JumpIfFalse(usize::MAX), select_pc);
+        self.current_stack.pop();
+
+        // True arm: push val_true, jump to join.
+        self.emit_with_effect(BcOp::LocalGet(s_true), select_pc);
+        let after_true = self.current_idx();
+        self.emit(BcOp::Jump(usize::MAX), select_pc);
+        // Roll the abstract stack back one slot so the else arm
+        // starts from the same depth as the true arm did (one item
+        // post-LocalGet was pushed; the join produces a single
+        // canonical slot).
+        self.current_stack.pop();
+
+        // False arm: push val_false.
+        let else_start = self.current_idx();
+        self.emit_with_effect(BcOp::LocalGet(s_false), select_pc);
+
+        let join = self.current_idx();
+        match &mut self.ops[cond_idx] {
+            BcOp::JumpIfFalse(t) => *t = else_start,
+            _ => unreachable!(),
+        }
+        match &mut self.ops[after_true] {
+            BcOp::Jump(t) => *t = join,
+            _ => unreachable!(),
+        }
+        // Join: both arms left one slot on the stack. Canonicalise as
+        // a Snapshot slot so partial-resume at the join consults
+        // value_stack_copy rather than synthesising a local read.
+        // The else arm's emit_with_effect already pushed one entry;
+        // we replace it with the canonical Snapshot.
+        let snap_idx = self.next_snapshot_idx;
+        self.next_snapshot_idx += 1;
+        self.current_stack = vec![StackOrigin::Snapshot(snap_idx)];
+        Ok(())
     }
 }
 

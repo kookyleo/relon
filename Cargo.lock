@@ -1535,6 +1535,7 @@ dependencies = [
  "relon-eval-api",
  "relon-ir",
  "relon-parser",
+ "relon-trace-abi",
  "thiserror",
 ]
 
