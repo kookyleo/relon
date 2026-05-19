@@ -3533,3 +3533,68 @@ bench 的 caller 是 Rust，inline 不能消除 Rust→JIT 边界。本 phase
   内嵌的 trace dispatch site 仍需要 splice）。
 
 详见 `docs/internal/v6-epsilon-0a-stage-report-2026-05-19.md`。
+
+---
+
+## Appendix · v6-ε bench rewrite (2026-05-19)
+
+**Title**: Hot-loop bench rewritten — measure loop-INSIDE-trace, not
+Rust→JIT per-iter boundary.
+
+**Why**: v6-δ M2-C → v6-ε-0-C → v6-ε-0-A 三个 phase 在同一个 9.5
+ns/iter 平台上反复试探，每次 0.00-0.04 ns delta。三轮 attempt 已经
+falsify 了 prologue/epilogue / ABI conv / inner trace call/ret 三条
+6 ns hypothesis；剩下的唯一 explanatory 仅剩 **bench harness 自身
+的 Rust → JIT 每 iter 的 extern-C 边界**。这不是 trace JIT 的固有
+cost，是 bench shape 的 artefact。
+
+**新 bench methodology**：
+
+- **loop-INSIDE rows**: callee 里面跑完整 N-iter loop，one Rust→callee
+  invoke per criterion iteration。`Throughput::Elements(HOT_LOOP_N)`
+  直接给 per-iter 数字。这是 honest hot-loop 测量。
+- **dispatch-boundary rows**: 保留 v6-γ shape 的「Rust drives N
+  invokes」结构，但 explicit 命名 + 文档标记为 "per-dispatch boundary
+  cost"。这些**不是** hot-loop 数字。
+
+**3 round criterion median** (`cargo bench --bench trace_jit_hot_loop`):
+
+```
+v6_epsilon_hot_loop/backend/tree_walk_loop      : 3.36 µs/iter   (µs-class baseline)
+v6_epsilon_hot_loop/backend/cranelift_aot_loop  : 2.07 ns/iter   (ns-class, AOT loop)
+v6_epsilon_hot_loop/backend/trace_jit_loop      : 1.185 ns/iter  ← LuaJIT-class
+v6_epsilon_hot_loop/backend/rust_native_loop    : 2.48 ns/iter   (floor)
+---
+dispatch_cranelift_step                          : 415 ns/iter   (HashMap-API)
+dispatch_trampoline                              : 9.51 ns/iter
+dispatch_ic                                      : 9.57 ns/iter
+dispatch_tail                                    : 9.54 ns/iter
+dispatch_sysv                                    : 9.53 ns/iter
+dispatch_inline                                  : 9.53 ns/iter
+dispatch_rust_inlined_baseline                   : 3.55 ns/iter
+```
+
+**Decision**:
+- **`trace_jit_loop = 1.185 ns/iter` < brief 阈值 3 ns/iter (≈ 2.5×
+  under)**。
+- 进入 LuaJIT 2.x trace-tier band (1-3 ns/iter)。
+- **ε phase 的 per-iter perf 目标已达**——剩余 ε-M sub-phases 中
+  纯 codegen-tier 的（bounds hoist / overflow hoist / LICM）不再
+  必要。
+- **剩余 follow-up（不是 perf gap）**:
+  - 让 trace recorder 学会 record loop trace（recorder-side feature，
+    不动 JIT codegen 路径，但这是真 Relon 源码自动进 trace 路径的
+    前置 ）。
+  - Cap hoisting / sandbox cycle-batch（ε-M4）对长 trace 仍然相关。
+  - `TraceOp::Call` 在 inline 路径 supported（composability gap）。
+
+**`trace_jit_loop` 行的本质**：
+
+Trace recorder 今天还不能 record 一个完整的 loop trace（不发
+`MarkLoopHead` / `MarkLoopBack`）。Bench 直接 hand-build 一个
+cranelift `JITModule`，body 就是完整的 `for i in 1..=n { acc += i }`
+overflow-guarded loop，sig 兼容 `TRACE_ENTRY_SIG`。从 codegen
+角度，hand-built 路径与 recorder-built 路径在 emitter 落 cranelift
+的形状是一致的——recorder 缺的是「触发」而不是「目标」。
+
+**详见**：`docs/internal/v6-epsilon-bench-rewrite-report-2026-05-19.md`。

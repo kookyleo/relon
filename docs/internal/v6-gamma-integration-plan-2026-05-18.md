@@ -1078,3 +1078,118 @@ add+overflow guard，对比 `rust_inlined_baseline`。如果 prototype 跑
   根本不存在。继续 defer。
 - host hook helpers 仍 SystemV，inline path 跨 conv call 已验证
   工作（smoke test 3）。
+
+## 19. v6-ε bench rewrite — hot-loop-INSIDE-trace (DONE-MET-TARGET 2026-05-19)
+
+**Status**: ε phase per-iter perf 目标**已达**——
+`trace_jit_loop = 1.185 ns/iter`，brief 阈值 3 ns/iter 之下 2.5×，
+进入 LuaJIT 2.x trace-tier 1-3 ns/iter band。
+
+ε-0-A 给的 prototype 假设（手写 cranelift fn 把 hot loop 整个编进
+cranelift 自身能跑 3-4 ns）**被 over-perform 验证**——实际跑到
+1.185 ns/iter，比 prototype 预测更好。
+
+Stage report:
+`docs/internal/v6-epsilon-bench-rewrite-report-2026-05-19.md`
+
+**Worktree HEAD**: `worktree-agent-a77de70826f538bbe`（base =
+`1a640ad`）。
+
+**Test count**: 1761 passing（与 ε-0-A baseline 一致；bench-only
+改动，不新增 test）。All gates green。
+
+### Bench shape rewrite
+
+bench `crates/relon-bench/benches/trace_jit_hot_loop.rs` 拆为两族：
+
+- **loop-INSIDE rows**（新增）：callee 内部跑完整 N-iter loop。
+  - `tree_walk_loop`：3.36 µs/iter（µs-class baseline，`list.sum(range(n))`）
+  - `cranelift_aot_loop`：2.07 ns/iter（Relon IR `Op::Loop` 编入 cranelift-AOT）
+  - **`trace_jit_loop`：1.185 ns/iter** ← LuaJIT-class
+  - `rust_native_loop`：2.48 ns/iter（floor with `checked_add`）
+- **dispatch-boundary rows**（保留 / relabel）：M2-C / ε-0-C / ε-0-A
+  原本的 5 + 2 行，命名前缀改成 `dispatch_*`，模块 doc 明示这些
+  measure 的是 per-dispatch Rust→JIT 边界 cost，**不是**
+  hot-loop cost。
+  - `dispatch_trampoline` / `dispatch_ic` / `dispatch_tail`
+    / `dispatch_sysv` / `dispatch_inline`: 9.5 ns/iter（与 ε-0-A 完全
+    持平，证明 bench shape 改写不影响 carry-over 信号）。
+  - `dispatch_rust_inlined_baseline`: 3.55 ns/iter（floor）。
+
+### `trace_jit_loop` 是怎么测的
+
+trace recorder 当下还不能 record 包含 backward branch 的 loop
+trace。Per task brief option (a)，bench 直接 hand-build 一个
+`JITModule`，body 包括：
+
+```text
+entry:    load n; seed acc=0, i=1; jump header(acc, i)
+header(acc, i):  if i > n -> exit; else -> body
+body:     (sum, of) = sadd_overflow(acc, i); next_i = i + 1
+          if of -> deopt; else -> header(sum, next_i)
+exit:     store acc -> ctx.result_slot; return Success
+deopt:    call save_deopt(ctx, 0, 0); return GuardFailed
+```
+
+JIT module flag set与 trampoline path 一致（`opt_level=speed`,
+no probestack, no frame pointers）。Sig 兼容 `TRACE_ENTRY_SIG`。
+
+cranelift 编出来的 x86_64 body：
+
+```text
+header:
+    cmp rdi, rsi          ; i <= n?
+    jg  exit
+    add rcx, rdi          ; sadd_overflow(acc, i)
+    jo  deopt
+    add rdi, 1
+    jmp header
+```
+
+5 inst / iter ≈ 3-4 cycles ≈ 1.2 ns 在 3.0 GHz 上——与实测一致。
+
+### Decision
+
+- **停止 ε phase 的 per-iter 优化工作**（bounds hoist /
+  overflow hoist / LICM 不再必要——目标已达）。
+- **真正剩下的 follow-up（不是 perf gap）**：
+  1. **recorder 学会 record loop**（ε-M0-recorder-loops，新增 sub-
+     phase，估计 2-3 天）。今天 hand-built 的 `trace_jit_loop` 行
+     是「JIT 编出 1.185 ns/iter」的 demo，但**真 Relon 源码自动进
+     这个 codegen 路径**需要 recorder 端发 `MarkLoopHead` /
+     `Cmp + LoopExitGuard` / `MarkLoopBack`。emitter 端已经支持。
+  2. **cap hoisting** (ε-M4) 对长 trace（> 100K iters under sandbox）
+     仍然相关，但不影响 per-iter 数字。
+  3. **`TraceOp::Call` in inline path** (ε-0-A §10.5) composability gap。
+
+### 3-round criterion median 数据
+
+```
+                                R1       R2       R3       median
+tree_walk_loop       (ns/elem): 3385     3364     3364     3364
+cranelift_aot_loop   (ns/iter): 2.074    2.073    2.073    2.073
+trace_jit_loop       (ns/iter): 1.186    1.185    1.185    1.185   ← target ≤ 3
+rust_native_loop     (ns/iter): 2.499    2.484    2.480    2.484
+dispatch_cranelift_step (ns/iter): 434   415      410      415
+dispatch_trampoline  (ns/iter): 9.507    9.538    9.496    9.507
+dispatch_ic          (ns/iter): 9.570    9.571    9.558    9.570
+dispatch_tail        (ns/iter): 9.531    9.536    9.547    9.536
+dispatch_sysv        (ns/iter): 9.532    9.533    9.530    9.532
+dispatch_inline      (ns/iter): 9.532    9.534    9.559    9.534
+dispatch_rust_inlined_baseline (ns/iter): 3.553 3.553 3.552 3.553
+```
+
+### Gate numbers
+
+- build / test / clippy / fmt / wasm32 全部清。
+- `cargo bench --bench trace_jit_hot_loop` × 3 round 完成。
+
+### 文件 diff stat（base = 1a640ad）
+
+```
+crates/relon-bench/Cargo.toml                       |  20 +-
+crates/relon-bench/benches/trace_jit_hot_loop.rs    | 800 +++++++--
+docs/internal/v6-epsilon-bench-rewrite-report-2026-05-19.md | 350 ++++ (新增)
+docs/internal/wasm-bench-report-2026-05-16.md       |  72 +
+docs/internal/v6-gamma-integration-plan-2026-05-18.md| (本节追加)
+```
