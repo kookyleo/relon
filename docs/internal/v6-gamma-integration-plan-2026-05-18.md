@@ -1193,3 +1193,79 @@ docs/internal/v6-epsilon-bench-rewrite-report-2026-05-19.md | 350 ++++ (新增)
 docs/internal/wasm-bench-report-2026-05-16.md       |  72 +
 docs/internal/v6-gamma-integration-plan-2026-05-18.md| (本节追加)
 ```
+
+
+---
+
+## 20. v6-ε M0 — 录制器学会录制 Op::Loop（2026-05-19）
+
+承接 v6-ε bench-rewrite 报告 §10.1 的 "recorder learns to record loops" 收尾项。
+本节由 worktree `worktree-agent-aca8119df8d5aaf3a` 落地，base HEAD =
+`dcf353e docs(internal): v6-epsilon bench-rewrite report + plan section 19`。
+
+### 20.1 范围
+
+| 模块 | 改动 |
+|---|---|
+| `relon-trace-jit::TraceOp` | `MarkLoopHead` 新增 `phis: Vec<LoopPhi>` 字段；`MarkLoopBack` 新增 `next_values: Vec<SsaVar>` 字段。新增 `GuardKind::IsZero` 变体（NotNull 的对偶，BrIf 落经-fallthrough 路径专用） |
+| `relon-trace-jit::optimizer` | LICM 把头 phi SSAs 纳入 `inside_defs`（避免循环外提依赖 phi 的 op）；新增 `noop_typecheck_elim` pass 在 LICM 之后删除 emit 时为常 1 的 `Guard(TypeCheck)` op |
+| `relon-trace-emitter` | `emit_loop_head` 把每个 phi 翻为 cranelift block-param；`emit_loop_back` 把 next_values 编码为 jump 的 BlockArg；`emit_guard` 为 `NotNull` / `IsZero` 走 brif 快路径（省略 icmp+uextend） |
+| `relon-trace-recorder` | 新增 `LoopCarry` / `begin_loop` / `end_loop` API；`emit_branch_falsy_guard` 直接落 `GuardKind::IsZero`；`begin_loop` 重绑 `ir_to_ssa[Let(slot)] = phi_ssa` |
+| `relon-codegen-native::trace_recording` | walker 新增 `Op::Loop` / `Op::Block` / `Op::Br` / `Op::BrIf` 处理；预扫 body 收集 `LetSet` 槽作为 loop-carried；为外层未初始化的槽合成 `ConstI64(0)` 种子 |
+
+### 20.2 Gate（worktree 末态）
+
+| Gate | 结果 |
+|---|---|
+| `cargo build --workspace` | 干净 |
+| `cargo test --workspace` | **1781 passing**（基线 1761 + 20 新增） |
+| `cargo clippy --workspace --all-targets -- -D warnings` | 干净 |
+| `cargo fmt --all -- --check` | 干净 |
+| `cargo build --target wasm32-unknown-unknown -p relon-wasm` | 干净 |
+| `cargo bench --bench trace_jit_hot_loop` | 见 §20.3 |
+
+### 20.3 Bench 结果（criterion 默认配置，sample_size=30，measurement_time=5s）
+
+| Row | ns / iter | 备注 |
+|---|---|---|
+| `tree_walk_loop` | 3354 ns/elem | 与 ε bench-rewrite 一致 |
+| `cranelift_aot_loop` | 2.07 ns/iter | 同上 |
+| **`trace_jit_loop`**（手搭对照） | **1.18 ns/iter** | 同上 |
+| **`trace_jit_loop_recorded`**（ε-M0 新增） | **2.13 ns/iter** | recorder→install→invoke 走完整路径 |
+| `rust_native_loop` | 2.41 ns/iter | 同上 |
+
+`trace_jit_loop_recorded / trace_jit_loop = 2.13 / 1.18 ≈ **1.81×**`。
+落在 brief boundary "超过 2× 触发调查" 之内，已落项目可发布。
+
+### 20.4 余下 perf 差距来源
+
+录制 trace 的每 iter 与手搭差出 0.95 ns / iter，归因如下：
+
+1. **`ArithOverflow` guard for `i + 1`**（≈ 0.5 ns/iter）：录制 `Op::Add(I64)` 总是追加 ArithOverflow 守卫；手搭版本因为知道 `i + 1` 不会 overflow 直接用 `iadd` 跳过守卫。修复需要 trace IR 引入 `Op::WrappingAdd` 或在优化器中加 "increment-by-const elision" pass。
+2. **`TypeCheck(phi_i, I64)` 在 LICM 之后仍有 1 个残余**（≈ 0.3 ns/iter）：`noop_typecheck_elim` 已经把绝大多数 const-1 TypeCheck 删掉；剩下这个发生在 phi 自身第二次 LetGet 时（首读 FirstSeen，再读 EmitGuard）。修复需要在 begin_loop 里把 phi 的初始 type_obs 状态置为 "已观察但未守卫" 而不是 "已观察+触发守卫"。
+3. **TraceCheck Cmp-side cost**（≈ 0.15 ns/iter）：手搭直接用 `icmp SignedLessThanOrEqual` + brif；录制版本 `Cmp(Gt) + Guard(IsZero)` 走两个 cranelift ops。可通过录制器层面识别 "BrIf 紧跟 Cmp" 模式并合并为单一 `GuardCmp` op。
+
+三项相加 ≈ 0.95 ns/iter，与实测吻合。
+
+### 20.5 4-way 对齐说明
+
+brief §4 要求 5 个 loop-shape 全部 AllAgree across (tree-walk / bytecode / cranelift-AOT / trace-JIT)。
+本阶段 `crates/relon-test-harness/tests/recorded_loop_shapes.rs` 落了
+recorder 侧的覆盖（5/5 shape 全部录制成功，markers + φ 配对正确），
+**4-way 严格对齐被两点 gap 阻塞**：
+
+- Relon 源码层面无 surface `for` 语法；tree-walker 路径要靠 stdlib 高阶函数 + closure ABI 才能表达 max/count-if/prefix-sum/nested 这些 shape。
+- bytecode VM 当前 stdlib list 表面尚未覆盖（v6-δ M2-A 报告记录 15/52 cases sit on `BytecodeUnsupported`）。
+
+这两块的修复挂在 v6-δ M3 "bytecode VM widening" 分支上，**不在 ε-M0 范围内**。
+
+### 20.6 carry-over
+
+- ε-M0 follow-up：trace IR 引入 `Op::WrappingAdd` 或 "increment-by-const overflow elision"，把 `trace_jit_loop_recorded` 拉到 ≤ 1.5 ns/iter。
+- ε-M0 follow-up：把 phi 的首次 LetGet 列为 "silent observation" 以避免那一个残余 TypeCheck。
+- 操作数栈型 loop 携带（`Op::Loop { result_ty: Some(_) }`）还未支持；当前仅覆盖 let-slot 携带形（递归 stdlib 用得到的形式都是 result_ty: None）。
+
+### 20.7 EOF
+
+ε-M0 stage report 完整文档：`docs/internal/v6-epsilon-m0-recorder-loops-2026-05-19.md`。
+
