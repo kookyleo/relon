@@ -3735,3 +3735,21 @@ cargo run --release -p relon-bench --bin bench_stats -- \
 
 详 `docs/internal/v6-lambda-machine-luajit-stage-report-2026-05-19.md`。
 
+
+---
+
+## v6-lambda-2/3 cmp_lua paired bench appendix（2026-05-19）
+
+Adversarial Relon-vs-LuaJIT 12-workload paired bench.
+
+bench file: `crates/relon-bench/benches/cmp_lua.rs`
+group: `v6_lambda_cmp_lua` (+ `v6_lambda_cmp_lua_cold` sub-group for W11)
+post-process: `cargo run --release -p relon-bench --bin bench_stats -- target/criterion/v6_lambda_cmp_lua`
+
+每个 W 包含：
+- Relon source（tree-walker baseline，部分含 cranelift-AOT / trace-JIT 引用）
+- Lua 5.1 source（mlua vendored LuaJIT 2.1）
+- 构造期一致性 assert：same input -> same output
+- criterion bench × 2 row（relon_tree_walk + luajit）
+
+完整结果详 `docs/internal/relon-vs-luajit-final-report-2026-05-19.md` 决策矩阵 §3。

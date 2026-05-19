@@ -1374,3 +1374,49 @@ wasm build / bench / validators / lua_smoke）通过。
 - **本阶段已知 limitation**：dev box 不能锁 governor（schedutil 持久），
   λ-2 / λ-3 必须在 quiescent 机上跑或显式 force-run 并在报告里说明。
 
+
+---
+
+## 23. v6-λ-2/3/5 — Paired Relon vs LuaJIT 12-workload bench + final report（IN-FLIGHT 2026-05-19）
+
+### 23.1 目标
+
+完成 [rigorous plan §3](relon-vs-luajit-rigorous-plan.md) 的 12 个 adversarial workload，每个 workload 跑 Relon (tree-walker baseline) + LuaJIT (mlua vendored 2.1) 一致性 assert + criterion 测量，并产出 §5 决策矩阵的 5/5 必过判定。
+
+### 23.2 文件清单
+
+新增：
+- `crates/relon-bench/benches/cmp_lua.rs` — 单一 criterion bench file 涵盖 W1-W12（W11 cold start 独立子 group 通过 `std::process::Command` shell out）
+- `crates/relon-bench/tests/cmp_lua_consistency.rs` — debug-mode consistency tests，10 个 W 都 parse + eval + 对比 Lua 输出
+- `docs/internal/relon-vs-luajit-final-report-2026-05-19.md` — 最终报告（带 5-dim 判定 + per-W 分布 + 复现指引）
+
+修改：
+- `crates/relon-bench/Cargo.toml`（注册新 bench 入口）
+
+### 23.3 Backend 选择 ratio
+
+`cmp_lua.rs` 主要测 **tree-walker** 一支（Relon 唯一能跑全 12 workload 的 backend；cranelift-AOT/trace-JIT 受限于今日 IR slice，只能跑数值类的 W1/W6/W7/W9）。结果 ratio = `relon_tree_walk_p50 / luajit_p50`；λ-2 的目标是**先看 tree-walker 的真实差距**，把 ITERATE 候选维度暴露出来。Cranelift-AOT 数字从 `cranelift_aot_vs_tree_walk` bench 补足；trace-JIT 数字从 `trace_jit_hot_loop::trace_jit_loop` 补足（hot int sum）。
+
+### 23.4 Workload N 选择
+
+| W | N | 原因 |
+|---|---|---|
+| W1 (int sum) | 10_000 | tree-walker us-class，10k 平衡精度与 wall-clock |
+| W2 (f64 dot) | 1_000 | map+sum 每个 elem 多次访问，10x 更慢 |
+| W3 (str concat) | 2_000 | O(N^2) 路径，N=10k Lua side > 1s/iter |
+| W4-W6, W8, W10 | 10_000 | us-class workload 通用 |
+| W7 (fib) | **22** | tree-walker 每帧 Scope::clone() ~ 64B + iter cursor table；默认 main thread 2MB stack 在 fib(28) 处溢出，22 是稳定上限 |
+| W9 (matrix) | 32 | N x N 嵌套 reduce，N=32 给 1024 elem 内部 |
+| W11 (cold start) | (process spawn) | sample_size=20 measurement_time=15s |
+| W12 (p99 tail) | 1 invoke per criterion iter | 用 sample 分布看 p50/p90/p99 |
+
+### 23.5 决策矩阵 + 实测结果
+
+(填入完整数据后由 host 接管 commit)
+
+详 `docs/internal/relon-vs-luajit-final-report-2026-05-19.md`。
+
+### 23.6 Carry-over
+
+- ITERATE 维度的 targeted fix plan 在 final report §7 附录
+- D5 p99.9 需要 sample_size >= 500 + 1M invoke：今日 sample_size=100，p99.9 只有 0.1 sample，作为下一轮 targeted measurement 任务
