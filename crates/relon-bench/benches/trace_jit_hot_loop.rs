@@ -71,8 +71,9 @@ use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criteri
 use cranelift_codegen::isa::CallConv;
 
 use relon_codegen_native::{
-    clear_recording, global_trace_jit_state, register_recording, trace_install::TraceJitState,
-    CraneliftAotEvaluator, RecordingRegistration, SandboxConfig, TraceIcSlot, MAX_FN_ID,
+    clear_recording, compile_inline_host_fn, global_trace_jit_state, register_recording,
+    trace_install::TraceJitState, CraneliftAotEvaluator, RecordingRegistration, SandboxConfig,
+    TraceIcSlot, MAX_FN_ID,
 };
 use relon_eval_api::{Evaluator, Value};
 use relon_evaluator::{Context, Scope, TreeWalkEvaluator};
@@ -223,6 +224,32 @@ fn install_trace_for_step() -> u32 {
 /// shape as `step_body_trace_real` so the emitter sees an identical
 /// op stream — the only difference between the two install paths is
 /// the call conv on the trace entry signature.
+/// v6-ε-0-A: build the same `LocalGet+LocalGet+Add+Return` body
+/// `install_explicit_conv_trace` builds, but compile it through the
+/// at-call-site inline path
+/// ([`relon_codegen_native::compile_inline_host_fn`]) so the trace
+/// ops live inside the host fn body itself rather than behind a
+/// trampoline `call trace_fn_ptr`.
+///
+/// Returns an owned [`relon_codegen_native::InlineHostFn`] that keeps
+/// the JIT module mapped for the bench's call loop lifetime; the
+/// caller pulls a typed entry pointer off it via
+/// [`relon_codegen_native::InlineHostFn::typed_entry`].
+fn build_inline_step_host_fn() -> relon_codegen_native::InlineHostFn {
+    use relon_trace_jit::{TraceBuffer, TraceOp};
+    let mut buffer = TraceBuffer::new();
+    let a = buffer.fresh_ssa();
+    let b = buffer.fresh_ssa();
+    let sum = buffer.fresh_ssa();
+    buffer.append(TraceOp::LocalGet(a, 0));
+    buffer.append(TraceOp::LocalGet(b, 1));
+    buffer.append(TraceOp::Add(sum, a, b));
+    buffer.append(TraceOp::Return(sum));
+    let trace = std::sync::Arc::new(buffer.into_optimized());
+    compile_inline_host_fn(trace)
+        .expect("inline host-fn compile must succeed for the 4-op step trace")
+}
+
 fn install_explicit_conv_trace(call_conv: CallConv) -> (TraceJitState, u32) {
     use relon_trace_jit::{TraceBuffer, TraceOp};
     let fn_id = 0u32; // local state, isolated from the global registry
@@ -499,6 +526,67 @@ fn bench_hot_loop(c: &mut Criterion) {
     });
     drop(sysv_trace_anchor);
     drop(sysv_state);
+
+    // ---- Row 4d: v6-ε-0-A — at-call-site inline trace. ----
+    //
+    // Builds the same `LocalGet+LocalGet+Add+Return` body, but instead
+    // of compiling a stand-alone trace entry function that the bench
+    // calls into via the trampoline call/ret + arg-marshall pair, the
+    // trace ops are spliced **directly into the host fn body** via
+    // [`relon_codegen_native::compile_inline_host_fn`]. The resulting
+    // function still obeys [`relon_trace_abi::TRACE_ENTRY_SIG`] so the
+    // bench loop's call shape is identical to Rows 4 / 4b / 4c — what
+    // changes is the **interior**: there is no inner `call trace_fn`
+    // between the host fn prologue and its `ret`. The host fn body
+    // is the trace body.
+    //
+    // ## Honest framing
+    //
+    // The Rust → JIT-fn boundary the bench loop pays per iter is the
+    // SAME boundary every other Row 3/4 variant pays — the bench
+    // caller is Rust, the callee is cranelift. Inlining one CALL into
+    // the host fn (the v6-ε-0-A scope) doesn't make the Rust→JIT call
+    // boundary go away; it just hides any **inner** trace-call hop.
+    // The inner hop only exists when the host fn has a real
+    // `call trace_fn_ptr` site (e.g. when the cranelift-AOT entry fn
+    // dispatches through an IC slot in the production wire-up — a
+    // surface this bench doesn't exercise yet). So the
+    // `trace_jit_warm_inline` number is expected to land **within
+    // criterion noise of `trace_jit_warm_ic`**. The row exists to:
+    //
+    // 1. prove the inline infrastructure is real (cranelift compiles
+    //    + runs the spliced IR, gives bit-identical results to the
+    //    trampoline path — see `tests/trace_jit_inline_smoke.rs`);
+    // 2. give the v6-ε-0-A stage report a concrete number to diff
+    //    against `trace_jit_warm_ic`, supporting the M2-C-falsification
+    //    narrative (the 9.5 ns floor is Rust→JIT, not the inner trace
+    //    hop);
+    // 3. anchor the next stage (ε-M1 / "compile the loop into
+    //    cranelift") which is where the inline path's value actually
+    //    surfaces.
+    let inline_host_fn = build_inline_step_host_fn();
+    let inline_entry = unsafe { inline_host_fn.typed_entry() };
+    group.bench_function(BenchmarkId::new("backend", "trace_jit_warm_inline"), |b| {
+        b.iter(|| {
+            let mut acc: i64 = 0;
+            let mut ctx = TraceContext::with_capacity(64);
+            let mut args: [u64; 2] = [0, 0];
+            for i in 0..HOT_LOOP_N as i64 {
+                args[0] = black_box(acc) as u64;
+                args[1] = black_box(i) as u64;
+                // SAFETY: `inline_entry` obeys TRACE_ENTRY_SIG. ctx is
+                // exclusive; args is a 2-element u64 array.
+                let raw = unsafe { inline_entry(&mut ctx as *mut _, args.as_ptr()) };
+                if raw == 0 {
+                    acc = ctx.result_slot as i64;
+                } else {
+                    acc = acc.wrapping_add(i);
+                }
+            }
+            black_box(acc)
+        });
+    });
+    drop(inline_host_fn);
 
     // ---- Row 5: Rust-inlined baseline (diagnostic). ----
     //
