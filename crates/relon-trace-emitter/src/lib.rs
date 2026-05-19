@@ -31,6 +31,7 @@
 //! helper and the hot-counter inject pass.
 
 pub mod abi;
+pub mod call_conv;
 pub mod emitter;
 pub mod guard_emit;
 
@@ -40,5 +41,6 @@ pub use abi::{
     ExternalSlot, ExternalSlotRepr, HostHookId, HostHookTable, ObservedType,
     RecoverableWriteRecord, TraceContext, TraceEntryStatus, TRACE_ENTRY_SIG,
 };
+pub use call_conv::{trace_entry_call_conv, trace_entry_uses_tail};
 pub use emitter::{EmitError, HostHookFuncIds, TraceEmitter};
 pub use guard_emit::{emit_guard, GuardEmitCtx};
