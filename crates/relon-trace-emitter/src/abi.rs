@@ -138,6 +138,22 @@ pub fn host_hook_slot_offset(hook: HostHookId) -> i32 {
         HostHookId::SaveDeopt => std::mem::offset_of!(HostHookTable, save_deopt),
         HostHookId::ResolveCall => std::mem::offset_of!(HostHookTable, resolve_call),
         HostHookId::InlineCacheLookup => std::mem::offset_of!(HostHookTable, inline_cache_lookup),
+        // F-D8 hooks are dispatched via direct symbol resolution, not
+        // through `HostHookTable`. The two-level table indirection
+        // exists so hosts can hot-swap `save_deopt` / `resolve_call`
+        // / `inline_cache_lookup` per-context; the dict/list helpers
+        // are read-only fast-paths whose hot-swap semantics aren't
+        // required for F-D8 v1. Callers that ask for a slot offset
+        // on these hooks have a bug — return a sentinel that will
+        // surface as `EmitError::HostHookNotDeclared` if reached.
+        HostHookId::ListGet | HostHookId::DictLookup => {
+            debug_assert!(
+                false,
+                "host_hook_slot_offset called for ListGet/DictLookup; \
+                 F-D8 hooks do not live in HostHookTable"
+            );
+            return -1;
+        }
     };
     off as i32
 }
@@ -157,6 +173,20 @@ pub enum HostHookId {
     ResolveCall,
     /// `__relon_trace_inline_cache_lookup`.
     InlineCacheLookup,
+    /// F-D8: `__relon_trace_list_get(list_ptr: *const u8, idx: i64,
+    /// ctx: *mut TraceContext) -> i64`. Bounds-checked indexed access
+    /// into a `[len: u32 LE][pad: u32][i64 elements...]` record. On
+    /// out-of-range access the helper writes a sentinel into
+    /// `ctx.result_slot` and returns 0; the cranelift-side guard
+    /// branches into the deopt block.
+    ListGet,
+    /// F-D8: `__relon_trace_dict_lookup(dict_ptr: *const u8, key_ptr:
+    /// *const u8, shape_hash: u64, ctx: *mut TraceContext) -> i64`.
+    /// IC-guarded dict access: on shape match the helper returns the
+    /// cached i64 value; on mismatch it returns a sentinel that the
+    /// surrounding cranelift IR turns into a deopt branch so the
+    /// recorder gets a chance to re-specialise under the new shape.
+    DictLookup,
 }
 
 impl HostHookId {
@@ -168,6 +198,8 @@ impl HostHookId {
             HostHookId::SaveDeopt => "__relon_trace_save_deopt",
             HostHookId::ResolveCall => "__relon_trace_resolve_call",
             HostHookId::InlineCacheLookup => "__relon_trace_inline_cache_lookup",
+            HostHookId::ListGet => "__relon_trace_list_get",
+            HostHookId::DictLookup => "__relon_trace_dict_lookup",
         }
     }
 }

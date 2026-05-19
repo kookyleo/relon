@@ -50,6 +50,7 @@
 
 pub mod call_table;
 pub mod deopt;
+pub mod dict_list;
 pub mod ic_lookup;
 
 pub use call_table::{
@@ -59,5 +60,9 @@ pub use call_table::{
 pub use deopt::{
     DeoptStateSnapshot, GenericState, RecoverableWriteRecord, TraceContext,
     __relon_trace_save_deopt,
+};
+pub use dict_list::{
+    __relon_trace_dict_lookup, __relon_trace_list_get, build_dict_record, build_flat_list_record,
+    build_string_record, fx_hash_bytes, fx_hash_key_record, DICT_LOOKUP_DEOPT,
 };
 pub use ic_lookup::{__relon_trace_inline_cache_lookup, ic_storage_size, write_ic_header};

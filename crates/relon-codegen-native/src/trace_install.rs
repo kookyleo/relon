@@ -775,10 +775,45 @@ impl TraceJitState {
                 &ic_lookup_sig,
             )
             .map_err(|e| TraceJitError::Module(format!("declare ic_lookup: {e}")))?;
+        // F-D8: pre-declare the dict/list helpers so traces emitted
+        // with `TraceOp::ListGet` / `TraceOp::DictLookup` link
+        // cleanly. Same Linkage::Import rationale as save_deopt /
+        // resolve_call — the symbols are registered via
+        // `register_trace_runtime_symbols` on the JIT builder before
+        // we finalise the module.
+        let list_get_sig = build_host_helper_signature(
+            &[pointer_ty, cranelift_codegen::ir::types::I64, pointer_ty],
+            &[cranelift_codegen::ir::types::I64],
+        );
+        let dict_lookup_sig = build_host_helper_signature(
+            &[
+                pointer_ty,
+                pointer_ty,
+                cranelift_codegen::ir::types::I64,
+                pointer_ty,
+            ],
+            &[cranelift_codegen::ir::types::I64],
+        );
+        let list_get_id = module
+            .declare_function(
+                relon_trace_emitter::HostHookId::ListGet.symbol(),
+                Linkage::Import,
+                &list_get_sig,
+            )
+            .map_err(|e| TraceJitError::Module(format!("declare list_get: {e}")))?;
+        let dict_lookup_id = module
+            .declare_function(
+                relon_trace_emitter::HostHookId::DictLookup.symbol(),
+                Linkage::Import,
+                &dict_lookup_sig,
+            )
+            .map_err(|e| TraceJitError::Module(format!("declare dict_lookup: {e}")))?;
         let hook_func_ids = HostHookFuncIds {
             save_deopt: save_deopt_id.as_u32(),
             resolve_call: resolve_call_id.as_u32(),
             inline_cache_lookup: ic_lookup_id.as_u32(),
+            list_get: Some(list_get_id.as_u32()),
+            dict_lookup: Some(dict_lookup_id.as_u32()),
         };
 
         let mut ctx = CodegenContext::new();
@@ -1149,6 +1184,18 @@ pub fn register_trace_runtime_symbols(builder: &mut JITBuilder) {
     builder.symbol(
         relon_trace_emitter::HostHookId::InlineCacheLookup.symbol(),
         relon_trace_jit::runtime::__relon_trace_inline_cache_lookup as *const u8,
+    );
+    // F-D8: dict/list helpers. Symbol resolution happens via
+    // `JITBuilder::symbol`; the cranelift emitter's
+    // `declare_imported_user_function` call carries the matching
+    // `HostHookId::symbol()` string so the linker pairs both ends.
+    builder.symbol(
+        relon_trace_emitter::HostHookId::ListGet.symbol(),
+        relon_trace_jit::runtime::__relon_trace_list_get as *const u8,
+    );
+    builder.symbol(
+        relon_trace_emitter::HostHookId::DictLookup.symbol(),
+        relon_trace_jit::runtime::__relon_trace_dict_lookup as *const u8,
     );
     builder.symbol(
         "__relon_jump_to_recorder",

@@ -61,6 +61,16 @@ pub struct HostHookFuncIds {
     pub save_deopt: u32,
     pub resolve_call: u32,
     pub inline_cache_lookup: u32,
+    /// F-D8: cranelift `FuncId.as_u32()` for `__relon_trace_list_get`.
+    /// `None` means the host has not declared the helper; emitter will
+    /// surface `EmitError::HostHookNotDeclared` if a `TraceOp::ListGet`
+    /// is seen.
+    pub list_get: Option<u32>,
+    /// F-D8: cranelift `FuncId.as_u32()` for `__relon_trace_dict_lookup`.
+    /// `None` means the host has not declared the helper; emitter will
+    /// surface `EmitError::HostHookNotDeclared` if a `TraceOp::DictLookup`
+    /// is seen.
+    pub dict_lookup: Option<u32>,
 }
 
 impl Default for HostHookFuncIds {
@@ -72,6 +82,10 @@ impl Default for HostHookFuncIds {
             save_deopt: 0,
             resolve_call: 1,
             inline_cache_lookup: 2,
+            // F-D8 helpers are opt-in: tests that don't exercise
+            // dict/list ops keep the historical 3-slot layout.
+            list_get: None,
+            dict_lookup: None,
         }
     }
 }
@@ -199,6 +213,37 @@ impl TraceEmitter {
             hook_func_ids.inline_cache_lookup,
         );
 
+        // F-D8: declare dict/list helpers when the host wired them.
+        // Signature:
+        //   `__relon_trace_list_get(list_ptr, idx, ctx) -> i64`
+        //   `__relon_trace_dict_lookup(dict_ptr, key_ptr, shape_hash,
+        //                              ctx) -> i64`
+        // Both helpers fold their out-of-band signalling (bounds /
+        // shape) into the i64 return: hosts encode the deopt
+        // sentinel as `i64::MIN`. The emitter follows the call with
+        // a `cmp r, sentinel; brif deopt` so a real OOB / IC miss
+        // exits the trace.
+        let list_get = hook_func_ids.list_get.map(|fid| {
+            declare_host_hook(
+                builder.func,
+                HostHookId::ListGet,
+                &[pointer_ty, I64, pointer_ty],
+                &[I64],
+                pointer_ty,
+                fid,
+            )
+        });
+        let dict_lookup = hook_func_ids.dict_lookup.map(|fid| {
+            declare_host_hook(
+                builder.func,
+                HostHookId::DictLookup,
+                &[pointer_ty, pointer_ty, I64, pointer_ty],
+                &[I64],
+                pointer_ty,
+                fid,
+            )
+        });
+
         let mut emitter = TraceEmitterState {
             builder: &mut builder,
             trace,
@@ -208,6 +253,8 @@ impl TraceEmitter {
             deopt_block,
             save_deopt,
             resolve_call,
+            list_get,
+            dict_lookup,
             ssa_to_value: HashMap::new(),
             overflow_bits: HashMap::new(),
             loop_head_blocks: HashMap::new(),
@@ -259,6 +306,13 @@ struct TraceEmitterState<'a, 'b> {
     deopt_block: ir::Block,
     save_deopt: ir::FuncRef,
     resolve_call: ir::FuncRef,
+    /// F-D8: optional `__relon_trace_list_get` FuncRef. `None` means
+    /// the host did not declare the helper — `TraceOp::ListGet` emits
+    /// will surface `EmitError::HostHookNotDeclared`.
+    list_get: Option<ir::FuncRef>,
+    /// F-D8: optional `__relon_trace_dict_lookup` FuncRef. Same
+    /// contract as `list_get`.
+    dict_lookup: Option<ir::FuncRef>,
     ssa_to_value: HashMap<SsaVar, ir::Value>,
     /// v6-δ M1: overflow bits surfaced by `Add` / `Sub` / `Mul`
     /// lowering. The matching `Guard(ArithOverflow(dst))` predicate
@@ -293,6 +347,14 @@ impl<'a, 'b> TraceEmitterState<'a, 'b> {
                 loop_id,
                 next_values,
             } => self.emit_loop_back(*loop_id, next_values),
+            // F-D8 -----------------------------------------------------
+            TraceOp::ListGet { dst, list_ptr, idx } => self.emit_list_get(*dst, *list_ptr, *idx),
+            TraceOp::DictLookup {
+                dst,
+                dict_ptr,
+                key_ptr,
+                shape_hash,
+            } => self.emit_dict_lookup(*dst, *dict_ptr, *key_ptr, *shape_hash),
         }
     }
 
@@ -497,6 +559,141 @@ impl<'a, 'b> TraceEmitterState<'a, 'b> {
         let inst = self.builder.ins().call_indirect(sig_ref, target, &arg_vals);
         let r = self.builder.inst_results(inst)[0];
         self.bind(dst, r);
+        Ok(())
+    }
+
+    /// F-D8: lower `TraceOp::ListGet { dst, list_ptr, idx }` to a
+    /// bounds-checked indexed load against the
+    /// `[len: u32 LE][pad: u32][i64 elements...]` record shape.
+    ///
+    /// Emit shape (per-iter cost, in cranelift IR):
+    ///
+    /// ```text
+    /// %len_u32 = load.i32 list_ptr + 0           // record header
+    /// %len_i64 = uextend.i64 %len_u32
+    /// %inb     = icmp ult, idx, %len_i64
+    /// brif %inb, ok_block, deopt_block(0, 0)     // bounds guard
+    /// ok_block:
+    ///   %off = imul idx, 8
+    ///   %elem_addr = iadd (iadd list_ptr, 8) %off  // skip [len+pad]
+    ///   %val = load.i64 %elem_addr + 0
+    ///   bind dst -> %val
+    /// ```
+    ///
+    /// The deopt arm fires with `(guard_pc=0, external_pc=0)` — the
+    /// optimiser pipeline does not (yet) attach explicit `GuardSite`s
+    /// to the inline bounds check; if a future pass wants to deopt
+    /// into a specific bytecode index it can do so by lifting this
+    /// inline guard into a `TraceOp::Guard(BoundsCheck, ...)` op the
+    /// recorder emits explicitly.
+    fn emit_list_get(
+        &mut self,
+        dst: SsaVar,
+        list_ptr: SsaVar,
+        idx: SsaVar,
+    ) -> Result<(), EmitError> {
+        let _ = self
+            .list_get
+            .ok_or(EmitError::HostHookNotDeclared(HostHookId::ListGet))?;
+        let base_v = self.lookup(list_ptr)?;
+        let idx_v = self.lookup(idx)?;
+        let idx_v = self.widen_to_i64(idx_v);
+
+        // Bounds guard: idx < len (treat idx as unsigned i64 — the
+        // recorder is responsible for emitting an `ult` rather than
+        // `slt` because Relon Int can in principle be negative, but
+        // a negative index here is a recorder bug we'd rather deopt
+        // on than load past the buffer head). We materialise `len`
+        // as i64 via uextend so cranelift picks the right compare
+        // width.
+        let len32 = self.builder.ins().load(I32, MemFlags::trusted(), base_v, 0);
+        let len64 = self.builder.ins().uextend(I64, len32);
+        let in_bounds = self
+            .builder
+            .ins()
+            .icmp(IntCC::UnsignedLessThan, idx_v, len64);
+
+        let ok_block = self.builder.create_block();
+        let guard_pc = self.builder.ins().iconst(I32, 0);
+        let external_pc = self.builder.ins().iconst(I64, 0);
+        self.builder.ins().brif(
+            in_bounds,
+            ok_block,
+            &[],
+            self.deopt_block,
+            &[BlockArg::Value(guard_pc), BlockArg::Value(external_pc)],
+        );
+        self.builder.seal_block(ok_block);
+        self.builder.switch_to_block(ok_block);
+
+        // Element address: list_ptr + 8 (skip [len + pad]) + idx*8.
+        let eight = self.builder.ins().iconst(I64, 8);
+        let elem_off = self.builder.ins().imul(idx_v, eight);
+        let payload_base = self.builder.ins().iadd_imm(base_v, 8);
+        let elem_addr = self.builder.ins().iadd(payload_base, elem_off);
+        let val = self
+            .builder
+            .ins()
+            .load(I64, MemFlags::trusted(), elem_addr, 0);
+        self.bind(dst, val);
+        Ok(())
+    }
+
+    /// F-D8: lower `TraceOp::DictLookup { dst, dict_ptr, key_ptr,
+    /// shape_hash }` to a single host-helper call that performs the
+    /// IC-guarded dict access.
+    ///
+    /// Emit shape:
+    ///
+    /// ```text
+    /// %val = call __relon_trace_dict_lookup(dict_ptr, key_ptr,
+    ///                                        shape_hash, trace_ctx)
+    /// %miss = icmp eq, %val, i64::MIN          // shape miss sentinel
+    /// brif %miss, deopt_block(0, 0), ok_block
+    /// ok_block:
+    ///   bind dst -> %val
+    /// ```
+    ///
+    /// Sentinel-encoding the deopt rather than indirecting through
+    /// `host_hooks.save_deopt` keeps the IC-hit fast path a single
+    /// branch off the load — the price of the dict helper itself is
+    /// already a function-call boundary, so adding one more guard
+    /// branch is free relative to the BTreeMap lookup the slow path
+    /// performs.
+    fn emit_dict_lookup(
+        &mut self,
+        dst: SsaVar,
+        dict_ptr: SsaVar,
+        key_ptr: SsaVar,
+        shape_hash: u64,
+    ) -> Result<(), EmitError> {
+        let helper = self
+            .dict_lookup
+            .ok_or(EmitError::HostHookNotDeclared(HostHookId::DictLookup))?;
+        let dict_v = self.lookup(dict_ptr)?;
+        let key_v = self.lookup(key_ptr)?;
+        let shape_v = self.builder.ins().iconst(I64, shape_hash as i64);
+        let inst = self
+            .builder
+            .ins()
+            .call(helper, &[dict_v, key_v, shape_v, self.trace_ctx_ptr]);
+        let val = self.builder.inst_results(inst)[0];
+
+        let sentinel = self.builder.ins().iconst(I64, i64::MIN);
+        let miss = self.builder.ins().icmp(IntCC::Equal, val, sentinel);
+        let ok_block = self.builder.create_block();
+        let guard_pc = self.builder.ins().iconst(I32, 0);
+        let external_pc = self.builder.ins().iconst(I64, 0);
+        self.builder.ins().brif(
+            miss,
+            self.deopt_block,
+            &[BlockArg::Value(guard_pc), BlockArg::Value(external_pc)],
+            ok_block,
+            &[],
+        );
+        self.builder.seal_block(ok_block);
+        self.builder.switch_to_block(ok_block);
+        self.bind(dst, val);
         Ok(())
     }
 
@@ -755,6 +952,12 @@ pub enum EmitError {
     UnrecoverableEffectInTrace,
     /// `MarkLoopBack` op with no preceding matching `MarkLoopHead`.
     UnmatchedLoopBack(u32),
+    /// F-D8: trace contains a `TraceOp::ListGet` / `TraceOp::DictLookup`
+    /// op but the host did not declare the matching helper FuncId via
+    /// [`HostHookFuncIds`]. The host must register the symbol
+    /// (`__relon_trace_list_get` / `__relon_trace_dict_lookup`) in its
+    /// cranelift module before installing dict/list traces.
+    HostHookNotDeclared(HostHookId),
     /// Forwarded from [`crate::guard_emit::GuardEmitError`].
     Guard(GuardEmitError),
 }
@@ -774,6 +977,12 @@ impl std::fmt::Display for EmitError {
             EmitError::UnmatchedLoopBack(id) => {
                 write!(f, "MarkLoopBack {{ loop_id: {} }} has no matching head", id)
             }
+            EmitError::HostHookNotDeclared(id) => write!(
+                f,
+                "host hook {:?} ({}) referenced by trace but not declared via HostHookFuncIds",
+                id,
+                id.symbol()
+            ),
             EmitError::Guard(e) => write!(f, "guard emit failure: {}", e),
         }
     }
@@ -846,5 +1055,101 @@ mod tests {
         let trace = b.into_optimized();
         let mut ctx = CodegenContext::new();
         TraceEmitter::emit(&trace, &mut ctx).expect("emit ok");
+    }
+
+    // ---- F-D8 -----------------------------------------------------
+
+    #[test]
+    fn list_get_without_helper_surfaces_undeclared_hook() {
+        let mut b = TraceBuffer::new();
+        let base = b.fresh_ssa();
+        let idx = b.fresh_ssa();
+        let dst = b.fresh_ssa();
+        b.append(TraceOp::ConstI64(base, 0x1000));
+        b.append(TraceOp::ConstI64(idx, 0));
+        b.append(TraceOp::ListGet {
+            dst,
+            list_ptr: base,
+            idx,
+        });
+        b.append(TraceOp::Return(dst));
+        let trace = b.into_optimized();
+        let mut ctx = CodegenContext::new();
+        let err = TraceEmitter::emit(&trace, &mut ctx).unwrap_err();
+        match err {
+            EmitError::HostHookNotDeclared(HostHookId::ListGet) => {}
+            other => panic!("expected HostHookNotDeclared(ListGet), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn dict_lookup_without_helper_surfaces_undeclared_hook() {
+        let mut b = TraceBuffer::new();
+        let dict = b.fresh_ssa();
+        let key = b.fresh_ssa();
+        let dst = b.fresh_ssa();
+        b.append(TraceOp::ConstI64(dict, 0x2000));
+        b.append(TraceOp::ConstI64(key, 0x3000));
+        b.append(TraceOp::DictLookup {
+            dst,
+            dict_ptr: dict,
+            key_ptr: key,
+            shape_hash: 0xdeadbeef,
+        });
+        b.append(TraceOp::Return(dst));
+        let trace = b.into_optimized();
+        let mut ctx = CodegenContext::new();
+        let err = TraceEmitter::emit(&trace, &mut ctx).unwrap_err();
+        match err {
+            EmitError::HostHookNotDeclared(HostHookId::DictLookup) => {}
+            other => panic!("expected HostHookNotDeclared(DictLookup), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn list_get_with_declared_helper_lowers() {
+        let mut b = TraceBuffer::new();
+        let base = b.fresh_ssa();
+        let idx = b.fresh_ssa();
+        let dst = b.fresh_ssa();
+        b.append(TraceOp::ConstI64(base, 0x1000));
+        b.append(TraceOp::ConstI64(idx, 0));
+        b.append(TraceOp::ListGet {
+            dst,
+            list_ptr: base,
+            idx,
+        });
+        b.append(TraceOp::Return(dst));
+        let trace = b.into_optimized();
+        let mut ctx = CodegenContext::new();
+        let hook_ids = HostHookFuncIds {
+            list_get: Some(7),
+            ..Default::default()
+        };
+        TraceEmitter::emit_with_hooks(&trace, &mut ctx, I64, hook_ids).expect("emit ok");
+    }
+
+    #[test]
+    fn dict_lookup_with_declared_helper_lowers() {
+        let mut b = TraceBuffer::new();
+        let dict = b.fresh_ssa();
+        let key = b.fresh_ssa();
+        let dst = b.fresh_ssa();
+        b.append(TraceOp::ConstI64(dict, 0x2000));
+        b.append(TraceOp::ConstI64(key, 0x3000));
+        b.append(TraceOp::DictLookup {
+            dst,
+            dict_ptr: dict,
+            key_ptr: key,
+            shape_hash: 0xfeed_face_dead_beef,
+        });
+        b.append(TraceOp::Return(dst));
+        let trace = b.into_optimized();
+        let mut ctx = CodegenContext::new();
+        let hook_ids = HostHookFuncIds {
+            dict_lookup: Some(8),
+            ..Default::default()
+        };
+        TraceEmitter::emit_with_hooks(&trace, &mut ctx, I64, hook_ids).expect("emit ok");
     }
 }

@@ -47,7 +47,9 @@ pub use optimizer::{
     type_spec::TypeSpec, OptimizerPass, OptimizerPipeline, PassReport,
 };
 pub use runtime::{
-    DeoptStateSnapshot, ExternalCallTable, GenericState, RecoverableWriteRecord, TraceContext,
+    build_dict_record, build_flat_list_record, build_string_record, fx_hash_bytes,
+    fx_hash_key_record, DeoptStateSnapshot, ExternalCallTable, GenericState,
+    RecoverableWriteRecord, TraceContext, DICT_LOOKUP_DEOPT,
 };
 pub use trace_ir::{
     CmpKind, ExternalAddr, ExternalPc, ExternalSlot, FuncId, GuardKind, LoopPhi, ObservedType,

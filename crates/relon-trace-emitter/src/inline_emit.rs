@@ -292,6 +292,15 @@ impl<'a, 'b> InlineEmitterState<'a, 'b> {
                 loop_id,
                 next_values,
             } => self.emit_loop_back(*loop_id, next_values),
+            // F-D8: inline emit doesn't yet thread the dict/list host
+            // helpers through the surrounding host-fn cranelift module
+            // (same reason `TraceOp::Call` returns `CallNotSupported`).
+            // The inline path is a perf shortcut for tiny straight-line
+            // traces; dict/list traces always go through the standalone
+            // emitter where the resolve_call FuncRef is in scope.
+            TraceOp::ListGet { .. } | TraceOp::DictLookup { .. } => {
+                Err(InlineEmitError::CallNotSupportedInInline)
+            }
         }
     }
 
