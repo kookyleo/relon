@@ -56,7 +56,7 @@ use std::collections::HashMap;
 use relon_ir::{IrType, Op, TaggedOp};
 use relon_trace_abi::ObservedType;
 use relon_trace_jit::SsaVar;
-use relon_trace_recorder::{AbortReason, RecordResult, RecorderState};
+use relon_trace_recorder::{AbortReason, LookupKind, LoopCarry, RecordResult, RecorderState};
 
 /// One value the recording-evaluator pushes on its operand stack while
 /// walking the IR.
@@ -182,6 +182,9 @@ impl<'a> TraceRecordingEvaluator<'a> {
                     }
                     return WalkExit::Aborted;
                 }
+                StepOutcome::BreakOut(depth) => {
+                    return WalkExit::BreakOut(depth);
+                }
             }
         }
         WalkExit::Fallthrough
@@ -284,6 +287,70 @@ impl<'a> TraceRecordingEvaluator<'a> {
                 }
             }
 
+            // ε-M0: structured control-flow recursion.
+            //
+            // `Op::Block { body }` opens a new label frame; the inner
+            // body's `Op::Br { label_depth: 0 }` exits the block.
+            // We do NOT emit a trace-IR op for the block itself — it's
+            // a static scoping construct visible only via the
+            // surrounding `BrIf` / `Br` `label_depth` arithmetic.
+            Op::Block { result_ty, body } => self.step_block(*result_ty, body),
+
+            // `Op::Loop { body }` opens a back-edge label frame and
+            // emits matching `MarkLoopHead` / `MarkLoopBack` markers
+            // around the body. The body's `Op::Br { label_depth: 0 }`
+            // is the back-edge (continue); a deeper depth exits.
+            Op::Loop { result_ty, body } => self.step_loop(*result_ty, body),
+
+            // `Op::Br { label_depth }` is a static branch out of the
+            // enclosing labelled construct. We bubble up through
+            // `walk_body` as `WalkExit::BreakOut(depth)`; the matching
+            // block / loop frame catches it.
+            Op::Br { label_depth } => {
+                let depth = *label_depth;
+                // Record the IR op so the recorder's PC counter stays
+                // aligned with the IR walker's view (mirrors the
+                // bytecode compiler's per-op `ir_pc_next` increment).
+                let _ = self.recorder.record_op(op, &[], None);
+                StepOutcome::BreakOut(depth)
+            }
+
+            // `Op::BrIf { label_depth }` — pop a Bool cond; if truthy
+            // we behave as `Op::Br`, otherwise fall through. We emit a
+            // branch guard so the trace deopts on the polarity flip.
+            //
+            // Polarity matters: when the recording observed the
+            // **fall-through** path (cond=0), the trace's runtime
+            // must keep the polarity stable — i.e. deopt if a future
+            // iteration's `cond` becomes truthy (the BrIf would have
+            // taken its branch). [`emit_branch_falsy_guard`] does
+            // exactly that by synthesising a `Cmp(Eq, cond, 0)` SSA
+            // and guarding on its NotNull. When the taken-arm was
+            // recorded (cond!=0), the historical NotNull(cond) guard
+            // is correct.
+            Op::BrIf { label_depth } => {
+                let cond = match self.operand_stack.pop() {
+                    Some(c) => c,
+                    None => {
+                        self.recorder
+                            .abort(AbortReason::UnsupportedOp("BrIfUnderflow"));
+                        return StepOutcome::Abort;
+                    }
+                };
+                let taken = cond.value != 0;
+                if taken {
+                    // Branch taken at recording → deopt if a future
+                    // cond is 0 (would fall through).
+                    let _ = self.recorder.emit_branch_guard(cond.ssa, taken);
+                    StepOutcome::BreakOut(*label_depth)
+                } else {
+                    // Branch NOT taken at recording → deopt if a
+                    // future cond is non-zero (would branch).
+                    let _ = self.recorder.emit_branch_falsy_guard(cond.ssa);
+                    StepOutcome::Continue
+                }
+            }
+
             // Everything outside the Phase-1 subset bounces off the
             // recorder. The recorder's lowering rule will Abort with
             // an UnsupportedOp variant carrying the right diagnostic
@@ -323,6 +390,10 @@ impl<'a> TraceRecordingEvaluator<'a> {
             WalkExit::Fallthrough => StepOutcome::Continue,
             WalkExit::Returned => StepOutcome::Return(result),
             WalkExit::Aborted => StepOutcome::Abort,
+            // ε-M0: a Br inside the If's arm pierces the If wrapper —
+            // the `If` is not a labelled construct, so we forward the
+            // unmodified depth up to the enclosing Block / Loop frame.
+            WalkExit::BreakOut(d) => StepOutcome::BreakOut(d),
         }
     }
 
@@ -485,6 +556,172 @@ impl<'a> TraceRecordingEvaluator<'a> {
         }
     }
 
+    /// ε-M0: walker side of `Op::Block { result_ty, body }`.
+    ///
+    /// A block is a forward-exit-only construct: inner `Op::Br` /
+    /// `Op::BrIf` with `label_depth = 0` jumps past the block end.
+    /// Nested constructs decrement the depth as they're crossed.
+    ///
+    /// For `result_ty: Some(_)`, a `Br`-out-with-yield leaves the
+    /// yielded value on the operand stack. We rely on the caller's
+    /// `Op::Br` lowering to NOT clear the stack; the IR contract
+    /// matches the cranelift-AOT side (see codegen.rs `Op::Block`
+    /// frame handling).
+    fn step_block(&mut self, result_ty: Option<IrType>, body: &[TaggedOp]) -> StepOutcome {
+        let _ = result_ty;
+        let mut inner_result = 0u64;
+        match self.walk_body(body, &mut inner_result) {
+            WalkExit::Fallthrough => StepOutcome::Continue,
+            WalkExit::Returned => StepOutcome::Return(inner_result),
+            WalkExit::Aborted => StepOutcome::Abort,
+            WalkExit::BreakOut(0) => {
+                // Block exit: branch landed here. Continue with the
+                // outer body. The Br-side already pushed any yield
+                // value (for typed blocks) onto the operand stack.
+                StepOutcome::Continue
+            }
+            WalkExit::BreakOut(d) => StepOutcome::BreakOut(d - 1),
+        }
+    }
+
+    /// ε-M0: walker side of `Op::Loop { result_ty, body }`.
+    ///
+    /// A loop's `body` is recorded **once**; the recorder emits
+    /// `MarkLoopHead` / `MarkLoopBack` markers around the body and
+    /// the cranelift emitter wires the back-edge. Inner
+    /// `Op::Br { label_depth: 0 }` is the back-edge (continue); deeper
+    /// depths exit.
+    ///
+    /// Loop-carried let-slots are detected by a pre-scan: any
+    /// let-slot that gets `LetSet` inside the body becomes a φ
+    /// carried through the head/back markers.
+    fn step_loop(&mut self, result_ty: Option<IrType>, body: &[TaggedOp]) -> StepOutcome {
+        let _ = result_ty;
+
+        // Pre-scan to collect every let-slot that gets re-assigned
+        // anywhere in the body tree. These are the loop-carried
+        // slots — the recorder emits a φ pair for each.
+        let carried_slots = collect_let_set_slots(body);
+
+        // Build the recorder's view: for each carried slot, the
+        // current cell's SSA is the φ's `init`, and we remember its
+        // observed type. Slots that the body writes without an
+        // outer-scope seed (e.g. `Op::If` yield-sink slots) get a
+        // synthetic zero seed so the recorder can still produce a
+        // valid φ pair — the body's first `LetSet` will overwrite
+        // the seed before any `LetGet` reads it.
+        let mut carries: Vec<LoopCarry> = Vec::with_capacity(carried_slots.len());
+        let mut carry_slot_idx: Vec<u32> = Vec::with_capacity(carried_slots.len());
+        let mut synth_seeds: Vec<(u32, StackCell)> = Vec::new();
+        for slot in &carried_slots {
+            let cell = match self.let_slots.get(slot).copied() {
+                Some(c) => c,
+                None => {
+                    // ε-M0 relaxation: emit a synthetic
+                    // `Op::ConstI64(0)` pre-loop to seed the slot.
+                    // The recorder's lowering for `Op::ConstI64`
+                    // emits the matching `TraceOp::ConstI64` to the
+                    // buffer; we feed the produced SSA into the
+                    // φ-pair's `init`. This lets the body's
+                    // `Op::LetSet` rebind freely on the first
+                    // iteration without aborting.
+                    let res =
+                        self.recorder
+                            .record_op(&Op::ConstI64(0), &[], Some(ObservedType::I64));
+                    let ssa = match res {
+                        relon_trace_recorder::RecordResult::Ok { value: Some(v) } => v,
+                        relon_trace_recorder::RecordResult::NeedsGuard {
+                            value: Some(v), ..
+                        } => v,
+                        _ => {
+                            self.recorder
+                                .abort(AbortReason::UnsupportedOp("LoopCarriedSynthSeed"));
+                            return StepOutcome::Abort;
+                        }
+                    };
+                    let synth = StackCell::new(0u64, ssa, ObservedType::I64);
+                    synth_seeds.push((*slot, synth));
+                    synth
+                }
+            };
+            // Pass the recorder's `LookupKind::Let(slot)` key so it
+            // rebinds `ir_to_ssa[Let(slot)] = phi_ssa` for body
+            // recording. Critical: without this rebind, body
+            // `LetGet(slot)` lowering resolves to the stale pre-loop
+            // SSA and the φ never sees any body update.
+            carries.push(LoopCarry::with_key(
+                cell.ssa,
+                cell.ty,
+                LookupKind::Let(*slot),
+            ));
+            carry_slot_idx.push(*slot);
+        }
+        // Persist the synthetic seeds into the walker's let_slots so
+        // subsequent body reads observe them too (the recorder side
+        // already has the SSA mapping via `with_key`).
+        for (slot, cell) in synth_seeds {
+            self.let_slots.insert(slot, cell);
+        }
+
+        // Open the loop frame on the recorder. This appends a
+        // `MarkLoopHead { loop_id, phis }` to the buffer; the returned
+        // φ SSAs are the new SSA ids visible inside the body for the
+        // carried slots.
+        let phi_ssas = self.recorder.begin_loop(&carries);
+        if phi_ssas.len() != carries.len() {
+            // begin_loop short-circuits on a stale-state recorder.
+            return StepOutcome::Abort;
+        }
+
+        // Re-bind the walker's let_slots so subsequent `LetGet` reads
+        // (during body recording) observe the φ SSA, while keeping the
+        // concrete u64 value identical (we still record only one
+        // iteration).
+        for (slot, phi) in carry_slot_idx.iter().zip(phi_ssas.iter()) {
+            if let Some(cell) = self.let_slots.get_mut(slot) {
+                cell.ssa = *phi;
+            }
+        }
+
+        // Walk the body once. The body's `Op::Br { label_depth: 0 }`
+        // is the back-edge; deeper depths are forward exits.
+        let mut inner_result = 0u64;
+        let exit = self.walk_body(body, &mut inner_result);
+
+        // Collect the post-body SSAs for the carried slots — these
+        // drive the `MarkLoopBack` next_values.
+        let mut next_values: Vec<SsaVar> = Vec::with_capacity(carry_slot_idx.len());
+        for slot in &carry_slot_idx {
+            let v = self
+                .let_slots
+                .get(slot)
+                .map(|c| c.ssa)
+                .unwrap_or(SsaVar::NONE);
+            next_values.push(v);
+        }
+        // Emit the back-edge marker.
+        if !self.recorder.end_loop(&next_values) {
+            return StepOutcome::Abort;
+        }
+
+        match exit {
+            WalkExit::Fallthrough | WalkExit::BreakOut(0) => {
+                // Fall-through end of body == back-edge target on the
+                // recorded trace. Caller's next op is reached only
+                // when the loop falls out (a deeper Br lands past us);
+                // since we recorded only the taken iteration the
+                // outer walker proceeds with whatever the runtime
+                // value happened to be at body end. The `MarkLoopBack`
+                // already emitted handles the recorded loop's
+                // back-edge runtime semantics.
+                StepOutcome::Continue
+            }
+            WalkExit::BreakOut(d) => StepOutcome::BreakOut(d - 1),
+            WalkExit::Returned => StepOutcome::Return(inner_result),
+            WalkExit::Aborted => StepOutcome::Abort,
+        }
+    }
+
     fn step_let_set(&mut self, idx: u32, op: &Op) -> StepOutcome {
         let top = match self.operand_stack.pop() {
             Some(c) => c,
@@ -513,6 +750,9 @@ enum StepOutcome {
     /// The walker / recorder aborted; the caller should fall back to
     /// the generic backend.
     Abort,
+    /// ε-M0: an `Op::Br` / `Op::BrIf` with the given label_depth.
+    /// Propagates up through `walk_body` as `WalkExit::BreakOut(depth)`.
+    BreakOut(u32),
 }
 
 /// Outcome of `walk_body`: either the body fell off the end (no
@@ -527,6 +767,14 @@ enum WalkExit {
     Returned,
     /// Body aborted; caller should propagate.
     Aborted,
+    /// ε-M0: structured `Op::Br` / `Op::BrIf` with a non-zero
+    /// label_depth. The current frame consumed depth 0 (one frame),
+    /// so it propagates `BreakOut(depth - 1)` upward. The frame whose
+    /// remaining `depth == 0` is the one the branch targets and
+    /// converts the exit back into `Fallthrough` (block exit) or back
+    /// into a back-edge (loop continue, handled by the loop frame
+    /// itself before it returns).
+    BreakOut(u32),
 }
 
 fn observed_from_ir(ty: IrType) -> ObservedType {
@@ -536,6 +784,47 @@ fn observed_from_ir(ty: IrType) -> ObservedType {
         IrType::F64 => ObservedType::F64,
         IrType::Bool => ObservedType::Bool,
         _ => ObservedType::Ptr,
+    }
+}
+
+/// ε-M0: walk an IR op tree and collect every let-slot index that is
+/// the target of an `Op::LetSet` anywhere in the tree.
+///
+/// Used by [`TraceRecordingEvaluator::step_loop`] to decide which
+/// let-slots need a φ pair: a slot the body assigns to is a
+/// loop-carried value; a slot the body only reads is loop-invariant
+/// and can keep its outer SSA binding.
+///
+/// Recurses through nested `Op::Block`, `Op::Loop`, `Op::If`; ignores
+/// `Op::LetGet` (read-only access).
+fn collect_let_set_slots(body: &[TaggedOp]) -> Vec<u32> {
+    let mut out: Vec<u32> = Vec::new();
+    let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    walk_let_set(body, &mut out, &mut seen);
+    out
+}
+
+fn walk_let_set(body: &[TaggedOp], out: &mut Vec<u32>, seen: &mut std::collections::HashSet<u32>) {
+    for tagged in body {
+        match &tagged.op {
+            Op::LetSet { idx, .. } => {
+                if seen.insert(*idx) {
+                    out.push(*idx);
+                }
+            }
+            Op::Block { body, .. } | Op::Loop { body, .. } => {
+                walk_let_set(body, out, seen);
+            }
+            Op::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                walk_let_set(then_body, out, seen);
+                walk_let_set(else_body, out, seen);
+            }
+            _ => {}
+        }
     }
 }
 
