@@ -780,6 +780,137 @@ fn arith_overflow_guard_uses_real_carry_bit() {
     let _ = state.invalidate_trace(fn_id);
 }
 
+/// v6-δ M1 R3: `invoke_with_resume` surfaces the full
+/// `DeoptStateSnapshot` to the fallback closure so callers can feed
+/// `local_slots` into `Evaluator::resume_from_pc` for partial-resume.
+/// On GuardFailed we observe the snapshot's `external_pc` + populated
+/// ssa_slots_copy buffer.
+#[test]
+fn invoke_with_resume_exposes_deopt_snapshot_to_fallback() {
+    let fn_id = 722u32;
+    let _ = clear_recording(fn_id);
+    let state = global_trace_jit_state();
+    let _ = state.invalidate_trace(fn_id);
+    register_recording(
+        fn_id,
+        RecordingRegistration {
+            body: vec![
+                TaggedOp {
+                    op: Op::LocalGet(0),
+                    range: TokenRange::default(),
+                },
+                TaggedOp {
+                    op: Op::LocalGet(1),
+                    range: TokenRange::default(),
+                },
+                TaggedOp {
+                    op: Op::Add(IrType::I64),
+                    range: TokenRange::default(),
+                },
+                TaggedOp {
+                    op: Op::Return,
+                    range: TokenRange::default(),
+                },
+            ],
+            param_tys: vec![IrType::I32, IrType::I32],
+        },
+    );
+    let warm_args: [u64; 2] = [1u64, 2u64];
+    unsafe {
+        relon_codegen_native::trace_install::__relon_jump_to_recorder(fn_id, warm_args.as_ptr());
+    }
+    assert!(state.lookup_trace(fn_id).is_some(), "trace must install");
+
+    // Trigger overflow to force a deopt; capture the snapshot.
+    let of_args: [u64; 2] = [i64::MAX as u64, 1u64];
+    let snapshot_was_present = std::cell::Cell::new(false);
+    let snapshot_slot_count = std::cell::Cell::new(0usize);
+    let snapshot_pc = std::cell::Cell::new(0u64);
+    let fallback_args_ptr = std::cell::Cell::new(std::ptr::null::<u64>());
+    let r = unsafe {
+        state.invoke_with_resume(
+            fn_id,
+            of_args.as_ptr(),
+            32,
+            |args, resume_pc, snapshot| {
+                fallback_args_ptr.set(args);
+                if let Some(s) = snapshot {
+                    snapshot_was_present.set(true);
+                    snapshot_slot_count.set(s.ssa_slots_copy.len());
+                    snapshot_pc.set(resume_pc.unwrap_or(0));
+                }
+                // Stand-in for resume_from_pc: return the wrapping sum.
+                (i64::MAX as i64).wrapping_add(1) as u64
+            },
+        )
+    };
+    assert_eq!(r, i64::MIN as u64);
+    assert!(
+        snapshot_was_present.get(),
+        "GuardFailed must surface a DeoptStateSnapshot"
+    );
+    assert!(
+        snapshot_slot_count.get() > 0,
+        "snapshot must carry ssa_slots_copy"
+    );
+    assert_eq!(
+        fallback_args_ptr.get(),
+        of_args.as_ptr(),
+        "args_ptr must round-trip into the fallback unchanged"
+    );
+    // resume_pc may be 0 on the very first guard site (recorder's
+    // monotone counter); we don't pin the exact value. The
+    // important property is that the snapshot is populated and the
+    // slots survived the trace -> fallback boundary.
+
+    let _ = clear_recording(fn_id);
+    let _ = state.invalidate_trace(fn_id);
+}
+
+/// v6-δ M1 R3: `Evaluator::resume_from_pc` default implementation
+/// re-runs `run_main` so the 4-prong sandbox semantics keep holding
+/// when a deopt'd trace bounces back into the tree-walker. We exercise
+/// the div-by-zero trap path since it's a representative sandbox
+/// surface; bounds-check / capability-gate / resource-limit follow
+/// the same shape (the default forwards to run_main, which already
+/// enforces all four).
+#[test]
+fn evaluator_resume_from_pc_default_preserves_sandbox_semantics() {
+    use relon_eval_api::Evaluator;
+    use std::sync::Arc;
+    let source = "#main(Int x, Int y) -> Int\nx / y";
+    let node = relon_parser::parse_document(source).expect("parse");
+    let analyzed = Arc::new(relon_analyzer::analyze(&node));
+    let mut ctx = relon_evaluator::Context::new()
+        .with_root(node)
+        .with_analyzed(Arc::clone(&analyzed));
+    relon_evaluator::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+    let ev: Box<dyn Evaluator> =
+        Box::new(relon_evaluator::TreeWalkEvaluator::new(Arc::new(ctx)));
+
+    // 1. Happy path through resume_from_pc — should return 21.
+    let mut args = HashMap::new();
+    args.insert("x".to_string(), Value::Int(42));
+    args.insert("y".to_string(), Value::Int(2));
+    let r = ev
+        .resume_from_pc(args, /*external_pc*/ 0, /*slots*/ &[])
+        .expect("ok");
+    assert_eq!(r, Value::Int(21));
+
+    // 2. Div-by-zero trap — resume_from_pc default forwards to
+    //    run_main which preserves the sandbox semantics.
+    let mut bad = HashMap::new();
+    bad.insert("x".to_string(), Value::Int(5));
+    bad.insert("y".to_string(), Value::Int(0));
+    let err = ev
+        .resume_from_pc(bad, /*external_pc*/ 0xdeadbeef, /*slots*/ &[0, 0])
+        .expect_err("must trap");
+    assert!(
+        matches!(err, relon_eval_api::RuntimeError::DivisionByZero(_)),
+        "expected DivisionByZero on resume, got {err:?}"
+    );
+}
+
 #[test]
 fn jump_helper_aborts_recording_for_unsupported_op() {
     // Register a body containing an op outside the recorder's

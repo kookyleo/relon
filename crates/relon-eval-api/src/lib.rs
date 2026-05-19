@@ -90,4 +90,49 @@ pub trait Evaluator: Send + Sync {
     /// shortest entry point when a host wants to call a Relon closure as a
     /// plain callback.
     fn invoke_closure(&self, closure: &ClosureData, args: &[Value]) -> Result<Value, RuntimeError>;
+
+    /// v6-δ M1 R3: resume a deopt'd trace at the supplied IR-side
+    /// `external_pc` with the SSA-slot snapshot the trace captured
+    /// just before the guard fired.
+    ///
+    /// ## Contract
+    ///
+    /// - `args` carries the `#main(...)` arguments the trace was
+    ///   originally invoked with. Hosts that lost the original args
+    ///   (e.g. a guard fired before any LocalGet) MUST pass an empty
+    ///   map; `MissingMainArg` then surfaces as today.
+    /// - `external_pc` is the synthetic PC the recorder stamped on
+    ///   the failing guard's `GuardSite`. For backends that do not
+    ///   maintain an `external_pc → (block, ip)` table the trait
+    ///   default discards the value and re-runs from entry — the
+    ///   4-prong sandbox semantics still hold because every trap
+    ///   surface re-fires on the re-run.
+    /// - `local_snapshot` is a flat `&[u64]` containing
+    ///   `DeoptStateSnapshot::ssa_slots_copy`. Backends that can
+    ///   round-trip the slots back to scope locals MAY do so for
+    ///   pixel-perfect partial-resume; the default ignores them.
+    ///
+    /// ## Default implementation
+    ///
+    /// The default — used by the [`TreeWalkEvaluator`] — drops both
+    /// `external_pc` and `local_snapshot` and forwards to
+    /// [`Self::run_main`]. This is the v6-γ M5 fallback semantic
+    /// promoted to the trait surface so the trace-install path can
+    /// always reach it via a single trait method.
+    ///
+    /// A future bytecode VM backend that exposes an IR-level
+    /// `(block, ip)` map can override this to honour the PC and
+    /// rehydrate `local_snapshot` into its frame — at that point the
+    /// host dispatcher gets the full "deopt to the exact next IR op"
+    /// semantics without changing the trait surface.
+    fn resume_from_pc(
+        &self,
+        args: HashMap<String, Value>,
+        external_pc: u64,
+        local_snapshot: &[u64],
+    ) -> Result<Value, RuntimeError> {
+        let _ = external_pc;
+        let _ = local_snapshot;
+        self.run_main(args)
+    }
 }

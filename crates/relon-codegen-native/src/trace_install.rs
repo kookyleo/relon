@@ -396,9 +396,56 @@ impl TraceJitState {
     where
         F: FnOnce(*const u64, Option<u64>) -> u64,
     {
+        unsafe {
+            self.invoke_with_resume(
+                fn_id,
+                args_ptr,
+                slot_count,
+                |args, resume_pc, _snapshot| fallback(args, resume_pc),
+            )
+        }
+    }
+
+    /// v6-δ M1 R3: invoke the installed trace, falling back through a
+    /// closure that receives the **full** deopt-state snapshot when a
+    /// guard fires.
+    ///
+    /// Compared to [`Self::invoke_with_fallback_at_pc`] the fallback
+    /// closure takes a third arg `snapshot: Option<&DeoptStateSnapshot>`
+    /// so it can:
+    ///
+    /// 1. Read the captured `ssa_slots_copy` to feed
+    ///    [`relon_eval_api::Evaluator::resume_from_pc`] —
+    ///    backends that maintain an IR-side PC table get pixel-perfect
+    ///    partial-resume rather than running from `#main` entry.
+    /// 2. Drain `recoverable_writes` to undo writes the trace
+    ///    speculatively performed before the deopt.
+    /// 3. Inspect `guard_pc` for telemetry / log-trace correlation.
+    ///
+    /// Hosts that don't need the snapshot can keep using the existing
+    /// `_at_pc` variant; the trait surface above (`Evaluator::resume_from_pc`)
+    /// has a sensible default that ignores `local_snapshot`.
+    ///
+    /// ## Safety
+    ///
+    /// Same contract as [`Self::invoke_with_fallback_at_pc`].
+    pub unsafe fn invoke_with_resume<F>(
+        &self,
+        fn_id: u32,
+        args_ptr: *const u64,
+        slot_count: usize,
+        fallback: F,
+    ) -> u64
+    where
+        F: FnOnce(
+            *const u64,
+            Option<u64>,
+            Option<&relon_trace_abi::DeoptStateSnapshot>,
+        ) -> u64,
+    {
         let trace_fn = match self.lookup_trace(fn_id) {
             Some(t) => t,
-            None => return fallback(args_ptr, None),
+            None => return fallback(args_ptr, None, None),
         };
 
         let mut ctx = TraceContext::with_hooks(slot_count, default_host_hooks());
@@ -406,15 +453,17 @@ impl TraceJitState {
         match status {
             TraceEntryStatus::Success => ctx.result_slot,
             TraceEntryStatus::GuardFailed => {
-                let resume_pc = ctx.deopt_state.as_ref().map(|d| d.external_pc);
+                let snapshot = ctx.deopt_state.as_ref();
+                let resume_pc = snapshot.map(|d| d.external_pc);
                 tracing::debug!(
                     target: "relon::trace_install",
                     fn_id,
-                    deopt_recorded = ctx.deopt_state.is_some(),
+                    deopt_recorded = snapshot.is_some(),
                     ?resume_pc,
-                    "trace GuardFailed; falling back to generic backend"
+                    slots = snapshot.map(|s| s.ssa_slots_copy.len()).unwrap_or(0),
+                    "trace GuardFailed; partial-resume snapshot ready"
                 );
-                fallback(args_ptr, resume_pc)
+                fallback(args_ptr, resume_pc, snapshot)
             }
             TraceEntryStatus::Aborted => {
                 tracing::warn!(
@@ -423,7 +472,7 @@ impl TraceJitState {
                     "trace Aborted; invalidating + falling back"
                 );
                 self.invalidate_trace(fn_id);
-                fallback(args_ptr, None)
+                fallback(args_ptr, None, None)
             }
         }
     }
