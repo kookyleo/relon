@@ -1486,6 +1486,7 @@ version = "0.1.0"
 dependencies = [
  "hex",
  "relon-analyzer",
+ "relon-bytecode",
  "relon-codegen-native",
  "relon-eval-api",
  "relon-evaluator",
@@ -1526,6 +1527,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "relon-bytecode"
+version = "0.1.0"
+dependencies = [
+ "ordered-float",
+ "relon-analyzer",
+ "relon-eval-api",
+ "relon-ir",
+ "relon-parser",
+ "thiserror",
+]
+
+[[package]]
 name = "relon-cli"
 version = "0.1.0"
 dependencies = [
@@ -1535,6 +1548,7 @@ dependencies = [
  "miette",
  "relon",
  "relon-analyzer",
+ "relon-bytecode",
  "relon-codegen-native",
  "relon-eval-api",
  "relon-evaluator",
@@ -1701,6 +1715,7 @@ version = "0.1.0"
 dependencies = [
  "relon",
  "relon-analyzer",
+ "relon-bytecode",
  "relon-codegen-native",
  "relon-eval-api",
  "relon-evaluator",

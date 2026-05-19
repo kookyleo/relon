@@ -1,0 +1,29 @@
+[package]
+name = "relon-bytecode"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "v6-delta M2-A: stack-based bytecode VM backend with IR-PC bookkeeping for partial-resume"
+keywords = ["relon", "bytecode", "interpreter", "vm", "evaluator"]
+categories = ["compilers"]
+
+[dependencies]
+# IR input: the bytecode compiler consumes the same `relon_ir::Op`
+# stream the cranelift-AOT backend lowers from `lower_workspace_single`.
+relon-ir = { workspace = true }
+# Trait Evaluator + shared Value / Scope / RuntimeError types.
+relon-eval-api = { workspace = true }
+# Source positions for diagnostics + entry range carried through the
+# `TaggedOp.range` slot.
+relon-parser = { workspace = true }
+# `BytecodeEvaluator::from_source` runs the analyzer before lowering so
+# the bytecode envelope tracks what the cranelift / wasm pipelines accept.
+relon-analyzer = { workspace = true }
+
+thiserror = { workspace = true }
+# `Value::Float(OrderedFloat<f64>)` construction; the f64 slot bits
+# get re-wrapped in `unpack_return`.
+ordered-float = { workspace = true }

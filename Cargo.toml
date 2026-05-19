@@ -47,6 +47,7 @@ relon-eval-api = { path = "crates/relon-eval-api", version = "0.1.0" }
 relon-evaluator = { path = "crates/relon-evaluator", version = "0.1.0" }
 relon-fmt = { path = "crates/relon-fmt", version = "0.1.0" }
 relon-ir = { path = "crates/relon-ir", version = "0.1.0" }
+relon-bytecode = { path = "crates/relon-bytecode", version = "0.1.0" }
 relon-codegen-native = { path = "crates/relon-codegen-native", version = "0.1.0" }
 relon-object-cache = { path = "crates/relon-object-cache", version = "0.1.0" }
 relon-object-link = { path = "crates/relon-object-link", version = "0.1.0" }
