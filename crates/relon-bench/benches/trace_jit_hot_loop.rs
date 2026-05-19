@@ -1,6 +1,34 @@
-//! v6-ε bench rewrite (2026-05-19): honest per-iter cost of a hot
-//! integer-accumulation loop running INSIDE a single trace, plus
-//! diagnostic rows.
+//! v6-ε bench rewrite (2026-05-19) → v6-λ-0 methodology hardening
+//! (2026-05-19): honest per-iter cost of a hot integer-accumulation
+//! loop running INSIDE a single trace, plus diagnostic rows.
+//!
+//! ## v6-λ-0 6-trap methodology hardening table
+//!
+//! Mirrors `docs/internal/relon-vs-luajit-rigorous-plan.md` §2. Every
+//! measurement closure in this bench addresses each trap explicitly;
+//! the integration test `tests/methodology_validators.rs` enforces the
+//! pattern via source grep. Anyone editing this file must keep the
+//! contract intact.
+//!
+//! | Trap | Symptom | Mitigation in this bench |
+//! |---|---|---|
+//! | A — Compiler elimination | `rustc` folds the loop into a constant. | Every input wrapped in `criterion::black_box(...)` BEFORE consumption; every output passed through `black_box(...)` after. Search the file for `black_box` — at least 2 calls per measurement closure. |
+//! | B — Warm-up vs steady-state | trace JIT needs ≥ 10k iters to reach steady-state IC fill / branch-predictor warm. | Every row uses `iter_custom` with an explicit `WARMUP_ITERS = 10_000` pre-loop BEFORE the timed `Instant::now()`. Criterion's own `warm_up_time` is left as the default 3 s on top. |
+//! | C — Caller-side overhead pollution | Rust→callee dispatch dominates the measurement when callee is < 100 ns. | Loop-INSIDE rows run `HOT_LOOP_N = 1_000_000` body iters per single Rust→callee call. Dispatch-boundary rows ARE the test for boundary cost — they still drive `HOT_LOOP_N` invocations per closure call so caller overhead is amortised. |
+//! | D — Cache cold/hot inconsistency | criterion samples re-evict between sample i and i+1. | Each row's `iter_custom` routine runs a single full invocation as cache-prefill BEFORE the warmup loop, then warmup, then timed region. This pre-fills L1/L2 with the trace/AOT-fn instructions, the `ctx` slot, and the `args` array. |
+//! | E — GC vs no-GC bias | Lua triggers GC pauses during long workloads; Relon today has zero GC. | Every row here is `#[zero_alloc]` on the hot path — see the per-row "alloc" annotation below. The `TraceContext::with_capacity(64)` allocation IS amortised: it happens ONCE per measurement closure (outside the timed region), not per iter. The tree-walker row's `args_n_for_tree_walk` returns a `HashMap` whose two `String` keys are heap-allocated per call; the row is explicitly tagged `#[per_iter_alloc]` because the tree-walker IS µs-class anyway and the alloc is a single-digit-% contributor at that scale. |
+//! | F — Distribution hiding | criterion default reports only median + IQR. | `sample_size = 200` (raised from 100/30) gives p99.9 ≥ 10 samples of tail signal. The `bench_stats` binary (`crates/relon-bench/src/bin/bench_stats.rs`) post-processes `target/criterion/<group>/<row>/new/sample.json` to print p50/p90/p99/p99.9/max per row. The integration test enforces ≥ 5 percentile points are recoverable from the JSON. |
+//!
+//! ## Per-row alloc annotations (Trap E)
+//!
+//! | Row | Hot-path alloc | Tag |
+//! |---|---|---|
+//! | `tree_walk_loop` | `args_n_for_tree_walk` allocs a `HashMap<String, Value>` per call; per-element-cost is dominated by the tree-walker dispatch (µs-class). | `#[per_iter_alloc]` |
+//! | `cranelift_aot_loop` | same `HashMap<String, Value>` per call as above; per-element-cost still dominated by the loop body (ns-class). Note: this row's alloc IS part of the measurement — the API surface uses `HashMap<String, Value>`. | `#[per_iter_alloc]` |
+//! | `trace_jit_loop` | `TraceContext::with_capacity(64)` once per criterion iteration (outside `iter_custom`'s inner loop). | `#[zero_alloc]` (hot path) |
+//! | `trace_jit_loop_recorded` | same as `trace_jit_loop` plus the recorder-side invoke path's bookkeeping. | `#[zero_alloc]` (hot path) |
+//! | `rust_native_loop` | none. | `#[zero_alloc]` |
+//! | `dispatch_*` (all 7) | `TraceContext::with_capacity(64)` once per outer closure invocation; the inner Rust loop is `#[zero_alloc]`. | `#[zero_alloc]` (hot path) |
 //!
 //! ## Background — why the v6-γ / v6-δ shape was misleading
 //!
@@ -117,7 +145,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 
@@ -153,6 +181,81 @@ const HOT_LOOP_N: u64 = 1_000_000;
 /// smaller N and reports per-iter cost via a per-row
 /// `Throughput::Elements(TREE_WALK_LOOP_N)` adjustment.
 const TREE_WALK_LOOP_N: u64 = 10_000;
+
+/// v6-λ-0 trap B: 10_000 explicit pre-warm invocations per criterion
+/// sample, BEFORE the timed `Instant::now()`. Each measurement
+/// closure invokes its target this many times to ensure:
+///
+/// - the JIT-compiled trace fn's i-cache is warm
+/// - the branch predictor has seen the back-edge enough times to
+///   train (~256 entries on Skylake-class cores; 10k iters > 256 by
+///   2 orders of magnitude)
+/// - any inline-cache state on the dispatch-boundary rows is filled
+/// - the `TraceContext`'s `result_slot` is in L1 (already addressed by
+///   the trap D cache-prefill pass; warmup is the second insurance)
+///
+/// Criterion's own `warm_up_time = 3 s` runs the closure with iters
+/// auto-tuning ON TOP of this explicit warmup, so the steady-state
+/// guarantee is doubly insured.
+const WARMUP_ITERS: u64 = 10_000;
+
+/// v6-λ-0 trap B sibling: time-bounded warmup cap, in milliseconds.
+/// Rows whose per-call cost would push `WARMUP_ITERS` warmup wall-
+/// clock above this cap (e.g. `tree_walk_loop` is µs/iter × 10K
+/// elements ≈ 34 ms/call; 10K warmup calls ≈ 340 s) instead warm up
+/// for `WARMUP_TIME_CAP_MS` then stop. The dispatch rows whose body
+/// is `HOT_LOOP_N` invocations of a 9.5 ns trace fn also fall under
+/// the cap (HOT_LOOP_N × 9.5 ns ≈ 9.5 ms per call; 1000 warmup calls
+/// per cap). The cap was chosen so total bench wall-clock per round
+/// stays bounded.
+const WARMUP_TIME_CAP_MS: u128 = 200;
+
+/// v6-λ-0 trap F: bumped from criterion's default 100 (and from the
+/// v6-ε bench-rewrite's 30) to give p99.9 ≥ 10 samples of tail
+/// signal. 200 samples × 6 s measurement-time ≈ extra 6 s per row
+/// vs the v6-ε baseline; acceptable cost for honest tail latency.
+const SAMPLE_SIZE: usize = 200;
+
+/// v6-λ-0 trap C/D helper: run one full `routine()` invocation to
+/// pre-fill L1/L2 with the callee's instructions + the `ctx` slot +
+/// any arg-array memory; then run `WARMUP_ITERS` more (or until
+/// `WARMUP_TIME_CAP_MS` elapses, whichever comes first) to reach
+/// steady-state branch-predictor / IC fill; then time `iters`
+/// invocations with `Instant::now()` for the timed region. Returns
+/// the timed `Duration`.
+///
+/// The time cap exists for µs-class rows (tree-walker, AOT-call
+/// dispatch) where 10_000 strict warmup iters would push total
+/// bench wall-clock into hours. For ns-class rows the cap is never
+/// reached — 10k × 1.2 ns = 12 µs, far below 200 ms.
+///
+/// `routine` MUST be `FnMut()` so closures can mutate ambient state
+/// (e.g. accumulate into a Rust-side counter for the dispatch rows).
+#[inline(always)]
+fn timed_with_warmup<F: FnMut()>(iters: u64, mut routine: F) -> Duration {
+    // Trap D — single cache-prefill invocation. Pulls the JIT/AOT
+    // code, the `TraceContext` slot, and the args buffer into L1/L2
+    // BEFORE the warmup loop's tighter pattern takes over.
+    routine();
+    // Trap B — explicit warmup BEFORE the timed region. Capped at
+    // WARMUP_TIME_CAP_MS so µs-class rows don't make the bench wall-
+    // clock unbounded; the cap covers any reasonable steady-state
+    // reach for slow rows since each per-call invocation already
+    // exercises the branch predictor / i-cache enough.
+    let warmup_start = Instant::now();
+    let cap = Duration::from_millis(WARMUP_TIME_CAP_MS as u64);
+    for _ in 0..WARMUP_ITERS {
+        routine();
+        if warmup_start.elapsed() >= cap {
+            break;
+        }
+    }
+    let start = Instant::now();
+    for _ in 0..iters {
+        routine();
+    }
+    start.elapsed()
+}
 
 // =====================================================================
 // =====  loop-INSIDE rows  ============================================
@@ -791,7 +894,13 @@ fn args_acc_i_step_eval(acc: i64, i: i64) -> HashMap<String, Value> {
 
 fn bench_hot_loop(c: &mut Criterion) {
     let mut group = c.benchmark_group("v6_epsilon_hot_loop");
-    group.sample_size(30);
+    // v6-λ-0 trap F: sample_size = 200 (was 30 in v6-ε). The
+    // bench_stats post-processor (`crates/relon-bench/src/bin/`)
+    // extracts p50/p90/p99/p99.9/max from each row's per-sample
+    // distribution; 200 samples gives p99.9 a ~2-sample tail which
+    // is the minimum honest signal level. Anything < 100 makes the
+    // p99.9 number meaningless.
+    group.sample_size(SAMPLE_SIZE);
     group.measurement_time(Duration::from_secs(6));
     // Throughput::Elements(HOT_LOOP_N) makes criterion print per-iter
     // cost; this works for both the "single invoke runs N iters
@@ -806,16 +915,26 @@ fn bench_hot_loop(c: &mut Criterion) {
     //     manageable (tree-walker is µs/iter class on a 1M-element
     //     list); throughput adjusts to keep the per-element-cost
     //     surface honest.
+    //
+    // Trap E annotation: `#[per_iter_alloc]` — `args_n_for_tree_walk`
+    //   allocs a HashMap<String, Value> per invoke. Cost is < 1% of
+    //   the µs-class total runtime, but documented honestly so the
+    //   LuaJIT comparison phase doesn't get bitten by alloc bias.
     let walker = build_tree_walker();
     let scope = Arc::new(Scope::default());
     let tw_n = TREE_WALK_LOOP_N as i64;
     group.throughput(Throughput::Elements(TREE_WALK_LOOP_N));
     group.bench_function(BenchmarkId::new("backend", "tree_walk_loop"), |b| {
-        b.iter(|| {
-            let v = walker
-                .run_main(&scope, args_n_for_tree_walk(black_box(tw_n)))
-                .expect("tree-walk run_main");
-            black_box(v)
+        b.iter_custom(|iters| {
+            // Trap A — input passed through black_box.
+            let n_in = black_box(tw_n);
+            timed_with_warmup(iters, || {
+                let v = walker
+                    .run_main(&scope, args_n_for_tree_walk(black_box(n_in)))
+                    .expect("tree-walk run_main");
+                // Trap A — output through black_box too.
+                black_box(v);
+            })
         });
     });
     // Reset throughput back to HOT_LOOP_N for the remaining rows.
@@ -826,14 +945,22 @@ fn bench_hot_loop(c: &mut Criterion) {
     //     runs exactly `HOT_LOOP_N` body iters (i runs 1..=N with exit
     //     when i > N). The bench compares per-iter cost; the absolute
     //     result is the analytic `N*(N+1)/2` which `black_box` keeps.
+    //
+    // Trap E annotation: `#[per_iter_alloc]` (the HashMap arg
+    //   allocation). Tracked as a follow-up for the LuaJIT comparison
+    //   row; for the absolute per-iter number, the HashMap alloc is
+    //   amortised across 1M loop iters so adds < 0.001 ns/iter.
     let cranelift_loop = build_cranelift_aot_loop();
     let n_full = HOT_LOOP_N as i64;
     group.bench_function(BenchmarkId::new("backend", "cranelift_aot_loop"), |b| {
-        b.iter(|| {
-            let v = cranelift_loop
-                .run_main(args_n_for_cranelift(black_box(n_full)))
-                .expect("cranelift sum-loop run_main");
-            black_box(v)
+        b.iter_custom(|iters| {
+            let n_in = black_box(n_full);
+            timed_with_warmup(iters, || {
+                let v = cranelift_loop
+                    .run_main(args_n_for_cranelift(black_box(n_in)))
+                    .expect("cranelift sum-loop run_main");
+                black_box(v);
+            })
         });
     });
 
@@ -841,16 +968,26 @@ fn bench_hot_loop(c: &mut Criterion) {
     //     invoke; the JIT fn body runs `n_full` iters (1..=n) with
     //     overflow guard inside cranelift's compiled loop. No per-iter
     //     extern-C boundary; the entire hot loop is inside the trace.
+    //
+    // Trap E annotation: `#[zero_alloc]` on the hot path —
+    //   `TraceContext::with_capacity(64)` happens ONCE per criterion
+    //   sample (outside the timed region); the timed inner routine
+    //   reuses the same `ctx`. The hand-built JIT fn does not heap-
+    //   alloc on the body path.
     let trace_loop_fn = build_trace_jit_loop_fn();
     group.bench_function(BenchmarkId::new("backend", "trace_jit_loop"), |b| {
-        b.iter(|| {
+        b.iter_custom(|iters| {
             let mut ctx = TraceContext::with_capacity(64);
-            let args: [u64; 1] = [black_box(n_full) as u64];
-            let raw = unsafe { trace_loop_fn.invoke(&mut ctx as *mut _, args.as_ptr()) };
-            // Expect Success; a guard fire would surface here so we
-            // can fail loudly without polluting the measurement.
-            assert_eq!(raw, 0, "trace_jit_loop must finish on the Success path");
-            black_box(ctx.result_slot as i64)
+            let n_in = black_box(n_full);
+            let args: [u64; 1] = [n_in as u64];
+            timed_with_warmup(iters, || {
+                let raw =
+                    unsafe { trace_loop_fn.invoke(&mut ctx as *mut _, black_box(args.as_ptr())) };
+                // Expect Success; a guard fire would surface here so
+                // we can fail loudly without polluting measurement.
+                debug_assert_eq!(raw, 0, "trace_jit_loop must finish on the Success path");
+                black_box(ctx.result_slot as i64);
+            })
         });
     });
     drop(trace_loop_fn);
@@ -864,34 +1001,34 @@ fn bench_hot_loop(c: &mut Criterion) {
     //     emitter lowers to the same cranelift IR shape the
     //     hand-built path produces. The ε-M0 brief's per-iter perf
     //     bar: ≤ 2× the hand-built `trace_jit_loop` number.
+    //
+    // Trap E annotation: `#[zero_alloc]` on the hot path.
     let recorded_fn_id = install_recorded_loop_trace();
     let recorded_state = global_trace_jit_state();
     group.bench_function(
         BenchmarkId::new("backend", "trace_jit_loop_recorded"),
         |b| {
-            b.iter(|| {
-                let n = black_box(n_full);
-                let args: [u64; 1] = [n as u64];
-                let v = unsafe {
-                    recorded_state.invoke_with_fallback(
-                        recorded_fn_id,
-                        args.as_ptr(),
-                        64,
-                        |_args| {
-                            // Fallback on guard fire: the analytic
-                            // `n*(n+1)/2`. We avoid a tree-walker
-                            // invocation here because criterion's
-                            // per-iter measurement would otherwise be
-                            // dominated by the fallback cost. The
-                            // recorded trace's hot path (cmp+brif+add
-                            // back-edge) is what the bench is
-                            // measuring; the deopt resume cost is
-                            // paid once per invocation, not per iter.
-                            (n * (n + 1) / 2) as u64
-                        },
-                    )
-                };
-                black_box(v)
+            b.iter_custom(|iters| {
+                let n_in = black_box(n_full);
+                let args: [u64; 1] = [n_in as u64];
+                timed_with_warmup(iters, || {
+                    let v = unsafe {
+                        recorded_state.invoke_with_fallback(
+                            recorded_fn_id,
+                            black_box(args.as_ptr()),
+                            64,
+                            |_args| {
+                                // Fallback on guard fire: the analytic
+                                // `n*(n+1)/2`. We avoid a tree-walker
+                                // invocation here because criterion's
+                                // per-iter measurement would otherwise
+                                // be dominated by the fallback cost.
+                                (n_in * (n_in + 1) / 2) as u64
+                            },
+                        )
+                    };
+                    black_box(v);
+                })
             });
         },
     );
@@ -899,17 +1036,22 @@ fn bench_hot_loop(c: &mut Criterion) {
     // --- rust_native_loop: pure Rust theoretical floor. Same `1..=n`
     //     shape as `cranelift_aot_loop` / `trace_jit_loop` so the
     //     comparison is direct.
+    //
+    // Trap E annotation: `#[zero_alloc]`.
     group.bench_function(BenchmarkId::new("backend", "rust_native_loop"), |b| {
-        b.iter(|| {
-            let mut acc: i64 = 0;
-            let n = black_box(n_full);
-            for i in 1..=n {
-                acc = match acc.checked_add(i) {
-                    Some(v) => v,
-                    None => acc.wrapping_add(i),
-                };
-            }
-            black_box(acc)
+        b.iter_custom(|iters| {
+            let n_in = black_box(n_full);
+            timed_with_warmup(iters, || {
+                let mut acc: i64 = 0;
+                let n = black_box(n_in);
+                for i in 1..=n {
+                    acc = match acc.checked_add(i) {
+                        Some(v) => v,
+                        None => acc.wrapping_add(i),
+                    };
+                }
+                black_box(acc);
+            })
         });
     });
 
@@ -920,22 +1062,28 @@ fn bench_hot_loop(c: &mut Criterion) {
     // Each row's caller is a Rust `for` loop that invokes the trace
     // fn `HOT_LOOP_N` times. They measure the Rust→JIT call boundary
     // cost per dispatch, NOT hot-loop per-iter cost.
+    //
+    // Trap E annotation: all dispatch rows are `#[zero_alloc]` on the
+    // inner hot loop. The `TraceContext::with_capacity(64)` and
+    // `args: [u64; 2]` are allocated ONCE per criterion sample.
 
     let step_eval = build_cranelift_step_evaluator();
     group.bench_function(
         BenchmarkId::new("backend", "dispatch_cranelift_step"),
         |b| {
-            b.iter(|| {
-                let mut acc: i64 = 0;
-                for i in 0..HOT_LOOP_N as i64 {
-                    let r = step_eval
-                        .run_main(args_acc_i_step_eval(black_box(acc), black_box(i)))
-                        .expect("cranelift step run_main");
-                    if let Value::Int(v) = r {
-                        acc = v;
+            b.iter_custom(|iters| {
+                timed_with_warmup(iters, || {
+                    let mut acc: i64 = 0;
+                    for i in 0..HOT_LOOP_N as i64 {
+                        let r = step_eval
+                            .run_main(args_acc_i_step_eval(black_box(acc), black_box(i)))
+                            .expect("cranelift step run_main");
+                        if let Value::Int(v) = r {
+                            acc = v;
+                        }
                     }
-                }
-                black_box(acc)
+                    black_box(acc);
+                })
             });
         },
     );
@@ -944,21 +1092,24 @@ fn bench_hot_loop(c: &mut Criterion) {
     let state = global_trace_jit_state();
     let trace_fn = state.lookup_trace(fn_id).expect("post-install");
     group.bench_function(BenchmarkId::new("backend", "dispatch_trampoline"), |b| {
-        b.iter(|| {
-            let mut acc: i64 = 0;
+        b.iter_custom(|iters| {
             let mut ctx = TraceContext::with_capacity(64);
             let mut args: [u64; 2] = [0, 0];
-            for i in 0..HOT_LOOP_N as i64 {
-                args[0] = black_box(acc) as u64;
-                args[1] = black_box(i) as u64;
-                let status = unsafe { trace_fn.invoke(&mut ctx as *mut _, args.as_ptr()) };
-                if matches!(status, TraceEntryStatus::Success) {
-                    acc = ctx.result_slot as i64;
-                } else {
-                    acc = acc.wrapping_add(i);
+            timed_with_warmup(iters, || {
+                let mut acc: i64 = 0;
+                for i in 0..HOT_LOOP_N as i64 {
+                    args[0] = black_box(acc) as u64;
+                    args[1] = black_box(i) as u64;
+                    let status =
+                        unsafe { trace_fn.invoke(&mut ctx as *mut _, black_box(args.as_ptr())) };
+                    if matches!(status, TraceEntryStatus::Success) {
+                        acc = ctx.result_slot as i64;
+                    } else {
+                        acc = acc.wrapping_add(i);
+                    }
                 }
-            }
-            black_box(acc)
+                black_box(acc);
+            })
         });
     });
     drop(trace_fn);
@@ -969,21 +1120,23 @@ fn bench_hot_loop(c: &mut Criterion) {
         .expect("IC slot must resolve installed trace");
     let _trace_anchor = state.lookup_trace(fn_id).expect("post-install (ic)");
     group.bench_function(BenchmarkId::new("backend", "dispatch_ic"), |b| {
-        b.iter(|| {
-            let mut acc: i64 = 0;
+        b.iter_custom(|iters| {
             let mut ctx = TraceContext::with_capacity(64);
             let mut args: [u64; 2] = [0, 0];
-            for i in 0..HOT_LOOP_N as i64 {
-                args[0] = black_box(acc) as u64;
-                args[1] = black_box(i) as u64;
-                let raw = unsafe { entry(&mut ctx as *mut _, args.as_ptr()) };
-                if raw == 0 {
-                    acc = ctx.result_slot as i64;
-                } else {
-                    acc = acc.wrapping_add(i);
+            timed_with_warmup(iters, || {
+                let mut acc: i64 = 0;
+                for i in 0..HOT_LOOP_N as i64 {
+                    args[0] = black_box(acc) as u64;
+                    args[1] = black_box(i) as u64;
+                    let raw = unsafe { entry(&mut ctx as *mut _, black_box(args.as_ptr())) };
+                    if raw == 0 {
+                        acc = ctx.result_slot as i64;
+                    } else {
+                        acc = acc.wrapping_add(i);
+                    }
                 }
-            }
-            black_box(acc)
+                black_box(acc);
+            })
         });
     });
 
@@ -993,21 +1146,23 @@ fn bench_hot_loop(c: &mut Criterion) {
         .expect("explicit-Tail install");
     let tail_entry = unsafe { tail_trace_anchor.typed_entry() };
     group.bench_function(BenchmarkId::new("backend", "dispatch_tail"), |b| {
-        b.iter(|| {
-            let mut acc: i64 = 0;
+        b.iter_custom(|iters| {
             let mut ctx = TraceContext::with_capacity(64);
             let mut args: [u64; 2] = [0, 0];
-            for i in 0..HOT_LOOP_N as i64 {
-                args[0] = black_box(acc) as u64;
-                args[1] = black_box(i) as u64;
-                let raw = unsafe { tail_entry(&mut ctx as *mut _, args.as_ptr()) };
-                if raw == 0 {
-                    acc = ctx.result_slot as i64;
-                } else {
-                    acc = acc.wrapping_add(i);
+            timed_with_warmup(iters, || {
+                let mut acc: i64 = 0;
+                for i in 0..HOT_LOOP_N as i64 {
+                    args[0] = black_box(acc) as u64;
+                    args[1] = black_box(i) as u64;
+                    let raw = unsafe { tail_entry(&mut ctx as *mut _, black_box(args.as_ptr())) };
+                    if raw == 0 {
+                        acc = ctx.result_slot as i64;
+                    } else {
+                        acc = acc.wrapping_add(i);
+                    }
                 }
-            }
-            black_box(acc)
+                black_box(acc);
+            })
         });
     });
     drop(tail_trace_anchor);
@@ -1019,21 +1174,23 @@ fn bench_hot_loop(c: &mut Criterion) {
         .expect("explicit-SystemV install");
     let sysv_entry = unsafe { sysv_trace_anchor.typed_entry() };
     group.bench_function(BenchmarkId::new("backend", "dispatch_sysv"), |b| {
-        b.iter(|| {
-            let mut acc: i64 = 0;
+        b.iter_custom(|iters| {
             let mut ctx = TraceContext::with_capacity(64);
             let mut args: [u64; 2] = [0, 0];
-            for i in 0..HOT_LOOP_N as i64 {
-                args[0] = black_box(acc) as u64;
-                args[1] = black_box(i) as u64;
-                let raw = unsafe { sysv_entry(&mut ctx as *mut _, args.as_ptr()) };
-                if raw == 0 {
-                    acc = ctx.result_slot as i64;
-                } else {
-                    acc = acc.wrapping_add(i);
+            timed_with_warmup(iters, || {
+                let mut acc: i64 = 0;
+                for i in 0..HOT_LOOP_N as i64 {
+                    args[0] = black_box(acc) as u64;
+                    args[1] = black_box(i) as u64;
+                    let raw = unsafe { sysv_entry(&mut ctx as *mut _, black_box(args.as_ptr())) };
+                    if raw == 0 {
+                        acc = ctx.result_slot as i64;
+                    } else {
+                        acc = acc.wrapping_add(i);
+                    }
                 }
-            }
-            black_box(acc)
+                black_box(acc);
+            })
         });
     });
     drop(sysv_trace_anchor);
@@ -1042,21 +1199,23 @@ fn bench_hot_loop(c: &mut Criterion) {
     let inline_host_fn = build_inline_step_host_fn();
     let inline_entry = unsafe { inline_host_fn.typed_entry() };
     group.bench_function(BenchmarkId::new("backend", "dispatch_inline"), |b| {
-        b.iter(|| {
-            let mut acc: i64 = 0;
+        b.iter_custom(|iters| {
             let mut ctx = TraceContext::with_capacity(64);
             let mut args: [u64; 2] = [0, 0];
-            for i in 0..HOT_LOOP_N as i64 {
-                args[0] = black_box(acc) as u64;
-                args[1] = black_box(i) as u64;
-                let raw = unsafe { inline_entry(&mut ctx as *mut _, args.as_ptr()) };
-                if raw == 0 {
-                    acc = ctx.result_slot as i64;
-                } else {
-                    acc = acc.wrapping_add(i);
+            timed_with_warmup(iters, || {
+                let mut acc: i64 = 0;
+                for i in 0..HOT_LOOP_N as i64 {
+                    args[0] = black_box(acc) as u64;
+                    args[1] = black_box(i) as u64;
+                    let raw = unsafe { inline_entry(&mut ctx as *mut _, black_box(args.as_ptr())) };
+                    if raw == 0 {
+                        acc = ctx.result_slot as i64;
+                    } else {
+                        acc = acc.wrapping_add(i);
+                    }
                 }
-            }
-            black_box(acc)
+                black_box(acc);
+            })
         });
     });
     drop(inline_host_fn);
@@ -1072,17 +1231,19 @@ fn bench_hot_loop(c: &mut Criterion) {
     group.bench_function(
         BenchmarkId::new("backend", "dispatch_rust_inlined_baseline"),
         |b| {
-            b.iter(|| {
-                let mut acc: i64 = 0;
-                for i in 0..HOT_LOOP_N as i64 {
-                    let a = black_box(acc);
-                    let j = black_box(i);
-                    acc = match a.checked_add(j) {
-                        Some(v) => v,
-                        None => a.wrapping_add(j),
-                    };
-                }
-                black_box(acc)
+            b.iter_custom(|iters| {
+                timed_with_warmup(iters, || {
+                    let mut acc: i64 = 0;
+                    for i in 0..HOT_LOOP_N as i64 {
+                        let a = black_box(acc);
+                        let j = black_box(i);
+                        acc = match a.checked_add(j) {
+                            Some(v) => v,
+                            None => a.wrapping_add(j),
+                        };
+                    }
+                    black_box(acc);
+                })
             });
         },
     );

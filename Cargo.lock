@@ -1529,7 +1529,10 @@ dependencies = [
  "relon-trace-abi",
  "relon-trace-emitter",
  "relon-trace-jit",
+ "serde",
+ "serde_json",
  "tempfile",
+ "thiserror",
 ]
 
 [[package]]

@@ -50,6 +50,13 @@ cranelift-native = "0.131"
 # TraceContext field rather than hard-coding the byte offset.
 relon-trace-emitter = { workspace = true }
 dhat = { version = "0.3", optional = true }
+# v6-λ-0 (bench methodology hardening): `bench_stats` post-processes
+# criterion's `sample.json` per-row to extract p50/p90/p99/p99.9/max.
+# Pulled in as non-dev deps so `cargo build -p relon-bench` exposes the
+# library + the `bench_stats` binary without `--tests`.
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
 
 [dev-dependencies]
 # Criterion 0.5.x: stage P0 measurement infra. Provides per-dimension
@@ -102,3 +109,12 @@ path = "benches/cranelift_aot_vs_tree_walk.rs"
 name = "trace_jit_hot_loop"
 harness = false
 path = "benches/trace_jit_hot_loop.rs"
+
+# v6-λ-0 (bench methodology hardening, 2026-05-19): post-processor for
+# criterion's per-sample `sample.json` outputs. Walks
+# `target/criterion/<group>/<dim>/<row>/new/sample.json` and prints a
+# Markdown table of p50/p90/p99/p99.9/max per row. Run via
+# `cargo run -p relon-bench --bin bench_stats -- <group_root>`.
+[[bin]]
+name = "bench_stats"
+path = "src/bin/bench_stats.rs"
