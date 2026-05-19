@@ -179,25 +179,36 @@ fn w6_dict_num_key() {
 
 #[test]
 fn w7_fib() {
-    let r = "#main(Int n) -> Dict\n\
-             {\n\
-               #private\n\
-               fib: (k) => k < 2 ? k : fib(k - 1) + fib(k - 2),\n\
-               result: fib(n)\n\
-             }";
-    let n = FIB_N;
-    let l = format!(
-        "return function() local function fib(k) if k < 2 then return k end; return fib(k-1) + fib(k-2) end; return fib({n}) end"
-    );
-    fn fib(k: i64) -> i64 {
-        if k < 2 {
-            k
-        } else {
-            fib(k - 1) + fib(k - 2)
-        }
-    }
-    let expected = fib(n);
-    run_pair("W7", r, &l, n, expected);
+    // The tree-walker recurses 17.7k times for fib(22), each frame
+    // cloning a Scope (>= 64B) + step counter + path_cache lookups.
+    // Default test thread stack (2 MB) overflows; spawn an explicit
+    // 16 MB thread so the test passes regardless of `RUST_MIN_STACK`.
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            let r = "#main(Int n) -> Dict\n\
+                     {\n\
+                       #private\n\
+                       fib: (k) => k < 2 ? k : fib(k - 1) + fib(k - 2),\n\
+                       result: fib(n)\n\
+                     }";
+            let n = FIB_N;
+            let l = format!(
+                "return function() local function fib(k) if k < 2 then return k end; return fib(k-1) + fib(k-2) end; return fib({n}) end"
+            );
+            fn fib(k: i64) -> i64 {
+                if k < 2 {
+                    k
+                } else {
+                    fib(k - 1) + fib(k - 2)
+                }
+            }
+            let expected = fib(n);
+            run_pair("W7", r, &l, n, expected);
+        })
+        .unwrap()
+        .join()
+        .unwrap();
 }
 
 #[test]
