@@ -404,6 +404,25 @@ pub fn all_cases() -> Vec<CorpusCase> {
             args_factory: no_args,
             tier: Tier::StdlibCaseFold,
         },
+        // v3++ b-7 reframed: FULL multi-cp + Σ-context coverage.
+        CorpusCase {
+            name: "stdlib_upper_sharp_s",
+            source: "#main() -> String\n\"straße\".upper()",
+            args_factory: no_args,
+            tier: Tier::StdlibCaseFold,
+        },
+        CorpusCase {
+            name: "stdlib_lower_final_sigma_at_end",
+            source: "#main() -> String\n\"ΟΔΥΣΣΕΥΣ\".lower()",
+            args_factory: no_args,
+            tier: Tier::StdlibCaseFold,
+        },
+        CorpusCase {
+            name: "stdlib_upper_ligature_fi",
+            source: "#main() -> String\n\"ﬁle\".upper()",
+            args_factory: no_args,
+            tier: Tier::StdlibCaseFold,
+        },
         // ---- StdlibList: higher-order needs closure ABI ----
         CorpusCase {
             name: "stdlib_list_sum",

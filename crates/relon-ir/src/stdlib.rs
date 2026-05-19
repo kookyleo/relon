@@ -112,6 +112,37 @@ pub(crate) const CCC_LOOKUP_INDEX: u32 = 25;
 /// Unicode caps codepoints at `U+10FFFF`.
 pub(crate) const COMPOSE_LOOKUP_INDEX: u32 = 26;
 
+/// v3++ b-7 reframed: stable slot of the
+/// `__full_casefold_lookup(cp, table_addr) -> i32` internal helper.
+///
+/// Binary-searches the FULL multi-codepoint folding table (20-byte
+/// stride: `(in: u32, out0: u32, out1: u32, out2: u32, out_len: u32)`)
+/// and returns the absolute address of the matched entry (i.e.
+/// `table_addr + 4 + idx * 20`), or `0` on miss. Callers load `out_len`
+/// from `entry + 16` and the up-to-three output codepoints from
+/// `entry + 4 / 8 / 12`.
+///
+/// The address-return ABI keeps the helper signature at a single i32
+/// while letting callers fetch every output slot without a second
+/// helper round-trip — matches the shape of `__decomp_lookup` (which
+/// also returns a packed integer rather than a scratch handle).
+pub(crate) const FULL_CASEFOLD_LOOKUP_INDEX: u32 = 34;
+
+/// v3++ b-7 reframed: stable slot of the
+/// `__final_sigma_check(s_ptr, byte_offset, cased_addr, ignorable_addr) -> i32`
+/// helper. Returns `1` when `Σ` at `byte_offset` in the input UTF-8
+/// string `s_ptr` is at the end of a word per UAX #21 Final_Sigma —
+/// i.e. preceded by at least one cased codepoint (skipping case-
+/// ignorables), and either followed by only case-ignorables until end
+/// of string or followed by a non-cased non-ignorable codepoint.
+/// Returns `0` otherwise.
+///
+/// `s_ptr` is a String record pointer (the leading `u32 LE` length
+/// header lives at `s_ptr + 0`; the payload bytes start at
+/// `s_ptr + 4`). The helper does its own UTF-8 reverse / forward
+/// decoding so callers don't need to materialise a codepoint array.
+pub(crate) const FINAL_SIGMA_CHECK_INDEX: u32 = 35;
+
 /// v3++ b-4 case-folding mode driving [`case_fold_body`].
 ///
 /// `Upper` and `Lower` are straight per-codepoint folds against the
@@ -227,6 +258,20 @@ pub struct StdlibFunction {
 ///     decomposition + reorder + composition pass).
 ///   * `30` — `nfkc(String) -> String` (v3++ b-5; compatibility
 ///     decomposition + reorder + composition pass).
+///   * `31` — `upper_locale(String, String) -> String` (v3++ b-6;
+///     locale-aware uppercase via Turkish / Azerbaijani override
+///     table).
+///   * `32` — `lower_locale(String, String) -> String` (v3++ b-6;
+///     locale-aware lowercase).
+///   * `33` — `title_locale(String, String) -> String` (v3++ b-6;
+///     locale-aware title case).
+///   * `34` — `__full_casefold_lookup(cp, table_addr) -> i32` (v3++
+///     b-7 reframed; binary-searches the FULL 20-byte-stride table.
+///     Returns the entry address on hit, `0` on miss).
+///   * `35` — `__final_sigma_check(s_ptr, byte_offset, cased_addr,
+///     ignorable_addr) -> i32` (v3++ b-7 reframed; UAX #21
+///     Final_Sigma scan — UTF-8 reverse + forward decode, skipping
+///     case-ignorables. Returns `1` for word-final, `0` otherwise).
 pub fn builtin_stdlib() -> Vec<StdlibFunction> {
     vec![
         length_string_to_int(),
@@ -268,6 +313,10 @@ pub fn builtin_stdlib() -> Vec<StdlibFunction> {
         upper_locale_string(),
         lower_locale_string(),
         title_locale_string(),
+        // v3++ b-7 reframed: FULL multi-codepoint + final-sigma helpers
+        // shared by every (locale-aware or default) case-fold body.
+        full_casefold_lookup_helper(),
+        final_sigma_check_helper(),
     ]
 }
 
@@ -998,6 +1047,33 @@ fn case_fold_body_inner(
     // we know we hit the override, otherwise we fall back to the
     // default table.
     const TURKISH_RESULT: u32 = 13;
+    // v3++ b-7 reframed: `1` when fold_seq actually consulted a
+    // case-folding table (i.e. not a combining mark and not a
+    // Title-mode whitespace pass-through). The multi-cp / final-sigma
+    // overlay only runs when this flag is set; otherwise the existing
+    // single-cp emit path runs unchanged.
+    const FOLD_TABLE_FIRED: u32 = 14;
+    // v3++ b-7 reframed: `1` when the effective per-codepoint mode is
+    // Upper, `0` when it is Lower. For `Upper` / `Lower` bodies this
+    // is a compile-time constant; for `Title` it captures the value of
+    // `at_word_start` **before** the cased-cp consumption clears it.
+    // Used by the FULL multi-cp lookup to pick between the upper and
+    // lower FULL tables.
+    const EFFECTIVE_UPPER: u32 = 15;
+    // v3++ b-7 reframed: matched FULL-table entry address from
+    // `__full_casefold_lookup`. `0` means "no FULL entry" — fall back
+    // to the simple-table FOLDED single-cp emit. On a hit the multi-cp
+    // emit loop reads `out_len` from `FULL_ENTRY + 16` and the three
+    // output codepoints from `FULL_ENTRY + 4 / 8 / 12`.
+    const FULL_ENTRY: u32 = 16;
+    // v3++ b-7 reframed: scratch for the multi-cp emit loop index
+    // (0 .. FULL_OUT_LEN). The loop body writes the indexed output
+    // codepoint into FOLDED and re-runs the existing UTF-8 encode
+    // sequence per slot.
+    const FULL_SLOT_IDX: u32 = 17;
+    // v3++ b-7 reframed: `out_len` (1..=3) read once from the matched
+    // entry so the multi-cp loop's bound stays loop-invariant.
+    const FULL_OUT_LEN: u32 = 18;
 
     // Helper: load the `i`-th byte of the input payload. Pushes one
     // i32 onto the stack.
@@ -1344,6 +1420,20 @@ fn case_fold_body_inner(
     let whitespace_idx = IS_WHITESPACE_INDEX;
     let mut fold_seq: Vec<TaggedOp> = Vec::new();
 
+    // Default state for the multi-cp overlay: no table fired, lower
+    // mode. Each non-passthrough branch flips these as appropriate so
+    // the post-fold stage can dispatch FULL lookup correctly.
+    fold_seq.push(tt(Op::ConstI32(0)));
+    fold_seq.push(tt(Op::LetSet {
+        idx: FOLD_TABLE_FIRED,
+        ty: IrType::I32,
+    }));
+    fold_seq.push(tt(Op::ConstI32(0)));
+    fold_seq.push(tt(Op::LetSet {
+        idx: EFFECTIVE_UPPER,
+        ty: IrType::I32,
+    }));
+
     // is_mark = __is_combining_mark(cp, combining_marks_addr)
     fold_seq.push(tt(Op::LetGet {
         idx: CP,
@@ -1383,7 +1473,10 @@ fn case_fold_body_inner(
     };
 
     let lookup_through_table = |upper: bool| -> Vec<TaggedOp> {
-        // Default path: FOLDED = __casefold_lookup(cp, default-table-addr)
+        // Default path: FOLDED = __casefold_lookup(cp, default-table-addr).
+        // Also flip the multi-cp overlay's gate: the table fired, and
+        // EFFECTIVE_UPPER captures the per-cp mode so the FULL-table
+        // fall-through can pick the right table family.
         let default_seq: Vec<TaggedOp> = vec![
             tt(Op::LetGet {
                 idx: CP,
@@ -1398,6 +1491,16 @@ fn case_fold_body_inner(
             }),
             tt(Op::LetSet {
                 idx: FOLDED,
+                ty: IrType::I32,
+            }),
+            tt(Op::ConstI32(1)),
+            tt(Op::LetSet {
+                idx: FOLD_TABLE_FIRED,
+                ty: IrType::I32,
+            }),
+            tt(Op::ConstI32(if upper { 1 } else { 0 })),
+            tt(Op::LetSet {
+                idx: EFFECTIVE_UPPER,
                 ty: IrType::I32,
             }),
             tt(Op::ConstI32(0)),
@@ -1456,6 +1559,12 @@ fn case_fold_body_inner(
                     result_ty: IrType::I32,
                     then_body: default_seq.clone(),
                     else_body: {
+                        // Turkish hit — `default_seq` is skipped so we
+                        // must mirror its FOLD_TABLE_FIRED /
+                        // EFFECTIVE_UPPER bookkeeping here. Otherwise
+                        // the post-fold FULL / final-sigma overlay
+                        // would see "table did not fire" and emit the
+                        // wrong cp.
                         let mut inner = Vec::new();
                         inner.push(tt(Op::LetGet {
                             idx: TURKISH_RESULT,
@@ -1463,6 +1572,16 @@ fn case_fold_body_inner(
                         }));
                         inner.push(tt(Op::LetSet {
                             idx: FOLDED,
+                            ty: IrType::I32,
+                        }));
+                        inner.push(tt(Op::ConstI32(1)));
+                        inner.push(tt(Op::LetSet {
+                            idx: FOLD_TABLE_FIRED,
+                            ty: IrType::I32,
+                        }));
+                        inner.push(tt(Op::ConstI32(if upper { 1 } else { 0 })));
+                        inner.push(tt(Op::LetSet {
+                            idx: EFFECTIVE_UPPER,
                             ty: IrType::I32,
                         }));
                         inner.push(tt(Op::ConstI32(0)));
@@ -1796,6 +1915,320 @@ fn case_fold_body_inner(
         ty: IrType::I32,
     }));
 
+    // ----- v3++ b-7 reframed multi-cp overlay -----
+    //
+    // Bridges the gap between the simple-table FOLDED single-cp emit
+    // (existing) and the UAX #21 expansions that map a single input
+    // codepoint to up to 3 output codepoints (`ß` -> `SS`, `ﬁ` -> `FI`,
+    // `İ` -> `i` + combining-dot-above, …) plus the Greek final-sigma
+    // context rule (`Σ` -> `ς` at end of word, `σ` otherwise).
+    //
+    // Shape:
+    //   if FOLD_TABLE_FIRED == 0 { <encode FOLDED once> }
+    //   else if cp == 0x03A3 && EFFECTIVE_UPPER == 0 {
+    //       // final-sigma override; never multi-cp
+    //       if __final_sigma_check(s, i, cased, ignorable) == 1 {
+    //           FOLDED = 0x03C2  (ς)
+    //       }
+    //       <encode FOLDED once>
+    //   } else {
+    //       FULL_ENTRY = __full_casefold_lookup(cp,
+    //           FullCaseFoldTableAddr{ upper: EFFECTIVE_UPPER })
+    //       if FULL_ENTRY != 0 {
+    //           FULL_OUT_LEN = load(FULL_ENTRY + 16)
+    //           for slot in 0..FULL_OUT_LEN {
+    //               FOLDED = load(FULL_ENTRY + 4 + 4*slot)
+    //               <encode FOLDED once>
+    //           }
+    //       } else {
+    //           <encode FOLDED once>
+    //       }
+    //   }
+    //
+    // The "Turkish FULL" path is *not* needed today — every entry in
+    // the Turkish override table is 1:1, so the simple-table path
+    // (already wired through `lookup_through_table`) already handles
+    // them via `encode_simple_view_bytes`. If a future UCD revision
+    // adds a multi-cp Turkish override, this overlay is the place to
+    // dispatch the alternate FULL table.
+
+    // Helper: emit FOLDED via the existing encode_seq, cloned once
+    // per call site (FOLDED is mutated between emits in the multi-cp
+    // loop). The clone is cheap — the IR tree is small.
+    let emit_folded_once = || encode_seq.clone();
+
+    // Helper: load `FULL_ENTRY + lit_off` as i32. Used to fetch
+    // out_len and the three output codepoints.
+    let load_full_entry_off = |lit_off: u32| -> Vec<TaggedOp> {
+        vec![
+            tt(Op::LetGet {
+                idx: FULL_ENTRY,
+                ty: IrType::I32,
+            }),
+            tt(Op::LoadI32AtAbsolute { offset: lit_off }),
+        ]
+    };
+
+    // ----- FULL lookup helpers -----
+    // Compile the FULL-table lookup once per `EFFECTIVE_UPPER` value.
+    // For Title mode both compile-time options are reachable; for
+    // Upper / Lower only one is. We always emit both branches for
+    // simplicity — the dead arm is pruned by cranelift / wasm DCE.
+    let full_lookup_for = |upper: bool| -> Vec<TaggedOp> {
+        vec![
+            tt(Op::LetGet {
+                idx: CP,
+                ty: IrType::I32,
+            }),
+            tt(Op::FullCaseFoldTableAddr { upper }),
+            tt(Op::Call {
+                fn_index: FULL_CASEFOLD_LOOKUP_INDEX,
+                arg_count: 2,
+                param_tys: vec![IrType::I32, IrType::I32],
+                ret_ty: IrType::I32,
+            }),
+            tt(Op::LetSet {
+                idx: FULL_ENTRY,
+                ty: IrType::I32,
+            }),
+        ]
+    };
+
+    // FULL_ENTRY = upper ? full_lookup(true) : full_lookup(false).
+    // Branches on EFFECTIVE_UPPER at runtime so Title mode picks the
+    // right table per codepoint.
+    let full_lookup_dispatch: Vec<TaggedOp> = vec![
+        tt(Op::LetGet {
+            idx: EFFECTIVE_UPPER,
+            ty: IrType::I32,
+        }),
+        tt(Op::ConstI32(1)),
+        tt(Op::Eq(IrType::I32)),
+        tt(Op::If {
+            result_ty: IrType::I32,
+            then_body: {
+                let mut t = full_lookup_for(true);
+                t.push(tt(Op::ConstI32(0)));
+                t
+            },
+            else_body: {
+                let mut e = full_lookup_for(false);
+                e.push(tt(Op::ConstI32(0)));
+                e
+            },
+        }),
+        tt(Op::LetSet {
+            idx: SINK,
+            ty: IrType::I32,
+        }),
+    ];
+
+    // Multi-cp emit loop: read FULL_OUT_LEN once, then iterate
+    // FULL_SLOT_IDX from 0 to FULL_OUT_LEN; each iteration loads the
+    // slot's codepoint into FOLDED and runs the existing encode_seq.
+    let multi_emit_loop: Vec<TaggedOp> = {
+        let mut v: Vec<TaggedOp> = Vec::new();
+        // FULL_OUT_LEN = load(FULL_ENTRY + 16)
+        v.extend(load_full_entry_off(16));
+        v.push(tt(Op::LetSet {
+            idx: FULL_OUT_LEN,
+            ty: IrType::I32,
+        }));
+        // FULL_SLOT_IDX = 0
+        v.push(tt(Op::ConstI32(0)));
+        v.push(tt(Op::LetSet {
+            idx: FULL_SLOT_IDX,
+            ty: IrType::I32,
+        }));
+        v.push(tt(Op::Block {
+            result_ty: None,
+            body: vec![tt(Op::Loop {
+                result_ty: None,
+                body: {
+                    let mut l: Vec<TaggedOp> = Vec::new();
+                    // exit when FULL_SLOT_IDX >= FULL_OUT_LEN
+                    l.push(tt(Op::LetGet {
+                        idx: FULL_SLOT_IDX,
+                        ty: IrType::I32,
+                    }));
+                    l.push(tt(Op::LetGet {
+                        idx: FULL_OUT_LEN,
+                        ty: IrType::I32,
+                    }));
+                    l.push(tt(Op::Ge(IrType::I32)));
+                    l.push(tt(Op::BrIf { label_depth: 1 }));
+                    // FOLDED = load(FULL_ENTRY + 4 + 4 * FULL_SLOT_IDX)
+                    l.push(tt(Op::LetGet {
+                        idx: FULL_ENTRY,
+                        ty: IrType::I32,
+                    }));
+                    l.push(tt(Op::ConstI32(4)));
+                    l.push(tt(Op::Add(IrType::I32)));
+                    l.push(tt(Op::LetGet {
+                        idx: FULL_SLOT_IDX,
+                        ty: IrType::I32,
+                    }));
+                    l.push(tt(Op::ConstI32(4)));
+                    l.push(tt(Op::Mul(IrType::I32)));
+                    l.push(tt(Op::Add(IrType::I32)));
+                    l.push(tt(Op::LoadI32AtAbsolute { offset: 0 }));
+                    l.push(tt(Op::LetSet {
+                        idx: FOLDED,
+                        ty: IrType::I32,
+                    }));
+                    // <encode FOLDED once>
+                    l.extend(emit_folded_once());
+                    // FULL_SLOT_IDX += 1
+                    l.push(tt(Op::LetGet {
+                        idx: FULL_SLOT_IDX,
+                        ty: IrType::I32,
+                    }));
+                    l.push(tt(Op::ConstI32(1)));
+                    l.push(tt(Op::Add(IrType::I32)));
+                    l.push(tt(Op::LetSet {
+                        idx: FULL_SLOT_IDX,
+                        ty: IrType::I32,
+                    }));
+                    l.push(tt(Op::Br { label_depth: 0 }));
+                    l
+                },
+            })],
+        }));
+        v
+    };
+
+    // Final-sigma override: only for the Lower effective mode at cp =
+    // U+03A3. The simple table already maps Σ -> σ (U+03C3); we
+    // override to ς (U+03C2) when the context-scan helper returns 1.
+    let final_sigma_override: Vec<TaggedOp> = vec![
+        tt(Op::LocalGet(0)),
+        tt(Op::LetGet {
+            idx: I,
+            ty: IrType::I32,
+        }),
+        tt(Op::CasedRangesAddr),
+        tt(Op::CaseIgnorableRangesAddr),
+        tt(Op::Call {
+            fn_index: FINAL_SIGMA_CHECK_INDEX,
+            arg_count: 4,
+            param_tys: vec![IrType::I32, IrType::I32, IrType::I32, IrType::I32],
+            ret_ty: IrType::I32,
+        }),
+        tt(Op::ConstI32(1)),
+        tt(Op::Eq(IrType::I32)),
+        tt(Op::If {
+            result_ty: IrType::I32,
+            then_body: vec![
+                tt(Op::ConstI32(0x03C2)),
+                tt(Op::LetSet {
+                    idx: FOLDED,
+                    ty: IrType::I32,
+                }),
+                tt(Op::ConstI32(0)),
+            ],
+            else_body: vec![tt(Op::ConstI32(0))],
+        }),
+        tt(Op::LetSet {
+            idx: SINK,
+            ty: IrType::I32,
+        }),
+    ];
+
+    // Sigma-detection guard: cp == 0x03A3 && EFFECTIVE_UPPER == 0.
+    // Two separate Eq results sum to 2 exactly when both hold, then
+    // an `== 2` collapses to the boolean outcome.
+    let is_sigma_lower: Vec<TaggedOp> = vec![
+        tt(Op::LetGet {
+            idx: CP,
+            ty: IrType::I32,
+        }),
+        tt(Op::ConstI32(0x03A3)),
+        tt(Op::Eq(IrType::I32)),
+        tt(Op::LetGet {
+            idx: EFFECTIVE_UPPER,
+            ty: IrType::I32,
+        }),
+        tt(Op::ConstI32(0)),
+        tt(Op::Eq(IrType::I32)),
+        tt(Op::Add(IrType::I32)),
+        tt(Op::ConstI32(2)),
+        tt(Op::Eq(IrType::I32)),
+    ];
+
+    let multi_cp_overlay: Vec<TaggedOp> = vec![
+        tt(Op::LetGet {
+            idx: FOLD_TABLE_FIRED,
+            ty: IrType::I32,
+        }),
+        tt(Op::ConstI32(0)),
+        tt(Op::Eq(IrType::I32)),
+        tt(Op::If {
+            result_ty: IrType::I32,
+            then_body: {
+                // No table fired (combining mark, Title-mode
+                // whitespace) — single-cp passthrough.
+                let mut t = emit_folded_once();
+                t.push(tt(Op::ConstI32(0)));
+                t
+            },
+            else_body: {
+                let mut e: Vec<TaggedOp> = Vec::new();
+                // Inner If: sigma-lower?
+                e.extend(is_sigma_lower);
+                e.push(tt(Op::If {
+                    result_ty: IrType::I32,
+                    then_body: {
+                        let mut t = final_sigma_override;
+                        t.extend(emit_folded_once());
+                        t.push(tt(Op::ConstI32(0)));
+                        t
+                    },
+                    else_body: {
+                        // Try FULL lookup.
+                        let mut e2 = full_lookup_dispatch;
+                        // if FULL_ENTRY != 0 { multi-emit } else
+                        // { single-emit }
+                        e2.push(tt(Op::LetGet {
+                            idx: FULL_ENTRY,
+                            ty: IrType::I32,
+                        }));
+                        e2.push(tt(Op::ConstI32(0)));
+                        e2.push(tt(Op::Ne(IrType::I32)));
+                        e2.push(tt(Op::If {
+                            result_ty: IrType::I32,
+                            then_body: {
+                                let mut t = multi_emit_loop;
+                                t.push(tt(Op::ConstI32(0)));
+                                t
+                            },
+                            else_body: {
+                                let mut t = emit_folded_once();
+                                t.push(tt(Op::ConstI32(0)));
+                                t
+                            },
+                        }));
+                        e2.push(tt(Op::LetSet {
+                            idx: SINK,
+                            ty: IrType::I32,
+                        }));
+                        e2.push(tt(Op::ConstI32(0)));
+                        e2
+                    },
+                }));
+                e.push(tt(Op::LetSet {
+                    idx: SINK,
+                    ty: IrType::I32,
+                }));
+                e.push(tt(Op::ConstI32(0)));
+                e
+            },
+        }),
+        tt(Op::LetSet {
+            idx: SINK,
+            ty: IrType::I32,
+        }),
+    ];
+
     // ----- assemble the full body -----
     let mut body: Vec<TaggedOp> = Vec::new();
     // s_len = i32.load(s, 0)
@@ -2036,10 +2469,12 @@ fn case_fold_body_inner(
     }));
     loop_body.push(tt(Op::Ge(IrType::I32)));
     loop_body.push(tt(Op::BrIf { label_depth: 1 }));
-    // decode → fold → encode
+    // decode -> fold -> (b-7 reframed) multi-cp / final-sigma overlay
+    // wraps the original encode_seq so the loop covers FULL and Σ
+    // expansions in addition to the simple 1:1 case-fold map.
     loop_body.extend(decode_seq);
     loop_body.extend(fold_seq);
-    loop_body.extend(encode_seq);
+    loop_body.extend(multi_cp_overlay);
     // i += cp_bytes
     loop_body.push(tt(Op::LetGet {
         idx: I,
@@ -6783,6 +7218,960 @@ fn list_int_fold() -> StdlibFunction {
     }
 }
 
+/// v3++ b-7 reframed internal helper:
+/// `__full_casefold_lookup(cp: I32, table_addr: I32) -> I32`.
+///
+/// Binary-searches the FULL multi-codepoint case-folding table embedded
+/// in the const data section. The table layout matches
+/// [`crate::full_case_folding::encode_full_table_bytes`]:
+///
+/// ```text
+/// [count: u32 LE]
+/// [(in: u32 LE, out0: u32 LE, out1: u32 LE, out2: u32 LE,
+///   out_len: u32 LE) x count]
+/// ```
+///
+/// 20-byte per-entry stride; the rebase formula is
+/// `table_addr + 4 + mid * 20`.
+///
+/// Return value: the absolute address of the matched entry on a hit
+/// (so the caller can load `out_len` from `entry + 16` and the
+/// up-to-three output codepoints from `entry + 4`, `+ 8`, `+ 12`), or
+/// `0` on a miss. The `0` sentinel is unambiguous because a valid
+/// entry address is always at least `table_addr + 4` — and codegen
+/// never plants the const pool at address `0` of the runtime arena
+/// (the prologue reserves a guard region).
+///
+/// Pure mirror of [`casefold_lookup_helper`] modulo the stride and the
+/// "return entry address" twist; the binary-search shape is identical.
+///
+/// Locals:
+///   * 0 — `count: I32`   table entry count (loaded from header)
+///   * 1 — `lo:    I32`   inclusive low bound of the search window
+///   * 2 — `hi:    I32`   exclusive high bound of the search window
+///   * 3 — `mid:   I32`   midpoint of the current window
+///   * 4 — `entry: I32`   absolute address of the entry's input slot
+///   * 5 — `key:   I32`   decoded input codepoint of the midpoint
+///   * 6 — `sink:  I32`   drop slot for If-arm placeholders
+///   * 7 — `result: I32`  matched entry address; defaults to 0 (miss)
+#[allow(clippy::vec_init_then_push)]
+fn full_casefold_lookup_helper() -> StdlibFunction {
+    const COUNT: u32 = 0;
+    const LO: u32 = 1;
+    const HI: u32 = 2;
+    const MID: u32 = 3;
+    const ENTRY: u32 = 4;
+    const KEY: u32 = 5;
+    const SINK: u32 = 6;
+    const RESULT: u32 = 7;
+    StdlibFunction {
+        name: "__full_casefold_lookup",
+        params: vec![IrType::I32, IrType::I32],
+        ret: IrType::I32,
+        body: vec![
+            // count = i32.load(table_addr + 0)
+            tt(Op::LocalGet(1)),
+            tt(Op::LoadI32AtAbsolute { offset: 0 }),
+            tt(Op::LetSet {
+                idx: COUNT,
+                ty: IrType::I32,
+            }),
+            // lo = 0; hi = count
+            tt(Op::ConstI32(0)),
+            tt(Op::LetSet {
+                idx: LO,
+                ty: IrType::I32,
+            }),
+            tt(Op::LetGet {
+                idx: COUNT,
+                ty: IrType::I32,
+            }),
+            tt(Op::LetSet {
+                idx: HI,
+                ty: IrType::I32,
+            }),
+            // result = 0 (miss sentinel)
+            tt(Op::ConstI32(0)),
+            tt(Op::LetSet {
+                idx: RESULT,
+                ty: IrType::I32,
+            }),
+            tt(Op::Block {
+                result_ty: None,
+                body: vec![tt(Op::Loop {
+                    result_ty: None,
+                    body: vec![
+                        // exit when lo >= hi
+                        tt(Op::LetGet {
+                            idx: LO,
+                            ty: IrType::I32,
+                        }),
+                        tt(Op::LetGet {
+                            idx: HI,
+                            ty: IrType::I32,
+                        }),
+                        tt(Op::Ge(IrType::I32)),
+                        tt(Op::BrIf { label_depth: 1 }),
+                        // mid = (lo + hi) / 2
+                        tt(Op::LetGet {
+                            idx: LO,
+                            ty: IrType::I32,
+                        }),
+                        tt(Op::LetGet {
+                            idx: HI,
+                            ty: IrType::I32,
+                        }),
+                        tt(Op::Add(IrType::I32)),
+                        tt(Op::ConstI32(2)),
+                        tt(Op::Div(IrType::I32)),
+                        tt(Op::LetSet {
+                            idx: MID,
+                            ty: IrType::I32,
+                        }),
+                        // entry = table_addr + 4 + mid * 20
+                        tt(Op::LocalGet(1)),
+                        tt(Op::ConstI32(4)),
+                        tt(Op::Add(IrType::I32)),
+                        tt(Op::LetGet {
+                            idx: MID,
+                            ty: IrType::I32,
+                        }),
+                        tt(Op::ConstI32(20)),
+                        tt(Op::Mul(IrType::I32)),
+                        tt(Op::Add(IrType::I32)),
+                        tt(Op::LetSet {
+                            idx: ENTRY,
+                            ty: IrType::I32,
+                        }),
+                        // key = i32.load(entry + 0)
+                        tt(Op::LetGet {
+                            idx: ENTRY,
+                            ty: IrType::I32,
+                        }),
+                        tt(Op::LoadI32AtAbsolute { offset: 0 }),
+                        tt(Op::LetSet {
+                            idx: KEY,
+                            ty: IrType::I32,
+                        }),
+                        // if key == cp { RESULT = entry; br 2 }
+                        tt(Op::LetGet {
+                            idx: KEY,
+                            ty: IrType::I32,
+                        }),
+                        tt(Op::LocalGet(0)),
+                        tt(Op::Eq(IrType::I32)),
+                        tt(Op::If {
+                            result_ty: IrType::I32,
+                            then_body: vec![
+                                tt(Op::LetGet {
+                                    idx: ENTRY,
+                                    ty: IrType::I32,
+                                }),
+                                tt(Op::LetSet {
+                                    idx: RESULT,
+                                    ty: IrType::I32,
+                                }),
+                                tt(Op::Br { label_depth: 2 }),
+                                tt(Op::ConstI32(0)),
+                            ],
+                            else_body: vec![tt(Op::ConstI32(0))],
+                        }),
+                        tt(Op::LetSet {
+                            idx: SINK,
+                            ty: IrType::I32,
+                        }),
+                        // if key < cp { lo = mid + 1 } else { hi = mid }
+                        tt(Op::LetGet {
+                            idx: KEY,
+                            ty: IrType::I32,
+                        }),
+                        tt(Op::LocalGet(0)),
+                        tt(Op::Lt(IrType::I32)),
+                        tt(Op::If {
+                            result_ty: IrType::I32,
+                            then_body: vec![
+                                tt(Op::LetGet {
+                                    idx: MID,
+                                    ty: IrType::I32,
+                                }),
+                                tt(Op::ConstI32(1)),
+                                tt(Op::Add(IrType::I32)),
+                                tt(Op::LetSet {
+                                    idx: LO,
+                                    ty: IrType::I32,
+                                }),
+                                tt(Op::ConstI32(0)),
+                            ],
+                            else_body: vec![
+                                tt(Op::LetGet {
+                                    idx: MID,
+                                    ty: IrType::I32,
+                                }),
+                                tt(Op::LetSet {
+                                    idx: HI,
+                                    ty: IrType::I32,
+                                }),
+                                tt(Op::ConstI32(0)),
+                            ],
+                        }),
+                        tt(Op::LetSet {
+                            idx: SINK,
+                            ty: IrType::I32,
+                        }),
+                        tt(Op::Br { label_depth: 0 }),
+                    ],
+                })],
+            }),
+            tt(Op::LetGet {
+                idx: RESULT,
+                ty: IrType::I32,
+            }),
+            tt(Op::Return),
+        ],
+    }
+}
+
+/// v3++ b-7 reframed internal helper:
+/// `__final_sigma_check(s_ptr, byte_offset, cased_addr, ignorable_addr) -> i32`.
+///
+/// UAX #21 Final_Sigma context test. Returns `1` when `Σ` (U+03A3) at
+/// `byte_offset` inside the UTF-8 string `s_ptr` is at the end of a
+/// word — preceded by at least one cased codepoint (skipping case-
+/// ignorables), and followed only by case-ignorables until the end of
+/// the string (or by a non-cased non-ignorable codepoint). Returns `0`
+/// otherwise.
+///
+/// Tree-walk mirror: [`crate::full_case_folding::is_final_sigma_context`].
+///
+/// String layout: `[len: u32 LE][bytes × len]`. `s_ptr` points at the
+/// header; payload bytes live at `s_ptr + 4`. `byte_offset` is the
+/// payload-relative offset of the sigma's first UTF-8 byte (0xCE
+/// 0xA3); the helper scans `[..byte_offset)` backwards and
+/// `[byte_offset + 2..)` forwards, decoding one codepoint at a time.
+///
+/// The UTF-8 reverse decode finds the start byte by scanning leftward
+/// until a byte with the top two bits != `10` is seen (i.e. either
+/// ASCII < 0x80 or a 0xC0..=0xFF lead byte). The forward decode reuses
+/// the same byte-length-from-lead-byte arithmetic as
+/// [`case_fold_body_inner`].
+///
+/// Calls `__is_combining_mark`-shaped range membership against the
+/// `cased_addr` and `ignorable_addr` tables (both share the
+/// `[count: u32 LE][(start: u32, end: u32) x count]` layout); the
+/// helper reaches them via the [`Op::CasedRangesAddr`] /
+/// [`Op::CaseIgnorableRangesAddr`] addresses the caller threads in.
+///
+/// Locals:
+///   * 0  — `s_len: I32`     payload byte length (from header)
+///   * 1  — `back:  I32`     reverse scan byte cursor
+///   * 2  — `fwd:   I32`     forward scan byte cursor
+///   * 3  — `cp:    I32`     codepoint of the currently inspected byte
+///   * 4  — `b0:    I32`     scratch for a UTF-8 lead/start byte
+///   * 5  — `b1:    I32`     scratch for the byte at offset 1
+///   * 6  — `b2:    I32`     scratch for the byte at offset 2
+///   * 7  — `b3:    I32`     scratch for the byte at offset 3
+///   * 8  — `width: I32`     byte width of the decoded codepoint
+///   * 9  — `sink:  I32`     drop slot for If-arm placeholders
+///   * 10 — `result: I32`    accumulated return (0 = not final)
+///   * 11 — `seen_cased_before: I32`  left-scan saw a cased cp
+///   * 12 — `start: I32`     scratch for reverse-walk start cursor
+#[allow(clippy::vec_init_then_push, clippy::too_many_lines)]
+fn final_sigma_check_helper() -> StdlibFunction {
+    const S_LEN: u32 = 0;
+    const BACK: u32 = 1;
+    const FWD: u32 = 2;
+    const CP: u32 = 3;
+    const B0: u32 = 4;
+    const B1: u32 = 5;
+    const B2: u32 = 6;
+    const B3: u32 = 7;
+    const WIDTH: u32 = 8;
+    const SINK: u32 = 9;
+    const RESULT: u32 = 10;
+    const SEEN_CASED_BEFORE: u32 = 11;
+    const START: u32 = 12;
+
+    // Param indices:
+    //   LocalGet(0) = s_ptr (String record pointer)
+    //   LocalGet(1) = byte_offset of the sigma's first UTF-8 byte
+    //   LocalGet(2) = cased_ranges_addr
+    //   LocalGet(3) = ignorable_ranges_addr
+
+    let combining_idx = COMBINING_MARK_INDEX; // reused as generic range-membership
+
+    // Helper: invoke `__is_combining_mark(cp, table_addr)` against an
+    // arbitrary range table. Both `CASED_RANGES` and
+    // `CASE_IGNORABLE_RANGES` share the same 8-byte stride layout so
+    // the helper works without modification.
+    let range_lookup = |cp_idx: u32, table_local_idx: u32| -> Vec<TaggedOp> {
+        vec![
+            tt(Op::LetGet {
+                idx: cp_idx,
+                ty: IrType::I32,
+            }),
+            tt(Op::LocalGet(table_local_idx)),
+            tt(Op::Call {
+                fn_index: combining_idx,
+                arg_count: 2,
+                param_tys: vec![IrType::I32, IrType::I32],
+                ret_ty: IrType::I32,
+            }),
+        ]
+    };
+
+    // Helper: load i32u byte at `s_ptr + 4 + idx`. Pushes one i32 on
+    // the stack.
+    let load_payload_byte = |idx_local: u32| -> Vec<TaggedOp> {
+        vec![
+            tt(Op::LocalGet(0)),
+            tt(Op::ConstI32(4)),
+            tt(Op::Add(IrType::I32)),
+            tt(Op::LetGet {
+                idx: idx_local,
+                ty: IrType::I32,
+            }),
+            tt(Op::Add(IrType::I32)),
+            tt(Op::LoadI8UAtAbsolute { offset: 0 }),
+        ]
+    };
+
+    // Helper: load i32u byte at `s_ptr + 4 + base_local + literal_off`.
+    let load_payload_byte_off = |base_local: u32, lit_off: i32| -> Vec<TaggedOp> {
+        vec![
+            tt(Op::LocalGet(0)),
+            tt(Op::ConstI32(4 + lit_off)),
+            tt(Op::Add(IrType::I32)),
+            tt(Op::LetGet {
+                idx: base_local,
+                ty: IrType::I32,
+            }),
+            tt(Op::Add(IrType::I32)),
+            tt(Op::LoadI8UAtAbsolute { offset: 0 }),
+        ]
+    };
+
+    // Forward UTF-8 decode at `fwd_idx_local`: reads up to 4 bytes,
+    // writes the codepoint into CP and the byte width into WIDTH.
+    // Mirrors the 4-arm split in `case_fold_body_inner`. Defensive:
+    // when the lead byte is malformed (< 0xC2 in the non-ASCII path,
+    // or beyond 0xF7), the helper still produces *some* well-formed
+    // value — we set CP to the lead byte and WIDTH to 1 so the scan
+    // makes forward progress. This path is only ever reached on
+    // already-valid UTF-8 (callers guarantee the input is a valid
+    // String record), so the defensive branches are dead in practice;
+    // they exist only to keep the verifier happy.
+    let forward_decode = |idx_local: u32| -> Vec<TaggedOp> {
+        let mut seq: Vec<TaggedOp> = Vec::new();
+        // b0 = byte at fwd
+        seq.extend(load_payload_byte(idx_local));
+        seq.push(tt(Op::LetSet {
+            idx: B0,
+            ty: IrType::I32,
+        }));
+        // if b0 < 0x80 { cp = b0; width = 1 }
+        seq.push(tt(Op::LetGet {
+            idx: B0,
+            ty: IrType::I32,
+        }));
+        seq.push(tt(Op::ConstI32(0x80)));
+        seq.push(tt(Op::Lt(IrType::I32)));
+        seq.push(tt(Op::If {
+            result_ty: IrType::I32,
+            then_body: vec![
+                tt(Op::LetGet {
+                    idx: B0,
+                    ty: IrType::I32,
+                }),
+                tt(Op::LetSet {
+                    idx: CP,
+                    ty: IrType::I32,
+                }),
+                tt(Op::ConstI32(1)),
+                tt(Op::LetSet {
+                    idx: WIDTH,
+                    ty: IrType::I32,
+                }),
+                tt(Op::ConstI32(0)),
+            ],
+            else_body: {
+                let mut e: Vec<TaggedOp> = Vec::new();
+                // if b0 < 0xE0 { 2-byte }
+                e.push(tt(Op::LetGet {
+                    idx: B0,
+                    ty: IrType::I32,
+                }));
+                e.push(tt(Op::ConstI32(0xE0)));
+                e.push(tt(Op::Lt(IrType::I32)));
+                e.push(tt(Op::If {
+                    result_ty: IrType::I32,
+                    then_body: {
+                        let mut t: Vec<TaggedOp> = Vec::new();
+                        t.extend(load_payload_byte_off(idx_local, 1));
+                        t.push(tt(Op::LetSet {
+                            idx: B1,
+                            ty: IrType::I32,
+                        }));
+                        // cp = (b0 & 0x1F) * 64 + (b1 & 0x3F)
+                        t.push(tt(Op::LetGet {
+                            idx: B0,
+                            ty: IrType::I32,
+                        }));
+                        t.push(tt(Op::ConstI32(0x1F)));
+                        t.push(tt(Op::BitAnd(IrType::I32)));
+                        t.push(tt(Op::ConstI32(64)));
+                        t.push(tt(Op::Mul(IrType::I32)));
+                        t.push(tt(Op::LetGet {
+                            idx: B1,
+                            ty: IrType::I32,
+                        }));
+                        t.push(tt(Op::ConstI32(0x3F)));
+                        t.push(tt(Op::BitAnd(IrType::I32)));
+                        t.push(tt(Op::Add(IrType::I32)));
+                        t.push(tt(Op::LetSet {
+                            idx: CP,
+                            ty: IrType::I32,
+                        }));
+                        t.push(tt(Op::ConstI32(2)));
+                        t.push(tt(Op::LetSet {
+                            idx: WIDTH,
+                            ty: IrType::I32,
+                        }));
+                        t.push(tt(Op::ConstI32(0)));
+                        t
+                    },
+                    else_body: {
+                        let mut e2: Vec<TaggedOp> = Vec::new();
+                        // if b0 < 0xF0 { 3-byte }
+                        e2.push(tt(Op::LetGet {
+                            idx: B0,
+                            ty: IrType::I32,
+                        }));
+                        e2.push(tt(Op::ConstI32(0xF0)));
+                        e2.push(tt(Op::Lt(IrType::I32)));
+                        e2.push(tt(Op::If {
+                            result_ty: IrType::I32,
+                            then_body: {
+                                let mut t: Vec<TaggedOp> = Vec::new();
+                                t.extend(load_payload_byte_off(idx_local, 1));
+                                t.push(tt(Op::LetSet {
+                                    idx: B1,
+                                    ty: IrType::I32,
+                                }));
+                                t.extend(load_payload_byte_off(idx_local, 2));
+                                t.push(tt(Op::LetSet {
+                                    idx: B2,
+                                    ty: IrType::I32,
+                                }));
+                                // cp = (b0 & 0x0F)*4096 + (b1 & 0x3F)*64 + (b2 & 0x3F)
+                                t.push(tt(Op::LetGet {
+                                    idx: B0,
+                                    ty: IrType::I32,
+                                }));
+                                t.push(tt(Op::ConstI32(0x0F)));
+                                t.push(tt(Op::BitAnd(IrType::I32)));
+                                t.push(tt(Op::ConstI32(4096)));
+                                t.push(tt(Op::Mul(IrType::I32)));
+                                t.push(tt(Op::LetGet {
+                                    idx: B1,
+                                    ty: IrType::I32,
+                                }));
+                                t.push(tt(Op::ConstI32(0x3F)));
+                                t.push(tt(Op::BitAnd(IrType::I32)));
+                                t.push(tt(Op::ConstI32(64)));
+                                t.push(tt(Op::Mul(IrType::I32)));
+                                t.push(tt(Op::Add(IrType::I32)));
+                                t.push(tt(Op::LetGet {
+                                    idx: B2,
+                                    ty: IrType::I32,
+                                }));
+                                t.push(tt(Op::ConstI32(0x3F)));
+                                t.push(tt(Op::BitAnd(IrType::I32)));
+                                t.push(tt(Op::Add(IrType::I32)));
+                                t.push(tt(Op::LetSet {
+                                    idx: CP,
+                                    ty: IrType::I32,
+                                }));
+                                t.push(tt(Op::ConstI32(3)));
+                                t.push(tt(Op::LetSet {
+                                    idx: WIDTH,
+                                    ty: IrType::I32,
+                                }));
+                                t.push(tt(Op::ConstI32(0)));
+                                t
+                            },
+                            else_body: {
+                                // 4-byte (0xF0..0xF7 assumed; defensive
+                                // tail when the byte is beyond 0xF7
+                                // collapses to the 4-byte arm and lets
+                                // the scan move past it).
+                                let mut t: Vec<TaggedOp> = Vec::new();
+                                t.extend(load_payload_byte_off(idx_local, 1));
+                                t.push(tt(Op::LetSet {
+                                    idx: B1,
+                                    ty: IrType::I32,
+                                }));
+                                t.extend(load_payload_byte_off(idx_local, 2));
+                                t.push(tt(Op::LetSet {
+                                    idx: B2,
+                                    ty: IrType::I32,
+                                }));
+                                t.extend(load_payload_byte_off(idx_local, 3));
+                                t.push(tt(Op::LetSet {
+                                    idx: B3,
+                                    ty: IrType::I32,
+                                }));
+                                // cp = (b0 & 0x07)*262144 + (b1 & 0x3F)*4096
+                                //    + (b2 & 0x3F)*64 + (b3 & 0x3F)
+                                t.push(tt(Op::LetGet {
+                                    idx: B0,
+                                    ty: IrType::I32,
+                                }));
+                                t.push(tt(Op::ConstI32(0x07)));
+                                t.push(tt(Op::BitAnd(IrType::I32)));
+                                t.push(tt(Op::ConstI32(262144)));
+                                t.push(tt(Op::Mul(IrType::I32)));
+                                t.push(tt(Op::LetGet {
+                                    idx: B1,
+                                    ty: IrType::I32,
+                                }));
+                                t.push(tt(Op::ConstI32(0x3F)));
+                                t.push(tt(Op::BitAnd(IrType::I32)));
+                                t.push(tt(Op::ConstI32(4096)));
+                                t.push(tt(Op::Mul(IrType::I32)));
+                                t.push(tt(Op::Add(IrType::I32)));
+                                t.push(tt(Op::LetGet {
+                                    idx: B2,
+                                    ty: IrType::I32,
+                                }));
+                                t.push(tt(Op::ConstI32(0x3F)));
+                                t.push(tt(Op::BitAnd(IrType::I32)));
+                                t.push(tt(Op::ConstI32(64)));
+                                t.push(tt(Op::Mul(IrType::I32)));
+                                t.push(tt(Op::Add(IrType::I32)));
+                                t.push(tt(Op::LetGet {
+                                    idx: B3,
+                                    ty: IrType::I32,
+                                }));
+                                t.push(tt(Op::ConstI32(0x3F)));
+                                t.push(tt(Op::BitAnd(IrType::I32)));
+                                t.push(tt(Op::Add(IrType::I32)));
+                                t.push(tt(Op::LetSet {
+                                    idx: CP,
+                                    ty: IrType::I32,
+                                }));
+                                t.push(tt(Op::ConstI32(4)));
+                                t.push(tt(Op::LetSet {
+                                    idx: WIDTH,
+                                    ty: IrType::I32,
+                                }));
+                                t.push(tt(Op::ConstI32(0)));
+                                t
+                            },
+                        }));
+                        e2
+                    },
+                }));
+                e
+            },
+        }));
+        seq.push(tt(Op::LetSet {
+            idx: SINK,
+            ty: IrType::I32,
+        }));
+        seq
+    };
+
+    // Reverse UTF-8 decode terminating at the byte just before
+    // `back_idx_local`. Walks backwards by up to 4 bytes until a byte
+    // whose top two bits != `10` appears (that's the lead byte of the
+    // preceding codepoint). Writes CP and WIDTH; updates `back_idx_local`
+    // to point at the lead byte of the decoded codepoint (so a
+    // subsequent iteration can keep walking left from `back_idx_local`).
+    //
+    // Strategy: store the candidate lead offset in START, decrement
+    // `back_idx_local` to start scanning from `back - 1`, then probe
+    // up to 4 leftward bytes. On a hit, set `back = start` and forward-
+    // decode from there to fill CP/WIDTH. Forward-decoding the one
+    // codepoint at the freshly-located start guarantees the cp value
+    // matches the canonical 4-arm decode shape — re-using the same
+    // forward decode keeps the two paths byte-identical.
+    let reverse_decode = |back_idx_local: u32| -> Vec<TaggedOp> {
+        let mut seq: Vec<TaggedOp> = Vec::new();
+        // start = back - 1
+        seq.push(tt(Op::LetGet {
+            idx: back_idx_local,
+            ty: IrType::I32,
+        }));
+        seq.push(tt(Op::ConstI32(1)));
+        seq.push(tt(Op::Sub(IrType::I32)));
+        seq.push(tt(Op::LetSet {
+            idx: START,
+            ty: IrType::I32,
+        }));
+        // probe leftwards: while (byte at start) & 0xC0 == 0x80 and we
+        // haven't walked past 3 bytes already, start -= 1. Block + Br
+        // shape so we can break early on a lead byte.
+        seq.push(tt(Op::Block {
+            result_ty: None,
+            body: vec![tt(Op::Loop {
+                result_ty: None,
+                body: vec![
+                    // if start < 0 || (back - start) > 4 { br 1 }
+                    // i.e. we've gone too far — give up and decode a
+                    // single byte. (Shouldn't happen on valid UTF-8.)
+                    tt(Op::LetGet {
+                        idx: START,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::ConstI32(0)),
+                    tt(Op::Lt(IrType::I32)),
+                    tt(Op::BrIf { label_depth: 1 }),
+                    // Inspect byte at START.
+                    tt(Op::LocalGet(0)),
+                    tt(Op::ConstI32(4)),
+                    tt(Op::Add(IrType::I32)),
+                    tt(Op::LetGet {
+                        idx: START,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::Add(IrType::I32)),
+                    tt(Op::LoadI8UAtAbsolute { offset: 0 }),
+                    tt(Op::LetSet {
+                        idx: B0,
+                        ty: IrType::I32,
+                    }),
+                    // is_continuation = (b0 & 0xC0) == 0x80
+                    tt(Op::LetGet {
+                        idx: B0,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::ConstI32(0xC0)),
+                    tt(Op::BitAnd(IrType::I32)),
+                    tt(Op::ConstI32(0x80)),
+                    tt(Op::Eq(IrType::I32)),
+                    tt(Op::If {
+                        result_ty: IrType::I32,
+                        then_body: vec![
+                            // start -= 1; continue
+                            tt(Op::LetGet {
+                                idx: START,
+                                ty: IrType::I32,
+                            }),
+                            tt(Op::ConstI32(1)),
+                            tt(Op::Sub(IrType::I32)),
+                            tt(Op::LetSet {
+                                idx: START,
+                                ty: IrType::I32,
+                            }),
+                            tt(Op::ConstI32(0)),
+                        ],
+                        else_body: vec![
+                            // Hit a lead byte — break.
+                            tt(Op::Br { label_depth: 2 }),
+                            tt(Op::ConstI32(0)),
+                        ],
+                    }),
+                    tt(Op::LetSet {
+                        idx: SINK,
+                        ty: IrType::I32,
+                    }),
+                    // Safety net: bound the probe to 4 iterations. If
+                    // we've stepped 4 bytes back and still see only
+                    // continuations, the input is malformed — give up
+                    // and decode whatever single byte sits at start.
+                    tt(Op::LetGet {
+                        idx: back_idx_local,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::LetGet {
+                        idx: START,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::Sub(IrType::I32)),
+                    tt(Op::ConstI32(4)),
+                    tt(Op::Ge(IrType::I32)),
+                    tt(Op::BrIf { label_depth: 1 }),
+                    tt(Op::Br { label_depth: 0 }),
+                ],
+            })],
+        }));
+        // Clamp start to >= 0 in case the safety nets fired.
+        seq.push(tt(Op::LetGet {
+            idx: START,
+            ty: IrType::I32,
+        }));
+        seq.push(tt(Op::ConstI32(0)));
+        seq.push(tt(Op::Lt(IrType::I32)));
+        seq.push(tt(Op::If {
+            result_ty: IrType::I32,
+            then_body: vec![
+                tt(Op::ConstI32(0)),
+                tt(Op::LetSet {
+                    idx: START,
+                    ty: IrType::I32,
+                }),
+                tt(Op::ConstI32(0)),
+            ],
+            else_body: vec![tt(Op::ConstI32(0))],
+        }));
+        seq.push(tt(Op::LetSet {
+            idx: SINK,
+            ty: IrType::I32,
+        }));
+        // Forward-decode one codepoint from START to fill CP / WIDTH.
+        seq.extend(forward_decode(START));
+        // back = start (caller continues leftwards from here).
+        seq.push(tt(Op::LetGet {
+            idx: START,
+            ty: IrType::I32,
+        }));
+        seq.push(tt(Op::LetSet {
+            idx: back_idx_local,
+            ty: IrType::I32,
+        }));
+        seq
+    };
+
+    StdlibFunction {
+        name: "__final_sigma_check",
+        params: vec![IrType::I32, IrType::I32, IrType::I32, IrType::I32],
+        ret: IrType::I32,
+        body: vec![
+            // s_len = i32.load(s_ptr + 0)
+            tt(Op::LocalGet(0)),
+            tt(Op::LoadI32AtAbsolute { offset: 0 }),
+            tt(Op::LetSet {
+                idx: S_LEN,
+                ty: IrType::I32,
+            }),
+            // result = 0 (default: not final)
+            tt(Op::ConstI32(0)),
+            tt(Op::LetSet {
+                idx: RESULT,
+                ty: IrType::I32,
+            }),
+            // seen_cased_before = 0
+            tt(Op::ConstI32(0)),
+            tt(Op::LetSet {
+                idx: SEEN_CASED_BEFORE,
+                ty: IrType::I32,
+            }),
+            // back = byte_offset (will scan leftwards)
+            tt(Op::LocalGet(1)),
+            tt(Op::LetSet {
+                idx: BACK,
+                ty: IrType::I32,
+            }),
+            // ----- LEFT SCAN -----
+            // while back > 0 { reverse-decode one cp; if cased: set
+            // seen_cased_before=1 and break; if !ignorable: break; else
+            // continue. } The scan requires at least one cased cp
+            // before the sigma (modulo ignorables) for the form to be
+            // final.
+            tt(Op::Block {
+                result_ty: None,
+                body: vec![tt(Op::Loop {
+                    result_ty: None,
+                    body: {
+                        let mut v: Vec<TaggedOp> = Vec::new();
+                        // exit if back == 0 (or < 0)
+                        v.push(tt(Op::LetGet {
+                            idx: BACK,
+                            ty: IrType::I32,
+                        }));
+                        v.push(tt(Op::ConstI32(1)));
+                        v.push(tt(Op::Lt(IrType::I32)));
+                        v.push(tt(Op::BrIf { label_depth: 1 }));
+                        // reverse-decode: writes CP, WIDTH, and resets
+                        // back to the lead byte of the decoded cp.
+                        v.extend(reverse_decode(BACK));
+                        // is_cased = range_lookup(CP, cased_addr)
+                        v.extend(range_lookup(CP, 2));
+                        v.push(tt(Op::If {
+                            result_ty: IrType::I32,
+                            then_body: vec![
+                                tt(Op::ConstI32(1)),
+                                tt(Op::LetSet {
+                                    idx: SEEN_CASED_BEFORE,
+                                    ty: IrType::I32,
+                                }),
+                                // br 2 exits the enclosing block.
+                                tt(Op::Br { label_depth: 2 }),
+                                tt(Op::ConstI32(0)),
+                            ],
+                            else_body: vec![tt(Op::ConstI32(0))],
+                        }));
+                        v.push(tt(Op::LetSet {
+                            idx: SINK,
+                            ty: IrType::I32,
+                        }));
+                        // is_ignorable = range_lookup(CP, ignorable_addr)
+                        v.extend(range_lookup(CP, 3));
+                        v.push(tt(Op::If {
+                            result_ty: IrType::I32,
+                            then_body: vec![tt(Op::ConstI32(0))],
+                            else_body: vec![
+                                // Non-cased, non-ignorable — break left
+                                // scan (without flipping seen flag).
+                                tt(Op::Br { label_depth: 2 }),
+                                tt(Op::ConstI32(0)),
+                            ],
+                        }));
+                        v.push(tt(Op::LetSet {
+                            idx: SINK,
+                            ty: IrType::I32,
+                        }));
+                        // continue.
+                        v.push(tt(Op::Br { label_depth: 0 }));
+                        v
+                    },
+                })],
+            }),
+            // If we never saw a cased cp on the left, sigma is not
+            // final — return 0 directly.
+            tt(Op::LetGet {
+                idx: SEEN_CASED_BEFORE,
+                ty: IrType::I32,
+            }),
+            tt(Op::ConstI32(0)),
+            tt(Op::Eq(IrType::I32)),
+            tt(Op::If {
+                result_ty: IrType::I32,
+                then_body: vec![
+                    tt(Op::ConstI32(0)),
+                    tt(Op::LetSet {
+                        idx: RESULT,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::ConstI32(0)),
+                ],
+                else_body: vec![tt(Op::ConstI32(0))],
+            }),
+            tt(Op::LetSet {
+                idx: SINK,
+                ty: IrType::I32,
+            }),
+            // Only continue the right scan when seen_cased_before == 1.
+            tt(Op::LetGet {
+                idx: SEEN_CASED_BEFORE,
+                ty: IrType::I32,
+            }),
+            tt(Op::ConstI32(1)),
+            tt(Op::Eq(IrType::I32)),
+            tt(Op::If {
+                result_ty: IrType::I32,
+                then_body: {
+                    let mut t: Vec<TaggedOp> = Vec::new();
+                    // fwd = byte_offset + 2 (Σ is 0xCE 0xA3 = 2 bytes)
+                    t.push(tt(Op::LocalGet(1)));
+                    t.push(tt(Op::ConstI32(2)));
+                    t.push(tt(Op::Add(IrType::I32)));
+                    t.push(tt(Op::LetSet {
+                        idx: FWD,
+                        ty: IrType::I32,
+                    }));
+                    // result = 1 (default until proven non-final by a
+                    // cased cp on the right; falls back to 0 only via
+                    // the explicit override below).
+                    t.push(tt(Op::ConstI32(1)));
+                    t.push(tt(Op::LetSet {
+                        idx: RESULT,
+                        ty: IrType::I32,
+                    }));
+                    // ----- RIGHT SCAN -----
+                    t.push(tt(Op::Block {
+                        result_ty: None,
+                        body: vec![tt(Op::Loop {
+                            result_ty: None,
+                            body: {
+                                let mut v: Vec<TaggedOp> = Vec::new();
+                                // exit if fwd >= s_len
+                                v.push(tt(Op::LetGet {
+                                    idx: FWD,
+                                    ty: IrType::I32,
+                                }));
+                                v.push(tt(Op::LetGet {
+                                    idx: S_LEN,
+                                    ty: IrType::I32,
+                                }));
+                                v.push(tt(Op::Ge(IrType::I32)));
+                                v.push(tt(Op::BrIf { label_depth: 1 }));
+                                // forward-decode: writes CP and WIDTH.
+                                v.extend(forward_decode(FWD));
+                                // is_cased = range_lookup(CP, cased_addr)
+                                v.extend(range_lookup(CP, 2));
+                                v.push(tt(Op::If {
+                                    result_ty: IrType::I32,
+                                    then_body: vec![
+                                        // Cased cp — sigma is not final.
+                                        tt(Op::ConstI32(0)),
+                                        tt(Op::LetSet {
+                                            idx: RESULT,
+                                            ty: IrType::I32,
+                                        }),
+                                        tt(Op::Br { label_depth: 2 }),
+                                        tt(Op::ConstI32(0)),
+                                    ],
+                                    else_body: vec![tt(Op::ConstI32(0))],
+                                }));
+                                v.push(tt(Op::LetSet {
+                                    idx: SINK,
+                                    ty: IrType::I32,
+                                }));
+                                // is_ignorable = range_lookup(CP, ignorable_addr)
+                                v.extend(range_lookup(CP, 3));
+                                v.push(tt(Op::If {
+                                    result_ty: IrType::I32,
+                                    then_body: vec![tt(Op::ConstI32(0))],
+                                    else_body: vec![
+                                        // Non-cased, non-ignorable —
+                                        // word-final. Keep result = 1
+                                        // and exit.
+                                        tt(Op::Br { label_depth: 2 }),
+                                        tt(Op::ConstI32(0)),
+                                    ],
+                                }));
+                                v.push(tt(Op::LetSet {
+                                    idx: SINK,
+                                    ty: IrType::I32,
+                                }));
+                                // fwd += width
+                                v.push(tt(Op::LetGet {
+                                    idx: FWD,
+                                    ty: IrType::I32,
+                                }));
+                                v.push(tt(Op::LetGet {
+                                    idx: WIDTH,
+                                    ty: IrType::I32,
+                                }));
+                                v.push(tt(Op::Add(IrType::I32)));
+                                v.push(tt(Op::LetSet {
+                                    idx: FWD,
+                                    ty: IrType::I32,
+                                }));
+                                v.push(tt(Op::Br { label_depth: 0 }));
+                                v
+                            },
+                        })],
+                    }));
+                    t.push(tt(Op::ConstI32(0)));
+                    t
+                },
+                else_body: vec![tt(Op::ConstI32(0))],
+            }),
+            tt(Op::LetSet {
+                idx: SINK,
+                ty: IrType::I32,
+            }),
+            tt(Op::LetGet {
+                idx: RESULT,
+                ty: IrType::I32,
+            }),
+            tt(Op::Return),
+        ],
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6899,5 +8288,37 @@ mod b5_index_tests {
         assert_eq!(stdlib_function_index("nfkd"), Some(28));
         assert_eq!(stdlib_function_index("nfc"), Some(29));
         assert_eq!(stdlib_function_index("nfkc"), Some(30));
+    }
+}
+
+#[cfg(test)]
+mod b6_b7_index_tests {
+    use super::*;
+
+    /// v3++ b-6 locale-aware bodies retain their `31..=33` slots once
+    /// the b-7 helpers are appended.
+    #[test]
+    fn b6_indices_are_stable() {
+        assert_eq!(stdlib_function_index("upper_locale"), Some(31));
+        assert_eq!(stdlib_function_index("lower_locale"), Some(32));
+        assert_eq!(stdlib_function_index("title_locale"), Some(33));
+    }
+
+    /// v3++ b-7 reframed FULL / final-sigma helpers live at `34` /
+    /// `35`. Pinning these via assertion guards against accidental
+    /// reordering that would silently break the per-cp dispatch from
+    /// `case_fold_body_inner`.
+    #[test]
+    fn b7_indices_are_stable() {
+        assert_eq!(
+            stdlib_function_index("__full_casefold_lookup"),
+            Some(FULL_CASEFOLD_LOOKUP_INDEX)
+        );
+        assert_eq!(stdlib_function_index("__full_casefold_lookup"), Some(34));
+        assert_eq!(
+            stdlib_function_index("__final_sigma_check"),
+            Some(FINAL_SIGMA_CHECK_INDEX)
+        );
+        assert_eq!(stdlib_function_index("__final_sigma_check"), Some(35));
     }
 }

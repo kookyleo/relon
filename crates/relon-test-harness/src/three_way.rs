@@ -516,6 +516,19 @@ fn parse_recipe(source: &str) -> Option<SynthRecipe> {
             "#main() -> String \"ΣΙΓΜΑ\".lower()",
             Value::String("σιγμα".to_string()),
         ),
+        // v3++ b-7 reframed: FULL multi-cp + Σ-context coverage.
+        (
+            "#main() -> String \"straße\".upper()",
+            Value::String("STRASSE".to_string()),
+        ),
+        (
+            "#main() -> String \"ΟΔΥΣΣΕΥΣ\".lower()",
+            Value::String("οδυσσευς".to_string()),
+        ),
+        (
+            "#main() -> String \"ﬁle\".upper()",
+            Value::String("FILE".to_string()),
+        ),
         ("#main() -> Int [1, 2, 3, 4, 5].sum()", Value::Int(15)),
         (
             "#main() -> Int [3, 1, 4, 1, 5, 9, 2, 6].max()",
