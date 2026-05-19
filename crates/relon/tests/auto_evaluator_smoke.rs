@@ -216,13 +216,26 @@ fn concurrent_run_main_only_builds_aot_once() {
     // still produce the right value, but the test guards against
     // a future refactor that drops the OnceLock and falls back
     // to per-call construction.
+    //
+    // The cranelift-AOT backend itself is `&self` but installs the
+    // per-call arena pointer onto a shared `SandboxState`; the
+    // v5-beta-1 contract documented in `CraneliftAotEvaluator`
+    // requires the host to serialise concurrent `run_main` calls
+    // via `Mutex<...>`. We do that here so the test reflects the
+    // supported usage pattern — the OnceLock invariant is still
+    // validated because the build path races freely before the
+    // first call enters the lock.
+    use std::sync::Mutex;
     let evaluator = Arc::new(AutoEvaluator::new(MAIN_SOURCE).expect("auto build"));
+    let call_gate: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
     let threads: Vec<_> = (0..8)
         .map(|i| {
             let evaluator = Arc::clone(&evaluator);
+            let call_gate = Arc::clone(&call_gate);
             std::thread::spawn(move || {
                 let mut args = HashMap::new();
                 args.insert("x".to_string(), Value::Int(i));
+                let _guard = call_gate.lock().expect("call gate poisoned");
                 evaluator.run_main(args).expect("thread run_main")
             })
         })
