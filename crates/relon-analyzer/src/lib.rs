@@ -174,7 +174,18 @@ pub fn analyze_with_options(root: &Node, options: &AnalyzeOptions) -> AnalyzedTr
     // that uniformity is what lets `s.upper()` dispatch through the
     // same path as `user_value.user_method()` with zero `#extend
     // String with { ... }` boilerplate.
-    core_schemas::inject_core_schemas(&mut tree);
+    //
+    // v6-fix-D2 cold-start: parsing the four embedded carrier files
+    // is the single biggest analyzer pass (~1.8 ms on the W11 shape).
+    // Hosts that know their entry never dispatches a built-in method
+    // can opt out via `AnalyzeOptions::skip_core_schemas`; the
+    // `relon-cli --lite` flag does exactly that. The first
+    // `inject_core_schemas` call in this process pays parse + lower
+    // once (via a `OnceLock`), every subsequent call clones from the
+    // cache — so the workspace pass's per-module analyse stays cheap.
+    if !options.skip_core_schemas {
+        core_schemas::inject_core_schemas(&mut tree);
+    }
     schema::collect_schemas(root, &mut tree);
     // Root-level `#schema A Body` directives must run after
     // `collect_schemas` so the dual-declaration collision check has the
@@ -289,6 +300,21 @@ pub struct AnalyzeOptions {
     /// unaffected — the supply-chain risk model targets the network.
     /// Default `false` preserves the v3+ a-3 behavior.
     pub require_hash: bool,
+    /// v6-fix-D2 cold-start: when `true`, skip the carrier-`.relon`
+    /// parse + lower pass ([`core_schemas::inject_core_schemas`]).
+    /// That pass contributes the `String` / `List<T>` / `Dict<K, V>`
+    /// / `Iter<T>` *method dispatch* table only — schema field-type
+    /// checks, typecheck, etc. don't read it. So skipping is safe
+    /// iff the source never dispatches a method on one of those
+    /// built-in carriers (e.g. `"x".upper()`, `[1,2].map(f)`); if it
+    /// does, the analyzer would surface an `UnknownMethod` diagnostic
+    /// instead of finding the carrier-declared signature. The CLI
+    /// `--lite` flag flips this on; we publish it on the options
+    /// struct so any host with the same "I know my entry has no
+    /// built-in method calls" knowledge can opt in too.
+    ///
+    /// Default `false` preserves the pre-D2 behavior.
+    pub skip_core_schemas: bool,
 }
 
 impl Default for AnalyzeOptions {
@@ -300,6 +326,7 @@ impl Default for AnalyzeOptions {
             caps: cap::Capabilities::default(),
             strict_mode: true,
             require_hash: false,
+            skip_core_schemas: false,
         }
     }
 }

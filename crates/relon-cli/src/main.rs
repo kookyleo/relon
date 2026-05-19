@@ -3,7 +3,10 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use miette::{IntoDiagnostic, LabeledSpan, NamedSource, Report};
 use relon::ResolverChainLoader;
-use relon_analyzer::{analyze_entry_with_options, AnalyzeOptions};
+use relon_analyzer::{
+    analyze_entry_with_options, analyze_with_options, AnalyzeOptions, WorkspaceDiagnostic,
+    WorkspaceTree,
+};
 use relon_codegen_native::CraneliftAotEvaluator;
 use relon_eval_api::Evaluator as EvaluatorTrait;
 use relon_evaluator::module::FilesystemModuleResolver;
@@ -65,6 +68,23 @@ enum Commands {
         /// Pretty-print the output JSON
         #[arg(short, long, default_value_t = true)]
         pretty: bool,
+        /// v6-fix-D2 cold-start lite mode. Short-circuits every
+        /// startup-side lazy init the default `relon run` path
+        /// would normally pay: forces `Backend::TreeWalk` (no
+        /// cranelift-AOT lower / JIT), skips the trust-only
+        /// remote-HTTP resolver mount, skips the optional warm-up
+        /// tick, and avoids constructing or probing the on-disk
+        /// AOT cache directory.
+        ///
+        /// Differs from `--backend tree-walk`: that flag only
+        /// switches the evaluator selection but still walks the
+        /// same default-mode startup sequence; `--lite` *also*
+        /// gates every other lazy init that doesn't pay for a
+        /// short-lived `relon run foo.relon` invocation. Pairs
+        /// best with the W11 bench shape (single-shot evaluator,
+        /// no JIT tier worth amortising).
+        #[arg(long, default_value_t = false)]
+        lite: bool,
         /// JSON object whose keys are `#main(...)` parameter names and
         /// whose values are the host-pushed args. Required if the
         /// target file declares a `#main(...)` signature; ignored
@@ -135,17 +155,54 @@ fn main() -> miette::Result<()> {
         Commands::Run {
             file,
             pretty,
+            lite,
             args,
             trust,
             backend,
             require_hash,
         } => {
+            // v6-fix-D2: phase timing. Emitted only when the
+            // operator opts in via `RELON_CLI_PROFILE=1`; default
+            // path stays silent so `--lite` doesn't pollute
+            // stderr.
+            let profile_phases = std::env::var_os("RELON_CLI_PROFILE").is_some();
+            let phase_start = std::time::Instant::now();
+            let mut last_phase_at = phase_start;
+            let mut phase = |label: &str| {
+                if !profile_phases {
+                    return;
+                }
+                let now = std::time::Instant::now();
+                let total_us = now.duration_since(phase_start).as_micros();
+                let delta_us = now.duration_since(last_phase_at).as_micros();
+                eprintln!("[relon-cli profile] {label:<24} +{delta_us:>6}us  (total {total_us}us)");
+                last_phase_at = now;
+            };
+            // v6-fix-D2: `--lite` forces the tree-walker, which
+            // is the only backend whose cold-start fits inside
+            // a 2× LuaJIT envelope on the W11 shape. Any
+            // explicit `--backend` choice incompatible with
+            // tree-walk is rejected up front so the operator
+            // doesn't get a silent backend swap.
+            if lite {
+                match backend {
+                    BackendArg::Auto | BackendArg::TreeWalk => {}
+                    other => {
+                        return Err(miette::miette!(
+                            "--lite forces `--backend tree-walk`; remove the explicit `--backend {:?}` or drop `--lite`",
+                            other
+                        ));
+                    }
+                }
+            }
             let canonical_file = std::fs::canonicalize(&file)
                 .into_diagnostic()
                 .map_err(|e| e.wrap_err(format!("Failed to resolve file {:?}", file)))?;
+            phase("canonicalize");
             let content = std::fs::read_to_string(&canonical_file)
                 .into_diagnostic()
                 .map_err(|e| e.wrap_err(format!("Failed to read file {:?}", canonical_file)))?;
+            phase("read_to_string");
 
             // The CLI runs sandboxed by default: the operator passes
             // `--trust` when the script needs filesystem `#import`
@@ -173,15 +230,113 @@ fn main() -> miette::Result<()> {
             // at their defaults so this branch keeps its prior behavior.
             let analyze_options = AnalyzeOptions {
                 require_hash,
+                // v6-fix-D2 cold-start: `--lite` strips the
+                // built-in `core/*.relon` carrier pass from the
+                // analyzer. The carrier only feeds the
+                // `s.upper()` / `lst.map(f)`-style method
+                // dispatch table — it's safe to skip on entries
+                // that don't invoke built-in methods. The
+                // operator opts in by passing `--lite`; any
+                // method call against a built-in carrier in a
+                // `--lite` run will surface as
+                // `UnknownMethod`. (See `--lite`'s flag doc for
+                // the contract.)
+                skip_core_schemas: lite,
                 ..AnalyzeOptions::default()
             };
-            let workspace = analyze_entry_with_options(
-                cache_namespace.clone(),
-                &content,
-                entry_dir,
-                &mut loader,
-                &analyze_options,
-            );
+            // v6-fix-D2 cold-start fast path. The default
+            // workspace pass (`analyze_entry_with_options`) is the
+            // single biggest in-process cost for short-lived
+            // invocations (~1.8 ms on a `#main(Int x) -> Int\nx + 1`
+            // shape). Most of that goes into BFS bookkeeping, cycle
+            // detection, cross-module schema collision, and the
+            // unknown-types re-check — every one of which is a
+            // no-op when the entry source has no `#import`
+            // directive. `--lite` short-circuits by parsing +
+            // running the per-module `analyze_with_options` pass
+            // directly, then hand-rolling a `WorkspaceTree` that
+            // looks identical to the multi-pass output for an
+            // import-free entry. Import-bearing entries fall back
+            // to the full workspace path so cross-module diagnostics
+            // keep their teeth.
+            let workspace = if lite {
+                match relon_parser::parse_document(&content) {
+                    Ok(node) => {
+                        phase("[lite] parse_only");
+                        let arc_node = Arc::new(node);
+                        // Mirror `workspace_build::build`'s entry
+                        // strict-mode decision: workspace flag AND
+                        // no `#relaxed` / `#unstrict` directive on
+                        // the root. The directive constants come
+                        // from `relon_parser::directive` so the
+                        // CLI stays in lockstep with the analyzer
+                        // crate's view.
+                        let entry_relaxed = arc_node.directives.iter().any(|d| {
+                            d.name == relon_parser::directive::RELAXED
+                                || d.name == relon_parser::directive::UNSTRICT
+                        });
+                        let entry_strict = analyze_options.strict_mode && !entry_relaxed;
+                        let mut eff = analyze_options.clone();
+                        eff.strict_mode = entry_strict;
+                        let tree = analyze_with_options(&arc_node, &eff);
+                        phase("[lite] analyze");
+                        // Only short-circuit when there really are
+                        // no imports. Otherwise the cross-module
+                        // analysis the workspace pass owns must
+                        // run; fall back to the standard path.
+                        if tree.imports.is_empty() {
+                            let mut ws = WorkspaceTree::new();
+                            ws.entry_id = cache_namespace.clone();
+                            ws.strict_mode = entry_strict;
+                            ws.import_graph.insert(cache_namespace.clone(), Vec::new());
+                            ws.modules.insert(cache_namespace.clone(), Arc::new(tree));
+                            ws.nodes.insert(cache_namespace.clone(), arc_node);
+                            phase("[lite] synth_ws");
+                            ws
+                        } else {
+                            phase("[lite] has_imports_fallback");
+                            analyze_entry_with_options(
+                                cache_namespace.clone(),
+                                &content,
+                                entry_dir,
+                                &mut loader,
+                                &analyze_options,
+                            )
+                        }
+                    }
+                    Err(parse_err) => {
+                        // Synthesize a workspace-shaped parse-error
+                        // record so the downstream error renderer
+                        // (which expects a `WorkspaceTree`) still
+                        // gets a coherent input. Mirrors the
+                        // workspace_build path verbatim.
+                        phase("[lite] parse_failed");
+                        let mut ws = WorkspaceTree::new();
+                        ws.entry_id = cache_namespace.clone();
+                        ws.workspace_diagnostics
+                            .push(WorkspaceDiagnostic::ModuleParseError {
+                                path: cache_namespace.clone(),
+                                message: parse_err.to_string(),
+                                range: miette::SourceSpan::from((0usize, 0usize)),
+                            });
+                        ws
+                    }
+                }
+            } else {
+                if profile_phases {
+                    let _ = relon_parser::parse_document(&content);
+                    phase("[probe] parse_only");
+                }
+                let ws = analyze_entry_with_options(
+                    cache_namespace.clone(),
+                    &content,
+                    entry_dir,
+                    &mut loader,
+                    &analyze_options,
+                );
+                phase("analyze_entry");
+                ws
+            };
             if workspace.has_errors() {
                 // Surface entry parse errors with the same labelled
                 // span treatment the CLI used to give pre-workspace,
@@ -282,6 +437,7 @@ fn main() -> miette::Result<()> {
             };
             let _root_loading_guard = ctx.enter_loading_module(cache_namespace.clone());
             let evaluator = TreeWalkEvaluator::new(Arc::clone(&ctx));
+            phase("context+tw_evaluator");
 
             let scope = std::sync::Arc::new(Scope {
                 current_dir: canonical_file
@@ -336,10 +492,21 @@ fn main() -> miette::Result<()> {
                 // the operator one indirection layer thinner. Trust
                 // is honoured by capability bitmap flipping inside
                 // the cranelift evaluator.
-                let effective_backend = match backend {
-                    BackendArg::Auto => BackendArg::CraneliftAot,
-                    other => other,
+                // v6-fix-D2: `--lite` forces tree-walk for the
+                // `#main(...)` path too. The lower / JIT path
+                // (cranelift-AOT) dominates the W11 cold-start
+                // budget; the tree-walker reaches the same
+                // scalar answer with parse + analyze + walk
+                // only.
+                let effective_backend = if lite {
+                    BackendArg::TreeWalk
+                } else {
+                    match backend {
+                        BackendArg::Auto => BackendArg::CraneliftAot,
+                        other => other,
+                    }
                 };
+                phase("backend_select");
                 match effective_backend {
                     BackendArg::Auto => unreachable!("normalised above"),
                     BackendArg::TreeWalk => evaluator.run_main(&scope, args_map).map_err(|e| {
@@ -432,18 +599,22 @@ fn main() -> miette::Result<()> {
                 })?
             };
 
+            phase("evaluate");
             let final_val = relon::to_json_value(result).map_err(|e| {
                 miette::miette!("{}", e)
                     .with_source_code(NamedSource::new(file.to_string_lossy(), content))
             })?;
+            phase("to_json_value");
 
             let output = if pretty {
                 serde_json::to_string_pretty(&final_val).into_diagnostic()?
             } else {
                 serde_json::to_string(&final_val).into_diagnostic()?
             };
+            phase("serialise_json");
 
             println!("{}", output);
+            phase("println");
         }
         Commands::Fmt {
             check,
