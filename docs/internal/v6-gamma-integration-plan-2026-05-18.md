@@ -994,3 +994,87 @@ falsified**。三轮实验显示 Tail vs SysV 数字几乎相同。
 - ε-0-B (trace-to-trace fall-through) 单 trace 场景不会动 bench，
   转为 ε-1 之后再说。
 - Host hook helpers 仍保留 SystemV，ε-0-A 不应改这点。
+
+---
+
+## 18. v6-ε-0-A — At-call-site inline (DONE 2026-05-19, honest no-delta on this bench)
+
+**Status**: 落地完整，基础设施 + IR retention + size cap + deopt
+preservation + bench row + smoke test 全部进库。Bench delta 不显著
+——*预期内的不显著*，与 ε-0-C 同蓝图。Plan 路径从「inline 必然
+跨 5 ns 门」修正为「inline 是 ε-M1 把 loop 编进 cranelift 的
+prerequisite，自身在当前 bench shape (Rust caller) 上不动数字」。
+
+Stage report: `docs/internal/v6-epsilon-0a-stage-report-2026-05-19.md`
+
+**Worktree HEAD**: `9bfff6a test(bench): trace_jit_warm_inline row
+for ε-0-A measurement`（branch
+`worktree-agent-a13e82a8e497ab669`，base = `f379a7f`）。
+
+**Test count**: 1761 passing (1751 ε-0-C baseline + 5
+inline_emit unit + 5 trace_jit_inline_smoke). All gates green
+（cargo build / test / clippy / fmt / wasm32 / bench × 3 round）.
+
+### Bench delta（criterion median, 3 rounds, R1/R2/R3）
+
+```
+trace_jit_warm_ic     : 9.55 / 9.54 / 9.56 ns/iter（ε-0-C carry-over）
+trace_jit_warm_tail   : 9.55 / 9.51 / 9.54 ns/iter（ε-0-C carry-over）
+trace_jit_warm_sysv   : 9.55 / 9.51 / 9.54 ns/iter（ε-0-C carry-over）
+trace_jit_warm_inline : 9.55 / 9.52 / 9.54 ns/iter ← new
+rust_inlined_baseline : 3.55 / 3.55 / 3.55 ns/iter
+```
+
+- delta vs ε-0-C `trace_jit_warm_tail` = -0.04 ~ +0.04 ns（< 0.5%，
+  criterion noise）。
+- delta vs `rust_inlined_baseline` = +5.99 ns（与 ε-0-C 一致——
+  Rust → JIT extern call boundary 的 irreducible cost）。
+
+### Architecture decisions（≤ 5 bullets）
+
+1. **Splice 通过 re-emit**：`emit_trace_inline()` 复用
+   `crate::emitter::TraceEmitterState` 的 per-op lowering 规则，
+   只重写 prologue / epilogue / Return。比 cranelift Function clone
+   更安全（不脱出 SSA invariant），比双份 lowering 更易维护
+   （smoke test 1 万次 round-trip 把 sync 写成自动检查）。
+2. **IR retention via `Arc<OptimizedTrace>`** on `JITedTraceFn`，
+   而不是 `Arc<cranelift::Function>`。OptimizedTrace 是不可变 op
+   stream，cross-thread Arc 共享天然安全，re-emit cost ≈ Function
+   clone 的 ~10%。
+3. **MAX_INLINE_OPS = 256 hard cap**：v6-ε plan §3 ε-0-A 规定。
+   `compile_inline_host_fn` 在调 `emit_trace_inline` 前 gate-check；
+   超 cap surfaces `InlineHostFnError::TraceTooLarge`，caller
+   fallback 走 trampoline-call path。
+4. **Deopt block mirror standalone emitter**：inline host fn
+   的 deopt block 也是 「`ctx.host_hooks.save_deopt` indirect /
+   direct fallback」2-arm shape。smoke test 3 (overflow guard fire)
+   验证 ctx.deopt_state 被正确写入。
+5. **`TraceOp::Call` reject 而非处理**：current corpus 没有 Call
+   op 的 trace，处理它需要跨 module FuncRef 协调，复杂度不值
+   ε-0-A 范围。当 recorder 接入 inter-trace call 时再补
+   （估计 ε-M3 cap hoisting 之后）。
+
+### Honest finding
+
+bench 9.5 ns 平台**不是任何 cranelift-side call boundary**：M2-C
+falsify「prologue/epilogue」，ε-0-C falsify「ABI conv」，ε-0-A
+falsify「内层 trace call/ret」。三次实验把所有 callee-side cost
+排除完之后，剩下唯一 explanatory 的是 **Rust caller 侧的 extern
+call 边界**——args 重打包、`call rax`、`ret`、result 读取。这条
+cost 不会被任何 cranelift 改造 move 走，因为它发生在 Rust 侧。
+
+**Recommendation**：ε phase 推进到 ε-M1 之前**先加一条 prototype
+bench**：手写 cranelift fn `step_loop(n) -> i64` 跑 N iter 内联
+add+overflow guard，对比 `rust_inlined_baseline`。如果 prototype 跑
+3-4 ns，证明 ε-M1+ 「loop into cranelift」方向正确；如果还是
+~10 ns，要先做 profiling 找 deeper cost。
+
+### Carry-over to v6-ε-M1+
+
+- `emit_trace_inline` + `compile_inline_host_fn` 是 ε-M1+ 把 loop
+  body 编进 cranelift 时**真正的内层 trace dispatch site 上**要
+  调的 splice 工具，本 phase 提供 prerequisite。
+- ε-0-B 现在比 ε-0-A 之前更悲观——RSB miss 在当前 bench shape 上
+  根本不存在。继续 defer。
+- host hook helpers 仍 SystemV，inline path 跨 conv call 已验证
+  工作（smoke test 3）。
