@@ -1,66 +1,119 @@
-//! v6-γ M5 / v6-δ M2-C: trace-JIT hot-loop micro-bench.
+//! v6-ε bench rewrite (2026-05-19): honest per-iter cost of a hot
+//! integer-accumulation loop running INSIDE a single trace, plus
+//! diagnostic rows.
 //!
-//! Four rows on the same hot integer-accumulation workload:
+//! ## Background — why the v6-γ / v6-δ shape was misleading
 //!
-//! - `tree_walk` — the AST evaluator running `#main(Int n) -> Int :
-//!   sum(range(n))` (analytic close: `n * (n-1) / 2`). Captures the
-//!   interpreter dispatch tax per iter.
-//! - `cranelift_aot` — the same body lowered through cranelift-AOT.
-//!   Captures the warm-call cost the v5-β-2 closeout bench
-//!   established (sub-µs per `run_main` invocation).
-//! - `trace_jit_warm` — the trace-JIT path through the historical
-//!   `JITedTraceFn::invoke` API: returns a `TraceEntryStatus` enum
-//!   the bench matches in the loop body. This row captures the
-//!   pre-M2-C "with extern-C status-enum marshalling" cost so we can
-//!   diff against the IC dispatch row.
-//! - `trace_jit_warm_ic` — v6-δ M2-C: IC-stub dispatch. Caches the
-//!   typed entry pointer in a `TraceIcSlot` on the first iter, then
-//!   calls the cached pointer directly in the inner loop. Skips the
-//!   `Arc` deref, the per-iter `transmute`, the enum-mapping match
-//!   in `JITedTraceFn::invoke`, and the `matches!(status, …)` in
-//!   the bench body. The steady-state dispatch tail is one
-//!   `call rax` against the cached pointer + an `==0` compare for
-//!   the raw i32 return code.
+//! The previous version of this bench (v6-γ M5 → v6-δ M2-C → v6-ε-0-C
+//! → v6-ε-0-A) used the following per-iter shape:
 //!
-//! Each row reports `Throughput::Elements(N)` so criterion prints
-//! per-iter cost directly. The bench fixes `N = 1_000_000` so the
-//! per-row mean represents the steady-state cost of one trace tail
-//! invocation (or one tree-walk dispatch); LuaJIT's trace tier
-//! benchmarks land in the 1-3 ns/iter range on similar hardware.
+//! ```text
+//! Rust caller loop:
+//!     for i in 0..N {
+//!         args[0] = acc; args[1] = i;
+//!         trace_fn(&mut ctx, args.as_ptr())   // <-- one extern-C call PER ITER
+//!         acc = ctx.result_slot as i64;
+//!     }
+//! ```
 //!
-//! ## Why not `for i in 0..N { acc += i }` literal source?
+//! That shape pinned a stable 9.5 ns/iter floor across **every**
+//! variant we threw at it: trampoline call, `CallConv::Tail`,
+//! `CallConv::SystemV`, IC-slot dispatch, at-call-site IR inlining.
+//! v6-δ M2-C, v6-ε-0-C, and v6-ε-0-A together form a three-attempt
+//! falsification chain proving the 9.5 ns is **not** any of:
 //!
-//! The trace-JIT recorder does not yet handle `Op::Loop` /
-//! `Op::Br` (v6-γ Phase-1 envelope = straight-line arith /
-//! cmp / If). We approximate the hot loop by invoking a trace whose
-//! body is one accumulation step, in a tight Rust-side `for` loop —
-//! exactly what the host dispatcher will do once the cranelift
-//! prologue routes installed traces back into the entry-fn slot
-//! (a v6-δ deliverable).
+//! - the inner `call trace_fn` (ε-0-A inlined the body — Δ = 0.00 ns)
+//! - the entry-fn prologue / epilogue (ε-0-C swapped CallConv::Tail
+//!   vs SystemV — Δ = 0.01 ns)
+//! - the IC dispatch layer (M2-C cached pointer — Δ = 0.01 ns)
 //!
-//! ## Real `LocalGet + Add` trace body (v6-δ M1)
+//! The 9.5 ns floor IS the **Rust → cranelift-JIT extern-C call
+//! boundary** the bench harness pays every iter: args repack, `call
+//! rax`, return-path `cmp eax,0`, `load ctx.result_slot`, loop
+//! increment. None of those costs are intrinsic to "what a trace JIT
+//! does"; they only exist because the bench harness drove the JIT
+//! one iter at a time.
 //!
-//! v6-γ M5 had to bench a const-only body (`ConstI64; Return`)
-//! because (a) the emitter had no `LocalGet` lowering — arith ops
-//! referencing LocalGet'd SSAs failed `EmitError::UnboundSsa` at
-//! install; (b) the `ArithOverflow` guard predicate was a constant
-//! 0, so the trace's brif always took the deopt arm and the bench
-//! was measuring the deopt path rather than the hot loop.
+//! ## What a real Relon hot loop looks like
 //!
-//! v6-δ M1 closes both gaps:
+//! A real Relon hot loop runs the entire `for i in 0..N { acc += i }`
+//! INSIDE the JIT-compiled trace body. The Rust caller invokes the
+//! trace **once**, the trace runs all N iters under cranelift's
+//! regalloc / scheduling, then returns. Per-iter cost is whatever
+//! cranelift compiled for `acc += i` plus loop control — typically
+//! 1-3 ns on LuaJIT trace-tier hardware.
 //!
-//! - R1: recorder emits `TraceOp::LocalGet(dst, slot_idx)` on first
-//!   read; emitter lowers to `load.i64(args_ptr + slot_idx * 8)`.
-//! - R2: emitter switches arith ops to `sadd_overflow` / `ssub_overflow`
-//!   / `smul_overflow` and threads the carry bit into the
-//!   `ArithOverflow` guard predicate. Non-overflowing iters keep
-//!   running on the hot path.
+//! ## Row anatomy in this rewrite
 //!
-//! The bench therefore runs the real body
-//! `LocalGet(0); LocalGet(1); Add; Return` — every iter performs one
-//! `trace_fn.invoke` against fresh `(acc, i)` args and reads the
-//! sum from `ctx.result_slot`. No Rust-side compensation; the
-//! number is the actual hot-loop tail steady state.
+//! New rows ("loop-INSIDE" methodology — the honest hot-loop cost):
+//!
+//! - `tree_walk_loop` — Tree-walker runs `#main(Int n): sum(range(n))`.
+//!   One Rust→tree-walker call total; per-iter cost = total_time /
+//!   `HOT_LOOP_N`. Captures the AST interpreter dispatch tax per
+//!   per-element on a real loop primitive (`_list_reduce`).
+//! - `cranelift_aot_loop` — Cranelift-AOT compiles a Relon IR
+//!   `Op::Loop` that sums `1..=n`. One Rust→cranelift call total;
+//!   per-iter cost = total / `HOT_LOOP_N`. This is the realistic
+//!   "ahead-of-time compiled function with a loop body" baseline.
+//! - `trace_jit_loop` — **The real test**. A hand-built cranelift
+//!   JIT function whose body IS the full N-iter
+//!   `for i in 0..n { acc += i }` with overflow guard, packaged
+//!   behind [`relon_trace_abi::TRACE_ENTRY_SIG`]. One Rust→JIT call
+//!   total; per-iter cost = total / `HOT_LOOP_N`. This is what a
+//!   trace JIT would produce after compiling a hot Relon loop into a
+//!   single trace — bypassing the trace **recorder** (which doesn't
+//!   yet record backward branches end-to-end) but exercising the JIT
+//!   path the recorder would feed into.
+//! - `rust_native_loop` — Pure Rust `for i in 0..n` accumulator with
+//!   `checked_add`. Theoretical floor; the compiler can constant-fold
+//!   when the input is constant so it's wrapped in `black_box` to
+//!   keep it honest.
+//!
+//! Legacy rows kept for regression context, **relabelled as
+//! "dispatch-boundary" rows**: these measure the Rust→JIT call
+//! boundary cost per dispatch, not hot-loop per-iter cost.
+//!
+//! - `dispatch_trampoline` — historical `trace_jit_warm`; v6-γ M5
+//!   shape, recorder-driven install, default ABI.
+//! - `dispatch_ic` — historical `trace_jit_warm_ic`; v6-δ M2-C IC-slot
+//!   cached pointer.
+//! - `dispatch_tail` — historical `trace_jit_warm_tail`; v6-ε-0-C
+//!   `CallConv::Tail` install path.
+//! - `dispatch_sysv` — historical `trace_jit_warm_sysv`; v6-ε-0-C
+//!   `CallConv::SystemV` install path.
+//! - `dispatch_inline` — historical `trace_jit_warm_inline`; v6-ε-0-A
+//!   at-call-site IR-inline install path.
+//!
+//! All five dispatch rows are expected to land in the same 9-10 ns
+//! band; the row spread is the boundary cost noise floor, not any
+//! optimisation's value-add. They exist to keep the M2-C / ε-0-C /
+//! ε-0-A falsification chain audit-able in one bench output.
+//!
+//! ## Methodology
+//!
+//! - `HOT_LOOP_N = 1_000_000` for every row.
+//! - For the four loop-INSIDE rows: one criterion iteration drives ONE
+//!   invocation of the loop fn (which itself runs `HOT_LOOP_N` iters).
+//!   `Throughput::Elements(HOT_LOOP_N)` makes criterion print per-iter
+//!   numbers directly.
+//! - For the five dispatch-boundary rows: one criterion iteration drives
+//!   a Rust-side `for` loop that calls the trace fn `HOT_LOOP_N` times.
+//!   Each call's body is the 4-op `LocalGet+LocalGet+Add+Return` shape
+//!   ε-0-A pinned.
+//!
+//! ## Recorder gap (option (a) per task brief)
+//!
+//! The trace recorder today emits straight-line `LocalGet+Add+Return`
+//! traces; it does **not** yet capture an `Op::Loop` body with a
+//! backward branch end-to-end. The emitter side has `MarkLoopHead` /
+//! `MarkLoopBack` lowering that compiles correctly, but the recorder
+//! never inserts those markers. We choose **option (a)** from the
+//! brief: bypass the recorder and hand-build the trace JIT function
+//! that includes the loop. The `trace_jit_loop` row's machine-code
+//! shape is the same shape a fully-extended recorder would produce
+//! once it knows how to record a loop trace; the JIT path is exercised
+//! identically. The recorder gap is documented as a follow-up in the
+//! bench-rewrite report.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -68,12 +121,20 @@ use std::time::Duration;
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 
+use cranelift_codegen::ir::condcodes::IntCC;
+use cranelift_codegen::ir::types::{I32, I64};
+use cranelift_codegen::ir::{self, AbiParam, BlockArg, InstBuilder, MemFlags, Signature};
 use cranelift_codegen::isa::CallConv;
+use cranelift_codegen::settings::{self, Configurable};
+use cranelift_codegen::Context as CodegenContext;
+use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
+use cranelift_jit::{JITBuilder, JITModule};
+use cranelift_module::{Linkage, Module as _};
 
 use relon_codegen_native::{
     clear_recording, compile_inline_host_fn, global_trace_jit_state, register_recording,
-    trace_install::TraceJitState, CraneliftAotEvaluator, RecordingRegistration, SandboxConfig,
-    TraceIcSlot, MAX_FN_ID,
+    register_trace_runtime_symbols, trace_install::TraceJitState, CraneliftAotEvaluator,
+    RecordingRegistration, SandboxConfig, TraceIcSlot, MAX_FN_ID,
 };
 use relon_eval_api::{Evaluator, Value};
 use relon_evaluator::{Context, Scope, TreeWalkEvaluator};
@@ -81,18 +142,374 @@ use relon_ir::ir::{Func, IrType, Module as IrModule, Op, TaggedOp};
 use relon_parser::{parse_document, TokenRange};
 use relon_trace_abi::{TraceContext, TraceEntryStatus};
 
-/// Number of inner-loop iterations per bench sample. Criterion's
-/// per-row mean then reports the **per-iter** cost rather than the
-/// total loop time.
+/// Iteration count for every row's hot loop. Criterion's
+/// `Throughput::Elements(HOT_LOOP_N)` makes the per-iter cost
+/// surface directly in the report.
 const HOT_LOOP_N: u64 = 1_000_000;
 
-/// IR body for the single-step accumulation: `acc + i`.
-/// Both args are passed through the wasm-handshake `LocalGet` slot;
-/// param 0 is `acc`, param 1 is `i`.
+/// Tree-walker hot loops are µs/iter class; running them at
+/// `HOT_LOOP_N = 1M` would blow up the bench wall-clock (single
+/// invocation ≈ seconds), so the `tree_walk_loop` row drops to a
+/// smaller N and reports per-iter cost via a per-row
+/// `Throughput::Elements(TREE_WALK_LOOP_N)` adjustment.
+const TREE_WALK_LOOP_N: u64 = 10_000;
+
+// =====================================================================
+// =====  loop-INSIDE rows  ============================================
+// =====================================================================
+
+/// Build an IR body that computes `sum(1..=n)` via an `Op::Loop` with
+/// an explicit `BrIf` exit, mirroring the working pattern from
+/// `relon-codegen-native/tests/control_flow_extended.rs`. The loop
+/// runs entirely on the wasm operand-stack carrier; the cranelift-AOT
+/// backend lowers the back-edge into a normal cranelift loop.
 ///
-/// Used for the cranelift-AOT row (cranelift-native lowers LocalGet
-/// against its real ABI arg vector). The trace-JIT row uses a
-/// constant-input body — see [`step_body_trace_const`].
+/// The body intentionally **does not** include an overflow check on
+/// every iter: Relon's `Add(I64)` is wrapping at the IR level, and the
+/// AOT backend matches that. Comparable to the `trace_jit_loop` row
+/// below (whose hand-built cranelift fn includes `sadd_overflow` for
+/// guard-exposure parity with what a real trace would emit).
+fn sum_loop_ir() -> IrModule {
+    fn t(op: Op) -> TaggedOp {
+        TaggedOp {
+            op,
+            range: TokenRange::default(),
+        }
+    }
+    const I: u32 = 0;
+    const ACC: u32 = 1;
+    let body = vec![
+        // i = 1
+        t(Op::ConstI64(1)),
+        t(Op::LetSet {
+            idx: I,
+            ty: IrType::I64,
+        }),
+        // seed yield = 0
+        t(Op::ConstI64(0)),
+        t(Op::Block {
+            result_ty: Some(IrType::I64),
+            body: vec![t(Op::Loop {
+                result_ty: Some(IrType::I64),
+                body: vec![
+                    // acc = block_param
+                    t(Op::LetSet {
+                        idx: ACC,
+                        ty: IrType::I64,
+                    }),
+                    // if i > n -> exit
+                    t(Op::LetGet {
+                        idx: I,
+                        ty: IrType::I64,
+                    }),
+                    t(Op::LocalGet(0)),
+                    t(Op::Gt(IrType::I64)),
+                    t(Op::If {
+                        result_ty: IrType::I64,
+                        then_body: vec![
+                            t(Op::LetGet {
+                                idx: ACC,
+                                ty: IrType::I64,
+                            }),
+                            t(Op::Br { label_depth: 2 }),
+                            t(Op::ConstI64(0)),
+                        ],
+                        else_body: vec![t(Op::ConstI64(0))],
+                    }),
+                    // drop If-yield placeholder
+                    t(Op::LetSet {
+                        idx: 2,
+                        ty: IrType::I64,
+                    }),
+                    // acc' = acc + i
+                    t(Op::LetGet {
+                        idx: ACC,
+                        ty: IrType::I64,
+                    }),
+                    t(Op::LetGet {
+                        idx: I,
+                        ty: IrType::I64,
+                    }),
+                    t(Op::Add(IrType::I64)),
+                    // i = i + 1
+                    t(Op::LetGet {
+                        idx: I,
+                        ty: IrType::I64,
+                    }),
+                    t(Op::ConstI64(1)),
+                    t(Op::Add(IrType::I64)),
+                    t(Op::LetSet {
+                        idx: I,
+                        ty: IrType::I64,
+                    }),
+                    // top-of-stack = acc'; back-edge.
+                    t(Op::Br { label_depth: 0 }),
+                ],
+            })],
+        }),
+        t(Op::Return),
+    ];
+    IrModule {
+        imports: vec![],
+        funcs: vec![Func {
+            name: "run_main".to_string(),
+            params: vec![IrType::I64],
+            ret: IrType::I64,
+            body,
+            range: TokenRange::default(),
+        }],
+        entry_func_index: Some(0),
+        closure_table: vec![],
+    }
+}
+
+/// Pre-warmed cranelift-AOT evaluator for the `sum 1..=n` loop body
+/// built by [`sum_loop_ir`]. One Rust→JIT invoke runs all N iters
+/// inside cranelift's compiled loop.
+fn build_cranelift_aot_loop() -> CraneliftAotEvaluator {
+    CraneliftAotEvaluator::from_ir_direct(
+        sum_loop_ir(),
+        SandboxConfig::default(),
+        vec!["n".to_string()],
+    )
+    .expect("cranelift sum-loop compile")
+}
+
+/// Owning wrapper around a hand-built cranelift JIT module whose only
+/// exported function runs the full `for i in 1..=n { acc += i }` loop
+/// internally and returns through [`relon_trace_abi::TRACE_ENTRY_SIG`].
+///
+/// This is the **honest** trace-JIT hot-loop measurement: bypass the
+/// trace recorder (which can't yet record a backward branch in a
+/// trace), but emit cranelift IR with the exact shape a fully-recorded
+/// trace would produce — `LocalGet` for `n`, an init block, a header
+/// block with the exit `brif`, a body block with `sadd_overflow` + a
+/// guard, and a back-edge.
+///
+/// The JIT module owns its memory mapping; drop order ensures the
+/// entry pointer stays valid as long as the wrapper is alive.
+pub struct TraceJitLoopFn {
+    entry: unsafe extern "C" fn(*mut TraceContext, *const u64) -> i32,
+    _module: JITModule,
+}
+
+// SAFETY: same contract as JITedTraceFn — entry pointer's lifetime is
+// tied to `_module`; cross-thread share is safe so long as callers
+// respect TRACE_ENTRY_SIG.
+unsafe impl Send for TraceJitLoopFn {}
+unsafe impl Sync for TraceJitLoopFn {}
+
+impl TraceJitLoopFn {
+    /// # Safety
+    ///
+    /// Caller must keep `self` alive for the duration of the call;
+    /// `ctx` must be exclusive; `args` must point to a slot[0] = `n`
+    /// u64 (the loop bound, treated as i64 inside the trace).
+    pub unsafe fn invoke(&self, ctx: *mut TraceContext, args: *const u64) -> i32 {
+        (self.entry)(ctx, args)
+    }
+}
+
+/// Build a cranelift JIT module containing one exported function:
+///
+/// ```text
+/// fn loop_step(ctx: *mut TraceContext, args: *const u64) -> i32 {
+///     let n: i64 = *args.add(0);
+///     let mut acc: i64 = 0;
+///     let mut i: i64 = 1;
+///     loop {
+///         if i > n { break }
+///         let (sum, of) = sadd_overflow(acc, i);
+///         if of { goto deopt }
+///         acc = sum;
+///         i = i + 1;
+///     }
+///     ctx.result_slot = acc;
+///     return 0   // Success
+/// deopt:
+///     // call ctx.host_hooks.save_deopt(ctx, 0, 0)
+///     return 1   // GuardFailed
+/// }
+/// ```
+///
+/// Block layout mirrors what a trace-JIT-compiled hot loop would look
+/// like once the recorder learns to record loops. We deliberately
+/// include `sadd_overflow` + guard so the per-iter cycle count is
+/// realistic — a real Relon `Add(I64)` body trace would carry the same
+/// `ArithOverflow` guard the v6-δ M1 emitter already lowers.
+fn build_trace_jit_loop_fn() -> TraceJitLoopFn {
+    // ---- ISA + flag setup mirrors the trampoline path
+    // (build_trace_jit_module in trace_install.rs) so the codegen
+    // tunings — opt_level=speed, probestack off, frame_pointer off —
+    // are identical between the dispatch-boundary rows and this row.
+    let mut flag_builder = settings::builder();
+    flag_builder
+        .set("is_pic", "false")
+        .expect("flag is_pic must accept false");
+    flag_builder
+        .set("opt_level", "speed")
+        .expect("flag opt_level must accept speed");
+    flag_builder
+        .set("enable_verifier", "true")
+        .expect("flag enable_verifier must accept true");
+    let _ = flag_builder.set("enable_probestack", "false");
+    let _ = flag_builder.set("preserve_frame_pointers", "false");
+    let flags = settings::Flags::new(flag_builder);
+    let isa_builder = cranelift_native::builder().expect("cranelift-native builder");
+    let isa = isa_builder.finish(flags).expect("isa finish");
+
+    let mut builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
+    register_trace_runtime_symbols(&mut builder);
+    let mut module = JITModule::new(builder);
+    let pointer_ty = module.target_config().pointer_type();
+
+    // Pre-declare save_deopt so the deopt arm has a callable extern.
+    let mut save_deopt_sig = Signature::new(CallConv::SystemV);
+    save_deopt_sig.params.push(AbiParam::new(pointer_ty));
+    save_deopt_sig.params.push(AbiParam::new(I32));
+    save_deopt_sig.params.push(AbiParam::new(I64));
+    let save_deopt_id = module
+        .declare_function("__relon_trace_save_deopt", Linkage::Import, &save_deopt_sig)
+        .expect("declare save_deopt");
+
+    // Entry signature: same as TRACE_ENTRY_SIG.
+    let mut sig = Signature::new(CallConv::SystemV);
+    sig.params.push(AbiParam::new(pointer_ty));
+    sig.params.push(AbiParam::new(pointer_ty));
+    sig.returns.push(AbiParam::new(I32));
+
+    let mut ctx = CodegenContext::new();
+    ctx.func = ir::Function::with_name_signature(
+        ir::UserFuncName::user(0, save_deopt_id.as_u32() + 1),
+        sig.clone(),
+    );
+
+    // Import save_deopt as a callable FuncRef inside the fn body.
+    let save_deopt_sig_ref = ctx.func.import_signature(save_deopt_sig.clone());
+    let save_deopt_name = ctx
+        .func
+        .declare_imported_user_function(ir::UserExternalName::new(0, save_deopt_id.as_u32()));
+    let save_deopt_ref = ctx.func.import_function(ir::ExtFuncData {
+        name: ir::ExternalName::User(save_deopt_name),
+        signature: save_deopt_sig_ref,
+        colocated: false,
+        patchable: false,
+    });
+
+    let mut builder_ctx = FunctionBuilderContext::new();
+    let mut fb = FunctionBuilder::new(&mut ctx.func, &mut builder_ctx);
+
+    // Entry block: load `n` from args, seed acc=0, i=1, jump to header.
+    let entry_block = fb.create_block();
+    fb.append_block_params_for_function_params(entry_block);
+    let trace_ctx = fb.block_params(entry_block)[0];
+    let args_ptr = fb.block_params(entry_block)[1];
+    fb.switch_to_block(entry_block);
+    fb.seal_block(entry_block);
+
+    let n_val = fb.ins().load(I64, MemFlags::trusted(), args_ptr, 0);
+    let acc_seed = fb.ins().iconst(I64, 0);
+    let i_seed = fb.ins().iconst(I64, 1);
+
+    // Header block carries (acc, i) as block params.
+    let header_block = fb.create_block();
+    fb.append_block_param(header_block, I64);
+    fb.append_block_param(header_block, I64);
+
+    let body_block = fb.create_block();
+    let exit_block = fb.create_block();
+    let deopt_block = fb.create_block();
+
+    fb.ins().jump(
+        header_block,
+        &[BlockArg::Value(acc_seed), BlockArg::Value(i_seed)],
+    );
+
+    // Header: if i > n -> exit; else -> body.
+    fb.switch_to_block(header_block);
+    let acc_p = fb.block_params(header_block)[0];
+    let i_p = fb.block_params(header_block)[1];
+    let cont = fb.ins().icmp(IntCC::SignedLessThanOrEqual, i_p, n_val);
+    let empty: [BlockArg; 0] = [];
+    fb.ins()
+        .brif(cont, body_block, empty.iter(), exit_block, empty.iter());
+
+    // Body: (sum, of) = sadd_overflow(acc, i); if of -> deopt; else
+    // jump header(sum, i+1).
+    fb.switch_to_block(body_block);
+    fb.seal_block(body_block);
+    let (sum, of) = fb.ins().sadd_overflow(acc_p, i_p);
+    let one = fb.ins().iconst(I64, 1);
+    let next_i = fb.ins().iadd(i_p, one);
+    let no_of = {
+        let zero = fb.ins().iconst(ir::types::I8, 0);
+        fb.ins().icmp(IntCC::Equal, of, zero)
+    };
+    fb.ins().brif(
+        no_of,
+        header_block,
+        &[BlockArg::Value(sum), BlockArg::Value(next_i)],
+        deopt_block,
+        empty.iter(),
+    );
+    fb.seal_block(header_block);
+
+    // Exit: store acc into ctx.result_slot, return Success (0).
+    fb.switch_to_block(exit_block);
+    fb.seal_block(exit_block);
+    fb.ins().store(
+        MemFlags::trusted(),
+        acc_p,
+        trace_ctx,
+        relon_trace_emitter::result_slot_offset(),
+    );
+    let zero_i32 = fb
+        .ins()
+        .iconst(I32, i64::from(TraceEntryStatus::Success.as_i32()));
+    fb.ins().return_(&[zero_i32]);
+
+    // Deopt: call save_deopt(ctx, 0, 0), return GuardFailed (1).
+    fb.switch_to_block(deopt_block);
+    fb.seal_block(deopt_block);
+    let guard_pc = fb.ins().iconst(I32, 0);
+    let ext_pc = fb.ins().iconst(I64, 0);
+    fb.ins()
+        .call(save_deopt_ref, &[trace_ctx, guard_pc, ext_pc]);
+    let failed_i32 = fb
+        .ins()
+        .iconst(I32, i64::from(TraceEntryStatus::GuardFailed.as_i32()));
+    fb.ins().return_(&[failed_i32]);
+
+    fb.finalize();
+
+    let func_id = module
+        .declare_function(
+            "relon_trace_jit_loop_fn",
+            Linkage::Local,
+            &ctx.func.signature,
+        )
+        .expect("declare loop fn");
+    module
+        .define_function(func_id, &mut ctx)
+        .expect("define loop fn");
+    module.finalize_definitions().expect("finalize");
+    let raw = module.get_finalized_function(func_id);
+    // SAFETY: signature matches TRACE_ENTRY_SIG.
+    let entry: unsafe extern "C" fn(*mut TraceContext, *const u64) -> i32 =
+        unsafe { std::mem::transmute(raw) };
+    TraceJitLoopFn {
+        entry,
+        _module: module,
+    }
+}
+
+// =====================================================================
+// =====  dispatch-boundary rows  ======================================
+// =====================================================================
+
+/// Step body for the dispatch-boundary rows: `acc + i` where both args
+/// are sourced via `Op::LocalGet`. Used by the cranelift-AOT entry-fn
+/// build path that pairs with the per-iter caller loop.
 fn step_body() -> Vec<TaggedOp> {
     vec![
         TaggedOp {
@@ -115,33 +532,8 @@ fn step_body() -> Vec<TaggedOp> {
 }
 
 /// Real hot-loop trace body: `LocalGet(0) + LocalGet(1); Return`.
-///
-/// v6-δ M1 measurement: the recorder now emits `TraceOp::LocalGet`
-/// (R1) so the emitter materialises both SSAs off `args_ptr`, and
-/// `Add(I64)` lowers to `sadd_overflow` with an `ArithOverflow` guard
-/// that brifs on the real carry bit (R2) — so the trace's brif goes
-/// to ok_block on every non-overflowing iter. The bench therefore
-/// measures the actual steady-state hot path, not the const-only
-/// stand-in v6-γ M5 had to fall back to.
 fn step_body_trace_real() -> Vec<TaggedOp> {
-    vec![
-        TaggedOp {
-            op: Op::LocalGet(0),
-            range: TokenRange::default(),
-        },
-        TaggedOp {
-            op: Op::LocalGet(1),
-            range: TokenRange::default(),
-        },
-        TaggedOp {
-            op: Op::Add(IrType::I64),
-            range: TokenRange::default(),
-        },
-        TaggedOp {
-            op: Op::Return,
-            range: TokenRange::default(),
-        },
-    ]
+    step_body()
 }
 
 fn step_ir() -> IrModule {
@@ -159,100 +551,49 @@ fn step_ir() -> IrModule {
     }
 }
 
-/// Build a pre-warmed cranelift evaluator for the accumulation step.
-fn build_cranelift() -> CraneliftAotEvaluator {
+/// Pre-warmed cranelift-AOT evaluator for the single-step body — used
+/// by the legacy "Rust-side loop drives N invokes" baseline, not by
+/// the new `cranelift_aot_loop` row.
+fn build_cranelift_step_evaluator() -> CraneliftAotEvaluator {
     CraneliftAotEvaluator::from_ir_direct(
         step_ir(),
         SandboxConfig::default(),
         vec!["arg0".to_string(), "arg1".to_string()],
     )
-    .expect("cranelift compile")
+    .expect("cranelift step compile")
 }
 
-/// Pre-installed trace for `acc + i`. Returns the synthetic fn_id we
-/// registered against; v6-δ M1 trace body really is
-/// `LocalGet + LocalGet + Add + Return`, so the bench measures the
-/// hot-loop steady state instead of the const-only stand-in.
-///
-/// v6-ε-0-C: the default install path now picks
-/// `CallConv::Tail` on x86_64 / aarch64 (per
-/// `relon_trace_emitter::trace_entry_call_conv`); the
-/// `trace_jit_warm` / `trace_jit_warm_ic` rows therefore exercise
-/// the Tail-conv code path. The new `trace_jit_warm_tail` row reaches
-/// in through `jit_compile_buffer_for_fn_with_call_conv` so the
-/// install path is documented even when the default flips back.
+/// Install a `LocalGet+LocalGet+Add+Return` trace through the
+/// recorder-driven default install path. Returns the synthetic fn_id
+/// the trace lives under in the global registry.
 fn install_trace_for_step() -> u32 {
-    // Use the upper half of the fn_id range to stay clear of any
-    // smoke-test fn ids.
     let fn_id = (MAX_FN_ID - 2) as u32;
     let _ = clear_recording(fn_id);
     register_recording(
         fn_id,
         RecordingRegistration {
             body: step_body_trace_real(),
-            // Pre-warmed with I32-typed slots — recorder seeds
-            // `LocalGet` with `ObservedType::I32`, so the TypeCheck
-            // guard policy doesn't flip.
             param_tys: vec![IrType::I32, IrType::I32],
         },
     );
     let state = global_trace_jit_state();
-    // If a previous bench run left a trace installed for the same
-    // fn_id we'd short-circuit and never drive recording. Invalidate
-    // before warming up.
     state.invalidate_trace(fn_id);
-    // Drive recording once with non-overflowing warm-up args so the
-    // recorded TypeCheck / ArithOverflow guard predicates land in
-    // their `passes` arms; the recording walker actually executes
-    // the body so the trace install proves both run.
     let warm: [u64; 2] = [1, 2];
     unsafe {
         relon_codegen_native::trace_install::__relon_jump_to_recorder(fn_id, warm.as_ptr());
     }
     assert!(
         state.lookup_trace(fn_id).is_some(),
-        "trace must install for the hot-loop bench step"
+        "trace must install for the dispatch-boundary bench step"
     );
     fn_id
 }
 
-/// v6-ε-0-C: install a `CallConv::Tail` trace on an isolated
-/// [`TraceJitState`] so the bench can compare the Tail-conv hot
-/// loop directly against the SystemV baseline below.
-///
-/// Uses a hand-built [`relon_trace_jit::TraceBuffer`] with the same
-/// shape as `step_body_trace_real` so the emitter sees an identical
-/// op stream — the only difference between the two install paths is
-/// the call conv on the trace entry signature.
-/// v6-ε-0-A: build the same `LocalGet+LocalGet+Add+Return` body
-/// `install_explicit_conv_trace` builds, but compile it through the
-/// at-call-site inline path
-/// ([`relon_codegen_native::compile_inline_host_fn`]) so the trace
-/// ops live inside the host fn body itself rather than behind a
-/// trampoline `call trace_fn_ptr`.
-///
-/// Returns an owned [`relon_codegen_native::InlineHostFn`] that keeps
-/// the JIT module mapped for the bench's call loop lifetime; the
-/// caller pulls a typed entry pointer off it via
-/// [`relon_codegen_native::InlineHostFn::typed_entry`].
-fn build_inline_step_host_fn() -> relon_codegen_native::InlineHostFn {
-    use relon_trace_jit::{TraceBuffer, TraceOp};
-    let mut buffer = TraceBuffer::new();
-    let a = buffer.fresh_ssa();
-    let b = buffer.fresh_ssa();
-    let sum = buffer.fresh_ssa();
-    buffer.append(TraceOp::LocalGet(a, 0));
-    buffer.append(TraceOp::LocalGet(b, 1));
-    buffer.append(TraceOp::Add(sum, a, b));
-    buffer.append(TraceOp::Return(sum));
-    let trace = std::sync::Arc::new(buffer.into_optimized());
-    compile_inline_host_fn(trace)
-        .expect("inline host-fn compile must succeed for the 4-op step trace")
-}
-
+/// Install the same 4-op trace via an isolated [`TraceJitState`] with
+/// the explicit `call_conv` pinned on the trace entry signature.
 fn install_explicit_conv_trace(call_conv: CallConv) -> (TraceJitState, u32) {
     use relon_trace_jit::{TraceBuffer, TraceOp};
-    let fn_id = 0u32; // local state, isolated from the global registry
+    let fn_id = 0u32;
     let mut buffer = TraceBuffer::new();
     let a = buffer.fresh_ssa();
     let b = buffer.fresh_ssa();
@@ -270,11 +611,39 @@ fn install_explicit_conv_trace(call_conv: CallConv) -> (TraceJitState, u32) {
     (state, fn_id)
 }
 
+/// Build the same 4-op trace through the at-call-site inline path
+/// (v6-ε-0-A). Used by the `dispatch_inline` row.
+fn build_inline_step_host_fn() -> relon_codegen_native::InlineHostFn {
+    use relon_trace_jit::{TraceBuffer, TraceOp};
+    let mut buffer = TraceBuffer::new();
+    let a = buffer.fresh_ssa();
+    let b = buffer.fresh_ssa();
+    let sum = buffer.fresh_ssa();
+    buffer.append(TraceOp::LocalGet(a, 0));
+    buffer.append(TraceOp::LocalGet(b, 1));
+    buffer.append(TraceOp::Add(sum, a, b));
+    buffer.append(TraceOp::Return(sum));
+    let trace = Arc::new(buffer.into_optimized());
+    compile_inline_host_fn(trace).expect("inline host-fn compile must succeed")
+}
+
+// =====================================================================
+// =====  tree-walker fixture  =========================================
+// =====================================================================
+
+/// Tree-walker fixture for the `tree_walk_loop` row: a Relon `#main`
+/// that delegates to `list.sum(range(n))`. `range(n)` builds
+/// `[0, 1, ..., n-1]` via the top-level builtin; `list.sum` reaches
+/// into the stdlib `std/list` module which is `_list_reduce`-backed.
+/// The per-iter cost reported by criterion is total_runtime /
+/// `TREE_WALK_LOOP_N`.
+///
+/// We deliberately don't try to hand-roll a tree-walker `while` loop
+/// — Relon's source surface composes the loop primitive via
+/// `_list_reduce`, and that's the canonical "Relon hot loop" shape on
+/// the tree-walker path.
 fn build_tree_walker() -> TreeWalkEvaluator {
-    // The tree-walker takes a Relon source. We use a single-iter
-    // `#main(Int acc, Int i) -> Int : acc + i` body so the per-call
-    // shape mirrors the trace-JIT invocation.
-    let src = "#main(Int acc, Int i) -> Int\nacc + i";
+    let src = "#import list from \"std/list\"\n#main(Int n) -> Int\nlist.sum(range(n))";
     let node = parse_document(src).expect("parse");
     let analyzed = Arc::new(relon_analyzer::analyze(&node));
     let mut ctx = Context::new()
@@ -284,84 +653,146 @@ fn build_tree_walker() -> TreeWalkEvaluator {
     TreeWalkEvaluator::new(Arc::new(ctx))
 }
 
-fn args_acc_i(acc: i64, i: i64) -> HashMap<String, Value> {
-    let mut m = HashMap::with_capacity(2);
-    m.insert("acc".to_string(), Value::Int(acc));
-    m.insert("i".to_string(), Value::Int(i));
+/// Argument helpers for the cranelift-AOT and tree-walker invocation
+/// shapes. The cranelift-AOT row's evaluator is built with the
+/// synthetic param name `n` (see [`build_cranelift_aot_loop`]).
+fn args_n_for_cranelift(n: i64) -> HashMap<String, Value> {
+    let mut m = HashMap::with_capacity(1);
+    m.insert("n".to_string(), Value::Int(n));
     m
 }
 
-fn args_acc_i_arg0(acc: i64, i: i64) -> HashMap<String, Value> {
-    // Cranelift's `from_ir_direct` constructor uses the synthetic
-    // arg0 / arg1 names we supplied above.
+fn args_n_for_tree_walk(n: i64) -> HashMap<String, Value> {
+    let mut m = HashMap::with_capacity(1);
+    m.insert("n".to_string(), Value::Int(n));
+    m
+}
+
+fn args_acc_i_step_eval(acc: i64, i: i64) -> HashMap<String, Value> {
     let mut m = HashMap::with_capacity(2);
     m.insert("arg0".to_string(), Value::Int(acc));
     m.insert("arg1".to_string(), Value::Int(i));
     m
 }
 
+// =====================================================================
+// =====  bench entry  =================================================
+// =====================================================================
+
 fn bench_hot_loop(c: &mut Criterion) {
-    let mut group = c.benchmark_group("v6_gamma_m5_hot_loop");
-    // Long enough sample window for criterion to settle. 5s of
-    // wall-clock keeps the run cheap on CI while still giving each
-    // row >= 30 samples.
+    let mut group = c.benchmark_group("v6_epsilon_hot_loop");
     group.sample_size(30);
     group.measurement_time(Duration::from_secs(6));
+    // Throughput::Elements(HOT_LOOP_N) makes criterion print per-iter
+    // cost; this works for both the "single invoke runs N iters
+    // internally" rows and the "Rust loop drives N invokes" rows.
     group.throughput(Throughput::Elements(HOT_LOOP_N));
 
-    // ---- Row 1: tree-walk baseline. ----
+    // ---------------- loop-INSIDE rows ----------------
+
+    // --- tree_walk_loop: single invoke; tree-walker runs the full
+    //     loop internally via `list.sum(range(n))`. N drops to
+    //     `TREE_WALK_LOOP_N = 10_000` so the bench wall-clock stays
+    //     manageable (tree-walker is µs/iter class on a 1M-element
+    //     list); throughput adjusts to keep the per-element-cost
+    //     surface honest.
     let walker = build_tree_walker();
     let scope = Arc::new(Scope::default());
-    group.bench_function(BenchmarkId::new("backend", "tree_walk"), |b| {
+    let tw_n = TREE_WALK_LOOP_N as i64;
+    group.throughput(Throughput::Elements(TREE_WALK_LOOP_N));
+    group.bench_function(BenchmarkId::new("backend", "tree_walk_loop"), |b| {
+        b.iter(|| {
+            let v = walker
+                .run_main(&scope, args_n_for_tree_walk(black_box(tw_n)))
+                .expect("tree-walk run_main");
+            black_box(v)
+        });
+    });
+    // Reset throughput back to HOT_LOOP_N for the remaining rows.
+    group.throughput(Throughput::Elements(HOT_LOOP_N));
+
+    // --- cranelift_aot_loop: single invoke; the cranelift-AOT fn body
+    //     IS the `sum 1..=n` loop. We pass `n = HOT_LOOP_N` so the loop
+    //     runs exactly `HOT_LOOP_N` body iters (i runs 1..=N with exit
+    //     when i > N). The bench compares per-iter cost; the absolute
+    //     result is the analytic `N*(N+1)/2` which `black_box` keeps.
+    let cranelift_loop = build_cranelift_aot_loop();
+    let n_full = HOT_LOOP_N as i64;
+    group.bench_function(BenchmarkId::new("backend", "cranelift_aot_loop"), |b| {
+        b.iter(|| {
+            let v = cranelift_loop
+                .run_main(args_n_for_cranelift(black_box(n_full)))
+                .expect("cranelift sum-loop run_main");
+            black_box(v)
+        });
+    });
+
+    // --- trace_jit_loop: the real hot-loop measurement. One Rust→JIT
+    //     invoke; the JIT fn body runs `n_full` iters (1..=n) with
+    //     overflow guard inside cranelift's compiled loop. No per-iter
+    //     extern-C boundary; the entire hot loop is inside the trace.
+    let trace_loop_fn = build_trace_jit_loop_fn();
+    group.bench_function(BenchmarkId::new("backend", "trace_jit_loop"), |b| {
+        b.iter(|| {
+            let mut ctx = TraceContext::with_capacity(64);
+            let args: [u64; 1] = [black_box(n_full) as u64];
+            let raw = unsafe { trace_loop_fn.invoke(&mut ctx as *mut _, args.as_ptr()) };
+            // Expect Success; a guard fire would surface here so we
+            // can fail loudly without polluting the measurement.
+            assert_eq!(raw, 0, "trace_jit_loop must finish on the Success path");
+            black_box(ctx.result_slot as i64)
+        });
+    });
+    drop(trace_loop_fn);
+
+    // --- rust_native_loop: pure Rust theoretical floor. Same `1..=n`
+    //     shape as `cranelift_aot_loop` / `trace_jit_loop` so the
+    //     comparison is direct.
+    group.bench_function(BenchmarkId::new("backend", "rust_native_loop"), |b| {
         b.iter(|| {
             let mut acc: i64 = 0;
-            for i in 0..HOT_LOOP_N as i64 {
-                let r = walker
-                    .run_main(&scope, args_acc_i(black_box(acc), black_box(i)))
-                    .expect("tree-walk run_main");
-                if let Value::Int(v) = r {
-                    acc = v;
-                }
+            let n = black_box(n_full);
+            for i in 1..=n {
+                acc = match acc.checked_add(i) {
+                    Some(v) => v,
+                    None => acc.wrapping_add(i),
+                };
             }
             black_box(acc)
         });
     });
 
-    // ---- Row 2: cranelift-AOT warm. ----
-    let cranelift = build_cranelift();
-    group.bench_function(BenchmarkId::new("backend", "cranelift_aot"), |b| {
-        b.iter(|| {
-            let mut acc: i64 = 0;
-            for i in 0..HOT_LOOP_N as i64 {
-                let r = cranelift
-                    .run_main(args_acc_i_arg0(black_box(acc), black_box(i)))
-                    .expect("cranelift run_main");
-                if let Value::Int(v) = r {
-                    acc = v;
-                }
-            }
-            black_box(acc)
-        });
-    });
+    // ---------------- dispatch-boundary rows ----------------
+    //
+    // These rows preserve the v6-γ M5 → v6-ε-0-A measurement shape so
+    // the falsification chain stays auditable in one bench output.
+    // Each row's caller is a Rust `for` loop that invokes the trace
+    // fn `HOT_LOOP_N` times. They measure the Rust→JIT call boundary
+    // cost per dispatch, NOT hot-loop per-iter cost.
 
-    // ---- Row 3: trace-JIT warm. ----
-    //
-    // Pre-install the trace; allocate a single reusable TraceContext;
-    // call the trace entry directly in the tight loop.
-    //
-    // v6-δ M1 measurement: the installed trace body is the real
-    // `LocalGet(0) + LocalGet(1); Return` shape (see
-    // `step_body_trace_real` for rationale). Each iter packs
-    // `(acc, i)` into a 2-slot u64 array, calls the trace, and reads
-    // the sum out of `ctx.result_slot`. No Rust-side fallback compute:
-    // a deopt would surface a `Success != GuardFailed` mismatch and
-    // we'd want the bench to fail loudly. The ArithOverflow guard
-    // (R2) brifs on the real carry bit so non-overflowing iters never
-    // deopt.
+    let step_eval = build_cranelift_step_evaluator();
+    group.bench_function(
+        BenchmarkId::new("backend", "dispatch_cranelift_step"),
+        |b| {
+            b.iter(|| {
+                let mut acc: i64 = 0;
+                for i in 0..HOT_LOOP_N as i64 {
+                    let r = step_eval
+                        .run_main(args_acc_i_step_eval(black_box(acc), black_box(i)))
+                        .expect("cranelift step run_main");
+                    if let Value::Int(v) = r {
+                        acc = v;
+                    }
+                }
+                black_box(acc)
+            });
+        },
+    );
+
     let fn_id = install_trace_for_step();
     let state = global_trace_jit_state();
     let trace_fn = state.lookup_trace(fn_id).expect("post-install");
-    group.bench_function(BenchmarkId::new("backend", "trace_jit_warm"), |b| {
+    group.bench_function(BenchmarkId::new("backend", "dispatch_trampoline"), |b| {
         b.iter(|| {
             let mut acc: i64 = 0;
             let mut ctx = TraceContext::with_capacity(64);
@@ -369,50 +800,24 @@ fn bench_hot_loop(c: &mut Criterion) {
             for i in 0..HOT_LOOP_N as i64 {
                 args[0] = black_box(acc) as u64;
                 args[1] = black_box(i) as u64;
-                // SAFETY: TRACE_ENTRY_SIG is `(*mut TraceContext, *const u64)`;
-                // `args` carries the two LocalGet slots the trace reads
-                // off `args_ptr + slot_idx * 8`.
                 let status = unsafe { trace_fn.invoke(&mut ctx as *mut _, args.as_ptr()) };
                 if matches!(status, TraceEntryStatus::Success) {
                     acc = ctx.result_slot as i64;
                 } else {
-                    // Deopt (overflow guard) — keep the loop alive
-                    // with wrapping arith so we still finish 1M iters
-                    // when running on `i64::MAX`-style edge inputs;
-                    // criterion's input range stays in non-overflow
-                    // territory so this branch is cold.
                     acc = acc.wrapping_add(i);
                 }
             }
             black_box(acc)
         });
     });
-    // Keep `trace_fn` Arc alive for the IC row's lifetime as well.
     drop(trace_fn);
 
-    // ---- Row 4: trace-JIT warm via IC dispatch (v6-δ M2-C). ----
-    //
-    // The IC slot caches the typed entry pointer on the first iter;
-    // every subsequent iter is one `call rax` against the cached
-    // pointer + a raw `i32 == 0` Success check. No Arc deref, no
-    // `transmute` per iter, no `match` arm building a
-    // `TraceEntryStatus` enum.
-    //
-    // The `type_sig` we pass is a stable opaque token — for this
-    // bench the trace is monomorphic so we use 0; production hosts
-    // would derive it from the call site's static type table.
-    //
-    // The trace was installed by Row 3's warm-up; we just look it up
-    // through the IC slot here.
     let ic_slot = TraceIcSlot::new();
     let entry = ic_slot
         .lookup_or_install(fn_id, 0)
         .expect("IC slot must resolve installed trace");
-    // Re-acquire the Arc explicitly so the bench loop's lifetime is
-    // tied to a clear owner. The IC slot also retains an Arc so the
-    // module can't be dropped under us.
     let _trace_anchor = state.lookup_trace(fn_id).expect("post-install (ic)");
-    group.bench_function(BenchmarkId::new("backend", "trace_jit_warm_ic"), |b| {
+    group.bench_function(BenchmarkId::new("backend", "dispatch_ic"), |b| {
         b.iter(|| {
             let mut acc: i64 = 0;
             let mut ctx = TraceContext::with_capacity(64);
@@ -420,15 +825,10 @@ fn bench_hot_loop(c: &mut Criterion) {
             for i in 0..HOT_LOOP_N as i64 {
                 args[0] = black_box(acc) as u64;
                 args[1] = black_box(i) as u64;
-                // SAFETY: `entry` is the typed entry pointer from
-                // [`TraceIcSlot::lookup_or_install`]; the anchoring
-                // Arc is held above so the JIT module stays mapped.
-                // The contract is identical to TRACE_ENTRY_SIG.
                 let raw = unsafe { entry(&mut ctx as *mut _, args.as_ptr()) };
                 if raw == 0 {
                     acc = ctx.result_slot as i64;
                 } else {
-                    // Deopt branch (cold).
                     acc = acc.wrapping_add(i);
                 }
             }
@@ -436,36 +836,12 @@ fn bench_hot_loop(c: &mut Criterion) {
         });
     });
 
-    // ---- Row 4b: explicit CallConv::Tail trace via IC dispatch (v6-ε-0-C). ----
-    //
-    // Installs a hand-built `LocalGet+LocalGet+Add+Return` trace
-    // with the trace entry signature pinned to `CallConv::Tail`,
-    // then exercises it through the same IC-slot fast path Row 4
-    // uses. On x86_64 / aarch64 the default install path already
-    // picks Tail (see `relon_trace_emitter::trace_entry_call_conv`),
-    // so this row's number is expected to match Row 4 numerically —
-    // the row exists so the bench output makes the Tail dispatch
-    // path explicit (not hiding behind a `cfg(target_arch)` defaul
-    // that future contributors might silently flip).
-    //
-    // The trace is hand-built (vs Row 4's recorder-driven install)
-    // because `__relon_jump_to_recorder` goes through the default
-    // conv path; reaching `jit_compile_buffer_for_fn_with_call_conv`
-    // requires sidestepping the recorder driver.
     let (tail_state, tail_fn_id) = install_explicit_conv_trace(CallConv::Tail);
-    let tail_ic_slot = TraceIcSlot::new();
-    // Resolve through a custom mini lookup: the IC slot resolves
-    // through the global registry, but the explicit-conv state is
-    // local. Read the typed entry pointer off the local install.
     let tail_trace_anchor = tail_state
         .lookup_trace(tail_fn_id)
         .expect("explicit-Tail install");
     let tail_entry = unsafe { tail_trace_anchor.typed_entry() };
-    // Keep the IC slot allocation symmetrical with Row 4 even though
-    // we don't actually consult it — that way the bench surface
-    // exposes one IC alloc per row.
-    let _ = tail_ic_slot;
-    group.bench_function(BenchmarkId::new("backend", "trace_jit_warm_tail"), |b| {
+    group.bench_function(BenchmarkId::new("backend", "dispatch_tail"), |b| {
         b.iter(|| {
             let mut acc: i64 = 0;
             let mut ctx = TraceContext::with_capacity(64);
@@ -473,10 +849,6 @@ fn bench_hot_loop(c: &mut Criterion) {
             for i in 0..HOT_LOOP_N as i64 {
                 args[0] = black_box(acc) as u64;
                 args[1] = black_box(i) as u64;
-                // SAFETY: `tail_entry` is a typed fn pointer from
-                // a `JITedTraceFn` whose lifetime is anchored by
-                // `tail_trace_anchor`. ctx is exclusive; args is a
-                // 2-element u64 array.
                 let raw = unsafe { tail_entry(&mut ctx as *mut _, args.as_ptr()) };
                 if raw == 0 {
                     acc = ctx.result_slot as i64;
@@ -488,22 +860,14 @@ fn bench_hot_loop(c: &mut Criterion) {
         });
     });
     drop(tail_trace_anchor);
-    // tail_state holds the JITModule live for the bench loop above.
     drop(tail_state);
 
-    // ---- Row 4c: explicit CallConv::SystemV trace (v6-δ M2-C baseline). ----
-    //
-    // Install the same hand-built trace with the SystemV conv so the
-    // bench keeps a stable baseline against the M2-C measurement of
-    // 9.53 ns/iter. Diffing `trace_jit_warm_sysv` vs
-    // `trace_jit_warm_tail` directly quantifies the v6-ε-0-C
-    // contribution.
     let (sysv_state, sysv_fn_id) = install_explicit_conv_trace(CallConv::SystemV);
     let sysv_trace_anchor = sysv_state
         .lookup_trace(sysv_fn_id)
         .expect("explicit-SystemV install");
     let sysv_entry = unsafe { sysv_trace_anchor.typed_entry() };
-    group.bench_function(BenchmarkId::new("backend", "trace_jit_warm_sysv"), |b| {
+    group.bench_function(BenchmarkId::new("backend", "dispatch_sysv"), |b| {
         b.iter(|| {
             let mut acc: i64 = 0;
             let mut ctx = TraceContext::with_capacity(64);
@@ -511,9 +875,6 @@ fn bench_hot_loop(c: &mut Criterion) {
             for i in 0..HOT_LOOP_N as i64 {
                 args[0] = black_box(acc) as u64;
                 args[1] = black_box(i) as u64;
-                // SAFETY: same contract as the Tail row above; the
-                // entry pointer just lowers to a different conv at
-                // the machine-code level.
                 let raw = unsafe { sysv_entry(&mut ctx as *mut _, args.as_ptr()) };
                 if raw == 0 {
                     acc = ctx.result_slot as i64;
@@ -527,46 +888,9 @@ fn bench_hot_loop(c: &mut Criterion) {
     drop(sysv_trace_anchor);
     drop(sysv_state);
 
-    // ---- Row 4d: v6-ε-0-A — at-call-site inline trace. ----
-    //
-    // Builds the same `LocalGet+LocalGet+Add+Return` body, but instead
-    // of compiling a stand-alone trace entry function that the bench
-    // calls into via the trampoline call/ret + arg-marshall pair, the
-    // trace ops are spliced **directly into the host fn body** via
-    // [`relon_codegen_native::compile_inline_host_fn`]. The resulting
-    // function still obeys [`relon_trace_abi::TRACE_ENTRY_SIG`] so the
-    // bench loop's call shape is identical to Rows 4 / 4b / 4c — what
-    // changes is the **interior**: there is no inner `call trace_fn`
-    // between the host fn prologue and its `ret`. The host fn body
-    // is the trace body.
-    //
-    // ## Honest framing
-    //
-    // The Rust → JIT-fn boundary the bench loop pays per iter is the
-    // SAME boundary every other Row 3/4 variant pays — the bench
-    // caller is Rust, the callee is cranelift. Inlining one CALL into
-    // the host fn (the v6-ε-0-A scope) doesn't make the Rust→JIT call
-    // boundary go away; it just hides any **inner** trace-call hop.
-    // The inner hop only exists when the host fn has a real
-    // `call trace_fn_ptr` site (e.g. when the cranelift-AOT entry fn
-    // dispatches through an IC slot in the production wire-up — a
-    // surface this bench doesn't exercise yet). So the
-    // `trace_jit_warm_inline` number is expected to land **within
-    // criterion noise of `trace_jit_warm_ic`**. The row exists to:
-    //
-    // 1. prove the inline infrastructure is real (cranelift compiles
-    //    + runs the spliced IR, gives bit-identical results to the
-    //    trampoline path — see `tests/trace_jit_inline_smoke.rs`);
-    // 2. give the v6-ε-0-A stage report a concrete number to diff
-    //    against `trace_jit_warm_ic`, supporting the M2-C-falsification
-    //    narrative (the 9.5 ns floor is Rust→JIT, not the inner trace
-    //    hop);
-    // 3. anchor the next stage (ε-M1 / "compile the loop into
-    //    cranelift") which is where the inline path's value actually
-    //    surfaces.
     let inline_host_fn = build_inline_step_host_fn();
     let inline_entry = unsafe { inline_host_fn.typed_entry() };
-    group.bench_function(BenchmarkId::new("backend", "trace_jit_warm_inline"), |b| {
+    group.bench_function(BenchmarkId::new("backend", "dispatch_inline"), |b| {
         b.iter(|| {
             let mut acc: i64 = 0;
             let mut ctx = TraceContext::with_capacity(64);
@@ -574,8 +898,6 @@ fn bench_hot_loop(c: &mut Criterion) {
             for i in 0..HOT_LOOP_N as i64 {
                 args[0] = black_box(acc) as u64;
                 args[1] = black_box(i) as u64;
-                // SAFETY: `inline_entry` obeys TRACE_ENTRY_SIG. ctx is
-                // exclusive; args is a 2-element u64 array.
                 let raw = unsafe { inline_entry(&mut ctx as *mut _, args.as_ptr()) };
                 if raw == 0 {
                     acc = ctx.result_slot as i64;
@@ -588,34 +910,31 @@ fn bench_hot_loop(c: &mut Criterion) {
     });
     drop(inline_host_fn);
 
-    // ---- Row 5: Rust-inlined baseline (diagnostic). ----
-    //
-    // Pure-Rust `acc + i` with a checked-add for the overflow guard
-    // analogue. This is the **theoretical floor** for the trace's
-    // hot-loop body — if cranelift were able to inline the trace body
-    // into the bench's call site (instead of emitting a separate
-    // function with its own prologue + epilogue), this is roughly
-    // what the bench would measure.
-    //
-    // Comparing `trace_jit_warm_ic` vs this row tells us how much
-    // cost lives in the **function-call boundary** (prologue +
-    // epilogue + Rust-side call setup) vs the body work itself. The
-    // gap is the v6-ε "trace-to-trace fall-through" budget (per the
-    // v6-δ M1 bench appendix §"Honest comparison to LuaJIT").
-    group.bench_function(BenchmarkId::new("backend", "rust_inlined_baseline"), |b| {
-        b.iter(|| {
-            let mut acc: i64 = 0;
-            for i in 0..HOT_LOOP_N as i64 {
-                let a = black_box(acc);
-                let j = black_box(i);
-                acc = match a.checked_add(j) {
-                    Some(v) => v,
-                    None => a.wrapping_add(j),
-                };
-            }
-            black_box(acc)
-        });
-    });
+    // --- dispatch_rust_inlined_baseline: same Rust-side per-iter
+    //     dispatch shape as the trace-fn rows above, but the callee
+    //     body is the pure-Rust `checked_add`. Theoretical floor for
+    //     the **dispatch-shape** rows (NOT the loop-INSIDE rows).
+    //     The gap between this and the dispatch rows isolates the
+    //     Rust→JIT extern-C boundary cost cleanly.
+    let ic_slot_owner = ic_slot;
+    let _ = ic_slot_owner; // keep IC slot alloc alive symmetrically.
+    group.bench_function(
+        BenchmarkId::new("backend", "dispatch_rust_inlined_baseline"),
+        |b| {
+            b.iter(|| {
+                let mut acc: i64 = 0;
+                for i in 0..HOT_LOOP_N as i64 {
+                    let a = black_box(acc);
+                    let j = black_box(i);
+                    acc = match a.checked_add(j) {
+                        Some(v) => v,
+                        None => a.wrapping_add(j),
+                    };
+                }
+                black_box(acc)
+            });
+        },
+    );
 
     group.finish();
 }

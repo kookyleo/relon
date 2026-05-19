@@ -1514,6 +1514,10 @@ name = "relon-bench"
 version = "0.1.0"
 dependencies = [
  "cranelift-codegen",
+ "cranelift-frontend",
+ "cranelift-jit",
+ "cranelift-module",
+ "cranelift-native",
  "criterion",
  "dhat",
  "relon-analyzer",
@@ -1523,6 +1527,7 @@ dependencies = [
  "relon-ir",
  "relon-parser",
  "relon-trace-abi",
+ "relon-trace-emitter",
  "relon-trace-jit",
  "tempfile",
 ]

@@ -35,6 +35,20 @@ relon-trace-jit = { workspace = true }
 # comparison is direct. Pulling cranelift-codegen here only exposes
 # the `CallConv` enum to the bench surface.
 cranelift-codegen = "0.131"
+# v6-ε bench-rewrite (2026-05-19): the new `trace_jit_loop` row
+# hand-builds a cranelift JIT module whose body runs the full N-iter
+# loop internally (bypassing the recorder gap). Frontend + module +
+# jit + native are needed for that build path; they pull in the same
+# 0.131 line the workspace already pins for `relon-codegen-native`.
+cranelift-frontend = "0.131"
+cranelift-module = "0.131"
+cranelift-jit = "0.131"
+cranelift-native = "0.131"
+# `result_slot_offset()` / `host_hooks_offset()` are exposed by the
+# trace-emitter crate; we link them in for the bench's
+# `trace_jit_loop` row so the JIT fn writes through the canonical
+# TraceContext field rather than hard-coding the byte offset.
+relon-trace-emitter = { workspace = true }
 dhat = { version = "0.3", optional = true }
 
 [dev-dependencies]
@@ -75,9 +89,14 @@ name = "cranelift_aot_vs_tree_walk"
 harness = false
 path = "benches/cranelift_aot_vs_tree_walk.rs"
 
-# v6-γ M5: trace-JIT hot-loop micro-bench. Three rows (tree_walk,
-# cranelift_aot, trace_jit_warm) on a million-iter `acc += i` loop.
-# Target for the trace-JIT row: < 5 ns / iter (LuaJIT trace tier).
+# v6-γ M5 → v6-ε bench-rewrite (2026-05-19): trace-JIT hot-loop
+# micro-bench. The historical "Rust drives N invokes" rows are kept
+# under the `dispatch_*` prefix as the M2-C → ε-0-A falsification
+# chain reference, but the headline rows are now the loop-INSIDE
+# variants (`tree_walk_loop`, `cranelift_aot_loop`, `trace_jit_loop`,
+# `rust_native_loop`) which invoke the callee **once** and measure
+# total / `HOT_LOOP_N`. See the bench module doc + the v6-ε
+# bench-rewrite report for the methodology rationale.
 # Run via `cargo bench -p relon-bench --bench trace_jit_hot_loop`.
 [[bench]]
 name = "trace_jit_hot_loop"
