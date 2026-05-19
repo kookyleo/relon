@@ -310,7 +310,17 @@ pub fn lower_op(op: &Op, cx: OpLoweringContext<'_>) -> LowerOutcome {
             // the recorder allocates a fresh marker id and rewrites
             // this before appending. Using SsaVar::NONE as a sentinel
             // is fine because MarkLoopHead carries the id inline.
-            op: TraceOp::MarkLoopHead { loop_id: 0 },
+            //
+            // ε-M0: the φ list is empty here because this lowering
+            // rule fires from the per-op path that has no view of
+            // loop-carried let-slots; the recorder's higher-level
+            // [`crate::record_loop`] entry point is what builds the
+            // full [`TraceOp::MarkLoopHead`] / [`TraceOp::MarkLoopBack`]
+            // pair with real φ pairs.
+            op: TraceOp::MarkLoopHead {
+                loop_id: 0,
+                phis: vec![],
+            },
         },
         Op::If { .. } => LowerOutcome::Abort(AbortReason::UnsupportedOp("If")),
 

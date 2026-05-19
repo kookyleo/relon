@@ -25,8 +25,8 @@ pub mod recorder;
 pub mod type_obs;
 
 pub use abort::AbortReason;
-pub use lowering::{lower_op, map_effect_class, OpLoweringContext};
-pub use recorder::{RecordResult, RecorderState, SsaAllocator};
+pub use lowering::{lower_op, map_effect_class, LookupKind, OpLoweringContext};
+pub use recorder::{LoopCarry, RecordResult, RecorderState, SsaAllocator};
 pub use type_obs::{infer_observed_type, ObservedType};
 
 /// Re-exported convenience aliases so downstream callers do not have

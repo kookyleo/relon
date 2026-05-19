@@ -107,7 +107,7 @@ fn nested_loop_markers_get_unique_ids() {
         .ops
         .iter()
         .filter_map(|o| match o {
-            TraceOp::MarkLoopHead { loop_id } => Some(*loop_id),
+            TraceOp::MarkLoopHead { loop_id, .. } => Some(*loop_id),
             _ => None,
         })
         .collect();
