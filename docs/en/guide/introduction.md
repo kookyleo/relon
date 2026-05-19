@@ -22,6 +22,11 @@ the same input always produces a byte-identical result.
   `std/string`, `std/math`, … ship with the runtime — scripts can
   `#import` them without the embedder wiring anything up. Authors
   depend only on the stable names the language provides.
+* **Multi-tier auto-execution.** Tree-walk / bytecode VM / Cranelift
+  AOT / trace JIT — `Backend::Auto` switches between them based on
+  heat. Cold code starts instantly; hot code enters a trace-JIT fast
+  path that approaches LuaJIT trace tier. The four sandbox checks
+  (bounds / trap / capability / resource) are preserved at every tier.
 
 <figure style="margin: 2rem auto; max-width: 720px; text-align: center;">
   <img src="/positioning.svg" alt="Relon two-tier authoring diagram" style="width: 100%; height: auto;" />
@@ -115,6 +120,21 @@ To prevent misreadings, here's what's deliberately out of scope:
 - ❌ **Cross-language native type / decorator registration**: the v1 cross-language roadmap is a C ABI "JSON in / JSON out" entry plus native-fn callbacks via JSON-wire — not schema registration from Python/Node.
 - ❌ **Multi-environment branching primitives**: no `dev/staging/prod` keywords — use plain `match` / `if`.
 
+## Execution model & performance (at a glance)
+
+Relon's runtime is **tiered and auto-switching**: the same `.relon`
+source may be executed by any of four backends depending on heat —
+tree-walk (interpreter), bytecode VM, Cranelift AOT, and trace JIT.
+The `Backend::Auto` entry picks a tier based on IR-op-count and
+call-count thresholds; callers don't have to choose.
+
+The tight integer hot loop measures **2.13 ns/iter** (recorded trace,
+trace JIT), with a **339 μs cached cold start** (artefacts persist to
+disk, so the next launch only `dlopen`s instead of recompiling).
+String / dict hot paths are still being optimised — not every workload
+is yet near LuaJIT. For the full numbers, paired benchmarks, and
+honest caveats see [Performance & execution tiers](./performance.md).
+
 ## Where to go next
 
 - Syntax basics: [Syntax basics](./syntax)
@@ -123,4 +143,5 @@ To prevent misreadings, here's what's deliberately out of scope:
 - Embedding into a Rust host: [Host integration](./host-integration)
 - Running untrusted scripts: [Sandbox & capabilities](./sandbox)
 - Standard library tour: [Standard library](./stdlib)
+- Performance & execution tiers: [Performance & execution tiers](./performance)
 - Project on GitHub: <https://github.com/kookyleo/relon>

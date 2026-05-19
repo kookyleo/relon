@@ -20,11 +20,11 @@ features:
   - title: 设计上的确定性
     details: "同源 + 同输入 → 字节级相同的输出。Dict 走 BTreeMap 保序、IEEE-754 f64 无歧义、不读环境变量、不依赖隐式上下文。把同一份 .relon 跑两次必然得到同一个结果，可重放、可 hash、可缓存。"
   - title: 默认沙箱，无逃生口
-    details: "脚本零环境特权。`Capabilities` 显式控制文件读、求值步数、value 元素水位、原生函数白名单——没有「trusted 模式」让脚本绕过宿主授权。安全审计的边界明确。"
+    details: "脚本零环境特权。`Capabilities` 显式控制文件读、求值步数、value 元素水位、原生函数白名单。bounds / trap / capability / resource 四道安检在所有执行档位都完整保留——没有「trusted 模式」让脚本绕过宿主授权。"
   - title: 自描述类型契约
     details: "`#schema`、sum-type tagged enum、递归 schema、品牌标记、计算默认值——契约信息和载荷一起传输，下游不需要带外文档就能校验。"
   - title: 上下文感知引用
     details: "`&root`、`&sibling`、`&prev`、`&next` 让逻辑声明式地引用周围数据，无硬编码路径——把片段移到结构里的另一个位置，引用会自动重新解析到新邻居。"
+  - title: 多档自动执行，接近 LuaJIT trace tier
+    details: "Tree-walk → bytecode VM → Cranelift AOT → trace JIT，按热度由 `Backend::Auto` 自动切档。紧凑整数 hot loop 实测 2.13 ns/iter（recorded trace），cached cold start 339 μs；string / dict 热路径仍在优化中。详见 [性能与执行档位](./guide/performance.md)。"
 ---
-
-<RelonGallery />

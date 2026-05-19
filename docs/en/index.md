@@ -20,11 +20,11 @@ features:
   - title: Deterministic by design
     details: "Same source + same input → byte-identical output. Dict iteration is `BTreeMap`-ordered, floats are IEEE-754 `f64`, the environment is opaque to the script. Replay, hash, cache evaluation freely — running the same `.relon` twice cannot diverge."
   - title: Sandboxed by default — no escape hatch
-    details: "Scripts hold zero ambient privileges. `Capabilities` explicitly grant filesystem reads, step budgets, value-size watermarks, and per-function allowlists. There is no \"trusted mode\" the script can fall back to without the host's consent."
+    details: "Scripts hold zero ambient privileges. `Capabilities` explicitly grant filesystem reads, step budgets, value-size watermarks, and per-function allowlists. The four checks — bounds / trap / capability / resource — are preserved across every execution tier. There is no \"trusted mode\" that bypasses host consent."
   - title: Self-describing type contracts
     details: "`#schema`, sum-type tagged enums, recursive schemas, branded values, computed defaults — type information travels with the payload. Receivers validate without out-of-band documentation."
   - title: Context-aware references
     details: "`&root`, `&sibling`, `&prev`, `&next` let logic reference its surrounding data declaratively — move a fragment to a different position in the tree and references re-resolve against its new neighbors automatically."
+  - title: Multi-tier auto-execution, approaching LuaJIT trace tier
+    details: "Tree-walk → bytecode VM → Cranelift AOT → trace JIT, switched automatically by `Backend::Auto` based on heat. Tight integer hot loop measures 2.13 ns/iter (recorded trace); cached cold start 339 μs. String / dict hot paths are still being optimised. See [Performance & execution tiers](./guide/performance.md) for the full picture."
 ---
-
-<RelonGallery />
