@@ -330,6 +330,92 @@ impl RecorderState {
         }
     }
 
+    /// F-D8: emit a `TraceOp::ListGet` op into the trace buffer.
+    ///
+    /// Used by the IR walker / source-side lowering when it recognises
+    /// a list indexed access pattern (`xs[i]` shape). The recorder
+    /// allocates a fresh SSA dst, records its observed type as `I64`,
+    /// updates the operand stack mirror so the next consumer sees the
+    /// load result on top, and prepends a `BoundsCheck` guard to the
+    /// buffer so the optimiser pipeline can lift it under LICM.
+    ///
+    /// `list_ssa` / `idx_ssa` are the SSAs the IR walker pushed for
+    /// the list pointer and the index; both must already be bound in
+    /// the recorder's `ir_to_ssa` table. The emitter side performs
+    /// the actual bounds compare inline (`cmp idx < len; brif ok,
+    /// deopt`), so the buffer-side `BoundsCheck` guard serves as the
+    /// deopt site for the optimiser passes to anchor LICM decisions
+    /// against — it does NOT emit a redundant runtime compare.
+    ///
+    /// Returns the destination SSA, or `None` if the recorder is in a
+    /// sticky abort/terminated state.
+    pub fn emit_list_get(&mut self, list_ssa: SsaVar, idx_ssa: SsaVar) -> Option<SsaVar> {
+        if self.aborted.is_some() || self.terminated {
+            return None;
+        }
+        if self.buffer.op_count() >= self.capacity {
+            self.aborted = Some(AbortReason::TraceTooLong);
+            return None;
+        }
+        let dst = self.ssa.alloc();
+        // Bounds guard anchored on the list_ssa / idx_ssa pair. The
+        // emitter folds it into an inline compare; the buffer-side
+        // record gives the LICM pass a hoist target.
+        self.append_guard_with_site(GuardKind::BoundsCheck(idx_ssa, list_ssa), idx_ssa);
+        self.buffer.append(TraceOp::ListGet {
+            dst,
+            list_ptr: list_ssa,
+            idx: idx_ssa,
+        });
+        // Mirror the operand-stack update: pop (list, idx), push dst.
+        self.pop_inputs(&[list_ssa, idx_ssa]);
+        self.push_ssa(dst);
+        self.buffer.record_type(dst, ObservedType::I64);
+        Some(dst)
+    }
+
+    /// F-D8: emit a `TraceOp::DictLookup` op into the trace buffer.
+    ///
+    /// Same contract as [`Self::emit_list_get`]: the IR walker pushes
+    /// `(dict_ssa, key_ssa)` onto the operand stack, the recorder
+    /// pops both, emits the lookup op, and pushes a fresh dst SSA.
+    /// `shape_hash` is the recorder-time fingerprint of the keys the
+    /// dict carries — computed via
+    /// [`relon_trace_jit::fx_hash_bytes`] over the sorted key set so
+    /// re-recordings of the same logical dict produce identical
+    /// fingerprints.
+    ///
+    /// The emitter lowers this to a single `call_indirect` to the
+    /// `__relon_trace_dict_lookup` helper plus a sentinel-compare
+    /// brif into the shared deopt block on IC miss. No
+    /// `TraceOp::Guard` is appended here — the deopt encoding lives
+    /// inside the host helper's return value.
+    pub fn emit_dict_lookup(
+        &mut self,
+        dict_ssa: SsaVar,
+        key_ssa: SsaVar,
+        shape_hash: u64,
+    ) -> Option<SsaVar> {
+        if self.aborted.is_some() || self.terminated {
+            return None;
+        }
+        if self.buffer.op_count() >= self.capacity {
+            self.aborted = Some(AbortReason::TraceTooLong);
+            return None;
+        }
+        let dst = self.ssa.alloc();
+        self.buffer.append(TraceOp::DictLookup {
+            dst,
+            dict_ptr: dict_ssa,
+            key_ptr: key_ssa,
+            shape_hash,
+        });
+        self.pop_inputs(&[dict_ssa, key_ssa]);
+        self.push_ssa(dst);
+        self.buffer.record_type(dst, ObservedType::I64);
+        Some(dst)
+    }
+
     /// ε-M0: open a loop frame and emit a `TraceOp::MarkLoopHead`
     /// carrying one φ pair per [`LoopCarry`].
     ///
@@ -1046,5 +1132,94 @@ mod tests {
         let ok = r.end_loop(&[]);
         assert!(!ok);
         assert!(r.is_aborted());
+    }
+
+    // ---- F-D8: list / dict ops ---------------------------------------
+
+    #[test]
+    fn emit_list_get_appends_bounds_guard_and_op() {
+        let mut r = RecorderState::new();
+        // Seed a list ptr + index SSA.
+        let list = match r.record_op(&Op::ConstI64(0x1000), &[], Some(ObservedType::Ptr)) {
+            RecordResult::Ok { value: Some(v) }
+            | RecordResult::NeedsGuard { value: Some(v), .. } => v,
+            other => panic!("unexpected {:?}", other),
+        };
+        let idx = match r.record_op(&Op::ConstI64(0), &[], Some(ObservedType::I64)) {
+            RecordResult::Ok { value: Some(v) }
+            | RecordResult::NeedsGuard { value: Some(v), .. } => v,
+            other => panic!("unexpected {:?}", other),
+        };
+        let dst = r
+            .emit_list_get(list, idx)
+            .expect("list_get must succeed on a fresh recorder");
+        assert_ne!(dst, list);
+        assert_ne!(dst, idx);
+        // Buffer should now hold [Const, Const, Guard(BoundsCheck),
+        // ListGet]; operand stack top is the dst.
+        assert_eq!(r.ssa_stack_snapshot(), vec![dst]);
+        let buf = r.buffer();
+        let kinds: Vec<&TraceOp> = buf.ops.iter().collect();
+        match kinds[kinds.len() - 1] {
+            TraceOp::ListGet {
+                dst: d,
+                list_ptr,
+                idx: i,
+            } => {
+                assert_eq!(*d, dst);
+                assert_eq!(*list_ptr, list);
+                assert_eq!(*i, idx);
+            }
+            other => panic!("last op must be ListGet, got {:?}", other),
+        }
+        assert!(
+            buf.guards
+                .iter()
+                .any(|g| matches!(g.kind, GuardKind::BoundsCheck(v, l) if v == idx && l == list)),
+            "BoundsCheck guard must be recorded"
+        );
+    }
+
+    #[test]
+    fn emit_dict_lookup_appends_op_with_shape_hash() {
+        let mut r = RecorderState::new();
+        let dict = match r.record_op(&Op::ConstI64(0x2000), &[], Some(ObservedType::Ptr)) {
+            RecordResult::Ok { value: Some(v) }
+            | RecordResult::NeedsGuard { value: Some(v), .. } => v,
+            other => panic!("unexpected {:?}", other),
+        };
+        let key = match r.record_op(&Op::ConstI64(0x3000), &[], Some(ObservedType::Ptr)) {
+            RecordResult::Ok { value: Some(v) }
+            | RecordResult::NeedsGuard { value: Some(v), .. } => v,
+            other => panic!("unexpected {:?}", other),
+        };
+        let shape: u64 = 0xfeed_face_dead_beef;
+        let dst = r
+            .emit_dict_lookup(dict, key, shape)
+            .expect("dict_lookup must succeed");
+        assert_eq!(r.ssa_stack_snapshot(), vec![dst]);
+        let buf = r.buffer();
+        match buf.ops.last().expect("≥1 op") {
+            TraceOp::DictLookup {
+                dst: d,
+                dict_ptr,
+                key_ptr,
+                shape_hash,
+            } => {
+                assert_eq!(*d, dst);
+                assert_eq!(*dict_ptr, dict);
+                assert_eq!(*key_ptr, key);
+                assert_eq!(*shape_hash, shape);
+            }
+            other => panic!("last op must be DictLookup, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn emit_list_get_short_circuits_when_aborted() {
+        let mut r = RecorderState::new();
+        r.abort(AbortReason::TraceTooLong);
+        let result = r.emit_list_get(SsaVar(0), SsaVar(1));
+        assert!(result.is_none());
     }
 }

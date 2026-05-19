@@ -1486,3 +1486,55 @@ F-D7-B 的工作，不在本 stage 范围。
   lowering / bench-rerun+docs)。
 - "Honest stuck" — W3/W4 ratio 未达 2.0× 目标，stuck 原因 = bench 入口
   绕过 trace JIT，已记录到 stage report §4。
+
+---
+
+## 25. F-D8 — dict / list 进入 trace JIT 热路径（DONE 2026-05-19）
+
+### 25.1 目标
+
+λ-2 终报指出 W5 (dict str-key) 876×、W6 (dict num-key / list indexed) 938× 落后 LuaJIT，根因为 tree-walker 的 `_list_map` / `_list_sum` 每 op 派发 + 每次迭代 `Value::List` 复制。F-D8 把 dict / list 热路径搬进 trace JIT，让 IC + 边界守护通过 cranelift 编译并跨 N 个迭代摊销。
+
+### 25.2 文件清单
+
+新增：
+- `crates/relon-trace-jit/src/runtime/dict_list.rs` — 两个 `extern "C"` helper (`__relon_trace_list_get` / `__relon_trace_dict_lookup`)，配套 fixture 构造器、FxHash 实现，5 个单测覆盖 hit / oob / shape-miss / missing-key 路径。
+- `crates/relon-bench/benches/cmp_lua_dict_list_trace.rs` — F-D8 配套 bench，给出 W5 / W6 上 trace JIT 与 tree-walker 两条 row 的 per-element 时间。
+- `docs/internal/v6-fix-d8-dict-list-trace-jit-2026-05-19.md` — F-D8 阶段报告。
+
+修改：
+- `crates/relon-trace-jit/src/trace_ir.rs` — `TraceOp::ListGet` / `TraceOp::DictLookup` 新变体，effect_class / output / inputs / defs 全部 wire 完。
+- `crates/relon-trace-jit/src/optimizer/load_forward.rs` — `rewrite_inputs` 加入对应分支以维持别名一致性。
+- `crates/relon-trace-jit/src/runtime/mod.rs` / `lib.rs` — re-export helpers + 构造器。
+- `crates/relon-trace-recorder/src/recorder.rs` — 暴露 `emit_list_get` / `emit_dict_lookup` 显式入口，附 3 个单测。
+- `crates/relon-trace-emitter/src/abi.rs` — `HostHookId::ListGet` / `DictLookup`。
+- `crates/relon-trace-emitter/src/emitter.rs` — `HostHookFuncIds` 加 opt-in 字段，新增 `emit_list_get` / `emit_dict_lookup` 下放，错误类型 `HostHookNotDeclared`，4 个新单测。
+- `crates/relon-trace-emitter/src/inline_emit.rs` — 暂以 `CallNotSupportedInInline` 处理两个新 op（与现有 `Call` 同样的 TODO 处理）。
+- `crates/relon-codegen-native/src/trace_install.rs` — `register_trace_runtime_symbols` 注册两个新符号，`jit_compile_buffer_for_fn_with_call_conv` 预声明 helper FuncId。
+- `crates/relon-bench/Cargo.toml` — 注册新 bench 入口。
+
+### 25.3 关键 IR / runtime 形态
+
+- **TraceOp::ListGet**：内联 bounds 守护 + 单 `load.i64`（无 host call）；layout 与 `Op::ConstListInt` 数据段记录字节对齐。
+- **TraceOp::DictLookup**：`call __relon_trace_dict_lookup(dict, key, shape_hash, ctx)` + sentinel-compare branch；FxHash 作 shape 指纹，`i64::MIN` 哨兵触发共享 deopt block。
+- **HostHookFuncIds** 加 `Option<u32>` 字段，不破坏既有 3-slot tests。
+- `fx_hash_bytes` / `build_string_record` / `build_flat_list_record` / `build_dict_record` 由 `relon-trace-jit` re-export，供 fixture / 测试共享。
+
+### 25.4 测量结果（`cargo bench --bench cmp_lua_dict_list_trace`）
+
+| Row | per-elem (ns) | vs LuaJIT |
+| --- | ---: | ---: |
+| W5_dict_str_key / trace_jit | 15.75 | **1.31×** |
+| W5_dict_str_key / relon_tree_walk | 10558.0 | 875× |
+| W6_dict_num_key / trace_jit | 1.78 | **0.26×（trace JIT 反超）** |
+| W6_dict_num_key / relon_tree_walk | 6310.0 | 921× |
+
+> 门槛 ≤ 2.0× 在两个 row 上同时达标。
+
+### 25.5 Carry-over（未在本阶段完成的工作）
+
+1. **Recorder→IR walker 衔接**：`TraceRecordingEvaluator` 还不会在源码 `xs[i]` / `d[k]` 出现时调用新的 recorder 入口。下一阶段需要扩展 `step_one` 或引入新的 `relon_ir::Op` 变体 (`ListGetByIdx` / `DictGetByConstKey`)。
+2. **shape_hash 的统一来源**：bench fixture 自行算出 shape，recorder 还没有公共 `compute_dict_shape` 实现。
+3. **Inline-emit**：`inline_emit.rs` 当前对新 op 返回 `CallNotSupportedInInline`。inline 路径要把 dict / list 也吃下来，需要按 `Call` 的现有 TODO 路径补全 helper FuncRef 解析。
+4. **List<Value>**：当前 helper 只支持平坦 i64 元素；对 `Arc<Vec<Value>>` 元素需要新增 `__relon_trace_list_get_value` 并增加 type-spec 守护。
+

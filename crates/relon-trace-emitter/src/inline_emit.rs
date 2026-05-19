@@ -301,6 +301,15 @@ impl<'a, 'b> InlineEmitterState<'a, 'b> {
             | TraceOp::StrContains(_, _, _)
             | TraceOp::StrFind(_, _, _)
             | TraceOp::StrSubstring(_, _, _, _) => Err(InlineEmitError::CallNotSupportedInInline),
+            // F-D8: inline emit doesn't yet thread the dict/list host
+            // helpers through the surrounding host-fn cranelift module
+            // (same reason `TraceOp::Call` returns `CallNotSupported`).
+            // The inline path is a perf shortcut for tiny straight-line
+            // traces; dict/list traces always go through the standalone
+            // emitter where the resolve_call FuncRef is in scope.
+            TraceOp::ListGet { .. } | TraceOp::DictLookup { .. } => {
+                Err(InlineEmitError::CallNotSupportedInInline)
+            }
         }
     }
 

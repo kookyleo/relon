@@ -192,6 +192,70 @@ pub enum TraceOp {
     /// Return from the trace.
     Return(SsaVar),
 
+    // ---- Dict / list ops (F-D8) -------------------------------------
+    /// `dst = list_get(list_ptr, idx)`.
+    ///
+    /// F-D8: lowered into cranelift as a bounds-checked load against a
+    /// `List<i64>`-shaped layout — `[len: u32 LE][pad: u32][i64 elements...]`.
+    /// The emitter materialises an inline `cmp idx < len; brif ok, deopt`
+    /// pair (the `BoundsCheck` guard) before the load so the trace
+    /// deopts on out-of-range access instead of corrupting memory.
+    ///
+    /// `list_ptr` is the raw byte pointer to the record header (the
+    /// same shape the cranelift-AOT backend uses for
+    /// `Op::ConstListInt` / `Op::LoadListIntPtr`). For list-of-Value
+    /// shapes the bench harness keeps the same `[len + i64 elements]`
+    /// pre-flattened layout so the cranelift-side fast path is uniform;
+    /// production wiring still goes through the host helper when the
+    /// list is a `Arc<Vec<Value>>` (see
+    /// `relon_trace_jit::runtime::dict_list::__relon_trace_list_get_value`).
+    ///
+    /// Effect class: `ReadOnly`.
+    ListGet {
+        /// SSA destination — holds the i64 element after the load.
+        dst: SsaVar,
+        /// SSA carrying the raw `list_ptr` (header start).
+        list_ptr: SsaVar,
+        /// SSA carrying the i64 index.
+        idx: SsaVar,
+    },
+
+    /// `dst = dict_lookup(dict_ptr, key_ptr, shape_hash)` via the
+    /// host's inline-cached hash table.
+    ///
+    /// F-D8: lowered into a single `call_indirect` to the host's
+    /// `__relon_trace_dict_lookup_with_shape` helper. The helper reads
+    /// the `shape_hash` immediate and compares it against the dict's
+    /// recorded shape fingerprint; on mismatch it returns a sentinel
+    /// the emitter turns into a deopt branch, leaving the slow path
+    /// to re-record under the new shape.
+    ///
+    /// `key_ptr` carries a pointer to a `[len: u32][utf8...]` String
+    /// record (same shape `Op::ConstString` uses); the host helper
+    /// rehydrates a borrowed `&str` from it on the slow path. On the
+    /// IC-hit fast path neither the key bytes nor the dict's BTreeMap
+    /// are touched — the cached index lookup short-circuits.
+    ///
+    /// `shape_hash` is computed at recording time from the keys the
+    /// recorder saw in the dict; the runtime side stamps the same
+    /// fingerprint into the dict header. FxHash is used here so the
+    /// per-key cost stays sub-cycle; collisions deopt cleanly.
+    ///
+    /// Effect class: `ReadOnly`.
+    DictLookup {
+        /// SSA destination — holds the i64 value (or pointer, in the
+        /// future) after the lookup.
+        dst: SsaVar,
+        /// SSA carrying the raw `dict_ptr` (header start).
+        dict_ptr: SsaVar,
+        /// SSA carrying the raw `key_ptr` to a String record.
+        key_ptr: SsaVar,
+        /// Per-trace shape fingerprint. F-D8 uses an FxHash digest of
+        /// the recorded keys in stable order. Forwarded verbatim to
+        /// the host helper as the IC's tag.
+        shape_hash: u64,
+    },
+
     // ---- Loop markers -----------------------------------------------
     /// Marks the entry of a recorded loop. `loop_id` distinguishes
     /// nested loops; the same id pairs `MarkLoopHead` with its matching
@@ -294,7 +358,10 @@ impl TraceOp {
             | TraceOp::StrFind(_, _, _)
             | TraceOp::StrSubstring(_, _, _, _) => EffectClass::Pure,
 
-            TraceOp::Load(_, _, _) | TraceOp::LocalGet(_, _) => EffectClass::ReadOnly,
+            TraceOp::Load(_, _, _)
+            | TraceOp::LocalGet(_, _)
+            | TraceOp::ListGet { .. }
+            | TraceOp::DictLookup { .. } => EffectClass::ReadOnly,
 
             TraceOp::Div(_, _, _) | TraceOp::Store(_, _, _) => EffectClass::RecoverableWrite,
 
@@ -320,6 +387,8 @@ impl TraceOp {
             | TraceOp::StrContains(dst, _, _)
             | TraceOp::StrFind(dst, _, _)
             | TraceOp::StrSubstring(dst, _, _, _) => Some(*dst),
+
+            TraceOp::ListGet { dst, .. } | TraceOp::DictLookup { dst, .. } => Some(*dst),
 
             TraceOp::Store(_, _, _)
             | TraceOp::Guard(_, _)
@@ -353,6 +422,10 @@ impl TraceOp {
             | TraceOp::StrContains(_, a, b)
             | TraceOp::StrFind(_, a, b) => vec![*a, *b],
             TraceOp::StrSubstring(_, s, start, len) => vec![*s, *start, *len],
+            TraceOp::ListGet { list_ptr, idx, .. } => vec![*list_ptr, *idx],
+            TraceOp::DictLookup {
+                dict_ptr, key_ptr, ..
+            } => vec![*dict_ptr, *key_ptr],
             TraceOp::Return(v) => vec![*v],
             // ε-M0: loop markers consume / produce φ pairs. The head
             // reads the `init` SSA (defined before the loop) for each
@@ -493,5 +566,37 @@ mod tests {
         );
         assert!(g.is_guard());
         assert_eq!(g.effect_class(), EffectClass::Pure);
+    }
+
+    // ---- F-D8: dict / list ops --------------------------------------
+
+    #[test]
+    fn list_get_is_read_only() {
+        let op = TraceOp::ListGet {
+            dst: SsaVar(3),
+            list_ptr: SsaVar(1),
+            idx: SsaVar(2),
+        };
+        assert_eq!(op.effect_class(), EffectClass::ReadOnly);
+        assert_eq!(op.output(), Some(SsaVar(3)));
+        assert_eq!(op.inputs(), vec![SsaVar(1), SsaVar(2)]);
+        assert!(!op.is_guard());
+    }
+
+    #[test]
+    fn dict_lookup_is_read_only_and_carries_shape() {
+        let op = TraceOp::DictLookup {
+            dst: SsaVar(4),
+            dict_ptr: SsaVar(1),
+            key_ptr: SsaVar(2),
+            shape_hash: 0xdead_beef_cafe_0001,
+        };
+        assert_eq!(op.effect_class(), EffectClass::ReadOnly);
+        assert_eq!(op.output(), Some(SsaVar(4)));
+        assert_eq!(op.inputs(), vec![SsaVar(1), SsaVar(2)]);
+        match op {
+            TraceOp::DictLookup { shape_hash, .. } => assert_eq!(shape_hash, 0xdead_beef_cafe_0001),
+            _ => panic!("variant must round-trip its shape_hash payload"),
+        }
     }
 }

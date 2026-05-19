@@ -211,6 +211,16 @@ fn rewrite_inputs(op: &mut TraceOp, alias: &HashMap<SsaVar, SsaVar>) -> usize {
             swap!(start);
             swap!(len);
         }
+        TraceOp::ListGet { list_ptr, idx, .. } => {
+            swap!(list_ptr);
+            swap!(idx);
+        }
+        TraceOp::DictLookup {
+            dict_ptr, key_ptr, ..
+        } => {
+            swap!(dict_ptr);
+            swap!(key_ptr);
+        }
         TraceOp::Return(v) => {
             swap!(v);
         }

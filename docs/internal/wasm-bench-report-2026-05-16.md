@@ -3790,3 +3790,42 @@ trace），现实下限 ≈ **10×**；要打到 2× 需要 trace 录制时 cons
 字面量参数并 fold shim 调用，属于 F-D7-B / F-D9 sub-phase 范围。
 
 stage report § 5 给出完整 floor 估计与后续 sub-phase 优先级清单。
+
+---
+
+## F-D8 dict / list trace-JIT appendix（2026-05-19）
+
+bench file: `crates/relon-bench/benches/cmp_lua_dict_list_trace.rs`
+group: `fd8_dict_list_trace`
+post-process: `cargo run --release -p relon-bench --bin bench_stats -- target/criterion/fd8_dict_list_trace`
+
+### 行结构
+
+每个 W 包含两条 row：
+- `trace_jit` — 手工搭建的 cranelift JIT trace，包含 `TraceOp::DictLookup` /
+  `TraceOp::ListGet` 路径；`for i in 0..n { ... }` 整个循环跑在 trace 内部
+- `relon_tree_walk` — `cmp_lua` W5/W6 同源 Relon 程序，作为基线对照
+
+### 实测（HOT_LOOP_N = 10_000，sample_size = 100，measurement_time = 6 s）
+
+| Row | per-elem (ns) | vs LuaJIT (`cmp_lua` 基线) |
+| --- | ---: | ---: |
+| `W5_dict_str_key/trace_jit` | 15.75 | **1.31× (LuaJIT = 12.07 ns)** |
+| `W5_dict_str_key/relon_tree_walk` | 10558.0 | 875× |
+| `W6_dict_num_key/trace_jit` | 1.78 | **0.26×（反超 LuaJIT = 6.85 ns）** |
+| `W6_dict_num_key/relon_tree_walk` | 6310.0 | 921× |
+
+### 复现
+
+```bash
+RELON_BENCH_FORCE_RUN=1 cargo bench --bench cmp_lua_dict_list_trace
+cargo run --release -p relon-bench --bin bench_stats -- \
+    target/criterion/fd8_dict_list_trace
+```
+
+构造期一致性 assert：fixture 构造完成后，bench 用 W5 = `full_blocks * 55 +
+tail`、W6 = `n*(n+1)/2` 解析公式校验 `ctx.result_slot`，确保不存在
+"更快但更错" 的退化。
+
+详 `docs/internal/v6-fix-d8-dict-list-trace-jit-2026-05-19.md`。
+
