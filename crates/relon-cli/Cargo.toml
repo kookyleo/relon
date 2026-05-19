@@ -20,6 +20,7 @@ relon-evaluator = { workspace = true }
 relon-eval-api = { workspace = true }
 relon-analyzer = { workspace = true }
 relon-codegen-native = { workspace = true }
+relon-bytecode = { workspace = true }
 relon-fmt = { workspace = true }
 relon-lsp = { workspace = true }
 clap = { workspace = true, features = ["derive"] }

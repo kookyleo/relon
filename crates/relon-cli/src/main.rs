@@ -40,6 +40,12 @@ enum BackendArg {
     /// is rejected — this backend only ships entries.
     #[value(name = "cranelift-aot")]
     CraneliftAot,
+    /// v6-δ M2-A bytecode VM. Stack-based interpreter with IR-PC
+    /// bookkeeping; covers the scalar `#main` envelope (Int / Bool /
+    /// Float / Null). Library-mode `eval_root` is rejected — this
+    /// backend only ships entries.
+    #[value(name = "bytecode")]
+    Bytecode,
 }
 
 #[derive(Parser)]
@@ -374,6 +380,30 @@ fn main() -> miette::Result<()> {
                             ))
                         })?
                     }
+                    BackendArg::Bytecode => {
+                        // v6-δ M2-A bytecode VM. Stack-based
+                        // interpreter — handles the scalar `#main`
+                        // envelope (Int / Bool / Float / Null);
+                        // anything else surfaces as a setup error.
+                        let _caps = if trust {
+                            relon_eval_api::Capabilities::all_granted()
+                        } else {
+                            relon_eval_api::Capabilities::default()
+                        };
+                        let bc = relon_bytecode::BytecodeEvaluator::from_source(&content).map_err(
+                            |e| {
+                                miette::miette!("bytecode VM backend setup: {e}").with_source_code(
+                                    NamedSource::new(file.to_string_lossy(), content.clone()),
+                                )
+                            },
+                        )?;
+                        EvaluatorTrait::run_main(&bc, args_map).map_err(|e| {
+                            Report::new(e).with_source_code(NamedSource::new(
+                                file.to_string_lossy(),
+                                content.clone(),
+                            ))
+                        })?
+                    }
                 }
             } else {
                 if args.is_some() {
@@ -382,9 +412,14 @@ fn main() -> miette::Result<()> {
                     )
                     .with_source_code(NamedSource::new(file.to_string_lossy(), content)));
                 }
-                if matches!(backend, BackendArg::CraneliftAot) {
+                if matches!(backend, BackendArg::CraneliftAot | BackendArg::Bytecode) {
+                    let name = if matches!(backend, BackendArg::CraneliftAot) {
+                        "cranelift-aot"
+                    } else {
+                        "bytecode"
+                    };
                     return Err(miette::miette!(
-                        "cranelift-aot backend only supports `#main(...)` entries; the file declares no signature"
+                        "{name} backend only supports `#main(...)` entries; the file declares no signature"
                     )
                     .with_source_code(NamedSource::new(file.to_string_lossy(), content)));
                 }

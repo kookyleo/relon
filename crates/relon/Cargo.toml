@@ -30,6 +30,11 @@ relon-analyzer = { workspace = true }
 # backend retired in stage 4 this is the only AOT path; default-on
 # above means native hosts get it without opting in.
 relon-codegen-native = { workspace = true, optional = true }
+# v6-δ M2-A: stack-based bytecode VM as a third evaluator backend.
+# Always-on (no feature gate) because the crate has no native-only
+# dependencies and the wasm32 build needs it for `Backend::Bytecode`
+# regression coverage.
+relon-bytecode = { workspace = true }
 relon-eval-api = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }

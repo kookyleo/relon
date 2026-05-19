@@ -581,6 +581,15 @@ pub enum Backend {
     /// up-front (e.g. before a latency-sensitive serving loop)
     /// rather than on first `run_main`.
     CraneliftAot,
+    /// v6-δ M2-A bytecode VM backend. Stack-based interpreter that
+    /// consumes the same IR `lower_workspace_single` produces, with
+    /// a per-function `ir_pc_map` enabling future partial-resume
+    /// (M2-B). M2-A only accepts scalar `#main` shapes (Int / Bool /
+    /// Float / Null arg + return fields); list / dict / closure /
+    /// stdlib sources surface as `BackendError::Bytecode`. Pick this
+    /// to exercise the resume-from-deopt path without paying the
+    /// cranelift cold-start cost.
+    Bytecode,
 }
 
 /// Errors specific to the backend factory. Distinct from
@@ -598,6 +607,12 @@ pub enum BackendError {
     /// crate stays decoupled from the cranelift crate's surface.
     #[error("cranelift-aot backend setup failed: {0}")]
     CraneliftAot(String),
+    /// v6-δ M2-A bytecode VM compile / setup failed. Typically the
+    /// source uses constructs outside the M2-A scalar envelope (list
+    /// / dict / closure / stdlib). Wrapper string so this crate stays
+    /// decoupled from the bytecode crate's enum.
+    #[error("bytecode VM backend setup failed: {0}")]
+    Bytecode(String),
 }
 
 /// Construct an [`relon_eval_api::Evaluator`] over `source` using the
@@ -631,6 +646,11 @@ pub fn new_evaluator(
             "this build was compiled without the `cranelift-aot` feature; rebuild with `--features cranelift-aot` to enable the backend"
                 .to_string(),
         )),
+        Backend::Bytecode => {
+            let ev = relon_bytecode::BytecodeEvaluator::from_source(source)
+                .map_err(|e| BackendError::Bytecode(e.to_string()))?;
+            Ok(Box::new(ev))
+        }
     }
 }
 
