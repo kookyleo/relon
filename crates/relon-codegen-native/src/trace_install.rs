@@ -95,9 +95,7 @@ pub fn default_host_hooks() -> HostHookTable {
         // `call_indirect` through `ctx.host_hooks.save_deopt`, so the
         // historical void-returning shim that dropped `external_pc` is
         // gone — hosts get the real resume PC.
-        save_deopt: Some(
-            relon_trace_jit::runtime::__relon_trace_save_deopt as TraceSaveDeoptFn,
-        ),
+        save_deopt: Some(relon_trace_jit::runtime::__relon_trace_save_deopt as TraceSaveDeoptFn),
         resolve_call: Some(
             relon_trace_jit::runtime::__relon_trace_resolve_call as TraceResolveCallFn,
         ),
@@ -388,12 +386,9 @@ impl TraceJitState {
         F: FnOnce(*const u64, Option<u64>) -> u64,
     {
         unsafe {
-            self.invoke_with_resume(
-                fn_id,
-                args_ptr,
-                slot_count,
-                |args, resume_pc, _snapshot| fallback(args, resume_pc),
-            )
+            self.invoke_with_resume(fn_id, args_ptr, slot_count, |args, resume_pc, _snapshot| {
+                fallback(args, resume_pc)
+            })
         }
     }
 
@@ -428,11 +423,7 @@ impl TraceJitState {
         fallback: F,
     ) -> u64
     where
-        F: FnOnce(
-            *const u64,
-            Option<u64>,
-            Option<&relon_trace_abi::DeoptStateSnapshot>,
-        ) -> u64,
+        F: FnOnce(*const u64, Option<u64>, Option<&relon_trace_abi::DeoptStateSnapshot>) -> u64,
     {
         let trace_fn = match self.lookup_trace(fn_id) {
             Some(t) => t,
@@ -522,7 +513,11 @@ impl TraceJitState {
         // emitter so `declare_imported_user_function` writes the
         // right indices into the function IR.
         let save_deopt_sig = build_host_helper_signature(
-            &[pointer_ty, cranelift_codegen::ir::types::I32, cranelift_codegen::ir::types::I64],
+            &[
+                pointer_ty,
+                cranelift_codegen::ir::types::I32,
+                cranelift_codegen::ir::types::I64,
+            ],
             &[],
         );
         let resolve_call_sig = build_host_helper_signature(
@@ -530,7 +525,11 @@ impl TraceJitState {
             &[pointer_ty],
         );
         let ic_lookup_sig = build_host_helper_signature(
-            &[pointer_ty, cranelift_codegen::ir::types::I32, cranelift_codegen::ir::types::I64],
+            &[
+                pointer_ty,
+                cranelift_codegen::ir::types::I32,
+                cranelift_codegen::ir::types::I64,
+            ],
             &[cranelift_codegen::ir::types::I64],
         );
         let save_deopt_id = module

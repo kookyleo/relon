@@ -271,19 +271,33 @@ enum SynthRecipe {
     BinCmp(Op),
     /// `const op x`. Encodes corpus boundary cases like
     /// `0 - x` (negate) and `0 * x`.
-    ConstThenVar { const_v: i64, op: Op },
+    ConstThenVar {
+        const_v: i64,
+        op: Op,
+    },
     /// `x op const`. Encodes boundary cases like `x + 1` / `x - 1`.
-    VarThenConst { const_v: i64, op: Op },
+    VarThenConst {
+        const_v: i64,
+        op: Op,
+    },
     /// `x op_a y op_b x` (three-token chain). Used by
     /// `arith_chain: x * y + x`.
-    Chain3 { op_a: Op, op_b: Op },
+    Chain3 {
+        op_a: Op,
+        op_b: Op,
+    },
     /// `(x op_a y) op_b x` paren form. Used by
     /// `arith_paren: (x + y) * x`.
-    ParenLhs { op_inner: Op, op_outer: Op },
+    ParenLhs {
+        op_inner: Op,
+        op_outer: Op,
+    },
     /// `(x cmp_op y) ? x : y` — the ternary-on-bin-cmp shape used by
     /// `if_true_arm` and `if_false_arm`. Walker recognises
     /// `Op::If { then_body, else_body }` and follows the taken arm.
-    IfBinSelect { cmp_op: Op },
+    IfBinSelect {
+        cmp_op: Op,
+    },
     /// `x cmp_op K0 ? (x cmp_op K1 ? x op_then K2 : x op_alt K3) :
     /// (K4 op_neg x)` — nested-ternary boundary form used by
     /// `if_nested` / `if_nested_neg`. The recipe pins the exact
@@ -462,22 +476,10 @@ fn parse_recipe(source: &str) -> Option<SynthRecipe> {
     // because the source has no `#main` args. We just return the
     // expected `Value` so the three-way diff lands on `AllAgree`.
     let const_table: &[(&str, Value)] = &[
-        (
-            "#main() -> Int \"hello\".length()",
-            Value::Int(5),
-        ),
-        (
-            "#main() -> Bool \"hi\".is_empty()",
-            Value::Bool(false),
-        ),
-        (
-            "#main() -> Bool \"\".is_empty()",
-            Value::Bool(true),
-        ),
-        (
-            "#main() -> Int [1, 2, 3, 4, 5].length()",
-            Value::Int(5),
-        ),
+        ("#main() -> Int \"hello\".length()", Value::Int(5)),
+        ("#main() -> Bool \"hi\".is_empty()", Value::Bool(false)),
+        ("#main() -> Bool \"\".is_empty()", Value::Bool(true)),
+        ("#main() -> Int [1, 2, 3, 4, 5].length()", Value::Int(5)),
         (
             "#main() -> String \"foo\".concat(\"bar\")",
             Value::String("foobar".to_string()),
@@ -514,10 +516,7 @@ fn parse_recipe(source: &str) -> Option<SynthRecipe> {
             "#main() -> String \"ΣΙΓΜΑ\".lower()",
             Value::String("σιγμα".to_string()),
         ),
-        (
-            "#main() -> Int [1, 2, 3, 4, 5].sum()",
-            Value::Int(15),
-        ),
+        ("#main() -> Int [1, 2, 3, 4, 5].sum()", Value::Int(15)),
         (
             "#main() -> Int [3, 1, 4, 1, 5, 9, 2, 6].max()",
             Value::Int(9),

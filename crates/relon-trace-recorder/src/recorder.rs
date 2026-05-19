@@ -362,17 +362,16 @@ impl RecorderState {
                 RecordResult::Ok { value: None }
             }
             LowerOutcome::Lookup { kind, ty_hint } => {
-                let (var, first_seen) =
-                    if let Some(existing) = self.ir_to_ssa.get(&kind).copied() {
-                        (existing, false)
-                    } else {
-                        // First time this slot is read — seed the map
-                        // with `fresh_dst` so subsequent reads alias the
-                        // same SSA id.
-                        self.ir_to_ssa.insert(kind, fresh_dst);
-                        self.type_obs.insert(fresh_dst, ty_hint);
-                        (fresh_dst, true)
-                    };
+                let (var, first_seen) = if let Some(existing) = self.ir_to_ssa.get(&kind).copied() {
+                    (existing, false)
+                } else {
+                    // First time this slot is read — seed the map
+                    // with `fresh_dst` so subsequent reads alias the
+                    // same SSA id.
+                    self.ir_to_ssa.insert(kind, fresh_dst);
+                    self.type_obs.insert(fresh_dst, ty_hint);
+                    (fresh_dst, true)
+                };
                 // v6-δ M1: emit `TraceOp::LocalGet` on first observation
                 // of a `LookupKind::Local(idx)` so the emitter can
                 // materialise the SSA value from the cranelift entry

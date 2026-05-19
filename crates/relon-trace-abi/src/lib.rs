@@ -58,8 +58,7 @@ pub mod external;
 pub mod observed;
 
 pub use context::{
-    HostHookTable, TraceContext, TraceHookFn, TraceIcLookupFn, TraceResolveCallFn,
-    TraceSaveDeoptFn,
+    HostHookTable, TraceContext, TraceHookFn, TraceIcLookupFn, TraceResolveCallFn, TraceSaveDeoptFn,
 };
 pub use deopt::{DeoptStateSnapshot, RecoverableWriteRecord};
 pub use effect::EffectClass;

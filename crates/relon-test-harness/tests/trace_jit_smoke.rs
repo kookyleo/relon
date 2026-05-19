@@ -830,21 +830,16 @@ fn invoke_with_resume_exposes_deopt_snapshot_to_fallback() {
     let snapshot_pc = std::cell::Cell::new(0u64);
     let fallback_args_ptr = std::cell::Cell::new(std::ptr::null::<u64>());
     let r = unsafe {
-        state.invoke_with_resume(
-            fn_id,
-            of_args.as_ptr(),
-            32,
-            |args, resume_pc, snapshot| {
-                fallback_args_ptr.set(args);
-                if let Some(s) = snapshot {
-                    snapshot_was_present.set(true);
-                    snapshot_slot_count.set(s.ssa_slots_copy.len());
-                    snapshot_pc.set(resume_pc.unwrap_or(0));
-                }
-                // Stand-in for resume_from_pc: return the wrapping sum.
-                (i64::MAX as i64).wrapping_add(1) as u64
-            },
-        )
+        state.invoke_with_resume(fn_id, of_args.as_ptr(), 32, |args, resume_pc, snapshot| {
+            fallback_args_ptr.set(args);
+            if let Some(s) = snapshot {
+                snapshot_was_present.set(true);
+                snapshot_slot_count.set(s.ssa_slots_copy.len());
+                snapshot_pc.set(resume_pc.unwrap_or(0));
+            }
+            // Stand-in for resume_from_pc: return the wrapping sum.
+            i64::MAX.wrapping_add(1) as u64
+        })
     };
     assert_eq!(r, i64::MIN as u64);
     assert!(
@@ -933,8 +928,10 @@ fn save_deopt_dispatches_through_host_hooks_table() {
 
     // Trigger overflow with a custom HostHookTable that observes the
     // call. The trace's deopt block dispatches through this slot.
-    let mut hooks = HostHookTable::default();
-    hooks.save_deopt = Some(custom_save_deopt as TraceSaveDeoptFn);
+    let hooks = HostHookTable {
+        save_deopt: Some(custom_save_deopt as TraceSaveDeoptFn),
+        ..HostHookTable::default()
+    };
     let mut ctx = TraceContext::with_hooks(32, hooks);
     let of_args: [u64; 2] = [i64::MAX as u64, 1];
     CUSTOM_OBSERVED.with(|c| c.set((0, 0)));
@@ -981,7 +978,10 @@ fn tree_walker_stdlib_free_fn_surface() {
             Value::Bool(true),
         ),
         ("#main() -> Int\n[1, 2, 3, 4, 5].sum()", Value::Int(15)),
-        ("#main() -> Int\n[3, 1, 4, 1, 5, 9, 2, 6].max()", Value::Int(9)),
+        (
+            "#main() -> Int\n[3, 1, 4, 1, 5, 9, 2, 6].max()",
+            Value::Int(9),
+        ),
     ];
     for (src, expected) in cases {
         let args = if src.contains("Int x") {
@@ -992,7 +992,9 @@ fn tree_walker_stdlib_free_fn_surface() {
             HashMap::new()
         };
         let ev = new_evaluator(src, Backend::TreeWalk).expect("setup");
-        let r = ev.run_main(args).unwrap_or_else(|e| panic!("{src} -> {e:?}"));
+        let r = ev
+            .run_main(args)
+            .unwrap_or_else(|e| panic!("{src} -> {e:?}"));
         assert_eq!(&r, expected, "tree-walker stdlib surface for {src}");
     }
 }
@@ -1015,8 +1017,7 @@ fn evaluator_resume_from_pc_default_preserves_sandbox_semantics() {
         .with_root(node)
         .with_analyzed(Arc::clone(&analyzed));
     relon_evaluator::TreeWalkEvaluator::prepare_in_place(&mut ctx);
-    let ev: Box<dyn Evaluator> =
-        Box::new(relon_evaluator::TreeWalkEvaluator::new(Arc::new(ctx)));
+    let ev: Box<dyn Evaluator> = Box::new(relon_evaluator::TreeWalkEvaluator::new(Arc::new(ctx)));
 
     // 1. Happy path through resume_from_pc — should return 21.
     let mut args = HashMap::new();

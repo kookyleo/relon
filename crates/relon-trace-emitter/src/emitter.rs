@@ -543,10 +543,12 @@ impl<'a, 'b> TraceEmitterState<'a, 'b> {
         // host wires a HostHookTable keep working.
         let hook_off = crate::abi::host_hooks_offset()
             + crate::abi::host_hook_slot_offset(HostHookId::SaveDeopt);
-        let hook_ptr =
-            self.builder
-                .ins()
-                .load(self.pointer_ty, MemFlags::trusted(), self.trace_ctx_ptr, hook_off);
+        let hook_ptr = self.builder.ins().load(
+            self.pointer_ty,
+            MemFlags::trusted(),
+            self.trace_ctx_ptr,
+            hook_off,
+        );
         let null = self.builder.ins().iconst(self.pointer_ty, 0);
         let has_hook = self.builder.ins().icmp(IntCC::NotEqual, hook_ptr, null);
         let indirect_block = self.builder.create_block();
@@ -656,8 +658,7 @@ fn declare_host_hook(
         sig.returns.push(AbiParam::new(*r));
     }
     let sig_ref = func.import_signature(sig);
-    let name_ref =
-        func.declare_imported_user_function(UserExternalName::new(0, func_id_index));
+    let name_ref = func.declare_imported_user_function(UserExternalName::new(0, func_id_index));
     func.import_function(ExtFuncData {
         name: ExternalName::User(name_ref),
         signature: sig_ref,

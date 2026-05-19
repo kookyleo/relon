@@ -3166,3 +3166,83 @@ v6-δ M1 处理：
 
 详情见 stage report §6（"residual TODO"）。
 
+
+---
+
+## 附录 v6-δ M1：real hot-loop number (2026-05-19)
+
+v6-γ M5 留下的两个核心 residual TODO（R1 emitter LocalGet 物化 +
+R2 真 ArithOverflow guard）在 v6-δ M1 全部落地，bench trace body
+**换回真实形态**：
+
+```
+LocalGet(0); LocalGet(1); Add(I64); Return
+```
+
+每次 invoke 把 `(acc, i)` 打包为 2-slot `u64[]` 喂给 `trace_fn.invoke`
+的 `args_ptr`；trace 内部 `args_ptr[0] + args_ptr[1]` 由
+`sadd_overflow.i64` 算出，ArithOverflow guard brif 真碳位
+（非溢出走 ok block，溢出走 deopt block）。bench 循环只做
+`ctx.result_slot` 读出，**Rust 侧不再做任何补偿计算**。
+
+### bench numbers（三轮）
+
+```
+v6_gamma_m5_hot_loop/backend/tree_walk
+    time:    [2.2739 s 2.2808 s 2.3085 s]      // run 3
+    thrpt:   [433.18 Kelem/s 438.44 Kelem/s 439.77 Kelem/s]
+v6_gamma_m5_hot_loop/backend/cranelift_aot
+    time:    [380.24 ms 380.27 ms 380.39 ms]
+    thrpt:   [2.6289 Melem/s 2.6297 Melem/s 2.6299 Melem/s]
+v6_gamma_m5_hot_loop/backend/trace_jit_warm
+    time:    [9.5316 ms 9.5325 ms 9.5362 ms]
+    thrpt:   [104.86 Melem/s 104.90 Melem/s 104.91 Melem/s]
+```
+
+三轮 trace_jit_warm 中位数：**9.52 ns / iter**（per-iter 95% CI
+9.50-9.53 ns）。
+
+### 与 v6-γ M5 const-only 数字的对比
+
+| 阶段        | trace body                                      | per-iter |
+|-------------|-------------------------------------------------|---------:|
+| v6-γ M5     | `ConstI64(1); Return`（guard-free 常量）         | 4.39 ns  |
+| v6-δ M1     | `LocalGet(0); LocalGet(1); Add(I64); Return`    | 9.52 ns  |
+
+v6-γ 数字翻了一倍多——这不是回归，是 **honest accounting**：
+
+1. v6-γ M5 的 trace 没有真做 `acc += i`（Rust 侧补偿），bench 衡量的
+   是 **trace tail-call invoke overhead**（~4.4 ns / iter）。
+2. v6-δ M1 的 trace 真做 `acc + i`：两次 LocalGet load (8 B 各)、
+   一次 sadd_overflow.i64、一次 ArithOverflow guard 的 icmp + brif、
+   一次 store result_slot、一次 return。约 6-8 条机器指令，加上
+   每次仍要付的 invoke ABI / TraceContext marshal。
+3. 总体 **9.52 ns ≈ 4.4 ns invoke overhead + 5.1 ns 真实 Add + guard
+   工作**，两件事的成本现在都暴露在数字里，没有 Rust 侧补偿掩盖。
+
+### 与 LuaJIT trace tier 对照
+
+LuaJIT 2.x 在同形态 `acc += i` 上稳态 1-3 ns/iter。v6-δ M1 的
+**9.52 ns/iter 比 LuaJIT 慢 3-9 倍**。差距来源（按数量级排序）：
+
+1. **每次 invoke 走 `extern "C"` ABI**：LuaJIT trace-to-trace 用自家
+   寄存器分配，trace tail 直接 fall-through 到下一个 trace 头；
+   `relon` 当前每次 invoke 都要 marshal `*mut TraceContext` 指针 +
+   通过 `entry / return` 序言走一遍 SystemV calling convention。
+   这就是 trace JIT 设计 §1.4 列出的 v6-ε 路线图终点。
+2. **TraceContext 大小**：包括 `Box<[u64]>` slot 数组、result_slot、
+   deopt_state、HostHookTable、recoverable_writes。每次 invoke 都
+   要把这块 stack-allocate 出来；LuaJIT 的 GC 帧 + register stack
+   合并到同一 spill area。
+3. **Add 的 sadd_overflow + guard 是真有工作**：保留 5 ns 左右的
+   "正确的 trace 主体工作"开销，LuaJIT 在同形态下大约 2 ns。差距
+   主要在 cranelift backend 的寄存器分配 / spill 决策上，比 LuaJIT
+   `arch/lua_arch.dasc` 的手写 trace tail 多 1-2 条 mov / spill。
+
+**结论**：v6-δ M1 的 9.52 ns/iter 是诚实的 trace tier 数字。
+v6-δ M2 的 inline-cache-driven trace dispatch（去掉 extern "C"
+boundary）预计能把数字推到 3-5 ns/iter；进一步追平 LuaJIT 需要
+trace-to-trace fall-through 协议，那是 v6-ε 的工作范围。
+
+如果数字不是 sub-ns —— 是的，它不是。9.52 ns 比 1 ns 慢一个数量级。
+诚实记录如上。
