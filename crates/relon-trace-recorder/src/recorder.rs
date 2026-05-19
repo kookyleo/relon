@@ -362,16 +362,29 @@ impl RecorderState {
                 RecordResult::Ok { value: None }
             }
             LowerOutcome::Lookup { kind, ty_hint } => {
-                let var = if let Some(existing) = self.ir_to_ssa.get(&kind).copied() {
-                    existing
+                let (var, first_seen) = if let Some(existing) = self.ir_to_ssa.get(&kind).copied() {
+                    (existing, false)
                 } else {
                     // First time this slot is read — seed the map
                     // with `fresh_dst` so subsequent reads alias the
                     // same SSA id.
                     self.ir_to_ssa.insert(kind, fresh_dst);
                     self.type_obs.insert(fresh_dst, ty_hint);
-                    fresh_dst
+                    (fresh_dst, true)
                 };
+                // v6-δ M1: emit `TraceOp::LocalGet` on first observation
+                // of a `LookupKind::Local(idx)` so the emitter can
+                // materialise the SSA value from the cranelift entry
+                // helper's packed-arg pointer. Without this, an arith
+                // op referencing the LocalGet'd SSA fails to install
+                // with `EmitError::UnboundSsa`. Let-slots are bound by
+                // `Op::LetSet` instead (no entry-arg materialisation
+                // needed), so we only emit for `Local`.
+                if first_seen {
+                    if let LookupKind::Local(slot_idx) = kind {
+                        self.buffer.append(TraceOp::LocalGet(var, slot_idx));
+                    }
+                }
                 if let Some(ty) = observed.or(Some(ty_hint)) {
                     if let Some(g) = self.maybe_emit_type_guard(var, ty) {
                         return RecordResult::NeedsGuard {

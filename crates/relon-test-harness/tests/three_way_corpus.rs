@@ -148,25 +148,23 @@ fn corpus_three_way_diff_aggregates() {
         mismatches.len()
     );
 
-    // M5 gate: at least 22 of the 52 cases must reach `AllAgree`
-    // bit-identically. The achievable upper bound is bounded by
-    // (a) the ArithControl corpus size (28 cases, of which 5 are
-    // legitimate trap / cranelift-unsupported divergences) and
-    // (b) the recipe catalogue in `three_way::parse_recipe`. Every
-    // remaining case lands on a passing variant carrying an
-    // explicit reason — see the per-case log above. Stdlib tiers
-    // (22 cases) all surface as `TreeWalkMissingStdlibSurface`
-    // because the tree-walker reports `FunctionNotFound` for those
-    // bodies; widening the tree-walker to match the IR pipeline is
-    // out of scope for v6-γ M5. Two `dict_*` cases are
-    // `TraceJitNotApplicable` (envelope doesn't model record
-    // construction). The 5 ArithControl edge cases that surface as
-    // not-applicable are the overflow-trapping boundary cases —
-    // documented in the M5 stage report under "tier-divergence
-    // residual TODO".
+    // v6-δ M1 gate: at least 40 of the 52 cases must reach
+    // `AllAgree` bit-identically (M5 baseline was 22 — the gate
+    // moved after R4 widened both the tree-walker stdlib free-fn
+    // surface and the synth recipe catalogue). The 6 cases that
+    // legitimately remain `TraceJitNotApplicable` are:
+    //   - 4 ArithControl trap-vs-wrap boundary cases (div-by-zero
+    //     / numeric-overflow surfaces — trace returns the wrapping
+    //     value while tw + cr trap; modelling the trap envelope is
+    //     a v6-δ M2 follow-up);
+    //   - 2 `dict_*` cases (the trace synth envelope still doesn't
+    //     model record construction).
+    // Everything else lands on `AllAgree`; the 1 `CraneliftUnsupported`
+    // (`let_chain`) stays as the cranelift analyzer's forward-ref
+    // bounce.
     assert!(
-        all_agree >= 22,
-        "M5 gate: expected >= 22 AllAgree, got {all_agree} (of {total})"
+        all_agree >= 40,
+        "v6-δ M1 gate: expected >= 40 AllAgree, got {all_agree} (of {total})"
     );
     // Sanity: every case must land on a passing variant. Mismatch
     // is the only hard failure; we already panic above when any

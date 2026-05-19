@@ -40,6 +40,11 @@ pub struct GuardEmitCtx<'a, 'b> {
     pub deopt_block: ir::Block,
     pub type_info: &'a HashMap<SsaVar, ObservedType>,
     pub pointer_ty: ir::Type,
+    /// v6-δ M1: per-SSA cranelift `i8` overflow bit surfaced by the
+    /// `Add` / `Sub` / `Mul` lowering. The `ArithOverflow(dst)`
+    /// guard reads this map to emit a real "did the arith carry?"
+    /// brif predicate instead of a constant-0 that always deopts.
+    pub overflow_bits: &'a HashMap<SsaVar, ir::Value>,
 }
 
 /// Lower a single [`GuardSite`] into cranelift IR at the current
@@ -134,19 +139,37 @@ fn build_guard_predicate(
             Ok(widen_to_i32(ctx, r))
         }
         GuardKind::ArithOverflow(var) => {
-            // Cranelift 0.131 has no built-in checked-arith intrinsic
-            // for plain `iadd`; we approximate the overflow guard with
-            // a recorder-side decision: if a value is known to fit in
-            // i32 from the recorded type info, predicate = 1; else 0.
-            // The v6-gamma phase will replace this with cranelift's
-            // `iadd_cout` once the IR pass starts emitting paired
-            // overflow / value results.
-            let observed = ctx.type_info.get(var).copied();
-            let pred = match observed {
-                Some(ObservedType::I32 | ObservedType::Bool) => 1,
-                _ => 0,
-            };
-            Ok(ctx.builder.ins().iconst(I32, pred))
+            // v6-δ M1: real overflow guard using the boolean carry-out
+            // surfaced by `sadd_overflow` / `ssub_overflow` /
+            // `smul_overflow` in the arith op lowering. The map is
+            // populated by `emit_binop_i64` keyed on the arith op's
+            // `dst`; if it's missing we fall back to the v6-γ
+            // constant-0 predicate so traces without recorded arith
+            // (e.g. `LocalGet` → `Cmp` → `Return`) keep their
+            // observed-type behaviour and corpus regression
+            // testing continues to pin the absence.
+            //
+            // The predicate is `1` (guard passes) when the overflow
+            // bit is **zero**, i.e. the arith op didn't overflow:
+            // emit `pred = (of == 0)` as an i32.
+            if let Some(of_bit) = ctx.overflow_bits.get(var).copied() {
+                let of_ty = ctx.builder.func.dfg.value_type(of_bit);
+                let zero = ctx.builder.ins().iconst(of_ty, 0);
+                let no_of = ctx.builder.ins().icmp(IntCC::Equal, of_bit, zero);
+                Ok(widen_to_i32(ctx, no_of))
+            } else {
+                // No overflow bit captured: fall back to the
+                // conservative pinned-by-observed-type predicate.
+                // This keeps ArithOverflow guards on synthetic /
+                // hand-rolled trace buffers (used in optimiser /
+                // emitter unit tests) behaving exactly as before.
+                let observed = ctx.type_info.get(var).copied();
+                let pred = match observed {
+                    Some(ObservedType::I32 | ObservedType::Bool) => 1,
+                    _ => 0,
+                };
+                Ok(ctx.builder.ins().iconst(I32, pred))
+            }
         }
     }
 }
@@ -231,11 +254,13 @@ mod tests {
         ssa_to_value.insert(SsaVar(0), v);
         let site = GuardSite::new(7, ExternalPc(0xfeedbeef), GuardKind::NotNull(SsaVar(0)));
 
+        let overflow_bits = HashMap::new();
         let mut ctx = GuardEmitCtx {
             builder: &mut builder,
             deopt_block: deopt,
             type_info: &type_info,
             pointer_ty: I64,
+            overflow_bits: &overflow_bits,
         };
         emit_guard(&mut ctx, &site, &ssa_to_value).expect("guard emits");
     }
@@ -262,11 +287,13 @@ mod tests {
             GuardKind::TypeCheck(SsaVar(3), ObservedType::I64),
         );
 
+        let overflow_bits = HashMap::new();
         let mut ctx = GuardEmitCtx {
             builder: &mut builder,
             deopt_block: deopt,
             type_info: &type_info,
             pointer_ty: I64,
+            overflow_bits: &overflow_bits,
         };
         emit_guard(&mut ctx, &site, &ssa_to_value).expect("type guard emits");
     }
@@ -292,11 +319,13 @@ mod tests {
             GuardKind::TypeCheck(SsaVar(99), ObservedType::Bool),
         );
 
+        let overflow_bits = HashMap::new();
         let mut ctx = GuardEmitCtx {
             builder: &mut builder,
             deopt_block: deopt,
             type_info: &type_info,
             pointer_ty: I64,
+            overflow_bits: &overflow_bits,
         };
         let err = emit_guard(&mut ctx, &site, &ssa_to_value).unwrap_err();
         assert!(matches!(err, GuardEmitError::MissingTypeInfo(_)));

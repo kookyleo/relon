@@ -52,7 +52,7 @@ use cranelift_module::{Linkage, Module as _};
 
 use relon_ir::{IrType, Op, TaggedOp};
 use relon_trace_abi::{HostHookTable, ObservedType, TraceContext, TraceEntryStatus};
-use relon_trace_emitter::TraceEmitter;
+use relon_trace_emitter::{HostHookFuncIds, TraceEmitter};
 use relon_trace_jit::{OptimizerPipeline, SsaVar};
 use relon_trace_recorder::{RecordResult, RecorderState};
 
@@ -86,27 +86,16 @@ use crate::trace_recording::{RecordingOutcome, TraceRecordingEvaluator};
 ///    `call_indirect` through `ctx.host_hooks.<slot>` without an
 ///    ABI break.
 pub fn default_host_hooks() -> HostHookTable {
-    use relon_trace_abi::{TraceHookFn, TraceIcLookupFn, TraceResolveCallFn};
-
-    // The hook table's TraceHookFn signature is
-    // `(*mut TraceContext, u32)`; `__relon_trace_save_deopt` takes
-    // a third u64 external_pc arg. We wrap it in a shim that drops
-    // the surplus arg so the table slot type-checks.
-    unsafe extern "C" fn save_deopt_shim(ctx: *mut TraceContext, guard_pc: u32) {
-        // SAFETY: the underlying helper accepts
-        // (ctx, guard_pc, external_pc); when the dispatcher invokes
-        // through the table we have no external_pc handy, so pass 0.
-        // Hosts that need a real external_pc go through the direct
-        // extern symbol (still wired via JITBuilder).
-        unsafe { relon_trace_jit::runtime::__relon_trace_save_deopt(ctx, guard_pc, 0) };
-    }
+    use relon_trace_abi::{TraceIcLookupFn, TraceResolveCallFn, TraceSaveDeoptFn};
 
     HostHookTable {
         on_trap: None,
-        save_deopt: Some(save_deopt_shim as TraceHookFn),
-        // resolve_call and inline_cache_lookup carry their full
-        // signatures; no shim needed since v6-γ M5 widened
-        // HostHookTable to carry typed fn-pointers for both.
+        // v6-δ M1 R5: save_deopt carries its full 3-arg signature now
+        // (TraceSaveDeoptFn). The emitter's deopt block dispatches via
+        // `call_indirect` through `ctx.host_hooks.save_deopt`, so the
+        // historical void-returning shim that dropped `external_pc` is
+        // gone — hosts get the real resume PC.
+        save_deopt: Some(relon_trace_jit::runtime::__relon_trace_save_deopt as TraceSaveDeoptFn),
         resolve_call: Some(
             relon_trace_jit::runtime::__relon_trace_resolve_call as TraceResolveCallFn,
         ),
@@ -396,9 +385,49 @@ impl TraceJitState {
     where
         F: FnOnce(*const u64, Option<u64>) -> u64,
     {
+        unsafe {
+            self.invoke_with_resume(fn_id, args_ptr, slot_count, |args, resume_pc, _snapshot| {
+                fallback(args, resume_pc)
+            })
+        }
+    }
+
+    /// v6-δ M1 R3: invoke the installed trace, falling back through a
+    /// closure that receives the **full** deopt-state snapshot when a
+    /// guard fires.
+    ///
+    /// Compared to [`Self::invoke_with_fallback_at_pc`] the fallback
+    /// closure takes a third arg `snapshot: Option<&DeoptStateSnapshot>`
+    /// so it can:
+    ///
+    /// 1. Read the captured `ssa_slots_copy` to feed
+    ///    [`relon_eval_api::Evaluator::resume_from_pc`] —
+    ///    backends that maintain an IR-side PC table get pixel-perfect
+    ///    partial-resume rather than running from `#main` entry.
+    /// 2. Drain `recoverable_writes` to undo writes the trace
+    ///    speculatively performed before the deopt.
+    /// 3. Inspect `guard_pc` for telemetry / log-trace correlation.
+    ///
+    /// Hosts that don't need the snapshot can keep using the existing
+    /// `_at_pc` variant; the trait surface above (`Evaluator::resume_from_pc`)
+    /// has a sensible default that ignores `local_snapshot`.
+    ///
+    /// ## Safety
+    ///
+    /// Same contract as [`Self::invoke_with_fallback_at_pc`].
+    pub unsafe fn invoke_with_resume<F>(
+        &self,
+        fn_id: u32,
+        args_ptr: *const u64,
+        slot_count: usize,
+        fallback: F,
+    ) -> u64
+    where
+        F: FnOnce(*const u64, Option<u64>, Option<&relon_trace_abi::DeoptStateSnapshot>) -> u64,
+    {
         let trace_fn = match self.lookup_trace(fn_id) {
             Some(t) => t,
-            None => return fallback(args_ptr, None),
+            None => return fallback(args_ptr, None, None),
         };
 
         let mut ctx = TraceContext::with_hooks(slot_count, default_host_hooks());
@@ -406,15 +435,17 @@ impl TraceJitState {
         match status {
             TraceEntryStatus::Success => ctx.result_slot,
             TraceEntryStatus::GuardFailed => {
-                let resume_pc = ctx.deopt_state.as_ref().map(|d| d.external_pc);
+                let snapshot = ctx.deopt_state.as_ref();
+                let resume_pc = snapshot.map(|d| d.external_pc);
                 tracing::debug!(
                     target: "relon::trace_install",
                     fn_id,
-                    deopt_recorded = ctx.deopt_state.is_some(),
+                    deopt_recorded = snapshot.is_some(),
                     ?resume_pc,
-                    "trace GuardFailed; falling back to generic backend"
+                    slots = snapshot.map(|s| s.ssa_slots_copy.len()).unwrap_or(0),
+                    "trace GuardFailed; partial-resume snapshot ready"
                 );
-                fallback(args_ptr, resume_pc)
+                fallback(args_ptr, resume_pc, snapshot)
             }
             TraceEntryStatus::Aborted => {
                 tracing::warn!(
@@ -423,7 +454,7 @@ impl TraceJitState {
                     "trace Aborted; invalidating + falling back"
                 );
                 self.invalidate_trace(fn_id);
-                fallback(args_ptr, None)
+                fallback(args_ptr, None, None)
             }
         }
     }
@@ -467,9 +498,76 @@ impl TraceJitState {
         let mut module = build_trace_jit_module()?;
         let pointer_ty = module.target_config().pointer_type();
 
+        // v6-δ M1: pre-declare the three host helpers as `Linkage::Import`
+        // functions BEFORE the trace fn itself. The cranelift-module
+        // crate uses `FuncId.as_u32()` for the `UserExternalName.index`
+        // when serialising calls in the function IR. If we let the
+        // trace fn be FuncId 0 (the historical default), then the
+        // emitter's `call save_deopt(...)` would compile down to
+        // calling FuncId 0 (the trace fn itself) — instant
+        // self-recursion → SIGSEGV the moment any guard fires.
+        //
+        // By pre-declaring the helpers we get a deterministic
+        // FuncId-to-symbol mapping; the trace fn then takes the next
+        // free slot. The `HostHookFuncIds` block is passed to the
+        // emitter so `declare_imported_user_function` writes the
+        // right indices into the function IR.
+        let save_deopt_sig = build_host_helper_signature(
+            &[
+                pointer_ty,
+                cranelift_codegen::ir::types::I32,
+                cranelift_codegen::ir::types::I64,
+            ],
+            &[],
+        );
+        let resolve_call_sig = build_host_helper_signature(
+            &[pointer_ty, cranelift_codegen::ir::types::I32],
+            &[pointer_ty],
+        );
+        let ic_lookup_sig = build_host_helper_signature(
+            &[
+                pointer_ty,
+                cranelift_codegen::ir::types::I32,
+                cranelift_codegen::ir::types::I64,
+            ],
+            &[cranelift_codegen::ir::types::I64],
+        );
+        let save_deopt_id = module
+            .declare_function(
+                relon_trace_emitter::HostHookId::SaveDeopt.symbol(),
+                Linkage::Import,
+                &save_deopt_sig,
+            )
+            .map_err(|e| TraceJitError::Module(format!("declare save_deopt: {e}")))?;
+        let resolve_call_id = module
+            .declare_function(
+                relon_trace_emitter::HostHookId::ResolveCall.symbol(),
+                Linkage::Import,
+                &resolve_call_sig,
+            )
+            .map_err(|e| TraceJitError::Module(format!("declare resolve_call: {e}")))?;
+        let ic_lookup_id = module
+            .declare_function(
+                relon_trace_emitter::HostHookId::InlineCacheLookup.symbol(),
+                Linkage::Import,
+                &ic_lookup_sig,
+            )
+            .map_err(|e| TraceJitError::Module(format!("declare ic_lookup: {e}")))?;
+        let hook_func_ids = HostHookFuncIds {
+            save_deopt: save_deopt_id.as_u32(),
+            resolve_call: resolve_call_id.as_u32(),
+            inline_cache_lookup: ic_lookup_id.as_u32(),
+        };
+
         let mut ctx = CodegenContext::new();
-        TraceEmitter::emit_with_pointer_ty(&optimized, &mut ctx, pointer_ty)
+        TraceEmitter::emit_with_hooks(&optimized, &mut ctx, pointer_ty, hook_func_ids)
             .map_err(TraceJitError::Emit)?;
+        tracing::trace!(
+            target: "relon::trace_install",
+            fn_id,
+            ir = %ctx.func.display(),
+            "trace cranelift IR ready for module install"
+        );
 
         // 4. Declare + define the function inside the trace JIT
         //    module, then finalize and resolve the function pointer.
@@ -497,6 +595,25 @@ impl Default for TraceJitState {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Build a cranelift `Signature` for a host helper function. Used by
+/// `jit_compile_buffer_for_fn` when pre-declaring `__relon_trace_save_deopt`
+/// et al. as `Linkage::Import` entries in the trace JIT module.
+fn build_host_helper_signature(
+    params: &[cranelift_codegen::ir::Type],
+    returns: &[cranelift_codegen::ir::Type],
+) -> cranelift_codegen::ir::Signature {
+    use cranelift_codegen::ir::{AbiParam, Signature};
+    use cranelift_codegen::isa::CallConv;
+    let mut sig = Signature::new(CallConv::SystemV);
+    for p in params {
+        sig.params.push(AbiParam::new(*p));
+    }
+    for r in returns {
+        sig.returns.push(AbiParam::new(*r));
+    }
+    sig
 }
 
 /// Process-wide singleton registry. The cranelift evaluator (M4
@@ -740,6 +857,9 @@ pub fn build_trace_jit_module() -> Result<JITModule, TraceJitError> {
     flag_builder
         .set("opt_level", "speed")
         .map_err(|e| TraceJitError::Module(format!("flag opt_level: {e}")))?;
+    flag_builder
+        .set("enable_verifier", "true")
+        .map_err(|e| TraceJitError::Module(format!("flag enable_verifier: {e}")))?;
     let flags = settings::Flags::new(flag_builder);
 
     let isa_builder = cranelift_native::builder()

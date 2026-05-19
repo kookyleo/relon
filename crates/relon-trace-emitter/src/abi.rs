@@ -115,6 +115,33 @@ pub const fn result_slot_offset() -> i32 {
     std::mem::offset_of!(TraceContext, result_slot) as i32
 }
 
+/// Byte offset of [`TraceContext::host_hooks`]. v6-δ M1 R5 uses this
+/// to load the `HostHookTable` so the emitter can dispatch `save_deopt`
+/// / `resolve_call` / `inline_cache_lookup` via `call_indirect` instead
+/// of a direct extern call. Indirecting through the table lets hosts
+/// hot-swap helpers (profile-guided / instrumented variants) without
+/// recompiling installed traces.
+pub const fn host_hooks_offset() -> i32 {
+    std::mem::offset_of!(TraceContext, host_hooks) as i32
+}
+
+/// Byte offset of the supplied [`HostHookId`] slot **inside** the
+/// embedded `HostHookTable`. Combine with [`host_hooks_offset`] for
+/// the full byte offset off a `TraceContext` pointer:
+///
+/// ```text
+/// hook_ptr = load.i64(ctx + host_hooks_offset() + host_hook_slot_offset(id))
+/// ```
+pub fn host_hook_slot_offset(hook: HostHookId) -> i32 {
+    use relon_trace_abi::HostHookTable;
+    let off = match hook {
+        HostHookId::SaveDeopt => std::mem::offset_of!(HostHookTable, save_deopt),
+        HostHookId::ResolveCall => std::mem::offset_of!(HostHookTable, resolve_call),
+        HostHookId::InlineCacheLookup => std::mem::offset_of!(HostHookTable, inline_cache_lookup),
+    };
+    off as i32
+}
+
 /// Stable id of a host hook the emitter may reference when importing
 /// runtime helper functions into the cranelift module.
 ///

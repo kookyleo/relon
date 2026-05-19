@@ -40,5 +40,5 @@ pub use abi::{
     ExternalSlot, ExternalSlotRepr, HostHookId, HostHookTable, ObservedType,
     RecoverableWriteRecord, TraceContext, TraceEntryStatus, TRACE_ENTRY_SIG,
 };
-pub use emitter::{EmitError, TraceEmitter};
+pub use emitter::{EmitError, HostHookFuncIds, TraceEmitter};
 pub use guard_emit::{emit_guard, GuardEmitCtx};

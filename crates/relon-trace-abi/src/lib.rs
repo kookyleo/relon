@@ -57,7 +57,9 @@ pub mod entry;
 pub mod external;
 pub mod observed;
 
-pub use context::{HostHookTable, TraceContext, TraceHookFn, TraceIcLookupFn, TraceResolveCallFn};
+pub use context::{
+    HostHookTable, TraceContext, TraceHookFn, TraceIcLookupFn, TraceResolveCallFn, TraceSaveDeoptFn,
+};
 pub use deopt::{DeoptStateSnapshot, RecoverableWriteRecord};
 pub use effect::EffectClass;
 pub use entry::{AbiSignature, AbiType, TraceEntryStatus, TRACE_ENTRY_SIG};

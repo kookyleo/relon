@@ -635,9 +635,411 @@ fn default_host_hooks_populates_save_deopt_slot() {
     // Confirm we can call through the table without crashing the
     // host. The shim records a snapshot into ctx.deopt_state.
     let f = ctx.host_hooks.save_deopt.expect("populated");
-    unsafe { f(&mut ctx as *mut _, 42) };
+    // v6-δ M1 R5: save_deopt slot now carries the full
+    // (ctx, guard_pc, external_pc) signature.
+    unsafe { f(&mut ctx as *mut _, 42, 0xfeedbeef) };
     let snap = ctx.deopt_state.as_ref().expect("snapshot populated");
     assert_eq!(snap.guard_pc, 42);
+}
+
+/// v6-δ M1 R1: a recording driver that hits `Op::LocalGet` followed
+/// by an arith op must install successfully. The recorder now emits
+/// `TraceOp::LocalGet(dst, slot_idx)` on first observation, and the
+/// emitter materialises the SSA from the entry-fn's `args_ptr` so
+/// `Add` no longer surfaces `EmitError::UnboundSsa`.
+#[test]
+fn let_with_arg_use_installs_via_local_get_lowering() {
+    let fn_id = 720u32;
+    let _ = clear_recording(fn_id);
+    let state = global_trace_jit_state();
+    let _ = state.invalidate_trace(fn_id);
+    register_recording(
+        fn_id,
+        RecordingRegistration {
+            body: vec![
+                TaggedOp {
+                    op: Op::LocalGet(0),
+                    range: TokenRange::default(),
+                },
+                TaggedOp {
+                    op: Op::LocalGet(1),
+                    range: TokenRange::default(),
+                },
+                TaggedOp {
+                    op: Op::Add(IrType::I64),
+                    range: TokenRange::default(),
+                },
+                TaggedOp {
+                    op: Op::Return,
+                    range: TokenRange::default(),
+                },
+            ],
+            // The recorder seeds `LocalGet` with `ObservedType::I32`;
+            // declare the params accordingly so the TypeCheck guard
+            // policy does not flip the recording into an abort.
+            param_tys: vec![IrType::I32, IrType::I32],
+        },
+    );
+    // The trace body reads two args; pass non-overflowing values
+    // so the `ArithOverflow` guard does not deopt.
+    let raw_args: [u64; 2] = [100u64, 23u64];
+    unsafe {
+        relon_codegen_native::trace_install::__relon_jump_to_recorder(fn_id, raw_args.as_ptr());
+    }
+    assert!(
+        state.lookup_trace(fn_id).is_some(),
+        "LocalGet + Add must install (R1)"
+    );
+
+    // Invoke the trace; the JIT body reads args_ptr[0] + args_ptr[1]
+    // and should return 123.
+    let mut ctx = TraceContext::with_capacity(32);
+    let trace_fn = state.lookup_trace(fn_id).expect("post-install");
+    let status = unsafe { trace_fn.invoke(&mut ctx as *mut _, raw_args.as_ptr()) };
+    assert!(
+        matches!(status, TraceEntryStatus::Success),
+        "expected Success, got {status:?}"
+    );
+    assert_eq!(
+        ctx.result_slot, 123,
+        "LocalGet(0) + LocalGet(1) must materialise the packed args"
+    );
+
+    let _ = clear_recording(fn_id);
+    let _ = state.invalidate_trace(fn_id);
+}
+
+/// v6-δ M1 R2: with `sadd_overflow` lowering wired through the
+/// emitter, the trace's `ArithOverflow` guard reads a real carry bit
+/// instead of a constant-0 predicate. Non-overflowing inputs run the
+/// hot path to completion; overflowing inputs deopt cleanly to the
+/// fallback closure.
+#[test]
+fn arith_overflow_guard_uses_real_carry_bit() {
+    let fn_id = 721u32;
+    let _ = clear_recording(fn_id);
+    let state = global_trace_jit_state();
+    let _ = state.invalidate_trace(fn_id);
+    register_recording(
+        fn_id,
+        RecordingRegistration {
+            body: vec![
+                TaggedOp {
+                    op: Op::LocalGet(0),
+                    range: TokenRange::default(),
+                },
+                TaggedOp {
+                    op: Op::LocalGet(1),
+                    range: TokenRange::default(),
+                },
+                TaggedOp {
+                    op: Op::Add(IrType::I64),
+                    range: TokenRange::default(),
+                },
+                TaggedOp {
+                    op: Op::Return,
+                    range: TokenRange::default(),
+                },
+            ],
+            param_tys: vec![IrType::I32, IrType::I32],
+        },
+    );
+    // Warm up with non-overflowing values.
+    let warm_args: [u64; 2] = [1u64, 2u64];
+    unsafe {
+        relon_codegen_native::trace_install::__relon_jump_to_recorder(fn_id, warm_args.as_ptr());
+    }
+    assert!(state.lookup_trace(fn_id).is_some(), "trace must install");
+
+    // 1) Non-overflowing happy path: 1 + 2 = 3 (same args as warmup).
+    let trace_fn = state.lookup_trace(fn_id).expect("trace");
+    let mut ctx_ok = TraceContext::with_capacity(32);
+    let status_ok = unsafe { trace_fn.invoke(&mut ctx_ok as *mut _, warm_args.as_ptr()) };
+    assert!(
+        matches!(status_ok, TraceEntryStatus::Success),
+        "expected Success for non-overflow, got {status_ok:?}"
+    );
+    assert_eq!(ctx_ok.result_slot, 3);
+
+    // 2) Overflow: i64::MAX + 1 must deopt. Expect GuardFailed. The
+    //    deopt block must call `__relon_trace_save_deopt` through the
+    //    proper FuncId-based import — v6-δ M1 fix; the historical
+    //    UserExternalName(0, 0) layout would have called back into
+    //    the trace fn itself.
+    let of_args: [u64; 2] = [i64::MAX as u64, 1u64];
+    let mut ctx_of = TraceContext::with_capacity(32);
+    let status_of = unsafe { trace_fn.invoke(&mut ctx_of as *mut _, of_args.as_ptr()) };
+    assert!(
+        matches!(status_of, TraceEntryStatus::GuardFailed),
+        "expected GuardFailed for overflow, got {status_of:?}"
+    );
+    assert!(
+        ctx_of.deopt_state.is_some(),
+        "GuardFailed must populate deopt_state via save_deopt"
+    );
+
+    let _ = clear_recording(fn_id);
+    let _ = state.invalidate_trace(fn_id);
+}
+
+/// v6-δ M1 R3: `invoke_with_resume` surfaces the full
+/// `DeoptStateSnapshot` to the fallback closure so callers can feed
+/// `local_slots` into `Evaluator::resume_from_pc` for partial-resume.
+/// On GuardFailed we observe the snapshot's `external_pc` + populated
+/// ssa_slots_copy buffer.
+#[test]
+fn invoke_with_resume_exposes_deopt_snapshot_to_fallback() {
+    let fn_id = 722u32;
+    let _ = clear_recording(fn_id);
+    let state = global_trace_jit_state();
+    let _ = state.invalidate_trace(fn_id);
+    register_recording(
+        fn_id,
+        RecordingRegistration {
+            body: vec![
+                TaggedOp {
+                    op: Op::LocalGet(0),
+                    range: TokenRange::default(),
+                },
+                TaggedOp {
+                    op: Op::LocalGet(1),
+                    range: TokenRange::default(),
+                },
+                TaggedOp {
+                    op: Op::Add(IrType::I64),
+                    range: TokenRange::default(),
+                },
+                TaggedOp {
+                    op: Op::Return,
+                    range: TokenRange::default(),
+                },
+            ],
+            param_tys: vec![IrType::I32, IrType::I32],
+        },
+    );
+    let warm_args: [u64; 2] = [1u64, 2u64];
+    unsafe {
+        relon_codegen_native::trace_install::__relon_jump_to_recorder(fn_id, warm_args.as_ptr());
+    }
+    assert!(state.lookup_trace(fn_id).is_some(), "trace must install");
+
+    // Trigger overflow to force a deopt; capture the snapshot.
+    let of_args: [u64; 2] = [i64::MAX as u64, 1u64];
+    let snapshot_was_present = std::cell::Cell::new(false);
+    let snapshot_slot_count = std::cell::Cell::new(0usize);
+    let snapshot_pc = std::cell::Cell::new(0u64);
+    let fallback_args_ptr = std::cell::Cell::new(std::ptr::null::<u64>());
+    let r = unsafe {
+        state.invoke_with_resume(fn_id, of_args.as_ptr(), 32, |args, resume_pc, snapshot| {
+            fallback_args_ptr.set(args);
+            if let Some(s) = snapshot {
+                snapshot_was_present.set(true);
+                snapshot_slot_count.set(s.ssa_slots_copy.len());
+                snapshot_pc.set(resume_pc.unwrap_or(0));
+            }
+            // Stand-in for resume_from_pc: return the wrapping sum.
+            i64::MAX.wrapping_add(1) as u64
+        })
+    };
+    assert_eq!(r, i64::MIN as u64);
+    assert!(
+        snapshot_was_present.get(),
+        "GuardFailed must surface a DeoptStateSnapshot"
+    );
+    assert!(
+        snapshot_slot_count.get() > 0,
+        "snapshot must carry ssa_slots_copy"
+    );
+    assert_eq!(
+        fallback_args_ptr.get(),
+        of_args.as_ptr(),
+        "args_ptr must round-trip into the fallback unchanged"
+    );
+    // resume_pc may be 0 on the very first guard site (recorder's
+    // monotone counter); we don't pin the exact value. The
+    // important property is that the snapshot is populated and the
+    // slots survived the trace -> fallback boundary.
+
+    let _ = clear_recording(fn_id);
+    let _ = state.invalidate_trace(fn_id);
+}
+
+/// v6-δ M1 R5: deopt path now dispatches `save_deopt` through
+/// `ctx.host_hooks.save_deopt` via `call_indirect`. A test that stubs
+/// the slot with a custom function observes the call (and confirms
+/// the indirect dispatch path is hot, not the legacy direct extern
+/// call).
+#[test]
+fn save_deopt_dispatches_through_host_hooks_table() {
+    use relon_trace_abi::{HostHookTable, TraceSaveDeoptFn};
+
+    // Per-thread observation slot the custom save_deopt writes into.
+    thread_local! {
+        static CUSTOM_OBSERVED: std::cell::Cell<(u32, u64)> = const {
+            std::cell::Cell::new((0, 0))
+        };
+    }
+    unsafe extern "C" fn custom_save_deopt(
+        ctx: *mut TraceContext,
+        guard_pc: u32,
+        external_pc: u64,
+    ) {
+        // Record into thread-local + also populate ctx.deopt_state
+        // so the trace's return path keeps observing the snapshot.
+        CUSTOM_OBSERVED.with(|c| c.set((guard_pc, external_pc)));
+        unsafe {
+            relon_trace_jit::runtime::__relon_trace_save_deopt(ctx, guard_pc, external_pc);
+        }
+    }
+
+    let fn_id = 723u32;
+    let _ = clear_recording(fn_id);
+    let state = global_trace_jit_state();
+    let _ = state.invalidate_trace(fn_id);
+    register_recording(
+        fn_id,
+        RecordingRegistration {
+            body: vec![
+                TaggedOp {
+                    op: Op::LocalGet(0),
+                    range: TokenRange::default(),
+                },
+                TaggedOp {
+                    op: Op::LocalGet(1),
+                    range: TokenRange::default(),
+                },
+                TaggedOp {
+                    op: Op::Add(IrType::I64),
+                    range: TokenRange::default(),
+                },
+                TaggedOp {
+                    op: Op::Return,
+                    range: TokenRange::default(),
+                },
+            ],
+            param_tys: vec![IrType::I32, IrType::I32],
+        },
+    );
+    let warm: [u64; 2] = [1, 2];
+    unsafe {
+        relon_codegen_native::trace_install::__relon_jump_to_recorder(fn_id, warm.as_ptr());
+    }
+    let trace_fn = state.lookup_trace(fn_id).expect("trace");
+
+    // Trigger overflow with a custom HostHookTable that observes the
+    // call. The trace's deopt block dispatches through this slot.
+    let hooks = HostHookTable {
+        save_deopt: Some(custom_save_deopt as TraceSaveDeoptFn),
+        ..HostHookTable::default()
+    };
+    let mut ctx = TraceContext::with_hooks(32, hooks);
+    let of_args: [u64; 2] = [i64::MAX as u64, 1];
+    CUSTOM_OBSERVED.with(|c| c.set((0, 0)));
+    let status = unsafe { trace_fn.invoke(&mut ctx as *mut _, of_args.as_ptr()) };
+    assert!(matches!(status, TraceEntryStatus::GuardFailed));
+    let (observed_pc, observed_external_pc) = CUSTOM_OBSERVED.with(|c| c.get());
+    assert!(
+        observed_pc != 0 || observed_external_pc != 0,
+        "custom save_deopt must have been called via call_indirect through ctx.host_hooks"
+    );
+    assert!(
+        ctx.deopt_state.is_some(),
+        "custom save_deopt should still populate ctx.deopt_state"
+    );
+
+    let _ = clear_recording(fn_id);
+    let _ = state.invalidate_trace(fn_id);
+}
+
+/// v6-δ M1 R4: tree-walker now registers `abs` / `min` / `max` /
+/// `clamp` as bare free fns and `length` / `is_empty` / `concat` /
+/// `substring` / `starts_with` / `sum` / `max` as String/List methods,
+/// closing the FunctionNotFound gap the v6-γ M5 corpus surfaced.
+#[test]
+fn tree_walker_stdlib_free_fn_surface() {
+    use relon::{new_evaluator, Backend};
+
+    let cases: &[(&str, Value)] = &[
+        ("#main(Int x) -> Int\nabs(x)", Value::Int(42)),
+        ("#main() -> Int\n\"hello\".length()", Value::Int(5)),
+        ("#main() -> Bool\n\"\".is_empty()", Value::Bool(true)),
+        ("#main() -> Bool\n\"hi\".is_empty()", Value::Bool(false)),
+        (
+            "#main() -> String\n\"foo\".concat(\"bar\")",
+            Value::String("foobar".to_string()),
+        ),
+        // substring(s, start, len) — `(1, 3)` selects "ell".
+        (
+            "#main() -> String\n\"hello\".substring(1, 3)",
+            Value::String("ell".to_string()),
+        ),
+        (
+            "#main() -> Bool\n\"hello world\".starts_with(\"hello\")",
+            Value::Bool(true),
+        ),
+        ("#main() -> Int\n[1, 2, 3, 4, 5].sum()", Value::Int(15)),
+        (
+            "#main() -> Int\n[3, 1, 4, 1, 5, 9, 2, 6].max()",
+            Value::Int(9),
+        ),
+    ];
+    for (src, expected) in cases {
+        let args = if src.contains("Int x") {
+            let mut m = HashMap::new();
+            m.insert("x".to_string(), Value::Int(-42));
+            m
+        } else {
+            HashMap::new()
+        };
+        let ev = new_evaluator(src, Backend::TreeWalk).expect("setup");
+        let r = ev
+            .run_main(args)
+            .unwrap_or_else(|e| panic!("{src} -> {e:?}"));
+        assert_eq!(&r, expected, "tree-walker stdlib surface for {src}");
+    }
+}
+
+/// v6-δ M1 R3: `Evaluator::resume_from_pc` default implementation
+/// re-runs `run_main` so the 4-prong sandbox semantics keep holding
+/// when a deopt'd trace bounces back into the tree-walker. We exercise
+/// the div-by-zero trap path since it's a representative sandbox
+/// surface; bounds-check / capability-gate / resource-limit follow
+/// the same shape (the default forwards to run_main, which already
+/// enforces all four).
+#[test]
+fn evaluator_resume_from_pc_default_preserves_sandbox_semantics() {
+    use relon_eval_api::Evaluator;
+    use std::sync::Arc;
+    let source = "#main(Int x, Int y) -> Int\nx / y";
+    let node = relon_parser::parse_document(source).expect("parse");
+    let analyzed = Arc::new(relon_analyzer::analyze(&node));
+    let mut ctx = relon_evaluator::Context::new()
+        .with_root(node)
+        .with_analyzed(Arc::clone(&analyzed));
+    relon_evaluator::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+    let ev: Box<dyn Evaluator> = Box::new(relon_evaluator::TreeWalkEvaluator::new(Arc::new(ctx)));
+
+    // 1. Happy path through resume_from_pc — should return 21.
+    let mut args = HashMap::new();
+    args.insert("x".to_string(), Value::Int(42));
+    args.insert("y".to_string(), Value::Int(2));
+    let r = ev
+        .resume_from_pc(args, /*external_pc*/ 0, /*slots*/ &[])
+        .expect("ok");
+    assert_eq!(r, Value::Int(21));
+
+    // 2. Div-by-zero trap — resume_from_pc default forwards to
+    //    run_main which preserves the sandbox semantics.
+    let mut bad = HashMap::new();
+    bad.insert("x".to_string(), Value::Int(5));
+    bad.insert("y".to_string(), Value::Int(0));
+    let err = ev
+        .resume_from_pc(bad, /*external_pc*/ 0xdeadbeef, /*slots*/ &[0, 0])
+        .expect_err("must trap");
+    assert!(
+        matches!(err, relon_eval_api::RuntimeError::DivisionByZero(_)),
+        "expected DivisionByZero on resume, got {err:?}"
+    );
 }
 
 #[test]

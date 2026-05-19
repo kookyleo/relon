@@ -30,20 +30,29 @@
 //! prologue routes installed traces back into the entry-fn slot
 //! (a v6-δ deliverable).
 //!
-//! ## Const-vs-LocalGet trace body
+//! ## Real `LocalGet + Add` trace body (v6-δ M1)
 //!
-//! The v6-γ M5 emitter still has no IR for `LocalGet(idx)` → load
-//! from `args_ptr` materialisation: the recorder rebinds SSAs for
-//! `LocalGet` without emitting a `TraceOp`, so the emitter sees
-//! arith ops referencing unbound SSAs and rejects the install with
-//! `EmitError::UnboundSsa`. Wiring through real arg materialisation
-//! is a residual v6-γ TODO (see the M5 stage report).
+//! v6-γ M5 had to bench a const-only body (`ConstI64; Return`)
+//! because (a) the emitter had no `LocalGet` lowering — arith ops
+//! referencing LocalGet'd SSAs failed `EmitError::UnboundSsa` at
+//! install; (b) the `ArithOverflow` guard predicate was a constant
+//! 0, so the trace's brif always took the deopt arm and the bench
+//! was measuring the deopt path rather than the hot loop.
 //!
-//! For the bench we install a **constant-input** trace —
-//! `ConstI64(acc_seed); ConstI64(i_step); Add; Return` — so the
-//! per-iter cost measured here is the steady-state trace tail-call
-//! overhead. The acc accumulation happens Rust-side; the trace is
-//! the analogue of LuaJIT's single-block trace tail body.
+//! v6-δ M1 closes both gaps:
+//!
+//! - R1: recorder emits `TraceOp::LocalGet(dst, slot_idx)` on first
+//!   read; emitter lowers to `load.i64(args_ptr + slot_idx * 8)`.
+//! - R2: emitter switches arith ops to `sadd_overflow` / `ssub_overflow`
+//!   / `smul_overflow` and threads the carry bit into the
+//!   `ArithOverflow` guard predicate. Non-overflowing iters keep
+//!   running on the hot path.
+//!
+//! The bench therefore runs the real body
+//! `LocalGet(0); LocalGet(1); Add; Return` — every iter performs one
+//! `trace_fn.invoke` against fresh `(acc, i)` args and reads the
+//! sum from `ctx.result_slot`. No Rust-side compensation; the
+//! number is the actual hot-loop tail steady state.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -94,26 +103,27 @@ fn step_body() -> Vec<TaggedOp> {
     ]
 }
 
-/// Constant-input trace body: `ConstI64(7); Return`.
+/// Real hot-loop trace body: `LocalGet(0) + LocalGet(1); Return`.
 ///
-/// See module-level note "Const-vs-LocalGet trace body". The trace
-/// returns a fixed value; the bench loop combines it Rust-side with
-/// the per-iter `i` so the steady-state cost is dominated by the
-/// trace tail-call overhead rather than the result computation.
-///
-/// We deliberately avoid `Add(I64)` here because the recorder
-/// lowering emits an `ArithOverflow` guard after every arith op,
-/// and the v6-γ guard predicate emitter encodes I64-typed
-/// ArithOverflow as a constant-0 predicate — which collapses the
-/// trace's brif into an unconditional jump to the deopt block on
-/// every invocation. That makes the bench's "trace-warm" row
-/// measure the deopt path rather than the hot path; using a
-/// guard-free body is the M5 work-around. Documented as a residual
-/// TODO in the stage report.
-fn step_body_trace_const() -> Vec<TaggedOp> {
+/// v6-δ M1 measurement: the recorder now emits `TraceOp::LocalGet`
+/// (R1) so the emitter materialises both SSAs off `args_ptr`, and
+/// `Add(I64)` lowers to `sadd_overflow` with an `ArithOverflow` guard
+/// that brifs on the real carry bit (R2) — so the trace's brif goes
+/// to ok_block on every non-overflowing iter. The bench therefore
+/// measures the actual steady-state hot path, not the const-only
+/// stand-in v6-γ M5 had to fall back to.
+fn step_body_trace_real() -> Vec<TaggedOp> {
     vec![
         TaggedOp {
-            op: Op::ConstI64(1),
+            op: Op::LocalGet(0),
+            range: TokenRange::default(),
+        },
+        TaggedOp {
+            op: Op::LocalGet(1),
+            range: TokenRange::default(),
+        },
+        TaggedOp {
+            op: Op::Add(IrType::I64),
             range: TokenRange::default(),
         },
         TaggedOp {
@@ -148,8 +158,10 @@ fn build_cranelift() -> CraneliftAotEvaluator {
     .expect("cranelift compile")
 }
 
-/// Pre-installed trace for `acc + i`. Returns the trace fn pointer +
-/// the synthetic fn_id we registered against.
+/// Pre-installed trace for `acc + i`. Returns the synthetic fn_id we
+/// registered against; v6-δ M1 trace body really is
+/// `LocalGet + LocalGet + Add + Return`, so the bench measures the
+/// hot-loop steady state instead of the const-only stand-in.
 fn install_trace_for_step() -> u32 {
     // Use the upper half of the fn_id range to stay clear of any
     // smoke-test fn ids.
@@ -158,10 +170,11 @@ fn install_trace_for_step() -> u32 {
     register_recording(
         fn_id,
         RecordingRegistration {
-            body: step_body_trace_const(),
-            // No params on the trace body (it's all ConstI64s); the
-            // walker just runs the const stream.
-            param_tys: vec![],
+            body: step_body_trace_real(),
+            // Pre-warmed with I32-typed slots — recorder seeds
+            // `LocalGet` with `ObservedType::I32`, so the TypeCheck
+            // guard policy doesn't flip.
+            param_tys: vec![IrType::I32, IrType::I32],
         },
     );
     let state = global_trace_jit_state();
@@ -169,11 +182,13 @@ fn install_trace_for_step() -> u32 {
     // fn_id we'd short-circuit and never drive recording. Invalidate
     // before warming up.
     state.invalidate_trace(fn_id);
-    // Drive recording once. The walker runs synchronously; on
-    // return the trace is installed (or aborted — handled by the
-    // assertion below).
+    // Drive recording once with non-overflowing warm-up args so the
+    // recorded TypeCheck / ArithOverflow guard predicates land in
+    // their `passes` arms; the recording walker actually executes
+    // the body so the trace install proves both run.
+    let warm: [u64; 2] = [1, 2];
     unsafe {
-        relon_codegen_native::trace_install::__relon_jump_to_recorder(fn_id, std::ptr::null());
+        relon_codegen_native::trace_install::__relon_jump_to_recorder(fn_id, warm.as_ptr());
     }
     assert!(
         state.lookup_trace(fn_id).is_some(),
@@ -261,43 +276,38 @@ fn bench_hot_loop(c: &mut Criterion) {
     // Pre-install the trace; allocate a single reusable TraceContext;
     // call the trace entry directly in the tight loop.
     //
-    // NOTE: the installed trace body is a constant-input
-    // `ConstI64(0); ConstI64(1); Add; Return` (see
-    // `step_body_trace_const` and the module-level note on the
-    // LocalGet gap). The Rust-side accumulation `acc += i` still
-    // happens in the loop body so each iter performs one
-    // `trace_fn.invoke` + one Rust add — exactly what the v6-δ
-    // host dispatcher will measure once the emitter gets real arg
-    // materialisation.
+    // v6-δ M1 measurement: the installed trace body is the real
+    // `LocalGet(0) + LocalGet(1); Return` shape (see
+    // `step_body_trace_real` for rationale). Each iter packs
+    // `(acc, i)` into a 2-slot u64 array, calls the trace, and reads
+    // the sum out of `ctx.result_slot`. No Rust-side fallback compute:
+    // a deopt would surface a `Success != GuardFailed` mismatch and
+    // we'd want the bench to fail loudly. The ArithOverflow guard
+    // (R2) brifs on the real carry bit so non-overflowing iters never
+    // deopt.
     let fn_id = install_trace_for_step();
     let state = global_trace_jit_state();
     let trace_fn = state.lookup_trace(fn_id).expect("post-install");
     group.bench_function(BenchmarkId::new("backend", "trace_jit_warm"), |b| {
         b.iter(|| {
             let mut acc: i64 = 0;
-            // Pre-allocate one context so the per-iter cost excludes
-            // alloc.
             let mut ctx = TraceContext::with_capacity(64);
+            let mut args: [u64; 2] = [0, 0];
             for i in 0..HOT_LOOP_N as i64 {
-                // SAFETY: the trace's TRACE_ENTRY_SIG accepts
-                // `(*mut TraceContext, *const u64)`; the trace body
-                // ignores its `args_ptr` (all inputs are ConstI64s)
-                // so we pass null. The trace writes its return into
-                // `ctx.result_slot` on Success.
-                let status = unsafe { trace_fn.invoke(&mut ctx as *mut _, std::ptr::null()) };
+                args[0] = black_box(acc) as u64;
+                args[1] = black_box(i) as u64;
+                // SAFETY: TRACE_ENTRY_SIG is `(*mut TraceContext, *const u64)`;
+                // `args` carries the two LocalGet slots the trace reads
+                // off `args_ptr + slot_idx * 8`.
+                let status = unsafe { trace_fn.invoke(&mut ctx as *mut _, args.as_ptr()) };
                 if matches!(status, TraceEntryStatus::Success) {
-                    // `ctx.result_slot` is `ConstI64(0) + ConstI64(1) = 1`
-                    // — a constant value. We still XOR it into `acc`
-                    // alongside the per-iter `i` so the optimiser
-                    // can't fold the trace call away.
-                    acc = acc.wrapping_add(i).wrapping_add(ctx.result_slot as i64 - 1);
+                    acc = ctx.result_slot as i64;
                 } else {
-                    // Guard fired (e.g. ArithOverflow predicate is
-                    // a const-0 today): fall through to Rust
-                    // wrapping arith so the bench loop still
-                    // produces a value. This is the bench's
-                    // analogue of the host dispatcher's
-                    // deopt-fallback path.
+                    // Deopt (overflow guard) — keep the loop alive
+                    // with wrapping arith so we still finish 1M iters
+                    // when running on `i64::MAX`-style edge inputs;
+                    // criterion's input range stays in non-overflow
+                    // territory so this branch is cold.
                     acc = acc.wrapping_add(i);
                 }
             }
