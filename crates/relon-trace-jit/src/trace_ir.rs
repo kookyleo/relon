@@ -150,16 +150,54 @@ pub enum TraceOp {
     // ---- Loop markers -----------------------------------------------
     /// Marks the entry of a recorded loop. `loop_id` distinguishes
     /// nested loops; the same id pairs `MarkLoopHead` with its matching
-    /// `MarkLoopBack`. Pure marker op, no SSA effect, used exclusively
-    /// by the LICM pass to identify hoistable regions.
+    /// `MarkLoopBack`.
+    ///
+    /// ε-M0: `phis` describes the loop-carried values. Each entry
+    /// `LoopPhi { init, phi }` says: the SSA `phi` is a φ-node visible
+    /// inside the loop body, seeded by `init` on the first entry from
+    /// the predecessor and updated on each back-edge by the matching
+    /// position in [`TraceOp::MarkLoopBack::next_values`]. An empty
+    /// `phis` vec keeps the historical "loop-carried-via-let-slot"
+    /// semantics (LICM-only marker), so existing tests stay green.
     MarkLoopHead {
         loop_id: u32,
+        /// Loop-carried φ pairs in stable order. The emitter creates
+        /// one cranelift block-param per entry, in the same order.
+        phis: Vec<LoopPhi>,
     },
     /// Marks the back-edge / exit of the loop with the matching
     /// `loop_id`. See [`TraceOp::MarkLoopHead`].
+    ///
+    /// ε-M0: `next_values` carries the SSAs that drive the matching
+    /// `MarkLoopHead`'s φ nodes on each back-edge iteration. Must
+    /// have the same length and stable order as the head's `phis`.
+    /// Empty when the matching head has no φs (LICM-only marker).
     MarkLoopBack {
         loop_id: u32,
+        /// SSAs forwarded to the head's φ nodes on the back-edge,
+        /// one per entry in [`TraceOp::MarkLoopHead::phis`], same order.
+        next_values: Vec<SsaVar>,
     },
+}
+
+/// A loop-carried φ pair recorded on [`TraceOp::MarkLoopHead`].
+///
+/// Inside the loop body, references to the loop-carried value see the
+/// `phi` SSA id. On the first entry, `init` (a value defined before
+/// the loop) flows into `phi`; on each back-edge, the matching slot
+/// in [`TraceOp::MarkLoopBack::next_values`] flows into `phi`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct LoopPhi {
+    /// Pre-loop seed value visible at the loop header entry edge.
+    pub init: SsaVar,
+    /// φ SSA id visible inside the loop body.
+    pub phi: SsaVar,
+}
+
+impl LoopPhi {
+    pub fn new(init: SsaVar, phi: SsaVar) -> Self {
+        Self { init, phi }
+    }
 }
 
 /// Inline guard kind. Mirrors the design doc §2 enum without the
@@ -175,6 +213,11 @@ pub enum GuardKind {
     BoundsCheck(SsaVar, SsaVar),
     /// Trace assumed an arithmetic op didn't overflow.
     ArithOverflow(SsaVar),
+    /// ε-M0: trace assumed `var == 0` — the dual of [`Self::NotNull`].
+    /// Used when the recorder is following the **fall-through** path
+    /// of a `BrIf` (cond was 0, branch not taken). Deopts when the
+    /// runtime cond flips to non-zero.
+    IsZero(SsaVar),
 }
 
 impl TraceOp {
@@ -244,10 +287,29 @@ impl TraceOp {
                 GuardKind::NotNull(v) => vec![v],
                 GuardKind::BoundsCheck(v, limit) => vec![v, limit],
                 GuardKind::ArithOverflow(v) => vec![v],
+                GuardKind::IsZero(v) => vec![v],
             },
             TraceOp::Call(_, _, args, _) => args.clone(),
             TraceOp::Return(v) => vec![*v],
-            TraceOp::MarkLoopHead { .. } | TraceOp::MarkLoopBack { .. } => vec![],
+            // ε-M0: loop markers consume / produce φ pairs. The head
+            // reads the `init` SSA (defined before the loop) for each
+            // φ; the back reads the `next_values` SSA (defined inside
+            // the body) on the back-edge.
+            TraceOp::MarkLoopHead { phis, .. } => phis.iter().map(|p| p.init).collect(),
+            TraceOp::MarkLoopBack { next_values, .. } => next_values.clone(),
+        }
+    }
+
+    /// All SSA vars *defined* by this op. Returns multiple ids for
+    /// loop heads that carry φ nodes; a thin wrapper over
+    /// [`TraceOp::output`] for every other variant.
+    ///
+    /// Optimizer passes that track "what's defined inside a loop"
+    /// MUST use this method so the head's φ SSAs are counted.
+    pub fn defs(&self) -> Vec<SsaVar> {
+        match self {
+            TraceOp::MarkLoopHead { phis, .. } => phis.iter().map(|p| p.phi).collect(),
+            other => other.output().into_iter().collect(),
         }
     }
 
@@ -269,7 +331,7 @@ impl TraceOp {
     /// Returns `Some(loop_id)` if this is a loop head marker.
     pub fn loop_head_id(&self) -> Option<u32> {
         match self {
-            TraceOp::MarkLoopHead { loop_id } => Some(*loop_id),
+            TraceOp::MarkLoopHead { loop_id, .. } => Some(*loop_id),
             _ => None,
         }
     }
@@ -277,7 +339,7 @@ impl TraceOp {
     /// Returns `Some(loop_id)` if this is a loop back marker.
     pub fn loop_back_id(&self) -> Option<u32> {
         match self {
-            TraceOp::MarkLoopBack { loop_id } => Some(*loop_id),
+            TraceOp::MarkLoopBack { loop_id, .. } => Some(*loop_id),
             _ => None,
         }
     }
@@ -340,8 +402,14 @@ mod tests {
 
     #[test]
     fn loop_markers_are_pure_and_outputless() {
-        let head = TraceOp::MarkLoopHead { loop_id: 3 };
-        let back = TraceOp::MarkLoopBack { loop_id: 3 };
+        let head = TraceOp::MarkLoopHead {
+            loop_id: 3,
+            phis: vec![],
+        };
+        let back = TraceOp::MarkLoopBack {
+            loop_id: 3,
+            next_values: vec![],
+        };
         assert!(head.is_loop_head());
         assert!(back.is_loop_back());
         assert_eq!(head.loop_head_id(), Some(3));

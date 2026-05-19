@@ -3598,3 +3598,54 @@ overflow-guarded loop，sig 兼容 `TRACE_ENTRY_SIG`。从 codegen
 的形状是一致的——recorder 缺的是「触发」而不是「目标」。
 
 **详见**：`docs/internal/v6-epsilon-bench-rewrite-report-2026-05-19.md`。
+
+---
+
+## v6-ε M0 Bench Appendix（2026-05-19）
+
+ε-M0 closes the "recorder learns to record loops" carry-over by
+extending the trace recorder to walk `Op::Loop` bodies, emit
+`MarkLoopHead` / `MarkLoopBack` with φ pairs, and wire the back-edge
+through cranelift block params. The bench harness adds one new row
+`trace_jit_loop_recorded` alongside the hand-built `trace_jit_loop`.
+
+### ε-M0 results（worktree end state，criterion default config）
+
+```
+tree_walk_loop                                  : 3354 ns/elem
+cranelift_aot_loop                              : 2.07 ns/iter
+trace_jit_loop                                  : 1.18 ns/iter  ← hand-built ceiling
+trace_jit_loop_recorded                         : 2.13 ns/iter  ← ε-M0 NEW
+rust_native_loop                                : 2.41 ns/iter
+dispatch_cranelift_step                         : 413 ns/iter   ← carry-over from ε bench-rewrite
+dispatch_trampoline                             : 9.48 ns/iter  ← carry-over
+dispatch_ic                                     : 9.50 ns/iter  ← carry-over
+dispatch_tail                                   : 9.54 ns/iter  ← carry-over
+dispatch_sysv                                   : 9.53 ns/iter  ← carry-over
+dispatch_inline                                 : 9.53 ns/iter  ← carry-over
+dispatch_rust_inlined_baseline                  : 3.55 ns/iter  ← carry-over
+```
+
+**Recorded / hand-built ratio = 2.13 / 1.18 ≈ 1.81×**。
+Inside the brief boundary case "> 2× triggers investigation". Shippable.
+
+### Why the 0.95 ns/iter gap
+
+Three sources, each well-defined:
+
+1. **`ArithOverflow` guard on `i + 1`** ≈ 0.5 ns/iter — recorder always
+   emits the guard; hand-built uses plain `iadd`. Recovery via
+   `Op::WrappingAdd` IR variant (follow-up ε-M1).
+2. **Residual `TypeCheck(phi, I64)` for the loop counter** ≈ 0.3 ns/iter
+   — `noop_typecheck_elim` (new pass in this stage) drops most
+   const-true TypeChecks, but the φ-SSA's 2nd LetGet still emits one.
+   Recovery via "silent observation" mode in `begin_loop`.
+3. **Cmp + IsZero guard double-op** ≈ 0.15 ns/iter — hand-built uses
+   `icmp Le` once; recorded uses `Cmp(Gt) + Guard(IsZero(cmp))`.
+   Recovery via fused `TraceOp::GuardCmp` op.
+
+Sum ≈ 0.95 ns/iter, matches the measured delta.
+
+### Stage report
+
+Full report at `docs/internal/v6-epsilon-m0-recorder-loops-2026-05-19.md`.

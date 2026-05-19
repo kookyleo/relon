@@ -29,6 +29,7 @@ pub mod const_fold;
 pub mod dead_store;
 pub mod licm;
 pub mod load_forward;
+pub mod noop_typecheck_elim;
 pub mod type_spec;
 
 use crate::buffer::TraceBuffer;
@@ -69,6 +70,11 @@ impl OptimizerPipeline {
                 Box::new(dead_store::DeadStoreElim),
                 Box::new(type_spec::TypeSpec),
                 Box::new(licm::LICM),
+                // ε-M0: drop Guard(TypeCheck(var, ty)) ops whose
+                // observed type already matches expected. Runs AFTER
+                // licm so any hoisted no-op TypeCheck above the loop
+                // also gets removed in the same pass.
+                Box::new(noop_typecheck_elim::NoopTypeCheckElim),
                 Box::new(dead_store::DeadStoreElim),
             ],
         }
@@ -104,9 +110,11 @@ mod tests {
     }
 
     #[test]
-    fn default_pipeline_has_six_passes() {
+    fn default_pipeline_has_seven_passes() {
+        // ε-M0 added `noop_typecheck_elim` between LICM and the
+        // second dead-store round.
         let p = OptimizerPipeline::default_pipeline();
-        assert_eq!(p.passes.len(), 6);
+        assert_eq!(p.passes.len(), 7);
     }
 
     #[test]

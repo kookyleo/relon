@@ -288,8 +288,11 @@ impl<'a, 'b> TraceEmitterState<'a, 'b> {
                 self.emit_call(*dst, func_id.0, args, *effect)
             }
             TraceOp::Return(v) => self.emit_return(*v),
-            TraceOp::MarkLoopHead { loop_id } => self.emit_loop_head(*loop_id),
-            TraceOp::MarkLoopBack { loop_id } => self.emit_loop_back(*loop_id),
+            TraceOp::MarkLoopHead { loop_id, phis } => self.emit_loop_head(*loop_id, phis),
+            TraceOp::MarkLoopBack {
+                loop_id,
+                next_values,
+            } => self.emit_loop_back(*loop_id, next_values),
         }
     }
 
@@ -532,26 +535,63 @@ impl<'a, 'b> TraceEmitterState<'a, 'b> {
         self.builder.ins().return_(&[success]);
     }
 
-    fn emit_loop_head(&mut self, loop_id: u32) -> Result<(), EmitError> {
-        // Create the header block and jump into it from the current
-        // insertion point. The header takes no block params because
-        // loop-carried values live in the trace's SSA slots (the
-        // recorder turns φ-style carries into explicit Load/Store
-        // pairs).
+    fn emit_loop_head(
+        &mut self,
+        loop_id: u32,
+        phis: &[relon_trace_jit::LoopPhi],
+    ) -> Result<(), EmitError> {
+        // Create the header block. ε-M0: when the recorder marked any
+        // loop-carried φ values, the header takes one block-param per
+        // φ (I64 width — wide enough for I32/I64/Bool/Ptr in the
+        // current trace IR envelope). The phi SSA listed by the
+        // recorder is bound to the matching block-param so subsequent
+        // body ops see the φ value.
+        //
+        // When `phis` is empty (legacy LICM-only marker), we keep the
+        // historical "header has no block params" shape so existing
+        // call sites stay byte-for-byte equivalent.
         let header = self.builder.create_block();
-        self.builder.ins().jump(header, &[]);
+
+        // Compute init values BEFORE the jump so they're available in
+        // the predecessor block.
+        let mut init_vals: Vec<ir::Value> = Vec::with_capacity(phis.len());
+        for phi in phis {
+            let v = self.lookup(phi.init)?;
+            // Widen to I64 so the block-param width is uniform; the
+            // emit_local_get / arith paths already widen as needed.
+            let widened = self.widen_to_i64(v);
+            init_vals.push(widened);
+        }
+
+        // Append one block-param per phi (all I64) and bind the phi
+        // SSA to the cranelift block-param.
+        for phi in phis {
+            let bp = self.builder.append_block_param(header, I64);
+            self.bind(phi.phi, bp);
+        }
+
+        let init_args: Vec<ir::BlockArg> =
+            init_vals.iter().map(|v| ir::BlockArg::Value(*v)).collect();
+        self.builder.ins().jump(header, &init_args);
         self.builder.switch_to_block(header);
         // Don't seal: the matching MarkLoopBack will add the back edge.
         self.loop_head_blocks.insert(loop_id, header);
         Ok(())
     }
 
-    fn emit_loop_back(&mut self, loop_id: u32) -> Result<(), EmitError> {
+    fn emit_loop_back(&mut self, loop_id: u32, next_values: &[SsaVar]) -> Result<(), EmitError> {
         let header = *self
             .loop_head_blocks
             .get(&loop_id)
             .ok_or(EmitError::UnmatchedLoopBack(loop_id))?;
-        self.builder.ins().jump(header, &[]);
+        let mut args_vals: Vec<ir::Value> = Vec::with_capacity(next_values.len());
+        for v in next_values {
+            let val = self.lookup(*v)?;
+            let widened = self.widen_to_i64(val);
+            args_vals.push(widened);
+        }
+        let args: Vec<ir::BlockArg> = args_vals.iter().map(|v| ir::BlockArg::Value(*v)).collect();
+        self.builder.ins().jump(header, &args);
         // The header had its forward edge from `emit_loop_head` and
         // now its back edge from this jump; safe to seal.
         self.builder.seal_block(header);

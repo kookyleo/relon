@@ -21,13 +21,60 @@ use std::collections::HashMap;
 
 use relon_ir::Op;
 use relon_trace_jit::{
-    EffectClass as TraceEffect, ExternalPc, GuardKind, GuardSite, ObservedType, SsaVar,
+    EffectClass as TraceEffect, ExternalPc, GuardKind, GuardSite, LoopPhi, ObservedType, SsaVar,
     TraceBuffer, TraceOp,
 };
 
 use crate::abort::AbortReason;
 use crate::lowering::{lower_op, LookupKind, LowerOutcome, OpLoweringContext};
 use crate::type_obs::{classify_observation, TypeObsDecision};
+
+/// Description of one loop-carried value the recorder should weave
+/// through a [`TraceOp::MarkLoopHead`] / [`TraceOp::MarkLoopBack`]
+/// φ-pair.
+///
+/// ε-M0: the higher-level walker driver builds one of these per
+/// let-slot that gets re-assigned inside the loop body.
+#[derive(Debug, Clone, Copy)]
+pub struct LoopCarry {
+    /// Pre-loop seed SSA — the value visible at the slot at the
+    /// instant the loop header is entered.
+    pub init: SsaVar,
+    /// Observed type the recorder should remember for the fresh phi
+    /// SSA. Drives the emitter's type-info side-table lookup at
+    /// guard-emission time.
+    pub ty: ObservedType,
+    /// Optional source-side key the φ should be wired into the
+    /// recorder's `ir_to_ssa` table for. When supplied, the
+    /// recorder rebinds `ir_to_ssa[key] = phi_ssa` so subsequent
+    /// `LetGet` / `LocalGet` lookups inside the loop body observe
+    /// the φ SSA instead of the pre-loop SSA. Without this rebind
+    /// the recorder would silently propagate the stale pre-loop
+    /// SSA into every body op, defeating the φ pair.
+    pub key: Option<crate::lowering::LookupKind>,
+}
+
+impl LoopCarry {
+    pub fn new(init: SsaVar, ty: ObservedType) -> Self {
+        Self {
+            init,
+            ty,
+            key: None,
+        }
+    }
+
+    /// Same as [`Self::new`] but also rebinds the recorder's
+    /// `ir_to_ssa` table for `key` to the fresh φ SSA. Pass this when
+    /// the φ is the loop-carried view of a let-slot / local-slot the
+    /// body reads via `Op::LetGet` / `Op::LocalGet`.
+    pub fn with_key(init: SsaVar, ty: ObservedType, key: crate::lowering::LookupKind) -> Self {
+        Self {
+            init,
+            ty,
+            key: Some(key),
+        }
+    }
+}
 
 /// Maximum number of ops a single trace may accumulate before the
 /// recorder gives up. Hard-coded so the buffer's growth stays
@@ -110,6 +157,11 @@ pub struct RecorderState {
     /// `Op::Loop` / its closing boundary.
     loop_depth: u32,
     next_loop_id: u32,
+    /// ε-M0: open `begin_loop` calls awaiting a matching `end_loop`.
+    /// Each frame remembers the loop-id stamped at begin time so the
+    /// matching back-edge stamps the same id. LIFO so nested loops
+    /// pair correctly.
+    open_loops: Vec<u32>,
     /// Maximum number of ops the buffer may collect before the
     /// recorder aborts with `TraceTooLong`.
     capacity: usize,
@@ -152,6 +204,7 @@ impl RecorderState {
             guarded_vars: HashMap::new(),
             loop_depth: 0,
             next_loop_id: 0,
+            open_loops: Vec::new(),
             capacity,
             next_external_pc: 0,
             ssa_stack: Vec::with_capacity(16),
@@ -214,6 +267,29 @@ impl RecorderState {
         self.emit_guard(GuardKind::NotNull(cond_ssa))
     }
 
+    /// ε-M0: emit a guard whose deopt polarity matches the **falsy
+    /// path** of a branch — i.e. "deopt if `cond_ssa` becomes
+    /// non-zero". Used by `Op::BrIf` recording when the walker's
+    /// runtime cond is false (fall through, branch NOT taken).
+    ///
+    /// Emits a single [`GuardKind::IsZero`] op (the dual of
+    /// `NotNull`); the emitter lowers it as `brif (cond != 0, deopt,
+    /// ok)` — a single icmp + brif per iter rather than the earlier
+    /// double-Cmp shape, matching the hand-built bench row's
+    /// per-iter cost profile.
+    ///
+    /// Returns `Some(GuardKind::IsZero(cond_ssa))` on the happy path,
+    /// `None` if the recorder is already aborted / terminated.
+    pub fn emit_branch_falsy_guard(&mut self, cond_ssa: SsaVar) -> Option<GuardKind> {
+        if self.aborted.is_some() || self.terminated {
+            return None;
+        }
+        if cond_ssa == SsaVar::NONE {
+            return None;
+        }
+        self.emit_guard(GuardKind::IsZero(cond_ssa))
+    }
+
     /// True when the recorder has accepted an abort decision and is
     /// no longer touching the buffer.
     pub fn is_aborted(&self) -> bool {
@@ -252,6 +328,114 @@ impl RecorderState {
         if self.aborted.is_none() {
             self.aborted = Some(reason);
         }
+    }
+
+    /// ε-M0: open a loop frame and emit a `TraceOp::MarkLoopHead`
+    /// carrying one φ pair per [`LoopCarry`].
+    ///
+    /// Returns the freshly-allocated φ SSAs in the same order as
+    /// `carries`. The caller (the IR walker) is expected to update
+    /// its let-slot map so subsequent `LetGet` reads observe the φ
+    /// SSAs while the body is being recorded.
+    ///
+    /// Recorder state side-effects:
+    /// - Allocates one fresh SSA per carry; records its observed type
+    ///   in the buffer's type_info table so the emitter's guard
+    ///   predicate builder can resolve `TypeCheck(phi, ty)`.
+    /// - Appends one `TraceOp::MarkLoopHead { loop_id, phis }` op.
+    /// - Pushes the loop_id onto the [`Self::open_loops`] stack so the
+    ///   matching `end_loop` stamps the correct id.
+    /// - Bumps `loop_depth` so the diagnostic counter mirrors nesting
+    ///   (the historical depth gauge still works).
+    ///
+    /// If the recorder is already aborted / terminated this is a
+    /// silent no-op and returns an empty vec — the caller's walker
+    /// already saw the sticky state on the prior op.
+    pub fn begin_loop(&mut self, carries: &[LoopCarry]) -> Vec<SsaVar> {
+        if self.aborted.is_some() || self.terminated {
+            return Vec::new();
+        }
+        if self.buffer.op_count() >= self.capacity {
+            self.aborted = Some(AbortReason::TraceTooLong);
+            return Vec::new();
+        }
+
+        let loop_id = self.next_loop_id;
+        self.next_loop_id += 1;
+        self.loop_depth = self.loop_depth.saturating_add(1);
+
+        let mut phis: Vec<LoopPhi> = Vec::with_capacity(carries.len());
+        let mut phi_ssas: Vec<SsaVar> = Vec::with_capacity(carries.len());
+        for c in carries {
+            let phi = self.ssa.alloc();
+            // Persist the φ's observed type so the emitter's
+            // type-info side-table resolves `TypeCheck(phi, ty)`
+            // predicates at install time. We intentionally do NOT
+            // seed `type_obs` here — that map drives the "first
+            // observed vs re-observed" guard-emission policy. By
+            // letting the first body `LetGet(phi)` hit the
+            // `FirstSeen` branch, we avoid emitting a redundant
+            // `Guard(TypeCheck(phi, ty))` brif on every loop iter
+            // (each such guard is `brif (iconst 1), ok, deopt` —
+            // technically a no-op once cranelift folds, but it adds
+            // pressure to the per-iter machine code).
+            self.buffer.record_type(phi, c.ty);
+            // ε-M0 critical rebind: if the carry has a source-side
+            // `ir_to_ssa` key, make subsequent body `LetGet` /
+            // `LocalGet` ops resolve to the φ SSA rather than the
+            // pre-loop SSA. Without this the recorder lowers every
+            // body read of a carried slot to the stale pre-loop SSA,
+            // defeating the φ pair (the SSA never changes, LICM
+            // hoists the entire body, the trace deopts on the first
+            // iter because the body's overflow / branch guards see
+            // recording-time values that don't match runtime).
+            if let Some(key) = c.key {
+                self.ir_to_ssa.insert(key, phi);
+                // Re-arm TypeCheck guard emission for the φ SSA so
+                // the next observation can emit a fresh guard if the
+                // type drifts; without clearing `guarded_vars` the
+                // φ would carry the seed's type-guard suppression.
+                self.guarded_vars.remove(&phi);
+            }
+            phis.push(LoopPhi::new(c.init, phi));
+            phi_ssas.push(phi);
+        }
+
+        self.buffer.append(TraceOp::MarkLoopHead { loop_id, phis });
+        self.open_loops.push(loop_id);
+        phi_ssas
+    }
+
+    /// ε-M0: close the most-recently-opened loop frame with the
+    /// supplied back-edge `next_values` and emit the matching
+    /// `TraceOp::MarkLoopBack`. The next-values vec must be the same
+    /// length and order as the `carries` passed to the corresponding
+    /// `begin_loop`.
+    ///
+    /// Returns `true` on success, `false` if the recorder is in a
+    /// sticky aborted/terminated state or there is no open loop frame.
+    /// Mismatched length aborts the recorder with `UnsupportedOp`.
+    pub fn end_loop(&mut self, next_values: &[SsaVar]) -> bool {
+        if self.aborted.is_some() || self.terminated {
+            return false;
+        }
+        let loop_id = match self.open_loops.pop() {
+            Some(id) => id,
+            None => {
+                self.aborted = Some(AbortReason::UnsupportedOp("LoopBackWithoutHead"));
+                return false;
+            }
+        };
+        self.loop_depth = self.loop_depth.saturating_sub(1);
+        if self.buffer.op_count() >= self.capacity {
+            self.aborted = Some(AbortReason::TraceTooLong);
+            return false;
+        }
+        self.buffer.append(TraceOp::MarkLoopBack {
+            loop_id,
+            next_values: next_values.to_vec(),
+        });
+        true
     }
 
     /// Drop the recorder, returning the underlying [`TraceBuffer`] iff
@@ -470,11 +654,11 @@ impl RecorderState {
             }
             LowerOutcome::LoopMarker { op: marker_op } => {
                 let marker = match marker_op {
-                    TraceOp::MarkLoopHead { .. } => {
+                    TraceOp::MarkLoopHead { phis, .. } => {
                         let id = self.next_loop_id;
                         self.next_loop_id += 1;
                         self.loop_depth = self.loop_depth.saturating_add(1);
-                        TraceOp::MarkLoopHead { loop_id: id }
+                        TraceOp::MarkLoopHead { loop_id: id, phis }
                     }
                     other => other,
                 };
@@ -563,7 +747,8 @@ impl RecorderState {
             GuardKind::TypeCheck(v, _)
             | GuardKind::NotNull(v)
             | GuardKind::BoundsCheck(v, _)
-            | GuardKind::ArithOverflow(v) => v,
+            | GuardKind::ArithOverflow(v)
+            | GuardKind::IsZero(v) => v,
         };
         self.append_guard_with_site(kind, payload);
         Some(kind)
@@ -788,5 +973,78 @@ mod tests {
             1,
             "post-Add stack depth is 1 (result on top)"
         );
+    }
+
+    // ---- ε-M0: begin_loop / end_loop ----
+
+    #[test]
+    fn begin_loop_emits_mark_head_with_phis() {
+        let mut r = RecorderState::new();
+        // Seed an acc=0 const so we have a real init SSA to carry.
+        let acc = match r.record_op(&Op::ConstI64(0), &[], Some(ObservedType::I64)) {
+            RecordResult::Ok { value: Some(v) } => v,
+            other => panic!("unexpected {:?}", other),
+        };
+        let phis = r.begin_loop(&[LoopCarry::new(acc, ObservedType::I64)]);
+        assert_eq!(phis.len(), 1, "one carry → one φ SSA");
+        let phi = phis[0];
+        assert_ne!(phi, acc, "φ SSA must differ from init SSA");
+
+        // The buffer's last op should be a MarkLoopHead with the
+        // recorded phi.
+        let buf = r.buffer();
+        let last = buf.ops.last().expect("buffer must have ≥1 op");
+        match last {
+            TraceOp::MarkLoopHead { loop_id, phis } => {
+                assert_eq!(*loop_id, 0, "first loop id is 0");
+                assert_eq!(phis.len(), 1);
+                assert_eq!(phis[0].init, acc);
+                assert_eq!(phis[0].phi, phi);
+            }
+            other => panic!("expected MarkLoopHead, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn end_loop_emits_mark_back_with_next_values() {
+        let mut r = RecorderState::new();
+        let acc = match r.record_op(&Op::ConstI64(0), &[], Some(ObservedType::I64)) {
+            RecordResult::Ok { value: Some(v) } => v,
+            other => panic!("unexpected {:?}", other),
+        };
+        let phis = r.begin_loop(&[LoopCarry::new(acc, ObservedType::I64)]);
+        let phi = phis[0];
+        // Fake an Add inside the body: phi + 1
+        let one = match r.record_op(&Op::ConstI64(1), &[], Some(ObservedType::I64)) {
+            RecordResult::Ok { value: Some(v) } => v,
+            _ => panic!(),
+        };
+        let acc_next =
+            match r.record_op(&Op::Add(IrType::I64), &[one, phi], Some(ObservedType::I64)) {
+                RecordResult::Ok { value: Some(v) }
+                | RecordResult::NeedsGuard { value: Some(v), .. } => v,
+                other => panic!("unexpected {:?}", other),
+            };
+        assert!(r.end_loop(&[acc_next]));
+        let buf = r.buffer();
+        let last = buf.ops.last().expect("≥1 op");
+        match last {
+            TraceOp::MarkLoopBack {
+                loop_id,
+                next_values,
+            } => {
+                assert_eq!(*loop_id, 0);
+                assert_eq!(next_values, &vec![acc_next]);
+            }
+            other => panic!("expected MarkLoopBack, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn end_loop_without_begin_aborts() {
+        let mut r = RecorderState::new();
+        let ok = r.end_loop(&[]);
+        assert!(!ok);
+        assert!(r.is_aborted());
     }
 }
