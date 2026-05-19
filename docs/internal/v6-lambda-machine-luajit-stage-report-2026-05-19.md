@@ -1,6 +1,6 @@
 # v6-λ-机器 quiescence + λ-1 LuaJIT install — Stage report
 
-**Status**：IN-PROGRESS（incremental writeback during agent run）
+**Status**：DONE-MET-TARGET（2026-05-19）
 **Base**：`52f9a38 docs(internal): v6-λ-0 stage report + plan §21 + bench appendix`
 **前置**：λ-0 bench methodology hardening 已落 main（6 陷阱硬化 + 12 个 validators）
 
@@ -118,17 +118,44 @@ mlua = { version = "0.10", features = ["luajit", "vendored", "macros"] }
 
 ## 3. Gate / 验证
 
-（填入：`cargo build --workspace`、`cargo test --workspace`、
-`cargo clippy --workspace --all-targets -- -D warnings`、
-`cargo fmt --all -- --check`、`cargo build --target wasm32-unknown-unknown -p
-relon-wasm`、`cargo bench --bench trace_jit_hot_loop`、
-`cargo test -p relon-bench --test methodology_validators` 各自结果）
+| Gate | 结果 |
+|---|---|
+| `cargo build --workspace` | OK（45 s 冷编） |
+| `cargo test --workspace` | **1798 passed, 0 failed, 5 ignored**（比 λ-0 基线 1793 多 5：3 个 quiescence 单测 + 2 个 Lua smoke） |
+| `cargo clippy --workspace --all-targets -- -D warnings` | OK（修了 result_large_err + manual_range_contains） |
+| `cargo fmt --all -- --check` | OK |
+| `cargo build --target wasm32-unknown-unknown -p relon-wasm` | OK（21 s） |
+| `cargo bench --bench trace_jit_hot_loop` | OK（force-run on dev box；新行 captured，见 §4） |
+| `cargo test -p relon-bench --test methodology_validators` | **9 passed**（验证 ≥ 12 closures 含新 lua_boundary_calibrate） |
+| `cargo test -p relon-bench --test lua_smoke` | **2 passed, 1 ignored**（boundary cost ballpark `#[ignore]`d） |
 
 ---
 
-## 4. 实测 lua_boundary_calibrate 单行
+## 4. 实测 lua_boundary_calibrate 单行（dev-box，未 quiescent）
 
-（填入：p50 / p99 / max / sample 数）
+机器状态：governor=schedutil（非 performance）、no_turbo=1、load1=4.47、
+`RELON_BENCH_FORCE_RUN=1` 强跑。**这个数字仅用作 wiring 验证 + 量级 sanity-check**；
+λ-2 跑前必须在 quiescent 机上重测。
+
+| Row | p50 | p99 | max | samples | tag |
+|---|---|---|---|---|---|
+| `lua_boundary_calibrate` | **94.90 ns/iter** | 94.92 | 94.92 | 2（quick 模式） | per_iter_alloc |
+
+**关键观察**：
+- 94.9 ns/iter 在 task brief 预期的 50-200 ns 区间内（mlua → LuaJIT pcall 边界，
+  含 Lua state stack-balance check + lua_pcall longjmp anchor）。
+- 比 Relon dispatch rows（9.5 ns）慢 ~10×，正如 plan §3 W8 推测的 "Lua state
+  设置比 Relon trampoline 重得多"。
+- 这就是 λ-2 paired workloads 用来 normalize Lua-side numbers 的减除基线。
+
+**Caveat**：本次跑是 `--quick`（2 samples），分布尾部不可靠。完整 200-sample
+distribution 要在 quiescent 机上重跑：
+```bash
+./scripts/bench_quiescence.sh
+taskset -c 4-7 cargo bench --bench trace_jit_hot_loop
+cargo run --release -p relon-bench --bin bench_stats -- \
+    target/criterion/v6_epsilon_hot_loop
+```
 
 ---
 

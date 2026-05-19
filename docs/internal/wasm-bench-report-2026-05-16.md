@@ -3699,3 +3699,39 @@ cargo run --release -p relon-bench --bin bench_stats -- \
     target/criterion/v6_epsilon_hot_loop
 ```
 
+---
+
+## v6-λ-1 — LuaJIT boundary 校准行 追加（2026-05-19）
+
+**新增 bench row**：`lua_boundary_calibrate`，作为 mlua → LuaJIT pcall 边界
+基线。λ-2 paired workloads 用该值从 W1-W12 的 Lua 数字里 normalize 出真正的
+"Lua 内部工作" 时间。
+
+### dev-box smoke 数据（quick mode，2 samples，governor=schedutil，load1=4.47）
+
+机器**非 quiescent**，需 `RELON_BENCH_FORCE_RUN=1` 强跑；本次仅作 wiring
+sanity-check：
+
+| Row | p50 ns/iter | p99 | max | samples | tag |
+|---|---|---|---|---|---|
+| `lua_boundary_calibrate` | **94.90** | 94.92 | 94.92 | 2 | per_iter_alloc |
+
+**关键观察**：
+- 落在 task brief 预期的 50-200 ns 区间内（mlua + LuaJIT pcall 含 stack-balance
+  check + longjmp anchor）。
+- 比 Relon `dispatch_*` 行（9.5 ns）慢 ~10×，与 plan §3 W8 的"Lua state 比
+  Relon trampoline 重得多"的预测一致。
+- λ-2 paired workloads 跑前需在 quiescent 机上重测 200-sample 完整分布；
+  本数字仅 wiring 验证用。
+
+### 复现（quiescent 机）
+
+```bash
+./scripts/bench_quiescence.sh           # 一次性，需 sudo
+taskset -c 4-7 cargo bench --bench trace_jit_hot_loop
+cargo run --release -p relon-bench --bin bench_stats -- \
+    target/criterion/v6_epsilon_hot_loop
+```
+
+详 `docs/internal/v6-lambda-machine-luajit-stage-report-2026-05-19.md`。
+
