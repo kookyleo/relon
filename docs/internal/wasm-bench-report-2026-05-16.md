@@ -3829,3 +3829,201 @@ tail`、W6 = `n*(n+1)/2` 解析公式校验 `ctx.result_slot`，确保不存在
 
 详 `docs/internal/v6-fix-d8-dict-list-trace-jit-2026-05-19.md`。
 
+## 附录 A.23：Phase v3++ b-7 reframed — cranelift-AOT IR body FULL + Σ 等价 (2026-05-19)
+
+时间戳：2026-05-19；base commit：`f93fba37b1058fb501e4da816693f31c15b9acfb`
+（`fix(playground): add #relaxed to 4 presets/examples for strict mode`）。
+
+### 背景
+
+v5-β-2 stage 4 已经把 wasm-AOT codegen crate（`crates/relon-codegen-wasm/`）
+整个删除（`b6b4470`，2026-05-18）。原 v3++ b-6 wasm-AOT 那一侧的两条
+gap：
+
+- FULL 多 cp 映射（`ß` -> `SS`、`ﬁ` -> `FI`、`İ` -> `i` + 上方组合点……
+  SpecialCasing.txt 里 `out_len > 1` 的所有非 1:1 unconditional 条目）
+- Greek final-sigma context (`Σ` -> `ς` vs `σ`)
+
+因此从 wasm-AOT 这条已退役的路径"迁移"到了幸存的 cranelift-AOT
+（`crates/relon-codegen-native/src/codegen.rs`）这条 AOT 通道。
+cranelift-AOT 消费 `crates/relon-ir/src/stdlib.rs` 的 IR-level body，
+const-pool wiring 已经齐备：
+
+- `FullCaseFoldTableAddr { upper }` -> `full_case_fold_upper_offset` /
+  `full_case_fold_lower_offset`（codegen-native: 323-396 + 2999-3043）
+- `CasedRangesAddr` / `CaseIgnorableRangesAddr` -> 同上文件
+- `TurkishCaseFoldTableAddr { upper }` -> 同上
+
+但 IR body `case_fold_body_inner` 之前只 emit `TurkishCaseFoldTableAddr`，
+const-pool 的 FULL / Cased / Case_Ignorable 三张表因为没有任何 op 引用，
+处于 dead code 状态。
+
+本附录记录把"tree-walk `fold_string` 已经实现的 UAX #21 高级特性"
+下沉到 cranelift-AOT 共用的 IR body 的工作。
+
+### 实现要点
+
+#### 1. 新 stdlib helper：`__full_casefold_lookup`
+
+`crates/relon-ir/src/stdlib.rs` 新增 `full_casefold_lookup_helper()`，
+slot 34 (`FULL_CASEFOLD_LOOKUP_INDEX`)。ABI：
+
+```
+__full_casefold_lookup(cp: I32, table_addr: I32) -> I32
+```
+
+- 二分查找 FULL 表（20-byte stride：`(in, out0, out1, out2, out_len)`
+  全 `u32` LE）。
+- 命中返回 entry 绝对地址（`table_addr + 4 + idx * 20`），未命中返回 0。
+- 0 作为 miss sentinel 是无歧义的，因为 const-pool 永不放在 wasm/arena
+  地址 0（prologue 保留 guard 区域）。
+- 调用方按 `entry + 16` 读 `out_len`，按 `entry + 4 / 8 / 12` 读 3 个
+  output 槽。
+
+形式跟现有的 `casefold_lookup_helper`（8-byte stride 简单表）一致，
+只是 stride 从 8 改成 20、return 改成 entry address 而非 mapped cp。
+保持同款 `block { loop { binary search } }` 控制流，方便人审。
+
+#### 2. 新 stdlib helper：`__final_sigma_check`
+
+slot 35 (`FINAL_SIGMA_CHECK_INDEX`)。ABI：
+
+```
+__final_sigma_check(s_ptr: I32, byte_offset: I32,
+                    cased_addr: I32, ignorable_addr: I32) -> I32
+```
+
+返回 1 当且仅当 `Σ` 处于 UAX #21 Final_Sigma 上下文：左侧（跳过
+case-ignorable）有至少一个 cased cp，右侧（同样跳过 ignorable）直到
+EOS 都没有 cased cp。算法直接镜像 tree-walk 的
+`is_final_sigma_context`。
+
+- **左扫**：从 byte_offset 起 UTF-8 反向解码 cp。反向解码逻辑：
+  start = back - 1 起步，循环左移直到遇到一个 `(byte & 0xC0) != 0x80`
+  的 lead byte；再用前向 4-arm 解码同一段，写入 `CP` / `WIDTH`，并把
+  `back` 拨到 lead byte 位置。安全网：4 字节后强制 break。
+- **右扫**：从 byte_offset + 2（Σ 是 2-byte UTF-8）起 UTF-8 前向解码。
+- 两侧都通过 `__is_combining_mark` slot（其实是通用 range-membership
+  helper）查询 cased / ignorable 范围 — 现有 helper 对任意
+  `[count][(start, end)*count]` 8-byte stride 表均生效，所以无需新增
+  range helper。
+- 命中 cased → 翻 `seen_cased_before=1` / 设 `result=0` 并 break。
+- 命中 non-ignorable non-cased → break，保留 result 状态。
+- 命中 ignorable → 继续 scan。
+
+#### 3. `case_fold_body_inner` 多 cp 覆盖层
+
+`case_fold_body_inner` 在原 decode -> fold -> encode 三段里，
+在 fold_seq 后、原 encode_seq 前插入"multi-cp overlay"：
+
+```text
+if FOLD_TABLE_FIRED == 0:
+    encode_seq      # 旧路径：is_mark / Title-whitespace 不走 FULL
+else if cp == 0x03A3 && EFFECTIVE_UPPER == 0:
+    if __final_sigma_check(s, i, cased, ignorable) == 1:
+        FOLDED = 0x03C2  # ς
+    encode_seq
+else:
+    entry = __full_casefold_lookup(cp, FullCaseFoldTableAddr{EFFECTIVE_UPPER})
+    if entry != 0:
+        out_len = load(entry + 16)
+        for slot in 0..out_len:
+            FOLDED = load(entry + 4 + 4 * slot)
+            encode_seq
+    else:
+        encode_seq
+```
+
+`FOLD_TABLE_FIRED` 和 `EFFECTIVE_UPPER` 是新增的 let-locals
+（slot 14 / 15）。`fold_seq` 在 simple-table（含 Turkish override）实际
+触发的两个分支里同时 set 这两个 flag，所以 overlay 能精确分辨
+"combining mark / Title-whitespace 直通" vs "正常 cased cp folding"。
+
+Title mode 的动态 `effective_mode`（at_word_start ? Upper : Lower）
+通过 `EFFECTIVE_UPPER` 跑到 multi-cp overlay 时还保留（fold_seq 在
+clear at_word_start 之前先把它 copy 进 EFFECTIVE_UPPER）。
+
+#### 4. 为什么走 IR body 而不是 cranelift Rust runtime helper
+
+关键决策。两条候选路径：
+
+| 选项 | 实现 | 缺点 |
+|------|------|------|
+| Rust runtime helper（`extern "C"` 注入 cranelift sigref） | 立刻能用 | 双轨：tree-walk 跑 Rust，cranelift 跑同一 Rust，**绕过** IR body，破坏了"用同一份 IR 体测三套 backend"的契约 |
+| **IR body（已选）** | 跟 simple-table 同款 IR 控制流 | 体力活：要手写 binary search + UTF-8 4-arm decode |
+
+选 IR body 的理由：
+
+1. **byte-identical**：tree-walk 与 cranelift-AOT 必须 byte-identical。
+   IR body 单一来源 + cranelift backend 直接 inline + tree-walk 通过
+   `relon-evaluator/src/stdlib.rs` 的 `fold_string` 同语义 — 三方都
+   走同一张 FULL 表 / Cased ranges / Case_Ignorable ranges，
+   const-pool 是字节对齐的同一份资源。
+2. **DCE 守得住**：IR body 引用 `FullCaseFoldTableAddr` / `CasedRangesAddr`
+   / `CaseIgnorableRangesAddr`，codegen-native 的 `collect_body`
+   pre-DCE pass 跟之前一样把这些表加进 const-pool；不被 reachable code
+   引用的话表不会落地。**之前 dead code 的 const-pool wiring**
+   现在被新引用激活了。
+3. **未来 backend 复用**：万一 v6 又引入第三个 AOT backend（譬如
+   wasm-AOT v2 / x64 直出），IR body 是 single source of truth，
+   不会再陷入"tree-walk 实现一遍 / cranelift 实现一遍"的 drift。
+
+### 测试覆盖
+
+`crates/relon-test-harness/src/corpus.rs::StdlibCaseFold` tier 新增 3
+case，对应三个高级特性各一条 minimum reproduction：
+
+```rust
+"stdlib_upper_sharp_s"            -> "straße".upper()         => "STRASSE"
+"stdlib_lower_final_sigma_at_end" -> "ΟΔΥΣΣΕΥΣ".lower()       => "οδυσσευς"
+"stdlib_upper_ligature_fi"        -> "ﬁle".upper()            => "FILE"
+```
+
+`crates/relon-test-harness/src/three_way.rs` 的 trace-JIT
+`SynthRecipe::StdlibConst` 常量表同步追加 3 entries，让三路 corpus
+trace-JIT 路径不再 fallback 成 `TraceJitNotApplicable`。
+
+三路（tree-walk / cranelift-AOT / trace-JIT）实测：
+
+| Tier | before | after |
+|------|--------|-------|
+| `stdlib_case_fold` | 5/5 all_agree | **8/8 all_agree** |
+| total corpus | 52 cases | 55 cases |
+
+`cargo test -p relon-test-harness --test three_way_corpus` 末尾
+output：
+
+```
+[three-way corpus] total=55 all_agree=48 all_trap=0 not_applicable=6
+  cranelift_unsupported=1 tree_walk_missing=0 mismatches=0
+  tier stdlib_case_fold: all_agree=8 ... (of 8)
+```
+
+新 case 三路均 byte-identical（tw=cr=trace=同串）。
+
+workspace 总测试数：1840 passed / 0 failed（含 IR crate 内 +2
+b6_b7_index_tests::* stability tests pin 住 34 / 35 两个 helper slot）。
+
+### Gate ✓
+
+```bash
+cargo build --workspace                                        # ✓
+cargo test --workspace                                         # ✓ 1840 passed
+cargo clippy --workspace --all-targets -- -D warnings          # ✓
+cargo fmt --all -- --check                                     # ✓
+cargo build --target wasm32-unknown-unknown -p relon-wasm      # ✓
+```
+
+注意：v5-β-2 stage 4 之后 `relon/wasm-aot` feature 已退役，**不要**
+再带 `--features 'relon/wasm-aot'`。
+
+### 遗留 / 不在范围
+
+- BCP-47 完整 tag 解析（当前 `is_turkish_locale` 只看前 2 个 ASCII
+  字符 + 一个 `-` / `_` 边界）— 跟 b-7 reframed 无关。
+- 立陶宛语 locale（`lt`）SoftDotted 上的 combining-dot 调整 — 同上
+  无关，留到未来 locale work。
+- Σ 之外的 conditional SpecialCasing 条目（如 After_I + Above 类）
+  — 当前 tree-walk 和 cranelift-AOT 都不实现这些 conditional 项，
+  保持一致即可。
+
