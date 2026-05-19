@@ -867,6 +867,49 @@ fn invoke_with_resume_exposes_deopt_snapshot_to_fallback() {
     let _ = state.invalidate_trace(fn_id);
 }
 
+/// v6-δ M1 R4: tree-walker now registers `abs` / `min` / `max` /
+/// `clamp` as bare free fns and `length` / `is_empty` / `concat` /
+/// `substring` / `starts_with` / `sum` / `max` as String/List methods,
+/// closing the FunctionNotFound gap the v6-γ M5 corpus surfaced.
+#[test]
+fn tree_walker_stdlib_free_fn_surface() {
+    use relon::{new_evaluator, Backend};
+
+    let cases: &[(&str, Value)] = &[
+        ("#main(Int x) -> Int\nabs(x)", Value::Int(42)),
+        ("#main() -> Int\n\"hello\".length()", Value::Int(5)),
+        ("#main() -> Bool\n\"\".is_empty()", Value::Bool(true)),
+        ("#main() -> Bool\n\"hi\".is_empty()", Value::Bool(false)),
+        (
+            "#main() -> String\n\"foo\".concat(\"bar\")",
+            Value::String("foobar".to_string()),
+        ),
+        // substring(s, start, len) — `(1, 3)` selects "ell".
+        (
+            "#main() -> String\n\"hello\".substring(1, 3)",
+            Value::String("ell".to_string()),
+        ),
+        (
+            "#main() -> Bool\n\"hello world\".starts_with(\"hello\")",
+            Value::Bool(true),
+        ),
+        ("#main() -> Int\n[1, 2, 3, 4, 5].sum()", Value::Int(15)),
+        ("#main() -> Int\n[3, 1, 4, 1, 5, 9, 2, 6].max()", Value::Int(9)),
+    ];
+    for (src, expected) in cases {
+        let args = if src.contains("Int x") {
+            let mut m = HashMap::new();
+            m.insert("x".to_string(), Value::Int(-42));
+            m
+        } else {
+            HashMap::new()
+        };
+        let ev = new_evaluator(src, Backend::TreeWalk).expect("setup");
+        let r = ev.run_main(args).unwrap_or_else(|e| panic!("{src} -> {e:?}"));
+        assert_eq!(&r, expected, "tree-walker stdlib surface for {src}");
+    }
+}
+
 /// v6-δ M1 R3: `Evaluator::resume_from_pc` default implementation
 /// re-runs `run_main` so the 4-prong sandbox semantics keep holding
 /// when a deopt'd trace bounces back into the tree-walker. We exercise

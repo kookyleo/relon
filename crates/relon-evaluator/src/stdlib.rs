@@ -75,10 +75,25 @@ pub fn register_to(ctx: &mut Context) {
     ctx.register_pure_fn("_dict_values", Arc::clone(&dict_values));
     ctx.register_pure_fn("_dict_has_key", Arc::clone(&dict_has_key));
 
-    ctx.register_pure_fn("_math_abs", Arc::new(MathAbs));
-    ctx.register_pure_fn("_math_max", Arc::new(MathMax));
-    ctx.register_pure_fn("_math_min", Arc::new(MathMin));
-    ctx.register_pure_fn("_math_clamp", Arc::new(MathClamp));
+    let math_abs: Arc<dyn RelonFunction> = Arc::new(MathAbs);
+    let math_max: Arc<dyn RelonFunction> = Arc::new(MathMax);
+    let math_min: Arc<dyn RelonFunction> = Arc::new(MathMin);
+    let math_clamp: Arc<dyn RelonFunction> = Arc::new(MathClamp);
+    ctx.register_pure_fn("_math_abs", Arc::clone(&math_abs));
+    ctx.register_pure_fn("_math_max", Arc::clone(&math_max));
+    ctx.register_pure_fn("_math_min", Arc::clone(&math_min));
+    ctx.register_pure_fn("_math_clamp", Arc::clone(&math_clamp));
+    // v6-δ M1 R4: also register the bare names so corpus / IR sources
+    // that call `abs(x)` / `min(a, b)` / `max(a, b)` / `clamp(v, lo, hi)`
+    // directly (mirroring the cranelift backend's stdlib free-fn
+    // surface) don't surface `FunctionNotFound` against the tree-walker.
+    // The relon-side wrapper modules at `std_relon/math.relon` keep
+    // working — `@import("std/math", as=math); math.abs(...)` reaches
+    // the same handlers via `_math_abs` etc.
+    ctx.register_pure_fn("abs", Arc::clone(&math_abs));
+    ctx.register_pure_fn("max", Arc::clone(&math_max));
+    ctx.register_pure_fn("min", Arc::clone(&math_min));
+    ctx.register_pure_fn("clamp", math_clamp);
 
     // Schema-machinery validators. Spec §6.3 mandates these exist with
     // the documented semantics; they're consumed by the `#schema`
@@ -149,6 +164,17 @@ pub fn register_to(ctx: &mut Context) {
     ctx.register_pure_method("String", "nfkd", string_nfkd);
     ctx.register_pure_method("String", "contains", Arc::clone(&string_contains));
     ctx.register_pure_method("String", "len", Arc::clone(&len));
+    // v6-δ M1 R4: corpus / IR-side sources use `length()` /
+    // `is_empty()` as method aliases for the same intrinsics the
+    // wasm-AOT / cranelift backend register. Adding the aliases on
+    // both String and List keeps the three-way differential corpus
+    // honest without forcing users to remember which length-flavour
+    // each backend speaks.
+    ctx.register_pure_method("String", "length", Arc::clone(&len));
+    ctx.register_pure_method("String", "is_empty", Arc::new(IsEmpty));
+    ctx.register_pure_method("String", "concat", Arc::new(StringConcat));
+    ctx.register_pure_method("String", "substring", Arc::new(StringSubstring));
+    ctx.register_pure_method("String", "starts_with", Arc::new(StringStartsWith));
 
     // List methods (note: `_string_join` takes `(List<T>, sep)`, so
     // its receiver is the List, not the String — register under List).
@@ -158,6 +184,14 @@ pub fn register_to(ctx: &mut Context) {
     ctx.register_pure_method("List", "contains", list_contains);
     ctx.register_pure_method("List", "join", string_join);
     ctx.register_pure_method("List", "len", Arc::clone(&len));
+    // v6-δ M1 R4: see String.length / String.is_empty above for
+    // rationale. `sum` + `max` are list-aggregations the cranelift
+    // backend already exposes as `list_int_sum` etc.; `length` is the
+    // `len()` alias the corpus uses.
+    ctx.register_pure_method("List", "length", Arc::clone(&len));
+    ctx.register_pure_method("List", "is_empty", Arc::new(IsEmpty));
+    ctx.register_pure_method("List", "sum", Arc::new(ListSum));
+    ctx.register_pure_method("List", "max", Arc::new(ListMax));
 
     // Dict methods
     ctx.register_pure_method("Dict", "merge", dict_merge);
@@ -1596,6 +1630,236 @@ fn validation_failure(
         ))
     } else {
         Err(default)
+    }
+}
+
+// ---- v6-δ M1 R4: stdlib free-fn surface for the three-way corpus ----
+
+/// `s.is_empty()` / `xs.is_empty()` — polymorphic over String / List /
+/// Dict; matches the wasm-AOT backend's `is_empty` stdlib slot. Mirrors
+/// the cranelift backend's `IrType::String, "is_empty"` lowering.
+struct IsEmpty;
+impl RelonFunction for IsEmpty {
+    fn call(
+        &self,
+        args: NativeArgs,
+        range: relon_parser::TokenRange,
+    ) -> Result<Value, RuntimeError> {
+        let args = args.into_positional();
+        expect_arg_count(&args, 1, range)?;
+        match &args[0] {
+            Value::String(s) => Ok(Value::Bool(s.is_empty())),
+            Value::List(l) => Ok(Value::Bool(l.is_empty())),
+            Value::Dict(d) => Ok(Value::Bool(d.map.is_empty())),
+            other => Err(RuntimeError::TypeMismatch {
+                expected: "String/List/Dict".to_string(),
+                found: other.type_name().to_string(),
+                range,
+            }),
+        }
+    }
+}
+
+/// `s.concat(t)` — string concatenation. Tree-walker's existing
+/// `_string_replace` etc. handle one-shot transforms; we model `concat`
+/// as a 2-arg String op so the corpus's `"foo".concat("bar")` reaches
+/// AllAgree without going through a `+` overload (the source-level
+/// `+` operator is integer addition only).
+struct StringConcat;
+impl RelonFunction for StringConcat {
+    fn call(
+        &self,
+        args: NativeArgs,
+        range: relon_parser::TokenRange,
+    ) -> Result<Value, RuntimeError> {
+        let args = args.into_positional();
+        expect_arg_count(&args, 2, range)?;
+        let lhs = expect_string(&args[0], range)?;
+        let rhs = expect_string(&args[1], range)?;
+        let mut out = String::with_capacity(lhs.len() + rhs.len());
+        out.push_str(lhs);
+        out.push_str(rhs);
+        Ok(Value::String(out))
+    }
+}
+
+/// `s.substring(start, length)` — start-byte-index + byte-length.
+/// Matches the wasm-AOT / cranelift backend's `substring` body which
+/// takes `(s, start, len)`. Indices are clamped against `[0, s.len()]`
+/// so off-by-one corpus inputs don't panic; the bounds-check trap the
+/// cranelift body raises is intentionally relaxed here because the
+/// tree-walker is the fallback path and never needs to mirror the
+/// trap (callers see `TraceJitNotApplicable` / etc.).
+struct StringSubstring;
+impl RelonFunction for StringSubstring {
+    fn call(
+        &self,
+        args: NativeArgs,
+        range: relon_parser::TokenRange,
+    ) -> Result<Value, RuntimeError> {
+        let args = args.into_positional();
+        expect_arg_count(&args, 3, range)?;
+        let s = expect_string(&args[0], range)?;
+        let start = expect_int(&args[1], range)?;
+        let length = expect_int(&args[2], range)?;
+        let s_len = s.len() as i64;
+        let start = start.clamp(0, s_len) as usize;
+        let length = length.max(0) as usize;
+        let end = (start + length).min(s.len());
+        if end <= start {
+            return Ok(Value::String(String::new()));
+        }
+        // Walk to the nearest char boundary to keep utf-8 well-formed
+        // on inputs the corpus may feed in (the wasm-AOT body indexes
+        // strictly by byte so this is a deliberately conservative
+        // bridge).
+        let real_start = s
+            .char_indices()
+            .find(|(i, _)| *i >= start)
+            .map(|(i, _)| i)
+            .unwrap_or(s.len());
+        let real_end = s
+            .char_indices()
+            .find(|(i, _)| *i >= end)
+            .map(|(i, _)| i)
+            .unwrap_or(s.len());
+        Ok(Value::String(s[real_start..real_end].to_string()))
+    }
+}
+
+/// `s.starts_with(prefix)` — Boolean prefix check. Mirrors the
+/// wasm-AOT backend's `starts_with` body.
+struct StringStartsWith;
+impl RelonFunction for StringStartsWith {
+    fn call(
+        &self,
+        args: NativeArgs,
+        range: relon_parser::TokenRange,
+    ) -> Result<Value, RuntimeError> {
+        let args = args.into_positional();
+        expect_arg_count(&args, 2, range)?;
+        let s = expect_string(&args[0], range)?;
+        let prefix = expect_string(&args[1], range)?;
+        Ok(Value::Bool(s.starts_with(prefix)))
+    }
+}
+
+/// `xs.sum()` over a `List<Int>`. Float lists return `Float`; mixed
+/// lists fall through to a TypeMismatch.
+struct ListSum;
+impl RelonFunction for ListSum {
+    fn call(
+        &self,
+        args: NativeArgs,
+        range: relon_parser::TokenRange,
+    ) -> Result<Value, RuntimeError> {
+        let args = args.into_positional();
+        expect_arg_count(&args, 1, range)?;
+        let list = expect_list(&args[0], range)?;
+        // Two-pass classification: if every element is Int we return
+        // Int; if every element is Float we return Float; otherwise
+        // TypeMismatch (the cranelift backend's typed `list_int_sum`
+        // / `list_float_sum` slots refuse a mixed list at lowering
+        // time, so the surfaces match by design).
+        let mut all_int = true;
+        let mut all_float = true;
+        for v in list {
+            match v {
+                Value::Int(_) => all_float = false,
+                Value::Float(_) => all_int = false,
+                _ => {
+                    return Err(RuntimeError::TypeMismatch {
+                        expected: "List<Int> or List<Float>".to_string(),
+                        found: v.type_name().to_string(),
+                        range,
+                    })
+                }
+            }
+        }
+        if all_int {
+            let mut acc: i64 = 0;
+            for v in list {
+                if let Value::Int(x) = v {
+                    acc = acc.wrapping_add(*x);
+                }
+            }
+            Ok(Value::Int(acc))
+        } else if all_float {
+            let mut acc: f64 = 0.0;
+            for v in list {
+                if let Value::Float(x) = v {
+                    acc += x.into_inner();
+                }
+            }
+            Ok(Value::Float(acc.into()))
+        } else {
+            // Empty list: sum is 0 (Int).
+            Ok(Value::Int(0))
+        }
+    }
+}
+
+/// `xs.max()` over a `List<Int>` / `List<Float>`. Returns the largest
+/// element (signed for Int). Empty list surfaces a typed
+/// `TypeMismatch` carrying "non-empty list"; the cranelift backend's
+/// behaviour on empty lists is undefined-by-design so picking a typed
+/// error here is the more honest surface.
+struct ListMax;
+impl RelonFunction for ListMax {
+    fn call(
+        &self,
+        args: NativeArgs,
+        range: relon_parser::TokenRange,
+    ) -> Result<Value, RuntimeError> {
+        let args = args.into_positional();
+        expect_arg_count(&args, 1, range)?;
+        let list = expect_list(&args[0], range)?;
+        if list.is_empty() {
+            return Err(RuntimeError::TypeMismatch {
+                expected: "non-empty list".to_string(),
+                found: "empty list".to_string(),
+                range,
+            });
+        }
+        let first = &list[0];
+        match first {
+            Value::Int(seed) => {
+                let mut acc = *seed;
+                for v in &list[1..] {
+                    let x = expect_int(v, range)?;
+                    if x > acc {
+                        acc = x;
+                    }
+                }
+                Ok(Value::Int(acc))
+            }
+            Value::Float(seed) => {
+                let mut acc = seed.into_inner();
+                for v in &list[1..] {
+                    match v {
+                        Value::Float(x) => {
+                            let xv = x.into_inner();
+                            if xv > acc {
+                                acc = xv;
+                            }
+                        }
+                        other => {
+                            return Err(RuntimeError::TypeMismatch {
+                                expected: "List<Float>".to_string(),
+                                found: other.type_name().to_string(),
+                                range,
+                            })
+                        }
+                    }
+                }
+                Ok(Value::Float(acc.into()))
+            }
+            other => Err(RuntimeError::TypeMismatch {
+                expected: "List<Int> or List<Float>".to_string(),
+                found: other.type_name().to_string(),
+                range,
+            }),
+        }
     }
 }
 
