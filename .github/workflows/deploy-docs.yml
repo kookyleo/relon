@@ -3,6 +3,12 @@ name: Deploy VitePress site to Pages
 on:
   push:
     branches: [main, master]
+    # Tagged releases also rebuild the site so the published docs
+    # snapshot reflects whatever was tagged. The workflow checks out
+    # the tag ref (not main) so the deployed site matches the tag's
+    # source tree. Concurrency group `pages` (below) queues runs so a
+    # rapid main + tag pair lands the latest in sequence.
+    tags: ['v*']
   workflow_dispatch:
 
 permissions:
