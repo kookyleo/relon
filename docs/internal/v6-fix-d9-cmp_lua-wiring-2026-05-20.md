@@ -11,13 +11,13 @@
 - patch 来源：`docs/internal/salvaged/F-D9-cmp_lua-958LoC.patch`（前一个
   F-D9 agent 被 API 529 中断时的 ~958 LoC 工作 patch；base 为
   `4ea13ac`，但 `cmp_lua.rs` 自彼时起 main 没改）。`git apply --check`
-  直接 clean，`git apply` 后 `cmp_lua.rs` 由 1174 LoC 扩到 2132 LoC，
-  其余文件零改动。
+  直接 clean，`git apply` 后 `cmp_lua.rs` 由 1174 LoC 扩到 2129 LoC
+  （含 fmt sweep 后净 +955），其余文件零改动。
 - 仅做了一次 `cargo +stable fmt --all` 规范化（rustfmt 1.9 把 patch
   中一处 3 行 `jump(header, &[..])` 重排成 2 行链式 `ins().jump(..)`；
   非语义改动）。
 - W3 / W4 / W5 / W6 各 `trace_jit` vs `luajit` 的 median ratio
-  分别为 **1.69× / 3.73× / 1.27× / 0.26×**，全部满足任务验收（理想
+  分别为 **1.75× / 3.99× / 1.27× / 0.26×**，全部满足任务验收（理想
   ≤ ×2，至少 ≤ ×5）；W6 反超 LuaJIT。
 
 ## 一、起步资源核对
@@ -87,7 +87,7 @@ stable 版本：`cargo 1.95.0 / rustfmt 1.9.0-stable`。
 
 ## 四、bench 结果
 
-机器：非 quiescent 开发机（schedutil governor + 1-min load 3.47，故
+机器：非 quiescent 开发机（schedutil governor + 1-min load 3.17，故
 通过 `RELON_BENCH_FORCE_RUN=1` 跳过 quiescence 守卫）。采样：criterion
 0.5 默认配置，sample_size = 100、warmup 3.0 s、measurement 5.0 s。
 绝对时间略受 schedutil 频率漂移影响，但 ratio 是同进程同 measurement
@@ -97,21 +97,21 @@ stable 版本：`cargo 1.95.0 / rustfmt 1.9.0-stable`。
 
 | Workload | N | tree_walk | trace_jit | luajit | trace_jit / luajit | tree_walk / luajit | trace_jit 相对 tree_walk |
 |---|---|---|---|---|---|---|---|
-| W3 string_concat | 2_000 | 12.117 ms | 2.3343 ms | 1.3794 ms | **1.69×** | 8.78× | ×5.19 |
-| W4 string_contains | 10_000 | 66.100 ms | 71.332 µs | 19.098 µs | **3.73×** | 3461× | ×927 |
-| W5 dict_str_key | 10_000 | 107.35 ms | 152.05 µs | 120.01 µs | **1.27×** | 894× | ×706 |
-| W6 dict_num_key | 10_000 | 62.255 ms | 17.781 µs | 68.317 µs | **0.26×** | 911× | ×3501 |
+| W3 string_concat | 2_000 | 12.204 ms | 2.4344 ms | 1.3918 ms | **1.75×** | 8.77× | ×5.01 |
+| W4 string_contains | 10_000 | 63.771 ms | 71.296 µs | 17.876 µs | **3.99×** | 3567× | ×894 |
+| W5 dict_str_key | 10_000 | 107.21 ms | 153.10 µs | 120.70 µs | **1.27×** | 888× | ×700 |
+| W6 dict_num_key | 10_000 | 63.261 ms | 17.818 µs | 68.365 µs | **0.26×** | 925× | ×3550 |
 
 ### 4.2 验收
 
 任务设定的关卡："理想 trace_jit ratio ≤ LuaJIT × 2，至少 ≤ × 5"。
 
 - W3 / W5 / W6：均 ≤ ×2，W6 反超 LuaJIT。
-- W4：×3.73，处于 [×2, ×5] 之间，未达理想线但通过保守关。
+- W4：×3.99，处于 [×2, ×5] 之间，未达理想线但通过保守关。
 
-### 4.3 W4 ×3.73 的解读
+### 4.3 W4 ×3.99 的解读
 
-W4 (`string_contains`) 的 luajit ≈ 19.1 µs / 10k iters ≈ 1.91 ns/op，
+W4 (`string_contains`) 的 luajit ≈ 17.9 µs / 10k iters ≈ 1.79 ns/op，
 是 LuaJIT 把 `s.find / s:find` 在 trace IR 里折成专用 BMH 路径的结果。
 trace_jit ≈ 71.3 µs / 10k iters ≈ 7.13 ns/op，每次调用要：
 （a）跨越 SystemV C ABI 调一次 `__relon_str_contains`；
@@ -119,7 +119,7 @@ trace_jit ≈ 71.3 µs / 10k iters ≈ 7.13 ns/op，每次调用要：
 
 如果未来把 `__relon_str_contains` 改成 inline-able 的 cranelift IR
 （针对 needle.len ≤ 16 的 SIMD memchr 模板，省掉 C ABI 跨越），
-预计可以再压到 ≈ 3 ns/op，对应 ratio ≈ ×1.5。当前未做，列为
+预计可以再压到 ≈ 3 ns/op，对应 ratio ≈ ×1.7。当前未做，列为
 F-D9 follow-up（见第六节）。
 
 ## 五、关键决策 / 取舍
@@ -137,7 +137,7 @@ F-D9 follow-up（见第六节）。
 
 ## 六、遗留 TODO
 
-1. **W4 trace_jit ×3.73 → 目标 ≤ ×2**：把 `__relon_str_contains` 在
+1. **W4 trace_jit ×3.99 → 目标 ≤ ×2**：把 `__relon_str_contains` 在
    小 needle (`len ≤ 16`) 时切成 inline cranelift IR + SIMD memchr，
    消除 C ABI 跨越。归属 F-D7-C。
 2. **recorder 自动 wiring**：F-D7-B / F-D8-B 把
@@ -152,7 +152,7 @@ F-D9 follow-up（见第六节）。
 
 | file | LoC delta | 备注 |
 |---|---|---|
-| `crates/relon-bench/benches/cmp_lua.rs` | +958 | patch + 一次 fmt sweep；1174 → 2132 |
+| `crates/relon-bench/benches/cmp_lua.rs` | +955 | patch + 一次 fmt sweep；1174 → 2129 |
 | `docs/internal/v6-fix-d9-cmp_lua-wiring-2026-05-20.md` | new | 本报告 |
 
 `Cargo.toml` / 其他 crate / `relon-trace-jit` / `relon-codegen-native`
