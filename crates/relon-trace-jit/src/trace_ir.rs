@@ -120,6 +120,21 @@ pub enum TraceOp {
     ConstI32(SsaVar, i32),
     ConstI64(SsaVar, i64),
 
+    // ---- Arg materialisation ----------------------------------------
+    /// `dst = args_ptr[slot_idx]` — pulls a packed `u64` from the
+    /// trace entry's `args_ptr` second-arg.
+    ///
+    /// v6-δ M1: the recorder emits this op when the IR walker hits
+    /// `Op::LocalGet(idx)` so the emitter can materialise the SSA
+    /// value from the cranelift prologue's packed arg array, instead
+    /// of leaving the SSA unbound and surfacing `EmitError::UnboundSsa`
+    /// at install time.
+    ///
+    /// `slot_idx` is the packed-array index (`0` for first arg, `1`
+    /// for second, ...). The emitter computes the byte offset as
+    /// `slot_idx * 8`.
+    LocalGet(SsaVar, u32),
+
     // ---- Control / guard --------------------------------------------
     /// Inline guard. Failure deopts to the most recent enclosing
     /// [`crate::GuardSite`].
@@ -181,7 +196,7 @@ impl TraceOp {
             | TraceOp::MarkLoopHead { .. }
             | TraceOp::MarkLoopBack { .. } => EffectClass::Pure,
 
-            TraceOp::Load(_, _, _) => EffectClass::ReadOnly,
+            TraceOp::Load(_, _, _) | TraceOp::LocalGet(_, _) => EffectClass::ReadOnly,
 
             TraceOp::Div(_, _, _) | TraceOp::Store(_, _, _) => EffectClass::RecoverableWrite,
 
@@ -201,6 +216,7 @@ impl TraceOp {
             | TraceOp::Load(dst, _, _)
             | TraceOp::ConstI32(dst, _)
             | TraceOp::ConstI64(dst, _)
+            | TraceOp::LocalGet(dst, _)
             | TraceOp::Call(dst, _, _, _) => Some(*dst),
 
             TraceOp::Store(_, _, _)
@@ -222,7 +238,7 @@ impl TraceOp {
             TraceOp::Cmp(_, _, a, b) => vec![*a, *b],
             TraceOp::Load(_, base, _) => vec![*base],
             TraceOp::Store(base, _, src) => vec![*base, *src],
-            TraceOp::ConstI32(_, _) | TraceOp::ConstI64(_, _) => vec![],
+            TraceOp::ConstI32(_, _) | TraceOp::ConstI64(_, _) | TraceOp::LocalGet(_, _) => vec![],
             TraceOp::Guard(kind, _check) => match *kind {
                 GuardKind::TypeCheck(v, _) => vec![v],
                 GuardKind::NotNull(v) => vec![v],

@@ -640,6 +640,146 @@ fn default_host_hooks_populates_save_deopt_slot() {
     assert_eq!(snap.guard_pc, 42);
 }
 
+/// v6-δ M1 R1: a recording driver that hits `Op::LocalGet` followed
+/// by an arith op must install successfully. The recorder now emits
+/// `TraceOp::LocalGet(dst, slot_idx)` on first observation, and the
+/// emitter materialises the SSA from the entry-fn's `args_ptr` so
+/// `Add` no longer surfaces `EmitError::UnboundSsa`.
+#[test]
+fn let_with_arg_use_installs_via_local_get_lowering() {
+    let fn_id = 720u32;
+    let _ = clear_recording(fn_id);
+    let state = global_trace_jit_state();
+    let _ = state.invalidate_trace(fn_id);
+    register_recording(
+        fn_id,
+        RecordingRegistration {
+            body: vec![
+                TaggedOp {
+                    op: Op::LocalGet(0),
+                    range: TokenRange::default(),
+                },
+                TaggedOp {
+                    op: Op::LocalGet(1),
+                    range: TokenRange::default(),
+                },
+                TaggedOp {
+                    op: Op::Add(IrType::I64),
+                    range: TokenRange::default(),
+                },
+                TaggedOp {
+                    op: Op::Return,
+                    range: TokenRange::default(),
+                },
+            ],
+            // The recorder seeds `LocalGet` with `ObservedType::I32`;
+            // declare the params accordingly so the TypeCheck guard
+            // policy does not flip the recording into an abort.
+            param_tys: vec![IrType::I32, IrType::I32],
+        },
+    );
+    // The trace body reads two args; pass non-overflowing values
+    // so the `ArithOverflow` guard does not deopt.
+    let raw_args: [u64; 2] = [100u64, 23u64];
+    unsafe {
+        relon_codegen_native::trace_install::__relon_jump_to_recorder(fn_id, raw_args.as_ptr());
+    }
+    assert!(
+        state.lookup_trace(fn_id).is_some(),
+        "LocalGet + Add must install (R1)"
+    );
+
+    // Invoke the trace; the JIT body reads args_ptr[0] + args_ptr[1]
+    // and should return 123.
+    let mut ctx = TraceContext::with_capacity(32);
+    let trace_fn = state.lookup_trace(fn_id).expect("post-install");
+    let status = unsafe { trace_fn.invoke(&mut ctx as *mut _, raw_args.as_ptr()) };
+    assert!(
+        matches!(status, TraceEntryStatus::Success),
+        "expected Success, got {status:?}"
+    );
+    assert_eq!(
+        ctx.result_slot, 123,
+        "LocalGet(0) + LocalGet(1) must materialise the packed args"
+    );
+
+    let _ = clear_recording(fn_id);
+    let _ = state.invalidate_trace(fn_id);
+}
+
+/// v6-δ M1 R2: with `sadd_overflow` lowering wired through the
+/// emitter, the trace's `ArithOverflow` guard reads a real carry bit
+/// instead of a constant-0 predicate. Non-overflowing inputs run the
+/// hot path to completion; overflowing inputs deopt cleanly to the
+/// fallback closure.
+#[test]
+fn arith_overflow_guard_uses_real_carry_bit() {
+    let fn_id = 721u32;
+    let _ = clear_recording(fn_id);
+    let state = global_trace_jit_state();
+    let _ = state.invalidate_trace(fn_id);
+    register_recording(
+        fn_id,
+        RecordingRegistration {
+            body: vec![
+                TaggedOp {
+                    op: Op::LocalGet(0),
+                    range: TokenRange::default(),
+                },
+                TaggedOp {
+                    op: Op::LocalGet(1),
+                    range: TokenRange::default(),
+                },
+                TaggedOp {
+                    op: Op::Add(IrType::I64),
+                    range: TokenRange::default(),
+                },
+                TaggedOp {
+                    op: Op::Return,
+                    range: TokenRange::default(),
+                },
+            ],
+            param_tys: vec![IrType::I32, IrType::I32],
+        },
+    );
+    // Warm up with non-overflowing values.
+    let warm_args: [u64; 2] = [1u64, 2u64];
+    unsafe {
+        relon_codegen_native::trace_install::__relon_jump_to_recorder(fn_id, warm_args.as_ptr());
+    }
+    assert!(state.lookup_trace(fn_id).is_some(), "trace must install");
+
+    // 1) Non-overflowing happy path: 1 + 2 = 3 (same args as warmup).
+    let trace_fn = state.lookup_trace(fn_id).expect("trace");
+    let mut ctx_ok = TraceContext::with_capacity(32);
+    let status_ok = unsafe { trace_fn.invoke(&mut ctx_ok as *mut _, warm_args.as_ptr()) };
+    assert!(
+        matches!(status_ok, TraceEntryStatus::Success),
+        "expected Success for non-overflow, got {status_ok:?}"
+    );
+    assert_eq!(ctx_ok.result_slot, 3);
+
+    // 2) Overflow: i64::MAX + 1 must deopt. Expect GuardFailed. The
+    //    deopt block must call `__relon_trace_save_deopt` through the
+    //    proper FuncId-based import — v6-δ M1 fix; the historical
+    //    UserExternalName(0, 0) layout would have called back into
+    //    the trace fn itself.
+    let of_args: [u64; 2] = [i64::MAX as u64, 1u64];
+    let mut ctx_of = TraceContext::with_capacity(32);
+    let status_of = unsafe { trace_fn.invoke(&mut ctx_of as *mut _, of_args.as_ptr()) };
+    assert!(
+        matches!(status_of, TraceEntryStatus::GuardFailed),
+        "expected GuardFailed for overflow, got {status_of:?}"
+    );
+    assert!(
+        ctx_of.deopt_state.is_some(),
+        "GuardFailed must populate deopt_state via save_deopt"
+    );
+
+    let _ = clear_recording(fn_id);
+    let _ = state.invalidate_trace(fn_id);
+}
+
 #[test]
 fn jump_helper_aborts_recording_for_unsupported_op() {
     // Register a body containing an op outside the recorder's

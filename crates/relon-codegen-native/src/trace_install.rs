@@ -52,7 +52,7 @@ use cranelift_module::{Linkage, Module as _};
 
 use relon_ir::{IrType, Op, TaggedOp};
 use relon_trace_abi::{HostHookTable, ObservedType, TraceContext, TraceEntryStatus};
-use relon_trace_emitter::TraceEmitter;
+use relon_trace_emitter::{HostHookFuncIds, TraceEmitter};
 use relon_trace_jit::{OptimizerPipeline, SsaVar};
 use relon_trace_recorder::{RecordResult, RecorderState};
 
@@ -467,9 +467,68 @@ impl TraceJitState {
         let mut module = build_trace_jit_module()?;
         let pointer_ty = module.target_config().pointer_type();
 
+        // v6-δ M1: pre-declare the three host helpers as `Linkage::Import`
+        // functions BEFORE the trace fn itself. The cranelift-module
+        // crate uses `FuncId.as_u32()` for the `UserExternalName.index`
+        // when serialising calls in the function IR. If we let the
+        // trace fn be FuncId 0 (the historical default), then the
+        // emitter's `call save_deopt(...)` would compile down to
+        // calling FuncId 0 (the trace fn itself) — instant
+        // self-recursion → SIGSEGV the moment any guard fires.
+        //
+        // By pre-declaring the helpers we get a deterministic
+        // FuncId-to-symbol mapping; the trace fn then takes the next
+        // free slot. The `HostHookFuncIds` block is passed to the
+        // emitter so `declare_imported_user_function` writes the
+        // right indices into the function IR.
+        let save_deopt_sig = build_host_helper_signature(
+            &[pointer_ty, cranelift_codegen::ir::types::I32, cranelift_codegen::ir::types::I64],
+            &[],
+        );
+        let resolve_call_sig = build_host_helper_signature(
+            &[pointer_ty, cranelift_codegen::ir::types::I32],
+            &[pointer_ty],
+        );
+        let ic_lookup_sig = build_host_helper_signature(
+            &[pointer_ty, cranelift_codegen::ir::types::I32, cranelift_codegen::ir::types::I64],
+            &[cranelift_codegen::ir::types::I64],
+        );
+        let save_deopt_id = module
+            .declare_function(
+                relon_trace_emitter::HostHookId::SaveDeopt.symbol(),
+                Linkage::Import,
+                &save_deopt_sig,
+            )
+            .map_err(|e| TraceJitError::Module(format!("declare save_deopt: {e}")))?;
+        let resolve_call_id = module
+            .declare_function(
+                relon_trace_emitter::HostHookId::ResolveCall.symbol(),
+                Linkage::Import,
+                &resolve_call_sig,
+            )
+            .map_err(|e| TraceJitError::Module(format!("declare resolve_call: {e}")))?;
+        let ic_lookup_id = module
+            .declare_function(
+                relon_trace_emitter::HostHookId::InlineCacheLookup.symbol(),
+                Linkage::Import,
+                &ic_lookup_sig,
+            )
+            .map_err(|e| TraceJitError::Module(format!("declare ic_lookup: {e}")))?;
+        let hook_func_ids = HostHookFuncIds {
+            save_deopt: save_deopt_id.as_u32(),
+            resolve_call: resolve_call_id.as_u32(),
+            inline_cache_lookup: ic_lookup_id.as_u32(),
+        };
+
         let mut ctx = CodegenContext::new();
-        TraceEmitter::emit_with_pointer_ty(&optimized, &mut ctx, pointer_ty)
+        TraceEmitter::emit_with_hooks(&optimized, &mut ctx, pointer_ty, hook_func_ids)
             .map_err(TraceJitError::Emit)?;
+        tracing::trace!(
+            target: "relon::trace_install",
+            fn_id,
+            ir = %ctx.func.display(),
+            "trace cranelift IR ready for module install"
+        );
 
         // 4. Declare + define the function inside the trace JIT
         //    module, then finalize and resolve the function pointer.
@@ -497,6 +556,25 @@ impl Default for TraceJitState {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Build a cranelift `Signature` for a host helper function. Used by
+/// `jit_compile_buffer_for_fn` when pre-declaring `__relon_trace_save_deopt`
+/// et al. as `Linkage::Import` entries in the trace JIT module.
+fn build_host_helper_signature(
+    params: &[cranelift_codegen::ir::Type],
+    returns: &[cranelift_codegen::ir::Type],
+) -> cranelift_codegen::ir::Signature {
+    use cranelift_codegen::ir::{AbiParam, Signature};
+    use cranelift_codegen::isa::CallConv;
+    let mut sig = Signature::new(CallConv::SystemV);
+    for p in params {
+        sig.params.push(AbiParam::new(*p));
+    }
+    for r in returns {
+        sig.returns.push(AbiParam::new(*r));
+    }
+    sig
 }
 
 /// Process-wide singleton registry. The cranelift evaluator (M4
@@ -740,6 +818,9 @@ pub fn build_trace_jit_module() -> Result<JITModule, TraceJitError> {
     flag_builder
         .set("opt_level", "speed")
         .map_err(|e| TraceJitError::Module(format!("flag opt_level: {e}")))?;
+    flag_builder
+        .set("enable_verifier", "true")
+        .map_err(|e| TraceJitError::Module(format!("flag enable_verifier: {e}")))?;
     let flags = settings::Flags::new(flag_builder);
 
     let isa_builder = cranelift_native::builder()

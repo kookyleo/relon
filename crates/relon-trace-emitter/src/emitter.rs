@@ -42,6 +42,40 @@ use relon_trace_jit::{EffectClass, GuardSite, OptimizedTrace, SsaVar, TraceOp};
 use crate::abi::{AbiSignatureExt, HostHookId, TraceEntryStatus, TRACE_ENTRY_SIG};
 use crate::guard_emit::{emit_guard, GuardEmitCtx, GuardEmitError};
 
+/// Override table for [`HostHookId`] → cranelift `UserExternalName.index`.
+///
+/// v6-δ M1: the historical emitter hard-coded hook indices to `0`, `1`,
+/// `2` matching the [`HostHookId`] discriminant. That breaks once the
+/// trace module declares the helpers as proper imports via
+/// `cranelift_module::Module::declare_function` — the module uses
+/// `FuncId.as_u32()` for the `UserExternalName.index`, which won't
+/// match `HostHookId`'s ordinal once the host re-orders declarations
+/// (e.g. when the trace fn itself is declared first and gets FuncId 0).
+///
+/// Callers building a trace JIT module supply this override so the
+/// emitter's `call save_deopt(...)` instruction targets the right
+/// FuncId. The fields default to the historical 0/1/2 layout for
+/// existing test fixtures that don't go through `cranelift_module`.
+#[derive(Debug, Clone, Copy)]
+pub struct HostHookFuncIds {
+    pub save_deopt: u32,
+    pub resolve_call: u32,
+    pub inline_cache_lookup: u32,
+}
+
+impl Default for HostHookFuncIds {
+    /// Historical layout: hook index == [`HostHookId`] discriminant.
+    /// Only safe when no `cranelift_module::Module` is owning the
+    /// imports — e.g. the emitter's own unit tests.
+    fn default() -> Self {
+        Self {
+            save_deopt: 0,
+            resolve_call: 1,
+            inline_cache_lookup: 2,
+        }
+    }
+}
+
 /// Public entry point. Builds the trace entry's cranelift IR into
 /// `ctx.func`. The caller is expected to set `ctx.func` to a
 /// freshly-named `Function`; the emitter overwrites its signature.
@@ -64,6 +98,24 @@ impl TraceEmitter {
         ctx: &mut CodegenContext,
         pointer_ty: ir::Type,
     ) -> Result<(), EmitError> {
+        Self::emit_with_hooks(trace, ctx, pointer_ty, HostHookFuncIds::default())
+    }
+
+    /// Same as [`TraceEmitter::emit_with_pointer_ty`] but with a
+    /// caller-supplied [`HostHookFuncIds`] mapping each
+    /// [`HostHookId`] to the cranelift `FuncId` the host has
+    /// pre-declared for that helper. v6-δ M1 callers that own a
+    /// `cranelift_module::Module` MUST go through this variant so the
+    /// `call save_deopt(...)` instruction targets the right `FuncId`
+    /// instead of accidentally calling back into the trace function
+    /// itself (which historically was assigned FuncId 0 by
+    /// `cranelift_module`).
+    pub fn emit_with_hooks(
+        trace: &OptimizedTrace,
+        ctx: &mut CodegenContext,
+        pointer_ty: ir::Type,
+        hook_func_ids: HostHookFuncIds,
+    ) -> Result<(), EmitError> {
         let signature = TRACE_ENTRY_SIG.to_cranelift(pointer_ty, CallConv::SystemV);
         ctx.func = Function::with_name_signature(UserFuncName::user(0, 0), signature.clone());
 
@@ -77,7 +129,7 @@ impl TraceEmitter {
         builder.seal_block(entry_block);
 
         let trace_ctx_ptr = builder.block_params(entry_block)[0];
-        let _input_args_ptr = builder.block_params(entry_block)[1];
+        let input_args_ptr = builder.block_params(entry_block)[1];
 
         // Shared deopt block: takes (trace_pc: i32, external_pc: i64)
         // params so every guard site can pass its identifying triple
@@ -95,6 +147,7 @@ impl TraceEmitter {
             &[pointer_ty, I32, I64],
             &[],
             pointer_ty,
+            hook_func_ids.save_deopt,
         );
         let resolve_call = declare_host_hook(
             builder.func,
@@ -102,6 +155,7 @@ impl TraceEmitter {
             &[pointer_ty, I32],
             &[pointer_ty],
             pointer_ty,
+            hook_func_ids.resolve_call,
         );
         let _inline_cache_lookup = declare_host_hook(
             builder.func,
@@ -109,17 +163,20 @@ impl TraceEmitter {
             &[pointer_ty, I32, I64],
             &[I64],
             pointer_ty,
+            hook_func_ids.inline_cache_lookup,
         );
 
         let mut emitter = TraceEmitterState {
             builder: &mut builder,
             trace,
             trace_ctx_ptr,
+            input_args_ptr,
             pointer_ty,
             deopt_block,
             save_deopt,
             resolve_call,
             ssa_to_value: HashMap::new(),
+            overflow_bits: HashMap::new(),
             loop_head_blocks: HashMap::new(),
             saw_return: false,
         };
@@ -161,11 +218,21 @@ struct TraceEmitterState<'a, 'b> {
     builder: &'a mut FunctionBuilder<'b>,
     trace: &'a OptimizedTrace,
     trace_ctx_ptr: ir::Value,
+    /// Packed `u64[]` arg pointer (2nd entry-fn ABI param). Each
+    /// `TraceOp::LocalGet(_, slot_idx)` lowers to a load at
+    /// `input_args_ptr + slot_idx * 8`.
+    input_args_ptr: ir::Value,
     pointer_ty: ir::Type,
     deopt_block: ir::Block,
     save_deopt: ir::FuncRef,
     resolve_call: ir::FuncRef,
     ssa_to_value: HashMap<SsaVar, ir::Value>,
+    /// v6-δ M1: overflow bits surfaced by `Add` / `Sub` / `Mul`
+    /// lowering. The matching `Guard(ArithOverflow(dst))` predicate
+    /// reads this map to surface a real cranelift `*_overflow` bit
+    /// rather than emitting a constant-0 predicate that always
+    /// deopts. Entry is keyed on the arith op's `dst` SSA.
+    overflow_bits: HashMap<SsaVar, ir::Value>,
     loop_head_blocks: HashMap<u32, ir::Block>,
     saw_return: bool,
 }
@@ -182,6 +249,7 @@ impl<'a, 'b> TraceEmitterState<'a, 'b> {
             TraceOp::Store(base, off, src) => self.emit_store(*base, off.0, *src),
             TraceOp::ConstI32(dst, v) => self.emit_const_i32(*dst, *v),
             TraceOp::ConstI64(dst, v) => self.emit_const_i64(*dst, *v),
+            TraceOp::LocalGet(dst, slot_idx) => self.emit_local_get(*dst, *slot_idx),
             TraceOp::Guard(_, _) => self.emit_guard_op(guard_site),
             TraceOp::Call(dst, func_id, args, effect) => {
                 self.emit_call(*dst, func_id.0, args, *effect)
@@ -201,12 +269,25 @@ impl<'a, 'b> TraceEmitterState<'a, 'b> {
     ) -> Result<(), EmitError> {
         let va = self.lookup(a)?;
         let vb = self.lookup(b)?;
-        let r = match op {
-            BinOp::Add => self.builder.ins().iadd(va, vb),
-            BinOp::Sub => self.builder.ins().isub(va, vb),
-            BinOp::Mul => self.builder.ins().imul(va, vb),
+        // v6-δ M1: switch from plain `iadd` / `isub` / `imul` to the
+        // cranelift overflow-checked variants `sadd_overflow` /
+        // `ssub_overflow` / `smul_overflow`. The wrapping result goes
+        // into `ssa_to_value` (downstream ops keep working), and the
+        // boolean overflow bit goes into `overflow_bits` keyed on the
+        // arith op's `dst` — `emit_guard_op` reads it when the
+        // matching `Guard(ArithOverflow(dst))` fires so the predicate
+        // is a real "did this iadd carry?" check instead of a
+        // constant-0 that always deopts. Relon Int is signed so we
+        // use the signed-overflow primitives across the board.
+        let widened_a = self.widen_to_i64(va);
+        let widened_b = self.widen_to_i64(vb);
+        let (r, of) = match op {
+            BinOp::Add => self.builder.ins().sadd_overflow(widened_a, widened_b),
+            BinOp::Sub => self.builder.ins().ssub_overflow(widened_a, widened_b),
+            BinOp::Mul => self.builder.ins().smul_overflow(widened_a, widened_b),
         };
         self.bind(dst, r);
+        self.overflow_bits.insert(dst, of);
         Ok(())
     }
 
@@ -302,6 +383,33 @@ impl<'a, 'b> TraceEmitterState<'a, 'b> {
         Ok(())
     }
 
+    /// v6-δ M1: lower `TraceOp::LocalGet(dst, slot_idx)` to a load
+    /// off the entry-fn's `args_ptr` second arg.
+    ///
+    /// The cranelift prologue (see
+    /// `relon-codegen-native::codegen::emit_hot_counter_inject`) packs
+    /// every entry-fn arg into a `u64[]` on a stack slot before
+    /// jumping to `__relon_jump_to_recorder`; the same packed layout
+    /// is what the trace entry receives via its second ABI param.
+    /// Reading `args_ptr + slot_idx * 8` therefore mirrors the
+    /// recorder's view of `Op::LocalGet(slot_idx)`.
+    fn emit_local_get(&mut self, dst: SsaVar, slot_idx: u32) -> Result<(), EmitError> {
+        // Trusted: the recorder/optimiser never emits a slot_idx the
+        // caller hasn't sized the packed array for. Using
+        // `MemFlags::trusted` matches the existing `emit_load`'s
+        // contract — same load lattice, same alias analysis.
+        let off = (slot_idx as i64).wrapping_mul(8);
+        // Cranelift's `load` takes the byte offset as an i32; the
+        // recorder bounds `slot_idx` well below i32::MAX / 8.
+        let off_i32 = i32::try_from(off).unwrap_or(0);
+        let v = self
+            .builder
+            .ins()
+            .load(I64, MemFlags::trusted(), self.input_args_ptr, off_i32);
+        self.bind(dst, v);
+        Ok(())
+    }
+
     fn emit_guard_op(&mut self, guard_site: Option<&GuardSite>) -> Result<(), EmitError> {
         let site = guard_site.ok_or(EmitError::OrphanGuardOp)?;
         let mut gctx = GuardEmitCtx {
@@ -309,6 +417,7 @@ impl<'a, 'b> TraceEmitterState<'a, 'b> {
             deopt_block: self.deopt_block,
             type_info: &self.trace.type_info,
             pointer_ty: self.pointer_ty,
+            overflow_bits: &self.overflow_bits,
         };
         emit_guard(&mut gctx, site, &self.ssa_to_value).map_err(EmitError::Guard)
     }
@@ -489,10 +598,11 @@ enum BinOp {
 /// symbolic name without a side table.
 fn declare_host_hook(
     func: &mut Function,
-    hook: HostHookId,
+    _hook: HostHookId,
     params: &[ir::Type],
     returns: &[ir::Type],
     _pointer_ty: ir::Type,
+    func_id_index: u32,
 ) -> ir::FuncRef {
     let mut sig = Signature::new(CallConv::SystemV);
     for p in params {
@@ -502,14 +612,8 @@ fn declare_host_hook(
         sig.returns.push(AbiParam::new(*r));
     }
     let sig_ref = func.import_signature(sig);
-    let name_ref = func.declare_imported_user_function(UserExternalName::new(
-        0,
-        match hook {
-            HostHookId::SaveDeopt => 0,
-            HostHookId::ResolveCall => 1,
-            HostHookId::InlineCacheLookup => 2,
-        },
-    ));
+    let name_ref =
+        func.declare_imported_user_function(UserExternalName::new(0, func_id_index));
     func.import_function(ExtFuncData {
         name: ExternalName::User(name_ref),
         signature: sig_ref,

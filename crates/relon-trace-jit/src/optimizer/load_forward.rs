@@ -177,7 +177,7 @@ fn rewrite_inputs(op: &mut TraceOp, alias: &HashMap<SsaVar, SsaVar>) -> usize {
             swap!(base);
             swap!(src);
         }
-        TraceOp::ConstI32(_, _) | TraceOp::ConstI64(_, _) => {}
+        TraceOp::ConstI32(_, _) | TraceOp::ConstI64(_, _) | TraceOp::LocalGet(_, _) => {}
         TraceOp::Guard(kind, check) => {
             swap!(check);
             match kind {
