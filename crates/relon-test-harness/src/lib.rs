@@ -60,6 +60,7 @@ use relon::{new_evaluator, Backend, BackendError};
 use relon_eval_api::{Evaluator, RuntimeError, Value};
 
 pub mod corpus;
+pub mod four_way;
 pub mod three_way;
 
 /// Outcome of one differential test run.
