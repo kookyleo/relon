@@ -1,5 +1,60 @@
 # Changelog
 
+## [0.1.0-preview.1] — 2026-05-19
+
+第一个公开 preview snapshot。**API 不稳定**，下一个 preview 可能 break，请勿用于
+生产。
+
+### 包含的能力
+
+**语言层**：完整 parser + AST、4-pass analyzer、Schema + sum type、模块系统
+（含远程 `#import "https://..."`、rustls）、严格模式默认 + `#relaxed` opt-out、
+标准库覆盖算术 / 字符串（含 Unicode normalize + case fold）/ 列表 / 字典 / 记录
+/ 日期时间 / 类型谓词。
+
+**执行后端 4 档自动选**（`Backend::Auto` 按 IR op 数量阈值切换）：
+- Tree-walk：reference 实现，全语言特性
+- Bytecode VM：IR-PC 表 + 真 partial-resume + 4-prong sandbox 重入
+- Cranelift AOT：原生编译 + ELF object cache + memfd dlopen + HMAC-SHA256
+- Trace JIT：hot path 追踪 + cranelift 内联编译；recorder 支持 `Op::Loop` 真
+  录制；guard 失败回退 bytecode VM 完整 resume
+
+**沙箱（4-prong 全保留）**：bounds check、trap、capability gate（vtable + 失效
+cookie）、resource limit（instr counter + memory）。
+
+### 已测性能（v6-ε M0 实测）
+
+紧凑整数 hot loop `for i in 0..N { acc += i }`：
+
+| 后端 | 时间 / iter |
+|---|---|
+| Tree-walk | 3.36 μs |
+| Cranelift AOT 暖调用 | 2.07 ns |
+| Trace JIT 真录制 | **2.13 ns** |
+| Rust native loop (no JIT) | 2.41 ns |
+
+→ 进入 LuaJIT 2.x trace tier 文档区间（1-3 ns / iter）。Cached cold start
+**339 μs**。1781 tests 全绿，clippy / fmt / wasm32 build 全清，4-way 差分语义
+0 mismatch。
+
+### 已知 caveat
+
+1. **LuaJIT 同机对照未实测**：上面的 2.13 ns 是和 LuaJIT 2.x 文档区间纵向比，
+   不是 mlua + libluajit side-by-side。下个 preview 会补。
+2. **Bytecode VM 在 15 / 52 corpus case 上 fallback 到 tree-walk**（字符串
+   case-fold / Unicode normalize / memory wasm op）。功能正确但慢。
+3. **p99 tail latency / memory footprint 未测**。
+4. **API 标 unstable**：`Backend` enum、`Context` 字段、`TraceContext` 布局可能
+   下个 preview break。SDK 集成请只用 `relon` facade。
+
+### 文档
+
+- [中文指南](./docs/zh/guide/introduction.md)
+- [English guide](./docs/en/guide/introduction.md)
+- [性能与执行档位](./docs/zh/guide/performance.md)
+
+---
+
 ## [Unreleased] — Schema-rooted dispatch (trait-bound foundation)
 
 ### Language: strict mode by default, opt out via `#relaxed` / `#unstrict`

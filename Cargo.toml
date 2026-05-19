@@ -5,7 +5,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.0-preview.1"
 edition = "2021"
 rust-version = "1.92"
 license = "Apache-2.0"
@@ -40,24 +40,24 @@ hex = "0.4"
 # without pulling cranelift-jit / region into a target where neither
 # builds. Native consumers (relon-cli, relon-bench, downstream hosts)
 # re-enable `default-features = true` in their own dependency entries.
-relon = { path = "crates/relon", version = "0.1.0", default-features = false }
-relon-parser = { path = "crates/relon-parser", version = "0.1.0" }
-relon-analyzer = { path = "crates/relon-analyzer", version = "0.1.0" }
-relon-eval-api = { path = "crates/relon-eval-api", version = "0.1.0" }
-relon-evaluator = { path = "crates/relon-evaluator", version = "0.1.0" }
-relon-fmt = { path = "crates/relon-fmt", version = "0.1.0" }
-relon-ir = { path = "crates/relon-ir", version = "0.1.0" }
-relon-bytecode = { path = "crates/relon-bytecode", version = "0.1.0" }
-relon-codegen-native = { path = "crates/relon-codegen-native", version = "0.1.0" }
-relon-object-cache = { path = "crates/relon-object-cache", version = "0.1.0" }
-relon-object-link = { path = "crates/relon-object-link", version = "0.1.0" }
-relon-trace-abi = { path = "crates/relon-trace-abi", version = "0.1.0" }
-relon-trace-jit = { path = "crates/relon-trace-jit", version = "0.1.0" }
-relon-trace-recorder = { path = "crates/relon-trace-recorder", version = "0.1.0" }
-relon-trace-emitter = { path = "crates/relon-trace-emitter", version = "0.1.0" }
-relon-lsp = { path = "crates/relon-lsp", version = "0.1.0" }
-relon-wasm = { path = "crates/relon-wasm", version = "0.1.0" }
-relon-test-harness = { path = "crates/relon-test-harness", version = "0.1.0" }
+relon = { path = "crates/relon", version = "0.1.0-preview.1", default-features = false }
+relon-parser = { path = "crates/relon-parser", version = "0.1.0-preview.1" }
+relon-analyzer = { path = "crates/relon-analyzer", version = "0.1.0-preview.1" }
+relon-eval-api = { path = "crates/relon-eval-api", version = "0.1.0-preview.1" }
+relon-evaluator = { path = "crates/relon-evaluator", version = "0.1.0-preview.1" }
+relon-fmt = { path = "crates/relon-fmt", version = "0.1.0-preview.1" }
+relon-ir = { path = "crates/relon-ir", version = "0.1.0-preview.1" }
+relon-bytecode = { path = "crates/relon-bytecode", version = "0.1.0-preview.1" }
+relon-codegen-native = { path = "crates/relon-codegen-native", version = "0.1.0-preview.1" }
+relon-object-cache = { path = "crates/relon-object-cache", version = "0.1.0-preview.1" }
+relon-object-link = { path = "crates/relon-object-link", version = "0.1.0-preview.1" }
+relon-trace-abi = { path = "crates/relon-trace-abi", version = "0.1.0-preview.1" }
+relon-trace-jit = { path = "crates/relon-trace-jit", version = "0.1.0-preview.1" }
+relon-trace-recorder = { path = "crates/relon-trace-recorder", version = "0.1.0-preview.1" }
+relon-trace-emitter = { path = "crates/relon-trace-emitter", version = "0.1.0-preview.1" }
+relon-lsp = { path = "crates/relon-lsp", version = "0.1.0-preview.1" }
+relon-wasm = { path = "crates/relon-wasm", version = "0.1.0-preview.1" }
+relon-test-harness = { path = "crates/relon-test-harness", version = "0.1.0-preview.1" }
 
 # Default release profile — throughput-tuned. Fat LTO + single
 # codegen unit so the optimizer sees the whole program; downstream

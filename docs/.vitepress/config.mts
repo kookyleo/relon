@@ -55,6 +55,7 @@ export default defineConfig({
             items: [
               { text: '什么是 Relon？', link: '/zh/guide/introduction' },
               { text: '业务场景与定位', link: '/zh/guide/use-cases' },
+              { text: '像 JSON 一样管理业务逻辑', link: '/zh/guide/logic-as-data' },
               { text: '基础语法', link: '/zh/guide/syntax' },
             ]
           },

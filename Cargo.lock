@@ -1482,7 +1482,7 @@ dependencies = [
 
 [[package]]
 name = "relon"
-version = "0.1.0"
+version = "0.1.0-preview.1"
 dependencies = [
  "hex",
  "relon-analyzer",
@@ -1500,7 +1500,7 @@ dependencies = [
 
 [[package]]
 name = "relon-analyzer"
-version = "0.1.0"
+version = "0.1.0-preview.1"
 dependencies = [
  "hex",
  "miette",
@@ -1511,7 +1511,7 @@ dependencies = [
 
 [[package]]
 name = "relon-bench"
-version = "0.1.0"
+version = "0.1.0-preview.1"
 dependencies = [
  "cranelift-codegen",
  "cranelift-frontend",
@@ -1534,7 +1534,7 @@ dependencies = [
 
 [[package]]
 name = "relon-bytecode"
-version = "0.1.0"
+version = "0.1.0-preview.1"
 dependencies = [
  "ordered-float",
  "relon-analyzer",
@@ -1547,7 +1547,7 @@ dependencies = [
 
 [[package]]
 name = "relon-cli"
-version = "0.1.0"
+version = "0.1.0-preview.1"
 dependencies = [
  "anyhow",
  "ariadne",
@@ -1567,7 +1567,7 @@ dependencies = [
 
 [[package]]
 name = "relon-codegen-native"
-version = "0.1.0"
+version = "0.1.0-preview.1"
 dependencies = [
  "cranelift-codegen",
  "cranelift-frontend",
@@ -1601,7 +1601,7 @@ dependencies = [
 
 [[package]]
 name = "relon-eval-api"
-version = "0.1.0"
+version = "0.1.0-preview.1"
 dependencies = [
  "miette",
  "ordered-float",
@@ -1615,7 +1615,7 @@ dependencies = [
 
 [[package]]
 name = "relon-evaluator"
-version = "0.1.0"
+version = "0.1.0-preview.1"
 dependencies = [
  "hex",
  "miette",
@@ -1635,7 +1635,7 @@ dependencies = [
 
 [[package]]
 name = "relon-fmt"
-version = "0.1.0"
+version = "0.1.0-preview.1"
 dependencies = [
  "clap",
  "relon-parser",
@@ -1644,7 +1644,7 @@ dependencies = [
 
 [[package]]
 name = "relon-ir"
-version = "0.1.0"
+version = "0.1.0-preview.1"
 dependencies = [
  "miette",
  "ordered-float",
@@ -1656,7 +1656,7 @@ dependencies = [
 
 [[package]]
 name = "relon-lsp"
-version = "0.1.0"
+version = "0.1.0-preview.1"
 dependencies = [
  "anyhow",
  "lsp-server",
@@ -1671,7 +1671,7 @@ dependencies = [
 
 [[package]]
 name = "relon-object-cache"
-version = "0.1.0"
+version = "0.1.0-preview.1"
 dependencies = [
  "bincode",
  "cranelift-codegen",
@@ -1691,7 +1691,7 @@ dependencies = [
 
 [[package]]
 name = "relon-object-link"
-version = "0.1.0"
+version = "0.1.0-preview.1"
 dependencies = [
  "cranelift-codegen",
  "cranelift-frontend",
@@ -1706,7 +1706,7 @@ dependencies = [
 
 [[package]]
 name = "relon-parser"
-version = "0.1.0"
+version = "0.1.0-preview.1"
 dependencies = [
  "memchr",
  "miette",
@@ -1718,7 +1718,7 @@ dependencies = [
 
 [[package]]
 name = "relon-test-harness"
-version = "0.1.0"
+version = "0.1.0-preview.1"
 dependencies = [
  "relon",
  "relon-analyzer",
@@ -1738,7 +1738,7 @@ dependencies = [
 
 [[package]]
 name = "relon-trace-abi"
-version = "0.1.0"
+version = "0.1.0-preview.1"
 dependencies = [
  "bincode",
  "serde",
@@ -1746,7 +1746,7 @@ dependencies = [
 
 [[package]]
 name = "relon-trace-emitter"
-version = "0.1.0"
+version = "0.1.0-preview.1"
 dependencies = [
  "cranelift-codegen",
  "cranelift-frontend",
@@ -1756,7 +1756,7 @@ dependencies = [
 
 [[package]]
 name = "relon-trace-jit"
-version = "0.1.0"
+version = "0.1.0-preview.1"
 dependencies = [
  "bincode",
  "relon-trace-abi",
@@ -1766,7 +1766,7 @@ dependencies = [
 
 [[package]]
 name = "relon-trace-recorder"
-version = "0.1.0"
+version = "0.1.0-preview.1"
 dependencies = [
  "ordered-float",
  "relon-eval-api",
@@ -1776,7 +1776,7 @@ dependencies = [
 
 [[package]]
 name = "relon-wasm"
-version = "0.1.0"
+version = "0.1.0-preview.1"
 dependencies = [
  "miette",
  "relon",
