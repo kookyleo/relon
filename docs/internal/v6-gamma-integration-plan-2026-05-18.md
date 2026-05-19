@@ -548,3 +548,101 @@ v6-γ M5 stage report §6 列了 5 个 residual TODO；M1 一天 sweep
    但要显式 case 锁定）。
 3. **resolve_call / inline_cache_lookup 也切 call_indirect**：和
    R5 save_deopt 同形，预期一次性扫掉。
+
+---
+
+## 14. v6-δ M2-A — Bytecode VM scaffold (DONE 2026-05-19)
+
+v6-δ M1 R3 留下的 partial-resume 缺口需要 IR-PC 表；tree-walker 永远
+拿不到，因为它走 parser AST 不走 IR Op 流。M2-A 引入新 crate
+`relon-bytecode`：一个 stack-based interpreter 直接消费
+`relon_ir::Op`，每个编译函数携带 `ir_pc_map: Vec<ExternalPc>`，
+`Evaluator::resume_from_pc` override 就能把 deopt 的 external_pc 路
+由回 bytecode index。本 milestone 只交付 scaffolding，operand-stack
+rehydration 是 M2-B 工作。
+
+详细 stage report 在
+`docs/internal/v6-delta-m2a-stage-report-2026-05-19.md`。
+
+### 落地组件
+
+| 组件 | 路径 | 状态 |
+|------|------|------|
+| 新 crate `relon-bytecode` | `crates/relon-bytecode/` | DONE |
+| `BcOp` flat opcode enum | `crates/relon-bytecode/src/op.rs` | DONE — arith/cmp/control flow/locals/Trap 覆盖 ArithControl tier |
+| `BcFunction` + `ir_pc_map` | `crates/relon-bytecode/src/op.rs` | DONE — 单调 PC，sentinel `0` 留给函数入口 |
+| `compile_function`：IR → bytecode | `crates/relon-bytecode/src/compile.rs` | DONE — 两遍 walk，branch fixup；schema-aware `LoadField`/`StoreField → LocalGet`/`LocalSet` |
+| `BytecodeVm` stack-based dispatch | `crates/relon-bytecode/src/vm.rs` | DONE — match-based（computed-goto 留给 M2-C 配合 IC dispatch） |
+| `BytecodeEvaluator` impl Evaluator | `crates/relon-bytecode/src/evaluator.rs` | DONE — resume_from_pc override + 4-prong RuntimeError lift |
+| `Backend::Bytecode` 接入 | `crates/relon/src/lib.rs` + `crates/relon-cli/src/main.rs` | DONE — facade + CLI `--backend=bytecode` |
+| 4-way diff harness | `crates/relon-test-harness/src/four_way.rs` + `tests/bytecode_diff.rs` | DONE — 0 mismatches；ArithControl 27 干净 |
+| 4-prong sandbox 测试 | `crates/relon-bytecode/tests/bytecode_sandbox.rs` | DONE — bounds / trap / capability / resource 4 prong + resume-from-pc replay |
+
+### Gate numbers
+
+- `cargo build --workspace` —— clean。
+- `cargo test --workspace` —— **1729 passing**（M1 baseline 1703 + M2-A 净新增 26）。
+- `corpus_four_way_diff_aggregates` —— 23 AllAgree + 4 AllTrap +
+  25 BytecodeUnsupported + 0 mismatches，52 / 52 reach passing。
+- `corpus_bytecode_vs_treewalk_strict_parity` —— 27 / 28 ArithControl
+  bit-identical，1 unsupported (`let_chain` 是 cranelift analyzer
+  reject 的同一 case)。
+- `cargo clippy --workspace --all-targets -- -D warnings` —— clean。
+- `cargo fmt --all -- --check` —— clean。
+- `cargo build --target wasm32-unknown-unknown -p relon-wasm` —— clean。
+
+### Architecture decisions（≤ 5 bullets，每条带 rationale）
+
+1. **新 crate 而非内嵌**：bytecode VM 完全 standalone（依赖 `relon-ir`
+   + `relon-eval-api` + `relon-parser` + `relon-analyzer`），独立 crate
+   边界更清晰；wasm32 也能编（无 native-only deps）。
+2. **Buffer-protocol IR → 虚拟 local**：`lower_workspace_single` 总
+   emit `params = [I32 in_ptr, ..., I64 caps]` 的 buffer-protocol
+   shape；bytecode VM 不实例化 arena，由 compile pass 用 schema
+   `OffsetTable` 把每个 `LoadField {offset}` 翻成 `LocalGet(slot)`。
+   零 arena 走读 → VM 实现更小、bounds-prong 直接走 BcVmError 路径。
+3. **resume_from_pc M2-A 只交付入口 + 未知 PC 路径**：mid-expression
+   PC 需要 operand stack rehydration（DeoptStateSnapshot 当前不携带
+   SSA value stack），属于 M2-B work。trait surface 落下来 + ir_pc_map
+   round-trip 已验证，sandbox prong replay 测试通过。
+4. **Match-based dispatch 而非 computed-goto**：稳定 rustc 上 computed-
+   goto 要 unstable feature；M2-A 是 scaffolding 不是 perf milestone，
+   match 已足够；M2-C IC dispatch 落地时一并评估是否换底层 dispatch
+   模型。
+5. **Cranelift-AOT envelope 内的 corpus 全覆盖即可**：ArithControl 28
+   case 是 cranelift legacy-i64 entry shape 的全集；其他 tier
+   （stdlib / list / dict / closure / case-fold / normalize）也都是
+   cranelift `from_source` 拒绝的范围。bytecode VM `UnsupportedEntry`
+   / `UnsupportedOp` 直接 reject → 4-way harness 走 `BytecodeUnsupported`
+   软通过路径，corpus 通过率不退化。
+
+### 4-prong sandbox prong test 结果
+
+| Prong | Test | Status |
+|-------|------|--------|
+| bounds | `sandbox_bounds_explicit_trap_op` | PASS — Op::Trap{IndexOutOfBounds} lift to `RuntimeError::WasmIndexOutOfBounds` |
+| trap | `sandbox_trap_div_by_zero` + `sandbox_trap_numeric_overflow` | PASS — `RuntimeError::DivisionByZero` / `RuntimeError::NumericOverflow` |
+| capability | `sandbox_capability_denied_via_trap_op` + `vtable_grant_smoke` | PASS — `BcVmError::CapabilityDenied` route lifts to `WasmCapabilityDenied`; vtable grant/check surface verified |
+| resource | `sandbox_resource_step_limit` + `sandbox_resource_deadline_exceeded` | PASS — `RuntimeError::WasmStepLimitExceeded` from both max_steps tick and past-deadline trip |
+
+### resume_from_pc 行为表
+
+| 场景 | 结果 |
+|------|------|
+| `external_pc = 0`（函数入口 sentinel） | 等价于 `run_main`（happy path 验证）|
+| 已知 PC + 空 operand stack（如 LocalSet 之后） | 资源 + capability 由 VM 重入；路径与 entry 等价 |
+| 已知 PC + 非空 operand stack（如 Div op 上） | 触发 `BcVmError::StackUnderflow` 然后 lift 到 `RuntimeError::Unsupported`，M2-B widen DeoptStateSnapshot 后修复 |
+| 未知 PC（不在 ir_pc_map 中） | 退到 `bc_index_for_pc.unwrap_or(0)` → 从入口重跑，args + local_snapshot 不丢 |
+| trap 复现（PC = entry + 同 args） | 真重新跑 → 相同 RuntimeError 变体（`resume_from_pc_after_each_prong_replays_trap` 测试覆盖）|
+
+### v6-δ M2-B 入口
+
+1. **Operand-stack rehydration**：M2-A 的 resume_from_pc 只对函数入口 PC
+   和 unknown-PC 回退路径完整；mid-expression PC 需要 widen
+   `DeoptStateSnapshot` payload 带 SSA value stack。
+2. **Inline-cache dispatch hook**：M2-A 没动 `Call` 类 op（直接 reject
+   为 UnsupportedOp）；M2-B/M2-C 把 IC slot 接进 BytecodeVm，做到
+   per-callsite type-specialization。
+3. **Bench**：M2-C 后跑 trace_jit_warm（vs bytecode 直接执行 / vs IC-
+   dispatched）；目标是把 v6-δ M1 的 9.52 ns/iter 推到 3-5 ns/iter
+   档位。
