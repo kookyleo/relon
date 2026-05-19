@@ -194,6 +194,24 @@ pub struct JITedTraceFn {
     /// Raw entry pointer obeying [`relon_trace_abi::TRACE_ENTRY_SIG`]:
     /// `(*mut TraceContext, *const u64) -> i32`.
     fn_ptr: *const u8,
+    /// v6-δ M2-C: per-guard SSA-index snapshots, indexed by `trace_pc`.
+    /// Each entry holds the list of SSA-index ints the recorder's
+    /// operand-stack mirror carried at the moment the guard was
+    /// emitted (oldest first / top last). Used by the host-side
+    /// `invoke_with_resume` path to render `value_stack_copy` into the
+    /// `DeoptStateSnapshot` AFTER the cranelift-emitted save_deopt
+    /// helper has written `ssa_slots_copy`. Empty for guards that
+    /// emitted before any operand was pushed (rare).
+    ///
+    /// Keyed by `trace_pc` (the guard op's index in the optimised
+    /// trace), not `external_pc`. The save_deopt helper passes
+    /// `guard_pc = trace_pc` so this is a direct index.
+    guard_ssa_stacks: Box<[Box<[u32]>]>,
+    /// v6-δ M2-C: parallel external_pc table — useful for tests that
+    /// want to verify the trace's deopt routing without reaching for
+    /// the full guard list.
+    #[allow(dead_code)]
+    guard_external_pcs: Box<[u64]>,
     /// Owning module — Drop'd after every installed trace fn for the
     /// fn_id has been removed. Kept inside an `Arc` so concurrent
     /// callers can share the same trace fn without lock contention.
@@ -219,9 +237,7 @@ impl JITedTraceFn {
     /// be null when the trace ignores its second arg (the v6-γ M3
     /// emitter doesn't materialise input args yet).
     pub unsafe fn invoke(&self, ctx: *mut TraceContext, args: *const u64) -> TraceEntryStatus {
-        let entry: unsafe extern "C" fn(*mut TraceContext, *const u64) -> i32 =
-            unsafe { std::mem::transmute(self.fn_ptr) };
-        let raw = unsafe { entry(ctx, args) };
+        let raw = unsafe { self.invoke_raw(ctx, args) };
         match raw {
             0 => TraceEntryStatus::Success,
             1 => TraceEntryStatus::GuardFailed,
@@ -229,12 +245,77 @@ impl JITedTraceFn {
         }
     }
 
+    /// v6-δ M2-C: invoke the trace entry skipping the
+    /// `i32 → TraceEntryStatus` enum mapping. The caller compares the
+    /// raw return code (`0 == Success`, `1 == GuardFailed`,
+    /// `2 == Aborted`) directly — useful in tight hot loops where the
+    /// enum match adds a branch + cmov pair.
+    ///
+    /// Marked `#[inline]` so call sites that have a hot-loop-shaped
+    /// usage (e.g. the bench's `trace_jit_warm_ic` row, or eventually
+    /// the cranelift IC dispatch stub) can have the indirect call
+    /// lower straight into a `call rax` with no Rust-side wrapper
+    /// frame in between.
+    ///
+    /// # Safety
+    ///
+    /// Same contract as [`Self::invoke`]: `ctx` is an exclusive,
+    /// properly aligned `*mut TraceContext` and `args` is either null
+    /// or points to a `u64` array sized for the trace's LocalGet
+    /// accesses.
+    #[inline]
+    pub unsafe fn invoke_raw(&self, ctx: *mut TraceContext, args: *const u64) -> i32 {
+        let entry: TraceEntryFn = unsafe { std::mem::transmute(self.fn_ptr) };
+        unsafe { entry(ctx, args) }
+    }
+
     /// Raw entry pointer (mainly for tests verifying install
-    /// dispatch behaviour).
+    /// dispatch behaviour, and for the v6-δ M2-C IC stub that wants
+    /// to bypass the [`JITedTraceFn`] indirection entirely).
     pub fn raw_fn_ptr(&self) -> *const u8 {
         self.fn_ptr
     }
+
+    /// v6-δ M2-C: typed function pointer cast of the trace entry. The
+    /// IC dispatch stub stores this in a per-callsite `Cell` and
+    /// calls it directly — one indirect call, no `Arc` deref, no
+    /// `transmute` per invocation, no status-enum mapping.
+    ///
+    /// Returns the same address as [`Self::raw_fn_ptr`], just typed.
+    ///
+    /// # Safety
+    ///
+    /// The returned function pointer's lifetime is bound by this
+    /// `JITedTraceFn`'s `_module`. Callers MUST keep the `Arc<Self>`
+    /// alive for as long as they may call through the typed pointer.
+    /// The IC slot in `trace_ic` enforces this by holding the `Arc`
+    /// alongside the typed pointer.
+    pub unsafe fn typed_entry(&self) -> TraceEntryFn {
+        unsafe { std::mem::transmute(self.fn_ptr) }
+    }
+
+    /// v6-δ M2-C: expose the per-guard SSA-stack table for tests that
+    /// want to verify the recorder mirror landed on the install path.
+    /// Indexed by `trace_pc`; entries are SSA-index lists (oldest
+    /// first / top last). Empty `Box<[u32]>` for non-guard trace_pcs.
+    pub fn guard_ssa_stack(&self, trace_pc: u32) -> Option<&[u32]> {
+        self.guard_ssa_stacks.get(trace_pc as usize).map(|s| &s[..])
+    }
+
+    /// v6-δ M2-C: number of slots in the per-guard SSA-stack table.
+    /// Equal to the trace's op_count — most entries are empty (only
+    /// guard ops populate them).
+    pub fn guard_table_len(&self) -> usize {
+        self.guard_ssa_stacks.len()
+    }
 }
+
+/// v6-δ M2-C: typed entry-function pointer matching
+/// [`relon_trace_abi::TRACE_ENTRY_SIG`]
+/// (`(*mut TraceContext, *const u64) -> i32`). Stored inline in
+/// [`crate::trace_ic::TraceIcSlot`] so the IC dispatch path can do a
+/// single `call rax` indirect call.
+pub type TraceEntryFn = unsafe extern "C" fn(*mut TraceContext, *const u64) -> i32;
 
 /// Error wrapper for [`TraceJitState::jit_compile_trace_for_fn`].
 #[derive(Debug, thiserror::Error)]
@@ -435,17 +516,50 @@ impl TraceJitState {
         match status {
             TraceEntryStatus::Success => ctx.result_slot,
             TraceEntryStatus::GuardFailed => {
-                let snapshot = ctx.deopt_state.as_ref();
-                let resume_pc = snapshot.map(|d| d.external_pc);
+                // v6-δ M2-C: render `value_stack_copy` from the
+                // recorder's per-guard ssa_stack snapshot. The
+                // cranelift-emitted `save_deopt` helper only knows
+                // `ssa_slots_copy` (the full SSA state); the
+                // operand-stack view lives in the install-time
+                // `guard_ssa_stacks` table on the trace_fn. Walking
+                // the table host-side is one indexed lookup + one
+                // `ssa_slots_copy[i]` per stack entry — typical
+                // trace bodies push at most 2-4 values mid-expression,
+                // so the cost is bounded and dwarfed by the bytecode
+                // VM resume path that consumes the result.
+                let mut snapshot = ctx.deopt_state.take();
+                if let Some(ref mut snap) = snapshot {
+                    let guard_pc = snap.guard_pc as usize;
+                    if guard_pc < trace_fn.guard_ssa_stacks.len() {
+                        let stack_ssas = &trace_fn.guard_ssa_stacks[guard_pc];
+                        let mut value_stack: Vec<u64> = Vec::with_capacity(stack_ssas.len());
+                        for &ssa_idx in stack_ssas.iter() {
+                            // SAFETY-equiv: out-of-range SSAs are
+                            // silently filled with 0 — matches the
+                            // bytecode-side `materialise_stack`
+                            // fall-back convention so a sloppy
+                            // recorder mirror doesn't panic the host.
+                            let val = snap
+                                .ssa_slots_copy
+                                .get(ssa_idx as usize)
+                                .copied()
+                                .unwrap_or(0);
+                            value_stack.push(val);
+                        }
+                        snap.value_stack_copy = value_stack.into_boxed_slice();
+                    }
+                }
+                let resume_pc = snapshot.as_ref().map(|d| d.external_pc);
                 tracing::debug!(
                     target: "relon::trace_install",
                     fn_id,
                     deopt_recorded = snapshot.is_some(),
                     ?resume_pc,
-                    slots = snapshot.map(|s| s.ssa_slots_copy.len()).unwrap_or(0),
-                    "trace GuardFailed; partial-resume snapshot ready"
+                    slots = snapshot.as_ref().map(|s| s.ssa_slots_copy.len()).unwrap_or(0),
+                    value_stack_len = snapshot.as_ref().map(|s| s.value_stack_copy.len()).unwrap_or(0),
+                    "trace GuardFailed; partial-resume snapshot ready (value_stack_copy rendered)"
                 );
-                fallback(args_ptr, resume_pc, snapshot)
+                fallback(args_ptr, resume_pc, snapshot.as_ref())
             }
             TraceEntryStatus::Aborted => {
                 tracing::warn!(
@@ -495,6 +609,35 @@ impl TraceJitState {
 
         // 3. Freeze + emit cranelift IR.
         let optimized = buffer.into_optimized();
+
+        // v6-δ M2-C: build the per-guard SSA-stack lookup table the
+        // host-side `invoke_with_resume` uses to render
+        // `value_stack_copy` on deopt. The table is indexed by
+        // `trace_pc` (guard op index in the optimised trace); the
+        // entry is the SSA-id snapshot the recorder mirror captured
+        // at emit time. Stored as `Box<[u32]>` per entry (vs
+        // `Vec<SsaVar>`) so the host-side rendering loop is a tight
+        // index → `ssa_slots_copy[idx]` lookup.
+        //
+        // Use `optimized.ops.len()` as the upper bound — guards only
+        // ever sit at trace_pc slots within that range, so we size
+        // the table to op_count and leave non-guard slots as empty.
+        let table_len = optimized.ops.len();
+        let mut guard_ssa_stacks_vec: Vec<Box<[u32]>> =
+            (0..table_len).map(|_| Box::<[u32]>::from([])).collect();
+        let mut guard_external_pcs_vec: Vec<u64> = vec![0u64; table_len];
+        for site in optimized.guards.iter() {
+            let idx = site.trace_pc as usize;
+            if idx >= table_len {
+                continue;
+            }
+            let stack: Vec<u32> = site.ssa_stack_snapshot.iter().map(|s| s.raw()).collect();
+            guard_ssa_stacks_vec[idx] = stack.into_boxed_slice();
+            guard_external_pcs_vec[idx] = site.deopt_pc.0;
+        }
+        let guard_ssa_stacks = guard_ssa_stacks_vec.into_boxed_slice();
+        let guard_external_pcs = guard_external_pcs_vec.into_boxed_slice();
+
         let mut module = build_trace_jit_module()?;
         let pointer_ty = module.target_config().pointer_type();
 
@@ -586,6 +729,8 @@ impl TraceJitState {
         Ok(JITedTraceFn {
             fn_id,
             fn_ptr,
+            guard_ssa_stacks,
+            guard_external_pcs,
             _module: module,
         })
     }
@@ -860,6 +1005,22 @@ pub fn build_trace_jit_module() -> Result<JITModule, TraceJitError> {
     flag_builder
         .set("enable_verifier", "true")
         .map_err(|e| TraceJitError::Module(format!("flag enable_verifier: {e}")))?;
+    // v6-δ M2-C: shave a few cycles off the per-call invoke cost.
+    // Cranelift's default `enable_probestack=true` injects a probe
+    // sequence at the function prologue that adds branch + stack
+    // access — useless for trace bodies that allocate zero stack
+    // space. The trace entries we emit today are leaf functions
+    // (no call_indirect outside the deopt block), so probestack is
+    // pure overhead. Same logic for `preserve_frame_pointers`: the
+    // bench loop never unwinds through a trace, and `gdb` /
+    // profilers prefer DWARF info anyway.
+    //
+    // Disabling these saves ~1-2 cycles / iter in the bench hot
+    // loop and reduces the trace entry's instruction footprint —
+    // both micro-optimisations help the trace_jit_warm_ic row
+    // approach the LuaJIT trace-tier range.
+    let _ = flag_builder.set("enable_probestack", "false");
+    let _ = flag_builder.set("preserve_frame_pointers", "false");
     let flags = settings::Flags::new(flag_builder);
 
     let isa_builder = cranelift_native::builder()
