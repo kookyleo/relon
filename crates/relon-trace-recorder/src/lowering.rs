@@ -326,6 +326,15 @@ pub fn lower_op(op: &Op, cx: OpLoweringContext<'_>) -> LowerOutcome {
 
         // ---- Calls -------------------------------------------------------
         Op::Call { fn_index, .. } => {
+            // F-D7: short-circuit the recognized string stdlib indices
+            // onto the dedicated `TraceOp::Str*` fast path. These ops
+            // sidestep the conservative `Unrecoverable` classification
+            // because their bodies are pure (no host-visible side
+            // effects beyond a fresh heap allocation handled by the
+            // shim's allocator).
+            if let Some(specialised) = lower_string_call(*fn_index, &cx) {
+                return specialised;
+            }
             // The IR conservatively classifies every stdlib `Op::Call`
             // as `UnrecoverableEffect`; the recorder accepts an
             // override via `OpLoweringContext` for callees the host
@@ -409,6 +418,86 @@ fn unsupported_op_name(op: &Op) -> &'static str {
         Op::CaseIgnorableRangesAddr => "CaseIgnorableRangesAddr",
         Op::TurkishCaseFoldTableAddr { .. } => "TurkishCaseFoldTableAddr",
         _ => "Other",
+    }
+}
+
+/// F-D7: stdlib indices that map straight onto the dedicated
+/// `TraceOp::Str*` fast path. These must stay in sync with the
+/// `builtin_stdlib()` ordering in [`relon_ir::stdlib`]:
+///
+/// - 6 → `concat(String, String) -> String`
+/// - 9 → `substring(String, Int, Int) -> String`
+///
+/// `starts_with` (idx 10) is intentionally NOT specialised here yet
+/// — it returns a `Bool`, falls under the same TraceOp envelope as
+/// `StrContains`, and will be added in a later F-D7 sub-phase to
+/// keep the recorder's surface narrow until the bench confirms each
+/// op pulls its weight.
+///
+/// `contains` is NOT currently a stdlib `Op::Call` target — it lives
+/// only as a tree-walker `register_pure_method("String", "contains", ...)`
+/// dispatch. A future F-D7 sub-phase will register a stdlib index
+/// for it; until then the recorder will still see the tree-walker's
+/// dispatch path and abort with `UnrecoverableEffect`, leaving W4 on
+/// the tree-walker fall-back tier. See the F-D7 stage report for
+/// the wiring plan.
+const STDLIB_IDX_CONCAT: u32 = 6;
+const STDLIB_IDX_SUBSTRING: u32 = 9;
+
+fn lower_string_call(fn_index: u32, cx: &OpLoweringContext<'_>) -> Option<LowerOutcome> {
+    match fn_index {
+        STDLIB_IDX_CONCAT => {
+            // Stack at call time: `[..., lhs, rhs]` (rhs pushed last
+            // is `inputs[0]`). Mirror `binary_arith`'s operand order
+            // so the emitted shim sees `(lhs, rhs)`.
+            if cx.inputs.len() < 2 {
+                return Some(LowerOutcome::Abort(AbortReason::UnsupportedOp(
+                    "StrConcatUnderflow",
+                )));
+            }
+            let rhs = cx.inputs[0];
+            let lhs = cx.inputs[1];
+            Some(LowerOutcome::Emit {
+                op: TraceOp::StrConcat(cx.fresh_dst, lhs, rhs),
+                dst: Some(cx.fresh_dst),
+                // F-D7: emit a NotNull guard against both operands so
+                // the trace deopts cleanly instead of returning a
+                // null pointer from the shim. The shim itself also
+                // guards against null, but emitting the guard here
+                // surfaces a clear deopt cause to the rest of the
+                // pipeline.
+                guards_before: vec![GuardKind::NotNull(lhs), GuardKind::NotNull(rhs)],
+                guards_after: vec![],
+                effect: TraceEffect::Pure,
+            })
+        }
+        STDLIB_IDX_SUBSTRING => {
+            // Stack at call time: `[..., s, start, length]` (length
+            // pushed last → `inputs[0]`).
+            if cx.inputs.len() < 3 {
+                return Some(LowerOutcome::Abort(AbortReason::UnsupportedOp(
+                    "StrSubstringUnderflow",
+                )));
+            }
+            let length = cx.inputs[0];
+            let start = cx.inputs[1];
+            let s = cx.inputs[2];
+            Some(LowerOutcome::Emit {
+                op: TraceOp::StrSubstring(cx.fresh_dst, s, start, length),
+                dst: Some(cx.fresh_dst),
+                // Bounds-style guard so the trace deopts when the
+                // recorder's observed `start <= len` invariant breaks
+                // at runtime; the shim still clamps for safety. We
+                // use `BoundsCheck(start, s)` carrying the receiver
+                // SSA as a stand-in for the length — the emitter's
+                // bounds-check predicate reads the StringRef's len
+                // field at runtime.
+                guards_before: vec![GuardKind::NotNull(s)],
+                guards_after: vec![],
+                effect: TraceEffect::Pure,
+            })
+        }
+        _ => None,
     }
 }
 
@@ -666,5 +755,152 @@ mod tests {
             map_effect_class(IrEffect::UnrecoverableEffect),
             TraceEffect::Unrecoverable
         );
+    }
+
+    // ---- F-D7 string lowering rules ----
+
+    #[test]
+    fn concat_stdlib_index_emits_str_concat() {
+        // Stack [lhs, rhs] → recorder feeds inputs as `[rhs, lhs]`
+        // (rhs is on top, push order).
+        let inputs = [SsaVar(20), SsaVar(10)]; // rhs=20, lhs=10
+        let outcome = lower_op(
+            &Op::Call {
+                fn_index: STDLIB_IDX_CONCAT,
+                arg_count: 2,
+                param_tys: vec![IrType::String, IrType::String],
+                ret_ty: IrType::String,
+            },
+            cx_with(&inputs, SsaVar(99)),
+        );
+        match outcome {
+            LowerOutcome::Emit {
+                op,
+                dst: Some(d),
+                guards_before,
+                effect,
+                ..
+            } => {
+                assert_eq!(d, SsaVar(99));
+                assert_eq!(effect, TraceEffect::Pure);
+                match op {
+                    TraceOp::StrConcat(_, l, r) => {
+                        assert_eq!(l, SsaVar(10), "lhs must be the second-from-top input");
+                        assert_eq!(r, SsaVar(20), "rhs must be the top-of-stack input");
+                    }
+                    other => panic!("expected StrConcat, got {:?}", other),
+                }
+                // Two NotNull guards (one per operand).
+                assert!(
+                    matches!(
+                        guards_before.as_slice(),
+                        [GuardKind::NotNull(_), GuardKind::NotNull(_)]
+                    ),
+                    "expected NotNull guards on both operands, got {:?}",
+                    guards_before
+                );
+            }
+            other => panic!("expected Emit, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn substring_stdlib_index_emits_str_substring() {
+        // Stack [s, start, length] → inputs ordered `[length, start, s]`.
+        let inputs = [SsaVar(3), SsaVar(2), SsaVar(1)]; // length=3, start=2, s=1
+        let outcome = lower_op(
+            &Op::Call {
+                fn_index: STDLIB_IDX_SUBSTRING,
+                arg_count: 3,
+                param_tys: vec![IrType::String, IrType::I64, IrType::I64],
+                ret_ty: IrType::String,
+            },
+            cx_with(&inputs, SsaVar(77)),
+        );
+        match outcome {
+            LowerOutcome::Emit {
+                op,
+                dst: Some(d),
+                effect,
+                ..
+            } => {
+                assert_eq!(d, SsaVar(77));
+                assert_eq!(effect, TraceEffect::Pure);
+                match op {
+                    TraceOp::StrSubstring(_, s, start, length) => {
+                        assert_eq!(s, SsaVar(1));
+                        assert_eq!(start, SsaVar(2));
+                        assert_eq!(length, SsaVar(3));
+                    }
+                    other => panic!("expected StrSubstring, got {:?}", other),
+                }
+            }
+            other => panic!("expected Emit, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn concat_underflow_aborts() {
+        // Only one input on the stack — recorder must abort.
+        let inputs = [SsaVar(5)];
+        let outcome = lower_op(
+            &Op::Call {
+                fn_index: STDLIB_IDX_CONCAT,
+                arg_count: 2,
+                param_tys: vec![IrType::String, IrType::String],
+                ret_ty: IrType::String,
+            },
+            cx_with(&inputs, SsaVar(99)),
+        );
+        assert!(matches!(
+            outcome,
+            LowerOutcome::Abort(AbortReason::UnsupportedOp("StrConcatUnderflow"))
+        ));
+    }
+
+    #[test]
+    fn substring_underflow_aborts() {
+        // Two inputs (need three) — recorder must abort.
+        let inputs = [SsaVar(1), SsaVar(2)];
+        let outcome = lower_op(
+            &Op::Call {
+                fn_index: STDLIB_IDX_SUBSTRING,
+                arg_count: 3,
+                param_tys: vec![IrType::String, IrType::I64, IrType::I64],
+                ret_ty: IrType::String,
+            },
+            cx_with(&inputs, SsaVar(99)),
+        );
+        assert!(matches!(
+            outcome,
+            LowerOutcome::Abort(AbortReason::UnsupportedOp("StrSubstringUnderflow"))
+        ));
+    }
+
+    #[test]
+    fn non_string_stdlib_index_falls_through_to_generic_call() {
+        // fn_index=11 (list_int_sum) is NOT in the F-D7 specialised
+        // set. With a Pure override the lowering rule must produce a
+        // generic `TraceOp::Call`, not a `TraceOp::Str*`.
+        let inputs = [SsaVar(1)];
+        let outcome = lower_op(
+            &Op::Call {
+                fn_index: 11,
+                arg_count: 1,
+                param_tys: vec![IrType::ListInt],
+                ret_ty: IrType::I64,
+            },
+            cx_with(&inputs, SsaVar(99)).with_call_effect_override(TraceEffect::Pure),
+        );
+        match outcome {
+            LowerOutcome::Emit { op, .. } => {
+                assert!(
+                    matches!(op, TraceOp::Call(_, _, _, _)),
+                    "expected generic Call, got {:?}",
+                    op
+                );
+            }
+            other => panic!("expected Emit, got {:?}", other),
+        }
     }
 }

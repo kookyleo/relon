@@ -292,6 +292,15 @@ impl<'a, 'b> InlineEmitterState<'a, 'b> {
                 loop_id,
                 next_values,
             } => self.emit_loop_back(*loop_id, next_values),
+            // F-D7: string ops follow the same rationale as Call —
+            // they need a host-function FuncRef that the inline path
+            // can't derive without going through the per-trace-module
+            // import machinery. Surface the same fallback error so the
+            // caller routes the trace through the regular emitter.
+            TraceOp::StrConcat(_, _, _)
+            | TraceOp::StrContains(_, _, _)
+            | TraceOp::StrFind(_, _, _)
+            | TraceOp::StrSubstring(_, _, _, _) => Err(InlineEmitError::CallNotSupportedInInline),
         }
     }
 
