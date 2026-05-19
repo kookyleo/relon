@@ -3347,3 +3347,85 @@ v6-δ M2-C **没达到 brief 阈值 ≤ 5 ns/iter**。但这是 falsifier 性
   预算）。
 
 详见 `docs/internal/v6-delta-m2c-stage-report-2026-05-19.md`。
+
+## 附录：v6-ε-0-C trace_jit_warm_tail / trace_jit_warm_sysv (2026-05-19)
+
+`docs/internal/v6-epsilon-0c-stage-report-2026-05-19.md` 完整账。
+关键点：
+
+### Bench 新增 2 行
+
+`trace_jit_warm_tail` + `trace_jit_warm_sysv` 行通过
+`TraceJitState::jit_compile_buffer_for_fn_with_call_conv` 显式
+pin trace entry calling convention，对照 M2-C 的 `trace_jit_warm_ic`
+(now Tail by default) 与 v6-δ M2-C 9.53 ns SystemV baseline。
+
+### Bench medians (criterion, 3 rounds)
+
+```
+backend/trace_jit_warm             : 9.49 ns/iter
+backend/trace_jit_warm_ic          : 9.56 ns/iter
+backend/trace_jit_warm_tail        : 9.54 ns/iter  ← new (CallConv::Tail explicit)
+backend/trace_jit_warm_sysv        : 9.53 ns/iter  ← new (CallConv::SystemV pinned)
+backend/rust_inlined_baseline      : 3.55 ns/iter
+```
+
+**Tail vs SysV 差距 = 0.01 ns ≈ criterion noise**。
+
+### M2-C 假设 falsified
+
+M2-C 报告 §5 预测「SystemV ABI prologue/epilogue = 6 ns 是
+boundary cost 的主要构成」，预期 Tail 移除 prologue 节省 1-2 ns。
+
+实测三轮：Tail vs SysV 数字相同 (within < 0.1% criterion noise)。
+M2-C 的瓶颈定位错——cranelift 0.131 在 leaf trace fn 上：
+
+1. **Tail 与 SysV 同 callee-save filter** (x86_64
+   `is_callee_save_systemv`)。
+2. **同 clobber set** (`SYSV_CLOBBERS` 在非异常 path)。
+3. **同 arg / ret reg seq**。
+4. **唯一差异**：callee vs caller pops stack args —— 0 stack args
+   时是 no-op。
+5. **`enable_probestack=false` + `preserve_frame_pointers=false`
+   (M2-C 已设)** 已把 prologue 优化到接近 0 ns，没什么可省。
+
+### vs LuaJIT 对比
+
+```
+v6-δ M2-C trace_jit_warm_ic    9.53 ns  4.8× slower
+v6-ε-0-C  trace_jit_warm_tail  9.54 ns  4.77× slower
+LuaJIT 2.x trace tier          ~2 ns    baseline
+```
+
+**ε-0-C 没有把差距拉近**。`CallConv::Tail` 不是攻略路径。
+
+### 真实 boundary cost 拆分
+
+9.54 - 3.55 (rust_inlined_baseline) = 5.99 ns 是「跨函数 boundary
+固有 cost」：
+
+| 组件 | 估算 |
+|---|---|
+| `call [reg]` indirect + branch predict miss | ~1.5 ns |
+| `ret` + RSB (return stack buffer) predict | ~1 ns |
+| Caller-side `args[0..1]` store + `lea rsi, args` | ~1.5 ns |
+| Caller-side `ctx.result_slot` read after ret | ~1 ns |
+| 残留 prologue / epilogue (Tail/SysV 相同) | ~0.5 ns |
+| 余量 / I-cache pressure 等 | ~0.5 ns |
+
+**这五个组件都不能靠 conv 选择消除** —— 只能 inline (ε-0-A) 或者
+trace-to-trace fall-through (ε-0-B) 才能跨过。
+
+### 结论：诚实账面
+
+v6-ε-0-C **没达到 brief 阈值 ≤ 5 ns/iter**（acceptable）或 ≤ 4 ns
+（aspirational）。本 phase 的核心交付是 **honest experimental
+falsification**：
+
+- M2-C 的 prologue 瓶颈假设证伪。
+- Tail-conv install path 全功能落地（4 smoke test 验证 cross-conv
+  deopt），未来 ε-0-A 之后若需切回也只是 cfg 翻转。
+- 5.99 ns budget 完整保留给 ε-0-A。
+- ε-0-B 转为 ε-1 优先级（单 trace 场景无收益）。
+
+详见 `docs/internal/v6-epsilon-0c-stage-report-2026-05-19.md`。
