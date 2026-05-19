@@ -32,7 +32,9 @@ LuaJIT 2.1 是 SOTA dynamic language runtime。其优秀不止单一指标。要
 | D7 string hot path（concat/find/format） | rope-based, near-C | ✗ 未测 |
 | D8 hash table 操作（含碰撞） | linear-probe, near-C | ✗ 未测 |
 
-**达级别 = ≥ 6 / 8 维度处于 LuaJIT × 2 内**。低于此阈值不能声称同级。
+**达级别 = D1 + D2 + D5 + D7 + D8 全部 ≤ LuaJIT × 2**（用户已确认必过维度）。D3 / D4 / D6 仍测量但不卡 PASS。
+
+低于此阈值不能声称同级。
 
 ---
 
@@ -80,8 +82,10 @@ LuaJIT 2.1 是 SOTA dynamic language runtime。其优秀不止单一指标。要
 | W6 | dict 数字 key dense `for i { sum += arr[i] }` 但 arr 是 dict | D8 | LuaJIT array-part 优化的拿手戏 |
 | W7 | recursive `fib(30)` | D1 + call overhead | call ABI + recursion stack |
 | W8 | polymorphic call site `f(any_of_4_types)` × 1M | D6 | IC 4-way set-assoc 够不够 |
-| W9 | nested loop matrix transpose `for i { for j { b[j][i] = a[i][j] }}` | D1 + D2 + cache | branch prediction + cache pattern |
+| W9 | nested loop matrix transpose `for i { for j { b[j][i] = a[i][j] }}` | D1 + cache | branch prediction + cache pattern |
 | W10 | 真实 Relon config eval（10-rule access control） | D4 综合 | 模拟生产 workload |
+| W11 | **cold start latency** — source 到首次执行的端到端 wall time | D2 **必过** | 从空进程算起，含 parse + analyze + JIT prep |
+| W12 | **p99 tail latency** — hot loop 1M invoke 的 p99 / p99.9 | D5 **必过** | 含 deopt 事件，criterion 默认 median 看不到 |
 
 每个 W 必须：
 - Relon 版（写到 `crates/relon-bench/benches/cmp_lua/relon_w*.rs`）
@@ -145,15 +149,29 @@ LuaJIT 2.1 是 SOTA dynamic language runtime。其优秀不止单一指标。要
 
 ---
 
-## 5. 通过/失败/迭代决策矩阵
+## 5. 通过/失败/迭代决策矩阵（D1+D2+D5+D7+D8 必过版）
 
-| ratio Relon-best / LuaJIT | 数量 | 动作 |
+每个必过维度的判定：
+
+| 维度 | 关联 W | 维度 PASS 条件 |
 |---|---|---|
-| ≤ 2× | ≥ 7 / 10 | **PASS** 写综合报告 + 停 loop |
-| ≤ 2× | 4-6 / 10 | **ITERATE** 派 targeted fix（按最大 ratio 排序） |
-| ≤ 2× | < 4 / 10 | **HONEST FAIL** 写 ceiling 报告 + 停 loop |
-| any ≥ 10× | ≥ 1 | **HALT** 派 RCA 排查 bench 是否 broken |
-| any ≥ 100× | ≥ 1 | **HALT** workload 不应该跑这么慢，肯定是 bug |
+| D1 hot loop | W1 + W2 + W7 + W9 | 至少 1 个 W ≤ LuaJIT × 2 |
+| D2 cold start | W11 | W11 ≤ LuaJIT × 2 |
+| D5 p99 tail | W12 | W12 p99 + p99.9 都 ≤ LuaJIT × 2 |
+| D7 string | W3 + W4 | 至少 1 个 W ≤ LuaJIT × 2 |
+| D8 hash table | W5 + W6 | 至少 1 个 W ≤ LuaJIT × 2 |
+
+**整体决策**：
+
+| 必过维度通过数 | 动作 |
+|---|---|
+| 5 / 5 | **PASS** 写综合报告 + 停 loop |
+| 3-4 / 5 | **ITERATE** 派 targeted fix 修没过的维度，每 fix 2 周 budget |
+| < 3 / 5 | **HONEST FAIL** 写 ceiling 报告 + 停 loop |
+| any W ratio ≥ 10× | **HALT** 派 RCA 排查 bench 是否 broken |
+| any W ratio ≤ 0.5（Relon 反胜 2×） | **RED FLAG** 必须重审 workload 是否公平 |
+
+D3 / D4 / D6 仍报告，但不影响 PASS 判定。
 
 **ratio 计算**：取每 workload 上 Relon 最快 backend（tree-walk/bytecode/cranelift-AOT/trace-JIT 中最小值）/ LuaJIT 时间。Relon 不规定必须 trace JIT 赢 —— 某 W 上 cranelift-AOT 比 trace-JIT 快也算 Relon best。
 
@@ -178,7 +196,7 @@ taskset -c 4-7 cargo bench ...
 perf stat -a sleep 5  # context-switches 应 < 100 / sec / core
 ```
 
-**或者**：用 s15 / s16（用户提过的隔壁 192.168.213.15/16 机器）作专用 bench 机，本地只编译，ssh 跑 bench。**这个方案需要用户确认 s15/s16 当前是否空闲**。
+**用户已确认**：本机带 quiescence（不用 s15/s16）。所以 sect 6 上述配置全部在本机生效，bench agent 必须在 setup 阶段验证 quiescence 状态，未达标则 fail-fast。
 
 ---
 
@@ -222,8 +240,8 @@ perf stat -a sleep 5  # context-switches 应 < 100 / sec / core
 - bench-rewrite 已落 main = dcf353e
 - ε-0-C / ε-0-A 基础设施保留在 trunk
 
-**待确认（需用户决策）**：
-- bench 机器：本机 vs s15/s16？需要后者的话需要 ssh 通且确认空闲
-- LuaJIT 版本：2.1.0-beta3 vs head？我推荐 2.1.0-stable
-- 用户对 8 维度的优先级排序：D1+D7+D8 必过？还是全 8 都要？
-- 超时上限：本 phase chain 估 3-4 周，超期是接受还是切换策略？
+**已用户确认**（2026-05-19）：
+- bench 机器：**本机带 quiescence**（sect 6 配置在本机生效）
+- LuaJIT 版本：**2.1.0-stable**（社区主线 head 的 stable 切点）
+- 8 维度必过：**D1 + D2 + D5 + D7 + D8**（hot loop + cold start + p99 tail + string + hash table），D3/D4/D6 报告但不卡 PASS
+- 超时上限：未规定，按"不达目的不停"推进，每 targeted fix phase 限 2 周
