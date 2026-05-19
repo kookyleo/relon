@@ -646,3 +646,128 @@ rehydration 是 M2-B 工作。
 3. **Bench**：M2-C 后跑 trace_jit_warm（vs bytecode 直接执行 / vs IC-
    dispatched）；目标是把 v6-δ M1 的 9.52 ns/iter 推到 3-5 ns/iter
    档位。
+
+---
+
+## 15. v6-δ M2-B — Real partial-resume from external_pc (DONE 2026-05-19)
+
+M2-A 留下的 mid-expression resume 缺口在 M2-B 关掉：bytecode 编译
+pass 现在跟踪每个 bc_idx 的 operand-stack recipe（`StackOrigin` 三
+变体：Local / Const / Snapshot），`DeoptStateSnapshot` widen 出
+`value_stack_copy: Box<[u64]>` 携带 mid-expression 运行时栈快照，
+`BytecodeEvaluator::resume_from_snapshot` 直接消费 snapshot 重建
+operand stack 然后从 trap PC 继续 dispatch — 不再回到函数入口。
+trace recorder 的 `next_external_pc` 同步改成 per-IR-op 单调计数
+（与 bytecode 编译 pass 的 `ir_pc_next` 对齐），guard 的 external_pc
+路由到 bytecode index 不再需要翻译表。
+
+详细 stage report 在
+`docs/internal/v6-delta-m2b-stage-report-2026-05-19.md`。
+
+### 落地组件
+
+| 组件 | 路径 | 状态 |
+|------|------|------|
+| `DeoptStateSnapshot.value_stack_copy` 字段 | `crates/relon-trace-abi/src/deopt.rs` | DONE — Box<[u64]>，layout 56 → 72 bytes |
+| `TraceContext` 136 → 152 size 更新 | `crates/relon-trace-abi/tests/layout_smoke.rs` | DONE — layout 假设同步 |
+| `__relon_trace_save_deopt` 写空 `value_stack_copy` | `crates/relon-trace-jit/src/runtime/deopt.rs` | DONE — JIT 端为 SSA，无 stack；trap 时空切片 |
+| `StackOrigin` recipe per bc_idx | `crates/relon-bytecode/src/op.rs` | DONE — Local/Const/Snapshot 三变体 |
+| `compile.rs` 跟踪 abstract operand stack | `crates/relon-bytecode/src/compile.rs` | DONE — `emit_with_effect` + `apply_stack_effect` |
+| `BytecodeVm::invoke_from_with_stack` initial-stack seed | `crates/relon-bytecode/src/vm.rs` | DONE — 旧 `invoke_from_with_locals` 是 thin wrapper |
+| `BytecodeEvaluator::resume_from_snapshot[_with_metrics]` | `crates/relon-bytecode/src/evaluator.rs` | DONE — `materialise_stack` + `ResumeMetrics` |
+| recorder per-op `external_pc` 对齐 | `crates/relon-trace-recorder/src/recorder.rs` | DONE — `record_op` 每次 +1 |
+| 4-prong partial-resume 测试 | `crates/relon-bytecode/tests/partial_resume_sandbox.rs` | DONE — 6 test (bounds + 2 trap + capability + resource×2 + value happy path) |
+| trace-JIT → bytecode integration | `crates/relon-test-harness/tests/bytecode_deopt_integration.rs` | DONE — 2 test |
+| 信封 widen：stdlib inlining + Select + ConstString 折叠 | `crates/relon-bytecode/src/compile.rs` | DONE — `compile_function_in_module` + `resolve_stdlib_func` + `compile_select` |
+
+### Gate numbers
+
+- `cargo build --workspace` —— clean。
+- `cargo test --workspace` —— **1739 passing**（M2-A baseline 1729 +
+  M2-B 净新增 10：6 partial-resume + 2 integration + 2 stdlib-inlining
+  smoke）。
+- `corpus_four_way_diff_aggregates` —— 28 AllAgree + 4 AllTrap +
+  1 BytecodeMatchesBaseline + 15 BytecodeUnsupported + 0 mismatches，
+  52 / 52 reach passing（M2-A 25 → M2-B 15）。
+- `cargo clippy --workspace --all-targets -- -D warnings` —— clean。
+- `cargo fmt --all -- --check` —— clean。
+- `cargo build --target wasm32-unknown-unknown -p relon-wasm` —— clean。
+
+### 4-prong sandbox partial-resume 结果
+
+| Prong | Test | 行为 | resume_steps vs entry_steps |
+|-------|------|------|-----------------------------|
+| trap (div) | `partial_resume_trap_div_by_zero_replays_at_div_pc` | snapshot.external_pc → Div bc_idx，重 trap | resume 1 vs entry 3 |
+| trap (overflow) | `partial_resume_trap_overflow_replays_at_add_pc` | snapshot.external_pc → Add bc_idx，重 trap | resume 1 vs entry 3 |
+| bounds | `partial_resume_bounds_explicit_trap_replays` | Trap{IOOB} 跨 LocalGet 后正确路由，重 trap | n/a (correctness pin) |
+| capability | `partial_resume_capability_denied_replays` | 手卷 BcFunction，BcOp::Trap{CapDenied} 重 trap | resume 2 vs baseline 3 |
+| resource (step-limit) | `partial_resume_resource_step_limit_retraps_then_completes` | trap-and-abort + 高 limit 下从 Add bc_idx 继续，得 1+2=3 | n/a (two-variant) |
+| happy-path | `partial_resume_arith_mid_expression_value_correct` | Add bc_idx resume，得 40+2=42 与 run_main 等价 | n/a (correctness pin) |
+| integration | `bytecode_resume_from_trace_jit_deopt_overflow` | 真实 trace JIT install → guard fire → bytecode resume，start_bc_idx=2 steps=3 vs entry=5 | resume 3 vs entry 5 |
+
+### 信封 widening 详情
+
+| 类别 | 落地策略 | 受益 |
+|------|----------|------|
+| `Op::AllocRootRecord` / `AllocSubRecord` / `PushRecordBase` | 编译 pass 当 no-op（bytecode VM 走虚拟 local 不需要 buffer-protocol 簿记）| `dict_simple_return` |
+| `Op::StoreFieldAtRecord` | 折成 `LocalSet(return_field_base + slot)` | `dict_simple_return` |
+| `Op::Call` 内联 stdlib bodies | 通过 `builtin_stdlib()` 查 `fn_index`，inline 走 callee body，max 64 ops / 3 deep | `abs` / `min` / `max` (5 case) |
+| `Op::Select` | `compile_select` lowering：3 scratch slot + JumpIfFalse 分支 | 所有 stdlib body 用 Select 的部分都能 inline |
+| `Op::ConstString` / `ConstListInt/Bool/Float/String` | 折叠为 `ConstI64(length)` | `length()` / `is_empty()` / `list_*_length()` (4 case) |
+| `Op::ReadStringLen` | no-op（前置 `ConstString` 已经把 length 放栈顶）| 同上 |
+
+M2-A 25 → M2-B 15 BytecodeUnsupported。剩余 15 的分布：
+
+- `arith_control / let_chain`（1）— analyzer 自身 reject（cranelift
+  也 reject 的同一 case），bytecode envelope 改不动。
+- `dict_return / dict_with_string_return`（1）— String 返回 field，
+  bytecode VM 当前不做 String marshalling。
+- `stdlib_case_fold`（5）— 全部返回 String。
+- `stdlib_list`（2）— `sum` / `max` body 依赖 `LoadI32AtAbsolute`（真
+  memory access），无虚拟-local fallback。
+- `stdlib_memory`（4）— 全部返回 String（substring / concat），
+  `starts_with` body 走真字节比较。
+- `stdlib_normalize`（2）— Unicode normalization，深度依赖 memory 表。
+
+任务 brief 给的目标是 ≤ 12；M2-B 落点是 15，差 3 case，全部需要
+String 槽位真实化或 wasm memory 模型（M2-C 或更后的 milestone）。
+
+### Architecture decisions（≤ 5 bullets，每条带 rationale）
+
+1. **`StackOrigin` 而非完整 SSA 镜像**：bytecode 编译 pass 跟踪三个
+   语义（Local / Const / Snapshot）足够覆盖所有 producer；arith / cmp
+   结果走 `Snapshot(idx)`，let-bound 走 `Local(slot)`，常量走
+   `Const(v)`。比 SSA dense rep 简单，partial-resume 时 `materialise_
+   stack` 直接 O(n) 重建栈。
+2. **trace recorder 与 bytecode 编译 pass 共用 per-IR-op 计数**：
+   recorder 在 `record_op` 入口 bump `next_external_pc`，guard 不再
+   独立 +1。这样 `bc_index_for_pc(external_pc)` 是 deterministic O(n)
+   lookup，不需要侧表翻译。
+3. **`value_stack_copy` 在 JIT 端先空着**：trace JIT 不维护 operand
+   stack；填充 `value_stack_copy` 是 M2-C/M2-D 工作（recorder gain
+   stack tracking）。今天 bytecode-side resume 已可用纯 Local/Const
+   recipe + ssa_slots_copy 重建运行时栈，覆盖了 4-prong sandbox 全
+   场景。
+4. **Stdlib inlining 走 `builtin_stdlib()` 注册表**：lower_workspace_single
+   只 emit user funcs，stdlib bodies 在 codegen 时 link；bytecode 编
+   译 pass 现在直接查注册表，绕过 link 步骤。深度上限 3、单次膨胀
+   64 ops，防止 cyclic / pathological 输入炸 compile pass。
+5. **`Op::Select` 手卷 lowering 而非新增 `BcOp::Select`**：3 scratch
+   slot 实现 wasm-typed-select 语义；新增专门的 op 是 M2-C IC 优化
+   时再考虑。今天落地的 lowering 跟 tree-walker / cranelift 等价
+   （`abs` / `min` / `max` smoke tests 都通过）。
+
+### v6-δ M2-C 入口
+
+1. **`value_stack_copy` 上联**：recorder gain operand-stack tracking
+   → 真 mid-expression deopt 也带 value_stack 数据；M2-B 在 bytecode
+   端的 `Snapshot(idx)` recipe 直接可用。
+2. **IC dispatch slot per Call**：M2-B 的 stdlib inlining 是 compile-
+   time inlining，没有 runtime IC。M2-C 加 `BcOp::CallNative { ic_slot }`
+   + 每个 callsite 一个 monomorphic-cache slot。
+3. **Bench**：v6-δ M1 的 9.52 ns/iter 推到 3-5 ns/iter 档位；M2-B
+   信封内 ArithControl 28 case 全 bit-by-bit 等价 → bench 可以专注
+   dispatch 路径而不需要 backend correctness gate。
+4. **剩余 envelope 缺口处理**：String 返回 field（5 case）+ list 真
+   memory 访问（2 case）+ Unicode normalization（2 case）。这些都不
+   是 M2-C 的本职但放在 carry-over 里追踪。
