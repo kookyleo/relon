@@ -3649,3 +3649,53 @@ Sum ≈ 0.95 ns/iter, matches the measured delta.
 ### Stage report
 
 Full report at `docs/internal/v6-epsilon-m0-recorder-loops-2026-05-19.md`.
+
+---
+
+## v6-λ-0 — Bench methodology hardening 附录（2026-05-19）
+
+**目的**：把 v6-γ M5 → v6-ε-0-A 期间累计 6 周 × 三连 false delta 的根因（6 个未硬化
+方法论陷阱）写进 harness。
+
+### 完整 distribution table（200 samples / row，hardened harness）
+
+| Row | p50 ns/iter | p90 | p99 | p99.9 | max | tag |
+|---|---|---|---|---|---|---|
+| `tree_walk_loop` | 3372 ns/elem | 3436 | 3460 | 3501 | 3504 | per_iter_alloc |
+| `cranelift_aot_loop` | **2.073** | 2.077 | 2.079 | 2.083 | 2.084 | per_iter_alloc |
+| **`trace_jit_loop`**（手搭） | **1.184** | 1.186 | 1.240 | 1.500 | 1.545 | zero_alloc |
+| **`trace_jit_loop_recorded`**（ε-M0） | **2.116** | 2.136 | 2.152 | 2.181 | 2.187 | zero_alloc |
+| `rust_native_loop` | 2.414 | 2.417 | 2.425 | 2.426 | 2.426 | zero_alloc |
+| `dispatch_trampoline` | 9.479 | 9.489 | 9.499 | 9.503 | 9.504 | zero_alloc |
+| `dispatch_ic` | 9.480 | 9.489 | 9.505 | 9.508 | 9.508 | zero_alloc |
+| `dispatch_tail` | 9.483 | 9.494 | 9.507 | 9.514 | 9.516 | zero_alloc |
+| `dispatch_sysv` | 9.486 | 9.497 | 9.513 | 9.530 | 9.533 | zero_alloc |
+| `dispatch_inline` | 9.478 | 9.486 | 9.504 | 9.506 | 9.506 | zero_alloc |
+| `dispatch_rust_inlined_baseline` | 3.553 | 3.557 | 3.560 | 3.562 | 3.562 | zero_alloc |
+| `dispatch_cranelift_step` | 425.7 | 425.9 | 426.2 | 426.3 | 426.3 | zero_alloc |
+
+### Tail 稳定性
+
+- `trace_jit_loop_recorded` max / p50 = **1.034** ← 真录路径极稳，进 LuaJIT trace
+  tier 1-3 ns 区间偏中位且分布紧
+- `trace_jit_loop` max / p50 = 1.305 ← 手搭路径有少量 trace evict / TLB miss tail，
+  但 p99 仍 = p50 × 1.047
+- 所有 dispatch_* 行 max / p50 &lt; 1.005 ← cache 极稳
+
+### 6 陷阱 mitigation in-bench
+
+详 `docs/internal/v6-lambda-0-bench-hardening-2026-05-19.md` 表 1。
+
+### Validators
+
+`crates/relon-bench/tests/methodology_validators.rs` 12 个 source-grep tests 防
+后续 hack 拆 hardening。
+
+### 复现命令
+
+```bash
+cargo bench --bench trace_jit_hot_loop
+cargo run --release -p relon-bench --bin bench_stats -- \
+    target/criterion/v6_epsilon_hot_loop
+```
+

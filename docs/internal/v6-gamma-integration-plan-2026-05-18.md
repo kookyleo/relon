@@ -1269,3 +1269,52 @@ recorder 侧的覆盖（5/5 shape 全部录制成功，markers + φ 配对正确
 
 ε-M0 stage report 完整文档：`docs/internal/v6-epsilon-m0-recorder-loops-2026-05-19.md`。
 
+---
+
+## 21. v6-λ-0 — Bench methodology hardening（DONE-MET-TARGET 2026-05-19）
+
+把历史 6 周 × 三连 false delta 的根因（6 个 bench 方法论陷阱）写进 harness +
+加 source-grep validators 防再犯。
+
+### 21.1 6 陷阱硬化
+
+| Trap | Mitigation |
+|---|---|
+| A 编译器消除 | 每 closure ≥ 2 个 `black_box` |
+| B Warm-up 混淆 | 显式 `WARMUP_ITERS = 10_000` |
+| C 调用方污染 | `HOT_LOOP_N = 1_000_000` |
+| D Cache 冷热 | setup prefill |
+| E GC bias | 每行标 `#[zero_alloc]` / `#[per_iter_alloc]` |
+| F 分布掩盖 | `sample_size = 200` + `bench_stats` post-process p50/p90/p99/p99.9/max |
+
+### 21.2 关键结果（hardened harness，200 samples / row）
+
+| Row | p50 | p99 | max | tail ratio |
+|---|---|---|---|---|
+| trace_jit_loop_recorded（真录） | 2.116 ns | 2.152 | 2.187 | 1.034 |
+| trace_jit_loop（手搭） | 1.184 | 1.240 | 1.545 | 1.305 |
+| cranelift_aot_loop | 2.073 | 2.079 | 2.084 | 1.005 |
+| rust_native_loop | 2.414 | 2.425 | 2.426 | 1.005 |
+| dispatch_* (trampoline/IC/tail/sysv/inline) | 9.48 ± 0.01 | 9.50 ± 0.02 | 9.51-9.53 | &lt; 1.005 |
+
+历史"三连 zero delta"（M2-C / ε-0-C / ε-0-A）在 hardened harness 下完全复现，
+**确认那些 phase 测出来的 9.5 ns 不是 dispatch 算法的问题，而是 bench harness
+的 Rust→JIT call boundary 自身**。
+
+### 21.3 Validators 防再犯
+
+`crates/relon-bench/tests/methodology_validators.rs` 12 个 grep-based tests，未来
+谁拆 hardening 直接 fail-fast。
+
+### 21.4 Files
+
+详 `docs/internal/v6-lambda-0-bench-hardening-2026-05-19.md`。
+
+### 21.5 carry-over
+
+- λ-机器 quiescence：harness 硬化但 CPU freq / turbo / cache state 仍未严格控制
+  （round1 vs round2 tree_walk_loop 有 2% diff）。
+- λ-1 LuaJIT install：`bench_stats` 已支持 cross-group analysis，可直接跨 Relon /
+  Lua 出对照表。
+- 每次 λ-fix-* 改 perf 路径必跑 hardened bench + validators 通过 才能进下一 phase。
+
