@@ -55,12 +55,12 @@ pub mod ic_lookup;
 pub mod str_ops;
 
 pub use call_table::{
-    register_external_call, resolve_external_call, with_call_table, ExternalCallTable,
-    __relon_trace_resolve_call,
+    __relon_trace_resolve_call, register_external_call, resolve_external_call, with_call_table,
+    ExternalCallTable,
 };
 pub use deopt::{
-    DeoptStateSnapshot, GenericState, RecoverableWriteRecord, TraceContext,
-    __relon_trace_save_deopt,
+    __relon_trace_save_deopt, DeoptStateSnapshot, GenericState, RecoverableWriteRecord,
+    TraceContext,
 };
 pub use dict_list::{
     __relon_trace_dict_lookup, __relon_trace_list_get, build_dict_record, build_flat_list_record,
@@ -68,6 +68,6 @@ pub use dict_list::{
 };
 pub use ic_lookup::{__relon_trace_inline_cache_lookup, ic_storage_size, write_ic_header};
 pub use str_ops::{
-    reset_str_contains_ic, str_contains_ic_counts, StringRef, __relon_str_concat,
-    __relon_str_contains, __relon_str_find, __relon_str_substring,
+    __relon_str_concat, __relon_str_contains, __relon_str_find, __relon_str_substring,
+    reset_str_contains_ic, str_contains_ic_counts, StringRef,
 };
