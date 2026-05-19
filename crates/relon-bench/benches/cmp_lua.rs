@@ -2076,6 +2076,29 @@ fn bench_cmp_lua(c: &mut Criterion) {
                 });
             },
         );
+        // v6-fix-D2 cold-start lite mode. Runs the same `relon run`
+        // through `--lite`, which forces the tree-walker and skips
+        // the carrier-`.relon` analyzer pass plus AOT cache probes.
+        // Reported as a separate criterion row so the LuaJIT × 2
+        // gate can be checked against the dedicated lite number
+        // (the default row still measures the cranelift-AOT path).
+        cold_group.bench_function(
+            BenchmarkId::new("W11_cold_start", "relon_fresh_proc_lite"),
+            |b| {
+                b.iter(|| {
+                    let out = Command::new(&relon_bin)
+                        .arg("run")
+                        .arg(&relon_src_path)
+                        .arg("--lite")
+                        .arg("--args")
+                        .arg(relon_args_json)
+                        .output();
+                    if let Ok(o) = &out {
+                        black_box(o.stdout.len());
+                    }
+                });
+            },
+        );
     } else {
         eprintln!(
             "[cmp_lua W11] relon-cli not found at {relon_bin}; skipping Relon cold-start row"

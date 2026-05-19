@@ -27,8 +27,11 @@
 //! one.
 
 use crate::root_schemas;
+use crate::schema::SchemaMethodInfo;
 use crate::tree::AnalyzedTree;
 use relon_parser::parse_document;
+use std::collections::HashMap;
+use std::sync::OnceLock;
 
 /// Source text of every built-in `.relon` carrier embedded at compile
 /// time. Each entry is `(virtual_path, source)`; the path is only used
@@ -40,16 +43,32 @@ const CORE_SOURCES: &[(&str, &str)] = &[
     ("core/dict.relon", include_str!("core/dict.relon")),
 ];
 
-/// Inject every built-in `core/*.relon` schema declaration into the
-/// analyzed tree's `schema_methods` table. Runs as the first analyzer
-/// pass so subsequent passes (`collect_schemas`, `collect_extends`,
-/// `check_derive_witnesses`, ...) see the built-in methods alongside
-/// user-declared ones — that uniformity is decision 21''s whole point.
+/// Process-local cache of the parsed + lowered `schema_methods` table
+/// produced by the four built-in `core/*.relon` carriers. Parsing those
+/// 80-odd lines and running them through `collect_root_schemas` was a
+/// hidden ~0.8 ms per `analyze_with_options` call before the cache —
+/// the carriers are static, the lowering deterministic, so we pay it
+/// once and clone the resulting `Vec<SchemaMethodInfo>` per analyzer
+/// invocation.
 ///
-/// Idempotent across modules: each invocation re-installs the same set,
-/// but `schema_methods` is shared per-`AnalyzedTree` and we're called
-/// before any per-module collection populates it.
-pub fn inject_core_schemas(tree: &mut AnalyzedTree) {
+/// `OnceLock` is process-local: each `relon-cli` invocation pays the
+/// build cost on its first analyzer call, and amortises across every
+/// subsequent module / re-analysis in that process. For a single-shot
+/// CLI run this saves us nothing extra; the win is "every call after
+/// the first" — and v6-fix-D2's W11 cold-start path measures the
+/// every-call case (host runs analyze on the entry, then again for any
+/// `#import`).
+fn cached_core_schema_methods() -> &'static HashMap<String, Vec<SchemaMethodInfo>> {
+    static CACHE: OnceLock<HashMap<String, Vec<SchemaMethodInfo>>> = OnceLock::new();
+    CACHE.get_or_init(build_core_schema_methods)
+}
+
+/// Slow-path builder driving `parse_document` + `collect_root_schemas`
+/// over every embedded carrier. Identical semantics to the pre-cache
+/// implementation; the only difference is the merge target is a free-
+/// standing map rather than the live `AnalyzedTree`.
+fn build_core_schema_methods() -> HashMap<String, Vec<SchemaMethodInfo>> {
+    let mut out: HashMap<String, Vec<SchemaMethodInfo>> = HashMap::new();
     for (path, source) in CORE_SOURCES {
         let root = match parse_document(source) {
             Ok(n) => n,
@@ -58,22 +77,8 @@ pub fn inject_core_schemas(tree: &mut AnalyzedTree) {
                  this is a compile-time-embedded source, fix the file"
             ),
         };
-        // The carriers only contain root-level `#schema X with { ... }`
-        // directives — the relevant analyzer pass is
-        // `collect_root_schemas`, which feeds each one through
-        // `lower_schema_pure_with` (recording fields + methods) and
-        // appends the methods to `tree.schema_methods` via
-        // `record_schema_methods`. We deliberately skip
-        // `collect_schemas` (no dict-field schemas in the carrier),
-        // `collect_extends` (no `#extend` directives), and
-        // `check_method_uniqueness` (covered by the user-source pass
-        // after merge).
         let mut tmp = AnalyzedTree::new();
         root_schemas::collect_root_schemas(&root, &mut tmp);
-        // Guard against silent regressions in the carrier — a parse
-        // succeeded but the lowering rejected the body (e.g. a typo in
-        // a `#schema` directive). Surface this loudly so the bug is
-        // unambiguous.
         if tmp
             .diagnostics
             .iter()
@@ -84,29 +89,38 @@ pub fn inject_core_schemas(tree: &mut AnalyzedTree) {
                 tmp.diagnostics
             );
         }
-        merge_core_into(tree, tmp);
+        for (schema_name, methods) in tmp.schema_methods {
+            let entry = out.entry(schema_name).or_default();
+            for m in methods {
+                if !entry.iter().any(|existing| existing.name == m.name) {
+                    entry.push(m);
+                }
+            }
+        }
     }
+    out
 }
 
-/// Append the core carrier's `schema_methods` contributions into `dst`.
-/// We do *not* copy `schemas` / `root_schemas` entries — those would
-/// pollute the user-visible declaration tables and trigger duplicate-
-/// name / collision diagnostics when a user `#extend`s the same
-/// built-in. The carrier's purpose is purely to populate the method
-/// dispatch table.
-fn merge_core_into(dst: &mut AnalyzedTree, src: AnalyzedTree) {
-    for (schema_name, methods) in src.schema_methods {
-        let entry = dst.schema_methods.entry(schema_name).or_default();
-        // Preserve source order; user-side `#extend` contributions
-        // appended later will sit after the carrier's methods.
+/// Inject every built-in `core/*.relon` schema declaration into the
+/// analyzed tree's `schema_methods` table. Runs as the first analyzer
+/// pass so subsequent passes (`collect_schemas`, `collect_extends`,
+/// `check_derive_witnesses`, ...) see the built-in methods alongside
+/// user-declared ones — that uniformity is decision 21''s whole point.
+///
+/// Idempotent across modules: each invocation re-installs the same set,
+/// but `schema_methods` is shared per-`AnalyzedTree` and we're called
+/// before any per-module collection populates it.
+///
+/// v6-fix-D2: parsing + lowering the carrier source is cached in a
+/// process-local `OnceLock` (see [`cached_core_schema_methods`]). Every
+/// call after the first clones from the cache instead of re-parsing.
+pub fn inject_core_schemas(tree: &mut AnalyzedTree) {
+    let cached = cached_core_schema_methods();
+    for (schema_name, methods) in cached {
+        let entry = tree.schema_methods.entry(schema_name.clone()).or_default();
         for m in methods {
-            // Defensive de-dup in case `inject_core_schemas` is ever
-            // called twice on the same tree (e.g. via a test harness
-            // that re-runs analysis). Match on method name — the
-            // carrier never registers two methods of the same name on
-            // one schema, so this is a no-op in the happy path.
             if !entry.iter().any(|existing| existing.name == m.name) {
-                entry.push(m);
+                entry.push(m.clone());
             }
         }
     }
