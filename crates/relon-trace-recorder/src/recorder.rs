@@ -119,6 +119,19 @@ pub struct RecorderState {
     /// we use a monotone counter so the emitter's guard lookup keeps
     /// finding a matching site for every `TraceOp::Guard` it sees.
     next_external_pc: u64,
+    /// v6-δ M2-C: mirror of the IR walker's operand stack in SSA
+    /// space. Each `record_op` call pops `inputs.len()` SSAs from
+    /// the top and (if the op produced a value) pushes the fresh
+    /// `dst`. The deopt machinery captures this slice into the
+    /// guard site's `ssa_stack_snapshot` so the bytecode-side
+    /// `Snapshot(idx)` recipe can materialise mid-expression operand
+    /// stacks at resume time without needing an extra translation
+    /// table (per M2-B carry-over §10.1).
+    ssa_stack: Vec<SsaVar>,
+    /// Maximum observed operand-stack depth across the recording.
+    /// Mainly diagnostic — emitter side allocates `value_stack_copy`
+    /// boxes by the per-guard snapshot length, not this watermark.
+    ssa_stack_high_water: u32,
     aborted: Option<AbortReason>,
     terminated: bool,
 }
@@ -141,9 +154,24 @@ impl RecorderState {
             next_loop_id: 0,
             capacity,
             next_external_pc: 0,
+            ssa_stack: Vec::with_capacity(16),
+            ssa_stack_high_water: 0,
             aborted: None,
             terminated: false,
         }
+    }
+
+    /// Snapshot of the current operand-stack (in SSA-id form), oldest
+    /// first / top last. Used by deopt-snapshot construction (the
+    /// emitter stamps `value_stack_copy` from this view at guard-fire
+    /// time, indirectly via `GuardSite`).
+    pub fn ssa_stack_snapshot(&self) -> Vec<SsaVar> {
+        self.ssa_stack.clone()
+    }
+
+    /// High-water-mark of operand-stack depth observed so far.
+    pub fn ssa_stack_high_water(&self) -> u32 {
+        self.ssa_stack_high_water
     }
 
     /// Override the next-external-PC the recorder stamps on its
@@ -346,6 +374,17 @@ impl RecorderState {
                     self.emit_guard(g);
                 }
                 self.buffer.append(trace_op);
+                // v6-δ M2-C: update operand-stack mirror BEFORE the
+                // `guards_after` emit so a guard emitted for THIS op
+                // sees the post-op stack (dst already pushed). The
+                // bytecode-side `Snapshot(idx)` recipe expects to see
+                // the value the trapping op was about to produce on
+                // top of the stack — matching the way the bytecode
+                // compile pass arranges its `current_stack` per op.
+                self.pop_inputs(inputs);
+                if let Some(d) = dst {
+                    self.push_ssa(d);
+                }
                 let mut surfaced_guard = None;
                 for g in guards_after {
                     let kind = self.emit_guard(g);
@@ -375,6 +414,13 @@ impl RecorderState {
                         self.ir_to_ssa.insert(key, ssa);
                     }
                 }
+                // SideEffectOnly ops still consume operand-stack
+                // entries (e.g. `LocalSet`, `LetSet` pop the stored
+                // value, `Br` may pop nothing depending on lowering
+                // semantics); the recorder's caller supplies the
+                // popped SSA ids in `inputs`. Mirror the pop so the
+                // ssa_stack stays in sync with the IR walker's view.
+                self.pop_inputs(inputs);
                 RecordResult::Ok { value: None }
             }
             LowerOutcome::Lookup { kind, ty_hint } => {
@@ -388,6 +434,8 @@ impl RecorderState {
                     self.type_obs.insert(fresh_dst, ty_hint);
                     (fresh_dst, true)
                 };
+                // Lookup pushes one value onto the operand stack.
+                self.push_ssa(var);
                 // v6-δ M1: emit `TraceOp::LocalGet` on first observation
                 // of a `LookupKind::Local(idx)` so the emitter can
                 // materialise the SSA value from the cranelift entry
@@ -413,6 +461,10 @@ impl RecorderState {
             }
             LowerOutcome::Terminate { op: trace_op } => {
                 self.buffer.append(trace_op);
+                // Terminator (`Return`) pops its return value off the
+                // operand stack. Mirror that so the final ssa_stack
+                // depth reads as 0 — diagnostic-friendly.
+                self.pop_inputs(inputs);
                 self.terminated = true;
                 RecordResult::Terminated
             }
@@ -428,12 +480,43 @@ impl RecorderState {
                 };
                 self.buffer.append(marker);
                 let _ = inputs;
+                // Loop markers don't push or pop operand-stack values.
                 RecordResult::Ok { value: None }
             }
             LowerOutcome::Abort(reason) => {
                 self.aborted = Some(reason);
                 RecordResult::Abort(reason)
             }
+        }
+    }
+
+    /// Pop `inputs.len()` entries off the ssa_stack mirror. Used by
+    /// every LowerOutcome arm except `Lookup`/`LoopMarker`. Tolerates
+    /// underflow because not every `record_op` call originates from
+    /// the production IR walker — direct test drivers may feed
+    /// synthetic SSA inputs that don't correspond to operand-stack
+    /// pushes. In production those callers run through
+    /// `TraceRecordingEvaluator` which pops the operand stack first
+    /// and feeds the popped SSAs as `inputs`, so the mirror stays in
+    /// sync.
+    ///
+    /// Underflow is **silent** (the mirror simply clears) so unit
+    /// tests that exercise lowering rules with synthetic inputs don't
+    /// panic. The mirror's view is best-effort — guard sites stamped
+    /// during such tests carry an under-populated snapshot, which is
+    /// equivalent to the M2-B "empty value_stack_copy" behaviour.
+    fn pop_inputs(&mut self, inputs: &[SsaVar]) {
+        let n = inputs.len();
+        let drain_from = self.ssa_stack.len().saturating_sub(n);
+        self.ssa_stack.truncate(drain_from);
+    }
+
+    /// Push one SSA value onto the ssa_stack mirror and update the
+    /// high-water mark.
+    fn push_ssa(&mut self, v: SsaVar) {
+        self.ssa_stack.push(v);
+        if (self.ssa_stack.len() as u32) > self.ssa_stack_high_water {
+            self.ssa_stack_high_water = self.ssa_stack.len() as u32;
         }
     }
 
@@ -507,8 +590,17 @@ impl RecorderState {
         // increment again here, else a guard-emitting op would skip
         // a PC slot and the bytecode-side index lookup would drift.
         let external_pc = ExternalPc(self.next_external_pc);
-        self.buffer
-            .record_guard(GuardSite::new(trace_pc, external_pc, kind));
+        // v6-δ M2-C: stamp the current operand-stack snapshot onto
+        // the site. The bytecode-side resume path reads
+        // `value_stack_copy` (built from these SSAs via
+        // `ssa_slots_copy` at deopt-fire time) to rehydrate the
+        // mid-expression stack. Empty snapshot ⇒ guard-at-empty-stack
+        // (e.g. immediately after a `Return`); the resume path falls
+        // back to recipe-only materialisation.
+        let snap = self.ssa_stack.clone();
+        self.buffer.record_guard(
+            GuardSite::new(trace_pc, external_pc, kind).with_ssa_stack_snapshot(snap),
+        );
     }
 }
 
@@ -605,5 +697,96 @@ mod tests {
             res,
             RecordResult::Abort(AbortReason::TraceTooLong)
         ));
+    }
+
+    // ---- v6-δ M2-C: ssa_stack mirror coverage ----
+
+    #[test]
+    fn const_push_grows_ssa_stack() {
+        let mut r = RecorderState::new();
+        assert_eq!(r.ssa_stack_high_water(), 0);
+        let v0 = match r.record_op(&Op::ConstI64(1), &[], Some(ObservedType::I64)) {
+            RecordResult::Ok { value: Some(v) } => v,
+            other => panic!("unexpected {:?}", other),
+        };
+        assert_eq!(r.ssa_stack_snapshot(), vec![v0]);
+        assert_eq!(r.ssa_stack_high_water(), 1);
+    }
+
+    #[test]
+    fn add_consumes_two_pushes_one() {
+        // Sequence: ConstI64(2); ConstI64(3); Add(I64) → stack = [add_ssa]
+        let mut r = RecorderState::new();
+        let v0 = match r.record_op(&Op::ConstI64(2), &[], Some(ObservedType::I64)) {
+            RecordResult::Ok { value: Some(v) } => v,
+            other => panic!("unexpected {:?}", other),
+        };
+        let v1 = match r.record_op(&Op::ConstI64(3), &[], Some(ObservedType::I64)) {
+            RecordResult::Ok { value: Some(v) } => v,
+            other => panic!("unexpected {:?}", other),
+        };
+        assert_eq!(r.ssa_stack_snapshot(), vec![v0, v1]);
+        assert_eq!(r.ssa_stack_high_water(), 2);
+        // Add(I64) surfaces NeedsGuard for ArithOverflow; both
+        // `Ok` and `NeedsGuard` carry the result SSA in `value`.
+        let add = match r.record_op(&Op::Add(IrType::I64), &[v0, v1], Some(ObservedType::I64)) {
+            RecordResult::Ok { value: Some(v) } => v,
+            RecordResult::NeedsGuard { value: Some(v), .. } => v,
+            other => panic!("unexpected {:?}", other),
+        };
+        // After Add: only the result is on the stack.
+        assert_eq!(r.ssa_stack_snapshot(), vec![add]);
+        // High water doesn't shrink.
+        assert_eq!(r.ssa_stack_high_water(), 2);
+    }
+
+    #[test]
+    fn return_drains_stack() {
+        let mut r = RecorderState::new();
+        let v0 = match r.record_op(&Op::ConstI64(7), &[], Some(ObservedType::I64)) {
+            RecordResult::Ok { value: Some(v) } => v,
+            _ => panic!("ConstI64 produced no SSA"),
+        };
+        assert_eq!(r.ssa_stack_snapshot().len(), 1);
+        let term = r.record_op(&Op::Return, &[v0], None);
+        assert!(matches!(term, RecordResult::Terminated));
+        assert!(r.ssa_stack_snapshot().is_empty());
+    }
+
+    #[test]
+    fn guard_site_carries_ssa_stack_snapshot() {
+        // Recipe: ConstI64; ConstI64; Add(I64) — the Add emits an
+        // ArithOverflow guard after the op. At that point ssa_stack
+        // should be `[add_ssa]` (input consumed, result pushed, guard
+        // emitted post-emit so it sees the post-op stack).
+        let mut r = RecorderState::new();
+        let v0 = match r.record_op(&Op::ConstI64(2), &[], Some(ObservedType::I64)) {
+            RecordResult::Ok { value: Some(v) } => v,
+            _ => panic!("ConstI64 produced no SSA"),
+        };
+        let v1 = match r.record_op(&Op::ConstI64(3), &[], Some(ObservedType::I64)) {
+            RecordResult::Ok { value: Some(v) } => v,
+            _ => panic!("ConstI64 produced no SSA"),
+        };
+        let res = r.record_op(&Op::Add(IrType::I64), &[v0, v1], Some(ObservedType::I64));
+        // Add(I64) emits a NeedsGuard with ArithOverflow.
+        let _guard = match res {
+            RecordResult::NeedsGuard { guard, .. } => guard,
+            other => panic!("unexpected {:?}", other),
+        };
+        // The buffer now holds [Const, Const, Add, Guard(ArithOverflow)].
+        let buf = r.buffer();
+        assert!(
+            !buf.guards.is_empty(),
+            "ArithOverflow guard must have been recorded"
+        );
+        let site = &buf.guards[0];
+        // Snapshot should be exactly `[add_ssa]`: the result is on the
+        // stack at guard-emit time.
+        assert_eq!(
+            site.ssa_stack_snapshot.len(),
+            1,
+            "post-Add stack depth is 1 (result on top)"
+        );
     }
 }
