@@ -53,7 +53,7 @@ use cranelift_module::{Linkage, Module as _};
 use relon_ir::{IrType, Op, TaggedOp};
 use relon_trace_abi::{HostHookTable, ObservedType, TraceContext, TraceEntryStatus};
 use relon_trace_emitter::{HostHookFuncIds, TraceEmitter};
-use relon_trace_jit::{OptimizerPipeline, SsaVar};
+use relon_trace_jit::{OptimizedTrace, OptimizerPipeline, SsaVar};
 use relon_trace_recorder::{RecordResult, RecorderState};
 
 use crate::trace_recording::{RecordingOutcome, TraceRecordingEvaluator};
@@ -216,6 +216,19 @@ pub struct JITedTraceFn {
     /// fn_id has been removed. Kept inside an `Arc` so concurrent
     /// callers can share the same trace fn without lock contention.
     _module: JITModule,
+    /// v6-ε-0-A: optimised trace IR retained so a host fn can re-emit
+    /// the same body inline at its trace dispatch call site, skipping
+    /// the cranelift call/ret + arg-marshall boundary entirely.
+    ///
+    /// Set unconditionally on the install path; consumers consult
+    /// [`relon_trace_emitter::should_inline_trace`] (or the
+    /// `MAX_INLINE_OPS` cap directly) to decide between the inline
+    /// path and the standard trampoline-call (`fn_ptr`) path.
+    ///
+    /// Wrapped in `Arc` so the host can cheaply hand the same trace to
+    /// multiple inline call sites without cloning the op stream each
+    /// time.
+    inline_trace: Arc<OptimizedTrace>,
 }
 
 // SAFETY: the entry fn pointer is owned by `_module`; sharing the
@@ -307,6 +320,29 @@ impl JITedTraceFn {
     /// guard ops populate them).
     pub fn guard_table_len(&self) -> usize {
         self.guard_ssa_stacks.len()
+    }
+
+    /// v6-ε-0-A: shared handle on the trace's [`OptimizedTrace`] IR.
+    ///
+    /// Host fn compilers consult this when deciding between the
+    /// inline path (re-emit the trace body straight into the host fn
+    /// IR — see [`relon_trace_emitter::emit_trace_inline`]) and the
+    /// trampoline-call path (jump to [`Self::raw_fn_ptr`]).
+    ///
+    /// Cloning the returned `Arc` is the cheap way for a caller to
+    /// pin the IR alive across the inline emit pass without holding
+    /// the [`TraceJitState`] write lock.
+    pub fn inline_trace(&self) -> Arc<OptimizedTrace> {
+        Arc::clone(&self.inline_trace)
+    }
+
+    /// v6-ε-0-A: convenience helper that wraps
+    /// [`relon_trace_emitter::should_inline_trace`] on this trace's
+    /// retained IR. Returns `true` when the trace is small enough to
+    /// be inlined at a host fn call site (per
+    /// [`relon_trace_emitter::MAX_INLINE_OPS`]).
+    pub fn inline_candidate(&self) -> bool {
+        relon_trace_emitter::should_inline_trace(&self.inline_trace)
     }
 }
 
@@ -782,6 +818,14 @@ impl TraceJitState {
             guard_ssa_stacks,
             guard_external_pcs,
             _module: module,
+            // v6-ε-0-A: clone the optimised trace into an Arc so host
+            // fn compilers that pick the inline path can re-emit the
+            // body without re-running the optimiser. The trace was
+            // moved into `module.define_function` via `ctx.func`; the
+            // OptimizedTrace itself is independent of the cranelift
+            // Function value, so cloning is cheap (Box<[TraceOp]> +
+            // small side tables).
+            inline_trace: Arc::new(optimized),
         })
     }
 }
