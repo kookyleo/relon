@@ -114,6 +114,12 @@ fn no_arith_no_guards() {
 
 #[test]
 fn external_pc_overrideable() {
+    // v6-δ M2-B: `set_next_external_pc(seed)` makes the **next**
+    // `record_op` stamp `seed + 1` (the recorder advances the
+    // counter once per op before lowering so guard-emitting ops
+    // never collide with non-guard predecessors). The test pins this
+    // by counting 3 ops (Const1, Const2, Add) past the seed: the Add
+    // op's PC is `seed + 3`, and the guard fires on Add.
     let mut r = RecorderState::new();
     r.set_next_external_pc(0xdead_beef);
     let a = const_i64(&mut r, 1);
@@ -121,5 +127,6 @@ fn external_pc_overrideable() {
     let _ = r.record_op(&Op::Add(IrType::I64), &[b, a], Some(ObservedType::I64));
     let buf = r.finalize().expect("no abort");
     assert_eq!(buf.guards.len(), 1);
-    assert_eq!(buf.guards[0].deopt_pc.0, 0xdead_beef);
+    // ConstI64(1)=PC seed+1, ConstI64(2)=PC seed+2, Add=PC seed+3.
+    assert_eq!(buf.guards[0].deopt_pc.0, 0xdead_beef + 3);
 }

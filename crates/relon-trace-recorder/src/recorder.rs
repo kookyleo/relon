@@ -247,6 +247,16 @@ impl RecorderState {
     ///
     /// Returns the SSA id of the emitted value (if any) wrapped in
     /// the appropriate [`RecordResult`] variant.
+    ///
+    /// v6-δ M2-B: every `record_op` call advances `next_external_pc`
+    /// by 1 **before** invoking the lowering rule. The bytecode
+    /// compiler's compile pass uses the same per-op monotonic counter
+    /// (`ir_pc_next`); aligning them lets partial-resume route a
+    /// guard's `external_pc` straight into the matching bytecode
+    /// index without an extra translation table. Hosts that prefer
+    /// the legacy guard-only scheme can still
+    /// [`Self::set_next_external_pc`] manually before each
+    /// `record_op` call to override.
     pub fn record_op(
         &mut self,
         op: &Op,
@@ -265,6 +275,12 @@ impl RecorderState {
             self.aborted = Some(AbortReason::TraceTooLong);
             return RecordResult::Abort(AbortReason::TraceTooLong);
         }
+
+        // v6-δ M2-B: bump the IR-side PC so any guard the lowering
+        // emits for THIS op carries the per-op counter the bytecode
+        // compile pass uses. Mirrors the bytecode compiler's
+        // `next_pc()` (`ir_pc_next += 1`) increment-then-stamp order.
+        self.next_external_pc = self.next_external_pc.wrapping_add(1);
 
         let fresh_dst = self.ssa.alloc();
         let cx = self.build_lowering_cx(op, inputs, fresh_dst);
@@ -485,8 +501,12 @@ impl RecorderState {
     /// fills it in via [`TraceBuffer::guards`] post-recording.
     fn append_guard_with_site(&mut self, kind: GuardKind, payload: SsaVar) {
         let trace_pc = self.buffer.append(TraceOp::Guard(kind, payload));
+        // v6-δ M2-B: the recorder bumps `next_external_pc` once per
+        // `record_op` call (see the comment in `record_op`). The
+        // current op's PC is therefore the current value — DO NOT
+        // increment again here, else a guard-emitting op would skip
+        // a PC slot and the bytecode-side index lookup would drift.
         let external_pc = ExternalPc(self.next_external_pc);
-        self.next_external_pc = self.next_external_pc.wrapping_add(1);
         self.buffer
             .record_guard(GuardSite::new(trace_pc, external_pc, kind));
     }
