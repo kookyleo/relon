@@ -106,6 +106,22 @@ pub struct GuardSite {
     pub deopt_state: DeoptState,
     /// Predicate kind (mirrors the op-level `GuardKind`).
     pub kind: GuardKind,
+    /// v6-δ M2-C: snapshot of the IR walker's operand stack (in SSA-id
+    /// form, oldest first / top last) **at the point this guard is
+    /// emitted**. The bytecode-side resume path consumes the
+    /// `value_stack_copy` Box derived from this snapshot (looked up
+    /// through `ssa_slots_copy` at deopt time) to rehydrate the
+    /// mid-expression operand stack rather than starting from the
+    /// bc_idx's compile-time `stack_recipe` only.
+    ///
+    /// Carried out-of-band from `DeoptState` because:
+    /// - `DeoptState::ssa_to_external_slot` is the (un-ordered) map of
+    ///   "live SSAs at this guard" while this field is the ordered
+    ///   stack view the resume API expects;
+    /// - the optimiser may rewrite SSA ids without touching the stack
+    ///   shape, so the two carry distinct optimiser-safety invariants.
+    #[serde(default)]
+    pub ssa_stack_snapshot: Vec<SsaVar>,
 }
 
 impl GuardSite {
@@ -115,7 +131,16 @@ impl GuardSite {
             deopt_pc,
             deopt_state: DeoptState::new(),
             kind,
+            ssa_stack_snapshot: Vec::new(),
         }
+    }
+
+    /// Builder-style attach the operand-stack snapshot (in SSA-id
+    /// form). The recorder stamps this at emit-time from its
+    /// `ssa_stack` mirror.
+    pub fn with_ssa_stack_snapshot(mut self, snap: Vec<SsaVar>) -> Self {
+        self.ssa_stack_snapshot = snap;
+        self
     }
 }
 

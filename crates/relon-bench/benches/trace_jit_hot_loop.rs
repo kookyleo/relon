@@ -1,6 +1,6 @@
-//! v6-γ M5: trace-JIT hot-loop micro-bench.
+//! v6-γ M5 / v6-δ M2-C: trace-JIT hot-loop micro-bench.
 //!
-//! Three rows on the same hot integer-accumulation workload:
+//! Four rows on the same hot integer-accumulation workload:
 //!
 //! - `tree_walk` — the AST evaluator running `#main(Int n) -> Int :
 //!   sum(range(n))` (analytic close: `n * (n-1) / 2`). Captures the
@@ -8,11 +8,19 @@
 //! - `cranelift_aot` — the same body lowered through cranelift-AOT.
 //!   Captures the warm-call cost the v5-β-2 closeout bench
 //!   established (sub-µs per `run_main` invocation).
-//! - `trace_jit_warm` — the trace-JIT path: warm up a `HotCounter`
-//!   so the recorder installs a trace for a `LocalGet x; ConstI64
-//!   k; Add; Return` body, then time **N tight invocations** of the
-//!   installed trace via `JITedTraceFn::invoke`. The throughput is
-//!   the LuaJIT trace-tier comparable.
+//! - `trace_jit_warm` — the trace-JIT path through the historical
+//!   `JITedTraceFn::invoke` API: returns a `TraceEntryStatus` enum
+//!   the bench matches in the loop body. This row captures the
+//!   pre-M2-C "with extern-C status-enum marshalling" cost so we can
+//!   diff against the IC dispatch row.
+//! - `trace_jit_warm_ic` — v6-δ M2-C: IC-stub dispatch. Caches the
+//!   typed entry pointer in a `TraceIcSlot` on the first iter, then
+//!   calls the cached pointer directly in the inner loop. Skips the
+//!   `Arc` deref, the per-iter `transmute`, the enum-mapping match
+//!   in `JITedTraceFn::invoke`, and the `matches!(status, …)` in
+//!   the bench body. The steady-state dispatch tail is one
+//!   `call rax` against the cached pointer + an `==0` compare for
+//!   the raw i32 return code.
 //!
 //! Each row reports `Throughput::Elements(N)` so criterion prints
 //! per-iter cost directly. The bench fixes `N = 1_000_000` so the
@@ -62,7 +70,7 @@ use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criteri
 
 use relon_codegen_native::{
     clear_recording, global_trace_jit_state, register_recording, CraneliftAotEvaluator,
-    RecordingRegistration, SandboxConfig, MAX_FN_ID,
+    RecordingRegistration, SandboxConfig, TraceIcSlot, MAX_FN_ID,
 };
 use relon_eval_api::{Evaluator, Value};
 use relon_evaluator::{Context, Scope, TreeWalkEvaluator};
@@ -310,6 +318,83 @@ fn bench_hot_loop(c: &mut Criterion) {
                     // territory so this branch is cold.
                     acc = acc.wrapping_add(i);
                 }
+            }
+            black_box(acc)
+        });
+    });
+    // Keep `trace_fn` Arc alive for the IC row's lifetime as well.
+    drop(trace_fn);
+
+    // ---- Row 4: trace-JIT warm via IC dispatch (v6-δ M2-C). ----
+    //
+    // The IC slot caches the typed entry pointer on the first iter;
+    // every subsequent iter is one `call rax` against the cached
+    // pointer + a raw `i32 == 0` Success check. No Arc deref, no
+    // `transmute` per iter, no `match` arm building a
+    // `TraceEntryStatus` enum.
+    //
+    // The `type_sig` we pass is a stable opaque token — for this
+    // bench the trace is monomorphic so we use 0; production hosts
+    // would derive it from the call site's static type table.
+    //
+    // The trace was installed by Row 3's warm-up; we just look it up
+    // through the IC slot here.
+    let ic_slot = TraceIcSlot::new();
+    let entry = ic_slot
+        .lookup_or_install(fn_id, 0)
+        .expect("IC slot must resolve installed trace");
+    // Re-acquire the Arc explicitly so the bench loop's lifetime is
+    // tied to a clear owner. The IC slot also retains an Arc so the
+    // module can't be dropped under us.
+    let _trace_anchor = state.lookup_trace(fn_id).expect("post-install (ic)");
+    group.bench_function(BenchmarkId::new("backend", "trace_jit_warm_ic"), |b| {
+        b.iter(|| {
+            let mut acc: i64 = 0;
+            let mut ctx = TraceContext::with_capacity(64);
+            let mut args: [u64; 2] = [0, 0];
+            for i in 0..HOT_LOOP_N as i64 {
+                args[0] = black_box(acc) as u64;
+                args[1] = black_box(i) as u64;
+                // SAFETY: `entry` is the typed entry pointer from
+                // [`TraceIcSlot::lookup_or_install`]; the anchoring
+                // Arc is held above so the JIT module stays mapped.
+                // The contract is identical to TRACE_ENTRY_SIG.
+                let raw = unsafe { entry(&mut ctx as *mut _, args.as_ptr()) };
+                if raw == 0 {
+                    acc = ctx.result_slot as i64;
+                } else {
+                    // Deopt branch (cold).
+                    acc = acc.wrapping_add(i);
+                }
+            }
+            black_box(acc)
+        });
+    });
+
+    // ---- Row 5: Rust-inlined baseline (diagnostic). ----
+    //
+    // Pure-Rust `acc + i` with a checked-add for the overflow guard
+    // analogue. This is the **theoretical floor** for the trace's
+    // hot-loop body — if cranelift were able to inline the trace body
+    // into the bench's call site (instead of emitting a separate
+    // function with its own prologue + epilogue), this is roughly
+    // what the bench would measure.
+    //
+    // Comparing `trace_jit_warm_ic` vs this row tells us how much
+    // cost lives in the **function-call boundary** (prologue +
+    // epilogue + Rust-side call setup) vs the body work itself. The
+    // gap is the v6-ε "trace-to-trace fall-through" budget (per the
+    // v6-δ M1 bench appendix §"Honest comparison to LuaJIT").
+    group.bench_function(BenchmarkId::new("backend", "rust_inlined_baseline"), |b| {
+        b.iter(|| {
+            let mut acc: i64 = 0;
+            for i in 0..HOT_LOOP_N as i64 {
+                let a = black_box(acc);
+                let j = black_box(i);
+                acc = match a.checked_add(j) {
+                    Some(v) => v,
+                    None => a.wrapping_add(j),
+                };
             }
             black_box(acc)
         });
