@@ -76,6 +76,37 @@ impl TreeWalkEvaluator {
         ctx.backend_prepared = true;
     }
 
+    /// v6-fix-D2-I cold-start lite-mode preparation. Skips every
+    /// registration `prepare_in_place` does — no `builtin_decorators`,
+    /// no `stdlib`, no `prelude` schema seed, no `StdModuleResolver`
+    /// (the trivial scalar `#main` envelope provably touches none of
+    /// these). Marks the Context as prepared so the wrap-time check
+    /// in [`prepare_tree_walk_context`] short-circuits.
+    ///
+    /// **Contract**: caller must guarantee the source under this
+    /// Context fits the trivial-scalar `#main` envelope as classified
+    /// by `relon::is_trivial_scalar_main` — single
+    /// Int/Float/Bool/Null/String parameter, body is a literal /
+    /// Variable / arithmetic / ternary over leaves, no `#import`,
+    /// no decorator, no fn call. Outside that envelope this skips
+    /// registrations the evaluator may dispatch into (stdlib lookup,
+    /// decorator pre-eval) and would surface as
+    /// `RuntimeError::FunctionNotFound`. The CLI wires this only on
+    /// the `lite_analyze` path which has already pinned the entry
+    /// shape via the same classifier.
+    pub fn prepare_in_place_lite(ctx: &mut Context) {
+        if ctx.backend_prepared {
+            return;
+        }
+        // The lite shape never invokes a native fn / decorator, so we
+        // intentionally skip every registration here. Flip the flag so
+        // `TreeWalkEvaluator::new`'s wrap-time `prepare_tree_walk_context`
+        // sees the Context as already prepared and doesn't insist on
+        // unique `Arc` ownership for a now-unnecessary re-registration
+        // pass.
+        ctx.backend_prepared = true;
+    }
+
     pub(crate) fn caps(&self) -> Arc<dyn NativeFnCaps> {
         self.caps
             .get_or_init(|| {
