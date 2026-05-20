@@ -379,6 +379,8 @@ impl TraceEmitter {
             hoisted_dict_entry_count: HashMap::new(),
             hoisted_mod_nonzero_divisor: HashSet::new(),
             hoisted_mod_magic: HashMap::new(),
+            hoisted_dict_inline_seed: None,
+            hoisted_dict_inline_prime: None,
             saw_return: false,
         };
 
@@ -520,6 +522,21 @@ struct TraceEmitterState<'a, 'b> {
     /// the divisor SSA so a re-entrant `Mod` with the same divisor
     /// shares the cached magic value.
     hoisted_mod_magic: HashMap<SsaVar, ir::Value>,
+    /// F-D8-E.7: preheader-hoisted `iconst.i64 FX_HASH_SEED` shared
+    /// by all `DictLookupPrechecked` lowerings emitted in the trace.
+    /// The FxHash seed is a 64-bit immediate that doesn't fit into
+    /// the `mov r64, imm32` encoding; without hoisting, every
+    /// in-body `DictLookupPrechecked` emits a 10-byte
+    /// `movabs reg, imm64` for the seed on every outer-loop iter.
+    /// Stamped in `prehoist_loop_invariants` when the loop body
+    /// contains at least one in-body `DictLookupPrechecked` op.
+    hoisted_dict_inline_seed: Option<ir::Value>,
+    /// F-D8-E.7: preheader-hoisted `iconst.i64 FX_HASH_PRIME`. The
+    /// prime multiplier is also a 64-bit immediate. The hash-loop
+    /// body re-emits it `key_len` times per outer iter without this
+    /// hoist (cranelift 0.131's GVN doesn't lift `iconst.i64 imm64`
+    /// across the inner hash loop).
+    hoisted_dict_inline_prime: Option<ir::Value>,
     saw_return: bool,
 }
 
@@ -1408,13 +1425,52 @@ impl<'a, 'b> TraceEmitterState<'a, 'b> {
         // `scan_idx * 16 + entries_base` chain into a single x86_64
         // `lea`; hoisting would defeat that fold and net negative on
         // the hot path.
+        // F-D8-E.7: when the source-level IR carried a static
+        // `entry_count_hint` (forwarded by the recorder into the
+        // buffer's `dict_entry_count_hints` side table) and the dict
+        // is small enough, switch to the fully-unrolled cmov-chain
+        // lowering. The unrolled form replaces the data-driven scan
+        // loop with N straight-line `(load + icmp + select + bor)`
+        // entries, where N is the static `entry_count`. cranelift
+        // 0.131's x86_64 backend lowers each `select.i64` to a
+        // single `cmov`, so a 10-entry W5 dict body costs ~10 cmov
+        // insns instead of an average ~5 loop iters × `(load + cmp +
+        // brif + jump)` each.
+        //
+        // Safety: the matching `DictShapeGuard` runs upstream and
+        // verifies the dict's shape hash; the shape hash by
+        // construction pins the key set (and therefore the entry
+        // count). A dict that drifted between record-time and
+        // execution-time deopts at the shape guard before the
+        // unrolled lookup reads anything from the entry table.
+        if let Some(static_n) = self.trace.dict_entry_count_hint(dict_ptr) {
+            if (1..=crate::dict_inline::MAX_INLINE_UNROLL).contains(&static_n) {
+                let val = crate::dict_inline::emit_dict_lookup_inline_unrolled(
+                    self.builder,
+                    dict_v,
+                    key_v,
+                    self.deopt_block,
+                    static_n,
+                );
+                self.bind(dst, val);
+                return Ok(());
+            }
+        }
         let hoisted_entry_count = self.hoisted_dict_entry_count.get(&dict_ptr).copied();
-        let val = crate::dict_inline::emit_dict_lookup_inline_with_entry_count(
+        // F-D8-E.7: forward the trace-wide hoisted FxHash seed +
+        // prime SSAs (when present) so the inline body's hash loop
+        // doesn't re-emit the 64-bit immediates per outer iter.
+        let hoists = crate::dict_inline::DictInlineHoists {
+            entry_count: hoisted_entry_count,
+            hash_seed: self.hoisted_dict_inline_seed,
+            hash_prime: self.hoisted_dict_inline_prime,
+        };
+        let val = crate::dict_inline::emit_dict_lookup_inline_with_hoists(
             self.builder,
             dict_v,
             key_v,
             self.deopt_block,
-            hoisted_entry_count,
+            hoists,
         );
         self.bind(dst, val);
         Ok(())
@@ -1597,6 +1653,30 @@ impl<'a, 'b> TraceEmitterState<'a, 'b> {
                         self.builder.ins().load(I32, MemFlags::trusted(), dict_v, 8);
                     let entry_count = self.builder.ins().uextend(I64, entry_count_u32);
                     self.hoisted_dict_entry_count.insert(*dict_ptr, entry_count);
+
+                    // F-D8-E.7: while we're here, also pre-emit the
+                    // FxHash seed + prime 64-bit immediates that the
+                    // dict_inline body would otherwise re-emit on
+                    // every outer-loop iter (seed: once per outer
+                    // iter; prime: once per hash-loop iter ≈ key_len
+                    // times). These are trace-wide constants, so we
+                    // emit each exactly once and reuse the SSAs
+                    // across every subsequent in-loop
+                    // `DictLookupPrechecked` lowering.
+                    if self.hoisted_dict_inline_seed.is_none() {
+                        let seed = self
+                            .builder
+                            .ins()
+                            .iconst(I64, crate::dict_inline::fx_hash_seed_i64());
+                        self.hoisted_dict_inline_seed = Some(seed);
+                    }
+                    if self.hoisted_dict_inline_prime.is_none() {
+                        let prime = self
+                            .builder
+                            .ins()
+                            .iconst(I64, crate::dict_inline::fx_hash_prime_i64());
+                        self.hoisted_dict_inline_prime = Some(prime);
+                    }
                 }
                 TraceOp::Mod(_, _, b)
                     if !meta.inside_defs.contains(b)
@@ -2216,6 +2296,112 @@ mod tests {
             ..Default::default()
         };
         TraceEmitter::emit_with_hooks(&trace, &mut ctx, I64, hook_ids).expect("emit ok");
+    }
+
+    /// F-D8-E.7: when the trace buffer carries an
+    /// `entry_count_hint` for a dict_ptr SSA that flows into a
+    /// `DictLookupPrechecked`, the emitter must switch the inline
+    /// scan into the unrolled cmov chain. We confirm by counting
+    /// `Opcode::Select` insns in the emitted cranelift IR — the
+    /// unrolled path emits exactly N selects (one per entry), while
+    /// the scan-loop path emits zero.
+    #[test]
+    fn dict_lookup_with_entry_count_hint_emits_unrolled_select_chain() {
+        use cranelift_codegen::ir::Opcode;
+
+        // Keep `n` ≤ `MAX_INLINE_UNROLL` so the unrolled emitter path
+        // fires (the cap is intentionally conservative to avoid the
+        // memory-pressure regression on large dicts; see the const
+        // doc-comment in dict_inline.rs).
+        let n = crate::dict_inline::MAX_INLINE_UNROLL;
+        let mut b = TraceBuffer::new();
+        let dict = b.fresh_ssa();
+        let key = b.fresh_ssa();
+        let dst = b.fresh_ssa();
+        b.append(TraceOp::ConstI64(dict, 0x2000));
+        b.append(TraceOp::ConstI64(key, 0x3000));
+        // Run the dict_ic_hoist pass shape by hand: emit a
+        // DictShapeGuard upstream and the prechecked flavour as the
+        // body op. The emitter requires the prechecked op to skip the
+        // host-call codepath; an upstream DictShapeGuard keeps the
+        // semantics honest (mismatch deopts).
+        b.append(TraceOp::DictShapeGuard {
+            dict_ptr: dict,
+            shape_hash: 0xfeed_face_dead_beef,
+        });
+        b.append(TraceOp::DictLookupPrechecked {
+            dst,
+            dict_ptr: dict,
+            key_ptr: key,
+        });
+        // Stash the static hint that mimics what
+        // `emit_dict_lookup_with_hint` would set on the recorder side.
+        b.record_dict_entry_count_hint(dict, n);
+        b.append(TraceOp::Return(dst));
+
+        let trace = b.into_optimized();
+        let mut ctx = CodegenContext::new();
+        TraceEmitter::emit(&trace, &mut ctx).expect("emit ok");
+
+        // Walk the emitted IR and count Select insns.
+        let func = &ctx.func;
+        let mut select_count = 0usize;
+        for block in func.layout.blocks() {
+            for inst in func.layout.block_insts(block) {
+                if func.dfg.insts[inst].opcode() == Opcode::Select {
+                    select_count += 1;
+                }
+            }
+        }
+        assert_eq!(
+            select_count, n as usize,
+            "unrolled DictLookupPrechecked with entry_count_hint={n} must emit exactly {n} \
+             select insns (got {select_count})"
+        );
+    }
+
+    /// F-D8-E.7: without an entry_count_hint, the emitter must keep
+    /// the data-driven scan-loop path. Zero select insns expected
+    /// (the scan body uses `brif` on the hash compare, not `select`).
+    #[test]
+    fn dict_lookup_without_entry_count_hint_keeps_scan_loop() {
+        use cranelift_codegen::ir::Opcode;
+
+        let mut b = TraceBuffer::new();
+        let dict = b.fresh_ssa();
+        let key = b.fresh_ssa();
+        let dst = b.fresh_ssa();
+        b.append(TraceOp::ConstI64(dict, 0x2000));
+        b.append(TraceOp::ConstI64(key, 0x3000));
+        b.append(TraceOp::DictShapeGuard {
+            dict_ptr: dict,
+            shape_hash: 0xfeed_face_dead_beef,
+        });
+        b.append(TraceOp::DictLookupPrechecked {
+            dst,
+            dict_ptr: dict,
+            key_ptr: key,
+        });
+        // No `record_dict_entry_count_hint` call → scan-loop path.
+        b.append(TraceOp::Return(dst));
+
+        let trace = b.into_optimized();
+        let mut ctx = CodegenContext::new();
+        TraceEmitter::emit(&trace, &mut ctx).expect("emit ok");
+
+        let func = &ctx.func;
+        let mut select_count = 0usize;
+        for block in func.layout.blocks() {
+            for inst in func.layout.block_insts(block) {
+                if func.dfg.insts[inst].opcode() == Opcode::Select {
+                    select_count += 1;
+                }
+            }
+        }
+        assert_eq!(
+            select_count, 0,
+            "scan-loop path must not emit any select insns; got {select_count}"
+        );
     }
 
     #[test]

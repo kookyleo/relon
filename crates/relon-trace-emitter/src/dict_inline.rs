@@ -123,6 +123,22 @@ const FX_HASH_SEED: i64 = 0xcbf2_9ce4_8422_2325u64 as i64;
 /// `relon_trace_abi::hash::fx_hash_bytes`.
 const FX_HASH_PRIME: i64 = 0x0100_0000_01b3u64 as i64;
 
+/// F-D8-E.7: getter for the FxHash seed value so emitter-side
+/// preheader hoist code can stamp the same i64 constant without
+/// re-importing the private const. Returning a plain `i64` keeps the
+/// constant `const fn`-callable from any module.
+#[inline]
+pub const fn fx_hash_seed_i64() -> i64 {
+    FX_HASH_SEED
+}
+
+/// F-D8-E.7: getter for the FxHash prime multiplier value. See
+/// [`fx_hash_seed_i64`] for the rationale.
+#[inline]
+pub const fn fx_hash_prime_i64() -> i64 {
+    FX_HASH_PRIME
+}
+
 /// Soft cap on `entry_count` for the inline form. Above this the
 /// emitter should fall back to the helper call so the per-trace
 /// machine-code footprint stays bounded. (The IR shape is constant
@@ -131,6 +147,28 @@ const FX_HASH_PRIME: i64 = 0x0100_0000_01b3u64 as i64;
 /// has 10 entries, and even a 64-entry table compiles to a single
 /// tight loop with one load + one cmp + one brif per entry.
 pub const MAX_INLINE_ENTRY_HINT: u32 = 64;
+
+/// F-D8-E.7: cap on `entry_count` for the **fully-unrolled** inline
+/// form. Above this we fall back to the data-driven scan loop.
+///
+/// Empirical perf study (W5 cmp_lua, 10-entry dict, round-robin key
+/// access): unrolling to N=10 makes every outer-loop iteration do N
+/// loads + N icmps + N selects + ~2N-1 bors, regardless of where the
+/// hit lands. The original scan loop terminates at the hit position,
+/// so for uniform round-robin its average work is ~N/2 entries per
+/// iter; that average wins on W5's 10-entry distribution even after
+/// the scan-loop's branch-misprediction cost. The unrolled path is
+/// faster when:
+///   (a) N is small enough that the difference between N and N/2 is
+///       a single load + cmp pair (i.e. N <= 4), or
+///   (b) the recorded access pattern hits the first 1-2 entries
+///       overwhelmingly (then the scan loop wastes branch-predictor
+///       bandwidth re-learning the same prediction).
+/// At N >= 8 with round-robin access the unrolled form regresses by
+/// ~70% on the W5 fixture. Capping the trigger at 4 means small
+/// dicts (e.g. 2-3 entry config structs) get the unroll win while
+/// W5-class loops keep the scan path.
+pub const MAX_INLINE_UNROLL: u32 = 4;
 
 /// Emit the inline body of `__relon_trace_dict_lookup_prechecked`
 /// directly into `builder`. The caller has already verified the
@@ -163,6 +201,30 @@ pub fn emit_dict_lookup_inline(
     emit_dict_lookup_inline_with_entry_count(builder, dict_ptr, key_ptr, deopt_block, None)
 }
 
+/// F-D8-E.7: bundle of optional preheader-hoisted SSAs the inline
+/// scan body can reuse instead of re-emitting per outer-loop
+/// iteration. Each field is `None` when the caller didn't hoist that
+/// particular subexpression; the inline body then falls back to its
+/// per-iter emit. The struct exists so the emitter can grow new
+/// hoisted fields (e.g. `hash_seed`, `hash_prime`, `entries_base`)
+/// without churning the public function signatures every time.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct DictInlineHoists {
+    /// i64 SSA holding the dict's `entry_count` (`load.u32 +
+    /// uextend`). See F-D8-E.5.
+    pub entry_count: Option<ir::Value>,
+    /// i64 SSA holding the FxHash seed (`iconst.i64 FX_HASH_SEED`).
+    /// Hoisting deletes one 10-byte `mov reg, imm64` from the
+    /// per-outer-iter hash-loop preamble.
+    pub hash_seed: Option<ir::Value>,
+    /// i64 SSA holding the FxHash prime multiplier
+    /// (`iconst.i64 FX_HASH_PRIME`). Hoisting deletes one 10-byte
+    /// `mov reg, imm64` from each hash-body iteration — saves
+    /// `key_len + 1` mov-imm64 per outer iter (W5 has 1-byte keys
+    /// → 2 saves per iter).
+    pub hash_prime: Option<ir::Value>,
+}
+
 /// F-D8-E.5 variant of [`emit_dict_lookup_inline`] that accepts a
 /// preheader-hoisted `entry_count` SSA. When `Some`, the inline body
 /// skips the per-iter `load.u32 [dict_ptr+8] + uextend` pair and
@@ -184,6 +246,40 @@ pub fn emit_dict_lookup_inline_with_entry_count(
     deopt_block: ir::Block,
     hoisted_entry_count: Option<ir::Value>,
 ) -> ir::Value {
+    emit_dict_lookup_inline_with_hoists(
+        builder,
+        dict_ptr,
+        key_ptr,
+        deopt_block,
+        DictInlineHoists {
+            entry_count: hoisted_entry_count,
+            hash_seed: None,
+            hash_prime: None,
+        },
+    )
+}
+
+/// F-D8-E.7 superset of [`emit_dict_lookup_inline_with_entry_count`]:
+/// accepts a [`DictInlineHoists`] bundle so the inline body can reuse
+/// preheader-hoisted `entry_count`, `hash_seed`, and `hash_prime`
+/// SSAs instead of re-emitting their `iconst` / `load` ops each
+/// outer-loop iteration.
+///
+/// On x86_64 the `FX_HASH_SEED` and `FX_HASH_PRIME` constants don't
+/// fit in a 32-bit immediate, so each in-body `iconst.i64 imm64`
+/// lowers to a 10-byte `movabs reg, imm64` plus a long-lived
+/// register reservation. Hoisting them to the preheader (where they
+/// emit exactly once per trace entry) shortens the hash-body insn
+/// stream and frees the registers for the hash accumulator and the
+/// scan loop's pointer chase.
+pub fn emit_dict_lookup_inline_with_hoists(
+    builder: &mut FunctionBuilder<'_>,
+    dict_ptr: ir::Value,
+    key_ptr: ir::Value,
+    deopt_block: ir::Block,
+    hoists: DictInlineHoists,
+) -> ir::Value {
+    let hoisted_entry_count = hoists.entry_count;
     // ----- Null-key guard ------------------------------------------------
     let zero = builder.ins().iconst(I64, 0);
     let key_null = builder.ins().icmp(IntCC::Equal, key_ptr, zero);
@@ -215,7 +311,14 @@ pub fn emit_dict_lookup_inline_with_entry_count(
     builder.append_block_param(hash_header, I64); // byte_idx
     builder.append_block_param(hash_header, I64); // accumulator h
     let zero_i64 = builder.ins().iconst(I64, 0);
-    let seed_i64 = builder.ins().iconst(I64, FX_HASH_SEED);
+    // F-D8-E.7: prefer the caller-supplied hoisted seed SSA when
+    // available; otherwise materialise the seed inside the inline
+    // body. The hoisted form must dominate the dict-inline call site
+    // (preheader block, by construction).
+    let seed_i64 = match hoists.hash_seed {
+        Some(v) => v,
+        None => builder.ins().iconst(I64, FX_HASH_SEED),
+    };
     builder.ins().jump(
         hash_header,
         &[BlockArg::Value(zero_i64), BlockArg::Value(seed_i64)],
@@ -242,7 +345,14 @@ pub fn emit_dict_lookup_inline_with_entry_count(
     let b = builder.ins().load(I8, MemFlags::trusted(), byte_addr, 0);
     let b_i64 = builder.ins().uextend(I64, b);
     let xored = builder.ins().bxor(acc_h, b_i64);
-    let prime_v = builder.ins().iconst(I64, FX_HASH_PRIME);
+    // F-D8-E.7: same hoist treatment for FX_HASH_PRIME. Hoisting the
+    // 64-bit immediate avoids re-issuing a `movabs reg, imm64` on
+    // every hash-body iteration; cranelift 0.131's GVN does not
+    // reliably lift `iconst.i64 imm64` across loop bodies.
+    let prime_v = match hoists.hash_prime {
+        Some(v) => v,
+        None => builder.ins().iconst(I64, FX_HASH_PRIME),
+    };
     let next_h = builder.ins().imul(xored, prime_v);
     let one_i64 = builder.ins().iconst(I64, 1);
     let next_idx = builder.ins().iadd(byte_idx, one_i64);
@@ -273,20 +383,38 @@ pub fn emit_dict_lookup_inline_with_entry_count(
             builder.ins().uextend(I64, entry_count_u32)
         }
     };
+    // F-D8-E.7: switch the scan loop from "index + imul + iadd" to
+    // "incremental entry_ptr". The original IR shape lowered the
+    // per-iter address computation to a 3-op sequence — `imul
+    // scan_idx, 16; iadd entries_base, off` — that cranelift's
+    // x86_64 backend folds into a single `lea`, but the multiplier
+    // chain still serialises behind the index update. By carrying
+    // the entry pointer itself across the back-edge and bumping it
+    // by 16 each iter, we get a single `add reg, 16` per iter and
+    // free the `imul` + `iadd` slots. We precompute `entries_end =
+    // entries_base + entry_count * 16` once at scan_init and the
+    // header tests `entry_ptr == entries_end` for termination.
+    //
+    // `entries_base` and `entries_end` stay inside this scan-init
+    // block (not hoisted to the preheader) so the cranelift
+    // x86_64 backend folds the `iadd_imm dict_ptr, 12` into the
+    // first load's displacement when `dict_ptr` is loop-invariant.
     let entries_base = builder.ins().iadd_imm(dict_ptr, 12);
+    let sixteen_init = builder.ins().iconst(I64, 16);
+    let total_bytes = builder.ins().imul(entry_count, sixteen_init);
+    let entries_end = builder.ins().iadd(entries_base, total_bytes);
     builder.seal_block(scan_init);
 
-    // Scan header: carries the current entry index.
+    // Scan header: carries the current entry pointer.
     let scan_header = builder.create_block();
-    builder.append_block_param(scan_header, I64); // scan_idx
-    let scan_seed = builder.ins().iconst(I64, 0);
+    builder.append_block_param(scan_header, I64); // entry_ptr
     builder
         .ins()
-        .jump(scan_header, &[BlockArg::Value(scan_seed)]);
+        .jump(scan_header, &[BlockArg::Value(entries_base)]);
     builder.switch_to_block(scan_header);
-    let scan_idx = builder.block_params(scan_header)[0];
+    let entry_ptr = builder.block_params(scan_header)[0];
 
-    let exhausted = builder.ins().icmp(IntCC::Equal, scan_idx, entry_count);
+    let exhausted = builder.ins().icmp(IntCC::Equal, entry_ptr, entries_end);
     let scan_body = builder.create_block();
     let guard_pc_miss = builder.ins().iconst(I32, 0);
     let ext_pc_miss = builder.ins().iconst(I64, 0);
@@ -300,14 +428,9 @@ pub fn emit_dict_lookup_inline_with_entry_count(
     builder.seal_block(scan_body);
     builder.switch_to_block(scan_body);
 
-    // Each entry is 16 bytes: [u64 hash][i64 value]. Compute the
-    // entry's address from `scan_idx`. cranelift folds the shift
-    // through its register allocator; this is a single `lea` on
-    // x86_64.
-    let sixteen = builder.ins().iconst(I64, 16);
-    let entry_off = builder.ins().imul(scan_idx, sixteen);
-    let entry_addr = builder.ins().iadd(entries_base, entry_off);
-    let entry_hash = builder.ins().load(I64, MemFlags::trusted(), entry_addr, 0);
+    // Each entry is 16 bytes: [u64 hash][i64 value]. Read both off
+    // the current `entry_ptr` (offset 0 and 8 respectively).
+    let entry_hash = builder.ins().load(I64, MemFlags::trusted(), entry_ptr, 0);
     let is_hit = builder.ins().icmp(IntCC::Equal, entry_hash, final_hash);
 
     let hit_block = builder.create_block();
@@ -318,16 +441,15 @@ pub fn emit_dict_lookup_inline_with_entry_count(
 
     // ----- Scan next ----------------------------------------------------
     builder.switch_to_block(scan_next);
-    let one = builder.ins().iconst(I64, 1);
-    let next_scan = builder.ins().iadd(scan_idx, one);
+    let next_ptr = builder.ins().iadd_imm(entry_ptr, 16);
     builder
         .ins()
-        .jump(scan_header, &[BlockArg::Value(next_scan)]);
+        .jump(scan_header, &[BlockArg::Value(next_ptr)]);
     builder.seal_block(scan_header);
 
     // ----- Hit block ----------------------------------------------------
     builder.switch_to_block(hit_block);
-    let value = builder.ins().load(I64, MemFlags::trusted(), entry_addr, 8);
+    let value = builder.ins().load(I64, MemFlags::trusted(), entry_ptr, 8);
 
     // ----- Join ---------------------------------------------------------
     let join_block = builder.create_block();
@@ -336,6 +458,232 @@ pub fn emit_dict_lookup_inline_with_entry_count(
     builder.switch_to_block(join_block);
     builder.seal_block(join_block);
     builder.block_params(join_block)[0]
+}
+
+/// F-D8-E.7 — fully-unrolled inline body of
+/// `__relon_trace_dict_lookup_prechecked` for the case where the
+/// caller knows the dict's entry count is statically `entry_count`
+/// (`<= MAX_INLINE_UNROLL`).
+///
+/// Replaces the data-driven scan-loop in
+/// [`emit_dict_lookup_inline_with_entry_count`] with a straight-line
+/// branch-free chain of N `(load + icmp + select)` triplets. cranelift
+/// 0.131's x86_64 backend lowers each `select.i64` to a single `cmov`,
+/// so a 10-entry W5 dict compiles to 10 `cmov` insns instead of an
+/// average ~5 loop iterations × `(load + cmp + brif + jump)` each. The
+/// dict_scan stop-condition (entry exhaustion → deopt) is replaced by
+/// a single `any_hit` branch at the tail: if no entry matched, deopt;
+/// otherwise carry `result` into the join.
+///
+/// Same key-hash algorithm and same shape contract as
+/// [`emit_dict_lookup_inline`] — the unrolled form only changes the
+/// scan loop, not the hash loop. The hash loop stays loop-shaped
+/// because cranelift can't statically unroll it (`key_len` is a
+/// per-call value), but the W5 hot path's keys are 1 byte long so the
+/// hash loop runs exactly 2 iterations (init + body) and shouldn't be
+/// the bottleneck the unroll targets.
+///
+/// `entry_count` must be `>= 1` and `<= MAX_INLINE_UNROLL`; callers
+/// are responsible for choosing this variant only when both conditions
+/// hold (see `emitter::TraceEmitterState::emit_dict_lookup_prechecked`).
+pub fn emit_dict_lookup_inline_unrolled(
+    builder: &mut FunctionBuilder<'_>,
+    dict_ptr: ir::Value,
+    key_ptr: ir::Value,
+    deopt_block: ir::Block,
+    entry_count: u32,
+) -> ir::Value {
+    debug_assert!(entry_count >= 1);
+    debug_assert!(entry_count <= MAX_INLINE_UNROLL);
+
+    // ----- Null-key guard ------------------------------------------------
+    let zero = builder.ins().iconst(I64, 0);
+    let key_null = builder.ins().icmp(IntCC::Equal, key_ptr, zero);
+    let nonnull = builder.create_block();
+    let guard_pc_null = builder.ins().iconst(I32, 0);
+    let ext_pc_null = builder.ins().iconst(I64, 0);
+    builder.ins().brif(
+        key_null,
+        deopt_block,
+        &[BlockArg::Value(guard_pc_null), BlockArg::Value(ext_pc_null)],
+        nonnull,
+        &[],
+    );
+    builder.seal_block(nonnull);
+    builder.switch_to_block(nonnull);
+
+    // ----- Key payload header -------------------------------------------
+    let key_len_u32 = builder.ins().load(I32, MemFlags::trusted(), key_ptr, 0);
+    let key_len = builder.ins().uextend(I64, key_len_u32);
+    let key_bytes = builder.ins().iadd_imm(key_ptr, 4);
+
+    // ----- Hash loop ----------------------------------------------------
+    // Identical to the data-driven variant — `key_len` is a per-call
+    // input so we can't statically unroll it here, but the loop body
+    // is tight enough that cranelift can keep the accumulator hot.
+    let hash_header = builder.create_block();
+    builder.append_block_param(hash_header, I64); // byte_idx
+    builder.append_block_param(hash_header, I64); // accumulator h
+    let zero_i64 = builder.ins().iconst(I64, 0);
+    let seed_i64 = builder.ins().iconst(I64, FX_HASH_SEED);
+    builder.ins().jump(
+        hash_header,
+        &[BlockArg::Value(zero_i64), BlockArg::Value(seed_i64)],
+    );
+    builder.switch_to_block(hash_header);
+    let byte_idx = builder.block_params(hash_header)[0];
+    let acc_h = builder.block_params(hash_header)[1];
+
+    let hash_done = builder.ins().icmp(IntCC::Equal, byte_idx, key_len);
+    let scan_block = builder.create_block();
+    builder.append_block_param(scan_block, I64); // final hash
+    let hash_body = builder.create_block();
+    builder.ins().brif(
+        hash_done,
+        scan_block,
+        &[BlockArg::Value(acc_h)],
+        hash_body,
+        &[],
+    );
+    builder.seal_block(hash_body);
+    builder.switch_to_block(hash_body);
+
+    let byte_addr = builder.ins().iadd(key_bytes, byte_idx);
+    let b = builder.ins().load(I8, MemFlags::trusted(), byte_addr, 0);
+    let b_i64 = builder.ins().uextend(I64, b);
+    let xored = builder.ins().bxor(acc_h, b_i64);
+    let prime_v = builder.ins().iconst(I64, FX_HASH_PRIME);
+    let next_h = builder.ins().imul(xored, prime_v);
+    let one_i64 = builder.ins().iconst(I64, 1);
+    let next_idx = builder.ins().iadd(byte_idx, one_i64);
+    builder.ins().jump(
+        hash_header,
+        &[BlockArg::Value(next_idx), BlockArg::Value(next_h)],
+    );
+    builder.seal_block(hash_header);
+
+    // ----- Unrolled scan ------------------------------------------------
+    //
+    // For each entry slot `k in 0..entry_count`:
+    //   entry_hash_k = load.u64 [dict_ptr + 12 + k*16 + 0]
+    //   entry_val_k  = load.i64 [dict_ptr + 12 + k*16 + 8]
+    //   hit_k        = icmp.eq entry_hash_k, final_hash
+    //   contrib_k    = select(hit_k, entry_val_k, 0)
+    //
+    // We then reduce the per-entry `contrib` lanes through a balanced
+    // `bor` tree (depth = ceil(log2(N))) so the dependency chain
+    // length is O(log N) instead of O(N). The per-entry `select` /
+    // `icmp` / `load` ops are mutually independent so cranelift's
+    // x86_64 backend (and the CPU's OoO window) can issue them in
+    // parallel. A naive left-fold `value = select(hit_k, val_k, value)`
+    // would emit a chain of N cmov insns whose data dependency forces
+    // serial execution — pessimising the unroll into a slowdown.
+    //
+    // The same shape applies to `any_hit`: build a parallel array of
+    // `hit_k` bits and reduce them via a `bor` tree.
+    //
+    // The `iadd_imm` per-entry stays inside this block; cranelift's
+    // x86_64 displacement folding collapses
+    // `load [dict_ptr + 12 + k*16 + 0]` (a 32-bit displacement) into a
+    // single `mov` per load — no separate `lea` needed.
+    //
+    // Tie-breaking on hash collisions: the IR guarantees each dict
+    // shape pins a unique key set; the `DictShapeGuard` upstream
+    // verifies that pin at runtime. So at most ONE entry's hash can
+    // equal `final_hash` — `or` of all `contrib_k` therefore yields
+    // exactly the hit's value (or 0 on miss).
+    builder.switch_to_block(scan_block);
+    let final_hash = builder.block_params(scan_block)[0];
+    builder.seal_block(scan_block);
+
+    // Stage 1: independent per-entry compute lanes.
+    let zero_acc = builder.ins().iconst(I64, 0);
+    let mut hits: Vec<ir::Value> = Vec::with_capacity(entry_count as usize);
+    let mut contribs: Vec<ir::Value> = Vec::with_capacity(entry_count as usize);
+    for k in 0..entry_count {
+        let base_off = 12i32 + (k as i32) * 16;
+        let hash_off = base_off; // + 0
+        let val_off = base_off + 8;
+        let entry_hash = builder
+            .ins()
+            .load(I64, MemFlags::trusted(), dict_ptr, hash_off);
+        let entry_val = builder
+            .ins()
+            .load(I64, MemFlags::trusted(), dict_ptr, val_off);
+        let hit = builder.ins().icmp(IntCC::Equal, entry_hash, final_hash);
+        let contrib = builder.ins().select(hit, entry_val, zero_acc);
+        hits.push(hit);
+        contribs.push(contrib);
+    }
+
+    // Stage 2: balanced `bor` tree reduction over `contribs` and
+    // `hits`. Reduces dependency chain length from N to ceil(log2(N)).
+    // For W5 (N=10) this is 4 levels.
+    let value_acc = bor_tree_reduce_i64(builder, &contribs);
+    // `hit` lanes are i8 (icmp result); reduce them via i8 `bor` too.
+    let any_hit = bor_tree_reduce_i8(builder, &hits);
+
+    // Tail: branch on whether any entry hit.
+    let hit_block = builder.create_block();
+    builder.append_block_param(hit_block, I64);
+    let guard_pc_miss = builder.ins().iconst(I32, 0);
+    let ext_pc_miss = builder.ins().iconst(I64, 0);
+    builder.ins().brif(
+        any_hit,
+        hit_block,
+        &[BlockArg::Value(value_acc)],
+        deopt_block,
+        &[BlockArg::Value(guard_pc_miss), BlockArg::Value(ext_pc_miss)],
+    );
+    builder.switch_to_block(hit_block);
+    builder.seal_block(hit_block);
+    builder.block_params(hit_block)[0]
+}
+
+/// Reduce a slice of i64 lanes through a balanced `bor` tree. The
+/// caller guarantees that at most one lane is non-zero (the others
+/// are all zero contribs), so `or` is equivalent to "pick the unique
+/// non-zero lane (or 0 if none matched)". A balanced tree keeps the
+/// dependency chain at `ceil(log2(lanes.len()))`, which is the lever
+/// for unroll perf — a left-fold would serialise the whole chain.
+fn bor_tree_reduce_i64(builder: &mut FunctionBuilder<'_>, lanes: &[ir::Value]) -> ir::Value {
+    debug_assert!(!lanes.is_empty(), "bor_tree_reduce_i64 requires ≥1 lane");
+    let mut level: Vec<ir::Value> = lanes.to_vec();
+    while level.len() > 1 {
+        let mut next: Vec<ir::Value> = Vec::with_capacity(level.len().div_ceil(2));
+        let mut i = 0;
+        while i + 1 < level.len() {
+            let merged = builder.ins().bor(level[i], level[i + 1]);
+            next.push(merged);
+            i += 2;
+        }
+        if i < level.len() {
+            next.push(level[i]); // odd lane carried over to next round
+        }
+        level = next;
+    }
+    level[0]
+}
+
+/// i8 variant of [`bor_tree_reduce_i64`]. Used for the `any_hit`
+/// reduction over `icmp` (i8) results.
+fn bor_tree_reduce_i8(builder: &mut FunctionBuilder<'_>, lanes: &[ir::Value]) -> ir::Value {
+    debug_assert!(!lanes.is_empty(), "bor_tree_reduce_i8 requires ≥1 lane");
+    let mut level: Vec<ir::Value> = lanes.to_vec();
+    while level.len() > 1 {
+        let mut next: Vec<ir::Value> = Vec::with_capacity(level.len().div_ceil(2));
+        let mut i = 0;
+        while i + 1 < level.len() {
+            let merged = builder.ins().bor(level[i], level[i + 1]);
+            next.push(merged);
+            i += 2;
+        }
+        if i < level.len() {
+            next.push(level[i]);
+        }
+        level = next;
+    }
+    level[0]
 }
 
 #[cfg(test)]
@@ -401,6 +749,89 @@ mod tests {
     /// for the constants — drift would silently turn IC lookups into
     /// deopts. Compare the constants directly so a refactor that
     /// shifts one side surfaces here.
+    /// Build a function around `emit_dict_lookup_inline_unrolled` with
+    /// a static N. We use the same wrapper shape so both inline
+    /// variants can share the verifier-side smoke test.
+    fn build_test_fn_unrolled(entry_count: u32) -> Function {
+        let mut sig = Signature::new(CallConv::SystemV);
+        sig.params.push(AbiParam::new(I64));
+        sig.params.push(AbiParam::new(I64));
+        sig.returns.push(AbiParam::new(I64));
+        let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig);
+
+        let mut bcx = FunctionBuilderContext::new();
+        let mut builder = FunctionBuilder::new(&mut func, &mut bcx);
+
+        let entry = builder.create_block();
+        builder.append_block_params_for_function_params(entry);
+        builder.switch_to_block(entry);
+        builder.seal_block(entry);
+
+        let dict_ptr = builder.block_params(entry)[0];
+        let key_ptr = builder.block_params(entry)[1];
+
+        let deopt = builder.create_block();
+        builder.append_block_param(deopt, I32);
+        builder.append_block_param(deopt, I64);
+
+        let value =
+            emit_dict_lookup_inline_unrolled(&mut builder, dict_ptr, key_ptr, deopt, entry_count);
+        builder.ins().return_(&[value]);
+
+        builder.switch_to_block(deopt);
+        builder.seal_block(deopt);
+        let sentinel = builder.ins().iconst(I64, -1);
+        builder.ins().return_(&[sentinel]);
+
+        builder.finalize();
+        func
+    }
+
+    /// F-D8-E.7: the fully-unrolled inline form must produce well-
+    /// formed cranelift IR for both small (W5 = 10) and the corner
+    /// cases at the edges of `MAX_INLINE_UNROLL`.
+    #[test]
+    fn emit_unrolled_produces_valid_cranelift_ir_for_n_1_to_max() {
+        let mut flag_builder = settings::builder();
+        flag_builder.set("opt_level", "speed").unwrap();
+        let flags = settings::Flags::new(flag_builder);
+        // Cover the supported `entry_count` range up through the
+        // MAX_INLINE_UNROLL cap inclusive. The fixture loop will
+        // grow / shrink alongside the cap if a future tuning round
+        // adjusts it.
+        for n in [
+            1u32,
+            2,
+            MAX_INLINE_UNROLL.saturating_sub(1).max(1),
+            MAX_INLINE_UNROLL,
+        ] {
+            let func = build_test_fn_unrolled(n);
+            verify_function(&func, &flags)
+                .unwrap_or_else(|e| panic!("unrolled IR (n={n}) must verify: {e:?}"));
+        }
+    }
+
+    /// F-D8-E.7: the unrolled form must contain N `select` insns —
+    /// one per entry slot in the cmov chain. Walk all insts via the
+    /// layout's block iteration and count `Opcode::Select`.
+    #[test]
+    fn emit_unrolled_emits_n_select_insns() {
+        let n = 4u32;
+        let func = build_test_fn_unrolled(n);
+        let mut select_count = 0usize;
+        for block in func.layout.blocks() {
+            for inst in func.layout.block_insts(block) {
+                if func.dfg.insts[inst].opcode() == cranelift_codegen::ir::Opcode::Select {
+                    select_count += 1;
+                }
+            }
+        }
+        assert_eq!(
+            select_count, n as usize,
+            "unrolled body for n={n} must emit exactly {n} select insns; got {select_count}"
+        );
+    }
+
     #[test]
     fn fx_hash_constants_match_relon_trace_abi() {
         // SEED / PRIME are private in `relon-trace-abi`, but their

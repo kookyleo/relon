@@ -38,7 +38,16 @@ pub enum SubscriptKind {
     /// Lower onto `RecorderState::emit_dict_lookup`. `inputs[1]` carries
     /// the dict pointer SSA, `inputs[0]` carries the key pointer SSA.
     /// `shape_hash` flows verbatim into the resulting `TraceOp::DictLookup`.
-    DictLookup { shape_hash: u64 },
+    ///
+    /// F-D8-E.7: `entry_count_hint` — when the IR-level
+    /// `Op::DictGetByStringKey` carried a static `entry_count_hint`,
+    /// forward it so the recorder can stash the value in the buffer's
+    /// `dict_entry_count_hints` side table, keyed by the dict_ptr SSA.
+    /// `None` keeps the legacy data-driven scan-loop emitter path.
+    DictLookup {
+        shape_hash: u64,
+        entry_count_hint: Option<u32>,
+    },
 }
 
 /// What the lowering pass wants the recorder to do for a given op.
@@ -311,6 +320,7 @@ pub fn lower_op(op: &Op, cx: OpLoweringContext<'_>) -> LowerOutcome {
         Op::DictGetByStringKey {
             shape_hash,
             value_ty,
+            entry_count_hint,
         } => {
             // Operand stack at call time: `[..., dict_ptr, key_ptr]`.
             // The recorder's apply_outcome arm peels both SSAs off
@@ -326,6 +336,7 @@ pub fn lower_op(op: &Op, cx: OpLoweringContext<'_>) -> LowerOutcome {
             LowerOutcome::SubscriptDispatch {
                 kind: SubscriptKind::DictLookup {
                     shape_hash: *shape_hash,
+                    entry_count_hint: *entry_count_hint,
                 },
                 ty_hint: ty_to_observed(*value_ty),
             }
@@ -1327,19 +1338,49 @@ mod tests {
             &Op::DictGetByStringKey {
                 shape_hash: 0xfeed_face_dead_beef,
                 value_ty: IrType::I64,
+                entry_count_hint: None,
             },
             cx_with(&inputs, SsaVar(99)),
         );
         match outcome {
             LowerOutcome::SubscriptDispatch { kind, ty_hint } => {
                 match kind {
-                    SubscriptKind::DictLookup { shape_hash } => {
+                    SubscriptKind::DictLookup {
+                        shape_hash,
+                        entry_count_hint,
+                    } => {
                         assert_eq!(shape_hash, 0xfeed_face_dead_beef);
+                        assert!(entry_count_hint.is_none());
                     }
                     other => panic!("expected DictLookup, got {:?}", other),
                 }
                 assert_eq!(ty_hint, ObservedType::I64);
             }
+            other => panic!("expected SubscriptDispatch, got {:?}", other),
+        }
+    }
+
+    /// F-D8-E.7: when the IR carries an entry_count_hint, the lowering
+    /// rule must forward it verbatim so the recorder can stash it in
+    /// the buffer's `dict_entry_count_hints` side table.
+    #[test]
+    fn dict_get_by_string_key_forwards_entry_count_hint() {
+        let inputs = [SsaVar(21), SsaVar(11)];
+        let outcome = lower_op(
+            &Op::DictGetByStringKey {
+                shape_hash: 0xabc,
+                value_ty: IrType::I64,
+                entry_count_hint: Some(10),
+            },
+            cx_with(&inputs, SsaVar(99)),
+        );
+        match outcome {
+            LowerOutcome::SubscriptDispatch { kind, .. } => match kind {
+                SubscriptKind::DictLookup {
+                    entry_count_hint, ..
+                } => assert_eq!(entry_count_hint, Some(10)),
+                other => panic!("expected DictLookup, got {:?}", other),
+            },
             other => panic!("expected SubscriptDispatch, got {:?}", other),
         }
     }
@@ -1371,6 +1412,7 @@ mod tests {
             &Op::DictGetByStringKey {
                 shape_hash: 0,
                 value_ty: IrType::I64,
+                entry_count_hint: None,
             },
             cx_with(&inputs, SsaVar(99)),
         );

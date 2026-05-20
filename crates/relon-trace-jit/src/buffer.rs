@@ -70,6 +70,24 @@ pub struct TraceBuffer {
     /// preheader and the per-iter cost drops to just the inline
     /// memchr/byte scan.
     pub str_payload: HashMap<SsaVar, (SsaVar, SsaVar)>,
+    /// F-D8-E.7: dict static-entry-count hint side table. Maps a
+    /// dict_ptr SSA (the same SSA that flows into the matching
+    /// `TraceOp::DictLookup` / `DictLookupPrechecked`) to the
+    /// statically known number of entries in the dict literal.
+    ///
+    /// Populated by [`crate::RecorderState::emit_dict_lookup_with_hint`]
+    /// when the source-level `Op::DictGetByStringKey` carried a
+    /// `entry_count_hint`; consumed by the trace-emitter to switch
+    /// the `DictLookupPrechecked` lowering from a data-driven scan
+    /// loop into a fully-unrolled cmov chain when the entry count is
+    /// small (≤ `MAX_INLINE_UNROLL` in dict_inline.rs).
+    ///
+    /// Why this is safe: the value is a static IR hint — the dict's
+    /// `DictShapeGuard` runs upstream and verifies the shape hash,
+    /// which by construction pins the key set (and hence the entry
+    /// count). A mismatch deopts at the shape guard before the
+    /// unrolled lookup reads anything from the entry table.
+    pub dict_entry_count_hints: HashMap<SsaVar, u32>,
     next_ssa: u32,
 }
 
@@ -134,6 +152,13 @@ impl TraceBuffer {
         self.str_payload.insert(haystack, (ptr_ssa, len_ssa));
     }
 
+    /// F-D8-E.7: stash the static `entry_count` hint for the dict
+    /// whose pointer is held by `dict_ptr`. See
+    /// [`Self::dict_entry_count_hints`].
+    pub fn record_dict_entry_count_hint(&mut self, dict_ptr: SsaVar, entry_count: u32) {
+        self.dict_entry_count_hints.insert(dict_ptr, entry_count);
+    }
+
     /// Convenience: how many ops the buffer currently holds.
     pub fn op_count(&self) -> usize {
         self.ops.len()
@@ -154,6 +179,7 @@ impl TraceBuffer {
             consts: self.consts,
             const_bytes: self.const_bytes,
             str_payload: self.str_payload,
+            dict_entry_count_hints: self.dict_entry_count_hints,
             ssa_high_water: self.next_ssa,
         }
     }
@@ -177,6 +203,9 @@ pub struct OptimizedTrace {
     /// F-D7-H: StringRef payload pre-load side table — see
     /// [`TraceBuffer::str_payload`].
     pub str_payload: HashMap<SsaVar, (SsaVar, SsaVar)>,
+    /// F-D8-E.7: dict static-entry-count hint side table — see
+    /// [`TraceBuffer::dict_entry_count_hints`].
+    pub dict_entry_count_hints: HashMap<SsaVar, u32>,
     pub ssa_high_water: u32,
 }
 
@@ -204,6 +233,15 @@ impl OptimizedTrace {
     /// to switch the inline scan onto `HaystackHandle::Preloaded`.
     pub fn str_payload_for(&self, var: SsaVar) -> Option<(SsaVar, SsaVar)> {
         self.str_payload.get(&var).copied()
+    }
+
+    /// F-D8-E.7: lookup the static dict `entry_count` hint bound to
+    /// `dict_ptr`, if any. The emitter uses this on
+    /// `TraceOp::DictLookupPrechecked` to switch between an unrolled
+    /// `n`-cmov chain (when `n <= MAX_INLINE_UNROLL`) and the legacy
+    /// data-driven scan loop.
+    pub fn dict_entry_count_hint(&self, dict_ptr: SsaVar) -> Option<u32> {
+        self.dict_entry_count_hints.get(&dict_ptr).copied()
     }
 
     /// Side tables only, exposed so callers can round-trip the parts
