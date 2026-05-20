@@ -29,11 +29,14 @@
 pub mod ast;
 pub mod cst;
 pub mod directive;
+pub mod fast_path;
 pub mod lex;
 pub mod lower;
 pub mod source;
 pub mod syntax;
 pub mod token;
+
+pub use fast_path::parse_document_fast;
 
 pub use token::*;
 

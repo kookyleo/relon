@@ -237,7 +237,30 @@ fn main() -> miette::Result<()> {
             // tree-walker's per-method-dispatch surface never enters
             // trivial-`#main` bodies, so skipping carrier injection
             // is observationally invisible.
-            let trivial_default = !lite && relon::is_trivial_scalar_main(&content);
+            //
+            // v6-fix-D2-I (this stage): replace the previous
+            // double-parse — first inside `is_trivial_scalar_main`,
+            // then again inside the lite branch's
+            // `relon_parser::parse_document` — with a single attempt
+            // at the cold-start fast path. `parse_document_fast` only
+            // accepts the trivial-scalar `#main` envelope; success
+            // both confirms triviality *and* yields the parsed Node
+            // the lite branch needs. Cache the result here so neither
+            // the classifier nor the lite-parse pays a second parse.
+            let prelite_node = if !lite {
+                relon_parser::parse_document_fast(&content)
+            } else {
+                // `--lite` already opts the operator into the
+                // tree-walker; still try the fast path so the
+                // explicit `--lite` invocation also avoids the
+                // rowan CST construction on trivial sources.
+                relon_parser::parse_document_fast(&content)
+            };
+            let trivial_default = !lite
+                && match &prelite_node {
+                    Some(node) => relon::is_trivial_scalar_main_node(node),
+                    None => relon::is_trivial_scalar_main(&content),
+                };
             phase("trivial_classify");
             let lite_analyze = lite || trivial_default;
             let analyze_options = AnalyzeOptions {
@@ -289,7 +312,15 @@ fn main() -> miette::Result<()> {
             // to the full workspace path so cross-module diagnostics
             // keep their teeth.
             let workspace = if lite_analyze {
-                match relon_parser::parse_document(&content) {
+                // v6-fix-D2-I: reuse the fast-path Node if the
+                // pre-classify attempt accepted; otherwise fall back
+                // to the rowan/CST `parse_document`. Either way the
+                // lite branch sees one parsed `Node` — no double-parse.
+                let parsed = match prelite_node {
+                    Some(node) => Ok(node),
+                    None => relon_parser::parse_document(&content),
+                };
+                match parsed {
                     Ok(node) => {
                         phase("[lite] parse_only");
                         let arc_node = Arc::new(node);
@@ -460,7 +491,21 @@ fn main() -> miette::Result<()> {
                 }
                 Arc::new({
                     let mut ctx = ctx;
-                    relon_evaluator::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+                    // v6-fix-D2-I: the trivial-scalar `#main` envelope
+                    // never dispatches into stdlib / decorators /
+                    // prelude — `is_trivial_scalar_main` rejects any
+                    // fn call, dict literal, schema, `#import`. Skip
+                    // the ~86 HashMap inserts + Arc allocations the
+                    // full `prepare_in_place` performs on the trivial
+                    // path. Both `lite` (operator opt-in) and
+                    // `trivial_default` (auto-detected) go through
+                    // the same classifier guard, so they share the
+                    // lite-prep shortcut.
+                    if lite_analyze {
+                        relon_evaluator::TreeWalkEvaluator::prepare_in_place_lite(&mut ctx);
+                    } else {
+                        relon_evaluator::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+                    }
                     ctx
                 })
             };
