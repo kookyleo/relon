@@ -33,6 +33,7 @@ pub mod ir;
 pub mod lowering;
 pub mod normalization;
 pub mod normalization_data;
+pub mod shape_hash;
 pub mod stdlib;
 pub mod whitespace;
 

@@ -181,43 +181,13 @@ pub unsafe extern "C" fn __relon_trace_dict_lookup(
     DICT_LOOKUP_DEOPT
 }
 
-/// Hash a `[len: u32 LE][utf8...]` String record with FxHash64.
-///
-/// Pulled out so the bench fixtures can pre-compute the per-key hash
-/// at fixture-build time and stamp it into the dict's entry table.
-///
-/// # Safety
-///
-/// `key_ptr` must point at a layout-conformant String record with
-/// `len + 4` valid bytes.
-pub unsafe fn fx_hash_key_record(key_ptr: *const u8) -> u64 {
-    // SAFETY: caller contract.
-    let len = unsafe { (key_ptr as *const u32).read_unaligned() } as usize;
-    let bytes = unsafe { std::slice::from_raw_parts(key_ptr.add(4), len) };
-    fx_hash_bytes(bytes)
-}
-
-/// FxHash64 over a byte slice. Pulled from the canonical FxHash
-/// reference impl; deterministic across runs / threads so the bench
-/// can pre-stamp expected hashes into fixtures.
-///
-/// Not exposed as the default `std::hash::Hasher` impl because
-/// `std::hash::Hasher` is `&mut self` and we want a stateless
-/// pure-function call site here.
-pub fn fx_hash_bytes(bytes: &[u8]) -> u64 {
-    const SEED: u64 = 0xcbf2_9ce4_8422_2325;
-    const PRIME: u64 = 0x0100_0000_01b3;
-    // FxHash's actual constants — chosen for good single-byte
-    // dispersal on x86. The exact constants don't affect correctness;
-    // any 64-bit hash with reasonable distribution suffices for IC
-    // tagging.
-    let mut h: u64 = SEED;
-    for &b in bytes {
-        h ^= u64::from(b);
-        h = h.wrapping_mul(PRIME);
-    }
-    h
-}
+// Re-exported from `relon-trace-abi` so the producer side (an
+// analyzer / IR pass that pre-stamps `Op::DictGetByStringKey::shape_hash`)
+// and the consumer side (this runtime's IC dispatch) share the same
+// canonical FxHash impl. Implementing the algorithm twice would risk
+// silent IC misses; centralising in `relon-trace-abi` keeps both
+// callers locked to the same bytes.
+pub use relon_trace_abi::hash::{fx_hash_bytes, fx_hash_key_record};
 
 /// Convenience constructor: layout-conformant String record for unit
 /// tests + bench fixtures. Returns a `Vec<u8>` whose first 4 bytes

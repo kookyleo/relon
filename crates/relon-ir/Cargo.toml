@@ -19,6 +19,11 @@ relon-analyzer = { workspace = true }
 # by Phase 2.b to package `#main` params into a 1-record schema and
 # resolve field offsets for `Op::LoadField` / `Op::StoreField`.
 relon-eval-api = { workspace = true }
+# Canonical FxHash (`fx_hash_bytes`) for `Op::DictGetByStringKey::shape_hash`
+# producers. Centralised in `relon-trace-abi` so analyzer / IR side and
+# trace-jit runtime side stamp/dispatch with identical hashes — drift
+# would silently turn every IC lookup into a miss.
+relon-trace-abi = { workspace = true }
 
 thiserror = { workspace = true }
 miette = { workspace = true }

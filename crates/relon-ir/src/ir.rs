@@ -424,10 +424,18 @@ pub enum Op {
     /// dict's hash table but does not mutate it; the recorder treats
     /// this exactly like a `LoadField`.
     DictGetByStringKey {
-        /// FxHash fingerprint of the dict's key set, computed at the
-        /// site where the subscript pattern was recognised. Carried
-        /// inline so the recorder can stamp it onto the resulting
-        /// `TraceOp::DictLookup`'s IC slot without re-hashing.
+        /// FxHash fingerprint of the dict's key set. **Producers MUST
+        /// derive this via [`crate::shape_hash::shape_hash_for_keys`]**
+        /// — the helper routes through the canonical FxHash impl in
+        /// `relon-trace-abi::hash::fx_hash_bytes`, which is the same
+        /// function `relon_trace_jit::runtime::dict_list` calls at
+        /// dispatch time to compute the runtime key's hash. Any
+        /// independent re-implementation of the algorithm would
+        /// silently turn every IC lookup into a miss.
+        ///
+        /// Carried inline so the recorder can stamp it onto the
+        /// resulting `TraceOp::DictLookup`'s IC slot without
+        /// re-hashing at trace-record time.
         shape_hash: u64,
         /// IR type of the dict's value side. Drives the recorder's
         /// `ObservedType` hint for the dst SSA so subsequent TypeCheck

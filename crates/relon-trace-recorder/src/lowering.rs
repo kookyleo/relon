@@ -543,6 +543,20 @@ const STDLIB_IDX_SUBSTRING: u32 = 9;
 /// [`record_method_call_contains`](crate::RecorderState::record_method_call_contains))
 /// can route through the same fast path the F-D7-C inline emit
 /// already supports.
+///
+/// **Drift guard.** The `stdlib_index_consistency` test below cross-
+/// checks `stdlib_function_index("contains")` against this constant
+/// on every workspace test run. The two states the test allows are:
+///
+/// 1. `stdlib_function_index("contains") == None` (current pre-F-D7-D
+///    state): nothing to drift against; test passes.
+/// 2. `stdlib_function_index("contains") == Some(STDLIB_IDX_CONTAINS)`:
+///    F-D7-D registered the body at the expected slot; test passes.
+///
+/// Any other state — `Some(other)` — fails the test, blocking F-D7-D
+/// from landing without updating either this constant or the bundle
+/// order. The same guard exists for [`STDLIB_IDX_CONCAT`] and
+/// [`STDLIB_IDX_SUBSTRING`], which are already-registered slots.
 pub const STDLIB_IDX_CONTAINS: u32 = 36;
 
 fn lower_string_call(fn_index: u32, cx: &OpLoweringContext<'_>) -> Option<LowerOutcome> {
@@ -739,6 +753,46 @@ mod tests {
 
     fn cx_with(inputs: &[SsaVar], dst: SsaVar) -> OpLoweringContext<'_> {
         OpLoweringContext::new(inputs, dst)
+    }
+
+    /// Drift guard for the [`STDLIB_IDX_CONCAT`] / [`STDLIB_IDX_SUBSTRING`]
+    /// / [`STDLIB_IDX_CONTAINS`] constants in this module. Each
+    /// constant is the position the recorder expects the matching
+    /// stdlib body to occupy in `relon_ir::stdlib::builtin_stdlib`.
+    /// Re-ordering the bundle without bumping the constant would
+    /// silently route a different op through the trace-JIT fast path
+    /// (or fail to route at all). This test pins the contract.
+    ///
+    /// Each constant has two acceptable states: the body is either
+    /// not registered (lookup returns `None`, pre-F-D7-D for
+    /// `contains`), or registered at exactly the constant's slot.
+    /// Any other state — `Some(other)` — is a real drift and fails
+    /// the test loudly, blocking the offending bundle change.
+    #[test]
+    fn stdlib_index_consistency() {
+        for (name, expected) in [
+            ("concat", STDLIB_IDX_CONCAT),
+            ("substring", STDLIB_IDX_SUBSTRING),
+            ("contains", STDLIB_IDX_CONTAINS),
+        ] {
+            match relon_ir::stdlib::stdlib_function_index(name) {
+                None => {
+                    // Not yet registered — F-D7-D is expected to land
+                    // `contains` at index `STDLIB_IDX_CONTAINS`. Print
+                    // a note so the test log makes the pre-F-D7-D
+                    // state visible; concat / substring should not hit
+                    // this branch today (they are already registered).
+                    eprintln!(
+                        "note: stdlib `{name}` not registered yet; expected to land at index {expected}"
+                    );
+                }
+                Some(actual) if actual == expected => {}
+                Some(actual) => panic!(
+                    "stdlib `{name}` is at index {actual} but the recorder constant pins it to {expected}. \
+                     Either rebase the constant or restore the bundle ordering."
+                ),
+            }
+        }
     }
 
     #[test]

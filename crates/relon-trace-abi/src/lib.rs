@@ -55,6 +55,7 @@ pub mod deopt;
 pub mod effect;
 pub mod entry;
 pub mod external;
+pub mod hash;
 pub mod observed;
 
 pub use context::{
@@ -64,4 +65,5 @@ pub use deopt::{DeoptStateSnapshot, RecoverableWriteRecord};
 pub use effect::EffectClass;
 pub use entry::{AbiSignature, AbiType, TraceEntryStatus, TRACE_ENTRY_SIG};
 pub use external::{ExternalAddr, ExternalPc, ExternalSlot};
+pub use hash::{fx_hash_bytes, fx_hash_key_record};
 pub use observed::ObservedType;
