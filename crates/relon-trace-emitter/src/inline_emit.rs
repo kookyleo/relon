@@ -358,26 +358,65 @@ impl<'a, 'b> InlineEmitterState<'a, 'b> {
     }
 
     /// F-D8-E.1: `Mod` mirrors `emit_div` — divisor-zero pre-check
-    /// + `srem`. Signed remainder, matches Relon `Int` semantics.
+    /// then `i64::MIN srem -1` pre-check, then `srem`. Signed remainder,
+    /// matches Relon `Int` semantics.
+    ///
+    /// Both pre-checks are required: without the MIN/-1 guard `srem`
+    /// would execute UB. Without seeding `overflow_bits` here the
+    /// recorder's `Guard(ArithOverflow(dst))` would fall through to
+    /// the constant-0 predicate the fallback uses for I64 observed
+    /// types, forcing ordinary inputs like `47 % 10` to deopt on every
+    /// iter. The const-0 seed below is the correct value: the two
+    /// pre-checks above prove `srem` runs only on safe input, so the
+    /// guard truly cannot overflow.
     fn emit_mod(&mut self, dst: SsaVar, a: SsaVar, b: SsaVar) -> Result<(), InlineEmitError> {
         let va = self.lookup(a)?;
         let vb = self.lookup(b)?;
+
+        // (1) Divisor-zero.
         let zero = self.builder.ins().iconst(I64, 0);
         let nonzero = self.builder.ins().icmp(IntCC::NotEqual, vb, zero);
-        let ok_block = self.builder.create_block();
+        let nonzero_block = self.builder.create_block();
         let guard_pc = self.builder.ins().iconst(I32, 0);
         let external_pc = self.builder.ins().iconst(I64, 0);
         self.builder.ins().brif(
             nonzero,
-            ok_block,
+            nonzero_block,
             &[],
             self.deopt_block,
             &[BlockArg::Value(guard_pc), BlockArg::Value(external_pc)],
         );
-        self.builder.seal_block(ok_block);
-        self.builder.switch_to_block(ok_block);
+        self.builder.seal_block(nonzero_block);
+        self.builder.switch_to_block(nonzero_block);
+
+        // (2) i64::MIN % -1 (the lone `srem` overflow case).
+        let min_v = self.builder.ins().iconst(I64, i64::MIN);
+        let neg_one = self.builder.ins().iconst(I64, -1);
+        let lhs_is_min = self.builder.ins().icmp(IntCC::Equal, va, min_v);
+        let rhs_is_neg_one = self.builder.ins().icmp(IntCC::Equal, vb, neg_one);
+        let overflows = self.builder.ins().band(lhs_is_min, rhs_is_neg_one);
+        let safe_block = self.builder.create_block();
+        let of_guard_pc = self.builder.ins().iconst(I32, 0);
+        let of_external_pc = self.builder.ins().iconst(I64, 0);
+        self.builder.ins().brif(
+            overflows,
+            self.deopt_block,
+            &[
+                BlockArg::Value(of_guard_pc),
+                BlockArg::Value(of_external_pc),
+            ],
+            safe_block,
+            &[],
+        );
+        self.builder.seal_block(safe_block);
+        self.builder.switch_to_block(safe_block);
+
         let r = self.builder.ins().srem(va, vb);
         self.bind(dst, r);
+        // Seed `overflow_bits` — the two pre-checks guarantee no
+        // overflow can reach the `Guard(ArithOverflow(dst))` predicate.
+        let of_bit = self.builder.ins().iconst(I32, 0);
+        self.overflow_bits.insert(dst, of_bit);
         Ok(())
     }
 

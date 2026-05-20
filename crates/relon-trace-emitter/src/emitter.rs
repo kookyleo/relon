@@ -520,26 +520,56 @@ impl<'a, 'b> TraceEmitterState<'a, 'b> {
         let va = self.lookup(a)?;
         let vb = self.lookup(b)?;
 
-        // Divisor-zero pre-check: deopt with synthetic trace_pc /
+        // (1) Divisor-zero pre-check: deopt with synthetic trace_pc /
         // external_pc = 0 if the recorder did not stamp a real
         // GuardSite (parity with `emit_div`).
         let zero = self.builder.ins().iconst(I64, 0);
-        let nonzero = self.builder.ins().icmp(IntCC::NotEqual, vb, zero);
-        let ok_block = self.builder.create_block();
+        let nonzero_b = self.builder.ins().icmp(IntCC::NotEqual, vb, zero);
+        let nonzero_block = self.builder.create_block();
         let guard_pc = self.builder.ins().iconst(I32, 0);
         let external_pc = self.builder.ins().iconst(I64, 0);
         self.builder.ins().brif(
-            nonzero,
-            ok_block,
+            nonzero_b,
+            nonzero_block,
             &[],
             self.deopt_block,
             &[BlockArg::Value(guard_pc), BlockArg::Value(external_pc)],
         );
-        self.builder.seal_block(ok_block);
-        self.builder.switch_to_block(ok_block);
+        self.builder.seal_block(nonzero_block);
+        self.builder.switch_to_block(nonzero_block);
+
+        // (2) Overflow pre-check: `i64::MIN srem -1` is the lone overflow
+        // case for `srem`. Without an explicit guard the recorder's
+        // `Guard(ArithOverflow(dst))` collapsed to "always pass" via the
+        // const-0 overflow_bit seed below, so a MIN%-1 trace would skip
+        // the deopt and produce UB at runtime. Materialise the predicate
+        // here so the deopt fires before `srem` runs on the unsafe pair.
+        let min_v = self.builder.ins().iconst(I64, i64::MIN);
+        let neg_one = self.builder.ins().iconst(I64, -1);
+        let lhs_is_min = self.builder.ins().icmp(IntCC::Equal, va, min_v);
+        let rhs_is_neg_one = self.builder.ins().icmp(IntCC::Equal, vb, neg_one);
+        let overflows = self.builder.ins().band(lhs_is_min, rhs_is_neg_one);
+        let safe_block = self.builder.create_block();
+        let of_guard_pc = self.builder.ins().iconst(I32, 0);
+        let of_external_pc = self.builder.ins().iconst(I64, 0);
+        self.builder.ins().brif(
+            overflows,
+            self.deopt_block,
+            &[
+                BlockArg::Value(of_guard_pc),
+                BlockArg::Value(of_external_pc),
+            ],
+            safe_block,
+            &[],
+        );
+        self.builder.seal_block(safe_block);
+        self.builder.switch_to_block(safe_block);
 
         let r = self.builder.ins().srem(va, vb);
         self.bind(dst, r);
+        // The two pre-checks above prove no overflow can reach `srem`,
+        // so the recorder's `Guard(ArithOverflow(dst))` (if any) can
+        // legitimately collapse to a constant pass.
         let of_bit = self.builder.ins().iconst(I32, 0);
         self.overflow_bits.insert(dst, of_bit);
         Ok(())
