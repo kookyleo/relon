@@ -920,6 +920,12 @@ impl TraceJitState {
             ir = %ctx.func.display(),
             "trace cranelift IR ready for module install"
         );
+        if std::env::var_os("RELON_DUMP_TRACE_IR").is_some() {
+            eprintln!(
+                "=== trace fn_id={fn_id} IR ===\n{}=== end ===",
+                ctx.func.display()
+            );
+        }
 
         // 4. Declare + define the function inside the trace JIT
         //    module, then finalize and resolve the function pointer.
