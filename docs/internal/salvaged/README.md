@@ -11,9 +11,13 @@ and risks future devs applying a stale patch to a moved-on tree.
 
 ## Current contents
 
-| File | Source | Removable when |
-|---|---|---|
-| `F-D9-cmp_lua-958LoC.patch` | F-D9 cmp_lua trace-JIT wiring; agent `ae896e6238a60836b` API-529 termination | F-D7-D + F-D8-D (IR-emit side — analyzer + relon-ir + stdlib bodies emit `Op::Add(IrType::String)` / `Op::Call{contains}` / `Op::DictGetByStringKey` / `Op::ListGetByIntIdx` instead of routing through the tree-walker's `try_index_method`) land in `main`, **and** the cmp_lua W3/W4/W5/W6 hand-built JIT entries are deleted in favour of `TraceRecordingEvaluator`-driven traces. F-D7-B / F-D8-B (commits `516c7a2` / `d2c478f`) landed the receiver side only — the patch's hand-built encoding is still the live shape the bench file uses. |
+_(empty — no live salvaged artifacts)_
 
 When removing an entry, also delete the corresponding row from this
 table.
+
+## History
+
+| File | Removed | Reason |
+|---|---|---|
+| `F-D9-cmp_lua-958LoC.patch` | 2026-05-20 | F-D7-D (`4a4341f`) + F-D8-D (`7219e70`) landed the IR-emit side AND deleted the cmp_lua W3/W4/W5/W6 hand-built JIT entries in favour of `TraceRecordingEvaluator`-driven traces. The patch's hand-built encoding had no live consumer left in the tree, so per this directory's transience rule it was removed. The shape it encoded is reconstructible from those two merges if a future micro-bench wants the byte-identical floor back. |
