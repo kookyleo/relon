@@ -179,3 +179,71 @@ fn inline_repeated_match_short_circuits_correctly() {
     // bit equality with extern).
     check_inline_matches_extern("ab", "ab__ab__ab", "ba__ba");
 }
+
+/// F-D7-E SIMD path coverage. Builds haystacks long enough to exercise
+/// the 16-byte chunked v128 loop in `emit_scan_single_byte`, and checks
+/// hit positions at multiple offsets — boundary of the first chunk,
+/// inside the second chunk, deep into the tail — to confirm the chunk
+/// loop's bitmask early-exit is byte-identical to the scalar tail.
+#[test]
+fn inline_one_byte_simd_chunk_hit_positions() {
+    // Helper: build a `len`-byte haystack of `pad`, then overwrite
+    // position `hit_at` with the needle byte.
+    fn make(len: usize, pad: u8, needle: u8, hit_at: Option<usize>) -> String {
+        let mut v = vec![pad; len];
+        if let Some(at) = hit_at {
+            v[at] = needle;
+        }
+        String::from_utf8(v).expect("ascii pad/needle")
+    }
+
+    let needle = "X";
+    let nb = b'X';
+    let pad = b'.';
+
+    // Each (len, hit_at) drives one (hit, miss) pair: the hit haystack
+    // places the needle at `hit_at`, the miss haystack has no needle.
+    // The lengths span the first SIMD chunk (15..=17), second-chunk
+    // boundaries (31..=33), and 256 / 512 / 1024 byte haystacks where
+    // the SIMD loop dominates.
+    let cases: &[(usize, usize)] = &[
+        (15, 14),     // tail-only path: len < 16
+        (16, 0),      // single full chunk, hit at byte 0
+        (16, 15),     // single full chunk, hit at last lane
+        (17, 16),     // one chunk + 1-byte tail, hit in tail
+        (31, 30),     // one chunk + 15-byte tail, hit at last tail byte
+        (32, 31),     // two chunks, hit at last byte of chunk 2
+        (33, 32),     // two chunks + 1-byte tail, hit in tail
+        (256, 0),     // long SIMD: hit in first chunk
+        (256, 200),   // long SIMD: hit deep in chunk loop
+        (256, 255),   // long SIMD: hit at last byte (tail = 0)
+        (512, 257),   // long SIMD: hit straddling many chunks
+        (1024, 1000), // long SIMD: hit near end, exercises 64 chunks before
+    ];
+
+    for &(len, hit_at) in cases {
+        let hit_str = make(len, pad, nb, Some(hit_at));
+        let miss_str = make(len, pad, nb, None);
+        check_inline_matches_extern(needle, &hit_str, &miss_str);
+    }
+}
+
+#[test]
+fn inline_one_byte_simd_empty_and_short_haystacks() {
+    // Boundary cases the SIMD entry has to pass straight through to
+    // the tail loop: empty haystack (no chunk, no tail) and 1..15-byte
+    // haystacks (chunk_end == h_ptr).
+    let needle = "Z";
+    for len in 0..16 {
+        let hit_at = if len == 0 { None } else { Some(len / 2) };
+        let hit_str = if let Some(at) = hit_at {
+            let mut v = vec![b'-'; len];
+            v[at] = b'Z';
+            String::from_utf8(v).unwrap()
+        } else {
+            String::new()
+        };
+        let miss_str = "-".repeat(len);
+        check_inline_matches_extern(needle, &hit_str, &miss_str);
+    }
+}

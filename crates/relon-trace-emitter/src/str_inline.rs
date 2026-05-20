@@ -32,14 +32,27 @@
 //! expected to emit a `Guard(NotNull(haystack))` upstream but we keep
 //! the inline path safe-by-default.
 //!
-//! ## Why scalar, not SIMD
+//! ## SIMD memchr fast path (F-D7-E)
 //!
-//! Cranelift's `i8x16` lanewise compare is appealing for needle
-//! length 1, but cranelift 0.131 lacks a stable mask-to-scalar idiom
-//! that's portable across x86_64 + aarch64 + native-target settings the
-//! bench runs in. The scalar path is enough to drop the W4 ratio
-//! comfortably under 2× LuaJIT; a v128 fast path is left as a follow-up
-//! (see the stage report's "remaining todo").
+//! For needle length 1 we emit a `memchr`-style 16-byte chunked scan
+//! using cranelift's portable `i8x16` ops:
+//!
+//! 1. `splat(I8X16, needle)` broadcasts the needle byte to all 16 lanes
+//!    once before the loop.
+//! 2. Each iteration loads a v128 chunk, lane-wise `icmp eq` against
+//!    the splat, then `vhigh_bits → i16` reduces the lane mask to a
+//!    scalar bitmask.
+//! 3. `icmp_imm ne mask, 0` early-exits the loop on the first hit (any
+//!    lane matched). Otherwise `cursor += 16` and re-enters.
+//! 4. After the chunked loop (or immediately if `h_len < 16`) a scalar
+//!    tail loop walks the remaining `h_len & 15` bytes. Same shape as
+//!    the original byte-at-a-time path — three IR ops per iter.
+//!
+//! Cranelift lowers the v128 ops to native `pcmpeqb`/`pmovmskb` on
+//! x86_64 SSE2 and `cmeq.16b`/`shrn` on aarch64 NEON. Both are the
+//! standard memchr building blocks; the loop body is one load + one
+//! compare + one mask-extract + one early-exit branch per 16 bytes,
+//! versus 16× the same per byte in the scalar path.
 //!
 //! ## API selection
 //!
@@ -69,7 +82,7 @@
 //! in straight line).
 
 use cranelift_codegen::ir::condcodes::IntCC;
-use cranelift_codegen::ir::types::{I32, I64};
+use cranelift_codegen::ir::types::{I16, I32, I64, I8X16};
 use cranelift_codegen::ir::{self, BlockArg, InstBuilder, MemFlags};
 use cranelift_frontend::FunctionBuilder;
 
@@ -363,11 +376,41 @@ fn emit_scan_preloaded(
     builder.seal_block(loop_header);
 }
 
-/// F-D7-C single-byte specialisation. `memchr`-style scan: walk the
-/// haystack one byte at a time, exit on the first match or when the
-/// `end_ptr` is reached. Three IR ops per inner iter (load + icmp +
-/// brif) plus one iadd at the bottom — half the general-case body
-/// because there's no candidate-position machinery to maintain.
+/// F-D7-E single-byte SIMD specialisation. `memchr`-style scan with a
+/// 16-byte chunked v128 fast path followed by a scalar tail.
+///
+/// ## Control flow
+///
+/// ```text
+///     entry:
+///         end_ptr   = h_ptr + h_len
+///         tail_len  = h_len & 15
+///         chunk_end = end_ptr - tail_len           // = h_ptr + (h_len & !15)
+///         needle_v8 = splat(I8X16, needle_byte)
+///         jump simd_header(h_ptr)
+///
+///     simd_header(cursor):
+///         if cursor == chunk_end: jump tail_header(cursor)
+///         chunk = load I8X16 [cursor]
+///         eq    = icmp_eq chunk, needle_v8         // i8x16 lane mask
+///         mask  = vhigh_bits I16, eq               // i16 top-bit-per-lane
+///         if mask != 0: jump join(result = 1)
+///         jump simd_header(cursor + 16)
+///
+///     tail_header(cursor):
+///         if cursor == end_ptr: jump join(result = 0)
+///         byte = load I8 [cursor]
+///         if byte == needle: jump join(result = 1)
+///         jump tail_header(cursor + 1)
+/// ```
+///
+/// Cranelift lowers `icmp eq` on `i8x16` + `vhigh_bits` to
+/// `pcmpeqb` + `pmovmskb` on x86_64 SSE2 (one 16-byte compare for the
+/// price of one scalar one) and `cmeq.16b` + `shrn.8b` + `fmov` on
+/// aarch64 NEON. On haystacks ≥ 16 bytes this is the standard memchr
+/// shape; on shorter haystacks the SIMD loop is entered with
+/// `cursor == chunk_end` and falls straight through to the scalar tail
+/// without ever loading a v128 (no risk of out-of-bounds read).
 fn emit_scan_single_byte(
     builder: &mut FunctionBuilder<'_>,
     h_ptr: ir::Value,
@@ -375,45 +418,107 @@ fn emit_scan_single_byte(
     needle_byte: u8,
     join_block: ir::Block,
 ) {
-    // Compute end pointer once. `end_ptr = h_ptr + h_len`. The loop
-    // terminates when `cursor == end_ptr`.
+    // ----- Pre-loop constants -----
     let end_ptr = builder.ins().iadd(h_ptr, h_len);
-    let needle_v = builder.ins().iconst(ir::types::I8, i64::from(needle_byte));
+    // `h_len & 15` — number of bytes left after the last full 16-byte
+    // chunk. `chunk_end = end_ptr - tail_len = h_ptr + (h_len & !15)`.
+    let tail_len = builder.ins().band_imm(h_len, 15);
+    let chunk_end = builder.ins().isub(end_ptr, tail_len);
 
-    let loop_header = builder.create_block();
-    builder.append_block_param(loop_header, I64); // cursor
-    builder.ins().jump(loop_header, &[BlockArg::Value(h_ptr)]);
-    builder.switch_to_block(loop_header);
-    let cursor = builder.block_params(loop_header)[0];
+    // Splat the needle byte to all 16 lanes once. `iconst(I8, n)` then
+    // `splat(I8X16, ...)` is the portable cranelift idiom; the backend
+    // lowers it to a register broadcast (`pshufb`/`vbroadcastb`/etc.)
+    // hoisted out of the inner loop.
+    let needle_v_i8 = builder.ins().iconst(ir::types::I8, i64::from(needle_byte));
+    let needle_splat = builder.ins().splat(I8X16, needle_v_i8);
+    let needle_v_scalar = needle_v_i8; // reused below for the scalar tail
 
-    let at_end = builder.ins().icmp(IntCC::Equal, cursor, end_ptr);
+    // ----- SIMD 16-byte chunk loop -----
+    let simd_header = builder.create_block();
+    builder.append_block_param(simd_header, I64); // cursor
+    builder.ins().jump(simd_header, &[BlockArg::Value(h_ptr)]);
+    builder.switch_to_block(simd_header);
+    let cursor_simd = builder.block_params(simd_header)[0];
 
-    let body = builder.create_block();
-    let miss_arg = builder.ins().iconst(I32, 0);
+    let at_chunk_end = builder.ins().icmp(IntCC::Equal, cursor_simd, chunk_end);
+    let simd_body = builder.create_block();
+    let tail_header = builder.create_block();
+    builder.append_block_param(tail_header, I64); // cursor
+    builder.ins().brif(
+        at_chunk_end,
+        tail_header,
+        &[BlockArg::Value(cursor_simd)],
+        simd_body,
+        &[],
+    );
+    builder.seal_block(simd_body);
+    builder.switch_to_block(simd_body);
+
+    // Lane-wise compare → bitmask → early exit on any match.
+    let chunk = builder
+        .ins()
+        .load(I8X16, MemFlags::trusted(), cursor_simd, 0);
+    let eq_lanes = builder.ins().icmp(IntCC::Equal, chunk, needle_splat);
+    let mask = builder.ins().vhigh_bits(I16, eq_lanes);
+    let any_hit = builder.ins().icmp_imm(IntCC::NotEqual, mask, 0);
+
+    let simd_next = builder.create_block();
+    let hit_arg_simd = builder.ins().iconst(I32, 1);
+    builder.ins().brif(
+        any_hit,
+        join_block,
+        &[BlockArg::Value(hit_arg_simd)],
+        simd_next,
+        &[],
+    );
+    builder.seal_block(simd_next);
+    builder.switch_to_block(simd_next);
+    let sixteen = builder.ins().iconst(I64, 16);
+    let next_cursor_simd = builder.ins().iadd(cursor_simd, sixteen);
     builder
         .ins()
-        .brif(at_end, join_block, &[BlockArg::Value(miss_arg)], body, &[]);
-    builder.seal_block(body);
-    builder.switch_to_block(body);
+        .jump(simd_header, &[BlockArg::Value(next_cursor_simd)]);
+    builder.seal_block(simd_header);
+
+    // ----- Scalar tail loop (≤ 15 bytes) -----
+    builder.switch_to_block(tail_header);
+    let cursor_tail = builder.block_params(tail_header)[0];
+
+    let at_end = builder.ins().icmp(IntCC::Equal, cursor_tail, end_ptr);
+    let tail_body = builder.create_block();
+    let miss_arg = builder.ins().iconst(I32, 0);
+    builder.ins().brif(
+        at_end,
+        join_block,
+        &[BlockArg::Value(miss_arg)],
+        tail_body,
+        &[],
+    );
+    builder.seal_block(tail_body);
+    builder.switch_to_block(tail_body);
 
     let byte = builder
         .ins()
-        .load(ir::types::I8, MemFlags::trusted(), cursor, 0);
-    let eq = builder.ins().icmp(IntCC::Equal, byte, needle_v);
+        .load(ir::types::I8, MemFlags::trusted(), cursor_tail, 0);
+    let eq = builder.ins().icmp(IntCC::Equal, byte, needle_v_scalar);
 
-    let next_iter = builder.create_block();
-    let hit_arg = builder.ins().iconst(I32, 1);
-    builder
-        .ins()
-        .brif(eq, join_block, &[BlockArg::Value(hit_arg)], next_iter, &[]);
-    builder.seal_block(next_iter);
-    builder.switch_to_block(next_iter);
+    let tail_next = builder.create_block();
+    let hit_arg_tail = builder.ins().iconst(I32, 1);
+    builder.ins().brif(
+        eq,
+        join_block,
+        &[BlockArg::Value(hit_arg_tail)],
+        tail_next,
+        &[],
+    );
+    builder.seal_block(tail_next);
+    builder.switch_to_block(tail_next);
     let one = builder.ins().iconst(I64, 1);
-    let next_cursor = builder.ins().iadd(cursor, one);
+    let next_cursor_tail = builder.ins().iadd(cursor_tail, one);
     builder
         .ins()
-        .jump(loop_header, &[BlockArg::Value(next_cursor)]);
-    builder.seal_block(loop_header);
+        .jump(tail_header, &[BlockArg::Value(next_cursor_tail)]);
+    builder.seal_block(tail_header);
 }
 
 #[cfg(test)]
