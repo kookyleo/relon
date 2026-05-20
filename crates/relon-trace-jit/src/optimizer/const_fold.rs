@@ -68,7 +68,10 @@ impl OptimizerPass for ConstFold {
                 TraceOp::ConstI64(dst, v) => {
                     known.insert(dst, TraceConst::I64(v));
                 }
-                TraceOp::Add(dst, a, b) | TraceOp::Sub(dst, a, b) | TraceOp::Mul(dst, a, b) => {
+                TraceOp::Add(dst, a, b)
+                | TraceOp::Sub(dst, a, b)
+                | TraceOp::Mul(dst, a, b)
+                | TraceOp::Mod(dst, a, b) => {
                     if let (Some(ka), Some(kb)) = (known.get(&a), known.get(&b)) {
                         if !is_safe_const_source(&trace.ops[idx]) {
                             continue;
@@ -120,6 +123,25 @@ fn fold_arith(op: &TraceOp, a: TraceConst, b: TraceConst) -> Option<TraceConst> 
         }
         (TraceOp::Mul(_, _, _), TraceConst::I64(x), TraceConst::I64(y)) => {
             Some(TraceConst::I64(x.wrapping_mul(y)))
+        }
+        // F-D8-E.1: fold `Mod` only when the divisor is safe. We
+        // refuse to fold `_ % 0` (runtime trap surface) and
+        // `MIN % -1` (the only overflow case for `srem`) so the
+        // emitter's divisor-zero guard / overflow guard stay the
+        // single source of truth for the trap behaviour.
+        (TraceOp::Mod(_, _, _), TraceConst::I32(x), TraceConst::I32(y)) => {
+            if y == 0 || (x == i32::MIN && y == -1) {
+                None
+            } else {
+                Some(TraceConst::I32(x.wrapping_rem(y)))
+            }
+        }
+        (TraceOp::Mod(_, _, _), TraceConst::I64(x), TraceConst::I64(y)) => {
+            if y == 0 || (x == i64::MIN && y == -1) {
+                None
+            } else {
+                Some(TraceConst::I64(x.wrapping_rem(y)))
+            }
         }
         _ => None,
     }

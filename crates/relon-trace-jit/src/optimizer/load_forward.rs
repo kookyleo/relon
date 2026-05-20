@@ -107,10 +107,11 @@ impl OptimizerPass for LoadForwarding {
                         panic!("trace must not contain Unrecoverable ops");
                     }
                 },
-                TraceOp::Div(_, _, _) => {
-                    // Div is classed RecoverableWrite (see trace_ir
-                    // docs). It does not actually touch memory but
-                    // the conservative rule applies: flush.
+                TraceOp::Div(_, _, _) | TraceOp::Mod(_, _, _) => {
+                    // Div / Mod are classed RecoverableWrite (see
+                    // trace_ir docs). They do not actually touch
+                    // memory but the conservative rule applies:
+                    // flush.
                     slot_value.clear();
                 }
                 _ => {
@@ -162,7 +163,8 @@ fn rewrite_inputs(op: &mut TraceOp, alias: &HashMap<SsaVar, SsaVar>) -> usize {
         TraceOp::Add(_dst, a, b)
         | TraceOp::Sub(_dst, a, b)
         | TraceOp::Mul(_dst, a, b)
-        | TraceOp::Div(_dst, a, b) => {
+        | TraceOp::Div(_dst, a, b)
+        | TraceOp::Mod(_dst, a, b) => {
             swap!(a);
             swap!(b);
         }

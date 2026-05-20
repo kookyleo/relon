@@ -61,6 +61,31 @@ fn div_inserts_divisor_zero_check() {
     emit_and_verify(&b.into_optimized());
 }
 
+/// F-D8-E.1: smoke-test that `TraceOp::Mod` lowers cleanly through
+/// the emitter. Asserts both shape (`srem` + divisor-zero `brif`)
+/// and verifier acceptance.
+#[test]
+fn mod_emits_srem_with_divisor_zero_check() {
+    let mut b = TraceBuffer::new();
+    let a = b.fresh_ssa();
+    let c = b.fresh_ssa();
+    let r = b.fresh_ssa();
+    b.append(TraceOp::ConstI64(a, 47));
+    b.append(TraceOp::ConstI64(c, 10));
+    b.append(TraceOp::Mod(r, a, c));
+    b.append(TraceOp::Return(r));
+    let ctx = emit_and_verify(&b.into_optimized());
+    let printed = format!("{}", ctx.func);
+    assert!(
+        printed.contains("srem"),
+        "expected srem instruction, got {printed}"
+    );
+    assert!(
+        printed.contains("brif"),
+        "expected divisor-zero brif, got {printed}"
+    );
+}
+
 #[test]
 fn cmp_lt_emits_widened_bool() {
     let mut b = TraceBuffer::new();

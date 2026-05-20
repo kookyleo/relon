@@ -247,6 +247,11 @@ impl<'a> TraceRecordingEvaluator<'a> {
                 self.step_arith(op, |a, b| (a as i64).wrapping_mul(b as i64) as u64)
             }
             Op::Div(ty) if !matches!(ty, IrType::F64) => self.step_div(op),
+            // F-D8-E.1: `Op::Mod` mirrors `Op::Div` end-to-end — same
+            // divisor-zero abort during recording, same `record_op`
+            // shape; the recorder lowers it to `TraceOp::Mod` which
+            // emits `srem` + divisor-zero guard at codegen.
+            Op::Mod(ty) if !matches!(ty, IrType::F64) => self.step_mod(op),
 
             // Comparisons: same envelope as arith. Walker forwards
             // the op verbatim so the recorder's `binary_cmp` rule
@@ -526,6 +531,39 @@ impl<'a> TraceRecordingEvaluator<'a> {
         }
         let inputs = [rhs.ssa, lhs.ssa];
         let result_value = ((lhs.value as i64).wrapping_div(rhs.value as i64)) as u64;
+        match self
+            .recorder
+            .record_op(op, &inputs, Some(ObservedType::I64))
+        {
+            RecordResult::Ok { value: Some(ssa) }
+            | RecordResult::NeedsGuard {
+                value: Some(ssa), ..
+            } => {
+                self.operand_stack
+                    .push(StackCell::new(result_value, ssa, ObservedType::I64));
+                StepOutcome::Continue
+            }
+            _ => StepOutcome::Abort,
+        }
+    }
+
+    /// F-D8-E.1: walker side of `Op::Mod` — mirrors [`Self::step_div`]
+    /// exactly except the recorded value uses `wrapping_rem` (signed
+    /// remainder, matches Rust `%` and cranelift `srem`). The
+    /// recording-time divisor-zero short-circuit keeps the host from
+    /// panicking even before the trace gets a chance to install.
+    fn step_mod(&mut self, op: &Op) -> StepOutcome {
+        if self.operand_stack.len() < 2 {
+            return StepOutcome::Abort;
+        }
+        let rhs = self.operand_stack.pop().expect("checked above");
+        let lhs = self.operand_stack.pop().expect("checked above");
+        if rhs.value as i64 == 0 {
+            self.recorder.abort(AbortReason::GuardFailureInRecording);
+            return StepOutcome::Abort;
+        }
+        let inputs = [rhs.ssa, lhs.ssa];
+        let result_value = ((lhs.value as i64).wrapping_rem(rhs.value as i64)) as u64;
         match self
             .recorder
             .record_op(op, &inputs, Some(ObservedType::I64))
