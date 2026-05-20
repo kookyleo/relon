@@ -261,6 +261,16 @@ fn main() -> miette::Result<()> {
                 // would get from `--lite`, without making them
                 // pass the flag.
                 skip_core_schemas: lite_analyze,
+                // v6-fix-D2-H cold-start: when the lite/trivial
+                // path is selected, also permit the analyzer's
+                // trivial-`#main` fast-path so passes that are
+                // provable no-ops on this shape (schema-collect,
+                // extend, constraints, resolve, full typecheck)
+                // drop out. The analyzer re-validates the shape
+                // internally and falls through to the full
+                // pipeline on any non-trivial source, so flipping
+                // this on for every lite-mode entry is safe.
+                trivial_main_fast_path: lite_analyze,
                 ..AnalyzeOptions::default()
             };
             // v6-fix-D2 cold-start fast path. The default
