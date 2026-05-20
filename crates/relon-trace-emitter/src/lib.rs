@@ -29,6 +29,28 @@
 //! emitted IR is well-formed. Integration with the JIT module + ISA
 //! lives in the v6-gamma phase, alongside the deopt-dispatch host
 //! helper and the hot-counter inject pass.
+//!
+//! ## inline_emit / emitter sync
+//!
+//! [`emitter::TraceEmitter`] (standalone trampoline entry) and
+//! [`inline_emit::emit_trace_inline`] (at-call-site embed) carry
+//! line-for-line copies of the per-op lowering rules. The sync
+//! invariant is: every `TraceOp` variant matched in one emit path's
+//! `emit_op` MUST also be matched in the other — as a real helper
+//! call OR an explicit `Err(InlineEmitError::CallNotSupportedInInline)`
+//! route. Adding a new op means touching both files.
+//!
+//! Guards:
+//!
+//! * `tests/inline_emit_sync_lint.rs` — source-level lint that scrapes
+//!   both `fn emit_op` bodies and asserts the `TraceOp::<Variant>` sets
+//!   they reference are equal AND cover every variant declared in
+//!   `relon_trace_jit::TraceOp`. Drift fails `cargo test` at compile +
+//!   test time.
+//! * `crates/relon-codegen-native/tests/trace_jit_inline_smoke.rs`
+//!   `inline_matches_standalone_result` — runtime equivalence check
+//!   on a small canned trace (the original sync guard; still useful
+//!   for catching divergent codegen on shared variants).
 
 pub mod abi;
 pub mod call_conv;
