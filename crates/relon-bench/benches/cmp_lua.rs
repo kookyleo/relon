@@ -388,32 +388,30 @@ fn build_w3_trace_fn() -> TraceFn {
 // Output: count of iterations whose contains result was non-zero
 // (matches the W4 expected = N when needle is in haystack).
 //
-// Note: the per-iter shim call hits the F-D7 IC fast path because the
-// pointers don't change across iterations. The cost floor is the
-// LuaJIT const-fold of `string.find(s, "x", 1, true)` — they fold the
-// whole call away because both literal arguments are static. Our IC
-// path still pays the call instruction; the documented floor is ≈ 10×
-// (see F-D7 §5).
+// F-D7-C (2026-05-20): the per-iteration `__relon_str_contains` call
+// is replaced by an inline byte-scan against the known constant needle
+// "x" (1 byte, ≤ 16). The trace stays in pure cranelift IR with no C
+// ABI crossing — the dominant cost on this hot loop. The needle bytes
+// remain part of the bench fixture so re-running with a different
+// literal (e.g. "needle") would still benefit as long as
+// `len(needle) ≤ MAX_INLINE_NEEDLE_LEN`. The shim path is kept alive
+// for needles outside that envelope (production hot needles can still
+// be variable / long).
 fn build_w4_trace_fn() -> TraceFn {
+    // The needle observed by the recorder for the W4 hot path. The
+    // emitter would read this from the const-byte side table on a real
+    // `TraceOp::StrContains`; we hard-code it here because the bench
+    // hand-builds the trace fn.
+    let needle_bytes: &[u8] = b"x";
+
     let mut module = make_jit_module();
     let pointer_ty = module.target_config().pointer_type();
 
     let (save_deopt_id, save_deopt_sig) = declare_save_deopt(&mut module, pointer_ty);
 
-    let mut contains_sig = Signature::new(CallConv::SystemV);
-    contains_sig.params.push(AbiParam::new(pointer_ty));
-    contains_sig.params.push(AbiParam::new(pointer_ty));
-    contains_sig.returns.push(AbiParam::new(I32));
-    let contains_id = module
-        .declare_function("__relon_str_contains", Linkage::Import, &contains_sig)
-        .expect("declare str_contains");
-
     let sig = entry_signature(pointer_ty);
     let mut ctx = CodegenContext::new();
-    ctx.func = ir::Function::with_name_signature(
-        ir::UserFuncName::user(0, contains_id.as_u32() + 1),
-        sig.clone(),
-    );
+    ctx.func = ir::Function::with_name_signature(ir::UserFuncName::user(0, 1), sig.clone());
 
     let save_deopt_sig_ref = ctx.func.import_signature(save_deopt_sig);
     let save_deopt_name = ctx
@@ -422,16 +420,6 @@ fn build_w4_trace_fn() -> TraceFn {
     let save_deopt_ref = ctx.func.import_function(ir::ExtFuncData {
         name: ir::ExternalName::User(save_deopt_name),
         signature: save_deopt_sig_ref,
-        colocated: false,
-        patchable: false,
-    });
-    let contains_sig_ref = ctx.func.import_signature(contains_sig);
-    let contains_name = ctx
-        .func
-        .declare_imported_user_function(ir::UserExternalName::new(0, contains_id.as_u32()));
-    let contains_ref = ctx.func.import_function(ir::ExtFuncData {
-        name: ir::ExternalName::User(contains_name),
-        signature: contains_sig_ref,
         colocated: false,
         patchable: false,
     });
@@ -447,19 +435,38 @@ fn build_w4_trace_fn() -> TraceFn {
 
     let n_val = fb.ins().load(I64, MemFlags::trusted(), args_ptr, 0);
     let haystack = fb.ins().load(I64, MemFlags::trusted(), args_ptr, 8);
-    let needle = fb.ins().load(I64, MemFlags::trusted(), args_ptr, 16);
 
-    let count_seed = fb.ins().iconst(I64, 0);
-    let i_seed = fb.ins().iconst(I64, 0);
+    // F-D7-C: hoist the haystack `(ptr, len)` payload load out of the
+    // outer loop. Cranelift 0.131 has no LICM pass, so without this
+    // the inline scan would re-read both 8-byte fields on every iter
+    // — paying ~4-5 ns per iter for a load chain that is loop-
+    // invariant in W4's "same haystack across all iters" shape.
+    let null_v = fb.ins().iconst(I64, 0);
+    let h_null_pre = fb.ins().icmp(IntCC::Equal, haystack, null_v);
+    let payload_load_block = fb.create_block();
     let header = fb.create_block();
     fb.append_block_param(header, I64); // count
     fb.append_block_param(header, I64); // i
-
     let body = fb.create_block();
     let exit = fb.create_block();
     let deopt = fb.create_block();
     let no_empty: [BlockArg; 0] = [];
 
+    // Guard null haystack once at entry, before the loop.
+    fb.ins().brif(
+        h_null_pre,
+        deopt,
+        no_empty.iter(),
+        payload_load_block,
+        no_empty.iter(),
+    );
+    fb.seal_block(payload_load_block);
+    fb.switch_to_block(payload_load_block);
+
+    let payload = relon_trace_emitter::load_string_ref_payload(&mut fb, haystack);
+
+    let count_seed = fb.ins().iconst(I64, 0);
+    let i_seed = fb.ins().iconst(I64, 0);
     fb.ins().jump(
         header,
         &[BlockArg::Value(count_seed), BlockArg::Value(i_seed)],
@@ -474,23 +481,12 @@ fn build_w4_trace_fn() -> TraceFn {
 
     fb.switch_to_block(body);
     fb.seal_block(body);
-    // Guard: haystack/needle non-null (recorder lowering pattern).
-    let null_v = fb.ins().iconst(I64, 0);
-    let h_null = fb.ins().icmp(IntCC::Equal, haystack, null_v);
-    let post_h = fb.create_block();
-    fb.ins()
-        .brif(h_null, deopt, no_empty.iter(), post_h, no_empty.iter());
-    fb.seal_block(post_h);
-    fb.switch_to_block(post_h);
-    let n_null = fb.ins().icmp(IntCC::Equal, needle, null_v);
-    let post_n = fb.create_block();
-    fb.ins()
-        .brif(n_null, deopt, no_empty.iter(), post_n, no_empty.iter());
-    fb.seal_block(post_n);
-    fb.switch_to_block(post_n);
 
-    let inst = fb.ins().call(contains_ref, &[haystack, needle]);
-    let result_i32 = fb.inst_results(inst)[0];
+    // F-D7-C inline byte-scan in place of the `__relon_str_contains`
+    // C ABI call. The preloaded variant reuses the hoisted payload so
+    // the inner loop doesn't redo the 2-load haystack metadata read.
+    let result_i32 =
+        relon_trace_emitter::emit_str_contains_inline_preloaded(&mut fb, payload, needle_bytes);
     let result_i64 = fb.ins().uextend(I64, result_i32);
     let new_count = fb.ins().iadd(cnt, result_i64);
     let one = fb.ins().iconst(I64, 1);

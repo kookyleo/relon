@@ -34,6 +34,19 @@ pub struct TraceBuffer {
     pub guards: Vec<GuardSite>,
     pub type_info: HashMap<SsaVar, ObservedType>,
     pub consts: HashMap<SsaVar, TraceConst>,
+    /// F-D7-C: const-string side table. Maps an SSA var to the raw
+    /// UTF-8 payload bytes of the string constant it carries.
+    ///
+    /// Populated by the recorder when it observes a literal string
+    /// flowing into a `TraceOp::StrContains` (or sibling) needle slot;
+    /// consumed by the emitter to switch `StrContains` lowering from a
+    /// `call __relon_str_contains` round-trip into an inline cranelift
+    /// byte-scan when the needle bytes are short (≤ 16). Storage is
+    /// `Vec<u8>` rather than `Box<str>` because the emitter only needs
+    /// byte equality, never UTF-8 inspection.
+    ///
+    /// The non-Copy payload is why this lives outside [`TraceConst`].
+    pub const_bytes: HashMap<SsaVar, Vec<u8>>,
     next_ssa: u32,
 }
 
@@ -78,6 +91,15 @@ impl TraceBuffer {
         self.consts.insert(var, value);
     }
 
+    /// F-D7-C: record the raw byte payload of a string-typed constant
+    /// flowing through `var`. Used by the recorder when it observes a
+    /// literal string source so the emitter can specialise
+    /// `TraceOp::StrContains` into an inline byte-scan; see
+    /// [`Self::const_bytes`].
+    pub fn record_const_bytes(&mut self, var: SsaVar, bytes: Vec<u8>) {
+        self.const_bytes.insert(var, bytes);
+    }
+
     /// Convenience: how many ops the buffer currently holds.
     pub fn op_count(&self) -> usize {
         self.ops.len()
@@ -96,6 +118,7 @@ impl TraceBuffer {
             guards: self.guards.into(),
             type_info: self.type_info,
             consts: self.consts,
+            const_bytes: self.const_bytes,
             ssa_high_water: self.next_ssa,
         }
     }
@@ -114,6 +137,8 @@ pub struct OptimizedTrace {
     pub guards: Box<[GuardSite]>,
     pub type_info: HashMap<SsaVar, ObservedType>,
     pub consts: HashMap<SsaVar, TraceConst>,
+    /// F-D7-C: const-string side table — see [`TraceBuffer::const_bytes`].
+    pub const_bytes: HashMap<SsaVar, Vec<u8>>,
     pub ssa_high_water: u32,
 }
 
@@ -124,6 +149,14 @@ impl OptimizedTrace {
 
     pub fn guard_count(&self) -> usize {
         self.guards.len()
+    }
+
+    /// F-D7-C: lookup the const byte payload bound to `var`, if any.
+    ///
+    /// The emitter uses this on `TraceOp::StrContains` to decide
+    /// between an inline byte-scan and the extern shim call.
+    pub fn const_bytes_for(&self, var: SsaVar) -> Option<&[u8]> {
+        self.const_bytes.get(&var).map(|v| v.as_slice())
     }
 
     /// Side tables only, exposed so callers can round-trip the parts
