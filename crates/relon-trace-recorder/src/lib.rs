@@ -25,7 +25,7 @@ pub mod recorder;
 pub mod type_obs;
 
 pub use abort::AbortReason;
-pub use lowering::{lower_op, map_effect_class, LookupKind, OpLoweringContext};
+pub use lowering::{lower_op, map_effect_class, LookupKind, OpLoweringContext, SubscriptKind};
 pub use recorder::{LoopCarry, RecordResult, RecorderState, SsaAllocator};
 pub use type_obs::{infer_observed_type, ObservedType};
 
