@@ -267,6 +267,54 @@ pub enum TraceOp {
         shape_hash: u64,
     },
 
+    /// F-D8-E.2: inline dict-shape verification.
+    ///
+    /// Lowers to a few cranelift insns — `load.u64 dict_ptr + 0`,
+    /// `icmp.eq vs imm shape_hash`, `brif → deopt` — and produces no
+    /// SSA value. The optimizer pairs this op with a
+    /// [`Self::DictLookupPrechecked`] body op when it can prove the
+    /// `(dict_ptr, shape_hash)` pair is loop-invariant; LICM then
+    /// hoists this op out of the loop so the shape check executes
+    /// exactly once per trace entry instead of every iteration.
+    ///
+    /// Effect class: [`EffectClass::Pure`]. The op only reads from
+    /// memory the caller is guaranteed to be allowed to read (the
+    /// dict header), and its only side effect is a deopt branch on
+    /// mismatch — same as any other guard op. LICM treats it as
+    /// hoistable when `dict_ptr` is defined outside the loop body.
+    DictShapeGuard {
+        /// SSA carrying the raw `dict_ptr` (header start). Same
+        /// pointer the matching `DictLookupPrechecked` will use.
+        dict_ptr: SsaVar,
+        /// Per-trace shape fingerprint expected to live at
+        /// `*(dict_ptr as *const u64) + 0`. Mismatch deopts.
+        shape_hash: u64,
+    },
+
+    /// F-D8-E.2: dict lookup whose shape compare was already proven
+    /// elsewhere (typically a loop-hoisted [`Self::DictShapeGuard`]).
+    ///
+    /// Same semantics as [`Self::DictLookup`] except the runtime
+    /// helper skips the shape compare on the IC fast path. The
+    /// recorder never emits this op directly — only the optimizer's
+    /// `dict_ic_hoist` pass produces it, and only when it has
+    /// inserted a matching `DictShapeGuard` upstream. Invariant
+    /// pairing is what keeps the runtime safe: a dict whose layout
+    /// drifted between recorder time and trace execution gets
+    /// rejected by the upstream `DictShapeGuard` before the
+    /// prechecked helper would scan into garbage entries.
+    ///
+    /// Effect class: [`EffectClass::ReadOnly`] (same as
+    /// `DictLookup`).
+    DictLookupPrechecked {
+        /// SSA destination — holds the i64 value after the lookup.
+        dst: SsaVar,
+        /// SSA carrying the raw `dict_ptr` (header start).
+        dict_ptr: SsaVar,
+        /// SSA carrying the raw `key_ptr` to a String record.
+        key_ptr: SsaVar,
+    },
+
     // ---- Loop markers -----------------------------------------------
     /// Marks the entry of a recorded loop. `loop_id` distinguishes
     /// nested loops; the same id pairs `MarkLoopHead` with its matching
@@ -367,12 +415,20 @@ impl TraceOp {
             | TraceOp::StrConcat(_, _, _)
             | TraceOp::StrContains(_, _, _)
             | TraceOp::StrFind(_, _, _)
-            | TraceOp::StrSubstring(_, _, _, _) => EffectClass::Pure,
+            | TraceOp::StrSubstring(_, _, _, _)
+            // F-D8-E.2: `DictShapeGuard` is a guard-like op — it
+            // reads the dict header's first 8 bytes (immutable for
+            // the trace's lifetime) and only deopts on mismatch. No
+            // host-visible side effect, no SSA output. Classified
+            // `Pure` so LICM lifts loop-invariant shape probes out
+            // of the loop body.
+            | TraceOp::DictShapeGuard { .. } => EffectClass::Pure,
 
             TraceOp::Load(_, _, _)
             | TraceOp::LocalGet(_, _)
             | TraceOp::ListGet { .. }
-            | TraceOp::DictLookup { .. } => EffectClass::ReadOnly,
+            | TraceOp::DictLookup { .. }
+            | TraceOp::DictLookupPrechecked { .. } => EffectClass::ReadOnly,
 
             TraceOp::Div(_, _, _) | TraceOp::Mod(_, _, _) | TraceOp::Store(_, _, _) => {
                 EffectClass::RecoverableWrite
@@ -402,13 +458,16 @@ impl TraceOp {
             | TraceOp::StrFind(dst, _, _)
             | TraceOp::StrSubstring(dst, _, _, _) => Some(*dst),
 
-            TraceOp::ListGet { dst, .. } | TraceOp::DictLookup { dst, .. } => Some(*dst),
+            TraceOp::ListGet { dst, .. }
+            | TraceOp::DictLookup { dst, .. }
+            | TraceOp::DictLookupPrechecked { dst, .. } => Some(*dst),
 
             TraceOp::Store(_, _, _)
             | TraceOp::Guard(_, _)
             | TraceOp::Return(_)
             | TraceOp::MarkLoopHead { .. }
-            | TraceOp::MarkLoopBack { .. } => None,
+            | TraceOp::MarkLoopBack { .. }
+            | TraceOp::DictShapeGuard { .. } => None,
         }
     }
 
@@ -439,6 +498,11 @@ impl TraceOp {
             TraceOp::StrSubstring(_, s, start, len) => vec![*s, *start, *len],
             TraceOp::ListGet { list_ptr, idx, .. } => vec![*list_ptr, *idx],
             TraceOp::DictLookup {
+                dict_ptr, key_ptr, ..
+            } => vec![*dict_ptr, *key_ptr],
+            // F-D8-E.2
+            TraceOp::DictShapeGuard { dict_ptr, .. } => vec![*dict_ptr],
+            TraceOp::DictLookupPrechecked {
                 dict_ptr, key_ptr, ..
             } => vec![*dict_ptr, *key_ptr],
             TraceOp::Return(v) => vec![*v],
@@ -622,5 +686,41 @@ mod tests {
             TraceOp::DictLookup { shape_hash, .. } => assert_eq!(shape_hash, 0xdead_beef_cafe_0001),
             _ => panic!("variant must round-trip its shape_hash payload"),
         }
+    }
+
+    // ---- F-D8-E.2: shape-guard + prechecked-lookup variants ---------
+
+    #[test]
+    fn dict_shape_guard_is_pure_outputless_single_input() {
+        let op = TraceOp::DictShapeGuard {
+            dict_ptr: SsaVar(7),
+            shape_hash: 0xfeed_cafe_dead_0001,
+        };
+        // LICM hoists Pure-effect ops; DictShapeGuard MUST be Pure or
+        // it will never lift out of the loop body.
+        assert_eq!(op.effect_class(), EffectClass::Pure);
+        assert_eq!(op.output(), None);
+        assert_eq!(op.inputs(), vec![SsaVar(7)]);
+        assert!(!op.is_guard()); // not a `Guard(...)` enum variant
+        match op {
+            TraceOp::DictShapeGuard { shape_hash, .. } => {
+                assert_eq!(shape_hash, 0xfeed_cafe_dead_0001);
+            }
+            _ => panic!("variant must round-trip its shape_hash payload"),
+        }
+    }
+
+    #[test]
+    fn dict_lookup_prechecked_is_read_only() {
+        let op = TraceOp::DictLookupPrechecked {
+            dst: SsaVar(9),
+            dict_ptr: SsaVar(3),
+            key_ptr: SsaVar(4),
+        };
+        // Same effect class as DictLookup so the LICM rules + dead-
+        // store passes treat both flavours uniformly.
+        assert_eq!(op.effect_class(), EffectClass::ReadOnly);
+        assert_eq!(op.output(), Some(SsaVar(9)));
+        assert_eq!(op.inputs(), vec![SsaVar(3), SsaVar(4)]);
     }
 }

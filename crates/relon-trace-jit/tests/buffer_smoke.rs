@@ -86,9 +86,10 @@ fn default_pipeline_runs_all_passes_clean_buffer() {
     b.append(TraceOp::ConstI64(x, 10));
     let p = OptimizerPipeline::default_pipeline();
     let reports = p.run(&mut b);
-    // const_fold + load_forward + dead_store + type_spec + licm +
-    // noop_typecheck_elim (ε-M0) + dead_store = 7
-    assert_eq!(reports.len(), 7);
+    // const_fold + load_forward + dead_store + type_spec +
+    // dict_ic_hoist (F-D8-E.2) + licm + noop_typecheck_elim (ε-M0) +
+    // dead_store = 8
+    assert_eq!(reports.len(), 8);
     // Nothing to fold / spec / DSE in this trivial trace.
     for (_, r) in reports {
         assert!(!r.touched());

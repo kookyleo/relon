@@ -308,7 +308,19 @@ impl<'a, 'b> InlineEmitterState<'a, 'b> {
             // The inline path is a perf shortcut for tiny straight-line
             // traces; dict/list traces always go through the standalone
             // emitter where the resolve_call FuncRef is in scope.
-            TraceOp::ListGet { .. } | TraceOp::DictLookup { .. } => {
+            //
+            // F-D8-E.2: `DictShapeGuard` is technically inline-only
+            // (no host helper call) and could be supported here, but
+            // it only appears in trace streams that ALSO carry a
+            // `DictLookupPrechecked` host call further down. Keeping
+            // the conservative bail-out preserves the historical
+            // "no dict/list ops in inline path" invariant; the bench
+            // and production paths route through the standalone
+            // emitter anyway.
+            TraceOp::ListGet { .. }
+            | TraceOp::DictLookup { .. }
+            | TraceOp::DictShapeGuard { .. }
+            | TraceOp::DictLookupPrechecked { .. } => {
                 Err(InlineEmitError::CallNotSupportedInInline)
             }
         }

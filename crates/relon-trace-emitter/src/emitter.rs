@@ -78,6 +78,15 @@ pub struct HostHookFuncIds {
     /// surface `EmitError::HostHookNotDeclared` if a `TraceOp::DictLookup`
     /// is seen.
     pub dict_lookup: Option<u32>,
+    /// F-D8-E.2: cranelift `FuncId.as_u32()` for
+    /// `__relon_trace_dict_lookup_prechecked`. `None` means the host
+    /// has not declared the helper; emitter surfaces
+    /// `EmitError::HostHookNotDeclared(DictLookupPrechecked)` if a
+    /// `TraceOp::DictLookupPrechecked` is seen. The optimizer's
+    /// `dict_ic_hoist` pass produces these ops so a host that wires
+    /// `dict_lookup` MUST also wire this one — otherwise installed
+    /// traces with hot dict accesses fail to emit.
+    pub dict_lookup_prechecked: Option<u32>,
 }
 
 impl Default for HostHookFuncIds {
@@ -97,6 +106,7 @@ impl Default for HostHookFuncIds {
             // dict/list ops keep the historical 3-slot layout.
             list_get: None,
             dict_lookup: None,
+            dict_lookup_prechecked: None,
         }
     }
 }
@@ -294,6 +304,20 @@ impl TraceEmitter {
                 fid,
             )
         });
+        // F-D8-E.2: prechecked variant of dict_lookup. Same signature
+        // as `dict_lookup` minus the `shape_hash: i64` arg, because
+        // the matching `TraceOp::DictShapeGuard` already verified it
+        // upstream (typically lifted out of the loop by LICM).
+        let dict_lookup_prechecked = hook_func_ids.dict_lookup_prechecked.map(|fid| {
+            declare_host_hook(
+                builder.func,
+                HostHookId::DictLookupPrechecked,
+                &[pointer_ty, pointer_ty, pointer_ty],
+                &[I64],
+                pointer_ty,
+                fid,
+            )
+        });
 
         let mut emitter = TraceEmitterState {
             builder: &mut builder,
@@ -310,6 +334,7 @@ impl TraceEmitter {
             str_substring,
             list_get,
             dict_lookup,
+            dict_lookup_prechecked,
             ssa_to_value: HashMap::new(),
             overflow_bits: HashMap::new(),
             loop_head_blocks: HashMap::new(),
@@ -375,6 +400,12 @@ struct TraceEmitterState<'a, 'b> {
     /// F-D8: optional `__relon_trace_dict_lookup` FuncRef. Same
     /// contract as `list_get`.
     dict_lookup: Option<ir::FuncRef>,
+    /// F-D8-E.2: optional `__relon_trace_dict_lookup_prechecked`
+    /// FuncRef. `None` means the host did not declare the helper;
+    /// `emit_dict_lookup_prechecked` surfaces
+    /// `EmitError::HostHookNotDeclared` if a
+    /// `TraceOp::DictLookupPrechecked` is seen without a wired hook.
+    dict_lookup_prechecked: Option<ir::FuncRef>,
     ssa_to_value: HashMap<SsaVar, ir::Value>,
     /// v6-δ M1: overflow bits surfaced by `Add` / `Sub` / `Mul`
     /// lowering. The matching `Guard(ArithOverflow(dst))` predicate
@@ -424,6 +455,16 @@ impl<'a, 'b> TraceEmitterState<'a, 'b> {
                 key_ptr,
                 shape_hash,
             } => self.emit_dict_lookup(*dst, *dict_ptr, *key_ptr, *shape_hash),
+            // F-D8-E.2 -------------------------------------------------
+            TraceOp::DictShapeGuard {
+                dict_ptr,
+                shape_hash,
+            } => self.emit_dict_shape_guard(*dict_ptr, *shape_hash),
+            TraceOp::DictLookupPrechecked {
+                dst,
+                dict_ptr,
+                key_ptr,
+            } => self.emit_dict_lookup_prechecked(*dst, *dict_ptr, *key_ptr),
         }
     }
 
@@ -900,6 +941,99 @@ impl<'a, 'b> TraceEmitterState<'a, 'b> {
             .builder
             .ins()
             .call(helper, &[dict_v, key_v, shape_v, self.trace_ctx_ptr]);
+        let val = self.builder.inst_results(inst)[0];
+
+        let sentinel = self.builder.ins().iconst(I64, i64::MIN);
+        let miss = self.builder.ins().icmp(IntCC::Equal, val, sentinel);
+        let ok_block = self.builder.create_block();
+        let guard_pc = self.builder.ins().iconst(I32, 0);
+        let external_pc = self.builder.ins().iconst(I64, 0);
+        self.builder.ins().brif(
+            miss,
+            self.deopt_block,
+            &[BlockArg::Value(guard_pc), BlockArg::Value(external_pc)],
+            ok_block,
+            &[],
+        );
+        self.builder.seal_block(ok_block);
+        self.builder.switch_to_block(ok_block);
+        self.bind(dst, val);
+        Ok(())
+    }
+
+    /// F-D8-E.2: lower `TraceOp::DictShapeGuard { dict_ptr,
+    /// shape_hash }` to an inline shape-fingerprint compare with a
+    /// straight branch into the shared deopt block on mismatch.
+    ///
+    /// Emit shape:
+    ///
+    /// ```text
+    /// %actual = load.i64 dict_ptr + 0          // dict header's
+    ///                                          // shape_hash field
+    /// %miss   = icmp ne, %actual, imm shape_hash
+    /// brif %miss, deopt_block(0, 0), ok_block
+    /// ok_block:
+    ///   (fallthrough — no SSA bound, no result)
+    /// ```
+    ///
+    /// Cost when the LICM pass hoists this op above the loop head:
+    /// one load + one cmp + one not-taken brif PER TRACE ENTRY, not
+    /// per loop iteration. The paired `DictLookupPrechecked` op then
+    /// calls a runtime helper that skips the same compare on every
+    /// iter.
+    fn emit_dict_shape_guard(
+        &mut self,
+        dict_ptr: SsaVar,
+        shape_hash: u64,
+    ) -> Result<(), EmitError> {
+        let dict_v = self.lookup(dict_ptr)?;
+        let actual = self.builder.ins().load(I64, MemFlags::trusted(), dict_v, 0);
+        let expected = self.builder.ins().iconst(I64, shape_hash as i64);
+        let mismatch = self.builder.ins().icmp(IntCC::NotEqual, actual, expected);
+        let ok_block = self.builder.create_block();
+        let guard_pc = self.builder.ins().iconst(I32, 0);
+        let external_pc = self.builder.ins().iconst(I64, 0);
+        self.builder.ins().brif(
+            mismatch,
+            self.deopt_block,
+            &[BlockArg::Value(guard_pc), BlockArg::Value(external_pc)],
+            ok_block,
+            &[],
+        );
+        self.builder.seal_block(ok_block);
+        self.builder.switch_to_block(ok_block);
+        Ok(())
+    }
+
+    /// F-D8-E.2: lower `TraceOp::DictLookupPrechecked { dst,
+    /// dict_ptr, key_ptr }` to a call into
+    /// `__relon_trace_dict_lookup_prechecked`, then deopt-branch on
+    /// the sentinel return.
+    ///
+    /// Same shape as [`Self::emit_dict_lookup`] except the helper
+    /// takes 3 args (the `shape_hash` immediate is dropped — its
+    /// matching `DictShapeGuard` enforced it upstream). The deopt
+    /// branch is kept because a missing key (e.g. the dict was
+    /// mutated between recorder time and execution time so a
+    /// previously-present entry vanished) still surfaces here even
+    /// when the shape header itself matches.
+    fn emit_dict_lookup_prechecked(
+        &mut self,
+        dst: SsaVar,
+        dict_ptr: SsaVar,
+        key_ptr: SsaVar,
+    ) -> Result<(), EmitError> {
+        let helper = self
+            .dict_lookup_prechecked
+            .ok_or(EmitError::HostHookNotDeclared(
+                HostHookId::DictLookupPrechecked,
+            ))?;
+        let dict_v = self.lookup(dict_ptr)?;
+        let key_v = self.lookup(key_ptr)?;
+        let inst = self
+            .builder
+            .ins()
+            .call(helper, &[dict_v, key_v, self.trace_ctx_ptr]);
         let val = self.builder.inst_results(inst)[0];
 
         let sentinel = self.builder.ins().iconst(I64, i64::MIN);

@@ -15,9 +15,16 @@
 //!    forwarded above plus any plain redundant stores.
 //! 4. [`type_spec::TypeSpec`] -- insert `Guard(TypeCheck(...))`
 //!    ops in front of generic call sites with observed types.
-//! 5. [`licm::LICM`] -- hoist `MarkLoopHead`-bracketed pure
-//!    invariants to the loop entry.
-//! 6. [`dead_store::DeadStoreElim`] (round 2) -- pick up any stores
+//! 5. [`dict_ic_hoist::DictIcHoist`] -- split in-loop
+//!    `TraceOp::DictLookup` ops with loop-invariant `dict_ptr` into
+//!    a hoistable `DictShapeGuard` + an in-loop
+//!    `DictLookupPrechecked`. Runs immediately before LICM so the
+//!    fresh shape-guard ops feed into the LICM scan in the same
+//!    pipeline round.
+//! 6. [`licm::LICM`] -- hoist `MarkLoopHead`-bracketed pure
+//!    invariants (including the freshly inserted `DictShapeGuard`s
+//!    from the previous pass) to the loop entry.
+//! 7. [`dead_store::DeadStoreElim`] (round 2) -- pick up any stores
 //!    that became dead after type specialisation / LICM moved
 //!    guards around.
 //!
@@ -27,6 +34,7 @@
 
 pub mod const_fold;
 pub mod dead_store;
+pub mod dict_ic_hoist;
 pub mod licm;
 pub mod load_forward;
 pub mod noop_typecheck_elim;
@@ -69,6 +77,10 @@ impl OptimizerPipeline {
                 Box::new(load_forward::LoadForwarding),
                 Box::new(dead_store::DeadStoreElim),
                 Box::new(type_spec::TypeSpec),
+                // F-D8-E.2: insert `DictShapeGuard`s ahead of LICM
+                // so the freshly-emitted guards are visible to its
+                // invariant scan in the same pipeline round.
+                Box::new(dict_ic_hoist::DictIcHoist),
                 Box::new(licm::LICM),
                 // ε-M0: drop Guard(TypeCheck(var, ty)) ops whose
                 // observed type already matches expected. Runs AFTER
@@ -110,11 +122,12 @@ mod tests {
     }
 
     #[test]
-    fn default_pipeline_has_seven_passes() {
+    fn default_pipeline_has_eight_passes() {
         // ε-M0 added `noop_typecheck_elim` between LICM and the
-        // second dead-store round.
+        // second dead-store round; F-D8-E.2 added `dict_ic_hoist`
+        // immediately before LICM.
         let p = OptimizerPipeline::default_pipeline();
-        assert_eq!(p.passes.len(), 7);
+        assert_eq!(p.passes.len(), 8);
     }
 
     #[test]
