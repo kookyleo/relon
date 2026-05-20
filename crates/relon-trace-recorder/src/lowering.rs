@@ -270,6 +270,7 @@ pub fn lower_op(op: &Op, cx: OpLoweringContext<'_>) -> LowerOutcome {
         Op::Sub(ty) => binary_arith(cx, *ty, BinaryArith::Sub),
         Op::Mul(ty) => binary_arith(cx, *ty, BinaryArith::Mul),
         Op::Div(ty) => binary_arith(cx, *ty, BinaryArith::Div),
+        Op::Mod(ty) => binary_arith(cx, *ty, BinaryArith::Mod),
 
         Op::Eq(ty) => binary_cmp(cx, *ty, CmpKind::Eq),
         Op::Ne(ty) => binary_cmp(cx, *ty, CmpKind::Ne),
@@ -278,10 +279,12 @@ pub fn lower_op(op: &Op, cx: OpLoweringContext<'_>) -> LowerOutcome {
         Op::Gt(ty) => binary_cmp(cx, *ty, CmpKind::Gt),
         Op::Ge(ty) => binary_cmp(cx, *ty, CmpKind::Ge),
 
-        // Mod / BitAnd are pure but the trace IR has no matching op
-        // today. Surface as UnsupportedOp so the abort path stays
-        // honest — a future phase adds the variants.
-        Op::Mod(_) => LowerOutcome::Abort(AbortReason::UnsupportedOp("Mod")),
+        // BitAnd is pure but the trace IR has no matching op today.
+        // Surface as UnsupportedOp so the abort path stays honest — a
+        // future phase adds the variant.
+        //
+        // F-D8-E.1: `Op::Mod` is wired into `binary_arith` above and
+        // lowers to `TraceOp::Mod`; the legacy abort arm here is gone.
         Op::BitAnd(_) => LowerOutcome::Abort(AbortReason::UnsupportedOp("BitAnd")),
 
         // ---- Local / let -------------------------------------------------
@@ -674,6 +677,7 @@ enum BinaryArith {
     Sub,
     Mul,
     Div,
+    Mod,
 }
 
 fn binary_arith(cx: OpLoweringContext<'_>, ty: IrType, kind: BinaryArith) -> LowerOutcome {
@@ -718,6 +722,16 @@ fn binary_arith(cx: OpLoweringContext<'_>, ty: IrType, kind: BinaryArith) -> Low
             // Div is RecoverableWrite at the trace-IR level — the
             // optimiser captures the dividend pre-value so a
             // div-by-zero deopt can re-execute the divisor.
+            TraceEffect::RecoverableWrite,
+            Some(GuardKind::ArithOverflow(cx.fresh_dst)),
+        ),
+        BinaryArith::Mod => (
+            TraceOp::Mod(cx.fresh_dst, lhs, rhs),
+            // F-D8-E.1: same RecoverableWrite rationale as Div —
+            // `b == 0` traps, and the trace must be able to roll
+            // back to the pre-modulo state on deopt. The same
+            // `ArithOverflow(dst)` guard covers the `i64::MIN % -1`
+            // overflow corner case the cranelift `srem` exposes.
             TraceEffect::RecoverableWrite,
             Some(GuardKind::ArithOverflow(cx.fresh_dst)),
         ),
@@ -862,6 +876,51 @@ mod tests {
             panic!()
         };
         assert_eq!(effect, TraceEffect::RecoverableWrite);
+    }
+
+    /// F-D8-E.1: `Op::Mod(I64)` collapses to a single `TraceOp::Mod`
+    /// plus one `ArithOverflow` guard, instead of the old
+    /// `Div + Mul + Sub` triple. This drift guard pins both the
+    /// opcode and the guard shape so a future refactor cannot
+    /// silently revert to the expansion that cost W5 three guards
+    /// per iter.
+    #[test]
+    fn mod_i64_emits_trace_mod() {
+        let inputs = [SsaVar(1), SsaVar(2)];
+        let outcome = lower_op(&Op::Mod(IrType::I64), cx_with(&inputs, SsaVar(3)));
+        match outcome {
+            LowerOutcome::Emit {
+                op,
+                dst,
+                guards_before,
+                guards_after,
+                effect,
+            } => {
+                assert!(
+                    matches!(op, TraceOp::Mod(_, _, _)),
+                    "Op::Mod(I64) must lower to TraceOp::Mod, got {:?}",
+                    op
+                );
+                assert_eq!(dst, Some(SsaVar(3)));
+                assert!(guards_before.is_empty());
+                assert!(matches!(
+                    guards_after.as_slice(),
+                    [GuardKind::ArithOverflow(_)]
+                ));
+                assert_eq!(effect, TraceEffect::RecoverableWrite);
+            }
+            other => panic!("unexpected outcome for Mod(I64): {:?}", other),
+        }
+    }
+
+    #[test]
+    fn mod_f64_aborts_float_arith() {
+        let inputs = [SsaVar(1), SsaVar(2)];
+        let outcome = lower_op(&Op::Mod(IrType::F64), cx_with(&inputs, SsaVar(3)));
+        assert!(matches!(
+            outcome,
+            LowerOutcome::Abort(AbortReason::UnsupportedOp("FloatArith"))
+        ));
     }
 
     #[test]

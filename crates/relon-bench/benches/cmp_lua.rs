@@ -555,14 +555,15 @@ fn tag(op: Op) -> TaggedOp {
 /// Let-slot layout:
 /// - 0: `I`         — loop counter
 /// - 1: `ACC`       — accumulator
-/// - 2: `KEY_IDX`   — `i % 10`, computed via `i - (i / 10) * 10`
-///   because the recorder lowering has no `Op::Mod` rule today.
-///   `Op::Select`-based wrap is **not** an option: the recorder
-///   specialises Select on the recorded polarity and emits an
-///   `IsZero(cond)` guard that fails after 9 iterations when
-///   `(KEY_IDX == 9)` flips to true — i.e. early deopt every block.
-///   The Div+Mul+Sub triple is hot-path cheap (cranelift folds the
-///   constant 10s) and keeps the trace stable across all N iters.
+/// - 2: `KEY_IDX`   — `i % 10`, lowered through `Op::Mod(IrType::I64)`.
+///   F-D8-E.1 added a dedicated `TraceOp::Mod` so this collapses to
+///   a single `srem` + divisor-zero guard in cranelift, instead of
+///   the old `Div + Mul + Sub` triple (three arith ops, three
+///   `ArithOverflow` guards) the recorder had to emit while no
+///   matching trace op existed. The earlier note about `Op::Select`
+///   not being an option still applies: the recorder specialises
+///   Select on the recorded polarity and would early-deopt every
+///   block once `KEY_IDX == 9`.
 /// - 3: `KEY_PTR`   — `keys_list[KEY_IDX]` (an `i64` payload that the
 ///   recorder treats as a pointer through to `TraceOp::DictLookup`).
 ///
@@ -605,20 +606,13 @@ fn build_w5_recorder_body(shape_hash: u64) -> Vec<TaggedOp> {
                     tag(Op::LocalGet(0)),
                     tag(Op::Ge(IrType::I64)),
                     tag(Op::BrIf { label_depth: 1 }),
-                    // KEY_IDX = i - (i / 10) * 10
-                    tag(Op::LetGet {
-                        idx: I,
-                        ty: IrType::I64,
-                    }),
+                    // KEY_IDX = i % 10 (F-D8-E.1: single TraceOp::Mod)
                     tag(Op::LetGet {
                         idx: I,
                         ty: IrType::I64,
                     }),
                     tag(Op::ConstI64(10)),
-                    tag(Op::Div(IrType::I64)),
-                    tag(Op::ConstI64(10)),
-                    tag(Op::Mul(IrType::I64)),
-                    tag(Op::Sub(IrType::I64)),
+                    tag(Op::Mod(IrType::I64)),
                     tag(Op::LetSet {
                         idx: KEY_IDX,
                         ty: IrType::I64,

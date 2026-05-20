@@ -107,6 +107,17 @@ pub enum TraceOp {
     /// captures the divisor's pre-value for deopt rollback if the
     /// trace fuses around it.
     Div(SsaVar, SsaVar, SsaVar),
+    /// `dst = a % b` (signed integer remainder; matches Rust's `%`
+    /// and cranelift's `srem`). Trap surface is identical to `Div`:
+    /// `b == 0` traps, and the `i64::MIN % -1` corner case is the
+    /// only overflow scenario. Classed `RecoverableWrite` for the
+    /// same divisor-zero deopt rationale as `Div`.
+    ///
+    /// F-D8-E.1: introduced so hot integer-modulo loops (W5's
+    /// `i % 10` index hash) lower to a single SSA op instead of the
+    /// `Div + Mul + Sub` triple the recorder had to emit while no
+    /// matching trace op existed.
+    Mod(SsaVar, SsaVar, SsaVar),
     /// `dst = cmp a b` (bool result via i64-typed slot).
     Cmp(CmpKind, SsaVar, SsaVar, SsaVar),
 
@@ -363,7 +374,9 @@ impl TraceOp {
             | TraceOp::ListGet { .. }
             | TraceOp::DictLookup { .. } => EffectClass::ReadOnly,
 
-            TraceOp::Div(_, _, _) | TraceOp::Store(_, _, _) => EffectClass::RecoverableWrite,
+            TraceOp::Div(_, _, _) | TraceOp::Mod(_, _, _) | TraceOp::Store(_, _, _) => {
+                EffectClass::RecoverableWrite
+            }
 
             TraceOp::Call(_, _, _, eff) => *eff,
         }
@@ -377,6 +390,7 @@ impl TraceOp {
             | TraceOp::Sub(dst, _, _)
             | TraceOp::Mul(dst, _, _)
             | TraceOp::Div(dst, _, _)
+            | TraceOp::Mod(dst, _, _)
             | TraceOp::Cmp(_, dst, _, _)
             | TraceOp::Load(dst, _, _)
             | TraceOp::ConstI32(dst, _)
@@ -405,7 +419,8 @@ impl TraceOp {
             TraceOp::Add(_, a, b)
             | TraceOp::Sub(_, a, b)
             | TraceOp::Mul(_, a, b)
-            | TraceOp::Div(_, a, b) => vec![*a, *b],
+            | TraceOp::Div(_, a, b)
+            | TraceOp::Mod(_, a, b) => vec![*a, *b],
             TraceOp::Cmp(_, _, a, b) => vec![*a, *b],
             TraceOp::Load(_, base, _) => vec![*base],
             TraceOp::Store(base, _, src) => vec![*base, *src],
@@ -522,6 +537,15 @@ mod tests {
         let cst = TraceOp::ConstI64(SsaVar(0), 42);
         assert_eq!(cst.output(), Some(SsaVar(0)));
         assert!(cst.inputs().is_empty());
+    }
+
+    #[test]
+    fn mod_is_recoverable_write_with_io() {
+        let op = TraceOp::Mod(SsaVar(3), SsaVar(1), SsaVar(2));
+        assert_eq!(op.effect_class(), EffectClass::RecoverableWrite);
+        assert_eq!(op.output(), Some(SsaVar(3)));
+        assert_eq!(op.inputs(), vec![SsaVar(1), SsaVar(2)]);
+        assert!(!op.is_guard());
     }
 
     #[test]

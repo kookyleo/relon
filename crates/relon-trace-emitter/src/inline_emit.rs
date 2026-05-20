@@ -262,6 +262,7 @@ impl<'a, 'b> InlineEmitterState<'a, 'b> {
             TraceOp::Sub(dst, a, b) => self.emit_binop_i64(*dst, *a, *b, BinOp::Sub),
             TraceOp::Mul(dst, a, b) => self.emit_binop_i64(*dst, *a, *b, BinOp::Mul),
             TraceOp::Div(dst, a, b) => self.emit_div(*dst, *a, *b),
+            TraceOp::Mod(dst, a, b) => self.emit_mod(*dst, *a, *b),
             TraceOp::Cmp(kind, dst, a, b) => self.emit_cmp(*kind, *dst, *a, *b),
             TraceOp::Load(dst, base, off) => self.emit_load(*dst, *base, off.0),
             TraceOp::Store(base, off, src) => self.emit_store(*base, off.0, *src),
@@ -352,6 +353,30 @@ impl<'a, 'b> InlineEmitterState<'a, 'b> {
         self.builder.seal_block(ok_block);
         self.builder.switch_to_block(ok_block);
         let r = self.builder.ins().sdiv(va, vb);
+        self.bind(dst, r);
+        Ok(())
+    }
+
+    /// F-D8-E.1: `Mod` mirrors `emit_div` — divisor-zero pre-check
+    /// + `srem`. Signed remainder, matches Relon `Int` semantics.
+    fn emit_mod(&mut self, dst: SsaVar, a: SsaVar, b: SsaVar) -> Result<(), InlineEmitError> {
+        let va = self.lookup(a)?;
+        let vb = self.lookup(b)?;
+        let zero = self.builder.ins().iconst(I64, 0);
+        let nonzero = self.builder.ins().icmp(IntCC::NotEqual, vb, zero);
+        let ok_block = self.builder.create_block();
+        let guard_pc = self.builder.ins().iconst(I32, 0);
+        let external_pc = self.builder.ins().iconst(I64, 0);
+        self.builder.ins().brif(
+            nonzero,
+            ok_block,
+            &[],
+            self.deopt_block,
+            &[BlockArg::Value(guard_pc), BlockArg::Value(external_pc)],
+        );
+        self.builder.seal_block(ok_block);
+        self.builder.switch_to_block(ok_block);
+        let r = self.builder.ins().srem(va, vb);
         self.bind(dst, r);
         Ok(())
     }
