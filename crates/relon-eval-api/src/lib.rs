@@ -6,6 +6,11 @@
 //! * Data shapes: [`Value`], [`Scope`], [`Thunk`], [`RuntimeError`].
 //! * Host configuration surface: [`Context`], [`Capabilities`],
 //!   [`NativeFnGate`], native-fn / decorator registration.
+//! * Policy boundary: the [`CapabilityGate`] trait — single source of
+//!   capability-policy truth consulted by every backend (see
+//!   `capability` module docs for the enforcement-timing diff
+//!   between dispatch-time tree-walker checks and vtable-build-time
+//!   cranelift checks).
 //! * Backend contract: the [`Evaluator`] trait — five `&self` methods
 //!   covering one full evaluation lifecycle.
 //!
@@ -24,6 +29,7 @@
 #![allow(unused_assignments)]
 
 pub mod buffer;
+pub mod capability;
 pub mod context;
 pub mod decorator;
 pub mod error;
@@ -35,6 +41,7 @@ pub mod schema_lower;
 pub mod scope;
 pub mod value;
 
+pub use capability::{CapabilityError, CapabilityGate, DenyReason};
 pub use context::{
     Capabilities, CapabilityBit, Context, GatedNativeFn, LoadingModuleGuard, NativeFnGate,
 };

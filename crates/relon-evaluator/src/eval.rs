@@ -1980,21 +1980,27 @@ impl TreeWalkEvaluator {
         self.eval(body, &method_scope)
     }
 
+    /// Tree-walker dispatch-time capability check. Delegates to the
+    /// crate-wide [`relon_eval_api::CapabilityGate`] policy boundary
+    /// so the cranelift backend (which consults the same trait at
+    /// vtable-build time) and any host-supplied gate share a single
+    /// source of truth. See `relon_eval_api::capability` for the
+    /// enforcement-timing diff between the two backends.
     pub(crate) fn check_native_fn_capability(
         &self,
         name: &str,
         entry: &GatedNativeFn,
         range: TokenRange,
     ) -> Result<(), RuntimeError> {
-        let caps = &self.context.capabilities;
-        if let Some(bit) = entry.gate.missing_bits(caps).first() {
-            return Err(RuntimeError::CapabilityDenied {
+        use relon_eval_api::CapabilityGate;
+        match self.context.capabilities.check_gate(&entry.gate) {
+            Ok(()) => Ok(()),
+            Err(err) => Err(RuntimeError::CapabilityDenied {
                 name: name.to_string(),
-                reason: format!("function declared `{bit}` but caller did not grant it"),
+                reason: err.reason.label(err.cap),
                 range,
-            });
+            }),
         }
-        Ok(())
     }
 
     fn fallback_decorator(
