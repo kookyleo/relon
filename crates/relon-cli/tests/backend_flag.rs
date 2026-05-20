@@ -9,16 +9,27 @@
 //! `run_main` through cranelift transparently).
 
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 const BINARY: &str = env!("CARGO_BIN_EXE_relon-cli");
+
+/// Per-call counter so parallel tests in this file each get a unique
+/// fixture path. `std::process::id()` is shared across all tests in
+/// the same binary, and the previous "{pid}-{backend}" scheme
+/// collided when `backends_produce_identical_output` and
+/// `tree_walk_backend_runs_main` both used `tree_walk` concurrently:
+/// one would `remove_file` mid-spawn of the other and the CLI saw a
+/// missing path. The counter discriminates every invocation.
+static FIXTURE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Write a one-off `#main(Int x) -> Int : x * 2` source file under
 /// the system temp dir and run the CLI against it with the supplied
 /// backend flag plus `--args`. Returns the captured stdout (utf-8).
 fn run_doubler(backend: &str) -> String {
     let path = std::env::temp_dir().join(format!(
-        "relon-cli-backend-{}-{}.relon",
+        "relon-cli-backend-{}-{}-{}.relon",
         std::process::id(),
+        FIXTURE_COUNTER.fetch_add(1, Ordering::Relaxed),
         backend.replace('-', "_"),
     ));
     std::fs::write(&path, "#main(Int x) -> Int\nx * 2\n").expect("write fixture");
