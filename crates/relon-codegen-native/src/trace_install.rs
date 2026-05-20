@@ -825,6 +825,18 @@ impl TraceJitState {
                 &str_substring_sig,
             )
             .map_err(|e| TraceJitError::Module(format!("declare str_substring: {e}")))?;
+        // F-D7-I: optional alloc-only helper for the inline `StrConcat`
+        // short-rhs lowering. `(lhs: *const StringRef, total_len: usize)
+        // -> *mut StringRef`.
+        let str_concat_alloc_sig =
+            build_host_helper_signature(&[pointer_ty, pointer_ty], &[pointer_ty]);
+        let str_concat_alloc_id = module
+            .declare_function(
+                relon_trace_emitter::HostHookId::StrConcatAlloc.symbol(),
+                Linkage::Import,
+                &str_concat_alloc_sig,
+            )
+            .map_err(|e| TraceJitError::Module(format!("declare str_concat_alloc: {e}")))?;
         // F-D8: pre-declare the dict/list helpers so traces emitted
         // with `TraceOp::ListGet` / `TraceOp::DictLookup` link
         // cleanly. Same Linkage::Import rationale as save_deopt /
@@ -886,6 +898,7 @@ impl TraceJitState {
             str_contains: str_contains_id.as_u32(),
             str_find: str_find_id.as_u32(),
             str_substring: str_substring_id.as_u32(),
+            str_concat_alloc: Some(str_concat_alloc_id.as_u32()),
             list_get: Some(list_get_id.as_u32()),
             dict_lookup: Some(dict_lookup_id.as_u32()),
             dict_lookup_prechecked: Some(dict_lookup_prechecked_id.as_u32()),
@@ -1276,6 +1289,14 @@ pub fn register_trace_runtime_symbols(builder: &mut JITBuilder) {
     builder.symbol(
         relon_trace_emitter::HostHookId::StrSubstring.symbol(),
         relon_trace_jit::runtime::__relon_str_substring as *const u8,
+    );
+    // F-D7-I: alloc-only helper paired with the inline `StrConcat`
+    // short-rhs lowering. Symbol resolution mirrors the other str
+    // shims; the emitter only emits the call when a trace's const-byte
+    // side table carries a ≤ 16-byte rhs payload.
+    builder.symbol(
+        relon_trace_emitter::HostHookId::StrConcatAlloc.symbol(),
+        relon_trace_jit::runtime::__relon_str_concat_alloc as *const u8,
     );
     // F-D8: dict/list helpers. Symbol resolution happens via
     // `JITBuilder::symbol`; the cranelift emitter's

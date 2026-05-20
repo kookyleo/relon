@@ -521,6 +521,118 @@ fn emit_scan_single_byte(
     builder.seal_block(tail_header);
 }
 
+/// Maximum length of the const rhs payload for which we emit the
+/// inline `StrConcat` lowering. Sized identically to
+/// [`MAX_INLINE_NEEDLE_LEN`] so a `b"a"` style short literal (W3 hot
+/// loop) and a 16-byte boundary literal both land on the inline path
+/// while longer payloads keep the extern shim. Picking the same bound
+/// keeps the per-trace machine code small (`≤16` unrolled stores) and
+/// matches the documented "small constant" envelope.
+pub const MAX_INLINE_CONCAT_RHS_LEN: usize = MAX_INLINE_NEEDLE_LEN;
+
+/// Should `TraceOp::StrConcat` be lowered inline given a known const
+/// rhs payload? Returns `true` for rhs of length
+/// `0..=[`MAX_INLINE_CONCAT_RHS_LEN`]`.
+pub fn concat_rhs_fits_inline(rhs: &[u8]) -> bool {
+    rhs.len() <= MAX_INLINE_CONCAT_RHS_LEN
+}
+
+/// F-D7-I: emit the inline `StrConcat(lhs, <const-rhs>)` lowering into
+/// `builder`. Returns the i64 result value carrying the freshly-
+/// allocated `*const StringRef` pointer.
+///
+/// `lhs` is a `*const StringRef` SSA value (i64); `rhs_bytes` carries
+/// the const payload bytes (UTF-8) known at emit time. Caller is
+/// responsible for the upstream `Guard(NotNull(lhs))` — the recorder's
+/// `emit_str_concat` already emits one before the op, and the
+/// allocator helper defends with a null-return on null lhs as a
+/// backstop.
+///
+/// ## Strategy
+///
+/// The lowering replaces a `call __relon_str_concat(lhs, rhs)` (which
+/// does UTF-8 validation on both operands + `String::with_capacity` +
+/// double `push_str` + `Box<str>` shuffle) with:
+///
+/// 1. `len = load.i64 lhs + STRING_REF_LEN_OFFSET`
+/// 2. `total = len + rhs.len()` (rhs.len is iconst)
+/// 3. `result = call __relon_str_concat_alloc(lhs, total)` — the
+///    helper alloc-and-memcpys the lhs prefix into the new payload
+///    buffer (no UTF-8 work; just a `ptr::copy_nonoverlapping`).
+/// 4. `buf = load.i64 result + STRING_REF_PTR_OFFSET`
+/// 5. Unrolled `store.i8 buf + len + k, iconst(rhs[k])` for each
+///    `k in 0..rhs.len()`. Cranelift's regalloc folds adjacent
+///    stores into wider movs (`mov dword`/`mov qword`) where alignment
+///    and width allow.
+/// 6. `return result`.
+///
+/// The boundary cost shrinks from one full Rust shim call to one tiny
+/// allocator call — the savings are the UTF-8 validation + `String`
+/// growth heuristics + `Box<str>` re-allocation. On the W3 hot loop
+/// (`acc + lit_a`, 1-byte rhs) the inline tail collapses to a single
+/// `store.i8`.
+///
+/// ## Caller contract
+///
+/// `lhs` must be a non-null `*const StringRef` SSA (i64). `rhs_bytes`
+/// must satisfy [`concat_rhs_fits_inline`] (`len ≤
+/// MAX_INLINE_CONCAT_RHS_LEN`); the caller is responsible for routing
+/// over-sized rhs back through the extern `__relon_str_concat` path.
+pub fn emit_str_concat_inline_short_rhs(
+    builder: &mut FunctionBuilder<'_>,
+    str_concat_alloc: ir::FuncRef,
+    lhs: ir::Value,
+    rhs_bytes: &[u8],
+) -> ir::Value {
+    debug_assert!(
+        rhs_bytes.len() <= MAX_INLINE_CONCAT_RHS_LEN,
+        "rhs over inline cap; caller must fall back to extern shim"
+    );
+    // 1. Load lhs.len from the `*const StringRef` header.
+    let lhs_len = builder.ins().load(
+        I64,
+        MemFlags::trusted(),
+        lhs,
+        relon_trace_jit::runtime::STRING_REF_LEN_OFFSET,
+    );
+
+    // 2. total_len = lhs.len + rhs.len(const).
+    let rhs_len_v = builder.ins().iconst(I64, rhs_bytes.len() as i64);
+    let total_len = builder.ins().iadd(lhs_len, rhs_len_v);
+
+    // 3. Call the alloc helper: returns a fresh `*mut StringRef`
+    //    whose buffer is pre-filled with the lhs prefix.
+    let alloc_inst = builder.ins().call(str_concat_alloc, &[lhs, total_len]);
+    let result_ptr = builder.inst_results(alloc_inst)[0];
+
+    // 4. Load the freshly-allocated payload buffer pointer.
+    let buf_ptr = builder.ins().load(
+        I64,
+        MemFlags::trusted(),
+        result_ptr,
+        relon_trace_jit::runtime::STRING_REF_PTR_OFFSET,
+    );
+
+    // 5. tail_addr = buf_ptr + lhs.len. Compute once outside the
+    //    unrolled stores so cranelift's regalloc folds the address
+    //    base into the per-byte store displacements.
+    if !rhs_bytes.is_empty() {
+        let tail_addr = builder.ins().iadd(buf_ptr, lhs_len);
+        // Emit one `store.i8` per rhs byte. For W3 (rhs.len == 1) this
+        // is exactly one instruction in the trace tail.
+        for (k, &b) in rhs_bytes.iter().enumerate() {
+            let b_v = builder.ins().iconst(ir::types::I8, i64::from(b));
+            builder
+                .ins()
+                .store(MemFlags::trusted(), b_v, tail_addr, k as i32);
+        }
+    }
+
+    // 6. Return the *mut StringRef cast back to *const StringRef
+    //    (same i64 slot — opaque to the JIT).
+    result_ptr
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -533,5 +645,13 @@ mod tests {
         assert!(needle_fits_inline(b"0123456789abcdef"));
         // 17 bytes → fall back to extern.
         assert!(!needle_fits_inline(b"0123456789abcdefg"));
+    }
+
+    #[test]
+    fn concat_rhs_fits_inline_thresholds() {
+        assert!(concat_rhs_fits_inline(b""));
+        assert!(concat_rhs_fits_inline(b"a"));
+        assert!(concat_rhs_fits_inline(b"0123456789abcdef"));
+        assert!(!concat_rhs_fits_inline(b"0123456789abcdefg"));
     }
 }

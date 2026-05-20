@@ -235,6 +235,94 @@ pub unsafe extern "C" fn __relon_str_concat(
     StringRef::from_owned(out)
 }
 
+/// F-D7-I: allocator-only helper for the inline `StrConcat` lowering.
+///
+/// The cranelift IR emitted by
+/// `relon_trace_emitter::str_inline::emit_str_concat_inline_short_rhs`
+/// uses this helper to obtain a fresh `StringRef` whose payload buffer
+/// is already populated with the `lhs` bytes — the JIT then writes the
+/// const rhs bytes inline (unrolled stores) at offset `lhs.len`.
+///
+/// Doing the lhs memcpy + StringRef header allocation inside the
+/// helper (rather than fully inline in cranelift IR) keeps the per-iter
+/// machine code small while skipping the costliest parts of the
+/// generic [`__relon_str_concat`]: `StringRef::as_str`'s UTF-8
+/// validation pass over both operands and the `String`/`Box<str>`
+/// re-allocation handoff. The leak-arena story is identical to
+/// [`StringRef::from_owned`] — every call leaks a fresh `Box<[u8]>` +
+/// `Box<StringRef>`; the surrounding `TraceContext` is responsible for
+/// reclaiming on teardown (see module docs).
+///
+/// Returns a non-null `*mut StringRef` whose `(ptr, len)` payload is
+/// `(buf_ptr, total_len)` and whose first `lhs.len()` bytes are copied
+/// from `lhs.ptr`. The remaining `total_len - lhs.len()` bytes are
+/// **uninitialised** — the JIT side is responsible for filling them in
+/// before any read.
+///
+/// `total_len` must be `>= lhs.len()`. On null `lhs` or
+/// `total_len < lhs.len()` the helper returns a null pointer; the JIT
+/// upstream guards against null lhs already (`Guard(NotNull(lhs))`),
+/// so this is a defensive backstop.
+///
+/// ## Safety
+///
+/// `lhs` must be null or a valid `*const StringRef` previously produced
+/// by another shim or by [`StringRef::from_owned`] /
+/// [`StringRef::from_static`].
+#[no_mangle]
+pub unsafe extern "C" fn __relon_str_concat_alloc(
+    lhs: *const StringRef,
+    total_len: usize,
+) -> *mut StringRef {
+    if lhs.is_null() {
+        return std::ptr::null_mut();
+    }
+    let lhs_ref = &*lhs;
+    let lhs_len = lhs_ref.len;
+    if total_len < lhs_len {
+        return std::ptr::null_mut();
+    }
+    // Single-block layout: `[StringRef header | payload bytes]` in one
+    // contiguous allocation. Saves a `Box<[u8]>` + `Box<StringRef>`
+    // double-alloc per iter vs the historical two-block design — the
+    // measured W3 hot loop spends most of its time inside the
+    // allocator, so halving the per-iter alloc count is the single
+    // biggest lever.
+    //
+    // Layout discipline: the payload bytes sit at
+    // `(header_ptr as *u8).add(size_of::<StringRef>())`. The
+    // `StringRef::ptr` field carries that interior pointer so the rest
+    // of the runtime treats this allocation identically to the
+    // historical two-block one.
+    use std::alloc::{alloc, Layout};
+    let header_size = std::mem::size_of::<StringRef>();
+    let header_align = std::mem::align_of::<StringRef>();
+    debug_assert!(header_size % header_align == 0);
+    let block_size = header_size + total_len;
+    let layout = Layout::from_size_align(block_size, header_align)
+        .expect("StringRef block layout must be valid");
+    let block = alloc(layout);
+    if block.is_null() {
+        // Allocator failed; surface as a null sentinel (the JIT side
+        // treats this as a deopt). We do not call `handle_alloc_error`
+        // because the calling trace expects a recoverable null.
+        return std::ptr::null_mut();
+    }
+    let payload_ptr = block.add(header_size);
+    if lhs_len > 0 && !lhs_ref.ptr.is_null() {
+        std::ptr::copy_nonoverlapping(lhs_ref.ptr, payload_ptr, lhs_len);
+    }
+    let header_ptr = block as *mut StringRef;
+    std::ptr::write(
+        header_ptr,
+        StringRef {
+            ptr: payload_ptr as *const u8,
+            len: total_len,
+        },
+    );
+    header_ptr
+}
+
 /// F-D7 `__relon_str_contains`. Consults the single-slot
 /// MRU cache before scanning; updates the cache on miss.
 ///
@@ -413,6 +501,46 @@ mod tests {
         let r = unsafe { __relon_str_substring(s, 2, 0) };
         let out = unsafe { StringRef::as_str(r) }.unwrap();
         assert_eq!(out, "");
+    }
+
+    #[test]
+    fn concat_alloc_copies_lhs_prefix_and_leaves_rhs_tail_uninit() {
+        let lhs = StringRef::from_static("hello");
+        // Reserve 5 + 2 = 7 bytes; the JIT writes the rhs into bytes 5..7.
+        let r = unsafe { __relon_str_concat_alloc(lhs, 7) };
+        assert!(!r.is_null());
+        let r_ref = unsafe { &*r };
+        assert_eq!(r_ref.len, 7);
+        // The first 5 bytes match "hello"; the trailing 2 bytes are
+        // undefined per contract, so we only inspect the prefix.
+        let prefix = unsafe { std::slice::from_raw_parts(r_ref.ptr, 5) };
+        assert_eq!(prefix, b"hello");
+    }
+
+    #[test]
+    fn concat_alloc_rejects_null_lhs() {
+        let r = unsafe { __relon_str_concat_alloc(std::ptr::null(), 4) };
+        assert!(r.is_null());
+    }
+
+    #[test]
+    fn concat_alloc_rejects_undersized_total_len() {
+        let lhs = StringRef::from_static("hello");
+        // total_len < lhs.len → defensive null return.
+        let r = unsafe { __relon_str_concat_alloc(lhs, 3) };
+        assert!(r.is_null());
+    }
+
+    #[test]
+    fn concat_alloc_zero_total_len_returns_empty_buffer() {
+        // Edge case: empty lhs + empty rhs (rhs is the JIT's
+        // responsibility to fill, so the buffer is just a zero-length
+        // ptr). `Box<[u8]>` allocates a non-null sentinel for ZSTs.
+        let lhs = StringRef::from_static("");
+        let r = unsafe { __relon_str_concat_alloc(lhs, 0) };
+        assert!(!r.is_null());
+        let r_ref = unsafe { &*r };
+        assert_eq!(r_ref.len, 0);
     }
 
     #[test]

@@ -143,6 +143,7 @@ pub fn host_hook_slot_offset(hook: HostHookId) -> i32 {
         // emitter can `call` them without a per-op pointer load.
         // Callers that ask for an offset have a bug.
         HostHookId::StrConcat
+        | HostHookId::StrConcatAlloc
         | HostHookId::StrContains
         | HostHookId::StrFind
         | HostHookId::StrSubstring => {
@@ -190,6 +191,15 @@ pub enum HostHookId {
     /// op. Resolution is performed once at install time via
     /// [`HostHookFuncIds`].
     StrConcat,
+    /// F-D7-I: `__relon_str_concat_alloc(lhs: *const StringRef,
+    /// total_len: usize) -> *mut StringRef`. Allocator-only helper for
+    /// the inline `StrConcat` lowering — the cranelift IR uses this to
+    /// reserve a fresh `StringRef` whose payload buffer already holds
+    /// the `lhs` bytes, then inlines unrolled stores for the const
+    /// rhs tail. See
+    /// [`relon_trace_jit::runtime::__relon_str_concat_alloc`] for the
+    /// payload-and-buffer ownership contract.
+    StrConcatAlloc,
     /// F-D7: `__relon_str_contains(*const u8, usize, *const u8, usize) -> i32`.
     StrContains,
     /// F-D7: `__relon_str_find(*const u8, usize, *const u8, usize) -> i64`.
@@ -231,6 +241,7 @@ impl HostHookId {
             HostHookId::ResolveCall => "__relon_trace_resolve_call",
             HostHookId::InlineCacheLookup => "__relon_trace_inline_cache_lookup",
             HostHookId::StrConcat => "__relon_str_concat",
+            HostHookId::StrConcatAlloc => "__relon_str_concat_alloc",
             HostHookId::StrContains => "__relon_str_contains",
             HostHookId::StrFind => "__relon_str_find",
             HostHookId::StrSubstring => "__relon_str_substring",
