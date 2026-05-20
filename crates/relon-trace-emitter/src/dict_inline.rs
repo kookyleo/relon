@@ -160,6 +160,30 @@ pub fn emit_dict_lookup_inline(
     key_ptr: ir::Value,
     deopt_block: ir::Block,
 ) -> ir::Value {
+    emit_dict_lookup_inline_with_entry_count(builder, dict_ptr, key_ptr, deopt_block, None)
+}
+
+/// F-D8-E.5 variant of [`emit_dict_lookup_inline`] that accepts a
+/// preheader-hoisted `entry_count` SSA. When `Some`, the inline body
+/// skips the per-iter `load.u32 [dict_ptr+8] + uextend` pair and
+/// feeds the cached i64 SSA straight into the scan loop's exit
+/// predicate.
+///
+/// We deliberately do NOT hoist `entries_base = dict_ptr + 12` — the
+/// scan body uses it as `scan_idx * 16 + entries_base`, an expression
+/// cranelift folds into a single x86_64 `lea` with displacement when
+/// the iadd_imm stays inside the body. Hoisting it as a separate SSA
+/// would break that fold and net out negative on the hot path.
+///
+/// Functionally identical to the unparametrised entry point when
+/// `entry_count` is `None`.
+pub fn emit_dict_lookup_inline_with_entry_count(
+    builder: &mut FunctionBuilder<'_>,
+    dict_ptr: ir::Value,
+    key_ptr: ir::Value,
+    deopt_block: ir::Block,
+    hoisted_entry_count: Option<ir::Value>,
+) -> ir::Value {
     // ----- Null-key guard ------------------------------------------------
     let zero = builder.ins().iconst(I64, 0);
     let key_null = builder.ins().icmp(IntCC::Equal, key_ptr, zero);
@@ -233,9 +257,22 @@ pub fn emit_dict_lookup_inline(
     let final_hash = builder.block_params(scan_init)[0];
 
     // entry_count is u32 LE at dict_ptr + 8 (shape is +0, already
-    // verified by DictShapeGuard).
-    let entry_count_u32 = builder.ins().load(I32, MemFlags::trusted(), dict_ptr, 8);
-    let entry_count = builder.ins().uextend(I64, entry_count_u32);
+    // verified by DictShapeGuard); entries start at dict_ptr + 12.
+    //
+    // F-D8-E.5: when the caller hoisted `entry_count` out of the loop
+    // (because `dict_ptr` is loop-invariant), reuse the cached SSA
+    // here instead of re-issuing the load every iteration. The hoist
+    // is sourced from the preheader block, which strictly dominates
+    // this scan-init block, so the cranelift verifier accepts the
+    // reused value as a plain input. `entries_base` stays inline so
+    // the `scan_idx * 16 + dict_ptr + 12` chain folds into one `lea`.
+    let entry_count = match hoisted_entry_count {
+        Some(v) => v,
+        None => {
+            let entry_count_u32 = builder.ins().load(I32, MemFlags::trusted(), dict_ptr, 8);
+            builder.ins().uextend(I64, entry_count_u32)
+        }
+    };
     let entries_base = builder.ins().iadd_imm(dict_ptr, 12);
     builder.seal_block(scan_init);
 

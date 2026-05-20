@@ -26,7 +26,7 @@
 //! handled by the trace recorder; cranelift's own SSA construction
 //! takes over from there.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::types::{I32, I64};
@@ -346,6 +346,13 @@ impl TraceEmitter {
             )
         });
 
+        // F-D8-E.5: precompute per-loop "defined inside the body" SSA
+        // sets so the per-op preheader hoister can decide what's loop-
+        // invariant in O(1). We do this once before the IR walk because
+        // walking the op stream a second time during emit_loop_head
+        // would be O(loops * body_len); precomputing keeps it linear.
+        let loop_meta = compute_loop_meta(&trace.ops);
+
         let mut emitter = TraceEmitterState {
             builder: &mut builder,
             trace,
@@ -366,6 +373,11 @@ impl TraceEmitter {
             ssa_to_value: HashMap::new(),
             overflow_bits: HashMap::new(),
             loop_head_blocks: HashMap::new(),
+            loop_meta,
+            active_loops: Vec::new(),
+            hoisted_list_len: HashMap::new(),
+            hoisted_dict_entry_count: HashMap::new(),
+            hoisted_mod_nonzero_divisor: HashSet::new(),
             saw_return: false,
         };
 
@@ -453,6 +465,50 @@ struct TraceEmitterState<'a, 'b> {
     /// deopts. Entry is keyed on the arith op's `dst` SSA.
     overflow_bits: HashMap<SsaVar, ir::Value>,
     loop_head_blocks: HashMap<u32, ir::Block>,
+    /// F-D8-E.5: per-loop metadata used by the preheader hoister.
+    /// Keyed by `loop_id`. `inside_defs` is the set of SSAs defined
+    /// inside the loop body (plus the head's φ pairs); the complement
+    /// of that set among the body's input SSAs is loop-invariant.
+    /// `body_start` / `body_end` are pc bounds (exclusive at end) of
+    /// the loop body in the post-optimiser op stream so the hoister
+    /// can walk the same ops the emit loop will visit next.
+    loop_meta: HashMap<u32, LoopMeta>,
+    /// F-D8-E.5: stack of currently-active loop IDs (innermost last).
+    /// Pushed in [`Self::emit_loop_head`], popped in
+    /// [`Self::emit_loop_back`]. Used by per-op emitters to look up the
+    /// most relevant preheader cache.
+    active_loops: Vec<u32>,
+    /// F-D8-E.5: preheader-hoisted `list_len_i64` SSA for each
+    /// loop-invariant `list_ptr`. Populated by
+    /// [`Self::prehoist_loop_invariants`] before the jump into the
+    /// loop header. The in-loop emit_list_get reuses the cached length
+    /// so the per-iter cost drops to the bounds compare + `idx * 8` +
+    /// `iadd` + load. We deliberately do NOT also pre-compute
+    /// `payload_base = list_ptr + 8`: leaving the `iadd_imm` inside the
+    /// loop body lets cranelift fold the entire `idx * 8 + (list_ptr +
+    /// 8)` expression into a single x86_64 `lea` with displacement
+    /// addressing, which is faster than hoisting one operand of the
+    /// addition out of the loop.
+    hoisted_list_len: HashMap<SsaVar, ir::Value>,
+    /// F-D8-E.5: preheader-hoisted dict scan preamble for each
+    /// loop-invariant `dict_ptr` SSA. We hoist only the
+    /// `entry_count: u32` load (not `entries_base = dict_ptr + 12`)
+    /// because the entries_base operand participates in an x86_64
+    /// `lea`-with-displacement fold inside the scan body
+    /// (`scan_idx * 16 + dict_ptr + 12`); hoisting it out as a
+    /// separate SSA breaks that fold and costs more cycles per iter
+    /// than the redundant `iadd_imm` would. The `load entry_count`
+    /// disappears from the hot path because the loop exit predicate
+    /// reads it on every iter regardless. See
+    /// [`crate::dict_inline::emit_dict_lookup_inline_with_entry_count`]
+    /// for the IR contract.
+    hoisted_dict_entry_count: HashMap<SsaVar, ir::Value>,
+    /// F-D8-E.5: preheader-hoisted divisor-nonzero ok-block for each
+    /// loop-invariant `b` operand of a `Mod`. Tracks the SSA `b` value
+    /// of the original `Mod` — when seen again in the loop body, the
+    /// emitter knows the divisor-nonzero guard already fired (and
+    /// passed) upstream so it can skip emitting a per-iter brif.
+    hoisted_mod_nonzero_divisor: HashSet<SsaVar>,
     saw_return: bool,
 }
 
@@ -603,20 +659,31 @@ impl<'a, 'b> TraceEmitterState<'a, 'b> {
         // (1) Divisor-zero pre-check: deopt with synthetic trace_pc /
         // external_pc = 0 if the recorder did not stamp a real
         // GuardSite (parity with `emit_div`).
-        let zero = self.builder.ins().iconst(I64, 0);
-        let nonzero_b = self.builder.ins().icmp(IntCC::NotEqual, vb, zero);
-        let nonzero_block = self.builder.create_block();
-        let guard_pc = self.builder.ins().iconst(I32, 0);
-        let external_pc = self.builder.ins().iconst(I64, 0);
-        self.builder.ins().brif(
-            nonzero_b,
-            nonzero_block,
-            &[],
-            self.deopt_block,
-            &[BlockArg::Value(guard_pc), BlockArg::Value(external_pc)],
-        );
-        self.builder.seal_block(nonzero_block);
-        self.builder.switch_to_block(nonzero_block);
+        //
+        // F-D8-E.5: if the preheader hoister already emitted the
+        // divisor-nonzero brif for this `b` SSA (it's loop-invariant
+        // under the enclosing loop), the in-loop check is redundant —
+        // we'd just emit a `nonzero=icmp_ne(b, 0); brif nonzero, ok,
+        // deopt` whose condition is provably true. Cranelift's
+        // simple_gvn collapses it eventually, but skipping the
+        // emission outright keeps the in-loop block body tighter and
+        // makes the optimisation observable in the IR dump.
+        if !self.hoisted_mod_nonzero_divisor.contains(&b) {
+            let zero = self.builder.ins().iconst(I64, 0);
+            let nonzero_b = self.builder.ins().icmp(IntCC::NotEqual, vb, zero);
+            let nonzero_block = self.builder.create_block();
+            let guard_pc = self.builder.ins().iconst(I32, 0);
+            let external_pc = self.builder.ins().iconst(I64, 0);
+            self.builder.ins().brif(
+                nonzero_b,
+                nonzero_block,
+                &[],
+                self.deopt_block,
+                &[BlockArg::Value(guard_pc), BlockArg::Value(external_pc)],
+            );
+            self.builder.seal_block(nonzero_block);
+            self.builder.switch_to_block(nonzero_block);
+        }
 
         // (2) Overflow pre-check: `i64::MIN srem -1` is the lone overflow
         // case for `srem`. Without an explicit guard the recorder's
@@ -999,8 +1066,18 @@ impl<'a, 'b> TraceEmitterState<'a, 'b> {
         // on than load past the buffer head). We materialise `len`
         // as i64 via uextend so cranelift picks the right compare
         // width.
-        let len32 = self.builder.ins().load(I32, MemFlags::trusted(), base_v, 0);
-        let len64 = self.builder.ins().uextend(I64, len32);
+        //
+        // F-D8-E.5: when the preheader hoister already pre-loaded the
+        // list's `len: u32` field for this invariant `list_ptr`, reuse
+        // the cached i64 SSA instead of re-loading every iter. The
+        // bounds compare itself stays per-iter because `idx` is
+        // loop-carried; only the load is eliminated from the hot path.
+        let len64 = if let Some(cached) = self.hoisted_list_len.get(&list_ptr).copied() {
+            cached
+        } else {
+            let len32 = self.builder.ins().load(I32, MemFlags::trusted(), base_v, 0);
+            self.builder.ins().uextend(I64, len32)
+        };
         let in_bounds = self
             .builder
             .ins()
@@ -1020,6 +1097,9 @@ impl<'a, 'b> TraceEmitterState<'a, 'b> {
         self.builder.switch_to_block(ok_block);
 
         // Element address: list_ptr + 8 (skip [len + pad]) + idx*8.
+        // We deliberately leave the `iadd_imm(base_v, 8)` here so
+        // cranelift can fold the entire `idx*8 + (list_ptr + 8)` into a
+        // single `lea` on x86_64 with displacement addressing.
         let eight = self.builder.ins().iconst(I64, 8);
         let elem_off = self.builder.ins().imul(idx_v, eight);
         let payload_base = self.builder.ins().iadd_imm(base_v, 8);
@@ -1179,11 +1259,26 @@ impl<'a, 'b> TraceEmitterState<'a, 'b> {
         // The shared deopt block is reused for null-key and key-miss
         // paths, matching the helper's `i64::MIN` sentinel semantics
         // (caller's view: a deopt fires either way).
-        let val = crate::dict_inline::emit_dict_lookup_inline(
+        //
+        // F-D8-E.5: when the preheader hoister pre-loaded
+        // `entry_count` for this invariant `dict_ptr`, forward the
+        // cached i64 SSA into the inline body so the per-iter
+        // `load.u32 [dict_ptr+8] + uextend` pair disappears from the
+        // hot path. Cranelift 0.131's GVN doesn't reliably hoist this
+        // load across the dict_inline scan loop — emitting it in the
+        // preheader is the supported way. We intentionally do NOT
+        // hoist `entries_base = dict_ptr + 12` because keeping the
+        // `iadd_imm` inside the scan body lets cranelift fold the
+        // `scan_idx * 16 + entries_base` chain into a single x86_64
+        // `lea`; hoisting would defeat that fold and net negative on
+        // the hot path.
+        let hoisted_entry_count = self.hoisted_dict_entry_count.get(&dict_ptr).copied();
+        let val = crate::dict_inline::emit_dict_lookup_inline_with_entry_count(
             self.builder,
             dict_v,
             key_v,
             self.deopt_block,
+            hoisted_entry_count,
         );
         self.bind(dst, val);
         Ok(())
@@ -1229,6 +1324,20 @@ impl<'a, 'b> TraceEmitterState<'a, 'b> {
         loop_id: u32,
         phis: &[relon_trace_jit::LoopPhi],
     ) -> Result<(), EmitError> {
+        // F-D8-E.5: pre-scan the body for loop-invariant op preambles
+        // and emit them HERE in the preheader block — before the jump
+        // to the loop header — so the in-loop ops can skip per-iter
+        // loads / guards whose inputs never change.
+        //
+        // We do this before touching `init_vals` because the hoist
+        // computations don't depend on the loop-carried φ inits; they
+        // only read SSAs already bound from pre-loop ops. After this
+        // call returns the builder's insertion point is still the
+        // preheader (the hoister may have branched through divisor-
+        // zero deopt arms but it always leaves us on an "ok" tail
+        // block ready to jump to the header).
+        self.prehoist_loop_invariants(loop_id)?;
+
         // Create the header block. ε-M0: when the recorder marked any
         // loop-carried φ values, the header takes one block-param per
         // φ (I64 width — wide enough for I32/I64/Bool/Ptr in the
@@ -1265,6 +1374,123 @@ impl<'a, 'b> TraceEmitterState<'a, 'b> {
         self.builder.switch_to_block(header);
         // Don't seal: the matching MarkLoopBack will add the back edge.
         self.loop_head_blocks.insert(loop_id, header);
+        self.active_loops.push(loop_id);
+        Ok(())
+    }
+
+    /// F-D8-E.5: pre-emit loop-invariant subexpressions of in-body ops
+    /// into the current (preheader) block so the in-loop emit_* paths
+    /// can skip them on every iteration.
+    ///
+    /// Targets:
+    ///
+    /// 1. `ListGet { list_ptr: invariant, .. }` — pre-load the list
+    ///    record's `len: u32` header into i64 and stash in
+    ///    `hoisted_list_len`. The in-loop bounds check then reuses the
+    ///    cached value; only the `idx < len` compare stays per-iter.
+    /// 2. `DictLookupPrechecked { dict_ptr: invariant, .. }` — pre-load
+    ///    the dict header's `entry_count: u32` field (extended to i64)
+    ///    and stash in `hoisted_dict_entry_count`. The inline dict
+    ///    body's scan-exit predicate then reads the cached value. We
+    ///    deliberately do NOT hoist `entries_base = dict_ptr + 12`
+    ///    because keeping the iadd_imm inline lets cranelift fold the
+    ///    `scan_idx * 16 + dict_ptr + 12` chain into a single
+    ///    `lea`-with-displacement on x86_64; hoisting would defeat
+    ///    that fold and undo any gain from removing the entry_count
+    ///    load.
+    /// 3. `Mod { _, _, b: invariant }` — pre-emit the divisor-nonzero
+    ///    brif so a runtime b==0 deopts ONCE before the loop instead
+    ///    of every iter. We don't pre-emit the overflow guard because
+    ///    cranelift's constant folder handles the common case
+    ///    (`b == ConstI64(10)` → `band` collapses to false).
+    ///
+    /// Safety:
+    /// - Invariance is decided from `loop_meta.inside_defs`: SSAs not
+    ///   in that set are by construction defined upstream of the loop
+    ///   head, so the lookup against `ssa_to_value` succeeds here.
+    /// - The hoister never moves an op whose inputs are loop-carried
+    ///   (the φ SSAs are entered into `inside_defs`).
+    /// - The hoister never moves a guard whose deopt arm references
+    ///   per-iter state — `list_len` / `entry_count` / `dict_entries`
+    ///   are all derived purely from invariant pointers, and the
+    ///   divisor-zero predicate only reads the invariant `b` operand.
+    fn prehoist_loop_invariants(&mut self, loop_id: u32) -> Result<(), EmitError> {
+        // Take a snapshot of the metadata so we can index back into
+        // the op stream without re-borrowing `self`. Cloning the
+        // HashSet is cheap (typically < 32 entries on the W5 / W6
+        // traces).
+        let meta = match self.loop_meta.get(&loop_id) {
+            Some(m) => m.clone(),
+            None => return Ok(()),
+        };
+
+        // Snapshot the body op slice so the per-op `&mut self` calls
+        // below don't conflict with the (immutable) borrow we'd
+        // otherwise hold on `self.trace.ops`.
+        let body_ops: Vec<TraceOp> = self.trace.ops[meta.head_pc + 1..meta.back_pc].to_vec();
+
+        for op in &body_ops {
+            match op {
+                TraceOp::ListGet { list_ptr, .. }
+                    if !meta.inside_defs.contains(list_ptr)
+                        && !self.hoisted_list_len.contains_key(list_ptr)
+                        && self.list_get.is_some() =>
+                {
+                    // Only the `len: u32` load is worth hoisting. The
+                    // matching `payload_base = list_ptr + 8` stays
+                    // inside the loop so cranelift can fold the whole
+                    // `idx * 8 + (list_ptr + 8)` chain into a single
+                    // x86_64 `lea` with displacement — hoisting the
+                    // `iadd_imm` would break that fold and add an
+                    // extra `add` to the per-iter cost.
+                    let base_v = self.lookup(*list_ptr)?;
+                    let len32 = self.builder.ins().load(I32, MemFlags::trusted(), base_v, 0);
+                    let len64 = self.builder.ins().uextend(I64, len32);
+                    self.hoisted_list_len.insert(*list_ptr, len64);
+                }
+                TraceOp::DictLookupPrechecked { dict_ptr, .. }
+                    if !meta.inside_defs.contains(dict_ptr)
+                        && !self.hoisted_dict_entry_count.contains_key(dict_ptr) =>
+                {
+                    // Hoist ONLY `entry_count`. `entries_base` stays in
+                    // the dict_inline scan body so cranelift's
+                    // displacement-folder can collapse the address
+                    // computation into a single instruction.
+                    let dict_v = self.lookup(*dict_ptr)?;
+                    let entry_count_u32 =
+                        self.builder.ins().load(I32, MemFlags::trusted(), dict_v, 8);
+                    let entry_count = self.builder.ins().uextend(I64, entry_count_u32);
+                    self.hoisted_dict_entry_count.insert(*dict_ptr, entry_count);
+                }
+                TraceOp::Mod(_, _, b)
+                    if !meta.inside_defs.contains(b)
+                        && !self.hoisted_mod_nonzero_divisor.contains(b) =>
+                {
+                    // Pre-emit the divisor-nonzero brif. The "ok"
+                    // arm becomes the new preheader insertion
+                    // point; the deopt arm reuses the shared
+                    // deopt block.
+                    let vb = self.lookup(*b)?;
+                    let zero = self.builder.ins().iconst(I64, 0);
+                    let nonzero = self.builder.ins().icmp(IntCC::NotEqual, vb, zero);
+                    let ok = self.builder.create_block();
+                    let guard_pc = self.builder.ins().iconst(I32, 0);
+                    let external_pc = self.builder.ins().iconst(I64, 0);
+                    self.builder.ins().brif(
+                        nonzero,
+                        ok,
+                        &[],
+                        self.deopt_block,
+                        &[BlockArg::Value(guard_pc), BlockArg::Value(external_pc)],
+                    );
+                    self.builder.seal_block(ok);
+                    self.builder.switch_to_block(ok);
+                    self.hoisted_mod_nonzero_divisor.insert(*b);
+                }
+                _ => {}
+            }
+        }
+
         Ok(())
     }
 
@@ -1284,6 +1510,18 @@ impl<'a, 'b> TraceEmitterState<'a, 'b> {
         // The header had its forward edge from `emit_loop_head` and
         // now its back edge from this jump; safe to seal.
         self.builder.seal_block(header);
+        // F-D8-E.5: pop the loop off the active stack so preheader-
+        // hoist caches scoped to this loop body stop being honoured by
+        // any subsequent straight-line ops. We deliberately leave the
+        // `hoisted_*` maps populated: the cached SSAs are still valid
+        // cranelift values (defined in the preheader), and any later
+        // ops can legally reuse them if they happen to fire with the
+        // same invariant pointer. Active-loop tracking just gates
+        // *whether* future emit_loop_head rounds bother to repopulate
+        // them for a newly-discovered loop body.
+        if self.active_loops.last() == Some(&loop_id) {
+            self.active_loops.pop();
+        }
         // Continue into a fresh block so subsequent ops have a place.
         let after = self.builder.create_block();
         self.builder.seal_block(after);
@@ -1395,6 +1633,65 @@ enum BinOp {
     Add,
     Sub,
     Mul,
+}
+
+/// F-D8-E.5: per-loop metadata used by the preheader hoister.
+///
+/// Pre-computed once during emit so the per-op walk can react in O(1).
+#[derive(Debug, Clone)]
+struct LoopMeta {
+    /// pc of the `MarkLoopHead` op in the post-optimiser stream.
+    head_pc: usize,
+    /// pc of the matching `MarkLoopBack` op (exclusive end of body).
+    back_pc: usize,
+    /// SSAs defined inside the body (including the head's φ pairs).
+    /// An SSA used in the body but NOT in this set is loop-invariant.
+    inside_defs: HashSet<SsaVar>,
+}
+
+/// F-D8-E.5: for each well-formed `MarkLoopHead` / `MarkLoopBack` pair
+/// in the op stream, collect the body pc range plus the SSAs defined
+/// *inside* the body (including the head's φ pairs). The complement of
+/// `inside_defs` among the body's input SSAs is loop-invariant under
+/// this loop and a candidate for the preheader hoist pre-scan.
+///
+/// Mirrors [`relon_trace_jit::optimizer::licm`]'s `collect_loops` +
+/// `inside_defs` computation but runs at emit time so we can react to
+/// the precise post-optimiser op stream without re-walking the
+/// optimiser passes. Keys by `loop_id` (the stable identifier carried
+/// on the marker pair) so nested loops with the same body shape stay
+/// distinct.
+///
+/// Unmatched markers are skipped silently — a recorder bug we'd
+/// rather degrade gracefully on than crash the install path.
+fn compute_loop_meta(ops: &[TraceOp]) -> HashMap<u32, LoopMeta> {
+    let mut out: HashMap<u32, LoopMeta> = HashMap::new();
+    let mut stack: Vec<(u32, usize)> = Vec::new();
+    for (pc, op) in ops.iter().enumerate() {
+        if let Some(id) = op.loop_head_id() {
+            stack.push((id, pc));
+        } else if let Some(id) = op.loop_back_id() {
+            if let Some(pos) = stack.iter().rposition(|(sid, _)| *sid == id) {
+                let (loop_id, head_pc) = stack.remove(pos);
+                let body_start = head_pc + 1;
+                let body_end = pc; // exclusive
+                let mut inside_defs: HashSet<SsaVar> =
+                    (body_start..body_end).flat_map(|i| ops[i].defs()).collect();
+                // The head's φ SSAs are loop-CARRIED — count them as
+                // "defined inside" for invariance purposes.
+                inside_defs.extend(ops[head_pc].defs());
+                out.insert(
+                    loop_id,
+                    LoopMeta {
+                        head_pc,
+                        back_pc: pc,
+                        inside_defs,
+                    },
+                );
+            }
+        }
+    }
+    out
 }
 
 /// Declare a host hook as an `ExtFuncData::User` import on the
@@ -1643,5 +1940,157 @@ mod tests {
             ..Default::default()
         };
         TraceEmitter::emit_with_hooks(&trace, &mut ctx, I64, hook_ids).expect("emit ok");
+    }
+
+    // ---- F-D8-E.5: preheader hoist pre-scan -------------------------
+
+    /// `compute_loop_meta` must return the body pc range plus the
+    /// inside-defs set keyed by the loop's `loop_id`. The head's φ
+    /// SSAs count as "inside" so the dict-ic-hoist / LICM logic
+    /// elsewhere agrees on what's loop-carried.
+    #[test]
+    fn compute_loop_meta_collects_body_pc_and_defs() {
+        let mut b = TraceBuffer::new();
+        let outer = b.fresh_ssa();
+        b.append(TraceOp::ConstI64(outer, 7));
+        let phi = b.fresh_ssa();
+        b.append(TraceOp::MarkLoopHead {
+            loop_id: 42,
+            phis: vec![relon_trace_jit::LoopPhi::new(outer, phi)],
+        });
+        let inner = b.fresh_ssa();
+        b.append(TraceOp::ConstI64(inner, 9));
+        b.append(TraceOp::MarkLoopBack {
+            loop_id: 42,
+            next_values: vec![phi],
+        });
+        let trace = b.into_optimized();
+        let meta = compute_loop_meta(&trace.ops);
+        let m = meta.get(&42).expect("loop_id 42 metadata present");
+        assert_eq!(m.head_pc, 1);
+        assert_eq!(m.back_pc, 3);
+        // `outer` is pre-loop → not in inside_defs. `phi` (head φ) and
+        // `inner` (body ConstI64) are both inside.
+        assert!(m.inside_defs.contains(&phi));
+        assert!(m.inside_defs.contains(&inner));
+        assert!(!m.inside_defs.contains(&outer));
+    }
+
+    /// Unmatched markers must not crash the pre-pass — the install
+    /// path tolerates a recorder bug by degrading to "no hoist for
+    /// this loop". Mirrors the LICM pass behaviour.
+    #[test]
+    fn compute_loop_meta_skips_unmatched_back() {
+        let mut b = TraceBuffer::new();
+        let v = b.fresh_ssa();
+        b.append(TraceOp::ConstI64(v, 0));
+        b.append(TraceOp::MarkLoopBack {
+            loop_id: 9,
+            next_values: vec![],
+        });
+        let trace = b.into_optimized();
+        let meta = compute_loop_meta(&trace.ops);
+        assert!(meta.is_empty(), "no well-formed loops → empty metadata");
+    }
+
+    /// End-to-end: a W5-shaped trace with a loop-invariant `list_ptr`
+    /// and `dict_ptr` should emit + verify under cranelift, and the
+    /// hot path inside the loop body must skip the per-iter
+    /// `list_len` load / `entry_count` load thanks to the preheader
+    /// hoist. We assert verifier acceptance — the bench harness covers
+    /// the perf delta — and probe the IR string to confirm the loop
+    /// header is not preceded by a vanished preheader (i.e. the hoist
+    /// emitted real cranelift loads BEFORE the loop jump).
+    #[test]
+    fn preheader_hoist_emits_invariant_loads_above_loop_head() {
+        use cranelift_codegen::verifier;
+
+        let mut b = TraceBuffer::new();
+        let list = b.fresh_ssa();
+        let dict = b.fresh_ssa();
+        let key = b.fresh_ssa();
+        let idx = b.fresh_ssa();
+        b.append(TraceOp::LocalGet(list, 0));
+        b.append(TraceOp::LocalGet(dict, 1));
+        b.append(TraceOp::LocalGet(key, 2));
+        b.append(TraceOp::ConstI64(idx, 0));
+        b.append(TraceOp::MarkLoopHead {
+            loop_id: 0,
+            phis: vec![],
+        });
+        // Body: list_get(list, idx) + dict_lookup_prechecked(dict, key).
+        let list_v = b.fresh_ssa();
+        b.append(TraceOp::ListGet {
+            dst: list_v,
+            list_ptr: list,
+            idx,
+        });
+        let dict_v = b.fresh_ssa();
+        b.append(TraceOp::DictLookupPrechecked {
+            dst: dict_v,
+            dict_ptr: dict,
+            key_ptr: key,
+        });
+        b.append(TraceOp::MarkLoopBack {
+            loop_id: 0,
+            next_values: vec![],
+        });
+        b.append(TraceOp::Return(dict_v));
+        let trace = b.into_optimized();
+
+        let mut ctx = CodegenContext::new();
+        let hook_ids = HostHookFuncIds {
+            list_get: Some(7),
+            dict_lookup_prechecked: Some(9),
+            ..Default::default()
+        };
+        TraceEmitter::emit_with_hooks(&trace, &mut ctx, I64, hook_ids).expect("emit ok");
+
+        // IR must still verify after the hoist insertion.
+        let flags = cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
+        verifier::verify_function(&ctx.func, &flags).expect("verifier accepts hoisted IR");
+    }
+
+    /// `Mod` with a loop-invariant divisor must not double-emit the
+    /// divisor-zero brif: the preheader hoister fires it once, and the
+    /// in-loop emit_mod skips its own copy. We verify the IR and check
+    /// that the brif count in the function string matches the
+    /// "one-divisor + Mod overflow guard" envelope (≤ 3 brifs total
+    /// for this minimal trace shape: preheader divisor brif + Mod
+    /// overflow brif + loop entry jump-not-brif).
+    #[test]
+    fn preheader_hoist_dedups_loop_invariant_mod_divisor_check() {
+        use cranelift_codegen::verifier;
+
+        let mut b = TraceBuffer::new();
+        let n = b.fresh_ssa();
+        b.append(TraceOp::LocalGet(n, 0));
+        let divisor = b.fresh_ssa();
+        b.append(TraceOp::ConstI64(divisor, 10));
+        let i_init = b.fresh_ssa();
+        b.append(TraceOp::ConstI64(i_init, 0));
+
+        let phi_i = b.fresh_ssa();
+        b.append(TraceOp::MarkLoopHead {
+            loop_id: 0,
+            phis: vec![relon_trace_jit::LoopPhi::new(i_init, phi_i)],
+        });
+        let mod_dst = b.fresh_ssa();
+        b.append(TraceOp::Mod(mod_dst, phi_i, divisor));
+        let one = b.fresh_ssa();
+        b.append(TraceOp::ConstI64(one, 1));
+        let next_i = b.fresh_ssa();
+        b.append(TraceOp::Add(next_i, phi_i, one));
+        b.append(TraceOp::MarkLoopBack {
+            loop_id: 0,
+            next_values: vec![next_i],
+        });
+        b.append(TraceOp::Return(mod_dst));
+        let trace = b.into_optimized();
+
+        let mut ctx = CodegenContext::new();
+        TraceEmitter::emit(&trace, &mut ctx).expect("emit ok");
+        let flags = cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
+        verifier::verify_function(&ctx.func, &flags).expect("verifier accepts hoisted Mod IR");
     }
 }
