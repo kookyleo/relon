@@ -416,6 +416,108 @@ impl RecorderState {
         Some(dst)
     }
 
+    /// F-D7-B: emit a `TraceOp::StrConcat(dst, lhs, rhs)` op into the
+    /// trace buffer.
+    ///
+    /// Used by an AST-level / IR-walking driver that has recognised the
+    /// `String + String` shape directly (the parser/IR lowering pipeline
+    /// does not yet produce `Op::Add(IrType::String)` for real source —
+    /// see the comment near [`crate::lowering::lower_str_add`]). Both
+    /// operand SSAs must already be bound in the recorder's tables.
+    ///
+    /// Recorder state side-effects:
+    /// - Appends two `NotNull` guards (one per operand) so the trace
+    ///   deopts cleanly rather than returning a null `StringRef`.
+    /// - Appends `TraceOp::StrConcat(dst, lhs, rhs)` and rebinds the
+    ///   operand-stack mirror (pops both operands, pushes the dst).
+    /// - Records the dst's observed type as `ObservedType::Ptr`
+    ///   (`StringRef *` carries through the trace as a pointer slot).
+    ///
+    /// Returns the destination SSA, or `None` if the recorder is in a
+    /// sticky abort / terminated state.
+    pub fn emit_str_concat(&mut self, lhs: SsaVar, rhs: SsaVar) -> Option<SsaVar> {
+        if self.aborted.is_some() || self.terminated {
+            return None;
+        }
+        if self.buffer.op_count() >= self.capacity {
+            self.aborted = Some(AbortReason::TraceTooLong);
+            return None;
+        }
+        // Guards before the op so a future invocation with a null
+        // operand deopts at the guard rather than crashing inside the
+        // shim. Mirror the order the lowering rule uses.
+        self.emit_guard(GuardKind::NotNull(lhs));
+        self.emit_guard(GuardKind::NotNull(rhs));
+        let dst = self.ssa.alloc();
+        self.buffer.append(TraceOp::StrConcat(dst, lhs, rhs));
+        self.pop_inputs(&[rhs, lhs]);
+        self.push_ssa(dst);
+        self.buffer.record_type(dst, ObservedType::Ptr);
+        Some(dst)
+    }
+
+    /// F-D7-B: emit a `TraceOp::StrContains(dst, haystack, needle)` op
+    /// into the trace buffer, optionally pre-filling the needle's
+    /// const-byte payload so the F-D7-C inline emit path can specialise
+    /// the trace into a literal byte-scan instead of a
+    /// `__relon_str_contains` shim call.
+    ///
+    /// Source-side wiring: a future AST-walker integration recognises
+    /// `s.contains(needle)` and (when `needle` is a literal string node)
+    /// passes `needle_bytes = Some(literal_bytes)`. The recorder
+    /// forwards the bytes into the buffer's `const_bytes` side table —
+    /// the same table [`relon_trace_emitter::emit_str_contains_inline`]
+    /// consults at lowering time. Variable-length needles still call
+    /// through the extern shim.
+    ///
+    /// Recorder state side-effects:
+    /// - Appends a `NotNull` guard on the haystack (mirror of the
+    ///   `STDLIB_IDX_CONTAINS` lowering rule).
+    /// - Appends `TraceOp::StrContains(dst, haystack, needle)` and
+    ///   updates the operand-stack mirror (pops both operands, pushes
+    ///   the dst).
+    /// - Records the dst's observed type as `ObservedType::Bool`
+    ///   (the shim returns `i32 in {0,1}`).
+    /// - Optionally records the const-byte payload via
+    ///   [`TraceBuffer::record_const_bytes`].
+    ///
+    /// Returns the destination SSA, or `None` if the recorder is in a
+    /// sticky abort / terminated state.
+    pub fn emit_str_contains(
+        &mut self,
+        haystack: SsaVar,
+        needle: SsaVar,
+        needle_bytes: Option<Vec<u8>>,
+    ) -> Option<SsaVar> {
+        if self.aborted.is_some() || self.terminated {
+            return None;
+        }
+        if self.buffer.op_count() >= self.capacity {
+            self.aborted = Some(AbortReason::TraceTooLong);
+            return None;
+        }
+        // F-D7 lowering policy: guard the haystack but not the needle.
+        // The inline / shim paths both tolerate a zero-length needle
+        // (return `true`) — emitting a `NotNull(needle)` here would
+        // surface a spurious deopt on the empty-string case.
+        self.emit_guard(GuardKind::NotNull(haystack));
+        let dst = self.ssa.alloc();
+        self.buffer
+            .append(TraceOp::StrContains(dst, haystack, needle));
+        self.pop_inputs(&[needle, haystack]);
+        self.push_ssa(dst);
+        self.buffer.record_type(dst, ObservedType::Bool);
+        // F-D7-C inline-emit hook: with a known-constant needle the
+        // emitter can lower into a tight cranelift byte-scan, saving
+        // the C ABI crossing. The recorder populates the side table
+        // here so the optimiser pipeline and emitter both see the
+        // same view.
+        if let Some(bytes) = needle_bytes {
+            self.buffer.record_const_bytes(needle, bytes);
+        }
+        Some(dst)
+    }
+
     /// ε-M0: open a loop frame and emit a `TraceOp::MarkLoopHead`
     /// carrying one φ pair per [`LoopCarry`].
     ///
@@ -1221,5 +1323,220 @@ mod tests {
         r.abort(AbortReason::TraceTooLong);
         let result = r.emit_list_get(SsaVar(0), SsaVar(1));
         assert!(result.is_none());
+    }
+
+    // ---- F-D7-B: String + / .contains() recognition --------------------
+
+    #[test]
+    fn str_add_irtype_lowers_to_str_concat() {
+        // Hand-build a `[lhs, rhs] -> Op::Add(IrType::String)` op
+        // stream so the recorder's lowering rule sees the same shape
+        // a future AST→IR pass would emit for `String + String`.
+        let mut r = RecorderState::new();
+        let lhs = match r.record_op(&Op::ConstI64(0xaa11), &[], Some(ObservedType::Ptr)) {
+            RecordResult::Ok { value: Some(v) }
+            | RecordResult::NeedsGuard { value: Some(v), .. } => v,
+            other => panic!("ConstI64 lhs: {other:?}"),
+        };
+        let rhs = match r.record_op(&Op::ConstI64(0xbb22), &[], Some(ObservedType::Ptr)) {
+            RecordResult::Ok { value: Some(v) }
+            | RecordResult::NeedsGuard { value: Some(v), .. } => v,
+            other => panic!("ConstI64 rhs: {other:?}"),
+        };
+        let inputs = [rhs, lhs];
+        let dst = match r.record_op(&Op::Add(IrType::String), &inputs, Some(ObservedType::Ptr)) {
+            RecordResult::Ok { value: Some(v) }
+            | RecordResult::NeedsGuard { value: Some(v), .. } => v,
+            other => panic!("Add(String) unexpected: {other:?}"),
+        };
+        let buf = r.buffer();
+        let last = buf.ops.last().expect(">=1 op");
+        match last {
+            TraceOp::StrConcat(d, l, rh) => {
+                assert_eq!(*d, dst);
+                assert_eq!(*l, lhs, "lhs must be second-from-top input");
+                assert_eq!(*rh, rhs, "rhs must be top input");
+            }
+            other => panic!("expected StrConcat, got {other:?}"),
+        }
+        // Two NotNull guards (one per operand) recorded in the
+        // buffer's guard side-table.
+        let str_guards: Vec<_> = buf
+            .guards
+            .iter()
+            .filter(|g| {
+                matches!(
+                    g.kind,
+                    GuardKind::NotNull(v) if v == lhs || v == rhs
+                )
+            })
+            .collect();
+        assert_eq!(
+            str_guards.len(),
+            2,
+            "expected NotNull guards on both operands, got {:?}",
+            buf.guards
+        );
+    }
+
+    #[test]
+    fn str_add_mismatched_irtype_falls_through_to_int_add() {
+        // `Op::Add(IrType::I64)` must still produce the integer Add
+        // path — the String specialisation does NOT swallow integer
+        // arithmetic.
+        let mut r = RecorderState::new();
+        let lhs = match r.record_op(&Op::ConstI64(1), &[], Some(ObservedType::I64)) {
+            RecordResult::Ok { value: Some(v) }
+            | RecordResult::NeedsGuard { value: Some(v), .. } => v,
+            other => panic!("ConstI64 lhs: {other:?}"),
+        };
+        let rhs = match r.record_op(&Op::ConstI64(2), &[], Some(ObservedType::I64)) {
+            RecordResult::Ok { value: Some(v) }
+            | RecordResult::NeedsGuard { value: Some(v), .. } => v,
+            other => panic!("ConstI64 rhs: {other:?}"),
+        };
+        let _ = match r.record_op(&Op::Add(IrType::I64), &[rhs, lhs], Some(ObservedType::I64)) {
+            RecordResult::Ok { value: Some(v) }
+            | RecordResult::NeedsGuard { value: Some(v), .. } => v,
+            other => panic!("Add(I64) unexpected: {other:?}"),
+        };
+        // Last non-guard op must be the integer Add, NOT a StrConcat.
+        let last_arith = r
+            .buffer()
+            .ops
+            .iter()
+            .rev()
+            .find(|op| !matches!(op, TraceOp::Guard(_, _)))
+            .expect(">=1 non-guard op");
+        assert!(
+            matches!(last_arith, TraceOp::Add(_, _, _)),
+            "expected integer Add, got {last_arith:?}"
+        );
+    }
+
+    #[test]
+    fn emit_str_concat_appends_op_and_guards() {
+        // Direct API entry — the AST-level driver passes the two
+        // String SSAs and the recorder emits the canonical
+        // StrConcat + NotNull guards.
+        let mut r = RecorderState::new();
+        let lhs = match r.record_op(&Op::ConstI64(0x1), &[], Some(ObservedType::Ptr)) {
+            RecordResult::Ok { value: Some(v) }
+            | RecordResult::NeedsGuard { value: Some(v), .. } => v,
+            other => panic!("ConstI64 lhs: {other:?}"),
+        };
+        let rhs = match r.record_op(&Op::ConstI64(0x2), &[], Some(ObservedType::Ptr)) {
+            RecordResult::Ok { value: Some(v) }
+            | RecordResult::NeedsGuard { value: Some(v), .. } => v,
+            other => panic!("ConstI64 rhs: {other:?}"),
+        };
+        let dst = r.emit_str_concat(lhs, rhs).expect("concat must succeed");
+        assert_eq!(r.ssa_stack_snapshot(), vec![dst]);
+        let last = r.buffer().ops.last().expect(">=1 op");
+        match last {
+            TraceOp::StrConcat(d, l, rh) => {
+                assert_eq!(*d, dst);
+                assert_eq!(*l, lhs);
+                assert_eq!(*rh, rhs);
+            }
+            other => panic!("expected StrConcat, got {other:?}"),
+        }
+        // dst is typed Ptr in the buffer's type_info side table.
+        assert_eq!(r.buffer().type_info.get(&dst), Some(&ObservedType::Ptr));
+    }
+
+    #[test]
+    fn emit_str_contains_records_const_bytes() {
+        // Constant needle → const_bytes side table is populated so
+        // the F-D7-C inline emit path can specialise into a byte-scan.
+        let mut r = RecorderState::new();
+        let haystack = match r.record_op(&Op::ConstI64(0xa), &[], Some(ObservedType::Ptr)) {
+            RecordResult::Ok { value: Some(v) }
+            | RecordResult::NeedsGuard { value: Some(v), .. } => v,
+            other => panic!("haystack const: {other:?}"),
+        };
+        let needle = match r.record_op(&Op::ConstI64(0xb), &[], Some(ObservedType::Ptr)) {
+            RecordResult::Ok { value: Some(v) }
+            | RecordResult::NeedsGuard { value: Some(v), .. } => v,
+            other => panic!("needle const: {other:?}"),
+        };
+        let needle_payload = b"x".to_vec();
+        let dst = r
+            .emit_str_contains(haystack, needle, Some(needle_payload.clone()))
+            .expect("contains must succeed");
+        assert_eq!(r.ssa_stack_snapshot(), vec![dst]);
+        let buf = r.buffer();
+        match buf.ops.last().expect(">=1 op") {
+            TraceOp::StrContains(d, h, n) => {
+                assert_eq!(*d, dst);
+                assert_eq!(*h, haystack);
+                assert_eq!(*n, needle);
+            }
+            other => panic!("expected StrContains, got {other:?}"),
+        }
+        // const_bytes table carries the needle payload keyed on the
+        // needle SSA, ready for the emitter's inline-emit lookup.
+        assert_eq!(
+            buf.const_bytes.get(&needle).map(|v| v.as_slice()),
+            Some(needle_payload.as_slice())
+        );
+        // Bool result type so the emitter materialises an i32-extended
+        // brif against the dst.
+        assert_eq!(buf.type_info.get(&dst), Some(&ObservedType::Bool));
+        // A NotNull(haystack) guard is recorded but NO NotNull(needle).
+        let has_h_guard = buf
+            .guards
+            .iter()
+            .any(|g| matches!(g.kind, GuardKind::NotNull(v) if v == haystack));
+        let has_n_guard = buf
+            .guards
+            .iter()
+            .any(|g| matches!(g.kind, GuardKind::NotNull(v) if v == needle));
+        assert!(has_h_guard, "expected NotNull(haystack) guard");
+        assert!(
+            !has_n_guard,
+            "must NOT emit NotNull(needle) — empty needle is valid"
+        );
+    }
+
+    #[test]
+    fn emit_str_contains_without_const_needle_skips_side_table() {
+        // No needle bytes passed → const_bytes stays empty; the
+        // emitter will route through the extern shim instead of the
+        // inline byte-scan.
+        let mut r = RecorderState::new();
+        let haystack = match r.record_op(&Op::ConstI64(0xa), &[], Some(ObservedType::Ptr)) {
+            RecordResult::Ok { value: Some(v) }
+            | RecordResult::NeedsGuard { value: Some(v), .. } => v,
+            other => panic!("haystack: {other:?}"),
+        };
+        let needle = match r.record_op(&Op::ConstI64(0xb), &[], Some(ObservedType::Ptr)) {
+            RecordResult::Ok { value: Some(v) }
+            | RecordResult::NeedsGuard { value: Some(v), .. } => v,
+            other => panic!("needle: {other:?}"),
+        };
+        let _ = r
+            .emit_str_contains(haystack, needle, None)
+            .expect("contains must succeed");
+        assert!(
+            r.buffer().const_bytes.is_empty(),
+            "const_bytes must stay empty without a known needle payload"
+        );
+    }
+
+    #[test]
+    fn emit_str_concat_short_circuits_when_aborted() {
+        let mut r = RecorderState::new();
+        r.abort(AbortReason::TraceTooLong);
+        assert!(r.emit_str_concat(SsaVar(0), SsaVar(1)).is_none());
+    }
+
+    #[test]
+    fn emit_str_contains_short_circuits_when_aborted() {
+        let mut r = RecorderState::new();
+        r.abort(AbortReason::TraceTooLong);
+        assert!(r
+            .emit_str_contains(SsaVar(0), SsaVar(1), Some(b"x".to_vec()))
+            .is_none());
     }
 }
