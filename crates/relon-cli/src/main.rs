@@ -2,15 +2,23 @@
 
 use clap::{Parser, Subcommand, ValueEnum};
 use miette::{IntoDiagnostic, LabeledSpan, NamedSource, Report};
-use relon::ResolverChainLoader;
+// Public surface lives on the `relon` facade: `Evaluator` (the
+// backend-agnostic trait), `Scope` / `Value` (the canonical runtime
+// data shapes), plus the `ResolverChainLoader` already routed here.
+// Runtime-impl types (`Context`, `TreeWalkEvaluator`,
+// `FilesystemModuleResolver`, `Capabilities`) remain direct reach
+// into `relon-evaluator` — the CLI's cold-start fast paths (`--lite`,
+// trivial-`#main` auto-detect, cache probing) need the lower-level
+// surface the facade deliberately doesn't expose, and the CLI
+// already declares a direct dep on `relon-evaluator` for them.
+use relon::{Evaluator as EvaluatorTrait, ResolverChainLoader, Scope, Value};
 use relon_analyzer::{
     analyze_entry_with_options, analyze_with_options, AnalyzeOptions, WorkspaceDiagnostic,
     WorkspaceTree,
 };
 use relon_codegen_native::CraneliftAotEvaluator;
-use relon_eval_api::Evaluator as EvaluatorTrait;
 use relon_evaluator::module::FilesystemModuleResolver;
-use relon_evaluator::{Capabilities, Context, Scope, TreeWalkEvaluator, Value};
+use relon_evaluator::{Capabilities, Context, TreeWalkEvaluator};
 use relon_parser::{parse_document, ParseDocumentError};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

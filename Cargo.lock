@@ -1710,6 +1710,7 @@ dependencies = [
  "lsp-server",
  "lsp-types",
  "miette",
+ "relon",
  "relon-analyzer",
  "relon-evaluator",
  "relon-parser",

@@ -1,6 +1,31 @@
 #![forbid(unsafe_code)]
 
+//! ## Re-export contract (v0.2 facade shrink, 2026-05-21)
+//!
+//! Hosts open the box through the typed surface exposed here:
+//! [`from_str`] / [`from_file`] (+ their `_trusted` / `value_` /
+//! `json_` variants), [`EvaluatorBuilder`], [`Backend`],
+//! [`TrustLevel`], the [`Projector`] trait, and the canonical
+//! [`Value`] / [`Scope`] / [`RuntimeError`] re-exports below.
+//!
+//! What we deliberately do **not** wildcard-re-export anymore:
+//! `relon_evaluator::*`, `relon_eval_api::*`, `relon_parser::*`.
+//! Hosts that previously reached `relon::TreeWalkEvaluator` /
+//! `relon::Context` / `relon::parse_document` through the wildcard
+//! re-exports must now either (a) take a dep on the downstream crate
+//! by name (the in-tree binaries — `relon-cli`, `relon-wasm`,
+//! `relon-lsp`, `relon-bench` — already do this) or (b) drive an
+//! [`EvaluatorBuilder`] which produces a `Box<dyn Evaluator>`
+//! without exposing the concrete backend type.
+//!
+//! The [`relon_analyzer`] facade re-export stays — the LSP / wasm
+//! playgrounds consume static-analysis types (`AnalyzedTree`,
+//! `Diagnostic`, `WorkspaceDiagnostic`, …) that have no equivalent
+//! on the runtime surface, and threading them through the facade
+//! would duplicate the entire analyzer API for no benefit.
+
 pub mod auto_evaluator;
+pub mod builder;
 pub mod projector;
 
 use relon_analyzer::{
@@ -10,7 +35,7 @@ use relon_analyzer::{
 #[cfg(not(target_arch = "wasm32"))]
 use relon_evaluator::module::RemoteHttpResolver;
 use relon_evaluator::module::{FilesystemModuleResolver, ModuleResolver, StdModuleResolver};
-use relon_evaluator::{Capabilities, Context, RuntimeError, Scope, TreeWalkEvaluator, Value};
+use relon_evaluator::{Capabilities, Context, TreeWalkEvaluator};
 use relon_parser::parse_document;
 use relon_parser::TokenRange;
 use serde::de::DeserializeOwned;
@@ -18,13 +43,19 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 pub use auto_evaluator::{is_trivial_scalar_main, is_trivial_scalar_main_node, AutoEvaluator};
+pub use builder::{EvaluatorBuilder, TrustLevel};
 pub use projector::{JsonProjector, Projector};
 pub use relon_analyzer;
-#[cfg(feature = "cranelift-aot")]
-pub use relon_codegen_native;
-pub use relon_eval_api;
-pub use relon_evaluator;
-pub use relon_parser;
+// Curated runtime surface. The wildcard re-exports of
+// `relon_evaluator` / `relon_eval_api` / `relon_parser` were dropped
+// in v0.2 — hosts that need a concrete `TreeWalkEvaluator` /
+// `Context` / `parse_document` symbol now take a dep on the
+// downstream crate by name. The canonical data shapes every facade
+// caller actually needs (`Value`, `Scope`, `RuntimeError`) plus the
+// backend-agnostic `Evaluator` trait re-export below so the
+// open-the-box [`EvaluatorBuilder`] path doesn't force a second
+// crate dep just to spell the return / arg types.
+pub use relon_eval_api::{Evaluator, RuntimeError, Scope, Value};
 
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -613,6 +644,15 @@ pub enum BackendError {
     /// decoupled from the bytecode crate's enum.
     #[error("bytecode VM backend setup failed: {0}")]
     Bytecode(String),
+    /// Builder requested a feature the selected backend cannot
+    /// honour. Today the canonical cause is host-native-fn
+    /// registration under [`Backend::CraneliftAot`] /
+    /// [`Backend::Bytecode`]: neither backend dispatches into the
+    /// tree-walker's host-fn table. Surfacing this loud instead of
+    /// silently dropping the registration prevents a class of
+    /// "the script can't see my fn" bug reports.
+    #[error("backend does not support the requested feature: {0}")]
+    UnsupportedFeature(String),
 }
 
 /// Construct an [`relon_eval_api::Evaluator`] over `source` using the
