@@ -3596,6 +3596,14 @@ impl<'a, 'b> Codegen<'a, 'b> {
     /// because the analyzer / IR pass can emit `CheckCap { cap_bit }`
     /// pre-flight before a native fn the host hasn't granted, and
     /// the trap path validates the negative case end-to-end.
+    ///
+    /// Policy boundary: the populated-vs-null slot decision the IR
+    /// reads here is made up-stack by
+    /// [`crate::sandbox::CapabilityVtable::register_via_gate`], which
+    /// consults the shared [`relon_eval_api::CapabilityGate`] — the
+    /// same trait the tree-walker's `check_native_fn_capability`
+    /// invokes at dispatch time. Single source of policy; two
+    /// enforcement-timing surfaces.
     fn emit_check_cap(&mut self, cap_bit: u32) -> Result<(), CraneliftError> {
         if !self.sandbox.capability_check {
             return Ok(());

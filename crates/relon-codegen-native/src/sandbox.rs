@@ -30,7 +30,13 @@
 //!    against zero on every indirect-call site and traps via the
 //!    capability path on miss. The vtable is reconfigured per
 //!    `run_main` so a single compiled module can serve multiple
-//!    capability postures without recompilation.
+//!    capability postures without recompilation. Slot population is
+//!    funnelled through the [`relon_eval_api::CapabilityGate`] trait
+//!    (see [`CapabilityVtable::register_via_gate`]) so the cranelift
+//!    backend's policy decision and the tree-walker's dispatch-time
+//!    check share a single source of truth — the enforcement timing
+//!    differs (build-time for cranelift, dispatch-time for the
+//!    tree-walker) but the policy bit consulted is the same.
 //!
 //! 4. **Resource limit** — the entry prologue performs one
 //!    monotonic-clock read and compares the result against the
@@ -224,6 +230,34 @@ impl CapabilityVtable {
             self.slots.resize(idx + 1, None);
         }
         self.slots[idx] = Some(host_fn);
+    }
+
+    /// Capability-gated registration. Consults `gate` for `cap_bit`
+    /// via the shared [`relon_eval_api::CapabilityGate`] trait; if the
+    /// gate denies the bit, the slot stays `None` so the IR-level
+    /// `cap_lookup` returns null and the call traps with
+    /// `TrapKind::CapabilityDenied`. This is the cranelift backend's
+    /// half of the unified-enforcement design: the same policy that
+    /// the tree-walker consults at dispatch time is consulted here at
+    /// vtable-build time, so denying a bit on the host side produces
+    /// the same outcome class (`RuntimeError::*CapabilityDenied`) on
+    /// both backends.
+    ///
+    /// Returns `true` if the slot was populated; `false` if the gate
+    /// denied the bit (slot left `None`).
+    pub fn register_via_gate<G: relon_eval_api::CapabilityGate>(
+        &mut self,
+        gate: &G,
+        cap_bit: relon_eval_api::CapabilityBit,
+        host_fn: HostFnPtr,
+    ) -> bool {
+        match gate.check(cap_bit) {
+            Ok(()) => {
+                self.register(cap_bit.bit_index(), host_fn);
+                true
+            }
+            Err(_) => false,
+        }
     }
 
     /// Resolve a slot. `None` means the capability is denied.
@@ -700,6 +734,33 @@ mod tests {
         assert!(!cfg.deadline_check);
         assert!(!cfg.capability_check);
         assert!(!cfg.div_check);
+    }
+
+    #[test]
+    fn register_via_gate_denies_when_capability_not_granted() {
+        unsafe extern "C" fn stub(x: i64) -> i64 {
+            x
+        }
+        let caps = relon_eval_api::Capabilities::default();
+        let mut vt = CapabilityVtable::with_capacity(8);
+        // `reads_fs` not granted in the default snapshot — slot stays null.
+        let populated = vt.register_via_gate(&caps, relon_eval_api::CapabilityBit::ReadsFs, stub);
+        assert!(!populated, "denied gate must leave slot unpopulated");
+        assert!(vt.lookup(0).is_none());
+    }
+
+    #[test]
+    fn register_via_gate_populates_when_capability_granted() {
+        unsafe extern "C" fn stub(x: i64) -> i64 {
+            x
+        }
+        let caps = relon_eval_api::Capabilities::all_granted();
+        let mut vt = CapabilityVtable::with_capacity(8);
+        let populated = vt.register_via_gate(&caps, relon_eval_api::CapabilityBit::Network, stub);
+        assert!(populated, "granted gate must populate the slot");
+        assert!(vt
+            .lookup(relon_eval_api::CapabilityBit::Network.bit_index())
+            .is_some());
     }
 
     #[test]
