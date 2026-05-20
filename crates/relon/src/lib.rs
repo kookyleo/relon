@@ -17,7 +17,7 @@ use serde::de::DeserializeOwned;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-pub use auto_evaluator::AutoEvaluator;
+pub use auto_evaluator::{is_trivial_scalar_main, AutoEvaluator};
 pub use projector::{JsonProjector, Projector};
 pub use relon_analyzer;
 #[cfg(feature = "cranelift-aot")]
