@@ -161,9 +161,11 @@ fn resolve_stdlib_func(fn_index: u32) -> Option<relon_ir::StdlibFunction> {
     if fn_index >= relon_ir::stdlib_function_count() {
         return None;
     }
-    relon_ir::builtin_stdlib()
-        .into_iter()
-        .nth(fn_index as usize)
+    // F-D2-G: the static registry slice is cached behind a `OnceLock`;
+    // `clone()` shares the lazy `Arc<OnceLock>` body cell so the
+    // bytecode-side `Func` lift below pays the body-build cost at
+    // most once per process per stdlib slot.
+    relon_ir::builtin_stdlib().get(fn_index as usize).cloned()
 }
 
 /// Build a `field_offset → local_idx` map from a schema offset
@@ -569,11 +571,14 @@ impl<'a> CompileState<'a> {
         let callee: Func = if let Some(stdlib_func) = resolve_stdlib_func(fn_index) {
             // Lift the StdlibFunction body into a Func shape so the
             // existing inline-walker doesn't need to special-case it.
+            // F-D2-G: `body_owned()` forces the lazy body cell on
+            // first touch and returns an owned clone for the lifted
+            // `Func` — subsequent calls hit the cached vector.
             Func {
                 name: stdlib_func.name.to_string(),
-                params: stdlib_func.params,
+                params: stdlib_func.params.clone(),
                 ret: stdlib_func.ret,
-                body: stdlib_func.body,
+                body: stdlib_func.body_owned(),
                 range: relon_parser::TokenRange::default(),
             }
         } else {
