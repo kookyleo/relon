@@ -297,7 +297,7 @@ pub unsafe extern "C" fn __relon_str_concat_alloc(
     use std::alloc::{alloc, Layout};
     let header_size = std::mem::size_of::<StringRef>();
     let header_align = std::mem::align_of::<StringRef>();
-    debug_assert!(header_size % header_align == 0);
+    debug_assert!(header_size.is_multiple_of(header_align));
     let block_size = header_size + total_len;
     let layout = Layout::from_size_align(block_size, header_align)
         .expect("StringRef block layout must be valid");
