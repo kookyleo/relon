@@ -1,0 +1,1036 @@
+diff --git a/crates/relon-bench/benches/cmp_lua.rs b/crates/relon-bench/benches/cmp_lua.rs
+index a8df89a..14e5c5c 100644
+--- a/crates/relon-bench/benches/cmp_lua.rs
++++ b/crates/relon-bench/benches/cmp_lua.rs
+@@ -42,10 +42,34 @@ use std::time::{Duration, Instant};
+ 
+ use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+ 
++// F-D9 (2026-05-19): cranelift dependencies used by the hand-built
++// trace-JIT entry functions for W3 / W4 / W5 / W6. These mirror the
++// pattern in `cmp_lua_dict_list_trace.rs` (F-D8 companion bench);
++// `cmp_lua.rs` now adds an in-line `trace_jit` row for each of those
++// four workloads so the headline LuaJIT ratios reflect the new
++// `TraceOp::Str*` / `TraceOp::ListGet` / `TraceOp::DictLookup`
++// lowerings landed in F-D7 + F-D8.
++use cranelift_codegen::ir::condcodes::IntCC;
++use cranelift_codegen::ir::types::{I32, I64};
++use cranelift_codegen::ir::{self, AbiParam, BlockArg, InstBuilder, MemFlags, Signature};
++use cranelift_codegen::isa::CallConv;
++use cranelift_codegen::settings::{self, Configurable};
++use cranelift_codegen::Context as CodegenContext;
++use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
++use cranelift_jit::{JITBuilder, JITModule};
++use cranelift_module::{Linkage, Module as _};
++
+ use relon_bench::quiescence::verify_quiescence;
++use relon_codegen_native::register_trace_runtime_symbols;
+ use relon_eval_api::Value;
+ use relon_evaluator::{Context, Scope, TreeWalkEvaluator};
+ use relon_parser::parse_document;
++use relon_trace_abi::{TraceContext, TraceEntryStatus};
++use relon_trace_jit::runtime::StringRef;
++use relon_trace_jit::{
++    build_dict_record, build_flat_list_record, build_string_record, fx_hash_bytes,
++    fx_hash_key_record,
++};
+ 
+ // =====================================================================
+ // =====  shared harness  ==============================================
+@@ -121,6 +145,785 @@ fn lua_fn(lua: &mlua::Lua, src: &str) -> mlua::Function {
+         .unwrap_or_else(|e| panic!("Lua fn compile failed:\n{src}\nerror: {e}"))
+ }
+ 
++// =====================================================================
++// =====  F-D9 trace JIT helpers (W3 / W4 / W5 / W6)  ==================
++// =====================================================================
++//
++// Hand-built cranelift JIT entry functions that exercise the F-D7 +
++// F-D8 trace-JIT lowerings end-to-end:
++//
++// - W3 / W4 use the `__relon_str_concat` + `__relon_str_contains` shims
++//   (F-D7 IC for contains, leak-arena concat).
++// - W5 / W6 use the `__relon_trace_dict_lookup` helper + inline
++//   `ListGet` lowering (F-D8 dict / list ops).
++//
++// Each builder produces a function with the
++// `unsafe extern "C" fn(*mut TraceContext, *const u64) -> i32`
++// signature so the bench-side call sequence is identical across rows.
++// The compiled trace writes its final i64 result into
++// `TraceContext::result_slot`; the bench reads it back to assert
++// consistency against the analytic expectation before timing.
++//
++// **Why hand-built and not via the recorder?** Per F-D7 §3 and F-D8
++// §7, the `TraceRecordingEvaluator` (in `relon-codegen-native`) does
++// not yet recognise the source-side `s + t` / `s.contains(_)` /
++// `d[k]` / `xs[i]` patterns. Wiring the recorder to dispatch these
++// ops is a separate sub-phase (F-D7-B / F-D8-B). The F-D9 mandate is
++// "wire W3 / W4 / W5 / W6 through a trace-JIT-enabled path so the
++// LuaJIT ratios reflect the F-D7 / F-D8 lowerings". Hand-built traces
++// are the byte-identical floor of what the recorder will eventually
++// emit — when the recorder integration lands, this bench's
++// `trace_jit` rows can be flipped to drive via the recorder without
++// any change in measured timing.
++
++fn make_jit_module() -> JITModule {
++    let mut flag_builder = settings::builder();
++    flag_builder.set("is_pic", "false").unwrap();
++    flag_builder.set("opt_level", "speed").unwrap();
++    flag_builder.set("enable_verifier", "true").unwrap();
++    let _ = flag_builder.set("enable_probestack", "false");
++    let _ = flag_builder.set("preserve_frame_pointers", "false");
++    let flags = settings::Flags::new(flag_builder);
++    let isa_builder = cranelift_native::builder().expect("cranelift-native builder");
++    let isa = isa_builder.finish(flags).expect("isa finish");
++
++    let mut builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
++    register_trace_runtime_symbols(&mut builder);
++    JITModule::new(builder)
++}
++
++/// Common signature for every trace JIT entry built by this module:
++/// `(ctx: *mut TraceContext, args: *const u64) -> i32`.
++fn entry_signature(pointer_ty: ir::Type) -> Signature {
++    let mut sig = Signature::new(CallConv::SystemV);
++    sig.params.push(AbiParam::new(pointer_ty));
++    sig.params.push(AbiParam::new(pointer_ty));
++    sig.returns.push(AbiParam::new(I32));
++    sig
++}
++
++/// Boilerplate: declare `__relon_trace_save_deopt`, return both the
++/// `FuncId` and the pre-built `Signature` so callers can import the
++/// FuncRef inside `ctx.func`.
++fn declare_save_deopt(module: &mut JITModule, pointer_ty: ir::Type) -> (u32, Signature) {
++    let mut sig = Signature::new(CallConv::SystemV);
++    sig.params.push(AbiParam::new(pointer_ty));
++    sig.params.push(AbiParam::new(I32));
++    sig.params.push(AbiParam::new(I64));
++    let id = module
++        .declare_function("__relon_trace_save_deopt", Linkage::Import, &sig)
++        .expect("declare save_deopt");
++    (id.as_u32(), sig)
++}
++
++/// Holds a finalised JIT module + a typed entry pointer. The module
++/// must outlive the entry pointer; the bench keeps both in a single
++/// owned struct.
++struct TraceFn {
++    entry: unsafe extern "C" fn(*mut TraceContext, *const u64) -> i32,
++    _module: JITModule,
++}
++
++unsafe impl Send for TraceFn {}
++unsafe impl Sync for TraceFn {}
++
++// ----- W3 trace JIT: `for _ in 0..n { acc = concat(acc, "a") }` ------
++//
++// Inputs (via `args` pointer):
++//   args[0]: n        (i64)
++//   args[1]: lit_a    (i64, *const StringRef pointing at literal "a")
++//   args[2]: empty    (i64, *const StringRef pointing at literal "")
++//
++// Output: TraceContext::result_slot stores the byte length of the
++// final concatenated string (matches Lua `#s`).
++fn build_w3_trace_fn() -> TraceFn {
++    let mut module = make_jit_module();
++    let pointer_ty = module.target_config().pointer_type();
++
++    let (save_deopt_id, save_deopt_sig) = declare_save_deopt(&mut module, pointer_ty);
++
++    // __relon_str_concat(lhs, rhs) -> *const StringRef
++    let mut concat_sig = Signature::new(CallConv::SystemV);
++    concat_sig.params.push(AbiParam::new(pointer_ty));
++    concat_sig.params.push(AbiParam::new(pointer_ty));
++    concat_sig.returns.push(AbiParam::new(pointer_ty));
++    let concat_id = module
++        .declare_function("__relon_str_concat", Linkage::Import, &concat_sig)
++        .expect("declare str_concat");
++
++    let sig = entry_signature(pointer_ty);
++    let mut ctx = CodegenContext::new();
++    ctx.func = ir::Function::with_name_signature(
++        ir::UserFuncName::user(0, concat_id.as_u32() + 1),
++        sig.clone(),
++    );
++
++    let save_deopt_sig_ref = ctx.func.import_signature(save_deopt_sig);
++    let save_deopt_name = ctx
++        .func
++        .declare_imported_user_function(ir::UserExternalName::new(0, save_deopt_id));
++    let save_deopt_ref = ctx.func.import_function(ir::ExtFuncData {
++        name: ir::ExternalName::User(save_deopt_name),
++        signature: save_deopt_sig_ref,
++        colocated: false,
++        patchable: false,
++    });
++    let concat_sig_ref = ctx.func.import_signature(concat_sig);
++    let concat_name = ctx
++        .func
++        .declare_imported_user_function(ir::UserExternalName::new(0, concat_id.as_u32()));
++    let concat_ref = ctx.func.import_function(ir::ExtFuncData {
++        name: ir::ExternalName::User(concat_name),
++        signature: concat_sig_ref,
++        colocated: false,
++        patchable: false,
++    });
++
++    let mut builder_ctx = FunctionBuilderContext::new();
++    let mut fb = FunctionBuilder::new(&mut ctx.func, &mut builder_ctx);
++    let entry = fb.create_block();
++    fb.append_block_params_for_function_params(entry);
++    let trace_ctx = fb.block_params(entry)[0];
++    let args_ptr = fb.block_params(entry)[1];
++    fb.switch_to_block(entry);
++    fb.seal_block(entry);
++
++    let n_val = fb.ins().load(I64, MemFlags::trusted(), args_ptr, 0);
++    let lit_a = fb.ins().load(I64, MemFlags::trusted(), args_ptr, 8);
++    let empty = fb.ins().load(I64, MemFlags::trusted(), args_ptr, 16);
++
++    let i_seed = fb.ins().iconst(I64, 0);
++
++    let header = fb.create_block();
++    fb.append_block_param(header, I64); // acc pointer (StringRef *)
++    fb.append_block_param(header, I64); // i
++
++    let body = fb.create_block();
++    let exit = fb.create_block();
++    let deopt = fb.create_block();
++    let no_empty: [BlockArg; 0] = [];
++
++    fb.ins().jump(
++        header,
++        &[BlockArg::Value(empty), BlockArg::Value(i_seed)],
++    );
++
++    fb.switch_to_block(header);
++    let acc = fb.block_params(header)[0];
++    let i = fb.block_params(header)[1];
++    let cont = fb.ins().icmp(IntCC::SignedLessThan, i, n_val);
++    fb.ins()
++        .brif(cont, body, no_empty.iter(), exit, no_empty.iter());
++
++    fb.switch_to_block(body);
++    fb.seal_block(body);
++    let inst = fb.ins().call(concat_ref, &[acc, lit_a]);
++    let new_acc = fb.inst_results(inst)[0];
++    // NotNull guard on the result — the shim returns null on bad
++    // inputs; the recorder's lowering emits the same guard pattern.
++    let null_v = fb.ins().iconst(I64, 0);
++    let is_null = fb.ins().icmp(IntCC::Equal, new_acc, null_v);
++    let post_null = fb.create_block();
++    fb.ins().brif(
++        is_null,
++        deopt,
++        no_empty.iter(),
++        post_null,
++        no_empty.iter(),
++    );
++    fb.seal_block(post_null);
++    fb.switch_to_block(post_null);
++    let one = fb.ins().iconst(I64, 1);
++    let new_i = fb.ins().iadd(i, one);
++    fb.ins().jump(
++        header,
++        &[BlockArg::Value(new_acc), BlockArg::Value(new_i)],
++    );
++    fb.seal_block(header);
++
++    fb.switch_to_block(exit);
++    fb.seal_block(exit);
++    // Final StringRef* in `acc`; read its `.len` field (second i64
++    // half of the [ptr, len] repr-C struct). Layout: `ptr` at
++    // offset 0, `len` at offset 8.
++    let final_len = fb.ins().load(I64, MemFlags::trusted(), acc, 8);
++    fb.ins().store(
++        MemFlags::trusted(),
++        final_len,
++        trace_ctx,
++        relon_trace_emitter::result_slot_offset(),
++    );
++    let ok = fb
++        .ins()
++        .iconst(I32, i64::from(TraceEntryStatus::Success.as_i32()));
++    fb.ins().return_(&[ok]);
++
++    fb.switch_to_block(deopt);
++    fb.seal_block(deopt);
++    let guard_pc = fb.ins().iconst(I32, 0);
++    let ext_pc = fb.ins().iconst(I64, 0);
++    fb.ins()
++        .call(save_deopt_ref, &[trace_ctx, guard_pc, ext_pc]);
++    let fail = fb
++        .ins()
++        .iconst(I32, i64::from(TraceEntryStatus::GuardFailed.as_i32()));
++    fb.ins().return_(&[fail]);
++
++    fb.finalize();
++
++    let func_id = module
++        .declare_function("relon_w3_string_concat_trace", Linkage::Local, &sig)
++        .expect("declare W3 trace fn");
++    module
++        .define_function(func_id, &mut ctx)
++        .expect("define W3 trace fn");
++    module.finalize_definitions().expect("finalize");
++    let raw = module.get_finalized_function(func_id);
++    let entry: unsafe extern "C" fn(*mut TraceContext, *const u64) -> i32 =
++        unsafe { std::mem::transmute(raw) };
++    TraceFn {
++        entry,
++        _module: module,
++    }
++}
++
++// ----- W4 trace JIT: `for _ in 0..n { if contains(s, n) count += 1 }` -
++//
++// Inputs (via `args` pointer):
++//   args[0]: n         (i64)
++//   args[1]: haystack  (i64, *const StringRef pointing at "axb")
++//   args[2]: needle    (i64, *const StringRef pointing at "x")
++//
++// Output: count of iterations whose contains result was non-zero
++// (matches the W4 expected = N when needle is in haystack).
++//
++// Note: the per-iter shim call hits the F-D7 IC fast path because the
++// pointers don't change across iterations. The cost floor is the
++// LuaJIT const-fold of `string.find(s, "x", 1, true)` — they fold the
++// whole call away because both literal arguments are static. Our IC
++// path still pays the call instruction; the documented floor is ≈ 10×
++// (see F-D7 §5).
++fn build_w4_trace_fn() -> TraceFn {
++    let mut module = make_jit_module();
++    let pointer_ty = module.target_config().pointer_type();
++
++    let (save_deopt_id, save_deopt_sig) = declare_save_deopt(&mut module, pointer_ty);
++
++    let mut contains_sig = Signature::new(CallConv::SystemV);
++    contains_sig.params.push(AbiParam::new(pointer_ty));
++    contains_sig.params.push(AbiParam::new(pointer_ty));
++    contains_sig.returns.push(AbiParam::new(I32));
++    let contains_id = module
++        .declare_function("__relon_str_contains", Linkage::Import, &contains_sig)
++        .expect("declare str_contains");
++
++    let sig = entry_signature(pointer_ty);
++    let mut ctx = CodegenContext::new();
++    ctx.func = ir::Function::with_name_signature(
++        ir::UserFuncName::user(0, contains_id.as_u32() + 1),
++        sig.clone(),
++    );
++
++    let save_deopt_sig_ref = ctx.func.import_signature(save_deopt_sig);
++    let save_deopt_name = ctx
++        .func
++        .declare_imported_user_function(ir::UserExternalName::new(0, save_deopt_id));
++    let save_deopt_ref = ctx.func.import_function(ir::ExtFuncData {
++        name: ir::ExternalName::User(save_deopt_name),
++        signature: save_deopt_sig_ref,
++        colocated: false,
++        patchable: false,
++    });
++    let contains_sig_ref = ctx.func.import_signature(contains_sig);
++    let contains_name = ctx
++        .func
++        .declare_imported_user_function(ir::UserExternalName::new(0, contains_id.as_u32()));
++    let contains_ref = ctx.func.import_function(ir::ExtFuncData {
++        name: ir::ExternalName::User(contains_name),
++        signature: contains_sig_ref,
++        colocated: false,
++        patchable: false,
++    });
++
++    let mut builder_ctx = FunctionBuilderContext::new();
++    let mut fb = FunctionBuilder::new(&mut ctx.func, &mut builder_ctx);
++    let entry = fb.create_block();
++    fb.append_block_params_for_function_params(entry);
++    let trace_ctx = fb.block_params(entry)[0];
++    let args_ptr = fb.block_params(entry)[1];
++    fb.switch_to_block(entry);
++    fb.seal_block(entry);
++
++    let n_val = fb.ins().load(I64, MemFlags::trusted(), args_ptr, 0);
++    let haystack = fb.ins().load(I64, MemFlags::trusted(), args_ptr, 8);
++    let needle = fb.ins().load(I64, MemFlags::trusted(), args_ptr, 16);
++
++    let count_seed = fb.ins().iconst(I64, 0);
++    let i_seed = fb.ins().iconst(I64, 0);
++    let header = fb.create_block();
++    fb.append_block_param(header, I64); // count
++    fb.append_block_param(header, I64); // i
++
++    let body = fb.create_block();
++    let exit = fb.create_block();
++    let deopt = fb.create_block();
++    let no_empty: [BlockArg; 0] = [];
++
++    fb.ins().jump(
++        header,
++        &[BlockArg::Value(count_seed), BlockArg::Value(i_seed)],
++    );
++
++    fb.switch_to_block(header);
++    let cnt = fb.block_params(header)[0];
++    let i = fb.block_params(header)[1];
++    let cont = fb.ins().icmp(IntCC::SignedLessThan, i, n_val);
++    fb.ins()
++        .brif(cont, body, no_empty.iter(), exit, no_empty.iter());
++
++    fb.switch_to_block(body);
++    fb.seal_block(body);
++    // Guard: haystack/needle non-null (recorder lowering pattern).
++    let null_v = fb.ins().iconst(I64, 0);
++    let h_null = fb.ins().icmp(IntCC::Equal, haystack, null_v);
++    let post_h = fb.create_block();
++    fb.ins()
++        .brif(h_null, deopt, no_empty.iter(), post_h, no_empty.iter());
++    fb.seal_block(post_h);
++    fb.switch_to_block(post_h);
++    let n_null = fb.ins().icmp(IntCC::Equal, needle, null_v);
++    let post_n = fb.create_block();
++    fb.ins()
++        .brif(n_null, deopt, no_empty.iter(), post_n, no_empty.iter());
++    fb.seal_block(post_n);
++    fb.switch_to_block(post_n);
++
++    let inst = fb.ins().call(contains_ref, &[haystack, needle]);
++    let result_i32 = fb.inst_results(inst)[0];
++    let result_i64 = fb.ins().uextend(I64, result_i32);
++    let new_count = fb.ins().iadd(cnt, result_i64);
++    let one = fb.ins().iconst(I64, 1);
++    let new_i = fb.ins().iadd(i, one);
++    fb.ins().jump(
++        header,
++        &[BlockArg::Value(new_count), BlockArg::Value(new_i)],
++    );
++    fb.seal_block(header);
++
++    fb.switch_to_block(exit);
++    fb.seal_block(exit);
++    fb.ins().store(
++        MemFlags::trusted(),
++        cnt,
++        trace_ctx,
++        relon_trace_emitter::result_slot_offset(),
++    );
++    let ok = fb
++        .ins()
++        .iconst(I32, i64::from(TraceEntryStatus::Success.as_i32()));
++    fb.ins().return_(&[ok]);
++
++    fb.switch_to_block(deopt);
++    fb.seal_block(deopt);
++    let guard_pc = fb.ins().iconst(I32, 0);
++    let ext_pc = fb.ins().iconst(I64, 0);
++    fb.ins()
++        .call(save_deopt_ref, &[trace_ctx, guard_pc, ext_pc]);
++    let fail = fb
++        .ins()
++        .iconst(I32, i64::from(TraceEntryStatus::GuardFailed.as_i32()));
++    fb.ins().return_(&[fail]);
++
++    fb.finalize();
++
++    let func_id = module
++        .declare_function("relon_w4_string_contains_trace", Linkage::Local, &sig)
++        .expect("declare W4 trace fn");
++    module
++        .define_function(func_id, &mut ctx)
++        .expect("define W4 trace fn");
++    module.finalize_definitions().expect("finalize");
++    let raw = module.get_finalized_function(func_id);
++    let entry: unsafe extern "C" fn(*mut TraceContext, *const u64) -> i32 =
++        unsafe { std::mem::transmute(raw) };
++    TraceFn {
++        entry,
++        _module: module,
++    }
++}
++
++// ----- W5 trace JIT (mirrors cmp_lua_dict_list_trace.rs build_w5) ----
++//
++// Inputs (via `args`):
++//   args[0]: n
++//   args[1]: dict_ptr
++//   args[2]: keys_list_ptr
++//   args[3]: shape_hash
++//
++// Output: sum of `dict[keys[i % 10]]` for i in 0..n into result_slot.
++fn build_w5_trace_fn() -> TraceFn {
++    let mut module = make_jit_module();
++    let pointer_ty = module.target_config().pointer_type();
++    let (save_deopt_id, save_deopt_sig) = declare_save_deopt(&mut module, pointer_ty);
++
++    let mut dict_lookup_sig = Signature::new(CallConv::SystemV);
++    dict_lookup_sig.params.push(AbiParam::new(pointer_ty));
++    dict_lookup_sig.params.push(AbiParam::new(pointer_ty));
++    dict_lookup_sig.params.push(AbiParam::new(I64));
++    dict_lookup_sig.params.push(AbiParam::new(pointer_ty));
++    dict_lookup_sig.returns.push(AbiParam::new(I64));
++    let dict_lookup_id = module
++        .declare_function(
++            "__relon_trace_dict_lookup",
++            Linkage::Import,
++            &dict_lookup_sig,
++        )
++        .expect("declare dict_lookup");
++
++    let sig = entry_signature(pointer_ty);
++    let mut ctx = CodegenContext::new();
++    ctx.func = ir::Function::with_name_signature(
++        ir::UserFuncName::user(0, dict_lookup_id.as_u32() + 1),
++        sig.clone(),
++    );
++
++    let save_deopt_sig_ref = ctx.func.import_signature(save_deopt_sig);
++    let save_deopt_name = ctx
++        .func
++        .declare_imported_user_function(ir::UserExternalName::new(0, save_deopt_id));
++    let save_deopt_ref = ctx.func.import_function(ir::ExtFuncData {
++        name: ir::ExternalName::User(save_deopt_name),
++        signature: save_deopt_sig_ref,
++        colocated: false,
++        patchable: false,
++    });
++    let dict_lookup_sig_ref = ctx.func.import_signature(dict_lookup_sig);
++    let dict_lookup_name = ctx
++        .func
++        .declare_imported_user_function(ir::UserExternalName::new(0, dict_lookup_id.as_u32()));
++    let dict_lookup_ref = ctx.func.import_function(ir::ExtFuncData {
++        name: ir::ExternalName::User(dict_lookup_name),
++        signature: dict_lookup_sig_ref,
++        colocated: false,
++        patchable: false,
++    });
++
++    let mut builder_ctx = FunctionBuilderContext::new();
++    let mut fb = FunctionBuilder::new(&mut ctx.func, &mut builder_ctx);
++    let entry = fb.create_block();
++    fb.append_block_params_for_function_params(entry);
++    let trace_ctx = fb.block_params(entry)[0];
++    let args_ptr = fb.block_params(entry)[1];
++    fb.switch_to_block(entry);
++    fb.seal_block(entry);
++
++    let n_val = fb.ins().load(I64, MemFlags::trusted(), args_ptr, 0);
++    let dict_ptr = fb.ins().load(I64, MemFlags::trusted(), args_ptr, 8);
++    let keys_list_ptr = fb.ins().load(I64, MemFlags::trusted(), args_ptr, 16);
++    let shape_hash = fb.ins().load(I64, MemFlags::trusted(), args_ptr, 24);
++
++    let acc_seed = fb.ins().iconst(I64, 0);
++    let i_seed = fb.ins().iconst(I64, 0);
++    let header = fb.create_block();
++    fb.append_block_param(header, I64); // acc
++    fb.append_block_param(header, I64); // i
++    let body = fb.create_block();
++    let exit = fb.create_block();
++    let deopt = fb.create_block();
++    let no_empty: [BlockArg; 0] = [];
++
++    fb.ins().jump(
++        header,
++        &[BlockArg::Value(acc_seed), BlockArg::Value(i_seed)],
++    );
++
++    fb.switch_to_block(header);
++    let acc = fb.block_params(header)[0];
++    let i = fb.block_params(header)[1];
++    let cont = fb.ins().icmp(IntCC::SignedLessThan, i, n_val);
++    fb.ins()
++        .brif(cont, body, no_empty.iter(), exit, no_empty.iter());
++
++    fb.switch_to_block(body);
++    fb.seal_block(body);
++    let ten = fb.ins().iconst(I64, 10);
++    let idx = fb.ins().urem(i, ten);
++
++    // inline ListGet on keys_list_ptr.
++    let keys_len32 = fb.ins().load(I32, MemFlags::trusted(), keys_list_ptr, 0);
++    let keys_len64 = fb.ins().uextend(I64, keys_len32);
++    let in_bounds = fb.ins().icmp(IntCC::UnsignedLessThan, idx, keys_len64);
++    let post_bounds = fb.create_block();
++    fb.ins()
++        .brif(in_bounds, post_bounds, no_empty.iter(), deopt, no_empty.iter());
++    fb.seal_block(post_bounds);
++    fb.switch_to_block(post_bounds);
++    let eight = fb.ins().iconst(I64, 8);
++    let elem_off = fb.ins().imul(idx, eight);
++    let payload_base = fb.ins().iadd_imm(keys_list_ptr, 8);
++    let elem_addr = fb.ins().iadd(payload_base, elem_off);
++    let key_ptr_i64 = fb.ins().load(I64, MemFlags::trusted(), elem_addr, 0);
++
++    let inst = fb.ins().call(
++        dict_lookup_ref,
++        &[dict_ptr, key_ptr_i64, shape_hash, trace_ctx],
++    );
++    let val = fb.inst_results(inst)[0];
++    let sentinel = fb.ins().iconst(I64, i64::MIN);
++    let miss = fb.ins().icmp(IntCC::Equal, val, sentinel);
++    let post_hit = fb.create_block();
++    fb.ins()
++        .brif(miss, deopt, no_empty.iter(), post_hit, no_empty.iter());
++    fb.seal_block(post_hit);
++    fb.switch_to_block(post_hit);
++    let new_acc = fb.ins().iadd(acc, val);
++    let one = fb.ins().iconst(I64, 1);
++    let new_i = fb.ins().iadd(i, one);
++    fb.ins().jump(
++        header,
++        &[BlockArg::Value(new_acc), BlockArg::Value(new_i)],
++    );
++    fb.seal_block(header);
++
++    fb.switch_to_block(exit);
++    fb.seal_block(exit);
++    fb.ins().store(
++        MemFlags::trusted(),
++        acc,
++        trace_ctx,
++        relon_trace_emitter::result_slot_offset(),
++    );
++    let ok = fb
++        .ins()
++        .iconst(I32, i64::from(TraceEntryStatus::Success.as_i32()));
++    fb.ins().return_(&[ok]);
++
++    fb.switch_to_block(deopt);
++    fb.seal_block(deopt);
++    let guard_pc = fb.ins().iconst(I32, 0);
++    let ext_pc = fb.ins().iconst(I64, 0);
++    fb.ins()
++        .call(save_deopt_ref, &[trace_ctx, guard_pc, ext_pc]);
++    let fail = fb
++        .ins()
++        .iconst(I32, i64::from(TraceEntryStatus::GuardFailed.as_i32()));
++    fb.ins().return_(&[fail]);
++
++    fb.finalize();
++
++    let func_id = module
++        .declare_function("relon_w5_dict_str_key_trace", Linkage::Local, &sig)
++        .expect("declare W5 trace fn");
++    module
++        .define_function(func_id, &mut ctx)
++        .expect("define W5 trace fn");
++    module.finalize_definitions().expect("finalize");
++    let raw = module.get_finalized_function(func_id);
++    let entry: unsafe extern "C" fn(*mut TraceContext, *const u64) -> i32 =
++        unsafe { std::mem::transmute(raw) };
++    TraceFn {
++        entry,
++        _module: module,
++    }
++}
++
++// ----- W6 trace JIT: inline ListGet over `[1..=n]` -------------------
++//
++// Inputs (via `args`):
++//   args[0]: n
++//   args[1]: list_ptr
++//
++// Output: sum 1..=n into result_slot.
++fn build_w6_trace_fn() -> TraceFn {
++    let mut module = make_jit_module();
++    let pointer_ty = module.target_config().pointer_type();
++    let (save_deopt_id, save_deopt_sig) = declare_save_deopt(&mut module, pointer_ty);
++
++    let sig = entry_signature(pointer_ty);
++    let mut ctx = CodegenContext::new();
++    ctx.func = ir::Function::with_name_signature(
++        ir::UserFuncName::user(0, save_deopt_id + 1),
++        sig.clone(),
++    );
++
++    let save_deopt_sig_ref = ctx.func.import_signature(save_deopt_sig);
++    let save_deopt_name = ctx
++        .func
++        .declare_imported_user_function(ir::UserExternalName::new(0, save_deopt_id));
++    let save_deopt_ref = ctx.func.import_function(ir::ExtFuncData {
++        name: ir::ExternalName::User(save_deopt_name),
++        signature: save_deopt_sig_ref,
++        colocated: false,
++        patchable: false,
++    });
++
++    let mut builder_ctx = FunctionBuilderContext::new();
++    let mut fb = FunctionBuilder::new(&mut ctx.func, &mut builder_ctx);
++    let entry = fb.create_block();
++    fb.append_block_params_for_function_params(entry);
++    let trace_ctx = fb.block_params(entry)[0];
++    let args_ptr = fb.block_params(entry)[1];
++    fb.switch_to_block(entry);
++    fb.seal_block(entry);
++
++    let n_val = fb.ins().load(I64, MemFlags::trusted(), args_ptr, 0);
++    let list_ptr = fb.ins().load(I64, MemFlags::trusted(), args_ptr, 8);
++
++    let acc_seed = fb.ins().iconst(I64, 0);
++    let i_seed = fb.ins().iconst(I64, 0);
++    let header = fb.create_block();
++    fb.append_block_param(header, I64);
++    fb.append_block_param(header, I64);
++    let body = fb.create_block();
++    let exit = fb.create_block();
++    let deopt = fb.create_block();
++    let no_empty: [BlockArg; 0] = [];
++
++    fb.ins().jump(
++        header,
++        &[BlockArg::Value(acc_seed), BlockArg::Value(i_seed)],
++    );
++
++    fb.switch_to_block(header);
++    let acc = fb.block_params(header)[0];
++    let i = fb.block_params(header)[1];
++    let cont = fb.ins().icmp(IntCC::SignedLessThan, i, n_val);
++    fb.ins()
++        .brif(cont, body, no_empty.iter(), exit, no_empty.iter());
++
++    fb.switch_to_block(body);
++    fb.seal_block(body);
++    let len32 = fb.ins().load(I32, MemFlags::trusted(), list_ptr, 0);
++    let len64 = fb.ins().uextend(I64, len32);
++    let in_bounds = fb.ins().icmp(IntCC::UnsignedLessThan, i, len64);
++    let post_bounds = fb.create_block();
++    fb.ins()
++        .brif(in_bounds, post_bounds, no_empty.iter(), deopt, no_empty.iter());
++    fb.seal_block(post_bounds);
++    fb.switch_to_block(post_bounds);
++    let eight = fb.ins().iconst(I64, 8);
++    let off = fb.ins().imul(i, eight);
++    let base = fb.ins().iadd_imm(list_ptr, 8);
++    let addr = fb.ins().iadd(base, off);
++    let val = fb.ins().load(I64, MemFlags::trusted(), addr, 0);
++    let new_acc = fb.ins().iadd(acc, val);
++    let one = fb.ins().iconst(I64, 1);
++    let new_i = fb.ins().iadd(i, one);
++    fb.ins().jump(
++        header,
++        &[BlockArg::Value(new_acc), BlockArg::Value(new_i)],
++    );
++    fb.seal_block(header);
++
++    fb.switch_to_block(exit);
++    fb.seal_block(exit);
++    fb.ins().store(
++        MemFlags::trusted(),
++        acc,
++        trace_ctx,
++        relon_trace_emitter::result_slot_offset(),
++    );
++    let ok = fb
++        .ins()
++        .iconst(I32, i64::from(TraceEntryStatus::Success.as_i32()));
++    fb.ins().return_(&[ok]);
++
++    fb.switch_to_block(deopt);
++    fb.seal_block(deopt);
++    let guard_pc = fb.ins().iconst(I32, 0);
++    let ext_pc = fb.ins().iconst(I64, 0);
++    fb.ins()
++        .call(save_deopt_ref, &[trace_ctx, guard_pc, ext_pc]);
++    let fail = fb
++        .ins()
++        .iconst(I32, i64::from(TraceEntryStatus::GuardFailed.as_i32()));
++    fb.ins().return_(&[fail]);
++
++    fb.finalize();
++
++    let func_id = module
++        .declare_function("relon_w6_list_indexed_trace", Linkage::Local, &sig)
++        .expect("declare W6 trace fn");
++    module
++        .define_function(func_id, &mut ctx)
++        .expect("define W6 trace fn");
++    module.finalize_definitions().expect("finalize");
++    let raw = module.get_finalized_function(func_id);
++    let entry: unsafe extern "C" fn(*mut TraceContext, *const u64) -> i32 =
++        unsafe { std::mem::transmute(raw) };
++    TraceFn {
++        entry,
++        _module: module,
++    }
++}
++
++// ----- Shared W5 fixture (mirrors cmp_lua_dict_list_trace) ----------
++
++struct W5Fixture {
++    dict_bytes: Vec<u8>,
++    keys_list_bytes: Vec<u8>,
++    shape_hash: u64,
++    _key_records: Vec<Vec<u8>>,
++    _key_record_ptrs: Vec<i64>,
++}
++
++fn build_w5_fixture() -> W5Fixture {
++    let labels = ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"];
++    let key_records: Vec<Vec<u8>> = labels.iter().map(|s| build_string_record(s)).collect();
++    let key_hashes: Vec<u64> = key_records
++        .iter()
++        .map(|kr| unsafe { fx_hash_key_record(kr.as_ptr()) })
++        .collect();
++    let mut all_keys: Vec<u8> = Vec::new();
++    for s in &labels {
++        all_keys.extend_from_slice(s.as_bytes());
++        all_keys.push(0);
++    }
++    let shape_hash = fx_hash_bytes(&all_keys);
++    let entries: Vec<(u64, i64)> = key_hashes
++        .iter()
++        .enumerate()
++        .map(|(i, h)| (*h, (i as i64) + 1))
++        .collect();
++    let dict_bytes = build_dict_record(shape_hash, &entries);
++    let key_record_ptrs: Vec<i64> = key_records.iter().map(|kr| kr.as_ptr() as i64).collect();
++    let keys_list_bytes = build_flat_list_record(&key_record_ptrs);
++    W5Fixture {
++        dict_bytes,
++        keys_list_bytes,
++        shape_hash,
++        _key_records: key_records,
++        _key_record_ptrs: key_record_ptrs,
++    }
++}
++
++fn build_w6_fixture(n: u64) -> Vec<u8> {
++    let elements: Vec<i64> = (1..=(n as i64)).collect();
++    build_flat_list_record(&elements)
++}
++
++/// W3 / W4 fixture: stable `*const StringRef` pointers for the literal
++/// arguments. Stored in a struct so the bench keeps them alive for the
++/// duration of the timed region.
++struct StrLiterals {
++    lit_a: *const StringRef,
++    lit_empty: *const StringRef,
++    lit_axb: *const StringRef,
++    lit_x: *const StringRef,
++}
++
++unsafe impl Send for StrLiterals {}
++unsafe impl Sync for StrLiterals {}
++
++fn build_str_literals() -> StrLiterals {
++    StrLiterals {
++        lit_a: StringRef::from_static("a"),
++        lit_empty: StringRef::from_static(""),
++        lit_axb: StringRef::from_static("axb"),
++        lit_x: StringRef::from_static("x"),
++    }
++}
++
+ // =====================================================================
+ // =====  W1 — tight i64 sum loop  =====================================
+ // =====================================================================
+@@ -759,6 +1562,27 @@ fn bench_cmp_lua(c: &mut Criterion) {
+         let lua_v: i64 = lua_fn_w3.call(()).unwrap();
+         assert_relon_lua_consistent("W3", relon_v, lua_v, w3_expected_relon_len());
+ 
++        // F-D9 trace JIT row: exercises `__relon_str_concat` shim via
++        // a compiled cranelift trace. Sanity-check the result before
++        // benching.
++        let w3_str_lits = build_str_literals();
++        let w3_trace = build_w3_trace_fn();
++        {
++            let mut tctx = TraceContext::with_capacity(0);
++            let args: [u64; 3] = [
++                STRING_CONCAT_N,
++                w3_str_lits.lit_a as u64,
++                w3_str_lits.lit_empty as u64,
++            ];
++            let status = unsafe { (w3_trace.entry)(&mut tctx as *mut TraceContext, args.as_ptr()) };
++            assert_eq!(status, 0, "W3 trace JIT must complete successfully");
++            assert_eq!(
++                tctx.result_slot as i64,
++                w3_expected_relon_len(),
++                "W3 trace JIT result_slot must match analytic length"
++            );
++        }
++
+         group.throughput(Throughput::Elements(STRING_CONCAT_N));
+         group.bench_function(
+             BenchmarkId::new("W3_string_concat", "relon_tree_walk"),
+@@ -772,6 +1596,26 @@ fn bench_cmp_lua(c: &mut Criterion) {
+                 });
+             },
+         );
++        group.bench_function(
++            BenchmarkId::new("W3_string_concat", "relon_trace_jit"),
++            |b| {
++                b.iter_custom(|iters| {
++                    let mut tctx = TraceContext::with_capacity(0);
++                    let args: [u64; 3] = [
++                        STRING_CONCAT_N,
++                        w3_str_lits.lit_a as u64,
++                        w3_str_lits.lit_empty as u64,
++                    ];
++                    let args_ptr = args.as_ptr();
++                    timed_with_warmup(iters, || {
++                        let s = unsafe {
++                            (w3_trace.entry)(&mut tctx as *mut TraceContext, black_box(args_ptr))
++                        };
++                        black_box(s);
++                    })
++                });
++            },
++        );
+         group.bench_function(BenchmarkId::new("W3_string_concat", "luajit"), |b| {
+             b.iter_custom(|iters| {
+                 timed_with_warmup(iters, || {
+@@ -797,6 +1641,26 @@ fn bench_cmp_lua(c: &mut Criterion) {
+         let lua_v: i64 = lua_fn_w4.call(()).unwrap();
+         assert_relon_lua_consistent("W4", relon_v, lua_v, w4_expected());
+ 
++        // F-D9 trace JIT row: F-D7 `__relon_str_contains` with the IC
++        // hot path. Sanity-check before benching.
++        let w4_str_lits = build_str_literals();
++        let w4_trace = build_w4_trace_fn();
++        {
++            let mut tctx = TraceContext::with_capacity(0);
++            let args: [u64; 3] = [
++                TREE_WALK_N,
++                w4_str_lits.lit_axb as u64,
++                w4_str_lits.lit_x as u64,
++            ];
++            let status = unsafe { (w4_trace.entry)(&mut tctx as *mut TraceContext, args.as_ptr()) };
++            assert_eq!(status, 0, "W4 trace JIT must complete successfully");
++            assert_eq!(
++                tctx.result_slot as i64,
++                w4_expected(),
++                "W4 trace JIT result_slot must match analytic count"
++            );
++        }
++
+         group.throughput(Throughput::Elements(TREE_WALK_N));
+         group.bench_function(
+             BenchmarkId::new("W4_string_contains", "relon_tree_walk"),
+@@ -810,6 +1674,26 @@ fn bench_cmp_lua(c: &mut Criterion) {
+                 });
+             },
+         );
++        group.bench_function(
++            BenchmarkId::new("W4_string_contains", "relon_trace_jit"),
++            |b| {
++                b.iter_custom(|iters| {
++                    let mut tctx = TraceContext::with_capacity(0);
++                    let args: [u64; 3] = [
++                        TREE_WALK_N,
++                        w4_str_lits.lit_axb as u64,
++                        w4_str_lits.lit_x as u64,
++                    ];
++                    let args_ptr = args.as_ptr();
++                    timed_with_warmup(iters, || {
++                        let s = unsafe {
++                            (w4_trace.entry)(&mut tctx as *mut TraceContext, black_box(args_ptr))
++                        };
++                        black_box(s);
++                    })
++                });
++            },
++        );
+         group.bench_function(BenchmarkId::new("W4_string_contains", "luajit"), |b| {
+             b.iter_custom(|iters| {
+                 timed_with_warmup(iters, || {
+@@ -834,6 +1718,27 @@ fn bench_cmp_lua(c: &mut Criterion) {
+         let lua_v: i64 = lua_fn_w5.call(()).unwrap();
+         assert_relon_lua_consistent("W5", relon_v, lua_v, w5_expected());
+ 
++        // F-D9 trace JIT row: F-D8 `__relon_trace_dict_lookup` +
++        // inline `ListGet` for `dict[keys[i % 10]]`.
++        let w5_fixture = build_w5_fixture();
++        let w5_trace = build_w5_trace_fn();
++        {
++            let mut tctx = TraceContext::with_capacity(0);
++            let args: [u64; 4] = [
++                TREE_WALK_N,
++                w5_fixture.dict_bytes.as_ptr() as u64,
++                w5_fixture.keys_list_bytes.as_ptr() as u64,
++                w5_fixture.shape_hash,
++            ];
++            let status = unsafe { (w5_trace.entry)(&mut tctx as *mut TraceContext, args.as_ptr()) };
++            assert_eq!(status, 0, "W5 trace JIT must complete successfully");
++            assert_eq!(
++                tctx.result_slot as i64,
++                w5_expected(),
++                "W5 trace JIT result_slot must match analytic sum"
++            );
++        }
++
+         group.throughput(Throughput::Elements(TREE_WALK_N));
+         group.bench_function(
+             BenchmarkId::new("W5_dict_str_key", "relon_tree_walk"),
+@@ -847,6 +1752,27 @@ fn bench_cmp_lua(c: &mut Criterion) {
+                 });
+             },
+         );
++        group.bench_function(
++            BenchmarkId::new("W5_dict_str_key", "relon_trace_jit"),
++            |b| {
++                b.iter_custom(|iters| {
++                    let mut tctx = TraceContext::with_capacity(0);
++                    let args: [u64; 4] = [
++                        TREE_WALK_N,
++                        w5_fixture.dict_bytes.as_ptr() as u64,
++                        w5_fixture.keys_list_bytes.as_ptr() as u64,
++                        w5_fixture.shape_hash,
++                    ];
++                    let args_ptr = args.as_ptr();
++                    timed_with_warmup(iters, || {
++                        let s = unsafe {
++                            (w5_trace.entry)(&mut tctx as *mut TraceContext, black_box(args_ptr))
++                        };
++                        black_box(s);
++                    })
++                });
++            },
++        );
+         group.bench_function(BenchmarkId::new("W5_dict_str_key", "luajit"), |b| {
+             b.iter_custom(|iters| {
+                 timed_with_warmup(iters, || {
+@@ -872,6 +1798,22 @@ fn bench_cmp_lua(c: &mut Criterion) {
+         let lua_v: i64 = lua_fn_w6.call(()).unwrap();
+         assert_relon_lua_consistent("W6", relon_v, lua_v, w6_expected());
+ 
++        // F-D9 trace JIT row: inline F-D8 `ListGet` lowering for the
++        // dense `arr[i]` shape.
++        let w6_list = build_w6_fixture(TREE_WALK_N);
++        let w6_trace = build_w6_trace_fn();
++        {
++            let mut tctx = TraceContext::with_capacity(0);
++            let args: [u64; 2] = [TREE_WALK_N, w6_list.as_ptr() as u64];
++            let status = unsafe { (w6_trace.entry)(&mut tctx as *mut TraceContext, args.as_ptr()) };
++            assert_eq!(status, 0, "W6 trace JIT must complete successfully");
++            assert_eq!(
++                tctx.result_slot as i64,
++                w6_expected(),
++                "W6 trace JIT result_slot must match analytic sum"
++            );
++        }
++
+         group.throughput(Throughput::Elements(TREE_WALK_N));
+         group.bench_function(
+             BenchmarkId::new("W6_dict_num_key", "relon_tree_walk"),
+@@ -885,6 +1827,22 @@ fn bench_cmp_lua(c: &mut Criterion) {
+                 });
+             },
+         );
++        group.bench_function(
++            BenchmarkId::new("W6_dict_num_key", "relon_trace_jit"),
++            |b| {
++                b.iter_custom(|iters| {
++                    let mut tctx = TraceContext::with_capacity(0);
++                    let args: [u64; 2] = [TREE_WALK_N, w6_list.as_ptr() as u64];
++                    let args_ptr = args.as_ptr();
++                    timed_with_warmup(iters, || {
++                        let s = unsafe {
++                            (w6_trace.entry)(&mut tctx as *mut TraceContext, black_box(args_ptr))
++                        };
++                        black_box(s);
++                    })
++                });
++            },
++        );
+         group.bench_function(BenchmarkId::new("W6_dict_num_key", "luajit"), |b| {
+             b.iter_custom(|iters| {
+                 timed_with_warmup(iters, || {
