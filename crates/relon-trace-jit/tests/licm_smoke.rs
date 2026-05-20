@@ -313,3 +313,248 @@ fn ssa_var_passthrough_assertions_compile() {
     // -- guards against future renames.
     let _v = SsaVar(0);
 }
+
+// ---- F-D8-E.3: ListGet / DictLookup / BoundsCheck hoist ------------
+
+#[test]
+fn loop_invariant_list_get_lifts_out_of_loop() {
+    // Layout (e.g. `xs[0]` with constant 0 index — pathological but
+    // realistic when the recorder propagated a const fold):
+    //   ConstI64 list_ptr, ...   (pre-loop, opaque ptr)
+    //   ConstI64 idx, 0          (pre-loop)
+    //   MarkLoopHead 0
+    //   Guard(BoundsCheck(idx, list_ptr))   <- loop-invariant
+    //   ListGet { dst, list_ptr, idx }      <- loop-invariant
+    //   MarkLoopBack 0
+    //
+    // After LICM both the guard and the ListGet should sit before
+    // MarkLoopHead.
+    let mut b = TraceBuffer::new();
+    let list_ptr = b.fresh_ssa();
+    let idx = b.fresh_ssa();
+    let dst = b.fresh_ssa();
+    b.append(TraceOp::ConstI64(list_ptr, 0x1000));
+    b.append(TraceOp::ConstI64(idx, 0));
+    b.append(TraceOp::MarkLoopHead {
+        loop_id: 0,
+        phis: vec![],
+    });
+    b.append(TraceOp::Guard(GuardKind::BoundsCheck(idx, list_ptr), idx));
+    b.append(TraceOp::ListGet { dst, list_ptr, idx });
+    b.append(TraceOp::MarkLoopBack {
+        loop_id: 0,
+        next_values: vec![],
+    });
+
+    let r = LICM.run(&mut b);
+    let head_idx = position(&b.ops, |o| o.is_loop_head()).expect("head missing");
+    let guard_pos = position(&b.ops, |o| {
+        matches!(o, TraceOp::Guard(GuardKind::BoundsCheck(_, _), _))
+    })
+    .expect("BoundsCheck guard missing");
+    let list_get_pos =
+        position(&b.ops, |o| matches!(o, TraceOp::ListGet { .. })).expect("ListGet missing");
+    assert!(
+        guard_pos < head_idx,
+        "BoundsCheck guard must be hoisted before MarkLoopHead, found at {guard_pos} vs head {head_idx}"
+    );
+    assert!(
+        list_get_pos < head_idx,
+        "ListGet must be hoisted before MarkLoopHead"
+    );
+    // Guard precedes the load so the deopt anchor stays adjacent.
+    assert!(
+        guard_pos < list_get_pos,
+        "BoundsCheck guard must remain immediately before its ListGet"
+    );
+    assert!(r.ops_replaced >= 2);
+}
+
+#[test]
+fn loop_variant_idx_keeps_list_get_inside() {
+    // The idx is produced inside the loop body — only `list_ptr` is
+    // invariant. ListGet (and its BoundsCheck guard) must stay inside.
+    let mut b = TraceBuffer::new();
+    let list_ptr = b.fresh_ssa();
+    let counter_base = b.fresh_ssa();
+    let idx_inside = b.fresh_ssa();
+    let dst = b.fresh_ssa();
+    b.append(TraceOp::ConstI64(list_ptr, 0x1000));
+    b.append(TraceOp::ConstI64(counter_base, 0));
+    b.append(TraceOp::MarkLoopHead {
+        loop_id: 0,
+        phis: vec![],
+    });
+    // idx_inside = Load(counter_base, 0) — synthesises a loop-variant
+    // SSA without dragging in MarkLoopHead φ wiring.
+    b.append(TraceOp::Load(idx_inside, counter_base, Offset(0)));
+    b.append(TraceOp::Guard(
+        GuardKind::BoundsCheck(idx_inside, list_ptr),
+        idx_inside,
+    ));
+    b.append(TraceOp::ListGet {
+        dst,
+        list_ptr,
+        idx: idx_inside,
+    });
+    b.append(TraceOp::MarkLoopBack {
+        loop_id: 0,
+        next_values: vec![],
+    });
+
+    LICM.run(&mut b);
+    let head_idx = position(&b.ops, |o| o.is_loop_head()).unwrap();
+    let list_get_pos = position(&b.ops, |o| matches!(o, TraceOp::ListGet { .. })).unwrap();
+    let guard_pos = position(&b.ops, |o| {
+        matches!(o, TraceOp::Guard(GuardKind::BoundsCheck(_, _), _))
+    })
+    .unwrap();
+    assert!(
+        list_get_pos > head_idx,
+        "ListGet with loop-variant idx must stay inside the body"
+    );
+    assert!(
+        guard_pos > head_idx,
+        "BoundsCheck on a loop-variant idx must stay inside the body"
+    );
+}
+
+#[test]
+fn loop_invariant_dict_lookup_lifts_out_of_loop() {
+    // Layout (e.g. `d["k"]` where both pointers come from outside):
+    //   ConstI64 dict_ptr, ...   (pre-loop)
+    //   ConstI64 key_ptr, ...    (pre-loop)
+    //   MarkLoopHead 0
+    //   DictLookup { dst, dict_ptr, key_ptr, shape_hash }
+    //   MarkLoopBack 0
+    let mut b = TraceBuffer::new();
+    let dict_ptr = b.fresh_ssa();
+    let key_ptr = b.fresh_ssa();
+    let dst = b.fresh_ssa();
+    b.append(TraceOp::ConstI64(dict_ptr, 0x2000));
+    b.append(TraceOp::ConstI64(key_ptr, 0x3000));
+    b.append(TraceOp::MarkLoopHead {
+        loop_id: 0,
+        phis: vec![],
+    });
+    b.append(TraceOp::DictLookup {
+        dst,
+        dict_ptr,
+        key_ptr,
+        shape_hash: 0xdead_beef,
+    });
+    b.append(TraceOp::MarkLoopBack {
+        loop_id: 0,
+        next_values: vec![],
+    });
+
+    let r = LICM.run(&mut b);
+    let head_idx = position(&b.ops, |o| o.is_loop_head()).unwrap();
+    let dict_pos =
+        position(&b.ops, |o| matches!(o, TraceOp::DictLookup { .. })).expect("DictLookup missing");
+    assert!(
+        dict_pos < head_idx,
+        "Loop-invariant DictLookup must hoist before MarkLoopHead"
+    );
+    assert!(r.ops_replaced >= 1);
+}
+
+#[test]
+fn loop_variant_key_keeps_dict_lookup_inside() {
+    // dict_ptr is invariant; key_ptr is loop-internal — DictLookup
+    // must stay inside the body.
+    let mut b = TraceBuffer::new();
+    let dict_ptr = b.fresh_ssa();
+    let key_base = b.fresh_ssa();
+    let key_ptr_inside = b.fresh_ssa();
+    let dst = b.fresh_ssa();
+    b.append(TraceOp::ConstI64(dict_ptr, 0x2000));
+    b.append(TraceOp::ConstI64(key_base, 0));
+    b.append(TraceOp::MarkLoopHead {
+        loop_id: 0,
+        phis: vec![],
+    });
+    b.append(TraceOp::Load(key_ptr_inside, key_base, Offset(0)));
+    b.append(TraceOp::DictLookup {
+        dst,
+        dict_ptr,
+        key_ptr: key_ptr_inside,
+        shape_hash: 0xcafe_babe,
+    });
+    b.append(TraceOp::MarkLoopBack {
+        loop_id: 0,
+        next_values: vec![],
+    });
+
+    LICM.run(&mut b);
+    let head_idx = position(&b.ops, |o| o.is_loop_head()).unwrap();
+    let dict_pos = position(&b.ops, |o| matches!(o, TraceOp::DictLookup { .. })).unwrap();
+    assert!(
+        dict_pos > head_idx,
+        "DictLookup with loop-variant key_ptr must stay inside the body"
+    );
+}
+
+#[test]
+fn loop_variant_bounds_check_stays_inside() {
+    // A `BoundsCheck` whose idx is loop-variant must NOT be hoisted —
+    // its pass/fail decision changes per iteration. (The matching
+    // `ListGet` is exercised elsewhere; this test isolates the guard.)
+    let mut b = TraceBuffer::new();
+    let list_ptr = b.fresh_ssa();
+    let counter_base = b.fresh_ssa();
+    let idx = b.fresh_ssa();
+    b.append(TraceOp::ConstI64(list_ptr, 0x1000));
+    b.append(TraceOp::ConstI64(counter_base, 0));
+    b.append(TraceOp::MarkLoopHead {
+        loop_id: 0,
+        phis: vec![],
+    });
+    b.append(TraceOp::Load(idx, counter_base, Offset(0)));
+    b.append(TraceOp::Guard(GuardKind::BoundsCheck(idx, list_ptr), idx));
+    b.append(TraceOp::MarkLoopBack {
+        loop_id: 0,
+        next_values: vec![],
+    });
+
+    LICM.run(&mut b);
+    let head_idx = position(&b.ops, |o| o.is_loop_head()).unwrap();
+    let guard_pos = position(&b.ops, |o| {
+        matches!(o, TraceOp::Guard(GuardKind::BoundsCheck(_, _), _))
+    })
+    .unwrap();
+    assert!(
+        guard_pos > head_idx,
+        "BoundsCheck on loop-variant idx must remain inside the body"
+    );
+}
+
+#[test]
+fn non_bounds_guards_remain_pinned_even_when_invariant() {
+    // F-D8-E.3 only opens the gate for `BoundsCheck`. A `TypeCheck`
+    // whose input is loop-invariant must still stay where the
+    // recorder pinned it, matching the doc-stated position-sensitive
+    // semantics for non-bounds guards.
+    let mut b = TraceBuffer::new();
+    let v = b.fresh_ssa();
+    b.append(TraceOp::ConstI64(v, 7));
+    b.append(TraceOp::MarkLoopHead {
+        loop_id: 0,
+        phis: vec![],
+    });
+    b.append(TraceOp::Guard(
+        GuardKind::TypeCheck(v, ObservedType::I64),
+        v,
+    ));
+    b.append(TraceOp::MarkLoopBack {
+        loop_id: 0,
+        next_values: vec![],
+    });
+    LICM.run(&mut b);
+    let head_idx = position(&b.ops, |o| o.is_loop_head()).unwrap();
+    let guard_pos = position(&b.ops, |o| o.is_guard()).unwrap();
+    assert!(
+        guard_pos > head_idx,
+        "Non-BoundsCheck guards stay pinned even when their input is invariant"
+    );
+}

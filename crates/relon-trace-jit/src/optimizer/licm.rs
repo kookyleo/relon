@@ -13,14 +13,17 @@
 //!
 //! An op is hoistable iff **all** of:
 //!
-//! 1. Its [`EffectClass`] is `Pure`. `ReadOnly` is intentionally
-//!    excluded: lifting a load above the loop changes its observed
-//!    state if any iteration writes the same slot, and we do not
-//!    do dependency analysis here. `RecoverableWrite` and worse are
-//!    never hoisted.
-//! 2. It is not a `Guard`. Guard placement is position-sensitive
-//!    (deopt expects the trace to have reached that pc before
-//!    failing).
+//! 1. Its [`EffectClass`] is `Pure`, or it is one of the
+//!    allow-listed `ReadOnly` ops (see [`is_hoistable`]).
+//!    `RecoverableWrite` and worse are never hoisted.
+//! 2. Guards are normally position-sensitive (deopt expects the
+//!    trace to have reached that pc before failing). The only
+//!    exception is [`GuardKind::BoundsCheck`]: if both inputs are
+//!    loop-invariant the pass/fail decision is iteration-independent,
+//!    so hoisting it merely fires the same deopt earlier — never
+//!    later than it would have anyway. F-D8-E.3 admits this case so
+//!    the `ListGet { list_ptr, idx }` it shields can also hoist when
+//!    its inputs are invariant.
 //! 3. It is not itself a loop marker.
 //! 4. Every SSA input is defined *outside* the loop body. "Defined
 //!    outside" means: produced by an op at a pc strictly less than
@@ -51,7 +54,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::buffer::TraceBuffer;
 use crate::effect::EffectClass;
-use crate::trace_ir::{SsaVar, TraceOp};
+use crate::trace_ir::{GuardKind, SsaVar, TraceOp};
 
 use super::{OptimizerPass, PassReport};
 
@@ -202,8 +205,24 @@ fn hoist_one_loop(trace: &mut TraceBuffer, lp: &LoopRange, report: &mut PassRepo
 }
 
 fn is_hoistable(op: &TraceOp) -> bool {
-    if op.is_guard() || op.is_loop_head() || op.is_loop_back() {
+    if op.is_loop_head() || op.is_loop_back() {
         return false;
+    }
+    // F-D8-E.3: a `Guard(BoundsCheck(idx, list_ptr))` whose inputs
+    // are both loop-invariant is iteration-independent — either it
+    // always passes or it always fails. Hoisting it just moves the
+    // (would-be) deopt earlier in the trace, which is safe because
+    // no side effect sits between the original guard position and
+    // the loop head (the in-loop ops up to that point would all be
+    // hoistable themselves under the same invariance precondition).
+    // Other guard kinds remain pinned: `TypeCheck` and `NotNull`
+    // are usually no-ops at the recorded position and lifting them
+    // does not reduce per-iter work; `ArithOverflow` and `IsZero`
+    // are inherently positional (they reference a specific SSA
+    // produced just upstream). See module docs §"Hoist eligibility"
+    // for the safety argument.
+    if let TraceOp::Guard(kind, _) = op {
+        return matches!(kind, GuardKind::BoundsCheck(_, _));
     }
     match op.effect_class() {
         EffectClass::Pure => {
@@ -221,7 +240,27 @@ fn is_hoistable(op: &TraceOp) -> bool {
         // its haystack input as a hoistable SSA defined OUTSIDE the
         // loop body, which only happens once LICM moves the
         // `LocalGet` itself.
-        EffectClass::ReadOnly => matches!(op, TraceOp::LocalGet(_, _)),
+        //
+        // F-D8-E.3: extend the `ReadOnly` allow-list with
+        // `ListGet` and `DictLookup`. Both are referentially
+        // transparent w.r.t. the trace's own write set — the
+        // recorder never emits a `Store` against a dict / list
+        // payload header in the same trace, and the optimiser
+        // pipeline would refuse to merge such a trace anyway. Their
+        // inputs (`list_ptr` / `dict_ptr` / `idx` / `key_ptr`)
+        // carry the actual variance, so the input-invariance check
+        // upstream of this predicate gates correctness. When *all*
+        // inputs are loop-invariant (e.g. the recorder observed a
+        // constant index, or a previous LICM round already hoisted
+        // `key_ptr`'s producer), the entire op moves to the loop
+        // preheader. The matching `Guard(BoundsCheck)` that the
+        // recorder prepended to a `ListGet` is hoisted by the
+        // dedicated branch above so the deopt-anchored guard stays
+        // adjacent to the load.
+        EffectClass::ReadOnly => matches!(
+            op,
+            TraceOp::LocalGet(_, _) | TraceOp::ListGet { .. } | TraceOp::DictLookup { .. }
+        ),
         EffectClass::RecoverableWrite | EffectClass::Unrecoverable => false,
     }
 }
