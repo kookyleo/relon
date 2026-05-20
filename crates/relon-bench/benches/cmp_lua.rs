@@ -228,6 +228,12 @@ fn lua_fn(lua: &mlua::Lua, src: &str) -> mlua::Function {
 /// `trace_jit_hot_loop` bench uses `MAX_FN_ID - 4` and `MAX_FN_ID - 2`).
 const W3_REC_FN_ID: u32 = (relon_codegen_native::MAX_FN_ID - 10) as u32;
 const W4_REC_FN_ID: u32 = (relon_codegen_native::MAX_FN_ID - 11) as u32;
+/// F-D7-H: separate fn_id slot for the long-haystack variant so it
+/// coexists with the short-haystack W4 row in the same bench process
+/// — both rows share the recorder install pipeline but observe
+/// independent haystack pointers at recording time, which means
+/// independent F-D7-C const-needle / F-D7-H str-payload side tables.
+const W4_LONG_REC_FN_ID: u32 = (relon_codegen_native::MAX_FN_ID - 12) as u32;
 
 fn ir_tag(op: Op) -> TaggedOp {
     TaggedOp {
@@ -764,17 +770,58 @@ struct StrLiterals {
     lit_empty: *const StringRef,
     lit_axb: *const StringRef,
     lit_x: *const StringRef,
+    /// F-D7-H: 256-byte lorem-ipsum-style haystack for the
+    /// `W4_long_haystack` row. Holds an 'x' at the very end so the
+    /// memchr SIMD scan walks the full 16 × 16-byte chunks before
+    /// hitting (worst-case path) rather than short-circuiting on
+    /// the first chunk. The string is `&'static str` (constructed
+    /// from a long compile-time literal) so the `from_static` shim
+    /// can pin a `StringRef` whose `ptr/len` payload survives for
+    /// the lifetime of the bench process.
+    lit_long_haystack: *const StringRef,
 }
 
 unsafe impl Send for StrLiterals {}
 unsafe impl Sync for StrLiterals {}
 
+/// F-D7-H: 256-byte haystack for the `W4_long_haystack` row. Hits
+/// the SIMD memchr fast path (`h_len ≥ 16` → 16 × 16-byte chunks)
+/// when the needle is the 1-byte 'x'. The 'x' sits at the very end
+/// so each invocation scans the full 256 bytes before reporting hit.
+/// At exactly 256 bytes the string fits the 16-chunk SIMD loop
+/// cleanly with no tail; cranelift's `pcmpeqb` + `pmovmskb` (or
+/// `cmeq.16b` + `shrn.8b` on aarch64) does one 16-byte compare per
+/// SIMD iter — the F-D7-E specialisation's "fully exercised" shape.
+///
+/// Layout note: stored as a single 256-character `&'static str` so
+/// `StringRef::from_static` can borrow the static buffer directly.
+/// We deliberately put the 'x' at offset 255 rather than mid-string
+/// so the LICM/SIMD perf delta surfaces against the worst-case path
+/// — short-circuiting on iter 1 would mask both signals.
+const W4_LONG_HAYSTACK: &str = "loremipsumdolorsitametconsecteturadipiscingelitseddoeiusmodtemporincididuntutlaboreetdoloremagnaaliquautenimadminimveniamquisnostrudezercitationullamcolaborisnisiutaliquipezeacommodoconsequatduisauteiruredolorinreprehenderitinvoluptatevelitessecillumaaaaax";
+// Exactly 256 bytes. Only one 'x', placed at the final position
+// (offset 255), so the SIMD memchr scan walks all 16 × 16-byte
+// chunks before reporting hit. Latin letters only (no UTF-8 multi-
+// byte sequences) so `len = byte-len = char-count`. Any future
+// edit that drifts the length is caught by the debug-assert in
+// `build_str_literals`, producing a clear panic instead of a
+// silent perf regression on the W4_long row.
+const W4_LONG_HAYSTACK_LEN: usize = 256;
+
 fn build_str_literals() -> StrLiterals {
+    debug_assert_eq!(
+        W4_LONG_HAYSTACK.len(),
+        W4_LONG_HAYSTACK_LEN,
+        "W4_LONG_HAYSTACK literal length drift — \
+         expected {W4_LONG_HAYSTACK_LEN} bytes, got {}",
+        W4_LONG_HAYSTACK.len()
+    );
     StrLiterals {
         lit_a: StringRef::from_static("a"),
         lit_empty: StringRef::from_static(""),
         lit_axb: StringRef::from_static("axb"),
         lit_x: StringRef::from_static("x"),
+        lit_long_haystack: StringRef::from_static(W4_LONG_HAYSTACK),
     }
 }
 
@@ -922,6 +969,30 @@ fn w4_lua_src() -> String {
 
 fn w4_expected() -> i64 {
     TREE_WALK_N as i64
+}
+
+/// F-D7-H: Lua source for the W4_long_haystack row. Mirrors `w4_lua_src`
+/// but with the 256-byte literal in place of "axb" so LuaJIT's
+/// `string.find` walks the same haystack the relon trace JIT does. The
+/// needle 'x' is at the last byte (offset 255), so each call's
+/// `string.find` scans the full string before reporting hit — the
+/// same worst-case shape the SIMD specialisation needs to exercise.
+fn w4_long_lua_src() -> String {
+    format!(
+        r#"return function()
+            local n = {n}
+            local count = 0
+            local s = "{haystack}"
+            for i = 1, n do
+                if string.find(s, "x", 1, true) ~= nil then
+                    count = count + 1
+                end
+            end
+            return count
+        end"#,
+        n = TREE_WALK_N,
+        haystack = W4_LONG_HAYSTACK
+    )
 }
 
 // =====================================================================
@@ -1629,6 +1700,139 @@ fn bench_cmp_lua(c: &mut Criterion) {
             b.iter_custom(|iters| {
                 timed_with_warmup(iters, || {
                     let v: i64 = lua_fn_w4.call(()).unwrap();
+                    black_box(v);
+                })
+            });
+        });
+    }
+
+    // ----- W4_long_haystack -----
+    //
+    // F-D7-H companion of W4. Same IR body, same recorder install
+    // pipeline, but the haystack is a 256-byte string (vs. W4's 3-byte
+    // "axb"). The longer haystack exercises two specialisations that
+    // the 3-byte W4 path can NOT reach:
+    //
+    // 1. F-D7-E SIMD memchr: 256 / 16 = 16 full chunks, so the
+    //    `pcmpeqb` + `pmovmskb` (or NEON equivalent) inner loop runs
+    //    16 times per call. The 3-byte W4 falls through the chunk
+    //    loop on iteration 1 (`cursor == chunk_end` immediately) and
+    //    never lowers to SIMD ops in practice.
+    //
+    // 2. F-D7-G + F-D7-H LICM hoist: with the haystack ≥ 256 bytes
+    //    the per-iter `(ptr, len)` StringRef deref is no longer a
+    //    rounding-error fraction of the call. F-D7-H promotes the
+    //    deref into real `TraceOp::Load { Offset(0|8) }` ops in the
+    //    recorder so LICM (which now admits Load with offset 0/8
+    //    when the body has no writes) can hoist them to the loop
+    //    preheader. The per-iter cost on a long haystack drops to
+    //    just the SIMD scan body — no payload deref, no null check.
+    //
+    // The W4 (short) row stays in place as the baseline / no-regression
+    // guard: F-D7-H must not regress the short-haystack ratio because
+    // the `HaystackHandle::Preloaded` path skips the inline null check
+    // the Raw variant emits — on a 3-byte haystack the SIMD scan never
+    // runs, and the only change is one fewer guard branch.
+    {
+        let (walker, scope) = build_tree_walker(w4_relon_src());
+        let lua_fn_w4_long = lua_fn(&lua, &w4_long_lua_src());
+
+        let w4l_str_lits = build_str_literals();
+        let w4l_warmup_args: [u64; 3] = [
+            4,
+            w4l_str_lits.lit_long_haystack as u64,
+            w4l_str_lits.lit_x as u64,
+        ];
+        let w4l_trace = install_recorder_trace(
+            W4_LONG_REC_FN_ID,
+            w4_recorder_body(),
+            vec![IrType::I64, IrType::String, IrType::String],
+            &w4l_warmup_args,
+        );
+        let w4l_state = relon_codegen_native::global_trace_jit_state();
+        let _ = w4l_trace;
+        {
+            let args: [u64; 3] = [
+                TREE_WALK_N,
+                w4l_str_lits.lit_long_haystack as u64,
+                w4l_str_lits.lit_x as u64,
+            ];
+            let v = unsafe {
+                w4l_state.invoke_with_fallback(
+                    W4_LONG_REC_FN_ID,
+                    args.as_ptr(),
+                    /* slot_count = */ 64,
+                    |args| {
+                        // The 256-byte haystack ends with 'x' so every
+                        // iter's `contains("...", "x")` returns true.
+                        // Analytic answer: count == n.
+                        *args
+                    },
+                )
+            };
+            assert_eq!(
+                v as i64, TREE_WALK_N as i64,
+                "W4_long recorder trace + fallback must return analytic count"
+            );
+        }
+        // LuaJIT consistency check on the long haystack — same
+        // shape as W4 but with the 256-byte literal in the
+        // Lua source.
+        let lua_v: i64 = lua_fn_w4_long.call(()).unwrap();
+        assert_eq!(
+            lua_v, TREE_WALK_N as i64,
+            "W4_long LuaJIT must produce the same analytic count"
+        );
+
+        group.throughput(Throughput::Elements(TREE_WALK_N));
+        group.bench_function(
+            BenchmarkId::new("W4_long_haystack", "relon_tree_walk"),
+            |b| {
+                b.iter_custom(|iters| {
+                    let n_in = black_box(TREE_WALK_N as i64);
+                    timed_with_warmup(iters, || {
+                        // The tree-walker hot loop still uses the W4
+                        // "axb" haystack — same Relon source, the
+                        // long-haystack delta only matters for the
+                        // trace_jit row where the SIMD specialisation
+                        // is observable. We keep the tree_walk row
+                        // here so the criterion BenchmarkId hierarchy
+                        // surfaces a complete trio of (tree_walk,
+                        // trace_jit, luajit) and the LuaJIT ratio
+                        // anchor is comparable across W4 / W4_long.
+                        let v = walker.run_main(&scope, args_w_n(black_box(n_in))).unwrap();
+                        black_box(v);
+                    })
+                });
+            },
+        );
+        group.bench_function(
+            BenchmarkId::new("W4_long_haystack", "relon_trace_jit"),
+            |b| {
+                let trace_fn = w4l_state
+                    .lookup_trace(W4_LONG_REC_FN_ID)
+                    .expect("W4_long recorder trace installed");
+                b.iter_custom(|iters| {
+                    let mut tctx = TraceContext::with_capacity(64);
+                    let args: [u64; 3] = [
+                        TREE_WALK_N,
+                        w4l_str_lits.lit_long_haystack as u64,
+                        w4l_str_lits.lit_x as u64,
+                    ];
+                    let args_ptr = args.as_ptr();
+                    timed_with_warmup(iters, || {
+                        let s = unsafe {
+                            trace_fn.invoke_raw(&mut tctx as *mut TraceContext, black_box(args_ptr))
+                        };
+                        black_box(s);
+                    })
+                });
+            },
+        );
+        group.bench_function(BenchmarkId::new("W4_long_haystack", "luajit"), |b| {
+            b.iter_custom(|iters| {
+                timed_with_warmup(iters, || {
+                    let v: i64 = lua_fn_w4_long.call(()).unwrap();
                     black_box(v);
                 })
             });

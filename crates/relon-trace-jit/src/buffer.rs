@@ -47,6 +47,29 @@ pub struct TraceBuffer {
     ///
     /// The non-Copy payload is why this lives outside [`TraceConst`].
     pub const_bytes: HashMap<SsaVar, Vec<u8>>,
+    /// F-D7-H: StringRef payload pre-load side table. Maps a haystack
+    /// SSA (`*const StringRef`) to the `(ptr_ssa, len_ssa)` pair that
+    /// holds the deref'd `(StringRef::ptr, StringRef::len)` payload.
+    ///
+    /// Populated by the recorder when it emits a `TraceOp::StrContains`:
+    /// it appends `TraceOp::Load(ptr_ssa, haystack, Offset(0))` and
+    /// `TraceOp::Load(len_ssa, haystack, Offset(8))` BEFORE the
+    /// `StrContains` op, then registers the pair here. The emitter's
+    /// `emit_str_contains` lowering consults this map and — when the
+    /// pair is present — calls the inline scan with
+    /// `HaystackHandle::Preloaded` so the per-iter `StringRef` deref
+    /// disappears from the StrContains lowering (the loads are now
+    /// independent ops in the trace stream).
+    ///
+    /// Why this matters: the F-D7-G LICM pass admits
+    /// `TraceOp::Load { Offset(0|8) }` as hoistable when the loop
+    /// body has no writes. By promoting the StringRef payload deref
+    /// from a raw cranelift `builder.ins().load` (inside
+    /// `load_string_ref_payload`, invisible to the optimiser) into
+    /// real `TraceOp::Load` ops, LICM can move them to the loop
+    /// preheader and the per-iter cost drops to just the inline
+    /// memchr/byte scan.
+    pub str_payload: HashMap<SsaVar, (SsaVar, SsaVar)>,
     next_ssa: u32,
 }
 
@@ -100,6 +123,17 @@ impl TraceBuffer {
         self.const_bytes.insert(var, bytes);
     }
 
+    /// F-D7-H: register that `haystack` (a `*const StringRef` SSA) has
+    /// had its `(ptr, len)` payload pre-loaded into `(ptr_ssa, len_ssa)`
+    /// by upstream `TraceOp::Load` ops at `Offset(0)` / `Offset(8)`.
+    /// The emitter's `emit_str_contains` consults this table to skip
+    /// the per-call `load_string_ref_payload` deref and feed the inline
+    /// scan via `HaystackHandle::Preloaded` instead. See
+    /// [`Self::str_payload`].
+    pub fn record_str_payload(&mut self, haystack: SsaVar, ptr_ssa: SsaVar, len_ssa: SsaVar) {
+        self.str_payload.insert(haystack, (ptr_ssa, len_ssa));
+    }
+
     /// Convenience: how many ops the buffer currently holds.
     pub fn op_count(&self) -> usize {
         self.ops.len()
@@ -119,6 +153,7 @@ impl TraceBuffer {
             type_info: self.type_info,
             consts: self.consts,
             const_bytes: self.const_bytes,
+            str_payload: self.str_payload,
             ssa_high_water: self.next_ssa,
         }
     }
@@ -139,6 +174,9 @@ pub struct OptimizedTrace {
     pub consts: HashMap<SsaVar, TraceConst>,
     /// F-D7-C: const-string side table — see [`TraceBuffer::const_bytes`].
     pub const_bytes: HashMap<SsaVar, Vec<u8>>,
+    /// F-D7-H: StringRef payload pre-load side table — see
+    /// [`TraceBuffer::str_payload`].
+    pub str_payload: HashMap<SsaVar, (SsaVar, SsaVar)>,
     pub ssa_high_water: u32,
 }
 
@@ -157,6 +195,15 @@ impl OptimizedTrace {
     /// between an inline byte-scan and the extern shim call.
     pub fn const_bytes_for(&self, var: SsaVar) -> Option<&[u8]> {
         self.const_bytes.get(&var).map(|v| v.as_slice())
+    }
+
+    /// F-D7-H: lookup the pre-loaded `(ptr_ssa, len_ssa)` pair bound to
+    /// the haystack SSA `var`, if any. Populated by the recorder when
+    /// it inserts the explicit `TraceOp::Load { Offset(0|8) }` ops
+    /// upstream of a `TraceOp::StrContains`; consumed by the emitter
+    /// to switch the inline scan onto `HaystackHandle::Preloaded`.
+    pub fn str_payload_for(&self, var: SsaVar) -> Option<(SsaVar, SsaVar)> {
+        self.str_payload.get(&var).copied()
     }
 
     /// Side tables only, exposed so callers can round-trip the parts

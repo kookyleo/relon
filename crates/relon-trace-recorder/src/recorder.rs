@@ -21,8 +21,8 @@ use std::collections::HashMap;
 
 use relon_ir::Op;
 use relon_trace_jit::{
-    EffectClass as TraceEffect, ExternalPc, GuardKind, GuardSite, LoopPhi, ObservedType, SsaVar,
-    TraceBuffer, TraceOp,
+    EffectClass as TraceEffect, ExternalPc, GuardKind, GuardSite, LoopPhi, ObservedType, Offset,
+    SsaVar, TraceBuffer, TraceOp,
 };
 
 use crate::abort::AbortReason;
@@ -517,6 +517,13 @@ impl RecorderState {
         // surface a spurious deopt on the empty-string case.
         self.emit_guard(GuardKind::NotNull(haystack));
         let dst = self.ssa.alloc();
+        // F-D7-H: pre-load the StringRef `(ptr, len)` payload as real
+        // `TraceOp::Load { Offset(0|8) }` ops upstream of the
+        // `StrContains` so the F-D7-G LICM pass can hoist them when
+        // `haystack` is loop-invariant. The emitter routes the inline
+        // scan through `HaystackHandle::Preloaded` whenever the
+        // `str_payload` side-table carries an entry for `haystack`.
+        self.inject_str_payload_loads(haystack);
         self.buffer
             .append(TraceOp::StrContains(dst, haystack, needle));
         self.pop_inputs(&[needle, haystack]);
@@ -760,6 +767,26 @@ impl RecorderState {
                 for g in guards_before {
                     self.emit_guard(g);
                 }
+                // F-D7-H: when the recorder is about to emit a
+                // `TraceOp::StrContains(_, haystack, _)`, also emit
+                // two `TraceOp::Load` ops reading the StringRef
+                // `(ptr, len)` payload upstream — and register the
+                // resulting SSA pair in the buffer's `str_payload`
+                // side-table. The emitter's `emit_str_contains` then
+                // consults the table to skip the per-call
+                // `load_string_ref_payload` raw deref and route the
+                // inline scan through `HaystackHandle::Preloaded`.
+                //
+                // Why two real `TraceOp::Load` ops instead of the raw
+                // cranelift `builder.ins().load` the old path used:
+                // F-D7-G LICM admits `TraceOp::Load { Offset(0|8) }`
+                // as hoistable when the loop body contains no writes
+                // (the W4 hot loop's case — no `Store`, no
+                // `RecoverableWrite`). Moving the loads from "hidden
+                // cranelift IR inside the StrContains emit" into "real
+                // TraceOps in the OptimizedTrace stream" gives LICM a
+                // chance to actually hoist them.
+                self.maybe_inject_str_contains_loads(&trace_op);
                 self.buffer.append(trace_op);
                 // v6-δ M2-C: update operand-stack mirror BEFORE the
                 // `guards_after` emit so a guard emitted for THIS op
@@ -967,6 +994,71 @@ impl RecorderState {
     /// and feeds the popped SSAs as `inputs`, so the mirror stays in
     /// sync.
     ///
+    /// F-D7-H: pattern-match a freshly-built `TraceOp` and, when it is
+    /// a `TraceOp::StrContains(_, haystack, _)`, prepend two
+    /// `TraceOp::Load` ops reading the StringRef payload from
+    /// `haystack` so the F-D7-G LICM pass can hoist them.
+    ///
+    /// Called from `apply_outcome`'s `Emit` arm — i.e. whenever the
+    /// `lower_string_call` `STDLIB_IDX_CONTAINS` rule fires through the
+    /// generic lowering path. The direct
+    /// [`Self::emit_str_contains`] entry calls
+    /// [`Self::inject_str_payload_loads`] explicitly so both call
+    /// paths produce the same op stream.
+    fn maybe_inject_str_contains_loads(&mut self, op: &TraceOp) {
+        if let TraceOp::StrContains(_, haystack, _) = *op {
+            self.inject_str_payload_loads(haystack);
+        }
+    }
+
+    /// F-D7-H: append the two `TraceOp::Load { Offset(0|8) }` reads
+    /// for the StringRef payload of `haystack` and record the
+    /// resulting SSA pair in the buffer's `str_payload` side-table.
+    ///
+    /// Idempotent on a per-(buffer, haystack) basis: if a prior call
+    /// already injected the loads for this haystack we skip — the
+    /// emitter's `emit_str_contains` will pick up the existing pair.
+    /// This keeps the load count bounded when the same haystack
+    /// appears in multiple `StrContains` calls in one trace (the W4
+    /// hot loop's pattern, where the haystack SSA is loop-invariant
+    /// and consumed once per iter).
+    ///
+    /// The op count gate matches the rest of the recorder — if we
+    /// would push past the per-trace `capacity` ceiling we set
+    /// `aborted = TraceTooLong` and bail without touching the buffer.
+    fn inject_str_payload_loads(&mut self, haystack: SsaVar) {
+        if self.aborted.is_some() || self.terminated {
+            return;
+        }
+        if self.buffer.str_payload.contains_key(&haystack) {
+            return;
+        }
+        // We are about to push two TraceOp::Load ops; if either would
+        // overflow `capacity`, abort cleanly. The emitter falls back
+        // to `HaystackHandle::Raw` when the side-table entry is
+        // missing, so a bail here just degrades to the previous
+        // per-iter deref path — no correctness fault.
+        if self.buffer.op_count() + 2 > self.capacity {
+            self.aborted = Some(AbortReason::TraceTooLong);
+            return;
+        }
+        let ptr_ssa = self.ssa.alloc();
+        let len_ssa = self.ssa.alloc();
+        self.buffer
+            .append(TraceOp::Load(ptr_ssa, haystack, Offset(0)));
+        self.buffer
+            .append(TraceOp::Load(len_ssa, haystack, Offset(8)));
+        // Both reads return i64-typed values (host StringRef is
+        // `{ ptr: *const u8, len: usize }`, both 8 bytes on x86_64 /
+        // aarch64). Stamp the type into the buffer so any future
+        // optimiser pass that walks `type_info` sees a consistent
+        // view, even though the emitter's `emit_load` always
+        // materialises an I64 cranelift value regardless.
+        self.buffer.record_type(ptr_ssa, ObservedType::I64);
+        self.buffer.record_type(len_ssa, ObservedType::I64);
+        self.buffer.record_str_payload(haystack, ptr_ssa, len_ssa);
+    }
+
     /// Underflow is **silent** (the mirror simply clears) so unit
     /// tests that exercise lowering rules with synthetic inputs don't
     /// panic. The mirror's view is best-effort — guard sites stamped
@@ -1762,5 +1854,98 @@ mod tests {
         assert!(r
             .emit_str_contains(SsaVar(0), SsaVar(1), Some(b"x".to_vec()))
             .is_none());
+    }
+
+    /// F-D7-H: `emit_str_contains` must prepend two `TraceOp::Load`
+    /// ops reading the StringRef `(ptr, len)` payload off the haystack
+    /// and register the dst pair in the buffer's `str_payload` side
+    /// table. The emitter's `emit_str_contains` consults the side
+    /// table at lowering time to route through `HaystackHandle::Preloaded`.
+    #[test]
+    fn emit_str_contains_injects_str_payload_loads() {
+        use relon_trace_jit::Offset;
+        let mut r = RecorderState::new();
+        let haystack = match r.record_op(&Op::ConstI64(0xa), &[], Some(ObservedType::Ptr)) {
+            RecordResult::Ok { value: Some(v) }
+            | RecordResult::NeedsGuard { value: Some(v), .. } => v,
+            other => panic!("haystack: {other:?}"),
+        };
+        let needle = match r.record_op(&Op::ConstI64(0xb), &[], Some(ObservedType::Ptr)) {
+            RecordResult::Ok { value: Some(v) }
+            | RecordResult::NeedsGuard { value: Some(v), .. } => v,
+            other => panic!("needle: {other:?}"),
+        };
+        let dst = r
+            .emit_str_contains(haystack, needle, Some(b"x".to_vec()))
+            .expect("contains must succeed");
+        let buf = r.buffer();
+        // Side-table populated.
+        let (ptr_ssa, len_ssa) = buf
+            .str_payload
+            .get(&haystack)
+            .copied()
+            .expect("str_payload entry for haystack must be present");
+        // Both Loads materialised against the haystack base, at
+        // offsets 0 / 8 respectively — exactly the offsets LICM
+        // admits as hoistable.
+        let load_ops: Vec<&TraceOp> = buf
+            .ops
+            .iter()
+            .filter(|op| matches!(op, TraceOp::Load(_, _, _)))
+            .collect();
+        assert_eq!(load_ops.len(), 2, "expected two Load ops: {load_ops:?}");
+        let load_ptr = load_ops[0];
+        let load_len = load_ops[1];
+        assert!(
+            matches!(load_ptr, TraceOp::Load(d, b, Offset(0)) if *d == ptr_ssa && *b == haystack),
+            "first Load mismatch: {load_ptr:?}"
+        );
+        assert!(
+            matches!(load_len, TraceOp::Load(d, b, Offset(8)) if *d == len_ssa && *b == haystack),
+            "second Load mismatch: {load_len:?}"
+        );
+        // The StrContains op still sits at the trace tail — the
+        // Loads were prepended, not appended.
+        match buf.ops.last().expect(">=1 op") {
+            TraceOp::StrContains(d, h, _) => {
+                assert_eq!(*d, dst);
+                assert_eq!(*h, haystack);
+            }
+            other => panic!("expected StrContains as last op, got {other:?}"),
+        }
+        // Both pre-loaded SSAs carry an i64 observed-type stamp so
+        // the emitter's type-info lookup resolves cleanly.
+        assert_eq!(buf.type_info.get(&ptr_ssa), Some(&ObservedType::I64));
+        assert_eq!(buf.type_info.get(&len_ssa), Some(&ObservedType::I64));
+    }
+
+    /// F-D7-H: invoking `inject_str_payload_loads` twice against the
+    /// same haystack SSA must NOT re-emit the Loads — the side-table
+    /// entry is reused so the trace stream stays bounded even when the
+    /// recorder lowers multiple `StrContains` calls sharing one
+    /// haystack.
+    #[test]
+    fn inject_str_payload_loads_is_idempotent() {
+        let mut r = RecorderState::new();
+        let haystack = SsaVar(5);
+        r.inject_str_payload_loads(haystack);
+        let first = r
+            .buffer()
+            .ops
+            .iter()
+            .filter(|op| matches!(op, TraceOp::Load(_, _, _)))
+            .count();
+        assert_eq!(first, 2);
+        r.inject_str_payload_loads(haystack);
+        let second = r
+            .buffer()
+            .ops
+            .iter()
+            .filter(|op| matches!(op, TraceOp::Load(_, _, _)))
+            .count();
+        assert_eq!(
+            second, 2,
+            "second inject_str_payload_loads must reuse the existing str_payload entry"
+        );
     }
 }
