@@ -652,13 +652,33 @@ impl<'a, 'b> TraceEmitterState<'a, 'b> {
     /// F-D7 `StrContains(dst, haystack, needle)` lowers to a direct
     /// `call __relon_str_contains(haystack, needle) -> i32`.
     ///
+    /// F-D7-C: if `needle` carries a const-byte side-table entry of
+    /// length ≤ [`crate::str_inline::MAX_INLINE_NEEDLE_LEN`], we
+    /// short-circuit the extern call and emit a straight-line inline
+    /// byte-scan instead. The trace body stays in cranelift IR with no
+    /// C ABI crossing — the dominant cost on the W4 cmp_lua hot path.
+    /// See [`crate::str_inline`] for the lowering strategy.
+    ///
     /// The result is a 0/1 i32 bool packed into the i32 SSA slot so
     /// downstream `Cmp` / `Guard(NotNull(dst))` ops see the same
     /// representation as a `ConstBool` value.
     fn emit_str_contains(&mut self, dst: SsaVar, a: SsaVar, b: SsaVar) -> Result<(), EmitError> {
         let va = self.lookup(a)?;
-        let vb = self.lookup(b)?;
         let va = self.widen_to_i64(va);
+
+        // F-D7-C inline path: needle is a known small constant.
+        if let Some(needle_bytes) = self.trace.const_bytes_for(b) {
+            if crate::str_inline::needle_fits_inline(needle_bytes) {
+                let needle_owned: Vec<u8> = needle_bytes.to_vec();
+                let r =
+                    crate::str_inline::emit_str_contains_inline(self.builder, va, &needle_owned);
+                self.bind(dst, r);
+                return Ok(());
+            }
+        }
+
+        // Fallback: extern shim call.
+        let vb = self.lookup(b)?;
         let vb = self.widen_to_i64(vb);
         let inst = self.builder.ins().call(self.str_contains, &[va, vb]);
         let r = self.builder.inst_results(inst)[0];
