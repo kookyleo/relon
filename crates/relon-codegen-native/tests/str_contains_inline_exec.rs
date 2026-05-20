@@ -20,7 +20,7 @@ use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{Linkage, Module as _};
 
 use relon_codegen_native::register_trace_runtime_symbols;
-use relon_trace_emitter::emit_str_contains_inline;
+use relon_trace_emitter::{emit_str_contains_inline, HaystackHandle};
 use relon_trace_jit::runtime::{__relon_str_contains, StringRef};
 
 /// Build a `fn(haystack_ptr: i64) -> i32` that calls the inline
@@ -70,7 +70,7 @@ fn build_inline_contains_fn(needle: &[u8]) -> InlineContainsFn {
         haystack
     };
 
-    let r = emit_str_contains_inline(&mut fb, haystack_i64, needle);
+    let r = emit_str_contains_inline(&mut fb, HaystackHandle::Raw(haystack_i64), needle);
     fb.ins().return_(&[r]);
     fb.finalize();
 

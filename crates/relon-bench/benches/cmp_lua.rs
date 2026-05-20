@@ -485,8 +485,11 @@ fn build_w4_trace_fn() -> TraceFn {
     // F-D7-C inline byte-scan in place of the `__relon_str_contains`
     // C ABI call. The preloaded variant reuses the hoisted payload so
     // the inner loop doesn't redo the 2-load haystack metadata read.
-    let result_i32 =
-        relon_trace_emitter::emit_str_contains_inline_preloaded(&mut fb, payload, needle_bytes);
+    let result_i32 = relon_trace_emitter::emit_str_contains_inline(
+        &mut fb,
+        relon_trace_emitter::HaystackHandle::Preloaded(payload),
+        needle_bytes,
+    );
     let result_i64 = fb.ins().uextend(I64, result_i32);
     let new_count = fb.ins().iadd(cnt, result_i64);
     let one = fb.ins().iconst(I64, 1);

@@ -51,6 +51,6 @@ pub use inline_emit::{
     emit_trace_inline, should_inline_trace, InlineEmitError, InlineEmitHandles, MAX_INLINE_OPS,
 };
 pub use str_inline::{
-    emit_str_contains_inline, emit_str_contains_inline_preloaded, load_string_ref_payload,
-    needle_fits_inline, StrPayload, MAX_INLINE_NEEDLE_LEN,
+    emit_str_contains_inline, load_string_ref_payload, needle_fits_inline, HaystackHandle,
+    StrPayload, MAX_INLINE_NEEDLE_LEN,
 };
