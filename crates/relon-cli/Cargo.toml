@@ -23,8 +23,16 @@ relon-codegen-native = { workspace = true }
 relon-bytecode = { workspace = true }
 relon-fmt = { workspace = true }
 relon-lsp = { workspace = true }
-clap = { workspace = true, features = ["derive"] }
+# v6-fix-D2-J cold-start: disable the `default` feature on clap so we
+# opt out of `color` / `suggestions` / `wrap_help` for the CLI binary.
+# `derive` + `std` + `help` cover the parser surface we actually use
+# (`#[derive(Parser, Subcommand, ValueEnum)]`, the `--help` /
+# `--version` envelope); the dropped features bring their own
+# unicode tables + levenshtein scoring, which inflate the ELF text
+# section without paying their way in the trivial-`#main` cold start.
+# Add explicit features back here if a downstream `relon` subcommand
+# starts depending on suggestions / colored errors.
+clap = { workspace = true, default-features = false, features = ["derive", "std", "help", "usage", "error-context"] }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
 miette = { workspace = true, features = ["derive", "fancy"] }
-ariadne = "0.6.0"

@@ -148,10 +148,115 @@ enum Commands {
     Lsp,
 }
 
-fn main() -> miette::Result<()> {
-    let cli = Cli::parse();
+/// v6-fix-D2-J cold-start: hand-rolled argv fast-path for the
+/// trivial `relon run <file> [--lite] [--args <json>]` invocation
+/// shape the W11 bench exercises. Constructing `Cli` through
+/// `clap::Cli::parse()` is ~270 µs on a fresh process — clap rebuilds
+/// the whole command tree (subcommands + value enums + help strings)
+/// before matching a 3 - 5 element argv. The match here is conservative:
+/// any unrecognised arg, prefix abbreviation, value-form (`--args=foo`),
+/// short flag, or extra positional falls back to `clap::Cli::parse()`
+/// so flag semantics stay defined by the `#[derive(Parser)]` block
+/// (single source of truth). The shape we accept by design:
+///
+/// * `relon run <file>` (positional only)
+/// * `relon run <file> --args <json>` (or `--args -` for stdin)
+/// * `relon run <file> --lite [--args <json>]`
+///
+/// Anything else — `fmt`, `lsp`, `--trust`, `--backend`,
+/// `--require-hash`, `--pretty`, `--help`, `--version` — defers to
+/// clap so the surface stays compatible.
+fn try_parse_run_fast(argv: &[std::ffi::OsString]) -> Option<Commands> {
+    // argv[0] is the binary. The first command-line arg must be `run`;
+    // everything else (`fmt`, `lsp`, `--help`, …) goes through clap.
+    let mut iter = argv.iter().skip(1);
+    let sub = iter.next()?;
+    if sub != "run" {
+        return None;
+    }
 
-    match cli.command {
+    let mut file: Option<PathBuf> = None;
+    let mut lite = false;
+    let mut args: Option<String> = None;
+
+    while let Some(tok) = iter.next() {
+        let s = tok.to_str()?;
+        if s == "--lite" {
+            if lite {
+                return None;
+            }
+            lite = true;
+        } else if s == "--args" {
+            if args.is_some() {
+                return None;
+            }
+            let v = iter.next()?.to_str()?.to_string();
+            args = Some(v);
+        } else if s.starts_with("--") || s.starts_with('-') {
+            // Any other flag (`--args=...`, `--trust`, `--pretty`,
+            // `--help`, short flags) bails so clap owns the parse.
+            return None;
+        } else {
+            if file.is_some() {
+                return None;
+            }
+            file = Some(PathBuf::from(tok));
+        }
+    }
+
+    let file = file?;
+    Some(Commands::Run {
+        file,
+        pretty: true,
+        lite,
+        args,
+        trust: false,
+        backend: BackendArg::Auto,
+        require_hash: false,
+    })
+}
+
+fn main() -> miette::Result<()> {
+    // v6-fix-D2-J: phase timing begins *before* `clap::Cli::parse`
+    // so the `RELON_CLI_PROFILE=1` trace includes the parser cost
+    // (previously hidden in the run-prologue total). The probe stays
+    // gated on the env var so the production hot path pays nothing.
+    let profile_main_entry = std::time::Instant::now();
+    let profile_enabled = std::env::var_os("RELON_CLI_PROFILE").is_some();
+    if profile_enabled {
+        let entry_us = profile_main_entry.elapsed().as_micros();
+        eprintln!(
+            "[relon-cli profile] main_entry              +{entry_us:>6}us  (total {entry_us}us)"
+        );
+    }
+    // v6-fix-D2-J: try the hand-rolled argv matcher first. On the W11
+    // shape (`run <file> [--lite] [--args …]`) this skips clap's
+    // ~270 µs cold-start tax entirely; any other argv shape falls
+    // through to `Cli::parse()` so flag semantics stay clap-defined.
+    let argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    let command = match try_parse_run_fast(&argv) {
+        Some(cmd) => {
+            if profile_enabled {
+                let total_us = profile_main_entry.elapsed().as_micros();
+                eprintln!(
+                    "[relon-cli profile] argv_fast_run          +{total_us:>6}us  (total {total_us}us)"
+                );
+            }
+            cmd
+        }
+        None => {
+            let cli = Cli::parse();
+            if profile_enabled {
+                let total_us = profile_main_entry.elapsed().as_micros();
+                eprintln!(
+                    "[relon-cli profile] clap::parse             +{total_us:>6}us  (total {total_us}us)"
+                );
+            }
+            cli.command
+        }
+    };
+
+    match command {
         Commands::Run {
             file,
             pretty,

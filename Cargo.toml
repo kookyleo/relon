@@ -21,7 +21,12 @@ miette = "7.6.0"
 serde = "1.0"
 serde_json = "1.0"
 sha2 = "0.10"
-clap = "4.4"
+# v6-fix-D2-J cold-start: declare clap with `default-features = false`
+# at the workspace level so per-crate `features = [...]` lists can
+# narrow the feature set without cargo silently unioning the default
+# bundle (color / suggestions / wrap_help) back in. Each binary that
+# imports clap re-enables exactly what it needs.
+clap = { version = "4.4", default-features = false }
 anyhow = "1.0"
 proptest = "1"
 # v3+ a-3: HTTPS fetch for remote `#import "https://..."`.
@@ -76,4 +81,21 @@ strip = true
 [profile.release-small]
 inherits = "release"
 opt-level = "z"
+panic = "abort"
+
+# v6-fix-D2-J cold-start profile for the `relon` CLI binary.
+# Inherits the throughput-tuned `release` settings (fat LTO + single
+# codegen unit + symbol strip) and adds `panic = "abort"` so the
+# linker drops the per-function unwinding tables (`.eh_frame` /
+# `.gcc_except_table`) and the personality routine. Together those
+# tables weigh ~1 MB on the CLI; dropping them shaves roughly the
+# same amount off the ELF loader's relocation / page-fault tax
+# during fresh-process startup — which is what dominates the W11
+# `relon run` cold-start row (in-process work is already ~830 µs;
+# the rest is pre-main). Library embedders that need unwinding for
+# poisoning / `Drop` semantics keep building under `release`; the
+# CLI binary is the only entry that ships with `abort`. Build with
+# `cargo build --profile release-cli -p relon-cli`.
+[profile.release-cli]
+inherits = "release"
 panic = "abort"
