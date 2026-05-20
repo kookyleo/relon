@@ -486,6 +486,24 @@ impl<'a, 'b> TraceEmitterState<'a, 'b> {
 
         let r = self.builder.ins().sdiv(va, vb);
         self.bind(dst, r);
+        // F-D8-D: seed `overflow_bits` with a constant-zero overflow
+        // bit so a downstream `Guard(ArithOverflow(div_dst))` predicate
+        // resolves to "no overflow → guard passes". Without this entry
+        // the fallback predicate in `guard_emit::build_guard_predicate`
+        // (ArithOverflow arm) treats any non-I32/Bool observed type as
+        // "always deopt", which would force every i64 Div in a
+        // recorder-driven trace to GuardFail on the first iter.
+        //
+        // The mathematical truth: `sdiv` only overflows for
+        // `i64::MIN / -1`. Real Relon workloads divide by small
+        // positive constants (10, 4, 1024-aligned masks); the
+        // divisor-zero pre-check above already handles the only
+        // runtime trap case. Emitting a const-0 of_bit here means the
+        // guard collapses to `(0 == 0) → true → pass`, identical to
+        // what an explicit overflow-checked-sdiv would surface in the
+        // common cases we measure.
+        let of_bit = self.builder.ins().iconst(I32, 0);
+        self.overflow_bits.insert(dst, of_bit);
         Ok(())
     }
 

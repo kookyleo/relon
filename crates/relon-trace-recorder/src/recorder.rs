@@ -802,8 +802,22 @@ impl RecorderState {
                     // First time this slot is read — seed the map
                     // with `fresh_dst` so subsequent reads alias the
                     // same SSA id.
+                    //
+                    // F-D8-D: do NOT pre-stamp `type_obs[fresh_dst] = ty_hint`
+                    // here. The lower_op rule's `ty_hint` is a static
+                    // best-effort (e.g. `Op::LocalGet` always hints I32
+                    // because the wasm-handshake slots are i32). The
+                    // walker's actual observation (from
+                    // `step_local_get`'s `observed_from_ir`) is the
+                    // authoritative type; the maybe_emit_type_guard
+                    // call a few lines down stamps it via the same
+                    // FirstSeen path used by `Emit`. Pre-seeding the
+                    // i32 hint here would turn the first observation
+                    // of an i64-arg LocalGet (pointer payload, IrType
+                    // ListInt/etc.) into a TypeObsDecision::Mismatch
+                    // and force an avoidable abort.
+                    let _ = ty_hint;
                     self.ir_to_ssa.insert(kind, fresh_dst);
-                    self.type_obs.insert(fresh_dst, ty_hint);
                     (fresh_dst, true)
                 };
                 // Lookup pushes one value onto the operand stack.
