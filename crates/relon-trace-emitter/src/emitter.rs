@@ -400,11 +400,17 @@ struct TraceEmitterState<'a, 'b> {
     /// F-D8: optional `__relon_trace_dict_lookup` FuncRef. Same
     /// contract as `list_get`.
     dict_lookup: Option<ir::FuncRef>,
-    /// F-D8-E.2: optional `__relon_trace_dict_lookup_prechecked`
-    /// FuncRef. `None` means the host did not declare the helper;
-    /// `emit_dict_lookup_prechecked` surfaces
-    /// `EmitError::HostHookNotDeclared` if a
-    /// `TraceOp::DictLookupPrechecked` is seen without a wired hook.
+    /// F-D8-E.2 + F-D8-E.4: optional
+    /// `__relon_trace_dict_lookup_prechecked` FuncRef. Retained as
+    /// the cranelift import (declared upstream in the function's
+    /// DFG) so the FuncId stays reachable for tools / debug dumps,
+    /// but the F-D8-E.4 inline lowering no longer reads it on the
+    /// fast path. Kept rather than removed because (a) the host's
+    /// `HostHookTable` still wires the helper for the dispatch
+    /// table's slot, and (b) follow-up work that wants a helper-call
+    /// fallback (e.g. for large entry tables) can flip back to the
+    /// call form without re-plumbing the declaration phase.
+    #[allow(dead_code)]
     dict_lookup_prechecked: Option<ir::FuncRef>,
     ssa_to_value: HashMap<SsaVar, ir::Value>,
     /// v6-δ M1: overflow bits surfaced by `Add` / `Sub` / `Mul`
@@ -1035,51 +1041,57 @@ impl<'a, 'b> TraceEmitterState<'a, 'b> {
         Ok(())
     }
 
-    /// F-D8-E.2: lower `TraceOp::DictLookupPrechecked { dst,
-    /// dict_ptr, key_ptr }` to a call into
-    /// `__relon_trace_dict_lookup_prechecked`, then deopt-branch on
-    /// the sentinel return.
+    /// F-D8-E.2 + F-D8-E.4: lower `TraceOp::DictLookupPrechecked
+    /// { dst, dict_ptr, key_ptr }`.
     ///
-    /// Same shape as [`Self::emit_dict_lookup`] except the helper
-    /// takes 3 args (the `shape_hash` immediate is dropped — its
-    /// matching `DictShapeGuard` enforced it upstream). The deopt
-    /// branch is kept because a missing key (e.g. the dict was
-    /// mutated between recorder time and execution time so a
-    /// previously-present entry vanished) still surfaces here even
-    /// when the shape header itself matches.
+    /// **Default path (F-D8-E.4 inline)**: drop the call into
+    /// `__relon_trace_dict_lookup_prechecked` entirely and emit the
+    /// helper's body (FxHash inline + linear entry scan inline)
+    /// directly into the cranelift IR via
+    /// [`crate::dict_inline::emit_dict_lookup_inline`]. The matching
+    /// `DictShapeGuard` already verified the shape header upstream
+    /// (LICM-lifted to the trace entry), so the inline body skips it
+    /// just like the helper would.
+    ///
+    /// Why inline:
+    /// - Eliminates the C ABI boundary (~6-7 ns/iter on the W5 hot
+    ///   loop, measured against the helper-call variant).
+    /// - Cranelift's GVN can hoist `entry_count` and `entries_base`
+    ///   computation if the dict pointer is loop-invariant — the
+    ///   helper kept those reloads opaque behind the call boundary.
+    /// - The hash loop's `(byte_idx, accumulator)` SSA folds straight
+    ///   into the surrounding trace; no register-save/restore at the
+    ///   call boundary.
+    ///
+    /// **Fallback path**: when the host has not declared the
+    /// `dict_lookup_prechecked` FuncId (`HostHookFuncIds.dict_lookup_prechecked
+    /// == None`) the inline path still works — neither cranelift
+    /// helper is needed because the body is purely inline. We keep
+    /// the FuncId field around for ABI completeness so existing
+    /// fixtures that wire the helper continue to type-check, but
+    /// the call instruction is never emitted on the hit path.
+    ///
+    /// The deopt branch is preserved on the miss path because a key
+    /// that was present at recorder time but vanished (dict mutated
+    /// between record and execute) still needs to bail out.
     fn emit_dict_lookup_prechecked(
         &mut self,
         dst: SsaVar,
         dict_ptr: SsaVar,
         key_ptr: SsaVar,
     ) -> Result<(), EmitError> {
-        let helper = self
-            .dict_lookup_prechecked
-            .ok_or(EmitError::HostHookNotDeclared(
-                HostHookId::DictLookupPrechecked,
-            ))?;
         let dict_v = self.lookup(dict_ptr)?;
         let key_v = self.lookup(key_ptr)?;
-        let inst = self
-            .builder
-            .ins()
-            .call(helper, &[dict_v, key_v, self.trace_ctx_ptr]);
-        let val = self.builder.inst_results(inst)[0];
-
-        let sentinel = self.builder.ins().iconst(I64, i64::MIN);
-        let miss = self.builder.ins().icmp(IntCC::Equal, val, sentinel);
-        let ok_block = self.builder.create_block();
-        let guard_pc = self.builder.ins().iconst(I32, 0);
-        let external_pc = self.builder.ins().iconst(I64, 0);
-        self.builder.ins().brif(
-            miss,
+        // F-D8-E.4: emit the helper body straight into cranelift IR.
+        // The shared deopt block is reused for null-key and key-miss
+        // paths, matching the helper's `i64::MIN` sentinel semantics
+        // (caller's view: a deopt fires either way).
+        let val = crate::dict_inline::emit_dict_lookup_inline(
+            self.builder,
+            dict_v,
+            key_v,
             self.deopt_block,
-            &[BlockArg::Value(guard_pc), BlockArg::Value(external_pc)],
-            ok_block,
-            &[],
         );
-        self.builder.seal_block(ok_block);
-        self.builder.switch_to_block(ok_block);
         self.bind(dst, val);
         Ok(())
     }

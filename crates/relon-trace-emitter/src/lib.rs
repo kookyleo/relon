@@ -32,6 +32,7 @@
 
 pub mod abi;
 pub mod call_conv;
+pub mod dict_inline;
 pub mod emitter;
 pub mod guard_emit;
 pub mod inline_emit;
@@ -45,6 +46,7 @@ pub use abi::{
     TraceEntryStatus, TRACE_ENTRY_SIG,
 };
 pub use call_conv::{trace_entry_call_conv, trace_entry_uses_tail};
+pub use dict_inline::{emit_dict_lookup_inline, MAX_INLINE_ENTRY_HINT};
 pub use emitter::{EmitError, HostHookFuncIds, TraceEmitter};
 pub use guard_emit::{emit_guard, GuardEmitCtx};
 pub use inline_emit::{
