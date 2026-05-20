@@ -73,6 +73,33 @@ pub struct StringRef {
     pub len: usize,
 }
 
+/// Byte offset of `StringRef::ptr` from the struct base. Exposed so the
+/// trace emitter's inline `StrContains` lowering can issue a
+/// `load` at this offset without re-encoding the layout assumption.
+/// The compile-time assert below ties this constant to `offset_of!` so
+/// any reordering of `StringRef` fields is caught at build time rather
+/// than at JIT execution time.
+pub const STRING_REF_PTR_OFFSET: i32 = 0;
+/// Byte offset of `StringRef::len` from the struct base. See the
+/// `STRING_REF_PTR_OFFSET` doc for the rationale.
+pub const STRING_REF_LEN_OFFSET: i32 = 8;
+
+// Compile-time invariant: the JIT-side `load` offsets used in
+// `relon_trace_emitter::str_inline::load_string_ref_payload` MUST
+// match the host-side `StringRef` layout. Any reordering / type
+// change in `StringRef` triggers a build error here so the emitter
+// can never drift silently.
+const _: () = {
+    assert!(
+        core::mem::offset_of!(StringRef, ptr) == STRING_REF_PTR_OFFSET as usize,
+        "StringRef::ptr offset drift; update STRING_REF_PTR_OFFSET"
+    );
+    assert!(
+        core::mem::offset_of!(StringRef, len) == STRING_REF_LEN_OFFSET as usize,
+        "StringRef::len offset drift; update STRING_REF_LEN_OFFSET"
+    );
+};
+
 impl StringRef {
     /// Build a `StringRef` from a Rust `&str`. The returned reference
     /// borrows from `s` — caller must keep `s` alive for as long as

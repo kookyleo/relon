@@ -69,5 +69,6 @@ pub use dict_list::{
 pub use ic_lookup::{__relon_trace_inline_cache_lookup, ic_storage_size, write_ic_header};
 pub use str_ops::{
     __relon_str_concat, __relon_str_contains, __relon_str_find, __relon_str_substring,
-    reset_str_contains_ic, str_contains_ic_counts, StringRef,
+    reset_str_contains_ic, str_contains_ic_counts, StringRef, STRING_REF_LEN_OFFSET,
+    STRING_REF_PTR_OFFSET,
 };

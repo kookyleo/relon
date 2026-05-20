@@ -41,14 +41,28 @@
 //! comfortably under 2× LuaJIT; a v128 fast path is left as a follow-up
 //! (see the stage report's "remaining todo").
 //!
+//! ## API selection
+//!
+//! Two entry points cover the two real use cases. Pick by **whether the
+//! haystack SSA changes per iteration**:
+//!
+//! | Use case | Entry point | Why |
+//! |---|---|---|
+//! | Recorder / IC lowering — haystack arrives fresh on each `StrContains` invocation in the trace stream | [`emit_str_contains_inline`] | Loads the `(ptr, len)` payload from the haystack each call; null-checks the pointer inline. |
+//! | Hand-built hot loop — haystack is loop-invariant and the caller wants to hoist the `StringRef` deref out of the loop | [`emit_str_contains_inline_preloaded`] | Takes a cached [`StrPayload`] (built once via [`load_string_ref_payload`]); skips per-iter `load` of `(ptr, len)`. Caller is responsible for the upstream null guard. |
+//!
+//! Mixing them up "works" semantically but leaves the per-iter `StringRef`
+//! load in place — F-D9 W4 bench measured the difference at ~6 ns / iter,
+//! enough to slip from ratio ≤ × 2 to ≥ × 2.3 on a 10 KB haystack.
+//!
 //! ## Caller contract
 //!
-//! [`emit_str_contains_inline`] takes the haystack i64 SSA value (a
-//! `*const StringRef`) and a needle byte slice, and returns the i32
-//! result value. It must be called inside a sealed builder; on entry
-//! the current cranelift block is the one that flows into the
-//! lowering, on exit the current block is the join after the scan
-//! (so subsequent ops continue in straight line).
+//! Both entry points take the haystack handle (either an i64 SSA value or
+//! a pre-loaded [`StrPayload`]) and a needle byte slice, and return the i32
+//! result value. They must be called inside a sealed builder; on entry the
+//! current cranelift block is the one that flows into the lowering, on
+//! exit the current block is the join after the scan (so subsequent ops
+//! continue in straight line).
 
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::types::{I32, I64};
@@ -84,27 +98,39 @@ pub struct StrPayload {
 /// Load the `(ptr: *const u8, len: usize)` payload from a
 /// `*const StringRef`. Both fields are returned as i64 values.
 ///
-/// Layout assumed: `#[repr(C)] { ptr: *const u8 @ 0, len: usize @ 8 }`
-/// on a 64-bit host. `str_ops::StringRef` enforces this; see the
-/// module-level doc on the runtime side.
+/// Offsets come from
+/// [`relon_trace_jit::runtime::STRING_REF_PTR_OFFSET`] /
+/// [`relon_trace_jit::runtime::STRING_REF_LEN_OFFSET`], which are
+/// pinned to the host-side `StringRef` layout by a compile-time
+/// `offset_of!` assert. Any layout drift surfaces as a build break
+/// in the runtime crate, never as a silent JIT memory bug.
 pub fn load_string_ref_payload(
     builder: &mut FunctionBuilder<'_>,
     string_ref_ptr: ir::Value,
 ) -> StrPayload {
-    let ptr = builder
-        .ins()
-        .load(I64, MemFlags::trusted(), string_ref_ptr, 0);
-    let len = builder
-        .ins()
-        .load(I64, MemFlags::trusted(), string_ref_ptr, 8);
+    let ptr = builder.ins().load(
+        I64,
+        MemFlags::trusted(),
+        string_ref_ptr,
+        relon_trace_jit::runtime::STRING_REF_PTR_OFFSET,
+    );
+    let len = builder.ins().load(
+        I64,
+        MemFlags::trusted(),
+        string_ref_ptr,
+        relon_trace_jit::runtime::STRING_REF_LEN_OFFSET,
+    );
     StrPayload { ptr, len }
 }
 
 /// Emit the inline `str_contains(haystack, needle)` lowering into
-/// `builder`. Returns the i32 result value (0 = miss, 1 = hit).
+/// `builder` for a dynamic-haystack callsite (e.g. the recorder /
+/// inline-cache lowering in `emitter::emit_str_contains`). Returns the
+/// i32 result value (0 = miss, 1 = hit).
 ///
-/// `haystack` must be an i64 SSA value carrying a `*const StringRef`
-/// pointer. Null is treated as miss.
+/// `haystack` is an i64 SSA carrying a `*const StringRef` pointer; the
+/// pointer is dereferenced here to read `(ptr, len)`, and a null check
+/// is emitted inline (null → miss).
 ///
 /// The current block must be sealed-or-open with a single predecessor
 /// path that flows here; the emitter switches blocks as part of the
@@ -112,9 +138,9 @@ pub fn load_string_ref_payload(
 /// function returns. The returned value is a block-param of the join
 /// block.
 ///
-/// For loop-hot callsites the caller should prefer
-/// [`emit_str_contains_inline_preloaded`], which avoids re-loading the
-/// haystack `(ptr, len)` payload on every iteration.
+/// **Choose [`emit_str_contains_inline_preloaded`] instead** when the
+/// haystack SSA is loop-invariant — it skips the per-iter `(ptr, len)`
+/// load. See the module-level "API selection" section.
 pub fn emit_str_contains_inline(
     builder: &mut FunctionBuilder<'_>,
     haystack: ir::Value,
@@ -161,11 +187,12 @@ pub fn emit_str_contains_inline(
     builder.block_params(join_block)[0]
 }
 
-/// Same as [`emit_str_contains_inline`] but takes a pre-loaded
-/// `StrPayload` for the haystack. This is the perf-critical entrypoint
-/// when the haystack SSA is loop-invariant — the caller hoists the
-/// `(ptr, len)` load out of the loop once and passes the cached values
-/// in on every iteration, avoiding a redundant memory probe per probe.
+/// Loop-hoisted variant of [`emit_str_contains_inline`]. Takes a
+/// pre-loaded `StrPayload` instead of a `*const StringRef` SSA, so the
+/// caller can issue [`load_string_ref_payload`] **once** outside the
+/// loop and reuse the cached `(ptr, len)` on every iteration. Used by
+/// the F-D9 hand-built cmp_lua W4 trace; the recorder / IC lowering
+/// uses the dynamic-haystack [`emit_str_contains_inline`] form instead.
 ///
 /// Null-haystack handling is the caller's responsibility (an upstream
 /// `Guard(NotNull(haystack))` is sufficient); this variant assumes the

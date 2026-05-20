@@ -37,7 +37,7 @@ use relon_eval_api::{ClosureData, Evaluator, RuntimeError, Scope, Thunk, Value};
 use relon_evaluator::TreeWalkEvaluator;
 use relon_parser::{Expr, Node, Operator};
 
-use crate::{build_tree_walk_evaluator, BackendError};
+use crate::BackendError;
 
 /// Wrapper [`Evaluator`] that routes the four AST-aware methods
 /// through a tree-walker and lazily spins up the cranelift-AOT
@@ -86,14 +86,15 @@ impl AutoEvaluator {
     /// `eval_root` / `force_thunk` / `invoke_closure`. The AOT
     /// half stays unbuilt until the first `run_main` invocation.
     pub fn new(source: &str) -> std::result::Result<Self, BackendError> {
-        let tree_walk = build_tree_walk_evaluator(source)?;
-        // v6-fix-D2 default-path short-circuit: detect trivial scalar
-        // `#main` shapes once at construction time so `run_main`
-        // doesn't have to re-inspect the AST on every call. Parse
-        // failures in this side-pass are demoted to "not trivial"
-        // (the tree-walker build above would have caught them
-        // already), so the flag stays conservative.
-        let is_trivial_main = is_trivial_scalar_main(source);
+        // Parse exactly once, hand the same AST to both the trivial
+        // classifier (borrow) and the tree-walker build (move). v6-fix-
+        // D2-default originally re-parsed inside `is_trivial_scalar_main`,
+        // which doubled cold-start parse cost. Now the source is parsed
+        // here and the borrow runs the same classifier rules.
+        let node =
+            relon_parser::parse_document(source).map_err(|e| BackendError::Parse(e.to_string()))?;
+        let is_trivial_main = is_trivial_scalar_main_node(&node);
+        let tree_walk = crate::build_tree_walk_evaluator_from_parsed(node)?;
         Ok(Self {
             source: source.to_string(),
             tree_walk: Box::new(tree_walk),
@@ -312,13 +313,22 @@ impl Evaluator for AutoEvaluator {
 ///   handles correctly but with materially different cost than the
 ///   trivial-arithmetic case.
 pub fn is_trivial_scalar_main(source: &str) -> bool {
-    use relon_parser::DirectiveBody;
-    // Parse twice with the same parser the tree-walker uses; on a
-    // failure we conservatively say "not trivial" so the AOT path's
-    // own diagnostic surfaces verbatim on first `run_main`.
+    // Parse failures are demoted to "not trivial" so the AOT path's
+    // own diagnostic surfaces verbatim on first `run_main`. Callers
+    // that already hold a parsed `Node` (e.g. `AutoEvaluator::new`)
+    // skip this parse via [`is_trivial_scalar_main_node`].
     let Ok(root) = relon_parser::parse_document(source) else {
         return false;
     };
+    is_trivial_scalar_main_node(&root)
+}
+
+/// AST-input variant of [`is_trivial_scalar_main`]. Used by
+/// [`AutoEvaluator::new`] to run the classifier on an already-parsed
+/// document, avoiding the ~100-300 µs duplicate parse cost the
+/// original source-string entry point pays.
+pub fn is_trivial_scalar_main_node(root: &relon_parser::Node) -> bool {
+    use relon_parser::DirectiveBody;
     // Exactly one `#main(...)` directive, no `#import`s. Multi-main
     // is an analyzer error anyway; we early-return false rather than
     // racing the analyzer.

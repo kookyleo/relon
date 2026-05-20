@@ -662,6 +662,16 @@ pub(crate) fn build_tree_walk_evaluator(
     source: &str,
 ) -> std::result::Result<TreeWalkEvaluator, BackendError> {
     let node = parse_document(source).map_err(|e| BackendError::Parse(e.to_string()))?;
+    build_tree_walk_evaluator_from_parsed(node)
+}
+
+/// Same as [`build_tree_walk_evaluator`] but takes an already-parsed
+/// document. Lets a caller (specifically [`crate::AutoEvaluator::new`])
+/// parse once and feed the same AST through both the build and the
+/// trivial-scalar classifier so cold-start avoids a redundant parse.
+pub(crate) fn build_tree_walk_evaluator_from_parsed(
+    node: relon_parser::Node,
+) -> std::result::Result<TreeWalkEvaluator, BackendError> {
     let analyzed = Arc::new(relon_analyzer::analyze(&node));
     let mut ctx = Context::new()
         .with_root(node)
