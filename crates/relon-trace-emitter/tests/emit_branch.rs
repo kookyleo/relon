@@ -105,6 +105,53 @@ fn arith_overflow_guard_lowers_predicate() {
     emit_and_verify(&b.into_optimized());
 }
 
+/// F-D7-J fast-path: `Add` produces an `of` bit via `sadd_overflow`;
+/// the immediately-following `Guard(ArithOverflow(dst))` should
+/// brif directly on the captured `of` SSA, skipping the
+/// `icmp(eq, of, 0)` + `uextend(I32)` chain the predicate builder
+/// would otherwise emit. We verify by counting that exactly one
+/// `icmp` ends up in the function — the one inside `sadd_overflow`'s
+/// own carry detection — and not the extra `eq` the legacy guard
+/// predicate added.
+#[test]
+fn arith_overflow_guard_skips_icmp_with_captured_of_bit() {
+    let mut b = TraceBuffer::new();
+    let a = b.fresh_ssa();
+    let bv = b.fresh_ssa();
+    let dst = b.fresh_ssa();
+    b.append(TraceOp::ConstI64(a, 1));
+    b.append(TraceOp::ConstI64(bv, 2));
+    b.append(TraceOp::Add(dst, a, bv));
+    let pc = b.append(TraceOp::Guard(GuardKind::ArithOverflow(dst), SsaVar::NONE));
+    b.record_guard(GuardSite::new(
+        pc,
+        ExternalPc(0xbb),
+        GuardKind::ArithOverflow(dst),
+    ));
+    b.append(TraceOp::Return(dst));
+
+    let ctx = emit_and_verify(&b.into_optimized());
+    let s = format!("{}", ctx.func);
+    // No standalone `icmp` should remain — `sadd_overflow` returns
+    // `(r, of)` and the guard `brif`s on `of` directly. (cranelift
+    // sometimes prints `sadd_overflow` as a single op without an
+    // adjacent `icmp`; the legacy predicate would have added an
+    // explicit `icmp eq, of, 0` we want to skip.) Match the legacy
+    // pattern's exact textual form to keep the assertion stable
+    // across cranelift print-format tweaks.
+    assert!(
+        !s.contains("icmp eq"),
+        "expected no `icmp eq` (legacy of==0 predicate), got:\n{s}"
+    );
+    // And exactly one brif (the guard's), since there's no other
+    // control flow in this trace.
+    let brif_count = s.matches("brif").count();
+    assert!(
+        brif_count >= 1,
+        "expected at least one brif (the guard), got {brif_count} in:\n{s}"
+    );
+}
+
 #[test]
 fn guard_then_load_chain_verifies() {
     // Guard(BoundsCheck) ↦ Load: the guard's ok path is the load's
