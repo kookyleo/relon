@@ -670,8 +670,11 @@ impl<'a, 'b> TraceEmitterState<'a, 'b> {
         if let Some(needle_bytes) = self.trace.const_bytes_for(b) {
             if crate::str_inline::needle_fits_inline(needle_bytes) {
                 let needle_owned: Vec<u8> = needle_bytes.to_vec();
-                let r =
-                    crate::str_inline::emit_str_contains_inline(self.builder, va, &needle_owned);
+                let r = crate::str_inline::emit_str_contains_inline(
+                    self.builder,
+                    crate::str_inline::HaystackHandle::Raw(va),
+                    &needle_owned,
+                );
                 self.bind(dst, r);
                 return Ok(());
             }
