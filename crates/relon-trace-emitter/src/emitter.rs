@@ -867,9 +867,38 @@ impl<'a, 'b> TraceEmitterState<'a, 'b> {
         if let Some(needle_bytes) = self.trace.const_bytes_for(b) {
             if crate::str_inline::needle_fits_inline(needle_bytes) {
                 let needle_owned: Vec<u8> = needle_bytes.to_vec();
+                // F-D7-H: when the recorder injected upstream
+                // `TraceOp::Load { Offset(0|8) }` reads against the
+                // haystack `*const StringRef`, route the inline scan
+                // through `HaystackHandle::Preloaded`. The loads are
+                // already cranelift SSAs by the time we get here
+                // (emit_load ran for them earlier in the stream); we
+                // just look them up and pass the resulting
+                // `StrPayload` straight in.
+                //
+                // The crucial knock-on benefit is that the F-D7-G
+                // LICM pass admits the upstream Loads as hoistable
+                // (offset is exactly 0 or 8, body has no writes), so
+                // when the haystack is loop-invariant the loads
+                // move to the preheader and the per-iter cost drops
+                // to just the inline scan body. Without this side-
+                // table path, `load_string_ref_payload` would emit a
+                // raw `builder.ins().load` inside the StrContains
+                // lowering — invisible to LICM and re-issued every
+                // iteration even on a constant haystack.
+                let handle = if let Some((ptr_ssa, len_ssa)) = self.trace.str_payload_for(a) {
+                    let ptr = self.lookup(ptr_ssa)?;
+                    let len = self.lookup(len_ssa)?;
+                    crate::str_inline::HaystackHandle::Preloaded(crate::str_inline::StrPayload {
+                        ptr,
+                        len,
+                    })
+                } else {
+                    crate::str_inline::HaystackHandle::Raw(va)
+                };
                 let r = crate::str_inline::emit_str_contains_inline(
                     self.builder,
-                    crate::str_inline::HaystackHandle::Raw(va),
+                    handle,
                     &needle_owned,
                 );
                 self.bind(dst, r);
