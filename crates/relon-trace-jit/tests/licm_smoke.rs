@@ -788,3 +788,77 @@ fn local_get_haystack_and_payload_load_hoist_together() {
         "both StringRef payload Loads must hoist above MarkLoopHead (F-D7-G)"
     );
 }
+
+// ---- F-D7-J: NotNull guard hoist when input is loop-invariant ------
+
+/// The F-D7-B recorder injects a `Guard(NotNull(haystack))` ahead of
+/// every `StrContains`. When the haystack SSA is loop-invariant (as
+/// in the W4 hot loop after F-D7-D hoists the matching `LocalGet`),
+/// the null-check answer is iteration-independent — pass forever or
+/// deopt on iter 0. F-D7-J admits the guard to the hoistable set so
+/// the brif moves to the preheader.
+#[test]
+fn loop_invariant_not_null_guard_lifts_out_of_loop() {
+    let mut b = TraceBuffer::new();
+    let haystack = b.fresh_ssa();
+    // Haystack SSA defined OUTSIDE the loop — canonical invariant
+    // case (post-LICM-of-LocalGet shape).
+    b.append(TraceOp::ConstI64(haystack, 0xbeef_0000));
+    b.append(TraceOp::MarkLoopHead {
+        loop_id: 0,
+        phis: vec![],
+    });
+    b.append(TraceOp::Guard(GuardKind::NotNull(haystack), haystack));
+    b.append(TraceOp::MarkLoopBack {
+        loop_id: 0,
+        next_values: vec![],
+    });
+
+    let r = LICM.run(&mut b);
+    assert!(r.ops_replaced > 0, "expected NotNull guard to hoist");
+
+    let head_idx = position(&b.ops, |o| o.is_loop_head()).unwrap();
+    let guard_idx = position(&b.ops, |o| {
+        matches!(o, TraceOp::Guard(GuardKind::NotNull(_), _))
+    })
+    .unwrap();
+    assert!(
+        guard_idx < head_idx,
+        "NotNull on a loop-invariant value must hoist above MarkLoopHead"
+    );
+}
+
+/// Counter-test: a `NotNull` whose input is loop-variant must remain
+/// pinned. This guards against the F-D7-J rule accidentally lifting
+/// a per-iter null-check on a phi-produced pointer.
+#[test]
+fn loop_variant_not_null_guard_stays_inside() {
+    let mut b = TraceBuffer::new();
+    let base = b.fresh_ssa();
+    let v = b.fresh_ssa();
+    b.append(TraceOp::ConstI64(base, 0x4000));
+    b.append(TraceOp::MarkLoopHead {
+        loop_id: 0,
+        phis: vec![],
+    });
+    // Offset 24: avoids the F-D7-G allow-listed (0 / 8) offsets so the
+    // Load stays inside the loop body — and the NotNull on its `dst`
+    // is then loop-variant by construction.
+    b.append(TraceOp::Load(v, base, Offset(24)));
+    b.append(TraceOp::Guard(GuardKind::NotNull(v), v));
+    b.append(TraceOp::MarkLoopBack {
+        loop_id: 0,
+        next_values: vec![],
+    });
+
+    LICM.run(&mut b);
+    let head_idx = position(&b.ops, |o| o.is_loop_head()).unwrap();
+    let guard_idx = position(&b.ops, |o| {
+        matches!(o, TraceOp::Guard(GuardKind::NotNull(_), _))
+    })
+    .unwrap();
+    assert!(
+        guard_idx > head_idx,
+        "NotNull on loop-variant value must remain inside the body"
+    );
+}

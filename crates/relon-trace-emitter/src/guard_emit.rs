@@ -106,6 +106,34 @@ pub fn emit_guard(
                 &[],
             );
         }
+        GuardKind::ArithOverflow(var) if ctx.overflow_bits.contains_key(var) => {
+            // F-D7-J: when the matching `Add` / `Sub` / `Mul` op
+            // surfaced an `of_bit` via `*_overflow`, branch directly
+            // on it. `of_bit == 1` ⇒ overflow ⇒ deopt; `of_bit == 0`
+            // ⇒ ok. This skips the `icmp(eq, of, 0); uextend(I32)`
+            // chain `build_guard_predicate` would otherwise emit and
+            // saves ~2 cranelift insts per ArithOverflow guard — the
+            // W4 hot loop fires two of these per iter (one for the
+            // accumulator `+= hit`, one for `i + 1`), so the trim
+            // shows up directly in the per-iter cost.
+            //
+            // The fallback path (no overflow bit captured — synthetic
+            // / hand-rolled buffers in unit tests) stays in
+            // `build_guard_predicate` so the constant-0/1 predicate
+            // behaviour pinned by existing tests doesn't change.
+            let of_bit = ctx
+                .overflow_bits
+                .get(var)
+                .copied()
+                .expect("overflow_bits entry verified above");
+            ctx.builder.ins().brif(
+                of_bit,
+                ctx.deopt_block,
+                &[BlockArg::Value(guard_pc), BlockArg::Value(external_pc)],
+                ok_block,
+                &[],
+            );
+        }
         _ => {
             let cond = build_guard_predicate(ctx, &site.kind, ssa_to_value)?;
             // brif: branch to `deopt_block` when the predicate is

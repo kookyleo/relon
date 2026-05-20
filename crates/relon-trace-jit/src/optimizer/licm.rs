@@ -17,13 +17,17 @@
 //!    allow-listed `ReadOnly` ops (see [`is_hoistable`]).
 //!    `RecoverableWrite` and worse are never hoisted.
 //! 2. Guards are normally position-sensitive (deopt expects the
-//!    trace to have reached that pc before failing). The only
-//!    exception is [`GuardKind::BoundsCheck`]: if both inputs are
+//!    trace to have reached that pc before failing). The exceptions
+//!    are [`GuardKind::BoundsCheck`] (F-D8-E.3) and
+//!    [`GuardKind::NotNull`] (F-D7-J): when their inputs are
 //!    loop-invariant the pass/fail decision is iteration-independent,
-//!    so hoisting it merely fires the same deopt earlier — never
-//!    later than it would have anyway. F-D8-E.3 admits this case so
-//!    the `ListGet { list_ptr, idx }` it shields can also hoist when
-//!    its inputs are invariant.
+//!    so hoisting them merely fires the same deopt earlier — never
+//!    later than it would have anyway. F-D8-E.3 admits `BoundsCheck`
+//!    so the `ListGet { list_ptr, idx }` it shields can also hoist
+//!    when its inputs are invariant; F-D7-J admits `NotNull` so the
+//!    `StrContains` / `StrConcat` haystack null-check the recorder
+//!    emits ahead of every str op lifts when the haystack is
+//!    invariant (saves one brif per iter on W4).
 //! 3. It is not itself a loop marker.
 //! 4. Every SSA input is defined *outside* the loop body. "Defined
 //!    outside" means: produced by an op at a pc strictly less than
@@ -247,14 +251,27 @@ fn is_hoistable(op: &TraceOp, body_has_writes: bool) -> bool {
     // no side effect sits between the original guard position and
     // the loop head (the in-loop ops up to that point would all be
     // hoistable themselves under the same invariance precondition).
-    // Other guard kinds remain pinned: `TypeCheck` and `NotNull`
-    // are usually no-ops at the recorded position and lifting them
-    // does not reduce per-iter work; `ArithOverflow` and `IsZero`
-    // are inherently positional (they reference a specific SSA
-    // produced just upstream). See module docs §"Hoist eligibility"
-    // for the safety argument.
+    //
+    // F-D7-J extends the same argument to `Guard(NotNull(v))`. The
+    // F-D7-B recorder injects a `NotNull(haystack)` ahead of every
+    // `StrContains` (and similarly for `StrConcat` / `StrFind` /
+    // `StrSubstring`). When `haystack` is loop-invariant (LICM has
+    // hoisted the matching `LocalGet`), the null-check answer is
+    // iteration-independent too: pass forever or deopt on the very
+    // first iter. Lifting the guard above the loop head saves one
+    // brif per iter on the W4 hot loop without changing semantics —
+    // an early deopt fires the same trace_pc / external_pc the
+    // recorder annotated.
+    //
+    // `TypeCheck` is similarly loop-invariant when its target is
+    // outside the body, but the current emitter resolves the
+    // predicate from the recorded observed type at install time
+    // (constant 0 / 1 brif), so hoisting offers no per-iter win.
+    // `ArithOverflow` and `IsZero` are positional by construction —
+    // they reference an SSA produced just upstream — and never get
+    // a loop-invariant input under the current trace shapes.
     if let TraceOp::Guard(kind, _) = op {
-        return matches!(kind, GuardKind::BoundsCheck(_, _));
+        return matches!(kind, GuardKind::BoundsCheck(_, _) | GuardKind::NotNull(_));
     }
     match op.effect_class() {
         EffectClass::Pure => {
