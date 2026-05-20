@@ -858,6 +858,26 @@ impl TraceJitState {
                 &dict_lookup_sig,
             )
             .map_err(|e| TraceJitError::Module(format!("declare dict_lookup: {e}")))?;
+        // F-D8-E.2: pre-declare the "shape already checked" variant
+        // of the dict lookup helper. The optimizer's `dict_ic_hoist`
+        // pass rewrites in-loop `TraceOp::DictLookup` whose
+        // `dict_ptr` is loop-invariant into a `DictShapeGuard` (LICM
+        // hoists out of the loop) + a `DictLookupPrechecked` (stays
+        // in the body) pair. The prechecked op routes here; the
+        // shape compare it skips was made redundant by the hoisted
+        // guard. Signature mirrors `dict_lookup` minus the
+        // `shape_hash: i64` arg.
+        let dict_lookup_prechecked_sig = build_host_helper_signature(
+            &[pointer_ty, pointer_ty, pointer_ty],
+            &[cranelift_codegen::ir::types::I64],
+        );
+        let dict_lookup_prechecked_id = module
+            .declare_function(
+                relon_trace_emitter::HostHookId::DictLookupPrechecked.symbol(),
+                Linkage::Import,
+                &dict_lookup_prechecked_sig,
+            )
+            .map_err(|e| TraceJitError::Module(format!("declare dict_lookup_prechecked: {e}")))?;
         let hook_func_ids = HostHookFuncIds {
             save_deopt: save_deopt_id.as_u32(),
             resolve_call: resolve_call_id.as_u32(),
@@ -868,6 +888,7 @@ impl TraceJitState {
             str_substring: str_substring_id.as_u32(),
             list_get: Some(list_get_id.as_u32()),
             dict_lookup: Some(dict_lookup_id.as_u32()),
+            dict_lookup_prechecked: Some(dict_lookup_prechecked_id.as_u32()),
         };
 
         let mut ctx = CodegenContext::new();
@@ -1267,6 +1288,12 @@ pub fn register_trace_runtime_symbols(builder: &mut JITBuilder) {
     builder.symbol(
         relon_trace_emitter::HostHookId::DictLookup.symbol(),
         relon_trace_jit::runtime::__relon_trace_dict_lookup as *const u8,
+    );
+    // F-D8-E.2: prechecked dict lookup helper. Paired with
+    // `TraceOp::DictShapeGuard` ahead of the call site.
+    builder.symbol(
+        relon_trace_emitter::HostHookId::DictLookupPrechecked.symbol(),
+        relon_trace_jit::runtime::__relon_trace_dict_lookup_prechecked as *const u8,
     );
     builder.symbol(
         "__relon_jump_to_recorder",

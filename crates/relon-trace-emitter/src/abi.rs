@@ -156,10 +156,10 @@ pub fn host_hook_slot_offset(hook: HostHookId) -> i32 {
         // required for F-D8 v1. Callers that ask for a slot offset
         // on these hooks have a bug — return a sentinel that will
         // surface as `EmitError::HostHookNotDeclared` if reached.
-        HostHookId::ListGet | HostHookId::DictLookup => {
+        HostHookId::ListGet | HostHookId::DictLookup | HostHookId::DictLookupPrechecked => {
             debug_assert!(
                 false,
-                "host_hook_slot_offset called for ListGet/DictLookup; \
+                "host_hook_slot_offset called for ListGet/DictLookup/DictLookupPrechecked; \
                  F-D8 hooks do not live in HostHookTable"
             );
             return -1;
@@ -210,6 +210,15 @@ pub enum HostHookId {
     /// surrounding cranelift IR turns into a deopt branch so the
     /// recorder gets a chance to re-specialise under the new shape.
     DictLookup,
+    /// F-D8-E.2: `__relon_trace_dict_lookup_prechecked(dict_ptr:
+    /// *const u8, key_ptr: *const u8, ctx: *mut TraceContext) -> i64`.
+    /// Same semantics as [`Self::DictLookup`] except the helper
+    /// skips the shape compare on the IC fast path. The cranelift
+    /// emitter lowers `TraceOp::DictLookupPrechecked` into a call
+    /// to this helper; the matching `TraceOp::DictShapeGuard` ahead
+    /// of the lookup (typically hoisted out of the enclosing loop
+    /// by LICM) keeps the safety contract intact.
+    DictLookupPrechecked,
 }
 
 impl HostHookId {
@@ -227,6 +236,7 @@ impl HostHookId {
             HostHookId::StrSubstring => "__relon_str_substring",
             HostHookId::ListGet => "__relon_trace_list_get",
             HostHookId::DictLookup => "__relon_trace_dict_lookup",
+            HostHookId::DictLookupPrechecked => "__relon_trace_dict_lookup_prechecked",
         }
     }
 }

@@ -223,6 +223,20 @@ fn rewrite_inputs(op: &mut TraceOp, alias: &HashMap<SsaVar, SsaVar>) -> usize {
             swap!(dict_ptr);
             swap!(key_ptr);
         }
+        // F-D8-E.2: the optimizer's `dict_ic_hoist` pass replaces a
+        // single `DictLookup` with this pair; both reference SSA
+        // inputs that an earlier load-forward round may have already
+        // alias-resolved, so participate in the swap loop just like
+        // their full-form sibling above.
+        TraceOp::DictShapeGuard { dict_ptr, .. } => {
+            swap!(dict_ptr);
+        }
+        TraceOp::DictLookupPrechecked {
+            dict_ptr, key_ptr, ..
+        } => {
+            swap!(dict_ptr);
+            swap!(key_ptr);
+        }
         TraceOp::Return(v) => {
             swap!(v);
         }

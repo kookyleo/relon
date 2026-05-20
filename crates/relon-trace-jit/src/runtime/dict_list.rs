@@ -181,6 +181,71 @@ pub unsafe extern "C" fn __relon_trace_dict_lookup(
     DICT_LOOKUP_DEOPT
 }
 
+/// F-D8-E.2: "shape already checked" companion of
+/// [`__relon_trace_dict_lookup`].
+///
+/// The cranelift emitter lowers `TraceOp::DictLookupPrechecked` into a
+/// call to this helper. It is byte-identical to the full
+/// [`__relon_trace_dict_lookup`] except for the leading `dict_shape !=
+/// shape_hash` compare — the caller must have already executed a
+/// preceding `TraceOp::DictShapeGuard` (inline `load + cmp + brif
+/// deopt`) for the same `(dict_ptr, shape_hash)` pair, so doing the
+/// compare again on every iteration would be pure dead work.
+///
+/// When the optimizer's `dict_ic_hoist` pass identifies a
+/// `TraceOp::DictLookup` whose `dict_ptr` SSA is loop-invariant, it
+/// splits the op into:
+///
+/// - one `TraceOp::DictShapeGuard { dict_ptr, shape_hash }` that LICM
+///   then lifts to the loop entry, executing the compare exactly once
+///   per trace entry;
+/// - one `TraceOp::DictLookupPrechecked { dst, dict_ptr, key_ptr }`
+///   that stays inside the loop body and routes here.
+///
+/// The W5 cmp_lua benchmark's hot loop accesses a fixed dict with a
+/// per-iter-varying string key (`d[keys[i % 10]]`); the shape compare
+/// is the only invariant within the dict-lookup helper, so the
+/// per-iter saving is just one `load.u64 + cmp + brif`. That is enough
+/// to drop the trace_jit ratio from × 1.95 toward × 1.5 LuaJIT on the
+/// F-D8-D recorder-driven path — see the F-D8-E.2 stage report.
+///
+/// # Safety
+///
+/// - Same shape contract as [`__relon_trace_dict_lookup`].
+/// - Caller MUST have executed a matching `TraceOp::DictShapeGuard`
+///   earlier in the trace, otherwise a dict whose layout drifted from
+///   the recorder-time fingerprint would silently scan into garbage
+///   entries. The optimizer is the only producer of
+///   `DictLookupPrechecked` ops, and it pairs them by construction.
+#[no_mangle]
+pub unsafe extern "C" fn __relon_trace_dict_lookup_prechecked(
+    dict_ptr: *const u8,
+    key_ptr: *const u8,
+    ctx: *mut TraceContext,
+) -> i64 {
+    let _ = ctx;
+    if dict_ptr.is_null() || key_ptr.is_null() {
+        return DICT_LOOKUP_DEOPT;
+    }
+
+    // SAFETY: caller contract — the dict layout is canonical and a
+    // matching `DictShapeGuard` already verified the shape header.
+    let entry_count = unsafe { (dict_ptr.add(8) as *const u32).read_unaligned() };
+    let key_hash = unsafe { fx_hash_key_record(key_ptr) };
+    let entries_base = unsafe { dict_ptr.add(12) };
+    for i in 0..entry_count {
+        let entry_off = (i as usize) * 16;
+        let entry_key_hash =
+            unsafe { (entries_base.add(entry_off) as *const u64).read_unaligned() };
+        if entry_key_hash == key_hash {
+            let entry_val =
+                unsafe { (entries_base.add(entry_off + 8) as *const i64).read_unaligned() };
+            return entry_val;
+        }
+    }
+    DICT_LOOKUP_DEOPT
+}
+
 // Re-exported from `relon-trace-abi` so the producer side (an
 // analyzer / IR pass that pre-stamps `Op::DictGetByStringKey::shape_hash`)
 // and the consumer side (this runtime's IC dispatch) share the same
@@ -327,6 +392,63 @@ mod tests {
         let mut ctx = TraceContext::with_capacity(0);
         let got = unsafe {
             __relon_trace_dict_lookup(dict.as_ptr(), kr_missing.as_ptr(), 0xc0de, &mut ctx)
+        };
+        assert_eq!(got, DICT_LOOKUP_DEOPT);
+    }
+
+    // ---- F-D8-E.2: prechecked-helper round-trip ---------------------
+
+    #[test]
+    fn dict_lookup_prechecked_hit_returns_value() {
+        // The prechecked helper skips the shape compare but otherwise
+        // matches the full helper's key-hash + scan path. Build the
+        // same fixture the full-helper test uses and confirm hits.
+        let key_records: Vec<Vec<u8>> = ["a", "b", "c"]
+            .iter()
+            .map(|s| build_string_record(s))
+            .collect();
+        let entries: Vec<(u64, i64)> = key_records
+            .iter()
+            .enumerate()
+            .map(|(i, kr)| {
+                let h = unsafe { fx_hash_key_record(kr.as_ptr()) };
+                (h, (i as i64 + 1) * 10)
+            })
+            .collect();
+        let dict = build_dict_record(0xfeed_face_dead_beef, &entries);
+        let mut ctx = TraceContext::with_capacity(0);
+        for (i, kr) in key_records.iter().enumerate() {
+            let got = unsafe {
+                __relon_trace_dict_lookup_prechecked(dict.as_ptr(), kr.as_ptr(), &mut ctx)
+            };
+            assert_eq!(got, (i as i64 + 1) * 10, "key {} value mismatch", i);
+        }
+    }
+
+    #[test]
+    fn dict_lookup_prechecked_ignores_shape_field() {
+        // The whole point of the prechecked path: the caller has
+        // already verified the shape via a hoisted DictShapeGuard, so
+        // the helper must NOT re-compare. Stamp a deliberately wrong
+        // shape into the header and confirm the helper still hits.
+        let kr = build_string_record("a");
+        let h = unsafe { fx_hash_key_record(kr.as_ptr()) };
+        let dict = build_dict_record(0xaaaa_bbbb, &[(h, 42)]);
+        let mut ctx = TraceContext::with_capacity(0);
+        let got =
+            unsafe { __relon_trace_dict_lookup_prechecked(dict.as_ptr(), kr.as_ptr(), &mut ctx) };
+        assert_eq!(got, 42);
+    }
+
+    #[test]
+    fn dict_lookup_prechecked_missing_key_returns_deopt_sentinel() {
+        let kr_present = build_string_record("a");
+        let kr_missing = build_string_record("z");
+        let h = unsafe { fx_hash_key_record(kr_present.as_ptr()) };
+        let dict = build_dict_record(0xc0de, &[(h, 7)]);
+        let mut ctx = TraceContext::with_capacity(0);
+        let got = unsafe {
+            __relon_trace_dict_lookup_prechecked(dict.as_ptr(), kr_missing.as_ptr(), &mut ctx)
         };
         assert_eq!(got, DICT_LOOKUP_DEOPT);
     }
