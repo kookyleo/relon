@@ -529,8 +529,8 @@ fn unsupported_op_name(op: &Op) -> &'static str {
 /// `StrContains`, and will be added in a later F-D7 sub-phase to
 /// keep the recorder's surface narrow until the bench confirms each
 /// op pulls its weight.
-const STDLIB_IDX_CONCAT: u32 = 6;
-const STDLIB_IDX_SUBSTRING: u32 = 9;
+pub const STDLIB_IDX_CONCAT: u32 = 6;
+pub const STDLIB_IDX_SUBSTRING: u32 = 9;
 /// F-D7-B: reserved stdlib index for the `(String, String) -> Bool`
 /// `contains` body. The constant is the slot the future
 /// `contains_string()` entry will occupy when added to

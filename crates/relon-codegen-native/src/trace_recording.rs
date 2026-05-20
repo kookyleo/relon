@@ -222,6 +222,14 @@ impl<'a> TraceRecordingEvaluator<'a> {
             Op::ConstI64(v) => self.step_const(*v as u64, ObservedType::I64, op),
             Op::ConstBool(v) => self.step_const(u64::from(*v), ObservedType::Bool, op),
 
+            // F-D7-D: `Op::Add(IrType::String)` short-circuits onto
+            // `TraceOp::StrConcat` through the recorder's
+            // `lower_str_add` rule. The walker calls into
+            // `__relon_str_concat` directly so the recording-time
+            // value stays in lock-step with what the installed trace
+            // computes; the operand-stack discipline (`[.., lhs, rhs]`)
+            // matches what the recorder's `lower_str_add` expects.
+            Op::Add(IrType::String) => self.step_str_concat(op),
             // Integer arithmetic: I32 / I64 / Bool widths all pass
             // through the recorder lowering as cranelift int ops
             // (`binary_arith` rejects only F64). The walker performs
@@ -229,7 +237,7 @@ impl<'a> TraceRecordingEvaluator<'a> {
             // declared tag — sufficient because the corpus's Int
             // values fit i64 and the cranelift backend itself widens
             // narrower types to i64 at emit time.
-            Op::Add(ty) if !matches!(ty, IrType::F64) => {
+            Op::Add(ty) if !matches!(ty, IrType::F64 | IrType::String) => {
                 self.step_arith(op, |a, b| (a as i64).wrapping_add(b as i64) as u64)
             }
             Op::Sub(ty) if !matches!(ty, IrType::F64) => {
@@ -369,6 +377,32 @@ impl<'a> TraceRecordingEvaluator<'a> {
                     StepOutcome::Continue
                 }
             }
+
+            // F-D7-D: `Op::Call { fn_index = STDLIB_IDX_CONTAINS }`
+            // (and its concat sibling) short-circuit onto the trace
+            // recorder's dedicated `lower_string_call` rule. The
+            // walker pops the matching argument count, drives the
+            // host shim to compute the recording-time value, and
+            // forwards the op to `record_op` so the recorder emits
+            // the `TraceOp::Str*` fast-path entry.
+            Op::Call {
+                fn_index,
+                arg_count,
+                ret_ty,
+                ..
+            } => self.step_stdlib_call(op, *fn_index, *arg_count, *ret_ty),
+
+            // F-D7-D: walker side of `Op::LoadField { offset, ty }`.
+            // Pops the base pointer SSA + concrete value, performs the
+            // host-side load so the recording-time value tracks what
+            // the installed trace will compute, and forwards the op so
+            // the recorder emits `TraceOp::Load(dst, base, offset)`.
+            //
+            // Used by F-D7-D bench fixtures to read
+            // `StringRef::len` (offset 8) off the final accumulator
+            // pointer at trace-tail; the trace then stores the loaded
+            // length into `TraceContext::result_slot` via `Op::Return`.
+            Op::LoadField { offset, ty } => self.step_load_field(op, *offset, *ty),
 
             // Everything outside the Phase-1 subset bounces off the
             // recorder. The recorder's lowering rule will Abort with
@@ -526,6 +560,197 @@ impl<'a> TraceRecordingEvaluator<'a> {
             } => {
                 self.operand_stack
                     .push(StackCell::new(result_value, ssa, ObservedType::Bool));
+                StepOutcome::Continue
+            }
+            _ => StepOutcome::Abort,
+        }
+    }
+
+    /// F-D7-D: walker side of `Op::Add(IrType::String)`. Operand
+    /// stack at call time: `[.., lhs, rhs]` (rhs pushed last, on top).
+    /// The recorder's `lower_str_add` mirrors `binary_arith`'s order
+    /// (`inputs[0] = rhs`, `inputs[1] = lhs`); we forward the cells
+    /// in the matching order.
+    ///
+    /// To stay value-faithful during recording, we drive the host
+    /// `__relon_str_concat` shim with the two `*const StringRef`
+    /// values riding the operand stack and push the returned pointer
+    /// onto the walker stack. The installed trace performs the same
+    /// call at execution time so the recording-time and trace-time
+    /// values stay byte-identical.
+    ///
+    /// Observed type for the destination is `Ptr` — matches what the
+    /// recorder's `ty_to_observed(IrType::String)` reports. Mismatched
+    /// hints surface as `GuardFailureInRecording` on the second
+    /// iteration's `LetGet`, so this must stay in lock-step with
+    /// `lower_str_add`'s implicit type contract.
+    fn step_str_concat(&mut self, op: &Op) -> StepOutcome {
+        if self.operand_stack.len() < 2 {
+            self.recorder
+                .abort(AbortReason::UnsupportedOp("StrConcatUnderflow"));
+            return StepOutcome::Abort;
+        }
+        let rhs = self.operand_stack.pop().expect("checked above");
+        let lhs = self.operand_stack.pop().expect("checked above");
+        let inputs = [rhs.ssa, lhs.ssa];
+        // Drive the shim with the host pointers carried on the
+        // operand stack. The recorder seeds `LocalGet(String)` cells
+        // with the raw `*const StringRef` the host passed in via
+        // `args`, so the values are valid for the shim ABI.
+        let result_ptr = unsafe {
+            relon_trace_jit::runtime::__relon_str_concat(
+                lhs.value as *const relon_trace_jit::runtime::StringRef,
+                rhs.value as *const relon_trace_jit::runtime::StringRef,
+            )
+        } as u64;
+        let observed = ObservedType::Ptr;
+        match self.recorder.record_op(op, &inputs, Some(observed)) {
+            RecordResult::Ok { value: Some(ssa) }
+            | RecordResult::NeedsGuard {
+                value: Some(ssa), ..
+            } => {
+                self.operand_stack
+                    .push(StackCell::new(result_ptr, ssa, observed));
+                StepOutcome::Continue
+            }
+            _ => StepOutcome::Abort,
+        }
+    }
+
+    /// F-D7-D: walker side of `Op::Call`. Today only the trace-IR
+    /// string fast-path slots (`STDLIB_IDX_CONCAT` /
+    /// `STDLIB_IDX_SUBSTRING` / `STDLIB_IDX_CONTAINS`) are wired —
+    /// every other stdlib call still bounces off the recorder (the
+    /// recorder's `lower_op` flags them as `UnrecoverableEffect`).
+    ///
+    /// Operand-stack order at call time mirrors the wasm-style
+    /// `[.., arg0, arg1, ..., argN-1]` (last arg on top → `inputs[0]`).
+    /// The recorder's `lower_string_call` follows the same convention.
+    fn step_stdlib_call(
+        &mut self,
+        op: &Op,
+        fn_index: u32,
+        arg_count: u32,
+        ret_ty: IrType,
+    ) -> StepOutcome {
+        let n = arg_count as usize;
+        if self.operand_stack.len() < n {
+            self.recorder
+                .abort(AbortReason::UnsupportedOp("CallUnderflow"));
+            return StepOutcome::Abort;
+        }
+        // Pop args; `popped[0]` = topmost = last-pushed = last param.
+        let mut popped: Vec<StackCell> = Vec::with_capacity(n);
+        for _ in 0..n {
+            popped.push(self.operand_stack.pop().expect("checked above"));
+        }
+        // `inputs` mirrors the operand-stack popping order — matches
+        // the recorder's `OpLoweringContext.inputs[0]` convention.
+        let inputs: Vec<SsaVar> = popped.iter().map(|c| c.ssa).collect();
+
+        // Compute the recording-time value for the slots we recognise;
+        // unknown callees fall through to a generic record_op + abort
+        // so the recorder surfaces the right diagnostic.
+        let observed_ty = observed_from_ir(ret_ty);
+        // F-D7-D: capture the const-needle bytes for the contains slot
+        // so the emitter's inline byte-scan lowering picks it up. The
+        // recorder side stores the side-table entry against the needle
+        // SSA via `record_const_bytes` (see `RecorderState`).
+        let mut contains_needle_bytes: Option<(SsaVar, Vec<u8>)> = None;
+        let recording_value: u64 = match fn_index {
+            // STDLIB_IDX_CONCAT (= 6): `concat(lhs, rhs)`. Operand
+            // order on entry: lhs pushed first, rhs pushed last.
+            // popped[0] = rhs, popped[1] = lhs.
+            x if x == relon_trace_recorder::lowering::STDLIB_IDX_CONCAT && n == 2 => {
+                let rhs = popped[0].value as *const relon_trace_jit::runtime::StringRef;
+                let lhs = popped[1].value as *const relon_trace_jit::runtime::StringRef;
+                unsafe { relon_trace_jit::runtime::__relon_str_concat(lhs, rhs) as u64 }
+            }
+            // STDLIB_IDX_CONTAINS (= 36): `contains(haystack, needle)`.
+            // popped[0] = needle, popped[1] = haystack.
+            x if x == relon_trace_recorder::lowering::STDLIB_IDX_CONTAINS && n == 2 => {
+                let needle = popped[0].value as *const relon_trace_jit::runtime::StringRef;
+                let haystack = popped[1].value as *const relon_trace_jit::runtime::StringRef;
+                let r = unsafe { relon_trace_jit::runtime::__relon_str_contains(haystack, needle) };
+                // Snapshot the needle bytes for the const-byte side table
+                // — the emitter's inline-needle fast path will read them
+                // back via `TraceBuffer::const_bytes_for`.
+                if !needle.is_null() {
+                    let bytes: Vec<u8> = unsafe {
+                        let s = &*needle;
+                        std::slice::from_raw_parts(s.ptr, s.len).to_vec()
+                    };
+                    contains_needle_bytes = Some((popped[0].ssa, bytes));
+                }
+                u64::from(r != 0)
+            }
+            _ => {
+                // Forward to record_op so the recorder reports the
+                // accurate UnrecoverableEffect / UnsupportedOp reason
+                // for this slot.
+                let _ = self.recorder.record_op(op, &inputs, Some(observed_ty));
+                return StepOutcome::Abort;
+            }
+        };
+
+        let outcome = self.recorder.record_op(op, &inputs, Some(observed_ty));
+        if let Some((needle_ssa, bytes)) = contains_needle_bytes {
+            self.recorder.record_const_bytes(needle_ssa, bytes);
+        }
+        match outcome {
+            RecordResult::Ok { value: Some(ssa) }
+            | RecordResult::NeedsGuard {
+                value: Some(ssa), ..
+            } => {
+                self.operand_stack
+                    .push(StackCell::new(recording_value, ssa, observed_ty));
+                StepOutcome::Continue
+            }
+            _ => StepOutcome::Abort,
+        }
+    }
+
+    /// F-D7-D: walker side of `Op::LoadField { offset, ty }`. Pops
+    /// the base pointer cell (carries the host pointer plus its SSA),
+    /// performs the host-side load so the recording-time concrete
+    /// value matches what the emitted `TraceOp::Load` will compute,
+    /// and forwards the op to `record_op` so the recorder lowers it
+    /// into the matching `TraceOp::Load(dst, base, Offset(offset))`.
+    ///
+    /// Only `IrType::I64` is wired today; the F-D7-D bench fixture
+    /// uses this to read `StringRef::len`, a `usize == u64` value.
+    fn step_load_field(&mut self, op: &Op, offset: u32, ty: IrType) -> StepOutcome {
+        let base = match self.operand_stack.pop() {
+            Some(c) => c,
+            None => {
+                self.recorder
+                    .abort(AbortReason::UnsupportedOp("LoadFieldUnderflow"));
+                return StepOutcome::Abort;
+            }
+        };
+        // Compute the recording-time value via a host-side load. Only
+        // I64 is in scope today; widening to other slot widths is a
+        // future-phase concern.
+        let loaded = match ty {
+            IrType::I64 => {
+                let addr = (base.value as usize).wrapping_add(offset as usize) as *const u64;
+                unsafe { addr.read() }
+            }
+            _ => {
+                self.recorder
+                    .abort(AbortReason::UnsupportedOp("LoadFieldNonI64"));
+                return StepOutcome::Abort;
+            }
+        };
+        let observed = observed_from_ir(ty);
+        let inputs = [base.ssa];
+        match self.recorder.record_op(op, &inputs, Some(observed)) {
+            RecordResult::Ok { value: Some(ssa) }
+            | RecordResult::NeedsGuard {
+                value: Some(ssa), ..
+            } => {
+                self.operand_stack
+                    .push(StackCell::new(loaded, ssa, observed));
                 StepOutcome::Continue
             }
             _ => StepOutcome::Abort,

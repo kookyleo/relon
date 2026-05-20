@@ -2620,6 +2620,23 @@ impl<'a, 'b> Codegen<'a, 'b> {
                 self.cond_trap(of, TrapKind::NumericOverflow);
                 self.push(r);
             }
+            // F-D7-D: `Op::Add(IrType::String)` (emitted by the IR
+            // lowering pass for source-side `s + t` where both sides
+            // are `String`) routes through the same inlined `concat`
+            // body the bundled stdlib registers at index
+            // `STDLIB_IDX_CONCAT = 6`. We synthesise the matching
+            // `Op::Call` so the existing `emit_call_stdlib` inlining
+            // path runs without needing a parallel `Op::Add(String)`
+            // body — the operand-stack discipline is identical (`[..,
+            // lhs, rhs] -> [.., result]`).
+            Op::Add(IrType::String) => {
+                let concat_idx =
+                    relon_ir::stdlib::stdlib_function_index("concat").ok_or_else(|| {
+                        CraneliftError::Codegen("stdlib `concat` slot not found".to_string())
+                    })?;
+                let param_tys = [IrType::String, IrType::String];
+                self.emit_call_stdlib(concat_idx, 2, &param_tys, IrType::String)?;
+            }
             Op::Sub(IrType::I64) => {
                 let b = self.pop()?;
                 let a = self.pop()?;

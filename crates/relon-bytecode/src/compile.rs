@@ -352,6 +352,19 @@ impl<'a> CompileState<'a> {
                 let base = self.input_arg_count() + self.return_field_count();
                 self.emit_with_effect(BcOp::LocalSet(base + *idx), pc);
             }
+            // F-D7-D: `Op::Add(IrType::String)` (source-side
+            // `s + t` lowering) needs a record-aware concat — outside
+            // the bytecode VM's M2-A scalar envelope. Bounce so the
+            // four-way harness routes the source through
+            // `BytecodeUnsupported`. Sub / Mul / etc. with String
+            // never escape the analyzer; the explicit check here is
+            // belt-and-braces.
+            Op::Add(IrType::String) => {
+                return Err(BcCompileError::UnsupportedOp(
+                    "Op::Add(IrType::String) — string concat is outside the bytecode VM's scalar envelope"
+                        .to_string(),
+                ));
+            }
             Op::Add(ty) => self.emit_with_effect(BcOp::Add(*ty), pc),
             Op::Sub(ty) => self.emit_with_effect(BcOp::Sub(*ty), pc),
             Op::Mul(ty) => self.emit_with_effect(BcOp::Mul(*ty), pc),

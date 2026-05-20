@@ -321,6 +321,21 @@ impl RecorderState {
         &self.buffer
     }
 
+    /// F-D7-D: record a const-byte side-table entry for `var`. The
+    /// trace emitter's `emit_str_contains` consults
+    /// [`TraceBuffer::const_bytes_for`] to decide between the F-D7-C
+    /// inline byte-scan lowering and the extern `__relon_str_contains`
+    /// shim — pre-filling the side table from a const-needle observed
+    /// at recording time keeps the trace on the inline fast path.
+    ///
+    /// The walker calls this after a successful `record_op` for an
+    /// `Op::Call { fn_index = STDLIB_IDX_CONTAINS }` whose needle
+    /// argument carries a host-side pointer the walker can safely
+    /// dereference (`*const StringRef`).
+    pub fn record_const_bytes(&mut self, var: SsaVar, bytes: Vec<u8>) {
+        self.buffer.record_const_bytes(var, bytes);
+    }
+
     /// Force an abort. Idempotent; the first reason wins so a
     /// downstream `UnsupportedOp` cannot mask an earlier
     /// `UnrecoverableEffect`.
@@ -818,6 +833,20 @@ impl RecorderState {
                     // and force an avoidable abort.
                     let _ = ty_hint;
                     self.ir_to_ssa.insert(kind, fresh_dst);
+                    // F-D7-D + F-D8-D merge: the walker's `observed`
+                    // is the authoritative first observation when it
+                    // knows the real `IrType` (e.g. `String` for a
+                    // host-pointer arg riding through
+                    // `TraceRecordingEvaluator::args`). Stamp it
+                    // straight onto `type_obs` so subsequent type-
+                    // guard decisions see the right shape from the
+                    // start. When `observed` is `None` we deliberately
+                    // skip the insert so the `FirstSeen` path lower
+                    // down picks up the runtime value and avoids the
+                    // stale `I32` seed F-D8-D documented above.
+                    if let Some(obs) = observed {
+                        self.type_obs.insert(fresh_dst, obs);
+                    }
                     (fresh_dst, true)
                 };
                 // Lookup pushes one value onto the operand stack.

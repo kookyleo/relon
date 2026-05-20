@@ -29,6 +29,9 @@ relon-eval-api = { workspace = true }
 # `JITedTraceFn::invoke` without going through `run_main`.
 relon-trace-abi = { workspace = true }
 relon-trace-jit = { workspace = true }
+# F-D7-D: cmp_lua W3 / W4 recorder-driven row references
+# `STDLIB_IDX_CONTAINS` to assemble the matching `Op::Call` IR fixture.
+relon-trace-recorder = { workspace = true }
 # v6-ε-0-C: the `trace_jit_warm_tail` bench row installs a
 # `CallConv::Tail` trace explicitly (vs the default-conv install path
 # the `trace_jit_warm` / `trace_jit_warm_ic` rows go through) so the

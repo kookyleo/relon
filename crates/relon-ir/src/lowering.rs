@@ -2270,6 +2270,27 @@ fn lower_binary(
         if lhs_ty != rhs_ty {
             return Err(LoweringError::UnsupportedOperator { op, range });
         }
+        // F-D7-D: `String + String` lowers to `Op::Add(IrType::String)`.
+        // The trace recorder short-circuits this onto `TraceOp::StrConcat`
+        // (see `relon_trace_recorder::lowering::lower_str_add`); the
+        // tree-walk / cranelift-AOT backends route through their generic
+        // string-concat dispatch (Value-level concat in the evaluator,
+        // and a host-shim call in cranelift). Only `Operator::Add` is
+        // accepted for strings — `String - String` / `String * String`
+        // would have been rejected upstream by the analyzer
+        // (`infer_binary` returns `None`) so the lhs/rhs types would
+        // not both be `String` here for any non-Add arith op.
+        if lhs_ty == IrType::String {
+            if !matches!(op, Operator::Add) {
+                return Err(LoweringError::UnsupportedOperator { op, range });
+            }
+            ctx.out.push(TaggedOp {
+                op: Op::Add(IrType::String),
+                range,
+            });
+            ctx.tstack.push(IrType::String);
+            return Ok(());
+        }
         // Only Int / Float pairs support arithmetic.
         if !matches!(lhs_ty, IrType::I64 | IrType::F64) {
             return Err(LoweringError::UnsupportedOperator { op, range });
