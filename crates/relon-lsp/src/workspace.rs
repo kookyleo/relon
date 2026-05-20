@@ -14,12 +14,21 @@
 use crate::diagnostics::to_lsp;
 use crate::position::offset_to_position;
 use lsp_types::{Diagnostic as LspDiagnostic, DiagnosticSeverity, NumberOrString, Url};
+use relon::{RuntimeError, Scope};
 use relon_analyzer::workspace::{LoadError, LoadedModule, ModuleLoader};
 use relon_analyzer::{analyze_entry, WorkspaceDiagnostic, WorkspaceTree};
+// LSP runs a root-constrained filesystem resolver
+// (`with_root_dir`) and consumes the `ModuleResolver` /
+// `ModuleSource` traits to plumb the custom resolver chain into the
+// analyzer workspace pass. These types live in the
+// `relon-evaluator` impl crate and the facade deliberately does
+// not re-export them — drive a `Box<dyn Evaluator>` through
+// `relon::EvaluatorBuilder` if the consumer just wants a runtime,
+// or take the direct reach (here) when a custom resolver chain is
+// required.
 use relon_evaluator::module::{
     FilesystemModuleResolver, ModuleResolver, ModuleSource, StdModuleResolver,
 };
-use relon_evaluator::{RuntimeError, Scope};
 use relon_parser::TokenRange;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

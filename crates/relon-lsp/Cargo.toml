@@ -14,6 +14,12 @@ name = "relon-lsp"
 path = "src/main.rs"
 
 [dependencies]
+# Public surface for the runtime data shapes the LSP consumes:
+# `RuntimeError`, `Scope` re-export from `relon-eval-api` via the
+# facade. Lower-level `ModuleResolver` / `FilesystemModuleResolver`
+# stays direct reach into `relon-evaluator` because the LSP installs
+# a root-constrained resolver chain not surfaced through the facade.
+relon = { workspace = true, default-features = false }
 relon-parser = { workspace = true }
 relon-analyzer = { workspace = true }
 relon-evaluator = { workspace = true }

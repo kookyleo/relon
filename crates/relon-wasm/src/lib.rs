@@ -21,10 +21,17 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use miette::Diagnostic as MietteDiagnostic;
-use relon::ResolverChainLoader;
+// `relon::ResolverChainLoader` + the facade-level `RuntimeError` /
+// `Scope` / `Value` cover the public surface. Lower-level
+// `Context` / `TreeWalkEvaluator` and the custom module-resolver
+// types stay direct reach: the playground installs an
+// in-memory `ModuleResolver` chain and threads it through
+// `Context::sandboxed()` + `TreeWalkEvaluator::prepare_in_place`,
+// which the facade deliberately doesn't expose.
+use relon::{ResolverChainLoader, RuntimeError, Scope, Value};
 use relon_analyzer::{analyze_entry, Severity};
 use relon_evaluator::module::{ModuleResolver, ModuleSource, StdModuleResolver};
-use relon_evaluator::{Context, RuntimeError, Scope, TreeWalkEvaluator, Value};
+use relon_evaluator::{Context, TreeWalkEvaluator};
 use relon_parser::{parse_document, parse_document_recovering, TokenRange};
 use serde::{Deserialize, Serialize};
 // Re-imported below where `value.serialize(&serializer)` is invoked; the
