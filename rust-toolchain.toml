@@ -1,0 +1,18 @@
+# Pin the workspace toolchain so local + CI + dtolnay/rust-toolchain
+# stay in lockstep. Without this file, contributors on older default
+# toolchains hit CI surprises every push because rustfmt and clippy
+# evolve across releases (e.g. rustfmt 1.8 -> 1.9 changed `pub use`
+# import ordering; clippy 1.95 added the `collapsible_match` lint).
+#
+# The version tracks whatever the GitHub Actions ubuntu-latest stable
+# resolves to at the time of the bump. Bump deliberately; do not let
+# it drift.
+#
+# The `msrv build` workflow uses its own dtolnay action with channel
+# "1.92" and ignores this file (dtolnay/rust-toolchain action respects
+# the explicit `toolchain:` input over the toml when both are present).
+[toolchain]
+channel = "1.95.0"
+components = ["rustfmt", "clippy"]
+targets = ["wasm32-unknown-unknown"]
+profile = "minimal"

@@ -25,4 +25,11 @@
 # all enable it by default too. Without this flag the `cfg(target_feature
 # = "simd128")` arm is gated out and the autovectorised scalar
 # path takes over — still correct, just slower.
+#
+# IMPORTANT: this rustflag MUST stay in sync with the
+# `--enable-simd` argument in
+# `crates/relon-wasm/Cargo.toml::package.metadata.wasm-pack.profile.*`.
+# Removing one without the other yields either (a) scalar wasm (slow
+# but correct) or (b) wasm-validator rejection in `wasm-opt` post-
+# processing. Both knobs together is the supported state.
 rustflags = ["--cap-lints=warn", "-Ctarget-feature=+simd128"]

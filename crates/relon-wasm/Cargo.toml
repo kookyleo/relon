@@ -25,6 +25,12 @@ crate-type = ["cdylib", "rlib"]
 # pre-bulk-memory feature set and rejects the input as invalid. Explicitly
 # enable the feature so optimisation succeeds. Bulk-memory is supported by
 # every evergreen browser since 2021, so this widens nothing in practice.
+#
+# IMPORTANT: `--enable-simd` MUST stay in sync with the
+# `-Ctarget-feature=+simd128` rustflag in `.cargo/config.toml` for the
+# `wasm32-unknown-unknown` target. Removing one without the other yields
+# either scalar wasm (slow but correct) or wasm-validator rejection in
+# `wasm-opt`. Both flags together is the supported state.
 [package.metadata.wasm-pack.profile.release]
 wasm-opt = ["-O", "--enable-bulk-memory", "--enable-nontrapping-float-to-int", "--enable-simd"]
 

@@ -408,8 +408,8 @@ pub fn fold_ascii_prefix_into_string(
     // implies UTF-8 validation; we don't want that overhead because
     // we *know* the bytes are ASCII).
     let result = {
-        // SAFETY: between the `as_mut_vec` and the matching length
-        // assertion below, the inner buffer holds: original valid
+        // SAFETY: between the `as_mut_vec` and the matching ASCII
+        // check below, the inner buffer holds: original valid
         // UTF-8 (length `pre_len`) || newly appended ASCII bytes
         // (each `< 0x80`, hence a single-byte UTF-8 codepoint each).
         // Therefore the buffer is valid UTF-8 throughout, which is
@@ -417,6 +417,20 @@ pub fn fold_ascii_prefix_into_string(
         let buf = unsafe { out.as_mut_vec() };
         fold_ascii_prefix(bytes, mode, at_word_start_in, buf)
     };
+    // Release-mode invariant check: the new bytes appended by the
+    // fast path must all be ASCII (`< 0x80`). The fast path is
+    // semantically guaranteed to never emit `>= 0x80` (mask-and-xor
+    // preserves the high bit which was already proven zero), but
+    // a future refactor that breaks this would silently corrupt the
+    // `String`'s UTF-8 invariant. The check is one branchless byte-
+    // wide compare per emitted byte; on a 10 KB ASCII input it adds
+    // < 1 µs to the fast path's 3 µs budget and surfaces a panic
+    // immediately rather than producing UB downstream.
+    let new_bytes = &out.as_bytes()[pre_len..pre_len + result.consumed];
+    assert!(
+        new_bytes.iter().all(|b| *b < 0x80),
+        "ascii fold emitted non-ASCII byte; UTF-8 invariant would be broken"
+    );
     debug_assert!(
         out.is_char_boundary(pre_len),
         "ascii fold corrupted utf-8 boundary at {pre_len}"
