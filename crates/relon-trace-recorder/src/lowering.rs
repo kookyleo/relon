@@ -21,6 +21,26 @@ use relon_trace_jit::{
 
 use crate::abort::AbortReason;
 
+/// F-D8-B: outcome variant the recorder uses to dispatch onto its
+/// dedicated [`crate::RecorderState::emit_list_get`] /
+/// [`crate::RecorderState::emit_dict_lookup`] entry points.
+///
+/// Both rely on emit-time state the pure `lower_op` rule does not have
+/// (allocator + buffer + IC fingerprint), so we surface the lookup as a
+/// `SubscriptDispatch` outcome instead of an `Emit` carrying a
+/// `TraceOp` — the recorder's `apply_outcome` arm then calls the right
+/// helper.
+#[derive(Debug, Clone, Copy)]
+pub enum SubscriptKind {
+    /// Lower onto `RecorderState::emit_list_get`. `inputs[1]` carries
+    /// the list pointer SSA, `inputs[0]` carries the i64 index SSA.
+    ListGet,
+    /// Lower onto `RecorderState::emit_dict_lookup`. `inputs[1]` carries
+    /// the dict pointer SSA, `inputs[0]` carries the key pointer SSA.
+    /// `shape_hash` flows verbatim into the resulting `TraceOp::DictLookup`.
+    DictLookup { shape_hash: u64 },
+}
+
 /// What the lowering pass wants the recorder to do for a given op.
 ///
 /// The recorder is responsible for appending the [`TraceOp`] to its
@@ -72,6 +92,17 @@ pub enum LowerOutcome {
     /// (`Block` start, `Loop` start, branch label). Carries the
     /// marker op to emit verbatim.
     LoopMarker { op: TraceOp },
+    /// F-D8-B: dict / list subscript dispatch. The recorder calls the
+    /// matching `emit_list_get` / `emit_dict_lookup` helper, which
+    /// allocates the fresh dst SSA, appends the bounds / IC guards,
+    /// and updates the operand-stack mirror.
+    SubscriptDispatch {
+        kind: SubscriptKind,
+        /// Static observed-type hint for the resulting SSA. The
+        /// recorder writes this into the buffer's `type_info` table so
+        /// downstream `TypeCheck` predicates resolve cleanly.
+        ty_hint: ObservedType,
+    },
     /// The op cannot be traced; emit an abort with the carried reason.
     Abort(AbortReason),
 }
@@ -272,6 +303,49 @@ pub fn lower_op(op: &Op, cx: OpLoweringContext<'_>) -> LowerOutcome {
             // its own `inputs` window — see recorder.rs.
             rebind: cx.inputs.first().copied(),
         },
+
+        // ---- F-D8-B subscript ops ---------------------------------------
+        Op::DictGetByStringKey {
+            shape_hash,
+            value_ty,
+        } => {
+            // Operand stack at call time: `[..., dict_ptr, key_ptr]`.
+            // The recorder's apply_outcome arm peels both SSAs off
+            // `inputs` (key on top of dict) and dispatches to
+            // `RecorderState::emit_dict_lookup`. F-D8's helper currently
+            // returns i64 — non-i64 element types still get a hint so
+            // future widening keeps a single observed-type entry per dst.
+            if cx.inputs.len() < 2 {
+                return LowerOutcome::Abort(AbortReason::UnsupportedOp(
+                    "DictGetByStringKeyUnderflow",
+                ));
+            }
+            LowerOutcome::SubscriptDispatch {
+                kind: SubscriptKind::DictLookup {
+                    shape_hash: *shape_hash,
+                },
+                ty_hint: ty_to_observed(*value_ty),
+            }
+        }
+        Op::ListGetByIntIdx { element_ty } => {
+            // Operand stack at call time: `[..., list_ptr, idx]`. The
+            // F-D8 host helper emits the bounds check inline; the
+            // recorder also stamps a `Guard(BoundsCheck(idx, list))`
+            // so LICM has a hoist target.
+            if cx.inputs.len() < 2 {
+                return LowerOutcome::Abort(AbortReason::UnsupportedOp("ListGetByIntIdxUnderflow"));
+            }
+            // F-D8 helper today reads i64 elements only. Refuse other
+            // element shapes so the recorder aborts cleanly rather than
+            // silently downcast a float / pointer slot.
+            if !matches!(element_ty, IrType::I64) {
+                return LowerOutcome::Abort(AbortReason::UnsupportedOp("ListGetByIntIdxNonI64"));
+            }
+            LowerOutcome::SubscriptDispatch {
+                kind: SubscriptKind::ListGet,
+                ty_hint: ty_to_observed(*element_ty),
+            }
+        }
 
         // ---- Field load / store -----------------------------------------
         Op::LoadField { offset, ty } => {
@@ -1126,6 +1200,88 @@ mod tests {
         assert!(matches!(
             outcome,
             LowerOutcome::Abort(AbortReason::UnsupportedOp("StrContainsUnderflow"))
+        ));
+    }
+
+    // ---- F-D8-B subscript lowering rules ----
+
+    #[test]
+    fn dict_get_by_string_key_dispatches_dict_lookup() {
+        // Operand stack at call time: `[dict_ptr, key_ptr]` →
+        // `inputs[0] = key_ptr (top)`, `inputs[1] = dict_ptr`.
+        let inputs = [SsaVar(20), SsaVar(10)];
+        let outcome = lower_op(
+            &Op::DictGetByStringKey {
+                shape_hash: 0xfeed_face_dead_beef,
+                value_ty: IrType::I64,
+            },
+            cx_with(&inputs, SsaVar(99)),
+        );
+        match outcome {
+            LowerOutcome::SubscriptDispatch { kind, ty_hint } => {
+                match kind {
+                    SubscriptKind::DictLookup { shape_hash } => {
+                        assert_eq!(shape_hash, 0xfeed_face_dead_beef);
+                    }
+                    other => panic!("expected DictLookup, got {:?}", other),
+                }
+                assert_eq!(ty_hint, ObservedType::I64);
+            }
+            other => panic!("expected SubscriptDispatch, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn list_get_by_int_idx_dispatches_list_get() {
+        let inputs = [SsaVar(30), SsaVar(20)]; // idx=30, list_ptr=20
+        let outcome = lower_op(
+            &Op::ListGetByIntIdx {
+                element_ty: IrType::I64,
+            },
+            cx_with(&inputs, SsaVar(99)),
+        );
+        match outcome {
+            LowerOutcome::SubscriptDispatch { kind, ty_hint } => {
+                assert!(matches!(kind, SubscriptKind::ListGet));
+                assert_eq!(ty_hint, ObservedType::I64);
+            }
+            other => panic!("expected SubscriptDispatch, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn dict_subscript_underflow_aborts() {
+        // Only one input on the stack — the lowering rule must abort
+        // cleanly rather than reach into `inputs[1]`.
+        let inputs = [SsaVar(5)];
+        let outcome = lower_op(
+            &Op::DictGetByStringKey {
+                shape_hash: 0,
+                value_ty: IrType::I64,
+            },
+            cx_with(&inputs, SsaVar(99)),
+        );
+        assert!(matches!(
+            outcome,
+            LowerOutcome::Abort(AbortReason::UnsupportedOp("DictGetByStringKeyUnderflow"))
+        ));
+    }
+
+    #[test]
+    fn list_subscript_non_i64_element_aborts() {
+        // F-D8 helper only handles i64 elements today; non-i64 must
+        // abort to avoid emitting a TraceOp::ListGet against a
+        // mis-sized payload.
+        let inputs = [SsaVar(2), SsaVar(1)];
+        let outcome = lower_op(
+            &Op::ListGetByIntIdx {
+                element_ty: IrType::F64,
+            },
+            cx_with(&inputs, SsaVar(99)),
+        );
+        assert!(matches!(
+            outcome,
+            LowerOutcome::Abort(AbortReason::UnsupportedOp("ListGetByIntIdxNonI64"))
         ));
     }
 }

@@ -315,6 +315,25 @@ impl<'a> TraceRecordingEvaluator<'a> {
                 StepOutcome::BreakOut(depth)
             }
 
+            // F-D8-B: dict / list subscript ops dispatch into the
+            // recorder's dedicated TraceOp paths. The walker pops the
+            // container + key/idx from its operand stack and forwards
+            // both SSAs to `record_op`. `lower_op` returns
+            // `SubscriptDispatch`, which `apply_outcome` routes onto
+            // `emit_list_get` / `emit_dict_lookup`.
+            //
+            // **Runtime semantics caveat:** F-D8-B does not have a
+            // ready-made way to compute the concrete u64 value
+            // (`Value::Int` payload) inside the walker without pulling
+            // in a full dict/list runtime. We propagate `0` as the
+            // recorded-iteration value placeholder — the resulting
+            // trace will deopt on the first install attempt if the
+            // partial result is read directly, but the trace SSA
+            // bindings + guard sites stay valid. Callers that depend
+            // on the concrete recording-time output should provide an
+            // explicit container_lookup hook (future F-D8-C work).
+            Op::DictGetByStringKey { .. } | Op::ListGetByIntIdx { .. } => self.step_subscript(op),
+
             // `Op::BrIf { label_depth }` — pop a Bool cond; if truthy
             // we behave as `Op::Br`, otherwise fall through. We emit a
             // branch guard so the trace deopts on the polarity flip.
@@ -722,6 +741,47 @@ impl<'a> TraceRecordingEvaluator<'a> {
         }
     }
 
+    /// F-D8-B: walker side of `Op::DictGetByStringKey` /
+    /// `Op::ListGetByIntIdx`. Pops `(container, key_or_idx)` off the
+    /// operand stack (top = key/idx), forwards both SSAs into the
+    /// recorder, and pushes the resulting dst SSA with a placeholder
+    /// concrete value of 0.
+    ///
+    /// The placeholder is acceptable because the recorder is the only
+    /// consumer of the walker's concrete values after the trace
+    /// finishes recording — its install pipeline replays the trace
+    /// through cranelift, at which point the dict/list helper produces
+    /// the real value. Test fixtures that feed synthetic ops directly
+    /// (no install) verify the buffer's SSA graph rather than the
+    /// walker-side `u64`, so the placeholder does not leak there
+    /// either.
+    fn step_subscript(&mut self, op: &Op) -> StepOutcome {
+        if self.operand_stack.len() < 2 {
+            self.recorder
+                .abort(AbortReason::UnsupportedOp("SubscriptUnderflow"));
+            return StepOutcome::Abort;
+        }
+        let top = self.operand_stack.pop().expect("checked above");
+        let container = self.operand_stack.pop().expect("checked above");
+        // Recorder side wants `inputs` in push-order (top first).
+        let inputs = [top.ssa, container.ssa];
+        // Observed type defaults to I64 (F-D8 helper return type).
+        // The recorder's apply_outcome arm overrides this hint with
+        // the IR op's `value_ty` / `element_ty` so the buffer's
+        // type_info table carries a stable expected width.
+        let observed = ObservedType::I64;
+        match self.recorder.record_op(op, &inputs, Some(observed)) {
+            RecordResult::Ok { value: Some(ssa) }
+            | RecordResult::NeedsGuard {
+                value: Some(ssa), ..
+            } => {
+                self.operand_stack.push(StackCell::new(0u64, ssa, observed));
+                StepOutcome::Continue
+            }
+            _ => StepOutcome::Abort,
+        }
+    }
+
     fn step_let_set(&mut self, idx: u32, op: &Op) -> StepOutcome {
         let top = match self.operand_stack.pop() {
             Some(c) => c,
@@ -953,6 +1013,97 @@ mod tests {
             tag(Op::ConstI64(10)),
             tag(Op::ConstI64(0)),
             tag(Op::Div(IrType::I64)),
+            tag(Op::Return),
+        ];
+        let outcome = TraceRecordingEvaluator::record_and_run(&mut recorder, &[], &body);
+        assert!(matches!(outcome, RecordingOutcome::Aborted { .. }));
+    }
+
+    // ---- F-D8-B: walker side of dict / list subscript dispatch ----
+
+    #[test]
+    fn dict_get_by_string_key_walker_emits_dict_lookup() {
+        // Body: ConstI64(dict_ptr); ConstI64(key_ptr); DictGetByStringKey;
+        // Return. The walker should push two SSAs, pop both, and emit a
+        // TraceOp::DictLookup carrying the static shape_hash.
+        let mut recorder = RecorderState::new();
+        let body = vec![
+            tag(Op::ConstI64(0x1000)),
+            tag(Op::ConstI64(0x2000)),
+            tag(Op::DictGetByStringKey {
+                shape_hash: 0xdeadbeef,
+                value_ty: IrType::I64,
+            }),
+            tag(Op::Return),
+        ];
+        let outcome = TraceRecordingEvaluator::record_and_run(&mut recorder, &[], &body);
+        match outcome {
+            RecordingOutcome::Recorded { recorder, .. } => {
+                let buf = recorder.buffer();
+                let dict_lookups: Vec<_> = buf
+                    .ops
+                    .iter()
+                    .filter(|o| matches!(o, relon_trace_jit::TraceOp::DictLookup { .. }))
+                    .collect();
+                assert_eq!(dict_lookups.len(), 1, "exactly one DictLookup expected");
+                match dict_lookups[0] {
+                    relon_trace_jit::TraceOp::DictLookup { shape_hash, .. } => {
+                        assert_eq!(*shape_hash, 0xdeadbeef);
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            RecordingOutcome::Aborted { reason, .. } => {
+                panic!("expected Recorded, got Aborted({reason:?})");
+            }
+        }
+    }
+
+    #[test]
+    fn list_get_by_int_idx_walker_emits_list_get_and_bounds_guard() {
+        let mut recorder = RecorderState::new();
+        let body = vec![
+            tag(Op::ConstI64(0x3000)), // list_ptr
+            tag(Op::ConstI64(0)),      // idx
+            tag(Op::ListGetByIntIdx {
+                element_ty: IrType::I64,
+            }),
+            tag(Op::Return),
+        ];
+        let outcome = TraceRecordingEvaluator::record_and_run(&mut recorder, &[], &body);
+        match outcome {
+            RecordingOutcome::Recorded { recorder, .. } => {
+                let buf = recorder.buffer();
+                let list_gets: Vec<_> = buf
+                    .ops
+                    .iter()
+                    .filter(|o| matches!(o, relon_trace_jit::TraceOp::ListGet { .. }))
+                    .collect();
+                assert_eq!(list_gets.len(), 1, "exactly one ListGet expected");
+                // BoundsCheck guard must be recorded.
+                let has_bounds_guard = buf
+                    .guards
+                    .iter()
+                    .any(|g| matches!(g.kind, relon_trace_jit::GuardKind::BoundsCheck(_, _)));
+                assert!(has_bounds_guard, "BoundsCheck guard required");
+            }
+            RecordingOutcome::Aborted { reason, .. } => {
+                panic!("expected Recorded, got Aborted({reason:?})");
+            }
+        }
+    }
+
+    #[test]
+    fn list_get_non_i64_element_aborts_recorder() {
+        // F-D8 helper only handles i64 elements; non-i64 must surface
+        // as an UnsupportedOp abort so the host falls back to tree-walker.
+        let mut recorder = RecorderState::new();
+        let body = vec![
+            tag(Op::ConstI64(0x4000)),
+            tag(Op::ConstI64(0)),
+            tag(Op::ListGetByIntIdx {
+                element_ty: IrType::F64,
+            }),
             tag(Op::Return),
         ];
         let outcome = TraceRecordingEvaluator::record_and_run(&mut recorder, &[], &body);

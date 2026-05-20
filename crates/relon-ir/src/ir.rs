@@ -399,6 +399,59 @@ pub enum Op {
         /// `f64.store`, `i32.store8`).
         ty: IrType,
     },
+
+    /// F-D8-B: source-level `dict[key]` subscript surfaced to the IR
+    /// as a first-class op so trace-recorder can dispatch onto
+    /// `TraceOp::DictLookup`. Stack: `[Dict, String] -> [V]`.
+    ///
+    /// Recording-time semantics: `inputs[0]` is the key SSA (top of
+    /// stack, pushed last); `inputs[1]` is the dict pointer SSA. The
+    /// recorder lowers this op directly to `RecorderState::emit_dict_lookup`
+    /// using `shape_hash` as the per-trace IC fingerprint of the
+    /// dict's key set.
+    ///
+    /// **Codegen status (F-D8-B):** the cranelift-AOT codegen does not
+    /// emit this op today. The high-level AST→IR lowering pipeline
+    /// keeps lowering `d[k]` through the tree-walker's
+    /// `try_index_method` dispatch, so this variant is currently
+    /// reachable only via the trace-recorder unit tests + future
+    /// analyzer wiring (see docs/internal/v6-fix-d8-... §7.1). The
+    /// codegen.rs catch-all surfaces it as `unsupported op` until that
+    /// wiring lands, matching how `Op::CallNative` widens
+    /// incrementally.
+    ///
+    /// `effect_class()` returns `ReadOnly` — the lookup observes the
+    /// dict's hash table but does not mutate it; the recorder treats
+    /// this exactly like a `LoadField`.
+    DictGetByStringKey {
+        /// FxHash fingerprint of the dict's key set, computed at the
+        /// site where the subscript pattern was recognised. Carried
+        /// inline so the recorder can stamp it onto the resulting
+        /// `TraceOp::DictLookup`'s IC slot without re-hashing.
+        shape_hash: u64,
+        /// IR type of the dict's value side. Drives the recorder's
+        /// `ObservedType` hint for the dst SSA so subsequent TypeCheck
+        /// guards see a stable expected width.
+        value_ty: IrType,
+    },
+
+    /// F-D8-B: source-level `list[idx]` subscript surfaced to the IR.
+    /// Stack: `[List, Int] -> [V]`.
+    ///
+    /// Recording-time semantics: `inputs[0]` is the index SSA (top of
+    /// stack, pushed last); `inputs[1]` is the list pointer SSA. The
+    /// recorder lowers this op directly to `RecorderState::emit_list_get`
+    /// which also emits a `Guard(BoundsCheck(idx, list))` for the
+    /// trace's LICM pass to anchor against.
+    ///
+    /// Codegen status mirrors [`Op::DictGetByStringKey`].
+    ListGetByIntIdx {
+        /// IR type of the list's element. Drives the recorder's
+        /// `ObservedType` hint for the dst SSA. F-D8's runtime helper
+        /// only supports `I64` payloads today; non-i64 element types
+        /// trigger an `UnsupportedOp` abort in the recorder lowering.
+        element_ty: IrType,
+    },
     /// Pop two operands of the tagged type, push their sum. Stack:
     /// `[T, T] -> [T]`.
     Add(IrType),
@@ -1496,7 +1549,15 @@ impl Op {
             | Op::LoadI64AtAbsolute { .. }
             | Op::LoadI8UAtAbsolute { .. }
             | Op::LoadF64AtAbsolute { .. }
-            | Op::ReadStringLen => ReadOnly,
+            | Op::ReadStringLen
+            // F-D8-B: dict/list subscript ops mirror LoadField's
+            // classification — they touch heap state but never mutate
+            // it. The recorder routes them onto the dedicated trace IR
+            // paths (`TraceOp::DictLookup` / `TraceOp::ListGet`) which
+            // are also `ReadOnly`, keeping the optimiser pipeline's
+            // alias / dead-store passes simple.
+            | Op::DictGetByStringKey { .. }
+            | Op::ListGetByIntIdx { .. } => ReadOnly,
 
             // Output buffer writes — RecoverableWrite because trace
             // optimizer can stash the prior cursor value (or the

@@ -26,7 +26,7 @@ use relon_trace_jit::{
 };
 
 use crate::abort::AbortReason;
-use crate::lowering::{lower_op, LookupKind, LowerOutcome, OpLoweringContext};
+use crate::lowering::{lower_op, LookupKind, LowerOutcome, OpLoweringContext, SubscriptKind};
 use crate::type_obs::{classify_observation, TypeObsDecision};
 
 /// Description of one loop-carried value the recorder should weave
@@ -840,6 +840,58 @@ impl RecorderState {
                 self.terminated = true;
                 RecordResult::Terminated
             }
+            LowerOutcome::SubscriptDispatch { kind, ty_hint } => {
+                // F-D8-B: dict / list subscript ops surface here.
+                // `apply_outcome` already received the popped SSA window
+                // via `inputs` (length checked in lower_op). Top-of-stack
+                // is at `inputs[0]`, dict/list pointer at `inputs[1]`.
+                // We dispatch into the dedicated helper so the buffer
+                // sees a `TraceOp::DictLookup` / `TraceOp::ListGet` plus
+                // the bounds / IC guards the helpers stamp.
+                //
+                // The `fresh_dst` allocated by `record_op` is unused
+                // here — the helpers allocate their own dst SSA so the
+                // operand-stack mirror update lines up with the ssa-id
+                // the dst gets. We log this so future readers don't
+                // chase the discrepancy.
+                let _unused = fresh_dst;
+                if inputs.len() < 2 {
+                    self.aborted = Some(AbortReason::UnsupportedOp("SubscriptUnderflow"));
+                    return RecordResult::Abort(AbortReason::UnsupportedOp("SubscriptUnderflow"));
+                }
+                let top = inputs[0];
+                let container = inputs[1];
+                let dst = match kind {
+                    SubscriptKind::ListGet => self.emit_list_get(container, top),
+                    SubscriptKind::DictLookup { shape_hash } => {
+                        self.emit_dict_lookup(container, top, shape_hash)
+                    }
+                };
+                let Some(d) = dst else {
+                    // emit_* short-circuits on aborted / terminated;
+                    // both update `self.aborted` themselves, so we just
+                    // surface whatever reason landed.
+                    let reason = self.aborted.unwrap_or(AbortReason::TraceTooLong);
+                    return RecordResult::Abort(reason);
+                };
+                // Override the helper-time observed type with the
+                // static hint from the IR op so a follow-up TypeCheck
+                // resolves against the correct width (the helper
+                // defaults to I64; non-I64 lists are rejected upstream
+                // but dict value types may still differ).
+                self.buffer.record_type(d, ty_hint);
+                // Surface a TypeCheck guard if observed disagrees with
+                // the recorder's running expectation.
+                if let Some(ty) = observed {
+                    if let Some(g) = self.maybe_emit_type_guard(d, ty) {
+                        return RecordResult::NeedsGuard {
+                            value: Some(d),
+                            guard: g,
+                        };
+                    }
+                }
+                RecordResult::Ok { value: Some(d) }
+            }
             LowerOutcome::LoopMarker { op: marker_op } => {
                 let marker = match marker_op {
                     TraceOp::MarkLoopHead { phis, .. } => {
@@ -1315,6 +1367,135 @@ mod tests {
             }
             other => panic!("last op must be DictLookup, got {:?}", other),
         }
+    }
+
+    // ---- F-D8-B: record_op dispatch for DictGetByStringKey / ListGetByIntIdx ----
+
+    #[test]
+    fn record_dict_get_dispatches_dict_lookup() {
+        // Drive record_op with the new IR op and confirm the buffer
+        // gains a single `TraceOp::DictLookup` carrying the supplied
+        // shape_hash, plus the operand-stack mirror is correctly
+        // updated (pop two pushes, push one).
+        let mut r = RecorderState::new();
+        let dict = match r.record_op(&Op::ConstI64(0x4000), &[], Some(ObservedType::Ptr)) {
+            RecordResult::Ok { value: Some(v) }
+            | RecordResult::NeedsGuard { value: Some(v), .. } => v,
+            other => panic!("ConstI64 dict ptr setup failed: {other:?}"),
+        };
+        let key = match r.record_op(&Op::ConstI64(0x5000), &[], Some(ObservedType::Ptr)) {
+            RecordResult::Ok { value: Some(v) }
+            | RecordResult::NeedsGuard { value: Some(v), .. } => v,
+            other => panic!("ConstI64 key ptr setup failed: {other:?}"),
+        };
+        // Recorder expects inputs in push order: top first (key), then
+        // container (dict).
+        let res = r.record_op(
+            &Op::DictGetByStringKey {
+                shape_hash: 0xab,
+                value_ty: IrType::I64,
+            },
+            &[key, dict],
+            Some(ObservedType::I64),
+        );
+        let dst = match res {
+            RecordResult::Ok { value: Some(v) }
+            | RecordResult::NeedsGuard { value: Some(v), .. } => v,
+            other => panic!("unexpected: {other:?}"),
+        };
+        // Top of operand-stack mirror is the dst.
+        assert_eq!(r.ssa_stack_snapshot(), vec![dst]);
+        // Buffer last op must be DictLookup with the carried shape_hash.
+        let buf = r.buffer();
+        match buf.ops.last().expect("≥1 op") {
+            TraceOp::DictLookup {
+                dst: d,
+                dict_ptr,
+                key_ptr,
+                shape_hash,
+            } => {
+                assert_eq!(*d, dst);
+                assert_eq!(*dict_ptr, dict);
+                assert_eq!(*key_ptr, key);
+                assert_eq!(*shape_hash, 0xab);
+            }
+            other => panic!("expected DictLookup, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn record_list_get_dispatches_list_get_with_bounds_guard() {
+        let mut r = RecorderState::new();
+        let list = match r.record_op(&Op::ConstI64(0x6000), &[], Some(ObservedType::Ptr)) {
+            RecordResult::Ok { value: Some(v) }
+            | RecordResult::NeedsGuard { value: Some(v), .. } => v,
+            other => panic!("ConstI64 list ptr setup failed: {other:?}"),
+        };
+        let idx = match r.record_op(&Op::ConstI64(0), &[], Some(ObservedType::I64)) {
+            RecordResult::Ok { value: Some(v) }
+            | RecordResult::NeedsGuard { value: Some(v), .. } => v,
+            other => panic!("ConstI64 idx setup failed: {other:?}"),
+        };
+        let res = r.record_op(
+            &Op::ListGetByIntIdx {
+                element_ty: IrType::I64,
+            },
+            &[idx, list],
+            Some(ObservedType::I64),
+        );
+        let dst = match res {
+            RecordResult::Ok { value: Some(v) }
+            | RecordResult::NeedsGuard { value: Some(v), .. } => v,
+            other => panic!("unexpected: {other:?}"),
+        };
+        assert_eq!(r.ssa_stack_snapshot(), vec![dst]);
+        let buf = r.buffer();
+        // Last op must be ListGet.
+        match buf.ops.last().expect("≥1 op") {
+            TraceOp::ListGet {
+                dst: d,
+                list_ptr,
+                idx: i,
+            } => {
+                assert_eq!(*d, dst);
+                assert_eq!(*list_ptr, list);
+                assert_eq!(*i, idx);
+            }
+            other => panic!("expected ListGet last op, got {:?}", other),
+        }
+        // BoundsCheck guard must have been recorded against (idx, list).
+        assert!(
+            buf.guards
+                .iter()
+                .any(|g| matches!(g.kind, GuardKind::BoundsCheck(v, l) if v == idx && l == list)),
+            "BoundsCheck guard required for trace LICM"
+        );
+    }
+
+    #[test]
+    fn record_list_get_with_non_i64_element_aborts() {
+        let mut r = RecorderState::new();
+        let list = match r.record_op(&Op::ConstI64(0x7000), &[], Some(ObservedType::Ptr)) {
+            RecordResult::Ok { value: Some(v) }
+            | RecordResult::NeedsGuard { value: Some(v), .. } => v,
+            other => panic!("setup: {other:?}"),
+        };
+        let idx = match r.record_op(&Op::ConstI64(0), &[], Some(ObservedType::I64)) {
+            RecordResult::Ok { value: Some(v) }
+            | RecordResult::NeedsGuard { value: Some(v), .. } => v,
+            other => panic!("setup: {other:?}"),
+        };
+        let res = r.record_op(
+            &Op::ListGetByIntIdx {
+                element_ty: IrType::F64,
+            },
+            &[idx, list],
+            None,
+        );
+        assert!(matches!(
+            res,
+            RecordResult::Abort(AbortReason::UnsupportedOp("ListGetByIntIdxNonI64"))
+        ));
     }
 
     #[test]
