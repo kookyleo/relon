@@ -28,7 +28,16 @@ const LIB_SOURCE: &str = r#"{ host: "localhost", port: 8080 }"#;
 
 /// A `#main(...)` entry script that both backends accept. Returns
 /// `x * 2` so `run_main(args={x:21})` produces `Value::Int(42)`.
-const MAIN_SOURCE: &str = "#main(Int x) -> Int\nx * 2";
+///
+/// v6-fix-D2 default-path: this source is intentionally non-trivial
+/// by the `is_trivial_scalar_main` classifier (the body is an
+/// `Expr::FnCall` into a stdlib helper). The trivial classifier
+/// short-circuits straight to the tree-walker without ever
+/// constructing the AOT slot, which would break the
+/// `run_main_routes_through_aot_and_caches` assertion below. Tests
+/// that *want* to exercise the trivial short-circuit inline a
+/// W11-shaped `#main(Int x) -> Int\nx + 1` source directly.
+const MAIN_SOURCE: &str = "#main(Int x) -> Int\nabs(x) * 2";
 
 /// A `#main(...)` shape the cranelift-AOT backend currently rejects
 /// (closure-bearing higher-order list op — `Op::CallClosure` is
@@ -295,5 +304,195 @@ fn force_thunk_and_invoke_closure_route_through_tree_walk() {
     assert!(
         !evaluator.is_aot_initialised(),
         "no tree-walker-only path may trigger AOT init"
+    );
+}
+
+// =====================================================================
+// v6-fix-D2 default-path coverage
+// =====================================================================
+//
+// Path (a): cranelift-AOT cache-hit fast restore. Drive `run_main`
+// twice through `Backend::Auto`; the first pass primes the on-disk
+// cache via `from_source_with_cache`, the second pass exercises
+// `from_cache_dir`'s dlopen-execute path. Both passes must agree on
+// the produced `Value`; the cache directory is isolated to a
+// `tempfile::TempDir` so concurrent test threads can't interfere.
+//
+// Path (b): trivial-`#main` tree-walker short-circuit. When the
+// source is a single scalar parameter + trivial body, `AutoEvaluator`
+// must (1) classify it as trivial at construction time, (2) route
+// `run_main` straight through the tree-walker without ever
+// constructing the AOT slot, (3) still produce the byte-identical
+// `Value` the AOT path would.
+
+/// Default-mode cache fast-path: drive the same source through two
+/// fresh `AutoEvaluator`s in the same process, with the on-disk
+/// cache redirected to an isolated tempdir. The second `run_main`
+/// must hit the dlopen-execute fast restore (we observe this
+/// indirectly by checking that the answer is reproduced and the
+/// cache directory is populated).
+#[cfg(feature = "cranelift-aot")]
+#[test]
+fn default_path_uses_disk_cache_on_second_call() {
+    use std::ffi::OsString;
+    use std::path::Path;
+
+    /// Restore the previous `XDG_CACHE_HOME` / `HOME` on drop so
+    /// the test stays hermetic even when a later test inspects
+    /// these env vars. Safety: this binary runs single-threaded by
+    /// default (cargo test serialises tests within a binary unless
+    /// `--test-threads` says otherwise); other tests in this file
+    /// do not consult `XDG_CACHE_HOME`.
+    struct EnvGuard {
+        prev_xdg: Option<OsString>,
+        prev_home: Option<OsString>,
+    }
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match self.prev_xdg.take() {
+                    Some(v) => std::env::set_var("XDG_CACHE_HOME", v),
+                    None => std::env::remove_var("XDG_CACHE_HOME"),
+                }
+                match self.prev_home.take() {
+                    Some(v) => std::env::set_var("HOME", v),
+                    None => std::env::remove_var("HOME"),
+                }
+            }
+        }
+    }
+
+    let cache_root = tempfile::tempdir().expect("tempdir for cache");
+    let prev_xdg = std::env::var_os("XDG_CACHE_HOME");
+    let prev_home = std::env::var_os("HOME");
+    unsafe {
+        std::env::set_var("XDG_CACHE_HOME", cache_root.path());
+        std::env::set_var("HOME", cache_root.path());
+    }
+    let _guard = EnvGuard {
+        prev_xdg,
+        prev_home,
+    };
+
+    // Non-trivial source so the trivial-`#main` short-circuit (path
+    // b) doesn't kick in; we want to observe the AOT cache path.
+    let src = "#main(Int x) -> Int\nabs(x) * 3";
+    let mut args = HashMap::new();
+    args.insert("x".to_string(), Value::Int(7));
+
+    // First pass primes the cache pair (object + ir + schema).
+    let first = AutoEvaluator::new(src).expect("first build");
+    let r1 = first.run_main(args.clone()).expect("first run_main");
+    assert_eq!(r1, Value::Int(21));
+    assert!(first.is_aot_initialised());
+    drop(first);
+
+    // The cache directory should now contain at least one cache
+    // file (object / ir / schema triple). We don't bind to the
+    // exact file names so the test stays robust against
+    // `relon_codegen_native`'s internal renaming.
+    let cache_dir = cache_root.path().join("relon");
+    let entries: Vec<_> = std::fs::read_dir(&cache_dir)
+        .expect("cache dir populated")
+        .filter_map(|e| e.ok())
+        .collect();
+    assert!(
+        !entries.is_empty(),
+        "first run_main must populate the on-disk cache at {}",
+        cache_dir.display()
+    );
+
+    // Second pass exercises the `from_cache_dir` dlopen-execute
+    // path. We can't directly assert "no cranelift codegen ran"
+    // from out here (the cranelift JIT module is hidden behind
+    // `Box<dyn Evaluator>`), but reproducing the same `Value` end-
+    // to-end is the load-bearing contract.
+    let second = AutoEvaluator::new(src).expect("second build");
+    let r2 = second.run_main(args).expect("second run_main");
+    assert_eq!(r2, Value::Int(21));
+    assert_eq!(r1, r2, "cache hit must reproduce the cold answer");
+    // The cache dir wasn't deleted between calls.
+    assert!(Path::new(&cache_dir).exists());
+}
+
+/// Default-path trivial short-circuit: an `AutoEvaluator` built over
+/// a `#main(Int x) -> Int\nx + 1` source must classify the body as
+/// trivial and route `run_main` through the tree-walker without ever
+/// hydrating the cranelift-AOT slot.
+#[test]
+fn default_path_skips_aot_for_trivial_main() {
+    let evaluator = AutoEvaluator::new("#main(Int x) -> Int\nx + 1").expect("auto build");
+    // Classifier must accept the W11 shape.
+    assert!(
+        evaluator.is_trivial_main(),
+        "the W11 source must be classified as trivial scalar #main"
+    );
+    assert!(!evaluator.is_aot_initialised());
+
+    let mut args = HashMap::new();
+    args.insert("x".to_string(), Value::Int(41));
+    let out = evaluator.run_main(args).expect("run_main");
+    assert_eq!(out, Value::Int(42));
+    // The trivial short-circuit must not have built the AOT slot
+    // — that's the entire point of the optimisation.
+    assert!(
+        !evaluator.is_aot_initialised(),
+        "trivial-main classifier must skip cranelift-AOT init"
+    );
+}
+
+/// Cross-backend parity for a trivial source. The trivial-main
+/// short-circuit and the tree-walker path must produce the same
+/// `Value`, and that `Value` must also match what an explicit
+/// `Backend::TreeWalk` returns. (The cranelift-AOT path can be
+/// validated separately via the explicit backend selector below.)
+#[test]
+fn trivial_source_parity_default_vs_tree_walk() {
+    let src = "#main(Int x, Int y) -> Int\nx * y + 7";
+    let mut args = HashMap::new();
+    args.insert("x".to_string(), Value::Int(6));
+    args.insert("y".to_string(), Value::Int(7));
+
+    let auto = new_evaluator(src, Backend::Auto).expect("auto build");
+    let tw = new_evaluator(src, Backend::TreeWalk).expect("tree-walk build");
+    let auto_out = auto.run_main(args.clone()).expect("auto run_main");
+    let tw_out = tw.run_main(args).expect("tree-walk run_main");
+    assert_eq!(auto_out, Value::Int(49));
+    assert_eq!(
+        auto_out, tw_out,
+        "trivial-main short-circuit must produce byte-identical output to tree-walk"
+    );
+}
+
+/// Negative-case classifier coverage: a source the trivial
+/// classifier must reject (`List<Int>` parameter, closure body)
+/// still goes through the AOT slot when `run_main` is invoked. We
+/// observe this by checking `is_trivial_main` and
+/// `is_aot_initialised` after the call.
+#[test]
+fn non_trivial_source_still_routes_through_aot_path() {
+    // List-typed parameter: definitely not scalar.
+    let src = "#main(List<Int> xs) -> Int\n42";
+    let evaluator = AutoEvaluator::new(src).expect("auto build");
+    assert!(
+        !evaluator.is_trivial_main(),
+        "List<Int> parameter must disqualify the trivial classifier"
+    );
+
+    // Source has no `Op::CallClosure` so the AOT path may or may
+    // not accept this exact shape today; whether AOT succeeds or
+    // surfaces `Unsupported`, the contract is "the trivial short-
+    // circuit did not engage". We assert that bit via
+    // `is_aot_initialised` (true after the AOT path was driven,
+    // success or failure — both populate the OnceLock slot).
+    let mut args = HashMap::new();
+    args.insert(
+        "xs".to_string(),
+        Value::List(Arc::new(vec![Value::Int(1), Value::Int(2)])),
+    );
+    let _ = evaluator.run_main(args);
+    assert!(
+        evaluator.is_aot_initialised(),
+        "non-trivial source must drive the AOT slot (success or cached failure)"
     );
 }

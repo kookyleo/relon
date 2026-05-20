@@ -53,3 +53,9 @@ tracing = "0.1"
 # them directly without relying on dependency inheritance.
 sha2 = { workspace = true }
 hex = { workspace = true }
+# v6-fix-D2 default-path: smoke test for the on-disk cache hit needs
+# an isolated cache root so concurrent test threads don't observe
+# each other's writes. The auto_evaluator_smoke.rs file overrides
+# XDG_CACHE_HOME / HOME for the duration of the test and restores on
+# drop via an env guard.
+tempfile = "3"

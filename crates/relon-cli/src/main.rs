@@ -228,6 +228,18 @@ fn main() -> miette::Result<()> {
             // workspace pass can flag unpinned remote imports up front
             // (before the loader runs). All other analyzer knobs stay
             // at their defaults so this branch keeps its prior behavior.
+            // v6-fix-D2 default-path-2: detect trivial scalar
+            // `#main(...)` shapes (single Int/Float/Bool/Null/String
+            // param + literal-or-arith body, no `#import`) so the
+            // default branch can take the same fast-analyze path
+            // `--lite` does. The classifier reads the raw source
+            // text — cheap, no analyzer state required — and the
+            // tree-walker's per-method-dispatch surface never enters
+            // trivial-`#main` bodies, so skipping carrier injection
+            // is observationally invisible.
+            let trivial_default = !lite && relon::is_trivial_scalar_main(&content);
+            phase("trivial_classify");
+            let lite_analyze = lite || trivial_default;
             let analyze_options = AnalyzeOptions {
                 require_hash,
                 // v6-fix-D2 cold-start: `--lite` strips the
@@ -241,7 +253,14 @@ fn main() -> miette::Result<()> {
                 // `--lite` run will surface as
                 // `UnknownMethod`. (See `--lite`'s flag doc for
                 // the contract.)
-                skip_core_schemas: lite,
+                //
+                // v6-fix-D2 default-path: trivial scalar `#main`
+                // bodies (path b) provably do not dispatch any
+                // built-in method. Skip the carrier in that
+                // branch too — same fast-analyze the operator
+                // would get from `--lite`, without making them
+                // pass the flag.
+                skip_core_schemas: lite_analyze,
                 ..AnalyzeOptions::default()
             };
             // v6-fix-D2 cold-start fast path. The default
@@ -259,7 +278,7 @@ fn main() -> miette::Result<()> {
             // import-free entry. Import-bearing entries fall back
             // to the full workspace path so cross-module diagnostics
             // keep their teeth.
-            let workspace = if lite {
+            let workspace = if lite_analyze {
                 match relon_parser::parse_document(&content) {
                     Ok(node) => {
                         phase("[lite] parse_only");
@@ -483,32 +502,118 @@ fn main() -> miette::Result<()> {
                         )
                         .with_source_code(NamedSource::new(file.to_string_lossy(), content.clone()))
                     })?;
-                // `--backend auto` matches the library facade's
-                // [`relon::Backend::Auto`] — `run_main` flows through
-                // cranelift-AOT, so a CLI invocation pays the AOT
-                // cold-start exactly once. The CLI is a single-shot
-                // driver, so we eagerly build the AOT path here
-                // rather than wrapping `AutoEvaluator`; that keeps
-                // the operator one indirection layer thinner. Trust
-                // is honoured by capability bitmap flipping inside
-                // the cranelift evaluator.
+                // `--backend auto` (default) flows through
+                // [`relon::AutoEvaluator`], which (a) probes the
+                // on-disk cache (`from_cache_dir` → dlopen-execute)
+                // before falling back to `from_source_with_cache`
+                // (writes a fresh cache pair as a side-effect), and
+                // (b) short-circuits straight to the tree-walker
+                // when the source is a trivial scalar `#main` (no
+                // cranelift cold-start at all). The second `relon
+                // run` of the same source therefore lands on the
+                // dlopen path — closing the lap on
+                // `--lite`'s tree-walker time. Trust is honoured by
+                // capability bitmap flipping inside the cranelift
+                // evaluator.
+                //
                 // v6-fix-D2: `--lite` forces tree-walk for the
                 // `#main(...)` path too. The lower / JIT path
                 // (cranelift-AOT) dominates the W11 cold-start
                 // budget; the tree-walker reaches the same
                 // scalar answer with parse + analyze + walk
                 // only.
-                let effective_backend = if lite {
-                    BackendArg::TreeWalk
-                } else {
-                    match backend {
-                        BackendArg::Auto => BackendArg::CraneliftAot,
-                        other => other,
-                    }
-                };
+                let effective_backend = if lite { BackendArg::TreeWalk } else { backend };
                 phase("backend_select");
                 match effective_backend {
-                    BackendArg::Auto => unreachable!("normalised above"),
+                    BackendArg::Auto => {
+                        // v6-fix-D2 default-path. Two short-circuits
+                        // apply here, in priority order:
+                        //
+                        // (b) Trivial scalar `#main` (single scalar
+                        // param + literal / arith body): route
+                        // straight through the workspace-built
+                        // tree-walker. The cranelift cold-start
+                        // (~4-5 ms) is pure overhead on these
+                        // shapes; the tree-walker reaches the same
+                        // scalar answer in ~60 µs. We share the
+                        // already-prepared `evaluator` + workspace
+                        // so the duplicate parse + analyze that
+                        // `AutoEvaluator::new` would have done stays
+                        // out of the hot path.
+                        //
+                        // (a) Otherwise drive the cranelift-AOT
+                        // pipeline via `from_source_with_cache` so
+                        // the second cold start of the same source
+                        // can dlopen-execute the cached binary
+                        // (skips parse + analyze + lower entirely).
+                        // The cache directory is the conventional
+                        // `$XDG_CACHE_HOME/relon` (override via env
+                        // for test isolation).
+                        if trivial_default {
+                            phase("default_trivial_tree_walk");
+                            evaluator.run_main(&scope, args_map).map_err(|e| {
+                                Report::new(e).with_source_code(NamedSource::new(
+                                    file.to_string_lossy(),
+                                    content.clone(),
+                                ))
+                            })?
+                        } else {
+                            let _caps = if trust {
+                                relon_eval_api::Capabilities::all_granted()
+                            } else {
+                                relon_eval_api::Capabilities::default()
+                            };
+                            let cache_dir = relon_codegen_native::default_cache_dir();
+                            // Cache-hit fast path: pull a matching
+                            // pair off disk if present. Any soft
+                            // miss (file absent, integrity failure,
+                            // metadata mismatch) returns `Ok(None)`;
+                            // a hard I/O failure surfaces as a
+                            // logged warning and we fall back to
+                            // the source path.
+                            let aot_opt = match CraneliftAotEvaluator::from_cache_dir(
+                                &content, &cache_dir,
+                            ) {
+                                Ok(opt) => opt,
+                                Err(e) => {
+                                    // Cache infrastructure problem
+                                    // (not a miss). Log and fall
+                                    // back to source; we don't
+                                    // gate the live invocation on
+                                    // a transient cache issue. The
+                                    // line goes to stderr so a
+                                    // tracing subscriber installed
+                                    // by `RELON_LOG=...` upstream
+                                    // would already capture it via
+                                    // the codegen-native
+                                    // `tracing::warn!` mirrored
+                                    // there.
+                                    eprintln!(
+                                        "[relon-cli] AOT cache load failed: {e}; falling back to from_source"
+                                    );
+                                    None
+                                }
+                            };
+                            phase("default_cache_probe");
+                            let aot = match aot_opt {
+                                Some(a) => a,
+                                None => CraneliftAotEvaluator::from_source_with_cache(
+                                    &content, &cache_dir,
+                                )
+                                .map_err(|e| {
+                                    miette::miette!("auto backend setup: {e}").with_source_code(
+                                        NamedSource::new(file.to_string_lossy(), content.clone()),
+                                    )
+                                })?,
+                            };
+                            EvaluatorTrait::run_main(&aot, args_map).map_err(|e| {
+                                Report::new(e).with_source_code(NamedSource::new(
+                                    file.to_string_lossy(),
+                                    content.clone(),
+                                ))
+                            })?
+                        }
+                    }
                     BackendArg::TreeWalk => evaluator.run_main(&scope, args_map).map_err(|e| {
                         Report::new(e).with_source_code(NamedSource::new(
                             file.to_string_lossy(),
