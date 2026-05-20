@@ -29,6 +29,18 @@
 //!    outside" means: produced by an op at a pc strictly less than
 //!    the loop's `MarkLoopHead`, or never produced at all (an
 //!    externally captured value).
+//! 5. For `TraceOp::Load` (F-D7-G): the loop body must contain no
+//!    `TraceOp::Store` and no op of effect class `RecoverableWrite`
+//!    or `Unrecoverable`. The trace IR's alias model treats every
+//!    in-loop write as potentially aliasing the load's slot, so the
+//!    conservative gate is "no in-loop writes at all". This is
+//!    sufficient for the F-D7-G W4-flavoured pattern (StringRef
+//!    `(ptr, len)` loads from a loop-invariant `*const StringRef`
+//!    base) — the recorder never emits a `Store` against StringRef
+//!    payload in the same trace because the host-side `Arc<str>` is
+//!    immutable. When a future phase needs a finer-grained
+//!    aliasing check, replace the per-loop boolean with a
+//!    `(base, offset)` clobber set.
 //!
 //! Nested loops are supported via `loop_id`. An op may be hoisted
 //! out of the innermost loop containing it, and the next pass run
@@ -54,7 +66,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::buffer::TraceBuffer;
 use crate::effect::EffectClass;
-use crate::trace_ir::{GuardKind, SsaVar, TraceOp};
+use crate::trace_ir::{GuardKind, Offset, SsaVar, TraceOp};
 
 use super::{OptimizerPass, PassReport};
 
@@ -159,10 +171,30 @@ fn hoist_one_loop(trace: &mut TraceBuffer, lp: &LoopRange, report: &mut PassRepo
         .collect();
     inside_defs.extend(trace.ops[lp.head_pc].defs());
 
+    // F-D7-G: precompute whether this loop body contains any op that
+    // could clobber the slot a hoist candidate `TraceOp::Load` reads.
+    // The conservative rule is "any in-loop `Store` or any op of
+    // effect class `RecoverableWrite` / `Unrecoverable` blocks all
+    // Load hoists". We do not attempt aliasing between distinct
+    // `(base, offset)` pairs because the trace IR's alias model is
+    // intentionally coarse — every write may alias every load. When
+    // the workload's loop body has zero writes (the W3 / W4 string
+    // patterns and the W5 / W6 dict/list patterns alike), the gate is
+    // open and any loop-invariant Load lifts on the same pipeline
+    // round as the existing pure / ReadOnly hoists.
+    let body_has_writes = (body_start..body_end).any(|i| {
+        let op = &trace.ops[i];
+        matches!(op, TraceOp::Store(_, _, _))
+            || matches!(
+                op.effect_class(),
+                EffectClass::RecoverableWrite | EffectClass::Unrecoverable
+            )
+    });
+
     // Collect candidate indices in order.
     let mut hoist_pcs: Vec<usize> = Vec::new();
     for pc in body_start..body_end {
-        if !is_hoistable(&trace.ops[pc]) {
+        if !is_hoistable(&trace.ops[pc], body_has_writes) {
             continue;
         }
         let inputs = trace.ops[pc].inputs();
@@ -204,7 +236,7 @@ fn hoist_one_loop(trace: &mut TraceBuffer, lp: &LoopRange, report: &mut PassRepo
     true
 }
 
-fn is_hoistable(op: &TraceOp) -> bool {
+fn is_hoistable(op: &TraceOp, body_has_writes: bool) -> bool {
     if op.is_loop_head() || op.is_loop_back() {
         return false;
     }
@@ -257,10 +289,29 @@ fn is_hoistable(op: &TraceOp) -> bool {
         // recorder prepended to a `ListGet` is hoisted by the
         // dedicated branch above so the deopt-anchored guard stays
         // adjacent to the load.
-        EffectClass::ReadOnly => matches!(
-            op,
-            TraceOp::LocalGet(_, _) | TraceOp::ListGet { .. } | TraceOp::DictLookup { .. }
-        ),
+        //
+        // F-D7-G: admit `TraceOp::Load` to the ReadOnly allow-list
+        // when the enclosing loop body contains no writes. The
+        // recorder emits `Load(dst, base, Offset(0 | 8))` for
+        // StringRef `ptr` / `len` payload reads off a `*const
+        // StringRef` SSA (see `LoadField { offset, ty }` lowering in
+        // the recorder). When the base SSA is loop-invariant and
+        // the loop body has no aliasing writes, hoisting the load
+        // moves the StringRef header deref into the preheader so
+        // the per-iter cost drops to the bare op (the `StrConcat`
+        // / `StrContains` extern call). The `body_has_writes` gate
+        // keeps the rule conservative: any in-loop `Store` (or any
+        // op of effect class `RecoverableWrite` / `Unrecoverable`,
+        // such as `Div` / `Mod`) closes the gate for every Load in
+        // that body. The input-invariance check upstream of this
+        // predicate still gates `base` invariance, so a Load whose
+        // base is loop-carried (e.g. an accumulator phi in the W3
+        // concat shape) stays inside the loop regardless.
+        EffectClass::ReadOnly => match op {
+            TraceOp::LocalGet(_, _) | TraceOp::ListGet { .. } | TraceOp::DictLookup { .. } => true,
+            TraceOp::Load(_, _, Offset(off)) => !body_has_writes && (*off == 0 || *off == 8),
+            _ => false,
+        },
         EffectClass::RecoverableWrite | EffectClass::Unrecoverable => false,
     }
 }

@@ -61,7 +61,10 @@ fn loop_variant_op_stays_inside() {
         loop_id: 0,
         phis: vec![],
     });
-    b.append(TraceOp::Load(inside_load, base, Offset(0)));
+    // Offset 24 sits outside F-D7-G's StringRef ptr/len hoist window,
+    // so the Load stays inside the body and the Add that depends on
+    // it must stay too.
+    b.append(TraceOp::Load(inside_load, base, Offset(24)));
     b.append(TraceOp::Add(res, inside_load, pre_c));
     b.append(TraceOp::MarkLoopBack {
         loop_id: 0,
@@ -200,7 +203,10 @@ fn nested_loops_partial_invariant_hoists_to_inner_head_only() {
         loop_id: 0,
         phis: vec![],
     });
-    b.append(TraceOp::Load(bb, base, Offset(0)));
+    // Offset 24: see F-D7-G note in the sister tests above — keeps
+    // `bb` loop-variant with respect to the outer loop so the Add
+    // below cannot escape the outer body.
+    b.append(TraceOp::Load(bb, base, Offset(24)));
     b.append(TraceOp::MarkLoopHead {
         loop_id: 1,
         phis: vec![],
@@ -238,7 +244,12 @@ fn nested_loops_partial_invariant_hoists_to_inner_head_only() {
 }
 
 #[test]
-fn unrelated_loop_with_no_invariants_leaves_trace_unchanged() {
+fn load_with_non_string_offset_stays_inside_loop() {
+    // F-D7-G admits `TraceOp::Load` to the hoistable set only for
+    // offsets 0 and 8 (StringRef ptr / len). A load at any other
+    // offset stays inside the loop body even when its base SSA is
+    // loop-invariant and the body has no writes — the optimiser
+    // takes no responsibility for aliasing arbitrary struct layouts.
     let mut b = TraceBuffer::new();
     let base = b.fresh_ssa();
     let inside_load = b.fresh_ssa();
@@ -246,7 +257,7 @@ fn unrelated_loop_with_no_invariants_leaves_trace_unchanged() {
         loop_id: 0,
         phis: vec![],
     });
-    b.append(TraceOp::Load(inside_load, base, Offset(0)));
+    b.append(TraceOp::Load(inside_load, base, Offset(16)));
     b.append(TraceOp::MarkLoopBack {
         loop_id: 0,
         next_values: vec![],
@@ -385,9 +396,11 @@ fn loop_variant_idx_keeps_list_get_inside() {
         loop_id: 0,
         phis: vec![],
     });
-    // idx_inside = Load(counter_base, 0) — synthesises a loop-variant
-    // SSA without dragging in MarkLoopHead φ wiring.
-    b.append(TraceOp::Load(idx_inside, counter_base, Offset(0)));
+    // idx_inside = Load(counter_base, 24) — synthesises a loop-variant
+    // SSA without dragging in MarkLoopHead φ wiring. Offset 24 sits
+    // outside F-D7-G's StringRef ptr/len hoist window (0 / 8), so the
+    // Load itself stays inside the body and feeds the BoundsCheck.
+    b.append(TraceOp::Load(idx_inside, counter_base, Offset(24)));
     b.append(TraceOp::Guard(
         GuardKind::BoundsCheck(idx_inside, list_ptr),
         idx_inside,
@@ -474,7 +487,10 @@ fn loop_variant_key_keeps_dict_lookup_inside() {
         loop_id: 0,
         phis: vec![],
     });
-    b.append(TraceOp::Load(key_ptr_inside, key_base, Offset(0)));
+    // Offset 24 avoids F-D7-G's StringRef ptr/len hoist window so the
+    // synthesised loop-variant Load stays inside the body and the
+    // DictLookup's key_ptr input remains loop-carried.
+    b.append(TraceOp::Load(key_ptr_inside, key_base, Offset(24)));
     b.append(TraceOp::DictLookup {
         dst,
         dict_ptr,
@@ -510,7 +526,10 @@ fn loop_variant_bounds_check_stays_inside() {
         loop_id: 0,
         phis: vec![],
     });
-    b.append(TraceOp::Load(idx, counter_base, Offset(0)));
+    // Offset 24: see F-D7-G note in the sister tests above — keeps the
+    // Load loop-internal so the BoundsCheck sees a true loop-variant
+    // `idx`.
+    b.append(TraceOp::Load(idx, counter_base, Offset(24)));
     b.append(TraceOp::Guard(GuardKind::BoundsCheck(idx, list_ptr), idx));
     b.append(TraceOp::MarkLoopBack {
         loop_id: 0,
@@ -556,5 +575,216 @@ fn non_bounds_guards_remain_pinned_even_when_invariant() {
     assert!(
         guard_pos > head_idx,
         "Non-BoundsCheck guards stay pinned even when their input is invariant"
+    );
+}
+
+// ---- F-D7-G: StringRef payload (ptr / len) Load hoist --------------
+
+/// Canonical W4-shaped pattern: the recorder emits `LoadField {
+/// offset: 0, ty: I64 }` (StringRef::ptr) and `LoadField { offset: 8,
+/// ty: I64 }` (StringRef::len) inside a hot loop body when the higher
+/// level surfaces `s.contains(needle)` against a loop-invariant
+/// haystack. Without F-D7-G these `TraceOp::Load`s stay inside the
+/// loop and the cranelift backend has no LICM of its own to lift
+/// them. F-D7-G admits them to the hoistable set whenever the loop
+/// body has no aliasing writes — so the StringRef header deref moves
+/// to the preheader.
+#[test]
+fn loop_invariant_string_payload_ptr_load_lifts_out_of_loop() {
+    let mut b = TraceBuffer::new();
+    let str_ref = b.fresh_ssa();
+    let ptr_dst = b.fresh_ssa();
+    // String SSA defined OUTSIDE the loop — canonical invariant case.
+    b.append(TraceOp::ConstI64(str_ref, 0xdead_0000));
+    b.append(TraceOp::MarkLoopHead {
+        loop_id: 0,
+        phis: vec![],
+    });
+    b.append(TraceOp::Load(ptr_dst, str_ref, Offset(0))); // StringRef::ptr
+    b.append(TraceOp::MarkLoopBack {
+        loop_id: 0,
+        next_values: vec![],
+    });
+
+    let r = LICM.run(&mut b);
+    let head_idx = position(&b.ops, |o| o.is_loop_head()).expect("head missing");
+    let load_idx = position(&b.ops, |o| matches!(o, TraceOp::Load(_, _, _))).expect("load missing");
+    assert!(
+        load_idx < head_idx,
+        "Load at offset 0 must hoist above MarkLoopHead, found at {load_idx} vs head {head_idx}"
+    );
+    assert!(r.ops_replaced >= 1);
+}
+
+#[test]
+fn loop_invariant_string_payload_len_load_lifts_out_of_loop() {
+    let mut b = TraceBuffer::new();
+    let str_ref = b.fresh_ssa();
+    let len_dst = b.fresh_ssa();
+    b.append(TraceOp::ConstI64(str_ref, 0xbeef_0000));
+    b.append(TraceOp::MarkLoopHead {
+        loop_id: 0,
+        phis: vec![],
+    });
+    b.append(TraceOp::Load(len_dst, str_ref, Offset(8))); // StringRef::len
+    b.append(TraceOp::MarkLoopBack {
+        loop_id: 0,
+        next_values: vec![],
+    });
+
+    let r = LICM.run(&mut b);
+    let head_idx = position(&b.ops, |o| o.is_loop_head()).unwrap();
+    let load_idx = position(&b.ops, |o| matches!(o, TraceOp::Load(_, _, _))).unwrap();
+    assert!(
+        load_idx < head_idx,
+        "Load at offset 8 must hoist above MarkLoopHead"
+    );
+    assert!(r.ops_replaced >= 1);
+}
+
+/// Loop-carried base SSA → the Load result varies per iter and MUST
+/// stay inside the body even with offsets 0 / 8. The W3 concat shape
+/// hits this case: the accumulator phi's `acc + lit` produces a fresh
+/// StringRef every iter, so reading its `(ptr, len)` upfront would
+/// see only the seed value.
+#[test]
+fn loop_carried_base_keeps_string_payload_load_inside() {
+    use relon_trace_jit::LoopPhi;
+    let mut b = TraceBuffer::new();
+    let init = b.fresh_ssa();
+    let phi = b.fresh_ssa();
+    let len_dst = b.fresh_ssa();
+    b.append(TraceOp::ConstI64(init, 0xcafe));
+    b.append(TraceOp::MarkLoopHead {
+        loop_id: 0,
+        phis: vec![LoopPhi::new(init, phi)],
+    });
+    b.append(TraceOp::Load(len_dst, phi, Offset(8))); // base = phi → variant
+    b.append(TraceOp::MarkLoopBack {
+        loop_id: 0,
+        next_values: vec![phi],
+    });
+
+    LICM.run(&mut b);
+    let head_idx = position(&b.ops, |o| o.is_loop_head()).unwrap();
+    let load_idx = position(&b.ops, |o| matches!(o, TraceOp::Load(_, _, _))).unwrap();
+    assert!(
+        load_idx > head_idx,
+        "Load against a loop-carried base must remain inside the loop body"
+    );
+}
+
+/// In-loop `Store` blocks the F-D7-G gate — even an invariant Load at
+/// offset 0 / 8 must stay inside because the optimiser's coarse alias
+/// model assumes every Store may clobber every slot.
+#[test]
+fn in_loop_store_blocks_string_payload_load_hoist() {
+    let mut b = TraceBuffer::new();
+    let str_ref = b.fresh_ssa();
+    let sink_base = b.fresh_ssa();
+    let writes = b.fresh_ssa();
+    let len_dst = b.fresh_ssa();
+    b.append(TraceOp::ConstI64(str_ref, 0xfeed_0000));
+    b.append(TraceOp::ConstI64(sink_base, 0x1));
+    b.append(TraceOp::ConstI64(writes, 7));
+    b.append(TraceOp::MarkLoopHead {
+        loop_id: 0,
+        phis: vec![],
+    });
+    b.append(TraceOp::Load(len_dst, str_ref, Offset(0)));
+    b.append(TraceOp::Store(sink_base, Offset(0), writes));
+    b.append(TraceOp::MarkLoopBack {
+        loop_id: 0,
+        next_values: vec![],
+    });
+
+    LICM.run(&mut b);
+    let head_idx = position(&b.ops, |o| o.is_loop_head()).unwrap();
+    let load_idx = position(&b.ops, |o| matches!(o, TraceOp::Load(_, _, _))).unwrap();
+    assert!(
+        load_idx > head_idx,
+        "Load must NOT hoist when the loop body contains a Store — conservative alias model"
+    );
+}
+
+/// `Div` is classified `RecoverableWrite` (deopt on /0 is a write
+/// against the trace's overflow / divide-by-zero deopt slot). It MUST
+/// close the F-D7-G hoist gate the same way an explicit `Store` does.
+#[test]
+fn in_loop_recoverable_write_blocks_string_payload_load_hoist() {
+    let mut b = TraceBuffer::new();
+    let str_ref = b.fresh_ssa();
+    let a = b.fresh_ssa();
+    let bv = b.fresh_ssa();
+    let q = b.fresh_ssa();
+    let len_dst = b.fresh_ssa();
+    b.append(TraceOp::ConstI64(str_ref, 0xfeed_0000));
+    b.append(TraceOp::ConstI64(a, 100));
+    b.append(TraceOp::ConstI64(bv, 5));
+    b.append(TraceOp::MarkLoopHead {
+        loop_id: 0,
+        phis: vec![],
+    });
+    b.append(TraceOp::Load(len_dst, str_ref, Offset(8)));
+    b.append(TraceOp::Div(q, a, bv));
+    b.append(TraceOp::MarkLoopBack {
+        loop_id: 0,
+        next_values: vec![],
+    });
+
+    LICM.run(&mut b);
+    let head_idx = position(&b.ops, |o| o.is_loop_head()).unwrap();
+    let load_idx = position(&b.ops, |o| matches!(o, TraceOp::Load(_, _, _))).unwrap();
+    assert!(
+        load_idx > head_idx,
+        "Load must NOT hoist when the loop body contains a RecoverableWrite op"
+    );
+}
+
+/// W4-shaped: a loop-invariant haystack SSA defined by `LocalGet` IS
+/// hoistable even though `LocalGet` itself sits inside the loop body.
+/// LICM's existing LocalGet allow-list lifts the LocalGet on its own
+/// pass, and the new F-D7-G arm lifts the StringRef payload Load
+/// alongside it — both end up above the MarkLoopHead in a single LICM
+/// run.
+#[test]
+fn local_get_haystack_and_payload_load_hoist_together() {
+    let mut b = TraceBuffer::new();
+    let haystack = b.fresh_ssa();
+    let ptr = b.fresh_ssa();
+    let len = b.fresh_ssa();
+    b.append(TraceOp::MarkLoopHead {
+        loop_id: 0,
+        phis: vec![],
+    });
+    // Mirrors the recorder's emit order for `s.contains(needle)` with
+    // a loop-invariant `s` arg: LocalGet first, then the two payload
+    // loads, then the inline scan (omitted here — we only assert the
+    // payload deref hoists).
+    b.append(TraceOp::LocalGet(haystack, 1));
+    b.append(TraceOp::Load(ptr, haystack, Offset(0)));
+    b.append(TraceOp::Load(len, haystack, Offset(8)));
+    b.append(TraceOp::MarkLoopBack {
+        loop_id: 0,
+        next_values: vec![],
+    });
+
+    LICM.run(&mut b);
+    let head_idx = position(&b.ops, |o| o.is_loop_head()).unwrap();
+    let lg_idx = position(&b.ops, |o| matches!(o, TraceOp::LocalGet(_, _))).unwrap();
+    let loads: Vec<usize> = b
+        .ops
+        .iter()
+        .enumerate()
+        .filter_map(|(i, o)| matches!(o, TraceOp::Load(_, _, _)).then_some(i))
+        .collect();
+    assert_eq!(loads.len(), 2, "both Load ops must still be present");
+    assert!(
+        lg_idx < head_idx,
+        "LocalGet haystack must hoist (F-D7-D rule)"
+    );
+    assert!(
+        loads.iter().all(|p| *p < head_idx),
+        "both StringRef payload Loads must hoist above MarkLoopHead (F-D7-G)"
     );
 }
