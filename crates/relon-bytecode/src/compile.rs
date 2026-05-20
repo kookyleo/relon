@@ -24,8 +24,13 @@ use std::collections::BTreeMap;
 
 use thiserror::Error;
 
+use ordered_float::OrderedFloat;
+
 use relon_eval_api::layout::OffsetTable;
-use relon_ir::{Func, IrType, Op, TaggedOp};
+use relon_ir::{
+    op_visitor::{walk_op, OpVisitor},
+    ClosureCapture, Func, IrType, Op, TaggedOp, TrapKind,
+};
 
 use crate::op::{BcFunction, BcOp, BcTrapKind, ExternalPc, StackOrigin};
 
@@ -126,6 +131,7 @@ pub fn compile_function_in_module(
             + field_offset_to_local.len() as u32
             + return_field_offset_to_local.len() as u32,
         inline_depth: 0,
+        current_pc: 0,
     };
     state.compile_seq(&func.body, /*depth_base=*/ 0)?;
     state.emit_ret_if_missing();
@@ -235,6 +241,13 @@ struct CompileState<'a> {
     /// [`MAX_INLINE_DEPTH`] surfaces as
     /// `BcCompileError::UnsupportedOp("inline depth exceeded")`.
     inline_depth: u32,
+    /// IR PC bound to the op currently being lowered. Re-entry into
+    /// the visitor methods (e.g. during `compile_seq` recursion for
+    /// `If` / `Block` / `Loop`) re-bumps the counter via
+    /// [`Self::next_pc`] before dispatching; this slot caches the
+    /// value once per outer dispatch so every visitor method sees the
+    /// matching PC without threading it through the trait surface.
+    current_pc: ExternalPc,
 }
 
 #[derive(Debug)]
@@ -333,205 +346,13 @@ impl<'a> CompileState<'a> {
     }
 
     fn compile_one(&mut self, op: &Op) -> Result<(), BcCompileError> {
-        let pc = self.next_pc();
-        match op {
-            Op::ConstI64(v) => self.emit_with_effect(BcOp::ConstI64(*v), pc),
-            Op::ConstI32(v) => self.emit_with_effect(BcOp::ConstI32(*v), pc),
-            Op::ConstBool(b) => self.emit_with_effect(BcOp::ConstI32(if *b { 1 } else { 0 }), pc),
-            Op::LocalGet(idx) => self.emit_with_effect(BcOp::LocalGet(*idx), pc),
-            Op::LetGet { idx, .. } => {
-                // Let-locals sit past the buffer-protocol arg slots.
-                // The buffer-protocol layout reserves the first
-                // `main_schema.fields.len()` virtual slots for inputs
-                // and the return-schema field slots after that; let
-                // locals come **on top of** those reserved slots so
-                // they don't collide. The offset is fixed by the
-                // compile-time field maps.
-                let base = self.input_arg_count() + self.return_field_count();
-                self.emit_with_effect(BcOp::LocalGet(base + *idx), pc);
-            }
-            Op::LetSet { idx, .. } => {
-                let base = self.input_arg_count() + self.return_field_count();
-                self.emit_with_effect(BcOp::LocalSet(base + *idx), pc);
-            }
-            // F-D7-D: `Op::Add(IrType::String)` (source-side
-            // `s + t` lowering) needs a record-aware concat — outside
-            // the bytecode VM's M2-A scalar envelope. Bounce so the
-            // four-way harness routes the source through
-            // `BytecodeUnsupported`. Sub / Mul / etc. with String
-            // never escape the analyzer; the explicit check here is
-            // belt-and-braces.
-            Op::Add(IrType::String) => {
-                return Err(BcCompileError::UnsupportedOp(
-                    "Op::Add(IrType::String) — string concat is outside the bytecode VM's scalar envelope"
-                        .to_string(),
-                ));
-            }
-            Op::Add(ty) => self.emit_with_effect(BcOp::Add(*ty), pc),
-            Op::Sub(ty) => self.emit_with_effect(BcOp::Sub(*ty), pc),
-            Op::Mul(ty) => self.emit_with_effect(BcOp::Mul(*ty), pc),
-            Op::Div(ty) => self.emit_with_effect(BcOp::Div(*ty), pc),
-            Op::Mod(ty) => self.emit_with_effect(BcOp::Mod(*ty), pc),
-            Op::Eq(ty) => self.emit_with_effect(BcOp::Eq(*ty), pc),
-            Op::Ne(ty) => self.emit_with_effect(BcOp::Ne(*ty), pc),
-            Op::Lt(ty) => self.emit_with_effect(BcOp::Lt(*ty), pc),
-            Op::Le(ty) => self.emit_with_effect(BcOp::Le(*ty), pc),
-            Op::Gt(ty) => self.emit_with_effect(BcOp::Gt(*ty), pc),
-            Op::Ge(ty) => self.emit_with_effect(BcOp::Ge(*ty), pc),
-            Op::Return => self.emit_with_effect(BcOp::Return, pc),
-            // v6-δ M2-B widening: `ConstString` / `ConstListInt` /
-            // `ConstListBool` / `ConstListFloat` / `ConstListString`
-            // emit a record-pointer in cranelift/wasm. The bytecode
-            // VM has no record memory model, so we encode them as
-            // "the length as i64" — adequate for the corpus's
-            // `"...".length()` / `[...].length()` / `is_empty()`
-            // patterns. The companion `ReadStringLen` /
-            // `ReadListIntLen` ops become no-ops because the top of
-            // stack already holds the length.
-            //
-            // Sources that try to USE the pointer for content access
-            // (substring, concat, etc.) fall outside this fold and
-            // surface as bytecode-side traps or compile-time
-            // mismatches. The corpus widening targets only the
-            // length-/empty-query cases.
-            Op::ConstString { idx: _, value } => {
-                let len = value.chars().count() as i64;
-                self.emit_with_effect(BcOp::ConstI64(len), pc);
-            }
-            Op::ConstListInt { idx: _, elements } => {
-                self.emit_with_effect(BcOp::ConstI64(elements.len() as i64), pc);
-            }
-            Op::ConstListFloat { idx: _, elements } => {
-                self.emit_with_effect(BcOp::ConstI64(elements.len() as i64), pc);
-            }
-            Op::ConstListBool { idx: _, elements } => {
-                self.emit_with_effect(BcOp::ConstI64(elements.len() as i64), pc);
-            }
-            Op::ConstListString { idx: _, elements } => {
-                self.emit_with_effect(BcOp::ConstI64(elements.len() as i64), pc);
-            }
-            Op::ReadStringLen => {
-                // No-op — see the ConstString comment above.
-                let _ = pc;
-            }
-            Op::Trap { kind, .. } => {
-                let bc_kind = match kind {
-                    relon_ir::ir::TrapKind::IndexOutOfBounds => BcTrapKind::IndexOutOfBounds,
-                    relon_ir::ir::TrapKind::EmptyList => BcTrapKind::EmptyList,
-                    relon_ir::ir::TrapKind::InvalidUtf8 => BcTrapKind::InvalidUtf8,
-                };
-                self.emit_with_effect(BcOp::Trap(bc_kind), pc);
-            }
-            Op::LoadField { offset, ty: _ } => {
-                let slot = self
-                    .field_offset_to_local
-                    .get(offset)
-                    .copied()
-                    .ok_or(BcCompileError::UnknownFieldOffset { offset: *offset })?;
-                self.emit_with_effect(BcOp::LocalGet(slot), pc);
-            }
-            Op::StoreField { offset, ty: _ } => {
-                // Map onto a return-field virtual slot, positioned
-                // **after** the input arg slots so the evaluator can
-                // read them back as `locals[input_args + i]`.
-                let return_slot = self
-                    .return_field_offset_to_local
-                    .get(offset)
-                    .copied()
-                    .ok_or(BcCompileError::UnknownFieldOffset { offset: *offset })?;
-                let slot = self.input_arg_count() + return_slot;
-                self.emit_with_effect(BcOp::LocalSet(slot), pc);
-            }
-            // v6-δ M2-B: `AllocRootRecord` is a buffer-protocol-only
-            // op — it allocates an `out_ptr`-relative slot in the
-            // wasm/cranelift output buffer. The bytecode VM uses
-            // virtual locals (no actual buffer), so this op is a
-            // no-op in our envelope. The stack effect is `[] -> []`
-            // and the same is true for `AllocSubRecord` /
-            // `PushRecordBase`. Emit no bytecode op; the next IR op
-            // continues compilation against the same `current_stack`.
-            Op::AllocRootRecord { .. } => {
-                // Burn the IR PC so subsequent ops' PC counters stay
-                // monotonic — but don't emit a bytecode op or touch
-                // the stack recipe. The bytecode VM's view skips
-                // buffer-protocol bookkeeping entirely.
-                let _ = pc;
-            }
-            Op::AllocSubRecord { .. } | Op::PushRecordBase { .. } => {
-                let _ = pc;
-            }
-            Op::StoreFieldAtRecord {
-                offset,
-                ty: _,
-                record_local_idx: _,
-            } => {
-                // Pop the operand value into the matching return-
-                // field virtual slot. The `record_local_idx` is part
-                // of the buffer-protocol bookkeeping (lets the wasm
-                // codegen address fields relative to the record's
-                // base offset); in the bytecode VM we collapse the
-                // base-relative offset to a flat virtual slot via
-                // the return-schema offset table.
-                let return_slot = self
-                    .return_field_offset_to_local
-                    .get(offset)
-                    .copied()
-                    .ok_or(BcCompileError::UnknownFieldOffset { offset: *offset })?;
-                let slot = self.input_arg_count() + return_slot;
-                self.emit_with_effect(BcOp::LocalSet(slot), pc);
-            }
-            Op::If {
-                result_ty,
-                then_body,
-                else_body,
-            } => self.compile_if(*result_ty, then_body, else_body, pc)?,
-            Op::Block { body, .. } => self.compile_block(body)?,
-            Op::Loop { body, .. } => self.compile_loop(body)?,
-            Op::Br { label_depth } => self.compile_br(*label_depth, /*conditional=*/ false)?,
-            Op::BrIf { label_depth } => {
-                self.compile_br(*label_depth, /*conditional=*/ true)?
-            }
-            Op::Call {
-                fn_index,
-                arg_count,
-                param_tys: _,
-                ret_ty: _,
-            } => self.compile_inline_call(*fn_index, *arg_count, pc)?,
-            // v6-δ M2-B: `Op::Select` is the wasm-typed-select primitive
-            // (`[val_true, val_false, cond] -> [chosen]`). Lower as an
-            // if/else over the cond: pop cond, JumpIfFalse over the
-            // val_true keep, drop val_false; on false drop val_true,
-            // pop val_false. Bytecode-VM-side, we emit:
-            //
-            //   JumpIfFalse(else_label)
-            //   ; cond was true, val_true stays as result, drop val_false
-            //   ... actually the VM has no Drop op. Use a tiny trick:
-            //   on entry, the abstract stack holds [val_true, val_false].
-            //   We synthesise a select via two LocalSet-style helpers
-            //   into scratch slots so the resulting stack is
-            //   `[chosen]`. The compile pass emits:
-            //
-            //   LocalSet(s0)   ; pop val_false
-            //   LocalSet(s1)   ; pop val_true
-            //   JumpIfFalse(else_lbl)
-            //   LocalGet(s1)   ; push val_true
-            //   Jump(join)
-            // else_lbl:
-            //   LocalGet(s0)   ; push val_false
-            // join:
-            //
-            // The cond is already popped by JumpIfFalse so the stack
-            // ends with [chosen].
-            Op::Select { ty: _ } => self.compile_select(pc)?,
-            // Everything else — CallNative / list / stdlib memory /
-            // closures / native — is outside the bytecode VM's M2-B
-            // envelope. Surface as a compile error so the caller can
-            // route through cranelift / tree-walker.
-            other => {
-                return Err(BcCompileError::UnsupportedOp(format!("{other:?}")));
-            }
-        }
-        Ok(())
+        // Bind one IR PC per outer dispatch and stash it so the
+        // visitor methods see a stable value while they emit / recurse.
+        // Nested `compile_seq` calls (`If` / `Block` / `Loop` body
+        // walks) re-enter this function and overwrite `current_pc`,
+        // which is exactly the historical match-arm behaviour.
+        self.current_pc = self.next_pc();
+        walk_op(op, self)
     }
 
     /// Inline the body of `funcs[fn_index]` against the caller's
@@ -995,6 +816,538 @@ impl<'a> CompileState<'a> {
         self.next_snapshot_idx += 1;
         self.current_stack = vec![StackOrigin::Snapshot(snap_idx)];
         Ok(())
+    }
+}
+
+/// Convenience: every `Op` variant outside the bytecode VM's M2-B
+/// envelope (record memory, scratch alloc, raw-memory primitives,
+/// native imports, closures, Unicode tables) surfaces as
+/// `UnsupportedOp` so the four-way harness can route the source
+/// through cranelift / tree-walker. Centralised here so every
+/// matching `OpVisitor` method shares the same diagnostic shape.
+#[inline]
+fn unsupported(label: &'static str) -> Result<(), BcCompileError> {
+    Err(BcCompileError::UnsupportedOp(format!(
+        "bytecode VM has no lowering for Op::{label}"
+    )))
+}
+
+/// `OpVisitor` impl driving the per-variant lowering. The dispatch
+/// table is generated by `walk_op` in `relon-ir`; adding a new `Op`
+/// variant forces this impl to gain a matching method, eliminating
+/// the historical risk where bytecode / cranelift / wasm backends
+/// drifted out of sync.
+impl<'a> OpVisitor for CompileState<'a> {
+    type Output = ();
+    type Error = BcCompileError;
+
+    fn visit_const_i64(&mut self, v: i64) -> Result<(), BcCompileError> {
+        let pc = self.current_pc;
+        self.emit_with_effect(BcOp::ConstI64(v), pc);
+        Ok(())
+    }
+
+    fn visit_const_i32(&mut self, v: i32) -> Result<(), BcCompileError> {
+        let pc = self.current_pc;
+        self.emit_with_effect(BcOp::ConstI32(v), pc);
+        Ok(())
+    }
+
+    fn visit_const_bool(&mut self, b: bool) -> Result<(), BcCompileError> {
+        let pc = self.current_pc;
+        self.emit_with_effect(BcOp::ConstI32(if b { 1 } else { 0 }), pc);
+        Ok(())
+    }
+
+    fn visit_const_f64(&mut self, _v: OrderedFloat<f64>) -> Result<(), BcCompileError> {
+        // The bytecode VM operates over i64-shaped slots; F64 literals
+        // arrive only through corpus paths that already bounce to
+        // cranelift before compile.
+        unsupported("ConstF64")
+    }
+
+    // v6-δ M2-B widening: `ConstString` / `ConstListInt` /
+    // `ConstListBool` / `ConstListFloat` / `ConstListString` emit a
+    // record pointer in cranelift / wasm. The bytecode VM has no
+    // record memory model, so we encode them as "the length as i64"
+    // — adequate for the corpus's `"...".length()` /
+    // `[...].length()` / `is_empty()` patterns. The companion
+    // `ReadStringLen` then becomes a no-op because the length is
+    // already on the stack.
+    fn visit_const_string(&mut self, _idx: u32, value: &str) -> Result<(), BcCompileError> {
+        let pc = self.current_pc;
+        let len = value.chars().count() as i64;
+        self.emit_with_effect(BcOp::ConstI64(len), pc);
+        Ok(())
+    }
+
+    fn visit_const_list_int(&mut self, _idx: u32, elements: &[i64]) -> Result<(), BcCompileError> {
+        let pc = self.current_pc;
+        self.emit_with_effect(BcOp::ConstI64(elements.len() as i64), pc);
+        Ok(())
+    }
+
+    fn visit_const_list_float(
+        &mut self,
+        _idx: u32,
+        elements: &[u64],
+    ) -> Result<(), BcCompileError> {
+        let pc = self.current_pc;
+        self.emit_with_effect(BcOp::ConstI64(elements.len() as i64), pc);
+        Ok(())
+    }
+
+    fn visit_const_list_bool(
+        &mut self,
+        _idx: u32,
+        elements: &[bool],
+    ) -> Result<(), BcCompileError> {
+        let pc = self.current_pc;
+        self.emit_with_effect(BcOp::ConstI64(elements.len() as i64), pc);
+        Ok(())
+    }
+
+    fn visit_const_list_string(
+        &mut self,
+        _idx: u32,
+        elements: &[String],
+    ) -> Result<(), BcCompileError> {
+        let pc = self.current_pc;
+        self.emit_with_effect(BcOp::ConstI64(elements.len() as i64), pc);
+        Ok(())
+    }
+
+    fn visit_local_get(&mut self, idx: u32) -> Result<(), BcCompileError> {
+        let pc = self.current_pc;
+        self.emit_with_effect(BcOp::LocalGet(idx), pc);
+        Ok(())
+    }
+
+    fn visit_let_get(&mut self, idx: u32, _ty: IrType) -> Result<(), BcCompileError> {
+        // Let-locals sit past the buffer-protocol arg slots. The
+        // buffer-protocol layout reserves the first
+        // `main_schema.fields.len()` virtual slots for inputs and the
+        // return-schema field slots after that; let locals come
+        // **on top of** those reserved slots so they don't collide.
+        let pc = self.current_pc;
+        let base = self.input_arg_count() + self.return_field_count();
+        self.emit_with_effect(BcOp::LocalGet(base + idx), pc);
+        Ok(())
+    }
+
+    fn visit_let_set(&mut self, idx: u32, _ty: IrType) -> Result<(), BcCompileError> {
+        let pc = self.current_pc;
+        let base = self.input_arg_count() + self.return_field_count();
+        self.emit_with_effect(BcOp::LocalSet(base + idx), pc);
+        Ok(())
+    }
+
+    fn visit_load_field(&mut self, offset: u32, _ty: IrType) -> Result<(), BcCompileError> {
+        let pc = self.current_pc;
+        let slot = self
+            .field_offset_to_local
+            .get(&offset)
+            .copied()
+            .ok_or(BcCompileError::UnknownFieldOffset { offset })?;
+        self.emit_with_effect(BcOp::LocalGet(slot), pc);
+        Ok(())
+    }
+
+    fn visit_store_field(&mut self, offset: u32, _ty: IrType) -> Result<(), BcCompileError> {
+        // Map onto a return-field virtual slot, positioned **after**
+        // the input arg slots so the evaluator can read them back as
+        // `locals[input_args + i]`.
+        let pc = self.current_pc;
+        let return_slot = self
+            .return_field_offset_to_local
+            .get(&offset)
+            .copied()
+            .ok_or(BcCompileError::UnknownFieldOffset { offset })?;
+        let slot = self.input_arg_count() + return_slot;
+        self.emit_with_effect(BcOp::LocalSet(slot), pc);
+        Ok(())
+    }
+
+    fn visit_dict_get_by_string_key(
+        &mut self,
+        _shape_hash: u64,
+        _value_ty: IrType,
+        _entry_count_hint: Option<u32>,
+    ) -> Result<(), BcCompileError> {
+        unsupported("DictGetByStringKey")
+    }
+
+    fn visit_list_get_by_int_idx(&mut self, _ty: IrType) -> Result<(), BcCompileError> {
+        unsupported("ListGetByIntIdx")
+    }
+
+    // F-D7-D: `Op::Add(IrType::String)` (source-side `s + t` lowering)
+    // needs a record-aware concat — outside the bytecode VM's M2-A
+    // scalar envelope. Bounce so the four-way harness routes the
+    // source through `BytecodeUnsupported`. Sub / Mul / etc. with
+    // String never escape the analyzer; the explicit check here is
+    // belt-and-braces.
+    fn visit_add(&mut self, ty: IrType) -> Result<(), BcCompileError> {
+        if ty == IrType::String {
+            return Err(BcCompileError::UnsupportedOp(
+                "Op::Add(IrType::String) — string concat is outside the bytecode VM's scalar envelope"
+                    .to_string(),
+            ));
+        }
+        let pc = self.current_pc;
+        self.emit_with_effect(BcOp::Add(ty), pc);
+        Ok(())
+    }
+
+    fn visit_sub(&mut self, ty: IrType) -> Result<(), BcCompileError> {
+        let pc = self.current_pc;
+        self.emit_with_effect(BcOp::Sub(ty), pc);
+        Ok(())
+    }
+
+    fn visit_mul(&mut self, ty: IrType) -> Result<(), BcCompileError> {
+        let pc = self.current_pc;
+        self.emit_with_effect(BcOp::Mul(ty), pc);
+        Ok(())
+    }
+
+    fn visit_div(&mut self, ty: IrType) -> Result<(), BcCompileError> {
+        let pc = self.current_pc;
+        self.emit_with_effect(BcOp::Div(ty), pc);
+        Ok(())
+    }
+
+    fn visit_mod_(&mut self, ty: IrType) -> Result<(), BcCompileError> {
+        let pc = self.current_pc;
+        self.emit_with_effect(BcOp::Mod(ty), pc);
+        Ok(())
+    }
+
+    fn visit_bit_and(&mut self, _ty: IrType) -> Result<(), BcCompileError> {
+        unsupported("BitAnd")
+    }
+
+    fn visit_eq(&mut self, ty: IrType) -> Result<(), BcCompileError> {
+        let pc = self.current_pc;
+        self.emit_with_effect(BcOp::Eq(ty), pc);
+        Ok(())
+    }
+
+    fn visit_ne(&mut self, ty: IrType) -> Result<(), BcCompileError> {
+        let pc = self.current_pc;
+        self.emit_with_effect(BcOp::Ne(ty), pc);
+        Ok(())
+    }
+
+    fn visit_lt(&mut self, ty: IrType) -> Result<(), BcCompileError> {
+        let pc = self.current_pc;
+        self.emit_with_effect(BcOp::Lt(ty), pc);
+        Ok(())
+    }
+
+    fn visit_le(&mut self, ty: IrType) -> Result<(), BcCompileError> {
+        let pc = self.current_pc;
+        self.emit_with_effect(BcOp::Le(ty), pc);
+        Ok(())
+    }
+
+    fn visit_gt(&mut self, ty: IrType) -> Result<(), BcCompileError> {
+        let pc = self.current_pc;
+        self.emit_with_effect(BcOp::Gt(ty), pc);
+        Ok(())
+    }
+
+    fn visit_ge(&mut self, ty: IrType) -> Result<(), BcCompileError> {
+        let pc = self.current_pc;
+        self.emit_with_effect(BcOp::Ge(ty), pc);
+        Ok(())
+    }
+
+    fn visit_if(
+        &mut self,
+        result_ty: IrType,
+        then_body: &[TaggedOp],
+        else_body: &[TaggedOp],
+    ) -> Result<(), BcCompileError> {
+        let pc = self.current_pc;
+        self.compile_if(result_ty, then_body, else_body, pc)
+    }
+
+    fn visit_block(
+        &mut self,
+        _result_ty: Option<IrType>,
+        body: &[TaggedOp],
+    ) -> Result<(), BcCompileError> {
+        self.compile_block(body)
+    }
+
+    fn visit_loop_(
+        &mut self,
+        _result_ty: Option<IrType>,
+        body: &[TaggedOp],
+    ) -> Result<(), BcCompileError> {
+        self.compile_loop(body)
+    }
+
+    fn visit_br(&mut self, label_depth: u32) -> Result<(), BcCompileError> {
+        self.compile_br(label_depth, /*conditional=*/ false)
+    }
+
+    fn visit_br_if(&mut self, label_depth: u32) -> Result<(), BcCompileError> {
+        self.compile_br(label_depth, /*conditional=*/ true)
+    }
+
+    fn visit_br_table(&mut self, _default: u32, _targets: &[u32]) -> Result<(), BcCompileError> {
+        unsupported("BrTable")
+    }
+
+    fn visit_return(&mut self) -> Result<(), BcCompileError> {
+        let pc = self.current_pc;
+        self.emit_with_effect(BcOp::Return, pc);
+        Ok(())
+    }
+
+    // v6-δ M2-B: `Op::Select` is the wasm-typed-select primitive
+    // (`[val_true, val_false, cond] -> [chosen]`). Lower it through
+    // the if/else scratch-local helper.
+    fn visit_select(&mut self, _ty: IrType) -> Result<(), BcCompileError> {
+        let pc = self.current_pc;
+        self.compile_select(pc)
+    }
+
+    fn visit_trap(&mut self, kind: TrapKind) -> Result<(), BcCompileError> {
+        let pc = self.current_pc;
+        let bc_kind = match kind {
+            TrapKind::IndexOutOfBounds => BcTrapKind::IndexOutOfBounds,
+            TrapKind::EmptyList => BcTrapKind::EmptyList,
+            TrapKind::InvalidUtf8 => BcTrapKind::InvalidUtf8,
+        };
+        self.emit_with_effect(BcOp::Trap(bc_kind), pc);
+        Ok(())
+    }
+
+    fn visit_load_string_ptr(&mut self, _offset: u32) -> Result<(), BcCompileError> {
+        unsupported("LoadStringPtr")
+    }
+
+    fn visit_load_list_int_ptr(&mut self, _offset: u32) -> Result<(), BcCompileError> {
+        unsupported("LoadListIntPtr")
+    }
+
+    fn visit_load_list_float_ptr(&mut self, _offset: u32) -> Result<(), BcCompileError> {
+        unsupported("LoadListFloatPtr")
+    }
+
+    fn visit_load_list_bool_ptr(&mut self, _offset: u32) -> Result<(), BcCompileError> {
+        unsupported("LoadListBoolPtr")
+    }
+
+    fn visit_load_list_string_ptr(&mut self, _offset: u32) -> Result<(), BcCompileError> {
+        unsupported("LoadListStringPtr")
+    }
+
+    fn visit_load_list_schema_ptr(&mut self, _offset: u32) -> Result<(), BcCompileError> {
+        unsupported("LoadListSchemaPtr")
+    }
+
+    fn visit_load_schema_ptr(&mut self, _offset: u32) -> Result<(), BcCompileError> {
+        unsupported("LoadSchemaPtr")
+    }
+
+    fn visit_load_field_at_absolute(
+        &mut self,
+        _offset: u32,
+        _ty: IrType,
+    ) -> Result<(), BcCompileError> {
+        unsupported("LoadFieldAtAbsolute")
+    }
+
+    fn visit_read_string_len(&mut self) -> Result<(), BcCompileError> {
+        // No-op — see the `visit_const_string` comment: the
+        // M2-B widening replaces the record pointer with its
+        // pre-computed length, so the companion `ReadStringLen` has
+        // nothing to do.
+        Ok(())
+    }
+
+    // v6-δ M2-B: `AllocRootRecord` / `AllocSubRecord` / `PushRecordBase`
+    // are buffer-protocol-only ops — they allocate / address slots in
+    // the wasm / cranelift output buffer. The bytecode VM uses
+    // virtual locals (no actual buffer), so these ops are no-ops in
+    // our envelope: emit no bytecode, leave the abstract stack
+    // unchanged, but consume the per-op PC (already done by
+    // `compile_one`'s `next_pc` bump).
+    fn visit_alloc_root_record(&mut self, _idx: u32) -> Result<(), BcCompileError> {
+        Ok(())
+    }
+
+    fn visit_alloc_sub_record(
+        &mut self,
+        _idx: u32,
+        _size: u32,
+        _align: u32,
+    ) -> Result<(), BcCompileError> {
+        Ok(())
+    }
+
+    fn visit_store_field_at_record(
+        &mut self,
+        _record_local_idx: u32,
+        offset: u32,
+        _ty: IrType,
+    ) -> Result<(), BcCompileError> {
+        // Pop the operand value into the matching return-field
+        // virtual slot. The `record_local_idx` is part of the buffer-
+        // protocol bookkeeping (lets the wasm codegen address fields
+        // relative to the record's base offset); in the bytecode VM
+        // we collapse the base-relative offset to a flat virtual slot
+        // via the return-schema offset table.
+        let pc = self.current_pc;
+        let return_slot = self
+            .return_field_offset_to_local
+            .get(&offset)
+            .copied()
+            .ok_or(BcCompileError::UnknownFieldOffset { offset })?;
+        let slot = self.input_arg_count() + return_slot;
+        self.emit_with_effect(BcOp::LocalSet(slot), pc);
+        Ok(())
+    }
+
+    fn visit_push_record_base(&mut self, _idx: u32) -> Result<(), BcCompileError> {
+        Ok(())
+    }
+
+    fn visit_emit_tail_record_from_absolute_addr(
+        &mut self,
+        _ty: IrType,
+    ) -> Result<(), BcCompileError> {
+        unsupported("EmitTailRecordFromAbsoluteAddr")
+    }
+
+    fn visit_call(
+        &mut self,
+        fn_index: u32,
+        arg_count: u32,
+        _param_tys: &[IrType],
+        _ret_ty: IrType,
+    ) -> Result<(), BcCompileError> {
+        let pc = self.current_pc;
+        self.compile_inline_call(fn_index, arg_count, pc)
+    }
+
+    fn visit_call_native(
+        &mut self,
+        _import_idx: u32,
+        _param_tys: &[IrType],
+        _ret_ty: IrType,
+        _cap_bit: u32,
+    ) -> Result<(), BcCompileError> {
+        unsupported("CallNative")
+    }
+
+    fn visit_check_cap(&mut self, _cap_bit: u32) -> Result<(), BcCompileError> {
+        unsupported("CheckCap")
+    }
+
+    fn visit_make_closure(
+        &mut self,
+        _fn_table_idx: u32,
+        _captures: &[ClosureCapture],
+        _captures_size: u32,
+    ) -> Result<(), BcCompileError> {
+        unsupported("MakeClosure")
+    }
+
+    fn visit_call_closure(
+        &mut self,
+        _param_tys: &[IrType],
+        _ret_ty: IrType,
+    ) -> Result<(), BcCompileError> {
+        unsupported("CallClosure")
+    }
+
+    fn visit_alloc_scratch(&mut self, _size_bytes: u32) -> Result<(), BcCompileError> {
+        unsupported("AllocScratch")
+    }
+
+    fn visit_alloc_scratch_dyn(&mut self) -> Result<(), BcCompileError> {
+        unsupported("AllocScratchDyn")
+    }
+
+    fn visit_load_i32_at_absolute(&mut self, _offset: u32) -> Result<(), BcCompileError> {
+        unsupported("LoadI32AtAbsolute")
+    }
+
+    fn visit_load_i64_at_absolute(&mut self, _offset: u32) -> Result<(), BcCompileError> {
+        unsupported("LoadI64AtAbsolute")
+    }
+
+    fn visit_load_i8u_at_absolute(&mut self, _offset: u32) -> Result<(), BcCompileError> {
+        unsupported("LoadI8UAtAbsolute")
+    }
+
+    fn visit_load_f64_at_absolute(&mut self, _offset: u32) -> Result<(), BcCompileError> {
+        unsupported("LoadF64AtAbsolute")
+    }
+
+    fn visit_store_i32_at_absolute(&mut self, _offset: u32) -> Result<(), BcCompileError> {
+        unsupported("StoreI32AtAbsolute")
+    }
+
+    fn visit_store_i64_at_absolute(&mut self, _offset: u32) -> Result<(), BcCompileError> {
+        unsupported("StoreI64AtAbsolute")
+    }
+
+    fn visit_store_i8_at_absolute(&mut self, _offset: u32) -> Result<(), BcCompileError> {
+        unsupported("StoreI8AtAbsolute")
+    }
+
+    fn visit_store_f64_at_absolute(&mut self, _offset: u32) -> Result<(), BcCompileError> {
+        unsupported("StoreF64AtAbsolute")
+    }
+
+    fn visit_memcpy_at_absolute(&mut self) -> Result<(), BcCompileError> {
+        unsupported("MemcpyAtAbsolute")
+    }
+
+    fn visit_case_fold_table_addr(&mut self, _upper: bool) -> Result<(), BcCompileError> {
+        unsupported("CaseFoldTableAddr")
+    }
+
+    fn visit_combining_mark_ranges_addr(&mut self) -> Result<(), BcCompileError> {
+        unsupported("CombiningMarkRangesAddr")
+    }
+
+    fn visit_whitespace_ranges_addr(&mut self) -> Result<(), BcCompileError> {
+        unsupported("WhitespaceRangesAddr")
+    }
+
+    fn visit_decomp_table_addr(&mut self, _compatibility: bool) -> Result<(), BcCompileError> {
+        unsupported("DecompTableAddr")
+    }
+
+    fn visit_ccc_table_addr(&mut self) -> Result<(), BcCompileError> {
+        unsupported("CccTableAddr")
+    }
+
+    fn visit_composition_table_addr(&mut self) -> Result<(), BcCompileError> {
+        unsupported("CompositionTableAddr")
+    }
+
+    fn visit_full_case_fold_table_addr(&mut self, _upper: bool) -> Result<(), BcCompileError> {
+        unsupported("FullCaseFoldTableAddr")
+    }
+
+    fn visit_cased_ranges_addr(&mut self) -> Result<(), BcCompileError> {
+        unsupported("CasedRangesAddr")
+    }
+
+    fn visit_case_ignorable_ranges_addr(&mut self) -> Result<(), BcCompileError> {
+        unsupported("CaseIgnorableRangesAddr")
+    }
+
+    fn visit_turkish_case_fold_table_addr(&mut self, _upper: bool) -> Result<(), BcCompileError> {
+        unsupported("TurkishCaseFoldTableAddr")
     }
 }
 

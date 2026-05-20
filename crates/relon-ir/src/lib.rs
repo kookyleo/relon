@@ -33,6 +33,7 @@ pub mod ir;
 pub mod lowering;
 pub mod normalization;
 pub mod normalization_data;
+pub mod op_visitor;
 pub mod shape_hash;
 pub mod stdlib;
 pub mod whitespace;
@@ -47,6 +48,7 @@ pub use lowering::{
     MAIN_RETURN_SCHEMA_NAME, RETURN_VALUE_FIELD_NAME, WASM_LOCAL_CAPS_ARG, WASM_LOCAL_IN_LEN,
     WASM_LOCAL_IN_PTR, WASM_LOCAL_OUT_CAP, WASM_LOCAL_OUT_PTR,
 };
+pub use op_visitor::{walk_body, walk_op, OpVisitor};
 pub use stdlib::{
     builtin_stdlib, stdlib_closure_arg_signature, stdlib_function_count, stdlib_function_index,
     stdlib_method_index, StdlibFunction,
