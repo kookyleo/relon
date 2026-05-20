@@ -317,6 +317,13 @@ pub fn builtin_stdlib() -> Vec<StdlibFunction> {
         // shared by every (locale-aware or default) case-fold body.
         full_casefold_lookup_helper(),
         final_sigma_check_helper(),
+        // F-D7-D (2026-05-20): `contains(haystack, needle) -> Bool`.
+        // Lives at index 36 — the slot the trace recorder pins via
+        // [`relon_trace_recorder::lowering::STDLIB_IDX_CONTAINS`].
+        // Body is naive O(s_len * p_len); the JIT side has the F-D7-C
+        // inline lowering for short const needles, so the body cost is
+        // only seen on the cold / tree-walk path.
+        contains_string(),
     ]
 }
 
@@ -5973,6 +5980,13 @@ pub fn stdlib_method_index(receiver_ty: IrType, name: &str) -> Option<u32> {
         (IrType::String, "title_locale") => stdlib_function_index("title_locale"),
         (IrType::String, "substring") => stdlib_function_index("substring"),
         (IrType::String, "starts_with") => stdlib_function_index("starts_with"),
+        // F-D7-D: `s.contains(needle)` and the free-call form
+        // `contains(s, needle)` both resolve to the same body. The
+        // trace recorder short-circuits the call onto
+        // `TraceOp::StrContains` via `STDLIB_IDX_CONTAINS = 36`; the
+        // tree-walk path stays in `Value`-space (see
+        // `relon_evaluator::stdlib::call_method`).
+        (IrType::String, "contains") => stdlib_function_index("contains"),
         (IrType::ListInt, "sum") => stdlib_function_index("list_int_sum"),
         (IrType::ListInt, "max") => stdlib_function_index("list_int_max"),
         // Phase 10-a higher-order List<Int> methods. Dispatch covers
@@ -6410,6 +6424,262 @@ fn starts_with_string() -> StdlibFunction {
                     }),
                     tt(Op::ConstI32(0)),
                     tt(Op::Ne(IrType::I32)),
+                ],
+            }),
+            tt(Op::Return),
+        ],
+    }
+}
+
+/// F-D7-D body for `contains(haystack: String, needle: String) -> Bool`.
+///
+/// Algorithm: naive O(s_len * p_len) substring scan. Mirrors the
+/// pre-existing `__relon_str_contains` host shim (and the F-D7-C
+/// inline lowering on the trace-JIT side) so the IR-level path stays
+/// compatible with the trace recorder's `TraceOp::StrContains`
+/// short-circuit (`STDLIB_IDX_CONTAINS = 36`).
+///
+/// 1. Load `s_len` / `p_len` from the records' `[len: u32 LE]` headers.
+/// 2. `p_len > s_len` → return `false` (needle too long).
+/// 3. `p_len == 0`     → return `true`  (empty needle).
+/// 4. Otherwise scan `i ∈ [0 .. s_len - p_len]` and compare the
+///    `p_len`-byte window byte-by-byte. Found ≥ 1 match → return `true`,
+///    else `false`.
+///
+/// Locals (indices into the let-area):
+///   * 0 — `s_len:      I32`
+///   * 1 — `p_len:      I32`
+///   * 2 — `last_start: I32` (= `s_len - p_len`, only valid in the scan arm)
+///   * 3 — `i:          I32` (outer scan position)
+///   * 4 — `j:          I32` (inner compare cursor)
+///   * 5 — `mismatch:   I32` (1 = mismatch hit inside inner loop)
+///   * 6 — `found:      I32` (1 = full window matched; outer-exit flag)
+///
+/// Returned `Bool` is encoded as `i32` (0 / 1), matching every other
+/// `Bool`-returning stdlib body.
+fn contains_string() -> StdlibFunction {
+    const S_LEN: u32 = 0;
+    const P_LEN: u32 = 1;
+    const LAST_START: u32 = 2;
+    const I: u32 = 3;
+    const J: u32 = 4;
+    const MISMATCH: u32 = 5;
+    const FOUND: u32 = 6;
+    StdlibFunction {
+        name: "contains",
+        params: vec![IrType::String, IrType::String],
+        ret: IrType::Bool,
+        body: vec![
+            // s_len = load_i32(s, 0)
+            tt(Op::LocalGet(0)),
+            tt(Op::LoadI32AtAbsolute { offset: 0 }),
+            tt(Op::LetSet {
+                idx: S_LEN,
+                ty: IrType::I32,
+            }),
+            // p_len = load_i32(p, 0)
+            tt(Op::LocalGet(1)),
+            tt(Op::LoadI32AtAbsolute { offset: 0 }),
+            tt(Op::LetSet {
+                idx: P_LEN,
+                ty: IrType::I32,
+            }),
+            // if p_len > s_len { return false }
+            tt(Op::LetGet {
+                idx: P_LEN,
+                ty: IrType::I32,
+            }),
+            tt(Op::LetGet {
+                idx: S_LEN,
+                ty: IrType::I32,
+            }),
+            tt(Op::Gt(IrType::I32)),
+            tt(Op::If {
+                result_ty: IrType::Bool,
+                then_body: vec![tt(Op::ConstBool(false))],
+                else_body: vec![
+                    // if p_len == 0 { return true }
+                    tt(Op::LetGet {
+                        idx: P_LEN,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::ConstI32(0)),
+                    tt(Op::Eq(IrType::I32)),
+                    tt(Op::If {
+                        result_ty: IrType::Bool,
+                        then_body: vec![tt(Op::ConstBool(true))],
+                        else_body: vec![
+                            // last_start = s_len - p_len
+                            tt(Op::LetGet {
+                                idx: S_LEN,
+                                ty: IrType::I32,
+                            }),
+                            tt(Op::LetGet {
+                                idx: P_LEN,
+                                ty: IrType::I32,
+                            }),
+                            tt(Op::Sub(IrType::I32)),
+                            tt(Op::LetSet {
+                                idx: LAST_START,
+                                ty: IrType::I32,
+                            }),
+                            // i = 0; found = 0
+                            tt(Op::ConstI32(0)),
+                            tt(Op::LetSet {
+                                idx: I,
+                                ty: IrType::I32,
+                            }),
+                            tt(Op::ConstI32(0)),
+                            tt(Op::LetSet {
+                                idx: FOUND,
+                                ty: IrType::I32,
+                            }),
+                            // outer scan
+                            tt(Op::Block {
+                                result_ty: None,
+                                body: vec![tt(Op::Loop {
+                                    result_ty: None,
+                                    body: vec![
+                                        // found != 0 ? br 1  (already matched)
+                                        tt(Op::LetGet {
+                                            idx: FOUND,
+                                            ty: IrType::I32,
+                                        }),
+                                        tt(Op::ConstI32(0)),
+                                        tt(Op::Ne(IrType::I32)),
+                                        tt(Op::BrIf { label_depth: 1 }),
+                                        // i > last_start ? br 1
+                                        tt(Op::LetGet {
+                                            idx: I,
+                                            ty: IrType::I32,
+                                        }),
+                                        tt(Op::LetGet {
+                                            idx: LAST_START,
+                                            ty: IrType::I32,
+                                        }),
+                                        tt(Op::Gt(IrType::I32)),
+                                        tt(Op::BrIf { label_depth: 1 }),
+                                        // j = 0; mismatch = 0
+                                        tt(Op::ConstI32(0)),
+                                        tt(Op::LetSet {
+                                            idx: J,
+                                            ty: IrType::I32,
+                                        }),
+                                        tt(Op::ConstI32(0)),
+                                        tt(Op::LetSet {
+                                            idx: MISMATCH,
+                                            ty: IrType::I32,
+                                        }),
+                                        // inner compare loop: increment j until
+                                        // either the window is fully matched
+                                        // (`j == p_len` → exit with mismatch=0)
+                                        // or a byte differs (mismatch=1).
+                                        tt(Op::Block {
+                                            result_ty: None,
+                                            body: vec![tt(Op::Loop {
+                                                result_ty: None,
+                                                body: vec![
+                                                    // j >= p_len ? br 1 (window fully matched
+                                                    // — leave mismatch as-is, which is 0)
+                                                    tt(Op::LetGet {
+                                                        idx: J,
+                                                        ty: IrType::I32,
+                                                    }),
+                                                    tt(Op::LetGet {
+                                                        idx: P_LEN,
+                                                        ty: IrType::I32,
+                                                    }),
+                                                    tt(Op::Ge(IrType::I32)),
+                                                    tt(Op::BrIf { label_depth: 1 }),
+                                                    // sb = load_i8(s + 4 + i + j)
+                                                    tt(Op::LocalGet(0)),
+                                                    tt(Op::ConstI32(4)),
+                                                    tt(Op::Add(IrType::I32)),
+                                                    tt(Op::LetGet {
+                                                        idx: I,
+                                                        ty: IrType::I32,
+                                                    }),
+                                                    tt(Op::Add(IrType::I32)),
+                                                    tt(Op::LetGet {
+                                                        idx: J,
+                                                        ty: IrType::I32,
+                                                    }),
+                                                    tt(Op::Add(IrType::I32)),
+                                                    tt(Op::LoadI8UAtAbsolute { offset: 0 }),
+                                                    // pb = load_i8(p + 4 + j)
+                                                    tt(Op::LocalGet(1)),
+                                                    tt(Op::ConstI32(4)),
+                                                    tt(Op::Add(IrType::I32)),
+                                                    tt(Op::LetGet {
+                                                        idx: J,
+                                                        ty: IrType::I32,
+                                                    }),
+                                                    tt(Op::Add(IrType::I32)),
+                                                    tt(Op::LoadI8UAtAbsolute { offset: 0 }),
+                                                    // mismatch = (sb != pb)   (0 / 1)
+                                                    tt(Op::Ne(IrType::I32)),
+                                                    tt(Op::LetSet {
+                                                        idx: MISMATCH,
+                                                        ty: IrType::I32,
+                                                    }),
+                                                    // mismatch != 0 ? br 1
+                                                    tt(Op::LetGet {
+                                                        idx: MISMATCH,
+                                                        ty: IrType::I32,
+                                                    }),
+                                                    tt(Op::ConstI32(0)),
+                                                    tt(Op::Ne(IrType::I32)),
+                                                    tt(Op::BrIf { label_depth: 1 }),
+                                                    // j = j + 1
+                                                    tt(Op::LetGet {
+                                                        idx: J,
+                                                        ty: IrType::I32,
+                                                    }),
+                                                    tt(Op::ConstI32(1)),
+                                                    tt(Op::Add(IrType::I32)),
+                                                    tt(Op::LetSet {
+                                                        idx: J,
+                                                        ty: IrType::I32,
+                                                    }),
+                                                    tt(Op::Br { label_depth: 0 }),
+                                                ],
+                                            })],
+                                        }),
+                                        // After inner: found = (mismatch == 0)
+                                        tt(Op::LetGet {
+                                            idx: MISMATCH,
+                                            ty: IrType::I32,
+                                        }),
+                                        tt(Op::ConstI32(0)),
+                                        tt(Op::Eq(IrType::I32)),
+                                        tt(Op::LetSet {
+                                            idx: FOUND,
+                                            ty: IrType::I32,
+                                        }),
+                                        // i = i + 1
+                                        tt(Op::LetGet {
+                                            idx: I,
+                                            ty: IrType::I32,
+                                        }),
+                                        tt(Op::ConstI32(1)),
+                                        tt(Op::Add(IrType::I32)),
+                                        tt(Op::LetSet {
+                                            idx: I,
+                                            ty: IrType::I32,
+                                        }),
+                                        tt(Op::Br { label_depth: 0 }),
+                                    ],
+                                })],
+                            }),
+                            // result = found != 0
+                            tt(Op::LetGet {
+                                idx: FOUND,
+                                ty: IrType::I32,
+                            }),
+                            tt(Op::ConstI32(0)),
+                            tt(Op::Ne(IrType::I32)),
+                        ],
+                    }),
                 ],
             }),
             tt(Op::Return),
@@ -8320,5 +8590,31 @@ mod b6_b7_index_tests {
             Some(FINAL_SIGMA_CHECK_INDEX)
         );
         assert_eq!(stdlib_function_index("__final_sigma_check"), Some(35));
+    }
+}
+
+#[cfg(test)]
+mod d7d_index_tests {
+    use super::*;
+
+    /// F-D7-D: `contains(String, String) -> Bool` lands at slot 36 —
+    /// the slot the trace recorder pins via
+    /// [`relon_trace_recorder::lowering::STDLIB_IDX_CONTAINS`]. Any
+    /// reordering that drifts the slot would either silently route a
+    /// different op through `TraceOp::StrContains` or break the
+    /// recorder's drift guard. The `stdlib_index_consistency` test in
+    /// `relon-trace-recorder` cross-checks this against the recorder's
+    /// hardcoded constant.
+    #[test]
+    fn contains_index_is_36() {
+        assert_eq!(stdlib_function_index("contains"), Some(36));
+    }
+
+    /// F-D7-D: method-form dispatch `s.contains(needle)` resolves to
+    /// the same slot as the free-call form `contains(s, needle)`.
+    #[test]
+    fn contains_method_dispatch_resolves() {
+        let idx = stdlib_function_index("contains").expect("contains stdlib slot");
+        assert_eq!(stdlib_method_index(IrType::String, "contains"), Some(idx));
     }
 }

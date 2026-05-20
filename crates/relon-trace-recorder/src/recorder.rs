@@ -321,6 +321,21 @@ impl RecorderState {
         &self.buffer
     }
 
+    /// F-D7-D: record a const-byte side-table entry for `var`. The
+    /// trace emitter's `emit_str_contains` consults
+    /// [`TraceBuffer::const_bytes_for`] to decide between the F-D7-C
+    /// inline byte-scan lowering and the extern `__relon_str_contains`
+    /// shim — pre-filling the side table from a const-needle observed
+    /// at recording time keeps the trace on the inline fast path.
+    ///
+    /// The walker calls this after a successful `record_op` for an
+    /// `Op::Call { fn_index = STDLIB_IDX_CONTAINS }` whose needle
+    /// argument carries a host-side pointer the walker can safely
+    /// dereference (`*const StringRef`).
+    pub fn record_const_bytes(&mut self, var: SsaVar, bytes: Vec<u8>) {
+        self.buffer.record_const_bytes(var, bytes);
+    }
+
     /// Force an abort. Idempotent; the first reason wins so a
     /// downstream `UnsupportedOp` cannot mask an earlier
     /// `UnrecoverableEffect`.
@@ -803,7 +818,16 @@ impl RecorderState {
                     // with `fresh_dst` so subsequent reads alias the
                     // same SSA id.
                     self.ir_to_ssa.insert(kind, fresh_dst);
-                    self.type_obs.insert(fresh_dst, ty_hint);
+                    // F-D7-D: the walker can pass a more accurate
+                    // `observed` than the lowering's `ty_hint` (the
+                    // hint hard-codes `I32` for `LocalGet` because the
+                    // pre-F-D7-D recorder never saw a non-i32 entry
+                    // arg). When the walker knows the real
+                    // `IrType` — e.g. `String` for a host-pointer arg
+                    // riding through `TraceRecordingEvaluator::args` —
+                    // we prefer that observation so the type-guard
+                    // policy doesn't trip on a stale `I32` seed.
+                    self.type_obs.insert(fresh_dst, observed.unwrap_or(ty_hint));
                     (fresh_dst, true)
                 };
                 // Lookup pushes one value onto the operand stack.

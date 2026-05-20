@@ -1647,6 +1647,7 @@ dependencies = [
  "relon-trace-abi",
  "relon-trace-emitter",
  "relon-trace-jit",
+ "relon-trace-recorder",
  "serde",
  "serde_json",
  "tempfile",
@@ -1772,6 +1773,7 @@ dependencies = [
  "relon-analyzer",
  "relon-eval-api",
  "relon-parser",
+ "relon-trace-abi",
  "thiserror",
 ]
 

@@ -210,7 +210,19 @@ fn is_hoistable(op: &TraceOp) -> bool {
             // Even pure: Return is not movable; it ends the trace.
             !matches!(op, TraceOp::Return(_))
         }
-        EffectClass::ReadOnly | EffectClass::RecoverableWrite | EffectClass::Unrecoverable => false,
+        // F-D7-D: `TraceOp::LocalGet` reads an immutable arg slot.
+        // The recorder may emit it inside the loop body when the
+        // first observation lands there (e.g. the loop-bound `n`
+        // arg, the loop-invariant haystack / needle ptrs in
+        // `s.contains(...)` patterns). Treat it as hoistable so the
+        // trace doesn't re-read `args_ptr[slot * 8]` every iter — the
+        // cranelift backend would constant-propagate anyway but we
+        // also want the dependent `StrContains` / `StrConcat` to see
+        // its haystack input as a hoistable SSA defined OUTSIDE the
+        // loop body, which only happens once LICM moves the
+        // `LocalGet` itself.
+        EffectClass::ReadOnly => matches!(op, TraceOp::LocalGet(_, _)),
+        EffectClass::RecoverableWrite | EffectClass::Unrecoverable => false,
     }
 }
 
