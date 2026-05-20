@@ -641,8 +641,34 @@ impl<'a> TraceRecordingEvaluator<'a> {
                 rhs.value as *const relon_trace_jit::runtime::StringRef,
             )
         } as u64;
+        // F-D7-I: snapshot the rhs payload bytes for the const-byte
+        // side table so the emitter's inline-rhs `StrConcat` lowering
+        // can specialise the trace into an alloc+inline-stores shape
+        // (skipping the UTF-8 validation and `String` churn in
+        // `__relon_str_concat`). The W3 hot loop's `acc + lit_a`
+        // pattern lives entirely on this path — `lit_a` rides through
+        // `LocalGet(1)` as a loop-invariant `*const StringRef` so its
+        // bytes are stable across iterations and safe to bake into
+        // the const-byte table.
+        let rhs_const_bytes: Option<Vec<u8>> = {
+            let rhs_ptr = rhs.value as *const relon_trace_jit::runtime::StringRef;
+            if !rhs_ptr.is_null() {
+                let r = unsafe { &*rhs_ptr };
+                if !r.ptr.is_null() {
+                    Some(unsafe { std::slice::from_raw_parts(r.ptr, r.len).to_vec() })
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
         let observed = ObservedType::Ptr;
-        match self.recorder.record_op(op, &inputs, Some(observed)) {
+        let outcome = self.recorder.record_op(op, &inputs, Some(observed));
+        if let Some(bytes) = rhs_const_bytes {
+            self.recorder.record_const_bytes(rhs.ssa, bytes);
+        }
+        match outcome {
             RecordResult::Ok { value: Some(ssa) }
             | RecordResult::NeedsGuard {
                 value: Some(ssa), ..
@@ -695,6 +721,11 @@ impl<'a> TraceRecordingEvaluator<'a> {
         // recorder side stores the side-table entry against the needle
         // SSA via `record_const_bytes` (see `RecorderState`).
         let mut contains_needle_bytes: Option<(SsaVar, Vec<u8>)> = None;
+        // F-D7-I: same capture for the const rhs of `concat(lhs, rhs)`
+        // — populates the side table the emitter's inline `StrConcat`
+        // short-rhs lowering reads back via
+        // `OptimizedTrace::const_bytes_for`.
+        let mut concat_rhs_bytes: Option<(SsaVar, Vec<u8>)> = None;
         let recording_value: u64 = match fn_index {
             // STDLIB_IDX_CONCAT (= 6): `concat(lhs, rhs)`. Operand
             // order on entry: lhs pushed first, rhs pushed last.
@@ -702,6 +733,18 @@ impl<'a> TraceRecordingEvaluator<'a> {
             x if x == relon_trace_recorder::lowering::STDLIB_IDX_CONCAT && n == 2 => {
                 let rhs = popped[0].value as *const relon_trace_jit::runtime::StringRef;
                 let lhs = popped[1].value as *const relon_trace_jit::runtime::StringRef;
+                // Snapshot the rhs bytes so the emitter's inline
+                // `StrConcat` short-rhs lowering can specialise. The
+                // recorder writes the side-table entry only after the
+                // matching `record_op` succeeds — see below.
+                if !rhs.is_null() {
+                    let r = unsafe { &*rhs };
+                    if !r.ptr.is_null() {
+                        let bytes: Vec<u8> =
+                            unsafe { std::slice::from_raw_parts(r.ptr, r.len).to_vec() };
+                        concat_rhs_bytes = Some((popped[0].ssa, bytes));
+                    }
+                }
                 unsafe { relon_trace_jit::runtime::__relon_str_concat(lhs, rhs) as u64 }
             }
             // STDLIB_IDX_CONTAINS (= 36): `contains(haystack, needle)`.
@@ -734,6 +777,9 @@ impl<'a> TraceRecordingEvaluator<'a> {
         let outcome = self.recorder.record_op(op, &inputs, Some(observed_ty));
         if let Some((needle_ssa, bytes)) = contains_needle_bytes {
             self.recorder.record_const_bytes(needle_ssa, bytes);
+        }
+        if let Some((rhs_ssa, bytes)) = concat_rhs_bytes {
+            self.recorder.record_const_bytes(rhs_ssa, bytes);
         }
         match outcome {
             RecordResult::Ok { value: Some(ssa) }

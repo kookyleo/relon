@@ -68,6 +68,13 @@ pub struct HostHookFuncIds {
     pub str_contains: u32,
     pub str_find: u32,
     pub str_substring: u32,
+    /// F-D7-I: cranelift `FuncId.as_u32()` for
+    /// `__relon_str_concat_alloc`. `None` means the host did not
+    /// declare the helper — the emitter's inline `StrConcat` path will
+    /// silently fall back to the extern `__relon_str_concat` shim,
+    /// preserving correctness for hosts wired against the pre-F-D7-I
+    /// ABI. Hosts that want the inline fast path MUST set this.
+    pub str_concat_alloc: Option<u32>,
     /// F-D8: cranelift `FuncId.as_u32()` for `__relon_trace_list_get`.
     /// `None` means the host has not declared the helper; emitter will
     /// surface `EmitError::HostHookNotDeclared` if a `TraceOp::ListGet`
@@ -102,6 +109,12 @@ impl Default for HostHookFuncIds {
             str_contains: 4,
             str_find: 5,
             str_substring: 6,
+            // F-D7-I helper is opt-in: tests that don't drive the host
+            // module path keep the inline `StrConcat` lowering disabled
+            // (the emitter falls back to the extern `__relon_str_concat`
+            // call which the historical layout already declared at
+            // FuncId 3).
+            str_concat_alloc: None,
             // F-D8 helpers are opt-in: tests that don't exercise
             // dict/list ops keep the historical 3-slot layout.
             list_get: None,
@@ -274,6 +287,20 @@ impl TraceEmitter {
             hook_func_ids.str_substring,
         );
 
+        // F-D7-I: optional alloc helper for the inline `StrConcat`
+        // short-rhs lowering. Declared only when the host wired the
+        // FuncId; absence keeps `emit_str_concat` on the extern shim.
+        let str_concat_alloc = hook_func_ids.str_concat_alloc.map(|fid| {
+            declare_host_hook(
+                builder.func,
+                HostHookId::StrConcatAlloc,
+                &[pointer_ty, I64],
+                &[pointer_ty],
+                pointer_ty,
+                fid,
+            )
+        });
+
         // F-D8: declare dict/list helpers when the host wired them.
         // Signature:
         //   `__relon_trace_list_get(list_ptr, idx, ctx) -> i64`
@@ -329,6 +356,7 @@ impl TraceEmitter {
             save_deopt,
             resolve_call,
             str_concat,
+            str_concat_alloc,
             str_contains,
             str_find,
             str_substring,
@@ -390,6 +418,11 @@ struct TraceEmitterState<'a, 'b> {
     /// `TraceOp::StrConcat`-style op lowers to a single `call` without
     /// the per-op `resolve_call` round-trip.
     str_concat: ir::FuncRef,
+    /// F-D7-I optional alloc helper. Imported only when the host wired
+    /// `HostHookFuncIds::str_concat_alloc`; `None` keeps
+    /// `emit_str_concat` on the historical extern shim path even when
+    /// the const-rhs side table is populated.
+    str_concat_alloc: Option<ir::FuncRef>,
     str_contains: ir::FuncRef,
     str_find: ir::FuncRef,
     str_substring: ir::FuncRef,
@@ -765,10 +798,41 @@ impl<'a, 'b> TraceEmitterState<'a, 'b> {
     /// Both `a` and `b` are pointer-typed SSAs (i64) pointing at an
     /// opaque `StringRef` host struct. The shim allocates a fresh
     /// `Arc<str>` on the host side and returns its payload pointer.
+    ///
+    /// F-D7-I: when `b` carries a const-byte side-table entry of
+    /// length ≤ [`crate::str_inline::MAX_INLINE_CONCAT_RHS_LEN`] **and**
+    /// the host wired the alloc helper, the lowering switches to an
+    /// inline cranelift IR shape (alloc-and-memcpy helper for the lhs
+    /// prefix + unrolled `store.i8` per rhs byte). This skips the
+    /// dominant cost of `__relon_str_concat` — UTF-8 validation on
+    /// both operands plus `String`/`Box<str>` allocation churn — and
+    /// is the cmp_lua W3 hot path's primary speedup. See
+    /// [`crate::str_inline::emit_str_concat_inline_short_rhs`] for the
+    /// lowering details.
     fn emit_str_concat(&mut self, dst: SsaVar, a: SsaVar, b: SsaVar) -> Result<(), EmitError> {
         let va = self.lookup(a)?;
-        let vb = self.lookup(b)?;
         let va = self.widen_to_i64(va);
+
+        // F-D7-I inline path: rhs is a known small constant AND the
+        // host wired the alloc helper.
+        if let Some(alloc_fn) = self.str_concat_alloc {
+            if let Some(rhs_bytes) = self.trace.const_bytes_for(b) {
+                if crate::str_inline::concat_rhs_fits_inline(rhs_bytes) {
+                    let rhs_owned: Vec<u8> = rhs_bytes.to_vec();
+                    let r = crate::str_inline::emit_str_concat_inline_short_rhs(
+                        self.builder,
+                        alloc_fn,
+                        va,
+                        &rhs_owned,
+                    );
+                    self.bind(dst, r);
+                    return Ok(());
+                }
+            }
+        }
+
+        // Fallback: extern shim call.
+        let vb = self.lookup(b)?;
         let vb = self.widen_to_i64(vb);
         let inst = self.builder.ins().call(self.str_concat, &[va, vb]);
         let r = self.builder.inst_results(inst)[0];
