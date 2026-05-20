@@ -63,6 +63,7 @@
 
 use crate::ir::{IrType, Op, TaggedOp, TrapKind};
 use relon_parser::TokenRange;
+use std::sync::{Arc, OnceLock};
 
 /// v3+ a-4: stable slot of the `__casefold_lookup` internal helper in
 /// the [`builtin_stdlib`] registry. Hardcoded so the `upper` / `lower`
@@ -173,7 +174,16 @@ pub(crate) enum CaseFoldMode {
 /// with a value on top of the virtual stack and an `Op::Return`. The
 /// stdlib bodies are hand-written so they sidestep the lowering pass
 /// entirely.
-#[derive(Debug, Clone)]
+///
+/// F-D2-G: the body is built lazily — the registry only holds the
+/// metadata triple (`name`, `params`, `ret`) plus a `fn() -> Vec<TaggedOp>`
+/// builder pointer. The first call to [`StdlibFunction::body`]
+/// instantiates the op vector and caches it in an `OnceLock`; callers
+/// that only consult the signature (e.g. the lowering pass picking the
+/// right `Op::Call` shape) never pay the body-construction cost. The
+/// `Arc` lets the lazy slot survive `Clone` (downstream `Func` lifts
+/// the stdlib body into a separate `Vec<TaggedOp>` when JIT-inlining
+/// or bytecode-inlining the callee).
 pub struct StdlibFunction {
     /// Surface-level name the lowering pass looks up via
     /// [`stdlib_function_index`].
@@ -183,8 +193,73 @@ pub struct StdlibFunction {
     pub params: Vec<IrType>,
     /// Return type. Each stdlib function returns exactly one value.
     pub ret: IrType,
-    /// IR op stream forming the function body.
-    pub body: Vec<TaggedOp>,
+    /// Lazy cell holding the IR op stream forming the function body.
+    /// Built on first access via [`StdlibFunction::body`].
+    body: Arc<OnceLock<Vec<TaggedOp>>>,
+    /// Pure builder constructing the body op stream. Invoked at most
+    /// once per process per registry entry (the result is cached in
+    /// `body`).
+    body_builder: fn() -> Vec<TaggedOp>,
+}
+
+impl StdlibFunction {
+    /// Construct a registry entry. `body_builder` is invoked lazily on
+    /// the first call to [`StdlibFunction::body`].
+    fn new(
+        name: &'static str,
+        params: Vec<IrType>,
+        ret: IrType,
+        body_builder: fn() -> Vec<TaggedOp>,
+    ) -> Self {
+        StdlibFunction {
+            name,
+            params,
+            ret,
+            body: Arc::new(OnceLock::new()),
+            body_builder,
+        }
+    }
+
+    /// Force-instantiate the body and return a borrowed view. The
+    /// first call runs `body_builder`; subsequent calls return the
+    /// cached op vector for free.
+    pub fn body(&self) -> &Vec<TaggedOp> {
+        self.body.get_or_init(self.body_builder)
+    }
+
+    /// Force-instantiate the body and return an owned clone. Used by
+    /// callers that need to move the op stream into a separate `Func`
+    /// (cranelift JIT inlining, bytecode inlining) without borrowing
+    /// from the static registry.
+    pub fn body_owned(&self) -> Vec<TaggedOp> {
+        self.body().clone()
+    }
+}
+
+impl Clone for StdlibFunction {
+    fn clone(&self) -> Self {
+        StdlibFunction {
+            name: self.name,
+            params: self.params.clone(),
+            ret: self.ret,
+            // Share the lazy cell so a `clone()` after the body has
+            // been built doesn't trigger a rebuild — the metadata
+            // copy is cheap, the body is the expensive part.
+            body: Arc::clone(&self.body),
+            body_builder: self.body_builder,
+        }
+    }
+}
+
+impl std::fmt::Debug for StdlibFunction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StdlibFunction")
+            .field("name", &self.name)
+            .field("params", &self.params)
+            .field("ret", &self.ret)
+            .field("body_built", &self.body.get().is_some())
+            .finish()
+    }
 }
 
 /// Return the ordered list of builtin stdlib functions. The order is
@@ -272,59 +347,62 @@ pub struct StdlibFunction {
 ///     ignorable_addr) -> i32` (v3++ b-7 reframed; UAX #21
 ///     Final_Sigma scan — UTF-8 reverse + forward decode, skipping
 ///     case-ignorables. Returns `1` for word-final, `0` otherwise).
-pub fn builtin_stdlib() -> Vec<StdlibFunction> {
-    vec![
-        length_string_to_int(),
-        list_int_length_to_int(),
-        abs_int(),
-        min_int(),
-        max_int(),
-        is_empty_string(),
-        concat_string_string(),
-        upper_string(),
-        lower_string(),
-        substring_string(),
-        starts_with_string(),
-        list_int_sum(),
-        list_int_max(),
-        list_int_map(),
-        list_int_filter(),
-        list_int_fold(),
-        list_float_length(),
-        list_bool_length(),
-        list_string_length(),
-        list_schema_length(),
-        casefold_lookup_helper(),
-        is_combining_mark_helper(),
-        is_whitespace_helper(),
-        title_string(),
-        decomp_lookup_helper(),
-        ccc_lookup_helper(),
-        compose_lookup_helper(),
-        nfd_string(),
-        nfkd_string(),
-        nfc_string(),
-        nfkc_string(),
-        // v3++ b-6: locale-aware case folding bodies. Each accepts
-        // `(String s, String locale) -> String`; the body parses the
-        // leading two ASCII letters of `locale` and dispatches to the
-        // Turkish / Azerbaijani override table when they match
-        // `tr` / `az` (case-insensitive, BCP-47-ish boundary check).
-        upper_locale_string(),
-        lower_locale_string(),
-        title_locale_string(),
-        // v3++ b-7 reframed: FULL multi-codepoint + final-sigma helpers
-        // shared by every (locale-aware or default) case-fold body.
-        full_casefold_lookup_helper(),
-        final_sigma_check_helper(),
-        // F-D7-D (2026-05-20): `contains(haystack, needle) -> Bool`.
-        // Lives at index 36 — the slot the trace recorder pins via
-        // [`relon_trace_recorder::lowering::STDLIB_IDX_CONTAINS`].
-        // Body is naive O(s_len * p_len); the JIT side has the F-D7-C
-        // inline lowering for short const needles, so the body cost is
-        // only seen on the cold / tree-walk path.
-        contains_string(),
-    ]
+pub fn builtin_stdlib() -> &'static [StdlibFunction] {
+    static REGISTRY: OnceLock<Vec<StdlibFunction>> = OnceLock::new();
+    REGISTRY.get_or_init(|| {
+        vec![
+            length_string_to_int(),
+            list_int_length_to_int(),
+            abs_int(),
+            min_int(),
+            max_int(),
+            is_empty_string(),
+            concat_string_string(),
+            upper_string(),
+            lower_string(),
+            substring_string(),
+            starts_with_string(),
+            list_int_sum(),
+            list_int_max(),
+            list_int_map(),
+            list_int_filter(),
+            list_int_fold(),
+            list_float_length(),
+            list_bool_length(),
+            list_string_length(),
+            list_schema_length(),
+            casefold_lookup_helper(),
+            is_combining_mark_helper(),
+            is_whitespace_helper(),
+            title_string(),
+            decomp_lookup_helper(),
+            ccc_lookup_helper(),
+            compose_lookup_helper(),
+            nfd_string(),
+            nfkd_string(),
+            nfc_string(),
+            nfkc_string(),
+            // v3++ b-6: locale-aware case folding bodies. Each accepts
+            // `(String s, String locale) -> String`; the body parses the
+            // leading two ASCII letters of `locale` and dispatches to the
+            // Turkish / Azerbaijani override table when they match
+            // `tr` / `az` (case-insensitive, BCP-47-ish boundary check).
+            upper_locale_string(),
+            lower_locale_string(),
+            title_locale_string(),
+            // v3++ b-7 reframed: FULL multi-codepoint + final-sigma helpers
+            // shared by every (locale-aware or default) case-fold body.
+            full_casefold_lookup_helper(),
+            final_sigma_check_helper(),
+            // F-D7-D (2026-05-20): `contains(haystack, needle) -> Bool`.
+            // Lives at index 36 — the slot the trace recorder pins via
+            // [`relon_trace_recorder::lowering::STDLIB_IDX_CONTAINS`].
+            // Body is naive O(s_len * p_len); the JIT side has the F-D7-C
+            // inline lowering for short const needles, so the body cost is
+            // only seen on the cold / tree-walk path.
+            contains_string(),
+        ]
+    })
 }
 
 /// Hand-written body for `length(s: String) -> Int`.
@@ -338,12 +416,9 @@ pub fn builtin_stdlib() -> Vec<StdlibFunction> {
 /// )
 /// ```
 fn length_string_to_int() -> StdlibFunction {
-    let range = TokenRange::default();
-    StdlibFunction {
-        name: "length",
-        params: vec![IrType::String],
-        ret: IrType::I64,
-        body: vec![
+    StdlibFunction::new("length", vec![IrType::String], IrType::I64, || {
+        let range = TokenRange::default();
+        vec![
             // Push the param slot (the String pointer).
             TaggedOp {
                 op: Op::LocalGet(0),
@@ -360,8 +435,8 @@ fn length_string_to_int() -> StdlibFunction {
                 op: Op::Return,
                 range,
             },
-        ],
-    }
+        ]
+    })
 }
 
 /// Hand-written body for `list_int_length(xs: List<Int>) -> Int`.
@@ -372,26 +447,28 @@ fn length_string_to_int() -> StdlibFunction {
 /// body — just typed against the `ListInt` slot at the IR level so
 /// lowering can dispatch on the receiver's IR type.
 fn list_int_length_to_int() -> StdlibFunction {
-    let range = TokenRange::default();
-    StdlibFunction {
-        name: "list_int_length",
-        params: vec![IrType::ListInt],
-        ret: IrType::I64,
-        body: vec![
-            TaggedOp {
-                op: Op::LocalGet(0),
-                range,
-            },
-            TaggedOp {
-                op: Op::ReadStringLen,
-                range,
-            },
-            TaggedOp {
-                op: Op::Return,
-                range,
-            },
-        ],
-    }
+    StdlibFunction::new(
+        "list_int_length",
+        vec![IrType::ListInt],
+        IrType::I64,
+        || {
+            let range = TokenRange::default();
+            vec![
+                TaggedOp {
+                    op: Op::LocalGet(0),
+                    range,
+                },
+                TaggedOp {
+                    op: Op::ReadStringLen,
+                    range,
+                },
+                TaggedOp {
+                    op: Op::Return,
+                    range,
+                },
+            ]
+        },
+    )
 }
 
 /// Phase 10-c length bodies for the new list types.
@@ -402,95 +479,62 @@ fn list_int_length_to_int() -> StdlibFunction {
 /// [`list_int_length_to_int`] — only the param type tag changes, which
 /// drives the IR-level dispatch in [`stdlib_method_index`].
 fn list_float_length() -> StdlibFunction {
-    let range = TokenRange::default();
-    StdlibFunction {
-        name: "list_float_length",
-        params: vec![IrType::ListFloat],
-        ret: IrType::I64,
-        body: vec![
-            TaggedOp {
-                op: Op::LocalGet(0),
-                range,
-            },
-            TaggedOp {
-                op: Op::ReadStringLen,
-                range,
-            },
-            TaggedOp {
-                op: Op::Return,
-                range,
-            },
-        ],
-    }
+    StdlibFunction::new(
+        "list_float_length",
+        vec![IrType::ListFloat],
+        IrType::I64,
+        list_length_record_header_body,
+    )
 }
 
 fn list_bool_length() -> StdlibFunction {
-    let range = TokenRange::default();
-    StdlibFunction {
-        name: "list_bool_length",
-        params: vec![IrType::ListBool],
-        ret: IrType::I64,
-        body: vec![
-            TaggedOp {
-                op: Op::LocalGet(0),
-                range,
-            },
-            TaggedOp {
-                op: Op::ReadStringLen,
-                range,
-            },
-            TaggedOp {
-                op: Op::Return,
-                range,
-            },
-        ],
-    }
+    StdlibFunction::new(
+        "list_bool_length",
+        vec![IrType::ListBool],
+        IrType::I64,
+        list_length_record_header_body,
+    )
 }
 
 fn list_string_length() -> StdlibFunction {
-    let range = TokenRange::default();
-    StdlibFunction {
-        name: "list_string_length",
-        params: vec![IrType::ListString],
-        ret: IrType::I64,
-        body: vec![
-            TaggedOp {
-                op: Op::LocalGet(0),
-                range,
-            },
-            TaggedOp {
-                op: Op::ReadStringLen,
-                range,
-            },
-            TaggedOp {
-                op: Op::Return,
-                range,
-            },
-        ],
-    }
+    StdlibFunction::new(
+        "list_string_length",
+        vec![IrType::ListString],
+        IrType::I64,
+        list_length_record_header_body,
+    )
 }
 
 fn list_schema_length() -> StdlibFunction {
+    StdlibFunction::new(
+        "list_schema_length",
+        vec![IrType::ListSchema],
+        IrType::I64,
+        list_length_record_header_body,
+    )
+}
+
+/// Shared body for every `list_<T>_length` shape — they all read the
+/// leading `u32 LE` length prefix of the record header. Hoisted so the
+/// lazy-build cache can reuse the same builder pointer across the
+/// four list types (each entry still has its own `OnceLock`, but the
+/// op-stream produced is byte-identical).
+fn list_length_record_header_body() -> Vec<TaggedOp> {
     let range = TokenRange::default();
-    StdlibFunction {
-        name: "list_schema_length",
-        params: vec![IrType::ListSchema],
-        ret: IrType::I64,
-        body: vec![
-            TaggedOp {
-                op: Op::LocalGet(0),
-                range,
-            },
-            TaggedOp {
-                op: Op::ReadStringLen,
-                range,
-            },
-            TaggedOp {
-                op: Op::Return,
-                range,
-            },
-        ],
-    }
+    vec![
+        TaggedOp {
+            op: Op::LocalGet(0),
+            range,
+        },
+        TaggedOp {
+            op: Op::ReadStringLen,
+            range,
+        },
+        TaggedOp {
+            op: Op::Return,
+            range,
+        },
+    ]
 }
 
 /// Hand-written body for `abs(x: Int) -> Int`.
@@ -514,12 +558,9 @@ fn list_schema_length() -> StdlibFunction {
 /// non-zero. We arrange `[-x, x, x < 0]` so a negative `x` selects
 /// `-x` while a non-negative `x` selects `x`.
 fn abs_int() -> StdlibFunction {
-    let range = TokenRange::default();
-    StdlibFunction {
-        name: "abs",
-        params: vec![IrType::I64],
-        ret: IrType::I64,
-        body: vec![
+    StdlibFunction::new("abs", vec![IrType::I64], IrType::I64, || {
+        let range = TokenRange::default();
+        vec![
             // val_true: -x  (computed as 0 - x).
             TaggedOp {
                 op: Op::ConstI64(0),
@@ -560,8 +601,8 @@ fn abs_int() -> StdlibFunction {
                 op: Op::Return,
                 range,
             },
-        ],
-    }
+        ]
+    })
 }
 
 /// Hand-written body for `min(a: Int, b: Int) -> Int`.
@@ -569,12 +610,9 @@ fn abs_int() -> StdlibFunction {
 /// Stack arrangement: push `[a, b, a < b]` so wasm `select` returns
 /// `a` when `a < b` and `b` otherwise.
 fn min_int() -> StdlibFunction {
-    let range = TokenRange::default();
-    StdlibFunction {
-        name: "min",
-        params: vec![IrType::I64, IrType::I64],
-        ret: IrType::I64,
-        body: vec![
+    StdlibFunction::new("min", vec![IrType::I64, IrType::I64], IrType::I64, || {
+        let range = TokenRange::default();
+        vec![
             // val_true: a.
             TaggedOp {
                 op: Op::LocalGet(0),
@@ -606,20 +644,17 @@ fn min_int() -> StdlibFunction {
                 op: Op::Return,
                 range,
             },
-        ],
-    }
+        ]
+    })
 }
 
 /// Hand-written body for `max(a: Int, b: Int) -> Int`.
 ///
 /// Mirror of [`min_int`] with the comparison flipped.
 fn max_int() -> StdlibFunction {
-    let range = TokenRange::default();
-    StdlibFunction {
-        name: "max",
-        params: vec![IrType::I64, IrType::I64],
-        ret: IrType::I64,
-        body: vec![
+    StdlibFunction::new("max", vec![IrType::I64, IrType::I64], IrType::I64, || {
+        let range = TokenRange::default();
+        vec![
             TaggedOp {
                 op: Op::LocalGet(0),
                 range,
@@ -648,8 +683,8 @@ fn max_int() -> StdlibFunction {
                 op: Op::Return,
                 range,
             },
-        ],
-    }
+        ]
+    })
 }
 
 /// Hand-written body for `is_empty(s: String) -> Bool`.
@@ -658,12 +693,9 @@ fn max_int() -> StdlibFunction {
 /// (which widens to `I64`), compares against the i64 constant zero,
 /// and returns the `Bool` result of the equality op directly.
 fn is_empty_string() -> StdlibFunction {
-    let range = TokenRange::default();
-    StdlibFunction {
-        name: "is_empty",
-        params: vec![IrType::String],
-        ret: IrType::Bool,
-        body: vec![
+    StdlibFunction::new("is_empty", vec![IrType::String], IrType::Bool, || {
+        let range = TokenRange::default();
+        vec![
             TaggedOp {
                 op: Op::LocalGet(0),
                 range,
@@ -684,8 +716,8 @@ fn is_empty_string() -> StdlibFunction {
                 op: Op::Return,
                 range,
             },
-        ],
-    }
+        ]
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -736,104 +768,108 @@ fn tt(op: Op) -> TaggedOp {
 ///   * 1 — `len_b: I32`
 ///   * 2 — `base:  I32`
 fn concat_string_string() -> StdlibFunction {
+    StdlibFunction::new(
+        "concat",
+        vec![IrType::String, IrType::String],
+        IrType::String,
+        concat_string_string_body,
+    )
+}
+
+fn concat_string_string_body() -> Vec<TaggedOp> {
     const LEN_A: u32 = 0;
     const LEN_B: u32 = 1;
     const BASE: u32 = 2;
-    StdlibFunction {
-        name: "concat",
-        params: vec![IrType::String, IrType::String],
-        ret: IrType::String,
-        body: vec![
-            // len_a = load_i32(a, 0)
-            tt(Op::LocalGet(0)),
-            tt(Op::LoadI32AtAbsolute { offset: 0 }),
-            tt(Op::LetSet {
-                idx: LEN_A,
-                ty: IrType::I32,
-            }),
-            // len_b = load_i32(b, 0)
-            tt(Op::LocalGet(1)),
-            tt(Op::LoadI32AtAbsolute { offset: 0 }),
-            tt(Op::LetSet {
-                idx: LEN_B,
-                ty: IrType::I32,
-            }),
-            // record_size = len_a + len_b + 4
-            tt(Op::LetGet {
-                idx: LEN_A,
-                ty: IrType::I32,
-            }),
-            tt(Op::LetGet {
-                idx: LEN_B,
-                ty: IrType::I32,
-            }),
-            tt(Op::Add(IrType::I32)),
-            tt(Op::ConstI32(4)),
-            tt(Op::Add(IrType::I32)),
-            // base = alloc_scratch_dyn(record_size)
-            tt(Op::AllocScratchDyn),
-            tt(Op::LetSet {
-                idx: BASE,
-                ty: IrType::I32,
-            }),
-            // store header: i32.store(base + 0, len_a + len_b)
-            tt(Op::LetGet {
-                idx: BASE,
-                ty: IrType::I32,
-            }),
-            tt(Op::LetGet {
-                idx: LEN_A,
-                ty: IrType::I32,
-            }),
-            tt(Op::LetGet {
-                idx: LEN_B,
-                ty: IrType::I32,
-            }),
-            tt(Op::Add(IrType::I32)),
-            tt(Op::StoreI32AtAbsolute { offset: 0 }),
-            // memcpy(base + 4, a + 4, len_a)
-            tt(Op::LetGet {
-                idx: BASE,
-                ty: IrType::I32,
-            }),
-            tt(Op::ConstI32(4)),
-            tt(Op::Add(IrType::I32)),
-            tt(Op::LocalGet(0)),
-            tt(Op::ConstI32(4)),
-            tt(Op::Add(IrType::I32)),
-            tt(Op::LetGet {
-                idx: LEN_A,
-                ty: IrType::I32,
-            }),
-            tt(Op::MemcpyAtAbsolute),
-            // memcpy(base + 4 + len_a, b + 4, len_b)
-            tt(Op::LetGet {
-                idx: BASE,
-                ty: IrType::I32,
-            }),
-            tt(Op::ConstI32(4)),
-            tt(Op::Add(IrType::I32)),
-            tt(Op::LetGet {
-                idx: LEN_A,
-                ty: IrType::I32,
-            }),
-            tt(Op::Add(IrType::I32)),
-            tt(Op::LocalGet(1)),
-            tt(Op::ConstI32(4)),
-            tt(Op::Add(IrType::I32)),
-            tt(Op::LetGet {
-                idx: LEN_B,
-                ty: IrType::I32,
-            }),
-            tt(Op::MemcpyAtAbsolute),
-            // return base
-            tt(Op::LetGet {
-                idx: BASE,
-                ty: IrType::I32,
-            }),
-            tt(Op::Return),
-        ],
-    }
+    vec![
+        // len_a = load_i32(a, 0)
+        tt(Op::LocalGet(0)),
+        tt(Op::LoadI32AtAbsolute { offset: 0 }),
+        tt(Op::LetSet {
+            idx: LEN_A,
+            ty: IrType::I32,
+        }),
+        // len_b = load_i32(b, 0)
+        tt(Op::LocalGet(1)),
+        tt(Op::LoadI32AtAbsolute { offset: 0 }),
+        tt(Op::LetSet {
+            idx: LEN_B,
+            ty: IrType::I32,
+        }),
+        // record_size = len_a + len_b + 4
+        tt(Op::LetGet {
+            idx: LEN_A,
+            ty: IrType::I32,
+        }),
+        tt(Op::LetGet {
+            idx: LEN_B,
+            ty: IrType::I32,
+        }),
+        tt(Op::Add(IrType::I32)),
+        tt(Op::ConstI32(4)),
+        tt(Op::Add(IrType::I32)),
+        // base = alloc_scratch_dyn(record_size)
+        tt(Op::AllocScratchDyn),
+        tt(Op::LetSet {
+            idx: BASE,
+            ty: IrType::I32,
+        }),
+        // store header: i32.store(base + 0, len_a + len_b)
+        tt(Op::LetGet {
+            idx: BASE,
+            ty: IrType::I32,
+        }),
+        tt(Op::LetGet {
+            idx: LEN_A,
+            ty: IrType::I32,
+        }),
+        tt(Op::LetGet {
+            idx: LEN_B,
+            ty: IrType::I32,
+        }),
+        tt(Op::Add(IrType::I32)),
+        tt(Op::StoreI32AtAbsolute { offset: 0 }),
+        // memcpy(base + 4, a + 4, len_a)
+        tt(Op::LetGet {
+            idx: BASE,
+            ty: IrType::I32,
+        }),
+        tt(Op::ConstI32(4)),
+        tt(Op::Add(IrType::I32)),
+        tt(Op::LocalGet(0)),
+        tt(Op::ConstI32(4)),
+        tt(Op::Add(IrType::I32)),
+        tt(Op::LetGet {
+            idx: LEN_A,
+            ty: IrType::I32,
+        }),
+        tt(Op::MemcpyAtAbsolute),
+        // memcpy(base + 4 + len_a, b + 4, len_b)
+        tt(Op::LetGet {
+            idx: BASE,
+            ty: IrType::I32,
+        }),
+        tt(Op::ConstI32(4)),
+        tt(Op::Add(IrType::I32)),
+        tt(Op::LetGet {
+            idx: LEN_A,
+            ty: IrType::I32,
+        }),
+        tt(Op::Add(IrType::I32)),
+        tt(Op::LocalGet(1)),
+        tt(Op::ConstI32(4)),
+        tt(Op::Add(IrType::I32)),
+        tt(Op::LetGet {
+            idx: LEN_B,
+            ty: IrType::I32,
+        }),
+        tt(Op::MemcpyAtAbsolute),
+        // return base
+        tt(Op::LetGet {
+            idx: BASE,
+            ty: IrType::I32,
+        }),
+        tt(Op::Return),
+    ]
 }
 
 /// v3+ a-4 Unicode-aware body for `upper(s: String) -> String`.
@@ -980,7 +1016,12 @@ fn title_string() -> StdlibFunction {
 // produces a `Vec<TaggedOp>` it appends to by-line.
 #[allow(clippy::vec_init_then_push)]
 pub(crate) fn case_fold_body(name: &'static str, mode: CaseFoldMode) -> StdlibFunction {
-    case_fold_body_inner(name, mode, false)
+    let body_builder: fn() -> Vec<TaggedOp> = match mode {
+        CaseFoldMode::Upper => || case_fold_body_inner_body(CaseFoldMode::Upper, false),
+        CaseFoldMode::Lower => || case_fold_body_inner_body(CaseFoldMode::Lower, false),
+        CaseFoldMode::Title => || case_fold_body_inner_body(CaseFoldMode::Title, false),
+    };
+    StdlibFunction::new(name, vec![IrType::String], IrType::String, body_builder)
 }
 
 /// v3++ b-6 locale-aware variant of [`case_fold_body`]. Same single-
@@ -1008,15 +1049,21 @@ pub(crate) fn locale_aware_case_fold_body(
     name: &'static str,
     mode: CaseFoldMode,
 ) -> StdlibFunction {
-    case_fold_body_inner(name, mode, true)
+    let body_builder: fn() -> Vec<TaggedOp> = match mode {
+        CaseFoldMode::Upper => || case_fold_body_inner_body(CaseFoldMode::Upper, true),
+        CaseFoldMode::Lower => || case_fold_body_inner_body(CaseFoldMode::Lower, true),
+        CaseFoldMode::Title => || case_fold_body_inner_body(CaseFoldMode::Title, true),
+    };
+    StdlibFunction::new(
+        name,
+        vec![IrType::String, IrType::String],
+        IrType::String,
+        body_builder,
+    )
 }
 
 #[allow(clippy::vec_init_then_push)]
-fn case_fold_body_inner(
-    name: &'static str,
-    mode: CaseFoldMode,
-    locale_aware: bool,
-) -> StdlibFunction {
+fn case_fold_body_inner_body(mode: CaseFoldMode, locale_aware: bool) -> Vec<TaggedOp> {
     const S_LEN: u32 = 0;
     const BASE: u32 = 1;
     const I: u32 = 2;
@@ -2521,17 +2568,13 @@ fn case_fold_body_inner(
     }));
     body.push(tt(Op::Return));
 
-    let params = if locale_aware {
-        vec![IrType::String, IrType::String]
-    } else {
-        vec![IrType::String]
-    };
-    StdlibFunction {
-        name,
-        params,
-        ret: IrType::String,
-        body,
-    }
+    // F-D2-G: the params / ret / name tuple is supplied by the
+    // outer `StdlibFunction::new` call; this function only emits the
+    // op stream. `locale_aware` stays as the sole flag that mutates
+    // the body shape (see the locale-dispatch insertions above); the
+    // param vector itself is fixed at the caller (single-arg for the
+    // default fold, two-arg for the locale variant).
+    body
 }
 
 /// v3+ a-4 internal helper: `__casefold_lookup(cp: I32, table_addr: I32) -> I32`.
@@ -2559,6 +2602,15 @@ fn case_fold_body_inner(
 ///   * 4 — `entry: I32`  absolute address of the entry's input slot
 ///   * 5 — `key:   I32`  decoded input codepoint of the midpoint
 fn casefold_lookup_helper() -> StdlibFunction {
+    StdlibFunction::new(
+        "__casefold_lookup",
+        vec![IrType::I32, IrType::I32],
+        IrType::I32,
+        casefold_lookup_helper_body,
+    )
+}
+
+fn casefold_lookup_helper_body() -> Vec<TaggedOp> {
     const COUNT: u32 = 0;
     const LO: u32 = 1;
     const HI: u32 = 2;
@@ -2576,189 +2628,184 @@ fn casefold_lookup_helper() -> StdlibFunction {
     /// codepoint into this slot and `br 1`s out of the surrounding
     /// block; the function tail simply pushes RESULT and returns.
     const RESULT: u32 = 7;
-    StdlibFunction {
-        name: "__casefold_lookup",
-        params: vec![IrType::I32, IrType::I32],
-        ret: IrType::I32,
-        body: vec![
-            // count = i32.load(table_addr + 0)
-            tt(Op::LocalGet(1)),
-            tt(Op::LoadI32AtAbsolute { offset: 0 }),
-            tt(Op::LetSet {
-                idx: COUNT,
-                ty: IrType::I32,
-            }),
-            // lo = 0; hi = count
-            tt(Op::ConstI32(0)),
-            tt(Op::LetSet {
-                idx: LO,
-                ty: IrType::I32,
-            }),
-            tt(Op::LetGet {
-                idx: COUNT,
-                ty: IrType::I32,
-            }),
-            tt(Op::LetSet {
-                idx: HI,
-                ty: IrType::I32,
-            }),
-            // result = cp (identity-on-miss).
-            tt(Op::LocalGet(0)),
-            tt(Op::LetSet {
-                idx: RESULT,
-                ty: IrType::I32,
-            }),
-            // block { loop { ... } } — search loop. `Br 1` (outer
-            // block) exits the search; the body writes the mapped
-            // codepoint into RESULT before the `Br 1` on a match.
-            // `Op::Return` cannot be used for early-out — the IR
-            // codegen treats it as the function-end marker only and
-            // does not emit a wasm `return` instruction at the call
-            // site (see codegen `Op::Return` arm). The block-and-flag
-            // shape gives the same control flow.
-            tt(Op::Block {
+    vec![
+        // count = i32.load(table_addr + 0)
+        tt(Op::LocalGet(1)),
+        tt(Op::LoadI32AtAbsolute { offset: 0 }),
+        tt(Op::LetSet {
+            idx: COUNT,
+            ty: IrType::I32,
+        }),
+        // lo = 0; hi = count
+        tt(Op::ConstI32(0)),
+        tt(Op::LetSet {
+            idx: LO,
+            ty: IrType::I32,
+        }),
+        tt(Op::LetGet {
+            idx: COUNT,
+            ty: IrType::I32,
+        }),
+        tt(Op::LetSet {
+            idx: HI,
+            ty: IrType::I32,
+        }),
+        // result = cp (identity-on-miss).
+        tt(Op::LocalGet(0)),
+        tt(Op::LetSet {
+            idx: RESULT,
+            ty: IrType::I32,
+        }),
+        // block { loop { ... } } — search loop. `Br 1` (outer
+        // block) exits the search; the body writes the mapped
+        // codepoint into RESULT before the `Br 1` on a match.
+        // `Op::Return` cannot be used for early-out — the IR
+        // codegen treats it as the function-end marker only and
+        // does not emit a wasm `return` instruction at the call
+        // site (see codegen `Op::Return` arm). The block-and-flag
+        // shape gives the same control flow.
+        tt(Op::Block {
+            result_ty: None,
+            body: vec![tt(Op::Loop {
                 result_ty: None,
-                body: vec![tt(Op::Loop {
-                    result_ty: None,
-                    body: vec![
-                        // exit when lo >= hi
-                        tt(Op::LetGet {
-                            idx: LO,
-                            ty: IrType::I32,
-                        }),
-                        tt(Op::LetGet {
-                            idx: HI,
-                            ty: IrType::I32,
-                        }),
-                        tt(Op::Ge(IrType::I32)),
-                        tt(Op::BrIf { label_depth: 1 }),
-                        // mid = (lo + hi) / 2
-                        tt(Op::LetGet {
-                            idx: LO,
-                            ty: IrType::I32,
-                        }),
-                        tt(Op::LetGet {
-                            idx: HI,
-                            ty: IrType::I32,
-                        }),
-                        tt(Op::Add(IrType::I32)),
-                        tt(Op::ConstI32(2)),
-                        tt(Op::Div(IrType::I32)),
-                        tt(Op::LetSet {
-                            idx: MID,
-                            ty: IrType::I32,
-                        }),
-                        // entry = table_addr + 4 + mid * 8
-                        tt(Op::LocalGet(1)),
-                        tt(Op::ConstI32(4)),
-                        tt(Op::Add(IrType::I32)),
-                        tt(Op::LetGet {
-                            idx: MID,
-                            ty: IrType::I32,
-                        }),
-                        tt(Op::ConstI32(8)),
-                        tt(Op::Mul(IrType::I32)),
-                        tt(Op::Add(IrType::I32)),
-                        tt(Op::LetSet {
-                            idx: ENTRY,
-                            ty: IrType::I32,
-                        }),
-                        // key = i32.load(entry + 0)
-                        tt(Op::LetGet {
-                            idx: ENTRY,
-                            ty: IrType::I32,
-                        }),
-                        tt(Op::LoadI32AtAbsolute { offset: 0 }),
-                        tt(Op::LetSet {
-                            idx: KEY,
-                            ty: IrType::I32,
-                        }),
-                        // if key == cp { RESULT = load(entry+4); br 1 }
-                        tt(Op::LetGet {
-                            idx: KEY,
-                            ty: IrType::I32,
-                        }),
-                        tt(Op::LocalGet(0)),
-                        tt(Op::Eq(IrType::I32)),
-                        tt(Op::If {
-                            result_ty: IrType::I32,
-                            then_body: vec![
-                                // RESULT = i32.load(entry + 4)
-                                tt(Op::LetGet {
-                                    idx: ENTRY,
-                                    ty: IrType::I32,
-                                }),
-                                tt(Op::LoadI32AtAbsolute { offset: 4 }),
-                                tt(Op::LetSet {
-                                    idx: RESULT,
-                                    ty: IrType::I32,
-                                }),
-                                // br 2 exits the enclosing block
-                                // (depth 0 = If, 1 = Loop, 2 = Block)
-                                tt(Op::Br { label_depth: 2 }),
-                                tt(Op::ConstI32(0)),
-                            ],
-                            else_body: vec![tt(Op::ConstI32(0))],
-                        }),
-                        // sink for the placeholder i32 from the
-                        // match-check above. MID stays untouched so
-                        // the narrowing arms below can still read the
-                        // current midpoint.
-                        tt(Op::LetSet {
-                            idx: SINK,
-                            ty: IrType::I32,
-                        }),
-                        // narrow the window: if key < cp { lo = mid + 1 } else { hi = mid }
-                        tt(Op::LetGet {
-                            idx: KEY,
-                            ty: IrType::I32,
-                        }),
-                        tt(Op::LocalGet(0)),
-                        tt(Op::Lt(IrType::I32)),
-                        tt(Op::If {
-                            result_ty: IrType::I32,
-                            then_body: vec![
-                                tt(Op::LetGet {
-                                    idx: MID,
-                                    ty: IrType::I32,
-                                }),
-                                tt(Op::ConstI32(1)),
-                                tt(Op::Add(IrType::I32)),
-                                tt(Op::LetSet {
-                                    idx: LO,
-                                    ty: IrType::I32,
-                                }),
-                                tt(Op::ConstI32(0)),
-                            ],
-                            else_body: vec![
-                                tt(Op::LetGet {
-                                    idx: MID,
-                                    ty: IrType::I32,
-                                }),
-                                tt(Op::LetSet {
-                                    idx: HI,
-                                    ty: IrType::I32,
-                                }),
-                                tt(Op::ConstI32(0)),
-                            ],
-                        }),
-                        tt(Op::LetSet {
-                            idx: SINK,
-                            ty: IrType::I32,
-                        }),
-                        tt(Op::Br { label_depth: 0 }),
-                    ],
-                })],
-            }),
-            // RESULT either holds the matched codepoint or the input
-            // codepoint (identity-on-miss). Return it.
-            tt(Op::LetGet {
-                idx: RESULT,
-                ty: IrType::I32,
-            }),
-            tt(Op::Return),
-        ],
-    }
+                body: vec![
+                    // exit when lo >= hi
+                    tt(Op::LetGet {
+                        idx: LO,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::LetGet {
+                        idx: HI,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::Ge(IrType::I32)),
+                    tt(Op::BrIf { label_depth: 1 }),
+                    // mid = (lo + hi) / 2
+                    tt(Op::LetGet {
+                        idx: LO,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::LetGet {
+                        idx: HI,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::Add(IrType::I32)),
+                    tt(Op::ConstI32(2)),
+                    tt(Op::Div(IrType::I32)),
+                    tt(Op::LetSet {
+                        idx: MID,
+                        ty: IrType::I32,
+                    }),
+                    // entry = table_addr + 4 + mid * 8
+                    tt(Op::LocalGet(1)),
+                    tt(Op::ConstI32(4)),
+                    tt(Op::Add(IrType::I32)),
+                    tt(Op::LetGet {
+                        idx: MID,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::ConstI32(8)),
+                    tt(Op::Mul(IrType::I32)),
+                    tt(Op::Add(IrType::I32)),
+                    tt(Op::LetSet {
+                        idx: ENTRY,
+                        ty: IrType::I32,
+                    }),
+                    // key = i32.load(entry + 0)
+                    tt(Op::LetGet {
+                        idx: ENTRY,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::LoadI32AtAbsolute { offset: 0 }),
+                    tt(Op::LetSet {
+                        idx: KEY,
+                        ty: IrType::I32,
+                    }),
+                    // if key == cp { RESULT = load(entry+4); br 1 }
+                    tt(Op::LetGet {
+                        idx: KEY,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::LocalGet(0)),
+                    tt(Op::Eq(IrType::I32)),
+                    tt(Op::If {
+                        result_ty: IrType::I32,
+                        then_body: vec![
+                            // RESULT = i32.load(entry + 4)
+                            tt(Op::LetGet {
+                                idx: ENTRY,
+                                ty: IrType::I32,
+                            }),
+                            tt(Op::LoadI32AtAbsolute { offset: 4 }),
+                            tt(Op::LetSet {
+                                idx: RESULT,
+                                ty: IrType::I32,
+                            }),
+                            // br 2 exits the enclosing block
+                            // (depth 0 = If, 1 = Loop, 2 = Block)
+                            tt(Op::Br { label_depth: 2 }),
+                            tt(Op::ConstI32(0)),
+                        ],
+                        else_body: vec![tt(Op::ConstI32(0))],
+                    }),
+                    // sink for the placeholder i32 from the
+                    // match-check above. MID stays untouched so
+                    // the narrowing arms below can still read the
+                    // current midpoint.
+                    tt(Op::LetSet {
+                        idx: SINK,
+                        ty: IrType::I32,
+                    }),
+                    // narrow the window: if key < cp { lo = mid + 1 } else { hi = mid }
+                    tt(Op::LetGet {
+                        idx: KEY,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::LocalGet(0)),
+                    tt(Op::Lt(IrType::I32)),
+                    tt(Op::If {
+                        result_ty: IrType::I32,
+                        then_body: vec![
+                            tt(Op::LetGet {
+                                idx: MID,
+                                ty: IrType::I32,
+                            }),
+                            tt(Op::ConstI32(1)),
+                            tt(Op::Add(IrType::I32)),
+                            tt(Op::LetSet {
+                                idx: LO,
+                                ty: IrType::I32,
+                            }),
+                            tt(Op::ConstI32(0)),
+                        ],
+                        else_body: vec![
+                            tt(Op::LetGet {
+                                idx: MID,
+                                ty: IrType::I32,
+                            }),
+                            tt(Op::LetSet {
+                                idx: HI,
+                                ty: IrType::I32,
+                            }),
+                            tt(Op::ConstI32(0)),
+                        ],
+                    }),
+                    tt(Op::LetSet {
+                        idx: SINK,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::Br { label_depth: 0 }),
+                ],
+            })],
+        }),
+        // RESULT either holds the matched codepoint or the input
+        // codepoint (identity-on-miss). Return it.
+        tt(Op::LetGet {
+            idx: RESULT,
+            ty: IrType::I32,
+        }),
+        tt(Op::Return),
+    ]
 }
 
 /// v3++ b-4 internal helper:
@@ -2808,6 +2855,15 @@ fn is_combining_mark_helper() -> StdlibFunction {
 /// emits the same range-membership shape. The ASCII fast path is
 /// stitched in front so the common case never touches the table.
 fn is_whitespace_helper() -> StdlibFunction {
+    StdlibFunction::new(
+        "__is_whitespace",
+        vec![IrType::I32, IrType::I32],
+        IrType::I32,
+        is_whitespace_helper_body,
+    )
+}
+
+fn is_whitespace_helper_body() -> Vec<TaggedOp> {
     // Locals mirror `range_membership_helper`.
     const COUNT: u32 = 0;
     const LO: u32 = 1;
@@ -2930,12 +2986,7 @@ fn is_whitespace_helper() -> StdlibFunction {
         }),
         tt(Op::Return),
     ];
-    StdlibFunction {
-        name: "__is_whitespace",
-        params: vec![IrType::I32, IrType::I32],
-        ret: IrType::I32,
-        body,
-    }
+    body
 }
 
 /// Shared body generator for the range-membership helpers
@@ -2944,6 +2995,15 @@ fn is_whitespace_helper() -> StdlibFunction {
 /// standalone builder so the wasm body's local layout stays
 /// hand-auditable instead of buried inside a higher-order helper.
 fn range_membership_helper(name: &'static str) -> StdlibFunction {
+    StdlibFunction::new(
+        name,
+        vec![IrType::I32, IrType::I32],
+        IrType::I32,
+        range_membership_helper_body,
+    )
+}
+
+fn range_membership_helper_body() -> Vec<TaggedOp> {
     const COUNT: u32 = 0;
     const LO: u32 = 1;
     const HI: u32 = 2;
@@ -2953,52 +3013,47 @@ fn range_membership_helper(name: &'static str) -> StdlibFunction {
     const END: u32 = 6;
     const SINK: u32 = 7;
     const RESULT: u32 = 8;
-    StdlibFunction {
-        name,
-        params: vec![IrType::I32, IrType::I32],
-        ret: IrType::I32,
-        body: vec![
-            // count = i32.load(table_addr + 0)
-            tt(Op::LocalGet(1)),
-            tt(Op::LoadI32AtAbsolute { offset: 0 }),
-            tt(Op::LetSet {
-                idx: COUNT,
-                ty: IrType::I32,
-            }),
-            // lo = 0; hi = count
-            tt(Op::ConstI32(0)),
-            tt(Op::LetSet {
-                idx: LO,
-                ty: IrType::I32,
-            }),
-            tt(Op::LetGet {
-                idx: COUNT,
-                ty: IrType::I32,
-            }),
-            tt(Op::LetSet {
-                idx: HI,
-                ty: IrType::I32,
-            }),
-            // result = 0 (default miss)
-            tt(Op::ConstI32(0)),
-            tt(Op::LetSet {
-                idx: RESULT,
-                ty: IrType::I32,
-            }),
-            tt(Op::Block {
+    vec![
+        // count = i32.load(table_addr + 0)
+        tt(Op::LocalGet(1)),
+        tt(Op::LoadI32AtAbsolute { offset: 0 }),
+        tt(Op::LetSet {
+            idx: COUNT,
+            ty: IrType::I32,
+        }),
+        // lo = 0; hi = count
+        tt(Op::ConstI32(0)),
+        tt(Op::LetSet {
+            idx: LO,
+            ty: IrType::I32,
+        }),
+        tt(Op::LetGet {
+            idx: COUNT,
+            ty: IrType::I32,
+        }),
+        tt(Op::LetSet {
+            idx: HI,
+            ty: IrType::I32,
+        }),
+        // result = 0 (default miss)
+        tt(Op::ConstI32(0)),
+        tt(Op::LetSet {
+            idx: RESULT,
+            ty: IrType::I32,
+        }),
+        tt(Op::Block {
+            result_ty: None,
+            body: vec![tt(Op::Loop {
                 result_ty: None,
-                body: vec![tt(Op::Loop {
-                    result_ty: None,
-                    body: range_search_loop_body(LO, HI, MID, ENTRY, START, END, SINK, RESULT),
-                })],
-            }),
-            tt(Op::LetGet {
-                idx: RESULT,
-                ty: IrType::I32,
-            }),
-            tt(Op::Return),
-        ],
-    }
+                body: range_search_loop_body(LO, HI, MID, ENTRY, START, END, SINK, RESULT),
+            })],
+        }),
+        tt(Op::LetGet {
+            idx: RESULT,
+            ty: IrType::I32,
+        }),
+        tt(Op::Return),
+    ]
 }
 
 /// Inner loop body for the range-membership binary search. Encoded
@@ -3173,6 +3228,15 @@ fn range_search_loop_body(
 /// a valid "no decomposition" sentinel because the table never stores
 /// zero-length entries.
 fn decomp_lookup_helper() -> StdlibFunction {
+    StdlibFunction::new(
+        "__decomp_lookup",
+        vec![IrType::I32, IrType::I32],
+        IrType::I32,
+        decomp_lookup_helper_body,
+    )
+}
+
+fn decomp_lookup_helper_body() -> Vec<TaggedOp> {
     const COUNT: u32 = 0;
     const LO: u32 = 1;
     const HI: u32 = 2;
@@ -3181,173 +3245,168 @@ fn decomp_lookup_helper() -> StdlibFunction {
     const KEY: u32 = 5;
     const SINK: u32 = 6;
     const RESULT: u32 = 7;
-    StdlibFunction {
-        name: "__decomp_lookup",
-        params: vec![IrType::I32, IrType::I32],
-        ret: IrType::I32,
-        body: vec![
-            tt(Op::LocalGet(1)),
-            tt(Op::LoadI32AtAbsolute { offset: 0 }),
-            tt(Op::LetSet {
-                idx: COUNT,
-                ty: IrType::I32,
-            }),
-            tt(Op::ConstI32(0)),
-            tt(Op::LetSet {
-                idx: LO,
-                ty: IrType::I32,
-            }),
-            tt(Op::LetGet {
-                idx: COUNT,
-                ty: IrType::I32,
-            }),
-            tt(Op::LetSet {
-                idx: HI,
-                ty: IrType::I32,
-            }),
-            tt(Op::ConstI32(0)),
-            tt(Op::LetSet {
-                idx: RESULT,
-                ty: IrType::I32,
-            }),
-            tt(Op::Block {
+    vec![
+        tt(Op::LocalGet(1)),
+        tt(Op::LoadI32AtAbsolute { offset: 0 }),
+        tt(Op::LetSet {
+            idx: COUNT,
+            ty: IrType::I32,
+        }),
+        tt(Op::ConstI32(0)),
+        tt(Op::LetSet {
+            idx: LO,
+            ty: IrType::I32,
+        }),
+        tt(Op::LetGet {
+            idx: COUNT,
+            ty: IrType::I32,
+        }),
+        tt(Op::LetSet {
+            idx: HI,
+            ty: IrType::I32,
+        }),
+        tt(Op::ConstI32(0)),
+        tt(Op::LetSet {
+            idx: RESULT,
+            ty: IrType::I32,
+        }),
+        tt(Op::Block {
+            result_ty: None,
+            body: vec![tt(Op::Loop {
                 result_ty: None,
-                body: vec![tt(Op::Loop {
-                    result_ty: None,
-                    body: vec![
-                        tt(Op::LetGet {
-                            idx: LO,
-                            ty: IrType::I32,
-                        }),
-                        tt(Op::LetGet {
-                            idx: HI,
-                            ty: IrType::I32,
-                        }),
-                        tt(Op::Ge(IrType::I32)),
-                        tt(Op::BrIf { label_depth: 1 }),
-                        tt(Op::LetGet {
-                            idx: LO,
-                            ty: IrType::I32,
-                        }),
-                        tt(Op::LetGet {
-                            idx: HI,
-                            ty: IrType::I32,
-                        }),
-                        tt(Op::Add(IrType::I32)),
-                        tt(Op::ConstI32(2)),
-                        tt(Op::Div(IrType::I32)),
-                        tt(Op::LetSet {
-                            idx: MID,
-                            ty: IrType::I32,
-                        }),
-                        // entry = table_addr + 4 + mid * 12
-                        tt(Op::LocalGet(1)),
-                        tt(Op::ConstI32(4)),
-                        tt(Op::Add(IrType::I32)),
-                        tt(Op::LetGet {
-                            idx: MID,
-                            ty: IrType::I32,
-                        }),
-                        tt(Op::ConstI32(12)),
-                        tt(Op::Mul(IrType::I32)),
-                        tt(Op::Add(IrType::I32)),
-                        tt(Op::LetSet {
-                            idx: ENTRY,
-                            ty: IrType::I32,
-                        }),
-                        tt(Op::LetGet {
-                            idx: ENTRY,
-                            ty: IrType::I32,
-                        }),
-                        tt(Op::LoadI32AtAbsolute { offset: 0 }),
-                        tt(Op::LetSet {
-                            idx: KEY,
-                            ty: IrType::I32,
-                        }),
-                        tt(Op::LetGet {
-                            idx: KEY,
-                            ty: IrType::I32,
-                        }),
-                        tt(Op::LocalGet(0)),
-                        tt(Op::Eq(IrType::I32)),
-                        tt(Op::If {
-                            result_ty: IrType::I32,
-                            then_body: vec![
-                                // result = (load(entry+4) << 8) | load(entry+8)
-                                tt(Op::LetGet {
-                                    idx: ENTRY,
-                                    ty: IrType::I32,
-                                }),
-                                tt(Op::LoadI32AtAbsolute { offset: 4 }),
-                                tt(Op::ConstI32(256)),
-                                tt(Op::Mul(IrType::I32)),
-                                tt(Op::LetGet {
-                                    idx: ENTRY,
-                                    ty: IrType::I32,
-                                }),
-                                tt(Op::LoadI32AtAbsolute { offset: 8 }),
-                                tt(Op::Add(IrType::I32)),
-                                tt(Op::LetSet {
-                                    idx: RESULT,
-                                    ty: IrType::I32,
-                                }),
-                                tt(Op::Br { label_depth: 2 }),
-                                tt(Op::ConstI32(0)),
-                            ],
-                            else_body: vec![tt(Op::ConstI32(0))],
-                        }),
-                        tt(Op::LetSet {
-                            idx: SINK,
-                            ty: IrType::I32,
-                        }),
-                        tt(Op::LetGet {
-                            idx: KEY,
-                            ty: IrType::I32,
-                        }),
-                        tt(Op::LocalGet(0)),
-                        tt(Op::Lt(IrType::I32)),
-                        tt(Op::If {
-                            result_ty: IrType::I32,
-                            then_body: vec![
-                                tt(Op::LetGet {
-                                    idx: MID,
-                                    ty: IrType::I32,
-                                }),
-                                tt(Op::ConstI32(1)),
-                                tt(Op::Add(IrType::I32)),
-                                tt(Op::LetSet {
-                                    idx: LO,
-                                    ty: IrType::I32,
-                                }),
-                                tt(Op::ConstI32(0)),
-                            ],
-                            else_body: vec![
-                                tt(Op::LetGet {
-                                    idx: MID,
-                                    ty: IrType::I32,
-                                }),
-                                tt(Op::LetSet {
-                                    idx: HI,
-                                    ty: IrType::I32,
-                                }),
-                                tt(Op::ConstI32(0)),
-                            ],
-                        }),
-                        tt(Op::LetSet {
-                            idx: SINK,
-                            ty: IrType::I32,
-                        }),
-                        tt(Op::Br { label_depth: 0 }),
-                    ],
-                })],
-            }),
-            tt(Op::LetGet {
-                idx: RESULT,
-                ty: IrType::I32,
-            }),
-            tt(Op::Return),
-        ],
-    }
+                body: vec![
+                    tt(Op::LetGet {
+                        idx: LO,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::LetGet {
+                        idx: HI,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::Ge(IrType::I32)),
+                    tt(Op::BrIf { label_depth: 1 }),
+                    tt(Op::LetGet {
+                        idx: LO,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::LetGet {
+                        idx: HI,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::Add(IrType::I32)),
+                    tt(Op::ConstI32(2)),
+                    tt(Op::Div(IrType::I32)),
+                    tt(Op::LetSet {
+                        idx: MID,
+                        ty: IrType::I32,
+                    }),
+                    // entry = table_addr + 4 + mid * 12
+                    tt(Op::LocalGet(1)),
+                    tt(Op::ConstI32(4)),
+                    tt(Op::Add(IrType::I32)),
+                    tt(Op::LetGet {
+                        idx: MID,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::ConstI32(12)),
+                    tt(Op::Mul(IrType::I32)),
+                    tt(Op::Add(IrType::I32)),
+                    tt(Op::LetSet {
+                        idx: ENTRY,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::LetGet {
+                        idx: ENTRY,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::LoadI32AtAbsolute { offset: 0 }),
+                    tt(Op::LetSet {
+                        idx: KEY,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::LetGet {
+                        idx: KEY,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::LocalGet(0)),
+                    tt(Op::Eq(IrType::I32)),
+                    tt(Op::If {
+                        result_ty: IrType::I32,
+                        then_body: vec![
+                            // result = (load(entry+4) << 8) | load(entry+8)
+                            tt(Op::LetGet {
+                                idx: ENTRY,
+                                ty: IrType::I32,
+                            }),
+                            tt(Op::LoadI32AtAbsolute { offset: 4 }),
+                            tt(Op::ConstI32(256)),
+                            tt(Op::Mul(IrType::I32)),
+                            tt(Op::LetGet {
+                                idx: ENTRY,
+                                ty: IrType::I32,
+                            }),
+                            tt(Op::LoadI32AtAbsolute { offset: 8 }),
+                            tt(Op::Add(IrType::I32)),
+                            tt(Op::LetSet {
+                                idx: RESULT,
+                                ty: IrType::I32,
+                            }),
+                            tt(Op::Br { label_depth: 2 }),
+                            tt(Op::ConstI32(0)),
+                        ],
+                        else_body: vec![tt(Op::ConstI32(0))],
+                    }),
+                    tt(Op::LetSet {
+                        idx: SINK,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::LetGet {
+                        idx: KEY,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::LocalGet(0)),
+                    tt(Op::Lt(IrType::I32)),
+                    tt(Op::If {
+                        result_ty: IrType::I32,
+                        then_body: vec![
+                            tt(Op::LetGet {
+                                idx: MID,
+                                ty: IrType::I32,
+                            }),
+                            tt(Op::ConstI32(1)),
+                            tt(Op::Add(IrType::I32)),
+                            tt(Op::LetSet {
+                                idx: LO,
+                                ty: IrType::I32,
+                            }),
+                            tt(Op::ConstI32(0)),
+                        ],
+                        else_body: vec![
+                            tt(Op::LetGet {
+                                idx: MID,
+                                ty: IrType::I32,
+                            }),
+                            tt(Op::LetSet {
+                                idx: HI,
+                                ty: IrType::I32,
+                            }),
+                            tt(Op::ConstI32(0)),
+                        ],
+                    }),
+                    tt(Op::LetSet {
+                        idx: SINK,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::Br { label_depth: 0 }),
+                ],
+            })],
+        }),
+        tt(Op::LetGet {
+            idx: RESULT,
+            ty: IrType::I32,
+        }),
+        tt(Op::Return),
+    ]
 }
 
 /// v3++ b-5 internal helper: `__ccc_lookup(cp, table_addr) -> i32`.
@@ -3356,6 +3415,15 @@ fn decomp_lookup_helper() -> StdlibFunction {
 /// Returns the CCC value on a hit, or `0` on a miss (the UCD
 /// convention: absent entries default to Not_Reordered).
 fn ccc_lookup_helper() -> StdlibFunction {
+    StdlibFunction::new(
+        "__ccc_lookup",
+        vec![IrType::I32, IrType::I32],
+        IrType::I32,
+        ccc_lookup_helper_body,
+    )
+}
+
+fn ccc_lookup_helper_body() -> Vec<TaggedOp> {
     const COUNT: u32 = 0;
     const LO: u32 = 1;
     const HI: u32 = 2;
@@ -3364,164 +3432,159 @@ fn ccc_lookup_helper() -> StdlibFunction {
     const KEY: u32 = 5;
     const SINK: u32 = 6;
     const RESULT: u32 = 7;
-    StdlibFunction {
-        name: "__ccc_lookup",
-        params: vec![IrType::I32, IrType::I32],
-        ret: IrType::I32,
-        body: vec![
-            tt(Op::LocalGet(1)),
-            tt(Op::LoadI32AtAbsolute { offset: 0 }),
-            tt(Op::LetSet {
-                idx: COUNT,
-                ty: IrType::I32,
-            }),
-            tt(Op::ConstI32(0)),
-            tt(Op::LetSet {
-                idx: LO,
-                ty: IrType::I32,
-            }),
-            tt(Op::LetGet {
-                idx: COUNT,
-                ty: IrType::I32,
-            }),
-            tt(Op::LetSet {
-                idx: HI,
-                ty: IrType::I32,
-            }),
-            tt(Op::ConstI32(0)),
-            tt(Op::LetSet {
-                idx: RESULT,
-                ty: IrType::I32,
-            }),
-            tt(Op::Block {
+    vec![
+        tt(Op::LocalGet(1)),
+        tt(Op::LoadI32AtAbsolute { offset: 0 }),
+        tt(Op::LetSet {
+            idx: COUNT,
+            ty: IrType::I32,
+        }),
+        tt(Op::ConstI32(0)),
+        tt(Op::LetSet {
+            idx: LO,
+            ty: IrType::I32,
+        }),
+        tt(Op::LetGet {
+            idx: COUNT,
+            ty: IrType::I32,
+        }),
+        tt(Op::LetSet {
+            idx: HI,
+            ty: IrType::I32,
+        }),
+        tt(Op::ConstI32(0)),
+        tt(Op::LetSet {
+            idx: RESULT,
+            ty: IrType::I32,
+        }),
+        tt(Op::Block {
+            result_ty: None,
+            body: vec![tt(Op::Loop {
                 result_ty: None,
-                body: vec![tt(Op::Loop {
-                    result_ty: None,
-                    body: vec![
-                        tt(Op::LetGet {
-                            idx: LO,
-                            ty: IrType::I32,
-                        }),
-                        tt(Op::LetGet {
-                            idx: HI,
-                            ty: IrType::I32,
-                        }),
-                        tt(Op::Ge(IrType::I32)),
-                        tt(Op::BrIf { label_depth: 1 }),
-                        tt(Op::LetGet {
-                            idx: LO,
-                            ty: IrType::I32,
-                        }),
-                        tt(Op::LetGet {
-                            idx: HI,
-                            ty: IrType::I32,
-                        }),
-                        tt(Op::Add(IrType::I32)),
-                        tt(Op::ConstI32(2)),
-                        tt(Op::Div(IrType::I32)),
-                        tt(Op::LetSet {
-                            idx: MID,
-                            ty: IrType::I32,
-                        }),
-                        // entry = table_addr + 4 + mid * 8
-                        tt(Op::LocalGet(1)),
-                        tt(Op::ConstI32(4)),
-                        tt(Op::Add(IrType::I32)),
-                        tt(Op::LetGet {
-                            idx: MID,
-                            ty: IrType::I32,
-                        }),
-                        tt(Op::ConstI32(8)),
-                        tt(Op::Mul(IrType::I32)),
-                        tt(Op::Add(IrType::I32)),
-                        tt(Op::LetSet {
-                            idx: ENTRY,
-                            ty: IrType::I32,
-                        }),
-                        tt(Op::LetGet {
-                            idx: ENTRY,
-                            ty: IrType::I32,
-                        }),
-                        tt(Op::LoadI32AtAbsolute { offset: 0 }),
-                        tt(Op::LetSet {
-                            idx: KEY,
-                            ty: IrType::I32,
-                        }),
-                        tt(Op::LetGet {
-                            idx: KEY,
-                            ty: IrType::I32,
-                        }),
-                        tt(Op::LocalGet(0)),
-                        tt(Op::Eq(IrType::I32)),
-                        tt(Op::If {
-                            result_ty: IrType::I32,
-                            then_body: vec![
-                                tt(Op::LetGet {
-                                    idx: ENTRY,
-                                    ty: IrType::I32,
-                                }),
-                                tt(Op::LoadI32AtAbsolute { offset: 4 }),
-                                tt(Op::LetSet {
-                                    idx: RESULT,
-                                    ty: IrType::I32,
-                                }),
-                                tt(Op::Br { label_depth: 2 }),
-                                tt(Op::ConstI32(0)),
-                            ],
-                            else_body: vec![tt(Op::ConstI32(0))],
-                        }),
-                        tt(Op::LetSet {
-                            idx: SINK,
-                            ty: IrType::I32,
-                        }),
-                        tt(Op::LetGet {
-                            idx: KEY,
-                            ty: IrType::I32,
-                        }),
-                        tt(Op::LocalGet(0)),
-                        tt(Op::Lt(IrType::I32)),
-                        tt(Op::If {
-                            result_ty: IrType::I32,
-                            then_body: vec![
-                                tt(Op::LetGet {
-                                    idx: MID,
-                                    ty: IrType::I32,
-                                }),
-                                tt(Op::ConstI32(1)),
-                                tt(Op::Add(IrType::I32)),
-                                tt(Op::LetSet {
-                                    idx: LO,
-                                    ty: IrType::I32,
-                                }),
-                                tt(Op::ConstI32(0)),
-                            ],
-                            else_body: vec![
-                                tt(Op::LetGet {
-                                    idx: MID,
-                                    ty: IrType::I32,
-                                }),
-                                tt(Op::LetSet {
-                                    idx: HI,
-                                    ty: IrType::I32,
-                                }),
-                                tt(Op::ConstI32(0)),
-                            ],
-                        }),
-                        tt(Op::LetSet {
-                            idx: SINK,
-                            ty: IrType::I32,
-                        }),
-                        tt(Op::Br { label_depth: 0 }),
-                    ],
-                })],
-            }),
-            tt(Op::LetGet {
-                idx: RESULT,
-                ty: IrType::I32,
-            }),
-            tt(Op::Return),
-        ],
-    }
+                body: vec![
+                    tt(Op::LetGet {
+                        idx: LO,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::LetGet {
+                        idx: HI,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::Ge(IrType::I32)),
+                    tt(Op::BrIf { label_depth: 1 }),
+                    tt(Op::LetGet {
+                        idx: LO,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::LetGet {
+                        idx: HI,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::Add(IrType::I32)),
+                    tt(Op::ConstI32(2)),
+                    tt(Op::Div(IrType::I32)),
+                    tt(Op::LetSet {
+                        idx: MID,
+                        ty: IrType::I32,
+                    }),
+                    // entry = table_addr + 4 + mid * 8
+                    tt(Op::LocalGet(1)),
+                    tt(Op::ConstI32(4)),
+                    tt(Op::Add(IrType::I32)),
+                    tt(Op::LetGet {
+                        idx: MID,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::ConstI32(8)),
+                    tt(Op::Mul(IrType::I32)),
+                    tt(Op::Add(IrType::I32)),
+                    tt(Op::LetSet {
+                        idx: ENTRY,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::LetGet {
+                        idx: ENTRY,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::LoadI32AtAbsolute { offset: 0 }),
+                    tt(Op::LetSet {
+                        idx: KEY,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::LetGet {
+                        idx: KEY,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::LocalGet(0)),
+                    tt(Op::Eq(IrType::I32)),
+                    tt(Op::If {
+                        result_ty: IrType::I32,
+                        then_body: vec![
+                            tt(Op::LetGet {
+                                idx: ENTRY,
+                                ty: IrType::I32,
+                            }),
+                            tt(Op::LoadI32AtAbsolute { offset: 4 }),
+                            tt(Op::LetSet {
+                                idx: RESULT,
+                                ty: IrType::I32,
+                            }),
+                            tt(Op::Br { label_depth: 2 }),
+                            tt(Op::ConstI32(0)),
+                        ],
+                        else_body: vec![tt(Op::ConstI32(0))],
+                    }),
+                    tt(Op::LetSet {
+                        idx: SINK,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::LetGet {
+                        idx: KEY,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::LocalGet(0)),
+                    tt(Op::Lt(IrType::I32)),
+                    tt(Op::If {
+                        result_ty: IrType::I32,
+                        then_body: vec![
+                            tt(Op::LetGet {
+                                idx: MID,
+                                ty: IrType::I32,
+                            }),
+                            tt(Op::ConstI32(1)),
+                            tt(Op::Add(IrType::I32)),
+                            tt(Op::LetSet {
+                                idx: LO,
+                                ty: IrType::I32,
+                            }),
+                            tt(Op::ConstI32(0)),
+                        ],
+                        else_body: vec![
+                            tt(Op::LetGet {
+                                idx: MID,
+                                ty: IrType::I32,
+                            }),
+                            tt(Op::LetSet {
+                                idx: HI,
+                                ty: IrType::I32,
+                            }),
+                            tt(Op::ConstI32(0)),
+                        ],
+                    }),
+                    tt(Op::LetSet {
+                        idx: SINK,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::Br { label_depth: 0 }),
+                ],
+            })],
+        }),
+        tt(Op::LetGet {
+            idx: RESULT,
+            ty: IrType::I32,
+        }),
+        tt(Op::Return),
+    ]
 }
 
 /// v3++ b-5 internal helper:
@@ -3532,6 +3595,15 @@ fn ccc_lookup_helper() -> StdlibFunction {
 /// codepoint on a hit, or `-1` on a miss. Composition exclusions are
 /// filtered at generation time so the runtime needs no extra check.
 fn compose_lookup_helper() -> StdlibFunction {
+    StdlibFunction::new(
+        "__compose_lookup",
+        vec![IrType::I32, IrType::I32, IrType::I32],
+        IrType::I32,
+        compose_lookup_helper_body,
+    )
+}
+
+fn compose_lookup_helper_body() -> Vec<TaggedOp> {
     const COUNT: u32 = 0;
     const LO: u32 = 1;
     const HI: u32 = 2;
@@ -3541,221 +3613,216 @@ fn compose_lookup_helper() -> StdlibFunction {
     const KEY_B: u32 = 6;
     const SINK: u32 = 7;
     const RESULT: u32 = 8;
-    StdlibFunction {
-        name: "__compose_lookup",
-        params: vec![IrType::I32, IrType::I32, IrType::I32],
-        ret: IrType::I32,
-        body: vec![
-            tt(Op::LocalGet(2)),
-            tt(Op::LoadI32AtAbsolute { offset: 0 }),
-            tt(Op::LetSet {
-                idx: COUNT,
-                ty: IrType::I32,
-            }),
-            tt(Op::ConstI32(0)),
-            tt(Op::LetSet {
-                idx: LO,
-                ty: IrType::I32,
-            }),
-            tt(Op::LetGet {
-                idx: COUNT,
-                ty: IrType::I32,
-            }),
-            tt(Op::LetSet {
-                idx: HI,
-                ty: IrType::I32,
-            }),
-            // sentinel -1: codegen represents as 0xFFFFFFFF i32
-            tt(Op::ConstI32(-1)),
-            tt(Op::LetSet {
-                idx: RESULT,
-                ty: IrType::I32,
-            }),
-            tt(Op::Block {
+    vec![
+        tt(Op::LocalGet(2)),
+        tt(Op::LoadI32AtAbsolute { offset: 0 }),
+        tt(Op::LetSet {
+            idx: COUNT,
+            ty: IrType::I32,
+        }),
+        tt(Op::ConstI32(0)),
+        tt(Op::LetSet {
+            idx: LO,
+            ty: IrType::I32,
+        }),
+        tt(Op::LetGet {
+            idx: COUNT,
+            ty: IrType::I32,
+        }),
+        tt(Op::LetSet {
+            idx: HI,
+            ty: IrType::I32,
+        }),
+        // sentinel -1: codegen represents as 0xFFFFFFFF i32
+        tt(Op::ConstI32(-1)),
+        tt(Op::LetSet {
+            idx: RESULT,
+            ty: IrType::I32,
+        }),
+        tt(Op::Block {
+            result_ty: None,
+            body: vec![tt(Op::Loop {
                 result_ty: None,
-                body: vec![tt(Op::Loop {
-                    result_ty: None,
-                    body: vec![
-                        tt(Op::LetGet {
-                            idx: LO,
-                            ty: IrType::I32,
-                        }),
-                        tt(Op::LetGet {
-                            idx: HI,
-                            ty: IrType::I32,
-                        }),
-                        tt(Op::Ge(IrType::I32)),
-                        tt(Op::BrIf { label_depth: 1 }),
-                        tt(Op::LetGet {
-                            idx: LO,
-                            ty: IrType::I32,
-                        }),
-                        tt(Op::LetGet {
-                            idx: HI,
-                            ty: IrType::I32,
-                        }),
-                        tt(Op::Add(IrType::I32)),
-                        tt(Op::ConstI32(2)),
-                        tt(Op::Div(IrType::I32)),
-                        tt(Op::LetSet {
-                            idx: MID,
-                            ty: IrType::I32,
-                        }),
-                        // entry = table_addr + 4 + mid * 12
-                        tt(Op::LocalGet(2)),
-                        tt(Op::ConstI32(4)),
-                        tt(Op::Add(IrType::I32)),
-                        tt(Op::LetGet {
-                            idx: MID,
-                            ty: IrType::I32,
-                        }),
-                        tt(Op::ConstI32(12)),
-                        tt(Op::Mul(IrType::I32)),
-                        tt(Op::Add(IrType::I32)),
-                        tt(Op::LetSet {
-                            idx: ENTRY,
-                            ty: IrType::I32,
-                        }),
-                        tt(Op::LetGet {
-                            idx: ENTRY,
-                            ty: IrType::I32,
-                        }),
-                        tt(Op::LoadI32AtAbsolute { offset: 0 }),
-                        tt(Op::LetSet {
-                            idx: KEY_A,
-                            ty: IrType::I32,
-                        }),
-                        tt(Op::LetGet {
-                            idx: ENTRY,
-                            ty: IrType::I32,
-                        }),
-                        tt(Op::LoadI32AtAbsolute { offset: 4 }),
-                        tt(Op::LetSet {
-                            idx: KEY_B,
-                            ty: IrType::I32,
-                        }),
-                        // if key_a == first && key_b == second { match }
-                        tt(Op::LetGet {
-                            idx: KEY_A,
-                            ty: IrType::I32,
-                        }),
-                        tt(Op::LocalGet(0)),
-                        tt(Op::Eq(IrType::I32)),
-                        tt(Op::If {
-                            result_ty: IrType::I32,
-                            then_body: vec![
-                                tt(Op::LetGet {
-                                    idx: KEY_B,
-                                    ty: IrType::I32,
-                                }),
-                                tt(Op::LocalGet(1)),
-                                tt(Op::Eq(IrType::I32)),
-                                tt(Op::If {
-                                    result_ty: IrType::I32,
-                                    then_body: vec![
-                                        tt(Op::LetGet {
-                                            idx: ENTRY,
-                                            ty: IrType::I32,
-                                        }),
-                                        tt(Op::LoadI32AtAbsolute { offset: 8 }),
-                                        tt(Op::LetSet {
-                                            idx: RESULT,
-                                            ty: IrType::I32,
-                                        }),
-                                        // Depth 0 = inner If, 1 = outer If,
-                                        // 2 = Loop, 3 = Block. Jump out of
-                                        // the search Block on a hit.
-                                        tt(Op::Br { label_depth: 3 }),
-                                        tt(Op::ConstI32(0)),
-                                    ],
-                                    else_body: vec![tt(Op::ConstI32(0))],
-                                }),
-                            ],
-                            else_body: vec![tt(Op::ConstI32(0))],
-                        }),
-                        tt(Op::LetSet {
-                            idx: SINK,
-                            ty: IrType::I32,
-                        }),
-                        // Compare (key_a, key_b) < (first, second)?
-                        // if key_a < first OR (key_a == first AND
-                        //                       key_b < second): lo = mid + 1
-                        // else: hi = mid
-                        tt(Op::LetGet {
-                            idx: KEY_A,
-                            ty: IrType::I32,
-                        }),
-                        tt(Op::LocalGet(0)),
-                        tt(Op::Lt(IrType::I32)),
-                        tt(Op::If {
-                            result_ty: IrType::I32,
-                            then_body: vec![tt(Op::ConstI32(1))],
-                            else_body: vec![
-                                // key_a == first?
-                                tt(Op::LetGet {
-                                    idx: KEY_A,
-                                    ty: IrType::I32,
-                                }),
-                                tt(Op::LocalGet(0)),
-                                tt(Op::Eq(IrType::I32)),
-                                tt(Op::If {
-                                    result_ty: IrType::I32,
-                                    then_body: vec![
-                                        // key_b < second?
-                                        tt(Op::LetGet {
-                                            idx: KEY_B,
-                                            ty: IrType::I32,
-                                        }),
-                                        tt(Op::LocalGet(1)),
-                                        tt(Op::Lt(IrType::I32)),
-                                    ],
-                                    else_body: vec![tt(Op::ConstI32(0))],
-                                }),
-                            ],
-                        }),
-                        // top of stack: 1 if (key_a, key_b) < (first, second)
-                        tt(Op::If {
-                            result_ty: IrType::I32,
-                            then_body: vec![
-                                tt(Op::LetGet {
-                                    idx: MID,
-                                    ty: IrType::I32,
-                                }),
-                                tt(Op::ConstI32(1)),
-                                tt(Op::Add(IrType::I32)),
-                                tt(Op::LetSet {
-                                    idx: LO,
-                                    ty: IrType::I32,
-                                }),
-                                tt(Op::ConstI32(0)),
-                            ],
-                            else_body: vec![
-                                tt(Op::LetGet {
-                                    idx: MID,
-                                    ty: IrType::I32,
-                                }),
-                                tt(Op::LetSet {
-                                    idx: HI,
-                                    ty: IrType::I32,
-                                }),
-                                tt(Op::ConstI32(0)),
-                            ],
-                        }),
-                        tt(Op::LetSet {
-                            idx: SINK,
-                            ty: IrType::I32,
-                        }),
-                        tt(Op::Br { label_depth: 0 }),
-                    ],
-                })],
-            }),
-            tt(Op::LetGet {
-                idx: RESULT,
-                ty: IrType::I32,
-            }),
-            tt(Op::Return),
-        ],
-    }
+                body: vec![
+                    tt(Op::LetGet {
+                        idx: LO,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::LetGet {
+                        idx: HI,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::Ge(IrType::I32)),
+                    tt(Op::BrIf { label_depth: 1 }),
+                    tt(Op::LetGet {
+                        idx: LO,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::LetGet {
+                        idx: HI,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::Add(IrType::I32)),
+                    tt(Op::ConstI32(2)),
+                    tt(Op::Div(IrType::I32)),
+                    tt(Op::LetSet {
+                        idx: MID,
+                        ty: IrType::I32,
+                    }),
+                    // entry = table_addr + 4 + mid * 12
+                    tt(Op::LocalGet(2)),
+                    tt(Op::ConstI32(4)),
+                    tt(Op::Add(IrType::I32)),
+                    tt(Op::LetGet {
+                        idx: MID,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::ConstI32(12)),
+                    tt(Op::Mul(IrType::I32)),
+                    tt(Op::Add(IrType::I32)),
+                    tt(Op::LetSet {
+                        idx: ENTRY,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::LetGet {
+                        idx: ENTRY,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::LoadI32AtAbsolute { offset: 0 }),
+                    tt(Op::LetSet {
+                        idx: KEY_A,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::LetGet {
+                        idx: ENTRY,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::LoadI32AtAbsolute { offset: 4 }),
+                    tt(Op::LetSet {
+                        idx: KEY_B,
+                        ty: IrType::I32,
+                    }),
+                    // if key_a == first && key_b == second { match }
+                    tt(Op::LetGet {
+                        idx: KEY_A,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::LocalGet(0)),
+                    tt(Op::Eq(IrType::I32)),
+                    tt(Op::If {
+                        result_ty: IrType::I32,
+                        then_body: vec![
+                            tt(Op::LetGet {
+                                idx: KEY_B,
+                                ty: IrType::I32,
+                            }),
+                            tt(Op::LocalGet(1)),
+                            tt(Op::Eq(IrType::I32)),
+                            tt(Op::If {
+                                result_ty: IrType::I32,
+                                then_body: vec![
+                                    tt(Op::LetGet {
+                                        idx: ENTRY,
+                                        ty: IrType::I32,
+                                    }),
+                                    tt(Op::LoadI32AtAbsolute { offset: 8 }),
+                                    tt(Op::LetSet {
+                                        idx: RESULT,
+                                        ty: IrType::I32,
+                                    }),
+                                    // Depth 0 = inner If, 1 = outer If,
+                                    // 2 = Loop, 3 = Block. Jump out of
+                                    // the search Block on a hit.
+                                    tt(Op::Br { label_depth: 3 }),
+                                    tt(Op::ConstI32(0)),
+                                ],
+                                else_body: vec![tt(Op::ConstI32(0))],
+                            }),
+                        ],
+                        else_body: vec![tt(Op::ConstI32(0))],
+                    }),
+                    tt(Op::LetSet {
+                        idx: SINK,
+                        ty: IrType::I32,
+                    }),
+                    // Compare (key_a, key_b) < (first, second)?
+                    // if key_a < first OR (key_a == first AND
+                    //                       key_b < second): lo = mid + 1
+                    // else: hi = mid
+                    tt(Op::LetGet {
+                        idx: KEY_A,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::LocalGet(0)),
+                    tt(Op::Lt(IrType::I32)),
+                    tt(Op::If {
+                        result_ty: IrType::I32,
+                        then_body: vec![tt(Op::ConstI32(1))],
+                        else_body: vec![
+                            // key_a == first?
+                            tt(Op::LetGet {
+                                idx: KEY_A,
+                                ty: IrType::I32,
+                            }),
+                            tt(Op::LocalGet(0)),
+                            tt(Op::Eq(IrType::I32)),
+                            tt(Op::If {
+                                result_ty: IrType::I32,
+                                then_body: vec![
+                                    // key_b < second?
+                                    tt(Op::LetGet {
+                                        idx: KEY_B,
+                                        ty: IrType::I32,
+                                    }),
+                                    tt(Op::LocalGet(1)),
+                                    tt(Op::Lt(IrType::I32)),
+                                ],
+                                else_body: vec![tt(Op::ConstI32(0))],
+                            }),
+                        ],
+                    }),
+                    // top of stack: 1 if (key_a, key_b) < (first, second)
+                    tt(Op::If {
+                        result_ty: IrType::I32,
+                        then_body: vec![
+                            tt(Op::LetGet {
+                                idx: MID,
+                                ty: IrType::I32,
+                            }),
+                            tt(Op::ConstI32(1)),
+                            tt(Op::Add(IrType::I32)),
+                            tt(Op::LetSet {
+                                idx: LO,
+                                ty: IrType::I32,
+                            }),
+                            tt(Op::ConstI32(0)),
+                        ],
+                        else_body: vec![
+                            tt(Op::LetGet {
+                                idx: MID,
+                                ty: IrType::I32,
+                            }),
+                            tt(Op::LetSet {
+                                idx: HI,
+                                ty: IrType::I32,
+                            }),
+                            tt(Op::ConstI32(0)),
+                        ],
+                    }),
+                    tt(Op::LetSet {
+                        idx: SINK,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::Br { label_depth: 0 }),
+                ],
+            })],
+        }),
+        tt(Op::LetGet {
+            idx: RESULT,
+            ty: IrType::I32,
+        }),
+        tt(Op::Return),
+    ]
 }
 
 /// v3++ b-5 normalization form discriminator for [`normalize_body`].
@@ -3772,15 +3839,6 @@ pub(crate) enum NormForm {
 }
 
 impl NormForm {
-    fn name(self) -> &'static str {
-        match self {
-            NormForm::Nfd => "nfd",
-            NormForm::Nfkd => "nfkd",
-            NormForm::Nfc => "nfc",
-            NormForm::Nfkc => "nfkc",
-        }
-    }
-
     /// `true` when the form uses the compatibility (NFKD) decomposition
     /// table; `false` for canonical (NFD).
     fn use_compatibility(self) -> bool {
@@ -3795,19 +3853,27 @@ impl NormForm {
 }
 
 fn nfd_string() -> StdlibFunction {
-    normalize_body(NormForm::Nfd)
+    StdlibFunction::new("nfd", vec![IrType::String], IrType::String, || {
+        normalize_body_ops(NormForm::Nfd)
+    })
 }
 
 fn nfkd_string() -> StdlibFunction {
-    normalize_body(NormForm::Nfkd)
+    StdlibFunction::new("nfkd", vec![IrType::String], IrType::String, || {
+        normalize_body_ops(NormForm::Nfkd)
+    })
 }
 
 fn nfc_string() -> StdlibFunction {
-    normalize_body(NormForm::Nfc)
+    StdlibFunction::new("nfc", vec![IrType::String], IrType::String, || {
+        normalize_body_ops(NormForm::Nfc)
+    })
 }
 
 fn nfkc_string() -> StdlibFunction {
-    normalize_body(NormForm::Nfkc)
+    StdlibFunction::new("nfkc", vec![IrType::String], IrType::String, || {
+        normalize_body_ops(NormForm::Nfkc)
+    })
 }
 
 /// Shared body builder for `nfd` / `nfkd` / `nfc` / `nfkc`.
@@ -3867,7 +3933,7 @@ fn nfkc_string() -> StdlibFunction {
 ///   * 16 `k:       I32` - reorder pass cursor.
 ///   * 17 `run_end: I32` - end of current non-starter run during reorder.
 #[allow(clippy::vec_init_then_push, clippy::too_many_lines)]
-fn normalize_body(form: NormForm) -> StdlibFunction {
+fn normalize_body_ops(form: NormForm) -> Vec<TaggedOp> {
     const S_LEN: u32 = 0;
     const CP_BASE: u32 = 1;
     const OUT_BASE: u32 = 2;
@@ -5907,12 +5973,10 @@ fn normalize_body(form: NormForm) -> StdlibFunction {
     }));
     body.push(tt(Op::Return));
 
-    StdlibFunction {
-        name: form.name(),
-        params: vec![IrType::String],
-        ret: IrType::String,
-        body,
-    }
+    // F-D2-G: name / params / ret tuple is wired by the caller's
+    // `StdlibFunction::new` invocation; this helper only emits the
+    // op stream for the given normalization form.
+    body
 }
 
 ///
@@ -5920,6 +5984,9 @@ fn normalize_body(form: NormForm) -> StdlibFunction {
 /// — see the module-level comment for why that order is part of the
 /// wire format.
 pub fn stdlib_function_index(name: &str) -> Option<u32> {
+    // F-D2-G: lookup only consults the cached name slice — never
+    // touches a body, so the eager lookup stays O(N) over the
+    // metadata vector without forcing the lazy bodies to build.
     builtin_stdlib()
         .iter()
         .position(|f| f.name == name)
@@ -6053,212 +6120,216 @@ pub fn stdlib_closure_arg_signature(name: &str, arg_idx: u32) -> Option<(Vec<IrT
 ///   * 2 — `len_i32:   I32` (narrowed)
 ///   * 3 — `base:      I32`
 fn substring_string() -> StdlibFunction {
+    StdlibFunction::new(
+        "substring",
+        vec![IrType::String, IrType::I64, IrType::I64],
+        IrType::String,
+        substring_string_body,
+    )
+}
+
+fn substring_string_body() -> Vec<TaggedOp> {
     const S_LEN: u32 = 0;
     const START_I32: u32 = 1;
     const LEN_I32: u32 = 2;
     const BASE: u32 = 3;
-    StdlibFunction {
-        name: "substring",
-        params: vec![IrType::String, IrType::I64, IrType::I64],
-        ret: IrType::String,
-        body: vec![
-            // s_len = load_i32(s, 0)
-            tt(Op::LocalGet(0)),
-            tt(Op::LoadI32AtAbsolute { offset: 0 }),
-            tt(Op::LetSet {
-                idx: S_LEN,
-                ty: IrType::I32,
-            }),
-            // -----------------------------------------------------
-            // Bounds check (all in i64 space against zero and s_len)
-            //   if start < 0           => trap
-            //   if len < 0             => trap
-            //   if start + len > s_len => trap  (signed compare)
-            // -----------------------------------------------------
-            // if start < 0 { trap }
-            tt(Op::LocalGet(1)),
-            tt(Op::ConstI64(0)),
-            tt(Op::Lt(IrType::I64)),
-            tt(Op::If {
-                result_ty: IrType::I32,
-                then_body: vec![
-                    tt(Op::Trap {
-                        kind: TrapKind::IndexOutOfBounds,
-                    }),
-                    // Unreachable but needed to satisfy the wasm
-                    // verifier's both-arms-typed contract — push a
-                    // placeholder i32 the outer code drops.
-                    tt(Op::ConstI32(0)),
-                ],
-                else_body: vec![tt(Op::ConstI32(0))],
-            }),
-            tt(Op::LetSet {
-                idx: BASE, /* reuse BASE as a scratch sink */
-                ty: IrType::I32,
-            }),
-            // if len < 0 { trap }
-            tt(Op::LocalGet(2)),
-            tt(Op::ConstI64(0)),
-            tt(Op::Lt(IrType::I64)),
-            tt(Op::If {
-                result_ty: IrType::I32,
-                then_body: vec![
-                    tt(Op::Trap {
-                        kind: TrapKind::IndexOutOfBounds,
-                    }),
-                    tt(Op::ConstI32(0)),
-                ],
-                else_body: vec![tt(Op::ConstI32(0))],
-            }),
-            tt(Op::LetSet {
-                idx: BASE,
-                ty: IrType::I32,
-            }),
-            // if start + len > s_len { trap }
-            //   compute `start + len` in i64 then compare against
-            //   the i64-extended s_len. We extend s_len by going
-            //   through a let-set/get into an i32 then promoting via
-            //   `i64.extend_i32_u`-style. Without a direct extend
-            //   op we go through ReadStringLen (which extends), but
-            //   that requires re-loading s. Simpler: compute
-            //   `start + len` in i64 then compare against
-            //   `ReadStringLen(s)` which already returns i64.
-            tt(Op::LocalGet(1)),
-            tt(Op::LocalGet(2)),
-            tt(Op::Add(IrType::I64)),
-            // s.length as i64
-            tt(Op::LocalGet(0)),
-            tt(Op::ReadStringLen),
-            tt(Op::Gt(IrType::I64)),
-            tt(Op::If {
-                result_ty: IrType::I32,
-                then_body: vec![
-                    tt(Op::Trap {
-                        kind: TrapKind::IndexOutOfBounds,
-                    }),
-                    tt(Op::ConstI32(0)),
-                ],
-                else_body: vec![tt(Op::ConstI32(0))],
-            }),
-            tt(Op::LetSet {
-                idx: BASE,
-                ty: IrType::I32,
-            }),
-            // -----------------------------------------------------
-            // Bounds-check survived; narrow start / len to i32.
-            //   We could go through a dedicated `WrapI64` op; lacking
-            //   one, the bounds check above guarantees `0 <= v <= s_len`
-            //   and the string layout caps `s_len` at u32, so the
-            //   high i32 of each value is zero. We use a wasm `select`
-            //   round-trip: `select(v_low, 0, v != 0)` — but that
-            //   only preserves zero/nonzero. Cleanest: route through
-            //   a `Sub` between the i64 value and its high half (0)
-            //   to coerce to i32. We instead leverage the fact that
-            //   the surface signature for substring intends i32 lengths
-            //   in practice; we introduce two helper sub-ops below.
-            //
-            // Pragmatic narrowing: cast via i64 -> i32 by computing
-            //   v_i32 = (v_i64 + 0) and then a Lt(I64) trap above
-            //   guarantees fit. Without a dedicated wrap op the
-            //   stdlib can't do it; we add the wrap as an
-            //   AllocScratchDyn-friendly path: store v into a wide
-            //   slot, then read the low i32. Use the scratch heap
-            //   as a temporary u64-to-u32 conversion:
-            //     allocate 8 scratch bytes
-            //     store_i64(scratch, 0, v_i64)
-            //     load_i32(scratch, 0)  -> low i32
-            // -----------------------------------------------------
-            // Narrow start.
-            tt(Op::ConstI32(8)),
-            tt(Op::AllocScratchDyn),
-            tt(Op::LetSet {
-                idx: BASE, /* reuse as narrow_scratch */
-                ty: IrType::I32,
-            }),
-            tt(Op::LetGet {
-                idx: BASE,
-                ty: IrType::I32,
-            }),
-            tt(Op::LocalGet(1)),
-            tt(Op::StoreI64AtAbsolute { offset: 0 }),
-            tt(Op::LetGet {
-                idx: BASE,
-                ty: IrType::I32,
-            }),
-            tt(Op::LoadI32AtAbsolute { offset: 0 }),
-            tt(Op::LetSet {
-                idx: START_I32,
-                ty: IrType::I32,
-            }),
-            // Narrow len (reuse the same scratch slot).
-            tt(Op::LetGet {
-                idx: BASE,
-                ty: IrType::I32,
-            }),
-            tt(Op::LocalGet(2)),
-            tt(Op::StoreI64AtAbsolute { offset: 0 }),
-            tt(Op::LetGet {
-                idx: BASE,
-                ty: IrType::I32,
-            }),
-            tt(Op::LoadI32AtAbsolute { offset: 0 }),
-            tt(Op::LetSet {
-                idx: LEN_I32,
-                ty: IrType::I32,
-            }),
-            // -----------------------------------------------------
-            // Build the result record.
-            // -----------------------------------------------------
-            // record_size = len + 4
-            tt(Op::LetGet {
-                idx: LEN_I32,
-                ty: IrType::I32,
-            }),
-            tt(Op::ConstI32(4)),
-            tt(Op::Add(IrType::I32)),
-            tt(Op::AllocScratchDyn),
-            tt(Op::LetSet {
-                idx: BASE,
-                ty: IrType::I32,
-            }),
-            // store header
-            tt(Op::LetGet {
-                idx: BASE,
-                ty: IrType::I32,
-            }),
-            tt(Op::LetGet {
-                idx: LEN_I32,
-                ty: IrType::I32,
-            }),
-            tt(Op::StoreI32AtAbsolute { offset: 0 }),
-            // memcpy(base + 4, s + 4 + start, len)
-            tt(Op::LetGet {
-                idx: BASE,
-                ty: IrType::I32,
-            }),
-            tt(Op::ConstI32(4)),
-            tt(Op::Add(IrType::I32)),
-            tt(Op::LocalGet(0)),
-            tt(Op::ConstI32(4)),
-            tt(Op::Add(IrType::I32)),
-            tt(Op::LetGet {
-                idx: START_I32,
-                ty: IrType::I32,
-            }),
-            tt(Op::Add(IrType::I32)),
-            tt(Op::LetGet {
-                idx: LEN_I32,
-                ty: IrType::I32,
-            }),
-            tt(Op::MemcpyAtAbsolute),
-            // return base
-            tt(Op::LetGet {
-                idx: BASE,
-                ty: IrType::I32,
-            }),
-            tt(Op::Return),
-        ],
-    }
+    vec![
+        // s_len = load_i32(s, 0)
+        tt(Op::LocalGet(0)),
+        tt(Op::LoadI32AtAbsolute { offset: 0 }),
+        tt(Op::LetSet {
+            idx: S_LEN,
+            ty: IrType::I32,
+        }),
+        // -----------------------------------------------------
+        // Bounds check (all in i64 space against zero and s_len)
+        //   if start < 0           => trap
+        //   if len < 0             => trap
+        //   if start + len > s_len => trap  (signed compare)
+        // -----------------------------------------------------
+        // if start < 0 { trap }
+        tt(Op::LocalGet(1)),
+        tt(Op::ConstI64(0)),
+        tt(Op::Lt(IrType::I64)),
+        tt(Op::If {
+            result_ty: IrType::I32,
+            then_body: vec![
+                tt(Op::Trap {
+                    kind: TrapKind::IndexOutOfBounds,
+                }),
+                // Unreachable but needed to satisfy the wasm
+                // verifier's both-arms-typed contract — push a
+                // placeholder i32 the outer code drops.
+                tt(Op::ConstI32(0)),
+            ],
+            else_body: vec![tt(Op::ConstI32(0))],
+        }),
+        tt(Op::LetSet {
+            idx: BASE, /* reuse BASE as a scratch sink */
+            ty: IrType::I32,
+        }),
+        // if len < 0 { trap }
+        tt(Op::LocalGet(2)),
+        tt(Op::ConstI64(0)),
+        tt(Op::Lt(IrType::I64)),
+        tt(Op::If {
+            result_ty: IrType::I32,
+            then_body: vec![
+                tt(Op::Trap {
+                    kind: TrapKind::IndexOutOfBounds,
+                }),
+                tt(Op::ConstI32(0)),
+            ],
+            else_body: vec![tt(Op::ConstI32(0))],
+        }),
+        tt(Op::LetSet {
+            idx: BASE,
+            ty: IrType::I32,
+        }),
+        // if start + len > s_len { trap }
+        //   compute `start + len` in i64 then compare against
+        //   the i64-extended s_len. We extend s_len by going
+        //   through a let-set/get into an i32 then promoting via
+        //   `i64.extend_i32_u`-style. Without a direct extend
+        //   op we go through ReadStringLen (which extends), but
+        //   that requires re-loading s. Simpler: compute
+        //   `start + len` in i64 then compare against
+        //   `ReadStringLen(s)` which already returns i64.
+        tt(Op::LocalGet(1)),
+        tt(Op::LocalGet(2)),
+        tt(Op::Add(IrType::I64)),
+        // s.length as i64
+        tt(Op::LocalGet(0)),
+        tt(Op::ReadStringLen),
+        tt(Op::Gt(IrType::I64)),
+        tt(Op::If {
+            result_ty: IrType::I32,
+            then_body: vec![
+                tt(Op::Trap {
+                    kind: TrapKind::IndexOutOfBounds,
+                }),
+                tt(Op::ConstI32(0)),
+            ],
+            else_body: vec![tt(Op::ConstI32(0))],
+        }),
+        tt(Op::LetSet {
+            idx: BASE,
+            ty: IrType::I32,
+        }),
+        // -----------------------------------------------------
+        // Bounds-check survived; narrow start / len to i32.
+        //   We could go through a dedicated `WrapI64` op; lacking
+        //   one, the bounds check above guarantees `0 <= v <= s_len`
+        //   and the string layout caps `s_len` at u32, so the
+        //   high i32 of each value is zero. We use a wasm `select`
+        //   round-trip: `select(v_low, 0, v != 0)` — but that
+        //   only preserves zero/nonzero. Cleanest: route through
+        //   a `Sub` between the i64 value and its high half (0)
+        //   to coerce to i32. We instead leverage the fact that
+        //   the surface signature for substring intends i32 lengths
+        //   in practice; we introduce two helper sub-ops below.
+        //
+        // Pragmatic narrowing: cast via i64 -> i32 by computing
+        //   v_i32 = (v_i64 + 0) and then a Lt(I64) trap above
+        //   guarantees fit. Without a dedicated wrap op the
+        //   stdlib can't do it; we add the wrap as an
+        //   AllocScratchDyn-friendly path: store v into a wide
+        //   slot, then read the low i32. Use the scratch heap
+        //   as a temporary u64-to-u32 conversion:
+        //     allocate 8 scratch bytes
+        //     store_i64(scratch, 0, v_i64)
+        //     load_i32(scratch, 0)  -> low i32
+        // -----------------------------------------------------
+        // Narrow start.
+        tt(Op::ConstI32(8)),
+        tt(Op::AllocScratchDyn),
+        tt(Op::LetSet {
+            idx: BASE, /* reuse as narrow_scratch */
+            ty: IrType::I32,
+        }),
+        tt(Op::LetGet {
+            idx: BASE,
+            ty: IrType::I32,
+        }),
+        tt(Op::LocalGet(1)),
+        tt(Op::StoreI64AtAbsolute { offset: 0 }),
+        tt(Op::LetGet {
+            idx: BASE,
+            ty: IrType::I32,
+        }),
+        tt(Op::LoadI32AtAbsolute { offset: 0 }),
+        tt(Op::LetSet {
+            idx: START_I32,
+            ty: IrType::I32,
+        }),
+        // Narrow len (reuse the same scratch slot).
+        tt(Op::LetGet {
+            idx: BASE,
+            ty: IrType::I32,
+        }),
+        tt(Op::LocalGet(2)),
+        tt(Op::StoreI64AtAbsolute { offset: 0 }),
+        tt(Op::LetGet {
+            idx: BASE,
+            ty: IrType::I32,
+        }),
+        tt(Op::LoadI32AtAbsolute { offset: 0 }),
+        tt(Op::LetSet {
+            idx: LEN_I32,
+            ty: IrType::I32,
+        }),
+        // -----------------------------------------------------
+        // Build the result record.
+        // -----------------------------------------------------
+        // record_size = len + 4
+        tt(Op::LetGet {
+            idx: LEN_I32,
+            ty: IrType::I32,
+        }),
+        tt(Op::ConstI32(4)),
+        tt(Op::Add(IrType::I32)),
+        tt(Op::AllocScratchDyn),
+        tt(Op::LetSet {
+            idx: BASE,
+            ty: IrType::I32,
+        }),
+        // store header
+        tt(Op::LetGet {
+            idx: BASE,
+            ty: IrType::I32,
+        }),
+        tt(Op::LetGet {
+            idx: LEN_I32,
+            ty: IrType::I32,
+        }),
+        tt(Op::StoreI32AtAbsolute { offset: 0 }),
+        // memcpy(base + 4, s + 4 + start, len)
+        tt(Op::LetGet {
+            idx: BASE,
+            ty: IrType::I32,
+        }),
+        tt(Op::ConstI32(4)),
+        tt(Op::Add(IrType::I32)),
+        tt(Op::LocalGet(0)),
+        tt(Op::ConstI32(4)),
+        tt(Op::Add(IrType::I32)),
+        tt(Op::LetGet {
+            idx: START_I32,
+            ty: IrType::I32,
+        }),
+        tt(Op::Add(IrType::I32)),
+        tt(Op::LetGet {
+            idx: LEN_I32,
+            ty: IrType::I32,
+        }),
+        tt(Op::MemcpyAtAbsolute),
+        // return base
+        tt(Op::LetGet {
+            idx: BASE,
+            ty: IrType::I32,
+        }),
+        tt(Op::Return),
+    ]
 }
 
 /// Hand-written body for `starts_with(s: String, prefix: String) -> Bool`.
@@ -6278,157 +6349,161 @@ fn substring_string() -> StdlibFunction {
 ///   * 2 — `i:     I32`
 ///   * 3 — `acc:   I32` (running result; 1 = still matches, 0 = miss)
 fn starts_with_string() -> StdlibFunction {
+    StdlibFunction::new(
+        "starts_with",
+        vec![IrType::String, IrType::String],
+        IrType::Bool,
+        starts_with_string_body,
+    )
+}
+
+fn starts_with_string_body() -> Vec<TaggedOp> {
     const S_LEN: u32 = 0;
     const P_LEN: u32 = 1;
     const I: u32 = 2;
     const ACC: u32 = 3;
-    StdlibFunction {
-        name: "starts_with",
-        params: vec![IrType::String, IrType::String],
-        ret: IrType::Bool,
-        body: vec![
-            // s_len = load_i32(s)
-            tt(Op::LocalGet(0)),
-            tt(Op::LoadI32AtAbsolute { offset: 0 }),
-            tt(Op::LetSet {
-                idx: S_LEN,
-                ty: IrType::I32,
-            }),
-            // p_len = load_i32(p)
-            tt(Op::LocalGet(1)),
-            tt(Op::LoadI32AtAbsolute { offset: 0 }),
-            tt(Op::LetSet {
-                idx: P_LEN,
-                ty: IrType::I32,
-            }),
-            // if p_len > s_len { return false }
-            //   We express the early-out via an if/else producing
-            //   the final Bool. Both arms must produce a value of
-            //   the same type; the false arm returns 0, the true arm
-            //   runs the loop and returns the final acc.
-            tt(Op::LetGet {
-                idx: P_LEN,
-                ty: IrType::I32,
-            }),
-            tt(Op::LetGet {
-                idx: S_LEN,
-                ty: IrType::I32,
-            }),
-            tt(Op::Gt(IrType::I32)),
-            tt(Op::If {
-                result_ty: IrType::Bool,
-                then_body: vec![tt(Op::ConstBool(false))],
-                else_body: vec![
-                    // acc = 1 (true so far)
-                    tt(Op::ConstI32(1)),
-                    tt(Op::LetSet {
-                        idx: ACC,
-                        ty: IrType::I32,
-                    }),
-                    // i = 0
-                    tt(Op::ConstI32(0)),
-                    tt(Op::LetSet {
-                        idx: I,
-                        ty: IrType::I32,
-                    }),
-                    // block { loop { ... } }
-                    tt(Op::Block {
+    vec![
+        // s_len = load_i32(s)
+        tt(Op::LocalGet(0)),
+        tt(Op::LoadI32AtAbsolute { offset: 0 }),
+        tt(Op::LetSet {
+            idx: S_LEN,
+            ty: IrType::I32,
+        }),
+        // p_len = load_i32(p)
+        tt(Op::LocalGet(1)),
+        tt(Op::LoadI32AtAbsolute { offset: 0 }),
+        tt(Op::LetSet {
+            idx: P_LEN,
+            ty: IrType::I32,
+        }),
+        // if p_len > s_len { return false }
+        //   We express the early-out via an if/else producing
+        //   the final Bool. Both arms must produce a value of
+        //   the same type; the false arm returns 0, the true arm
+        //   runs the loop and returns the final acc.
+        tt(Op::LetGet {
+            idx: P_LEN,
+            ty: IrType::I32,
+        }),
+        tt(Op::LetGet {
+            idx: S_LEN,
+            ty: IrType::I32,
+        }),
+        tt(Op::Gt(IrType::I32)),
+        tt(Op::If {
+            result_ty: IrType::Bool,
+            then_body: vec![tt(Op::ConstBool(false))],
+            else_body: vec![
+                // acc = 1 (true so far)
+                tt(Op::ConstI32(1)),
+                tt(Op::LetSet {
+                    idx: ACC,
+                    ty: IrType::I32,
+                }),
+                // i = 0
+                tt(Op::ConstI32(0)),
+                tt(Op::LetSet {
+                    idx: I,
+                    ty: IrType::I32,
+                }),
+                // block { loop { ... } }
+                tt(Op::Block {
+                    result_ty: None,
+                    body: vec![tt(Op::Loop {
                         result_ty: None,
-                        body: vec![tt(Op::Loop {
-                            result_ty: None,
-                            body: vec![
-                                // exit when i >= p_len
-                                tt(Op::LetGet {
-                                    idx: I,
-                                    ty: IrType::I32,
-                                }),
-                                tt(Op::LetGet {
-                                    idx: P_LEN,
-                                    ty: IrType::I32,
-                                }),
-                                tt(Op::Ge(IrType::I32)),
-                                tt(Op::BrIf { label_depth: 1 }),
-                                // sb = i32.load8_u(s + 4 + i)
-                                tt(Op::LocalGet(0)),
-                                tt(Op::ConstI32(4)),
-                                tt(Op::Add(IrType::I32)),
-                                tt(Op::LetGet {
-                                    idx: I,
-                                    ty: IrType::I32,
-                                }),
-                                tt(Op::Add(IrType::I32)),
-                                tt(Op::LoadI8UAtAbsolute { offset: 0 }),
-                                // pb = i32.load8_u(p + 4 + i)
-                                tt(Op::LocalGet(1)),
-                                tt(Op::ConstI32(4)),
-                                tt(Op::Add(IrType::I32)),
-                                tt(Op::LetGet {
-                                    idx: I,
-                                    ty: IrType::I32,
-                                }),
-                                tt(Op::Add(IrType::I32)),
-                                tt(Op::LoadI8UAtAbsolute { offset: 0 }),
-                                // if sb != pb { acc = 0; br 1 }
-                                tt(Op::Ne(IrType::I32)),
-                                tt(Op::If {
-                                    result_ty: IrType::I32,
-                                    then_body: vec![
-                                        tt(Op::ConstI32(0)),
-                                        tt(Op::LetSet {
-                                            idx: ACC,
-                                            ty: IrType::I32,
-                                        }),
-                                        // Use a sentinel i32 to keep the
-                                        // arm typed; the Br exits before
-                                        // any caller observes it.
-                                        tt(Op::ConstI32(0)),
-                                        tt(Op::Br { label_depth: 2 }),
-                                    ],
-                                    else_body: vec![tt(Op::ConstI32(0))],
-                                }),
-                                // Drop the i32 the If produced
-                                // (codegen has no Drop op; instead we
-                                // sink it into a let we ignore).
-                                tt(Op::LetSet {
-                                    idx: ACC, /* harmlessly overwritten next iter */
-                                    ty: IrType::I32,
-                                }),
-                                // Restore acc to its earlier value
-                                // (it was 1 entering this iteration
-                                // and we just clobbered it). Cheaper:
-                                // hoist the sink to a scratch local.
-                                tt(Op::ConstI32(1)),
-                                tt(Op::LetSet {
-                                    idx: ACC,
-                                    ty: IrType::I32,
-                                }),
-                                // i = i + 1
-                                tt(Op::LetGet {
-                                    idx: I,
-                                    ty: IrType::I32,
-                                }),
-                                tt(Op::ConstI32(1)),
-                                tt(Op::Add(IrType::I32)),
-                                tt(Op::LetSet {
-                                    idx: I,
-                                    ty: IrType::I32,
-                                }),
-                                tt(Op::Br { label_depth: 0 }),
-                            ],
-                        })],
-                    }),
-                    // Result = acc != 0
-                    tt(Op::LetGet {
-                        idx: ACC,
-                        ty: IrType::I32,
-                    }),
-                    tt(Op::ConstI32(0)),
-                    tt(Op::Ne(IrType::I32)),
-                ],
-            }),
-            tt(Op::Return),
-        ],
-    }
+                        body: vec![
+                            // exit when i >= p_len
+                            tt(Op::LetGet {
+                                idx: I,
+                                ty: IrType::I32,
+                            }),
+                            tt(Op::LetGet {
+                                idx: P_LEN,
+                                ty: IrType::I32,
+                            }),
+                            tt(Op::Ge(IrType::I32)),
+                            tt(Op::BrIf { label_depth: 1 }),
+                            // sb = i32.load8_u(s + 4 + i)
+                            tt(Op::LocalGet(0)),
+                            tt(Op::ConstI32(4)),
+                            tt(Op::Add(IrType::I32)),
+                            tt(Op::LetGet {
+                                idx: I,
+                                ty: IrType::I32,
+                            }),
+                            tt(Op::Add(IrType::I32)),
+                            tt(Op::LoadI8UAtAbsolute { offset: 0 }),
+                            // pb = i32.load8_u(p + 4 + i)
+                            tt(Op::LocalGet(1)),
+                            tt(Op::ConstI32(4)),
+                            tt(Op::Add(IrType::I32)),
+                            tt(Op::LetGet {
+                                idx: I,
+                                ty: IrType::I32,
+                            }),
+                            tt(Op::Add(IrType::I32)),
+                            tt(Op::LoadI8UAtAbsolute { offset: 0 }),
+                            // if sb != pb { acc = 0; br 1 }
+                            tt(Op::Ne(IrType::I32)),
+                            tt(Op::If {
+                                result_ty: IrType::I32,
+                                then_body: vec![
+                                    tt(Op::ConstI32(0)),
+                                    tt(Op::LetSet {
+                                        idx: ACC,
+                                        ty: IrType::I32,
+                                    }),
+                                    // Use a sentinel i32 to keep the
+                                    // arm typed; the Br exits before
+                                    // any caller observes it.
+                                    tt(Op::ConstI32(0)),
+                                    tt(Op::Br { label_depth: 2 }),
+                                ],
+                                else_body: vec![tt(Op::ConstI32(0))],
+                            }),
+                            // Drop the i32 the If produced
+                            // (codegen has no Drop op; instead we
+                            // sink it into a let we ignore).
+                            tt(Op::LetSet {
+                                idx: ACC, /* harmlessly overwritten next iter */
+                                ty: IrType::I32,
+                            }),
+                            // Restore acc to its earlier value
+                            // (it was 1 entering this iteration
+                            // and we just clobbered it). Cheaper:
+                            // hoist the sink to a scratch local.
+                            tt(Op::ConstI32(1)),
+                            tt(Op::LetSet {
+                                idx: ACC,
+                                ty: IrType::I32,
+                            }),
+                            // i = i + 1
+                            tt(Op::LetGet {
+                                idx: I,
+                                ty: IrType::I32,
+                            }),
+                            tt(Op::ConstI32(1)),
+                            tt(Op::Add(IrType::I32)),
+                            tt(Op::LetSet {
+                                idx: I,
+                                ty: IrType::I32,
+                            }),
+                            tt(Op::Br { label_depth: 0 }),
+                        ],
+                    })],
+                }),
+                // Result = acc != 0
+                tt(Op::LetGet {
+                    idx: ACC,
+                    ty: IrType::I32,
+                }),
+                tt(Op::ConstI32(0)),
+                tt(Op::Ne(IrType::I32)),
+            ],
+        }),
+        tt(Op::Return),
+    ]
 }
 
 /// F-D7-D body for `contains(haystack: String, needle: String) -> Bool`.
@@ -6458,6 +6533,15 @@ fn starts_with_string() -> StdlibFunction {
 /// Returned `Bool` is encoded as `i32` (0 / 1), matching every other
 /// `Bool`-returning stdlib body.
 fn contains_string() -> StdlibFunction {
+    StdlibFunction::new(
+        "contains",
+        vec![IrType::String, IrType::String],
+        IrType::Bool,
+        contains_string_body,
+    )
+}
+
+fn contains_string_body() -> Vec<TaggedOp> {
     const S_LEN: u32 = 0;
     const P_LEN: u32 = 1;
     const LAST_START: u32 = 2;
@@ -6465,226 +6549,221 @@ fn contains_string() -> StdlibFunction {
     const J: u32 = 4;
     const MISMATCH: u32 = 5;
     const FOUND: u32 = 6;
-    StdlibFunction {
-        name: "contains",
-        params: vec![IrType::String, IrType::String],
-        ret: IrType::Bool,
-        body: vec![
-            // s_len = load_i32(s, 0)
-            tt(Op::LocalGet(0)),
-            tt(Op::LoadI32AtAbsolute { offset: 0 }),
-            tt(Op::LetSet {
-                idx: S_LEN,
-                ty: IrType::I32,
-            }),
-            // p_len = load_i32(p, 0)
-            tt(Op::LocalGet(1)),
-            tt(Op::LoadI32AtAbsolute { offset: 0 }),
-            tt(Op::LetSet {
-                idx: P_LEN,
-                ty: IrType::I32,
-            }),
-            // if p_len > s_len { return false }
-            tt(Op::LetGet {
-                idx: P_LEN,
-                ty: IrType::I32,
-            }),
-            tt(Op::LetGet {
-                idx: S_LEN,
-                ty: IrType::I32,
-            }),
-            tt(Op::Gt(IrType::I32)),
-            tt(Op::If {
-                result_ty: IrType::Bool,
-                then_body: vec![tt(Op::ConstBool(false))],
-                else_body: vec![
-                    // if p_len == 0 { return true }
-                    tt(Op::LetGet {
-                        idx: P_LEN,
-                        ty: IrType::I32,
-                    }),
-                    tt(Op::ConstI32(0)),
-                    tt(Op::Eq(IrType::I32)),
-                    tt(Op::If {
-                        result_ty: IrType::Bool,
-                        then_body: vec![tt(Op::ConstBool(true))],
-                        else_body: vec![
-                            // last_start = s_len - p_len
-                            tt(Op::LetGet {
-                                idx: S_LEN,
-                                ty: IrType::I32,
-                            }),
-                            tt(Op::LetGet {
-                                idx: P_LEN,
-                                ty: IrType::I32,
-                            }),
-                            tt(Op::Sub(IrType::I32)),
-                            tt(Op::LetSet {
-                                idx: LAST_START,
-                                ty: IrType::I32,
-                            }),
-                            // i = 0; found = 0
-                            tt(Op::ConstI32(0)),
-                            tt(Op::LetSet {
-                                idx: I,
-                                ty: IrType::I32,
-                            }),
-                            tt(Op::ConstI32(0)),
-                            tt(Op::LetSet {
-                                idx: FOUND,
-                                ty: IrType::I32,
-                            }),
-                            // outer scan
-                            tt(Op::Block {
+    vec![
+        // s_len = load_i32(s, 0)
+        tt(Op::LocalGet(0)),
+        tt(Op::LoadI32AtAbsolute { offset: 0 }),
+        tt(Op::LetSet {
+            idx: S_LEN,
+            ty: IrType::I32,
+        }),
+        // p_len = load_i32(p, 0)
+        tt(Op::LocalGet(1)),
+        tt(Op::LoadI32AtAbsolute { offset: 0 }),
+        tt(Op::LetSet {
+            idx: P_LEN,
+            ty: IrType::I32,
+        }),
+        // if p_len > s_len { return false }
+        tt(Op::LetGet {
+            idx: P_LEN,
+            ty: IrType::I32,
+        }),
+        tt(Op::LetGet {
+            idx: S_LEN,
+            ty: IrType::I32,
+        }),
+        tt(Op::Gt(IrType::I32)),
+        tt(Op::If {
+            result_ty: IrType::Bool,
+            then_body: vec![tt(Op::ConstBool(false))],
+            else_body: vec![
+                // if p_len == 0 { return true }
+                tt(Op::LetGet {
+                    idx: P_LEN,
+                    ty: IrType::I32,
+                }),
+                tt(Op::ConstI32(0)),
+                tt(Op::Eq(IrType::I32)),
+                tt(Op::If {
+                    result_ty: IrType::Bool,
+                    then_body: vec![tt(Op::ConstBool(true))],
+                    else_body: vec![
+                        // last_start = s_len - p_len
+                        tt(Op::LetGet {
+                            idx: S_LEN,
+                            ty: IrType::I32,
+                        }),
+                        tt(Op::LetGet {
+                            idx: P_LEN,
+                            ty: IrType::I32,
+                        }),
+                        tt(Op::Sub(IrType::I32)),
+                        tt(Op::LetSet {
+                            idx: LAST_START,
+                            ty: IrType::I32,
+                        }),
+                        // i = 0; found = 0
+                        tt(Op::ConstI32(0)),
+                        tt(Op::LetSet {
+                            idx: I,
+                            ty: IrType::I32,
+                        }),
+                        tt(Op::ConstI32(0)),
+                        tt(Op::LetSet {
+                            idx: FOUND,
+                            ty: IrType::I32,
+                        }),
+                        // outer scan
+                        tt(Op::Block {
+                            result_ty: None,
+                            body: vec![tt(Op::Loop {
                                 result_ty: None,
-                                body: vec![tt(Op::Loop {
-                                    result_ty: None,
-                                    body: vec![
-                                        // found != 0 ? br 1  (already matched)
-                                        tt(Op::LetGet {
-                                            idx: FOUND,
-                                            ty: IrType::I32,
-                                        }),
-                                        tt(Op::ConstI32(0)),
-                                        tt(Op::Ne(IrType::I32)),
-                                        tt(Op::BrIf { label_depth: 1 }),
-                                        // i > last_start ? br 1
-                                        tt(Op::LetGet {
-                                            idx: I,
-                                            ty: IrType::I32,
-                                        }),
-                                        tt(Op::LetGet {
-                                            idx: LAST_START,
-                                            ty: IrType::I32,
-                                        }),
-                                        tt(Op::Gt(IrType::I32)),
-                                        tt(Op::BrIf { label_depth: 1 }),
-                                        // j = 0; mismatch = 0
-                                        tt(Op::ConstI32(0)),
-                                        tt(Op::LetSet {
-                                            idx: J,
-                                            ty: IrType::I32,
-                                        }),
-                                        tt(Op::ConstI32(0)),
-                                        tt(Op::LetSet {
-                                            idx: MISMATCH,
-                                            ty: IrType::I32,
-                                        }),
-                                        // inner compare loop: increment j until
-                                        // either the window is fully matched
-                                        // (`j == p_len` → exit with mismatch=0)
-                                        // or a byte differs (mismatch=1).
-                                        tt(Op::Block {
+                                body: vec![
+                                    // found != 0 ? br 1  (already matched)
+                                    tt(Op::LetGet {
+                                        idx: FOUND,
+                                        ty: IrType::I32,
+                                    }),
+                                    tt(Op::ConstI32(0)),
+                                    tt(Op::Ne(IrType::I32)),
+                                    tt(Op::BrIf { label_depth: 1 }),
+                                    // i > last_start ? br 1
+                                    tt(Op::LetGet {
+                                        idx: I,
+                                        ty: IrType::I32,
+                                    }),
+                                    tt(Op::LetGet {
+                                        idx: LAST_START,
+                                        ty: IrType::I32,
+                                    }),
+                                    tt(Op::Gt(IrType::I32)),
+                                    tt(Op::BrIf { label_depth: 1 }),
+                                    // j = 0; mismatch = 0
+                                    tt(Op::ConstI32(0)),
+                                    tt(Op::LetSet {
+                                        idx: J,
+                                        ty: IrType::I32,
+                                    }),
+                                    tt(Op::ConstI32(0)),
+                                    tt(Op::LetSet {
+                                        idx: MISMATCH,
+                                        ty: IrType::I32,
+                                    }),
+                                    // inner compare loop: increment j until
+                                    // either the window is fully matched
+                                    // (`j == p_len` → exit with mismatch=0)
+                                    // or a byte differs (mismatch=1).
+                                    tt(Op::Block {
+                                        result_ty: None,
+                                        body: vec![tt(Op::Loop {
                                             result_ty: None,
-                                            body: vec![tt(Op::Loop {
-                                                result_ty: None,
-                                                body: vec![
-                                                    // j >= p_len ? br 1 (window fully matched
-                                                    // — leave mismatch as-is, which is 0)
-                                                    tt(Op::LetGet {
-                                                        idx: J,
-                                                        ty: IrType::I32,
-                                                    }),
-                                                    tt(Op::LetGet {
-                                                        idx: P_LEN,
-                                                        ty: IrType::I32,
-                                                    }),
-                                                    tt(Op::Ge(IrType::I32)),
-                                                    tt(Op::BrIf { label_depth: 1 }),
-                                                    // sb = load_i8(s + 4 + i + j)
-                                                    tt(Op::LocalGet(0)),
-                                                    tt(Op::ConstI32(4)),
-                                                    tt(Op::Add(IrType::I32)),
-                                                    tt(Op::LetGet {
-                                                        idx: I,
-                                                        ty: IrType::I32,
-                                                    }),
-                                                    tt(Op::Add(IrType::I32)),
-                                                    tt(Op::LetGet {
-                                                        idx: J,
-                                                        ty: IrType::I32,
-                                                    }),
-                                                    tt(Op::Add(IrType::I32)),
-                                                    tt(Op::LoadI8UAtAbsolute { offset: 0 }),
-                                                    // pb = load_i8(p + 4 + j)
-                                                    tt(Op::LocalGet(1)),
-                                                    tt(Op::ConstI32(4)),
-                                                    tt(Op::Add(IrType::I32)),
-                                                    tt(Op::LetGet {
-                                                        idx: J,
-                                                        ty: IrType::I32,
-                                                    }),
-                                                    tt(Op::Add(IrType::I32)),
-                                                    tt(Op::LoadI8UAtAbsolute { offset: 0 }),
-                                                    // mismatch = (sb != pb)   (0 / 1)
-                                                    tt(Op::Ne(IrType::I32)),
-                                                    tt(Op::LetSet {
-                                                        idx: MISMATCH,
-                                                        ty: IrType::I32,
-                                                    }),
-                                                    // mismatch != 0 ? br 1
-                                                    tt(Op::LetGet {
-                                                        idx: MISMATCH,
-                                                        ty: IrType::I32,
-                                                    }),
-                                                    tt(Op::ConstI32(0)),
-                                                    tt(Op::Ne(IrType::I32)),
-                                                    tt(Op::BrIf { label_depth: 1 }),
-                                                    // j = j + 1
-                                                    tt(Op::LetGet {
-                                                        idx: J,
-                                                        ty: IrType::I32,
-                                                    }),
-                                                    tt(Op::ConstI32(1)),
-                                                    tt(Op::Add(IrType::I32)),
-                                                    tt(Op::LetSet {
-                                                        idx: J,
-                                                        ty: IrType::I32,
-                                                    }),
-                                                    tt(Op::Br { label_depth: 0 }),
-                                                ],
-                                            })],
-                                        }),
-                                        // After inner: found = (mismatch == 0)
-                                        tt(Op::LetGet {
-                                            idx: MISMATCH,
-                                            ty: IrType::I32,
-                                        }),
-                                        tt(Op::ConstI32(0)),
-                                        tt(Op::Eq(IrType::I32)),
-                                        tt(Op::LetSet {
-                                            idx: FOUND,
-                                            ty: IrType::I32,
-                                        }),
-                                        // i = i + 1
-                                        tt(Op::LetGet {
-                                            idx: I,
-                                            ty: IrType::I32,
-                                        }),
-                                        tt(Op::ConstI32(1)),
-                                        tt(Op::Add(IrType::I32)),
-                                        tt(Op::LetSet {
-                                            idx: I,
-                                            ty: IrType::I32,
-                                        }),
-                                        tt(Op::Br { label_depth: 0 }),
-                                    ],
-                                })],
-                            }),
-                            // result = found != 0
-                            tt(Op::LetGet {
-                                idx: FOUND,
-                                ty: IrType::I32,
-                            }),
-                            tt(Op::ConstI32(0)),
-                            tt(Op::Ne(IrType::I32)),
-                        ],
-                    }),
-                ],
-            }),
-            tt(Op::Return),
-        ],
-    }
+                                            body: vec![
+                                                // j >= p_len ? br 1 (window fully matched
+                                                // — leave mismatch as-is, which is 0)
+                                                tt(Op::LetGet {
+                                                    idx: J,
+                                                    ty: IrType::I32,
+                                                }),
+                                                tt(Op::LetGet {
+                                                    idx: P_LEN,
+                                                    ty: IrType::I32,
+                                                }),
+                                                tt(Op::Ge(IrType::I32)),
+                                                tt(Op::BrIf { label_depth: 1 }),
+                                                // sb = load_i8(s + 4 + i + j)
+                                                tt(Op::LocalGet(0)),
+                                                tt(Op::ConstI32(4)),
+                                                tt(Op::Add(IrType::I32)),
+                                                tt(Op::LetGet {
+                                                    idx: I,
+                                                    ty: IrType::I32,
+                                                }),
+                                                tt(Op::Add(IrType::I32)),
+                                                tt(Op::LetGet {
+                                                    idx: J,
+                                                    ty: IrType::I32,
+                                                }),
+                                                tt(Op::Add(IrType::I32)),
+                                                tt(Op::LoadI8UAtAbsolute { offset: 0 }),
+                                                // pb = load_i8(p + 4 + j)
+                                                tt(Op::LocalGet(1)),
+                                                tt(Op::ConstI32(4)),
+                                                tt(Op::Add(IrType::I32)),
+                                                tt(Op::LetGet {
+                                                    idx: J,
+                                                    ty: IrType::I32,
+                                                }),
+                                                tt(Op::Add(IrType::I32)),
+                                                tt(Op::LoadI8UAtAbsolute { offset: 0 }),
+                                                // mismatch = (sb != pb)   (0 / 1)
+                                                tt(Op::Ne(IrType::I32)),
+                                                tt(Op::LetSet {
+                                                    idx: MISMATCH,
+                                                    ty: IrType::I32,
+                                                }),
+                                                // mismatch != 0 ? br 1
+                                                tt(Op::LetGet {
+                                                    idx: MISMATCH,
+                                                    ty: IrType::I32,
+                                                }),
+                                                tt(Op::ConstI32(0)),
+                                                tt(Op::Ne(IrType::I32)),
+                                                tt(Op::BrIf { label_depth: 1 }),
+                                                // j = j + 1
+                                                tt(Op::LetGet {
+                                                    idx: J,
+                                                    ty: IrType::I32,
+                                                }),
+                                                tt(Op::ConstI32(1)),
+                                                tt(Op::Add(IrType::I32)),
+                                                tt(Op::LetSet {
+                                                    idx: J,
+                                                    ty: IrType::I32,
+                                                }),
+                                                tt(Op::Br { label_depth: 0 }),
+                                            ],
+                                        })],
+                                    }),
+                                    // After inner: found = (mismatch == 0)
+                                    tt(Op::LetGet {
+                                        idx: MISMATCH,
+                                        ty: IrType::I32,
+                                    }),
+                                    tt(Op::ConstI32(0)),
+                                    tt(Op::Eq(IrType::I32)),
+                                    tt(Op::LetSet {
+                                        idx: FOUND,
+                                        ty: IrType::I32,
+                                    }),
+                                    // i = i + 1
+                                    tt(Op::LetGet {
+                                        idx: I,
+                                        ty: IrType::I32,
+                                    }),
+                                    tt(Op::ConstI32(1)),
+                                    tt(Op::Add(IrType::I32)),
+                                    tt(Op::LetSet {
+                                        idx: I,
+                                        ty: IrType::I32,
+                                    }),
+                                    tt(Op::Br { label_depth: 0 }),
+                                ],
+                            })],
+                        }),
+                        // result = found != 0
+                        tt(Op::LetGet {
+                            idx: FOUND,
+                            ty: IrType::I32,
+                        }),
+                        tt(Op::ConstI32(0)),
+                        tt(Op::Ne(IrType::I32)),
+                    ],
+                }),
+            ],
+        }),
+        tt(Op::Return),
+    ]
 }
 
 /// Hand-written body for `list_int_sum(xs: List<Int>) -> Int`.
@@ -6703,105 +6782,109 @@ fn contains_string() -> StdlibFunction {
 ///   * 2 — `acc:     I64` (running sum)
 ///   * 3 — `payload: I32` (absolute address of element 0)
 fn list_int_sum() -> StdlibFunction {
+    StdlibFunction::new(
+        "list_int_sum",
+        vec![IrType::ListInt],
+        IrType::I64,
+        list_int_sum_body,
+    )
+}
+
+fn list_int_sum_body() -> Vec<TaggedOp> {
     const N: u32 = 0;
     const I: u32 = 1;
     const ACC: u32 = 2;
     const PAYLOAD: u32 = 3;
-    StdlibFunction {
-        name: "list_int_sum",
-        params: vec![IrType::ListInt],
-        ret: IrType::I64,
-        body: vec![
-            // n = load_i32(xs, 0)
-            tt(Op::LocalGet(0)),
-            tt(Op::LoadI32AtAbsolute { offset: 0 }),
-            tt(Op::LetSet {
-                idx: N,
-                ty: IrType::I32,
-            }),
-            // payload = (xs + 4 + 7) & -8
-            tt(Op::LocalGet(0)),
-            tt(Op::ConstI32(4 + 7)),
-            tt(Op::Add(IrType::I32)),
-            tt(Op::ConstI32(-8)),
-            tt(Op::BitAnd(IrType::I32)),
-            tt(Op::LetSet {
-                idx: PAYLOAD,
-                ty: IrType::I32,
-            }),
-            // acc = 0; i = 0
-            tt(Op::ConstI64(0)),
-            tt(Op::LetSet {
-                idx: ACC,
-                ty: IrType::I64,
-            }),
-            tt(Op::ConstI32(0)),
-            tt(Op::LetSet {
-                idx: I,
-                ty: IrType::I32,
-            }),
-            // block { loop { ... } }
-            tt(Op::Block {
+    vec![
+        // n = load_i32(xs, 0)
+        tt(Op::LocalGet(0)),
+        tt(Op::LoadI32AtAbsolute { offset: 0 }),
+        tt(Op::LetSet {
+            idx: N,
+            ty: IrType::I32,
+        }),
+        // payload = (xs + 4 + 7) & -8
+        tt(Op::LocalGet(0)),
+        tt(Op::ConstI32(4 + 7)),
+        tt(Op::Add(IrType::I32)),
+        tt(Op::ConstI32(-8)),
+        tt(Op::BitAnd(IrType::I32)),
+        tt(Op::LetSet {
+            idx: PAYLOAD,
+            ty: IrType::I32,
+        }),
+        // acc = 0; i = 0
+        tt(Op::ConstI64(0)),
+        tt(Op::LetSet {
+            idx: ACC,
+            ty: IrType::I64,
+        }),
+        tt(Op::ConstI32(0)),
+        tt(Op::LetSet {
+            idx: I,
+            ty: IrType::I32,
+        }),
+        // block { loop { ... } }
+        tt(Op::Block {
+            result_ty: None,
+            body: vec![tt(Op::Loop {
                 result_ty: None,
-                body: vec![tt(Op::Loop {
-                    result_ty: None,
-                    body: vec![
-                        // exit when i >= n
-                        tt(Op::LetGet {
-                            idx: I,
-                            ty: IrType::I32,
-                        }),
-                        tt(Op::LetGet {
-                            idx: N,
-                            ty: IrType::I32,
-                        }),
-                        tt(Op::Ge(IrType::I32)),
-                        tt(Op::BrIf { label_depth: 1 }),
-                        // acc += i64.load(payload + i * 8)
-                        tt(Op::LetGet {
-                            idx: ACC,
-                            ty: IrType::I64,
-                        }),
-                        tt(Op::LetGet {
-                            idx: PAYLOAD,
-                            ty: IrType::I32,
-                        }),
-                        tt(Op::LetGet {
-                            idx: I,
-                            ty: IrType::I32,
-                        }),
-                        tt(Op::ConstI32(8)),
-                        tt(Op::Mul(IrType::I32)),
-                        tt(Op::Add(IrType::I32)),
-                        tt(Op::LoadI64AtAbsolute { offset: 0 }),
-                        tt(Op::Add(IrType::I64)),
-                        tt(Op::LetSet {
-                            idx: ACC,
-                            ty: IrType::I64,
-                        }),
-                        // i = i + 1
-                        tt(Op::LetGet {
-                            idx: I,
-                            ty: IrType::I32,
-                        }),
-                        tt(Op::ConstI32(1)),
-                        tt(Op::Add(IrType::I32)),
-                        tt(Op::LetSet {
-                            idx: I,
-                            ty: IrType::I32,
-                        }),
-                        tt(Op::Br { label_depth: 0 }),
-                    ],
-                })],
-            }),
-            // return acc
-            tt(Op::LetGet {
-                idx: ACC,
-                ty: IrType::I64,
-            }),
-            tt(Op::Return),
-        ],
-    }
+                body: vec![
+                    // exit when i >= n
+                    tt(Op::LetGet {
+                        idx: I,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::LetGet {
+                        idx: N,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::Ge(IrType::I32)),
+                    tt(Op::BrIf { label_depth: 1 }),
+                    // acc += i64.load(payload + i * 8)
+                    tt(Op::LetGet {
+                        idx: ACC,
+                        ty: IrType::I64,
+                    }),
+                    tt(Op::LetGet {
+                        idx: PAYLOAD,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::LetGet {
+                        idx: I,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::ConstI32(8)),
+                    tt(Op::Mul(IrType::I32)),
+                    tt(Op::Add(IrType::I32)),
+                    tt(Op::LoadI64AtAbsolute { offset: 0 }),
+                    tt(Op::Add(IrType::I64)),
+                    tt(Op::LetSet {
+                        idx: ACC,
+                        ty: IrType::I64,
+                    }),
+                    // i = i + 1
+                    tt(Op::LetGet {
+                        idx: I,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::ConstI32(1)),
+                    tt(Op::Add(IrType::I32)),
+                    tt(Op::LetSet {
+                        idx: I,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::Br { label_depth: 0 }),
+                ],
+            })],
+        }),
+        // return acc
+        tt(Op::LetGet {
+            idx: ACC,
+            ty: IrType::I64,
+        }),
+        tt(Op::Return),
+    ]
 }
 
 /// Hand-written body for `list_int_max(xs: List<Int>) -> Int`.
@@ -6823,151 +6906,155 @@ fn list_int_sum() -> StdlibFunction {
 ///   * 3 — `payload: I32`
 ///   * 4 — `val:     I64` (per-iter scratch for `max(acc, val)`)
 fn list_int_max() -> StdlibFunction {
+    StdlibFunction::new(
+        "list_int_max",
+        vec![IrType::ListInt],
+        IrType::I64,
+        list_int_max_body,
+    )
+}
+
+fn list_int_max_body() -> Vec<TaggedOp> {
     const N: u32 = 0;
     const I: u32 = 1;
     const ACC: u32 = 2;
     const PAYLOAD: u32 = 3;
     const VAL: u32 = 4;
-    StdlibFunction {
-        name: "list_int_max",
-        params: vec![IrType::ListInt],
-        ret: IrType::I64,
-        body: vec![
-            // n = load_i32(xs, 0)
-            tt(Op::LocalGet(0)),
-            tt(Op::LoadI32AtAbsolute { offset: 0 }),
-            tt(Op::LetSet {
-                idx: N,
-                ty: IrType::I32,
-            }),
-            // if n == 0 { trap }
-            tt(Op::LetGet {
-                idx: N,
-                ty: IrType::I32,
-            }),
-            tt(Op::ConstI32(0)),
-            tt(Op::Eq(IrType::I32)),
-            tt(Op::If {
-                result_ty: IrType::I32,
-                then_body: vec![
-                    tt(Op::Trap {
-                        kind: TrapKind::EmptyList,
-                    }),
-                    tt(Op::ConstI32(0)),
-                ],
-                else_body: vec![tt(Op::ConstI32(0))],
-            }),
-            // Sink the i32 placeholder produced by the If.
-            tt(Op::LetSet {
-                idx: I, /* harmless: I is overwritten just below */
-                ty: IrType::I32,
-            }),
-            // payload = (xs + 4 + 7) & -8
-            tt(Op::LocalGet(0)),
-            tt(Op::ConstI32(4 + 7)),
-            tt(Op::Add(IrType::I32)),
-            tt(Op::ConstI32(-8)),
-            tt(Op::BitAnd(IrType::I32)),
-            tt(Op::LetSet {
-                idx: PAYLOAD,
-                ty: IrType::I32,
-            }),
-            // acc = i64.load(payload + 0) (the first element)
-            tt(Op::LetGet {
-                idx: PAYLOAD,
-                ty: IrType::I32,
-            }),
-            tt(Op::LoadI64AtAbsolute { offset: 0 }),
-            tt(Op::LetSet {
-                idx: ACC,
-                ty: IrType::I64,
-            }),
-            // i = 1
-            tt(Op::ConstI32(1)),
-            tt(Op::LetSet {
-                idx: I,
-                ty: IrType::I32,
-            }),
-            // block { loop { ... } }
-            tt(Op::Block {
+    vec![
+        // n = load_i32(xs, 0)
+        tt(Op::LocalGet(0)),
+        tt(Op::LoadI32AtAbsolute { offset: 0 }),
+        tt(Op::LetSet {
+            idx: N,
+            ty: IrType::I32,
+        }),
+        // if n == 0 { trap }
+        tt(Op::LetGet {
+            idx: N,
+            ty: IrType::I32,
+        }),
+        tt(Op::ConstI32(0)),
+        tt(Op::Eq(IrType::I32)),
+        tt(Op::If {
+            result_ty: IrType::I32,
+            then_body: vec![
+                tt(Op::Trap {
+                    kind: TrapKind::EmptyList,
+                }),
+                tt(Op::ConstI32(0)),
+            ],
+            else_body: vec![tt(Op::ConstI32(0))],
+        }),
+        // Sink the i32 placeholder produced by the If.
+        tt(Op::LetSet {
+            idx: I, /* harmless: I is overwritten just below */
+            ty: IrType::I32,
+        }),
+        // payload = (xs + 4 + 7) & -8
+        tt(Op::LocalGet(0)),
+        tt(Op::ConstI32(4 + 7)),
+        tt(Op::Add(IrType::I32)),
+        tt(Op::ConstI32(-8)),
+        tt(Op::BitAnd(IrType::I32)),
+        tt(Op::LetSet {
+            idx: PAYLOAD,
+            ty: IrType::I32,
+        }),
+        // acc = i64.load(payload + 0) (the first element)
+        tt(Op::LetGet {
+            idx: PAYLOAD,
+            ty: IrType::I32,
+        }),
+        tt(Op::LoadI64AtAbsolute { offset: 0 }),
+        tt(Op::LetSet {
+            idx: ACC,
+            ty: IrType::I64,
+        }),
+        // i = 1
+        tt(Op::ConstI32(1)),
+        tt(Op::LetSet {
+            idx: I,
+            ty: IrType::I32,
+        }),
+        // block { loop { ... } }
+        tt(Op::Block {
+            result_ty: None,
+            body: vec![tt(Op::Loop {
                 result_ty: None,
-                body: vec![tt(Op::Loop {
-                    result_ty: None,
-                    body: vec![
-                        // exit when i >= n
-                        tt(Op::LetGet {
-                            idx: I,
-                            ty: IrType::I32,
-                        }),
-                        tt(Op::LetGet {
-                            idx: N,
-                            ty: IrType::I32,
-                        }),
-                        tt(Op::Ge(IrType::I32)),
-                        tt(Op::BrIf { label_depth: 1 }),
-                        // val = i64.load(payload + i * 8)
-                        tt(Op::LetGet {
-                            idx: PAYLOAD,
-                            ty: IrType::I32,
-                        }),
-                        tt(Op::LetGet {
-                            idx: I,
-                            ty: IrType::I32,
-                        }),
-                        tt(Op::ConstI32(8)),
-                        tt(Op::Mul(IrType::I32)),
-                        tt(Op::Add(IrType::I32)),
-                        tt(Op::LoadI64AtAbsolute { offset: 0 }),
-                        tt(Op::LetSet {
-                            idx: VAL,
-                            ty: IrType::I64,
-                        }),
-                        // acc = select(val, acc, val > acc)
-                        tt(Op::LetGet {
-                            idx: VAL,
-                            ty: IrType::I64,
-                        }),
-                        tt(Op::LetGet {
-                            idx: ACC,
-                            ty: IrType::I64,
-                        }),
-                        tt(Op::LetGet {
-                            idx: VAL,
-                            ty: IrType::I64,
-                        }),
-                        tt(Op::LetGet {
-                            idx: ACC,
-                            ty: IrType::I64,
-                        }),
-                        tt(Op::Gt(IrType::I64)),
-                        tt(Op::Select { ty: IrType::I64 }),
-                        tt(Op::LetSet {
-                            idx: ACC,
-                            ty: IrType::I64,
-                        }),
-                        // i = i + 1
-                        tt(Op::LetGet {
-                            idx: I,
-                            ty: IrType::I32,
-                        }),
-                        tt(Op::ConstI32(1)),
-                        tt(Op::Add(IrType::I32)),
-                        tt(Op::LetSet {
-                            idx: I,
-                            ty: IrType::I32,
-                        }),
-                        tt(Op::Br { label_depth: 0 }),
-                    ],
-                })],
-            }),
-            // return acc
-            tt(Op::LetGet {
-                idx: ACC,
-                ty: IrType::I64,
-            }),
-            tt(Op::Return),
-        ],
-    }
+                body: vec![
+                    // exit when i >= n
+                    tt(Op::LetGet {
+                        idx: I,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::LetGet {
+                        idx: N,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::Ge(IrType::I32)),
+                    tt(Op::BrIf { label_depth: 1 }),
+                    // val = i64.load(payload + i * 8)
+                    tt(Op::LetGet {
+                        idx: PAYLOAD,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::LetGet {
+                        idx: I,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::ConstI32(8)),
+                    tt(Op::Mul(IrType::I32)),
+                    tt(Op::Add(IrType::I32)),
+                    tt(Op::LoadI64AtAbsolute { offset: 0 }),
+                    tt(Op::LetSet {
+                        idx: VAL,
+                        ty: IrType::I64,
+                    }),
+                    // acc = select(val, acc, val > acc)
+                    tt(Op::LetGet {
+                        idx: VAL,
+                        ty: IrType::I64,
+                    }),
+                    tt(Op::LetGet {
+                        idx: ACC,
+                        ty: IrType::I64,
+                    }),
+                    tt(Op::LetGet {
+                        idx: VAL,
+                        ty: IrType::I64,
+                    }),
+                    tt(Op::LetGet {
+                        idx: ACC,
+                        ty: IrType::I64,
+                    }),
+                    tt(Op::Gt(IrType::I64)),
+                    tt(Op::Select { ty: IrType::I64 }),
+                    tt(Op::LetSet {
+                        idx: ACC,
+                        ty: IrType::I64,
+                    }),
+                    // i = i + 1
+                    tt(Op::LetGet {
+                        idx: I,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::ConstI32(1)),
+                    tt(Op::Add(IrType::I32)),
+                    tt(Op::LetSet {
+                        idx: I,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::Br { label_depth: 0 }),
+                ],
+            })],
+        }),
+        // return acc
+        tt(Op::LetGet {
+            idx: ACC,
+            ty: IrType::I64,
+        }),
+        tt(Op::Return),
+    ]
 }
 
 /// Phase 10-a body for `list_int_map(xs: List<Int>, f: Closure) -> List<Int>`.
@@ -6993,151 +7080,155 @@ fn list_int_max() -> StdlibFunction {
 ///   * 3 — `dst_payload: I32`
 ///   * 4 — `new_base:    I32`
 fn list_int_map() -> StdlibFunction {
+    StdlibFunction::new(
+        "list_int_map",
+        vec![IrType::ListInt, IrType::Closure],
+        IrType::ListInt,
+        list_int_map_body,
+    )
+}
+
+fn list_int_map_body() -> Vec<TaggedOp> {
     const N: u32 = 0;
     const I: u32 = 1;
     const SRC_PAYLOAD: u32 = 2;
     const DST_PAYLOAD: u32 = 3;
     const NEW_BASE: u32 = 4;
-    StdlibFunction {
-        name: "list_int_map",
-        params: vec![IrType::ListInt, IrType::Closure],
-        ret: IrType::ListInt,
-        body: vec![
-            // n = i32.load(xs, 0)
-            tt(Op::LocalGet(0)),
-            tt(Op::LoadI32AtAbsolute { offset: 0 }),
-            tt(Op::LetSet {
-                idx: N,
-                ty: IrType::I32,
-            }),
-            // record_size = 8 + 8*n + 8
-            tt(Op::ConstI32(16)),
-            tt(Op::LetGet {
-                idx: N,
-                ty: IrType::I32,
-            }),
-            tt(Op::ConstI32(8)),
-            tt(Op::Mul(IrType::I32)),
-            tt(Op::Add(IrType::I32)),
-            tt(Op::AllocScratchDyn),
-            tt(Op::LetSet {
-                idx: NEW_BASE,
-                ty: IrType::I32,
-            }),
-            // store header: i32.store(new_base, n)
-            tt(Op::LetGet {
-                idx: NEW_BASE,
-                ty: IrType::I32,
-            }),
-            tt(Op::LetGet {
-                idx: N,
-                ty: IrType::I32,
-            }),
-            tt(Op::StoreI32AtAbsolute { offset: 0 }),
-            // src_payload = (xs + 4 + 7) & -8
-            tt(Op::LocalGet(0)),
-            tt(Op::ConstI32(4 + 7)),
-            tt(Op::Add(IrType::I32)),
-            tt(Op::ConstI32(-8)),
-            tt(Op::BitAnd(IrType::I32)),
-            tt(Op::LetSet {
-                idx: SRC_PAYLOAD,
-                ty: IrType::I32,
-            }),
-            // dst_payload = (new_base + 4 + 7) & -8
-            tt(Op::LetGet {
-                idx: NEW_BASE,
-                ty: IrType::I32,
-            }),
-            tt(Op::ConstI32(4 + 7)),
-            tt(Op::Add(IrType::I32)),
-            tt(Op::ConstI32(-8)),
-            tt(Op::BitAnd(IrType::I32)),
-            tt(Op::LetSet {
-                idx: DST_PAYLOAD,
-                ty: IrType::I32,
-            }),
-            // i = 0
-            tt(Op::ConstI32(0)),
-            tt(Op::LetSet {
-                idx: I,
-                ty: IrType::I32,
-            }),
-            // block { loop { ... } }
-            tt(Op::Block {
+    vec![
+        // n = i32.load(xs, 0)
+        tt(Op::LocalGet(0)),
+        tt(Op::LoadI32AtAbsolute { offset: 0 }),
+        tt(Op::LetSet {
+            idx: N,
+            ty: IrType::I32,
+        }),
+        // record_size = 8 + 8*n + 8
+        tt(Op::ConstI32(16)),
+        tt(Op::LetGet {
+            idx: N,
+            ty: IrType::I32,
+        }),
+        tt(Op::ConstI32(8)),
+        tt(Op::Mul(IrType::I32)),
+        tt(Op::Add(IrType::I32)),
+        tt(Op::AllocScratchDyn),
+        tt(Op::LetSet {
+            idx: NEW_BASE,
+            ty: IrType::I32,
+        }),
+        // store header: i32.store(new_base, n)
+        tt(Op::LetGet {
+            idx: NEW_BASE,
+            ty: IrType::I32,
+        }),
+        tt(Op::LetGet {
+            idx: N,
+            ty: IrType::I32,
+        }),
+        tt(Op::StoreI32AtAbsolute { offset: 0 }),
+        // src_payload = (xs + 4 + 7) & -8
+        tt(Op::LocalGet(0)),
+        tt(Op::ConstI32(4 + 7)),
+        tt(Op::Add(IrType::I32)),
+        tt(Op::ConstI32(-8)),
+        tt(Op::BitAnd(IrType::I32)),
+        tt(Op::LetSet {
+            idx: SRC_PAYLOAD,
+            ty: IrType::I32,
+        }),
+        // dst_payload = (new_base + 4 + 7) & -8
+        tt(Op::LetGet {
+            idx: NEW_BASE,
+            ty: IrType::I32,
+        }),
+        tt(Op::ConstI32(4 + 7)),
+        tt(Op::Add(IrType::I32)),
+        tt(Op::ConstI32(-8)),
+        tt(Op::BitAnd(IrType::I32)),
+        tt(Op::LetSet {
+            idx: DST_PAYLOAD,
+            ty: IrType::I32,
+        }),
+        // i = 0
+        tt(Op::ConstI32(0)),
+        tt(Op::LetSet {
+            idx: I,
+            ty: IrType::I32,
+        }),
+        // block { loop { ... } }
+        tt(Op::Block {
+            result_ty: None,
+            body: vec![tt(Op::Loop {
                 result_ty: None,
-                body: vec![tt(Op::Loop {
-                    result_ty: None,
-                    body: vec![
-                        // exit when i >= n
-                        tt(Op::LetGet {
-                            idx: I,
-                            ty: IrType::I32,
-                        }),
-                        tt(Op::LetGet {
-                            idx: N,
-                            ty: IrType::I32,
-                        }),
-                        tt(Op::Ge(IrType::I32)),
-                        tt(Op::BrIf { label_depth: 1 }),
-                        // dst_addr = dst_payload + i * 8 (pushed first
-                        // so the i64.store sees [addr, value] at end)
-                        tt(Op::LetGet {
-                            idx: DST_PAYLOAD,
-                            ty: IrType::I32,
-                        }),
-                        tt(Op::LetGet {
-                            idx: I,
-                            ty: IrType::I32,
-                        }),
-                        tt(Op::ConstI32(8)),
-                        tt(Op::Mul(IrType::I32)),
-                        tt(Op::Add(IrType::I32)),
-                        // push closure handle (param 1)
-                        tt(Op::LocalGet(1)),
-                        // push the source element: i64.load(src_payload + i*8)
-                        tt(Op::LetGet {
-                            idx: SRC_PAYLOAD,
-                            ty: IrType::I32,
-                        }),
-                        tt(Op::LetGet {
-                            idx: I,
-                            ty: IrType::I32,
-                        }),
-                        tt(Op::ConstI32(8)),
-                        tt(Op::Mul(IrType::I32)),
-                        tt(Op::Add(IrType::I32)),
-                        tt(Op::LoadI64AtAbsolute { offset: 0 }),
-                        // call_indirect via Op::CallClosure
-                        tt(Op::CallClosure {
-                            param_tys: vec![IrType::I64],
-                            ret_ty: IrType::I64,
-                        }),
-                        // i64.store: stack is [dst_addr, result_i64]
-                        tt(Op::StoreI64AtAbsolute { offset: 0 }),
-                        // i = i + 1
-                        tt(Op::LetGet {
-                            idx: I,
-                            ty: IrType::I32,
-                        }),
-                        tt(Op::ConstI32(1)),
-                        tt(Op::Add(IrType::I32)),
-                        tt(Op::LetSet {
-                            idx: I,
-                            ty: IrType::I32,
-                        }),
-                        tt(Op::Br { label_depth: 0 }),
-                    ],
-                })],
-            }),
-            // return new_base
-            tt(Op::LetGet {
-                idx: NEW_BASE,
-                ty: IrType::I32,
-            }),
-            tt(Op::Return),
-        ],
-    }
+                body: vec![
+                    // exit when i >= n
+                    tt(Op::LetGet {
+                        idx: I,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::LetGet {
+                        idx: N,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::Ge(IrType::I32)),
+                    tt(Op::BrIf { label_depth: 1 }),
+                    // dst_addr = dst_payload + i * 8 (pushed first
+                    // so the i64.store sees [addr, value] at end)
+                    tt(Op::LetGet {
+                        idx: DST_PAYLOAD,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::LetGet {
+                        idx: I,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::ConstI32(8)),
+                    tt(Op::Mul(IrType::I32)),
+                    tt(Op::Add(IrType::I32)),
+                    // push closure handle (param 1)
+                    tt(Op::LocalGet(1)),
+                    // push the source element: i64.load(src_payload + i*8)
+                    tt(Op::LetGet {
+                        idx: SRC_PAYLOAD,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::LetGet {
+                        idx: I,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::ConstI32(8)),
+                    tt(Op::Mul(IrType::I32)),
+                    tt(Op::Add(IrType::I32)),
+                    tt(Op::LoadI64AtAbsolute { offset: 0 }),
+                    // call_indirect via Op::CallClosure
+                    tt(Op::CallClosure {
+                        param_tys: vec![IrType::I64],
+                        ret_ty: IrType::I64,
+                    }),
+                    // i64.store: stack is [dst_addr, result_i64]
+                    tt(Op::StoreI64AtAbsolute { offset: 0 }),
+                    // i = i + 1
+                    tt(Op::LetGet {
+                        idx: I,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::ConstI32(1)),
+                    tt(Op::Add(IrType::I32)),
+                    tt(Op::LetSet {
+                        idx: I,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::Br { label_depth: 0 }),
+                ],
+            })],
+        }),
+        // return new_base
+        tt(Op::LetGet {
+            idx: NEW_BASE,
+            ty: IrType::I32,
+        }),
+        tt(Op::Return),
+    ]
 }
 
 /// Phase 10-a body for `list_int_filter(xs: List<Int>, f: Closure) -> List<Int>`.
@@ -7165,6 +7256,15 @@ fn list_int_map() -> StdlibFunction {
 ///   * 5 — `out_count:   I32`
 ///   * 6 — `cur_val:     I64`
 fn list_int_filter() -> StdlibFunction {
+    StdlibFunction::new(
+        "list_int_filter",
+        vec![IrType::ListInt, IrType::Closure],
+        IrType::ListInt,
+        list_int_filter_body,
+    )
+}
+
+fn list_int_filter_body() -> Vec<TaggedOp> {
     const N: u32 = 0;
     const I: u32 = 1;
     const SRC_PAYLOAD: u32 = 2;
@@ -7179,185 +7279,180 @@ fn list_int_filter() -> StdlibFunction {
     /// a value behind; we route an `i32.const 0` sentinel through
     /// the sink, then ignore it.
     const SINK: u32 = 7;
-    StdlibFunction {
-        name: "list_int_filter",
-        params: vec![IrType::ListInt, IrType::Closure],
-        ret: IrType::ListInt,
-        body: vec![
-            tt(Op::LocalGet(0)),
-            tt(Op::LoadI32AtAbsolute { offset: 0 }),
-            tt(Op::LetSet {
-                idx: N,
-                ty: IrType::I32,
-            }),
-            // record_size = 8 + 8*n + 8
-            tt(Op::ConstI32(16)),
-            tt(Op::LetGet {
-                idx: N,
-                ty: IrType::I32,
-            }),
-            tt(Op::ConstI32(8)),
-            tt(Op::Mul(IrType::I32)),
-            tt(Op::Add(IrType::I32)),
-            tt(Op::AllocScratchDyn),
-            tt(Op::LetSet {
-                idx: NEW_BASE,
-                ty: IrType::I32,
-            }),
-            // src_payload = (xs + 4 + 7) & -8
-            tt(Op::LocalGet(0)),
-            tt(Op::ConstI32(4 + 7)),
-            tt(Op::Add(IrType::I32)),
-            tt(Op::ConstI32(-8)),
-            tt(Op::BitAnd(IrType::I32)),
-            tt(Op::LetSet {
-                idx: SRC_PAYLOAD,
-                ty: IrType::I32,
-            }),
-            // dst_payload = (new_base + 4 + 7) & -8
-            tt(Op::LetGet {
-                idx: NEW_BASE,
-                ty: IrType::I32,
-            }),
-            tt(Op::ConstI32(4 + 7)),
-            tt(Op::Add(IrType::I32)),
-            tt(Op::ConstI32(-8)),
-            tt(Op::BitAnd(IrType::I32)),
-            tt(Op::LetSet {
-                idx: DST_PAYLOAD,
-                ty: IrType::I32,
-            }),
-            // i = 0; out_count = 0
-            tt(Op::ConstI32(0)),
-            tt(Op::LetSet {
-                idx: I,
-                ty: IrType::I32,
-            }),
-            tt(Op::ConstI32(0)),
-            tt(Op::LetSet {
-                idx: OUT_COUNT,
-                ty: IrType::I32,
-            }),
-            tt(Op::Block {
+    vec![
+        tt(Op::LocalGet(0)),
+        tt(Op::LoadI32AtAbsolute { offset: 0 }),
+        tt(Op::LetSet {
+            idx: N,
+            ty: IrType::I32,
+        }),
+        // record_size = 8 + 8*n + 8
+        tt(Op::ConstI32(16)),
+        tt(Op::LetGet {
+            idx: N,
+            ty: IrType::I32,
+        }),
+        tt(Op::ConstI32(8)),
+        tt(Op::Mul(IrType::I32)),
+        tt(Op::Add(IrType::I32)),
+        tt(Op::AllocScratchDyn),
+        tt(Op::LetSet {
+            idx: NEW_BASE,
+            ty: IrType::I32,
+        }),
+        // src_payload = (xs + 4 + 7) & -8
+        tt(Op::LocalGet(0)),
+        tt(Op::ConstI32(4 + 7)),
+        tt(Op::Add(IrType::I32)),
+        tt(Op::ConstI32(-8)),
+        tt(Op::BitAnd(IrType::I32)),
+        tt(Op::LetSet {
+            idx: SRC_PAYLOAD,
+            ty: IrType::I32,
+        }),
+        // dst_payload = (new_base + 4 + 7) & -8
+        tt(Op::LetGet {
+            idx: NEW_BASE,
+            ty: IrType::I32,
+        }),
+        tt(Op::ConstI32(4 + 7)),
+        tt(Op::Add(IrType::I32)),
+        tt(Op::ConstI32(-8)),
+        tt(Op::BitAnd(IrType::I32)),
+        tt(Op::LetSet {
+            idx: DST_PAYLOAD,
+            ty: IrType::I32,
+        }),
+        // i = 0; out_count = 0
+        tt(Op::ConstI32(0)),
+        tt(Op::LetSet {
+            idx: I,
+            ty: IrType::I32,
+        }),
+        tt(Op::ConstI32(0)),
+        tt(Op::LetSet {
+            idx: OUT_COUNT,
+            ty: IrType::I32,
+        }),
+        tt(Op::Block {
+            result_ty: None,
+            body: vec![tt(Op::Loop {
                 result_ty: None,
-                body: vec![tt(Op::Loop {
-                    result_ty: None,
-                    body: vec![
-                        // exit when i >= n
-                        tt(Op::LetGet {
-                            idx: I,
-                            ty: IrType::I32,
-                        }),
-                        tt(Op::LetGet {
-                            idx: N,
-                            ty: IrType::I32,
-                        }),
-                        tt(Op::Ge(IrType::I32)),
-                        tt(Op::BrIf { label_depth: 1 }),
-                        // cur_val = i64.load(src_payload + i*8)
-                        tt(Op::LetGet {
-                            idx: SRC_PAYLOAD,
-                            ty: IrType::I32,
-                        }),
-                        tt(Op::LetGet {
-                            idx: I,
-                            ty: IrType::I32,
-                        }),
-                        tt(Op::ConstI32(8)),
-                        tt(Op::Mul(IrType::I32)),
-                        tt(Op::Add(IrType::I32)),
-                        tt(Op::LoadI64AtAbsolute { offset: 0 }),
-                        tt(Op::LetSet {
-                            idx: CUR_VAL,
-                            ty: IrType::I64,
-                        }),
-                        // closure(cur_val) -> bool
-                        tt(Op::LocalGet(1)),
-                        tt(Op::LetGet {
-                            idx: CUR_VAL,
-                            ty: IrType::I64,
-                        }),
-                        tt(Op::CallClosure {
-                            param_tys: vec![IrType::I64],
-                            ret_ty: IrType::Bool,
-                        }),
-                        // if cond { dst[out_count] = cur_val; out_count++ }
-                        tt(Op::If {
-                            result_ty: IrType::I32,
-                            then_body: vec![
-                                // dst_addr = dst_payload + out_count*8
-                                tt(Op::LetGet {
-                                    idx: DST_PAYLOAD,
-                                    ty: IrType::I32,
-                                }),
-                                tt(Op::LetGet {
-                                    idx: OUT_COUNT,
-                                    ty: IrType::I32,
-                                }),
-                                tt(Op::ConstI32(8)),
-                                tt(Op::Mul(IrType::I32)),
-                                tt(Op::Add(IrType::I32)),
-                                tt(Op::LetGet {
-                                    idx: CUR_VAL,
-                                    ty: IrType::I64,
-                                }),
-                                tt(Op::StoreI64AtAbsolute { offset: 0 }),
-                                // out_count = out_count + 1
-                                tt(Op::LetGet {
-                                    idx: OUT_COUNT,
-                                    ty: IrType::I32,
-                                }),
-                                tt(Op::ConstI32(1)),
-                                tt(Op::Add(IrType::I32)),
-                                tt(Op::LetSet {
-                                    idx: OUT_COUNT,
-                                    ty: IrType::I32,
-                                }),
-                                // sentinel for the if's i32 result
-                                tt(Op::ConstI32(0)),
-                            ],
-                            else_body: vec![tt(Op::ConstI32(0))],
-                        }),
-                        // Sink the i32 placeholder produced by the If
-                        // into a dedicated local so the loop counter
-                        // stays intact.
-                        tt(Op::LetSet {
-                            idx: SINK,
-                            ty: IrType::I32,
-                        }),
-                        // i = i + 1
-                        tt(Op::LetGet {
-                            idx: I,
-                            ty: IrType::I32,
-                        }),
-                        tt(Op::ConstI32(1)),
-                        tt(Op::Add(IrType::I32)),
-                        tt(Op::LetSet {
-                            idx: I,
-                            ty: IrType::I32,
-                        }),
-                        tt(Op::Br { label_depth: 0 }),
-                    ],
-                })],
-            }),
-            // store header: i32.store(new_base, out_count)
-            tt(Op::LetGet {
-                idx: NEW_BASE,
-                ty: IrType::I32,
-            }),
-            tt(Op::LetGet {
-                idx: OUT_COUNT,
-                ty: IrType::I32,
-            }),
-            tt(Op::StoreI32AtAbsolute { offset: 0 }),
-            // return new_base
-            tt(Op::LetGet {
-                idx: NEW_BASE,
-                ty: IrType::I32,
-            }),
-            tt(Op::Return),
-        ],
-    }
+                body: vec![
+                    // exit when i >= n
+                    tt(Op::LetGet {
+                        idx: I,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::LetGet {
+                        idx: N,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::Ge(IrType::I32)),
+                    tt(Op::BrIf { label_depth: 1 }),
+                    // cur_val = i64.load(src_payload + i*8)
+                    tt(Op::LetGet {
+                        idx: SRC_PAYLOAD,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::LetGet {
+                        idx: I,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::ConstI32(8)),
+                    tt(Op::Mul(IrType::I32)),
+                    tt(Op::Add(IrType::I32)),
+                    tt(Op::LoadI64AtAbsolute { offset: 0 }),
+                    tt(Op::LetSet {
+                        idx: CUR_VAL,
+                        ty: IrType::I64,
+                    }),
+                    // closure(cur_val) -> bool
+                    tt(Op::LocalGet(1)),
+                    tt(Op::LetGet {
+                        idx: CUR_VAL,
+                        ty: IrType::I64,
+                    }),
+                    tt(Op::CallClosure {
+                        param_tys: vec![IrType::I64],
+                        ret_ty: IrType::Bool,
+                    }),
+                    // if cond { dst[out_count] = cur_val; out_count++ }
+                    tt(Op::If {
+                        result_ty: IrType::I32,
+                        then_body: vec![
+                            // dst_addr = dst_payload + out_count*8
+                            tt(Op::LetGet {
+                                idx: DST_PAYLOAD,
+                                ty: IrType::I32,
+                            }),
+                            tt(Op::LetGet {
+                                idx: OUT_COUNT,
+                                ty: IrType::I32,
+                            }),
+                            tt(Op::ConstI32(8)),
+                            tt(Op::Mul(IrType::I32)),
+                            tt(Op::Add(IrType::I32)),
+                            tt(Op::LetGet {
+                                idx: CUR_VAL,
+                                ty: IrType::I64,
+                            }),
+                            tt(Op::StoreI64AtAbsolute { offset: 0 }),
+                            // out_count = out_count + 1
+                            tt(Op::LetGet {
+                                idx: OUT_COUNT,
+                                ty: IrType::I32,
+                            }),
+                            tt(Op::ConstI32(1)),
+                            tt(Op::Add(IrType::I32)),
+                            tt(Op::LetSet {
+                                idx: OUT_COUNT,
+                                ty: IrType::I32,
+                            }),
+                            // sentinel for the if's i32 result
+                            tt(Op::ConstI32(0)),
+                        ],
+                        else_body: vec![tt(Op::ConstI32(0))],
+                    }),
+                    // Sink the i32 placeholder produced by the If
+                    // into a dedicated local so the loop counter
+                    // stays intact.
+                    tt(Op::LetSet {
+                        idx: SINK,
+                        ty: IrType::I32,
+                    }),
+                    // i = i + 1
+                    tt(Op::LetGet {
+                        idx: I,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::ConstI32(1)),
+                    tt(Op::Add(IrType::I32)),
+                    tt(Op::LetSet {
+                        idx: I,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::Br { label_depth: 0 }),
+                ],
+            })],
+        }),
+        // store header: i32.store(new_base, out_count)
+        tt(Op::LetGet {
+            idx: NEW_BASE,
+            ty: IrType::I32,
+        }),
+        tt(Op::LetGet {
+            idx: OUT_COUNT,
+            ty: IrType::I32,
+        }),
+        tt(Op::StoreI32AtAbsolute { offset: 0 }),
+        // return new_base
+        tt(Op::LetGet {
+            idx: NEW_BASE,
+            ty: IrType::I32,
+        }),
+        tt(Op::Return),
+    ]
 }
 
 /// Phase 10-a body for `list_int_fold(xs: List<Int>, init: Int, f: Closure) -> Int`.
@@ -7376,116 +7471,120 @@ fn list_int_filter() -> StdlibFunction {
 ///   * 2 — `src_payload: I32`
 ///   * 3 — `acc:         I64`
 fn list_int_fold() -> StdlibFunction {
+    // Param ordering matches the user-facing surface:
+    //   `xs.fold(init, |acc, x| ...)` lowers to
+    //   `list_int_fold(xs, init, f)`.
+    StdlibFunction::new(
+        "list_int_fold",
+        vec![IrType::ListInt, IrType::I64, IrType::Closure],
+        IrType::I64,
+        list_int_fold_body,
+    )
+}
+
+fn list_int_fold_body() -> Vec<TaggedOp> {
     const N: u32 = 0;
     const I: u32 = 1;
     const SRC_PAYLOAD: u32 = 2;
     const ACC: u32 = 3;
-    StdlibFunction {
-        name: "list_int_fold",
-        // Param ordering matches the user-facing surface:
-        //   `xs.fold(init, |acc, x| ...)` lowers to
-        //   `list_int_fold(xs, init, f)`.
-        params: vec![IrType::ListInt, IrType::I64, IrType::Closure],
-        ret: IrType::I64,
-        body: vec![
-            // n = i32.load(xs, 0)
-            tt(Op::LocalGet(0)),
-            tt(Op::LoadI32AtAbsolute { offset: 0 }),
-            tt(Op::LetSet {
-                idx: N,
-                ty: IrType::I32,
-            }),
-            // src_payload = (xs + 4 + 7) & -8
-            tt(Op::LocalGet(0)),
-            tt(Op::ConstI32(4 + 7)),
-            tt(Op::Add(IrType::I32)),
-            tt(Op::ConstI32(-8)),
-            tt(Op::BitAnd(IrType::I32)),
-            tt(Op::LetSet {
-                idx: SRC_PAYLOAD,
-                ty: IrType::I32,
-            }),
-            // acc = init
-            tt(Op::LocalGet(1)),
-            tt(Op::LetSet {
-                idx: ACC,
-                ty: IrType::I64,
-            }),
-            // i = 0
-            tt(Op::ConstI32(0)),
-            tt(Op::LetSet {
-                idx: I,
-                ty: IrType::I32,
-            }),
-            tt(Op::Block {
+    vec![
+        // n = i32.load(xs, 0)
+        tt(Op::LocalGet(0)),
+        tt(Op::LoadI32AtAbsolute { offset: 0 }),
+        tt(Op::LetSet {
+            idx: N,
+            ty: IrType::I32,
+        }),
+        // src_payload = (xs + 4 + 7) & -8
+        tt(Op::LocalGet(0)),
+        tt(Op::ConstI32(4 + 7)),
+        tt(Op::Add(IrType::I32)),
+        tt(Op::ConstI32(-8)),
+        tt(Op::BitAnd(IrType::I32)),
+        tt(Op::LetSet {
+            idx: SRC_PAYLOAD,
+            ty: IrType::I32,
+        }),
+        // acc = init
+        tt(Op::LocalGet(1)),
+        tt(Op::LetSet {
+            idx: ACC,
+            ty: IrType::I64,
+        }),
+        // i = 0
+        tt(Op::ConstI32(0)),
+        tt(Op::LetSet {
+            idx: I,
+            ty: IrType::I32,
+        }),
+        tt(Op::Block {
+            result_ty: None,
+            body: vec![tt(Op::Loop {
                 result_ty: None,
-                body: vec![tt(Op::Loop {
-                    result_ty: None,
-                    body: vec![
-                        // exit when i >= n
-                        tt(Op::LetGet {
-                            idx: I,
-                            ty: IrType::I32,
-                        }),
-                        tt(Op::LetGet {
-                            idx: N,
-                            ty: IrType::I32,
-                        }),
-                        tt(Op::Ge(IrType::I32)),
-                        tt(Op::BrIf { label_depth: 1 }),
-                        // push closure (param 2)
-                        tt(Op::LocalGet(2)),
-                        // push acc
-                        tt(Op::LetGet {
-                            idx: ACC,
-                            ty: IrType::I64,
-                        }),
-                        // push x = i64.load(src_payload + i*8)
-                        tt(Op::LetGet {
-                            idx: SRC_PAYLOAD,
-                            ty: IrType::I32,
-                        }),
-                        tt(Op::LetGet {
-                            idx: I,
-                            ty: IrType::I32,
-                        }),
-                        tt(Op::ConstI32(8)),
-                        tt(Op::Mul(IrType::I32)),
-                        tt(Op::Add(IrType::I32)),
-                        tt(Op::LoadI64AtAbsolute { offset: 0 }),
-                        // call closure
-                        tt(Op::CallClosure {
-                            param_tys: vec![IrType::I64, IrType::I64],
-                            ret_ty: IrType::I64,
-                        }),
-                        // acc = result
-                        tt(Op::LetSet {
-                            idx: ACC,
-                            ty: IrType::I64,
-                        }),
-                        // i = i + 1
-                        tt(Op::LetGet {
-                            idx: I,
-                            ty: IrType::I32,
-                        }),
-                        tt(Op::ConstI32(1)),
-                        tt(Op::Add(IrType::I32)),
-                        tt(Op::LetSet {
-                            idx: I,
-                            ty: IrType::I32,
-                        }),
-                        tt(Op::Br { label_depth: 0 }),
-                    ],
-                })],
-            }),
-            // return acc
-            tt(Op::LetGet {
-                idx: ACC,
-                ty: IrType::I64,
-            }),
-            tt(Op::Return),
-        ],
-    }
+                body: vec![
+                    // exit when i >= n
+                    tt(Op::LetGet {
+                        idx: I,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::LetGet {
+                        idx: N,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::Ge(IrType::I32)),
+                    tt(Op::BrIf { label_depth: 1 }),
+                    // push closure (param 2)
+                    tt(Op::LocalGet(2)),
+                    // push acc
+                    tt(Op::LetGet {
+                        idx: ACC,
+                        ty: IrType::I64,
+                    }),
+                    // push x = i64.load(src_payload + i*8)
+                    tt(Op::LetGet {
+                        idx: SRC_PAYLOAD,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::LetGet {
+                        idx: I,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::ConstI32(8)),
+                    tt(Op::Mul(IrType::I32)),
+                    tt(Op::Add(IrType::I32)),
+                    tt(Op::LoadI64AtAbsolute { offset: 0 }),
+                    // call closure
+                    tt(Op::CallClosure {
+                        param_tys: vec![IrType::I64, IrType::I64],
+                        ret_ty: IrType::I64,
+                    }),
+                    // acc = result
+                    tt(Op::LetSet {
+                        idx: ACC,
+                        ty: IrType::I64,
+                    }),
+                    // i = i + 1
+                    tt(Op::LetGet {
+                        idx: I,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::ConstI32(1)),
+                    tt(Op::Add(IrType::I32)),
+                    tt(Op::LetSet {
+                        idx: I,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::Br { label_depth: 0 }),
+                ],
+            })],
+        }),
+        // return acc
+        tt(Op::LetGet {
+            idx: ACC,
+            ty: IrType::I64,
+        }),
+        tt(Op::Return),
+    ]
 }
 
 /// v3++ b-7 reframed internal helper:
@@ -7524,8 +7623,17 @@ fn list_int_fold() -> StdlibFunction {
 ///   * 5 — `key:   I32`   decoded input codepoint of the midpoint
 ///   * 6 — `sink:  I32`   drop slot for If-arm placeholders
 ///   * 7 — `result: I32`  matched entry address; defaults to 0 (miss)
-#[allow(clippy::vec_init_then_push)]
 fn full_casefold_lookup_helper() -> StdlibFunction {
+    StdlibFunction::new(
+        "__full_casefold_lookup",
+        vec![IrType::I32, IrType::I32],
+        IrType::I32,
+        full_casefold_lookup_helper_body,
+    )
+}
+
+#[allow(clippy::vec_init_then_push)]
+fn full_casefold_lookup_helper_body() -> Vec<TaggedOp> {
     const COUNT: u32 = 0;
     const LO: u32 = 1;
     const HI: u32 = 2;
@@ -7534,171 +7642,166 @@ fn full_casefold_lookup_helper() -> StdlibFunction {
     const KEY: u32 = 5;
     const SINK: u32 = 6;
     const RESULT: u32 = 7;
-    StdlibFunction {
-        name: "__full_casefold_lookup",
-        params: vec![IrType::I32, IrType::I32],
-        ret: IrType::I32,
-        body: vec![
-            // count = i32.load(table_addr + 0)
-            tt(Op::LocalGet(1)),
-            tt(Op::LoadI32AtAbsolute { offset: 0 }),
-            tt(Op::LetSet {
-                idx: COUNT,
-                ty: IrType::I32,
-            }),
-            // lo = 0; hi = count
-            tt(Op::ConstI32(0)),
-            tt(Op::LetSet {
-                idx: LO,
-                ty: IrType::I32,
-            }),
-            tt(Op::LetGet {
-                idx: COUNT,
-                ty: IrType::I32,
-            }),
-            tt(Op::LetSet {
-                idx: HI,
-                ty: IrType::I32,
-            }),
-            // result = 0 (miss sentinel)
-            tt(Op::ConstI32(0)),
-            tt(Op::LetSet {
-                idx: RESULT,
-                ty: IrType::I32,
-            }),
-            tt(Op::Block {
+    vec![
+        // count = i32.load(table_addr + 0)
+        tt(Op::LocalGet(1)),
+        tt(Op::LoadI32AtAbsolute { offset: 0 }),
+        tt(Op::LetSet {
+            idx: COUNT,
+            ty: IrType::I32,
+        }),
+        // lo = 0; hi = count
+        tt(Op::ConstI32(0)),
+        tt(Op::LetSet {
+            idx: LO,
+            ty: IrType::I32,
+        }),
+        tt(Op::LetGet {
+            idx: COUNT,
+            ty: IrType::I32,
+        }),
+        tt(Op::LetSet {
+            idx: HI,
+            ty: IrType::I32,
+        }),
+        // result = 0 (miss sentinel)
+        tt(Op::ConstI32(0)),
+        tt(Op::LetSet {
+            idx: RESULT,
+            ty: IrType::I32,
+        }),
+        tt(Op::Block {
+            result_ty: None,
+            body: vec![tt(Op::Loop {
                 result_ty: None,
-                body: vec![tt(Op::Loop {
-                    result_ty: None,
-                    body: vec![
-                        // exit when lo >= hi
-                        tt(Op::LetGet {
-                            idx: LO,
-                            ty: IrType::I32,
-                        }),
-                        tt(Op::LetGet {
-                            idx: HI,
-                            ty: IrType::I32,
-                        }),
-                        tt(Op::Ge(IrType::I32)),
-                        tt(Op::BrIf { label_depth: 1 }),
-                        // mid = (lo + hi) / 2
-                        tt(Op::LetGet {
-                            idx: LO,
-                            ty: IrType::I32,
-                        }),
-                        tt(Op::LetGet {
-                            idx: HI,
-                            ty: IrType::I32,
-                        }),
-                        tt(Op::Add(IrType::I32)),
-                        tt(Op::ConstI32(2)),
-                        tt(Op::Div(IrType::I32)),
-                        tt(Op::LetSet {
-                            idx: MID,
-                            ty: IrType::I32,
-                        }),
-                        // entry = table_addr + 4 + mid * 20
-                        tt(Op::LocalGet(1)),
-                        tt(Op::ConstI32(4)),
-                        tt(Op::Add(IrType::I32)),
-                        tt(Op::LetGet {
-                            idx: MID,
-                            ty: IrType::I32,
-                        }),
-                        tt(Op::ConstI32(20)),
-                        tt(Op::Mul(IrType::I32)),
-                        tt(Op::Add(IrType::I32)),
-                        tt(Op::LetSet {
-                            idx: ENTRY,
-                            ty: IrType::I32,
-                        }),
-                        // key = i32.load(entry + 0)
-                        tt(Op::LetGet {
-                            idx: ENTRY,
-                            ty: IrType::I32,
-                        }),
-                        tt(Op::LoadI32AtAbsolute { offset: 0 }),
-                        tt(Op::LetSet {
-                            idx: KEY,
-                            ty: IrType::I32,
-                        }),
-                        // if key == cp { RESULT = entry; br 2 }
-                        tt(Op::LetGet {
-                            idx: KEY,
-                            ty: IrType::I32,
-                        }),
-                        tt(Op::LocalGet(0)),
-                        tt(Op::Eq(IrType::I32)),
-                        tt(Op::If {
-                            result_ty: IrType::I32,
-                            then_body: vec![
-                                tt(Op::LetGet {
-                                    idx: ENTRY,
-                                    ty: IrType::I32,
-                                }),
-                                tt(Op::LetSet {
-                                    idx: RESULT,
-                                    ty: IrType::I32,
-                                }),
-                                tt(Op::Br { label_depth: 2 }),
-                                tt(Op::ConstI32(0)),
-                            ],
-                            else_body: vec![tt(Op::ConstI32(0))],
-                        }),
-                        tt(Op::LetSet {
-                            idx: SINK,
-                            ty: IrType::I32,
-                        }),
-                        // if key < cp { lo = mid + 1 } else { hi = mid }
-                        tt(Op::LetGet {
-                            idx: KEY,
-                            ty: IrType::I32,
-                        }),
-                        tt(Op::LocalGet(0)),
-                        tt(Op::Lt(IrType::I32)),
-                        tt(Op::If {
-                            result_ty: IrType::I32,
-                            then_body: vec![
-                                tt(Op::LetGet {
-                                    idx: MID,
-                                    ty: IrType::I32,
-                                }),
-                                tt(Op::ConstI32(1)),
-                                tt(Op::Add(IrType::I32)),
-                                tt(Op::LetSet {
-                                    idx: LO,
-                                    ty: IrType::I32,
-                                }),
-                                tt(Op::ConstI32(0)),
-                            ],
-                            else_body: vec![
-                                tt(Op::LetGet {
-                                    idx: MID,
-                                    ty: IrType::I32,
-                                }),
-                                tt(Op::LetSet {
-                                    idx: HI,
-                                    ty: IrType::I32,
-                                }),
-                                tt(Op::ConstI32(0)),
-                            ],
-                        }),
-                        tt(Op::LetSet {
-                            idx: SINK,
-                            ty: IrType::I32,
-                        }),
-                        tt(Op::Br { label_depth: 0 }),
-                    ],
-                })],
-            }),
-            tt(Op::LetGet {
-                idx: RESULT,
-                ty: IrType::I32,
-            }),
-            tt(Op::Return),
-        ],
-    }
+                body: vec![
+                    // exit when lo >= hi
+                    tt(Op::LetGet {
+                        idx: LO,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::LetGet {
+                        idx: HI,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::Ge(IrType::I32)),
+                    tt(Op::BrIf { label_depth: 1 }),
+                    // mid = (lo + hi) / 2
+                    tt(Op::LetGet {
+                        idx: LO,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::LetGet {
+                        idx: HI,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::Add(IrType::I32)),
+                    tt(Op::ConstI32(2)),
+                    tt(Op::Div(IrType::I32)),
+                    tt(Op::LetSet {
+                        idx: MID,
+                        ty: IrType::I32,
+                    }),
+                    // entry = table_addr + 4 + mid * 20
+                    tt(Op::LocalGet(1)),
+                    tt(Op::ConstI32(4)),
+                    tt(Op::Add(IrType::I32)),
+                    tt(Op::LetGet {
+                        idx: MID,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::ConstI32(20)),
+                    tt(Op::Mul(IrType::I32)),
+                    tt(Op::Add(IrType::I32)),
+                    tt(Op::LetSet {
+                        idx: ENTRY,
+                        ty: IrType::I32,
+                    }),
+                    // key = i32.load(entry + 0)
+                    tt(Op::LetGet {
+                        idx: ENTRY,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::LoadI32AtAbsolute { offset: 0 }),
+                    tt(Op::LetSet {
+                        idx: KEY,
+                        ty: IrType::I32,
+                    }),
+                    // if key == cp { RESULT = entry; br 2 }
+                    tt(Op::LetGet {
+                        idx: KEY,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::LocalGet(0)),
+                    tt(Op::Eq(IrType::I32)),
+                    tt(Op::If {
+                        result_ty: IrType::I32,
+                        then_body: vec![
+                            tt(Op::LetGet {
+                                idx: ENTRY,
+                                ty: IrType::I32,
+                            }),
+                            tt(Op::LetSet {
+                                idx: RESULT,
+                                ty: IrType::I32,
+                            }),
+                            tt(Op::Br { label_depth: 2 }),
+                            tt(Op::ConstI32(0)),
+                        ],
+                        else_body: vec![tt(Op::ConstI32(0))],
+                    }),
+                    tt(Op::LetSet {
+                        idx: SINK,
+                        ty: IrType::I32,
+                    }),
+                    // if key < cp { lo = mid + 1 } else { hi = mid }
+                    tt(Op::LetGet {
+                        idx: KEY,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::LocalGet(0)),
+                    tt(Op::Lt(IrType::I32)),
+                    tt(Op::If {
+                        result_ty: IrType::I32,
+                        then_body: vec![
+                            tt(Op::LetGet {
+                                idx: MID,
+                                ty: IrType::I32,
+                            }),
+                            tt(Op::ConstI32(1)),
+                            tt(Op::Add(IrType::I32)),
+                            tt(Op::LetSet {
+                                idx: LO,
+                                ty: IrType::I32,
+                            }),
+                            tt(Op::ConstI32(0)),
+                        ],
+                        else_body: vec![
+                            tt(Op::LetGet {
+                                idx: MID,
+                                ty: IrType::I32,
+                            }),
+                            tt(Op::LetSet {
+                                idx: HI,
+                                ty: IrType::I32,
+                            }),
+                            tt(Op::ConstI32(0)),
+                        ],
+                    }),
+                    tt(Op::LetSet {
+                        idx: SINK,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::Br { label_depth: 0 }),
+                ],
+            })],
+        }),
+        tt(Op::LetGet {
+            idx: RESULT,
+            ty: IrType::I32,
+        }),
+        tt(Op::Return),
+    ]
 }
 
 /// v3++ b-7 reframed internal helper:
@@ -7745,8 +7848,17 @@ fn full_casefold_lookup_helper() -> StdlibFunction {
 ///   * 10 — `result: I32`    accumulated return (0 = not final)
 ///   * 11 — `seen_cased_before: I32`  left-scan saw a cased cp
 ///   * 12 — `start: I32`     scratch for reverse-walk start cursor
-#[allow(clippy::vec_init_then_push, clippy::too_many_lines)]
 fn final_sigma_check_helper() -> StdlibFunction {
+    StdlibFunction::new(
+        "__final_sigma_check",
+        vec![IrType::I32, IrType::I32, IrType::I32, IrType::I32],
+        IrType::I32,
+        final_sigma_check_helper_body,
+    )
+}
+
+#[allow(clippy::vec_init_then_push, clippy::too_many_lines)]
+fn final_sigma_check_helper_body() -> Vec<TaggedOp> {
     const S_LEN: u32 = 0;
     const BACK: u32 = 1;
     const FWD: u32 = 2;
@@ -8202,244 +8314,239 @@ fn final_sigma_check_helper() -> StdlibFunction {
         seq
     };
 
-    StdlibFunction {
-        name: "__final_sigma_check",
-        params: vec![IrType::I32, IrType::I32, IrType::I32, IrType::I32],
-        ret: IrType::I32,
-        body: vec![
-            // s_len = i32.load(s_ptr + 0)
-            tt(Op::LocalGet(0)),
-            tt(Op::LoadI32AtAbsolute { offset: 0 }),
-            tt(Op::LetSet {
-                idx: S_LEN,
-                ty: IrType::I32,
-            }),
-            // result = 0 (default: not final)
-            tt(Op::ConstI32(0)),
-            tt(Op::LetSet {
-                idx: RESULT,
-                ty: IrType::I32,
-            }),
-            // seen_cased_before = 0
-            tt(Op::ConstI32(0)),
-            tt(Op::LetSet {
-                idx: SEEN_CASED_BEFORE,
-                ty: IrType::I32,
-            }),
-            // back = byte_offset (will scan leftwards)
-            tt(Op::LocalGet(1)),
-            tt(Op::LetSet {
-                idx: BACK,
-                ty: IrType::I32,
-            }),
-            // ----- LEFT SCAN -----
-            // while back > 0 { reverse-decode one cp; if cased: set
-            // seen_cased_before=1 and break; if !ignorable: break; else
-            // continue. } The scan requires at least one cased cp
-            // before the sigma (modulo ignorables) for the form to be
-            // final.
-            tt(Op::Block {
+    vec![
+        // s_len = i32.load(s_ptr + 0)
+        tt(Op::LocalGet(0)),
+        tt(Op::LoadI32AtAbsolute { offset: 0 }),
+        tt(Op::LetSet {
+            idx: S_LEN,
+            ty: IrType::I32,
+        }),
+        // result = 0 (default: not final)
+        tt(Op::ConstI32(0)),
+        tt(Op::LetSet {
+            idx: RESULT,
+            ty: IrType::I32,
+        }),
+        // seen_cased_before = 0
+        tt(Op::ConstI32(0)),
+        tt(Op::LetSet {
+            idx: SEEN_CASED_BEFORE,
+            ty: IrType::I32,
+        }),
+        // back = byte_offset (will scan leftwards)
+        tt(Op::LocalGet(1)),
+        tt(Op::LetSet {
+            idx: BACK,
+            ty: IrType::I32,
+        }),
+        // ----- LEFT SCAN -----
+        // while back > 0 { reverse-decode one cp; if cased: set
+        // seen_cased_before=1 and break; if !ignorable: break; else
+        // continue. } The scan requires at least one cased cp
+        // before the sigma (modulo ignorables) for the form to be
+        // final.
+        tt(Op::Block {
+            result_ty: None,
+            body: vec![tt(Op::Loop {
                 result_ty: None,
-                body: vec![tt(Op::Loop {
-                    result_ty: None,
-                    body: {
-                        let mut v: Vec<TaggedOp> = Vec::new();
-                        // exit if back == 0 (or < 0)
-                        v.push(tt(Op::LetGet {
-                            idx: BACK,
-                            ty: IrType::I32,
-                        }));
-                        v.push(tt(Op::ConstI32(1)));
-                        v.push(tt(Op::Lt(IrType::I32)));
-                        v.push(tt(Op::BrIf { label_depth: 1 }));
-                        // reverse-decode: writes CP, WIDTH, and resets
-                        // back to the lead byte of the decoded cp.
-                        v.extend(reverse_decode(BACK));
-                        // is_cased = range_lookup(CP, cased_addr)
-                        v.extend(range_lookup(CP, 2));
-                        v.push(tt(Op::If {
-                            result_ty: IrType::I32,
-                            then_body: vec![
-                                tt(Op::ConstI32(1)),
-                                tt(Op::LetSet {
-                                    idx: SEEN_CASED_BEFORE,
-                                    ty: IrType::I32,
-                                }),
-                                // br 2 exits the enclosing block.
-                                tt(Op::Br { label_depth: 2 }),
-                                tt(Op::ConstI32(0)),
-                            ],
-                            else_body: vec![tt(Op::ConstI32(0))],
-                        }));
-                        v.push(tt(Op::LetSet {
-                            idx: SINK,
-                            ty: IrType::I32,
-                        }));
-                        // is_ignorable = range_lookup(CP, ignorable_addr)
-                        v.extend(range_lookup(CP, 3));
-                        v.push(tt(Op::If {
-                            result_ty: IrType::I32,
-                            then_body: vec![tt(Op::ConstI32(0))],
-                            else_body: vec![
-                                // Non-cased, non-ignorable — break left
-                                // scan (without flipping seen flag).
-                                tt(Op::Br { label_depth: 2 }),
-                                tt(Op::ConstI32(0)),
-                            ],
-                        }));
-                        v.push(tt(Op::LetSet {
-                            idx: SINK,
-                            ty: IrType::I32,
-                        }));
-                        // continue.
-                        v.push(tt(Op::Br { label_depth: 0 }));
-                        v
-                    },
-                })],
-            }),
-            // If we never saw a cased cp on the left, sigma is not
-            // final — return 0 directly.
-            tt(Op::LetGet {
-                idx: SEEN_CASED_BEFORE,
-                ty: IrType::I32,
-            }),
-            tt(Op::ConstI32(0)),
-            tt(Op::Eq(IrType::I32)),
-            tt(Op::If {
-                result_ty: IrType::I32,
-                then_body: vec![
-                    tt(Op::ConstI32(0)),
-                    tt(Op::LetSet {
-                        idx: RESULT,
-                        ty: IrType::I32,
-                    }),
-                    tt(Op::ConstI32(0)),
-                ],
-                else_body: vec![tt(Op::ConstI32(0))],
-            }),
-            tt(Op::LetSet {
-                idx: SINK,
-                ty: IrType::I32,
-            }),
-            // Only continue the right scan when seen_cased_before == 1.
-            tt(Op::LetGet {
-                idx: SEEN_CASED_BEFORE,
-                ty: IrType::I32,
-            }),
-            tt(Op::ConstI32(1)),
-            tt(Op::Eq(IrType::I32)),
-            tt(Op::If {
-                result_ty: IrType::I32,
-                then_body: {
-                    let mut t: Vec<TaggedOp> = Vec::new();
-                    // fwd = byte_offset + 2 (Σ is 0xCE 0xA3 = 2 bytes)
-                    t.push(tt(Op::LocalGet(1)));
-                    t.push(tt(Op::ConstI32(2)));
-                    t.push(tt(Op::Add(IrType::I32)));
-                    t.push(tt(Op::LetSet {
-                        idx: FWD,
+                body: {
+                    let mut v: Vec<TaggedOp> = Vec::new();
+                    // exit if back == 0 (or < 0)
+                    v.push(tt(Op::LetGet {
+                        idx: BACK,
                         ty: IrType::I32,
                     }));
-                    // result = 1 (default until proven non-final by a
-                    // cased cp on the right; falls back to 0 only via
-                    // the explicit override below).
-                    t.push(tt(Op::ConstI32(1)));
-                    t.push(tt(Op::LetSet {
-                        idx: RESULT,
+                    v.push(tt(Op::ConstI32(1)));
+                    v.push(tt(Op::Lt(IrType::I32)));
+                    v.push(tt(Op::BrIf { label_depth: 1 }));
+                    // reverse-decode: writes CP, WIDTH, and resets
+                    // back to the lead byte of the decoded cp.
+                    v.extend(reverse_decode(BACK));
+                    // is_cased = range_lookup(CP, cased_addr)
+                    v.extend(range_lookup(CP, 2));
+                    v.push(tt(Op::If {
+                        result_ty: IrType::I32,
+                        then_body: vec![
+                            tt(Op::ConstI32(1)),
+                            tt(Op::LetSet {
+                                idx: SEEN_CASED_BEFORE,
+                                ty: IrType::I32,
+                            }),
+                            // br 2 exits the enclosing block.
+                            tt(Op::Br { label_depth: 2 }),
+                            tt(Op::ConstI32(0)),
+                        ],
+                        else_body: vec![tt(Op::ConstI32(0))],
+                    }));
+                    v.push(tt(Op::LetSet {
+                        idx: SINK,
                         ty: IrType::I32,
                     }));
-                    // ----- RIGHT SCAN -----
-                    t.push(tt(Op::Block {
-                        result_ty: None,
-                        body: vec![tt(Op::Loop {
-                            result_ty: None,
-                            body: {
-                                let mut v: Vec<TaggedOp> = Vec::new();
-                                // exit if fwd >= s_len
-                                v.push(tt(Op::LetGet {
-                                    idx: FWD,
-                                    ty: IrType::I32,
-                                }));
-                                v.push(tt(Op::LetGet {
-                                    idx: S_LEN,
-                                    ty: IrType::I32,
-                                }));
-                                v.push(tt(Op::Ge(IrType::I32)));
-                                v.push(tt(Op::BrIf { label_depth: 1 }));
-                                // forward-decode: writes CP and WIDTH.
-                                v.extend(forward_decode(FWD));
-                                // is_cased = range_lookup(CP, cased_addr)
-                                v.extend(range_lookup(CP, 2));
-                                v.push(tt(Op::If {
-                                    result_ty: IrType::I32,
-                                    then_body: vec![
-                                        // Cased cp — sigma is not final.
-                                        tt(Op::ConstI32(0)),
-                                        tt(Op::LetSet {
-                                            idx: RESULT,
-                                            ty: IrType::I32,
-                                        }),
-                                        tt(Op::Br { label_depth: 2 }),
-                                        tt(Op::ConstI32(0)),
-                                    ],
-                                    else_body: vec![tt(Op::ConstI32(0))],
-                                }));
-                                v.push(tt(Op::LetSet {
-                                    idx: SINK,
-                                    ty: IrType::I32,
-                                }));
-                                // is_ignorable = range_lookup(CP, ignorable_addr)
-                                v.extend(range_lookup(CP, 3));
-                                v.push(tt(Op::If {
-                                    result_ty: IrType::I32,
-                                    then_body: vec![tt(Op::ConstI32(0))],
-                                    else_body: vec![
-                                        // Non-cased, non-ignorable —
-                                        // word-final. Keep result = 1
-                                        // and exit.
-                                        tt(Op::Br { label_depth: 2 }),
-                                        tt(Op::ConstI32(0)),
-                                    ],
-                                }));
-                                v.push(tt(Op::LetSet {
-                                    idx: SINK,
-                                    ty: IrType::I32,
-                                }));
-                                // fwd += width
-                                v.push(tt(Op::LetGet {
-                                    idx: FWD,
-                                    ty: IrType::I32,
-                                }));
-                                v.push(tt(Op::LetGet {
-                                    idx: WIDTH,
-                                    ty: IrType::I32,
-                                }));
-                                v.push(tt(Op::Add(IrType::I32)));
-                                v.push(tt(Op::LetSet {
-                                    idx: FWD,
-                                    ty: IrType::I32,
-                                }));
-                                v.push(tt(Op::Br { label_depth: 0 }));
-                                v
-                            },
-                        })],
+                    // is_ignorable = range_lookup(CP, ignorable_addr)
+                    v.extend(range_lookup(CP, 3));
+                    v.push(tt(Op::If {
+                        result_ty: IrType::I32,
+                        then_body: vec![tt(Op::ConstI32(0))],
+                        else_body: vec![
+                            // Non-cased, non-ignorable — break left
+                            // scan (without flipping seen flag).
+                            tt(Op::Br { label_depth: 2 }),
+                            tt(Op::ConstI32(0)),
+                        ],
                     }));
-                    t.push(tt(Op::ConstI32(0)));
-                    t
+                    v.push(tt(Op::LetSet {
+                        idx: SINK,
+                        ty: IrType::I32,
+                    }));
+                    // continue.
+                    v.push(tt(Op::Br { label_depth: 0 }));
+                    v
                 },
-                else_body: vec![tt(Op::ConstI32(0))],
-            }),
-            tt(Op::LetSet {
-                idx: SINK,
-                ty: IrType::I32,
-            }),
-            tt(Op::LetGet {
-                idx: RESULT,
-                ty: IrType::I32,
-            }),
-            tt(Op::Return),
-        ],
-    }
+            })],
+        }),
+        // If we never saw a cased cp on the left, sigma is not
+        // final — return 0 directly.
+        tt(Op::LetGet {
+            idx: SEEN_CASED_BEFORE,
+            ty: IrType::I32,
+        }),
+        tt(Op::ConstI32(0)),
+        tt(Op::Eq(IrType::I32)),
+        tt(Op::If {
+            result_ty: IrType::I32,
+            then_body: vec![
+                tt(Op::ConstI32(0)),
+                tt(Op::LetSet {
+                    idx: RESULT,
+                    ty: IrType::I32,
+                }),
+                tt(Op::ConstI32(0)),
+            ],
+            else_body: vec![tt(Op::ConstI32(0))],
+        }),
+        tt(Op::LetSet {
+            idx: SINK,
+            ty: IrType::I32,
+        }),
+        // Only continue the right scan when seen_cased_before == 1.
+        tt(Op::LetGet {
+            idx: SEEN_CASED_BEFORE,
+            ty: IrType::I32,
+        }),
+        tt(Op::ConstI32(1)),
+        tt(Op::Eq(IrType::I32)),
+        tt(Op::If {
+            result_ty: IrType::I32,
+            then_body: {
+                let mut t: Vec<TaggedOp> = Vec::new();
+                // fwd = byte_offset + 2 (Σ is 0xCE 0xA3 = 2 bytes)
+                t.push(tt(Op::LocalGet(1)));
+                t.push(tt(Op::ConstI32(2)));
+                t.push(tt(Op::Add(IrType::I32)));
+                t.push(tt(Op::LetSet {
+                    idx: FWD,
+                    ty: IrType::I32,
+                }));
+                // result = 1 (default until proven non-final by a
+                // cased cp on the right; falls back to 0 only via
+                // the explicit override below).
+                t.push(tt(Op::ConstI32(1)));
+                t.push(tt(Op::LetSet {
+                    idx: RESULT,
+                    ty: IrType::I32,
+                }));
+                // ----- RIGHT SCAN -----
+                t.push(tt(Op::Block {
+                    result_ty: None,
+                    body: vec![tt(Op::Loop {
+                        result_ty: None,
+                        body: {
+                            let mut v: Vec<TaggedOp> = Vec::new();
+                            // exit if fwd >= s_len
+                            v.push(tt(Op::LetGet {
+                                idx: FWD,
+                                ty: IrType::I32,
+                            }));
+                            v.push(tt(Op::LetGet {
+                                idx: S_LEN,
+                                ty: IrType::I32,
+                            }));
+                            v.push(tt(Op::Ge(IrType::I32)));
+                            v.push(tt(Op::BrIf { label_depth: 1 }));
+                            // forward-decode: writes CP and WIDTH.
+                            v.extend(forward_decode(FWD));
+                            // is_cased = range_lookup(CP, cased_addr)
+                            v.extend(range_lookup(CP, 2));
+                            v.push(tt(Op::If {
+                                result_ty: IrType::I32,
+                                then_body: vec![
+                                    // Cased cp — sigma is not final.
+                                    tt(Op::ConstI32(0)),
+                                    tt(Op::LetSet {
+                                        idx: RESULT,
+                                        ty: IrType::I32,
+                                    }),
+                                    tt(Op::Br { label_depth: 2 }),
+                                    tt(Op::ConstI32(0)),
+                                ],
+                                else_body: vec![tt(Op::ConstI32(0))],
+                            }));
+                            v.push(tt(Op::LetSet {
+                                idx: SINK,
+                                ty: IrType::I32,
+                            }));
+                            // is_ignorable = range_lookup(CP, ignorable_addr)
+                            v.extend(range_lookup(CP, 3));
+                            v.push(tt(Op::If {
+                                result_ty: IrType::I32,
+                                then_body: vec![tt(Op::ConstI32(0))],
+                                else_body: vec![
+                                    // Non-cased, non-ignorable —
+                                    // word-final. Keep result = 1
+                                    // and exit.
+                                    tt(Op::Br { label_depth: 2 }),
+                                    tt(Op::ConstI32(0)),
+                                ],
+                            }));
+                            v.push(tt(Op::LetSet {
+                                idx: SINK,
+                                ty: IrType::I32,
+                            }));
+                            // fwd += width
+                            v.push(tt(Op::LetGet {
+                                idx: FWD,
+                                ty: IrType::I32,
+                            }));
+                            v.push(tt(Op::LetGet {
+                                idx: WIDTH,
+                                ty: IrType::I32,
+                            }));
+                            v.push(tt(Op::Add(IrType::I32)));
+                            v.push(tt(Op::LetSet {
+                                idx: FWD,
+                                ty: IrType::I32,
+                            }));
+                            v.push(tt(Op::Br { label_depth: 0 }));
+                            v
+                        },
+                    })],
+                }));
+                t.push(tt(Op::ConstI32(0)));
+                t
+            },
+            else_body: vec![tt(Op::ConstI32(0))],
+        }),
+        tt(Op::LetSet {
+            idx: SINK,
+            ty: IrType::I32,
+        }),
+        tt(Op::LetGet {
+            idx: RESULT,
+            ty: IrType::I32,
+        }),
+        tt(Op::Return),
+    ]
 }
 
 #[cfg(test)]

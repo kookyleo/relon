@@ -394,10 +394,13 @@ impl ConstPool {
                 // The cranelift backend inlines bundled stdlib bodies.
                 // Recurse into the callee so its `ConstString` /
                 // `CaseFoldTableAddr` references contribute to the
-                // pool before the entry body is lowered.
+                // pool before the entry body is lowered. F-D2-G:
+                // `.body()` lazily forces the op stream on first
+                // touch — the same callee revisited later picks the
+                // cached vector for free.
                 let stdlib = relon_ir::stdlib::builtin_stdlib();
                 if let Some(callee) = stdlib.get(*fn_index as usize) {
-                    self.collect_body(&callee.body)?;
+                    self.collect_body(callee.body())?;
                 }
             }
             _ => {}
@@ -2433,8 +2436,10 @@ impl<'a, 'b> Codegen<'a, 'b> {
         // Push the inline frame and lower the callee body. We clone
         // the body out of the stdlib vector because `emit_body`
         // takes &self mut and we can't simultaneously hold a borrow
-        // into stdlib.
-        let body = callee.body.clone();
+        // into stdlib. F-D2-G: `body()` lazily forces the op stream
+        // on first touch and caches it for the rest of the process —
+        // the JIT pulls the cache on subsequent inlines for free.
+        let body = callee.body_owned();
         self.inline_frames.push(InlineFrame {
             params: args,
             exit_block,

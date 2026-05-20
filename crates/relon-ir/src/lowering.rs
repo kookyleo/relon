@@ -1737,14 +1737,13 @@ fn lower_fn_call(
                 range,
             });
         };
-        let stdlib_meta = builtin_stdlib()
-            .into_iter()
-            .nth(fn_index as usize)
-            .ok_or_else(|| LoweringError::UnknownStdlibMethod {
+        let stdlib_meta = builtin_stdlib().get(fn_index as usize).ok_or_else(|| {
+            LoweringError::UnknownStdlibMethod {
                 name: method_name.to_string(),
                 arity,
                 range,
-            })?;
+            }
+        })?;
         if (stdlib_meta.params.len() as u32) != arity {
             return Err(LoweringError::UnknownStdlibMethod {
                 name: method_name.to_string(),
@@ -1829,14 +1828,13 @@ fn lower_fn_call(
             range,
         });
     };
-    let stdlib_meta = builtin_stdlib()
-        .into_iter()
-        .nth(fn_index as usize)
-        .ok_or_else(|| LoweringError::UnknownStdlibMethod {
+    let stdlib_meta = builtin_stdlib().get(fn_index as usize).ok_or_else(|| {
+        LoweringError::UnknownStdlibMethod {
             name: method_name.to_string(),
             arity,
             range,
-        })?;
+        }
+    })?;
     if (stdlib_meta.params.len() as u32) != arity {
         return Err(LoweringError::UnknownStdlibMethod {
             name: method_name.to_string(),
