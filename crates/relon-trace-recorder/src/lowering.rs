@@ -216,6 +216,25 @@ pub fn lower_op(op: &Op, cx: OpLoweringContext<'_>) -> LowerOutcome {
         }
 
         // ---- Arithmetic / comparison ------------------------------------
+        // F-D7-B: `String + String` short-circuits onto the dedicated
+        // `TraceOp::StrConcat` fast path. The recorder mirrors the
+        // operand-stack order of `binary_arith` (rhs on top → inputs[0])
+        // and emits NotNull guards on both operands so the trace deopts
+        // cleanly rather than returning a null `StringRef` from the
+        // extern shim. We dispatch this before the generic
+        // `binary_arith` arm because that helper only accepts integer
+        // widths.
+        //
+        // Source-side wiring: the AST parser/analyzer pair lowers
+        // `expr_lhs + expr_rhs` to `Op::Binary(Add, ...)` and onto
+        // `Op::Add(IrType::String)` whenever both sides are typed
+        // `IrType::String`. The IR-side AST→Op pipeline gating for
+        // this shape is tracked in the F-D7-B follow-up; until that
+        // lands no real Relon program produces `Op::Add(IrType::String)`,
+        // but the recorder rule is kept here so a hand-built IR fragment
+        // (or a future lowering pass) can drive `StrConcat` through
+        // the same code path the stdlib `concat()` call already uses.
+        Op::Add(IrType::String) => lower_str_add(cx),
         Op::Add(ty) => binary_arith(cx, *ty, BinaryArith::Add),
         Op::Sub(ty) => binary_arith(cx, *ty, BinaryArith::Sub),
         Op::Mul(ty) => binary_arith(cx, *ty, BinaryArith::Mul),
@@ -425,24 +444,32 @@ fn unsupported_op_name(op: &Op) -> &'static str {
 /// `TraceOp::Str*` fast path. These must stay in sync with the
 /// `builtin_stdlib()` ordering in [`relon_ir::stdlib`]:
 ///
-/// - 6 → `concat(String, String) -> String`
-/// - 9 → `substring(String, Int, Int) -> String`
+/// - 6  → `concat(String, String) -> String`
+/// - 9  → `substring(String, Int, Int) -> String`
+/// - 36 → `contains(String, String) -> Bool` (F-D7-B placeholder;
+///   not yet registered in `builtin_stdlib()`, see
+///   [`STDLIB_IDX_CONTAINS`] below).
 ///
 /// `starts_with` (idx 10) is intentionally NOT specialised here yet
 /// — it returns a `Bool`, falls under the same TraceOp envelope as
 /// `StrContains`, and will be added in a later F-D7 sub-phase to
 /// keep the recorder's surface narrow until the bench confirms each
 /// op pulls its weight.
-///
-/// `contains` is NOT currently a stdlib `Op::Call` target — it lives
-/// only as a tree-walker `register_pure_method("String", "contains", ...)`
-/// dispatch. A future F-D7 sub-phase will register a stdlib index
-/// for it; until then the recorder will still see the tree-walker's
-/// dispatch path and abort with `UnrecoverableEffect`, leaving W4 on
-/// the tree-walker fall-back tier. See the F-D7 stage report for
-/// the wiring plan.
 const STDLIB_IDX_CONCAT: u32 = 6;
 const STDLIB_IDX_SUBSTRING: u32 = 9;
+/// F-D7-B: reserved stdlib index for the `(String, String) -> Bool`
+/// `contains` body. The constant is the slot the future
+/// `contains_string()` entry will occupy when added to
+/// [`relon_ir::stdlib::builtin_stdlib`] (one past the last current
+/// entry — see the doc-comment list above
+/// [`relon_ir::stdlib::builtin_stdlib`]). Until that lands, no
+/// real Relon program produces `Op::Call { fn_index: 36 }`; the
+/// recorder rule below stays here so a hand-built IR fragment (or
+/// the AST-level shortcut in
+/// [`record_method_call_contains`](crate::RecorderState::record_method_call_contains))
+/// can route through the same fast path the F-D7-C inline emit
+/// already supports.
+pub const STDLIB_IDX_CONTAINS: u32 = 36;
 
 fn lower_string_call(fn_index: u32, cx: &OpLoweringContext<'_>) -> Option<LowerOutcome> {
     match fn_index {
@@ -497,7 +524,60 @@ fn lower_string_call(fn_index: u32, cx: &OpLoweringContext<'_>) -> Option<LowerO
                 effect: TraceEffect::Pure,
             })
         }
+        // F-D7-B: `contains(haystack, needle) -> Bool` short-circuits
+        // onto `TraceOp::StrContains`. Operand-stack order at call
+        // time: `[..., haystack, needle]` (needle pushed last →
+        // `inputs[0]`). We emit a NotNull guard on the haystack only;
+        // a null needle is handled by the F-D7-C inline-emit path
+        // (zero-length needle returns true / shim returns true) so
+        // guarding it here would surface spurious deopts. The
+        // const-bytes side table (`OptimizedTrace::const_bytes`) is
+        // filled by a dedicated recorder API
+        // ([`crate::RecorderState::record_method_call_contains`])
+        // because this pure-function lowering cannot reach into the
+        // walker's per-arg constant view; routing only via this arm
+        // means inline-needle specialisation stays off until the
+        // higher-level entry fires.
+        STDLIB_IDX_CONTAINS => {
+            if cx.inputs.len() < 2 {
+                return Some(LowerOutcome::Abort(AbortReason::UnsupportedOp(
+                    "StrContainsUnderflow",
+                )));
+            }
+            let needle = cx.inputs[0];
+            let haystack = cx.inputs[1];
+            Some(LowerOutcome::Emit {
+                op: TraceOp::StrContains(cx.fresh_dst, haystack, needle),
+                dst: Some(cx.fresh_dst),
+                guards_before: vec![GuardKind::NotNull(haystack)],
+                guards_after: vec![],
+                effect: TraceEffect::Pure,
+            })
+        }
         _ => None,
+    }
+}
+
+/// F-D7-B: lower `Op::Add(IrType::String)` onto the dedicated
+/// `TraceOp::StrConcat` fast path.
+///
+/// Mirrors [`lower_string_call`]'s `STDLIB_IDX_CONCAT` arm operand
+/// ordering — at call time the stack is `[..., lhs, rhs]` so rhs is
+/// `cx.inputs[0]` and lhs is `cx.inputs[1]`. Emits NotNull guards on
+/// both operands so the trace deopts cleanly rather than returning a
+/// null `StringRef` from the extern shim.
+fn lower_str_add(cx: OpLoweringContext<'_>) -> LowerOutcome {
+    if cx.inputs.len() < 2 {
+        return LowerOutcome::Abort(AbortReason::UnsupportedOp("StrConcatUnderflow"));
+    }
+    let rhs = cx.inputs[0];
+    let lhs = cx.inputs[1];
+    LowerOutcome::Emit {
+        op: TraceOp::StrConcat(cx.fresh_dst, lhs, rhs),
+        dst: Some(cx.fresh_dst),
+        guards_before: vec![GuardKind::NotNull(lhs), GuardKind::NotNull(rhs)],
+        guards_after: vec![],
+        effect: TraceEffect::Pure,
     }
 }
 
@@ -514,6 +594,15 @@ fn binary_arith(cx: OpLoweringContext<'_>, ty: IrType, kind: BinaryArith) -> Low
     // UnsupportedOp until a typed variant lands.
     if matches!(ty, IrType::F64) {
         return LowerOutcome::Abort(AbortReason::UnsupportedOp("FloatArith"));
+    }
+    // F-D7-B: `Op::Add(IrType::String)` is short-circuited before
+    // this helper is reached (see `lower_op`); a `Sub`/`Mul`/`Div`
+    // with String operands is nonsense at the source level and
+    // would never lower through the IR. Defensive guard rejects it
+    // here so a hand-built fuzz fragment cannot smuggle two String
+    // SSAs into the integer `TraceOp::Sub`.
+    if matches!(ty, IrType::String) {
+        return LowerOutcome::Abort(AbortReason::UnsupportedOp("StringArith"));
     }
     if cx.inputs.len() < 2 {
         return LowerOutcome::Abort(AbortReason::UnsupportedOp("ArithUnderflow"));
@@ -902,5 +991,141 @@ mod tests {
             }
             other => panic!("expected Emit, got {:?}", other),
         }
+    }
+
+    // ---- F-D7-B: String + / contains recognition ----
+
+    #[test]
+    fn add_irtype_string_emits_str_concat() {
+        // Stack ordering matches `binary_arith`: rhs on top → inputs[0].
+        let inputs = [SsaVar(20), SsaVar(10)]; // rhs=20, lhs=10
+        let outcome = lower_op(&Op::Add(IrType::String), cx_with(&inputs, SsaVar(99)));
+        match outcome {
+            LowerOutcome::Emit {
+                op,
+                dst: Some(d),
+                guards_before,
+                effect,
+                ..
+            } => {
+                assert_eq!(d, SsaVar(99));
+                assert_eq!(effect, TraceEffect::Pure);
+                match op {
+                    TraceOp::StrConcat(_, l, r) => {
+                        assert_eq!(l, SsaVar(10), "lhs is the second-from-top input");
+                        assert_eq!(r, SsaVar(20), "rhs is the top input");
+                    }
+                    other => panic!("expected StrConcat, got {other:?}"),
+                }
+                assert!(
+                    matches!(
+                        guards_before.as_slice(),
+                        [GuardKind::NotNull(_), GuardKind::NotNull(_)]
+                    ),
+                    "expected NotNull guards on both operands, got {guards_before:?}"
+                );
+            }
+            other => panic!("expected Emit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn add_irtype_int_keeps_generic_binary_arith() {
+        // `Op::Add(IrType::I64)` must NOT route into `lower_str_add` —
+        // type mismatch should fall through to `binary_arith`.
+        let inputs = [SsaVar(2), SsaVar(1)];
+        let outcome = lower_op(&Op::Add(IrType::I64), cx_with(&inputs, SsaVar(7)));
+        match outcome {
+            LowerOutcome::Emit { op, .. } => {
+                assert!(
+                    matches!(op, TraceOp::Add(_, _, _)),
+                    "expected integer Add, got {op:?}"
+                );
+            }
+            other => panic!("expected Emit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn add_irtype_string_underflow_aborts() {
+        let inputs = [SsaVar(1)];
+        let outcome = lower_op(&Op::Add(IrType::String), cx_with(&inputs, SsaVar(99)));
+        assert!(matches!(
+            outcome,
+            LowerOutcome::Abort(AbortReason::UnsupportedOp("StrConcatUnderflow"))
+        ));
+    }
+
+    #[test]
+    fn sub_irtype_string_aborts_as_string_arith() {
+        // Defensive: Sub/Mul/Div with String operands is nonsense and
+        // never produced by real source. The recorder rejects it
+        // explicitly rather than handing two String SSAs to the
+        // integer Sub op.
+        let inputs = [SsaVar(2), SsaVar(1)];
+        let outcome = lower_op(&Op::Sub(IrType::String), cx_with(&inputs, SsaVar(7)));
+        assert!(matches!(
+            outcome,
+            LowerOutcome::Abort(AbortReason::UnsupportedOp("StringArith"))
+        ));
+    }
+
+    #[test]
+    fn contains_stdlib_index_emits_str_contains() {
+        // Stack [haystack, needle] → inputs ordered [needle, haystack].
+        let inputs = [SsaVar(7), SsaVar(3)]; // needle=7, haystack=3
+        let outcome = lower_op(
+            &Op::Call {
+                fn_index: STDLIB_IDX_CONTAINS,
+                arg_count: 2,
+                param_tys: vec![IrType::String, IrType::String],
+                ret_ty: IrType::Bool,
+            },
+            cx_with(&inputs, SsaVar(50)),
+        );
+        match outcome {
+            LowerOutcome::Emit {
+                op,
+                dst: Some(d),
+                guards_before,
+                effect,
+                ..
+            } => {
+                assert_eq!(d, SsaVar(50));
+                assert_eq!(effect, TraceEffect::Pure);
+                match op {
+                    TraceOp::StrContains(_, h, n) => {
+                        assert_eq!(h, SsaVar(3), "haystack is the second-from-top input");
+                        assert_eq!(n, SsaVar(7), "needle is the top input");
+                    }
+                    other => panic!("expected StrContains, got {other:?}"),
+                }
+                // Single NotNull(haystack) guard — needle stays
+                // unguarded so the zero-length case can succeed.
+                assert!(
+                    matches!(guards_before.as_slice(), [GuardKind::NotNull(_)]),
+                    "expected single NotNull guard, got {guards_before:?}"
+                );
+            }
+            other => panic!("expected Emit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn contains_underflow_aborts() {
+        let inputs = [SsaVar(5)];
+        let outcome = lower_op(
+            &Op::Call {
+                fn_index: STDLIB_IDX_CONTAINS,
+                arg_count: 2,
+                param_tys: vec![IrType::String, IrType::String],
+                ret_ty: IrType::Bool,
+            },
+            cx_with(&inputs, SsaVar(50)),
+        );
+        assert!(matches!(
+            outcome,
+            LowerOutcome::Abort(AbortReason::UnsupportedOp("StrContainsUnderflow"))
+        ));
     }
 }
