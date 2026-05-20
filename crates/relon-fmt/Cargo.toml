@@ -10,6 +10,10 @@ keywords = ["formatter", "cli", "dsl", "config"]
 categories = ["development-tools", "command-line-utilities"]
 
 [dependencies]
-clap = { workspace = true, features = ["derive"] }
+# v6-fix-D2-J cold-start: opt out of clap's default-on `color` /
+# `suggestions` / `wrap_help` so the `relon-fmt` binary (and the CLI
+# that re-exports its `Fmt` subcommand) stays lean. `derive` + `std`
+# + `help` are sufficient for the bare `relon-fmt` parser surface.
+clap = { workspace = true, default-features = false, features = ["derive", "std", "help", "usage", "error-context"] }
 relon-parser = { workspace = true }
 thiserror = { workspace = true }

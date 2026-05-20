@@ -2233,7 +2233,15 @@ fn bench_cmp_lua(c: &mut Criterion) {
 
     let relon_bin = std::env::var("RELON_CLI_BIN").unwrap_or_else(|_| {
         // Try a few likely locations; falls back to PATH lookup.
-        let candidates = ["target/release/relon-cli", "target/debug/relon-cli"];
+        // v6-fix-D2-J: prefer the `release-cli` profile binary (fat-LTO
+        // + `panic = "abort"`) when present so the W11 cold-start row
+        // measures the leanest available binary; fall back to the
+        // regular release / debug builds otherwise.
+        let candidates = [
+            "target/release-cli/relon-cli",
+            "target/release/relon-cli",
+            "target/debug/relon-cli",
+        ];
         for c in candidates {
             if std::path::Path::new(c).exists() {
                 return c.to_string();
