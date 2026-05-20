@@ -411,6 +411,28 @@ impl RecorderState {
         key_ssa: SsaVar,
         shape_hash: u64,
     ) -> Option<SsaVar> {
+        self.emit_dict_lookup_with_hint(dict_ssa, key_ssa, shape_hash, None)
+    }
+
+    /// F-D8-E.7 variant of [`Self::emit_dict_lookup`] that also stamps
+    /// the dict's static `entry_count` (when the source-level IR
+    /// carried one via `Op::DictGetByStringKey::entry_count_hint`) into
+    /// the trace buffer's `dict_entry_count_hints` side table.
+    ///
+    /// Keying on `dict_ssa` lets the optimizer's `dict_ic_hoist` pass
+    /// rewrite the dict-pointer use site without losing the hint —
+    /// `DictShapeGuard` + `DictLookupPrechecked` share the same
+    /// dict_ptr SSA. The trace-emitter then queries the side table
+    /// from `emit_dict_lookup_prechecked` and switches the inline
+    /// scan into a fully-unrolled cmov chain when `entry_count_hint
+    /// <= MAX_INLINE_UNROLL`.
+    pub fn emit_dict_lookup_with_hint(
+        &mut self,
+        dict_ssa: SsaVar,
+        key_ssa: SsaVar,
+        shape_hash: u64,
+        entry_count_hint: Option<u32>,
+    ) -> Option<SsaVar> {
         if self.aborted.is_some() || self.terminated {
             return None;
         }
@@ -428,6 +450,9 @@ impl RecorderState {
         self.pop_inputs(&[dict_ssa, key_ssa]);
         self.push_ssa(dst);
         self.buffer.record_type(dst, ObservedType::I64);
+        if let Some(n) = entry_count_hint {
+            self.buffer.record_dict_entry_count_hint(dict_ssa, n);
+        }
         Some(dst)
     }
 
@@ -933,9 +958,15 @@ impl RecorderState {
                 let container = inputs[1];
                 let dst = match kind {
                     SubscriptKind::ListGet => self.emit_list_get(container, top),
-                    SubscriptKind::DictLookup { shape_hash } => {
-                        self.emit_dict_lookup(container, top, shape_hash)
-                    }
+                    SubscriptKind::DictLookup {
+                        shape_hash,
+                        entry_count_hint,
+                    } => self.emit_dict_lookup_with_hint(
+                        container,
+                        top,
+                        shape_hash,
+                        entry_count_hint,
+                    ),
                 };
                 let Some(d) = dst else {
                     // emit_* short-circuits on aborted / terminated;
@@ -1529,6 +1560,7 @@ mod tests {
             &Op::DictGetByStringKey {
                 shape_hash: 0xab,
                 value_ty: IrType::I64,
+                entry_count_hint: None,
             },
             &[key, dict],
             Some(ObservedType::I64),

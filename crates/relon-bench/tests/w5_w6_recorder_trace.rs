@@ -239,6 +239,7 @@ fn w5_recorder_trace_runs_actual_iterations() {
                     tag(Op::DictGetByStringKey {
                         shape_hash,
                         value_ty: IrType::I64,
+                        entry_count_hint: None,
                     }),
                     tag(Op::LetGet {
                         idx: ACC,

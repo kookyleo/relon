@@ -645,6 +645,10 @@ fn build_w5_recorder_body(shape_hash: u64) -> Vec<TaggedOp> {
                     tag(Op::DictGetByStringKey {
                         shape_hash,
                         value_ty: IrType::I64,
+                        // F-D8-E.7: W5 fixture has 10 fixed keys; this
+                        // hint lets the emitter switch the inline
+                        // lookup to a 10-deep cmov chain (no scan loop).
+                        entry_count_hint: Some(10),
                     }),
                     // acc = acc + value
                     tag(Op::LetGet {
