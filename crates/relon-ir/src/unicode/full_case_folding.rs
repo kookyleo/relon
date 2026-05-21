@@ -1,7 +1,7 @@
 //! v3++ b-6 full Unicode case folding (UAX #21).
 //!
 //! Extends the v3+ a-4 simple folding (1:1 codepoint mappings in
-//! [`crate::case_folding`]) with three additional rules drawn from
+//! [`super::case_folding`]) with three additional rules drawn from
 //! UCD 14.0.0:
 //!
 //!   * **Multi-codepoint unconditional mappings** — `ß` -> `SS`, the
