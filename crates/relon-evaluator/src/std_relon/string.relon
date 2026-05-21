@@ -8,5 +8,6 @@
     replace(s, old, new): _string_replace(s, old, new),
     upper(s): _string_upper(s),
     lower(s): _string_lower(s),
-    contains(s, sub): _string_contains(s, sub)
+    contains(s, sub): _string_contains(s, sub),
+    glob_match(s, pattern): _string_glob_match(s, pattern)
 }

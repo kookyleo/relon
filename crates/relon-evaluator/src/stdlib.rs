@@ -51,6 +51,11 @@ pub fn register_to(ctx: &mut Context) {
     let string_nfkc: Arc<dyn RelonFunction> = Arc::new(StringNfkc);
     let string_nfkd: Arc<dyn RelonFunction> = Arc::new(StringNfkd);
     let string_contains: Arc<dyn RelonFunction> = Arc::new(StringContains);
+    // 2026-05-21: Tier-2 glob matcher. Surface name `glob_match`
+    // matches the bundled stdlib slot 37; the cranelift backend
+    // intercepts the same fn_index and routes through a host helper
+    // for AOT-compiled scripts.
+    let string_glob_match: Arc<dyn RelonFunction> = Arc::new(StringGlobMatch);
     ctx.register_pure_fn("_string_split", Arc::clone(&string_split));
     ctx.register_pure_fn("_string_join", Arc::clone(&string_join));
     ctx.register_pure_fn("_string_replace", Arc::clone(&string_replace));
@@ -65,6 +70,8 @@ pub fn register_to(ctx: &mut Context) {
     ctx.register_pure_fn("_string_nfkc", Arc::clone(&string_nfkc));
     ctx.register_pure_fn("_string_nfkd", Arc::clone(&string_nfkd));
     ctx.register_pure_fn("_string_contains", Arc::clone(&string_contains));
+    ctx.register_pure_fn("_string_glob_match", Arc::clone(&string_glob_match));
+    ctx.register_pure_fn("glob_match", Arc::clone(&string_glob_match));
 
     let dict_merge: Arc<dyn RelonFunction> = Arc::new(DictMerge);
     let dict_keys: Arc<dyn RelonFunction> = Arc::new(DictKeys);
@@ -163,6 +170,7 @@ pub fn register_to(ctx: &mut Context) {
     ctx.register_pure_method("String", "nfkc", string_nfkc);
     ctx.register_pure_method("String", "nfkd", string_nfkd);
     ctx.register_pure_method("String", "contains", Arc::clone(&string_contains));
+    ctx.register_pure_method("String", "glob_match", Arc::clone(&string_glob_match));
     ctx.register_pure_method("String", "len", Arc::clone(&len));
     // v6-δ M1 R4: corpus / IR-side sources use `length()` /
     // `is_empty()` as method aliases for the same intrinsics the
@@ -1206,6 +1214,31 @@ impl RelonFunction for StringContains {
         Ok(Value::Bool(
             expect_string(&args[0], range)?.contains(expect_string(&args[1], range)?),
         ))
+    }
+}
+
+/// 2026-05-21: Tier-2 LuaJIT-pattern-subset glob matcher
+/// (`glob_match(s, pattern) -> Bool`).
+///
+/// Delegates to the shared algorithm in [`relon_ir::glob::glob_match`]
+/// so the tree-walker and the cranelift host-helper backend stay
+/// byte-for-byte in lock-step. The matcher itself is anchored, case-
+/// sensitive, char-by-char Unicode, and runs in linear time over
+/// `|s| * |p|` with no exponential-backtracking surface — see the
+/// module doc-comment in `relon-ir/src/glob.rs` for the supported
+/// syntax and malformed-pattern handling.
+struct StringGlobMatch;
+impl RelonFunction for StringGlobMatch {
+    fn call(
+        &self,
+        args: NativeArgs,
+        range: relon_parser::TokenRange,
+    ) -> Result<Value, RuntimeError> {
+        let args = args.into_positional();
+        expect_arg_count(&args, 2, range)?;
+        let s = expect_string(&args[0], range)?;
+        let pattern = expect_string(&args[1], range)?;
+        Ok(Value::Bool(relon_ir::glob::glob_match(s, pattern)))
     }
 }
 

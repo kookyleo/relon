@@ -260,7 +260,12 @@ fn test_string_stdlib() {
         "replaced": string.replace("hello world", "world", "relon"),
         "upper": string.upper("Relon"),
         "lower": string.lower("Relon"),
-        "has_config": string.contains("rust config dsl", "config")
+        "has_config": string.contains("rust config dsl", "config"),
+        "glob_prefix": string.glob_match("/api/v1/users", "/api/*"),
+        "glob_extension": string.glob_match("readme.txt", "*.txt"),
+        "glob_question": string.glob_match("abc", "a?c"),
+        "glob_reject": string.glob_match("/other/v1", "/api/*"),
+        "glob_via_free_fn": glob_match("hello", "h?llo")
     }"#,
     )
     .unwrap();
@@ -283,6 +288,15 @@ fn test_string_stdlib() {
             &Value::String("relon".to_string())
         );
         assert_eq!(map.map.get("has_config").unwrap(), &Value::Bool(true));
+        // 2026-05-21: glob_match surface covers `string.glob_match(...)`,
+        // the method form `s.glob_match(...)`, and the bare free-fn
+        // `glob_match(...)`. All three must dispatch into the shared
+        // `relon_ir::glob::glob_match` impl.
+        assert_eq!(map.map.get("glob_prefix").unwrap(), &Value::Bool(true));
+        assert_eq!(map.map.get("glob_extension").unwrap(), &Value::Bool(true));
+        assert_eq!(map.map.get("glob_question").unwrap(), &Value::Bool(true));
+        assert_eq!(map.map.get("glob_reject").unwrap(), &Value::Bool(false));
+        assert_eq!(map.map.get("glob_via_free_fn").unwrap(), &Value::Bool(true));
     } else {
         panic!("Expected Dict");
     }
