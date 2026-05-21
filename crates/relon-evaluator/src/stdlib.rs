@@ -884,6 +884,10 @@ fn fold_string(s: &str, mode: CaseFoldMode, locale_turkish: bool) -> String {
 /// fold engine has the full state space rather than a default-true
 /// / default-false split.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(
+    dead_code,
+    reason = "AllAscii / KnownNonAscii are reached only by the #153 parity tests today; surface call site lands in the follow-up that plumbs the StringRef ASCII flag bit into the evaluator's Value -> &str path"
+)]
 enum AsciiHint {
     /// Caller has not classified the input. The fold engine runs the
     /// SIMD scan + fast path as before.
@@ -2261,7 +2265,11 @@ mod ascii_hint_tests {
             "0123456789",
             "  leading  spaces",
         ] {
-            for mode in [CaseFoldMode::Upper, CaseFoldMode::Lower, CaseFoldMode::Title] {
+            for mode in [
+                CaseFoldMode::Upper,
+                CaseFoldMode::Lower,
+                CaseFoldMode::Title,
+            ] {
                 let (unknown, all_ascii, known_non_ascii) = run(s, mode);
                 assert_eq!(unknown, all_ascii, "s={s:?} mode={mode:?}");
                 // KnownNonAscii forces the slow path; for ASCII input
@@ -2286,9 +2294,12 @@ mod ascii_hint_tests {
             "\u{03A3}\u{0391}",
             "Welt: ich bin\u{00E9}",
         ] {
-            for mode in [CaseFoldMode::Upper, CaseFoldMode::Lower, CaseFoldMode::Title] {
-                let unknown =
-                    fold_string_with_ascii_hint(s, mode, false, AsciiHint::Unknown);
+            for mode in [
+                CaseFoldMode::Upper,
+                CaseFoldMode::Lower,
+                CaseFoldMode::Title,
+            ] {
+                let unknown = fold_string_with_ascii_hint(s, mode, false, AsciiHint::Unknown);
                 let known_non_ascii =
                     fold_string_with_ascii_hint(s, mode, false, AsciiHint::KnownNonAscii);
                 assert_eq!(unknown, known_non_ascii, "s={s:?} mode={mode:?}");

@@ -98,10 +98,10 @@ pub const STRING_RECORD_ASCII_FLAG_BIT: u32 = 1u32 << 31;
 ///
 /// `const_assert`-style invariant: every payload accepted into a
 /// dict key record fits in 31 bits (2 GiB). The producer-side
-/// helpers ([`build_string_record_with_flags`]) panic in debug builds
-/// if a longer payload is presented; release builds would silently
-/// fold the high bit into the length, which the ASCII fast-path
-/// would then mis-read.
+/// helper `relon_trace_jit::runtime::build_string_record` panics in
+/// debug builds if a longer payload is presented; release builds
+/// would silently fold the high bit into the length, which the
+/// ASCII fast-path would then mis-read.
 pub const STRING_RECORD_LEN_MASK: u32 = !STRING_RECORD_ASCII_FLAG_BIT;
 
 /// Hash a `[len_with_flags: u32 LE][hash: u64 LE][utf8...]` dict key
@@ -254,8 +254,12 @@ mod tests {
         // load matches the byte-wise reference.
         let payload = b"thekey";
         let cached_hash = fx_hash_bytes(payload);
-        let len_with_flags =
-            (payload.len() as u32) | if is_ascii_bytes(payload) { STRING_RECORD_ASCII_FLAG_BIT } else { 0 };
+        let len_with_flags = (payload.len() as u32)
+            | if is_ascii_bytes(payload) {
+                STRING_RECORD_ASCII_FLAG_BIT
+            } else {
+                0
+            };
         let mut record = len_with_flags.to_le_bytes().to_vec();
         record.extend_from_slice(&cached_hash.to_le_bytes());
         record.extend_from_slice(payload);
@@ -279,7 +283,10 @@ mod tests {
     fn ascii_flag_bit_does_not_overlap_len_mask() {
         // Belt-and-braces: the masking arithmetic relies on
         // ASCII_FLAG_BIT and LEN_MASK being exact complements.
-        assert_eq!(STRING_RECORD_ASCII_FLAG_BIT | STRING_RECORD_LEN_MASK, u32::MAX);
+        assert_eq!(
+            STRING_RECORD_ASCII_FLAG_BIT | STRING_RECORD_LEN_MASK,
+            u32::MAX
+        );
         assert_eq!(STRING_RECORD_ASCII_FLAG_BIT & STRING_RECORD_LEN_MASK, 0);
     }
 

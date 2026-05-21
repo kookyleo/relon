@@ -821,12 +821,7 @@ mod tests {
     #[test]
     fn case_fold_ascii_fast_into_string_appends_correctly() {
         let mut acc = String::from("prefix:");
-        let r = case_fold_ascii_fast_into_string(
-            b"Hello",
-            AsciiFoldMode::Lower,
-            true,
-            &mut acc,
-        );
+        let r = case_fold_ascii_fast_into_string(b"Hello", AsciiFoldMode::Lower, true, &mut acc);
         assert_eq!(acc, "prefix:hello");
         assert_eq!(r.consumed, 5);
     }
