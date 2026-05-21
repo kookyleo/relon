@@ -1625,6 +1625,7 @@ dependencies = [
  "libc",
  "ordered-float",
  "relon-analyzer",
+ "relon-bytecode",
  "relon-eval-api",
  "relon-evaluator",
  "relon-ir",

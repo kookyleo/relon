@@ -259,6 +259,51 @@ impl BytecodeEvaluator {
         self
     }
 
+    /// M2-B phase 4c: install the trace-JIT hot-counter trigger on the
+    /// default VM config. Returns `self` so the call chains cleanly
+    /// off `from_source`.
+    ///
+    /// The trigger is consulted on every `run_main` invocation; when
+    /// the per-`fn_id` counter crosses the configured threshold (see
+    /// [`Self::with_hot_threshold`]), `trigger.on_hot(fn_id, args)`
+    /// fires exactly once. Hosts using the cranelift adapter
+    /// (`relon_codegen_native::CraneliftHotTrigger`) get the standard
+    /// `__relon_jump_to_recorder` recording-driver pipeline; tests can
+    /// install a mock to observe the dispatch shape.
+    ///
+    /// The host is also responsible for stamping a non-`None`
+    /// [`crate::BcFunction::fn_id`] on the compiled function —
+    /// without one the prologue stays inert. The convenience
+    /// [`Self::with_fn_id`] handles the common case where the host
+    /// wants the bytecode artefact and the matching cranelift trace
+    /// to share the same id.
+    pub fn with_hot_trigger(
+        mut self,
+        trigger: crate::hot_counter::HotTraceTriggerHandle,
+    ) -> Self {
+        self.default_config.hot_trigger = Some(trigger);
+        self
+    }
+
+    /// M2-B phase 4c: override the default hot-counter threshold.
+    /// `1` triggers on the very first invocation (smoke-test mode);
+    /// the default 1000 mirrors the LuaJIT-style conservative kickoff
+    /// the cranelift backend uses.
+    pub fn with_hot_threshold(mut self, threshold: u32) -> Self {
+        self.default_config.hot_threshold = threshold;
+        self
+    }
+
+    /// M2-B phase 4c: stamp the cross-backend `fn_id` on the compiled
+    /// function. The slot drives the hot-counter prologue's per-id
+    /// lookup and matches the id under which the host registered a
+    /// [`relon_codegen_native::trace_install::RecordingRegistration`]
+    /// for the recorder.
+    pub fn with_fn_id(mut self, fn_id: u32) -> Self {
+        self.func = self.func.clone().with_fn_id(fn_id);
+        self
+    }
+
     /// Inspect the entry source range.
     pub fn entry_range(&self) -> TokenRange {
         self.entry_range
