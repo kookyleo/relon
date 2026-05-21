@@ -23,6 +23,17 @@
 //! to expose a `specialised_for(callee, type)` lookup). What it
 //! does provide is the guard-site bookkeeping that downstream
 //! cranelift emission relies on.
+//!
+//! ## Ordering
+//!
+//! Runs after [`super::dead_store::DeadStoreElim`] (round 1) and
+//! before [`super::dict_ic_hoist::DictIcHoist`]. The order relative
+//! to dict-ic-hoist / LICM is incidental — the guards this pass
+//! inserts don't affect `dict_ptr` invariance — but it MUST precede
+//! [`super::noop_typecheck_elim::NoopTypeCheckElim`], which is the
+//! consumer that folds away `TypeCheck` guards once LICM has had a
+//! chance to hoist them. See the [`super`] module docs for the full
+//! pipeline contract.
 
 use crate::buffer::TraceBuffer;
 use crate::effect::EffectClass;

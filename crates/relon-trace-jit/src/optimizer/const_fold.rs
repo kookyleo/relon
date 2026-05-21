@@ -15,6 +15,15 @@
 //!
 //! `Cmp` results are encoded as i32 (1 / 0) so the trace IR stays
 //! integer-typed end-to-end.
+//!
+//! ## Ordering
+//!
+//! First pass in [`super::OptimizerPipeline::default_pipeline`]; no
+//! upstream dependencies. MUST stay first so the literals it
+//! propagates are visible to every subsequent pass (load-forwarding's
+//! `(base, offset)` slot keys, type-spec's guard arguments, dict-ic-
+//! hoist's `dict_ptr` invariance check). See the [`super`] module
+//! docs for the full pipeline contract.
 
 use crate::buffer::TraceBuffer;
 use crate::effect::EffectClass;

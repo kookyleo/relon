@@ -65,6 +65,15 @@
 //!    ops is preserved.
 //! 4. After moving ops, rebuild the guard `trace_pc` table because
 //!    indices shifted.
+//!
+//! ## Ordering
+//!
+//! Runs after [`super::dict_ic_hoist::DictIcHoist`] (which inserts
+//! the `DictShapeGuard` ops LICM lifts to the preheader) and
+//! before [`super::noop_typecheck_elim::NoopTypeCheckElim`] (so any
+//! `TypeCheck` LICM hoisted into a region where the observed type
+//! is already known gets folded away in the same pipeline round).
+//! See the [`super`] module docs for the full pipeline contract.
 
 use std::collections::{HashMap, HashSet};
 

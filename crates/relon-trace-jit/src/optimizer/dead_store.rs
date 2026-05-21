@@ -16,6 +16,20 @@
 //! The pass is intentionally conservative: it operates per
 //! `(base_ssa, offset)` key with byte-exact matching. Aliasing
 //! between different base SSAs is *not* analysed.
+//!
+//! ## Ordering
+//!
+//! Scheduled twice by [`super::OptimizerPipeline::default_pipeline`]:
+//!
+//! - **Round 1** runs after [`super::load_forward::LoadForwarding`]
+//!   to drop the now-dead `Load` ops it leaves behind.
+//! - **Round 2** runs last, after
+//!   [`super::noop_typecheck_elim::NoopTypeCheckElim`], to mop up
+//!   any stores that became dead because LICM moved a guard past
+//!   them. Round 2 is cheap when nothing changed; preserved so the
+//!   pipeline doesn't need a third pass for rare interactions.
+//!
+//! See the [`super`] module docs for the full pipeline contract.
 
 use std::collections::HashMap;
 

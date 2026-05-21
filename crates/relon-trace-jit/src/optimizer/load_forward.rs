@@ -45,6 +45,15 @@
 //! - We rewrite inputs in place on every op we visit, but we never
 //!   remove a `Load` -- removal is delegated to dead-store elim so
 //!   guard `trace_pc` fixups stay in one place.
+//!
+//! ## Ordering
+//!
+//! Runs **after** [`super::const_fold::ConstFold`] so constant
+//! offsets are already collapsed into the `(base, offset)` slot keys
+//! the alias table uses, and **before**
+//! [`super::dead_store::DeadStoreElim`] (round 1), which cleans up
+//! the `Load` ops this pass leaves dead. See the [`super`] module
+//! docs for the full pipeline contract.
 
 use std::collections::HashMap;
 

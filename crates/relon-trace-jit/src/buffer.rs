@@ -6,17 +6,57 @@
 //! cranelift IR emitter will eventually consume (TODO: that emitter
 //! lives outside this crate).
 //!
-//! The buffer keeps three side tables in sync with the linear op
-//! stream:
+//! ## Side-table contract
 //!
-//! * `guards`     -- guard sites by `trace_pc`.
-//! * `type_info`  -- observed concrete type per SSA var.
-//! * `consts`     -- captured literal values per SSA var, used by the
-//!   constant-folding pass.
+//! Beyond the linear `ops` vector and the position-anchored `guards`
+//! list, the buffer carries five SSA-keyed side tables. All five obey
+//! the same contract — documented here once and referenced from each
+//! accessor / field rather than re-stated:
 //!
-//! All three tables are indexed by SSA id (not by op position) so
-//! optimiser passes can rewrite the op vector without invalidating
-//! lookups.
+//! * `type_info`               — observed concrete type per SSA
+//!   (`SsaVar -> ObservedType`). Drives `TypeSpec` /
+//!   `NoopTypeCheckElim`.
+//! * `consts`                  — captured literal scalar value per SSA
+//!   (`SsaVar -> TraceConst`). Drives `ConstFold`.
+//! * `const_bytes` (F-D7-C)    — raw byte payload of a string-typed
+//!   constant SSA (`SsaVar -> Vec<u8>`). Consumed by the emitter to
+//!   switch `StrContains` lowering to an inline byte-scan.
+//! * `str_payload` (F-D7-H)    — `(ptr_ssa, len_ssa)` pair holding
+//!   the pre-loaded `StringRef::{ptr, len}` for a haystack SSA
+//!   (`SsaVar -> (SsaVar, SsaVar)`). Lets LICM hoist the payload
+//!   deref out of hot loops.
+//! * `dict_entry_count_hints`  (F-D8-E.7) — static entry count for a
+//!   dict-pointer SSA (`SsaVar -> u32`). Lets the emitter pick the
+//!   fully-unrolled `DictLookupPrechecked` lowering.
+//!
+//! Shared invariants:
+//!
+//! 1. **Keyed by SSA, not op position.** Optimiser passes can splice
+//!    or delete ops without invalidating lookups; an SSA id remains
+//!    bound to the same observed value across rewrites.
+//! 2. **Filled by the recorder, frozen at `into_optimized`.** The
+//!    recorder is the only writer during op-append. Once
+//!    `TraceBuffer::into_optimized` runs, the resulting
+//!    [`OptimizedTrace`] exposes the same maps read-only.
+//! 3. **Optimiser passes never invent new SSA values.** Passes may
+//!    delete ops, swap one op for another with the same output SSA
+//!    (`ConstFold`'s in-place rewrite), or insert ops whose outputs
+//!    reuse already-allocated SSAs (`DictIcHoist`'s
+//!    `DictShapeGuard` has no output). They MUST NOT allocate new
+//!    SSA ids — if they did, the side-table keys would go stale
+//!    relative to the post-pass op stream.
+//! 4. **Stale keys are harmless.** When an op whose output SSA had
+//!    a side-table entry gets deleted (e.g. dead-store elim drops
+//!    a `Store`), the entry is intentionally left behind. Lookups
+//!    are by-need and only consulted on surviving ops, so the dead
+//!    entry never fires.
+//! 5. **The `guards` vector** is anchored by `trace_pc` (op index),
+//!    not SSA, and is therefore the exception — passes that delete
+//!    or move ops MUST rebind `GuardSite::trace_pc` in lock-step
+//!    (see `rebind_guard_pcs` in `optimizer::licm` /
+//!    `noop_typecheck_elim`).
+//!
+//! See each `record_*` / `*_for` accessor for the per-table specifics.
 
 use std::collections::HashMap;
 
@@ -32,7 +72,11 @@ use crate::trace_ir::{ObservedType, SsaVar, TraceConst, TraceOp};
 pub struct TraceBuffer {
     pub ops: Vec<TraceOp>,
     pub guards: Vec<GuardSite>,
+    /// Observed concrete type per SSA. See the module-level
+    /// "Side-table contract" section.
     pub type_info: HashMap<SsaVar, ObservedType>,
+    /// Captured literal scalar value per SSA. See the module-level
+    /// "Side-table contract" section.
     pub consts: HashMap<SsaVar, TraceConst>,
     /// F-D7-C: const-string side table. Maps an SSA var to the raw
     /// UTF-8 payload bytes of the string constant it carries.
@@ -46,6 +90,9 @@ pub struct TraceBuffer {
     /// byte equality, never UTF-8 inspection.
     ///
     /// The non-Copy payload is why this lives outside [`TraceConst`].
+    ///
+    /// Follows the module-level "Side-table contract" — SSA-keyed,
+    /// recorder-written, frozen after `into_optimized`.
     pub const_bytes: HashMap<SsaVar, Vec<u8>>,
     /// F-D7-H: StringRef payload pre-load side table. Maps a haystack
     /// SSA (`*const StringRef`) to the `(ptr_ssa, len_ssa)` pair that
@@ -69,6 +116,9 @@ pub struct TraceBuffer {
     /// real `TraceOp::Load` ops, LICM can move them to the loop
     /// preheader and the per-iter cost drops to just the inline
     /// memchr/byte scan.
+    ///
+    /// Follows the module-level "Side-table contract" — SSA-keyed,
+    /// recorder-written, frozen after `into_optimized`.
     pub str_payload: HashMap<SsaVar, (SsaVar, SsaVar)>,
     /// F-D8-E.7: dict static-entry-count hint side table. Maps a
     /// dict_ptr SSA (the same SSA that flows into the matching
@@ -87,6 +137,9 @@ pub struct TraceBuffer {
     /// which by construction pins the key set (and hence the entry
     /// count). A mismatch deopts at the shape guard before the
     /// unrolled lookup reads anything from the entry table.
+    ///
+    /// Follows the module-level "Side-table contract" — SSA-keyed,
+    /// recorder-written, frozen after `into_optimized`.
     pub dict_entry_count_hints: HashMap<SsaVar, u32>,
     next_ssa: u32,
 }
@@ -124,10 +177,17 @@ impl TraceBuffer {
         self.guards.push(guard);
     }
 
+    /// Register `var`'s observed concrete type. Drives
+    /// [`crate::optimizer::type_spec`] guard insertion and
+    /// [`crate::optimizer::noop_typecheck_elim`] folding. See the
+    /// module-level "Side-table contract" for invariants.
     pub fn record_type(&mut self, var: SsaVar, ty: ObservedType) {
         self.type_info.insert(var, ty);
     }
 
+    /// Capture a literal scalar value flowing through `var`. Drives
+    /// [`crate::optimizer::const_fold`]. See the module-level
+    /// "Side-table contract" for invariants.
     pub fn record_const(&mut self, var: SsaVar, value: TraceConst) {
         self.consts.insert(var, value);
     }
@@ -196,7 +256,11 @@ impl TraceBuffer {
 pub struct OptimizedTrace {
     pub ops: Box<[TraceOp]>,
     pub guards: Box<[GuardSite]>,
+    /// Frozen mirror of [`TraceBuffer::type_info`]. See the
+    /// "Side-table contract" in the [`crate::buffer`] module docs.
     pub type_info: HashMap<SsaVar, ObservedType>,
+    /// Frozen mirror of [`TraceBuffer::consts`]. See the
+    /// "Side-table contract" in the [`crate::buffer`] module docs.
     pub consts: HashMap<SsaVar, TraceConst>,
     /// F-D7-C: const-string side table — see [`TraceBuffer::const_bytes`].
     pub const_bytes: HashMap<SsaVar, Vec<u8>>,
