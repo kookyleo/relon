@@ -1,7 +1,7 @@
 # RFC — v6-δ M2-B Bytecode Backend Investment
 
 Date: 2026-05-21
-Status: planning + Phase 1 / 2 / 3 land
+Status: planning + Phase 1 / 2 / 3 / 4a / 4b-scaffold land
 Owner: bytecode VM track
 Worktree: `.claude/worktrees/agent-ac8a6a5af256fa8c2`
 
@@ -60,9 +60,11 @@ existing benches never invoke the bytecode VM.
 - **Phase 2 (landed)** — gate-consult helpers + dispatch-time pre-check + `BcOp::Trap(CapabilityDenied)` enrichment with first-denied-bit. Five new helper API entries on `CapabilityVtable`.
 - **Phase 3 (landed)** — IR coverage expansion: four new `BcOp` variants (`CallNative`, `CheckCap`, `CallStdlibScalar`, `ListLen`) with per-call-site capability consult routed through the phase-2 helpers. `BcVmError::NativeNotImplemented` carries the phase-4 host-fn registry gap. The compile pass lifts IR `Op::CallNative` / `Op::CheckCap` from the unsupported pile into real bytecode emit. See `docs/internal/review-improvement-133-bytecode-phase3-2026-05-21.md` for the stage report.
 - **Phase 4a (landed)** — host-fn registry on `CapabilityVtable` keyed by `import_idx` (`HashMap<u32, Arc<dyn RelonFunction>>`). `BcOp::CallNative` now: consult gate → resolve registry slot → pop args (Phase-4a scalar lane: all args travel as `Value::Int`) → invoke `RelonFunction::call` with a minimal `BytecodeNativeFnCaps` stub → encode return per `ret_ty`. Two new error envelopes: `HostFnError { import_idx, reason }` for host-side failures and `HostFnReturnTypeMismatch { import_idx, expected, found }` for non-scalar returns. Unregistered slots keep the legacy `NativeNotImplemented` fallback so the differential harness's bounce shape stays stable. See `docs/internal/review-improvement-141-bytecode-phase4a-2026-05-21.md`.
-- **Phase 4b (planned)** — real list/dict ops + the buffer-protocol memory model that unlocks per-arg-type lanes for host fns, hot-counter + trace-JIT bridge (the original phase-3 deliverable, deferred so the IR coverage work could land first). 4-way bench row activation and `cmp_lua_dict_list_trace` integration follow once the wider memory model is wired.
+- **Phase 4b scaffold (landed)** — handle-based memory model (per-VM `ListArena` / `DictArena` / `StringArena`) plus the first list ops (`BcOp::MakeList { len }` / `BcOp::ListGetInt`). The dispatch loop keeps its `u64` operand-stack lane; the BcOp variant carries the type discrimination so no per-op tag dispatch lands. See `docs/internal/rfc-m2-b-phase4b-memory-model-2026-05-21.md` for the option-A/B/C comparison and `docs/internal/review-improvement-142-bytecode-phase4b-2026-05-21.md` for the stage report.
+- **Phase 4b-continuation (planned)** — `BcOp::ListPush` (copy-on-write semantics) + the string ops (`StrConst` + per-function string pool, `StrLen` / `StrConcat` / `StrEq`) + dict ops (`MakeDict` + `DictLookupStr`). Once those land the `compile.rs` lift drops the `unsupported("ListGetByIntIdx")` / `unsupported("DictGetByStringKey")` bounces in favour of real emit, unlocking the 4-way differential row for list / dict / string workloads.
+- **Phase 4c (planned)** — trace-JIT hot counter + recorder bridge (the original phase-3 deliverable, deferred so the IR coverage work could land first). The bridge layer translates arena handles into trace-JIT arena pointers (revisits the Option C question from the phase-4b RFC). 4-way bench row activation and `cmp_lua_dict_list_trace` integration follow.
 
-Each phase ≤ M work; phase 4 splits into 4a (host-fn registry; landed) + 4b (list/dict ops; deferred).
+Each phase ≤ M work; phase 4 splits into 4a (host-fn registry; landed), 4b scaffold (memory model + list ops; landed), 4b-continuation (lists/strings/dicts), and 4c (trace-JIT bridge).
 
 ## 4. Risks / unknowns
 
