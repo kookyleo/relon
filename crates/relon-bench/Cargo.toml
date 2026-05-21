@@ -148,6 +148,17 @@ name = "cmp_lua_dict_list_trace"
 harness = false
 path = "benches/cmp_lua_dict_list_trace.rs"
 
+# 2026-05-21: trace-JIT failure-mode fixtures (abort / high-deopt /
+# cold workload). Three workloads × three rows (tree_walk / cranelift_aot
+# / trace_jit) covering paths the existing W1..W10 hot-loop suite does
+# not touch — see the bench file header for the per-fixture hypothesis
+# table. Same 6-trap hardening as `trace_jit_hot_loop` /  `cmp_lua`.
+# Run via `cargo bench -p relon-bench --bench jit_failure_modes`.
+[[bench]]
+name = "jit_failure_modes"
+harness = false
+path = "benches/jit_failure_modes.rs"
+
 # v3++ item 4 (2026-05-20): SIMD ASCII fast-path throughput. Compares
 # the new `relon_ir::ascii_fold_simd` helper against a scalar
 # `char::to_uppercase` / `to_lowercase` baseline across 100 B / 1 KB /
