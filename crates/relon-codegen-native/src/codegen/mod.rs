@@ -61,6 +61,7 @@ mod memory;
 mod record;
 
 use const_pool::ConstPool;
+use const_pool_emit::ConstValueKind;
 use guard::{
     declare_vtable_data, emit_indirect_host_call, make_cap_lookup_signature,
     make_glob_match_signature, make_now_signature, make_raise_trap_signature,
@@ -1409,60 +1410,16 @@ impl<'a, 'b> Codegen<'a, 'b> {
             // time; here we just resolve the `idx` to its offset and
             // push a constant.
             Op::ConstString { idx, .. } => {
-                let off = self
-                    .const_pool
-                    .string_offsets
-                    .get(idx)
-                    .copied()
-                    .ok_or_else(|| {
-                        CraneliftError::Codegen(format!(
-                            "ConstString idx {idx} not in pre-computed pool"
-                        ))
-                    })?;
-                let v = self.builder.ins().iconst(I32, i64::from(off));
-                self.push(v);
+                self.emit_const_value(*idx, ConstValueKind::String)?;
             }
             Op::ConstListInt { idx, .. } => {
-                let off = self
-                    .const_pool
-                    .list_int_offsets
-                    .get(idx)
-                    .copied()
-                    .ok_or_else(|| {
-                        CraneliftError::Codegen(format!(
-                            "ConstListInt idx {idx} not in pre-computed pool"
-                        ))
-                    })?;
-                let v = self.builder.ins().iconst(I32, i64::from(off));
-                self.push(v);
+                self.emit_const_value(*idx, ConstValueKind::ListInt)?;
             }
             Op::ConstListFloat { idx, .. } => {
-                let off = self
-                    .const_pool
-                    .list_float_offsets
-                    .get(idx)
-                    .copied()
-                    .ok_or_else(|| {
-                        CraneliftError::Codegen(format!(
-                            "ConstListFloat idx {idx} not in pre-computed pool"
-                        ))
-                    })?;
-                let v = self.builder.ins().iconst(I32, i64::from(off));
-                self.push(v);
+                self.emit_const_value(*idx, ConstValueKind::ListFloat)?;
             }
             Op::ConstListBool { idx, .. } => {
-                let off = self
-                    .const_pool
-                    .list_bool_offsets
-                    .get(idx)
-                    .copied()
-                    .ok_or_else(|| {
-                        CraneliftError::Codegen(format!(
-                            "ConstListBool idx {idx} not in pre-computed pool"
-                        ))
-                    })?;
-                let v = self.builder.ins().iconst(I32, i64::from(off));
-                self.push(v);
+                self.emit_const_value(*idx, ConstValueKind::ListBool)?;
             }
 
             // Pop an i32 arena-relative pointer, push the leading

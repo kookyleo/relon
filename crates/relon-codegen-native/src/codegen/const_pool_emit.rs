@@ -18,6 +18,17 @@ use cranelift_codegen::ir::{InstBuilder, Value as CValue};
 
 use crate::error::CraneliftError;
 
+/// Type-tag for [`super::Codegen::emit_const_value`]. Selects which of
+/// the per-record offset maps on [`super::const_pool::ConstPool`] the
+/// lookup hits.
+#[derive(Debug, Clone, Copy)]
+pub(super) enum ConstValueKind {
+    String,
+    ListInt,
+    ListFloat,
+    ListBool,
+}
+
 impl<'a, 'b> super::Codegen<'a, 'b> {
     /// Resolve a const-pool table offset and push it as an `i32`
     /// operand-stack value. The `offset` is the pre-computed
@@ -36,6 +47,41 @@ impl<'a, 'b> super::Codegen<'a, 'b> {
     ) -> Result<CValue, CraneliftError> {
         let off = offset.ok_or_else(|| {
             CraneliftError::Codegen(format!("{label} missing from const pool"))
+        })?;
+        let v = self.builder.ins().iconst(I32, i64::from(off));
+        self.push(v);
+        Ok(v)
+    }
+
+    /// Resolve a `ConstString` / `ConstList*` record offset by `idx`
+    /// and push it as an `i32` operand-stack value. `kind` selects
+    /// which per-record offset map drives the lookup and also names
+    /// the originating IR op for the diagnostic on a missing entry.
+    pub(super) fn emit_const_value(
+        &mut self,
+        idx: u32,
+        kind: ConstValueKind,
+    ) -> Result<CValue, CraneliftError> {
+        let (offset, label) = match kind {
+            ConstValueKind::String => (
+                self.const_pool.string_offsets.get(&idx).copied(),
+                "ConstString",
+            ),
+            ConstValueKind::ListInt => (
+                self.const_pool.list_int_offsets.get(&idx).copied(),
+                "ConstListInt",
+            ),
+            ConstValueKind::ListFloat => (
+                self.const_pool.list_float_offsets.get(&idx).copied(),
+                "ConstListFloat",
+            ),
+            ConstValueKind::ListBool => (
+                self.const_pool.list_bool_offsets.get(&idx).copied(),
+                "ConstListBool",
+            ),
+        };
+        let off = offset.ok_or_else(|| {
+            CraneliftError::Codegen(format!("{label} idx {idx} not in pre-computed pool"))
         })?;
         let v = self.builder.ins().iconst(I32, i64::from(off));
         self.push(v);
