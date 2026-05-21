@@ -25,6 +25,7 @@
 //! IR-first crate split rationale.
 
 pub mod error;
+pub mod glob;
 pub mod ir;
 pub mod lowering;
 pub mod op_visitor;
