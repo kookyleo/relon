@@ -479,18 +479,27 @@ use relon_codegen_native::{
 fn jump_helper_no_registration_is_noop() {
     // fn_id not in the recording registry → helper logs + returns
     // without installing anything. We can't observe the log without
-    // a subscriber, but the global state must stay clean.
+    // a subscriber, but no trace for this fn_id must appear in the
+    // global registry. Note: we deliberately scope the assertion to
+    // this fn_id (rather than the global `installed_count()`) so the
+    // test stays robust against parallel-test pollution — other
+    // tests in this binary share `global_trace_jit_state()` and
+    // install / invalidate their own fn_ids concurrently, which
+    // would flake a count-delta check.
     let state = global_trace_jit_state();
-    let pre_installed = state.installed_count();
     // Pick a fn_id that no other test uses.
     let fn_id = 700u32;
     let _ = clear_recording(fn_id);
+    let _ = state.invalidate_trace(fn_id);
     reset_jump_helper_call_count();
     unsafe {
         relon_codegen_native::trace_install::__relon_jump_to_recorder(fn_id, std::ptr::null());
     }
     assert_eq!(jump_helper_call_count(), 1);
-    assert_eq!(state.installed_count(), pre_installed);
+    assert!(
+        state.lookup_trace(fn_id).is_none(),
+        "no registration → no trace installed for this fn_id"
+    );
 }
 
 #[test]
@@ -538,16 +547,22 @@ fn jump_helper_installs_const_trace_from_registry() {
 
     // A second helper invocation must short-circuit (trace already
     // installed); the diagnostic counter still bumps because the
-    // entry path is unchanged.
-    let pre_installed = state.installed_count();
+    // entry path is unchanged. Capture the per-fn_id `Arc` before
+    // and after, so the assertion is robust against parallel tests
+    // mutating other entries in `global_trace_jit_state()` between
+    // the two reads.
+    use std::sync::Arc;
+    let pre_trace = state.lookup_trace(fn_id).expect("pre: trace installed");
     unsafe {
         relon_codegen_native::trace_install::__relon_jump_to_recorder(fn_id, std::ptr::null());
     }
     assert_eq!(jump_helper_call_count(), 2);
-    assert_eq!(
-        state.installed_count(),
-        pre_installed,
-        "second hot trigger must not double-install"
+    let post_trace = state
+        .lookup_trace(fn_id)
+        .expect("post: trace still installed");
+    assert!(
+        Arc::ptr_eq(&pre_trace, &post_trace),
+        "second hot trigger must not replace the installed trace"
     );
 
     let _ = clear_recording(fn_id);
@@ -1047,12 +1062,20 @@ fn jump_helper_aborts_recording_for_unsupported_op() {
     // Register a body containing an op outside the recorder's
     // accepted envelope. The helper should walk in, abort, and not
     // install any trace.
+    //
+    // Note: the assertion is scoped to *this* `fn_id` only. Other
+    // tests in this binary share `global_trace_jit_state()` and may
+    // install / invalidate their own fn_ids concurrently with this
+    // body, so a global `installed_count()` delta is not a reliable
+    // signal here. The recorder's correctness invariant is "do not
+    // install a trace for fn_id 703 once we abort", which `lookup_trace`
+    // captures directly.
     let fn_id = 703u32;
     let _ = clear_recording(fn_id);
     let state = global_trace_jit_state();
-    if state.lookup_trace(fn_id).is_some() {
-        return;
-    }
+    // Best-effort reset of any sticky install from a previous run
+    // in the same process (e.g. nextest's process reuse).
+    let _ = state.invalidate_trace(fn_id);
     register_recording(
         fn_id,
         RecordingRegistration {
@@ -1077,11 +1100,9 @@ fn jump_helper_aborts_recording_for_unsupported_op() {
             param_tys: vec![],
         },
     );
-    let pre_installed = state.installed_count();
     unsafe {
         relon_codegen_native::trace_install::__relon_jump_to_recorder(fn_id, std::ptr::null());
     }
     assert!(state.lookup_trace(fn_id).is_none(), "aborted → no install");
-    assert_eq!(state.installed_count(), pre_installed);
     let _ = clear_recording(fn_id);
 }
