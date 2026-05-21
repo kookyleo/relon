@@ -1084,13 +1084,26 @@ impl CraneliftAotEvaluator {
     }
 
     /// Internal: invoke the legacy-shape JIT entry with the supplied
-    /// i64 args. Uses `catch_unwind` to convert panics raised by
-    /// cranelift trap instructions into typed `RuntimeError`s. The
-    /// stage 5 signal-hook handler is installed once at evaluator
-    /// construction (`from_ir_inner`) and intercepts SIGSEGV / SIGFPE
-    /// / SIGILL into the thread-local trap slot as a defense-in-depth
-    /// measure; this hot-path entry assumes the handler is already
-    /// live.
+    /// i64 args.
+    ///
+    /// 2026-05-21 dispatch-boundary lever (b): the `catch_unwind`
+    /// shield is now `cfg(debug_assertions)`-gated. Production /
+    /// release builds call the JIT entry directly because:
+    ///
+    /// * cranelift codegen routes every guarded op through `cond_trap`
+    ///   + a recorded `trap_code` — these become hardware traps
+    ///   intercepted by the signal-hook handler, not Rust panics.
+    /// * Helper-call symbols (`relon_now`, `relon_raise_trap`,
+    ///   `relon_cap_lookup`) are audited to never panic on their hot
+    ///   paths; they return error codes via the sandbox state instead.
+    /// * The thread-local signal slot (`dispatch_post` reads it before
+    ///   the trap_code) catches SIGSEGV / SIGFPE / SIGILL even without
+    ///   `catch_unwind`.
+    ///
+    /// Debug builds keep `catch_unwind` so unit tests that exercise
+    /// pathological codegen (e.g. helper-call panics regression suite)
+    /// still surface a typed error rather than aborting the test
+    /// process.
     fn invoke_legacy_entry(&self, args: [i64; 4]) -> Result<i64, RuntimeError> {
         crate::trap_handler::reset_thread_signal_slot();
         self.sandbox_state.reset_trap();
@@ -1105,11 +1118,23 @@ impl CraneliftAotEvaluator {
             }
         };
 
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
-            entry(state_ptr, args[0], args[1], args[2], args[3])
-        }));
-
-        self.dispatch_post(result)
+        #[cfg(debug_assertions)]
+        {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+                entry(state_ptr, args[0], args[1], args[2], args[3])
+            }));
+            self.dispatch_post(result)
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            // SAFETY: the signal-hook handler is process-wide-installed
+            // at evaluator construction; SIGSEGV / SIGFPE / SIGILL from
+            // the JIT body land in the thread-local slot which
+            // `dispatch_post_unshielded` reads. Helper calls are audited
+            // to never panic on their hot paths.
+            let value = unsafe { entry(state_ptr, args[0], args[1], args[2], args[3]) };
+            self.dispatch_post_unshielded(value)
+        }
     }
 
     /// Same as [`Self::invoke_buffer_entry_with_scratch`] without an
@@ -1172,18 +1197,60 @@ impl CraneliftAotEvaluator {
             }
         };
 
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
-            entry(
-                state_ptr,
-                in_ptr as i32,
-                in_len as i32,
-                out_ptr as i32,
-                out_cap as i32,
-                caps as i64,
-            )
-        }));
+        // 2026-05-21 dispatch-boundary lever (b): cfg-gate the
+        // catch_unwind shield to debug builds. See `invoke_legacy_entry`
+        // for the audit; the buffer-protocol entry shares the same
+        // helper-call surface so the same reasoning applies.
+        #[cfg(debug_assertions)]
+        {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+                entry(
+                    state_ptr,
+                    in_ptr as i32,
+                    in_len as i32,
+                    out_ptr as i32,
+                    out_cap as i32,
+                    caps as i64,
+                )
+            }));
+            self.dispatch_post(result)
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            let value = unsafe {
+                entry(
+                    state_ptr,
+                    in_ptr as i32,
+                    in_len as i32,
+                    out_ptr as i32,
+                    out_cap as i32,
+                    caps as i64,
+                )
+            };
+            self.dispatch_post_unshielded(value)
+        }
+    }
 
-        self.dispatch_post(result)
+    /// 2026-05-21 dispatch-boundary lever (b) helper: release-build
+    /// post-call processing. Same checks as [`Self::dispatch_post`]
+    /// minus the panic unwrap step. The JIT body was called outside a
+    /// `catch_unwind` so `value` is already the raw return; we still
+    /// consult the thread-local signal slot and the sandbox-state
+    /// `trap_code` so hardware traps and JIT-side `cond_trap`s surface
+    /// as typed errors.
+    #[cfg(not(debug_assertions))]
+    fn dispatch_post_unshielded<T>(&self, value: T) -> Result<T, RuntimeError> {
+        let signal_code = crate::trap_handler::read_thread_signal_slot();
+        if signal_code != 0 {
+            if let Some(kind) = crate::trap_handler::signal_to_trap_kind(signal_code) {
+                return Err(kind.to_runtime_error(self.entry_range));
+            }
+        }
+        let code = self.sandbox_state.trap_code();
+        if code != 0 {
+            return Err(TrapKind::from_code(code as u8).to_runtime_error(self.entry_range));
+        }
+        Ok(value)
     }
 
     /// Post-process a JIT-call result: surface typed traps recorded in
@@ -1195,6 +1262,11 @@ impl CraneliftAotEvaluator {
     /// precedence over the JIT-recorded trap code because the
     /// signal observation came from the hardware / OS layer which
     /// our codegen guards can't intercept.
+    ///
+    /// 2026-05-21 lever (b): only used by the debug-build dispatch
+    /// path; release builds skip the `catch_unwind` and call
+    /// `dispatch_post_unshielded` instead.
+    #[cfg(debug_assertions)]
     fn dispatch_post<T>(&self, result: std::thread::Result<T>) -> Result<T, RuntimeError> {
         // Check the signal-hook slot first — a SIGSEGV during JIT
         // body execution should surface as a typed trap even if the
