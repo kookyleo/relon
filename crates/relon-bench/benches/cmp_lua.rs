@@ -2576,13 +2576,8 @@ fn bench_cmp_lua(c: &mut Criterion) {
         // (alloc + dispatch + decode) without the host-arg surface
         // overhead — closer to the LuaJIT row's accounting.
         if let Ok(ev_bc) = relon_bytecode::BytecodeEvaluator::from_source(w12_relon_src()) {
-            let v = ev_bc
-                .run_main_i64(&[7])
-                .expect("W12 bytecode run_main_i64");
-            assert_eq!(
-                v, 8,
-                "W12 bytecode result must match analytic answer x + 1"
-            );
+            let v = ev_bc.run_main_i64(&[7]).expect("W12 bytecode run_main_i64");
+            assert_eq!(v, 8, "W12 bytecode result must match analytic answer x + 1");
             group.bench_function(BenchmarkId::new("W12_p99_tail", "relon_bytecode"), |b| {
                 b.iter(|| {
                     let v = ev_bc.run_main_i64(&[black_box(7i64)]).unwrap();

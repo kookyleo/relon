@@ -421,9 +421,7 @@ impl BytecodeEvaluator {
         // schema-fields walk it previously paid every invoke.
         let slot = self.return_field_base as usize;
         match self.return_shape {
-            ReturnShape::LegacyI64 => {
-                Value::Int(locals.first().copied().unwrap_or(0) as i64)
-            }
+            ReturnShape::LegacyI64 => Value::Int(locals.first().copied().unwrap_or(0) as i64),
             ReturnShape::SingleScalarInt => {
                 Value::Int(locals.get(slot).copied().unwrap_or(0) as i64)
             }
@@ -845,10 +843,9 @@ impl BytecodeEvaluator {
             ReturnShape::SingleScalarInt | ReturnShape::LegacyI64 => {}
             _ => {
                 return Err(RuntimeError::Unsupported {
-                    reason:
-                        "bytecode VM run_main_i64: return shape outside Int scalar envelope; \
+                    reason: "bytecode VM run_main_i64: return shape outside Int scalar envelope; \
                          use run_main"
-                            .into(),
+                        .into(),
                 });
             }
         };
@@ -883,14 +880,7 @@ impl BytecodeEvaluator {
     fn run_main_i64_inner(&self, packed: &[u64]) -> Result<i64, RuntimeError> {
         let vm = BytecodeVm::new(self.default_config.clone());
         let return_slot_count = self.cached_return_slot_count();
-        let outcome = vm.invoke_from_with_stack(
-            &self.func,
-            packed,
-            0,
-            &[],
-            return_slot_count,
-            &[],
-        );
+        let outcome = vm.invoke_from_with_stack(&self.func, packed, 0, &[], return_slot_count, &[]);
         if let Some(err) = outcome.error {
             return Err(err.into_runtime_error(self.entry_range));
         }
