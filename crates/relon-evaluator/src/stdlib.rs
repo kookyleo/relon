@@ -2,6 +2,7 @@ use crate::error::RuntimeError;
 use crate::native_fn::{NativeArgs, NativeFnCaps, RelonFunction};
 use crate::value::{Value, ValueDict};
 use relon_eval_api::context::Context;
+use relon_eval_api::SmolStr;
 use std::sync::Arc;
 
 pub fn register_to(ctx: &mut Context) {
@@ -490,7 +491,7 @@ impl RelonFunction for Type {
     ) -> Result<Value, RuntimeError> {
         let args = args.into_positional();
         expect_arg_count(&args, 1, range)?;
-        Ok(Value::String(args[0].type_name().to_string()))
+        Ok(Value::String(args[0].type_name().into()))
     }
 }
 
@@ -792,7 +793,7 @@ impl RelonFunction for StringSplit {
         let mut parts = Vec::new();
         for part in input.split(separator) {
             caps.tick(1, range)?;
-            parts.push(Value::String(part.to_string()));
+            parts.push(Value::String(part.into()));
         }
         Ok(Value::list(parts))
     }
@@ -815,7 +816,7 @@ impl RelonFunction for StringJoin {
             caps.tick(1, range)?;
             parts.push(format!("{}", value));
         }
-        Ok(Value::String(parts.join(separator)))
+        Ok(Value::String(parts.join(separator).into()))
     }
 }
 
@@ -844,7 +845,7 @@ impl RelonFunction for StringReplace {
         if occurrences > 0 {
             caps.tick(occurrences as u64, range)?;
         }
-        Ok(Value::String(input.replace(from, to)))
+        Ok(Value::String(input.replace(from, to).into()))
     }
 }
 
@@ -1107,7 +1108,9 @@ impl RelonFunction for StringUpper {
         let args = args.into_positional();
         expect_arg_count(&args, 1, range)?;
         let s = expect_string(&args[0], range)?;
-        Ok(Value::String(fold_string(s, CaseFoldMode::Upper, false)))
+        Ok(Value::String(
+            fold_string(s, CaseFoldMode::Upper, false).into(),
+        ))
     }
 }
 
@@ -1121,7 +1124,9 @@ impl RelonFunction for StringLower {
         let args = args.into_positional();
         expect_arg_count(&args, 1, range)?;
         let s = expect_string(&args[0], range)?;
-        Ok(Value::String(fold_string(s, CaseFoldMode::Lower, false)))
+        Ok(Value::String(
+            fold_string(s, CaseFoldMode::Lower, false).into(),
+        ))
     }
 }
 
@@ -1143,7 +1148,9 @@ impl RelonFunction for StringUpperLocale {
         let s = expect_string(&args[0], range)?;
         let locale = expect_string(&args[1], range)?;
         let tr = relon_ir::full_case_folding::is_turkish_locale(locale);
-        Ok(Value::String(fold_string(s, CaseFoldMode::Upper, tr)))
+        Ok(Value::String(
+            fold_string(s, CaseFoldMode::Upper, tr).into(),
+        ))
     }
 }
 
@@ -1159,7 +1166,9 @@ impl RelonFunction for StringLowerLocale {
         let s = expect_string(&args[0], range)?;
         let locale = expect_string(&args[1], range)?;
         let tr = relon_ir::full_case_folding::is_turkish_locale(locale);
-        Ok(Value::String(fold_string(s, CaseFoldMode::Lower, tr)))
+        Ok(Value::String(
+            fold_string(s, CaseFoldMode::Lower, tr).into(),
+        ))
     }
 }
 
@@ -1175,7 +1184,9 @@ impl RelonFunction for StringTitleLocale {
         let s = expect_string(&args[0], range)?;
         let locale = expect_string(&args[1], range)?;
         let tr = relon_ir::full_case_folding::is_turkish_locale(locale);
-        Ok(Value::String(fold_string(s, CaseFoldMode::Title, tr)))
+        Ok(Value::String(
+            fold_string(s, CaseFoldMode::Title, tr).into(),
+        ))
     }
 }
 
@@ -1206,7 +1217,9 @@ impl RelonFunction for StringTitle {
         let args = args.into_positional();
         expect_arg_count(&args, 1, range)?;
         let s = expect_string(&args[0], range)?;
-        Ok(Value::String(fold_string(s, CaseFoldMode::Title, false)))
+        Ok(Value::String(
+            fold_string(s, CaseFoldMode::Title, false).into(),
+        ))
     }
 }
 
@@ -1231,7 +1244,7 @@ impl RelonFunction for StringNfc {
         let args = args.into_positional();
         expect_arg_count(&args, 1, range)?;
         let s = expect_string(&args[0], range)?;
-        Ok(Value::String(relon_ir::normalization::to_nfc(s)))
+        Ok(Value::String(relon_ir::normalization::to_nfc(s).into()))
     }
 }
 
@@ -1247,7 +1260,7 @@ impl RelonFunction for StringNfd {
         let args = args.into_positional();
         expect_arg_count(&args, 1, range)?;
         let s = expect_string(&args[0], range)?;
-        Ok(Value::String(relon_ir::normalization::to_nfd(s)))
+        Ok(Value::String(relon_ir::normalization::to_nfd(s).into()))
     }
 }
 
@@ -1263,7 +1276,7 @@ impl RelonFunction for StringNfkc {
         let args = args.into_positional();
         expect_arg_count(&args, 1, range)?;
         let s = expect_string(&args[0], range)?;
-        Ok(Value::String(relon_ir::normalization::to_nfkc(s)))
+        Ok(Value::String(relon_ir::normalization::to_nfkc(s).into()))
     }
 }
 
@@ -1279,7 +1292,7 @@ impl RelonFunction for StringNfkd {
         let args = args.into_positional();
         expect_arg_count(&args, 1, range)?;
         let s = expect_string(&args[0], range)?;
-        Ok(Value::String(relon_ir::normalization::to_nfkd(s)))
+        Ok(Value::String(relon_ir::normalization::to_nfkd(s).into()))
     }
 }
 
@@ -1383,7 +1396,9 @@ impl RelonFunction for DictKeys {
         }
         let mut keys = map.keys().cloned().collect::<Vec<_>>();
         keys.sort();
-        Ok(Value::list(keys.into_iter().map(Value::String).collect()))
+        Ok(Value::list(
+            keys.into_iter().map(|k| Value::String(k.into())).collect(),
+        ))
     }
 }
 
@@ -1606,7 +1621,7 @@ impl RelonFunction for IterNext {
                 // route.
                 let chars: Vec<char> = s.chars().collect();
                 caps.iter_cursor_fetch_and_inc(iter_id, chars.len())
-                    .map(|idx| Value::String(chars[idx].to_string()))
+                    .map(|idx| Value::String(chars[idx].to_string().into()))
             }
             "dict_entries" => {
                 let src_dict = match source {
@@ -1631,7 +1646,7 @@ impl RelonFunction for IterNext {
                     .map(|idx| {
                         let key: &String = keys[idx];
                         let v = src_dict.map.get(key).cloned().unwrap_or(Value::Null);
-                        Value::list(vec![Value::String(key.clone()), v])
+                        Value::list(vec![Value::String(key.as_str().into()), v])
                     })
             }
             other => {
@@ -1682,7 +1697,7 @@ fn option_value(inner: Option<Value>) -> Value {
 /// accumulates entries.
 pub(crate) fn make_iter_value(caps: &dyn NativeFnCaps, kind: &str, source: Value) -> Value {
     let mut map = std::collections::BTreeMap::new();
-    map.insert("_kind".to_string(), Value::String(kind.to_string()));
+    map.insert("_kind".to_string(), Value::String(kind.into()));
     map.insert("_source".to_string(), source);
     // `_id` is `i64`-coerced from a `u64` so the existing
     // `Value::Int(i64)` representation can carry it without inventing
@@ -1839,7 +1854,7 @@ impl RelonFunction for StringConcat {
         let mut out = String::with_capacity(lhs.len() + rhs.len());
         out.push_str(lhs);
         out.push_str(rhs);
-        Ok(Value::String(out))
+        Ok(Value::String(out.into()))
     }
 }
 
@@ -1867,7 +1882,7 @@ impl RelonFunction for StringSubstring {
         let length = length.max(0) as usize;
         let end = (start + length).min(s.len());
         if end <= start {
-            return Ok(Value::String(String::new()));
+            return Ok(Value::String(SmolStr::new_empty()));
         }
         // Walk to the nearest char boundary to keep utf-8 well-formed
         // on inputs the corpus may feed in (the wasm-AOT body indexes
@@ -1883,7 +1898,7 @@ impl RelonFunction for StringSubstring {
             .find(|(i, _)| *i >= end)
             .map(|(i, _)| i)
             .unwrap_or(s.len());
-        Ok(Value::String(s[real_start..real_end].to_string()))
+        Ok(Value::String(s[real_start..real_end].into()))
     }
 }
 

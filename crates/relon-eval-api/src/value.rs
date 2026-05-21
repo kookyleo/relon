@@ -1,4 +1,5 @@
 use crate::scope::Scope;
+use crate::smol_str::SmolStr;
 use ordered_float::OrderedFloat;
 use relon_parser::Node;
 use serde::{Deserialize, Serialize};
@@ -136,7 +137,10 @@ pub enum Value {
     Bool(bool),
     Int(i64),
     Float(OrderedFloat<f64>),
-    String(String),
+    /// Short-string-optimized: ≤ 22 byte payloads inline in the value
+    /// slot (no heap alloc), longer payloads ride a refcounted
+    /// `Arc<str>` so clones stay O(1). See [`SmolStr`].
+    String(SmolStr),
     List(Arc<Vec<Value>>),
     Dict(Arc<ValueDict>),
     /// A unified closure (can be used as a function or a decorator).

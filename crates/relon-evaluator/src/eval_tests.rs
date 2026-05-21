@@ -92,7 +92,7 @@ fn test_user_defined_meta_logic() {
         assert_eq!(map.map.get("result_fn").unwrap(), &Value::Int(50));
         assert_eq!(
             map.map.get("result_dec").unwrap(),
-            &Value::String("hello!!!".to_string())
+            &Value::String("hello!!!".into())
         );
     } else {
         panic!("Expected Dict");
@@ -273,19 +273,19 @@ fn test_string_stdlib() {
     if let Value::Dict(map) = result {
         assert_eq!(
             map.map.get("joined").unwrap(),
-            &Value::String("rust-config-dsl".to_string())
+            &Value::String("rust-config-dsl".into())
         );
         assert_eq!(
             map.map.get("replaced").unwrap(),
-            &Value::String("hello relon".to_string())
+            &Value::String("hello relon".into())
         );
         assert_eq!(
             map.map.get("upper").unwrap(),
-            &Value::String("RELON".to_string())
+            &Value::String("RELON".into())
         );
         assert_eq!(
             map.map.get("lower").unwrap(),
-            &Value::String("relon".to_string())
+            &Value::String("relon".into())
         );
         assert_eq!(map.map.get("has_config").unwrap(), &Value::Bool(true));
         // 2026-05-21: glob_match surface covers `string.glob_match(...)`,
@@ -324,9 +324,9 @@ fn test_dict_stdlib() {
         assert_eq!(
             map.map.get("keys").unwrap(),
             &Value::list(vec![
-                Value::String("a".to_string()),
-                Value::String("b".to_string()),
-                Value::String("c".to_string()),
+                Value::String("a".into()),
+                Value::String("b".into()),
+                Value::String("c".into()),
             ])
         );
         assert_eq!(
@@ -373,15 +373,12 @@ fn test_virtual_stdlib_modules() {
         assert_eq!(map.map.get("clamped").unwrap(), &Value::Int(10));
         assert_eq!(
             map.map.get("defaulted").unwrap(),
-            &Value::String("fallback".to_string())
+            &Value::String("fallback".into())
         );
         assert_eq!(map.map.get("kept_false").unwrap(), &Value::Bool(false));
         assert_eq!(map.map.get("is_number").unwrap(), &Value::Bool(true));
         assert_eq!(map.map.get("is_empty").unwrap(), &Value::Bool(true));
-        assert_eq!(
-            map.map.get("joined").unwrap(),
-            &Value::String("a-b".to_string())
-        );
+        assert_eq!(map.map.get("joined").unwrap(), &Value::String("a-b".into()));
         assert_eq!(map.map.get("has_key").unwrap(), &Value::Bool(true));
     } else {
         panic!("Expected Dict");
@@ -441,7 +438,7 @@ fn test_cross_field_validation() {
     if let Value::Dict(map) = result {
         assert_eq!(
             map.map.get("host").unwrap(),
-            &Value::String("localhost".to_string())
+            &Value::String("localhost".into())
         );
     } else {
         panic!("Expected Dict");
@@ -888,7 +885,7 @@ fn test_custom_schema_validation() {
         if let Value::Dict(admin_map) = admin {
             assert_eq!(
                 admin_map.map.get("name").unwrap(),
-                &Value::String("Alice".to_string())
+                &Value::String("Alice".into())
             );
             assert_eq!(admin_map.map.get("age").unwrap(), &Value::Int(30));
         } else {
@@ -965,12 +962,12 @@ fn test_optional_chaining() {
     if let Value::Dict(map) = result {
         assert_eq!(
             map.map.get("email").unwrap(),
-            &Value::String("alice@example.com".to_string())
+            &Value::String("alice@example.com".into())
         );
         assert_eq!(map.map.get("missing").unwrap(), &Value::Null);
         assert_eq!(
             map.map.get("default").unwrap(),
-            &Value::String("default".to_string())
+            &Value::String("default".into())
         );
     } else {
         panic!("Expected Dict");
@@ -1052,7 +1049,7 @@ fn test_schema_composition_mixins() {
     if let Value::Dict(map) = result {
         assert_eq!(
             map.map.get("invalid_btn").unwrap(),
-            &Value::String("INVALID".to_string())
+            &Value::String("INVALID".into())
         );
     } else {
         panic!();
@@ -1074,10 +1071,7 @@ fn test_schema_composition_defaults() {
     if let Value::Dict(map) = result {
         let e = map.map.get("e").unwrap();
         if let Value::Dict(ed) = e {
-            assert_eq!(
-                ed.map.get("level").unwrap(),
-                &Value::String("error".to_string())
-            );
+            assert_eq!(ed.map.get("level").unwrap(), &Value::String("error".into()));
         } else {
             panic!();
         }
@@ -1145,7 +1139,7 @@ fn test_deep_merge() {
             if let Value::Dict(style) = btn1.map.get("style").unwrap() {
                 assert_eq!(
                     style.map.get("color").unwrap(),
-                    &Value::String("red".to_string())
+                    &Value::String("red".into())
                 );
                 assert_eq!(style.map.get("size").unwrap(), &Value::Int(14));
             // padding preserved
@@ -1161,7 +1155,7 @@ fn test_deep_merge() {
             if let Value::Dict(style) = btn2.map.get("style").unwrap() {
                 assert_eq!(
                     style.map.get("color").unwrap(),
-                    &Value::String("blue".to_string())
+                    &Value::String("blue".into())
                 );
                 assert_eq!(style.map.get("size").unwrap(), &Value::Int(20));
             } else {
@@ -1321,7 +1315,7 @@ fn test_match_expression() {
     if let Value::Dict(map) = result {
         assert_eq!(
             map.map.get("render").unwrap(),
-            &Value::String("IMAGE".to_string())
+            &Value::String("IMAGE".into())
         );
     } else {
         panic!("Expected Dict");
@@ -1380,11 +1374,11 @@ fn test_nominal_branding() {
     if let Value::Dict(d) = result {
         assert_eq!(
             d.map.get("check_b").unwrap(),
-            &Value::String("is_button".to_string())
+            &Value::String("is_button".into())
         );
         assert_eq!(
             d.map.get("check_l").unwrap(),
-            &Value::String("is_link".to_string())
+            &Value::String("is_link".into())
         );
     } else {
         panic!("Expected Dict");
@@ -1423,12 +1417,12 @@ fn test_brand_decorator_validates_and_brands_dict() {
     assert_eq!(w.brand.as_deref(), Some("Weather"));
     assert_eq!(
         w.map.get("location").unwrap(),
-        &Value::String("Shanghai".to_string())
+        &Value::String("Shanghai".into())
     );
     assert_eq!(w.map.get("temperature").unwrap(), &Value::Int(22));
     assert_eq!(
         d.map.get("kind").unwrap(),
-        &Value::String("is_weather".to_string())
+        &Value::String("is_weather".into())
     );
 }
 
@@ -1550,7 +1544,7 @@ fn test_brand_decorator_at_document_root() {
     assert_eq!(d.brand.as_deref(), Some("Weather"));
     assert_eq!(
         d.map.get("location").unwrap(),
-        &Value::String("Berlin".to_string())
+        &Value::String("Berlin".into())
     );
     assert_eq!(d.map.get("temperature").unwrap(), &Value::Int(15));
 }
@@ -1780,10 +1774,7 @@ fn test_brand_decorator_in_schema_field_equivalent_to_type_prefix() {
     let Value::Dict(inst) = d.map.get("inst").unwrap() else {
         panic!("Expected Dict for inst");
     };
-    assert_eq!(
-        inst.map.get("name").unwrap(),
-        &Value::String("Ada".to_string())
-    );
+    assert_eq!(inst.map.get("name").unwrap(), &Value::String("Ada".into()));
 
     let bad = eval_doc(
         r#"{
@@ -1950,7 +1941,7 @@ fn test_brand_decorator_in_schema_field_end_to_end_with_meta() {
     };
     assert_eq!(
         alice.map.get("name").unwrap(),
-        &Value::String("Alice".to_string())
+        &Value::String("Alice".into())
     );
     assert_eq!(alice.map.get("age").unwrap(), &Value::Int(0));
 }
@@ -1975,7 +1966,7 @@ fn test_schema_defaulting() {
         if let Value::Dict(alice_d) = alice {
             assert_eq!(
                 alice_d.map.get("role").unwrap(),
-                &Value::String("guest".to_string())
+                &Value::String("guest".into())
             );
             assert_eq!(alice_d.map.get("age").unwrap(), &Value::Int(25));
         } else {
@@ -2013,7 +2004,7 @@ fn test_schema_computed_default_from_siblings() {
     };
     assert_eq!(
         u.map.get("full").unwrap(),
-        &Value::String("Ada Lovelace".to_string())
+        &Value::String("Ada Lovelace".into())
     );
 }
 
@@ -2043,7 +2034,7 @@ fn test_schema_computed_default_does_not_override_explicit_value() {
     };
     assert_eq!(
         u.map.get("full").unwrap(),
-        &Value::String("Countess".to_string())
+        &Value::String("Countess".into())
     );
 }
 
@@ -2141,7 +2132,7 @@ fn variant_ctor_constructs_branded_dict() {
     assert_eq!(msg.variant_of.as_deref(), Some("Notification"));
     assert_eq!(
         msg.map.get("address").unwrap(),
-        &Value::String("a@b.c".to_string())
+        &Value::String("a@b.c".into())
     );
 }
 
@@ -2201,10 +2192,7 @@ fn variant_value_field_access_is_flat() {
     )
     .unwrap();
     let Value::Dict(d) = result else { panic!() };
-    assert_eq!(
-        d.map.get("got").unwrap(),
-        &Value::String("a@b.c".to_string())
-    );
+    assert_eq!(d.map.get("got").unwrap(), &Value::String("a@b.c".into()));
 }
 
 #[test]
@@ -2226,7 +2214,7 @@ fn match_on_variant_dispatches_via_brand() {
     let Value::Dict(d) = result else { panic!() };
     assert_eq!(
         d.map.get("out").unwrap(),
-        &Value::String("emailed a@b.c".to_string())
+        &Value::String("emailed a@b.c".into())
     );
 }
 
@@ -2273,7 +2261,7 @@ fn run_main_validates_args_and_fills_defaults() {
     assert_eq!(analyzed.main_signature.as_ref().unwrap().params.len(), 1);
 
     let mut req = BTreeMap::new();
-    req.insert("name".to_string(), Value::String("Alice".to_string()));
+    req.insert("name".to_string(), Value::String("Alice".into()));
     let mut args: HashMap<String, Value> = HashMap::new();
     args.insert("req".to_string(), Value::dict(req));
 
@@ -2290,7 +2278,7 @@ fn run_main_validates_args_and_fills_defaults() {
     let Value::Dict(d) = result else { panic!() };
     assert_eq!(
         d.map.get("greeting").unwrap(),
-        &Value::String("hello Alice, retries=0".to_string())
+        &Value::String("hello Alice, retries=0".into())
     );
 }
 
@@ -2309,7 +2297,7 @@ fn run_main_with_multiple_params() {
     assert!(analyzed.main_signature.is_some());
 
     let mut user = BTreeMap::new();
-    user.insert("name".to_string(), Value::String("Alice".to_string()));
+    user.insert("name".to_string(), Value::String("Alice".into()));
     let mut cart = BTreeMap::new();
     cart.insert("total".to_string(), Value::Int(100));
     let mut args: HashMap<String, Value> = HashMap::new();
@@ -2329,7 +2317,7 @@ fn run_main_with_multiple_params() {
     let Value::Dict(d) = result else { panic!() };
     assert_eq!(
         d.map.get("summary").unwrap(),
-        &Value::String("Alice - 100".to_string())
+        &Value::String("Alice - 100".into())
     );
 }
 
@@ -2370,7 +2358,7 @@ fn run_main_unexpected_arg_errors() {
     let analyzed = std::sync::Arc::new(relon_analyzer::analyze(&node));
     let mut args: HashMap<String, Value> = HashMap::new();
     let mut req = std::collections::BTreeMap::new();
-    req.insert("name".to_string(), Value::String("A".to_string()));
+    req.insert("name".to_string(), Value::String("A".into()));
     args.insert("req".to_string(), Value::dict(req));
     args.insert("bogus".to_string(), Value::Int(0));
     let ctx = Context::new()
@@ -2399,7 +2387,7 @@ fn run_main_arg_type_mismatch_errors() {
     let node = parse_doc(source);
     let analyzed = std::sync::Arc::new(relon_analyzer::analyze(&node));
     let mut args: HashMap<String, Value> = HashMap::new();
-    args.insert("n".to_string(), Value::String("not an int".to_string()));
+    args.insert("n".to_string(), Value::String("not an int".into()));
     let ctx = Context::new()
         .with_root(node.clone())
         .with_analyzed(std::sync::Arc::clone(&analyzed));
@@ -2475,10 +2463,7 @@ fn private_field_is_dropped_from_dict_map_but_visible_to_siblings() {
     )
     .unwrap();
     let Value::Dict(d) = result else { panic!() };
-    assert_eq!(
-        d.map.get("display").unwrap(),
-        &Value::String("<hi>".to_string())
-    );
+    assert_eq!(d.map.get("display").unwrap(), &Value::String("<hi>".into()));
     assert!(
         !d.map.contains_key("helper"),
         "private field leaked into map: {:?}",
@@ -2501,7 +2486,7 @@ fn private_value_field_is_also_dropped_from_dict_map() {
     let Value::Dict(d) = result else { panic!() };
     assert_eq!(
         d.map.get("public").unwrap(),
-        &Value::String("shhh (declassified)".to_string())
+        &Value::String("shhh (declassified)".into())
     );
     assert!(!d.map.contains_key("secret"));
 }
@@ -2626,11 +2611,11 @@ fn underscore_prefix_no_longer_implies_private() {
     let Value::Dict(d) = result else { panic!() };
     assert_eq!(
         d.map.get("_legacy").unwrap(),
-        &Value::String("still here".to_string())
+        &Value::String("still here".into())
     );
     assert_eq!(
         d.map.get("shown").unwrap(),
-        &Value::String("still here".to_string())
+        &Value::String("still here".into())
     );
 }
 
@@ -2650,7 +2635,7 @@ fn root_schema_directive_validates_main_arg() {
     assert!(analyzed.main_signature.is_some());
 
     let mut req = BTreeMap::new();
-    req.insert("name".to_string(), Value::String("Alice".to_string()));
+    req.insert("name".to_string(), Value::String("Alice".into()));
     req.insert("age".to_string(), Value::Int(30));
     let mut args: HashMap<String, Value> = HashMap::new();
     args.insert("req".to_string(), Value::dict(req));
@@ -2668,7 +2653,7 @@ fn root_schema_directive_validates_main_arg() {
     let Value::Dict(d) = result else { panic!() };
     assert_eq!(
         d.map.get("greeting").unwrap(),
-        &Value::String("hello Alice, age=30".to_string())
+        &Value::String("hello Alice, age=30".into())
     );
 }
 
@@ -2686,7 +2671,7 @@ fn root_schema_directive_supports_multiple_declarations() {
     assert_eq!(analyzed.root_schemas.len(), 2);
 
     let mut user = BTreeMap::new();
-    user.insert("name".to_string(), Value::String("Alice".to_string()));
+    user.insert("name".to_string(), Value::String("Alice".into()));
     let mut cart = BTreeMap::new();
     cart.insert("total".to_string(), Value::Int(100));
     let mut args: HashMap<String, Value> = HashMap::new();
@@ -2706,7 +2691,7 @@ fn root_schema_directive_supports_multiple_declarations() {
     let Value::Dict(d) = result else { panic!() };
     assert_eq!(
         d.map.get("summary").unwrap(),
-        &Value::String("Alice - 100".to_string())
+        &Value::String("Alice - 100".into())
     );
 }
 
@@ -2737,7 +2722,7 @@ fn root_schema_directive_visible_inside_dict_body() {
     };
     assert_eq!(
         alice.map.get("name").unwrap(),
-        &Value::String("Alice".to_string())
+        &Value::String("Alice".into())
     );
     assert_eq!(alice.map.get("age").unwrap(), &Value::Int(30));
 }
@@ -2798,7 +2783,7 @@ fn user_defined_decorator_applies_closure_to_value() {
     let Value::Dict(d) = result else { panic!() };
     assert_eq!(
         d.map.get("greeting").unwrap(),
-        &Value::String("hello!".to_string())
+        &Value::String("hello!".into())
     );
 }
 
@@ -2817,7 +2802,7 @@ fn user_defined_decorator_with_extra_args() {
     let Value::Dict(d) = result else { panic!() };
     assert_eq!(
         d.map.get("display").unwrap(),
-        &Value::String("[core]".to_string())
+        &Value::String("[core]".into())
     );
 }
 
@@ -2838,7 +2823,7 @@ fn user_defined_decorator_stack_is_innermost_first() {
     // bottom-up: paren("x") = "(x)", star("(x)") = "*(x)*"
     assert_eq!(
         d.map.get("display").unwrap(),
-        &Value::String("*(x)*".to_string())
+        &Value::String("*(x)*".into())
     );
 }
 
@@ -3172,7 +3157,7 @@ o.customer.name"#;
     assert_eq!(mm, 0, "{:?}", analyzed.diagnostics);
 
     let mut customer = BTreeMap::new();
-    customer.insert("name".to_string(), Value::String("Alice".to_string()));
+    customer.insert("name".to_string(), Value::String("Alice".into()));
     let mut order = BTreeMap::new();
     order.insert("customer".to_string(), Value::dict(customer));
     order.insert("id".to_string(), Value::Int(1));
@@ -3189,7 +3174,7 @@ o.customer.name"#;
     }))
     .run_main(&std::sync::Arc::new(Scope::default()), args)
     .unwrap();
-    assert_eq!(result, Value::String("Alice".to_string()));
+    assert_eq!(result, Value::String("Alice".into()));
 }
 
 /// v1.4 forward: strict mode with a path-spread of a typed field
@@ -3664,7 +3649,7 @@ fn dynamic_path_segment_is_evaluated_only_once() {
             _range: relon_parser::TokenRange,
         ) -> Result<Value, RuntimeError> {
             CALLS.fetch_add(1, Ordering::SeqCst);
-            Ok(Value::String("a".to_string()))
+            Ok(Value::String("a".into()))
         }
     }
 
@@ -3789,7 +3774,7 @@ fn workspace_module_lookup_skips_reparse_during_evaluate_module_source() {
     let Value::Dict(d) = result else {
         panic!("expected dict, got {result:?}")
     };
-    assert_eq!(d.map.get("msg"), Some(&Value::String("hi".to_string())));
+    assert_eq!(d.map.get("msg"), Some(&Value::String("hi".into())));
 }
 
 // ---------------------------------------------------------------------
@@ -3809,7 +3794,7 @@ fn v12_root_atomic_int() {
 #[test]
 fn v12_root_atomic_string() {
     let result = eval_doc(r#""hello""#).unwrap();
-    assert_eq!(result, Value::String("hello".to_string()));
+    assert_eq!(result, Value::String("hello".into()));
 }
 
 #[test]
@@ -3886,7 +3871,7 @@ s"#;
     let node = parse_doc(source);
     let analyzed = std::sync::Arc::new(relon_analyzer::analyze(&node));
     let mut args: HashMap<String, Value> = HashMap::new();
-    args.insert("s".to_string(), Value::String("hi".to_string()));
+    args.insert("s".to_string(), Value::String("hi".into()));
 
     let ctx = Context::new()
         .with_root(node.clone())
@@ -3898,7 +3883,7 @@ s"#;
     }))
     .run_main(&std::sync::Arc::new(Scope::default()), args)
     .unwrap();
-    assert_eq!(result, Value::String("hi".to_string()));
+    assert_eq!(result, Value::String("hi".into()));
 }
 
 #[test]
@@ -4133,7 +4118,7 @@ fn v17_tuple_typed_field_evaluates_as_list() {
     };
     assert_eq!(items.len(), 2);
     assert_eq!(items[0], Value::Int(42));
-    assert_eq!(items[1], Value::String("hello".to_string()));
+    assert_eq!(items[1], Value::String("hello".into()));
 }
 
 #[test]
@@ -4219,7 +4204,7 @@ fn v18_tuple_position_access_runtime() {
     assert_eq!(map.map.get("first").unwrap(), &Value::Int(42));
     assert_eq!(
         map.map.get("second").unwrap(),
-        &Value::String("hello".to_string())
+        &Value::String("hello".into())
     );
 }
 
@@ -4292,7 +4277,9 @@ fn register_method_dispatches_to_host_fn() {
             let Value::Int(cents) = d.map.get("cents").expect("cents") else {
                 panic!("cents should be Int");
             };
-            Ok(Value::String(format!("${:0.2}", *cents as f64 / 100.0)))
+            Ok(Value::String(
+                format!("${:0.2}", *cents as f64 / 100.0).into(),
+            ))
         }
     }
 
@@ -4314,7 +4301,7 @@ fn register_method_dispatches_to_host_fn() {
     .run_main(&std::sync::Arc::new(Scope::default()), args)
     .unwrap();
     let Value::Dict(d) = result else { panic!() };
-    assert_eq!(d.map.get("s"), Some(&Value::String("$1.99".to_string())));
+    assert_eq!(d.map.get("s"), Some(&Value::String("$1.99".into())));
 }
 
 // ===================================================================
@@ -4477,9 +4464,9 @@ fn auto_derived_eq_falls_back_to_structural_equality() {
     let node = parse_doc(source);
     let analyzed = std::sync::Arc::new(relon_analyzer::analyze(&node));
     let mut a = BTreeMap::new();
-    a.insert("name".to_string(), Value::String("ada".to_string()));
+    a.insert("name".to_string(), Value::String("ada".into()));
     let mut b = BTreeMap::new();
-    b.insert("name".to_string(), Value::String("ada".to_string()));
+    b.insert("name".to_string(), Value::String("ada".into()));
     let mut args: HashMap<String, Value> = HashMap::new();
     args.insert("a".to_string(), Value::dict(a));
     args.insert("b".to_string(), Value::dict(b));
@@ -4516,9 +4503,9 @@ fn no_auto_derive_equatable_still_falls_back_structurally() {
     let node = parse_doc(source);
     let analyzed = std::sync::Arc::new(relon_analyzer::analyze(&node));
     let mut a = BTreeMap::new();
-    a.insert("value".to_string(), Value::String("abc".to_string()));
+    a.insert("value".to_string(), Value::String("abc".into()));
     let mut b = BTreeMap::new();
-    b.insert("value".to_string(), Value::String("abc".to_string()));
+    b.insert("value".to_string(), Value::String("abc".into()));
     let mut args: HashMap<String, Value> = HashMap::new();
     args.insert("a".to_string(), Value::dict(a));
     args.insert("b".to_string(), Value::dict(b));
@@ -4675,7 +4662,7 @@ fn extend_user_schema_adds_method() {
     let node = parse_doc(source);
     let analyzed = std::sync::Arc::new(relon_analyzer::analyze(&node));
     let mut user = BTreeMap::new();
-    user.insert("name".to_string(), Value::String("admin".to_string()));
+    user.insert("name".to_string(), Value::String("admin".into()));
     let mut args: HashMap<String, Value> = HashMap::new();
     args.insert("u".to_string(), Value::dict(user));
     let ctx = Context::new()
@@ -4783,7 +4770,7 @@ fn multi_hop_schema_method_dispatches_through_field() {
     assert!(errors.is_empty(), "analyzer errors: {:?}", errors);
 
     let mut customer = BTreeMap::new();
-    customer.insert("name".to_string(), Value::String("Alice".to_string()));
+    customer.insert("name".to_string(), Value::String("Alice".into()));
     let mut order = BTreeMap::new();
     order.insert("customer".to_string(), Value::dict(customer));
     let mut args: HashMap<String, Value> = HashMap::new();
@@ -4799,10 +4786,7 @@ fn multi_hop_schema_method_dispatches_through_field() {
     .run_main(&std::sync::Arc::new(Scope::default()), args)
     .unwrap();
     let Value::Dict(d) = result else { panic!() };
-    assert_eq!(
-        d.map.get("s"),
-        Some(&Value::String("hello Alice".to_string()))
-    );
+    assert_eq!(d.map.get("s"), Some(&Value::String("hello Alice".into())));
 }
 
 #[test]
@@ -4827,7 +4811,7 @@ fn multi_hop_schema_method_with_arg() {
     let node = parse_doc(source);
     let analyzed = std::sync::Arc::new(relon_analyzer::analyze(&node));
     let mut customer = BTreeMap::new();
-    customer.insert("name".to_string(), Value::String("Bob".to_string()));
+    customer.insert("name".to_string(), Value::String("Bob".into()));
     let mut order = BTreeMap::new();
     order.insert("customer".to_string(), Value::dict(customer));
     let mut args: HashMap<String, Value> = HashMap::new();
@@ -4843,10 +4827,7 @@ fn multi_hop_schema_method_with_arg() {
     .run_main(&std::sync::Arc::new(Scope::default()), args)
     .unwrap();
     let Value::Dict(d) = result else { panic!() };
-    assert_eq!(
-        d.map.get("s"),
-        Some(&Value::String("hello Bob!".to_string()))
-    );
+    assert_eq!(d.map.get("s"), Some(&Value::String("hello Bob!".into())));
 }
 
 // ===================================================================
@@ -4880,7 +4861,7 @@ fn stdlib_method_string_upper_dispatches_via_register_pure_method() {
         .collect();
     assert!(errors.is_empty(), "analyzer errors: {:?}", errors);
     let mut args: HashMap<String, Value> = HashMap::new();
-    args.insert("s".to_string(), Value::String("hello".to_string()));
+    args.insert("s".to_string(), Value::String("hello".into()));
     let ctx = Context::new()
         .with_root(node.clone())
         .with_analyzed(std::sync::Arc::clone(&analyzed));
@@ -4892,10 +4873,7 @@ fn stdlib_method_string_upper_dispatches_via_register_pure_method() {
     .run_main(&std::sync::Arc::new(Scope::default()), args)
     .unwrap();
     let Value::Dict(d) = result else { panic!() };
-    assert_eq!(
-        d.map.get("shout"),
-        Some(&Value::String("HELLO".to_string()))
-    );
+    assert_eq!(d.map.get("shout"), Some(&Value::String("HELLO".into())));
 }
 
 #[test]
@@ -4975,8 +4953,8 @@ fn stdlib_method_dict_keys_dispatches_via_register_pure_method() {
     assert_eq!(
         out.map.get("ks"),
         Some(&Value::list(vec![
-            Value::String("a".to_string()),
-            Value::String("b".to_string()),
+            Value::String("a".into()),
+            Value::String("b".into()),
         ])),
     );
 }
@@ -5002,7 +4980,7 @@ fn stdlib_method_string_len_matches_free_fn_len() {
         .collect();
     assert!(errors.is_empty(), "analyzer errors: {:?}", errors);
     let mut args: HashMap<String, Value> = HashMap::new();
-    args.insert("s".to_string(), Value::String("relon".to_string()));
+    args.insert("s".to_string(), Value::String("relon".into()));
     let ctx = Context::new()
         .with_root(node.clone())
         .with_analyzed(std::sync::Arc::clone(&analyzed));
@@ -5042,7 +5020,7 @@ fn stdlib_method_self_contains_in_extend_body() {
         .collect();
     assert!(errors.is_empty(), "analyzer errors: {:?}", errors);
     let mut args: HashMap<String, Value> = HashMap::new();
-    args.insert("s".to_string(), Value::String("a@b.com".to_string()));
+    args.insert("s".to_string(), Value::String("a@b.com".into()));
     let ctx = Context::new()
         .with_root(node.clone())
         .with_analyzed(std::sync::Arc::clone(&analyzed));
@@ -5401,7 +5379,7 @@ fn core_string_method_no_extend_needed() {
         .collect();
     assert!(errors.is_empty(), "analyzer errors: {:?}", errors);
     let mut args: HashMap<String, Value> = HashMap::new();
-    args.insert("s".to_string(), Value::String("hi".to_string()));
+    args.insert("s".to_string(), Value::String("hi".into()));
     let ctx = Context::new()
         .with_root(node.clone())
         .with_analyzed(std::sync::Arc::clone(&analyzed));
@@ -5413,7 +5391,7 @@ fn core_string_method_no_extend_needed() {
     .run_main(&std::sync::Arc::new(Scope::default()), args)
     .unwrap();
     let Value::Dict(d) = result else { panic!() };
-    assert_eq!(d.map.get("shout"), Some(&Value::String("HI".to_string())));
+    assert_eq!(d.map.get("shout"), Some(&Value::String("HI".into())));
 }
 
 #[test]
@@ -5518,7 +5496,7 @@ fn comprehension_over_string_iter() {
         .collect();
     assert!(errors.is_empty(), "analyzer errors: {:?}", errors);
     let mut args: HashMap<String, Value> = HashMap::new();
-    args.insert("s".to_string(), Value::String("abc".to_string()));
+    args.insert("s".to_string(), Value::String("abc".into()));
     let ctx = Context::new()
         .with_root(node.clone())
         .with_analyzed(std::sync::Arc::clone(&analyzed));
@@ -5533,9 +5511,9 @@ fn comprehension_over_string_iter() {
     assert_eq!(
         d.map.get("chars"),
         Some(&Value::list(vec![
-            Value::String("a".to_string()),
-            Value::String("b".to_string()),
-            Value::String("c".to_string()),
+            Value::String("a".into()),
+            Value::String("b".into()),
+            Value::String("c".into()),
         ])),
     );
 }
@@ -5729,7 +5707,7 @@ fn iter_next_on_string_advances_per_codepoint() {
         .collect();
     assert!(errors.is_empty(), "analyzer errors: {:?}", errors);
     let mut args: HashMap<String, Value> = HashMap::new();
-    args.insert("s".to_string(), Value::String("ab".to_string()));
+    args.insert("s".to_string(), Value::String("ab".into()));
     let ctx = Context::new()
         .with_root(node.clone())
         .with_analyzed(std::sync::Arc::clone(&analyzed));
@@ -5747,7 +5725,7 @@ fn iter_next_on_string_advances_per_codepoint() {
         };
         assert_eq!(opt.brand.as_deref(), Some("Some"), "{key} should be Some");
         match opt.map.get("value") {
-            Some(Value::String(s)) => s.clone(),
+            Some(Value::String(s)) => s.as_str().to_owned(),
             other => panic!("{key} payload not String: {other:?}"),
         }
     };
@@ -5814,7 +5792,7 @@ fn iter_next_on_dict_yields_key_sorted_entries() {
         };
         assert_eq!(items.len(), 2, "{key} payload should be 2-tuple");
         let k = match &items[0] {
-            Value::String(s) => s.clone(),
+            Value::String(s) => s.as_str().to_owned(),
             other => panic!("{key} key not String: {other:?}"),
         };
         let v = match &items[1] {

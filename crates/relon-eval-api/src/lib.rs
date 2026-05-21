@@ -21,7 +21,13 @@
 //! Trait object-safety is a hard requirement: every method is `&self` plus
 //! concrete in/out types — no generic methods.
 
-#![forbid(unsafe_code)]
+// `unsafe_code` is forbidden everywhere except the SSO `SmolStr` module,
+// which needs a single `str::from_utf8_unchecked` on the inline-payload
+// borrow to keep `as_str()` cost on par with `String::as_str()`. The
+// invariant is local — every constructor fills `data[..len]` from a
+// `&str` / `String` so the bytes are UTF-8 by construction — and the
+// `unsafe` block has an explicit `// SAFETY:` comment documenting it.
+#![deny(unsafe_code)]
 // rustc ≥ 1.93 false-positive: `unused_assignments` fires on fields of every
 // `#[derive(miette::Diagnostic)]` / `thiserror::Error` enum (the derive
 // expands to internal let-bindings that the lint mis-reads). Mirror the
@@ -39,6 +45,7 @@ pub mod native_fn;
 pub mod schema_canonical;
 pub mod schema_lower;
 pub mod scope;
+pub mod smol_str;
 pub mod value;
 
 pub use capability::{CapabilityError, CapabilityGate, DenyReason};
@@ -50,6 +57,7 @@ pub use error::RuntimeError;
 pub use module::{ModuleResolver, ModuleSource};
 pub use native_fn::{EvaluatedArg, NativeArgs, NativeFn, NativeFnCaps, RelonFunction};
 pub use scope::{ListContext, Locals, RootRef, Scope, Thunk, Thunks};
+pub use smol_str::{SmolStr, SMOL_STR_INLINE_CAP};
 pub use value::{ClosureData, EnumSchemaData, SchemaData, SchemaField, Value, ValueDict};
 
 use std::collections::HashMap;

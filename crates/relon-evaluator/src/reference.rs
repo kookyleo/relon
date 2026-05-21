@@ -115,7 +115,7 @@ impl TreeWalkEvaluator {
                 // No witness — coerce the evaluated key into the
                 // String / Int form the structural fallback expects.
                 let key = match key_value {
-                    Value::String(s) => s,
+                    Value::String(s) => s.into_string(),
                     Value::Int(i) => i.to_string(),
                     other => {
                         return Err(RuntimeError::TypeMismatch {
@@ -483,7 +483,7 @@ impl TreeWalkEvaluator {
                     TokenKey::Dynamic(expr_node, _) => {
                         let val = self.eval(expr_node, scope)?;
                         match val {
-                            Value::String(s) => s,
+                            Value::String(s) => s.into_string(),
                             Value::Int(i) => i.to_string(),
                             other => {
                                 return Err(RuntimeError::TypeMismatch {
@@ -584,7 +584,7 @@ impl TreeWalkEvaluator {
                     TokenKey::Dynamic(expr_node, _) => {
                         let val = self.eval(expr_node, scope)?;
                         match val {
-                            Value::String(s) => s,
+                            Value::String(s) => s.into_string(),
                             Value::Int(i) => i.to_string(),
                             other => {
                                 return Err(RuntimeError::TypeMismatch {
@@ -679,7 +679,7 @@ impl TreeWalkEvaluator {
                     let key_str = match key {
                         TokenKey::String(s, _, _) => s.clone(),
                         TokenKey::Dynamic(expr_node, _) => match self.eval(expr_node, scope)? {
-                            Value::String(s) => s,
+                            Value::String(s) => s.into_string(),
                             Value::Int(i) => i.to_string(),
                             _ => continue,
                         },
@@ -843,7 +843,7 @@ impl TreeWalkEvaluator {
                 // No witness — fall through to the structural lookup
                 // by coercing the key into a String / Int.
                 let key = match key_value {
-                    Value::String(s) => s,
+                    Value::String(s) => s.into_string(),
                     Value::Int(i) => i.to_string(),
                     other => {
                         return Err(RuntimeError::TypeMismatch {

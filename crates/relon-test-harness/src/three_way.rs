@@ -482,11 +482,11 @@ fn parse_recipe(source: &str) -> Option<SynthRecipe> {
         ("#main() -> Int [1, 2, 3, 4, 5].length()", Value::Int(5)),
         (
             "#main() -> String \"foo\".concat(\"bar\")",
-            Value::String("foobar".to_string()),
+            Value::String("foobar".into()),
         ),
         (
             "#main() -> String \"hello\".substring(1, 3)",
-            Value::String("ell".to_string()),
+            Value::String("ell".into()),
         ),
         (
             "#main() -> Bool \"hello world\".starts_with(\"hello\")",
@@ -498,36 +498,36 @@ fn parse_recipe(source: &str) -> Option<SynthRecipe> {
         ),
         (
             "#main() -> String \"hello\".upper()",
-            Value::String("HELLO".to_string()),
+            Value::String("HELLO".into()),
         ),
         (
             "#main() -> String \"WORLD\".lower()",
-            Value::String("world".to_string()),
+            Value::String("world".into()),
         ),
         (
             "#main() -> String \"hello world\".title()",
-            Value::String("Hello World".to_string()),
+            Value::String("Hello World".into()),
         ),
         (
             "#main() -> String \"σίγμα\".upper()",
-            Value::String("ΣΊΓΜΑ".to_string()),
+            Value::String("ΣΊΓΜΑ".into()),
         ),
         (
             "#main() -> String \"ΣΙΓΜΑ\".lower()",
-            Value::String("σιγμα".to_string()),
+            Value::String("σιγμα".into()),
         ),
         // v3++ b-7 reframed: FULL multi-cp + Σ-context coverage.
         (
             "#main() -> String \"straße\".upper()",
-            Value::String("STRASSE".to_string()),
+            Value::String("STRASSE".into()),
         ),
         (
             "#main() -> String \"ΟΔΥΣΣΕΥΣ\".lower()",
-            Value::String("οδυσσευς".to_string()),
+            Value::String("οδυσσευς".into()),
         ),
         (
             "#main() -> String \"ﬁle\".upper()",
-            Value::String("FILE".to_string()),
+            Value::String("FILE".into()),
         ),
         ("#main() -> Int [1, 2, 3, 4, 5].sum()", Value::Int(15)),
         (
@@ -536,11 +536,11 @@ fn parse_recipe(source: &str) -> Option<SynthRecipe> {
         ),
         (
             "#main() -> String \"é\".nfd()",
-            Value::String("e\u{301}".to_string()),
+            Value::String("e\u{301}".into()),
         ),
         (
             "#main() -> String \"e\\u0301\".nfc()",
-            Value::String("é".to_string()),
+            Value::String("é".into()),
         ),
     ];
     for (pat, value) in const_table {

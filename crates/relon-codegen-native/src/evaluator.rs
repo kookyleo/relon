@@ -1679,7 +1679,7 @@ fn read_value_from_reader(
             .map_err(buffer_to_runtime_error),
         TypeRepr::String => reader
             .read_string(&field.name)
-            .map(|s| Value::String(s.to_string()))
+            .map(|s| Value::String(s.into()))
             .map_err(buffer_to_runtime_error),
         TypeRepr::List { element } => match element.as_ref() {
             TypeRepr::Int => reader
