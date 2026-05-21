@@ -2022,3 +2022,190 @@ fn str_const_out_of_pool_traps() {
         "expected StackUnderflow, got {err:?}"
     );
 }
+
+// -- M2-C lever 2: inline cache for CallNative host-fn dispatch ----
+
+/// Loop-style program calling `import_idx=5` three times in a row.
+/// The cache must be primed on the first call and re-used on the
+/// next two; the host fn still runs exactly once per call (the cache
+/// is a resolve-side cache, not a memoiser).
+#[test]
+fn call_native_inline_cache_dispatches_hot_loop_cleanly() {
+    use relon_bytecode::op::{BcFunction, BcOp};
+    use std::sync::Arc;
+
+    let bc = BcFunction {
+        ops: vec![
+            BcOp::ConstI64(1),
+            BcOp::ConstI64(2),
+            BcOp::CallNative {
+                import_idx: 5,
+                arg_count: 2,
+                cap_bit: relon_ir::NO_CAPABILITY_BIT,
+                ret_ty: relon_ir::IrType::I64,
+            },
+            BcOp::ConstI64(3),
+            BcOp::CallNative {
+                import_idx: 5,
+                arg_count: 2,
+                cap_bit: relon_ir::NO_CAPABILITY_BIT,
+                ret_ty: relon_ir::IrType::I64,
+            },
+            BcOp::ConstI64(4),
+            BcOp::CallNative {
+                import_idx: 5,
+                arg_count: 2,
+                cap_bit: relon_ir::NO_CAPABILITY_BIT,
+                ret_ty: relon_ir::IrType::I64,
+            },
+            BcOp::Return,
+        ],
+        locals: 0,
+        ir_pc_map: (1..=8).collect(),
+        string_pool: Vec::new(),
+        stack_recipe: vec![vec![]; 8],
+        fn_id: None,
+    };
+
+    let mut vtable = CapabilityVtable::default();
+    let native: Arc<SumNative> = Arc::new(SumNative::new());
+    let native_dyn: Arc<dyn relon_eval_api::RelonFunction> = native.clone();
+    vtable.register_host_fn(5, native_dyn);
+    let cfg = BcVmConfig {
+        cap_vtable: vtable,
+        ..BcVmConfig::default()
+    };
+    let vm = BytecodeVm::new(cfg);
+    let outcome = vm.invoke(&bc, &[]);
+    assert!(outcome.error.is_none());
+    // 1+2 = 3; result 3 then sum(3,3)=6 then sum(6,4)=10.
+    assert_eq!(outcome.value, Some(10u64));
+    assert_eq!(
+        native.hits.load(std::sync::atomic::Ordering::SeqCst),
+        3,
+        "host fn invoked once per CallNative op"
+    );
+}
+
+/// Polymorphic call-site shape: alternates `import_idx=5` and
+/// `import_idx=6`. The cache must invalidate cleanly on each switch —
+/// both host fns are observed for every visit, no stale slot leaks.
+#[test]
+fn call_native_inline_cache_polymorphic_resolves_correctly() {
+    use relon_bytecode::op::{BcFunction, BcOp};
+    use std::sync::Arc;
+
+    let bc = BcFunction {
+        ops: vec![
+            BcOp::ConstI64(10),
+            BcOp::ConstI64(20),
+            BcOp::CallNative {
+                import_idx: 5,
+                arg_count: 2,
+                cap_bit: relon_ir::NO_CAPABILITY_BIT,
+                ret_ty: relon_ir::IrType::I64,
+            },
+            BcOp::ConstI64(100),
+            BcOp::CallNative {
+                import_idx: 6,
+                arg_count: 2,
+                cap_bit: relon_ir::NO_CAPABILITY_BIT,
+                ret_ty: relon_ir::IrType::I64,
+            },
+            BcOp::ConstI64(7),
+            BcOp::CallNative {
+                import_idx: 5,
+                arg_count: 2,
+                cap_bit: relon_ir::NO_CAPABILITY_BIT,
+                ret_ty: relon_ir::IrType::I64,
+            },
+            BcOp::Return,
+        ],
+        locals: 0,
+        ir_pc_map: (1..=8).collect(),
+        string_pool: Vec::new(),
+        stack_recipe: vec![vec![]; 8],
+        fn_id: None,
+    };
+
+    let mut vtable = CapabilityVtable::default();
+    let n5: Arc<SumNative> = Arc::new(SumNative::new());
+    let n6: Arc<SumNative> = Arc::new(SumNative::new());
+    let dyn5: Arc<dyn relon_eval_api::RelonFunction> = n5.clone();
+    let dyn6: Arc<dyn relon_eval_api::RelonFunction> = n6.clone();
+    vtable.register_host_fn(5, dyn5);
+    vtable.register_host_fn(6, dyn6);
+    let cfg = BcVmConfig {
+        cap_vtable: vtable,
+        ..BcVmConfig::default()
+    };
+    let vm = BytecodeVm::new(cfg);
+    let outcome = vm.invoke(&bc, &[]);
+    assert!(outcome.error.is_none(), "got error {:?}", outcome.error);
+    // 10+20=30; 30+100=130 via slot 6; 130+7=137 via slot 5.
+    assert_eq!(outcome.value, Some(137u64));
+    assert_eq!(n5.hits.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert_eq!(n6.hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+/// Cache must reset between `invoke_*` calls so a `register_host_fn`
+/// swap between invocations is observed.
+#[test]
+fn call_native_inline_cache_resets_between_invokes() {
+    use relon_bytecode::op::{BcFunction, BcOp};
+    use std::sync::Arc;
+
+    let bc = BcFunction {
+        ops: vec![
+            BcOp::ConstI64(1),
+            BcOp::ConstI64(2),
+            BcOp::CallNative {
+                import_idx: 5,
+                arg_count: 2,
+                cap_bit: relon_ir::NO_CAPABILITY_BIT,
+                ret_ty: relon_ir::IrType::I64,
+            },
+            BcOp::Return,
+        ],
+        locals: 0,
+        ir_pc_map: vec![1, 2, 3, 4],
+        string_pool: Vec::new(),
+        stack_recipe: vec![vec![]; 4],
+        fn_id: None,
+    };
+
+    let mut vtable = CapabilityVtable::default();
+    let n_first: Arc<SumNative> = Arc::new(SumNative::new());
+    let dyn_first: Arc<dyn relon_eval_api::RelonFunction> = n_first.clone();
+    vtable.register_host_fn(5, dyn_first);
+    let cfg = BcVmConfig {
+        cap_vtable: vtable,
+        ..BcVmConfig::default()
+    };
+    let mut vm = BytecodeVm::new(cfg);
+    let o1 = vm.invoke(&bc, &[]);
+    assert!(o1.error.is_none());
+    assert_eq!(o1.value, Some(3u64));
+    assert_eq!(n_first.hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    // Swap the registered host fn for slot 5 between invokes; the
+    // second `invoke` must observe the new fn even though the previous
+    // call primed the cache with `n_first`.
+    let n_second: Arc<SumNative> = Arc::new(SumNative::new());
+    let dyn_second: Arc<dyn relon_eval_api::RelonFunction> = n_second.clone();
+    vm.config_mut().cap_vtable.register_host_fn(5, dyn_second);
+
+    let o2 = vm.invoke(&bc, &[]);
+    assert!(o2.error.is_none());
+    assert_eq!(o2.value, Some(3u64));
+    assert_eq!(
+        n_second.hits.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "second invoke must observe the freshly-registered host fn"
+    );
+    assert_eq!(
+        n_first.hits.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "first host fn must not be re-invoked from a stale cache slot"
+    );
+}
