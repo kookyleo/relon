@@ -24,6 +24,7 @@ use thiserror::Error;
 use crate::arena::{ArenaError, VmMemory};
 use crate::hot_counter::{HotCounterResult, HotTraceTriggerHandle};
 use crate::op::{BcFunction, BcOp, BcStdlibKind, BcTrapKind, ExternalPc};
+use crate::trace_dispatch::InstalledTraceLookupHandle;
 
 /// Raw VM-value slot. The bytecode VM is homogeneous on `u64` so
 /// the dispatch arms don't switch on a tagged enum on every op.
@@ -68,6 +69,24 @@ pub struct BcVmConfig {
     /// to fire after a single iteration) lower this to `1`. Threshold
     /// 0 is rejected at [`HotCounter::with_threshold`] time.
     pub hot_threshold: u32,
+    /// M2-B phase 4c-cont: optional installed-trace lookup. When set,
+    /// the evaluator consults this hook at the top of every
+    /// `run_main` invocation; a hit bypasses the bytecode dispatch
+    /// loop entirely and routes through the JIT'd trace (mirror of
+    /// the cranelift backend's entry-fn prologue + inline cache).
+    ///
+    /// `None` leaves the path inert — the VM behaves as before phase
+    /// 4c-cont. The native adapter
+    /// (`relon_codegen_native::bytecode_bridge::CraneliftTraceLookup`)
+    /// wraps `TraceJitState::invoke_with_resume` so a successful
+    /// trace returns its `result_slot` value and a guard-failed trace
+    /// surfaces the [`relon_trace_abi::DeoptStateSnapshot`] for the
+    /// evaluator's `resume_from_snapshot` path to absorb.
+    ///
+    /// Stored on the config (not directly on the VM) so each
+    /// `run_main` invocation clones the `Arc` once at entry — the VM
+    /// itself stays cranelift-free.
+    pub trace_lookup: Option<InstalledTraceLookupHandle>,
 }
 
 impl Default for BcVmConfig {
@@ -82,6 +101,7 @@ impl Default for BcVmConfig {
             cap_vtable: CapabilityVtable::default(),
             hot_trigger: None,
             hot_threshold: crate::hot_counter::DEFAULT_HOT_THRESHOLD,
+            trace_lookup: None,
         }
     }
 }

@@ -301,6 +301,23 @@ impl BytecodeEvaluator {
         self
     }
 
+    /// M2-B phase 4c-cont: install the installed-trace lookup on the
+    /// default VM config. When set, every `run_main` invocation first
+    /// consults the lookup; a hit bypasses the bytecode dispatch loop
+    /// entirely (the trace fn writes its return value directly into
+    /// the schema's return slot) and a guard-failed trace routes
+    /// through [`Self::resume_from_snapshot`] for partial-resume.
+    ///
+    /// Pair this with [`Self::with_fn_id`] — without a `fn_id` on the
+    /// compiled function the dispatcher-switch path is inert.
+    pub fn with_trace_lookup(
+        mut self,
+        lookup: crate::trace_dispatch::InstalledTraceLookupHandle,
+    ) -> Self {
+        self.default_config.trace_lookup = Some(lookup);
+        self
+    }
+
     /// Inspect the entry source range.
     pub fn entry_range(&self) -> TokenRange {
         self.entry_range
@@ -318,6 +335,45 @@ impl BytecodeEvaluator {
             packed.push(value_to_vm(value, ty, name, self.entry_range)?);
         }
         Ok(packed)
+    }
+
+    /// M2-B phase 4c-cont: lift the trace's `result_slot` value into
+    /// a Relon [`Value`].
+    ///
+    /// The bytecode VM's regular `Return` path goes through
+    /// [`Self::unpack_return_slots`] which reads `final_locals`
+    /// (populated by the schema-driven `StoreField` lowering). On the
+    /// trace-bypass path we don't run the dispatch loop, so there's
+    /// no `final_locals` snapshot — the trace fn writes its return
+    /// value into `TraceContext::result_slot`, which we get back as a
+    /// raw `u64`. Decode against the return schema's first (and, for
+    /// the M2-B trace envelope, only) field. Multi-field returns are
+    /// out of scope until the trace runtime widens
+    /// [`relon_trace_abi::TraceContext`] beyond a single `result_slot`
+    /// — until then a multi-field schema falls back to the bytecode
+    /// path via the recorder declining to compile a multi-output
+    /// trace.
+    fn pack_trace_result(&self, result: u64) -> Value {
+        let Some(schema) = self.return_schema.as_ref() else {
+            return Value::Int(result as i64);
+        };
+        if schema.fields.len() == 1 {
+            return decode_field(&schema.fields[0].ty, result);
+        }
+        // Multi-field return: trace envelope only carries the first
+        // slot; remaining fields stay at the zero-init value the
+        // dispatch loop would have produced. This shape is not
+        // expected in production today (trace recorder declines to
+        // compile when the IR has more than one StoreField), but we
+        // surface a defined value rather than panicking so unit tests
+        // that exercise the dispatcher with synthetic schemas don't
+        // fall off a cliff.
+        let mut map: std::collections::BTreeMap<String, Value> = std::collections::BTreeMap::new();
+        for (i, f) in schema.fields.iter().enumerate() {
+            let raw = if i == 0 { result } else { 0 };
+            map.insert(f.name.clone(), decode_field(&f.ty, raw));
+        }
+        Value::branded_dict(map, Some(schema.name.clone()))
     }
 
     fn unpack_return_slots(&self, locals: &[VmValue]) -> Value {
@@ -519,6 +575,52 @@ impl Evaluator for BytecodeEvaluator {
     }
 
     fn run_main(&self, args: HashMap<String, Value>) -> Result<Value, RuntimeError> {
+        // M2-B phase 4c-cont: dispatcher switch. When an installed
+        // trace exists for this `fn_id`, bypass the bytecode dispatch
+        // loop and route through the JIT'd trace fn. The cranelift
+        // backend's entry-fn prologue does the same thing in machine
+        // code; the bytecode VM does it in Rust at the evaluator
+        // boundary.
+        //
+        // The three outcomes:
+        //   - `NoTrace`        — fall through to regular dispatch.
+        //   - `Success { r }`  — trace ran clean; pack `r` into the
+        //                        return slot and skip the dispatch
+        //                        loop entirely (the user-visible win).
+        //   - `Deopt { snap }` — a guard fired mid-trace; route the
+        //                        snapshot into the bytecode VM's
+        //                        partial-resume so dispatch picks up
+        //                        exactly where the trace bailed.
+        //
+        // We only consult the lookup on the **outer** invocation
+        // entry; partial-resume re-entries land on the `resume_from_*`
+        // paths and don't pass through here, so a deopt → resume →
+        // re-deopt cycle can't accidentally bounce off the trace
+        // again before the bytecode VM finishes the job.
+        if let (Some(fn_id), Some(lookup)) =
+            (self.func.fn_id, self.default_config.trace_lookup.as_ref())
+        {
+            let packed = self.pack_args(&args)?;
+            match lookup.try_invoke(fn_id, &packed) {
+                crate::trace_dispatch::TraceInvokeOutcome::NoTrace => {
+                    // Re-use the pre-packed args via the
+                    // packed-args variant so we don't double-pack.
+                    return self.run_main_inner_with_packed(&packed, 0, &[], &[]);
+                }
+                crate::trace_dispatch::TraceInvokeOutcome::Success { result } => {
+                    return Ok(self.pack_trace_result(result));
+                }
+                crate::trace_dispatch::TraceInvokeOutcome::Deopt { snapshot } => {
+                    // Drive the partial-resume path through the
+                    // sub-task-B convenience alias so the call site
+                    // explicitly names what's happening. The snapshot
+                    // carries `external_pc` + slot copies;
+                    // `resume_from_deopt` routes those onto the
+                    // bytecode VM's `start_bc_idx`.
+                    return self.resume_from_deopt(args, &snapshot);
+                }
+            }
+        }
         self.run_main_inner(&args, /*start_bc_idx=*/ 0, &[], &[])
     }
 
@@ -657,6 +759,30 @@ impl BytecodeEvaluator {
     ) -> Result<Value, RuntimeError> {
         let (value, _) = self.resume_from_snapshot_with_metrics(args, snapshot)?;
         Ok(value)
+    }
+
+    /// M2-B phase 4c-cont sub-task B: full deopt → bytecode handoff
+    /// entry point.
+    ///
+    /// Convenience alias for [`Self::resume_from_snapshot`] surfaced
+    /// at this name so the public API mirrors the
+    /// [`crate::trace_dispatch::TraceInvokeOutcome::Deopt`] arm the
+    /// dispatcher switch routes through internally. Hosts that hold
+    /// a snapshot (e.g. when manually orchestrating the trace
+    /// pipeline outside of [`Self::run_main`]) can call this directly
+    /// to skip the lookup re-consult.
+    ///
+    /// The semantic is identical to `resume_from_snapshot`: rebuild
+    /// the operand stack from the per-PC recipe + snapshot fragments,
+    /// dispatch the bytecode VM starting at the snapshot's
+    /// `external_pc`, propagate any trap on the resumed dispatch as
+    /// the public [`RuntimeError`] envelope.
+    pub fn resume_from_deopt(
+        &self,
+        args: HashMap<String, Value>,
+        snapshot: &relon_trace_abi::DeoptStateSnapshot,
+    ) -> Result<Value, RuntimeError> {
+        self.resume_from_snapshot(args, snapshot)
     }
 
     /// Same as [`Self::resume_from_snapshot`] but also returns
