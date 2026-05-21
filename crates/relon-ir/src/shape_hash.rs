@@ -87,11 +87,14 @@ mod tests {
         // The producer-side `shape_hash_for_keys(["k"])` must round-
         // trip with the consumer-side `fx_hash_key_record(record)` on
         // a single-key dict; otherwise the IC dispatch would always
-        // miss. We anchor this to a literal layout-conformant String
-        // record so the layout drift the layout-smoke test guards
-        // against also shows up here.
+        // miss. We anchor this to a literal layout-conformant dict
+        // key record (#149 layout: [len:u32][hash:u64][payload]) so
+        // the layout drift the layout-smoke test guards against also
+        // shows up here.
         let key = "thekey";
+        let cached_hash = fx_hash_bytes(key.as_bytes());
         let mut record = (key.len() as u32).to_le_bytes().to_vec();
+        record.extend_from_slice(&cached_hash.to_le_bytes());
         record.extend_from_slice(key.as_bytes());
 
         let producer = shape_hash_for_keys([key]);
@@ -99,8 +102,8 @@ mod tests {
         // the accumulator is `SEED ^ fx_hash_bytes(key_bytes)`.
         let expected = INITIAL_SEED ^ fx_hash_bytes(key.as_bytes());
         assert_eq!(producer, expected);
-        // The runtime helper sees the layout-conformant record, hashes
-        // payload-only, matches the un-seeded fx_hash_bytes value.
+        // The runtime helper reads the cached hash field, which equals
+        // the un-seeded fx_hash_bytes value by construction.
         let runtime = unsafe { fx_hash_key_record(record.as_ptr()) };
         assert_eq!(runtime, fx_hash_bytes(key.as_bytes()));
     }
