@@ -15,6 +15,12 @@ dhat-heap = ["dep:dhat"]
 [dependencies]
 relon-parser = { workspace = true }
 relon-evaluator = { workspace = true }
+# M2-C lever 1 (2026-05-21): the W12 bytecode row drives the concrete
+# `BytecodeEvaluator::run_main_i64` typed fast-path to bypass the
+# host-arg `HashMap<String, Value>` round-trip the trait-level
+# `run_main` carries. Direct crate dep so the bench can name the
+# concrete type rather than the `Box<dyn Evaluator>` trait object.
+relon-bytecode = { workspace = true }
 # M2-B phase 4d (2026-05-21): the bytecode VM is driven via the
 # `relon::new_evaluator(src, Backend::Bytecode)` facade so the cmp_lua
 # bench's bytecode row picks up whatever from-source envelope the
