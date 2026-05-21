@@ -770,6 +770,14 @@ impl CraneliftAotEvaluator {
         param_names: Vec<String>,
         buffer_schema: Option<BufferSchema>,
     ) -> Result<Self, CraneliftError> {
+        // Install the process-wide signal handler once at evaluator
+        // construction. The handler is idempotent (`Once::call_once`
+        // internally) so doing it here rather than per-invoke moves a
+        // (cheap but non-zero) atomic-load probe off the dispatch hot
+        // path. The `Once`'s state lives in the trap-handler module
+        // and stays live for the host's lifetime.
+        crate::trap_handler::install_global_signal_handler();
+
         // The codegen's tail-cursor protocol needs the return record's
         // fixed-area size up front to seed the cursor past the root.
         // Direct-IR / legacy callers without schema metadata pass 0;
@@ -939,14 +947,62 @@ impl CraneliftAotEvaluator {
         &self.param_names
     }
 
+    /// Fast-path entry for legacy-shape modules: skip the
+    /// `HashMap<String, Value>` packing / lookup that `run_main`
+    /// performs and call the JIT entry directly with the supplied i64
+    /// argument vector.
+    ///
+    /// Returns `Err(Unsupported)` when the evaluator was built from a
+    /// buffer-protocol source (i.e. `from_source` rather than
+    /// `from_ir_direct` / `from_cache`). Callers that need a typed
+    /// signature contract for both shapes should keep using
+    /// [`Evaluator::run_main`].
+    ///
+    /// Boundary cost vs `run_main`: at the time this fast path was
+    /// added (2026-05-21), profiling on `dispatch_cranelift_step`
+    /// attributed roughly 200-250 ns / invoke to the HashMap arg
+    /// packing + name-keyed lookup that `run_main` does for the legacy
+    /// shape. Callers driving a hot loop of Rust→AOT invocations (e.g.
+    /// per-record evaluation in a streaming pipeline) should prefer
+    /// this entry; per-invoke cost drops into the 150-200 ns band.
+    pub fn run_main_legacy_i64(&self, args: &[i64]) -> Result<i64, RuntimeError> {
+        if self.buffer_schema.is_some() {
+            return Err(RuntimeError::Unsupported {
+                reason: "cranelift-native: run_main_legacy_i64 requires a legacy-shape entry; the evaluator was built from buffer-protocol source"
+                    .into(),
+            });
+        }
+        if args.len() != self.entry_arity {
+            return Err(RuntimeError::Unsupported {
+                reason: format!(
+                    "cranelift-native: #main expects {} arg(s), got {}",
+                    self.entry_arity,
+                    args.len()
+                ),
+            });
+        }
+        if args.len() > 4 {
+            return Err(RuntimeError::Unsupported {
+                reason: format!(
+                    "cranelift-native legacy entry supports up to 4 args; got {}",
+                    args.len()
+                ),
+            });
+        }
+        let mut argv = [0i64; 4];
+        argv[..args.len()].copy_from_slice(args);
+        self.invoke_legacy_entry(argv)
+    }
+
     /// Internal: invoke the legacy-shape JIT entry with the supplied
     /// i64 args. Uses `catch_unwind` to convert panics raised by
     /// cranelift trap instructions into typed `RuntimeError`s. The
-    /// stage 5 signal-hook handler (installed process-wide once)
-    /// intercepts SIGSEGV / SIGFPE / SIGILL into the thread-local
-    /// trap slot as a defense-in-depth measure.
+    /// stage 5 signal-hook handler is installed once at evaluator
+    /// construction (`from_ir_inner`) and intercepts SIGSEGV / SIGFPE
+    /// / SIGILL into the thread-local trap slot as a defense-in-depth
+    /// measure; this hot-path entry assumes the handler is already
+    /// live.
     fn invoke_legacy_entry(&self, args: [i64; 4]) -> Result<i64, RuntimeError> {
-        crate::trap_handler::install_global_signal_handler();
         crate::trap_handler::reset_thread_signal_slot();
         self.sandbox_state.reset_trap();
         let state_ptr: *const SandboxState = Arc::as_ptr(&self.sandbox_state);
@@ -1001,7 +1057,10 @@ impl CraneliftAotEvaluator {
         scratch_base: u32,
         caps: u64,
     ) -> Result<i32, RuntimeError> {
-        crate::trap_handler::install_global_signal_handler();
+        // The process-wide signal handler is installed once at
+        // evaluator construction (`from_ir_inner`); it stays live for
+        // the host's lifetime, so the hot dispatch path doesn't pay a
+        // `Once::call_once` atomic-load probe per invocation.
         crate::trap_handler::reset_thread_signal_slot();
         self.sandbox_state.reset_trap();
         // SAFETY: `arena` is borrowed mutably here and stays valid

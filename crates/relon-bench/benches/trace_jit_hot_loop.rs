@@ -1108,6 +1108,34 @@ fn bench_hot_loop(c: &mut Criterion) {
         },
     );
 
+    // 2026-05-21 dispatch-boundary profile row #1: same body as
+    // `dispatch_cranelift_step` above but uses the new
+    // `run_main_legacy_i64(&[i64])` fast path that skips the
+    // HashMap<String, Value> arg packing + name-keyed lookup. The
+    // delta vs `dispatch_cranelift_step` isolates the HashMap-arg cost
+    // (alloc + 2× String key clones + 2× hash lookup + Value::Int
+    // boxing). Same evaluator instance as `dispatch_cranelift_step`,
+    // so the only changed component is the arg-marshalling path.
+    group.bench_function(
+        BenchmarkId::new("backend", "dispatch_cranelift_step_legacy_i64"),
+        |b| {
+            b.iter_custom(|iters| {
+                timed_with_warmup(iters, || {
+                    let mut acc: i64 = 0;
+                    let mut argv: [i64; 2] = [0, 0];
+                    for i in 0..HOT_LOOP_N as i64 {
+                        argv[0] = black_box(acc);
+                        argv[1] = black_box(i);
+                        acc = step_eval
+                            .run_main_legacy_i64(&argv)
+                            .expect("cranelift step run_main_legacy_i64");
+                    }
+                    black_box(acc);
+                })
+            });
+        },
+    );
+
     let fn_id = install_trace_for_step();
     let state = global_trace_jit_state();
     let trace_fn = state.lookup_trace(fn_id).expect("post-install");
