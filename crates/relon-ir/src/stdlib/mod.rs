@@ -98,7 +98,7 @@ pub use index::{
     stdlib_closure_arg_signature, stdlib_function_count, stdlib_function_index, stdlib_method_index,
 };
 pub use registry::builtin_stdlib;
-pub use signatures::StdlibFunction;
+pub use signatures::{StdlibFunction, GLOB_MATCH_INDEX};
 
 #[cfg(test)]
 mod tests {
@@ -278,5 +278,46 @@ mod d7d_index_tests {
     fn contains_method_dispatch_resolves() {
         let idx = stdlib_function_index("contains").expect("contains stdlib slot");
         assert_eq!(stdlib_method_index(IrType::String, "contains"), Some(idx));
+    }
+}
+
+#[cfg(test)]
+mod glob_match_index_tests {
+    use super::signatures::GLOB_MATCH_INDEX;
+    use super::*;
+    use crate::ir::IrType;
+
+    /// 2026-05-21: `glob_match(String, String) -> Bool` lands at slot
+    /// 37 — the slot cranelift's `emit_call_stdlib` intercepts to
+    /// route through the `RelonGlobMatch` vtable indirection.
+    /// Reordering the bundle without bumping the constant would
+    /// silently route a different body through the host helper,
+    /// almost certainly with a fatal ABI mismatch on the first call.
+    #[test]
+    fn glob_match_index_is_37() {
+        assert_eq!(
+            stdlib_function_index("glob_match"),
+            Some(GLOB_MATCH_INDEX)
+        );
+        assert_eq!(stdlib_function_index("glob_match"), Some(37));
+    }
+
+    /// Method-form dispatch `s.glob_match(pattern)` resolves to the
+    /// same slot as the free-call form `glob_match(s, pattern)`.
+    #[test]
+    fn glob_match_method_dispatch_resolves() {
+        let idx = stdlib_function_index("glob_match").expect("glob_match stdlib slot");
+        assert_eq!(
+            stdlib_method_index(IrType::String, "glob_match"),
+            Some(idx)
+        );
+    }
+
+    /// The bundled stdlib count grows by exactly one for the
+    /// `glob_match` addition (was 37 pre-2026-05-21, now 38). Pinning
+    /// the count catches accidental double-registrations.
+    #[test]
+    fn glob_match_extends_bundle_to_38_entries() {
+        assert_eq!(stdlib_function_count(), 38);
     }
 }

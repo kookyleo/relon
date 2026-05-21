@@ -81,6 +81,20 @@ pub(crate) const COMPOSE_LOOKUP_INDEX: u32 = 26;
 /// also returns a packed integer rather than a scratch handle).
 pub(crate) const FULL_CASEFOLD_LOOKUP_INDEX: u32 = 34;
 
+/// Stable slot of the Tier-2 `glob_match(s, pattern) -> Bool` body.
+///
+/// Tree-walker / cranelift / trace-JIT all special-case dispatch
+/// against this constant; the wasm AOT inline path traps because
+/// writing the full Unicode glob algorithm out as IR ops is on the
+/// follow-up roadmap. See `crate::glob::glob_match` for the matcher
+/// itself and `crate::stdlib::defs::glob_match_string` for the
+/// registry entry / body-shape rationale.
+///
+/// Unit-tested by the consistency tests in `super` and (drift-side)
+/// by `relon_trace_recorder::lowering::STDLIB_IDX_GLOB_MATCH` once
+/// the trace recorder gains its own constant.
+pub const GLOB_MATCH_INDEX: u32 = 37;
+
 /// v3++ b-7 reframed: stable slot of the
 /// `__final_sigma_check(s_ptr, byte_offset, cased_addr, ignorable_addr) -> i32`
 /// helper. Returns `1` when `Σ` at `byte_offset` in the input UTF-8

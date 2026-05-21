@@ -22,10 +22,10 @@ use super::case_fold::{
     title_locale_string, title_string, upper_locale_string, upper_string,
 };
 use super::defs::{
-    abs_int, concat_string_string, contains_string, is_empty_string, length_string_to_int,
-    list_bool_length, list_float_length, list_int_filter, list_int_fold, list_int_length_to_int,
-    list_int_map, list_int_max, list_int_sum, list_schema_length, list_string_length, max_int,
-    min_int, starts_with_string, substring_string,
+    abs_int, concat_string_string, contains_string, glob_match_string, is_empty_string,
+    length_string_to_int, list_bool_length, list_float_length, list_int_filter, list_int_fold,
+    list_int_length_to_int, list_int_map, list_int_max, list_int_sum, list_schema_length,
+    list_string_length, max_int, min_int, starts_with_string, substring_string,
 };
 use super::normalization::{
     ccc_lookup_helper, compose_lookup_helper, decomp_lookup_helper, nfc_string, nfd_string,
@@ -172,6 +172,13 @@ pub fn builtin_stdlib() -> &'static [StdlibFunction] {
             // inline lowering for short const needles, so the body cost is
             // only seen on the cold / tree-walk path.
             contains_string(),
+            // 2026-05-21: `glob_match(s, pattern) -> Bool`.
+            // Lives at index 37 (pinned via `GLOB_MATCH_INDEX`). Tier-2
+            // LuaJIT-pattern-subset matcher — see `crate::glob::glob_match`
+            // for the algorithm and `super::defs::glob_match_string` for
+            // the backend-dispatch matrix (tree-walker native impl,
+            // cranelift vtable indirection, wasm body trap).
+            glob_match_string(),
         ]
     })
 }

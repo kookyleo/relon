@@ -89,6 +89,13 @@ pub fn stdlib_method_index(receiver_ty: IrType, name: &str) -> Option<u32> {
         // tree-walk path stays in `Value`-space (see
         // `relon_evaluator::stdlib::call_method`).
         (IrType::String, "contains") => stdlib_function_index("contains"),
+        // 2026-05-21: `s.glob_match(pattern)` and the free-call form
+        // `glob_match(s, pattern)` resolve to the same body. The
+        // matcher itself lives in `crate::glob::glob_match`; the
+        // bundled stdlib slot at index 37 is a routing anchor — see
+        // `super::defs::glob_match_string` for the per-backend
+        // dispatch matrix.
+        (IrType::String, "glob_match") => stdlib_function_index("glob_match"),
         (IrType::ListInt, "sum") => stdlib_function_index("list_int_sum"),
         (IrType::ListInt, "max") => stdlib_function_index("list_int_max"),
         // Phase 10-a higher-order List<Int> methods. Dispatch covers

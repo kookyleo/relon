@@ -933,6 +933,61 @@ pub(super) fn contains_string() -> StdlibFunction {
     )
 }
 
+/// Registry entry for `glob_match(s: String, pattern: String) -> Bool`.
+///
+/// Tier-2 LuaJIT-pattern-subset glob matcher: `*` / `?` / `[set]` /
+/// `[^set]` plus `\`-escapes, anchored on both ends, char-by-char
+/// Unicode, case-sensitive. The matcher itself lives in
+/// [`crate::glob::glob_match`].
+///
+/// ## Why the body traps
+///
+/// The body builder emits a single `Op::Trap` so any backend that
+/// inlines the IR body literally (`wasm` AOT, future bytecode
+/// inliner) fails loudly rather than silently returning `false`. The
+/// production lowering paths route around the trap:
+///
+/// * **Tree-walker** registers its own Rust impl in
+///   `relon-evaluator::stdlib::StringGlobMatch` and never reads the
+///   IR body.
+/// * **Cranelift native codegen** intercepts `Op::Call { fn_index ==
+///   STDLIB_IDX_GLOB_MATCH }` in `emit_call_stdlib` and emits an
+///   indirect call to the `RelonGlobMatch` vtable slot instead of
+///   inlining the body.
+/// * **Bytecode / trace-JIT** treat the call as an opaque stdlib
+///   dispatch — they fall back to the tree-walker bridge until the
+///   inline-lowering follow-up phase lands.
+///
+/// The IR body still occupies a fixed slot (`STDLIB_IDX_GLOB_MATCH =
+/// 37`) so the wire format stays stable: any module compiled against
+/// this build references slot 37, and future bundle reordering would
+/// surface via the `stdlib_index_consistency` drift guard.
+pub(super) fn glob_match_string() -> StdlibFunction {
+    StdlibFunction::new(
+        "glob_match",
+        vec![IrType::String, IrType::String],
+        IrType::Bool,
+        glob_match_string_body,
+    )
+}
+
+fn glob_match_string_body() -> Vec<TaggedOp> {
+    // The body is unreachable on the supported lowering paths (see
+    // the registry doc-comment above for the routing matrix). We
+    // still need to push the declared return type onto the virtual
+    // stack so the wasm verifier / cranelift `emit_body` pre-check
+    // accepts the function shape: `Op::Trap` claims `[] -> [...]`,
+    // which lets us follow it with a sentinel `ConstBool` that's
+    // verifier-visible but dynamically unreachable.
+    vec![
+        tt(Op::Trap {
+            kind: TrapKind::IndexOutOfBounds,
+        }),
+        tt(Op::ConstBool(false)),
+        tt(Op::Return),
+    ]
+}
+
 fn contains_string_body() -> Vec<TaggedOp> {
     const S_LEN: u32 = 0;
     const P_LEN: u32 = 1;
