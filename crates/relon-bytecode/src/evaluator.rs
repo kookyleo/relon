@@ -1,6 +1,6 @@
 //! Public façade implementing [`relon_eval_api::Evaluator`].
 //!
-//! Construction mirrors [`relon_codegen_native::CraneliftAotEvaluator::from_source`]:
+//! Construction mirrors `relon_codegen_native::CraneliftAotEvaluator::from_source`:
 //! parse → analyze → `lower_workspace_single` → bytecode compile.
 //! `run_main` packs the args into virtual local slots, runs the VM,
 //! and unpacks the return slots back into a `Value`. The arena
@@ -68,7 +68,7 @@ pub enum BytecodeError {
 
 /// Bytecode VM evaluator. Built from a Relon source string via
 /// [`Self::from_source`] or directly from an IR module via
-/// [`Self::from_ir`].
+/// [`Self::from_ir_legacy`].
 #[derive(Debug)]
 pub struct BytecodeEvaluator {
     func: BcFunction,
@@ -242,11 +242,11 @@ impl BytecodeEvaluator {
     /// * Pre-dispatch sweep — `BytecodeVm::invoke_from_with_stack`
     ///   consults the gate for every grant-table bit before the first
     ///   op runs; a denial trips
-    ///   [`RuntimeError::WasmCapabilityDenied`] with the failing bit.
+    ///   [`relon_eval_api::RuntimeError::WasmCapabilityDenied`] with the failing bit.
     /// * Trap enrichment — when `BcOp::Trap(CapabilityDenied)` fires
     ///   in a hand-built BcFunction, the VM consults the gate to
     ///   substitute the legacy `u32::MAX` sentinel with the first
-    ///   gate-denied [`CapabilityBit`].
+    ///   gate-denied [`relon_eval_api::CapabilityBit`].
     ///
     /// For the M2-A scaffold envelope (scalar arith / cmp / control
     /// flow only) the standard `from_source` compile pass emits no

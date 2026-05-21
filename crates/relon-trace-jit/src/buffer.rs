@@ -125,7 +125,7 @@ pub struct TraceBuffer {
     /// `TraceOp::DictLookup` / `DictLookupPrechecked`) to the
     /// statically known number of entries in the dict literal.
     ///
-    /// Populated by [`crate::RecorderState::emit_dict_lookup_with_hint`]
+    /// Populated by `relon_trace_recorder::RecorderState::emit_dict_lookup_with_hint`
     /// when the source-level `Op::DictGetByStringKey` carried a
     /// `entry_count_hint`; consumed by the trace-emitter to switch
     /// the `DictLookupPrechecked` lowering from a data-driven scan

@@ -43,8 +43,8 @@
 //!   `BrTable` / out-of-bounds bytecode jumps.
 //! - **trap**: `DivisionByZero`, `NumericOverflow` lift through the
 //!   same `RuntimeError` variants the tree-walker emits.
-//! - **capability**: a [`CapabilityVtable`] indexed by `cap_bit`; an
-//!   absent slot trips [`RuntimeError::WasmCapabilityDenied`] without
+//! - **capability**: a [`vm::CapabilityVtable`] indexed by `cap_bit`; an
+//!   absent slot trips [`relon_eval_api::RuntimeError::WasmCapabilityDenied`] without
 //!   ever calling the host fn. v6-δ M2-A only carries the surface —
 //!   the cranelift-AOT capability vtable is the canonical lookup
 //!   path today, so the VM's vtable starts empty.

@@ -116,7 +116,7 @@ pub(crate) const FINAL_SIGMA_CHECK_INDEX: u32 = 35;
 /// or bytecode-inlining the callee).
 pub struct StdlibFunction {
     /// Surface-level name the lowering pass looks up via
-    /// [`stdlib_function_index`].
+    /// [`crate::stdlib::stdlib_function_index`].
     pub name: &'static str,
     /// Parameter types in declaration order. Each maps to a wasm-
     /// level function-parameter slot consumed via `Op::LocalGet`.

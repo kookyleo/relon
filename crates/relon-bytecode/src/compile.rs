@@ -13,7 +13,7 @@
 //! `params = [I32 in_ptr, I32 in_len, I32 out_ptr, I32 out_cap,
 //! I64 caps]` and the body uses `LoadField { offset }` /
 //! `StoreField { offset }` against the in/out buffers. The bytecode
-//! VM doesn't talk arenas; instead, [`compile_buffer_protocol`]
+//! VM doesn't talk arenas; instead, `compile_buffer_protocol`
 //! synthesises a virtual-local layout where each `#main` parameter
 //! occupies one slot and every `LoadField` / `StoreField` is
 //! rewritten to the matching `LocalGet` / `LocalSet`. The arg
@@ -104,7 +104,7 @@ pub fn compile_function(
 /// rewriting its `LocalGet(N)` references into reads against
 /// fresh scratch slots seeded from the caller's stack. This is the
 /// classic "tree-shake by inlining" approach — bounded in
-/// per-function expansion by [`MAX_INLINE_OPS`] so a maliciously
+/// per-function expansion by `MAX_INLINE_OPS` so a maliciously
 /// deep call chain can't blow the compile pass.
 ///
 /// Callers without a module (legacy-i64 direct-IR tests) pass an

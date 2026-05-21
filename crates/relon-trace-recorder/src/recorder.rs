@@ -323,7 +323,7 @@ impl RecorderState {
 
     /// F-D7-D: record a const-byte side-table entry for `var`. The
     /// trace emitter's `emit_str_contains` consults
-    /// [`TraceBuffer::const_bytes_for`] to decide between the F-D7-C
+    /// [`relon_trace_jit::OptimizedTrace::const_bytes_for`] to decide between the F-D7-C
     /// inline byte-scan lowering and the extern `__relon_str_contains`
     /// shim — pre-filling the side table from a const-needle observed
     /// at recording time keeps the trace on the inline fast path.
@@ -462,7 +462,7 @@ impl RecorderState {
     /// Used by an AST-level / IR-walking driver that has recognised the
     /// `String + String` shape directly (the parser/IR lowering pipeline
     /// does not yet produce `Op::Add(IrType::String)` for real source —
-    /// see the comment near [`crate::lowering::lower_str_add`]). Both
+    /// see the comment near `crate::lowering::lower_str_add`). Both
     /// operand SSAs must already be bound in the recorder's tables.
     ///
     /// Recorder state side-effects:
@@ -506,7 +506,7 @@ impl RecorderState {
     /// `s.contains(needle)` and (when `needle` is a literal string node)
     /// passes `needle_bytes = Some(literal_bytes)`. The recorder
     /// forwards the bytes into the buffer's `const_bytes` side table —
-    /// the same table [`relon_trace_emitter::emit_str_contains_inline`]
+    /// the same table `relon_trace_emitter::emit_str_contains_inline`
     /// consults at lowering time. Variable-length needles still call
     /// through the extern shim.
     ///
@@ -578,7 +578,7 @@ impl RecorderState {
     ///   in the buffer's type_info table so the emitter's guard
     ///   predicate builder can resolve `TypeCheck(phi, ty)`.
     /// - Appends one `TraceOp::MarkLoopHead { loop_id, phis }` op.
-    /// - Pushes the loop_id onto the [`Self::open_loops`] stack so the
+    /// - Pushes the loop_id onto the `open_loops` stack so the
     ///   matching `end_loop` stamps the correct id.
     /// - Bumps `loop_depth` so the diagnostic counter mirrors nesting
     ///   (the historical depth gauge still works).

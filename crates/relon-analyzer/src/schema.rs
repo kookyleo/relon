@@ -199,7 +199,7 @@ pub struct BaseRef {
 ///
 /// v1.6 piggyback: same walk also enforces the "no `Any` in user code"
 /// policy on schema field types. The recursive
-/// [`crate::ban_unsafe_types::scan_typenode_for_any`] helper covers nested generics
+/// `crate::ban_unsafe_types::scan_typenode_for_any` helper covers nested generics
 /// like `List<Any>` / `Dict<String, Any>` — those used to be a sneaky
 /// way to launder `Any` past the surface check.
 pub fn check_schema_field_types(tree: &mut AnalyzedTree) {

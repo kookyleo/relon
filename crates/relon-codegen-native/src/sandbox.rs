@@ -9,7 +9,7 @@
 //!    `icmp_ult` comparison against the linear-memory byte length.
 //!    The fault path branches to a dedicated trap stub that converts
 //!    to [`RuntimeError::WasmIndexOutOfBounds`] before unwinding back
-//!    to the host through [`SandboxState::call_with_sandbox`].
+//!    to the host through the JIT entry's `catch_unwind` boundary.
 //!
 //! 2. **Trap handler** — the JIT-compiled entry runs inside
 //!    `std::panic::catch_unwind` so divide-by-zero / bounds / cap /
@@ -127,7 +127,7 @@ impl SandboxConfig {
 /// Trap kind raised by a guard inside cranelift-emitted code. Values
 /// match the numeric `code` parameter of cranelift's `trap` /
 /// `trapnz` instructions emitted by the lowering pass, so the trap
-/// handler in [`SandboxState::call_with_sandbox`] can decode the
+/// handler at the JIT entry's `catch_unwind` boundary can decode the
 /// cause from the `Trap` payload alone.
 ///
 /// Encoded as `u8` so it fits the cranelift `TrapCode::User` slot
@@ -289,7 +289,7 @@ impl CapabilityVtable {
 /// its first parameter.
 ///
 /// Field ordering is part of the cranelift ABI: do not reorder
-/// without updating the [`STATE_OFFSET_*`] constants in this module —
+/// without updating the `STATE_OFFSET_*` constants in this module —
 /// the codegen pass reads each field via `load.<ty>` against the
 /// state pointer using these offsets.
 ///
@@ -376,37 +376,37 @@ pub struct SandboxState {
     pub(crate) entry_range: Cell<TokenRange>,
 }
 
-/// Byte offset of [`SandboxState::deadline_ns`] inside the
+/// Byte offset of `SandboxState::deadline_ns` inside the
 /// `#[repr(C)]` layout. Cranelift's resource-check sequence reads at
 /// this offset; mirrored here as a const so both the codegen and the
 /// runtime stay in sync.
 pub const STATE_OFFSET_DEADLINE_NS: i32 = 0;
-/// Byte offset of [`SandboxState::trap_code`]. Not currently read
+/// Byte offset of `SandboxState::trap_code`. Not currently read
 /// from cranelift IR (the trap path uses the `raise_trap` host helper
 /// indirectly) but documented for completeness.
 #[allow(dead_code)]
 pub const STATE_OFFSET_TRAP_CODE: i32 = 8;
-/// Byte offset of [`SandboxState::arena_base`]. Cranelift code emits
+/// Byte offset of `SandboxState::arena_base`. Cranelift code emits
 /// `load.<pointer_ty>` at this offset to materialise the arena base
 /// before computing absolute field addresses.
 pub const STATE_OFFSET_ARENA_BASE: i32 = 16;
-/// Byte offset of [`SandboxState::arena_len`]. Codegen consults this
+/// Byte offset of `SandboxState::arena_len`. Codegen consults this
 /// for the per-load / per-store bounds check.
 pub const STATE_OFFSET_ARENA_LEN: i32 = 24;
-/// Byte offset of [`SandboxState::tail_cursor`]. Codegen reads /
+/// Byte offset of `SandboxState::tail_cursor`. Codegen reads /
 /// writes this from `Op::AllocSubRecord` / `Op::EmitTailRecord*` to
 /// bump-allocate inside the output buffer's tail region.
 pub const STATE_OFFSET_TAIL_CURSOR: i32 = 28;
-/// Byte offset of [`SandboxState::scratch_cursor`]. Codegen uses this
+/// Byte offset of `SandboxState::scratch_cursor`. Codegen uses this
 /// for the `Op::AllocScratch` / `Op::AllocScratchDyn` bump path the
 /// memory stdlib (`concat` / `substring` / …) relies on.
 pub const STATE_OFFSET_SCRATCH_CURSOR: i32 = 32;
-/// Byte offset of [`SandboxState::scratch_base`]. The arena-relative
+/// Byte offset of `SandboxState::scratch_base`. The arena-relative
 /// start of the scratch region; the cranelift bump-allocator returns
 /// `scratch_base + scratch_cursor` as the i32 pointer the stdlib body
 /// then dereferences via `LoadI32AtAbsolute` / `MemcpyAtAbsolute` etc.
 pub const STATE_OFFSET_SCRATCH_BASE: i32 = 36;
-/// Byte offset of [`SandboxState::closure_table_base`]. The host
+/// Byte offset of `SandboxState::closure_table_base`. The host
 /// installs the per-module closure fn pointer table here after JIT
 /// finalize; cranelift `Op::CallClosure` reads through this address
 /// `+ sizeof(usize) * fn_table_idx` to materialise the lambda's host

@@ -304,7 +304,7 @@ impl ResolverChainLoader {
     /// Trusted posture: `std/*` + trusted filesystem fallback +
     /// the `RemoteHttpResolver` for `https://` (and, by default, *not*
     /// `http://`) URLs. Any host change to this chain has to mirror
-    /// the `Context` assembly in [`evaluate_source`].
+    /// the `Context` assembly in `evaluate_source`.
     ///
     /// On `wasm32-unknown-unknown` the remote resolver is unavailable
     /// (no sockets / TLS); the chain falls back to `std/*` + trusted

@@ -209,7 +209,7 @@ pub enum BcTrapKind {
 /// Recipe describing how to materialise a single operand-stack slot
 /// at resume time. The bytecode compiler emits a recipe per stack
 /// slot at each bytecode index; the
-/// [`crate::evaluator::BytecodeEvaluator::resume_from_pc`] consults
+/// `crate::evaluator::BytecodeEvaluator::resume_from_pc` consults
 /// the recipe array for the target `bc_idx` to rebuild the operand
 /// stack before continuing dispatch.
 ///

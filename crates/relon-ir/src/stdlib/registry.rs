@@ -66,7 +66,7 @@ use super::signatures::StdlibFunction;
 ///   * `19` — `list_schema_length(List<Schema>) -> Int` (Phase 10-c).
 ///   * `20` — `__casefold_lookup(cp: I32, table_addr: I32) -> I32`
 ///     (v3+ a-4 internal helper; binary-searches the simple Unicode
-///     case-folding table — see [`casefold_lookup_helper`] for the
+///     case-folding table — see `casefold_lookup_helper` for the
 ///     body. Not surfaced through `stdlib_method_index`; only
 ///     reachable as a `Op::Call` target from the rewritten
 ///     `upper` / `lower` bodies).

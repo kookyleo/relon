@@ -34,7 +34,7 @@
 //! row bumps `sample_size`), not the per-iteration distribution: each
 //! sample averages over `iters[i]` invocations, so single-invocation
 //! tail outliers are already smeared by criterion's sampler. For tail
-//! events that recur every K invocations (K ≪ iters[i]) the sample
+//! events that recur every K invocations (K ≪ `iters[i]`) the sample
 //! mean is still pushed up though, so `max`/`p99` is meaningful.
 //!
 //! For per-iteration tail latency (where a single deopt event in a
@@ -133,7 +133,7 @@ impl RowStats {
         })
     }
 
-    /// Same as [`from_sample_json`] but also reads `benchmark.json`
+    /// Same as [`Self::from_sample_json`] but also reads `benchmark.json`
     /// (a sibling file in the same `new/` directory) so the per-row
     /// `Throughput::Elements(N)` is captured. Use this for the canonical
     /// path; `from_sample_json` is the building block.

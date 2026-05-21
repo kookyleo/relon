@@ -80,7 +80,7 @@ pub struct SchemaCacheEntry {
     pub entry_range: SerTokenRange,
 }
 
-/// Serializable mirror of [`crate::codegen::EntryShape`]. Kept in
+/// Serializable mirror of `crate::codegen::EntryShape`. Kept in
 /// sync with the codegen-side enum; an incompatible variant change
 /// is gated by [`SCHEMA_CACHE_VERSION`].
 #[repr(u8)]

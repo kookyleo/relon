@@ -387,7 +387,7 @@ pub struct LoweredEntry {
 ///    definitions without breaking canonical-hash determinism.
 /// 3. Rejects the workspace when more than one reachable module
 ///    carries a `#main` directive (`LoweringError::MultipleMainDirectives`).
-/// 4. Builds a multi-tree [`SchemaResolver`] so the entry's
+/// 4. Builds a multi-tree `SchemaResolver` so the entry's
 ///    parameter / body lowering walks see every reachable schema
 ///    declaration.
 /// 5. Delegates to the existing entry-body lowering against the

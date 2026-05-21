@@ -1,7 +1,7 @@
 //! Capability mirrors used by the analyzer's static reachability check.
 //!
 //! These types intentionally duplicate the shape of
-//! [`relon_evaluator::eval::Capabilities`] / `NativeFnGate` rather than
+//! `relon_evaluator::eval::Capabilities` / `NativeFnGate` rather than
 //! depending on the evaluator crate. The analyzer sits *below* the
 //! evaluator in the dependency graph (the evaluator pulls the analyzer's
 //! workspace tree at startup); reaching into the evaluator from here

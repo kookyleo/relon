@@ -21,7 +21,7 @@
 //! ## Layout contract
 //!
 //! The flat list record is byte-identical to the one
-//! [`relon_ir::Op::ConstListInt`] / [`relon_ir::Op::LoadListIntPtr`]
+//! `relon_ir::Op::ConstListInt` / `relon_ir::Op::LoadListIntPtr`
 //! produce in the cranelift-AOT backend's data section:
 //!
 //! ```text
@@ -61,7 +61,7 @@
 
 use crate::runtime::TraceContext;
 
-/// Sentinel returned by [`relon_trace_list_get`] / [`relon_trace_dict_lookup`]
+/// Sentinel returned by [`__relon_trace_list_get`] / [`__relon_trace_dict_lookup`]
 /// on out-of-range index / IC shape mismatch. The cranelift emitter
 /// compares against this value and branches into the shared deopt
 /// block when the helper signals failure.

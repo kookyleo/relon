@@ -3,7 +3,7 @@
 //! [`smallest_node_at`] walks the AST and returns the deepest node whose
 //! range covers a given byte offset — used by every feature handler to
 //! answer "what is the user pointing at?". Position translation lives
-//! one module up in [`crate::position`].
+//! one module up in `crate::position`.
 
 use relon_parser::{
     CallArg, Decorator, Directive, DirectiveBody, Expr, FStringPart, Node, TokenKey, TokenRange,
