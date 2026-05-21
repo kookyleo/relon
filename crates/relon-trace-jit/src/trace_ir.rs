@@ -200,6 +200,25 @@ pub enum TraceOp {
     /// Effect: `Pure`.
     StrSubstring(SsaVar, SsaVar, SsaVar, SsaVar),
 
+    /// `dst = StrGlobMatch(s, pattern) -> i32 (0/1)` — typed as
+    /// `i32` so callers can branch on the result with the existing
+    /// `Cmp` / `Guard` machinery. The emitter lowers this to
+    /// `call __relon_str_glob_match(s, pattern)`; the helper runs
+    /// the shared `relon_ir::glob::glob_match` matcher (Tier-2
+    /// LuaJIT-pattern-subset glob: `*` / `?` / `[set]` / `[^set]`
+    /// plus `\`-escapes, anchored on both ends, Unicode).
+    ///
+    /// 2026-05-21: glob_match's algorithm is intentionally NOT
+    /// IR-inlined — the matcher is ~150 LoC with backtracking, and
+    /// inlining it would balloon the trace body well past the
+    /// per-iter cost budget. The helper-call path lands the trace-
+    /// JIT in parity with the cranelift backend (which also routes
+    /// through a host helper via `RelonGlobMatch` vtable slot)
+    /// without the IR-inline complexity.
+    ///
+    /// Effect: `Pure`.
+    StrGlobMatch(SsaVar, SsaVar, SsaVar),
+
     /// Return from the trace.
     Return(SsaVar),
 
@@ -416,6 +435,7 @@ impl TraceOp {
             | TraceOp::StrContains(_, _, _)
             | TraceOp::StrFind(_, _, _)
             | TraceOp::StrSubstring(_, _, _, _)
+            | TraceOp::StrGlobMatch(_, _, _)
             // F-D8-E.2: `DictShapeGuard` is a guard-like op — it
             // reads the dict header's first 8 bytes (immutable for
             // the trace's lifetime) and only deopts on mismatch. No
@@ -456,7 +476,8 @@ impl TraceOp {
             | TraceOp::StrConcat(dst, _, _)
             | TraceOp::StrContains(dst, _, _)
             | TraceOp::StrFind(dst, _, _)
-            | TraceOp::StrSubstring(dst, _, _, _) => Some(*dst),
+            | TraceOp::StrSubstring(dst, _, _, _)
+            | TraceOp::StrGlobMatch(dst, _, _) => Some(*dst),
 
             TraceOp::ListGet { dst, .. }
             | TraceOp::DictLookup { dst, .. }
@@ -494,7 +515,8 @@ impl TraceOp {
             TraceOp::Call(_, _, args, _) => args.clone(),
             TraceOp::StrConcat(_, a, b)
             | TraceOp::StrContains(_, a, b)
-            | TraceOp::StrFind(_, a, b) => vec![*a, *b],
+            | TraceOp::StrFind(_, a, b)
+            | TraceOp::StrGlobMatch(_, a, b) => vec![*a, *b],
             TraceOp::StrSubstring(_, s, start, len) => vec![*s, *start, *len],
             TraceOp::ListGet { list_ptr, idx, .. } => vec![*list_ptr, *idx],
             TraceOp::DictLookup {
@@ -601,6 +623,20 @@ mod tests {
         let cst = TraceOp::ConstI64(SsaVar(0), 42);
         assert_eq!(cst.output(), Some(SsaVar(0)));
         assert!(cst.inputs().is_empty());
+    }
+
+    /// 2026-05-21: `StrGlobMatch` mirrors `StrContains` shape — pure,
+    /// produces one i32 SSA, consumes (haystack, pattern). Pin the
+    /// taxonomy so a future reordering of the enum doesn't silently
+    /// drop the glob op out of the pure-op fast path the optimizer
+    /// hoists across loop bodies.
+    #[test]
+    fn str_glob_match_is_pure_with_two_inputs() {
+        let op = TraceOp::StrGlobMatch(SsaVar(3), SsaVar(1), SsaVar(2));
+        assert_eq!(op.effect_class(), EffectClass::Pure);
+        assert_eq!(op.output(), Some(SsaVar(3)));
+        assert_eq!(op.inputs(), vec![SsaVar(1), SsaVar(2)]);
+        assert!(!op.is_guard());
     }
 
     #[test]

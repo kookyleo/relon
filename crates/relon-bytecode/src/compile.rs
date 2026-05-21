@@ -440,7 +440,7 @@ impl<'a> CompileState<'a> {
                 self.next_snapshot_idx += 1;
                 self.current_stack.push(StackOrigin::Snapshot(snap_idx));
             }
-            BcOp::StrConcat | BcOp::StrEq => {
+            BcOp::StrConcat | BcOp::StrEq | BcOp::StrGlobMatch => {
                 self.current_stack.pop();
                 self.current_stack.pop();
                 let snap_idx = self.next_snapshot_idx;
@@ -548,6 +548,17 @@ impl<'a> CompileState<'a> {
         arg_count: u32,
         call_pc: ExternalPc,
     ) -> Result<(), BcCompileError> {
+        // 2026-05-21: Tier-2 glob_match short-circuit. The bundled
+        // stdlib slot at `GLOB_MATCH_INDEX` carries a sentinel `Trap`
+        // body (see `relon_ir::stdlib::defs::glob_match_string`);
+        // walking it via the inliner would emit `BcOp::Trap` and never
+        // produce a match. Route the call onto the dedicated
+        // `BcOp::StrGlobMatch` dispatch instead so the VM defers to
+        // `relon_ir::glob::glob_match` with the live string handles.
+        if fn_index == relon_ir::GLOB_MATCH_INDEX && arg_count == 2 {
+            self.emit_with_effect(BcOp::StrGlobMatch, call_pc);
+            return Ok(());
+        }
         if self.inline_depth >= MAX_INLINE_DEPTH {
             return Err(BcCompileError::UnsupportedOp(format!(
                 "inline depth exceeded {} for fn_index {}",

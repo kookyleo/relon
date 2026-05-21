@@ -573,6 +573,20 @@ pub const STDLIB_IDX_SUBSTRING: u32 = 9;
 /// [`STDLIB_IDX_SUBSTRING`], which are already-registered slots.
 pub const STDLIB_IDX_CONTAINS: u32 = 36;
 
+/// 2026-05-21: stdlib slot for `glob_match(s, pattern) -> Bool`. Pinned
+/// to the same constant the IR side exports via
+/// [`relon_ir::GLOB_MATCH_INDEX`]; the drift guard below cross-checks
+/// the two against [`relon_ir::stdlib_function_index`] on every test
+/// run so the recorder fast path stays aligned with the bundle order.
+///
+/// The recorder routes this slot onto [`TraceOp::StrGlobMatch`] —
+/// dedicated extern call rather than the generic `TraceOp::Call`, so
+/// the optimiser sees the op as `Pure` (loop-invariant `glob_match(s,
+/// pat)` with the same operands hoists out of inner loops) and the
+/// emitter wires the call directly to the `__relon_str_glob_match`
+/// helper without a `resolve_call` round trip.
+pub const STDLIB_IDX_GLOB_MATCH: u32 = 37;
+
 fn lower_string_call(fn_index: u32, cx: &OpLoweringContext<'_>) -> Option<LowerOutcome> {
     match fn_index {
         STDLIB_IDX_CONCAT => {
@@ -652,6 +666,33 @@ fn lower_string_call(fn_index: u32, cx: &OpLoweringContext<'_>) -> Option<LowerO
                 op: TraceOp::StrContains(cx.fresh_dst, haystack, needle),
                 dst: Some(cx.fresh_dst),
                 guards_before: vec![GuardKind::NotNull(haystack)],
+                guards_after: vec![],
+                effect: TraceEffect::Pure,
+            })
+        }
+        // 2026-05-21 Tier-2: `glob_match(s, pattern) -> Bool` short-
+        // circuits onto `TraceOp::StrGlobMatch`. Operand-stack order
+        // at call time: `[..., s, pattern]` (pattern pushed last so it
+        // lands in `inputs[0]`). Mirrors the `STDLIB_IDX_CONTAINS` arm
+        // — the haystack is the receiver, the pattern follows, both
+        // share the `Pure` effect class.
+        STDLIB_IDX_GLOB_MATCH => {
+            if cx.inputs.len() < 2 {
+                return Some(LowerOutcome::Abort(AbortReason::UnsupportedOp(
+                    "StrGlobMatchUnderflow",
+                )));
+            }
+            let pattern = cx.inputs[0];
+            let s = cx.inputs[1];
+            Some(LowerOutcome::Emit {
+                op: TraceOp::StrGlobMatch(cx.fresh_dst, s, pattern),
+                dst: Some(cx.fresh_dst),
+                // Guard the haystack against null so the trace deopts
+                // cleanly rather than letting the helper return 0 on a
+                // stale arena reference. Pattern null-ness is rarer in
+                // recorded surfaces; we leave it to the helper's own
+                // null check (matches `StrContains`'s asymmetry).
+                guards_before: vec![GuardKind::NotNull(s)],
                 guards_after: vec![],
                 effect: TraceEffect::Pure,
             })
@@ -799,6 +840,7 @@ mod tests {
             ("concat", STDLIB_IDX_CONCAT),
             ("substring", STDLIB_IDX_SUBSTRING),
             ("contains", STDLIB_IDX_CONTAINS),
+            ("glob_match", STDLIB_IDX_GLOB_MATCH),
         ] {
             match relon_ir::stdlib::stdlib_function_index(name) {
                 None => {
@@ -1161,6 +1203,72 @@ mod tests {
         assert!(matches!(
             outcome,
             LowerOutcome::Abort(AbortReason::UnsupportedOp("StrSubstringUnderflow"))
+        ));
+    }
+
+    /// 2026-05-21 Tier-2: `Op::Call { fn_index = STDLIB_IDX_GLOB_MATCH }`
+    /// short-circuits onto `TraceOp::StrGlobMatch`. Operand layout
+    /// mirrors `STDLIB_IDX_CONTAINS`: pattern is on top of the stack
+    /// (inputs[0]) and the haystack is just below (inputs[1]). A
+    /// NotNull guard on the haystack only — pattern null is handled by
+    /// the helper itself, same asymmetry `StrContains` uses.
+    #[test]
+    fn glob_match_stdlib_index_emits_str_glob_match() {
+        let inputs = [SsaVar(30), SsaVar(20)]; // pattern=30 (top), s=20
+        let outcome = lower_op(
+            &Op::Call {
+                fn_index: STDLIB_IDX_GLOB_MATCH,
+                arg_count: 2,
+                param_tys: vec![IrType::String, IrType::String],
+                ret_ty: IrType::Bool,
+            },
+            cx_with(&inputs, SsaVar(88)),
+        );
+        match outcome {
+            LowerOutcome::Emit {
+                op,
+                dst: Some(d),
+                guards_before,
+                effect,
+                ..
+            } => {
+                assert_eq!(d, SsaVar(88));
+                assert_eq!(effect, TraceEffect::Pure);
+                match op {
+                    TraceOp::StrGlobMatch(_, s, pat) => {
+                        assert_eq!(s, SsaVar(20));
+                        assert_eq!(pat, SsaVar(30));
+                    }
+                    other => panic!("expected StrGlobMatch, got {:?}", other),
+                }
+                assert!(
+                    matches!(guards_before.as_slice(), [GuardKind::NotNull(_)]),
+                    "expected one NotNull guard on the haystack, got {:?}",
+                    guards_before
+                );
+            }
+            other => panic!("expected Emit, got {:?}", other),
+        }
+    }
+
+    /// Underflow guard: too few inputs aborts cleanly under the
+    /// `StrGlobMatchUnderflow` label so the recorder logs surface the
+    /// failure mode the same way the sibling stdlib short-circuits do.
+    #[test]
+    fn glob_match_underflow_aborts() {
+        let inputs = [SsaVar(10)];
+        let outcome = lower_op(
+            &Op::Call {
+                fn_index: STDLIB_IDX_GLOB_MATCH,
+                arg_count: 2,
+                param_tys: vec![IrType::String, IrType::String],
+                ret_ty: IrType::Bool,
+            },
+            cx_with(&inputs, SsaVar(88)),
+        );
+        assert!(matches!(
+            outcome,
+            LowerOutcome::Abort(AbortReason::UnsupportedOp("StrGlobMatchUnderflow"))
         ));
     }
 

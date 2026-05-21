@@ -68,6 +68,15 @@ pub struct HostHookFuncIds {
     pub str_contains: u32,
     pub str_find: u32,
     pub str_substring: u32,
+    /// 2026-05-21: cranelift `FuncId.as_u32()` for the Tier-2
+    /// `__relon_str_glob_match` helper. `None` keeps the trace emitter
+    /// off the `TraceOp::StrGlobMatch` lowering — hosts that don't
+    /// declare the helper will surface `EmitError::HostHookNotDeclared(
+    /// HostHookId::StrGlobMatch)` if a recorded trace tries to emit
+    /// the op. Hosts wired against the historical (pre-Tier-2) ABI keep
+    /// working because the recorder lowering only emits `StrGlobMatch`
+    /// when the underlying program reaches `glob_match(s, pat)`.
+    pub str_glob_match: Option<u32>,
     /// F-D7-I: cranelift `FuncId.as_u32()` for
     /// `__relon_str_concat_alloc`. `None` means the host did not
     /// declare the helper — the emitter's inline `StrConcat` path will
@@ -109,6 +118,12 @@ impl Default for HostHookFuncIds {
             str_contains: 4,
             str_find: 5,
             str_substring: 6,
+            // 2026-05-21: `__relon_str_glob_match` is opt-in. Tests that
+            // never feed a `TraceOp::StrGlobMatch` through the emitter
+            // keep the historical 7-slot layout; the recorder only
+            // produces the op when the underlying program reaches
+            // `glob_match(s, pat)`.
+            str_glob_match: None,
             // F-D7-I helper is opt-in: tests that don't drive the host
             // module path keep the inline `StrConcat` lowering disabled
             // (the emitter falls back to the extern `__relon_str_concat`
@@ -287,6 +302,22 @@ impl TraceEmitter {
             hook_func_ids.str_substring,
         );
 
+        // 2026-05-21: Tier-2 `__relon_str_glob_match(s, pattern) -> i32`.
+        // Declared only when the host wired the FuncId — same opt-in
+        // contract as the F-D7-I alloc helper and the F-D8 dict/list
+        // hooks so existing fixtures keep working without forcing the
+        // helper symbol on every trace JIT module.
+        let str_glob_match = hook_func_ids.str_glob_match.map(|fid| {
+            declare_host_hook(
+                builder.func,
+                HostHookId::StrGlobMatch,
+                &[pointer_ty, pointer_ty],
+                &[I32],
+                pointer_ty,
+                fid,
+            )
+        });
+
         // F-D7-I: optional alloc helper for the inline `StrConcat`
         // short-rhs lowering. Declared only when the host wired the
         // FuncId; absence keeps `emit_str_concat` on the extern shim.
@@ -367,6 +398,7 @@ impl TraceEmitter {
             str_contains,
             str_find,
             str_substring,
+            str_glob_match,
             list_get,
             dict_lookup,
             dict_lookup_prechecked,
@@ -441,6 +473,13 @@ struct TraceEmitterState<'a, 'b> {
     str_contains: ir::FuncRef,
     str_find: ir::FuncRef,
     str_substring: ir::FuncRef,
+    /// 2026-05-21: optional `__relon_str_glob_match` FuncRef. `None`
+    /// means the host did not declare the helper; a
+    /// `TraceOp::StrGlobMatch` then surfaces
+    /// `EmitError::HostHookNotDeclared(StrGlobMatch)` so the trace
+    /// install path can abort cleanly rather than emit a call to an
+    /// unresolved symbol.
+    str_glob_match: Option<ir::FuncRef>,
     /// F-D8: optional `__relon_trace_list_get` FuncRef. `None` means
     /// the host did not declare the helper — `TraceOp::ListGet` emits
     /// will surface `EmitError::HostHookNotDeclared`.
@@ -570,6 +609,7 @@ impl<'a, 'b> TraceEmitterState<'a, 'b> {
             TraceOp::StrSubstring(dst, s, start, len) => {
                 self.emit_str_substring(*dst, *s, *start, *len)
             }
+            TraceOp::StrGlobMatch(dst, s, pattern) => self.emit_str_glob_match(*dst, *s, *pattern),
             // F-D8 -----------------------------------------------------
             TraceOp::ListGet { dst, list_ptr, idx } => self.emit_list_get(*dst, *list_ptr, *idx),
             TraceOp::DictLookup {
@@ -1145,6 +1185,36 @@ impl<'a, 'b> TraceEmitterState<'a, 'b> {
         let va = self.widen_to_i64(va);
         let vb = self.widen_to_i64(vb);
         let inst = self.builder.ins().call(self.str_find, &[va, vb]);
+        let r = self.builder.inst_results(inst)[0];
+        self.bind(dst, r);
+        Ok(())
+    }
+
+    /// 2026-05-21 Tier-2 `StrGlobMatch(dst, s, pattern)` lowers to a
+    /// direct `call __relon_str_glob_match(s, pattern) -> i32`. No
+    /// inline fast path: the matcher itself is ~150 LoC with
+    /// backtracking, and inlining it would bloat the trace body well
+    /// past the per-iter cost budget. The recorder also keeps the call
+    /// off the const-bytes side table since the pattern is rarely a
+    /// short ASCII literal in the surfaces this op targets.
+    ///
+    /// Returns a 0/1 `i32` packed into the i32 SSA slot — same shape
+    /// `StrContains` uses so downstream `Cmp` / `Guard(NotNull(dst))`
+    /// ops see uniform width.
+    fn emit_str_glob_match(
+        &mut self,
+        dst: SsaVar,
+        s: SsaVar,
+        pattern: SsaVar,
+    ) -> Result<(), EmitError> {
+        let helper = self
+            .str_glob_match
+            .ok_or(EmitError::HostHookNotDeclared(HostHookId::StrGlobMatch))?;
+        let vs = self.lookup(s)?;
+        let vp = self.lookup(pattern)?;
+        let vs = self.widen_to_i64(vs);
+        let vp = self.widen_to_i64(vp);
+        let inst = self.builder.ins().call(helper, &[vs, vp]);
         let r = self.builder.inst_results(inst)[0];
         self.bind(dst, r);
         Ok(())

@@ -837,6 +837,24 @@ impl TraceJitState {
                 &str_concat_alloc_sig,
             )
             .map_err(|e| TraceJitError::Module(format!("declare str_concat_alloc: {e}")))?;
+        // 2026-05-21 Tier-2: pre-declare `__relon_str_glob_match` so
+        // recorded traces that hit `glob_match(s, pat)` link cleanly.
+        // Same `(ptr, ptr) -> i32` signature shape as
+        // `__relon_str_contains`; the symbol resolves to the body in
+        // `crate::trace_glob_helper`. `Linkage::Import` rationale
+        // mirrors the rest of this block — `register_trace_runtime_symbols`
+        // registers the symbol before finalisation.
+        let str_glob_match_sig = build_host_helper_signature(
+            &[pointer_ty, pointer_ty],
+            &[cranelift_codegen::ir::types::I32],
+        );
+        let str_glob_match_id = module
+            .declare_function(
+                relon_trace_emitter::HostHookId::StrGlobMatch.symbol(),
+                Linkage::Import,
+                &str_glob_match_sig,
+            )
+            .map_err(|e| TraceJitError::Module(format!("declare str_glob_match: {e}")))?;
         // F-D8: pre-declare the dict/list helpers so traces emitted
         // with `TraceOp::ListGet` / `TraceOp::DictLookup` link
         // cleanly. Same Linkage::Import rationale as save_deopt /
@@ -899,6 +917,7 @@ impl TraceJitState {
             str_find: str_find_id.as_u32(),
             str_substring: str_substring_id.as_u32(),
             str_concat_alloc: Some(str_concat_alloc_id.as_u32()),
+            str_glob_match: Some(str_glob_match_id.as_u32()),
             list_get: Some(list_get_id.as_u32()),
             dict_lookup: Some(dict_lookup_id.as_u32()),
             dict_lookup_prechecked: Some(dict_lookup_prechecked_id.as_u32()),
@@ -1303,6 +1322,14 @@ pub fn register_trace_runtime_symbols(builder: &mut JITBuilder) {
     builder.symbol(
         relon_trace_emitter::HostHookId::StrConcatAlloc.symbol(),
         relon_trace_jit::runtime::__relon_str_concat_alloc as *const u8,
+    );
+    // 2026-05-21 Tier-2: glob_match helper. Body lives in
+    // `crate::trace_glob_helper` so the trace JIT runtime crate stays
+    // free of a `relon-ir` dependency; the symbol still resolves via
+    // the same JITBuilder symbol table the other str_* shims use.
+    builder.symbol(
+        relon_trace_emitter::HostHookId::StrGlobMatch.symbol(),
+        crate::trace_glob_helper::__relon_str_glob_match as *const u8,
     );
     // F-D8: dict/list helpers. Symbol resolution happens via
     // `JITBuilder::symbol`; the cranelift emitter's

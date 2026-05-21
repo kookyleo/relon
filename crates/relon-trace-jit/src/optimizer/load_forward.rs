@@ -213,7 +213,8 @@ fn rewrite_inputs(op: &mut TraceOp, alias: &HashMap<SsaVar, SsaVar>) -> usize {
         // the forwarded source if the underlying load was DCE-d.
         TraceOp::StrConcat(_dst, a, b)
         | TraceOp::StrContains(_dst, a, b)
-        | TraceOp::StrFind(_dst, a, b) => {
+        | TraceOp::StrFind(_dst, a, b)
+        | TraceOp::StrGlobMatch(_dst, a, b) => {
             swap!(a);
             swap!(b);
         }

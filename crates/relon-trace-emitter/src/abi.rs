@@ -146,7 +146,8 @@ pub fn host_hook_slot_offset(hook: HostHookId) -> i32 {
         | HostHookId::StrConcatAlloc
         | HostHookId::StrContains
         | HostHookId::StrFind
-        | HostHookId::StrSubstring => {
+        | HostHookId::StrSubstring
+        | HostHookId::StrGlobMatch => {
             panic!("host_hook_slot_offset called for F-D7 str hook {:?}; str hooks do not sit in HostHookTable", hook)
         }
         // F-D8 hooks are dispatched via direct symbol resolution, not
@@ -206,6 +207,12 @@ pub enum HostHookId {
     StrFind,
     /// F-D7: `__relon_str_substring(*const u8, usize, i64, i64, *mut StrRet)`.
     StrSubstring,
+    /// 2026-05-21: `__relon_str_glob_match(*const StringRef, *const StringRef) -> i32`.
+    /// Tier-2 glob_match dispatch — same pointer-payload contract as
+    /// the F-D7 string shims; the helper body itself lives in
+    /// `relon-codegen-native` so the JIT runtime crate doesn't pick up
+    /// a `relon-ir` dependency just to surface the matcher.
+    StrGlobMatch,
     /// F-D8: `__relon_trace_list_get(list_ptr: *const u8, idx: i64,
     /// ctx: *mut TraceContext) -> i64`. Bounds-checked indexed access
     /// into a `[len: u32 LE][pad: u32][i64 elements...]` record. On
@@ -245,6 +252,7 @@ impl HostHookId {
             HostHookId::StrContains => "__relon_str_contains",
             HostHookId::StrFind => "__relon_str_find",
             HostHookId::StrSubstring => "__relon_str_substring",
+            HostHookId::StrGlobMatch => "__relon_str_glob_match",
             HostHookId::ListGet => "__relon_trace_list_get",
             HostHookId::DictLookup => "__relon_trace_dict_lookup",
             HostHookId::DictLookupPrechecked => "__relon_trace_dict_lookup_prechecked",

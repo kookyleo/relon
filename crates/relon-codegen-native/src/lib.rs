@@ -79,6 +79,7 @@ pub mod glob_helper;
 pub mod object_cache_integration;
 pub mod sandbox;
 pub mod schema_cache;
+pub mod trace_glob_helper;
 pub mod trace_ic;
 pub mod trace_inline;
 pub mod trace_install;
