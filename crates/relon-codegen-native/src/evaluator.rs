@@ -1105,8 +1105,17 @@ impl CraneliftAotEvaluator {
     /// still surface a typed error rather than aborting the test
     /// process.
     fn invoke_legacy_entry(&self, args: [i64; 4]) -> Result<i64, RuntimeError> {
-        crate::trap_handler::reset_thread_signal_slot();
-        self.sandbox_state.reset_trap();
+        // 2026-05-21 dispatch-boundary lever (c): lazy trap-code reset.
+        // Debug builds keep the eager pre-invoke reset so a stale code
+        // from a previous panicking test can't leak across runs; release
+        // builds skip both resets because `dispatch_post_unshielded`
+        // owns the cleanup (only stores back when the slot was found
+        // non-zero, see `take_trap_code` and `take_signal_slot`).
+        #[cfg(debug_assertions)]
+        {
+            crate::trap_handler::reset_thread_signal_slot();
+            self.sandbox_state.reset_trap();
+        }
         let state_ptr: *const SandboxState = Arc::as_ptr(&self.sandbox_state);
         let entry = match self.entry_fn {
             EntryPtr::Legacy(f) => f,
@@ -1175,8 +1184,16 @@ impl CraneliftAotEvaluator {
         // evaluator construction (`from_ir_inner`); it stays live for
         // the host's lifetime, so the hot dispatch path doesn't pay a
         // `Once::call_once` atomic-load probe per invocation.
-        crate::trap_handler::reset_thread_signal_slot();
-        self.sandbox_state.reset_trap();
+        //
+        // 2026-05-21 dispatch-boundary lever (c): lazy trap-code reset.
+        // See `invoke_legacy_entry` for the rationale; release builds
+        // skip both resets and let `dispatch_post_unshielded` own the
+        // cleanup.
+        #[cfg(debug_assertions)]
+        {
+            crate::trap_handler::reset_thread_signal_slot();
+            self.sandbox_state.reset_trap();
+        }
         // SAFETY: `arena` is borrowed mutably here and stays valid
         // through the JIT call's lifetime (`arena` outlives this
         // function); the JIT side reads / writes through the pointer
@@ -1238,15 +1255,24 @@ impl CraneliftAotEvaluator {
     /// consult the thread-local signal slot and the sandbox-state
     /// `trap_code` so hardware traps and JIT-side `cond_trap`s surface
     /// as typed errors.
+    ///
+    /// 2026-05-21 lever (c): owns the lazy-reset side of the lazy
+    /// trap-code protocol. Uses `take_trap_code` (load-then-store-iff-
+    /// nonzero) and only resets the thread-local signal slot when a
+    /// signal actually fired, so the success path is two predictable-
+    /// not-taken branches with no atomic stores.
     #[cfg(not(debug_assertions))]
     fn dispatch_post_unshielded<T>(&self, value: T) -> Result<T, RuntimeError> {
         let signal_code = crate::trap_handler::read_thread_signal_slot();
         if signal_code != 0 {
+            // Reset the slot eagerly so the next dispatch doesn't pick
+            // up a stale signal code.
+            crate::trap_handler::reset_thread_signal_slot();
             if let Some(kind) = crate::trap_handler::signal_to_trap_kind(signal_code) {
                 return Err(kind.to_runtime_error(self.entry_range));
             }
         }
-        let code = self.sandbox_state.trap_code();
+        let code = self.sandbox_state.take_trap_code();
         if code != 0 {
             return Err(TrapKind::from_code(code as u8).to_runtime_error(self.entry_range));
         }
