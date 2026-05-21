@@ -301,7 +301,8 @@ impl<'a, 'b> InlineEmitterState<'a, 'b> {
             TraceOp::StrConcat(_, _, _)
             | TraceOp::StrContains(_, _, _)
             | TraceOp::StrFind(_, _, _)
-            | TraceOp::StrSubstring(_, _, _, _) => Err(InlineEmitError::CallNotSupportedInInline),
+            | TraceOp::StrSubstring(_, _, _, _)
+            | TraceOp::StrGlobMatch(_, _, _) => Err(InlineEmitError::CallNotSupportedInInline),
             // F-D8: inline emit doesn't yet thread the dict/list host
             // helpers through the surrounding host-fn cranelift module
             // (same reason `TraceOp::Call` returns `CallNotSupported`).

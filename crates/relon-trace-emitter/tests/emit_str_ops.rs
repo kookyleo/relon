@@ -34,6 +34,72 @@ fn str_concat_emits_call() {
     );
 }
 
+/// 2026-05-21: `TraceOp::StrGlobMatch` lowers to a direct
+/// `call __relon_str_glob_match` against the FuncId the host wires
+/// up via `HostHookFuncIds::str_glob_match`. Without that wiring the
+/// emit surfaces `EmitError::HostHookNotDeclared(StrGlobMatch)`; the
+/// happy-path test below uses an explicit `emit_with_hooks` invocation
+/// that sets `str_glob_match: Some(...)` so we exercise the real
+/// lowering rather than the missing-helper guard.
+#[test]
+fn str_glob_match_surfaces_missing_helper_error_under_default_hooks() {
+    let mut b = TraceBuffer::new();
+    let s = b.fresh_ssa();
+    let p = b.fresh_ssa();
+    let dst = b.fresh_ssa();
+    b.append(TraceOp::ConstI64(s, 0x5000));
+    b.append(TraceOp::ConstI64(p, 0x6000));
+    b.append(TraceOp::StrGlobMatch(dst, s, p));
+    b.append(TraceOp::Return(dst));
+    let mut ctx = cranelift_codegen::Context::new();
+    let err = relon_trace_emitter::TraceEmitter::emit(&b.into_optimized(), &mut ctx)
+        .expect_err("StrGlobMatch with default hooks must report missing helper");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("StrGlobMatch"),
+        "missing-helper error must mention StrGlobMatch, got: {msg}"
+    );
+}
+
+#[test]
+fn str_glob_match_emits_call_when_helper_declared() {
+    use relon_trace_emitter::HostHookFuncIds;
+    let mut b = TraceBuffer::new();
+    let s = b.fresh_ssa();
+    let p = b.fresh_ssa();
+    let dst = b.fresh_ssa();
+    b.append(TraceOp::ConstI64(s, 0x5000));
+    b.append(TraceOp::ConstI64(p, 0x6000));
+    b.append(TraceOp::StrGlobMatch(dst, s, p));
+    b.append(TraceOp::Return(dst));
+
+    // Park the helper FuncId past every default slot so it doesn't
+    // collide with another import. The emitter uses the integer as
+    // `UserExternalName.index`; the standalone tests don't link the
+    // real symbol, the IR-level verification just confirms the call
+    // shape.
+    let hooks = HostHookFuncIds {
+        str_glob_match: Some(20),
+        ..HostHookFuncIds::default()
+    };
+    let mut ctx = cranelift_codegen::Context::new();
+    relon_trace_emitter::TraceEmitter::emit_with_hooks(
+        &b.into_optimized(),
+        &mut ctx,
+        cranelift_codegen::ir::types::I64,
+        hooks,
+    )
+    .expect("emit succeeds when str_glob_match is declared");
+    let flags = cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
+    cranelift_codegen::verifier::verify_function(&ctx.func, &flags)
+        .expect("verifier accepts the StrGlobMatch lowering");
+    let ir = format!("{}", ctx.func);
+    assert!(
+        ir.contains("call fn"),
+        "expected `call` in emitted IR for StrGlobMatch:\n{ir}"
+    );
+}
+
 #[test]
 fn str_contains_emits_call() {
     let mut b = TraceBuffer::new();
