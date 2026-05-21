@@ -140,6 +140,7 @@ fn sandbox_capability_denied_via_trap_op() {
         string_pool: Vec::new(),
         stack_recipe: vec![vec![], vec![]],
         fn_id: None,
+        closure_bodies: Vec::new(),
     };
     let cfg = BcVmConfig {
         cap_vtable: CapabilityVtable::default(),
@@ -393,6 +394,7 @@ fn capability_gate_denial_surfaces_as_error_on_pre_dispatch_sweep() {
         string_pool: Vec::new(),
         stack_recipe: vec![vec![], vec![]],
         fn_id: None,
+        closure_bodies: Vec::new(),
     };
 
     let mut vtable = CapabilityVtable::default();
@@ -433,6 +435,7 @@ fn capability_gate_grant_passes_pre_dispatch_sweep() {
         string_pool: Vec::new(),
         stack_recipe: vec![vec![], vec![]],
         fn_id: None,
+        closure_bodies: Vec::new(),
     };
 
     let mut vtable = CapabilityVtable::default();
@@ -473,6 +476,7 @@ fn capability_trap_enrichment_uses_gate_bit_when_installed() {
         string_pool: Vec::new(),
         stack_recipe: vec![vec![], vec![]],
         fn_id: None,
+        closure_bodies: Vec::new(),
     };
 
     // Baseline: no gate, sentinel preserved.
@@ -520,6 +524,7 @@ fn capability_gate_denial_lifts_to_runtime_error() {
         string_pool: Vec::new(),
         stack_recipe: vec![vec![], vec![]],
         fn_id: None,
+        closure_bodies: Vec::new(),
     };
 
     let mut vtable = CapabilityVtable::default();
@@ -569,6 +574,7 @@ fn call_native_denied_by_gate_traps_with_declared_bit() {
         string_pool: Vec::new(),
         stack_recipe: vec![vec![], vec![]],
         fn_id: None,
+        closure_bodies: Vec::new(),
     };
 
     // Variant A: gate installed, denies everything.
@@ -627,6 +633,7 @@ fn call_native_passes_gate_but_traps_native_not_implemented() {
         string_pool: Vec::new(),
         stack_recipe: vec![vec![], vec![], vec![], vec![]],
         fn_id: None,
+        closure_bodies: Vec::new(),
     };
 
     let mut vtable = CapabilityVtable::default();
@@ -673,6 +680,7 @@ fn call_native_no_capability_bit_skips_gate_consult() {
         string_pool: Vec::new(),
         stack_recipe: vec![vec![], vec![]],
         fn_id: None,
+        closure_bodies: Vec::new(),
     };
 
     let gate_concrete = Arc::new(CountingGate::deny_all());
@@ -717,6 +725,7 @@ fn check_cap_traps_when_bit_denied() {
         string_pool: Vec::new(),
         stack_recipe: vec![vec![], vec![], vec![]],
         fn_id: None,
+        closure_bodies: Vec::new(),
     };
     let mut vtable = CapabilityVtable::default();
     let gate: Arc<dyn relon_eval_api::CapabilityGate> = Arc::new(CountingGate::deny_all());
@@ -759,6 +768,7 @@ fn check_cap_no_capability_bit_is_noop() {
             vec![relon_bytecode::op::StackOrigin::Const(42)],
         ],
         fn_id: None,
+        closure_bodies: Vec::new(),
     };
     let vm = BytecodeVm::new(BcVmConfig::default());
     let outcome = vm.invoke(&bc, &[]);
@@ -786,6 +796,7 @@ fn call_stdlib_scalar_int_abs() {
         string_pool: Vec::new(),
         stack_recipe: vec![vec![], vec![], vec![]],
         fn_id: None,
+        closure_bodies: Vec::new(),
     };
     let vm = BytecodeVm::new(BcVmConfig::default());
     let outcome = vm.invoke(&bc, &[]);
@@ -812,6 +823,7 @@ fn call_stdlib_scalar_int_min_max() {
         string_pool: Vec::new(),
         stack_recipe: vec![vec![], vec![], vec![], vec![]],
         fn_id: None,
+        closure_bodies: Vec::new(),
     };
     let vm = BytecodeVm::new(BcVmConfig::default());
     assert_eq!(vm.invoke(&bc_min, &[]).value, Some(3));
@@ -831,6 +843,7 @@ fn call_stdlib_scalar_int_min_max() {
         string_pool: Vec::new(),
         stack_recipe: vec![vec![], vec![], vec![], vec![]],
         fn_id: None,
+        closure_bodies: Vec::new(),
     };
     assert_eq!(vm.invoke(&bc_max, &[]).value, Some(7));
 }
@@ -851,6 +864,7 @@ fn list_len_witness_passes_length_through() {
         string_pool: Vec::new(),
         stack_recipe: vec![vec![], vec![], vec![]],
         fn_id: None,
+        closure_bodies: Vec::new(),
     };
     let vm = BytecodeVm::new(BcVmConfig::default());
     let outcome = vm.invoke(&bc, &[]);
@@ -923,6 +937,7 @@ fn call_native_registry_dispatches_scalar_sum() {
         string_pool: Vec::new(),
         stack_recipe: vec![vec![], vec![], vec![], vec![]],
         fn_id: None,
+        closure_bodies: Vec::new(),
     };
 
     let mut vtable = CapabilityVtable::default();
@@ -972,6 +987,7 @@ fn call_native_registry_gate_denial_skips_host_fn() {
         string_pool: Vec::new(),
         stack_recipe: vec![vec![], vec![]],
         fn_id: None,
+        closure_bodies: Vec::new(),
     };
 
     let mut vtable = CapabilityVtable::default();
@@ -1021,6 +1037,7 @@ fn call_native_unregistered_slot_keeps_native_not_implemented_fallback() {
         string_pool: Vec::new(),
         stack_recipe: vec![vec![], vec![]],
         fn_id: None,
+        closure_bodies: Vec::new(),
     };
     // Empty registry — no host fn registered for any slot.
     let vm = BytecodeVm::new(BcVmConfig::default());
@@ -1065,6 +1082,7 @@ fn call_native_registry_bool_return_round_trips() {
         string_pool: Vec::new(),
         stack_recipe: vec![vec![], vec![]],
         fn_id: None,
+        closure_bodies: Vec::new(),
     };
     let mut vtable = CapabilityVtable::default();
     let native: Arc<dyn relon_eval_api::RelonFunction> = Arc::new(AlwaysTrue);
@@ -1115,6 +1133,7 @@ fn call_native_host_fn_failure_lifts_to_unsupported() {
         string_pool: Vec::new(),
         stack_recipe: vec![vec![], vec![]],
         fn_id: None,
+        closure_bodies: Vec::new(),
     };
     let mut vtable = CapabilityVtable::default();
     let native: Arc<dyn relon_eval_api::RelonFunction> = Arc::new(AlwaysFail);
@@ -1191,6 +1210,7 @@ fn call_native_registry_arg_order_matches_declaration() {
         string_pool: Vec::new(),
         stack_recipe: vec![vec![], vec![], vec![], vec![], vec![]],
         fn_id: None,
+        closure_bodies: Vec::new(),
     };
     let mut vtable = CapabilityVtable::default();
     let native: Arc<dyn relon_eval_api::RelonFunction> = Arc::new(OrderProbe);
@@ -1241,6 +1261,7 @@ fn call_native_registry_unsupported_return_type_traps() {
         string_pool: Vec::new(),
         stack_recipe: vec![vec![], vec![]],
         fn_id: None,
+        closure_bodies: Vec::new(),
     };
     let mut vtable = CapabilityVtable::default();
     let native: Arc<dyn relon_eval_api::RelonFunction> = Arc::new(StringReturner);
@@ -1298,6 +1319,7 @@ fn call_native_string_return_lifts_into_arena() {
         string_pool: Vec::new(),
         stack_recipe: vec![vec![]; 3],
         fn_id: None,
+        closure_bodies: Vec::new(),
     };
     let mut vtable = CapabilityVtable::default();
     let native: Arc<dyn relon_eval_api::RelonFunction> = Arc::new(StrReturner);
@@ -1356,6 +1378,7 @@ fn call_native_list_int_return_lifts_into_arena() {
         string_pool: Vec::new(),
         stack_recipe: vec![vec![]; 4],
         fn_id: None,
+        closure_bodies: Vec::new(),
     };
     let mut vtable = CapabilityVtable::default();
     let native: Arc<dyn relon_eval_api::RelonFunction> = Arc::new(ListReturner);
@@ -1411,6 +1434,7 @@ fn call_native_list_int_rejects_heterogeneous() {
         string_pool: Vec::new(),
         stack_recipe: vec![vec![]; 2],
         fn_id: None,
+        closure_bodies: Vec::new(),
     };
     let mut vtable = CapabilityVtable::default();
     let native: Arc<dyn relon_eval_api::RelonFunction> = Arc::new(MixedReturner);
@@ -1454,6 +1478,7 @@ fn call_native_lifts_to_unsupported_runtime_error() {
         string_pool: Vec::new(),
         stack_recipe: vec![vec![], vec![]],
         fn_id: None,
+        closure_bodies: Vec::new(),
     };
     let vm = BytecodeVm::new(BcVmConfig::default());
     let outcome = vm.invoke(&bc, &[]);
@@ -1494,6 +1519,7 @@ fn make_list_and_get_int_round_trip() {
         string_pool: Vec::new(),
         stack_recipe: vec![vec![], vec![], vec![], vec![], vec![], vec![], vec![]],
         fn_id: None,
+        closure_bodies: Vec::new(),
     };
     let vm = BytecodeVm::new(BcVmConfig::default());
     let outcome = vm.invoke(&bc, &[]);
@@ -1522,6 +1548,7 @@ fn list_get_int_first_last_and_empty() {
         string_pool: Vec::new(),
         stack_recipe: vec![vec![]; 6],
         fn_id: None,
+        closure_bodies: Vec::new(),
     };
     let vm = BytecodeVm::new(BcVmConfig::default());
     assert_eq!(vm.invoke(&bc_first, &[]).value, Some(7));
@@ -1541,6 +1568,7 @@ fn list_get_int_first_last_and_empty() {
         string_pool: Vec::new(),
         stack_recipe: vec![vec![]; 6],
         fn_id: None,
+        closure_bodies: Vec::new(),
     };
     assert_eq!(vm.invoke(&bc_last, &[]).value, Some(8));
 
@@ -1557,6 +1585,7 @@ fn list_get_int_first_last_and_empty() {
         string_pool: Vec::new(),
         stack_recipe: vec![vec![]; 4],
         fn_id: None,
+        closure_bodies: Vec::new(),
     };
     let outcome = vm.invoke(&bc_empty, &[]);
     let err = outcome.error.expect("empty-list index must trap");
@@ -1586,6 +1615,7 @@ fn list_get_int_out_of_range_traps() {
         string_pool: Vec::new(),
         stack_recipe: vec![vec![]; 6],
         fn_id: None,
+        closure_bodies: Vec::new(),
     };
     let vm = BytecodeVm::new(BcVmConfig::default());
 
@@ -1639,6 +1669,7 @@ fn multiple_make_lists_mint_distinct_handles() {
         string_pool: Vec::new(),
         stack_recipe: vec![vec![]; 15],
         fn_id: None,
+        closure_bodies: Vec::new(),
     };
     let vm = BytecodeVm::new(BcVmConfig::default());
     let outcome = vm.invoke(&bc, &[]);
@@ -1664,6 +1695,7 @@ fn make_list_stack_underflow_traps() {
         string_pool: Vec::new(),
         stack_recipe: vec![vec![]; 3],
         fn_id: None,
+        closure_bodies: Vec::new(),
     };
     let vm = BytecodeVm::new(BcVmConfig::default());
     let outcome = vm.invoke(&bc, &[]);
@@ -1696,6 +1728,7 @@ fn make_list_preserves_declaration_order() {
         string_pool: Vec::new(),
         stack_recipe: vec![vec![]; 7],
         fn_id: None,
+        closure_bodies: Vec::new(),
     };
     let vm = BytecodeVm::new(BcVmConfig::default());
     assert_eq!(vm.invoke(&bc, &[]).value, Some(5));
@@ -1722,6 +1755,7 @@ fn arena_is_reset_between_invocations() {
         string_pool: Vec::new(),
         stack_recipe: vec![vec![]; 5],
         fn_id: None,
+        closure_bodies: Vec::new(),
     };
     let vm = BytecodeVm::new(BcVmConfig::default());
     let a = vm.invoke(&bc, &[]);
@@ -1756,6 +1790,7 @@ fn list_push_extends_single_owner_in_place() {
         string_pool: Vec::new(),
         stack_recipe: vec![vec![]; 8],
         fn_id: None,
+        closure_bodies: Vec::new(),
     };
     let vm = BytecodeVm::new(BcVmConfig::default());
     let outcome = vm.invoke(&bc, &[]);
@@ -1802,6 +1837,7 @@ fn list_push_clones_on_shared_handle() {
         string_pool: Vec::new(),
         stack_recipe: vec![vec![]; 18],
         fn_id: None,
+        closure_bodies: Vec::new(),
     };
     let vm = BytecodeVm::new(BcVmConfig::default());
     let outcome = vm.invoke(&bc, &[]);
@@ -1824,6 +1860,7 @@ fn str_const_and_str_len_round_trip() {
         string_pool: vec!["héllo".to_string()],
         stack_recipe: vec![vec![]; 3],
         fn_id: None,
+        closure_bodies: Vec::new(),
     };
     let vm = BytecodeVm::new(BcVmConfig::default());
     let outcome = vm.invoke(&bc, &[]);
@@ -1851,6 +1888,7 @@ fn str_concat_produces_combined_length() {
         string_pool: vec!["foo".to_string(), "bar".to_string()],
         stack_recipe: vec![vec![]; 5],
         fn_id: None,
+        closure_bodies: Vec::new(),
     };
     let vm = BytecodeVm::new(BcVmConfig::default());
     let outcome = vm.invoke(&bc, &[]);
@@ -1876,6 +1914,7 @@ fn str_eq_byte_compare() {
         string_pool: vec!["hi".to_string()],
         stack_recipe: vec![vec![]; 4],
         fn_id: None,
+        closure_bodies: Vec::new(),
     };
     let vm = BytecodeVm::new(BcVmConfig::default());
     assert_eq!(vm.invoke(&bc_eq, &[]).value, Some(1));
@@ -1892,6 +1931,7 @@ fn str_eq_byte_compare() {
         string_pool: vec!["hi".to_string(), "lo".to_string()],
         stack_recipe: vec![vec![]; 4],
         fn_id: None,
+        closure_bodies: Vec::new(),
     };
     assert_eq!(vm.invoke(&bc_ne, &[]).value, Some(0));
 }
@@ -1928,6 +1968,7 @@ fn make_dict_and_lookup_str_round_trip() {
         string_pool: vec!["a".to_string(), "b".to_string()],
         stack_recipe: vec![vec![]; 14],
         fn_id: None,
+        closure_bodies: Vec::new(),
     };
     let vm = BytecodeVm::new(BcVmConfig::default());
     let outcome = vm.invoke(&bc, &[]);
@@ -1959,6 +2000,7 @@ fn dict_lookup_miss_traps_index_out_of_bounds() {
         string_pool: vec!["a".to_string(), "missing".to_string()],
         stack_recipe: vec![vec![]; 6],
         fn_id: None,
+        closure_bodies: Vec::new(),
     };
     let vm = BytecodeVm::new(BcVmConfig::default());
     let outcome = vm.invoke(&bc, &[]);
@@ -1992,6 +2034,7 @@ fn dict_lookup_last_write_wins_on_duplicate_key() {
         string_pool: vec!["k".to_string()],
         stack_recipe: vec![vec![]; 8],
         fn_id: None,
+        closure_bodies: Vec::new(),
     };
     let vm = BytecodeVm::new(BcVmConfig::default());
     let outcome = vm.invoke(&bc, &[]);
@@ -2013,6 +2056,7 @@ fn str_const_out_of_pool_traps() {
         string_pool: vec!["only-slot".to_string()],
         stack_recipe: vec![vec![]; 2],
         fn_id: None,
+        closure_bodies: Vec::new(),
     };
     let vm = BytecodeVm::new(BcVmConfig::default());
     let outcome = vm.invoke(&bc, &[]);
@@ -2065,6 +2109,7 @@ fn call_native_inline_cache_dispatches_hot_loop_cleanly() {
         string_pool: Vec::new(),
         stack_recipe: vec![vec![]; 8],
         fn_id: None,
+        closure_bodies: Vec::new(),
     };
 
     let mut vtable = CapabilityVtable::default();
@@ -2126,6 +2171,7 @@ fn call_native_inline_cache_polymorphic_resolves_correctly() {
         string_pool: Vec::new(),
         stack_recipe: vec![vec![]; 8],
         fn_id: None,
+        closure_bodies: Vec::new(),
     };
 
     let mut vtable = CapabilityVtable::default();
@@ -2172,6 +2218,7 @@ fn call_native_inline_cache_resets_between_invokes() {
         string_pool: Vec::new(),
         stack_recipe: vec![vec![]; 4],
         fn_id: None,
+        closure_bodies: Vec::new(),
     };
 
     let mut vtable = CapabilityVtable::default();

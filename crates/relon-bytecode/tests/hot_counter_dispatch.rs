@@ -54,6 +54,7 @@ fn make_id_function(fn_id: u32) -> BcFunction {
         stack_recipe: vec![vec![], vec![]],
         string_pool: Vec::new(),
         fn_id: Some(fn_id),
+        closure_bodies: Vec::new(),
     }
 }
 
@@ -67,6 +68,7 @@ fn make_id_function_no_id() -> BcFunction {
         stack_recipe: vec![vec![], vec![]],
         string_pool: Vec::new(),
         fn_id: None,
+        closure_bodies: Vec::new(),
     }
 }
 
@@ -246,6 +248,7 @@ fn args_passed_to_trigger_match_invoke_call() {
         stack_recipe: vec![vec![], vec![], vec![], vec![]],
         string_pool: Vec::new(),
         fn_id: Some(7),
+        closure_bodies: Vec::new(),
     };
     let out = vm.invoke(&func, &[10, 32]);
     assert_eq!(out.value, Some(42));

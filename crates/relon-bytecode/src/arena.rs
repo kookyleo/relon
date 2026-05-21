@@ -93,6 +93,34 @@ type StringSlot = Arc<str>;
 /// the storage shape if benchmarks show lookup cost dominating.
 type DictSlot = Arc<Vec<(Arc<str>, u64)>>;
 
+/// M3 closure slot: a (body, captures) pair allocated by
+/// [`crate::op::BcOp::MakeClosure`] and consumed by
+/// [`crate::op::BcOp::CallClosure`]. `body_idx` indexes into the
+/// enclosing `BcFunction::closure_bodies` slice (the lambda body the
+/// compile pass already lowered); `captures` carries the upvalues
+/// the closure construction site popped off the operand stack, in
+/// declaration order.
+///
+/// The slot lives behind an `Arc<ClosureSlot>` so cheap clone via
+/// refcount bump is the common pattern (a closure handle threaded
+/// through multiple ops without being mutated). The dispatch path
+/// reads `captures[idx]` via [`crate::op::BcOp::CaptureGet`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClosureSlot {
+    /// Index into the enclosing `BcFunction::closure_bodies` slice.
+    /// Carried verbatim from the `BcOp::MakeClosure { body_idx, .. }`
+    /// emit; the call-site looks the body up at dispatch time.
+    pub body_idx: u32,
+    /// Captured values laid out in declaration order. Read by the
+    /// closure body via `BcOp::CaptureGet { idx }`. The values travel
+    /// through the same `u64` lane the rest of the dispatch loop uses
+    /// — int / bool / f64-via-bits / list+string+dict handles all
+    /// share the slot shape.
+    pub captures: Vec<u64>,
+}
+
+type ClosureSlotRef = Arc<ClosureSlot>;
+
 /// Arena-side error envelope. The dispatch loop lifts these into the
 /// matching [`crate::vm::BcVmError`] variant — `OutOfRange` becomes
 /// `IndexOutOfBounds`; the others stay arena-side because they
@@ -306,6 +334,45 @@ impl DictArena {
     }
 }
 
+/// Per-VM arena holding [`ClosureSlot`]-shaped closure handles. The
+/// arena is monotonic (no slot reuse) — closures are dropped en masse
+/// when the enclosing `BcRunOutcome` falls out of scope.
+///
+/// The bytecode VM keeps the slot behind an `Arc` so re-pushing a
+/// closure handle (one operand stack popped, copied through control
+/// flow, then re-pushed) is a refcount bump rather than a deep clone.
+#[derive(Debug, Default, Clone)]
+pub struct ClosureArena {
+    slots: Vec<ClosureSlotRef>,
+}
+
+impl ClosureArena {
+    /// Allocate a fresh closure slot. Returns the handle the operand
+    /// stack should carry to reach this slot.
+    pub fn alloc(&mut self, body_idx: u32, captures: Vec<u64>) -> Handle {
+        let handle = self.slots.len() as Handle;
+        self.slots
+            .push(Arc::new(ClosureSlot { body_idx, captures }));
+        handle
+    }
+
+    /// Read a closure slot. Returns a borrowed `Arc<ClosureSlot>` so
+    /// the caller pays refcount cost only on `clone()`.
+    pub fn get(&self, handle: Handle) -> Result<&ClosureSlotRef, ArenaError> {
+        let len = self.slots.len();
+        self.slots
+            .get(handle as usize)
+            .ok_or(ArenaError::OutOfRange { handle, len })
+    }
+
+    /// Total number of allocated closure slots. Used by the
+    /// instrumentation tests to assert the arena resets between
+    /// invocations.
+    pub fn slot_count(&self) -> usize {
+        self.slots.len()
+    }
+}
+
 /// Composite VM-side memory state. Bundled in one struct so the
 /// dispatch loop borrows the arenas mutably as a unit — partial
 /// borrows of the three would force every BcOp arm that touches more
@@ -319,14 +386,19 @@ pub struct VmMemory {
     pub strings: StringArena,
     /// Dict arena — phase 4b-continuation.
     pub dicts: DictArena,
+    /// Closure arena — M3.
+    pub closures: ClosureArena,
 }
 
 impl VmMemory {
-    /// Total handle count across the three arenas. Used by the
+    /// Total handle count across the four arenas. Used by the
     /// instrumentation tests to assert the arenas are reset between
     /// invocations.
     pub fn total_slot_count(&self) -> usize {
-        self.lists.slot_count() + self.strings.slot_count() + self.dicts.slot_count()
+        self.lists.slot_count()
+            + self.strings.slot_count()
+            + self.dicts.slot_count()
+            + self.closures.slot_count()
     }
 }
 
@@ -397,7 +469,31 @@ mod tests {
         mem.lists.alloc(vec![3]);
         mem.strings.alloc("x");
         mem.dicts.alloc(vec![]);
-        assert_eq!(mem.total_slot_count(), 4);
+        mem.closures.alloc(0, vec![1, 2, 3]);
+        assert_eq!(mem.total_slot_count(), 5);
+    }
+
+    #[test]
+    fn closure_arena_alloc_get_round_trip() {
+        let mut arena = ClosureArena::default();
+        let h0 = arena.alloc(0, vec![]);
+        let h1 = arena.alloc(7, vec![100, 200, 300]);
+        assert_eq!(h0, 0);
+        assert_eq!(h1, 1);
+        assert_eq!(arena.slot_count(), 2);
+        let slot0 = arena.get(h0).unwrap();
+        assert_eq!(slot0.body_idx, 0);
+        assert!(slot0.captures.is_empty());
+        let slot1 = arena.get(h1).unwrap();
+        assert_eq!(slot1.body_idx, 7);
+        assert_eq!(slot1.captures, vec![100, 200, 300]);
+    }
+
+    #[test]
+    fn closure_arena_out_of_range_handle_trips() {
+        let arena = ClosureArena::default();
+        let err = arena.get(0).unwrap_err();
+        assert!(matches!(err, ArenaError::OutOfRange { handle: 0, len: 0 }));
     }
 
     /// `push_cow` mutates in place when the slot's `Arc` has one

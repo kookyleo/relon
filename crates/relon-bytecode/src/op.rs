@@ -250,6 +250,65 @@ pub enum BcOp {
     /// keeps the storage as a `Vec<(Arc<str>, u64)>` so the scan cost
     /// stays linear; richer storage shapes are deferred to phase 4c.
     DictLookupStr,
+
+    /// M3 closure construction. Pops `capture_count` operands in
+    /// declaration order (top-of-stack is the last capture), allocates
+    /// a fresh closure slot in the VM's [`crate::arena::ClosureArena`]
+    /// carrying the supplied `body_idx` (an index into the enclosing
+    /// `BcFunction::closure_bodies` slice), and pushes the resulting
+    /// handle. Stack effect: `[c_0, c_1, ..., c_{n-1}] -> [closure_handle]`.
+    ///
+    /// `body_idx` is resolved against the closure_bodies on the function
+    /// that emitted the op. Cross-function closures are out of scope
+    /// for M3 — each lambda is compiled as a sub-body of its enclosing
+    /// `BcFunction`, mirroring the wasm-AOT design where the IR-level
+    /// `Op::MakeClosure { fn_table_idx }` keys into the per-module
+    /// funcref table. The bytecode VM compresses that into a
+    /// per-function index because the bytecode crate has no module
+    /// surface yet.
+    MakeClosure {
+        /// Index into the enclosing `BcFunction::closure_bodies` slice
+        /// of the lambda body. The dispatch path looks the body up at
+        /// call time via the parent function passed to `dispatch_one`.
+        body_idx: u32,
+        /// Number of operands the op pops to populate the captures
+        /// vector. Must match the count of `BcOp::CaptureGet { idx }`
+        /// references inside the lambda body; mismatches surface as
+        /// out-of-range captures access at dispatch time.
+        capture_count: u32,
+    },
+
+    /// M3 closure invocation. Pops `argc` arguments (top-of-stack is
+    /// the last argument) then the closure handle, looks up the
+    /// closure slot in the VM's [`crate::arena::ClosureArena`], and
+    /// recursively dispatches the closure body. The popped args are
+    /// laid out into `locals[0..argc]` of the inner invocation frame;
+    /// the captures travel through a per-frame slot the dispatch loop
+    /// consults via [`BcOp::CaptureGet`].
+    ///
+    /// Stack effect: `[closure_handle, a_0, ..., a_{argc-1}] -> [ret]`.
+    /// The closure body must end with `BcOp::Return` (returning a
+    /// single value); the popped return value is what the call site
+    /// observes on its operand stack.
+    CallClosure {
+        /// Number of user-visible arguments the op pops. The argument
+        /// slot count is independent of the capture count — captures
+        /// live in the closure handle, not on the operand stack at the
+        /// call site.
+        argc: u32,
+    },
+
+    /// M3 closure capture access. Push the value at `idx` of the
+    /// currently-executing closure's `captures` vector. Stack effect:
+    /// `[] -> [capture_value]`. Out-of-range / outside-a-closure-body
+    /// use trips [`crate::vm::BcVmError::StackUnderflow`] (compiler
+    /// bug — the lowering pass should only emit `CaptureGet` inside a
+    /// closure body and only against indices the matching `MakeClosure`
+    /// reserved).
+    CaptureGet {
+        /// Index into the active closure slot's `captures` vector.
+        idx: u32,
+    },
 }
 
 /// M2-B phase 3: scalar-pure stdlib handlers the bytecode VM can
@@ -385,6 +444,21 @@ pub struct BcFunction {
     /// the integer; it just hands it back to the
     /// [`crate::vm::HotTraceTrigger`] hook on threshold crossing.
     pub fn_id: Option<u32>,
+    /// M3 closure bodies: pre-compiled lambda bodies the parent
+    /// function references by index. `BcOp::MakeClosure { body_idx, .. }`
+    /// keys into this slice; the dispatch path resolves the body at
+    /// call time and recursively re-enters the VM dispatch loop against
+    /// it.
+    ///
+    /// Stored as `Vec<BcFunction>` (not `Vec<Arc<BcFunction>>`) because
+    /// the parent function already lives behind a hot-path pointer
+    /// (`&BcFunction` flows through `BytecodeVm::dispatch_one`); the
+    /// closure body's `Vec<BcOp>` indirection is the dispatch-cost slot
+    /// that matters, and `Vec<BcFunction>` keeps the bodies contiguous
+    /// in memory so the `body_idx` indexed read stays cache-friendly.
+    /// Empty on every function that doesn't introduce lambdas — the
+    /// historical M2-A scaffold path observes no behaviour change.
+    pub closure_bodies: Vec<BcFunction>,
 }
 
 impl Default for BcFunction {
@@ -401,6 +475,7 @@ impl Default for BcFunction {
             stack_recipe: Vec::new(),
             string_pool: Vec::new(),
             fn_id: None,
+            closure_bodies: Vec::new(),
         }
     }
 }
