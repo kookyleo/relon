@@ -71,7 +71,10 @@ pub const SMOL_STR_INLINE_CAP: usize = 22;
 pub enum SmolStr {
     /// Inline payload. `len` is the active prefix length of `data`;
     /// bytes past `len` are zeroed at construction.
-    Inline { len: u8, data: [u8; SMOL_STR_INLINE_CAP] },
+    Inline {
+        len: u8,
+        data: [u8; SMOL_STR_INLINE_CAP],
+    },
     /// Heap payload. `Arc<str>` shares the bytes across clones; the
     /// `NonNull` pointer inside the `Arc` provides the niche the enum
     /// discriminant rides on.
@@ -129,8 +132,13 @@ impl SmolStr {
 
     /// Build a `SmolStr` from any `&str`. ≤ [`SMOL_STR_INLINE_CAP`]
     /// bytes land inline; longer payloads allocate one `Arc<str>`.
+    ///
+    /// Named `from_borrowed` to avoid shadowing the `FromStr` trait
+    /// method (clippy::should_implement_trait); the trait impl below
+    /// forwards to this helper so `"x".parse::<SmolStr>()` keeps
+    /// working too.
     #[inline]
-    pub fn from_str(s: &str) -> Self {
+    pub fn from_borrowed(s: &str) -> Self {
         let bytes = s.as_bytes();
         if bytes.len() <= SMOL_STR_INLINE_CAP {
             let mut data = [0u8; SMOL_STR_INLINE_CAP];
@@ -152,7 +160,7 @@ impl SmolStr {
     pub fn from_string(s: String) -> Self {
         if s.len() <= SMOL_STR_INLINE_CAP {
             // Drop the heap buffer once inline-copy is done.
-            SmolStr::from_str(s.as_str())
+            SmolStr::from_borrowed(s.as_str())
         } else {
             SmolStr::Heap(Arc::from(s))
         }
@@ -204,7 +212,16 @@ impl Borrow<str> for SmolStr {
 impl From<&str> for SmolStr {
     #[inline]
     fn from(s: &str) -> Self {
-        SmolStr::from_str(s)
+        SmolStr::from_borrowed(s)
+    }
+}
+
+impl std::str::FromStr for SmolStr {
+    type Err = std::convert::Infallible;
+
+    #[inline]
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(SmolStr::from_borrowed(s))
     }
 }
 
@@ -218,7 +235,7 @@ impl From<String> for SmolStr {
 impl From<&String> for SmolStr {
     #[inline]
     fn from(s: &String) -> Self {
-        SmolStr::from_str(s.as_str())
+        SmolStr::from_borrowed(s.as_str())
     }
 }
 
@@ -356,7 +373,7 @@ mod tests {
 
     #[test]
     fn short_payload_stays_inline() {
-        let s = SmolStr::from_str("hello");
+        let s = SmolStr::from_borrowed("hello");
         assert!(s.is_inline());
         assert_eq!(s.as_str(), "hello");
         assert_eq!(s.len(), 5);
@@ -366,7 +383,7 @@ mod tests {
     fn cap_boundary_inline() {
         // Exactly cap bytes -> still inline.
         let payload = "a".repeat(SMOL_STR_INLINE_CAP);
-        let s = SmolStr::from_str(&payload);
+        let s = SmolStr::from_borrowed(&payload);
         assert!(s.is_inline());
         assert_eq!(s.len(), SMOL_STR_INLINE_CAP);
         assert_eq!(s.as_str(), payload);
@@ -375,7 +392,7 @@ mod tests {
     #[test]
     fn one_past_cap_goes_heap() {
         let payload = "a".repeat(SMOL_STR_INLINE_CAP + 1);
-        let s = SmolStr::from_str(&payload);
+        let s = SmolStr::from_borrowed(&payload);
         assert!(!s.is_inline());
         assert_eq!(s.len(), SMOL_STR_INLINE_CAP + 1);
         assert_eq!(s.as_str(), payload);
@@ -383,7 +400,7 @@ mod tests {
 
     #[test]
     fn clone_inline_does_not_alloc_heap() {
-        let s = SmolStr::from_str("short");
+        let s = SmolStr::from_borrowed("short");
         let c = s.clone();
         assert!(c.is_inline());
         assert_eq!(s, c);
@@ -391,10 +408,13 @@ mod tests {
 
     #[test]
     fn clone_heap_shares_arc() {
-        let s = SmolStr::from_str(&"x".repeat(40));
+        let s = SmolStr::from_borrowed(&"x".repeat(40));
         match (&s, &s.clone()) {
             (SmolStr::Heap(a), SmolStr::Heap(b)) => {
-                assert!(Arc::ptr_eq(a, b), "Heap clone should share the same Arc allocation");
+                assert!(
+                    Arc::ptr_eq(a, b),
+                    "Heap clone should share the same Arc allocation"
+                );
             }
             _ => panic!("expected both heap variants"),
         }
@@ -402,7 +422,7 @@ mod tests {
 
     #[test]
     fn round_trip_serde() {
-        let s = SmolStr::from_str("hello world");
+        let s = SmolStr::from_borrowed("hello world");
         let json = serde_json::to_string(&s).unwrap();
         assert_eq!(json, "\"hello world\"");
         let back: SmolStr = serde_json::from_str(&json).unwrap();
@@ -411,7 +431,7 @@ mod tests {
 
     #[test]
     fn eq_against_str_and_string() {
-        let s = SmolStr::from_str("k");
+        let s = SmolStr::from_borrowed("k");
         assert_eq!(s, "k");
         assert_eq!(s, *"k");
         assert_eq!(s, String::from("k"));

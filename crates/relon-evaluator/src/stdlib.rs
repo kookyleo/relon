@@ -1397,9 +1397,7 @@ impl RelonFunction for DictKeys {
         let mut keys = map.keys().cloned().collect::<Vec<_>>();
         keys.sort();
         Ok(Value::list(
-            keys.into_iter()
-                .map(|k| Value::String(k.into()))
-                .collect(),
+            keys.into_iter().map(|k| Value::String(k.into())).collect(),
         ))
     }
 }

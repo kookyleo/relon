@@ -378,10 +378,7 @@ fn test_virtual_stdlib_modules() {
         assert_eq!(map.map.get("kept_false").unwrap(), &Value::Bool(false));
         assert_eq!(map.map.get("is_number").unwrap(), &Value::Bool(true));
         assert_eq!(map.map.get("is_empty").unwrap(), &Value::Bool(true));
-        assert_eq!(
-            map.map.get("joined").unwrap(),
-            &Value::String("a-b".into())
-        );
+        assert_eq!(map.map.get("joined").unwrap(), &Value::String("a-b".into()));
         assert_eq!(map.map.get("has_key").unwrap(), &Value::Bool(true));
     } else {
         panic!("Expected Dict");
@@ -1074,10 +1071,7 @@ fn test_schema_composition_defaults() {
     if let Value::Dict(map) = result {
         let e = map.map.get("e").unwrap();
         if let Value::Dict(ed) = e {
-            assert_eq!(
-                ed.map.get("level").unwrap(),
-                &Value::String("error".into())
-            );
+            assert_eq!(ed.map.get("level").unwrap(), &Value::String("error".into()));
         } else {
             panic!();
         }
@@ -1780,10 +1774,7 @@ fn test_brand_decorator_in_schema_field_equivalent_to_type_prefix() {
     let Value::Dict(inst) = d.map.get("inst").unwrap() else {
         panic!("Expected Dict for inst");
     };
-    assert_eq!(
-        inst.map.get("name").unwrap(),
-        &Value::String("Ada".into())
-    );
+    assert_eq!(inst.map.get("name").unwrap(), &Value::String("Ada".into()));
 
     let bad = eval_doc(
         r#"{
@@ -2201,10 +2192,7 @@ fn variant_value_field_access_is_flat() {
     )
     .unwrap();
     let Value::Dict(d) = result else { panic!() };
-    assert_eq!(
-        d.map.get("got").unwrap(),
-        &Value::String("a@b.c".into())
-    );
+    assert_eq!(d.map.get("got").unwrap(), &Value::String("a@b.c".into()));
 }
 
 #[test]
@@ -2475,10 +2463,7 @@ fn private_field_is_dropped_from_dict_map_but_visible_to_siblings() {
     )
     .unwrap();
     let Value::Dict(d) = result else { panic!() };
-    assert_eq!(
-        d.map.get("display").unwrap(),
-        &Value::String("<hi>".into())
-    );
+    assert_eq!(d.map.get("display").unwrap(), &Value::String("<hi>".into()));
     assert!(
         !d.map.contains_key("helper"),
         "private field leaked into map: {:?}",
@@ -4801,10 +4786,7 @@ fn multi_hop_schema_method_dispatches_through_field() {
     .run_main(&std::sync::Arc::new(Scope::default()), args)
     .unwrap();
     let Value::Dict(d) = result else { panic!() };
-    assert_eq!(
-        d.map.get("s"),
-        Some(&Value::String("hello Alice".into()))
-    );
+    assert_eq!(d.map.get("s"), Some(&Value::String("hello Alice".into())));
 }
 
 #[test]
@@ -4845,10 +4827,7 @@ fn multi_hop_schema_method_with_arg() {
     .run_main(&std::sync::Arc::new(Scope::default()), args)
     .unwrap();
     let Value::Dict(d) = result else { panic!() };
-    assert_eq!(
-        d.map.get("s"),
-        Some(&Value::String("hello Bob!".into()))
-    );
+    assert_eq!(d.map.get("s"), Some(&Value::String("hello Bob!".into())));
 }
 
 // ===================================================================
@@ -4894,10 +4873,7 @@ fn stdlib_method_string_upper_dispatches_via_register_pure_method() {
     .run_main(&std::sync::Arc::new(Scope::default()), args)
     .unwrap();
     let Value::Dict(d) = result else { panic!() };
-    assert_eq!(
-        d.map.get("shout"),
-        Some(&Value::String("HELLO".into()))
-    );
+    assert_eq!(d.map.get("shout"), Some(&Value::String("HELLO".into())));
 }
 
 #[test]
