@@ -195,13 +195,12 @@ impl InstalledTraceLookup for CraneliftTraceLookup {
                                 // writes vector is logically already
                                 // consumed by the trace runtime before
                                 // we land here, so we leave it empty.
-                                let owned =
-                                    relon_trace_abi::DeoptStateSnapshot::with_value_stack(
-                                        snap.guard_pc,
-                                        snap.external_pc,
-                                        snap.ssa_slots_copy.clone(),
-                                        snap.value_stack_copy.clone(),
-                                    );
+                                let owned = relon_trace_abi::DeoptStateSnapshot::with_value_stack(
+                                    snap.guard_pc,
+                                    snap.external_pc,
+                                    snap.ssa_slots_copy.clone(),
+                                    snap.value_stack_copy.clone(),
+                                );
                                 captured.set(Some(TraceInvokeOutcome::Deopt {
                                     snapshot: Box::new(owned),
                                 }));

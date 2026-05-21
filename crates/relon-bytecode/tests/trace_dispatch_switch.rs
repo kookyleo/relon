@@ -124,8 +124,8 @@ fn success_outcome_bypasses_dispatch_and_returns_trace_result() {
 fn deopt_outcome_routes_through_resume_path() {
     use relon_bytecode::op::BcOp;
 
-    let ev_template = BytecodeEvaluator::from_source("#main(Int x, Int y) -> Int\nx + y")
-        .expect("compile");
+    let ev_template =
+        BytecodeEvaluator::from_source("#main(Int x, Int y) -> Int\nx + y").expect("compile");
     let func = ev_template.function();
     let add_bc_idx = func
         .ops

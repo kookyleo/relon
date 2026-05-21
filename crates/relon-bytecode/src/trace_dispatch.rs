@@ -133,7 +133,8 @@ pub trait InstalledTraceLookup: Send + Sync {
 
 impl fmt::Debug for dyn InstalledTraceLookup {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("InstalledTraceLookup").finish_non_exhaustive()
+        f.debug_struct("InstalledTraceLookup")
+            .finish_non_exhaustive()
     }
 }
 

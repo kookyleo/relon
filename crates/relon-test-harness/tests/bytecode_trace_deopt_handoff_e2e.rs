@@ -150,8 +150,8 @@ fn deopt_handoff_propagates_bytecode_overflow_envelope() {
     // produce NumericOverflow on (i64::MAX, 1). Verify this through
     // a sibling evaluator with no trace lookup installed (so we have
     // a known baseline envelope to compare the handoff against).
-    let bare = BytecodeEvaluator::from_source("#main(Int x, Int y) -> Int\nx + y")
-        .expect("compile");
+    let bare =
+        BytecodeEvaluator::from_source("#main(Int x, Int y) -> Int\nx + y").expect("compile");
     let mut overflow_args = HashMap::new();
     overflow_args.insert("x".to_string(), Value::Int(i64::MAX));
     overflow_args.insert("y".to_string(), Value::Int(1));
