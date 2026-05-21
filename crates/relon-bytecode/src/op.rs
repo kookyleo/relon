@@ -372,6 +372,19 @@ pub struct BcFunction {
     /// interning produces fresh `Arc<str>` slots regardless. Phase
     /// 4c can revisit if pool re-use becomes hot.
     pub string_pool: Vec<String>,
+    /// M2-B phase 4c: opaque function id used as the hot-counter slot
+    /// key. `None` means the function is not eligible for trace-JIT
+    /// promotion — the VM's hot-counter prologue stays inert.
+    ///
+    /// Mirrors the `fn_id` the cranelift HotCounter prologue uses
+    /// (`relon_codegen_native::trace_install::__relon_jump_to_recorder`),
+    /// so a single tracer registry can host both backends without
+    /// collisions: hosts that wire bytecode + cranelift dispatchers to
+    /// the same source program assign the same `fn_id` to both
+    /// compiled artefacts. The bytecode crate itself never interprets
+    /// the integer; it just hands it back to the
+    /// [`crate::vm::HotTraceTrigger`] hook on threshold crossing.
+    pub fn_id: Option<u32>,
 }
 
 impl Default for BcFunction {
@@ -387,6 +400,7 @@ impl Default for BcFunction {
             ir_pc_map: Vec::new(),
             stack_recipe: Vec::new(),
             string_pool: Vec::new(),
+            fn_id: None,
         }
     }
 }
@@ -412,5 +426,19 @@ impl BcFunction {
     /// `None` for out-of-range indices.
     pub fn stack_depth_at(&self, bc_idx: usize) -> Option<usize> {
         self.stack_recipe.get(bc_idx).map(|v| v.len())
+    }
+
+    /// M2-B phase 4c: stamp the hot-counter `fn_id` on the compiled
+    /// function. Hosts that share the trace-JIT recording registry
+    /// between the cranelift backend and the bytecode VM call this
+    /// after `compile_function` so the bytecode dispatch prologue
+    /// routes through the same `__relon_jump_to_recorder` slot the
+    /// cranelift entry function uses.
+    ///
+    /// Returns `self` so the call chains cleanly off a compile-pass
+    /// result.
+    pub fn with_fn_id(mut self, fn_id: u32) -> Self {
+        self.fn_id = Some(fn_id);
+        self
     }
 }
