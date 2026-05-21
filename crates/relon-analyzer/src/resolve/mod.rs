@@ -16,11 +16,33 @@
 //! does not run on schema bodies, since their `Type field: predicate`
 //! shape isn't a regular dict and the predicate values aren't really
 //! references in the data sense.
+//!
+//! ## Sub-module split
+//!
+//! The dispatch loop + struct definitions live in this file; each
+//! sibling sub-module hangs more methods off the same `Walker<'a>` via
+//! an `impl<'a> super::Walker<'a>` extension block so all sub-modules
+//! share the same private fields without a trait abstraction.
+//!
+//! - **`scope`** — in-document scope-walk resolution: `resolve`
+//!   (`&sibling` / `&root` / `&uncle` base lookup) and
+//!   `resolve_variable` (closure-param + dict-sibling chain walk for
+//!   bare `Variable` / `FnCall` heads).
+//! - **`cross_module`** — `queue_cross_module` records pending
+//!   `#import`-rooted references that the workspace post-pass later
+//!   binds to their target module's NodeId.
 
-use crate::diagnostic::Diagnostic;
+mod cross_module;
+mod scope;
+
+#[cfg(test)]
+mod tests;
+
 use crate::tree::AnalyzedTree;
 use relon_parser::{child_nodes, Expr, Node, NodeId, RefBase, TokenKey, TokenRange};
 use std::collections::HashMap;
+
+use crate::diagnostic::Diagnostic;
 
 /// Result of resolving a reference expression to a known dict field.
 #[derive(Debug, Clone)]
@@ -427,146 +449,6 @@ impl<'a> Walker<'a> {
             }
         }
     }
-
-    /// Record a pending cross-module reference if `path[0]` matches a
-    /// `#import` binding visible to this importer. No-op when the head
-    /// doesn't match any import — the typecheck pass will report it as
-    /// `UnresolvedReference` later if it stays unbound. The function
-    /// is deliberately a strict superset of the in-document scope walk:
-    /// callers invoke it only after the in-document lookup has failed.
-    fn queue_cross_module(&mut self, node_id: NodeId, path: &[TokenKey], source_range: TokenRange) {
-        let Some(head) = path_head(path) else { return };
-        // Tail segments after the head, lowered to string keys. Dynamic
-        // / spread / non-string tails (`alias.[expr]`) aren't statically
-        // resolvable and stay None — we still record the entry so the
-        // hover layer can offer a jump to the module head.
-        let tail: Vec<String> = path
-            .iter()
-            .skip(1)
-            .filter_map(|seg| match seg {
-                TokenKey::String(s, _, _) => Some(s.clone()),
-                _ => None,
-            })
-            .collect();
-        for (idx, imp) in self.tree.imports.iter().enumerate() {
-            if imp.alias.as_deref() == Some(head.as_str()) {
-                self.tree
-                    .pending_cross_module_refs
-                    .push(PendingCrossModuleRef {
-                        node_id,
-                        source_range,
-                        import_index: idx,
-                        tail,
-                        via: PendingCrossModuleVia::Alias,
-                    });
-                return;
-            }
-            for (upstream, local) in &imp.destructure {
-                let bound_name = local.as_deref().unwrap_or(upstream);
-                if bound_name == head {
-                    self.tree
-                        .pending_cross_module_refs
-                        .push(PendingCrossModuleRef {
-                            node_id,
-                            source_range,
-                            import_index: idx,
-                            tail,
-                            via: PendingCrossModuleVia::Destructured {
-                                upstream: upstream.clone(),
-                            },
-                        });
-                    return;
-                }
-            }
-        }
-        // Fall back to a spread candidate. We can't tell yet which
-        // spread import (if any) exports `head`; the post-pass tries
-        // each `#import *` in source order. Only queue when at least
-        // one spread import exists, otherwise the entry is dead noise.
-        if self.tree.imports.iter().any(|imp| imp.spread) {
-            // `import_index` for spread candidates points at the *first*
-            // spread import in source order; the post-pass uses the
-            // head name + every spread import on the importer, so this
-            // anchor is just bookkeeping for diagnostics.
-            let first_spread = self
-                .tree
-                .imports
-                .iter()
-                .position(|imp| imp.spread)
-                .expect("at least one spread import (checked above)");
-            self.tree
-                .pending_cross_module_refs
-                .push(PendingCrossModuleRef {
-                    node_id,
-                    source_range,
-                    import_index: first_spread,
-                    tail,
-                    via: PendingCrossModuleVia::SpreadCandidate { head },
-                });
-        }
-    }
-
-    /// Look up `path[0]` against the active scope chain. `Root` jumps
-    /// straight to the bottom-most frame (the document root); `Sibling`
-    /// uses the top frame; `Uncle` skips one frame up.
-    fn resolve(
-        &self,
-        base: &RefBase,
-        path: &[TokenKey],
-        source_range: TokenRange,
-    ) -> Option<ResolvedRef> {
-        let head = path_head(path)?;
-        let frame = match base {
-            RefBase::Root => self.scope_stack.first()?,
-            RefBase::Sibling => self.scope_stack.last()?,
-            RefBase::Uncle => {
-                // `path.len() >= 2` lets `&uncle.X` skip both the current
-                // dict and the parent. Otherwise the legacy form `&uncle`
-                // (no path) is dynamic and we punt.
-                let len = self.scope_stack.len();
-                if len < 2 {
-                    return None;
-                }
-                self.scope_stack.get(len - 2)?
-            }
-            // List-context refs (`&prev`, `&next`, `&index`, `&this`)
-            // depend on iteration state we don't track statically.
-            _ => return None,
-        };
-        // Only resolve the *head* of the path. Multi-segment lookups
-        // (`&sibling.foo.bar`) need the runtime to walk inside the value
-        // — recording the head's target is enough for LSP and lint.
-        let target = frame.lookup_field(&head)?;
-        Some(ResolvedRef {
-            target,
-            source_range,
-            via: *base,
-        })
-    }
-
-    /// Walk the scope chain for a bare `Variable(path)`. Closure params
-    /// shadow enclosing dict siblings; matches evaluator's
-    /// `resolve_variable` semantics.
-    fn resolve_variable(&self, path: &[TokenKey], source_range: TokenRange) -> Option<ResolvedRef> {
-        let head = path_head(path)?;
-        for frame in self.scope_stack.iter().rev() {
-            if let Some(target) = frame.closure_params.get(&head).copied() {
-                return Some(ResolvedRef {
-                    target,
-                    source_range,
-                    via: RefBase::This,
-                });
-            }
-            if let Some(target) = frame.lookup_field(&head) {
-                return Some(ResolvedRef {
-                    target,
-                    source_range,
-                    via: RefBase::Sibling,
-                });
-            }
-        }
-        None
-    }
 }
 
 pub(crate) fn build_frame(pairs: &[(TokenKey, Node)]) -> ScopeFrame {
@@ -630,129 +512,5 @@ pub(crate) fn path_head(path: &[TokenKey]) -> Option<String> {
     match path.first()? {
         TokenKey::String(s, _, _) => Some(s.clone()),
         _ => None,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use relon_parser::parse_document;
-
-    fn analyze(src: &str) -> AnalyzedTree {
-        let node = parse_document(src).expect("parse");
-        crate::analyze(&node)
-    }
-
-    #[test]
-    fn binds_sibling_at_root_level() {
-        // `&sibling.a` should resolve to the value-node id of field `a`.
-        let tree = analyze(r#"{ a: 1, b: &sibling.a }"#);
-        assert_eq!(tree.references.len(), 1);
-        let resolved = tree.references.values().next().unwrap();
-        // The recorded target must round-trip back to a node we
-        // tracked in the index.
-        assert!(tree.node(resolved.target).is_some());
-        assert!(matches!(resolved.via, RefBase::Sibling));
-    }
-
-    #[test]
-    fn binds_root_reference_from_nested_dict() {
-        let tree = analyze(
-            r#"{
-                a: 10,
-                inner: { ptr: &root.a }
-            }"#,
-        );
-        // `ptr` resolves to the top-level `a`.
-        let resolved = tree
-            .references
-            .values()
-            .find(|r| matches!(r.via, RefBase::Root))
-            .expect("root ref");
-        let target_node = tree.node(resolved.target).expect("indexed");
-        assert!(matches!(&*target_node.expr, Expr::Int(10)));
-    }
-
-    #[test]
-    fn does_not_bind_list_context_refs() {
-        // `&prev` / `&index` / `&next` need iteration state — skip them.
-        let tree = analyze(
-            r#"[
-                { v: 1, p: &prev },
-                { v: 2, p: &prev.v }
-            ]"#,
-        );
-        assert!(tree.references.is_empty(), "{:?}", tree.references);
-    }
-
-    #[test]
-    fn variables_resolve_like_siblings() {
-        // Bare identifiers that name a sibling should bind too.
-        let tree = analyze(r#"{ helper(x): x + 1, twice: helper }"#);
-        // The `helper` reference inside `twice: helper` is a Variable
-        // expression. Confirm it's bound.
-        assert!(tree.references.values().any(|r| {
-            let node = tree.node(r.target).unwrap();
-            matches!(&*node.expr, Expr::Closure { .. })
-        }));
-    }
-
-    #[test]
-    fn closure_params_shadow_outer_siblings() {
-        // `x` inside the closure body should bind to the closure
-        // param, not to the outer `x: 100` field.
-        let tree = analyze(
-            r#"{
-                x: 100,
-                fn(x): x + 1
-            }"#,
-        );
-        // Find the `Variable(x)` reference inside the closure body
-        // (the `x + 1` expression).
-        let bound = tree
-            .references
-            .values()
-            .find(|r| {
-                let target = tree.node(r.target).unwrap();
-                // Closure-param sentinel is the body's NodeId, which
-                // is the `Binary(Add, x, 1)` expression.
-                matches!(&*target.expr, Expr::Binary(_, _, _))
-            })
-            .expect("closure param resolved");
-        assert!(matches!(bound.via, RefBase::This));
-    }
-
-    #[test]
-    fn dict_with_spread_marks_frame_dynamic() {
-        // The spread expands `base`'s keys at runtime. The frame
-        // containing the spread should report `has_dynamic_spread`
-        // so a downstream typecheck pass won't false-positive on
-        // names that may come from `base`. Inline check: ask the
-        // builder directly.
-        use relon_parser::{parse_document, Expr, TokenKey};
-        let node = parse_document(
-            r#"{
-                base: { x: 1, y: 2 },
-                merged: { ...&sibling.base, z: 3 }
-            }"#,
-        )
-        .unwrap();
-        // Drill down to the inner dict (the value of "merged") and
-        // build a frame for it.
-        let Expr::Dict(root_pairs) = &*node.expr else {
-            panic!()
-        };
-        let merged_value = &root_pairs
-            .iter()
-            .find(|(k, _)| matches!(k, TokenKey::String(s, _, _) if s == "merged"))
-            .unwrap()
-            .1;
-        let Expr::Dict(merged_pairs) = &*merged_value.expr else {
-            panic!()
-        };
-        let frame = build_frame(merged_pairs);
-        assert!(frame.has_dynamic_spread);
-        assert!(!frame.fields.contains_key("x"));
-        assert!(frame.fields.contains_key("z"));
     }
 }

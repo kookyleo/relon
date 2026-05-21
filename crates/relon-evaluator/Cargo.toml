@@ -40,8 +40,12 @@ hex = { workspace = true }
 [dev-dependencies]
 proptest = { workspace = true }
 # `relon-fmt` is pulled in only for the fmt round-trip property in
-# `tests/property_tests.rs` — formatter ↔ evaluator equivalence is a
-# determinism guarantee, but the runtime crate stays formatter-free.
-# `relon-fmt`'s own dependency closure (parser only) does not loop back
-# through `relon-evaluator`, so this dev-dep is acyclic.
+# `tests/property_tests.rs` (the formatter ↔ evaluator equivalence
+# guarantee: formatting source preserves its evaluated value).
+#
+# Audit (2026-05-21, review-improvement-138): no `relon_fmt::` use
+# in `src/`; the runtime crate stays formatter-free and the published
+# `[dependencies]` graph carries no edge to `relon-fmt`. `relon-fmt`'s
+# own dependency closure (parser only) does not loop back through
+# `relon-evaluator`, so this dev-dep is acyclic and safe to keep.
 relon-fmt = { workspace = true }
