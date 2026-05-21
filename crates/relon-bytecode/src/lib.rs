@@ -95,7 +95,9 @@ pub mod op;
 pub mod trace_dispatch;
 pub mod vm;
 
-pub use arena::{ArenaError, DictArena, Handle, ListArena, StringArena, VmMemory};
+pub use arena::{
+    ArenaError, ClosureArena, ClosureSlot, DictArena, Handle, ListArena, StringArena, VmMemory,
+};
 pub use compile::{compile_function, BcCompileError};
 pub use evaluator::{BytecodeError, BytecodeEvaluator, ResumeMetrics};
 pub use hot_counter::{

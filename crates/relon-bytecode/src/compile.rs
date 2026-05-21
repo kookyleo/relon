@@ -164,6 +164,13 @@ pub fn compile_function_in_module(
         // matching cranelift trace function share the same hot-counter
         // slot.
         fn_id: None,
+        // M3 closure bodies: empty by default. The IR-level
+        // `Op::MakeClosure` path remains gated on follow-up work that
+        // hoists the lambda body through the bytecode compile pipeline;
+        // hand-built `BcFunction` instances (tests / future direct-IR
+        // closure constructions) populate this slice via the public
+        // field.
+        closure_bodies: Vec::new(),
     })
 }
 
@@ -454,6 +461,46 @@ impl<'a> CompileState<'a> {
                 // Pops [dict, key], pushes the value.
                 self.current_stack.pop();
                 self.current_stack.pop();
+                let snap_idx = self.next_snapshot_idx;
+                self.next_snapshot_idx += 1;
+                self.current_stack.push(StackOrigin::Snapshot(snap_idx));
+            }
+            BcOp::MakeClosure {
+                capture_count, ..
+            } => {
+                // M3: pops `capture_count` capture values, pushes one
+                // closure handle. Handle is snapshot-tagged because its
+                // numeric value (the arena slot index) can't be
+                // re-derived from locals / consts at resume time — the
+                // recipe consumer reads it out of the deopt snapshot's
+                // `value_stack_copy` slot.
+                for _ in 0..*capture_count {
+                    self.current_stack.pop();
+                }
+                let snap_idx = self.next_snapshot_idx;
+                self.next_snapshot_idx += 1;
+                self.current_stack.push(StackOrigin::Snapshot(snap_idx));
+            }
+            BcOp::CallClosure { argc } => {
+                // M3: pops `argc` args + 1 closure handle, pushes the
+                // return value. Result is snapshot-tagged — produced by
+                // the inner dispatch loop and observable only via the
+                // operand stack.
+                for _ in 0..*argc {
+                    self.current_stack.pop();
+                }
+                // Pop the closure handle.
+                self.current_stack.pop();
+                let snap_idx = self.next_snapshot_idx;
+                self.next_snapshot_idx += 1;
+                self.current_stack.push(StackOrigin::Snapshot(snap_idx));
+            }
+            BcOp::CaptureGet { .. } => {
+                // M3: pushes one capture value. Like `LocalGet` the
+                // value is reproducible from the closure handle at
+                // resume time, but the handle isn't visible to the
+                // straight-line recipe walker. Snapshot-tag so the
+                // deopt path is honest about the dependency.
                 let snap_idx = self.next_snapshot_idx;
                 self.next_snapshot_idx += 1;
                 self.current_stack.push(StackOrigin::Snapshot(snap_idx));
