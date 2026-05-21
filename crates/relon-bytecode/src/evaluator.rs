@@ -89,6 +89,52 @@ pub struct BytecodeEvaluator {
     /// Default VM config. Cloned per `run_main` so concurrent calls
     /// don't share the resource counter.
     default_config: BcVmConfig,
+    /// M2-C lever 5: cached return-shape descriptor derived from the
+    /// `return_schema`. Computed once at construction so the per-call
+    /// `run_main` epilogue avoids re-walking the schema on every
+    /// invoke.
+    return_shape: ReturnShape,
+    /// M2-C lever 5: cached `return_schema.fields.len() as u32`. The
+    /// VM needs this on every `invoke_from_with_stack` call to size the
+    /// local-slot reservation past the args span; without the cache the
+    /// hot path paid an `Option<&Schema>` walk + a `.fields.len()`
+    /// re-read on each invoke. Stored alongside `return_shape` so the
+    /// scalar fast-path and the trait-level `run_main` epilogue can
+    /// both consume the cached value without the extra schema probe.
+    cached_return_field_count: u32,
+    /// M2-C lever 5: cached arity of the `#main(...)` declaration.
+    /// Mirrors `param_names.len() as usize` but kept on a separate
+    /// field so the typed-i64 fast path can validate caller arity
+    /// against a single field read.
+    cached_param_count: usize,
+}
+
+/// M2-C lever 5: pre-computed return-shape classification used by the
+/// typed fast-path and the standard `unpack_return_slots` epilogue.
+///
+/// The hot W12 fixture (single-scalar return) hits `SingleScalarInt`;
+/// the fallback variants preserve the existing schema-walk semantics
+/// for the multi-field / legacy paths.
+#[derive(Debug, Clone, Copy)]
+enum ReturnShape {
+    /// Legacy / direct-IR path (no schema). Lift one VmValue as
+    /// `Value::Int`.
+    LegacyI64,
+    /// Single-field return whose field name matches
+    /// [`relon_ir::RETURN_VALUE_FIELD_NAME`] and whose type is `Int`.
+    /// The slot index is `return_field_base`.
+    SingleScalarInt,
+    /// Single-field return slot whose type is one of the other
+    /// scalars (`Bool` / `Null` / `Float`). The dispatch epilogue
+    /// branches on the cached type code.
+    SingleScalarFloat,
+    /// Single-field return slot of type `Bool`.
+    SingleScalarBool,
+    /// Single-field return slot of type `Null`.
+    SingleScalarNull,
+    /// Multi-field return record — falls back to the
+    /// `unpack_return_slots` branded-dict reconstruction.
+    BrandedDict,
 }
 
 impl BytecodeEvaluator {
@@ -178,6 +224,7 @@ impl BytecodeEvaluator {
         let param_tys = func.params.clone();
         let empty = std::collections::BTreeMap::new();
         let compiled = compile_function(func, &empty, &empty)?;
+        let cached_param_count = param_names.len();
         Ok(Self {
             func: compiled,
             entry_range,
@@ -186,6 +233,9 @@ impl BytecodeEvaluator {
             return_schema: None,
             return_field_base: 0,
             default_config: BcVmConfig::default(),
+            return_shape: ReturnShape::LegacyI64,
+            cached_return_field_count: 0,
+            cached_param_count,
         })
     }
 
@@ -205,6 +255,12 @@ impl BytecodeEvaluator {
         // bytecode compile pass can inline simple callees
         // (`Op::Call`) the M2-A scaffold rejected.
         let compiled = compile_function_in_module(func, &module.funcs, in_map, out_map)?;
+        // M2-C lever 5: classify the return schema once so the hot
+        // dispatch epilogue branches on a cheap copy-enum rather than
+        // re-walking the field vector on every invoke.
+        let return_shape = classify_return_shape(&return_schema);
+        let cached_return_field_count = return_schema.fields.len() as u32;
+        let cached_param_count = param_names.len();
         Ok(Self {
             func: compiled,
             entry_range,
@@ -213,6 +269,9 @@ impl BytecodeEvaluator {
             return_schema: Some(return_schema),
             return_field_base,
             default_config: BcVmConfig::default(),
+            return_shape,
+            cached_return_field_count,
+            cached_param_count,
         })
     }
 
@@ -377,26 +436,44 @@ impl BytecodeEvaluator {
     }
 
     fn unpack_return_slots(&self, locals: &[VmValue]) -> Value {
-        let Some(schema) = self.return_schema.as_ref() else {
-            // Legacy / direct-IR path: the VM returns one slot.
-            return Value::Int(locals.first().copied().unwrap_or(0) as i64);
-        };
-        if schema.fields.len() == 1 && schema.fields[0].name == relon_ir::RETURN_VALUE_FIELD_NAME {
-            // Single-value wrapper: lift the bare scalar.
-            let f = &schema.fields[0];
-            let slot = self.return_field_base as usize;
-            return decode_field(&f.ty, locals.get(slot).copied().unwrap_or(0));
+        // M2-C lever 5: branch on the cached `ReturnShape` so the hot
+        // single-scalar epilogue avoids the `Option<&Schema>` +
+        // schema-fields walk it previously paid every invoke.
+        let slot = self.return_field_base as usize;
+        match self.return_shape {
+            ReturnShape::LegacyI64 => Value::Int(locals.first().copied().unwrap_or(0) as i64),
+            ReturnShape::SingleScalarInt => {
+                Value::Int(locals.get(slot).copied().unwrap_or(0) as i64)
+            }
+            ReturnShape::SingleScalarBool => {
+                Value::Bool((locals.get(slot).copied().unwrap_or(0) as u32) != 0)
+            }
+            ReturnShape::SingleScalarNull => Value::Null,
+            ReturnShape::SingleScalarFloat => {
+                use ordered_float::OrderedFloat;
+                let bits = locals.get(slot).copied().unwrap_or(0);
+                Value::Float(OrderedFloat(f64::from_bits(bits)))
+            }
+            ReturnShape::BrandedDict => {
+                // Multi-field return record. The schema must be
+                // present — `BrandedDict` is set by
+                // `classify_return_shape` only when one was supplied.
+                let schema = self
+                    .return_schema
+                    .as_ref()
+                    .expect("BrandedDict implies Some(return_schema)");
+                let mut map: std::collections::BTreeMap<String, Value> =
+                    std::collections::BTreeMap::new();
+                for (i, f) in schema.fields.iter().enumerate() {
+                    let s = self.return_field_base as usize + i;
+                    map.insert(
+                        f.name.clone(),
+                        decode_field(&f.ty, locals.get(s).copied().unwrap_or(0)),
+                    );
+                }
+                Value::branded_dict(map, Some(schema.name.clone()))
+            }
         }
-        // Multi-field return record (Dict). Reconstruct a branded dict.
-        let mut map: std::collections::BTreeMap<String, Value> = std::collections::BTreeMap::new();
-        for (i, f) in schema.fields.iter().enumerate() {
-            let slot = self.return_field_base as usize + i;
-            map.insert(
-                f.name.clone(),
-                decode_field(&f.ty, locals.get(slot).copied().unwrap_or(0)),
-            );
-        }
-        Value::branded_dict(map, Some(schema.name.clone()))
     }
 
     /// Internal `run_main` core — kept separate so `resume_from_pc`
@@ -416,10 +493,7 @@ impl BytecodeEvaluator {
             start_bc_idx,
             extra_locals,
             /*return_slot_count=*/
-            self.return_schema
-                .as_ref()
-                .map(|s| s.fields.len() as u32)
-                .unwrap_or(0),
+            self.cached_return_slot_count(),
             initial_stack,
         );
         if let Some(err) = outcome.error {
@@ -487,6 +561,23 @@ impl BytecodeEvaluator {
         }
         out
     }
+}
+
+/// M2-C lever 5: classify the return schema into a `ReturnShape` once
+/// at construction. The hot epilogue then switches on the cheap
+/// `Copy`-enum rather than walking `schema.fields` on every invoke.
+fn classify_return_shape(schema: &Schema) -> ReturnShape {
+    use relon_eval_api::schema_canonical::TypeRepr;
+    if schema.fields.len() == 1 && schema.fields[0].name == relon_ir::RETURN_VALUE_FIELD_NAME {
+        return match schema.fields[0].ty {
+            TypeRepr::Int => ReturnShape::SingleScalarInt,
+            TypeRepr::Float => ReturnShape::SingleScalarFloat,
+            TypeRepr::Bool => ReturnShape::SingleScalarBool,
+            TypeRepr::Null => ReturnShape::SingleScalarNull,
+            _ => ReturnShape::BrandedDict,
+        };
+    }
+    ReturnShape::BrandedDict
 }
 
 /// Decide whether a schema field type is in the M2-A scalar envelope.
@@ -719,6 +810,127 @@ impl Evaluator for BytecodeEvaluator {
 }
 
 impl BytecodeEvaluator {
+    /// M2-C lever 1: typed-i64 fast-path entry mirroring the cranelift
+    /// `run_main_legacy_i64` shape.
+    ///
+    /// Hosts that already hold their `#main(...)` arguments as a flat
+    /// `&[i64]` (e.g. benchmark harnesses, FFI bridges, the trace-JIT
+    /// dispatch boundary) pay zero `HashMap<String, Value>` lookup
+    /// cost: args land directly in the VM's `u64` slots via a
+    /// `as u64` reinterpret, and the return shape is decoded against
+    /// the pre-classified [`ReturnShape::SingleScalar`] schema slot
+    /// (cached at construction time — see lever 5).
+    ///
+    /// Returns `Err(RuntimeError::Unsupported)` when the entry's
+    /// `#main(...)` schema is not in the typed-i64 envelope:
+    /// non-`Int` parameter types or a multi-field return record. The
+    /// caller should fall back to [`Self::run_main`] in that case.
+    ///
+    /// The trace-JIT dispatcher-switch path is intentionally **not**
+    /// consulted here — the fast path is for hot benchmarks and the
+    /// recorder/installed-trace overhead would defeat the purpose.
+    /// Hosts that need the trace bypass should keep calling the
+    /// trait-level `run_main`.
+    pub fn run_main_i64(&self, args: &[i64]) -> Result<i64, RuntimeError> {
+        // Param-count + type check: every declared param must be the
+        // `I64` lane and the caller must supply exactly that many
+        // args. Anything richer falls back to the trait surface.
+        // M2-C lever 5: arity check reads the cached `param_count`
+        // field so the hot path doesn't pay a `Vec::len` indirection.
+        if args.len() != self.cached_param_count {
+            return Err(RuntimeError::Unsupported {
+                reason: format!(
+                    "bytecode VM run_main_i64: arity mismatch (expected {} args, got {})",
+                    self.cached_param_count,
+                    args.len()
+                ),
+            });
+        }
+        for ty in &self.param_tys {
+            if !matches!(ty, IrType::I64 | IrType::I32) {
+                return Err(RuntimeError::Unsupported {
+                    reason: format!(
+                        "bytecode VM run_main_i64: non-i64 param type {ty:?} \
+                         falls outside the fast-path envelope; use run_main"
+                    ),
+                });
+            }
+        }
+        // Return-shape check: single Int scalar only — multi-field
+        // dicts / non-Int returns fall back to the trait surface.
+        match self.return_shape {
+            ReturnShape::SingleScalarInt | ReturnShape::LegacyI64 => {}
+            _ => {
+                return Err(RuntimeError::Unsupported {
+                    reason: "bytecode VM run_main_i64: return shape outside Int scalar envelope; \
+                         use run_main"
+                        .into(),
+                });
+            }
+        };
+        // Reinterpret each i64 arg through the VM's u64 lane —
+        // matches the same cast `value_to_vm` would have produced
+        // for `(Value::Int(v), IrType::I64) => v as u64`. We use a
+        // small inline buffer for the common 0..4 args case so the
+        // typed path avoids the heap allocation. For wider arities
+        // the fallback is a regular `Vec`.
+        let mut inline: [u64; 4] = [0; 4];
+        let packed: &[u64] = if args.len() <= 4 {
+            for (i, v) in args.iter().enumerate() {
+                inline[i] = *v as u64;
+            }
+            &inline[..args.len()]
+        } else {
+            let mut tmp: Vec<u64> = Vec::with_capacity(args.len());
+            for v in args {
+                tmp.push(*v as u64);
+            }
+            // Lifetime: extend through `tmp` — but we need `&[u64]`
+            // outliving `inline`. Branch the invoke separately for
+            // the wide arity below.
+            return self.run_main_i64_inner(&tmp);
+        };
+        self.run_main_i64_inner(packed)
+    }
+
+    /// Core of the typed-i64 fast path: clone the cached config (lever
+    /// 5 keeps the clone shallow), dispatch the VM, and decode the
+    /// return slot directly without re-walking the schema.
+    fn run_main_i64_inner(&self, packed: &[u64]) -> Result<i64, RuntimeError> {
+        let vm = BytecodeVm::new(self.default_config.clone());
+        let return_slot_count = self.cached_return_slot_count();
+        let outcome = vm.invoke_from_with_stack(&self.func, packed, 0, &[], return_slot_count, &[]);
+        if let Some(err) = outcome.error {
+            return Err(err.into_runtime_error(self.entry_range));
+        }
+        // Decode the return slot directly. For SingleScalarInt the
+        // slot index is `return_field_base`; for LegacyI64 there's no
+        // schema and we read slot 0 of `final_locals`.
+        let raw = match self.return_shape {
+            ReturnShape::LegacyI64 => outcome.final_locals.first().copied().unwrap_or(0),
+            _ => outcome
+                .final_locals
+                .get(self.return_field_base as usize)
+                .copied()
+                .unwrap_or(0),
+        };
+        Ok(raw as i64)
+    }
+
+    /// M2-C lever 5: cached return-slot count. Reads the
+    /// `cached_return_field_count` field populated once at construction
+    /// time — no `Option<Schema>` walk + no `.fields.len()` indirection
+    /// on the hot dispatch path. `LegacyI64` short-circuits to 0
+    /// (direct-IR tests don't carry a schema and the VM returns a
+    /// single i64 slot through the stack).
+    #[inline(always)]
+    fn cached_return_slot_count(&self) -> u32 {
+        match self.return_shape {
+            ReturnShape::LegacyI64 => 0,
+            _ => self.cached_return_field_count,
+        }
+    }
+
     /// Variant of [`Self::run_main_inner`] that takes pre-packed
     /// args. The resume path goes through here because it already
     /// packed the args while materialising the stack recipe; using
@@ -736,10 +948,7 @@ impl BytecodeEvaluator {
             packed,
             start_bc_idx,
             extra_locals,
-            self.return_schema
-                .as_ref()
-                .map(|s| s.fields.len() as u32)
-                .unwrap_or(0),
+            self.cached_return_slot_count(),
             initial_stack,
         );
         if let Some(err) = outcome.error {
@@ -865,10 +1074,7 @@ impl BytecodeEvaluator {
             &packed,
             start_bc_idx,
             &snapshot.ssa_slots_copy,
-            self.return_schema
-                .as_ref()
-                .map(|s| s.fields.len() as u32)
-                .unwrap_or(0),
+            self.cached_return_slot_count(),
             &initial_stack,
         );
         let metrics = ResumeMetrics {
@@ -894,10 +1100,7 @@ impl BytecodeEvaluator {
             &packed,
             0,
             &[],
-            self.return_schema
-                .as_ref()
-                .map(|s| s.fields.len() as u32)
-                .unwrap_or(0),
+            self.cached_return_slot_count(),
             &[],
         );
         let metrics = ResumeMetrics {

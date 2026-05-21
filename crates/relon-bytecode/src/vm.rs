@@ -585,12 +585,83 @@ pub struct BcRunOutcome {
 /// [`BytecodeVm::invoke`]).
 pub struct BytecodeVm {
     config: BcVmConfig,
+    /// M2-C lever 2: per-`BytecodeVm` inline cache for `BcOp::CallNative`
+    /// host-fn resolution.
+    ///
+    /// `BcOp::CallNative { import_idx, .. }` previously walked the
+    /// per-call `CapabilityVtable::host_fns: HashMap<u32, Arc<dyn>>`
+    /// on every dispatch. Loops that hit the same host fn back-to-back
+    /// now consult this single-slot cache first — a hit skips the
+    /// HashMap probe and re-uses the already-resolved `Arc` without a
+    /// fresh refcount bump (the `Arc::clone` still happens on consume,
+    /// but the cache absorbs the lookup).
+    ///
+    /// `RefCell` so `dispatch_one(&self, ...)` keeps its existing
+    /// signature; the cache reads + writes are single-threaded per
+    /// `invoke_*` (`BytecodeVm` is not `Sync` in practice). Cleared
+    /// on every `invoke` entry via [`Self::reset_call_cache`] so a
+    /// stale entry can't leak across VM reuses.
+    ///
+    /// W12 doesn't exercise `CallNative` so this cache doesn't shift
+    /// the cmp_lua W12 row's number; the benefit shows up on workloads
+    /// with hot `CallNative` sites (today: phase-4a stdlib-driven
+    /// fixtures inside the bytecode envelope). Future fixtures that
+    /// dispatch the same `import_idx` from a hot loop are the primary
+    /// motivation for keeping the cache wired even though the bench
+    /// dashboard's W12 row reads "no delta".
+    call_native_cache: std::cell::RefCell<CallNativeCache>,
+}
+
+/// M2-C lever 2 cache slot. Single-entry "last resolved" cache —
+/// matches the LuaJIT / V8 monomorphic IC shape: the common case
+/// (loop bodies dispatching one stdlib slot repeatedly) hits, the
+/// polymorphic / megamorphic case still goes through the HashMap
+/// but doesn't degrade beyond the pre-cache baseline.
+#[derive(Default)]
+struct CallNativeCache {
+    last: Option<(u32, Arc<dyn RelonFunction>)>,
 }
 
 impl BytecodeVm {
     /// Build a new VM with the supplied config.
     pub fn new(config: BcVmConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            call_native_cache: std::cell::RefCell::new(CallNativeCache::default()),
+        }
+    }
+
+    /// M2-C lever 2: reset the per-VM inline cache. Called at the top
+    /// of every `invoke_*` so a previously-resolved host fn from a
+    /// prior invocation can't shadow a config swap between calls.
+    /// The cache is intentionally `Option<...>` rather than `Vec<...>`
+    /// because the common dispatch loop hits the same slot on every
+    /// iteration — a single-entry cache is enough for the monomorphic
+    /// case, and the slow path still consults the HashMap.
+    fn reset_call_cache(&self) {
+        self.call_native_cache.borrow_mut().last = None;
+    }
+
+    /// M2-C lever 2: resolve a host fn via the inline cache. Hit
+    /// re-uses the cached `Arc` (one refcount bump on the consumer
+    /// side); miss falls through to the HashMap probe and primes the
+    /// cache for the next iteration.
+    fn resolve_host_fn_cached(&self, import_idx: u32) -> Option<Arc<dyn RelonFunction>> {
+        if let Some((cached_idx, ref f)) = self.call_native_cache.borrow().last {
+            if cached_idx == import_idx {
+                return Some(Arc::clone(f));
+            }
+        }
+        // Miss — go to the HashMap, then prime the cache. A `None`
+        // resolve (un-registered slot) does NOT update the cache; the
+        // next dispatch hits the same slow path so registration races
+        // surface immediately instead of being hidden by a stale
+        // `None`.
+        let resolved = self.config.cap_vtable.resolve_host_fn(import_idx).cloned();
+        if let Some(ref f) = resolved {
+            self.call_native_cache.borrow_mut().last = Some((import_idx, Arc::clone(f)));
+        }
+        resolved
     }
 
     /// Mutable accessor on the active config — used by tests that
@@ -690,6 +761,11 @@ impl BytecodeVm {
         return_slot_count: u32,
         initial_stack: &[VmValue],
     ) -> BcRunOutcome {
+        // M2-C lever 2: reset the inline cache at the top of every
+        // outer invocation so a previously-resolved host fn from an
+        // earlier call can't shadow a `register_host_fn` swap that
+        // happened between calls.
+        self.reset_call_cache();
         let needed = (func.locals as usize)
             .max(args.len() + return_slot_count as usize + extra_locals.len());
         let mut locals = vec![0u64; needed];
@@ -984,7 +1060,11 @@ impl BytecodeVm {
                 // matches what a real dispatch would leave behind —
                 // this keeps the `stack_recipe` table valid in the
                 // deopt-resume path.
-                let host_fn = self.config.cap_vtable.resolve_host_fn(*import_idx).cloned();
+                // M2-C lever 2: consult the per-VM inline cache before
+                // walking the per-call HashMap. Hot loops dispatching
+                // the same `import_idx` repeatedly take the fast path;
+                // the polymorphic case still falls through cleanly.
+                let host_fn = self.resolve_host_fn_cached(*import_idx);
                 if let Some(func) = host_fn {
                     // Pop in declaration order: stack top is the last
                     // arg, so we collect then reverse.

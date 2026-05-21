@@ -2567,7 +2567,27 @@ fn bench_cmp_lua(c: &mut Criterion) {
         // squarely inside the M2-A scalar envelope. This is the canonical
         // "bytecode-from-source" measurement and the only timed row the
         // bytecode column currently produces; everything else bounces.
-        if let Some(ev) = try_build_bytecode(w12_relon_src(), "W12") {
+        //
+        // M2-C lever 1 (2026-05-21): the W12 bench drives the concrete
+        // `BytecodeEvaluator` through `run_main_i64`, the typed-i64
+        // fast-path that skips `HashMap<String, Value>` arg packing
+        // and the `Value::Int` round-trip on the return slot. The
+        // resulting timing measures bytecode dispatch cost end-to-end
+        // (alloc + dispatch + decode) without the host-arg surface
+        // overhead — closer to the LuaJIT row's accounting.
+        if let Ok(ev_bc) = relon_bytecode::BytecodeEvaluator::from_source(w12_relon_src()) {
+            let v = ev_bc.run_main_i64(&[7]).expect("W12 bytecode run_main_i64");
+            assert_eq!(v, 8, "W12 bytecode result must match analytic answer x + 1");
+            group.bench_function(BenchmarkId::new("W12_p99_tail", "relon_bytecode"), |b| {
+                b.iter(|| {
+                    let v = ev_bc.run_main_i64(&[black_box(7i64)]).unwrap();
+                    black_box(v);
+                });
+            });
+        } else if let Some(ev) = try_build_bytecode(w12_relon_src(), "W12") {
+            // Fallback shape — keeps the bench row alive if W12 falls
+            // outside the typed-i64 envelope (it doesn't today, but
+            // this branch absorbs any regression in `from_source`).
             let v = ev
                 .run_main(w12_relon_args(7))
                 .expect("W12 bytecode run_main");

@@ -1566,6 +1566,7 @@ dependencies = [
  "mlua",
  "relon",
  "relon-analyzer",
+ "relon-bytecode",
  "relon-codegen-native",
  "relon-eval-api",
  "relon-evaluator",
