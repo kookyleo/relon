@@ -86,7 +86,7 @@ pub mod trace_recording;
 pub mod trap_handler;
 pub mod vtable;
 
-pub use bytecode_bridge::CraneliftHotTrigger;
+pub use bytecode_bridge::{CraneliftHotTrigger, CraneliftTraceLookup};
 pub use cache::{deserialize as deserialize_cache, serialize as serialize_cache, CacheEntry};
 pub use error::CraneliftError;
 pub use evaluator::CraneliftAotEvaluator;
