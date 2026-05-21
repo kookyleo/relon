@@ -351,10 +351,8 @@ impl ClosureArena {
     /// stack should carry to reach this slot.
     pub fn alloc(&mut self, body_idx: u32, captures: Vec<u64>) -> Handle {
         let handle = self.slots.len() as Handle;
-        self.slots.push(Arc::new(ClosureSlot {
-            body_idx,
-            captures,
-        }));
+        self.slots
+            .push(Arc::new(ClosureSlot { body_idx, captures }));
         handle
     }
 

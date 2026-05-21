@@ -465,9 +465,7 @@ impl<'a> CompileState<'a> {
                 self.next_snapshot_idx += 1;
                 self.current_stack.push(StackOrigin::Snapshot(snap_idx));
             }
-            BcOp::MakeClosure {
-                capture_count, ..
-            } => {
+            BcOp::MakeClosure { capture_count, .. } => {
                 // M3: pops `capture_count` capture values, pushes one
                 // closure handle. Handle is snapshot-tagged because its
                 // numeric value (the arena slot index) can't be

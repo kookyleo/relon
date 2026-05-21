@@ -269,10 +269,7 @@ fn capture_get_outside_closure_traps() {
     // bug. The dispatch loop surfaces it as `StackUnderflow` (the
     // shared "compiler-bug" envelope) — no panic.
     let outer = BcFunction {
-        ops: vec![
-            BcOp::CaptureGet { idx: 0 },
-            BcOp::Return,
-        ],
+        ops: vec![BcOp::CaptureGet { idx: 0 }, BcOp::Return],
         locals: 0,
         ir_pc_map: vec![0; 2],
         stack_recipe: vec![Vec::new(); 2],

@@ -1021,6 +1021,12 @@ impl BytecodeVm {
         }
     }
 
+    // M3: the captures parameter pushes the arg count past clippy's
+    // default seven-arg threshold; the alternative (bundle the dispatch
+    // state into a struct) buys nothing here because the fields are
+    // already pulled apart for borrow-discipline reasons (operand
+    // stack borrowed mutably alongside locals + arena).
+    #[allow(clippy::too_many_arguments)]
     fn dispatch_one(
         &self,
         func: &BcFunction,
@@ -1458,8 +1464,7 @@ impl BytecodeVm {
                     .closure_bodies
                     .get(slot.body_idx as usize)
                     .ok_or(BcVmError::StackUnderflow { bc_idx })?;
-                let ret =
-                    self.invoke_closure_body(body, &args, &slot.captures, memory)?;
+                let ret = self.invoke_closure_body(body, &args, &slot.captures, memory)?;
                 stack.push(ret);
             }
             BcOp::CaptureGet { idx } => {
