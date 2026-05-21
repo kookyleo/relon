@@ -22,7 +22,7 @@ use std::sync::Arc;
 
 use relon_eval_api::layout::SchemaLayout;
 use relon_eval_api::schema_canonical::Schema;
-use relon_eval_api::{ClosureData, Evaluator, RuntimeError, Scope, Thunk, Value};
+use relon_eval_api::{CapabilityGate, ClosureData, Evaluator, RuntimeError, Scope, Thunk, Value};
 use relon_ir::ir::Module as IrModule;
 use relon_ir::IrType;
 use relon_parser::{Node, TokenRange};
@@ -226,6 +226,26 @@ impl BytecodeEvaluator {
     /// vtable).
     pub fn with_config(mut self, config: BcVmConfig) -> Self {
         self.default_config = config;
+        self
+    }
+
+    /// M2-B phase 1: install the unified
+    /// [`CapabilityGate`] policy boundary on the
+    /// evaluator's default VM config. Subsequent `run_main` /
+    /// `resume_from_*` calls inherit the gate; per-call configs built
+    /// via [`Self::with_config`] are responsible for carrying their
+    /// own gate.
+    ///
+    /// Phase 1 only **parks** the hook — the dispatch loop does not
+    /// consult the gate yet because the bytecode VM has no
+    /// `BcOp::CallNative` / `BcOp::CheckCap` op today. The wire-up of
+    /// those ops + the dispatch consult is phase 2 work tracked by the
+    /// M2-B RFC. Calling this method on an M2-A scaffold source is
+    /// safe and behaviourally a no-op; it preserves the option for
+    /// hosts that want to register the gate at evaluator construction
+    /// time, before phase 2 lands the consult.
+    pub fn with_capability_gate(mut self, gate: Arc<dyn CapabilityGate>) -> Self {
+        self.default_config.cap_vtable.set_gate(gate);
         self
     }
 

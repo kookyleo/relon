@@ -288,3 +288,63 @@ fn vtable_grant_smoke() {
     assert!(vtable.is_granted(7));
     assert!(!vtable.is_granted(8));
 }
+
+// -- M2-B phase 1: CapabilityGate hook smoke ----------------------
+
+/// Counts every `check` invocation so the test can confirm the hook
+/// is reachable from the evaluator surface. The dispatch path does
+/// not consult the gate yet (phase 2 work) — this test only proves
+/// the slot is wired so future phases can dispatch through it without
+/// re-plumbing the type.
+struct CountingGate {
+    hits: std::sync::atomic::AtomicU64,
+}
+
+impl relon_eval_api::CapabilityGate for CountingGate {
+    fn check(
+        &self,
+        cap: relon_eval_api::CapabilityBit,
+    ) -> Result<(), relon_eval_api::CapabilityError> {
+        self.hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        // Deny everything; the dispatch path doesn't consult the gate
+        // in phase 1, so denial here must not surface as a runtime
+        // error for arithmetic-only sources.
+        Err(relon_eval_api::CapabilityError::not_granted(cap))
+    }
+}
+
+#[test]
+fn capability_gate_hook_can_be_installed_and_inspected() {
+    use std::sync::Arc;
+
+    let gate = Arc::new(CountingGate {
+        hits: std::sync::atomic::AtomicU64::new(0),
+    });
+    let ev = BytecodeEvaluator::from_source("#main(Int x, Int y) -> Int\nx + y")
+        .unwrap()
+        .with_capability_gate(gate.clone());
+
+    // Run a scalar-only source: the dispatch path is unchanged in
+    // phase 1, so the gate is parked but never consulted. We assert
+    // both: the run completes successfully and the gate sees zero
+    // dispatch-time hits.
+    let mut args = HashMap::new();
+    args.insert("x".to_string(), Value::Int(40));
+    args.insert("y".to_string(), Value::Int(2));
+    let value = ev.run_main(args).expect("scalar source runs unchanged");
+    assert_eq!(value, Value::Int(42));
+    assert_eq!(gate.hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+#[test]
+fn capability_vtable_set_gate_round_trips() {
+    use std::sync::Arc;
+
+    let mut vtable = CapabilityVtable::default();
+    assert!(vtable.gate().is_none());
+    let gate: Arc<dyn relon_eval_api::CapabilityGate> = Arc::new(CountingGate {
+        hits: std::sync::atomic::AtomicU64::new(0),
+    });
+    vtable.set_gate(gate);
+    assert!(vtable.gate().is_some());
+}
