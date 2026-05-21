@@ -51,10 +51,19 @@
 //!   **M2-B phase 1**: the vtable now accepts an optional
 //!   `Arc<dyn relon_eval_api::CapabilityGate>` so the unified P0-B
 //!   policy boundary can be installed ahead of native-fn dispatch
-//!   wire-up. Phase 1 only parks the hook — callers register a gate
+//!   wire-up. Phase 1 parked the hook — callers register a gate
 //!   via [`BytecodeEvaluator::with_capability_gate`] or
-//!   [`vm::CapabilityVtable::set_gate`]; native-fn dispatch + the
-//!   in-VM consult follow in subsequent phases (see
+//!   [`vm::CapabilityVtable::set_gate`].
+//!   **M2-B phase 2**: the dispatch path now consults the installed
+//!   gate at two points: a pre-dispatch sweep of every grant-table
+//!   bit (`CapabilityVtable::consult_all_granted_bits`) and an
+//!   enrichment hook on `BcOp::Trap(CapabilityDenied)` that replaces
+//!   the legacy `u32::MAX` sentinel with the first gate-denied bit.
+//!   Phase 2 stays consistent with the M2-A scaffold envelope —
+//!   no IR-level `CallNative` / IO ops exist yet, so the consult
+//!   surface area is bounded by the trap+grant pair. The wider
+//!   per-call-site consult lands in phase 3 alongside IR coverage
+//!   expansion (see
 //!   `docs/internal/rfc-m2-b-bytecode-jit-integration-2026-05-21.md`).
 //! - **resource**: an instruction counter (`BcVmConfig::max_steps`)
 //!   plus a per-call deadline. Ticks once per bytecode op so the

@@ -236,14 +236,24 @@ impl BytecodeEvaluator {
     /// via [`Self::with_config`] are responsible for carrying their
     /// own gate.
     ///
-    /// Phase 1 only **parks** the hook — the dispatch loop does not
-    /// consult the gate yet because the bytecode VM has no
-    /// `BcOp::CallNative` / `BcOp::CheckCap` op today. The wire-up of
-    /// those ops + the dispatch consult is phase 2 work tracked by the
-    /// M2-B RFC. Calling this method on an M2-A scaffold source is
-    /// safe and behaviourally a no-op; it preserves the option for
-    /// hosts that want to register the gate at evaluator construction
-    /// time, before phase 2 lands the consult.
+    /// Phase 2 wires this into two enforcement points on the dispatch
+    /// path:
+    ///
+    /// * Pre-dispatch sweep — `BytecodeVm::invoke_from_with_stack`
+    ///   consults the gate for every grant-table bit before the first
+    ///   op runs; a denial trips
+    ///   [`RuntimeError::WasmCapabilityDenied`] with the failing bit.
+    /// * Trap enrichment — when `BcOp::Trap(CapabilityDenied)` fires
+    ///   in a hand-built BcFunction, the VM consults the gate to
+    ///   substitute the legacy `u32::MAX` sentinel with the first
+    ///   gate-denied [`CapabilityBit`].
+    ///
+    /// For the M2-A scaffold envelope (scalar arith / cmp / control
+    /// flow only) the standard `from_source` compile pass emits no
+    /// grants and no capability traps, so calling this method remains
+    /// behaviourally a no-op on those sources. Hosts that register the
+    /// gate ahead of phase 3 IR coverage get the consult mechanism
+    /// for free as soon as guarded ops land.
     pub fn with_capability_gate(mut self, gate: Arc<dyn CapabilityGate>) -> Self {
         self.default_config.cap_vtable.set_gate(gate);
         self
