@@ -611,11 +611,13 @@ impl Evaluator for BytecodeEvaluator {
                     return Ok(self.pack_trace_result(result));
                 }
                 crate::trace_dispatch::TraceInvokeOutcome::Deopt { snapshot } => {
-                    // Drive the existing partial-resume path. The
-                    // snapshot carries `external_pc` + slot copies;
-                    // `resume_from_snapshot` routes those onto the
+                    // Drive the partial-resume path through the
+                    // sub-task-B convenience alias so the call site
+                    // explicitly names what's happening. The snapshot
+                    // carries `external_pc` + slot copies;
+                    // `resume_from_deopt` routes those onto the
                     // bytecode VM's `start_bc_idx`.
-                    return self.resume_from_snapshot(args, &snapshot);
+                    return self.resume_from_deopt(args, &snapshot);
                 }
             }
         }
@@ -757,6 +759,30 @@ impl BytecodeEvaluator {
     ) -> Result<Value, RuntimeError> {
         let (value, _) = self.resume_from_snapshot_with_metrics(args, snapshot)?;
         Ok(value)
+    }
+
+    /// M2-B phase 4c-cont sub-task B: full deopt → bytecode handoff
+    /// entry point.
+    ///
+    /// Convenience alias for [`Self::resume_from_snapshot`] surfaced
+    /// at this name so the public API mirrors the
+    /// [`crate::trace_dispatch::TraceInvokeOutcome::Deopt`] arm the
+    /// dispatcher switch routes through internally. Hosts that hold
+    /// a snapshot (e.g. when manually orchestrating the trace
+    /// pipeline outside of [`Self::run_main`]) can call this directly
+    /// to skip the lookup re-consult.
+    ///
+    /// The semantic is identical to `resume_from_snapshot`: rebuild
+    /// the operand stack from the per-PC recipe + snapshot fragments,
+    /// dispatch the bytecode VM starting at the snapshot's
+    /// `external_pc`, propagate any trap on the resumed dispatch as
+    /// the public [`RuntimeError`] envelope.
+    pub fn resume_from_deopt(
+        &self,
+        args: HashMap<String, Value>,
+        snapshot: &relon_trace_abi::DeoptStateSnapshot,
+    ) -> Result<Value, RuntimeError> {
+        self.resume_from_snapshot(args, snapshot)
     }
 
     /// Same as [`Self::resume_from_snapshot`] but also returns
