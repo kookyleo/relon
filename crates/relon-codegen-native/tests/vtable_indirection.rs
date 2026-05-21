@@ -18,14 +18,15 @@ use tempfile::tempdir;
 
 #[test]
 fn vtable_layout_matches_slot_count() {
-    // 3 active slots × 8-byte pointer = 24 bytes used; the reserved
+    // 4 active slots × 8-byte pointer = 32 bytes used; the reserved
     // section is 32 slots so we have headroom for new helpers.
-    assert_eq!(VtableSlot::COUNT, 3);
+    assert_eq!(VtableSlot::COUNT, 4);
     let active_bytes: usize = VtableSlot::COUNT as usize * 8;
     assert!(VTABLE_BYTES >= active_bytes);
     assert_eq!(VtableSlot::RelonNow.offset_bytes(), 0);
     assert_eq!(VtableSlot::RelonRaiseTrap.offset_bytes(), 8);
     assert_eq!(VtableSlot::RelonCapLookup.offset_bytes(), 16);
+    assert_eq!(VtableSlot::RelonGlobMatch.offset_bytes(), 24);
     assert_eq!(VTABLE_SYMBOL, "__relon_capability_vtable");
 }
 
@@ -38,6 +39,7 @@ fn populate_vtable_yields_three_non_null_pointers() {
         assert!(!(*slots.add(0)).is_null(), "RelonNow slot");
         assert!(!(*slots.add(1)).is_null(), "RelonRaiseTrap slot");
         assert!(!(*slots.add(2)).is_null(), "RelonCapLookup slot");
+        assert!(!(*slots.add(3)).is_null(), "RelonGlobMatch slot");
     }
 }
 

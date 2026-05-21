@@ -69,13 +69,27 @@ pub enum VtableSlot {
     RelonRaiseTrap = 1,
     /// `extern "C" fn(state: *const SandboxState, cap_bit: i32) -> *const u8`
     RelonCapLookup = 2,
+    /// 2026-05-21: `extern "C" fn(s_ptr: *const u8, p_ptr: *const u8) -> i32`.
+    ///
+    /// Tier-2 LuaJIT-pattern-subset glob matcher. The two arguments
+    /// are absolute pointers to wasm-style String records (`[len: u32
+    /// LE][utf8 bytes]`); the helper reads the headers, decodes the
+    /// UTF-8 payloads, runs the shared `relon_ir::glob::glob_match`
+    /// algorithm, and returns `1` for match / `0` for no-match.
+    ///
+    /// Codegen intercepts `Op::Call { fn_index ==
+    /// relon_ir::stdlib::GLOB_MATCH_INDEX }` in `emit_call_stdlib` and
+    /// emits the indirect call here rather than inlining the bundled
+    /// stdlib body (the body is a trap sentinel — see
+    /// `relon_ir::stdlib::defs::glob_match_string`).
+    RelonGlobMatch = 3,
 }
 
 impl VtableSlot {
     /// Number of slots reserved in the vtable. Bumping this requires
     /// a `GENERATOR_VERSION` bump in `object_cache_integration` so
     /// older cache files self-invalidate.
-    pub const COUNT: u32 = 3;
+    pub const COUNT: u32 = 4;
 
     /// Byte offset of this slot inside the vtable. Each slot is one
     /// host pointer (8 bytes on x86_64-linux, which is v5-γ's only
@@ -123,14 +137,17 @@ pub unsafe fn populate_vtable(vtable_ptr: *mut u8) {
         *slots.add(VtableSlot::RelonNow as usize) = SandboxState::now_helper as *const u8;
         *slots.add(VtableSlot::RelonRaiseTrap as usize) = SandboxState::raise_trap as *const u8;
         *slots.add(VtableSlot::RelonCapLookup as usize) = SandboxState::cap_lookup as *const u8;
+        *slots.add(VtableSlot::RelonGlobMatch as usize) =
+            crate::glob_helper::relon_glob_match_helper as *const u8;
     }
     tracing::trace!(
         target: "relon::vtable",
-        "populated vtable at {:p}: now={:p} raise_trap={:p} cap_lookup={:p}",
+        "populated vtable at {:p}: now={:p} raise_trap={:p} cap_lookup={:p} glob_match={:p}",
         vtable_ptr,
         SandboxState::now_helper as *const u8,
         SandboxState::raise_trap as *const u8,
         SandboxState::cap_lookup as *const u8,
+        crate::glob_helper::relon_glob_match_helper as *const u8,
     );
 }
 
@@ -143,6 +160,7 @@ mod tests {
         assert_eq!(VtableSlot::RelonNow.offset_bytes(), 0);
         assert_eq!(VtableSlot::RelonRaiseTrap.offset_bytes(), 8);
         assert_eq!(VtableSlot::RelonCapLookup.offset_bytes(), 16);
+        assert_eq!(VtableSlot::RelonGlobMatch.offset_bytes(), 24);
     }
 
     #[test]
@@ -153,6 +171,7 @@ mod tests {
             VtableSlot::RelonNow,
             VtableSlot::RelonRaiseTrap,
             VtableSlot::RelonCapLookup,
+            VtableSlot::RelonGlobMatch,
         ];
         assert_eq!(variants.len() as u32, VtableSlot::COUNT);
     }
@@ -172,7 +191,7 @@ mod tests {
     }
 
     #[test]
-    fn populate_vtable_writes_three_non_null_pointers() {
+    fn populate_vtable_writes_all_active_slot_pointers() {
         let mut buf = [0u8; VTABLE_BYTES];
         unsafe { populate_vtable(buf.as_mut_ptr()) };
         let slots = buf.as_ptr() as *const *const u8;
@@ -180,6 +199,7 @@ mod tests {
             assert!(!(*slots.add(0)).is_null(), "RelonNow slot");
             assert!(!(*slots.add(1)).is_null(), "RelonRaiseTrap slot");
             assert!(!(*slots.add(2)).is_null(), "RelonCapLookup slot");
+            assert!(!(*slots.add(3)).is_null(), "RelonGlobMatch slot");
         }
     }
 }

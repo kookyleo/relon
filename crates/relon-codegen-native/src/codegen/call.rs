@@ -88,6 +88,30 @@ impl<'a, 'b> super::Codegen<'a, 'b> {
         }
         args.reverse();
 
+        // 2026-05-21: `glob_match(s, pattern) -> Bool` intercept.
+        //
+        // The bundled stdlib body for `glob_match` is a trap sentinel
+        // (`relon_ir::stdlib::defs::glob_match_string`) — inlining it
+        // would always trap at runtime. Instead, route the call to
+        // the `RelonGlobMatch` vtable slot which dispatches to
+        // `relon_codegen_native::glob_helper::relon_glob_match_helper`.
+        //
+        // The helper takes the SandboxState pointer plus two
+        // arena-relative i32 offsets (`s_off`, `p_off`) and returns
+        // i32 (1 = match / 0 = no-match). Both String IR values
+        // already live on the operand stack as i32 arena offsets, so
+        // we forward them verbatim.
+        if fn_index == relon_ir::stdlib::GLOB_MATCH_INDEX {
+            debug_assert_eq!(args.len(), 2, "glob_match has two String args");
+            let inst = self.emit_host_fn_call(
+                crate::vtable::VtableSlot::RelonGlobMatch,
+                &[self.state_ptr, args[0], args[1]],
+            );
+            let bool_v = self.builder.inst_results(inst)[0];
+            self.push(bool_v);
+            return Ok(());
+        }
+
         // Allocate the exit block + result-carrier param.
         let exit_block = self.builder.create_block();
         let exit_ty = ir_ty_to_cl(ret_ty)?;

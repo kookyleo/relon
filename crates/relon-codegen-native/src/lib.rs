@@ -74,6 +74,7 @@ pub mod cache;
 pub(crate) mod codegen;
 pub mod error;
 pub mod evaluator;
+pub mod glob_helper;
 pub mod object_cache_integration;
 pub mod sandbox;
 pub mod schema_cache;

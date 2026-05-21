@@ -86,6 +86,20 @@ pub(super) fn make_cap_lookup_signature(pointer_ty: cranelift_codegen::ir::Type)
     sig
 }
 
+/// Build the cranelift signature for the `RelonGlobMatch` vtable
+/// slot: `extern "C" fn(state: *const SandboxState, s_off: i32,
+/// p_off: i32) -> i32`. The two i32 args are arena-relative offsets
+/// into the wasm-style String records the codegen layout pass
+/// produced; the i32 return is the matched (1) / no-match (0) bool.
+pub(super) fn make_glob_match_signature(pointer_ty: cranelift_codegen::ir::Type) -> Signature {
+    let mut sig = Signature::new(CallConv::SystemV);
+    sig.params.push(AbiParam::new(pointer_ty));
+    sig.params.push(AbiParam::new(I32));
+    sig.params.push(AbiParam::new(I32));
+    sig.returns.push(AbiParam::new(I32));
+    sig
+}
+
 /// Declare the `__relon_capability_vtable` data symbol on the given
 /// module. Reserves [`VTABLE_BYTES`] of zero-initialised space so the
 /// host can populate the slots post-finalize (JIT) or post-dlopen

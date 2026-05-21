@@ -515,6 +515,29 @@ impl SandboxState {
         unsafe { *self.tail_cursor.get() }
     }
 
+    /// Read the current arena base pointer as a raw `usize`.
+    ///
+    /// Used by host helpers that need to resolve an arena-relative
+    /// i32 offset to an absolute address (e.g. the `glob_match`
+    /// helper that takes two `String` operands as offsets and reads
+    /// the wasm-style `[len][bytes]` records out of the arena).
+    ///
+    /// Returns `0` when no arena is installed.
+    pub fn arena_base(&self) -> usize {
+        // SAFETY: helpers are only invoked while the JIT thread is
+        // executing host code on behalf of a still-live JIT entry —
+        // `install_arena` has already published a value, and no other
+        // writer is racing.
+        unsafe { *self.arena_base.get() }
+    }
+
+    /// Read the current arena length (`install_arena`'s `len`
+    /// argument). Companion to [`Self::arena_base`].
+    pub fn arena_len(&self) -> u32 {
+        // SAFETY: see `arena_base`.
+        unsafe { *self.arena_len.get() }
+    }
+
     /// Configure the per-call deadline. Pass `Duration::MAX` (or any
     /// value that overflows to `i64::MAX` nanos) to disable.
     pub fn set_deadline(&self, deadline: Duration) {

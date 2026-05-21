@@ -61,8 +61,8 @@ mod record;
 
 use const_pool::ConstPool;
 use guard::{
-    declare_vtable_data, emit_indirect_host_call, make_cap_lookup_signature, make_now_signature,
-    make_raise_trap_signature,
+    declare_vtable_data, emit_indirect_host_call, make_cap_lookup_signature,
+    make_glob_match_signature, make_now_signature, make_raise_trap_signature,
 };
 use hot_counter::emit_hot_counter_inject;
 
@@ -462,6 +462,7 @@ fn lower_module_into<M: CrModule>(
     let raise_trap_sig = make_raise_trap_signature(module.target_config().pointer_type());
     let now_sig = make_now_signature(module.target_config().pointer_type());
     let cap_lookup_sig = make_cap_lookup_signature(module.target_config().pointer_type());
+    let glob_match_sig = make_glob_match_signature(module.target_config().pointer_type());
 
     // Build the entry signature. The exact shape depends on
     // `entry_shape`: legacy IR carries `I64...` user args, while the
@@ -570,6 +571,7 @@ fn lower_module_into<M: CrModule>(
         let raise_trap_sig_ref = builder.import_signature(raise_trap_sig.clone());
         let now_sig_ref = builder.import_signature(now_sig.clone());
         let cap_lookup_sig_ref = builder.import_signature(cap_lookup_sig.clone());
+        let glob_match_sig_ref = builder.import_signature(glob_match_sig.clone());
 
         // Pre-allocate the trap block + a block param that carries
         // the i64 trap code. Every guard branches here with its
@@ -590,6 +592,7 @@ fn lower_module_into<M: CrModule>(
             raise_trap_sig_ref,
             now_sig_ref,
             cap_lookup_sig_ref,
+            glob_match_sig_ref,
             pointer_ty,
             frontend_config: module.target_config(),
             entry_shape,
@@ -687,6 +690,7 @@ fn lower_module_into<M: CrModule>(
             let raise_trap_sig_ref = builder.import_signature(raise_trap_sig.clone());
             let now_sig_ref = builder.import_signature(now_sig.clone());
             let cap_lookup_sig_ref = builder.import_signature(cap_lookup_sig.clone());
+            let glob_match_sig_ref = builder.import_signature(glob_match_sig.clone());
 
             let trap_block = builder.create_block();
             builder.append_block_param(trap_block, I64);
@@ -709,6 +713,7 @@ fn lower_module_into<M: CrModule>(
                 raise_trap_sig_ref,
                 now_sig_ref,
                 cap_lookup_sig_ref,
+                glob_match_sig_ref,
                 pointer_ty,
                 frontend_config: module.target_config(),
                 // Lambdas use the LegacyI64Args entry shape for
@@ -919,6 +924,12 @@ struct Codegen<'a, 'b> {
     now_sig_ref: SigRef,
     /// Pre-built cranelift signature for `relon_cap_lookup`.
     cap_lookup_sig_ref: SigRef,
+    /// Pre-built cranelift signature for `relon_glob_match_helper`
+    /// (`extern "C" fn(state, s_off: i32, p_off: i32) -> i32`).
+    /// Used by [`Self::emit_call_stdlib`] to route the bundled
+    /// `glob_match` stdlib slot through the vtable rather than
+    /// inlining the trap-sentinel IR body.
+    glob_match_sig_ref: SigRef,
     pointer_ty: cranelift_codegen::ir::Type,
     /// Target frontend config (pointer width / default call conv).
     /// Threaded through so helpers that call `call_memcpy` get the
@@ -1086,6 +1097,7 @@ impl<'a, 'b> Codegen<'a, 'b> {
             VtableSlot::RelonNow => self.now_sig_ref,
             VtableSlot::RelonRaiseTrap => self.raise_trap_sig_ref,
             VtableSlot::RelonCapLookup => self.cap_lookup_sig_ref,
+            VtableSlot::RelonGlobMatch => self.glob_match_sig_ref,
         };
         emit_indirect_host_call(
             self.builder,
