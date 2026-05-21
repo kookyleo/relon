@@ -36,7 +36,9 @@
 //! Run: `cargo bench -p relon-bench --bench ascii_case_fold`.
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use relon_ir::ascii_fold_simd::{fold_ascii_prefix_into_string, AsciiFoldMode};
+use relon_ir::ascii_fold_simd::{
+    case_fold_ascii_fast_into_string, fold_ascii_prefix_into_string, AsciiFoldMode,
+};
 
 /// Build an ASCII corpus of `n` bytes that exercises both the in-
 /// range (cased letters) and out-of-range (digits / punctuation /
@@ -105,6 +107,24 @@ fn simd_fold_string(s: &str, mode: AsciiFoldMode) -> String {
     out
 }
 
+/// Tier 2c (#153) "pre-classified" fast path. The caller has
+/// already proven the payload is all-ASCII (typically by reading
+/// the StringRef record's flag bit) so this row skips the
+/// `scan_ascii_prefix` SIMD pass that [`simd_fold_string`] runs.
+///
+/// The delta between this row and `simd_*` is the pure cost of the
+/// per-call SIMD scan: one pass over the payload, ~3 cycles / byte
+/// on x86_64-v3 once LLVM autovectorises the mask-and-compare. On
+/// the 10 KB corpus we expect ~30 % faster than `simd_*`; on the
+/// 100 B corpus the per-call branch overhead dominates so the
+/// delta should be much smaller.
+fn pre_classified_fold_string(s: &str, mode: AsciiFoldMode) -> String {
+    let mut out = String::with_capacity(s.len());
+    let r = case_fold_ascii_fast_into_string(s.as_bytes(), mode, true, &mut out);
+    debug_assert_eq!(r.consumed, s.len());
+    out
+}
+
 fn bench_ascii_case_fold(c: &mut Criterion) {
     let mut group = c.benchmark_group("ascii_case_fold");
 
@@ -136,6 +156,21 @@ fn bench_ascii_case_fold(c: &mut Criterion) {
                     black_box(out)
                 });
             });
+
+            // Tier 2c pre-classified: caller has already proven the
+            // payload is ASCII (via the StringRef record's flag bit)
+            // so the per-call SIMD scan is skipped. The delta vs
+            // `simd_*` is the pure cost of one SIMD scan over the
+            // payload.
+            group.bench_function(
+                BenchmarkId::new(format!("preclassified_{mode_str}"), n),
+                |b| {
+                    b.iter(|| {
+                        let out = pre_classified_fold_string(black_box(&corpus), mode);
+                        black_box(out)
+                    });
+                },
+            );
         }
     }
 

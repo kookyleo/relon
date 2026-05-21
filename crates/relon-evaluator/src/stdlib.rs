@@ -863,6 +863,58 @@ impl RelonFunction for StringReplace {
 ///   5. Identity (combining marks pass through unchanged when not
 ///      `at_word_start` for the title flow).
 fn fold_string(s: &str, mode: CaseFoldMode, locale_turkish: bool) -> String {
+    fold_string_with_ascii_hint(s, mode, locale_turkish, AsciiHint::Unknown)
+}
+
+/// Tier 2c (#153) classification hint passed in from the caller.
+///
+/// Surface bodies (`upper` / `lower` / `title` / locale variants) call
+/// in via the plain [`fold_string`] entry point and supply
+/// [`AsciiHint::Unknown`]; the fast path then runs its usual SIMD
+/// scan to decide whether to skip the slow per-codepoint loop. When
+/// a future caller can prove the input is pure ASCII upstream — e.g.
+/// the StringRef record's [`relon_trace_abi::STRING_RECORD_ASCII_FLAG_BIT`]
+/// is set after intern / record-build — it can pass
+/// [`AsciiHint::AllAscii`] to skip the per-call scan entirely.
+///
+/// `KnownNonAscii` lets a future intern-table classifier report the
+/// opposite fact and skip the SIMD scan in the other direction; the
+/// slow path runs over the whole input from codepoint 0. v3++ b-6
+/// has no callers passing this yet, but the variant is here so the
+/// fold engine has the full state space rather than a default-true
+/// / default-false split.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(
+    dead_code,
+    reason = "AllAscii / KnownNonAscii are reached only by the #153 parity tests today; surface call site lands in the follow-up that plumbs the StringRef ASCII flag bit into the evaluator's Value -> &str path"
+)]
+enum AsciiHint {
+    /// Caller has not classified the input. The fold engine runs the
+    /// SIMD scan + fast path as before.
+    Unknown,
+    /// Caller has proven the input is all `< 0x80`. The fold engine
+    /// skips the SIMD scan and goes straight to the mask + xor
+    /// (or Title walker) over the whole payload.
+    AllAscii,
+    /// Caller has proven the input contains at least one byte
+    /// `>= 0x80`. The fold engine skips the SIMD scan and goes
+    /// straight to the per-codepoint slow path.
+    KnownNonAscii,
+}
+
+/// Tier 2c (#153) entry point that lets the caller surface the
+/// ASCII-flag fact bypassing the per-call SIMD scan.
+///
+/// Identical UAX #21 semantics to [`fold_string`]; the only difference
+/// is that an [`AsciiHint::AllAscii`] caller saves one
+/// `scan_ascii_prefix` pass per fold (~3 cycles / byte after auto-
+/// vectorisation).
+fn fold_string_with_ascii_hint(
+    s: &str,
+    mode: CaseFoldMode,
+    locale_turkish: bool,
+    ascii_hint: AsciiHint,
+) -> String {
     let mut out = String::with_capacity(s.len());
     let mut at_word_start = true;
 
@@ -874,6 +926,12 @@ fn fold_string(s: &str, mode: CaseFoldMode, locale_turkish: bool) -> String {
     // overrides `I <-> ı` / `i <-> İ` produce 2-byte UTF-8 output
     // from ASCII input, which the byte-in / byte-out fast path can't
     // express.
+    //
+    // Tier 2c (#153): when the caller has already proven the payload
+    // is pure ASCII (e.g. the StringRef record's flag bit is set), we
+    // route through `case_fold_ascii_fast_into_string` and skip the
+    // per-call `scan_ascii_prefix` SIMD pass. Saves ~3 cycles / byte
+    // on the auto-vec scan + the entry into the mask+xor loop.
     //
     // The fast path appends folded bytes directly into `out`'s UTF-8
     // buffer (every byte is `< 0x80`, hence a 1-byte UTF-8 codepoint).
@@ -888,14 +946,37 @@ fn fold_string(s: &str, mode: CaseFoldMode, locale_turkish: bool) -> String {
     };
     let fast_consumed = if !locale_turkish {
         if let Some(fm) = fast_mode {
-            let r = relon_ir::ascii_fold_simd::fold_ascii_prefix_into_string(
-                s.as_bytes(),
-                fm,
-                at_word_start,
-                &mut out,
-            );
-            at_word_start = r.at_word_start;
-            r.consumed
+            match ascii_hint {
+                AsciiHint::AllAscii => {
+                    // Caller has guaranteed every byte is `< 0x80`.
+                    // Skip the scan and consume the whole payload.
+                    let r = relon_ir::ascii_fold_simd::case_fold_ascii_fast_into_string(
+                        s.as_bytes(),
+                        fm,
+                        at_word_start,
+                        &mut out,
+                    );
+                    at_word_start = r.at_word_start;
+                    r.consumed
+                }
+                AsciiHint::KnownNonAscii => {
+                    // Caller has guaranteed there is at least one
+                    // non-ASCII byte. Skip the SIMD scan and let the
+                    // per-codepoint slow path handle the whole
+                    // payload starting at index 0.
+                    0
+                }
+                AsciiHint::Unknown => {
+                    let r = relon_ir::ascii_fold_simd::fold_ascii_prefix_into_string(
+                        s.as_bytes(),
+                        fm,
+                        at_word_start,
+                        &mut out,
+                    );
+                    at_word_start = r.at_word_start;
+                    r.consumed
+                }
+            }
         } else {
             0
         }
@@ -2145,5 +2226,84 @@ mod full_case_folding_tests {
         // "OΣ\u{0301}" — combining acute is case-ignorable, so Σ at
         // index 1 still qualifies as word-final.
         assert_eq!(lower("O\u{03A3}\u{0301}"), "o\u{03C2}\u{0301}");
+    }
+}
+
+#[cfg(test)]
+mod ascii_hint_tests {
+    //! Tier 2c (#153) — caller-supplied ASCII classification hint.
+    //!
+    //! The fold engine must produce byte-identical output regardless of
+    //! whether the caller passes `AsciiHint::Unknown` (the historical
+    //! shape — fold runs its own SIMD scan) or `AsciiHint::AllAscii` /
+    //! `AsciiHint::KnownNonAscii` (the producer side has already paid
+    //! the classification cost, typically via the StringRef record's
+    //! flag bit). These tests pin the parity guarantee so a future
+    //! caller that wires the StringRef flag into the evaluator gets
+    //! semantics-equivalent behaviour for free.
+    use super::{fold_string_with_ascii_hint, AsciiHint, CaseFoldMode};
+
+    fn run(s: &str, mode: CaseFoldMode) -> (String, String, String) {
+        let unknown = fold_string_with_ascii_hint(s, mode, false, AsciiHint::Unknown);
+        let all_ascii = if s.is_ascii() {
+            fold_string_with_ascii_hint(s, mode, false, AsciiHint::AllAscii)
+        } else {
+            unknown.clone()
+        };
+        let known_non_ascii = fold_string_with_ascii_hint(s, mode, false, AsciiHint::KnownNonAscii);
+        (unknown, all_ascii, known_non_ascii)
+    }
+
+    #[test]
+    fn ascii_input_matches_across_hints() {
+        for s in [
+            "",
+            "a",
+            "Z",
+            "Hello, World!",
+            "the quick brown fox",
+            "0123456789",
+            "  leading  spaces",
+        ] {
+            for mode in [
+                CaseFoldMode::Upper,
+                CaseFoldMode::Lower,
+                CaseFoldMode::Title,
+            ] {
+                let (unknown, all_ascii, known_non_ascii) = run(s, mode);
+                assert_eq!(unknown, all_ascii, "s={s:?} mode={mode:?}");
+                // KnownNonAscii forces the slow path; for ASCII input
+                // it must still produce the same output because the
+                // slow path's per-codepoint logic agrees with the
+                // mask + xor on ASCII codepoints.
+                assert_eq!(unknown, known_non_ascii, "s={s:?} mode={mode:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn non_ascii_input_matches_unknown_and_known_non_ascii() {
+        // `AsciiHint::AllAscii` is contractually invalid for non-ASCII
+        // inputs (it would skip the SIMD scan and mask-flip the high
+        // bytes), so we only assert `Unknown` vs `KnownNonAscii`
+        // parity here. The fold engine's slow path is the same in
+        // both shapes.
+        for s in [
+            "caf\u{00E9}",
+            "stra\u{00DF}e",
+            "\u{03A3}\u{0391}",
+            "Welt: ich bin\u{00E9}",
+        ] {
+            for mode in [
+                CaseFoldMode::Upper,
+                CaseFoldMode::Lower,
+                CaseFoldMode::Title,
+            ] {
+                let unknown = fold_string_with_ascii_hint(s, mode, false, AsciiHint::Unknown);
+                let known_non_ascii =
+                    fold_string_with_ascii_hint(s, mode, false, AsciiHint::KnownNonAscii);
+                assert_eq!(unknown, known_non_ascii, "s={s:?} mode={mode:?}");
+            }
+        }
     }
 }

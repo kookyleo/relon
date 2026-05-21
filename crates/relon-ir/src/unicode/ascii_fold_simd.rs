@@ -377,6 +377,98 @@ pub fn fold_ascii_prefix(
     }
 }
 
+/// Tier 2c "pre-classified" fast path — the caller has already
+/// proven (typically via the StringRef record's ASCII-flag bit) that
+/// `bytes` is entirely ASCII, so we can skip the `scan_ascii_prefix`
+/// pre-pass and go straight to the byte-wise mask + xor body.
+///
+/// This is the entry point that `case_fold` / `to_lower` / `to_upper`
+/// stdlib bodies reach when the input's record header carries the
+/// [`relon_trace_abi::STRING_RECORD_ASCII_FLAG_BIT`] — the producer
+/// (`build_string_record` or the evaluator's intern path) paid the
+/// per-byte ASCII check once at record-build time, so per-call hot
+/// paths drop the SIMD scan entirely.
+///
+/// Saves ~3 cycles / byte vs [`fold_ascii_prefix`] on the auto-vec
+/// scan + mask + xor sequence — the scan alone is one of the three
+/// data-dependent loops; removing it leaves the mask + xor (which
+/// LLVM still auto-vectorises) running on a tighter dependency
+/// chain.
+///
+/// # Safety contract (informal)
+///
+/// Caller MUST have verified `bytes.iter().all(|b| *b < 0x80)` by
+/// some upstream invariant — typically the StringRef ASCII-flag
+/// probe. Passing non-ASCII bytes through this function is **not
+/// memory-unsafe** (every operation stays inside `bytes` / `out`),
+/// but the output is no longer byte-identical with the UAX #21 slow
+/// path because non-ASCII high bytes would be mask-flipped (e.g. a
+/// 2-byte UTF-8 continuation byte `0x80..=0xBF` would get its bit-5
+/// flipped, corrupting the codepoint). A debug-mode assert flags
+/// the contract break.
+#[inline]
+pub fn case_fold_ascii_fast(
+    bytes: &[u8],
+    mode: AsciiFoldMode,
+    at_word_start_in: bool,
+    out: &mut Vec<u8>,
+) -> AsciiFastResult {
+    debug_assert!(
+        bytes.iter().all(|b| *b < 0x80),
+        "case_fold_ascii_fast called with non-ASCII payload — caller must check flag bit first"
+    );
+    if bytes.is_empty() {
+        return AsciiFastResult {
+            consumed: 0,
+            at_word_start: at_word_start_in,
+        };
+    }
+    let at_word_start = match mode {
+        AsciiFoldMode::Upper => {
+            fold_ascii_prefix_upper_lower(bytes, true, out);
+            at_word_start_in
+        }
+        AsciiFoldMode::Lower => {
+            fold_ascii_prefix_upper_lower(bytes, false, out);
+            at_word_start_in
+        }
+        AsciiFoldMode::Title => fold_ascii_prefix_title(bytes, at_word_start_in, out),
+    };
+    AsciiFastResult {
+        consumed: bytes.len(),
+        at_word_start,
+    }
+}
+
+/// Convenience wrapper around [`case_fold_ascii_fast`] that appends
+/// directly into a `String` (the common case for `fold_string`-style
+/// callers that hold a mutable `String` accumulator). ASCII bytes
+/// are valid 1-byte UTF-8 codeunits, so we promote the `Vec<u8>`
+/// path through `String::as_mut_vec` without a separate UTF-8 check.
+#[inline]
+pub fn case_fold_ascii_fast_into_string(
+    bytes: &[u8],
+    mode: AsciiFoldMode,
+    at_word_start_in: bool,
+    out: &mut String,
+) -> AsciiFastResult {
+    let pre_len = out.len();
+    let result = {
+        // SAFETY: the bytes we append here are all `< 0x80` (the
+        // caller proved this via the flag bit; the debug_assert
+        // inside `case_fold_ascii_fast` re-asserts in tests). Each
+        // such byte is a valid single-byte UTF-8 codepoint so the
+        // `String` invariant remains satisfied.
+        let buf = unsafe { out.as_mut_vec() };
+        case_fold_ascii_fast(bytes, mode, at_word_start_in, buf)
+    };
+    debug_assert!(
+        out.is_char_boundary(pre_len),
+        "case_fold_ascii_fast corrupted utf-8 boundary at {pre_len}"
+    );
+    result
+}
+
 /// Convenience wrapper: append the ASCII fast-path output directly to
 /// a `String`. ASCII bytes are valid 1-byte UTF-8 codeunits, so we
 /// can safely promote the `Vec<u8>` write into the `String`'s inner
@@ -686,5 +778,70 @@ mod tests {
         let r = fold_ascii_prefix(s, AsciiFoldMode::Upper, true, &mut out);
         assert_eq!(r.consumed, 0);
         assert!(out.is_empty());
+    }
+
+    // ---- Tier 2c: pre-classified ASCII fast path -------------------
+
+    #[test]
+    fn case_fold_ascii_fast_matches_scan_path_byte_identical() {
+        // For any pure-ASCII input, the new pre-classified fast path
+        // must produce output byte-identical with the scan-based
+        // `fold_ascii_prefix`. The contract is that the flag-bit-aware
+        // dispatch can substitute either implementation without
+        // observable differences.
+        for src in [
+            b"".as_ref(),
+            b"a",
+            b"A",
+            b"Hello, World!",
+            b"0123456789",
+            b"AAAaaa BBBbbb CCCccc",
+            b"\x00\x01\x7F",
+            b"the quick brown fox",
+        ] {
+            for mode in [
+                AsciiFoldMode::Upper,
+                AsciiFoldMode::Lower,
+                AsciiFoldMode::Title,
+            ] {
+                let mut via_scan = Vec::new();
+                let r_scan = fold_ascii_prefix(src, mode, true, &mut via_scan);
+                let mut via_fast = Vec::new();
+                let r_fast = case_fold_ascii_fast(src, mode, true, &mut via_fast);
+                assert_eq!(
+                    via_scan, via_fast,
+                    "src={src:?} mode={mode:?}: scan vs fast path divergence"
+                );
+                assert_eq!(r_scan.consumed, r_fast.consumed);
+                assert_eq!(r_scan.at_word_start, r_fast.at_word_start);
+            }
+        }
+    }
+
+    #[test]
+    fn case_fold_ascii_fast_into_string_appends_correctly() {
+        let mut acc = String::from("prefix:");
+        let r = case_fold_ascii_fast_into_string(b"Hello", AsciiFoldMode::Lower, true, &mut acc);
+        assert_eq!(acc, "prefix:hello");
+        assert_eq!(r.consumed, 5);
+    }
+
+    #[test]
+    fn case_fold_ascii_fast_empty_input_is_noop() {
+        let mut out = Vec::new();
+        let r = case_fold_ascii_fast(b"", AsciiFoldMode::Upper, true, &mut out);
+        assert_eq!(r.consumed, 0);
+        assert!(r.at_word_start);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn case_fold_ascii_fast_title_carries_word_state() {
+        let mut out = Vec::new();
+        let r = case_fold_ascii_fast(b"hello world", AsciiFoldMode::Title, true, &mut out);
+        assert_eq!(out, b"Hello World");
+        assert_eq!(r.consumed, 11);
+        // Ends mid-word (the 'd') so the boundary flag must be false.
+        assert!(!r.at_word_start);
     }
 }

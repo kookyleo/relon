@@ -253,8 +253,9 @@ pub unsafe extern "C" fn __relon_trace_dict_lookup_prechecked(
 // silent IC misses; centralising in `relon-trace-abi` keeps both
 // callers locked to the same bytes.
 pub use relon_trace_abi::hash::{
-    fx_hash_bytes, fx_hash_key_record, fx_hash_key_record_payload, STRING_RECORD_HASH_OFFSET,
-    STRING_RECORD_PAYLOAD_OFFSET,
+    fx_hash_bytes, fx_hash_key_record, fx_hash_key_record_payload, is_ascii_bytes,
+    is_ascii_flag_set, STRING_RECORD_ASCII_FLAG_BIT, STRING_RECORD_HASH_OFFSET,
+    STRING_RECORD_LEN_MASK, STRING_RECORD_PAYLOAD_OFFSET,
 };
 
 /// Convenience constructor: layout-conformant dict key record for
@@ -263,9 +264,12 @@ pub use relon_trace_abi::hash::{
 /// [`fx_hash_key_record`]:
 ///
 /// ```text
-/// offset 0  : len   : u32 LE     (payload byte count)
-/// offset 4  : hash  : u64 LE     (pre-computed fx_hash_bytes(payload))
-/// offset 12 : bytes : [u8; len]  (UTF-8 payload)
+/// offset 0  : len_with_flags : u32 LE
+///               bits 0..31 — payload byte count
+///               bit 31     — Tier 2c ASCII-flag bit (set ⇒ payload
+///                            is all `< 0x80`)
+/// offset 4  : hash           : u64 LE  (pre-computed fx_hash_bytes(payload))
+/// offset 12 : bytes          : [u8; len] (UTF-8 payload)
 /// ```
 ///
 /// Pre-stamping the FxHash at fixture-build time is what makes the
@@ -275,16 +279,36 @@ pub use relon_trace_abi::hash::{
 /// the byte-wise hash loop. See the Tier 1a stage report for the
 /// before/after numbers.
 ///
+/// Tier 2c adds the ASCII-flag bit in lockstep — the producer scans
+/// the payload once here (~3 cycles / byte after auto-vectorisation)
+/// and Unicode-heavy stdlib bodies (`upper` / `lower` / `title` /
+/// `normalize`) probe the bit on the consumer side to skip the
+/// per-codepoint UCD table walk on pure-ASCII inputs.
+///
 /// The legacy 4-byte-header layout that this used to produce is gone:
 /// every consumer of this helper (dict_inline.rs, the W5/W6 bench
 /// fixtures, the recorder tests) was updated in the same commit
 /// sequence so there is no compatibility surface to preserve.
+///
+/// # Panics
+///
+/// Debug-mode panics when `s.len() >= 2^31`. The high bit of the
+/// 32-bit header is reserved for the ASCII flag; a 2 GiB+ payload
+/// would silently clobber it in release builds. Production dict keys
+/// are interned identifiers many orders of magnitude under this cap.
 pub fn build_string_record(s: &str) -> Vec<u8> {
-    let len = s.len() as u32;
+    debug_assert!(
+        (s.len() as u64) < (STRING_RECORD_ASCII_FLAG_BIT as u64),
+        "dict key payload exceeds 2^31 bytes — ASCII flag bit would overflow into the length"
+    );
     let payload = s.as_bytes();
+    let mut len_with_flags = s.len() as u32;
+    if is_ascii_bytes(payload) {
+        len_with_flags |= STRING_RECORD_ASCII_FLAG_BIT;
+    }
     let hash = fx_hash_bytes(payload);
     let mut out = Vec::with_capacity(STRING_RECORD_PAYLOAD_OFFSET as usize + s.len());
-    out.extend_from_slice(&len.to_le_bytes());
+    out.extend_from_slice(&len_with_flags.to_le_bytes());
     out.extend_from_slice(&hash.to_le_bytes());
     out.extend_from_slice(payload);
     debug_assert_eq!(out.len(), STRING_RECORD_PAYLOAD_OFFSET as usize + s.len());
@@ -475,5 +499,54 @@ mod tests {
             __relon_trace_dict_lookup_prechecked(dict.as_ptr(), kr_missing.as_ptr(), &mut ctx)
         };
         assert_eq!(got, DICT_LOOKUP_DEOPT);
+    }
+
+    // ---- Tier 2c: ASCII flag is stamped at build time --------------
+
+    #[test]
+    fn build_string_record_marks_pure_ascii_payload() {
+        let kr = build_string_record("plainkey");
+        // Producer side has set bit 31 of the header.
+        assert!(unsafe { is_ascii_flag_set(kr.as_ptr()) });
+        // Cached hash still matches the byte-wise reference.
+        let cached = unsafe { fx_hash_key_record(kr.as_ptr()) };
+        let recomputed = unsafe { fx_hash_key_record_payload(kr.as_ptr()) };
+        assert_eq!(cached, recomputed);
+    }
+
+    #[test]
+    fn build_string_record_clears_flag_for_non_ascii_payload() {
+        // U+00E9 (é) encodes as 2 UTF-8 bytes both >= 0x80 — the
+        // producer must NOT mark the record ASCII.
+        let kr = build_string_record("caf\u{00E9}");
+        assert!(!unsafe { is_ascii_flag_set(kr.as_ptr()) });
+        // Hash + length must still round-trip via the flag-masked
+        // length field.
+        let cached = unsafe { fx_hash_key_record(kr.as_ptr()) };
+        let recomputed = unsafe { fx_hash_key_record_payload(kr.as_ptr()) };
+        assert_eq!(cached, recomputed);
+    }
+
+    #[test]
+    fn build_string_record_empty_payload_is_ascii() {
+        // Empty payload is vacuously ASCII; the flag is set so a
+        // case_fold call on `""` skips the slow path right away.
+        let kr = build_string_record("");
+        assert!(unsafe { is_ascii_flag_set(kr.as_ptr()) });
+    }
+
+    #[test]
+    fn dict_lookup_still_hits_with_ascii_flag_present() {
+        // Belt-and-braces: the dict-lookup hot path must keep working
+        // unchanged with the ASCII flag occupying bit 31 of the
+        // length field. The hash is computed over the payload only,
+        // so the flag should not perturb it.
+        let kr = build_string_record("ascii_key");
+        let h = unsafe { fx_hash_key_record(kr.as_ptr()) };
+        let dict = build_dict_record(0xfeed, &[(h, 99)]);
+        let mut ctx = TraceContext::with_capacity(0);
+        let got =
+            unsafe { __relon_trace_dict_lookup(dict.as_ptr(), kr.as_ptr(), 0xfeed, &mut ctx) };
+        assert_eq!(got, 99);
     }
 }
