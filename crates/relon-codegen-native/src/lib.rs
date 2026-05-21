@@ -70,6 +70,7 @@
 
 #![allow(unused_assignments)]
 
+pub mod bytecode_bridge;
 pub mod cache;
 pub(crate) mod codegen;
 pub mod error;
@@ -85,6 +86,7 @@ pub mod trace_recording;
 pub mod trap_handler;
 pub mod vtable;
 
+pub use bytecode_bridge::CraneliftHotTrigger;
 pub use cache::{deserialize as deserialize_cache, serialize as serialize_cache, CacheEntry};
 pub use error::CraneliftError;
 pub use evaluator::CraneliftAotEvaluator;

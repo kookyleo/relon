@@ -36,6 +36,13 @@ relon-trace-abi = { workspace = true }
 relon-trace-jit = { workspace = true }
 relon-trace-recorder = { workspace = true }
 relon-trace-emitter = { workspace = true }
+# v6-δ M2-B phase 4c: the cranelift backend hosts the
+# `BytecodeHotTrigger` adapter that wires the bytecode VM's
+# hot-counter prologue into the same `__relon_jump_to_recorder`
+# helper the cranelift entry-fn prologue uses. The dep is one-way
+# (codegen-native → bytecode); the bytecode crate itself stays
+# cranelift-free so the wasm32 build still compiles.
+relon-bytecode = { workspace = true }
 
 thiserror = { workspace = true }
 serde = { workspace = true, features = ["derive"] }

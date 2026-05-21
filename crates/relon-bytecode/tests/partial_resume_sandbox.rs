@@ -221,6 +221,7 @@ fn partial_resume_capability_denied_replays() {
             vec![StackOrigin::Local(0)], // before Return
         ],
         string_pool: Vec::new(),
+        fn_id: None,
     };
     let cfg = BcVmConfig {
         cap_vtable: CapabilityVtable::default(),

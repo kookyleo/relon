@@ -157,6 +157,13 @@ pub fn compile_function_in_module(
         ir_pc_map: state.ir_pc_map,
         stack_recipe: state.stack_recipe,
         string_pool: state.string_pool,
+        // M2-B phase 4c: the compile pass leaves `fn_id` blank by
+        // default. Hosts that wire the bytecode VM into the cross-
+        // backend trace-JIT registry stamp the id post-compile via
+        // [`BcFunction::with_fn_id`] so the bytecode artefact and the
+        // matching cranelift trace function share the same hot-counter
+        // slot.
+        fn_id: None,
     })
 }
 
