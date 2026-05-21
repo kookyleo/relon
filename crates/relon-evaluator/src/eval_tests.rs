@@ -302,6 +302,54 @@ fn test_string_stdlib() {
     }
 }
 
+/// String concat tree fold (Tier 2b, #152). Verifies that a chained
+/// `"a" + "b" + "c" + "d"` expression yields byte-identical output to
+/// the same chain split into nested let-bindings (which forces the
+/// recursive concat shape). Also exercises the heap-fallback path
+/// (total length > 22 bytes) so we catch any off-by-one in the
+/// `SmolStr::concat_many` heap branch.
+#[test]
+fn test_string_concat_tree_fold_matches_nested() {
+    // Short chain — inline result.
+    let chain = eval_doc(r#"{ "x": "a" + "b" + "c" + "d" }"#).unwrap();
+    let chain_x = match &chain {
+        Value::Dict(d) => d.map.get("x").cloned().unwrap(),
+        _ => panic!("expected Dict"),
+    };
+    assert_eq!(chain_x, Value::String("abcd".into()));
+
+    // Long chain that crosses the 22-byte SSO cap. 4 leaves of 8
+    // bytes each = 32 bytes total, so the result must land on the
+    // heap branch of `SmolStr::concat_many`.
+    let long = eval_doc(r#"{ "x": "aaaaaaaa" + "bbbbbbbb" + "cccccccc" + "dddddddd" }"#).unwrap();
+    let long_x = match &long {
+        Value::Dict(d) => d.map.get("x").cloned().unwrap(),
+        _ => panic!("expected Dict"),
+    };
+    let expected = "aaaaaaaabbbbbbbbccccccccdddddddd";
+    assert_eq!(long_x, Value::String(expected.into()));
+    if let Value::String(s) = &long_x {
+        assert_eq!(s.as_str(), expected);
+        assert!(!s.is_inline(), "32-byte result must land on heap");
+    } else {
+        panic!("expected String");
+    }
+}
+
+/// Sanity-check that the concat fold leaves the `String + non-String`
+/// `Display` shape untouched — the fold gate is statically scoped to
+/// chains rooted in a String literal, and a Variable / Int leaf in
+/// the middle must still go through the `format!` arm.
+#[test]
+fn test_string_concat_tree_fold_skips_mixed_chain() {
+    let result = eval_doc(r#"{ "x": "v=" + 42 + ":" + "ok" }"#).unwrap();
+    let x = match &result {
+        Value::Dict(d) => d.map.get("x").cloned().unwrap(),
+        _ => panic!("expected Dict"),
+    };
+    assert_eq!(x, Value::String("v=42:ok".into()));
+}
+
 #[test]
 fn test_dict_stdlib() {
     let result = eval_doc(

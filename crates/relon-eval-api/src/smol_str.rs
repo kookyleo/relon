@@ -208,6 +208,56 @@ impl SmolStr {
         }
     }
 
+    /// Concatenate N `&str` slices into a single `SmolStr` with at most
+    /// one allocation regardless of arity. Compared to the recursive
+    /// `concat(concat(a, b), c)` shape this drops the intermediate
+    /// `Arc<str>` allocations (and their refcount drops) entirely —
+    /// useful when the evaluator detects a left-leaning `+` chain on
+    /// `Value::String` operands (e.g. `"prefix" + name + ": " + value`).
+    ///
+    /// * Pre-scans the total length once.
+    /// * Inline-fast-path when `total <= SMOL_STR_INLINE_CAP`: no
+    ///   allocator hit, single byte-fill into the 22-byte slot.
+    /// * Heap fallback allocates one `String::with_capacity(total)`,
+    ///   pushes each slice in order, then hands the buffer to
+    ///   `Arc::from(String)` which moves the allocation into the Arc
+    ///   payload without a second copy.
+    ///
+    /// Degenerate inputs:
+    ///
+    /// * Zero slices -> empty inline payload.
+    /// * One slice -> identical semantics to `from_borrowed`.
+    /// * Two slices -> identical semantics to `concat`. Kept as a single
+    ///   entry point so the evaluator can pick `concat_many` whenever the
+    ///   chain length is `>= 2` without dispatching on arity.
+    #[inline]
+    pub fn concat_many(slices: &[&str]) -> Self {
+        // Sum total length once. We rely on the caller to keep the slice
+        // count small enough that `usize` cannot overflow — every reachable
+        // caller bounds the chain via the AST shape, which is itself
+        // memory-bounded.
+        let total: usize = slices.iter().map(|s| s.len()).sum();
+        if total <= SMOL_STR_INLINE_CAP {
+            let mut data = [0u8; SMOL_STR_INLINE_CAP];
+            let mut offset = 0usize;
+            for s in slices {
+                let bytes = s.as_bytes();
+                data[offset..offset + bytes.len()].copy_from_slice(bytes);
+                offset += bytes.len();
+            }
+            SmolStr::Inline {
+                len: total as u8,
+                data,
+            }
+        } else {
+            let mut buf = String::with_capacity(total);
+            for s in slices {
+                buf.push_str(s);
+            }
+            SmolStr::Heap(Arc::from(buf))
+        }
+    }
+
     /// Materialise an owned `String` copy of the payload. Allocates for
     /// inline and heap variants alike — call sites that only need a
     /// borrow should prefer [`SmolStr::as_str`] / `Deref`.
@@ -484,5 +534,63 @@ mod tests {
     fn size_is_24_bytes() {
         // Match `String` exactly so `Value` enum width does not grow.
         assert_eq!(std::mem::size_of::<SmolStr>(), 24);
+    }
+
+    #[test]
+    fn concat_many_empty_is_empty_inline() {
+        let s = SmolStr::concat_many(&[]);
+        assert!(s.is_inline());
+        assert_eq!(s.len(), 0);
+        assert_eq!(s.as_str(), "");
+    }
+
+    #[test]
+    fn concat_many_single_slice_matches_from_borrowed() {
+        let s = SmolStr::concat_many(&["hello"]);
+        assert!(s.is_inline());
+        assert_eq!(s.as_str(), "hello");
+    }
+
+    #[test]
+    fn concat_many_inline_path() {
+        // 4 chunks of 5 bytes = 20 bytes, still inline.
+        let s = SmolStr::concat_many(&["aaaaa", "bbbbb", "ccccc", "ddddd"]);
+        assert!(s.is_inline());
+        assert_eq!(s.as_str(), "aaaaabbbbbcccccddddd");
+        assert_eq!(s.len(), 20);
+    }
+
+    #[test]
+    fn concat_many_at_cap_inline() {
+        // 22 bytes exactly -> still inline.
+        let s = SmolStr::concat_many(&["a".repeat(11).as_str(), "b".repeat(11).as_str()]);
+        assert!(s.is_inline());
+        assert_eq!(s.len(), SMOL_STR_INLINE_CAP);
+    }
+
+    #[test]
+    fn concat_many_heap_path() {
+        // 4 chunks of 8 = 32 bytes, past cap -> heap.
+        let s = SmolStr::concat_many(&["aaaaaaaa", "bbbbbbbb", "cccccccc", "dddddddd"]);
+        assert!(!s.is_inline());
+        assert_eq!(s.as_str(), "aaaaaaaabbbbbbbbccccccccdddddddd");
+        assert_eq!(s.len(), 32);
+    }
+
+    #[test]
+    fn concat_many_matches_nested_concat() {
+        // Result must be byte-identical to the recursive shape so the
+        // evaluator can swap in `concat_many` without changing user-
+        // visible string values.
+        let leaves = ["foo_", "bar_", "baz_", "qux_"];
+        let nested = {
+            let mut acc = SmolStr::new_empty();
+            for leaf in leaves.iter() {
+                acc = SmolStr::concat(acc.as_str(), leaf);
+            }
+            acc
+        };
+        let folded = SmolStr::concat_many(&leaves);
+        assert_eq!(nested.as_str(), folded.as_str());
     }
 }

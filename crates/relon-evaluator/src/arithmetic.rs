@@ -37,6 +37,27 @@ impl TreeWalkEvaluator {
         right: &Node,
         scope: &Arc<Scope>,
     ) -> Result<Value, RuntimeError> {
+        // String concat tree fold (Tier 2b, #152). A source expression
+        // like `"a" + "b" + "c" + "d"` parses left-associatively into
+        // `(((a+b)+c)+d)`, so the default recursive `eval_binary` shape
+        // performs N-1 sub-concats each allocating a fresh `SmolStr`
+        // (heap once the running prefix passes the 22-byte SSO cap).
+        // When *every* leaf in the chain evaluates to `Value::String`
+        // we can collect their `&str` projections and route through
+        // `SmolStr::concat_many` for a single allocation.
+        //
+        // Trigger gate is strict to avoid regressing the dict-merge /
+        // schema-merge chains (`dict1 + dict2 + dict3`): we only
+        // attempt the fold when the LHS chain is itself a binary-add
+        // **and** the first leaf is a syntactic String-only shape
+        // (literal / FString). That keeps the optimisation focused on
+        // the format-style hot pattern `"prefix" + name + ": " + value`
+        // and rules out Schema / Dict leaves at zero eval cost.
+        if matches!(op, Operator::Add) && is_string_add_chain_head(left) {
+            if let Some(folded) = self.try_eval_string_concat_chain(left, right, scope)? {
+                return Ok(folded);
+            }
+        }
         let l = self.eval(left, scope)?;
 
         // `Schema + Dict_AST` / `Schema + (Schema + Dict_AST)`: walk
@@ -266,6 +287,82 @@ impl TreeWalkEvaluator {
                 node.range,
             )),
         }
+    }
+
+    /// Fold a left-leaning `String + String + ... + String` chain into a
+    /// single `SmolStr::concat_many` call. The caller has already
+    /// verified that `left` is itself a binary-add (cheap AST shape
+    /// check, no eval) so the chain length is at least 2.
+    ///
+    /// Walks the LHS spine iteratively to keep recursion depth bounded
+    /// by the AST nesting (which the parser already caps). To avoid
+    /// regressing dict-merge / schema-merge chains we gate on the
+    /// deepest LHS leaf having a **statically String-typed AST shape**
+    /// (`Expr::String` / `Expr::FString`). That makes the optimisation
+    /// fire on the format-style pattern (`"prefix" + name + ": " + v`)
+    /// without ever evaluating the chain in the Dict / Schema case.
+    /// Evaluation then proceeds left-to-right so side-effecting sub-
+    /// expressions observe the same ordering as the recursive shape.
+    ///
+    /// Returns `Ok(None)` when the static gate rejects the chain (zero
+    /// eval cost) or — rarely — when some non-leftmost leaf still
+    /// evaluates to a non-String value despite the static prefix. The
+    /// caller falls back to the recursive walk in either case; the
+    /// rare non-leftmost-mismatch path pays one duplicate eval and is
+    /// accepted as a code-clarity / correctness trade-off.
+    fn try_eval_string_concat_chain(
+        &self,
+        left: &Node,
+        right: &Node,
+        scope: &Arc<Scope>,
+    ) -> Result<Option<Value>, RuntimeError> {
+        // Descend the LHS spine, pushing the RHS of every `Add` onto a
+        // reversed list. After the walk `cursor` points at the deepest
+        // leaf and `rhs_stack` holds the chain's right-hand operands in
+        // outer-to-inner order (so popping yields source-order).
+        let mut rhs_stack: Vec<&Node> = Vec::with_capacity(4);
+        let mut cursor: &Node = left;
+        while let Expr::Binary(Operator::Add, inner_l, inner_r) = cursor.expr.as_ref() {
+            rhs_stack.push(inner_r);
+            cursor = inner_l;
+        }
+        // Static gate: refuse to evaluate if the deepest leaf is not
+        // syntactically String-only. This is the cheap filter that
+        // keeps dict-merge / schema-merge chains on their original
+        // path with zero duplicate evaluation.
+        if !is_statically_string_expr(cursor) {
+            return Ok(None);
+        }
+        // Evaluate leaves in source order: deepest LHS first, then each
+        // collected RHS in the order it appears in the source (which is
+        // the reverse of the rhs_stack push order).
+        let leaf_count = rhs_stack.len() + 2; // chain LHS leaves + 1 + outer rhs
+        let mut values: Vec<Value> = Vec::with_capacity(leaf_count);
+        values.push(self.eval(cursor, scope)?);
+        while let Some(node) = rhs_stack.pop() {
+            values.push(self.eval(node, scope)?);
+        }
+        values.push(self.eval(right, scope)?);
+
+        // The static gate guarantees the *first* leaf is String. Any
+        // later leaf is allowed to be non-String — in that case we
+        // fall back so the existing `String + non-String` `Display`
+        // arm handles the mixed shape. Returning `None` here triggers
+        // one duplicate evaluation but only for chains that mix types,
+        // which is rare and never on the hot format-string path.
+        if !values.iter().all(|v| matches!(v, Value::String(_))) {
+            return Ok(None);
+        }
+        let slices: Vec<&str> = values
+            .iter()
+            .map(|v| match v {
+                Value::String(s) => s.as_str(),
+                _ => unreachable!("checked above"),
+            })
+            .collect();
+        Ok(Some(Value::String(relon_eval_api::SmolStr::concat_many(
+            &slices,
+        ))))
     }
 
     /// Phase C operator lowering: dispatch a comparison op (`==`, `!=`,
@@ -613,6 +710,34 @@ fn eval_numeric_comparison(
         _ => unreachable!("non-comparison operator passed to eval_numeric_comparison"),
     };
     Ok(Value::Bool(result))
+}
+
+/// Cheap AST-shape predicate used by the `eval_binary` fast path to
+/// gate the `concat_many` fold (#152). Returns `true` iff `node` is
+/// itself a binary-add, signalling that the surrounding `Operator::Add`
+/// dispatch site has a chain length of at least 2 to attempt folding.
+///
+/// The check is type-blind on purpose — we cannot know the operand
+/// types without evaluating. The chain-fold helper then applies a
+/// stricter "first leaf is statically String" filter before doing any
+/// evaluation, so this predicate alone never causes a re-evaluation.
+fn is_string_add_chain_head(node: &Node) -> bool {
+    matches!(node.expr.as_ref(), Expr::Binary(Operator::Add, _, _))
+}
+
+/// Static AST-shape filter: returns `true` when `node` is guaranteed
+/// to evaluate to a `Value::String`. Used by the concat-chain fold
+/// gate so we never evaluate a Dict / Schema sub-expression "just to
+/// check" — if the leftmost leaf passes this filter, we know the
+/// chain is String-rooted before paying any eval cost.
+///
+/// The recognised shapes are kept conservative: string literals and
+/// f-strings only. Variable / call results may have any type and stay
+/// off the fold path even when an analyzer would prove them String —
+/// the evaluator does not currently consume type info, and the
+/// conservative miss costs only the unfolded recursive concat.
+fn is_statically_string_expr(node: &Node) -> bool {
+    matches!(node.expr.as_ref(), Expr::String(_) | Expr::FString(_))
 }
 
 fn expect_number(value: &Value, range: TokenRange) -> Result<NumericValue, RuntimeError> {
