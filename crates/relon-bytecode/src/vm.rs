@@ -21,7 +21,7 @@ use relon_ir::IrType;
 use relon_parser::TokenRange;
 use thiserror::Error;
 
-use crate::arena::{ArenaError, VmMemory};
+use crate::arena::{ArenaError, ClosureSlot, VmMemory};
 use crate::hot_counter::{HotCounterResult, HotTraceTriggerHandle};
 use crate::op::{BcFunction, BcOp, BcStdlibKind, BcTrapKind, ExternalPc};
 use crate::trace_dispatch::InstalledTraceLookupHandle;
@@ -917,6 +917,7 @@ impl BytecodeVm {
                 &mut locals,
                 &mut memory,
                 pc,
+                /*current_captures=*/ None,
             ) {
                 Ok(StepOutcome::Advance) => pc += 1,
                 Ok(StepOutcome::Jump(target)) => {
@@ -944,6 +945,82 @@ impl BytecodeVm {
         }
     }
 
+    /// M3 closure-body sub-dispatch. Runs the supplied closure body
+    /// against a fresh locals frame seeded with `args` (positional)
+    /// and with `captures` exposed via [`BcOp::CaptureGet`]. The
+    /// outer VM's [`VmMemory`] is shared (allocations made by the
+    /// closure body — list pushes, string concats, nested closure
+    /// constructions — live alongside the caller's handles so
+    /// closure-returned values stay observable to the caller).
+    ///
+    /// The sub-loop reuses the parent VM's resource accounting style
+    /// (step ticks + deadline check) but on a fresh local counter,
+    /// then returns the single value the body pushed on its operand
+    /// stack via `BcOp::Return`. A trap inside the body propagates
+    /// unchanged.
+    fn invoke_closure_body(
+        &self,
+        body: &BcFunction,
+        args: &[VmValue],
+        captures: &[VmValue],
+        memory: &mut VmMemory,
+    ) -> Result<VmValue, BcVmError> {
+        let needed = (body.locals as usize).max(args.len());
+        let mut locals: Vec<VmValue> = vec![0u64; needed];
+        for (i, v) in args.iter().enumerate() {
+            if i < locals.len() {
+                locals[i] = *v;
+            }
+        }
+        let mut stack: Vec<VmValue> = Vec::with_capacity(8);
+        let mut pc: usize = 0;
+        // Local step budget: keep the closure body bounded by the
+        // outer VM's `max_steps` cap (closure bodies inherit the
+        // resource budget). If `max_steps` is `None` the loop runs
+        // unbounded (matches the outer dispatch).
+        let mut steps: u64 = 0;
+        loop {
+            steps += 1;
+            if let Some(limit) = self.config.max_steps {
+                if steps > limit {
+                    return Err(BcVmError::StepLimitExceeded { steps });
+                }
+            }
+            if let Some(d) = self.config.deadline {
+                if Instant::now() >= d {
+                    return Err(BcVmError::DeadlineExceeded);
+                }
+            }
+            if pc >= body.ops.len() {
+                return Err(BcVmError::JumpOutOfRange {
+                    target: pc,
+                    ops: body.ops.len(),
+                });
+            }
+            match self.dispatch_one(
+                body,
+                &body.ops[pc],
+                &mut stack,
+                &mut locals,
+                memory,
+                pc,
+                Some(captures),
+            )? {
+                StepOutcome::Advance => pc += 1,
+                StepOutcome::Jump(target) => {
+                    if target > body.ops.len() {
+                        return Err(BcVmError::JumpOutOfRange {
+                            target,
+                            ops: body.ops.len(),
+                        });
+                    }
+                    pc = target;
+                }
+                StepOutcome::Return(v) => return Ok(v),
+            }
+        }
+    }
+
     fn dispatch_one(
         &self,
         func: &BcFunction,
@@ -952,6 +1029,12 @@ impl BytecodeVm {
         locals: &mut [VmValue],
         memory: &mut VmMemory,
         bc_idx: usize,
+        // M3: captures of the currently executing closure body, if
+        // any. Outer (non-closure) dispatch passes `None`; the closure
+        // call site (`BcOp::CallClosure`) re-enters a sub-dispatch loop
+        // with `Some(&closure_slot.captures)` so `BcOp::CaptureGet`
+        // resolves against the matching frame.
+        current_captures: Option<&[VmValue]>,
     ) -> Result<StepOutcome, BcVmError> {
         match op {
             BcOp::ConstI64(v) => {
@@ -1320,6 +1403,76 @@ impl BytecodeVm {
                     .map_err(arena_to_vm_error)?
                     .ok_or(BcVmError::IndexOutOfBounds)?;
                 stack.push(value);
+            }
+            BcOp::MakeClosure {
+                body_idx,
+                capture_count,
+            } => {
+                // M3: pop `capture_count` operands in declaration
+                // order (top-of-stack is the last capture), copy into
+                // a fresh closure slot, push the resulting handle.
+                let n = *capture_count as usize;
+                if stack.len() < n {
+                    return Err(BcVmError::StackUnderflow { bc_idx });
+                }
+                let mut captures: Vec<VmValue> = Vec::with_capacity(n);
+                for _ in 0..n {
+                    captures.push(pop(stack, bc_idx)?);
+                }
+                captures.reverse();
+                // Validate body index is in range. The compile pass is
+                // responsible for emitting only valid indices; this
+                // check guards against hand-built BcFunction misuse.
+                if (*body_idx as usize) >= func.closure_bodies.len() {
+                    return Err(BcVmError::StackUnderflow { bc_idx });
+                }
+                let handle = memory.closures.alloc(*body_idx, captures);
+                stack.push(handle as u64);
+            }
+            BcOp::CallClosure { argc } => {
+                // M3: pop `argc` args (top-of-stack is the last arg)
+                // then the closure handle. Look up the slot, dispatch
+                // the closure body in a fresh stack/locals frame
+                // populated with the popped args, return value pushed
+                // back onto the caller's stack.
+                let n = *argc as usize;
+                if stack.len() < n + 1 {
+                    return Err(BcVmError::StackUnderflow { bc_idx });
+                }
+                let mut args: Vec<VmValue> = Vec::with_capacity(n);
+                for _ in 0..n {
+                    args.push(pop(stack, bc_idx)?);
+                }
+                args.reverse();
+                let handle = pop(stack, bc_idx)? as u32;
+                // Clone the Arc<ClosureSlot> so we can release the
+                // mutable borrow on `memory.closures` before re-entering
+                // dispatch. The body lookup uses the body_idx the slot
+                // carries.
+                let slot: Arc<ClosureSlot> = memory
+                    .closures
+                    .get(handle)
+                    .map_err(arena_to_vm_error)?
+                    .clone();
+                let body = func
+                    .closure_bodies
+                    .get(slot.body_idx as usize)
+                    .ok_or(BcVmError::StackUnderflow { bc_idx })?;
+                let ret =
+                    self.invoke_closure_body(body, &args, &slot.captures, memory)?;
+                stack.push(ret);
+            }
+            BcOp::CaptureGet { idx } => {
+                // M3: push the value at `idx` of the currently
+                // executing closure's captures vector. Outside a
+                // closure body (current_captures is None) is a compiler
+                // bug — surface as StackUnderflow.
+                let caps = current_captures.ok_or(BcVmError::StackUnderflow { bc_idx })?;
+                let i = *idx as usize;
+                if i >= caps.len() {
+                    return Err(BcVmError::StackUnderflow { bc_idx });
+                }
+                stack.push(caps[i]);
             }
             BcOp::Trap(kind) => match kind {
                 BcTrapKind::IndexOutOfBounds => return Err(BcVmError::IndexOutOfBounds),
