@@ -87,11 +87,13 @@
 #![allow(unused_assignments)] // mirrors the rustc-1.93 false positive
                               // pattern used in the evaluator + eval-api crates.
 
+pub mod arena;
 pub mod compile;
 pub mod evaluator;
 pub mod op;
 pub mod vm;
 
+pub use arena::{ArenaError, DictArena, Handle, ListArena, StringArena, VmMemory};
 pub use compile::{compile_function, BcCompileError};
 pub use evaluator::{BytecodeError, BytecodeEvaluator, ResumeMetrics};
 pub use op::{BcFunction, BcOp, ExternalPc, StackOrigin};
