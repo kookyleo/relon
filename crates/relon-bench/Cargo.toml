@@ -15,6 +15,14 @@ dhat-heap = ["dep:dhat"]
 [dependencies]
 relon-parser = { workspace = true }
 relon-evaluator = { workspace = true }
+# M2-B phase 4d (2026-05-21): the bytecode VM is driven via the
+# `relon::new_evaluator(src, Backend::Bytecode)` facade so the cmp_lua
+# bench's bytecode row picks up whatever from-source envelope the
+# `BytecodeEvaluator::from_source` pipeline currently honours. Sources
+# outside the scalar envelope surface as `BackendError::Bytecode` and
+# the bench row prints `n/a (UnsupportedOp)` rather than the row's
+# numbers — matches the corpus four-way harness's soft-pass policy.
+relon = { workspace = true }
 # v5-β-2 stage 4: cranelift-AOT comparison bench. The wasm-AOT
 # backend retired here; the bench crate now only depends on the
 # cranelift-native AOT crate for cold/warm measurement against the
