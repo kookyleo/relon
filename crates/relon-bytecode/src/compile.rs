@@ -1599,4 +1599,68 @@ mod tests {
         let err = compile_function(&func, &empty, &empty).unwrap_err();
         assert!(matches!(err, BcCompileError::UnsupportedOp(_)));
     }
+
+    /// M2-B phase 4b-continuation: `Op::ListGetByIntIdx` lifts cleanly
+    /// into `BcOp::ListGetInt`. Pinned because the visitor previously
+    /// returned `unsupported("ListGetByIntIdx")` and we want a
+    /// regression alarm if the lowering bounces again.
+    #[test]
+    fn list_get_by_int_idx_lifts_to_list_get_int() {
+        // Hand-build a function that takes a list handle in local 0
+        // and pushes an i64 idx via local 1, then runs the subscript.
+        // The IR `LocalGet(0)` slot would carry a real list handle
+        // when wired end-to-end (today's from-source pipeline still
+        // length-folds `ConstListInt`, so this is the direct-IR path).
+        let func = Func {
+            name: "f".into(),
+            params: vec![IrType::ListInt, IrType::I64],
+            ret: IrType::I64,
+            body: vec![
+                tagged(Op::LocalGet(0)),
+                tagged(Op::LocalGet(1)),
+                tagged(Op::ListGetByIntIdx {
+                    element_ty: IrType::I64,
+                }),
+                tagged(Op::Return),
+            ],
+            range: TokenRange::default(),
+        };
+        let empty = BTreeMap::new();
+        let bc = compile_function(&func, &empty, &empty).unwrap();
+        assert!(
+            bc.ops.iter().any(|op| matches!(op, BcOp::ListGetInt)),
+            "expected BcOp::ListGetInt in lowered ops: {:?}",
+            bc.ops
+        );
+    }
+
+    /// M2-B phase 4b-continuation: `Op::DictGetByStringKey` lifts
+    /// cleanly into `BcOp::DictLookupStr`. Same pinning rationale as
+    /// the list test above.
+    #[test]
+    fn dict_get_by_string_key_lifts_to_dict_lookup_str() {
+        let func = Func {
+            name: "f".into(),
+            params: vec![IrType::String, IrType::String],
+            ret: IrType::I64,
+            body: vec![
+                tagged(Op::LocalGet(0)), // dict
+                tagged(Op::LocalGet(1)), // key
+                tagged(Op::DictGetByStringKey {
+                    shape_hash: 0,
+                    value_ty: IrType::I64,
+                    entry_count_hint: None,
+                }),
+                tagged(Op::Return),
+            ],
+            range: TokenRange::default(),
+        };
+        let empty = BTreeMap::new();
+        let bc = compile_function(&func, &empty, &empty).unwrap();
+        assert!(
+            bc.ops.iter().any(|op| matches!(op, BcOp::DictLookupStr)),
+            "expected BcOp::DictLookupStr in lowered ops: {:?}",
+            bc.ops
+        );
+    }
 }
