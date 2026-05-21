@@ -48,6 +48,14 @@
 //!   ever calling the host fn. v6-δ M2-A only carries the surface —
 //!   the cranelift-AOT capability vtable is the canonical lookup
 //!   path today, so the VM's vtable starts empty.
+//!   **M2-B phase 1**: the vtable now accepts an optional
+//!   `Arc<dyn relon_eval_api::CapabilityGate>` so the unified P0-B
+//!   policy boundary can be installed ahead of native-fn dispatch
+//!   wire-up. Phase 1 only parks the hook — callers register a gate
+//!   via [`BytecodeEvaluator::with_capability_gate`] or
+//!   [`vm::CapabilityVtable::set_gate`]; native-fn dispatch + the
+//!   in-VM consult follow in subsequent phases (see
+//!   `docs/internal/rfc-m2-b-bytecode-jit-integration-2026-05-21.md`).
 //! - **resource**: an instruction counter (`BcVmConfig::max_steps`)
 //!   plus a per-call deadline. Ticks once per bytecode op so the
 //!   tree-walker's `WasmStepLimitExceeded` shape is reachable.

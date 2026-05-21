@@ -7,9 +7,11 @@
 //! prongs trip through [`BcVmError`] variants that lift cleanly into
 //! `relon_eval_api::RuntimeError`.
 
+use std::fmt;
+use std::sync::Arc;
 use std::time::Instant;
 
-use relon_eval_api::RuntimeError;
+use relon_eval_api::{CapabilityGate, RuntimeError};
 use relon_ir::IrType;
 use relon_parser::TokenRange;
 use thiserror::Error;
@@ -60,9 +62,40 @@ impl Default for BcVmConfig {
 /// `Some(_)` when the host has granted access; the actual host-fn
 /// pointer payload is M2-B work. Today the table tracks **grants
 /// only** so the capability prong can fire in the M2-A sandbox tests.
-#[derive(Debug, Clone, Default)]
+///
+/// ## M2-B phase 1 — `CapabilityGate` hook
+///
+/// The optional `gate` field carries the unified
+/// [`CapabilityGate`] policy (`relon_eval_api::capability`). When set,
+/// it becomes the canonical authority for "is this capability bit
+/// granted?" questions a future `BcOp::CallNative` / `BcOp::CheckCap`
+/// op asks at dispatch time. The grant-bool vector stays as the
+/// fallback for code paths that haven't been migrated yet — phase 2
+/// will land the dispatch-side consult and trim the fallback's reach.
+///
+/// Native-fn slot payloads land in phase 2 alongside the new ops;
+/// phase 1 only parks the trait hook so the field shape stops moving
+/// across upcoming commits.
+#[derive(Clone, Default)]
 pub struct CapabilityVtable {
     grants: Vec<bool>,
+    /// M2-B phase 1: optional shared gate consulted on every guarded
+    /// op (phase 2 wires the actual `BcOp::CheckCap` consult). `None`
+    /// preserves the M2-A grant-table-only behaviour so existing
+    /// callers don't observe a change.
+    gate: Option<Arc<dyn CapabilityGate>>,
+}
+
+impl fmt::Debug for CapabilityVtable {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // `dyn CapabilityGate` doesn't carry `Debug`; print presence
+        // only so the surrounding `BcVmConfig` debug stays cheap and
+        // doesn't force the trait surface wider than necessary.
+        f.debug_struct("CapabilityVtable")
+            .field("grants", &self.grants)
+            .field("has_gate", &self.gate.is_some())
+            .finish()
+    }
 }
 
 impl CapabilityVtable {
@@ -79,6 +112,21 @@ impl CapabilityVtable {
     /// Inspect whether `cap_bit` is currently granted.
     pub fn is_granted(&self, cap_bit: u32) -> bool {
         self.grants.get(cap_bit as usize).copied().unwrap_or(false)
+    }
+
+    /// M2-B phase 1: install the unified [`CapabilityGate`] policy.
+    /// Phase 2 wires this into the dispatch path; phase 1 only parks
+    /// the slot so callers can opt in ahead of time.
+    pub fn set_gate(&mut self, gate: Arc<dyn CapabilityGate>) {
+        self.gate = Some(gate);
+    }
+
+    /// M2-B phase 1: read the installed gate, if any. Returns `None`
+    /// when the caller hasn't opted into the unified policy boundary —
+    /// the phase-2 dispatch consult treats this as "fall back to the
+    /// grant-bool table".
+    pub fn gate(&self) -> Option<&Arc<dyn CapabilityGate>> {
+        self.gate.as_ref()
     }
 }
 
