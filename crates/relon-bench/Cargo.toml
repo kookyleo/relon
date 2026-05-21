@@ -185,6 +185,16 @@ name = "ascii_case_fold"
 harness = false
 path = "benches/ascii_case_fold.rs"
 
+# Phase 1b (2026-05-21): SSO `SmolStr` micro-bench. Three row groups
+# (construct / clone / concat) across short / cap-boundary / long
+# payloads to verify the inline path is alloc-free and the heap
+# fallback stays cheap. Run via
+# `cargo bench -p relon-bench --bench sso`.
+[[bench]]
+name = "sso"
+harness = false
+path = "benches/sso.rs"
+
 # v6-λ-0 (bench methodology hardening, 2026-05-19): post-processor for
 # criterion's per-sample `sample.json` outputs. Walks
 # `target/criterion/<group>/<dim>/<row>/new/sample.json` and prints a
