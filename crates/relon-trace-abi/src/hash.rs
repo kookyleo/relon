@@ -71,8 +71,41 @@ pub const STRING_RECORD_HASH_OFFSET: i32 = 4;
 /// [`STRING_RECORD_HASH_OFFSET`].
 pub const STRING_RECORD_PAYLOAD_OFFSET: i32 = 12;
 
-/// Hash a `[len: u32 LE][hash: u64 LE][utf8...]` dict key record by
-/// **reading the cached hash field** — the producer side
+/// Tier 2c: high bit of the `len` field doubles as the "payload is
+/// pure ASCII" flag.
+///
+/// **Layout choice rationale (option C from #153 plan).** The header
+/// is already 12 bytes wide (`[len: u32][hash: u64]`); adding a fresh
+/// `flags: u32` would push it to 16 bytes and force every existing
+/// consumer (cranelift emitter constants, bench fixtures, recorder
+/// driver) to bump their offsets in lockstep. Option A (steal a hash
+/// bit) shrinks the IC's effective hash space and would silently raise
+/// the collision rate on the W5 hot path. Option C reuses the unused
+/// high bit of `len` — every dict key in the workspace is an
+/// interned identifier well under 2^31 bytes, so the flag pays no
+/// header growth tax. The producer side ANDs the bit in at record
+/// build time; the consumer side masks it off before reading the
+/// length. LuaJIT GCstr packs `hash24` / `len24` / flags into a
+/// similar split, so the pattern has a precedent.
+///
+/// Bit 31 of the LE u32 stored at offset 0. Set ⇒ payload bytes are
+/// all `< 0x80`; clear ⇒ payload may contain non-ASCII codepoints.
+pub const STRING_RECORD_ASCII_FLAG_BIT: u32 = 1u32 << 31;
+
+/// Mask isolating the payload length out of the `len_with_flags`
+/// header field. ANDing the raw u32 with this constant strips the
+/// Tier 2c ASCII-flag bit and leaves the byte count untouched.
+///
+/// `const_assert`-style invariant: every payload accepted into a
+/// dict key record fits in 31 bits (2 GiB). The producer-side
+/// helpers ([`build_string_record_with_flags`]) panic in debug builds
+/// if a longer payload is presented; release builds would silently
+/// fold the high bit into the length, which the ASCII fast-path
+/// would then mis-read.
+pub const STRING_RECORD_LEN_MASK: u32 = !STRING_RECORD_ASCII_FLAG_BIT;
+
+/// Hash a `[len_with_flags: u32 LE][hash: u64 LE][utf8...]` dict key
+/// record by **reading the cached hash field** — the producer side
 /// (`build_string_record` / the recorder driver) has already pre-computed
 /// the payload hash at record-build time and stamped it into bytes
 /// 4..12, so the consumer side just loads it back as a u64.
@@ -90,7 +123,10 @@ pub const STRING_RECORD_PAYLOAD_OFFSET: i32 = 12;
 /// `key_ptr` must point at a layout-conformant dict key record with at
 /// least `12 + len` valid bytes:
 ///
-/// - bytes 0..4   — `len: u32 LE` (payload byte count)
+/// - bytes 0..4   — `len_with_flags: u32 LE`
+///     - bits 0..31 — payload byte count (must be `< 2^31`)
+///     - bit 31     — Tier 2c [`STRING_RECORD_ASCII_FLAG_BIT`]: set
+///       iff the payload bytes are all `< 0x80`
 /// - bytes 4..12  — `hash: u64 LE` (pre-computed `fx_hash_bytes(payload)`)
 /// - bytes 12..12+len — UTF-8 payload bytes
 ///
@@ -129,11 +165,59 @@ pub unsafe fn fx_hash_key_record(key_ptr: *const u8) -> u64 {
 #[inline]
 pub unsafe fn fx_hash_key_record_payload(key_ptr: *const u8) -> u64 {
     // SAFETY: caller contract — see [`fx_hash_key_record`].
-    let len = unsafe { (key_ptr as *const u32).read_unaligned() } as usize;
+    let len_with_flags = unsafe { (key_ptr as *const u32).read_unaligned() };
+    let len = (len_with_flags & STRING_RECORD_LEN_MASK) as usize;
     let bytes = unsafe {
         std::slice::from_raw_parts(key_ptr.add(STRING_RECORD_PAYLOAD_OFFSET as usize), len)
     };
     fx_hash_bytes(bytes)
+}
+
+/// Tier 2c: probe the cached ASCII-flag bit in a layout-conformant
+/// dict key / string record header.
+///
+/// Returns `true` iff the producer side stamped the payload as
+/// all-ASCII at record-build time. Unicode-heavy stdlib bodies
+/// (`upper` / `lower` / `title` / `normalize` …) consult this bit
+/// before they enter the UCD-table-driven slow path; on hit they
+/// route through the byte-wise ASCII fold (`b ^ 0x20` for `Upper`
+/// vs `Lower`, simple ASCII whitespace tracker for `Title`) and
+/// skip every per-codepoint table query.
+///
+/// The probe is a single `load.u32 + and + cmp` on the consumer
+/// side — strictly cheaper than the SIMD `scan_ascii_prefix` that
+/// the tree-walk fold currently runs every call, because the
+/// producer has already paid that cost exactly once at intern /
+/// recorder-driver time.
+///
+/// # Safety
+///
+/// `key_ptr` must point at a layout-conformant string record
+/// (`[len_with_flags: u32 LE][hash: u64 LE][payload]`), with at
+/// least 4 valid bytes for the header read.
+#[inline]
+pub unsafe fn is_ascii_flag_set(key_ptr: *const u8) -> bool {
+    // SAFETY: caller contract — the first 4 bytes of `key_ptr` are
+    // the `len_with_flags` field per the layout invariant.
+    let len_with_flags = unsafe { (key_ptr as *const u32).read_unaligned() };
+    (len_with_flags & STRING_RECORD_ASCII_FLAG_BIT) != 0
+}
+
+/// Tier 2c producer-side helper: decide whether `payload` should
+/// carry the cached ASCII-flag bit.
+///
+/// Pulls every byte and verifies `b < 0x80`. ~3 cycles / byte on
+/// x86_64-v3 (LLVM auto-vectorises the all-clear-high-bit reduction
+/// to `pmovmskb`); the call happens once at record-build time so
+/// even a 100 KB string only costs ~30 µs amortised across the
+/// arbitrarily many future fold lookups that the bit short-circuits.
+#[inline]
+pub fn is_ascii_bytes(payload: &[u8]) -> bool {
+    // The naive `all(|b| *b < 0x80)` compiles to the same SIMD-friendly
+    // shape that `core::str::is_ascii` uses on str. We keep it inline
+    // so the producer's record-build call site can fold the check into
+    // the surrounding extend-from-slice loop.
+    payload.iter().all(|b| *b < 0x80)
 }
 
 #[cfg(test)]
@@ -170,7 +254,9 @@ mod tests {
         // load matches the byte-wise reference.
         let payload = b"thekey";
         let cached_hash = fx_hash_bytes(payload);
-        let mut record = (payload.len() as u32).to_le_bytes().to_vec();
+        let len_with_flags =
+            (payload.len() as u32) | if is_ascii_bytes(payload) { STRING_RECORD_ASCII_FLAG_BIT } else { 0 };
+        let mut record = len_with_flags.to_le_bytes().to_vec();
         record.extend_from_slice(&cached_hash.to_le_bytes());
         record.extend_from_slice(payload);
         let via_record = unsafe { fx_hash_key_record(record.as_ptr()) };
@@ -185,5 +271,56 @@ mod tests {
             via_payload, via_bytes,
             "payload-only fallback must agree with byte-wise reference"
         );
+    }
+
+    // ---- Tier 2c: ASCII-flag probe ---------------------------------
+
+    #[test]
+    fn ascii_flag_bit_does_not_overlap_len_mask() {
+        // Belt-and-braces: the masking arithmetic relies on
+        // ASCII_FLAG_BIT and LEN_MASK being exact complements.
+        assert_eq!(STRING_RECORD_ASCII_FLAG_BIT | STRING_RECORD_LEN_MASK, u32::MAX);
+        assert_eq!(STRING_RECORD_ASCII_FLAG_BIT & STRING_RECORD_LEN_MASK, 0);
+    }
+
+    #[test]
+    fn is_ascii_bytes_matches_std_lib_classifier() {
+        assert!(is_ascii_bytes(b""));
+        assert!(is_ascii_bytes(b"hello"));
+        assert!(is_ascii_bytes(b"\x7F"));
+        assert!(!is_ascii_bytes(b"\x80"));
+        assert!(!is_ascii_bytes("caf\u{00E9}".as_bytes()));
+        // Mixed: a single non-ASCII byte taints the whole payload.
+        assert!(!is_ascii_bytes(b"abc\x80def"));
+    }
+
+    #[test]
+    fn is_ascii_flag_round_trip_pure_ascii() {
+        let payload = b"plainkey";
+        assert!(is_ascii_bytes(payload));
+        let len_with_flags = (payload.len() as u32) | STRING_RECORD_ASCII_FLAG_BIT;
+        let mut record = len_with_flags.to_le_bytes().to_vec();
+        record.extend_from_slice(&fx_hash_bytes(payload).to_le_bytes());
+        record.extend_from_slice(payload);
+        // Probe sees the flag.
+        assert!(unsafe { is_ascii_flag_set(record.as_ptr()) });
+        // Length reads correctly through the mask (fallback hash uses it).
+        let via_payload = unsafe { fx_hash_key_record_payload(record.as_ptr()) };
+        assert_eq!(via_payload, fx_hash_bytes(payload));
+    }
+
+    #[test]
+    fn is_ascii_flag_round_trip_non_ascii() {
+        let payload = "caf\u{00E9}".as_bytes();
+        assert!(!is_ascii_bytes(payload));
+        let len_with_flags = payload.len() as u32; // flag clear
+        let mut record = len_with_flags.to_le_bytes().to_vec();
+        record.extend_from_slice(&fx_hash_bytes(payload).to_le_bytes());
+        record.extend_from_slice(payload);
+        assert!(!unsafe { is_ascii_flag_set(record.as_ptr()) });
+        // Length still recovers — even though flag is clear, masking
+        // is a no-op on a value with bit 31 already zero.
+        let via_payload = unsafe { fx_hash_key_record_payload(record.as_ptr()) };
+        assert_eq!(via_payload, fx_hash_bytes(payload));
     }
 }

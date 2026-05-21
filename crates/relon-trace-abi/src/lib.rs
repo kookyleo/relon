@@ -66,7 +66,8 @@ pub use effect::EffectClass;
 pub use entry::{AbiSignature, AbiType, TraceEntryStatus, TRACE_ENTRY_SIG};
 pub use external::{ExternalAddr, ExternalPc, ExternalSlot};
 pub use hash::{
-    fx_hash_bytes, fx_hash_key_record, fx_hash_key_record_payload, STRING_RECORD_HASH_OFFSET,
-    STRING_RECORD_PAYLOAD_OFFSET,
+    fx_hash_bytes, fx_hash_key_record, fx_hash_key_record_payload, is_ascii_bytes,
+    is_ascii_flag_set, STRING_RECORD_ASCII_FLAG_BIT, STRING_RECORD_HASH_OFFSET,
+    STRING_RECORD_LEN_MASK, STRING_RECORD_PAYLOAD_OFFSET,
 };
 pub use observed::ObservedType;
