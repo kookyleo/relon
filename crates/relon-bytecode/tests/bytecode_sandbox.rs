@@ -1936,6 +1936,100 @@ fn str_eq_byte_compare() {
     assert_eq!(vm.invoke(&bc_ne, &[]).value, Some(0));
 }
 
+/// 2026-05-21: Tier-2 `glob_match(s, pattern) -> Bool` dispatch.
+/// Pin both arms (match + non-match) plus a Unicode-payload arm so
+/// the bytecode VM stays behaviour-equivalent with
+/// `relon_ir::glob::glob_match`.
+#[test]
+fn str_glob_match_matches_and_misses() {
+    use relon_bytecode::op::{BcFunction, BcOp};
+
+    let make = |s: &str, pat: &str| BcFunction {
+        ops: vec![
+            BcOp::StrConst { idx: 0 },
+            BcOp::StrConst { idx: 1 },
+            BcOp::StrGlobMatch,
+            BcOp::Return,
+        ],
+        locals: 0,
+        ir_pc_map: vec![1, 2, 3, 4],
+        string_pool: vec![s.to_string(), pat.to_string()],
+        stack_recipe: vec![vec![]; 4],
+        fn_id: None,
+        closure_bodies: Vec::new(),
+    };
+    let vm = BytecodeVm::new(BcVmConfig::default());
+
+    // Anchored prefix glob: "hello *" matches "hello world".
+    assert_eq!(
+        vm.invoke(&make("hello world", "hello *"), &[]).value,
+        Some(1)
+    );
+    // Non-match: leading literal mismatch.
+    assert_eq!(
+        vm.invoke(&make("hello world", "goodbye *"), &[]).value,
+        Some(0)
+    );
+    // `?` matches exactly one Unicode char.
+    assert_eq!(vm.invoke(&make("h?", "h?"), &[]).value, Some(1));
+    // Unicode payload: emoji + Greek mix.
+    assert_eq!(vm.invoke(&make("αβγ🦀", "α*🦀"), &[]).value, Some(1));
+}
+
+/// Drift guard: the bytecode compile pass must short-circuit
+/// `Op::Call { fn_index = GLOB_MATCH_INDEX }` onto `BcOp::StrGlobMatch`
+/// instead of inlining the sentinel `Trap` body that lives in the
+/// bundled stdlib slot.
+#[test]
+fn compile_routes_glob_match_call_to_str_glob_match_op() {
+    use relon_bytecode::op::BcOp;
+    use relon_ir::ir::{Func, Op, TaggedOp};
+    use relon_ir::IrType;
+    use relon_parser::TokenRange;
+
+    fn tt(op: Op) -> TaggedOp {
+        TaggedOp {
+            op,
+            range: TokenRange::default(),
+        }
+    }
+
+    let caller = Func {
+        name: "uses_glob_match".to_string(),
+        params: vec![IrType::String, IrType::String],
+        ret: IrType::Bool,
+        body: vec![
+            tt(Op::LocalGet(0)),
+            tt(Op::LocalGet(1)),
+            tt(Op::Call {
+                fn_index: relon_ir::GLOB_MATCH_INDEX,
+                arg_count: 2,
+                param_tys: vec![IrType::String, IrType::String],
+                ret_ty: IrType::Bool,
+            }),
+            tt(Op::Return),
+        ],
+        range: TokenRange::default(),
+    };
+    let bc = relon_bytecode::compile::compile_function_in_module(
+        &caller,
+        &[],
+        &std::collections::BTreeMap::new(),
+        &std::collections::BTreeMap::new(),
+    )
+    .expect("compile succeeds");
+    assert!(
+        bc.ops.iter().any(|op| matches!(op, BcOp::StrGlobMatch)),
+        "compile pass must lower glob_match call to BcOp::StrGlobMatch, got {:?}",
+        bc.ops
+    );
+    assert!(
+        !bc.ops.iter().any(|op| matches!(op, BcOp::Trap(_))),
+        "compile pass must NOT walk the sentinel Trap body, got {:?}",
+        bc.ops
+    );
+}
+
 // -- M2-B phase 4b-continuation: dict ops -------------------------
 
 /// `MakeDict` + `DictLookupStr` round-trip: build `{ a: 1, b: 2 }`,

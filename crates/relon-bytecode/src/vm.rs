@@ -1361,6 +1361,24 @@ impl BytecodeVm {
                     .clone();
                 stack.push(if lhs.as_ref() == rhs.as_ref() { 1 } else { 0 });
             }
+            BcOp::StrGlobMatch => {
+                // 2026-05-21: `[s, pattern] -> [bool]`. Pop pattern
+                // first (top-of-stack), then the haystack. Resolve both
+                // handles in the StringArena and defer to the shared
+                // `relon_ir::glob::glob_match` algorithm so the
+                // bytecode backend stays behaviour-equivalent with the
+                // tree-walker + cranelift paths.
+                let pat_h = pop(stack, bc_idx)? as u32;
+                let s_h = pop(stack, bc_idx)? as u32;
+                let s = memory.strings.get(s_h).map_err(arena_to_vm_error)?.clone();
+                let pat = memory
+                    .strings
+                    .get(pat_h)
+                    .map_err(arena_to_vm_error)?
+                    .clone();
+                let matched = relon_ir::glob::glob_match(s.as_ref(), pat.as_ref());
+                stack.push(if matched { 1 } else { 0 });
+            }
             BcOp::MakeDict { len } => {
                 // `[k_0, v_0, ..., k_{n-1}, v_{n-1}] -> [dict_handle]`.
                 // Pops `len * 2` slots; the keys are string handles

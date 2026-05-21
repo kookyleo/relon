@@ -228,6 +228,20 @@ pub enum BcOp {
     /// when their byte payloads match exactly; `0` otherwise.
     StrEq,
 
+    /// 2026-05-21: Tier-2 `glob_match(s, pattern) -> Bool` dispatch.
+    /// `[s_handle, pattern_handle] -> [bool]`. Pops the pattern first
+    /// (top-of-stack) then the haystack, looks both up in the
+    /// `StringArena`, and runs [`relon_ir::glob::glob_match`]. Pushes
+    /// `1` on match, `0` otherwise.
+    ///
+    /// Emitted by the bytecode compile pass when it spots an
+    /// `Op::Call { fn_index = relon_ir::GLOB_MATCH_INDEX }` instead of
+    /// walking the bundled stdlib body (the body is a sentinel `Trap`
+    /// — see [`relon_ir::stdlib::defs::glob_match_string`]). Centralises
+    /// the algorithm in a single Rust impl so the bytecode VM stays
+    /// behaviour-equivalent with the tree-walker and cranelift backends.
+    StrGlobMatch,
+
     /// M2-B phase 4b-continuation: allocate a dict slot from
     /// `len` key/value pairs. `[k_0, v_0, k_1, v_1, ..., k_{n-1},
     /// v_{n-1}] -> [dict_handle]`. Pops `len * 2` slots in
