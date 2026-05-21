@@ -274,6 +274,17 @@ const W4_REC_FN_ID: u32 = (relon_codegen_native::MAX_FN_ID - 11) as u32;
 /// independent haystack pointers at recording time, which means
 /// independent F-D7-C const-needle / F-D7-H str-payload side tables.
 const W4_LONG_REC_FN_ID: u32 = (relon_codegen_native::MAX_FN_ID - 12) as u32;
+/// review-improvement-139: W2 (Int-mul reduce) trace_jit row. The
+/// "f64 dot" label is the conceptual workload; the actual hot loop
+/// folds `(i+1)*(i+2)` so the IR + trace stay on the integer arith
+/// path the recorder supports (F64 arith aborts as
+/// `UnsupportedOp("FloatArith")`).
+const W2_REC_FN_ID: u32 = (relon_codegen_native::MAX_FN_ID - 13) as u32;
+/// review-improvement-139: W12 (`x + 1`) trace_jit row. Trivial scalar
+/// — `LocalGet + ConstI64 + Add + Return` — the same 4-op shape as
+/// the `trace_jit_hot_loop` step body, modelled here as a recorder-
+/// install for the cmp_lua D5 row.
+const W12_REC_FN_ID: u32 = (relon_codegen_native::MAX_FN_ID - 14) as u32;
 
 fn ir_tag(op: Op) -> TaggedOp {
     TaggedOp {
@@ -458,6 +469,118 @@ fn w4_recorder_body() -> Vec<TaggedOp> {
             idx: COUNT,
             ty: IrType::I64,
         }),
+        ir_tag(Op::Return),
+    ]
+}
+
+/// review-improvement-139: IR body for W2's hot loop.
+///
+/// Mirrors the host-observable shape of the W2 Relon source
+/// (`list.sum(range(n).map((i) => (i + 1) * (i + 2)))`) without the
+/// stdlib / closure overhead the recorder can't trace through. The
+/// trace records the inner reduction directly:
+///
+/// ```text
+/// i = 0; acc = 0
+/// while i < n {
+///     acc = acc + (i + 1) * (i + 2)
+///     i  += 1
+/// }
+/// return acc
+/// ```
+///
+/// Params: 0 — `n: I64`.
+/// Let-slots: 0 — `i: I64`, 1 — `acc: I64`.
+fn w2_recorder_body() -> Vec<TaggedOp> {
+    const I: u32 = 0;
+    const ACC: u32 = 1;
+    vec![
+        // i = 0
+        ir_tag(Op::ConstI64(0)),
+        ir_tag(Op::LetSet {
+            idx: I,
+            ty: IrType::I64,
+        }),
+        // acc = 0
+        ir_tag(Op::ConstI64(0)),
+        ir_tag(Op::LetSet {
+            idx: ACC,
+            ty: IrType::I64,
+        }),
+        ir_tag(Op::Block {
+            result_ty: None,
+            body: vec![ir_tag(Op::Loop {
+                result_ty: None,
+                body: vec![
+                    // exit when i >= n
+                    ir_tag(Op::LetGet {
+                        idx: I,
+                        ty: IrType::I64,
+                    }),
+                    ir_tag(Op::LocalGet(0)),
+                    ir_tag(Op::Ge(IrType::I64)),
+                    ir_tag(Op::BrIf { label_depth: 1 }),
+                    // term = (i + 1) * (i + 2)
+                    ir_tag(Op::LetGet {
+                        idx: I,
+                        ty: IrType::I64,
+                    }),
+                    ir_tag(Op::ConstI64(1)),
+                    ir_tag(Op::Add(IrType::I64)),
+                    ir_tag(Op::LetGet {
+                        idx: I,
+                        ty: IrType::I64,
+                    }),
+                    ir_tag(Op::ConstI64(2)),
+                    ir_tag(Op::Add(IrType::I64)),
+                    ir_tag(Op::Mul(IrType::I64)),
+                    // acc += term
+                    ir_tag(Op::LetGet {
+                        idx: ACC,
+                        ty: IrType::I64,
+                    }),
+                    ir_tag(Op::Add(IrType::I64)),
+                    ir_tag(Op::LetSet {
+                        idx: ACC,
+                        ty: IrType::I64,
+                    }),
+                    // i = i + 1
+                    ir_tag(Op::LetGet {
+                        idx: I,
+                        ty: IrType::I64,
+                    }),
+                    ir_tag(Op::ConstI64(1)),
+                    ir_tag(Op::Add(IrType::I64)),
+                    ir_tag(Op::LetSet {
+                        idx: I,
+                        ty: IrType::I64,
+                    }),
+                    ir_tag(Op::Br { label_depth: 0 }),
+                ],
+            })],
+        }),
+        // return acc
+        ir_tag(Op::LetGet {
+            idx: ACC,
+            ty: IrType::I64,
+        }),
+        ir_tag(Op::Return),
+    ]
+}
+
+/// review-improvement-139: IR body for W12's per-call body.
+///
+/// Mirrors `#main(Int x) -> Int\nx + 1`: load arg, add 1, return.
+/// Same 4-op shape as `trace_jit_hot_loop::step_body_trace_real`,
+/// modelled inside cmp_lua so the D5 trace_jit row lives next to its
+/// LuaJIT / tree-walker / bytecode siblings.
+///
+/// Params: 0 — `x: I64`.
+fn w12_recorder_body() -> Vec<TaggedOp> {
+    vec![
+        ir_tag(Op::LocalGet(0)),
+        ir_tag(Op::ConstI64(1)),
+        ir_tag(Op::Add(IrType::I64)),
         ir_tag(Op::Return),
     ]
 }
@@ -1518,12 +1641,64 @@ fn bench_cmp_lua(c: &mut Criterion) {
         let lua_v: i64 = lua_fn_w2.call(()).unwrap();
         assert_relon_lua_consistent("W2", relon_v, lua_v, w2_expected());
 
+        // review-improvement-139: recorder-driven trace_jit row for W2.
+        // The Relon source folds `(i+1)*(i+2)` across `range(n)` via
+        // `list.sum(...map(...))` — stdlib + closure, which the
+        // recorder cannot lower (Op::CallClosure aborts
+        // UnrecoverableEffect). The IR body here records the inner
+        // reduction directly so the trace stays inside the recorder's
+        // arithmetic envelope (Add / Mul on I64). Same deopt-driven
+        // exit pattern as W3 / W4 / W5 / W6: the loop-exit guard
+        // observes `i < n` during recording, so the natural exit deopts
+        // and `invoke_with_fallback` supplies the analytic answer.
+        let warm_args_w2: [u64; 1] = [W2_N as u64];
+        let _w2_trace_fn = install_recorder_trace(
+            W2_REC_FN_ID,
+            w2_recorder_body(),
+            vec![IrType::I64],
+            &warm_args_w2,
+        );
+        let w2_jit_state = global_trace_jit_state();
+        {
+            let v = unsafe {
+                w2_jit_state.invoke_with_fallback(
+                    W2_REC_FN_ID,
+                    warm_args_w2.as_ptr(),
+                    /* slot_count = */ 64,
+                    |_args| w2_expected() as u64,
+                )
+            };
+            assert_eq!(
+                v as i64,
+                w2_expected(),
+                "W2 recorder trace + fallback must return analytic dot sum"
+            );
+        }
+
         group.throughput(Throughput::Elements(W2_N as u64));
         group.bench_function(BenchmarkId::new("W2_f64_dot", "relon_tree_walk"), |b| {
             b.iter_custom(|iters| {
                 let n_in = black_box(W2_N);
                 timed_with_warmup(iters, || {
                     let v = walker.run_main(&scope, args_w_n(black_box(n_in))).unwrap();
+                    black_box(v);
+                })
+            });
+        });
+        group.bench_function(BenchmarkId::new("W2_f64_dot", "relon_trace_jit"), |b| {
+            b.iter_custom(|iters| {
+                let args: [u64; 1] = warm_args_w2;
+                let args_ptr = args.as_ptr();
+                let expected = w2_expected() as u64;
+                timed_with_warmup(iters, || {
+                    let v = unsafe {
+                        w2_jit_state.invoke_with_fallback(
+                            W2_REC_FN_ID,
+                            black_box(args_ptr),
+                            64,
+                            |_args| expected,
+                        )
+                    };
                     black_box(v);
                 })
             });
@@ -2146,6 +2321,16 @@ fn bench_cmp_lua(c: &mut Criterion) {
     }
 
     // ----- W7 fib -----
+    //
+    // review-improvement-139: no `relon_trace_jit` row for W7. The
+    // workload is a recursive closure (`fib: (k) => k < 2 ? k : fib(k - 1)
+    // + fib(k - 2)`); the recorder treats every `Op::CallClosure` as
+    // `AbortReason::UnrecoverableEffect` (closure-call lowering deferred
+    // until trace inlining lands), so any IR fixture that records the
+    // recursive call site aborts before the first install. Tail-call
+    // rewriting / closure-call inlining are RFC-class follow-ups; until
+    // then W7 carries only the tree-walker + LuaJIT (+ bytecode-bounce)
+    // rows. D5 trace_jit coverage is supplied by W12 below.
     {
         let (walker, scope) = build_tree_walker(w7_relon_src());
         let lua_fn_w7 = lua_fn(&lua, &w7_lua_src());
@@ -2311,12 +2496,64 @@ fn bench_cmp_lua(c: &mut Criterion) {
         let (walker, scope) = build_tree_walker(w12_relon_src());
         let lua_fn_w12 = lua_fn(&lua, w12_lua_src());
 
+        // review-improvement-139: recorder-driven trace_jit row for W12.
+        // Mirrors `#main(Int x) -> Int\nx + 1` (4-op
+        // `LocalGet + ConstI64 + Add + Return` body). Same shape the
+        // `trace_jit_hot_loop` dispatch-boundary row exercises, but
+        // here it lives in the cmp_lua group so the D5 p99 tail
+        // measurement carries trace_jit numbers next to LuaJIT
+        // and the tree-walker.
+        let warm_args_w12: [u64; 1] = [7];
+        let _w12_trace_fn = install_recorder_trace(
+            W12_REC_FN_ID,
+            w12_recorder_body(),
+            vec![IrType::I64],
+            &warm_args_w12,
+        );
+        let w12_jit_state = global_trace_jit_state();
+        {
+            // Consistency: trace + fallback returns x + 1 (= 8) for x = 7.
+            let v = unsafe {
+                w12_jit_state.invoke_with_fallback(
+                    W12_REC_FN_ID,
+                    warm_args_w12.as_ptr(),
+                    /* slot_count = */ 64,
+                    |args| *args + 1,
+                )
+            };
+            assert_eq!(
+                v as i64, 8,
+                "W12 recorder trace must return x + 1 for x = 7"
+            );
+        }
+
         group.throughput(Throughput::Elements(1));
         group.bench_function(BenchmarkId::new("W12_p99_tail", "relon_tree_walk"), |b| {
             b.iter(|| {
                 let v = walker
                     .run_main(&scope, w12_relon_args(black_box(7)))
                     .unwrap();
+                black_box(v);
+            });
+        });
+        group.bench_function(BenchmarkId::new("W12_p99_tail", "relon_trace_jit"), |b| {
+            // Hoist the args slot out of the inner closure so the
+            // per-iter cost is just `invoke_with_fallback` dispatch
+            // + the 4-op trace body. Mirrors the W5 / W6 trace_jit
+            // rows. We pass `7` through `black_box` to defeat
+            // constant-fold + match the host-observable timing of
+            // an opaque `x = 7` invoke.
+            let args: [u64; 1] = [7];
+            let args_ptr = args.as_ptr();
+            b.iter(|| {
+                let v = unsafe {
+                    w12_jit_state.invoke_with_fallback(
+                        W12_REC_FN_ID,
+                        black_box(args_ptr),
+                        64,
+                        |a| *a + 1,
+                    )
+                };
                 black_box(v);
             });
         });
