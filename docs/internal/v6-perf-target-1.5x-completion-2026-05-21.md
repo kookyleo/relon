@@ -13,18 +13,23 @@ trace-JIT reference 均达 ≤ LuaJIT × 1.5。原始 × 2 软目标 → × 1.5 
 | Dim | Workload | trace_jit | LuaJIT | ratio | × 1.5 | 起点 | 路径 |
 |---|---|---:|---:|---:|:---:|---:|---|
 | D1 | W1 hot int sum | trace-JIT ref | — | × 0.66 | ✓ | × 0.66 | already |
-| D1 | W2 f64 dot | (no trace row) | — | n/a | ✓† | — | D1 via W1 |
+| D1 | W2 f64 dot | 5.66 µs | 15.86 µs | **× 0.36** | ✓ | n/a → meas | review-improvement-139 |
 | D2 | W11 default | 2.93 ms | 1.97 ms | **× 1.488** | ✓ | × 4.59 | F-D2-default → I → J |
 | D2 | W11 lite | 2.93 ms | 1.97 ms | **× 1.486** | ✓ | × 1.59 | F-D2 → I → J |
 | D5 | W7 fib (D5 ref) | trace-JIT ref | — | × 0.01 | ✓ | × 0.01 | already |
-| D5 | W12 p99 tail | trace-JIT ref | — | × 0.01 | ✓ | × 0.01 | already |
+| D5 | W7 fib (cmp_lua) | n/a (abort) | — | n/a‡ | ✓ | — | recursion → CallClosure abort |
+| D5 | W12 p99 tail (ref) | trace-JIT ref | — | × 0.01 | ✓ | × 0.01 | already |
+| D5 | W12 p99 tail (cmp_lua) | 150.4 ns | 108.1 ns | **× 1.39** | ✓ | n/a → meas | review-improvement-139 |
 | D7 | W3 string concat | 1.94 ms | 1.39 ms | **× 1.40** | ✓ | × 1.61 | F-D7-I (single-block alloc) |
 | D7 | W4 string contains | 23.8 µs | 17.9 µs | **× 1.33** | ✓ | × 1.66 | F-D7-J (guard hoist + brif quick-arm) |
 | D8 | W5 dict_str_key | 168.5 µs | 114.4 µs | **× 1.47** | ✓ | × 1.95 | F-D8-E.4 + E.5 + E.6 + E.7 |
 | D8 | W6 dict_num_key | 17.8 µs | 71.8 µs | **× 0.50** | ✓ | × 0.59 | F-D8 + F-D9 |
 
-†D1 通过 W1 trace-JIT reference 已通过 × 1.5（× 0.66）；W2/W7 cmp_lua 没建
-trace_jit row，但 D1/D5 维度通过 W1/W12 reference 达成。
+‡review-improvement-139: W7 fib 的 trace_jit row 不可达。recorder 把
+`Op::CallClosure` 一律视为 `AbortReason::UnrecoverableEffect`（closure-call
+lowering 暂未支持），W7 fixture 走到递归调用点立刻 abort，install 不会发生。
+W7 在 cmp_lua 内只剩 tree-walker + LuaJIT (+ bytecode-bounce) row；D5 trace_jit
+覆盖由同维度 W12 cmp_lua row 与 trace_jit_hot_loop reference 共同提供。
 
 ## 推进路径
 
