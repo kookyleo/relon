@@ -830,6 +830,395 @@ fn list_len_witness_passes_length_through() {
     assert_eq!(outcome.value, Some(5));
 }
 
+// -- M2-B phase 4a: host-fn registry on CapabilityVtable ----------
+
+/// Hand-written `RelonFunction` for the phase-4a tests. Pure scalar
+/// in / scalar out — sums every positional arg as i64 and returns
+/// `Value::Int(sum)`. Tracks invocation count so the test can pin
+/// that a denied call site never reaches the host fn.
+struct SumNative {
+    hits: std::sync::atomic::AtomicU64,
+}
+
+impl SumNative {
+    fn new() -> Self {
+        Self {
+            hits: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+}
+
+impl relon_eval_api::RelonFunction for SumNative {
+    fn call(
+        &self,
+        args: relon_eval_api::NativeArgs,
+        _range: relon_parser::TokenRange,
+    ) -> Result<Value, RuntimeError> {
+        self.hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let mut acc: i64 = 0;
+        for v in args.positional.iter() {
+            match v {
+                Value::Int(i) => acc = acc.wrapping_add(*i),
+                other => {
+                    return Err(RuntimeError::Unsupported {
+                        reason: format!("SumNative expects Int, got {}", other.type_name()),
+                    })
+                }
+            }
+        }
+        Ok(Value::Int(acc))
+    }
+}
+
+#[test]
+fn call_native_registry_dispatches_scalar_sum() {
+    use relon_bytecode::op::{BcFunction, BcOp};
+    use std::sync::Arc;
+
+    // Two args on the stack, CallNative with import_idx 5, ret_ty i64.
+    // Registered SumNative returns the i64 sum; we then return that
+    // value out of the bytecode VM to assert the round-trip.
+    let bc = BcFunction {
+        ops: vec![
+            BcOp::ConstI64(11),
+            BcOp::ConstI64(22),
+            BcOp::CallNative {
+                import_idx: 5,
+                arg_count: 2,
+                cap_bit: relon_ir::NO_CAPABILITY_BIT,
+                ret_ty: relon_ir::IrType::I64,
+            },
+            BcOp::Return,
+        ],
+        locals: 0,
+        ir_pc_map: vec![1, 2, 3, 4],
+        stack_recipe: vec![vec![], vec![], vec![], vec![]],
+    };
+
+    let mut vtable = CapabilityVtable::default();
+    let native: Arc<SumNative> = Arc::new(SumNative::new());
+    let native_dyn: Arc<dyn relon_eval_api::RelonFunction> = native.clone();
+    vtable.register_host_fn(5, native_dyn);
+    assert_eq!(vtable.host_fn_count(), 1);
+    let cfg = BcVmConfig {
+        cap_vtable: vtable,
+        ..BcVmConfig::default()
+    };
+    let vm = BytecodeVm::new(cfg);
+    let outcome = vm.invoke(&bc, &[]);
+    assert!(
+        outcome.error.is_none(),
+        "expected clean run, got {:?}",
+        outcome.error
+    );
+    assert_eq!(outcome.value, Some(33u64));
+    assert_eq!(
+        native.hits.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "host fn invoked exactly once"
+    );
+}
+
+#[test]
+fn call_native_registry_gate_denial_skips_host_fn() {
+    use relon_bytecode::op::{BcFunction, BcOp};
+    use std::sync::Arc;
+
+    // Registered host fn for slot 5, but the gate denies the call's
+    // cap_bit. The dispatcher must trip CapabilityDenied with the
+    // declared bit and never invoke the host fn.
+    let bc = BcFunction {
+        ops: vec![
+            BcOp::CallNative {
+                import_idx: 5,
+                arg_count: 0,
+                cap_bit: relon_eval_api::CapabilityBit::Network.bit_index(),
+                ret_ty: relon_ir::IrType::I64,
+            },
+            BcOp::Return,
+        ],
+        locals: 0,
+        ir_pc_map: vec![1, 2],
+        stack_recipe: vec![vec![], vec![]],
+    };
+
+    let mut vtable = CapabilityVtable::default();
+    let native: Arc<SumNative> = Arc::new(SumNative::new());
+    let native_dyn: Arc<dyn relon_eval_api::RelonFunction> = native.clone();
+    vtable.register_host_fn(5, native_dyn);
+    let gate: Arc<dyn relon_eval_api::CapabilityGate> = Arc::new(CountingGate::deny_all());
+    vtable.set_gate(gate);
+    let cfg = BcVmConfig {
+        cap_vtable: vtable,
+        ..BcVmConfig::default()
+    };
+    let vm = BytecodeVm::new(cfg);
+    let outcome = vm.invoke(&bc, &[]);
+    match outcome.error {
+        Some(BcVmError::CapabilityDenied { cap_bit }) => {
+            assert_eq!(cap_bit, relon_eval_api::CapabilityBit::Network.bit_index());
+        }
+        other => panic!("expected CapabilityDenied before host fn, got {other:?}"),
+    }
+    assert_eq!(
+        native.hits.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "host fn must not run when capability prong fires"
+    );
+}
+
+#[test]
+fn call_native_unregistered_slot_keeps_native_not_implemented_fallback() {
+    use relon_bytecode::op::{BcFunction, BcOp};
+
+    // Phase-4a contract: an absent registry slot keeps the legacy
+    // `NativeNotImplemented` envelope so the differential harness's
+    // bounce shape stays stable.
+    let bc = BcFunction {
+        ops: vec![
+            BcOp::CallNative {
+                import_idx: 99,
+                arg_count: 0,
+                cap_bit: relon_ir::NO_CAPABILITY_BIT,
+                ret_ty: relon_ir::IrType::I64,
+            },
+            BcOp::Return,
+        ],
+        locals: 0,
+        ir_pc_map: vec![1, 2],
+        stack_recipe: vec![vec![], vec![]],
+    };
+    // Empty registry — no host fn registered for any slot.
+    let vm = BytecodeVm::new(BcVmConfig::default());
+    let outcome = vm.invoke(&bc, &[]);
+    match outcome.error {
+        Some(BcVmError::NativeNotImplemented { import_idx }) => assert_eq!(import_idx, 99),
+        other => panic!("expected NativeNotImplemented for unregistered slot, got {other:?}"),
+    }
+}
+
+#[test]
+fn call_native_registry_bool_return_round_trips() {
+    use relon_bytecode::op::{BcFunction, BcOp};
+    use std::sync::Arc;
+
+    // Host fn returns `Value::Bool(true)` against a declared
+    // `IrType::Bool`. The encoder must lift it back into the bool
+    // slot (`1`) so the surrounding op stream can branch on it.
+    struct AlwaysTrue;
+    impl relon_eval_api::RelonFunction for AlwaysTrue {
+        fn call(
+            &self,
+            _args: relon_eval_api::NativeArgs,
+            _range: relon_parser::TokenRange,
+        ) -> Result<Value, RuntimeError> {
+            Ok(Value::Bool(true))
+        }
+    }
+
+    let bc = BcFunction {
+        ops: vec![
+            BcOp::CallNative {
+                import_idx: 1,
+                arg_count: 0,
+                cap_bit: relon_ir::NO_CAPABILITY_BIT,
+                ret_ty: relon_ir::IrType::Bool,
+            },
+            BcOp::Return,
+        ],
+        locals: 0,
+        ir_pc_map: vec![1, 2],
+        stack_recipe: vec![vec![], vec![]],
+    };
+    let mut vtable = CapabilityVtable::default();
+    let native: Arc<dyn relon_eval_api::RelonFunction> = Arc::new(AlwaysTrue);
+    vtable.register_host_fn(1, native);
+    let cfg = BcVmConfig {
+        cap_vtable: vtable,
+        ..BcVmConfig::default()
+    };
+    let vm = BytecodeVm::new(cfg);
+    let outcome = vm.invoke(&bc, &[]);
+    assert!(outcome.error.is_none());
+    assert_eq!(outcome.value, Some(1u64));
+}
+
+#[test]
+fn call_native_host_fn_failure_lifts_to_unsupported() {
+    use relon_bytecode::op::{BcFunction, BcOp};
+    use std::sync::Arc;
+
+    // Host fn returns an explicit `RuntimeError`; the dispatcher
+    // surfaces `BcVmError::HostFnError` which lifts to
+    // `RuntimeError::Unsupported` per the phase-4a envelope.
+    struct AlwaysFail;
+    impl relon_eval_api::RelonFunction for AlwaysFail {
+        fn call(
+            &self,
+            _args: relon_eval_api::NativeArgs,
+            _range: relon_parser::TokenRange,
+        ) -> Result<Value, RuntimeError> {
+            Err(RuntimeError::Unsupported {
+                reason: "synthetic host fn failure".into(),
+            })
+        }
+    }
+
+    let bc = BcFunction {
+        ops: vec![
+            BcOp::CallNative {
+                import_idx: 2,
+                arg_count: 0,
+                cap_bit: relon_ir::NO_CAPABILITY_BIT,
+                ret_ty: relon_ir::IrType::I64,
+            },
+            BcOp::Return,
+        ],
+        locals: 0,
+        ir_pc_map: vec![1, 2],
+        stack_recipe: vec![vec![], vec![]],
+    };
+    let mut vtable = CapabilityVtable::default();
+    let native: Arc<dyn relon_eval_api::RelonFunction> = Arc::new(AlwaysFail);
+    vtable.register_host_fn(2, native);
+    let cfg = BcVmConfig {
+        cap_vtable: vtable,
+        ..BcVmConfig::default()
+    };
+    let vm = BytecodeVm::new(cfg);
+    let outcome = vm.invoke(&bc, &[]);
+    let err = outcome.error.expect("must surface host fn failure");
+    assert!(
+        matches!(err, BcVmError::HostFnError { import_idx, .. } if import_idx == 2),
+        "got {err:?}"
+    );
+    let lifted = err.into_runtime_error(relon_parser::TokenRange::default());
+    match lifted {
+        RuntimeError::Unsupported { reason } => {
+            assert!(reason.contains("import_idx 2"));
+            assert!(reason.contains("synthetic host fn failure"));
+        }
+        other => panic!("expected Unsupported, got {other:?}"),
+    }
+}
+
+#[test]
+fn call_native_registry_arg_order_matches_declaration() {
+    use relon_bytecode::op::{BcFunction, BcOp};
+    use std::sync::Arc;
+
+    // Push 1, 2, 3 in that order onto the stack, then CallNative with
+    // arg_count=3. The host fn must receive `[1, 2, 3]` in declaration
+    // order (top-of-stack is the last positional arg). We assert this
+    // by encoding the args as `100*a + 10*b + c` so the order is
+    // observable in the returned scalar.
+    struct OrderProbe;
+    impl relon_eval_api::RelonFunction for OrderProbe {
+        fn call(
+            &self,
+            args: relon_eval_api::NativeArgs,
+            _range: relon_parser::TokenRange,
+        ) -> Result<Value, RuntimeError> {
+            let a = match args.positional.first() {
+                Some(Value::Int(v)) => *v,
+                _ => 0,
+            };
+            let b = match args.positional.get(1) {
+                Some(Value::Int(v)) => *v,
+                _ => 0,
+            };
+            let c = match args.positional.get(2) {
+                Some(Value::Int(v)) => *v,
+                _ => 0,
+            };
+            Ok(Value::Int(100 * a + 10 * b + c))
+        }
+    }
+
+    let bc = BcFunction {
+        ops: vec![
+            BcOp::ConstI64(1),
+            BcOp::ConstI64(2),
+            BcOp::ConstI64(3),
+            BcOp::CallNative {
+                import_idx: 7,
+                arg_count: 3,
+                cap_bit: relon_ir::NO_CAPABILITY_BIT,
+                ret_ty: relon_ir::IrType::I64,
+            },
+            BcOp::Return,
+        ],
+        locals: 0,
+        ir_pc_map: vec![1, 2, 3, 4, 5],
+        stack_recipe: vec![vec![], vec![], vec![], vec![], vec![]],
+    };
+    let mut vtable = CapabilityVtable::default();
+    let native: Arc<dyn relon_eval_api::RelonFunction> = Arc::new(OrderProbe);
+    vtable.register_host_fn(7, native);
+    let cfg = BcVmConfig {
+        cap_vtable: vtable,
+        ..BcVmConfig::default()
+    };
+    let vm = BytecodeVm::new(cfg);
+    let outcome = vm.invoke(&bc, &[]);
+    assert!(outcome.error.is_none());
+    assert_eq!(outcome.value, Some(123u64));
+}
+
+#[test]
+fn call_native_registry_unsupported_return_type_traps() {
+    use relon_bytecode::op::{BcFunction, BcOp};
+    use std::sync::Arc;
+
+    // Host fn returns `Value::String` — outside the phase-4a scalar
+    // envelope. The encoder must surface
+    // `HostFnReturnTypeMismatch`; the lift routes through
+    // `Unsupported` with both `import_idx` and the unsupported type
+    // name in the reason.
+    struct StringReturner;
+    impl relon_eval_api::RelonFunction for StringReturner {
+        fn call(
+            &self,
+            _args: relon_eval_api::NativeArgs,
+            _range: relon_parser::TokenRange,
+        ) -> Result<Value, RuntimeError> {
+            Ok(Value::String("nope".into()))
+        }
+    }
+
+    let bc = BcFunction {
+        ops: vec![
+            BcOp::CallNative {
+                import_idx: 8,
+                arg_count: 0,
+                cap_bit: relon_ir::NO_CAPABILITY_BIT,
+                ret_ty: relon_ir::IrType::I64,
+            },
+            BcOp::Return,
+        ],
+        locals: 0,
+        ir_pc_map: vec![1, 2],
+        stack_recipe: vec![vec![], vec![]],
+    };
+    let mut vtable = CapabilityVtable::default();
+    let native: Arc<dyn relon_eval_api::RelonFunction> = Arc::new(StringReturner);
+    vtable.register_host_fn(8, native);
+    let cfg = BcVmConfig {
+        cap_vtable: vtable,
+        ..BcVmConfig::default()
+    };
+    let vm = BytecodeVm::new(cfg);
+    let outcome = vm.invoke(&bc, &[]);
+    let err = outcome.error.expect("must trap on String return");
+    assert!(
+        matches!(
+            err,
+            BcVmError::HostFnReturnTypeMismatch { import_idx: 8, .. }
+        ),
+        "got {err:?}"
+    );
+}
+
 #[test]
 fn call_native_lifts_to_unsupported_runtime_error() {
     use relon_bytecode::op::{BcFunction, BcOp};

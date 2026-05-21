@@ -7,11 +7,16 @@
 //! prongs trip through [`BcVmError`] variants that lift cleanly into
 //! `relon_eval_api::RuntimeError`.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 use std::time::Instant;
 
-use relon_eval_api::{CapabilityBit, CapabilityError, CapabilityGate, RuntimeError};
+use ordered_float::OrderedFloat;
+use relon_eval_api::{
+    CapabilityBit, CapabilityError, CapabilityGate, NativeArgs, NativeFnCaps, RelonFunction,
+    RuntimeError, Value,
+};
 use relon_ir::IrType;
 use relon_parser::TokenRange;
 use thiserror::Error;
@@ -73,9 +78,16 @@ impl Default for BcVmConfig {
 /// fallback for code paths that haven't been migrated yet — phase 2
 /// will land the dispatch-side consult and trim the fallback's reach.
 ///
-/// Native-fn slot payloads land in phase 2 alongside the new ops;
-/// phase 1 only parks the trait hook so the field shape stops moving
-/// across upcoming commits.
+/// ## M2-B phase 4a — host-fn registry
+///
+/// The `host_fns` map keys host-supplied [`RelonFunction`] entries by
+/// `import_idx` (the same slot `BcOp::CallNative` carries). Phase 4a
+/// scope is **scalar in / scalar out** — args travel as `Value::Int` /
+/// `Value::Bool` / `Value::Float` / `Value::Null` (decoded from the
+/// VM's `u64` slots through the lane convention shared with the
+/// cranelift backend); return values follow `BcOp::CallNative::ret_ty`
+/// back into a `u64`. List / dict / string return shapes need the
+/// buffer-protocol memory model and ship in phase 4b.
 #[derive(Clone, Default)]
 pub struct CapabilityVtable {
     grants: Vec<bool>,
@@ -84,16 +96,28 @@ pub struct CapabilityVtable {
     /// preserves the M2-A grant-table-only behaviour so existing
     /// callers don't observe a change.
     gate: Option<Arc<dyn CapabilityGate>>,
+    /// M2-B phase 4a: host-fn registry keyed by the `import_idx`
+    /// carried on `BcOp::CallNative`. An entry here unfreezes the
+    /// phase-3 `NativeNotImplemented` trap — the dispatcher pops
+    /// `arg_count` slots, decodes them into a positional `Vec<Value>`,
+    /// invokes the host fn, and re-encodes the returned [`Value`] back
+    /// into the operand stack per `ret_ty`. An absent slot keeps the
+    /// historical `NativeNotImplemented` envelope so the differential
+    /// harness still has a stable bounce shape for un-registered
+    /// imports.
+    host_fns: HashMap<u32, Arc<dyn RelonFunction>>,
 }
 
 impl fmt::Debug for CapabilityVtable {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // `dyn CapabilityGate` doesn't carry `Debug`; print presence
-        // only so the surrounding `BcVmConfig` debug stays cheap and
-        // doesn't force the trait surface wider than necessary.
+        // `dyn CapabilityGate` / `dyn RelonFunction` don't carry
+        // `Debug`; print presence + cardinality only so the surrounding
+        // `BcVmConfig` debug stays cheap and doesn't force the trait
+        // surfaces wider than necessary.
         f.debug_struct("CapabilityVtable")
             .field("grants", &self.grants)
             .field("has_gate", &self.gate.is_some())
+            .field("host_fn_count", &self.host_fns.len())
             .finish()
     }
 }
@@ -157,6 +181,33 @@ impl CapabilityVtable {
         gate.check(bit)
     }
 
+    /// M2-B phase 4a: register a host fn under `import_idx`. Overwrites
+    /// any existing slot so a host can rebind between `run_main` calls
+    /// without rebuilding the vtable. The `import_idx` is the same slot
+    /// the [`crate::op::BcOp::CallNative`] op carries — typically the
+    /// position of the corresponding `relon_ir::NativeImport` entry in
+    /// the module's imports table.
+    pub fn register_host_fn(&mut self, import_idx: u32, func: Arc<dyn RelonFunction>) {
+        self.host_fns.insert(import_idx, func);
+    }
+
+    /// M2-B phase 4a: resolve a host fn by `import_idx`. Returns `None`
+    /// when no host has registered an entry for the slot — the
+    /// dispatcher then keeps the legacy `NativeNotImplemented` trap so
+    /// the differential harness's bounce shape stays stable.
+    pub fn resolve_host_fn(&self, import_idx: u32) -> Option<&Arc<dyn RelonFunction>> {
+        self.host_fns.get(&import_idx)
+    }
+
+    /// M2-B phase 4a: total number of registered host-fn slots. Used by
+    /// the dispatch-side instrumentation tests + the four-way harness's
+    /// readiness check — `0` means "no `CallNative` will succeed; route
+    /// through cranelift / tree-walker". The number is **not** part of
+    /// the public ABI; hosts should not condition behaviour on it.
+    pub fn host_fn_count(&self) -> usize {
+        self.host_fns.len()
+    }
+
     /// M2-B phase 2: sweep every grant-table bit through the installed
     /// gate. Used as a dispatch-time pre-check so a gate that denies a
     /// previously-granted bit (e.g. trust-level downgrade between
@@ -195,6 +246,73 @@ fn first_denied_bit(gate: &Arc<dyn CapabilityGate>) -> Option<u32> {
         }
     }
     None
+}
+
+/// M2-B phase 4a: encode a returned [`Value`] into the VM's `u64`
+/// slot according to the call site's declared `ret_ty`. The phase-4a
+/// envelope is **scalar only** — anything richer than `Int` / `Float`
+/// / `Bool` / `Null` (i.e. `String` / `List*` / `Closure`) surfaces as
+/// [`BcVmError::HostFnReturnTypeMismatch`] so the host gets a clear
+/// "route through cranelift / tree-walker" envelope rather than a
+/// silently-wrong slot value.
+fn encode_value_for_ret(
+    value: &Value,
+    ret_ty: IrType,
+    import_idx: u32,
+) -> Result<VmValue, BcVmError> {
+    match (value, ret_ty) {
+        (Value::Int(v), IrType::I64) | (Value::Int(v), IrType::I32) => Ok(*v as u64),
+        (Value::Bool(b), IrType::Bool) => Ok(if *b { 1 } else { 0 }),
+        (Value::Bool(b), IrType::I64) | (Value::Bool(b), IrType::I32) => {
+            // Host fns sometimes upcast a bool return through the i64
+            // lane (matches the cranelift backend's bool-as-i32-as-i64
+            // convention). Mirror that so the harness round-trip works
+            // even when the IR-level decl narrows to Bool.
+            Ok(if *b { 1 } else { 0 })
+        }
+        (Value::Null, IrType::Null) | (Value::Null, IrType::I64) | (Value::Null, IrType::I32) => {
+            Ok(0)
+        }
+        (Value::Float(OrderedFloat(f)), IrType::F64) => Ok(f.to_bits()),
+        (other, _) => Err(BcVmError::HostFnReturnTypeMismatch {
+            import_idx,
+            expected: ret_ty,
+            found: other.type_name().to_string(),
+        }),
+    }
+}
+
+/// M2-B phase 4a stub [`NativeFnCaps`] handed to host fns the bytecode
+/// VM dispatches.
+///
+/// The scaffold envelope does not support Relon-level callbacks
+/// (`call_relon`) or `Iter`-cursor tracking, so the impl leans on the
+/// trait's default implementations for everything except presence —
+/// host fns that rely on those callbacks must keep routing through the
+/// tree-walker / cranelift backends until the bytecode VM grows
+/// frame-stack + cursor surface (M3 or later).
+///
+/// `Send + Sync` because the underlying caps handle ends up shared
+/// across the host fn's execution; the empty stub is trivially safe.
+struct BytecodeNativeFnCaps;
+
+impl NativeFnCaps for BytecodeNativeFnCaps {
+    fn call_relon(
+        &self,
+        _func: &Value,
+        _args: Vec<Value>,
+        _range: TokenRange,
+    ) -> Result<Value, RuntimeError> {
+        // Closure callbacks land alongside the bytecode VM's frame
+        // stack — until then a host fn that tries to call back into
+        // Relon logic surfaces this `Unsupported` envelope so the host
+        // can route the call through the tree-walker instead. Phase 4a
+        // scope is scalar-only, so the standard scalar intrinsics never
+        // hit this path.
+        Err(RuntimeError::Unsupported {
+            reason: "bytecode VM: native fn callbacks into Relon closures land in M3".into(),
+        })
+    }
 }
 
 /// Map a numeric `cap_bit` to a [`CapabilityBit`] variant. Returns
@@ -272,14 +390,45 @@ pub enum BcVmError {
     },
     /// M2-B phase 3: `BcOp::CallNative` passed the capability prong
     /// but the bytecode VM has no host-fn registry to invoke. The
-    /// phase-3 dispatch shape lands the consult sites; the host-fn
-    /// pointer wiring follows in phase 4. Callers that observe this
-    /// envelope today should route the source through cranelift /
+    /// phase-3 dispatch shape lands the consult sites; phase 4a wires
+    /// the actual registry so this envelope now fires only for
+    /// `import_idx` values the host has not registered. Callers that
+    /// observe this envelope today should either register a host fn
+    /// for the slot or route the source through cranelift /
     /// tree-walker.
     #[error("bytecode VM has no host-fn registry for import_idx {import_idx}")]
     NativeNotImplemented {
         /// The `NativeImport` slot the call targeted.
         import_idx: u32,
+    },
+    /// M2-B phase 4a: the host-fn registry entry for `import_idx`
+    /// resolved, the gate consult passed, but the host fn itself
+    /// returned an error. The reason string carries the underlying
+    /// `RuntimeError`'s display form for diagnostics; the surrounding
+    /// envelope lifts to `RuntimeError::Unsupported` today so the
+    /// four-way differential harness keeps a stable shape. Phase 4b
+    /// can widen this to a richer carrier when typed-arg lanes land.
+    #[error("bytecode VM host-fn (import_idx {import_idx}) failed: {reason}")]
+    HostFnError {
+        /// The `NativeImport` slot the failing call targeted.
+        import_idx: u32,
+        /// Display form of the underlying `RuntimeError`.
+        reason: String,
+    },
+    /// M2-B phase 4a: a registered host fn returned a [`Value`] whose
+    /// shape doesn't match the [`BcOp::CallNative::ret_ty`] declared
+    /// at the call site. Surfaces as `Unsupported` after the lift —
+    /// the scaffold envelope is scalar-only so this typically means
+    /// the host fn would need the phase-4b list / dict / string
+    /// memory model.
+    #[error("bytecode VM host-fn (import_idx {import_idx}) returned unsupported {found} for {expected:?}")]
+    HostFnReturnTypeMismatch {
+        /// The `NativeImport` slot the call targeted.
+        import_idx: u32,
+        /// Declared IR return type from the call site.
+        expected: IrType,
+        /// Display-friendly form of the returned `Value` type.
+        found: String,
     },
 }
 
@@ -313,6 +462,19 @@ impl BcVmError {
                 reason: format!(
                     "bytecode VM has no host-fn registry for native import_idx {import_idx}; \
                      route through cranelift/tree-walker until phase 4 wiring lands"
+                ),
+            },
+            BcVmError::HostFnError { import_idx, reason } => RuntimeError::Unsupported {
+                reason: format!("bytecode VM host-fn (import_idx {import_idx}) failed: {reason}"),
+            },
+            BcVmError::HostFnReturnTypeMismatch {
+                import_idx,
+                expected,
+                found,
+            } => RuntimeError::Unsupported {
+                reason: format!(
+                    "bytecode VM host-fn (import_idx {import_idx}) returned {found} \
+                     for declared ret_ty {expected:?} — phase 4a scope is scalar-only"
                 ),
             },
         }
@@ -654,7 +816,7 @@ impl BytecodeVm {
                 import_idx,
                 arg_count,
                 cap_bit,
-                ret_ty: _,
+                ret_ty,
             } => {
                 // M2-B phase 3: per-call-site capability consult.
                 //
@@ -680,26 +842,67 @@ impl BytecodeVm {
                         return Err(BcVmError::CapabilityDenied { cap_bit: *cap_bit });
                     }
                 }
-                // Phase 3 ships the gate / vtable consult shape; the
-                // host-fn pointer registry that would unfreeze the
-                // actual call lands alongside the wider native dispatch
-                // wire-up (phase 4). Until then a permitted
-                // `CallNative` traps with the dedicated
-                // `NativeNotImplemented` envelope so the differential
-                // harness sees a stable shape (vs. the historical
-                // `Unsupported` route taken by the unsupported-op
-                // bounce).
+                // M2-B phase 4a: real host-fn dispatch.
                 //
-                // We still drain `arg_count` operands so the surrounding
-                // op stream's stack discipline matches what a real
-                // dispatch would leave behind — this keeps the
-                // `stack_recipe` table valid in the deopt-resume path.
-                for _ in 0..*arg_count {
-                    pop(stack, bc_idx)?;
+                // Resolve the registry slot keyed by `import_idx`. A
+                // hit pops `arg_count` operands (in declaration order —
+                // the top-of-stack is the last arg), decodes them per
+                // the phase-4a scalar lane convention (i64 for the
+                // numeric / bool / null slots, f64 via bit cast for the
+                // float lane), invokes the host fn, and re-encodes the
+                // [`Value`] return back into the operand stack per
+                // `ret_ty`. A miss falls through to the legacy
+                // `NativeNotImplemented` envelope so the differential
+                // harness's bounce shape stays stable.
+                //
+                // We still drain `arg_count` operands on the miss path
+                // so the surrounding op stream's stack discipline
+                // matches what a real dispatch would leave behind —
+                // this keeps the `stack_recipe` table valid in the
+                // deopt-resume path.
+                let host_fn = self.config.cap_vtable.resolve_host_fn(*import_idx).cloned();
+                if let Some(func) = host_fn {
+                    // Pop in declaration order: stack top is the last
+                    // arg, so we collect then reverse.
+                    let mut packed: Vec<Value> = Vec::with_capacity(*arg_count as usize);
+                    for _ in 0..*arg_count {
+                        let slot = pop(stack, bc_idx)?;
+                        // Phase 4a scope: all args travel through the
+                        // i64 lane as `Value::Int`. The wider
+                        // arg-type-tagged decode (per-slot `IrType`)
+                        // ships with the buffer-protocol envelope in
+                        // phase 4b — until then host fns that need
+                        // anything richer than `Value::Int` should
+                        // route through the tree-walker / cranelift
+                        // backends.
+                        packed.push(Value::Int(slot as i64));
+                    }
+                    packed.reverse();
+                    let caps: Arc<dyn NativeFnCaps> = Arc::new(BytecodeNativeFnCaps);
+                    let args = NativeArgs::from_positional(packed, caps);
+                    let returned = func.call(args, TokenRange::default()).map_err(|e| {
+                        // Host-fn failure surfaces as `Unsupported` —
+                        // the bytecode VM's error envelope doesn't
+                        // carry a `NativeFnError` variant today, and
+                        // the lift through `into_runtime_error` already
+                        // routes `Unsupported` cleanly. Phase 4b can
+                        // widen this when richer error shapes land.
+                        BcVmError::HostFnError {
+                            import_idx: *import_idx,
+                            reason: e.to_string(),
+                        }
+                    })?;
+                    // Encode the return value back into the VM's u64
+                    // slot per `ret_ty`.
+                    stack.push(encode_value_for_ret(&returned, *ret_ty, *import_idx)?);
+                } else {
+                    for _ in 0..*arg_count {
+                        pop(stack, bc_idx)?;
+                    }
+                    return Err(BcVmError::NativeNotImplemented {
+                        import_idx: *import_idx,
+                    });
                 }
-                return Err(BcVmError::NativeNotImplemented {
-                    import_idx: *import_idx,
-                });
             }
             BcOp::CheckCap { cap_bit } => {
                 // M2-B phase 3: standalone capability consult. The
