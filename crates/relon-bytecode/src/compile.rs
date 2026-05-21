@@ -373,6 +373,31 @@ impl<'a> CompileState<'a> {
                 self.next_snapshot_idx += 1;
                 self.current_stack.push(StackOrigin::Snapshot(snap_idx));
             }
+            BcOp::MakeList { len } => {
+                // Pops `len` elements, pushes one list handle. The
+                // pushed handle is snapshot-tagged because the value
+                // (an arena-local handle index) can't be re-derived
+                // from locals / consts at resume time — the recipe
+                // consumer reads the handle out of the deopt
+                // snapshot's `value_stack_copy`.
+                for _ in 0..*len {
+                    self.current_stack.pop();
+                }
+                let snap_idx = self.next_snapshot_idx;
+                self.next_snapshot_idx += 1;
+                self.current_stack.push(StackOrigin::Snapshot(snap_idx));
+            }
+            BcOp::ListGetInt => {
+                // Pops [list_handle, idx], pushes one element. Same
+                // snapshot-tag reasoning as `MakeList` — the element
+                // value depends on the arena state which isn't part
+                // of the producer-based recipe taxonomy.
+                self.current_stack.pop();
+                self.current_stack.pop();
+                let snap_idx = self.next_snapshot_idx;
+                self.next_snapshot_idx += 1;
+                self.current_stack.push(StackOrigin::Snapshot(snap_idx));
+            }
         }
     }
 

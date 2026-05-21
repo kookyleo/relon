@@ -21,6 +21,7 @@ use relon_ir::IrType;
 use relon_parser::TokenRange;
 use thiserror::Error;
 
+use crate::arena::{ArenaError, VmMemory};
 use crate::op::{BcFunction, BcOp, BcStdlibKind, BcTrapKind, ExternalPc};
 
 /// Raw VM-value slot. The bytecode VM is homogeneous on `u64` so
@@ -635,6 +636,13 @@ impl BytecodeVm {
         }
         let mut stack: Vec<VmValue> = Vec::with_capacity(16.max(initial_stack.len()));
         stack.extend_from_slice(initial_stack);
+        // M2-B phase 4b: per-invoke arena state. Each invocation gets
+        // a fresh memory bag — handles minted here drop with the
+        // outcome so no value escapes the call. The memory state lives
+        // on the stack frame (not inside `BytecodeVm`) because a
+        // `&BytecodeVm` is shared across calls and the arenas must not
+        // leak between them.
+        let mut memory = VmMemory::default();
         let mut pc = start_bc_idx;
         let mut steps: u64 = 0;
         let mut last_bc_idx = pc;
@@ -719,7 +727,7 @@ impl BytecodeVm {
                 );
             }
             last_bc_idx = pc;
-            match self.dispatch_one(&func.ops[pc], &mut stack, &mut locals, pc) {
+            match self.dispatch_one(&func.ops[pc], &mut stack, &mut locals, &mut memory, pc) {
                 Ok(StepOutcome::Advance) => pc += 1,
                 Ok(StepOutcome::Jump(target)) => {
                     if target > func.ops.len() {
@@ -751,6 +759,7 @@ impl BytecodeVm {
         op: &BcOp,
         stack: &mut Vec<VmValue>,
         locals: &mut [VmValue],
+        memory: &mut VmMemory,
         bc_idx: usize,
     ) -> Result<StepOutcome, BcVmError> {
         match op {
@@ -958,6 +967,37 @@ impl BytecodeVm {
                 // The op is a witness slot — leave the stack untouched
                 // and step over.
             }
+            BcOp::MakeList { len } => {
+                // M2-B phase 4b: pop `len` operands in declaration
+                // order. Top-of-stack is the last element, so we
+                // collect-then-reverse to match the IR-level layout.
+                // An underflow surfaces as `StackUnderflow` (compiler
+                // bug — `apply_stack_effect` should have caught it).
+                let n = *len as usize;
+                if stack.len() < n {
+                    return Err(BcVmError::StackUnderflow { bc_idx });
+                }
+                let mut elements: Vec<u64> = Vec::with_capacity(n);
+                for _ in 0..n {
+                    elements.push(pop(stack, bc_idx)?);
+                }
+                elements.reverse();
+                let handle = memory.lists.alloc(elements);
+                stack.push(handle as u64);
+            }
+            BcOp::ListGetInt => {
+                // M2-B phase 4b: `[list, idx] -> [elem]`. Pop idx
+                // first (top-of-stack), then handle. Out-of-range
+                // (incl. negative) trips `IndexOutOfBounds` — matches
+                // the tree-walker / cranelift envelope.
+                let idx = pop(stack, bc_idx)? as i64;
+                let handle = pop(stack, bc_idx)? as u32;
+                let elem = memory
+                    .lists
+                    .get_element(handle, idx)
+                    .map_err(arena_to_vm_error)?;
+                stack.push(elem);
+            }
             BcOp::Trap(kind) => match kind {
                 BcTrapKind::IndexOutOfBounds => return Err(BcVmError::IndexOutOfBounds),
                 BcTrapKind::EmptyList => return Err(BcVmError::EmptyList),
@@ -997,6 +1037,23 @@ enum StepOutcome {
 
 fn pop(stack: &mut Vec<VmValue>, bc_idx: usize) -> Result<VmValue, BcVmError> {
     stack.pop().ok_or(BcVmError::StackUnderflow { bc_idx })
+}
+
+/// M2-B phase 4b: lift an [`ArenaError`] into the dispatch-side
+/// [`BcVmError`]. `OutOfRange` (compiler bug — handle the arena never
+/// minted) maps to the same `IndexOutOfBounds` envelope as
+/// `ElementOutOfRange` for now; both surface as
+/// `RuntimeError::WasmIndexOutOfBounds` after the lift, which keeps
+/// the four-way differential harness's bounce shape stable. Phase
+/// 4b-continuation can widen the carrier if we ever want to
+/// distinguish "compiler bug" from "runtime trap" at the public
+/// surface.
+fn arena_to_vm_error(err: ArenaError) -> BcVmError {
+    match err {
+        ArenaError::OutOfRange { .. } | ArenaError::ElementOutOfRange { .. } => {
+            BcVmError::IndexOutOfBounds
+        }
+    }
 }
 
 #[derive(Clone, Copy)]

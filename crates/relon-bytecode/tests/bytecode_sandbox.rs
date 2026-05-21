@@ -1255,3 +1255,246 @@ fn call_native_lifts_to_unsupported_runtime_error() {
         other => panic!("expected Unsupported, got {other:?}"),
     }
 }
+
+// -- M2-B phase 4b: arena-backed list ops -------------------------
+
+/// `MakeList` allocates an arena slot from the operand-stack
+/// contents and pushes the handle. `ListGetInt` then indexes it.
+/// Round-trip pin: build [10, 20, 30], pull index 1, expect 20.
+#[test]
+fn make_list_and_get_int_round_trip() {
+    use relon_bytecode::op::{BcFunction, BcOp};
+
+    let bc = BcFunction {
+        ops: vec![
+            BcOp::ConstI64(10),
+            BcOp::ConstI64(20),
+            BcOp::ConstI64(30),
+            BcOp::MakeList { len: 3 },
+            BcOp::ConstI64(1),
+            BcOp::ListGetInt,
+            BcOp::Return,
+        ],
+        locals: 0,
+        ir_pc_map: vec![1, 2, 3, 4, 5, 6, 7],
+        stack_recipe: vec![vec![], vec![], vec![], vec![], vec![], vec![], vec![]],
+    };
+    let vm = BytecodeVm::new(BcVmConfig::default());
+    let outcome = vm.invoke(&bc, &[]);
+    assert!(outcome.error.is_none(), "round-trip completes cleanly");
+    assert_eq!(outcome.value, Some(20));
+}
+
+/// First element + last element + empty list. Each branch validates
+/// a different slot of the arena's element-access discipline.
+#[test]
+fn list_get_int_first_last_and_empty() {
+    use relon_bytecode::op::{BcFunction, BcOp};
+
+    // First element.
+    let bc_first = BcFunction {
+        ops: vec![
+            BcOp::ConstI64(7),
+            BcOp::ConstI64(8),
+            BcOp::MakeList { len: 2 },
+            BcOp::ConstI64(0),
+            BcOp::ListGetInt,
+            BcOp::Return,
+        ],
+        locals: 0,
+        ir_pc_map: vec![1, 2, 3, 4, 5, 6],
+        stack_recipe: vec![vec![]; 6],
+    };
+    let vm = BytecodeVm::new(BcVmConfig::default());
+    assert_eq!(vm.invoke(&bc_first, &[]).value, Some(7));
+
+    // Last element.
+    let bc_last = BcFunction {
+        ops: vec![
+            BcOp::ConstI64(7),
+            BcOp::ConstI64(8),
+            BcOp::MakeList { len: 2 },
+            BcOp::ConstI64(1),
+            BcOp::ListGetInt,
+            BcOp::Return,
+        ],
+        locals: 0,
+        ir_pc_map: vec![1, 2, 3, 4, 5, 6],
+        stack_recipe: vec![vec![]; 6],
+    };
+    assert_eq!(vm.invoke(&bc_last, &[]).value, Some(8));
+
+    // Empty list — any index trips.
+    let bc_empty = BcFunction {
+        ops: vec![
+            BcOp::MakeList { len: 0 },
+            BcOp::ConstI64(0),
+            BcOp::ListGetInt,
+            BcOp::Return,
+        ],
+        locals: 0,
+        ir_pc_map: vec![1, 2, 3, 4],
+        stack_recipe: vec![vec![]; 4],
+    };
+    let outcome = vm.invoke(&bc_empty, &[]);
+    let err = outcome.error.expect("empty-list index must trap");
+    assert!(
+        matches!(err, BcVmError::IndexOutOfBounds),
+        "expected IndexOutOfBounds, got {err:?}"
+    );
+}
+
+/// `ListGetInt` with out-of-range indices traps. Covers the upper-
+/// bound and the explicit negative-index path the arena rejects.
+#[test]
+fn list_get_int_out_of_range_traps() {
+    use relon_bytecode::op::{BcFunction, BcOp};
+
+    let make_oob = |idx: i64| BcFunction {
+        ops: vec![
+            BcOp::ConstI64(1),
+            BcOp::ConstI64(2),
+            BcOp::MakeList { len: 2 },
+            BcOp::ConstI64(idx),
+            BcOp::ListGetInt,
+            BcOp::Return,
+        ],
+        locals: 0,
+        ir_pc_map: vec![1, 2, 3, 4, 5, 6],
+        stack_recipe: vec![vec![]; 6],
+    };
+    let vm = BytecodeVm::new(BcVmConfig::default());
+
+    for idx in [2i64, 5, -1, i64::MIN] {
+        let outcome = vm.invoke(&make_oob(idx), &[]);
+        let err = outcome
+            .error
+            .unwrap_or_else(|| panic!("idx {idx} must trap, got value={:?}", outcome.value));
+        assert!(
+            matches!(err, BcVmError::IndexOutOfBounds),
+            "expected IndexOutOfBounds for idx {idx}, got {err:?}"
+        );
+        // Lift cleanly through the public surface.
+        let lifted = err.into_runtime_error(relon_parser::TokenRange::default());
+        assert!(
+            matches!(lifted, RuntimeError::WasmIndexOutOfBounds { .. }),
+            "lift envelope: idx {idx} -> {lifted:?}"
+        );
+    }
+}
+
+/// Two independent `MakeList` ops mint distinct handles and the
+/// second list's contents don't shadow the first. Pin against an
+/// accidental "all ops share a slot 0" arena bug.
+#[test]
+fn multiple_make_lists_mint_distinct_handles() {
+    use relon_bytecode::op::{BcFunction, BcOp};
+
+    // Build [100, 200] then [9], read element 0 of each, sum them.
+    // First-list elem 0 + second-list elem 0 = 100 + 9 = 109.
+    let bc = BcFunction {
+        ops: vec![
+            BcOp::ConstI64(100),
+            BcOp::ConstI64(200),
+            BcOp::MakeList { len: 2 },
+            BcOp::LocalSet(0),
+            BcOp::ConstI64(9),
+            BcOp::MakeList { len: 1 },
+            BcOp::LocalSet(1),
+            BcOp::LocalGet(0),
+            BcOp::ConstI64(0),
+            BcOp::ListGetInt,
+            BcOp::LocalGet(1),
+            BcOp::ConstI64(0),
+            BcOp::ListGetInt,
+            BcOp::Add(relon_ir::IrType::I64),
+            BcOp::Return,
+        ],
+        locals: 2,
+        ir_pc_map: vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+        stack_recipe: vec![vec![]; 15],
+    };
+    let vm = BytecodeVm::new(BcVmConfig::default());
+    let outcome = vm.invoke(&bc, &[]);
+    assert!(outcome.error.is_none(), "distinct-handle path completes");
+    assert_eq!(outcome.value, Some(109));
+}
+
+/// Stack underflow on `MakeList { len }` when the operand stack has
+/// fewer than `len` slots. Compiler bug envelope; surfaces as
+/// `StackUnderflow` rather than silently shrinking the list.
+#[test]
+fn make_list_stack_underflow_traps() {
+    use relon_bytecode::op::{BcFunction, BcOp};
+
+    let bc = BcFunction {
+        ops: vec![
+            BcOp::ConstI64(1),
+            BcOp::MakeList { len: 5 }, // wants 5 operands, only 1 on stack
+            BcOp::Return,
+        ],
+        locals: 0,
+        ir_pc_map: vec![1, 2, 3],
+        stack_recipe: vec![vec![]; 3],
+    };
+    let vm = BytecodeVm::new(BcVmConfig::default());
+    let outcome = vm.invoke(&bc, &[]);
+    let err = outcome.error.expect("must trap StackUnderflow");
+    assert!(
+        matches!(err, BcVmError::StackUnderflow { .. }),
+        "expected StackUnderflow, got {err:?}"
+    );
+}
+
+/// The MakeList op pops in declaration order — slot 0 is the
+/// bottom-of-stack push. Pin: `[5, 6, 7]` indexed at 0 returns 5
+/// (not 7).
+#[test]
+fn make_list_preserves_declaration_order() {
+    use relon_bytecode::op::{BcFunction, BcOp};
+
+    let bc = BcFunction {
+        ops: vec![
+            BcOp::ConstI64(5),
+            BcOp::ConstI64(6),
+            BcOp::ConstI64(7),
+            BcOp::MakeList { len: 3 },
+            BcOp::ConstI64(0),
+            BcOp::ListGetInt,
+            BcOp::Return,
+        ],
+        locals: 0,
+        ir_pc_map: vec![1, 2, 3, 4, 5, 6, 7],
+        stack_recipe: vec![vec![]; 7],
+    };
+    let vm = BytecodeVm::new(BcVmConfig::default());
+    assert_eq!(vm.invoke(&bc, &[]).value, Some(5));
+}
+
+/// Arena is per-invoke — a second `invoke` against the same VM
+/// instance starts with a fresh arena (handle 0 is fresh again).
+/// Pin: two back-to-back invocations build a one-element list and
+/// read its slot; both succeed independently.
+#[test]
+fn arena_is_reset_between_invocations() {
+    use relon_bytecode::op::{BcFunction, BcOp};
+
+    let bc = BcFunction {
+        ops: vec![
+            BcOp::ConstI64(42),
+            BcOp::MakeList { len: 1 },
+            BcOp::ConstI64(0),
+            BcOp::ListGetInt,
+            BcOp::Return,
+        ],
+        locals: 0,
+        ir_pc_map: vec![1, 2, 3, 4, 5],
+        stack_recipe: vec![vec![]; 5],
+    };
+    let vm = BytecodeVm::new(BcVmConfig::default());
+    let a = vm.invoke(&bc, &[]);
+    let b = vm.invoke(&bc, &[]);
+    assert_eq!(a.value, Some(42));
+    assert_eq!(b.value, Some(42));
+    assert!(a.error.is_none() && b.error.is_none());
+}
