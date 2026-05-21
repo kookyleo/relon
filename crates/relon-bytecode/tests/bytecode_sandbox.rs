@@ -137,7 +137,8 @@ fn sandbox_capability_denied_via_trap_op() {
         ops: vec![BcOp::Trap(BcTrapKind::CapabilityDenied), BcOp::Return],
         locals: 1,
         ir_pc_map: vec![1, 2],
-        stack_recipe: vec![vec![], vec![]],
+        string_pool: Vec::new(),
+        stack_recipe:vec![vec![], vec![]],
     };
     let cfg = BcVmConfig {
         cap_vtable: CapabilityVtable::default(),
@@ -388,7 +389,8 @@ fn capability_gate_denial_surfaces_as_error_on_pre_dispatch_sweep() {
         ops: vec![BcOp::ConstI64(7), BcOp::Return],
         locals: 0,
         ir_pc_map: vec![1, 2],
-        stack_recipe: vec![vec![], vec![]],
+        string_pool: Vec::new(),
+        stack_recipe:vec![vec![], vec![]],
     };
 
     let mut vtable = CapabilityVtable::default();
@@ -426,7 +428,8 @@ fn capability_gate_grant_passes_pre_dispatch_sweep() {
         ops: vec![BcOp::ConstI64(7), BcOp::Return],
         locals: 0,
         ir_pc_map: vec![1, 2],
-        stack_recipe: vec![vec![], vec![]],
+        string_pool: Vec::new(),
+        stack_recipe:vec![vec![], vec![]],
     };
 
     let mut vtable = CapabilityVtable::default();
@@ -464,7 +467,8 @@ fn capability_trap_enrichment_uses_gate_bit_when_installed() {
         ops: vec![BcOp::Trap(BcTrapKind::CapabilityDenied), BcOp::Return],
         locals: 0,
         ir_pc_map: vec![1, 2],
-        stack_recipe: vec![vec![], vec![]],
+        string_pool: Vec::new(),
+        stack_recipe:vec![vec![], vec![]],
     };
 
     // Baseline: no gate, sentinel preserved.
@@ -509,7 +513,8 @@ fn capability_gate_denial_lifts_to_runtime_error() {
         ops: vec![BcOp::ConstI64(0), BcOp::Return],
         locals: 0,
         ir_pc_map: vec![1, 2],
-        stack_recipe: vec![vec![], vec![]],
+        string_pool: Vec::new(),
+        stack_recipe:vec![vec![], vec![]],
     };
 
     let mut vtable = CapabilityVtable::default();
@@ -556,7 +561,8 @@ fn call_native_denied_by_gate_traps_with_declared_bit() {
         ],
         locals: 0,
         ir_pc_map: vec![1, 2],
-        stack_recipe: vec![vec![], vec![]],
+        string_pool: Vec::new(),
+        stack_recipe:vec![vec![], vec![]],
     };
 
     // Variant A: gate installed, denies everything.
@@ -612,7 +618,8 @@ fn call_native_passes_gate_but_traps_native_not_implemented() {
         ],
         locals: 0,
         ir_pc_map: vec![1, 2, 3, 4],
-        stack_recipe: vec![vec![], vec![], vec![], vec![]],
+        string_pool: Vec::new(),
+        stack_recipe:vec![vec![], vec![], vec![], vec![]],
     };
 
     let mut vtable = CapabilityVtable::default();
@@ -656,7 +663,8 @@ fn call_native_no_capability_bit_skips_gate_consult() {
         ],
         locals: 0,
         ir_pc_map: vec![1, 2],
-        stack_recipe: vec![vec![], vec![]],
+        string_pool: Vec::new(),
+        stack_recipe:vec![vec![], vec![]],
     };
 
     let gate_concrete = Arc::new(CountingGate::deny_all());
@@ -698,7 +706,8 @@ fn check_cap_traps_when_bit_denied() {
         ],
         locals: 0,
         ir_pc_map: vec![1, 2, 3],
-        stack_recipe: vec![vec![], vec![], vec![]],
+        string_pool: Vec::new(),
+        stack_recipe:vec![vec![], vec![], vec![]],
     };
     let mut vtable = CapabilityVtable::default();
     let gate: Arc<dyn relon_eval_api::CapabilityGate> = Arc::new(CountingGate::deny_all());
@@ -734,7 +743,8 @@ fn check_cap_no_capability_bit_is_noop() {
         ],
         locals: 0,
         ir_pc_map: vec![1, 2, 3],
-        stack_recipe: vec![
+        string_pool: Vec::new(),
+        stack_recipe:vec![
             vec![],
             vec![relon_bytecode::op::StackOrigin::Const(42)],
             vec![relon_bytecode::op::StackOrigin::Const(42)],
@@ -763,7 +773,8 @@ fn call_stdlib_scalar_int_abs() {
         ],
         locals: 0,
         ir_pc_map: vec![1, 2, 3],
-        stack_recipe: vec![vec![], vec![], vec![]],
+        string_pool: Vec::new(),
+        stack_recipe:vec![vec![], vec![], vec![]],
     };
     let vm = BytecodeVm::new(BcVmConfig::default());
     let outcome = vm.invoke(&bc, &[]);
@@ -787,7 +798,8 @@ fn call_stdlib_scalar_int_min_max() {
         ],
         locals: 0,
         ir_pc_map: vec![1, 2, 3, 4],
-        stack_recipe: vec![vec![], vec![], vec![], vec![]],
+        string_pool: Vec::new(),
+        stack_recipe:vec![vec![], vec![], vec![], vec![]],
     };
     let vm = BytecodeVm::new(BcVmConfig::default());
     assert_eq!(vm.invoke(&bc_min, &[]).value, Some(3));
@@ -804,7 +816,8 @@ fn call_stdlib_scalar_int_min_max() {
         ],
         locals: 0,
         ir_pc_map: vec![1, 2, 3, 4],
-        stack_recipe: vec![vec![], vec![], vec![], vec![]],
+        string_pool: Vec::new(),
+        stack_recipe:vec![vec![], vec![], vec![], vec![]],
     };
     assert_eq!(vm.invoke(&bc_max, &[]).value, Some(7));
 }
@@ -822,7 +835,8 @@ fn list_len_witness_passes_length_through() {
         ops: vec![BcOp::ConstI64(5), BcOp::ListLen, BcOp::Return],
         locals: 0,
         ir_pc_map: vec![1, 2, 3],
-        stack_recipe: vec![vec![], vec![], vec![]],
+        string_pool: Vec::new(),
+        stack_recipe:vec![vec![], vec![], vec![]],
     };
     let vm = BytecodeVm::new(BcVmConfig::default());
     let outcome = vm.invoke(&bc, &[]);
@@ -892,7 +906,8 @@ fn call_native_registry_dispatches_scalar_sum() {
         ],
         locals: 0,
         ir_pc_map: vec![1, 2, 3, 4],
-        stack_recipe: vec![vec![], vec![], vec![], vec![]],
+        string_pool: Vec::new(),
+        stack_recipe:vec![vec![], vec![], vec![], vec![]],
     };
 
     let mut vtable = CapabilityVtable::default();
@@ -939,7 +954,8 @@ fn call_native_registry_gate_denial_skips_host_fn() {
         ],
         locals: 0,
         ir_pc_map: vec![1, 2],
-        stack_recipe: vec![vec![], vec![]],
+        string_pool: Vec::new(),
+        stack_recipe:vec![vec![], vec![]],
     };
 
     let mut vtable = CapabilityVtable::default();
@@ -986,7 +1002,8 @@ fn call_native_unregistered_slot_keeps_native_not_implemented_fallback() {
         ],
         locals: 0,
         ir_pc_map: vec![1, 2],
-        stack_recipe: vec![vec![], vec![]],
+        string_pool: Vec::new(),
+        stack_recipe:vec![vec![], vec![]],
     };
     // Empty registry — no host fn registered for any slot.
     let vm = BytecodeVm::new(BcVmConfig::default());
@@ -1028,7 +1045,8 @@ fn call_native_registry_bool_return_round_trips() {
         ],
         locals: 0,
         ir_pc_map: vec![1, 2],
-        stack_recipe: vec![vec![], vec![]],
+        string_pool: Vec::new(),
+        stack_recipe:vec![vec![], vec![]],
     };
     let mut vtable = CapabilityVtable::default();
     let native: Arc<dyn relon_eval_api::RelonFunction> = Arc::new(AlwaysTrue);
@@ -1076,7 +1094,8 @@ fn call_native_host_fn_failure_lifts_to_unsupported() {
         ],
         locals: 0,
         ir_pc_map: vec![1, 2],
-        stack_recipe: vec![vec![], vec![]],
+        string_pool: Vec::new(),
+        stack_recipe:vec![vec![], vec![]],
     };
     let mut vtable = CapabilityVtable::default();
     let native: Arc<dyn relon_eval_api::RelonFunction> = Arc::new(AlwaysFail);
@@ -1150,7 +1169,8 @@ fn call_native_registry_arg_order_matches_declaration() {
         ],
         locals: 0,
         ir_pc_map: vec![1, 2, 3, 4, 5],
-        stack_recipe: vec![vec![], vec![], vec![], vec![], vec![]],
+        string_pool: Vec::new(),
+        stack_recipe:vec![vec![], vec![], vec![], vec![], vec![]],
     };
     let mut vtable = CapabilityVtable::default();
     let native: Arc<dyn relon_eval_api::RelonFunction> = Arc::new(OrderProbe);
@@ -1198,7 +1218,8 @@ fn call_native_registry_unsupported_return_type_traps() {
         ],
         locals: 0,
         ir_pc_map: vec![1, 2],
-        stack_recipe: vec![vec![], vec![]],
+        string_pool: Vec::new(),
+        stack_recipe:vec![vec![], vec![]],
     };
     let mut vtable = CapabilityVtable::default();
     let native: Arc<dyn relon_eval_api::RelonFunction> = Arc::new(StringReturner);
@@ -1239,7 +1260,8 @@ fn call_native_lifts_to_unsupported_runtime_error() {
         ],
         locals: 0,
         ir_pc_map: vec![1, 2],
-        stack_recipe: vec![vec![], vec![]],
+        string_pool: Vec::new(),
+        stack_recipe:vec![vec![], vec![]],
     };
     let vm = BytecodeVm::new(BcVmConfig::default());
     let outcome = vm.invoke(&bc, &[]);
@@ -1277,7 +1299,8 @@ fn make_list_and_get_int_round_trip() {
         ],
         locals: 0,
         ir_pc_map: vec![1, 2, 3, 4, 5, 6, 7],
-        stack_recipe: vec![vec![], vec![], vec![], vec![], vec![], vec![], vec![]],
+        string_pool: Vec::new(),
+        stack_recipe:vec![vec![], vec![], vec![], vec![], vec![], vec![], vec![]],
     };
     let vm = BytecodeVm::new(BcVmConfig::default());
     let outcome = vm.invoke(&bc, &[]);
@@ -1303,7 +1326,8 @@ fn list_get_int_first_last_and_empty() {
         ],
         locals: 0,
         ir_pc_map: vec![1, 2, 3, 4, 5, 6],
-        stack_recipe: vec![vec![]; 6],
+        string_pool: Vec::new(),
+        stack_recipe:vec![vec![]; 6],
     };
     let vm = BytecodeVm::new(BcVmConfig::default());
     assert_eq!(vm.invoke(&bc_first, &[]).value, Some(7));
@@ -1320,7 +1344,8 @@ fn list_get_int_first_last_and_empty() {
         ],
         locals: 0,
         ir_pc_map: vec![1, 2, 3, 4, 5, 6],
-        stack_recipe: vec![vec![]; 6],
+        string_pool: Vec::new(),
+        stack_recipe:vec![vec![]; 6],
     };
     assert_eq!(vm.invoke(&bc_last, &[]).value, Some(8));
 
@@ -1334,7 +1359,8 @@ fn list_get_int_first_last_and_empty() {
         ],
         locals: 0,
         ir_pc_map: vec![1, 2, 3, 4],
-        stack_recipe: vec![vec![]; 4],
+        string_pool: Vec::new(),
+        stack_recipe:vec![vec![]; 4],
     };
     let outcome = vm.invoke(&bc_empty, &[]);
     let err = outcome.error.expect("empty-list index must trap");
@@ -1361,7 +1387,8 @@ fn list_get_int_out_of_range_traps() {
         ],
         locals: 0,
         ir_pc_map: vec![1, 2, 3, 4, 5, 6],
-        stack_recipe: vec![vec![]; 6],
+        string_pool: Vec::new(),
+        stack_recipe:vec![vec![]; 6],
     };
     let vm = BytecodeVm::new(BcVmConfig::default());
 
@@ -1412,7 +1439,8 @@ fn multiple_make_lists_mint_distinct_handles() {
         ],
         locals: 2,
         ir_pc_map: vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
-        stack_recipe: vec![vec![]; 15],
+        string_pool: Vec::new(),
+        stack_recipe:vec![vec![]; 15],
     };
     let vm = BytecodeVm::new(BcVmConfig::default());
     let outcome = vm.invoke(&bc, &[]);
@@ -1435,7 +1463,8 @@ fn make_list_stack_underflow_traps() {
         ],
         locals: 0,
         ir_pc_map: vec![1, 2, 3],
-        stack_recipe: vec![vec![]; 3],
+        string_pool: Vec::new(),
+        stack_recipe:vec![vec![]; 3],
     };
     let vm = BytecodeVm::new(BcVmConfig::default());
     let outcome = vm.invoke(&bc, &[]);
@@ -1465,7 +1494,8 @@ fn make_list_preserves_declaration_order() {
         ],
         locals: 0,
         ir_pc_map: vec![1, 2, 3, 4, 5, 6, 7],
-        stack_recipe: vec![vec![]; 7],
+        string_pool: Vec::new(),
+        stack_recipe:vec![vec![]; 7],
     };
     let vm = BytecodeVm::new(BcVmConfig::default());
     assert_eq!(vm.invoke(&bc, &[]).value, Some(5));
@@ -1489,7 +1519,8 @@ fn arena_is_reset_between_invocations() {
         ],
         locals: 0,
         ir_pc_map: vec![1, 2, 3, 4, 5],
-        stack_recipe: vec![vec![]; 5],
+        string_pool: Vec::new(),
+        stack_recipe:vec![vec![]; 5],
     };
     let vm = BytecodeVm::new(BcVmConfig::default());
     let a = vm.invoke(&bc, &[]);

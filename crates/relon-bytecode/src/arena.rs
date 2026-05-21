@@ -188,6 +188,39 @@ impl ListArena {
     pub fn slot_count(&self) -> usize {
         self.slots.len()
     }
+
+    /// M2-B phase 4b-continuation: copy-on-write append. When the
+    /// existing slot has refcount 1 (no other owner has cloned the
+    /// handle) we mutate the underlying `Vec<u64>` in place and reuse
+    /// the handle — the common loop-accumulator pattern stays
+    /// allocation-free. When the refcount is higher we clone the
+    /// elements into a fresh slot and return its new handle so the
+    /// original list stays observable to its other owners (matches
+    /// the tree-walker / cranelift `Value::List` semantics).
+    pub fn push_cow(&mut self, handle: Handle, elem: u64) -> Result<Handle, ArenaError> {
+        let len = self.slots.len();
+        let slot = self
+            .slots
+            .get_mut(handle as usize)
+            .ok_or(ArenaError::OutOfRange { handle, len })?;
+        if Arc::get_mut(slot).is_some() {
+            // Single owner — push in place. `Arc::get_mut` returns
+            // `Some(&mut Vec)` when the refcount is 1, which is the
+            // hot path for "list := list.push(x)" style folds.
+            let v = Arc::get_mut(slot).expect("checked above");
+            v.push(elem);
+            Ok(handle)
+        } else {
+            // Multiple owners — clone the underlying vector. The
+            // operand-stack copy of the old handle still points at the
+            // pre-push state; the new handle carries the extended one.
+            let mut cloned: Vec<u64> = slot.as_ref().clone();
+            cloned.push(elem);
+            let new_handle = self.slots.len() as Handle;
+            self.slots.push(Arc::new(cloned));
+            Ok(new_handle)
+        }
+    }
 }
 
 /// Per-VM arena holding [`Arc<str>`]-shaped string slots. Parked for
