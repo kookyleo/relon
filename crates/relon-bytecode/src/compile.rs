@@ -331,6 +331,48 @@ impl<'a> CompileState<'a> {
                 // payload). Keep `current_stack` unchanged so any
                 // tail recipe stays consistent.
             }
+            BcOp::CallNative {
+                arg_count, ret_ty, ..
+            } => {
+                // Pops `arg_count` operands, pushes one return slot
+                // tagged as Snapshot — the value can't be derived
+                // from locals / consts alone (a host fn produced it).
+                // Even though phase 3's dispatcher traps before
+                // pushing, the static stack discipline still has to
+                // account for the would-be return value: callers that
+                // resume past the trap (or graft the op into a
+                // permitted call site in future phases) need the
+                // recipe to match.
+                for _ in 0..*arg_count {
+                    self.current_stack.pop();
+                }
+                let _ = ret_ty;
+                let snap_idx = self.next_snapshot_idx;
+                self.next_snapshot_idx += 1;
+                self.current_stack.push(StackOrigin::Snapshot(snap_idx));
+            }
+            BcOp::CheckCap { .. } => {
+                // No stack effect — capability check is a pure side
+                // effect over the gate / vtable state.
+            }
+            BcOp::CallStdlibScalar { arg_count, .. } => {
+                for _ in 0..*arg_count {
+                    self.current_stack.pop();
+                }
+                let snap_idx = self.next_snapshot_idx;
+                self.next_snapshot_idx += 1;
+                self.current_stack.push(StackOrigin::Snapshot(snap_idx));
+            }
+            BcOp::ListLen => {
+                // Witness op against a pre-computed length on the
+                // stack — net zero effect (pops the length, pushes it
+                // back). Modelled as a snapshot to keep partial-resume
+                // safe even though today the value is observable.
+                self.current_stack.pop();
+                let snap_idx = self.next_snapshot_idx;
+                self.next_snapshot_idx += 1;
+                self.current_stack.push(StackOrigin::Snapshot(snap_idx));
+            }
         }
     }
 
@@ -1237,16 +1279,41 @@ impl<'a> OpVisitor for CompileState<'a> {
 
     fn visit_call_native(
         &mut self,
-        _import_idx: u32,
-        _param_tys: &[IrType],
-        _ret_ty: IrType,
-        _cap_bit: u32,
+        import_idx: u32,
+        param_tys: &[IrType],
+        ret_ty: IrType,
+        cap_bit: u32,
     ) -> Result<(), BcCompileError> {
-        unsupported("CallNative")
+        // M2-B phase 3: lower the IR `Op::CallNative` into a real
+        // bytecode op carrying the capability bit. The dispatcher
+        // consults the installed `CapabilityGate` (or the legacy
+        // grant table) at op-dispatch time and traps before any host
+        // state is observed when the bit is denied. The host-fn
+        // pointer registry that finishes the dispatch lands in phase
+        // 4; today the op surfaces `BcVmError::NativeNotImplemented`
+        // after the capability prong passes, matching the other
+        // backends' "no registry → unsupported" envelope.
+        let pc = self.current_pc;
+        self.emit_with_effect(
+            BcOp::CallNative {
+                import_idx,
+                arg_count: param_tys.len() as u32,
+                cap_bit,
+                ret_ty,
+            },
+            pc,
+        );
+        Ok(())
     }
 
-    fn visit_check_cap(&mut self, _cap_bit: u32) -> Result<(), BcCompileError> {
-        unsupported("CheckCap")
+    fn visit_check_cap(&mut self, cap_bit: u32) -> Result<(), BcCompileError> {
+        // M2-B phase 3: standalone capability consult. The op is a
+        // no-op when `cap_bit == u32::MAX` (NO_CAPABILITY_BIT) so the
+        // analyzer can emit unconditional `CheckCap` ops without
+        // forcing every backend to special-case the sentinel.
+        let pc = self.current_pc;
+        self.emit_with_effect(BcOp::CheckCap { cap_bit }, pc);
+        Ok(())
     }
 
     fn visit_make_closure(

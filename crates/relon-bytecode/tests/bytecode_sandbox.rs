@@ -531,3 +531,338 @@ fn capability_gate_denial_lifts_to_runtime_error() {
         other => panic!("expected WasmCapabilityDenied, got {other:?}"),
     }
 }
+
+// -- M2-B phase 3: BcOp::CallNative + BcOp::CheckCap dispatch ------
+
+#[test]
+fn call_native_denied_by_gate_traps_with_declared_bit() {
+    use relon_bytecode::op::{BcFunction, BcOp};
+    use std::sync::Arc;
+
+    // Hand-built BcFunction whose body is a single CallNative with
+    // cap_bit = Network. No gate / grant table has Network set, so
+    // the per-call-site consult must trip CapabilityDenied with the
+    // declared bit *before* the dispatcher tries to look up the host
+    // fn. This is the phase-3 contract.
+    let bc = BcFunction {
+        ops: vec![
+            BcOp::CallNative {
+                import_idx: 0,
+                arg_count: 0,
+                cap_bit: relon_eval_api::CapabilityBit::Network.bit_index(),
+                ret_ty: relon_ir::IrType::I64,
+            },
+            BcOp::Return,
+        ],
+        locals: 0,
+        ir_pc_map: vec![1, 2],
+        stack_recipe: vec![vec![], vec![]],
+    };
+
+    // Variant A: gate installed, denies everything.
+    let mut vtable = CapabilityVtable::default();
+    let gate: Arc<dyn relon_eval_api::CapabilityGate> = Arc::new(CountingGate::deny_all());
+    vtable.set_gate(gate);
+    let cfg = BcVmConfig {
+        cap_vtable: vtable,
+        ..BcVmConfig::default()
+    };
+    let vm = BytecodeVm::new(cfg);
+    let outcome = vm.invoke(&bc, &[]);
+    match outcome.error {
+        Some(BcVmError::CapabilityDenied { cap_bit }) => {
+            assert_eq!(cap_bit, relon_eval_api::CapabilityBit::Network.bit_index());
+        }
+        other => panic!("expected per-call CapabilityDenied (gate), got {other:?}"),
+    }
+
+    // Variant B: no gate, no grant — legacy grant-table fallback
+    // must still trip the prong with the same bit.
+    let vm_no_gate = BytecodeVm::new(BcVmConfig::default());
+    let outcome = vm_no_gate.invoke(&bc, &[]);
+    match outcome.error {
+        Some(BcVmError::CapabilityDenied { cap_bit }) => {
+            assert_eq!(cap_bit, relon_eval_api::CapabilityBit::Network.bit_index());
+        }
+        other => panic!("expected per-call CapabilityDenied (grant fallback), got {other:?}"),
+    }
+}
+
+#[test]
+fn call_native_passes_gate_but_traps_native_not_implemented() {
+    use relon_bytecode::op::{BcFunction, BcOp};
+    use std::sync::Arc;
+
+    // Gate grants the bit → the capability prong passes. The phase-3
+    // dispatcher then surfaces `NativeNotImplemented` because the
+    // host-fn registry is phase-4 work. The args we push on the stack
+    // are still drained so the operand-stack discipline stays
+    // consistent with the recipe.
+    let bc = BcFunction {
+        ops: vec![
+            BcOp::ConstI64(11),
+            BcOp::ConstI64(22),
+            BcOp::CallNative {
+                import_idx: 7,
+                arg_count: 2,
+                cap_bit: relon_eval_api::CapabilityBit::ReadsClock.bit_index(),
+                ret_ty: relon_ir::IrType::I64,
+            },
+            BcOp::Return,
+        ],
+        locals: 0,
+        ir_pc_map: vec![1, 2, 3, 4],
+        stack_recipe: vec![vec![], vec![], vec![], vec![]],
+    };
+
+    let mut vtable = CapabilityVtable::default();
+    let gate: Arc<dyn relon_eval_api::CapabilityGate> = Arc::new(CountingGate::allow(&[
+        relon_eval_api::CapabilityBit::ReadsClock,
+    ]));
+    vtable.set_gate(gate);
+    let cfg = BcVmConfig {
+        cap_vtable: vtable,
+        ..BcVmConfig::default()
+    };
+    let vm = BytecodeVm::new(cfg);
+    let outcome = vm.invoke(&bc, &[]);
+    match outcome.error {
+        Some(BcVmError::NativeNotImplemented { import_idx }) => {
+            assert_eq!(import_idx, 7, "import_idx round-trips into error envelope");
+        }
+        other => panic!("expected NativeNotImplemented after gate grant, got {other:?}"),
+    }
+}
+
+#[test]
+fn call_native_no_capability_bit_skips_gate_consult() {
+    use relon_bytecode::op::{BcFunction, BcOp};
+    use std::sync::Arc;
+
+    // NO_CAPABILITY_BIT means "pure host fn"; the dispatcher must
+    // skip the gate consult entirely. Even a deny-all gate doesn't
+    // observe the call. The dispatcher still bounces with
+    // `NativeNotImplemented` because the host-fn registry is phase-4
+    // work, but importantly the gate's `check` was never invoked.
+    let bc = BcFunction {
+        ops: vec![
+            BcOp::CallNative {
+                import_idx: 3,
+                arg_count: 0,
+                cap_bit: relon_ir::NO_CAPABILITY_BIT,
+                ret_ty: relon_ir::IrType::I64,
+            },
+            BcOp::Return,
+        ],
+        locals: 0,
+        ir_pc_map: vec![1, 2],
+        stack_recipe: vec![vec![], vec![]],
+    };
+
+    let gate_concrete = Arc::new(CountingGate::deny_all());
+    let gate: Arc<dyn relon_eval_api::CapabilityGate> = gate_concrete.clone();
+    let mut vtable = CapabilityVtable::default();
+    vtable.set_gate(gate);
+    let cfg = BcVmConfig {
+        cap_vtable: vtable,
+        ..BcVmConfig::default()
+    };
+    let vm = BytecodeVm::new(cfg);
+    let outcome = vm.invoke(&bc, &[]);
+    match outcome.error {
+        Some(BcVmError::NativeNotImplemented { import_idx }) => assert_eq!(import_idx, 3),
+        other => panic!("expected NativeNotImplemented, got {other:?}"),
+    }
+    // The gate was never consulted: pre-dispatch sweep has no granted
+    // bits to walk, and the CallNative path's `cap_bit == u32::MAX`
+    // guard skipped the per-site consult.
+    assert_eq!(
+        gate_concrete.hits.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "NO_CAPABILITY_BIT must not consult the gate"
+    );
+}
+
+#[test]
+fn check_cap_traps_when_bit_denied() {
+    use relon_bytecode::op::{BcFunction, BcOp};
+    use std::sync::Arc;
+
+    let bc = BcFunction {
+        ops: vec![
+            BcOp::CheckCap {
+                cap_bit: relon_eval_api::CapabilityBit::WritesFs.bit_index(),
+            },
+            BcOp::ConstI64(0),
+            BcOp::Return,
+        ],
+        locals: 0,
+        ir_pc_map: vec![1, 2, 3],
+        stack_recipe: vec![vec![], vec![], vec![]],
+    };
+    let mut vtable = CapabilityVtable::default();
+    let gate: Arc<dyn relon_eval_api::CapabilityGate> = Arc::new(CountingGate::deny_all());
+    vtable.set_gate(gate);
+    let cfg = BcVmConfig {
+        cap_vtable: vtable,
+        ..BcVmConfig::default()
+    };
+    let vm = BytecodeVm::new(cfg);
+    let outcome = vm.invoke(&bc, &[]);
+    match outcome.error {
+        Some(BcVmError::CapabilityDenied { cap_bit }) => {
+            assert_eq!(cap_bit, relon_eval_api::CapabilityBit::WritesFs.bit_index());
+        }
+        other => panic!("expected CheckCap-driven CapabilityDenied, got {other:?}"),
+    }
+}
+
+#[test]
+fn check_cap_no_capability_bit_is_noop() {
+    use relon_bytecode::op::{BcFunction, BcOp};
+
+    // NO_CAPABILITY_BIT must short-circuit before any gate consult.
+    // The Return after it carries the constant 42, which we assert
+    // round-trips out to confirm the op didn't drop our stack.
+    let bc = BcFunction {
+        ops: vec![
+            BcOp::ConstI64(42),
+            BcOp::CheckCap {
+                cap_bit: relon_ir::NO_CAPABILITY_BIT,
+            },
+            BcOp::Return,
+        ],
+        locals: 0,
+        ir_pc_map: vec![1, 2, 3],
+        stack_recipe: vec![
+            vec![],
+            vec![relon_bytecode::op::StackOrigin::Const(42)],
+            vec![relon_bytecode::op::StackOrigin::Const(42)],
+        ],
+    };
+    let vm = BytecodeVm::new(BcVmConfig::default());
+    let outcome = vm.invoke(&bc, &[]);
+    assert!(outcome.error.is_none(), "no-op CheckCap must not trap");
+    assert_eq!(outcome.value, Some(42));
+}
+
+// -- M2-B phase 3: BcOp::CallStdlibScalar handlers -----------------
+
+#[test]
+fn call_stdlib_scalar_int_abs() {
+    use relon_bytecode::op::{BcFunction, BcOp, BcStdlibKind};
+
+    let bc = BcFunction {
+        ops: vec![
+            BcOp::ConstI64(-13),
+            BcOp::CallStdlibScalar {
+                kind: BcStdlibKind::IntAbs,
+                arg_count: 1,
+            },
+            BcOp::Return,
+        ],
+        locals: 0,
+        ir_pc_map: vec![1, 2, 3],
+        stack_recipe: vec![vec![], vec![], vec![]],
+    };
+    let vm = BytecodeVm::new(BcVmConfig::default());
+    let outcome = vm.invoke(&bc, &[]);
+    assert!(outcome.error.is_none(), "abs run completes");
+    assert_eq!(outcome.value, Some(13));
+}
+
+#[test]
+fn call_stdlib_scalar_int_min_max() {
+    use relon_bytecode::op::{BcFunction, BcOp, BcStdlibKind};
+
+    let bc_min = BcFunction {
+        ops: vec![
+            BcOp::ConstI64(7),
+            BcOp::ConstI64(3),
+            BcOp::CallStdlibScalar {
+                kind: BcStdlibKind::IntMin,
+                arg_count: 2,
+            },
+            BcOp::Return,
+        ],
+        locals: 0,
+        ir_pc_map: vec![1, 2, 3, 4],
+        stack_recipe: vec![vec![], vec![], vec![], vec![]],
+    };
+    let vm = BytecodeVm::new(BcVmConfig::default());
+    assert_eq!(vm.invoke(&bc_min, &[]).value, Some(3));
+
+    let bc_max = BcFunction {
+        ops: vec![
+            BcOp::ConstI64(7),
+            BcOp::ConstI64(3),
+            BcOp::CallStdlibScalar {
+                kind: BcStdlibKind::IntMax,
+                arg_count: 2,
+            },
+            BcOp::Return,
+        ],
+        locals: 0,
+        ir_pc_map: vec![1, 2, 3, 4],
+        stack_recipe: vec![vec![], vec![], vec![], vec![]],
+    };
+    assert_eq!(vm.invoke(&bc_max, &[]).value, Some(7));
+}
+
+#[test]
+fn list_len_witness_passes_length_through() {
+    use relon_bytecode::op::{BcFunction, BcOp};
+
+    // The compile pass constant-folds list lengths into ConstI64.
+    // BcOp::ListLen is a witness slot that consumes + re-pushes the
+    // length so the dispatch loop has a `length`-shaped op to step
+    // over (kept for stack-recipe stability when phase-4 widens the
+    // op set with actual list operations).
+    let bc = BcFunction {
+        ops: vec![BcOp::ConstI64(5), BcOp::ListLen, BcOp::Return],
+        locals: 0,
+        ir_pc_map: vec![1, 2, 3],
+        stack_recipe: vec![vec![], vec![], vec![]],
+    };
+    let vm = BytecodeVm::new(BcVmConfig::default());
+    let outcome = vm.invoke(&bc, &[]);
+    assert!(outcome.error.is_none());
+    assert_eq!(outcome.value, Some(5));
+}
+
+#[test]
+fn call_native_lifts_to_unsupported_runtime_error() {
+    use relon_bytecode::op::{BcFunction, BcOp};
+
+    // The `NativeNotImplemented` envelope lifts to `Unsupported` so
+    // the surrounding `Evaluator::run_main` shape stays compatible
+    // with the four-way harness's bytecode row. Phase 4 will widen
+    // this once a host-fn registry is wired.
+    let bc = BcFunction {
+        ops: vec![
+            BcOp::CallNative {
+                import_idx: 2,
+                arg_count: 0,
+                cap_bit: relon_ir::NO_CAPABILITY_BIT,
+                ret_ty: relon_ir::IrType::I64,
+            },
+            BcOp::Return,
+        ],
+        locals: 0,
+        ir_pc_map: vec![1, 2],
+        stack_recipe: vec![vec![], vec![]],
+    };
+    let vm = BytecodeVm::new(BcVmConfig::default());
+    let outcome = vm.invoke(&bc, &[]);
+    let err = outcome.error.expect("must trap NativeNotImplemented");
+    let lifted = err.into_runtime_error(relon_parser::TokenRange::default());
+    match lifted {
+        RuntimeError::Unsupported { reason } => {
+            assert!(
+                reason.contains("import_idx 2"),
+                "lifted reason carries import_idx; got {reason}"
+            );
+        }
+        other => panic!("expected Unsupported, got {other:?}"),
+    }
+}

@@ -1,7 +1,7 @@
 # RFC — v6-δ M2-B Bytecode Backend Investment
 
 Date: 2026-05-21
-Status: planning + Phase 1 land
+Status: planning + Phase 1 / 2 / 3 land
 Owner: bytecode VM track
 Worktree: `.claude/worktrees/agent-ac8a6a5af256fa8c2`
 
@@ -56,12 +56,12 @@ existing benches never invoke the bytecode VM.
 
 ## 3. Phase split
 
-- **Phase 1 (this commit)** — #1: vtable accepts `Option<Arc<dyn CapabilityGate>>` via `cap_vtable.set_gate(...)`. No behaviour change for callers that don't set a gate; the trait hook is parked for #6.
-- **Phase 2** — #5 + a single new `BcOp::CheckCap` op that consults the gate (the analyzer-side `Op::CheckCap` lower target). Validates the gate hook actually fires in the dispatch loop. Adds the missing `cmp_lua_dict_list_trace` four-way row for the scalar subset.
-- **Phase 3** — #3: hot counter + threshold trip + bridge into `relon_trace_recorder`. Lands the deopt-source end of the M2-B partial-resume story.
-- **Phase 4** — #2 (subset: `LetGet / LetSet / LoadField / StoreField / Select` + record-builder ops to lift the dict-shaped return path); reassess after Phase 3 whether #4 needs further work or the M2-A surface suffices.
+- **Phase 1 (landed)** — #1: vtable accepts `Option<Arc<dyn CapabilityGate>>` via `cap_vtable.set_gate(...)`. No behaviour change for callers that don't set a gate; the trait hook is parked for #6.
+- **Phase 2 (landed)** — gate-consult helpers + dispatch-time pre-check + `BcOp::Trap(CapabilityDenied)` enrichment with first-denied-bit. Five new helper API entries on `CapabilityVtable`.
+- **Phase 3 (landed)** — IR coverage expansion: four new `BcOp` variants (`CallNative`, `CheckCap`, `CallStdlibScalar`, `ListLen`) with per-call-site capability consult routed through the phase-2 helpers. `BcVmError::NativeNotImplemented` carries the phase-4 host-fn registry gap. The compile pass lifts IR `Op::CallNative` / `Op::CheckCap` from the unsupported pile into real bytecode emit. See `docs/internal/review-improvement-133-bytecode-phase3-2026-05-21.md` for the stage report.
+- **Phase 4 (planned)** — host-fn registry on `CapabilityVtable` (`Vec<Option<Arc<dyn NativeHostFn>>>` indexed by `cap_bit`), real list/dict ops, hot-counter + trace-JIT bridge (the original phase-3 deliverable, deferred so the IR coverage work could land first). 4-way bench row activation and `cmp_lua_dict_list_trace` integration follow once the registry is wired.
 
-Each phase ≤ M work; Phase 4 may slip to phase 5 if Op coverage exceeds budget.
+Each phase ≤ M work; phase 4 may split into 4a (host-fn registry) + 4b (list/dict ops) if Op coverage exceeds budget.
 
 ## 4. Risks / unknowns
 
