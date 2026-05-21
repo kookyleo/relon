@@ -1240,6 +1240,158 @@ fn call_native_registry_unsupported_return_type_traps() {
     );
 }
 
+/// M2-B phase 4b-continuation: a host fn that returns `Value::String`
+/// when the call site declares `ret_ty: IrType::String` lifts the
+/// payload into the VM's StringArena and the resulting handle drives
+/// downstream string ops (here: `StrLen`). Locks in the new
+/// String-lane in `encode_value_for_ret`.
+#[test]
+fn call_native_string_return_lifts_into_arena() {
+    use relon_bytecode::op::{BcFunction, BcOp};
+    use std::sync::Arc;
+
+    struct StrReturner;
+    impl relon_eval_api::RelonFunction for StrReturner {
+        fn call(
+            &self,
+            _args: relon_eval_api::NativeArgs,
+            _range: relon_parser::TokenRange,
+        ) -> Result<Value, RuntimeError> {
+            Ok(Value::String("héllo".into()))
+        }
+    }
+
+    let bc = BcFunction {
+        ops: vec![
+            BcOp::CallNative {
+                import_idx: 9,
+                arg_count: 0,
+                cap_bit: relon_ir::NO_CAPABILITY_BIT,
+                ret_ty: relon_ir::IrType::String,
+            },
+            BcOp::StrLen,
+            BcOp::Return,
+        ],
+        locals: 0,
+        ir_pc_map: vec![1, 2, 3],
+        string_pool: Vec::new(),
+        stack_recipe: vec![vec![]; 3],
+    };
+    let mut vtable = CapabilityVtable::default();
+    let native: Arc<dyn relon_eval_api::RelonFunction> = Arc::new(StrReturner);
+    vtable.register_host_fn(9, native);
+    let cfg = BcVmConfig {
+        cap_vtable: vtable,
+        ..BcVmConfig::default()
+    };
+    let vm = BytecodeVm::new(cfg);
+    let outcome = vm.invoke(&bc, &[]);
+    assert!(outcome.error.is_none(), "string-lane lift completes: {:?}", outcome.error);
+    assert_eq!(outcome.value, Some(5)); // "héllo" code points
+}
+
+/// M2-B phase 4b-continuation: a host fn that returns `Value::List`
+/// of integers when the call site declares `ret_ty: IrType::ListInt`
+/// materialises the list into the VM's ListArena and the handle
+/// drives downstream list ops.
+#[test]
+fn call_native_list_int_return_lifts_into_arena() {
+    use relon_bytecode::op::{BcFunction, BcOp};
+    use std::sync::Arc;
+
+    struct ListReturner;
+    impl relon_eval_api::RelonFunction for ListReturner {
+        fn call(
+            &self,
+            _args: relon_eval_api::NativeArgs,
+            _range: relon_parser::TokenRange,
+        ) -> Result<Value, RuntimeError> {
+            Ok(Value::List(vec![Value::Int(7), Value::Int(8), Value::Int(9)].into()))
+        }
+    }
+
+    // Read element 2 of the returned list -> 9.
+    let bc = BcFunction {
+        ops: vec![
+            BcOp::CallNative {
+                import_idx: 10,
+                arg_count: 0,
+                cap_bit: relon_ir::NO_CAPABILITY_BIT,
+                ret_ty: relon_ir::IrType::ListInt,
+            },
+            BcOp::ConstI64(2),
+            BcOp::ListGetInt,
+            BcOp::Return,
+        ],
+        locals: 0,
+        ir_pc_map: vec![1, 2, 3, 4],
+        string_pool: Vec::new(),
+        stack_recipe: vec![vec![]; 4],
+    };
+    let mut vtable = CapabilityVtable::default();
+    let native: Arc<dyn relon_eval_api::RelonFunction> = Arc::new(ListReturner);
+    vtable.register_host_fn(10, native);
+    let cfg = BcVmConfig {
+        cap_vtable: vtable,
+        ..BcVmConfig::default()
+    };
+    let vm = BytecodeVm::new(cfg);
+    let outcome = vm.invoke(&bc, &[]);
+    assert!(outcome.error.is_none(), "list-lane lift completes: {:?}", outcome.error);
+    assert_eq!(outcome.value, Some(9));
+}
+
+/// M2-B phase 4b-continuation: a heterogeneous list (Int + String)
+/// returned for `IrType::ListInt` surfaces as
+/// `HostFnReturnTypeMismatch` — the encoder rejects rather than
+/// silently dropping the non-Int element.
+#[test]
+fn call_native_list_int_rejects_heterogeneous() {
+    use relon_bytecode::op::{BcFunction, BcOp};
+    use std::sync::Arc;
+
+    struct MixedReturner;
+    impl relon_eval_api::RelonFunction for MixedReturner {
+        fn call(
+            &self,
+            _args: relon_eval_api::NativeArgs,
+            _range: relon_parser::TokenRange,
+        ) -> Result<Value, RuntimeError> {
+            Ok(Value::List(vec![Value::Int(1), Value::String("oops".into())].into()))
+        }
+    }
+
+    let bc = BcFunction {
+        ops: vec![
+            BcOp::CallNative {
+                import_idx: 11,
+                arg_count: 0,
+                cap_bit: relon_ir::NO_CAPABILITY_BIT,
+                ret_ty: relon_ir::IrType::ListInt,
+            },
+            BcOp::Return,
+        ],
+        locals: 0,
+        ir_pc_map: vec![1, 2],
+        string_pool: Vec::new(),
+        stack_recipe: vec![vec![]; 2],
+    };
+    let mut vtable = CapabilityVtable::default();
+    let native: Arc<dyn relon_eval_api::RelonFunction> = Arc::new(MixedReturner);
+    vtable.register_host_fn(11, native);
+    let cfg = BcVmConfig {
+        cap_vtable: vtable,
+        ..BcVmConfig::default()
+    };
+    let vm = BytecodeVm::new(cfg);
+    let outcome = vm.invoke(&bc, &[]);
+    let err = outcome.error.expect("mixed list must trap");
+    assert!(
+        matches!(err, BcVmError::HostFnReturnTypeMismatch { import_idx: 11, .. }),
+        "got {err:?}"
+    );
+}
+
 #[test]
 fn call_native_lifts_to_unsupported_runtime_error() {
     use relon_bytecode::op::{BcFunction, BcOp};
