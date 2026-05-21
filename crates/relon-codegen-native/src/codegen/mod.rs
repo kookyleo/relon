@@ -52,6 +52,7 @@ mod arith;
 mod call;
 mod closure;
 mod const_pool;
+mod const_pool_emit;
 mod control_flow;
 mod field;
 mod guard;
@@ -1605,27 +1606,15 @@ impl<'a, 'b> Codegen<'a, 'b> {
                 } else {
                     self.const_pool.case_fold_lower_offset
                 };
-                let off = off.ok_or_else(|| {
-                    CraneliftError::Codegen("CaseFoldTableAddr missing from const pool".into())
-                })?;
-                let v = self.builder.ins().iconst(I32, i64::from(off));
-                self.push(v);
+                self.emit_const_pool_address(off, "CaseFoldTableAddr")?;
             }
             Op::CombiningMarkRangesAddr => {
-                let off = self.const_pool.combining_marks_offset.ok_or_else(|| {
-                    CraneliftError::Codegen(
-                        "CombiningMarkRangesAddr missing from const pool".into(),
-                    )
-                })?;
-                let v = self.builder.ins().iconst(I32, i64::from(off));
-                self.push(v);
+                let off = self.const_pool.combining_marks_offset;
+                self.emit_const_pool_address(off, "CombiningMarkRangesAddr")?;
             }
             Op::WhitespaceRangesAddr => {
-                let off = self.const_pool.whitespace_offset.ok_or_else(|| {
-                    CraneliftError::Codegen("WhitespaceRangesAddr missing from const pool".into())
-                })?;
-                let v = self.builder.ins().iconst(I32, i64::from(off));
-                self.push(v);
+                let off = self.const_pool.whitespace_offset;
+                self.emit_const_pool_address(off, "WhitespaceRangesAddr")?;
             }
             Op::DecompTableAddr { compatibility } => {
                 let off = if *compatibility {
@@ -1633,25 +1622,15 @@ impl<'a, 'b> Codegen<'a, 'b> {
                 } else {
                     self.const_pool.decomp_nfd_offset
                 };
-                let off = off.ok_or_else(|| {
-                    CraneliftError::Codegen("DecompTableAddr missing from const pool".into())
-                })?;
-                let v = self.builder.ins().iconst(I32, i64::from(off));
-                self.push(v);
+                self.emit_const_pool_address(off, "DecompTableAddr")?;
             }
             Op::CccTableAddr => {
-                let off = self.const_pool.ccc_offset.ok_or_else(|| {
-                    CraneliftError::Codegen("CccTableAddr missing from const pool".into())
-                })?;
-                let v = self.builder.ins().iconst(I32, i64::from(off));
-                self.push(v);
+                let off = self.const_pool.ccc_offset;
+                self.emit_const_pool_address(off, "CccTableAddr")?;
             }
             Op::CompositionTableAddr => {
-                let off = self.const_pool.composition_offset.ok_or_else(|| {
-                    CraneliftError::Codegen("CompositionTableAddr missing from const pool".into())
-                })?;
-                let v = self.builder.ins().iconst(I32, i64::from(off));
-                self.push(v);
+                let off = self.const_pool.composition_offset;
+                self.emit_const_pool_address(off, "CompositionTableAddr")?;
             }
             Op::FullCaseFoldTableAddr { upper } => {
                 let off = if *upper {
@@ -1659,30 +1638,15 @@ impl<'a, 'b> Codegen<'a, 'b> {
                 } else {
                     self.const_pool.full_case_fold_lower_offset
                 };
-                let off = off.ok_or_else(|| {
-                    CraneliftError::Codegen("FullCaseFoldTableAddr missing from const pool".into())
-                })?;
-                let v = self.builder.ins().iconst(I32, i64::from(off));
-                self.push(v);
+                self.emit_const_pool_address(off, "FullCaseFoldTableAddr")?;
             }
             Op::CasedRangesAddr => {
-                let off = self.const_pool.cased_ranges_offset.ok_or_else(|| {
-                    CraneliftError::Codegen("CasedRangesAddr missing from const pool".into())
-                })?;
-                let v = self.builder.ins().iconst(I32, i64::from(off));
-                self.push(v);
+                let off = self.const_pool.cased_ranges_offset;
+                self.emit_const_pool_address(off, "CasedRangesAddr")?;
             }
             Op::CaseIgnorableRangesAddr => {
-                let off = self
-                    .const_pool
-                    .case_ignorable_ranges_offset
-                    .ok_or_else(|| {
-                        CraneliftError::Codegen(
-                            "CaseIgnorableRangesAddr missing from const pool".into(),
-                        )
-                    })?;
-                let v = self.builder.ins().iconst(I32, i64::from(off));
-                self.push(v);
+                let off = self.const_pool.case_ignorable_ranges_offset;
+                self.emit_const_pool_address(off, "CaseIgnorableRangesAddr")?;
             }
             Op::TurkishCaseFoldTableAddr { upper } => {
                 let off = if *upper {
@@ -1690,13 +1654,7 @@ impl<'a, 'b> Codegen<'a, 'b> {
                 } else {
                     self.const_pool.turkish_lower_offset
                 };
-                let off = off.ok_or_else(|| {
-                    CraneliftError::Codegen(
-                        "TurkishCaseFoldTableAddr missing from const pool".into(),
-                    )
-                })?;
-                let v = self.builder.ins().iconst(I32, i64::from(off));
-                self.push(v);
+                self.emit_const_pool_address(off, "TurkishCaseFoldTableAddr")?;
             }
             Op::Trap { kind } => {
                 // `relon_ir::TrapKind` covers stdlib-domain failures
