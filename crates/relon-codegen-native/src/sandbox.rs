@@ -601,6 +601,24 @@ impl SandboxState {
     /// received, so the invariant holds for every production caller.
     pub(crate) unsafe extern "C" fn now_helper(state: *const SandboxState) -> i64 {
         let state = unsafe { &*state };
+        // 2026-05-21 Option I (cranelift loop-opt regression fix):
+        // fast-return 0 when the host has not configured a deadline.
+        // The JIT prologue + the loop back-edge resource-check both
+        // unconditionally call this helper to avoid the brif-shaped
+        // basic-block expansion that defeated a cranelift loop-opt
+        // pass (see commit log on the b99f2b4 revert for the
+        // bisect details). Returning 0 makes the downstream
+        // `icmp 0 >= deadline_ns` comparison trivially false when
+        // the caller will load `deadline_ns` and find `i64::MAX`,
+        // so the cond_trap stays inert without needing a brif guard
+        // in cranelift IR. Hosts that opt in via
+        // `SandboxState::set_deadline` pay the vDSO clock_gettime;
+        // default-configured evaluators amortise an indirect-call-
+        // only shape (~3-5 ns) instead of an indirect-call +
+        // clock_gettime (~25-45 ns).
+        if state.deadline_ns.load(Ordering::Relaxed) == i64::MAX {
+            return 0;
+        }
         state.epoch.elapsed().as_nanos() as i64
     }
 
