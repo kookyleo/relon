@@ -189,8 +189,7 @@ mod tests {
         let state = fixture_state(&mut arena);
         // SAFETY: state outlives the call; offsets were produced by
         // `build_two_records` which respects the arena layout.
-        let result =
-            unsafe { relon_glob_match_helper(state.as_ref() as *const _, s_off, p_off) };
+        let result = unsafe { relon_glob_match_helper(state.as_ref() as *const _, s_off, p_off) };
         assert_eq!(result, 1);
     }
 
@@ -198,8 +197,7 @@ mod tests {
     fn rejects_non_matching_glob_through_helper() {
         let (mut arena, s_off, p_off) = build_two_records(b"hello world", b"goodbye *");
         let state = fixture_state(&mut arena);
-        let result =
-            unsafe { relon_glob_match_helper(state.as_ref() as *const _, s_off, p_off) };
+        let result = unsafe { relon_glob_match_helper(state.as_ref() as *const _, s_off, p_off) };
         assert_eq!(result, 0);
     }
 
@@ -207,8 +205,7 @@ mod tests {
     fn handles_empty_string_against_star() {
         let (mut arena, s_off, p_off) = build_two_records(b"", b"*");
         let state = fixture_state(&mut arena);
-        let result =
-            unsafe { relon_glob_match_helper(state.as_ref() as *const _, s_off, p_off) };
+        let result = unsafe { relon_glob_match_helper(state.as_ref() as *const _, s_off, p_off) };
         assert_eq!(result, 1);
     }
 
@@ -224,8 +221,7 @@ mod tests {
         let state = fixture_state(&mut arena);
         // `s_off = 1024` walks far past `arena_len = 32`; the helper
         // must refuse rather than read past the arena.
-        let result =
-            unsafe { relon_glob_match_helper(state.as_ref() as *const _, 1024, 0) };
+        let result = unsafe { relon_glob_match_helper(state.as_ref() as *const _, 1024, 0) };
         assert_eq!(result, 0);
     }
 
@@ -234,8 +230,7 @@ mod tests {
         // 4-byte UTF-8 emoji + 2-byte UTF-8 Greek + ASCII mixed.
         let (mut arena, s_off, p_off) = build_two_records("αβγ🦀".as_bytes(), "α*🦀".as_bytes());
         let state = fixture_state(&mut arena);
-        let result =
-            unsafe { relon_glob_match_helper(state.as_ref() as *const _, s_off, p_off) };
+        let result = unsafe { relon_glob_match_helper(state.as_ref() as *const _, s_off, p_off) };
         assert_eq!(result, 1);
     }
 }
