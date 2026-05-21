@@ -251,15 +251,17 @@ fn first_denied_bit(gate: &Arc<dyn CapabilityGate>) -> Option<u32> {
 
 /// M2-B phase 4a: encode a returned [`Value`] into the VM's `u64`
 /// slot according to the call site's declared `ret_ty`. The phase-4a
-/// envelope is **scalar only** — anything richer than `Int` / `Float`
-/// / `Bool` / `Null` (i.e. `String` / `List*` / `Closure`) surfaces as
-/// [`BcVmError::HostFnReturnTypeMismatch`] so the host gets a clear
-/// "route through cranelift / tree-walker" envelope rather than a
-/// silently-wrong slot value.
+/// envelope was scalar only; phase 4b-continuation widens it to the
+/// `String` / `ListInt` lanes by materialising the host-side `Value`
+/// into the VM's per-call arenas and returning the freshly minted
+/// handle. Anything outside that envelope (`ListFloat` / `ListBool` /
+/// `ListString` / `Closure`) still surfaces as
+/// [`BcVmError::HostFnReturnTypeMismatch`].
 fn encode_value_for_ret(
     value: &Value,
     ret_ty: IrType,
     import_idx: u32,
+    memory: &mut VmMemory,
 ) -> Result<VmValue, BcVmError> {
     match (value, ret_ty) {
         (Value::Int(v), IrType::I64) | (Value::Int(v), IrType::I32) => Ok(*v as u64),
@@ -275,6 +277,37 @@ fn encode_value_for_ret(
             Ok(0)
         }
         (Value::Float(OrderedFloat(f)), IrType::F64) => Ok(f.to_bits()),
+        // M2-B phase 4b-continuation: lift a host-returned `Value::String`
+        // into the bytecode VM's string arena. The fresh handle lives
+        // for the rest of the `invoke` call; downstream ops that
+        // consume the slot (StrLen / StrConcat / StrEq / DictLookupStr)
+        // resolve it through the same arena.
+        (Value::String(s), IrType::String) => {
+            let handle = memory.strings.alloc(s.as_str());
+            Ok(handle as u64)
+        }
+        // M2-B phase 4b-continuation: lift a host-returned `Value::List`
+        // of integers into the bytecode VM's list arena. Phase 4b only
+        // models type-uniform i64 lists; a heterogeneous list (or a
+        // non-int list) surfaces as `HostFnReturnTypeMismatch` so the
+        // host gets a clear "route through tree-walker" envelope.
+        (Value::List(items), IrType::ListInt) => {
+            let mut packed: Vec<u64> = Vec::with_capacity(items.len());
+            for elem in items.iter() {
+                match elem {
+                    Value::Int(v) => packed.push(*v as u64),
+                    other => {
+                        return Err(BcVmError::HostFnReturnTypeMismatch {
+                            import_idx,
+                            expected: ret_ty,
+                            found: format!("List<{}>", other.type_name()),
+                        });
+                    }
+                }
+            }
+            let handle = memory.lists.alloc(packed);
+            Ok(handle as u64)
+        }
         (other, _) => Err(BcVmError::HostFnReturnTypeMismatch {
             import_idx,
             expected: ret_ty,
@@ -727,7 +760,14 @@ impl BytecodeVm {
                 );
             }
             last_bc_idx = pc;
-            match self.dispatch_one(&func.ops[pc], &mut stack, &mut locals, &mut memory, pc) {
+            match self.dispatch_one(
+                func,
+                &func.ops[pc],
+                &mut stack,
+                &mut locals,
+                &mut memory,
+                pc,
+            ) {
                 Ok(StepOutcome::Advance) => pc += 1,
                 Ok(StepOutcome::Jump(target)) => {
                     if target > func.ops.len() {
@@ -756,6 +796,7 @@ impl BytecodeVm {
 
     fn dispatch_one(
         &self,
+        func: &BcFunction,
         op: &BcOp,
         stack: &mut Vec<VmValue>,
         locals: &mut [VmValue],
@@ -902,8 +943,16 @@ impl BytecodeVm {
                         }
                     })?;
                     // Encode the return value back into the VM's u64
-                    // slot per `ret_ty`.
-                    stack.push(encode_value_for_ret(&returned, *ret_ty, *import_idx)?);
+                    // slot per `ret_ty`. Phase 4b-continuation: the
+                    // encoder reaches into `memory` for the String /
+                    // ListInt lift lanes, so it has to thread the
+                    // arena state through.
+                    stack.push(encode_value_for_ret(
+                        &returned,
+                        *ret_ty,
+                        *import_idx,
+                        memory,
+                    )?);
                 } else {
                     for _ in 0..*arg_count {
                         pop(stack, bc_idx)?;
@@ -997,6 +1046,126 @@ impl BytecodeVm {
                     .get_element(handle, idx)
                     .map_err(arena_to_vm_error)?;
                 stack.push(elem);
+            }
+            BcOp::ListPush => {
+                // M2-B phase 4b-continuation: `[list, elem] -> [list']`.
+                // Pop element first (top-of-stack), then handle.
+                // Copy-on-write semantics: if the slot's Arc has a
+                // single owner the push lands in place and we re-push
+                // the same handle; otherwise we clone the elements and
+                // allocate a fresh slot.
+                let elem = pop(stack, bc_idx)?;
+                let handle = pop(stack, bc_idx)? as u32;
+                let new_handle = memory
+                    .lists
+                    .push_cow(handle, elem)
+                    .map_err(arena_to_vm_error)?;
+                stack.push(new_handle as u64);
+            }
+            BcOp::StrConst { idx } => {
+                // M2-B phase 4b-continuation: intern a per-function
+                // string pool entry into the live VM's StringArena and
+                // push the resulting handle.
+                let pool_idx = *idx as usize;
+                let value = func
+                    .string_pool
+                    .get(pool_idx)
+                    .ok_or(BcVmError::StackUnderflow { bc_idx })?;
+                let handle = memory.strings.alloc(value.as_str());
+                stack.push(handle as u64);
+            }
+            BcOp::StrLen => {
+                // `[s] -> [i64 len]`. Code-point count for tree-walker
+                // parity (`String::chars().count()`).
+                let handle = pop(stack, bc_idx)? as u32;
+                let n = memory.strings.len_of(handle).map_err(arena_to_vm_error)?;
+                stack.push(n as u64);
+            }
+            BcOp::StrConcat => {
+                // `[s_lhs, s_rhs] -> [s_concat]`. Pop rhs first then
+                // lhs; alloc a fresh slot.
+                let rhs_h = pop(stack, bc_idx)? as u32;
+                let lhs_h = pop(stack, bc_idx)? as u32;
+                let lhs = memory
+                    .strings
+                    .get(lhs_h)
+                    .map_err(arena_to_vm_error)?
+                    .clone();
+                let rhs = memory
+                    .strings
+                    .get(rhs_h)
+                    .map_err(arena_to_vm_error)?
+                    .clone();
+                let mut joined = String::with_capacity(lhs.len() + rhs.len());
+                joined.push_str(&lhs);
+                joined.push_str(&rhs);
+                let handle = memory.strings.alloc(joined.as_str());
+                stack.push(handle as u64);
+            }
+            BcOp::StrEq => {
+                // `[s_lhs, s_rhs] -> [bool]`. Byte-equal compare.
+                let rhs_h = pop(stack, bc_idx)? as u32;
+                let lhs_h = pop(stack, bc_idx)? as u32;
+                let lhs = memory
+                    .strings
+                    .get(lhs_h)
+                    .map_err(arena_to_vm_error)?
+                    .clone();
+                let rhs = memory
+                    .strings
+                    .get(rhs_h)
+                    .map_err(arena_to_vm_error)?
+                    .clone();
+                stack.push(if lhs.as_ref() == rhs.as_ref() { 1 } else { 0 });
+            }
+            BcOp::MakeDict { len } => {
+                // `[k_0, v_0, ..., k_{n-1}, v_{n-1}] -> [dict_handle]`.
+                // Pops `len * 2` slots; the keys are string handles
+                // (a compile-time invariant — the lowering pass only
+                // emits MakeDict after StrConst entries).
+                let n = *len as usize;
+                let needed = n * 2;
+                if stack.len() < needed {
+                    return Err(BcVmError::StackUnderflow { bc_idx });
+                }
+                let mut entries: Vec<(std::sync::Arc<str>, u64)> = Vec::with_capacity(n);
+                // Pop in reverse, then reverse so declaration order is
+                // restored.
+                let mut tmp: Vec<(u32, u64)> = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let v = pop(stack, bc_idx)?;
+                    let k = pop(stack, bc_idx)? as u32;
+                    tmp.push((k, v));
+                }
+                tmp.reverse();
+                for (k_handle, v) in tmp {
+                    let k = memory
+                        .strings
+                        .get(k_handle)
+                        .map_err(arena_to_vm_error)?
+                        .clone();
+                    entries.push((std::sync::Arc::<str>::from(k.as_ref()), v));
+                }
+                let handle = memory.dicts.alloc(entries);
+                stack.push(handle as u64);
+            }
+            BcOp::DictLookupStr => {
+                // `[dict, key] -> [value]`. Pop key first (top of
+                // stack), then dict handle. Miss surfaces as
+                // `IndexOutOfBounds` — the tree-walker envelope.
+                let key_handle = pop(stack, bc_idx)? as u32;
+                let dict_handle = pop(stack, bc_idx)? as u32;
+                let key = memory
+                    .strings
+                    .get(key_handle)
+                    .map_err(arena_to_vm_error)?
+                    .clone();
+                let value = memory
+                    .dicts
+                    .lookup(dict_handle, key.as_ref())
+                    .map_err(arena_to_vm_error)?
+                    .ok_or(BcVmError::IndexOutOfBounds)?;
+                stack.push(value);
             }
             BcOp::Trap(kind) => match kind {
                 BcTrapKind::IndexOutOfBounds => return Err(BcVmError::IndexOutOfBounds),

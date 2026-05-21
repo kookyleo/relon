@@ -186,6 +186,70 @@ pub enum BcOp {
     /// rest of the dispatch loop — consumer ops know the type from
     /// their own BcOp variant (e.g. `BcOp::Add(I64)` reads it as `i64`).
     ListGetInt,
+
+    /// M2-B phase 4b-continuation: append `[list_handle, elem] -> [list_handle']`.
+    /// Pops the element (top-of-stack) then the handle. If the
+    /// underlying `Arc<Vec<u64>>` slot has refcount 1 (no other owner)
+    /// the push happens in place and the handle is reused; otherwise
+    /// a fresh slot is allocated holding the cloned-then-extended
+    /// vector. Either way the pushed handle points at a list whose
+    /// trailing element is the popped value.
+    ///
+    /// Phase 4b-continuation models type-uniform lists; the element
+    /// travels through the same `u64` lane as the rest of the dispatch
+    /// loop. Mixed-element lists are out of scope until the trace-JIT
+    /// bridge revisits the storage shape (phase 4c+).
+    ListPush,
+
+    /// M2-B phase 4b-continuation: push a string handle from the
+    /// per-function string constant pool. `[] -> [string_handle]`.
+    /// `idx` is the index into [`BcFunction::string_pool`]; out-of-
+    /// range traps `StackUnderflow` (compiler bug — the lowering pass
+    /// allocates pool entries before emitting the op).
+    StrConst {
+        /// Index into the per-function string pool.
+        idx: u32,
+    },
+
+    /// M2-B phase 4b-continuation: code-point length of a string.
+    /// `[string_handle] -> [i64 len]`. The arena lift counts
+    /// `String::chars()` for tree-walker parity.
+    StrLen,
+
+    /// M2-B phase 4b-continuation: concatenate two strings.
+    /// `[s_lhs, s_rhs] -> [s_concat]`. Pops the right-hand side first
+    /// (top-of-stack), then the left-hand side. Allocates a fresh
+    /// string slot whose bytes are the concatenation; both operand
+    /// strings remain reachable via their original handles.
+    StrConcat,
+
+    /// M2-B phase 4b-continuation: byte-equal string compare.
+    /// `[s_lhs, s_rhs] -> [bool]`. Pops both handles, pushes `1`
+    /// when their byte payloads match exactly; `0` otherwise.
+    StrEq,
+
+    /// M2-B phase 4b-continuation: allocate a dict slot from
+    /// `len` key/value pairs. `[k_0, v_0, k_1, v_1, ..., k_{n-1},
+    /// v_{n-1}] -> [dict_handle]`. Pops `len * 2` slots in
+    /// declaration order (top-of-stack is `v_{n-1}`). Keys are
+    /// interpreted as string handles (a key produced by `BcOp::StrConst`
+    /// is the only supported shape in phase 4b-continuation); values
+    /// travel through the same `u64` lane as the rest of the dispatch
+    /// loop. Duplicate keys are stored as-is — the lookup arm scans
+    /// in reverse so last-write-wins on hit (tree-walker parity).
+    MakeDict {
+        /// Number of key/value pairs the op pops.
+        len: u32,
+    },
+
+    /// M2-B phase 4b-continuation: look up a string key in a dict.
+    /// `[dict_handle, key_handle] -> [value]`. Pops the key first
+    /// (top-of-stack) then the dict handle; pushes the slot value on
+    /// hit, traps `IndexOutOfBounds` on miss (matches the tree-walker
+    /// envelope where `dict[absent]` raises). Phase 4b-continuation
+    /// keeps the storage as a `Vec<(Arc<str>, u64)>` so the scan cost
+    /// stays linear; richer storage shapes are deferred to phase 4c.
+    DictLookupStr,
 }
 
 /// M2-B phase 3: scalar-pure stdlib handlers the bytecode VM can
@@ -298,6 +362,33 @@ pub struct BcFunction {
     /// either an empty-stack boundary (post-LocalSet) or a join
     /// point of the same depth coming from both arms.
     pub stack_recipe: Vec<Vec<StackOrigin>>,
+    /// M2-B phase 4b-continuation: per-function string constant pool.
+    /// `BcOp::StrConst { idx }` indexes this vector; the dispatch arm
+    /// interns the slot into the VM's [`crate::arena::StringArena`]
+    /// on first touch.
+    ///
+    /// Stored as a `Vec<String>` (not `Vec<Arc<str>>`) because the
+    /// compile-time pool is module-local and the dispatch-time
+    /// interning produces fresh `Arc<str>` slots regardless. Phase
+    /// 4c can revisit if pool re-use becomes hot.
+    pub string_pool: Vec<String>,
+}
+
+impl Default for BcFunction {
+    /// Empty bytecode function. Used as a "fill in just the fields I
+    /// care about" base in hand-built tests — every field is its
+    /// natural zero state so the standard `Default::default()` trick
+    /// stays ergonomic even when the struct gains new optional surface
+    /// (e.g. the phase 4b-continuation `string_pool` slot).
+    fn default() -> Self {
+        Self {
+            ops: Vec::new(),
+            locals: 0,
+            ir_pc_map: Vec::new(),
+            stack_recipe: Vec::new(),
+            string_pool: Vec::new(),
+        }
+    }
 }
 
 impl BcFunction {

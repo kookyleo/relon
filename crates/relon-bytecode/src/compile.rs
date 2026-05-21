@@ -132,6 +132,7 @@ pub fn compile_function_in_module(
             + return_field_offset_to_local.len() as u32,
         inline_depth: 0,
         current_pc: 0,
+        string_pool: Vec::new(),
     };
     state.compile_seq(&func.body, /*depth_base=*/ 0)?;
     state.emit_ret_if_missing();
@@ -155,6 +156,7 @@ pub fn compile_function_in_module(
         locals,
         ir_pc_map: state.ir_pc_map,
         stack_recipe: state.stack_recipe,
+        string_pool: state.string_pool,
     })
 }
 
@@ -248,6 +250,13 @@ struct CompileState<'a> {
     /// value once per outer dispatch so every visitor method sees the
     /// matching PC without threading it through the trait surface.
     current_pc: ExternalPc,
+    /// M2-B phase 4b-continuation: per-function string constant pool.
+    /// `visit_const_string` (in the **real-handle** path, opted into by
+    /// the phase-4b-continuation widening) registers the value here
+    /// and emits `BcOp::StrConst { idx }` against the slot. The legacy
+    /// length-fold path keeps emitting `BcOp::ConstI64(len)` and never
+    /// touches the pool, so existing callers don't observe a change.
+    string_pool: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -392,6 +401,50 @@ impl<'a> CompileState<'a> {
                 // snapshot-tag reasoning as `MakeList` — the element
                 // value depends on the arena state which isn't part
                 // of the producer-based recipe taxonomy.
+                self.current_stack.pop();
+                self.current_stack.pop();
+                let snap_idx = self.next_snapshot_idx;
+                self.next_snapshot_idx += 1;
+                self.current_stack.push(StackOrigin::Snapshot(snap_idx));
+            }
+            BcOp::ListPush => {
+                // Pops [list_handle, elem], pushes one new handle.
+                self.current_stack.pop();
+                self.current_stack.pop();
+                let snap_idx = self.next_snapshot_idx;
+                self.next_snapshot_idx += 1;
+                self.current_stack.push(StackOrigin::Snapshot(snap_idx));
+            }
+            BcOp::StrConst { .. } => {
+                let snap_idx = self.next_snapshot_idx;
+                self.next_snapshot_idx += 1;
+                self.current_stack.push(StackOrigin::Snapshot(snap_idx));
+            }
+            BcOp::StrLen => {
+                self.current_stack.pop();
+                let snap_idx = self.next_snapshot_idx;
+                self.next_snapshot_idx += 1;
+                self.current_stack.push(StackOrigin::Snapshot(snap_idx));
+            }
+            BcOp::StrConcat | BcOp::StrEq => {
+                self.current_stack.pop();
+                self.current_stack.pop();
+                let snap_idx = self.next_snapshot_idx;
+                self.next_snapshot_idx += 1;
+                self.current_stack.push(StackOrigin::Snapshot(snap_idx));
+            }
+            BcOp::MakeDict { len } => {
+                // Pops `len * 2` slots (key/value pairs), pushes one
+                // dict handle.
+                for _ in 0..(*len as usize * 2) {
+                    self.current_stack.pop();
+                }
+                let snap_idx = self.next_snapshot_idx;
+                self.next_snapshot_idx += 1;
+                self.current_stack.push(StackOrigin::Snapshot(snap_idx));
+            }
+            BcOp::DictLookupStr => {
+                // Pops [dict, key], pushes the value.
                 self.current_stack.pop();
                 self.current_stack.pop();
                 let snap_idx = self.next_snapshot_idx;
@@ -1041,11 +1094,27 @@ impl<'a> OpVisitor for CompileState<'a> {
         _value_ty: IrType,
         _entry_count_hint: Option<u32>,
     ) -> Result<(), BcCompileError> {
-        unsupported("DictGetByStringKey")
+        // M2-B phase 4b-continuation: real IR-lift. Stack at this point
+        // is `[dict_handle, key_handle]` (the IR `[Dict, String]` shape
+        // mapped onto bytecode VM handles). The producers — dict and
+        // string handles — currently come from hand-built IR tests
+        // (phase 4b-continuation does not yet wire the from-source
+        // pipeline through `Op::MakeDict` / `Op::ConstString`-as-
+        // -handle; that's phase 4c work).
+        let pc = self.current_pc;
+        self.emit_with_effect(BcOp::DictLookupStr, pc);
+        Ok(())
     }
 
     fn visit_list_get_by_int_idx(&mut self, _ty: IrType) -> Result<(), BcCompileError> {
-        unsupported("ListGetByIntIdx")
+        // M2-B phase 4b-continuation: real IR-lift. Stack at this point
+        // is `[list_handle, i64 idx]` (the IR `[List, Int]` shape).
+        // Producers for list handles arrive via hand-built IR until
+        // the from-source pipeline switches `Op::ConstListInt` from
+        // length-fold to a real `MakeList` lowering (phase 4c).
+        let pc = self.current_pc;
+        self.emit_with_effect(BcOp::ListGetInt, pc);
+        Ok(())
     }
 
     // F-D7-D: `Op::Add(IrType::String)` (source-side `s + t` lowering)
@@ -1529,5 +1598,69 @@ mod tests {
         let empty = BTreeMap::new();
         let err = compile_function(&func, &empty, &empty).unwrap_err();
         assert!(matches!(err, BcCompileError::UnsupportedOp(_)));
+    }
+
+    /// M2-B phase 4b-continuation: `Op::ListGetByIntIdx` lifts cleanly
+    /// into `BcOp::ListGetInt`. Pinned because the visitor previously
+    /// returned `unsupported("ListGetByIntIdx")` and we want a
+    /// regression alarm if the lowering bounces again.
+    #[test]
+    fn list_get_by_int_idx_lifts_to_list_get_int() {
+        // Hand-build a function that takes a list handle in local 0
+        // and pushes an i64 idx via local 1, then runs the subscript.
+        // The IR `LocalGet(0)` slot would carry a real list handle
+        // when wired end-to-end (today's from-source pipeline still
+        // length-folds `ConstListInt`, so this is the direct-IR path).
+        let func = Func {
+            name: "f".into(),
+            params: vec![IrType::ListInt, IrType::I64],
+            ret: IrType::I64,
+            body: vec![
+                tagged(Op::LocalGet(0)),
+                tagged(Op::LocalGet(1)),
+                tagged(Op::ListGetByIntIdx {
+                    element_ty: IrType::I64,
+                }),
+                tagged(Op::Return),
+            ],
+            range: TokenRange::default(),
+        };
+        let empty = BTreeMap::new();
+        let bc = compile_function(&func, &empty, &empty).unwrap();
+        assert!(
+            bc.ops.iter().any(|op| matches!(op, BcOp::ListGetInt)),
+            "expected BcOp::ListGetInt in lowered ops: {:?}",
+            bc.ops
+        );
+    }
+
+    /// M2-B phase 4b-continuation: `Op::DictGetByStringKey` lifts
+    /// cleanly into `BcOp::DictLookupStr`. Same pinning rationale as
+    /// the list test above.
+    #[test]
+    fn dict_get_by_string_key_lifts_to_dict_lookup_str() {
+        let func = Func {
+            name: "f".into(),
+            params: vec![IrType::String, IrType::String],
+            ret: IrType::I64,
+            body: vec![
+                tagged(Op::LocalGet(0)), // dict
+                tagged(Op::LocalGet(1)), // key
+                tagged(Op::DictGetByStringKey {
+                    shape_hash: 0,
+                    value_ty: IrType::I64,
+                    entry_count_hint: None,
+                }),
+                tagged(Op::Return),
+            ],
+            range: TokenRange::default(),
+        };
+        let empty = BTreeMap::new();
+        let bc = compile_function(&func, &empty, &empty).unwrap();
+        assert!(
+            bc.ops.iter().any(|op| matches!(op, BcOp::DictLookupStr)),
+            "expected BcOp::DictLookupStr in lowered ops: {:?}",
+            bc.ops
+        );
     }
 }

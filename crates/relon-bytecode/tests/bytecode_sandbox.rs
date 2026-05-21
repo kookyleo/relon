@@ -137,6 +137,7 @@ fn sandbox_capability_denied_via_trap_op() {
         ops: vec![BcOp::Trap(BcTrapKind::CapabilityDenied), BcOp::Return],
         locals: 1,
         ir_pc_map: vec![1, 2],
+        string_pool: Vec::new(),
         stack_recipe: vec![vec![], vec![]],
     };
     let cfg = BcVmConfig {
@@ -388,6 +389,7 @@ fn capability_gate_denial_surfaces_as_error_on_pre_dispatch_sweep() {
         ops: vec![BcOp::ConstI64(7), BcOp::Return],
         locals: 0,
         ir_pc_map: vec![1, 2],
+        string_pool: Vec::new(),
         stack_recipe: vec![vec![], vec![]],
     };
 
@@ -426,6 +428,7 @@ fn capability_gate_grant_passes_pre_dispatch_sweep() {
         ops: vec![BcOp::ConstI64(7), BcOp::Return],
         locals: 0,
         ir_pc_map: vec![1, 2],
+        string_pool: Vec::new(),
         stack_recipe: vec![vec![], vec![]],
     };
 
@@ -464,6 +467,7 @@ fn capability_trap_enrichment_uses_gate_bit_when_installed() {
         ops: vec![BcOp::Trap(BcTrapKind::CapabilityDenied), BcOp::Return],
         locals: 0,
         ir_pc_map: vec![1, 2],
+        string_pool: Vec::new(),
         stack_recipe: vec![vec![], vec![]],
     };
 
@@ -509,6 +513,7 @@ fn capability_gate_denial_lifts_to_runtime_error() {
         ops: vec![BcOp::ConstI64(0), BcOp::Return],
         locals: 0,
         ir_pc_map: vec![1, 2],
+        string_pool: Vec::new(),
         stack_recipe: vec![vec![], vec![]],
     };
 
@@ -556,6 +561,7 @@ fn call_native_denied_by_gate_traps_with_declared_bit() {
         ],
         locals: 0,
         ir_pc_map: vec![1, 2],
+        string_pool: Vec::new(),
         stack_recipe: vec![vec![], vec![]],
     };
 
@@ -612,6 +618,7 @@ fn call_native_passes_gate_but_traps_native_not_implemented() {
         ],
         locals: 0,
         ir_pc_map: vec![1, 2, 3, 4],
+        string_pool: Vec::new(),
         stack_recipe: vec![vec![], vec![], vec![], vec![]],
     };
 
@@ -656,6 +663,7 @@ fn call_native_no_capability_bit_skips_gate_consult() {
         ],
         locals: 0,
         ir_pc_map: vec![1, 2],
+        string_pool: Vec::new(),
         stack_recipe: vec![vec![], vec![]],
     };
 
@@ -698,6 +706,7 @@ fn check_cap_traps_when_bit_denied() {
         ],
         locals: 0,
         ir_pc_map: vec![1, 2, 3],
+        string_pool: Vec::new(),
         stack_recipe: vec![vec![], vec![], vec![]],
     };
     let mut vtable = CapabilityVtable::default();
@@ -734,6 +743,7 @@ fn check_cap_no_capability_bit_is_noop() {
         ],
         locals: 0,
         ir_pc_map: vec![1, 2, 3],
+        string_pool: Vec::new(),
         stack_recipe: vec![
             vec![],
             vec![relon_bytecode::op::StackOrigin::Const(42)],
@@ -763,6 +773,7 @@ fn call_stdlib_scalar_int_abs() {
         ],
         locals: 0,
         ir_pc_map: vec![1, 2, 3],
+        string_pool: Vec::new(),
         stack_recipe: vec![vec![], vec![], vec![]],
     };
     let vm = BytecodeVm::new(BcVmConfig::default());
@@ -787,6 +798,7 @@ fn call_stdlib_scalar_int_min_max() {
         ],
         locals: 0,
         ir_pc_map: vec![1, 2, 3, 4],
+        string_pool: Vec::new(),
         stack_recipe: vec![vec![], vec![], vec![], vec![]],
     };
     let vm = BytecodeVm::new(BcVmConfig::default());
@@ -804,6 +816,7 @@ fn call_stdlib_scalar_int_min_max() {
         ],
         locals: 0,
         ir_pc_map: vec![1, 2, 3, 4],
+        string_pool: Vec::new(),
         stack_recipe: vec![vec![], vec![], vec![], vec![]],
     };
     assert_eq!(vm.invoke(&bc_max, &[]).value, Some(7));
@@ -822,6 +835,7 @@ fn list_len_witness_passes_length_through() {
         ops: vec![BcOp::ConstI64(5), BcOp::ListLen, BcOp::Return],
         locals: 0,
         ir_pc_map: vec![1, 2, 3],
+        string_pool: Vec::new(),
         stack_recipe: vec![vec![], vec![], vec![]],
     };
     let vm = BytecodeVm::new(BcVmConfig::default());
@@ -892,6 +906,7 @@ fn call_native_registry_dispatches_scalar_sum() {
         ],
         locals: 0,
         ir_pc_map: vec![1, 2, 3, 4],
+        string_pool: Vec::new(),
         stack_recipe: vec![vec![], vec![], vec![], vec![]],
     };
 
@@ -939,6 +954,7 @@ fn call_native_registry_gate_denial_skips_host_fn() {
         ],
         locals: 0,
         ir_pc_map: vec![1, 2],
+        string_pool: Vec::new(),
         stack_recipe: vec![vec![], vec![]],
     };
 
@@ -986,6 +1002,7 @@ fn call_native_unregistered_slot_keeps_native_not_implemented_fallback() {
         ],
         locals: 0,
         ir_pc_map: vec![1, 2],
+        string_pool: Vec::new(),
         stack_recipe: vec![vec![], vec![]],
     };
     // Empty registry — no host fn registered for any slot.
@@ -1028,6 +1045,7 @@ fn call_native_registry_bool_return_round_trips() {
         ],
         locals: 0,
         ir_pc_map: vec![1, 2],
+        string_pool: Vec::new(),
         stack_recipe: vec![vec![], vec![]],
     };
     let mut vtable = CapabilityVtable::default();
@@ -1076,6 +1094,7 @@ fn call_native_host_fn_failure_lifts_to_unsupported() {
         ],
         locals: 0,
         ir_pc_map: vec![1, 2],
+        string_pool: Vec::new(),
         stack_recipe: vec![vec![], vec![]],
     };
     let mut vtable = CapabilityVtable::default();
@@ -1150,6 +1169,7 @@ fn call_native_registry_arg_order_matches_declaration() {
         ],
         locals: 0,
         ir_pc_map: vec![1, 2, 3, 4, 5],
+        string_pool: Vec::new(),
         stack_recipe: vec![vec![], vec![], vec![], vec![], vec![]],
     };
     let mut vtable = CapabilityVtable::default();
@@ -1198,6 +1218,7 @@ fn call_native_registry_unsupported_return_type_traps() {
         ],
         locals: 0,
         ir_pc_map: vec![1, 2],
+        string_pool: Vec::new(),
         stack_recipe: vec![vec![], vec![]],
     };
     let mut vtable = CapabilityVtable::default();
@@ -1214,6 +1235,173 @@ fn call_native_registry_unsupported_return_type_traps() {
         matches!(
             err,
             BcVmError::HostFnReturnTypeMismatch { import_idx: 8, .. }
+        ),
+        "got {err:?}"
+    );
+}
+
+/// M2-B phase 4b-continuation: a host fn that returns `Value::String`
+/// when the call site declares `ret_ty: IrType::String` lifts the
+/// payload into the VM's StringArena and the resulting handle drives
+/// downstream string ops (here: `StrLen`). Locks in the new
+/// String-lane in `encode_value_for_ret`.
+#[test]
+fn call_native_string_return_lifts_into_arena() {
+    use relon_bytecode::op::{BcFunction, BcOp};
+    use std::sync::Arc;
+
+    struct StrReturner;
+    impl relon_eval_api::RelonFunction for StrReturner {
+        fn call(
+            &self,
+            _args: relon_eval_api::NativeArgs,
+            _range: relon_parser::TokenRange,
+        ) -> Result<Value, RuntimeError> {
+            Ok(Value::String("héllo".into()))
+        }
+    }
+
+    let bc = BcFunction {
+        ops: vec![
+            BcOp::CallNative {
+                import_idx: 9,
+                arg_count: 0,
+                cap_bit: relon_ir::NO_CAPABILITY_BIT,
+                ret_ty: relon_ir::IrType::String,
+            },
+            BcOp::StrLen,
+            BcOp::Return,
+        ],
+        locals: 0,
+        ir_pc_map: vec![1, 2, 3],
+        string_pool: Vec::new(),
+        stack_recipe: vec![vec![]; 3],
+    };
+    let mut vtable = CapabilityVtable::default();
+    let native: Arc<dyn relon_eval_api::RelonFunction> = Arc::new(StrReturner);
+    vtable.register_host_fn(9, native);
+    let cfg = BcVmConfig {
+        cap_vtable: vtable,
+        ..BcVmConfig::default()
+    };
+    let vm = BytecodeVm::new(cfg);
+    let outcome = vm.invoke(&bc, &[]);
+    assert!(
+        outcome.error.is_none(),
+        "string-lane lift completes: {:?}",
+        outcome.error
+    );
+    assert_eq!(outcome.value, Some(5)); // "héllo" code points
+}
+
+/// M2-B phase 4b-continuation: a host fn that returns `Value::List`
+/// of integers when the call site declares `ret_ty: IrType::ListInt`
+/// materialises the list into the VM's ListArena and the handle
+/// drives downstream list ops.
+#[test]
+fn call_native_list_int_return_lifts_into_arena() {
+    use relon_bytecode::op::{BcFunction, BcOp};
+    use std::sync::Arc;
+
+    struct ListReturner;
+    impl relon_eval_api::RelonFunction for ListReturner {
+        fn call(
+            &self,
+            _args: relon_eval_api::NativeArgs,
+            _range: relon_parser::TokenRange,
+        ) -> Result<Value, RuntimeError> {
+            Ok(Value::List(
+                vec![Value::Int(7), Value::Int(8), Value::Int(9)].into(),
+            ))
+        }
+    }
+
+    // Read element 2 of the returned list -> 9.
+    let bc = BcFunction {
+        ops: vec![
+            BcOp::CallNative {
+                import_idx: 10,
+                arg_count: 0,
+                cap_bit: relon_ir::NO_CAPABILITY_BIT,
+                ret_ty: relon_ir::IrType::ListInt,
+            },
+            BcOp::ConstI64(2),
+            BcOp::ListGetInt,
+            BcOp::Return,
+        ],
+        locals: 0,
+        ir_pc_map: vec![1, 2, 3, 4],
+        string_pool: Vec::new(),
+        stack_recipe: vec![vec![]; 4],
+    };
+    let mut vtable = CapabilityVtable::default();
+    let native: Arc<dyn relon_eval_api::RelonFunction> = Arc::new(ListReturner);
+    vtable.register_host_fn(10, native);
+    let cfg = BcVmConfig {
+        cap_vtable: vtable,
+        ..BcVmConfig::default()
+    };
+    let vm = BytecodeVm::new(cfg);
+    let outcome = vm.invoke(&bc, &[]);
+    assert!(
+        outcome.error.is_none(),
+        "list-lane lift completes: {:?}",
+        outcome.error
+    );
+    assert_eq!(outcome.value, Some(9));
+}
+
+/// M2-B phase 4b-continuation: a heterogeneous list (Int + String)
+/// returned for `IrType::ListInt` surfaces as
+/// `HostFnReturnTypeMismatch` — the encoder rejects rather than
+/// silently dropping the non-Int element.
+#[test]
+fn call_native_list_int_rejects_heterogeneous() {
+    use relon_bytecode::op::{BcFunction, BcOp};
+    use std::sync::Arc;
+
+    struct MixedReturner;
+    impl relon_eval_api::RelonFunction for MixedReturner {
+        fn call(
+            &self,
+            _args: relon_eval_api::NativeArgs,
+            _range: relon_parser::TokenRange,
+        ) -> Result<Value, RuntimeError> {
+            Ok(Value::List(
+                vec![Value::Int(1), Value::String("oops".into())].into(),
+            ))
+        }
+    }
+
+    let bc = BcFunction {
+        ops: vec![
+            BcOp::CallNative {
+                import_idx: 11,
+                arg_count: 0,
+                cap_bit: relon_ir::NO_CAPABILITY_BIT,
+                ret_ty: relon_ir::IrType::ListInt,
+            },
+            BcOp::Return,
+        ],
+        locals: 0,
+        ir_pc_map: vec![1, 2],
+        string_pool: Vec::new(),
+        stack_recipe: vec![vec![]; 2],
+    };
+    let mut vtable = CapabilityVtable::default();
+    let native: Arc<dyn relon_eval_api::RelonFunction> = Arc::new(MixedReturner);
+    vtable.register_host_fn(11, native);
+    let cfg = BcVmConfig {
+        cap_vtable: vtable,
+        ..BcVmConfig::default()
+    };
+    let vm = BytecodeVm::new(cfg);
+    let outcome = vm.invoke(&bc, &[]);
+    let err = outcome.error.expect("mixed list must trap");
+    assert!(
+        matches!(
+            err,
+            BcVmError::HostFnReturnTypeMismatch { import_idx: 11, .. }
         ),
         "got {err:?}"
     );
@@ -1239,6 +1427,7 @@ fn call_native_lifts_to_unsupported_runtime_error() {
         ],
         locals: 0,
         ir_pc_map: vec![1, 2],
+        string_pool: Vec::new(),
         stack_recipe: vec![vec![], vec![]],
     };
     let vm = BytecodeVm::new(BcVmConfig::default());
@@ -1277,6 +1466,7 @@ fn make_list_and_get_int_round_trip() {
         ],
         locals: 0,
         ir_pc_map: vec![1, 2, 3, 4, 5, 6, 7],
+        string_pool: Vec::new(),
         stack_recipe: vec![vec![], vec![], vec![], vec![], vec![], vec![], vec![]],
     };
     let vm = BytecodeVm::new(BcVmConfig::default());
@@ -1303,6 +1493,7 @@ fn list_get_int_first_last_and_empty() {
         ],
         locals: 0,
         ir_pc_map: vec![1, 2, 3, 4, 5, 6],
+        string_pool: Vec::new(),
         stack_recipe: vec![vec![]; 6],
     };
     let vm = BytecodeVm::new(BcVmConfig::default());
@@ -1320,6 +1511,7 @@ fn list_get_int_first_last_and_empty() {
         ],
         locals: 0,
         ir_pc_map: vec![1, 2, 3, 4, 5, 6],
+        string_pool: Vec::new(),
         stack_recipe: vec![vec![]; 6],
     };
     assert_eq!(vm.invoke(&bc_last, &[]).value, Some(8));
@@ -1334,6 +1526,7 @@ fn list_get_int_first_last_and_empty() {
         ],
         locals: 0,
         ir_pc_map: vec![1, 2, 3, 4],
+        string_pool: Vec::new(),
         stack_recipe: vec![vec![]; 4],
     };
     let outcome = vm.invoke(&bc_empty, &[]);
@@ -1361,6 +1554,7 @@ fn list_get_int_out_of_range_traps() {
         ],
         locals: 0,
         ir_pc_map: vec![1, 2, 3, 4, 5, 6],
+        string_pool: Vec::new(),
         stack_recipe: vec![vec![]; 6],
     };
     let vm = BytecodeVm::new(BcVmConfig::default());
@@ -1412,6 +1606,7 @@ fn multiple_make_lists_mint_distinct_handles() {
         ],
         locals: 2,
         ir_pc_map: vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+        string_pool: Vec::new(),
         stack_recipe: vec![vec![]; 15],
     };
     let vm = BytecodeVm::new(BcVmConfig::default());
@@ -1435,6 +1630,7 @@ fn make_list_stack_underflow_traps() {
         ],
         locals: 0,
         ir_pc_map: vec![1, 2, 3],
+        string_pool: Vec::new(),
         stack_recipe: vec![vec![]; 3],
     };
     let vm = BytecodeVm::new(BcVmConfig::default());
@@ -1465,6 +1661,7 @@ fn make_list_preserves_declaration_order() {
         ],
         locals: 0,
         ir_pc_map: vec![1, 2, 3, 4, 5, 6, 7],
+        string_pool: Vec::new(),
         stack_recipe: vec![vec![]; 7],
     };
     let vm = BytecodeVm::new(BcVmConfig::default());
@@ -1489,6 +1686,7 @@ fn arena_is_reset_between_invocations() {
         ],
         locals: 0,
         ir_pc_map: vec![1, 2, 3, 4, 5],
+        string_pool: Vec::new(),
         stack_recipe: vec![vec![]; 5],
     };
     let vm = BytecodeVm::new(BcVmConfig::default());
@@ -1497,4 +1695,286 @@ fn arena_is_reset_between_invocations() {
     assert_eq!(a.value, Some(42));
     assert_eq!(b.value, Some(42));
     assert!(a.error.is_none() && b.error.is_none());
+}
+
+// -- M2-B phase 4b-continuation: ListPush copy-on-write -----------
+
+/// `ListPush` against a freshly-minted list mutates in place (single
+/// owner) and the resulting handle indexes a longer list.
+#[test]
+fn list_push_extends_single_owner_in_place() {
+    use relon_bytecode::op::{BcFunction, BcOp};
+
+    // Build [10, 20], push 30, read index 2 -> 30.
+    let bc = BcFunction {
+        ops: vec![
+            BcOp::ConstI64(10),
+            BcOp::ConstI64(20),
+            BcOp::MakeList { len: 2 },
+            BcOp::ConstI64(30),
+            BcOp::ListPush,
+            BcOp::ConstI64(2),
+            BcOp::ListGetInt,
+            BcOp::Return,
+        ],
+        locals: 0,
+        ir_pc_map: vec![1, 2, 3, 4, 5, 6, 7, 8],
+        string_pool: Vec::new(),
+        stack_recipe: vec![vec![]; 8],
+    };
+    let vm = BytecodeVm::new(BcVmConfig::default());
+    let outcome = vm.invoke(&bc, &[]);
+    assert!(outcome.error.is_none(), "push completes");
+    assert_eq!(outcome.value, Some(30));
+}
+
+/// `ListPush` on a shared handle (the same handle stashed twice in
+/// locals) clones rather than aliasing. Pin: the original list still
+/// observes its original length after the push.
+#[test]
+fn list_push_clones_on_shared_handle() {
+    use relon_bytecode::op::{BcFunction, BcOp};
+
+    // Build [1, 2], stash handle in local 0 and local 1 (refcount=2).
+    // Push 99 onto a copy from local 0 -> new handle in local 2.
+    // Read element 2 of new list (-> 99) and element 1 of original
+    // list (local 1, idx 1 -> 2). Return their sum: 99 + 2 = 101.
+    let bc = BcFunction {
+        ops: vec![
+            BcOp::ConstI64(1),
+            BcOp::ConstI64(2),
+            BcOp::MakeList { len: 2 },
+            BcOp::LocalSet(0), // local 0 = orig handle
+            BcOp::LocalGet(0), // dup handle onto stack
+            BcOp::LocalSet(1), // local 1 = orig handle (refcount=2)
+            BcOp::LocalGet(0),
+            BcOp::ConstI64(99),
+            BcOp::ListPush,    // new handle (clone path)
+            BcOp::LocalSet(2), // local 2 = extended handle
+            // Read local-2[2] -> 99
+            BcOp::LocalGet(2),
+            BcOp::ConstI64(2),
+            BcOp::ListGetInt,
+            // Read local-1[1] -> 2 (original untouched)
+            BcOp::LocalGet(1),
+            BcOp::ConstI64(1),
+            BcOp::ListGetInt,
+            BcOp::Add(relon_ir::IrType::I64),
+            BcOp::Return,
+        ],
+        locals: 3,
+        ir_pc_map: (1..=18).collect(),
+        string_pool: Vec::new(),
+        stack_recipe: vec![vec![]; 18],
+    };
+    let vm = BytecodeVm::new(BcVmConfig::default());
+    let outcome = vm.invoke(&bc, &[]);
+    assert!(outcome.error.is_none(), "clone path completes");
+    assert_eq!(outcome.value, Some(101));
+}
+
+// -- M2-B phase 4b-continuation: string ops -----------------------
+
+/// `StrConst` interns a pool entry into the arena and `StrLen` reads
+/// the chars count back.
+#[test]
+fn str_const_and_str_len_round_trip() {
+    use relon_bytecode::op::{BcFunction, BcOp};
+
+    let bc = BcFunction {
+        ops: vec![BcOp::StrConst { idx: 0 }, BcOp::StrLen, BcOp::Return],
+        locals: 0,
+        ir_pc_map: vec![1, 2, 3],
+        string_pool: vec!["héllo".to_string()],
+        stack_recipe: vec![vec![]; 3],
+    };
+    let vm = BytecodeVm::new(BcVmConfig::default());
+    let outcome = vm.invoke(&bc, &[]);
+    assert!(outcome.error.is_none(), "len round-trip completes");
+    // "héllo" has 5 code points.
+    assert_eq!(outcome.value, Some(5));
+}
+
+/// `StrConcat` allocates a fresh slot whose chars-count is the sum
+/// of the operand strings. Pin against accidental in-place mutation.
+#[test]
+fn str_concat_produces_combined_length() {
+    use relon_bytecode::op::{BcFunction, BcOp};
+
+    let bc = BcFunction {
+        ops: vec![
+            BcOp::StrConst { idx: 0 },
+            BcOp::StrConst { idx: 1 },
+            BcOp::StrConcat,
+            BcOp::StrLen,
+            BcOp::Return,
+        ],
+        locals: 0,
+        ir_pc_map: vec![1, 2, 3, 4, 5],
+        string_pool: vec!["foo".to_string(), "bar".to_string()],
+        stack_recipe: vec![vec![]; 5],
+    };
+    let vm = BytecodeVm::new(BcVmConfig::default());
+    let outcome = vm.invoke(&bc, &[]);
+    assert!(outcome.error.is_none(), "concat completes");
+    assert_eq!(outcome.value, Some(6));
+}
+
+/// `StrEq` byte-compares two string slots — same content from the
+/// same pool entry returns 1; distinct content returns 0.
+#[test]
+fn str_eq_byte_compare() {
+    use relon_bytecode::op::{BcFunction, BcOp};
+
+    let bc_eq = BcFunction {
+        ops: vec![
+            BcOp::StrConst { idx: 0 },
+            BcOp::StrConst { idx: 0 },
+            BcOp::StrEq,
+            BcOp::Return,
+        ],
+        locals: 0,
+        ir_pc_map: vec![1, 2, 3, 4],
+        string_pool: vec!["hi".to_string()],
+        stack_recipe: vec![vec![]; 4],
+    };
+    let vm = BytecodeVm::new(BcVmConfig::default());
+    assert_eq!(vm.invoke(&bc_eq, &[]).value, Some(1));
+
+    let bc_ne = BcFunction {
+        ops: vec![
+            BcOp::StrConst { idx: 0 },
+            BcOp::StrConst { idx: 1 },
+            BcOp::StrEq,
+            BcOp::Return,
+        ],
+        locals: 0,
+        ir_pc_map: vec![1, 2, 3, 4],
+        string_pool: vec!["hi".to_string(), "lo".to_string()],
+        stack_recipe: vec![vec![]; 4],
+    };
+    assert_eq!(vm.invoke(&bc_ne, &[]).value, Some(0));
+}
+
+// -- M2-B phase 4b-continuation: dict ops -------------------------
+
+/// `MakeDict` + `DictLookupStr` round-trip: build `{ a: 1, b: 2 }`,
+/// look up "a" -> 1, look up "b" -> 2.
+#[test]
+fn make_dict_and_lookup_str_round_trip() {
+    use relon_bytecode::op::{BcFunction, BcOp};
+
+    // Build dict { "a": 1, "b": 2 } in local 0, look up "a" + "b",
+    // sum: 1 + 2 = 3.
+    let bc = BcFunction {
+        ops: vec![
+            BcOp::StrConst { idx: 0 }, // key "a"
+            BcOp::ConstI64(1),         // val 1
+            BcOp::StrConst { idx: 1 }, // key "b"
+            BcOp::ConstI64(2),         // val 2
+            BcOp::MakeDict { len: 2 },
+            BcOp::LocalSet(0),
+            BcOp::LocalGet(0),
+            BcOp::StrConst { idx: 0 },
+            BcOp::DictLookupStr,
+            BcOp::LocalGet(0),
+            BcOp::StrConst { idx: 1 },
+            BcOp::DictLookupStr,
+            BcOp::Add(relon_ir::IrType::I64),
+            BcOp::Return,
+        ],
+        locals: 1,
+        ir_pc_map: (1..=14).collect(),
+        string_pool: vec!["a".to_string(), "b".to_string()],
+        stack_recipe: vec![vec![]; 14],
+    };
+    let vm = BytecodeVm::new(BcVmConfig::default());
+    let outcome = vm.invoke(&bc, &[]);
+    assert!(
+        outcome.error.is_none(),
+        "round-trip completes: {:?}",
+        outcome.error
+    );
+    assert_eq!(outcome.value, Some(3));
+}
+
+/// `DictLookupStr` on a miss traps `IndexOutOfBounds` (matches the
+/// tree-walker "dict[absent]" envelope).
+#[test]
+fn dict_lookup_miss_traps_index_out_of_bounds() {
+    use relon_bytecode::op::{BcFunction, BcOp};
+
+    let bc = BcFunction {
+        ops: vec![
+            BcOp::StrConst { idx: 0 }, // key "a"
+            BcOp::ConstI64(1),
+            BcOp::MakeDict { len: 1 },
+            BcOp::StrConst { idx: 1 }, // missing key "missing"
+            BcOp::DictLookupStr,
+            BcOp::Return,
+        ],
+        locals: 0,
+        ir_pc_map: vec![1, 2, 3, 4, 5, 6],
+        string_pool: vec!["a".to_string(), "missing".to_string()],
+        stack_recipe: vec![vec![]; 6],
+    };
+    let vm = BytecodeVm::new(BcVmConfig::default());
+    let outcome = vm.invoke(&bc, &[]);
+    let err = outcome.error.expect("miss must trap");
+    assert!(
+        matches!(err, BcVmError::IndexOutOfBounds),
+        "expected IndexOutOfBounds, got {err:?}"
+    );
+}
+
+/// Duplicate keys observe last-write-wins (tree-walker parity). Pin
+/// the dispatch arm's reverse-scan discipline against accidental
+/// first-write-wins regressions.
+#[test]
+fn dict_lookup_last_write_wins_on_duplicate_key() {
+    use relon_bytecode::op::{BcFunction, BcOp};
+
+    let bc = BcFunction {
+        ops: vec![
+            BcOp::StrConst { idx: 0 }, // key "k"
+            BcOp::ConstI64(10),        // first val 10
+            BcOp::StrConst { idx: 0 }, // duplicate key "k"
+            BcOp::ConstI64(99),        // overriding val 99
+            BcOp::MakeDict { len: 2 },
+            BcOp::StrConst { idx: 0 },
+            BcOp::DictLookupStr,
+            BcOp::Return,
+        ],
+        locals: 0,
+        ir_pc_map: vec![1, 2, 3, 4, 5, 6, 7, 8],
+        string_pool: vec!["k".to_string()],
+        stack_recipe: vec![vec![]; 8],
+    };
+    let vm = BytecodeVm::new(BcVmConfig::default());
+    let outcome = vm.invoke(&bc, &[]);
+    assert!(outcome.error.is_none());
+    assert_eq!(outcome.value, Some(99));
+}
+
+/// `StrConst { idx }` with `idx` outside the pool surfaces as
+/// `StackUnderflow` (compiler-bug envelope) — pin so a future pool
+/// growth bug surfaces clearly.
+#[test]
+fn str_const_out_of_pool_traps() {
+    use relon_bytecode::op::{BcFunction, BcOp};
+
+    let bc = BcFunction {
+        ops: vec![BcOp::StrConst { idx: 5 }, BcOp::Return],
+        locals: 0,
+        ir_pc_map: vec![1, 2],
+        string_pool: vec!["only-slot".to_string()],
+        stack_recipe: vec![vec![]; 2],
+    };
+    let vm = BytecodeVm::new(BcVmConfig::default());
+    let outcome = vm.invoke(&bc, &[]);
+    let err = outcome.error.expect("OOR pool idx must trap");
+    assert!(
+        matches!(err, BcVmError::StackUnderflow { .. }),
+        "expected StackUnderflow, got {err:?}"
+    );
 }
