@@ -8,7 +8,7 @@
 //! 2. Host-registered native fns — supplied via
 //!    [`crate::AnalyzeOptions::host_fn_signatures`].
 //! 3. Hardcoded stdlib signatures — provided by
-//!    [`crate::stdlib_signatures::stdlib_signatures`].
+//!    `crate::stdlib_signatures::stdlib_signatures`.
 //!
 //! The shape is intentionally minimal (just enough to drive arity / arg
 //! type checks); generic instantiation, named-arg coverage, and cross-

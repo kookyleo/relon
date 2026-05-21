@@ -449,7 +449,7 @@ pub struct AnalyzeOptions {
     /// Default `false` preserves the v3+ a-3 behavior.
     pub require_hash: bool,
     /// v6-fix-D2 cold-start: when `true`, skip the carrier-`.relon`
-    /// parse + lower pass ([`core_schemas::inject_core_schemas`]).
+    /// parse + lower pass (`core_schemas::inject_core_schemas`).
     /// That pass contributes the `String` / `List<T>` / `Dict<K, V>`
     /// / `Iter<T>` *method dispatch* table only — schema field-type
     /// checks, typecheck, etc. don't read it. So skipping is safe

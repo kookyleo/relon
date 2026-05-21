@@ -3,7 +3,7 @@
 //! `to_json_value` historically hard-coded the `Value` → `serde_json::Value`
 //! shape. The [`Projector`] trait inverts that: hosts implement it once for
 //! their target representation (JSON, YAML, BSON, a typed builder, …) and
-//! plug it into [`crate::project`] / [`crate::project_from_str`].
+//! plug it into [`crate::project_with`] / [`crate::project_from_str`].
 //!
 //! Implementors recurse through [`Value::List`] / [`Value::Dict`]
 //! themselves; the trait deliberately doesn't bake in a visitor walk so

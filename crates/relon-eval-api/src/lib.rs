@@ -121,7 +121,7 @@ pub trait Evaluator: Send + Sync {
     ///
     /// ## Default implementation
     ///
-    /// The default — used by the [`TreeWalkEvaluator`] — drops both
+    /// The default — used by the `TreeWalkEvaluator` — drops both
     /// `external_pc` and `local_snapshot` and forwards to
     /// [`Self::run_main`]. This is the v6-γ M5 fallback semantic
     /// promoted to the trait surface so the trace-install path can

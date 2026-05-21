@@ -279,13 +279,13 @@ pub enum Op {
         value: String,
     },
     /// Push an absolute wasm linear-memory address of a constant
-    /// List<Int> record. Stack: `[] -> [ListInt]`.
+    /// `List<Int>` record. Stack: `[] -> [ListInt]`.
     ///
     /// Record layout in the data section: `[len: u32 LE][pad: u32 zero][i64 elements]`.
     /// Total size: `8 + 8 * elements.len()` bytes. The 4-byte pad
     /// keeps the elements 8-aligned **inside the record** when the
     /// record itself is placed at an 8-aligned absolute address. The
-    /// codegen layout pass aligns each List<Int> data-section entry
+    /// codegen layout pass aligns each `List<Int>` data-section entry
     /// to 8 to satisfy that invariant.
     ConstListInt {
         /// Per-module identifier the codegen layout pass uses to look
@@ -668,7 +668,7 @@ pub enum Op {
     /// bump `$tail_cursor` by the record size, and push the new
     /// buffer-relative offset of the record onto the stack as i32.
     ///
-    /// Used for emitting String / List<Int> fields inside a dict
+    /// Used for emitting String / `List<Int>` fields inside a dict
     /// literal: the resulting offset is what the parent's pointer
     /// slot stores via [`Op::StoreFieldAtRecord`] with `ty:
     /// String`/`ListInt`.
@@ -1057,7 +1057,7 @@ pub enum Op {
     /// top). Codegen lowers to `memory.copy dst_mem=0 src_mem=0`.
     ///
     /// Used by stdlib bodies that splice bytes between scratch
-    /// buffers and existing String / List<Int> records without
+    /// buffers and existing String / `List<Int>` records without
     /// going through the tail-record machinery (`concat`,
     /// `substring`, ...). The `MemoryCopy` instruction is part of
     /// the wasm bulk-memory proposal which wasmtime keeps enabled

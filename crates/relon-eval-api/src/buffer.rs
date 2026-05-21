@@ -70,7 +70,7 @@ pub enum BufferError {
         /// Required length per the offset table.
         need: usize,
     },
-    /// A pointer-indirect payload (String / List<Int>) is larger than
+    /// A pointer-indirect payload (String / `List<Int>`) is larger than
     /// the `u32` length prefix can describe. Phase 2.c caps each
     /// payload at `u32::MAX` bytes / elements; longer values surface
     /// here rather than overflow silently.
@@ -78,7 +78,7 @@ pub enum BufferError {
     ValueTooLarge {
         /// Field name carrying the oversized payload.
         name: String,
-        /// Requested length (bytes for String, elements for List<Int>).
+        /// Requested length (bytes for String, elements for `List<Int>`).
         len: usize,
     },
     /// A pointer-indirect read tripped over a malformed tail-area
@@ -101,7 +101,7 @@ pub enum BufferError {
 ///
 /// * The fixed area is pre-allocated to `layout.root_size` so every
 ///   inline scalar slot is well-defined zero bytes per the spec.
-/// * String / List<Int> writes append a `[len: u32 LE][payload]`
+/// * String / `List<Int>` writes append a `[len: u32 LE][payload]`
 ///   record after the fixed area and back-patch the pointer slot in
 ///   the fixed area with the tail-record's byte offset (relative to
 ///   the buffer start — the wasm side adds `in_ptr` to it).
@@ -836,7 +836,7 @@ impl<'b> ListRecordWriter<'b> {
     ///
     /// Pads the parent tail area up to the schema's `root_align`,
     /// rebases the child's pointer-indirect slots through
-    /// [`relocate_pointers`], appends the bytes, and records the
+    /// `relocate_pointers`, appends the bytes, and records the
     /// entry's offset for the eventual list header.
     pub fn finish_entry(
         &mut self,
@@ -1457,7 +1457,7 @@ impl<'a> BufferReader<'a> {
     /// Phase 3.b: branded dict fields lay their fixed area in the
     /// parent's tail area, addressed through a 4-byte pointer slot in
     /// the parent's fixed area. The sub-record's own pointer-indirect
-    /// children (its String / List<Int> / nested Dict slots) keep
+    /// children (its String / `List<Int>` / nested Dict slots) keep
     /// pointing into the same shared buffer — `sub_record` borrows the
     /// parent bytes verbatim, so a subsequent `read_string` on the
     /// sub-reader resolves through the same tail area without copying.

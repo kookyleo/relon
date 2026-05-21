@@ -554,7 +554,7 @@ pub const STDLIB_IDX_SUBSTRING: u32 = 9;
 /// real Relon program produces `Op::Call { fn_index: 36 }`; the
 /// recorder rule below stays here so a hand-built IR fragment (or
 /// the AST-level shortcut in
-/// [`record_method_call_contains`](crate::RecorderState::record_method_call_contains))
+/// `record_method_call_contains`)
 /// can route through the same fast path the F-D7-C inline emit
 /// already supports.
 ///
@@ -635,7 +635,7 @@ fn lower_string_call(fn_index: u32, cx: &OpLoweringContext<'_>) -> Option<LowerO
         // guarding it here would surface spurious deopts. The
         // const-bytes side table (`OptimizedTrace::const_bytes`) is
         // filled by a dedicated recorder API
-        // ([`crate::RecorderState::record_method_call_contains`])
+        // (`crate::RecorderState::record_method_call_contains`)
         // because this pure-function lowering cannot reach into the
         // walker's per-arg constant view; routing only via this arm
         // means inline-needle specialisation stays off until the

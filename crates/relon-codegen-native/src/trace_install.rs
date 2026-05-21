@@ -632,7 +632,7 @@ impl TraceJitState {
         self.jit_compile_buffer_for_fn(fn_id, buffer)
     }
 
-    /// Compile a pre-built [`TraceBuffer`] (skipping the recorder
+    /// Compile a pre-built [`relon_trace_jit::TraceBuffer`] (skipping the recorder
     /// finalize step). Used by tests that need to construct a trace
     /// without going through the recorder lowering rules — useful for
     /// pinning emitter / optimiser behaviour on synthetic ops. The
@@ -666,7 +666,7 @@ impl TraceJitState {
     /// (`trace_jit_warm_ic` vs `trace_jit_warm_tail` rows).
     ///
     /// **Note on `extern "C"` interop**: Rust callers that go through
-    /// [`JITedTraceFn::invoke`] / [`Self::typed_entry`] declare the
+    /// [`JITedTraceFn::invoke`] / the typed-entry helpers declare the
     /// entry pointer as `unsafe extern "C" fn(...) -> i32`. On
     /// x86_64 + aarch64 the wire-level register layout for the
     /// `TRACE_ENTRY_SIG` shape (2 ptr args + i32 return) is identical
@@ -1263,7 +1263,7 @@ pub fn build_trace_jit_module() -> Result<JITModule, TraceJitError> {
 /// keeping every helper symbol-registered avoids surprising
 /// rdynamic / strip behaviour.
 ///
-/// Exposed `pub` so [`build_jit_module_with_runtime_helpers`] (the
+/// Exposed `pub` so `build_jit_module_with_runtime_helpers` (the
 /// codegen-native entry function builder) can call it without
 /// duplicating the symbol list.
 pub fn register_trace_runtime_symbols(builder: &mut JITBuilder) {

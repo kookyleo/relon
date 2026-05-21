@@ -192,7 +192,7 @@ pub enum SyntaxKind {
     /// CST builder breaks it into F_STRING_OPEN, F_STRING_LITERAL
     /// chunks, F_STRING_INTERPOLATION children, and F_STRING_CLOSE.
     F_STRING,
-    /// One `${ expr }` zone inside an [`F_STRING`]. Children are
+    /// One `${ expr }` zone inside an [`SyntaxKind::F_STRING`]. Children are
     /// `F_STRING_INTERP_START`, then a regular Relon expression node,
     /// then `F_STRING_INTERP_END`.
     F_STRING_INTERPOLATION,
@@ -219,7 +219,7 @@ pub enum SyntaxKind {
     /// schema-level pragma directives. The CST keeps every byte
     /// verbatim; the typed-AST layer reads the structure.
     SCHEMA_WITH,
-    /// One method declaration inside a [`SCHEMA_WITH`] block.
+    /// One method declaration inside a [`SyntaxKind::SCHEMA_WITH`] block.
     /// Children: optional pragma directives (`#derive`, `#native`,
     /// `#private`), an IDENT method name, optional `<T>` generics,
     /// `CLOSURE_PARAM` list, a TYPE_NODE return type, and an

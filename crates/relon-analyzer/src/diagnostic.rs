@@ -282,7 +282,7 @@ pub enum Diagnostic {
         method: String,
         /// Expected witness shape, rendered as
         /// `eq(other: Self) -> Bool` etc. — see
-        /// [`crate::constraints`].
+        /// `crate::constraints`.
         expected_shape: String,
         /// Actual method signature as written in source.
         found_shape: String,

@@ -633,7 +633,7 @@ pub fn is_builtin_type_name(name: &str) -> bool {
 /// Accepted shapes:
 ///
 /// * Full type expression (`Map<String, Int>`, `Foo<T>`, `Weather?`,
-///   `Int`, `Enum<...>`) — produced by [`crate::expr::parse_type_expr`]
+///   `Int`, `Enum<...>`) — produced by `crate::expr::parse_type_expr`
 ///   and surfaced as `Expr::Type`. The contained `TypeNode` is returned
 ///   verbatim so generics and `is_optional` survive.
 /// * Bareword / dotted path (`Weather`, `geo.Location`) — surfaced as

@@ -4,7 +4,7 @@
 //!
 //! Split out from [`crate::eval`] because reference resolution forms a
 //! self-contained sub-system: it has its own `ReferenceStep` enum, its own
-//! caching protocol against [`crate::eval::Context::path_cache`] and
+//! caching protocol against [`crate::Context`]'s `path_cache` and
 //! `evaluating_paths`, and its own circular-detection logic. Keeping it
 //! adjacent to (but separate from) the main `eval_internal` dispatcher makes
 //! both halves easier to follow.

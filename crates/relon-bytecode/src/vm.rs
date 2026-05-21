@@ -419,7 +419,7 @@ impl BytecodeVm {
     /// [`Self::invoke_from_with_locals`] but pre-seeds the operand
     /// stack with `initial_stack` (bottom-up) before dispatching.
     /// This is the path
-    /// [`crate::evaluator::BytecodeEvaluator::resume_from_pc`] uses
+    /// `crate::evaluator::BytecodeEvaluator::resume_from_pc` uses
     /// to rehydrate mid-expression deopts: the recipe in
     /// `BcFunction::stack_recipe[start_bc_idx]` tells the evaluator
     /// what values to push (locals / consts / snapshot slots), the

@@ -35,7 +35,7 @@ impl TreeWalkEvaluator {
     /// Build a [`TreeWalkEvaluator`] over `context`.
     ///
     /// The first wrap installs the tree-walking backend's default
-    /// stdlib / decorators / prelude (see [`prepare_tree_walk_context`]).
+    /// stdlib / decorators / prelude (see `prepare_tree_walk_context`).
     /// Subsequent wraps short-circuit because
     /// [`Context::backend_prepared`] stays `true` once flipped.
     ///
@@ -81,7 +81,7 @@ impl TreeWalkEvaluator {
     /// no `stdlib`, no `prelude` schema seed, no `StdModuleResolver`
     /// (the trivial scalar `#main` envelope provably touches none of
     /// these). Marks the Context as prepared so the wrap-time check
-    /// in [`prepare_tree_walk_context`] short-circuits.
+    /// in `prepare_tree_walk_context` short-circuits.
     ///
     /// **Contract**: caller must guarantee the source under this
     /// Context fits the trivial-scalar `#main` envelope as classified
@@ -1203,7 +1203,7 @@ impl TreeWalkEvaluator {
     }
 
     /// Lower a `#meta ...` directive's body into the positional-args
-    /// vector a [`DecoratorPlugin::schema_field_meta`] hook expects.
+    /// vector a [`crate::decorator::DecoratorPlugin::schema_field_meta`] hook expects.
     ///
     /// * `Bare` → no args.
     /// * `Value(body)` → one positional `EvaluatedArg` carrying the

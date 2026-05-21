@@ -189,7 +189,7 @@ pub enum HostHookId {
     /// machinery so the emitter can issue a direct `call` to them
     /// without an `__relon_trace_resolve_call` round-trip on every
     /// op. Resolution is performed once at install time via
-    /// [`HostHookFuncIds`].
+    /// [`crate::HostHookFuncIds`].
     StrConcat,
     /// F-D7-I: `__relon_str_concat_alloc(lhs: *const StringRef,
     /// total_len: usize) -> *mut StringRef`. Allocator-only helper for

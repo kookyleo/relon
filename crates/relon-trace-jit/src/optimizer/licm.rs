@@ -14,7 +14,7 @@
 //! An op is hoistable iff **all** of:
 //!
 //! 1. Its [`EffectClass`] is `Pure`, or it is one of the
-//!    allow-listed `ReadOnly` ops (see [`is_hoistable`]).
+//!    allow-listed `ReadOnly` ops (see `is_hoistable`).
 //!    `RecoverableWrite` and worse are never hoisted.
 //! 2. Guards are normally position-sensitive (deopt expects the
 //!    trace to have reached that pc before failing). The exceptions

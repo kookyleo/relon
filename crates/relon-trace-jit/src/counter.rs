@@ -91,7 +91,7 @@ impl HotCounter {
     ///    returns `AlreadyHot`.
     /// 4. If the new value is exactly 1 and the threshold is greater
     ///    than 1, return [`RecordResult::Cold`].
-    /// 5. Else return [`RecordResult::Heating(count)`].
+    /// 5. Else return [`RecordResult::Heating`]`(count)`.
     pub fn record(&self, fn_id: u32) -> RecordResult {
         let slot = &self.counters[fn_id as usize];
         let cur = slot.get();

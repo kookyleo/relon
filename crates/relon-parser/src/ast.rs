@@ -698,7 +698,7 @@ pub fn document_of(syntax: SyntaxNode) -> Option<Document> {
     Document::cast(syntax)
 }
 
-/// Re-export of [`SyntaxToken`] for callers who need it but don't
+/// Re-export of [`crate::syntax::SyntaxToken`] for callers who need it but don't
 /// otherwise depend on the `syntax` module.
 pub use crate::syntax::SyntaxToken as _Token;
 

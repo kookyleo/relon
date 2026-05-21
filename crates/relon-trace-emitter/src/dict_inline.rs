@@ -2,7 +2,7 @@
 //!
 //! Default lowering of `TraceOp::DictLookupPrechecked` is a direct
 //! `call __relon_trace_dict_lookup_prechecked(dict_ptr, key_ptr, ctx)`
-//! (see [`crate::emitter::TraceEmitterState::emit_dict_lookup_prechecked`]).
+//! (see `crate::emitter::TraceEmitterState::emit_dict_lookup_prechecked`).
 //! For the W5 cmp_lua hot loop — fixed dict, short string keys, ~10
 //! entries — the C ABI crossing alone runs ~6-7 ns/iter. On top of
 //! that, the helper does a fresh FxHash on the key bytes and a linear
@@ -107,7 +107,7 @@
 //! `entry_count == 10`; we still emit the inline scan even for larger
 //! tables because the inner loop is tight (one load + one compare +
 //! one brif per entry). The
-//! [`crate::emitter::TraceEmitterState::emit_dict_lookup_prechecked`]
+//! `crate::emitter::TraceEmitterState::emit_dict_lookup_prechecked`
 //! dispatcher applies a soft cap so machine-code footprint stays
 //! bounded; see that callsite for the constant.
 //!

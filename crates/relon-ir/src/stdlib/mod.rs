@@ -32,7 +32,7 @@
 //!   * `min(a: Int, b: Int) -> Int` / `max(a: Int, b: Int) -> Int` —
 //!     two-arg numeric min/max via wasm `select`.
 //!   * `is_empty(s: String) -> Bool` — zero-length predicate, reusing
-//!     [`Op::ReadStringLen`] + [`Op::Eq`].
+//!     [`crate::ir::Op::ReadStringLen`] + [`crate::ir::Op::Eq`].
 //!
 //! Phase 4.c-2 scope (this phase):
 //!   * `concat(a: String, b: String) -> String` — allocate scratch,
@@ -71,19 +71,19 @@
 //! [`stdlib_closure_arg_signature`]) is re-exported here so downstream
 //! consumers see no API change.
 //!
-//! * [`signatures`] — [`StdlibFunction`] entry type + the stable
+//! * `signatures` — [`StdlibFunction`] entry type + the stable
 //!   `*_INDEX` constants pinning internal helper slots.
-//! * [`registry`] — [`builtin_stdlib`], the ordered list whose
+//! * `registry` — [`builtin_stdlib`], the ordered list whose
 //!   declaration order is part of the wasm wire format.
-//! * [`index`] — name / receiver / closure-arg lookup helpers.
-//! * [`defs`] — non-Unicode body builders (length / arithmetic /
+//! * `index` — name / receiver / closure-arg lookup helpers.
+//! * `defs` — non-Unicode body builders (length / arithmetic /
 //!   is_empty / concat / substring / starts_with / contains /
 //!   list_int_*) plus the shared `tt` op-tag helper.
-//! * [`case_fold`] — case-fold body builders (`upper` / `lower` /
+//! * `case_fold` — case-fold body builders (`upper` / `lower` /
 //!   `title` and locale variants) plus the `__casefold_lookup`,
 //!   `__is_combining_mark`, `__is_whitespace`,
 //!   `__full_casefold_lookup`, `__final_sigma_check` internal helpers.
-//! * [`normalization`] — UAX #15 NFD / NFKD / NFC / NFKC bodies plus
+//! * `normalization` — UAX #15 NFD / NFKD / NFC / NFKC bodies plus
 //!   the `__decomp_lookup`, `__ccc_lookup`, `__compose_lookup`
 //!   helpers.
 

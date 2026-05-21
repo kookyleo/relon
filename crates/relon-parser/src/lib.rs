@@ -19,7 +19,7 @@
 //! * [`cst`] / [`syntax`] — rowan CST, the single source of truth
 //!   for what input the parser accepts.
 //! * [`ast`] — typed wrappers over the CST nodes.
-//! * [`lower`] — CST → legacy [`Node`] / [`Expr`] / [`TokenKey`]
+//! * `lower` — CST → legacy [`Node`] / [`Expr`] / [`TokenKey`]
 //!   tree. The legacy tree is still public because the analyzer and
 //!   evaluator depend on its semantic shape; new consumers should
 //!   prefer the [`ast`] wrappers (cheap, ranged, error-tolerant).
@@ -81,11 +81,11 @@ impl ParseDocumentError {
 ///
 /// The entry point routes every call through the rowan CST
 /// ([`cst::parse_cst`]) first, then hands off to
-/// [`lower::lower_document`] for the typed-tree construction. The
+/// `lower::lower_document` for the typed-tree construction. The
 /// CST is the single source of truth for what input the parser
 /// accepts; downstream consumers (analyzer / evaluator / fmt / wasm
 /// / lsp / cli) keep seeing the same `Node` / `Expr` shape they did
-/// pre-rowan-rewrite. See [`lower`] for the migration design note.
+/// pre-rowan-rewrite. See the `lower` module for the migration design note.
 ///
 /// This is the strict-parsing entry point — any CST error or
 /// lowering failure surfaces as a typed [`ParseDocumentError`]. Use
@@ -139,7 +139,7 @@ pub struct ParsedDocument {
 ///
 /// Implementation: routes through [`cst::parse_cst`] (which never
 /// panics) and then walks the resulting CST, lowering every
-/// top-level expression child via [`lower::lower_document_node_v2`].
+/// top-level expression child via `lower::lower_document_node_v2`.
 /// CST `ERROR` spans + lowering misses are collected as
 /// [`ParseDiagnostic`]s with byte-accurate ranges.
 pub fn parse_document_recovering(source: &str) -> ParsedDocument {

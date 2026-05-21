@@ -2,7 +2,7 @@
 //!
 //! Currently `Result<T, E>` and `Option<T>`, both expressed as
 //! tagged-enum schemas (`Value::EnumSchema`) with a single value-payload
-//! field per non-unit variant. Seeding them in [`Context::new`] means
+//! field per non-unit variant. Seeding them in [`crate::Context::new`] means
 //! user code can write
 //!
 //! ```relon
