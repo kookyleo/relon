@@ -84,6 +84,110 @@ pub enum BcOp {
     /// `Trap` op forward so a hand-built buffer test can validate
     /// the trap-prong without going through arith overflow.
     Trap(BcTrapKind),
+
+    /// M2-B phase 3: invoke a host `#native` function.
+    ///
+    /// `[arg_count operands] -> [ret_ty value]`. The dispatcher:
+    ///
+    /// 1. Consults the installed `CapabilityGate` for `cap_bit`. A
+    ///    denial trips `BcVmError::CapabilityDenied { cap_bit }`
+    ///    before any args are observed.
+    /// 2. Looks up the host fn in the per-call `CapabilityVtable`
+    ///    native-slot table. An empty slot (no host registry wired up
+    ///    yet — M2-B phase 3 ships the dispatch shape but the host-fn
+    ///    pointer registry remains placeholder) also trips
+    ///    `BcVmError::CapabilityDenied { cap_bit }`.
+    /// 3. When implemented, the dispatcher pops `arg_count` operands
+    ///    in declaration order, invokes the host fn, and pushes the
+    ///    return value. Today the host slot is always empty so step
+    ///    3 is unreachable; the capability prong fires at step 1 / 2.
+    ///
+    /// `cap_bit == u32::MAX` (`relon_ir::NO_CAPABILITY_BIT`) means
+    /// "no capability required" — the gate consult is skipped and
+    /// the host fn would dispatch unconditionally if present.
+    CallNative {
+        /// Position of the `NativeImport` entry in the module's
+        /// imports table (re-emitted into bytecode for diagnostics
+        /// and for the future host-fn registry lookup).
+        import_idx: u32,
+        /// Number of operands the host fn consumes.
+        arg_count: u32,
+        /// Capability bit guarding the call. `u32::MAX` skips the gate.
+        cap_bit: u32,
+        /// IR-level return type — used to decide what to push back
+        /// on the operand stack. Today the dispatch path traps before
+        /// emitting a return value so the type is informational.
+        ret_ty: IrType,
+    },
+
+    /// M2-B phase 3: standalone capability consult — wasm
+    /// `Op::CheckCap` lower target. `[] -> []`. Consults the installed
+    /// `CapabilityGate` for `cap_bit`; denial trips
+    /// `BcVmError::CapabilityDenied { cap_bit }`. `cap_bit == u32::MAX`
+    /// is a no-op (matches `Op::CheckCap`'s wasm-elision semantics).
+    CheckCap {
+        /// Bit position in the `Capabilities` bitmap.
+        cap_bit: u32,
+    },
+
+    /// M2-B phase 3: scalar-pure stdlib dispatch — pops `arg_count`
+    /// operands, evaluates the matching [`BcStdlibKind`] handler, and
+    /// pushes the result. `arg_count` matches the handler's declared
+    /// arity; mismatches trip `BcVmError::StackUnderflow`.
+    ///
+    /// Reserved for stdlib bodies that operate on the bytecode VM's
+    /// i64-shaped slots without touching record memory — `int.abs`,
+    /// `int.min`, `int.max`. Wider stdlib (list / dict / string)
+    /// requires the buffer-protocol envelope and stays unsupported
+    /// per the M2-A scaffold.
+    CallStdlibScalar {
+        /// Which scalar-pure stdlib body to evaluate.
+        kind: BcStdlibKind,
+        /// Number of operands the handler pops.
+        arg_count: u32,
+    },
+
+    /// M2-B phase 3: read the pre-computed length of a constant
+    /// list / string slot. `[i64 len] -> [i64 len]` — a no-op against
+    /// the M2-A constant-fold representation (where `Op::ConstList*`
+    /// already lowers to `BcOp::ConstI64(len)`). Emitted by the
+    /// compile path when an IR `Op::Call { stdlib(length) }` would
+    /// have run after the fold; the op stays in the table as a
+    /// witness slot so the dispatch loop has a `length`-shaped
+    /// instruction to step over rather than synthesising one.
+    ListLen,
+}
+
+/// M2-B phase 3: scalar-pure stdlib handlers the bytecode VM can
+/// evaluate without record / list memory. Each variant pops the
+/// declared arity and pushes a single i64 result.
+///
+/// The set is deliberately narrow — anything that touches list
+/// elements / string bytes / dict entries needs the buffer-protocol
+/// envelope (phase 4). Extending this enum is a phase-4 task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BcStdlibKind {
+    /// `int.abs(i64) -> i64`. Pops one operand; pushes
+    /// `i64::wrapping_abs` of it (tree-walker parity; the cranelift
+    /// path emits a 2-op sequence that matches modulo wrapping).
+    IntAbs,
+    /// `int.min(i64, i64) -> i64`. Pops two operands; pushes the
+    /// signed min.
+    IntMin,
+    /// `int.max(i64, i64) -> i64`. Pops two operands; pushes the
+    /// signed max.
+    IntMax,
+}
+
+impl BcStdlibKind {
+    /// Declared arity. Used by the compile pass to validate
+    /// `arg_count` matches at lower time.
+    pub fn arity(self) -> u32 {
+        match self {
+            BcStdlibKind::IntAbs => 1,
+            BcStdlibKind::IntMin | BcStdlibKind::IntMax => 2,
+        }
+    }
 }
 
 /// Trap reasons the bytecode VM can raise without an extra runtime

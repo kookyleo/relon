@@ -65,6 +65,19 @@
 //!   per-call-site consult lands in phase 3 alongside IR coverage
 //!   expansion (see
 //!   `docs/internal/rfc-m2-b-bytecode-jit-integration-2026-05-21.md`).
+//!   **M2-B phase 3**: the `BcOp` table grows by four ops — the
+//!   IR-level `CallNative` / `CheckCap` lower targets and the
+//!   `CallStdlibScalar` / `ListLen` dispatch shapes. `BcOp::CallNative`
+//!   carries its `cap_bit` and consults the installed
+//!   `CapabilityGate` (or the legacy grant table) at op-dispatch
+//!   time, then traps with the new `BcVmError::NativeNotImplemented`
+//!   envelope when the capability prong passes but no host-fn
+//!   registry is wired (the registry itself is phase-4 work).
+//!   `BcOp::CheckCap` provides the standalone consult shape;
+//!   `BcOp::CallStdlibScalar { kind: IntAbs|IntMin|IntMax, ... }`
+//!   evaluates the three scalar-pure stdlib bodies inline so the
+//!   bytecode VM doesn't need to lift the IR inlining cost on every
+//!   call site. The full op-table surface lives in [`crate::op`].
 //! - **resource**: an instruction counter (`BcVmConfig::max_steps`)
 //!   plus a per-call deadline. Ticks once per bytecode op so the
 //!   tree-walker's `WasmStepLimitExceeded` shape is reachable.

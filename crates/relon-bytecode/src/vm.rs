@@ -16,7 +16,7 @@ use relon_ir::IrType;
 use relon_parser::TokenRange;
 use thiserror::Error;
 
-use crate::op::{BcFunction, BcOp, BcTrapKind, ExternalPc};
+use crate::op::{BcFunction, BcOp, BcStdlibKind, BcTrapKind, ExternalPc};
 
 /// Raw VM-value slot. The bytecode VM is homogeneous on `u64` so
 /// the dispatch arms don't switch on a tagged enum on every op.
@@ -270,6 +270,17 @@ pub enum BcVmError {
         /// Bytecode index of the offending op.
         bc_idx: usize,
     },
+    /// M2-B phase 3: `BcOp::CallNative` passed the capability prong
+    /// but the bytecode VM has no host-fn registry to invoke. The
+    /// phase-3 dispatch shape lands the consult sites; the host-fn
+    /// pointer wiring follows in phase 4. Callers that observe this
+    /// envelope today should route the source through cranelift /
+    /// tree-walker.
+    #[error("bytecode VM has no host-fn registry for import_idx {import_idx}")]
+    NativeNotImplemented {
+        /// The `NativeImport` slot the call targeted.
+        import_idx: u32,
+    },
 }
 
 impl BcVmError {
@@ -297,6 +308,12 @@ impl BcVmError {
             },
             BcVmError::StackUnderflow { bc_idx } => RuntimeError::Unsupported {
                 reason: format!("bytecode VM stack underflow at bc_idx {bc_idx}"),
+            },
+            BcVmError::NativeNotImplemented { import_idx } => RuntimeError::Unsupported {
+                reason: format!(
+                    "bytecode VM has no host-fn registry for native import_idx {import_idx}; \
+                     route through cranelift/tree-walker until phase 4 wiring lands"
+                ),
             },
         }
     }
@@ -632,6 +649,111 @@ impl BytecodeVm {
                 // through.
                 let v = stack.pop().unwrap_or(0);
                 return Ok(StepOutcome::Return(v));
+            }
+            BcOp::CallNative {
+                import_idx,
+                arg_count,
+                cap_bit,
+                ret_ty: _,
+            } => {
+                // M2-B phase 3: per-call-site capability consult.
+                //
+                // Order of operations matters — the gate consult runs
+                // **before** we touch the operand stack so a denial
+                // surfaces with the correct `cap_bit` regardless of
+                // arg-count mismatches. This matches the cranelift
+                // `check_cap` prologue's discipline: the host fn never
+                // observes any state when the capability prong fires.
+                if *cap_bit != u32::MAX {
+                    if let Err(err) = self.config.cap_vtable.consult_gate(*cap_bit) {
+                        return Err(BcVmError::CapabilityDenied {
+                            cap_bit: err.cap.bit_index(),
+                        });
+                    }
+                    // Belt-and-braces: when no gate is installed the
+                    // legacy grant-table path enforces the bit. An
+                    // ungranted bit on a `cap_bit`-tagged call surfaces
+                    // as the same `CapabilityDenied` shape.
+                    if self.config.cap_vtable.gate().is_none()
+                        && !self.config.cap_vtable.is_granted(*cap_bit)
+                    {
+                        return Err(BcVmError::CapabilityDenied { cap_bit: *cap_bit });
+                    }
+                }
+                // Phase 3 ships the gate / vtable consult shape; the
+                // host-fn pointer registry that would unfreeze the
+                // actual call lands alongside the wider native dispatch
+                // wire-up (phase 4). Until then a permitted
+                // `CallNative` traps with the dedicated
+                // `NativeNotImplemented` envelope so the differential
+                // harness sees a stable shape (vs. the historical
+                // `Unsupported` route taken by the unsupported-op
+                // bounce).
+                //
+                // We still drain `arg_count` operands so the surrounding
+                // op stream's stack discipline matches what a real
+                // dispatch would leave behind — this keeps the
+                // `stack_recipe` table valid in the deopt-resume path.
+                for _ in 0..*arg_count {
+                    pop(stack, bc_idx)?;
+                }
+                return Err(BcVmError::NativeNotImplemented {
+                    import_idx: *import_idx,
+                });
+            }
+            BcOp::CheckCap { cap_bit } => {
+                // M2-B phase 3: standalone capability consult. The
+                // wasm `Op::CheckCap` lower target — fires the gate
+                // consult without dispatching a call. `u32::MAX`
+                // (`NO_CAPABILITY_BIT`) is a no-op so the analyzer can
+                // emit unconditional `CheckCap` ops without forcing
+                // every backend to special-case the sentinel.
+                if *cap_bit != u32::MAX {
+                    if let Err(err) = self.config.cap_vtable.consult_gate(*cap_bit) {
+                        return Err(BcVmError::CapabilityDenied {
+                            cap_bit: err.cap.bit_index(),
+                        });
+                    }
+                    if self.config.cap_vtable.gate().is_none()
+                        && !self.config.cap_vtable.is_granted(*cap_bit)
+                    {
+                        return Err(BcVmError::CapabilityDenied { cap_bit: *cap_bit });
+                    }
+                }
+            }
+            BcOp::CallStdlibScalar { kind, arg_count } => {
+                // M2-B phase 3: scalar-pure stdlib dispatch. Pops the
+                // declared arity, evaluates the handler, pushes one
+                // i64 result. Arity mismatches between `kind.arity()`
+                // and `arg_count` are compile-time bugs but the
+                // dispatcher honours the encoded `arg_count` so the
+                // stack-recipe accounting stays consistent.
+                if kind.arity() != *arg_count {
+                    return Err(BcVmError::StackUnderflow { bc_idx });
+                }
+                match kind {
+                    BcStdlibKind::IntAbs => {
+                        let v = pop(stack, bc_idx)? as i64;
+                        stack.push(v.wrapping_abs() as u64);
+                    }
+                    BcStdlibKind::IntMin => {
+                        let rhs = pop(stack, bc_idx)? as i64;
+                        let lhs = pop(stack, bc_idx)? as i64;
+                        stack.push(lhs.min(rhs) as u64);
+                    }
+                    BcStdlibKind::IntMax => {
+                        let rhs = pop(stack, bc_idx)? as i64;
+                        let lhs = pop(stack, bc_idx)? as i64;
+                        stack.push(lhs.max(rhs) as u64);
+                    }
+                }
+            }
+            BcOp::ListLen => {
+                // M2-B phase 3: pre-computed length already sits on
+                // the stack as an i64 (the compile-pass constant-fold
+                // for `Op::ConstList*` stores the length verbatim).
+                // The op is a witness slot — leave the stack untouched
+                // and step over.
             }
             BcOp::Trap(kind) => match kind {
                 BcTrapKind::IndexOutOfBounds => return Err(BcVmError::IndexOutOfBounds),
