@@ -104,9 +104,16 @@ pub struct CraneliftAotEvaluator {
     /// lifetime so the function pointers in `entry_fn` /
     /// `closure_table` stay valid.
     _module: EntryBacking,
-    /// Raw function pointer to the JIT'd `run_main`. The exact shape
-    /// is tracked in [`EntryPtr`].
-    entry_fn: EntryPtr,
+    /// 2026-05-21 dispatch-boundary lever (d): de-tagged inline cache
+    /// of the legacy-shape entry pointer. Populated at construction
+    /// when the JIT produced a `LegacyI64Args`-shaped entry; `None`
+    /// for buffer-protocol evaluators. The legacy hot dispatch path
+    /// reads this field directly with one load instead of matching on
+    /// an `EntryPtr` enum discriminant on every invoke.
+    legacy_entry_cached: Option<LegacyEntryFn>,
+    /// 2026-05-21 dispatch-boundary lever (d): symmetric inline cache
+    /// for the buffer-protocol entry pointer. See `legacy_entry_cached`.
+    buffer_entry_cached: Option<BufferEntryFn>,
     /// Number of declared `#main` parameters. For the buffer-protocol
     /// shape this counts user fields (matching
     /// `main_schema.fields.len()`); for the legacy shape it counts
@@ -494,9 +501,14 @@ impl CraneliftAotEvaluator {
             .map(|bs| bs.main_schema.fields.len())
             .unwrap_or(schema_entry.entry_arity as usize);
 
+        let (legacy_entry_cached, buffer_entry_cached) = match entry_fn {
+            EntryPtr::Legacy(f) => (Some(f), None),
+            EntryPtr::Buffer(f) => (None, Some(f)),
+        };
         Ok(Self {
             _module: EntryBacking::Dlopen(loaded),
-            entry_fn,
+            legacy_entry_cached,
+            buffer_entry_cached,
             entry_arity: arity,
             param_names: schema_entry.param_names,
             entry_range,
@@ -887,9 +899,14 @@ impl CraneliftAotEvaluator {
             .map(|bs| bs.main_schema.fields.len())
             .unwrap_or(entry_arity);
 
+        let (legacy_entry_cached, buffer_entry_cached) = match entry_fn {
+            EntryPtr::Legacy(f) => (Some(f), None),
+            EntryPtr::Buffer(f) => (None, Some(f)),
+        };
         Ok(Self {
             _module: EntryBacking::Jit(module),
-            entry_fn,
+            legacy_entry_cached,
+            buffer_entry_cached,
             entry_arity: arity,
             param_names,
             entry_range,
@@ -1117,9 +1134,12 @@ impl CraneliftAotEvaluator {
             self.sandbox_state.reset_trap();
         }
         let state_ptr: *const SandboxState = Arc::as_ptr(&self.sandbox_state);
-        let entry = match self.entry_fn {
-            EntryPtr::Legacy(f) => f,
-            EntryPtr::Buffer(_) => {
+        // 2026-05-21 dispatch-boundary lever (d): use the de-tagged
+        // inline-cached entry pointer (single field load) instead of
+        // matching on the `entry_fn` enum discriminant each invoke.
+        let entry = match self.legacy_entry_cached {
+            Some(f) => f,
+            None => {
                 return Err(RuntimeError::Unsupported {
                     reason: "cranelift-native: invoke_legacy_entry called on buffer-protocol shape"
                         .into(),
@@ -1205,9 +1225,11 @@ impl CraneliftAotEvaluator {
             self.sandbox_state.install_scratch_base(scratch_base);
         }
         let state_ptr: *const SandboxState = Arc::as_ptr(&self.sandbox_state);
-        let entry = match self.entry_fn {
-            EntryPtr::Buffer(f) => f,
-            EntryPtr::Legacy(_) => {
+        // 2026-05-21 dispatch-boundary lever (d): de-tagged inline
+        // cache; see `invoke_legacy_entry` for the rationale.
+        let entry = match self.buffer_entry_cached {
+            Some(f) => f,
+            None => {
                 return Err(RuntimeError::Unsupported {
                     reason: "cranelift-native: invoke_buffer_entry called on legacy shape".into(),
                 });
