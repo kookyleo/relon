@@ -510,7 +510,7 @@ impl TreeWalkEvaluator {
             Expr::Bool(b) => Ok(Value::Bool(*b)),
             Expr::Int(i) => Ok(Value::Int(*i)),
             Expr::Float(f) => Ok(Value::Float(*f)),
-            Expr::String(s) => Ok(Value::String(s.clone())),
+            Expr::String(s) => Ok(Value::String(s.as_str().into())),
 
             Expr::List(elements) => {
                 let mut thunks = Vec::new();
@@ -598,7 +598,7 @@ impl TreeWalkEvaluator {
                                 TokenKey::String(s, _, _) => s.clone(),
                                 TokenKey::Dynamic(expr_node, _) => {
                                     match self.eval(expr_node, &dict_scope)? {
-                                        Value::String(s) => s,
+                                        Value::String(s) => s.into_string(),
                                         Value::Int(i) => i.to_string(),
                                         Value::Type(t) => {
                                             t.path.first().cloned().unwrap_or_default()
@@ -895,7 +895,7 @@ impl TreeWalkEvaluator {
                         }
                     }
                 }
-                Ok(Value::String(result))
+                Ok(Value::String(result.into()))
             }
             Expr::Type(t) => Ok(Value::Type(Box::new(t.clone()))),
             Expr::Wildcard => Ok(Value::Wildcard),
@@ -1895,7 +1895,9 @@ impl TreeWalkEvaluator {
                             }
                         };
                         Ok(Cow::Owned(
-                            s.chars().map(|c| Value::String(c.to_string())).collect(),
+                            s.chars()
+                                .map(|c| Value::String(c.to_string().into()))
+                                .collect(),
                         ))
                     }
                     "dict_entries" => {
@@ -1917,7 +1919,10 @@ impl TreeWalkEvaluator {
                             keys.into_iter()
                                 .filter_map(|k| {
                                     src_dict.map.get(k).map(|v| {
-                                        Value::list(vec![Value::String(k.clone()), v.clone()])
+                                        Value::list(vec![
+                                            Value::String(k.as_str().into()),
+                                            v.clone(),
+                                        ])
                                     })
                                 })
                                 .collect(),
@@ -2219,7 +2224,7 @@ impl TreeWalkEvaluator {
                     let key_str = match key {
                         TokenKey::String(s, _, _) => s.clone(),
                         TokenKey::Dynamic(expr_node, _) => match self.eval(expr_node, scope)? {
-                            Value::String(s) => s,
+                            Value::String(s) => s.into_string(),
                             Value::Int(i) => i.to_string(),
                             Value::Type(t) => t.path.first().cloned().unwrap_or_default(),
                             other => {
@@ -2287,7 +2292,7 @@ impl TreeWalkEvaluator {
                 TokenKey::Index(i, _) => i.to_string(),
                 TokenKey::Spread(_) => continue,
                 TokenKey::Dynamic(expr_node, _) => match self.eval(expr_node, scope)? {
-                    Value::String(s) => s,
+                    Value::String(s) => s.into_string(),
                     Value::Int(i) => i.to_string(),
                     Value::Type(t) => t.path.first().cloned().unwrap_or_default(),
                     other => {

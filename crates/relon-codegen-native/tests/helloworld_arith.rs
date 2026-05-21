@@ -108,7 +108,7 @@ fn type_mismatch_arg_surfaces_typed_error() {
     let evaluator = build_evaluator(ir);
     let mut args = HashMap::new();
     args.insert("x".to_string(), Value::Int(1));
-    args.insert("y".to_string(), Value::String("not an int".to_string()));
+    args.insert("y".to_string(), Value::String("not an int".into()));
     let err = evaluator.run_main(args).expect_err("type mismatch");
     let msg = format!("{err}");
     assert!(

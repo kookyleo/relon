@@ -981,12 +981,12 @@ fn tree_walker_stdlib_free_fn_surface() {
         ("#main() -> Bool\n\"hi\".is_empty()", Value::Bool(false)),
         (
             "#main() -> String\n\"foo\".concat(\"bar\")",
-            Value::String("foobar".to_string()),
+            Value::String("foobar".into()),
         ),
         // substring(s, start, len) — `(1, 3)` selects "ell".
         (
             "#main() -> String\n\"hello\".substring(1, 3)",
-            Value::String("ell".to_string()),
+            Value::String("ell".into()),
         ),
         (
             "#main() -> Bool\n\"hello world\".starts_with(\"hello\")",

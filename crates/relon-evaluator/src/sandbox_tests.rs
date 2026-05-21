@@ -594,7 +594,7 @@ fn gated_fn_rejected_in_sandbox_without_allowlist() {
             _args: crate::native_fn::NativeArgs,
             _range: relon_parser::TokenRange,
         ) -> Result<Value, RuntimeError> {
-            Ok(Value::String("contents".to_string()))
+            Ok(Value::String("contents".into()))
         }
     }
 
@@ -623,7 +623,7 @@ fn gated_fn_permitted_when_bit_granted() {
             _args: crate::native_fn::NativeArgs,
             _range: relon_parser::TokenRange,
         ) -> Result<Value, RuntimeError> {
-            Ok(Value::String("contents".to_string()))
+            Ok(Value::String("contents".into()))
         }
     }
 
@@ -643,7 +643,7 @@ fn gated_fn_permitted_when_bit_granted() {
     };
     assert_eq!(
         d.map.get("data").unwrap(),
-        &Value::String("contents".to_string())
+        &Value::String("contents".into())
     );
 }
 

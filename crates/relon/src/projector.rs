@@ -46,7 +46,7 @@ impl Projector for JsonProjector {
                     .map(serde_json::Value::Number)
                     .ok_or(crate::Error::NonFiniteFloat(raw))
             }
-            Value::String(s) => Ok(serde_json::Value::String(s.clone())),
+            Value::String(s) => Ok(serde_json::Value::String(s.as_str().to_owned())),
             Value::List(items) => {
                 let mut out = Vec::with_capacity(items.len());
                 for item in items.iter() {

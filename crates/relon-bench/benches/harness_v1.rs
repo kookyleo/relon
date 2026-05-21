@@ -379,7 +379,7 @@ fn bench_method_dispatch(c: &mut Criterion) {
             let eval = TreeWalkEvaluator::new(Arc::clone(&ctx));
             let scope = Arc::new(Scope::default());
             let mut args = HashMap::with_capacity(1);
-            args.insert("s".to_string(), Value::String("abc".to_string()));
+            args.insert("s".to_string(), Value::String("abc".into()));
             let r = eval.run_main(&scope, black_box(args)).expect("run_main");
             black_box((ctx, r))
         });

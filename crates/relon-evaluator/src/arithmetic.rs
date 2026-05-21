@@ -132,8 +132,19 @@ impl TreeWalkEvaluator {
                 merged.deep_merge(&r);
                 Ok(merged)
             }
-            (Operator::Add, Value::String(a), b) => Ok(Value::String(format!("{}{}", a, b))),
-            (Operator::Add, a, Value::String(b)) => Ok(Value::String(format!("{}{}", a, b))),
+            // String concat hot path. The `format!` route through `&str` /
+            // `Display` keeps the existing semantics, then we hand the
+            // resulting `String` to `SmolStr::from` — payloads ≤
+            // `SMOL_STR_INLINE_CAP` (22 B) stay inline and the heap
+            // `String` allocation is freed immediately after the inline
+            // copy, eliminating the long-lived alloc on short concat
+            // intermediates (W3 / W4-style workloads).
+            (Operator::Add, Value::String(a), b) => {
+                Ok(Value::String(format!("{}{}", a.as_str(), b).into()))
+            }
+            (Operator::Add, a, Value::String(b)) => {
+                Ok(Value::String(format!("{}{}", a, b.as_str()).into()))
+            }
             (Operator::Add | Operator::Sub | Operator::Mul, a, b) => {
                 // Phase C operator lowering: a branded value whose
                 // schema derives Addable / Subtractable / Multiplicable
@@ -478,7 +489,7 @@ impl TreeWalkEvaluator {
         }
         // Auto-derive fallback: serialize the dict via serde_json.
         match serde_json::to_string(receiver) {
-            Ok(s) => Ok(Some(Value::String(s))),
+            Ok(s) => Ok(Some(Value::String(s.into()))),
             Err(_) => Ok(None),
         }
     }
