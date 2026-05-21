@@ -31,7 +31,14 @@ pub mod cst;
 pub mod directive;
 pub mod fast_path;
 pub mod lex;
-pub mod lower;
+// `lower` is an implementation detail: it owns the CST → legacy `Node`
+// translation that backs `parse_document` / `parse_document_recovering`.
+// Downstream callers should only depend on those entry points (and the
+// resulting `Node` / `Expr` tree); the lowering walker, partial-recovery
+// scope guard, and offset-translation helpers are subject to change as
+// the rowan rewrite continues and are deliberately not part of the
+// public API surface.
+pub(crate) mod lower;
 pub mod source;
 pub mod syntax;
 pub mod token;
