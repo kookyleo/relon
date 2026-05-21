@@ -1107,13 +1107,13 @@ impl CraneliftAotEvaluator {
     /// shield is now `cfg(debug_assertions)`-gated. Production /
     /// release builds call the JIT entry directly because:
     ///
-    /// * cranelift codegen routes every guarded op through `cond_trap`
-    ///   + a recorded `trap_code` — these become hardware traps
+    /// - cranelift codegen routes every guarded op through `cond_trap`
+    ///   plus a recorded `trap_code` — these become hardware traps
     ///   intercepted by the signal-hook handler, not Rust panics.
-    /// * Helper-call symbols (`relon_now`, `relon_raise_trap`,
+    /// - Helper-call symbols (`relon_now`, `relon_raise_trap`,
     ///   `relon_cap_lookup`) are audited to never panic on their hot
     ///   paths; they return error codes via the sandbox state instead.
-    /// * The thread-local signal slot (`dispatch_post` reads it before
+    /// - The thread-local signal slot (`dispatch_post` reads it before
     ///   the trap_code) catches SIGSEGV / SIGFPE / SIGILL even without
     ///   `catch_unwind`.
     ///
