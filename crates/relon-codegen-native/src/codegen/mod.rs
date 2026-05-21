@@ -33,24 +33,34 @@ use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::types::{I32, I64};
 use cranelift_codegen::ir::{
     AbiParam, BlockArg, BlockCall, Function, GlobalValue, Inst, InstBuilder, JumpTableData,
-    MemFlags, SigRef, Signature, StackSlotData, StackSlotKind, TrapCode, UserFuncName,
-    Value as CValue,
+    MemFlags, SigRef, Signature, StackSlotData, StackSlotKind, UserFuncName, Value as CValue,
 };
 use cranelift_codegen::isa::CallConv;
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_codegen::Context as CodegenContext;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_jit::{JITBuilder, JITModule};
-use cranelift_module::{DataDescription, DataId, Linkage, Module as CrModule};
+use cranelift_module::{DataId, Linkage, Module as CrModule};
 
 use relon_ir::ir::{IrType, Module as IrModule, Op, TaggedOp};
 
 use crate::error::CraneliftError;
 use crate::sandbox::{
     SandboxConfig, TrapKind, STATE_OFFSET_ARENA_BASE, STATE_OFFSET_ARENA_LEN,
-    STATE_OFFSET_SCRATCH_BASE, STATE_OFFSET_SCRATCH_CURSOR, STATE_OFFSET_TAIL_CURSOR,
+    STATE_OFFSET_TAIL_CURSOR,
 };
-use crate::vtable::{VtableSlot, VTABLE_BYTES, VTABLE_SYMBOL};
+use crate::vtable::{VtableSlot, VTABLE_SYMBOL};
+
+mod arith;
+mod const_pool;
+mod guard;
+mod memory;
+
+use const_pool::ConstPool;
+use guard::{
+    declare_vtable_data, emit_indirect_host_call, make_cap_lookup_signature, make_now_signature,
+    make_raise_trap_signature,
+};
 
 /// Output of a successful compile: a JIT module plus the entry's
 /// function ID so the host can resolve a raw function pointer through
@@ -87,333 +97,6 @@ pub struct CompiledModule {
     /// `cranelift-object` pipeline emits the symbol as `Linkage::Export`
     /// so the host's `dlsym` round-trip resolves it after `dlopen`.
     pub vtable_data_id: cranelift_module::DataId,
-}
-
-/// Per-module const-pool layout. Maps each IR-level `idx` referenced
-/// by `Op::ConstString` / `Op::ConstList*` to its byte offset inside
-/// the const-data blob shipped on the [`CompiledModule`].
-#[derive(Debug, Default, Clone)]
-struct ConstPool {
-    /// String pool: `idx -> byte offset within `bytes`.
-    string_offsets: HashMap<u32, u32>,
-    /// List<Int> pool.
-    list_int_offsets: HashMap<u32, u32>,
-    /// List<Float> pool.
-    list_float_offsets: HashMap<u32, u32>,
-    /// List<Bool> pool.
-    list_bool_offsets: HashMap<u32, u32>,
-    /// Materialised bytes in record order. Cranelift code emits
-    /// `i32.const <offset>` so the value at runtime is the buffer-
-    /// relative address.
-    bytes: Vec<u8>,
-    /// Lazily-laid-out Unicode case-fold tables. Each entry is set
-    /// when the body references `Op::CaseFoldTableAddr { upper }`.
-    case_fold_upper_offset: Option<u32>,
-    case_fold_lower_offset: Option<u32>,
-    /// Lazily-laid-out combining-mark + whitespace ranges tables.
-    combining_marks_offset: Option<u32>,
-    whitespace_offset: Option<u32>,
-    /// Unicode normalization tables (NFD / NFKD decompositions,
-    /// Canonical_Combining_Class, canonical composition pairs).
-    decomp_nfd_offset: Option<u32>,
-    decomp_nfkd_offset: Option<u32>,
-    ccc_offset: Option<u32>,
-    composition_offset: Option<u32>,
-    /// Full multi-codepoint case-folding tables (UAX #21).
-    full_case_fold_upper_offset: Option<u32>,
-    full_case_fold_lower_offset: Option<u32>,
-    cased_ranges_offset: Option<u32>,
-    case_ignorable_ranges_offset: Option<u32>,
-    /// Locale-aware Turkish / Azerbaijani override tables.
-    turkish_upper_offset: Option<u32>,
-    turkish_lower_offset: Option<u32>,
-}
-
-impl ConstPool {
-    /// Build the pool from a scan of the entry's IR body. Each unique
-    /// `idx` ends up with a `[len:u32 LE][payload]` record laid out
-    /// in declaration order, aligned to 8 to match the wasm side.
-    fn from_module(module: &IrModule) -> Result<Self, CraneliftError> {
-        let mut pool = ConstPool::default();
-        for func in &module.funcs {
-            pool.collect_body(&func.body)?;
-        }
-        Ok(pool)
-    }
-
-    fn collect_body(&mut self, body: &[TaggedOp]) -> Result<(), CraneliftError> {
-        for tagged in body {
-            self.collect_op(&tagged.op)?;
-        }
-        Ok(())
-    }
-
-    fn collect_op(&mut self, op: &Op) -> Result<(), CraneliftError> {
-        match op {
-            Op::ConstString { idx, value } => {
-                if self.string_offsets.contains_key(idx) {
-                    return Ok(());
-                }
-                self.align_to(4);
-                let off = u32::try_from(self.bytes.len())
-                    .map_err(|_| CraneliftError::Codegen("const pool exceeds u32 range".into()))?;
-                let len = u32::try_from(value.len()).map_err(|_| {
-                    CraneliftError::Codegen("ConstString length exceeds u32 range".into())
-                })?;
-                self.bytes.extend_from_slice(&len.to_le_bytes());
-                self.bytes.extend_from_slice(value.as_bytes());
-                self.string_offsets.insert(*idx, off);
-            }
-            Op::ConstListInt { idx, elements } => {
-                if self.list_int_offsets.contains_key(idx) {
-                    return Ok(());
-                }
-                self.align_to(8);
-                let off = u32::try_from(self.bytes.len())
-                    .map_err(|_| CraneliftError::Codegen("const pool exceeds u32 range".into()))?;
-                let len = u32::try_from(elements.len()).map_err(|_| {
-                    CraneliftError::Codegen("ConstListInt length exceeds u32 range".into())
-                })?;
-                self.bytes.extend_from_slice(&len.to_le_bytes());
-                self.bytes.extend_from_slice(&[0u8; 4]); // pad to 8
-                for e in elements {
-                    self.bytes.extend_from_slice(&e.to_le_bytes());
-                }
-                self.list_int_offsets.insert(*idx, off);
-            }
-            Op::ConstListFloat { idx, elements } => {
-                if self.list_float_offsets.contains_key(idx) {
-                    return Ok(());
-                }
-                self.align_to(8);
-                let off = u32::try_from(self.bytes.len())
-                    .map_err(|_| CraneliftError::Codegen("const pool exceeds u32 range".into()))?;
-                let len = u32::try_from(elements.len()).map_err(|_| {
-                    CraneliftError::Codegen("ConstListFloat length exceeds u32 range".into())
-                })?;
-                self.bytes.extend_from_slice(&len.to_le_bytes());
-                self.bytes.extend_from_slice(&[0u8; 4]); // pad to 8
-                for e in elements {
-                    self.bytes.extend_from_slice(&e.to_le_bytes());
-                }
-                self.list_float_offsets.insert(*idx, off);
-            }
-            Op::ConstListBool { idx, elements } => {
-                if self.list_bool_offsets.contains_key(idx) {
-                    return Ok(());
-                }
-                self.align_to(4);
-                let off = u32::try_from(self.bytes.len())
-                    .map_err(|_| CraneliftError::Codegen("const pool exceeds u32 range".into()))?;
-                let len = u32::try_from(elements.len()).map_err(|_| {
-                    CraneliftError::Codegen("ConstListBool length exceeds u32 range".into())
-                })?;
-                self.bytes.extend_from_slice(&len.to_le_bytes());
-                for e in elements {
-                    self.bytes.push(if *e { 1 } else { 0 });
-                }
-                self.list_bool_offsets.insert(*idx, off);
-            }
-            Op::CaseFoldTableAddr { upper } => {
-                let slot = if *upper {
-                    &mut self.case_fold_upper_offset
-                } else {
-                    &mut self.case_fold_lower_offset
-                };
-                if slot.is_none() {
-                    self.align_to(4);
-                    let off = u32::try_from(self.bytes.len()).map_err(|_| {
-                        CraneliftError::Codegen("const pool exceeds u32 range".into())
-                    })?;
-                    let table: &[(u32, u32)] = if *upper {
-                        relon_ir::case_folding::simple_upper_folding()
-                    } else {
-                        relon_ir::case_folding::simple_lower_folding()
-                    };
-                    let bytes = relon_ir::case_folding::encode_table_bytes(table);
-                    self.bytes.extend_from_slice(&bytes);
-                    if *upper {
-                        self.case_fold_upper_offset = Some(off);
-                    } else {
-                        self.case_fold_lower_offset = Some(off);
-                    }
-                }
-            }
-            Op::CombiningMarkRangesAddr if self.combining_marks_offset.is_none() => {
-                self.align_to(4);
-                let off = u32::try_from(self.bytes.len())
-                    .map_err(|_| CraneliftError::Codegen("const pool exceeds u32 range".into()))?;
-                let table = relon_ir::combining_marks::combining_mark_ranges();
-                let bytes = relon_ir::combining_marks::encode_ranges_bytes(table);
-                self.bytes.extend_from_slice(&bytes);
-                self.combining_marks_offset = Some(off);
-            }
-            Op::WhitespaceRangesAddr if self.whitespace_offset.is_none() => {
-                self.align_to(4);
-                let off = u32::try_from(self.bytes.len())
-                    .map_err(|_| CraneliftError::Codegen("const pool exceeds u32 range".into()))?;
-                let table = relon_ir::whitespace::non_ascii_whitespace_ranges();
-                let bytes = relon_ir::whitespace::encode_ranges_bytes(table);
-                self.bytes.extend_from_slice(&bytes);
-                self.whitespace_offset = Some(off);
-            }
-            Op::DecompTableAddr { compatibility } => {
-                let slot = if *compatibility {
-                    &mut self.decomp_nfkd_offset
-                } else {
-                    &mut self.decomp_nfd_offset
-                };
-                if slot.is_none() {
-                    self.align_to(4);
-                    let off = u32::try_from(self.bytes.len()).map_err(|_| {
-                        CraneliftError::Codegen("const pool exceeds u32 range".into())
-                    })?;
-                    let (index, payload) = if *compatibility {
-                        (
-                            relon_ir::normalization_data::NFKD_INDEX,
-                            relon_ir::normalization_data::NFKD_POOL,
-                        )
-                    } else {
-                        (
-                            relon_ir::normalization_data::NFD_INDEX,
-                            relon_ir::normalization_data::NFD_POOL,
-                        )
-                    };
-                    let bytes = relon_ir::normalization::encode_decomp_table_bytes(index, payload);
-                    self.bytes.extend_from_slice(&bytes);
-                    if *compatibility {
-                        self.decomp_nfkd_offset = Some(off);
-                    } else {
-                        self.decomp_nfd_offset = Some(off);
-                    }
-                }
-            }
-            Op::CccTableAddr if self.ccc_offset.is_none() => {
-                self.align_to(4);
-                let off = u32::try_from(self.bytes.len())
-                    .map_err(|_| CraneliftError::Codegen("const pool exceeds u32 range".into()))?;
-                let bytes = relon_ir::normalization::encode_ccc_table_bytes(
-                    relon_ir::normalization_data::CCC_TABLE,
-                );
-                self.bytes.extend_from_slice(&bytes);
-                self.ccc_offset = Some(off);
-            }
-            Op::CompositionTableAddr if self.composition_offset.is_none() => {
-                self.align_to(4);
-                let off = u32::try_from(self.bytes.len())
-                    .map_err(|_| CraneliftError::Codegen("const pool exceeds u32 range".into()))?;
-                let bytes = relon_ir::normalization::encode_composition_table_bytes(
-                    relon_ir::normalization_data::COMPOSITION_PAIRS,
-                );
-                self.bytes.extend_from_slice(&bytes);
-                self.composition_offset = Some(off);
-            }
-            Op::FullCaseFoldTableAddr { upper } => {
-                let slot = if *upper {
-                    &mut self.full_case_fold_upper_offset
-                } else {
-                    &mut self.full_case_fold_lower_offset
-                };
-                if slot.is_none() {
-                    self.align_to(4);
-                    let off = u32::try_from(self.bytes.len()).map_err(|_| {
-                        CraneliftError::Codegen("const pool exceeds u32 range".into())
-                    })?;
-                    let table = if *upper {
-                        relon_ir::full_case_folding::full_upper_folding()
-                    } else {
-                        relon_ir::full_case_folding::full_lower_folding()
-                    };
-                    let bytes = relon_ir::full_case_folding::encode_full_table_bytes(table);
-                    self.bytes.extend_from_slice(&bytes);
-                    if *upper {
-                        self.full_case_fold_upper_offset = Some(off);
-                    } else {
-                        self.full_case_fold_lower_offset = Some(off);
-                    }
-                }
-            }
-            Op::CasedRangesAddr if self.cased_ranges_offset.is_none() => {
-                self.align_to(4);
-                let off = u32::try_from(self.bytes.len())
-                    .map_err(|_| CraneliftError::Codegen("const pool exceeds u32 range".into()))?;
-                let table = relon_ir::full_case_folding::cased_ranges();
-                let bytes = relon_ir::full_case_folding::encode_ranges_bytes(table);
-                self.bytes.extend_from_slice(&bytes);
-                self.cased_ranges_offset = Some(off);
-            }
-            Op::CaseIgnorableRangesAddr if self.case_ignorable_ranges_offset.is_none() => {
-                self.align_to(4);
-                let off = u32::try_from(self.bytes.len())
-                    .map_err(|_| CraneliftError::Codegen("const pool exceeds u32 range".into()))?;
-                let table = relon_ir::full_case_folding::case_ignorable_ranges();
-                let bytes = relon_ir::full_case_folding::encode_ranges_bytes(table);
-                self.bytes.extend_from_slice(&bytes);
-                self.case_ignorable_ranges_offset = Some(off);
-            }
-            Op::TurkishCaseFoldTableAddr { upper } => {
-                let slot = if *upper {
-                    &mut self.turkish_upper_offset
-                } else {
-                    &mut self.turkish_lower_offset
-                };
-                if slot.is_none() {
-                    self.align_to(4);
-                    let off = u32::try_from(self.bytes.len()).map_err(|_| {
-                        CraneliftError::Codegen("const pool exceeds u32 range".into())
-                    })?;
-                    let table = if *upper {
-                        relon_ir::full_case_folding::turkish_upper_folding()
-                    } else {
-                        relon_ir::full_case_folding::turkish_lower_folding()
-                    };
-                    let bytes = relon_ir::full_case_folding::encode_simple_view_bytes(table);
-                    self.bytes.extend_from_slice(&bytes);
-                    if *upper {
-                        self.turkish_upper_offset = Some(off);
-                    } else {
-                        self.turkish_lower_offset = Some(off);
-                    }
-                }
-            }
-            // Recurse into structured bodies so nested ConstStrings
-            // (e.g. inside If arms or Block / Loop bodies) get
-            // picked up too.
-            Op::If {
-                then_body,
-                else_body,
-                ..
-            } => {
-                self.collect_body(then_body)?;
-                self.collect_body(else_body)?;
-            }
-            Op::Block { body, .. } | Op::Loop { body, .. } => {
-                self.collect_body(body)?;
-            }
-            Op::Call { fn_index, .. } => {
-                // The cranelift backend inlines bundled stdlib bodies.
-                // Recurse into the callee so its `ConstString` /
-                // `CaseFoldTableAddr` references contribute to the
-                // pool before the entry body is lowered. F-D2-G:
-                // `.body()` lazily forces the op stream on first
-                // touch — the same callee revisited later picks the
-                // cached vector for free.
-                let stdlib = relon_ir::stdlib::builtin_stdlib();
-                if let Some(callee) = stdlib.get(*fn_index as usize) {
-                    self.collect_body(callee.body())?;
-                }
-            }
-            _ => {}
-        }
-        Ok(())
-    }
-
-    fn align_to(&mut self, align: usize) {
-        let rem = self.bytes.len() % align;
-        if rem != 0 {
-            self.bytes.resize(self.bytes.len() + (align - rem), 0);
-        }
-    }
 }
 
 /// How the host trampoline talks to the JIT entry.
@@ -457,30 +140,6 @@ fn is_buffer_protocol_signature(params: &[IrType], ret: IrType) -> bool {
             IrType::I64
         ]
     ) && matches!(ret, IrType::I32)
-}
-
-/// Trap codes the cranelift lowering emits via `trap` /
-/// `trapnz` / `trapz`. Aligned with [`TrapKind`] so the host
-/// translates without a translation table.
-///
-/// v5-beta-1 uses cranelift's intrinsic `trap` instruction only for
-/// guaranteed-fatal paths (Unreachable). Every guard reachable by
-/// the lowered code (divide-by-zero, bounds, capability, resource)
-/// routes through the `raise_trap` host helper + early-return
-/// sequence instead, because:
-///
-/// 1. `cranelift_codegen::ir::trap` emits a `ud2` (SIGILL) on x86
-///    Linux which Rust's panic runtime cannot intercept through
-///    `catch_unwind`. Routing the trap through a host helper lets
-///    us record the trap code in `SandboxState::trap_code` and
-///    return a sentinel zero, which the trampoline interprets as
-///    "trap fired — translate via the recorded code".
-/// 2. Real `sigsetjmp` support is on the v5-beta-2 roadmap; until
-///    then this is the cleanest path that preserves the typed
-///    `RuntimeError` surface on every supported target.
-#[allow(dead_code)]
-fn trap_code(kind: TrapKind) -> TrapCode {
-    TrapCode::user(kind as u8).expect("TrapKind discriminant is non-zero")
 }
 
 /// Build a cranelift JIT module and lower the IR's entry function
@@ -1254,94 +913,6 @@ fn emit_hot_counter_inject(
     // Continue with the normal block.
     builder.switch_to_block(normal_block);
     builder.seal_block(normal_block);
-}
-
-/// Build the cranelift signature for the `RelonRaiseTrap` vtable
-/// slot: `extern "C" fn(state: *const SandboxState, code: i64)`.
-fn make_raise_trap_signature(pointer_ty: cranelift_codegen::ir::Type) -> Signature {
-    let mut sig = Signature::new(CallConv::SystemV);
-    sig.params.push(AbiParam::new(pointer_ty));
-    sig.params.push(AbiParam::new(I64));
-    sig
-}
-
-/// Build the cranelift signature for the `RelonNow` vtable slot:
-/// `extern "C" fn(state: *const SandboxState) -> i64`.
-fn make_now_signature(pointer_ty: cranelift_codegen::ir::Type) -> Signature {
-    let mut sig = Signature::new(CallConv::SystemV);
-    sig.params.push(AbiParam::new(pointer_ty));
-    sig.returns.push(AbiParam::new(I64));
-    sig
-}
-
-/// Build the cranelift signature for the `RelonCapLookup` vtable
-/// slot: `extern "C" fn(state: *const SandboxState, cap_bit: i32) ->
-/// *const u8`.
-fn make_cap_lookup_signature(pointer_ty: cranelift_codegen::ir::Type) -> Signature {
-    let mut sig = Signature::new(CallConv::SystemV);
-    sig.params.push(AbiParam::new(pointer_ty));
-    sig.params.push(AbiParam::new(I32));
-    sig.returns.push(AbiParam::new(pointer_ty));
-    sig
-}
-
-/// Declare the `__relon_capability_vtable` data symbol on the given
-/// module. Reserves [`VTABLE_BYTES`] of zero-initialised space so the
-/// host can populate the slots post-finalize (JIT) or post-dlopen
-/// (cranelift-object).
-///
-/// Linkage rules:
-/// - `JITModule`: `Linkage::Local` — the JIT resolves the symbol by
-///   `DataId` rather than by name, so the linkage is advisory.
-/// - `ObjectModule`: `Linkage::Export` — the ELF needs the symbol in
-///   `.dynsym` so `dlsym` can find it from the host side.
-///
-/// We pick `Export` here because both backends accept it; the JIT's
-/// `get_finalized_data` works either way.
-fn declare_vtable_data<M: CrModule>(module: &mut M) -> Result<DataId, CraneliftError> {
-    // `writable = true` because the host populates the slots
-    // post-link. `tls = false` — single-process shared vtable.
-    let data_id = module
-        .declare_data(
-            VTABLE_SYMBOL,
-            Linkage::Export,
-            /*writable=*/ true,
-            /*tls=*/ false,
-        )
-        .map_err(|e| CraneliftError::ModuleDefine(format!("declare vtable data: {e}")))?;
-    let mut desc = DataDescription::new();
-    desc.define_zeroinit(VTABLE_BYTES);
-    module
-        .define_data(data_id, &desc)
-        .map_err(|e| CraneliftError::ModuleDefine(format!("define vtable data: {e}")))?;
-    Ok(data_id)
-}
-
-/// Emit an indirect host-helper call: load the function pointer from
-/// the vtable slot, then `call_indirect` with the supplied signature.
-///
-/// Used both inside `Codegen` (for body-level helper calls) and in
-/// the `compile_module_with` driver (to lower the trap_block tail).
-/// Centralising the load sequence keeps the codegen output uniform
-/// across entry / lambda / trap-block call sites.
-fn emit_indirect_host_call(
-    builder: &mut FunctionBuilder<'_>,
-    vtable_gv: GlobalValue,
-    pointer_ty: cranelift_codegen::ir::Type,
-    slot: VtableSlot,
-    sig_ref: SigRef,
-    args: &[CValue],
-) -> Inst {
-    // Materialise the vtable base address in the function.
-    let vtable_base = builder.ins().global_value(pointer_ty, vtable_gv);
-    // Load the slot's host fn pointer.
-    let fn_ptr = builder.ins().load(
-        pointer_ty,
-        MemFlags::trusted(),
-        vtable_base,
-        slot.offset_bytes(),
-    );
-    builder.ins().call_indirect(sig_ref, fn_ptr, args)
 }
 
 /// Map a generic IR type to its cranelift slot type. Used by the
@@ -2613,18 +2184,7 @@ impl<'a, 'b> Codegen<'a, 'b> {
                 let v = self.pop()?;
                 self.set_let(mapped, *ty, v);
             }
-            Op::Add(IrType::I64) => {
-                let b = self.pop()?;
-                let a = self.pop()?;
-                // Use sadd_overflow + cond_trap so signed overflow
-                // surfaces as `NumericOverflow` (matching the tree-
-                // walker's strict semantics). The wasm-AOT backend
-                // wraps silently — cranelift differs deliberately to
-                // close the differential corpus.
-                let (r, of) = self.builder.ins().sadd_overflow(a, b);
-                self.cond_trap(of, TrapKind::NumericOverflow);
-                self.push(r);
-            }
+            Op::Add(IrType::I64) => self.emit_add_i64()?,
             // F-D7-D: `Op::Add(IrType::String)` (emitted by the IR
             // lowering pass for source-side `s + t` where both sides
             // are `String`) routes through the same inlined `concat`
@@ -2642,46 +2202,10 @@ impl<'a, 'b> Codegen<'a, 'b> {
                 let param_tys = [IrType::String, IrType::String];
                 self.emit_call_stdlib(concat_idx, 2, &param_tys, IrType::String)?;
             }
-            Op::Sub(IrType::I64) => {
-                let b = self.pop()?;
-                let a = self.pop()?;
-                let (r, of) = self.builder.ins().ssub_overflow(a, b);
-                self.cond_trap(of, TrapKind::NumericOverflow);
-                self.push(r);
-            }
-            Op::Mul(IrType::I64) => {
-                let b = self.pop()?;
-                let a = self.pop()?;
-                let (r, of) = self.builder.ins().smul_overflow(a, b);
-                self.cond_trap(of, TrapKind::NumericOverflow);
-                self.push(r);
-            }
-            Op::Div(IrType::I64) => {
-                let b = self.pop()?;
-                let a = self.pop()?;
-                if self.sandbox.div_check {
-                    // Trap when divisor == 0. The cond_trap helper
-                    // routes through `raise_trap` + early return so
-                    // the trap is observable through the typed
-                    // `RuntimeError` channel rather than SIGFPE/SIGILL.
-                    let zero = self.builder.ins().iconst(I64, 0);
-                    let cmp = self.builder.ins().icmp(IntCC::Equal, b, zero);
-                    self.cond_trap(cmp, TrapKind::DivisionByZero);
-                }
-                let r = self.builder.ins().sdiv(a, b);
-                self.push(r);
-            }
-            Op::Mod(IrType::I64) => {
-                let b = self.pop()?;
-                let a = self.pop()?;
-                if self.sandbox.div_check {
-                    let zero = self.builder.ins().iconst(I64, 0);
-                    let cmp = self.builder.ins().icmp(IntCC::Equal, b, zero);
-                    self.cond_trap(cmp, TrapKind::DivisionByZero);
-                }
-                let r = self.builder.ins().srem(a, b);
-                self.push(r);
-            }
+            Op::Sub(IrType::I64) => self.emit_sub_i64()?,
+            Op::Mul(IrType::I64) => self.emit_mul_i64()?,
+            Op::Div(IrType::I64) => self.emit_div_i64()?,
+            Op::Mod(IrType::I64) => self.emit_mod_i64()?,
             Op::Eq(IrType::I64) => self.emit_cmp(IntCC::Equal)?,
             Op::Ne(IrType::I64) => self.emit_cmp(IntCC::NotEqual)?,
             Op::Lt(IrType::I64) => self.emit_cmp(IntCC::SignedLessThan)?,
@@ -2824,58 +2348,13 @@ impl<'a, 'b> Codegen<'a, 'b> {
             // bodies for pointer / length arithmetic against the
             // wasm linear-memory model). Same semantics as the I64
             // variants but on cranelift's `I32` type.
-            Op::Add(IrType::I32) => {
-                let b = self.pop()?;
-                let a = self.pop()?;
-                let r = self.builder.ins().iadd(a, b);
-                self.push(r);
-            }
-            Op::Sub(IrType::I32) => {
-                let b = self.pop()?;
-                let a = self.pop()?;
-                let r = self.builder.ins().isub(a, b);
-                self.push(r);
-            }
-            Op::Mul(IrType::I32) => {
-                let b = self.pop()?;
-                let a = self.pop()?;
-                let r = self.builder.ins().imul(a, b);
-                self.push(r);
-            }
-            Op::BitAnd(IrType::I32) => {
-                let b = self.pop()?;
-                let a = self.pop()?;
-                let r = self.builder.ins().band(a, b);
-                self.push(r);
-            }
-            Op::Div(IrType::I32) => {
-                let b = self.pop()?;
-                let a = self.pop()?;
-                if self.sandbox.div_check {
-                    let zero = self.builder.ins().iconst(I32, 0);
-                    let cmp = self.builder.ins().icmp(IntCC::Equal, b, zero);
-                    self.cond_trap(cmp, TrapKind::DivisionByZero);
-                }
-                let r = self.builder.ins().sdiv(a, b);
-                self.push(r);
-            }
-            Op::Mod(IrType::I32) => {
-                let b = self.pop()?;
-                let a = self.pop()?;
-                if self.sandbox.div_check {
-                    let zero = self.builder.ins().iconst(I32, 0);
-                    let cmp = self.builder.ins().icmp(IntCC::Equal, b, zero);
-                    self.cond_trap(cmp, TrapKind::DivisionByZero);
-                }
-                let r = self.builder.ins().srem(a, b);
-                self.push(r);
-            }
-            Op::BitAnd(IrType::I64) => {
-                let b = self.pop()?;
-                let a = self.pop()?;
-                let r = self.builder.ins().band(a, b);
-                self.push(r);
-            }
+            Op::Add(IrType::I32) => self.emit_add_i32()?,
+            Op::Sub(IrType::I32) => self.emit_sub_i32()?,
+            Op::Mul(IrType::I32) => self.emit_mul_i32()?,
+            Op::BitAnd(IrType::I32) => self.emit_bitand_i32()?,
+            Op::Div(IrType::I32) => self.emit_div_i32()?,
+            Op::Mod(IrType::I32) => self.emit_mod_i32()?,
+            Op::BitAnd(IrType::I64) => self.emit_bitand_i64()?,
             Op::Lt(IrType::I32) => self.emit_cmp_i32(IntCC::SignedLessThan)?,
             Op::Le(IrType::I32) => self.emit_cmp_i32(IntCC::SignedLessThanOrEqual)?,
             Op::Gt(IrType::I32) => self.emit_cmp_i32(IntCC::SignedGreaterThan)?,
@@ -3070,26 +2549,6 @@ impl<'a, 'b> Codegen<'a, 'b> {
                 )))
             }
         }
-        Ok(())
-    }
-
-    fn emit_cmp(&mut self, cc: IntCC) -> Result<(), CraneliftError> {
-        let b = self.pop()?;
-        let a = self.pop()?;
-        let r = self.builder.ins().icmp(cc, a, b);
-        // cranelift `icmp` produces an i8 in some versions, an i32 in
-        // others; we normalise to i32 to match the IR's `Bool` slot.
-        let r = self.builder.ins().uextend(I32, r);
-        self.push(r);
-        Ok(())
-    }
-
-    fn emit_cmp_i32(&mut self, cc: IntCC) -> Result<(), CraneliftError> {
-        let b = self.pop()?;
-        let a = self.pop()?;
-        let r = self.builder.ins().icmp(cc, a, b);
-        let r = self.builder.ins().uextend(I32, r);
-        self.push(r);
         Ok(())
     }
 
@@ -3898,259 +3357,6 @@ impl<'a, 'b> Codegen<'a, 'b> {
             let r = self.builder.inst_results(inst)[0];
             self.push(r);
         }
-        Ok(())
-    }
-
-    /// Bump-allocate `size_bytes` inside the scratch region of the
-    /// arena. Mirrors the wasm-side `emit_alloc_scratch_static`:
-    ///
-    /// 1. Read `state.scratch_cursor`.
-    /// 2. Bounds-check `scratch_base + cursor + size <= arena_len`.
-    /// 3. Bump the cursor.
-    /// 4. Push the **arena-relative** offset `scratch_base + pre_cursor`
-    ///    onto the virtual stack as an `i32`.
-    ///
-    /// The pushed value is an arena-relative i32 pointer the stdlib
-    /// body's `LoadI32AtAbsolute` / `StoreI32AtAbsolute` /
-    /// `MemcpyAtAbsolute` ops can dereference.
-    fn emit_alloc_scratch(&mut self, size: CValue) -> Result<(), CraneliftError> {
-        let cur = self.builder.ins().load(
-            I32,
-            MemFlags::trusted(),
-            self.state_ptr,
-            STATE_OFFSET_SCRATCH_CURSOR,
-        );
-        let scratch_base = self.builder.ins().load(
-            I32,
-            MemFlags::trusted(),
-            self.state_ptr,
-            STATE_OFFSET_SCRATCH_BASE,
-        );
-        let arena_len = self.builder.ins().load(
-            I32,
-            MemFlags::trusted(),
-            self.state_ptr,
-            STATE_OFFSET_ARENA_LEN,
-        );
-        // Bounds: scratch_base + cur + size <= arena_len.
-        if self.sandbox.bounds_check {
-            let base_plus_cur = self.builder.ins().iadd(scratch_base, cur);
-            let end = self.builder.ins().iadd(base_plus_cur, size);
-            let cmp = self
-                .builder
-                .ins()
-                .icmp(IntCC::UnsignedGreaterThan, end, arena_len);
-            self.cond_trap(cmp, TrapKind::BoundsViolation);
-        }
-        // Push the arena-relative offset (scratch_base + pre_cursor).
-        let off = self.builder.ins().iadd(scratch_base, cur);
-        // Bump.
-        let new_cur = self.builder.ins().iadd(cur, size);
-        self.builder.ins().store(
-            MemFlags::trusted(),
-            new_cur,
-            self.state_ptr,
-            STATE_OFFSET_SCRATCH_CURSOR,
-        );
-        self.push(off);
-        Ok(())
-    }
-
-    /// Lower `Op::AllocScratchDyn`. The size is popped from the
-    /// virtual stack (must be an `i32`).
-    fn emit_alloc_scratch_dyn(&mut self) -> Result<(), CraneliftError> {
-        let size = self.pop()?;
-        self.emit_alloc_scratch(size)
-    }
-
-    /// Lower `Op::AllocScratch { size_bytes }`. The size is a
-    /// compile-time constant.
-    fn emit_alloc_scratch_static(&mut self, size_bytes: u32) -> Result<(), CraneliftError> {
-        let size = self.builder.ins().iconst(I32, i64::from(size_bytes));
-        self.emit_alloc_scratch(size)
-    }
-
-    /// Translate an arena-relative `i32` offset (top of stack) to its
-    /// absolute host address. Performs the standard `arena_base + off`
-    /// computation plus an optional bounds check against `arena_len`.
-    /// Pushes nothing — the caller decides what to do with the
-    /// returned cranelift value.
-    fn arena_addr(&mut self, off_i32: CValue, slot_size: u32) -> Result<CValue, CraneliftError> {
-        let arena_base = self.builder.ins().load(
-            self.pointer_ty,
-            MemFlags::trusted(),
-            self.state_ptr,
-            STATE_OFFSET_ARENA_BASE,
-        );
-        if self.sandbox.bounds_check {
-            let arena_len = self.builder.ins().load(
-                I32,
-                MemFlags::trusted(),
-                self.state_ptr,
-                STATE_OFFSET_ARENA_LEN,
-            );
-            let size = self.builder.ins().iconst(I32, i64::from(slot_size));
-            let end = self.builder.ins().iadd(off_i32, size);
-            let cmp = self
-                .builder
-                .ins()
-                .icmp(IntCC::UnsignedGreaterThan, end, arena_len);
-            self.cond_trap(cmp, TrapKind::BoundsViolation);
-        }
-        let off_p = self.builder.ins().uextend(self.pointer_ty, off_i32);
-        Ok(self.builder.ins().iadd(arena_base, off_p))
-    }
-
-    /// Lower `Op::LoadI32AtAbsolute { offset }`. Pops an arena-
-    /// relative i32 base, adds `offset`, performs the bounds check
-    /// (`base + offset + 4 <= arena_len`), loads 4 bytes, and pushes
-    /// the resulting i32.
-    fn emit_load_i32_at_absolute(&mut self, offset: u32) -> Result<(), CraneliftError> {
-        let base = self.pop()?;
-        let off_v = self.builder.ins().iconst(I32, i64::from(offset));
-        let composed = self.builder.ins().iadd(base, off_v);
-        let abs = self.arena_addr(composed, 4)?;
-        let v = self.builder.ins().load(I32, MemFlags::trusted(), abs, 0);
-        self.push(v);
-        Ok(())
-    }
-
-    /// Lower `Op::LoadI64AtAbsolute { offset }`.
-    fn emit_load_i64_at_absolute(&mut self, offset: u32) -> Result<(), CraneliftError> {
-        let base = self.pop()?;
-        let off_v = self.builder.ins().iconst(I32, i64::from(offset));
-        let composed = self.builder.ins().iadd(base, off_v);
-        let abs = self.arena_addr(composed, 8)?;
-        let v = self.builder.ins().load(I64, MemFlags::trusted(), abs, 0);
-        self.push(v);
-        Ok(())
-    }
-
-    /// Lower `Op::LoadF64AtAbsolute { offset }`.
-    fn emit_load_f64_at_absolute(&mut self, offset: u32) -> Result<(), CraneliftError> {
-        let base = self.pop()?;
-        let off_v = self.builder.ins().iconst(I32, i64::from(offset));
-        let composed = self.builder.ins().iadd(base, off_v);
-        let abs = self.arena_addr(composed, 8)?;
-        let v = self.builder.ins().load(
-            cranelift_codegen::ir::types::F64,
-            MemFlags::trusted(),
-            abs,
-            0,
-        );
-        self.push(v);
-        Ok(())
-    }
-
-    /// Lower `Op::LoadI8UAtAbsolute { offset }`. Loads a single byte
-    /// and zero-extends to i32.
-    fn emit_load_i8u_at_absolute(&mut self, offset: u32) -> Result<(), CraneliftError> {
-        let base = self.pop()?;
-        let off_v = self.builder.ins().iconst(I32, i64::from(offset));
-        let composed = self.builder.ins().iadd(base, off_v);
-        let abs = self.arena_addr(composed, 1)?;
-        let b = self.builder.ins().load(
-            cranelift_codegen::ir::types::I8,
-            MemFlags::trusted(),
-            abs,
-            0,
-        );
-        let v = self.builder.ins().uextend(I32, b);
-        self.push(v);
-        Ok(())
-    }
-
-    /// Lower `Op::StoreI32AtAbsolute { offset }`. Stack:
-    /// `[base: i32, value: i32]`. Pops value first, then base.
-    fn emit_store_i32_at_absolute(&mut self, offset: u32) -> Result<(), CraneliftError> {
-        let value = self.pop()?;
-        let base = self.pop()?;
-        let off_v = self.builder.ins().iconst(I32, i64::from(offset));
-        let composed = self.builder.ins().iadd(base, off_v);
-        let abs = self.arena_addr(composed, 4)?;
-        self.builder.ins().store(MemFlags::trusted(), value, abs, 0);
-        Ok(())
-    }
-
-    /// Lower `Op::StoreI64AtAbsolute { offset }`.
-    fn emit_store_i64_at_absolute(&mut self, offset: u32) -> Result<(), CraneliftError> {
-        let value = self.pop()?;
-        let base = self.pop()?;
-        let off_v = self.builder.ins().iconst(I32, i64::from(offset));
-        let composed = self.builder.ins().iadd(base, off_v);
-        let abs = self.arena_addr(composed, 8)?;
-        self.builder.ins().store(MemFlags::trusted(), value, abs, 0);
-        Ok(())
-    }
-
-    /// Lower `Op::StoreF64AtAbsolute { offset }`.
-    fn emit_store_f64_at_absolute(&mut self, offset: u32) -> Result<(), CraneliftError> {
-        let value = self.pop()?;
-        let base = self.pop()?;
-        let off_v = self.builder.ins().iconst(I32, i64::from(offset));
-        let composed = self.builder.ins().iadd(base, off_v);
-        let abs = self.arena_addr(composed, 8)?;
-        self.builder.ins().store(MemFlags::trusted(), value, abs, 0);
-        Ok(())
-    }
-
-    /// Lower `Op::StoreI8AtAbsolute { offset }`. Pops i32 value;
-    /// stores its low byte.
-    fn emit_store_i8_at_absolute(&mut self, offset: u32) -> Result<(), CraneliftError> {
-        let value = self.pop()?;
-        let base = self.pop()?;
-        let off_v = self.builder.ins().iconst(I32, i64::from(offset));
-        let composed = self.builder.ins().iadd(base, off_v);
-        let abs = self.arena_addr(composed, 1)?;
-        let v8 = self
-            .builder
-            .ins()
-            .ireduce(cranelift_codegen::ir::types::I8, value);
-        self.builder.ins().store(MemFlags::trusted(), v8, abs, 0);
-        Ok(())
-    }
-
-    /// Lower `Op::MemcpyAtAbsolute`. Stack: `[dest: i32, src: i32,
-    /// len: i32]`. Translates each pointer through `arena_addr` and
-    /// invokes libc memcpy via cranelift's `call_memcpy` helper.
-    fn emit_memcpy_at_absolute(&mut self) -> Result<(), CraneliftError> {
-        let len = self.pop()?;
-        let src_off = self.pop()?;
-        let dest_off = self.pop()?;
-        // Bounds-check both pointers using the len.
-        if self.sandbox.bounds_check {
-            let arena_len = self.builder.ins().load(
-                I32,
-                MemFlags::trusted(),
-                self.state_ptr,
-                STATE_OFFSET_ARENA_LEN,
-            );
-            let dest_end = self.builder.ins().iadd(dest_off, len);
-            let cmp_d = self
-                .builder
-                .ins()
-                .icmp(IntCC::UnsignedGreaterThan, dest_end, arena_len);
-            self.cond_trap(cmp_d, TrapKind::BoundsViolation);
-            let src_end = self.builder.ins().iadd(src_off, len);
-            let cmp_s = self
-                .builder
-                .ins()
-                .icmp(IntCC::UnsignedGreaterThan, src_end, arena_len);
-            self.cond_trap(cmp_s, TrapKind::BoundsViolation);
-        }
-        let arena_base = self.builder.ins().load(
-            self.pointer_ty,
-            MemFlags::trusted(),
-            self.state_ptr,
-            STATE_OFFSET_ARENA_BASE,
-        );
-        let dest_p = self.builder.ins().uextend(self.pointer_ty, dest_off);
-        let src_p = self.builder.ins().uextend(self.pointer_ty, src_off);
-        let dest = self.builder.ins().iadd(arena_base, dest_p);
-        let src = self.builder.ins().iadd(arena_base, src_p);
-        let len_p = self.builder.ins().uextend(self.pointer_ty, len);
-        self.builder
-            .call_memcpy(self.frontend_config, dest, src, len_p);
         Ok(())
     }
 
