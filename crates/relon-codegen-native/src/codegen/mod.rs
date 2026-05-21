@@ -1153,23 +1153,15 @@ impl<'a, 'b> Codegen<'a, 'b> {
         self.builder.switch_to_block(continue_block);
     }
 
-    /// Insert a deadline guard at the current insertion point. Loads
-    /// `state.deadline_ns` and, when it is something other than
-    /// `i64::MAX` (the "no deadline" sentinel), reads
+    /// Insert a deadline guard at the current insertion point. Reads
     /// `state.epoch.elapsed().as_nanos()` via the host helper and
-    /// traps when the result is past the configured budget.
-    ///
-    /// The `i64::MAX` short-circuit elides the `relon_now` host helper
-    /// call (a `clock_gettime(CLOCK_MONOTONIC)` vDSO call, ~25-40 ns
-    /// on Linux x86_64) on every dispatch when the host has not
-    /// configured a real deadline via [`SandboxState::set_deadline`].
-    /// Default-configured evaluators (`SandboxState::new`) start at
-    /// the sentinel; hosts that need a deadline pay the clock read
-    /// only on that path.
+    /// traps when the result is past `state.deadline_ns`.
     fn emit_resource_check(&mut self) {
-        // Load deadline_ns from state first so we can short-circuit
-        // away from the clock-read host helper when the host hasn't
-        // configured a real deadline. The offset lives in
+        // call relon_now(state) -> i64 via the capability vtable.
+        let inst = self.emit_host_fn_call(VtableSlot::RelonNow, &[self.state_ptr]);
+        let elapsed = self.builder.inst_results(inst)[0];
+
+        // Load deadline_ns from state. The offset lives in
         // `STATE_OFFSET_DEADLINE_NS`; the codegen and sandbox must
         // agree on it.
         let deadline = self.builder.ins().load(
@@ -1179,35 +1171,12 @@ impl<'a, 'b> Codegen<'a, 'b> {
             crate::sandbox::STATE_OFFSET_DEADLINE_NS,
         );
 
-        // Build: if deadline != i64::MAX { now = relon_now(); if now
-        // >= deadline { trap } }. The sentinel branch is the cold
-        // path; the hot dispatch path falls straight through.
-        let max = self.builder.ins().iconst(I64, i64::MAX);
-        let needs_check = self.builder.ins().icmp(IntCC::NotEqual, deadline, max);
-
-        let check_block = self.builder.create_block();
-        let after_block = self.builder.create_block();
-        self.builder
-            .ins()
-            .brif(needs_check, check_block, &[], after_block, &[]);
-        self.builder.seal_block(check_block);
-
-        self.builder.switch_to_block(check_block);
-        let inst = self.emit_host_fn_call(VtableSlot::RelonNow, &[self.state_ptr]);
-        let elapsed = self.builder.inst_results(inst)[0];
+        // Trap when elapsed >= deadline.
         let cmp = self
             .builder
             .ins()
             .icmp(IntCC::SignedGreaterThanOrEqual, elapsed, deadline);
-        // `cond_trap` consumes the current block; the `continue_block`
-        // it builds for the non-trap path becomes the new insertion
-        // point. Jump from there to `after_block` so both paths
-        // converge.
         self.cond_trap(cmp, TrapKind::ResourceExhausted);
-        self.builder.ins().jump(after_block, &[]);
-
-        self.builder.seal_block(after_block);
-        self.builder.switch_to_block(after_block);
     }
 
     /// Materialise a cranelift `Variable` for a `LocalGet` slot the
