@@ -50,7 +50,8 @@
 //! wasm32 build leaves the trigger unconfigured and the prologue
 //! becomes inert.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
@@ -222,6 +223,69 @@ impl fmt::Debug for dyn HotTraceTrigger {
 /// `HotCounter` slot (each `BcFunction` owns its own counter), but
 /// they do share the trigger.
 pub type HotTraceTriggerHandle = Arc<dyn HotTraceTrigger>;
+
+thread_local! {
+    /// Per-thread map `fn_id -> HotCounter`. The bytecode VM's
+    /// dispatch loop builds a fresh `BytecodeVm` per `invoke` call (see
+    /// `crate::evaluator::BytecodeEvaluator::run_main_inner`), so the
+    /// counter has to live somewhere other than the VM itself for the
+    /// "tick on every entry" semantics to hold across calls. A
+    /// thread-local map mirrors the cranelift backend's
+    /// `RELON_HOT_COUNTERS` global table while keeping the bytecode
+    /// crate dependency-free (no cranelift, wasm32-safe).
+    ///
+    /// The map is `RefCell` so the dispatch path can lazily insert
+    /// new slots without taking a lock. Concurrent threads each see
+    /// their own table — this matches the recorder state machine's
+    /// per-thread shape (`relon_codegen_native` keeps
+    /// `RECORDING_REGISTRY` thread-local for the same reason).
+    static HOT_COUNTERS: RefCell<HashMap<u32, HotCounter>> =
+        RefCell::new(HashMap::new());
+}
+
+/// Bump the hot counter for `fn_id`, creating the slot with
+/// `threshold` on first touch. Returns the [`HotCounterResult`] the
+/// dispatcher should act on.
+///
+/// Cheap fast path: when the slot is already `COUNTER_SATURATED` the
+/// helper returns `AlreadyHot` with a single `HashMap::get` + load.
+/// Cold path (new slot) costs one `HashMap::entry` insert.
+pub fn record_hot(fn_id: u32, threshold: u32) -> HotCounterResult {
+    HOT_COUNTERS.with(|cell| {
+        let mut map = cell.borrow_mut();
+        let slot = map
+            .entry(fn_id)
+            .or_insert_with(|| HotCounter::with_threshold(threshold));
+        slot.record()
+    })
+}
+
+/// Inspect the current value of the `fn_id` counter. Returns `None`
+/// when no slot has been touched yet. Mainly used by tests verifying
+/// the bump cadence.
+pub fn peek_hot(fn_id: u32) -> Option<u32> {
+    HOT_COUNTERS.with(|cell| cell.borrow().get(&fn_id).map(|c| c.peek()))
+}
+
+/// Reset (or remove) the counter for `fn_id`. Used by test harness
+/// setup to isolate individual cases; production code typically
+/// leaves saturated slots alone so `AlreadyHot` keeps short-circuiting
+/// the helper.
+pub fn reset_hot(fn_id: u32) {
+    HOT_COUNTERS.with(|cell| {
+        let map = cell.borrow();
+        if let Some(slot) = map.get(&fn_id) {
+            slot.reset();
+        }
+    });
+}
+
+/// Drop every slot on the current thread. Test harness setup calls
+/// this between cases so a stale `HotTrigger` from a previous test
+/// doesn't bleed through.
+pub fn reset_hot_all() {
+    HOT_COUNTERS.with(|cell| cell.borrow_mut().clear());
+}
 
 #[cfg(test)]
 mod tests {

@@ -98,8 +98,8 @@ pub use arena::{ArenaError, DictArena, Handle, ListArena, StringArena, VmMemory}
 pub use compile::{compile_function, BcCompileError};
 pub use evaluator::{BytecodeError, BytecodeEvaluator, ResumeMetrics};
 pub use hot_counter::{
-    HotCounter, HotCounterResult, HotTraceTrigger, HotTraceTriggerHandle, COUNTER_SATURATED,
-    DEFAULT_HOT_THRESHOLD,
+    peek_hot, record_hot, reset_hot, reset_hot_all, HotCounter, HotCounterResult, HotTraceTrigger,
+    HotTraceTriggerHandle, COUNTER_SATURATED, DEFAULT_HOT_THRESHOLD,
 };
 pub use op::{BcFunction, BcOp, ExternalPc, StackOrigin};
 pub use vm::{BcVmConfig, BcVmError, BytecodeVm, VmValue};

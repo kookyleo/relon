@@ -22,6 +22,7 @@ use relon_parser::TokenRange;
 use thiserror::Error;
 
 use crate::arena::{ArenaError, VmMemory};
+use crate::hot_counter::{HotCounterResult, HotTraceTriggerHandle};
 use crate::op::{BcFunction, BcOp, BcStdlibKind, BcTrapKind, ExternalPc};
 
 /// Raw VM-value slot. The bytecode VM is homogeneous on `u64` so
@@ -48,6 +49,25 @@ pub struct BcVmConfig {
     /// guarded call to trip [`BcVmError::CapabilityDenied`]; non-empty
     /// slots are reserved for M2-B when host-fn dispatch lands.
     pub cap_vtable: CapabilityVtable,
+    /// M2-B phase 4c: optional trace-JIT recording hook. When set, the
+    /// VM bumps a [`crate::HotCounter`] slot once per `invoke` and,
+    /// when the slot crosses the configured threshold, calls
+    /// `trigger.on_hot(fn_id, args)` so the host can drive a trace
+    /// recording (cranelift backend: indirects through
+    /// `__relon_jump_to_recorder`).
+    ///
+    /// `None` leaves the prologue inert — that's the wasm32 / unit-test
+    /// default. The hook lives behind a trait object so the bytecode
+    /// crate stays cranelift-free; the native adapter lives in
+    /// `relon_codegen_native::bytecode_bridge` (added alongside the
+    /// recording-registry wire-up).
+    pub hot_trigger: Option<HotTraceTriggerHandle>,
+    /// M2-B phase 4c: per-`invoke` hot-counter threshold. Defaults to
+    /// [`crate::DEFAULT_HOT_THRESHOLD`] (1000). Hosts that want eager
+    /// recording (smoke tests / corpus harnesses that need the trigger
+    /// to fire after a single iteration) lower this to `1`. Threshold
+    /// 0 is rejected at [`HotCounter::with_threshold`] time.
+    pub hot_threshold: u32,
 }
 
 impl Default for BcVmConfig {
@@ -60,6 +80,8 @@ impl Default for BcVmConfig {
             max_steps: Some(1_000_000),
             deadline: None,
             cap_vtable: CapabilityVtable::default(),
+            hot_trigger: None,
+            hot_threshold: crate::hot_counter::DEFAULT_HOT_THRESHOLD,
         }
     }
 }
@@ -721,6 +743,41 @@ impl BytecodeVm {
                 steps,
                 locals,
             );
+        }
+        // M2-B phase 4c: hot-counter prologue. Mirrors the cranelift
+        // entry-fn prologue (`crates/relon-codegen-native/src/codegen/hot_counter.rs`)
+        // but as Rust on the dispatch path — no machine-code emit.
+        //
+        // We only run the prologue on the **outer** invocation entry —
+        // `start_bc_idx == 0` filters out partial-resume re-entries
+        // routed through `BytecodeEvaluator::resume_from_pc`, so the
+        // recorder doesn't get retriggered for every deopt bounce.
+        // The trigger fires at most once per (fn_id, thread) because
+        // the counter saturates after `HotTrigger`; subsequent
+        // crossings observe `AlreadyHot` and skip the call.
+        //
+        // The hook runs **before** the first op dispatches so the
+        // recording-time view matches what the bytecode VM is about
+        // to execute. The host is responsible for ensuring `on_hot`
+        // is panic-free (the trait docs spell this out); a panic here
+        // would propagate through the `invoke` call and the host has
+        // no convenient catch-unwind boundary today.
+        if start_bc_idx == 0 {
+            if let (Some(fn_id), Some(trigger)) =
+                (func.fn_id, self.config.hot_trigger.as_ref())
+            {
+                let outcome =
+                    crate::hot_counter::record_hot(fn_id, self.config.hot_threshold);
+                if outcome == HotCounterResult::HotTrigger {
+                    // The packed-args view the recorder needs is just
+                    // the args slice we already have on the stack —
+                    // the bytecode VM's calling convention is one
+                    // `u64` per arg in declaration order, matching
+                    // the `args_ptr` shape `__relon_jump_to_recorder`
+                    // unpacks against the registered `param_tys`.
+                    trigger.on_hot(fn_id, args);
+                }
+            }
         }
         loop {
             // Resource prong: tick.
