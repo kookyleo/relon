@@ -24,19 +24,28 @@
 //! See `docs/internal/wasm-crate-structure-2026-05-16.md` for the
 //! IR-first crate split rationale.
 
-pub mod ascii_fold_simd;
-pub mod case_folding;
-pub mod combining_marks;
 pub mod error;
-pub mod full_case_folding;
 pub mod ir;
 pub mod lowering;
-pub mod normalization;
-pub mod normalization_data;
 pub mod op_visitor;
 pub mod shape_hash;
 pub mod stdlib;
-pub mod whitespace;
+pub mod unicode;
+
+// Backwards-compatible re-exports: the eight Unicode-adjacent modules
+// previously lived flat under `relon-ir/src/`. They moved into
+// [`unicode`] (review-improvement P3, large-file / domain split,
+// 2026-05-21). Re-exporting them at the crate root keeps
+// `relon_ir::case_folding::...` / `relon_ir::normalization::...` /
+// etc. compiling for downstream crates so the move stays
+// non-breaking.
+pub use crate::unicode::ascii_fold_simd;
+pub use crate::unicode::case_folding;
+pub use crate::unicode::combining_marks;
+pub use crate::unicode::full_case_folding;
+pub use crate::unicode::normalization;
+pub use crate::unicode::normalization_data;
+pub use crate::unicode::whitespace;
 
 pub use error::LoweringError;
 pub use ir::{

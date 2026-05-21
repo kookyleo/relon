@@ -2,7 +2,7 @@
 //!
 //! v3++ b-5: implements the four standard normalization forms - NFC,
 //! NFD, NFKC, NFKD - directly against the embedded UCD 14.0.0 tables
-//! in [`crate::normalization_data`]. The implementation is intentionally
+//! in [`super::normalization_data`]. The implementation is intentionally
 //! third-party-free so:
 //!
 //!   * Both the tree-walk evaluator and the wasm-AOT backend share
@@ -33,7 +33,7 @@
 //! `COMPOSITION_PAIRS` at generation time, so the composition pass
 //! never needs to consult an exclusion table at runtime.
 
-use crate::normalization_data::{
+use super::normalization_data::{
     CCC_TABLE, COMPOSITION_PAIRS, NFD_INDEX, NFD_POOL, NFKD_INDEX, NFKD_POOL,
 };
 

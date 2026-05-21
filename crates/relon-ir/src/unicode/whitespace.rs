@@ -1,7 +1,7 @@
 //! v3++ b-4 Unicode whitespace range table embedded into the wasm-AOT
 //! `title` stdlib body.
 //!
-//! Mirrors the contract of [`crate::combining_marks`] but for the
+//! Mirrors the contract of [`super::combining_marks`] but for the
 //! Unicode `White_Space` property — the set of codepoints
 //! [`char::is_whitespace`] returns `true` for. The `title` body uses
 //! this table to decide whether a decoded codepoint resets the
@@ -55,7 +55,7 @@ pub fn non_ascii_whitespace_ranges() -> &'static [(u32, u32)] {
 }
 
 /// Encode the whitespace range table into the raw byte layout the
-/// wasm data section expects. See [`crate::combining_marks::encode_ranges_bytes`]
+/// wasm data section expects. See [`super::combining_marks::encode_ranges_bytes`]
 /// for the wire format — both helpers emit the same `[count: u32][(start, end) × N]`
 /// shape so the runtime can binary-search them with one shared op
 /// stream.
@@ -70,7 +70,7 @@ pub fn encode_ranges_bytes(table: &[(u32, u32)]) -> Vec<u8> {
 }
 
 /// Byte size of the encoded whitespace ranges. Mirrors
-/// [`crate::combining_marks::encoded_ranges_size`].
+/// [`super::combining_marks::encoded_ranges_size`].
 pub fn encoded_ranges_size(table: &[(u32, u32)]) -> usize {
     4 + table.len() * 8
 }
