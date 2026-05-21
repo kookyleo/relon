@@ -65,7 +65,8 @@ pub use deopt::{
 pub use dict_list::{
     __relon_trace_dict_lookup, __relon_trace_dict_lookup_prechecked, __relon_trace_list_get,
     build_dict_record, build_flat_list_record, build_string_record, fx_hash_bytes,
-    fx_hash_key_record, DICT_LOOKUP_DEOPT,
+    fx_hash_key_record, fx_hash_key_record_payload, DICT_LOOKUP_DEOPT, STRING_RECORD_HASH_OFFSET,
+    STRING_RECORD_PAYLOAD_OFFSET,
 };
 pub use ic_lookup::{__relon_trace_inline_cache_lookup, ic_storage_size, write_ic_header};
 pub use str_ops::{

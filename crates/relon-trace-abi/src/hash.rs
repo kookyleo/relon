@@ -55,25 +55,84 @@ pub fn fx_hash_bytes(bytes: &[u8]) -> u64 {
     h
 }
 
-/// Hash a `[len: u32 LE][utf8...]` String record with [`fx_hash_bytes`].
+/// Byte offset of the cached payload hash inside a layout-conformant
+/// dict key record. See [`fx_hash_key_record`] for the layout contract
+/// and the rationale for caching the hash at fixture-build time.
 ///
-/// Pulled out so bench fixtures can pre-compute the per-key hash at
-/// fixture-build time and stamp it into the dict's entry table.
+/// Exposed as a `pub const` so the cranelift-side inline emitter
+/// (`relon_trace_emitter::dict_inline`) can issue a single
+/// `load.u64 [key_ptr + STRING_RECORD_HASH_OFFSET]` instead of running
+/// the byte-wise hash loop on every dict lookup.
+pub const STRING_RECORD_HASH_OFFSET: i32 = 4;
+
+/// Byte offset of the payload bytes inside a layout-conformant dict
+/// key record. Sits after the 4-byte `len` header and the 8-byte
+/// cached `hash` field. Exposed for the same reason as
+/// [`STRING_RECORD_HASH_OFFSET`].
+pub const STRING_RECORD_PAYLOAD_OFFSET: i32 = 12;
+
+/// Hash a `[len: u32 LE][hash: u64 LE][utf8...]` dict key record by
+/// **reading the cached hash field** — the producer side
+/// (`build_string_record` / the recorder driver) has already pre-computed
+/// the payload hash at record-build time and stamped it into bytes
+/// 4..12, so the consumer side just loads it back as a u64.
+///
+/// This is the Tier 1a "StringRef header caches u32 fx_hash" optimisation
+/// (the cached field is widened to u64 here so it matches the dict's
+/// entry-table hash width — see the dict_list module doc for why u32
+/// would force an extra fold step on the IC hot path). Replacing the
+/// byte-wise hash loop with a single load drops the W5 hot-path key
+/// hashing cost from ~one xor+mul per key byte to a single 8-byte
+/// load.
 ///
 /// # Safety
 ///
-/// `key_ptr` must point at a layout-conformant String record with
-/// `len + 4` valid bytes (4-byte little-endian length header followed
-/// by exactly `len` UTF-8 payload bytes). The trace JIT runtime
-/// holds these records on a stable arena; callers outside that
-/// arena ownership boundary must keep the backing memory alive for
-/// the duration of this call.
+/// `key_ptr` must point at a layout-conformant dict key record with at
+/// least `12 + len` valid bytes:
+///
+/// - bytes 0..4   — `len: u32 LE` (payload byte count)
+/// - bytes 4..12  — `hash: u64 LE` (pre-computed `fx_hash_bytes(payload)`)
+/// - bytes 12..12+len — UTF-8 payload bytes
+///
+/// The trace JIT runtime holds these records on a stable arena;
+/// callers outside that arena ownership boundary must keep the
+/// backing memory alive for the duration of this call. The cached
+/// hash MUST match `fx_hash_bytes(payload)` byte-for-byte — otherwise
+/// the dict IC will silently turn every lookup into a deopt; producer
+/// helpers like `build_string_record` enforce this at construction
+/// time and tests in this module round-trip the invariant.
 #[inline]
 pub unsafe fn fx_hash_key_record(key_ptr: *const u8) -> u64 {
-    // SAFETY: caller contract — `key_ptr` is a layout-conformant
-    // String record.
+    // SAFETY: caller contract — `key_ptr` is a layout-conformant dict
+    // key record whose cached hash field at offset 4 is the FxHash of
+    // the payload bytes. Loading the cached u64 is byte-identical to
+    // re-running the byte-wise hash loop on the payload, by the
+    // construction invariant of `build_string_record`.
+    unsafe {
+        key_ptr
+            .add(STRING_RECORD_HASH_OFFSET as usize)
+            .cast::<u64>()
+            .read_unaligned()
+    }
+}
+
+/// Byte-wise FxHash over a dict key record's payload — the fallback
+/// reference implementation used by tests + the producer side of the
+/// pre-cache contract. Production hot paths route through
+/// [`fx_hash_key_record`] (loads the cached u64) instead.
+///
+/// # Safety
+///
+/// Same layout contract as [`fx_hash_key_record`]; this variant simply
+/// ignores the cached field and recomputes the hash from the payload
+/// bytes.
+#[inline]
+pub unsafe fn fx_hash_key_record_payload(key_ptr: *const u8) -> u64 {
+    // SAFETY: caller contract — see [`fx_hash_key_record`].
     let len = unsafe { (key_ptr as *const u32).read_unaligned() } as usize;
-    let bytes = unsafe { std::slice::from_raw_parts(key_ptr.add(4), len) };
+    let bytes = unsafe {
+        std::slice::from_raw_parts(key_ptr.add(STRING_RECORD_PAYLOAD_OFFSET as usize), len)
+    };
     fx_hash_bytes(bytes)
 }
 
@@ -106,11 +165,25 @@ mod tests {
 
     #[test]
     fn key_record_matches_payload_only() {
+        // Producer-side construction: stamp the cached hash at
+        // record-build time so the consumer-side `fx_hash_key_record`
+        // load matches the byte-wise reference.
         let payload = b"thekey";
+        let cached_hash = fx_hash_bytes(payload);
         let mut record = (payload.len() as u32).to_le_bytes().to_vec();
+        record.extend_from_slice(&cached_hash.to_le_bytes());
         record.extend_from_slice(payload);
         let via_record = unsafe { fx_hash_key_record(record.as_ptr()) };
         let via_bytes = fx_hash_bytes(payload);
-        assert_eq!(via_record, via_bytes);
+        assert_eq!(
+            via_record, via_bytes,
+            "cached hash must round-trip vs byte-wise reference"
+        );
+        // Belt-and-braces: the payload-only fallback must agree too.
+        let via_payload = unsafe { fx_hash_key_record_payload(record.as_ptr()) };
+        assert_eq!(
+            via_payload, via_bytes,
+            "payload-only fallback must agree with byte-wise reference"
+        );
     }
 }

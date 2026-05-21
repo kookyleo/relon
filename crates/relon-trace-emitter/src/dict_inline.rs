@@ -31,24 +31,27 @@
 //! Key record (the value supplied as `key_ptr`):
 //!
 //! ```text
-//! offset 0  : len  : u32 LE   (key byte count)
-//! offset 4  : bytes[0..len]   (utf8 payload)
+//! offset 0  : len   : u32 LE   (key byte count)
+//! offset 4  : hash  : u64 LE   (pre-computed fx_hash_bytes(payload))
+//! offset 12 : bytes : [u8; len] (UTF-8 payload)
 //! ```
 //!
-//! ## Hash algorithm — must match `relon_trace_abi::hash::fx_hash_bytes`
+//! ## Hash retrieval — Tier 1a "StringRef header caches fx_hash"
+//!
+//! The producer side (`build_string_record` / the recorder driver)
+//! stamps `fx_hash_bytes(payload)` into bytes 4..12 of every dict key
+//! record at fixture-build / recorder time. The inline emitter just
+//! loads it back as a single `u64`:
 //!
 //! ```text
-//! h = SEED
-//! for &b in bytes:
-//!     h ^= b as u64
-//!     h = h.wrapping_mul(PRIME)
+//! final_hash = load.u64 [key_ptr + 4]
 //! ```
 //!
-//! with `SEED = 0xcbf2_9ce4_8422_2325` and
-//! `PRIME = 0x0100_0000_01b3`. Implementing the algorithm a second
-//! time in IR is mandatory because the dict's entry table was
-//! pre-hashed with the same constants at fixture-build / recorder
-//! time — any drift would silently turn every IC lookup into a deopt.
+//! This replaces the historical inline FxHash loop (one xor+mul per
+//! payload byte) — the producer-side guarantee documented on
+//! `fx_hash_key_record` is what makes the load equivalent to the
+//! byte-wise computation. The seed / prime constants the loop used to
+//! materialise are no longer needed on the dispatch hot path.
 //!
 //! ## Generated control flow
 //!
@@ -56,20 +59,8 @@
 //!     entry:
 //!         (key_ptr, dict_ptr supplied as SSA i64)
 //!         null-check key_ptr → deopt if null
-//!         key_len    = load.u32 [key_ptr + 0]    (uextend to i64)
-//!         key_bytes  = key_ptr + 4
-//!         jump hash_loop(byte_idx = 0, h = SEED)
-//!
-//!     hash_loop(byte_idx, h):
-//!         done = icmp_eq byte_idx, key_len
-//!         brif done, scan_init, hash_body(byte_idx, h)
-//!     hash_body(byte_idx, h):
-//!         b      = load.u8 [key_bytes + byte_idx]
-//!         b_u64  = uextend b
-//!         h1     = bxor h, b_u64
-//!         h2     = imul h1, PRIME
-//!         byte_idx' = byte_idx + 1
-//!         jump hash_loop(byte_idx', h2)
+//!         final_hash = load.u64 [key_ptr + 4]    (cached fx_hash from
+//!                                                  the producer side)
 //!
 //!     scan_init:
 //!         entry_count = load.u32 [dict_ptr + 8]  (uextend to i64)
@@ -149,7 +140,7 @@
 //! independent callsites masquerading as one.
 
 use cranelift_codegen::ir::condcodes::IntCC;
-use cranelift_codegen::ir::types::{I32, I64, I8};
+use cranelift_codegen::ir::types::{I32, I64};
 use cranelift_codegen::ir::{self, BlockArg, InstBuilder, MemFlags};
 use cranelift_frontend::FunctionBuilder;
 
@@ -243,22 +234,29 @@ pub fn emit_dict_lookup_inline(
 /// iteration. Each field is `None` when the caller didn't hoist that
 /// particular subexpression; the inline body then falls back to its
 /// per-iter emit. The struct exists so the emitter can grow new
-/// hoisted fields (e.g. `hash_seed`, `hash_prime`, `entries_base`)
-/// without churning the public function signatures every time.
+/// hoisted fields without churning the public function signatures
+/// every time.
+///
+/// Tier 1a (#149): the historical `hash_seed` / `hash_prime` slots
+/// are retained on the surface for API back-compat but no longer
+/// drive any per-iter cranelift IR — the cached-hash retrieval
+/// (`load.u64 [key_ptr + 4]`) sits one insn before the scan loop and
+/// has no `iconst.i64 imm64` constants to lift. Callers may still
+/// populate the fields; they will be ignored. New hoists for the
+/// scan loop should be added below.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct DictInlineHoists {
     /// i64 SSA holding the dict's `entry_count` (`load.u32 +
     /// uextend`). See F-D8-E.5.
     pub entry_count: Option<ir::Value>,
-    /// i64 SSA holding the FxHash seed (`iconst.i64 FX_HASH_SEED`).
-    /// Hoisting deletes one 10-byte `mov reg, imm64` from the
-    /// per-outer-iter hash-loop preamble.
+    /// Historical: hoisted FxHash seed constant. Ignored as of #149;
+    /// kept on the struct to avoid churning every caller's
+    /// initialiser at the same time as the layout change. A future
+    /// cleanup pass can drop the field once the recorder-side
+    /// preheader emitters stop populating it.
     pub hash_seed: Option<ir::Value>,
-    /// i64 SSA holding the FxHash prime multiplier
-    /// (`iconst.i64 FX_HASH_PRIME`). Hoisting deletes one 10-byte
-    /// `mov reg, imm64` from each hash-body iteration — saves
-    /// `key_len + 1` mov-imm64 per outer iter (W5 has 1-byte keys
-    /// → 2 saves per iter).
+    /// Historical: hoisted FxHash prime multiplier. Same status as
+    /// [`Self::hash_seed`] — ignored after #149.
     pub hash_prime: Option<ir::Value>,
 }
 
@@ -317,6 +315,13 @@ pub fn emit_dict_lookup_inline_with_hoists(
     hoists: DictInlineHoists,
 ) -> ir::Value {
     let hoisted_entry_count = hoists.entry_count;
+    // The hash_seed / hash_prime hoist slots are retained on the
+    // public API surface for back-compat with callers that still
+    // populate them, but the cached-hash retrieval below no longer
+    // materialises either constant on the per-iter path so the SSAs
+    // are intentionally unused.
+    let _ = hoists.hash_seed;
+    let _ = hoists.hash_prime;
     // ----- Null-key guard ------------------------------------------------
     let zero = builder.ins().iconst(I64, 0);
     let key_null = builder.ins().icmp(IntCC::Equal, key_ptr, zero);
@@ -333,75 +338,32 @@ pub fn emit_dict_lookup_inline_with_hoists(
     builder.seal_block(nonnull);
     builder.switch_to_block(nonnull);
 
-    // ----- Key payload header -------------------------------------------
-    let key_len_u32 = builder.ins().load(I32, MemFlags::trusted(), key_ptr, 0);
-    let key_len = builder.ins().uextend(I64, key_len_u32);
-    let key_bytes = builder.ins().iadd_imm(key_ptr, 4);
-
-    // ----- Hash loop ----------------------------------------------------
+    // ----- Cached-hash retrieval ---------------------------------------
     //
-    // `(idx, h)` carry per-iter state. We branch the exit edge into a
-    // dedicated `scan_init` block that carries the final hash as a
-    // block-param, so the value flows into the scan loop as a normal
-    // SSA value.
-    let hash_header = builder.create_block();
-    builder.append_block_param(hash_header, I64); // byte_idx
-    builder.append_block_param(hash_header, I64); // accumulator h
-    let zero_i64 = builder.ins().iconst(I64, 0);
-    // F-D8-E.7: prefer the caller-supplied hoisted seed SSA when
-    // available; otherwise materialise the seed inside the inline
-    // body. The hoisted form must dominate the dict-inline call site
-    // (preheader block, by construction).
-    let seed_i64 = match hoists.hash_seed {
-        Some(v) => v,
-        None => builder.ins().iconst(I64, FX_HASH_SEED),
-    };
-    builder.ins().jump(
-        hash_header,
-        &[BlockArg::Value(zero_i64), BlockArg::Value(seed_i64)],
+    // Tier 1a: load the producer-stamped FxHash from the key record's
+    // header instead of running the byte-wise hash loop. The producer
+    // (`build_string_record` / the recorder driver) writes
+    // `fx_hash_bytes(payload)` into bytes 4..12 of every key record at
+    // construction time, so this single 8-byte load is byte-identical
+    // to the historical inline hash loop's final accumulator value.
+    //
+    // The load is `MemFlags::trusted()` because the upstream
+    // `Guard(NotNull(key_ptr))` plus the recorded layout invariant
+    // (every key record has at least a 12-byte header) guarantee the
+    // load is in-bounds; the dict's `DictShapeGuard` upstream pins the
+    // payload-hash contract for this trace.
+    //
+    // The hash field sits 4 bytes into the record (unaligned w.r.t. 8
+    // on most allocators), but cranelift's x86_64 backend folds the
+    // displacement into a single `mov` insn without an aligned-load
+    // fast-path bonus, and `Vec<u8>` storage of the key records gives
+    // 1-byte alignment so an aligned `load.u64` is impossible anyway.
+    let final_hash = builder.ins().load(
+        I64,
+        MemFlags::trusted(),
+        key_ptr,
+        relon_trace_abi::STRING_RECORD_HASH_OFFSET,
     );
-    builder.switch_to_block(hash_header);
-    let byte_idx = builder.block_params(hash_header)[0];
-    let acc_h = builder.block_params(hash_header)[1];
-
-    let hash_done = builder.ins().icmp(IntCC::Equal, byte_idx, key_len);
-    let scan_init = builder.create_block();
-    builder.append_block_param(scan_init, I64); // final hash
-    let hash_body = builder.create_block();
-    builder.ins().brif(
-        hash_done,
-        scan_init,
-        &[BlockArg::Value(acc_h)],
-        hash_body,
-        &[],
-    );
-    builder.seal_block(hash_body);
-    builder.switch_to_block(hash_body);
-
-    let byte_addr = builder.ins().iadd(key_bytes, byte_idx);
-    let b = builder.ins().load(I8, MemFlags::trusted(), byte_addr, 0);
-    let b_i64 = builder.ins().uextend(I64, b);
-    let xored = builder.ins().bxor(acc_h, b_i64);
-    // F-D8-E.7: same hoist treatment for FX_HASH_PRIME. Hoisting the
-    // 64-bit immediate avoids re-issuing a `movabs reg, imm64` on
-    // every hash-body iteration; cranelift 0.131's GVN does not
-    // reliably lift `iconst.i64 imm64` across loop bodies.
-    let prime_v = match hoists.hash_prime {
-        Some(v) => v,
-        None => builder.ins().iconst(I64, FX_HASH_PRIME),
-    };
-    let next_h = builder.ins().imul(xored, prime_v);
-    let one_i64 = builder.ins().iconst(I64, 1);
-    let next_idx = builder.ins().iadd(byte_idx, one_i64);
-    builder.ins().jump(
-        hash_header,
-        &[BlockArg::Value(next_idx), BlockArg::Value(next_h)],
-    );
-    builder.seal_block(hash_header);
-
-    // ----- Scan loop ----------------------------------------------------
-    builder.switch_to_block(scan_init);
-    let final_hash = builder.block_params(scan_init)[0];
 
     // entry_count is u32 LE at dict_ptr + 8 (shape is +0, already
     // verified by DictShapeGuard); entries start at dict_ptr + 12.
@@ -440,7 +402,6 @@ pub fn emit_dict_lookup_inline_with_hoists(
     let sixteen_init = builder.ins().iconst(I64, 16);
     let total_bytes = builder.ins().imul(entry_count, sixteen_init);
     let entries_end = builder.ins().iadd(entries_base, total_bytes);
-    builder.seal_block(scan_init);
 
     // Scan header: carries the current entry pointer.
     let scan_header = builder.create_block();
@@ -549,55 +510,20 @@ pub fn emit_dict_lookup_inline_unrolled(
     builder.seal_block(nonnull);
     builder.switch_to_block(nonnull);
 
-    // ----- Key payload header -------------------------------------------
-    let key_len_u32 = builder.ins().load(I32, MemFlags::trusted(), key_ptr, 0);
-    let key_len = builder.ins().uextend(I64, key_len_u32);
-    let key_bytes = builder.ins().iadd_imm(key_ptr, 4);
-
-    // ----- Hash loop ----------------------------------------------------
-    // Identical to the data-driven variant — `key_len` is a per-call
-    // input so we can't statically unroll it here, but the loop body
-    // is tight enough that cranelift can keep the accumulator hot.
-    let hash_header = builder.create_block();
-    builder.append_block_param(hash_header, I64); // byte_idx
-    builder.append_block_param(hash_header, I64); // accumulator h
-    let zero_i64 = builder.ins().iconst(I64, 0);
-    let seed_i64 = builder.ins().iconst(I64, FX_HASH_SEED);
-    builder.ins().jump(
-        hash_header,
-        &[BlockArg::Value(zero_i64), BlockArg::Value(seed_i64)],
+    // ----- Cached-hash retrieval ---------------------------------------
+    // Tier 1a: the producer side stamps the FxHash of the key payload
+    // into bytes 4..12 of the record at fixture-build / recorder time
+    // (see `relon_trace_jit::runtime::build_string_record`), so the
+    // inline emitter just loads it back as a single `u64`. This drops
+    // the historical hash loop (one xor+mul per payload byte) entirely
+    // — the W5 hot path's 1-byte keys saw 2 iterations per call but
+    // the same load works for any key length without per-byte work.
+    let final_hash = builder.ins().load(
+        I64,
+        MemFlags::trusted(),
+        key_ptr,
+        relon_trace_abi::STRING_RECORD_HASH_OFFSET,
     );
-    builder.switch_to_block(hash_header);
-    let byte_idx = builder.block_params(hash_header)[0];
-    let acc_h = builder.block_params(hash_header)[1];
-
-    let hash_done = builder.ins().icmp(IntCC::Equal, byte_idx, key_len);
-    let scan_block = builder.create_block();
-    builder.append_block_param(scan_block, I64); // final hash
-    let hash_body = builder.create_block();
-    builder.ins().brif(
-        hash_done,
-        scan_block,
-        &[BlockArg::Value(acc_h)],
-        hash_body,
-        &[],
-    );
-    builder.seal_block(hash_body);
-    builder.switch_to_block(hash_body);
-
-    let byte_addr = builder.ins().iadd(key_bytes, byte_idx);
-    let b = builder.ins().load(I8, MemFlags::trusted(), byte_addr, 0);
-    let b_i64 = builder.ins().uextend(I64, b);
-    let xored = builder.ins().bxor(acc_h, b_i64);
-    let prime_v = builder.ins().iconst(I64, FX_HASH_PRIME);
-    let next_h = builder.ins().imul(xored, prime_v);
-    let one_i64 = builder.ins().iconst(I64, 1);
-    let next_idx = builder.ins().iadd(byte_idx, one_i64);
-    builder.ins().jump(
-        hash_header,
-        &[BlockArg::Value(next_idx), BlockArg::Value(next_h)],
-    );
-    builder.seal_block(hash_header);
 
     // ----- Unrolled scan ------------------------------------------------
     //
@@ -629,9 +555,6 @@ pub fn emit_dict_lookup_inline_unrolled(
     // verifies that pin at runtime. So at most ONE entry's hash can
     // equal `final_hash` — `or` of all `contrib_k` therefore yields
     // exactly the hit's value (or 0 on miss).
-    builder.switch_to_block(scan_block);
-    let final_hash = builder.block_params(scan_block)[0];
-    builder.seal_block(scan_block);
 
     // Stage 1: independent per-entry compute lanes.
     let zero_acc = builder.ins().iconst(I64, 0);

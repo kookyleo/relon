@@ -252,18 +252,42 @@ pub unsafe extern "C" fn __relon_trace_dict_lookup_prechecked(
 // canonical FxHash impl. Implementing the algorithm twice would risk
 // silent IC misses; centralising in `relon-trace-abi` keeps both
 // callers locked to the same bytes.
-pub use relon_trace_abi::hash::{fx_hash_bytes, fx_hash_key_record};
+pub use relon_trace_abi::hash::{
+    fx_hash_bytes, fx_hash_key_record, fx_hash_key_record_payload, STRING_RECORD_HASH_OFFSET,
+    STRING_RECORD_PAYLOAD_OFFSET,
+};
 
-/// Convenience constructor: layout-conformant String record for unit
-/// tests + bench fixtures. Returns a `Vec<u8>` whose first 4 bytes
-/// are the little-endian length and whose remaining bytes are the
-/// UTF-8 payload. The fixture pins it on a Box so the trace's raw
-/// pointer stays stable.
+/// Convenience constructor: layout-conformant dict key record for
+/// unit tests + bench fixtures. Returns a `Vec<u8>` whose layout
+/// matches the consumer contract documented on
+/// [`fx_hash_key_record`]:
+///
+/// ```text
+/// offset 0  : len   : u32 LE     (payload byte count)
+/// offset 4  : hash  : u64 LE     (pre-computed fx_hash_bytes(payload))
+/// offset 12 : bytes : [u8; len]  (UTF-8 payload)
+/// ```
+///
+/// Pre-stamping the FxHash at fixture-build time is what makes the
+/// W5-class dict hot loop avoid re-hashing each key byte on every
+/// iteration — the inline emitter and the runtime helpers both just
+/// `load.u64 [key_ptr + STRING_RECORD_HASH_OFFSET]` instead of running
+/// the byte-wise hash loop. See the Tier 1a stage report for the
+/// before/after numbers.
+///
+/// The legacy 4-byte-header layout that this used to produce is gone:
+/// every consumer of this helper (dict_inline.rs, the W5/W6 bench
+/// fixtures, the recorder tests) was updated in the same commit
+/// sequence so there is no compatibility surface to preserve.
 pub fn build_string_record(s: &str) -> Vec<u8> {
     let len = s.len() as u32;
-    let mut out = Vec::with_capacity(4 + s.len());
+    let payload = s.as_bytes();
+    let hash = fx_hash_bytes(payload);
+    let mut out = Vec::with_capacity(STRING_RECORD_PAYLOAD_OFFSET as usize + s.len());
     out.extend_from_slice(&len.to_le_bytes());
-    out.extend_from_slice(s.as_bytes());
+    out.extend_from_slice(&hash.to_le_bytes());
+    out.extend_from_slice(payload);
+    debug_assert_eq!(out.len(), STRING_RECORD_PAYLOAD_OFFSET as usize + s.len());
     out
 }
 

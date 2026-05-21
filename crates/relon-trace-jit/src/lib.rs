@@ -48,8 +48,9 @@ pub use optimizer::{
 };
 pub use runtime::{
     build_dict_record, build_flat_list_record, build_string_record, fx_hash_bytes,
-    fx_hash_key_record, DeoptStateSnapshot, ExternalCallTable, GenericState,
-    RecoverableWriteRecord, TraceContext, DICT_LOOKUP_DEOPT,
+    fx_hash_key_record, fx_hash_key_record_payload, DeoptStateSnapshot, ExternalCallTable,
+    GenericState, RecoverableWriteRecord, TraceContext, DICT_LOOKUP_DEOPT,
+    STRING_RECORD_HASH_OFFSET, STRING_RECORD_PAYLOAD_OFFSET,
 };
 pub use trace_ir::{
     CmpKind, ExternalAddr, ExternalPc, ExternalSlot, FuncId, GuardKind, LoopPhi, ObservedType,
