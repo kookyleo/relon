@@ -30,9 +30,12 @@ use relon_analyzer::workspace::WorkspaceTree;
 use relon_eval_api::layout::{FieldKind, OffsetTable, SchemaLayout};
 use relon_eval_api::schema_canonical::{Field, Schema, TypeRepr};
 use relon_parser::{ClosureParam, Expr, Node, Operator, TokenKey, TokenRange, TypeNode};
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use crate::error::LoweringError;
+use crate::intern::ConstInternTables;
 use crate::ir::{ClosureCapture, Func, IrType, Module, Op, TaggedOp};
 use crate::stdlib::{
     builtin_stdlib, stdlib_closure_arg_signature, stdlib_function_count, stdlib_function_index,
@@ -60,16 +63,15 @@ struct LowerCtx<'a> {
     /// Next per-function let-local index. Stable across `where`
     /// blocks so a shadowed name still picks up a fresh wasm local.
     next_let_idx: u32,
-    /// Next per-module constant index for [`Op::ConstString`].
-    next_string_idx: u32,
-    /// Next per-module constant index for [`Op::ConstListInt`].
-    next_list_int_idx: u32,
-    /// Phase 10-c: per-module constant index for [`Op::ConstListFloat`].
-    next_list_float_idx: u32,
-    /// Phase 10-c: per-module constant index for [`Op::ConstListBool`].
-    next_list_bool_idx: u32,
-    /// Phase 10-c: per-module constant index for [`Op::ConstListString`].
-    next_list_string_idx: u32,
+    /// #151 — Module-wide intern + idx-allocation table shared across
+    /// every [`LowerCtx`] in the same `Module` (entry body + each
+    /// schema-method body + each emitted lambda). Two source-level
+    /// `Op::ConstString { value }` with the same bytes intern to the
+    /// same idx so the downstream const-pool walker stores one record
+    /// instead of N. Per-list-variant counters also live here so the
+    /// const-pool's `HashMap<idx, offset>` keys stay module-unique
+    /// across the entry / method funcs that share it.
+    const_intern: Rc<RefCell<ConstInternTables>>,
     /// Next per-function record-local index. Each
     /// [`Op::AllocRootRecord`] / [`Op::AllocSubRecord`] hands out a
     /// fresh local so nested dicts under construction don't clobber
@@ -246,16 +248,13 @@ impl<'a> LowerCtx<'a> {
         params: &'a [LocalBinding],
         schema_resolver: SchemaResolver<'a>,
         method_registry: SchemaMethodRegistry,
+        const_intern: Rc<RefCell<ConstInternTables>>,
     ) -> Self {
         Self {
             params,
             lets: Vec::new(),
             next_let_idx: 0,
-            next_string_idx: 0,
-            next_list_int_idx: 0,
-            next_list_float_idx: 0,
-            next_list_bool_idx: 0,
-            next_list_string_idx: 0,
+            const_intern,
             next_record_idx: 0,
             out: Vec::new(),
             tstack: Vec::new(),
@@ -277,16 +276,13 @@ impl<'a> LowerCtx<'a> {
         method_registry: SchemaMethodRegistry,
         self_binding: SelfBinding,
         method_params: Vec<MethodParam>,
+        const_intern: Rc<RefCell<ConstInternTables>>,
     ) -> Self {
         Self {
             params,
             lets: Vec::new(),
             next_let_idx: 0,
-            next_string_idx: 0,
-            next_list_int_idx: 0,
-            next_list_float_idx: 0,
-            next_list_bool_idx: 0,
-            next_list_string_idx: 0,
+            const_intern,
             next_record_idx: 0,
             out: Vec::new(),
             tstack: Vec::new(),
@@ -296,6 +292,13 @@ impl<'a> LowerCtx<'a> {
             method_params,
             lambda_funcs: Vec::new(),
         }
+    }
+
+    /// Clone the shared intern handle for spawning a nested
+    /// `LowerCtx` (lambda body / schema-method body) that must
+    /// participate in the same module-wide idx space.
+    fn intern_handle(&self) -> Rc<RefCell<ConstInternTables>> {
+        Rc::clone(&self.const_intern)
     }
 
     /// Allocate a fresh per-function record-local index used by
@@ -640,18 +643,29 @@ fn lower_entry_with_resolver<'a>(
     // without a second pass over the layout pass.
     let locals = build_local_index(sig, &main_schema, &main_layout)?;
 
+    // #151 — One shared `ConstInternTables` per `Module`. Threaded
+    // through every `LowerCtx` (method funcs lowered next, the entry
+    // body, plus any lambda body spawned inside either) so all
+    // `Op::ConstString` / `Op::ConstList*` records share one module-
+    // wide idx space. Same-bytes ConstString literals across funcs
+    // collapse to one const-pool record; per-list-variant counters
+    // stay collision-free across funcs that previously each restarted
+    // at idx 0.
+    let const_intern = ConstInternTables::shared();
+
     // Phase 5: enumerate every user-declared schema method, assign
     // IR-side indices (and through them combined wasm-level
     // function indices), then lower each method body into a `Func`.
     // The entry body is appended last so it can resolve
     // `obj.method()` calls against the populated registry.
-    let (method_funcs, method_registry) = lower_schema_methods(tree, &resolver)?;
+    let (method_funcs, method_registry) =
+        lower_schema_methods(tree, &resolver, Rc::clone(&const_intern))?;
     let entry_ir_idx = method_funcs.len();
 
     // Walk the body into a single op stream + virtual stack via the
     // per-function lowering context. Phase 3.a's let-bindings + const
     // literals piggy-back on `LowerCtx` for their counters.
-    let mut ctx = LowerCtx::new(&locals, resolver, method_registry);
+    let mut ctx = LowerCtx::new(&locals, resolver, method_registry, const_intern);
 
     if let Some(ref user_schema) = user_return_schema {
         // Branded dict-return path: emit `AllocRootRecord` + the
@@ -1072,14 +1086,16 @@ fn lower_expr(expr: &Expr, range: TokenRange, ctx: &mut LowerCtx<'_>) -> Result<
             Ok(())
         }
         Expr::String(s) => {
-            // Each ConstString gets a fresh module-unique index the
-            // codegen layout pass uses to look up its absolute
-            // memory offset. The bytes ride along on the op so a
-            // future cross-function dedup pass can hash them; for
-            // Phase 3.a we keep it simple and let codegen materialise
-            // every occurrence.
-            let idx = ctx.next_string_idx;
-            ctx.next_string_idx += 1;
+            // #151 — Intern through the module-wide
+            // `ConstInternTables`. Two `Op::ConstString` with the same
+            // bytes (across any func in the module — entry / schema
+            // method / lambda body) resolve to the same idx so the
+            // const-pool walker stores one `[len][payload]` record and
+            // every reference materialises the same arena offset.
+            // The bytes still ride along on the op so the const-pool
+            // pass (which walks `Op::ConstString` by visitor dispatch)
+            // can populate `string_offsets[idx]` on the first sighting.
+            let idx = ctx.const_intern.borrow_mut().strings.intern(s);
             ctx.out.push(TaggedOp {
                 op: Op::ConstString {
                     idx,
@@ -1137,8 +1153,7 @@ fn lower_expr(expr: &Expr, range: TokenRange, ctx: &mut LowerCtx<'_>) -> Result<
                             }
                         }
                     }
-                    let idx = ctx.next_list_int_idx;
-                    ctx.next_list_int_idx += 1;
+                    let idx = ctx.const_intern.borrow_mut().alloc_list_int_idx();
                     ctx.out.push(TaggedOp {
                         op: Op::ConstListInt { idx, elements },
                         range,
@@ -1166,8 +1181,7 @@ fn lower_expr(expr: &Expr, range: TokenRange, ctx: &mut LowerCtx<'_>) -> Result<
                             }
                         }
                     }
-                    let idx = ctx.next_list_float_idx;
-                    ctx.next_list_float_idx += 1;
+                    let idx = ctx.const_intern.borrow_mut().alloc_list_float_idx();
                     ctx.out.push(TaggedOp {
                         op: Op::ConstListFloat { idx, elements },
                         range,
@@ -1190,8 +1204,7 @@ fn lower_expr(expr: &Expr, range: TokenRange, ctx: &mut LowerCtx<'_>) -> Result<
                             }
                         }
                     }
-                    let idx = ctx.next_list_bool_idx;
-                    ctx.next_list_bool_idx += 1;
+                    let idx = ctx.const_intern.borrow_mut().alloc_list_bool_idx();
                     ctx.out.push(TaggedOp {
                         op: Op::ConstListBool { idx, elements },
                         range,
@@ -1214,8 +1227,7 @@ fn lower_expr(expr: &Expr, range: TokenRange, ctx: &mut LowerCtx<'_>) -> Result<
                             }
                         }
                     }
-                    let idx = ctx.next_list_string_idx;
-                    ctx.next_list_string_idx += 1;
+                    let idx = ctx.const_intern.borrow_mut().alloc_list_string_idx();
                     ctx.out.push(TaggedOp {
                         op: Op::ConstListString { idx, elements },
                         range,
@@ -1510,12 +1522,15 @@ fn lower_closure_arg(
     // Use a fresh LowerCtx — captures + lambda params become its let
     // bindings. Cloning the schema resolver / method registry is a
     // cheap re-use of the outer-side shared maps; the inner walk
-    // never mutates them.
+    // never mutates them. #151 — share the outer ctx's intern handle
+    // so any literal lowered inside the lambda body participates in
+    // the module-wide dedup table.
     const EMPTY_PARAMS: &[LocalBinding] = &[];
     let mut inner = LowerCtx::new(
         EMPTY_PARAMS,
         ctx.schema_resolver.clone(),
         ctx.method_registry.clone(),
+        ctx.intern_handle(),
     );
 
     // Prologue: load each capture into a fresh inner let-local.
@@ -3508,6 +3523,7 @@ fn enumerate_methods<'a>(
 fn lower_schema_methods<'a>(
     tree: &'a AnalyzedTree,
     resolver: &SchemaResolver<'a>,
+    const_intern: Rc<RefCell<ConstInternTables>>,
 ) -> Result<(Vec<Func>, SchemaMethodRegistry), LoweringError> {
     let enumerated = enumerate_methods(tree, resolver)?;
     let stdlib_offset = stdlib_function_count();
@@ -3527,10 +3543,13 @@ fn lower_schema_methods<'a>(
         method_sigs.push(sig);
     }
     // Second pass: lower each method's body now that the registry is
-    // fully populated.
+    // fully populated. #151 — each method ctx receives a clone of the
+    // shared intern handle so its `Op::ConstString` / `Op::ConstList*`
+    // ops mint idxs out of the same module-wide allocator as the
+    // entry body.
     let mut funcs: Vec<Func> = Vec::with_capacity(enumerated.len());
     for (m, sig) in enumerated.iter().zip(method_sigs) {
-        let func = lower_one_method(m, &sig, resolver, &registry)?;
+        let func = lower_one_method(m, &sig, resolver, &registry, Rc::clone(&const_intern))?;
         funcs.push(func);
     }
     Ok((funcs, registry))
@@ -3623,6 +3642,7 @@ fn lower_one_method<'a>(
     sig: &MethodSig,
     resolver: &SchemaResolver<'a>,
     registry: &SchemaMethodRegistry,
+    const_intern: Rc<RefCell<ConstInternTables>>,
 ) -> Result<Func, LoweringError> {
     let MethodSig {
         param_tys,
@@ -3668,6 +3688,7 @@ fn lower_one_method<'a>(
         registry.clone(),
         self_binding,
         method_params,
+        const_intern,
     );
     lower_expr(&body_node.expr, body_node.range, &mut ctx)?;
     // Validate the body left exactly one value of the declared
@@ -3703,4 +3724,150 @@ fn lower_one_method<'a>(
         body: ctx.out,
         range: m.info.range,
     })
+}
+
+// =====================================================================
+// #151 — Compile-time intern invariants.
+//
+// End-to-end checks that drive the analyzer + lowering pipeline so the
+// invariants exercise the same code path real callers hit (rather
+// than synthesising a `LowerCtx` directly, which would bypass the
+// schema-method composition step where the latent idx-collision bug
+// lived).
+// =====================================================================
+
+#[cfg(test)]
+mod intern_tests {
+    use super::*;
+
+    /// Walk `funcs` and collect every `Op::ConstString { idx, value }`
+    /// across each func's body (and into any nested `If` / `Block` /
+    /// `Loop` arms). Used by the invariant tests below to project the
+    /// flat `(idx, value)` ground truth out of the lowered module.
+    fn collect_const_strings(funcs: &[Func]) -> Vec<(u32, String)> {
+        fn walk(body: &[TaggedOp], out: &mut Vec<(u32, String)>) {
+            for t in body {
+                match &t.op {
+                    Op::ConstString { idx, value } => out.push((*idx, value.clone())),
+                    Op::If {
+                        then_body,
+                        else_body,
+                        ..
+                    } => {
+                        walk(then_body, out);
+                        walk(else_body, out);
+                    }
+                    Op::Block { body, .. } => walk(body, out),
+                    Op::Loop { body, .. } => walk(body, out),
+                    _ => {}
+                }
+            }
+        }
+        let mut acc = Vec::new();
+        for f in funcs {
+            walk(&f.body, &mut acc);
+        }
+        acc
+    }
+
+    fn lower_source(src: &str) -> Module {
+        let ast = relon_parser::parse_document(src).expect("parse");
+        let analyzed = relon_analyzer::analyze(&ast);
+        assert!(
+            !analyzed.has_errors(),
+            "analyze errors: {:?}",
+            analyzed.diagnostics
+        );
+        let lowered = lower_workspace_single(&analyzed, &ast).expect("lower");
+        lowered.module
+    }
+
+    /// Same-bytes string literals inside one function dedup to a
+    /// single idx. Pre-#151 the per-`LowerCtx` counter minted a
+    /// fresh idx for each occurrence and the const-pool laid out
+    /// three identical `[len][bytes]` records.
+    #[test]
+    fn intern_dedups_same_literal_in_one_func() {
+        // Two `"foo"` literals inside one entry body. Both lower to
+        // `Op::ConstString { value: "foo" }` through the same
+        // `LowerCtx`.
+        let src = "#main() -> String\n\"foo\".concat(\"foo\")";
+        let module = lower_source(src);
+        let consts = collect_const_strings(&module.funcs);
+        let foo_idxs: Vec<u32> = consts
+            .iter()
+            .filter(|(_, v)| v == "foo")
+            .map(|(idx, _)| *idx)
+            .collect();
+        assert!(
+            foo_idxs.len() >= 2,
+            "expected at least two `foo` Op::ConstString emissions, got {foo_idxs:?}"
+        );
+        // Intern contract: every occurrence resolves to the same idx.
+        assert!(
+            foo_idxs.iter().all(|i| *i == foo_idxs[0]),
+            "intern violated — `foo` literals mapped to {foo_idxs:?}"
+        );
+    }
+
+    /// Distinct literals get distinct idxs (sanity — guards against
+    /// a regression that always returns 0).
+    #[test]
+    fn intern_keeps_distinct_literals_distinct() {
+        let src = "#main() -> String\n\"foo\".concat(\"bar\")";
+        let module = lower_source(src);
+        let consts = collect_const_strings(&module.funcs);
+        let foo = consts.iter().find(|(_, v)| v == "foo").map(|(i, _)| *i);
+        let bar = consts.iter().find(|(_, v)| v == "bar").map(|(i, _)| *i);
+        assert!(foo.is_some(), "missing foo, got {consts:?}");
+        assert!(bar.is_some(), "missing bar, got {consts:?}");
+        assert_ne!(
+            foo, bar,
+            "intern collapsed two distinct literals to the same idx"
+        );
+    }
+
+    /// Module-wide idx-uniqueness across schema-method bodies + the
+    /// entry body. Before #151 each func reset `next_string_idx` to
+    /// 0, so a method emitting `Op::ConstString { idx: 0, "a" }` and
+    /// the entry emitting `Op::ConstString { idx: 0, "b" }` produced
+    /// idx collisions the const-pool silently misresolved. The
+    /// invariant: every distinct (idx) maps to a single value across
+    /// the whole module.
+    #[test]
+    fn module_wide_idx_uniqueness_across_methods_and_entry() {
+        // Schema with a method that returns a string-derived bool
+        // (touches a literal), plus an entry body that touches a
+        // different literal. The shared intern handle threads through
+        // `lower_schema_methods` so both funcs draw idxs from the
+        // same allocator.
+        let src = "#schema P { String name: * } with {\n\
+                     starts_a() -> Bool: self.name.starts_with(\"a\")\n\
+                   }\n\
+                   #main(P p) -> Bool\n\
+                   p.starts_a() ? true : p.name.starts_with(\"b\")";
+        let module = lower_source(src);
+        let consts = collect_const_strings(&module.funcs);
+        // Each idx maps to at most one (value) — collision-free.
+        let mut by_idx: HashMap<u32, &String> = HashMap::new();
+        for (idx, value) in &consts {
+            if let Some(prev) = by_idx.insert(*idx, value) {
+                assert_eq!(
+                    prev, value,
+                    "idx {idx} bound to two values: `{prev}` and `{value}` (module-wide \
+                     uniqueness violation)"
+                );
+            }
+        }
+        // And we got at least both literals.
+        let values: Vec<&String> = consts.iter().map(|(_, v)| v).collect();
+        assert!(
+            values.iter().any(|v| v.as_str() == "a"),
+            "missing `a`, got {values:?}"
+        );
+        assert!(
+            values.iter().any(|v| v.as_str() == "b"),
+            "missing `b`, got {values:?}"
+        );
+    }
 }

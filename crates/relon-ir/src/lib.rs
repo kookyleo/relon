@@ -26,6 +26,7 @@
 
 pub mod error;
 pub mod glob;
+pub mod intern;
 pub mod ir;
 pub mod lowering;
 pub mod op_visitor;
