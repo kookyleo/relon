@@ -42,6 +42,19 @@ use std::time::{Duration, Instant};
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 
+// M2-B phase 4d (2026-05-21): drive the bytecode VM from source via
+// the public `relon::new_evaluator` facade. The bytecode envelope is
+// scalar-only today (M2-A) — sources that include stdlib / closures /
+// list / dict surface as `BackendError::Bytecode` at setup and the
+// bench row routes to the n/a marker instead of attempting a timed
+// invocation. The honest list of which workloads survive the envelope
+// lives in the coverage matrix in the stage report; today only
+// W12 (`#main(Int x) -> Int\nx + 1`) passes through cleanly. All
+// other rows record `n/a (UnsupportedOp)` so the row hierarchy stays
+// uniform across the four backends.
+use relon::{new_evaluator as new_relon_evaluator, Backend as RelonBackend, BackendError};
+use relon_eval_api::Evaluator as RelonEvaluator;
+
 // F-D9 (2026-05-19): cranelift dependencies used by the hand-built
 // trace-JIT entry functions for W3 / W4 / W5 / W6. These mirror the
 // pattern in `cmp_lua_dict_list_trace.rs` (F-D8 companion bench);
@@ -144,6 +157,33 @@ fn build_tree_walker(src: &str) -> (TreeWalkEvaluator, Arc<Scope>) {
         TreeWalkEvaluator::new(Arc::new(ctx)),
         Arc::new(Scope::default()),
     )
+}
+
+/// M2-B phase 4d (2026-05-21): attempt to construct a bytecode-VM
+/// evaluator from `src`. Returns:
+///
+/// - `Ok(Some(evaluator))` — the source survived
+///   `BytecodeEvaluator::from_source`'s envelope check and is ready to
+///   drive through `run_main`.
+/// - `Ok(None)` — `BackendError::Bytecode(reason)` (the M2-A scalar
+///   envelope rejected the source). The bench row prints
+///   `n/a (UnsupportedOp: <reason>)` to stderr and skips the timed
+///   inner loop. `reason` is forwarded so the failure mode is
+///   visible in the bench log.
+/// - `Err(other)` — propagated unchanged (parse / unsupported-feature
+///   / unexpected setup failure). The caller panics so the regression
+///   shows up in the bench run.
+fn try_build_bytecode(src: &str, label: &str) -> Option<Box<dyn RelonEvaluator>> {
+    match new_relon_evaluator(src, RelonBackend::Bytecode) {
+        Ok(ev) => Some(ev),
+        Err(BackendError::Bytecode(reason)) => {
+            eprintln!("[cmp_lua {label}] bytecode row n/a (UnsupportedOp: {reason})");
+            None
+        }
+        Err(other) => panic!(
+            "{label} bytecode setup failed unexpectedly (not a scalar-envelope bounce): {other}"
+        ),
+    }
 }
 
 /// Build a Lua function from source: the source must be a `return function(...) ... end`
@@ -1442,6 +1482,29 @@ fn bench_cmp_lua(c: &mut Criterion) {
                 })
             });
         });
+        // M2-B phase 4d bytecode row. Today W1 uses `list.sum(range(n))`
+        // which the M2-A scalar envelope rejects at IR-lift time
+        // ("unresolved variable `list`"); the row records n/a and
+        // skips the timed loop. Coverage widens once phase 4c lifts
+        // stdlib + list-ctor surface into bytecode.
+        if let Some(ev) = try_build_bytecode(w1_relon_src(), "W1") {
+            // Consistency check before timing.
+            let v = ev.run_main(args_w_n(W1_N)).expect("W1 bytecode run_main");
+            assert_eq!(
+                relon_int_result("W1", v),
+                w1_expected(),
+                "W1 bytecode result must match analytic answer"
+            );
+            group.bench_function(BenchmarkId::new("W1_int_sum", "relon_bytecode"), |b| {
+                b.iter_custom(|iters| {
+                    let n_in = black_box(W1_N);
+                    timed_with_warmup(iters, || {
+                        let v = ev.run_main(args_w_n(black_box(n_in))).unwrap();
+                        black_box(v);
+                    })
+                });
+            });
+        }
     }
 
     // ----- W2 -----
@@ -1473,6 +1536,26 @@ fn bench_cmp_lua(c: &mut Criterion) {
                 })
             });
         });
+        // M2-B phase 4d bytecode row — W2 uses `list.sum(...map(...))`,
+        // closure + stdlib; bounces with `analyzer rejected source`
+        // until phase 4c-cont lifts the closure surface.
+        if let Some(ev) = try_build_bytecode(w2_relon_src(), "W2") {
+            let v = ev.run_main(args_w_n(W2_N)).expect("W2 bytecode run_main");
+            assert_eq!(
+                relon_int_result("W2", v),
+                w2_expected(),
+                "W2 bytecode result must match analytic answer"
+            );
+            group.bench_function(BenchmarkId::new("W2_f64_dot", "relon_bytecode"), |b| {
+                b.iter_custom(|iters| {
+                    let n_in = black_box(W2_N);
+                    timed_with_warmup(iters, || {
+                        let v = ev.run_main(args_w_n(black_box(n_in))).unwrap();
+                        black_box(v);
+                    })
+                });
+            });
+        }
     }
 
     // ----- W3 -----
@@ -1598,6 +1681,10 @@ fn bench_cmp_lua(c: &mut Criterion) {
                 })
             });
         });
+        // M2-B phase 4d bytecode row — W3's `range(n).map(...).reduce(...)`
+        // is closure + stdlib; the M2-A scalar envelope rejects it.
+        // String-return + closure surface lands with phase 4c-cont.
+        let _ = try_build_bytecode(w3_relon_src(), "W3");
     }
 
     // ----- W4 -----
@@ -1708,6 +1795,9 @@ fn bench_cmp_lua(c: &mut Criterion) {
                 })
             });
         });
+        // M2-B phase 4d bytecode row — W4 source uses `.filter(...).len()`
+        // (closure + list ctor) so it bounces on the M2-A envelope.
+        let _ = try_build_bytecode(w4_relon_src(), "W4");
     }
 
     // ----- W4_long_haystack -----
@@ -1833,6 +1923,10 @@ fn bench_cmp_lua(c: &mut Criterion) {
                 });
             },
         );
+        // M2-B phase 4d bytecode row — same Relon source as W4 (the
+        // long-haystack variant only differs on the Lua side); the
+        // envelope check fires identically.
+        let _ = try_build_bytecode(w4_relon_src(), "W4_long_haystack");
         group.bench_function(BenchmarkId::new("W4_long_haystack", "luajit"), |b| {
             b.iter_custom(|iters| {
                 timed_with_warmup(iters, || {
@@ -1953,6 +2047,10 @@ fn bench_cmp_lua(c: &mut Criterion) {
                 })
             });
         });
+        // M2-B phase 4d bytecode row — W5 builds a literal dict in a
+        // `#private` body and indexes by string; closure + dict + list
+        // surface, way outside the M2-A scalar envelope.
+        let _ = try_build_bytecode(w5_relon_src(), "W5");
     }
 
     // ----- W6 -----
@@ -2042,6 +2140,9 @@ fn bench_cmp_lua(c: &mut Criterion) {
                 })
             });
         });
+        // M2-B phase 4d bytecode row — W6 uses `list.sum(range(n).map(...))`,
+        // closure + stdlib; same bounce shape as W1 / W2.
+        let _ = try_build_bytecode(w6_relon_src(), "W6");
     }
 
     // ----- W7 fib -----
@@ -2075,6 +2176,9 @@ fn bench_cmp_lua(c: &mut Criterion) {
                 })
             });
         });
+        // M2-B phase 4d bytecode row — W7's recursive fib closure is
+        // dict-bodied + first-class; bounces in the analyzer pass.
+        let _ = try_build_bytecode(w7_relon_src(), "W7");
     }
 
     // ----- W8 polymorphic -----
@@ -2112,6 +2216,9 @@ fn bench_cmp_lua(c: &mut Criterion) {
                 })
             });
         });
+        // M2-B phase 4d bytecode row — W8 is a polymorphic closure
+        // dispatch + list.sum; outside the M2-A envelope.
+        let _ = try_build_bytecode(w8_relon_src(), "W8");
     }
 
     // ----- W9 matrix transpose -----
@@ -2144,6 +2251,9 @@ fn bench_cmp_lua(c: &mut Criterion) {
                 })
             });
         });
+        // M2-B phase 4d bytecode row — W9 nests `range(n).map(...)` /
+        // `reduce(...)` two deep; analyzer bounces (closure + list).
+        let _ = try_build_bytecode(w9_relon_src(), "W9");
     }
 
     // ----- W10 config eval -----
@@ -2181,6 +2291,9 @@ fn bench_cmp_lua(c: &mut Criterion) {
                 })
             });
         });
+        // M2-B phase 4d bytecode row — W10 lives behind a closure
+        // (`allow: (i) => ...`) + `list.sum`; analyzer bounces.
+        let _ = try_build_bytecode(w10_relon_src(), "W10");
     }
 
     // ----- W12 p99 tail (1 invoke per iter, large sample) -----
@@ -2213,6 +2326,26 @@ fn bench_cmp_lua(c: &mut Criterion) {
                 black_box(r);
             });
         });
+        // M2-B phase 4d bytecode row — W12 is `#main(Int x) -> Int\nx + 1`,
+        // squarely inside the M2-A scalar envelope. This is the canonical
+        // "bytecode-from-source" measurement and the only timed row the
+        // bytecode column currently produces; everything else bounces.
+        if let Some(ev) = try_build_bytecode(w12_relon_src(), "W12") {
+            let v = ev
+                .run_main(w12_relon_args(7))
+                .expect("W12 bytecode run_main");
+            assert_eq!(
+                relon_int_result("W12", v),
+                8,
+                "W12 bytecode result must match analytic answer x + 1"
+            );
+            group.bench_function(BenchmarkId::new("W12_p99_tail", "relon_bytecode"), |b| {
+                b.iter(|| {
+                    let v = ev.run_main(w12_relon_args(black_box(7))).unwrap();
+                    black_box(v);
+                });
+            });
+        }
     }
 
     group.finish();
