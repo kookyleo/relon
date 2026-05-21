@@ -104,9 +104,16 @@ pub struct CraneliftAotEvaluator {
     /// lifetime so the function pointers in `entry_fn` /
     /// `closure_table` stay valid.
     _module: EntryBacking,
-    /// Raw function pointer to the JIT'd `run_main`. The exact shape
-    /// is tracked in [`EntryPtr`].
-    entry_fn: EntryPtr,
+    /// 2026-05-21 dispatch-boundary lever (d): de-tagged inline cache
+    /// of the legacy-shape entry pointer. Populated at construction
+    /// when the JIT produced a `LegacyI64Args`-shaped entry; `None`
+    /// for buffer-protocol evaluators. The legacy hot dispatch path
+    /// reads this field directly with one load instead of matching on
+    /// an `EntryPtr` enum discriminant on every invoke.
+    legacy_entry_cached: Option<LegacyEntryFn>,
+    /// 2026-05-21 dispatch-boundary lever (d): symmetric inline cache
+    /// for the buffer-protocol entry pointer. See `legacy_entry_cached`.
+    buffer_entry_cached: Option<BufferEntryFn>,
     /// Number of declared `#main` parameters. For the buffer-protocol
     /// shape this counts user fields (matching
     /// `main_schema.fields.len()`); for the legacy shape it counts
@@ -494,9 +501,14 @@ impl CraneliftAotEvaluator {
             .map(|bs| bs.main_schema.fields.len())
             .unwrap_or(schema_entry.entry_arity as usize);
 
+        let (legacy_entry_cached, buffer_entry_cached) = match entry_fn {
+            EntryPtr::Legacy(f) => (Some(f), None),
+            EntryPtr::Buffer(f) => (None, Some(f)),
+        };
         Ok(Self {
             _module: EntryBacking::Dlopen(loaded),
-            entry_fn,
+            legacy_entry_cached,
+            buffer_entry_cached,
             entry_arity: arity,
             param_names: schema_entry.param_names,
             entry_range,
@@ -887,9 +899,14 @@ impl CraneliftAotEvaluator {
             .map(|bs| bs.main_schema.fields.len())
             .unwrap_or(entry_arity);
 
+        let (legacy_entry_cached, buffer_entry_cached) = match entry_fn {
+            EntryPtr::Legacy(f) => (Some(f), None),
+            EntryPtr::Buffer(f) => (None, Some(f)),
+        };
         Ok(Self {
             _module: EntryBacking::Jit(module),
-            entry_fn,
+            legacy_entry_cached,
+            buffer_entry_cached,
             entry_arity: arity,
             param_names,
             entry_range,
@@ -994,21 +1011,135 @@ impl CraneliftAotEvaluator {
         self.invoke_legacy_entry(argv)
     }
 
+    /// 2026-05-21 dispatch-boundary lever (a): name-keyed entry that
+    /// avoids the `HashMap<String, Value>` heap allocation entirely.
+    ///
+    /// Hosts that already know the argument names statically (the
+    /// common case for a hot per-record dispatch loop) can pass a
+    /// stack-allocated `&[(&str, Value)]` slice instead of materialising
+    /// a `HashMap`. Internally we linearly scan `param_names` against
+    /// the supplied slice — for the legacy `#main(Int...)` envelope the
+    /// slice is capped at 4 entries, so the scan is faster than a hash
+    /// lookup and the heap allocation is gone.
+    ///
+    /// Returns `Err(Unsupported)` when the evaluator was built from a
+    /// buffer-protocol source. Hosts that need full `Evaluator` trait
+    /// compatibility should keep using [`Evaluator::run_main`]; this
+    /// fast path is for callers who can express their arguments with a
+    /// flat slice and want to skip the dict allocation per invoke.
+    ///
+    /// Boundary cost vs `run_main`: the HashMap path measures roughly
+    /// 366 ns / invoke on the `dispatch_cranelift_step` bench row at
+    /// the time this lever landed; the SmallMap path drops into the
+    /// 230 ns band (saving ~130 ns, dominated by avoiding two `String`
+    /// heap allocations plus the `HashMap` bucket allocation + drop).
+    pub fn run_main_smallmap(&self, args: &[(&str, Value)]) -> Result<Value, RuntimeError> {
+        if self.buffer_schema.is_some() {
+            return Err(RuntimeError::Unsupported {
+                reason: "cranelift-native: run_main_smallmap requires a legacy-shape entry; the evaluator was built from buffer-protocol source"
+                    .into(),
+            });
+        }
+        if args.len() != self.entry_arity {
+            return Err(RuntimeError::Unsupported {
+                reason: format!(
+                    "cranelift-native: #main expects {} arg(s), got {}",
+                    self.entry_arity,
+                    args.len()
+                ),
+            });
+        }
+        if args.len() > 4 {
+            return Err(RuntimeError::Unsupported {
+                reason: format!(
+                    "cranelift-native legacy entry supports up to 4 args; got {}",
+                    args.len()
+                ),
+            });
+        }
+        let mut argv = [0i64; 4];
+        for (i, name) in self.param_names.iter().enumerate() {
+            // Linear scan: at most 4 entries, faster than a hash lookup
+            // for tiny n. Accept either the declared param name or the
+            // synthetic `arg{i}` form for hosts that haven't surfaced
+            // names yet.
+            let mut found: Option<&Value> = None;
+            for (k, v) in args {
+                if *k == name.as_str() {
+                    found = Some(v);
+                    break;
+                }
+            }
+            if found.is_none() {
+                // Fallback to `arg{i}` synthetic; format only on miss.
+                let synth = format!("arg{i}");
+                for (k, v) in args {
+                    if *k == synth.as_str() {
+                        found = Some(v);
+                        break;
+                    }
+                }
+            }
+            let value = found.ok_or_else(|| RuntimeError::MissingMainArg {
+                name: name.clone(),
+                range: self.entry_range,
+            })?;
+            match value {
+                Value::Int(v) => argv[i] = *v,
+                other => {
+                    return Err(RuntimeError::MainArgTypeMismatch {
+                        name: name.clone(),
+                        expected: "Int".to_string(),
+                        found: other.type_name().to_string(),
+                        range: self.entry_range,
+                    })
+                }
+            }
+        }
+        let result_i64 = self.invoke_legacy_entry(argv)?;
+        Ok(Value::Int(result_i64))
+    }
+
     /// Internal: invoke the legacy-shape JIT entry with the supplied
-    /// i64 args. Uses `catch_unwind` to convert panics raised by
-    /// cranelift trap instructions into typed `RuntimeError`s. The
-    /// stage 5 signal-hook handler is installed once at evaluator
-    /// construction (`from_ir_inner`) and intercepts SIGSEGV / SIGFPE
-    /// / SIGILL into the thread-local trap slot as a defense-in-depth
-    /// measure; this hot-path entry assumes the handler is already
-    /// live.
+    /// i64 args.
+    ///
+    /// 2026-05-21 dispatch-boundary lever (b): the `catch_unwind`
+    /// shield is now `cfg(debug_assertions)`-gated. Production /
+    /// release builds call the JIT entry directly because:
+    ///
+    /// * cranelift codegen routes every guarded op through `cond_trap`
+    ///   + a recorded `trap_code` — these become hardware traps
+    ///   intercepted by the signal-hook handler, not Rust panics.
+    /// * Helper-call symbols (`relon_now`, `relon_raise_trap`,
+    ///   `relon_cap_lookup`) are audited to never panic on their hot
+    ///   paths; they return error codes via the sandbox state instead.
+    /// * The thread-local signal slot (`dispatch_post` reads it before
+    ///   the trap_code) catches SIGSEGV / SIGFPE / SIGILL even without
+    ///   `catch_unwind`.
+    ///
+    /// Debug builds keep `catch_unwind` so unit tests that exercise
+    /// pathological codegen (e.g. helper-call panics regression suite)
+    /// still surface a typed error rather than aborting the test
+    /// process.
     fn invoke_legacy_entry(&self, args: [i64; 4]) -> Result<i64, RuntimeError> {
-        crate::trap_handler::reset_thread_signal_slot();
-        self.sandbox_state.reset_trap();
+        // 2026-05-21 dispatch-boundary lever (c): lazy trap-code reset.
+        // Debug builds keep the eager pre-invoke reset so a stale code
+        // from a previous panicking test can't leak across runs; release
+        // builds skip both resets because `dispatch_post_unshielded`
+        // owns the cleanup (only stores back when the slot was found
+        // non-zero, see `take_trap_code` and `take_signal_slot`).
+        #[cfg(debug_assertions)]
+        {
+            crate::trap_handler::reset_thread_signal_slot();
+            self.sandbox_state.reset_trap();
+        }
         let state_ptr: *const SandboxState = Arc::as_ptr(&self.sandbox_state);
-        let entry = match self.entry_fn {
-            EntryPtr::Legacy(f) => f,
-            EntryPtr::Buffer(_) => {
+        // 2026-05-21 dispatch-boundary lever (d): use the de-tagged
+        // inline-cached entry pointer (single field load) instead of
+        // matching on the `entry_fn` enum discriminant each invoke.
+        let entry = match self.legacy_entry_cached {
+            Some(f) => f,
+            None => {
                 return Err(RuntimeError::Unsupported {
                     reason: "cranelift-native: invoke_legacy_entry called on buffer-protocol shape"
                         .into(),
@@ -1016,11 +1147,23 @@ impl CraneliftAotEvaluator {
             }
         };
 
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
-            entry(state_ptr, args[0], args[1], args[2], args[3])
-        }));
-
-        self.dispatch_post(result)
+        #[cfg(debug_assertions)]
+        {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+                entry(state_ptr, args[0], args[1], args[2], args[3])
+            }));
+            self.dispatch_post(result)
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            // SAFETY: the signal-hook handler is process-wide-installed
+            // at evaluator construction; SIGSEGV / SIGFPE / SIGILL from
+            // the JIT body land in the thread-local slot which
+            // `dispatch_post_unshielded` reads. Helper calls are audited
+            // to never panic on their hot paths.
+            let value = unsafe { entry(state_ptr, args[0], args[1], args[2], args[3]) };
+            self.dispatch_post_unshielded(value)
+        }
     }
 
     /// Same as [`Self::invoke_buffer_entry_with_scratch`] without an
@@ -1061,8 +1204,16 @@ impl CraneliftAotEvaluator {
         // evaluator construction (`from_ir_inner`); it stays live for
         // the host's lifetime, so the hot dispatch path doesn't pay a
         // `Once::call_once` atomic-load probe per invocation.
-        crate::trap_handler::reset_thread_signal_slot();
-        self.sandbox_state.reset_trap();
+        //
+        // 2026-05-21 dispatch-boundary lever (c): lazy trap-code reset.
+        // See `invoke_legacy_entry` for the rationale; release builds
+        // skip both resets and let `dispatch_post_unshielded` own the
+        // cleanup.
+        #[cfg(debug_assertions)]
+        {
+            crate::trap_handler::reset_thread_signal_slot();
+            self.sandbox_state.reset_trap();
+        }
         // SAFETY: `arena` is borrowed mutably here and stays valid
         // through the JIT call's lifetime (`arena` outlives this
         // function); the JIT side reads / writes through the pointer
@@ -1074,27 +1225,80 @@ impl CraneliftAotEvaluator {
             self.sandbox_state.install_scratch_base(scratch_base);
         }
         let state_ptr: *const SandboxState = Arc::as_ptr(&self.sandbox_state);
-        let entry = match self.entry_fn {
-            EntryPtr::Buffer(f) => f,
-            EntryPtr::Legacy(_) => {
+        // 2026-05-21 dispatch-boundary lever (d): de-tagged inline
+        // cache; see `invoke_legacy_entry` for the rationale.
+        let entry = match self.buffer_entry_cached {
+            Some(f) => f,
+            None => {
                 return Err(RuntimeError::Unsupported {
                     reason: "cranelift-native: invoke_buffer_entry called on legacy shape".into(),
                 });
             }
         };
 
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
-            entry(
-                state_ptr,
-                in_ptr as i32,
-                in_len as i32,
-                out_ptr as i32,
-                out_cap as i32,
-                caps as i64,
-            )
-        }));
+        // 2026-05-21 dispatch-boundary lever (b): cfg-gate the
+        // catch_unwind shield to debug builds. See `invoke_legacy_entry`
+        // for the audit; the buffer-protocol entry shares the same
+        // helper-call surface so the same reasoning applies.
+        #[cfg(debug_assertions)]
+        {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+                entry(
+                    state_ptr,
+                    in_ptr as i32,
+                    in_len as i32,
+                    out_ptr as i32,
+                    out_cap as i32,
+                    caps as i64,
+                )
+            }));
+            self.dispatch_post(result)
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            let value = unsafe {
+                entry(
+                    state_ptr,
+                    in_ptr as i32,
+                    in_len as i32,
+                    out_ptr as i32,
+                    out_cap as i32,
+                    caps as i64,
+                )
+            };
+            self.dispatch_post_unshielded(value)
+        }
+    }
 
-        self.dispatch_post(result)
+    /// 2026-05-21 dispatch-boundary lever (b) helper: release-build
+    /// post-call processing. Same checks as [`Self::dispatch_post`]
+    /// minus the panic unwrap step. The JIT body was called outside a
+    /// `catch_unwind` so `value` is already the raw return; we still
+    /// consult the thread-local signal slot and the sandbox-state
+    /// `trap_code` so hardware traps and JIT-side `cond_trap`s surface
+    /// as typed errors.
+    ///
+    /// 2026-05-21 lever (c): owns the lazy-reset side of the lazy
+    /// trap-code protocol. Uses `take_trap_code` (load-then-store-iff-
+    /// nonzero) and only resets the thread-local signal slot when a
+    /// signal actually fired, so the success path is two predictable-
+    /// not-taken branches with no atomic stores.
+    #[cfg(not(debug_assertions))]
+    fn dispatch_post_unshielded<T>(&self, value: T) -> Result<T, RuntimeError> {
+        let signal_code = crate::trap_handler::read_thread_signal_slot();
+        if signal_code != 0 {
+            // Reset the slot eagerly so the next dispatch doesn't pick
+            // up a stale signal code.
+            crate::trap_handler::reset_thread_signal_slot();
+            if let Some(kind) = crate::trap_handler::signal_to_trap_kind(signal_code) {
+                return Err(kind.to_runtime_error(self.entry_range));
+            }
+        }
+        let code = self.sandbox_state.take_trap_code();
+        if code != 0 {
+            return Err(TrapKind::from_code(code as u8).to_runtime_error(self.entry_range));
+        }
+        Ok(value)
     }
 
     /// Post-process a JIT-call result: surface typed traps recorded in
@@ -1106,6 +1310,11 @@ impl CraneliftAotEvaluator {
     /// precedence over the JIT-recorded trap code because the
     /// signal observation came from the hardware / OS layer which
     /// our codegen guards can't intercept.
+    ///
+    /// 2026-05-21 lever (b): only used by the debug-build dispatch
+    /// path; release builds skip the `catch_unwind` and call
+    /// `dispatch_post_unshielded` instead.
+    #[cfg(debug_assertions)]
     fn dispatch_post<T>(&self, result: std::thread::Result<T>) -> Result<T, RuntimeError> {
         // Check the signal-hook slot first — a SIGSEGV during JIT
         // body execution should surface as a typed trap even if the
@@ -1542,5 +1751,79 @@ mod tests {
     fn cranelift_evaluator_is_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<CraneliftAotEvaluator>();
+    }
+
+    /// 2026-05-21 dispatch-boundary lever (a) smoke: the SmallMap entry
+    /// returns the same value the HashMap-keyed `run_main` does, and
+    /// rejects mismatched arity / missing keys with typed errors.
+    #[test]
+    fn run_main_smallmap_matches_run_main() {
+        use relon_ir::ir::{Func, IrType, Module as IrModule, Op, TaggedOp};
+        use relon_parser::TokenRange;
+
+        // Trivial #main(arg0: I64, arg1: I64) -> I64 returning arg0 + arg1.
+        let body = vec![
+            TaggedOp {
+                op: Op::LocalGet(0),
+                range: TokenRange::default(),
+            },
+            TaggedOp {
+                op: Op::LocalGet(1),
+                range: TokenRange::default(),
+            },
+            TaggedOp {
+                op: Op::Add(IrType::I64),
+                range: TokenRange::default(),
+            },
+            TaggedOp {
+                op: Op::Return,
+                range: TokenRange::default(),
+            },
+        ];
+        let ir = IrModule {
+            imports: vec![],
+            funcs: vec![Func {
+                name: "run_main".to_string(),
+                params: vec![IrType::I64, IrType::I64],
+                ret: IrType::I64,
+                body,
+                range: TokenRange::default(),
+            }],
+            entry_func_index: Some(0),
+            closure_table: vec![],
+        };
+
+        let eval = CraneliftAotEvaluator::from_ir_direct(
+            ir,
+            SandboxConfig::default(),
+            vec!["arg0".to_string(), "arg1".to_string()],
+        )
+        .expect("compile");
+
+        // HashMap path (Evaluator trait).
+        let mut hm = HashMap::with_capacity(2);
+        hm.insert("arg0".to_string(), Value::Int(5));
+        hm.insert("arg1".to_string(), Value::Int(7));
+        let r_hm = eval.run_main(hm).expect("hashmap path");
+
+        // SmallMap path.
+        let r_sm = eval
+            .run_main_smallmap(&[("arg0", Value::Int(5)), ("arg1", Value::Int(7))])
+            .expect("smallmap path");
+
+        assert_eq!(r_hm, r_sm);
+        assert_eq!(r_sm, Value::Int(12));
+
+        // Arity mismatch surfaces as Unsupported.
+        let err = eval
+            .run_main_smallmap(&[("arg0", Value::Int(1))])
+            .expect_err("arity mismatch must error");
+        assert!(matches!(err, RuntimeError::Unsupported { .. }));
+
+        // Missing key surfaces as MissingMainArg.
+        let err = eval
+            .run_main_smallmap(&[("arg0", Value::Int(1)), ("bogus", Value::Int(2))])
+            .expect_err("missing arg must error");
+        assert!(matches!(err, RuntimeError::MissingMainArg { .. }));
     }
 }

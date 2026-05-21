@@ -547,6 +547,14 @@ impl SandboxState {
 
     /// Reset the trap slot. Called between invocations so a successful
     /// run doesn't pick up a stale code.
+    ///
+    /// 2026-05-21 dispatch-boundary lever (c): hosts can elide the
+    /// pre-invoke call when they observe `trap_code() == 0` after the
+    /// previous dispatch (i.e. the slot was never set, no reset
+    /// required). This shaves a Relaxed store off the hot dispatch
+    /// path for the success case. See
+    /// [`Self::take_trap_code_and_reset`] for the after-the-fact
+    /// pattern that lets the post-dispatch path own the reset.
     pub fn reset_trap(&self) {
         self.trap_code.store(0, Ordering::Relaxed);
     }
@@ -555,6 +563,24 @@ impl SandboxState {
     /// trap occurred.
     pub fn trap_code(&self) -> u64 {
         self.trap_code.load(Ordering::Relaxed)
+    }
+
+    /// 2026-05-21 dispatch-boundary lever (c): atomic
+    /// "read-then-reset-if-nonzero". Used by the post-dispatch path so
+    /// the pre-invoke reset can be elided in the success case (the slot
+    /// already reads 0 after a successful trap-free invoke).
+    ///
+    /// Returns the observed trap code; a non-zero code is followed by
+    /// a Relaxed store of 0 so the next invoke starts clean. The dual
+    /// is a no-op when the slot is already 0, which compiles to a
+    /// single Relaxed load + a predictable branch (the branch is
+    /// hot-biased toward the no-trap case in the JIT).
+    pub fn take_trap_code(&self) -> u64 {
+        let code = self.trap_code.load(Ordering::Relaxed);
+        if code != 0 {
+            self.trap_code.store(0, Ordering::Relaxed);
+        }
+        code
     }
 
     /// Active vtable. Used by tests / observability.

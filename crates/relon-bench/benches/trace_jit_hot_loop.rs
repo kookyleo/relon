@@ -890,6 +890,16 @@ fn args_acc_i_step_eval(acc: i64, i: i64) -> HashMap<String, Value> {
     m
 }
 
+/// 2026-05-21 dispatch-boundary lever (a): zero-alloc arg packing.
+/// Returns a stack-resident `[(&str, Value); 2]` slice for the
+/// `run_main_smallmap` fast path — no `HashMap`, no `String` heap
+/// allocs, no bucket pre-allocation. The `&'static str` keys live in
+/// the binary's rodata so each call is purely a pair of `Value::Int`
+/// stack writes.
+fn args_acc_i_step_eval_smallmap(acc: i64, i: i64) -> [(&'static str, Value); 2] {
+    [("arg0", Value::Int(acc)), ("arg1", Value::Int(i))]
+}
+
 // =====================================================================
 // =====  bench entry  =================================================
 // =====================================================================
@@ -1098,6 +1108,42 @@ fn bench_hot_loop(c: &mut Criterion) {
                         let r = step_eval
                             .run_main(args_acc_i_step_eval(black_box(acc), black_box(i)))
                             .expect("cranelift step run_main");
+                        if let Value::Int(v) = r {
+                            acc = v;
+                        }
+                    }
+                    black_box(acc);
+                })
+            });
+        },
+    );
+
+    // 2026-05-21 dispatch-boundary lever (a) profile row: same body
+    // as `dispatch_cranelift_step` above but uses the new
+    // `run_main_smallmap(&[(&str, Value)])` fast path that skips the
+    // `HashMap<String, Value>` heap allocation entirely while still
+    // accepting name-keyed args. The delta vs `dispatch_cranelift_step`
+    // isolates the HashMap heap-alloc cost (bucket allocation + 2×
+    // owned-String allocs + bucket drop). The delta vs
+    // `dispatch_cranelift_step_legacy_i64` below isolates the
+    // name-keyed scan + `Value::Int` boxing cost (those remain since
+    // the slice still carries `Value` entries).
+    //
+    // Trap E annotation: `#[zero_alloc]` — the slice is stack-resident
+    // and the `&'static str` keys live in rodata.
+    group.bench_function(
+        BenchmarkId::new("backend", "dispatch_cranelift_step_smallmap"),
+        |b| {
+            b.iter_custom(|iters| {
+                timed_with_warmup(iters, || {
+                    let mut acc: i64 = 0;
+                    for i in 0..HOT_LOOP_N as i64 {
+                        let r = step_eval
+                            .run_main_smallmap(&args_acc_i_step_eval_smallmap(
+                                black_box(acc),
+                                black_box(i),
+                            ))
+                            .expect("cranelift step run_main_smallmap");
                         if let Value::Int(v) = r {
                             acc = v;
                         }
