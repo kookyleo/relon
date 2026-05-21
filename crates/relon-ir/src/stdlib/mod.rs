@@ -295,10 +295,7 @@ mod glob_match_index_tests {
     /// almost certainly with a fatal ABI mismatch on the first call.
     #[test]
     fn glob_match_index_is_37() {
-        assert_eq!(
-            stdlib_function_index("glob_match"),
-            Some(GLOB_MATCH_INDEX)
-        );
+        assert_eq!(stdlib_function_index("glob_match"), Some(GLOB_MATCH_INDEX));
         assert_eq!(stdlib_function_index("glob_match"), Some(37));
     }
 
@@ -307,10 +304,7 @@ mod glob_match_index_tests {
     #[test]
     fn glob_match_method_dispatch_resolves() {
         let idx = stdlib_function_index("glob_match").expect("glob_match stdlib slot");
-        assert_eq!(
-            stdlib_method_index(IrType::String, "glob_match"),
-            Some(idx)
-        );
+        assert_eq!(stdlib_method_index(IrType::String, "glob_match"), Some(idx));
     }
 
     /// The bundled stdlib count grows by exactly one for the
