@@ -13,15 +13,14 @@
 //!    trigger, set the threshold to 1 so the trigger fires on the
 //!    first invocation.
 //! 4. Call `run_main` once.
-//! 5. Assert:
-//!    a. The bytecode VM's `peek_hot(FN_ID)` reports `COUNTER_SATURATED`
-//!       (the prologue ran and the counter tripped).
-//!    b. `jump_helper_call_count()` increased by exactly one (the
-//!       adapter forwarded the event to the recorder).
-//!    c. `global_trace_jit_state().lookup_trace(FN_ID)` returns
-//!       `Some(_)` — the recorder walked the registered IR body, the
-//!       optimiser / emitter / install pipeline ran, and the trace fn
-//!       is now resident.
+//! 5. Assert (a) the bytecode VM's `peek_hot(FN_ID)` reports
+//!    `COUNTER_SATURATED` (the prologue ran and the counter tripped);
+//!    (b) `jump_helper_call_count()` increased by exactly one (the
+//!    adapter forwarded the event to the recorder); (c)
+//!    `global_trace_jit_state().lookup_trace(FN_ID)` returns
+//!    `Some(_)` — the recorder walked the registered IR body, the
+//!    optimiser / emitter / install pipeline ran, and the trace fn
+//!    is now resident.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -113,7 +112,11 @@ fn bytecode_hot_loop_drives_trace_install() {
     args.insert("x".to_string(), Value::Int(40));
     args.insert("y".to_string(), Value::Int(2));
     let result = ev.run_main(args).expect("run_main");
-    assert_eq!(result, Value::Int(42), "bytecode VM still returns the real value");
+    assert_eq!(
+        result,
+        Value::Int(42),
+        "bytecode VM still returns the real value"
+    );
 
     // Assertion a: hot counter saturated.
     assert_eq!(

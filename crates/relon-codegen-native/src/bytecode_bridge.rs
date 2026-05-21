@@ -127,8 +127,7 @@ mod tests {
     /// shape `BcVmConfig` stores.
     #[test]
     fn adapter_works_through_trait_object() {
-        let trigger: std::sync::Arc<dyn HotTraceTrigger> =
-            std::sync::Arc::new(CraneliftHotTrigger);
+        let trigger: std::sync::Arc<dyn HotTraceTrigger> = std::sync::Arc::new(CraneliftHotTrigger);
         trigger.on_hot(65_535, &[]);
     }
 }

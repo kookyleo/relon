@@ -277,10 +277,7 @@ impl BytecodeEvaluator {
     /// [`Self::with_fn_id`] handles the common case where the host
     /// wants the bytecode artefact and the matching cranelift trace
     /// to share the same id.
-    pub fn with_hot_trigger(
-        mut self,
-        trigger: crate::hot_counter::HotTraceTriggerHandle,
-    ) -> Self {
+    pub fn with_hot_trigger(mut self, trigger: crate::hot_counter::HotTraceTriggerHandle) -> Self {
         self.default_config.hot_trigger = Some(trigger);
         self
     }

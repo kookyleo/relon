@@ -763,11 +763,8 @@ impl BytecodeVm {
         // would propagate through the `invoke` call and the host has
         // no convenient catch-unwind boundary today.
         if start_bc_idx == 0 {
-            if let (Some(fn_id), Some(trigger)) =
-                (func.fn_id, self.config.hot_trigger.as_ref())
-            {
-                let outcome =
-                    crate::hot_counter::record_hot(fn_id, self.config.hot_threshold);
+            if let (Some(fn_id), Some(trigger)) = (func.fn_id, self.config.hot_trigger.as_ref()) {
+                let outcome = crate::hot_counter::record_hot(fn_id, self.config.hot_threshold);
                 if outcome == HotCounterResult::HotTrigger {
                     // The packed-args view the recorder needs is just
                     // the args slice we already have on the stack —

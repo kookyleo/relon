@@ -75,9 +75,11 @@ fn hot_counter_fires_trigger_at_threshold() {
     reset_hot_all();
     let trigger = MockTrigger::new();
     let handle: HotTraceTriggerHandle = trigger.clone();
-    let mut cfg = BcVmConfig::default();
-    cfg.hot_trigger = Some(handle);
-    cfg.hot_threshold = 3;
+    let cfg = BcVmConfig {
+        hot_trigger: Some(handle),
+        hot_threshold: 3,
+        ..Default::default()
+    };
     let vm = BytecodeVm::new(cfg);
     let func = make_id_function(/*fn_id=*/ 42);
 
@@ -131,9 +133,11 @@ fn hot_counter_inert_without_fn_id() {
     reset_hot_all();
     let trigger = MockTrigger::new();
     let handle: HotTraceTriggerHandle = trigger.clone();
-    let mut cfg = BcVmConfig::default();
-    cfg.hot_trigger = Some(handle);
-    cfg.hot_threshold = 2;
+    let cfg = BcVmConfig {
+        hot_trigger: Some(handle),
+        hot_threshold: 2,
+        ..Default::default()
+    };
     let vm = BytecodeVm::new(cfg);
     let func = make_id_function_no_id();
     for _ in 0..10 {
@@ -150,9 +154,11 @@ fn partial_resume_skips_hot_counter_bump() {
     reset_hot_all();
     let trigger = MockTrigger::new();
     let handle: HotTraceTriggerHandle = trigger.clone();
-    let mut cfg = BcVmConfig::default();
-    cfg.hot_trigger = Some(handle);
-    cfg.hot_threshold = 1;
+    let cfg = BcVmConfig {
+        hot_trigger: Some(handle),
+        hot_threshold: 1,
+        ..Default::default()
+    };
     let vm = BytecodeVm::new(cfg);
     let func = make_id_function(/*fn_id=*/ 5);
 
@@ -185,9 +191,11 @@ fn distinct_fn_ids_track_independently() {
     reset_hot_all();
     let trigger = MockTrigger::new();
     let handle: HotTraceTriggerHandle = trigger.clone();
-    let mut cfg = BcVmConfig::default();
-    cfg.hot_trigger = Some(handle);
-    cfg.hot_threshold = 2;
+    let cfg = BcVmConfig {
+        hot_trigger: Some(handle),
+        hot_threshold: 2,
+        ..Default::default()
+    };
     let vm = BytecodeVm::new(cfg);
     let func_a = make_id_function(/*fn_id=*/ 100);
     let func_b = make_id_function(/*fn_id=*/ 200);
@@ -219,13 +227,20 @@ fn args_passed_to_trigger_match_invoke_call() {
     reset_hot_all();
     let trigger = MockTrigger::new();
     let handle: HotTraceTriggerHandle = trigger.clone();
-    let mut cfg = BcVmConfig::default();
-    cfg.hot_trigger = Some(handle);
-    cfg.hot_threshold = 1;
+    let cfg = BcVmConfig {
+        hot_trigger: Some(handle),
+        hot_threshold: 1,
+        ..Default::default()
+    };
     let vm = BytecodeVm::new(cfg);
     // Build a function with two arg slots.
     let func = BcFunction {
-        ops: vec![BcOp::LocalGet(0), BcOp::LocalGet(1), BcOp::Add(IrType::I64), BcOp::Return],
+        ops: vec![
+            BcOp::LocalGet(0),
+            BcOp::LocalGet(1),
+            BcOp::Add(IrType::I64),
+            BcOp::Return,
+        ],
         locals: 2,
         ir_pc_map: vec![1, 2, 3, 4],
         stack_recipe: vec![vec![], vec![], vec![], vec![]],
