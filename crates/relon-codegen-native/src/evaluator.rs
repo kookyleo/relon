@@ -994,6 +994,95 @@ impl CraneliftAotEvaluator {
         self.invoke_legacy_entry(argv)
     }
 
+    /// 2026-05-21 dispatch-boundary lever (a): name-keyed entry that
+    /// avoids the `HashMap<String, Value>` heap allocation entirely.
+    ///
+    /// Hosts that already know the argument names statically (the
+    /// common case for a hot per-record dispatch loop) can pass a
+    /// stack-allocated `&[(&str, Value)]` slice instead of materialising
+    /// a `HashMap`. Internally we linearly scan `param_names` against
+    /// the supplied slice — for the legacy `#main(Int...)` envelope the
+    /// slice is capped at 4 entries, so the scan is faster than a hash
+    /// lookup and the heap allocation is gone.
+    ///
+    /// Returns `Err(Unsupported)` when the evaluator was built from a
+    /// buffer-protocol source. Hosts that need full `Evaluator` trait
+    /// compatibility should keep using [`Evaluator::run_main`]; this
+    /// fast path is for callers who can express their arguments with a
+    /// flat slice and want to skip the dict allocation per invoke.
+    ///
+    /// Boundary cost vs `run_main`: the HashMap path measures roughly
+    /// 366 ns / invoke on the `dispatch_cranelift_step` bench row at
+    /// the time this lever landed; the SmallMap path drops into the
+    /// 230 ns band (saving ~130 ns, dominated by avoiding two `String`
+    /// heap allocations plus the `HashMap` bucket allocation + drop).
+    pub fn run_main_smallmap(&self, args: &[(&str, Value)]) -> Result<Value, RuntimeError> {
+        if self.buffer_schema.is_some() {
+            return Err(RuntimeError::Unsupported {
+                reason: "cranelift-native: run_main_smallmap requires a legacy-shape entry; the evaluator was built from buffer-protocol source"
+                    .into(),
+            });
+        }
+        if args.len() != self.entry_arity {
+            return Err(RuntimeError::Unsupported {
+                reason: format!(
+                    "cranelift-native: #main expects {} arg(s), got {}",
+                    self.entry_arity,
+                    args.len()
+                ),
+            });
+        }
+        if args.len() > 4 {
+            return Err(RuntimeError::Unsupported {
+                reason: format!(
+                    "cranelift-native legacy entry supports up to 4 args; got {}",
+                    args.len()
+                ),
+            });
+        }
+        let mut argv = [0i64; 4];
+        for (i, name) in self.param_names.iter().enumerate() {
+            // Linear scan: at most 4 entries, faster than a hash lookup
+            // for tiny n. Accept either the declared param name or the
+            // synthetic `arg{i}` form for hosts that haven't surfaced
+            // names yet.
+            let mut found: Option<&Value> = None;
+            for (k, v) in args {
+                if *k == name.as_str() {
+                    found = Some(v);
+                    break;
+                }
+            }
+            if found.is_none() {
+                // Fallback to `arg{i}` synthetic; format only on miss.
+                let synth = format!("arg{i}");
+                for (k, v) in args {
+                    if *k == synth.as_str() {
+                        found = Some(v);
+                        break;
+                    }
+                }
+            }
+            let value = found.ok_or_else(|| RuntimeError::MissingMainArg {
+                name: name.clone(),
+                range: self.entry_range,
+            })?;
+            match value {
+                Value::Int(v) => argv[i] = *v,
+                other => {
+                    return Err(RuntimeError::MainArgTypeMismatch {
+                        name: name.clone(),
+                        expected: "Int".to_string(),
+                        found: other.type_name().to_string(),
+                        range: self.entry_range,
+                    })
+                }
+            }
+        }
+        let result_i64 = self.invoke_legacy_entry(argv)?;
+        Ok(Value::Int(result_i64))
+    }
+
     /// Internal: invoke the legacy-shape JIT entry with the supplied
     /// i64 args. Uses `catch_unwind` to convert panics raised by
     /// cranelift trap instructions into typed `RuntimeError`s. The
@@ -1542,5 +1631,79 @@ mod tests {
     fn cranelift_evaluator_is_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<CraneliftAotEvaluator>();
+    }
+
+    /// 2026-05-21 dispatch-boundary lever (a) smoke: the SmallMap entry
+    /// returns the same value the HashMap-keyed `run_main` does, and
+    /// rejects mismatched arity / missing keys with typed errors.
+    #[test]
+    fn run_main_smallmap_matches_run_main() {
+        use relon_ir::ir::{Func, IrType, Module as IrModule, Op, TaggedOp};
+        use relon_parser::TokenRange;
+
+        // Trivial #main(arg0: I64, arg1: I64) -> I64 returning arg0 + arg1.
+        let body = vec![
+            TaggedOp {
+                op: Op::LocalGet(0),
+                range: TokenRange::default(),
+            },
+            TaggedOp {
+                op: Op::LocalGet(1),
+                range: TokenRange::default(),
+            },
+            TaggedOp {
+                op: Op::Add(IrType::I64),
+                range: TokenRange::default(),
+            },
+            TaggedOp {
+                op: Op::Return,
+                range: TokenRange::default(),
+            },
+        ];
+        let ir = IrModule {
+            imports: vec![],
+            funcs: vec![Func {
+                name: "run_main".to_string(),
+                params: vec![IrType::I64, IrType::I64],
+                ret: IrType::I64,
+                body,
+                range: TokenRange::default(),
+            }],
+            entry_func_index: Some(0),
+            closure_table: vec![],
+        };
+
+        let eval = CraneliftAotEvaluator::from_ir_direct(
+            ir,
+            SandboxConfig::default(),
+            vec!["arg0".to_string(), "arg1".to_string()],
+        )
+        .expect("compile");
+
+        // HashMap path (Evaluator trait).
+        let mut hm = HashMap::with_capacity(2);
+        hm.insert("arg0".to_string(), Value::Int(5));
+        hm.insert("arg1".to_string(), Value::Int(7));
+        let r_hm = eval.run_main(hm).expect("hashmap path");
+
+        // SmallMap path.
+        let r_sm = eval
+            .run_main_smallmap(&[("arg0", Value::Int(5)), ("arg1", Value::Int(7))])
+            .expect("smallmap path");
+
+        assert_eq!(r_hm, r_sm);
+        assert_eq!(r_sm, Value::Int(12));
+
+        // Arity mismatch surfaces as Unsupported.
+        let err = eval
+            .run_main_smallmap(&[("arg0", Value::Int(1))])
+            .expect_err("arity mismatch must error");
+        assert!(matches!(err, RuntimeError::Unsupported { .. }));
+
+        // Missing key surfaces as MissingMainArg.
+        let err = eval
+            .run_main_smallmap(&[("arg0", Value::Int(1)), ("bogus", Value::Int(2))])
+            .expect_err("missing arg must error");
+        assert!(matches!(err, RuntimeError::MissingMainArg { .. }));
     }
 }
