@@ -12,21 +12,27 @@ W12 ≤ 250 ns (~2× LuaJIT).
 
 ## Result
 
-W12 `relon_bytecode` dropped from **448.59 ns → 181.39 ns**
-(−60 %, −267 ns delta, **target ≤ 250 ns surpassed**). Ratio vs
-LuaJIT now ~1.68× (was 4.15×). p = 0.00 < 0.05 on the criterion
-change report; performance gain is robust to bench noise.
+W12 `relon_bytecode` dropped from **448.59 ns → 192.87 ns** (criterion
+median across the post-lever rerun; first sweep right after lever 1
+landed read 181.39 ns under cleaner machine quiescence). **Target
+≤ 250 ns surpassed**. Both runs sit well below the 250 ns gate; the
+~10 ns spread is bench-machine noise (16 high outliers / 100 samples
+in the rerun under `RELON_BENCH_FORCE_RUN=1` with concurrent load).
+Ratio vs LuaJIT now ~1.84× (192.87 / 104.56 vs prior 4.15×).
 
 ### W12 before / after table
 
-| backend                | before (ns) | after (ns) | delta    |
-|------------------------|-------------|------------|----------|
-| `relon_bytecode`       | 448.59      | 181.39     | −267 ns  |
-| `luajit` (reference)   | 107.86      | 107.86     | 0 ns     |
-| `relon_tree_walk`      | unchanged   | unchanged  | —        |
-| `relon_trace_jit`      | unchanged   | unchanged  | —        |
+| backend                | before (ns) | after (ns)   | delta    |
+|------------------------|-------------|--------------|----------|
+| `relon_bytecode`       | 448.59      | 181.39 ~ 192.87 | −255 to −267 ns |
+| `luajit` (reference)   | 107.86      | 104.56       | bench-noise band |
+| `relon_tree_walk`      | unchanged   | unchanged    | —        |
+| `relon_trace_jit`      | unchanged   | 177.79       | unchanged path |
 
-Ratio vs LuaJIT: 4.15× → 1.68×.
+Ratio vs LuaJIT: 4.15× → 1.84× (worst-case post-rerun reading);
+1.74× under cleaner quiescence. Note that the bytecode VM now sits
+within ~9 % of the trace-JIT row on W12 — the dispatcher-switch path
+no longer dominates for the trivial fixture.
 
 ## Levers landed
 
