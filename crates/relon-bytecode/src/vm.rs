@@ -760,7 +760,14 @@ impl BytecodeVm {
                 );
             }
             last_bc_idx = pc;
-            match self.dispatch_one(func, &func.ops[pc], &mut stack, &mut locals, &mut memory, pc) {
+            match self.dispatch_one(
+                func,
+                &func.ops[pc],
+                &mut stack,
+                &mut locals,
+                &mut memory,
+                pc,
+            ) {
                 Ok(StepOutcome::Advance) => pc += 1,
                 Ok(StepOutcome::Jump(target)) => {
                     if target > func.ops.len() {
@@ -940,7 +947,12 @@ impl BytecodeVm {
                     // encoder reaches into `memory` for the String /
                     // ListInt lift lanes, so it has to thread the
                     // arena state through.
-                    stack.push(encode_value_for_ret(&returned, *ret_ty, *import_idx, memory)?);
+                    stack.push(encode_value_for_ret(
+                        &returned,
+                        *ret_ty,
+                        *import_idx,
+                        memory,
+                    )?);
                 } else {
                     for _ in 0..*arg_count {
                         pop(stack, bc_idx)?;
@@ -1074,8 +1086,16 @@ impl BytecodeVm {
                 // lhs; alloc a fresh slot.
                 let rhs_h = pop(stack, bc_idx)? as u32;
                 let lhs_h = pop(stack, bc_idx)? as u32;
-                let lhs = memory.strings.get(lhs_h).map_err(arena_to_vm_error)?.clone();
-                let rhs = memory.strings.get(rhs_h).map_err(arena_to_vm_error)?.clone();
+                let lhs = memory
+                    .strings
+                    .get(lhs_h)
+                    .map_err(arena_to_vm_error)?
+                    .clone();
+                let rhs = memory
+                    .strings
+                    .get(rhs_h)
+                    .map_err(arena_to_vm_error)?
+                    .clone();
                 let mut joined = String::with_capacity(lhs.len() + rhs.len());
                 joined.push_str(&lhs);
                 joined.push_str(&rhs);
@@ -1086,8 +1106,16 @@ impl BytecodeVm {
                 // `[s_lhs, s_rhs] -> [bool]`. Byte-equal compare.
                 let rhs_h = pop(stack, bc_idx)? as u32;
                 let lhs_h = pop(stack, bc_idx)? as u32;
-                let lhs = memory.strings.get(lhs_h).map_err(arena_to_vm_error)?.clone();
-                let rhs = memory.strings.get(rhs_h).map_err(arena_to_vm_error)?.clone();
+                let lhs = memory
+                    .strings
+                    .get(lhs_h)
+                    .map_err(arena_to_vm_error)?
+                    .clone();
+                let rhs = memory
+                    .strings
+                    .get(rhs_h)
+                    .map_err(arena_to_vm_error)?
+                    .clone();
                 stack.push(if lhs.as_ref() == rhs.as_ref() { 1 } else { 0 });
             }
             BcOp::MakeDict { len } => {
