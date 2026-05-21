@@ -1269,6 +1269,35 @@ mod tests {
         ));
     }
 
+    /// Core path smoke test: minified input must reach the canonical
+    /// shape on the first call and stay there on the second. Guards
+    /// against regressions in the format-then-tokenize-then-rewrite
+    /// pipeline where a missing paragraph-break offset or a stray
+    /// emit would otherwise silently change the second pass.
+    #[test]
+    fn format_source_double_idempotent_on_minified() {
+        let minified = "{a:1,b:2}";
+        let once = format_source(minified).expect("first format must succeed");
+        assert_ne!(once, minified, "expected reflow of minified input");
+        let twice = format_source(&once).expect("second format must succeed");
+        assert_eq!(once, twice, "format_source is not idempotent");
+        assert!(
+            is_formatted(&once).expect("is_formatted must succeed"),
+            "first-pass output must report as already formatted"
+        );
+    }
+
+    /// Garbage that no recovery can rescue must surface as a typed
+    /// `Error::Parse`, not a panic. The CLI / LSP entry points rely on
+    /// this contract to render diagnostics instead of crashing.
+    #[test]
+    fn format_source_surfaces_parse_error_on_garbage() {
+        assert!(matches!(
+            format_source("{ bad syntax"),
+            Err(Error::Parse(_))
+        ));
+    }
+
     #[test]
     fn keeps_type_generics_compact() {
         for source in [
