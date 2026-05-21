@@ -89,6 +89,16 @@ pub const STRING_REF_LEN_OFFSET: i32 = 8;
 // match the host-side `StringRef` layout. Any reordering / type
 // change in `StringRef` triggers a build error here so the emitter
 // can never drift silently.
+//
+// Gated on `target_pointer_width = "64"` because the offsets above
+// assume a 64-bit `usize` (`len` lives at byte 8). On 32-bit targets
+// (notably `wasm32-unknown-unknown`, which the workspace must still
+// `cargo check` cleanly for the playground / docs build) `usize` is
+// 4 bytes and `len` lands at byte 4, which is fine — the trace JIT
+// runtime never executes on wasm32 (cranelift cannot target the host
+// from wasm), but the crate's pure-Rust portions still need to type-
+// check there for the wasm playground's dependency tree.
+#[cfg(target_pointer_width = "64")]
 const _: () = {
     assert!(
         core::mem::offset_of!(StringRef, ptr) == STRING_REF_PTR_OFFSET as usize,
