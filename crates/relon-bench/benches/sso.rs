@@ -163,5 +163,88 @@ fn bench_concat(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_construct, bench_clone, bench_concat);
+/// `concat_tree` row group — single-expression chain shape that the
+/// evaluator now folds into one `SmolStr::concat_many` call (Tier 2b,
+/// #152). Compares three implementations on the same logical result:
+///
+/// * `nested_concat` — what the tree-walker did **before** the fold:
+///   N-1 recursive `SmolStr::concat` calls, each allocating a fresh
+///   `Arc<str>` once the running prefix passes the 22-byte SSO cap.
+/// * `concat_many` — the new single-allocation path.
+/// * `string_with_capacity` — `String::with_capacity` + push baseline,
+///   useful as a "no SSO enum dispatch" ceiling.
+///
+/// Two payload regimes:
+///
+/// * `inline` — 4 leaves of 4 bytes = 16 byte result, stays in the
+///   inline slot for the `concat_many` path. Wins for `concat_many`
+///   are pure allocator skips on the intermediate prefix.
+/// * `heap` — 4 leaves of 8 bytes = 32 byte result, past the SSO cap.
+///   `nested_concat` allocates one `Arc<str>` per intermediate;
+///   `concat_many` allocates one for the final 32-byte payload.
+const CONCAT_TREE_LEAVES_INLINE: &[&str] = &["foo_", "bar_", "baz_", "qux_"];
+const CONCAT_TREE_LEAVES_HEAP: &[&str] = &["aaaaaaaa", "bbbbbbbb", "cccccccc", "dddddddd"];
+
+fn concat_tree_nested(leaves: &[&str]) -> SmolStr {
+    // Pre-fold shape: N-1 `SmolStr::concat` calls form a left-leaning
+    // chain. Each step allocates an `Arc<str>` for the running prefix
+    // once the prefix passes the 22-byte SSO cap.
+    let mut acc = SmolStr::from(leaves[0]);
+    for leaf in &leaves[1..] {
+        acc = SmolStr::concat(acc.as_str(), leaf);
+    }
+    acc
+}
+
+fn concat_tree_many(leaves: &[&str]) -> SmolStr {
+    // Folded shape: a single `concat_many` call with all leaves —
+    // one allocation for the final payload.
+    SmolStr::concat_many(leaves)
+}
+
+fn concat_tree_string_baseline(leaves: &[&str]) -> String {
+    let total: usize = leaves.iter().map(|s| s.len()).sum();
+    let mut buf = String::with_capacity(total);
+    for leaf in leaves {
+        buf.push_str(leaf);
+    }
+    buf
+}
+
+fn bench_concat_tree(c: &mut Criterion) {
+    let mut group = c.benchmark_group("sso/concat_tree");
+
+    for (label, leaves) in [
+        ("inline", CONCAT_TREE_LEAVES_INLINE),
+        ("heap", CONCAT_TREE_LEAVES_HEAP),
+    ] {
+        let total: u64 = leaves.iter().map(|s| s.len() as u64).sum();
+        group.throughput(Throughput::Bytes(total));
+
+        group.bench_with_input(
+            BenchmarkId::new("nested_concat", label),
+            &leaves,
+            |b, leaves| b.iter(|| concat_tree_nested(black_box(leaves))),
+        );
+        group.bench_with_input(
+            BenchmarkId::new("concat_many", label),
+            &leaves,
+            |b, leaves| b.iter(|| concat_tree_many(black_box(leaves))),
+        );
+        group.bench_with_input(
+            BenchmarkId::new("string_with_capacity", label),
+            &leaves,
+            |b, leaves| b.iter(|| concat_tree_string_baseline(black_box(leaves))),
+        );
+    }
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_construct,
+    bench_clone,
+    bench_concat,
+    bench_concat_tree,
+);
 criterion_main!(benches);
