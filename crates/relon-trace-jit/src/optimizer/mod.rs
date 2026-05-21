@@ -4,33 +4,60 @@
 //! mutates a [`crate::TraceBuffer`] in place and returns a
 //! [`PassReport`] for diagnostics.
 //!
-//! Pass ordering matters. The default pipeline runs:
+//! ## Pass ordering invariants
+//!
+//! The default pipeline runs eight passes in a fixed order. Each
+//! ordering choice has a load-bearing reason; before reordering or
+//! inserting a new pass, read the dependency it would cross.
 //!
 //! 1. [`const_fold::ConstFold`] -- collapse arithmetic on captured
-//!    constants. Runs first so later passes see propagated literals.
+//!    constants. MUST run first so the literals it propagates are
+//!    visible to every subsequent pass (load-forwarding's slot
+//!    keys, type-spec's guard arguments, dict-ic-hoist's invariance
+//!    check).
 //! 2. [`load_forward::LoadForwarding`] -- alias `Load(addr)` results
-//!    to the value most recently `Store`d at the same slot, when no
-//!    intervening op clobbers it.
+//!    to the value most recently `Store`d at the same slot. Relies
+//!    on `ConstFold` having turned constant offsets into stable
+//!    `(base, offset)` keys.
 //! 3. [`dead_store::DeadStoreElim`] (round 1) -- drop the loads
-//!    forwarded above plus any plain redundant stores.
-//! 4. [`type_spec::TypeSpec`] -- insert `Guard(TypeCheck(...))`
-//!    ops in front of generic call sites with observed types.
+//!    forwarded above plus any plain redundant stores. MUST follow
+//!    `LoadForwarding` to pick up its trail of dead `Load` ops.
+//! 4. [`type_spec::TypeSpec`] -- insert `Guard(TypeCheck(...))` ops
+//!    in front of generic call sites with observed types. Order
+//!    relative to `dict_ic_hoist` / `licm` is incidental (the
+//!    guards it inserts don't affect dict-pointer invariance), but
+//!    it MUST precede `noop_typecheck_elim`, which folds away the
+//!    guards `type_spec` inserts but `licm` later finds redundant.
 //! 5. [`dict_ic_hoist::DictIcHoist`] -- split in-loop
 //!    `TraceOp::DictLookup` ops with loop-invariant `dict_ptr` into
 //!    a hoistable `DictShapeGuard` + an in-loop
-//!    `DictLookupPrechecked`. Runs immediately before LICM so the
-//!    fresh shape-guard ops feed into the LICM scan in the same
-//!    pipeline round.
+//!    `DictLookupPrechecked`. MUST run **before** `LICM` so the
+//!    freshly inserted `DictShapeGuard` ops are visible to the
+//!    LICM invariant scan in the same pipeline round; otherwise
+//!    they would only get hoisted on a follow-up run, which the
+//!    pipeline never schedules.
 //! 6. [`licm::LICM`] -- hoist `MarkLoopHead`-bracketed pure
-//!    invariants (including the freshly inserted `DictShapeGuard`s
-//!    from the previous pass) to the loop entry.
-//! 7. [`dead_store::DeadStoreElim`] (round 2) -- pick up any stores
+//!    invariants (including the `DictShapeGuard`s from the previous
+//!    pass) to the loop preheader. MUST run after `dict_ic_hoist`
+//!    (see above) and before `noop_typecheck_elim` (see below).
+//! 7. [`noop_typecheck_elim::NoopTypeCheckElim`] -- drop
+//!    `Guard(TypeCheck(var, ty))` ops whose observed type already
+//!    matches `ty`. MUST run **after** `LICM` so any TypeCheck that
+//!    LICM hoisted out of the loop body — and that now sits in a
+//!    region where the observed type is statically known — also
+//!    gets eliminated in the same pass.
+//! 8. [`dead_store::DeadStoreElim`] (round 2) -- pick up any stores
 //!    that became dead after type specialisation / LICM moved
-//!    guards around.
+//!    guards around. Cheap when nothing changed; preserved so the
+//!    pipeline doesn't need a third round for rare interactions.
 //!
 //! Two rounds of `DeadStoreElim` are explicit: round 1 cleans up
 //! forwarded loads (cheap), round 2 cleans up the trailing effects
 //! of `type_spec` / `licm` (rarely needed, but cheap to keep).
+//!
+//! When adding a new pass, declare its ordering dependencies in
+//! this list AND in the new pass's own module-level docs (each
+//! existing pass file carries an "Ordering" section pointing here).
 
 pub mod const_fold;
 pub mod dead_store;

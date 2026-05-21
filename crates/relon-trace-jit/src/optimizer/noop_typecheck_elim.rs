@@ -16,6 +16,18 @@
 //! also rebinds surviving guards' trace_pc to their new indices via
 //! a position-tracking sweep — mirrors `rebind_guard_pcs` in
 //! [`crate::optimizer::licm`].
+//!
+//! ## Ordering
+//!
+//! Runs after [`super::licm::LICM`] and before the round-2
+//! [`super::dead_store::DeadStoreElim`]. The post-LICM placement is
+//! load-bearing: LICM can hoist a `TypeCheck` guard out of the loop
+//! body into the preheader, and only after that move does this pass
+//! see it sitting in a region where the recorder's observed type
+//! statically matches `expected`. Running before LICM would miss
+//! every hoist-eligible guard and leave the per-iter `brif` on the
+//! hot path. See the [`super`] module docs for the full pipeline
+//! contract.
 
 use std::collections::HashSet;
 

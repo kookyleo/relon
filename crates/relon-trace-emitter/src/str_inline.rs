@@ -80,6 +80,35 @@
 //! cranelift block is the one that flows into the lowering, on exit the
 //! current block is the join after the scan (so subsequent ops continue
 //! in straight line).
+//!
+//! ## Inline / fallback decision pattern
+//!
+//! `StrContains` and the dict counterpart in [`crate::dict_inline`]
+//! share a probe-threshold-tier dispatch pattern, run by the emitter
+//! at op-lowering time:
+//!
+//! 1. **Probe side table** — `OptimizedTrace::const_bytes_for(needle_ssa)`
+//!    asks whether the recorder pinned a literal payload for the
+//!    needle. `None` means "needle is dynamic" — go straight to the
+//!    extern shim.
+//! 2. **Threshold check** — when a payload is present, run it
+//!    through [`needle_fits_inline`] ([`MAX_INLINE_NEEDLE_LEN`]
+//!    bytes). Longer needles fall through to the shim so the
+//!    per-trace machine-code footprint stays bounded.
+//! 3. **Lowering tier** — when both checks pass, call
+//!    [`emit_str_contains_inline`] with a [`HaystackHandle`]
+//!    chosen by another probe of the buffer's
+//!    `str_payload` side table (preloaded payload when the LICM
+//!    pass hoisted the StringRef deref, raw pointer otherwise).
+//!    Otherwise emit the extern `__relon_str_contains` call.
+//!
+//! Document mirror: [`crate::dict_inline`]'s "Inline / fallback
+//! decision pattern" section covers the same pattern for
+//! `DictLookupPrechecked`. The dispatcher lives in [`crate::emitter`]
+//! because the per-callsite glue is emitter state; a generic
+//! `InlineDecisionHelper<T>` was considered and rejected (dict's key
+//! is `u32`, str's is `&[u8]`, and the inline-form signatures are
+//! disjoint).
 
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::types::{I16, I32, I64, I8X16};

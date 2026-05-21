@@ -27,11 +27,16 @@
 //!    [`crate::runtime::dict_list::__relon_trace_dict_lookup_prechecked`],
 //!    which skips the shape compare.
 //!
-//! ## Ordering invariant
+//! ## Ordering
 //!
-//! This pass MUST run BEFORE `LICM`. The optimizer pipeline already
-//! orders LICM after `type_spec`, so we insert `dict_ic_hoist` just
-//! before LICM (and after `type_spec`, which is unrelated).
+//! Runs after [`super::type_spec::TypeSpec`] (incidental — type-spec
+//! doesn't interact with `dict_ptr` invariance) and MUST run
+//! **before** [`super::licm::LICM`]. The freshly inserted
+//! `DictShapeGuard` ops carry `EffectClass::Pure` so LICM treats
+//! them as hoistable; if `dict_ic_hoist` ran after LICM, the guards
+//! would only get hoisted on a follow-up pipeline pass, which the
+//! default pipeline never schedules. See the [`super`] module docs
+//! for the full pipeline contract.
 //!
 //! ## Why not also hoist the prechecked op when `key_ptr` is invariant
 //!

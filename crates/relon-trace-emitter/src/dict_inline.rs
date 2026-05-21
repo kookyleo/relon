@@ -110,6 +110,43 @@
 //! [`crate::emitter::TraceEmitterState::emit_dict_lookup_prechecked`]
 //! dispatcher applies a soft cap so machine-code footprint stays
 //! bounded; see that callsite for the constant.
+//!
+//! ## Inline / fallback decision pattern
+//!
+//! `DictLookupPrechecked` (and its sibling `StrContains` in
+//! [`crate::str_inline`]) share a three-tier dispatch pattern, run
+//! by the emitter at op-lowering time:
+//!
+//! 1. **Probe side table** — look up the recorder's per-SSA hint
+//!    ([`relon_trace_jit::OptimizedTrace::dict_entry_count_hint`]
+//!    for dicts; `const_bytes_for` for strings). Absence means
+//!    "no hint" — take the most general path.
+//! 2. **Threshold check** — when a hint is present, compare it
+//!    against the inline-form cap ([`MAX_INLINE_UNROLL`] for
+//!    dict; [`crate::str_inline::MAX_INLINE_NEEDLE_LEN`] for str).
+//!    Above the cap, fall through to the next tier — the inline
+//!    form's machine-code footprint would dominate the win.
+//! 3. **Lowering tier** — pick from (best → worst):
+//!    - **Fully inline / unrolled** — straight-line cranelift IR
+//!      with no extern call and no inner loop. Used only when
+//!      both (1) and (2) hold.
+//!    - **Inline data-driven** — straight-line cranelift IR with
+//!      a tight inner loop. Used for dicts that have a hint above
+//!      the unroll cap, and for strs the recorder pinned a needle
+//!      but it's > `MAX_INLINE_NEEDLE_LEN` (today: falls through
+//!      to extern instead — no intermediate tier for str).
+//!    - **Extern shim call** — fallback when no hint is recorded.
+//!
+//! The dispatcher lives in [`crate::emitter`] rather than this
+//! module because the per-callsite glue (SSA lookups, hoisted-SSA
+//! bundles, deopt-block plumbing) is emitter state. The inline
+//! modules export the cap constants and the inline-form emitters;
+//! the emitter owns the if-let chain that walks the tiers. A
+//! generic `InlineDecisionHelper<T>` abstraction was considered
+//! and rejected — the dict and str dispatchers branch on different
+//! key types (`u32` count vs `&[u8]` payload) and feed disjoint
+//! inline-form signatures, so the helper would collapse to two
+//! independent callsites masquerading as one.
 
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::types::{I32, I64, I8};
