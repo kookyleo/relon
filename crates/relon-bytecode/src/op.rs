@@ -156,6 +156,36 @@ pub enum BcOp {
     /// witness slot so the dispatch loop has a `length`-shaped
     /// instruction to step over rather than synthesising one.
     ListLen,
+
+    /// M2-B phase 4b: allocate a list slot from the supplied operands.
+    /// `[v_0, v_1, ..., v_{len-1}] -> [list_handle]`. Pops `len` slots
+    /// in declaration order (top-of-stack is `v_{len-1}`), copies them
+    /// into a fresh [`crate::arena::ListArena`] slot, and pushes the
+    /// handle. Element values travel through the same `u64` lane the
+    /// rest of the dispatch loop uses — int / bool / f64-via-bits all
+    /// share the slot shape.
+    ///
+    /// Phase 4b only models type-uniform lists (matching the IR
+    /// `Op::ConstList*` surface). The handle is VM-local — it must
+    /// not be observed across `invoke` boundaries; phase 4b-continuation
+    /// adds the host-fn boundary `encode_list_for_ret` /
+    /// `decode_list_arg` pair.
+    MakeList {
+        /// Number of operands the op pops off the stack.
+        len: u32,
+    },
+
+    /// M2-B phase 4b: index into a list by integer. `[list_handle, i64
+    /// index] -> [u64 element]`. Pops the index first (top-of-stack)
+    /// then the handle, consults the list arena, and pushes the slot
+    /// element. Out-of-range indices (including negative) trip
+    /// [`crate::vm::BcVmError::IndexOutOfBounds`] without observing
+    /// the element value.
+    ///
+    /// The pushed element travels through the same `u64` lane as the
+    /// rest of the dispatch loop — consumer ops know the type from
+    /// their own BcOp variant (e.g. `BcOp::Add(I64)` reads it as `i64`).
+    ListGetInt,
 }
 
 /// M2-B phase 3: scalar-pure stdlib handlers the bytecode VM can

@@ -149,12 +149,10 @@ impl ListArena {
     /// Read a list slot. Returns a borrowed `Arc<Vec<u64>>` so the
     /// caller pays refcount cost only on `clone()`.
     pub fn get(&self, handle: Handle) -> Result<&ListSlot, ArenaError> {
+        let len = self.slots.len();
         self.slots
             .get(handle as usize)
-            .ok_or_else(|| ArenaError::OutOfRange {
-                handle,
-                len: self.slots.len(),
-            })
+            .ok_or(ArenaError::OutOfRange { handle, len })
     }
 
     /// Read one element from a list slot. `IndexOutOfBounds`-style
@@ -168,12 +166,13 @@ impl ListArena {
                 len: slot.len(),
             });
         }
-        slot.get(index as usize)
-            .copied()
-            .ok_or_else(|| ArenaError::ElementOutOfRange {
+        let len = slot.len();
+        slot.get(index as usize).copied().ok_or({
+            ArenaError::ElementOutOfRange {
                 index: index as usize,
-                len: slot.len(),
-            })
+                len,
+            }
+        })
     }
 
     /// Length of a list slot. Lifts into the `i64` lane the dispatch
@@ -210,12 +209,10 @@ impl StringArena {
 
     /// Read a string slot.
     pub fn get(&self, handle: Handle) -> Result<&StringSlot, ArenaError> {
+        let len = self.slots.len();
         self.slots
             .get(handle as usize)
-            .ok_or_else(|| ArenaError::OutOfRange {
-                handle,
-                len: self.slots.len(),
-            })
+            .ok_or(ArenaError::OutOfRange { handle, len })
     }
 
     /// Code-point count of a string slot — matches tree-walker's
@@ -251,12 +248,10 @@ impl DictArena {
 
     /// Read a dict slot.
     pub fn get(&self, handle: Handle) -> Result<&DictSlot, ArenaError> {
+        let len = self.slots.len();
         self.slots
             .get(handle as usize)
-            .ok_or_else(|| ArenaError::OutOfRange {
-                handle,
-                len: self.slots.len(),
-            })
+            .ok_or(ArenaError::OutOfRange { handle, len })
     }
 
     /// Look up a key. Returns `None` on miss (caller decides whether
