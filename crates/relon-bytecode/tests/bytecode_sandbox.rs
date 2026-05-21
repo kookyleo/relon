@@ -289,15 +289,33 @@ fn vtable_grant_smoke() {
     assert!(!vtable.is_granted(8));
 }
 
-// -- M2-B phase 1: CapabilityGate hook smoke ----------------------
+// -- M2-B phase 2: CapabilityGate dispatch consult ----------------
 
-/// Counts every `check` invocation so the test can confirm the hook
-/// is reachable from the evaluator surface. The dispatch path does
-/// not consult the gate yet (phase 2 work) — this test only proves
-/// the slot is wired so future phases can dispatch through it without
-/// re-plumbing the type.
+/// Counts every `check` invocation so the test can pin how many
+/// dispatch-time consults the VM made. Phase 2 consults at two
+/// points: the pre-dispatch sweep over grant-table bits, and the
+/// `BcOp::Trap(CapabilityDenied)` enrichment path.
 struct CountingGate {
     hits: std::sync::atomic::AtomicU64,
+    /// Bits the gate grants — stored as bit indices to side-step the
+    /// absent `Hash` impl on [`relon_eval_api::CapabilityBit`].
+    granted: Vec<u32>,
+}
+
+impl CountingGate {
+    fn deny_all() -> Self {
+        Self {
+            hits: std::sync::atomic::AtomicU64::new(0),
+            granted: Vec::new(),
+        }
+    }
+
+    fn allow(bits: &[relon_eval_api::CapabilityBit]) -> Self {
+        Self {
+            hits: std::sync::atomic::AtomicU64::new(0),
+            granted: bits.iter().map(|b| b.bit_index()).collect(),
+        }
+    }
 }
 
 impl relon_eval_api::CapabilityGate for CountingGate {
@@ -306,10 +324,11 @@ impl relon_eval_api::CapabilityGate for CountingGate {
         cap: relon_eval_api::CapabilityBit,
     ) -> Result<(), relon_eval_api::CapabilityError> {
         self.hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        // Deny everything; the dispatch path doesn't consult the gate
-        // in phase 1, so denial here must not surface as a runtime
-        // error for arithmetic-only sources.
-        Err(relon_eval_api::CapabilityError::not_granted(cap))
+        if self.granted.contains(&cap.bit_index()) {
+            Ok(())
+        } else {
+            Err(relon_eval_api::CapabilityError::not_granted(cap))
+        }
     }
 }
 
@@ -317,23 +336,29 @@ impl relon_eval_api::CapabilityGate for CountingGate {
 fn capability_gate_hook_can_be_installed_and_inspected() {
     use std::sync::Arc;
 
-    let gate = Arc::new(CountingGate {
-        hits: std::sync::atomic::AtomicU64::new(0),
-    });
+    // Scalar-only source compiles to an empty grant table; the M2-B
+    // phase 2 pre-dispatch sweep therefore performs zero gate hits
+    // and the run completes regardless of the gate's deny posture.
+    // This pins the scaffold-envelope behaviour: a host can install
+    // a deny-everything gate on a pure arithmetic source without
+    // breaking it.
+    let gate_concrete = Arc::new(CountingGate::deny_all());
+    let gate: Arc<dyn relon_eval_api::CapabilityGate> = gate_concrete.clone();
     let ev = BytecodeEvaluator::from_source("#main(Int x, Int y) -> Int\nx + y")
         .unwrap()
-        .with_capability_gate(gate.clone());
+        .with_capability_gate(gate);
 
-    // Run a scalar-only source: the dispatch path is unchanged in
-    // phase 1, so the gate is parked but never consulted. We assert
-    // both: the run completes successfully and the gate sees zero
-    // dispatch-time hits.
     let mut args = HashMap::new();
     args.insert("x".to_string(), Value::Int(40));
     args.insert("y".to_string(), Value::Int(2));
     let value = ev.run_main(args).expect("scalar source runs unchanged");
     assert_eq!(value, Value::Int(42));
-    assert_eq!(gate.hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+    // Empty grant table → zero pre-dispatch consults. Phase 3 IR
+    // coverage will widen this once `BcOp::CallNative` lands.
+    assert_eq!(
+        gate_concrete.hits.load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
 }
 
 #[test]
@@ -342,9 +367,167 @@ fn capability_vtable_set_gate_round_trips() {
 
     let mut vtable = CapabilityVtable::default();
     assert!(vtable.gate().is_none());
-    let gate: Arc<dyn relon_eval_api::CapabilityGate> = Arc::new(CountingGate {
-        hits: std::sync::atomic::AtomicU64::new(0),
-    });
+    let gate: Arc<dyn relon_eval_api::CapabilityGate> = Arc::new(CountingGate::deny_all());
     vtable.set_gate(gate);
     assert!(vtable.gate().is_some());
+}
+
+#[test]
+fn capability_gate_denial_surfaces_as_error_on_pre_dispatch_sweep() {
+    use relon_bytecode::compile::build_offset_to_local;
+    use relon_bytecode::op::{BcFunction, BcOp};
+    use std::sync::Arc;
+
+    // Construct a hand-built BcFunction that does nothing but return
+    // a constant — no capability ops in the stream. We then grant a
+    // bit in the vtable and install a gate that denies it. The
+    // dispatch-time pre-check must trip CapabilityDenied with the
+    // denied bit, *before* any op runs.
+    let _ = build_offset_to_local; // suppress unused warning
+    let bc = BcFunction {
+        ops: vec![BcOp::ConstI64(7), BcOp::Return],
+        locals: 0,
+        ir_pc_map: vec![1, 2],
+        stack_recipe: vec![vec![], vec![]],
+    };
+
+    let mut vtable = CapabilityVtable::default();
+    vtable.grant(relon_eval_api::CapabilityBit::Network.bit_index());
+    let gate_concrete = Arc::new(CountingGate::deny_all());
+    let gate: Arc<dyn relon_eval_api::CapabilityGate> = gate_concrete.clone();
+    vtable.set_gate(gate);
+    let cfg = BcVmConfig {
+        cap_vtable: vtable,
+        ..BcVmConfig::default()
+    };
+    let vm = BytecodeVm::new(cfg);
+    let outcome = vm.invoke(&bc, &[]);
+    match outcome.error {
+        Some(BcVmError::CapabilityDenied { cap_bit }) => {
+            assert_eq!(cap_bit, relon_eval_api::CapabilityBit::Network.bit_index());
+        }
+        other => panic!("expected pre-dispatch CapabilityDenied, got {other:?}"),
+    }
+    // Pre-check fires before the loop ticks, so steps stays at 0.
+    assert_eq!(outcome.steps, 0);
+    // Pre-check consulted the gate exactly once (one granted bit).
+    assert_eq!(
+        gate_concrete.hits.load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+}
+
+#[test]
+fn capability_gate_grant_passes_pre_dispatch_sweep() {
+    use relon_bytecode::op::{BcFunction, BcOp};
+    use std::sync::Arc;
+
+    let bc = BcFunction {
+        ops: vec![BcOp::ConstI64(7), BcOp::Return],
+        locals: 0,
+        ir_pc_map: vec![1, 2],
+        stack_recipe: vec![vec![], vec![]],
+    };
+
+    let mut vtable = CapabilityVtable::default();
+    vtable.grant(relon_eval_api::CapabilityBit::ReadsClock.bit_index());
+    let gate_concrete = Arc::new(CountingGate::allow(&[
+        relon_eval_api::CapabilityBit::ReadsClock,
+    ]));
+    let gate: Arc<dyn relon_eval_api::CapabilityGate> = gate_concrete.clone();
+    vtable.set_gate(gate);
+    let cfg = BcVmConfig {
+        cap_vtable: vtable,
+        ..BcVmConfig::default()
+    };
+    let vm = BytecodeVm::new(cfg);
+    let outcome = vm.invoke(&bc, &[]);
+    assert!(outcome.error.is_none(), "gate granted bit → run completes");
+    assert_eq!(outcome.value, Some(7));
+    // Pre-check consulted once (the single granted bit).
+    assert_eq!(
+        gate_concrete.hits.load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+}
+
+#[test]
+fn capability_trap_enrichment_uses_gate_bit_when_installed() {
+    use relon_bytecode::op::{BcFunction, BcOp, BcTrapKind};
+    use std::sync::Arc;
+
+    // BcFunction whose first op is the legacy static
+    // `CapabilityDenied` trap. With no gate installed the surfaced
+    // `cap_bit` is `u32::MAX`; with a gate installed the VM enriches
+    // it with the first gate-denied bit.
+    let bc = BcFunction {
+        ops: vec![BcOp::Trap(BcTrapKind::CapabilityDenied), BcOp::Return],
+        locals: 0,
+        ir_pc_map: vec![1, 2],
+        stack_recipe: vec![vec![], vec![]],
+    };
+
+    // Baseline: no gate, sentinel preserved.
+    let vm_no_gate = BytecodeVm::new(BcVmConfig::default());
+    let outcome = vm_no_gate.invoke(&bc, &[]);
+    match outcome.error {
+        Some(BcVmError::CapabilityDenied { cap_bit }) => assert_eq!(cap_bit, u32::MAX),
+        other => panic!("expected sentinel CapabilityDenied, got {other:?}"),
+    }
+
+    // Gate installed and denies everything: first declared bit
+    // (ReadsFs at index 0) gets reported.
+    let mut vtable = CapabilityVtable::default();
+    let gate: Arc<dyn relon_eval_api::CapabilityGate> = Arc::new(CountingGate::deny_all());
+    vtable.set_gate(gate);
+    let cfg = BcVmConfig {
+        cap_vtable: vtable,
+        ..BcVmConfig::default()
+    };
+    let vm_with_gate = BytecodeVm::new(cfg);
+    let outcome = vm_with_gate.invoke(&bc, &[]);
+    match outcome.error {
+        Some(BcVmError::CapabilityDenied { cap_bit }) => {
+            assert_eq!(cap_bit, relon_eval_api::CapabilityBit::ReadsFs.bit_index());
+        }
+        other => panic!("expected enriched CapabilityDenied, got {other:?}"),
+    }
+}
+
+#[test]
+fn capability_gate_denial_lifts_to_runtime_error() {
+    use relon_bytecode::op::{BcFunction, BcOp};
+    use std::sync::Arc;
+
+    // Verify the trap envelope lifts cleanly through
+    // `BcVmError::into_runtime_error`. The evaluator surface goes
+    // through a different (IR-compiled) path that today never emits
+    // capability ops; this test exercises the lifting contract on a
+    // hand-built BcFunction so phase 3 callers can rely on the
+    // shape.
+    let bc = BcFunction {
+        ops: vec![BcOp::ConstI64(0), BcOp::Return],
+        locals: 0,
+        ir_pc_map: vec![1, 2],
+        stack_recipe: vec![vec![], vec![]],
+    };
+
+    let mut vtable = CapabilityVtable::default();
+    vtable.grant(relon_eval_api::CapabilityBit::WritesFs.bit_index());
+    let gate: Arc<dyn relon_eval_api::CapabilityGate> = Arc::new(CountingGate::deny_all());
+    vtable.set_gate(gate);
+    let cfg = BcVmConfig {
+        cap_vtable: vtable,
+        ..BcVmConfig::default()
+    };
+    let vm = BytecodeVm::new(cfg);
+    let outcome = vm.invoke(&bc, &[]);
+    let err = outcome.error.expect("must trap");
+    let lifted = err.into_runtime_error(relon_parser::TokenRange::default());
+    match lifted {
+        RuntimeError::WasmCapabilityDenied { cap_bit, .. } => {
+            assert_eq!(cap_bit, relon_eval_api::CapabilityBit::WritesFs.bit_index());
+        }
+        other => panic!("expected WasmCapabilityDenied, got {other:?}"),
+    }
 }

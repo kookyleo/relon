@@ -11,7 +11,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Instant;
 
-use relon_eval_api::{CapabilityGate, RuntimeError};
+use relon_eval_api::{CapabilityBit, CapabilityError, CapabilityGate, RuntimeError};
 use relon_ir::IrType;
 use relon_parser::TokenRange;
 use thiserror::Error;
@@ -127,6 +127,89 @@ impl CapabilityVtable {
     /// grant-bool table".
     pub fn gate(&self) -> Option<&Arc<dyn CapabilityGate>> {
         self.gate.as_ref()
+    }
+
+    /// M2-B phase 2: consult the installed [`CapabilityGate`] for a
+    /// single `cap_bit`. Returns `Ok(())` when:
+    ///
+    /// - no gate is installed (legacy fallback — grant table remains
+    ///   the only check), OR
+    /// - the gate explicitly grants the bit.
+    ///
+    /// Returns `Err(CapabilityError)` when the gate denies the bit.
+    /// `cap_bit` outside the [`CapabilityBit`] enum's lower range is
+    /// also treated as "no gate authority" — the legacy host-supplied
+    /// `BcOp::Trap(CapabilityDenied)` carries `u32::MAX` which falls
+    /// into this bucket and surfaces as the historical unbit-tagged
+    /// denial.
+    ///
+    /// This helper is the dispatch-side single consult entry point
+    /// future `BcOp::CallNative` / `BcOp::CheckCap` ops will use; it
+    /// also drives the pre-dispatch `consult_all_granted_bits` sweep
+    /// run from [`BytecodeVm::invoke_from_with_stack`].
+    pub fn consult_gate(&self, cap_bit: u32) -> Result<(), CapabilityError> {
+        let Some(gate) = self.gate.as_ref() else {
+            return Ok(());
+        };
+        let Some(bit) = decode_cap_bit(cap_bit) else {
+            return Ok(());
+        };
+        gate.check(bit)
+    }
+
+    /// M2-B phase 2: sweep every grant-table bit through the installed
+    /// gate. Used as a dispatch-time pre-check so a gate that denies a
+    /// previously-granted bit (e.g. trust-level downgrade between
+    /// `grant` and `invoke`) trips the capability prong before any
+    /// guarded op runs. No-op when no gate is installed; no-op when no
+    /// bits are granted (the scaffold's default-empty-vtable case).
+    pub fn consult_all_granted_bits(&self) -> Result<(), CapabilityError> {
+        if self.gate.is_none() {
+            return Ok(());
+        }
+        for (idx, granted) in self.grants.iter().enumerate() {
+            if *granted {
+                self.consult_gate(idx as u32)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// M2-B phase 2: walk every declared [`CapabilityBit`] and return the
+/// first one the supplied gate denies. Used to give the static
+/// `BcOp::Trap(CapabilityDenied)` site a meaningful `cap_bit` to
+/// report when a gate is installed but the trap fires from a
+/// hand-built BcFunction that didn't carry the bit through the IR.
+fn first_denied_bit(gate: &Arc<dyn CapabilityGate>) -> Option<u32> {
+    for bit in [
+        CapabilityBit::ReadsFs,
+        CapabilityBit::WritesFs,
+        CapabilityBit::Network,
+        CapabilityBit::ReadsClock,
+        CapabilityBit::ReadsEnv,
+        CapabilityBit::UsesRng,
+    ] {
+        if gate.check(bit).is_err() {
+            return Some(bit.bit_index());
+        }
+    }
+    None
+}
+
+/// Map a numeric `cap_bit` to a [`CapabilityBit`] variant. Returns
+/// `None` for bits outside the declared range — callers treat that as
+/// "the bit predates the gate API and falls through to the legacy
+/// grant-table path".
+fn decode_cap_bit(cap_bit: u32) -> Option<CapabilityBit> {
+    match cap_bit {
+        0 => Some(CapabilityBit::ReadsFs),
+        1 => Some(CapabilityBit::WritesFs),
+        2 => Some(CapabilityBit::Network),
+        3 => Some(CapabilityBit::ReadsClock),
+        4 => Some(CapabilityBit::ReadsEnv),
+        5 => Some(CapabilityBit::UsesRng),
+        _ => None,
     }
 }
 
@@ -266,6 +349,16 @@ impl BytecodeVm {
         &self.config
     }
 
+    /// M2-B phase 2: pre-dispatch consult of the installed
+    /// [`CapabilityGate`]. Convenience pass-through to
+    /// [`CapabilityVtable::consult_all_granted_bits`] — exposed on the
+    /// VM so callers that hold a [`BytecodeVm`] can opt into the
+    /// pre-check without reaching into the config. Returns `Ok(())`
+    /// when no gate is installed or every granted bit passes.
+    pub fn consult_capability_gate(&self) -> Result<(), CapabilityError> {
+        self.config.cap_vtable.consult_all_granted_bits()
+    }
+
     /// Invoke `func` with the supplied `args` filling locals
     /// `0..args.len()`. The dispatch loop ticks against
     /// `max_steps`, watches `deadline`, and surfaces trap-prong
@@ -380,6 +473,35 @@ impl BytecodeVm {
                 final_locals: locals,
             }
         };
+        // M2-B phase 2 dispatch-time pre-check: if a `CapabilityGate`
+        // is installed, every grant-table bit must still pass the
+        // gate before the first op runs. Mirrors the cranelift
+        // backend's vtable-build-time consult — the bytecode VM
+        // doesn't have a vtable-build phase, so the pre-check runs
+        // once at invoke entry (cost: one virtual call per granted
+        // bit, paid by callers that opted into the gate). The scaffold
+        // grant table is empty for the standard `from_source` path so
+        // this is a no-op there; hand-built BcFunctions that grant
+        // bits get the consult for free.
+        //
+        // Note: this is enforcement, not advisory — a denial here
+        // surfaces as `RuntimeError::WasmCapabilityDenied` exactly
+        // like a `BcOp::Trap(CapabilityDenied)` would. Phase 3 IR
+        // coverage expansion will widen this into per-call-site
+        // consults via the new `BcOp::CheckCap` / `BcOp::CallNative`
+        // ops; phase 2 keeps the consult at the dispatch boundary
+        // where the existing scaffold ops live.
+        if let Err(err) = self.config.cap_vtable.consult_all_granted_bits() {
+            return exit(
+                None,
+                Some(BcVmError::CapabilityDenied {
+                    cap_bit: err.cap.bit_index(),
+                }),
+                last_bc_idx,
+                steps,
+                locals,
+            );
+        }
         loop {
             // Resource prong: tick.
             steps += 1;
@@ -516,7 +638,25 @@ impl BytecodeVm {
                 BcTrapKind::EmptyList => return Err(BcVmError::EmptyList),
                 BcTrapKind::InvalidUtf8 => return Err(BcVmError::InvalidUtf8),
                 BcTrapKind::CapabilityDenied => {
-                    return Err(BcVmError::CapabilityDenied { cap_bit: u32::MAX })
+                    // M2-B phase 2: when a `CapabilityGate` is
+                    // installed, consult it for the first denied
+                    // grant-table bit so the surfaced `cap_bit`
+                    // matches the policy authority rather than the
+                    // legacy `u32::MAX` sentinel. The sentinel is
+                    // preserved when no gate is installed (legacy
+                    // behaviour) so existing tests / hand-built
+                    // BcFunctions don't observe a change.
+                    //
+                    // Phase 3 will replace this BC-level static trap
+                    // with `BcOp::CallNative`-driven per-site
+                    // consults; phase 2's role is to prove the gate
+                    // is reachable from the dispatch path and to
+                    // standardise the error envelope.
+                    let cap_bit = match self.config.cap_vtable.gate() {
+                        Some(gate) => first_denied_bit(gate).unwrap_or(u32::MAX),
+                        None => u32::MAX,
+                    };
+                    return Err(BcVmError::CapabilityDenied { cap_bit });
                 }
             },
         }
