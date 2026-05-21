@@ -45,9 +45,8 @@ impl<'a, 'b> super::Codegen<'a, 'b> {
         offset: Option<u32>,
         label: &str,
     ) -> Result<CValue, CraneliftError> {
-        let off = offset.ok_or_else(|| {
-            CraneliftError::Codegen(format!("{label} missing from const pool"))
-        })?;
+        let off = offset
+            .ok_or_else(|| CraneliftError::Codegen(format!("{label} missing from const pool")))?;
         let v = self.builder.ins().iconst(I32, i64::from(off));
         self.push(v);
         Ok(v)
