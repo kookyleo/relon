@@ -367,4 +367,3 @@ impl<'a> Walker<'a> {
             .any(|frame| frame.might_dynamically_bind(name))
     }
 }
-
