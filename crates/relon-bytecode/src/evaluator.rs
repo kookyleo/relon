@@ -94,6 +94,19 @@ pub struct BytecodeEvaluator {
     /// `run_main` epilogue avoids re-walking the schema on every
     /// invoke.
     return_shape: ReturnShape,
+    /// M2-C lever 5: cached `return_schema.fields.len() as u32`. The
+    /// VM needs this on every `invoke_from_with_stack` call to size the
+    /// local-slot reservation past the args span; without the cache the
+    /// hot path paid an `Option<&Schema>` walk + a `.fields.len()`
+    /// re-read on each invoke. Stored alongside `return_shape` so the
+    /// scalar fast-path and the trait-level `run_main` epilogue can
+    /// both consume the cached value without the extra schema probe.
+    cached_return_field_count: u32,
+    /// M2-C lever 5: cached arity of the `#main(...)` declaration.
+    /// Mirrors `param_names.len() as usize` but kept on a separate
+    /// field so the typed-i64 fast path can validate caller arity
+    /// against a single field read.
+    cached_param_count: usize,
 }
 
 /// M2-C lever 5: pre-computed return-shape classification used by the
@@ -211,6 +224,7 @@ impl BytecodeEvaluator {
         let param_tys = func.params.clone();
         let empty = std::collections::BTreeMap::new();
         let compiled = compile_function(func, &empty, &empty)?;
+        let cached_param_count = param_names.len();
         Ok(Self {
             func: compiled,
             entry_range,
@@ -220,6 +234,8 @@ impl BytecodeEvaluator {
             return_field_base: 0,
             default_config: BcVmConfig::default(),
             return_shape: ReturnShape::LegacyI64,
+            cached_return_field_count: 0,
+            cached_param_count,
         })
     }
 
@@ -243,6 +259,8 @@ impl BytecodeEvaluator {
         // dispatch epilogue branches on a cheap copy-enum rather than
         // re-walking the field vector on every invoke.
         let return_shape = classify_return_shape(&return_schema);
+        let cached_return_field_count = return_schema.fields.len() as u32;
+        let cached_param_count = param_names.len();
         Ok(Self {
             func: compiled,
             entry_range,
@@ -252,6 +270,8 @@ impl BytecodeEvaluator {
             return_field_base,
             default_config: BcVmConfig::default(),
             return_shape,
+            cached_return_field_count,
+            cached_param_count,
         })
     }
 
@@ -473,10 +493,7 @@ impl BytecodeEvaluator {
             start_bc_idx,
             extra_locals,
             /*return_slot_count=*/
-            self.return_schema
-                .as_ref()
-                .map(|s| s.fields.len() as u32)
-                .unwrap_or(0),
+            self.cached_return_slot_count(),
             initial_stack,
         );
         if let Some(err) = outcome.error {
@@ -818,11 +835,13 @@ impl BytecodeEvaluator {
         // Param-count + type check: every declared param must be the
         // `I64` lane and the caller must supply exactly that many
         // args. Anything richer falls back to the trait surface.
-        if args.len() != self.param_tys.len() {
+        // M2-C lever 5: arity check reads the cached `param_count`
+        // field so the hot path doesn't pay a `Vec::len` indirection.
+        if args.len() != self.cached_param_count {
             return Err(RuntimeError::Unsupported {
                 reason: format!(
                     "bytecode VM run_main_i64: arity mismatch (expected {} args, got {})",
-                    self.param_tys.len(),
+                    self.cached_param_count,
                     args.len()
                 ),
             });
@@ -898,23 +917,17 @@ impl BytecodeEvaluator {
         Ok(raw as i64)
     }
 
-    /// M2-C lever 5: cached return-slot count. Mirrors the
-    /// `self.return_schema.as_ref().map(|s| s.fields.len()).unwrap_or(0)`
-    /// idiom but stays inlinable so the typed-i64 path doesn't pay an
-    /// `Option<Schema>` walk on every call.
+    /// M2-C lever 5: cached return-slot count. Reads the
+    /// `cached_return_field_count` field populated once at construction
+    /// time — no `Option<Schema>` walk + no `.fields.len()` indirection
+    /// on the hot dispatch path. `LegacyI64` short-circuits to 0
+    /// (direct-IR tests don't carry a schema and the VM returns a
+    /// single i64 slot through the stack).
     #[inline(always)]
     fn cached_return_slot_count(&self) -> u32 {
         match self.return_shape {
             ReturnShape::LegacyI64 => 0,
-            ReturnShape::SingleScalarInt
-            | ReturnShape::SingleScalarFloat
-            | ReturnShape::SingleScalarBool
-            | ReturnShape::SingleScalarNull => 1,
-            ReturnShape::BrandedDict => self
-                .return_schema
-                .as_ref()
-                .map(|s| s.fields.len() as u32)
-                .unwrap_or(0),
+            _ => self.cached_return_field_count,
         }
     }
 
@@ -935,10 +948,7 @@ impl BytecodeEvaluator {
             packed,
             start_bc_idx,
             extra_locals,
-            self.return_schema
-                .as_ref()
-                .map(|s| s.fields.len() as u32)
-                .unwrap_or(0),
+            self.cached_return_slot_count(),
             initial_stack,
         );
         if let Some(err) = outcome.error {
@@ -1064,10 +1074,7 @@ impl BytecodeEvaluator {
             &packed,
             start_bc_idx,
             &snapshot.ssa_slots_copy,
-            self.return_schema
-                .as_ref()
-                .map(|s| s.fields.len() as u32)
-                .unwrap_or(0),
+            self.cached_return_slot_count(),
             &initial_stack,
         );
         let metrics = ResumeMetrics {
@@ -1093,10 +1100,7 @@ impl BytecodeEvaluator {
             &packed,
             0,
             &[],
-            self.return_schema
-                .as_ref()
-                .map(|s| s.fields.len() as u32)
-                .unwrap_or(0),
+            self.cached_return_slot_count(),
             &[],
         );
         let metrics = ResumeMetrics {
