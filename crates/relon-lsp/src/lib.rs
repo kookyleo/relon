@@ -1,17 +1,45 @@
 #![forbid(unsafe_code)]
-//! LSP plumbing for Relon.
+//! Relon Language Server.
 //!
-//! The crate is split into:
+//! Implements the editor-facing LSP capabilities exposed by relon-cli's
+//! `relon lsp` subcommand and re-used by `relon-wasm` for the browser
+//! playground:
 //!
-//! * [`diagnostics`] — pure conversion from `relon-analyzer` diagnostics
-//!   to `lsp_types::Diagnostic`. Easy to unit-test.
-//! * [`server`] — the `lsp-server` glue (initialize, document store,
+//! - hover (`textDocument/hover`)
+//! - completion (`textDocument/completion`)
+//! - go-to-definition (`textDocument/definition`)
+//! - find-references (`textDocument/references`)
+//! - rename (`textDocument/rename`)
+//! - code-actions (`textDocument/codeAction`)
+//! - document-symbols (`textDocument/documentSymbol`)
+//! - inlay-hints (`textDocument/inlayHint`)
+//! - signature-help (`textDocument/signatureHelp`)
+//! - publish-diagnostics (analyzer-derived warnings / errors)
+//!
+//! ## Crate layout
+//!
+//! - [`diagnostics`] — pure conversion from `relon-analyzer`
+//!   diagnostics to `lsp_types::Diagnostic`. Easy to unit-test.
+//! - [`features`] — per-capability adapters that pull the static
+//!   analysis out of `relon-analyzer` and shape it into the wire
+//!   types `lsp_types` expects.
+//! - `position` (private) — UTF-16 line/character ↔ byte-offset
+//!   conversions shared by every feature module.
+//! - [`server`] — the `lsp-server` glue (initialize, document store,
 //!   request/notification dispatch). Uses synchronous I/O so the crate
 //!   keeps a small dependency footprint.
+//! - [`workspace`] — multi-file project tracking (the analyzer's
+//!   workspace tree, kept in sync with the editor's open document
+//!   state).
 //!
-//! The `relon-lsp` binary wires `server::run_stdio()` into a stdio
-//! transport. Hosts that want a custom transport (e.g. embedding the
-//! server in another process) can call into `server` directly.
+//! ## Hosting
+//!
+//! The `relon-lsp` binary wires [`server::run_stdio`] into a stdio
+//! transport — the default integration path for VS Code, Neovim and
+//! other editors. Hosts that want a custom transport (e.g. embedding
+//! the server in another process, or driving it from the WASM
+//! playground's browser-side adapter) can call into [`server`]
+//! directly without going through stdio.
 
 pub mod diagnostics;
 pub mod features;
