@@ -436,6 +436,32 @@ pub fn all_cases() -> Vec<CorpusCase> {
             args_factory: no_args,
             tier: Tier::StdlibList,
         },
+        // review-improvement-160 bytecode M3 phase 2: the IR-level
+        // `list.sum(range(...))` peephole desugar.  The tree-walker
+        // resolves the call through the dynamic `std/list` module
+        // loader; the bytecode + cranelift backends recognise the
+        // pattern in `lower_fn_call` and emit an explicit `Op::Loop`
+        // accumulator.  Differential agreement here is the regression
+        // guard — without the peephole, the IR side surfaces
+        // `UnresolvedVariable("list")` and fails the diff.
+        CorpusCase {
+            name: "stdlib_list_sum_range_n",
+            source: "#import list from \"std/list\"\n#main(Int n) -> Int\nlist.sum(range(n))",
+            args_factory: || one_int("n", 100),
+            tier: Tier::StdlibList,
+        },
+        CorpusCase {
+            name: "stdlib_list_sum_range_start_end",
+            source: "#import list from \"std/list\"\n#main(Int n) -> Int\nlist.sum(range(5, n))",
+            args_factory: || one_int("n", 100),
+            tier: Tier::StdlibList,
+        },
+        CorpusCase {
+            name: "stdlib_list_sum_range_empty",
+            source: "#import list from \"std/list\"\n#main(Int n) -> Int\nlist.sum(range(n))",
+            args_factory: || one_int("n", 0),
+            tier: Tier::StdlibList,
+        },
         // ---- StdlibNormalize: most complex ----
         CorpusCase {
             name: "stdlib_nfd_combine",
