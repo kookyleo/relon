@@ -276,4 +276,117 @@ impl<'a, 'b> super::Codegen<'a, 'b> {
             .call_memcpy(self.frontend_config, dest, src, len_p);
         Ok(())
     }
+
+    /// #165 — single-allocation N-operand string concat. Mirrors the
+    /// shape of the bundled stdlib `concat` body
+    /// ([`relon_ir::stdlib::defs::concat_string_string_body`]) but
+    /// generalised: one scratch alloc sized `total_len + 4`, one
+    /// header store, and N memcpys writing each operand payload at
+    /// the running cursor. The N - 1 intermediate scratch records the
+    /// unfolded `concat(concat(...), ...)` path used to emit are
+    /// elided entirely — the win the [`Op::StrConcatN`] IR variant
+    /// exists to deliver.
+    ///
+    /// Operand layout: each `String` IR value is an i32 arena offset
+    /// pointing at a `[len: u32 LE][utf8 bytes]` record. The op pops
+    /// `operand_count` such offsets from the operand stack (top-of-
+    /// stack is the outer RHS, bottom is the deepest LHS leaf), then
+    /// pushes one fresh i32 offset for the joined record.
+    pub(super) fn emit_str_concat_n(
+        &mut self,
+        operand_count: u32,
+    ) -> Result<(), CraneliftError> {
+        if operand_count < 2 {
+            return Err(CraneliftError::Codegen(format!(
+                "Op::StrConcatN with operand_count={operand_count} (expected >= 2)"
+            )));
+        }
+        let n = operand_count as usize;
+        // Pop N i32 offsets, restore source order so the join reads
+        // `s_0 || s_1 || ... || s_{n-1}` left-to-right.
+        let mut offs: Vec<CValue> = Vec::with_capacity(n);
+        for _ in 0..n {
+            offs.push(self.pop()?);
+        }
+        offs.reverse();
+        // Load the `[len: u32]` header for every operand once. Stored
+        // in a parallel `lens` vector so we can both sum lengths and
+        // drive the per-operand memcpy from the same i32 values
+        // without re-loading.
+        let mut lens: Vec<CValue> = Vec::with_capacity(n);
+        for off in &offs {
+            // Compute `addr = arena_addr(off, 4)` (4-byte header).
+            let abs = self.arena_addr(*off, 4)?;
+            let len = self.builder.ins().load(I32, MemFlags::trusted(), abs, 0);
+            lens.push(len);
+        }
+        // total_len = sum of lens (i32 add fold).
+        let mut total_len = lens[0];
+        for v in &lens[1..] {
+            total_len = self.builder.ins().iadd(total_len, *v);
+        }
+        // record_size = total_len + 4 (header)
+        let four = self.builder.ins().iconst(I32, 4);
+        let record_size = self.builder.ins().iadd(total_len, four);
+        // Allocate the scratch record (one allocation for the entire
+        // join — the perf win).
+        self.emit_alloc_scratch(record_size)?;
+        let base_off = self.pop()?;
+        // Write header: i32.store(base, total_len)
+        let base_abs = self.arena_addr(base_off, 4)?;
+        self.builder
+            .ins()
+            .store(MemFlags::trusted(), total_len, base_abs, 0);
+        // Walk operands in source order, copying each payload at the
+        // running cursor.
+        //   cursor_off = base_off + 4
+        //   for each operand:
+        //     memcpy(arena[cursor_off], arena[off + 4], len)
+        //     cursor_off += len
+        let mut cursor_off = self.builder.ins().iadd(base_off, four);
+        for i in 0..n {
+            let len = lens[i];
+            let src_off_payload = self.builder.ins().iadd(offs[i], four);
+            // Bounds-check both pointers once per copy when the
+            // sandbox config asks for it (matches the existing
+            // `Op::MemcpyAtAbsolute` policy).
+            if self.sandbox.bounds_check {
+                let arena_len = self.builder.ins().load(
+                    I32,
+                    MemFlags::trusted(),
+                    self.state_ptr,
+                    STATE_OFFSET_ARENA_LEN,
+                );
+                let dst_end = self.builder.ins().iadd(cursor_off, len);
+                let cmp_d =
+                    self.builder
+                        .ins()
+                        .icmp(IntCC::UnsignedGreaterThan, dst_end, arena_len);
+                self.cond_trap(cmp_d, TrapKind::BoundsViolation);
+                let src_end = self.builder.ins().iadd(src_off_payload, len);
+                let cmp_s =
+                    self.builder
+                        .ins()
+                        .icmp(IntCC::UnsignedGreaterThan, src_end, arena_len);
+                self.cond_trap(cmp_s, TrapKind::BoundsViolation);
+            }
+            let arena_base = self.builder.ins().load(
+                self.pointer_ty,
+                MemFlags::trusted(),
+                self.state_ptr,
+                STATE_OFFSET_ARENA_BASE,
+            );
+            let dest_p = self.builder.ins().uextend(self.pointer_ty, cursor_off);
+            let src_p = self.builder.ins().uextend(self.pointer_ty, src_off_payload);
+            let dest = self.builder.ins().iadd(arena_base, dest_p);
+            let src = self.builder.ins().iadd(arena_base, src_p);
+            let len_p = self.builder.ins().uextend(self.pointer_ty, len);
+            self.builder
+                .call_memcpy(self.frontend_config, dest, src, len_p);
+            cursor_off = self.builder.ins().iadd(cursor_off, len);
+        }
+        // Push the resulting record offset.
+        self.push(base_off);
+        Ok(())
+    }
 }
