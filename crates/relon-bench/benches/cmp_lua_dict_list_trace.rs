@@ -19,7 +19,7 @@
 //!   it would produce byte-identical machine code; this bench's row
 //!   is the floor of that path.
 //! - The fixture record layouts (`[len][pad][i64...]` for lists,
-//!   `[shape_hash][entry_count][entries...]` for dicts) match what
+//!   `[shape_hash][entry_count][entries + key payloads...]` for dicts) match what
 //!   the cranelift-AOT data section already produces for
 //!   `Op::ConstListInt` and what the F-D8 helper expects.
 //!
@@ -61,8 +61,7 @@ use relon_evaluator::{Context, Scope, TreeWalkEvaluator};
 use relon_parser::parse_document;
 use relon_trace_abi::{TraceContext, TraceEntryStatus};
 use relon_trace_jit::{
-    build_dict_record, build_flat_list_record, build_string_record, fx_hash_bytes,
-    fx_hash_key_record,
+    build_dict_record_v2, build_flat_list_record, build_string_record, fx_hash_bytes,
 };
 
 // ----- methodology constants ----------------------------------------
@@ -114,12 +113,6 @@ struct W5Fixture {
 fn build_w5_fixture() -> W5Fixture {
     let labels = ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"];
     let key_records: Vec<Vec<u8>> = labels.iter().map(|s| build_string_record(s)).collect();
-    let key_hashes: Vec<u64> = key_records
-        .iter()
-        // SAFETY: each kr is a layout-conformant String record built
-        // by `build_string_record`.
-        .map(|kr| unsafe { fx_hash_key_record(kr.as_ptr()) })
-        .collect();
     // Dict shape hash: FxHash over the concatenated sorted keys (the
     // F-D8 recorder would compute this the same way at recording
     // time).
@@ -129,12 +122,12 @@ fn build_w5_fixture() -> W5Fixture {
         all_keys.push(0);
     }
     let shape_hash = fx_hash_bytes(&all_keys);
-    let entries: Vec<(u64, i64)> = key_hashes
+    let entries: Vec<(&[u8], i64)> = labels
         .iter()
         .enumerate()
-        .map(|(i, h)| (*h, (i as i64) + 1))
+        .map(|(i, s)| (s.as_bytes(), (i as i64) + 1))
         .collect();
-    let dict_bytes = build_dict_record(shape_hash, &entries);
+    let dict_bytes = build_dict_record_v2(shape_hash, &entries);
     // Keys list: array of raw String-record pointers, packed as i64.
     let key_record_ptrs: Vec<i64> = key_records.iter().map(|kr| kr.as_ptr() as i64).collect();
     let keys_list_bytes = build_flat_list_record(&key_record_ptrs);
@@ -163,13 +156,14 @@ fn build_w6_fixture(n: u64) -> Vec<u8> {
 ///   LuaJIT's `((i-1) % 10) + 1` which jits to the same cycle count)
 /// - `key_ptr = list_get(keys_list_ptr, idx)` (the new F-D8 path,
 ///   inlined into the trace machine code)
-/// - `val = dict_lookup(dict_ptr, key_ptr, shape_hash)` (host helper
-///   call; the IC tag check + hash match is amortised over the loop)
+/// - `val = dict_lookup_v2(dict_ptr, record_len, key_ptr, shape_hash)`
+///   (host helper call; the IC tag check + collision-safe key compare
+///   is amortised over the loop)
 /// - `acc = acc + val`
 ///
 /// The signature matches `TRACE_ENTRY_SIG`: `(ctx, args) -> i32`,
 /// with `args[0] = n`, `args[1] = dict_ptr`, `args[2] = keys_list_ptr`,
-/// `args[3] = shape_hash`.
+/// `args[3] = shape_hash`, `args[4] = dict_record_len`.
 struct W5TraceFn {
     entry: unsafe extern "C" fn(*mut TraceContext, *const u64) -> i32,
     _module: JITModule,
@@ -206,12 +200,13 @@ fn build_w5_trace_fn() -> W5TraceFn {
     let mut dict_lookup_sig = Signature::new(CallConv::SystemV);
     dict_lookup_sig.params.push(AbiParam::new(pointer_ty));
     dict_lookup_sig.params.push(AbiParam::new(pointer_ty));
+    dict_lookup_sig.params.push(AbiParam::new(pointer_ty));
     dict_lookup_sig.params.push(AbiParam::new(I64));
     dict_lookup_sig.params.push(AbiParam::new(pointer_ty));
     dict_lookup_sig.returns.push(AbiParam::new(I64));
     let dict_lookup_id = module
         .declare_function(
-            "__relon_trace_dict_lookup",
+            "__relon_trace_dict_lookup_v2",
             Linkage::Import,
             &dict_lookup_sig,
         )
@@ -265,6 +260,7 @@ fn build_w5_trace_fn() -> W5TraceFn {
     let dict_ptr = fb.ins().load(I64, MemFlags::trusted(), args_ptr, 8);
     let keys_list_ptr = fb.ins().load(I64, MemFlags::trusted(), args_ptr, 16);
     let shape_hash = fb.ins().load(I64, MemFlags::trusted(), args_ptr, 24);
+    let dict_record_len = fb.ins().load(I64, MemFlags::trusted(), args_ptr, 32);
 
     let acc_seed = fb.ins().iconst(I64, 0);
     let i_seed = fb.ins().iconst(I64, 0);
@@ -321,10 +317,16 @@ fn build_w5_trace_fn() -> W5TraceFn {
     // Element is a String-record pointer stored as i64.
     let key_ptr_i64 = fb.ins().load(I64, MemFlags::trusted(), elem_addr, 0);
 
-    // val = dict_lookup(dict_ptr, key_ptr, shape_hash, trace_ctx).
+    // val = dict_lookup_v2(dict_ptr, record_len, key_ptr, shape_hash, trace_ctx).
     let inst = fb.ins().call(
         dict_lookup_ref,
-        &[dict_ptr, key_ptr_i64, shape_hash, trace_ctx],
+        &[
+            dict_ptr,
+            dict_record_len,
+            key_ptr_i64,
+            shape_hash,
+            trace_ctx,
+        ],
     );
     let val = fb.inst_results(inst)[0];
     // Deopt sentinel check: val == i64::MIN -> deopt.
@@ -629,11 +631,12 @@ fn bench_dict_list(c: &mut Criterion) {
     // sum for n = HOT_LOOP_N.
     {
         let mut ctx = TraceContext::with_capacity(0);
-        let args: [u64; 4] = [
+        let args: [u64; 5] = [
             HOT_LOOP_N,
             w5_fixture.dict_bytes.as_ptr() as u64,
             w5_fixture.keys_list_bytes.as_ptr() as u64,
             w5_fixture.shape_hash,
+            w5_fixture.dict_bytes.len() as u64,
         ];
         let status = unsafe { (w5_trace.entry)(&mut ctx as *mut TraceContext, args.as_ptr()) };
         assert_eq!(status, 0, "W5 trace must complete successfully");
@@ -656,11 +659,12 @@ fn bench_dict_list(c: &mut Criterion) {
     group.bench_function(BenchmarkId::new("W5_dict_str_key", "trace_jit"), |b| {
         b.iter_custom(|iters| {
             let mut ctx = TraceContext::with_capacity(0);
-            let args: [u64; 4] = [
+            let args: [u64; 5] = [
                 HOT_LOOP_N,
                 w5_fixture.dict_bytes.as_ptr() as u64,
                 w5_fixture.keys_list_bytes.as_ptr() as u64,
                 w5_fixture.shape_hash,
+                w5_fixture.dict_bytes.len() as u64,
             ];
             let args_ptr = args.as_ptr();
             timed_with_warmup(iters, || {

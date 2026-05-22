@@ -1,9 +1,9 @@
 //! F-D8: host-side helpers backing `TraceOp::ListGet` /
 //! `TraceOp::DictLookup`.
 //!
-//! The cranelift emitter lowers `TraceOp::DictLookup` to a single
-//! `call __relon_trace_dict_lookup(dict_ptr, key_ptr, shape_hash, ctx)`
-//! and lowers `TraceOp::ListGet` to either:
+//! The cranelift emitter lowers `TraceOp::DictLookup` to
+//! `call __relon_trace_dict_lookup_v2(dict_ptr, record_len, key_ptr,
+//! shape_hash, ctx)` and lowers `TraceOp::ListGet` to either:
 //!
 //! - An inline bounds-checked load against a flat
 //!   `[len: u32 LE][pad: u32][i64 elements...]` record (the
@@ -32,20 +32,18 @@
 //!
 //! ## Dict layout
 //!
-//! For F-D8 v1 the dict is keyed on shape: the host pre-computes an
-//! FxHash digest of the keys in the dict at recording time, stamps it
-//! into the dict header, and the trace's `shape_hash` immediate is
-//! that same digest. On IC hit the helper short-circuits with the
-//! cached value lookup; on miss it returns [`DICT_LOOKUP_DEOPT`] (an
-//! `i64::MIN` sentinel) so the cranelift-side branch falls into the
-//! shared deopt block.
+//! Active trace dict lowering uses the v2 record envelope: the host
+//! pre-computes the shape hash, stores key-hash metadata in the entry
+//! table, and also stores key payload bytes in the same record. The
+//! helper receives the record byte length from the recorder side table
+//! and validates the entry table / payload ranges before comparing key
+//! bytes on a hash hit. That makes payload-distinct FxHash collisions
+//! safe: they continue scanning or deopt instead of returning the
+//! wrong value.
 //!
-//! The dict header carries a small inline cache of recently-seen
-//! `(key_hash, value_idx)` pairs so the steady-state path skips both
-//! the BTreeMap walk and the UTF-8 key compare. The cache is
-//! single-threaded by construction — each trace runs on the
-//! `TraceContext`'s thread, and the helper writes through the dict's
-//! mutable header.
+//! The older v1 helpers in this module are retained for legacy tests
+//! and fixtures. New emitter / installer paths should use the v2
+//! symbols below.
 //!
 //! ## Why this lives in `relon-trace-jit`
 //!
@@ -61,10 +59,10 @@
 
 use crate::runtime::TraceContext;
 
-/// Sentinel returned by [`__relon_trace_list_get`] / [`__relon_trace_dict_lookup`]
-/// on out-of-range index / IC shape mismatch. The cranelift emitter
-/// compares against this value and branches into the shared deopt
-/// block when the helper signals failure.
+/// Sentinel returned by the list / dict helpers on out-of-range index,
+/// IC shape mismatch, malformed record envelope, or missing key. The
+/// cranelift emitter compares against this value and branches into the
+/// shared deopt block when the helper signals failure.
 ///
 /// `i64::MIN` is the most compact encoding for cranelift — `cmp r,
 /// imm64` lowers to a single x86_64 `cmp` against an immediate that
@@ -111,7 +109,7 @@ pub unsafe extern "C" fn __relon_trace_list_get(
     unsafe { (elem_addr as *const i64).read_unaligned() }
 }
 
-/// IC-guarded dict lookup helper (v1, hash-only).
+/// Legacy IC-guarded dict lookup helper (v1, hash-only).
 ///
 /// `dict_ptr` is laid out as:
 ///
@@ -145,13 +143,11 @@ pub unsafe extern "C" fn __relon_trace_list_get(
 ///    keys, so the IC hot path never encounters a colliding payload
 ///    in practice.
 ///
-/// Both guarantees hold for the v6 corpus; neither survives a
-/// general production dict whose key set is unbounded. The
-/// long-term plan is to widen the entry layout to carry the key
-/// record pointer (`[key_hash][key_record_off][value]`) so the
-/// helper can `memcmp` the payload after the hash match; until that
-/// lands, callers feeding live production dicts MUST route through
-/// the recorder-side `BTreeMap` fallback rather than this helper.
+/// Both guarantees hold for the legacy v6 corpus; neither survives a
+/// general production dict whose key set is unbounded. The v2 helpers
+/// below are the active production-facing ABI and carry enough record
+/// envelope metadata to byte-compare the key payload after a hash
+/// match. New call sites MUST use v2.
 ///
 /// # Safety
 ///
@@ -199,11 +195,11 @@ pub unsafe extern "C" fn __relon_trace_dict_lookup(
     DICT_LOOKUP_DEOPT
 }
 
-/// F-D8-E.2: "shape already checked" companion of
+/// Legacy F-D8-E.2: "shape already checked" companion of
 /// [`__relon_trace_dict_lookup`].
 ///
-/// The cranelift emitter lowers `TraceOp::DictLookupPrechecked` into a
-/// call to this helper. It is byte-identical to the full
+/// Historical cranelift lowering used this helper for
+/// `TraceOp::DictLookupPrechecked`. It is byte-identical to the full
 /// [`__relon_trace_dict_lookup`] except for the leading `dict_shape !=
 /// shape_hash` compare — the caller must have already executed a
 /// preceding `TraceOp::DictShapeGuard` (inline `load + cmp + brif
@@ -227,7 +223,7 @@ pub unsafe extern "C" fn __relon_trace_dict_lookup(
 /// to drop the trace_jit ratio from × 1.95 toward × 1.5 LuaJIT on the
 /// F-D8-D recorder-driven path — see the F-D8-E.2 stage report.
 ///
-/// # ⚠️ Bench-fixture-only safety (review #175 P2)
+/// # ⚠️ Legacy bench-fixture-only safety (review #175 P2)
 ///
 /// Inherits the hash-only collision caveat of
 /// [`__relon_trace_dict_lookup`] **and** drops the shape-fingerprint
@@ -238,8 +234,8 @@ pub unsafe extern "C" fn __relon_trace_dict_lookup(
 /// and `relon-codegen-native` integration tests exercise when the
 /// inline path is disabled. Production traces MUST NOT route through
 /// this helper against a dict whose key set is not collision-audited.
-/// The follow-up plan is the same v2 entry layout described on
-/// [`__relon_trace_dict_lookup`].
+/// Active emitter / installer paths now use
+/// [`__relon_trace_dict_lookup_prechecked_v2`] instead.
 ///
 /// # Safety
 ///

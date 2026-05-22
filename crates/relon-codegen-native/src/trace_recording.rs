@@ -1420,6 +1420,7 @@ mod tests {
                 shape_hash: 0xdeadbeef,
                 value_ty: IrType::I64,
                 entry_count_hint: None,
+                record_len_hint: None,
             }),
             tag(Op::Return),
         ];

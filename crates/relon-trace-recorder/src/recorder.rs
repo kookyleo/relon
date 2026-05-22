@@ -400,8 +400,8 @@ impl RecorderState {
     /// re-recordings of the same logical dict produce identical
     /// fingerprints.
     ///
-    /// The emitter lowers this to a single `call_indirect` to the
-    /// `__relon_trace_dict_lookup` helper plus a sentinel-compare
+    /// The emitter lowers this to a single call to the collision-safe
+    /// `__relon_trace_dict_lookup_v2` helper plus a sentinel-compare
     /// brif into the shared deopt block on IC miss. No
     /// `TraceOp::Guard` is appended here — the deopt encoding lives
     /// inside the host helper's return value.
@@ -411,7 +411,7 @@ impl RecorderState {
         key_ssa: SsaVar,
         shape_hash: u64,
     ) -> Option<SsaVar> {
-        self.emit_dict_lookup_with_hint(dict_ssa, key_ssa, shape_hash, None)
+        self.emit_dict_lookup_with_hints(dict_ssa, key_ssa, shape_hash, None, None)
     }
 
     /// F-D8-E.7 variant of [`Self::emit_dict_lookup`] that also stamps
@@ -419,19 +419,32 @@ impl RecorderState {
     /// carried one via `Op::DictGetByStringKey::entry_count_hint`) into
     /// the trace buffer's `dict_entry_count_hints` side table.
     ///
-    /// Keying on `dict_ssa` lets the optimizer's `dict_ic_hoist` pass
-    /// rewrite the dict-pointer use site without losing the hint —
-    /// `DictShapeGuard` + `DictLookupPrechecked` share the same
-    /// dict_ptr SSA. The trace-emitter then queries the side table
-    /// from `emit_dict_lookup_prechecked` and switches the inline
-    /// scan into a fully-unrolled cmov chain when `entry_count_hint
-    /// <= MAX_INLINE_UNROLL`.
+    /// Keying on `dict_ssa` lets optimizer rewrites preserve the
+    /// hint because `DictShapeGuard` + `DictLookupPrechecked` share
+    /// the same dict_ptr SSA. The active v2 helper path does not use
+    /// this hint, but it remains available to legacy / future inline
+    /// dict lowering.
     pub fn emit_dict_lookup_with_hint(
         &mut self,
         dict_ssa: SsaVar,
         key_ssa: SsaVar,
         shape_hash: u64,
         entry_count_hint: Option<u32>,
+    ) -> Option<SsaVar> {
+        self.emit_dict_lookup_with_hints(dict_ssa, key_ssa, shape_hash, entry_count_hint, None)
+    }
+
+    /// F-D8 v2 variant that also carries a record byte-length hint.
+    /// Missing `record_len_hint` is safe: the emitter passes
+    /// `record_len = 0` to the v2 helper, which deopts before reading
+    /// the dict body.
+    pub fn emit_dict_lookup_with_hints(
+        &mut self,
+        dict_ssa: SsaVar,
+        key_ssa: SsaVar,
+        shape_hash: u64,
+        entry_count_hint: Option<u32>,
+        record_len_hint: Option<u32>,
     ) -> Option<SsaVar> {
         if self.aborted.is_some() || self.terminated {
             return None;
@@ -452,6 +465,9 @@ impl RecorderState {
         self.buffer.record_type(dst, ObservedType::I64);
         if let Some(n) = entry_count_hint {
             self.buffer.record_dict_entry_count_hint(dict_ssa, n);
+        }
+        if let Some(len) = record_len_hint {
+            self.buffer.record_dict_record_len_hint(dict_ssa, len);
         }
         Some(dst)
     }
@@ -961,11 +977,13 @@ impl RecorderState {
                     SubscriptKind::DictLookup {
                         shape_hash,
                         entry_count_hint,
-                    } => self.emit_dict_lookup_with_hint(
+                        record_len_hint,
+                    } => self.emit_dict_lookup_with_hints(
                         container,
                         top,
                         shape_hash,
                         entry_count_hint,
+                        record_len_hint,
                     ),
                 };
                 let Some(d) = dst else {
@@ -1561,6 +1579,7 @@ mod tests {
                 shape_hash: 0xab,
                 value_ty: IrType::I64,
                 entry_count_hint: None,
+                record_len_hint: None,
             },
             &[key, dict],
             Some(ObservedType::I64),

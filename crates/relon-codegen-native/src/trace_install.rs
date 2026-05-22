@@ -60,7 +60,7 @@ use cranelift_module::{Linkage, Module as _};
 use relon_ir::{IrType, Op, TaggedOp};
 use relon_trace_abi::{HostHookTable, ObservedType, TraceContext, TraceEntryStatus};
 use relon_trace_emitter::{HostHookFuncIds, TraceEmitter};
-use relon_trace_jit::{OptimizedTrace, OptimizerPipeline, SsaVar};
+use relon_trace_jit::{OptimizedTrace, OptimizerPipeline, SsaVar, TraceOp};
 use relon_trace_recorder::{RecordResult, RecorderState};
 
 use crate::trace_recording::{RecordingOutcome, TraceRecordingEvaluator};
@@ -239,6 +239,20 @@ pub struct JITedTraceFn {
 unsafe impl Send for JITedTraceFn {}
 unsafe impl Sync for JITedTraceFn {}
 
+fn with_trace_string_reclaim<R>(f: impl FnOnce() -> R) -> R {
+    struct ReclaimOnDrop;
+    impl Drop for ReclaimOnDrop {
+        fn drop(&mut self) {
+            // SAFETY: callers arrange for any arena-backed StringRef
+            // pointers to be consumed before leaving the scope.
+            unsafe { relon_trace_jit::runtime::reclaim_trace_strings() };
+        }
+    }
+
+    let _reclaim = ReclaimOnDrop;
+    f()
+}
+
 impl JITedTraceFn {
     /// Invoke the trace entry with the supplied [`TraceContext`] and
     /// argument slot pointer. The return value is the raw status code
@@ -258,6 +272,57 @@ impl JITedTraceFn {
             1 => TraceEntryStatus::GuardFailed,
             _ => TraceEntryStatus::Aborted,
         }
+    }
+
+    /// Invoke the trace and reclaim every trace-string allocation
+    /// after `consume` has inspected / copied the result.
+    ///
+    /// Use this for traces that may return or snapshot `StringRef`
+    /// pointers allocated by runtime string shims. The closure runs
+    /// before reclaim, so callers can materialise the payload into an
+    /// owned value. After this method returns, any `StringRef` pointer
+    /// produced on the calling thread during the trace invocation is
+    /// invalid.
+    ///
+    /// # Safety
+    ///
+    /// Same pointer/slot contract as [`Self::invoke`]. In addition,
+    /// `consume` must not return borrowed pointers into the trace
+    /// string arena unless the caller deliberately accepts that they
+    /// are dangling after the method returns.
+    pub unsafe fn invoke_with_string_reclaim<R, F>(
+        &self,
+        ctx: *mut TraceContext,
+        args: *const u64,
+        consume: F,
+    ) -> R
+    where
+        F: FnOnce(TraceEntryStatus, &mut TraceContext) -> R,
+    {
+        with_trace_string_reclaim(|| {
+            let status = unsafe { self.invoke(ctx, args) };
+            // SAFETY: `ctx` is valid and exclusive by the method's
+            // safety contract, and remains live for the duration of
+            // `consume`.
+            consume(status, unsafe { &mut *ctx })
+        })
+    }
+
+    fn return_observed_type(&self) -> Option<ObservedType> {
+        self.inline_trace.ops.iter().rev().find_map(|op| {
+            if let TraceOp::Return(var) = op {
+                self.inline_trace.type_info.get(var).copied()
+            } else {
+                None
+            }
+        })
+    }
+
+    fn success_result_allows_string_reclaim(&self) -> bool {
+        matches!(
+            self.return_observed_type(),
+            Some(ObservedType::I32 | ObservedType::I64 | ObservedType::F64 | ObservedType::Bool)
+        )
     }
 
     /// v6-δ M2-C: invoke the trace entry skipping the
@@ -552,8 +617,19 @@ impl TraceJitState {
         let mut ctx = TraceContext::with_hooks(slot_count, default_host_hooks());
         let status = unsafe { trace_fn.invoke(&mut ctx as *mut _, args_ptr) };
         match status {
-            TraceEntryStatus::Success => ctx.result_slot,
-            TraceEntryStatus::GuardFailed => {
+            TraceEntryStatus::Success => {
+                let result = ctx.result_slot;
+                if trace_fn.success_result_allows_string_reclaim() {
+                    // SAFETY: the installed trace's return SSA is a
+                    // non-pointer observed type, so the raw result
+                    // cannot be an arena-backed StringRef. Temporary
+                    // StringRef allocations made along the way can be
+                    // reclaimed after the result slot has been copied.
+                    unsafe { relon_trace_jit::runtime::reclaim_trace_strings() };
+                }
+                result
+            }
+            TraceEntryStatus::GuardFailed => with_trace_string_reclaim(|| {
                 // v6-δ M2-C: render `value_stack_copy` from the
                 // recorder's per-guard ssa_stack snapshot. The
                 // cranelift-emitted `save_deopt` helper only knows
@@ -598,8 +674,8 @@ impl TraceJitState {
                     "trace GuardFailed; partial-resume snapshot ready (value_stack_copy rendered)"
                 );
                 fallback(args_ptr, resume_pc, snapshot.as_ref())
-            }
-            TraceEntryStatus::Aborted => {
+            }),
+            TraceEntryStatus::Aborted => with_trace_string_reclaim(|| {
                 tracing::warn!(
                     target: "relon::trace_install",
                     fn_id,
@@ -607,7 +683,7 @@ impl TraceJitState {
                 );
                 self.invalidate_trace(fn_id);
                 fallback(args_ptr, None, None)
-            }
+            }),
         }
     }
 
@@ -907,6 +983,7 @@ impl TraceJitState {
             &[
                 pointer_ty,
                 pointer_ty,
+                pointer_ty,
                 cranelift_codegen::ir::types::I64,
                 pointer_ty,
             ],
@@ -933,10 +1010,10 @@ impl TraceJitState {
         // hoists out of the loop) + a `DictLookupPrechecked` (stays
         // in the body) pair. The prechecked op routes here; the
         // shape compare it skips was made redundant by the hoisted
-        // guard. Signature mirrors `dict_lookup` minus the
+        // guard. Signature mirrors v2 `dict_lookup` minus the
         // `shape_hash: i64` arg.
         let dict_lookup_prechecked_sig = build_host_helper_signature(
-            &[pointer_ty, pointer_ty, pointer_ty],
+            &[pointer_ty, pointer_ty, pointer_ty, pointer_ty],
             &[cranelift_codegen::ir::types::I64],
         );
         let dict_lookup_prechecked_id = module
@@ -1407,13 +1484,13 @@ pub fn register_trace_runtime_symbols(builder: &mut JITBuilder) {
     );
     builder.symbol(
         relon_trace_emitter::HostHookId::DictLookup.symbol(),
-        relon_trace_jit::runtime::__relon_trace_dict_lookup as *const u8,
+        relon_trace_jit::runtime::__relon_trace_dict_lookup_v2 as *const u8,
     );
     // F-D8-E.2: prechecked dict lookup helper. Paired with
     // `TraceOp::DictShapeGuard` ahead of the call site.
     builder.symbol(
         relon_trace_emitter::HostHookId::DictLookupPrechecked.symbol(),
-        relon_trace_jit::runtime::__relon_trace_dict_lookup_prechecked as *const u8,
+        relon_trace_jit::runtime::__relon_trace_dict_lookup_prechecked_v2 as *const u8,
     );
     builder.symbol(
         "__relon_jump_to_recorder",

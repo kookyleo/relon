@@ -2,6 +2,8 @@
 //! unmodified file must round-trip, and a no-HMAC cache must still
 //! load without a key.
 
+#![allow(deprecated)]
+
 use relon_object_cache::{
     compute_hmac, ensure_key, hmac_key_path, load, store, verify_hmac, CacheError, HostFnImport,
     IntegrityMode, Metadata, SignatureHash,

@@ -68,16 +68,16 @@ pub const SMOL_STR_INLINE_CAP: usize = 22;
 /// bytes directly in the value slot; longer payloads land on the heap
 /// behind a refcounted `Arc<str>` so clones are O(1).
 #[derive(Clone)]
-pub enum SmolStr {
-    /// Inline payload. `len` is the active prefix length of `data`;
-    /// bytes past `len` are zeroed at construction.
+pub struct SmolStr {
+    repr: SmolStrRepr,
+}
+
+#[derive(Clone)]
+enum SmolStrRepr {
     Inline {
         len: u8,
         data: [u8; SMOL_STR_INLINE_CAP],
     },
-    /// Heap payload. `Arc<str>` shares the bytes across clones; the
-    /// `NonNull` pointer inside the `Arc` provides the niche the enum
-    /// discriminant rides on.
     Heap(Arc<str>),
 }
 
@@ -85,9 +85,26 @@ impl SmolStr {
     /// Build an empty `SmolStr` without touching the allocator.
     #[inline]
     pub const fn new_empty() -> Self {
-        SmolStr::Inline {
-            len: 0,
-            data: [0u8; SMOL_STR_INLINE_CAP],
+        Self {
+            repr: SmolStrRepr::Inline {
+                len: 0,
+                data: [0u8; SMOL_STR_INLINE_CAP],
+            },
+        }
+    }
+
+    #[inline]
+    fn inline(len: u8, data: [u8; SMOL_STR_INLINE_CAP]) -> Self {
+        debug_assert!((len as usize) <= SMOL_STR_INLINE_CAP);
+        Self {
+            repr: SmolStrRepr::Inline { len, data },
+        }
+    }
+
+    #[inline]
+    fn heap(arc: Arc<str>) -> Self {
+        Self {
+            repr: SmolStrRepr::Heap(arc),
         }
     }
 
@@ -95,25 +112,24 @@ impl SmolStr {
     /// `Inline` and `Heap` modes.
     #[inline]
     pub fn as_str(&self) -> &str {
-        match self {
-            SmolStr::Inline { len, data } => {
+        match &self.repr {
+            SmolStrRepr::Inline { len, data } => {
                 let slice = &data[..*len as usize];
-                // SAFETY: every public constructor fills `data[..len]`
-                // from a `&str` / `String`, so the bytes are valid
-                // UTF-8 by construction. We never expose a way to
-                // mutate `data` past construction.
+                // SAFETY: the representation is private and every
+                // constructor validates or copies from an existing
+                // `str`, so `data[..len]` is always UTF-8.
                 unsafe { std::str::from_utf8_unchecked(slice) }
             }
-            SmolStr::Heap(arc) => arc,
+            SmolStrRepr::Heap(arc) => arc,
         }
     }
 
     /// Byte length of the payload (matching `str::len`).
     #[inline]
     pub fn len(&self) -> usize {
-        match self {
-            SmolStr::Inline { len, .. } => *len as usize,
-            SmolStr::Heap(arc) => arc.len(),
+        match &self.repr {
+            SmolStrRepr::Inline { len, .. } => *len as usize,
+            SmolStrRepr::Heap(arc) => arc.len(),
         }
     }
 
@@ -127,7 +143,7 @@ impl SmolStr {
     /// allocation). Useful for SSO-aware diagnostics + tests.
     #[inline]
     pub fn is_inline(&self) -> bool {
-        matches!(self, SmolStr::Inline { .. })
+        matches!(&self.repr, SmolStrRepr::Inline { .. })
     }
 
     /// Returns `true` iff every byte in the payload is ASCII
@@ -166,14 +182,14 @@ impl SmolStr {
     ///   24 bytes.
     #[inline]
     pub fn is_ascii(&self) -> bool {
-        match self {
+        match &self.repr {
             // Inline: scan the (≤ 22-byte) data prefix directly. Even
             // on a non-SIMD target this is a tight loop bounded by the
             // inline cap.
-            SmolStr::Inline { len, data } => data[..*len as usize].is_ascii(),
+            SmolStrRepr::Inline { len, data } => data[..*len as usize].is_ascii(),
             // Heap: delegate to `str::is_ascii`. See type-level note
             // for the follow-up cache work.
-            SmolStr::Heap(arc) => arc.is_ascii(),
+            SmolStrRepr::Heap(arc) => arc.is_ascii(),
         }
     }
 
@@ -196,12 +212,9 @@ impl SmolStr {
             // / `to_owned` cost the alternative path pays.
             let mut data = [0u8; SMOL_STR_INLINE_CAP];
             data[..bytes.len()].copy_from_slice(bytes);
-            SmolStr::Inline {
-                len: bytes.len() as u8,
-                data,
-            }
+            Self::inline(bytes.len() as u8, data)
         } else {
-            SmolStr::Heap(Arc::from(s))
+            Self::heap(Arc::from(s))
         }
     }
 
@@ -215,7 +228,7 @@ impl SmolStr {
             // Drop the heap buffer once inline-copy is done.
             SmolStr::from_borrowed(s.as_str())
         } else {
-            SmolStr::Heap(Arc::from(s))
+            Self::heap(Arc::from(s))
         }
     }
 
@@ -239,10 +252,7 @@ impl SmolStr {
             let mut data = [0u8; SMOL_STR_INLINE_CAP];
             data[..a.len()].copy_from_slice(a.as_bytes());
             data[a.len()..total].copy_from_slice(b.as_bytes());
-            SmolStr::Inline {
-                len: total as u8,
-                data,
-            }
+            Self::inline(total as u8, data)
         } else {
             // Heap fallback: pre-size a `String` (one allocation), push
             // both slices, then hand the buffer to `Arc::from(String)`
@@ -251,7 +261,7 @@ impl SmolStr {
             let mut buf = String::with_capacity(total);
             buf.push_str(a);
             buf.push_str(b);
-            SmolStr::Heap(Arc::from(buf))
+            Self::heap(Arc::from(buf))
         }
     }
 
@@ -292,16 +302,13 @@ impl SmolStr {
                 data[offset..offset + bytes.len()].copy_from_slice(bytes);
                 offset += bytes.len();
             }
-            SmolStr::Inline {
-                len: total as u8,
-                data,
-            }
+            Self::inline(total as u8, data)
         } else {
             let mut buf = String::with_capacity(total);
             for s in slices {
                 buf.push_str(s);
             }
-            SmolStr::Heap(Arc::from(buf))
+            Self::heap(Arc::from(buf))
         }
     }
 
@@ -325,23 +332,11 @@ impl SmolStr {
     /// letting the caller fall through to its heap-path implementation
     /// without paying for the writer invocation. When the inline path
     /// is taken the caller receives a `&mut [u8]` of length `out_len`
-    /// pointing into the inline buffer and is expected to fill every
-    /// byte with a valid UTF-8 codeunit (typically ASCII bytes, since
-    /// the inline cap is 22 bytes and any short Unicode payload that
-    /// can stay inline fits the same byte slice).
-    ///
-    /// # Safety contract (informal)
-    ///
-    /// Caller MUST write exactly `out_len` valid UTF-8 bytes into the
-    /// slice. The closure receives a zero-initialised buffer so a
-    /// missed byte is a `0x00` — still valid UTF-8, but a logic bug
-    /// the debug-mode `assert!(self.as_str().is_char_boundary(_))`
-    /// downstream catches. This API exists to let `to_lower`/`to_upper`
-    /// stdlib helpers route the ASCII fast path through the inline
-    /// slot without going through a `String::with_capacity` + `Arc`
-    /// wrap (see `#161` write-to-buffer rollout); a misuse would
-    /// produce a string with non-UTF-8 interior bytes, which `as_str`
-    /// then exposes via an unchecked `from_utf8_unchecked`.
+    /// pointing into the inline buffer. The resulting byte prefix is
+    /// validated before construction; invalid UTF-8 returns `None`.
+    /// This keeps the unchecked `as_str()` conversion behind the
+    /// private representation sound while preserving the allocation-free
+    /// fast path for ASCII case-fold helpers.
     #[inline]
     pub fn try_build_inline<F>(out_len: usize, write: F) -> Option<Self>
     where
@@ -356,10 +351,8 @@ impl SmolStr {
         // store the `from_borrowed` path performs, so the cost matches
         // the existing inline-path baseline.
         write(&mut data[..out_len]);
-        Some(SmolStr::Inline {
-            len: out_len as u8,
-            data,
-        })
+        std::str::from_utf8(&data[..out_len]).ok()?;
+        Some(Self::inline(out_len as u8, data))
     }
 }
 
@@ -593,8 +586,9 @@ mod tests {
     #[test]
     fn clone_heap_shares_arc() {
         let s = SmolStr::from_borrowed(&"x".repeat(40));
-        match (&s, &s.clone()) {
-            (SmolStr::Heap(a), SmolStr::Heap(b)) => {
+        let c = s.clone();
+        match (&s.repr, &c.repr) {
+            (SmolStrRepr::Heap(a), SmolStrRepr::Heap(b)) => {
                 assert!(
                     Arc::ptr_eq(a, b),
                     "Heap clone should share the same Arc allocation"
@@ -702,6 +696,12 @@ mod tests {
         let s = SmolStr::try_build_inline(SMOL_STR_INLINE_CAP + 1, |_out| {
             panic!("writer must not run when out_len exceeds cap");
         });
+        assert!(s.is_none());
+    }
+
+    #[test]
+    fn try_build_inline_rejects_invalid_utf8() {
+        let s = SmolStr::try_build_inline(1, |out| out[0] = 0xff);
         assert!(s.is_none());
     }
 

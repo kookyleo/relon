@@ -43,10 +43,12 @@ pub enum SubscriptKind {
     /// `Op::DictGetByStringKey` carried a static `entry_count_hint`,
     /// forward it so the recorder can stash the value in the buffer's
     /// `dict_entry_count_hints` side table, keyed by the dict_ptr SSA.
-    /// `None` keeps the legacy data-driven scan-loop emitter path.
+    /// The active v2 helper path uses `record_len_hint`; entry-count
+    /// hints are retained as advisory metadata for inline lowering.
     DictLookup {
         shape_hash: u64,
         entry_count_hint: Option<u32>,
+        record_len_hint: Option<u32>,
     },
 }
 
@@ -329,6 +331,7 @@ pub fn lower_op(op: &Op, cx: OpLoweringContext<'_>) -> LowerOutcome {
             shape_hash,
             value_ty,
             entry_count_hint,
+            record_len_hint,
         } => {
             // Operand stack at call time: `[..., dict_ptr, key_ptr]`.
             // The recorder's apply_outcome arm peels both SSAs off
@@ -345,6 +348,7 @@ pub fn lower_op(op: &Op, cx: OpLoweringContext<'_>) -> LowerOutcome {
                 kind: SubscriptKind::DictLookup {
                     shape_hash: *shape_hash,
                     entry_count_hint: *entry_count_hint,
+                    record_len_hint: *record_len_hint,
                 },
                 ty_hint: ty_to_observed(*value_ty),
             }
@@ -1638,6 +1642,7 @@ mod tests {
                 shape_hash: 0xfeed_face_dead_beef,
                 value_ty: IrType::I64,
                 entry_count_hint: None,
+                record_len_hint: None,
             },
             cx_with(&inputs, SsaVar(99)),
         );
@@ -1647,9 +1652,11 @@ mod tests {
                     SubscriptKind::DictLookup {
                         shape_hash,
                         entry_count_hint,
+                        record_len_hint,
                     } => {
                         assert_eq!(shape_hash, 0xfeed_face_dead_beef);
                         assert!(entry_count_hint.is_none());
+                        assert!(record_len_hint.is_none());
                     }
                     other => panic!("expected DictLookup, got {:?}", other),
                 }
@@ -1661,7 +1668,8 @@ mod tests {
 
     /// F-D8-E.7: when the IR carries an entry_count_hint, the lowering
     /// rule must forward it verbatim so the recorder can stash it in
-    /// the buffer's `dict_entry_count_hints` side table.
+    /// the buffer's `dict_entry_count_hints` side table for advisory
+    /// inline-lowering metadata.
     #[test]
     fn dict_get_by_string_key_forwards_entry_count_hint() {
         let inputs = [SsaVar(21), SsaVar(11)];
@@ -1670,14 +1678,20 @@ mod tests {
                 shape_hash: 0xabc,
                 value_ty: IrType::I64,
                 entry_count_hint: Some(10),
+                record_len_hint: Some(256),
             },
             cx_with(&inputs, SsaVar(99)),
         );
         match outcome {
             LowerOutcome::SubscriptDispatch { kind, .. } => match kind {
                 SubscriptKind::DictLookup {
-                    entry_count_hint, ..
-                } => assert_eq!(entry_count_hint, Some(10)),
+                    entry_count_hint,
+                    record_len_hint,
+                    ..
+                } => {
+                    assert_eq!(entry_count_hint, Some(10));
+                    assert_eq!(record_len_hint, Some(256));
+                }
                 other => panic!("expected DictLookup, got {:?}", other),
             },
             other => panic!("expected SubscriptDispatch, got {:?}", other),
@@ -1712,6 +1726,7 @@ mod tests {
                 shape_hash: 0,
                 value_ty: IrType::I64,
                 entry_count_hint: None,
+                record_len_hint: None,
             },
             cx_with(&inputs, SsaVar(99)),
         );

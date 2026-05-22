@@ -1,24 +1,21 @@
-//! F-D8-E.4 — inline cranelift IR for `TraceOp::DictLookupPrechecked`.
+//! F-D8-E.4 — legacy inline cranelift IR for the v1
+//! `TraceOp::DictLookupPrechecked` experiment.
 //!
-//! Default lowering of `TraceOp::DictLookupPrechecked` is a direct
-//! `call __relon_trace_dict_lookup_prechecked(dict_ptr, key_ptr, ctx)`
-//! (see `crate::emitter::TraceEmitterState::emit_dict_lookup_prechecked`).
-//! For the W5 cmp_lua hot loop — fixed dict, short string keys, ~10
-//! entries — the C ABI crossing alone runs ~6-7 ns/iter. On top of
-//! that, the helper does a fresh FxHash on the key bytes and a linear
-//! scan of the entry table every call. Both are cheap per iteration
-//! but together they account for the bulk of the per-iter cost the
-//! W5 row is measuring.
+//! The active `TraceOp::DictLookupPrechecked` lowering now calls the
+//! collision-safe v2 helper
+//! `__relon_trace_dict_lookup_prechecked_v2(dict_ptr, record_len,
+//! key_ptr, ctx)`. That path carries a record envelope length and
+//! byte-compares key payloads after hash hits.
 //!
-//! This module emits the helper body straight into the caller's
-//! cranelift IR so the trace stays in one straight-line cranelift
-//! function — no extern call, no stack-frame setup, and the same
-//! optimizer (cranelift's `simple_gvn` + register allocator) gets to
-//! schedule the inline-cache scan against the surrounding trace ops.
+//! The helpers in this module are retained as reference code and unit
+//! coverage for the old v1 hash-only inline experiment. They should not
+//! be wired into production lowering without first porting the v2
+//! record-envelope bounds checks and payload comparison into the inline
+//! body.
 //!
 //! ## Layout contract
 //!
-//! Matches `relon-trace-jit::runtime::dict_list::build_dict_record`:
+//! Matches the legacy `build_dict_record` v1 layout:
 //!
 //! ```text
 //! offset 0  : shape_hash  : u64 LE   (already verified by DictShapeGuard)
@@ -94,19 +91,15 @@
 //!
 //! ## Why no upper bound on `entry_count` here
 //!
-//! The caller is responsible for choosing inline vs helper. For W5
-//! `entry_count == 10`; we still emit the inline scan even for larger
-//! tables because the inner loop is tight (one load + one compare +
-//! one brif per entry). The
-//! `crate::emitter::TraceEmitterState::emit_dict_lookup_prechecked`
-//! dispatcher applies a soft cap so machine-code footprint stays
-//! bounded; see that callsite for the constant.
+//! The caller is responsible for choosing inline vs helper. Current
+//! production lowering does not call this module; any future v2 inline
+//! port should set an explicit cap so machine-code footprint stays
+//! bounded.
 //!
 //! ## Inline / fallback decision pattern
 //!
-//! `DictLookupPrechecked` (and its sibling `StrContains` in
-//! [`crate::str_inline`]) share a three-tier dispatch pattern, run
-//! by the emitter at op-lowering time:
+//! The historical `DictLookupPrechecked` inline experiment used this
+//! three-tier dispatch pattern:
 //!
 //! 1. **Probe side table** — look up the recorder's per-SSA hint
 //!    ([`relon_trace_jit::OptimizedTrace::dict_entry_count_hint`]
@@ -128,16 +121,11 @@
 //!      to extern instead — no intermediate tier for str).
 //!    - **Extern shim call** — fallback when no hint is recorded.
 //!
-//! The dispatcher lives in [`crate::emitter`] rather than this
-//! module because the per-callsite glue (SSA lookups, hoisted-SSA
-//! bundles, deopt-block plumbing) is emitter state. The inline
-//! modules export the cap constants and the inline-form emitters;
-//! the emitter owns the if-let chain that walks the tiers. A
-//! generic `InlineDecisionHelper<T>` abstraction was considered
-//! and rejected — the dict and str dispatchers branch on different
-//! key types (`u32` count vs `&[u8]` payload) and feed disjoint
-//! inline-form signatures, so the helper would collapse to two
-//! independent callsites masquerading as one.
+//! The old dispatcher lived in [`crate::emitter`] because the
+//! per-callsite glue (SSA lookups, hoisted-SSA bundles, deopt-block
+//! plumbing) was emitter state. The active emitter has deliberately
+//! returned to the v2 helper call until a collision-safe inline form is
+//! implemented.
 
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::types::{I32, I64};
@@ -198,7 +186,7 @@ pub const MAX_INLINE_ENTRY_HINT: u32 = 64;
 /// W5-class loops keep the scan path.
 pub const MAX_INLINE_UNROLL: u32 = 4;
 
-/// Emit the inline body of `__relon_trace_dict_lookup_prechecked`
+/// Emit the inline body of legacy `__relon_trace_dict_lookup_prechecked`
 /// directly into `builder`. The caller has already verified the
 /// dict's shape via a paired `DictShapeGuard`; we skip the leading
 /// `dict_shape != shape_hash` compare and start straight at the key
@@ -459,7 +447,7 @@ pub fn emit_dict_lookup_inline_with_hoists(
 }
 
 /// F-D8-E.7 — fully-unrolled inline body of
-/// `__relon_trace_dict_lookup_prechecked` for the case where the
+/// legacy `__relon_trace_dict_lookup_prechecked` for the case where the
 /// caller knows the dict's entry count is statically `entry_count`
 /// (`<= MAX_INLINE_UNROLL`).
 ///

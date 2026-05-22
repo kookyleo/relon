@@ -1,7 +1,7 @@
 //! F-D8-E.2 — Dict inline-cache shape-check hoisting.
 //!
 //! `TraceOp::DictLookup` in the recorded trace stream calls into
-//! [`crate::runtime::dict_list::__relon_trace_dict_lookup`] every
+//! [`crate::runtime::dict_list::__relon_trace_dict_lookup_v2`] every
 //! iteration. Inside that helper the first observable cost is a
 //! `read_unaligned::<u64>(dict_ptr)` followed by an `icmp` against
 //! the trace's per-op `shape_hash` immediate, and a sentinel-return
@@ -24,8 +24,9 @@
 //!    enclosing `MarkLoopHead`.
 //! 2. [`TraceOp::DictLookupPrechecked { dst, dict_ptr, key_ptr }`]
 //!    replacing the original `DictLookup`. Lowers to a call into
-//!    [`crate::runtime::dict_list::__relon_trace_dict_lookup_prechecked`],
-//!    which skips the shape compare.
+//!    [`crate::runtime::dict_list::__relon_trace_dict_lookup_prechecked_v2`],
+//!    which skips the shape compare while keeping v2 bounds and key
+//!    payload checks.
 //!
 //! ## Ordering
 //!

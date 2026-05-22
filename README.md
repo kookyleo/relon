@@ -97,23 +97,21 @@ parallel workflows). It's advisory — never blocks.
 - **Local docs site**: `cd docs && npx vitepress dev`
 
 ## 🏗 Project Structure
-- `crates/relon-parser`: The core parser built with `winnow`.
+- `crates/relon-parser`: Rowan-backed lexer/parser, CST, and legacy AST lowering.
 - `crates/relon-analyzer`: Semantic-analysis layer (schema desugar, name resolution, diagnostics).
-- `crates/relon-ir`: Lowered IR consumed by the wasm-AOT backend.
+- `crates/relon-ir`: Lowered IR consumed by the bytecode VM, native backend, and trace recorder.
 - `crates/relon-eval-api`: Shared types + the `Evaluator` trait both backends implement.
 - `crates/relon-evaluator`: Tree-walking interpreter (default backend) + standard library.
-- `crates/relon-codegen-wasm`: Optional wasm-AOT backend (`WasmAotEvaluator`). Compiles
-  a Relon document into wasm at construction time and dispatches `run_main` calls
-  through wasmtime. Gated behind the `wasm-aot` cargo feature on the `relon` facade;
-  the CLI exposes it via `--backend wasm-aot`. See
-  [`docs/internal/wasm-bench-report-2026-05-16.md`](docs/internal/wasm-bench-report-2026-05-16.md)
-  for the cross-backend perf comparison and
-  [`docs/internal/wasm-aot-status-2026-05-16.md`](docs/internal/wasm-aot-status-2026-05-16.md)
-  for the supported language subset.
+- `crates/relon-bytecode`: Stack bytecode compiler/VM and trace-dispatch bridge.
+- `crates/relon-codegen-native`: Cranelift native AOT/JIT backend, sandbox glue, and trace install pipeline.
+- `crates/relon-object-cache`, `crates/relon-object-link`: Native object cache, HMAC integrity, memfd/dlopen loader, and ET_REL linking support.
+- `crates/relon-trace-abi`, `crates/relon-trace-recorder`, `crates/relon-trace-jit`,
+  `crates/relon-trace-emitter`: Trace IR, recorder, optimizer/runtime helpers, and Cranelift emitter.
 - `crates/relon`: Public API facade (`evaluate_source`, `json_from_*`, `Projector`, `new_evaluator`).
 - `crates/relon-cli`: Command-line tool.
 - `crates/relon-fmt`: Formatter / syntax checker.
 - `crates/relon-lsp`: Language Server (parse + analyze + diagnostics).
+- `crates/relon-test-harness`: Cross-backend differential and recorded-loop integration tests.
 - `crates/relon-bench`: Internal micro-benchmark harness (not published).
 - `crates/relon-wasm`: Browser-side wasm bindings for the playground.
 - `examples/`, `fixtures/`: Demo / golden files.

@@ -9,7 +9,7 @@
 //! ## Side-table contract
 //!
 //! Beyond the linear `ops` vector and the position-anchored `guards`
-//! list, the buffer carries five SSA-keyed side tables. All five obey
+//! list, the buffer carries six SSA-keyed side tables. All six obey
 //! the same contract — documented here once and referenced from each
 //! accessor / field rather than re-stated:
 //!
@@ -26,8 +26,13 @@
 //!   (`SsaVar -> (SsaVar, SsaVar)`). Lets LICM hoist the payload
 //!   deref out of hot loops.
 //! * `dict_entry_count_hints`  (F-D8-E.7) — static entry count for a
-//!   dict-pointer SSA (`SsaVar -> u32`). Lets the emitter pick the
-//!   fully-unrolled `DictLookupPrechecked` lowering.
+//!   dict-pointer SSA (`SsaVar -> u32`). Retained as advisory metadata
+//!   for legacy / future inline dict lowering; the active v2 helper
+//!   path does not need it.
+//! * `dict_record_len_hints`   (F-D8 v2) — byte length of the dict
+//!   record envelope (`SsaVar -> u32`). Lets the emitter call the v2
+//!   dict helper, which bounds-checks the entry table and byte-compares
+//!   stored key payloads on hash hit.
 //!
 //! Shared invariants:
 //!
@@ -127,20 +132,27 @@ pub struct TraceBuffer {
     ///
     /// Populated by `relon_trace_recorder::RecorderState::emit_dict_lookup_with_hint`
     /// when the source-level `Op::DictGetByStringKey` carried a
-    /// `entry_count_hint`; consumed by the trace-emitter to switch
-    /// the `DictLookupPrechecked` lowering from a data-driven scan
-    /// loop into a fully-unrolled cmov chain when the entry count is
-    /// small (≤ `MAX_INLINE_UNROLL` in dict_inline.rs).
+    /// `entry_count_hint`. The active v2 helper lowering consumes
+    /// `dict_record_len_hints` instead; this table remains available
+    /// to legacy / future inline dict lowering experiments.
     ///
     /// Why this is safe: the value is a static IR hint — the dict's
     /// `DictShapeGuard` runs upstream and verifies the shape hash,
     /// which by construction pins the key set (and hence the entry
-    /// count). A mismatch deopts at the shape guard before the
-    /// unrolled lookup reads anything from the entry table.
+    /// count). A mismatch deopts at the shape guard before a
+    /// prechecked lookup reads anything from the entry table.
     ///
     /// Follows the module-level "Side-table contract" — SSA-keyed,
     /// recorder-written, frozen after `into_optimized`.
     pub dict_entry_count_hints: HashMap<SsaVar, u32>,
+    /// F-D8 v2: dict record length side table. Maps a dict_ptr SSA to
+    /// the byte length of the record it points at. The v2 runtime
+    /// helper requires this envelope so it can reject truncated entry
+    /// tables and validate every key payload range before doing a
+    /// byte compare on hash hit. Missing length hints are lowered as
+    /// `record_len = 0`, causing the helper to deopt safely instead
+    /// of falling back to the hash-only v1 lookup.
+    pub dict_record_len_hints: HashMap<SsaVar, u32>,
     next_ssa: u32,
 }
 
@@ -219,6 +231,12 @@ impl TraceBuffer {
         self.dict_entry_count_hints.insert(dict_ptr, entry_count);
     }
 
+    /// F-D8 v2: stash the dict record's byte length for the pointer
+    /// held by `dict_ptr`. See [`Self::dict_record_len_hints`].
+    pub fn record_dict_record_len_hint(&mut self, dict_ptr: SsaVar, record_len: u32) {
+        self.dict_record_len_hints.insert(dict_ptr, record_len);
+    }
+
     /// Convenience: how many ops the buffer currently holds.
     pub fn op_count(&self) -> usize {
         self.ops.len()
@@ -240,6 +258,7 @@ impl TraceBuffer {
             const_bytes: self.const_bytes,
             str_payload: self.str_payload,
             dict_entry_count_hints: self.dict_entry_count_hints,
+            dict_record_len_hints: self.dict_record_len_hints,
             ssa_high_water: self.next_ssa,
         }
     }
@@ -270,6 +289,9 @@ pub struct OptimizedTrace {
     /// F-D8-E.7: dict static-entry-count hint side table — see
     /// [`TraceBuffer::dict_entry_count_hints`].
     pub dict_entry_count_hints: HashMap<SsaVar, u32>,
+    /// F-D8 v2: dict record length side table — see
+    /// [`TraceBuffer::dict_record_len_hints`].
+    pub dict_record_len_hints: HashMap<SsaVar, u32>,
     pub ssa_high_water: u32,
 }
 
@@ -300,12 +322,18 @@ impl OptimizedTrace {
     }
 
     /// F-D8-E.7: lookup the static dict `entry_count` hint bound to
-    /// `dict_ptr`, if any. The emitter uses this on
-    /// `TraceOp::DictLookupPrechecked` to switch between an unrolled
-    /// `n`-cmov chain (when `n <= MAX_INLINE_UNROLL`) and the legacy
-    /// data-driven scan loop.
+    /// `dict_ptr`, if any. This is advisory metadata for legacy /
+    /// future inline dict lowering; active collision-safe v2 lowering
+    /// uses [`Self::dict_record_len_hint`] instead.
     pub fn dict_entry_count_hint(&self, dict_ptr: SsaVar) -> Option<u32> {
         self.dict_entry_count_hints.get(&dict_ptr).copied()
+    }
+
+    /// F-D8 v2: lookup the record byte length for a dict pointer.
+    /// Missing hints make the emitter pass `record_len = 0` to the
+    /// v2 helper, which deopts before reading the entry table.
+    pub fn dict_record_len_hint(&self, dict_ptr: SsaVar) -> Option<u32> {
+        self.dict_record_len_hints.get(&dict_ptr).copied()
     }
 
     /// Side tables only, exposed so callers can round-trip the parts

@@ -3,6 +3,8 @@
 //! mutable state, so this is mostly a smoke test against future
 //! regressions that introduce a non-thread-safe cache.
 
+#![allow(deprecated)]
+
 use relon_object_cache::{load, store, HostFnImport, IntegrityMode, Metadata, SignatureHash};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;

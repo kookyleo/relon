@@ -243,21 +243,17 @@ pub enum HostHookId {
     /// `ctx.result_slot` and returns 0; the cranelift-side guard
     /// branches into the deopt block.
     ListGet,
-    /// F-D8: `__relon_trace_dict_lookup(dict_ptr: *const u8, key_ptr:
-    /// *const u8, shape_hash: u64, ctx: *mut TraceContext) -> i64`.
-    /// IC-guarded dict access: on shape match the helper returns the
-    /// cached i64 value; on mismatch it returns a sentinel that the
-    /// surrounding cranelift IR turns into a deopt branch so the
-    /// recorder gets a chance to re-specialise under the new shape.
+    /// F-D8 v2: `__relon_trace_dict_lookup_v2(dict_ptr: *const u8,
+    /// record_len: usize, key_ptr: *const u8, shape_hash: u64, ctx:
+    /// *mut TraceContext) -> i64`. The v2 helper bounds-checks the
+    /// dict record envelope and byte-compares key payloads after a
+    /// hash hit, so FxHash collisions cannot return the wrong value.
     DictLookup,
-    /// F-D8-E.2: `__relon_trace_dict_lookup_prechecked(dict_ptr:
-    /// *const u8, key_ptr: *const u8, ctx: *mut TraceContext) -> i64`.
-    /// Same semantics as [`Self::DictLookup`] except the helper
-    /// skips the shape compare on the IC fast path. The cranelift
-    /// emitter lowers `TraceOp::DictLookupPrechecked` into a call
-    /// to this helper; the matching `TraceOp::DictShapeGuard` ahead
-    /// of the lookup (typically hoisted out of the enclosing loop
-    /// by LICM) keeps the safety contract intact.
+    /// F-D8 v2 prechecked companion:
+    /// `__relon_trace_dict_lookup_prechecked_v2(dict_ptr, record_len,
+    /// key_ptr, ctx) -> i64`. Same semantics as [`Self::DictLookup`]
+    /// except the matching `TraceOp::DictShapeGuard` has already
+    /// verified the shape hash.
     DictLookupPrechecked,
 }
 
@@ -279,8 +275,8 @@ impl HostHookId {
             HostHookId::StrSubstring => "__relon_str_substring",
             HostHookId::StrGlobMatch => "__relon_str_glob_match",
             HostHookId::ListGet => "__relon_trace_list_get",
-            HostHookId::DictLookup => "__relon_trace_dict_lookup",
-            HostHookId::DictLookupPrechecked => "__relon_trace_dict_lookup_prechecked",
+            HostHookId::DictLookup => "__relon_trace_dict_lookup_v2",
+            HostHookId::DictLookupPrechecked => "__relon_trace_dict_lookup_prechecked_v2",
         }
     }
 }

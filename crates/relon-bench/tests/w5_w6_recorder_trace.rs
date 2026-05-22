@@ -18,9 +18,7 @@ use relon_codegen_native::trace_install::{
 use relon_ir::ir::{IrType, Op, TaggedOp};
 use relon_ir::shape_hash::shape_hash_for_keys;
 use relon_parser::TokenRange;
-use relon_trace_jit::{
-    build_dict_record, build_flat_list_record, build_string_record, fx_hash_key_record,
-};
+use relon_trace_jit::{build_dict_record_v2, build_flat_list_record, build_string_record};
 
 fn tag(op: Op) -> TaggedOp {
     TaggedOp {
@@ -158,17 +156,13 @@ fn w6_recorder_trace_runs_actual_iterations() {
 fn w5_recorder_trace_runs_actual_iterations() {
     let labels = ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"];
     let key_records: Vec<Vec<u8>> = labels.iter().map(|s| build_string_record(s)).collect();
-    let key_hashes: Vec<u64> = key_records
-        .iter()
-        .map(|kr| unsafe { fx_hash_key_record(kr.as_ptr()) })
-        .collect();
     let shape_hash = shape_hash_for_keys(labels.iter().copied());
-    let entries: Vec<(u64, i64)> = key_hashes
+    let entries: Vec<(&[u8], i64)> = labels
         .iter()
         .enumerate()
-        .map(|(i, h)| (*h, (i as i64) + 1))
+        .map(|(i, s)| (s.as_bytes(), (i as i64) + 1))
         .collect();
-    let dict_bytes = build_dict_record(shape_hash, &entries);
+    let dict_bytes = build_dict_record_v2(shape_hash, &entries);
     let key_record_ptrs: Vec<i64> = key_records.iter().map(|kr| kr.as_ptr() as i64).collect();
     let keys_list_bytes = build_flat_list_record(&key_record_ptrs);
 
@@ -240,6 +234,7 @@ fn w5_recorder_trace_runs_actual_iterations() {
                         shape_hash,
                         value_ty: IrType::I64,
                         entry_count_hint: None,
+                        record_len_hint: Some(dict_bytes.len() as u32),
                     }),
                     tag(Op::LetGet {
                         idx: ACC,

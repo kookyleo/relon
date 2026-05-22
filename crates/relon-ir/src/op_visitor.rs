@@ -99,6 +99,7 @@ pub trait OpVisitor {
         shape_hash: u64,
         value_ty: IrType,
         entry_count_hint: Option<u32>,
+        record_len_hint: Option<u32>,
     ) -> Result<Self::Output, Self::Error>;
     fn visit_list_get_by_int_idx(
         &mut self,
@@ -283,7 +284,13 @@ pub fn walk_op<V: OpVisitor>(op: &Op, visitor: &mut V) -> Result<V::Output, V::E
             shape_hash,
             value_ty,
             entry_count_hint,
-        } => visitor.visit_dict_get_by_string_key(*shape_hash, *value_ty, *entry_count_hint),
+            record_len_hint,
+        } => visitor.visit_dict_get_by_string_key(
+            *shape_hash,
+            *value_ty,
+            *entry_count_hint,
+            *record_len_hint,
+        ),
         Op::ListGetByIntIdx { element_ty } => visitor.visit_list_get_by_int_idx(*element_ty),
         Op::Add(ty) => visitor.visit_add(*ty),
         Op::StrConcatN { operand_count } => visitor.visit_str_concat_n(*operand_count),
@@ -492,6 +499,7 @@ mod tests {
             &mut self,
             _: u64,
             _: IrType,
+            _: Option<u32>,
             _: Option<u32>,
         ) -> Result<(), ()> {
             self.calls += 1;

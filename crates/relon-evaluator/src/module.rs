@@ -380,6 +380,15 @@ mod remote_http {
                     // *something* to anchor on (still no validators).
                     self.synth_meta(&body, &meta_path)
                 });
+                if Self::body_digest(&body) != meta.body_sha256 {
+                    // The cache body and sidecar disagree. Treat the
+                    // entry as corrupt and remove both halves so a
+                    // later resolve cannot keep serving stale bytes or
+                    // accept a 304 against the wrong body.
+                    let _ = std::fs::remove_file(&body_path);
+                    let _ = std::fs::remove_file(&meta_path);
+                    return None;
+                }
                 let fresh = self.is_fresh(meta.fetched_at);
                 return Some(CachedEntry { body, meta, fresh });
             }
@@ -888,6 +897,31 @@ mod remote_http {
                 p1.with_extension("meta"),
                 cache.meta_path("https://example.com/util.relon")
             );
+        }
+
+        #[test]
+        fn cache_body_digest_mismatch_is_cache_miss() {
+            let cache_root = temp_cache_dir();
+            let cache = RemoteImportCache::new(&cache_root);
+            let url = "https://example.com/tampered.relon";
+
+            cache.store(url, "{ value: 1 }", Some("\"v1\"".to_string()), None);
+            std::fs::write(cache.body_path(url), "{ value: 2 }").expect("tamper body");
+
+            assert!(
+                cache.load(url).is_none(),
+                "digest mismatch must invalidate the cache entry"
+            );
+            assert!(
+                !cache.body_path(url).exists(),
+                "corrupt body should be removed"
+            );
+            assert!(
+                !cache.meta_path(url).exists(),
+                "corrupt sidecar should be removed"
+            );
+
+            let _ = std::fs::remove_dir_all(&cache_root);
         }
 
         // -------- v3++ b-3: conditional GET tests --------

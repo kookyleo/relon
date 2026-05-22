@@ -59,9 +59,14 @@ code that builds a `Context` and registers native fns).
   before allocating; the post-call check is a catch-all on the
   intrinsic return path — see `NativeFnCaps::max_value_elements` in
   `crates/relon-evaluator/src/native_fn.rs`).
-- **No `unsafe` Rust.** Every crate in the workspace declares
-  `#![forbid(unsafe_code)]` at the crate root, so the compiler rejects
-  any `unsafe` block.
+- **Safe core, audited unsafe islands.** The parser, analyzer,
+  tree-walking evaluator, bytecode VM, facade, CLI, LSP, formatter,
+  and browser wasm bindings are intended to remain safe Rust. The
+  native backend, object cache/loader, trace ABI/runtime/emitter, and
+  compact string representation contain explicit unsafe islands for
+  FFI, JIT entry calls, raw object loading, and layout-sensitive fast
+  paths. Treat those crates as part of the host trust boundary and keep
+  changes behind focused tests and review.
 
 ### What is *not* guaranteed
 

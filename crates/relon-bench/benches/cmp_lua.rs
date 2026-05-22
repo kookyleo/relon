@@ -66,17 +66,15 @@ use relon_eval_api::Evaluator as RelonEvaluator;
 // cranelift entries to the recorder-driven install path. The full
 // cranelift_codegen / cranelift_frontend surface this file once
 // imported is now unused. Fixture construction still calls into
-// `relon-trace-jit`'s `build_*_record` / `fx_hash_key_record`
-// helpers, which is what the imports below cover.
+// `relon-trace-jit`'s `build_*_record` helpers, which is what the
+// imports below cover.
 use relon_bench::quiescence::verify_quiescence;
 use relon_eval_api::Value;
 use relon_evaluator::{Context, Scope, TreeWalkEvaluator};
 use relon_parser::parse_document;
 use relon_trace_abi::TraceContext;
 use relon_trace_jit::runtime::StringRef;
-use relon_trace_jit::{
-    build_dict_record, build_flat_list_record, build_string_record, fx_hash_key_record,
-};
+use relon_trace_jit::{build_dict_record_v2, build_flat_list_record, build_string_record};
 
 // F-D8-D (2026-05-20): recorder-driven trace install path. The W5 / W6
 // `trace_jit` rows below switch from the hand-built cranelift entry
@@ -203,7 +201,7 @@ fn lua_fn(lua: &mlua::Lua, src: &str) -> mlua::Function {
 //
 // - W3 / W4 use the `__relon_str_concat` + `__relon_str_contains` shims
 //   (F-D7 IC for contains, leak-arena concat).
-// - W5 / W6 use the `__relon_trace_dict_lookup` helper + inline
+// - W5 / W6 use the v2 dict helper + inline
 //   `ListGet` lowering (F-D8 dict / list ops).
 //
 // Each builder produces a function with the
@@ -1054,26 +1052,22 @@ struct W5Fixture {
 /// (per-key fx_hash XOR-mixed against an `INITIAL_SEED`). The F-D8-D
 /// recorder row needs the dict record's first-8-byte header to match
 /// the `Op::DictGetByStringKey { shape_hash }` payload exactly,
-/// otherwise the runtime IC dispatch (`__relon_trace_dict_lookup`)
+/// otherwise the runtime IC dispatch (`__relon_trace_dict_lookup_v2`)
 /// hits the `dict_shape != shape_hash` branch and returns the deopt
 /// sentinel every iteration.
 fn build_w5_fixture() -> W5Fixture {
     let labels = ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"];
     let key_records: Vec<Vec<u8>> = labels.iter().map(|s| build_string_record(s)).collect();
-    let key_hashes: Vec<u64> = key_records
-        .iter()
-        .map(|kr| unsafe { fx_hash_key_record(kr.as_ptr()) })
-        .collect();
     // F-D8-D: route through the canonical producer-side helper so the
     // bench's `shape_hash` lines up bit-for-bit with what an analyzer-
     // emitted `Op::DictGetByStringKey` would stamp in production.
     let shape_hash = shape_hash_for_keys(labels.iter().copied());
-    let entries: Vec<(u64, i64)> = key_hashes
+    let entries: Vec<(&[u8], i64)> = labels
         .iter()
         .enumerate()
-        .map(|(i, h)| (*h, (i as i64) + 1))
+        .map(|(i, s)| (s.as_bytes(), (i as i64) + 1))
         .collect();
-    let dict_bytes = build_dict_record(shape_hash, &entries);
+    let dict_bytes = build_dict_record_v2(shape_hash, &entries);
     let key_record_ptrs: Vec<i64> = key_records.iter().map(|kr| kr.as_ptr() as i64).collect();
     let keys_list_bytes = build_flat_list_record(&key_record_ptrs);
     W5Fixture {
@@ -1139,7 +1133,7 @@ fn tag(op: Op) -> TaggedOp {
 /// computed by [`build_w5_fixture`]; baking it into the IR Op
 /// matches the F-D8-D analyzer story (the shape is static at IR
 /// emit time, observed by the recorder verbatim).
-fn build_w5_recorder_body(shape_hash: u64) -> Vec<TaggedOp> {
+fn build_w5_recorder_body(shape_hash: u64, record_len: u32) -> Vec<TaggedOp> {
     const I: u32 = 0;
     const ACC: u32 = 1;
     const KEY_IDX: u32 = 2;
@@ -1203,10 +1197,11 @@ fn build_w5_recorder_body(shape_hash: u64) -> Vec<TaggedOp> {
                     tag(Op::DictGetByStringKey {
                         shape_hash,
                         value_ty: IrType::I64,
-                        // F-D8-E.7: W5 fixture has 10 fixed keys; this
-                        // hint lets the emitter switch the inline
-                        // lookup to a 10-deep cmov chain (no scan loop).
+                        // W5 fixture has 10 fixed keys and a static v2
+                        // record envelope; forward both hints so the
+                        // trace can use collision-safe dict lookup.
                         entry_count_hint: Some(10),
+                        record_len_hint: Some(record_len),
                     }),
                     // acc = acc + value
                     tag(Op::LetGet {
@@ -2548,7 +2543,7 @@ fn bench_cmp_lua(c: &mut Criterion) {
         ];
         let _w5_trace_fn = install_recorder_trace(
             w5_fn_id,
-            build_w5_recorder_body(w5_fixture.shape_hash),
+            build_w5_recorder_body(w5_fixture.shape_hash, w5_fixture.dict_bytes.len() as u32),
             vec![IrType::I64, IrType::I64, IrType::I64],
             &warm_args_w5,
         );

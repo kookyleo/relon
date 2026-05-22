@@ -285,25 +285,26 @@ pub enum TraceOp {
     },
 
     /// `dst = dict_lookup(dict_ptr, key_ptr, shape_hash)` via the
-    /// host's inline-cached hash table.
+    /// host's collision-safe dict helper.
     ///
-    /// F-D8: lowered into a single `call_indirect` to the host's
-    /// `__relon_trace_dict_lookup_with_shape` helper. The helper reads
-    /// the `shape_hash` immediate and compares it against the dict's
+    /// F-D8/v2: lowered into a call to the host's
+    /// `__relon_trace_dict_lookup_v2` helper. The helper reads the
+    /// `shape_hash` immediate and compares it against the dict's
     /// recorded shape fingerprint; on mismatch it returns a sentinel
     /// the emitter turns into a deopt branch, leaving the slow path
     /// to re-record under the new shape.
     ///
-    /// `key_ptr` carries a pointer to a `[len: u32][utf8...]` String
-    /// record (same shape `Op::ConstString` uses); the host helper
-    /// rehydrates a borrowed `&str` from it on the slow path. On the
-    /// IC-hit fast path neither the key bytes nor the dict's BTreeMap
-    /// are touched — the cached index lookup short-circuits.
+    /// `key_ptr` carries a pointer to a `[len: u32][hash: u64][utf8...]`
+    /// String record. On hash hit, v2 compares the stored key payload
+    /// bytes before returning the value, so payload-distinct hash
+    /// collisions deopt or continue scanning instead of producing a
+    /// wrong value.
     ///
     /// `shape_hash` is computed at recording time from the keys the
     /// recorder saw in the dict; the runtime side stamps the same
     /// fingerprint into the dict header. FxHash is used here so the
-    /// per-key cost stays sub-cycle; collisions deopt cleanly.
+    /// per-key cost stays small; v2 handles entry-key collisions by
+    /// comparing payload bytes after the hash match.
     ///
     /// Effect class: `ReadOnly`.
     DictLookup {
@@ -348,14 +349,14 @@ pub enum TraceOp {
     /// elsewhere (typically a loop-hoisted [`Self::DictShapeGuard`]).
     ///
     /// Same semantics as [`Self::DictLookup`] except the runtime
-    /// helper skips the shape compare on the IC fast path. The
+    /// v2 helper skips the shape compare. The
     /// recorder never emits this op directly — only the optimizer's
     /// `dict_ic_hoist` pass produces it, and only when it has
     /// inserted a matching `DictShapeGuard` upstream. Invariant
     /// pairing is what keeps the runtime safe: a dict whose layout
     /// drifted between recorder time and trace execution gets
     /// rejected by the upstream `DictShapeGuard` before the
-    /// prechecked helper would scan into garbage entries.
+    /// prechecked helper would read the record body.
     ///
     /// Effect class: [`EffectClass::ReadOnly`] (same as
     /// `DictLookup`).

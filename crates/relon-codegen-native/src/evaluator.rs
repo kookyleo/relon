@@ -835,12 +835,10 @@ impl CraneliftAotEvaluator {
         param_names: Vec<String>,
         buffer_schema: Option<BufferSchema>,
     ) -> Result<Self, CraneliftError> {
-        // Install the process-wide signal handler once at evaluator
-        // construction. The handler is idempotent (`Once::call_once`
-        // internally) so doing it here rather than per-invoke moves a
-        // (cheap but non-zero) atomic-load probe off the dispatch hot
-        // path. The `Once`'s state lives in the trap-handler module
-        // and stays live for the host's lifetime.
+        // Historical hook kept as a no-op: Relon no longer installs a
+        // Rust process-wide SIGSEGV/SIGFPE/SIGILL handler. Hardware
+        // faults remain fail-fast; typed traps come from the
+        // structured `cond_trap -> SandboxState::trap_code` path.
         crate::trap_handler::install_global_signal_handler();
 
         // The codegen's tail-cursor protocol needs the return record's
@@ -1151,12 +1149,10 @@ impl CraneliftAotEvaluator {
     ///   builds were one helper regression away from aborting the
     ///   host process.
     /// - The shield is **not** what types SIGSEGV / SIGFPE / SIGILL.
-    ///   Those are observed via the thread-local signal slot
-    ///   populated by `crate::trap_handler`, which works
-    ///   independently of `catch_unwind` (and the trap_handler doc
-    ///   honestly admits the slot is best-effort: a real hardware
-    ///   fault typically aborts the process via the chained default
-    ///   handler before the trampoline ever reads it).
+    ///   Those remain fail-fast process crashes unless a future host
+    ///   installs a real `sigsetjmp`/landing-pad recovery trampoline.
+    ///   The old Rust TLS signal-slot telemetry path is intentionally
+    ///   disabled because it was not async-signal-safe.
     /// - Measured release-build cost of the shield on
     ///   `dispatch_cranelift_step_legacy_i64` (#154 baseline) is
     ///   ~1.75 ns / +12 % over the unshielded path — acceptable to
@@ -1174,12 +1170,9 @@ impl CraneliftAotEvaluator {
         // overhead matters on the dispatch hot path.
         let state = Box::new(SandboxState::from_template(&self.sandbox_shared));
         let state_ptr: *const SandboxState = &*state;
-        // 2026-05-22 review #172: reset the thread-local signal slot
-        // before every dispatch in all build modes. The previous
-        // debug-only reset relied on the (release-only) lever (b)
-        // skip; with the `catch_unwind` shield restored in release
-        // we share the same pre-/post-dispatch protocol across both
-        // build modes.
+        // No-op today: retained so a future host-side hardware-fault
+        // recovery trampoline can wire an async-signal-safe signal
+        // observation path without perturbing dispatch structure.
         crate::trap_handler::reset_thread_signal_slot();
         // 2026-05-21 dispatch-boundary lever (d): use the de-tagged
         // inline-cached entry pointer (single field load) instead of
@@ -1234,11 +1227,6 @@ impl CraneliftAotEvaluator {
         scratch_base: u32,
         caps: u64,
     ) -> Result<i32, RuntimeError> {
-        // The process-wide signal handler is installed once at
-        // evaluator construction (`from_ir_inner`); it stays live for
-        // the host's lifetime, so the hot dispatch path doesn't pay a
-        // `Once::call_once` atomic-load probe per invocation.
-        //
         // 2026-05-22 P0 fix: allocate a per-call SandboxState from
         // the evaluator's immutable template. See
         // `invoke_legacy_entry` for the rationale; the buffer entry
@@ -1246,8 +1234,7 @@ impl CraneliftAotEvaluator {
         // base, which previously raced on a shared Arc<SandboxState>.
         let state = Box::new(SandboxState::from_template(&self.sandbox_shared));
         let state_ptr: *const SandboxState = &*state;
-        // 2026-05-22 review #172: reset across debug + release; see
-        // `invoke_legacy_entry` for the rationale.
+        // No-op today; see `invoke_legacy_entry`.
         crate::trap_handler::reset_thread_signal_slot();
         // SAFETY: `arena` is borrowed mutably here and stays valid
         // through the JIT call's lifetime (`arena` outlives this
@@ -1291,22 +1278,11 @@ impl CraneliftAotEvaluator {
     /// Post-process a JIT-call result: surface typed traps recorded in
     /// `state.trap_code`, otherwise pass the raw return value through.
     ///
-    /// Stage 5 Phase C.3: also consults the thread-local signal slot
-    /// populated by `crate::trap_handler` when a SIGSEGV / SIGFPE /
-    /// SIGILL fired during the JIT call. Signal-side traps take
-    /// precedence over the JIT-recorded trap code because the
-    /// signal observation came from the hardware / OS layer which
-    /// our codegen guards can't intercept.
-    ///
-    /// 2026-05-22 review #172: this helper runs on both debug and
-    /// release dispatch paths now that the `catch_unwind` shield is
-    /// no longer cfg-gated. The signal slot read remains
-    /// best-effort — a genuine SIGSEGV typically aborts the process
-    /// via the chained default handler before we get to it (see
-    /// `crate::trap_handler` for the honest semantics); but if
-    /// control does return, we still convert the slot into a typed
-    /// error rather than silently passing the JIT's sentinel
-    /// through.
+    /// The old best-effort Rust TLS signal observation path is now a
+    /// no-op because writing TLS from a synchronous signal handler is
+    /// not async-signal-safe. A genuine SIGSEGV/SIGFPE/SIGILL remains
+    /// a platform fail-fast crash until a real host recovery
+    /// trampoline exists.
     ///
     /// 2026-05-21 lever (c): success path uses `take_trap_code`
     /// (load-then-store-iff-nonzero) so the predictable-not-taken
@@ -1317,9 +1293,7 @@ impl CraneliftAotEvaluator {
         state: &SandboxState,
         result: std::thread::Result<T>,
     ) -> Result<T, RuntimeError> {
-        // Check the signal-hook slot first — a SIGSEGV during JIT
-        // body execution should surface as a typed trap even if the
-        // JIT-side `cond_trap` sequence never ran.
+        // Kept as a no-op compatibility probe; see `trap_handler`.
         let signal_code = crate::trap_handler::read_thread_signal_slot();
         if signal_code != 0 {
             // Reset the slot eagerly so the next dispatch doesn't pick

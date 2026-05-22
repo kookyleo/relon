@@ -442,21 +442,28 @@ pub enum Op {
         /// guards see a stable expected width.
         value_ty: IrType,
         /// F-D8-E.7: static hint of how many entries the dict carries
-        /// at IR emit time. When `Some(n)` with `n <= 16` the
-        /// trace-emitter can specialise the `DictLookupPrechecked`
-        /// lowering into a fully-unrolled `n`-cmov chain (no scan
-        /// loop). `None` keeps the historical data-driven scan-loop
-        /// path. The hint is ADVISORY: a runtime `entry_count`
-        /// mismatch fails the `DictShapeGuard` upstream because shape
-        /// hashes pin the key set (and therefore the entry count) at
-        /// record time.
+        /// at IR emit time. The active collision-safe v2 helper path
+        /// does not need this value, but the recorder preserves it as
+        /// advisory metadata for legacy / future inline dict lowering.
+        /// The hint is ADVISORY: a runtime `entry_count` mismatch
+        /// fails the `DictShapeGuard` upstream because shape hashes
+        /// pin the key set (and therefore the entry count) at record
+        /// time.
         ///
         /// Producers SHOULD fill this when the dict literal's key set
         /// is statically known (e.g. `{ "a": 1, "b": 2 }` in source);
         /// the analyzer pipeline counts the keys and forwards them
-        /// here. Hand-built IR fixtures pass `None` when they want
-        /// the legacy path.
+        /// here. Hand-built IR fixtures pass `None` when the value is
+        /// not statically known or not useful for the chosen lowering.
         entry_count_hint: Option<u32>,
+        /// F-D8 v2: byte length of the dict record envelope, when the
+        /// producer knows the backing record statically. The trace
+        /// emitter forwards this to the v2 runtime helper so it can
+        /// bounds-check the entry table and key payload ranges before
+        /// comparing bytes on a hash hit. `None` is safe: the emitter
+        /// passes `record_len = 0`, which forces a deopt before any
+        /// dict-body read.
+        record_len_hint: Option<u32>,
     },
 
     /// F-D8-B: source-level `list[idx]` subscript surfaced to the IR.

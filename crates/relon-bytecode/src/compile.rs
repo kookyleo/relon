@@ -1282,6 +1282,7 @@ impl<'a> OpVisitor for CompileState<'a> {
         _shape_hash: u64,
         _value_ty: IrType,
         _entry_count_hint: Option<u32>,
+        _record_len_hint: Option<u32>,
     ) -> Result<(), BcCompileError> {
         // M2-B phase 4b-continuation: real IR-lift. Stack at this point
         // is `[dict_handle, key_handle]` (the IR `[Dict, String]` shape
@@ -1874,6 +1875,7 @@ mod tests {
                     shape_hash: 0,
                     value_ty: IrType::I64,
                     entry_count_hint: None,
+                    record_len_hint: None,
                 }),
                 tagged(Op::Return),
             ],

@@ -499,6 +499,7 @@ impl OpVisitor for ConstPool {
         _: u64,
         _: IrType,
         _: Option<u32>,
+        _: Option<u32>,
     ) -> Result<(), CraneliftError> {
         Ok(())
     }

@@ -78,24 +78,11 @@ relon-object-link = { workspace = true }
 # corrupt, etc.).
 tracing = "0.1"
 
-# Stage 5 Phase C.3: SIGSEGV / SIGFPE / SIGILL signal handler. We
-# install a process-wide handler once via `OnceLock`; the handler
-# records the trap code into a thread-local slot so the host-side
-# trampoline lifts the signal into a typed `RuntimeError`. The full
-# `sigsetjmp` / `siglongjmp` round trip stays deferred because libc
-# doesn't expose `sigsetjmp` directly (it's a macro on glibc); the
-# current `catch_unwind` path is functionally equivalent for the
-# guards we emit (cond_trap + sentinel return, not a native trap),
-# and signal-hook adds defense-in-depth for genuine memory-safety
-# bugs in the JIT-emitted code. Linux/macOS targets only — the
-# wasm32 build re-routes through tree-walk and doesn't need it.
+# Stage 5 Phase C.3: libc signal constants are used only to map
+# platform signal numbers to Relon trap kinds for diagnostics. Relon
+# does not install a Rust process-wide signal handler; typed traps are
+# delivered through structured sandbox state instead.
 [target.'cfg(unix)'.dependencies]
-signal-hook = "0.3"
-# `register_signal_unchecked` is on the registry crate; we use it to
-# install handlers for SIGSEGV / SIGFPE / SIGILL which signal-hook
-# marks as "forbidden" by default. See `trap_handler.rs` for the
-# justification.
-signal-hook-registry = "1.4"
 libc = "0.2"
 
 [dev-dependencies]

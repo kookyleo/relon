@@ -2,6 +2,8 @@
 //! the exact bytes we put in, and storing two different sources
 //! into the same directory must not stomp on each other.
 
+#![allow(deprecated)]
+
 use relon_object_cache::{
     load, store, CacheError, HostFnImport, IntegrityMode, Metadata, SignatureHash,
 };

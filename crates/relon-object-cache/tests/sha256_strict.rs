@@ -1,6 +1,8 @@
 //! Strict-integrity mode: any change to the object body must be
 //! caught by the SHA-256 recompute, even when no HMAC key is in use.
 
+#![allow(deprecated)]
+
 use relon_object_cache::{
     load, store, CacheError, HostFnImport, IntegrityMode, Metadata, SignatureHash,
 };

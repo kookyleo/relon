@@ -45,6 +45,10 @@ pub enum IntegrityMode {
     /// Skip the recompute; trust the writer. Retained for legacy
     /// tests only — new code must use [`IntegrityMode::HmacRequired`]
     /// so the loader cannot silently fall back to no-integrity mode.
+    #[deprecated(
+        since = "0.1.0",
+        note = "use Strict when the filename is the object hash, or HmacRequired when integrity is provided by the HMAC tag"
+    )]
     TrustOnWrite,
 }
 

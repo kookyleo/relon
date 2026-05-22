@@ -114,14 +114,15 @@ pub struct HostHookFuncIds {
     /// surface `EmitError::HostHookNotDeclared` if a `TraceOp::ListGet`
     /// is seen.
     pub list_get: Option<u32>,
-    /// F-D8: cranelift `FuncId.as_u32()` for `__relon_trace_dict_lookup`.
+    /// F-D8/v2: cranelift `FuncId.as_u32()` for
+    /// `__relon_trace_dict_lookup_v2`.
     /// `None` means the host has not declared the helper; emitter will
     /// surface `EmitError::HostHookNotDeclared` if a `TraceOp::DictLookup`
     /// is seen.
     pub dict_lookup: Option<u32>,
-    /// F-D8-E.2: cranelift `FuncId.as_u32()` for
-    /// `__relon_trace_dict_lookup_prechecked`. `None` means the host
-    /// has not declared the helper; emitter surfaces
+    /// F-D8-E.2/v2: cranelift `FuncId.as_u32()` for
+    /// `__relon_trace_dict_lookup_prechecked_v2`. `None` means the
+    /// host has not declared the helper; emitter surfaces
     /// `EmitError::HostHookNotDeclared(DictLookupPrechecked)` if a
     /// `TraceOp::DictLookupPrechecked` is seen. The optimizer's
     /// `dict_ic_hoist` pass produces these ops so a host that wires
@@ -414,8 +415,8 @@ impl TraceEmitter {
         // F-D8: declare dict/list helpers when the host wired them.
         // Signature:
         //   `__relon_trace_list_get(list_ptr, idx, ctx) -> i64`
-        //   `__relon_trace_dict_lookup(dict_ptr, key_ptr, shape_hash,
-        //                              ctx) -> i64`
+        //   `__relon_trace_dict_lookup_v2(dict_ptr, record_len,
+        //                                  key_ptr, shape_hash, ctx) -> i64`
         // Both helpers fold their out-of-band signalling (bounds /
         // shape) into the i64 return: hosts encode the deopt
         // sentinel as `i64::MIN`. The emitter follows the call with
@@ -435,21 +436,22 @@ impl TraceEmitter {
             declare_host_hook(
                 builder.func,
                 HostHookId::DictLookup,
-                &[pointer_ty, pointer_ty, I64, pointer_ty],
+                &[pointer_ty, pointer_ty, pointer_ty, I64, pointer_ty],
                 &[I64],
                 pointer_ty,
                 fid,
             )
         });
-        // F-D8-E.2: prechecked variant of dict_lookup. Same signature
-        // as `dict_lookup` minus the `shape_hash: i64` arg, because
-        // the matching `TraceOp::DictShapeGuard` already verified it
-        // upstream (typically lifted out of the loop by LICM).
+        // F-D8-E.2/v2: prechecked variant of dict_lookup. Same
+        // signature as `dict_lookup` minus the `shape_hash: i64` arg,
+        // because the matching `TraceOp::DictShapeGuard` already
+        // verified it upstream (typically lifted out of the loop by
+        // LICM).
         let dict_lookup_prechecked = hook_func_ids.dict_lookup_prechecked.map(|fid| {
             declare_host_hook(
                 builder.func,
                 HostHookId::DictLookupPrechecked,
-                &[pointer_ty, pointer_ty, pointer_ty],
+                &[pointer_ty, pointer_ty, pointer_ty, pointer_ty],
                 &[I64],
                 pointer_ty,
                 fid,
@@ -489,11 +491,8 @@ impl TraceEmitter {
             loop_meta,
             active_loops: Vec::new(),
             hoisted_list_len: HashMap::new(),
-            hoisted_dict_entry_count: HashMap::new(),
             hoisted_mod_nonzero_divisor: HashSet::new(),
             hoisted_mod_magic: HashMap::new(),
-            hoisted_dict_inline_seed: None,
-            hoisted_dict_inline_prime: None,
             saw_return: false,
         };
 
@@ -582,20 +581,12 @@ struct TraceEmitterState<'a, 'b> {
     /// the host did not declare the helper — `TraceOp::ListGet` emits
     /// will surface `EmitError::HostHookNotDeclared`.
     list_get: Option<ir::FuncRef>,
-    /// F-D8: optional `__relon_trace_dict_lookup` FuncRef. Same
+    /// F-D8/v2: optional `__relon_trace_dict_lookup_v2` FuncRef. Same
     /// contract as `list_get`.
     dict_lookup: Option<ir::FuncRef>,
-    /// F-D8-E.2 + F-D8-E.4: optional
-    /// `__relon_trace_dict_lookup_prechecked` FuncRef. Retained as
-    /// the cranelift import (declared upstream in the function's
-    /// DFG) so the FuncId stays reachable for tools / debug dumps,
-    /// but the F-D8-E.4 inline lowering no longer reads it on the
-    /// fast path. Kept rather than removed because (a) the host's
-    /// `HostHookTable` still wires the helper for the dispatch
-    /// table's slot, and (b) follow-up work that wants a helper-call
-    /// fallback (e.g. for large entry tables) can flip back to the
-    /// call form without re-plumbing the declaration phase.
-    #[allow(dead_code)]
+    /// F-D8-E.2/v2 optional `__relon_trace_dict_lookup_prechecked_v2`
+    /// FuncRef. Required when the optimizer has split a dict lookup
+    /// into `DictShapeGuard + DictLookupPrechecked`.
     dict_lookup_prechecked: Option<ir::FuncRef>,
     ssa_to_value: HashMap<SsaVar, ir::Value>,
     /// v6-δ M1: overflow bits surfaced by `Add` / `Sub` / `Mul`
@@ -630,19 +621,6 @@ struct TraceEmitterState<'a, 'b> {
     /// addressing, which is faster than hoisting one operand of the
     /// addition out of the loop.
     hoisted_list_len: HashMap<SsaVar, ir::Value>,
-    /// F-D8-E.5: preheader-hoisted dict scan preamble for each
-    /// loop-invariant `dict_ptr` SSA. We hoist only the
-    /// `entry_count: u32` load (not `entries_base = dict_ptr + 12`)
-    /// because the entries_base operand participates in an x86_64
-    /// `lea`-with-displacement fold inside the scan body
-    /// (`scan_idx * 16 + dict_ptr + 12`); hoisting it out as a
-    /// separate SSA breaks that fold and costs more cycles per iter
-    /// than the redundant `iadd_imm` would. The `load entry_count`
-    /// disappears from the hot path because the loop exit predicate
-    /// reads it on every iter regardless. See
-    /// [`crate::dict_inline::emit_dict_lookup_inline_with_entry_count`]
-    /// for the IR contract.
-    hoisted_dict_entry_count: HashMap<SsaVar, ir::Value>,
     /// F-D8-E.5: preheader-hoisted divisor-nonzero ok-block for each
     /// loop-invariant `b` operand of a `Mod`. Tracks the SSA `b` value
     /// of the original `Mod` — when seen again in the loop body, the
@@ -659,21 +637,6 @@ struct TraceEmitterState<'a, 'b> {
     /// the divisor SSA so a re-entrant `Mod` with the same divisor
     /// shares the cached magic value.
     hoisted_mod_magic: HashMap<SsaVar, ir::Value>,
-    /// F-D8-E.7: preheader-hoisted `iconst.i64 FX_HASH_SEED` shared
-    /// by all `DictLookupPrechecked` lowerings emitted in the trace.
-    /// The FxHash seed is a 64-bit immediate that doesn't fit into
-    /// the `mov r64, imm32` encoding; without hoisting, every
-    /// in-body `DictLookupPrechecked` emits a 10-byte
-    /// `movabs reg, imm64` for the seed on every outer-loop iter.
-    /// Stamped in `prehoist_loop_invariants` when the loop body
-    /// contains at least one in-body `DictLookupPrechecked` op.
-    hoisted_dict_inline_seed: Option<ir::Value>,
-    /// F-D8-E.7: preheader-hoisted `iconst.i64 FX_HASH_PRIME`. The
-    /// prime multiplier is also a 64-bit immediate. The hash-loop
-    /// body re-emits it `key_len` times per outer iter without this
-    /// hoist (cranelift 0.131's GVN doesn't lift `iconst.i64 imm64`
-    /// across the inner hash loop).
-    hoisted_dict_inline_prime: Option<ir::Value>,
     saw_return: bool,
 }
 
@@ -1557,15 +1520,17 @@ impl<'a, 'b> TraceEmitterState<'a, 'b> {
         Ok(())
     }
 
-    /// F-D8: lower `TraceOp::DictLookup { dst, dict_ptr, key_ptr,
+    /// F-D8 v2: lower `TraceOp::DictLookup { dst, dict_ptr, key_ptr,
     /// shape_hash }` to a single host-helper call that performs the
-    /// IC-guarded dict access.
+    /// IC-guarded dict access with a bounded record envelope and key
+    /// payload byte-compare on hash hit.
     ///
     /// Emit shape:
     ///
     /// ```text
-    /// %val = call __relon_trace_dict_lookup(dict_ptr, key_ptr,
-    ///                                        shape_hash, trace_ctx)
+    /// %val = call __relon_trace_dict_lookup_v2(dict_ptr, record_len,
+    ///                                           key_ptr, shape_hash,
+    ///                                           trace_ctx)
     /// %miss = icmp eq, %val, i64::MIN          // shape miss sentinel
     /// brif %miss, deopt_block(0, 0), ok_block
     /// ok_block:
@@ -1590,11 +1555,16 @@ impl<'a, 'b> TraceEmitterState<'a, 'b> {
             .ok_or(EmitError::HostHookNotDeclared(HostHookId::DictLookup))?;
         let dict_v = self.lookup(dict_ptr)?;
         let key_v = self.lookup(key_ptr)?;
-        let shape_v = self.builder.ins().iconst(I64, shape_hash as i64);
-        let inst = self
+        let record_len = self.trace.dict_record_len_hint(dict_ptr).unwrap_or(0);
+        let record_len_v = self
             .builder
             .ins()
-            .call(helper, &[dict_v, key_v, shape_v, self.trace_ctx_ptr]);
+            .iconst(self.pointer_ty, i64::from(record_len));
+        let shape_v = self.builder.ins().iconst(I64, shape_hash as i64);
+        let inst = self.builder.ins().call(
+            helper,
+            &[dict_v, record_len_v, key_v, shape_v, self.trace_ctx_ptr],
+        );
         let val = self.builder.inst_results(inst)[0];
 
         let sentinel = self.builder.ins().iconst(I64, i64::MIN);
@@ -1659,111 +1629,50 @@ impl<'a, 'b> TraceEmitterState<'a, 'b> {
         Ok(())
     }
 
-    /// F-D8-E.2 + F-D8-E.4: lower `TraceOp::DictLookupPrechecked
-    /// { dst, dict_ptr, key_ptr }`.
-    ///
-    /// **Default path (F-D8-E.4 inline)**: drop the call into
-    /// `__relon_trace_dict_lookup_prechecked` entirely and emit the
-    /// helper's body (FxHash inline + linear entry scan inline)
-    /// directly into the cranelift IR via
-    /// [`crate::dict_inline::emit_dict_lookup_inline`]. The matching
-    /// `DictShapeGuard` already verified the shape header upstream
-    /// (LICM-lifted to the trace entry), so the inline body skips it
-    /// just like the helper would.
-    ///
-    /// Why inline:
-    /// - Eliminates the C ABI boundary (~6-7 ns/iter on the W5 hot
-    ///   loop, measured against the helper-call variant).
-    /// - Cranelift's GVN can hoist `entry_count` and `entries_base`
-    ///   computation if the dict pointer is loop-invariant — the
-    ///   helper kept those reloads opaque behind the call boundary.
-    /// - The hash loop's `(byte_idx, accumulator)` SSA folds straight
-    ///   into the surrounding trace; no register-save/restore at the
-    ///   call boundary.
-    ///
-    /// **Fallback path**: when the host has not declared the
-    /// `dict_lookup_prechecked` FuncId (`HostHookFuncIds.dict_lookup_prechecked
-    /// == None`) the inline path still works — neither cranelift
-    /// helper is needed because the body is purely inline. We keep
-    /// the FuncId field around for ABI completeness so existing
-    /// fixtures that wire the helper continue to type-check, but
-    /// the call instruction is never emitted on the hit path.
-    ///
-    /// The deopt branch is preserved on the miss path because a key
-    /// that was present at recorder time but vanished (dict mutated
-    /// between record and execute) still needs to bail out.
+    /// F-D8-E.2/v2: lower `TraceOp::DictLookupPrechecked { dst,
+    /// dict_ptr, key_ptr }` to the collision-safe v2 helper. The
+    /// matching `DictShapeGuard` already verified the shape header
+    /// upstream, so this call skips only that compare; it still uses
+    /// the dict record length side table to bounds-check the record
+    /// and byte-compare key payloads after hash hits.
     fn emit_dict_lookup_prechecked(
         &mut self,
         dst: SsaVar,
         dict_ptr: SsaVar,
         key_ptr: SsaVar,
     ) -> Result<(), EmitError> {
+        let helper = self
+            .dict_lookup_prechecked
+            .ok_or(EmitError::HostHookNotDeclared(
+                HostHookId::DictLookupPrechecked,
+            ))?;
         let dict_v = self.lookup(dict_ptr)?;
         let key_v = self.lookup(key_ptr)?;
-        // F-D8-E.4: emit the helper body straight into cranelift IR.
-        // The shared deopt block is reused for null-key and key-miss
-        // paths, matching the helper's `i64::MIN` sentinel semantics
-        // (caller's view: a deopt fires either way).
-        //
-        // F-D8-E.5: when the preheader hoister pre-loaded
-        // `entry_count` for this invariant `dict_ptr`, forward the
-        // cached i64 SSA into the inline body so the per-iter
-        // `load.u32 [dict_ptr+8] + uextend` pair disappears from the
-        // hot path. Cranelift 0.131's GVN doesn't reliably hoist this
-        // load across the dict_inline scan loop — emitting it in the
-        // preheader is the supported way. We intentionally do NOT
-        // hoist `entries_base = dict_ptr + 12` because keeping the
-        // `iadd_imm` inside the scan body lets cranelift fold the
-        // `scan_idx * 16 + entries_base` chain into a single x86_64
-        // `lea`; hoisting would defeat that fold and net negative on
-        // the hot path.
-        // F-D8-E.7: when the source-level IR carried a static
-        // `entry_count_hint` (forwarded by the recorder into the
-        // buffer's `dict_entry_count_hints` side table) and the dict
-        // is small enough, switch to the fully-unrolled cmov-chain
-        // lowering. The unrolled form replaces the data-driven scan
-        // loop with N straight-line `(load + icmp + select + bor)`
-        // entries, where N is the static `entry_count`. cranelift
-        // 0.131's x86_64 backend lowers each `select.i64` to a
-        // single `cmov`, so a 10-entry W5 dict body costs ~10 cmov
-        // insns instead of an average ~5 loop iters × `(load + cmp +
-        // brif + jump)` each.
-        //
-        // Safety: the matching `DictShapeGuard` runs upstream and
-        // verifies the dict's shape hash; the shape hash by
-        // construction pins the key set (and therefore the entry
-        // count). A dict that drifted between record-time and
-        // execution-time deopts at the shape guard before the
-        // unrolled lookup reads anything from the entry table.
-        if let Some(static_n) = self.trace.dict_entry_count_hint(dict_ptr) {
-            if (1..=crate::dict_inline::MAX_INLINE_UNROLL).contains(&static_n) {
-                let val = crate::dict_inline::emit_dict_lookup_inline_unrolled(
-                    self.builder,
-                    dict_v,
-                    key_v,
-                    self.deopt_block,
-                    static_n,
-                );
-                self.bind(dst, val);
-                return Ok(());
-            }
-        }
-        let hoisted_entry_count = self.hoisted_dict_entry_count.get(&dict_ptr).copied();
-        // F-D8-E.7: forward the trace-wide hoisted FxHash seed +
-        // prime SSAs (when present) so the inline body's hash loop
-        // doesn't re-emit the 64-bit immediates per outer iter.
-        let hoists = crate::dict_inline::DictInlineHoists {
-            entry_count: hoisted_entry_count,
-            hash_seed: self.hoisted_dict_inline_seed,
-            hash_prime: self.hoisted_dict_inline_prime,
-        };
-        let val = crate::dict_inline::emit_dict_lookup_inline_with_hoists(
-            self.builder,
-            dict_v,
-            key_v,
+        let record_len = self.trace.dict_record_len_hint(dict_ptr).unwrap_or(0);
+        let record_len_v = self
+            .builder
+            .ins()
+            .iconst(self.pointer_ty, i64::from(record_len));
+        let inst = self
+            .builder
+            .ins()
+            .call(helper, &[dict_v, record_len_v, key_v, self.trace_ctx_ptr]);
+        let val = self.builder.inst_results(inst)[0];
+
+        let sentinel = self.builder.ins().iconst(I64, i64::MIN);
+        let miss = self.builder.ins().icmp(IntCC::Equal, val, sentinel);
+        let ok_block = self.builder.create_block();
+        let guard_pc = self.builder.ins().iconst(I32, 0);
+        let external_pc = self.builder.ins().iconst(I64, 0);
+        self.builder.ins().brif(
+            miss,
             self.deopt_block,
-            hoists,
+            &[BlockArg::Value(guard_pc), BlockArg::Value(external_pc)],
+            ok_block,
+            &[],
         );
+        self.builder.seal_block(ok_block);
+        self.builder.switch_to_block(ok_block);
         self.bind(dst, val);
         Ok(())
     }
@@ -1872,17 +1781,7 @@ impl<'a, 'b> TraceEmitterState<'a, 'b> {
     ///    record's `len: u32` header into i64 and stash in
     ///    `hoisted_list_len`. The in-loop bounds check then reuses the
     ///    cached value; only the `idx < len` compare stays per-iter.
-    /// 2. `DictLookupPrechecked { dict_ptr: invariant, .. }` — pre-load
-    ///    the dict header's `entry_count: u32` field (extended to i64)
-    ///    and stash in `hoisted_dict_entry_count`. The inline dict
-    ///    body's scan-exit predicate then reads the cached value. We
-    ///    deliberately do NOT hoist `entries_base = dict_ptr + 12`
-    ///    because keeping the iadd_imm inline lets cranelift fold the
-    ///    `scan_idx * 16 + dict_ptr + 12` chain into a single
-    ///    `lea`-with-displacement on x86_64; hoisting would defeat
-    ///    that fold and undo any gain from removing the entry_count
-    ///    load.
-    /// 3. `Mod { _, _, b: invariant }` — pre-emit the divisor-nonzero
+    /// 2. `Mod { _, _, b: invariant }` — pre-emit the divisor-nonzero
     ///    brif so a runtime b==0 deopts ONCE before the loop instead
     ///    of every iter. We don't pre-emit the overflow guard because
     ///    cranelift's constant folder handles the common case
@@ -1895,9 +1794,9 @@ impl<'a, 'b> TraceEmitterState<'a, 'b> {
     /// - The hoister never moves an op whose inputs are loop-carried
     ///   (the φ SSAs are entered into `inside_defs`).
     /// - The hoister never moves a guard whose deopt arm references
-    ///   per-iter state — `list_len` / `entry_count` / `dict_entries`
-    ///   are all derived purely from invariant pointers, and the
-    ///   divisor-zero predicate only reads the invariant `b` operand.
+    ///   per-iter state — `list_len` is derived purely from invariant
+    ///   pointers, and the divisor-zero predicate only reads the
+    ///   invariant `b` operand.
     fn prehoist_loop_invariants(&mut self, loop_id: u32) -> Result<(), EmitError> {
         // Take a snapshot of the metadata so we can index back into
         // the op stream without re-borrowing `self`. Cloning the
@@ -1931,44 +1830,6 @@ impl<'a, 'b> TraceEmitterState<'a, 'b> {
                     let len32 = self.builder.ins().load(I32, MemFlags::trusted(), base_v, 0);
                     let len64 = self.builder.ins().uextend(I64, len32);
                     self.hoisted_list_len.insert(*list_ptr, len64);
-                }
-                TraceOp::DictLookupPrechecked { dict_ptr, .. }
-                    if !meta.inside_defs.contains(dict_ptr)
-                        && !self.hoisted_dict_entry_count.contains_key(dict_ptr) =>
-                {
-                    // Hoist ONLY `entry_count`. `entries_base` stays in
-                    // the dict_inline scan body so cranelift's
-                    // displacement-folder can collapse the address
-                    // computation into a single instruction.
-                    let dict_v = self.lookup(*dict_ptr)?;
-                    let entry_count_u32 =
-                        self.builder.ins().load(I32, MemFlags::trusted(), dict_v, 8);
-                    let entry_count = self.builder.ins().uextend(I64, entry_count_u32);
-                    self.hoisted_dict_entry_count.insert(*dict_ptr, entry_count);
-
-                    // F-D8-E.7: while we're here, also pre-emit the
-                    // FxHash seed + prime 64-bit immediates that the
-                    // dict_inline body would otherwise re-emit on
-                    // every outer-loop iter (seed: once per outer
-                    // iter; prime: once per hash-loop iter ≈ key_len
-                    // times). These are trace-wide constants, so we
-                    // emit each exactly once and reuse the SSAs
-                    // across every subsequent in-loop
-                    // `DictLookupPrechecked` lowering.
-                    if self.hoisted_dict_inline_seed.is_none() {
-                        let seed = self
-                            .builder
-                            .ins()
-                            .iconst(I64, crate::dict_inline::fx_hash_seed_i64());
-                        self.hoisted_dict_inline_seed = Some(seed);
-                    }
-                    if self.hoisted_dict_inline_prime.is_none() {
-                        let prime = self
-                            .builder
-                            .ins()
-                            .iconst(I64, crate::dict_inline::fx_hash_prime_i64());
-                        self.hoisted_dict_inline_prime = Some(prime);
-                    }
                 }
                 TraceOp::Mod(_, _, b)
                     if !meta.inside_defs.contains(b)
@@ -2416,7 +2277,7 @@ pub enum EmitError {
     /// F-D8: trace contains a `TraceOp::ListGet` / `TraceOp::DictLookup`
     /// op but the host did not declare the matching helper FuncId via
     /// [`HostHookFuncIds`]. The host must register the symbol
-    /// (`__relon_trace_list_get` / `__relon_trace_dict_lookup`) in its
+    /// (`__relon_trace_list_get` / `__relon_trace_dict_lookup_v2`) in its
     /// cranelift module before installing dict/list traces.
     HostHookNotDeclared(HostHookId),
     /// Forwarded from [`crate::guard_emit::GuardEmitError`].
@@ -2598,22 +2459,14 @@ mod tests {
         TraceEmitter::emit_with_hooks(&trace, &mut ctx, I64, hook_ids).expect("emit ok");
     }
 
-    /// F-D8-E.7: when the trace buffer carries an
-    /// `entry_count_hint` for a dict_ptr SSA that flows into a
-    /// `DictLookupPrechecked`, the emitter must switch the inline
-    /// scan into the unrolled cmov chain. We confirm by counting
-    /// `Opcode::Select` insns in the emitted cranelift IR — the
-    /// unrolled path emits exactly N selects (one per entry), while
-    /// the scan-loop path emits zero.
+    /// F-D8 v2: when the trace buffer carries a record-length hint
+    /// for a dict_ptr SSA that flows into `DictLookupPrechecked`, the
+    /// emitter must call the collision-safe v2 helper rather than the
+    /// old hash-only inline scan.
     #[test]
-    fn dict_lookup_with_entry_count_hint_emits_unrolled_select_chain() {
+    fn dict_lookup_prechecked_with_record_len_uses_v2_helper_call() {
         use cranelift_codegen::ir::Opcode;
 
-        // Keep `n` ≤ `MAX_INLINE_UNROLL` so the unrolled emitter path
-        // fires (the cap is intentionally conservative to avoid the
-        // memory-pressure regression on large dicts; see the const
-        // doc-comment in dict_inline.rs).
-        let n = crate::dict_inline::MAX_INLINE_UNROLL;
         let mut b = TraceBuffer::new();
         let dict = b.fresh_ssa();
         let key = b.fresh_ssa();
@@ -2622,9 +2475,9 @@ mod tests {
         b.append(TraceOp::ConstI64(key, 0x3000));
         // Run the dict_ic_hoist pass shape by hand: emit a
         // DictShapeGuard upstream and the prechecked flavour as the
-        // body op. The emitter requires the prechecked op to skip the
-        // host-call codepath; an upstream DictShapeGuard keeps the
-        // semantics honest (mismatch deopts).
+        // body op. The prechecked helper skips the repeated shape
+        // compare; an upstream DictShapeGuard keeps the semantics
+        // honest (mismatch deopts).
         b.append(TraceOp::DictShapeGuard {
             dict_ptr: dict,
             shape_hash: 0xfeed_face_dead_beef,
@@ -2634,39 +2487,44 @@ mod tests {
             dict_ptr: dict,
             key_ptr: key,
         });
-        // Stash the static hint that mimics what
-        // `emit_dict_lookup_with_hint` would set on the recorder side.
-        b.record_dict_entry_count_hint(dict, n);
+        b.record_dict_record_len_hint(dict, 128);
         b.append(TraceOp::Return(dst));
 
         let trace = b.into_optimized();
         let mut ctx = CodegenContext::new();
-        TraceEmitter::emit(&trace, &mut ctx).expect("emit ok");
+        let hook_ids = HostHookFuncIds {
+            dict_lookup_prechecked: Some(9),
+            ..Default::default()
+        };
+        TraceEmitter::emit_with_hooks(&trace, &mut ctx, I64, hook_ids).expect("emit ok");
 
-        // Walk the emitted IR and count Select insns.
         let func = &ctx.func;
         let mut select_count = 0usize;
+        let mut call_count = 0usize;
         for block in func.layout.blocks() {
             for inst in func.layout.block_insts(block) {
-                if func.dfg.insts[inst].opcode() == Opcode::Select {
-                    select_count += 1;
+                match func.dfg.insts[inst].opcode() {
+                    Opcode::Select => select_count += 1,
+                    Opcode::Call => call_count += 1,
+                    _ => {}
                 }
             }
         }
         assert_eq!(
-            select_count, n as usize,
-            "unrolled DictLookupPrechecked with entry_count_hint={n} must emit exactly {n} \
-             select insns (got {select_count})"
+            select_count, 0,
+            "v2 helper path must not emit hash-only select-chain inline lookup"
+        );
+        assert!(
+            call_count >= 1,
+            "DictLookupPrechecked v2 lowering must emit a helper call"
         );
     }
 
-    /// F-D8-E.7: without an entry_count_hint, the emitter must keep
-    /// the data-driven scan-loop path. Zero select insns expected
-    /// (the scan body uses `brif` on the hash compare, not `select`).
+    /// F-D8 v2: missing record length hints are still safe. The
+    /// emitter passes `record_len = 0`; the runtime helper deopts
+    /// before reading the dict body.
     #[test]
-    fn dict_lookup_without_entry_count_hint_keeps_scan_loop() {
-        use cranelift_codegen::ir::Opcode;
-
+    fn dict_lookup_prechecked_without_record_len_still_lowers() {
         let mut b = TraceBuffer::new();
         let dict = b.fresh_ssa();
         let key = b.fresh_ssa();
@@ -2682,26 +2540,17 @@ mod tests {
             dict_ptr: dict,
             key_ptr: key,
         });
-        // No `record_dict_entry_count_hint` call → scan-loop path.
+        // No record-length hint: the helper receives record_len = 0
+        // and will deopt before reading the dict body at runtime.
         b.append(TraceOp::Return(dst));
 
         let trace = b.into_optimized();
         let mut ctx = CodegenContext::new();
-        TraceEmitter::emit(&trace, &mut ctx).expect("emit ok");
-
-        let func = &ctx.func;
-        let mut select_count = 0usize;
-        for block in func.layout.blocks() {
-            for inst in func.layout.block_insts(block) {
-                if func.dfg.insts[inst].opcode() == Opcode::Select {
-                    select_count += 1;
-                }
-            }
-        }
-        assert_eq!(
-            select_count, 0,
-            "scan-loop path must not emit any select insns; got {select_count}"
-        );
+        let hook_ids = HostHookFuncIds {
+            dict_lookup_prechecked: Some(9),
+            ..Default::default()
+        };
+        TraceEmitter::emit_with_hooks(&trace, &mut ctx, I64, hook_ids).expect("emit ok");
     }
 
     #[test]

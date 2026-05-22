@@ -137,6 +137,7 @@ impl<'a, 'b> OpVisitor for Codegen<'a, 'b> {
         _shape_hash: u64,
         _value_ty: IrType,
         _entry_count_hint: Option<u32>,
+        _record_len_hint: Option<u32>,
     ) -> Result<(), CraneliftError> {
         unsupported("DictGetByStringKey")
     }
