@@ -1486,10 +1486,7 @@ mod tests {
                 TraceOp::StrConcatN { dst, operands } => {
                     assert_eq!(dst, SsaVar(50));
                     assert_eq!(operands.len(), 4);
-                    assert_eq!(
-                        operands,
-                        vec![SsaVar(1), SsaVar(2), SsaVar(3), SsaVar(4)]
-                    );
+                    assert_eq!(operands, vec![SsaVar(1), SsaVar(2), SsaVar(3), SsaVar(4)]);
                 }
                 other => panic!("expected StrConcatN, got {other:?}"),
             },
@@ -1502,13 +1499,7 @@ mod tests {
         // Five operands exceed MAX_INLINE_STR_CONCAT_N — recorder aborts
         // so the outer tier router falls back to the cranelift AOT
         // backend's identically shaped single-alloc lowering.
-        let inputs = [
-            SsaVar(5),
-            SsaVar(4),
-            SsaVar(3),
-            SsaVar(2),
-            SsaVar(1),
-        ];
+        let inputs = [SsaVar(5), SsaVar(4), SsaVar(3), SsaVar(2), SsaVar(1)];
         let outcome = lower_op(
             &Op::StrConcatN { operand_count: 5 },
             cx_with(&inputs, SsaVar(99)),

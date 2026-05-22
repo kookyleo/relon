@@ -438,10 +438,7 @@ fn emit_concat_n(n: usize, enable_helpers: bool) -> (String, String) {
         ops.push(v);
     }
     let dst = b.fresh_ssa();
-    b.append(TraceOp::StrConcatN {
-        dst,
-        operands: ops,
-    });
+    b.append(TraceOp::StrConcatN { dst, operands: ops });
     b.append(TraceOp::Return(dst));
 
     let mut hooks = HostHookFuncIds::default();

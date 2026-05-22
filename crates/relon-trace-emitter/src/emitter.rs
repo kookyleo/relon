@@ -1241,11 +1241,7 @@ impl<'a, 'b> TraceEmitterState<'a, 'b> {
     /// recorder's cap and lowers any `operands.len() >= 3` it sees,
     /// surfacing a defensive `EmitError::HostHookNotDeclared` only
     /// when the host did not wire the alloc helper.
-    fn emit_str_concat_n(
-        &mut self,
-        dst: SsaVar,
-        operands: &[SsaVar],
-    ) -> Result<(), EmitError> {
+    fn emit_str_concat_n(&mut self, dst: SsaVar, operands: &[SsaVar]) -> Result<(), EmitError> {
         // Defensive: the recorder guarantees `len >= 3`; reject
         // anything else so a malformed buffer can't slip through to
         // the allocator helper with an under-budget total_len.
@@ -1294,13 +1290,11 @@ impl<'a, 'b> TraceEmitterState<'a, 'b> {
         //    cranelift `call` once the helper has copied the bytes,
         //    so no further book-keeping is required.
         let slot_bytes = (operands.len() as u32) * 8;
-        let stack_slot = self
-            .builder
-            .create_sized_stack_slot(StackSlotData::new(
-                StackSlotKind::ExplicitSlot,
-                slot_bytes,
-                3, // 2^3 = 8-byte align
-            ));
+        let stack_slot = self.builder.create_sized_stack_slot(StackSlotData::new(
+            StackSlotKind::ExplicitSlot,
+            slot_bytes,
+            3, // 2^3 = 8-byte align
+        ));
         for (i, v) in operand_vals.iter().enumerate() {
             self.builder
                 .ins()

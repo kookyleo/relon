@@ -141,19 +141,13 @@ fn str_concat_n_three_operands_drives_a_hot_loop() {
     // holds the per-iter StringRefs alive; the loop is bounded.
     let trace = build_concat_n_trace(3);
     let state = TraceJitState::new();
-    let jited = state
-        .jit_compile_buffer_for_fn(42, trace)
-        .expect("install");
+    let jited = state.jit_compile_buffer_for_fn(42, trace).expect("install");
     let operands = [
         StringRef::from_static("L_"),
         StringRef::from_static("M_"),
         StringRef::from_static("R"),
     ];
-    let args: [u64; 3] = [
-        operands[0] as u64,
-        operands[1] as u64,
-        operands[2] as u64,
-    ];
+    let args: [u64; 3] = [operands[0] as u64, operands[1] as u64, operands[2] as u64];
     let hooks = relon_codegen_native::default_host_hooks();
     for iter in 0..32 {
         let mut ctx = TraceContext::with_hooks(64, hooks);

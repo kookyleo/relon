@@ -22,7 +22,11 @@ fn push_const_pointers(recorder: &mut RecorderState, n: u32) -> Vec<SsaVar> {
         // Each const is a fake `*const StringRef` cast to i64; the
         // recorder's `Op::ConstI64` lowering allocates a fresh SSA and
         // pushes it onto the operand-stack mirror.
-        let res = recorder.record_op(&Op::ConstI64(0x1000 + i as i64), &[], Some(ObservedType::I64));
+        let res = recorder.record_op(
+            &Op::ConstI64(0x1000 + i as i64),
+            &[],
+            Some(ObservedType::I64),
+        );
         match res {
             RecordResult::Ok { value: Some(ssa) } => out.push(ssa),
             other => panic!("ConstI64 must Ok with a fresh SSA, got {other:?}"),
@@ -79,10 +83,7 @@ fn record_str_concat_n_three_operands_emits_trace_op() {
         .iter()
         .filter(|op| matches!(op, TraceOp::Guard(GuardKind::NotNull(_), _)))
         .count();
-    assert_eq!(
-        notnull_count, 3,
-        "one NotNull guard per StrConcatN operand"
-    );
+    assert_eq!(notnull_count, 3, "one NotNull guard per StrConcatN operand");
 }
 
 #[test]
@@ -98,7 +99,9 @@ fn record_str_concat_n_five_operands_aborts_over_cap() {
     assert!(
         matches!(
             res,
-            RecordResult::Abort(relon_trace_recorder::AbortReason::UnsupportedOp("StrConcatNOverCap"))
+            RecordResult::Abort(relon_trace_recorder::AbortReason::UnsupportedOp(
+                "StrConcatNOverCap"
+            ))
         ),
         "operand_count > MAX_INLINE_STR_CONCAT_N must abort cleanly so the \
          outer tier router can fall back to the cranelift AOT backend; \
