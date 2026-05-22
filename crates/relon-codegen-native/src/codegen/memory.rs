@@ -292,10 +292,7 @@ impl<'a, 'b> super::Codegen<'a, 'b> {
     /// `operand_count` such offsets from the operand stack (top-of-
     /// stack is the outer RHS, bottom is the deepest LHS leaf), then
     /// pushes one fresh i32 offset for the joined record.
-    pub(super) fn emit_str_concat_n(
-        &mut self,
-        operand_count: u32,
-    ) -> Result<(), CraneliftError> {
+    pub(super) fn emit_str_concat_n(&mut self, operand_count: u32) -> Result<(), CraneliftError> {
         if operand_count < 2 {
             return Err(CraneliftError::Codegen(format!(
                 "Op::StrConcatN with operand_count={operand_count} (expected >= 2)"
@@ -358,16 +355,16 @@ impl<'a, 'b> super::Codegen<'a, 'b> {
                     STATE_OFFSET_ARENA_LEN,
                 );
                 let dst_end = self.builder.ins().iadd(cursor_off, len);
-                let cmp_d =
-                    self.builder
-                        .ins()
-                        .icmp(IntCC::UnsignedGreaterThan, dst_end, arena_len);
+                let cmp_d = self
+                    .builder
+                    .ins()
+                    .icmp(IntCC::UnsignedGreaterThan, dst_end, arena_len);
                 self.cond_trap(cmp_d, TrapKind::BoundsViolation);
                 let src_end = self.builder.ins().iadd(src_off_payload, len);
-                let cmp_s =
-                    self.builder
-                        .ins()
-                        .icmp(IntCC::UnsignedGreaterThan, src_end, arena_len);
+                let cmp_s = self
+                    .builder
+                    .ins()
+                    .icmp(IntCC::UnsignedGreaterThan, src_end, arena_len);
                 self.cond_trap(cmp_s, TrapKind::BoundsViolation);
             }
             let arena_base = self.builder.ins().load(

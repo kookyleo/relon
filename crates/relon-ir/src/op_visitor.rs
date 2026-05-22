@@ -114,8 +114,7 @@ pub trait OpVisitor {
     /// `SmolStr::concat_many`, the bytecode VM materialises a single
     /// fresh arena slot, and cranelift sums the lengths once before
     /// the alloc.
-    fn visit_str_concat_n(&mut self, operand_count: u32)
-        -> Result<Self::Output, Self::Error>;
+    fn visit_str_concat_n(&mut self, operand_count: u32) -> Result<Self::Output, Self::Error>;
     fn visit_sub(&mut self, ty: IrType) -> Result<Self::Output, Self::Error>;
     fn visit_mul(&mut self, ty: IrType) -> Result<Self::Output, Self::Error>;
     fn visit_div(&mut self, ty: IrType) -> Result<Self::Output, Self::Error>;

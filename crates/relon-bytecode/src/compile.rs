@@ -1315,7 +1315,12 @@ impl<'a> OpVisitor for CompileState<'a> {
             )));
         }
         let pc = self.current_pc;
-        self.emit_with_effect(BcOp::StrConcatN { argc: operand_count }, pc);
+        self.emit_with_effect(
+            BcOp::StrConcatN {
+                argc: operand_count,
+            },
+            pc,
+        );
         Ok(())
     }
 
