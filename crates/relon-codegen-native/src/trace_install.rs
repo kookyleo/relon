@@ -274,40 +274,6 @@ impl JITedTraceFn {
         }
     }
 
-    /// Invoke the trace and reclaim every trace-string allocation
-    /// after `consume` has inspected / copied the result.
-    ///
-    /// Use this for traces that may return or snapshot `StringRef`
-    /// pointers allocated by runtime string shims. The closure runs
-    /// before reclaim, so callers can materialise the payload into an
-    /// owned value. After this method returns, any `StringRef` pointer
-    /// produced on the calling thread during the trace invocation is
-    /// invalid.
-    ///
-    /// # Safety
-    ///
-    /// Same pointer/slot contract as [`Self::invoke`]. In addition,
-    /// `consume` must not return borrowed pointers into the trace
-    /// string arena unless the caller deliberately accepts that they
-    /// are dangling after the method returns.
-    pub unsafe fn invoke_with_string_reclaim<R, F>(
-        &self,
-        ctx: *mut TraceContext,
-        args: *const u64,
-        consume: F,
-    ) -> R
-    where
-        F: FnOnce(TraceEntryStatus, &mut TraceContext) -> R,
-    {
-        with_trace_string_reclaim(|| {
-            let status = unsafe { self.invoke(ctx, args) };
-            // SAFETY: `ctx` is valid and exclusive by the method's
-            // safety contract, and remains live for the duration of
-            // `consume`.
-            consume(status, unsafe { &mut *ctx })
-        })
-    }
-
     fn return_observed_type(&self) -> Option<ObservedType> {
         self.inline_trace.ops.iter().rev().find_map(|op| {
             if let TraceOp::Return(var) = op {
