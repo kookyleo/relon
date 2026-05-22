@@ -240,11 +240,17 @@ pub fn store(
 /// `expected_triple` is checked against the value stored in the
 /// blob; pass the loader's current host triple.
 ///
-/// `integrity` decides whether the SHA-256 of the object body is
-/// recomputed and compared to `source_sha256`:
+/// `integrity` decides how the loader proves the cache file's
+/// integrity. See [`IntegrityMode`] for the trade-offs.
 /// - [`IntegrityMode::Strict`] (default) — always re-hash.
-/// - [`IntegrityMode::TrustOnWrite`] — skip the recompute, trust
-///   that the writer hashed correctly.
+/// - [`IntegrityMode::HmacRequired`] — refuse to load with no HMAC
+///   key; rely on the HMAC tag (covers header + object bytes +
+///   metadata) for tamper detection. Strict's SHA-256 recompute is
+///   skipped because the filename stem is a source-derived key, not
+///   the object body's own hash.
+/// - [`IntegrityMode::TrustOnWrite`] — legacy alias of
+///   `HmacRequired` minus the "HMAC mandatory" enforcement. New
+///   production callers must not use this variant.
 pub fn load(
     cache_dir: &Path,
     source_sha256: [u8; 32],
@@ -252,6 +258,13 @@ pub fn load(
     hmac_key: Option<&[u8; 32]>,
     integrity: IntegrityMode,
 ) -> Result<Option<CacheEntry>, CacheError> {
+    // Refuse the HMAC-required mode early when no key is supplied:
+    // we must not silently downgrade to a no-authentication load
+    // even if the on-disk blob also happens to have a zero HMAC
+    // trailer (writer dropped to `hmac_key = None` is exactly the
+    // bypass we're guarding against here).
+    integrity.enforce_hmac_present(hmac_key)?;
+
     let path = cache_path_for(cache_dir, source_sha256);
     let bytes = match fs::read(&path) {
         Ok(b) => b,

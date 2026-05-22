@@ -8,8 +8,11 @@
 //! cargo-test thread pool doesn't see flicker.
 //!
 //! The HMAC key path is left at the host default
-//! (`$XDG_DATA_HOME/relon/cache-key`); a missing key gracefully
-//! degrades to no-HMAC mode per the integration layer's design.
+//! (`$XDG_DATA_HOME/relon/cache-key`). #171: the integration layer
+//! refuses to write or read the cache triple when the key cannot be
+//! provisioned — the dedicated `cache_hmac_absence` test exercises
+//! that fail-closed branch in its own test binary so this file's
+//! HMAC-present assertions stay clean.
 
 use std::collections::HashMap;
 
@@ -293,6 +296,103 @@ fn cache_hits_are_concurrency_safe() {
         let v = h.join().expect("join");
         assert_eq!(v, Value::Int(15));
     }
+}
+
+#[test]
+fn tampered_schema_sidecar_invalidates_triple() {
+    // #171: the schema sidecar is HMAC-sealed against the source
+    // key + the object body's SHA-256. An attacker who flips a body
+    // byte (and can't compute the right HMAC) must trigger the
+    // fail-closed invalidation path so the cached cold-start never
+    // dlopens a sidecar that was swapped under it.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let src = corpus_add_source();
+
+    let _ = CraneliftAotEvaluator::from_source_with_cache(src, dir.path())
+        .expect("from_source_with_cache");
+    let hash = compute_source_hash(src, &SandboxConfig::default());
+    let schema_path = relon_codegen_native::schema_cache::schema_cache_path_for(dir.path(), hash);
+    let obj_path = relon_object_cache::storage::cache_path_for(dir.path(), hash);
+    if !schema_path.exists() || !obj_path.exists() {
+        eprintln!("skipping sidecar tamper test: linker / hmac unavailable");
+        return;
+    }
+
+    // Flip a single byte inside the JSON body (well clear of the
+    // magic + version prefix and the trailing 32-byte HMAC tag) so
+    // the version / magic checks pass and we hit the HMAC verify
+    // step on the read path. The HMAC binds to object + source +
+    // entry-shape + arity, so this single-bit flip must fail
+    // authentication.
+    let mut buf = std::fs::read(&schema_path).expect("read schema");
+    let mid = 12 + (buf.len() - 12 - 32) / 2;
+    buf[mid] ^= 0x01;
+    std::fs::write(&schema_path, &buf).expect("rewrite schema");
+
+    let opt = CraneliftAotEvaluator::from_cache_dir(src, dir.path()).expect("from_cache_dir");
+    assert!(opt.is_none(), "tampered schema sidecar must invalidate");
+    assert!(
+        !schema_path.exists(),
+        "tampered schema sidecar should be cleaned up by invalidation"
+    );
+    assert!(
+        !obj_path.exists(),
+        "object cache should be invalidated alongside the schema sidecar"
+    );
+}
+
+#[test]
+fn schema_sidecar_bound_to_object_hash() {
+    // Direct unit-level proof of the HMAC binding: a sidecar
+    // serialized against object hash A must fail to verify when the
+    // loader supplies object hash B. This is the property the
+    // production loader relies on after the object-cache layer has
+    // already verified its own HMAC tag.
+    use relon_codegen_native::schema_cache::{
+        deserialize, schema_cache_path_for, serialize, SchemaCacheEntry, SerEntryShape,
+        SerTokenRange,
+    };
+    use relon_eval_api::schema_canonical::{Field, Schema, TypeRepr};
+
+    let entry = SchemaCacheEntry {
+        main_schema: Schema {
+            name: "M".into(),
+            generics: Vec::new(),
+            fields: vec![Field {
+                name: "x".into(),
+                ty: TypeRepr::Int,
+                default: None,
+            }],
+        },
+        return_schema: Schema {
+            name: "R".into(),
+            generics: Vec::new(),
+            fields: vec![Field {
+                name: "v".into(),
+                ty: TypeRepr::Int,
+                default: None,
+            }],
+        },
+        param_names: vec!["x".into()],
+        const_data: Vec::new(),
+        closure_count: 0,
+        entry_shape: SerEntryShape::BufferProtocol,
+        entry_arity: 1,
+        entry_range: SerTokenRange::default(),
+    };
+    let src = [0xA1u8; 32];
+    let obj_a = [0xB1u8; 32];
+    let obj_b = [0xB2u8; 32];
+    let key = [0xC1u8; 32];
+    let bytes = serialize(&entry, &src, &obj_a, &key).expect("serialize");
+
+    deserialize(&bytes, &src, &obj_a, &key).expect("matching hashes load");
+    let err = deserialize(&bytes, &src, &obj_b, &key).expect_err("object swap caught");
+    assert!(format!("{err}").contains("hmac"));
+
+    // Sanity check the production path computes the same filename.
+    let p = schema_cache_path_for(std::path::Path::new("/tmp"), src);
+    assert!(p.file_name().is_some());
 }
 
 #[test]

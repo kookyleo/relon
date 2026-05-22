@@ -47,6 +47,23 @@
 //! through the IR cache (skips parse + analyze + lower). The
 //! ET_DYN bytes round-trip in this phase serves the dlopen-execution
 //! M2 milestone that activates in a follow-up.
+//!
+//! ## Authentication invariant (#171)
+//!
+//! Both the write path and the load path **require** a working HMAC
+//! key. When [`relon_object_cache::ensure_key`] fails we log a warn
+//! and refuse to write or read the cache triple — a host without a
+//! key always falls back to a fresh cold-start build. This closes
+//! the bypass where an attacker who can write `cache_dir` could
+//! drop an unauthenticated `.relon-native-v1` blob and `dlopen` it
+//! into the host: with no key the object-cache loader was previously
+//! using `IntegrityMode::TrustOnWrite`, which skips the SHA-256
+//! recompute and offered no other integrity guarantee for the
+//! unsigned trailer.
+//!
+//! The load path uses [`relon_object_cache::IntegrityMode::HmacRequired`]
+//! so the storage layer also refuses to load a blob without a key,
+//! making the no-cache decision explicit at two layers.
 
 use std::path::{Path, PathBuf};
 
@@ -176,33 +193,61 @@ pub fn build_metadata(
     }
 }
 
+/// Outcome of a successful object-cache write. Surfaces the linked
+/// ET_DYN's SHA-256 to the caller so the schema-cache HMAC binding
+/// can be computed over the same bytes the loader will validate.
+pub struct StoredObject {
+    /// SHA-256 of the linked ET_DYN bytes (after `relon-object-link`).
+    pub object_sha256: [u8; 32],
+}
+
 /// Best-effort cache write: links the ET_REL bytes via
 /// `relon-object-link`, then persists to `cache_dir` via
 /// `relon-object-cache`. Also writes the IR-bincode blob next door so
 /// `try_load_from_cache` can skip parse + analyze + lower on restore.
 ///
-/// Returns `Ok(())` on a successful write **or** any best-effort
-/// fallback (linker missing, unsupported triple, HMAC unavailable —
-/// each logged at the appropriate level). Bubbles up only the truly
-/// unexpected errors (out-of-disk while writing the tmp file we
-/// already opened).
+/// Returns:
+/// - `Ok(Some(StoredObject))` on a successful object + IR write —
+///   the caller uses `object_sha256` to bind the schema-cache HMAC.
+/// - `Ok(None)` on any best-effort fallback (linker missing,
+///   unsupported triple, HMAC key unavailable, write error). The
+///   caller must skip the schema-cache write in this case.
+/// - `Err(_)` only for truly unexpected errors (none today; reserved
+///   for future propagation of fatal I/O).
 pub fn try_store_to_cache(
     cache_dir: &Path,
     source_sha256: [u8; 32],
     et_rel_bytes: &[u8],
     metadata: &Metadata,
     ir_blob: &[u8],
-) -> Result<(), CraneliftError> {
+) -> Result<Option<StoredObject>, CraneliftError> {
     if !cache_supported_on_host() {
         tracing::info!(
             target: "relon::object_cache",
             "cache write skipped: host {} not supported in v5-gamma",
             host_target_triple()
         );
-        return Ok(());
+        return Ok(None);
     }
 
-    // 1. Link ET_REL -> ET_DYN. Best-effort: missing linker / failed
+    // 1. Resolve the HMAC key first. #171: a missing key disables the
+    // cache entirely so an attacker who can write `cache_dir` cannot
+    // get an unauthenticated `.relon-native-v1` blob dlopen'd into the
+    // host. The cold-start cost of skipping the cache is bounded by
+    // the first call only.
+    let hmac_key = match relon_object_cache::ensure_key() {
+        Ok(k) => k,
+        Err(e) => {
+            tracing::warn!(
+                target: "relon::object_cache",
+                "cache write refused: HMAC key unavailable ({e}); \
+                 native cache disabled until the key is provisioned"
+            );
+            return Ok(None);
+        }
+    };
+
+    // 2. Link ET_REL -> ET_DYN. Best-effort: missing linker / failed
     // linker downgrades to a logged warning. Other I/O errors propagate.
     let triple = host_target_triple();
     let dyn_bytes = match relon_object_link::link_to_dyn(et_rel_bytes, triple) {
@@ -212,21 +257,21 @@ pub fn try_store_to_cache(
                 target: "relon::object_cache",
                 "cache write skipped: no usable system linker on $PATH"
             );
-            return Ok(());
+            return Ok(None);
         }
         Err(relon_object_link::LinkError::LinkerFailed(msg)) => {
             tracing::error!(
                 target: "relon::object_cache",
                 "cache write skipped: linker failed: {msg}"
             );
-            return Ok(());
+            return Ok(None);
         }
         Err(relon_object_link::LinkError::UnsupportedTriple(t)) => {
             tracing::info!(
                 target: "relon::object_cache",
                 "cache write skipped: triple {t} not supported by relon-object-link"
             );
-            return Ok(());
+            return Ok(None);
         }
         Err(relon_object_link::LinkError::NotEtRel(t)) => {
             tracing::error!(
@@ -234,7 +279,7 @@ pub fn try_store_to_cache(
                 "cache write skipped: emitted bytes were {:?}, expected ET_REL",
                 t
             );
-            return Ok(());
+            return Ok(None);
         }
         Err(relon_object_link::LinkError::NotEtDyn(t)) => {
             tracing::error!(
@@ -242,53 +287,53 @@ pub fn try_store_to_cache(
                 "cache write skipped: linker output was {:?}, expected ET_DYN",
                 t
             );
-            return Ok(());
+            return Ok(None);
         }
         Err(relon_object_link::LinkError::InvalidElf(msg)) => {
             tracing::error!(
                 target: "relon::object_cache",
                 "cache write skipped: ET_REL bytes did not parse as ELF: {msg}"
             );
-            return Ok(());
+            return Ok(None);
         }
         Err(relon_object_link::LinkError::Io(e)) => {
             tracing::warn!(
                 target: "relon::object_cache",
                 "cache write skipped: linker io error: {e}"
             );
-            return Ok(());
+            return Ok(None);
         }
         Err(relon_object_link::LinkError::FeatureNotImplemented) => {
             tracing::info!(
                 target: "relon::object_cache",
                 "cache write skipped: link backend not implemented"
             );
-            return Ok(());
+            return Ok(None);
         }
     };
 
-    // 2. Resolve the HMAC key (best-effort). Missing key downgrades
-    // to a no-HMAC write — still integrity-checked via the sha256
-    // path inside relon-object-cache.
-    let hmac_key = match relon_object_cache::ensure_key() {
-        Ok(k) => Some(k),
-        Err(e) => {
-            tracing::info!(
-                target: "relon::object_cache",
-                "cache HMAC key unavailable ({e}); proceeding without authentication"
-            );
-            None
-        }
+    // 3. Hash the linked bytes so the schema-cache HMAC can bind to
+    // the exact object the loader will validate. We compute this once
+    // here and pass it back to the caller; the HMAC tag in the
+    // object-cache file already covers `dyn_bytes` so a tampered body
+    // would fail authentication independently.
+    let object_sha256: [u8; 32] = {
+        let mut h = Sha256::new();
+        h.update(&dyn_bytes);
+        h.finalize().into()
     };
 
-    // 3. Persist the linked bytes + metadata trailer.
+    // 4. Persist the linked bytes + metadata trailer with mandatory
+    // HMAC. We pass `Some(&hmac_key)` so the HMAC trailer is present;
+    // loaders open this blob via `IntegrityMode::HmacRequired` which
+    // refuses any key-less read.
     let write_res = relon_object_cache::store(
         cache_dir,
         source_sha256,
         triple,
         &dyn_bytes,
         metadata,
-        hmac_key.as_ref(),
+        Some(&hmac_key),
     );
     match write_res {
         Ok(path) => {
@@ -304,21 +349,25 @@ pub fn try_store_to_cache(
                 target: "relon::object_cache",
                 "object-cache write failed: {e}"
             );
-            return Ok(());
+            return Ok(None);
         }
     }
 
-    // 4. Persist the IR-bincode blob next door so the fast-restore
-    // path can skip parse + analyze + lower. We swallow IR write
-    // errors with a warn — the relon-object-cache half is still
-    // useful for dlopen-once-vtable-indirection lands.
+    // 5. Persist the IR-bincode blob next door so the fast-restore
+    // path can skip parse + analyze + lower. Failure here invalidates
+    // the just-written object so the next cold start regenerates a
+    // consistent triple rather than dlopen'ing without IR.
     let ir_path = ir_cache_path_for(cache_dir, source_sha256);
     if let Err(e) = std::fs::create_dir_all(cache_dir) {
         tracing::warn!(
             target: "relon::object_cache",
             "ir-cache create_dir_all failed: {e}"
         );
-        return Ok(());
+        let _ = std::fs::remove_file(relon_object_cache::storage::cache_path_for(
+            cache_dir,
+            source_sha256,
+        ));
+        return Ok(None);
     }
     let tmp_path = ir_path.with_extension(format!(
         "tmp.{}.{}",
@@ -334,7 +383,11 @@ pub fn try_store_to_cache(
             "ir-cache tmp write failed: {e}"
         );
         let _ = std::fs::remove_file(&tmp_path);
-        return Ok(());
+        let _ = std::fs::remove_file(relon_object_cache::storage::cache_path_for(
+            cache_dir,
+            source_sha256,
+        ));
+        return Ok(None);
     }
     if let Err(e) = std::fs::rename(&tmp_path, &ir_path) {
         tracing::warn!(
@@ -342,7 +395,11 @@ pub fn try_store_to_cache(
             "ir-cache rename failed: {e}"
         );
         let _ = std::fs::remove_file(&tmp_path);
-        return Ok(());
+        let _ = std::fs::remove_file(relon_object_cache::storage::cache_path_for(
+            cache_dir,
+            source_sha256,
+        ));
+        return Ok(None);
     }
     tracing::debug!(
         target: "relon::object_cache",
@@ -351,7 +408,7 @@ pub fn try_store_to_cache(
         ir_path.display()
     );
 
-    Ok(())
+    Ok(Some(StoredObject { object_sha256 }))
 }
 
 /// Result of a successful cache load: both the IR-cache restore (for
@@ -362,6 +419,15 @@ pub struct LoadedCache {
     /// Linked ET_DYN bytes from the relon-object-cache file. Reserved
     /// for the dlopen execution path landing in a follow-up phase.
     pub object_bytes: Vec<u8>,
+    /// SHA-256 of `object_bytes`. Surfaced so the schema-cache loader
+    /// can verify the sidecar's HMAC binds to the same ET_DYN the
+    /// loader is about to dlopen.
+    pub object_sha256: [u8; 32],
+    /// HMAC key resolved by `ensure_key()` at load time. Forwarded so
+    /// the schema-cache loader uses the same per-installation key as
+    /// the object-cache layer — this guarantees the sidecar cannot be
+    /// verified against a different (stolen / spoofed) key.
+    pub hmac_key: [u8; 32],
     /// Metadata trailer the relon-object-cache verified.
     #[allow(dead_code)]
     pub metadata: Metadata,
@@ -388,21 +454,36 @@ pub fn try_load_from_cache(
     }
 
     let triple = host_target_triple();
-    let hmac_key = relon_object_cache::ensure_key().ok();
+    // #171: cache load requires an HMAC key. Without one we refuse
+    // to read the blob so an unauthenticated file dropped by a local
+    // attacker cannot be dlopen'd into the host.
+    let hmac_key = match relon_object_cache::ensure_key() {
+        Ok(k) => k,
+        Err(e) => {
+            tracing::warn!(
+                target: "relon::object_cache",
+                "cache load refused: HMAC key unavailable ({e}); \
+                 native cache disabled until the key is provisioned"
+            );
+            return Ok(None);
+        }
+    };
 
-    // 1. Object-cache lookup. Use `TrustOnWrite` integrity mode
-    // because our `source_sha256` is the SHA-256 of the *source*
-    // text (canonical key), not the SHA-256 of the linked object
-    // body — the relon-object-cache `Strict` mode would reject the
-    // file otherwise. Tamper detection is still covered by the
-    // HMAC tag on the trailer (HMAC over the entire blob, including
-    // object bytes), which the loader verifies inside `load`.
+    // 1. Object-cache lookup. Use `IntegrityMode::HmacRequired`: the
+    // filename stem is the *source* hash (canonical key), not the
+    // SHA-256 of the linked object body, so the `Strict` mode would
+    // reject the file. The HMAC tag covers the entire blob (header +
+    // object bytes + metadata), so in-place tampering still surfaces
+    // as `CacheError::HmacMismatch`. The `HmacRequired` mode also
+    // refuses to fall back to a no-authentication load if `hmac_key`
+    // is somehow `None` at this layer — belt-and-braces against
+    // future drift.
     let object_entry = match relon_object_cache::load(
         cache_dir,
         source_sha256,
         triple,
-        hmac_key.as_ref(),
-        IntegrityMode::TrustOnWrite,
+        Some(&hmac_key),
+        IntegrityMode::HmacRequired,
     ) {
         Ok(Some(e)) => e,
         Ok(None) => {
@@ -422,6 +503,16 @@ pub fn try_load_from_cache(
             let _ = std::fs::remove_file(&path);
             return Ok(None);
         }
+    };
+
+    // Hash the verified object bytes so the schema-cache loader can
+    // bind its HMAC verification to the same body. The object-cache
+    // HMAC tag already covered these bytes; this hash is consumed by
+    // the schema-cache layer (sidecar HMAC), not by the object cache.
+    let object_sha256: [u8; 32] = {
+        let mut h = Sha256::new();
+        h.update(&object_entry.object_bytes);
+        h.finalize().into()
     };
 
     // 2. Metadata sanity. Mismatched runtime invalidates the file.
@@ -480,6 +571,8 @@ pub fn try_load_from_cache(
     Ok(Some(LoadedCache {
         ir_entry,
         object_bytes: object_entry.object_bytes,
+        object_sha256,
+        hmac_key,
         metadata: object_entry.metadata,
     }))
 }
