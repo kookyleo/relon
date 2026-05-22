@@ -72,6 +72,13 @@ pub enum CacheError {
     /// Almost always means a truncated write or a non-cache file.
     #[error("file too short for a v1 cache blob (got {0} bytes)")]
     Truncated(usize),
+
+    /// Loader was invoked with `IntegrityMode::HmacRequired` but no
+    /// HMAC key was supplied. Production callers must always pair the
+    /// HMAC-required mode with a present key so a stolen / corrupted
+    /// cache file cannot bypass authentication.
+    #[error("hmac key required by IntegrityMode::HmacRequired but caller passed None")]
+    HmacKeyRequired,
 }
 
 /// Errors raised by the `memfd_create` + dlopen path in

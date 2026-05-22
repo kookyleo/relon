@@ -13,9 +13,12 @@
 //! - [`hmac`] — per-installation HMAC-SHA256 key, stored mode-`0600`
 //!   under `$XDG_DATA_HOME/relon/cache-key`, used to authenticate
 //!   cache files against third-party injection.
-//! - [`integrity`] — strict vs trust-on-write SHA-256 modes. Default
-//!   is strict; the host can opt into the faster path once it has
-//!   audited the cache directory permissions.
+//! - [`integrity`] — `Strict` (re-hash on every load),
+//!   `HmacRequired` (rely on the HMAC trailer for integrity; refuses
+//!   keyless loads), and the legacy `TrustOnWrite` variant kept only
+//!   for backward compatibility with older tests. New production
+//!   callers should use `HmacRequired` whenever the filename stem
+//!   does not equal the object body's own SHA-256.
 //! - [`loader`] — Linux `memfd_create` + `/proc/self/fd/<n>` dlopen +
 //!   dlsym path that turns cached bytes back into callable function
 //!   pointers without touching disk on the warm path. macOS / Windows
