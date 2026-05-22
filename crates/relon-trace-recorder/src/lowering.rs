@@ -160,32 +160,12 @@ impl<'a> OpLoweringContext<'a> {
     }
 }
 
-/// Translate `relon_ir::EffectClass` to the shared trace ABI variant.
-///
-/// v6-γ M1 keeps these as **two separate enums** by design:
-///
-/// - `relon_ir::EffectClass` is the IR-level Op effect annotation. Its
-///   variant `UnrecoverableEffect` uses the longer historical name so
-///   v5-β-2 doc strings + golden tests keep round-tripping.
-/// - `relon_trace_abi::EffectClass` (re-exported through
-///   `relon_trace_jit::EffectClass` aka [`TraceEffect`] here) is the
-///   runtime classification the recorder / emitter share. Variant
-///   `Unrecoverable` lines up byte-for-byte with `Pure`/`ReadOnly`/
-///   `RecoverableWrite` on the IR side, so the mapping is total.
-///
-/// We use a plain function rather than `From<IrEffect> for TraceEffect`
-/// because both types are foreign to this crate (orphan rules). Adding
-/// the `From` impl would require either `relon-ir -> relon-trace-abi`
-/// or `relon-trace-abi -> relon-ir` — both edges leak concerns across
-/// layers v6-γ wants to keep separated, so the explicit translation
-/// stays here in the recorder's lowering crate where it belongs.
+/// Identity passthrough kept for backwards compatibility with callers
+/// that import the historical name. `relon_ir::EffectClass` is now a
+/// re-export of `relon_trace_abi::EffectClass` (= [`TraceEffect`]) so
+/// the two are the same type and no translation is needed.
 pub fn map_effect_class(ir: IrEffect) -> TraceEffect {
-    match ir {
-        IrEffect::Pure => TraceEffect::Pure,
-        IrEffect::ReadOnly => TraceEffect::ReadOnly,
-        IrEffect::RecoverableWrite => TraceEffect::RecoverableWrite,
-        IrEffect::UnrecoverableEffect => TraceEffect::Unrecoverable,
-    }
+    ir
 }
 
 /// Project an `IrType` onto the observed-type grid used in the trace
@@ -1154,7 +1134,7 @@ mod tests {
             TraceEffect::RecoverableWrite
         );
         assert_eq!(
-            map_effect_class(IrEffect::UnrecoverableEffect),
+            map_effect_class(IrEffect::Unrecoverable),
             TraceEffect::Unrecoverable
         );
     }

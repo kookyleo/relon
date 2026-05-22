@@ -1499,39 +1499,15 @@ pub enum TrapKind {
 
 /// v5-β-2 + v6-γ trace JIT hook: per-Op effect classification.
 ///
-/// Each `Op` variant returns one of these so the v6-γ trace recorder
-/// can decide whether to keep recording, ABORT the trace, or schedule
-/// a side-effect replay in the deopt path. See
-/// `docs/internal/v6-gamma-trace-jit-design.md` §3.3 for the
-/// rationale.
-///
-/// The classification is conservative: when uncertain, surface the
-/// stricter class (a `Pure` op miscategorised as
-/// `UnrecoverableEffect` only loses optimization opportunity; the
-/// reverse risks correctness).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum EffectClass {
-    /// No side effects; pure function of operands. Trace optimizer
-    /// is free to reorder / eliminate / hoist across other Pure or
-    /// ReadOnly ops.
-    Pure,
-    /// Reads side-effecting state (memory, host clock, capability
-    /// vtable) but does not mutate it. Safe to reorder with other
-    /// Pure / ReadOnly ops, but **not** with any Write op against
-    /// the same backing store.
-    ReadOnly,
-    /// Mutates state, but the mutation is recoverable: the trace
-    /// optimizer records sufficient deopt state to undo / replay the
-    /// mutation if a guard later fires. Scratch arena cursor
-    /// mutation, sub-record allocation, and bump-allocated string
-    /// writes fall into this class.
-    RecoverableWrite,
-    /// Mutates externally-visible state in a way the trace optimizer
-    /// cannot replay (host fn call into user-provided
-    /// `register_pure_fn`, IO, etc). Encountering an Unrecoverable op
-    /// during trace recording **must** ABORT the trace.
-    UnrecoverableEffect,
-}
+/// Re-exported from [`relon_trace_abi::EffectClass`] — single source
+/// of truth for the IR side, the recorder, and the runtime. Each
+/// `Op` variant returns one of these so the v6-γ trace recorder can
+/// decide whether to keep recording, ABORT the trace, or schedule a
+/// side-effect replay in the deopt path. The classification is
+/// conservative: when uncertain, surface the stricter class (a
+/// `Pure` op miscategorised as `Unrecoverable` only loses
+/// optimization opportunity; the reverse risks correctness).
+pub use relon_trace_abi::EffectClass;
 
 impl Op {
     /// Return the [`EffectClass`] of this op. Conservative when in
@@ -1653,15 +1629,15 @@ impl Op {
             // Calls into stdlib bodies (`Op::Call`) and closures
             // (`Op::CallClosure`): the callee's effect class is the
             // composition of its body's ops. Conservative default is
-            // UnrecoverableEffect because the recorder can't see
-            // through the dispatch without inlining; stdlib bodies
+            // Unrecoverable because the recorder can't see through
+            // the dispatch without inlining; stdlib bodies
             // that are known pure-or-recoverable will be inlined by
             // the recorder before this classification matters.
-            Op::Call { .. } | Op::CallClosure { .. } => UnrecoverableEffect,
+            Op::Call { .. } | Op::CallClosure { .. } => Unrecoverable,
 
             // Native imports — opaque to the trace recorder by
             // construction. Always ABORTs the trace.
-            Op::CallNative { .. } => UnrecoverableEffect,
+            Op::CallNative { .. } => Unrecoverable,
         }
     }
 }
@@ -1738,7 +1714,7 @@ mod effect_tests {
                 cap_bit: NO_CAPABILITY_BIT,
             }
             .effect_class(),
-            EffectClass::UnrecoverableEffect
+            EffectClass::Unrecoverable
         );
     }
 
