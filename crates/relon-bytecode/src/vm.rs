@@ -7,6 +7,7 @@
 //! prongs trip through [`BcVmError`] variants that lift cleanly into
 //! `relon_eval_api::RuntimeError`.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
@@ -661,6 +662,22 @@ struct CallNativeCache {
     last: Option<(u32, Arc<dyn RelonFunction>)>,
 }
 
+// M2-C lever 7: per-thread scratch buffers reused across the typed-i64
+// fast path. Each `invoke_pooled_typed_i64` call borrows + clears the
+// `locals` / `stack` buffers, then resizes them in place — no per-call
+// heap allocation when the buffer is already large enough (the common
+// case after the first warm-up invoke).
+//
+// The buffers are thread-local because the bytecode VM is not `Sync`
+// in practice — `BytecodeVm` carries a `RefCell<CallNativeCache>`
+// which forces single-threaded access regardless. The pooled buffers
+// stay coherent with that invariant: each thread that drives the
+// typed-i64 fast path owns its own pair.
+thread_local! {
+    static POOLED_LOCALS: RefCell<Vec<VmValue>> = const { RefCell::new(Vec::new()) };
+    static POOLED_STACK: RefCell<Vec<VmValue>> = const { RefCell::new(Vec::new()) };
+}
+
 impl BytecodeVm {
     /// Build a new VM with the supplied config.
     pub fn new(config: BcVmConfig) -> Self {
@@ -1013,6 +1030,167 @@ impl BytecodeVm {
                 }
             }
         }
+    }
+
+    /// M2-C lever 7: typed-i64 pooled fast path.
+    ///
+    /// A bespoke entry for the scalar `#main(Int...) -> Int` envelope
+    /// the `BytecodeEvaluator::run_main_i64` API serves. Differences
+    /// from [`Self::invoke_from_with_stack`] (the general entry):
+    ///
+    /// * Reuses [`POOLED_LOCALS`] / [`POOLED_STACK`] thread-local
+    ///   scratch buffers — no per-call `vec![0u64; N]` / `Vec::with_capacity`
+    ///   alloc. After the first invoke warms the buffer the hot path
+    ///   pays only a `Vec::clear` + a memset for the locals span.
+    /// * Returns a single [`VmValue`] result + a `BcVmError` envelope,
+    ///   skipping [`BcRunOutcome`]'s `final_locals` `Vec` move. The
+    ///   caller passes the return slot index it wants to read directly.
+    /// * No `extra_locals` / `initial_stack` overlay — the fast path
+    ///   is for outer-entry invokes only (partial-resume still routes
+    ///   through `invoke_from_with_stack`).
+    ///
+    /// All other dispatch semantics (cap-vtable consult, hot-counter
+    /// prologue, dispatcher-switch / trace-lookup consult, step/deadline
+    /// ticks, full `BcOp` coverage) match the general path bit-for-bit.
+    /// This is purely an allocation + return-shape micro-optimisation;
+    /// it does not change the W12 envelope's correctness surface.
+    ///
+    /// Returns `Ok(VmValue)` with the value at `return_slot_idx` on
+    /// successful `Return`, or `Err(BcVmError)` for any sandbox prong
+    /// trip. The caller is responsible for ensuring `return_slot_idx`
+    /// is in range — typically `BytecodeEvaluator::return_field_base`
+    /// for schema-driven returns, or `0` for the legacy-i64 envelope.
+    pub fn invoke_pooled_typed_i64(
+        &self,
+        func: &BcFunction,
+        args: &[VmValue],
+        return_slot_count: u32,
+        return_slot_idx: u32,
+    ) -> Result<VmValue, BcVmError> {
+        // Reset the inline cache so a previously-resolved host fn from
+        // an earlier call can't shadow a `register_host_fn` swap that
+        // happened between calls. Matches the general path's discipline.
+        self.reset_call_cache();
+        let needed = (func.locals as usize).max(args.len() + return_slot_count as usize);
+        POOLED_LOCALS.with(|locals_cell| {
+            POOLED_STACK.with(|stack_cell| {
+                let mut locals = locals_cell.borrow_mut();
+                let mut stack = stack_cell.borrow_mut();
+                // Resize-and-zero the locals span. `resize` keeps any
+                // already-allocated capacity from a previous call and
+                // only grows the heap span when `needed` exceeds it.
+                // Once-warmed buffers stay warm — the W12 row pays the
+                // memset only.
+                locals.clear();
+                locals.resize(needed, 0u64);
+                // Seed args into the bottom of the locals span.
+                for (i, v) in args.iter().enumerate() {
+                    locals[i] = *v;
+                }
+                stack.clear();
+                // Pre-emptively reserve a reasonable stack depth so the
+                // typical scalar workload doesn't grow mid-dispatch.
+                if stack.capacity() < 16 {
+                    stack.reserve(16);
+                }
+
+                let mut memory = VmMemory::default();
+                let mut pc: usize = 0;
+                let mut steps: u64 = 0;
+                let mut last_bc_idx: usize = 0;
+
+                // Capability pre-checks: the consult helpers short-
+                // circuit when no gate is installed, so the inert
+                // scaffold (W12-style) pays one branch each.
+                if let Err(err) = self.config.cap_vtable.consult_all_granted_bits() {
+                    return Err(BcVmError::CapabilityDenied {
+                        cap_bit: err.cap.bit_index(),
+                    });
+                }
+                if func.requires_cap_consult {
+                    if let Err(err) = self.config.cap_vtable.consult_all_declared_bits() {
+                        return Err(BcVmError::CapabilityDenied {
+                            cap_bit: err.cap.bit_index(),
+                        });
+                    }
+                }
+
+                // Hot-counter prologue mirrors the general path. The
+                // trigger fires at most once per (fn_id, thread); the
+                // saturated counter keeps the cost at a single Option
+                // probe for subsequent invokes.
+                if let (Some(fn_id), Some(trigger)) = (func.fn_id, self.config.hot_trigger.as_ref())
+                {
+                    let outcome = crate::hot_counter::record_hot(fn_id, self.config.hot_threshold);
+                    if outcome == HotCounterResult::HotTrigger {
+                        trigger.on_hot(fn_id, args);
+                    }
+                }
+
+                loop {
+                    steps += 1;
+                    if let Some(limit) = self.config.max_steps {
+                        if steps > limit {
+                            return Err(BcVmError::StepLimitExceeded { steps });
+                        }
+                    }
+                    if let Some(d) = self.config.deadline {
+                        if Instant::now() >= d {
+                            return Err(BcVmError::DeadlineExceeded);
+                        }
+                    }
+                    if pc >= func.ops.len() {
+                        return Err(BcVmError::JumpOutOfRange {
+                            target: pc,
+                            ops: func.ops.len(),
+                        });
+                    }
+                    last_bc_idx = pc;
+                    match self.dispatch_one(
+                        func,
+                        &func.ops[pc],
+                        &mut stack,
+                        &mut locals,
+                        &mut memory,
+                        pc,
+                        /*current_captures=*/ None,
+                    ) {
+                        Ok(StepOutcome::Advance) => pc += 1,
+                        Ok(StepOutcome::Jump(target)) => {
+                            if target > func.ops.len() {
+                                return Err(BcVmError::JumpOutOfRange {
+                                    target,
+                                    ops: func.ops.len(),
+                                });
+                            }
+                            pc = target;
+                        }
+                        Ok(StepOutcome::Return(v)) => {
+                            // For the legacy-i64 path the schema slot
+                            // is irrelevant — the return value `v` is
+                            // already what the caller wants. For schema-
+                            // driven returns the value lives at
+                            // `return_slot_idx` of the locals span; the
+                            // top-of-stack `v` is the buffer-protocol
+                            // `bytes_written` placeholder (the bytecode
+                            // compiler synthesises it but never reads
+                            // it back). Read the slot if the schema
+                            // reserved one, otherwise return `v`.
+                            let _ = last_bc_idx;
+                            let _ = steps;
+                            if return_slot_count > 0 {
+                                return Ok(locals
+                                    .get(return_slot_idx as usize)
+                                    .copied()
+                                    .unwrap_or(0));
+                            }
+                            return Ok(v);
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+            })
+        })
     }
 
     /// M3 closure-body sub-dispatch. Runs the supplied closure body
