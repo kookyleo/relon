@@ -1064,17 +1064,134 @@ impl BytecodeVm {
                 }
                 locals[i] = v;
             }
-            BcOp::Add(ty) => arith_binop(stack, *ty, bc_idx, ArithOp::Add)?,
-            BcOp::Sub(ty) => arith_binop(stack, *ty, bc_idx, ArithOp::Sub)?,
-            BcOp::Mul(ty) => arith_binop(stack, *ty, bc_idx, ArithOp::Mul)?,
-            BcOp::Div(ty) => arith_binop(stack, *ty, bc_idx, ArithOp::Div)?,
-            BcOp::Mod(ty) => arith_binop(stack, *ty, bc_idx, ArithOp::Mod)?,
-            BcOp::Eq(ty) => cmp_binop(stack, *ty, bc_idx, CmpOp::Eq)?,
-            BcOp::Ne(ty) => cmp_binop(stack, *ty, bc_idx, CmpOp::Ne)?,
-            BcOp::Lt(ty) => cmp_binop(stack, *ty, bc_idx, CmpOp::Lt)?,
-            BcOp::Le(ty) => cmp_binop(stack, *ty, bc_idx, CmpOp::Le)?,
-            BcOp::Gt(ty) => cmp_binop(stack, *ty, bc_idx, CmpOp::Gt)?,
-            BcOp::Ge(ty) => cmp_binop(stack, *ty, bc_idx, CmpOp::Ge)?,
+            // M2-C lever 3: per-op specialization — typed arith / cmp
+            // ops dispatch through monomorphic arms that read the
+            // operand-stack slots through the i64 / f64 lane directly,
+            // skipping the inner `match ty` the typed-IrType umbrella
+            // used to go through. The i64 arms cover both `IrType::I64`
+            // and `IrType::I32` (the bytecode VM has no I32 storage of
+            // its own — both ride the same u64 slot).
+            BcOp::AddI64 => {
+                let rhs = pop(stack, bc_idx)? as i64;
+                let lhs = pop(stack, bc_idx)? as i64;
+                let r = lhs.checked_add(rhs).ok_or(BcVmError::NumericOverflow)?;
+                stack.push(r as u64);
+            }
+            BcOp::SubI64 => {
+                let rhs = pop(stack, bc_idx)? as i64;
+                let lhs = pop(stack, bc_idx)? as i64;
+                let r = lhs.checked_sub(rhs).ok_or(BcVmError::NumericOverflow)?;
+                stack.push(r as u64);
+            }
+            BcOp::MulI64 => {
+                let rhs = pop(stack, bc_idx)? as i64;
+                let lhs = pop(stack, bc_idx)? as i64;
+                let r = lhs.checked_mul(rhs).ok_or(BcVmError::NumericOverflow)?;
+                stack.push(r as u64);
+            }
+            BcOp::DivI64 => {
+                let rhs = pop(stack, bc_idx)? as i64;
+                let lhs = pop(stack, bc_idx)? as i64;
+                if rhs == 0 {
+                    return Err(BcVmError::DivisionByZero);
+                }
+                let r = lhs.checked_div(rhs).ok_or(BcVmError::NumericOverflow)?;
+                stack.push(r as u64);
+            }
+            BcOp::ModI64 => {
+                let rhs = pop(stack, bc_idx)? as i64;
+                let lhs = pop(stack, bc_idx)? as i64;
+                if rhs == 0 {
+                    return Err(BcVmError::DivisionByZero);
+                }
+                let r = lhs.checked_rem(rhs).ok_or(BcVmError::NumericOverflow)?;
+                stack.push(r as u64);
+            }
+            BcOp::AddF64 => {
+                let rhs = f64::from_bits(pop(stack, bc_idx)?);
+                let lhs = f64::from_bits(pop(stack, bc_idx)?);
+                stack.push((lhs + rhs).to_bits());
+            }
+            BcOp::SubF64 => {
+                let rhs = f64::from_bits(pop(stack, bc_idx)?);
+                let lhs = f64::from_bits(pop(stack, bc_idx)?);
+                stack.push((lhs - rhs).to_bits());
+            }
+            BcOp::MulF64 => {
+                let rhs = f64::from_bits(pop(stack, bc_idx)?);
+                let lhs = f64::from_bits(pop(stack, bc_idx)?);
+                stack.push((lhs * rhs).to_bits());
+            }
+            BcOp::DivF64 => {
+                let rhs = f64::from_bits(pop(stack, bc_idx)?);
+                let lhs = f64::from_bits(pop(stack, bc_idx)?);
+                stack.push((lhs / rhs).to_bits());
+            }
+            BcOp::ModF64 => {
+                let rhs = f64::from_bits(pop(stack, bc_idx)?);
+                let lhs = f64::from_bits(pop(stack, bc_idx)?);
+                stack.push((lhs % rhs).to_bits());
+            }
+            BcOp::EqI64 => {
+                let rhs = pop(stack, bc_idx)? as i64;
+                let lhs = pop(stack, bc_idx)? as i64;
+                stack.push(if lhs == rhs { 1 } else { 0 });
+            }
+            BcOp::NeI64 => {
+                let rhs = pop(stack, bc_idx)? as i64;
+                let lhs = pop(stack, bc_idx)? as i64;
+                stack.push(if lhs != rhs { 1 } else { 0 });
+            }
+            BcOp::LtI64 => {
+                let rhs = pop(stack, bc_idx)? as i64;
+                let lhs = pop(stack, bc_idx)? as i64;
+                stack.push(if lhs < rhs { 1 } else { 0 });
+            }
+            BcOp::LeI64 => {
+                let rhs = pop(stack, bc_idx)? as i64;
+                let lhs = pop(stack, bc_idx)? as i64;
+                stack.push(if lhs <= rhs { 1 } else { 0 });
+            }
+            BcOp::GtI64 => {
+                let rhs = pop(stack, bc_idx)? as i64;
+                let lhs = pop(stack, bc_idx)? as i64;
+                stack.push(if lhs > rhs { 1 } else { 0 });
+            }
+            BcOp::GeI64 => {
+                let rhs = pop(stack, bc_idx)? as i64;
+                let lhs = pop(stack, bc_idx)? as i64;
+                stack.push(if lhs >= rhs { 1 } else { 0 });
+            }
+            BcOp::EqF64 => {
+                let rhs = f64::from_bits(pop(stack, bc_idx)?);
+                let lhs = f64::from_bits(pop(stack, bc_idx)?);
+                stack.push(if lhs == rhs { 1 } else { 0 });
+            }
+            BcOp::NeF64 => {
+                let rhs = f64::from_bits(pop(stack, bc_idx)?);
+                let lhs = f64::from_bits(pop(stack, bc_idx)?);
+                stack.push(if lhs != rhs { 1 } else { 0 });
+            }
+            BcOp::LtF64 => {
+                let rhs = f64::from_bits(pop(stack, bc_idx)?);
+                let lhs = f64::from_bits(pop(stack, bc_idx)?);
+                stack.push(if lhs < rhs { 1 } else { 0 });
+            }
+            BcOp::LeF64 => {
+                let rhs = f64::from_bits(pop(stack, bc_idx)?);
+                let lhs = f64::from_bits(pop(stack, bc_idx)?);
+                stack.push(if lhs <= rhs { 1 } else { 0 });
+            }
+            BcOp::GtF64 => {
+                let rhs = f64::from_bits(pop(stack, bc_idx)?);
+                let lhs = f64::from_bits(pop(stack, bc_idx)?);
+                stack.push(if lhs > rhs { 1 } else { 0 });
+            }
+            BcOp::GeF64 => {
+                let rhs = f64::from_bits(pop(stack, bc_idx)?);
+                let lhs = f64::from_bits(pop(stack, bc_idx)?);
+                stack.push(if lhs >= rhs { 1 } else { 0 });
+            }
             BcOp::Jump(target) => return Ok(StepOutcome::Jump(*target)),
             BcOp::JumpIfTrue(target) => {
                 let cond = pop(stack, bc_idx)? as u32;
@@ -1534,6 +1651,7 @@ enum StepOutcome {
     Return(VmValue),
 }
 
+#[inline(always)]
 fn pop(stack: &mut Vec<VmValue>, bc_idx: usize) -> Result<VmValue, BcVmError> {
     stack.pop().ok_or(BcVmError::StackUnderflow { bc_idx })
 }
@@ -1553,129 +1671,6 @@ fn arena_to_vm_error(err: ArenaError) -> BcVmError {
             BcVmError::IndexOutOfBounds
         }
     }
-}
-
-#[derive(Clone, Copy)]
-enum ArithOp {
-    Add,
-    Sub,
-    Mul,
-    Div,
-    Mod,
-}
-
-fn arith_binop(
-    stack: &mut Vec<VmValue>,
-    ty: IrType,
-    bc_idx: usize,
-    op: ArithOp,
-) -> Result<(), BcVmError> {
-    let rhs = pop(stack, bc_idx)?;
-    let lhs = pop(stack, bc_idx)?;
-    let out = match ty {
-        IrType::I64 | IrType::I32 => {
-            let lhs = lhs as i64;
-            let rhs = rhs as i64;
-            let r = match op {
-                ArithOp::Add => lhs.checked_add(rhs).ok_or(BcVmError::NumericOverflow)?,
-                ArithOp::Sub => lhs.checked_sub(rhs).ok_or(BcVmError::NumericOverflow)?,
-                ArithOp::Mul => lhs.checked_mul(rhs).ok_or(BcVmError::NumericOverflow)?,
-                ArithOp::Div => {
-                    if rhs == 0 {
-                        return Err(BcVmError::DivisionByZero);
-                    }
-                    // i64::MIN / -1 wraps in two's complement; tree-walker traps.
-                    lhs.checked_div(rhs).ok_or(BcVmError::NumericOverflow)?
-                }
-                ArithOp::Mod => {
-                    if rhs == 0 {
-                        return Err(BcVmError::DivisionByZero);
-                    }
-                    lhs.checked_rem(rhs).ok_or(BcVmError::NumericOverflow)?
-                }
-            };
-            r as u64
-        }
-        IrType::F64 => {
-            let lhs = f64::from_bits(lhs);
-            let rhs = f64::from_bits(rhs);
-            let r = match op {
-                ArithOp::Add => lhs + rhs,
-                ArithOp::Sub => lhs - rhs,
-                ArithOp::Mul => lhs * rhs,
-                ArithOp::Div => lhs / rhs,
-                ArithOp::Mod => lhs % rhs,
-            };
-            r.to_bits()
-        }
-        // Boolean / pointer types reject arith; the compiler should
-        // never have lowered them in the first place.
-        _ => {
-            return Err(BcVmError::StackUnderflow { bc_idx });
-        }
-    };
-    stack.push(out);
-    Ok(())
-}
-
-#[derive(Clone, Copy)]
-enum CmpOp {
-    Eq,
-    Ne,
-    Lt,
-    Le,
-    Gt,
-    Ge,
-}
-
-fn cmp_binop(
-    stack: &mut Vec<VmValue>,
-    ty: IrType,
-    bc_idx: usize,
-    op: CmpOp,
-) -> Result<(), BcVmError> {
-    let rhs = pop(stack, bc_idx)?;
-    let lhs = pop(stack, bc_idx)?;
-    let cmp = match ty {
-        IrType::I64 | IrType::I32 => {
-            let lhs = lhs as i64;
-            let rhs = rhs as i64;
-            match op {
-                CmpOp::Eq => lhs == rhs,
-                CmpOp::Ne => lhs != rhs,
-                CmpOp::Lt => lhs < rhs,
-                CmpOp::Le => lhs <= rhs,
-                CmpOp::Gt => lhs > rhs,
-                CmpOp::Ge => lhs >= rhs,
-            }
-        }
-        IrType::F64 => {
-            let lhs = f64::from_bits(lhs);
-            let rhs = f64::from_bits(rhs);
-            match op {
-                CmpOp::Eq => lhs == rhs,
-                CmpOp::Ne => lhs != rhs,
-                CmpOp::Lt => lhs < rhs,
-                CmpOp::Le => lhs <= rhs,
-                CmpOp::Gt => lhs > rhs,
-                CmpOp::Ge => lhs >= rhs,
-            }
-        }
-        // Treat the rest as i64 (Bool / Null lifted to i32 via the
-        // low 32 bits would still be representable through the i64
-        // path, since the compiler only emits Eq/Ne for them).
-        _ => {
-            let lhs = lhs as i64;
-            let rhs = rhs as i64;
-            match op {
-                CmpOp::Eq => lhs == rhs,
-                CmpOp::Ne => lhs != rhs,
-                _ => return Err(BcVmError::StackUnderflow { bc_idx }),
-            }
-        }
-    };
-    stack.push(if cmp { 1 } else { 0 });
-    Ok(())
 }
 
 /// Discover the IR PC the VM was sitting on right before it tripped

@@ -255,10 +255,12 @@ fn resume_from_pc_after_each_prong_replays_trap() {
     // operational yet. M2-B will widen the snapshot envelope to
     // rehydrate the operand stack so this PC becomes resumable.
     let func = ev.function();
-    let div_present = func
-        .ops
-        .iter()
-        .any(|op| matches!(op, relon_bytecode::op::BcOp::Div(_)));
+    let div_present = func.ops.iter().any(|op| {
+        matches!(
+            op,
+            relon_bytecode::op::BcOp::DivI64 | relon_bytecode::op::BcOp::DivF64
+        )
+    });
     assert!(div_present, "Div op must be in the compiled stream");
     // Each emitted op carries a unique IR PC > 0.
     for pc in &func.ir_pc_map {
@@ -1661,7 +1663,7 @@ fn multiple_make_lists_mint_distinct_handles() {
             BcOp::LocalGet(1),
             BcOp::ConstI64(0),
             BcOp::ListGetInt,
-            BcOp::Add(relon_ir::IrType::I64),
+            BcOp::AddI64,
             BcOp::Return,
         ],
         locals: 2,
@@ -1829,7 +1831,7 @@ fn list_push_clones_on_shared_handle() {
             BcOp::LocalGet(1),
             BcOp::ConstI64(1),
             BcOp::ListGetInt,
-            BcOp::Add(relon_ir::IrType::I64),
+            BcOp::AddI64,
             BcOp::Return,
         ],
         locals: 3,
@@ -2054,7 +2056,7 @@ fn make_dict_and_lookup_str_round_trip() {
             BcOp::LocalGet(0),
             BcOp::StrConst { idx: 1 },
             BcOp::DictLookupStr,
-            BcOp::Add(relon_ir::IrType::I64),
+            BcOp::AddI64,
             BcOp::Return,
         ],
         locals: 1,
