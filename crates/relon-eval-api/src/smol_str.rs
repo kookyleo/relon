@@ -130,6 +130,53 @@ impl SmolStr {
         matches!(self, SmolStr::Inline { .. })
     }
 
+    /// Returns `true` iff every byte in the payload is ASCII
+    /// (`< 0x80`).
+    ///
+    /// # Why this exists
+    ///
+    /// The tree-walker case-fold helpers (`upper` / `lower` / `title`
+    /// in `relon-evaluator::stdlib`) accept an `AsciiHint` so they can
+    /// skip the per-call SIMD scan inside
+    /// `fold_string_with_ascii_hint`. Without a `SmolStr`-side oracle
+    /// every surface call had to pass `AsciiHint::Unknown` and let the
+    /// fold engine pay the scan cost — even when the caller's value
+    /// container had the bytes right there. Wiring `is_ascii()` into
+    /// the helpers lets them surface `AllAscii` / `KnownNonAscii` and
+    /// route through the preclassified fast path documented in
+    /// `crates/relon-bench/benches/ascii_case_fold.rs` (the
+    /// `preclassified_*` rows in `bench ascii_case_fold`).
+    ///
+    /// # Cost
+    ///
+    /// * **Inline** (`len ≤ SMOL_STR_INLINE_CAP = 22`): a single
+    ///   vectorisable byte-AND scan over at most 22 bytes — well under
+    ///   one cycle on every modern x86_64 / aarch64 target. Rust's
+    ///   `[u8]::is_ascii()` codegens to a single `vpand` + `vpmovmskb`
+    ///   shape at this size.
+    /// * **Heap** (`Arc<str>`): delegates to `str::is_ascii()`, which
+    ///   the standard library implements via the same SIMD primitive
+    ///   over the full payload. A future revision can cache the bit
+    ///   beside the `Arc<str>` pointer (mirroring the
+    ///   [`relon_trace_abi::STRING_RECORD_ASCII_FLAG_BIT`] flag the
+    ///   trace-JIT keeps on its StringRef header) so heap payloads
+    ///   become an O(1) load too; for now the on-demand scan keeps
+    ///   the slot layout identical to its pre-flag shape and avoids
+    ///   touching the niche-optimisation that pins the enum size to
+    ///   24 bytes.
+    #[inline]
+    pub fn is_ascii(&self) -> bool {
+        match self {
+            // Inline: scan the (≤ 22-byte) data prefix directly. Even
+            // on a non-SIMD target this is a tight loop bounded by the
+            // inline cap.
+            SmolStr::Inline { len, data } => data[..*len as usize].is_ascii(),
+            // Heap: delegate to `str::is_ascii`. See type-level note
+            // for the follow-up cache work.
+            SmolStr::Heap(arc) => arc.is_ascii(),
+        }
+    }
+
     /// Build a `SmolStr` from any `&str`. ≤ [`SMOL_STR_INLINE_CAP`]
     /// bytes land inline; longer payloads allocate one `Arc<str>`.
     ///
@@ -664,6 +711,66 @@ mod tests {
             .expect("zero-length always inline");
         assert!(s.is_inline());
         assert_eq!(s.as_str(), "");
+    }
+
+    #[test]
+    fn is_ascii_inline_empty() {
+        // Empty payload is vacuously ASCII.
+        let s = SmolStr::new_empty();
+        assert!(s.is_inline());
+        assert!(s.is_ascii());
+    }
+
+    #[test]
+    fn is_ascii_inline_pure_ascii() {
+        let s = SmolStr::from_borrowed("hello");
+        assert!(s.is_inline());
+        assert!(s.is_ascii());
+    }
+
+    #[test]
+    fn is_ascii_inline_with_high_byte() {
+        // 'caf' + U+00E9 (encoded as 0xC3 0xA9). Built from raw bytes
+        // so the source file stays pure-ASCII while the SmolStr
+        // payload contains a byte >= 0x80, forcing `is_ascii()` to
+        // false.
+        let raw = vec![b'c', b'a', b'f', 0xC3, 0xA9];
+        let payload = String::from_utf8(raw).expect("valid UTF-8");
+        let s = SmolStr::from_borrowed(&payload);
+        assert!(s.is_inline());
+        assert!(!s.is_ascii());
+    }
+
+    #[test]
+    fn is_ascii_inline_at_cap_boundary() {
+        // 22-byte ASCII payload sits exactly at the inline cap.
+        let payload = "a".repeat(SMOL_STR_INLINE_CAP);
+        let s = SmolStr::from_borrowed(&payload);
+        assert!(s.is_inline());
+        assert!(s.is_ascii());
+    }
+
+    #[test]
+    fn is_ascii_heap_pure_ascii() {
+        let payload = "x".repeat(SMOL_STR_INLINE_CAP + 8);
+        let s = SmolStr::from_borrowed(&payload);
+        assert!(!s.is_inline());
+        assert!(s.is_ascii());
+    }
+
+    #[test]
+    fn is_ascii_heap_with_non_ascii() {
+        // Heap-sized payload (> 22 bytes) that contains a non-ASCII
+        // codepoint near the end — exercises the heap-path delegation
+        // to `str::is_ascii`. We append U+00E9 (encoded as 0xC3 0xA9
+        // raw bytes) so the source file stays pure-ASCII while the
+        // runtime payload contains a byte >= 0x80.
+        let mut payload = "x".repeat(SMOL_STR_INLINE_CAP).into_bytes();
+        payload.extend_from_slice(&[b'y', b'y', b'z', 0xC3, 0xA9]);
+        let payload = String::from_utf8(payload).expect("valid UTF-8");
+        let s = SmolStr::from_borrowed(&payload);
+        assert!(!s.is_inline());
+        assert!(!s.is_ascii());
     }
 
     #[test]
