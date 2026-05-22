@@ -944,7 +944,8 @@ impl<'a, 'b> TraceEmitterState<'a, 'b> {
         if divisor == 1 {
             return self.builder.ins().iconst(I64, 0);
         }
-        let (magic, post_shift) = signed_div_magic_i64(divisor);
+        let (magic, post_shift) = signed_div_magic_i64(divisor)
+            .expect("emit_signed_mod_by_const callers gate via magic_supported_divisor");
         let m_v = match hoisted_magic {
             Some(v) => v,
             None => self.builder.ins().iconst(I64, magic),
@@ -1847,12 +1848,11 @@ impl<'a, 'b> TraceEmitterState<'a, 'b> {
                     // imm64` (which lowers to a 10-byte `mov reg,
                     // imm64` on x86_64) is shared across iterations.
                     if let Some(divisor) = self.const_positive_i64(*b) {
-                        if magic_supported_divisor(divisor)
-                            && !self.hoisted_mod_magic.contains_key(b)
-                        {
-                            let (magic, _post_shift) = signed_div_magic_i64(divisor);
-                            let magic_v = self.builder.ins().iconst(I64, magic);
-                            self.hoisted_mod_magic.insert(*b, magic_v);
+                        if !self.hoisted_mod_magic.contains_key(b) {
+                            if let Some((magic, _post_shift)) = signed_div_magic_i64(divisor) {
+                                let magic_v = self.builder.ins().iconst(I64, magic);
+                                self.hoisted_mod_magic.insert(*b, magic_v);
+                            }
                         }
                         // Magic path doesn't need the divisor-nonzero
                         // guard, but mark the SSA as "guard handled"
@@ -2091,63 +2091,18 @@ fn compute_loop_meta(ops: &[TraceOp]) -> HashMap<u32, LoopMeta> {
     out
 }
 
-/// Declare a host hook as an `ExtFuncData::User` import on the
-/// function. Returns the resulting `FuncRef` so call sites can use it.
-///
 /// F-D8-E.6: predicate gating the magic-mod fast path. Returns
 /// `true` when the divisor has a positive i64 signed-division magic
 /// (so the simple `smulhi` + `sshr_imm` + `+ (a<0)` sequence is
 /// correct). Computed by running [`signed_div_magic_i64`]'s search
-/// once and checking the high bit of the resulting magic; we expose
-/// it as a separate helper so callers can guard the lowering at
-/// emit-time without bringing the magic value into scope.
+/// once and checking the high bit of the resulting magic.
 ///
 /// `d <= 1` returns `false` — `d == 1` is handled inline in
 /// [`TraceEmitterState::emit_signed_mod_by_const`], and `d <= 0`
 /// would not reach this predicate via the `const_positive_i64`
 /// pre-filter anyway.
 fn magic_supported_divisor(d: i64) -> bool {
-    if d <= 1 {
-        return false;
-    }
-    // Re-derive the magic. The function panics in debug if the
-    // magic would need the "add" correction; mirror its check in
-    // release by recomputing whether `magic_u <= i64::MAX`.
-    let ad = d as u128;
-    let two_63_minus_1: u128 = (1u128 << 63) - 1;
-    let anc: u128 = two_63_minus_1 - (two_63_minus_1 % ad);
-    let mut p: u32 = 63;
-    let mut q1: u128 = (1u128 << 63) / anc;
-    let mut r1: u128 = (1u128 << 63) - q1 * anc;
-    let mut q2: u128 = (1u128 << 63) / ad;
-    let mut r2: u128 = (1u128 << 63) - q2 * ad;
-    loop {
-        p += 1;
-        q1 *= 2;
-        r1 *= 2;
-        if r1 >= anc {
-            q1 += 1;
-            r1 -= anc;
-        }
-        q2 *= 2;
-        r2 *= 2;
-        if r2 >= ad {
-            q2 += 1;
-            r2 -= ad;
-        }
-        let delta: u128 = ad - r2;
-        if !(q1 < delta || (q1 == delta && r1 == 0)) {
-            break;
-        }
-        // Safety brake against runaway loops on pathological inputs.
-        // The Hacker's Delight algorithm terminates by `p < 96` for
-        // any 64-bit divisor; we cap a bit higher than that.
-        if p > 128 {
-            return false;
-        }
-    }
-    let magic_u: u128 = q2 + 1;
-    magic_u <= i64::MAX as u128
+    signed_div_magic_i64(d).is_some()
 }
 
 /// F-D8-E.6: pre-compute the i64 signed-division magic multiplier
@@ -2169,15 +2124,18 @@ fn magic_supported_divisor(d: i64) -> bool {
 /// {7, 11, 14, 19, 21, ...} — the recorder hasn't produced any of
 /// these as a const divisor in the trace suite we've measured.
 ///
-/// Returns `(magic, post_shift)` where the runtime computes
+/// Returns `Some((magic, post_shift))` where the runtime computes
 /// `(a * magic) >>_high 64 >> post_shift + (a < 0 ? 1 : 0)` as the
-/// quotient. See [`TraceEmitterState::emit_signed_mod_by_const`]
-/// for the matching IR emission.
-fn signed_div_magic_i64(d: i64) -> (i64, u32) {
-    debug_assert!(
-        d > 1,
-        "magic helper requires d >= 2 (d == 1 short-circuited)"
-    );
+/// quotient. Returns `None` when `d <= 1` (caller should short-
+/// circuit) or when the magic would set the sign bit (the simple
+/// emit sequence omits the "needs add" correction). See
+/// [`TraceEmitterState::emit_signed_mod_by_const`] for the matching
+/// IR emission and [`magic_supported_divisor`] for the predicate
+/// form.
+fn signed_div_magic_i64(d: i64) -> Option<(i64, u32)> {
+    if d <= 1 {
+        return None;
+    }
     let ad = d as u128;
     // The Hacker's Delight algorithm tracks two ratios: `q2 = 2^p/d`
     // (drives the magic itself) and `q1 = 2^p/anc` (drives the loop
@@ -2213,21 +2171,25 @@ fn signed_div_magic_i64(d: i64) -> (i64, u32) {
         if !(q1 < delta || (q1 == delta && r1 == 0)) {
             break;
         }
+        // Safety brake against runaway loops on pathological inputs.
+        // The Hacker's Delight algorithm terminates by `p < 96` for
+        // any 64-bit divisor; cap a bit higher than that.
+        if p > 128 {
+            return None;
+        }
     }
     let magic_u: u128 = q2 + 1;
     // For divisors we care about, magic_u fits in i64's positive
     // range. If it doesn't, the simple emit_signed_mod_by_const
     // sequence omits the "needs add" correction step and would
-    // silently miscompile. Trap loudly in debug builds and force
-    // the caller to fall back.
-    debug_assert!(
-        magic_u <= i64::MAX as u128,
-        "signed magic for divisor {} would set the sign bit (needs Hacker's Delight add-correction); emitter has no support yet",
-        d,
-    );
+    // silently miscompile — return None and force the caller to
+    // fall back.
+    if magic_u > i64::MAX as u128 {
+        return None;
+    }
     let magic = magic_u as i64;
     let post_shift = p - 64;
-    (magic, post_shift)
+    Some((magic, post_shift))
 }
 
 /// The `namespace` field is set to `0` (matching what
@@ -2754,8 +2716,7 @@ mod tests {
             (10, 0x6666_6666_6666_6667u64 as i64, 2),
         ];
         for (d, m, s) in cases {
-            assert!(super::magic_supported_divisor(d), "d = {d}");
-            let (gm, gs) = super::signed_div_magic_i64(d);
+            let (gm, gs) = super::signed_div_magic_i64(d).expect("supported divisor");
             assert_eq!(gm, m, "magic for {d}");
             assert_eq!(gs, s, "shift for {d}");
         }
@@ -2812,7 +2773,7 @@ mod tests {
     #[test]
     fn signed_mod_magic_matches_native_srem_for_sample_grid() {
         fn model_mod(a: i64, d: i64) -> i64 {
-            let (magic, shift) = super::signed_div_magic_i64(d);
+            let (magic, shift) = super::signed_div_magic_i64(d).expect("supported divisor");
             // smulhi: (a * magic) >> 64, with arithmetic semantics
             // matching Rust's i128 sign-extend.
             let hi = ((a as i128).wrapping_mul(magic as i128) >> 64) as i64;
