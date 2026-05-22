@@ -47,4 +47,6 @@ mod eval_tests;
 #[cfg(test)]
 mod host_boundary_tests;
 #[cfg(test)]
+mod import_pin_tests;
+#[cfg(test)]
 mod sandbox_tests;
