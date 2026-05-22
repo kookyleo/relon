@@ -746,7 +746,9 @@ mod tests {
         );
         assert_eq!(
             pool.string_hashes.get(&1).copied(),
-            Some(relon_trace_abi::hash::fx_hash_bytes("caf\u{00E9}".as_bytes())),
+            Some(relon_trace_abi::hash::fx_hash_bytes(
+                "caf\u{00E9}".as_bytes()
+            )),
             "non-ASCII payload hash must match fx_hash_bytes reference"
         );
     }
