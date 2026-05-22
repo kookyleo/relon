@@ -846,7 +846,11 @@ impl TraceJitState {
         // (see the helper's doc comment in
         // `relon_trace_jit::runtime::str_ops`).
         let str_concat_seal_hash_sig = build_host_helper_signature(&[pointer_ty], &[]);
-        let str_concat_seal_hash_id = module
+        // Declared but currently unused — the IR emitter is configured
+        // to skip the seal call (see str_concat_seal_hash: None below).
+        // Keep the symbol declaration so JIT installs the runtime helper
+        // for future selective-emit reactivation.
+        let _str_concat_seal_hash_id = module
             .declare_function(
                 relon_trace_emitter::HostHookId::StrConcatSealHash.symbol(),
                 Linkage::Import,
@@ -949,7 +953,15 @@ impl TraceJitState {
             str_find: str_find_id.as_u32(),
             str_substring: str_substring_id.as_u32(),
             str_concat_alloc: Some(str_concat_alloc_id.as_u32()),
-            str_concat_seal_hash: Some(str_concat_seal_hash_id.as_u32()),
+            // 2026-05-22: disabled to fix W3 string_concat trace_jit +245%
+            // regression. Per-iter unconditional seal_hash does fx_hash
+            // over the full (growing) payload, making any hot-loop
+            // concat O(N²). #159 reported Tier 1b dict-IC-on-concat-
+            // result win as unmeasurable (W5 noise), so trading that
+            // for W3 recovery is net-positive. Helper symbol is still
+            // declared above for future selective-emit reactivation
+            // (only when concat result is statically a dict-key feed).
+            str_concat_seal_hash: None,
             str_concat_n_alloc: Some(str_concat_n_alloc_id.as_u32()),
             str_glob_match: Some(str_glob_match_id.as_u32()),
             list_get: Some(list_get_id.as_u32()),
