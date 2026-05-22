@@ -154,16 +154,13 @@ struct MethodParam {
 /// wasm `call` instruction without further translation.
 #[derive(Debug, Clone, Default)]
 struct SchemaMethodRegistry {
-    /// `(schema_name, method_name)` -> wasm-level fn_index. The same
-    /// schema name keyed by both the original declaration site and
-    /// any `#extend` contributions is fine — analyzer-level conflict
-    /// detection happens upstream; the IR pass picks whichever lands
-    /// in the table first.
-    lookup: HashMap<(String, String), u32>,
-    /// `(schema_name, method_name)` -> (param IR types, return IR
-    /// type) so call sites can populate `Op::Call`'s `param_tys` /
-    /// `ret_ty` without re-walking the method's declared params.
-    sigs: HashMap<(String, String), (Vec<IrType>, IrType)>,
+    /// `(schema_name, method_name)` -> `(wasm fn_index, param IR
+    /// types, return IR type)`. Single-map form so call sites resolve
+    /// dispatch index + signature in one lookup. The same schema name
+    /// keyed by both the original declaration site and any `#extend`
+    /// contributions is fine — analyzer-level conflict detection
+    /// happens upstream; the IR pass picks whichever lands first.
+    methods: HashMap<(String, String), (u32, Vec<IrType>, IrType)>,
 }
 
 /// Name → `SchemaDef` lookup built once per `lower_workspace_*` call
@@ -1266,11 +1263,12 @@ fn lower_expr(expr: &Expr, range: TokenRange, ctx: &mut LowerCtx<'_>) -> Result<
 /// are excluded so they don't pollute the captures list.
 fn collect_free_vars(expr: &Expr, lambda_params: &[ClosureParam]) -> Vec<String> {
     let mut found: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut visit = |s: &str| {
         if lambda_params.iter().any(|p| p.name == s) {
             return;
         }
-        if !found.iter().any(|n| n == s) {
+        if seen.insert(s.to_string()) {
             found.push(s.to_string());
         }
     };
@@ -1837,18 +1835,12 @@ fn lower_fn_call(
     // stdlib path stays available for receivers without a brand
     // (`String::length`, `List<Int>::length`).
     if let Some(schema_name) = receiver_brand.as_deref() {
+        let key = (schema_name.to_string(), method_name.to_string());
         if let Some((fn_index, param_tys, ret_ty)) = ctx
             .method_registry
-            .lookup
-            .get(&(schema_name.to_string(), method_name.to_string()))
-            .copied()
-            .and_then(|idx| {
-                ctx.method_registry
-                    .sigs
-                    .get(&(schema_name.to_string(), method_name.to_string()))
-                    .cloned()
-                    .map(|(p, r)| (idx, p, r))
-            })
+            .methods
+            .get(&key)
+            .map(|(idx, p, r)| (*idx, p.clone(), *r))
         {
             return finish_schema_method_call(
                 fn_index,
@@ -3320,16 +3312,11 @@ fn lower_dict_into_record(
 
     for idx in order {
         let canonical_field = &schema.fields[idx];
-        let layout_field = layout
-            .fields
-            .iter()
-            .find(|fo| fo.name == canonical_field.name)
-            .ok_or_else(|| LoweringError::UnsupportedFieldType {
-                schema: schema.name.clone(),
-                field: canonical_field.name.clone(),
-                ty: "<layout-miss>".to_string(),
-                range,
-            })?;
+        // `SchemaLayout::offsets_for` walks `schema.fields` in
+        // declaration order, so `layout.fields[i].name ==
+        // schema.fields[i].name` is invariant by construction.
+        let layout_field = &layout.fields[idx];
+        debug_assert_eq!(layout_field.name, canonical_field.name);
         let field_range = def.fields[idx].value_range;
         // Lower the value expression (user-supplied or schema default).
         if let Some(user_value) = user_values.get(canonical_field.name.as_str()) {
@@ -3878,10 +3865,9 @@ fn lower_schema_methods<'a>(
         let sig = method_signature_ir_types(&m.info, resolver)?;
         let wasm_idx = stdlib_offset + m.ir_idx as u32;
         let key = (m.schema_name.clone(), m.info.name.clone());
-        registry.lookup.insert(key.clone(), wasm_idx);
         registry
-            .sigs
-            .insert(key, (sig.param_tys.clone(), sig.ret_ty));
+            .methods
+            .insert(key, (wasm_idx, sig.param_tys.clone(), sig.ret_ty));
         method_sigs.push(sig);
     }
     // Second pass: lower each method's body now that the registry is

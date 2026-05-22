@@ -54,25 +54,16 @@ pub fn non_ascii_whitespace_ranges() -> &'static [(u32, u32)] {
     NON_ASCII_WHITESPACE_RANGES
 }
 
-/// Encode the whitespace range table into the raw byte layout the
-/// wasm data section expects. See [`super::combining_marks::encode_ranges_bytes`]
-/// for the wire format — both helpers emit the same `[count: u32][(start, end) × N]`
-/// shape so the runtime can binary-search them with one shared op
-/// stream.
+/// Encode the whitespace range table into the wasm data-section
+/// layout. Delegates to [`super::encode_u32_pair_table`] — see that
+/// helper for the wire format.
 pub fn encode_ranges_bytes(table: &[(u32, u32)]) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(4 + table.len() * 8);
-    bytes.extend_from_slice(&(table.len() as u32).to_le_bytes());
-    for (s, e) in table {
-        bytes.extend_from_slice(&s.to_le_bytes());
-        bytes.extend_from_slice(&e.to_le_bytes());
-    }
-    bytes
+    super::encode_u32_pair_table(table)
 }
 
-/// Byte size of the encoded whitespace ranges. Mirrors
-/// [`super::combining_marks::encoded_ranges_size`].
+/// Byte size of the encoded whitespace ranges.
 pub fn encoded_ranges_size(table: &[(u32, u32)]) -> usize {
-    4 + table.len() * 8
+    super::encoded_u32_pair_table_size(table.len())
 }
 
 /// Compile-time check used by the tree-walk evaluator (the wasm body
@@ -84,17 +75,7 @@ pub fn is_unicode_whitespace(cp: u32) -> bool {
     if (0x09..=0x0D).contains(&cp) || cp == 0x20 {
         return true;
     }
-    NON_ASCII_WHITESPACE_RANGES
-        .binary_search_by(|(s, e)| {
-            if cp < *s {
-                std::cmp::Ordering::Greater
-            } else if cp > *e {
-                std::cmp::Ordering::Less
-            } else {
-                std::cmp::Ordering::Equal
-            }
-        })
-        .is_ok()
+    super::cp_in_ranges(cp, NON_ASCII_WHITESPACE_RANGES)
 }
 
 #[cfg(test)]

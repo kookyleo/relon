@@ -156,17 +156,7 @@ pub fn is_turkish_locale(locale: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 fn range_contains(ranges: &[(u32, u32)], cp: u32) -> bool {
-    ranges
-        .binary_search_by(|&(lo, hi)| {
-            if cp < lo {
-                std::cmp::Ordering::Greater
-            } else if cp > hi {
-                std::cmp::Ordering::Less
-            } else {
-                std::cmp::Ordering::Equal
-            }
-        })
-        .is_ok()
+    super::cp_in_ranges(cp, ranges)
 }
 
 /// Look up a FULL fold entry by codepoint, returning `(out_len,
@@ -247,17 +237,10 @@ pub fn encode_simple_view_bytes(table: &[(u32, u32, u32, u32, u8)]) -> Vec<u8> {
     bytes
 }
 
-/// Encode a range table (`[count: u32 LE][(start: u32, end: u32) ×
-/// count]`) — same shape as the combining-mark / whitespace ranges so
-/// the runtime helper can share the binary-search rebase arithmetic.
+/// Encode a range table — same shape as the combining-mark /
+/// whitespace ranges. Delegates to [`super::encode_u32_pair_table`].
 pub fn encode_ranges_bytes(table: &[(u32, u32)]) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(4 + table.len() * 8);
-    bytes.extend_from_slice(&(table.len() as u32).to_le_bytes());
-    for (lo, hi) in table {
-        bytes.extend_from_slice(&lo.to_le_bytes());
-        bytes.extend_from_slice(&hi.to_le_bytes());
-    }
-    bytes
+    super::encode_u32_pair_table(table)
 }
 
 #[cfg(test)]

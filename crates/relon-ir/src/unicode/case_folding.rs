@@ -41,28 +41,17 @@ pub fn simple_lower_folding() -> &'static [(u32, u32)] {
     SIMPLE_LOWER_FOLDING
 }
 
-/// Encode the case-folding table into the raw byte layout the wasm
-/// data section expects.
-///
-/// Layout: a 4-byte little-endian entry count followed by `count` *
-/// 8 bytes, each entry being `(input_cp: u32 LE, output_cp: u32 LE)`.
-/// The header lets the wasm body emit a fixed-shape binary search
-/// without taking the table length as a separate constant.
+/// Encode the case-folding table into the wasm data-section layout.
+/// Delegates to [`super::encode_u32_pair_table`] — entries encode
+/// `(input_cp, output_cp)` pairs but the byte layout matches the
+/// range tables so the runtime helper can share rebase arithmetic.
 pub fn encode_table_bytes(table: &[(u32, u32)]) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(4 + table.len() * 8);
-    bytes.extend_from_slice(&(table.len() as u32).to_le_bytes());
-    for (k, v) in table {
-        bytes.extend_from_slice(&k.to_le_bytes());
-        bytes.extend_from_slice(&v.to_le_bytes());
-    }
-    bytes
+    super::encode_u32_pair_table(table)
 }
 
-/// Byte size of the encoded table — header (4 bytes) plus 8 bytes
-/// per entry. Codegen uses this to pre-size the data section before
-/// it lays out per-table offsets.
+/// Byte size of the encoded case-folding table.
 pub fn encoded_table_size(table: &[(u32, u32)]) -> usize {
-    4 + table.len() * 8
+    super::encoded_u32_pair_table_size(table.len())
 }
 
 #[cfg(test)]

@@ -401,28 +401,15 @@ pub fn combining_mark_ranges() -> &'static [(u32, u32)] {
     COMBINING_MARK_RANGES
 }
 
-/// Encode the combining-mark range table into the raw byte layout
-/// the wasm data section expects.
-///
-/// Layout: a 4-byte little-endian entry count followed by `count *
-/// 8 bytes`, each entry being `(start: u32 LE, end: u32 LE)` —
-/// matches the case-folding table shape so the runtime helper can
-/// reuse the same `(table_addr + 4 + mid * 8)` rebase arithmetic.
+/// Encode the combining-mark range table into the wasm data-section
+/// layout. Delegates to [`super::encode_u32_pair_table`].
 pub fn encode_ranges_bytes(table: &[(u32, u32)]) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(4 + table.len() * 8);
-    bytes.extend_from_slice(&(table.len() as u32).to_le_bytes());
-    for (s, e) in table {
-        bytes.extend_from_slice(&s.to_le_bytes());
-        bytes.extend_from_slice(&e.to_le_bytes());
-    }
-    bytes
+    super::encode_u32_pair_table(table)
 }
 
-/// Byte size of the encoded ranges table — header (4 bytes) plus
-/// 8 bytes per `(start, end)` pair. Codegen uses this to pre-size
-/// the data section before laying out per-table offsets.
+/// Byte size of the encoded ranges table.
 pub fn encoded_ranges_size(table: &[(u32, u32)]) -> usize {
-    4 + table.len() * 8
+    super::encoded_u32_pair_table_size(table.len())
 }
 
 /// Compile-time check (mirrors the runtime contract). Returns true
@@ -432,17 +419,7 @@ pub fn encoded_ranges_size(table: &[(u32, u32)]) -> usize {
 /// helper is only used by the unit tests and the tree-walk
 /// evaluator's title implementation.
 pub fn is_combining_mark(cp: u32) -> bool {
-    COMBINING_MARK_RANGES
-        .binary_search_by(|(s, e)| {
-            if cp < *s {
-                std::cmp::Ordering::Greater
-            } else if cp > *e {
-                std::cmp::Ordering::Less
-            } else {
-                std::cmp::Ordering::Equal
-            }
-        })
-        .is_ok()
+    super::cp_in_ranges(cp, COMBINING_MARK_RANGES)
 }
 
 #[cfg(test)]
