@@ -24,6 +24,9 @@ trace-JIT reference 均达 ≤ LuaJIT × 1.5。原始 × 2 软目标 → × 1.5 
 | D7 | W4 string contains | 23.8 µs | 17.9 µs | **× 1.33** | ✓ | × 1.66 | F-D7-J (guard hoist + brif quick-arm) |
 | D8 | W5 dict_str_key | 168.5 µs | 114.4 µs | **× 1.47** | ✓ | × 1.95 | F-D8-E.4 + E.5 + E.6 + E.7 |
 | D8 | W6 dict_num_key | 17.8 µs | 71.8 µs | **× 0.50** | ✓ | × 0.59 | F-D8 + F-D9 |
+| D6 | W8 poly_callsite | 53.7 µs | 132.5 µs | **× 0.41** | ✓ | n/a → meas | review-improvement-167 |
+| D1 | W9 nested_matrix | 0.40 µs | 52.1 µs | **× 0.008** | ✓ | n/a → meas | review-improvement-167 |
+| D4 | W10 config_eval | 16.5 µs | 26.3 µs | **× 0.63** | ✓ | n/a → meas | review-improvement-167 |
 
 ‡review-improvement-139: W7 fib 的 trace_jit row 不可达。recorder 把
 `Op::CallClosure` 一律视为 `AbortReason::UnrecoverableEffect`（closure-call
@@ -83,8 +86,11 @@ identified 真实 fail 集 W3/W4/W5/W11
 
 ## 遗留 / 后续
 
-- D1/D5 cmp_lua trace_jit row（W2/W7/W12 trace_jit measurement）—— 当前通过
-  W1 reference 通过任务，但 cmp_lua bench infrastructure 完整化属独立 follow-up
+- ~~D1/D5 cmp_lua trace_jit row（W2/W7/W12 trace_jit measurement）~~ —
+  review-improvement-139 已补 W2/W12，W7 honest n/a（recursion CallClosure
+  abort）。review-improvement-167 进一步补 W8/W9/W10，三 row 均拿到
+  honest trace_jit 数字。cmp_lua 现存 trace_jit 列对应于：W1/W2/W3/W4/W5/W6/
+  W8/W9/W10/W12（10 row），W7 honest n/a，W11 cold-start 不适用
 - W11 进一步压（× 1.49 → × 1.4）需 musl static-link 或 mini-binary，属 RFC-class
   API 变更
 - W5 × 1.47 是 buffer 0.027 通过；perfect-hash for ≥ 5-entry small dicts
