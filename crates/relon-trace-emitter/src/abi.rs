@@ -145,6 +145,7 @@ pub fn host_hook_slot_offset(hook: HostHookId) -> i32 {
         HostHookId::StrConcat
         | HostHookId::StrConcatAlloc
         | HostHookId::StrConcatSealHash
+        | HostHookId::StrConcatNAlloc
         | HostHookId::StrContains
         | HostHookId::StrFind
         | HostHookId::StrSubstring
@@ -212,6 +213,17 @@ pub enum HostHookId {
     /// cross-trace dict access on the concat result. See
     /// [`relon_trace_jit::runtime::__relon_str_concat_seal_hash`].
     StrConcatSealHash,
+    /// #168: `__relon_str_concat_n_alloc(operands: *const *const StringRef,
+    /// n: usize, total_len: usize) -> *mut StringRef`. N-operand single-
+    /// allocation concat helper for the inline `TraceOp::StrConcatN`
+    /// lowering. The cranelift IR stack-spills the operand pointer SSAs
+    /// into a contiguous `[*const StringRef; N]` slot, computes the
+    /// payload length sum, and calls this helper once to allocate +
+    /// memcpy in one shot. Followed by a [`Self::StrConcatSealHash`]
+    /// call so the result `StringRef`'s cached `fx_hash` field matches
+    /// the now-complete payload. See
+    /// [`relon_trace_jit::runtime::__relon_str_concat_n_alloc`].
+    StrConcatNAlloc,
     /// F-D7: `__relon_str_contains(*const u8, usize, *const u8, usize) -> i32`.
     StrContains,
     /// F-D7: `__relon_str_find(*const u8, usize, *const u8, usize) -> i64`.
@@ -261,6 +273,7 @@ impl HostHookId {
             HostHookId::StrConcat => "__relon_str_concat",
             HostHookId::StrConcatAlloc => "__relon_str_concat_alloc",
             HostHookId::StrConcatSealHash => "__relon_str_concat_seal_hash",
+            HostHookId::StrConcatNAlloc => "__relon_str_concat_n_alloc",
             HostHookId::StrContains => "__relon_str_contains",
             HostHookId::StrFind => "__relon_str_find",
             HostHookId::StrSubstring => "__relon_str_substring",

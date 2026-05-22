@@ -853,6 +853,22 @@ impl TraceJitState {
                 &str_concat_seal_hash_sig,
             )
             .map_err(|e| TraceJitError::Module(format!("declare str_concat_seal_hash: {e}")))?;
+        // #168: N-operand single-allocation concat helper.
+        // `(operands: *const *const StringRef, n: usize, total_len: usize)
+        //   -> *mut StringRef`. The inline `TraceOp::StrConcatN`
+        // lowering stack-spills the operand pointer SSAs into a small
+        // `[*const StringRef; N]` array and calls this helper once per
+        // op so the trace tail stays a single allocation + memcpy
+        // sequence rather than `N - 1` pair-wise extern shim calls.
+        let str_concat_n_alloc_sig =
+            build_host_helper_signature(&[pointer_ty, pointer_ty, pointer_ty], &[pointer_ty]);
+        let str_concat_n_alloc_id = module
+            .declare_function(
+                relon_trace_emitter::HostHookId::StrConcatNAlloc.symbol(),
+                Linkage::Import,
+                &str_concat_n_alloc_sig,
+            )
+            .map_err(|e| TraceJitError::Module(format!("declare str_concat_n_alloc: {e}")))?;
         // 2026-05-21 Tier-2: pre-declare `__relon_str_glob_match` so
         // recorded traces that hit `glob_match(s, pat)` link cleanly.
         // Same `(ptr, ptr) -> i32` signature shape as
@@ -934,6 +950,7 @@ impl TraceJitState {
             str_substring: str_substring_id.as_u32(),
             str_concat_alloc: Some(str_concat_alloc_id.as_u32()),
             str_concat_seal_hash: Some(str_concat_seal_hash_id.as_u32()),
+            str_concat_n_alloc: Some(str_concat_n_alloc_id.as_u32()),
             str_glob_match: Some(str_glob_match_id.as_u32()),
             list_get: Some(list_get_id.as_u32()),
             dict_lookup: Some(dict_lookup_id.as_u32()),
@@ -1348,6 +1365,15 @@ pub fn register_trace_runtime_symbols(builder: &mut JITBuilder) {
     builder.symbol(
         relon_trace_emitter::HostHookId::StrConcatSealHash.symbol(),
         relon_trace_jit::runtime::__relon_str_concat_seal_hash as *const u8,
+    );
+    // #168: N-operand single-allocation concat helper. The inline
+    // `TraceOp::StrConcatN` lowering calls this once per op so hot
+    // 3-/4-way string concat chains stop bouncing through `N - 1`
+    // pair-wise extern shim invocations. The seal-hash helper above
+    // closes the digest gap on the result `StringRef`.
+    builder.symbol(
+        relon_trace_emitter::HostHookId::StrConcatNAlloc.symbol(),
+        relon_trace_jit::runtime::__relon_str_concat_n_alloc as *const u8,
     );
     // 2026-05-21 Tier-2: glob_match helper. Body lives in
     // `crate::trace_glob_helper` so the trace JIT runtime crate stays

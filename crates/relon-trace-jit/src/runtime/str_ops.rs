@@ -393,6 +393,105 @@ pub unsafe extern "C" fn __relon_str_concat_alloc(
     header_ptr
 }
 
+/// #168: N-operand single-allocation concat helper for the inline
+/// `TraceOp::StrConcatN` lowering.
+///
+/// Allocates a single `[StringRef header | payload bytes]` block (same
+/// layout discipline as [`__relon_str_concat_alloc`]), then `memcpy`s
+/// each operand's `(ptr, len)` payload contiguously into the payload
+/// buffer in operand order. Returns a non-null `*mut StringRef` whose
+/// payload is the byte-concatenation of all N operand payloads, plus
+/// `hash = 0` as the "not yet sealed" sentinel — the inline lowering
+/// follows up with [`__relon_str_concat_seal_hash`] so the dict-key
+/// IC can trust the cached digest.
+///
+/// ## ABI
+///
+/// `operands` is a packed `*const *const StringRef` array (the inline
+/// lowering stack-spills its operand pointer SSAs into this layout).
+/// `n` is the operand count; the helper reads exactly `n` pointers.
+/// `total_len` is the pre-computed sum of operand `len`s — the inline
+/// lowering computes it via cranelift IR adds outside the helper so
+/// the slow path can be a straight allocation + copy loop. Passing a
+/// mismatched `total_len` is UB (would over- or under-fill the
+/// payload). The inline lowering and the test in `str_ops.rs` are the
+/// only callers; both keep the invariant.
+///
+/// ## Safety
+///
+/// * `operands` must point at a contiguous `n`-element array of
+///   `*const StringRef` pointers; each pointer must be null or a
+///   valid `*const StringRef` previously produced by another shim.
+/// * `total_len` must equal `Σ operand_i.len` (or be larger — the
+///   payload tail is undefined past the concatenated content, but
+///   the allocation succeeds and the JIT-side seal-hash call would
+///   then digest stale bytes; the inline lowering matches exactly).
+/// * On a null operand or a null inner `ptr`, the helper returns
+///   null — the JIT-side `Guard(NotNull(operand_i))` lifts this into
+///   a clean deopt before the call, so the path is a defensive
+///   backstop.
+#[no_mangle]
+pub unsafe extern "C" fn __relon_str_concat_n_alloc(
+    operands: *const *const StringRef,
+    n: usize,
+    total_len: usize,
+) -> *mut StringRef {
+    if operands.is_null() {
+        return std::ptr::null_mut();
+    }
+    use std::alloc::{alloc, Layout};
+    let header_size = std::mem::size_of::<StringRef>();
+    let header_align = std::mem::align_of::<StringRef>();
+    debug_assert!(header_size.is_multiple_of(header_align));
+    let block_size = header_size + total_len;
+    let layout = Layout::from_size_align(block_size, header_align)
+        .expect("StringRef block layout must be valid");
+    let block = alloc(layout);
+    if block.is_null() {
+        return std::ptr::null_mut();
+    }
+    let payload_ptr = block.add(header_size);
+    let mut cursor: usize = 0;
+    for i in 0..n {
+        let operand = *operands.add(i);
+        if operand.is_null() {
+            // Defensive: a null operand short-circuits to null. The
+            // upstream `Guard(NotNull(_))` should catch this first.
+            std::alloc::dealloc(block, layout);
+            return std::ptr::null_mut();
+        }
+        let r = &*operand;
+        if r.len == 0 {
+            continue;
+        }
+        if r.ptr.is_null() {
+            std::alloc::dealloc(block, layout);
+            return std::ptr::null_mut();
+        }
+        if cursor + r.len > total_len {
+            // `total_len` was under-budget. Bail out instead of
+            // writing past the allocation.
+            std::alloc::dealloc(block, layout);
+            return std::ptr::null_mut();
+        }
+        std::ptr::copy_nonoverlapping(r.ptr, payload_ptr.add(cursor), r.len);
+        cursor += r.len;
+    }
+    let header_ptr = block as *mut StringRef;
+    // `hash = 0` is the "not yet sealed" sentinel; the JIT-side
+    // inline lowering calls `__relon_str_concat_seal_hash` after this
+    // returns so the dict IC fast path sees a valid digest.
+    std::ptr::write(
+        header_ptr,
+        StringRef {
+            ptr: payload_ptr as *const u8,
+            len: cursor,
+            hash: 0,
+        },
+    );
+    header_ptr
+}
+
 /// Tier 1b companion to [`__relon_str_concat_alloc`]: re-compute
 /// `fx_hash_bytes(payload)` over the **now-filled** payload buffer and
 /// stamp it into `StringRef::hash`.
@@ -706,6 +805,99 @@ mod tests {
         assert!(!r.is_null());
         let r_ref = unsafe { &*r };
         assert_eq!(r_ref.len, 0);
+    }
+
+    // ---- #168: N-operand single-allocation concat ------------------
+
+    #[test]
+    fn concat_n_alloc_writes_payloads_in_order() {
+        let a = StringRef::from_static("foo");
+        let b = StringRef::from_static("-bar");
+        let c = StringRef::from_static("-baz");
+        let operands: [*const StringRef; 3] = [a, b, c];
+        let total = 3 + 4 + 4;
+        let r = unsafe { __relon_str_concat_n_alloc(operands.as_ptr(), 3, total) };
+        assert!(!r.is_null());
+        let r_ref = unsafe { &*r };
+        assert_eq!(r_ref.len, total);
+        let payload = unsafe { std::slice::from_raw_parts(r_ref.ptr, r_ref.len) };
+        assert_eq!(payload, b"foo-bar-baz");
+        // hash unsealed per the alloc contract; the inline lowering
+        // calls __relon_str_concat_seal_hash after this returns.
+        assert_eq!(r_ref.hash, 0);
+    }
+
+    #[test]
+    fn concat_n_alloc_handles_four_operands() {
+        // Mirrors the trace-JIT inline cap (MAX_INLINE_STR_CONCAT_N = 4).
+        let a = StringRef::from_static("a");
+        let b = StringRef::from_static("bb");
+        let c = StringRef::from_static("ccc");
+        let d = StringRef::from_static("dddd");
+        let operands: [*const StringRef; 4] = [a, b, c, d];
+        let total = 1 + 2 + 3 + 4;
+        let r = unsafe { __relon_str_concat_n_alloc(operands.as_ptr(), 4, total) };
+        assert!(!r.is_null());
+        let payload = unsafe { std::slice::from_raw_parts((*r).ptr, (*r).len) };
+        assert_eq!(payload, b"abbcccdddd");
+    }
+
+    #[test]
+    fn concat_n_alloc_handles_empty_operand() {
+        let a = StringRef::from_static("");
+        let b = StringRef::from_static("x");
+        let c = StringRef::from_static("");
+        let operands: [*const StringRef; 3] = [a, b, c];
+        let r = unsafe { __relon_str_concat_n_alloc(operands.as_ptr(), 3, 1) };
+        assert!(!r.is_null());
+        let payload = unsafe { std::slice::from_raw_parts((*r).ptr, (*r).len) };
+        assert_eq!(payload, b"x");
+    }
+
+    #[test]
+    fn concat_n_alloc_rejects_null_operand_array() {
+        let r = unsafe { __relon_str_concat_n_alloc(std::ptr::null(), 3, 0) };
+        assert!(r.is_null());
+    }
+
+    #[test]
+    fn concat_n_alloc_rejects_null_inner_operand() {
+        let a = StringRef::from_static("foo");
+        let operands: [*const StringRef; 2] = [a, std::ptr::null()];
+        let r = unsafe { __relon_str_concat_n_alloc(operands.as_ptr(), 2, 3) };
+        assert!(r.is_null());
+    }
+
+    #[test]
+    fn concat_n_alloc_rejects_undersized_total_len() {
+        let a = StringRef::from_static("foo");
+        let b = StringRef::from_static("bar");
+        let operands: [*const StringRef; 2] = [a, b];
+        // total_len = 4 < 6 — the helper bails before overflowing.
+        let r = unsafe { __relon_str_concat_n_alloc(operands.as_ptr(), 2, 4) };
+        assert!(r.is_null());
+    }
+
+    #[test]
+    fn concat_n_alloc_seal_hash_matches_fx_hash() {
+        // Mirror the full inline lowering: alloc + seal_hash. The
+        // sealed digest must match the byte-wise fx_hash reference so
+        // dict IC consumers stay in sync.
+        let a = StringRef::from_static("hi-");
+        let b = StringRef::from_static("there-");
+        let c = StringRef::from_static("you");
+        let operands: [*const StringRef; 3] = [a, b, c];
+        let r = unsafe { __relon_str_concat_n_alloc(operands.as_ptr(), 3, 3 + 6 + 3) };
+        assert!(!r.is_null());
+        unsafe { __relon_str_concat_seal_hash(r) };
+        let r_ref = unsafe { &*r };
+        let payload = unsafe { std::slice::from_raw_parts(r_ref.ptr, r_ref.len) };
+        assert_eq!(payload, b"hi-there-you");
+        assert_eq!(
+            r_ref.hash,
+            relon_trace_abi::hash::fx_hash_bytes(payload),
+            "sealed concat-n hash matches byte-wise fx_hash reference"
+        );
     }
 
     #[test]

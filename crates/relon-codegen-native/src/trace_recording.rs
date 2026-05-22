@@ -230,6 +230,19 @@ impl<'a> TraceRecordingEvaluator<'a> {
             // computes; the operand-stack discipline (`[.., lhs, rhs]`)
             // matches what the recorder's `lower_str_add` expects.
             Op::Add(IrType::String) => self.step_str_concat(op),
+            // #168: walker side of `Op::StrConcatN { operand_count }`.
+            // Pops exactly `operand_count` `*const StringRef` operands
+            // off the stack (`popped[0]` = rhs / topmost,
+            // `popped[N-1]` = lhs / deepest leaf — matches the
+            // recorder's [`relon_trace_recorder::lowering::lower_str_concat_n`]
+            // operand-order contract) and drives the host
+            // `__relon_str_concat` shim chain-style so the recording-
+            // time value stays in lock-step with the installed trace's
+            // single-allocation N-way concat. The recorder lowers to
+            // [`relon_trace_jit::TraceOp::StrConcatN`]; the emitter's
+            // inline path unrolls into `(ptr, len)` loads + per-operand
+            // memcpy through a small alloc helper.
+            Op::StrConcatN { operand_count } => self.step_str_concat_n(op, *operand_count),
             // Integer arithmetic: I32 / I64 / Bool widths all pass
             // through the recorder lowering as cranelift int ops
             // (`binary_arith` rejects only F64). The walker performs
@@ -668,6 +681,70 @@ impl<'a> TraceRecordingEvaluator<'a> {
         if let Some(bytes) = rhs_const_bytes {
             self.recorder.record_const_bytes(rhs.ssa, bytes);
         }
+        match outcome {
+            RecordResult::Ok { value: Some(ssa) }
+            | RecordResult::NeedsGuard {
+                value: Some(ssa), ..
+            } => {
+                self.operand_stack
+                    .push(StackCell::new(result_ptr, ssa, observed));
+                StepOutcome::Continue
+            }
+            _ => StepOutcome::Abort,
+        }
+    }
+
+    /// #168: walker side of `Op::StrConcatN { operand_count }`.
+    /// Operand stack at call time: `[.., leaf0, leaf1, ..., leafN-1]`
+    /// (leftmost source argument pushed first, rightmost on top). Pops
+    /// exactly `operand_count` operands so the recorder's
+    /// [`relon_trace_recorder::lowering::lower_str_concat_n`] sees the
+    /// expected window — feeding the entire operand stack would over-
+    /// pop on the `apply_outcome` side.
+    ///
+    /// `popped[0]` is the topmost / last-pushed (= rightmost), in line
+    /// with `step_arith` / `step_str_concat` conventions; the recorder
+    /// lowering reverses the slice so the resulting `operands` vec runs
+    /// left-to-right through the source-level chain.
+    ///
+    /// Drives the host `__relon_str_concat` shim chain-style to compute
+    /// the recording-time value so the installed trace's N-way single
+    /// allocation yields the same byte payload — keeps the trace-/
+    /// recording-time consistency invariant the F-D7-D fixtures already
+    /// rely on for pair-wise concat.
+    fn step_str_concat_n(&mut self, op: &Op, operand_count: u32) -> StepOutcome {
+        let n = operand_count as usize;
+        if self.operand_stack.len() < n {
+            self.recorder
+                .abort(AbortReason::UnsupportedOp("StrConcatNUnderflow"));
+            return StepOutcome::Abort;
+        }
+        // Pop top-first so `popped[0]` is the rhs / topmost. Matches
+        // `step_stdlib_call`'s convention; the recorder's lowering
+        // reverses the window into source order on the way to the
+        // `TraceOp::StrConcatN` operands vec.
+        let mut popped: Vec<StackCell> = Vec::with_capacity(n);
+        for _ in 0..n {
+            popped.push(self.operand_stack.pop().expect("checked above"));
+        }
+        let inputs: Vec<SsaVar> = popped.iter().map(|c| c.ssa).collect();
+        // Compute the recording-time value by chaining the pair-wise
+        // shim left-to-right over the source-order operands. `popped`
+        // is top-first (rhs first); reverse to walk leftmost → rightmost.
+        let mut acc: *const relon_trace_jit::runtime::StringRef = std::ptr::null();
+        let mut initialised = false;
+        for cell in popped.iter().rev() {
+            let ptr = cell.value as *const relon_trace_jit::runtime::StringRef;
+            if !initialised {
+                acc = ptr;
+                initialised = true;
+            } else {
+                acc = unsafe { relon_trace_jit::runtime::__relon_str_concat(acc, ptr) };
+            }
+        }
+        let result_ptr = acc as u64;
+        let observed = ObservedType::Ptr;
+        let outcome = self.recorder.record_op(op, &inputs, Some(observed));
         match outcome {
             RecordResult::Ok { value: Some(ssa) }
             | RecordResult::NeedsGuard {

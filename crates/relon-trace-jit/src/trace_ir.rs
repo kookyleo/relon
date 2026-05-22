@@ -170,6 +170,40 @@ pub enum TraceOp {
     /// host's sandbox quota.
     StrConcat(SsaVar, SsaVar, SsaVar),
 
+    /// `dst = StrConcatN(operands)` — N-operand single-allocation
+    /// string concatenation. `operands` carry opaque i64 SSAs each
+    /// holding a `*const StringRef` payload pointer; operand order
+    /// matches the IR-side `Op::StrConcatN` operand stack
+    /// (`operands[0]` is the deepest leaf / leftmost source-level
+    /// argument, `operands[N-1]` is the rightmost / top-of-stack).
+    /// The emitter lowers this to a single allocation + N-way
+    /// payload memcpy, returning a freshly-owned `StringRef` whose
+    /// `(ptr, len)` payload is the byte-concatenation of all N
+    /// operand payloads.
+    ///
+    /// Effect: `Pure`. Same rationale as [`Self::StrConcat`]: each
+    /// operand `Arc<str>` payload is immutable, the helper allocates
+    /// a fresh `StringRef`, and there is no host-visible side effect.
+    /// Classifying as `Pure` lets LICM hoist a loop-invariant
+    /// `StrConcatN(a, b, c)` out of an inner loop and lets dead-store
+    /// elision drop the op if `dst` is never consumed.
+    ///
+    /// `operands.len() >= 3` — two-operand concat goes through
+    /// [`Self::StrConcat`] (and its inline short-rhs fast path); the
+    /// IR-level fold pass never emits the degenerate one-operand
+    /// shape. The emitter caps inline lowering at four operands
+    /// today; recorders MUST abort cleanly when the IR-side
+    /// `Op::StrConcatN { operand_count }` exceeds the cap so the
+    /// outer tier router can fall back to the cranelift AOT backend.
+    StrConcatN {
+        /// SSA destination — holds the i64 result `*const StringRef`.
+        dst: SsaVar,
+        /// Operand SSAs in operand-stack order (`[0]` deepest leaf
+        /// → `[N-1]` topmost / last pushed). Length matches the
+        /// IR-side `Op::StrConcatN { operand_count }`.
+        operands: Vec<SsaVar>,
+    },
+
     /// `dst = StrContains(haystack, needle) -> i32 (0/1)` — typed
     /// as `i32` so callers can branch on the result with the
     /// existing `Guard(NotNull(dst))` / `Cmp` machinery. The
@@ -432,6 +466,7 @@ impl TraceOp {
             // `StrContains(s, "x")` out of an inner loop when `s` is
             // loop-invariant (W4's hot pattern).
             | TraceOp::StrConcat(_, _, _)
+            | TraceOp::StrConcatN { .. }
             | TraceOp::StrContains(_, _, _)
             | TraceOp::StrFind(_, _, _)
             | TraceOp::StrSubstring(_, _, _, _)
@@ -481,7 +516,8 @@ impl TraceOp {
 
             TraceOp::ListGet { dst, .. }
             | TraceOp::DictLookup { dst, .. }
-            | TraceOp::DictLookupPrechecked { dst, .. } => Some(*dst),
+            | TraceOp::DictLookupPrechecked { dst, .. }
+            | TraceOp::StrConcatN { dst, .. } => Some(*dst),
 
             TraceOp::Store(_, _, _)
             | TraceOp::Guard(_, _)
@@ -517,6 +553,7 @@ impl TraceOp {
             | TraceOp::StrContains(_, a, b)
             | TraceOp::StrFind(_, a, b)
             | TraceOp::StrGlobMatch(_, a, b) => vec![*a, *b],
+            TraceOp::StrConcatN { operands, .. } => operands.clone(),
             TraceOp::StrSubstring(_, s, start, len) => vec![*s, *start, *len],
             TraceOp::ListGet { list_ptr, idx, .. } => vec![*list_ptr, *idx],
             TraceOp::DictLookup {
@@ -744,6 +781,40 @@ mod tests {
             }
             _ => panic!("variant must round-trip its shape_hash payload"),
         }
+    }
+
+    // ---- #168: N-operand string concat -----------------------------
+
+    #[test]
+    fn str_concat_n_is_pure_with_variable_inputs() {
+        let op = TraceOp::StrConcatN {
+            dst: SsaVar(10),
+            operands: vec![SsaVar(1), SsaVar(2), SsaVar(3)],
+        };
+        // Same effect class as the two-operand `StrConcat` so LICM /
+        // const-fold treat the N-way fold uniformly.
+        assert_eq!(op.effect_class(), EffectClass::Pure);
+        assert_eq!(op.output(), Some(SsaVar(10)));
+        assert_eq!(op.inputs(), vec![SsaVar(1), SsaVar(2), SsaVar(3)]);
+        assert!(!op.is_guard());
+    }
+
+    #[test]
+    fn str_concat_n_inputs_preserve_operand_order() {
+        // Operand order MUST round-trip through `inputs()` because the
+        // emitter relies on `[0]` being the deepest leaf and `[N-1]`
+        // being the top-of-stack rhs. Any reordering inside the helper
+        // would silently swap source-level concat operands.
+        let op = TraceOp::StrConcatN {
+            dst: SsaVar(99),
+            operands: vec![SsaVar(7), SsaVar(8), SsaVar(9), SsaVar(11)],
+        };
+        assert_eq!(
+            op.inputs(),
+            vec![SsaVar(7), SsaVar(8), SsaVar(9), SsaVar(11)]
+        );
+        // `defs()` mirrors `output()` for non-loop-head ops.
+        assert_eq!(op.defs(), vec![SsaVar(99)]);
     }
 
     #[test]

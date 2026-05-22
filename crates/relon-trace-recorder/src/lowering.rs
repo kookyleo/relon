@@ -276,16 +276,14 @@ pub fn lower_op(op: &Op, cx: OpLoweringContext<'_>) -> LowerOutcome {
         // the same code path the stdlib `concat()` call already uses.
         Op::Add(IrType::String) => lower_str_add(cx),
         Op::Add(ty) => binary_arith(cx, *ty, BinaryArith::Add),
-        // #165 — `Op::StrConcatN` is the IR-level fold of a left-
-        // leaning `String + String + ... + String` source chain. The
-        // bytecode VM and cranelift AOT backends have matching single-
-        // allocation lowerings; the trace recorder doesn't yet model
-        // an N-input string concat (would need a new `TraceOp`
-        // variant + inline emitter helper). Abort cleanly so the
-        // outer tier router falls back to cranelift AOT (which has
-        // the single-alloc path) instead of recording an unrecoverable
-        // trace shape.
-        Op::StrConcatN { .. } => LowerOutcome::Abort(AbortReason::UnsupportedOp("StrConcatN")),
+        // #168: `Op::StrConcatN` lowers to the dedicated
+        // [`TraceOp::StrConcatN`] N-input variant. The emitter caps
+        // inline lowering at [`MAX_INLINE_STR_CONCAT_N`] operands —
+        // longer chains abort cleanly here so the outer tier router
+        // falls back to cranelift AOT (which has the single-alloc
+        // path) instead of recording a trace the emitter would
+        // reject at install time.
+        Op::StrConcatN { operand_count } => lower_str_concat_n(cx, *operand_count),
         Op::Sub(ty) => binary_arith(cx, *ty, BinaryArith::Sub),
         Op::Mul(ty) => binary_arith(cx, *ty, BinaryArith::Mul),
         Op::Div(ty) => binary_arith(cx, *ty, BinaryArith::Div),
@@ -708,6 +706,77 @@ fn lower_string_call(fn_index: u32, cx: &OpLoweringContext<'_>) -> Option<LowerO
             })
         }
         _ => None,
+    }
+}
+
+/// #168: maximum `operand_count` the trace-JIT inline emitter accepts
+/// for `Op::StrConcatN`. Chains with more operands abort the recording
+/// cleanly so the outer tier router can fall back to the cranelift AOT
+/// backend (which has its own single-alloc `StrConcatN` lowering).
+///
+/// Sized at 4 because the inline emit unrolls the per-operand `(ptr,
+/// len)` loads + stack-slot pointer stores into straight-line cranelift
+/// IR; past 4 operands the trace tail balloons (each operand costs ~3
+/// loads + 1 store) and the alloc-then-helper-memcpy path stops paying
+/// off vs the bytecode VM's identically-shaped single-alloc concat. The
+/// IR-side fold pass produces `operand_count` values in `2..=N` (with
+/// N=2 already covered by [`TraceOp::StrConcat`]); 4 matches the
+/// cranelift backend's empirically observed inline cap.
+pub const MAX_INLINE_STR_CONCAT_N: u32 = 4;
+
+/// #168: lower `Op::StrConcatN { operand_count }` onto the dedicated
+/// [`TraceOp::StrConcatN`] N-input fast path.
+///
+/// Operand-stack order at call time mirrors `binary_arith`'s rhs-on-top
+/// convention extended to N operands: `inputs[0]` is the rightmost /
+/// last-pushed leaf, `inputs[operand_count - 1]` is the leftmost /
+/// deepest leaf. We reverse into `operands` so `operands[0]` lines up
+/// with the source-level leftmost argument (matches the IR-side
+/// `Op::StrConcatN` operand semantics from `relon-ir/src/ir.rs`).
+///
+/// Emits one [`GuardKind::NotNull`] per operand so the trace deopts
+/// cleanly rather than leaving the emitter to write through a stale
+/// `*const StringRef`.
+///
+/// Bails out for `operand_count < 3` (the AST fold pass never produces
+/// `<= 2`-arity `StrConcatN`; the two-operand shape is covered by the
+/// pair-wise [`TraceOp::StrConcat`] fast path) and for `operand_count >
+/// [`MAX_INLINE_STR_CONCAT_N`]` (per the constant's doc).
+fn lower_str_concat_n(cx: OpLoweringContext<'_>, operand_count: u32) -> LowerOutcome {
+    if operand_count < 3 {
+        // Defensive: the IR-level fold pass guarantees `>= 3`. A
+        // hand-built fragment with `operand_count` of 0 / 1 / 2 would
+        // be malformed — abort cleanly so the recorder surfaces the
+        // shape mismatch instead of writing an empty / pair-wise
+        // `StrConcatN` the emitter can't safely interpret.
+        return LowerOutcome::Abort(AbortReason::UnsupportedOp("StrConcatNTooFewOperands"));
+    }
+    if operand_count > MAX_INLINE_STR_CONCAT_N {
+        return LowerOutcome::Abort(AbortReason::UnsupportedOp("StrConcatNOverCap"));
+    }
+    let n = operand_count as usize;
+    if cx.inputs.len() < n {
+        return LowerOutcome::Abort(AbortReason::UnsupportedOp("StrConcatNUnderflow"));
+    }
+    // Reverse so `operands[0]` is the deepest leaf (leftmost source
+    // arg) and `operands[N-1]` is the topmost rhs — matches the IR-
+    // side `Op::StrConcatN` operand-stack semantics. Keeps the
+    // emitter's per-operand memcpy loop walking left-to-right through
+    // the source-level chain.
+    let operands: Vec<SsaVar> = cx.inputs[..n].iter().rev().copied().collect();
+    let guards_before = operands
+        .iter()
+        .map(|s| GuardKind::NotNull(*s))
+        .collect::<Vec<_>>();
+    LowerOutcome::Emit {
+        op: TraceOp::StrConcatN {
+            dst: cx.fresh_dst,
+            operands,
+        },
+        dst: Some(cx.fresh_dst),
+        guards_before,
+        guards_after: vec![],
+        effect: TraceEffect::Pure,
     }
 }
 
@@ -1360,6 +1429,118 @@ mod tests {
             }
             other => panic!("expected Emit, got {other:?}"),
         }
+    }
+
+    // ---- #168: N-operand StrConcatN lowering ----
+
+    #[test]
+    fn str_concat_n_three_operands_emits_trace_op() {
+        // Stack at call time: [.., leaf0, leaf1, leaf2] with leaf2 on
+        // top. `inputs` are popped top-first by the walker, so
+        // `inputs[0] = leaf2` (rhs / topmost), `inputs[2] = leaf0`
+        // (lhs / deepest leaf). The lowering reverses into operand
+        // order so `operands[0]` is the source-level leftmost arg.
+        let inputs = [SsaVar(30), SsaVar(20), SsaVar(10)]; // top → bottom
+        let outcome = lower_op(
+            &Op::StrConcatN { operand_count: 3 },
+            cx_with(&inputs, SsaVar(99)),
+        );
+        match outcome {
+            LowerOutcome::Emit {
+                op,
+                dst: Some(d),
+                guards_before,
+                effect,
+                ..
+            } => {
+                assert_eq!(d, SsaVar(99));
+                assert_eq!(effect, TraceEffect::Pure);
+                match op {
+                    TraceOp::StrConcatN { dst, operands } => {
+                        assert_eq!(dst, SsaVar(99));
+                        // operands run left-to-right: leaf0, leaf1, leaf2.
+                        assert_eq!(operands, vec![SsaVar(10), SsaVar(20), SsaVar(30)]);
+                    }
+                    other => panic!("expected StrConcatN, got {other:?}"),
+                }
+                // One NotNull guard per operand so the trace deopts on
+                // a stale `*const StringRef` instead of segfaulting.
+                assert_eq!(guards_before.len(), 3);
+                for g in &guards_before {
+                    assert!(matches!(g, GuardKind::NotNull(_)));
+                }
+            }
+            other => panic!("expected Emit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn str_concat_n_four_operands_at_cap_emits_trace_op() {
+        let inputs = [SsaVar(4), SsaVar(3), SsaVar(2), SsaVar(1)];
+        let outcome = lower_op(
+            &Op::StrConcatN { operand_count: 4 },
+            cx_with(&inputs, SsaVar(50)),
+        );
+        match outcome {
+            LowerOutcome::Emit { op, .. } => match op {
+                TraceOp::StrConcatN { dst, operands } => {
+                    assert_eq!(dst, SsaVar(50));
+                    assert_eq!(operands.len(), 4);
+                    assert_eq!(operands, vec![SsaVar(1), SsaVar(2), SsaVar(3), SsaVar(4)]);
+                }
+                other => panic!("expected StrConcatN, got {other:?}"),
+            },
+            other => panic!("expected Emit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn str_concat_n_above_cap_aborts() {
+        // Five operands exceed MAX_INLINE_STR_CONCAT_N — recorder aborts
+        // so the outer tier router falls back to the cranelift AOT
+        // backend's identically shaped single-alloc lowering.
+        let inputs = [SsaVar(5), SsaVar(4), SsaVar(3), SsaVar(2), SsaVar(1)];
+        let outcome = lower_op(
+            &Op::StrConcatN { operand_count: 5 },
+            cx_with(&inputs, SsaVar(99)),
+        );
+        assert!(matches!(
+            outcome,
+            LowerOutcome::Abort(AbortReason::UnsupportedOp("StrConcatNOverCap"))
+        ));
+    }
+
+    #[test]
+    fn str_concat_n_too_few_operands_aborts() {
+        let inputs = [SsaVar(2), SsaVar(1)];
+        let outcome = lower_op(
+            &Op::StrConcatN { operand_count: 2 },
+            cx_with(&inputs, SsaVar(99)),
+        );
+        // operand_count < 3 is a malformed IR fragment (the fold pass
+        // never produces it); rejecting it cleanly keeps the recorder
+        // from emitting a degenerate StrConcatN the emitter can't safely
+        // interpret.
+        assert!(matches!(
+            outcome,
+            LowerOutcome::Abort(AbortReason::UnsupportedOp("StrConcatNTooFewOperands"))
+        ));
+    }
+
+    #[test]
+    fn str_concat_n_underflow_aborts() {
+        // operand_count=3 but only two inputs available — caller is
+        // malformed (walker should have refused to dispatch). Surface as
+        // a distinct abort reason for diagnostic clarity.
+        let inputs = [SsaVar(20), SsaVar(10)];
+        let outcome = lower_op(
+            &Op::StrConcatN { operand_count: 3 },
+            cx_with(&inputs, SsaVar(99)),
+        );
+        assert!(matches!(
+            outcome,
+            LowerOutcome::Abort(AbortReason::UnsupportedOp("StrConcatNUnderflow"))
+        ));
     }
 
     #[test]
