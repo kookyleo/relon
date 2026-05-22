@@ -114,8 +114,10 @@ fn overwrite_replaces_previous_entry() {
     // bytes change. Strict mode would reject the second write
     // because its sha256 no longer matches the stable key — that
     // is exactly the codegen behaviour `source_sha256` was meant
-    // to model, so the overwrite scenario uses TrustOnWrite.
+    // to model, so the overwrite scenario uses HmacRequired with
+    // a fixture HMAC key to authenticate each freshly-written body.
     let key = sha_of(b"src-C-stable-key");
+    let hmac_key = [0x77u8; 32];
     let obj_v1 = b"version-1".to_vec();
     let obj_v2 = b"version-2-now-longer".to_vec();
 
@@ -125,7 +127,7 @@ fn overwrite_replaces_previous_entry() {
         triple,
         &obj_v1,
         &sample_metadata("v1"),
-        None,
+        Some(&hmac_key),
     )
     .unwrap();
     // Re-store with v2 — the atomic rename inside `store` should
@@ -136,13 +138,19 @@ fn overwrite_replaces_previous_entry() {
         triple,
         &obj_v2,
         &sample_metadata("v2"),
-        None,
+        Some(&hmac_key),
     )
     .unwrap();
 
-    let entry = load(dir.path(), key, triple, None, IntegrityMode::TrustOnWrite)
-        .unwrap()
-        .unwrap();
+    let entry = load(
+        dir.path(),
+        key,
+        triple,
+        Some(&hmac_key),
+        IntegrityMode::HmacRequired,
+    )
+    .unwrap()
+    .unwrap();
     assert_eq!(entry.object_bytes, obj_v2);
     assert_eq!(entry.metadata.generator_version, "v2");
 }

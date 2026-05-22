@@ -63,27 +63,39 @@ fn concurrent_writers_atomic_rename() {
     // must produce a syntactically valid file; the loader must
     // observe one of the two payloads (the last writer to rename
     // wins) and never a partial blob.
+    //
+    // The filename stem is a stable source-derived key, not the
+    // object body's own SHA-256, so we use `IntegrityMode::HmacRequired`
+    // + a fixture HMAC key to authenticate whichever blob wins the
+    // rename race.
     let dir = tempdir().unwrap();
     let triple = "x86_64-unknown-linux-gnu";
     let key = sha(b"contended-source");
+    let hmac_key = [0x42u8; 32];
 
     let dir1 = dir.path().to_path_buf();
     let dir2 = dir.path().to_path_buf();
 
     let t1 = thread::spawn(move || {
         let obj_a = vec![0xAAu8; 2048];
-        store(&dir1, key, triple, &obj_a, &meta(), None).unwrap();
+        store(&dir1, key, triple, &obj_a, &meta(), Some(&hmac_key)).unwrap();
     });
     let t2 = thread::spawn(move || {
         let obj_b = vec![0xBBu8; 2048];
-        store(&dir2, key, triple, &obj_b, &meta(), None).unwrap();
+        store(&dir2, key, triple, &obj_b, &meta(), Some(&hmac_key)).unwrap();
     });
     t1.join().unwrap();
     t2.join().unwrap();
 
-    let entry = load(dir.path(), key, triple, None, IntegrityMode::TrustOnWrite)
-        .unwrap()
-        .unwrap();
+    let entry = load(
+        dir.path(),
+        key,
+        triple,
+        Some(&hmac_key),
+        IntegrityMode::HmacRequired,
+    )
+    .unwrap()
+    .unwrap();
     assert_eq!(entry.object_bytes.len(), 2048);
     assert!(
         entry.object_bytes.iter().all(|&b| b == 0xAA)
@@ -98,18 +110,24 @@ fn reads_during_overwrite_never_observe_partial_blob() {
     // hammer the same key. Readers either see the prior valid
     // version (Ok(Some)) or, on Linux, may transiently see NotFound
     // between unlink and rename — either is acceptable.
+    //
+    // The writer reuses a stable source-derived `key` rather than
+    // per-version hashes, so `HmacRequired` + HMAC key is the right
+    // mode: the SHA-256 recompute would mismatch, but the HMAC tag
+    // authenticates each freshly-rewritten body.
     let dir = tempdir().unwrap();
     let triple = "x86_64-unknown-linux-gnu";
     let key = sha(b"churn");
+    let hmac_key = [0x55u8; 32];
     let initial = vec![0xCCu8; 512];
-    store(dir.path(), key, triple, &initial, &meta(), None).unwrap();
+    store(dir.path(), key, triple, &initial, &meta(), Some(&hmac_key)).unwrap();
 
     let dir_path = dir.path().to_path_buf();
     let writer_path = dir_path.clone();
     let writer = thread::spawn(move || {
         for i in 0..20 {
             let body = vec![(0xD0 | (i & 0x0F)) as u8; 512];
-            store(&writer_path, key, triple, &body, &meta(), None).unwrap();
+            store(&writer_path, key, triple, &body, &meta(), Some(&hmac_key)).unwrap();
         }
     });
 
@@ -118,10 +136,13 @@ fn reads_during_overwrite_never_observe_partial_blob() {
         let dir_path = dir_path.clone();
         readers.push(thread::spawn(move || {
             for _ in 0..50 {
-                // TrustOnWrite avoids the sha256 mismatch we would
-                // hit since the writer uses a static `key` rather
-                // than per-version hashes.
-                match load(&dir_path, key, triple, None, IntegrityMode::TrustOnWrite) {
+                match load(
+                    &dir_path,
+                    key,
+                    triple,
+                    Some(&hmac_key),
+                    IntegrityMode::HmacRequired,
+                ) {
                     Ok(Some(entry)) => {
                         assert_eq!(entry.object_bytes.len(), 512);
                     }

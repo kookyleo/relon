@@ -1,10 +1,10 @@
 //! #171 regression: when the per-installation HMAC key cannot be
 //! provisioned, the native cache must refuse to write or read the
 //! object / IR / schema triple. The earlier code path silently fell
-//! back to a `hmac_key = None` write and a `TrustOnWrite` load —
-//! any local attacker with write access to the cache directory
-//! could then drop an unauthenticated ELF and have it dlopen'd into
-//! the host process.
+//! back to a `hmac_key = None` write and a permissive
+//! (now-removed) integrity-mode load — any local attacker with
+//! write access to the cache directory could then drop an
+//! unauthenticated ELF and have it dlopen'd into the host process.
 //!
 //! This test pins `XDG_DATA_HOME` to a read-only directory so
 //! `relon_object_cache::ensure_key()` fails (cannot create the key

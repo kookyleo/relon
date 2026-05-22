@@ -56,10 +56,11 @@
 //! key always falls back to a fresh cold-start build. This closes
 //! the bypass where an attacker who can write `cache_dir` could
 //! drop an unauthenticated `.relon-native-v1` blob and `dlopen` it
-//! into the host: with no key the object-cache loader was previously
-//! using `IntegrityMode::TrustOnWrite`, which skips the SHA-256
+//! into the host: with no key the object-cache loader previously
+//! used a permissive integrity mode that skipped the SHA-256
 //! recompute and offered no other integrity guarantee for the
-//! unsigned trailer.
+//! unsigned trailer. That mode was removed in v0.x once
+//! `HmacRequired` became the only supported HMAC-layer policy.
 //!
 //! The load path uses [`relon_object_cache::IntegrityMode::HmacRequired`]
 //! so the storage layer also refuses to load a blob without a key,
