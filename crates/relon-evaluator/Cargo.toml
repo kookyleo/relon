@@ -27,6 +27,14 @@ serde = { workspace = true, features = ["derive", "rc"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 miette = { workspace = true, features = ["derive"] }
+# v3++ b-2 fix (review-improvement-174): runtime `#import "..." sha256:"..."`
+# integrity verification must apply on every target (including the wasm32
+# playground); otherwise an attacker could bypass pinning simply by running
+# the script in the browser. So sha2/hex are promoted from the previous
+# `cfg(not(wasm32))` block to the top-level [dependencies] table; `ureq`
+# stays target-gated since it still needs native sockets / TLS.
+sha2 = { workspace = true }
+hex = { workspace = true }
 
 # v3+ a-3: HTTPS fetch for remote `#import "https://..."` modules.
 # Restricted to native hosts so the browser playground build of
@@ -34,8 +42,6 @@ miette = { workspace = true, features = ["derive"] }
 # `wasm32-unknown-unknown` without dragging in native sockets / TLS.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 ureq = { workspace = true }
-sha2 = { workspace = true }
-hex = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

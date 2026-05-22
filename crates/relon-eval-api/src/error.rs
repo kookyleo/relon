@@ -493,6 +493,71 @@ pub enum RuntimeError {
         #[label("hash mismatch on remote import")]
         range: TokenRange,
     },
+
+    /// review-improvement-174 (v3++ b-2 fix): the evaluator's `#import`
+    /// path computed the loaded module body's digest and it did not match
+    /// the inline `sha256:"..."` integrity pin written on the directive.
+    ///
+    /// Distinct from [`Self::RemoteImportHashMismatch`] so operators can
+    /// tell apart "remote fetch produced an unexpected body" (caught by
+    /// `RemoteHttpResolver` / analyzer) from "evaluator was handed a
+    /// pre-resolved module body that disagrees with its pin" — the latter
+    /// is the analyzer-bypass attack vector this fix closes.
+    #[error(
+        "import {} hash mismatch: expected {}:{}, got {}",
+        payload.path,
+        payload.algorithm,
+        payload.expected,
+        payload.got
+    )]
+    #[diagnostic(
+        code(relon::eval::import_hash_mismatch),
+        help("The module body the evaluator loaded does not match the inline integrity pin on this `#import`. Either update the pin to the new digest or refuse to trust the source.")
+    )]
+    ImportHashMismatch {
+        payload: Box<ImportHashMismatchDetail>,
+        #[label("import body does not match pinned digest")]
+        range: TokenRange,
+    },
+
+    /// review-improvement-174: the inline pin on a `#import` carried an
+    /// algorithm identifier (`<algo>:"..."`) the evaluator does not know
+    /// how to compute. The analyzer surfaces the same condition as a
+    /// `WorkspaceDiagnostic::ImportHashUnknownAlgorithm`; this variant
+    /// mirrors it for the analyzer-bypass path so the evaluator never
+    /// silently treats an unknown algorithm as "no pin".
+    #[error("import {path} pinned with unsupported hash algorithm `{algorithm}`")]
+    #[diagnostic(
+        code(relon::eval::import_hash_unknown_algorithm),
+        help("Use a supported algorithm (currently `sha256:`). The evaluator refuses to load an `#import` it cannot verify against the pin.")
+    )]
+    ImportHashUnknownAlgorithm {
+        path: String,
+        algorithm: String,
+        #[label("unsupported integrity algorithm")]
+        range: TokenRange,
+    },
+
+    /// review-improvement-174: the inline pin hex was malformed (wrong
+    /// length, non-hex character). Mirrors the analyzer's
+    /// `WorkspaceDiagnostic::ImportHashInvalidHex` for the
+    /// evaluator-direct path; a malformed pin is rejected fail-closed
+    /// because we cannot compare against gibberish.
+    #[error(
+        "import {path} pinned with invalid {algorithm} hex (expected {expected_len} chars, got {got_len})"
+    )]
+    #[diagnostic(
+        code(relon::eval::import_hash_invalid_hex),
+        help("The pin's hex digest is not the expected length or contains non-hex characters. Re-encode the digest as lowercase hex.")
+    )]
+    ImportHashInvalidHex {
+        path: String,
+        algorithm: String,
+        expected_len: usize,
+        got_len: usize,
+        #[label("invalid integrity hex")]
+        range: TokenRange,
+    },
 }
 
 /// Boxed payload for [`RuntimeError::RemoteImportFailed`]. Holds the
@@ -521,5 +586,25 @@ pub struct RemoteImportDenial {
 pub struct RemoteImportHashMismatchDetail {
     pub url: String,
     pub expected: String,
+    pub got: String,
+}
+
+/// Boxed payload for [`RuntimeError::ImportHashMismatch`]. Carries the
+/// raw `#import` path, the algorithm name, and the expected / actual
+/// digests so error rendering can surface enough context for the
+/// operator to decide whether to update the pin or refuse the load.
+#[derive(Debug, Clone)]
+pub struct ImportHashMismatchDetail {
+    /// `#import "..."` path as written in source (may be a local path,
+    /// `std/...`, or a `https://` URL — the integrity check is
+    /// path-agnostic so the analyzer-bypass attack vector cannot find
+    /// a path shape that skips verification).
+    pub path: String,
+    /// Algorithm identifier as it appears in the pin (e.g. `sha256`).
+    pub algorithm: String,
+    /// Lower-case hex digest the pin asserted.
+    pub expected: String,
+    /// Lower-case hex digest the evaluator computed over the loaded
+    /// module body.
     pub got: String,
 }
