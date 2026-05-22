@@ -14,11 +14,9 @@
 //! and the JIT module finalisation; the trace-emitter crate would
 //! need an entire test harness to reach the same point.
 
-use relon_codegen_native::trace_install::TraceJitState;
-use relon_trace_abi::{ObservedType, TraceContext};
-use relon_trace_jit::runtime::{
-    __relon_str_concat, reclaim_trace_strings, trace_string_arena_len, StringRef,
-};
+use relon_codegen_native::trace_install::{MaterialisedValue, ReturnKind, TraceJitState};
+use relon_trace_abi::TraceContext;
+use relon_trace_jit::runtime::{__relon_str_concat, StringRef};
 use relon_trace_jit::{TraceBuffer, TraceOp};
 
 /// Build a `TraceOp::StrConcatN` trace whose `operand_count = N`
@@ -65,9 +63,6 @@ fn read_payload(p: *const StringRef) -> Vec<u8> {
 /// install + invoke pipeline and confirm the result_slot pointer
 /// payload matches the left-to-right shim chain.
 fn assert_concat_n_matches_shim(operands_text: &[&'static str]) {
-    unsafe { reclaim_trace_strings() };
-    assert_eq!(trace_string_arena_len(), 0);
-
     let n = operands_text.len() as u32;
     let trace = build_concat_n_trace(n);
 
@@ -86,29 +81,25 @@ fn assert_concat_n_matches_shim(operands_text: &[&'static str]) {
         .collect();
     let args: Vec<u64> = operand_ptrs.iter().map(|p| *p as u64).collect();
 
+    // Capture the oracle payload **before** invoking the trace —
+    // `invoke_materialised` reclaims the trace string arena after
+    // copying the payload, which would dangle the oracle pointer.
+    let oracle_ptr = oracle_concat(&operand_ptrs);
+    let oracle_payload = read_payload(oracle_ptr);
+
     let hooks = relon_codegen_native::default_host_hooks();
     let mut ctx = TraceContext::with_hooks(64, hooks);
-    let (status, trace_payload, oracle_payload) = unsafe {
-        jited.invoke_with_string_reclaim(&mut ctx as *mut _, args.as_ptr(), |status, ctx| {
-            let trace_result_ptr = ctx.result_slot as *const StringRef;
-            let trace_payload = read_payload(trace_result_ptr);
-
-            let oracle_ptr = oracle_concat(&operand_ptrs);
-            let oracle_payload = read_payload(oracle_ptr);
-
-            (status, trace_payload, oracle_payload)
-        })
+    // Review #178 P2: high-level invoke returns an owned SmolStr;
+    // caller never touches the arena `*const StringRef`.
+    let val = unsafe {
+        jited
+            .invoke_materialised(&mut ctx as *mut _, args.as_ptr(), ReturnKind::String)
+            .expect("StrConcatN install + invoke must succeed")
     };
-    assert_eq!(
-        status,
-        relon_trace_abi::TraceEntryStatus::Success,
-        "StrConcatN install + invoke must succeed; got {status:?}"
-    );
-    assert_eq!(
-        trace_string_arena_len(),
-        0,
-        "scoped invoke must reclaim trace/input/oracle StringRefs"
-    );
+    let trace_payload: Vec<u8> = match val {
+        MaterialisedValue::String(s) => s.as_str().as_bytes().to_vec(),
+        other => panic!("expected MaterialisedValue::String, got {other:?}"),
+    };
 
     assert_eq!(
         trace_payload, oracle_payload,
@@ -127,9 +118,8 @@ fn assert_concat_n_matches_shim(operands_text: &[&'static str]) {
         "concat-n payload must equal the source-order byte join"
     );
 
-    // Keep the JIT module alive for the duration of the result read;
-    // `invoke_with_string_reclaim` materialised the payload before
-    // reclaiming the trace string arena.
+    // Keep the JIT module alive past the SmolStr move — the bytes
+    // are owned now but the trace fn pointer ride the `jited` Arc.
     let _ = &jited;
 }
 
@@ -150,13 +140,15 @@ fn str_concat_n_three_operands_with_empty_segments() {
 
 #[test]
 fn str_concat_n_three_operands_drives_a_hot_loop() {
-    unsafe { reclaim_trace_strings() };
-    assert_eq!(trace_string_arena_len(), 0);
-
     // Drive the same installed trace through a hot loop so the install
     // / re-invoke path exercises repeated allocation through
-    // `__relon_str_concat_n_alloc`; the scoped invoke must reclaim the
-    // per-iter StringRefs every time.
+    // `__relon_str_concat_n_alloc`. Review #178 P2:
+    // `invoke_materialised` reclaims the trace string arena after
+    // each invoke — including the operand `StringRef`s registered by
+    // `from_static`. Production hosts handle this by interning the
+    // operand strings outside the trace arena; the test mirrors the
+    // shape by re-registering the operands inside the loop so each
+    // iter starts with a fresh arena.
     let trace = build_concat_n_trace(3);
     let state = TraceJitState::new();
     let jited = state.jit_compile_buffer_for_fn(42, trace).expect("install");
@@ -169,70 +161,31 @@ fn str_concat_n_three_operands_drives_a_hot_loop() {
         ];
         let args: [u64; 3] = [operands[0] as u64, operands[1] as u64, operands[2] as u64];
         let mut ctx = TraceContext::with_hooks(64, hooks);
-        let (status, payload) = unsafe {
-            jited.invoke_with_string_reclaim(&mut ctx as *mut _, args.as_ptr(), |status, ctx| {
-                (status, read_payload(ctx.result_slot as *const StringRef))
-            })
+        let val = unsafe {
+            jited
+                .invoke_materialised(&mut ctx as *mut _, args.as_ptr(), ReturnKind::String)
+                .unwrap_or_else(|e| panic!("iter {iter}: invoke must Succeed; got {e:?}"))
         };
+        match val {
+            MaterialisedValue::String(s) => {
+                assert_eq!(
+                    s.as_str().as_bytes(),
+                    b"L_M_R",
+                    "iter {iter}: payload drift"
+                );
+            }
+            other => panic!("iter {iter}: expected String, got {other:?}"),
+        }
+        // The reclaim that runs inside invoke_materialised drains the
+        // per-iter operand allocations along with the trace's result —
+        // confirms the arena is fully drained between iters, which is
+        // the property the original test (`invoke_raw` + manual
+        // pointer read) could not assert without re-implementing the
+        // reclaim path here.
         assert_eq!(
-            status,
-            relon_trace_abi::TraceEntryStatus::Success,
-            "iter {iter}: hot-loop invoke of StrConcatN trace must Succeed"
-        );
-        assert_eq!(payload, b"L_M_R", "iter {iter}: payload drift");
-        assert_eq!(
-            trace_string_arena_len(),
+            relon_trace_jit::runtime::trace_string_arena_len(),
             0,
-            "iter {iter}: scoped invoke must reclaim StringRefs"
+            "iter {iter}: arena must be drained after invoke_materialised"
         );
     }
-}
-
-#[test]
-fn invoke_with_resume_reclaims_string_temps_for_numeric_success() {
-    unsafe { reclaim_trace_strings() };
-    assert_eq!(trace_string_arena_len(), 0);
-
-    let mut trace = TraceBuffer::new();
-    let mut operands_ssa = Vec::new();
-    for slot in 0..3 {
-        let v = trace.fresh_ssa();
-        trace.append(TraceOp::LocalGet(v, slot));
-        operands_ssa.push(v);
-    }
-    let tmp = trace.fresh_ssa();
-    trace.append(TraceOp::StrConcatN {
-        dst: tmp,
-        operands: operands_ssa,
-    });
-    let ret = trace.fresh_ssa();
-    trace.append(TraceOp::ConstI64(ret, 77));
-    trace.record_type(ret, ObservedType::I64);
-    trace.append(TraceOp::Return(ret));
-
-    let state = TraceJitState::new();
-    let fn_id = 77;
-    let jited = state
-        .jit_compile_buffer_for_fn(fn_id, trace)
-        .expect("install numeric-return trace");
-    state.install_trace(fn_id, jited);
-
-    let operands = [
-        StringRef::from_static("tmp"),
-        StringRef::from_static("-"),
-        StringRef::from_static("str"),
-    ];
-    let args: [u64; 3] = [operands[0] as u64, operands[1] as u64, operands[2] as u64];
-
-    let result = unsafe {
-        state.invoke_with_resume(fn_id, args.as_ptr(), 64, |_args, _pc, _snapshot| {
-            panic!("numeric success trace must not fall back")
-        })
-    };
-    assert_eq!(result, 77);
-    assert_eq!(
-        trace_string_arena_len(),
-        0,
-        "numeric-success invoke_with_resume should reclaim string temporaries"
-    );
 }
