@@ -47,10 +47,10 @@ pub use optimizer::{
     type_spec::TypeSpec, OptimizerPass, OptimizerPipeline, PassReport,
 };
 pub use runtime::{
-    build_dict_record, build_dict_record_v2, build_flat_list_record, build_string_record,
-    fx_hash_bytes, fx_hash_key_record, fx_hash_key_record_payload, is_ascii_bytes,
-    is_ascii_flag_set, DeoptStateSnapshot, ExternalCallTable, GenericState, RecoverableWriteRecord,
-    TraceContext, DICT_LOOKUP_DEOPT, STRING_RECORD_ASCII_FLAG_BIT, STRING_RECORD_HASH_OFFSET,
+    build_dict_record_v2, build_flat_list_record, build_string_record, fx_hash_bytes,
+    fx_hash_key_record, fx_hash_key_record_payload, is_ascii_bytes, is_ascii_flag_set,
+    DeoptStateSnapshot, ExternalCallTable, GenericState, RecoverableWriteRecord, TraceContext,
+    DICT_LOOKUP_DEOPT, STRING_RECORD_ASCII_FLAG_BIT, STRING_RECORD_HASH_OFFSET,
     STRING_RECORD_LEN_MASK, STRING_RECORD_PAYLOAD_OFFSET,
 };
 pub use trace_ir::{
