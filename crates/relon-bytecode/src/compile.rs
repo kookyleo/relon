@@ -393,9 +393,7 @@ impl<'a> CompileState<'a> {
                 // payload). Keep `current_stack` unchanged so any
                 // tail recipe stays consistent.
             }
-            BcOp::CallNative {
-                arg_count, ret_ty, ..
-            } => {
+            BcOp::CallNative { arg_count, .. } => {
                 // Pops `arg_count` operands, pushes one return slot
                 // tagged as Snapshot — the value can't be derived
                 // from locals / consts alone (a host fn produced it).
@@ -408,7 +406,6 @@ impl<'a> CompileState<'a> {
                 for _ in 0..*arg_count {
                     self.current_stack.pop();
                 }
-                let _ = ret_ty;
                 let snap_idx = self.next_snapshot_idx;
                 self.next_snapshot_idx += 1;
                 self.current_stack.push(StackOrigin::Snapshot(snap_idx));
@@ -815,9 +812,7 @@ impl<'a> CompileState<'a> {
             Op::ConstListString { idx: _, elements } => {
                 self.emit_with_effect(BcOp::ConstI64(elements.len() as i64), call_pc);
             }
-            Op::ReadStringLen => {
-                let _ = call_pc;
-            }
+            Op::ReadStringLen => {}
             // Nested call: recurse via the public path (bumps inline
             // depth + reserves a fresh scratch block).
             Op::Call {
@@ -852,12 +847,11 @@ impl<'a> CompileState<'a> {
 
     fn compile_if(
         &mut self,
-        result_ty: IrType,
+        _result_ty: IrType,
         then_body: &[TaggedOp],
         else_body: &[TaggedOp],
         if_pc: ExternalPc,
     ) -> Result<(), BcCompileError> {
-        let _ = result_ty;
         if then_body.is_empty() && else_body.is_empty() {
             return Err(BcCompileError::EmptyArm { pc: if_pc });
         }
@@ -923,8 +917,6 @@ impl<'a> CompileState<'a> {
                 _ => unreachable!("Block fixup pointed at a non-jump op"),
             }
         }
-        let _ = frame.kind;
-        let _ = frame.target;
         Ok(())
     }
 

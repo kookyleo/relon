@@ -412,6 +412,15 @@ fn encode_value_for_ret(
 /// across the host fn's execution; the empty stub is trivially safe.
 struct BytecodeNativeFnCaps;
 
+/// Cached single-instance `Arc<dyn NativeFnCaps>` for the bytecode VM.
+/// The struct is a zero-sized unit type with no per-call state, so
+/// every dispatch can clone the same `Arc` (refcount bump) instead of
+/// allocating a fresh `Arc::new(BytecodeNativeFnCaps)` per `CallNative`.
+fn bytecode_native_caps() -> Arc<dyn NativeFnCaps> {
+    static CAPS: std::sync::OnceLock<Arc<dyn NativeFnCaps>> = std::sync::OnceLock::new();
+    Arc::clone(CAPS.get_or_init(|| Arc::new(BytecodeNativeFnCaps) as Arc<dyn NativeFnCaps>))
+}
+
 impl NativeFnCaps for BytecodeNativeFnCaps {
     fn call_relon(
         &self,
@@ -1097,7 +1106,6 @@ impl BytecodeVm {
                 let mut memory = VmMemory::default();
                 let mut pc: usize = 0;
                 let mut steps: u64 = 0;
-                let mut last_bc_idx: usize = 0;
 
                 // Capability pre-checks: the consult helpers short-
                 // circuit when no gate is installed, so the inert
@@ -1145,7 +1153,6 @@ impl BytecodeVm {
                             ops: func.ops.len(),
                         });
                     }
-                    last_bc_idx = pc;
                     match self.dispatch_one(
                         func,
                         &func.ops[pc],
@@ -1176,8 +1183,6 @@ impl BytecodeVm {
                             // compiler synthesises it but never reads
                             // it back). Read the slot if the schema
                             // reserved one, otherwise return `v`.
-                            let _ = last_bc_idx;
-                            let _ = steps;
                             if return_slot_count > 0 {
                                 return Ok(locals
                                     .get(return_slot_idx as usize)
@@ -1536,7 +1541,7 @@ impl BytecodeVm {
                         packed.push(Value::Int(slot as i64));
                     }
                     packed.reverse();
-                    let caps: Arc<dyn NativeFnCaps> = Arc::new(BytecodeNativeFnCaps);
+                    let caps = bytecode_native_caps();
                     let args = NativeArgs::from_positional(packed, caps);
                     let returned = func.call(args, TokenRange::default()).map_err(|e| {
                         // Host-fn failure surfaces as `Unsupported` —
@@ -1950,6 +1955,8 @@ enum StepOutcome {
 
 #[inline(always)]
 fn pop(stack: &mut Vec<VmValue>, bc_idx: usize) -> Result<VmValue, BcVmError> {
+    // ok_or_else defers the error struct construction to the cold
+    // path — the success arm (every hot arith / cmp pop) skips it.
     stack.pop().ok_or(BcVmError::StackUnderflow { bc_idx })
 }
 
