@@ -139,6 +139,17 @@ impl ErrorReport {
     }
 }
 
+/// The crate-wide `serde_wasm_bindgen` serializer config. Every
+/// wasm-bindgen entry that returns a Rust struct to JS must route
+/// through this helper so the `Vec<HashMap<_,_>>` shaped payloads
+/// (`spans`, `diagnostics`, etc.) deserialize on the JS side as
+/// JS objects rather than `Map` instances — without the
+/// `serialize_maps_as_objects(true)` flag downstream `err.kind` /
+/// `diag.range` field reads would silently fail.
+fn js_serializer() -> serde_wasm_bindgen::Serializer {
+    serde_wasm_bindgen::Serializer::new().serialize_maps_as_objects(true)
+}
+
 fn err_to_js(report: ErrorReport) -> JsValue {
     // Fallback to the message string if serialization itself fails, so
     // the JS side always sees *something* throwable rather than an
@@ -149,7 +160,7 @@ fn err_to_js(report: ErrorReport) -> JsValue {
     // `Vec<SpanInfo>` (already a JS array), but the wrapping struct is
     // serialised as a JS object — without the flag, downstream
     // `err.kind` access on the JS side would fail.
-    let serializer = serde_wasm_bindgen::Serializer::new().serialize_maps_as_objects(true);
+    let serializer = js_serializer();
     match report.serialize(&serializer) {
         Ok(value) => value,
         Err(_) => JsValue::from_str(&report.message),
@@ -341,7 +352,7 @@ pub fn evaluate(sources: JsValue, entry: &str, args: JsValue) -> Result<JsValue,
             // which is also what the README-documented contract implies
             // ("projected JSON result"). Flip the flag on the serializer
             // so maps round-trip as `{...}`.
-            let serializer = serde_wasm_bindgen::Serializer::new().serialize_maps_as_objects(true);
+            let serializer = js_serializer();
             value.serialize(&serializer).map_err(|err| {
                 err_to_js(ErrorReport::invalid_input(format!(
                     "result is not JS-serialisable: {err}"
@@ -693,7 +704,7 @@ pub fn goto_definition(
         Some(t) => t,
         None => return Ok(JsValue::NULL),
     };
-    let serializer = serde_wasm_bindgen::Serializer::new().serialize_maps_as_objects(true);
+    let serializer = js_serializer();
     target.serialize(&serializer).map_err(|err| {
         err_to_js(ErrorReport::invalid_input(format!(
             "goto_definition result is not JS-serialisable: {err}"
@@ -831,7 +842,7 @@ pub fn hover(sources: JsValue, entry: &str, line: u32, character: u32) -> Result
         Some(r) => r,
         None => return Ok(JsValue::NULL),
     };
-    let serializer = serde_wasm_bindgen::Serializer::new().serialize_maps_as_objects(true);
+    let serializer = js_serializer();
     result.serialize(&serializer).map_err(|err| {
         err_to_js(ErrorReport::invalid_input(format!(
             "hover result is not JS-serialisable: {err}"
@@ -872,7 +883,7 @@ pub fn signature_help(
         Some(r) => r,
         None => return Ok(JsValue::NULL),
     };
-    let serializer = serde_wasm_bindgen::Serializer::new().serialize_maps_as_objects(true);
+    let serializer = js_serializer();
     result.serialize(&serializer).map_err(|err| {
         err_to_js(ErrorReport::invalid_input(format!(
             "signature_help result is not JS-serialisable: {err}"
@@ -920,7 +931,7 @@ pub fn code_actions(
 ) -> Result<JsValue, JsValue> {
     let sources = decode_sources(sources).map_err(err_to_js)?;
     let result = code_actions_internal(&sources, entry, line, character).unwrap_or_default();
-    let serializer = serde_wasm_bindgen::Serializer::new().serialize_maps_as_objects(true);
+    let serializer = js_serializer();
     result.serialize(&serializer).map_err(|err| {
         err_to_js(ErrorReport::invalid_input(format!(
             "code_actions result is not JS-serialisable: {err}"
@@ -992,7 +1003,7 @@ pub struct DocumentSymbolWire {
 pub fn document_symbols(sources: JsValue, entry: &str) -> Result<JsValue, JsValue> {
     let sources = decode_sources(sources).map_err(err_to_js)?;
     let result = document_symbols_internal(&sources, entry).unwrap_or_default();
-    let serializer = serde_wasm_bindgen::Serializer::new().serialize_maps_as_objects(true);
+    let serializer = js_serializer();
     result.serialize(&serializer).map_err(|err| {
         err_to_js(ErrorReport::invalid_input(format!(
             "document_symbols result is not JS-serialisable: {err}"
@@ -1081,7 +1092,7 @@ pub fn prepare_rename(
 ) -> Result<JsValue, JsValue> {
     let sources = decode_sources(sources).map_err(err_to_js)?;
     let result = prepare_rename_internal(&sources, entry, line, character);
-    let serializer = serde_wasm_bindgen::Serializer::new().serialize_maps_as_objects(true);
+    let serializer = js_serializer();
     result.serialize(&serializer).map_err(|err| {
         err_to_js(ErrorReport::invalid_input(format!(
             "prepare_rename result is not JS-serialisable: {err}"
@@ -1180,7 +1191,7 @@ pub fn rename_symbol(
             new_text: e.new_text,
         })
         .collect();
-    let serializer = serde_wasm_bindgen::Serializer::new().serialize_maps_as_objects(true);
+    let serializer = js_serializer();
     wire.serialize(&serializer).map_err(|err| {
         err_to_js(ErrorReport::invalid_input(format!(
             "rename result is not JS-serialisable: {err}"
@@ -1209,7 +1220,7 @@ pub struct InlayHintWire {
 pub fn inlay_hints(sources: JsValue, entry: &str) -> Result<JsValue, JsValue> {
     let sources = decode_sources(sources).map_err(err_to_js)?;
     let result = inlay_hints_internal(&sources, entry).unwrap_or_default();
-    let serializer = serde_wasm_bindgen::Serializer::new().serialize_maps_as_objects(true);
+    let serializer = js_serializer();
     result.serialize(&serializer).map_err(|err| {
         err_to_js(ErrorReport::invalid_input(format!(
             "inlay_hints result is not JS-serialisable: {err}"
@@ -1273,7 +1284,7 @@ pub fn find_references(
             Some(r) => r,
             None => return Ok(JsValue::NULL),
         };
-    let serializer = serde_wasm_bindgen::Serializer::new().serialize_maps_as_objects(true);
+    let serializer = js_serializer();
     result.serialize(&serializer).map_err(|err| {
         err_to_js(ErrorReport::invalid_input(format!(
             "find_references result is not JS-serialisable: {err}"
@@ -1374,7 +1385,7 @@ pub fn complete(
 ) -> Result<JsValue, JsValue> {
     let sources = decode_sources(sources).map_err(err_to_js)?;
     let results = complete_internal(&sources, entry, line, character).unwrap_or_default();
-    let serializer = serde_wasm_bindgen::Serializer::new().serialize_maps_as_objects(true);
+    let serializer = js_serializer();
     results.serialize(&serializer).map_err(|err| {
         err_to_js(ErrorReport::invalid_input(format!(
             "complete result is not JS-serialisable: {err}"

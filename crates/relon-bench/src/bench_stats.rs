@@ -274,6 +274,7 @@ pub fn collect_group_stats(group_root: &Path) -> Result<Vec<RowStats>, BenchStat
 /// `Throughput::Elements(N)` and N elements happen per closure call).
 /// Otherwise columns are per closure call.
 pub fn render_markdown_table(rows: &[RowStats]) -> String {
+    use std::fmt::Write as _;
     let mut out = String::new();
     out.push_str("| Row | p50 (ns/elem) | p90 | p99 | p99.9 | max | samples | elements/call |\n");
     out.push_str("|---|---|---|---|---|---|---|---|\n");
@@ -287,8 +288,9 @@ pub fn render_markdown_table(rows: &[RowStats]) -> String {
             Some(n) => format!("{n}"),
             None => "(per-call)".to_string(),
         };
-        out.push_str(&format!(
-            "| `{}` | {:.4} | {:.4} | {:.4} | {:.4} | {:.4} | {} | {} |\n",
+        let _ = writeln!(
+            out,
+            "| `{}` | {:.4} | {:.4} | {:.4} | {:.4} | {:.4} | {} | {} |",
             row.row,
             p50,
             p90,
@@ -297,7 +299,7 @@ pub fn render_markdown_table(rows: &[RowStats]) -> String {
             max,
             row.per_sample_ns.len(),
             elem,
-        ));
+        );
     }
     out
 }
