@@ -2,6 +2,21 @@
 
 ## [Unreleased] — Schema-rooted dispatch (trait-bound foundation)
 
+### Breaking: `relon-object-cache` — `IntegrityMode::TrustOnWrite` removed
+
+`relon_object_cache::IntegrityMode::TrustOnWrite` skipped both the
+SHA-256 recompute and the HMAC enforcement, making it a footgun for
+callers who hashed a source-derived key into the filename stem and
+forgot to pass an HMAC key — the loader would then silently downgrade
+to a no-integrity read (the exact bypass #171 closed at the
+integration layer). v0.x permits the breaking removal: any external
+caller still on `TrustOnWrite` should migrate to
+`IntegrityMode::HmacRequired` with a real per-installation HMAC key
+(`relon_object_cache::ensure_key()`), which authenticates the entire
+on-disk body via the trailing HMAC tag instead. No production caller
+inside the workspace used `TrustOnWrite`; the variant existed only to
+back legacy tests, which have been rewritten against `HmacRequired`.
+
 ### Language: strict mode by default, opt out via `#relaxed` / `#unstrict`
 
 Relon's analyzer runs in strict static-inference mode by default.

@@ -248,9 +248,6 @@ pub fn store(
 ///   metadata) for tamper detection. Strict's SHA-256 recompute is
 ///   skipped because the filename stem is a source-derived key, not
 ///   the object body's own hash.
-/// - [`IntegrityMode::TrustOnWrite`] — legacy alias of
-///   `HmacRequired` minus the "HMAC mandatory" enforcement. New
-///   production callers must not use this variant.
 pub fn load(
     cache_dir: &Path,
     source_sha256: [u8; 32],

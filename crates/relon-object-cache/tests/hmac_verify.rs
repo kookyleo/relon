@@ -53,9 +53,11 @@ fn hmac_rejects_tampered_object_byte() {
 
     let path = store(dir.path(), src, triple, &object, &sample_meta(), Some(&key)).unwrap();
 
-    // Flip exactly one byte deep in the object body so the
-    // SHA-256 check does not catch us first when we run with
-    // TrustOnWrite — HMAC must catch the change regardless.
+    // Flip exactly one byte deep in the object body so the SHA-256
+    // check does not catch us first — HMAC must catch the change
+    // regardless. `HmacRequired` skips the recompute (the filename
+    // stem is still the object's own digest here, but the test is
+    // about the HMAC layer's tamper detection in isolation).
     let mut bytes = std::fs::read(&path).unwrap();
     let target = 4 + 4 + 1 + "x86_64-unknown-linux-gnu".len() + 4 + 3;
     bytes[target] ^= 0x01;
@@ -66,7 +68,7 @@ fn hmac_rejects_tampered_object_byte() {
         src,
         triple,
         Some(&key),
-        IntegrityMode::TrustOnWrite,
+        IntegrityMode::HmacRequired,
     )
     .expect_err("tampered byte must surface a HMAC mismatch");
     assert!(matches!(err, CacheError::HmacMismatch), "got {err:?}");

@@ -1,6 +1,6 @@
 //! Integrity-mode selector for [`crate::storage::load`].
 //!
-//! Three modes exist:
+//! Two modes exist:
 //!
 //! - [`IntegrityMode::Strict`] (default) — recompute SHA-256 over
 //!   the object bytes on every load and compare against the value
@@ -18,14 +18,21 @@
 //!   object bytes + metadata), so in-place tampering is still
 //!   caught — just by the HMAC layer instead of by SHA-256.
 //!
-//! - [`IntegrityMode::TrustOnWrite`] — deprecated alias retained
-//!   for tests; behaves identically to `HmacRequired` minus the
-//!   "HMAC mandatory" enforcement. New production callers must
-//!   prefer `HmacRequired`.
-//!
 //! Production callers should use `Strict` when they hash the object
 //! into the filename, or `HmacRequired` when they hash something
 //! else into the filename and rely on HMAC for integrity.
+//!
+//! ## Removed: `TrustOnWrite`
+//!
+//! Earlier revisions exposed a third variant, `TrustOnWrite`, that
+//! skipped both the SHA-256 recompute *and* the HMAC enforcement.
+//! It was a footgun: any caller who hashed a source-derived key
+//! into the filename stem (rather than the object body's own
+//! digest) and forgot to pass an HMAC key would silently downgrade
+//! to a no-integrity load, the exact bypass #171 closed at the
+//! integration layer. The variant has been removed in v0.x — use
+//! `HmacRequired` (with a real HMAC key) for the same use case
+//! while keeping tamper detection.
 
 use crate::error::CacheError;
 
@@ -42,10 +49,6 @@ pub enum IntegrityMode {
     /// who hash a source-derived key (not the object body) into the
     /// filename stem.
     HmacRequired,
-    /// Skip the recompute; trust the writer. Retained for legacy
-    /// tests only — new code must use [`IntegrityMode::HmacRequired`]
-    /// so the loader cannot silently fall back to no-integrity mode.
-    TrustOnWrite,
 }
 
 impl IntegrityMode {

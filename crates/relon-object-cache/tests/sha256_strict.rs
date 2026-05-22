@@ -56,22 +56,34 @@ fn strict_rejects_mismatched_filename_hash() {
 }
 
 #[test]
-fn trust_on_write_skips_recompute() {
-    // Same setup as above; TrustOnWrite skips the recompute, so
-    // the load must succeed even though the filename hash and the
-    // object's hash disagree.
+fn hmac_required_skips_recompute_when_filename_is_source_derived() {
+    // Mirror of the `trust_on_write_skips_recompute` test that was
+    // removed alongside the `TrustOnWrite` variant: when the
+    // filename stem is a source-derived key (not the object body's
+    // own SHA-256), the loader must skip the recompute. With
+    // `HmacRequired` the HMAC tag is what authenticates the body —
+    // the SHA-256 mismatch we'd otherwise hit is bypassed.
     let dir = tempdir().unwrap();
     let triple = "x86_64-unknown-linux-gnu";
     let object = b"body-B".to_vec();
-    let lied_key = sha(b"unrelated-source");
-    store(dir.path(), lied_key, triple, &object, &meta(), None).unwrap();
+    let src_key = sha(b"unrelated-source");
+    let hmac_key = [0x33u8; 32];
+    store(
+        dir.path(),
+        src_key,
+        triple,
+        &object,
+        &meta(),
+        Some(&hmac_key),
+    )
+    .unwrap();
 
     let entry = load(
         dir.path(),
-        lied_key,
+        src_key,
         triple,
-        None,
-        IntegrityMode::TrustOnWrite,
+        Some(&hmac_key),
+        IntegrityMode::HmacRequired,
     )
     .unwrap()
     .unwrap();
