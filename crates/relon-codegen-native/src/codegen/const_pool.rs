@@ -46,6 +46,23 @@ use crate::error::CraneliftError;
 pub(super) struct ConstPool {
     /// String pool: `idx -> byte offset within `bytes`.
     pub(super) string_offsets: HashMap<u32, u32>,
+    /// Tier 1b cached `fx_hash_bytes(payload)` for each
+    /// `Op::ConstString` payload. Populated in parallel with
+    /// [`Self::string_offsets`] at IR-walk time so a future trace-JIT
+    /// consumer that wants to cross a const string into a dict key
+    /// can read the digest off the pool without re-running the
+    /// byte-wise hash loop. Kept as a side table (rather than packed
+    /// into the wire-layout header) so the existing stdlib body
+    /// `+4`-offset payload reads (concat / substring / upper / …)
+    /// keep working byte-for-byte against the legacy
+    /// `[len:u32][payload]` const-record shape. The widened header
+    /// layout used on dict-key records (#149) is documented as the
+    /// Tier 1b target for the cranelift AOT path, but the wire
+    /// migration has to land alongside a coordinated rewrite of the
+    /// stdlib bodies' payload offsets and the
+    /// `EmitTailRecordFromAbsoluteAddr` strip-header copy — see the
+    /// follow-up tracked in the #164 stage report.
+    pub(super) string_hashes: HashMap<u32, u64>,
     /// List<Int> pool.
     pub(super) list_int_offsets: HashMap<u32, u32>,
     /// List<Float> pool.
@@ -128,6 +145,14 @@ impl OpVisitor for ConstPool {
         self.bytes.extend_from_slice(&len.to_le_bytes());
         self.bytes.extend_from_slice(value.as_bytes());
         self.string_offsets.insert(idx, off);
+        // Tier 1b: stamp `fx_hash_bytes(payload)` into the parallel
+        // side table at IR-walk time. The wire-layout side stays on
+        // the legacy `[len:u32][payload]` shape (see the
+        // `string_hashes` doc for why); the cached digest sits next to
+        // the offset so a future consumer that wants to cross a const
+        // string into a dict key reads it for free.
+        self.string_hashes
+            .insert(idx, relon_trace_abi::hash::fx_hash_bytes(value.as_bytes()));
         Ok(())
     }
 
@@ -695,6 +720,35 @@ mod tests {
         assert_eq!(&pool.bytes[4..6], b"hi");
         assert_eq!(&pool.bytes[8..12], &5u32.to_le_bytes());
         assert_eq!(&pool.bytes[12..17], b"world");
+    }
+
+    /// Tier 1b: visit_const_string pre-stamps `fx_hash_bytes(payload)`
+    /// into the side table for every unique idx. Round-trips against
+    /// the canonical `relon-trace-abi` reference so producer + consumer
+    /// can never drift apart.
+    #[test]
+    fn opvisitor_caches_fx_hash_for_each_const_string() {
+        let module = synth_module(vec![
+            tagged(Op::ConstString {
+                idx: 0,
+                value: "alpha".into(),
+            }),
+            tagged(Op::ConstString {
+                idx: 1,
+                value: "caf\u{00E9}".into(),
+            }),
+        ]);
+        let pool = ConstPool::from_module(&module).unwrap();
+        assert_eq!(
+            pool.string_hashes.get(&0).copied(),
+            Some(relon_trace_abi::hash::fx_hash_bytes(b"alpha")),
+            "ASCII payload hash must match fx_hash_bytes reference"
+        );
+        assert_eq!(
+            pool.string_hashes.get(&1).copied(),
+            Some(relon_trace_abi::hash::fx_hash_bytes("caf\u{00E9}".as_bytes())),
+            "non-ASCII payload hash must match fx_hash_bytes reference"
+        );
     }
 
     /// Duplicate `ConstString` idx is a no-op (mirrors the legacy
