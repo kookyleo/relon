@@ -4124,6 +4124,13 @@ mod intern_tests {
         lowered.module
     }
 
+    /// Re-export `lower_source` under a stable name so sibling test
+    /// modules can drive the same parse + analyze + lower pipeline
+    /// without duplicating the boilerplate.
+    pub(super) fn test_helpers_lower_source(src: &str) -> Module {
+        lower_source(src)
+    }
+
     /// Same-bytes string literals inside one function dedup to a
     /// single idx. Pre-#151 the per-`LowerCtx` counter minted a
     /// fresh idx for each occurrence and the const-pool laid out
@@ -4210,6 +4217,125 @@ mod intern_tests {
         assert!(
             values.iter().any(|v| v.as_str() == "b"),
             "missing `b`, got {values:?}"
+        );
+    }
+}
+
+// =====================================================================
+// #165 — `Op::StrConcatN` chain-fold invariants.
+//
+// End-to-end checks that drive the analyzer + lowering pipeline so the
+// fold gate observes the same AST shapes real callers hit. The
+// invariants verify both the happy path (a 3+ leaf String chain
+// collapses to one `StrConcatN`) and the rejection paths (Dict /
+// Schema merge chains and two-operand pair-wise concat keep their
+// existing shape).
+// =====================================================================
+
+#[cfg(test)]
+mod str_concat_chain_tests {
+    use super::*;
+
+    /// Walk `funcs` flattening every IR op into a single Vec for
+    /// shape-pattern assertions. Recurses into `If` / `Block` / `Loop`
+    /// arms so a chain inside a branch still surfaces.
+    fn flatten_ops(funcs: &[Func]) -> Vec<Op> {
+        fn walk(body: &[TaggedOp], out: &mut Vec<Op>) {
+            for t in body {
+                out.push(t.op.clone());
+                match &t.op {
+                    Op::If {
+                        then_body,
+                        else_body,
+                        ..
+                    } => {
+                        walk(then_body, out);
+                        walk(else_body, out);
+                    }
+                    Op::Block { body, .. } => walk(body, out),
+                    Op::Loop { body, .. } => walk(body, out),
+                    _ => {}
+                }
+            }
+        }
+        let mut acc = Vec::new();
+        for f in funcs {
+            walk(&f.body, &mut acc);
+        }
+        acc
+    }
+
+    /// Four-leaf left-leaning chain `"a" + "b" + "c" + "d"` folds to
+    /// one `Op::StrConcatN { operand_count: 4 }` and emits zero
+    /// `Op::Add(IrType::String)` in the same function.
+    #[test]
+    fn four_way_string_chain_folds_to_str_concat_n() {
+        let src = "#main() -> String\n\"a\" + \"b\" + \"c\" + \"d\"";
+        let module = super::intern_tests::test_helpers_lower_source(src);
+        let ops = flatten_ops(&module.funcs);
+        let concat_n_args: Vec<u32> = ops
+            .iter()
+            .filter_map(|op| match op {
+                Op::StrConcatN { operand_count } => Some(*operand_count),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(concat_n_args, vec![4], "expected one StrConcatN{{4}}");
+        // Pair-wise `Op::Add(IrType::String)` must be elided — every
+        // String add was absorbed into the chain fold.
+        let leftover_str_adds = ops
+            .iter()
+            .filter(|op| matches!(op, Op::Add(IrType::String)))
+            .count();
+        assert_eq!(
+            leftover_str_adds, 0,
+            "fold left behind {leftover_str_adds} pair-wise Op::Add(String) ops"
+        );
+    }
+
+    /// Three-leaf chain also fires — the minimal shape the fold gate
+    /// requires (LHS itself is an Add).
+    #[test]
+    fn three_way_string_chain_folds_to_str_concat_n() {
+        let src = "#main() -> String\n\"a\" + \"b\" + \"c\"";
+        let module = super::intern_tests::test_helpers_lower_source(src);
+        let ops = flatten_ops(&module.funcs);
+        let concat_n_count = ops
+            .iter()
+            .filter(|op| matches!(op, Op::StrConcatN { operand_count: 3 }))
+            .count();
+        assert_eq!(concat_n_count, 1, "expected one StrConcatN{{3}}");
+        assert_eq!(
+            ops.iter()
+                .filter(|op| matches!(op, Op::Add(IrType::String)))
+                .count(),
+            0,
+        );
+    }
+
+    /// Two-leaf concat keeps the existing `Op::Add(IrType::String)`
+    /// shape — the fold gate requires `lhs` to be a Binary(Add), which
+    /// a single `"a" + "b"` does not satisfy. Backends that don't yet
+    /// support the pair-wise variant still bail to the tree-walker via
+    /// the existing fallback envelope.
+    #[test]
+    fn two_way_string_concat_stays_on_add_string() {
+        let src = "#main() -> String\n\"a\" + \"b\"";
+        let module = super::intern_tests::test_helpers_lower_source(src);
+        let ops = flatten_ops(&module.funcs);
+        assert_eq!(
+            ops.iter()
+                .filter(|op| matches!(op, Op::StrConcatN { .. }))
+                .count(),
+            0,
+            "two-leaf concat should not fold to StrConcatN"
+        );
+        assert_eq!(
+            ops.iter()
+                .filter(|op| matches!(op, Op::Add(IrType::String)))
+                .count(),
+            1,
+            "expected one Op::Add(IrType::String) for the pair-wise concat"
         );
     }
 }

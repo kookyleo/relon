@@ -1898,6 +1898,42 @@ fn str_concat_produces_combined_length() {
     assert_eq!(outcome.value, Some(6));
 }
 
+/// #165 — `BcOp::StrConcatN` joins N operand handles with a single
+/// arena alloc. Pin the four-leaf chain `"foo" + "bar" + "baz" +
+/// "qux"` (12 bytes) and assert the resulting code-point count.
+#[test]
+fn str_concat_n_joins_four_handles_with_single_alloc() {
+    use relon_bytecode::op::{BcFunction, BcOp};
+
+    let bc = BcFunction {
+        ops: vec![
+            BcOp::StrConst { idx: 0 },
+            BcOp::StrConst { idx: 1 },
+            BcOp::StrConst { idx: 2 },
+            BcOp::StrConst { idx: 3 },
+            BcOp::StrConcatN { argc: 4 },
+            BcOp::StrLen,
+            BcOp::Return,
+        ],
+        locals: 0,
+        ir_pc_map: vec![1, 2, 3, 4, 5, 6, 7],
+        string_pool: vec![
+            "foo".to_string(),
+            "bar".to_string(),
+            "baz".to_string(),
+            "qux".to_string(),
+        ],
+        stack_recipe: vec![vec![]; 7],
+        fn_id: None,
+        closure_bodies: Vec::new(),
+    };
+    let vm = BytecodeVm::new(BcVmConfig::default());
+    let outcome = vm.invoke(&bc, &[]);
+    assert!(outcome.error.is_none(), "concat-n completes");
+    // 3 + 3 + 3 + 3 = 12 code points.
+    assert_eq!(outcome.value, Some(12));
+}
+
 /// `StrEq` byte-compares two string slots — same content from the
 /// same pool entry returns 1; distinct content returns 0.
 #[test]
