@@ -218,6 +218,16 @@ fn rewrite_inputs(op: &mut TraceOp, alias: &HashMap<SsaVar, SsaVar>) -> usize {
             swap!(a);
             swap!(b);
         }
+        // #168: variable-arity sibling of `StrConcat`. Every operand
+        // SSA participates in the load-forward swap loop just like the
+        // two-operand variant — the inline emitter lowers each operand
+        // to a separate `(ptr, len)` load, so an alias resolution on
+        // operand[k] still flows through to the per-operand memcpy.
+        TraceOp::StrConcatN { operands, .. } => {
+            for o in operands {
+                swap!(o);
+            }
+        }
         TraceOp::StrSubstring(_dst, s, start, len) => {
             swap!(s);
             swap!(start);
