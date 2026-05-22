@@ -461,6 +461,19 @@ impl<'a> CompileState<'a> {
                 self.next_snapshot_idx += 1;
                 self.current_stack.push(StackOrigin::Snapshot(snap_idx));
             }
+            BcOp::StrConcatN { argc } => {
+                // #165 — pops `argc` string handles in source order
+                // (deepest leaf is bottom-most operand), pushes a
+                // single fresh handle. Snapshot-tagged because the
+                // arena slot's numeric value can't be re-derived from
+                // consts / locals after the alloc.
+                for _ in 0..*argc {
+                    self.current_stack.pop();
+                }
+                let snap_idx = self.next_snapshot_idx;
+                self.next_snapshot_idx += 1;
+                self.current_stack.push(StackOrigin::Snapshot(snap_idx));
+            }
             BcOp::MakeDict { len } => {
                 // Pops `len * 2` slots (key/value pairs), pushes one
                 // dict handle.
@@ -1284,6 +1297,25 @@ impl<'a> OpVisitor for CompileState<'a> {
         let pc = self.current_pc;
         let bc = arith_bcop_for(ty, ArithKind::Add)?;
         self.emit_with_effect(bc, pc);
+        Ok(())
+    }
+
+    // #165 — `Op::StrConcatN { operand_count }` is the IR-level fold of
+    // a left-leaning `String + String + ... + String` source chain.
+    // The bytecode VM has a matching `BcOp::StrConcatN { argc }`
+    // (handles the single-allocation join in the `StringArena`), so
+    // wire the op through directly. Two-operand `Op::Add(String)`
+    // still bails via `visit_add` — the AST fold pass only emits
+    // `StrConcatN` for chains of length 3+, and pair-wise concat
+    // falls back to the tree-walker via `BytecodeUnsupported`.
+    fn visit_str_concat_n(&mut self, operand_count: u32) -> Result<(), BcCompileError> {
+        if operand_count < 2 {
+            return Err(BcCompileError::UnsupportedOp(format!(
+                "Op::StrConcatN with operand_count={operand_count} (expected >= 2)"
+            )));
+        }
+        let pc = self.current_pc;
+        self.emit_with_effect(BcOp::StrConcatN { argc: operand_count }, pc);
         Ok(())
     }
 
