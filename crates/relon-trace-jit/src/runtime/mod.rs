@@ -63,10 +63,11 @@ pub use deopt::{
     TraceContext,
 };
 pub use dict_list::{
-    __relon_trace_dict_lookup, __relon_trace_dict_lookup_prechecked, __relon_trace_list_get,
-    build_dict_record, build_flat_list_record, build_string_record, fx_hash_bytes,
-    fx_hash_key_record, fx_hash_key_record_payload, is_ascii_bytes, is_ascii_flag_set,
-    DICT_LOOKUP_DEOPT, STRING_RECORD_ASCII_FLAG_BIT, STRING_RECORD_HASH_OFFSET,
+    __relon_trace_dict_lookup, __relon_trace_dict_lookup_prechecked,
+    __relon_trace_dict_lookup_prechecked_v2, __relon_trace_dict_lookup_v2, __relon_trace_list_get,
+    build_dict_record, build_dict_record_v2, build_flat_list_record, build_string_record,
+    fx_hash_bytes, fx_hash_key_record, fx_hash_key_record_payload, is_ascii_bytes,
+    is_ascii_flag_set, DICT_LOOKUP_DEOPT, STRING_RECORD_ASCII_FLAG_BIT, STRING_RECORD_HASH_OFFSET,
     STRING_RECORD_LEN_MASK, STRING_RECORD_PAYLOAD_OFFSET,
 };
 pub use ic_lookup::{__relon_trace_inline_cache_lookup, ic_storage_size, write_ic_header};

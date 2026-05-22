@@ -111,7 +111,7 @@ pub unsafe extern "C" fn __relon_trace_list_get(
     unsafe { (elem_addr as *const i64).read_unaligned() }
 }
 
-/// IC-guarded dict lookup helper.
+/// IC-guarded dict lookup helper (v1, hash-only).
 ///
 /// `dict_ptr` is laid out as:
 ///
@@ -128,12 +128,30 @@ pub unsafe extern "C" fn __relon_trace_list_get(
 /// [`DICT_LOOKUP_DEOPT`] so the trace deopts and the recorder
 /// re-specialises under the new shape.
 ///
-/// Collision behaviour: F-D8 v1 uses FxHash64 — for the W5 corpus
-/// (10 string keys, max 4 bytes each) the per-key collision rate
-/// over the entire keyspace is < 2^-32, and the IC hit-path verifies
-/// the cached `value` matches the BTreeMap-resolved one at install
-/// time. The bench fixtures sidestep BTreeMap by pre-flattening the
-/// dict into the entry table at fixture-build time.
+/// # ⚠️ Hash collision caveat (review #175 P2)
+///
+/// The v1 layout stores **only** `(key_hash, value)` per entry and
+/// has **no key payload** to byte-compare. The helper therefore
+/// returns the first entry whose 64-bit FxHash matches the looked-up
+/// key — if a future host plumbs in a dict whose key set contains a
+/// payload-distinct entry that collides on FxHash64, the helper will
+/// silently return the wrong value. The risk is bounded today only
+/// by:
+///
+/// 1. The recorder-time `shape_hash` fingerprint must encode the
+///    full key set; mismatch deopts before the scan.
+/// 2. Bench fixtures (W5 / W6 / `cmp_lua*` corpus) hand-build the
+///    entry table from a fixed, collision-audited set of literal
+///    keys, so the IC hot path never encounters a colliding payload
+///    in practice.
+///
+/// Both guarantees hold for the v6 corpus; neither survives a
+/// general production dict whose key set is unbounded. The
+/// long-term plan is to widen the entry layout to carry the key
+/// record pointer (`[key_hash][key_record_off][value]`) so the
+/// helper can `memcmp` the payload after the hash match; until that
+/// lands, callers feeding live production dicts MUST route through
+/// the recorder-side `BTreeMap` fallback rather than this helper.
 ///
 /// # Safety
 ///
@@ -208,6 +226,20 @@ pub unsafe extern "C" fn __relon_trace_dict_lookup(
 /// per-iter saving is just one `load.u64 + cmp + brif`. That is enough
 /// to drop the trace_jit ratio from × 1.95 toward × 1.5 LuaJIT on the
 /// F-D8-D recorder-driven path — see the F-D8-E.2 stage report.
+///
+/// # ⚠️ Bench-fixture-only safety (review #175 P2)
+///
+/// Inherits the hash-only collision caveat of
+/// [`__relon_trace_dict_lookup`] **and** drops the shape-fingerprint
+/// safety net. The cranelift emitter's `dict_inline` lowering inlines
+/// the body of this helper directly into the trace IR (see
+/// `relon_trace_emitter::dict_inline::emit_dict_lookup_inline`); the
+/// helper call survives only as a fall-back path that bench fixtures
+/// and `relon-codegen-native` integration tests exercise when the
+/// inline path is disabled. Production traces MUST NOT route through
+/// this helper against a dict whose key set is not collision-audited.
+/// The follow-up plan is the same v2 entry layout described on
+/// [`__relon_trace_dict_lookup`].
 ///
 /// # Safety
 ///
@@ -345,6 +377,281 @@ pub fn build_dict_record(shape_hash: u64, entries: &[(u64, i64)]) -> Vec<u8> {
         out.extend_from_slice(&v.to_le_bytes());
     }
     out
+}
+
+// =====================================================================
+// v2 dict layout — key payload memcmp on hash hit (review #175 P2 fix)
+// =====================================================================
+//
+// Motivation: the v1 layout above stores only `(key_hash, value)` per
+// entry and is therefore vulnerable to a 64-bit FxHash collision
+// silently returning the wrong value. v1 stays as the inline-emitter
+// hot path because its bench-fixture call sites pre-validate every
+// key set against collisions and the cranelift-side lowering depends
+// on the 16-byte entry stride for the `lea` fold. v2 adds a second
+// helper + builder pair that keeps the entry header backwards-
+// compatible (same `[key_hash:u64]` first eight bytes) but appends a
+// pointer + length pair into the entry body so the helper can do a
+// `memcmp` of the looked-up key payload against the stored payload
+// after the hash match. The cost is one extra cache line per entry
+// plus a per-iter `memcmp` of ~`key.len()` bytes on the hit path —
+// acceptable for production dicts where correctness trumps the
+// last 5-10 ns/iter on the W5 bench.
+
+/// Byte offset of the v2 dict header's `entry_count` field. See
+/// [`build_dict_record_v2`] for the full layout.
+const DICT_V2_ENTRY_COUNT_OFFSET: usize = 8;
+/// Byte offset of the first entry in a v2 dict record.
+const DICT_V2_ENTRIES_OFFSET: usize = 12;
+/// v2 entry stride: `[key_hash:u64][key_payload_off:u32][key_payload_len:u32][value:i64]`.
+const DICT_V2_ENTRY_STRIDE: usize = 24;
+
+/// v2 dict-record constructor.
+///
+/// `entries` carries one `(key_payload, value)` per dict entry; the
+/// builder pre-hashes each payload (via [`fx_hash_bytes`]) and
+/// appends every payload byte-for-byte to the tail of the record so
+/// [`__relon_trace_dict_lookup_v2`] can `memcmp` the looked-up key
+/// payload against the stored one after the hash match. The returned
+/// layout is:
+///
+/// ```text
+/// offset 0  : shape_hash       : u64 LE
+/// offset 8  : entry_count      : u32 LE
+/// offset 12 : entries[0..N]    each 24 bytes:
+///                 [key_hash       : u64 LE]
+///                 [key_payload_off: u32 LE]  // bytes from record base
+///                 [key_payload_len: u32 LE]
+///                 [value          : i64 LE]
+/// offset H  : payload_blob     : variable
+/// ```
+///
+/// Each entry's `key_payload_off` is the absolute byte offset (from
+/// the record base) of its payload bytes in the trailing blob. The
+/// v2 helper validates `(off, len)` against the surrounding record
+/// length before issuing the `memcmp`, so a corrupt record cannot
+/// drive an out-of-bounds read.
+///
+/// # Panics
+///
+/// Debug-mode panics when any key payload's length exceeds
+/// `u32::MAX` — production dict keys are interned identifiers many
+/// orders of magnitude under this cap.
+pub fn build_dict_record_v2(shape_hash: u64, entries: &[(&[u8], i64)]) -> Vec<u8> {
+    let entry_count = entries.len() as u32;
+    let payload_total: usize = entries.iter().map(|(k, _)| k.len()).sum();
+    let header_size = DICT_V2_ENTRIES_OFFSET + DICT_V2_ENTRY_STRIDE * entries.len();
+    let mut out = Vec::with_capacity(header_size + payload_total);
+    out.extend_from_slice(&shape_hash.to_le_bytes());
+    out.extend_from_slice(&entry_count.to_le_bytes());
+
+    // First pass: emit zeroed entry headers so we can fill them once
+    // we know each payload's final absolute offset.
+    let mut payload_cursor = header_size;
+    for (key, value) in entries {
+        debug_assert!(
+            (key.len() as u64) <= (u32::MAX as u64),
+            "v2 dict key payload exceeds u32::MAX bytes"
+        );
+        let key_hash = fx_hash_bytes(key);
+        let key_off = payload_cursor as u32;
+        let key_len = key.len() as u32;
+        out.extend_from_slice(&key_hash.to_le_bytes());
+        out.extend_from_slice(&key_off.to_le_bytes());
+        out.extend_from_slice(&key_len.to_le_bytes());
+        out.extend_from_slice(&value.to_le_bytes());
+        payload_cursor += key.len();
+    }
+    debug_assert_eq!(out.len(), header_size);
+    // Second pass: append the payload blob.
+    for (key, _) in entries {
+        out.extend_from_slice(key);
+    }
+    debug_assert_eq!(out.len(), header_size + payload_total);
+    out
+}
+
+/// v2 dict-lookup helper. Performs a `memcmp` of the looked-up key
+/// payload against the stored payload after the hash match, so
+/// FxHash64 collisions cannot silently return the wrong value.
+///
+/// `dict_ptr` must point at a record produced by
+/// [`build_dict_record_v2`] (or laid out identically). `key_ptr` must
+/// point at a layout-conformant string record
+/// (`[len_with_flags:u32][hash:u64][payload]`) — the same shape the v1
+/// helper consumes.
+///
+/// On shape-fingerprint mismatch the helper returns
+/// [`DICT_LOOKUP_DEOPT`] before reading any entry. On hash match the
+/// helper validates `(key_off, key_len)` against the surrounding
+/// record bounds (passed via `record_len`) and `memcmp`s the stored
+/// payload against the looked-up key payload; mismatched payloads
+/// continue the scan, so a hash collision degrades to one extra
+/// `memcmp` per collision rather than corrupting the result.
+///
+/// # Safety
+///
+/// - `dict_ptr` must point at the first byte of a v2 record whose
+///   total length is `record_len`. The helper reads at most
+///   `record_len` bytes from `dict_ptr` and bounds-checks every
+///   per-entry payload range against `record_len` before issuing the
+///   `memcmp`.
+/// - `key_ptr` must point at a layout-conformant string record (same
+///   contract as the v1 helper).
+/// - `ctx` must be a valid `TraceContext` pointer; currently unused
+///   but reserved for IC bookkeeping.
+#[no_mangle]
+pub unsafe extern "C" fn __relon_trace_dict_lookup_v2(
+    dict_ptr: *const u8,
+    record_len: usize,
+    key_ptr: *const u8,
+    shape_hash: u64,
+    ctx: *mut TraceContext,
+) -> i64 {
+    let _ = ctx;
+    if dict_ptr.is_null() || key_ptr.is_null() {
+        return DICT_LOOKUP_DEOPT;
+    }
+    // Defensive: a record_len smaller than the fixed header is
+    // structurally impossible; bail out before any read.
+    if record_len < DICT_V2_ENTRIES_OFFSET {
+        return DICT_LOOKUP_DEOPT;
+    }
+
+    let dict_shape = unsafe { (dict_ptr as *const u64).read_unaligned() };
+    if dict_shape != shape_hash {
+        return DICT_LOOKUP_DEOPT;
+    }
+
+    let entry_count =
+        unsafe { (dict_ptr.add(DICT_V2_ENTRY_COUNT_OFFSET) as *const u32).read_unaligned() };
+    // Validate the entry table itself fits inside `record_len` — a
+    // malformed record could otherwise drive an OOB read on the very
+    // first entry header.
+    let entries_total = (entry_count as usize).saturating_mul(DICT_V2_ENTRY_STRIDE);
+    let entries_end = DICT_V2_ENTRIES_OFFSET.saturating_add(entries_total);
+    if entries_end > record_len {
+        return DICT_LOOKUP_DEOPT;
+    }
+
+    let key_payload_len = unsafe { fx_hash_key_record_payload_len(key_ptr) };
+    let key_payload_ptr = unsafe { key_ptr.add(STRING_RECORD_PAYLOAD_OFFSET as usize) };
+    let key_hash = unsafe { fx_hash_key_record(key_ptr) };
+    let entries_base = unsafe { dict_ptr.add(DICT_V2_ENTRIES_OFFSET) };
+
+    for i in 0..entry_count {
+        let entry_off = (i as usize) * DICT_V2_ENTRY_STRIDE;
+        let entry_ptr = unsafe { entries_base.add(entry_off) };
+        let entry_key_hash = unsafe { (entry_ptr as *const u64).read_unaligned() };
+        if entry_key_hash != key_hash {
+            continue;
+        }
+        let stored_off = unsafe { (entry_ptr.add(8) as *const u32).read_unaligned() } as usize;
+        let stored_len = unsafe { (entry_ptr.add(12) as *const u32).read_unaligned() } as usize;
+        // Bounds-check the stored payload range against the record so
+        // a corrupt record can't drive an OOB compare.
+        let stored_end = stored_off.saturating_add(stored_len);
+        if stored_off < entries_end || stored_end > record_len {
+            return DICT_LOOKUP_DEOPT;
+        }
+        if stored_len != key_payload_len {
+            // Same hash, different payload length ⇒ collision; keep
+            // scanning instead of returning the wrong value.
+            continue;
+        }
+        let stored_payload_ptr = unsafe { dict_ptr.add(stored_off) };
+        // SAFETY: bounds verified above; both slices point at
+        // `stored_len` valid bytes inside the live record / key buffer.
+        let stored_bytes = unsafe { std::slice::from_raw_parts(stored_payload_ptr, stored_len) };
+        let lookup_bytes = unsafe { std::slice::from_raw_parts(key_payload_ptr, key_payload_len) };
+        if stored_bytes != lookup_bytes {
+            // Hash collision with distinct payload — keep scanning.
+            continue;
+        }
+        let entry_val = unsafe { (entry_ptr.add(16) as *const i64).read_unaligned() };
+        return entry_val;
+    }
+    DICT_LOOKUP_DEOPT
+}
+
+/// v2 "shape already checked" companion of
+/// [`__relon_trace_dict_lookup_v2`]. Skips the leading shape compare
+/// (a paired `DictShapeGuard` ran upstream) but keeps the key payload
+/// `memcmp` so hash collisions still degrade safely.
+///
+/// # Safety
+///
+/// Same contract as [`__relon_trace_dict_lookup_v2`] plus the
+/// upstream-`DictShapeGuard` requirement of the v1 prechecked
+/// helper.
+#[no_mangle]
+pub unsafe extern "C" fn __relon_trace_dict_lookup_prechecked_v2(
+    dict_ptr: *const u8,
+    record_len: usize,
+    key_ptr: *const u8,
+    ctx: *mut TraceContext,
+) -> i64 {
+    let _ = ctx;
+    if dict_ptr.is_null() || key_ptr.is_null() {
+        return DICT_LOOKUP_DEOPT;
+    }
+    if record_len < DICT_V2_ENTRIES_OFFSET {
+        return DICT_LOOKUP_DEOPT;
+    }
+    let entry_count =
+        unsafe { (dict_ptr.add(DICT_V2_ENTRY_COUNT_OFFSET) as *const u32).read_unaligned() };
+    let entries_total = (entry_count as usize).saturating_mul(DICT_V2_ENTRY_STRIDE);
+    let entries_end = DICT_V2_ENTRIES_OFFSET.saturating_add(entries_total);
+    if entries_end > record_len {
+        return DICT_LOOKUP_DEOPT;
+    }
+
+    let key_payload_len = unsafe { fx_hash_key_record_payload_len(key_ptr) };
+    let key_payload_ptr = unsafe { key_ptr.add(STRING_RECORD_PAYLOAD_OFFSET as usize) };
+    let key_hash = unsafe { fx_hash_key_record(key_ptr) };
+    let entries_base = unsafe { dict_ptr.add(DICT_V2_ENTRIES_OFFSET) };
+
+    for i in 0..entry_count {
+        let entry_off = (i as usize) * DICT_V2_ENTRY_STRIDE;
+        let entry_ptr = unsafe { entries_base.add(entry_off) };
+        let entry_key_hash = unsafe { (entry_ptr as *const u64).read_unaligned() };
+        if entry_key_hash != key_hash {
+            continue;
+        }
+        let stored_off = unsafe { (entry_ptr.add(8) as *const u32).read_unaligned() } as usize;
+        let stored_len = unsafe { (entry_ptr.add(12) as *const u32).read_unaligned() } as usize;
+        let stored_end = stored_off.saturating_add(stored_len);
+        if stored_off < entries_end || stored_end > record_len {
+            return DICT_LOOKUP_DEOPT;
+        }
+        if stored_len != key_payload_len {
+            continue;
+        }
+        let stored_payload_ptr = unsafe { dict_ptr.add(stored_off) };
+        let stored_bytes = unsafe { std::slice::from_raw_parts(stored_payload_ptr, stored_len) };
+        let lookup_bytes = unsafe { std::slice::from_raw_parts(key_payload_ptr, key_payload_len) };
+        if stored_bytes != lookup_bytes {
+            continue;
+        }
+        let entry_val = unsafe { (entry_ptr.add(16) as *const i64).read_unaligned() };
+        return entry_val;
+    }
+    DICT_LOOKUP_DEOPT
+}
+
+/// Read the payload length stored in a layout-conformant string
+/// record header (bits 0..31 of the `len_with_flags` word).
+///
+/// # Safety
+///
+/// Same shape contract as
+/// [`relon_trace_abi::hash::fx_hash_key_record`]: `key_ptr` must point
+/// at the first byte of a layout-conformant string record with at
+/// least 4 valid header bytes plus `len` payload bytes.
+#[inline]
+unsafe fn fx_hash_key_record_payload_len(key_ptr: *const u8) -> usize {
+    let len_with_flags = unsafe { (key_ptr as *const u32).read_unaligned() };
+    (len_with_flags & STRING_RECORD_LEN_MASK) as usize
 }
 
 #[cfg(test)]
@@ -548,5 +855,268 @@ mod tests {
         let got =
             unsafe { __relon_trace_dict_lookup(dict.as_ptr(), kr.as_ptr(), 0xfeed, &mut ctx) };
         assert_eq!(got, 99);
+    }
+
+    // ---- v2 helper: hit, miss, shape mismatch ----------------------
+
+    #[test]
+    fn dict_lookup_v2_hit_returns_value() {
+        let entries: Vec<(&[u8], i64)> = vec![(b"a", 10), (b"bb", 20), (b"ccc", 30)];
+        let shape: u64 = 0xfeed_face_dead_beef;
+        let dict = build_dict_record_v2(shape, &entries);
+        let mut ctx = TraceContext::with_capacity(0);
+        for (key, expected) in &entries {
+            let kr = build_string_record(std::str::from_utf8(key).unwrap());
+            let got = unsafe {
+                __relon_trace_dict_lookup_v2(
+                    dict.as_ptr(),
+                    dict.len(),
+                    kr.as_ptr(),
+                    shape,
+                    &mut ctx,
+                )
+            };
+            assert_eq!(got, *expected, "v2 key {:?} value mismatch", key);
+        }
+    }
+
+    #[test]
+    fn dict_lookup_v2_shape_mismatch_returns_deopt() {
+        let entries: Vec<(&[u8], i64)> = vec![(b"a", 42)];
+        let dict = build_dict_record_v2(0xaaaa, &entries);
+        let kr = build_string_record("a");
+        let mut ctx = TraceContext::with_capacity(0);
+        let got = unsafe {
+            __relon_trace_dict_lookup_v2(dict.as_ptr(), dict.len(), kr.as_ptr(), 0xbbbb, &mut ctx)
+        };
+        assert_eq!(got, DICT_LOOKUP_DEOPT);
+    }
+
+    #[test]
+    fn dict_lookup_v2_missing_key_returns_deopt() {
+        let entries: Vec<(&[u8], i64)> = vec![(b"a", 7)];
+        let dict = build_dict_record_v2(0xc0de, &entries);
+        let kr_missing = build_string_record("z");
+        let mut ctx = TraceContext::with_capacity(0);
+        let got = unsafe {
+            __relon_trace_dict_lookup_v2(
+                dict.as_ptr(),
+                dict.len(),
+                kr_missing.as_ptr(),
+                0xc0de,
+                &mut ctx,
+            )
+        };
+        assert_eq!(got, DICT_LOOKUP_DEOPT);
+    }
+
+    // ---- v2 helper: review #175 hash-collision regression ----------
+
+    #[test]
+    fn dict_lookup_v2_hash_collision_returns_correct_value() {
+        // Review #175 P2 regression: forge two distinct key records
+        // that hash to the same FxHash64 by *manually stamping* the
+        // cached hash field in the lookup key's string record to the
+        // FxHash of an unrelated payload. The v1 helper would return
+        // the entry whose hash matches the stamped digest — silent
+        // corruption. The v2 helper must `memcmp` the payload and
+        // therefore return DICT_LOOKUP_DEOPT (no real entry matches
+        // the looked-up payload).
+        let entries: Vec<(&[u8], i64)> = vec![(b"alpha", 100), (b"bravo", 200), (b"charlie", 300)];
+        let dict = build_dict_record_v2(0xdead, &entries);
+
+        // Build a key record whose payload is "ghost" but whose cached
+        // hash field points to the FxHash of "alpha" — i.e. a forged
+        // FxHash collision. fx_hash_key_record loads the cached field
+        // directly, so the helper sees the colliding hash but the
+        // payload memcmp must catch the mismatch.
+        let collision_hash = fx_hash_bytes(b"alpha");
+        let payload: &[u8] = b"ghost";
+        let mut forged = Vec::with_capacity(STRING_RECORD_PAYLOAD_OFFSET as usize + payload.len());
+        let len_with_flags = payload.len() as u32 | STRING_RECORD_ASCII_FLAG_BIT;
+        forged.extend_from_slice(&len_with_flags.to_le_bytes());
+        forged.extend_from_slice(&collision_hash.to_le_bytes());
+        forged.extend_from_slice(payload);
+
+        let mut ctx = TraceContext::with_capacity(0);
+        let got = unsafe {
+            __relon_trace_dict_lookup_v2(
+                dict.as_ptr(),
+                dict.len(),
+                forged.as_ptr(),
+                0xdead,
+                &mut ctx,
+            )
+        };
+        assert_eq!(
+            got, DICT_LOOKUP_DEOPT,
+            "v2 helper must reject a forged hash collision (payload memcmp catches it)"
+        );
+
+        // Belt-and-braces: a real lookup of "alpha" still hits.
+        let kr_real = build_string_record("alpha");
+        let got_real = unsafe {
+            __relon_trace_dict_lookup_v2(
+                dict.as_ptr(),
+                dict.len(),
+                kr_real.as_ptr(),
+                0xdead,
+                &mut ctx,
+            )
+        };
+        assert_eq!(got_real, 100, "v2 helper still hits genuine payload");
+    }
+
+    #[test]
+    fn dict_lookup_v2_hash_collision_keeps_scanning_for_real_entry() {
+        // Construct two dict entries whose hashes collide (forge it by
+        // sharing the same key_hash slot via the v2 builder's manual
+        // entry placement) and verify the helper returns the
+        // payload-matching entry instead of the first hash hit. We
+        // build the record by hand because `build_dict_record_v2`
+        // hashes via fx_hash_bytes (no API to inject collisions).
+        let payload_a: &[u8] = b"alpha";
+        let payload_b: &[u8] = b"bravo";
+        let real_hash = fx_hash_bytes(payload_a); // re-used as the
+                                                  // colliding fake hash for the b-entry.
+                                                  // Manually assemble: shape | entry_count=2 | entry_a (hash=real_hash, value=999, payload=alpha)
+                                                  // | entry_b (hash=real_hash, value=42, payload=bravo) | payload_a | payload_b.
+        let shape: u64 = 0xbeef;
+        let header_size = DICT_V2_ENTRIES_OFFSET + DICT_V2_ENTRY_STRIDE * 2;
+        let off_a = header_size as u32;
+        let off_b = (header_size + payload_a.len()) as u32;
+        let mut record = Vec::with_capacity(header_size + payload_a.len() + payload_b.len());
+        record.extend_from_slice(&shape.to_le_bytes());
+        record.extend_from_slice(&2u32.to_le_bytes());
+        // entry a — wrong value, used to verify we don't stop at the
+        // first hash hit when the payload doesn't match.
+        record.extend_from_slice(&real_hash.to_le_bytes());
+        record.extend_from_slice(&off_a.to_le_bytes());
+        record.extend_from_slice(&(payload_a.len() as u32).to_le_bytes());
+        record.extend_from_slice(&999i64.to_le_bytes());
+        // entry b — colliding hash, real value, payload "bravo".
+        record.extend_from_slice(&real_hash.to_le_bytes());
+        record.extend_from_slice(&off_b.to_le_bytes());
+        record.extend_from_slice(&(payload_b.len() as u32).to_le_bytes());
+        record.extend_from_slice(&42i64.to_le_bytes());
+        record.extend_from_slice(payload_a);
+        record.extend_from_slice(payload_b);
+
+        // Lookup key "bravo" but with the cached hash forced to
+        // real_hash (same as entry_a's hash). The v2 helper must skip
+        // entry_a after the payload memcmp fails and return entry_b's
+        // value (42).
+        let payload: &[u8] = b"bravo";
+        let len_with_flags = payload.len() as u32 | STRING_RECORD_ASCII_FLAG_BIT;
+        let mut forged = Vec::with_capacity(STRING_RECORD_PAYLOAD_OFFSET as usize + payload.len());
+        forged.extend_from_slice(&len_with_flags.to_le_bytes());
+        forged.extend_from_slice(&real_hash.to_le_bytes());
+        forged.extend_from_slice(payload);
+
+        let mut ctx = TraceContext::with_capacity(0);
+        let got = unsafe {
+            __relon_trace_dict_lookup_v2(
+                record.as_ptr(),
+                record.len(),
+                forged.as_ptr(),
+                shape,
+                &mut ctx,
+            )
+        };
+        assert_eq!(
+            got, 42,
+            "v2 helper must scan past a colliding entry and return the payload-matching one"
+        );
+    }
+
+    #[test]
+    fn dict_lookup_v2_rejects_truncated_record_len() {
+        // record_len smaller than the minimum header → deopt.
+        let entries: Vec<(&[u8], i64)> = vec![(b"a", 10)];
+        let dict = build_dict_record_v2(0xfeed, &entries);
+        let kr = build_string_record("a");
+        let mut ctx = TraceContext::with_capacity(0);
+        // record_len = 4 < DICT_V2_ENTRIES_OFFSET ⇒ deopt.
+        let got = unsafe {
+            __relon_trace_dict_lookup_v2(dict.as_ptr(), 4, kr.as_ptr(), 0xfeed, &mut ctx)
+        };
+        assert_eq!(got, DICT_LOOKUP_DEOPT);
+        // record_len cut off mid-entry-table ⇒ deopt before any read.
+        let got2 = unsafe {
+            __relon_trace_dict_lookup_v2(
+                dict.as_ptr(),
+                DICT_V2_ENTRIES_OFFSET + 4,
+                kr.as_ptr(),
+                0xfeed,
+                &mut ctx,
+            )
+        };
+        assert_eq!(got2, DICT_LOOKUP_DEOPT);
+    }
+
+    #[test]
+    fn dict_lookup_prechecked_v2_hit_returns_value() {
+        let entries: Vec<(&[u8], i64)> = vec![(b"hello", 7), (b"world", 11)];
+        let dict = build_dict_record_v2(0xdeadbeef, &entries);
+        let kr = build_string_record("hello");
+        let mut ctx = TraceContext::with_capacity(0);
+        let got = unsafe {
+            __relon_trace_dict_lookup_prechecked_v2(
+                dict.as_ptr(),
+                dict.len(),
+                kr.as_ptr(),
+                &mut ctx,
+            )
+        };
+        assert_eq!(got, 7);
+    }
+
+    #[test]
+    fn dict_lookup_prechecked_v2_ignores_shape_field() {
+        let entries: Vec<(&[u8], i64)> = vec![(b"k", 42)];
+        // Stamp a deliberately wrong shape — the prechecked helper
+        // must NOT compare it (paired DictShapeGuard owns that check).
+        let dict = build_dict_record_v2(0xaaaa_bbbb, &entries);
+        let kr = build_string_record("k");
+        let mut ctx = TraceContext::with_capacity(0);
+        let got = unsafe {
+            __relon_trace_dict_lookup_prechecked_v2(
+                dict.as_ptr(),
+                dict.len(),
+                kr.as_ptr(),
+                &mut ctx,
+            )
+        };
+        assert_eq!(got, 42);
+    }
+
+    #[test]
+    fn dict_lookup_prechecked_v2_hash_collision_returns_correct_value() {
+        // Same forged-collision shape as the full-helper regression
+        // test, but exercising the prechecked variant.
+        let entries: Vec<(&[u8], i64)> = vec![(b"alpha", 100), (b"bravo", 200)];
+        let dict = build_dict_record_v2(0x123, &entries);
+
+        let collision_hash = fx_hash_bytes(b"alpha");
+        let payload: &[u8] = b"ghost";
+        let mut forged = Vec::with_capacity(STRING_RECORD_PAYLOAD_OFFSET as usize + payload.len());
+        let len_with_flags = payload.len() as u32 | STRING_RECORD_ASCII_FLAG_BIT;
+        forged.extend_from_slice(&len_with_flags.to_le_bytes());
+        forged.extend_from_slice(&collision_hash.to_le_bytes());
+        forged.extend_from_slice(payload);
+
+        let mut ctx = TraceContext::with_capacity(0);
+        let got = unsafe {
+            __relon_trace_dict_lookup_prechecked_v2(
+                dict.as_ptr(),
+                dict.len(),
+                forged.as_ptr(),
+                &mut ctx,
+            )
+        };
+        assert_eq!(
+            got, DICT_LOOKUP_DEOPT,
+            "prechecked v2 helper must reject a forged hash collision"
+        );
     }
 }
