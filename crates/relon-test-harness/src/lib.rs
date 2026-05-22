@@ -63,6 +63,38 @@ pub mod corpus;
 pub mod four_way;
 pub mod three_way;
 
+/// Backend tier identifiers used by the corpus support-claim ratchet.
+///
+/// Distinct from [`Backend`] because the trace-JIT runs as an extra
+/// tier on top of the cranelift IR pipeline rather than a standalone
+/// `Backend::*` variant; the harness still needs to express "case X
+/// claims trace-JIT support" so a regression to
+/// `TraceJitNotApplicable` is caught.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BackendKind {
+    /// Reference tree-walking interpreter (`Backend::TreeWalk`).
+    TreeWalk,
+    /// Cranelift-AOT (`Backend::CraneliftAot`).
+    CraneliftAot,
+    /// Trace-JIT tier — installed on top of cranelift IR; the
+    /// harness's synth-recipe catalogue stands in for a real recorder.
+    TraceJit,
+    /// Bytecode VM (`Backend::Bytecode`).
+    Bytecode,
+}
+
+impl BackendKind {
+    /// Human-readable label used in ratchet failure messages.
+    pub fn label(self) -> &'static str {
+        match self {
+            BackendKind::TreeWalk => "tree_walk",
+            BackendKind::CraneliftAot => "cranelift_aot",
+            BackendKind::TraceJit => "trace_jit",
+            BackendKind::Bytecode => "bytecode",
+        }
+    }
+}
+
 /// Outcome of one differential test run.
 #[derive(Debug)]
 pub enum DiffOutcome {
