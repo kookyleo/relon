@@ -315,6 +315,11 @@ impl CraneliftAotEvaluator {
         // skip parse + analyze + lower. Without it, the dlopen path
         // would have to re-derive schemas from source on every cold
         // start — blowing the 15 µs strict-mode budget.
+        //
+        // #171: the sidecar HMAC binds to the just-verified object
+        // hash + the source key + the entry-shape/arity it carries.
+        // A tampered sidecar surfaces as an hmac-mismatch error so we
+        // invalidate the triple fail-closed.
         let schema_path = crate::schema_cache::schema_cache_path_for(cache_dir, source_hash);
         let schema_bytes = match std::fs::read(&schema_path) {
             Ok(b) => b,
@@ -335,7 +340,12 @@ impl CraneliftAotEvaluator {
                 return Ok(None);
             }
         };
-        let schema_entry = match crate::schema_cache::deserialize(&schema_bytes) {
+        let schema_entry = match crate::schema_cache::deserialize(
+            &schema_bytes,
+            &source_hash,
+            &loaded.object_sha256,
+            &loaded.hmac_key,
+        ) {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!(
@@ -614,8 +624,9 @@ impl CraneliftAotEvaluator {
                 }
             };
 
-        // 3. Persist the schema cache so `from_cache_dir` can rebuild
-        // the trampoline without re-parsing.
+        // 3. Build the schema entry; we'll only HMAC-seal + persist
+        // it after the object cache lands so we know the
+        // `object_sha256` to bind to.
         let schema_entry = crate::schema_cache::SchemaCacheEntry {
             main_schema: main_schema.clone(),
             return_schema: return_schema.clone(),
@@ -633,45 +644,75 @@ impl CraneliftAotEvaluator {
             entry_arity: artifact.entry_arity as u32,
             entry_range: artifact.entry_range.into(),
         };
-        let schema_bytes = match crate::schema_cache::serialize(&schema_entry) {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::warn!(
-                    target: "relon::object_cache",
-                    "schema cache serialise failed: {e}; skipping schema cache write"
-                );
-                // Still try to persist object + ir for forward
-                // compatibility; without schema cache, from_cache_dir
-                // will fall back to from_source.
-                if let Err(e) = cache_int::try_store_to_cache(
-                    cache_dir,
-                    source_hash,
-                    &artifact.et_rel_bytes,
-                    &metadata,
-                    &ir_bytes,
-                ) {
-                    tracing::warn!(
-                        target: "relon::object_cache",
-                        "cache write returned unexpected error: {e}"
-                    );
-                }
-                return;
-            }
-        };
 
-        if let Err(e) = cache_int::try_store_to_cache(
+        // 4. Persist object + IR. `try_store_to_cache` surfaces the
+        // linked ET_DYN's SHA-256 only on a fully successful pair
+        // write; on best-effort skip (no HMAC key, no linker, etc.)
+        // we drop the schema cache too so the triple stays consistent.
+        let stored = match cache_int::try_store_to_cache(
             cache_dir,
             source_hash,
             &artifact.et_rel_bytes,
             &metadata,
             &ir_bytes,
         ) {
-            tracing::warn!(
-                target: "relon::object_cache",
-                "cache write returned unexpected error: {e}"
-            );
-            return;
-        }
+            Ok(Some(s)) => s,
+            Ok(None) => {
+                // Object + IR write skipped. Schema cache would be
+                // useless without them; bail without writing it.
+                return;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "relon::object_cache",
+                    "cache write returned unexpected error: {e}"
+                );
+                return;
+            }
+        };
+
+        // 5. HMAC-seal the schema sidecar binding it to the source
+        // key + the just-written object hash + the entry shape/arity.
+        // Resolving the key here a second time keeps the schema layer
+        // independent of the object-cache layer's internal handle; on
+        // the typical hot path it's a memoised file read.
+        let hmac_key = match relon_object_cache::ensure_key() {
+            Ok(k) => k,
+            Err(e) => {
+                // Object cache wrote successfully above (which means
+                // HMAC was available there). Hitting an error here is
+                // unexpected — surface at warn so operators see it,
+                // and roll back the freshly-written object/IR pair so
+                // the next cold start regenerates a consistent triple
+                // with a working key.
+                tracing::warn!(
+                    target: "relon::object_cache",
+                    "schema cache HMAC key disappeared mid-write ({e}); \
+                     invalidating freshly-written cache triple"
+                );
+                Self::invalidate_cache_triple(cache_dir, source_hash);
+                return;
+            }
+        };
+        let schema_bytes = match crate::schema_cache::serialize(
+            &schema_entry,
+            &source_hash,
+            &stored.object_sha256,
+            &hmac_key,
+        ) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(
+                    target: "relon::object_cache",
+                    "schema cache serialise failed: {e}; invalidating triple"
+                );
+                // Without a sidecar the next `from_cache_dir` would
+                // refuse the pair anyway; clean up so we re-emit a
+                // valid triple on the next cold start.
+                Self::invalidate_cache_triple(cache_dir, source_hash);
+                return;
+            }
+        };
 
         // Schema cache write is best-effort, but its absence forces a
         // fallback so we surface failures at `info`.

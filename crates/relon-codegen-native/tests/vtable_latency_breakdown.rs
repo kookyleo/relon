@@ -36,13 +36,20 @@ fn cached_cold_start_phase_breakdown_prints() {
         .expect("hit");
     let t_load = t0.elapsed();
 
-    // Phase 2: schema cache decode.
+    // Phase 2: schema cache decode. #171: the sidecar is HMAC-sealed
+    // against the source + object hashes; mirror what `from_cache_dir`
+    // does at the production layer.
     let schema_path =
         relon_codegen_native::schema_cache::schema_cache_path_for(cache.path(), source_hash);
     let t1 = Instant::now();
     let schema_bytes = std::fs::read(&schema_path).expect("schema read");
-    let schema_entry =
-        relon_codegen_native::schema_cache::deserialize(&schema_bytes).expect("schema decode");
+    let schema_entry = relon_codegen_native::schema_cache::deserialize(
+        &schema_bytes,
+        &source_hash,
+        &loaded.object_sha256,
+        &loaded.hmac_key,
+    )
+    .expect("schema decode");
     let t_schema = t1.elapsed();
 
     // Phase 3: dlopen + dlsym.
