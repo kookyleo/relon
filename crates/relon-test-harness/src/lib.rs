@@ -95,6 +95,207 @@ impl BackendKind {
     }
 }
 
+/// One ratchet violation — a backend that **claimed** to support a
+/// case ended up bouncing to its fallback surface (Unsupported /
+/// NotApplicable). Aggregated by the corpus drivers; a non-empty list
+/// fails the test loud.
+#[derive(Debug)]
+pub struct RatchetViolation {
+    /// Corpus case name.
+    pub case: String,
+    /// The backend that broke its support claim.
+    pub backend: BackendKind,
+    /// Backend-side reason / soft-pass reason string.
+    pub reason: String,
+}
+
+impl std::fmt::Display for RatchetViolation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "ratchet: case `{}` claims `{}` support but observed soft fallback: {}",
+            self.case,
+            self.backend.label(),
+            self.reason
+        )
+    }
+}
+
+/// Ratchet utilities — turn the soft-pass variants of [`DiffOutcome`]
+/// / [`three_way::ThreeWayResult`] / [`four_way::FourWayResult`] into
+/// hard failures when a backend in `claim` claimed to support the
+/// case but bounced anyway.
+pub mod ratchet {
+    use super::{BackendKind, DiffOutcome, RatchetViolation};
+    use crate::four_way::FourWayResult;
+    use crate::three_way::ThreeWayResult;
+
+    /// True iff `claim` lists `backend` as a supporter for the case.
+    fn claims(claim: &[BackendKind], backend: BackendKind) -> bool {
+        claim.contains(&backend)
+    }
+
+    /// Validate a two-way [`DiffOutcome`] against the case's
+    /// `supported_by` claim list. Returns the single backend that
+    /// regressed, or `None` when the outcome matches every claim.
+    pub fn check_two_way(
+        case_name: &str,
+        outcome: &DiffOutcome,
+        claim: &[BackendKind],
+    ) -> Option<RatchetViolation> {
+        match outcome {
+            DiffOutcome::MatchOk | DiffOutcome::MatchTrap => None,
+            DiffOutcome::CraneliftUnsupported { reason, .. } => {
+                if claims(claim, BackendKind::CraneliftAot) {
+                    Some(RatchetViolation {
+                        case: case_name.to_string(),
+                        backend: BackendKind::CraneliftAot,
+                        reason: reason.clone(),
+                    })
+                } else {
+                    None
+                }
+            }
+            DiffOutcome::TreeWalkMissingStdlibSurface {
+                tree_walk_error, ..
+            } => {
+                // The tree-walker is *always* the reference impl; any
+                // case that surfaces here is either out of the
+                // tree-walker's stdlib envelope (forward-compat) or a
+                // real reference-impl regression. If the case claims
+                // tree-walk support, treat it as a violation.
+                if claims(claim, BackendKind::TreeWalk) {
+                    Some(RatchetViolation {
+                        case: case_name.to_string(),
+                        backend: BackendKind::TreeWalk,
+                        reason: tree_walk_error.clone(),
+                    })
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    /// Validate a three-way [`ThreeWayResult`] against the claim list.
+    /// Returns the first violation (callers running the whole corpus
+    /// should collect violations across all cases before failing).
+    pub fn check_three_way(
+        case_name: &str,
+        outcome: &ThreeWayResult,
+        claim: &[BackendKind],
+    ) -> Option<RatchetViolation> {
+        match outcome {
+            ThreeWayResult::AllAgree(_) | ThreeWayResult::AllTrap => None,
+            ThreeWayResult::TraceJitNotApplicable { reason, .. } => {
+                if claims(claim, BackendKind::TraceJit) {
+                    Some(RatchetViolation {
+                        case: case_name.to_string(),
+                        backend: BackendKind::TraceJit,
+                        reason: reason.clone(),
+                    })
+                } else {
+                    None
+                }
+            }
+            ThreeWayResult::CraneliftUnsupported { reason, .. } => {
+                if claims(claim, BackendKind::CraneliftAot) {
+                    Some(RatchetViolation {
+                        case: case_name.to_string(),
+                        backend: BackendKind::CraneliftAot,
+                        reason: reason.clone(),
+                    })
+                } else {
+                    None
+                }
+            }
+            ThreeWayResult::TreeWalkMissingStdlibSurface {
+                tree_walk_error, ..
+            } => {
+                if claims(claim, BackendKind::TreeWalk) {
+                    Some(RatchetViolation {
+                        case: case_name.to_string(),
+                        backend: BackendKind::TreeWalk,
+                        reason: tree_walk_error.clone(),
+                    })
+                } else {
+                    None
+                }
+            }
+            ThreeWayResult::Mismatch { .. } => {
+                // Mismatch is a hard correctness bug — not a ratchet
+                // violation. The driver test asserts mismatches==0
+                // separately; we don't double-count here.
+                None
+            }
+        }
+    }
+
+    /// Validate a four-way [`FourWayResult`] against the claim list.
+    /// Walks the embedded three-way result first, then the bytecode
+    /// claim.
+    pub fn check_four_way(
+        case_name: &str,
+        outcome: &FourWayResult,
+        claim: &[BackendKind],
+    ) -> Vec<RatchetViolation> {
+        let mut out = Vec::new();
+        match outcome {
+            FourWayResult::AllAgree(_) | FourWayResult::AllTrap => {}
+            FourWayResult::BytecodeMatchesBaseline {
+                trace_skip_reason, ..
+            } => {
+                // Bytecode produced the right value but the trace-JIT
+                // / cranelift path bounced. The reason string carries
+                // which tier soft-passed; we surface a ratchet
+                // violation only when *that* tier is in `claim`.
+                // Heuristic: parse the reason prefix.
+                if trace_skip_reason.starts_with("cranelift_unsupported")
+                    && claims(claim, BackendKind::CraneliftAot)
+                {
+                    out.push(RatchetViolation {
+                        case: case_name.to_string(),
+                        backend: BackendKind::CraneliftAot,
+                        reason: trace_skip_reason.clone(),
+                    });
+                } else if trace_skip_reason.starts_with("tree_walk_missing_stdlib_surface")
+                    && claims(claim, BackendKind::TreeWalk)
+                {
+                    out.push(RatchetViolation {
+                        case: case_name.to_string(),
+                        backend: BackendKind::TreeWalk,
+                        reason: trace_skip_reason.clone(),
+                    });
+                } else if claims(claim, BackendKind::TraceJit) {
+                    // Generic "trace-JIT skipped" branch.
+                    out.push(RatchetViolation {
+                        case: case_name.to_string(),
+                        backend: BackendKind::TraceJit,
+                        reason: trace_skip_reason.clone(),
+                    });
+                }
+            }
+            FourWayResult::BytecodeUnsupported { baseline, reason } => {
+                if claims(claim, BackendKind::Bytecode) {
+                    out.push(RatchetViolation {
+                        case: case_name.to_string(),
+                        backend: BackendKind::Bytecode,
+                        reason: reason.clone(),
+                    });
+                }
+                // Plus whatever the embedded three-way says.
+                if let Some(v) = check_three_way(case_name, baseline, claim) {
+                    out.push(v);
+                }
+            }
+            FourWayResult::Mismatch { .. } => {
+                // Mismatch handled by the driver's hard assertion.
+            }
+        }
+        out
+    }
+}
+
 /// Outcome of one differential test run.
 #[derive(Debug)]
 pub enum DiffOutcome {

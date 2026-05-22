@@ -8,7 +8,7 @@
 //! what's covered.
 
 use relon_test_harness::corpus::{all_cases, Tier};
-use relon_test_harness::{diff_test, DiffOutcome};
+use relon_test_harness::{diff_test, ratchet, DiffOutcome};
 
 #[test]
 fn corpus_runs_through_both_backends_without_mismatch() {
@@ -23,6 +23,7 @@ fn corpus_runs_through_both_backends_without_mismatch() {
         std::collections::BTreeMap::new();
 
     let mut failures: Vec<(String, String)> = Vec::new();
+    let mut ratchet_violations = Vec::new();
 
     for case in &cases {
         let tier_label = tier_label(case.tier);
@@ -31,23 +32,30 @@ fn corpus_runs_through_both_backends_without_mismatch() {
 
         let args = (case.args_factory)();
         match diff_test(case.source, args) {
-            Ok(DiffOutcome::MatchOk) => {
-                match_ok += 1;
-                counts.0 += 1;
-            }
-            Ok(DiffOutcome::MatchTrap) => {
-                match_trap += 1;
-                counts.0 += 1;
-            }
-            Ok(DiffOutcome::CraneliftUnsupported { .. }) => {
-                unsupported += 1;
-            }
-            Ok(DiffOutcome::TreeWalkMissingStdlibSurface { .. }) => {
-                // Cranelift is correct; tree-walker lags on the
-                // free-function stdlib surface. Soft-counted so the
-                // tier breakdown still credits cranelift coverage.
-                tw_missing += 1;
-                counts.0 += 1;
+            Ok(outcome) => {
+                if let Some(v) = ratchet::check_two_way(case.name, &outcome, case.supported_by) {
+                    ratchet_violations.push(v);
+                }
+                match outcome {
+                    DiffOutcome::MatchOk => {
+                        match_ok += 1;
+                        counts.0 += 1;
+                    }
+                    DiffOutcome::MatchTrap => {
+                        match_trap += 1;
+                        counts.0 += 1;
+                    }
+                    DiffOutcome::CraneliftUnsupported { .. } => {
+                        unsupported += 1;
+                    }
+                    DiffOutcome::TreeWalkMissingStdlibSurface { .. } => {
+                        // Cranelift is correct; tree-walker lags on the
+                        // free-function stdlib surface. Soft-counted so the
+                        // tier breakdown still credits cranelift coverage.
+                        tw_missing += 1;
+                        counts.0 += 1;
+                    }
+                }
             }
             Err(e) => {
                 failures.push((case.name.to_string(), format!("{e}")));
@@ -68,6 +76,16 @@ fn corpus_runs_through_both_backends_without_mismatch() {
             eprintln!("FAIL {name}: {err}");
         }
         panic!("{} differential corpus mismatches", failures.len());
+    }
+
+    if !ratchet_violations.is_empty() {
+        for v in &ratchet_violations {
+            eprintln!("RATCHET {v}");
+        }
+        panic!(
+            "{} ratchet violation(s): a claimed-support backend regressed to its fallback",
+            ratchet_violations.len()
+        );
     }
 }
 
