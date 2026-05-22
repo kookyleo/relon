@@ -893,27 +893,34 @@ impl BytecodeEvaluator {
         self.run_main_i64_inner(packed)
     }
 
-    /// Core of the typed-i64 fast path: clone the cached config (lever
-    /// 5 keeps the clone shallow), dispatch the VM, and decode the
-    /// return slot directly without re-walking the schema.
+    /// Core of the typed-i64 fast path.
+    ///
+    /// M2-C lever 7 (2026-05-22): drives the bytecode VM through
+    /// [`BytecodeVm::invoke_pooled_typed_i64`], the alloc-free typed
+    /// fast entry. Differences from the general path:
+    ///
+    /// * Thread-local pooled `Vec<u64>` scratch for locals / stack —
+    ///   no per-call `vec![0u64; N]` / `Vec::with_capacity` alloc once
+    ///   the buffer is warm.
+    /// * Returns the schema-decoded value directly — skips the
+    ///   [`crate::vm::BcRunOutcome`] `final_locals` Vec move on return.
+    ///
+    /// The [`BytecodeVm::new`] + `default_config.clone()` cost remains
+    /// per-call for now — `BytecodeVm` is intentionally `!Sync` (the
+    /// per-call inline cache lives behind a `RefCell`), so it can't be
+    /// cached on the `Send + Sync` evaluator without a wider rework.
+    /// The W12 row's allocator pressure is the dominant remaining
+    /// cost; lever 7's pool clears it.
     fn run_main_i64_inner(&self, packed: &[u64]) -> Result<i64, RuntimeError> {
         let vm = BytecodeVm::new(self.default_config.clone());
         let return_slot_count = self.cached_return_slot_count();
-        let outcome = vm.invoke_from_with_stack(&self.func, packed, 0, &[], return_slot_count, &[]);
-        if let Some(err) = outcome.error {
-            return Err(err.into_runtime_error(self.entry_range));
-        }
-        // Decode the return slot directly. For SingleScalarInt the
-        // slot index is `return_field_base`; for LegacyI64 there's no
-        // schema and we read slot 0 of `final_locals`.
-        let raw = match self.return_shape {
-            ReturnShape::LegacyI64 => outcome.final_locals.first().copied().unwrap_or(0),
-            _ => outcome
-                .final_locals
-                .get(self.return_field_base as usize)
-                .copied()
-                .unwrap_or(0),
+        let return_slot_idx = match self.return_shape {
+            ReturnShape::LegacyI64 => 0,
+            _ => self.return_field_base,
         };
+        let raw = vm
+            .invoke_pooled_typed_i64(&self.func, packed, return_slot_count, return_slot_idx)
+            .map_err(|err| err.into_runtime_error(self.entry_range))?;
         Ok(raw as i64)
     }
 
