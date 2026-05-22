@@ -418,3 +418,121 @@ fn str_substring_emits_call() {
     b.append(TraceOp::Return(dst));
     emit_and_verify(&b.into_optimized());
 }
+
+// ---- #168: N-operand StrConcatN inline lowering -------------------
+
+/// Emit a `StrConcatN` trace with `n` operand SSAs through the
+/// hook-overriding emit path. Returns the verified IR plus the
+/// `call fn?(` tag for the `str_concat_n_alloc` helper.
+fn emit_concat_n(n: usize, enable_helpers: bool) -> (String, String) {
+    use cranelift_codegen::settings;
+    use cranelift_codegen::verifier;
+    use cranelift_codegen::Context;
+    use relon_trace_emitter::{HostHookFuncIds, TraceEmitter};
+
+    let mut b = TraceBuffer::new();
+    let mut ops: Vec<relon_trace_jit::SsaVar> = Vec::with_capacity(n);
+    for i in 0..n {
+        let v = b.fresh_ssa();
+        b.append(TraceOp::ConstI64(v, 0x1000 + i as i64));
+        ops.push(v);
+    }
+    let dst = b.fresh_ssa();
+    b.append(TraceOp::StrConcatN {
+        dst,
+        operands: ops,
+    });
+    b.append(TraceOp::Return(dst));
+
+    let mut hooks = HostHookFuncIds::default();
+    let alloc_id: u32 = 8;
+    if enable_helpers {
+        hooks.str_concat_n_alloc = Some(alloc_id);
+        // seal_hash is optional but the lowering routes through it
+        // when present; pin a deterministic slot for the call-tag grep.
+        hooks.str_concat_seal_hash = Some(9);
+    }
+    let mut ctx = Context::new();
+    TraceEmitter::emit_with_hooks(
+        &b.into_optimized(),
+        &mut ctx,
+        cranelift_codegen::ir::types::I64,
+        hooks,
+    )
+    .expect("emit should succeed when concat_n alloc helper is declared");
+    let flags = settings::Flags::new(settings::builder());
+    if let Err(errors) = verifier::verify_function(&ctx.func, &flags) {
+        panic!(
+            "cranelift verifier rejected the emitted function:\n{}\n--- IR ---\n{}",
+            errors, ctx.func
+        );
+    }
+    (format!("{}", ctx.func), format!("call fn{alloc_id}("))
+}
+
+#[test]
+fn str_concat_n_three_operands_emits_helper_call() {
+    let (ir, alloc_tag) = emit_concat_n(3, true);
+    // The inline lowering MUST issue exactly one call to the alloc
+    // helper (per-iter, regardless of N). A second call would mean
+    // the lowering accidentally dropped to the pair-wise extern shim.
+    assert!(
+        ir.contains(&alloc_tag),
+        "inline N=3 path must call str_concat_n_alloc:\n{ir}"
+    );
+    assert_eq!(
+        ir.matches(&alloc_tag).count(),
+        1,
+        "inline N=3 path should call str_concat_n_alloc exactly once:\n{ir}"
+    );
+    // Three operand-pointer stores into the stack slot.
+    assert!(
+        ir.contains("stack_store"),
+        "inline lowering should spill operand pointers via stack_store:\n{ir}"
+    );
+    assert_eq!(
+        ir.matches("stack_store").count(),
+        3,
+        "exactly one stack_store per operand (3 ops):\n{ir}"
+    );
+}
+
+#[test]
+fn str_concat_n_four_operands_emits_helper_call() {
+    let (ir, alloc_tag) = emit_concat_n(4, true);
+    assert!(ir.contains(&alloc_tag));
+    assert_eq!(
+        ir.matches("stack_store").count(),
+        4,
+        "exactly one stack_store per operand (4 ops):\n{ir}"
+    );
+}
+
+#[test]
+fn str_concat_n_surfaces_missing_helper_error_under_default_hooks() {
+    use cranelift_codegen::Context;
+    use relon_trace_emitter::TraceEmitter;
+
+    let mut b = TraceBuffer::new();
+    let a = b.fresh_ssa();
+    let bb = b.fresh_ssa();
+    let c = b.fresh_ssa();
+    b.append(TraceOp::ConstI64(a, 0x1000));
+    b.append(TraceOp::ConstI64(bb, 0x2000));
+    b.append(TraceOp::ConstI64(c, 0x3000));
+    let dst = b.fresh_ssa();
+    b.append(TraceOp::StrConcatN {
+        dst,
+        operands: vec![a, bb, c],
+    });
+    b.append(TraceOp::Return(dst));
+
+    let mut ctx = Context::new();
+    let err = TraceEmitter::emit(&b.into_optimized(), &mut ctx)
+        .expect_err("StrConcatN with default hooks must report missing helper");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("StrConcatNAlloc"),
+        "missing-helper error must mention StrConcatNAlloc, got: {msg}"
+    );
+}

@@ -32,7 +32,7 @@ use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::types::{I32, I64};
 use cranelift_codegen::ir::{
     self, AbiParam, BlockArg, ExtFuncData, ExternalName, Function, InstBuilder, MemFlags,
-    Signature, UserExternalName, UserFuncName,
+    Signature, StackSlotData, StackSlotKind, UserExternalName, UserFuncName,
 };
 use cranelift_codegen::isa::CallConv;
 use cranelift_codegen::Context as CodegenContext;
@@ -99,6 +99,16 @@ pub struct HostHookFuncIds {
     /// goes through `__relon_str_concat` / `StringRef::from_owned`
     /// (which stamps the hash producer-side).
     pub str_concat_seal_hash: Option<u32>,
+    /// #168: cranelift `FuncId.as_u32()` for
+    /// `__relon_str_concat_n_alloc`. `None` means the host did not
+    /// declare the helper — `TraceOp::StrConcatN` then surfaces
+    /// `EmitError::HostHookNotDeclared(HostHookId::StrConcatNAlloc)` at
+    /// emit time so the install pipeline falls back to the cranelift
+    /// AOT backend. Hosts that want the inline N-way concat path MUST
+    /// set this AND `str_concat_seal_hash` (the inline lowering seals
+    /// the result `StringRef`'s cached fx_hash digest exactly like the
+    /// two-operand inline `StrConcat` lowering does).
+    pub str_concat_n_alloc: Option<u32>,
     /// F-D8: cranelift `FuncId.as_u32()` for `__relon_trace_list_get`.
     /// `None` means the host has not declared the helper; emitter will
     /// surface `EmitError::HostHookNotDeclared` if a `TraceOp::ListGet`
@@ -152,6 +162,13 @@ impl Default for HostHookFuncIds {
             // (which calls `StringRef::from_owned` — already hash-
             // stamped producer-side).
             str_concat_seal_hash: None,
+            // #168 helper is opt-in: tests that don't drive the host
+            // module path keep `TraceOp::StrConcatN` off the inline
+            // emit path — the recorder lowering still produces the op,
+            // but the emit-time `HostHookNotDeclared` surfaces a clean
+            // install-time fallback. Hosts that want the trace-JIT to
+            // serve hot `StrConcatN` chains MUST set this.
+            str_concat_n_alloc: None,
             // F-D8 helpers are opt-in: tests that don't exercise
             // dict/list ops keep the historical 3-slot layout.
             list_get: None,
@@ -371,6 +388,28 @@ impl TraceEmitter {
                 fid,
             )
         });
+        // #168: N-operand single-allocation concat helper. Imported
+        // only when the host wired the FuncId; absence leaves the
+        // inline `StrConcatN` lowering off (the op surfaces
+        // `EmitError::HostHookNotDeclared` so the install pipeline can
+        // fall back to the cranelift AOT backend). Signature:
+        //   `__relon_str_concat_n_alloc(operands: *const *const StringRef,
+        //                               n: usize, total_len: usize)
+        //        -> *mut StringRef`
+        // The `operands` slot is stack-allocated by the cranelift
+        // lowering (a `[*const StringRef; N]` array filled with the
+        // operand pointer SSAs); `n` and `total_len` are passed as
+        // `i64`-wide values via the SystemV ABI.
+        let str_concat_n_alloc = hook_func_ids.str_concat_n_alloc.map(|fid| {
+            declare_host_hook(
+                builder.func,
+                HostHookId::StrConcatNAlloc,
+                &[pointer_ty, I64, I64],
+                &[pointer_ty],
+                pointer_ty,
+                fid,
+            )
+        });
 
         // F-D8: declare dict/list helpers when the host wired them.
         // Signature:
@@ -436,6 +475,7 @@ impl TraceEmitter {
             str_concat,
             str_concat_alloc,
             str_concat_seal_hash,
+            str_concat_n_alloc,
             str_contains,
             str_find,
             str_substring,
@@ -520,6 +560,14 @@ struct TraceEmitterState<'a, 'b> {
     /// path skips the seal call (correct but defeats the cached-hash
     /// win once the concat result feeds a dict key).
     str_concat_seal_hash: Option<ir::FuncRef>,
+    /// #168 optional N-operand single-allocation concat helper.
+    /// Imported only when the host wired
+    /// `HostHookFuncIds::str_concat_n_alloc`. `TraceOp::StrConcatN`
+    /// surfaces `EmitError::HostHookNotDeclared(StrConcatNAlloc)` when
+    /// this is `None` — the trace install pipeline then falls back to
+    /// the cranelift AOT backend (which has its own single-alloc
+    /// `StrConcatN` lowering).
+    str_concat_n_alloc: Option<ir::FuncRef>,
     str_contains: ir::FuncRef,
     str_find: ir::FuncRef,
     str_substring: ir::FuncRef,
@@ -654,6 +702,7 @@ impl<'a, 'b> TraceEmitterState<'a, 'b> {
                 next_values,
             } => self.emit_loop_back(*loop_id, next_values),
             TraceOp::StrConcat(dst, a, b) => self.emit_str_concat(*dst, *a, *b),
+            TraceOp::StrConcatN { dst, operands } => self.emit_str_concat_n(*dst, operands),
             TraceOp::StrContains(dst, a, b) => self.emit_str_contains(*dst, *a, *b),
             TraceOp::StrFind(dst, a, b) => self.emit_str_find(*dst, *a, *b),
             TraceOp::StrSubstring(dst, s, start, len) => {
@@ -1160,6 +1209,128 @@ impl<'a, 'b> TraceEmitterState<'a, 'b> {
         let inst = self.builder.ins().call(self.str_concat, &[va, vb]);
         let r = self.builder.inst_results(inst)[0];
         self.bind(dst, r);
+        Ok(())
+    }
+
+    /// #168 `StrConcatN { dst, operands }` lowers to a single
+    /// allocation + per-operand payload memcpy via the
+    /// `__relon_str_concat_n_alloc` helper, mirroring the two-operand
+    /// inline `StrConcat` lowering's split between cranelift IR
+    /// (length sum + stack-slot pointer table) and the C-side
+    /// allocator (alloc + memcpy loop).
+    ///
+    /// ## Lowering
+    ///
+    /// 1. For each `operands[i]`, load `len.i64` off the `StringRef`
+    ///    header and accumulate into `total_len` via `iadd`.
+    /// 2. Reserve an `[*const StringRef; N]` stack slot, then
+    ///    `stack_store` each operand's pointer SSA into the slot.
+    /// 3. `stack_addr` to materialise a pointer to the slot, then call
+    ///    `__relon_str_concat_n_alloc(slot_ptr, N, total_len)`.
+    /// 4. Call `__relon_str_concat_seal_hash(result)` so the cached
+    ///    `fx_hash` matches the just-filled payload (same Tier 1b
+    ///    contract the inline `StrConcat` lowering follows).
+    /// 5. Bind `result` to `dst`.
+    ///
+    /// ## Caps
+    ///
+    /// The recorder caps `operand_count` at
+    /// [`relon_trace_recorder::lowering::MAX_INLINE_STR_CONCAT_N`] so
+    /// the unrolled per-operand length loads + stores fit in a small
+    /// constant number of cranelift insns. This emitter trusts the
+    /// recorder's cap and lowers any `operands.len() >= 3` it sees,
+    /// surfacing a defensive `EmitError::HostHookNotDeclared` only
+    /// when the host did not wire the alloc helper.
+    fn emit_str_concat_n(
+        &mut self,
+        dst: SsaVar,
+        operands: &[SsaVar],
+    ) -> Result<(), EmitError> {
+        // Defensive: the recorder guarantees `len >= 3`; reject
+        // anything else so a malformed buffer can't slip through to
+        // the allocator helper with an under-budget total_len.
+        if operands.len() < 3 {
+            return Err(EmitError::Malformed(format!(
+                "TraceOp::StrConcatN with operand_count={} (expected >= 3)",
+                operands.len()
+            )));
+        }
+        let alloc_fn = self
+            .str_concat_n_alloc
+            .ok_or(EmitError::HostHookNotDeclared(HostHookId::StrConcatNAlloc))?;
+
+        // 1. Resolve each operand SSA to its cranelift Value (a
+        //    pointer-typed slot carrying `*const StringRef`).
+        let mut operand_vals: Vec<ir::Value> = Vec::with_capacity(operands.len());
+        for &op_ssa in operands {
+            let v = self.lookup(op_ssa)?;
+            let v = self.widen_to_i64(v);
+            operand_vals.push(v);
+        }
+
+        // 2. Length-sum: load each operand's `.len` field and reduce
+        //    via `iadd` so cranelift sees a single `total_len` SSA the
+        //    allocator helper consumes.
+        let mut total_len = self.builder.ins().load(
+            I64,
+            MemFlags::trusted(),
+            operand_vals[0],
+            relon_trace_jit::runtime::STRING_REF_LEN_OFFSET,
+        );
+        for v in &operand_vals[1..] {
+            let len_i = self.builder.ins().load(
+                I64,
+                MemFlags::trusted(),
+                *v,
+                relon_trace_jit::runtime::STRING_REF_LEN_OFFSET,
+            );
+            total_len = self.builder.ins().iadd(total_len, len_i);
+        }
+
+        // 3. Stack-spill the operand pointer table. Each slot is an
+        //    `i64` (= pointer on 64-bit hosts) and aligned to 8 bytes
+        //    so the allocator helper can read it with a plain
+        //    `load.i64`. The slot's lifetime ends at the next
+        //    cranelift `call` once the helper has copied the bytes,
+        //    so no further book-keeping is required.
+        let slot_bytes = (operands.len() as u32) * 8;
+        let stack_slot = self
+            .builder
+            .create_sized_stack_slot(StackSlotData::new(
+                StackSlotKind::ExplicitSlot,
+                slot_bytes,
+                3, // 2^3 = 8-byte align
+            ));
+        for (i, v) in operand_vals.iter().enumerate() {
+            self.builder
+                .ins()
+                .stack_store(*v, stack_slot, (i as i32) * 8);
+        }
+        let slot_ptr = self
+            .builder
+            .ins()
+            .stack_addr(self.pointer_ty, stack_slot, 0);
+
+        // 4. Call the alloc-and-memcpy helper. `n` and `total_len` are
+        //    widened to i64 by the signature; cranelift truncates on
+        //    the SysV ABI if the helper's prototype is narrower (it
+        //    isn't — both args are `usize`).
+        let n_const = self.builder.ins().iconst(I64, operands.len() as i64);
+        let alloc_inst = self
+            .builder
+            .ins()
+            .call(alloc_fn, &[slot_ptr, n_const, total_len]);
+        let result_ptr = self.builder.inst_results(alloc_inst)[0];
+
+        // 5. Seal the cached fx_hash on the freshly-built StringRef
+        //    so cross-trace dict-key lookups see a valid digest.
+        //    Mirrors the inline two-operand `StrConcat` path; absence
+        //    of the seal helper would leave `hash = 0` and silently
+        //    miss the dict IC on every trace exit.
+        if let Some(seal_fn) = self.str_concat_seal_hash {
+            self.builder.ins().call(seal_fn, &[result_ptr]);
+        }
+        self.bind(dst, result_ptr);
         Ok(())
     }
 
@@ -2256,6 +2427,13 @@ pub enum EmitError {
     HostHookNotDeclared(HostHookId),
     /// Forwarded from [`crate::guard_emit::GuardEmitError`].
     Guard(GuardEmitError),
+    /// #168: catch-all for malformed-buffer rejects the per-op
+    /// lowering helpers raise (e.g. `TraceOp::StrConcatN` with an
+    /// `operands.len()` outside the recorder's documented cap). The
+    /// message is intended for diagnostics only; the install pipeline
+    /// reports it through the usual `EmitError` Display path so the
+    /// outer tier router can fall back to the cranelift AOT backend.
+    Malformed(String),
 }
 
 impl std::fmt::Display for EmitError {
@@ -2280,6 +2458,7 @@ impl std::fmt::Display for EmitError {
                 id.symbol()
             ),
             EmitError::Guard(e) => write!(f, "guard emit failure: {}", e),
+            EmitError::Malformed(s) => write!(f, "malformed trace op: {}", s),
         }
     }
 }

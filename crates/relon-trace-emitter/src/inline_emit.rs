@@ -299,6 +299,7 @@ impl<'a, 'b> InlineEmitterState<'a, 'b> {
             // import machinery. Surface the same fallback error so the
             // caller routes the trace through the regular emitter.
             TraceOp::StrConcat(_, _, _)
+            | TraceOp::StrConcatN { .. }
             | TraceOp::StrContains(_, _, _)
             | TraceOp::StrFind(_, _, _)
             | TraceOp::StrSubstring(_, _, _, _)
