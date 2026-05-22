@@ -14,7 +14,7 @@
 //! and the JIT module finalisation; the trace-emitter crate would
 //! need an entire test harness to reach the same point.
 
-use relon_codegen_native::trace_install::TraceJitState;
+use relon_codegen_native::trace_install::{MaterialisedValue, ReturnKind, TraceJitState};
 use relon_trace_abi::TraceContext;
 use relon_trace_jit::runtime::{__relon_str_concat, StringRef};
 use relon_trace_jit::{TraceBuffer, TraceOp};
@@ -81,19 +81,25 @@ fn assert_concat_n_matches_shim(operands_text: &[&'static str]) {
         .collect();
     let args: Vec<u64> = operand_ptrs.iter().map(|p| *p as u64).collect();
 
-    let hooks = relon_codegen_native::default_host_hooks();
-    let mut ctx = TraceContext::with_hooks(64, hooks);
-    let status = unsafe { jited.invoke_raw(&mut ctx as *mut _, args.as_ptr()) };
-    assert_eq!(
-        status, 0,
-        "StrConcatN install + invoke must succeed (status=0); got {status}"
-    );
-
-    let trace_result_ptr = ctx.result_slot as *const StringRef;
-    let trace_payload = read_payload(trace_result_ptr);
-
+    // Capture the oracle payload **before** invoking the trace —
+    // `invoke_materialised` reclaims the trace string arena after
+    // copying the payload, which would dangle the oracle pointer.
     let oracle_ptr = oracle_concat(&operand_ptrs);
     let oracle_payload = read_payload(oracle_ptr);
+
+    let hooks = relon_codegen_native::default_host_hooks();
+    let mut ctx = TraceContext::with_hooks(64, hooks);
+    // Review #178 P2: high-level invoke returns an owned SmolStr;
+    // caller never touches the arena `*const StringRef`.
+    let val = unsafe {
+        jited
+            .invoke_materialised(&mut ctx as *mut _, args.as_ptr(), ReturnKind::String)
+            .expect("StrConcatN install + invoke must succeed")
+    };
+    let trace_payload: Vec<u8> = match val {
+        MaterialisedValue::String(s) => s.as_str().as_bytes().to_vec(),
+        other => panic!("expected MaterialisedValue::String, got {other:?}"),
+    };
 
     assert_eq!(
         trace_payload, oracle_payload,
@@ -112,9 +118,8 @@ fn assert_concat_n_matches_shim(operands_text: &[&'static str]) {
         "concat-n payload must equal the source-order byte join"
     );
 
-    // Keep the JIT module alive for the duration of the result read;
-    // the result pointer references memory the leak-arena allocates
-    // through `__relon_str_concat_n_alloc`.
+    // Keep the JIT module alive past the SmolStr move — the bytes
+    // are owned now but the trace fn pointer ride the `jited` Arc.
     let _ = &jited;
 }
 
@@ -137,26 +142,50 @@ fn str_concat_n_three_operands_with_empty_segments() {
 fn str_concat_n_three_operands_drives_a_hot_loop() {
     // Drive the same installed trace through a hot loop so the install
     // / re-invoke path exercises repeated allocation through
-    // `__relon_str_concat_n_alloc`. The trace-JIT's "leak arena" still
-    // holds the per-iter StringRefs alive; the loop is bounded.
+    // `__relon_str_concat_n_alloc`. Review #178 P2:
+    // `invoke_materialised` reclaims the trace string arena after
+    // each invoke — including the operand `StringRef`s registered by
+    // `from_static`. Production hosts handle this by interning the
+    // operand strings outside the trace arena; the test mirrors the
+    // shape by re-registering the operands inside the loop so each
+    // iter starts with a fresh arena.
     let trace = build_concat_n_trace(3);
     let state = TraceJitState::new();
     let jited = state.jit_compile_buffer_for_fn(42, trace).expect("install");
-    let operands = [
-        StringRef::from_static("L_"),
-        StringRef::from_static("M_"),
-        StringRef::from_static("R"),
-    ];
-    let args: [u64; 3] = [operands[0] as u64, operands[1] as u64, operands[2] as u64];
     let hooks = relon_codegen_native::default_host_hooks();
     for iter in 0..32 {
+        let operands = [
+            StringRef::from_static("L_"),
+            StringRef::from_static("M_"),
+            StringRef::from_static("R"),
+        ];
+        let args: [u64; 3] = [operands[0] as u64, operands[1] as u64, operands[2] as u64];
         let mut ctx = TraceContext::with_hooks(64, hooks);
-        let status = unsafe { jited.invoke_raw(&mut ctx as *mut _, args.as_ptr()) };
+        let val = unsafe {
+            jited
+                .invoke_materialised(&mut ctx as *mut _, args.as_ptr(), ReturnKind::String)
+                .unwrap_or_else(|e| panic!("iter {iter}: invoke must Succeed; got {e:?}"))
+        };
+        match val {
+            MaterialisedValue::String(s) => {
+                assert_eq!(
+                    s.as_str().as_bytes(),
+                    b"L_M_R",
+                    "iter {iter}: payload drift"
+                );
+            }
+            other => panic!("iter {iter}: expected String, got {other:?}"),
+        }
+        // The reclaim that runs inside invoke_materialised drains the
+        // per-iter operand allocations along with the trace's result —
+        // confirms the arena is fully drained between iters, which is
+        // the property the original test (`invoke_raw` + manual
+        // pointer read) could not assert without re-implementing the
+        // reclaim path here.
         assert_eq!(
-            status, 0,
-            "iter {iter}: hot-loop invoke of StrConcatN trace must Succeed"
+            relon_trace_jit::runtime::trace_string_arena_len(),
+            0,
+            "iter {iter}: arena must be drained after invoke_materialised"
         );
-        let payload = read_payload(ctx.result_slot as *const StringRef);
-        assert_eq!(payload, b"L_M_R", "iter {iter}: payload drift");
     }
 }
