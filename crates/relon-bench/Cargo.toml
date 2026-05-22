@@ -195,6 +195,15 @@ name = "sso"
 harness = false
 path = "benches/sso.rs"
 
+# `#161` (2026-05-22): write-to-buffer micro-bench. Targets the
+# `SmolStr::try_build_inline` fast path stdlib `to_lower` / `concat`
+# helpers now route through for short ASCII payloads. Run via
+# `cargo bench -p relon-bench --bench string_stdlib`.
+[[bench]]
+name = "string_stdlib"
+harness = false
+path = "benches/string_stdlib.rs"
+
 # v6-λ-0 (bench methodology hardening, 2026-05-19): post-processor for
 # criterion's per-sample `sample.json` outputs. Walks
 # `target/criterion/<group>/<dim>/<row>/new/sample.json` and prints a

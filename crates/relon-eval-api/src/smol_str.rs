@@ -269,6 +269,51 @@ impl SmolStr {
         // call `into_string` (host boundary, JSON projector).
         self.as_str().to_owned()
     }
+
+    /// Build an inline `SmolStr` by writing UTF-8 bytes directly into
+    /// the 22-byte inline slot via the caller-supplied writer.
+    ///
+    /// `out_len` is the number of bytes the writer will emit; the call
+    /// returns `None` immediately if `out_len > SMOL_STR_INLINE_CAP`,
+    /// letting the caller fall through to its heap-path implementation
+    /// without paying for the writer invocation. When the inline path
+    /// is taken the caller receives a `&mut [u8]` of length `out_len`
+    /// pointing into the inline buffer and is expected to fill every
+    /// byte with a valid UTF-8 codeunit (typically ASCII bytes, since
+    /// the inline cap is 22 bytes and any short Unicode payload that
+    /// can stay inline fits the same byte slice).
+    ///
+    /// # Safety contract (informal)
+    ///
+    /// Caller MUST write exactly `out_len` valid UTF-8 bytes into the
+    /// slice. The closure receives a zero-initialised buffer so a
+    /// missed byte is a `0x00` — still valid UTF-8, but a logic bug
+    /// the debug-mode `assert!(self.as_str().is_char_boundary(_))`
+    /// downstream catches. This API exists to let `to_lower`/`to_upper`
+    /// stdlib helpers route the ASCII fast path through the inline
+    /// slot without going through a `String::with_capacity` + `Arc`
+    /// wrap (see `#161` write-to-buffer rollout); a misuse would
+    /// produce a string with non-UTF-8 interior bytes, which `as_str`
+    /// then exposes via an unchecked `from_utf8_unchecked`.
+    #[inline]
+    pub fn try_build_inline<F>(out_len: usize, write: F) -> Option<Self>
+    where
+        F: FnOnce(&mut [u8]),
+    {
+        if out_len > SMOL_STR_INLINE_CAP {
+            return None;
+        }
+        let mut data = [0u8; SMOL_STR_INLINE_CAP];
+        // Hand the writer the exact slice it must fill. The zero-fill
+        // on the tail bytes (past `out_len`) is the same SIMD-width
+        // store the `from_borrowed` path performs, so the cost matches
+        // the existing inline-path baseline.
+        write(&mut data[..out_len]);
+        Some(SmolStr::Inline {
+            len: out_len as u8,
+            data,
+        })
+    }
 }
 
 impl Default for SmolStr {
@@ -575,6 +620,50 @@ mod tests {
         assert!(!s.is_inline());
         assert_eq!(s.as_str(), "aaaaaaaabbbbbbbbccccccccdddddddd");
         assert_eq!(s.len(), 32);
+    }
+
+    #[test]
+    fn try_build_inline_fills_inline_slot() {
+        // Writer fills the slice byte-by-byte with the lower-case of
+        // each ASCII letter — exercises the to_lower fast path shape
+        // the stdlib helpers now use.
+        let src = b"HELLO";
+        let s = SmolStr::try_build_inline(src.len(), |out| {
+            for (i, b) in src.iter().enumerate() {
+                out[i] = b.to_ascii_lowercase();
+            }
+        })
+        .expect("inline path should accept 5-byte payload");
+        assert!(s.is_inline());
+        assert_eq!(s.as_str(), "hello");
+    }
+
+    #[test]
+    fn try_build_inline_at_cap_inline() {
+        // Exactly 22 bytes — boundary of the inline slot.
+        let s =
+            SmolStr::try_build_inline(SMOL_STR_INLINE_CAP, |out| out.fill(b'x')).expect("22 fits");
+        assert!(s.is_inline());
+        assert_eq!(s.len(), SMOL_STR_INLINE_CAP);
+    }
+
+    #[test]
+    fn try_build_inline_overflow_returns_none() {
+        // 23 bytes — past the cap. Writer must not be invoked; we
+        // assert via a panicking closure to catch a hypothetical
+        // regression.
+        let s = SmolStr::try_build_inline(SMOL_STR_INLINE_CAP + 1, |_out| {
+            panic!("writer must not run when out_len exceeds cap");
+        });
+        assert!(s.is_none());
+    }
+
+    #[test]
+    fn try_build_inline_zero_length_is_empty() {
+        let s = SmolStr::try_build_inline(0, |_out| { /* nothing */ })
+            .expect("zero-length always inline");
+        assert!(s.is_inline());
+        assert_eq!(s.as_str(), "");
     }
 
     #[test]

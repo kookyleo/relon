@@ -1098,6 +1098,107 @@ enum CaseFoldMode {
     Title,
 }
 
+/// `#161` write-to-buffer fast path for `to_upper` / `to_lower` /
+/// `title` on short ASCII inputs.
+///
+/// When the payload is ≤ [`relon_eval_api::SMOL_STR_INLINE_CAP`] bytes
+/// **and** entirely ASCII, output length equals input length and every
+/// byte is a single-byte UTF-8 codeunit. We can therefore write the
+/// folded bytes directly into the `SmolStr` inline slot via
+/// [`SmolStr::try_build_inline`], skipping the
+/// `String::with_capacity` allocation + `Arc<str>` wrap that the
+/// historical `fold_string(...).into()` path paid even on inline-sized
+/// outputs.
+///
+/// Returns `None` and falls through to the general
+/// [`fold_string`] path for any of:
+///
+///   * Payload longer than the inline cap (heap-side anyway).
+///   * Non-ASCII payload — multi-codepoint mappings (`ß` -> `SS`,
+///     `ﬁ` -> `FI`, sigma-final, combining marks) can make output
+///     length differ from input length, so the byte-equal precondition
+///     no longer holds.
+///   * Turkish locale — the `i` / `I` overrides emit 2-byte UTF-8
+///     output from 1-byte ASCII input, breaking the byte-equal
+///     contract.
+#[inline]
+fn fold_string_to_smol_ascii_fast(s: &str, mode: CaseFoldMode) -> Option<SmolStr> {
+    use relon_eval_api::SMOL_STR_INLINE_CAP;
+    let bytes = s.as_bytes();
+    if bytes.len() > SMOL_STR_INLINE_CAP {
+        return None;
+    }
+    if !s.is_ascii() {
+        return None;
+    }
+    let ir_mode = match mode {
+        CaseFoldMode::Upper => relon_ir::ascii_fold_simd::AsciiFoldMode::Upper,
+        CaseFoldMode::Lower => relon_ir::ascii_fold_simd::AsciiFoldMode::Lower,
+        CaseFoldMode::Title => relon_ir::ascii_fold_simd::AsciiFoldMode::Title,
+    };
+    // Inline buffer write: the slice handed to the writer is exactly
+    // `bytes.len()` bytes long, and the body below emits exactly that
+    // many bytes (output length == input length for ASCII upper /
+    // lower / title). The mask + xor body is the same one
+    // [`relon_ir::ascii_fold_simd::fold_ascii_prefix_upper_lower`]
+    // implements; we inline it here to write directly into the inline
+    // slot — going through the IR helper would force a scratch
+    // `Vec<u8>` allocation, defeating the alloc-skip the inline path
+    // exists for.
+    SmolStr::try_build_inline(bytes.len(), |out| match ir_mode {
+        relon_ir::ascii_fold_simd::AsciiFoldMode::Upper => {
+            // upper(b) = (b in 'a'..='z') ? b ^ 0x20 : b
+            for (i, &b) in bytes.iter().enumerate() {
+                let in_range = b.wrapping_sub(b'a') < 26;
+                out[i] = b ^ if in_range { 0x20 } else { 0x00 };
+            }
+        }
+        relon_ir::ascii_fold_simd::AsciiFoldMode::Lower => {
+            // lower(b) = (b in 'A'..='Z') ? b ^ 0x20 : b
+            for (i, &b) in bytes.iter().enumerate() {
+                let in_range = b.wrapping_sub(b'A') < 26;
+                out[i] = b ^ if in_range { 0x20 } else { 0x00 };
+            }
+        }
+        relon_ir::ascii_fold_simd::AsciiFoldMode::Title => {
+            // title walks the prefix tracking word-boundary state:
+            // ASCII whitespace resets `at_word_start = true`, the first
+            // non-whitespace codepoint after that uppers, every later
+            // codepoint in the word lowers.
+            let mut at_word_start = true;
+            for (i, &b) in bytes.iter().enumerate() {
+                if b.is_ascii_whitespace() {
+                    out[i] = b;
+                    at_word_start = true;
+                    continue;
+                }
+                out[i] = if at_word_start {
+                    let in_range = b.wrapping_sub(b'a') < 26;
+                    b ^ if in_range { 0x20 } else { 0x00 }
+                } else {
+                    let in_range = b.wrapping_sub(b'A') < 26;
+                    b ^ if in_range { 0x20 } else { 0x00 }
+                };
+                at_word_start = false;
+            }
+        }
+    })
+}
+
+/// `#161` write-to-buffer entry the `StringUpper` / `StringLower` /
+/// `StringTitle` callers reach. The ASCII-fast inline path skips the
+/// `String::with_capacity` + `Arc::from(String)` round-trip; the
+/// fallback re-uses [`fold_string`] for the full Unicode pipeline.
+#[inline]
+fn fold_string_to_smol(s: &str, mode: CaseFoldMode, locale_turkish: bool) -> SmolStr {
+    if !locale_turkish {
+        if let Some(smol) = fold_string_to_smol_ascii_fast(s, mode) {
+            return smol;
+        }
+    }
+    SmolStr::from(fold_string(s, mode, locale_turkish))
+}
+
 struct StringUpper;
 impl RelonFunction for StringUpper {
     fn call(
@@ -1108,9 +1209,11 @@ impl RelonFunction for StringUpper {
         let args = args.into_positional();
         expect_arg_count(&args, 1, range)?;
         let s = expect_string(&args[0], range)?;
-        Ok(Value::String(
-            fold_string(s, CaseFoldMode::Upper, false).into(),
-        ))
+        Ok(Value::String(fold_string_to_smol(
+            s,
+            CaseFoldMode::Upper,
+            false,
+        )))
     }
 }
 
@@ -1124,9 +1227,11 @@ impl RelonFunction for StringLower {
         let args = args.into_positional();
         expect_arg_count(&args, 1, range)?;
         let s = expect_string(&args[0], range)?;
-        Ok(Value::String(
-            fold_string(s, CaseFoldMode::Lower, false).into(),
-        ))
+        Ok(Value::String(fold_string_to_smol(
+            s,
+            CaseFoldMode::Lower,
+            false,
+        )))
     }
 }
 
@@ -1148,9 +1253,11 @@ impl RelonFunction for StringUpperLocale {
         let s = expect_string(&args[0], range)?;
         let locale = expect_string(&args[1], range)?;
         let tr = relon_ir::full_case_folding::is_turkish_locale(locale);
-        Ok(Value::String(
-            fold_string(s, CaseFoldMode::Upper, tr).into(),
-        ))
+        Ok(Value::String(fold_string_to_smol(
+            s,
+            CaseFoldMode::Upper,
+            tr,
+        )))
     }
 }
 
@@ -1166,9 +1273,11 @@ impl RelonFunction for StringLowerLocale {
         let s = expect_string(&args[0], range)?;
         let locale = expect_string(&args[1], range)?;
         let tr = relon_ir::full_case_folding::is_turkish_locale(locale);
-        Ok(Value::String(
-            fold_string(s, CaseFoldMode::Lower, tr).into(),
-        ))
+        Ok(Value::String(fold_string_to_smol(
+            s,
+            CaseFoldMode::Lower,
+            tr,
+        )))
     }
 }
 
@@ -1184,9 +1293,11 @@ impl RelonFunction for StringTitleLocale {
         let s = expect_string(&args[0], range)?;
         let locale = expect_string(&args[1], range)?;
         let tr = relon_ir::full_case_folding::is_turkish_locale(locale);
-        Ok(Value::String(
-            fold_string(s, CaseFoldMode::Title, tr).into(),
-        ))
+        Ok(Value::String(fold_string_to_smol(
+            s,
+            CaseFoldMode::Title,
+            tr,
+        )))
     }
 }
 
@@ -1217,9 +1328,11 @@ impl RelonFunction for StringTitle {
         let args = args.into_positional();
         expect_arg_count(&args, 1, range)?;
         let s = expect_string(&args[0], range)?;
-        Ok(Value::String(
-            fold_string(s, CaseFoldMode::Title, false).into(),
-        ))
+        Ok(Value::String(fold_string_to_smol(
+            s,
+            CaseFoldMode::Title,
+            false,
+        )))
     }
 }
 
@@ -1851,10 +1964,11 @@ impl RelonFunction for StringConcat {
         expect_arg_count(&args, 2, range)?;
         let lhs = expect_string(&args[0], range)?;
         let rhs = expect_string(&args[1], range)?;
-        let mut out = String::with_capacity(lhs.len() + rhs.len());
-        out.push_str(lhs);
-        out.push_str(rhs);
-        Ok(Value::String(out.into()))
+        // `#161` write-to-buffer: route through `SmolStr::concat` so
+        // short-string outputs (≤ 22 bytes total) land inline without
+        // the `String::with_capacity` + `Arc::from(String)` round-trip
+        // the old `out.into()` path always paid.
+        Ok(Value::String(SmolStr::concat(lhs, rhs)))
     }
 }
 
