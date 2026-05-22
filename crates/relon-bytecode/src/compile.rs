@@ -151,6 +151,16 @@ pub fn compile_function_in_module(
     let locals_used = max_local.map(|m| m + 1).unwrap_or(0);
     let locals = (func.params.len() as u32).max(locals_used);
 
+    // #166 M2-B from_source full cap-gate activation: scan the emitted
+    // ops for capability-sensitive shapes. `BcOp::CallNative` and
+    // `BcOp::CheckCap` are the only IR-level ops that touch the gate
+    // today; either presence means the dispatch path needs the
+    // installed gate consulted at entry too, so a trust-level downgrade
+    // between compile and run is caught before the first sensitive op
+    // observes any state. The flag is `false` for the scalar
+    // `from_source` envelope (arith / cmp / control flow only), which
+    // keeps the historical zero-overhead posture intact.
+    let requires_cap_consult = ops_contain_sensitive(&state.ops);
     Ok(BcFunction {
         ops: state.ops,
         locals,
@@ -171,7 +181,22 @@ pub fn compile_function_in_module(
         // closure constructions) populate this slice via the public
         // field.
         closure_bodies: Vec::new(),
+        requires_cap_consult,
     })
+}
+
+/// #166 M2-B from_source full cap-gate activation: scan a flat
+/// bytecode op stream for capability-sensitive shapes. Today only
+/// `BcOp::CallNative` and `BcOp::CheckCap` reach the gate, so the
+/// scan is a single pass. Scalar / control-flow / string-arena /
+/// list-arena ops do not consult the gate and are excluded.
+///
+/// Centralised here (instead of inlined at the compile-pass tail)
+/// so hand-built `BcFunction` constructors and the closure-body
+/// walker share the same predicate.
+pub(crate) fn ops_contain_sensitive(ops: &[BcOp]) -> bool {
+    ops.iter()
+        .any(|op| matches!(op, BcOp::CallNative { .. } | BcOp::CheckCap { .. }))
 }
 
 /// Resolve a stdlib `Op::Call { fn_index }` to its bundled

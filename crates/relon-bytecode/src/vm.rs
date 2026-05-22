@@ -268,6 +268,45 @@ impl CapabilityVtable {
         }
         Ok(())
     }
+
+    /// #166 M2-B from_source full cap-gate activation: sweep every
+    /// declared [`CapabilityBit`] through the installed gate.
+    ///
+    /// Unlike [`Self::consult_all_granted_bits`] (which only asks about
+    /// bits the host explicitly granted on the grant-bool vector), this
+    /// sweep asks about every bit the API knows about — `ReadsFs`,
+    /// `WritesFs`, `Network`, `ReadsClock`, `ReadsEnv`, `UsesRng`. The
+    /// first denial short-circuits with the corresponding
+    /// [`CapabilityError`].
+    ///
+    /// Used as the entry-time consult for functions whose op stream
+    /// contains a capability-sensitive op (`BcOp::CallNative` /
+    /// `BcOp::CheckCap`). A deny-everything gate paired with such a
+    /// function trips the prong before any op observes state — the
+    /// per-op consult emitted by those ops still fires independently,
+    /// so the entry sweep is defense in depth that catches the case
+    /// where the host installed the gate but the source happens to use
+    /// an op the per-op consult was already going to allow (today's
+    /// scalar `from_source` envelope has no sensitive ops yet; this
+    /// sweep is the activation point for the future widening).
+    ///
+    /// No-op when no gate is installed.
+    pub fn consult_all_declared_bits(&self) -> Result<(), CapabilityError> {
+        let Some(gate) = self.gate.as_ref() else {
+            return Ok(());
+        };
+        for bit in [
+            CapabilityBit::ReadsFs,
+            CapabilityBit::WritesFs,
+            CapabilityBit::Network,
+            CapabilityBit::ReadsClock,
+            CapabilityBit::ReadsEnv,
+            CapabilityBit::UsesRng,
+        ] {
+            gate.check(bit)?;
+        }
+        Ok(())
+    }
 }
 
 /// M2-B phase 2: walk every declared [`CapabilityBit`] and return the
@@ -839,6 +878,37 @@ impl BytecodeVm {
                 steps,
                 locals,
             );
+        }
+        // #166 M2-B from_source full cap-gate activation: when the
+        // compile pass flagged the function as carrying a capability-
+        // sensitive op (`BcOp::CallNative` / `BcOp::CheckCap` — or, for
+        // hand-built `BcFunction` instances, anything the host marked
+        // via `requires_cap_consult`), sweep every declared
+        // `CapabilityBit` through the installed gate before the first
+        // op dispatches. This activates the gate consult chain even
+        // when the per-op `cap_bit` carries `NO_CAPABILITY_BIT`
+        // (`u32::MAX`) — a future native fn whose declared gate is
+        // narrower than what the host might still deny still surfaces
+        // a denied bit at the entry boundary.
+        //
+        // No-op for scalar `from_source` (the historical M2-A
+        // envelope) — those functions compile with the flag cleared,
+        // so the consult never runs. The cost paid by hosts that opted
+        // into the gate is six virtual calls at the entry boundary
+        // (`Capabilities::check` per declared bit) — comparable to the
+        // cranelift backend's vtable-build-time sweep.
+        if func.requires_cap_consult {
+            if let Err(err) = self.config.cap_vtable.consult_all_declared_bits() {
+                return exit(
+                    None,
+                    Some(BcVmError::CapabilityDenied {
+                        cap_bit: err.cap.bit_index(),
+                    }),
+                    last_bc_idx,
+                    steps,
+                    locals,
+                );
+            }
         }
         // M2-B phase 4c: hot-counter prologue. Mirrors the cranelift
         // entry-fn prologue (`crates/relon-codegen-native/src/codegen/hot_counter.rs`)

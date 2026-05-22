@@ -223,6 +223,7 @@ fn partial_resume_capability_denied_replays() {
         string_pool: Vec::new(),
         fn_id: None,
         closure_bodies: Vec::new(),
+        requires_cap_consult: false,
     };
     let cfg = BcVmConfig {
         cap_vtable: CapabilityVtable::default(),
