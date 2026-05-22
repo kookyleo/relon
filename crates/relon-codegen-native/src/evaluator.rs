@@ -1139,24 +1139,29 @@ impl CraneliftAotEvaluator {
     /// Internal: invoke the legacy-shape JIT entry with the supplied
     /// i64 args.
     ///
-    /// 2026-05-21 dispatch-boundary lever (b): the `catch_unwind`
-    /// shield is now `cfg(debug_assertions)`-gated. Production /
-    /// release builds call the JIT entry directly because:
+    /// 2026-05-22 review #172: the `catch_unwind` shield runs in
+    /// **both** debug and release builds. The 2026-05-21 lever (b)
+    /// release-only skip is reverted because:
     ///
-    /// - cranelift codegen routes every guarded op through `cond_trap`
-    ///   plus a recorded `trap_code` — these become hardware traps
-    ///   intercepted by the signal-hook handler, not Rust panics.
-    /// - Helper-call symbols (`relon_now`, `relon_raise_trap`,
-    ///   `relon_cap_lookup`) are audited to never panic on their hot
-    ///   paths; they return error codes via the sandbox state instead.
-    /// - The thread-local signal slot (`dispatch_post` reads it before
-    ///   the trap_code) catches SIGSEGV / SIGFPE / SIGILL even without
-    ///   `catch_unwind`.
-    ///
-    /// Debug builds keep `catch_unwind` so unit tests that exercise
-    /// pathological codegen (e.g. helper-call panics regression suite)
-    /// still surface a typed error rather than aborting the test
-    /// process.
+    /// - The shield's role is to convert a Rust panic from a
+    ///   misbehaving helper symbol into a typed `RuntimeError`. The
+    ///   helper-call surface is audited as non-panicking, but the
+    ///   audit is a static promise; debug-only enforcement turned
+    ///   the shield into a development-time-only safety net. Release
+    ///   builds were one helper regression away from aborting the
+    ///   host process.
+    /// - The shield is **not** what types SIGSEGV / SIGFPE / SIGILL.
+    ///   Those are observed via the thread-local signal slot
+    ///   populated by `crate::trap_handler`, which works
+    ///   independently of `catch_unwind` (and the trap_handler doc
+    ///   honestly admits the slot is best-effort: a real hardware
+    ///   fault typically aborts the process via the chained default
+    ///   handler before the trampoline ever reads it).
+    /// - Measured release-build cost of the shield on
+    ///   `dispatch_cranelift_step_legacy_i64` (#154 baseline) is
+    ///   ~1.75 ns / +12 % over the unshielded path — acceptable to
+    ///   restore the typed-error guarantee for any helper-panic
+    ///   regression that escapes the audit.
     fn invoke_legacy_entry(&self, args: [i64; 4]) -> Result<i64, RuntimeError> {
         // 2026-05-22 P0 fix: allocate a fresh per-call SandboxState
         // from the evaluator's immutable template. Two threads
@@ -1169,17 +1174,13 @@ impl CraneliftAotEvaluator {
         // overhead matters on the dispatch hot path.
         let state = Box::new(SandboxState::from_template(&self.sandbox_shared));
         let state_ptr: *const SandboxState = &*state;
-        // 2026-05-21 dispatch-boundary lever (c): the per-call state
-        // starts with `trap_code == 0` and a clean thread_local signal
-        // slot (we reset before dispatch only on debug builds so panic
-        // tests don't leak stale codes). Release builds rely on the
-        // per-call ownership for the trap slot and let
-        // `dispatch_post_unshielded` reset the signal slot on
-        // observation.
-        #[cfg(debug_assertions)]
-        {
-            crate::trap_handler::reset_thread_signal_slot();
-        }
+        // 2026-05-22 review #172: reset the thread-local signal slot
+        // before every dispatch in all build modes. The previous
+        // debug-only reset relied on the (release-only) lever (b)
+        // skip; with the `catch_unwind` shield restored in release
+        // we share the same pre-/post-dispatch protocol across both
+        // build modes.
+        crate::trap_handler::reset_thread_signal_slot();
         // 2026-05-21 dispatch-boundary lever (d): use the de-tagged
         // inline-cached entry pointer (single field load) instead of
         // matching on the `entry_fn` enum discriminant each invoke.
@@ -1193,23 +1194,10 @@ impl CraneliftAotEvaluator {
             }
         };
 
-        #[cfg(debug_assertions)]
-        {
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
-                entry(state_ptr, args[0], args[1], args[2], args[3])
-            }));
-            self.dispatch_post(&state, result)
-        }
-        #[cfg(not(debug_assertions))]
-        {
-            // SAFETY: the signal-hook handler is process-wide-installed
-            // at evaluator construction; SIGSEGV / SIGFPE / SIGILL from
-            // the JIT body land in the thread-local slot which
-            // `dispatch_post_unshielded` reads. Helper calls are audited
-            // to never panic on their hot paths.
-            let value = unsafe { entry(state_ptr, args[0], args[1], args[2], args[3]) };
-            self.dispatch_post_unshielded(&state, value)
-        }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            entry(state_ptr, args[0], args[1], args[2], args[3])
+        }));
+        self.dispatch_post(&state, result)
     }
 
     /// Same as [`Self::invoke_buffer_entry_with_scratch`] without an
@@ -1258,10 +1246,9 @@ impl CraneliftAotEvaluator {
         // base, which previously raced on a shared Arc<SandboxState>.
         let state = Box::new(SandboxState::from_template(&self.sandbox_shared));
         let state_ptr: *const SandboxState = &*state;
-        #[cfg(debug_assertions)]
-        {
-            crate::trap_handler::reset_thread_signal_slot();
-        }
+        // 2026-05-22 review #172: reset across debug + release; see
+        // `invoke_legacy_entry` for the rationale.
+        crate::trap_handler::reset_thread_signal_slot();
         // SAFETY: `arena` is borrowed mutably here and stays valid
         // through the JIT call's lifetime (`arena` outlives this
         // function). The per-call `state` is the unique owner of the
@@ -1282,73 +1269,23 @@ impl CraneliftAotEvaluator {
             }
         };
 
-        // 2026-05-21 dispatch-boundary lever (b): cfg-gate the
-        // catch_unwind shield to debug builds. See `invoke_legacy_entry`
-        // for the audit; the buffer-protocol entry shares the same
-        // helper-call surface so the same reasoning applies.
-        #[cfg(debug_assertions)]
-        {
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
-                entry(
-                    state_ptr,
-                    in_ptr as i32,
-                    in_len as i32,
-                    out_ptr as i32,
-                    out_cap as i32,
-                    caps as i64,
-                )
-            }));
-            self.dispatch_post(&state, result)
-        }
-        #[cfg(not(debug_assertions))]
-        {
-            let value = unsafe {
-                entry(
-                    state_ptr,
-                    in_ptr as i32,
-                    in_len as i32,
-                    out_ptr as i32,
-                    out_cap as i32,
-                    caps as i64,
-                )
-            };
-            self.dispatch_post_unshielded(&state, value)
-        }
-    }
-
-    /// 2026-05-21 dispatch-boundary lever (b) helper: release-build
-    /// post-call processing. Same checks as [`Self::dispatch_post`]
-    /// minus the panic unwrap step. The JIT body was called outside a
-    /// `catch_unwind` so `value` is already the raw return; we still
-    /// consult the thread-local signal slot and the sandbox-state
-    /// `trap_code` so hardware traps and JIT-side `cond_trap`s surface
-    /// as typed errors.
-    ///
-    /// 2026-05-21 lever (c): owns the lazy-reset side of the lazy
-    /// trap-code protocol. Uses `take_trap_code` (load-then-store-iff-
-    /// nonzero) and only resets the thread-local signal slot when a
-    /// signal actually fired, so the success path is two predictable-
-    /// not-taken branches with no atomic stores.
-    #[cfg(not(debug_assertions))]
-    fn dispatch_post_unshielded<T>(
-        &self,
-        state: &SandboxState,
-        value: T,
-    ) -> Result<T, RuntimeError> {
-        let signal_code = crate::trap_handler::read_thread_signal_slot();
-        if signal_code != 0 {
-            // Reset the slot eagerly so the next dispatch doesn't pick
-            // up a stale signal code.
-            crate::trap_handler::reset_thread_signal_slot();
-            if let Some(kind) = crate::trap_handler::signal_to_trap_kind(signal_code) {
-                return Err(kind.to_runtime_error(self.entry_range));
-            }
-        }
-        let code = state.take_trap_code();
-        if code != 0 {
-            return Err(TrapKind::from_code(code as u8).to_runtime_error(self.entry_range));
-        }
-        Ok(value)
+        // 2026-05-22 review #172: the `catch_unwind` shield runs in
+        // both debug and release. The release-only skip introduced
+        // by 2026-05-21 lever (b) is reverted because the
+        // helper-non-panic audit is a static promise, not an
+        // enforced invariant — see `invoke_legacy_entry` for the
+        // full rationale.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            entry(
+                state_ptr,
+                in_ptr as i32,
+                in_len as i32,
+                out_ptr as i32,
+                out_cap as i32,
+                caps as i64,
+            )
+        }));
+        self.dispatch_post(&state, result)
     }
 
     /// Post-process a JIT-call result: surface typed traps recorded in
@@ -1361,10 +1298,20 @@ impl CraneliftAotEvaluator {
     /// signal observation came from the hardware / OS layer which
     /// our codegen guards can't intercept.
     ///
-    /// 2026-05-21 lever (b): only used by the debug-build dispatch
-    /// path; release builds skip the `catch_unwind` and call
-    /// `dispatch_post_unshielded` instead.
-    #[cfg(debug_assertions)]
+    /// 2026-05-22 review #172: this helper runs on both debug and
+    /// release dispatch paths now that the `catch_unwind` shield is
+    /// no longer cfg-gated. The signal slot read remains
+    /// best-effort — a genuine SIGSEGV typically aborts the process
+    /// via the chained default handler before we get to it (see
+    /// `crate::trap_handler` for the honest semantics); but if
+    /// control does return, we still convert the slot into a typed
+    /// error rather than silently passing the JIT's sentinel
+    /// through.
+    ///
+    /// 2026-05-21 lever (c): success path uses `take_trap_code`
+    /// (load-then-store-iff-nonzero) so the predictable-not-taken
+    /// branch has no atomic store cost. The signal-slot reset is
+    /// also only performed when a signal actually fired.
     fn dispatch_post<T>(
         &self,
         state: &SandboxState,
@@ -1375,20 +1322,23 @@ impl CraneliftAotEvaluator {
         // JIT-side `cond_trap` sequence never ran.
         let signal_code = crate::trap_handler::read_thread_signal_slot();
         if signal_code != 0 {
+            // Reset the slot eagerly so the next dispatch doesn't pick
+            // up a stale signal code.
+            crate::trap_handler::reset_thread_signal_slot();
             if let Some(kind) = crate::trap_handler::signal_to_trap_kind(signal_code) {
                 return Err(kind.to_runtime_error(self.entry_range));
             }
         }
         match result {
             Ok(v) => {
-                let code = state.trap_code();
+                let code = state.take_trap_code();
                 if code != 0 {
                     return Err(TrapKind::from_code(code as u8).to_runtime_error(self.entry_range));
                 }
                 Ok(v)
             }
             Err(payload) => {
-                let code = state.trap_code();
+                let code = state.take_trap_code();
                 let _ = payload;
                 if code != 0 {
                     Err(TrapKind::from_code(code as u8).to_runtime_error(self.entry_range))
