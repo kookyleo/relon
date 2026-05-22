@@ -197,24 +197,24 @@ impl NativeFnGate {
     /// uses the first entry as the failure reason, analyzer emits one
     /// diagnostic per entry.
     pub fn missing_bits(&self, caps: &Capabilities) -> Vec<&'static str> {
-        let mut out = Vec::new();
+        let mut out = Vec::with_capacity(6);
         if self.reads_fs && !caps.reads_fs {
-            out.push("reads_fs");
+            out.push(CapabilityBit::ReadsFs.as_str());
         }
         if self.writes_fs && !caps.writes_fs {
-            out.push("writes_fs");
+            out.push(CapabilityBit::WritesFs.as_str());
         }
         if self.network && !caps.network {
-            out.push("network");
+            out.push(CapabilityBit::Network.as_str());
         }
         if self.reads_clock && !caps.reads_clock {
-            out.push("reads_clock");
+            out.push(CapabilityBit::ReadsClock.as_str());
         }
         if self.reads_env && !caps.reads_env {
-            out.push("reads_env");
+            out.push(CapabilityBit::ReadsEnv.as_str());
         }
         if self.uses_rng && !caps.uses_rng {
-            out.push("uses_rng");
+            out.push(CapabilityBit::UsesRng.as_str());
         }
         out
     }

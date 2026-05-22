@@ -789,10 +789,8 @@ impl<'a> BufferBuilder<'a> {
         if align <= 1 {
             return;
         }
-        let rem = self.bytes.len() % align;
-        if rem != 0 {
-            let pad = align - rem;
-            self.bytes.resize(self.bytes.len() + pad, 0);
+        if let Some(target) = self.bytes.len().checked_next_multiple_of(align) {
+            self.bytes.resize(target, 0);
         }
     }
 

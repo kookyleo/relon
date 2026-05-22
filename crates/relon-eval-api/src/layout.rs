@@ -296,14 +296,7 @@ fn list_layout_decision(
     element: &TypeRepr,
 ) -> Result<FieldLayoutDecision, LayoutError> {
     match element {
-        TypeRepr::Int => Ok(FieldLayoutDecision {
-            kind: FieldKind::PointerIndirect { tail_alignment: 8 },
-            list_element: Some(ListElementKind::InlineFixed {
-                elem_size: 8,
-                elem_align: 8,
-            }),
-        }),
-        TypeRepr::Float => Ok(FieldLayoutDecision {
+        TypeRepr::Int | TypeRepr::Float => Ok(FieldLayoutDecision {
             kind: FieldKind::PointerIndirect { tail_alignment: 8 },
             list_element: Some(ListElementKind::InlineFixed {
                 elem_size: 8,
@@ -357,19 +350,11 @@ fn list_layout_decision(
 
 /// Round `value` up to the next multiple of `align`. `align` is
 /// assumed to be a non-zero power of two (the layout spec guarantees
-/// alignments of 1 / 4 / 8 for v1; the routine still works for any
-/// non-zero divisor).
+/// alignments of 1 / 4 / 8 for v1; std's `checked_next_multiple_of`
+/// works for any non-zero divisor and returns `None` on overflow).
 fn align_up(value: usize, align: usize) -> Option<usize> {
     debug_assert!(align != 0, "alignment must be non-zero");
-    // Equivalent to `(value + align - 1) & !(align - 1)` for power-
-    // of-two alignments, but we use the modulo form so the routine
-    // doesn't silently produce garbage for a hypothetical non-power-
-    // of-two alignment a future type might want.
-    let rem = value % align;
-    if rem == 0 {
-        return Some(value);
-    }
-    value.checked_add(align - rem)
+    value.checked_next_multiple_of(align)
 }
 
 /// Schema-level layout entry point. Computes the offset table for the
