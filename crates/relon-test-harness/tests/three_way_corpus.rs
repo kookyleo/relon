@@ -22,6 +22,7 @@
 use std::collections::BTreeMap;
 
 use relon_test_harness::corpus::{all_cases, CorpusCase, Tier};
+use relon_test_harness::ratchet;
 use relon_test_harness::three_way::{diff_test_3way, ThreeWayResult};
 
 #[derive(Debug, Default)]
@@ -72,6 +73,7 @@ fn corpus_three_way_diff_aggregates() {
     let mut tree_walk_missing = 0usize;
     let mut mismatches: Vec<(String, String)> = Vec::new();
     let mut not_applicable_reasons: Vec<(String, String)> = Vec::new();
+    let mut ratchet_violations = Vec::new();
 
     for case in &cases {
         let counts = per_tier.entry(tier_label(case.tier)).or_default();
@@ -85,6 +87,9 @@ fn corpus_three_way_diff_aggregates() {
                 continue;
             }
         };
+        if let Some(v) = ratchet::check_three_way(case.name, &result, case.supported_by) {
+            ratchet_violations.push(v);
+        }
         let label = classify(&result, case);
         match (&result, label) {
             (_, "AllAgree") => {
@@ -147,6 +152,16 @@ fn corpus_three_way_diff_aggregates() {
         "{} three-way mismatches",
         mismatches.len()
     );
+
+    if !ratchet_violations.is_empty() {
+        for v in &ratchet_violations {
+            eprintln!("RATCHET {v}");
+        }
+        panic!(
+            "{} three-way ratchet violation(s): a claimed-support backend regressed to its fallback",
+            ratchet_violations.len()
+        );
+    }
 
     // v6-δ M1 gate: at least 40 of the 52 cases must reach
     // `AllAgree` bit-identically (M5 baseline was 22 — the gate

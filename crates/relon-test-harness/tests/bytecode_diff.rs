@@ -14,6 +14,7 @@ use std::collections::BTreeMap;
 
 use relon_test_harness::corpus::{all_cases, CorpusCase, Tier};
 use relon_test_harness::four_way::{diff_test_4way, FourWayResult};
+use relon_test_harness::ratchet;
 
 #[derive(Debug, Default)]
 struct TierCounts {
@@ -59,6 +60,7 @@ fn corpus_four_way_diff_aggregates() {
     let mut bytecode_matches_baseline = 0usize;
     let mut bytecode_unsupported = 0usize;
     let mut mismatches: Vec<(String, String)> = Vec::new();
+    let mut ratchet_violations = Vec::new();
 
     for case in &cases {
         let counts = per_tier.entry(tier_label(case.tier)).or_default();
@@ -72,6 +74,9 @@ fn corpus_four_way_diff_aggregates() {
                 continue;
             }
         };
+        for v in ratchet::check_four_way(case.name, &result, case.supported_by) {
+            ratchet_violations.push(v);
+        }
         let label = classify(&result, case);
         match (&result, label) {
             (_, "AllAgree") => {
@@ -125,6 +130,19 @@ fn corpus_four_way_diff_aggregates() {
         "{} four-way mismatches",
         mismatches.len()
     );
+
+    // Ratchet: a backend in a case's `supported_by` claim list bouncing
+    // to its soft-pass fallback is a regression. The harness fails
+    // here so the support matrix can never silently shrink.
+    if !ratchet_violations.is_empty() {
+        for v in &ratchet_violations {
+            eprintln!("RATCHET {v}");
+        }
+        panic!(
+            "{} four-way ratchet violation(s): a claimed-support backend regressed to its fallback",
+            ratchet_violations.len()
+        );
+    }
 
     // Soft gate: every ArithControl case must reach AllAgree or
     // AllTrap. The bytecode VM's scalar envelope covers all 28 of
