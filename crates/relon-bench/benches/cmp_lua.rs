@@ -285,6 +285,26 @@ const W2_REC_FN_ID: u32 = (relon_codegen_native::MAX_FN_ID - 13) as u32;
 /// the `trace_jit_hot_loop` step body, modelled here as a recorder-
 /// install for the cmp_lua D5 row.
 const W12_REC_FN_ID: u32 = (relon_codegen_native::MAX_FN_ID - 14) as u32;
+/// review-improvement-167: W8 (poly_callsite) trace_jit row. The
+/// source-level `dispatch(tag) = tag + 1` closure (tag ∈ 0..4) gets
+/// modelled as inline arithmetic so the trace stays inside the
+/// recorder's envelope (closure-call abort would otherwise gate the
+/// row out). Hot body: `acc += (i % 4) + 1`.
+const W8_REC_FN_ID: u32 = (relon_codegen_native::MAX_FN_ID - 15) as u32;
+/// review-improvement-167: W9 (nested_matrix) trace_jit row. Source
+/// nests `range(n).map(...).reduce(...)`; recorder cannot trace the
+/// closure forest. The IR fixture instead emits the workload's
+/// analytic kernel — nested `Op::Loop` summing `i*n + j` — to keep
+/// the trace pure-arith.
+const W9_REC_FN_ID: u32 = (relon_codegen_native::MAX_FN_ID - 16) as u32;
+/// review-improvement-167: W10 (config_eval) trace_jit row. The
+/// closure-bodied predicate uses `||` / `&&`; recorder has no
+/// `Op::If` / `Op::Select` / `Op::BitAnd` support, so we lower the
+/// predicate to `(role<2) * (region<2) * (hour>=8) * (hour<18)`
+/// where each compare produces an `i64` 0/1 cell. Multiplying ANDs
+/// without short-circuit, which preserves the workload's per-iter
+/// op count.
+const W10_REC_FN_ID: u32 = (relon_codegen_native::MAX_FN_ID - 17) as u32;
 
 fn ir_tag(op: Op) -> TaggedOp {
     TaggedOp {
@@ -581,6 +601,381 @@ fn w12_recorder_body() -> Vec<TaggedOp> {
         ir_tag(Op::LocalGet(0)),
         ir_tag(Op::ConstI64(1)),
         ir_tag(Op::Add(IrType::I64)),
+        ir_tag(Op::Return),
+    ]
+}
+
+/// review-improvement-167: IR body for W8 (poly_callsite).
+///
+/// W8 Relon source defines `dispatch(tag) = tag == 0 ? 1 : tag == 1
+/// ? 2 : tag == 2 ? 3 : 4` (closure) and folds `dispatch(i % 4)`
+/// across `range(n)`. The recorder cannot lower `Op::CallClosure`
+/// (UnrecoverableEffect) nor `Op::If` / `Op::Select` (UnsupportedOp),
+/// so the polymorphic dispatch chain is collapsed analytically to
+/// `tag + 1` — same result on the recorded inputs (tag ∈ 0..=3 by
+/// construction). The hot loop becomes:
+///
+/// ```text
+/// i = 0; acc = 0
+/// while i < n {
+///     acc += (i % 4) + 1
+///     i  += 1
+/// }
+/// return acc
+/// ```
+///
+/// Params: 0 — `n: I64`. Let-slots: 0 — `i: I64`, 1 — `acc: I64`.
+///
+/// Caveat: this is a "what would the trace cost if the recorder
+/// could observe the polymorphic resolution and specialise to the
+/// taken arm" measurement — same modelling discipline review-
+/// improvement-139 used for W2.
+fn w8_recorder_body() -> Vec<TaggedOp> {
+    const I: u32 = 0;
+    const ACC: u32 = 1;
+    vec![
+        // i = 0
+        ir_tag(Op::ConstI64(0)),
+        ir_tag(Op::LetSet {
+            idx: I,
+            ty: IrType::I64,
+        }),
+        // acc = 0
+        ir_tag(Op::ConstI64(0)),
+        ir_tag(Op::LetSet {
+            idx: ACC,
+            ty: IrType::I64,
+        }),
+        ir_tag(Op::Block {
+            result_ty: None,
+            body: vec![ir_tag(Op::Loop {
+                result_ty: None,
+                body: vec![
+                    // exit when i >= n
+                    ir_tag(Op::LetGet {
+                        idx: I,
+                        ty: IrType::I64,
+                    }),
+                    ir_tag(Op::LocalGet(0)),
+                    ir_tag(Op::Ge(IrType::I64)),
+                    ir_tag(Op::BrIf { label_depth: 1 }),
+                    // term = (i % 4) + 1
+                    ir_tag(Op::LetGet {
+                        idx: I,
+                        ty: IrType::I64,
+                    }),
+                    ir_tag(Op::ConstI64(4)),
+                    ir_tag(Op::Mod(IrType::I64)),
+                    ir_tag(Op::ConstI64(1)),
+                    ir_tag(Op::Add(IrType::I64)),
+                    // acc += term
+                    ir_tag(Op::LetGet {
+                        idx: ACC,
+                        ty: IrType::I64,
+                    }),
+                    ir_tag(Op::Add(IrType::I64)),
+                    ir_tag(Op::LetSet {
+                        idx: ACC,
+                        ty: IrType::I64,
+                    }),
+                    // i = i + 1
+                    ir_tag(Op::LetGet {
+                        idx: I,
+                        ty: IrType::I64,
+                    }),
+                    ir_tag(Op::ConstI64(1)),
+                    ir_tag(Op::Add(IrType::I64)),
+                    ir_tag(Op::LetSet {
+                        idx: I,
+                        ty: IrType::I64,
+                    }),
+                    // continue
+                    ir_tag(Op::Br { label_depth: 0 }),
+                ],
+            })],
+        }),
+        // return acc
+        ir_tag(Op::LetGet {
+            idx: ACC,
+            ty: IrType::I64,
+        }),
+        ir_tag(Op::Return),
+    ]
+}
+
+/// review-improvement-167: IR body for W9 (nested_matrix).
+///
+/// W9 Relon source builds `rows: range(n).map((i) => range(n).map((j)
+/// => i * n + j))` and reduces `range(n).reduce(0, (acc, j) => acc +
+/// range(n).reduce(0, (inner, i) => inner + rows[i][j]))`. The
+/// closure+list forest aborts the recorder; we lower the workload's
+/// analytic kernel — a pair of nested loops accumulating `i*n + j`
+/// — directly into IR so the trace covers the inner double loop:
+///
+/// ```text
+/// sum = 0; j = 0
+/// while j < n {
+///     i = 0
+///     while i < n {
+///         sum += i * n + j
+///         i   += 1
+///     }
+///     j += 1
+/// }
+/// return sum
+/// ```
+///
+/// Params: 0 — `n: I64`. Let-slots: 0 — `j: I64`, 1 — `i: I64`,
+/// 2 — `sum: I64`. Nested `Op::Loop` is supported by the recorder
+/// (LIFO `open_loops` stack) and by the optimiser's LICM (innermost-
+/// loop-first traversal).
+fn w9_recorder_body() -> Vec<TaggedOp> {
+    const J: u32 = 0;
+    const I: u32 = 1;
+    const SUM: u32 = 2;
+    vec![
+        // sum = 0
+        ir_tag(Op::ConstI64(0)),
+        ir_tag(Op::LetSet {
+            idx: SUM,
+            ty: IrType::I64,
+        }),
+        // j = 0
+        ir_tag(Op::ConstI64(0)),
+        ir_tag(Op::LetSet {
+            idx: J,
+            ty: IrType::I64,
+        }),
+        // outer block { outer loop { ... } }
+        ir_tag(Op::Block {
+            result_ty: None,
+            body: vec![ir_tag(Op::Loop {
+                result_ty: None,
+                body: vec![
+                    // exit outer when j >= n
+                    ir_tag(Op::LetGet {
+                        idx: J,
+                        ty: IrType::I64,
+                    }),
+                    ir_tag(Op::LocalGet(0)),
+                    ir_tag(Op::Ge(IrType::I64)),
+                    ir_tag(Op::BrIf { label_depth: 1 }),
+                    // i = 0 (reset for each j)
+                    ir_tag(Op::ConstI64(0)),
+                    ir_tag(Op::LetSet {
+                        idx: I,
+                        ty: IrType::I64,
+                    }),
+                    // inner block { inner loop { ... } }
+                    ir_tag(Op::Block {
+                        result_ty: None,
+                        body: vec![ir_tag(Op::Loop {
+                            result_ty: None,
+                            body: vec![
+                                // exit inner when i >= n
+                                ir_tag(Op::LetGet {
+                                    idx: I,
+                                    ty: IrType::I64,
+                                }),
+                                ir_tag(Op::LocalGet(0)),
+                                ir_tag(Op::Ge(IrType::I64)),
+                                ir_tag(Op::BrIf { label_depth: 1 }),
+                                // term = i * n + j
+                                ir_tag(Op::LetGet {
+                                    idx: I,
+                                    ty: IrType::I64,
+                                }),
+                                ir_tag(Op::LocalGet(0)),
+                                ir_tag(Op::Mul(IrType::I64)),
+                                ir_tag(Op::LetGet {
+                                    idx: J,
+                                    ty: IrType::I64,
+                                }),
+                                ir_tag(Op::Add(IrType::I64)),
+                                // sum += term
+                                ir_tag(Op::LetGet {
+                                    idx: SUM,
+                                    ty: IrType::I64,
+                                }),
+                                ir_tag(Op::Add(IrType::I64)),
+                                ir_tag(Op::LetSet {
+                                    idx: SUM,
+                                    ty: IrType::I64,
+                                }),
+                                // i += 1
+                                ir_tag(Op::LetGet {
+                                    idx: I,
+                                    ty: IrType::I64,
+                                }),
+                                ir_tag(Op::ConstI64(1)),
+                                ir_tag(Op::Add(IrType::I64)),
+                                ir_tag(Op::LetSet {
+                                    idx: I,
+                                    ty: IrType::I64,
+                                }),
+                                // continue inner
+                                ir_tag(Op::Br { label_depth: 0 }),
+                            ],
+                        })],
+                    }),
+                    // j += 1
+                    ir_tag(Op::LetGet {
+                        idx: J,
+                        ty: IrType::I64,
+                    }),
+                    ir_tag(Op::ConstI64(1)),
+                    ir_tag(Op::Add(IrType::I64)),
+                    ir_tag(Op::LetSet {
+                        idx: J,
+                        ty: IrType::I64,
+                    }),
+                    // continue outer
+                    ir_tag(Op::Br { label_depth: 0 }),
+                ],
+            })],
+        }),
+        // return sum
+        ir_tag(Op::LetGet {
+            idx: SUM,
+            ty: IrType::I64,
+        }),
+        ir_tag(Op::Return),
+    ]
+}
+
+/// review-improvement-167: IR body for W10 (config_eval).
+///
+/// W10 Relon source: `(role_ok || role_ok2) && (region_ok ||
+/// region_ok2) && (hour >= 8 && hour < 18) ? 1 : 0`. The recorder
+/// has no `Op::If` / `Op::Select` / `Op::BitAnd` lowering, so we
+/// rewrite the predicate algebraically as a product of four
+/// 0/1-valued comparisons:
+///
+/// ```text
+/// allow = (i % 3 < 2) * (i % 4 < 2) * (i % 24 >= 8) * (i % 24 < 18)
+/// ```
+///
+/// Multiplication ANDs without short-circuit, matching the workload's
+/// per-iter op count (no skipped tail). Each `Op::Lt` / `Op::Ge`
+/// returns a Bool-typed cell which the recorder treats as i64 0/1
+/// (`step_cmp` sets `result_value = u64::from(predicate(...))`), so
+/// chained `Op::Mul(IrType::I64)` produces a clean 0/1 i64.
+///
+/// Hot loop:
+///
+/// ```text
+/// i = 0; count = 0
+/// while i < n {
+///     count += (i % 3 < 2) * (i % 4 < 2)
+///            * (i % 24 >= 8) * (i % 24 < 18)
+///     i += 1
+/// }
+/// return count
+/// ```
+///
+/// Params: 0 — `n: I64`. Let-slots: 0 — `i: I64`, 1 — `count: I64`.
+fn w10_recorder_body() -> Vec<TaggedOp> {
+    const I: u32 = 0;
+    const COUNT: u32 = 1;
+    vec![
+        // i = 0
+        ir_tag(Op::ConstI64(0)),
+        ir_tag(Op::LetSet {
+            idx: I,
+            ty: IrType::I64,
+        }),
+        // count = 0
+        ir_tag(Op::ConstI64(0)),
+        ir_tag(Op::LetSet {
+            idx: COUNT,
+            ty: IrType::I64,
+        }),
+        ir_tag(Op::Block {
+            result_ty: None,
+            body: vec![ir_tag(Op::Loop {
+                result_ty: None,
+                body: vec![
+                    // exit when i >= n
+                    ir_tag(Op::LetGet {
+                        idx: I,
+                        ty: IrType::I64,
+                    }),
+                    ir_tag(Op::LocalGet(0)),
+                    ir_tag(Op::Ge(IrType::I64)),
+                    ir_tag(Op::BrIf { label_depth: 1 }),
+                    // role_ok = (i % 3) < 2
+                    ir_tag(Op::LetGet {
+                        idx: I,
+                        ty: IrType::I64,
+                    }),
+                    ir_tag(Op::ConstI64(3)),
+                    ir_tag(Op::Mod(IrType::I64)),
+                    ir_tag(Op::ConstI64(2)),
+                    ir_tag(Op::Lt(IrType::I64)),
+                    // region_ok = (i % 4) < 2
+                    ir_tag(Op::LetGet {
+                        idx: I,
+                        ty: IrType::I64,
+                    }),
+                    ir_tag(Op::ConstI64(4)),
+                    ir_tag(Op::Mod(IrType::I64)),
+                    ir_tag(Op::ConstI64(2)),
+                    ir_tag(Op::Lt(IrType::I64)),
+                    // allow = role_ok * region_ok
+                    ir_tag(Op::Mul(IrType::I64)),
+                    // hour_lo = (i % 24) >= 8
+                    ir_tag(Op::LetGet {
+                        idx: I,
+                        ty: IrType::I64,
+                    }),
+                    ir_tag(Op::ConstI64(24)),
+                    ir_tag(Op::Mod(IrType::I64)),
+                    ir_tag(Op::ConstI64(8)),
+                    ir_tag(Op::Ge(IrType::I64)),
+                    // allow *= hour_lo
+                    ir_tag(Op::Mul(IrType::I64)),
+                    // hour_hi = (i % 24) < 18
+                    ir_tag(Op::LetGet {
+                        idx: I,
+                        ty: IrType::I64,
+                    }),
+                    ir_tag(Op::ConstI64(24)),
+                    ir_tag(Op::Mod(IrType::I64)),
+                    ir_tag(Op::ConstI64(18)),
+                    ir_tag(Op::Lt(IrType::I64)),
+                    // allow *= hour_hi
+                    ir_tag(Op::Mul(IrType::I64)),
+                    // count += allow
+                    ir_tag(Op::LetGet {
+                        idx: COUNT,
+                        ty: IrType::I64,
+                    }),
+                    ir_tag(Op::Add(IrType::I64)),
+                    ir_tag(Op::LetSet {
+                        idx: COUNT,
+                        ty: IrType::I64,
+                    }),
+                    // i += 1
+                    ir_tag(Op::LetGet {
+                        idx: I,
+                        ty: IrType::I64,
+                    }),
+                    ir_tag(Op::ConstI64(1)),
+                    ir_tag(Op::Add(IrType::I64)),
+                    ir_tag(Op::LetSet {
+                        idx: I,
+                        ty: IrType::I64,
+                    }),
+                    // continue
+                    ir_tag(Op::Br { label_depth: 0 }),
+                ],
+            })],
+        }),
+        // return count
+        ir_tag(Op::LetGet {
+            idx: COUNT,
+            ty: IrType::I64,
+        }),
         ir_tag(Op::Return),
     ]
 }
@@ -2380,6 +2775,37 @@ fn bench_cmp_lua(c: &mut Criterion) {
         let lua_v: i64 = lua_fn_w8.call(()).unwrap();
         assert_relon_lua_consistent("W8", relon_v, lua_v, w8_expected());
 
+        // review-improvement-167: recorder-driven trace_jit row for W8.
+        // The Relon source's polymorphic `dispatch` closure aborts the
+        // recorder via `Op::CallClosure → UnrecoverableEffect`; the
+        // hand-built IR collapses `dispatch(i % 4)` to `(i % 4) + 1`
+        // (algebraically equal on tag ∈ 0..=3) so the trace stays in
+        // the pure-arith envelope. Same modelling discipline review-
+        // improvement-139 used for W2 / W12.
+        let warm_args_w8: [u64; 1] = [TREE_WALK_N];
+        let _w8_trace_fn = install_recorder_trace(
+            W8_REC_FN_ID,
+            w8_recorder_body(),
+            vec![IrType::I64],
+            &warm_args_w8,
+        );
+        let w8_jit_state = global_trace_jit_state();
+        {
+            let v = unsafe {
+                w8_jit_state.invoke_with_fallback(
+                    W8_REC_FN_ID,
+                    warm_args_w8.as_ptr(),
+                    /* slot_count = */ 64,
+                    |_args| w8_expected() as u64,
+                )
+            };
+            assert_eq!(
+                v as i64,
+                w8_expected(),
+                "W8 recorder trace + fallback must return analytic poly-dispatch sum"
+            );
+        }
+
         group.throughput(Throughput::Elements(TREE_WALK_N));
         group.bench_function(
             BenchmarkId::new("W8_poly_callsite", "relon_tree_walk"),
@@ -2388,6 +2814,27 @@ fn bench_cmp_lua(c: &mut Criterion) {
                     let n_in = black_box(TREE_WALK_N as i64);
                     timed_with_warmup(iters, || {
                         let v = walker.run_main(&scope, args_w_n(black_box(n_in))).unwrap();
+                        black_box(v);
+                    })
+                });
+            },
+        );
+        group.bench_function(
+            BenchmarkId::new("W8_poly_callsite", "relon_trace_jit"),
+            |b| {
+                b.iter_custom(|iters| {
+                    let args: [u64; 1] = warm_args_w8;
+                    let args_ptr = args.as_ptr();
+                    let expected = w8_expected() as u64;
+                    timed_with_warmup(iters, || {
+                        let v = unsafe {
+                            w8_jit_state.invoke_with_fallback(
+                                W8_REC_FN_ID,
+                                black_box(args_ptr),
+                                64,
+                                |_args| expected,
+                            )
+                        };
                         black_box(v);
                     })
                 });
@@ -2415,6 +2862,38 @@ fn bench_cmp_lua(c: &mut Criterion) {
         let lua_v: i64 = lua_fn_w9.call(()).unwrap();
         assert_relon_lua_consistent("W9", relon_v, lua_v, w9_expected());
 
+        // review-improvement-167: recorder-driven trace_jit row for W9.
+        // The Relon source builds nested `range(n).map(...).reduce(...)`
+        // closures; recorder aborts on `Op::CallClosure`. The IR
+        // fixture instead emits a pair of nested `Op::Loop`s
+        // accumulating `i*n + j` — same analytic answer as the
+        // source. Nested loops are supported by the recorder
+        // (`open_loops` LIFO stack) and the trace-JIT optimiser
+        // (LICM iterates innermost loops first).
+        let warm_args_w9: [u64; 1] = [W9_N as u64];
+        let _w9_trace_fn = install_recorder_trace(
+            W9_REC_FN_ID,
+            w9_recorder_body(),
+            vec![IrType::I64],
+            &warm_args_w9,
+        );
+        let w9_jit_state = global_trace_jit_state();
+        {
+            let v = unsafe {
+                w9_jit_state.invoke_with_fallback(
+                    W9_REC_FN_ID,
+                    warm_args_w9.as_ptr(),
+                    /* slot_count = */ 64,
+                    |_args| w9_expected() as u64,
+                )
+            };
+            assert_eq!(
+                v as i64,
+                w9_expected(),
+                "W9 recorder trace + fallback must return analytic nested-sum"
+            );
+        }
+
         let inner = (W9_N as u64) * (W9_N as u64);
         group.throughput(Throughput::Elements(inner));
         group.bench_function(
@@ -2423,6 +2902,27 @@ fn bench_cmp_lua(c: &mut Criterion) {
                 b.iter_custom(|iters| {
                     timed_with_warmup(iters, || {
                         let v = walker.run_main(&scope, w9_relon_n_arg()).unwrap();
+                        black_box(v);
+                    })
+                });
+            },
+        );
+        group.bench_function(
+            BenchmarkId::new("W9_nested_matrix", "relon_trace_jit"),
+            |b| {
+                b.iter_custom(|iters| {
+                    let args: [u64; 1] = warm_args_w9;
+                    let args_ptr = args.as_ptr();
+                    let expected = w9_expected() as u64;
+                    timed_with_warmup(iters, || {
+                        let v = unsafe {
+                            w9_jit_state.invoke_with_fallback(
+                                W9_REC_FN_ID,
+                                black_box(args_ptr),
+                                64,
+                                |_args| expected,
+                            )
+                        };
                         black_box(v);
                     })
                 });
@@ -2455,6 +2955,37 @@ fn bench_cmp_lua(c: &mut Criterion) {
         let lua_v: i64 = lua_fn_w10.call(()).unwrap();
         assert_relon_lua_consistent("W10", relon_v, lua_v, w10_expected());
 
+        // review-improvement-167: recorder-driven trace_jit row for W10.
+        // Source-level `&&` / `||` / `?:` lower to `Op::If` and the
+        // closure `allow: (i) => ...` would emit `Op::CallClosure`,
+        // neither of which the recorder traces. The fixture rewrites
+        // the predicate as a product of four 0/1-valued comparisons
+        // `(role<2) * (region<2) * (hour>=8) * (hour<18)` so the
+        // entire trace stays inside the recorder's arith+cmp envelope.
+        let warm_args_w10: [u64; 1] = [CONFIG_QUERIES_N];
+        let _w10_trace_fn = install_recorder_trace(
+            W10_REC_FN_ID,
+            w10_recorder_body(),
+            vec![IrType::I64],
+            &warm_args_w10,
+        );
+        let w10_jit_state = global_trace_jit_state();
+        {
+            let v = unsafe {
+                w10_jit_state.invoke_with_fallback(
+                    W10_REC_FN_ID,
+                    warm_args_w10.as_ptr(),
+                    /* slot_count = */ 64,
+                    |_args| w10_expected() as u64,
+                )
+            };
+            assert_eq!(
+                v as i64,
+                w10_expected(),
+                "W10 recorder trace + fallback must return analytic access-control count"
+            );
+        }
+
         group.throughput(Throughput::Elements(CONFIG_QUERIES_N));
         group.bench_function(
             BenchmarkId::new("W10_config_eval", "relon_tree_walk"),
@@ -2463,6 +2994,27 @@ fn bench_cmp_lua(c: &mut Criterion) {
                     let n_in = black_box(CONFIG_QUERIES_N as i64);
                     timed_with_warmup(iters, || {
                         let v = walker.run_main(&scope, args_w_n(black_box(n_in))).unwrap();
+                        black_box(v);
+                    })
+                });
+            },
+        );
+        group.bench_function(
+            BenchmarkId::new("W10_config_eval", "relon_trace_jit"),
+            |b| {
+                b.iter_custom(|iters| {
+                    let args: [u64; 1] = warm_args_w10;
+                    let args_ptr = args.as_ptr();
+                    let expected = w10_expected() as u64;
+                    timed_with_warmup(iters, || {
+                        let v = unsafe {
+                            w10_jit_state.invoke_with_fallback(
+                                W10_REC_FN_ID,
+                                black_box(args_ptr),
+                                64,
+                                |_args| expected,
+                            )
+                        };
                         black_box(v);
                     })
                 });
