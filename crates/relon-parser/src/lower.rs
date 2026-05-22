@@ -19,19 +19,15 @@
 //! every quirk in a from-scratch CST walker would be a multi-week effort
 //! with a long tail of off-by-one failures.
 //!
-//! P4 takes a pragmatic *byte-slice* approach: each typed `ast::Expr`
-//! (or `ast::Directive` / `ast::Decorator`) holds a CST node whose
-//! `text_range()` is byte-exact. The lowering slices the original
-//! source to that range, runs the relevant legacy combinator
-//! (`parse_expr` / `parse_directive` / `parse_decorator`) on the
-//! sliced bytes, and translates the produced `TokenRange`s back onto
-//! the full source via [`translate_node_offsets`] (+ the directive /
-//! decorator / type-node specializations below). The result is a
-//! byte-identical `Node` tree without re-implementing dict / list /
+//! The lowering walks the CST directly: each typed `ast::Expr` /
+//! `ast::Directive` / `ast::Decorator` carries a rowan node whose
+//! `text_range()` is byte-exact, and the lowering converts those
+//! ranges into the legacy `Node` shape (`TokenRange` with line /
+//! column resolved against the full source). All dict / list /
 //! comprehension / binary-precedence / call-arg / closure / match /
 //! variant-ctor / f-string / typed-spread / typed-dynamic-key /
 //! with-block-method / schema-method-param / generic / optional /
-//! variant-fields / etc. machinery here.
+//! variant-fields machinery lives in this file.
 //!
 //! Dispatch
 //! --------
@@ -675,247 +671,6 @@ fn walk_path_tokens(node: &SyntaxNode, source: &str, is_reference: bool) -> Opti
         }
     }
     Some(path)
-}
-
-/// Recursively shift every `TokenRange` inside `node` by `base_offset`
-/// bytes, then rewrite `line` / `column` against the *full* `source`.
-/// Used after parsing an atom from a sliced source — the slice-local
-/// offsets need to be lifted onto the surrounding document.
-#[allow(dead_code)]
-fn translate_node_offsets(node: &mut Node, base_offset: usize, source: &str) {
-    let s = node.range.start.offset + base_offset;
-    let e = node.range.end.offset + base_offset;
-    node.range = range_from_offsets(source, s, e);
-    // Side-tables attached to the Node wrapper itself.
-    if let Some(t) = node.type_hint.as_mut() {
-        translate_type_node_offsets(t, base_offset, source);
-    }
-    for dec in &mut node.decorators {
-        translate_decorator_offsets(dec, base_offset, source);
-    }
-    for dir in &mut node.directives {
-        translate_directive_offsets(dir, base_offset, source);
-    }
-    // Visit nested ranges that the Expr can carry.
-    match node.expr.as_mut() {
-        Expr::Variable(path) | Expr::Reference { path, .. } => {
-            for k in path {
-                translate_token_key(k, base_offset, source);
-            }
-        }
-        Expr::Dict(pairs) => {
-            for (k, v) in pairs {
-                translate_token_key(k, base_offset, source);
-                translate_node_offsets(v, base_offset, source);
-            }
-        }
-        Expr::List(items) => {
-            for it in items {
-                translate_node_offsets(it, base_offset, source);
-            }
-        }
-        Expr::Spread(inner) => translate_node_offsets(inner, base_offset, source),
-        Expr::Binary(_, a, b) => {
-            translate_node_offsets(a, base_offset, source);
-            translate_node_offsets(b, base_offset, source);
-        }
-        Expr::Unary(_, inner) => translate_node_offsets(inner, base_offset, source),
-        Expr::Ternary { cond, then, els } => {
-            translate_node_offsets(cond, base_offset, source);
-            translate_node_offsets(then, base_offset, source);
-            translate_node_offsets(els, base_offset, source);
-        }
-        Expr::FnCall { path, args } => {
-            for k in path {
-                translate_token_key(k, base_offset, source);
-            }
-            for a in args {
-                translate_node_offsets(&mut a.value, base_offset, source);
-            }
-        }
-        Expr::FString(parts) => {
-            for p in parts {
-                if let crate::FStringPart::Interpolation(n) = p {
-                    translate_node_offsets(n, base_offset, source);
-                }
-            }
-        }
-        Expr::Where { expr, bindings } => {
-            translate_node_offsets(expr, base_offset, source);
-            translate_node_offsets(bindings, base_offset, source);
-        }
-        Expr::Match { expr, arms } => {
-            translate_node_offsets(expr, base_offset, source);
-            for (p, b) in arms {
-                translate_node_offsets(p, base_offset, source);
-                translate_node_offsets(b, base_offset, source);
-            }
-        }
-        Expr::Closure {
-            params,
-            return_type,
-            body,
-        } => {
-            for p in params {
-                let ps = p.range.start.offset + base_offset;
-                let pe = p.range.end.offset + base_offset;
-                p.range = range_from_offsets(source, ps, pe);
-                if let Some(t) = p.type_hint.as_mut() {
-                    translate_type_node_offsets(t, base_offset, source);
-                }
-            }
-            if let Some(t) = return_type.as_mut() {
-                translate_type_node_offsets(t, base_offset, source);
-            }
-            translate_node_offsets(body, base_offset, source);
-        }
-        Expr::VariantCtor { body, .. } => translate_node_offsets(body, base_offset, source),
-        Expr::Comprehension {
-            element,
-            iterable,
-            condition,
-            ..
-        } => {
-            translate_node_offsets(element, base_offset, source);
-            translate_node_offsets(iterable, base_offset, source);
-            if let Some(c) = condition {
-                translate_node_offsets(c, base_offset, source);
-            }
-        }
-        Expr::Type(t) => translate_type_node_offsets(t, base_offset, source),
-        Expr::Null
-        | Expr::Bool(_)
-        | Expr::Int(_)
-        | Expr::Float(_)
-        | Expr::String(_)
-        | Expr::Wildcard => {}
-    }
-}
-
-#[allow(dead_code)]
-fn translate_token_key(key: &mut TokenKey, base_offset: usize, source: &str) {
-    match key {
-        TokenKey::String(_, r, _) => {
-            let s = r.start.offset + base_offset;
-            let e = r.end.offset + base_offset;
-            *r = range_from_offsets(source, s, e);
-        }
-        TokenKey::Spread(r) => {
-            let s = r.start.offset + base_offset;
-            let e = r.end.offset + base_offset;
-            *r = range_from_offsets(source, s, e);
-        }
-        TokenKey::Dynamic(inner, _) => translate_node_offsets(inner, base_offset, source),
-        TokenKey::Dummy | TokenKey::Index(_, _) => {}
-    }
-}
-
-/// Shift every `TokenRange` inside a [`crate::Directive`] by
-/// `base_offset` bytes, then rewrite each `line` / `column` against
-/// the full `source`. Mirrors the body of [`translate_node_offsets`]
-/// but for the directive's own outer `range`, its
-/// `DirectiveBody`-specific sub-ranges (name / path / param names),
-/// and any inner `Node` payloads (the body expression / `with`-block
-/// schema-method bodies).
-#[allow(dead_code)]
-fn translate_directive_offsets(dir: &mut crate::Directive, base_offset: usize, source: &str) {
-    let s = dir.range.start.offset + base_offset;
-    let e = dir.range.end.offset + base_offset;
-    dir.range = range_from_offsets(source, s, e);
-    match &mut dir.body {
-        crate::DirectiveBody::Bare => {}
-        crate::DirectiveBody::Value(node) => translate_node_offsets(node, base_offset, source),
-        crate::DirectiveBody::NameBody {
-            name_range,
-            body,
-            methods,
-            ..
-        } => {
-            let ns = name_range.start.offset + base_offset;
-            let ne = name_range.end.offset + base_offset;
-            *name_range = range_from_offsets(source, ns, ne);
-            translate_node_offsets(body, base_offset, source);
-            for m in methods {
-                let ms = m.range.start.offset + base_offset;
-                let me = m.range.end.offset + base_offset;
-                m.range = range_from_offsets(source, ms, me);
-                let nms = m.name_range.start.offset + base_offset;
-                let nme = m.name_range.end.offset + base_offset;
-                m.name_range = range_from_offsets(source, nms, nme);
-                for p in &mut m.params {
-                    let ps = p.name_range.start.offset + base_offset;
-                    let pe = p.name_range.end.offset + base_offset;
-                    p.name_range = range_from_offsets(source, ps, pe);
-                    translate_type_node_offsets(&mut p.type_node, base_offset, source);
-                }
-                translate_type_node_offsets(&mut m.return_type, base_offset, source);
-                if let Some(b) = &mut m.body {
-                    translate_node_offsets(b, base_offset, source);
-                }
-            }
-        }
-        crate::DirectiveBody::Import {
-            path_range,
-            integrity,
-            ..
-        } => {
-            let ps = path_range.start.offset + base_offset;
-            let pe = path_range.end.offset + base_offset;
-            *path_range = range_from_offsets(source, ps, pe);
-            if let Some(int) = integrity.as_mut() {
-                let s = int.range.start.offset + base_offset;
-                let e = int.range.end.offset + base_offset;
-                int.range = range_from_offsets(source, s, e);
-            }
-        }
-        crate::DirectiveBody::Main {
-            params,
-            return_type,
-        } => {
-            for p in params {
-                let ns = p.name_range.start.offset + base_offset;
-                let ne = p.name_range.end.offset + base_offset;
-                p.name_range = range_from_offsets(source, ns, ne);
-                translate_type_node_offsets(&mut p.type_node, base_offset, source);
-            }
-            if let Some(t) = return_type {
-                translate_type_node_offsets(t, base_offset, source);
-            }
-        }
-    }
-}
-
-/// Recursively shift the `range` of a [`crate::TypeNode`] (and every
-/// nested generic argument and variant-field type) by `base_offset`.
-#[allow(dead_code)]
-fn translate_type_node_offsets(t: &mut crate::TypeNode, base_offset: usize, source: &str) {
-    let s = t.range.start.offset + base_offset;
-    let e = t.range.end.offset + base_offset;
-    t.range = range_from_offsets(source, s, e);
-    for g in &mut t.generics {
-        translate_type_node_offsets(g, base_offset, source);
-    }
-    if let Some(fields) = &mut t.variant_fields {
-        for (_name, ty) in fields {
-            translate_type_node_offsets(ty, base_offset, source);
-        }
-    }
-}
-
-/// Shift every `TokenRange` inside a [`crate::Decorator`] by
-/// `base_offset` bytes. Mirrors [`translate_directive_offsets`] for
-/// the simpler decorator shape (`path` + positional/named `args`).
-#[allow(dead_code)]
-fn translate_decorator_offsets(dec: &mut crate::Decorator, base_offset: usize, source: &str) {
-    let s = dec.range.start.offset + base_offset;
-    let e = dec.range.end.offset + base_offset;
-    dec.range = range_from_offsets(source, s, e);
-    for k in &mut dec.path {
-        translate_token_key(k, base_offset, source);
-    }
-    for a in &mut dec.args {
-        translate_node_offsets(&mut a.value, base_offset, source);
-    }
 }
 
 /// Trim leading whitespace / comment trivia bytes from the start of
@@ -3520,7 +3275,7 @@ pub fn lower_document_node_v2(doc: &ast::Document, source: &str) -> Option<Node>
     //    IDE callers (completion / hover / goto-def) still receive a
     //    navigable partial AST. Strict mode propagates the failure.
     let root_ast = doc.root_expr()?;
-    let body = match lower_expr_v2(&root_ast, source) {
+    let mut body = match lower_expr_v2(&root_ast, source) {
         Some(n) => n,
         None if is_recovering() => {
             let r = root_ast.syntax().text_range();
@@ -3552,7 +3307,7 @@ pub fn lower_document_node_v2(doc: &ast::Document, source: &str) -> Option<Node>
     //    `parse_base`'s behavior. Only Dict roots produce hoisted
     //    inner directives (other roots can't carry them).
     if matches!(body.expr.as_ref(), Expr::Dict(_)) {
-        directives.extend(body.directives.clone());
+        directives.extend(std::mem::take(&mut body.directives));
     }
 
     // 5. Doc-comment: leading comments above the first attribute / root.
