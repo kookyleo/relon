@@ -57,6 +57,8 @@
 
 use std::cell::Cell;
 
+use relon_trace_abi::hash::fx_hash_bytes;
+
 /// Opaque, repr-C string-payload box exposed across the JIT boundary.
 ///
 /// The JIT sees a single `*const StringRef` (an i64); only this crate
@@ -64,6 +66,24 @@ use std::cell::Cell;
 /// stable across opt levels; the underlying `Box<str>` (or its raw
 /// `(ptr, len)`) is **not** dropped automatically — see the leak
 /// caveat in the module docs.
+///
+/// ## Tier 1b: cached `fx_hash` field
+///
+/// The `hash` field caches `fx_hash_bytes(payload)` so dict-key lookups
+/// crossing the trace boundary can reuse the digest instead of re-running
+/// the byte-wise hash loop. Producer helpers (`from_owned` / `borrow`
+/// / `from_static`) stamp the digest at construction time. The inline
+/// `StrConcat` lowering writes the digest of the freshly-built payload
+/// via [`__relon_str_concat_seal_hash`] after the JIT fills the rhs
+/// tail bytes — see `runtime/str_ops.rs` for the seal-after-write
+/// contract.
+///
+/// Sentinel value `0` is reserved for "hash not yet sealed"; consumers
+/// that need a guaranteed-fresh digest can re-compute via
+/// [`fx_hash_bytes`] over `(ptr, len)` and update the field. Today the
+/// only consumer is the dict-lookup IC which reads
+/// [`STRING_REF_HASH_OFFSET`] via a single `load.u64` — the seal path
+/// MUST run before any such consumer touches the result.
 #[repr(C)]
 pub struct StringRef {
     /// UTF-8 payload pointer. Stable for the lifetime of the
@@ -71,6 +91,12 @@ pub struct StringRef {
     pub ptr: *const u8,
     /// Payload byte length.
     pub len: usize,
+    /// Cached `fx_hash_bytes(payload)`. Stamped by every producer
+    /// helper (`from_owned` / `borrow` / `from_static`) and re-sealed
+    /// after the inline `StrConcat` lowering writes the rhs tail bytes.
+    /// `0` = "not yet sealed"; consumers MUST treat that as a deopt
+    /// signal or fall back to recomputing via [`fx_hash_bytes`].
+    pub hash: u64,
 }
 
 /// Byte offset of `StringRef::ptr` from the struct base. Exposed so the
@@ -83,6 +109,16 @@ pub const STRING_REF_PTR_OFFSET: i32 = 0;
 /// Byte offset of `StringRef::len` from the struct base. See the
 /// `STRING_REF_PTR_OFFSET` doc for the rationale.
 pub const STRING_REF_LEN_OFFSET: i32 = 8;
+/// Byte offset of `StringRef::hash` from the struct base.
+///
+/// Tier 1b: the cached `fx_hash_bytes(payload)` lives at this offset
+/// so the dict-lookup IC can `load.u64 [str_ref + 16]` instead of
+/// re-running the byte-wise hash loop on every cross-trace dict
+/// lookup. Same layout-pin rationale as the other STRING_REF_*
+/// constants — the compile-time assert below ties it to
+/// `offset_of!(StringRef, hash)` so reordering the struct triggers
+/// a build error.
+pub const STRING_REF_HASH_OFFSET: i32 = 16;
 
 // Compile-time invariant: the JIT-side `load` offsets used in
 // `relon_trace_emitter::str_inline::load_string_ref_payload` MUST
@@ -108,22 +144,35 @@ const _: () = {
         core::mem::offset_of!(StringRef, len) == STRING_REF_LEN_OFFSET as usize,
         "StringRef::len offset drift; update STRING_REF_LEN_OFFSET"
     );
+    assert!(
+        core::mem::offset_of!(StringRef, hash) == STRING_REF_HASH_OFFSET as usize,
+        "StringRef::hash offset drift; update STRING_REF_HASH_OFFSET"
+    );
 };
 
 impl StringRef {
     /// Build a `StringRef` from a Rust `&str`. The returned reference
     /// borrows from `s` — caller must keep `s` alive for as long as
     /// the JIT may use the pointer.
+    ///
+    /// Tier 1b: stamps the cached `fx_hash_bytes(payload)` so the
+    /// dict-lookup IC can short-circuit the byte-wise hash loop on
+    /// cross-trace dict accesses.
     pub fn borrow(s: &str) -> Self {
+        let bytes = s.as_bytes();
         Self {
-            ptr: s.as_ptr(),
-            len: s.len(),
+            ptr: bytes.as_ptr(),
+            len: bytes.len(),
+            hash: fx_hash_bytes(bytes),
         }
     }
 
     /// Build a `StringRef` whose payload lives in a leaked `Box<str>`.
     /// The returned pointer is suitable for handing to the JIT and
     /// keeping alive for the lifetime of the surrounding trace.
+    ///
+    /// Tier 1b: stamps the cached `fx_hash_bytes(payload)` on the
+    /// fresh struct so the dict IC fast path stays in sync.
     ///
     /// ## Safety
     ///
@@ -135,8 +184,9 @@ impl StringRef {
     pub fn from_owned(s: String) -> *const StringRef {
         let boxed_str: Box<str> = s.into_boxed_str();
         let len = boxed_str.len();
+        let hash = fx_hash_bytes(boxed_str.as_bytes());
         let ptr = Box::into_raw(boxed_str) as *const u8;
-        let r = Box::new(StringRef { ptr, len });
+        let r = Box::new(StringRef { ptr, len, hash });
         Box::into_raw(r) as *const StringRef
     }
 
@@ -145,7 +195,8 @@ impl StringRef {
     pub fn from_static(s: &'static str) -> *const StringRef {
         // We can still leak a fresh box because the JIT-side API takes
         // a single `*const StringRef`; the inner ptr borrows from the
-        // static and never needs to be freed.
+        // static and never needs to be freed. `borrow` stamps the
+        // cached fx_hash.
         let r = Box::new(StringRef::borrow(s));
         Box::into_raw(r) as *const StringRef
     }
@@ -323,14 +374,57 @@ pub unsafe extern "C" fn __relon_str_concat_alloc(
         std::ptr::copy_nonoverlapping(lhs_ref.ptr, payload_ptr, lhs_len);
     }
     let header_ptr = block as *mut StringRef;
+    // Tier 1b: stash `hash = 0` as the "not yet sealed" sentinel. The
+    // cranelift inline-rhs `StrConcat` lowering writes the const rhs
+    // bytes after this call returns; the matching
+    // `__relon_str_concat_seal_hash(header_ptr)` call closes the hash
+    // gap before any consumer (notably the dict-lookup IC) reads back
+    // `StringRef::hash`. Leaving hash unsealed (`0`) here keeps the
+    // alloc shim allocation-free of the second pass over the lhs
+    // bytes; sealing folds the full lhs+rhs payload in one shot.
     std::ptr::write(
         header_ptr,
         StringRef {
             ptr: payload_ptr as *const u8,
             len: total_len,
+            hash: 0,
         },
     );
     header_ptr
+}
+
+/// Tier 1b companion to [`__relon_str_concat_alloc`]: re-compute
+/// `fx_hash_bytes(payload)` over the **now-filled** payload buffer and
+/// stamp it into `StringRef::hash`.
+///
+/// The cranelift inline `StrConcat` lowering calls this after writing
+/// the const rhs bytes via the unrolled `store.i8` tail so the dict
+/// IC fast path can `load.u64 [str_ref + STRING_REF_HASH_OFFSET]` and
+/// trust the cached digest. Without this seal step the dict lookup
+/// would either consume the `0` sentinel (silent IC miss every iter)
+/// or re-run the byte-wise hash loop (defeating Tier 1a's cached-
+/// hash win).
+///
+/// # Safety
+///
+/// `s` must point at a non-null `*mut StringRef` whose `(ptr, len)`
+/// payload is fully initialised — i.e. the cranelift caller has
+/// completed all rhs stores before this call. The function reads
+/// `len` bytes via `ptr`, so partial writes would surface either as
+/// UB (uninitialised reads) or a stale digest.
+#[no_mangle]
+pub unsafe extern "C" fn __relon_str_concat_seal_hash(s: *mut StringRef) {
+    if s.is_null() {
+        return;
+    }
+    let r = &mut *s;
+    if r.ptr.is_null() {
+        // Defensive: payload pointer unset, nothing to hash. Leave the
+        // existing sentinel in place so consumers can detect the miss.
+        return;
+    }
+    let bytes = std::slice::from_raw_parts(r.ptr, r.len);
+    r.hash = fx_hash_bytes(bytes);
 }
 
 /// F-D7 `__relon_str_contains`. Consults the single-slot
@@ -525,6 +619,67 @@ mod tests {
         // undefined per contract, so we only inspect the prefix.
         let prefix = unsafe { std::slice::from_raw_parts(r_ref.ptr, 5) };
         assert_eq!(prefix, b"hello");
+        // Tier 1b: `hash = 0` is the "not yet sealed" sentinel; the
+        // matching `__relon_str_concat_seal_hash` runs after the JIT
+        // writes the rhs tail bytes.
+        assert_eq!(r_ref.hash, 0, "alloc leaves hash unsealed");
+    }
+
+    #[test]
+    fn concat_seal_hash_matches_fx_hash_bytes() {
+        // Tier 1b: simulate the cranelift `StrConcat(lhs, rhs)` inline
+        // tail. Alloc, manually fill the rhs tail, then seal the hash
+        // — the cached digest must equal `fx_hash_bytes(payload)`.
+        let lhs = StringRef::from_static("hello");
+        let total = 5 + 3; // "hello" + " wo"
+        let r = unsafe { __relon_str_concat_alloc(lhs, total) };
+        assert!(!r.is_null());
+        unsafe {
+            let r_ref = &mut *r;
+            // Write the rhs tail bytes the way the JIT would.
+            let tail = (r_ref.ptr as *mut u8).add(5);
+            std::ptr::copy_nonoverlapping(b" wo".as_ptr(), tail, 3);
+            __relon_str_concat_seal_hash(r);
+        }
+        let r_ref = unsafe { &*r };
+        let payload = unsafe { std::slice::from_raw_parts(r_ref.ptr, r_ref.len) };
+        assert_eq!(payload, b"hello wo");
+        assert_eq!(
+            r_ref.hash,
+            relon_trace_abi::hash::fx_hash_bytes(payload),
+            "sealed hash matches byte-wise fx_hash reference"
+        );
+        // Belt-and-braces: from_static / from_owned must also stamp
+        // a matching digest so dict-key crossings stay consistent.
+        let baseline = StringRef::from_static("hello wo");
+        let baseline_ref = unsafe { &*baseline };
+        assert_eq!(baseline_ref.hash, r_ref.hash);
+    }
+
+    #[test]
+    fn concat_seal_hash_null_input_is_noop() {
+        // Defensive backstop: null pointer must not segfault — callers
+        // upstream of the JIT already null-guard, but the seal helper
+        // is invoked unconditionally in the cranelift IR.
+        unsafe {
+            __relon_str_concat_seal_hash(std::ptr::null_mut());
+        }
+    }
+
+    #[test]
+    fn from_owned_stamps_cached_fx_hash() {
+        // Tier 1b producer-side guarantee: every helper that builds a
+        // fresh `StringRef` must pre-compute `fx_hash_bytes(payload)`
+        // so the dict-lookup IC can short-circuit the byte-wise loop.
+        let owned = StringRef::from_owned("dict_key".to_string());
+        let owned_ref = unsafe { &*owned };
+        assert_eq!(
+            owned_ref.hash,
+            relon_trace_abi::hash::fx_hash_bytes(b"dict_key"),
+        );
+        let borrowed = StringRef::from_static("dict_key");
+        let borrowed_ref = unsafe { &*borrowed };
+        assert_eq!(borrowed_ref.hash, owned_ref.hash);
     }
 
     #[test]

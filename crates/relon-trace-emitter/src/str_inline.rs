@@ -610,6 +610,7 @@ pub fn concat_rhs_fits_inline(rhs: &[u8]) -> bool {
 pub fn emit_str_concat_inline_short_rhs(
     builder: &mut FunctionBuilder<'_>,
     str_concat_alloc: ir::FuncRef,
+    str_concat_seal_hash: Option<ir::FuncRef>,
     lhs: ir::Value,
     rhs_bytes: &[u8],
 ) -> ir::Value {
@@ -657,7 +658,20 @@ pub fn emit_str_concat_inline_short_rhs(
         }
     }
 
-    // 6. Return the *mut StringRef cast back to *const StringRef
+    // 6. Tier 1b: seal the cached fx_hash field on the freshly-built
+    //    `StringRef` so cross-trace dict-key lookups see a valid
+    //    digest. The alloc helper left `hash = 0` as the "not yet
+    //    sealed" sentinel; the seal helper reads the now-complete
+    //    payload via `(ptr, len)` and folds `fx_hash_bytes` over it.
+    //    `None` ⇒ host did not wire the helper; the inline lowering
+    //    skips the seal call to stay correct (the result `StringRef`
+    //    still serialises through `StringRef::as_str` etc. correctly;
+    //    the only consequence is the dict IC missing on the result).
+    if let Some(seal_fn) = str_concat_seal_hash {
+        builder.ins().call(seal_fn, &[result_ptr]);
+    }
+
+    // 7. Return the *mut StringRef cast back to *const StringRef
     //    (same i64 slot — opaque to the JIT).
     result_ptr
 }
