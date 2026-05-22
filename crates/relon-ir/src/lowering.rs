@@ -2513,6 +2513,22 @@ fn lower_binary(
     range: TokenRange,
     ctx: &mut LowerCtx<'_>,
 ) -> Result<(), LoweringError> {
+    // #165 — collapse a left-leaning `String + String + ... + String`
+    // chain into a single `Op::StrConcatN { operand_count: N }` so
+    // every IR-consuming backend (bytecode VM / cranelift AOT /
+    // trace-JIT) routes through a single allocation instead of N - 1
+    // pairwise `Op::Add(String)` allocs. The fold is gated on AST
+    // shape (the outer node is `Add` and the LHS is itself an `Add`),
+    // matches the tree-walker's `try_eval_string_concat_chain` filter,
+    // and bails to standard pair-wise lowering when the chain mixes
+    // non-String operand types.
+    if matches!(op, Operator::Add)
+        && matches!(lhs.expr.as_ref(), Expr::Binary(Operator::Add, _, _))
+    {
+        if try_lower_str_concat_chain(lhs, rhs, range, ctx)? {
+            return Ok(());
+        }
+    }
     if let Some(ir_op_ctor) = arithmetic_op_ctor(op) {
         lower_expr(&lhs.expr, lhs.range, ctx)?;
         lower_expr(&rhs.expr, rhs.range, ctx)?;
@@ -2596,6 +2612,89 @@ fn lower_binary(
         return Ok(());
     }
     Err(LoweringError::UnsupportedOperator { op, range })
+}
+
+/// #165 — fold a left-leaning `String + String + ... + String` chain
+/// into a single `Op::StrConcatN { operand_count: N }` so every
+/// IR-consuming backend (bytecode VM / cranelift AOT / trace-JIT)
+/// allocates once instead of N - 1 times.
+///
+/// Returns `Ok(true)` when the fold fired (caller skips its standard
+/// pair-wise path), `Ok(false)` when the chain mixes non-String
+/// operand types (caller falls back). The function side-effects
+/// `ctx.out` / `ctx.tstack` only when it commits — a mismatch is
+/// detected before any append, so the caller's fall-back path
+/// re-lowers from the original `lhs` / `rhs` nodes without seeing
+/// stale ops.
+///
+/// AST shape preconditions (checked by the caller): the outer op is
+/// `Operator::Add` and `lhs` is itself an `Expr::Binary(Add, _, _)` —
+/// i.e. the chain has at least three leaves.
+fn try_lower_str_concat_chain(
+    lhs: &Node,
+    rhs: &Node,
+    range: TokenRange,
+    ctx: &mut LowerCtx<'_>,
+) -> Result<bool, LoweringError> {
+    // Walk the LHS spine, peeling off each Add's RHS onto a stack so
+    // the deepest leaf becomes `cursor` and `rhs_stack` holds the
+    // outer-to-inner right operands. Pop order then yields source
+    // order: deepest leaf first, then each RHS in chain order, then
+    // the original outer `rhs` last.
+    let mut rhs_stack: Vec<&Node> = Vec::with_capacity(4);
+    let mut cursor: &Node = lhs;
+    while let Expr::Binary(Operator::Add, inner_l, inner_r) = cursor.expr.as_ref() {
+        rhs_stack.push(inner_r);
+        cursor = inner_l;
+    }
+    // `cursor` is now the deepest non-Add leaf. Build the leaf list in
+    // source order. `leaf_count >= 3` is guaranteed by the caller's
+    // shape gate (`lhs` itself is a Binary(Add)).
+    let mut leaves: Vec<&Node> = Vec::with_capacity(rhs_stack.len() + 2);
+    leaves.push(cursor);
+    while let Some(node) = rhs_stack.pop() {
+        leaves.push(node);
+    }
+    leaves.push(rhs);
+    debug_assert!(leaves.len() >= 3);
+    let leaf_count = leaves.len();
+    // Snapshot the emit cursor / type stack so we can roll back if any
+    // leaf turns out non-String. We restore both on miss so the
+    // caller's standard `lower_arith` path re-runs from the same
+    // starting state without observing partial ops.
+    let saved_out_len = ctx.out.len();
+    let saved_tstack_len = ctx.tstack.len();
+    // Lower each leaf, type-checking after each so we abort early on
+    // the first non-String operand (the common rejection — e.g. an
+    // outer-Add was actually Schema-merge from a non-Add LHS, which
+    // the caller's shape gate already filters).
+    for leaf in &leaves {
+        lower_expr(&leaf.expr, leaf.range, ctx)?;
+        let leaf_ty = ctx.tstack.last().copied();
+        if leaf_ty != Some(IrType::String) {
+            // Mismatch — restore the snapshot and let the caller fall
+            // back to pair-wise lowering. `const_intern` interning is
+            // idempotent so any literals we pushed into the intern
+            // table are still correct; the leaf-lowering ops never
+            // touch `next_let_idx` / `lambda_funcs` for non-Where /
+            // non-Lambda leaves, and those shapes aren't legal inside
+            // an `Add` chain anyway.
+            ctx.out.truncate(saved_out_len);
+            ctx.tstack.truncate(saved_tstack_len);
+            return Ok(false);
+        }
+    }
+    // All N leaves are String — commit the StrConcatN op. Pop the N
+    // type-stack entries and push the single result.
+    ctx.tstack.truncate(saved_tstack_len);
+    ctx.tstack.push(IrType::String);
+    ctx.out.push(TaggedOp {
+        op: Op::StrConcatN {
+            operand_count: leaf_count as u32,
+        },
+        range,
+    });
+    Ok(true)
 }
 
 /// Lower a ternary `cond ? then : els` into `Op::If`. The branches
