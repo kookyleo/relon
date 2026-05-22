@@ -33,8 +33,8 @@ relon-trace-abi = { workspace = true }
 
 # Cranelift v0.131 — kept in lock-step with relon-codegen-native so we
 # don't dual-instantiate the same backend in a downstream binary.
-cranelift-codegen = "0.131"
-cranelift-frontend = "0.131"
+cranelift-codegen = "0.132"
+cranelift-frontend = "0.132"
 
 [dev-dependencies]
 # Tests roundtrip ops through the emitter and then run cranelift's

@@ -51,16 +51,16 @@ relon-trace-recorder = { workspace = true }
 # the `trace_jit_warm` / `trace_jit_warm_ic` rows go through) so the
 # comparison is direct. Pulling cranelift-codegen here only exposes
 # the `CallConv` enum to the bench surface.
-cranelift-codegen = "0.131"
+cranelift-codegen = "0.132"
 # v6-ε bench-rewrite (2026-05-19): the new `trace_jit_loop` row
 # hand-builds a cranelift JIT module whose body runs the full N-iter
 # loop internally (bypassing the recorder gap). Frontend + module +
 # jit + native are needed for that build path; they pull in the same
 # 0.131 line the workspace already pins for `relon-codegen-native`.
-cranelift-frontend = "0.131"
-cranelift-module = "0.131"
-cranelift-jit = "0.131"
-cranelift-native = "0.131"
+cranelift-frontend = "0.132"
+cranelift-module = "0.132"
+cranelift-jit = "0.132"
+cranelift-native = "0.132"
 # `result_slot_offset()` / `host_hooks_offset()` are exposed by the
 # trace-emitter crate; we link them in for the bench's
 # `trace_jit_loop` row so the JIT fn writes through the canonical

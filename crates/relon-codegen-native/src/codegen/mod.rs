@@ -1156,6 +1156,16 @@ impl<'a, 'b> Codegen<'a, 'b> {
     /// Insert a deadline guard at the current insertion point. Reads
     /// `state.epoch.elapsed().as_nanos()` via the host helper and
     /// traps when the result is past `state.deadline_ns`.
+    ///
+    /// The vDSO clock-gettime cost is elided host-side: `now_helper`
+    /// fast-returns 0 when `deadline_ns == i64::MAX` (the "no
+    /// deadline" sentinel). This keeps the cranelift IR shape as a
+    /// straight-line (call + load + cond_trap) so the surrounding
+    /// `Op::Loop` body retains its tight optimisation; an IR-level
+    /// sentinel-skip (brif-guarded) was tried twice and rejected
+    /// (see commit log on f5857d7 and the 0.132 retry attempt) — the
+    /// extra basic blocks defeat a cranelift loop-opt heuristic
+    /// (still present in 0.132).
     fn emit_resource_check(&mut self) {
         // call relon_now(state) -> i64 via the capability vtable.
         let inst = self.emit_host_fn_call(VtableSlot::RelonNow, &[self.state_ptr]);

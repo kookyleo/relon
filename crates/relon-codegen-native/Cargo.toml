@@ -53,16 +53,16 @@ ordered-float = { workspace = true }
 # Cranelift v0.131 — matched to the wasmtime-internal-cranelift the
 # wasm-AOT backend pulls in so the workspace shares one ISLE backend
 # tree and avoids dual-instantiation of the same compiler.
-cranelift-codegen = "0.131"
-cranelift-frontend = "0.131"
-cranelift-module = "0.131"
-cranelift-jit = "0.131"
-cranelift-native = "0.131"
+cranelift-codegen = "0.132"
+cranelift-frontend = "0.132"
+cranelift-module = "0.132"
+cranelift-jit = "0.132"
+cranelift-native = "0.132"
 # v5-γ: cranelift-object emits relocatable `.o` bytes parallel to the
 # JIT path so the host can persist a cache artefact + dlopen it on
 # subsequent cold starts. Same 0.131 channel the other cranelift
 # crates pin so the workspace shares one ISLE backend tree.
-cranelift-object = "0.131"
+cranelift-object = "0.132"
 target-lexicon = "0.13"
 
 # v5-γ: persist `.o` bytes (after ET_REL -> ET_DYN link) to disk and
