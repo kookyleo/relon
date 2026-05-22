@@ -1036,9 +1036,27 @@ impl TreeWalkEvaluator {
         use relon_parser::DirectiveBody;
         match directive.name.as_str() {
             IMPORT => {
-                if let DirectiveBody::Import { spec, path, .. } = &directive.body {
-                    let new_scope =
-                        self.apply_directive_import(spec, path, current_scope, directive.range)?;
+                if let DirectiveBody::Import {
+                    spec,
+                    path,
+                    integrity,
+                    ..
+                } = &directive.body
+                {
+                    // review-improvement-174: forward the inline integrity
+                    // pin (if any) so the evaluator's import path verifies
+                    // the loaded module body. Without this, a host that
+                    // skips the analyzer's workspace pass — for example a
+                    // bench harness that parses straight into the
+                    // evaluator — would silently load a poisoned remote
+                    // module even though its `sha256:"..."` pin disagreed.
+                    let new_scope = self.apply_directive_import(
+                        spec,
+                        path,
+                        integrity.as_ref(),
+                        current_scope,
+                        directive.range,
+                    )?;
                     *current_scope = new_scope;
                 }
             }
@@ -1134,15 +1152,24 @@ impl TreeWalkEvaluator {
 
     /// Lower a `#import <spec> from "path"` directive into a scope with
     /// the imported bindings.
+    ///
+    /// `integrity`, when present, is the inline `sha256:"..."` pin
+    /// parsed off the directive. The evaluator verifies the loaded
+    /// module body against it before exposing any bindings — see the
+    /// `verify_module_integrity` helper for the algorithm /
+    /// fail-closed semantics. Passing `None` mirrors the previous
+    /// behaviour for unpinned imports (local paths, std modules, hosts
+    /// that opt out of pinning).
     pub fn apply_directive_import(
         &self,
         spec: &relon_parser::DirectiveImportSpec,
         path: &str,
+        integrity: Option<&relon_parser::IntegrityHash>,
         scope: &Arc<Scope>,
         range: TokenRange,
     ) -> Result<Arc<Scope>, RuntimeError> {
         use relon_parser::DirectiveImportSpec;
-        let evaluated_module = self.load_module(path, scope, range)?;
+        let evaluated_module = self.load_module(path, integrity, scope, range)?;
         let mut new_locals: HashMap<Arc<str>, Value> = HashMap::new();
         match spec {
             DirectiveImportSpec::Alias(name) => {
@@ -1226,19 +1253,36 @@ impl TreeWalkEvaluator {
         }
     }
 
-    /// Resolve `@import("path")` against the registered resolver chain
+    /// Resolve `#import "path"` against the registered resolver chain
     /// and evaluate the resulting source. Resolvers are tried in order;
     /// the first one returning `Some(ModuleSource)` wins. Resolved
     /// modules are evaluated with their own `current_dir` so nested
     /// imports inside the module are anchored to the module's location,
     /// not the host's.
+    ///
+    /// When `integrity` is `Some`, the loaded body's digest is verified
+    /// against the inline pin *before* the module body is parsed or
+    /// evaluated. Mismatch / unsupported-algo / malformed-hex cases all
+    /// produce a typed [`RuntimeError`] and the module body never
+    /// reaches the evaluator's parser — fail-closed by design so a
+    /// poisoned remote source cannot influence anything downstream
+    /// (cache, scope, side-effects). See `verify_module_integrity` for
+    /// the per-branch decisions.
     pub fn load_module(
         &self,
         path_str: &str,
+        integrity: Option<&relon_parser::IntegrityHash>,
         scope: &Arc<Scope>,
         range: TokenRange,
     ) -> Result<Value, RuntimeError> {
         let source = self.resolve_module_source(path_str, scope, range)?;
+        // review-improvement-174: enforce the inline pin *after*
+        // resolution (so we have the actual bytes) but *before* parse /
+        // cache / evaluation, so an attacker-controlled body that
+        // disagrees with its pin is dropped with zero side effects.
+        if let Some(pin) = integrity {
+            verify_module_integrity(path_str, pin, source.source.as_bytes(), range)?;
+        }
         self.evaluate_module_source(source, range)
     }
 
@@ -2387,6 +2431,78 @@ fn fallback_parse_analyze(
         });
     }
     Ok(Arc::new(node))
+}
+
+/// Verify a `#import "..." sha256:"..."` integrity pin against the
+/// resolved module body bytes. review-improvement-174 (v3++ b-2 fix):
+/// closes the analyzer-bypass attack vector where a host parses and
+/// hands an unverified module directly to the evaluator.
+///
+/// Fail-closed semantics, in source order:
+/// * Unknown algorithm → `ImportHashUnknownAlgorithm` (refuse before
+///   we compute anything we cannot compare against).
+/// * Malformed hex (wrong length or non-hex chars) → `ImportHashInvalidHex`.
+/// * Digest mismatch → `ImportHashMismatch`.
+/// * Match → `Ok(())`.
+///
+/// The check intentionally runs on every path (local, `std/...`, or
+/// remote). Local pins are rare but legitimate (lockfile-style audit
+/// of a vendored module); making the check path-agnostic means the
+/// attacker cannot find a path shape that silently skips verification.
+fn verify_module_integrity(
+    raw_path: &str,
+    pin: &relon_parser::IntegrityHash,
+    body: &[u8],
+    range: TokenRange,
+) -> Result<(), RuntimeError> {
+    let Some(algo) = pin.algorithm else {
+        return Err(RuntimeError::ImportHashUnknownAlgorithm {
+            path: raw_path.to_string(),
+            algorithm: pin.algorithm_text.clone(),
+            range,
+        });
+    };
+    let algo_str = algo.as_str();
+    let expected_len = algo.hex_len();
+    if pin.hex.len() != expected_len || !pin.hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(RuntimeError::ImportHashInvalidHex {
+            path: raw_path.to_string(),
+            algorithm: algo_str.to_string(),
+            expected_len,
+            got_len: pin.hex.len(),
+            range,
+        });
+    }
+    let computed = compute_module_digest(algo, body);
+    // Case-insensitive comparison mirrors the analyzer-side
+    // `digest_matches` so a copy-pasted uppercase digest still
+    // verifies. Pins themselves are usually lower-case hex.
+    if !pin.hex.eq_ignore_ascii_case(&computed) {
+        return Err(RuntimeError::ImportHashMismatch {
+            payload: Box::new(relon_eval_api::error::ImportHashMismatchDetail {
+                path: raw_path.to_string(),
+                algorithm: algo_str.to_string(),
+                expected: pin.hex.to_ascii_lowercase(),
+                got: computed,
+            }),
+            range,
+        });
+    }
+    Ok(())
+}
+
+/// Compute the lower-case hex digest of `bytes` under `algo`. Mirrors
+/// `relon-analyzer::workspace_build::compute_digest` so the two
+/// verification sites cannot drift on byte ordering or casing.
+fn compute_module_digest(algo: relon_parser::HashAlgorithm, bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    match algo {
+        relon_parser::HashAlgorithm::Sha256 => {
+            let mut hasher = Sha256::new();
+            hasher.update(bytes);
+            hex::encode(hasher.finalize())
+        }
+    }
 }
 
 /// Caps handle handed to native functions so they can call back into Relon.
