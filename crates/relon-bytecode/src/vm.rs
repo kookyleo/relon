@@ -1462,6 +1462,55 @@ impl BytecodeVm {
                 let handle = memory.strings.alloc(joined.as_str());
                 stack.push(handle as u64);
             }
+            BcOp::StrConcatN { argc } => {
+                // #165 — single-allocation N-operand string concat.
+                // `[s_0, s_1, ..., s_{n-1}] -> [s_concat]`. Pops `argc`
+                // handles in declaration order (the top-of-stack is
+                // the outer RHS, the bottom is the deepest leaf). The
+                // op was lowered from `Op::StrConcatN` so we know
+                // `argc >= 2`; defensive guard keeps the dispatch
+                // honest in case a malformed bytecode reaches us.
+                let n = *argc as usize;
+                if n < 2 {
+                    return Err(BcVmError::StackUnderflow { bc_idx });
+                }
+                if stack.len() < n {
+                    return Err(BcVmError::StackUnderflow { bc_idx });
+                }
+                // Pop handles into a temp buffer in reverse order then
+                // restore source order so the joined payload reads
+                // `s_0 || s_1 || ... || s_{n-1}` left-to-right.
+                let mut handles: Vec<u32> = Vec::with_capacity(n);
+                for _ in 0..n {
+                    handles.push(pop(stack, bc_idx)? as u32);
+                }
+                handles.reverse();
+                // Resolve every handle up-front, clone the underlying
+                // `Arc<str>` so we don't keep the arena's per-slot
+                // borrow alive across the eventual `memory.strings.alloc`
+                // call. Cloning an `Arc` is a cheap refcount bump.
+                let mut slots: Vec<std::sync::Arc<str>> = Vec::with_capacity(n);
+                let mut total_len: usize = 0;
+                for h in &handles {
+                    let s = memory.strings.get(*h).map_err(arena_to_vm_error)?.clone();
+                    total_len = total_len.saturating_add(s.len());
+                    slots.push(s);
+                }
+                // Single-allocation join: one `String::with_capacity`
+                // for `total_len` bytes followed by an in-place
+                // `push_str` per operand. Mirrors the
+                // `SmolStr::concat_many` shape that the tree-walker
+                // already uses (#152) — the bytecode VM keeps its
+                // own `StringArena` rather than touching `SmolStr`,
+                // so we re-implement the single-alloc pattern in
+                // arena terms.
+                let mut joined = String::with_capacity(total_len);
+                for slot in &slots {
+                    joined.push_str(slot);
+                }
+                let handle = memory.strings.alloc(joined.as_str());
+                stack.push(handle as u64);
+            }
             BcOp::StrEq => {
                 // `[s_lhs, s_rhs] -> [bool]`. Byte-equal compare.
                 let rhs_h = pop(stack, bc_idx)? as u32;

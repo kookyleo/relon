@@ -107,6 +107,14 @@ pub trait OpVisitor {
 
     // Arithmetic / bitwise.
     fn visit_add(&mut self, ty: IrType) -> Result<Self::Output, Self::Error>;
+    /// #165 — single-allocation N-operand `String` concat. Pops
+    /// `operand_count` String values off the operand stack (deepest
+    /// leaf first), pushes one concatenated String. Backends decide
+    /// how to fulfil "single allocation"; the tree-walker delegates to
+    /// `SmolStr::concat_many`, the bytecode VM materialises a single
+    /// fresh arena slot, and cranelift sums the lengths once before
+    /// the alloc.
+    fn visit_str_concat_n(&mut self, operand_count: u32) -> Result<Self::Output, Self::Error>;
     fn visit_sub(&mut self, ty: IrType) -> Result<Self::Output, Self::Error>;
     fn visit_mul(&mut self, ty: IrType) -> Result<Self::Output, Self::Error>;
     fn visit_div(&mut self, ty: IrType) -> Result<Self::Output, Self::Error>;
@@ -278,6 +286,7 @@ pub fn walk_op<V: OpVisitor>(op: &Op, visitor: &mut V) -> Result<V::Output, V::E
         } => visitor.visit_dict_get_by_string_key(*shape_hash, *value_ty, *entry_count_hint),
         Op::ListGetByIntIdx { element_ty } => visitor.visit_list_get_by_int_idx(*element_ty),
         Op::Add(ty) => visitor.visit_add(*ty),
+        Op::StrConcatN { operand_count } => visitor.visit_str_concat_n(*operand_count),
         Op::Sub(ty) => visitor.visit_sub(*ty),
         Op::Mul(ty) => visitor.visit_mul(*ty),
         Op::Div(ty) => visitor.visit_div(*ty),
@@ -497,6 +506,11 @@ mod tests {
         fn visit_add(&mut self, _: IrType) -> Result<(), ()> {
             self.calls += 1;
             self.last = "Add";
+            Ok(())
+        }
+        fn visit_str_concat_n(&mut self, _: u32) -> Result<(), ()> {
+            self.calls += 1;
+            self.last = "StrConcatN";
             Ok(())
         }
         fn visit_sub(&mut self, _: IrType) -> Result<(), ()> {
@@ -816,6 +830,14 @@ mod tests {
         let mut v = CountingVisitor::default();
         walk_op(&op, &mut v).unwrap();
         assert_eq!(v.last, "Add");
+    }
+
+    #[test]
+    fn dispatch_routes_str_concat_n_to_matching_method() {
+        let op = Op::StrConcatN { operand_count: 4 };
+        let mut v = CountingVisitor::default();
+        walk_op(&op, &mut v).unwrap();
+        assert_eq!(v.last, "StrConcatN");
     }
 
     #[test]

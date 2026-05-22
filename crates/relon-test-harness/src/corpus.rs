@@ -355,6 +355,25 @@ pub fn all_cases() -> Vec<CorpusCase> {
             args_factory: no_args,
             tier: Tier::StdlibMemory,
         },
+        // #165 — left-leaning 4-leaf String concat chain folds to one
+        // `Op::StrConcatN { 4 }` in IR; the four-way harness validates
+        // tree-walker / bytecode / cranelift / trace-JIT all agree on
+        // the joined payload (single-alloc shape for each).
+        CorpusCase {
+            name: "str_concat_chain_four_way",
+            source: "#main() -> String\n\"foo\" + \"bar\" + \"baz\" + \"qux\"",
+            args_factory: no_args,
+            tier: Tier::StdlibMemory,
+        },
+        // #165 — three-leaf chain hits the minimal `StrConcatN { 3 }`
+        // shape the fold gate accepts (outer Add + lhs itself a
+        // Binary(Add)).
+        CorpusCase {
+            name: "str_concat_chain_three_way",
+            source: "#main() -> String\n\"foo\" + \"bar\" + \"baz\"",
+            args_factory: no_args,
+            tier: Tier::StdlibMemory,
+        },
         CorpusCase {
             name: "stdlib_substring",
             source: "#main() -> String\n\"hello\".substring(1, 3)",

@@ -262,6 +262,22 @@ pub enum BcOp {
     /// strings remain reachable via their original handles.
     StrConcat,
 
+    /// #165 — single-allocation N-operand string concat. Lowered from
+    /// `Op::StrConcatN` so a source-level chain
+    /// `(((a + b) + c) + d)` allocates exactly one fresh arena slot
+    /// instead of N - 1 (one per pairwise `StrConcat`).
+    /// `[s_0, s_1, ..., s_{n-1}] -> [s_concat]` — pops `argc` handles
+    /// (top-of-stack is the outer RHS, bottom is the deepest LHS
+    /// leaf), looks each up in the [`StringArena`], computes the
+    /// total length once, and allocates the concatenated result in
+    /// declaration order. Operand handles remain reachable.
+    StrConcatN {
+        /// Number of operand handles the op pops. `argc >= 2` —
+        /// pair-wise concat stays on `StrConcat`; the AST fold pass
+        /// only emits `StrConcatN` for chains of length 3+.
+        argc: u32,
+    },
+
     /// M2-B phase 4b-continuation: byte-equal string compare.
     /// `[s_lhs, s_rhs] -> [bool]`. Pops both handles, pushes `1`
     /// when their byte payloads match exactly; `0` otherwise.

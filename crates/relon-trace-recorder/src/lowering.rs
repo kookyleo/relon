@@ -276,6 +276,16 @@ pub fn lower_op(op: &Op, cx: OpLoweringContext<'_>) -> LowerOutcome {
         // the same code path the stdlib `concat()` call already uses.
         Op::Add(IrType::String) => lower_str_add(cx),
         Op::Add(ty) => binary_arith(cx, *ty, BinaryArith::Add),
+        // #165 — `Op::StrConcatN` is the IR-level fold of a left-
+        // leaning `String + String + ... + String` source chain. The
+        // bytecode VM and cranelift AOT backends have matching single-
+        // allocation lowerings; the trace recorder doesn't yet model
+        // an N-input string concat (would need a new `TraceOp`
+        // variant + inline emitter helper). Abort cleanly so the
+        // outer tier router falls back to cranelift AOT (which has
+        // the single-alloc path) instead of recording an unrecoverable
+        // trace shape.
+        Op::StrConcatN { .. } => LowerOutcome::Abort(AbortReason::UnsupportedOp("StrConcatN")),
         Op::Sub(ty) => binary_arith(cx, *ty, BinaryArith::Sub),
         Op::Mul(ty) => binary_arith(cx, *ty, BinaryArith::Mul),
         Op::Div(ty) => binary_arith(cx, *ty, BinaryArith::Div),

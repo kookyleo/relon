@@ -166,6 +166,18 @@ impl<'a, 'b> OpVisitor for Codegen<'a, 'b> {
         }
     }
 
+    // #165 — `Op::StrConcatN { operand_count }` is the IR-level fold of
+    // a left-leaning source chain `(((a + b) + c) + d)` for `String +
+    // String + ... + String`. Cranelift emits an inline single-
+    // allocation join: it walks the N operand `StringRef`s already on
+    // the operand stack, sums their `len` fields once, allocates one
+    // scratch record sized `total + 4`, stamps the header, and copies
+    // each payload at the running cursor — replacing the N - 1
+    // pairwise `concat` allocations the unfolded path used to emit.
+    fn visit_str_concat_n(&mut self, operand_count: u32) -> Result<(), CraneliftError> {
+        self.emit_str_concat_n(operand_count)
+    }
+
     fn visit_sub(&mut self, ty: IrType) -> Result<(), CraneliftError> {
         match ty {
             IrType::I64 => self.emit_sub_i64(),
