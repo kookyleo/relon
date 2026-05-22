@@ -83,7 +83,8 @@
 //!
 //! ## Inline / fallback decision pattern
 //!
-//! `StrContains` and the dict counterpart in [`crate::dict_inline`]
+//! `StrContains` and the legacy dict counterpart `crate::dict_inline`
+//! (now `#[cfg(test)]` after review #179 P3 isolated the v1 helpers)
 //! share a probe-threshold-tier dispatch pattern, run by the emitter
 //! at op-lowering time:
 //!
@@ -102,8 +103,8 @@
 //!    pass hoisted the StringRef deref, raw pointer otherwise).
 //!    Otherwise emit the extern `__relon_str_contains` call.
 //!
-//! Document mirror: [`crate::dict_inline`]'s "Inline / fallback
-//! decision pattern" section covers the same pattern for
+//! Document mirror: the legacy `crate::dict_inline`'s "Inline /
+//! fallback decision pattern" section covers the same pattern for
 //! `DictLookupPrechecked`. The dispatcher lives in [`crate::emitter`]
 //! because the per-callsite glue is emitter state; a generic
 //! `InlineDecisionHelper<T>` was considered and rejected (dict's key

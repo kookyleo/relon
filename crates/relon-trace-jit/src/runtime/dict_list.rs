@@ -41,9 +41,11 @@
 //! safe: they continue scanning or deopt instead of returning the
 //! wrong value.
 //!
-//! The older v1 helpers in this module are retained for legacy tests
-//! and fixtures. New emitter / installer paths should use the v2
-//! symbols below.
+//! The older v1 helpers in this module are gated behind `#[cfg(test)]`
+//! and only exist for in-crate regression tests that pin the legacy
+//! layout (review #179 P3 — production builds carry zero v1 surface).
+//! All active emitter / installer / bench paths use the v2 symbols
+//! below.
 //!
 //! ## Why this lives in `relon-trace-jit`
 //!
@@ -109,7 +111,10 @@ pub unsafe extern "C" fn __relon_trace_list_get(
     unsafe { (elem_addr as *const i64).read_unaligned() }
 }
 
-/// Legacy IC-guarded dict lookup helper (v1, hash-only).
+/// Legacy IC-guarded dict lookup helper (v1, hash-only). Test-only
+/// — gated behind `#[cfg(test)]` so production builds carry zero v1
+/// surface; the active emitter / installer paths route through the
+/// collision-safe v2 helpers below.
 ///
 /// `dict_ptr` is laid out as:
 ///
@@ -131,28 +136,16 @@ pub unsafe extern "C" fn __relon_trace_list_get(
 /// The v1 layout stores **only** `(key_hash, value)` per entry and
 /// has **no key payload** to byte-compare. The helper therefore
 /// returns the first entry whose 64-bit FxHash matches the looked-up
-/// key — if a future host plumbs in a dict whose key set contains a
-/// payload-distinct entry that collides on FxHash64, the helper will
-/// silently return the wrong value. The risk is bounded today only
-/// by:
-///
-/// 1. The recorder-time `shape_hash` fingerprint must encode the
-///    full key set; mismatch deopts before the scan.
-/// 2. Bench fixtures (W5 / W6 / `cmp_lua*` corpus) hand-build the
-///    entry table from a fixed, collision-audited set of literal
-///    keys, so the IC hot path never encounters a colliding payload
-///    in practice.
-///
-/// Both guarantees hold for the legacy v6 corpus; neither survives a
-/// general production dict whose key set is unbounded. The v2 helpers
-/// below are the active production-facing ABI and carry enough record
-/// envelope metadata to byte-compare the key payload after a hash
-/// match. New call sites MUST use v2.
+/// key — a payload-distinct FxHash64 collision would silently return
+/// the wrong value. Review #179 P3 closed that exposure by gating the
+/// v1 helper behind `#[cfg(test)]`; only the regression tests below
+/// reach it.
 ///
 /// # Safety
 ///
 /// Same shape contract as [`__relon_trace_list_get`]; both pointers
 /// must satisfy the documented layouts and outlive the call.
+#[cfg(test)]
 #[no_mangle]
 pub unsafe extern "C" fn __relon_trace_dict_lookup(
     dict_ptr: *const u8,
@@ -223,19 +216,15 @@ pub unsafe extern "C" fn __relon_trace_dict_lookup(
 /// to drop the trace_jit ratio from × 1.95 toward × 1.5 LuaJIT on the
 /// F-D8-D recorder-driven path — see the F-D8-E.2 stage report.
 ///
-/// # ⚠️ Legacy bench-fixture-only safety (review #175 P2)
+/// # ⚠️ Legacy test-only safety (review #179 P3)
 ///
 /// Inherits the hash-only collision caveat of
 /// [`__relon_trace_dict_lookup`] **and** drops the shape-fingerprint
-/// safety net. The cranelift emitter's `dict_inline` lowering inlines
-/// the body of this helper directly into the trace IR (see
-/// `relon_trace_emitter::dict_inline::emit_dict_lookup_inline`); the
-/// helper call survives only as a fall-back path that bench fixtures
-/// and `relon-codegen-native` integration tests exercise when the
-/// inline path is disabled. Production traces MUST NOT route through
-/// this helper against a dict whose key set is not collision-audited.
-/// Active emitter / installer paths now use
-/// [`__relon_trace_dict_lookup_prechecked_v2`] instead.
+/// safety net. Active emitter / installer paths route through
+/// [`__relon_trace_dict_lookup_prechecked_v2`]; this helper is now
+/// gated behind `#[cfg(test)]` so production builds carry no v1
+/// surface at all and the legacy regression tests can still pin the
+/// historical layout contract.
 ///
 /// # Safety
 ///
@@ -245,6 +234,7 @@ pub unsafe extern "C" fn __relon_trace_dict_lookup(
 ///   the recorder-time fingerprint would silently scan into garbage
 ///   entries. The optimizer is the only producer of
 ///   `DictLookupPrechecked` ops, and it pairs them by construction.
+#[cfg(test)]
 #[no_mangle]
 pub unsafe extern "C" fn __relon_trace_dict_lookup_prechecked(
     dict_ptr: *const u8,
@@ -357,12 +347,15 @@ pub fn build_flat_list_record(elements: &[i64]) -> Vec<u8> {
     out
 }
 
-/// Convenience constructor: layout-conformant dict record for tests
-/// + bench fixtures.
+/// Convenience constructor for the v1 dict record. Test-only —
+/// gated behind `#[cfg(test)]` because v1 helpers / inline emit are
+/// no longer compiled into production builds. Bench fixtures use
+/// [`build_dict_record_v2`] instead.
 ///
 /// `shape_hash` is the recorder-time fingerprint stamped into the
 /// header; `entries` is the pre-flattened (`key_hash`, `value`)
 /// table. Callers compute the per-key FxHash via [`fx_hash_bytes`].
+#[cfg(test)]
 pub fn build_dict_record(shape_hash: u64, entries: &[(u64, i64)]) -> Vec<u8> {
     let entry_count = entries.len() as u32;
     let mut out = Vec::with_capacity(12 + 16 * entries.len());
