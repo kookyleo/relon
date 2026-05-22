@@ -46,26 +46,13 @@ impl OptimizerPass for ConstFold {
         // a single pass.
         let mut known = trace.consts.clone();
 
-        // Cache effect class per pc to enforce reorder-barrier rule
-        // when checking whether an upstream const is still valid.
-        // Because we only fold ops whose *inputs* are already in
-        // `known` and we walk top-to-bottom, the barrier rule is
-        // simpler: ConstI32/ConstI64 ops never cross a barrier
-        // because they have no inputs. We only need to make sure we
-        // do not let a RecoverableWrite *erase* an earlier const --
-        // it cannot, since `known` is keyed by SSA id, not by
-        // address. So we just verify the input ops aren't themselves
-        // RecoverableWrite outputs (they can't be -- those produce no
-        // SSA output for `Store` and `Div` produces non-foldable
-        // semantics).
-        //
-        // The explicit barrier check below guards future variants:
-        // if a `RecoverableWrite` op is ever added that *does*
-        // produce an SSA value, we must NOT fold it.
-        let is_safe_const_source = |op: &TraceOp| match op {
-            TraceOp::ConstI32(_, _) | TraceOp::ConstI64(_, _) => true,
-            _ => !op.effect_class().is_reorder_barrier(),
-        };
+        // Inputs come from the `known` table keyed by SSA id, so a
+        // RecoverableWrite op can never silently overwrite an earlier
+        // const we depend on. The op being folded is itself replaced
+        // by a pure ConstI32/I64; for `Mod` (the one RecoverableWrite
+        // arithmetic op the recorder produces today) `fold_arith`
+        // refuses the fold when the divisor is 0 or `MIN % -1`, so
+        // the runtime trap path is preserved.
 
         for idx in 0..trace.ops.len() {
             let op = trace.ops[idx].clone();
@@ -81,9 +68,6 @@ impl OptimizerPass for ConstFold {
                 | TraceOp::Mul(dst, a, b)
                 | TraceOp::Mod(dst, a, b) => {
                     if let (Some(ka), Some(kb)) = (known.get(&a), known.get(&b)) {
-                        if !is_safe_const_source(&trace.ops[idx]) {
-                            continue;
-                        }
                         if let Some(folded) = fold_arith(&trace.ops[idx], *ka, *kb) {
                             apply_fold(trace, &mut known, idx, dst, folded);
                             report.ops_replaced += 1;
