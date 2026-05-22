@@ -31,7 +31,7 @@ use crate::cache::CacheEntry;
 use crate::codegen::{self, CompiledModule, EntryShape};
 use crate::error::CraneliftError;
 use crate::object_cache_integration as cache_int;
-use crate::sandbox::{CapabilityVtable, SandboxConfig, SandboxState, TrapKind};
+use crate::sandbox::{CapabilityVtable, SandboxConfig, SandboxShared, SandboxState, TrapKind};
 
 /// Type alias for the raw `extern "C"` entry the JIT produced when
 /// the entry shape is [`EntryShape::LegacyI64Args`]. Five i64s cover
@@ -125,11 +125,19 @@ pub struct CraneliftAotEvaluator {
     param_names: Vec<String>,
     /// Source range of the entry `#main` directive.
     entry_range: TokenRange,
-    /// Per-call sandbox state. Wrapped in `Arc` so concurrent
-    /// `run_main` invocations from multiple threads can hand the JIT
-    /// the same pointer without contention on the underlying
-    /// allocation; the few atomic fields synchronise updates.
-    sandbox_state: Arc<SandboxState>,
+    /// 2026-05-22 P0 fix: immutable sandbox template the evaluator
+    /// owns between dispatches. Each `run_main` allocates its own
+    /// per-call `SandboxState` from this snapshot so concurrent
+    /// invocations from multiple threads never share the
+    /// `UnsafeCell<_>` arena / cursor fields. See
+    /// [`SandboxState`]'s top-comment for the unsafety history.
+    ///
+    /// Holds the live deadline + capability vtable + closure-table
+    /// base; updates flow through `set_deadline` /
+    /// `install_capabilities_mut` and only become visible on the
+    /// **next** dispatch (the current dispatch already snapshotted at
+    /// the top of `from_template`).
+    sandbox_shared: Arc<SandboxShared>,
     /// Schema descriptors for the buffer-protocol path. `None` for
     /// legacy direct-IR modules.
     buffer_schema: Option<BufferSchema>,
@@ -142,20 +150,27 @@ pub struct CraneliftAotEvaluator {
     /// Stage 5 Phase C.4: closure fn-pointer table. One `usize` per
     /// `IrModule::closure_table` entry; populated after JIT finalize
     /// by resolving each lambda `FuncId` through
-    /// `JITModule::get_finalized_function`. The sandbox state's
+    /// `JITModule::get_finalized_function`. The sandbox template's
     /// `closure_table_base` is installed to point at this vec's
     /// element zero so `Op::CallClosure` can dereference the slot.
     ///
     /// Wrapped in `Box<[usize]>` so the address is stable for the
     /// evaluator's lifetime (we install a raw pointer into the
-    /// sandbox state). Empty when the module has no lambdas.
+    /// sandbox template). Empty when the module has no lambdas. The
+    /// field is never directly read post-construction — keeping it
+    /// alive is the entire point, so the JIT-side `Op::CallClosure`
+    /// indirect address resolution doesn't dangle.
+    #[allow(dead_code)]
     closure_table: Box<[usize]>,
 }
 
-// SAFETY: The JIT-emitted code is reentrant and the `SandboxState`
-// fields that get mutated across calls (deadline / trap_code) are
-// `AtomicI64` / `AtomicU64`. `JITModule` itself is `Send + Sync` in
-// cranelift's current public surface.
+// SAFETY: The JIT-emitted code is reentrant, and `SandboxShared`'s
+// fields are all atomics or `Mutex<Arc<_>>` — neither requires
+// exclusive thread access. `JITModule` is `Send + Sync` in
+// cranelift's current public surface. Every per-call `SandboxState`
+// is freshly boxed inside `run_main`, so the unsafe shared-state
+// path the original `unsafe impl Sync for SandboxState` papered over
+// (see 2026-05-22 P0 fix) is gone.
 unsafe impl Send for CraneliftAotEvaluator {}
 unsafe impl Sync for CraneliftAotEvaluator {}
 
@@ -482,19 +497,16 @@ impl CraneliftAotEvaluator {
         let closure_table: Box<[usize]> = closure_table_vec.into_boxed_slice();
 
         let capabilities = Arc::new(CapabilityVtable::with_capacity(64));
-        let sandbox_state = Arc::new(SandboxState::new(capabilities));
-        sandbox_state.entry_range.set(entry_range);
+        let sandbox_shared = Arc::new(SandboxShared::new(capabilities));
         // SAFETY: closure_table is Box-allocated and lives on the
         // evaluator; the raw pointer stays valid for the evaluator's
         // lifetime.
-        unsafe {
-            let base = if closure_table.is_empty() {
-                0
-            } else {
-                closure_table.as_ptr() as usize
-            };
-            sandbox_state.install_closure_table(base);
-        }
+        let base = if closure_table.is_empty() {
+            0
+        } else {
+            closure_table.as_ptr() as usize
+        };
+        sandbox_shared.set_closure_table_base(base);
 
         let arity = buffer_schema
             .as_ref()
@@ -512,7 +524,7 @@ impl CraneliftAotEvaluator {
             entry_arity: arity,
             param_names: schema_entry.param_names,
             entry_range,
-            sandbox_state,
+            sandbox_shared,
             buffer_schema,
             const_data: schema_entry.const_data,
             closure_table,
@@ -875,21 +887,17 @@ impl CraneliftAotEvaluator {
         // `relon_caps_avail` u64 bitmap shape. Hosts that register a
         // higher cap_bit cause `register` to grow the vector.
         let capabilities = Arc::new(CapabilityVtable::with_capacity(64));
-        let sandbox_state = Arc::new(SandboxState::new(capabilities));
-        sandbox_state.entry_range.set(entry_range);
-        // SAFETY: closure_table is Box-allocated and lives on the
-        // evaluator; the raw pointer stays valid for the evaluator's
-        // lifetime. When the table is empty we install 0 (cranelift
-        // never reads through it because no Op::CallClosure was
-        // emitted).
-        unsafe {
-            let base = if closure_table.is_empty() {
-                0
-            } else {
-                closure_table.as_ptr() as usize
-            };
-            sandbox_state.install_closure_table(base);
-        }
+        let sandbox_shared = Arc::new(SandboxShared::new(capabilities));
+        // closure_table is Box-allocated and lives on the evaluator;
+        // the raw pointer stays valid for the evaluator's lifetime.
+        // When the table is empty we install 0 (cranelift never reads
+        // through it because no Op::CallClosure was emitted).
+        let base = if closure_table.is_empty() {
+            0
+        } else {
+            closure_table.as_ptr() as usize
+        };
+        sandbox_shared.set_closure_table_base(base);
 
         // Buffer-protocol arity equals the user-field count when we
         // have a schema; fall back to the IR-param count for legacy
@@ -910,46 +918,33 @@ impl CraneliftAotEvaluator {
             entry_arity: arity,
             param_names,
             entry_range,
-            sandbox_state,
+            sandbox_shared,
             buffer_schema,
             const_data,
             closure_table,
         })
     }
 
-    /// Replace the capability vtable wholesale. The new vtable is
-    /// wired into a fresh [`SandboxState`] that inherits the entry
-    /// range; the caller resets the deadline separately if needed.
+    /// Replace the capability vtable wholesale.
     ///
-    /// v5-beta-1 only supports `&mut self` reconfiguration because
-    /// the JIT module's state pointer is captured at compile time;
-    /// hosts that need to vary capabilities per call wrap the
-    /// evaluator in their own `Mutex<CraneliftAotEvaluator>` and
-    /// take the lock before each `run_main` invocation.
+    /// 2026-05-22 P0 fix: previously this rebuilt a brand-new
+    /// `Arc<SandboxState>` so the in-flight invocation kept its old
+    /// vtable while the next invocation picked up the new one. The
+    /// per-call ownership model gives us the same property "for free":
+    /// each `run_main` snapshots the template at the top of dispatch,
+    /// so swapping the `Arc<CapabilityVtable>` inside the template
+    /// here only affects subsequent dispatches.
     pub fn install_capabilities_mut(&mut self, capabilities: Arc<CapabilityVtable>) {
-        let new_state = SandboxState::new(capabilities);
-        new_state.entry_range.set(self.entry_range);
-        // Stage 5 Phase C.4: re-install the closure table pointer
-        // onto the fresh state so `Op::CallClosure` keeps resolving.
-        // SAFETY: the closure_table allocation lives on the
-        // evaluator; its raw pointer remains valid for the
-        // evaluator's lifetime.
-        unsafe {
-            let base = if self.closure_table.is_empty() {
-                0
-            } else {
-                self.closure_table.as_ptr() as usize
-            };
-            new_state.install_closure_table(base);
-        }
-        self.sandbox_state = Arc::new(new_state);
+        self.sandbox_shared.set_capabilities(capabilities);
     }
 
     /// Configure the per-call wall-clock deadline. Pass
     /// `std::time::Duration::MAX` (or any value that overflows the
-    /// nanos-as-i64 budget) to disable.
+    /// nanos-as-i64 budget) to disable. The new value applies from the
+    /// next dispatch onward — invocations already in flight keep the
+    /// deadline they snapshotted at the top of dispatch.
     pub fn set_deadline(&self, deadline: std::time::Duration) {
-        self.sandbox_state.set_deadline(deadline);
+        self.sandbox_shared.set_deadline(deadline);
     }
 
     /// Number of `#main` arguments expected.
@@ -1122,18 +1117,28 @@ impl CraneliftAotEvaluator {
     /// still surface a typed error rather than aborting the test
     /// process.
     fn invoke_legacy_entry(&self, args: [i64; 4]) -> Result<i64, RuntimeError> {
-        // 2026-05-21 dispatch-boundary lever (c): lazy trap-code reset.
-        // Debug builds keep the eager pre-invoke reset so a stale code
-        // from a previous panicking test can't leak across runs; release
-        // builds skip both resets because `dispatch_post_unshielded`
-        // owns the cleanup (only stores back when the slot was found
-        // non-zero, see `take_trap_code` and `take_signal_slot`).
+        // 2026-05-22 P0 fix: allocate a fresh per-call SandboxState
+        // from the evaluator's immutable template. Two threads
+        // dispatching against the same evaluator each see their own
+        // boxed state, so the in-place arena / trap_code writes that
+        // used to race are now thread-local.
+        //
+        // `Box::new` is ~30-50 ns on x86_64 glibc; an upcoming follow-
+        // up can pool these via thread_local!{} if profiling shows the
+        // overhead matters on the dispatch hot path.
+        let state = Box::new(SandboxState::from_template(&self.sandbox_shared));
+        let state_ptr: *const SandboxState = &*state;
+        // 2026-05-21 dispatch-boundary lever (c): the per-call state
+        // starts with `trap_code == 0` and a clean thread_local signal
+        // slot (we reset before dispatch only on debug builds so panic
+        // tests don't leak stale codes). Release builds rely on the
+        // per-call ownership for the trap slot and let
+        // `dispatch_post_unshielded` reset the signal slot on
+        // observation.
         #[cfg(debug_assertions)]
         {
             crate::trap_handler::reset_thread_signal_slot();
-            self.sandbox_state.reset_trap();
         }
-        let state_ptr: *const SandboxState = Arc::as_ptr(&self.sandbox_state);
         // 2026-05-21 dispatch-boundary lever (d): use the de-tagged
         // inline-cached entry pointer (single field load) instead of
         // matching on the `entry_fn` enum discriminant each invoke.
@@ -1152,7 +1157,7 @@ impl CraneliftAotEvaluator {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
                 entry(state_ptr, args[0], args[1], args[2], args[3])
             }));
-            self.dispatch_post(result)
+            self.dispatch_post(&state, result)
         }
         #[cfg(not(debug_assertions))]
         {
@@ -1162,7 +1167,7 @@ impl CraneliftAotEvaluator {
             // `dispatch_post_unshielded` reads. Helper calls are audited
             // to never panic on their hot paths.
             let value = unsafe { entry(state_ptr, args[0], args[1], args[2], args[3]) };
-            self.dispatch_post_unshielded(value)
+            self.dispatch_post_unshielded(&state, value)
         }
     }
 
@@ -1205,26 +1210,26 @@ impl CraneliftAotEvaluator {
         // the host's lifetime, so the hot dispatch path doesn't pay a
         // `Once::call_once` atomic-load probe per invocation.
         //
-        // 2026-05-21 dispatch-boundary lever (c): lazy trap-code reset.
-        // See `invoke_legacy_entry` for the rationale; release builds
-        // skip both resets and let `dispatch_post_unshielded` own the
-        // cleanup.
+        // 2026-05-22 P0 fix: allocate a per-call SandboxState from
+        // the evaluator's immutable template. See
+        // `invoke_legacy_entry` for the rationale; the buffer entry
+        // additionally writes the arena pointer / length / scratch
+        // base, which previously raced on a shared Arc<SandboxState>.
+        let state = Box::new(SandboxState::from_template(&self.sandbox_shared));
+        let state_ptr: *const SandboxState = &*state;
         #[cfg(debug_assertions)]
         {
             crate::trap_handler::reset_thread_signal_slot();
-            self.sandbox_state.reset_trap();
         }
         // SAFETY: `arena` is borrowed mutably here and stays valid
         // through the JIT call's lifetime (`arena` outlives this
-        // function); the JIT side reads / writes through the pointer
-        // we install. Both the host trampoline and the cranelift
-        // emitter respect the `arena_len` field for bounds.
+        // function). The per-call `state` is the unique owner of the
+        // arena / scratch UnsafeCells for the dispatch's duration, so
+        // the writes below cannot race with another thread.
         unsafe {
-            self.sandbox_state
-                .install_arena(arena.as_mut_ptr(), arena.len() as u32);
-            self.sandbox_state.install_scratch_base(scratch_base);
+            state.install_arena(arena.as_mut_ptr(), arena.len() as u32);
+            state.install_scratch_base(scratch_base);
         }
-        let state_ptr: *const SandboxState = Arc::as_ptr(&self.sandbox_state);
         // 2026-05-21 dispatch-boundary lever (d): de-tagged inline
         // cache; see `invoke_legacy_entry` for the rationale.
         let entry = match self.buffer_entry_cached {
@@ -1252,7 +1257,7 @@ impl CraneliftAotEvaluator {
                     caps as i64,
                 )
             }));
-            self.dispatch_post(result)
+            self.dispatch_post(&state, result)
         }
         #[cfg(not(debug_assertions))]
         {
@@ -1266,7 +1271,7 @@ impl CraneliftAotEvaluator {
                     caps as i64,
                 )
             };
-            self.dispatch_post_unshielded(value)
+            self.dispatch_post_unshielded(&state, value)
         }
     }
 
@@ -1284,7 +1289,11 @@ impl CraneliftAotEvaluator {
     /// signal actually fired, so the success path is two predictable-
     /// not-taken branches with no atomic stores.
     #[cfg(not(debug_assertions))]
-    fn dispatch_post_unshielded<T>(&self, value: T) -> Result<T, RuntimeError> {
+    fn dispatch_post_unshielded<T>(
+        &self,
+        state: &SandboxState,
+        value: T,
+    ) -> Result<T, RuntimeError> {
         let signal_code = crate::trap_handler::read_thread_signal_slot();
         if signal_code != 0 {
             // Reset the slot eagerly so the next dispatch doesn't pick
@@ -1294,7 +1303,7 @@ impl CraneliftAotEvaluator {
                 return Err(kind.to_runtime_error(self.entry_range));
             }
         }
-        let code = self.sandbox_state.take_trap_code();
+        let code = state.take_trap_code();
         if code != 0 {
             return Err(TrapKind::from_code(code as u8).to_runtime_error(self.entry_range));
         }
@@ -1315,7 +1324,11 @@ impl CraneliftAotEvaluator {
     /// path; release builds skip the `catch_unwind` and call
     /// `dispatch_post_unshielded` instead.
     #[cfg(debug_assertions)]
-    fn dispatch_post<T>(&self, result: std::thread::Result<T>) -> Result<T, RuntimeError> {
+    fn dispatch_post<T>(
+        &self,
+        state: &SandboxState,
+        result: std::thread::Result<T>,
+    ) -> Result<T, RuntimeError> {
         // Check the signal-hook slot first — a SIGSEGV during JIT
         // body execution should surface as a typed trap even if the
         // JIT-side `cond_trap` sequence never ran.
@@ -1327,14 +1340,14 @@ impl CraneliftAotEvaluator {
         }
         match result {
             Ok(v) => {
-                let code = self.sandbox_state.trap_code();
+                let code = state.trap_code();
                 if code != 0 {
                     return Err(TrapKind::from_code(code as u8).to_runtime_error(self.entry_range));
                 }
                 Ok(v)
             }
             Err(payload) => {
-                let code = self.sandbox_state.trap_code();
+                let code = state.trap_code();
                 let _ = payload;
                 if code != 0 {
                     Err(TrapKind::from_code(code as u8).to_runtime_error(self.entry_range))
