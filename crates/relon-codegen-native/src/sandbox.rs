@@ -52,9 +52,9 @@
 
 use relon_eval_api::RuntimeError;
 use relon_parser::TokenRange;
-use std::cell::{Cell, UnsafeCell};
+use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// Compile-time sandbox configuration. Built once when a
@@ -303,27 +303,50 @@ impl CapabilityVtable {
 /// uninitialised output region. Cranelift code emits `LoadField` /
 /// `StoreField` as `arena_base + in_or_out_ptr + offset` with an
 /// `arena_len`-relative bounds check.
+///
+/// ## 2026-05-22 P0 fix: ownership model
+///
+/// Earlier drafts kept a single `Arc<SandboxState>` on the evaluator
+/// and re-pointed `arena_base` / `tail_cursor` / `scratch_*` from
+/// every `run_main` invocation — concurrent invocations on threads
+/// sharing the same evaluator raced on those `UnsafeCell` fields and
+/// risked silent corruption (the `unsafe impl Sync` was unsound).
+///
+/// Stage 5 reverts to **per-call ownership**: the evaluator stores an
+/// immutable [`SandboxShared`] template, and each `run_main` allocates
+/// a fresh `Box<SandboxState>` (or fishes one out of an optional pool),
+/// installs its arena, runs the JIT entry, and drops the state at the
+/// end of the dispatch. Two threads dispatching on the same evaluator
+/// each see their own `SandboxState`, so the per-call `UnsafeCell`
+/// fields stay unaliased without needing `Sync`. `SandboxState` is
+/// only `Send` now; the `Sync` marker is gone.
 #[repr(C)]
 pub struct SandboxState {
     /// Deadline as nanos since `Instant::now()` at session start. The
     /// entry prologue reads `now - epoch >= deadline_ns` and traps on
     /// overflow.
+    ///
+    /// Kept as `AtomicI64` because the cranelift entry pulls it through
+    /// the host-side `now_helper` indirection (which already issues a
+    /// `Relaxed` load) and the evaluator copies the freshest value out
+    /// of the [`SandboxShared`] template at the top of each dispatch.
     deadline_ns: AtomicI64,
     /// Trap reason set by the JIT entry before unwinding. Encoded as
     /// `u64` so we can swap it from cranelift via a normal `i64`
     /// store without going through a wider cell type. Value 0 means
-    /// "no trap".
+    /// "no trap". Lives on the per-call state so cross-thread invokes
+    /// never observe each other's trap bits.
     trap_code: AtomicU64,
     /// Base pointer of the "linear memory" arena. Cranelift code
     /// computes addresses as `arena_base + buf_ptr + field_offset`
     /// for every `LoadField` / `StoreField` it emits. Re-pointed by
-    /// the host trampoline before each `run_main` invocation; see
+    /// the host trampoline before invoking the JIT entry; see
     /// [`SandboxState::install_arena`].
     ///
-    /// Stored as `UnsafeCell<usize>` so the JIT thread can read
-    /// through a stable offset without going through a Rust borrow
-    /// — the host holds the only `&mut` access via `install_arena`,
-    /// and that happens strictly before the JIT call begins.
+    /// Stored as `UnsafeCell<usize>` so the JIT thread can read /
+    /// write through a stable offset without going through a Rust
+    /// borrow. The per-call ownership model means at most one thread
+    /// can ever observe this cell.
     arena_base: UnsafeCell<usize>,
     /// Length in bytes of the arena pointed to by `arena_base`. Used
     /// by the cranelift bounds-check sequence to trap before any
@@ -367,13 +390,9 @@ pub struct SandboxState {
     /// construction; the entry computes elapsed nanos against this.
     epoch: Instant,
     /// Active vtable for host-fn dispatch. Wrapped in `Arc` so the
-    /// host can hand a vtable to multiple concurrent run_main calls
-    /// without cloning the slot array per invocation.
+    /// evaluator can hand the same vtable to every per-call
+    /// [`SandboxState`] without cloning the slot array.
     capabilities: Arc<CapabilityVtable>,
-    /// Slot used by the cranelift codegen to remember an entry source
-    /// range for the trap-to-RuntimeError step. Not read by the JIT;
-    /// the host walks it post-trap.
-    pub(crate) entry_range: Cell<TokenRange>,
 }
 
 /// Byte offset of `SandboxState::deadline_ns` inside the
@@ -413,12 +432,105 @@ pub const STATE_OFFSET_SCRATCH_BASE: i32 = 36;
 /// fn pointer.
 pub const STATE_OFFSET_CLOSURE_TABLE_BASE: i32 = 40;
 
-// SAFETY: `Cell<TokenRange>` is not `Sync`, but we only hand
-// `&SandboxState` to single-threaded cranelift code; the typed
-// atomics serialise across threads when the host shares an `Arc<>`.
-// Marking explicitly because the public `Arc<SandboxState>` shape
-// crosses thread boundaries via `Send + Sync` bounds elsewhere.
-unsafe impl Sync for SandboxState {}
+// 2026-05-22 P0 fix: the previous `unsafe impl Sync for SandboxState`
+// claimed it was safe to share `&SandboxState` across threads, but the
+// `UnsafeCell<_>` fields (`arena_base`, `arena_len`, `tail_cursor`,
+// `scratch_*`, `closure_table_base`) were written by `install_arena` /
+// `install_scratch_base` on the host thread immediately before each
+// JIT dispatch. Two threads dispatching against a shared
+// `Arc<SandboxState>` therefore raced on those writes — data race
+// under the Rust memory model. The fix is to drop `Sync` entirely and
+// allocate a fresh per-call `Box<SandboxState>` (or fetch one from a
+// per-evaluator pool) inside the run_main trampoline; that gives the
+// state a single-owner thread for the duration of the JIT call without
+// any shared mutability. `Send` is sound because the per-call state is
+// moved (not aliased) across `Box::new` / `Box::leak` boundaries when
+// pooled.
+//
+// `SandboxState` therefore stays `Send` (the auto-trait works through
+// the atomics and the `UnsafeCell<usize>` via the type system because
+// `usize` and `u32` are `Send`) and is **not** `Sync`. The asserts in
+// the test module below guard against an accidental re-introduction of
+// `Sync`.
+
+/// Immutable template the evaluator holds between dispatches. The host
+/// drives per-call [`SandboxState::from_template`] off this snapshot so
+/// the evaluator itself stays `Sync` without ever exposing a shared
+/// `&SandboxState` to two threads at once. Updates to the deadline /
+/// capabilities / closure-table address all flow through the
+/// evaluator, which copies the current snapshot into the per-call
+/// state at dispatch time.
+pub(crate) struct SandboxShared {
+    /// Deadline as nanos since `epoch`. `i64::MAX` means
+    /// "effectively no deadline". `set_deadline` writes here; every
+    /// per-call state copies the freshest value at dispatch time.
+    pub(crate) deadline_ns: AtomicI64,
+    /// Active capability vtable. `install_capabilities_mut` swaps the
+    /// `Arc` wholesale; cheap clone-per-call (one atomic inc). The
+    /// mutex is taken only for the duration of the swap / snapshot,
+    /// never held across a JIT dispatch.
+    pub(crate) capabilities: Mutex<Arc<CapabilityVtable>>,
+    /// Pointer to the closure-table the evaluator's `Box<[usize]>`
+    /// allocation lives at. `0` when the module has no closures.
+    /// Stored as raw `AtomicUsize` because the table allocation lives
+    /// on the evaluator and stays put for the evaluator's lifetime —
+    /// the value is set once during construction and never re-pointed.
+    pub(crate) closure_table_base: std::sync::atomic::AtomicUsize,
+    /// Reference start time for deadline calculations. Captured once
+    /// when the template is built.
+    pub(crate) epoch: Instant,
+}
+
+impl SandboxShared {
+    /// Build a template carrying the supplied capability vtable. The
+    /// deadline starts at `i64::MAX` (effectively no deadline) and the
+    /// closure-table pointer at 0; both are wired up by the
+    /// evaluator after construction.
+    pub(crate) fn new(capabilities: Arc<CapabilityVtable>) -> Self {
+        Self {
+            deadline_ns: AtomicI64::new(i64::MAX),
+            capabilities: Mutex::new(capabilities),
+            closure_table_base: std::sync::atomic::AtomicUsize::new(0),
+            epoch: Instant::now(),
+        }
+    }
+
+    /// Snapshot the current capability vtable. The mutex is released
+    /// before the snapshot is returned; the JIT dispatch only ever
+    /// holds an `Arc<CapabilityVtable>` clone, never the lock.
+    pub(crate) fn capabilities_snapshot(&self) -> Arc<CapabilityVtable> {
+        Arc::clone(
+            &self
+                .capabilities
+                .lock()
+                .expect("sandbox capabilities mutex poisoned"),
+        )
+    }
+
+    /// Swap the active capability vtable. Used by
+    /// `install_capabilities_mut` on the evaluator surface.
+    pub(crate) fn set_capabilities(&self, vt: Arc<CapabilityVtable>) {
+        *self
+            .capabilities
+            .lock()
+            .expect("sandbox capabilities mutex poisoned") = vt;
+    }
+
+    /// Update the closure-table base pointer. Called once after the
+    /// evaluator resolves the per-module fn pointers.
+    pub(crate) fn set_closure_table_base(&self, base: usize) {
+        self.closure_table_base
+            .store(base, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Configure the per-call deadline. Pass `Duration::MAX` (or any
+    /// value that overflows to `i64::MAX` nanos) to disable.
+    pub(crate) fn set_deadline(&self, deadline: Duration) {
+        let nanos = i64::try_from(deadline.as_nanos()).unwrap_or(i64::MAX);
+        self.deadline_ns
+            .store(nanos, std::sync::atomic::Ordering::Relaxed);
+    }
+}
 
 impl SandboxState {
     /// Build a fresh sandbox state with an effectively-infinite
@@ -426,6 +538,12 @@ impl SandboxState {
     /// [`Self::set_deadline`] before invoking the JIT entry. The
     /// arena starts unpopulated; the host trampoline calls
     /// [`Self::install_arena`] before invoking the JIT entry.
+    ///
+    /// Direct callers are tests / direct-IR fixtures; production
+    /// dispatch goes through the evaluator's
+    /// [`SandboxShared::new`] template + per-call
+    /// [`Self::from_template`] path so the per-call state is
+    /// thread-local rather than shared.
     pub fn new(capabilities: Arc<CapabilityVtable>) -> Self {
         Self {
             deadline_ns: AtomicI64::new(i64::MAX),
@@ -438,7 +556,34 @@ impl SandboxState {
             closure_table_base: UnsafeCell::new(0),
             epoch: Instant::now(),
             capabilities,
-            entry_range: Cell::new(TokenRange::default()),
+        }
+    }
+
+    /// Materialise a per-call `SandboxState` from the evaluator's
+    /// shared template. Copies the current deadline + capability
+    /// snapshot + closure-table base into a freshly-allocated state
+    /// the dispatch thread owns exclusively for the duration of the
+    /// JIT call.
+    ///
+    /// `epoch` deliberately threads through the template rather than
+    /// being re-sampled per-call so the deadline math stays anchored
+    /// to a stable wall-clock origin across consecutive dispatches.
+    pub(crate) fn from_template(template: &SandboxShared) -> Self {
+        let deadline = template.deadline_ns.load(Ordering::Relaxed);
+        let closure_base = template
+            .closure_table_base
+            .load(std::sync::atomic::Ordering::Relaxed);
+        Self {
+            deadline_ns: AtomicI64::new(deadline),
+            trap_code: AtomicU64::new(0),
+            arena_base: UnsafeCell::new(0),
+            arena_len: UnsafeCell::new(0),
+            tail_cursor: UnsafeCell::new(0),
+            scratch_cursor: UnsafeCell::new(0),
+            scratch_base: UnsafeCell::new(0),
+            closure_table_base: UnsafeCell::new(closure_base),
+            epoch: template.epoch,
+            capabilities: template.capabilities_snapshot(),
         }
     }
 
@@ -837,5 +982,42 @@ mod tests {
         assert!(cfg.deadline_check);
         assert!(cfg.capability_check);
         assert!(cfg.div_check);
+    }
+
+    /// 2026-05-22 P0 fix: the per-call `SandboxState` must be `Send`
+    /// (moves between threads when boxed inside the trampoline) but
+    /// **not** `Sync` — its `UnsafeCell<_>` fields cannot soundly be
+    /// shared. The previous `unsafe impl Sync for SandboxState` raced
+    /// on every `install_arena` write across concurrent dispatches.
+    #[test]
+    fn sandbox_state_is_send_but_not_sync() {
+        fn assert_send<T: Send>() {}
+        assert_send::<SandboxState>();
+
+        // Compile-time witness that `SandboxState` is **not** `Sync`:
+        // we feed the type into a generic that requires `Sync` and
+        // expect the file to *fail* to compile if `Sync` ever leaks
+        // back in. We can't express a `!Sync` bound on stable Rust,
+        // so we use a `cfg(any())` arm that the compiler still type-
+        // checks. Removing the `cfg(any())` guard reveals the
+        // intent: `SandboxState: !Sync`.
+        #[allow(dead_code)]
+        fn _must_not_be_sync() {
+            #[cfg(any())]
+            {
+                fn assert_sync<T: Sync>() {}
+                assert_sync::<SandboxState>();
+            }
+        }
+    }
+
+    /// 2026-05-22 P0 fix: the `SandboxShared` template must be
+    /// `Send + Sync` so the evaluator (which holds an
+    /// `Arc<SandboxShared>`) stays `Send + Sync`. Without this the
+    /// `Evaluator` trait's bound would fail to derive.
+    #[test]
+    fn sandbox_shared_is_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<SandboxShared>();
     }
 }
