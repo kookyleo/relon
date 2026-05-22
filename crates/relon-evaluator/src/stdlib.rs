@@ -1253,7 +1253,11 @@ impl RelonFunction for StringUpperLocale {
         let s = expect_string(&args[0], range)?;
         let locale = expect_string(&args[1], range)?;
         let tr = relon_ir::full_case_folding::is_turkish_locale(locale);
-        Ok(Value::String(fold_string_to_smol(s, CaseFoldMode::Upper, tr)))
+        Ok(Value::String(fold_string_to_smol(
+            s,
+            CaseFoldMode::Upper,
+            tr,
+        )))
     }
 }
 
@@ -1269,7 +1273,11 @@ impl RelonFunction for StringLowerLocale {
         let s = expect_string(&args[0], range)?;
         let locale = expect_string(&args[1], range)?;
         let tr = relon_ir::full_case_folding::is_turkish_locale(locale);
-        Ok(Value::String(fold_string_to_smol(s, CaseFoldMode::Lower, tr)))
+        Ok(Value::String(fold_string_to_smol(
+            s,
+            CaseFoldMode::Lower,
+            tr,
+        )))
     }
 }
 
@@ -1285,7 +1293,11 @@ impl RelonFunction for StringTitleLocale {
         let s = expect_string(&args[0], range)?;
         let locale = expect_string(&args[1], range)?;
         let tr = relon_ir::full_case_folding::is_turkish_locale(locale);
-        Ok(Value::String(fold_string_to_smol(s, CaseFoldMode::Title, tr)))
+        Ok(Value::String(fold_string_to_smol(
+            s,
+            CaseFoldMode::Title,
+            tr,
+        )))
     }
 }
 
