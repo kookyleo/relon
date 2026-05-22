@@ -863,6 +863,12 @@ impl RelonFunction for StringReplace {
 ///      remaining simple + multi-cp behaviour for free.
 ///   5. Identity (combining marks pass through unchanged when not
 ///      `at_word_start` for the title flow).
+///
+/// Test-only convenience wrapper around
+/// [`fold_string_with_ascii_hint`]; production code reaches in via
+/// [`fold_string_to_smol_with_hint`] so the caller's pre-classified
+/// ASCII fact propagates through the inline write-to-buffer fast path.
+#[cfg(test)]
 fn fold_string(s: &str, mode: CaseFoldMode, locale_turkish: bool) -> String {
     fold_string_with_ascii_hint(s, mode, locale_turkish, AsciiHint::Unknown)
 }
@@ -885,13 +891,24 @@ fn fold_string(s: &str, mode: CaseFoldMode, locale_turkish: bool) -> String {
 /// fold engine has the full state space rather than a default-true
 /// / default-false split.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(
-    dead_code,
-    reason = "AllAscii / KnownNonAscii are reached only by the #153 parity tests today; surface call site lands in the follow-up that plumbs the StringRef ASCII flag bit into the evaluator's Value -> &str path"
-)]
 enum AsciiHint {
     /// Caller has not classified the input. The fold engine runs the
     /// SIMD scan + fast path as before.
+    ///
+    /// Live tree-walk callers (`String{Upper,Lower,Title}{,Locale}`)
+    /// always derive a concrete `AllAscii` / `KnownNonAscii` hint from
+    /// the input `SmolStr`, so this variant is only constructed by the
+    /// test suite + the `#[cfg(test)]` `fold_string` wrapper. The
+    /// fold engine still pattern-matches against it because future
+    /// bytecode / trace-JIT callers may want the legacy SIMD-scan
+    /// shape when no upstream classification exists.
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "constructed only by the #[cfg(test)] `fold_string` wrapper + ascii_hint parity tests; surface call sites all classify via `AsciiHint::from_smol`"
+        )
+    )]
     Unknown,
     /// Caller has proven the input is all `< 0x80`. The fold engine
     /// skips the SIMD scan and goes straight to the mask + xor
@@ -901,6 +918,21 @@ enum AsciiHint {
     /// `>= 0x80`. The fold engine skips the SIMD scan and goes
     /// straight to the per-codepoint slow path.
     KnownNonAscii,
+}
+
+impl AsciiHint {
+    /// Build a hint from a [`SmolStr`] caller. Inline payloads pay one
+    /// vectorisable 22-byte scan; heap payloads delegate to
+    /// `str::is_ascii`. See the type-level note on
+    /// [`relon_eval_api::SmolStr::is_ascii`] for the cost breakdown.
+    #[inline]
+    fn from_smol(s: &SmolStr) -> Self {
+        if s.is_ascii() {
+            AsciiHint::AllAscii
+        } else {
+            AsciiHint::KnownNonAscii
+        }
+    }
 }
 
 /// Tier 2c (#153) entry point that lets the caller surface the
@@ -1110,6 +1142,14 @@ enum CaseFoldMode {
 /// historical `fold_string(...).into()` path paid even on inline-sized
 /// outputs.
 ///
+/// `ascii_hint` lets the caller surface a pre-classified ASCII fact
+/// (typically from [`relon_eval_api::SmolStr::is_ascii`]). When the
+/// caller has already paid the scan we skip the redundant
+/// `s.is_ascii()` re-check; on `AsciiHint::KnownNonAscii` we bail out
+/// without touching the bytes at all. `AsciiHint::Unknown` keeps the
+/// legacy shape (one `str::is_ascii` scan over the inline-cap
+/// payload).
+///
 /// Returns `None` and falls through to the general
 /// [`fold_string`] path for any of:
 ///
@@ -1122,14 +1162,35 @@ enum CaseFoldMode {
 ///     output from 1-byte ASCII input, breaking the byte-equal
 ///     contract.
 #[inline]
-fn fold_string_to_smol_ascii_fast(s: &str, mode: CaseFoldMode) -> Option<SmolStr> {
+fn fold_string_to_smol_ascii_fast(
+    s: &str,
+    mode: CaseFoldMode,
+    ascii_hint: AsciiHint,
+) -> Option<SmolStr> {
     use relon_eval_api::SMOL_STR_INLINE_CAP;
     let bytes = s.as_bytes();
     if bytes.len() > SMOL_STR_INLINE_CAP {
         return None;
     }
-    if !s.is_ascii() {
-        return None;
+    match ascii_hint {
+        AsciiHint::AllAscii => {
+            // Caller has proven the payload is pure ASCII — skip the
+            // re-scan. Every byte is `< 0x80` so output length equals
+            // input length and the mask + xor body below is safe.
+        }
+        AsciiHint::KnownNonAscii => {
+            // Caller has proven the payload contains a byte `>= 0x80`.
+            // The inline ASCII fast path's byte-equal precondition no
+            // longer holds — bail straight to the general path.
+            return None;
+        }
+        AsciiHint::Unknown => {
+            // Legacy shape: scan ourselves. Cheap (≤ 22 bytes) but
+            // wasted when the caller already paid via `SmolStr::is_ascii`.
+            if !s.is_ascii() {
+                return None;
+            }
+        }
     }
     let ir_mode = match mode {
         CaseFoldMode::Upper => relon_ir::ascii_fold_simd::AsciiFoldMode::Upper,
@@ -1186,17 +1247,38 @@ fn fold_string_to_smol_ascii_fast(s: &str, mode: CaseFoldMode) -> Option<SmolStr
 }
 
 /// `#161` write-to-buffer entry the `StringUpper` / `StringLower` /
-/// `StringTitle` callers reach. The ASCII-fast inline path skips the
-/// `String::with_capacity` + `Arc::from(String)` round-trip; the
-/// fallback re-uses [`fold_string`] for the full Unicode pipeline.
+/// `StringTitle` callers reach, plus the `#163` Tier 2c follow-up that
+/// threads a pre-classified [`AsciiHint`] through to the fold engine.
+///
+/// The ASCII-fast inline path skips the `String::with_capacity` +
+/// `Arc::from(String)` round-trip; the fallback re-uses
+/// [`fold_string_with_ascii_hint`] for the full Unicode pipeline.
+///
+/// `ascii_hint` is typically derived from the input `SmolStr` via
+/// [`AsciiHint::from_smol`] at the surface call site; future bytecode
+/// / trace-JIT callers can read the same fact from
+/// [`relon_trace_abi::STRING_RECORD_ASCII_FLAG_BIT`] without any
+/// additional scan. Passing [`AsciiHint::Unknown`] preserves the
+/// pre-#163 behaviour where the fold engine + the inline ASCII fast
+/// path each run their own SIMD scan.
 #[inline]
-fn fold_string_to_smol(s: &str, mode: CaseFoldMode, locale_turkish: bool) -> SmolStr {
+fn fold_string_to_smol_with_hint(
+    s: &str,
+    mode: CaseFoldMode,
+    locale_turkish: bool,
+    ascii_hint: AsciiHint,
+) -> SmolStr {
     if !locale_turkish {
-        if let Some(smol) = fold_string_to_smol_ascii_fast(s, mode) {
+        if let Some(smol) = fold_string_to_smol_ascii_fast(s, mode, ascii_hint) {
             return smol;
         }
     }
-    SmolStr::from(fold_string(s, mode, locale_turkish))
+    SmolStr::from(fold_string_with_ascii_hint(
+        s,
+        mode,
+        locale_turkish,
+        ascii_hint,
+    ))
 }
 
 struct StringUpper;
@@ -1208,11 +1290,19 @@ impl RelonFunction for StringUpper {
     ) -> Result<Value, RuntimeError> {
         let args = args.into_positional();
         expect_arg_count(&args, 1, range)?;
-        let s = expect_string(&args[0], range)?;
-        Ok(Value::String(fold_string_to_smol(
-            s,
+        // Reach the SmolStr container so the case-fold engine sees the
+        // pre-classified ASCII fact via `AsciiHint::from_smol` —
+        // bypasses the per-call SIMD scan inside
+        // `fold_string_with_ascii_hint` for both ASCII and non-ASCII
+        // payloads (see `preclassified_*` rows in
+        // `crates/relon-bench/benches/ascii_case_fold.rs`).
+        let smol = expect_smol_string(&args[0], range)?;
+        let hint = AsciiHint::from_smol(smol);
+        Ok(Value::String(fold_string_to_smol_with_hint(
+            smol.as_str(),
             CaseFoldMode::Upper,
             false,
+            hint,
         )))
     }
 }
@@ -1226,11 +1316,13 @@ impl RelonFunction for StringLower {
     ) -> Result<Value, RuntimeError> {
         let args = args.into_positional();
         expect_arg_count(&args, 1, range)?;
-        let s = expect_string(&args[0], range)?;
-        Ok(Value::String(fold_string_to_smol(
-            s,
+        let smol = expect_smol_string(&args[0], range)?;
+        let hint = AsciiHint::from_smol(smol);
+        Ok(Value::String(fold_string_to_smol_with_hint(
+            smol.as_str(),
             CaseFoldMode::Lower,
             false,
+            hint,
         )))
     }
 }
@@ -1250,13 +1342,15 @@ impl RelonFunction for StringUpperLocale {
     ) -> Result<Value, RuntimeError> {
         let args = args.into_positional();
         expect_arg_count(&args, 2, range)?;
-        let s = expect_string(&args[0], range)?;
+        let smol = expect_smol_string(&args[0], range)?;
         let locale = expect_string(&args[1], range)?;
         let tr = relon_ir::full_case_folding::is_turkish_locale(locale);
-        Ok(Value::String(fold_string_to_smol(
-            s,
+        let hint = AsciiHint::from_smol(smol);
+        Ok(Value::String(fold_string_to_smol_with_hint(
+            smol.as_str(),
             CaseFoldMode::Upper,
             tr,
+            hint,
         )))
     }
 }
@@ -1270,13 +1364,15 @@ impl RelonFunction for StringLowerLocale {
     ) -> Result<Value, RuntimeError> {
         let args = args.into_positional();
         expect_arg_count(&args, 2, range)?;
-        let s = expect_string(&args[0], range)?;
+        let smol = expect_smol_string(&args[0], range)?;
         let locale = expect_string(&args[1], range)?;
         let tr = relon_ir::full_case_folding::is_turkish_locale(locale);
-        Ok(Value::String(fold_string_to_smol(
-            s,
+        let hint = AsciiHint::from_smol(smol);
+        Ok(Value::String(fold_string_to_smol_with_hint(
+            smol.as_str(),
             CaseFoldMode::Lower,
             tr,
+            hint,
         )))
     }
 }
@@ -1290,13 +1386,15 @@ impl RelonFunction for StringTitleLocale {
     ) -> Result<Value, RuntimeError> {
         let args = args.into_positional();
         expect_arg_count(&args, 2, range)?;
-        let s = expect_string(&args[0], range)?;
+        let smol = expect_smol_string(&args[0], range)?;
         let locale = expect_string(&args[1], range)?;
         let tr = relon_ir::full_case_folding::is_turkish_locale(locale);
-        Ok(Value::String(fold_string_to_smol(
-            s,
+        let hint = AsciiHint::from_smol(smol);
+        Ok(Value::String(fold_string_to_smol_with_hint(
+            smol.as_str(),
             CaseFoldMode::Title,
             tr,
+            hint,
         )))
     }
 }
@@ -1327,11 +1425,13 @@ impl RelonFunction for StringTitle {
     ) -> Result<Value, RuntimeError> {
         let args = args.into_positional();
         expect_arg_count(&args, 1, range)?;
-        let s = expect_string(&args[0], range)?;
-        Ok(Value::String(fold_string_to_smol(
-            s,
+        let smol = expect_smol_string(&args[0], range)?;
+        let hint = AsciiHint::from_smol(smol);
+        Ok(Value::String(fold_string_to_smol_with_hint(
+            smol.as_str(),
             CaseFoldMode::Title,
             false,
+            hint,
         )))
     }
 }
@@ -1861,6 +1961,31 @@ fn expect_arg_count(
 }
 
 fn expect_string(value: &Value, range: relon_parser::TokenRange) -> Result<&str, RuntimeError> {
+    match value {
+        Value::String(value) => Ok(value),
+        other => Err(RuntimeError::TypeMismatch {
+            expected: "String".to_string(),
+            found: other.type_name().to_string(),
+            range,
+        }),
+    }
+}
+
+/// Borrow the underlying [`SmolStr`] when the caller needs the
+/// container itself (not just a `&str`) — typically because it intends
+/// to surface the SmolStr-side ASCII oracle into a downstream helper
+/// that takes an [`AsciiHint`].
+///
+/// The hot case-fold path (`upper` / `lower` / `title` / locale
+/// variants) reaches in here so it can pass
+/// `AsciiHint::AllAscii` / `KnownNonAscii` to
+/// [`fold_string_to_smol_with_hint`], avoiding the per-call SIMD scan
+/// the historical `AsciiHint::Unknown` shape forced on the fold
+/// engine.
+fn expect_smol_string(
+    value: &Value,
+    range: relon_parser::TokenRange,
+) -> Result<&SmolStr, RuntimeError> {
     match value {
         Value::String(value) => Ok(value),
         other => Err(RuntimeError::TypeMismatch {
@@ -2434,5 +2559,83 @@ mod ascii_hint_tests {
                 assert_eq!(unknown, known_non_ascii, "s={s:?} mode={mode:?}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod ascii_hint_wiring_tests {
+    //! `#163` follow-up — parity checks for the SmolStr-side ASCII
+    //! oracle wired into [`fold_string_to_smol_with_hint`] / the
+    //! `String{Upper,Lower,Title}{,Locale}` surface helpers.
+    //!
+    //! The hint must change *performance only*: the byte-identical
+    //! output is the load-bearing contract every downstream caller
+    //! depends on. These tests fix the input via [`SmolStr`] (matching
+    //! the live call shape) and assert that
+    //! `fold_string_to_smol_with_hint(s, mode, false, hint_from_smol)`
+    //! matches the legacy `Unknown` path.
+    use super::{fold_string_to_smol_with_hint, AsciiHint, CaseFoldMode};
+    use relon_eval_api::SmolStr;
+
+    fn parity(input: &str) {
+        let smol = SmolStr::from_borrowed(input);
+        let hint = AsciiHint::from_smol(&smol);
+        for mode in [
+            CaseFoldMode::Upper,
+            CaseFoldMode::Lower,
+            CaseFoldMode::Title,
+        ] {
+            let with_hint = fold_string_to_smol_with_hint(smol.as_str(), mode, false, hint);
+            let unknown =
+                fold_string_to_smol_with_hint(smol.as_str(), mode, false, AsciiHint::Unknown);
+            assert_eq!(
+                with_hint.as_str(),
+                unknown.as_str(),
+                "input={input:?} mode={mode:?} hint={hint:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn inline_ascii_payload_matches_unknown() {
+        // Inline path (≤ 22 bytes) + ASCII — exercises the
+        // `AsciiHint::AllAscii` arm in `fold_string_to_smol_ascii_fast`
+        // which now skips the redundant `s.is_ascii()` re-scan.
+        for input in ["hi", "Hello, World!", "the QUICK brown fox 1"] {
+            parity(input);
+        }
+    }
+
+    #[test]
+    fn inline_non_ascii_payload_matches_unknown() {
+        // Inline path + non-ASCII — exercises the
+        // `AsciiHint::KnownNonAscii` arm which now bails out of the
+        // inline fast path without touching the bytes.
+        for input in ["caf\u{00E9}", "stra\u{00DF}e", "n\u{00E9}e"] {
+            parity(input);
+        }
+    }
+
+    #[test]
+    fn heap_ascii_payload_matches_unknown() {
+        // Heap path (> 22 bytes) + ASCII — the inline fast path is
+        // off-limits because the output would not fit; the hint
+        // propagates into `fold_string_with_ascii_hint` and routes
+        // through `case_fold_ascii_fast_into_string`.
+        let big = "a".repeat(64);
+        parity(&big);
+        parity("the quick brown fox jumps over the lazy dog 1234567890");
+    }
+
+    #[test]
+    fn heap_non_ascii_payload_matches_unknown() {
+        // Heap path + non-ASCII — `KnownNonAscii` skips the
+        // `fold_ascii_prefix_into_string` scan and lands directly in
+        // the per-codepoint slow path. Multi-cp mappings (ß -> SS,
+        // sigma-final, combining marks) must still produce the
+        // legacy output.
+        let mixed = format!("{}stra\u{00DF}e {}", "x".repeat(16), "y".repeat(16));
+        parity(&mixed);
+        parity("\u{03A3}\u{0391} \u{03A3}\u{03B1} \u{03A3}\u{0391}");
     }
 }
