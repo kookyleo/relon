@@ -74,6 +74,6 @@ pub use ic_lookup::{__relon_trace_inline_cache_lookup, ic_storage_size, write_ic
 pub use str_ops::{
     __relon_str_concat, __relon_str_concat_alloc, __relon_str_concat_n_alloc,
     __relon_str_concat_seal_hash, __relon_str_contains, __relon_str_find, __relon_str_substring,
-    reset_str_contains_ic, str_contains_ic_counts, StringRef, STRING_REF_HASH_OFFSET,
-    STRING_REF_LEN_OFFSET, STRING_REF_PTR_OFFSET,
+    reclaim_trace_strings, reset_str_contains_ic, str_contains_ic_counts, trace_string_arena_len,
+    StringRef, STRING_REF_HASH_OFFSET, STRING_REF_LEN_OFFSET, STRING_REF_PTR_OFFSET,
 };
