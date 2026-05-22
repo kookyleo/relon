@@ -84,6 +84,21 @@ pub struct HostHookFuncIds {
     /// preserving correctness for hosts wired against the pre-F-D7-I
     /// ABI. Hosts that want the inline fast path MUST set this.
     pub str_concat_alloc: Option<u32>,
+    /// Tier 1b: cranelift `FuncId.as_u32()` for
+    /// `__relon_str_concat_seal_hash`. Co-required with
+    /// [`Self::str_concat_alloc`]: the inline `StrConcat` lowering uses
+    /// the alloc helper to reserve a fresh `StringRef` whose payload
+    /// buffer ends with rhs bytes the JIT writes inline, then calls
+    /// the seal helper to fold those bytes into the cached `fx_hash`
+    /// field. Hosts that wire `str_concat_alloc` but leave this `None`
+    /// will produce `StringRef` results whose hash field stays as the
+    /// `0` "not yet sealed" sentinel — dict-key crossings on the
+    /// concat result will silently miss the IC every iter. Hosts wired
+    /// against the pre-Tier-1b ABI keep working because the inline
+    /// `StrConcat` lowering falls back to the extern shim path that
+    /// goes through `__relon_str_concat` / `StringRef::from_owned`
+    /// (which stamps the hash producer-side).
+    pub str_concat_seal_hash: Option<u32>,
     /// F-D8: cranelift `FuncId.as_u32()` for `__relon_trace_list_get`.
     /// `None` means the host has not declared the helper; emitter will
     /// surface `EmitError::HostHookNotDeclared` if a `TraceOp::ListGet`
@@ -130,6 +145,13 @@ impl Default for HostHookFuncIds {
             // call which the historical layout already declared at
             // FuncId 3).
             str_concat_alloc: None,
+            // Tier 1b seal-hash helper is also opt-in. Co-required with
+            // `str_concat_alloc` when the host wants the inline
+            // `StrConcat` path to produce IC-friendly results; left as
+            // `None` so historical fixtures stay on the extern shim
+            // (which calls `StringRef::from_owned` — already hash-
+            // stamped producer-side).
+            str_concat_seal_hash: None,
             // F-D8 helpers are opt-in: tests that don't exercise
             // dict/list ops keep the historical 3-slot layout.
             list_get: None,
@@ -331,6 +353,24 @@ impl TraceEmitter {
                 fid,
             )
         });
+        // Tier 1b: optional seal-hash helper for the inline `StrConcat`
+        // short-rhs lowering. Same opt-in contract as the alloc helper;
+        // when wired, the inline lowering follows the unrolled rhs
+        // stores with a `call str_concat_seal_hash(result_ptr)` so the
+        // freshly-built `StringRef`'s cached `fx_hash` field matches
+        // the now-complete payload. See the doc on
+        // `HostHookFuncIds::str_concat_seal_hash` for the IC-miss
+        // failure mode when this is left `None`.
+        let str_concat_seal_hash = hook_func_ids.str_concat_seal_hash.map(|fid| {
+            declare_host_hook(
+                builder.func,
+                HostHookId::StrConcatSealHash,
+                &[pointer_ty],
+                &[],
+                pointer_ty,
+                fid,
+            )
+        });
 
         // F-D8: declare dict/list helpers when the host wired them.
         // Signature:
@@ -395,6 +435,7 @@ impl TraceEmitter {
             resolve_call,
             str_concat,
             str_concat_alloc,
+            str_concat_seal_hash,
             str_contains,
             str_find,
             str_substring,
@@ -470,6 +511,15 @@ struct TraceEmitterState<'a, 'b> {
     /// `emit_str_concat` on the historical extern shim path even when
     /// the const-rhs side table is populated.
     str_concat_alloc: Option<ir::FuncRef>,
+    /// Tier 1b optional seal-hash helper. Imported only when the host
+    /// wired `HostHookFuncIds::str_concat_seal_hash`. The inline
+    /// `StrConcat` lowering calls this after writing the rhs tail so
+    /// the freshly-built `StringRef`'s cached `fx_hash` field is
+    /// in-sync with the payload — without it the dict-lookup IC
+    /// silently misses on the concat result. `None` ⇒ the inline
+    /// path skips the seal call (correct but defeats the cached-hash
+    /// win once the concat result feeds a dict key).
+    str_concat_seal_hash: Option<ir::FuncRef>,
     str_contains: ir::FuncRef,
     str_find: ir::FuncRef,
     str_substring: ir::FuncRef,
@@ -1088,6 +1138,13 @@ impl<'a, 'b> TraceEmitterState<'a, 'b> {
                     let r = crate::str_inline::emit_str_concat_inline_short_rhs(
                         self.builder,
                         alloc_fn,
+                        // Tier 1b: pass the seal-hash helper through so
+                        // the inline lowering can fold the freshly-built
+                        // payload into the cached fx_hash field. `None`
+                        // keeps the historical inline shape (no seal
+                        // call) — correct, but defeats the cross-trace
+                        // dict IC fast path on the concat result.
+                        self.str_concat_seal_hash,
                         va,
                         &rhs_owned,
                     );

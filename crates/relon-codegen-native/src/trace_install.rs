@@ -837,6 +837,22 @@ impl TraceJitState {
                 &str_concat_alloc_sig,
             )
             .map_err(|e| TraceJitError::Module(format!("declare str_concat_alloc: {e}")))?;
+        // Tier 1b: companion seal-hash helper for the inline `StrConcat`
+        // short-rhs lowering. `(s: *mut StringRef) -> ()`. The emitter
+        // calls this after the unrolled rhs `store.i8` tail so the
+        // freshly-built `StringRef`'s cached fx_hash field matches the
+        // now-complete payload; without it the dict-lookup IC fast
+        // path on the concat result would silently miss every iter
+        // (see the helper's doc comment in
+        // `relon_trace_jit::runtime::str_ops`).
+        let str_concat_seal_hash_sig = build_host_helper_signature(&[pointer_ty], &[]);
+        let str_concat_seal_hash_id = module
+            .declare_function(
+                relon_trace_emitter::HostHookId::StrConcatSealHash.symbol(),
+                Linkage::Import,
+                &str_concat_seal_hash_sig,
+            )
+            .map_err(|e| TraceJitError::Module(format!("declare str_concat_seal_hash: {e}")))?;
         // 2026-05-21 Tier-2: pre-declare `__relon_str_glob_match` so
         // recorded traces that hit `glob_match(s, pat)` link cleanly.
         // Same `(ptr, ptr) -> i32` signature shape as
@@ -917,6 +933,7 @@ impl TraceJitState {
             str_find: str_find_id.as_u32(),
             str_substring: str_substring_id.as_u32(),
             str_concat_alloc: Some(str_concat_alloc_id.as_u32()),
+            str_concat_seal_hash: Some(str_concat_seal_hash_id.as_u32()),
             str_glob_match: Some(str_glob_match_id.as_u32()),
             list_get: Some(list_get_id.as_u32()),
             dict_lookup: Some(dict_lookup_id.as_u32()),
@@ -1322,6 +1339,15 @@ pub fn register_trace_runtime_symbols(builder: &mut JITBuilder) {
     builder.symbol(
         relon_trace_emitter::HostHookId::StrConcatAlloc.symbol(),
         relon_trace_jit::runtime::__relon_str_concat_alloc as *const u8,
+    );
+    // Tier 1b: companion seal-hash helper for the inline `StrConcat`
+    // short-rhs lowering. Runs after the unrolled rhs `store.i8` tail
+    // so the freshly-built `StringRef`'s cached fx_hash field matches
+    // the now-complete payload — keeps the dict-lookup IC fast path
+    // viable on cross-trace dict accesses against the concat result.
+    builder.symbol(
+        relon_trace_emitter::HostHookId::StrConcatSealHash.symbol(),
+        relon_trace_jit::runtime::__relon_str_concat_seal_hash as *const u8,
     );
     // 2026-05-21 Tier-2: glob_match helper. Body lives in
     // `crate::trace_glob_helper` so the trace JIT runtime crate stays

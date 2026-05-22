@@ -88,7 +88,14 @@ fn build_inline_concat_fn(rhs: &[u8]) -> InlineConcatFn {
     fb.switch_to_block(entry);
     fb.seal_block(entry);
 
-    let result = emit_str_concat_inline_short_rhs(&mut fb, alloc_funcref, lhs, rhs);
+    // Tier 1b: pass `None` for the seal-hash FuncRef — this test only
+    // checks payload byte parity against the extern shim, which writes
+    // its result through `StringRef::from_owned` (producer-side hash
+    // stamp). The inline shape without the seal call leaves
+    // `result.hash = 0`; that's fine because we never read the hash
+    // field here. The matching parity test for the hash field lives in
+    // the trace-jit `concat_seal_hash_matches_fx_hash_bytes` unit test.
+    let result = emit_str_concat_inline_short_rhs(&mut fb, alloc_funcref, None, lhs, rhs);
     fb.ins().return_(&[result]);
     fb.finalize();
 

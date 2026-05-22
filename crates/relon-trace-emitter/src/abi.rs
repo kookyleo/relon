@@ -144,6 +144,7 @@ pub fn host_hook_slot_offset(hook: HostHookId) -> i32 {
         // Callers that ask for an offset have a bug.
         HostHookId::StrConcat
         | HostHookId::StrConcatAlloc
+        | HostHookId::StrConcatSealHash
         | HostHookId::StrContains
         | HostHookId::StrFind
         | HostHookId::StrSubstring
@@ -201,6 +202,16 @@ pub enum HostHookId {
     /// [`relon_trace_jit::runtime::__relon_str_concat_alloc`] for the
     /// payload-and-buffer ownership contract.
     StrConcatAlloc,
+    /// Tier 1b: `__relon_str_concat_seal_hash(s: *mut StringRef)`.
+    /// Companion to [`Self::StrConcatAlloc`] — the cranelift inline
+    /// `StrConcat` lowering calls this after writing the const rhs
+    /// tail bytes so the freshly-built `StringRef`'s cached
+    /// `fx_hash` field matches the now-complete payload. Without
+    /// this seal step the dict-lookup IC fast path would consume
+    /// the `0` "not yet sealed" sentinel and silently miss every
+    /// cross-trace dict access on the concat result. See
+    /// [`relon_trace_jit::runtime::__relon_str_concat_seal_hash`].
+    StrConcatSealHash,
     /// F-D7: `__relon_str_contains(*const u8, usize, *const u8, usize) -> i32`.
     StrContains,
     /// F-D7: `__relon_str_find(*const u8, usize, *const u8, usize) -> i64`.
@@ -249,6 +260,7 @@ impl HostHookId {
             HostHookId::InlineCacheLookup => "__relon_trace_inline_cache_lookup",
             HostHookId::StrConcat => "__relon_str_concat",
             HostHookId::StrConcatAlloc => "__relon_str_concat_alloc",
+            HostHookId::StrConcatSealHash => "__relon_str_concat_seal_hash",
             HostHookId::StrContains => "__relon_str_contains",
             HostHookId::StrFind => "__relon_str_find",
             HostHookId::StrSubstring => "__relon_str_substring",
