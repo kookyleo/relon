@@ -52,14 +52,13 @@ fn parse(source: &str) -> relon_parser::Node {
 fn ctx_with_stub(path: &str, body: &str) -> Context {
     let mut ctx = Context::default();
     // Prepend so the stub wins over the default filesystem resolver.
-    ctx.module_resolvers
-        .insert(
-            0,
-            Arc::new(StubResolver {
-                path: path.to_string(),
-                body: body.to_string(),
-            }),
-        );
+    ctx.module_resolvers.insert(
+        0,
+        Arc::new(StubResolver {
+            path: path.to_string(),
+            body: body.to_string(),
+        }),
+    );
     ctx
 }
 
@@ -79,8 +78,10 @@ fn import_with_matching_sha256_pin_loads() {
     // sha256("{ value: 42 }") = 18b86269e2161e03ef55c6e067ff28da71e1453456dab03675cee416e4bde8da
     let body = "{ value: 42 }";
     let pin = "18b86269e2161e03ef55c6e067ff28da71e1453456dab03675cee416e4bde8da";
-    let src = format!(r#"#import lib from "stub.relon" sha256:"{pin}"
-{{ v: lib.value }}"#);
+    let src = format!(
+        r#"#import lib from "stub.relon" sha256:"{pin}"
+{{ v: lib.value }}"#
+    );
     let result = run(&src, "stub.relon", body).expect("matching pin should evaluate");
     let Value::Dict(d) = result else {
         panic!("expected dict, got {result:?}");
@@ -96,8 +97,10 @@ fn import_with_mismatched_sha256_pin_is_rejected() {
     // the body and before any binding is exposed.
     let attacker_body = r#"{ secret: "tampered" }"#;
     let honest_pin = "18b86269e2161e03ef55c6e067ff28da71e1453456dab03675cee416e4bde8da";
-    let src = format!(r#"#import lib from "stub.relon" sha256:"{honest_pin}"
-{{ v: lib.secret }}"#);
+    let src = format!(
+        r#"#import lib from "stub.relon" sha256:"{honest_pin}"
+{{ v: lib.secret }}"#
+    );
     let err = run(&src, "stub.relon", attacker_body).expect_err("mismatch must error");
     match err {
         RuntimeError::ImportHashMismatch { payload, .. } => {
@@ -124,7 +127,9 @@ fn import_with_unsupported_algorithm_is_rejected() {
 { v: lib.value }"#;
     let err = run(src, "stub.relon", body).expect_err("unknown algo must error");
     match err {
-        RuntimeError::ImportHashUnknownAlgorithm { path, algorithm, .. } => {
+        RuntimeError::ImportHashUnknownAlgorithm {
+            path, algorithm, ..
+        } => {
             assert_eq!(path, "stub.relon");
             assert_eq!(algorithm, "md5");
         }
@@ -167,8 +172,10 @@ fn import_with_uppercase_hex_pin_matches_lowercase_digest() {
     // the casing rule.
     let body = "{ value: 42 }";
     let pin_upper = "18B86269E2161E03EF55C6E067FF28DA71E1453456DAB03675CEE416E4BDE8DA";
-    let src = format!(r#"#import lib from "stub.relon" sha256:"{pin_upper}"
-{{ v: lib.value }}"#);
+    let src = format!(
+        r#"#import lib from "stub.relon" sha256:"{pin_upper}"
+{{ v: lib.value }}"#
+    );
     let result = run(&src, "stub.relon", body).expect("upper-case pin must verify");
     let Value::Dict(d) = result else {
         panic!("expected dict, got {result:?}");
