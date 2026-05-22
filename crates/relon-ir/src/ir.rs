@@ -479,6 +479,28 @@ pub enum Op {
     /// Pop two operands of the tagged type, push their sum. Stack:
     /// `[T, T] -> [T]`.
     Add(IrType),
+    /// #165 (post-#152) — single-allocation `String` concat over N
+    /// operands. Stack: `[String; operand_count] -> [String]` (the
+    /// deepest leaf is the bottom-most operand, the outermost RHS the
+    /// topmost). Lowering folds a left-leaning source chain
+    /// `(((a + b) + c) + d)` into one `StrConcatN { operand_count: N }`
+    /// op so every IR-consuming backend (bytecode / cranelift AOT /
+    /// trace-JIT) can route through a single concat allocator instead
+    /// of `N - 1` pair-wise `Add(String)` allocations.
+    ///
+    /// `operand_count >= 2` — the AST fold pass never emits the
+    /// degenerate one-operand shape (it would be a plain copy) and
+    /// fall-back to `Op::Add(String)` is required when the chain has
+    /// only two operands.
+    StrConcatN {
+        /// Number of `String` operands the op pops from the operand
+        /// stack. Each operand is a complete `String` IR value
+        /// (backend-specific wire shape — arena handle for the
+        /// bytecode VM, i32 record pointer for cranelift, `SmolStr`
+        /// for the tree-walker — but the type tag is `IrType::String`
+        /// in all cases).
+        operand_count: u32,
+    },
     /// Pop two operands of the tagged type, push their difference.
     Sub(IrType),
     /// Pop two operands of the tagged type, push their product.
@@ -1528,6 +1550,7 @@ impl Op {
             | Op::LocalGet(_)
             | Op::LetGet { .. }
             | Op::Add(_)
+            | Op::StrConcatN { .. }
             | Op::Sub(_)
             | Op::Mul(_)
             | Op::Div(_)
