@@ -63,16 +63,17 @@ pub use deopt::{
     TraceContext,
 };
 pub use dict_list::{
-    __relon_trace_dict_lookup, __relon_trace_dict_lookup_prechecked, __relon_trace_list_get,
-    build_dict_record, build_flat_list_record, build_string_record, fx_hash_bytes,
-    fx_hash_key_record, fx_hash_key_record_payload, is_ascii_bytes, is_ascii_flag_set,
-    DICT_LOOKUP_DEOPT, STRING_RECORD_ASCII_FLAG_BIT, STRING_RECORD_HASH_OFFSET,
+    __relon_trace_dict_lookup, __relon_trace_dict_lookup_prechecked,
+    __relon_trace_dict_lookup_prechecked_v2, __relon_trace_dict_lookup_v2, __relon_trace_list_get,
+    build_dict_record, build_dict_record_v2, build_flat_list_record, build_string_record,
+    fx_hash_bytes, fx_hash_key_record, fx_hash_key_record_payload, is_ascii_bytes,
+    is_ascii_flag_set, DICT_LOOKUP_DEOPT, STRING_RECORD_ASCII_FLAG_BIT, STRING_RECORD_HASH_OFFSET,
     STRING_RECORD_LEN_MASK, STRING_RECORD_PAYLOAD_OFFSET,
 };
 pub use ic_lookup::{__relon_trace_inline_cache_lookup, ic_storage_size, write_ic_header};
 pub use str_ops::{
     __relon_str_concat, __relon_str_concat_alloc, __relon_str_concat_n_alloc,
     __relon_str_concat_seal_hash, __relon_str_contains, __relon_str_find, __relon_str_substring,
-    reset_str_contains_ic, str_contains_ic_counts, StringRef, STRING_REF_HASH_OFFSET,
-    STRING_REF_LEN_OFFSET, STRING_REF_PTR_OFFSET,
+    reclaim_trace_strings, reset_str_contains_ic, str_contains_ic_counts, trace_string_arena_len,
+    StringRef, STRING_REF_HASH_OFFSET, STRING_REF_LEN_OFFSET, STRING_REF_PTR_OFFSET,
 };

@@ -26,25 +26,38 @@
 //! ## Lifetime / ownership model
 //!
 //! `StringRef` is a `#[repr(C)]` host-side box whose lifetime is owned
-//! by the surrounding [`crate::TraceContext`] — host-side glue stores
-//! every allocated `StringRef` into a per-trace arena so a deopt-fired
-//! mid-trace cleanly drops the chain. From the JIT's perspective the
-//! pointers are opaque `i64` slots; the shim is responsible for
-//! reading the `(ptr, len)` payload and writing a fresh entry to the
-//! arena on each allocation.
+//! by a **thread-local trace string arena** (`TRACE_STRING_ARENA`).
+//! Every shim that allocates a fresh `StringRef` — `from_owned`,
+//! `from_static`, `__relon_str_concat`, `__relon_str_concat_alloc`,
+//! `__relon_str_concat_n_alloc`, `__relon_str_substring` — also
+//! registers the underlying allocation with the arena so the host can
+//! reclaim every per-iter buffer at trace exit / deopt by calling
+//! [`reclaim_trace_strings`]. From the JIT's perspective the pointers
+//! remain opaque `i64` slots; the arena is invisible until the host
+//! decides it's time to free the chain.
 //!
-//! For the v6-ζ-F-D7 drop the arena is intentionally simple: each
-//! call leaks a `Box<StringRef>` whose backing `Box<str>` is
-//! `mem::forget`-ed and never reclaimed. Subsequent F-D7 phases will
-//! wire the StringRef into the `TraceContext::pending_recoverable_writes`
-//! so the deopt path can drop them; until then a short hot trace
-//! leaks the per-iter strings but the cmp_lua bench bounds the total
-//! at `STRING_CONCAT_N` iterations.
+//! ### Review #175 P2 fix
+//!
+//! The historical drop was an **unbounded** leak — each shim called
+//! `Box::into_raw` (or raw `alloc(Layout)`) with no reclamation hook,
+//! relying on the short-lived `cmp_lua` benches to bound total memory
+//! usage. Long-lived hosts running thousands of traces accumulated
+//! per-iter `StringRef` allocations forever. The trace string arena
+//! addresses that: hosts call [`reclaim_trace_strings`] after each
+//! trace (typical site: the trace-runner's exit path / the deopt
+//! handler) and the arena `dealloc`s every record it recorded since
+//! the last reclaim. Bench fixtures with a tight intra-process
+//! re-entry pattern can choose to reclaim once per outer iter; the
+//! benchmark numbers (W3 hot loop, `__relon_str_concat` per-iter
+//! repeats) are unaffected because the per-call cost of pushing a
+//! single `TraceStringAlloc` enum to a thread-local `Vec` is well
+//! below the cost of the alloc itself.
 //!
 //! The shims are SAFE to call from any thread because each trace
 //! context lives on a single thread by design (`thread_local` call
-//! table — see `call_table.rs`); the leak-arena above also operates
-//! per-thread via the same constraint.
+//! table — see `call_table.rs`); the arena above also operates
+//! per-thread via the same constraint, so concurrent traces on
+//! different threads see independent reclaim lists.
 //!
 //! ## Inline cache
 //!
@@ -55,9 +68,131 @@
 //! to the cached i32 result; misses fall back to the scan and update
 //! the slot.
 
-use std::cell::Cell;
+use std::alloc::Layout;
+use std::cell::{Cell, RefCell};
 
 use relon_trace_abi::hash::fx_hash_bytes;
+
+// =====================================================================
+// Trace string reclamation arena (review #175 P2 fix)
+// =====================================================================
+//
+// Each shim that allocates a fresh `StringRef` registers its
+// allocation with the thread-local `TRACE_STRING_ARENA`. The host
+// calls [`reclaim_trace_strings`] at trace exit to drop every
+// allocation back to the global allocator. Without this hook every
+// per-iter `__relon_str_concat*` call leaked unbounded memory in
+// long-lived hosts (the bench fixtures hide it behind their tight
+// loop bounds).
+//
+// Three allocation shapes need three reclamation strategies:
+//
+// * `BoxedHeader` — produced by `from_static`: a single
+//   `Box<StringRef>` whose payload pointer borrows a `&'static`
+//   buffer (no payload free needed). Free via
+//   `drop(Box::from_raw(header))`.
+// * `OwnedHeaderAndPayload` — produced by `from_owned`: a
+//   `Box<StringRef>` header plus a separately-boxed `Box<str>`
+//   payload. Free via two `Box::from_raw` reconstructions, one for
+//   each.
+// * `SingleBlock` — produced by `__relon_str_concat_alloc` /
+//   `__relon_str_concat_n_alloc`: a single
+//   `[header | payload]` block from `std::alloc::alloc(layout)`.
+//   Free via `std::alloc::dealloc(block, layout)`.
+
+/// One reclaim record per allocation handed back from the str shims.
+/// The `Layout`-bearing variant stores the full layout so reclaim
+/// can `dealloc` correctly even if the allocation predates a later
+/// layout-discipline tweak.
+enum TraceStringAlloc {
+    /// `Box<StringRef>` only — payload is borrowed (`from_static`).
+    BoxedHeader { header: *mut StringRef },
+    /// `Box<StringRef>` header + heap-owned `Box<str>` payload.
+    /// Reclamation drops both boxes.
+    OwnedHeaderAndPayload {
+        header: *mut StringRef,
+        payload_ptr: *mut u8,
+        payload_len: usize,
+    },
+    /// Single contiguous `[header | payload]` block allocated via
+    /// `std::alloc::alloc(layout)`.
+    SingleBlock { block: *mut u8, layout: Layout },
+}
+
+// SAFETY: the arena is only ever touched on the thread that owns it
+// (thread_local!); `*mut StringRef` / `*mut u8` are not Send/Sync
+// only because of their pointer nature, but never escape this thread.
+unsafe impl Send for TraceStringAlloc {}
+
+thread_local! {
+    static TRACE_STRING_ARENA: RefCell<Vec<TraceStringAlloc>> =
+        const { RefCell::new(Vec::new()) };
+}
+
+/// Register a pre-allocated reclaim record. Implementation detail
+/// shared by every shim; not part of the public surface.
+fn arena_push(alloc: TraceStringAlloc) {
+    TRACE_STRING_ARENA.with(|cell| cell.borrow_mut().push(alloc));
+}
+
+/// Diagnostic: returns the number of live allocations the trace
+/// string arena currently tracks for the calling thread. Tests use
+/// this to verify that [`reclaim_trace_strings`] actually drops the
+/// recorded allocations and that subsequent shim calls grow the
+/// list.
+pub fn trace_string_arena_len() -> usize {
+    TRACE_STRING_ARENA.with(|cell| cell.borrow().len())
+}
+
+/// Reclaim every `StringRef` (and its backing payload) that the str
+/// shims allocated on the calling thread since the last reclaim.
+///
+/// Hosts MUST call this at every trace exit / deopt site to bound
+/// memory usage; not calling it preserves the historical leak
+/// behaviour (every shim allocation lives until process exit).
+///
+/// # Safety
+///
+/// After this call returns, every `*const StringRef` previously
+/// handed out by [`StringRef::from_owned`], [`StringRef::from_static`],
+/// [`__relon_str_concat`], [`__relon_str_concat_alloc`],
+/// [`__relon_str_concat_n_alloc`], or [`__relon_str_substring`] on
+/// the calling thread is invalid. Callers that still hold such
+/// pointers MUST NOT dereference them. Typical use site: the trace
+/// runner's exit handler immediately after reading the result slot
+/// out of `TraceContext`.
+pub unsafe fn reclaim_trace_strings() {
+    TRACE_STRING_ARENA.with(|cell| {
+        let mut allocs = cell.borrow_mut();
+        for alloc in allocs.drain(..) {
+            // SAFETY: by the shim contracts, every recorded
+            // allocation came from this module's own producer
+            // helpers and is uniquely owned. The caller's safety
+            // precondition above (no stale dereferences after this
+            // returns) is what keeps the operation sound.
+            unsafe {
+                match alloc {
+                    TraceStringAlloc::BoxedHeader { header } => {
+                        drop(Box::from_raw(header));
+                    }
+                    TraceStringAlloc::OwnedHeaderAndPayload {
+                        header,
+                        payload_ptr,
+                        payload_len,
+                    } => {
+                        let payload_slice =
+                            std::slice::from_raw_parts_mut(payload_ptr, payload_len);
+                        drop(Box::from_raw(payload_slice as *mut [u8]));
+                        drop(Box::from_raw(header));
+                    }
+                    TraceStringAlloc::SingleBlock { block, layout } => {
+                        std::alloc::dealloc(block, layout);
+                    }
+                }
+            }
+        }
+    });
+}
 
 /// Opaque, repr-C string-payload box exposed across the JIT boundary.
 ///
@@ -167,38 +302,59 @@ impl StringRef {
         }
     }
 
-    /// Build a `StringRef` whose payload lives in a leaked `Box<str>`.
-    /// The returned pointer is suitable for handing to the JIT and
-    /// keeping alive for the lifetime of the surrounding trace.
+    /// Build a `StringRef` whose payload lives in a heap-owned
+    /// buffer. The returned pointer is suitable for handing to the
+    /// JIT and keeping alive for the lifetime of the surrounding
+    /// trace.
     ///
     /// Tier 1b: stamps the cached `fx_hash_bytes(payload)` on the
     /// fresh struct so the dict IC fast path stays in sync.
     ///
+    /// Review #175 P2: the allocation (both the `Box<StringRef>`
+    /// header and the `Box<[u8]>` payload) is registered with the
+    /// thread-local trace string arena so a subsequent
+    /// [`reclaim_trace_strings`] call drops both back to the global
+    /// allocator. Without that, every per-trace call leaked the
+    /// payload forever.
+    ///
     /// ## Safety
     ///
-    /// Caller must arrange for the leaked allocation to be reclaimed
-    /// once the trace stops running — typically by storing the
-    /// returned `*const StringRef` in the trace's `TraceContext` and
-    /// dropping it on context teardown. The shim layer leaks for now
-    /// (see module docs).
+    /// Callers may keep the returned pointer alive for the duration
+    /// of the surrounding trace. The trace exit / deopt path is
+    /// expected to invoke [`reclaim_trace_strings`] which invalidates
+    /// every pointer this helper handed out on the same thread.
     pub fn from_owned(s: String) -> *const StringRef {
-        let boxed_str: Box<str> = s.into_boxed_str();
-        let len = boxed_str.len();
-        let hash = fx_hash_bytes(boxed_str.as_bytes());
-        let ptr = Box::into_raw(boxed_str) as *const u8;
-        let r = Box::new(StringRef { ptr, len, hash });
-        Box::into_raw(r) as *const StringRef
+        // Convert the `String` to a `Box<[u8]>` so the payload's
+        // (thin ptr, len) pair can be reconstructed into a
+        // `Box<[u8]>` at reclaim time.
+        let boxed_bytes: Box<[u8]> = s.into_bytes().into_boxed_slice();
+        let len = boxed_bytes.len();
+        let hash = fx_hash_bytes(&boxed_bytes);
+        let payload_ptr = Box::into_raw(boxed_bytes) as *mut u8;
+        let header = Box::into_raw(Box::new(StringRef {
+            ptr: payload_ptr as *const u8,
+            len,
+            hash,
+        }));
+        arena_push(TraceStringAlloc::OwnedHeaderAndPayload {
+            header,
+            payload_ptr,
+            payload_len: len,
+        });
+        header as *const StringRef
     }
 
     /// Build a `StringRef` from a `&'static str` source. Useful for
     /// host-side construction of constant inputs in tests.
+    ///
+    /// Review #175 P2: the freshly-allocated `Box<StringRef>` header
+    /// is registered with the trace string arena so
+    /// [`reclaim_trace_strings`] can drop it. The payload pointer
+    /// itself borrows from the static and never needs freeing.
     pub fn from_static(s: &'static str) -> *const StringRef {
-        // We can still leak a fresh box because the JIT-side API takes
-        // a single `*const StringRef`; the inner ptr borrows from the
-        // static and never needs to be freed. `borrow` stamps the
-        // cached fx_hash.
-        let r = Box::new(StringRef::borrow(s));
-        Box::into_raw(r) as *const StringRef
+        let header = Box::into_raw(Box::new(StringRef::borrow(s)));
+        arena_push(TraceStringAlloc::BoxedHeader { header });
+        header as *const StringRef
     }
 
     /// Read back a `&str` slice from the pointer. Returns `None` if
@@ -355,7 +511,7 @@ pub unsafe extern "C" fn __relon_str_concat_alloc(
     // `StringRef::ptr` field carries that interior pointer so the rest
     // of the runtime treats this allocation identically to the
     // historical two-block one.
-    use std::alloc::{alloc, Layout};
+    use std::alloc::alloc;
     let header_size = std::mem::size_of::<StringRef>();
     let header_align = std::mem::align_of::<StringRef>();
     debug_assert!(header_size.is_multiple_of(header_align));
@@ -390,6 +546,9 @@ pub unsafe extern "C" fn __relon_str_concat_alloc(
             hash: 0,
         },
     );
+    // Review #175 P2: register the single-block allocation so
+    // `reclaim_trace_strings` can dealloc it at trace exit.
+    arena_push(TraceStringAlloc::SingleBlock { block, layout });
     header_ptr
 }
 
@@ -439,7 +598,7 @@ pub unsafe extern "C" fn __relon_str_concat_n_alloc(
     if operands.is_null() {
         return std::ptr::null_mut();
     }
-    use std::alloc::{alloc, Layout};
+    use std::alloc::alloc;
     let header_size = std::mem::size_of::<StringRef>();
     let header_align = std::mem::align_of::<StringRef>();
     debug_assert!(header_size.is_multiple_of(header_align));
@@ -489,6 +648,9 @@ pub unsafe extern "C" fn __relon_str_concat_n_alloc(
             hash: 0,
         },
     );
+    // Review #175 P2: register the single-block allocation so
+    // `reclaim_trace_strings` can dealloc it at trace exit.
+    arena_push(TraceStringAlloc::SingleBlock { block, layout });
     header_ptr
 }
 
@@ -924,5 +1086,146 @@ mod tests {
         let (hits, misses) = str_contains_ic_counts();
         assert_eq!(hits, 0);
         assert_eq!(misses, 2);
+    }
+
+    // ---- Review #175 P2: trace string reclamation arena ------------
+    //
+    // Each test runs on its own spawned thread so the thread-local
+    // arena is isolated from sibling tests that allocate via the same
+    // shims (the cargo test runner uses a multi-thread pool but each
+    // test starts on its own thread).
+
+    #[test]
+    fn arena_records_every_shim_allocation() {
+        std::thread::spawn(|| {
+            assert_eq!(
+                trace_string_arena_len(),
+                0,
+                "fresh thread starts with empty arena"
+            );
+            let _a = StringRef::from_static("alpha");
+            assert_eq!(trace_string_arena_len(), 1, "from_static registers");
+            let _b = StringRef::from_owned("bravo".to_string());
+            assert_eq!(trace_string_arena_len(), 2, "from_owned registers");
+            // concat_alloc goes through the single-block path.
+            let lhs = StringRef::from_static("hello");
+            assert_eq!(trace_string_arena_len(), 3);
+            let _c = unsafe { __relon_str_concat_alloc(lhs, 5 + 3) };
+            assert_eq!(
+                trace_string_arena_len(),
+                4,
+                "concat_alloc registers the single-block allocation"
+            );
+            // concat_n_alloc same path.
+            let operands: [*const StringRef; 1] = [_a];
+            let _n = unsafe { __relon_str_concat_n_alloc(operands.as_ptr(), 1, 5) };
+            assert_eq!(trace_string_arena_len(), 5, "concat_n_alloc registers");
+            // __relon_str_concat routes through from_owned.
+            let _cat = unsafe { __relon_str_concat(_a, lhs) };
+            assert_eq!(
+                trace_string_arena_len(),
+                6,
+                "__relon_str_concat (via from_owned) registers"
+            );
+            // __relon_str_substring routes through from_owned.
+            let _sub = unsafe { __relon_str_substring(_a, 1, 2) };
+            assert_eq!(
+                trace_string_arena_len(),
+                7,
+                "__relon_str_substring (via from_owned) registers"
+            );
+            unsafe { reclaim_trace_strings() };
+            assert_eq!(
+                trace_string_arena_len(),
+                0,
+                "reclaim drains every recorded allocation"
+            );
+        })
+        .join()
+        .expect("arena thread joined cleanly");
+    }
+
+    #[test]
+    fn reclaim_releases_owned_payload_buffers() {
+        // Smoke test for the OwnedHeaderAndPayload reclaim path: we
+        // allocate many fairly-large from_owned strings and reclaim
+        // them. The test would fail loudly under miri / address
+        // sanitizer if the payload `Box<[u8]>` reclamation
+        // reconstructed the slice with the wrong (ptr, len) pair.
+        std::thread::spawn(|| {
+            for i in 0..256 {
+                let s = format!("payload-{i:04}-{}", "x".repeat(64));
+                let _r = StringRef::from_owned(s);
+            }
+            assert_eq!(trace_string_arena_len(), 256);
+            unsafe { reclaim_trace_strings() };
+            assert_eq!(trace_string_arena_len(), 0);
+        })
+        .join()
+        .expect("reclaim payload thread joined cleanly");
+    }
+
+    #[test]
+    fn reclaim_releases_single_block_concat_buffers() {
+        // Hot-loop simulation: many __relon_str_concat_alloc calls
+        // (the W3 / cmp_lua pattern) followed by a single reclaim.
+        // The historical leak path would grow process RSS by
+        // `total_len` bytes per iter forever; with the arena hooked
+        // up the reclaim drains every block.
+        std::thread::spawn(|| {
+            let lhs = StringRef::from_static("prefix-");
+            for _ in 0..512 {
+                let block = unsafe { __relon_str_concat_alloc(lhs, 7 + 8) };
+                assert!(!block.is_null());
+            }
+            // 1 (from_static) + 512 (concat_alloc) = 513.
+            assert_eq!(trace_string_arena_len(), 513);
+            unsafe { reclaim_trace_strings() };
+            assert_eq!(trace_string_arena_len(), 0);
+        })
+        .join()
+        .expect("reclaim concat thread joined cleanly");
+    }
+
+    #[test]
+    fn reclaim_is_idempotent_on_empty_arena() {
+        // Calling reclaim twice in a row (or on a thread that never
+        // allocated anything) must be a no-op rather than a double-free.
+        std::thread::spawn(|| {
+            unsafe { reclaim_trace_strings() };
+            unsafe { reclaim_trace_strings() };
+            assert_eq!(trace_string_arena_len(), 0);
+        })
+        .join()
+        .expect("idempotent reclaim thread joined cleanly");
+    }
+
+    #[test]
+    fn reclaim_does_not_cross_thread_boundaries() {
+        // Allocations on thread A must NOT show up in thread B's
+        // arena view, and reclaim on B must not free A's pointers.
+        // The pointer is leaked deliberately in this test (the
+        // owning thread never reclaims) so we don't accidentally
+        // free A's allocation here; the test asserts only on the
+        // arena counters.
+        let handle_a = std::thread::spawn(|| {
+            let _a = StringRef::from_static("a-thread");
+            assert_eq!(trace_string_arena_len(), 1);
+            // Deliberately do not reclaim — leak for the duration of
+            // the test process. This is OK because the test asserts
+            // only on counters, and the OS reclaims process memory
+            // at exit.
+        });
+        handle_a.join().expect("thread A joined");
+        std::thread::spawn(|| {
+            assert_eq!(
+                trace_string_arena_len(),
+                0,
+                "thread B sees its own empty arena"
+            );
+            unsafe { reclaim_trace_strings() };
+        })
+        .join()
+        .expect("thread B joined");
     }
 }
