@@ -1290,7 +1290,6 @@ fn detect_cross_module_schema_collisions(ws: &mut WorkspaceTree) {
     let Some(entry_tree) = ws.modules.get(&ws.entry_id).cloned() else {
         return;
     };
-    let entry_node = ws.nodes.get(&ws.entry_id).cloned();
 
     // Build set of spread-imported modules (canonical ids the entry
     // imports with `#import *`).
@@ -1337,12 +1336,6 @@ fn detect_cross_module_schema_collisions(ws: &mut WorkspaceTree) {
             }
         }
     }
-
-    // Silence unused-warning: `entry_node` is kept for future passes
-    // that need a root span fallback, and `Node` is used only via
-    // re-exports / function signatures.
-    let _ = entry_node;
-    let _ = std::marker::PhantomData::<Node>;
 }
 
 #[cfg(test)]

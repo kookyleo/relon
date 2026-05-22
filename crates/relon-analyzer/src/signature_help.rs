@@ -102,16 +102,7 @@ fn render_signature(sig: &FnSignature) -> String {
     )
 }
 
-fn format_type(t: &relon_parser::TypeNode) -> String {
-    let suffix = if t.is_optional { "?" } else { "" };
-    let path = t.path.join(".");
-    if t.generics.is_empty() {
-        format!("{path}{suffix}")
-    } else {
-        let inner: Vec<String> = t.generics.iter().map(format_type).collect();
-        format!("{path}<{}>{suffix}", inner.join(", "))
-    }
-}
+use crate::typecheck::format_type;
 
 /// Count completed args before `offset`. Walks the parsed CallArg
 /// list and increments for each whose end-offset is before the
@@ -120,7 +111,7 @@ fn format_type(t: &relon_parser::TypeNode) -> String {
 fn active_param_index(
     source: &str,
     offset: usize,
-    args: &[relon_parser::CallArg],
+    _args: &[relon_parser::CallArg],
     call_range: TokenRange,
 ) -> usize {
     // The CallArg shape doesn't carry a per-arg range we can rely on
@@ -147,6 +138,5 @@ fn active_param_index(
             _ => {}
         }
     }
-    let _ = args; // future: use names to disambiguate named args
     commas
 }

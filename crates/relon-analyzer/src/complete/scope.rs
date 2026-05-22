@@ -38,10 +38,9 @@ pub(super) fn push_scope_candidates_partial(
 pub(super) fn push_scope_candidates(
     items: &mut Vec<CompletionItem>,
     root: &Node,
-    tree: &AnalyzedTree,
+    _tree: &AnalyzedTree,
     offset: usize,
 ) {
-    let _ = tree;
     walk_scope(root, offset, items);
 }
 
@@ -138,10 +137,6 @@ pub(super) fn is_inside_list(root: &Node, offset: usize) -> bool {
         }
         let here = matches!(&*node.expr, Expr::List(_) | Expr::Comprehension { .. });
         let nested = in_list || here;
-        for c in crate::goto_def::smallest_node_at(node, offset).into_iter() {
-            // unused — we just need a deep walk; do recursion manually.
-            let _ = c;
-        }
         // Manual recursion via the child-walker that handles directive
         // bodies + decorator args, mirroring resolve.rs's scope walker.
         for child in children_of(node) {

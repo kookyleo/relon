@@ -473,15 +473,14 @@ fn walk_schema_body(node: &Node, def: &mut SchemaDef, tree: &mut AnalyzedTree) -
 /// `HeterogeneousEnum`. Untagged enums (no `variant_fields` anywhere) are
 /// left intact for runtime check (`def.variants` stays empty).
 fn lower_enum_body(t: &TypeNode, def: &mut SchemaDef, tree: &mut AnalyzedTree) -> bool {
-    let any_variant = t.generics.iter().any(|g| g.variant_fields.is_some());
-    if !any_variant {
+    let any_struct = t.generics.iter().any(|g| g.variant_fields.is_some());
+    if !any_struct {
         // Plain untagged enum — runtime owns it. We still mark the schema
         // valid so the host has a `SchemaDef` keyed at this node id.
         return true;
     }
-    let any_struct = t.generics.iter().any(|g| g.variant_fields.is_some());
     let all_struct = t.generics.iter().all(|g| g.variant_fields.is_some());
-    if any_struct && !all_struct {
+    if !all_struct {
         tree.diagnostics.push(Diagnostic::HeterogeneousEnum {
             range: span_of(t.range),
         });
@@ -490,38 +489,33 @@ fn lower_enum_body(t: &TypeNode, def: &mut SchemaDef, tree: &mut AnalyzedTree) -
         return false;
     }
 
-    // Always treat as tagged if any structuring is present
-    if any_struct {
-        for alt in &t.generics {
-            let variant_name = alt.path.first().cloned().unwrap_or_default();
-            let mut fields = Vec::new();
-            if let Some(fields_spec) = &alt.variant_fields {
-                for (fname, ftype) in fields_spec {
-                    fields.push(SchemaFieldDef {
-                        name: fname.clone(),
-                        type_hint: Some(ftype.clone()),
-                        value_range: ftype.range,
-                        is_wildcard: true,
-                        value_node: Arc::new(Node::with_id(
-                            NodeId::SYNTHETIC,
-                            Expr::Wildcard,
-                            ftype.range,
-                        )),
-                        meta_decorators: Vec::new(),
-                        doc_comment: ftype.doc_comment.clone(),
-                    });
-                }
+    for alt in &t.generics {
+        let variant_name = alt.path.first().cloned().unwrap_or_default();
+        let mut fields = Vec::new();
+        if let Some(fields_spec) = &alt.variant_fields {
+            for (fname, ftype) in fields_spec {
+                fields.push(SchemaFieldDef {
+                    name: fname.clone(),
+                    type_hint: Some(ftype.clone()),
+                    value_range: ftype.range,
+                    is_wildcard: true,
+                    value_node: Arc::new(Node::with_id(
+                        NodeId::SYNTHETIC,
+                        Expr::Wildcard,
+                        ftype.range,
+                    )),
+                    meta_decorators: Vec::new(),
+                    doc_comment: ftype.doc_comment.clone(),
+                });
             }
-            def.variants.push(EnumVariant {
-                name: variant_name,
-                fields,
-                range: alt.range,
-                doc_comment: alt.doc_comment.clone(),
-            });
         }
-        return true;
+        def.variants.push(EnumVariant {
+            name: variant_name,
+            fields,
+            range: alt.range,
+            doc_comment: alt.doc_comment.clone(),
+        });
     }
-
     true
 }
 

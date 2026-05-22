@@ -8,7 +8,7 @@
 
 use crate::tree::AnalyzedTree;
 use crate::SchemaFieldDef;
-use relon_parser::{Expr, Node, TokenRange, TypeNode};
+use relon_parser::{Expr, Node, TokenRange};
 
 /// Result of a successful hover lookup. `range` is the source span the
 /// IDE should highlight to indicate which token the tooltip belongs to.
@@ -109,13 +109,4 @@ fn source_slice(source: &str, start: usize, end: usize) -> &str {
     &source[start..end]
 }
 
-fn format_type(t: &TypeNode) -> String {
-    let suffix = if t.is_optional { "?" } else { "" };
-    let path = t.path.join(".");
-    if t.generics.is_empty() {
-        format!("{path}{suffix}")
-    } else {
-        let inner: Vec<String> = t.generics.iter().map(format_type).collect();
-        format!("{path}<{}>{suffix}", inner.join(", "))
-    }
-}
+use crate::typecheck::format_type;
