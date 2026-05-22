@@ -554,6 +554,115 @@ fn capability_gate_denial_lifts_to_runtime_error() {
     }
 }
 
+// -- #166 M2-B from_source full cap-gate activation ----------------
+//
+// The compile pass flags every `BcFunction` whose op stream carries a
+// capability-sensitive op (`BcOp::CallNative` / `BcOp::CheckCap`) so
+// the VM consults the installed gate over every declared
+// `CapabilityBit` before the first op dispatches. The activation
+// closes the gap where a host installed a gate but no `cap_bit`-tagged
+// per-op consult fired (because the IR happened to use sentinel /
+// no-cap shapes), leaving the gate dormant on production workloads.
+//
+// Scalar `from_source` workloads (the historical M2-A envelope)
+// compile with the flag cleared, so the entry sweep stays inert.
+
+#[test]
+fn from_source_full_cap_gate_fires_on_sensitive_compiled_op() {
+    use relon_bytecode::op::{BcFunction, BcOp};
+    use std::sync::Arc;
+
+    // Stand in for the future widened `from_source` lowering that emits
+    // a `BcOp::CheckCap` against the no-cap sentinel (analyzer parity).
+    // The per-op consult treats `u32::MAX` as a no-op so it never
+    // touches the gate; only the entry-time sweep added by #166 will.
+    // A deny-everything gate must trip `CapabilityDenied` before any
+    // op runs — surfacing the first declared bit (ReadsFs) as the
+    // first-denied reporting convention.
+    let bc = BcFunction {
+        ops: vec![
+            BcOp::CheckCap {
+                cap_bit: relon_ir::NO_CAPABILITY_BIT,
+            },
+            BcOp::ConstI64(7),
+            BcOp::Return,
+        ],
+        locals: 0,
+        ir_pc_map: vec![1, 2, 3],
+        string_pool: Vec::new(),
+        stack_recipe: vec![vec![], vec![], vec![]],
+        fn_id: None,
+        closure_bodies: Vec::new(),
+        // Compile-pass-equivalent flag: the op stream contains a
+        // sensitive op, so the entry sweep must fire.
+        requires_cap_consult: true,
+    };
+
+    let gate_concrete = Arc::new(CountingGate::deny_all());
+    let gate: Arc<dyn relon_eval_api::CapabilityGate> = gate_concrete.clone();
+    let mut vtable = CapabilityVtable::default();
+    vtable.set_gate(gate);
+    let cfg = BcVmConfig {
+        cap_vtable: vtable,
+        ..BcVmConfig::default()
+    };
+    let vm = BytecodeVm::new(cfg);
+    let outcome = vm.invoke(&bc, &[]);
+    match outcome.error {
+        Some(BcVmError::CapabilityDenied { cap_bit }) => {
+            // First declared bit (ReadsFs) is reported on the
+            // "first-denied" sweep order — matches the tree-walker's
+            // historical diagnostic shape.
+            assert_eq!(cap_bit, relon_eval_api::CapabilityBit::ReadsFs.bit_index());
+        }
+        other => panic!("expected entry-sweep CapabilityDenied, got {other:?}"),
+    }
+    // Entry sweep fires before the loop ticks, so steps stays at 0.
+    assert_eq!(outcome.steps, 0);
+    // Exactly one consult on the deny-all path (the sweep short-
+    // circuits on the first denied bit).
+    assert_eq!(
+        gate_concrete.hits.load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+}
+
+#[test]
+fn from_source_scalar_does_not_consult_gate_at_entry() {
+    use std::sync::Arc;
+
+    // Mirror of `capability_gate_hook_can_be_installed_and_inspected`
+    // with stronger preconditions: a deny-everything gate paired with a
+    // pure scalar `from_source` (no `BcOp::CallNative` / `BcOp::CheckCap`)
+    // must record **zero** consults. The compile pass clears
+    // `requires_cap_consult` for the scaffold-envelope op stream, and
+    // the existing pre-dispatch sweep over `grants` stays a no-op
+    // because the grant table is empty. This pins the zero-overhead
+    // posture #166 promises for the historical workload.
+    let gate_concrete = Arc::new(CountingGate::deny_all());
+    let gate: Arc<dyn relon_eval_api::CapabilityGate> = gate_concrete.clone();
+    let ev = BytecodeEvaluator::from_source("#main(Int x, Int y) -> Int\nx + y")
+        .unwrap()
+        .with_capability_gate(gate);
+    // Sanity: the compile pass left the flag cleared on the scalar
+    // envelope. This is the property the consult sweep relies on to
+    // stay inert.
+    assert!(!ev.function().requires_cap_consult);
+
+    let mut args = HashMap::new();
+    args.insert("x".to_string(), Value::Int(40));
+    args.insert("y".to_string(), Value::Int(2));
+    let value = ev
+        .run_main(args)
+        .expect("scalar source runs unchanged with deny-all gate");
+    assert_eq!(value, Value::Int(42));
+    // Zero gate consults: the entry sweep stayed inert.
+    assert_eq!(
+        gate_concrete.hits.load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+}
+
 // -- M2-B phase 3: BcOp::CallNative + BcOp::CheckCap dispatch ------
 
 #[test]
