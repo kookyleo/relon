@@ -33,11 +33,15 @@ use crate::error::CraneliftError;
 use crate::object_cache_integration as cache_int;
 use crate::sandbox::{CapabilityVtable, SandboxConfig, SandboxShared, SandboxState, TrapKind};
 
+/// Maximum positional arity supported by the legacy `i64` entry
+/// shape. Anchored to the four scratch slots in [`LegacyEntryFn`];
+/// longer arities surface as `UnsupportedSignature` before the
+/// trampoline tries to dispatch.
+const MAX_LEGACY_ARITY: usize = 4;
+
 /// Type alias for the raw `extern "C"` entry the JIT produced when
 /// the entry shape is [`EntryShape::LegacyI64Args`]. Five i64s cover
-/// the v5-β-1 `#main(Int x, Int y, Int z, Int w)` envelope; longer
-/// arities surface as `UnsupportedSignature` before the trampoline
-/// tries to dispatch.
+/// the v5-β-1 `#main(Int x, Int y, Int z, Int w)` envelope.
 type LegacyEntryFn = unsafe extern "C" fn(*const SandboxState, i64, i64, i64, i64) -> i64;
 
 /// Type alias for the raw `extern "C"` entry the JIT produced when
@@ -835,12 +839,6 @@ impl CraneliftAotEvaluator {
         param_names: Vec<String>,
         buffer_schema: Option<BufferSchema>,
     ) -> Result<Self, CraneliftError> {
-        // Historical hook kept as a no-op: Relon no longer installs a
-        // Rust process-wide SIGSEGV/SIGFPE/SIGILL handler. Hardware
-        // faults remain fail-fast; typed traps come from the
-        // structured `cond_trap -> SandboxState::trap_code` path.
-        crate::trap_handler::install_global_signal_handler();
-
         // The codegen's tail-cursor protocol needs the return record's
         // fixed-area size up front to seed the cursor past the root.
         // Direct-IR / legacy callers without schema metadata pass 0;
@@ -1032,7 +1030,7 @@ impl CraneliftAotEvaluator {
                 ),
             });
         }
-        if args.len() > 4 {
+        if args.len() > MAX_LEGACY_ARITY {
             return Err(RuntimeError::Unsupported {
                 reason: format!(
                     "cranelift-native legacy entry supports up to 4 args; got {}",
@@ -1040,7 +1038,7 @@ impl CraneliftAotEvaluator {
                 ),
             });
         }
-        let mut argv = [0i64; 4];
+        let mut argv = [0i64; MAX_LEGACY_ARITY];
         argv[..args.len()].copy_from_slice(args);
         self.invoke_legacy_entry(argv)
     }
@@ -1083,7 +1081,7 @@ impl CraneliftAotEvaluator {
                 ),
             });
         }
-        if args.len() > 4 {
+        if args.len() > MAX_LEGACY_ARITY {
             return Err(RuntimeError::Unsupported {
                 reason: format!(
                     "cranelift-native legacy entry supports up to 4 args; got {}",
@@ -1091,7 +1089,7 @@ impl CraneliftAotEvaluator {
                 ),
             });
         }
-        let mut argv = [0i64; 4];
+        let mut argv = [0i64; MAX_LEGACY_ARITY];
         for (i, name) in self.param_names.iter().enumerate() {
             // Linear scan: at most 4 entries, faster than a hash lookup
             // for tiny n. Accept either the declared param name or the
@@ -1170,13 +1168,9 @@ impl CraneliftAotEvaluator {
         // overhead matters on the dispatch hot path.
         let state = Box::new(SandboxState::from_template(&self.sandbox_shared));
         let state_ptr: *const SandboxState = &*state;
-        // No-op today: retained so a future host-side hardware-fault
-        // recovery trampoline can wire an async-signal-safe signal
-        // observation path without perturbing dispatch structure.
-        crate::trap_handler::reset_thread_signal_slot();
-        // 2026-05-21 dispatch-boundary lever (d): use the de-tagged
-        // inline-cached entry pointer (single field load) instead of
-        // matching on the `entry_fn` enum discriminant each invoke.
+        // De-tagged inline-cached entry pointer (single field load)
+        // beats matching on the `entry_fn` enum discriminant each
+        // invoke.
         let entry = match self.legacy_entry_cached {
             Some(f) => f,
             None => {
@@ -1234,8 +1228,6 @@ impl CraneliftAotEvaluator {
         // base, which previously raced on a shared Arc<SandboxState>.
         let state = Box::new(SandboxState::from_template(&self.sandbox_shared));
         let state_ptr: *const SandboxState = &*state;
-        // No-op today; see `invoke_legacy_entry`.
-        crate::trap_handler::reset_thread_signal_slot();
         // SAFETY: `arena` is borrowed mutably here and stays valid
         // through the JIT call's lifetime (`arena` outlives this
         // function). The per-call `state` is the unique owner of the
@@ -1293,16 +1285,6 @@ impl CraneliftAotEvaluator {
         state: &SandboxState,
         result: std::thread::Result<T>,
     ) -> Result<T, RuntimeError> {
-        // Kept as a no-op compatibility probe; see `trap_handler`.
-        let signal_code = crate::trap_handler::read_thread_signal_slot();
-        if signal_code != 0 {
-            // Reset the slot eagerly so the next dispatch doesn't pick
-            // up a stale signal code.
-            crate::trap_handler::reset_thread_signal_slot();
-            if let Some(kind) = crate::trap_handler::signal_to_trap_kind(signal_code) {
-                return Err(kind.to_runtime_error(self.entry_range));
-            }
-        }
         match result {
             Ok(v) => {
                 let code = state.take_trap_code();
@@ -1476,7 +1458,7 @@ impl Evaluator for CraneliftAotEvaluator {
 
         // Legacy direct-IR path: pack i64 args into the JIT's
         // `extern "C"` slot.
-        if args.len() > 4 {
+        if args.len() > MAX_LEGACY_ARITY {
             return Err(RuntimeError::Unsupported {
                 reason: format!(
                     "cranelift-native legacy entry supports up to 4 args; got {}",
@@ -1494,7 +1476,7 @@ impl Evaluator for CraneliftAotEvaluator {
             });
         }
 
-        let mut argv = [0i64; 4];
+        let mut argv = [0i64; MAX_LEGACY_ARITY];
         for (i, name) in self.param_names.iter().enumerate() {
             let value = args.get(name).or_else(|| args.get(&format!("arg{i}")));
             let value = value.ok_or_else(|| RuntimeError::MissingMainArg {
