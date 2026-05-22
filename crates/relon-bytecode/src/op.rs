@@ -528,6 +528,26 @@ pub struct BcFunction {
     /// Empty on every function that doesn't introduce lambdas — the
     /// historical M2-A scaffold path observes no behaviour change.
     pub closure_bodies: Vec<BcFunction>,
+    /// #166 M2-B from_source full cap-gate activation: set when the
+    /// compiled op stream (this function or any nested
+    /// `closure_bodies` entry) contains a capability-sensitive op —
+    /// `BcOp::CallNative` or `BcOp::CheckCap`. The bytecode VM consults
+    /// it on every `invoke_from_with_stack` entry; when the flag is
+    /// `true` **and** a [`relon_eval_api::CapabilityGate`] is installed
+    /// on the active `CapabilityVtable`, the VM sweeps every declared
+    /// [`relon_eval_api::CapabilityBit`] through the gate so a denied
+    /// bit surfaces as `CapabilityDenied` before the first op dispatches.
+    ///
+    /// The mechanism stays inert when no gate is installed or when the
+    /// flag is `false` — scalar `from_source` workloads (the historical
+    /// M2-A envelope) compile to ops with neither `CallNative` nor
+    /// `CheckCap`, so the entry sweep skips them at zero per-call cost.
+    ///
+    /// Note that the per-op gate consult emitted by `BcOp::CallNative` /
+    /// `BcOp::CheckCap` still fires independently — the entry sweep is
+    /// defense in depth that catches a trust-level downgrade happening
+    /// between `compile_function_in_module` and the next `invoke`.
+    pub requires_cap_consult: bool,
 }
 
 impl Default for BcFunction {
@@ -545,6 +565,7 @@ impl Default for BcFunction {
             string_pool: Vec::new(),
             fn_id: None,
             closure_bodies: Vec::new(),
+            requires_cap_consult: false,
         }
     }
 }

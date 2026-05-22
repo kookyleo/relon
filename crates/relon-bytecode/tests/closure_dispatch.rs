@@ -29,6 +29,7 @@ fn closure_body_add_two_args() -> BcFunction {
         string_pool: Vec::new(),
         fn_id: None,
         closure_bodies: Vec::new(),
+        requires_cap_consult: false,
     }
 }
 
@@ -49,6 +50,7 @@ fn closure_body_one_capture_one_arg() -> BcFunction {
         string_pool: Vec::new(),
         fn_id: None,
         closure_bodies: Vec::new(),
+        requires_cap_consult: false,
     }
 }
 
@@ -76,6 +78,7 @@ fn make_closure_allocates_handle_and_records_captures() {
         string_pool: Vec::new(),
         fn_id: None,
         closure_bodies: vec![body],
+        requires_cap_consult: false,
     };
 
     let vm = BytecodeVm::new(BcVmConfig::default());
@@ -113,6 +116,7 @@ fn call_closure_dispatches_through_body_and_returns_value() {
         string_pool: Vec::new(),
         fn_id: None,
         closure_bodies: vec![body],
+        requires_cap_consult: false,
     };
 
     let vm = BytecodeVm::new(BcVmConfig::default());
@@ -147,6 +151,7 @@ fn capture_get_reads_closure_upvalue() {
         string_pool: Vec::new(),
         fn_id: None,
         closure_bodies: vec![body],
+        requires_cap_consult: false,
     };
 
     let vm = BytecodeVm::new(BcVmConfig::default());
@@ -192,6 +197,7 @@ fn closure_called_multiple_times_with_independent_args() {
         string_pool: Vec::new(),
         fn_id: None,
         closure_bodies: vec![body],
+        requires_cap_consult: false,
     };
 
     let vm = BytecodeVm::new(BcVmConfig::default());
@@ -232,6 +238,7 @@ fn closure_body_with_internal_branch_is_dispatched_correctly() {
         string_pool: Vec::new(),
         fn_id: None,
         closure_bodies: Vec::new(),
+        requires_cap_consult: false,
     };
     let outer = BcFunction {
         ops: vec![
@@ -254,6 +261,7 @@ fn closure_body_with_internal_branch_is_dispatched_correctly() {
         string_pool: Vec::new(),
         fn_id: None,
         closure_bodies: vec![body],
+        requires_cap_consult: false,
     };
 
     let vm = BytecodeVm::new(BcVmConfig::default());
@@ -275,6 +283,7 @@ fn capture_get_outside_closure_traps() {
         string_pool: Vec::new(),
         fn_id: None,
         closure_bodies: Vec::new(),
+        requires_cap_consult: false,
     };
 
     let vm = BytecodeVm::new(BcVmConfig::default());
@@ -316,6 +325,7 @@ fn closure_reducer_sum_of_zero_to_n_minus_one() {
         string_pool: Vec::new(),
         fn_id: None,
         closure_bodies: Vec::new(),
+        requires_cap_consult: false,
     };
     // Outer op layout:
     //   0: ConstI64 0          ; acc = 0
@@ -377,6 +387,7 @@ fn closure_reducer_sum_of_zero_to_n_minus_one() {
         string_pool: Vec::new(),
         fn_id: None,
         closure_bodies: vec![step_body],
+        requires_cap_consult: false,
     };
 
     let vm = BytecodeVm::new(BcVmConfig::default());
@@ -406,6 +417,7 @@ fn call_closure_invalid_body_idx_traps() {
         string_pool: Vec::new(),
         fn_id: None,
         closure_bodies: Vec::new(),
+        requires_cap_consult: false,
     };
 
     let vm = BytecodeVm::new(BcVmConfig::default());
