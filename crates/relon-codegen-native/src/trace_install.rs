@@ -23,11 +23,17 @@
 //!
 //! ## Layout decisions
 //!
-//! - **Non-atomic counters** (per v6-γ design §3): the cranelift
-//!   prologue emits `load.i32 / iadd_imm / store.i32` for cheap
-//!   warm-path overhead. Multi-thread races may delay a hot trigger
-//!   by one or two iterations, but never cause UB — the storage is
-//!   plain `u32` cells inside an [`UnsafeCell`] wrapped for `Sync`.
+//! - **Atomic counters** (#173 review fix): each slot is an
+//!   [`AtomicU32`] and the cranelift prologue emits a single
+//!   `atomic_rmw add` against it. Earlier drafts used a
+//!   non-atomic `load/iadd/store` triple inside an `UnsafeCell`
+//!   on the rationale that races would only delay a hot trigger;
+//!   that reasoning is incorrect under the Rust memory model —
+//!   concurrent Rust readers / JIT writers on the same `u32`
+//!   slot form a data race and are UB. Switching to `AtomicU32`
+//!   keeps the slot lock-free (on x86 the lowering is a single
+//!   `LOCK XADD` / ~1 cycle) and makes the storage naturally
+//!   `Sync` without an `unsafe impl`.
 //! - **Threshold = 10** (LuaJIT default; see design §1.2).
 //! - **Counter capacity = 1024** fn ids — generous for v6-γ's
 //!   single-entry-function workloads. Excess fn ids saturate via a
@@ -41,8 +47,9 @@
 //!   stage; the public surface used by the smoke tests today feeds
 //!   the recorder an explicit `Op` stream.
 
-use std::cell::{RefCell, UnsafeCell};
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 
 use cranelift_codegen::settings::{self, Configurable};
@@ -125,22 +132,16 @@ pub const RELON_HOT_THRESHOLD: u32 = 10;
 /// the address by name at link time.
 pub const HOT_COUNTERS_SYMBOL: &str = "__relon_hot_counters";
 
-/// Wrapper around the global counter table so it can be `static` and
-/// also mutable from non-`Sync` cranelift-emitted code. Each slot is a
-/// raw `u32` — torn writes are tolerated (multi-thread races at worst
-/// delay a hot trigger by one iteration; design decision).
-struct HotCountersTable {
-    inner: UnsafeCell<[u32; MAX_FN_ID]>,
-}
-
-// SAFETY: We accept torn reads/writes on the raw u32 slots; no
-// invariant requires atomicity. The trace-install path's correctness
-// is guarded downstream by `TraceJitState`'s RwLock.
-unsafe impl Sync for HotCountersTable {}
-
-static RELON_HOT_COUNTERS: HotCountersTable = HotCountersTable {
-    inner: UnsafeCell::new([0u32; MAX_FN_ID]),
-};
+/// Global counter table. Each slot is an [`AtomicU32`] indexed by
+/// `fn_id`; the cranelift prologue derives the slot address as
+/// `RELON_HOT_COUNTERS_BASE + fn_id * 4` and increments via
+/// `atomic_rmw add`.
+///
+/// `AtomicU32` has the same layout / alignment as `u32`, so the JIT
+/// continues to treat each cell as a 4-byte integer location. The
+/// array is naturally `Sync` without an `unsafe impl`.
+static RELON_HOT_COUNTERS: [AtomicU32; MAX_FN_ID] =
+    [const { AtomicU32::new(0) }; MAX_FN_ID];
 
 /// Raw pointer to the first counter slot. The cranelift prologue
 /// folds this into an `iconst.i64` so each entry-fn invocation does:
@@ -148,37 +149,39 @@ static RELON_HOT_COUNTERS: HotCountersTable = HotCountersTable {
 /// ```text
 /// %base = iconst.i64 <hot_counters_base()>
 /// %slot = iadd_imm %base, fn_id * 4
-/// %v    = load.i32 %slot
-/// %v1   = iadd_imm.i32 %v, 1
-/// store.i32 %v1, %slot
+/// %v    = atomic_rmw.i32 add %slot, 1     ; returns the OLD value
+/// %v1   = iadd_imm.i32 %v, 1               ; reconstruct the NEW value
 /// %hot  = icmp_imm.i32 uge %v1, RELON_HOT_THRESHOLD
 /// brif %hot, hot_block, normal_block
 /// ```
+///
+/// Returning `*mut u32` (rather than `*mut AtomicU32`) is sound:
+/// `AtomicU32` and `u32` share layout and alignment, and every
+/// caller — cranelift-emitted `atomic_rmw` plus the
+/// [`AtomicU32::from_ptr`] helpers in this module's accessors —
+/// goes through atomic memory operations, so there is no
+/// non-atomic access in flight.
 pub fn hot_counters_base() -> *mut u32 {
-    RELON_HOT_COUNTERS.inner.get() as *mut u32
+    RELON_HOT_COUNTERS.as_ptr() as *mut u32
 }
 
 /// Read the current counter value for `fn_id` (for tests).
 pub fn hot_counter_peek(fn_id: u32) -> u32 {
     assert!((fn_id as usize) < MAX_FN_ID, "fn_id out of range");
-    // SAFETY: in-bounds; torn reads are explicitly tolerated.
-    unsafe { *hot_counters_base().add(fn_id as usize) }
+    RELON_HOT_COUNTERS[fn_id as usize].load(Ordering::Relaxed)
 }
 
 /// Reset a counter slot to zero (for tests).
 pub fn hot_counter_reset(fn_id: u32) {
     assert!((fn_id as usize) < MAX_FN_ID, "fn_id out of range");
-    // SAFETY: in-bounds; tests run sequentially per fn_id.
-    unsafe { *hot_counters_base().add(fn_id as usize) = 0 };
+    RELON_HOT_COUNTERS[fn_id as usize].store(0, Ordering::Relaxed);
 }
 
 /// Reset every counter slot. Used by test harness setup to isolate
 /// individual cases; production paths never call this.
 pub fn hot_counter_reset_all() {
-    // SAFETY: we hold the only writer (test code, single-threaded).
-    let p = hot_counters_base();
-    for i in 0..MAX_FN_ID {
-        unsafe { *p.add(i) = 0 };
+    for slot in RELON_HOT_COUNTERS.iter() {
+        slot.store(0, Ordering::Relaxed);
     }
 }
 
@@ -1459,10 +1462,7 @@ mod tests {
         let id = (MAX_FN_ID - 1) as u32;
         hot_counter_reset(id);
         assert_eq!(hot_counter_peek(id), 0);
-        // SAFETY: writes a single u32 slot to a process-stable buffer.
-        unsafe {
-            *hot_counters_base().add(id as usize) = 7;
-        }
+        RELON_HOT_COUNTERS[id as usize].store(7, Ordering::Relaxed);
         assert_eq!(hot_counter_peek(id), 7);
         hot_counter_reset(id);
         assert_eq!(hot_counter_peek(id), 0);

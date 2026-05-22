@@ -85,8 +85,8 @@ pub struct SandboxConfig {
     /// on SIGFPE is not portable across all targets.
     pub div_check: bool,
     /// v6-γ M2: when `Some(fn_id)`, the codegen emits a HotCounter
-    /// prologue at the entry block. Every invocation atomically (per
-    /// design § 3, non-atomic) bumps slot `fn_id` of the global
+    /// prologue at the entry block. Every invocation atomically
+    /// (`atomic_rmw add`, #173) bumps slot `fn_id` of the global
     /// `__relon_hot_counters` table; when the slot crosses
     /// [`crate::trace_install::RELON_HOT_THRESHOLD`], the prologue
     /// calls [`crate::trace_install::__relon_jump_to_recorder`] and
