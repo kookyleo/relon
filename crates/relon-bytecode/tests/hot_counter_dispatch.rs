@@ -16,7 +16,6 @@ use relon_bytecode::hot_counter::{peek_hot, reset_hot_all};
 use relon_bytecode::op::{BcFunction, BcOp};
 use relon_bytecode::vm::{BcVmConfig, BytecodeVm, VmValue};
 use relon_bytecode::{HotTraceTrigger, HotTraceTriggerHandle, COUNTER_SATURATED};
-use relon_ir::IrType;
 
 /// Test mock that pushes every (fn_id, args) trigger event into a
 /// shared `Vec` for the assertions to inspect.
@@ -240,7 +239,7 @@ fn args_passed_to_trigger_match_invoke_call() {
         ops: vec![
             BcOp::LocalGet(0),
             BcOp::LocalGet(1),
-            BcOp::Add(IrType::I64),
+            BcOp::AddI64,
             BcOp::Return,
         ],
         locals: 2,

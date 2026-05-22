@@ -183,7 +183,7 @@ fn bytecode_resume_routes_to_addop_for_pre_aligned_pcs() {
     let add_bc_idx = func
         .ops
         .iter()
-        .position(|op| matches!(op, BcOp::Add(_)))
+        .position(|op| matches!(op, BcOp::AddI64 | BcOp::AddF64))
         .expect("Add present");
     let add_external_pc = func.ir_pc_map[add_bc_idx];
 

@@ -314,17 +314,31 @@ impl<'a> CompileState<'a> {
             BcOp::LocalSet(_) => {
                 self.current_stack.pop();
             }
-            BcOp::Add(_)
-            | BcOp::Sub(_)
-            | BcOp::Mul(_)
-            | BcOp::Div(_)
-            | BcOp::Mod(_)
-            | BcOp::Eq(_)
-            | BcOp::Ne(_)
-            | BcOp::Lt(_)
-            | BcOp::Le(_)
-            | BcOp::Gt(_)
-            | BcOp::Ge(_) => {
+            // M2-C lever 3: typed arith / cmp ops carry no payload after
+            // the per-type specialization split; the stack effect is the
+            // same regardless of i64 / f64 lane.
+            BcOp::AddI64
+            | BcOp::SubI64
+            | BcOp::MulI64
+            | BcOp::DivI64
+            | BcOp::ModI64
+            | BcOp::AddF64
+            | BcOp::SubF64
+            | BcOp::MulF64
+            | BcOp::DivF64
+            | BcOp::ModF64
+            | BcOp::EqI64
+            | BcOp::NeI64
+            | BcOp::LtI64
+            | BcOp::LeI64
+            | BcOp::GtI64
+            | BcOp::GeI64
+            | BcOp::EqF64
+            | BcOp::NeF64
+            | BcOp::LtF64
+            | BcOp::LeF64
+            | BcOp::GtF64
+            | BcOp::GeF64 => {
                 // Pop two operands, push one snapshot-backed result.
                 self.current_stack.pop();
                 self.current_stack.pop();
@@ -673,17 +687,17 @@ impl<'a> CompileState<'a> {
             Op::LetSet { idx, .. } => {
                 self.emit_with_effect(BcOp::LocalSet(let_base + *idx), call_pc)
             }
-            Op::Add(ty) => self.emit_with_effect(BcOp::Add(*ty), call_pc),
-            Op::Sub(ty) => self.emit_with_effect(BcOp::Sub(*ty), call_pc),
-            Op::Mul(ty) => self.emit_with_effect(BcOp::Mul(*ty), call_pc),
-            Op::Div(ty) => self.emit_with_effect(BcOp::Div(*ty), call_pc),
-            Op::Mod(ty) => self.emit_with_effect(BcOp::Mod(*ty), call_pc),
-            Op::Eq(ty) => self.emit_with_effect(BcOp::Eq(*ty), call_pc),
-            Op::Ne(ty) => self.emit_with_effect(BcOp::Ne(*ty), call_pc),
-            Op::Lt(ty) => self.emit_with_effect(BcOp::Lt(*ty), call_pc),
-            Op::Le(ty) => self.emit_with_effect(BcOp::Le(*ty), call_pc),
-            Op::Gt(ty) => self.emit_with_effect(BcOp::Gt(*ty), call_pc),
-            Op::Ge(ty) => self.emit_with_effect(BcOp::Ge(*ty), call_pc),
+            Op::Add(ty) => self.emit_with_effect(arith_bcop_for(*ty, ArithKind::Add)?, call_pc),
+            Op::Sub(ty) => self.emit_with_effect(arith_bcop_for(*ty, ArithKind::Sub)?, call_pc),
+            Op::Mul(ty) => self.emit_with_effect(arith_bcop_for(*ty, ArithKind::Mul)?, call_pc),
+            Op::Div(ty) => self.emit_with_effect(arith_bcop_for(*ty, ArithKind::Div)?, call_pc),
+            Op::Mod(ty) => self.emit_with_effect(arith_bcop_for(*ty, ArithKind::Mod)?, call_pc),
+            Op::Eq(ty) => self.emit_with_effect(cmp_bcop_for(*ty, CmpKind::Eq)?, call_pc),
+            Op::Ne(ty) => self.emit_with_effect(cmp_bcop_for(*ty, CmpKind::Ne)?, call_pc),
+            Op::Lt(ty) => self.emit_with_effect(cmp_bcop_for(*ty, CmpKind::Lt)?, call_pc),
+            Op::Le(ty) => self.emit_with_effect(cmp_bcop_for(*ty, CmpKind::Le)?, call_pc),
+            Op::Gt(ty) => self.emit_with_effect(cmp_bcop_for(*ty, CmpKind::Gt)?, call_pc),
+            Op::Ge(ty) => self.emit_with_effect(cmp_bcop_for(*ty, CmpKind::Ge)?, call_pc),
             // Callee's `Return` is a fallthrough in the inlining:
             // the value left on the operand stack is the result of
             // the call (popped by the surrounding caller, if any).
@@ -1015,6 +1029,80 @@ fn unsupported(label: &'static str) -> Result<(), BcCompileError> {
     )))
 }
 
+/// M2-C lever 3: per-op specialization. The five arith op-flavours the
+/// bytecode lowering routes through.
+#[derive(Clone, Copy)]
+enum ArithKind {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Mod,
+}
+
+/// M2-C lever 3: per-op specialization. The six cmp op-flavours.
+#[derive(Clone, Copy)]
+enum CmpKind {
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+}
+
+/// Resolve the typed arith `BcOp` variant matching `(ty, kind)`.
+/// I32 routes through the I64 variants because both ride the same
+/// u64 lane on the operand stack; non-arith types (Bool / Null /
+/// pointer-shaped) surface as `UnsupportedOp` so the compile pass
+/// fails clearly rather than emitting an op the dispatch can't honour.
+fn arith_bcop_for(ty: IrType, kind: ArithKind) -> Result<BcOp, BcCompileError> {
+    let bc = match (ty, kind) {
+        (IrType::I64 | IrType::I32, ArithKind::Add) => BcOp::AddI64,
+        (IrType::I64 | IrType::I32, ArithKind::Sub) => BcOp::SubI64,
+        (IrType::I64 | IrType::I32, ArithKind::Mul) => BcOp::MulI64,
+        (IrType::I64 | IrType::I32, ArithKind::Div) => BcOp::DivI64,
+        (IrType::I64 | IrType::I32, ArithKind::Mod) => BcOp::ModI64,
+        (IrType::F64, ArithKind::Add) => BcOp::AddF64,
+        (IrType::F64, ArithKind::Sub) => BcOp::SubF64,
+        (IrType::F64, ArithKind::Mul) => BcOp::MulF64,
+        (IrType::F64, ArithKind::Div) => BcOp::DivF64,
+        (IrType::F64, ArithKind::Mod) => BcOp::ModF64,
+        (other, _) => {
+            return Err(BcCompileError::UnsupportedOp(format!(
+                "bytecode arith for IrType::{other:?} outside scalar envelope",
+            )));
+        }
+    };
+    Ok(bc)
+}
+
+/// Resolve the typed cmp `BcOp` variant matching `(ty, kind)`. Same
+/// routing convention as [`arith_bcop_for`]: I32 shares the I64 path,
+/// non-scalar types bounce out.
+fn cmp_bcop_for(ty: IrType, kind: CmpKind) -> Result<BcOp, BcCompileError> {
+    let bc = match (ty, kind) {
+        (IrType::I64 | IrType::I32 | IrType::Bool | IrType::Null, CmpKind::Eq) => BcOp::EqI64,
+        (IrType::I64 | IrType::I32 | IrType::Bool | IrType::Null, CmpKind::Ne) => BcOp::NeI64,
+        (IrType::I64 | IrType::I32, CmpKind::Lt) => BcOp::LtI64,
+        (IrType::I64 | IrType::I32, CmpKind::Le) => BcOp::LeI64,
+        (IrType::I64 | IrType::I32, CmpKind::Gt) => BcOp::GtI64,
+        (IrType::I64 | IrType::I32, CmpKind::Ge) => BcOp::GeI64,
+        (IrType::F64, CmpKind::Eq) => BcOp::EqF64,
+        (IrType::F64, CmpKind::Ne) => BcOp::NeF64,
+        (IrType::F64, CmpKind::Lt) => BcOp::LtF64,
+        (IrType::F64, CmpKind::Le) => BcOp::LeF64,
+        (IrType::F64, CmpKind::Gt) => BcOp::GtF64,
+        (IrType::F64, CmpKind::Ge) => BcOp::GeF64,
+        (other, _) => {
+            return Err(BcCompileError::UnsupportedOp(format!(
+                "bytecode cmp for IrType::{other:?} outside scalar envelope",
+            )));
+        }
+    };
+    Ok(bc)
+}
+
 /// `OpVisitor` impl driving the per-variant lowering. The dispatch
 /// table is generated by `walk_op` in `relon-ir`; adding a new `Op`
 /// variant forces this impl to gain a matching method, eliminating
@@ -1194,31 +1282,36 @@ impl<'a> OpVisitor for CompileState<'a> {
             ));
         }
         let pc = self.current_pc;
-        self.emit_with_effect(BcOp::Add(ty), pc);
+        let bc = arith_bcop_for(ty, ArithKind::Add)?;
+        self.emit_with_effect(bc, pc);
         Ok(())
     }
 
     fn visit_sub(&mut self, ty: IrType) -> Result<(), BcCompileError> {
         let pc = self.current_pc;
-        self.emit_with_effect(BcOp::Sub(ty), pc);
+        let bc = arith_bcop_for(ty, ArithKind::Sub)?;
+        self.emit_with_effect(bc, pc);
         Ok(())
     }
 
     fn visit_mul(&mut self, ty: IrType) -> Result<(), BcCompileError> {
         let pc = self.current_pc;
-        self.emit_with_effect(BcOp::Mul(ty), pc);
+        let bc = arith_bcop_for(ty, ArithKind::Mul)?;
+        self.emit_with_effect(bc, pc);
         Ok(())
     }
 
     fn visit_div(&mut self, ty: IrType) -> Result<(), BcCompileError> {
         let pc = self.current_pc;
-        self.emit_with_effect(BcOp::Div(ty), pc);
+        let bc = arith_bcop_for(ty, ArithKind::Div)?;
+        self.emit_with_effect(bc, pc);
         Ok(())
     }
 
     fn visit_mod_(&mut self, ty: IrType) -> Result<(), BcCompileError> {
         let pc = self.current_pc;
-        self.emit_with_effect(BcOp::Mod(ty), pc);
+        let bc = arith_bcop_for(ty, ArithKind::Mod)?;
+        self.emit_with_effect(bc, pc);
         Ok(())
     }
 
@@ -1228,37 +1321,43 @@ impl<'a> OpVisitor for CompileState<'a> {
 
     fn visit_eq(&mut self, ty: IrType) -> Result<(), BcCompileError> {
         let pc = self.current_pc;
-        self.emit_with_effect(BcOp::Eq(ty), pc);
+        let bc = cmp_bcop_for(ty, CmpKind::Eq)?;
+        self.emit_with_effect(bc, pc);
         Ok(())
     }
 
     fn visit_ne(&mut self, ty: IrType) -> Result<(), BcCompileError> {
         let pc = self.current_pc;
-        self.emit_with_effect(BcOp::Ne(ty), pc);
+        let bc = cmp_bcop_for(ty, CmpKind::Ne)?;
+        self.emit_with_effect(bc, pc);
         Ok(())
     }
 
     fn visit_lt(&mut self, ty: IrType) -> Result<(), BcCompileError> {
         let pc = self.current_pc;
-        self.emit_with_effect(BcOp::Lt(ty), pc);
+        let bc = cmp_bcop_for(ty, CmpKind::Lt)?;
+        self.emit_with_effect(bc, pc);
         Ok(())
     }
 
     fn visit_le(&mut self, ty: IrType) -> Result<(), BcCompileError> {
         let pc = self.current_pc;
-        self.emit_with_effect(BcOp::Le(ty), pc);
+        let bc = cmp_bcop_for(ty, CmpKind::Le)?;
+        self.emit_with_effect(bc, pc);
         Ok(())
     }
 
     fn visit_gt(&mut self, ty: IrType) -> Result<(), BcCompileError> {
         let pc = self.current_pc;
-        self.emit_with_effect(BcOp::Gt(ty), pc);
+        let bc = cmp_bcop_for(ty, CmpKind::Gt)?;
+        self.emit_with_effect(bc, pc);
         Ok(())
     }
 
     fn visit_ge(&mut self, ty: IrType) -> Result<(), BcCompileError> {
         let pc = self.current_pc;
-        self.emit_with_effect(BcOp::Ge(ty), pc);
+        let bc = cmp_bcop_for(ty, CmpKind::Ge)?;
+        self.emit_with_effect(bc, pc);
         Ok(())
     }
 

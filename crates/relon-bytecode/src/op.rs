@@ -34,33 +34,72 @@ pub enum BcOp {
     LocalGet(u32),
     /// `[T] -> []`. Pop into local slot `idx`. Used for let-bindings.
     LocalSet(u32),
-    /// `[T, T] -> [T]`. Signed add with overflow check; on overflow
-    /// the VM emits `RuntimeError::NumericOverflow`.
-    Add(IrType),
-    /// `[T, T] -> [T]`. Signed sub with overflow check.
-    Sub(IrType),
-    /// `[T, T] -> [T]`. Signed mul with overflow check.
-    Mul(IrType),
-    /// `[T, T] -> [T]`. Signed integer / floating div. Divide-by-
-    /// zero on integers emits `RuntimeError::DivisionByZero`; floats
-    /// produce IEEE-754 inf / nan per spec.
-    Div(IrType),
-    /// `[T, T] -> [T]`. Signed integer / floating mod. Mod-by-zero
-    /// on integers emits `RuntimeError::DivisionByZero` (matches
-    /// tree-walker + cranelift).
-    Mod(IrType),
-    /// `[T, T] -> [Bool]`.
-    Eq(IrType),
-    /// `[T, T] -> [Bool]`.
-    Ne(IrType),
-    /// `[T, T] -> [Bool]`. Signed comparison for `I64`.
-    Lt(IrType),
-    /// `[T, T] -> [Bool]`.
-    Le(IrType),
-    /// `[T, T] -> [Bool]`.
-    Gt(IrType),
-    /// `[T, T] -> [Bool]`.
-    Ge(IrType),
+    // ---- M2-C lever 3: per-op specialization ----
+    //
+    // Each arith / cmp op is split into a per-type monomorphic variant
+    // so the dispatch arm reads the operand slots directly through the
+    // i64 / f64 lane without an inner `match ty` round-trip. The
+    // compile pass at [`crate::compile`] lowers `Op::Add(IrType)` into
+    // the matching `AddI64` / `AddF64` variant; the I32 lane shares the
+    // `*I64` variants because both ride the same i64-shaped u64 slot
+    // (the bytecode VM keeps no I32 storage of its own).
+    //
+    // The variants intentionally carry no `IrType` payload — the
+    // monomorphic shape is the entire point. Tests that match the old
+    // `BcOp::Add(_)` umbrella should switch to `matches!(op, BcOp::AddI64
+    // | BcOp::AddF64)` (or the i64-only `BcOp::AddI64`) per the
+    // intended typing of the program under test.
+    /// `[i64, i64] -> [i64]`. Signed integer add with overflow check;
+    /// on overflow the VM emits `RuntimeError::NumericOverflow`. Also
+    /// the lowering target for `Op::Add(IrType::I32)` since the I32
+    /// lane rides the same u64 slot.
+    AddI64,
+    /// `[i64, i64] -> [i64]`. Signed integer sub with overflow check.
+    SubI64,
+    /// `[i64, i64] -> [i64]`. Signed integer mul with overflow check.
+    MulI64,
+    /// `[i64, i64] -> [i64]`. Signed integer div. Divide-by-zero
+    /// emits `RuntimeError::DivisionByZero`; `i64::MIN / -1` traps as
+    /// `RuntimeError::NumericOverflow` (matches tree-walker).
+    DivI64,
+    /// `[i64, i64] -> [i64]`. Signed integer mod. Mod-by-zero emits
+    /// `RuntimeError::DivisionByZero`.
+    ModI64,
+    /// `[f64, f64] -> [f64]`. IEEE-754 add.
+    AddF64,
+    /// `[f64, f64] -> [f64]`. IEEE-754 sub.
+    SubF64,
+    /// `[f64, f64] -> [f64]`. IEEE-754 mul.
+    MulF64,
+    /// `[f64, f64] -> [f64]`. IEEE-754 div (inf / nan per spec).
+    DivF64,
+    /// `[f64, f64] -> [f64]`. IEEE-754 mod (rust `%` semantics).
+    ModF64,
+    /// `[i64, i64] -> [bool]`. Also the lowering target for
+    /// `Op::Eq(IrType::I32)`.
+    EqI64,
+    /// `[i64, i64] -> [bool]`. Also covers `Op::Ne(IrType::I32)`.
+    NeI64,
+    /// `[i64, i64] -> [bool]`. Signed integer less-than.
+    LtI64,
+    /// `[i64, i64] -> [bool]`.
+    LeI64,
+    /// `[i64, i64] -> [bool]`.
+    GtI64,
+    /// `[i64, i64] -> [bool]`.
+    GeI64,
+    /// `[f64, f64] -> [bool]`. IEEE-754 equality (NaN != NaN).
+    EqF64,
+    /// `[f64, f64] -> [bool]`. IEEE-754 inequality.
+    NeF64,
+    /// `[f64, f64] -> [bool]`.
+    LtF64,
+    /// `[f64, f64] -> [bool]`.
+    LeF64,
+    /// `[f64, f64] -> [bool]`.
+    GtF64,
+    /// `[f64, f64] -> [bool]`.
+    GeF64,
 
     /// Unconditional jump to a resolved bytecode index. The
     /// compiler pass turns IR `Br { label_depth }` into one of these

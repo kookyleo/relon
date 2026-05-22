@@ -11,7 +11,6 @@
 //! corpus uses for ops the source-level lowering doesn't reach yet.
 
 use relon_bytecode::{BcFunction, BcOp, BcVmConfig, BytecodeVm};
-use relon_ir::IrType;
 
 /// `(x: i64, y: i64) -> i64 { return x + y }` — a closure body
 /// that consumes two positional args and returns their sum. Used
@@ -21,7 +20,7 @@ fn closure_body_add_two_args() -> BcFunction {
         ops: vec![
             BcOp::LocalGet(0),
             BcOp::LocalGet(1),
-            BcOp::Add(IrType::I64),
+            BcOp::AddI64,
             BcOp::Return,
         ],
         locals: 2,
@@ -41,7 +40,7 @@ fn closure_body_one_capture_one_arg() -> BcFunction {
         ops: vec![
             BcOp::CaptureGet { idx: 0 },
             BcOp::LocalGet(0),
-            BcOp::Add(IrType::I64),
+            BcOp::AddI64,
             BcOp::Return,
         ],
         locals: 1,
@@ -184,7 +183,7 @@ fn closure_called_multiple_times_with_independent_args() {
             BcOp::CallClosure { argc: 1 },
             // Add the two results: 1007 + 1023 = 2030.
             BcOp::LocalGet(1),
-            BcOp::Add(IrType::I64),
+            BcOp::AddI64,
             BcOp::Return,
         ],
         locals: 2,
@@ -220,7 +219,7 @@ fn closure_body_with_internal_branch_is_dispatched_correctly() {
         ops: vec![
             BcOp::LocalGet(0),
             BcOp::CaptureGet { idx: 0 },
-            BcOp::Lt(IrType::I64),
+            BcOp::LtI64,
             BcOp::JumpIfFalse(6),
             BcOp::CaptureGet { idx: 0 },
             BcOp::Return,
@@ -356,17 +355,17 @@ fn closure_reducer_sum_of_zero_to_n_minus_one() {
             BcOp::LocalSet(2),
             BcOp::LocalGet(1),
             BcOp::ConstI64(100),
-            BcOp::Ge(IrType::I64),
+            BcOp::GeI64,
             BcOp::JumpIfTrue(21),
             BcOp::LocalGet(0),
             BcOp::LocalGet(2),
             BcOp::LocalGet(1),
             BcOp::CallClosure { argc: 1 },
-            BcOp::Add(IrType::I64),
+            BcOp::AddI64,
             BcOp::LocalSet(0),
             BcOp::LocalGet(1),
             BcOp::ConstI64(1),
-            BcOp::Add(IrType::I64),
+            BcOp::AddI64,
             BcOp::LocalSet(1),
             BcOp::Jump(6),
             BcOp::LocalGet(0),

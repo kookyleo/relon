@@ -52,7 +52,7 @@ fn partial_resume_trap_div_by_zero_replays_at_div_pc() {
     let div_idx = func
         .ops
         .iter()
-        .position(|op| matches!(op, BcOp::Div(_)))
+        .position(|op| matches!(op, BcOp::DivI64 | BcOp::DivF64))
         .expect("Div present");
     let div_external_pc = func.ir_pc_map[div_idx];
 
@@ -112,7 +112,7 @@ fn partial_resume_trap_overflow_replays_at_add_pc() {
     let add_idx = func
         .ops
         .iter()
-        .position(|op| matches!(op, BcOp::Add(_)))
+        .position(|op| matches!(op, BcOp::AddI64 | BcOp::AddF64))
         .expect("Add present");
     let add_pc = func.ir_pc_map[add_idx];
     let recipe = &func.stack_recipe[add_idx];
@@ -323,7 +323,7 @@ fn partial_resume_resource_step_limit_retraps_then_completes() {
     let add_idx = func
         .ops
         .iter()
-        .position(|op| matches!(op, BcOp::Add(_)))
+        .position(|op| matches!(op, BcOp::AddI64 | BcOp::AddF64))
         .expect("Add present");
     let add_pc = func.ir_pc_map[add_idx];
     let snap = DeoptStateSnapshot::with_value_stack(
@@ -352,7 +352,7 @@ fn partial_resume_arith_mid_expression_value_correct() {
     let add_idx = func
         .ops
         .iter()
-        .position(|op| matches!(op, BcOp::Add(_)))
+        .position(|op| matches!(op, BcOp::AddI64 | BcOp::AddF64))
         .expect("Add present");
     let add_pc = func.ir_pc_map[add_idx];
 
