@@ -2522,11 +2522,11 @@ fn lower_binary(
     // matches the tree-walker's `try_eval_string_concat_chain` filter,
     // and bails to standard pair-wise lowering when the chain mixes
     // non-String operand types.
-    if matches!(op, Operator::Add) && matches!(lhs.expr.as_ref(), Expr::Binary(Operator::Add, _, _))
+    if matches!(op, Operator::Add)
+        && matches!(lhs.expr.as_ref(), Expr::Binary(Operator::Add, _, _))
+        && try_lower_str_concat_chain(lhs, rhs, range, ctx)?
     {
-        if try_lower_str_concat_chain(lhs, rhs, range, ctx)? {
-            return Ok(());
-        }
+        return Ok(());
     }
     if let Some(ir_op_ctor) = arithmetic_op_ctor(op) {
         lower_expr(&lhs.expr, lhs.range, ctx)?;
