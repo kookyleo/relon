@@ -1701,6 +1701,31 @@ fn lower_fn_call(
             range,
         });
     }
+    // review-improvement-160 bytecode M3 phase 2: peephole-desugar
+    // `list.sum(range(end))` / `list.sum(range(start, end))` into an
+    // explicit `Op::Loop` accumulator before normal lowering kicks in.
+    //
+    // Why not go through the stdlib path?  `list` is a Relon-source
+    // module alias (`#import list from "std/list"`) — the tree-walker
+    // resolves it dynamically through the host module loader, but IR
+    // lowering has no notion of "user-imported namespace", so the
+    // receiver `list` always falls through as `UnresolvedVariable`.
+    // Similarly `range` is a tree-walker-only host fn with no IR stdlib
+    // entry.  Together this makes the canonical hot-loop shape
+    // `list.sum(range(n))` (cmp_lua W1) unreachable to the bytecode +
+    // cranelift backends today.
+    //
+    // The desugar emits the same arithmetic the hand-written
+    // `list_int_sum` body computes (i64 accumulator over `start..end`)
+    // without materialising the intermediate List<Int> — bytecode does
+    // not have list arenas big enough for a 10k element transient
+    // anyway, and even the cranelift backend benefits from skipping the
+    // record allocation.  Behaviour matches the tree-walker exactly:
+    // `range(start, end)` produces the integers `[start, end)` (empty
+    // when `start >= end`) and `list.sum([])` returns `0`.
+    if let Some(()) = try_lower_list_sum_range(path, args, range, ctx)? {
+        return Ok(());
+    }
     // Final path segment is the method / function name. Earlier
     // segments either form the receiver (method-call form) or are
     // unused (free-call form has exactly one path segment).
@@ -1897,6 +1922,225 @@ fn lower_fn_call(
     });
     ctx.tstack.push(stdlib_meta.ret);
     Ok(())
+}
+
+/// review-improvement-160 bytecode M3 phase 2: recognise the
+/// `list.sum(range(...))` peephole at the receiver/method/inner-call
+/// level and emit an explicit `Op::Loop` accumulator.  Returns
+/// `Ok(Some(()))` when the desugar fired (leaves a single `I64` on the
+/// vstack), `Ok(None)` when the pattern did not match (caller falls
+/// through to the normal lowering path), or `Err` when the inner
+/// argument expressions themselves fail to lower.
+///
+/// Pattern shapes accepted:
+///   * `list.sum(range(end))` — `start = 0`.
+///   * `list.sum(range(start, end))`.
+///
+/// Both inner args must be plain positional (no keyword form); the
+/// inner `range` call must use the bare identifier head (no dotted
+/// receiver).  Anything else falls through to the default path so a
+/// future `list.sum(my_user_fn())` keeps the existing diagnostic.
+fn try_lower_list_sum_range(
+    path: &[TokenKey],
+    args: &[relon_parser::CallArg],
+    range: TokenRange,
+    ctx: &mut LowerCtx<'_>,
+) -> Result<Option<()>, LoweringError> {
+    // Outer head must be `list.sum(<single positional arg>)`.
+    if path.len() != 2 {
+        return Ok(None);
+    }
+    let outer_head = matches!(&path[0], TokenKey::String(s, _, _) if s == "list");
+    let outer_method = matches!(&path[1], TokenKey::String(s, _, _) if s == "sum");
+    if !(outer_head && outer_method) {
+        return Ok(None);
+    }
+    if args.len() != 1 || args[0].name.is_some() {
+        return Ok(None);
+    }
+    // Inner arg must be `range(...)` (single-segment path).
+    let (range_path, range_args) = match &*args[0].value.expr {
+        Expr::FnCall {
+            path: inner_path,
+            args: inner_args,
+        } => (inner_path, inner_args),
+        _ => return Ok(None),
+    };
+    if range_path.len() != 1 {
+        return Ok(None);
+    }
+    let is_range = matches!(&range_path[0], TokenKey::String(s, _, _) if s == "range");
+    if !is_range {
+        return Ok(None);
+    }
+    if range_args.is_empty() || range_args.len() > 2 {
+        return Ok(None);
+    }
+    if range_args.iter().any(|a| a.name.is_some()) {
+        return Ok(None);
+    }
+
+    // Emit the loop body.  We need three i64 let-slots:
+    //   start_i — loop counter, initialised to `start`
+    //   end_i   — loop bound (cached so the user expression is only
+    //             evaluated once)
+    //   acc_i   — running sum, initialised to `0`
+    //
+    // Pseudo-IR (matches `list_int_sum`'s structural shape, but pure
+    // i64 instead of buffer-protocol):
+    //   start_i = <start expr>          // 0 when 1-arg
+    //   end_i   = <end expr>
+    //   acc_i   = 0i64
+    //   block {
+    //     loop {
+    //       if start_i >= end_i { br 1 }
+    //       acc_i += start_i
+    //       start_i += 1
+    //       br 0
+    //     }
+    //   }
+    //   push acc_i
+    let start_i = ctx.next_let_idx;
+    let end_i = ctx.next_let_idx + 1;
+    let acc_i = ctx.next_let_idx + 2;
+    ctx.next_let_idx += 3;
+
+    // start
+    if range_args.len() == 2 {
+        lower_expr(&range_args[0].value.expr, range_args[0].value.range, ctx)?;
+        expect_int_top(ctx, range)?;
+    } else {
+        ctx.out.push(TaggedOp {
+            op: Op::ConstI64(0),
+            range,
+        });
+        ctx.tstack.push(IrType::I64);
+    }
+    ctx.out.push(TaggedOp {
+        op: Op::LetSet {
+            idx: start_i,
+            ty: IrType::I64,
+        },
+        range,
+    });
+    ctx.tstack.pop();
+    // end
+    let end_arg = &range_args[range_args.len() - 1];
+    lower_expr(&end_arg.value.expr, end_arg.value.range, ctx)?;
+    expect_int_top(ctx, range)?;
+    ctx.out.push(TaggedOp {
+        op: Op::LetSet {
+            idx: end_i,
+            ty: IrType::I64,
+        },
+        range,
+    });
+    ctx.tstack.pop();
+    // acc = 0
+    ctx.out.push(TaggedOp {
+        op: Op::ConstI64(0),
+        range,
+    });
+    ctx.tstack.push(IrType::I64);
+    ctx.out.push(TaggedOp {
+        op: Op::LetSet {
+            idx: acc_i,
+            ty: IrType::I64,
+        },
+        range,
+    });
+    ctx.tstack.pop();
+
+    // Build the inner loop body. We construct it as a separate `Vec<TaggedOp>`
+    // and splice it under `Op::Block { body: [Op::Loop { body: ... }] }`.
+    let mk = |op: Op| TaggedOp { op, range };
+    let loop_body: Vec<TaggedOp> = vec![
+        // if start_i >= end_i { br 1 }   (label_depth 1 = outer block)
+        mk(Op::LetGet {
+            idx: start_i,
+            ty: IrType::I64,
+        }),
+        mk(Op::LetGet {
+            idx: end_i,
+            ty: IrType::I64,
+        }),
+        mk(Op::Ge(IrType::I64)),
+        mk(Op::BrIf { label_depth: 1 }),
+        // acc_i += start_i
+        mk(Op::LetGet {
+            idx: acc_i,
+            ty: IrType::I64,
+        }),
+        mk(Op::LetGet {
+            idx: start_i,
+            ty: IrType::I64,
+        }),
+        mk(Op::Add(IrType::I64)),
+        mk(Op::LetSet {
+            idx: acc_i,
+            ty: IrType::I64,
+        }),
+        // start_i += 1
+        mk(Op::LetGet {
+            idx: start_i,
+            ty: IrType::I64,
+        }),
+        mk(Op::ConstI64(1)),
+        mk(Op::Add(IrType::I64)),
+        mk(Op::LetSet {
+            idx: start_i,
+            ty: IrType::I64,
+        }),
+        // br 0
+        mk(Op::Br { label_depth: 0 }),
+    ];
+    ctx.out.push(TaggedOp {
+        op: Op::Block {
+            result_ty: None,
+            body: vec![TaggedOp {
+                op: Op::Loop {
+                    result_ty: None,
+                    body: loop_body,
+                },
+                range,
+            }],
+        },
+        range,
+    });
+    // Loop never touches the vstack post-Block (block/loop are
+    // None-typed); push the accumulator now so the consumer sees an
+    // I64 on top, matching `list_int_sum`'s return shape.
+    ctx.out.push(TaggedOp {
+        op: Op::LetGet {
+            idx: acc_i,
+            ty: IrType::I64,
+        },
+        range,
+    });
+    ctx.tstack.push(IrType::I64);
+    Ok(Some(()))
+}
+
+/// Pop the current vstack head and require it to be `I64`.  Used by
+/// the `list.sum(range(...))` desugar to defend against the inner
+/// argument exprs lowering to a non-i64 slot — analyzer typing should
+/// have caught this earlier, but the desugar emits raw arithmetic so a
+/// drift would silently corrupt subsequent ops.
+fn expect_int_top(ctx: &mut LowerCtx<'_>, range: TokenRange) -> Result<(), LoweringError> {
+    match ctx.tstack.last().copied() {
+        Some(IrType::I64) => Ok(()),
+        Some(other) => Err(LoweringError::UnsupportedExpr {
+            kind: format!(
+                "list.sum(range(...)) desugar requires Int args, got {:?}",
+                other
+            ),
+            range,
+        }),
+        None => Err(LoweringError::UnsupportedExpr {
+            kind: "list.sum(range(...)) desugar saw empty vstack".to_string(),
+            range,
+        }),
+    }
 }
 
 /// Phase 10-a: lower one argument to a stdlib call, routing closure
