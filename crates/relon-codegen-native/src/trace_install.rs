@@ -346,6 +346,213 @@ impl JITedTraceFn {
     pub fn inline_candidate(&self) -> bool {
         relon_trace_emitter::should_inline_trace(&self.inline_trace)
     }
+
+    /// Review #178 P2: scoped invoke that exposes the raw trace return
+    /// to a caller closure **before** the trace string arena is
+    /// reclaimed. Power-user API for callers that need a fine-grained
+    /// look at the raw `ctx.result_slot` (e.g. dispatchers that
+    /// branch on the status and want to materialise different
+    /// representations per status).
+    ///
+    /// The closure receives a [`RawInvokeResult`] carrying the raw
+    /// `i32` status code and the `ctx.result_slot` value. After the
+    /// closure returns, [`reclaim_trace_strings`] runs unconditionally
+    /// — any `*const StringRef` the closure read out of
+    /// `result_slot` MUST be materialised (i.e. its payload bytes
+    /// copied) before the closure returns. Callers that only want an
+    /// owned representation should reach for
+    /// [`Self::invoke_materialised`] instead; this helper exists for
+    /// the rare case where the caller needs custom dispatch logic.
+    ///
+    /// # Safety
+    ///
+    /// Same contract as [`Self::invoke`] / [`Self::invoke_raw`]:
+    /// `ctx` is an exclusive `*mut TraceContext`, `args` is either
+    /// null or a sized `u64` array. The closure MUST NOT retain any
+    /// `*const StringRef` derived from `result.result` past its own
+    /// return — those pointers become dangling once
+    /// `reclaim_trace_strings` runs.
+    pub unsafe fn invoke_with_string_reclaim<R, F>(
+        &self,
+        ctx: *mut TraceContext,
+        args: *const u64,
+        f: F,
+    ) -> R
+    where
+        F: FnOnce(RawInvokeResult) -> R,
+    {
+        // Read the raw status first; the `ctx.result_slot` is a
+        // `u64` field on `TraceContext` populated by the trace's
+        // `Return` lowering. Reading it via the raw pointer keeps
+        // the borrow contract obvious (the caller owns `ctx`; we
+        // only read one field through it).
+        let status = unsafe { self.invoke_raw(ctx, args) };
+        let result = unsafe { (*ctx).result_slot };
+        let out = f(RawInvokeResult { status, result });
+        // Drain every per-trace allocation on the calling thread.
+        // SAFETY: by the closure contract above, no caller-held
+        // `*const StringRef` derived from `result` survives past
+        // `f`'s return.
+        unsafe { relon_trace_jit::runtime::reclaim_trace_strings() };
+        out
+    }
+
+    /// Review #178 P2: high-level invoke that returns an **owned**
+    /// representation of the trace's success value, sourced from the
+    /// declared [`ReturnKind`] hint, and reclaims the trace string
+    /// arena before returning. Callers never see the raw
+    /// `*const StringRef` pointer the arena owns.
+    ///
+    /// ## Dispatch shape
+    ///
+    /// - `ReturnKind::I64` / `ReturnKind::Bool` / `ReturnKind::F64`:
+    ///   bit-cast `ctx.result_slot` into the corresponding scalar.
+    ///   No arena pointer is touched and the reclaim pass is still
+    ///   issued (it's a no-op when the trace did not allocate).
+    /// - `ReturnKind::String`: treat `ctx.result_slot` as a
+    ///   `*const StringRef`, copy the payload bytes into a
+    ///   [`SmolStr`] (inline if `≤ SMOL_STR_INLINE_CAP`, else
+    ///   `Arc<str>`), then reclaim. The returned `SmolStr` outlives
+    ///   the reclaim and is the only handle the caller needs to
+    ///   carry forward.
+    ///
+    /// On `GuardFailed` / `Aborted` status the trace's success value
+    /// is undefined; the helper surfaces those as
+    /// [`MaterialisedInvokeError::GuardFailed`] /
+    /// [`MaterialisedInvokeError::Aborted`] respectively. The reclaim
+    /// pass still runs so partial allocations made before the guard
+    /// fire are released.
+    ///
+    /// # Safety
+    ///
+    /// Same contract as [`Self::invoke`]: `ctx` is an exclusive
+    /// `*mut TraceContext`, `args` is either null or a sized `u64`
+    /// array.
+    ///
+    /// When `return_kind == ReturnKind::String` the trace MUST tail-
+    /// `Return` a `*const StringRef` previously handed out by the
+    /// `relon_trace_jit::runtime::str_ops` family — that is the only
+    /// pointer shape the materialiser dereferences. Passing a
+    /// `ReturnKind::String` to a non-string-returning trace is UB.
+    pub unsafe fn invoke_materialised(
+        &self,
+        ctx: *mut TraceContext,
+        args: *const u64,
+        return_kind: ReturnKind,
+    ) -> Result<MaterialisedValue, MaterialisedInvokeError> {
+        unsafe {
+            self.invoke_with_string_reclaim(ctx, args, |raw| match raw.status {
+                0 => Ok(materialise_success_slot(raw.result, return_kind)),
+                1 => Err(MaterialisedInvokeError::GuardFailed),
+                _ => Err(MaterialisedInvokeError::Aborted),
+            })
+        }
+    }
+}
+
+/// Raw output of a trace invoke handed into the
+/// [`JITedTraceFn::invoke_with_string_reclaim`] closure. Carries the
+/// status code and the `ctx.result_slot` value as a `u64`; the
+/// caller-side closure interprets the bit pattern per the trace's
+/// declared return shape.
+#[derive(Debug, Clone, Copy)]
+pub struct RawInvokeResult {
+    /// Raw status code (`0 == Success`, `1 == GuardFailed`,
+    /// `2 == Aborted`). See [`TraceEntryStatus`].
+    pub status: i32,
+    /// `ctx.result_slot` value at the moment the trace returned.
+    pub result: u64,
+}
+
+/// Caller-supplied hint that drives the high-level
+/// [`JITedTraceFn::invoke_materialised`] dispatch.
+///
+/// The trace itself does not carry a self-describing return type tag
+/// at the ABI boundary — `result_slot` is a `u64` slot the trace
+/// writes a `Return`ed SSA value into. The host knows the trace's IR
+/// return shape (it built the recorder + ran the optimiser) so the
+/// kind is supplied at invoke time rather than re-derived from the
+/// trace IR.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReturnKind {
+    /// Bit-cast `result_slot` into `i64`.
+    I64,
+    /// Bit-cast `result_slot` into `f64` (via
+    /// `f64::from_bits(u64)`).
+    F64,
+    /// Treat `result_slot` as a `u64` boolean (0 = false, non-zero
+    /// = true). The cranelift `Return` lowering for a `Bool` value
+    /// emits a 0/1 result, so the canonical shape is met.
+    Bool,
+    /// Treat `result_slot` as a `*const StringRef` (the
+    /// trace-runtime arena-owned shape). The materialiser copies the
+    /// payload into a [`SmolStr`] before the reclaim pass invalidates
+    /// the arena pointer.
+    String,
+}
+
+/// Owned representation of a trace's success value produced by
+/// [`JITedTraceFn::invoke_materialised`].
+///
+/// String-shaped traces hand back a [`SmolStr`] (≤ 22 byte payloads
+/// inline, longer payloads behind an `Arc<str>`) so the caller never
+/// has to reach into the arena pointer; numeric / boolean traces
+/// hand back the unwrapped scalar directly.
+#[derive(Debug, Clone, PartialEq)]
+pub enum MaterialisedValue {
+    /// 64-bit signed integer return.
+    Int(i64),
+    /// IEEE-754 double-precision float return.
+    Float(f64),
+    /// Boolean return — `result_slot` interpreted as a 0/1
+    /// indicator.
+    Bool(bool),
+    /// String return: an SSO-friendly owned copy of the trace's
+    /// arena-allocated payload.
+    String(relon_eval_api::SmolStr),
+}
+
+/// Error variants surfaced by [`JITedTraceFn::invoke_materialised`].
+/// The success path always yields a [`MaterialisedValue`]; deopt /
+/// abort signal through this enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum MaterialisedInvokeError {
+    /// Trace hit a guard and returned `TraceEntryStatus::GuardFailed`.
+    /// The caller's bytecode-side resume path must run; the trace's
+    /// `result_slot` value is undefined here.
+    #[error("trace guard failed; resume on bytecode")]
+    GuardFailed,
+    /// Trace returned `TraceEntryStatus::Aborted` (typically: a
+    /// runtime invariant the trace cannot honour, e.g. a deopt that
+    /// did not snapshot). The caller should invalidate the install
+    /// and re-run from scratch.
+    #[error("trace aborted; invalidate + re-run")]
+    Aborted,
+}
+
+/// Common materialisation core shared by [`JITedTraceFn::invoke_materialised`]
+/// and the `cfg(test)` mirror used inside this module. Pulled out as a
+/// free function so it stays a non-`unsafe` building block — the only
+/// dangerous bit (dereferencing the `StringRef` pointer) is gated by
+/// the caller declaring `ReturnKind::String`.
+fn materialise_success_slot(result: u64, return_kind: ReturnKind) -> MaterialisedValue {
+    match return_kind {
+        ReturnKind::I64 => MaterialisedValue::Int(result as i64),
+        ReturnKind::F64 => MaterialisedValue::Float(f64::from_bits(result)),
+        ReturnKind::Bool => MaterialisedValue::Bool(result != 0),
+        ReturnKind::String => {
+            // SAFETY: the caller-supplied `ReturnKind::String` is the
+            // ABI hint that the trace's success path tail-returned a
+            // valid `*const StringRef`. A null pointer surfaces as
+            // an empty SmolStr — matches the str_ops shim contract
+            // for null inputs without panicking.
+            let ptr = result as usize as *const relon_trace_jit::runtime::StringRef;
+            let owned = unsafe { relon_trace_jit::runtime::StringRef::as_str(ptr) }
+                .map(relon_eval_api::SmolStr::from_borrowed)
+                .unwrap_or_else(relon_eval_api::SmolStr::new_empty);
+            MaterialisedValue::String(owned)
+        }
+    }
 }
 
 /// v6-δ M2-C: typed entry-function pointer matching
@@ -1587,5 +1794,145 @@ mod tests {
             "atomic counter must not lose updates under contention"
         );
         hot_counter_reset(fn_id);
+    }
+
+    // ---- Review #178 P2: invoke_materialised / invoke_with_string_reclaim ----
+
+    /// Drive a `ConstI64 + Return` trace through `invoke_materialised`
+    /// (with `ReturnKind::I64`) and check the helper returns the
+    /// owned `Int` variant without touching the trace string arena.
+    #[test]
+    fn invoke_materialised_i64_unwraps_const_return() {
+        let state = TraceJitState::new();
+        let recorder = make_const_return_recorder(123);
+        let trace_fn = state
+            .jit_compile_trace_for_fn(0, recorder)
+            .expect("compile");
+        let mut ctx = TraceContext::with_hooks(64, default_host_hooks());
+        let val = unsafe {
+            trace_fn.invoke_materialised(&mut ctx as *mut _, std::ptr::null(), ReturnKind::I64)
+        }
+        .expect("trace must Succeed");
+        assert_eq!(val, MaterialisedValue::Int(123));
+    }
+
+    /// Drive a string-returning trace through `invoke_materialised`
+    /// (with `ReturnKind::String`) and verify the returned `SmolStr`
+    /// outlives the post-invoke reclaim — i.e. the payload bytes are
+    /// owned by the SmolStr, not borrowed from the arena.
+    #[test]
+    fn invoke_materialised_string_outlives_reclaim() {
+        // Build a `LocalGet(0) -> Return` trace; feed it a host-side
+        // arena `StringRef::from_static("hello-relon")` and let the
+        // materialiser copy the payload into a SmolStr.
+        let mut buffer = relon_trace_jit::TraceBuffer::new();
+        let v = buffer.fresh_ssa();
+        buffer.append(relon_trace_jit::TraceOp::LocalGet(v, 0));
+        buffer.append(relon_trace_jit::TraceOp::Return(v));
+        let state = TraceJitState::new();
+        let trace_fn = state
+            .jit_compile_buffer_for_fn(7, buffer)
+            .expect("LocalGet+Return trace must install");
+
+        // Host-side input lives in the trace string arena; the
+        // materialiser must reclaim it after copying.
+        let arena_before = relon_trace_jit::runtime::trace_string_arena_len();
+        let input = relon_trace_jit::runtime::StringRef::from_static("hello-relon");
+        let args = [input as u64];
+        let arena_after_input = relon_trace_jit::runtime::trace_string_arena_len();
+        assert_eq!(
+            arena_after_input,
+            arena_before + 1,
+            "from_static registers one allocation"
+        );
+
+        let mut ctx = TraceContext::with_hooks(64, default_host_hooks());
+        let val = unsafe {
+            trace_fn.invoke_materialised(&mut ctx as *mut _, args.as_ptr(), ReturnKind::String)
+        }
+        .expect("trace must Succeed");
+
+        // SmolStr must own its bytes — the arena was drained, so a
+        // dangling pointer would tripwire `assert_eq` here.
+        match val {
+            MaterialisedValue::String(s) => {
+                assert_eq!(s.as_str(), "hello-relon");
+                assert!(
+                    s.is_inline(),
+                    "payload fits in 22-byte inline slot, should stay off the heap"
+                );
+            }
+            other => panic!("expected MaterialisedValue::String, got {other:?}"),
+        }
+        assert_eq!(
+            relon_trace_jit::runtime::trace_string_arena_len(),
+            0,
+            "invoke_materialised must drain the arena after copying the payload"
+        );
+    }
+
+    /// `invoke_with_string_reclaim` exposes the raw status code +
+    /// `result_slot` and lets the closure render a custom shape
+    /// before the reclaim pass runs.
+    #[test]
+    fn invoke_with_string_reclaim_passes_raw_then_reclaims() {
+        let state = TraceJitState::new();
+        let recorder = make_const_return_recorder(-7);
+        let trace_fn = state
+            .jit_compile_trace_for_fn(1, recorder)
+            .expect("compile");
+        let mut ctx = TraceContext::with_hooks(64, default_host_hooks());
+        // Seed the arena with one allocation so we can confirm the
+        // post-closure reclaim pass actually drained the recorder.
+        let _seed = relon_trace_jit::runtime::StringRef::from_static("seed");
+        let before = relon_trace_jit::runtime::trace_string_arena_len();
+        assert!(before >= 1);
+        let raw = unsafe {
+            trace_fn.invoke_with_string_reclaim(&mut ctx as *mut _, std::ptr::null(), |raw| {
+                (raw.status, raw.result)
+            })
+        };
+        assert_eq!(raw.0, 0, "trace must Succeed");
+        assert_eq!(raw.1 as i64, -7, "result slot must carry the ConstI64");
+        assert_eq!(
+            relon_trace_jit::runtime::trace_string_arena_len(),
+            0,
+            "post-closure reclaim must drain the arena"
+        );
+    }
+
+    /// Materialise dispatch covers I64, F64, and Bool shapes without
+    /// touching `unsafe` arena pointer arithmetic in the caller.
+    #[test]
+    fn materialise_success_slot_handles_scalar_kinds() {
+        assert_eq!(
+            materialise_success_slot(42u64, ReturnKind::I64),
+            MaterialisedValue::Int(42)
+        );
+        let f_bits = (1.5_f64).to_bits();
+        assert_eq!(
+            materialise_success_slot(f_bits, ReturnKind::F64),
+            MaterialisedValue::Float(1.5)
+        );
+        assert_eq!(
+            materialise_success_slot(0u64, ReturnKind::Bool),
+            MaterialisedValue::Bool(false)
+        );
+        assert_eq!(
+            materialise_success_slot(1u64, ReturnKind::Bool),
+            MaterialisedValue::Bool(true)
+        );
+    }
+
+    /// Null `*const StringRef` returns surface as an empty
+    /// `SmolStr` rather than a panic — matches the str_ops shim
+    /// contract for null inputs.
+    #[test]
+    fn materialise_string_null_pointer_returns_empty() {
+        let v = materialise_success_slot(0u64, ReturnKind::String);
+        match v {
+            MaterialisedValue::String(s) => assert!(s.is_empty()),
+            other => panic!("expected empty MaterialisedValue::String, got {other:?}"),
+        }
     }
 }
