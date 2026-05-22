@@ -26,7 +26,6 @@
 //! docs for the full pipeline contract.
 
 use crate::buffer::TraceBuffer;
-use crate::effect::EffectClass;
 use crate::trace_ir::{CmpKind, SsaVar, TraceConst, TraceOp};
 
 use super::{OptimizerPass, PassReport};
@@ -178,12 +177,4 @@ fn apply_fold(
         TraceConst::Bool(b) => TraceOp::ConstI32(dst, if b { 1 } else { 0 }),
     };
     known.insert(dst, folded);
-}
-
-// Helper: tighten the barrier-source check (currently always true
-// for the variants we touch, but keep a function so future readers
-// see the intent).
-#[allow(dead_code)]
-fn safe_to_fold_pure(op: &TraceOp) -> bool {
-    matches!(op.effect_class(), EffectClass::Pure)
 }

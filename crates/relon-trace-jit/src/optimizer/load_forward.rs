@@ -139,17 +139,18 @@ impl OptimizerPass for LoadForwarding {
 /// Iterates -- no path compression needed because the chains are
 /// short and we walk the trace exactly once.
 fn resolve(alias: &HashMap<SsaVar, SsaVar>, mut v: SsaVar) -> SsaVar {
-    let mut hops = 0;
-    while let Some(next) = alias.get(&v).copied() {
+    // Cap the walk at 1024 hops as a defensive break against cycles —
+    // none should be reachable but a soft cap beats an infinite loop
+    // on a future bug; debug builds also assert the chain stays short.
+    for hops in 0..1024 {
+        let Some(next) = alias.get(&v).copied() else {
+            break;
+        };
         if next == v {
             break;
         }
         v = next;
-        hops += 1;
-        debug_assert!(hops < 1024, "alias chain looks cyclic");
-        if hops >= 1024 {
-            break;
-        }
+        debug_assert!(hops + 1 < 1024, "alias chain looks cyclic");
     }
     v
 }
