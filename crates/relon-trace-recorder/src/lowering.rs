@@ -143,10 +143,6 @@ pub struct OpLoweringContext<'a> {
     /// the callee is `Pure` / `ReadOnly` / `RecoverableWrite`. None
     /// means use the IR's conservative classification.
     pub call_effect_override: Option<TraceEffect>,
-    /// Hint for the branch direction the recorder is following. We
-    /// always record the taken path; the rule uses this to pick the
-    /// right `GuardKind::BranchTaken`-style emit.
-    pub branch_taken: Option<bool>,
 }
 
 impl<'a> OpLoweringContext<'a> {
@@ -155,17 +151,11 @@ impl<'a> OpLoweringContext<'a> {
             inputs,
             fresh_dst,
             call_effect_override: None,
-            branch_taken: None,
         }
     }
 
     pub fn with_call_effect_override(mut self, eff: TraceEffect) -> Self {
         self.call_effect_override = Some(eff);
-        self
-    }
-
-    pub fn with_branch_taken(mut self, taken: bool) -> Self {
-        self.branch_taken = Some(taken);
         self
     }
 }

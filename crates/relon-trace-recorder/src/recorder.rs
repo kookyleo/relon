@@ -152,10 +152,6 @@ pub struct RecorderState {
     /// optimiser pipeline can rely on at most one TypeCheck per var
     /// before its own LICM pass runs.
     guarded_vars: HashMap<SsaVar, ObservedType>,
-    /// Hot-loop nesting depth so the recorder can stamp matching
-    /// `MarkLoopHead` / `MarkLoopBack` ids when it sees an
-    /// `Op::Loop` / its closing boundary.
-    loop_depth: u32,
     next_loop_id: u32,
     /// ε-M0: open `begin_loop` calls awaiting a matching `end_loop`.
     /// Each frame remembers the loop-id stamped at begin time so the
@@ -202,9 +198,8 @@ impl RecorderState {
             ir_to_ssa: HashMap::new(),
             type_obs: HashMap::new(),
             guarded_vars: HashMap::new(),
-            loop_depth: 0,
             next_loop_id: 0,
-            open_loops: Vec::new(),
+            open_loops: Vec::with_capacity(4),
             capacity,
             next_external_pc: 0,
             ssa_stack: Vec::with_capacity(16),
@@ -596,8 +591,6 @@ impl RecorderState {
     /// - Appends one `TraceOp::MarkLoopHead { loop_id, phis }` op.
     /// - Pushes the loop_id onto the `open_loops` stack so the
     ///   matching `end_loop` stamps the correct id.
-    /// - Bumps `loop_depth` so the diagnostic counter mirrors nesting
-    ///   (the historical depth gauge still works).
     ///
     /// If the recorder is already aborted / terminated this is a
     /// silent no-op and returns an empty vec — the caller's walker
@@ -613,7 +606,6 @@ impl RecorderState {
 
         let loop_id = self.next_loop_id;
         self.next_loop_id += 1;
-        self.loop_depth = self.loop_depth.saturating_add(1);
 
         let mut phis: Vec<LoopPhi> = Vec::with_capacity(carries.len());
         let mut phi_ssas: Vec<SsaVar> = Vec::with_capacity(carries.len());
@@ -677,7 +669,6 @@ impl RecorderState {
                 return false;
             }
         };
-        self.loop_depth = self.loop_depth.saturating_sub(1);
         if self.buffer.op_count() >= self.capacity {
             self.aborted = Some(AbortReason::TraceTooLong);
             return false;
@@ -1016,7 +1007,6 @@ impl RecorderState {
                     TraceOp::MarkLoopHead { phis, .. } => {
                         let id = self.next_loop_id;
                         self.next_loop_id += 1;
-                        self.loop_depth = self.loop_depth.saturating_add(1);
                         TraceOp::MarkLoopHead { loop_id: id, phis }
                     }
                     other => other,
