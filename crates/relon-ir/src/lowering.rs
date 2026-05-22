@@ -3224,32 +3224,22 @@ fn check_field_default_refs_resolvable(
     Ok(())
 }
 
-/// Map a Phase 3.b `TypeRepr` to its corresponding `IrType`. Distinct
-/// from [`type_repr_to_ir_type`] above only in that it accepts the
-/// `Schema { ... }` variant (treated as a pointer-indirect i32).
+/// Map a Phase 3.b `TypeRepr` to its corresponding `IrType` in dict
+/// field context. Reuses [`type_repr_to_ir_type`] for the strict
+/// subset (base types + `List<base>`) and extends with the cases
+/// only dict fields can carry: nested branded `Schema { .. }` rides a
+/// pointer slot, and `Option` / `Result` fold to i32 too. Hand-
+/// crafted ill-formed schemas (where the layout pass would normally
+/// reject) get a silent `IrType::ListInt` fallback to keep the
+/// lowering total.
 fn type_repr_to_ir_type_dict(t: &TypeRepr) -> IrType {
+    if let Ok(ty) = type_repr_to_ir_type(t) {
+        return ty;
+    }
     match t {
-        TypeRepr::Int => IrType::I64,
-        TypeRepr::Float => IrType::F64,
-        TypeRepr::Bool => IrType::Bool,
-        TypeRepr::Null => IrType::Null,
-        TypeRepr::String => IrType::String,
-        TypeRepr::List { element } => match element.as_ref() {
-            TypeRepr::Int => IrType::ListInt,
-            TypeRepr::Float => IrType::ListFloat,
-            TypeRepr::Bool => IrType::ListBool,
-            TypeRepr::String => IrType::ListString,
-            TypeRepr::Schema { .. } => IrType::ListSchema,
-            // Fallback: treat unknown element types as the i32 pointer
-            // slot. Layout pass will already have rejected these at
-            // schema build time, so this branch fires only for hand-
-            // crafted ill-formed schemas.
-            _ => IrType::ListInt,
-        },
-        // Nested branded schema rides a pointer slot — same wasm
-        // representation as String / ListInt.
-        TypeRepr::Schema { .. } => IrType::I32,
-        TypeRepr::Option { .. } | TypeRepr::Result { .. } => IrType::I32,
+        TypeRepr::Schema { .. } | TypeRepr::Option { .. } | TypeRepr::Result { .. } => IrType::I32,
+        TypeRepr::List { .. } => IrType::ListInt,
+        _ => IrType::I32,
     }
 }
 
