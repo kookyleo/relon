@@ -10,10 +10,14 @@
 //! builder positioned on `normal_block` so the rest of the entry
 //! codegen flows unchanged.
 //!
-//! The prologue is intentionally non-atomic: the counter store / load
-//! pair is `MemFlags::trusted()` and the threshold check uses
-//! `icmp_imm`. Races on the counter can over-count by a small bounded
-//! amount, which is acceptable for the recorder kick-off heuristic.
+//! The counter cell is an [`std::sync::atomic::AtomicU32`] (#173
+//! review fix); the prologue emits a single `atomic_rmw add` against
+//! it. Earlier drafts used a non-atomic load / iadd_imm / store on
+//! the rationale that "races at worst over-count" — that reasoning is
+//! incorrect under the Rust memory model. The atomic RMW lowers to a
+//! single `LOCK XADD` on x86 (~1 cycle on contemporary hardware), so
+//! the hot-trigger detection path stays effectively as cheap as the
+//! racy original while becoming race-free.
 //!
 //! This module is a sibling of the other codegen sub-files
 //! (`arith` / `call` / `closure` / `control_flow` / `field` /
@@ -24,8 +28,8 @@
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::types::{I32, I64};
 use cranelift_codegen::ir::{
-    AbiParam, BlockArg, InstBuilder, MemFlags, Signature, StackSlotData, StackSlotKind,
-    Value as CValue,
+    AbiParam, AtomicRmwOp, BlockArg, InstBuilder, MemFlags, Signature, StackSlotData,
+    StackSlotKind, Value as CValue,
 };
 use cranelift_codegen::isa::CallConv;
 use cranelift_frontend::FunctionBuilder;
@@ -47,10 +51,10 @@ use super::EntryShape;
 /// entry_block:
 ///     %base    = iconst.i64 <hot_counters_base()>
 ///     %slot    = iadd_imm %base, fn_id * 4
-///     %v       = load.i32 trusted %slot
-///     %v1      = iadd_imm.i32 %v, 1
-///                store.i32 trusted %v1, %slot
-///     %hot     = icmp_imm.i32 uge %v1, RELON_HOT_THRESHOLD
+///     %one     = iconst.i32 1
+///     %old     = atomic_rmw.i32 add trusted %slot, %one   ; returns OLD
+///     %new     = iadd_imm.i32 %old, 1                     ; reconstruct
+///     %hot     = icmp_imm.i32 uge %new, RELON_HOT_THRESHOLD
 ///     brif %hot, hot_block, normal_block
 ///
 /// hot_block:
@@ -78,12 +82,20 @@ pub(super) fn emit_hot_counter_inject(
     let counter_addr = base_addr.wrapping_add(slot_offset);
     let counter_ptr = builder.ins().iconst(pointer_ty, counter_addr);
 
-    // load.i32 / iadd_imm.i32 / store.i32 (non-atomic per design).
-    let cur = builder.ins().load(I32, MemFlags::trusted(), counter_ptr, 0);
-    let inc = builder.ins().iadd_imm(cur, 1);
-    builder
-        .ins()
-        .store(MemFlags::trusted(), inc, counter_ptr, 0);
+    // atomic_rmw add returns the OLD value. Reconstruct the new value
+    // via iadd_imm so the threshold compare still observes the count
+    // this invocation produced (without an additional atomic load).
+    // The `atomic_rmw` instruction is sequentially consistent in
+    // cranelift, which is stronger than we strictly need (Relaxed
+    // would suffice for a counter), but the lowering on x86/aarch64
+    // is still a single locked instruction (`LOCK XADD` / `LDADD`)
+    // so the prologue cost stays at ~1 cycle.
+    let one = builder.ins().iconst(I32, 1);
+    let old =
+        builder
+            .ins()
+            .atomic_rmw(I32, MemFlags::trusted(), AtomicRmwOp::Add, counter_ptr, one);
+    let inc = builder.ins().iadd_imm(old, 1);
 
     // icmp uge against the threshold; branch on the result.
     let hot = builder.ins().icmp_imm(
