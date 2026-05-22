@@ -422,18 +422,16 @@ impl TreeWalkEvaluator {
         if let Some(entry) = self.context.native_methods.get(&key) {
             let display_name = format!("{}.{}", brand, method_name);
             self.check_native_fn_capability(&display_name, entry, range)?;
-            let mut native = crate::native_fn::NativeArgs::from_evaluated(
+            let native = crate::native_fn::NativeArgs::from_evaluated(
                 vec![
                     crate::native_fn::EvaluatedArg::positional(receiver.clone()),
                     crate::native_fn::EvaluatedArg::positional(other.clone()),
                 ],
                 self.caps(),
             );
-            // The host fn convention prepends `self` as the first
-            // positional arg (see `try_call_native_method` in eval.rs).
-            // The two `positional` pushes above already match that
-            // shape, so no rotation needed.
-            let _ = &mut native; // silence unused-mut lint on future edits
+            // Host fn convention prepends `self` as the first positional
+            // arg (see `try_call_native_method` in eval.rs) — the two
+            // `positional` pushes already match that shape.
             return Ok(Some(entry.func.call(native, range)?));
         }
         Ok(None)
@@ -548,63 +546,6 @@ impl TreeWalkEvaluator {
             return Ok(Some(entry.func.call(native, range)?));
         }
         Ok(None)
-    }
-
-    /// Like `try_compare_op_method` but for the zero-arg
-    /// `to_json() -> String` witness — used by JsonProjectable
-    /// fallback at sites that need a serialized projection (Phase D
-    /// follow-up; defined here so the constraint registry stays
-    /// colocated with its operator hooks).
-    #[allow(dead_code)]
-    fn try_to_json_method(
-        &self,
-        receiver: &Value,
-        scope: &Arc<Scope>,
-        range: TokenRange,
-    ) -> Result<Option<Value>, RuntimeError> {
-        let Value::Dict(d) = receiver else {
-            return Ok(None);
-        };
-        let Some(brand) = d.brand.as_ref() else {
-            return Ok(None);
-        };
-        let Some(analyzed) = self.context.analyzed.as_ref() else {
-            return Ok(None);
-        };
-        let Some(method) = analyzed
-            .schema_methods
-            .get(brand)
-            .and_then(|methods| methods.iter().find(|m| m.name == "to_json"))
-        else {
-            return Ok(None);
-        };
-        if let Some(body) = method.body_node.as_ref() {
-            return self
-                .invoke_method_body(
-                    body,
-                    Some(receiver.clone()),
-                    &method.params,
-                    &[],
-                    scope,
-                    range,
-                )
-                .map(Some);
-        }
-        let key = (brand.clone(), "to_json".to_string());
-        if let Some(entry) = self.context.native_methods.get(&key) {
-            let display_name = format!("{}.to_json", brand);
-            self.check_native_fn_capability(&display_name, entry, range)?;
-            let native = crate::native_fn::NativeArgs::from_evaluated(
-                vec![crate::native_fn::EvaluatedArg::positional(receiver.clone())],
-                self.caps(),
-            );
-            return Ok(Some(entry.func.call(native, range)?));
-        }
-        // Auto-derive fallback: serialize the dict via serde_json.
-        match serde_json::to_string(receiver) {
-            Ok(s) => Ok(Some(Value::String(s.into()))),
-            Err(_) => Ok(None),
-        }
     }
 }
 

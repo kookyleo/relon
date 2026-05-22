@@ -885,13 +885,14 @@ impl TreeWalkEvaluator {
                 })
             }
             Expr::FString(parts) => {
+                use std::fmt::Write as _;
                 let mut result = String::new();
                 for part in parts {
                     match part {
                         FStringPart::Literal(s) => result.push_str(s),
                         FStringPart::Interpolation(node) => {
                             let val = self.eval(node, &current_scope)?;
-                            result.push_str(&format!("{}", val));
+                            let _ = write!(result, "{}", val);
                         }
                     }
                 }
@@ -1955,19 +1956,15 @@ impl TreeWalkEvaluator {
                                 })
                             }
                         };
-                        // Sorted-by-key for stable iteration order —
-                        // matches `Dict.keys()` / `Dict.values()`.
-                        let mut keys: Vec<&String> = src_dict.map.keys().collect();
-                        keys.sort();
+                        // BTreeMap iteration is already key-sorted, so
+                        // no explicit sort needed — order matches
+                        // `Dict.keys()` / `Dict.values()`.
                         Ok(Cow::Owned(
-                            keys.into_iter()
-                                .filter_map(|k| {
-                                    src_dict.map.get(k).map(|v| {
-                                        Value::list(vec![
-                                            Value::String(k.as_str().into()),
-                                            v.clone(),
-                                        ])
-                                    })
+                            src_dict
+                                .map
+                                .iter()
+                                .map(|(k, v)| {
+                                    Value::list(vec![Value::String(k.as_str().into()), v.clone()])
                                 })
                                 .collect(),
                         ))

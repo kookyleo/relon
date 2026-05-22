@@ -1603,14 +1603,15 @@ impl RelonFunction for DictKeys {
         expect_arg_count(&args, 1, range)?;
         let map = &expect_dict(&args[0], range)?.map;
         // Charge for every scanned entry — keys() iterates the whole
-        // BTreeMap and sorts it, so the per-entry cost is real.
+        // BTreeMap, so the per-entry cost is real. (Iteration is
+        // already key-sorted.)
         if !map.is_empty() {
             caps.tick(map.len() as u64, range)?;
         }
-        let mut keys = map.keys().cloned().collect::<Vec<_>>();
-        keys.sort();
         Ok(Value::list(
-            keys.into_iter().map(|k| Value::String(k.into())).collect(),
+            map.keys()
+                .map(|k| Value::String(k.as_str().into()))
+                .collect(),
         ))
     }
 }
@@ -1629,13 +1630,8 @@ impl RelonFunction for DictValues {
         if !dict.map.is_empty() {
             caps.tick(dict.map.len() as u64, range)?;
         }
-        let mut keys = dict.map.keys().cloned().collect::<Vec<_>>();
-        keys.sort();
-        Ok(Value::list(
-            keys.into_iter()
-                .filter_map(|key| dict.map.get(&key).cloned())
-                .collect(),
-        ))
+        // BTreeMap iter is already key-sorted.
+        Ok(Value::list(dict.map.values().cloned().collect()))
     }
 }
 
@@ -1847,20 +1843,21 @@ impl RelonFunction for IterNext {
                         })
                     }
                 };
-                // Key-sort each call. Same O(n log n) per `next()` as
-                // the char-vec rebuild above; comprehension fast path
-                // avoids this entirely. Matches the iteration order
-                // used by `materialize_iterable` so user-side
-                // `it.next()` walks pairs in the same order a
-                // `for kv in d.iter()` would.
-                let mut keys: Vec<&String> = src_dict.map.keys().collect();
-                keys.sort();
-                caps.iter_cursor_fetch_and_inc(iter_id, keys.len())
-                    .map(|idx| {
-                        let key: &String = keys[idx];
-                        let v = src_dict.map.get(key).cloned().unwrap_or(Value::Null);
-                        Value::list(vec![Value::String(key.as_str().into()), v])
-                    })
+                // BTreeMap iter is key-sorted; matches the order used
+                // by `materialize_iterable` so user-side `it.next()`
+                // walks pairs in the same order a `for kv in d.iter()`
+                // would. O(n) per `next()` (linear walk to idx); the
+                // comprehension fast path avoids this entirely.
+                let total = src_dict.map.len();
+                caps.iter_cursor_fetch_and_inc(iter_id, total).map(|idx| {
+                    let (key, v) = src_dict
+                        .map
+                        .iter()
+                        .nth(idx)
+                        .map(|(k, v)| (k.as_str(), v.clone()))
+                        .unwrap_or(("", Value::Null));
+                    Value::list(vec![Value::String(key.into()), v])
+                })
             }
             other => {
                 return Err(RuntimeError::TypeMismatch {
