@@ -292,7 +292,7 @@ impl<'a> Walker<'a> {
     /// existing single-segment `UnresolvedReference` /
     /// `UnknownTypeName` machinery already covers that, and we must
     /// not double-count names like sibling closures or aliased imports.
-    pub(super) fn check_method_dispatch(&mut self, node: &Node, path: &[TokenKey]) {
+    pub(super) fn check_method_dispatch(&mut self, _node: &Node, path: &[TokenKey]) {
         if path.len() < 2 {
             return;
         }
@@ -323,7 +323,6 @@ impl<'a> Walker<'a> {
         let Some(schema) = self.resolve_method_receiver_prefix(&path[..last_idx]) else {
             return;
         };
-        let key = (schema.clone(), method.clone());
         let Some(info) = self
             .tree
             .schema_methods
@@ -347,11 +346,6 @@ impl<'a> Walker<'a> {
                     range: span_of(*method_range),
                 });
         }
-        // Suppress unused-key warning until we wire in argument
-        // type-checking against the synthesized method signature: the
-        // existing `check_fn_call` already validated arity once
-        // `resolve_call_signature` returned the method's `FnSignature`.
-        let _ = (key, node);
     }
 
     /// Schema-rooted §J follow-up: walk `path` for any `Dynamic`
@@ -436,15 +430,16 @@ impl<'a> Walker<'a> {
         self.tree.diagnostics.extend(to_emit);
     }
 
-    /// Stub for the in-method-block tracking hook used by
-    /// `check_method_dispatch`. The full implementation needs the
-    /// type-check walker to push / pop a per-method context as it
-    /// enters each `with { ... }` block; today we have no such
-    /// machinery, so the conservative answer is "no" — which means a
-    /// `#private` method called from anywhere outside its declaration
-    /// site (including from sibling methods on the same schema) is
-    /// flagged. This is a known false-positive surface that the
-    /// follow-up sub-task wires up properly.
+    /// True when the walker is currently inside the body of a method
+    /// declared on `schema`. The typecheck walker only traverses the
+    /// entry root today — method bodies are not walked from this
+    /// path — so the answer is always `false`. The `#private` check
+    /// in `check_method_dispatch` therefore only flags calls reached
+    /// from the entry root, which is the correct conservative
+    /// behaviour: private methods are explicitly opt-out of external
+    /// callers. When a future pass walks method bodies, it must push
+    /// a "currently inside schema X's method body" frame onto the
+    /// walker so this hook returns `true` for sibling-method calls.
     pub(super) fn in_method_block(&self, _schema: &str) -> bool {
         false
     }
