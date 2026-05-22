@@ -91,13 +91,10 @@ pub(super) fn emit_hot_counter_inject(
     // is still a single locked instruction (`LOCK XADD` / `LDADD`)
     // so the prologue cost stays at ~1 cycle.
     let one = builder.ins().iconst(I32, 1);
-    let old = builder.ins().atomic_rmw(
-        I32,
-        MemFlags::trusted(),
-        AtomicRmwOp::Add,
-        counter_ptr,
-        one,
-    );
+    let old =
+        builder
+            .ins()
+            .atomic_rmw(I32, MemFlags::trusted(), AtomicRmwOp::Add, counter_ptr, one);
     let inc = builder.ins().iadd_imm(old, 1);
 
     // icmp uge against the threshold; branch on the result.

@@ -140,8 +140,7 @@ pub const HOT_COUNTERS_SYMBOL: &str = "__relon_hot_counters";
 /// `AtomicU32` has the same layout / alignment as `u32`, so the JIT
 /// continues to treat each cell as a 4-byte integer location. The
 /// array is naturally `Sync` without an `unsafe impl`.
-static RELON_HOT_COUNTERS: [AtomicU32; MAX_FN_ID] =
-    [const { AtomicU32::new(0) }; MAX_FN_ID];
+static RELON_HOT_COUNTERS: [AtomicU32; MAX_FN_ID] = [const { AtomicU32::new(0) }; MAX_FN_ID];
 
 /// Raw pointer to the first counter slot. The cranelift prologue
 /// folds this into an `iconst.i64` so each entry-fn invocation does:
@@ -1535,5 +1534,58 @@ mod tests {
             .err()
             .expect("must error");
         assert!(matches!(err, TraceJitError::FnIdOutOfRange(_)));
+    }
+
+    /// #173 regression: prior to the AtomicU32 conversion the
+    /// counter slots were plain `u32` inside an `UnsafeCell`, so two
+    /// threads hammering the same slot would race and lose
+    /// increments (UB strictly, lost updates observably). With the
+    /// `AtomicU32` + `fetch_add` lowering the final value must equal
+    /// `THREADS * BUMPS_PER_THREAD` exactly.
+    ///
+    /// We pin to a fn_id at the top of the table so we can't
+    /// collide with any other test in this module that touches
+    /// low-numbered slots.
+    #[test]
+    fn hot_counter_multi_thread_no_lost_updates() {
+        use std::sync::atomic::{AtomicBool, Ordering as ThreadOrd};
+        use std::sync::Arc;
+        use std::thread;
+
+        const THREADS: usize = 8;
+        const BUMPS_PER_THREAD: u32 = 5_000;
+        let fn_id = (MAX_FN_ID - 2) as u32;
+
+        hot_counter_reset(fn_id);
+        assert_eq!(hot_counter_peek(fn_id), 0);
+
+        // Release barrier so every worker starts hammering the slot
+        // at roughly the same wall-clock instant, maximising the
+        // chance of overlapping RMWs.
+        let go = Arc::new(AtomicBool::new(false));
+        let mut handles = Vec::with_capacity(THREADS);
+        for _ in 0..THREADS {
+            let go = Arc::clone(&go);
+            handles.push(thread::spawn(move || {
+                while !go.load(ThreadOrd::Acquire) {
+                    std::hint::spin_loop();
+                }
+                for _ in 0..BUMPS_PER_THREAD {
+                    RELON_HOT_COUNTERS[fn_id as usize].fetch_add(1, Ordering::Relaxed);
+                }
+            }));
+        }
+        go.store(true, ThreadOrd::Release);
+        for h in handles {
+            h.join().expect("worker panicked");
+        }
+
+        let expected = (THREADS as u32) * BUMPS_PER_THREAD;
+        assert_eq!(
+            hot_counter_peek(fn_id),
+            expected,
+            "atomic counter must not lose updates under contention"
+        );
+        hot_counter_reset(fn_id);
     }
 }
