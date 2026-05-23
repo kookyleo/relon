@@ -1645,7 +1645,6 @@ fn lower_type_node_from_cst(node: &SyntaxNode, source: &str) -> Option<crate::Ty
     let mut is_optional = false;
     let mut after_path = false;
     let mut generics: Vec<crate::TypeNode> = Vec::new();
-    let variant_fields: Option<Vec<(String, crate::TypeNode)>> = None;
     let mut is_enum_head = false;
 
     for el in node.children_with_tokens() {
@@ -1682,111 +1681,8 @@ fn lower_type_node_from_cst(node: &SyntaxNode, source: &str) -> Option<crate::Ty
                 if in_generics && matches!(n.kind(), SyntaxKind::TYPE_NODE | SyntaxKind::TUPLE_TYPE)
                 {
                     let mut g = lower_type_node_from_cst(&n, source)?;
-                    // For Enum heads, a TYPE_NODE followed by a DICT
-                    // sibling is a variant-struct alternative
-                    // (`Enum<Email { field: T }>`). We detect this by
-                    // checking the next sibling.
                     if is_enum_head {
-                        // Bare single-segment IDENT-headed Enum
-                        // alternative is a unit variant — legacy
-                        // `parse_enum_alternative` calls `id`
-                        // (IDENT-only) first; if that fails (e.g. for
-                        // STRING-headed `"hot"`) it falls through to
-                        // `parse_type_node` and never marks it as a
-                        // variant. We replicate by checking the first
-                        // token of `n`.
-                        let first_tok = n.children_with_tokens().find_map(|el| {
-                            el.into_token().filter(|t| {
-                                !matches!(
-                                    t.kind(),
-                                    SyntaxKind::WHITESPACE
-                                        | SyntaxKind::LINE_COMMENT
-                                        | SyntaxKind::BLOCK_COMMENT
-                                )
-                            })
-                        });
-                        let ident_headed = first_tok
-                            .map(|t| t.kind() == SyntaxKind::IDENT)
-                            .unwrap_or(false);
-                        if ident_headed
-                            && g.path.len() == 1
-                            && g.generics.is_empty()
-                            && !g.is_optional
-                            && g.variant_fields.is_none()
-                        {
-                            g.variant_fields = Some(Vec::new());
-                        }
-                        if let Some(next) = n.next_sibling() {
-                            if next.kind() == SyntaxKind::DICT {
-                                // Extend the variant TypeNode's range
-                                // to cover the body `{...}` — legacy
-                                // `parse_enum_alternative` captures
-                                // `range = start_offset..end_offset`
-                                // where end_offset is after `}`.
-                                let dict_end: usize = next.text_range().end().into();
-                                g.range =
-                                    range_from_offsets(source, g.range.start.offset, dict_end);
-                                // Walk DICT to extract `(field_name, field_type)` pairs.
-                                let mut fields: Vec<(String, crate::TypeNode)> = Vec::new();
-                                for f in next
-                                    .children()
-                                    .filter(|c| c.kind() == SyntaxKind::DICT_FIELD)
-                                {
-                                    // Variant fields are emitted as
-                                    // `name: Type` shape. The CST may
-                                    // emit the type either as a
-                                    // TYPE_NODE / TUPLE_TYPE child (for
-                                    // shapes the type-atom heuristic
-                                    // claimed as types) or as a
-                                    // VARIABLE_EXPR child (for bare
-                                    // identifiers like `T`). Legacy
-                                    // `parse_variant_field` always
-                                    // calls `parse_type_node`, so we
-                                    // mirror that by also accepting
-                                    // VARIABLE_EXPR-shaped children as
-                                    // type-name paths.
-                                    let name = f
-                                        .children_with_tokens()
-                                        .filter_map(|el| el.into_token())
-                                        .find(|t| t.kind() == SyntaxKind::IDENT)
-                                        .map(|t| t.text().to_string());
-                                    let ty = f.children().find_map(|c| match c.kind() {
-                                        SyntaxKind::TYPE_NODE | SyntaxKind::TUPLE_TYPE => {
-                                            lower_type_node_from_cst(&c, source)
-                                        }
-                                        SyntaxKind::VARIABLE_EXPR => {
-                                            // Build a TypeNode from
-                                            // the IDENT-only path.
-                                            let segs: Vec<String> = c
-                                                .children_with_tokens()
-                                                .filter_map(|el| el.into_token())
-                                                .filter(|t| t.kind() == SyntaxKind::IDENT)
-                                                .map(|t| t.text().to_string())
-                                                .collect();
-                                            if segs.is_empty() {
-                                                return None;
-                                            }
-                                            let r = c.text_range();
-                                            let s: usize = r.start().into();
-                                            let e: usize = r.end().into();
-                                            Some(crate::TypeNode {
-                                                path: segs,
-                                                generics: Vec::new(),
-                                                is_optional: false,
-                                                range: range_from_offsets(source, s, e),
-                                                variant_fields: None,
-                                                doc_comment: None,
-                                            })
-                                        }
-                                        _ => None,
-                                    });
-                                    if let (Some(name), Some(ty)) = (name, ty) {
-                                        fields.push((name, ty));
-                                    }
-                                }
-                                g.variant_fields = Some(fields);
-                            }
-                        }
+                        attach_enum_variant_fields(&mut g, &n, source);
                     }
                     generics.push(g);
                 } else if !in_generics && n.kind() == SyntaxKind::DICT {
@@ -1802,11 +1698,11 @@ fn lower_type_node_from_cst(node: &SyntaxNode, source: &str) -> Option<crate::Ty
     // the tentative unit-variant markers so the rest of the pipeline
     // treats this as a classic untagged enum.
     if is_enum_head {
-        // Legacy `parse_enum_alternative` marks bare unit-variants
-        // with `variant_fields = Some(vec![])`. We don't do that here
-        // — the CST walker has no way to detect "this came in via
-        // the Enum-alternative parser vs the regular type parser".
-        // For now, leave variant_fields as set above.
+        // Bare unit-variants stay marked (legacy `parse_enum_alternative`
+        // sets `variant_fields = Some(vec![])` for them). If no
+        // generic actually carries a struct body, clear the
+        // tentative markers so downstream treats this as a classic
+        // untagged enum — matching the legacy fallthrough behaviour.
         let any_struct_form = generics
             .iter()
             .any(|g| g.variant_fields.as_ref().is_some_and(|f| !f.is_empty()));
@@ -1816,7 +1712,6 @@ fn lower_type_node_from_cst(node: &SyntaxNode, source: &str) -> Option<crate::Ty
             }
         }
     }
-    let _ = variant_fields;
 
     if path.is_empty() {
         return None;
@@ -1829,6 +1724,96 @@ fn lower_type_node_from_cst(node: &SyntaxNode, source: &str) -> Option<crate::Ty
         variant_fields: None,
         doc_comment: None,
     })
+}
+
+/// Apply the enum-variant-struct detection rules to a single generic
+/// argument under an `Enum<...>` head. Mutates `g.variant_fields` in
+/// place when the generic is a unit variant (bare IDENT) or a
+/// struct-bodied variant (`Email { field: T }`); also extends `g.range`
+/// to cover the trailing `{...}` body so downstream consumers see the
+/// full source span. Extracted from `lower_type_node_from_cst` to keep
+/// that function's main flow at one nesting level.
+fn attach_enum_variant_fields(g: &mut crate::TypeNode, n: &SyntaxNode, source: &str) {
+    // Bare single-segment IDENT-headed Enum alternative is a unit
+    // variant. Legacy `parse_enum_alternative` calls `id` (IDENT-only)
+    // first; if that fails (e.g. for STRING-headed `"hot"`) it falls
+    // through to `parse_type_node` and never marks it as a variant.
+    // We replicate by checking the first non-trivia token of `n`.
+    let first_tok = n.children_with_tokens().find_map(|el| {
+        el.into_token().filter(|t| {
+            !matches!(
+                t.kind(),
+                SyntaxKind::WHITESPACE | SyntaxKind::LINE_COMMENT | SyntaxKind::BLOCK_COMMENT
+            )
+        })
+    });
+    let ident_headed = first_tok
+        .map(|t| t.kind() == SyntaxKind::IDENT)
+        .unwrap_or(false);
+    if ident_headed
+        && g.path.len() == 1
+        && g.generics.is_empty()
+        && !g.is_optional
+        && g.variant_fields.is_none()
+    {
+        g.variant_fields = Some(Vec::new());
+    }
+    let Some(next) = n.next_sibling() else {
+        return;
+    };
+    if next.kind() != SyntaxKind::DICT {
+        return;
+    }
+    // Extend the variant TypeNode's range to cover the body `{...}`
+    // — legacy `parse_enum_alternative` captures
+    // `range = start_offset..end_offset` where end_offset is after `}`.
+    let dict_end: usize = next.text_range().end().into();
+    g.range = range_from_offsets(source, g.range.start.offset, dict_end);
+    let mut fields: Vec<(String, crate::TypeNode)> = Vec::new();
+    for f in next
+        .children()
+        .filter(|c| c.kind() == SyntaxKind::DICT_FIELD)
+    {
+        let name = f
+            .children_with_tokens()
+            .filter_map(|el| el.into_token())
+            .find(|t| t.kind() == SyntaxKind::IDENT)
+            .map(|t| t.text().to_string());
+        let ty = f.children().find_map(|c| match c.kind() {
+            SyntaxKind::TYPE_NODE | SyntaxKind::TUPLE_TYPE => lower_type_node_from_cst(&c, source),
+            SyntaxKind::VARIABLE_EXPR => {
+                // Legacy `parse_variant_field` always calls
+                // `parse_type_node`; the CST sometimes emits a
+                // VARIABLE_EXPR for bare identifiers (`T`). Mirror
+                // by building a TypeNode from the IDENT-only path.
+                let segs: Vec<String> = c
+                    .children_with_tokens()
+                    .filter_map(|el| el.into_token())
+                    .filter(|t| t.kind() == SyntaxKind::IDENT)
+                    .map(|t| t.text().to_string())
+                    .collect();
+                if segs.is_empty() {
+                    return None;
+                }
+                let r = c.text_range();
+                let s: usize = r.start().into();
+                let e: usize = r.end().into();
+                Some(crate::TypeNode {
+                    path: segs,
+                    generics: Vec::new(),
+                    is_optional: false,
+                    range: range_from_offsets(source, s, e),
+                    variant_fields: None,
+                    doc_comment: None,
+                })
+            }
+            _ => None,
+        });
+        if let (Some(name), Some(ty)) = (name, ty) {
+            fields.push((name, ty));
+        }
+    }
+    g.variant_fields = Some(fields);
 }
 
 /// Find the offset of the first non-trivia child element (token or
