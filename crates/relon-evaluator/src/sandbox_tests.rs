@@ -41,7 +41,7 @@ fn sandboxed_context_rejects_default_filesystem_imports() {
         ctx
     });
     let scope = Arc::new(Scope {
-        current_dir: dir.to_string_lossy().to_string(),
+        current_dir: dir.to_string_lossy().into_owned().into(),
         ..Default::default()
     });
     let result = TreeWalkEvaluator::new(std::sync::Arc::clone(&ctx)).eval_root(&scope);
@@ -73,7 +73,7 @@ fn filesystem_resolver_with_root_dir_allows_paths_under_root() {
         ctx
     });
     let scope = Arc::new(Scope {
-        current_dir: dir.to_string_lossy().to_string(),
+        current_dir: dir.to_string_lossy().into_owned().into(),
         ..Default::default()
     });
 
@@ -110,7 +110,7 @@ fn filesystem_resolver_rejects_traversal_outside_root() {
         ctx
     });
     let scope = Arc::new(Scope {
-        current_dir: inner.to_string_lossy().to_string(),
+        current_dir: inner.to_string_lossy().into_owned().into(),
         ..Default::default()
     });
     let result = TreeWalkEvaluator::new(std::sync::Arc::clone(&ctx)).eval_root(&scope);
@@ -148,7 +148,7 @@ fn filesystem_resolver_rejects_symlink_escape() {
         ctx
     });
     let scope = Arc::new(Scope {
-        current_dir: inner.to_string_lossy().to_string(),
+        current_dir: inner.to_string_lossy().into_owned().into(),
         ..Default::default()
     });
     let result = TreeWalkEvaluator::new(std::sync::Arc::clone(&ctx)).eval_root(&scope);

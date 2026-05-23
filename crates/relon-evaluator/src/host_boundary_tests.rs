@@ -308,7 +308,7 @@ fn host_receives_module_not_found() {
     let mut ctx = Context::new().with_root(node);
     ctx.prepend_module_resolver(Arc::new(FilesystemModuleResolver::trusted()));
     let scope = Arc::new(Scope {
-        current_dir: dir.to_string_lossy().to_string(),
+        current_dir: dir.to_string_lossy().into_owned().into(),
         ..Default::default()
     });
     let result = TreeWalkEvaluator::new(Arc::new({

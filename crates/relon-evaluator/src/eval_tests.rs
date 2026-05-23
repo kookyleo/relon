@@ -749,7 +749,7 @@ fn test_circular_import() {
     });
     let eval = TreeWalkEvaluator::new(std::sync::Arc::clone(&ctx));
     let scope = std::sync::Arc::new(Scope {
-        current_dir: env!("CARGO_MANIFEST_DIR").to_string(),
+        current_dir: env!("CARGO_MANIFEST_DIR").into(),
         ..Default::default()
     });
 
@@ -782,7 +782,7 @@ fn test_import_cache_uses_canonical_paths() {
     });
     let eval = TreeWalkEvaluator::new(std::sync::Arc::clone(&ctx));
     let scope = std::sync::Arc::new(Scope {
-        current_dir: dir.to_string_lossy().to_string(),
+        current_dir: dir.to_string_lossy().into_owned().into(),
         ..Default::default()
     });
 
@@ -822,7 +822,7 @@ fn test_imported_module_references_use_module_root() {
     });
     let eval = TreeWalkEvaluator::new(std::sync::Arc::clone(&ctx));
     let scope = std::sync::Arc::new(Scope {
-        current_dir: dir.to_string_lossy().to_string(),
+        current_dir: dir.to_string_lossy().into_owned().into(),
         ..Default::default()
     });
 
@@ -851,7 +851,7 @@ fn test_loading_modules_restored_after_module_parse_error() {
     });
     let eval = TreeWalkEvaluator::new(std::sync::Arc::clone(&ctx));
     let scope = std::sync::Arc::new(Scope {
-        current_dir: dir.to_string_lossy().to_string(),
+        current_dir: dir.to_string_lossy().into_owned().into(),
         ..Default::default()
     });
 
@@ -2567,7 +2567,7 @@ fn private_field_is_not_visible_through_alias_import() {
         ctx
     });
     let scope = std::sync::Arc::new(Scope {
-        current_dir: dir.to_string_lossy().to_string(),
+        current_dir: dir.to_string_lossy().into_owned().into(),
         ..Default::default()
     });
     let result = TreeWalkEvaluator::new(std::sync::Arc::clone(&ctx)).eval_root(&scope);
@@ -2607,7 +2607,7 @@ fn private_field_is_skipped_by_import_spread() {
         ctx
     });
     let scope = std::sync::Arc::new(Scope {
-        current_dir: dir.to_string_lossy().to_string(),
+        current_dir: dir.to_string_lossy().into_owned().into(),
         ..Default::default()
     });
     let result = TreeWalkEvaluator::new(std::sync::Arc::clone(&ctx)).eval_root(&scope);
@@ -3013,7 +3013,7 @@ fn imported_module_runs_analyzer_and_surfaces_errors() {
     );
     let ctx = fully_granted_ctx().with_root(node.clone());
     let scope = std::sync::Arc::new(Scope {
-        current_dir: dir.to_string_lossy().to_string(),
+        current_dir: dir.to_string_lossy().into_owned().into(),
         ..Default::default()
     });
     let result = TreeWalkEvaluator::new(std::sync::Arc::new({
