@@ -226,7 +226,7 @@ pub fn register_to(ctx: &mut Context) {
     // in a per-Context table (`Context::iter_cursors`), keyed by the
     // `_id` stamped into the Iter dict at construction time. See
     // schema-rooted-implementation-log §C.11 for the rationale.
-    ctx.register_pure_method("Iter", "next", Arc::new(IterNext));
+    ctx.register_pure_method(crate::iter_protocol::BRAND, "next", Arc::new(IterNext));
 }
 
 struct ListMap;
@@ -1670,7 +1670,11 @@ impl RelonFunction for IterFromList {
         // expect_list validates the receiver shape; the value itself
         // is what we wrap (cheap Arc clone — no element copy).
         let _ = expect_list(&args[0], range)?;
-        Ok(make_iter_value(caps, "list", args[0].clone()))
+        Ok(make_iter_value(
+            caps,
+            crate::iter_protocol::KIND_LIST,
+            args[0].clone(),
+        ))
     }
 }
 
@@ -1687,7 +1691,11 @@ impl RelonFunction for IterFromString {
         let args = args.positional.clone();
         expect_arg_count(&args, 1, range)?;
         let _ = expect_string(&args[0], range)?;
-        Ok(make_iter_value(caps, "string", args[0].clone()))
+        Ok(make_iter_value(
+            caps,
+            crate::iter_protocol::KIND_STRING,
+            args[0].clone(),
+        ))
     }
 }
 
@@ -1706,7 +1714,11 @@ impl RelonFunction for IterFromDict {
         let args = args.positional.clone();
         expect_arg_count(&args, 1, range)?;
         let _ = expect_dict(&args[0], range)?;
-        Ok(make_iter_value(caps, "dict_entries", args[0].clone()))
+        Ok(make_iter_value(
+            caps,
+            crate::iter_protocol::KIND_DICT_ENTRIES,
+            args[0].clone(),
+        ))
     }
 }
 
@@ -1749,9 +1761,11 @@ impl RelonFunction for IterNext {
         let args = args.positional.clone();
         expect_arg_count(&args, 1, range)?;
         let iter_dict = expect_dict(&args[0], range)?;
-        if iter_dict.brand.as_deref() != Some("Iter") {
+        use crate::iter_protocol::{BRAND, FIELD_ID, FIELD_KIND, FIELD_SOURCE};
+        use crate::iter_protocol::{KIND_DICT_ENTRIES, KIND_LIST, KIND_STRING};
+        if iter_dict.brand.as_deref() != Some(BRAND) {
             return Err(RuntimeError::TypeMismatch {
-                expected: "Iter".to_string(),
+                expected: BRAND.to_string(),
                 found: iter_dict
                     .brand
                     .clone()
@@ -1761,7 +1775,7 @@ impl RelonFunction for IterNext {
         }
         let kind = iter_dict
             .map
-            .get("_kind")
+            .get(FIELD_KIND)
             .and_then(|v| match v {
                 Value::String(s) => Some(s.as_str()),
                 _ => None,
@@ -1773,7 +1787,7 @@ impl RelonFunction for IterNext {
             })?;
         let source = iter_dict
             .map
-            .get("_source")
+            .get(FIELD_SOURCE)
             .ok_or_else(|| RuntimeError::TypeMismatch {
                 expected: "Iter with `_source` field".to_string(),
                 found: "Iter without `_source`".to_string(),
@@ -1781,7 +1795,7 @@ impl RelonFunction for IterNext {
             })?;
         let iter_id = iter_dict
             .map
-            .get("_id")
+            .get(FIELD_ID)
             .and_then(|v| match v {
                 Value::Int(i) => Some(*i as u64),
                 _ => None,
@@ -1796,7 +1810,7 @@ impl RelonFunction for IterNext {
         // check and increment under one critical section so concurrent
         // advances on the same id remain consistent.
         let element = match kind {
-            "list" => {
+            KIND_LIST => {
                 let items = match source {
                     Value::List(l) => l,
                     other => {
@@ -1810,7 +1824,7 @@ impl RelonFunction for IterNext {
                 caps.iter_cursor_fetch_and_inc(iter_id, items.len())
                     .map(|idx| items[idx].clone())
             }
-            "string" => {
+            KIND_STRING => {
                 let s = match source {
                     Value::String(s) => s,
                     other => {
@@ -1832,7 +1846,7 @@ impl RelonFunction for IterNext {
                 caps.iter_cursor_fetch_and_inc(iter_id, chars.len())
                     .map(|idx| Value::String(chars[idx].to_string().into()))
             }
-            "dict_entries" => {
+            KIND_DICT_ENTRIES => {
                 let src_dict = match source {
                     Value::Dict(d) => d,
                     other => {
@@ -1907,13 +1921,19 @@ fn option_value(inner: Option<Value>) -> Value {
 /// accumulates entries.
 pub(crate) fn make_iter_value(caps: &dyn NativeFnCaps, kind: &str, source: Value) -> Value {
     let mut map = std::collections::BTreeMap::new();
-    map.insert("_kind".to_string(), Value::String(kind.into()));
-    map.insert("_source".to_string(), source);
+    map.insert(
+        crate::iter_protocol::FIELD_KIND.to_string(),
+        Value::String(kind.into()),
+    );
+    map.insert(crate::iter_protocol::FIELD_SOURCE.to_string(), source);
     // `_id` is `i64`-coerced from a `u64` so the existing
     // `Value::Int(i64)` representation can carry it without inventing
     // a new variant. `IterNext` reads it back via `as u64` round-trip.
-    map.insert("_id".to_string(), Value::Int(caps.next_iter_id() as i64));
-    Value::branded_dict(map, Some("Iter".to_string()))
+    map.insert(
+        crate::iter_protocol::FIELD_ID.to_string(),
+        Value::Int(caps.next_iter_id() as i64),
+    );
+    Value::branded_dict(map, Some(crate::iter_protocol::BRAND.to_string()))
 }
 
 struct ListContains;

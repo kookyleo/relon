@@ -1888,10 +1888,12 @@ impl TreeWalkEvaluator {
         // delegating to the surrounding match) so a user-built
         // `Iter`-shaped dict that wraps another `Iter` still works.
         if let Value::Dict(d) = value {
-            if d.brand.as_deref() == Some("Iter") {
+            use crate::iter_protocol::{BRAND, FIELD_KIND, FIELD_SOURCE};
+            use crate::iter_protocol::{KIND_DICT_ENTRIES, KIND_LIST, KIND_STRING};
+            if d.brand.as_deref() == Some(BRAND) {
                 let kind = d
                     .map
-                    .get("_kind")
+                    .get(FIELD_KIND)
                     .and_then(|v| match v {
                         Value::String(s) => Some(s.as_str()),
                         _ => None,
@@ -1903,14 +1905,14 @@ impl TreeWalkEvaluator {
                     })?;
                 let source = d
                     .map
-                    .get("_source")
+                    .get(FIELD_SOURCE)
                     .ok_or_else(|| RuntimeError::TypeMismatch {
                         expected: "Iter with `_source` field".to_string(),
                         found: "Iter without `_source`".to_string(),
                         range,
                     })?;
                 return match kind {
-                    "list" => {
+                    KIND_LIST => {
                         let items = match source {
                             Value::List(l) => l,
                             other => {
@@ -1928,7 +1930,7 @@ impl TreeWalkEvaluator {
                         // the returned `Cow`.
                         Ok(Cow::Borrowed(items.as_slice()))
                     }
-                    "string" => {
+                    KIND_STRING => {
                         let s = match source {
                             Value::String(s) => s,
                             other => {
@@ -1945,7 +1947,7 @@ impl TreeWalkEvaluator {
                                 .collect(),
                         ))
                     }
-                    "dict_entries" => {
+                    KIND_DICT_ENTRIES => {
                         let src_dict = match source {
                             Value::Dict(d) => d,
                             other => {

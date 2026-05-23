@@ -13,6 +13,7 @@ pub mod decorator;
 pub mod decorator_names;
 pub mod error;
 pub mod eval;
+pub(crate) mod iter_protocol;
 pub mod module;
 pub mod native_fn;
 pub mod prelude;
