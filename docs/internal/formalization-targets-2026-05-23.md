@@ -26,7 +26,7 @@
 |---|---|---|:---:|---|
 | F-1 | Miri CI sweep on unsafe modules | **DONE** | 高 | `.github/workflows/ci.yml::miri` job (2026-05-23) |
 | F-2 | Kani bounded model check JIT str/dict layout arithmetic | 2-3d | 中-高 | trace-jit 加新 runtime helper / dict layout 改 |
-| F-3 | Capability/sandbox TLA+ spec | 1-2w | 中 | 加 NativeFnGate variant / cache 拓展 / multi-tenant 出 RFC |
+| F-3 | Capability/sandbox TLA+ spec | **SKELETON LANDED** | 中 | 加 NativeFnGate variant / cache 拓展 / multi-tenant 出 RFC |
 | F-4 | Trace JIT deopt invariant prop-test | 3-5d | 中-高 | 调 deopt site / guard kind 加 variant |
 | F-5 | wire-format smoke gate for ConstString migration | **DONE** | 中 | byte-pin tests + cross-link doc landed 2026-05-23 |
 
@@ -72,7 +72,19 @@
 
 **Win**：integer-overflow / OOB-read 类的 layout-arithmetic bug 在 checked 配置下被 SMT solver 数学证明不可达。
 
-### F-3 Capability/sandbox TLA+ spec
+### F-3 Capability/sandbox TLA+ spec — SKELETON LANDED 2026-05-23
+
+**位置**：
+- `docs/internal/capability-sandbox-spec-2026-05-23.tla` — syntactic 合法的 TLA+ module，含 6 个 VARIABLES、Init/TypeOK/Next、6 个 actions (Grant/Deny/RegisterHostFn/EnsureKey/CacheWrite/CacheRead) + 4 个 invariant 占位 (INV1-INV4)。
+- `docs/internal/capability-sandbox-spec-2026-05-23.cfg` — 配套 TLC config，含 CONSTANTS / SPEC / INVARIANT 三段。
+
+**当前能做的**：spec 把 state shape + action enabling condition 显式化；CacheWrite 的 `hmac_key_provisioned = TRUE` 前置即 #171 的 spec-level 表达。
+
+**当前不能做的**：INV1-INV4 留 `TRUE` placeholder，各带 TODO 注释说明缺哪段建模 (NativeFnGate dispatch action / history variable / sidecar enum 三态 / sidecar triple record 拆解)。CI 不挂 TLA tools，仅保证 syntactic skeleton。
+
+**触发**：cap RFC (新 cap variant / multi-tenant / 第三方 backend) 落地时把 stub 替成真实谓词并跑 TLC model check。
+
+**原始建模描述** (留作 follow-up 参考)：
 
 **Variables**:
 ```
