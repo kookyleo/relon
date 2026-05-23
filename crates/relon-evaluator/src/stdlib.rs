@@ -163,6 +163,12 @@ pub fn register_to(ctx: &mut Context) {
     ctx.register_pure_fn("sqrt", Arc::clone(&math_sqrt));
     ctx.register_pure_fn("pow", Arc::clone(&math_pow));
 
+    // Stdlib JSON Schema parity wave — batch 3: list helpers.
+    let list_unique: Arc<dyn RelonFunction> = Arc::new(ListUnique);
+    let list_count: Arc<dyn RelonFunction> = Arc::new(ListCount);
+    ctx.register_pure_fn("unique", Arc::clone(&list_unique));
+    ctx.register_pure_fn("count", Arc::clone(&list_count));
+
     // Phase D 收尾: schema-rooted method aliases for the same Rust
     // intrinsics. Decision 14 (`schema-rooted-model-2026-05-11.md`):
     // `method` is the model's center; free-fn forms above remain for
@@ -2869,6 +2875,52 @@ impl RelonFunction for MathPow {
         Ok(Value::Float(
             to_f64_val(&args[0]).powf(to_f64_val(&args[1])).into(),
         ))
+    }
+}
+
+// ============================================================
+// Stdlib JSON Schema parity wave — batch 3: list helpers
+// ============================================================
+
+/// `unique(xs) -> Bool` — JSON Schema `uniqueItems`. O(N²) equality
+/// (Value doesn't implement Hash); cheap for the typical small
+/// list lengths predicates work with.
+struct ListUnique;
+impl RelonFunction for ListUnique {
+    fn call(
+        &self,
+        args: NativeArgs,
+        range: relon_parser::TokenRange,
+    ) -> Result<Value, RuntimeError> {
+        let args = args.into_positional();
+        expect_arg_count(&args, 1, range)?;
+        let xs = expect_list(&args[0], range)?;
+        for i in 0..xs.len() {
+            for j in (i + 1)..xs.len() {
+                if xs[i] == xs[j] {
+                    return Ok(Value::Bool(false));
+                }
+            }
+        }
+        Ok(Value::Bool(true))
+    }
+}
+
+/// `count(xs) -> Int` — list length as Int. Convenience wrapper so
+/// predicate authors don't need `xs.length()` (which routes through
+/// the polymorphic `len` and returns Int already, but `count` reads
+/// more naturally in a numeric predicate context).
+struct ListCount;
+impl RelonFunction for ListCount {
+    fn call(
+        &self,
+        args: NativeArgs,
+        range: relon_parser::TokenRange,
+    ) -> Result<Value, RuntimeError> {
+        let args = args.into_positional();
+        expect_arg_count(&args, 1, range)?;
+        let xs = expect_list(&args[0], range)?;
+        Ok(Value::Int(xs.len() as i64))
     }
 }
 
