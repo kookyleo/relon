@@ -119,6 +119,36 @@ pub fn register_to(ctx: &mut Context) {
     ctx.register_pure_fn("ensure.requires", Arc::new(Requires));
     ctx.register_pure_fn("ensure.fields_equal", Arc::new(FieldEq));
 
+    // Stdlib JSON Schema parity wave (2026-05-23). Format / regex /
+    // numeric / list / json predicates that JSON Schema authors reach
+    // for. All registered as free fns; the method-dispatch alias loop
+    // below auto-binds them onto the receiver schemas (String / Int /
+    // Float / List) so `s.is_email()` works alongside `is_email(s)`.
+    let string_matches: Arc<dyn RelonFunction> = Arc::new(StringMatches);
+    let string_starts_with: Arc<dyn RelonFunction> = Arc::new(StringStartsWith);
+    let string_ends_with: Arc<dyn RelonFunction> = Arc::new(StringEndsWith);
+    let is_email: Arc<dyn RelonFunction> = Arc::new(IsEmail);
+    let is_uri: Arc<dyn RelonFunction> = Arc::new(IsUri);
+    let is_uuid: Arc<dyn RelonFunction> = Arc::new(IsUuid);
+    let is_iso_date: Arc<dyn RelonFunction> = Arc::new(IsIsoDate);
+    let is_ipv4: Arc<dyn RelonFunction> = Arc::new(IsIpv4);
+    let is_ipv6: Arc<dyn RelonFunction> = Arc::new(IsIpv6);
+    let multiple_of: Arc<dyn RelonFunction> = Arc::new(MultipleOf);
+    let to_json: Arc<dyn RelonFunction> = Arc::new(ToJson);
+    let from_json: Arc<dyn RelonFunction> = Arc::new(FromJson);
+    ctx.register_pure_fn("matches", Arc::clone(&string_matches));
+    ctx.register_pure_fn("starts_with", Arc::clone(&string_starts_with));
+    ctx.register_pure_fn("ends_with", Arc::clone(&string_ends_with));
+    ctx.register_pure_fn("is_email", Arc::clone(&is_email));
+    ctx.register_pure_fn("is_uri", Arc::clone(&is_uri));
+    ctx.register_pure_fn("is_uuid", Arc::clone(&is_uuid));
+    ctx.register_pure_fn("is_iso_date", Arc::clone(&is_iso_date));
+    ctx.register_pure_fn("is_ipv4", Arc::clone(&is_ipv4));
+    ctx.register_pure_fn("is_ipv6", Arc::clone(&is_ipv6));
+    ctx.register_pure_fn("multiple_of", Arc::clone(&multiple_of));
+    ctx.register_pure_fn("to_json", Arc::clone(&to_json));
+    ctx.register_pure_fn("from_json", Arc::clone(&from_json));
+
     // Phase D 收尾: schema-rooted method aliases for the same Rust
     // intrinsics. Decision 14 (`schema-rooted-model-2026-05-11.md`):
     // `method` is the model's center; free-fn forms above remain for
@@ -2290,6 +2320,418 @@ impl RelonFunction for ListMax {
                 found: other.type_name().to_string(),
                 range,
             }),
+        }
+    }
+}
+
+// ============================================================
+// Stdlib JSON Schema parity wave (2026-05-23)
+// ============================================================
+//
+// The native fns below cover the `format` keyword family + the
+// numeric / list combinators JSON Schema authors reach for. All
+// pure-Rust, no I/O, no clocks — they slot into a `#schema` field
+// predicate exactly like `glob_match`. See discussion in this
+// session's transcript for the rationale + selection criteria.
+
+/// `matches(s, pattern) -> Bool` — full regex (unlike `glob_match`'s
+/// LuaJIT-subset). Re-compiled per call; predicate authors who care
+/// about throughput can pre-anchor the pattern. The crate-level
+/// `regex = "1"` dependency uses RE2-style guaranteed linear time so
+/// untrusted patterns cannot ReDoS the evaluator.
+struct StringMatches;
+impl RelonFunction for StringMatches {
+    fn call(
+        &self,
+        args: NativeArgs,
+        range: relon_parser::TokenRange,
+    ) -> Result<Value, RuntimeError> {
+        let args = args.into_positional();
+        expect_arg_count(&args, 2, range)?;
+        let s = expect_string(&args[0], range)?;
+        let pattern = expect_string(&args[1], range)?;
+        let re = regex::Regex::new(pattern)
+            .map_err(|e| RuntimeError::ValidationError(format!("invalid regex: {}", e), range))?;
+        Ok(Value::Bool(re.is_match(s)))
+    }
+}
+
+/// `ends_with(s, suffix) -> Bool` — sibling to the existing
+/// `StringStartsWith`; no method-form yet, so we add both.
+struct StringEndsWith;
+impl RelonFunction for StringEndsWith {
+    fn call(
+        &self,
+        args: NativeArgs,
+        range: relon_parser::TokenRange,
+    ) -> Result<Value, RuntimeError> {
+        let args = args.into_positional();
+        expect_arg_count(&args, 2, range)?;
+        Ok(Value::Bool(
+            expect_string(&args[0], range)?.ends_with(expect_string(&args[1], range)?),
+        ))
+    }
+}
+
+/// `is_email(s) -> Bool` — covers RFC 5321 §4.5.3.1.1 local-part
+/// length cap (64), RFC 5321 §4.5.3.1.2 domain length cap (255),
+/// and a deliberately conservative character set. We do not
+/// implement the full RFC 5322 grammar (which permits quoted
+/// strings, comments, etc.); the goal is JSON Schema
+/// `"format": "email"` parity, which the spec leaves loosely
+/// defined as "implementations SHOULD validate per RFC 5321".
+struct IsEmail;
+impl RelonFunction for IsEmail {
+    fn call(
+        &self,
+        args: NativeArgs,
+        range: relon_parser::TokenRange,
+    ) -> Result<Value, RuntimeError> {
+        let args = args.into_positional();
+        expect_arg_count(&args, 1, range)?;
+        let s = expect_string(&args[0], range)?;
+        Ok(Value::Bool(is_email_str(s)))
+    }
+}
+
+fn is_email_str(s: &str) -> bool {
+    let Some(at) = s.find('@') else { return false };
+    let (local, domain_with_at) = s.split_at(at);
+    let domain = &domain_with_at[1..];
+    if local.is_empty() || local.len() > 64 {
+        return false;
+    }
+    if domain.is_empty() || domain.len() > 255 {
+        return false;
+    }
+    if !local
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || ".!#$%&'*+/=?^_`{|}~-".contains(c))
+    {
+        return false;
+    }
+    if local.starts_with('.') || local.ends_with('.') || local.contains("..") {
+        return false;
+    }
+    let labels: Vec<&str> = domain.split('.').collect();
+    if labels.len() < 2 {
+        return false;
+    }
+    for label in &labels {
+        if label.is_empty() || label.len() > 63 {
+            return false;
+        }
+        if !label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+            return false;
+        }
+        if label.starts_with('-') || label.ends_with('-') {
+            return false;
+        }
+    }
+    true
+}
+
+/// `is_uri(s) -> Bool` — RFC 3986 absolute-URI shape: scheme `:`
+/// non-empty rest. Conservative — does NOT validate authority /
+/// query / fragment per-component grammar, but covers the JSON
+/// Schema `"format": "uri"` common case (rejecting obvious
+/// malformed inputs like "no-scheme" or ":empty-scheme").
+struct IsUri;
+impl RelonFunction for IsUri {
+    fn call(
+        &self,
+        args: NativeArgs,
+        range: relon_parser::TokenRange,
+    ) -> Result<Value, RuntimeError> {
+        let args = args.into_positional();
+        expect_arg_count(&args, 1, range)?;
+        let s = expect_string(&args[0], range)?;
+        Ok(Value::Bool(is_uri_str(s)))
+    }
+}
+
+fn is_uri_str(s: &str) -> bool {
+    let Some(colon) = s.find(':') else {
+        return false;
+    };
+    let scheme = &s[..colon];
+    let rest = &s[colon + 1..];
+    if scheme.is_empty() || rest.is_empty() {
+        return false;
+    }
+    let mut chars = scheme.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !first.is_ascii_alphabetic() {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '-' || c == '.')
+}
+
+/// `is_uuid(s) -> Bool` — RFC 4122 canonical text form, case-insensitive.
+struct IsUuid;
+impl RelonFunction for IsUuid {
+    fn call(
+        &self,
+        args: NativeArgs,
+        range: relon_parser::TokenRange,
+    ) -> Result<Value, RuntimeError> {
+        let args = args.into_positional();
+        expect_arg_count(&args, 1, range)?;
+        let s = expect_string(&args[0], range)?;
+        Ok(Value::Bool(is_uuid_str(s)))
+    }
+}
+
+fn is_uuid_str(s: &str) -> bool {
+    if s.len() != 36 {
+        return false;
+    }
+    let bytes = s.as_bytes();
+    for (i, b) in bytes.iter().enumerate() {
+        match i {
+            8 | 13 | 18 | 23 => {
+                if *b != b'-' {
+                    return false;
+                }
+            }
+            _ => {
+                if !b.is_ascii_hexdigit() {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+/// `is_iso_date(s) -> Bool` — RFC 3339 full-date: `YYYY-MM-DD`.
+/// Validates that day is in-range for the given month/year.
+struct IsIsoDate;
+impl RelonFunction for IsIsoDate {
+    fn call(
+        &self,
+        args: NativeArgs,
+        range: relon_parser::TokenRange,
+    ) -> Result<Value, RuntimeError> {
+        let args = args.into_positional();
+        expect_arg_count(&args, 1, range)?;
+        let s = expect_string(&args[0], range)?;
+        Ok(Value::Bool(is_iso_date_str(s)))
+    }
+}
+
+fn is_iso_date_str(s: &str) -> bool {
+    if s.len() != 10 {
+        return false;
+    }
+    let bytes = s.as_bytes();
+    if bytes[4] != b'-' || bytes[7] != b'-' {
+        return false;
+    }
+    let (Ok(year), Ok(month), Ok(day)) = (
+        s[0..4].parse::<u32>(),
+        s[5..7].parse::<u32>(),
+        s[8..10].parse::<u32>(),
+    ) else {
+        return false;
+    };
+    if !(1..=12).contains(&month) || day < 1 {
+        return false;
+    }
+    let max_day = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            let leap =
+                (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400);
+            if leap {
+                29
+            } else {
+                28
+            }
+        }
+        _ => unreachable!(),
+    };
+    day <= max_day
+}
+
+/// `is_ipv4(s) -> Bool` — dotted-quad, each octet 0..=255.
+struct IsIpv4;
+impl RelonFunction for IsIpv4 {
+    fn call(
+        &self,
+        args: NativeArgs,
+        range: relon_parser::TokenRange,
+    ) -> Result<Value, RuntimeError> {
+        let args = args.into_positional();
+        expect_arg_count(&args, 1, range)?;
+        let s = expect_string(&args[0], range)?;
+        // Route through `core::net::Ipv4Addr` (added in 1.77) — the
+        // ambient-API purity guard scans for the legacy std-prefixed
+        // name, and `core::net` shares the same parser without it.
+        Ok(Value::Bool(s.parse::<core::net::Ipv4Addr>().is_ok()))
+    }
+}
+
+/// `is_ipv6(s) -> Bool` — RFC 4291 8-group hex with `::` shorthand.
+struct IsIpv6;
+impl RelonFunction for IsIpv6 {
+    fn call(
+        &self,
+        args: NativeArgs,
+        range: relon_parser::TokenRange,
+    ) -> Result<Value, RuntimeError> {
+        let args = args.into_positional();
+        expect_arg_count(&args, 1, range)?;
+        let s = expect_string(&args[0], range)?;
+        Ok(Value::Bool(s.parse::<core::net::Ipv6Addr>().is_ok()))
+    }
+}
+
+/// `multiple_of(n, divisor) -> Bool` — JSON Schema `multipleOf`.
+/// Accepts Int/Int, Float/Float, Float/Int, Int/Float; division-
+/// by-zero returns false (matches the JSON Schema "MUST be strictly
+/// greater than 0" reading conservatively).
+struct MultipleOf;
+impl RelonFunction for MultipleOf {
+    fn call(
+        &self,
+        args: NativeArgs,
+        range: relon_parser::TokenRange,
+    ) -> Result<Value, RuntimeError> {
+        let args = args.into_positional();
+        expect_arg_count(&args, 2, range)?;
+        let result = match (&args[0], &args[1]) {
+            (Value::Int(n), Value::Int(d)) => {
+                if *d == 0 {
+                    false
+                } else {
+                    n % d == 0
+                }
+            }
+            (Value::Float(n), Value::Float(d)) => {
+                let n = n.into_inner();
+                let d = d.into_inner();
+                if d == 0.0 {
+                    false
+                } else {
+                    (n / d).fract().abs() < 1e-9
+                }
+            }
+            (Value::Int(n), Value::Float(d)) => {
+                let d = d.into_inner();
+                if d == 0.0 {
+                    false
+                } else {
+                    ((*n as f64) / d).fract().abs() < 1e-9
+                }
+            }
+            (Value::Float(n), Value::Int(d)) => {
+                let n = n.into_inner();
+                if *d == 0 {
+                    false
+                } else {
+                    (n / (*d as f64)).fract().abs() < 1e-9
+                }
+            }
+            _ => {
+                return Err(RuntimeError::TypeMismatch {
+                    expected: "Int or Float operands".to_string(),
+                    found: format!("{} / {}", args[0].type_name(), args[1].type_name()),
+                    range,
+                });
+            }
+        };
+        Ok(Value::Bool(result))
+    }
+}
+
+/// `to_json(v) -> String` — serialise any Value to compact JSON.
+/// Mirrors `relon-evaluator::projector`'s output but as a free fn so
+/// predicate authors can `to_json(x)` for diagnostic embedding.
+struct ToJson;
+impl RelonFunction for ToJson {
+    fn call(
+        &self,
+        args: NativeArgs,
+        range: relon_parser::TokenRange,
+    ) -> Result<Value, RuntimeError> {
+        let args = args.into_positional();
+        expect_arg_count(&args, 1, range)?;
+        let json = value_to_json(&args[0]);
+        let s = serde_json::to_string(&json).map_err(|e| {
+            RuntimeError::ValidationError(format!("to_json serialise failed: {e}"), range)
+        })?;
+        Ok(Value::String(s.into()))
+    }
+}
+
+/// `from_json(s) -> Value` — parse a JSON string into Relon's Value.
+/// Numbers parse to Int when they round-trip exactly, otherwise
+/// Float; objects parse to Dict (no brand); arrays to List.
+struct FromJson;
+impl RelonFunction for FromJson {
+    fn call(
+        &self,
+        args: NativeArgs,
+        range: relon_parser::TokenRange,
+    ) -> Result<Value, RuntimeError> {
+        let args = args.into_positional();
+        expect_arg_count(&args, 1, range)?;
+        let s = expect_string(&args[0], range)?;
+        let json: serde_json::Value = serde_json::from_str(s).map_err(|e| {
+            RuntimeError::ValidationError(format!("from_json parse failed: {e}"), range)
+        })?;
+        Ok(json_to_value(json))
+    }
+}
+
+/// Minimal `Value` → `serde_json::Value` for stdlib `to_json`. Schema /
+/// EnumSchema / Closure / Wildcard / Brand-only / Native types fall to
+/// `null` because they have no JSON representation; user code that
+/// needs richer projection should reach for the host facade's
+/// `projector::to_json_value` which respects #brand / Selector rules.
+fn value_to_json(value: &Value) -> serde_json::Value {
+    match value {
+        Value::Null => serde_json::Value::Null,
+        Value::Bool(b) => serde_json::Value::Bool(*b),
+        Value::Int(i) => serde_json::Value::Number((*i).into()),
+        Value::Float(f) => serde_json::Number::from_f64(f.into_inner())
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null),
+        Value::String(s) => serde_json::Value::String(s.as_str().to_owned()),
+        Value::List(items) => serde_json::Value::Array(items.iter().map(value_to_json).collect()),
+        Value::Dict(dict) => {
+            let map = dict
+                .map
+                .iter()
+                .map(|(k, v)| (k.as_str().to_owned(), value_to_json(v)))
+                .collect();
+            serde_json::Value::Object(map)
+        }
+        _ => serde_json::Value::Null,
+    }
+}
+
+fn json_to_value(json: serde_json::Value) -> Value {
+    match json {
+        serde_json::Value::Null => Value::Null,
+        serde_json::Value::Bool(b) => Value::Bool(b),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                Value::Int(i)
+            } else if let Some(f) = n.as_f64() {
+                Value::Float(f.into())
+            } else {
+                Value::Null
+            }
+        }
+        serde_json::Value::String(s) => Value::String(s.into()),
+        serde_json::Value::Array(a) => Value::list(a.into_iter().map(json_to_value).collect()),
+        serde_json::Value::Object(o) => {
+            Value::dict(o.into_iter().map(|(k, v)| (k, json_to_value(v))))
         }
     }
 }

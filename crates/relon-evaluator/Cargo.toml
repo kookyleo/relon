@@ -35,6 +35,9 @@ miette = { workspace = true, features = ["derive"] }
 # stays target-gated since it still needs native sockets / TLS.
 sha2 = { workspace = true }
 hex = { workspace = true }
+# Stdlib JSON Schema parity wave: regex for `matches` + format
+# predicates (`is_email` / `is_uri` / `is_ipv4` / etc.).
+regex = { workspace = true }
 
 # v3+ a-3: HTTPS fetch for remote `#import "https://..."` modules.
 # Restricted to native hosts so the browser playground build of

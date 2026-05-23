@@ -1733,6 +1733,7 @@ dependencies = [
  "miette",
  "ordered-float",
  "proptest",
+ "regex",
  "relon-analyzer",
  "relon-eval-api",
  "relon-fmt",

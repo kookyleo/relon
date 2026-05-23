@@ -57,6 +57,11 @@ arc-swap = "1"
 # parse+analyze jobs across the global pool. Loader IO and ws-state
 # mutation stay sequential — only the pure CPU work is parallelised.
 rayon = "1"
+# Stdlib JSON Schema parity wave: regex for `matches` + format
+# predicates (`is_email` / `is_uri` / `is_ipv4` / `is_ipv6` / etc.).
+# Pure-Rust, no DFA backtracking explosion; safe to expose to user
+# predicates without a sandbox escape route.
+regex = "1"
 
 # Internal crates declared with both `path` and `version` so each can
 # be published to crates.io independently while local builds keep
