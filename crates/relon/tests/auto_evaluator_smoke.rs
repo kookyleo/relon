@@ -289,7 +289,7 @@ fn force_thunk_and_invoke_closure_route_through_tree_walk() {
 
     let closure = ClosureData {
         params: vec![],
-        body: node,
+        body: Arc::new(node),
         captured_env: Arc::new(Scope::default()),
     };
     let res = evaluator.invoke_closure(&closure, &[]);

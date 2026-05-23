@@ -88,7 +88,12 @@ pub struct SchemaField {
 #[derive(Debug, Clone)]
 pub struct ClosureData {
     pub params: Vec<String>,
-    pub body: Node,
+    /// P2-2: closure body shared via `Arc<Node>` so `xs.map(f)` and
+    /// `Value::Closure::clone()` only bump the body's refcount instead
+    /// of deep-cloning the AST per element. The reference shape
+    /// (`&closure.body`) keeps existing consumers source-compatible —
+    /// `Arc<Node>` auto-derefs to `&Node` for `eval_node` calls.
+    pub body: Arc<Node>,
     pub captured_env: Arc<Scope>,
 }
 

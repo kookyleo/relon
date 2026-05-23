@@ -746,7 +746,9 @@ impl TreeWalkEvaluator {
 
                 Ok(Value::Closure(Box::new(crate::value::ClosureData {
                     params: param_names,
-                    body: body.clone(),
+                    // P2-2: wrap once at closure construction; subsequent
+                    // `Value::Closure::clone()` only bumps the Arc.
+                    body: Arc::new(body.clone()),
                     captured_env,
                 })))
             }
