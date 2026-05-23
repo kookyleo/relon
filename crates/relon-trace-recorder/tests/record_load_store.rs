@@ -83,9 +83,10 @@ fn store_field_marks_recoverable_write() {
 }
 
 #[test]
-fn missing_base_uses_sentinel_and_skips_bounds_guard() {
+fn missing_base_uses_sentinel_and_skips_guard() {
     // LoadField with no inputs uses SsaVar::NONE as base; the recorder
-    // suppresses the BoundsCheck guard in that case.
+    // suppresses the NotNull guard in that case (no valid SSA id to
+    // gate against).
     let mut r = RecorderState::new();
     let _ = r.record_op(
         &Op::LoadField {
@@ -96,17 +97,12 @@ fn missing_base_uses_sentinel_and_skips_bounds_guard() {
         None,
     );
     let buf = r.finalize().unwrap();
-    let bounds = buf
+    let not_null = buf
         .ops
         .iter()
-        .filter(|o| {
-            matches!(
-                o,
-                TraceOp::Guard(relon_trace_jit::GuardKind::BoundsCheck(_, _), _)
-            )
-        })
+        .filter(|o| matches!(o, TraceOp::Guard(relon_trace_jit::GuardKind::NotNull(_), _)))
         .count();
-    assert_eq!(bounds, 0);
+    assert_eq!(not_null, 0);
 }
 
 #[test]

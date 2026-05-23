@@ -1157,13 +1157,6 @@ impl RecorderState {
     }
 
     fn emit_guard(&mut self, kind: GuardKind) -> Option<GuardKind> {
-        // BoundsCheck whose base equals SsaVar::NONE is a recorder
-        // sentinel — we never emit guards over invalid SSA ids.
-        if let GuardKind::BoundsCheck(v, _) = kind {
-            if v == SsaVar::NONE {
-                return None;
-            }
-        }
         let payload = match kind {
             GuardKind::TypeCheck(v, _)
             | GuardKind::NotNull(v)
@@ -1171,6 +1164,13 @@ impl RecorderState {
             | GuardKind::ArithOverflow(v)
             | GuardKind::IsZero(v) => v,
         };
+        // SsaVar::NONE is a recorder sentinel used when an input was
+        // unavailable (synthetic test buffer, dropped LoadField with
+        // no base). We never emit guards over invalid SSA ids — any
+        // guard kind reaching here with that payload short-circuits.
+        if payload == SsaVar::NONE {
+            return None;
+        }
         self.append_guard_with_site(kind, payload);
         Some(kind)
     }
