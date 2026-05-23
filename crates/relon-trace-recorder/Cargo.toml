@@ -21,3 +21,7 @@ relon-eval-api = { workspace = true }
 ordered-float = { workspace = true }
 # P2-15: FxHashMap for hot SsaVar lookups.
 rustc-hash = { workspace = true }
+# P2-14: ArrayVec for LowerOutcome::Emit guard lists. Cap=4 covers the
+# StrConcatN worst case (`MAX_INLINE_STR_CONCAT_N`) so the per-op
+# lowering pass stays alloc-free on the hot path.
+arrayvec = { workspace = true }

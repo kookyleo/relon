@@ -13,6 +13,7 @@
 //! backend keeps handling those ops on the cold path until a later
 //! v6-γ phase teaches the recorder how to trace through them.
 
+use arrayvec::ArrayVec;
 use ordered_float::OrderedFloat;
 use relon_ir::{EffectClass as IrEffect, IrType, Op};
 use relon_trace_jit::{
@@ -20,6 +21,32 @@ use relon_trace_jit::{
 };
 
 use crate::abort::AbortReason;
+
+/// P2-14: inline-capacity small-vec used for `LowerOutcome::Emit`'s
+/// `guards_before` / `guards_after` lists. Capped at 4 because the
+/// worst-case caller is [`lower_str_concat_n`] which emits one
+/// `GuardKind::NotNull` per operand and the recorder rejects
+/// `operand_count > MAX_INLINE_STR_CONCAT_N` (= 4). All other lowering
+/// rules emit at most 2 guards. Using a stack-resident ArrayVec drops
+/// the per-op `Vec::new` + drop pair the previous `Vec<GuardKind>`
+/// shape paid on the trace-recorder hot path.
+pub type GuardList = ArrayVec<GuardKind, 4>;
+
+/// Build a [`GuardList`] from a fixed-size array literal. Wrapper around
+/// `ArrayVec::from_iter` so the lowering rules can keep their concise
+/// `guards![g1, g2]` shorthand instead of pushing one by one.
+///
+/// Compile-time assertion via the array length keeps the call sites
+/// honest — passing more than 4 guards fails the [`ArrayVec::from_iter`]
+/// capacity check the same way `vec!` would have silently grown.
+macro_rules! guards {
+    () => {
+        $crate::lowering::GuardList::new()
+    };
+    ($($g:expr),+ $(,)?) => {
+        $crate::lowering::GuardList::from_iter([$($g),+])
+    };
+}
 
 /// F-D8-B: outcome variant the recorder uses to dispatch onto its
 /// dedicated [`crate::RecorderState::emit_list_get`] /
@@ -68,8 +95,10 @@ pub enum LowerOutcome {
     Emit {
         op: TraceOp,
         dst: Option<SsaVar>,
-        guards_before: Vec<GuardKind>,
-        guards_after: Vec<GuardKind>,
+        /// P2-14: inline ArrayVec (cap 4) to keep the per-op lowering
+        /// pass alloc-free on the trace-recorder hot path.
+        guards_before: GuardList,
+        guards_after: GuardList,
         /// Side-effect class to record on the buffer. Mirrors the
         /// op's `effect_class()` so the optimiser pipeline can apply
         /// reorder-barrier rules consistently.
@@ -196,15 +225,15 @@ pub fn lower_op(op: &Op, cx: OpLoweringContext<'_>) -> LowerOutcome {
         Op::ConstI32(v) => LowerOutcome::Emit {
             op: TraceOp::ConstI32(cx.fresh_dst, *v),
             dst: Some(cx.fresh_dst),
-            guards_before: vec![],
-            guards_after: vec![],
+            guards_before: guards![],
+            guards_after: guards![],
             effect: TraceEffect::Pure,
         },
         Op::ConstI64(v) => LowerOutcome::Emit {
             op: TraceOp::ConstI64(cx.fresh_dst, *v),
             dst: Some(cx.fresh_dst),
-            guards_before: vec![],
-            guards_after: vec![],
+            guards_before: guards![],
+            guards_after: guards![],
             effect: TraceEffect::Pure,
         },
         Op::ConstBool(v) => LowerOutcome::Emit {
@@ -213,8 +242,8 @@ pub fn lower_op(op: &Op, cx: OpLoweringContext<'_>) -> LowerOutcome {
             // representation.
             op: TraceOp::ConstI32(cx.fresh_dst, if *v { 1 } else { 0 }),
             dst: Some(cx.fresh_dst),
-            guards_before: vec![],
-            guards_after: vec![],
+            guards_before: guards![],
+            guards_after: guards![],
             effect: TraceEffect::Pure,
         },
         // F64 const is conservatively unsupported in the Phase-1
@@ -359,8 +388,8 @@ pub fn lower_op(op: &Op, cx: OpLoweringContext<'_>) -> LowerOutcome {
                 // The offset is bounded by the schema layout at IR
                 // construction time; the only runtime check needed
                 // is that `base` is non-null.
-                guards_before: vec![GuardKind::NotNull(base)],
-                guards_after: vec![GuardKind::TypeCheck(cx.fresh_dst, ty_to_observed(*ty))],
+                guards_before: guards![GuardKind::NotNull(base)],
+                guards_after: guards![GuardKind::TypeCheck(cx.fresh_dst, ty_to_observed(*ty))],
                 effect: TraceEffect::ReadOnly,
             }
         }
@@ -372,8 +401,8 @@ pub fn lower_op(op: &Op, cx: OpLoweringContext<'_>) -> LowerOutcome {
                 dst: None,
                 // Offset bounded at IR construction; only the
                 // non-null check matters at runtime.
-                guards_before: vec![GuardKind::NotNull(base)],
-                guards_after: vec![],
+                guards_before: guards![GuardKind::NotNull(base)],
+                guards_after: guards![],
                 effect: TraceEffect::RecoverableWrite,
             }
         }
@@ -392,8 +421,8 @@ pub fn lower_op(op: &Op, cx: OpLoweringContext<'_>) -> LowerOutcome {
                 // the *other* arm.
                 op: TraceOp::Guard(GuardKind::NotNull(var), var),
                 dst: None,
-                guards_before: vec![],
-                guards_after: vec![],
+                guards_before: guards![],
+                guards_after: guards![],
                 effect: TraceEffect::Pure,
             }
         }
@@ -443,8 +472,8 @@ pub fn lower_op(op: &Op, cx: OpLoweringContext<'_>) -> LowerOutcome {
                 LowerOutcome::Emit {
                     op: TraceOp::Call(cx.fresh_dst, FuncId(*fn_index), cx.inputs.to_vec(), effect),
                     dst: Some(cx.fresh_dst),
-                    guards_before: vec![],
-                    guards_after: vec![],
+                    guards_before: guards![],
+                    guards_after: guards![],
                     effect,
                 }
             }
@@ -596,8 +625,8 @@ fn lower_string_call(fn_index: u32, cx: &OpLoweringContext<'_>) -> Option<LowerO
                 // guards against null, but emitting the guard here
                 // surfaces a clear deopt cause to the rest of the
                 // pipeline.
-                guards_before: vec![GuardKind::NotNull(lhs), GuardKind::NotNull(rhs)],
-                guards_after: vec![],
+                guards_before: guards![GuardKind::NotNull(lhs), GuardKind::NotNull(rhs)],
+                guards_after: guards![],
                 effect: TraceEffect::Pure,
             })
         }
@@ -622,8 +651,8 @@ fn lower_string_call(fn_index: u32, cx: &OpLoweringContext<'_>) -> Option<LowerO
                 // SSA as a stand-in for the length — the emitter's
                 // bounds-check predicate reads the StringRef's len
                 // field at runtime.
-                guards_before: vec![GuardKind::NotNull(s)],
-                guards_after: vec![],
+                guards_before: guards![GuardKind::NotNull(s)],
+                guards_after: guards![],
                 effect: TraceEffect::Pure,
             })
         }
@@ -652,8 +681,8 @@ fn lower_string_call(fn_index: u32, cx: &OpLoweringContext<'_>) -> Option<LowerO
             Some(LowerOutcome::Emit {
                 op: TraceOp::StrContains(cx.fresh_dst, haystack, needle),
                 dst: Some(cx.fresh_dst),
-                guards_before: vec![GuardKind::NotNull(haystack)],
-                guards_after: vec![],
+                guards_before: guards![GuardKind::NotNull(haystack)],
+                guards_after: guards![],
                 effect: TraceEffect::Pure,
             })
         }
@@ -679,8 +708,8 @@ fn lower_string_call(fn_index: u32, cx: &OpLoweringContext<'_>) -> Option<LowerO
                 // stale arena reference. Pattern null-ness is rarer in
                 // recorded surfaces; we leave it to the helper's own
                 // null check (matches `StrContains`'s asymmetry).
-                guards_before: vec![GuardKind::NotNull(s)],
-                guards_after: vec![],
+                guards_before: guards![GuardKind::NotNull(s)],
+                guards_after: guards![],
                 effect: TraceEffect::Pure,
             })
         }
@@ -743,10 +772,11 @@ fn lower_str_concat_n(cx: OpLoweringContext<'_>, operand_count: u32) -> LowerOut
     // emitter's per-operand memcpy loop walking left-to-right through
     // the source-level chain.
     let operands: Vec<SsaVar> = cx.inputs[..n].iter().rev().copied().collect();
-    let guards_before = operands
-        .iter()
-        .map(|s| GuardKind::NotNull(*s))
-        .collect::<Vec<_>>();
+    // P2-14: cap=4 GuardList — safe because `operand_count` is bounded
+    // above by `MAX_INLINE_STR_CONCAT_N` (= 4) by the early-return
+    // check, so the per-operand NotNull guard fan-out never exceeds the
+    // ArrayVec capacity.
+    let guards_before: GuardList = operands.iter().map(|s| GuardKind::NotNull(*s)).collect();
     LowerOutcome::Emit {
         op: TraceOp::StrConcatN {
             dst: cx.fresh_dst,
@@ -754,7 +784,7 @@ fn lower_str_concat_n(cx: OpLoweringContext<'_>, operand_count: u32) -> LowerOut
         },
         dst: Some(cx.fresh_dst),
         guards_before,
-        guards_after: vec![],
+        guards_after: guards![],
         effect: TraceEffect::Pure,
     }
 }
@@ -776,8 +806,8 @@ fn lower_str_add(cx: OpLoweringContext<'_>) -> LowerOutcome {
     LowerOutcome::Emit {
         op: TraceOp::StrConcat(cx.fresh_dst, lhs, rhs),
         dst: Some(cx.fresh_dst),
-        guards_before: vec![GuardKind::NotNull(lhs), GuardKind::NotNull(rhs)],
-        guards_after: vec![],
+        guards_before: guards![GuardKind::NotNull(lhs), GuardKind::NotNull(rhs)],
+        guards_after: guards![],
         effect: TraceEffect::Pure,
     }
 }
@@ -846,11 +876,12 @@ fn binary_arith(cx: OpLoweringContext<'_>, ty: IrType, kind: BinaryArith) -> Low
             Some(GuardKind::ArithOverflow(cx.fresh_dst)),
         ),
     };
+    let guards_after: GuardList = guard_after.into_iter().collect();
     LowerOutcome::Emit {
         op,
         dst: Some(cx.fresh_dst),
-        guards_before: vec![],
-        guards_after: guard_after.into_iter().collect(),
+        guards_before: guards![],
+        guards_after,
         effect,
     }
 }
@@ -864,8 +895,8 @@ fn binary_cmp(cx: OpLoweringContext<'_>, _ty: IrType, kind: CmpKind) -> LowerOut
     LowerOutcome::Emit {
         op: TraceOp::Cmp(kind, cx.fresh_dst, lhs, rhs),
         dst: Some(cx.fresh_dst),
-        guards_before: vec![],
-        guards_after: vec![],
+        guards_before: guards![],
+        guards_after: guards![],
         effect: TraceEffect::Pure,
     }
 }

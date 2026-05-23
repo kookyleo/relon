@@ -41,6 +41,12 @@ hex = "0.4"
 # the trace-record / trace-install paths. Serde wire format is
 # unchanged (HashMap serialises as a sequence; the hasher is internal).
 rustc-hash = "1.1"
+# P2-14: ArrayVec for inline small-vec storage on the trace-recorder
+# lowering hot path. `LowerOutcome::Emit` carries guards_before /
+# guards_after with at most 4 entries (StrConcatN cap), so a stack-
+# resident ArrayVec eliminates the per-op heap allocation the previous
+# `Vec<GuardKind>` shape paid.
+arrayvec = "0.7"
 
 # Internal crates declared with both `path` and `version` so each can
 # be published to crates.io independently while local builds keep
