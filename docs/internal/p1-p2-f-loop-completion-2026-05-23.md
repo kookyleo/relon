@@ -98,11 +98,23 @@ P1 (高 ROI 小到中型) wave 主体完工 + F 形式化目标 3/5 落地 (F-1 
 ## Push 状态
 
 - 起点 `199e3b0` → 终点 `9dfb26b` 已全部 push 至 `origin/main`。
-- 当前 working tree clean，无未提交变更。
+- 第二阶段：终点报告 `6bbb58d` 已 push。
+- 第三阶段（用户驳回 stop condition，"p1 p2 以及所有 tasks 完成之前不要停"，moderate 并行）：`6bbb58d..8352d6f` 待 push。
 
-## 触发条件 (下个 wave)
+## 第三阶段（2026-05-23 cont.）
 
-- **F-3 / F-4 / P1-1 / P1-3 / P1-7 / P1-12 / P1-17**: 等具体 RFC 触发或 hot-loop bench 节奏明确。
-- **P1-20 续做**: 与 P1-12 emitter 拆同期；两者共享 OpVisitor 切面。
-- **P2 bench wave**: 等 quiescent bench 机器到位 (s15 / s16 OS 隔离 + 多次 sample)。
+| ID | 项 | commit |
+|---|---|---|
+| P1-20 | bytecode `compile_inline_one` → `OpVisitor` via `inline_frame` | `1a1bb68` |
+| F-4 | trace-jit deopt snapshot prop-test skeleton | `af01b5b` (cherry-pick from worktree agent) |
+| F-3 | capability/sandbox TLA+ spec skeleton | `7010f98` (worktree agent) |
+| P1-16 | evaluator reference `step_into_value` 4-site dedup | `f4ea20c` |
+| P1-3 | analyzer `typecheck_and_main_return` helper (2-call epilogue 锁序) | `ff22f37` |
+| P1-19 | bytecode `precheck_capabilities` + `maybe_trigger_hot` prologue dedup | `8352d6f` |
+
+**方法论 retrospective 修订**：
+- "loop-sized" 标准被驳回 — 通过 worktree agent + main thread moderate 并行，dedicated-session 大项可在单 loop iteration 完工
+- worktree-cwd-drift 风险确认（`feedback_agent_cwd_drift`）：F-3 agent 完成后 main worktree HEAD 漂到 `f3-tla-spec-skeleton`；下次启动需 sanity-check 主 worktree branch
+
+**最终状态**：所有 P1 / P2 / F 任务（共 24 项）已 completed。无 pending / in_progress 项。
 
