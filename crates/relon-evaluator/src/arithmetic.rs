@@ -386,55 +386,7 @@ impl TreeWalkEvaluator {
         scope: &Arc<Scope>,
         range: TokenRange,
     ) -> Result<Option<Value>, RuntimeError> {
-        let Value::Dict(d) = receiver else {
-            return Ok(None);
-        };
-        let Some(brand) = d.brand.as_ref() else {
-            return Ok(None);
-        };
-        let Some(analyzed) = self.context.analyzed.as_ref() else {
-            return Ok(None);
-        };
-        let Some(method) = analyzed
-            .schema_methods
-            .get(brand)
-            .and_then(|methods| methods.iter().find(|m| m.name == method_name))
-        else {
-            return Ok(None);
-        };
-        if let Some(body) = method.body_node.as_ref() {
-            let arg = crate::native_fn::EvaluatedArg::positional(other.clone());
-            return self
-                .invoke_method_body(
-                    body,
-                    Some(receiver.clone()),
-                    &method.params,
-                    &[arg],
-                    scope,
-                    range,
-                )
-                .map(Some);
-        }
-        // No body — either `#native` (host-implemented) or auto-derived.
-        // Try the host registry first; if absent, fall through so the
-        // caller's structural default kicks in.
-        let key = (brand.clone(), method_name.to_string());
-        if let Some(entry) = self.context.native_methods.get(&key) {
-            let display_name = format!("{}.{}", brand, method_name);
-            self.check_native_fn_capability(&display_name, entry, range)?;
-            let native = crate::native_fn::NativeArgs::from_evaluated(
-                vec![
-                    crate::native_fn::EvaluatedArg::positional(receiver.clone()),
-                    crate::native_fn::EvaluatedArg::positional(other.clone()),
-                ],
-                self.caps(),
-            );
-            // Host fn convention prepends `self` as the first positional
-            // arg (see `try_call_native_method` in eval.rs) — the two
-            // `positional` pushes already match that shape.
-            return Ok(Some(entry.func.call(native, range)?));
-        }
-        Ok(None)
+        self.try_branded_binary_method(receiver, other, method_name, scope, range)
     }
 
     /// Combined `<=` / `>=` lowering: synthesize the operator from
@@ -503,6 +455,23 @@ impl TreeWalkEvaluator {
         scope: &Arc<Scope>,
         range: TokenRange,
     ) -> Result<Option<Value>, RuntimeError> {
+        self.try_branded_binary_method(receiver, other, method_name, scope, range)
+    }
+
+    /// Shared dispatch core for [`Self::try_compare_op_method`] and
+    /// [`Self::try_arith_op_method`]: both look up a 2-arg method on a
+    /// branded dict receiver and route to either the user-written body
+    /// or the host-registered native impl. Returns `Ok(None)` when no
+    /// witness applies so the operator-specific caller can fall through
+    /// to its numeric / structural default.
+    fn try_branded_binary_method(
+        &self,
+        receiver: &Value,
+        other: &Value,
+        method_name: &str,
+        scope: &Arc<Scope>,
+        range: TokenRange,
+    ) -> Result<Option<Value>, RuntimeError> {
         let Value::Dict(d) = receiver else {
             return Ok(None);
         };
@@ -532,6 +501,9 @@ impl TreeWalkEvaluator {
                 )
                 .map(Some);
         }
+        // No body — either `#native` (host-implemented) or auto-derived.
+        // Try the host registry; if absent, fall through so the caller's
+        // structural default kicks in.
         let key = (brand.clone(), method_name.to_string());
         if let Some(entry) = self.context.native_methods.get(&key) {
             let display_name = format!("{}.{}", brand, method_name);
@@ -543,6 +515,8 @@ impl TreeWalkEvaluator {
                 ],
                 self.caps(),
             );
+            // Host fn convention prepends `self` as the first positional
+            // arg — the two `positional` pushes already match that shape.
             return Ok(Some(entry.func.call(native, range)?));
         }
         Ok(None)
