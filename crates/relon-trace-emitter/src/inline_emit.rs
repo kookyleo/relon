@@ -51,22 +51,28 @@
 //! that in cranelift 0.131. Instead `inline_emit` is a focused
 //! re-implementation of the per-op lowering against an arbitrary
 //! [`FunctionBuilder`], no entry block / ABI param creation, no
-//! `return`. The lowering rules themselves are line-for-line copies
-//! of `crate::emitter::TraceEmitterState`'s; keeping them in sync is
-//! a sync-check on a stage commit (see the smoke test
-//! `inline_matches_standalone_result` in
-//! `crates/relon-codegen-native/tests/trace_jit_inline_smoke.rs`).
+//! `return`. The genuinely identical per-op lowering rules
+//! (`Add`/`Sub`/`Mul`/`Div`/`Cmp`/`Load`/`Store`/`Const*`/`LocalGet`)
+//! live in [`crate::op_lower`] and both paths drive them through the
+//! [`crate::op_lower::OpLowerer`] trait; only the divergent ops
+//! (`Return`, `MarkLoopHead`, `Mod`, host-helper calls) keep per-path
+//! impls. Cross-path equivalence on the shared lowering still has its
+//! runtime smoke test `inline_matches_standalone_result` in
+//! `crates/relon-codegen-native/tests/trace_jit_inline_smoke.rs`.
 
 use rustc_hash::FxHashMap;
 
-use cranelift_codegen::ir::condcodes::IntCC;
-use cranelift_codegen::ir::types::{I32, I64};
+use cranelift_codegen::ir::types::I64;
 use cranelift_codegen::ir::{self, BlockArg, InstBuilder, MemFlags};
 use cranelift_frontend::FunctionBuilder;
 
 use relon_trace_jit::{EffectClass, GuardSite, OptimizedTrace, SsaVar, TraceOp};
 
 use crate::guard_emit::{emit_guard, GuardEmitCtx, GuardEmitError};
+use crate::op_lower::{
+    lower_binop_i64, lower_cmp, lower_const_i32, lower_const_i64, lower_div, lower_load,
+    lower_local_get, lower_mod_plain, lower_store, widen_to_i64, BinOp, OpLowerer,
+};
 
 /// Maximum number of [`TraceOp`]s an inlined trace may contain. Above
 /// this threshold the host fn falls back to the regular trampoline
@@ -148,6 +154,12 @@ impl std::fmt::Display for InlineEmitError {
 }
 
 impl std::error::Error for InlineEmitError {}
+
+impl From<GuardEmitError> for InlineEmitError {
+    fn from(e: GuardEmitError) -> Self {
+        InlineEmitError::Guard(e)
+    }
+}
 
 /// External handles the host fn must supply when inlining a trace.
 ///
@@ -251,6 +263,41 @@ struct InlineEmitterState<'a, 'b> {
     saw_return: bool,
 }
 
+impl OpLowerer for InlineEmitterState<'_, '_> {
+    type Err = InlineEmitError;
+
+    fn with_builder<R>(&mut self, cb: impl FnOnce(&mut FunctionBuilder<'_>) -> R) -> R {
+        cb(self.builder)
+    }
+
+    fn pointer_ty(&self) -> ir::Type {
+        self.pointer_ty
+    }
+
+    fn deopt_block(&self) -> ir::Block {
+        self.deopt_block
+    }
+
+    fn input_args_ptr(&self) -> ir::Value {
+        self.input_args_ptr
+    }
+
+    fn lookup(&self, var: SsaVar) -> Result<ir::Value, InlineEmitError> {
+        self.ssa_to_value
+            .get(&var)
+            .copied()
+            .ok_or(InlineEmitError::UnboundSsa(var))
+    }
+
+    fn bind(&mut self, var: SsaVar, v: ir::Value) {
+        self.ssa_to_value.insert(var, v);
+    }
+
+    fn record_overflow_bit(&mut self, dst: SsaVar, bit: ir::Value) {
+        self.overflow_bits.insert(dst, bit);
+    }
+}
+
 impl<'a, 'b> InlineEmitterState<'a, 'b> {
     fn emit_op(
         &mut self,
@@ -258,17 +305,17 @@ impl<'a, 'b> InlineEmitterState<'a, 'b> {
         guard_site: Option<&GuardSite>,
     ) -> Result<(), InlineEmitError> {
         match op {
-            TraceOp::Add(dst, a, b) => self.emit_binop_i64(*dst, *a, *b, BinOp::Add),
-            TraceOp::Sub(dst, a, b) => self.emit_binop_i64(*dst, *a, *b, BinOp::Sub),
-            TraceOp::Mul(dst, a, b) => self.emit_binop_i64(*dst, *a, *b, BinOp::Mul),
-            TraceOp::Div(dst, a, b) => self.emit_div(*dst, *a, *b),
-            TraceOp::Mod(dst, a, b) => self.emit_mod(*dst, *a, *b),
-            TraceOp::Cmp(kind, dst, a, b) => self.emit_cmp(*kind, *dst, *a, *b),
-            TraceOp::Load(dst, base, off) => self.emit_load(*dst, *base, off.0),
-            TraceOp::Store(base, off, src) => self.emit_store(*base, off.0, *src),
-            TraceOp::ConstI32(dst, v) => self.emit_const_i32(*dst, *v),
-            TraceOp::ConstI64(dst, v) => self.emit_const_i64(*dst, *v),
-            TraceOp::LocalGet(dst, slot_idx) => self.emit_local_get(*dst, *slot_idx),
+            TraceOp::Add(dst, a, b) => lower_binop_i64(self, *dst, *a, *b, BinOp::Add),
+            TraceOp::Sub(dst, a, b) => lower_binop_i64(self, *dst, *a, *b, BinOp::Sub),
+            TraceOp::Mul(dst, a, b) => lower_binop_i64(self, *dst, *a, *b, BinOp::Mul),
+            TraceOp::Div(dst, a, b) => lower_div(self, *dst, *a, *b),
+            TraceOp::Mod(dst, a, b) => lower_mod_plain(self, *dst, *a, *b),
+            TraceOp::Cmp(kind, dst, a, b) => lower_cmp(self, *kind, *dst, *a, *b),
+            TraceOp::Load(dst, base, off) => lower_load(self, *dst, *base, off.0),
+            TraceOp::Store(base, off, src) => lower_store(self, *base, off.0, *src),
+            TraceOp::ConstI32(dst, v) => lower_const_i32(self, *dst, *v),
+            TraceOp::ConstI64(dst, v) => lower_const_i64(self, *dst, *v),
+            TraceOp::LocalGet(dst, slot_idx) => lower_local_get(self, *dst, *slot_idx),
             TraceOp::Guard(_, _) => self.emit_guard_op(guard_site),
             TraceOp::Call(_, _, _, effect) => {
                 if matches!(effect, EffectClass::Unrecoverable) {
@@ -328,178 +375,6 @@ impl<'a, 'b> InlineEmitterState<'a, 'b> {
         }
     }
 
-    fn emit_binop_i64(
-        &mut self,
-        dst: SsaVar,
-        a: SsaVar,
-        b: SsaVar,
-        op: BinOp,
-    ) -> Result<(), InlineEmitError> {
-        let va = self.lookup(a)?;
-        let vb = self.lookup(b)?;
-        let widened_a = self.widen_to_i64(va);
-        let widened_b = self.widen_to_i64(vb);
-        let (r, of) = match op {
-            BinOp::Add => self.builder.ins().sadd_overflow(widened_a, widened_b),
-            BinOp::Sub => self.builder.ins().ssub_overflow(widened_a, widened_b),
-            BinOp::Mul => self.builder.ins().smul_overflow(widened_a, widened_b),
-        };
-        self.bind(dst, r);
-        self.overflow_bits.insert(dst, of);
-        Ok(())
-    }
-
-    fn emit_div(&mut self, dst: SsaVar, a: SsaVar, b: SsaVar) -> Result<(), InlineEmitError> {
-        let va = self.lookup(a)?;
-        let vb = self.lookup(b)?;
-        let zero = self.builder.ins().iconst(I64, 0);
-        let nonzero = self.builder.ins().icmp(IntCC::NotEqual, vb, zero);
-        let ok_block = self.builder.create_block();
-        let guard_pc = self.builder.ins().iconst(I32, 0);
-        let external_pc = self.builder.ins().iconst(I64, 0);
-        self.builder.ins().brif(
-            nonzero,
-            ok_block,
-            &[],
-            self.deopt_block,
-            &[BlockArg::Value(guard_pc), BlockArg::Value(external_pc)],
-        );
-        self.builder.seal_block(ok_block);
-        self.builder.switch_to_block(ok_block);
-        let r = self.builder.ins().sdiv(va, vb);
-        self.bind(dst, r);
-        Ok(())
-    }
-
-    /// F-D8-E.1: `Mod` mirrors `emit_div` — divisor-zero pre-check
-    /// then `i64::MIN srem -1` pre-check, then `srem`. Signed remainder,
-    /// matches Relon `Int` semantics.
-    ///
-    /// Both pre-checks are required: without the MIN/-1 guard `srem`
-    /// would execute UB. Without seeding `overflow_bits` here the
-    /// recorder's `Guard(ArithOverflow(dst))` would fall through to
-    /// the constant-0 predicate the fallback uses for I64 observed
-    /// types, forcing ordinary inputs like `47 % 10` to deopt on every
-    /// iter. The const-0 seed below is the correct value: the two
-    /// pre-checks above prove `srem` runs only on safe input, so the
-    /// guard truly cannot overflow.
-    fn emit_mod(&mut self, dst: SsaVar, a: SsaVar, b: SsaVar) -> Result<(), InlineEmitError> {
-        let va = self.lookup(a)?;
-        let vb = self.lookup(b)?;
-
-        // (1) Divisor-zero.
-        let zero = self.builder.ins().iconst(I64, 0);
-        let nonzero = self.builder.ins().icmp(IntCC::NotEqual, vb, zero);
-        let nonzero_block = self.builder.create_block();
-        let guard_pc = self.builder.ins().iconst(I32, 0);
-        let external_pc = self.builder.ins().iconst(I64, 0);
-        self.builder.ins().brif(
-            nonzero,
-            nonzero_block,
-            &[],
-            self.deopt_block,
-            &[BlockArg::Value(guard_pc), BlockArg::Value(external_pc)],
-        );
-        self.builder.seal_block(nonzero_block);
-        self.builder.switch_to_block(nonzero_block);
-
-        // (2) i64::MIN % -1 (the lone `srem` overflow case).
-        let min_v = self.builder.ins().iconst(I64, i64::MIN);
-        let neg_one = self.builder.ins().iconst(I64, -1);
-        let lhs_is_min = self.builder.ins().icmp(IntCC::Equal, va, min_v);
-        let rhs_is_neg_one = self.builder.ins().icmp(IntCC::Equal, vb, neg_one);
-        let overflows = self.builder.ins().band(lhs_is_min, rhs_is_neg_one);
-        let safe_block = self.builder.create_block();
-        let of_guard_pc = self.builder.ins().iconst(I32, 0);
-        let of_external_pc = self.builder.ins().iconst(I64, 0);
-        self.builder.ins().brif(
-            overflows,
-            self.deopt_block,
-            &[
-                BlockArg::Value(of_guard_pc),
-                BlockArg::Value(of_external_pc),
-            ],
-            safe_block,
-            &[],
-        );
-        self.builder.seal_block(safe_block);
-        self.builder.switch_to_block(safe_block);
-
-        let r = self.builder.ins().srem(va, vb);
-        self.bind(dst, r);
-        // Seed `overflow_bits` — the two pre-checks guarantee no
-        // overflow can reach the `Guard(ArithOverflow(dst))` predicate.
-        let of_bit = self.builder.ins().iconst(I32, 0);
-        self.overflow_bits.insert(dst, of_bit);
-        Ok(())
-    }
-
-    fn emit_cmp(
-        &mut self,
-        kind: relon_trace_jit::CmpKind,
-        dst: SsaVar,
-        a: SsaVar,
-        b: SsaVar,
-    ) -> Result<(), InlineEmitError> {
-        let va = self.lookup(a)?;
-        let vb = self.lookup(b)?;
-        let cc = match kind {
-            relon_trace_jit::CmpKind::Eq => IntCC::Equal,
-            relon_trace_jit::CmpKind::Ne => IntCC::NotEqual,
-            relon_trace_jit::CmpKind::Lt => IntCC::SignedLessThan,
-            relon_trace_jit::CmpKind::Le => IntCC::SignedLessThanOrEqual,
-            relon_trace_jit::CmpKind::Gt => IntCC::SignedGreaterThan,
-            relon_trace_jit::CmpKind::Ge => IntCC::SignedGreaterThanOrEqual,
-        };
-        let bit = self.builder.ins().icmp(cc, va, vb);
-        let widened = self.builder.ins().uextend(I32, bit);
-        self.bind(dst, widened);
-        Ok(())
-    }
-
-    fn emit_load(&mut self, dst: SsaVar, base: SsaVar, off: i32) -> Result<(), InlineEmitError> {
-        let base_v = self.lookup(base)?;
-        let r = self
-            .builder
-            .ins()
-            .load(I64, MemFlags::trusted(), base_v, off);
-        self.bind(dst, r);
-        Ok(())
-    }
-
-    fn emit_store(&mut self, base: SsaVar, off: i32, src: SsaVar) -> Result<(), InlineEmitError> {
-        let base_v = self.lookup(base)?;
-        let src_v = self.lookup(src)?;
-        let src_v = self.widen_to_i64(src_v);
-        self.builder
-            .ins()
-            .store(MemFlags::trusted(), src_v, base_v, off);
-        Ok(())
-    }
-
-    fn emit_const_i32(&mut self, dst: SsaVar, v: i32) -> Result<(), InlineEmitError> {
-        let val = self.builder.ins().iconst(I32, i64::from(v));
-        self.bind(dst, val);
-        Ok(())
-    }
-
-    fn emit_const_i64(&mut self, dst: SsaVar, v: i64) -> Result<(), InlineEmitError> {
-        let val = self.builder.ins().iconst(I64, v);
-        self.bind(dst, val);
-        Ok(())
-    }
-
-    fn emit_local_get(&mut self, dst: SsaVar, slot_idx: u32) -> Result<(), InlineEmitError> {
-        let off = (slot_idx as i64).wrapping_mul(8);
-        let off_i32 = i32::try_from(off).unwrap_or(0);
-        let v = self
-            .builder
-            .ins()
-            .load(I64, MemFlags::trusted(), self.input_args_ptr, off_i32);
-        self.bind(dst, v);
-        Ok(())
-    }
-
     fn emit_guard_op(&mut self, guard_site: Option<&GuardSite>) -> Result<(), InlineEmitError> {
         let site = guard_site.ok_or(InlineEmitError::OrphanGuardOp)?;
         let mut gctx = GuardEmitCtx {
@@ -514,7 +389,7 @@ impl<'a, 'b> InlineEmitterState<'a, 'b> {
 
     fn emit_return(&mut self, var: SsaVar) -> Result<(), InlineEmitError> {
         let v = self.lookup(var)?;
-        let v = self.widen_to_i64(v);
+        let v = widen_to_i64(self, v);
         // Legacy compat: keep writing the value into `ctx.result_slot`
         // so any host code that reads it (telemetry, deopt fallback)
         // still observes the canonical location. Cranelift's later
@@ -551,7 +426,7 @@ impl<'a, 'b> InlineEmitterState<'a, 'b> {
         let mut init_vals: Vec<ir::Value> = Vec::with_capacity(phis.len());
         for phi in phis {
             let v = self.lookup(phi.init)?;
-            let widened = self.widen_to_i64(v);
+            let widened = widen_to_i64(self, v);
             init_vals.push(widened);
         }
         for phi in phis {
@@ -578,7 +453,7 @@ impl<'a, 'b> InlineEmitterState<'a, 'b> {
         let mut args_vals: Vec<ir::Value> = Vec::with_capacity(next_values.len());
         for v in next_values {
             let val = self.lookup(*v)?;
-            let widened = self.widen_to_i64(val);
+            let widened = widen_to_i64(self, val);
             args_vals.push(widened);
         }
         let args: Vec<BlockArg> = args_vals.iter().map(|v| BlockArg::Value(*v)).collect();
@@ -589,41 +464,12 @@ impl<'a, 'b> InlineEmitterState<'a, 'b> {
         self.builder.switch_to_block(after);
         Ok(())
     }
-
-    fn lookup(&self, var: SsaVar) -> Result<ir::Value, InlineEmitError> {
-        self.ssa_to_value
-            .get(&var)
-            .copied()
-            .ok_or(InlineEmitError::UnboundSsa(var))
-    }
-
-    fn bind(&mut self, var: SsaVar, v: ir::Value) {
-        self.ssa_to_value.insert(var, v);
-    }
-
-    fn widen_to_i64(&mut self, v: ir::Value) -> ir::Value {
-        let ty = self.builder.func.dfg.value_type(v);
-        if ty == I64 {
-            v
-        } else if ty == I32 {
-            self.builder.ins().uextend(I64, v)
-        } else {
-            v
-        }
-    }
-}
-
-/// Internal binary-op tag; not part of the public API.
-#[derive(Debug, Clone, Copy)]
-enum BinOp {
-    Add,
-    Sub,
-    Mul,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cranelift_codegen::ir::types::I32;
     use cranelift_codegen::ir::{Function, UserFuncName};
     use cranelift_codegen::isa::CallConv;
     use cranelift_codegen::settings;

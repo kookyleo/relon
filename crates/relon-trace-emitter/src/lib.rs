@@ -33,12 +33,22 @@
 //! ## inline_emit / emitter sync
 //!
 //! [`emitter::TraceEmitter`] (standalone trampoline entry) and
-//! [`inline_emit::emit_trace_inline`] (at-call-site embed) carry
-//! line-for-line copies of the per-op lowering rules. The sync
-//! invariant is: every `TraceOp` variant matched in one emit path's
-//! `emit_op` MUST also be matched in the other — as a real helper
-//! call OR an explicit `Err(InlineEmitError::CallNotSupportedInInline)`
-//! route. Adding a new op means touching both files.
+//! [`inline_emit::emit_trace_inline`] (at-call-site embed) historically
+//! carried line-for-line copies of the per-op lowering rules. P1-12
+//! collapsed the genuinely identical helpers (`Add`/`Sub`/`Mul`/`Div`/
+//! `Cmp`/`Load`/`Store`/`Const*`/`LocalGet`) into [`op_lower`], so both
+//! emit paths now drive the shared lowering via the
+//! [`op_lower::OpLowerer`] trait. Divergent ops — `Return`,
+//! `MarkLoopHead`/`MarkLoopBack`, `Mod` (the standalone path has
+//! magic-mod + preheader-hoist), and the str / dict / list / Call host
+//! helpers (standalone-only; the inline path returns
+//! `CallNotSupportedInInline`) — stay per-path.
+//!
+//! The sync invariant is still: every `TraceOp` variant matched in one
+//! emit path's `emit_op` MUST also be matched in the other — as a real
+//! helper call (potentially the same `lower_*` free function) OR an
+//! explicit `Err(InlineEmitError::CallNotSupportedInInline)` route.
+//! Adding a new op means touching both files.
 //!
 //! Guards:
 //!
@@ -59,6 +69,7 @@ pub mod dict_inline;
 pub mod emitter;
 pub mod guard_emit;
 pub mod inline_emit;
+pub mod op_lower;
 pub mod str_inline;
 
 pub use abi::{

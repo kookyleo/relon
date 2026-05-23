@@ -43,6 +43,10 @@ use relon_trace_jit::{EffectClass, GuardSite, OptimizedTrace, SsaVar, TraceConst
 
 use crate::abi::{AbiSignatureExt, HostHookId, TraceEntryStatus, TRACE_ENTRY_SIG};
 use crate::guard_emit::{emit_guard, GuardEmitCtx, GuardEmitError};
+use crate::op_lower::{
+    lower_binop_i64, lower_cmp, lower_const_i32, lower_const_i64, lower_div, lower_load,
+    lower_local_get, lower_store, widen_to_i64, BinOp, OpLowerer,
+};
 
 /// Override table for [`HostHookId`] → cranelift `UserExternalName.index`.
 ///
@@ -641,20 +645,55 @@ struct TraceEmitterState<'a, 'b> {
     saw_return: bool,
 }
 
+impl OpLowerer for TraceEmitterState<'_, '_> {
+    type Err = EmitError;
+
+    fn with_builder<R>(&mut self, cb: impl FnOnce(&mut FunctionBuilder<'_>) -> R) -> R {
+        cb(self.builder)
+    }
+
+    fn pointer_ty(&self) -> ir::Type {
+        self.pointer_ty
+    }
+
+    fn deopt_block(&self) -> ir::Block {
+        self.deopt_block
+    }
+
+    fn input_args_ptr(&self) -> ir::Value {
+        self.input_args_ptr
+    }
+
+    fn lookup(&self, var: SsaVar) -> Result<ir::Value, EmitError> {
+        self.ssa_to_value
+            .get(&var)
+            .copied()
+            .ok_or(EmitError::UnboundSsa(var))
+    }
+
+    fn bind(&mut self, var: SsaVar, v: ir::Value) {
+        self.ssa_to_value.insert(var, v);
+    }
+
+    fn record_overflow_bit(&mut self, dst: SsaVar, bit: ir::Value) {
+        self.overflow_bits.insert(dst, bit);
+    }
+}
+
 impl<'a, 'b> TraceEmitterState<'a, 'b> {
     fn emit_op(&mut self, op: &TraceOp, guard_site: Option<&GuardSite>) -> Result<(), EmitError> {
         match op {
-            TraceOp::Add(dst, a, b) => self.emit_binop_i64(*dst, *a, *b, BinOp::Add),
-            TraceOp::Sub(dst, a, b) => self.emit_binop_i64(*dst, *a, *b, BinOp::Sub),
-            TraceOp::Mul(dst, a, b) => self.emit_binop_i64(*dst, *a, *b, BinOp::Mul),
-            TraceOp::Div(dst, a, b) => self.emit_div(*dst, *a, *b),
+            TraceOp::Add(dst, a, b) => lower_binop_i64(self, *dst, *a, *b, BinOp::Add),
+            TraceOp::Sub(dst, a, b) => lower_binop_i64(self, *dst, *a, *b, BinOp::Sub),
+            TraceOp::Mul(dst, a, b) => lower_binop_i64(self, *dst, *a, *b, BinOp::Mul),
+            TraceOp::Div(dst, a, b) => lower_div(self, *dst, *a, *b),
             TraceOp::Mod(dst, a, b) => self.emit_mod(*dst, *a, *b),
-            TraceOp::Cmp(kind, dst, a, b) => self.emit_cmp(*kind, *dst, *a, *b),
-            TraceOp::Load(dst, base, off) => self.emit_load(*dst, *base, off.0),
-            TraceOp::Store(base, off, src) => self.emit_store(*base, off.0, *src),
-            TraceOp::ConstI32(dst, v) => self.emit_const_i32(*dst, *v),
-            TraceOp::ConstI64(dst, v) => self.emit_const_i64(*dst, *v),
-            TraceOp::LocalGet(dst, slot_idx) => self.emit_local_get(*dst, *slot_idx),
+            TraceOp::Cmp(kind, dst, a, b) => lower_cmp(self, *kind, *dst, *a, *b),
+            TraceOp::Load(dst, base, off) => lower_load(self, *dst, *base, off.0),
+            TraceOp::Store(base, off, src) => lower_store(self, *base, off.0, *src),
+            TraceOp::ConstI32(dst, v) => lower_const_i32(self, *dst, *v),
+            TraceOp::ConstI64(dst, v) => lower_const_i64(self, *dst, *v),
+            TraceOp::LocalGet(dst, slot_idx) => lower_local_get(self, *dst, *slot_idx),
             TraceOp::Guard(_, _) => self.emit_guard_op(guard_site),
             TraceOp::Call(dst, func_id, args, effect) => {
                 self.emit_call(*dst, func_id.0, args, *effect)
@@ -692,88 +731,6 @@ impl<'a, 'b> TraceEmitterState<'a, 'b> {
                 key_ptr,
             } => self.emit_dict_lookup_prechecked(*dst, *dict_ptr, *key_ptr),
         }
-    }
-
-    fn emit_binop_i64(
-        &mut self,
-        dst: SsaVar,
-        a: SsaVar,
-        b: SsaVar,
-        op: BinOp,
-    ) -> Result<(), EmitError> {
-        let va = self.lookup(a)?;
-        let vb = self.lookup(b)?;
-        // v6-δ M1: switch from plain `iadd` / `isub` / `imul` to the
-        // cranelift overflow-checked variants `sadd_overflow` /
-        // `ssub_overflow` / `smul_overflow`. The wrapping result goes
-        // into `ssa_to_value` (downstream ops keep working), and the
-        // boolean overflow bit goes into `overflow_bits` keyed on the
-        // arith op's `dst` — `emit_guard_op` reads it when the
-        // matching `Guard(ArithOverflow(dst))` fires so the predicate
-        // is a real "did this iadd carry?" check instead of a
-        // constant-0 that always deopts. Relon Int is signed so we
-        // use the signed-overflow primitives across the board.
-        let widened_a = self.widen_to_i64(va);
-        let widened_b = self.widen_to_i64(vb);
-        let (r, of) = match op {
-            BinOp::Add => self.builder.ins().sadd_overflow(widened_a, widened_b),
-            BinOp::Sub => self.builder.ins().ssub_overflow(widened_a, widened_b),
-            BinOp::Mul => self.builder.ins().smul_overflow(widened_a, widened_b),
-        };
-        self.bind(dst, r);
-        self.overflow_bits.insert(dst, of);
-        Ok(())
-    }
-
-    /// `Div` carries a divisor-zero guard inline so the trace can be
-    /// recorded as a single op; the recorder still emits an explicit
-    /// `Guard(NotNull,..)` op when its policy is to externalise the
-    /// check. We emit a conservative inline check here as well so the
-    /// generated cranelift IR can never trap directly.
-    fn emit_div(&mut self, dst: SsaVar, a: SsaVar, b: SsaVar) -> Result<(), EmitError> {
-        let va = self.lookup(a)?;
-        let vb = self.lookup(b)?;
-
-        // Divisor-zero pre-check: if `b == 0` deopt with synthetic
-        // trace_pc / external_pc = 0 (the optimiser should have
-        // attached a real GuardSite earlier; this is the safety net
-        // for traces the recorder forgot to annotate).
-        let zero = self.builder.ins().iconst(I64, 0);
-        let nonzero = self.builder.ins().icmp(IntCC::NotEqual, vb, zero);
-        let ok_block = self.builder.create_block();
-        let guard_pc = self.builder.ins().iconst(I32, 0);
-        let external_pc = self.builder.ins().iconst(I64, 0);
-        self.builder.ins().brif(
-            nonzero,
-            ok_block,
-            &[],
-            self.deopt_block,
-            &[BlockArg::Value(guard_pc), BlockArg::Value(external_pc)],
-        );
-        self.builder.seal_block(ok_block);
-        self.builder.switch_to_block(ok_block);
-
-        let r = self.builder.ins().sdiv(va, vb);
-        self.bind(dst, r);
-        // F-D8-D: seed `overflow_bits` with a constant-zero overflow
-        // bit so a downstream `Guard(ArithOverflow(div_dst))` predicate
-        // resolves to "no overflow → guard passes". Without this entry
-        // the fallback predicate in `guard_emit::build_guard_predicate`
-        // (ArithOverflow arm) treats any non-I32/Bool observed type as
-        // "always deopt", which would force every i64 Div in a
-        // recorder-driven trace to GuardFail on the first iter.
-        //
-        // The mathematical truth: `sdiv` only overflows for
-        // `i64::MIN / -1`. Real Relon workloads divide by small
-        // positive constants (10, 4, 1024-aligned masks); the
-        // divisor-zero pre-check above already handles the only
-        // runtime trap case. Emitting a const-0 of_bit here means the
-        // guard collapses to `(0 == 0) → true → pass`, identical to
-        // what an explicit overflow-checked-sdiv would surface in the
-        // common cases we measure.
-        let of_bit = self.builder.ins().iconst(I32, 0);
-        self.overflow_bits.insert(dst, of_bit);
-        Ok(())
     }
 
     /// F-D8-E.1: `Mod` mirrors `Div`'s shape — divisor-zero pre-check
@@ -979,92 +936,6 @@ impl<'a, 'b> TraceEmitterState<'a, 'b> {
         self.builder.ins().isub(dividend, prod)
     }
 
-    fn emit_cmp(
-        &mut self,
-        kind: relon_trace_jit::CmpKind,
-        dst: SsaVar,
-        a: SsaVar,
-        b: SsaVar,
-    ) -> Result<(), EmitError> {
-        let va = self.lookup(a)?;
-        let vb = self.lookup(b)?;
-        let cc = match kind {
-            relon_trace_jit::CmpKind::Eq => IntCC::Equal,
-            relon_trace_jit::CmpKind::Ne => IntCC::NotEqual,
-            relon_trace_jit::CmpKind::Lt => IntCC::SignedLessThan,
-            relon_trace_jit::CmpKind::Le => IntCC::SignedLessThanOrEqual,
-            relon_trace_jit::CmpKind::Gt => IntCC::SignedGreaterThan,
-            relon_trace_jit::CmpKind::Ge => IntCC::SignedGreaterThanOrEqual,
-        };
-        let bit = self.builder.ins().icmp(cc, va, vb);
-        let widened = self.builder.ins().uextend(I32, bit);
-        self.bind(dst, widened);
-        Ok(())
-    }
-
-    fn emit_load(&mut self, dst: SsaVar, base: SsaVar, off: i32) -> Result<(), EmitError> {
-        let base_v = self.lookup(base)?;
-        // Cranelift `load` takes a pointer-typed base; the recorder
-        // already established that `base` carries a pointer SSA value.
-        let r = self
-            .builder
-            .ins()
-            .load(I64, MemFlags::trusted(), base_v, off);
-        self.bind(dst, r);
-        Ok(())
-    }
-
-    fn emit_store(&mut self, base: SsaVar, off: i32, src: SsaVar) -> Result<(), EmitError> {
-        let base_v = self.lookup(base)?;
-        let src_v = self.lookup(src)?;
-        // `store` needs the value at the expected width (I64). We
-        // narrow / widen wherever the source value isn't already I64.
-        let src_v = self.widen_to_i64(src_v);
-        self.builder
-            .ins()
-            .store(MemFlags::trusted(), src_v, base_v, off);
-        Ok(())
-    }
-
-    fn emit_const_i32(&mut self, dst: SsaVar, v: i32) -> Result<(), EmitError> {
-        let val = self.builder.ins().iconst(I32, i64::from(v));
-        self.bind(dst, val);
-        Ok(())
-    }
-
-    fn emit_const_i64(&mut self, dst: SsaVar, v: i64) -> Result<(), EmitError> {
-        let val = self.builder.ins().iconst(I64, v);
-        self.bind(dst, val);
-        Ok(())
-    }
-
-    /// v6-δ M1: lower `TraceOp::LocalGet(dst, slot_idx)` to a load
-    /// off the entry-fn's `args_ptr` second arg.
-    ///
-    /// The cranelift prologue (see
-    /// `relon-codegen-native::codegen::emit_hot_counter_inject`) packs
-    /// every entry-fn arg into a `u64[]` on a stack slot before
-    /// jumping to `__relon_jump_to_recorder`; the same packed layout
-    /// is what the trace entry receives via its second ABI param.
-    /// Reading `args_ptr + slot_idx * 8` therefore mirrors the
-    /// recorder's view of `Op::LocalGet(slot_idx)`.
-    fn emit_local_get(&mut self, dst: SsaVar, slot_idx: u32) -> Result<(), EmitError> {
-        // Trusted: the recorder/optimiser never emits a slot_idx the
-        // caller hasn't sized the packed array for. Using
-        // `MemFlags::trusted` matches the existing `emit_load`'s
-        // contract — same load lattice, same alias analysis.
-        let off = (slot_idx as i64).wrapping_mul(8);
-        // Cranelift's `load` takes the byte offset as an i32; the
-        // recorder bounds `slot_idx` well below i32::MAX / 8.
-        let off_i32 = i32::try_from(off).unwrap_or(0);
-        let v = self
-            .builder
-            .ins()
-            .load(I64, MemFlags::trusted(), self.input_args_ptr, off_i32);
-        self.bind(dst, v);
-        Ok(())
-    }
-
     fn emit_guard_op(&mut self, guard_site: Option<&GuardSite>) -> Result<(), EmitError> {
         let site = guard_site.ok_or(EmitError::OrphanGuardOp)?;
         let mut gctx = GuardEmitCtx {
@@ -1110,7 +981,7 @@ impl<'a, 'b> TraceEmitterState<'a, 'b> {
         let mut arg_vals = Vec::with_capacity(args.len());
         for a in args {
             let v = self.lookup(*a)?;
-            arg_vals.push(self.widen_to_i64(v));
+            arg_vals.push(widen_to_i64(self, v));
         }
 
         let inst = self.builder.ins().call_indirect(sig_ref, target, &arg_vals);
@@ -1141,7 +1012,7 @@ impl<'a, 'b> TraceEmitterState<'a, 'b> {
     /// lowering details.
     fn emit_str_concat(&mut self, dst: SsaVar, a: SsaVar, b: SsaVar) -> Result<(), EmitError> {
         let va = self.lookup(a)?;
-        let va = self.widen_to_i64(va);
+        let va = widen_to_i64(self, va);
 
         // F-D7-I inline path: rhs is a known small constant AND the
         // host wired the alloc helper.
@@ -1170,7 +1041,7 @@ impl<'a, 'b> TraceEmitterState<'a, 'b> {
 
         // Fallback: extern shim call.
         let vb = self.lookup(b)?;
-        let vb = self.widen_to_i64(vb);
+        let vb = widen_to_i64(self, vb);
         let inst = self.builder.ins().call(self.str_concat, &[va, vb]);
         let r = self.builder.inst_results(inst)[0];
         self.bind(dst, r);
@@ -1225,7 +1096,7 @@ impl<'a, 'b> TraceEmitterState<'a, 'b> {
         let mut operand_vals: Vec<ir::Value> = Vec::with_capacity(operands.len());
         for &op_ssa in operands {
             let v = self.lookup(op_ssa)?;
-            let v = self.widen_to_i64(v);
+            let v = widen_to_i64(self, v);
             operand_vals.push(v);
         }
 
@@ -1308,7 +1179,7 @@ impl<'a, 'b> TraceEmitterState<'a, 'b> {
     /// representation as a `ConstBool` value.
     fn emit_str_contains(&mut self, dst: SsaVar, a: SsaVar, b: SsaVar) -> Result<(), EmitError> {
         let va = self.lookup(a)?;
-        let va = self.widen_to_i64(va);
+        let va = widen_to_i64(self, va);
 
         // F-D7-C inline path: needle is a known small constant.
         if let Some(needle_bytes) = self.trace.const_bytes_for(b) {
@@ -1355,7 +1226,7 @@ impl<'a, 'b> TraceEmitterState<'a, 'b> {
 
         // Fallback: extern shim call.
         let vb = self.lookup(b)?;
-        let vb = self.widen_to_i64(vb);
+        let vb = widen_to_i64(self, vb);
         let inst = self.builder.ins().call(self.str_contains, &[va, vb]);
         let r = self.builder.inst_results(inst)[0];
         self.bind(dst, r);
@@ -1369,8 +1240,8 @@ impl<'a, 'b> TraceEmitterState<'a, 'b> {
     fn emit_str_find(&mut self, dst: SsaVar, a: SsaVar, b: SsaVar) -> Result<(), EmitError> {
         let va = self.lookup(a)?;
         let vb = self.lookup(b)?;
-        let va = self.widen_to_i64(va);
-        let vb = self.widen_to_i64(vb);
+        let va = widen_to_i64(self, va);
+        let vb = widen_to_i64(self, vb);
         let inst = self.builder.ins().call(self.str_find, &[va, vb]);
         let r = self.builder.inst_results(inst)[0];
         self.bind(dst, r);
@@ -1399,8 +1270,8 @@ impl<'a, 'b> TraceEmitterState<'a, 'b> {
             .ok_or(EmitError::HostHookNotDeclared(HostHookId::StrGlobMatch))?;
         let vs = self.lookup(s)?;
         let vp = self.lookup(pattern)?;
-        let vs = self.widen_to_i64(vs);
-        let vp = self.widen_to_i64(vp);
+        let vs = widen_to_i64(self, vs);
+        let vp = widen_to_i64(self, vp);
         let inst = self.builder.ins().call(helper, &[vs, vp]);
         let r = self.builder.inst_results(inst)[0];
         self.bind(dst, r);
@@ -1420,9 +1291,9 @@ impl<'a, 'b> TraceEmitterState<'a, 'b> {
         let vs = self.lookup(s)?;
         let vstart = self.lookup(start)?;
         let vlength = self.lookup(length)?;
-        let vs = self.widen_to_i64(vs);
-        let vstart = self.widen_to_i64(vstart);
-        let vlength = self.widen_to_i64(vlength);
+        let vs = widen_to_i64(self, vs);
+        let vstart = widen_to_i64(self, vstart);
+        let vlength = widen_to_i64(self, vlength);
         let inst = self
             .builder
             .ins()
@@ -1467,7 +1338,7 @@ impl<'a, 'b> TraceEmitterState<'a, 'b> {
             .ok_or(EmitError::HostHookNotDeclared(HostHookId::ListGet))?;
         let base_v = self.lookup(list_ptr)?;
         let idx_v = self.lookup(idx)?;
-        let idx_v = self.widen_to_i64(idx_v);
+        let idx_v = widen_to_i64(self, idx_v);
 
         // Bounds guard: idx < len (treat idx as unsigned i64 — the
         // recorder is responsible for emitting an `ult` rather than
@@ -1681,7 +1552,7 @@ impl<'a, 'b> TraceEmitterState<'a, 'b> {
 
     fn emit_return(&mut self, var: SsaVar) -> Result<(), EmitError> {
         let v = self.lookup(var)?;
-        let v = self.widen_to_i64(v);
+        let v = widen_to_i64(self, v);
         // Store into `TraceContext::result_slot`. The byte offset is
         // sourced from `relon-trace-abi` so the emitter and the runtime
         // helpers always agree on the layout — see
@@ -1752,7 +1623,7 @@ impl<'a, 'b> TraceEmitterState<'a, 'b> {
             let v = self.lookup(phi.init)?;
             // Widen to I64 so the block-param width is uniform; the
             // emit_local_get / arith paths already widen as needed.
-            let widened = self.widen_to_i64(v);
+            let widened = widen_to_i64(self, v);
             init_vals.push(widened);
         }
 
@@ -1900,7 +1771,7 @@ impl<'a, 'b> TraceEmitterState<'a, 'b> {
         let mut args_vals: Vec<ir::Value> = Vec::with_capacity(next_values.len());
         for v in next_values {
             let val = self.lookup(*v)?;
-            let widened = self.widen_to_i64(val);
+            let widened = widen_to_i64(self, val);
             args_vals.push(widened);
         }
         let args: Vec<ir::BlockArg> = args_vals.iter().map(|v| ir::BlockArg::Value(*v)).collect();
@@ -1991,46 +1862,6 @@ impl<'a, 'b> TraceEmitterState<'a, 'b> {
         self.builder.ins().return_(&[failed_d]);
         self.builder.seal_block(self.deopt_block);
     }
-
-    fn lookup(&self, var: SsaVar) -> Result<ir::Value, EmitError> {
-        self.ssa_to_value
-            .get(&var)
-            .copied()
-            .ok_or(EmitError::UnboundSsa(var))
-    }
-
-    fn bind(&mut self, var: SsaVar, v: ir::Value) {
-        // Per-var binding overwrites are forbidden by SSA, but the
-        // recorder guarantees unique destinations so we use a plain
-        // insert.
-        self.ssa_to_value.insert(var, v);
-    }
-
-    /// Coerce a value into an i64 by `uextend` (narrower → wider) /
-    /// passthrough (already i64). Other widths are recorder bugs.
-    fn widen_to_i64(&mut self, v: ir::Value) -> ir::Value {
-        let ty = self.builder.func.dfg.value_type(v);
-        if ty == I64 {
-            v
-        } else if ty == I32 {
-            self.builder.ins().uextend(I64, v)
-        } else {
-            // Pointer-typed value: bitcast through `raw_bitcast` is
-            // overkill for the test surface; we treat the value as
-            // already 64-bit on a 64-bit host and pass it through.
-            // The integration phase will fix this once non-i64 args
-            // are widened in the recorder.
-            v
-        }
-    }
-}
-
-/// Internal binary-op tag; not part of the public API.
-#[derive(Debug, Clone, Copy)]
-enum BinOp {
-    Add,
-    Sub,
-    Mul,
 }
 
 /// F-D8-E.5: per-loop metadata used by the preheader hoister.
@@ -2282,6 +2113,12 @@ impl std::fmt::Display for EmitError {
 }
 
 impl std::error::Error for EmitError {}
+
+impl From<GuardEmitError> for EmitError {
+    fn from(e: GuardEmitError) -> Self {
+        EmitError::Guard(e)
+    }
+}
 
 #[cfg(test)]
 mod tests {
