@@ -177,6 +177,29 @@ pub fn register_to(ctx: &mut Context) {
     ctx.register_pure_method("List", "some", list_some);
     ctx.register_pure_method("List", "unique", list_unique);
 
+    // Stdlib JSON Schema parity wave — batch 5: string trim + dict
+    // helpers + date parser.
+    let string_trim: Arc<dyn RelonFunction> = Arc::new(StringTrim);
+    let string_trim_start: Arc<dyn RelonFunction> = Arc::new(StringTrimStart);
+    let string_trim_end: Arc<dyn RelonFunction> = Arc::new(StringTrimEnd);
+    let dict_select_keys: Arc<dyn RelonFunction> = Arc::new(DictSelectKeys);
+    let dict_omit_keys: Arc<dyn RelonFunction> = Arc::new(DictOmitKeys);
+    let size_in_range: Arc<dyn RelonFunction> = Arc::new(SizeInRange);
+    let parse_iso_date: Arc<dyn RelonFunction> = Arc::new(ParseIsoDate);
+    ctx.register_pure_fn("trim", Arc::clone(&string_trim));
+    ctx.register_pure_fn("trim_start", Arc::clone(&string_trim_start));
+    ctx.register_pure_fn("trim_end", Arc::clone(&string_trim_end));
+    ctx.register_pure_fn("select_keys", Arc::clone(&dict_select_keys));
+    ctx.register_pure_fn("omit_keys", Arc::clone(&dict_omit_keys));
+    ctx.register_pure_fn("size_in_range", Arc::clone(&size_in_range));
+    ctx.register_pure_fn("parse_iso_date", Arc::clone(&parse_iso_date));
+    // Method-form aliases for string trims + dict helpers.
+    ctx.register_pure_method("String", "trim", string_trim);
+    ctx.register_pure_method("String", "trim_start", string_trim_start);
+    ctx.register_pure_method("String", "trim_end", string_trim_end);
+    ctx.register_pure_method("Dict", "select_keys", dict_select_keys);
+    ctx.register_pure_method("Dict", "omit_keys", dict_omit_keys);
+
     // Phase D 收尾: schema-rooted method aliases for the same Rust
     // intrinsics. Decision 14 (`schema-rooted-model-2026-05-11.md`):
     // `method` is the model's center; free-fn forms above remain for
@@ -2979,6 +3002,158 @@ impl RelonFunction for ListSome {
             }
         }
         Ok(Value::Bool(false))
+    }
+}
+
+/// `trim(s) -> String` — strip leading + trailing Unicode whitespace.
+struct StringTrim;
+impl RelonFunction for StringTrim {
+    fn call(
+        &self,
+        args: NativeArgs,
+        range: relon_parser::TokenRange,
+    ) -> Result<Value, RuntimeError> {
+        let args = args.into_positional();
+        expect_arg_count(&args, 1, range)?;
+        Ok(Value::String(expect_string(&args[0], range)?.trim().into()))
+    }
+}
+
+/// `trim_start(s) -> String`
+struct StringTrimStart;
+impl RelonFunction for StringTrimStart {
+    fn call(
+        &self,
+        args: NativeArgs,
+        range: relon_parser::TokenRange,
+    ) -> Result<Value, RuntimeError> {
+        let args = args.into_positional();
+        expect_arg_count(&args, 1, range)?;
+        Ok(Value::String(
+            expect_string(&args[0], range)?.trim_start().into(),
+        ))
+    }
+}
+
+/// `trim_end(s) -> String`
+struct StringTrimEnd;
+impl RelonFunction for StringTrimEnd {
+    fn call(
+        &self,
+        args: NativeArgs,
+        range: relon_parser::TokenRange,
+    ) -> Result<Value, RuntimeError> {
+        let args = args.into_positional();
+        expect_arg_count(&args, 1, range)?;
+        Ok(Value::String(
+            expect_string(&args[0], range)?.trim_end().into(),
+        ))
+    }
+}
+
+/// `select_keys(d, ks) -> Dict` — project a dict onto a subset of
+/// keys. Missing keys are silently dropped. Mirrors JSON Schema
+/// `additionalProperties: false` post-filter use case.
+struct DictSelectKeys;
+impl RelonFunction for DictSelectKeys {
+    fn call(
+        &self,
+        args: NativeArgs,
+        range: relon_parser::TokenRange,
+    ) -> Result<Value, RuntimeError> {
+        let args = args.into_positional();
+        expect_arg_count(&args, 2, range)?;
+        let dict = expect_dict(&args[0], range)?;
+        let keys = expect_string_list(&args[1], range)?;
+        let mut out = std::collections::BTreeMap::new();
+        for k in &keys {
+            if let Some(v) = dict.map.get(k.as_str()) {
+                out.insert(crate::value::SmolStr::from(k.as_str()), v.clone());
+            }
+        }
+        Ok(Value::dict(out))
+    }
+}
+
+/// `omit_keys(d, ks) -> Dict` — drop a key set from a dict.
+struct DictOmitKeys;
+impl RelonFunction for DictOmitKeys {
+    fn call(
+        &self,
+        args: NativeArgs,
+        range: relon_parser::TokenRange,
+    ) -> Result<Value, RuntimeError> {
+        let args = args.into_positional();
+        expect_arg_count(&args, 2, range)?;
+        let dict = expect_dict(&args[0], range)?;
+        let keys = expect_string_list(&args[1], range)?;
+        let drop: std::collections::HashSet<&str> = keys.iter().map(|s| s.as_str()).collect();
+        let mut out = std::collections::BTreeMap::new();
+        for (k, v) in dict.map.iter() {
+            if !drop.contains(k.as_str()) {
+                out.insert(k.clone(), v.clone());
+            }
+        }
+        Ok(Value::dict(out))
+    }
+}
+
+/// `size_in_range(d, lo, hi) -> Bool` — JSON Schema
+/// `minProperties` / `maxProperties` covered. Inclusive bounds.
+/// Also accepts a List receiver, in which case it's
+/// `minItems` / `maxItems`.
+struct SizeInRange;
+impl RelonFunction for SizeInRange {
+    fn call(
+        &self,
+        args: NativeArgs,
+        range: relon_parser::TokenRange,
+    ) -> Result<Value, RuntimeError> {
+        let args = args.into_positional();
+        expect_arg_count(&args, 3, range)?;
+        let len = match &args[0] {
+            Value::Dict(d) => d.map.len() as i64,
+            Value::List(l) => l.len() as i64,
+            Value::String(s) => s.chars().count() as i64,
+            other => {
+                return Err(RuntimeError::TypeMismatch {
+                    expected: "Dict / List / String".to_string(),
+                    found: other.type_name().to_string(),
+                    range,
+                });
+            }
+        };
+        let lo = expect_int(&args[1], range)?;
+        let hi = expect_int(&args[2], range)?;
+        Ok(Value::Bool(len >= lo && len <= hi))
+    }
+}
+
+/// `parse_iso_date(s) -> Dict { year, month, day }` — parse an
+/// `YYYY-MM-DD` string into a structured dict. Returns `Value::Null`
+/// when the format is invalid. Avoids a `chrono` dep — date math
+/// stays on the caller side via `year` / `month` / `day` fields.
+struct ParseIsoDate;
+impl RelonFunction for ParseIsoDate {
+    fn call(
+        &self,
+        args: NativeArgs,
+        range: relon_parser::TokenRange,
+    ) -> Result<Value, RuntimeError> {
+        let args = args.into_positional();
+        expect_arg_count(&args, 1, range)?;
+        let s = expect_string(&args[0], range)?;
+        if !is_iso_date_str(s) {
+            return Ok(Value::Null);
+        }
+        let year: i64 = s[0..4].parse().unwrap();
+        let month: i64 = s[5..7].parse().unwrap();
+        let day: i64 = s[8..10].parse().unwrap();
+        let mut map = std::collections::BTreeMap::new();
+        map.insert(crate::value::SmolStr::from("year"), Value::Int(year));
+        map.insert(crate::value::SmolStr::from("month"), Value::Int(month));
+        map.insert(crate::value::SmolStr::from("day"), Value::Int(day));
+        Ok(Value::dict(map))
     }
 }
 
