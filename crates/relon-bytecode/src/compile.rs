@@ -326,9 +326,28 @@ impl<'a> CompileState<'a> {
         self.ir_pc_map.push(pc);
     }
 
+    /// Drop the top `n` slots from the abstract operand stack.
+    fn pop_n(&mut self, n: usize) {
+        for _ in 0..n {
+            self.current_stack.pop();
+        }
+    }
+
+    /// Push a fresh `StackOrigin::Snapshot(idx)` onto the abstract
+    /// operand stack. Used for any op whose pushed value is produced
+    /// by the dispatcher (arena handle, host-fn return, etc.) rather
+    /// than re-derivable from locals / consts.
+    fn push_snapshot(&mut self) {
+        let snap_idx = self.next_snapshot_idx;
+        self.next_snapshot_idx += 1;
+        self.current_stack.push(StackOrigin::Snapshot(snap_idx));
+    }
+
     /// Apply the abstract stack effect of `op` to `current_stack`.
     /// Called immediately after [`Self::emit`] so the next op's
     /// recorded recipe reflects the producer/consumer behaviour.
+    /// Most arms reduce to "pop N inputs, push a single Snapshot for
+    /// the dispatcher-produced result" — see `pop_n` + `push_snapshot`.
     fn apply_stack_effect(&mut self, op: &BcOp) {
         match op {
             BcOp::ConstI64(v) => self.current_stack.push(StackOrigin::Const(*v as u64)),
@@ -336,9 +355,7 @@ impl<'a> CompileState<'a> {
                 .current_stack
                 .push(StackOrigin::Const(*v as u32 as u64)),
             BcOp::LocalGet(idx) => self.current_stack.push(StackOrigin::Local(*idx)),
-            BcOp::LocalSet(_) => {
-                self.current_stack.pop();
-            }
+            BcOp::LocalSet(_) => self.pop_n(1),
             // M2-C lever 3: typed arith / cmp ops carry no payload after
             // the per-type specialization split; the stack effect is the
             // same regardless of i64 / f64 lane.
@@ -365,11 +382,8 @@ impl<'a> CompileState<'a> {
             | BcOp::GtF64
             | BcOp::GeF64 => {
                 // Pop two operands, push one snapshot-backed result.
-                self.current_stack.pop();
-                self.current_stack.pop();
-                let snap_idx = self.next_snapshot_idx;
-                self.next_snapshot_idx += 1;
-                self.current_stack.push(StackOrigin::Snapshot(snap_idx));
+                self.pop_n(2);
+                self.push_snapshot();
             }
             BcOp::Jump(_) => {
                 // Unconditional jump: no stack effect at this point.
@@ -377,16 +391,13 @@ impl<'a> CompileState<'a> {
                 // label-fixup pass; for the straight-line envelope
                 // the next recipe is whatever the join produces.
             }
-            BcOp::JumpIfTrue(_) | BcOp::JumpIfFalse(_) => {
-                self.current_stack.pop();
-            }
+            BcOp::JumpIfTrue(_) | BcOp::JumpIfFalse(_) => self.pop_n(1),
             BcOp::Return => {
                 // Return pops one value (or zero in the buffer-
-                // protocol path). The abstract pop here is best-
-                // effort and only matters for tail-of-function
-                // recipes; subsequent recipes (post-Return) won't be
-                // consulted.
-                self.current_stack.pop();
+                // protocol path). The abstract pop here is best-effort
+                // and only matters for tail-of-function recipes;
+                // subsequent recipes (post-Return) won't be consulted.
+                self.pop_n(1);
             }
             BcOp::Trap(_) => {
                 // Trap doesn't pop in the bytecode VM (it ignores its
@@ -397,160 +408,76 @@ impl<'a> CompileState<'a> {
                 // Pops `arg_count` operands, pushes one return slot
                 // tagged as Snapshot — the value can't be derived
                 // from locals / consts alone (a host fn produced it).
-                // Even though phase 3's dispatcher traps before
-                // pushing, the static stack discipline still has to
-                // account for the would-be return value: callers that
-                // resume past the trap (or graft the op into a
-                // permitted call site in future phases) need the
-                // recipe to match.
-                for _ in 0..*arg_count {
-                    self.current_stack.pop();
-                }
-                let snap_idx = self.next_snapshot_idx;
-                self.next_snapshot_idx += 1;
-                self.current_stack.push(StackOrigin::Snapshot(snap_idx));
+                self.pop_n(*arg_count as usize);
+                self.push_snapshot();
             }
             BcOp::CheckCap { .. } => {
                 // No stack effect — capability check is a pure side
                 // effect over the gate / vtable state.
             }
             BcOp::CallStdlibScalar { arg_count, .. } => {
-                for _ in 0..*arg_count {
-                    self.current_stack.pop();
-                }
-                let snap_idx = self.next_snapshot_idx;
-                self.next_snapshot_idx += 1;
-                self.current_stack.push(StackOrigin::Snapshot(snap_idx));
+                self.pop_n(*arg_count as usize);
+                self.push_snapshot();
             }
             BcOp::ListLen => {
                 // Witness op against a pre-computed length on the
                 // stack — net zero effect (pops the length, pushes it
                 // back). Modelled as a snapshot to keep partial-resume
                 // safe even though today the value is observable.
-                self.current_stack.pop();
-                let snap_idx = self.next_snapshot_idx;
-                self.next_snapshot_idx += 1;
-                self.current_stack.push(StackOrigin::Snapshot(snap_idx));
+                self.pop_n(1);
+                self.push_snapshot();
             }
+            // Arena-handle producers: the pushed handle is the
+            // dispatcher's index into an arena slot, not re-derivable
+            // from consts/locals at resume time. The deopt path reads
+            // it back out of the snapshot's value_stack_copy.
             BcOp::MakeList { len } => {
-                // Pops `len` elements, pushes one list handle. The
-                // pushed handle is snapshot-tagged because the value
-                // (an arena-local handle index) can't be re-derived
-                // from locals / consts at resume time — the recipe
-                // consumer reads the handle out of the deopt
-                // snapshot's `value_stack_copy`.
-                for _ in 0..*len {
-                    self.current_stack.pop();
-                }
-                let snap_idx = self.next_snapshot_idx;
-                self.next_snapshot_idx += 1;
-                self.current_stack.push(StackOrigin::Snapshot(snap_idx));
+                self.pop_n(*len as usize);
+                self.push_snapshot();
             }
-            BcOp::ListGetInt => {
-                // Pops [list_handle, idx], pushes one element. Same
-                // snapshot-tag reasoning as `MakeList` — the element
-                // value depends on the arena state which isn't part
-                // of the producer-based recipe taxonomy.
-                self.current_stack.pop();
-                self.current_stack.pop();
-                let snap_idx = self.next_snapshot_idx;
-                self.next_snapshot_idx += 1;
-                self.current_stack.push(StackOrigin::Snapshot(snap_idx));
+            BcOp::ListGetInt | BcOp::ListPush | BcOp::DictLookupStr => {
+                // Pops [a, b], pushes one snapshot-backed slot.
+                self.pop_n(2);
+                self.push_snapshot();
             }
-            BcOp::ListPush => {
-                // Pops [list_handle, elem], pushes one new handle.
-                self.current_stack.pop();
-                self.current_stack.pop();
-                let snap_idx = self.next_snapshot_idx;
-                self.next_snapshot_idx += 1;
-                self.current_stack.push(StackOrigin::Snapshot(snap_idx));
-            }
-            BcOp::StrConst { .. } => {
-                let snap_idx = self.next_snapshot_idx;
-                self.next_snapshot_idx += 1;
-                self.current_stack.push(StackOrigin::Snapshot(snap_idx));
+            BcOp::StrConst { .. } | BcOp::CaptureGet { .. } => {
+                // Pure producers: no input pops, just a snapshot push.
+                // CaptureGet's value is reproducible from the closure
+                // handle but the handle isn't visible to the straight-
+                // line recipe walker, so we honestly tag it Snapshot.
+                self.push_snapshot();
             }
             BcOp::StrLen => {
-                self.current_stack.pop();
-                let snap_idx = self.next_snapshot_idx;
-                self.next_snapshot_idx += 1;
-                self.current_stack.push(StackOrigin::Snapshot(snap_idx));
+                self.pop_n(1);
+                self.push_snapshot();
             }
             BcOp::StrConcat | BcOp::StrEq | BcOp::StrGlobMatch => {
-                self.current_stack.pop();
-                self.current_stack.pop();
-                let snap_idx = self.next_snapshot_idx;
-                self.next_snapshot_idx += 1;
-                self.current_stack.push(StackOrigin::Snapshot(snap_idx));
+                self.pop_n(2);
+                self.push_snapshot();
             }
             BcOp::StrConcatN { argc } => {
                 // #165 — pops `argc` string handles in source order
                 // (deepest leaf is bottom-most operand), pushes a
-                // single fresh handle. Snapshot-tagged because the
-                // arena slot's numeric value can't be re-derived from
-                // consts / locals after the alloc.
-                for _ in 0..*argc {
-                    self.current_stack.pop();
-                }
-                let snap_idx = self.next_snapshot_idx;
-                self.next_snapshot_idx += 1;
-                self.current_stack.push(StackOrigin::Snapshot(snap_idx));
+                // single fresh handle.
+                self.pop_n(*argc as usize);
+                self.push_snapshot();
             }
             BcOp::MakeDict { len } => {
                 // Pops `len * 2` slots (key/value pairs), pushes one
                 // dict handle.
-                for _ in 0..(*len as usize * 2) {
-                    self.current_stack.pop();
-                }
-                let snap_idx = self.next_snapshot_idx;
-                self.next_snapshot_idx += 1;
-                self.current_stack.push(StackOrigin::Snapshot(snap_idx));
-            }
-            BcOp::DictLookupStr => {
-                // Pops [dict, key], pushes the value.
-                self.current_stack.pop();
-                self.current_stack.pop();
-                let snap_idx = self.next_snapshot_idx;
-                self.next_snapshot_idx += 1;
-                self.current_stack.push(StackOrigin::Snapshot(snap_idx));
+                self.pop_n(*len as usize * 2);
+                self.push_snapshot();
             }
             BcOp::MakeClosure { capture_count, .. } => {
-                // M3: pops `capture_count` capture values, pushes one
-                // closure handle. Handle is snapshot-tagged because its
-                // numeric value (the arena slot index) can't be
-                // re-derived from locals / consts at resume time — the
-                // recipe consumer reads it out of the deopt snapshot's
-                // `value_stack_copy` slot.
-                for _ in 0..*capture_count {
-                    self.current_stack.pop();
-                }
-                let snap_idx = self.next_snapshot_idx;
-                self.next_snapshot_idx += 1;
-                self.current_stack.push(StackOrigin::Snapshot(snap_idx));
+                // M3: pops capture values, pushes one closure handle.
+                self.pop_n(*capture_count as usize);
+                self.push_snapshot();
             }
             BcOp::CallClosure { argc } => {
                 // M3: pops `argc` args + 1 closure handle, pushes the
-                // return value. Result is snapshot-tagged — produced by
-                // the inner dispatch loop and observable only via the
-                // operand stack.
-                for _ in 0..*argc {
-                    self.current_stack.pop();
-                }
-                // Pop the closure handle.
-                self.current_stack.pop();
-                let snap_idx = self.next_snapshot_idx;
-                self.next_snapshot_idx += 1;
-                self.current_stack.push(StackOrigin::Snapshot(snap_idx));
-            }
-            BcOp::CaptureGet { .. } => {
-                // M3: pushes one capture value. Like `LocalGet` the
-                // value is reproducible from the closure handle at
-                // resume time, but the handle isn't visible to the
-                // straight-line recipe walker. Snapshot-tag so the
-                // deopt path is honest about the dependency.
-                let snap_idx = self.next_snapshot_idx;
-                self.next_snapshot_idx += 1;
-                self.current_stack.push(StackOrigin::Snapshot(snap_idx));
+                // return value.
+                self.pop_n(*argc as usize + 1);
+                self.push_snapshot();
             }
         }
     }
