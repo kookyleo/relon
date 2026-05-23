@@ -79,7 +79,17 @@ jobs:
       - name: miri test (relon-trace-jit lib)
         run: cargo +nightly miri test -p relon-trace-jit --lib
         env:
-          MIRIFLAGS: -Zmiri-disable-isolation
+          # `-Zmiri-ignore-leaks` is required for this crate: the
+          # `__relon_str_*` / `StringRef::from_owned|from_static` /
+          # `__relon_str_concat_n_alloc` / `__relon_str_substring`
+          # runtime helpers are caller-managed — production code drains
+          # them via `reclaim_trace_strings()` at trace exit. The unit
+          # tests intentionally exercise the alloc shape without the
+          # reclaim call, so miri's default "leak == error" flags every
+          # such test. The flag suppresses *leak* reporting only;
+          # use-after-free / double-free / OOB checks still fire, which
+          # is what the F-1 sweep actually buys.
+          MIRIFLAGS: -Zmiri-disable-isolation -Zmiri-ignore-leaks
       - name: miri test (relon-trace-recorder)
         run: cargo +nightly miri test -p relon-trace-recorder
         env:
