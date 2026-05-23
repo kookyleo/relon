@@ -380,6 +380,19 @@ pub enum BcOp {
     },
 }
 
+/// P2-6 dispatch-cache guard. The dispatch loop walks `Vec<BcOp>` one
+/// slot per tick, so the per-slot size directly bounds how many ops
+/// land in a single L1 cache line. Keep the enum slot at 16 B —
+/// roughly four ops per typical 64 B cache line — until a follow-up
+/// pass redesigns the hot variants (today every realistic shrink
+/// path adds a heap indirection on a hot variant like `Jump(usize)` /
+/// `ConstI64(i64)`, which would more than spend the cache win).
+///
+/// If a future change widens any payload (e.g. adds an `i128` const
+/// variant or another `usize`-shaped target), this const assertion
+/// fails at build time and the perf budget is forced through review.
+const _: [(); 16] = [(); core::mem::size_of::<BcOp>()];
+
 /// M2-B phase 3: scalar-pure stdlib handlers the bytecode VM can
 /// evaluate without record / list memory. Each variant pops the
 /// declared arity and pushes a single i64 result.
