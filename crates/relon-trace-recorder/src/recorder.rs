@@ -232,6 +232,16 @@ impl RecorderState {
         self.next_external_pc = pc;
     }
 
+    /// Internal: advance `next_external_pc` by one op-step. Used by
+    /// both `record_op` and the direct `emit_*` API surfaces so each
+    /// API-level op-step gets a distinct PC for guard-site lookup —
+    /// without this, mixing `record_op` + `emit_branch_guard` etc.
+    /// would let multiple guards share the same `external_pc` and
+    /// collide in the deopt-site lookup.
+    fn bump_external_pc(&mut self) {
+        self.next_external_pc = self.next_external_pc.wrapping_add(1);
+    }
+
     /// Emit a branch-direction guard against `cond_ssa`.
     ///
     /// v6-γ M5: the trace-recording IR walker decides at recording
@@ -259,6 +269,7 @@ impl RecorderState {
         if cond_ssa == SsaVar::NONE {
             return None;
         }
+        self.bump_external_pc();
         self.emit_guard(GuardKind::NotNull(cond_ssa))
     }
 
@@ -282,6 +293,7 @@ impl RecorderState {
         if cond_ssa == SsaVar::NONE {
             return None;
         }
+        self.bump_external_pc();
         self.emit_guard(GuardKind::IsZero(cond_ssa))
     }
 
@@ -367,6 +379,7 @@ impl RecorderState {
             self.aborted = Some(AbortReason::TraceTooLong);
             return None;
         }
+        self.bump_external_pc();
         let dst = self.ssa.alloc();
         // Bounds guard anchored on the list_ssa / idx_ssa pair. The
         // emitter folds it into an inline compare; the buffer-side
@@ -448,6 +461,7 @@ impl RecorderState {
             self.aborted = Some(AbortReason::TraceTooLong);
             return None;
         }
+        self.bump_external_pc();
         let dst = self.ssa.alloc();
         self.buffer.append(TraceOp::DictLookup {
             dst,
@@ -494,6 +508,7 @@ impl RecorderState {
             self.aborted = Some(AbortReason::TraceTooLong);
             return None;
         }
+        self.bump_external_pc();
         // Guards before the op so a future invocation with a null
         // operand deopts at the guard rather than crashing inside the
         // shim. Mirror the order the lowering rule uses.
@@ -547,6 +562,7 @@ impl RecorderState {
             self.aborted = Some(AbortReason::TraceTooLong);
             return None;
         }
+        self.bump_external_pc();
         // F-D7 lowering policy: guard the haystack but not the needle.
         // The inline / shim paths both tolerate a zero-length needle
         // (return `true`) — emitting a `NotNull(needle)` here would
@@ -734,7 +750,7 @@ impl RecorderState {
         // emits for THIS op carries the per-op counter the bytecode
         // compile pass uses. Mirrors the bytecode compiler's
         // `next_pc()` (`ir_pc_next += 1`) increment-then-stamp order.
-        self.next_external_pc = self.next_external_pc.wrapping_add(1);
+        self.bump_external_pc();
 
         let fresh_dst = self.ssa.alloc();
         let cx = self.build_lowering_cx(op, inputs, fresh_dst);
