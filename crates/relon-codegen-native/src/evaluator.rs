@@ -15,6 +15,7 @@
 //! `relon` facade keeps the tree-walker available for those code
 //! paths, so callers never see a hard failure outside `run_main`.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::Arc;
@@ -1350,15 +1351,113 @@ impl CraneliftAotEvaluator {
             .checked_add(scratch_size)
             .ok_or_else(|| RuntimeError::IoError("cranelift arena size overflow".into()))?;
 
-        let mut arena = vec![0u8; arena_size as usize];
+        // 3. Borrow a thread-local arena buffer from the pool, sized
+        // to `arena_size`. Reuses the per-thread allocation across
+        // dispatches so the steady-state cost of a `run_main` no
+        // longer pays a fresh ~70 KiB `vec![0u8; …]` (alloc + zero)
+        // on every call. We only zero the bytes the JIT can read
+        // before writing — see `dispatch_with_pooled_arena` for the
+        // detailed zero plan.
+        //
+        // If the pool is already borrowed (e.g., a stdlib helper
+        // reentered the evaluator on the same thread) we transparently
+        // fall back to a fresh `Vec<u8>`; correctness wins over the
+        // pool hit on that vanishingly rare path.
+        ARENA_POOL.with(|cell| match cell.try_borrow_mut() {
+            Ok(mut buf) => self.dispatch_with_pooled_arena(
+                bs,
+                &mut buf,
+                arena_size as usize,
+                in_ptr,
+                in_len,
+                out_ptr,
+                out_cap,
+                scratch_base,
+                &in_bytes,
+            ),
+            Err(_) => {
+                let mut fallback: Vec<u8> = Vec::new();
+                self.dispatch_with_pooled_arena(
+                    bs,
+                    &mut fallback,
+                    arena_size as usize,
+                    in_ptr,
+                    in_len,
+                    out_ptr,
+                    out_cap,
+                    scratch_base,
+                    &in_bytes,
+                )
+            }
+        })
+    }
+
+    /// Run a single buffer-protocol dispatch against a caller-provided
+    /// `arena` `Vec<u8>`. The vector is resized in place to
+    /// `arena_size`; reused capacity is preserved, growth pays a
+    /// realloc only on the first oversized request. Only the bytes
+    /// the JIT (or the decode step) can read before writing are
+    /// zeroed:
+    ///
+    /// * `[0 .. const_data.len())` — overwritten by the const-data
+    ///   copy, so no pre-zero required.
+    /// * `[const_data.len() .. in_ptr + in_len)` — covers the
+    ///   alignment pad between const-data and the input buffer plus
+    ///   the input region itself; the input slice is then copied on
+    ///   top.
+    /// * `[in_ptr + in_len .. out_ptr + out_cap)` — alignment pad +
+    ///   output region. The JIT writes the prefix the trampoline
+    ///   reads back (`bytes_written`), but `BufferReader` may consume
+    ///   up to `return_layout.root_size` bytes, so any trailing slack
+    ///   must read as zero.
+    /// * `[scratch_base .. arena_size)` — left uninitialised. The
+    ///   scratch bump allocator always writes before it reads (see
+    ///   `codegen::memory::emit_alloc_scratch`), so previous-dispatch
+    ///   bytes don't leak into observable behaviour.
+    ///
+    /// Skipping the scratch zero is where the 70 KiB → ~6 KiB
+    /// per-dispatch zero savings come from (the scratch region is
+    /// the dominant 64 KiB slab).
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_with_pooled_arena(
+        &self,
+        bs: &BufferSchema,
+        arena: &mut Vec<u8>,
+        arena_size: usize,
+        in_ptr: u32,
+        in_len: u32,
+        out_ptr: u32,
+        out_cap: u32,
+        scratch_base: u32,
+        in_bytes: &[u8],
+    ) -> Result<Value, RuntimeError> {
+        // Ensure the backing storage is at least `arena_size` bytes
+        // and zero the prefix the JIT / decoder can observe. We use
+        // `resize` (zero-fill new tail) for growth and an explicit
+        // `fill(0)` over the observable prefix on reuse.
+        if arena.len() < arena_size {
+            arena.resize(arena_size, 0);
+        }
+        let observable_end = (out_ptr as usize) + (out_cap as usize);
+        debug_assert!(observable_end <= arena_size);
+        debug_assert!(self.const_data.len() <= in_ptr as usize);
+        // Zero the const-data → out-buf prefix. The const-data bytes
+        // are about to be overwritten in full, so we can skip them;
+        // start zeroing at `const_data.len()` and stop at the scratch
+        // boundary.
+        arena[self.const_data.len()..observable_end].fill(0);
         if !self.const_data.is_empty() {
             arena[..self.const_data.len()].copy_from_slice(&self.const_data);
         }
-        arena[in_ptr as usize..in_ptr as usize + in_bytes.len()].copy_from_slice(&in_bytes);
+        arena[in_ptr as usize..in_ptr as usize + in_bytes.len()].copy_from_slice(in_bytes);
 
-        // 3. Invoke the JIT.
+        // Hand only the live `arena_size` slice to the JIT so the
+        // sandbox's bounds check still sees the layout-correct length
+        // even when the underlying `Vec` is larger from a previous
+        // dispatch.
+        let live_arena = &mut arena[..arena_size];
         let bytes_written = self.invoke_buffer_entry_with_scratch(
-            &mut arena,
+            live_arena,
             in_ptr,
             in_len,
             out_ptr,
@@ -1378,7 +1477,7 @@ impl CraneliftAotEvaluator {
         // wasm side does the same.
         let read_len = bw.max(bs.return_layout.root_size);
         let read_end = out_ptr as usize + read_len;
-        if read_end > arena.len() {
+        if read_end > arena_size {
             return Err(RuntimeError::IoError(
                 "cranelift arena too small for return decode".into(),
             ));
@@ -1398,6 +1497,23 @@ impl CraneliftAotEvaluator {
             ))
         }
     }
+}
+
+thread_local! {
+    /// Per-thread arena buffer reused across `run_main_buffer`
+    /// dispatches. The buffer caches the largest `arena_size` the
+    /// thread has ever requested; subsequent dispatches reuse the
+    /// allocation, paying only a targeted `fill(0)` over the bytes
+    /// the JIT can observe (not the full ~64 KiB scratch slab).
+    ///
+    /// Thread-local sidesteps the synchronisation cost of a global
+    /// pool and matches the rest of the cranelift backend's runtime
+    /// state (`RECORDING_REGISTRY`, etc.), which is already
+    /// per-thread by design. Each `try_borrow_mut` is a single
+    /// boolean flip, so reentrant calls (a stdlib helper looping
+    /// back into the evaluator on the same thread) fall through to
+    /// a fresh `Vec` and stay correct.
+    static ARENA_POOL: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Inspect the IR module's entry function and return its parameter
