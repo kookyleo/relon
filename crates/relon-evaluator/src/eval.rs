@@ -1617,47 +1617,84 @@ impl TreeWalkEvaluator {
         let TokenKey::String(method_name, _, _) = &path[last_idx] else {
             return Ok(None);
         };
-        let Some(analyzed) = self.context.analyzed.as_ref() else {
+        if self.context.analyzed.is_none() {
+            return Ok(None);
+        }
+        // Static `Schema.method` dispatch (head names a schema directly,
+        // path is exactly 2 segments). Multi-hop paths can't be static.
+        if let Some(out) = self.try_static_schema_method(path, method_name, args, scope, range)? {
+            return Ok(Some(out));
+        }
+        // Receiver-value dispatch (`<expr>.method(...)` or
+        // `obj.field.method(...)`): materialise the receiver, then
+        // dispatch off its branded / primitive schema tag.
+        self.try_receiver_method(path, method_name, args, scope, range)
+    }
+
+    /// Static path: `Schema.method(...)` with `path.len() == 2` and the
+    /// head naming a known schema in `analyzed.schema_methods`.
+    /// Returns `Ok(None)` when this shape doesn't apply so the caller
+    /// can fall through to receiver dispatch.
+    fn try_static_schema_method(
+        &self,
+        path: &[TokenKey],
+        method_name: &str,
+        args: &[EvaluatedArg],
+        scope: &Arc<Scope>,
+        range: TokenRange,
+    ) -> Result<Option<Value>, RuntimeError> {
+        if path.len() != 2 {
+            return Ok(None);
+        }
+        let TokenKey::String(head, _, _) = &path[0] else {
             return Ok(None);
         };
-        // Static dispatch first: head names a schema directly, and
-        // the path is exactly `Schema.method` (2 segments). Multi-hop
-        // paths can't be static — `Order.User.greet` doesn't make
-        // sense; the prefix must resolve to a value at runtime.
-        if path.len() == 2 {
-            if let TokenKey::String(head, _, _) = &path[0] {
-                if let Some(methods) = analyzed.schema_methods.get(head) {
-                    if let Some(method) = methods.iter().find(|m| m.name == *method_name) {
-                        // Phase D: a `#native` method declared at source
-                        // level with no body delegates to a host-registered
-                        // impl. Try that table before falling through to
-                        // any (currently un-supported) static-body
-                        // dispatch.
-                        if method.is_native {
-                            if let Some(out) =
-                                self.try_call_native_method(head, method_name, None, args, range)?
-                            {
-                                return Ok(Some(out));
-                            }
-                        }
-                        if let Some(body) = method.body_node.as_ref() {
-                            return self
-                                .invoke_method_body(body, None, &method.params, args, scope, range)
-                                .map(Some);
-                        }
-                    }
-                }
+        let analyzed = self
+            .context
+            .analyzed
+            .as_ref()
+            .expect("caller already verified analyzed.is_some()");
+        let Some(methods) = analyzed.schema_methods.get(head) else {
+            return Ok(None);
+        };
+        let Some(method) = methods.iter().find(|m| m.name == *method_name) else {
+            return Ok(None);
+        };
+        // Phase D: a `#native` method with no body delegates to a
+        // host-registered impl. Try the host table before any static
+        // body fallback.
+        if method.is_native {
+            if let Some(out) = self.try_call_native_method(head, method_name, None, args, range)? {
+                return Ok(Some(out));
             }
         }
-        // v6-δ M1 R4: receiver dispatch for `<expr>.method(...)` where
-        // the receiver is an expression (string literal, list literal,
-        // parenthesised expr, etc.) — the parser lowers these as
-        // `TokenKey::Dynamic(inner_node, ...)`. We evaluate the inner
-        // node directly and use its value's brand / primitive tag as
-        // the schema name. Without this branch
-        // `"hello".length()` / `[1,2,3].sum()` were both
-        // FunctionNotFound because `resolve_variable` only walks the
-        // scope chain (string literals never make it into a local).
+        if let Some(body) = method.body_node.as_ref() {
+            return self
+                .invoke_method_body(body, None, &method.params, args, scope, range)
+                .map(Some);
+        }
+        Ok(None)
+    }
+
+    /// Receiver dispatch: materialise `path[..-1]` as a value, then
+    /// route through host native methods + analyzed schema methods
+    /// keyed by the value's brand / primitive tag. Handles both
+    /// `<expr>.method(...)` (via `TokenKey::Dynamic` head) and
+    /// `obj.field.method(...)` (multi-hop variable walk).
+    fn try_receiver_method(
+        &self,
+        path: &[TokenKey],
+        method_name: &str,
+        args: &[EvaluatedArg],
+        scope: &Arc<Scope>,
+        range: TokenRange,
+    ) -> Result<Option<Value>, RuntimeError> {
+        let last_idx = path.len() - 1;
+        // v6-δ M1 R4: `<expr>.method(...)` lowers head as
+        // `TokenKey::Dynamic(inner, ...)`. We evaluate the inner node
+        // directly because `resolve_variable` only walks the scope
+        // chain (string literals / list literals never land in a
+        // local).
         let receiver_value = if path.len() == 2 {
             if let TokenKey::Dynamic(inner, _) = &path[0] {
                 self.eval(inner, scope)?
@@ -1668,14 +1705,9 @@ impl TreeWalkEvaluator {
                 }
             }
         } else {
-            // Receiver dispatch: walk `path[..-1]` to materialize the
-            // receiver value, then read its schema tag. For 2-segment
-            // calls (`m.method`) this collapses to the original
-            // single-name lookup; for 3+ segments (`o.customer.method`)
-            // we descend through the intermediate fields using the same
-            // `resolve_variable` driver that powers `Expr::Variable`.
-            let prefix = &path[..last_idx];
-            match self.resolve_variable(prefix, scope, range) {
+            // Multi-segment receiver: descend the prefix through
+            // `resolve_variable` (same driver as Expr::Variable).
+            match self.resolve_variable(&path[..last_idx], scope, range) {
                 Ok(v) => v,
                 Err(_) => return Ok(None),
             }
@@ -1683,11 +1715,10 @@ impl TreeWalkEvaluator {
         let Some(schema_name) = value_schema_tag(&receiver_value) else {
             return Ok(None);
         };
-        // Phase D: receiver-side native method dispatch. Try the
-        // host-registered table first so schemas may attach behaviors
-        // even when the source-side `with { ... }` block is empty
-        // (e.g. body-less `#schema String with { ... }` from
-        // `register_pure_method("String", "is_blank", ...)`).
+        // Phase D: receiver-side native method dispatch first so
+        // host-attached behaviour wins over a body-less analyzed
+        // method (e.g. body-less `#schema String with { ... }` paired
+        // with `register_pure_method("String", "is_blank", ...)`).
         if let Some(out) = self.try_call_native_method(
             &schema_name,
             method_name,
@@ -1697,6 +1728,11 @@ impl TreeWalkEvaluator {
         )? {
             return Ok(Some(out));
         }
+        let analyzed = self
+            .context
+            .analyzed
+            .as_ref()
+            .expect("caller already verified analyzed.is_some()");
         let Some(methods) = analyzed.schema_methods.get(&schema_name) else {
             return Ok(None);
         };
