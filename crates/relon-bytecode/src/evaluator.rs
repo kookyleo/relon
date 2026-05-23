@@ -86,9 +86,14 @@ pub struct BytecodeEvaluator {
     /// Return field local-slot start index (right after the input
     /// arg slots).
     return_field_base: u32,
-    /// Default VM config. Cloned per `run_main` so concurrent calls
-    /// don't share the resource counter.
-    default_config: BcVmConfig,
+    /// Default VM config. Wrapped in `Arc` so per-`run_main` VM
+    /// construction is a refcount bump rather than a deep clone of
+    /// the `cap_vtable` (which carries a `HashMap<u32, Arc<dyn ...>>`
+    /// of host-fn registrations). Mutating `with_*` methods on
+    /// `BytecodeEvaluator` go through `Arc::make_mut`, copying once
+    /// on first mutation after a hot share — in practice the
+    /// evaluator's setup is single-owner and the make_mut is in-place.
+    default_config: Arc<BcVmConfig>,
     /// M2-C lever 5: cached return-shape descriptor derived from the
     /// `return_schema`. Computed once at construction so the per-call
     /// `run_main` epilogue avoids re-walking the schema on every
@@ -232,7 +237,7 @@ impl BytecodeEvaluator {
             param_tys,
             return_schema: None,
             return_field_base: 0,
-            default_config: BcVmConfig::default(),
+            default_config: Arc::new(BcVmConfig::default()),
             return_shape: ReturnShape::LegacyI64,
             cached_return_field_count: 0,
             cached_param_count,
@@ -268,7 +273,7 @@ impl BytecodeEvaluator {
             param_tys,
             return_schema: Some(return_schema),
             return_field_base,
-            default_config: BcVmConfig::default(),
+            default_config: Arc::new(BcVmConfig::default()),
             return_shape,
             cached_return_field_count,
             cached_param_count,
@@ -282,9 +287,11 @@ impl BytecodeEvaluator {
     }
 
     /// Override the default VM config (max_steps / deadline / cap
-    /// vtable).
+    /// vtable). Consumes the owned config and wraps in `Arc` so
+    /// subsequent `run_main` calls hand the VM a refcount-bumped
+    /// share rather than a deep clone.
     pub fn with_config(mut self, config: BcVmConfig) -> Self {
-        self.default_config = config;
+        self.default_config = Arc::new(config);
         self
     }
 
@@ -314,7 +321,9 @@ impl BytecodeEvaluator {
     /// gate ahead of phase 3 IR coverage get the consult mechanism
     /// for free as soon as guarded ops land.
     pub fn with_capability_gate(mut self, gate: Arc<dyn CapabilityGate>) -> Self {
-        self.default_config.cap_vtable.set_gate(gate);
+        Arc::make_mut(&mut self.default_config)
+            .cap_vtable
+            .set_gate(gate);
         self
     }
 
@@ -337,7 +346,7 @@ impl BytecodeEvaluator {
     /// wants the bytecode artefact and the matching cranelift trace
     /// to share the same id.
     pub fn with_hot_trigger(mut self, trigger: crate::hot_counter::HotTraceTriggerHandle) -> Self {
-        self.default_config.hot_trigger = Some(trigger);
+        Arc::make_mut(&mut self.default_config).hot_trigger = Some(trigger);
         self
     }
 
@@ -346,7 +355,7 @@ impl BytecodeEvaluator {
     /// the default 1000 mirrors the LuaJIT-style conservative kickoff
     /// the cranelift backend uses.
     pub fn with_hot_threshold(mut self, threshold: u32) -> Self {
-        self.default_config.hot_threshold = threshold;
+        Arc::make_mut(&mut self.default_config).hot_threshold = threshold;
         self
     }
 
@@ -373,7 +382,7 @@ impl BytecodeEvaluator {
         mut self,
         lookup: crate::trace_dispatch::InstalledTraceLookupHandle,
     ) -> Self {
-        self.default_config.trace_lookup = Some(lookup);
+        Arc::make_mut(&mut self.default_config).trace_lookup = Some(lookup);
         self
     }
 

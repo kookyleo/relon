@@ -633,7 +633,7 @@ pub struct BcRunOutcome {
 /// Stack-based VM. Stateful across calls (counters reset per
 /// [`BytecodeVm::invoke`]).
 pub struct BytecodeVm {
-    config: BcVmConfig,
+    config: Arc<BcVmConfig>,
     /// M2-C lever 2: per-`BytecodeVm` inline cache for `BcOp::CallNative`
     /// host-fn resolution.
     ///
@@ -688,10 +688,13 @@ thread_local! {
 }
 
 impl BytecodeVm {
-    /// Build a new VM with the supplied config.
-    pub fn new(config: BcVmConfig) -> Self {
+    /// Build a new VM with the supplied config. Accepts either an
+    /// owned `BcVmConfig` (auto-wrapped in `Arc`) or a pre-shared
+    /// `Arc<BcVmConfig>` (refcount bump on the caller side, deep
+    /// clone avoided).
+    pub fn new(config: impl Into<Arc<BcVmConfig>>) -> Self {
         Self {
-            config,
+            config: config.into(),
             call_native_cache: std::cell::RefCell::new(CallNativeCache::default()),
         }
     }
@@ -731,8 +734,12 @@ impl BytecodeVm {
 
     /// Mutable accessor on the active config — used by tests that
     /// flip a single knob (cap grant, max_steps) between invocations.
+    /// Routes through `Arc::make_mut`: if this VM has the only handle
+    /// the mutation is in-place; if the config is still shared (e.g.
+    /// the evaluator that built the VM still holds an `Arc`) it
+    /// clones once and detaches.
     pub fn config_mut(&mut self) -> &mut BcVmConfig {
-        &mut self.config
+        Arc::make_mut(&mut self.config)
     }
 
     /// Read-only accessor on the active config.
