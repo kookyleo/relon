@@ -1015,32 +1015,69 @@ impl CraneliftAotEvaluator {
     /// per-record evaluation in a streaming pipeline) should prefer
     /// this entry; per-invoke cost drops into the 150-200 ns band.
     pub fn run_main_legacy_i64(&self, args: &[i64]) -> Result<i64, RuntimeError> {
-        if self.buffer_schema.is_some() {
-            return Err(RuntimeError::Unsupported {
-                reason: "cranelift-native: run_main_legacy_i64 requires a legacy-shape entry; the evaluator was built from buffer-protocol source"
-                    .into(),
-            });
-        }
-        if args.len() != self.entry_arity {
-            return Err(RuntimeError::Unsupported {
-                reason: format!(
-                    "cranelift-native: #main expects {} arg(s), got {}",
-                    self.entry_arity,
-                    args.len()
-                ),
-            });
-        }
-        if args.len() > MAX_LEGACY_ARITY {
-            return Err(RuntimeError::Unsupported {
-                reason: format!(
-                    "cranelift-native legacy entry supports up to 4 args; got {}",
-                    args.len()
-                ),
-            });
-        }
+        self.check_legacy_entry_shape(args.len(), "run_main_legacy_i64")?;
         let mut argv = [0i64; MAX_LEGACY_ARITY];
         argv[..args.len()].copy_from_slice(args);
         self.invoke_legacy_entry(argv)
+    }
+
+    /// Shared pre-flight for every legacy `#main(...)` entry: reject
+    /// buffer-protocol evaluators, mismatched arity, or arity beyond
+    /// [`MAX_LEGACY_ARITY`]. `entry_name` is woven into the
+    /// buffer-protocol diagnostic so callers can tell which API path
+    /// surfaced the mismatch.
+    fn check_legacy_entry_shape(&self, n: usize, entry_name: &str) -> Result<(), RuntimeError> {
+        if self.buffer_schema.is_some() {
+            return Err(RuntimeError::Unsupported {
+                reason: format!(
+                    "cranelift-native: {entry_name} requires a legacy-shape entry; the evaluator was built from buffer-protocol source"
+                ),
+            });
+        }
+        if n != self.entry_arity {
+            return Err(RuntimeError::Unsupported {
+                reason: format!(
+                    "cranelift-native: #main expects {} arg(s), got {}",
+                    self.entry_arity, n
+                ),
+            });
+        }
+        if n > MAX_LEGACY_ARITY {
+            return Err(RuntimeError::Unsupported {
+                reason: format!("cranelift-native legacy entry supports up to 4 args; got {n}"),
+            });
+        }
+        Ok(())
+    }
+
+    /// Walk `param_names` and use `lookup` to materialise each slot
+    /// of the legacy `[i64; 4]` argv. Shared by `run_main_smallmap`
+    /// (slice-keyed lookup) and `Evaluator::run_main` (HashMap-keyed
+    /// lookup). The lookup closure receives the slot index plus the
+    /// declared parameter name and returns either the resolved
+    /// `Value` or a missing-arg error.
+    fn pack_legacy_argv_by_name<F>(
+        &self,
+        mut lookup: F,
+    ) -> Result<[i64; MAX_LEGACY_ARITY], RuntimeError>
+    where
+        F: FnMut(usize, &str) -> Result<Value, RuntimeError>,
+    {
+        let mut argv = [0i64; MAX_LEGACY_ARITY];
+        for (i, name) in self.param_names.iter().enumerate() {
+            match lookup(i, name)? {
+                Value::Int(v) => argv[i] = v,
+                other => {
+                    return Err(RuntimeError::MainArgTypeMismatch {
+                        name: name.clone(),
+                        expected: "Int".to_string(),
+                        found: other.type_name().to_string(),
+                        range: self.entry_range,
+                    });
+                }
+            }
+        }
+        Ok(argv)
     }
 
     /// 2026-05-21 dispatch-boundary lever (a): name-keyed entry that
@@ -1066,68 +1103,28 @@ impl CraneliftAotEvaluator {
     /// 230 ns band (saving ~130 ns, dominated by avoiding two `String`
     /// heap allocations plus the `HashMap` bucket allocation + drop).
     pub fn run_main_smallmap(&self, args: &[(&str, Value)]) -> Result<Value, RuntimeError> {
-        if self.buffer_schema.is_some() {
-            return Err(RuntimeError::Unsupported {
-                reason: "cranelift-native: run_main_smallmap requires a legacy-shape entry; the evaluator was built from buffer-protocol source"
-                    .into(),
-            });
-        }
-        if args.len() != self.entry_arity {
-            return Err(RuntimeError::Unsupported {
-                reason: format!(
-                    "cranelift-native: #main expects {} arg(s), got {}",
-                    self.entry_arity,
-                    args.len()
-                ),
-            });
-        }
-        if args.len() > MAX_LEGACY_ARITY {
-            return Err(RuntimeError::Unsupported {
-                reason: format!(
-                    "cranelift-native legacy entry supports up to 4 args; got {}",
-                    args.len()
-                ),
-            });
-        }
-        let mut argv = [0i64; MAX_LEGACY_ARITY];
-        for (i, name) in self.param_names.iter().enumerate() {
+        self.check_legacy_entry_shape(args.len(), "run_main_smallmap")?;
+        let argv = self.pack_legacy_argv_by_name(|i, name| {
             // Linear scan: at most 4 entries, faster than a hash lookup
             // for tiny n. Accept either the declared param name or the
             // synthetic `arg{i}` form for hosts that haven't surfaced
             // names yet.
-            let mut found: Option<&Value> = None;
             for (k, v) in args {
-                if *k == name.as_str() {
-                    found = Some(v);
-                    break;
+                if *k == name {
+                    return Ok(v.clone());
                 }
             }
-            if found.is_none() {
-                // Fallback to `arg{i}` synthetic; format only on miss.
-                let synth = format!("arg{i}");
-                for (k, v) in args {
-                    if *k == synth.as_str() {
-                        found = Some(v);
-                        break;
-                    }
+            let synth = format!("arg{i}");
+            for (k, v) in args {
+                if *k == synth.as_str() {
+                    return Ok(v.clone());
                 }
             }
-            let value = found.ok_or_else(|| RuntimeError::MissingMainArg {
-                name: name.clone(),
+            Err(RuntimeError::MissingMainArg {
+                name: name.to_string(),
                 range: self.entry_range,
-            })?;
-            match value {
-                Value::Int(v) => argv[i] = *v,
-                other => {
-                    return Err(RuntimeError::MainArgTypeMismatch {
-                        name: name.clone(),
-                        expected: "Int".to_string(),
-                        found: other.type_name().to_string(),
-                        range: self.entry_range,
-                    })
-                }
-            }
-        }
+            })
+        })?;
         let result_i64 = self.invoke_legacy_entry(argv)?;
         Ok(Value::Int(result_i64))
     }
@@ -1455,47 +1452,19 @@ impl Evaluator for CraneliftAotEvaluator {
         if self.buffer_schema.is_some() {
             return self.run_main_buffer(args);
         }
-
         // Legacy direct-IR path: pack i64 args into the JIT's
         // `extern "C"` slot.
-        if args.len() > MAX_LEGACY_ARITY {
-            return Err(RuntimeError::Unsupported {
-                reason: format!(
-                    "cranelift-native legacy entry supports up to 4 args; got {}",
-                    args.len()
-                ),
-            });
-        }
-        if args.len() != self.entry_arity {
-            return Err(RuntimeError::Unsupported {
-                reason: format!(
-                    "cranelift-native: #main expects {} arg(s), got {}",
-                    self.entry_arity,
-                    args.len()
-                ),
-            });
-        }
-
-        let mut argv = [0i64; MAX_LEGACY_ARITY];
-        for (i, name) in self.param_names.iter().enumerate() {
-            let value = args.get(name).or_else(|| args.get(&format!("arg{i}")));
-            let value = value.ok_or_else(|| RuntimeError::MissingMainArg {
-                name: name.clone(),
-                range: self.entry_range,
-            })?;
-            match value {
-                Value::Int(v) => argv[i] = *v,
-                other => {
-                    return Err(RuntimeError::MainArgTypeMismatch {
-                        name: name.clone(),
-                        expected: "Int".to_string(),
-                        found: other.type_name().to_string(),
-                        range: self.entry_range,
-                    })
-                }
-            }
-        }
-
+        self.check_legacy_entry_shape(args.len(), "run_main")?;
+        let argv = self.pack_legacy_argv_by_name(|i, name| {
+            let synth_key = format!("arg{i}");
+            args.get(name)
+                .or_else(|| args.get(&synth_key))
+                .cloned()
+                .ok_or_else(|| RuntimeError::MissingMainArg {
+                    name: name.to_string(),
+                    range: self.entry_range,
+                })
+        })?;
         let result_i64 = self.invoke_legacy_entry(argv)?;
         Ok(Value::Int(result_i64))
     }
