@@ -395,21 +395,21 @@ impl<'a> Parser<'a> {
         // Directive — dispatch on name. Unknown directive names take a
         // single optional expression body to match the legacy parser's
         // permissive fallback.
-        match name_text
-            .map(directive_shape)
-            .unwrap_or(DirectiveShape::Value)
-        {
-            DirectiveShape::Bare => {
+        let shape = name_text
+            .and_then(crate::directive::directive_shape)
+            .unwrap_or(crate::DirectiveShape::Value);
+        match shape {
+            crate::DirectiveShape::Bare => {
                 // No body. `#private`, `#relaxed`, `#unstrict`, `#native`.
             }
-            DirectiveShape::Value => {
+            crate::DirectiveShape::Value => {
                 if self.is_attribute_body_start() {
                     self.parse_expr();
                 }
             }
-            DirectiveShape::NameBody => self.parse_directive_name_body(),
-            DirectiveShape::Import => self.parse_directive_import(),
-            DirectiveShape::Main => self.parse_directive_main(),
+            crate::DirectiveShape::NameBody => self.parse_directive_name_body(),
+            crate::DirectiveShape::Import => self.parse_directive_import(),
+            crate::DirectiveShape::Main => self.parse_directive_main(),
         }
         self.close();
     }
@@ -2377,37 +2377,6 @@ impl<'a> Parser<'a> {
 //   8. pipe |
 // All operators are left-associative (right_bp = left_bp + 1).
 // =====================================================================
-
-/// Body shape every known `#name` directive expects. Mirrors the
-/// legacy `directive::DIRECTIVE_SHAPES` table (in `directive.rs`) —
-/// the lossless CST grammar takes the body bytes verbatim, but it
-/// still has to know whether to *try* to consume one (Value /
-/// NameBody / Import / Main) or stop right after the keyword (Bare).
-/// Unknown names fall through to `Value` so the corpus's permissive
-/// behaviour around third-party-looking directives is preserved.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DirectiveShape {
-    Bare,
-    Value,
-    NameBody,
-    Import,
-    Main,
-}
-
-/// Map a directive name to its expected body shape. Keep in sync with
-/// `crate::directive::DIRECTIVE_SHAPES`.
-fn directive_shape(name: &str) -> DirectiveShape {
-    match name {
-        "private" | "relaxed" | "unstrict" | "native" => DirectiveShape::Bare,
-        "default" | "expect" | "msg" | "error" | "brand" | "derive" | "no_auto_derive" => {
-            DirectiveShape::Value
-        }
-        "schema" | "extend" => DirectiveShape::NameBody,
-        "import" => DirectiveShape::Import,
-        "main" => DirectiveShape::Main,
-        _ => DirectiveShape::Value,
-    }
-}
 
 fn infix_bp(kind: SyntaxKind) -> Option<(u8, u8)> {
     Some(match kind {
