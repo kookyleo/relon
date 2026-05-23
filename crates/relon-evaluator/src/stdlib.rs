@@ -166,8 +166,16 @@ pub fn register_to(ctx: &mut Context) {
     // Stdlib JSON Schema parity wave — batch 3: list helpers.
     let list_unique: Arc<dyn RelonFunction> = Arc::new(ListUnique);
     let list_count: Arc<dyn RelonFunction> = Arc::new(ListCount);
+    let list_every: Arc<dyn RelonFunction> = Arc::new(ListEvery);
+    let list_some: Arc<dyn RelonFunction> = Arc::new(ListSome);
     ctx.register_pure_fn("unique", Arc::clone(&list_unique));
     ctx.register_pure_fn("count", Arc::clone(&list_count));
+    ctx.register_pure_fn("every", Arc::clone(&list_every));
+    ctx.register_pure_fn("some", Arc::clone(&list_some));
+    // Method-form aliases so `xs.every(p)` / `xs.some(p)` work.
+    ctx.register_pure_method("List", "every", list_every);
+    ctx.register_pure_method("List", "some", list_some);
+    ctx.register_pure_method("List", "unique", list_unique);
 
     // Phase D 收尾: schema-rooted method aliases for the same Rust
     // intrinsics. Decision 14 (`schema-rooted-model-2026-05-11.md`):
@@ -2903,6 +2911,74 @@ impl RelonFunction for ListUnique {
             }
         }
         Ok(Value::Bool(true))
+    }
+}
+
+/// `every(xs, p) -> Bool` — short-circuiting universal quantifier.
+/// `xs.every(p)` is JSON Schema `contains: { allOf: [<p>] }` if
+/// every element matches `<p>`. Empty list returns `true` (vacuous
+/// truth, matches mathematical convention + JS `Array.prototype.every`).
+struct ListEvery;
+impl RelonFunction for ListEvery {
+    fn call(
+        &self,
+        args: NativeArgs,
+        range: relon_parser::TokenRange,
+    ) -> Result<Value, RuntimeError> {
+        expect_arg_count(&args.positional, 2, range)?;
+        let list = expect_list(&args.positional[0], range)?;
+        let func = &args.positional[1];
+        let caps = args.caps();
+        let items = list.to_vec();
+        for item in items {
+            caps.tick(1, range)?;
+            let result = caps.call_relon(func, vec![item], range)?;
+            match result {
+                Value::Bool(true) => continue,
+                Value::Bool(false) => return Ok(Value::Bool(false)),
+                other => {
+                    return Err(RuntimeError::TypeMismatch {
+                        expected: "Bool".to_string(),
+                        found: other.type_name().to_string(),
+                        range,
+                    })
+                }
+            }
+        }
+        Ok(Value::Bool(true))
+    }
+}
+
+/// `some(xs, p) -> Bool` — short-circuiting existential quantifier.
+/// JSON Schema `contains: <p>` parity. Empty list returns `false`.
+struct ListSome;
+impl RelonFunction for ListSome {
+    fn call(
+        &self,
+        args: NativeArgs,
+        range: relon_parser::TokenRange,
+    ) -> Result<Value, RuntimeError> {
+        expect_arg_count(&args.positional, 2, range)?;
+        let list = expect_list(&args.positional[0], range)?;
+        let func = &args.positional[1];
+        let caps = args.caps();
+        let items = list.to_vec();
+        for item in items {
+            caps.tick(1, range)?;
+            let result = caps.call_relon(func, vec![item], range)?;
+            match result {
+                Value::Bool(true) => return Ok(Value::Bool(true)),
+                Value::Bool(false) => continue,
+                other => {
+                    return Err(RuntimeError::TypeMismatch {
+                        expected: "Bool".to_string(),
+                        found: other.type_name().to_string(),
+                        range,
+                    })
+                }
+            }
+        }
+        Ok(Value::Bool(false))
     }
 }
 
