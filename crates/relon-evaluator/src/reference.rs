@@ -50,6 +50,111 @@ fn child_owning_depth(d: Option<usize>) -> Option<usize> {
     }
 }
 
+/// Result of stepping one path-segment into a [`Value`] in the
+/// structural Dict / List fallback (i.e. when no `index()` witness
+/// caught the access first).
+pub(crate) enum ValueStep {
+    /// Lookup succeeded; this is the next `current_val`.
+    Found(Value),
+    /// Lookup missed but the segment is `?`-marked, so the whole
+    /// reference resolves to `Value::Null` and the caller should
+    /// stop walking.
+    OptionalNull,
+}
+
+/// How the structural fallback reports a malformed list index. The
+/// two `resolve_variable` / `lookup_value_path` callers split on this:
+/// the `parts`-tracking variant surfaces `TypeMismatch { expected:
+/// "Index" }` while the `display_path`-anchored variant collapses to a
+/// plain `VariableNotFound`. Calling out the difference here keeps
+/// the divergence in diagnostic shape audit-visible.
+pub(crate) enum ListIndexErrorKind {
+    /// `lookup_value_path` (called from `resolve_variable`'s tail and
+    /// from `eval_reference_path_from`'s tail) reports a non-integer
+    /// list index as `TypeMismatch`.
+    TypeMismatchIndex,
+    /// The other `lookup_value_path` (the path-cache flavour) reports
+    /// the same as `VariableNotFound(display_path, range)`. The
+    /// shape difference is observable through error diagnostics; do
+    /// not collapse the two without a test ratchet refresh.
+    VariableNotFound,
+}
+
+/// P1-16 step_into_value dedup: shared Dict / List structural-lookup
+/// step. Four near-identical match blocks in `resolve_variable` /
+/// `lookup_value_path` (the path-cache flavour) lower to this
+/// helper, parameterised by `list_index_err` so each diagnostic
+/// shape stays exactly as the unduplicated code emitted. Behaviour
+/// guarantees (each leg is covered by existing tests):
+///
+/// * Dict miss / List out-of-bounds: `OptionalNull` when `is_optional`,
+///   else `VariableNotFound(display_name, range)`.
+/// * Null receiver: `OptionalNull` when `is_optional`, else
+///   `TypeMismatch { expected: "Dict/List", found: "Null" }`.
+/// * Non-collection receiver: same — `OptionalNull` when optional,
+///   else `TypeMismatch { expected: "Dict/List" }`.
+/// * List index parse failure: shape depends on `list_index_err`
+///   (see [`ListIndexErrorKind`]).
+pub(crate) fn step_into_value(
+    current_val: &Value,
+    key: &str,
+    display_name: &str,
+    is_optional: bool,
+    range: TokenRange,
+    list_index_err: ListIndexErrorKind,
+) -> Result<ValueStep, RuntimeError> {
+    match current_val {
+        Value::Dict(d) => {
+            if let Some(val) = d.map.get(key) {
+                Ok(ValueStep::Found(val.clone()))
+            } else if is_optional {
+                Ok(ValueStep::OptionalNull)
+            } else {
+                Err(RuntimeError::VariableNotFound(
+                    display_name.to_string(),
+                    range,
+                ))
+            }
+        }
+        Value::List(list) => {
+            let idx = key
+                .parse::<usize>()
+                .map_err(|_| match list_index_err {
+                    ListIndexErrorKind::TypeMismatchIndex => RuntimeError::TypeMismatch {
+                        expected: "Index".to_string(),
+                        found: "String".to_string(),
+                        range,
+                    },
+                    ListIndexErrorKind::VariableNotFound => {
+                        RuntimeError::VariableNotFound(display_name.to_string(), range)
+                    }
+                })?;
+            if let Some(val) = list.get(idx) {
+                Ok(ValueStep::Found(val.clone()))
+            } else if is_optional {
+                Ok(ValueStep::OptionalNull)
+            } else {
+                Err(RuntimeError::VariableNotFound(
+                    display_name.to_string(),
+                    range,
+                ))
+            }
+        }
+        Value::Null if is_optional => Ok(ValueStep::OptionalNull),
+        _ => {
+            if is_optional {
+                Ok(ValueStep::OptionalNull)
+            } else {
+                Err(RuntimeError::TypeMismatch {
+                    expected: "Dict/List".to_string(),
+                    found: current_val.type_name().to_string(),
+                    range,
+                })
+            }
+        }
+    }
+}
+
 impl TreeWalkEvaluator {
     pub(crate) fn resolve_variable(
         &self,
@@ -127,43 +232,16 @@ impl TreeWalkEvaluator {
                 };
                 parts.push(key.clone());
                 let display_name = parts.join(".");
-                match current_val {
-                    Value::Dict(ref d) => {
-                        if let Some(val) = d.map.get(&key) {
-                            current_val = val.clone();
-                        } else if is_optional {
-                            return Ok(Value::Null);
-                        } else {
-                            return Err(RuntimeError::VariableNotFound(display_name, range));
-                        }
-                    }
-                    Value::List(ref list) => {
-                        let idx = key
-                            .parse::<usize>()
-                            .map_err(|_| RuntimeError::TypeMismatch {
-                                expected: "Index".to_string(),
-                                found: "String".to_string(),
-                                range,
-                            })?;
-                        if let Some(val) = list.get(idx) {
-                            current_val = val.clone();
-                        } else if is_optional {
-                            return Ok(Value::Null);
-                        } else {
-                            return Err(RuntimeError::VariableNotFound(display_name, range));
-                        }
-                    }
-                    Value::Null if is_optional => return Ok(Value::Null),
-                    _ => {
-                        if is_optional {
-                            return Ok(Value::Null);
-                        }
-                        return Err(RuntimeError::TypeMismatch {
-                            expected: "Dict/List".to_string(),
-                            found: current_val.type_name().to_string(),
-                            range,
-                        });
-                    }
+                match step_into_value(
+                    &current_val,
+                    &key,
+                    &display_name,
+                    is_optional,
+                    range,
+                    ListIndexErrorKind::TypeMismatchIndex,
+                )? {
+                    ValueStep::Found(v) => current_val = v,
+                    ValueStep::OptionalNull => return Ok(Value::Null),
                 }
                 continue;
             }
@@ -171,43 +249,16 @@ impl TreeWalkEvaluator {
             parts.push(key.clone());
             let display_name = parts.join(".");
 
-            match current_val {
-                Value::Dict(ref d) => {
-                    if let Some(val) = d.map.get(&key) {
-                        current_val = val.clone();
-                    } else if is_optional {
-                        return Ok(Value::Null);
-                    } else {
-                        return Err(RuntimeError::VariableNotFound(display_name, range));
-                    }
-                }
-                Value::List(ref list) => {
-                    let idx = key
-                        .parse::<usize>()
-                        .map_err(|_| RuntimeError::TypeMismatch {
-                            expected: "Index".to_string(),
-                            found: "String".to_string(),
-                            range,
-                        })?;
-                    if let Some(val) = list.get(idx) {
-                        current_val = val.clone();
-                    } else if is_optional {
-                        return Ok(Value::Null);
-                    } else {
-                        return Err(RuntimeError::VariableNotFound(display_name, range));
-                    }
-                }
-                Value::Null if is_optional => return Ok(Value::Null),
-                _ => {
-                    if is_optional {
-                        return Ok(Value::Null);
-                    }
-                    return Err(RuntimeError::TypeMismatch {
-                        expected: "Dict/List".to_string(),
-                        found: current_val.type_name().to_string(),
-                        range,
-                    });
-                }
+            match step_into_value(
+                &current_val,
+                &key,
+                &display_name,
+                is_optional,
+                range,
+                ListIndexErrorKind::TypeMismatchIndex,
+            )? {
+                ValueStep::Found(v) => current_val = v,
+                ValueStep::OptionalNull => return Ok(Value::Null),
             }
         }
         Ok(current_val)
@@ -853,47 +904,17 @@ impl TreeWalkEvaluator {
                         })
                     }
                 };
-                current_val = match current_val {
-                    Value::Dict(ref d) => {
-                        if let Some(v) = d.map.get(&key) {
-                            v.clone()
-                        } else if is_optional {
-                            Value::Null
-                        } else {
-                            return Err(RuntimeError::VariableNotFound(
-                                display_path.to_string(),
-                                range,
-                            ));
-                        }
-                    }
-                    Value::List(list) => {
-                        let index = key.parse::<usize>().map_err(|_| {
-                            RuntimeError::VariableNotFound(display_path.to_string(), range)
-                        })?;
-                        if let Some(v) = list.get(index) {
-                            v.clone()
-                        } else if is_optional {
-                            Value::Null
-                        } else {
-                            return Err(RuntimeError::VariableNotFound(
-                                display_path.to_string(),
-                                range,
-                            ));
-                        }
-                    }
-                    Value::Null if is_optional => Value::Null,
-                    other => {
-                        if is_optional {
-                            Value::Null
-                        } else {
-                            return Err(RuntimeError::TypeMismatch {
-                                expected: "Dict/List".to_string(),
-                                found: other.type_name().to_string(),
-                                range,
-                            });
-                        }
-                    }
-                };
+                match step_into_value(
+                    &current_val,
+                    &key,
+                    display_path,
+                    is_optional,
+                    range,
+                    ListIndexErrorKind::VariableNotFound,
+                )? {
+                    ValueStep::Found(v) => current_val = v,
+                    ValueStep::OptionalNull => return Ok(Value::Null),
+                }
                 if current_val == Value::Null && is_optional {
                     return Ok(Value::Null);
                 }
@@ -904,47 +925,17 @@ impl TreeWalkEvaluator {
             // the literal string `"<dynamic>"`.
             let key = part.name();
 
-            current_val = match current_val {
-                Value::Dict(ref d) => {
-                    if let Some(v) = d.map.get(&key) {
-                        v.clone()
-                    } else if is_optional {
-                        Value::Null
-                    } else {
-                        return Err(RuntimeError::VariableNotFound(
-                            display_path.to_string(),
-                            range,
-                        ));
-                    }
-                }
-                Value::List(list) => {
-                    let index = key.parse::<usize>().map_err(|_| {
-                        RuntimeError::VariableNotFound(display_path.to_string(), range)
-                    })?;
-                    if let Some(v) = list.get(index) {
-                        v.clone()
-                    } else if is_optional {
-                        Value::Null
-                    } else {
-                        return Err(RuntimeError::VariableNotFound(
-                            display_path.to_string(),
-                            range,
-                        ));
-                    }
-                }
-                Value::Null if is_optional => Value::Null,
-                other => {
-                    if is_optional {
-                        Value::Null
-                    } else {
-                        return Err(RuntimeError::TypeMismatch {
-                            expected: "Dict/List".to_string(),
-                            found: other.type_name().to_string(),
-                            range,
-                        });
-                    }
-                }
-            };
+            match step_into_value(
+                &current_val,
+                &key,
+                display_path,
+                is_optional,
+                range,
+                ListIndexErrorKind::VariableNotFound,
+            )? {
+                ValueStep::Found(v) => current_val = v,
+                ValueStep::OptionalNull => return Ok(Value::Null),
+            }
             if current_val == Value::Null && is_optional {
                 return Ok(Value::Null);
             }
