@@ -757,6 +757,51 @@ impl BytecodeVm {
         self.config.cap_vtable.consult_all_granted_bits()
     }
 
+    /// P1-19: shared dispatch-entry capability prologue. Both
+    /// [`Self::invoke_from_with_stack`] and
+    /// [`Self::invoke_pooled_typed_i64`] ran the same two-stage
+    /// consult sequence (`consult_all_granted_bits` then, when the
+    /// function carries cap-sensitive ops, `consult_all_declared_bits`)
+    /// inline; the helper unifies the sequencing so future cap-gate
+    /// changes can't drift between the two entry points. Marked
+    /// `#[inline]` so the call sites stay branch-equivalent to the
+    /// hand-inlined original — the dispatch loop body itself
+    /// (`feedback_bench_methodology_first`) remains untouched.
+    #[inline]
+    fn precheck_capabilities(&self, func: &BcFunction) -> Result<(), BcVmError> {
+        if let Err(err) = self.config.cap_vtable.consult_all_granted_bits() {
+            return Err(BcVmError::CapabilityDenied {
+                cap_bit: err.cap.bit_index(),
+            });
+        }
+        if func.requires_cap_consult {
+            if let Err(err) = self.config.cap_vtable.consult_all_declared_bits() {
+                return Err(BcVmError::CapabilityDenied {
+                    cap_bit: err.cap.bit_index(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// P1-19: shared hot-counter trigger prologue. The trigger
+    /// records one tick against the hot counter and, when the
+    /// configured threshold is crossed for the first time, hands the
+    /// args slice to the installed `HotTrigger` so the trace recorder
+    /// can prime against the same view the VM is about to execute.
+    /// Saturates after `HotTrigger` so subsequent invocations pay
+    /// only the Option probe. Inlined so neither call site grows a
+    /// new fn boundary inside the per-invoke prologue.
+    #[inline]
+    fn maybe_trigger_hot(&self, func: &BcFunction, args: &[VmValue]) {
+        if let (Some(fn_id), Some(trigger)) = (func.fn_id, self.config.hot_trigger.as_ref()) {
+            let outcome = crate::hot_counter::record_hot(fn_id, self.config.hot_threshold);
+            if outcome == HotCounterResult::HotTrigger {
+                trigger.on_hot(fn_id, args);
+            }
+        }
+    }
+
     /// Invoke `func` with the supplied `args` filling locals
     /// `0..args.len()`. The dispatch loop ticks against
     /// `max_steps`, watches `deadline`, and surfaces trap-prong
@@ -901,79 +946,23 @@ impl BytecodeVm {
         // consults via the new `BcOp::CheckCap` / `BcOp::CallNative`
         // ops; phase 2 keeps the consult at the dispatch boundary
         // where the existing scaffold ops live.
-        if let Err(err) = self.config.cap_vtable.consult_all_granted_bits() {
-            return exit(
-                None,
-                Some(BcVmError::CapabilityDenied {
-                    cap_bit: err.cap.bit_index(),
-                }),
-                last_bc_idx,
-                steps,
-                locals,
-            );
-        }
-        // #166 M2-B from_source full cap-gate activation: when the
-        // compile pass flagged the function as carrying a capability-
-        // sensitive op (`BcOp::CallNative` / `BcOp::CheckCap` — or, for
-        // hand-built `BcFunction` instances, anything the host marked
-        // via `requires_cap_consult`), sweep every declared
-        // `CapabilityBit` through the installed gate before the first
-        // op dispatches. This activates the gate consult chain even
-        // when the per-op `cap_bit` carries `NO_CAPABILITY_BIT`
-        // (`u32::MAX`) — a future native fn whose declared gate is
-        // narrower than what the host might still deny still surfaces
-        // a denied bit at the entry boundary.
-        //
-        // No-op for scalar `from_source` (the historical M2-A
-        // envelope) — those functions compile with the flag cleared,
-        // so the consult never runs. The cost paid by hosts that opted
-        // into the gate is six virtual calls at the entry boundary
-        // (`Capabilities::check` per declared bit) — comparable to the
-        // cranelift backend's vtable-build-time sweep.
-        if func.requires_cap_consult {
-            if let Err(err) = self.config.cap_vtable.consult_all_declared_bits() {
-                return exit(
-                    None,
-                    Some(BcVmError::CapabilityDenied {
-                        cap_bit: err.cap.bit_index(),
-                    }),
-                    last_bc_idx,
-                    steps,
-                    locals,
-                );
-            }
+        // P1-19: capability prologue runs through the shared helper so
+        // the two-stage consult sequence (`consult_all_granted_bits`
+        // then, when `requires_cap_consult` is set, the declared-bit
+        // sweep — #166 M2-B from_source full cap-gate activation)
+        // can't drift between this entry and `invoke_pooled_typed_i64`.
+        if let Err(err) = self.precheck_capabilities(func) {
+            return exit(None, Some(err), last_bc_idx, steps, locals);
         }
         // M2-B phase 4c: hot-counter prologue. Mirrors the cranelift
         // entry-fn prologue (`crates/relon-codegen-native/src/codegen/hot_counter.rs`)
         // but as Rust on the dispatch path — no machine-code emit.
-        //
-        // We only run the prologue on the **outer** invocation entry —
+        // Only the **outer** invocation entry runs the trigger —
         // `start_bc_idx == 0` filters out partial-resume re-entries
-        // routed through `BytecodeEvaluator::resume_from_pc`, so the
+        // routed through `BytecodeEvaluator::resume_from_pc` so the
         // recorder doesn't get retriggered for every deopt bounce.
-        // The trigger fires at most once per (fn_id, thread) because
-        // the counter saturates after `HotTrigger`; subsequent
-        // crossings observe `AlreadyHot` and skip the call.
-        //
-        // The hook runs **before** the first op dispatches so the
-        // recording-time view matches what the bytecode VM is about
-        // to execute. The host is responsible for ensuring `on_hot`
-        // is panic-free (the trait docs spell this out); a panic here
-        // would propagate through the `invoke` call and the host has
-        // no convenient catch-unwind boundary today.
         if start_bc_idx == 0 {
-            if let (Some(fn_id), Some(trigger)) = (func.fn_id, self.config.hot_trigger.as_ref()) {
-                let outcome = crate::hot_counter::record_hot(fn_id, self.config.hot_threshold);
-                if outcome == HotCounterResult::HotTrigger {
-                    // The packed-args view the recorder needs is just
-                    // the args slice we already have on the stack —
-                    // the bytecode VM's calling convention is one
-                    // `u64` per arg in declaration order, matching
-                    // the `args_ptr` shape `__relon_jump_to_recorder`
-                    // unpacks against the registered `param_tys`.
-                    trigger.on_hot(fn_id, args);
-                }
-            }
+            self.maybe_trigger_hot(func, args);
         }
         loop {
             // Resource prong: tick.
@@ -1114,33 +1103,16 @@ impl BytecodeVm {
                 let mut pc: usize = 0;
                 let mut steps: u64 = 0;
 
-                // Capability pre-checks: the consult helpers short-
-                // circuit when no gate is installed, so the inert
-                // scaffold (W12-style) pays one branch each.
-                if let Err(err) = self.config.cap_vtable.consult_all_granted_bits() {
-                    return Err(BcVmError::CapabilityDenied {
-                        cap_bit: err.cap.bit_index(),
-                    });
-                }
-                if func.requires_cap_consult {
-                    if let Err(err) = self.config.cap_vtable.consult_all_declared_bits() {
-                        return Err(BcVmError::CapabilityDenied {
-                            cap_bit: err.cap.bit_index(),
-                        });
-                    }
-                }
-
-                // Hot-counter prologue mirrors the general path. The
-                // trigger fires at most once per (fn_id, thread); the
-                // saturated counter keeps the cost at a single Option
-                // probe for subsequent invokes.
-                if let (Some(fn_id), Some(trigger)) = (func.fn_id, self.config.hot_trigger.as_ref())
-                {
-                    let outcome = crate::hot_counter::record_hot(fn_id, self.config.hot_threshold);
-                    if outcome == HotCounterResult::HotTrigger {
-                        trigger.on_hot(fn_id, args);
-                    }
-                }
+                // P1-19: capability + hot-counter prologue routed
+                // through the shared helpers, identical to the general
+                // `invoke_from_with_stack` path. The W12-style inert
+                // scaffold still pays only the per-helper short-circuit
+                // (`consult_all_granted_bits` / `consult_all_declared_bits`
+                // each return early when no gate is installed), and the
+                // `#[inline]` annotation keeps the call sites equivalent
+                // to the hand-inlined original.
+                self.precheck_capabilities(func)?;
+                self.maybe_trigger_hot(func, args);
 
                 loop {
                     steps += 1;
