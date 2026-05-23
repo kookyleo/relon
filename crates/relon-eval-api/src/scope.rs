@@ -138,7 +138,7 @@ pub struct Scope {
     /// Most-recent path segment opened by [`Scope::with_path`] /
     /// [`Scope::with_list_context`]; `&sibling` / `&uncle` peel these off when
     /// rebuilding the relative target path.
-    pub path_node: Option<String>,
+    pub path_node: Option<Arc<str>>,
     /// Bindings introduced inside this frame (closure params, comprehension
     /// loop vars, `where` clauses, imported aliases).
     pub locals: Locals,
@@ -272,7 +272,7 @@ impl Scope {
         let mut current = Some(self);
         while let Some(scope) = current {
             if let Some(node) = &scope.path_node {
-                path.push(node.clone());
+                path.push(node.to_string());
             }
             current = scope.parent.as_deref();
         }
@@ -345,13 +345,13 @@ impl Scope {
         child
     }
 
-    pub fn with_path(self: &Arc<Self>, node: String) -> Arc<Self> {
+    pub fn with_path(self: &Arc<Self>, node: impl Into<Arc<str>>) -> Arc<Self> {
         let mut child = self.child();
         // `child()` returns Arc with no other strong references yet, so this
         // get_mut is safe.
         Arc::get_mut(&mut child)
             .expect("freshly built child has no aliases")
-            .path_node = Some(node);
+            .path_node = Some(node.into());
         child
     }
 
@@ -362,7 +362,7 @@ impl Scope {
     ) -> Arc<Self> {
         let mut child = self.child();
         let unique = Arc::get_mut(&mut child).expect("freshly built child has no aliases");
-        unique.path_node = Some(index.to_string());
+        unique.path_node = Some(Arc::<str>::from(index.to_string()));
         unique.list_context = Some(Arc::new(ListContext::fixed(index, elements)));
         child
     }
