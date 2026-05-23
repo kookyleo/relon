@@ -985,240 +985,133 @@ impl TraceJitState {
         // free slot. The `HostHookFuncIds` block is passed to the
         // emitter so `declare_imported_user_function` writes the
         // right indices into the function IR.
-        let save_deopt_sig = build_host_helper_signature(
-            &[
-                pointer_ty,
-                cranelift_codegen::ir::types::I32,
-                cranelift_codegen::ir::types::I64,
-            ],
-            &[],
-        );
-        let resolve_call_sig = build_host_helper_signature(
-            &[pointer_ty, cranelift_codegen::ir::types::I32],
-            &[pointer_ty],
-        );
-        let ic_lookup_sig = build_host_helper_signature(
-            &[
-                pointer_ty,
-                cranelift_codegen::ir::types::I32,
-                cranelift_codegen::ir::types::I64,
-            ],
-            &[cranelift_codegen::ir::types::I64],
-        );
-        let save_deopt_id = module
-            .declare_function(
-                relon_trace_emitter::HostHookId::SaveDeopt.symbol(),
-                Linkage::Import,
-                &save_deopt_sig,
-            )
-            .map_err(|e| TraceJitError::Module(format!("declare save_deopt: {e}")))?;
-        let resolve_call_id = module
-            .declare_function(
-                relon_trace_emitter::HostHookId::ResolveCall.symbol(),
-                Linkage::Import,
-                &resolve_call_sig,
-            )
-            .map_err(|e| TraceJitError::Module(format!("declare resolve_call: {e}")))?;
-        let ic_lookup_id = module
-            .declare_function(
-                relon_trace_emitter::HostHookId::InlineCacheLookup.symbol(),
-                Linkage::Import,
-                &ic_lookup_sig,
-            )
-            .map_err(|e| TraceJitError::Module(format!("declare ic_lookup: {e}")))?;
-        // F-D7 string shims: import the four `__relon_str_*` helpers
-        // up-front so the emitter can target them by FuncId. All four
-        // use `(ptr,ptr) -> ptr`-shaped signatures except contains
-        // (returns i32), find (returns i64), and substring (takes an
-        // extra start+length pair).
-        let str_concat_sig = build_host_helper_signature(&[pointer_ty, pointer_ty], &[pointer_ty]);
-        let str_contains_sig = build_host_helper_signature(
-            &[pointer_ty, pointer_ty],
-            &[cranelift_codegen::ir::types::I32],
-        );
-        let str_find_sig = build_host_helper_signature(
-            &[pointer_ty, pointer_ty],
-            &[cranelift_codegen::ir::types::I64],
-        );
-        let str_substring_sig = build_host_helper_signature(
-            &[
-                pointer_ty,
-                cranelift_codegen::ir::types::I64,
-                cranelift_codegen::ir::types::I64,
-            ],
-            &[pointer_ty],
-        );
-        let str_concat_id = module
-            .declare_function(
-                relon_trace_emitter::HostHookId::StrConcat.symbol(),
-                Linkage::Import,
-                &str_concat_sig,
-            )
-            .map_err(|e| TraceJitError::Module(format!("declare str_concat: {e}")))?;
-        let str_contains_id = module
-            .declare_function(
-                relon_trace_emitter::HostHookId::StrContains.symbol(),
-                Linkage::Import,
-                &str_contains_sig,
-            )
-            .map_err(|e| TraceJitError::Module(format!("declare str_contains: {e}")))?;
-        let str_find_id = module
-            .declare_function(
-                relon_trace_emitter::HostHookId::StrFind.symbol(),
-                Linkage::Import,
-                &str_find_sig,
-            )
-            .map_err(|e| TraceJitError::Module(format!("declare str_find: {e}")))?;
-        let str_substring_id = module
-            .declare_function(
-                relon_trace_emitter::HostHookId::StrSubstring.symbol(),
-                Linkage::Import,
-                &str_substring_sig,
-            )
-            .map_err(|e| TraceJitError::Module(format!("declare str_substring: {e}")))?;
-        // F-D7-I: optional alloc-only helper for the inline `StrConcat`
-        // short-rhs lowering. `(lhs: *const StringRef, total_len: usize)
-        // -> *mut StringRef`.
-        let str_concat_alloc_sig =
-            build_host_helper_signature(&[pointer_ty, pointer_ty], &[pointer_ty]);
-        let str_concat_alloc_id = module
-            .declare_function(
-                relon_trace_emitter::HostHookId::StrConcatAlloc.symbol(),
-                Linkage::Import,
-                &str_concat_alloc_sig,
-            )
-            .map_err(|e| TraceJitError::Module(format!("declare str_concat_alloc: {e}")))?;
-        // Tier 1b: companion seal-hash helper for the inline `StrConcat`
-        // short-rhs lowering. `(s: *mut StringRef) -> ()`. The emitter
-        // calls this after the unrolled rhs `store.i8` tail so the
-        // freshly-built `StringRef`'s cached fx_hash field matches the
-        // now-complete payload; without it the dict-lookup IC fast
-        // path on the concat result would silently miss every iter
-        // (see the helper's doc comment in
-        // `relon_trace_jit::runtime::str_ops`).
-        let str_concat_seal_hash_sig = build_host_helper_signature(&[pointer_ty], &[]);
-        // Declared but currently unused — the IR emitter is configured
-        // to skip the seal call (see str_concat_seal_hash: None below).
-        // Keep the symbol declaration so JIT installs the runtime helper
-        // for future selective-emit reactivation.
-        let _str_concat_seal_hash_id = module
-            .declare_function(
-                relon_trace_emitter::HostHookId::StrConcatSealHash.symbol(),
-                Linkage::Import,
-                &str_concat_seal_hash_sig,
-            )
-            .map_err(|e| TraceJitError::Module(format!("declare str_concat_seal_hash: {e}")))?;
-        // #168: N-operand single-allocation concat helper.
-        // `(operands: *const *const StringRef, n: usize, total_len: usize)
-        //   -> *mut StringRef`. The inline `TraceOp::StrConcatN`
-        // lowering stack-spills the operand pointer SSAs into a small
-        // `[*const StringRef; N]` array and calls this helper once per
-        // op so the trace tail stays a single allocation + memcpy
-        // sequence rather than `N - 1` pair-wise extern shim calls.
-        let str_concat_n_alloc_sig =
-            build_host_helper_signature(&[pointer_ty, pointer_ty, pointer_ty], &[pointer_ty]);
-        let str_concat_n_alloc_id = module
-            .declare_function(
-                relon_trace_emitter::HostHookId::StrConcatNAlloc.symbol(),
-                Linkage::Import,
-                &str_concat_n_alloc_sig,
-            )
-            .map_err(|e| TraceJitError::Module(format!("declare str_concat_n_alloc: {e}")))?;
-        // 2026-05-21 Tier-2: pre-declare `__relon_str_glob_match` so
-        // recorded traces that hit `glob_match(s, pat)` link cleanly.
-        // Same `(ptr, ptr) -> i32` signature shape as
-        // `__relon_str_contains`; the symbol resolves to the body in
-        // `crate::trace_glob_helper`. `Linkage::Import` rationale
-        // mirrors the rest of this block — `register_trace_runtime_symbols`
-        // registers the symbol before finalisation.
-        let str_glob_match_sig = build_host_helper_signature(
-            &[pointer_ty, pointer_ty],
-            &[cranelift_codegen::ir::types::I32],
-        );
-        let str_glob_match_id = module
-            .declare_function(
-                relon_trace_emitter::HostHookId::StrGlobMatch.symbol(),
-                Linkage::Import,
-                &str_glob_match_sig,
-            )
-            .map_err(|e| TraceJitError::Module(format!("declare str_glob_match: {e}")))?;
-        // F-D8: pre-declare the dict/list helpers so traces emitted
-        // with `TraceOp::ListGet` / `TraceOp::DictLookup` link
-        // cleanly. Same Linkage::Import rationale as save_deopt /
-        // resolve_call — the symbols are registered via
-        // `register_trace_runtime_symbols` on the JIT builder before
-        // we finalise the module.
-        let list_get_sig = build_host_helper_signature(
-            &[pointer_ty, cranelift_codegen::ir::types::I64, pointer_ty],
-            &[cranelift_codegen::ir::types::I64],
-        );
-        let dict_lookup_sig = build_host_helper_signature(
-            &[
-                pointer_ty,
-                pointer_ty,
-                pointer_ty,
-                cranelift_codegen::ir::types::I64,
-                pointer_ty,
-            ],
-            &[cranelift_codegen::ir::types::I64],
-        );
-        let list_get_id = module
-            .declare_function(
-                relon_trace_emitter::HostHookId::ListGet.symbol(),
-                Linkage::Import,
-                &list_get_sig,
-            )
-            .map_err(|e| TraceJitError::Module(format!("declare list_get: {e}")))?;
-        let dict_lookup_id = module
-            .declare_function(
-                relon_trace_emitter::HostHookId::DictLookup.symbol(),
-                Linkage::Import,
-                &dict_lookup_sig,
-            )
-            .map_err(|e| TraceJitError::Module(format!("declare dict_lookup: {e}")))?;
-        // F-D8-E.2: pre-declare the "shape already checked" variant
-        // of the dict lookup helper. The optimizer's `dict_ic_hoist`
-        // pass rewrites in-loop `TraceOp::DictLookup` whose
-        // `dict_ptr` is loop-invariant into a `DictShapeGuard` (LICM
-        // hoists out of the loop) + a `DictLookupPrechecked` (stays
-        // in the body) pair. The prechecked op routes here; the
-        // shape compare it skips was made redundant by the hoisted
-        // guard. Signature mirrors v2 `dict_lookup` minus the
-        // `shape_hash: i64` arg.
-        let dict_lookup_prechecked_sig = build_host_helper_signature(
-            &[pointer_ty, pointer_ty, pointer_ty, pointer_ty],
-            &[cranelift_codegen::ir::types::I64],
-        );
-        let dict_lookup_prechecked_id = module
-            .declare_function(
-                relon_trace_emitter::HostHookId::DictLookupPrechecked.symbol(),
-                Linkage::Import,
-                &dict_lookup_prechecked_sig,
-            )
-            .map_err(|e| TraceJitError::Module(format!("declare dict_lookup_prechecked: {e}")))?;
+        // Pre-declare every host helper the emitter may reference,
+        // keyed by `HostHookId`. We declare them up-front so the JIT
+        // module's FuncId-to-symbol mapping is deterministic before
+        // the trace fn claims the next free slot — otherwise the
+        // emitter could end up calling FuncId 0 (the trace itself)
+        // and recurse the moment any guard fires.
+        //
+        // `Linkage::Import` is the right shape for every entry:
+        // `register_trace_runtime_symbols` wires the actual address
+        // through the JIT builder before finalisation. Helpers
+        // disabled at emit time (e.g. `StrConcatSealHash`, which the
+        // IR emitter currently skips per the W3 +245% regression
+        // fix) still get declared so a future selective-emit pass
+        // can re-enable them without a fresh install pipeline.
+        let i32_ty = cranelift_codegen::ir::types::I32;
+        let i64_ty = cranelift_codegen::ir::types::I64;
+        let host_hooks: &[(
+            relon_trace_emitter::HostHookId,
+            &[cranelift_codegen::ir::Type],
+            &[cranelift_codegen::ir::Type],
+        )] = &[
+            (
+                relon_trace_emitter::HostHookId::SaveDeopt,
+                &[pointer_ty, i32_ty, i64_ty],
+                &[],
+            ),
+            (
+                relon_trace_emitter::HostHookId::ResolveCall,
+                &[pointer_ty, i32_ty],
+                &[pointer_ty],
+            ),
+            (
+                relon_trace_emitter::HostHookId::InlineCacheLookup,
+                &[pointer_ty, i32_ty, i64_ty],
+                &[i64_ty],
+            ),
+            (
+                relon_trace_emitter::HostHookId::StrConcat,
+                &[pointer_ty, pointer_ty],
+                &[pointer_ty],
+            ),
+            (
+                relon_trace_emitter::HostHookId::StrContains,
+                &[pointer_ty, pointer_ty],
+                &[i32_ty],
+            ),
+            (
+                relon_trace_emitter::HostHookId::StrFind,
+                &[pointer_ty, pointer_ty],
+                &[i64_ty],
+            ),
+            (
+                relon_trace_emitter::HostHookId::StrSubstring,
+                &[pointer_ty, i64_ty, i64_ty],
+                &[pointer_ty],
+            ),
+            (
+                relon_trace_emitter::HostHookId::StrConcatAlloc,
+                &[pointer_ty, pointer_ty],
+                &[pointer_ty],
+            ),
+            (
+                relon_trace_emitter::HostHookId::StrConcatSealHash,
+                &[pointer_ty],
+                &[],
+            ),
+            (
+                relon_trace_emitter::HostHookId::StrConcatNAlloc,
+                &[pointer_ty, pointer_ty, pointer_ty],
+                &[pointer_ty],
+            ),
+            (
+                relon_trace_emitter::HostHookId::StrGlobMatch,
+                &[pointer_ty, pointer_ty],
+                &[i32_ty],
+            ),
+            (
+                relon_trace_emitter::HostHookId::ListGet,
+                &[pointer_ty, i64_ty, pointer_ty],
+                &[i64_ty],
+            ),
+            (
+                relon_trace_emitter::HostHookId::DictLookup,
+                &[pointer_ty, pointer_ty, pointer_ty, i64_ty, pointer_ty],
+                &[i64_ty],
+            ),
+            (
+                relon_trace_emitter::HostHookId::DictLookupPrechecked,
+                &[pointer_ty, pointer_ty, pointer_ty, pointer_ty],
+                &[i64_ty],
+            ),
+        ];
+        let mut hook_id_by_hook: std::collections::HashMap<relon_trace_emitter::HostHookId, u32> =
+            std::collections::HashMap::with_capacity(host_hooks.len());
+        for (hook, args, rets) in host_hooks {
+            let sig = build_host_helper_signature(args, rets);
+            let id = module
+                .declare_function(hook.symbol(), Linkage::Import, &sig)
+                .map_err(|e| TraceJitError::Module(format!("declare {}: {e}", hook.symbol())))?;
+            hook_id_by_hook.insert(*hook, id.as_u32());
+        }
+        let get = |h: relon_trace_emitter::HostHookId| -> u32 {
+            *hook_id_by_hook.get(&h).expect("hook declared above")
+        };
         let hook_func_ids = HostHookFuncIds {
-            save_deopt: save_deopt_id.as_u32(),
-            resolve_call: resolve_call_id.as_u32(),
-            inline_cache_lookup: ic_lookup_id.as_u32(),
-            str_concat: str_concat_id.as_u32(),
-            str_contains: str_contains_id.as_u32(),
-            str_find: str_find_id.as_u32(),
-            str_substring: str_substring_id.as_u32(),
-            str_concat_alloc: Some(str_concat_alloc_id.as_u32()),
+            save_deopt: get(relon_trace_emitter::HostHookId::SaveDeopt),
+            resolve_call: get(relon_trace_emitter::HostHookId::ResolveCall),
+            inline_cache_lookup: get(relon_trace_emitter::HostHookId::InlineCacheLookup),
+            str_concat: get(relon_trace_emitter::HostHookId::StrConcat),
+            str_contains: get(relon_trace_emitter::HostHookId::StrContains),
+            str_find: get(relon_trace_emitter::HostHookId::StrFind),
+            str_substring: get(relon_trace_emitter::HostHookId::StrSubstring),
+            str_concat_alloc: Some(get(relon_trace_emitter::HostHookId::StrConcatAlloc)),
             // 2026-05-22: disabled to fix W3 string_concat trace_jit +245%
             // regression. Per-iter unconditional seal_hash does fx_hash
-            // over the full (growing) payload, making any hot-loop
-            // concat O(N²). #159 reported Tier 1b dict-IC-on-concat-
-            // result win as unmeasurable (W5 noise), so trading that
-            // for W3 recovery is net-positive. Helper symbol is still
-            // declared above for future selective-emit reactivation
-            // (only when concat result is statically a dict-key feed).
+            // over the full (growing) payload, making any hot-loop concat
+            // O(N²). The symbol is still declared above for a future
+            // selective-emit reactivation (only when the concat result is
+            // statically a dict-key feed).
             str_concat_seal_hash: None,
-            str_concat_n_alloc: Some(str_concat_n_alloc_id.as_u32()),
-            str_glob_match: Some(str_glob_match_id.as_u32()),
-            list_get: Some(list_get_id.as_u32()),
-            dict_lookup: Some(dict_lookup_id.as_u32()),
-            dict_lookup_prechecked: Some(dict_lookup_prechecked_id.as_u32()),
+            str_concat_n_alloc: Some(get(relon_trace_emitter::HostHookId::StrConcatNAlloc)),
+            str_glob_match: Some(get(relon_trace_emitter::HostHookId::StrGlobMatch)),
+            list_get: Some(get(relon_trace_emitter::HostHookId::ListGet)),
+            dict_lookup: Some(get(relon_trace_emitter::HostHookId::DictLookup)),
+            dict_lookup_prechecked: Some(get(
+                relon_trace_emitter::HostHookId::DictLookupPrechecked,
+            )),
         };
 
         let mut ctx = CodegenContext::new();

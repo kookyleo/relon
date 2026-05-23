@@ -179,7 +179,7 @@ pub fn host_hook_slot_offset(hook: HostHookId) -> i32 {
 /// ABI between the emitted IR and the runtime helpers; it's only used
 /// inside the emitter as a `UserExternalName::index` so downstream
 /// linker / debugger tooling can match imports back to symbolic names.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum HostHookId {
     /// `__relon_trace_save_deopt`.
     SaveDeopt,
