@@ -35,6 +35,12 @@ proptest = "1"
 # `relon-evaluator` so the browser playground does not link it.
 ureq = { version = "3", default-features = false, features = ["rustls"] }
 hex = "0.4"
+# P2-15: FxHashMap for trace-recorder + trace-jit hot lookups. The
+# `rustc-hash` hasher is unkeyed FNV-style — substantially faster than
+# the default SipHash for small integer keys like SsaVar / NodeId on
+# the trace-record / trace-install paths. Serde wire format is
+# unchanged (HashMap serialises as a sequence; the hasher is internal).
+rustc-hash = "1.1"
 
 # Internal crates declared with both `path` and `version` so each can
 # be published to crates.io independently while local builds keep

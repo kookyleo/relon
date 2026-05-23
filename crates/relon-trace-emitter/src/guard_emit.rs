@@ -28,7 +28,7 @@ use cranelift_codegen::ir::types::{I32, I64};
 use cranelift_codegen::ir::InstBuilder;
 use cranelift_codegen::ir::{self, BlockArg};
 use cranelift_frontend::FunctionBuilder;
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 use relon_trace_jit::{GuardKind, GuardSite, ObservedType, SsaVar};
 
@@ -38,13 +38,13 @@ use relon_trace_jit::{GuardKind, GuardSite, ObservedType, SsaVar};
 pub struct GuardEmitCtx<'a, 'b> {
     pub builder: &'a mut FunctionBuilder<'b>,
     pub deopt_block: ir::Block,
-    pub type_info: &'a HashMap<SsaVar, ObservedType>,
+    pub type_info: &'a FxHashMap<SsaVar, ObservedType>,
     pub pointer_ty: ir::Type,
     /// v6-δ M1: per-SSA cranelift `i8` overflow bit surfaced by the
     /// `Add` / `Sub` / `Mul` lowering. The `ArithOverflow(dst)`
     /// guard reads this map to emit a real "did the arith carry?"
     /// brif predicate instead of a constant-0 that always deopts.
-    pub overflow_bits: &'a HashMap<SsaVar, ir::Value>,
+    pub overflow_bits: &'a FxHashMap<SsaVar, ir::Value>,
 }
 
 /// Lower a single [`GuardSite`] into cranelift IR at the current
@@ -60,7 +60,7 @@ pub struct GuardEmitCtx<'a, 'b> {
 pub fn emit_guard(
     ctx: &mut GuardEmitCtx<'_, '_>,
     site: &GuardSite,
-    ssa_to_value: &HashMap<SsaVar, ir::Value>,
+    ssa_to_value: &FxHashMap<SsaVar, ir::Value>,
 ) -> Result<(), GuardEmitError> {
     // ε-M0 fast paths: guard kinds whose predicate is already a
     // single SSA bool value emit `brif` directly, skipping the
@@ -161,7 +161,7 @@ pub fn emit_guard(
 fn build_guard_predicate(
     ctx: &mut GuardEmitCtx<'_, '_>,
     kind: &GuardKind,
-    ssa_to_value: &HashMap<SsaVar, ir::Value>,
+    ssa_to_value: &FxHashMap<SsaVar, ir::Value>,
 ) -> Result<ir::Value, GuardEmitError> {
     match kind {
         GuardKind::TypeCheck(var, expected) => {
@@ -332,12 +332,12 @@ mod tests {
         builder.append_block_param(deopt, I32);
         builder.append_block_param(deopt, I64);
 
-        let type_info = HashMap::new();
-        let mut ssa_to_value = HashMap::new();
+        let type_info = FxHashMap::default();
+        let mut ssa_to_value = FxHashMap::default();
         ssa_to_value.insert(SsaVar(0), v);
         let site = GuardSite::new(7, ExternalPc(0xfeedbeef), GuardKind::NotNull(SsaVar(0)));
 
-        let overflow_bits = HashMap::new();
+        let overflow_bits = FxHashMap::default();
         let mut ctx = GuardEmitCtx {
             builder: &mut builder,
             deopt_block: deopt,
@@ -361,16 +361,16 @@ mod tests {
         builder.append_block_param(deopt, I32);
         builder.append_block_param(deopt, I64);
 
-        let mut type_info = HashMap::new();
+        let mut type_info = FxHashMap::default();
         type_info.insert(SsaVar(3), ObservedType::I64);
-        let ssa_to_value = HashMap::new();
+        let ssa_to_value = FxHashMap::default();
         let site = GuardSite::new(
             2,
             ExternalPc(0x1),
             GuardKind::TypeCheck(SsaVar(3), ObservedType::I64),
         );
 
-        let overflow_bits = HashMap::new();
+        let overflow_bits = FxHashMap::default();
         let mut ctx = GuardEmitCtx {
             builder: &mut builder,
             deopt_block: deopt,
@@ -394,15 +394,15 @@ mod tests {
         builder.append_block_param(deopt, I32);
         builder.append_block_param(deopt, I64);
 
-        let type_info = HashMap::new();
-        let ssa_to_value = HashMap::new();
+        let type_info = FxHashMap::default();
+        let ssa_to_value = FxHashMap::default();
         let site = GuardSite::new(
             0,
             ExternalPc(0),
             GuardKind::TypeCheck(SsaVar(99), ObservedType::Bool),
         );
 
-        let overflow_bits = HashMap::new();
+        let overflow_bits = FxHashMap::default();
         let mut ctx = GuardEmitCtx {
             builder: &mut builder,
             deopt_block: deopt,

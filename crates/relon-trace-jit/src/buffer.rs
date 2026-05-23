@@ -63,7 +63,7 @@
 //!
 //! See each `record_*` / `*_for` accessor for the per-table specifics.
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 use serde::{Deserialize, Serialize};
 
@@ -79,10 +79,10 @@ pub struct TraceBuffer {
     pub guards: Vec<GuardSite>,
     /// Observed concrete type per SSA. See the module-level
     /// "Side-table contract" section.
-    pub type_info: HashMap<SsaVar, ObservedType>,
+    pub type_info: FxHashMap<SsaVar, ObservedType>,
     /// Captured literal scalar value per SSA. See the module-level
     /// "Side-table contract" section.
-    pub consts: HashMap<SsaVar, TraceConst>,
+    pub consts: FxHashMap<SsaVar, TraceConst>,
     /// F-D7-C: const-string side table. Maps an SSA var to the raw
     /// UTF-8 payload bytes of the string constant it carries.
     ///
@@ -98,7 +98,7 @@ pub struct TraceBuffer {
     ///
     /// Follows the module-level "Side-table contract" — SSA-keyed,
     /// recorder-written, frozen after `into_optimized`.
-    pub const_bytes: HashMap<SsaVar, Vec<u8>>,
+    pub const_bytes: FxHashMap<SsaVar, Vec<u8>>,
     /// F-D7-H: StringRef payload pre-load side table. Maps a haystack
     /// SSA (`*const StringRef`) to the `(ptr_ssa, len_ssa)` pair that
     /// holds the deref'd `(StringRef::ptr, StringRef::len)` payload.
@@ -124,7 +124,7 @@ pub struct TraceBuffer {
     ///
     /// Follows the module-level "Side-table contract" — SSA-keyed,
     /// recorder-written, frozen after `into_optimized`.
-    pub str_payload: HashMap<SsaVar, (SsaVar, SsaVar)>,
+    pub str_payload: FxHashMap<SsaVar, (SsaVar, SsaVar)>,
     /// F-D8-E.7: dict static-entry-count hint side table. Maps a
     /// dict_ptr SSA (the same SSA that flows into the matching
     /// `TraceOp::DictLookup` / `DictLookupPrechecked`) to the
@@ -144,7 +144,7 @@ pub struct TraceBuffer {
     ///
     /// Follows the module-level "Side-table contract" — SSA-keyed,
     /// recorder-written, frozen after `into_optimized`.
-    pub dict_entry_count_hints: HashMap<SsaVar, u32>,
+    pub dict_entry_count_hints: FxHashMap<SsaVar, u32>,
     /// F-D8 v2: dict record length side table. Maps a dict_ptr SSA to
     /// the byte length of the record it points at. The v2 runtime
     /// helper requires this envelope so it can reject truncated entry
@@ -152,7 +152,7 @@ pub struct TraceBuffer {
     /// byte compare on hash hit. Missing length hints are lowered as
     /// `record_len = 0`, causing the helper to deopt safely instead
     /// of falling back to the hash-only v1 lookup.
-    pub dict_record_len_hints: HashMap<SsaVar, u32>,
+    pub dict_record_len_hints: FxHashMap<SsaVar, u32>,
     next_ssa: u32,
 }
 
@@ -198,7 +198,7 @@ impl TraceBuffer {
         if self.guards.is_empty() {
             return;
         }
-        let mut by_kind: HashMap<crate::trace_ir::GuardKind, Vec<usize>> = HashMap::new();
+        let mut by_kind: FxHashMap<crate::trace_ir::GuardKind, Vec<usize>> = FxHashMap::default();
         for (pc, op) in self.ops.iter().enumerate() {
             if let TraceOp::Guard(k, _) = op {
                 by_kind.entry(*k).or_default().push(pc);
@@ -301,21 +301,21 @@ pub struct OptimizedTrace {
     pub guards: Box<[GuardSite]>,
     /// Frozen mirror of [`TraceBuffer::type_info`]. See the
     /// "Side-table contract" in the [`crate::buffer`] module docs.
-    pub type_info: HashMap<SsaVar, ObservedType>,
+    pub type_info: FxHashMap<SsaVar, ObservedType>,
     /// Frozen mirror of [`TraceBuffer::consts`]. See the
     /// "Side-table contract" in the [`crate::buffer`] module docs.
-    pub consts: HashMap<SsaVar, TraceConst>,
+    pub consts: FxHashMap<SsaVar, TraceConst>,
     /// F-D7-C: const-string side table — see [`TraceBuffer::const_bytes`].
-    pub const_bytes: HashMap<SsaVar, Vec<u8>>,
+    pub const_bytes: FxHashMap<SsaVar, Vec<u8>>,
     /// F-D7-H: StringRef payload pre-load side table — see
     /// [`TraceBuffer::str_payload`].
-    pub str_payload: HashMap<SsaVar, (SsaVar, SsaVar)>,
+    pub str_payload: FxHashMap<SsaVar, (SsaVar, SsaVar)>,
     /// F-D8-E.7: dict static-entry-count hint side table — see
     /// [`TraceBuffer::dict_entry_count_hints`].
-    pub dict_entry_count_hints: HashMap<SsaVar, u32>,
+    pub dict_entry_count_hints: FxHashMap<SsaVar, u32>,
     /// F-D8 v2: dict record length side table — see
     /// [`TraceBuffer::dict_record_len_hints`].
-    pub dict_record_len_hints: HashMap<SsaVar, u32>,
+    pub dict_record_len_hints: FxHashMap<SsaVar, u32>,
     pub ssa_high_water: u32,
 }
 
@@ -377,8 +377,8 @@ impl OptimizedTrace {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SerializableSideTables {
     pub guards: Vec<GuardSite>,
-    pub type_info: HashMap<SsaVar, ObservedType>,
-    pub consts: HashMap<SsaVar, TraceConst>,
+    pub type_info: FxHashMap<SsaVar, ObservedType>,
+    pub consts: FxHashMap<SsaVar, TraceConst>,
     pub ssa_high_water: u32,
 }
 

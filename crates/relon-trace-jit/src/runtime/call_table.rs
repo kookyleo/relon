@@ -24,7 +24,7 @@
 //! tables with thousands of entries — verified in tests.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 use crate::runtime::deopt::TraceContext;
 use crate::trace_ir::ExternalAddr;
@@ -40,7 +40,7 @@ pub struct ExternalCallTable {
     /// representation-stable across `ExternalAddr` repacking
     /// (e.g. when v6-gamma decides to fold a type tag into the high
     /// bits — see `ExternalAddr` TODO in `trace_ir.rs`).
-    entries: HashMap<u64, *const u8>,
+    entries: FxHashMap<u64, *const u8>,
 }
 
 impl std::fmt::Debug for ExternalCallTable {
@@ -55,7 +55,7 @@ impl ExternalCallTable {
     /// New empty table.
     pub fn new() -> Self {
         Self {
-            entries: HashMap::new(),
+            entries: FxHashMap::default(),
         }
     }
 

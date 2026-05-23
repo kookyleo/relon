@@ -17,7 +17,7 @@
 //! op stream (today the cranelift-generic backend, tomorrow a tiny
 //! interpreter). Each call corresponds to one observed op execution.
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 use relon_ir::Op;
 use relon_trace_jit::{
@@ -145,13 +145,13 @@ impl SsaAllocator {
 pub struct RecorderState {
     buffer: TraceBuffer,
     ssa: SsaAllocator,
-    ir_to_ssa: HashMap<LookupKind, SsaVar>,
-    type_obs: HashMap<SsaVar, ObservedType>,
+    ir_to_ssa: FxHashMap<LookupKind, SsaVar>,
+    type_obs: FxHashMap<SsaVar, ObservedType>,
     /// SSA values that have already had a TypeCheck guard emitted —
     /// used by the de-dupe logic in `maybe_emit_type_guard` so the
     /// optimiser pipeline can rely on at most one TypeCheck per var
     /// before its own LICM pass runs.
-    guarded_vars: HashMap<SsaVar, ObservedType>,
+    guarded_vars: FxHashMap<SsaVar, ObservedType>,
     next_loop_id: u32,
     /// ε-M0: open `begin_loop` calls awaiting a matching `end_loop`.
     /// Each frame remembers the loop-id stamped at begin time so the
@@ -195,9 +195,9 @@ impl RecorderState {
         Self {
             buffer: TraceBuffer::new(),
             ssa: SsaAllocator::default(),
-            ir_to_ssa: HashMap::new(),
-            type_obs: HashMap::new(),
-            guarded_vars: HashMap::new(),
+            ir_to_ssa: FxHashMap::default(),
+            type_obs: FxHashMap::default(),
+            guarded_vars: FxHashMap::default(),
             next_loop_id: 0,
             open_loops: Vec::with_capacity(4),
             capacity,

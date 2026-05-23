@@ -57,7 +57,7 @@
 //! `inline_matches_standalone_result` in
 //! `crates/relon-codegen-native/tests/trace_jit_inline_smoke.rs`).
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::types::{I32, I64};
@@ -206,15 +206,15 @@ pub fn emit_trace_inline(
         pointer_ty,
         post_block: handles.post_block,
         deopt_block: handles.deopt_block,
-        ssa_to_value: HashMap::new(),
-        overflow_bits: HashMap::new(),
-        loop_head_blocks: HashMap::new(),
+        ssa_to_value: FxHashMap::default(),
+        overflow_bits: FxHashMap::default(),
+        loop_head_blocks: FxHashMap::default(),
         saw_return: false,
     };
 
     // Index guards by `trace_pc` so the per-op walk can pick the
     // matching site without scanning the guard vector each time.
-    let guards_by_pc: HashMap<u32, &GuardSite> =
+    let guards_by_pc: FxHashMap<u32, &GuardSite> =
         trace.guards.iter().map(|g| (g.trace_pc, g)).collect();
 
     for (pc, op) in trace.ops.iter().enumerate() {
@@ -245,9 +245,9 @@ struct InlineEmitterState<'a, 'b> {
     pointer_ty: ir::Type,
     post_block: ir::Block,
     deopt_block: ir::Block,
-    ssa_to_value: HashMap<SsaVar, ir::Value>,
-    overflow_bits: HashMap<SsaVar, ir::Value>,
-    loop_head_blocks: HashMap<u32, ir::Block>,
+    ssa_to_value: FxHashMap<SsaVar, ir::Value>,
+    overflow_bits: FxHashMap<SsaVar, ir::Value>,
+    loop_head_blocks: FxHashMap<u32, ir::Block>,
     saw_return: bool,
 }
 

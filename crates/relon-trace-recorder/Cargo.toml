@@ -19,3 +19,5 @@ relon-ir = { workspace = true }
 relon-trace-jit = { workspace = true }
 relon-eval-api = { workspace = true }
 ordered-float = { workspace = true }
+# P2-15: FxHashMap for hot SsaVar lookups.
+rustc-hash = { workspace = true }

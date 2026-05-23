@@ -55,7 +55,7 @@
 //! the `Load` ops this pass leaves dead. See the [`super`] module
 //! docs for the full pipeline contract.
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 use crate::buffer::TraceBuffer;
 use crate::effect::EffectClass;
@@ -74,10 +74,10 @@ impl OptimizerPass for LoadForwarding {
     fn run(&self, trace: &mut TraceBuffer) -> PassReport {
         let mut report = PassReport::default();
         // Most recent value stored at (base, offset).
-        let mut slot_value: HashMap<(SsaVar, i32), SsaVar> = HashMap::new();
+        let mut slot_value: FxHashMap<(SsaVar, i32), SsaVar> = FxHashMap::default();
         // SSA alias chain: lookup is iterated to a fixed point so
         // `A -> B`, `B -> C` collapses to `A -> C` lazily.
-        let mut alias: HashMap<SsaVar, SsaVar> = HashMap::new();
+        let mut alias: FxHashMap<SsaVar, SsaVar> = FxHashMap::default();
 
         for idx in 0..trace.ops.len() {
             // First, rewrite the op's inputs through the alias table
@@ -138,7 +138,7 @@ impl OptimizerPass for LoadForwarding {
 /// Resolve `v` through the alias map to its canonical SSA id.
 /// Iterates -- no path compression needed because the chains are
 /// short and we walk the trace exactly once.
-fn resolve(alias: &HashMap<SsaVar, SsaVar>, mut v: SsaVar) -> SsaVar {
+fn resolve(alias: &FxHashMap<SsaVar, SsaVar>, mut v: SsaVar) -> SsaVar {
     // Cap the walk at 1024 hops as a defensive break against cycles —
     // none should be reachable but a soft cap beats an infinite loop
     // on a future bug; debug builds also assert the chain stays short.
@@ -158,7 +158,7 @@ fn resolve(alias: &HashMap<SsaVar, SsaVar>, mut v: SsaVar) -> SsaVar {
 /// Rewrite every SSA input of `op` through the alias map. Returns
 /// the number of slots that actually changed -- used purely for
 /// `PassReport` accounting.
-fn rewrite_inputs(op: &mut TraceOp, alias: &HashMap<SsaVar, SsaVar>) -> usize {
+fn rewrite_inputs(op: &mut TraceOp, alias: &FxHashMap<SsaVar, SsaVar>) -> usize {
     let mut changed = 0;
     macro_rules! swap {
         ($v:expr) => {{

@@ -150,7 +150,7 @@ fn fold_cmp(kind: CmpKind, a: TraceConst, b: TraceConst) -> Option<bool> {
 
 fn apply_fold(
     trace: &mut TraceBuffer,
-    known: &mut std::collections::HashMap<SsaVar, TraceConst>,
+    known: &mut rustc_hash::FxHashMap<SsaVar, TraceConst>,
     idx: usize,
     dst: SsaVar,
     folded: TraceConst,

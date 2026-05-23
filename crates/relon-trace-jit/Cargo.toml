@@ -27,6 +27,8 @@ relon-trace-abi = { workspace = true, features = ["serde"] }
 
 serde = { workspace = true, features = ["derive"] }
 bincode = "1.3"
+# P2-15: FxHashMap for hot SsaVar / NodeId lookups.
+rustc-hash = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }

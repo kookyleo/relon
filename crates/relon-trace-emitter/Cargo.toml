@@ -35,6 +35,12 @@ relon-trace-abi = { workspace = true }
 # don't dual-instantiate the same backend in a downstream binary.
 cranelift-codegen = "0.132"
 cranelift-frontend = "0.132"
+# P2-15: FxHashMap for SsaVar lookups. Used both as direct local
+# tables (`ssa_to_value` / `loop_head_blocks`) and as the borrowed
+# `type_info` slice the guard emitter consumes — keeping the type
+# unified with `relon-trace-jit::TraceBuffer::type_info` so
+# `&self.trace.type_info` passes through without a re-hash.
+rustc-hash = { workspace = true }
 
 [dev-dependencies]
 # Tests roundtrip ops through the emitter and then run cranelift's

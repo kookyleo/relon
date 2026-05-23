@@ -26,7 +26,8 @@
 //! handled by the trace recorder; cranelift's own SSA construction
 //! takes over from there.
 
-use std::collections::{HashMap, HashSet};
+use rustc_hash::FxHashMap;
+use std::collections::HashSet;
 
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::types::{I32, I64};
@@ -485,20 +486,20 @@ impl TraceEmitter {
             list_get,
             dict_lookup,
             dict_lookup_prechecked,
-            ssa_to_value: HashMap::new(),
-            overflow_bits: HashMap::new(),
-            loop_head_blocks: HashMap::new(),
+            ssa_to_value: FxHashMap::default(),
+            overflow_bits: FxHashMap::default(),
+            loop_head_blocks: FxHashMap::default(),
             loop_meta,
             active_loops: Vec::new(),
-            hoisted_list_len: HashMap::new(),
+            hoisted_list_len: FxHashMap::default(),
             hoisted_mod_nonzero_divisor: HashSet::new(),
-            hoisted_mod_magic: HashMap::new(),
+            hoisted_mod_magic: FxHashMap::default(),
             saw_return: false,
         };
 
         // Index guards by `trace_pc` so the per-op walk can pick the
         // matching site without scanning the guard vector each time.
-        let guards_by_pc: HashMap<u32, &GuardSite> =
+        let guards_by_pc: FxHashMap<u32, &GuardSite> =
             trace.guards.iter().map(|g| (g.trace_pc, g)).collect();
 
         for (pc, op) in trace.ops.iter().enumerate() {
@@ -588,14 +589,14 @@ struct TraceEmitterState<'a, 'b> {
     /// FuncRef. Required when the optimizer has split a dict lookup
     /// into `DictShapeGuard + DictLookupPrechecked`.
     dict_lookup_prechecked: Option<ir::FuncRef>,
-    ssa_to_value: HashMap<SsaVar, ir::Value>,
+    ssa_to_value: FxHashMap<SsaVar, ir::Value>,
     /// v6-δ M1: overflow bits surfaced by `Add` / `Sub` / `Mul`
     /// lowering. The matching `Guard(ArithOverflow(dst))` predicate
     /// reads this map to surface a real cranelift `*_overflow` bit
     /// rather than emitting a constant-0 predicate that always
     /// deopts. Entry is keyed on the arith op's `dst` SSA.
-    overflow_bits: HashMap<SsaVar, ir::Value>,
-    loop_head_blocks: HashMap<u32, ir::Block>,
+    overflow_bits: FxHashMap<SsaVar, ir::Value>,
+    loop_head_blocks: FxHashMap<u32, ir::Block>,
     /// F-D8-E.5: per-loop metadata used by the preheader hoister.
     /// Keyed by `loop_id`. `inside_defs` is the set of SSAs defined
     /// inside the loop body (plus the head's φ pairs); the complement
@@ -603,7 +604,7 @@ struct TraceEmitterState<'a, 'b> {
     /// `body_start` / `body_end` are pc bounds (exclusive at end) of
     /// the loop body in the post-optimiser op stream so the hoister
     /// can walk the same ops the emit loop will visit next.
-    loop_meta: HashMap<u32, LoopMeta>,
+    loop_meta: FxHashMap<u32, LoopMeta>,
     /// F-D8-E.5: stack of currently-active loop IDs (innermost last).
     /// Pushed in [`Self::emit_loop_head`], popped in
     /// [`Self::emit_loop_back`]. Used by per-op emitters to look up the
@@ -620,7 +621,7 @@ struct TraceEmitterState<'a, 'b> {
     /// 8)` expression into a single x86_64 `lea` with displacement
     /// addressing, which is faster than hoisting one operand of the
     /// addition out of the loop.
-    hoisted_list_len: HashMap<SsaVar, ir::Value>,
+    hoisted_list_len: FxHashMap<SsaVar, ir::Value>,
     /// F-D8-E.5: preheader-hoisted divisor-nonzero ok-block for each
     /// loop-invariant `b` operand of a `Mod`. Tracks the SSA `b` value
     /// of the original `Mod` — when seen again in the loop body, the
@@ -636,7 +637,7 @@ struct TraceEmitterState<'a, 'b> {
     /// allocator pin it to a long-lived register instead. Keyed by
     /// the divisor SSA so a re-entrant `Mod` with the same divisor
     /// shares the cached magic value.
-    hoisted_mod_magic: HashMap<SsaVar, ir::Value>,
+    hoisted_mod_magic: FxHashMap<SsaVar, ir::Value>,
     saw_return: bool,
 }
 
@@ -2061,8 +2062,8 @@ struct LoopMeta {
 ///
 /// Unmatched markers are skipped silently — a recorder bug we'd
 /// rather degrade gracefully on than crash the install path.
-fn compute_loop_meta(ops: &[TraceOp]) -> HashMap<u32, LoopMeta> {
-    let mut out: HashMap<u32, LoopMeta> = HashMap::new();
+fn compute_loop_meta(ops: &[TraceOp]) -> FxHashMap<u32, LoopMeta> {
+    let mut out: FxHashMap<u32, LoopMeta> = FxHashMap::default();
     let mut stack: Vec<(u32, usize)> = Vec::new();
     for (pc, op) in ops.iter().enumerate() {
         if let Some(id) = op.loop_head_id() {

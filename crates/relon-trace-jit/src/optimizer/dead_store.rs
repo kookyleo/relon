@@ -31,7 +31,7 @@
 //!
 //! See the [`super`] module docs for the full pipeline contract.
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 use crate::buffer::TraceBuffer;
 use crate::effect::EffectClass;
@@ -86,7 +86,7 @@ impl OptimizerPass for DeadStoreElim {
 fn find_dead_stores(ops: &[TraceOp]) -> std::collections::HashSet<usize> {
     let mut dead = std::collections::HashSet::new();
     // Map of (base, offset) -> idx of most recent live store.
-    let mut latest: HashMap<(SsaVar, i32), usize> = HashMap::new();
+    let mut latest: FxHashMap<(SsaVar, i32), usize> = FxHashMap::default();
 
     for (idx, op) in ops.iter().enumerate() {
         match op {
