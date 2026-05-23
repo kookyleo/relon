@@ -504,8 +504,12 @@ impl TreeWalkEvaluator {
         // No body — either `#native` (host-implemented) or auto-derived.
         // Try the host registry; if absent, fall through so the caller's
         // structural default kicks in.
-        let key = (brand.clone(), method_name.to_string());
-        if let Some(entry) = self.context.native_methods.get(&key) {
+        if let Some(entry) = self
+            .context
+            .native_methods
+            .get(brand.as_str())
+            .and_then(|m| m.get(method_name))
+        {
             let display_name = format!("{}.{}", brand, method_name);
             self.check_native_fn_capability(&display_name, entry, range)?;
             let native = crate::native_fn::NativeArgs::from_evaluated(

@@ -1809,7 +1809,8 @@ impl TreeWalkEvaluator {
         let has_native = self
             .context
             .native_methods
-            .contains_key(&(schema_name.clone(), "index".to_string()));
+            .get(schema_name.as_str())
+            .is_some_and(|m| m.contains_key("index"));
         if !has_method && !has_native {
             return Ok(None);
         }
@@ -1865,8 +1866,14 @@ impl TreeWalkEvaluator {
         args: &[EvaluatedArg],
         range: TokenRange,
     ) -> Result<Option<Value>, RuntimeError> {
-        let key = (schema.to_string(), method.to_string());
-        let Some(entry) = self.context.native_methods.get(&key) else {
+        // P2-4: nested lookup borrows `&str` keys directly, no per-call
+        // `String::from` to mint a tuple key.
+        let Some(entry) = self
+            .context
+            .native_methods
+            .get(schema)
+            .and_then(|m| m.get(method))
+        else {
             return Ok(None);
         };
         let display_name = format!("{schema}.{method}");

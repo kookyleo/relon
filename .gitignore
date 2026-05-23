@@ -41,3 +41,4 @@ tmp/
 # the `target` rule above.
 perf.data
 perf.data.old
+.claude/worktrees/

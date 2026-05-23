@@ -248,7 +248,13 @@ pub struct Context {
     /// `tree.method_signatures` shape; the `#native` directive on a
     /// `with { ... }` method declares the slot, the host fills it at
     /// runtime through this map.
-    pub native_methods: HashMap<(String, String), GatedNativeFn>,
+    /// P2-4: nested map keyed `schema -> method -> entry` so per-call
+    /// `try_call_native_method` looks up without minting a
+    /// `(String, String)` tuple on every dispatch. The outer/inner
+    /// `HashMap::get(&str)` paths borrow the schema/method names
+    /// directly, eliminating the prior 2 × `String::from`
+    /// allocations on every comparator / index / arithmetic dispatch.
+    pub native_methods: HashMap<String, HashMap<String, GatedNativeFn>>,
     pub schemas: HashMap<String, Value>,
     pub module_resolvers: Vec<Arc<dyn ModuleResolver>>,
     pub path_cache: Mutex<HashMap<String, Value>>,
@@ -442,7 +448,9 @@ impl Context {
         func: Arc<dyn RelonFunction>,
     ) {
         self.native_methods
-            .insert((schema.into(), method.into()), GatedNativeFn { func, gate });
+            .entry(schema.into())
+            .or_default()
+            .insert(method.into(), GatedNativeFn { func, gate });
     }
 
     /// Pure-method counterpart to [`Self::register_method`]. Equivalent

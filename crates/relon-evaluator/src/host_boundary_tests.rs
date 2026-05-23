@@ -536,9 +536,12 @@ fn core_relon_native_slots_match_stdlib_registration() {
             if !method.is_native {
                 continue;
             }
-            let key = (schema_name.clone(), method.name.clone());
-            if !ctx.native_methods.contains_key(&key) {
-                missing.push(key);
+            let present = ctx
+                .native_methods
+                .get(schema_name)
+                .is_some_and(|m| m.contains_key(method.name.as_str()));
+            if !present {
+                missing.push((schema_name.clone(), method.name.clone()));
             }
         }
     }
