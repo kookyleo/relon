@@ -611,8 +611,7 @@ fn lower_module_into<M: CrModule>(
             needs_tail_cursor: matches!(entry_shape, EntryShape::BufferProtocol)
                 && body_needs_tail_cursor(&entry.body),
             return_root_size,
-            captures_ptr: None,
-            lambda_param_tys: None,
+            mode: CodegenMode::Entry,
         };
 
         codegen.emit_prologue();
@@ -737,8 +736,10 @@ fn lower_module_into<M: CrModule>(
                 record_locals: HashMap::new(),
                 needs_tail_cursor: false,
                 return_root_size: 0,
-                captures_ptr: Some(captures_ptr),
-                lambda_param_tys: Some(&lambda.params),
+                mode: CodegenMode::Lambda {
+                    captures_ptr,
+                    lambda_param_tys: &lambda.params,
+                },
             };
 
             codegen.emit_prologue();
@@ -1012,17 +1013,50 @@ struct Codegen<'a, 'b> {
     return_root_size: u32,
     /// Stage 5 Phase C.4: when this Codegen is lowering a *lambda*
     /// body (not the entry function), `captures_ptr` carries the
-    /// cranelift `i32` block-param the lambda received as its
-    /// captures argument. `Op::LoadField` against an offset inside
-    /// the captures struct resolves through this pointer (added to
-    /// `arena_base`); `Op::LocalGet` continues to address the
-    /// IR-declared params via `arg_values`.
-    captures_ptr: Option<CValue>,
-    /// When set (lambda mode), supplies the per-param IR types so
-    /// `LocalGet(idx)` resolves to the correct cranelift slot type.
-    /// `None` when lowering the entry function (which derives types
-    /// from `entry_shape`).
-    lambda_param_tys: Option<&'a [IrType]>,
+    /// Entry vs lambda mode. Encodes the two cases that previously
+    /// lived as two separate `Option` fields (`captures_ptr` /
+    /// `lambda_param_tys`) — both were always `Some` together
+    /// (lambda) or both `None` (entry), making them an implicit
+    /// 2-state enum. See [`CodegenMode`] for the union shape.
+    mode: CodegenMode<'a>,
+}
+
+/// Lowering mode for the `Codegen` driver. Two cases:
+///
+/// * [`CodegenMode::Entry`] — top-level entry fn. `LocalGet(idx)`
+///   reads from `arg_values` using `entry_shape` to derive types.
+/// * [`CodegenMode::Lambda`] — closure body. `LocalGet(idx)` reads
+///   from `arg_values` using the lambda's declared param types; an
+///   extra `captures_ptr` block-param feeds `LoadField`-via-captures
+///   lookups (`captures_ptr + offset`).
+///
+/// The `Inline` shape (stdlib body lowered through `Op::Call`) stays
+/// orthogonal — it sits in `inline_frames` and overlays the active
+/// `CodegenMode` for the duration of the inlined body.
+enum CodegenMode<'a> {
+    Entry,
+    Lambda {
+        captures_ptr: CValue,
+        lambda_param_tys: &'a [IrType],
+    },
+}
+
+impl<'a> CodegenMode<'a> {
+    fn captures_ptr(&self) -> Option<CValue> {
+        match self {
+            CodegenMode::Entry => None,
+            CodegenMode::Lambda { captures_ptr, .. } => Some(*captures_ptr),
+        }
+    }
+
+    fn lambda_param_tys(&self) -> Option<&'a [IrType]> {
+        match self {
+            CodegenMode::Entry => None,
+            CodegenMode::Lambda {
+                lambda_param_tys, ..
+            } => Some(lambda_param_tys),
+        }
+    }
 }
 
 /// One inline-frame entry for a stdlib body lowered through
@@ -1225,7 +1259,7 @@ impl<'a, 'b> Codegen<'a, 'b> {
                 self.arg_values.len()
             )));
         }
-        let cr_ty = if let Some(param_tys) = self.lambda_param_tys {
+        let cr_ty = if let Some(param_tys) = self.mode.lambda_param_tys() {
             // Lambda mode: types come from the IR-declared param list.
             let ir_ty = param_tys.get(arg_idx).copied().ok_or_else(|| {
                 CraneliftError::Codegen(format!(

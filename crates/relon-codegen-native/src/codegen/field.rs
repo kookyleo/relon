@@ -107,7 +107,7 @@ impl<'a, 'b> super::Codegen<'a, 'b> {
         ty: IrType,
     ) -> Result<(), CraneliftError> {
         let (cr_ty, size, push_ty) = field_load_shape(ty)?;
-        let addr = if let Some(captures_ptr) = self.captures_ptr {
+        let addr = if let Some(captures_ptr) = self.mode.captures_ptr() {
             // Lambda mode: arena_base + captures_ptr + offset.
             let off_v = self.builder.ins().iconst(I32, i64::from(offset));
             let composed = self.builder.ins().iadd(captures_ptr, off_v);
