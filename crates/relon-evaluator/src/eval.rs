@@ -3,7 +3,7 @@ use crate::error::RuntimeError;
 use crate::module::{FilesystemModuleResolver, ModuleSource, StdModuleResolver};
 use crate::native_fn::{EvaluatedArg, NativeArgs, NativeFnCaps};
 use crate::scope::{Scope, Thunk};
-use crate::value::Value;
+use crate::value::{SmolStr, Value};
 use relon_eval_api::context::{Context, GatedNativeFn};
 use relon_parser::{
     is_builtin_type_name, parse_document, CallArg, Decorator as DecoratorNode, Expr, FStringPart,
@@ -634,7 +634,7 @@ impl TreeWalkEvaluator {
                             // — making it invisible to imports, projectors,
                             // and any cross-dict `&root` lookup.
                             if !is_private_field(value_node) {
-                                map.insert(key_str.clone(), val.clone());
+                                map.insert(SmolStr::from(key_str.as_str()), val.clone());
                             }
                             dict_scope
                                 .locals_for_write()
@@ -1211,7 +1211,7 @@ impl TreeWalkEvaluator {
                         Some(a) => Arc::from(a.as_str()),
                         None => Arc::from(name.as_str()),
                     };
-                    let Some(v) = d.map.get(name) else {
+                    let Some(v) = d.map.get(name.as_str()) else {
                         return Err(RuntimeError::VariableNotFound(
                             format!("`{name}` not exported by `{path}`"),
                             range,
@@ -1388,7 +1388,7 @@ impl TreeWalkEvaluator {
                         // precedence over the schema name).
                         let d_mut = Arc::make_mut(d);
                         for decl in &tree.root_schemas {
-                            if d_mut.map.contains_key(&decl.name) {
+                            if d_mut.map.contains_key(decl.name.as_str()) {
                                 continue;
                             }
                             let (lowered, _diags) = relon_analyzer::lower_schema_pure(
@@ -1410,7 +1410,7 @@ impl TreeWalkEvaluator {
                                     fields,
                                 }))
                             };
-                            d_mut.map.insert(decl.name.clone(), value);
+                            d_mut.map.insert(SmolStr::from(decl.name.as_str()), value);
                         }
                     }
                 }
@@ -1446,7 +1446,7 @@ impl TreeWalkEvaluator {
         for seg in &enum_path[1..] {
             match current {
                 Value::Dict(d) => {
-                    current = d.map.get(seg).cloned().ok_or_else(|| {
+                    current = d.map.get(seg.as_str()).cloned().ok_or_else(|| {
                         RuntimeError::VariableNotFound(format!("{head}.{seg}"), range)
                     })?;
                 }
@@ -1501,7 +1501,7 @@ impl TreeWalkEvaluator {
             Err(arc) => arc.map.clone(),
         };
         for (fname, field_def) in variant_fields.iter() {
-            if let Some(fval) = map.get_mut(fname) {
+            if let Some(fval) = map.get_mut(fname.as_str()) {
                 // Skip the type check when the declared field type is
                 // a bare reference to one of the enum's generic
                 // parameters (e.g. `value: T` inside `Result<T, E>`).
@@ -1516,7 +1516,7 @@ impl TreeWalkEvaluator {
             } else if field_def.type_hint.is_optional {
                 continue;
             } else if let Some(default) = &field_def.default_value {
-                map.insert(fname.clone(), default.clone());
+                map.insert(SmolStr::from(fname.as_str()), default.clone());
             } else {
                 return Err(RuntimeError::TypeMismatch {
                     expected: format!("field `{fname}` for variant `{variant}`"),

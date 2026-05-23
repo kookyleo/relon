@@ -141,7 +141,7 @@ mod tests {
         );
         assert_eq!(infer_observed_type(&Value::list(vec![])), ObservedType::Ptr);
         assert_eq!(
-            infer_observed_type(&Value::dict(BTreeMap::new())),
+            infer_observed_type(&Value::dict(BTreeMap::<String, Value>::new())),
             ObservedType::Ptr
         );
         assert_eq!(infer_observed_type(&Value::Wildcard), ObservedType::Ptr);

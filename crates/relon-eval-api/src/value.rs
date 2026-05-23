@@ -8,7 +8,12 @@ use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub struct ValueDict {
-    pub map: BTreeMap<String, Value>,
+    /// P2-17: dict keys land in a `SmolStr` so ≤ 22-byte field names
+    /// (the overwhelming majority — see corpus telemetry) ride the
+    /// inline slot and skip the per-key `String` allocation. `SmolStr`
+    /// implements `Borrow<str>` so existing `.get(&str)` /
+    /// `.contains_key(&str)` callsites keep working unchanged.
+    pub map: BTreeMap<SmolStr, Value>,
     pub brand: Option<String>,
     /// Name of the parent sum-type Enum when this dict is a tagged-enum
     /// variant. `Some("Notification")` distinguishes a `Notification.Email`
@@ -19,17 +24,31 @@ pub struct ValueDict {
 }
 
 impl ValueDict {
-    pub fn new(map: BTreeMap<String, Value>) -> Self {
+    /// Build a `ValueDict` from any iterable of key/value pairs. Accepts
+    /// both `SmolStr` (zero-cost) and `String` (consumed and SSO'd via
+    /// `SmolStr::from`) keys; see [`Value::dict`] for the wider
+    /// constructor.
+    pub fn new<K, I>(map: I) -> Self
+    where
+        K: Into<SmolStr>,
+        I: IntoIterator<Item = (K, Value)>,
+    {
         Self {
-            map,
+            map: map.into_iter().map(|(k, v)| (k.into(), v)).collect(),
             brand: None,
             variant_of: None,
         }
     }
 
-    pub fn with_brand(map: BTreeMap<String, Value>, brand: Option<String>) -> Self {
+    /// Build a branded `ValueDict`. See [`ValueDict::new`] for the
+    /// key-type contract.
+    pub fn with_brand<K, I>(map: I, brand: Option<String>) -> Self
+    where
+        K: Into<SmolStr>,
+        I: IntoIterator<Item = (K, Value)>,
+    {
         Self {
-            map,
+            map: map.into_iter().map(|(k, v)| (k.into(), v)).collect(),
             brand,
             variant_of: None,
         }
@@ -208,21 +227,32 @@ impl Value {
         Self::List(Arc::new(items))
     }
 
-    /// Build a `Value::Dict` from a `BTreeMap`. Use [`Value::branded_dict`]
-    /// when the dict carries a nominal-type brand.
-    pub fn dict(map: BTreeMap<String, Value>) -> Self {
+    /// Build a `Value::Dict` from any iterable of key/value pairs. The
+    /// generic key accepts either a `SmolStr` (zero-cost) or a `String`
+    /// (consumed and short-string-optimised via `SmolStr::from`). Use
+    /// [`Value::branded_dict`] when the dict carries a nominal-type brand.
+    pub fn dict<K, I>(map: I) -> Self
+    where
+        K: Into<SmolStr>,
+        I: IntoIterator<Item = (K, Value)>,
+    {
         Self::Dict(Arc::new(ValueDict {
-            map,
+            map: map.into_iter().map(|(k, v)| (k.into(), v)).collect(),
             brand: None,
             variant_of: None,
         }))
     }
 
     /// Build a `Value::Dict` with an explicit brand (the typed-dict tag set
-    /// after a successful `User x: { ... }` validation, etc.).
-    pub fn branded_dict(map: BTreeMap<String, Value>, brand: Option<String>) -> Self {
+    /// after a successful `User x: { ... }` validation, etc.). See
+    /// [`Value::dict`] for the key-type contract.
+    pub fn branded_dict<K, I>(map: I, brand: Option<String>) -> Self
+    where
+        K: Into<SmolStr>,
+        I: IntoIterator<Item = (K, Value)>,
+    {
         Self::Dict(Arc::new(ValueDict {
-            map,
+            map: map.into_iter().map(|(k, v)| (k.into(), v)).collect(),
             brand,
             variant_of: None,
         }))
@@ -231,9 +261,14 @@ impl Value {
     /// Build a `Value::Dict` representing a tagged-enum variant: carries a
     /// `brand` (the variant name) plus `variant_of` (the parent enum name).
     /// The JSON projector uses `variant_of` to externally tag the output.
-    pub fn variant_dict(map: BTreeMap<String, Value>, variant: String, enum_name: String) -> Self {
+    /// See [`Value::dict`] for the key-type contract.
+    pub fn variant_dict<K, I>(map: I, variant: String, enum_name: String) -> Self
+    where
+        K: Into<SmolStr>,
+        I: IntoIterator<Item = (K, Value)>,
+    {
         Self::Dict(Arc::new(ValueDict {
-            map,
+            map: map.into_iter().map(|(k, v)| (k.into(), v)).collect(),
             brand: Some(variant),
             variant_of: Some(enum_name),
         }))
@@ -340,7 +375,7 @@ impl Value {
                 let base = Arc::make_mut(base);
                 let base_fields = &mut base.fields;
                 for (k, v) in &patch_data.map {
-                    if let Some(base_field) = base_fields.get_mut(k) {
+                    if let Some(base_field) = base_fields.get_mut(k.as_str()) {
                         base_field.default_value = Some(v.clone());
                     }
                 }

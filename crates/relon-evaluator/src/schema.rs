@@ -2,7 +2,7 @@ use crate::error::RuntimeError;
 use crate::eval::{decorator_name, TreeWalkEvaluator};
 use crate::native_fn::EvaluatedArg;
 use crate::scope::Scope;
-use crate::value::{SchemaField, Value};
+use crate::value::{SchemaField, SmolStr, Value};
 use relon_analyzer::{format_type, substitute_generics_in_typenode, SchemaDef, SchemaFieldDef};
 use relon_parser::{is_builtin_type_name, Expr, Node, TokenKey, TokenRange, TypeNode};
 use std::collections::{HashMap, HashSet};
@@ -172,7 +172,7 @@ impl TreeWalkEvaluator {
             schema_val = match schema_val {
                 Value::Dict(d) => d
                     .map
-                    .get(part)
+                    .get(part.as_str())
                     .cloned()
                     .ok_or_else(|| RuntimeError::VariableNotFound(type_name.clone(), range))?,
                 _ => {
@@ -376,7 +376,7 @@ impl TreeWalkEvaluator {
         let d = Arc::make_mut(d);
         let mut deferred_closures: Vec<(String, Value)> = Vec::new();
         for (field_name, field) in fields.iter() {
-            if let Some(field_val) = d.map.get_mut(field_name) {
+            if let Some(field_val) = d.map.get_mut(field_name.as_str()) {
                 self.check_type_internal(
                     field_val,
                     &field.type_hint,
@@ -411,7 +411,8 @@ impl TreeWalkEvaluator {
                 if matches!(def, Value::Closure(_)) {
                     deferred_closures.push((field_name.clone(), def.clone()));
                 } else {
-                    d.map.insert(field_name.clone(), def.clone());
+                    d.map
+                        .insert(SmolStr::from(field_name.as_str()), def.clone());
                 }
             } else if field.type_hint.is_optional {
                 continue;
@@ -432,7 +433,7 @@ impl TreeWalkEvaluator {
                     scope,
                     range,
                 )?;
-                d.map.insert(field_name, computed);
+                d.map.insert(SmolStr::from(field_name.as_str()), computed);
             }
         }
         Ok(true)

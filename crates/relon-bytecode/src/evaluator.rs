@@ -22,7 +22,9 @@ use std::sync::Arc;
 
 use relon_eval_api::layout::SchemaLayout;
 use relon_eval_api::schema_canonical::Schema;
-use relon_eval_api::{CapabilityGate, ClosureData, Evaluator, RuntimeError, Scope, Thunk, Value};
+use relon_eval_api::{
+    CapabilityGate, ClosureData, Evaluator, RuntimeError, Scope, SmolStr, Thunk, Value,
+};
 use relon_ir::ir::Module as IrModule;
 use relon_ir::IrType;
 use relon_parser::{Node, TokenRange};
@@ -436,10 +438,10 @@ impl BytecodeEvaluator {
         // surface a defined value rather than panicking so unit tests
         // that exercise the dispatcher with synthetic schemas don't
         // fall off a cliff.
-        let mut map: std::collections::BTreeMap<String, Value> = std::collections::BTreeMap::new();
+        let mut map: std::collections::BTreeMap<SmolStr, Value> = std::collections::BTreeMap::new();
         for (i, f) in schema.fields.iter().enumerate() {
             let raw = if i == 0 { result } else { 0 };
-            map.insert(f.name.clone(), decode_field(&f.ty, raw));
+            map.insert(SmolStr::from(f.name.as_str()), decode_field(&f.ty, raw));
         }
         Value::branded_dict(map, Some(schema.name.clone()))
     }
@@ -471,12 +473,12 @@ impl BytecodeEvaluator {
                     .return_schema
                     .as_ref()
                     .expect("BrandedDict implies Some(return_schema)");
-                let mut map: std::collections::BTreeMap<String, Value> =
+                let mut map: std::collections::BTreeMap<SmolStr, Value> =
                     std::collections::BTreeMap::new();
                 for (i, f) in schema.fields.iter().enumerate() {
                     let s = self.return_field_base as usize + i;
                     map.insert(
-                        f.name.clone(),
+                        SmolStr::from(f.name.as_str()),
                         decode_field(&f.ty, locals.get(s).copied().unwrap_or(0)),
                     );
                 }

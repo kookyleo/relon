@@ -71,7 +71,7 @@ impl Projector for JsonProjector {
                         // validation) from polluting serialized output.
                         continue;
                     }
-                    map.insert(key.clone(), self.project(val)?);
+                    map.insert(key.as_str().to_owned(), self.project(val)?);
                 }
                 let inner = serde_json::Value::Object(map);
                 // Externally-tagged sum-type variant: wrap as

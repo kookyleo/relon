@@ -253,8 +253,8 @@ proptest! {
 
         // BTreeMap iteration is always sorted; assert it matches the
         // expected sorted view of the input.
-        let actual_keys: Vec<&String> = dict.map.keys().collect();
-        let mut expected_keys: Vec<&String> = pairs.iter().map(|(k, _)| k).collect();
+        let actual_keys: Vec<&str> = dict.map.keys().map(|k| k.as_str()).collect();
+        let mut expected_keys: Vec<&str> = pairs.iter().map(|(k, _)| k.as_str()).collect();
         expected_keys.sort();
         prop_assert_eq!(actual_keys, expected_keys);
 
@@ -349,7 +349,7 @@ proptest! {
         };
         for k in 0..steps {
             let key = format!("step_{k}");
-            let opt = match dict.map.get(&key).expect("step key present") {
+            let opt = match dict.map.get(key.as_str()).expect("step key present") {
                 Value::Dict(d) => d,
                 other => panic!("expected Option dict for {key}, got {other:?}"),
             };

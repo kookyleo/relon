@@ -5,3 +5,4 @@
 pub use relon_eval_api::value::{
     ClosureData, EnumSchemaData, SchemaData, SchemaField, Value, ValueDict,
 };
+pub use relon_eval_api::SmolStr;

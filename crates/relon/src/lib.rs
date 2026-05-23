@@ -806,7 +806,8 @@ mod tests {
             fn project(&self, value: &Value) -> std::result::Result<Self::Output, Self::Error> {
                 match value {
                     Value::Dict(d) => {
-                        let mut keys: Vec<String> = d.map.keys().cloned().collect();
+                        let mut keys: Vec<String> =
+                            d.map.keys().map(|k| k.as_str().to_owned()).collect();
                         keys.sort();
                         Ok(keys)
                     }

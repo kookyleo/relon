@@ -1893,11 +1893,11 @@ fn option_value(inner: Option<Value>) -> Value {
     match inner {
         Some(v) => {
             let mut map = std::collections::BTreeMap::new();
-            map.insert("value".to_string(), v);
+            map.insert(SmolStr::from("value"), v);
             Value::variant_dict(map, "Some".to_string(), "Option".to_string())
         }
         None => Value::variant_dict(
-            std::collections::BTreeMap::new(),
+            std::collections::BTreeMap::<SmolStr, Value>::new(),
             "None".to_string(),
             "Option".to_string(),
         ),
@@ -1922,15 +1922,15 @@ fn option_value(inner: Option<Value>) -> Value {
 pub(crate) fn make_iter_value(caps: &dyn NativeFnCaps, kind: &str, source: Value) -> Value {
     let mut map = std::collections::BTreeMap::new();
     map.insert(
-        crate::iter_protocol::FIELD_KIND.to_string(),
+        SmolStr::from(crate::iter_protocol::FIELD_KIND),
         Value::String(kind.into()),
     );
-    map.insert(crate::iter_protocol::FIELD_SOURCE.to_string(), source);
+    map.insert(SmolStr::from(crate::iter_protocol::FIELD_SOURCE), source);
     // `_id` is `i64`-coerced from a `u64` so the existing
     // `Value::Int(i64)` representation can carry it without inventing
     // a new variant. `IterNext` reads it back via `as u64` round-trip.
     map.insert(
-        crate::iter_protocol::FIELD_ID.to_string(),
+        SmolStr::from(crate::iter_protocol::FIELD_ID),
         Value::Int(caps.next_iter_id() as i64),
     );
     Value::branded_dict(map, Some(crate::iter_protocol::BRAND.to_string()))

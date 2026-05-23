@@ -25,7 +25,7 @@ use cranelift_jit::JITModule;
 use relon_eval_api::buffer::{BufferBuilder, BufferError, BufferReader};
 use relon_eval_api::layout::{OffsetTable, SchemaLayout};
 use relon_eval_api::schema_canonical::{Field, Schema, TypeRepr};
-use relon_eval_api::{ClosureData, Evaluator, RuntimeError, Scope, Thunk, Value};
+use relon_eval_api::{ClosureData, Evaluator, RuntimeError, Scope, SmolStr, Thunk, Value};
 use relon_parser::{Node, TokenRange};
 
 use crate::cache::CacheEntry;
@@ -1849,16 +1849,16 @@ fn ordered_float_wrap(f: f64) -> ordered_float::OrderedFloat<f64> {
     ordered_float::OrderedFloat(f)
 }
 
-/// Drain every field of `schema` into a sorted `BTreeMap<String,
+/// Drain every field of `schema` into a sorted `BTreeMap<SmolStr,
 /// Value>`. Mirrors `relon_codegen_wasm::read_record_into_map`.
 fn read_record_into_map(
     reader: &BufferReader<'_>,
     schema: &Schema,
-) -> Result<BTreeMap<String, Value>, RuntimeError> {
+) -> Result<BTreeMap<SmolStr, Value>, RuntimeError> {
     let mut map = BTreeMap::new();
     for field in &schema.fields {
         let value = read_value_from_reader(reader, field, schema)?;
-        map.insert(field.name.clone(), value);
+        map.insert(SmolStr::from(field.name.as_str()), value);
     }
     Ok(map)
 }
