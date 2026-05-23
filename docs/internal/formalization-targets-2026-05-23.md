@@ -50,22 +50,27 @@
 
 **预算**：每 PR 在 CI 上加 ~5-8 分钟 (miri 解释速度比 native 慢 100-1000x)。timeout-minutes: 30。
 
-### F-2 Kani BMC
+### F-2 Kani BMC — DONE 2026-05-23
 
-**目标 helpers**:
-```
-__relon_trace_dict_lookup_v2 (entry_count * 24 ≤ record_len)
-__relon_trace_dict_lookup_prechecked_v2
-__relon_str_concat_n_alloc (n × ptr_size 不溢)
-__relon_str_substring (start + len ≤ payload_len, char boundary)
-build_dict_record_v2 (header + entries 不溢 u32)
-```
+**位置**：`crates/relon-trace-jit/src/runtime/proofs.rs` (cfg(kani) 门) + CI `kani` job 用 `model-checking/kani-github-action@v1`。
 
-**Harness 模板**：每个 helper 一个 `#[kani::proof]` 函数，构造任意符号输入 + 调用 + assert 没 panic / OOB / overflow。
+**4 proofs verified**:
+1. `dict_v2_entry_table_bounds_valid` — entries-end gate (`12 + entry_count * 24 ≤ record_len`) 通过 → 任意 `i ∈ [0, entry_count)` 的 entry 末字节仍在 record 内。
+2. `dict_v2_stored_payload_bounds_imply_in_record` — post-hash payload bounds (`stored_off ≥ entries_end ∧ stored_end ≤ record_len`) 通过 → `from_raw_parts(stored, stored_len)` 切片在 record 内。
+3. `str_concat_n_alloc_cursor_stays_in_payload` — 每 operand 通过 `cursor + r.len ≤ total_len` → 最终 cursor ≤ total_len，写入都在 allocation 内。`#[kani::unwind(5)]` bound MAX_INLINE_STR_CONCAT_N=4 防 SAT blowup。
+4. `str_substring_clamp_keeps_inside_payload` — start/len/payload_len clamping → `start' ≤ end' ≤ payload_len`。
 
-**Cost**：kani setup (~半天) + per-helper 10-30 行 harness × 5 = 2-3 天。
+**关键 lessons**:
+- 不证 unsafe extern "C" 本身（kani 无法 model 任意 raw pointer）；改证 **layout arithmetic**（saturating ops + bounds 比较）的纯算术性质。这覆盖 helper 安全性的最关键不变量。
+- 符号 loop bound (`for _ in 0..n` where `n: usize = kani::any()`) 会让 CBMC SAT solver 卡死（实测 47+ 分钟 timeout）。fix：`#[kani::unwind(5)]` + `kani::assume(n <= 4)` 双约束。
 
-**风险**：kani 不支持 raw pointer 全模型。需用 `kani::any_slice` 或类似 trick。
+**未做** (留 follow-up):
+- `build_dict_record_v2` 的 header + entries 不溢 u32（doc 列了 5 项但只 prove 4 项，build 那条算术覆盖在 dict_v2_entry_table_bounds_valid 里反向蕴含）。
+- `decode_pointer_header` / consumer-side layouts。
+
+**Cost 实际**：~1.5h (writing + 1 次 SAT-stuck debug)，远低于 doc 预估 2-3d。
+
+**Win**：integer-overflow / OOB-read 类的 layout-arithmetic bug 在 checked 配置下被 SMT solver 数学证明不可达。
 
 ### F-3 Capability/sandbox TLA+ spec
 

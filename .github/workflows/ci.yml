@@ -88,3 +88,23 @@ jobs:
         run: cargo +nightly miri test -p relon-bytecode --lib
         env:
           MIRIFLAGS: -Zmiri-disable-isolation
+
+  kani:
+    # F-2 per docs/internal/formalization-targets-2026-05-23.md:
+    # bounded model-check the layout arithmetic in the trace-JIT
+    # runtime helpers (dict_v2 entry table bounds, stored payload
+    # bounds, str_concat_n_alloc cursor bounds, str_substring
+    # clamping). Proofs live in
+    # crates/relon-trace-jit/src/runtime/proofs.rs behind #[cfg(kani)].
+    #
+    # Local: cargo kani -p relon-trace-jit.
+    name: kani (JIT helper bounds proofs)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Kani
+        uses: model-checking/kani-github-action@v1
+      - name: kani -p relon-trace-jit
+        run: cargo kani -p relon-trace-jit

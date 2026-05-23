@@ -389,11 +389,11 @@ pub fn build_dict_record(shape_hash: u64, entries: &[(u64, i64)]) -> Vec<u8> {
 
 /// Byte offset of the v2 dict header's `entry_count` field. See
 /// [`build_dict_record_v2`] for the full layout.
-const DICT_V2_ENTRY_COUNT_OFFSET: usize = 8;
+pub(crate) const DICT_V2_ENTRY_COUNT_OFFSET: usize = 8;
 /// Byte offset of the first entry in a v2 dict record.
-const DICT_V2_ENTRIES_OFFSET: usize = 12;
+pub(crate) const DICT_V2_ENTRIES_OFFSET: usize = 12;
 /// v2 entry stride: `[key_hash:u64][key_payload_off:u32][key_payload_len:u32][value:i64]`.
-const DICT_V2_ENTRY_STRIDE: usize = 24;
+pub(crate) const DICT_V2_ENTRY_STRIDE: usize = 24;
 
 /// v2 dict-record constructor.
 ///

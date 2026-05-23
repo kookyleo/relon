@@ -54,6 +54,11 @@ pub mod dict_list;
 pub mod ic_lookup;
 pub mod str_ops;
 
+// F-2: bounded model-check proofs for the helper layout arithmetic.
+// Inert outside Kani: the `#![cfg(kani)]` inside guards the module.
+#[cfg(kani)]
+pub mod proofs;
+
 pub use call_table::{
     __relon_trace_resolve_call, register_external_call, resolve_external_call, with_call_table,
     ExternalCallTable,
