@@ -664,8 +664,9 @@ fn cmd_run(
             .parent()
             .unwrap_or(std::path::Path::new("."))
             .to_string_lossy()
-            .to_string(),
-        cache_namespace: cache_namespace.clone(),
+            .into_owned()
+            .into(),
+        cache_namespace: cache_namespace.clone().into(),
         ..Scope::default()
     });
 

@@ -143,11 +143,14 @@ pub struct Scope {
     /// loop vars, `where` clauses, imported aliases).
     pub locals: Locals,
     /// Working directory used when resolving relative `#import` paths.
-    pub current_dir: String,
+    /// Wrapped in `Arc<str>` so child-scope construction (which clones
+    /// the field on every list / dict / closure descent) is a refcount
+    /// bump rather than a heap String alloc.
+    pub current_dir: Arc<str>,
     /// Stable namespace for the path cache; usually the canonical id of the
     /// surrounding module so different modules can't collide on identical
-    /// paths.
-    pub cache_namespace: String,
+    /// paths. Same `Arc<str>` reasoning as `current_dir`.
+    pub cache_namespace: Arc<str>,
     /// `&root` anchor. `None` only at scopes that haven't yet acquired one
     /// (typically just the pre-eval root scope before the evaluator's
     /// `eval_root` stamps it). See [`RootRef`] for invariants.

@@ -130,7 +130,7 @@ impl ModuleResolver for FilesystemModuleResolver {
             });
         }
 
-        let target_path = Path::new(&scope.current_dir).join(path);
+        let target_path = Path::new(scope.current_dir.as_ref()).join(path);
 
         // Workspace-aware fallback so workspace-root `cargo test` can
         // resolve fixtures that live under `crates/relon-evaluator/`. Gated

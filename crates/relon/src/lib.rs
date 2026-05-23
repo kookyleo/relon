@@ -398,7 +398,7 @@ impl ModuleLoader for ResolverChainLoader {
         // that field, since none of the resolvers we mount in the
         // facade consult any of the others.
         let scope = Arc::new(Scope {
-            current_dir: current_dir.to_string_lossy().to_string(),
+            current_dir: current_dir.to_string_lossy().into(),
             ..Scope::default()
         });
         for resolver in &self.resolvers {
@@ -548,8 +548,8 @@ fn evaluate_source(
     let evaluator = TreeWalkEvaluator::new(Arc::clone(&ctx));
 
     let root_scope = Scope {
-        current_dir,
-        cache_namespace,
+        current_dir: current_dir.into(),
+        cache_namespace: cache_namespace.into(),
         ..Scope::default()
     };
     Ok(evaluator.eval_root(&Arc::new(root_scope))?)

@@ -484,8 +484,8 @@ fn evaluate_internal(
     let evaluator = TreeWalkEvaluator::new(Arc::clone(&ctx));
 
     let scope_arc = Arc::new(Scope {
-        current_dir: entry_dir,
-        cache_namespace: entry.to_string(),
+        current_dir: entry_dir.into(),
+        cache_namespace: entry.into(),
         ..Scope::default()
     });
     let value = match args {

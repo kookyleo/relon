@@ -1351,8 +1351,8 @@ impl TreeWalkEvaluator {
             fallback_parse_analyze(&source, range)?
         };
         let module_scope = Arc::new(Scope {
-            current_dir: source.current_dir,
-            cache_namespace: source.canonical_id.clone(),
+            current_dir: source.current_dir.into(),
+            cache_namespace: source.canonical_id.clone().into(),
             root_ref: Some(crate::scope::RootRef::new(Arc::clone(&node_arc))),
             ..Default::default()
         });
@@ -2199,7 +2199,7 @@ impl TreeWalkEvaluator {
             parent: Some(Arc::clone(captured_env)),
             locals: Mutex::new(bindings),
             current_dir: captured_env.current_dir.clone(),
-            cache_namespace: call_namespace,
+            cache_namespace: call_namespace.into(),
             root_ref: captured_env.root_ref.clone(),
             ..Default::default()
         });

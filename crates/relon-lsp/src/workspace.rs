@@ -62,7 +62,7 @@ impl ModuleLoader for LspLoader {
         // doesn't know about `Scope`) to the evaluator-side resolver
         // chain (which reads `current_dir` off the scope).
         let scope = Arc::new(Scope {
-            current_dir: current_dir.to_string_lossy().to_string(),
+            current_dir: current_dir.to_string_lossy().into_owned().into(),
             ..Scope::default()
         });
         for resolver in &self.resolvers {
