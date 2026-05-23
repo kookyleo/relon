@@ -291,15 +291,18 @@ fn main() -> miette::Result<()> {
                 eprintln!("[relon-cli profile] {label:<24} +{delta_us:>6}us  (total {total_us}us)");
                 last_phase_at = now;
             };
-            // v6-fix-D2: `--lite` forces the tree-walker, which
-            // is the only backend whose cold-start fits inside
-            // a 2× LuaJIT envelope on the W11 shape. Any
-            // explicit `--backend` choice incompatible with
-            // tree-walk is rejected up front so the operator
-            // doesn't get a silent backend swap.
-            if lite {
+            // v6-fix-D2: `--lite` forces the tree-walker, which is
+            // the only backend whose cold-start fits inside a 2x
+            // LuaJIT envelope on the W11 shape. Resolve the effective
+            // backend once here so the dispatch site below has a
+            // single source of truth:
+            //   * --lite + cranelift-aot / bytecode -> hard reject
+            //     (operator should not see a silent swap).
+            //   * --lite + auto / tree-walk         -> tree-walk
+            //   * no --lite                          -> requested backend
+            let effective_backend = if lite {
                 match backend {
-                    BackendArg::Auto | BackendArg::TreeWalk => {}
+                    BackendArg::Auto | BackendArg::TreeWalk => BackendArg::TreeWalk,
                     other => {
                         return Err(miette::miette!(
                             "--lite forces `--backend tree-walk`; remove the explicit `--backend {:?}` or drop `--lite`",
@@ -307,7 +310,9 @@ fn main() -> miette::Result<()> {
                         ));
                     }
                 }
-            }
+            } else {
+                backend
+            };
             let canonical_file = std::fs::canonicalize(&file)
                 .into_diagnostic()
                 .map_err(|e| e.wrap_err(format!("Failed to resolve file {:?}", file)))?;
@@ -690,7 +695,6 @@ fn main() -> miette::Result<()> {
                 // budget; the tree-walker reaches the same
                 // scalar answer with parse + analyze + walk
                 // only.
-                let effective_backend = if lite { BackendArg::TreeWalk } else { backend };
                 phase("backend_select");
                 match effective_backend {
                     BackendArg::Auto => {
