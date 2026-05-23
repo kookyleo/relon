@@ -120,8 +120,15 @@ pub struct GuardSite {
     ///   stack view the resume API expects;
     /// - the optimiser may rewrite SSA ids without touching the stack
     ///   shape, so the two carry distinct optimiser-safety invariants.
+    ///
+    /// P2-16: `Box<[SsaVar]>` instead of `Vec<SsaVar>` so each stored
+    /// guard pays one fewer machine word (no `cap` field) — meaningful
+    /// when traces accumulate hundreds of guards. The slice is built
+    /// once at emit time and never grown; the `Vec` capacity bookkeeping
+    /// is pure overhead here. Serde wire format is unchanged —
+    /// `Box<[T]>` round-trips as a sequence, identical to `Vec<T>`.
     #[serde(default)]
-    pub ssa_stack_snapshot: Vec<SsaVar>,
+    pub ssa_stack_snapshot: Box<[SsaVar]>,
 }
 
 impl GuardSite {
@@ -131,14 +138,14 @@ impl GuardSite {
             deopt_pc,
             deopt_state: DeoptState::new(),
             kind,
-            ssa_stack_snapshot: Vec::new(),
+            ssa_stack_snapshot: Box::new([]),
         }
     }
 
     /// Builder-style attach the operand-stack snapshot (in SSA-id
     /// form). The recorder stamps this at emit-time from its
     /// `ssa_stack` mirror.
-    pub fn with_ssa_stack_snapshot(mut self, snap: Vec<SsaVar>) -> Self {
+    pub fn with_ssa_stack_snapshot(mut self, snap: Box<[SsaVar]>) -> Self {
         self.ssa_stack_snapshot = snap;
         self
     }

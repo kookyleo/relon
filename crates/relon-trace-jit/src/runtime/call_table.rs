@@ -23,8 +23,8 @@
 //! amortised O(1) hash lookup keeps the helper well under 100 ns on
 //! tables with thousands of entries — verified in tests.
 
-use std::cell::RefCell;
 use rustc_hash::FxHashMap;
+use std::cell::RefCell;
 
 use crate::runtime::deopt::TraceContext;
 use crate::trace_ir::ExternalAddr;

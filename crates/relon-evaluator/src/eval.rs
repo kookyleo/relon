@@ -532,8 +532,7 @@ impl TreeWalkEvaluator {
 
                 let mut values = Vec::new();
                 for (i, thunk) in thunks.iter().enumerate() {
-                    let item_scope =
-                        current_scope.with_list_context(i, Arc::clone(&thunks));
+                    let item_scope = current_scope.with_list_context(i, Arc::clone(&thunks));
                     let element_val = self.force_thunk_with_scope(thunk, &item_scope)?;
 
                     if let Expr::Spread(_) = thunk.node.expr.as_ref() {
@@ -704,7 +703,8 @@ impl TreeWalkEvaluator {
                 // `&prev` / `&next` only fire inside list literals —
                 // so an empty `elements` vec is the cheapest stand-in
                 // and keeps the API uniform.
-                let outer_scope = current_scope.with_iter_loop(Arc::from(Vec::<Arc<Thunk>>::new().into_boxed_slice()));
+                let outer_scope = current_scope
+                    .with_iter_loop(Arc::from(Vec::<Arc<Thunk>>::new().into_boxed_slice()));
                 for (i, item) in items.iter().enumerate() {
                     outer_scope.set_iter_binding(Arc::clone(&id_arc), item.clone(), i);
 

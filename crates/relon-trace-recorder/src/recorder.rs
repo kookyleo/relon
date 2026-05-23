@@ -1219,7 +1219,10 @@ impl RecorderState {
         // mid-expression stack. Empty snapshot ⇒ guard-at-empty-stack
         // (e.g. immediately after a `Return`); the resume path falls
         // back to recipe-only materialisation.
-        let snap = self.ssa_stack.clone();
+        // P2-16: `.as_slice().into()` builds a `Box<[SsaVar]>` directly
+        // via a single allocation + memcpy, dropping the per-guard
+        // `Vec` capacity word.
+        let snap: Box<[SsaVar]> = self.ssa_stack.as_slice().into();
         self.buffer.record_guard(
             GuardSite::new(trace_pc, external_pc, kind).with_ssa_stack_snapshot(snap),
         );

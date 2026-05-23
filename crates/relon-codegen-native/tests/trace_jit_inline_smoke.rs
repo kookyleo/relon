@@ -136,7 +136,7 @@ fn inline_guard_fire_routes_through_deopt_path() {
             ExternalPc(add_pc as u64),
             GuardKind::ArithOverflow(sum),
         )
-        .with_ssa_stack_snapshot(vec![a, b, sum]),
+        .with_ssa_stack_snapshot(Box::new([a, b, sum])),
     );
     buffer.append(TraceOp::Return(sum));
 
