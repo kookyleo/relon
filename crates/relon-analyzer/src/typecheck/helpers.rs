@@ -285,6 +285,7 @@ impl<'a> Walker<'a> {
     pub(super) fn build_type_scope(&self) -> TypeScope<'_> {
         TypeScope {
             locals: HashMap::new(),
+            parent_locals: Vec::new(),
             schemas: Some(&self.schema_index),
             frames: self.scope_stack.iter().collect(),
             tree: Some(self.tree),
@@ -311,6 +312,7 @@ impl<'a> Walker<'a> {
         }
         TypeScope {
             locals,
+            parent_locals: Vec::new(),
             schemas: Some(&self.schema_index),
             frames: self.scope_stack.iter().collect(),
             tree: Some(self.tree),

@@ -608,6 +608,11 @@ pub(crate) struct TypeScope<'a> {
     /// Closure-param types in the innermost frame. Populated when we
     /// enter a `Closure { params, ... }` node.
     pub(crate) locals: HashMap<String, InferredType>,
+    /// Outer scope frames, walked outward when `locals` misses. Built
+    /// as a stack of borrowed locals maps so entering a child scope
+    /// only clones the (small, pointer-sized) chain instead of the
+    /// parent's full locals HashMap. Innermost-parent last.
+    pub(crate) parent_locals: Vec<&'a HashMap<String, InferredType>>,
     /// Pointer back to the schema index so we can lift a `Variable(X)`
     /// that happens to name a schema into [`InferredType::Schema`].
     pub(crate) schemas: Option<&'a SchemaIndex>,
@@ -624,17 +629,55 @@ impl<'a> TypeScope<'a> {
     pub(crate) fn new(tree: &'a AnalyzedTree, schemas: &'a SchemaIndex) -> Self {
         Self {
             locals: HashMap::new(),
+            parent_locals: Vec::new(),
             schemas: Some(schemas),
             frames: Vec::new(),
             tree: Some(tree),
         }
     }
 
+    /// Build a child scope inheriting the parent's visibility but
+    /// seeded with only `new_locals`. The parent's `locals` is
+    /// stitched in by reference, so the per-recursion allocation is
+    /// bounded by the new bindings instead of cloning the whole
+    /// parent map (hot path for nested closures / comprehensions /
+    /// where-blocks).
+    pub(crate) fn child_with_locals(
+        &'a self,
+        new_locals: HashMap<String, InferredType>,
+    ) -> TypeScope<'a> {
+        let mut parent_locals = Vec::with_capacity(self.parent_locals.len() + 1);
+        parent_locals.extend(self.parent_locals.iter().copied());
+        parent_locals.push(&self.locals);
+        TypeScope {
+            locals: new_locals,
+            parent_locals,
+            schemas: self.schemas,
+            frames: self.frames.clone(),
+            tree: self.tree,
+        }
+    }
+
+    /// Walk `locals` then the parent chain (innermost-first) looking
+    /// for `name`. Mirrors the prior single-map lookup but lets the
+    /// chain stand in for a cloned parent HashMap.
+    fn lookup_local(&self, name: &str) -> Option<InferredType> {
+        if let Some(t) = self.locals.get(name) {
+            return Some(t.clone());
+        }
+        for map in self.parent_locals.iter().rev() {
+            if let Some(t) = map.get(name) {
+                return Some(t.clone());
+            }
+        }
+        None
+    }
+
     /// Look up `name` against (in order) closure params, dict frames,
     /// and schema names. Returns `None` when nothing matches.
     pub(crate) fn lookup(&self, name: &str) -> Option<InferredType> {
-        if let Some(t) = self.locals.get(name) {
-            return Some(t.clone());
+        if let Some(t) = self.lookup_local(name) {
+            return Some(t);
         }
         if !self.frames.is_empty() {
             for frame in self.frames.iter().rev() {
@@ -663,8 +706,12 @@ impl<'a> TypeScope<'a> {
                         ));
                     }
                     // Otherwise infer from the value expression itself.
+                    // Reset locals + parent chain — we're inferring a
+                    // sibling field's value type, not continuing the
+                    // current closure body.
                     let scope = TypeScope {
                         locals: HashMap::new(),
+                        parent_locals: Vec::new(),
                         schemas: self.schemas,
                         frames: Vec::new(),
                         tree: self.tree,
@@ -798,16 +845,15 @@ pub(crate) fn infer_type(node: &Node, scope: &TypeScope) -> Option<InferredType>
                 })
                 .collect();
             // Body type: build a child scope with the params installed.
-            let mut child_locals = scope.locals.clone();
+            // Only the new bindings live in the child's owned map; the
+            // parent's locals are stitched in by reference via
+            // `child_with_locals` so we skip cloning the outer HashMap
+            // (hot path for deeply nested closures).
+            let mut new_locals = HashMap::with_capacity(params.len());
             for (param, ty) in params.iter().zip(param_types.iter()) {
-                child_locals.insert(param.name.clone(), ty.clone());
+                new_locals.insert(param.name.clone(), ty.clone());
             }
-            let child = TypeScope {
-                locals: child_locals,
-                schemas: scope.schemas,
-                frames: scope.frames.clone(),
-                tree: scope.tree,
-            };
+            let child = scope.child_with_locals(new_locals);
             let body_type = infer_type(body, &child).unwrap_or(InferredType::Any);
             let return_ty = match return_type {
                 Some(rt) => infer_from_type_node_with_imports(
@@ -936,14 +982,12 @@ pub(crate) fn infer_type(node: &Node, scope: &TypeScope) -> Option<InferredType>
                 // reasonable.
                 _ => InferredType::Any,
             };
-            let mut child_locals = scope.locals.clone();
-            child_locals.insert(id.clone(), item_ty);
-            let child = TypeScope {
-                locals: child_locals,
-                schemas: scope.schemas,
-                frames: scope.frames.clone(),
-                tree: scope.tree,
-            };
+            // Seed the comprehension binding into a fresh child frame
+            // and chain back to the parent's locals by reference (no
+            // outer-map clone).
+            let mut new_locals = HashMap::with_capacity(1);
+            new_locals.insert(id.clone(), item_ty);
+            let child = scope.child_with_locals(new_locals);
             let elem_ty = infer_type(element, &child).unwrap_or(InferredType::Any);
             Some(InferredType::List(Box::new(elem_ty)))
         }
@@ -952,8 +996,11 @@ pub(crate) fn infer_type(node: &Node, scope: &TypeScope) -> Option<InferredType>
         // seed them into a child scope, and infer `expr` there. The
         // result type is the body's type.
         Expr::Where { expr, bindings } => {
-            let mut child_locals = scope.locals.clone();
+            // Only the new where-bindings live in the child's owned
+            // map; the parent's locals are reused by reference.
+            let mut new_locals: HashMap<String, InferredType> = HashMap::new();
             if let Expr::Dict(pairs) = &*bindings.expr {
+                new_locals.reserve(pairs.len());
                 for (key, value) in pairs {
                     if let TokenKey::String(name, _, _) = key {
                         // Each binding's value type seeds a local.
@@ -968,16 +1015,11 @@ pub(crate) fn infer_type(node: &Node, scope: &TypeScope) -> Option<InferredType>
                         } else {
                             infer_type(value, scope).unwrap_or(InferredType::Any)
                         };
-                        child_locals.insert(name.clone(), val_ty);
+                        new_locals.insert(name.clone(), val_ty);
                     }
                 }
             }
-            let child = TypeScope {
-                locals: child_locals,
-                schemas: scope.schemas,
-                frames: scope.frames.clone(),
-                tree: scope.tree,
-            };
+            let child = scope.child_with_locals(new_locals);
             infer_type(expr, &child)
         }
         _ => None,

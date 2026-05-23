@@ -112,6 +112,7 @@ impl<'a> Walker<'a> {
         }
         let scope = TypeScope {
             locals,
+            parent_locals: Vec::new(),
             schemas: Some(&self.schema_index),
             frames: self.scope_stack.iter().collect(),
             tree: Some(self.tree),

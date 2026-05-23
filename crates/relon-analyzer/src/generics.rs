@@ -267,8 +267,10 @@ pub(crate) fn collect_bindings(
         // Build the child scope: closure params get either their
         // explicit annotation, or the slot type substituted under
         // current bindings (so `T` resolves to the type already
-        // bound from pass 1).
-        let mut child_locals = scope.locals.clone();
+        // bound from pass 1). Use `child_with_locals` so the parent's
+        // locals stay borrowed in-place rather than getting cloned
+        // into the child map.
+        let mut new_locals: HashMap<String, InferredType> = HashMap::with_capacity(params.len());
         let imports = scope.tree.and_then(|t| t.workspace_import_index.as_ref());
         for (p_idx, cp) in params.iter().enumerate() {
             let local_ty = if let Some(hint) = &cp.type_hint {
@@ -280,14 +282,9 @@ pub(crate) fn collect_bindings(
             } else {
                 InferredType::Any
             };
-            child_locals.insert(cp.name.clone(), local_ty);
+            new_locals.insert(cp.name.clone(), local_ty);
         }
-        let child_scope = TypeScope {
-            locals: child_locals,
-            schemas: scope.schemas,
-            frames: scope.frames.clone(),
-            tree: scope.tree,
-        };
+        let child_scope = scope.child_with_locals(new_locals);
         // Body type: prefer an explicit `-> Ret` annotation; fall
         // back to walking the body under the child scope.
         let body_ty = if let Some(rt) = return_type {
