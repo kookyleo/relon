@@ -117,18 +117,16 @@ pub(crate) fn step_into_value(
             }
         }
         Value::List(list) => {
-            let idx = key
-                .parse::<usize>()
-                .map_err(|_| match list_index_err {
-                    ListIndexErrorKind::TypeMismatchIndex => RuntimeError::TypeMismatch {
-                        expected: "Index".to_string(),
-                        found: "String".to_string(),
-                        range,
-                    },
-                    ListIndexErrorKind::VariableNotFound => {
-                        RuntimeError::VariableNotFound(display_name.to_string(), range)
-                    }
-                })?;
+            let idx = key.parse::<usize>().map_err(|_| match list_index_err {
+                ListIndexErrorKind::TypeMismatchIndex => RuntimeError::TypeMismatch {
+                    expected: "Index".to_string(),
+                    found: "String".to_string(),
+                    range,
+                },
+                ListIndexErrorKind::VariableNotFound => {
+                    RuntimeError::VariableNotFound(display_name.to_string(), range)
+                }
+            })?;
             if let Some(val) = list.get(idx) {
                 Ok(ValueStep::Found(val.clone()))
             } else if is_optional {
