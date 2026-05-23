@@ -9,6 +9,7 @@ use crate::sig::FnSignature;
 use crate::tree::AnalyzedTree;
 use crate::workspace::{LoadError, ModuleLoader, WorkspaceDiagnostic, WorkspaceTree};
 use miette::SourceSpan;
+use rayon::prelude::*;
 use relon_parser::{parse_document, Expr, IntegrityHash, Node, TokenKey, TokenRange, TypeNode};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -82,14 +83,18 @@ pub(crate) fn build<L: ModuleLoader>(
             ws.nodes.insert(entry_id.clone(), arc_node);
             // Seed BFS queue.
             let mut queue: VecDeque<PendingImport> = imports.into_iter().collect();
-            // BFS: for each pending import, resolve it through the
-            // loader, parse + analyze, then enqueue *its* imports.
-            // Modules already in `ws.modules` are skipped (their
-            // canonical id is the dedup key — the loader is what maps
-            // raw paths to canonical ids, so we have to call it to know
-            // whether a module is already loaded).
+            // BFS, processed one level at a time: drain the queue into
+            // a batch, run the sequential prelude (integrity checks,
+            // loader IO, graph-edge rewrites, dedup) per-item to land
+            // every `LoadJob` that still needs analysis, then fan the
+            // pure-CPU `parse + analyze` work across rayon's pool.
+            // Finally fold the results back into `ws.modules` /
+            // `ws.nodes` / `ws.import_graph` in canonical-id order so
+            // the post-passes (`detect_cycles`, `re_check_unknown_types`,
+            // …) see a deterministic snapshot regardless of which
+            // worker thread finished first.
             //
-            // v1.8+ fix: pre-fix this loop carried a `seen_raw:
+            // v1.8+ history: pre-fix this loop carried a `seen_raw:
             // HashSet<(importer_id, raw_path)>` short-circuit that
             // skipped the loader call when the same `(importer,
             // raw_path)` pair was queued twice. That elided
@@ -98,20 +103,60 @@ pub(crate) fn build<L: ModuleLoader>(
             // `process_import`, so its `import_graph` edge stayed at
             // the raw path and `build_import_index` lost `b`'s
             // schemas / closures (lockstep with `tree.imports`
-            // broken). The dedup is now done downstream inside
-            // `process_import` via `ws.modules.contains_key` after
-            // the loader resolves to a canonical id; the only cost
-            // is one extra loader call per duplicate raw path, which
-            // is negligible for the common filesystem-resolver case.
-            while let Some(item) = queue.pop_front() {
-                process_import(
-                    item,
-                    loader,
-                    &mut ws,
-                    &mut queue,
-                    &mut module_dirs,
-                    &effective_options,
-                );
+            // broken). The dedup is now done downstream inside the
+            // prelude via `ws.modules.contains_key` after the loader
+            // resolves to a canonical id; the only cost is one extra
+            // loader call per duplicate raw path, which is negligible
+            // for the common filesystem-resolver case.
+            while !queue.is_empty() {
+                let level: Vec<PendingImport> = queue.drain(..).collect();
+                // Phase 1 (sequential): integrity-pin validation +
+                // loader IO + import-graph edge rewrite + dedup. Items
+                // that pass land in `jobs`; the rest are short-circuited
+                // here (parse error / not-found / mismatch surfaces
+                // into `workspace_diagnostics` in queue order). Within
+                // a single level we also dedup canonical ids so the
+                // parallel phase never analyzes the same module twice.
+                let mut jobs: Vec<LoadJob> = Vec::new();
+                let mut level_seen: HashSet<String> = HashSet::new();
+                for item in level {
+                    if let Some(job) = prelude_import(
+                        item,
+                        loader,
+                        &mut ws,
+                        &mut module_dirs,
+                        &mut level_seen,
+                        &effective_options,
+                    ) {
+                        jobs.push(job);
+                    }
+                }
+                // Phase 2 (parallel): `parse_document` + `analyze_with_options`.
+                // Both calls are pure functions of `(source, options)`,
+                // hold no shared mutable state, and produce owned
+                // outputs — safe to fan across rayon's global pool.
+                // Falling back to a sequential iterator for tiny
+                // batches (<2 jobs) avoids the rayon scheduling
+                // overhead on the common single-import case.
+                let mut analyzed: Vec<AnalyzedJob> = if jobs.len() < 2 {
+                    jobs.into_iter()
+                        .map(|job| analyze_job(job, &effective_options))
+                        .collect()
+                } else {
+                    jobs.into_par_iter()
+                        .map(|job| analyze_job(job, &effective_options))
+                        .collect()
+                };
+                // Phase 3 (sequential, deterministic order): sort the
+                // batch by canonical id so `ws.workspace_diagnostics`
+                // pushes (e.g. ModuleParseError) and `ws.modules`
+                // inserts land in a stable order regardless of how
+                // rayon scheduled the workers. Then enqueue the next
+                // BFS level.
+                analyzed.sort_by(|a, b| a.canonical_id.cmp(&b.canonical_id));
+                for result in analyzed {
+                    merge_analyzed(result, &mut ws, &mut queue);
+                }
             }
         }
         Err(parse_err) => {
@@ -341,14 +386,67 @@ fn lookup_root_field(
     None
 }
 
-fn process_import<L: ModuleLoader>(
+/// A `PendingImport` that survived the sequential prelude (integrity
+/// checks + loader IO + graph rewrites + dedup) and now needs the
+/// pure-CPU `parse + analyze` work. Carrying the canonical id, source
+/// text, and current_dir together lets the parallel phase fan jobs
+/// out without touching `ws` state.
+struct LoadJob {
+    /// Canonical id the loader produced; used as the key under which
+    /// the analyzed tree will land in `ws.modules` / `ws.nodes`.
+    canonical_id: String,
+    /// Source text fetched by the loader. Owned so the parallel worker
+    /// can consume it without lifetime entanglement with `ws`.
+    source: String,
+    /// Directory transitive `#import "./..."` paths resolve against
+    /// once *this* module's own imports go through the loader. Pinned
+    /// here so the merge phase can stamp it into `module_dirs`.
+    current_dir: PathBuf,
+    /// Range of the directive in the *importer*. Anchors any
+    /// ModuleParseError that surfaces from the parallel phase back at
+    /// the import site rather than at offset 0 of the imported module.
+    range: TokenRange,
+}
+
+/// Result of the parallel parse + analyze phase. Carries either the
+/// analyzed module (success) or a parse error (failure); the merge
+/// phase folds it back into `ws` deterministically by canonical id.
+struct AnalyzedJob {
+    canonical_id: String,
+    range: TokenRange,
+    outcome: AnalyzedOutcome,
+}
+
+enum AnalyzedOutcome {
+    /// `tree` is boxed because `AnalyzedTree` is the heavyweight
+    /// variant (>1.3KB on stack); without indirection the enum's
+    /// payload would balloon every `AnalyzedJob` slot in the rayon
+    /// collection vector even for the lean ParseError case.
+    Ok {
+        arc_node: Arc<Node>,
+        tree: Box<AnalyzedTree>,
+        imports: Vec<PendingImport>,
+    },
+    ParseError {
+        message: String,
+    },
+}
+
+/// Sequential prelude: validate the integrity pin, call the loader,
+/// rewrite the importer's `raw_path` edge to the canonical id, dedup
+/// against already-analyzed modules (and against other items in the
+/// same BFS level via `level_seen`), and stash the working directory.
+/// Items that need parse + analyze leave a `LoadJob` for the parallel
+/// phase; everything else short-circuits here with the appropriate
+/// `WorkspaceDiagnostic`.
+fn prelude_import<L: ModuleLoader>(
     item: PendingImport,
     loader: &mut L,
     ws: &mut WorkspaceTree,
-    queue: &mut VecDeque<PendingImport>,
     module_dirs: &mut HashMap<String, PathBuf>,
+    level_seen: &mut HashSet<String>,
     options: &crate::AnalyzeOptions,
-) {
+) -> Option<LoadJob> {
     let span = SourceSpan::from(item.range);
     // v3++ b-2: enforce `--require-hash` *before* the loader runs.
     // Missing pins on remote paths surface here so the operator sees a
@@ -362,7 +460,7 @@ fn process_import<L: ModuleLoader>(
                 path: item.raw_path.clone(),
                 range: span,
             });
-        return;
+        return None;
     }
     // Catch pin-shape mistakes (unknown algorithm, wrong hex length)
     // before we ever ask the loader for the body. Lets the operator
@@ -376,7 +474,7 @@ fn process_import<L: ModuleLoader>(
                     algorithm: int.algorithm_text.clone(),
                     range: pin_span,
                 });
-            return;
+            return None;
         };
         let algo_str = algo.as_str();
         let expected_len = algo.hex_len();
@@ -389,7 +487,7 @@ fn process_import<L: ModuleLoader>(
                     got: int.hex.len(),
                     range: pin_span,
                 });
-            return;
+            return None;
         }
     }
     match loader.load(&item.raw_path, &item.importer_dir) {
@@ -417,7 +515,7 @@ fn process_import<L: ModuleLoader>(
                             got: computed,
                             range: pin_span,
                         });
-                    return;
+                    return None;
                 }
             }
             // Wire `importer -> loaded.canonical_id` into the import
@@ -432,45 +530,26 @@ fn process_import<L: ModuleLoader>(
                 }
             }
             if ws.modules.contains_key(&loaded.canonical_id) {
-                // Already analyzed; don't re-enqueue but the graph
-                // edge is now resolved, which is what cycle detection
-                // needs.
-                return;
+                // Already analyzed in a previous BFS level; don't
+                // re-enqueue but the graph edge is now resolved,
+                // which is what cycle detection needs.
+                return None;
+            }
+            if !level_seen.insert(loaded.canonical_id.clone()) {
+                // Already scheduled within the current BFS level by an
+                // earlier item (two raw paths resolving to the same
+                // canonical id). The first claim wins the analyze
+                // slot; subsequent claims only needed the loader call
+                // to rewrite their own importer's edge above.
+                return None;
             }
             module_dirs.insert(loaded.canonical_id.clone(), loaded.current_dir.clone());
-            match parse_document(&loaded.source) {
-                Ok(node) => {
-                    let arc_node = Arc::new(node);
-                    let tree = crate::analyze_with_options(&arc_node, options);
-                    let imports =
-                        collect_import_targets(&tree, &loaded.canonical_id, &loaded.current_dir);
-                    ws.import_graph.insert(
-                        loaded.canonical_id.clone(),
-                        imports.iter().map(|p| p.raw_path.clone()).collect(),
-                    );
-                    ws.modules
-                        .insert(loaded.canonical_id.clone(), Arc::new(tree));
-                    ws.nodes.insert(loaded.canonical_id.clone(), arc_node);
-                    for next in imports {
-                        queue.push_back(next);
-                    }
-                }
-                Err(parse_err) => {
-                    ws.workspace_diagnostics
-                        .push(WorkspaceDiagnostic::ModuleParseError {
-                            path: loaded.canonical_id.clone(),
-                            message: parse_err.to_string(),
-                            range: span,
-                        });
-                    // Insert an empty AnalyzedTree shell + import-graph
-                    // entry so cycle detection / collision analysis
-                    // doesn't trip over a "ghost" canonical id.
-                    ws.modules
-                        .insert(loaded.canonical_id.clone(), Arc::new(AnalyzedTree::new()));
-                    ws.import_graph
-                        .insert(loaded.canonical_id.clone(), Vec::new());
-                }
-            }
+            Some(LoadJob {
+                canonical_id: loaded.canonical_id,
+                source: loaded.source,
+                current_dir: loaded.current_dir,
+                range: item.range,
+            })
         }
         Err(LoadError::NotFound) => {
             ws.workspace_diagnostics
@@ -478,6 +557,7 @@ fn process_import<L: ModuleLoader>(
                     path: item.raw_path.clone(),
                     range: span,
                 });
+            None
         }
         Err(LoadError::AccessDenied(reason)) => {
             // Treated as ModuleNotFound for the user; the reason is
@@ -487,6 +567,7 @@ fn process_import<L: ModuleLoader>(
                     path: format!("{} ({reason})", item.raw_path),
                     range: span,
                 });
+            None
         }
         Err(LoadError::Other(message)) => {
             ws.workspace_diagnostics
@@ -495,6 +576,94 @@ fn process_import<L: ModuleLoader>(
                     message,
                     range: span,
                 });
+            None
+        }
+    }
+}
+
+/// Parallel-safe analysis step. Pure function of `(job, options)` —
+/// touches no shared mutable state, so rayon can run it on any worker.
+/// Failure to parse produces an `AnalyzedOutcome::ParseError` rather
+/// than panicking, so the merge phase can surface the right diagnostic
+/// against the importer's range.
+fn analyze_job(job: LoadJob, options: &crate::AnalyzeOptions) -> AnalyzedJob {
+    let LoadJob {
+        canonical_id,
+        source,
+        current_dir,
+        range,
+    } = job;
+    let outcome = match parse_document(&source) {
+        Ok(node) => {
+            let arc_node = Arc::new(node);
+            let tree = crate::analyze_with_options(&arc_node, options);
+            let imports = collect_import_targets(&tree, &canonical_id, &current_dir);
+            AnalyzedOutcome::Ok {
+                arc_node,
+                tree: Box::new(tree),
+                imports,
+            }
+        }
+        Err(parse_err) => AnalyzedOutcome::ParseError {
+            message: parse_err.to_string(),
+        },
+    };
+    // `current_dir` was consumed by `collect_import_targets` above;
+    // anything downstream looks it up via `module_dirs` (populated by
+    // the prelude) so we don't carry it past this point.
+    let _ = current_dir;
+    AnalyzedJob {
+        canonical_id,
+        range,
+        outcome,
+    }
+}
+
+/// Merge a parallel-phase result back into `ws` and enqueue the next
+/// BFS level. Called serially in canonical-id order so workspace-
+/// level diagnostics and module-table inserts land deterministically.
+fn merge_analyzed(
+    result: AnalyzedJob,
+    ws: &mut WorkspaceTree,
+    queue: &mut VecDeque<PendingImport>,
+) {
+    let AnalyzedJob {
+        canonical_id,
+        range,
+        outcome,
+    } = result;
+    let span = SourceSpan::from(range);
+    match outcome {
+        AnalyzedOutcome::Ok {
+            arc_node,
+            tree,
+            imports,
+        } => {
+            ws.import_graph.insert(
+                canonical_id.clone(),
+                imports.iter().map(|p| p.raw_path.clone()).collect(),
+            );
+            // `Arc::from(Box<T>)` reuses the box's allocation without
+            // a second move/copy of `AnalyzedTree`'s bulky fields.
+            ws.modules.insert(canonical_id.clone(), Arc::from(tree));
+            ws.nodes.insert(canonical_id, arc_node);
+            for next in imports {
+                queue.push_back(next);
+            }
+        }
+        AnalyzedOutcome::ParseError { message } => {
+            ws.workspace_diagnostics
+                .push(WorkspaceDiagnostic::ModuleParseError {
+                    path: canonical_id.clone(),
+                    message,
+                    range: span,
+                });
+            // Insert an empty AnalyzedTree shell + import-graph
+            // entry so cycle detection / collision analysis doesn't
+            // trip over a "ghost" canonical id.
+            ws.modules
+                .insert(canonical_id.clone(), Arc::new(AnalyzedTree::new()));
+            ws.import_graph.insert(canonical_id, Vec::new());
         }
     }
 }

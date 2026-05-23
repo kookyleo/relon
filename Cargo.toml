@@ -51,6 +51,12 @@ arrayvec = "0.7"
 # is on the trace dispatch hot path; an `Arc::clone` of the wrapper
 # replaces a reader-lock acquire on every call.
 arc-swap = "1"
+# P1-2: data-parallel parse + analyze for multi-module workspaces.
+# Cold-start of a 3+ module entry pays a serial `parse + analyze`
+# per import in the BFS pass; rayon lets a single BFS level fan its
+# parse+analyze jobs across the global pool. Loader IO and ws-state
+# mutation stay sequential — only the pure CPU work is parallelised.
+rayon = "1"
 
 # Internal crates declared with both `path` and `version` so each can
 # be published to crates.io independently while local builds keep
