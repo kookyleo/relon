@@ -39,7 +39,6 @@ pub mod lex;
 // the rowan rewrite continues and are deliberately not part of the
 // public API surface.
 pub(crate) mod lower;
-pub mod source;
 pub mod syntax;
 pub mod token;
 

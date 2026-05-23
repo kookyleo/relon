@@ -2,11 +2,158 @@
 
 use relon_parser::ast::{self, Document};
 use relon_parser::cst::parse_cst;
-use relon_parser::source::{tokenize_source, SourceToken as Token, SourceTokenKind as TokenKind};
+use relon_parser::lex::lex;
 use relon_parser::syntax::{SyntaxKind, SyntaxNode};
 use std::collections::BTreeSet;
 use std::ops::Range;
 use std::path::PathBuf;
+
+// =====================================================================
+// Formatter-facing token view.
+//
+// The CST lexer ([`relon_parser::lex::lex`]) is the single source of
+// truth for tokenisation. It emits every byte — including whitespace
+// — as a `(SyntaxKind, &str)` slice. The formatter wants a *coarser*
+// stream: trivia (WHITESPACE) folded into a `leading_newlines` count
+// on the next significant token, multi-char operators collapsed onto
+// a single `Operator` family, and offsets pre-computed.
+//
+// [`tokenize_source`] is the thin adapter that turns the lex stream
+// into that view. It replaces the previously-duplicated
+// `relon_parser::source` lexer (~400 LOC of overlap with `lex.rs`).
+// =====================================================================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Token<'a> {
+    kind: TokenKind,
+    text: &'a str,
+    leading_newlines: usize,
+    start: usize,
+    end: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TokenKind {
+    Word,
+    Number,
+    String,
+    LineComment,
+    BlockComment,
+    OpenBrace,
+    CloseBrace,
+    OpenBracket,
+    CloseBracket,
+    OpenParen,
+    CloseParen,
+    Comma,
+    Colon,
+    Dot,
+    At,
+    Hash,
+    Amp,
+    Question,
+    Ellipsis,
+    Operator,
+    Equal,
+}
+
+/// Adapter from CST lex tokens to the formatter's token view.
+///
+/// The CST lexer never fails — every byte is covered, including
+/// unrecoverable ones (UNKNOWN). The formatter currently runs after
+/// a strict parse and therefore never sees UNKNOWN, so we conservatively
+/// classify it as `Operator` (it won't appear in well-formed input).
+fn tokenize_source(source: &str) -> Vec<Token<'_>> {
+    let raw = lex(source);
+    let mut out: Vec<Token<'_>> = Vec::with_capacity(raw.len());
+    let mut offset: usize = 0;
+    let mut pending_newlines: usize = 0;
+
+    for (kind, text) in raw {
+        let start = offset;
+        let end = start + text.len();
+        offset = end;
+
+        if kind == SyntaxKind::WHITESPACE {
+            pending_newlines += text.bytes().filter(|b| *b == b'\n' || *b == b'\r').count();
+            continue;
+        }
+
+        let token_kind = match map_syntax_to_token_kind(kind) {
+            Some(k) => k,
+            None => continue,
+        };
+
+        out.push(Token {
+            kind: token_kind,
+            text,
+            leading_newlines: pending_newlines,
+            start,
+            end,
+        });
+        pending_newlines = 0;
+    }
+
+    out
+}
+
+/// Project a [`SyntaxKind`] leaf onto the formatter's coarse
+/// [`TokenKind`]. Returns `None` for the trivia kind already filtered
+/// upstream (`WHITESPACE`) — every other leaf maps to exactly one
+/// `TokenKind`.
+fn map_syntax_to_token_kind(kind: SyntaxKind) -> Option<TokenKind> {
+    Some(match kind {
+        SyntaxKind::WHITESPACE => return None,
+        SyntaxKind::LINE_COMMENT => TokenKind::LineComment,
+        SyntaxKind::BLOCK_COMMENT => TokenKind::BlockComment,
+        SyntaxKind::IDENT => TokenKind::Word,
+        SyntaxKind::NUMBER => TokenKind::Number,
+        SyntaxKind::STRING => TokenKind::String,
+        SyntaxKind::L_BRACE => TokenKind::OpenBrace,
+        SyntaxKind::R_BRACE => TokenKind::CloseBrace,
+        SyntaxKind::L_BRACK => TokenKind::OpenBracket,
+        SyntaxKind::R_BRACK => TokenKind::CloseBracket,
+        SyntaxKind::L_PAREN => TokenKind::OpenParen,
+        SyntaxKind::R_PAREN => TokenKind::CloseParen,
+        SyntaxKind::COMMA => TokenKind::Comma,
+        SyntaxKind::COLON => TokenKind::Colon,
+        SyntaxKind::DOT => TokenKind::Dot,
+        SyntaxKind::AT => TokenKind::At,
+        SyntaxKind::HASH => TokenKind::Hash,
+        SyntaxKind::AMP => TokenKind::Amp,
+        SyntaxKind::QUESTION => TokenKind::Question,
+        SyntaxKind::EQ => TokenKind::Equal,
+        SyntaxKind::ELLIPSIS => TokenKind::Ellipsis,
+        // Multi- and single-char operators all collapse onto the
+        // formatter's `Operator` family — it dispatches on `.text`
+        // for any cases that need the exact lexeme (`<`, `>`, ...).
+        SyntaxKind::EQ_EQ
+        | SyntaxKind::BANG_EQ
+        | SyntaxKind::LT_EQ
+        | SyntaxKind::GT_EQ
+        | SyntaxKind::AMP_AMP
+        | SyntaxKind::PIPE_PIPE
+        | SyntaxKind::PLUS_PLUS
+        | SyntaxKind::FAT_ARROW
+        | SyntaxKind::THIN_ARROW
+        | SyntaxKind::LT
+        | SyntaxKind::GT
+        | SyntaxKind::PLUS
+        | SyntaxKind::MINUS
+        | SyntaxKind::STAR
+        | SyntaxKind::SLASH
+        | SyntaxKind::PERCENT
+        | SyntaxKind::BANG
+        | SyntaxKind::PIPE => TokenKind::Operator,
+        // The lexer emits UNKNOWN for stray bytes a well-formed
+        // source can't contain. The formatter only runs after a
+        // strict parse, so we never expect this — fall through as
+        // `Operator` to keep the round-trip in the unlikely event a
+        // future change exposes it.
+        SyntaxKind::UNKNOWN => TokenKind::Operator,
+        _ => return None,
+    })
+}
 
 const INDENT: &str = "    ";
 
@@ -64,7 +211,7 @@ pub fn format_source(source: &str) -> Result<String, Error> {
         out
     };
 
-    let tokens = tokenize_source(&edited).map_err(|error| Error::Tokenize(error.to_string()))?;
+    let tokens = tokenize_source(&edited);
     let mut formatter = SourceFormatter::new(&tokens, &break_offsets);
     let output = formatter.format();
     validate_source(&output)?;
