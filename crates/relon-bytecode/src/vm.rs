@@ -107,6 +107,22 @@ impl Default for BcVmConfig {
     }
 }
 
+/// P2-7: pick the dispatch-loop sampling mask for the deadline /
+/// `max_steps` resource gates. The mask is `0` (check every op) when
+/// `max_steps` is tight enough that a 64-op slip could let the program
+/// return before the gate sees the over-budget tick; otherwise it's
+/// `63` (sample once per 64 ops). The threshold doubles the sample
+/// period to leave headroom — at `max_steps == 64` the first sample
+/// after step 1 lands at step 65, which already exceeds the budget by
+/// one op, so the per-op fall-back kicks in for any limit below 128.
+#[inline]
+fn step_sample_mask(config: &BcVmConfig) -> u64 {
+    match config.max_steps {
+        Some(limit) if limit < 128 => 0,
+        _ => 63,
+    }
+}
+
 /// Per-call capability table. The slot at index `cap_bit` carries
 /// `Some(_)` when the host has granted access; the actual host-fn
 /// pointer payload is M2-B work. Today the table tracks **grants
@@ -964,29 +980,38 @@ impl BytecodeVm {
         if start_bc_idx == 0 {
             self.maybe_trigger_hot(func, args);
         }
+        // P2-7: sample the deadline / max_steps gates every 64 ops to
+        // shave the per-op `Instant::now()` + `Option` branch from the
+        // hot dispatch loop. The mask collapses to 0 (per-op) when
+        // `max_steps` is tight enough that a ±64 op slip could let a
+        // small-budget program slip past the trap; otherwise we
+        // tolerate the ±64 op fuzz the task brief allows.
+        let step_sample_mask: u64 = step_sample_mask(&self.config);
         loop {
             // Resource prong: tick.
             steps += 1;
-            if let Some(limit) = self.config.max_steps {
-                if steps > limit {
-                    return exit(
-                        None,
-                        Some(BcVmError::StepLimitExceeded { steps }),
-                        last_bc_idx,
-                        steps,
-                        locals,
-                    );
+            if (steps & step_sample_mask) == (1 & step_sample_mask) {
+                if let Some(limit) = self.config.max_steps {
+                    if steps > limit {
+                        return exit(
+                            None,
+                            Some(BcVmError::StepLimitExceeded { steps }),
+                            last_bc_idx,
+                            steps,
+                            locals,
+                        );
+                    }
                 }
-            }
-            if let Some(d) = self.config.deadline {
-                if Instant::now() >= d {
-                    return exit(
-                        None,
-                        Some(BcVmError::DeadlineExceeded),
-                        last_bc_idx,
-                        steps,
-                        locals,
-                    );
+                if let Some(d) = self.config.deadline {
+                    if Instant::now() >= d {
+                        return exit(
+                            None,
+                            Some(BcVmError::DeadlineExceeded),
+                            last_bc_idx,
+                            steps,
+                            locals,
+                        );
+                    }
                 }
             }
             if pc >= func.ops.len() {
@@ -1114,16 +1139,21 @@ impl BytecodeVm {
                 self.precheck_capabilities(func)?;
                 self.maybe_trigger_hot(func, args);
 
+                // P2-7: deadline / max_steps sampling — see
+                // `invoke_from_with_stack` for the rationale.
+                let step_sample_mask: u64 = step_sample_mask(&self.config);
                 loop {
                     steps += 1;
-                    if let Some(limit) = self.config.max_steps {
-                        if steps > limit {
-                            return Err(BcVmError::StepLimitExceeded { steps });
+                    if (steps & step_sample_mask) == (1 & step_sample_mask) {
+                        if let Some(limit) = self.config.max_steps {
+                            if steps > limit {
+                                return Err(BcVmError::StepLimitExceeded { steps });
+                            }
                         }
-                    }
-                    if let Some(d) = self.config.deadline {
-                        if Instant::now() >= d {
-                            return Err(BcVmError::DeadlineExceeded);
+                        if let Some(d) = self.config.deadline {
+                            if Instant::now() >= d {
+                                return Err(BcVmError::DeadlineExceeded);
+                            }
                         }
                     }
                     if pc >= func.ops.len() {
@@ -1211,16 +1241,21 @@ impl BytecodeVm {
         // resource budget). If `max_steps` is `None` the loop runs
         // unbounded (matches the outer dispatch).
         let mut steps: u64 = 0;
+        // P2-7: deadline / max_steps sampling — see
+        // `invoke_from_with_stack` for the rationale.
+        let step_sample_mask: u64 = step_sample_mask(&self.config);
         loop {
             steps += 1;
-            if let Some(limit) = self.config.max_steps {
-                if steps > limit {
-                    return Err(BcVmError::StepLimitExceeded { steps });
+            if (steps & step_sample_mask) == (1 & step_sample_mask) {
+                if let Some(limit) = self.config.max_steps {
+                    if steps > limit {
+                        return Err(BcVmError::StepLimitExceeded { steps });
+                    }
                 }
-            }
-            if let Some(d) = self.config.deadline {
-                if Instant::now() >= d {
-                    return Err(BcVmError::DeadlineExceeded);
+                if let Some(d) = self.config.deadline {
+                    if Instant::now() >= d {
+                        return Err(BcVmError::DeadlineExceeded);
+                    }
                 }
             }
             if pc >= body.ops.len() {
