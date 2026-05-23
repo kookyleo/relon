@@ -81,7 +81,15 @@ fn record_str_concat_n_three_operands_emits_trace_op() {
     // order); just count.
     let notnull_count: usize = ops
         .iter()
-        .filter(|op| matches!(op, TraceOp::Guard(GuardKind::NotNull(_), _)))
+        .filter(|op| {
+            matches!(
+                op,
+                TraceOp::Guard {
+                    kind: GuardKind::NotNull(_),
+                    check: _
+                }
+            )
+        })
         .count();
     assert_eq!(notnull_count, 3, "one NotNull guard per StrConcatN operand");
 }

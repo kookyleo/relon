@@ -571,12 +571,21 @@ fn single_phi_loop_compiles() {
     let mut buffer = TraceBuffer::new();
     // n = LocalGet(0)
     let n = buffer.fresh_ssa();
-    buffer.append(TraceOp::LocalGet(n, 0));
+    buffer.append(TraceOp::LocalGet {
+        dst: n,
+        slot_idx: 0,
+    });
     // acc_init = 0
     let acc_init = buffer.fresh_ssa();
-    buffer.append(TraceOp::ConstI64(acc_init, 0));
+    buffer.append(TraceOp::ConstI64 {
+        dst: acc_init,
+        value: 0,
+    });
     let i_init = buffer.fresh_ssa();
-    buffer.append(TraceOp::ConstI64(i_init, 1));
+    buffer.append(TraceOp::ConstI64 {
+        dst: i_init,
+        value: 1,
+    });
 
     // φ pair for (acc, i).
     let phi_acc = buffer.fresh_ssa();
@@ -588,25 +597,41 @@ fn single_phi_loop_compiles() {
 
     // cmp = i <= n; guard(cmp); acc_next = acc + i; i_next = i + 1.
     let cmp = buffer.fresh_ssa();
-    buffer.append(TraceOp::Cmp(CmpKind::Le, cmp, phi_i, n));
-    let cmp_pc = buffer.append(TraceOp::Guard(GuardKind::NotNull(cmp), cmp));
+    buffer.append(TraceOp::Cmp {
+        kind: CmpKind::Le,
+        dst: cmp,
+        lhs: phi_i,
+        rhs: n,
+    });
+    let cmp_pc = buffer.append(TraceOp::Guard {
+        kind: GuardKind::NotNull(cmp),
+        check: cmp,
+    });
     buffer.record_guard(GuardSite::new(
         cmp_pc,
         ExternalPc(1),
         GuardKind::NotNull(cmp),
     ));
     let acc_next = buffer.fresh_ssa();
-    buffer.append(TraceOp::Add(acc_next, phi_acc, phi_i));
+    buffer.append(TraceOp::Add {
+        dst: acc_next,
+        lhs: phi_acc,
+        rhs: phi_i,
+    });
     let one = buffer.fresh_ssa();
-    buffer.append(TraceOp::ConstI64(one, 1));
+    buffer.append(TraceOp::ConstI64 { dst: one, value: 1 });
     let i_next = buffer.fresh_ssa();
-    buffer.append(TraceOp::Add(i_next, phi_i, one));
+    buffer.append(TraceOp::Add {
+        dst: i_next,
+        lhs: phi_i,
+        rhs: one,
+    });
 
     buffer.append(TraceOp::MarkLoopBack {
         loop_id: 0,
         next_values: vec![acc_next, i_next],
     });
-    buffer.append(TraceOp::Return(phi_acc));
+    buffer.append(TraceOp::Return { value: phi_acc });
 
     let state = TraceJitState::new();
     let trace_fn = state

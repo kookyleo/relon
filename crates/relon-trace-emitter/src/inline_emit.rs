@@ -19,7 +19,7 @@
 //! 1. Walks the trace's [`OptimizedTrace`] ops in order, lowering each
 //!    one into the supplied builder using the same rules
 //!    [`crate::emitter::TraceEmitter`] uses for a stand-alone entry fn.
-//! 2. Replaces `TraceOp::Return(v)` (the trace's terminator) with a
+//! 2. Replaces `TraceOp::Return { value: v }` (the trace's terminator) with a
 //!    `jump` to a caller-supplied **post-block** carrying the resulting
 //!    `i64` value as a single block-param. Control flow then continues
 //!    inside the host fn — no `call/ret` pair, no `extern "C"` arg
@@ -305,19 +305,24 @@ impl<'a, 'b> InlineEmitterState<'a, 'b> {
         guard_site: Option<&GuardSite>,
     ) -> Result<(), InlineEmitError> {
         match op {
-            TraceOp::Add(dst, a, b) => lower_binop_i64(self, *dst, *a, *b, BinOp::Add),
-            TraceOp::Sub(dst, a, b) => lower_binop_i64(self, *dst, *a, *b, BinOp::Sub),
-            TraceOp::Mul(dst, a, b) => lower_binop_i64(self, *dst, *a, *b, BinOp::Mul),
-            TraceOp::Div(dst, a, b) => lower_div(self, *dst, *a, *b),
-            TraceOp::Mod(dst, a, b) => lower_mod_plain(self, *dst, *a, *b),
-            TraceOp::Cmp(kind, dst, a, b) => lower_cmp(self, *kind, *dst, *a, *b),
-            TraceOp::Load(dst, base, off) => lower_load(self, *dst, *base, off.0),
-            TraceOp::Store(base, off, src) => lower_store(self, *base, off.0, *src),
-            TraceOp::ConstI32(dst, v) => lower_const_i32(self, *dst, *v),
-            TraceOp::ConstI64(dst, v) => lower_const_i64(self, *dst, *v),
-            TraceOp::LocalGet(dst, slot_idx) => lower_local_get(self, *dst, *slot_idx),
-            TraceOp::Guard(_, _) => self.emit_guard_op(guard_site),
-            TraceOp::Call(_, _, _, effect) => {
+            TraceOp::Add { dst, lhs, rhs } => lower_binop_i64(self, *dst, *lhs, *rhs, BinOp::Add),
+            TraceOp::Sub { dst, lhs, rhs } => lower_binop_i64(self, *dst, *lhs, *rhs, BinOp::Sub),
+            TraceOp::Mul { dst, lhs, rhs } => lower_binop_i64(self, *dst, *lhs, *rhs, BinOp::Mul),
+            TraceOp::Div { dst, lhs, rhs } => lower_div(self, *dst, *lhs, *rhs),
+            TraceOp::Mod { dst, lhs, rhs } => lower_mod_plain(self, *dst, *lhs, *rhs),
+            TraceOp::Cmp {
+                kind,
+                dst,
+                lhs,
+                rhs,
+            } => lower_cmp(self, *kind, *dst, *lhs, *rhs),
+            TraceOp::Load { dst, base, offset } => lower_load(self, *dst, *base, offset.0),
+            TraceOp::Store { base, offset, src } => lower_store(self, *base, offset.0, *src),
+            TraceOp::ConstI32 { dst, value } => lower_const_i32(self, *dst, *value),
+            TraceOp::ConstI64 { dst, value } => lower_const_i64(self, *dst, *value),
+            TraceOp::LocalGet { dst, slot_idx } => lower_local_get(self, *dst, *slot_idx),
+            TraceOp::Guard { .. } => self.emit_guard_op(guard_site),
+            TraceOp::Call { effect, .. } => {
                 if matches!(effect, EffectClass::Unrecoverable) {
                     return Err(InlineEmitError::UnrecoverableEffectInTrace);
                 }
@@ -334,7 +339,7 @@ impl<'a, 'b> InlineEmitterState<'a, 'b> {
                 // back to the trampoline-call path.
                 Err(InlineEmitError::CallNotSupportedInInline)
             }
-            TraceOp::Return(v) => self.emit_return(*v),
+            TraceOp::Return { value } => self.emit_return(*value),
             TraceOp::MarkLoopHead { loop_id, phis } => self.emit_loop_head(*loop_id, phis),
             TraceOp::MarkLoopBack {
                 loop_id,
@@ -345,12 +350,12 @@ impl<'a, 'b> InlineEmitterState<'a, 'b> {
             // can't derive without going through the per-trace-module
             // import machinery. Surface the same fallback error so the
             // caller routes the trace through the regular emitter.
-            TraceOp::StrConcat(_, _, _)
+            TraceOp::StrConcat { .. }
             | TraceOp::StrConcatN { .. }
-            | TraceOp::StrContains(_, _, _)
-            | TraceOp::StrFind(_, _, _)
-            | TraceOp::StrSubstring(_, _, _, _)
-            | TraceOp::StrGlobMatch(_, _, _) => Err(InlineEmitError::CallNotSupportedInInline),
+            | TraceOp::StrContains { .. }
+            | TraceOp::StrFind { .. }
+            | TraceOp::StrSubstring { .. }
+            | TraceOp::StrGlobMatch { .. } => Err(InlineEmitError::CallNotSupportedInInline),
             // F-D8: inline emit doesn't yet thread the dict/list host
             // helpers through the surrounding host-fn cranelift module
             // (same reason `TraceOp::Call` returns `CallNotSupported`).
@@ -546,8 +551,8 @@ mod tests {
     fn inline_emit_const_return() {
         let mut b = TraceBuffer::new();
         let dst = b.fresh_ssa();
-        b.append(TraceOp::ConstI64(dst, 42));
-        b.append(TraceOp::Return(dst));
+        b.append(TraceOp::ConstI64 { dst, value: 42 });
+        b.append(TraceOp::Return { value: dst });
         let trace = b.into_optimized();
         let ir = host_fn_with_inline_trace(trace).expect("inline emit");
         // The result-slot store survives the inline path so deopt
@@ -566,10 +571,20 @@ mod tests {
         let a = b.fresh_ssa();
         let bb = b.fresh_ssa();
         let sum = b.fresh_ssa();
-        b.append(TraceOp::LocalGet(a, 0));
-        b.append(TraceOp::LocalGet(bb, 1));
-        b.append(TraceOp::Add(sum, a, bb));
-        b.append(TraceOp::Return(sum));
+        b.append(TraceOp::LocalGet {
+            dst: a,
+            slot_idx: 0,
+        });
+        b.append(TraceOp::LocalGet {
+            dst: bb,
+            slot_idx: 1,
+        });
+        b.append(TraceOp::Add {
+            dst: sum,
+            lhs: a,
+            rhs: bb,
+        });
+        b.append(TraceOp::Return { value: sum });
         let trace = b.into_optimized();
         let ir = host_fn_with_inline_trace(trace).expect("inline emit");
         // Both LocalGet ops lower to loads off args_ptr.
@@ -588,11 +603,22 @@ mod tests {
     fn inline_emit_load_store_round_trip() {
         let mut b = TraceBuffer::new();
         let base = b.fresh_ssa();
-        b.append(TraceOp::ConstI64(base, 0x1000));
+        b.append(TraceOp::ConstI64 {
+            dst: base,
+            value: 0x1000,
+        });
         let loaded = b.fresh_ssa();
-        b.append(TraceOp::Load(loaded, base, Offset(8)));
-        b.append(TraceOp::Store(base, Offset(16), loaded));
-        b.append(TraceOp::Return(loaded));
+        b.append(TraceOp::Load {
+            dst: loaded,
+            base,
+            offset: Offset(8),
+        });
+        b.append(TraceOp::Store {
+            base,
+            offset: Offset(16),
+            src: loaded,
+        });
+        b.append(TraceOp::Return { value: loaded });
         let trace = b.into_optimized();
         let _ = host_fn_with_inline_trace(trace).expect("inline emit");
     }
@@ -602,12 +628,18 @@ mod tests {
         // Build a trace with MAX_INLINE_OPS + 1 ops (each a no-op ConstI64).
         let mut b = TraceBuffer::new();
         let mut last = b.fresh_ssa();
-        b.append(TraceOp::ConstI64(last, 0));
+        b.append(TraceOp::ConstI64 {
+            dst: last,
+            value: 0,
+        });
         for _ in 0..MAX_INLINE_OPS {
             last = b.fresh_ssa();
-            b.append(TraceOp::ConstI64(last, 0));
+            b.append(TraceOp::ConstI64 {
+                dst: last,
+                value: 0,
+            });
         }
-        b.append(TraceOp::Return(last));
+        b.append(TraceOp::Return { value: last });
         let trace = b.into_optimized();
         assert!(!should_inline_trace(&trace));
         let err = host_fn_with_inline_trace(trace).expect_err("must reject");
@@ -618,7 +650,7 @@ mod tests {
     fn inline_emit_missing_return_errors() {
         let mut b = TraceBuffer::new();
         let dst = b.fresh_ssa();
-        b.append(TraceOp::ConstI64(dst, 42));
+        b.append(TraceOp::ConstI64 { dst, value: 42 });
         // No Return — should surface MissingReturn.
         let trace = b.into_optimized();
         let err = host_fn_with_inline_trace(trace).expect_err("must error");

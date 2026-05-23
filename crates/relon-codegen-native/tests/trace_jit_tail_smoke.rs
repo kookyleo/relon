@@ -53,8 +53,11 @@ fn tail_conv_const_return_invokes_through_extern_c() {
     let state = TraceJitState::new();
     let mut buffer = TraceBuffer::new();
     let dst = buffer.fresh_ssa();
-    buffer.append(TraceOp::ConstI64(dst, 0xfeed_beef));
-    buffer.append(TraceOp::Return(dst));
+    buffer.append(TraceOp::ConstI64 {
+        dst,
+        value: 0xfeed_beef,
+    });
+    buffer.append(TraceOp::Return { value: dst });
 
     let trace_fn = state
         .jit_compile_buffer_for_fn_with_call_conv(TAIL_SMOKE_FN_ID_BASE, buffer, CallConv::Tail)
@@ -79,10 +82,20 @@ fn tail_conv_add_via_localget_round_trips_args() {
     let a = buffer.fresh_ssa();
     let b = buffer.fresh_ssa();
     let sum = buffer.fresh_ssa();
-    buffer.append(TraceOp::LocalGet(a, 0));
-    buffer.append(TraceOp::LocalGet(b, 1));
-    buffer.append(TraceOp::Add(sum, a, b));
-    buffer.append(TraceOp::Return(sum));
+    buffer.append(TraceOp::LocalGet {
+        dst: a,
+        slot_idx: 0,
+    });
+    buffer.append(TraceOp::LocalGet {
+        dst: b,
+        slot_idx: 1,
+    });
+    buffer.append(TraceOp::Add {
+        dst: sum,
+        lhs: a,
+        rhs: b,
+    });
+    buffer.append(TraceOp::Return { value: sum });
 
     let trace_fn = state
         .jit_compile_buffer_for_fn_with_call_conv(TAIL_SMOKE_FN_ID_BASE + 1, buffer, CallConv::Tail)
@@ -215,10 +228,20 @@ fn tail_conv_matches_systemv_for_identical_buffer() {
         let x = b.fresh_ssa();
         let y = b.fresh_ssa();
         let r = b.fresh_ssa();
-        b.append(TraceOp::ConstI64(x, 1_000_000));
-        b.append(TraceOp::ConstI64(y, 234_567));
-        b.append(TraceOp::Add(r, x, y));
-        b.append(TraceOp::Return(r));
+        b.append(TraceOp::ConstI64 {
+            dst: x,
+            value: 1_000_000,
+        });
+        b.append(TraceOp::ConstI64 {
+            dst: y,
+            value: 234_567,
+        });
+        b.append(TraceOp::Add {
+            dst: r,
+            lhs: x,
+            rhs: y,
+        });
+        b.append(TraceOp::Return { value: r });
         b
     }
 

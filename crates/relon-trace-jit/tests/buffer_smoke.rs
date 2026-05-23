@@ -10,8 +10,8 @@ fn append_and_count() {
     let mut b = TraceBuffer::new();
     let a = b.fresh_ssa();
     let c = b.fresh_ssa();
-    b.append(TraceOp::ConstI32(a, 1));
-    b.append(TraceOp::ConstI32(c, 2));
+    b.append(TraceOp::ConstI32 { dst: a, value: 1 });
+    b.append(TraceOp::ConstI32 { dst: c, value: 2 });
     assert_eq!(b.op_count(), 2);
 }
 
@@ -19,7 +19,10 @@ fn append_and_count() {
 fn fresh_ssa_advances_past_manual_dst() {
     let mut b = TraceBuffer::new();
     let manual = SsaVar(99);
-    b.append(TraceOp::ConstI64(manual, 7));
+    b.append(TraceOp::ConstI64 {
+        dst: manual,
+        value: 7,
+    });
     let next = b.fresh_ssa();
     assert_eq!(next, SsaVar(100));
 }
@@ -28,7 +31,7 @@ fn fresh_ssa_advances_past_manual_dst() {
 fn record_guard_stores_metadata() {
     let mut b = TraceBuffer::new();
     let var = b.fresh_ssa();
-    b.append(TraceOp::ConstI64(var, 0));
+    b.append(TraceOp::ConstI64 { dst: var, value: 0 });
     b.record_guard(GuardSite::new(
         0,
         relon_trace_jit::ExternalPc(0xdead),
@@ -43,7 +46,7 @@ fn into_optimized_carries_state() {
     let x = b.fresh_ssa();
     b.record_type(x, ObservedType::I32);
     b.record_const(x, TraceConst::I32(99));
-    b.append(TraceOp::ConstI32(x, 99));
+    b.append(TraceOp::ConstI32 { dst: x, value: 99 });
     let opt = b.into_optimized();
     assert_eq!(opt.op_count(), 1);
     assert_eq!(opt.type_info[&x], ObservedType::I32);
@@ -55,7 +58,7 @@ fn side_tables_roundtrip_bincode() {
     let x = b.fresh_ssa();
     b.record_type(x, ObservedType::Bool);
     b.record_const(x, TraceConst::Bool(true));
-    b.append(TraceOp::ConstI32(x, 1));
+    b.append(TraceOp::ConstI32 { dst: x, value: 1 });
     b.record_guard(GuardSite::new(
         0,
         relon_trace_jit::ExternalPc(42),
@@ -73,8 +76,13 @@ fn call_op_records_inputs() {
     let mut b = TraceBuffer::new();
     let arg = b.fresh_ssa();
     let ret = b.fresh_ssa();
-    b.append(TraceOp::ConstI64(arg, 9));
-    b.append(TraceOp::Call(ret, FuncId(3), vec![arg], EffectClass::Pure));
+    b.append(TraceOp::ConstI64 { dst: arg, value: 9 });
+    b.append(TraceOp::Call {
+        dst: ret,
+        func: FuncId(3),
+        args: vec![arg],
+        effect: EffectClass::Pure,
+    });
     assert_eq!(b.op_count(), 2);
     assert_eq!(b.ops[1].inputs(), vec![arg]);
 }
@@ -83,7 +91,7 @@ fn call_op_records_inputs() {
 fn default_pipeline_runs_all_passes_clean_buffer() {
     let mut b = TraceBuffer::new();
     let x = b.fresh_ssa();
-    b.append(TraceOp::ConstI64(x, 10));
+    b.append(TraceOp::ConstI64 { dst: x, value: 10 });
     let p = OptimizerPipeline::default_pipeline();
     let reports = p.run(&mut b);
     // const_fold + load_forward + dead_store + type_spec +
@@ -98,7 +106,11 @@ fn default_pipeline_runs_all_passes_clean_buffer() {
 
 #[test]
 fn store_op_has_two_inputs() {
-    let op = TraceOp::Store(SsaVar(0), Offset(8), SsaVar(1));
+    let op = TraceOp::Store {
+        base: SsaVar(0),
+        offset: Offset(8),
+        src: SsaVar(1),
+    };
     assert_eq!(op.inputs(), vec![SsaVar(0), SsaVar(1)]);
     assert!(op.output().is_none());
 }

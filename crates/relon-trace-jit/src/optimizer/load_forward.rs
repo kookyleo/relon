@@ -87,10 +87,18 @@ impl OptimizerPass for LoadForwarding {
             report.ops_replaced += replaced;
 
             match &trace.ops[idx] {
-                TraceOp::Store(base, Offset(off), src) => {
+                TraceOp::Store {
+                    base,
+                    offset: Offset(off),
+                    src,
+                } => {
                     slot_value.insert((*base, *off), *src);
                 }
-                TraceOp::Load(dst, base, Offset(off)) => {
+                TraceOp::Load {
+                    dst,
+                    base,
+                    offset: Offset(off),
+                } => {
                     if let Some(forwarded) = slot_value.get(&(*base, *off)).copied() {
                         // Resolve forwarded through the alias chain
                         // in case the stored value was itself a
@@ -102,7 +110,7 @@ impl OptimizerPass for LoadForwarding {
                         // pipeline iteration.
                     }
                 }
-                TraceOp::Call(_, _, _, eff) => match eff {
+                TraceOp::Call { effect, .. } => match effect {
                     EffectClass::Pure | EffectClass::ReadOnly => {
                         // Pure/ReadOnly calls cannot mutate memory
                         // visible to our slot table.
@@ -116,7 +124,7 @@ impl OptimizerPass for LoadForwarding {
                         panic!("trace must not contain Unrecoverable ops");
                     }
                 },
-                TraceOp::Div(_, _, _) | TraceOp::Mod(_, _, _) => {
+                TraceOp::Div { .. } | TraceOp::Mod { .. } => {
                     // Div / Mod are classed RecoverableWrite (see
                     // trace_ir docs). They do not actually touch
                     // memory but the conservative rule applies:
@@ -170,27 +178,27 @@ fn rewrite_inputs(op: &mut TraceOp, alias: &FxHashMap<SsaVar, SsaVar>) -> usize 
         }};
     }
     match op {
-        TraceOp::Add(_dst, a, b)
-        | TraceOp::Sub(_dst, a, b)
-        | TraceOp::Mul(_dst, a, b)
-        | TraceOp::Div(_dst, a, b)
-        | TraceOp::Mod(_dst, a, b) => {
-            swap!(a);
-            swap!(b);
+        TraceOp::Add { lhs, rhs, .. }
+        | TraceOp::Sub { lhs, rhs, .. }
+        | TraceOp::Mul { lhs, rhs, .. }
+        | TraceOp::Div { lhs, rhs, .. }
+        | TraceOp::Mod { lhs, rhs, .. } => {
+            swap!(lhs);
+            swap!(rhs);
         }
-        TraceOp::Cmp(_, _dst, a, b) => {
-            swap!(a);
-            swap!(b);
+        TraceOp::Cmp { lhs, rhs, .. } => {
+            swap!(lhs);
+            swap!(rhs);
         }
-        TraceOp::Load(_dst, base, _off) => {
+        TraceOp::Load { base, .. } => {
             swap!(base);
         }
-        TraceOp::Store(base, _off, src) => {
+        TraceOp::Store { base, src, .. } => {
             swap!(base);
             swap!(src);
         }
-        TraceOp::ConstI32(_, _) | TraceOp::ConstI64(_, _) | TraceOp::LocalGet(_, _) => {}
-        TraceOp::Guard(kind, check) => {
+        TraceOp::ConstI32 { .. } | TraceOp::ConstI64 { .. } | TraceOp::LocalGet { .. } => {}
+        TraceOp::Guard { kind, check } => {
             swap!(check);
             match kind {
                 GuardKind::TypeCheck(v, _) => swap!(v),
@@ -203,7 +211,7 @@ fn rewrite_inputs(op: &mut TraceOp, alias: &FxHashMap<SsaVar, SsaVar>) -> usize 
                 GuardKind::IsZero(v) => swap!(v),
             }
         }
-        TraceOp::Call(_dst, _, args, _) => {
+        TraceOp::Call { args, .. } => {
             for a in args {
                 swap!(a);
             }
@@ -212,12 +220,22 @@ fn rewrite_inputs(op: &mut TraceOp, alias: &FxHashMap<SsaVar, SsaVar>) -> usize 
         // the forwarding pass replaced earlier. Swap each input slot
         // so a `StrContains(haystack=load_dst, needle=...)` re-uses
         // the forwarded source if the underlying load was DCE-d.
-        TraceOp::StrConcat(_dst, a, b)
-        | TraceOp::StrContains(_dst, a, b)
-        | TraceOp::StrFind(_dst, a, b)
-        | TraceOp::StrGlobMatch(_dst, a, b) => {
-            swap!(a);
-            swap!(b);
+        TraceOp::StrConcat { lhs, rhs, .. } => {
+            swap!(lhs);
+            swap!(rhs);
+        }
+        TraceOp::StrContains {
+            haystack, needle, ..
+        }
+        | TraceOp::StrFind {
+            haystack, needle, ..
+        } => {
+            swap!(haystack);
+            swap!(needle);
+        }
+        TraceOp::StrGlobMatch { s, pattern, .. } => {
+            swap!(s);
+            swap!(pattern);
         }
         // #168: variable-arity sibling of `StrConcat`. Every operand
         // SSA participates in the load-forward swap loop just like the
@@ -229,10 +247,12 @@ fn rewrite_inputs(op: &mut TraceOp, alias: &FxHashMap<SsaVar, SsaVar>) -> usize 
                 swap!(o);
             }
         }
-        TraceOp::StrSubstring(_dst, s, start, len) => {
+        TraceOp::StrSubstring {
+            s, start, length, ..
+        } => {
             swap!(s);
             swap!(start);
-            swap!(len);
+            swap!(length);
         }
         TraceOp::ListGet { list_ptr, idx, .. } => {
             swap!(list_ptr);
@@ -258,8 +278,8 @@ fn rewrite_inputs(op: &mut TraceOp, alias: &FxHashMap<SsaVar, SsaVar>) -> usize 
             swap!(dict_ptr);
             swap!(key_ptr);
         }
-        TraceOp::Return(v) => {
-            swap!(v);
+        TraceOp::Return { value } => {
+            swap!(value);
         }
         TraceOp::MarkLoopHead { .. } | TraceOp::MarkLoopBack { .. } => {}
     }

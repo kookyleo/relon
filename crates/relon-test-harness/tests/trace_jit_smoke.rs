@@ -344,10 +344,14 @@ fn pipeline_compiles_add_trace() {
     let a = buffer.fresh_ssa();
     let b = buffer.fresh_ssa();
     let sum = buffer.fresh_ssa();
-    buffer.append(TraceOp::ConstI64(a, 11));
-    buffer.append(TraceOp::ConstI64(b, 22));
-    buffer.append(TraceOp::Add(sum, a, b));
-    buffer.append(TraceOp::Return(sum));
+    buffer.append(TraceOp::ConstI64 { dst: a, value: 11 });
+    buffer.append(TraceOp::ConstI64 { dst: b, value: 22 });
+    buffer.append(TraceOp::Add {
+        dst: sum,
+        lhs: a,
+        rhs: b,
+    });
+    buffer.append(TraceOp::Return { value: sum });
 
     let trace_fn = state
         .jit_compile_buffer_for_fn(0, buffer)
@@ -371,10 +375,14 @@ fn pipeline_compiles_mul_trace_via_buffer() {
     let a = buffer.fresh_ssa();
     let b = buffer.fresh_ssa();
     let prod = buffer.fresh_ssa();
-    buffer.append(TraceOp::ConstI64(a, 6));
-    buffer.append(TraceOp::ConstI64(b, 7));
-    buffer.append(TraceOp::Mul(prod, a, b));
-    buffer.append(TraceOp::Return(prod));
+    buffer.append(TraceOp::ConstI64 { dst: a, value: 6 });
+    buffer.append(TraceOp::ConstI64 { dst: b, value: 7 });
+    buffer.append(TraceOp::Mul {
+        dst: prod,
+        lhs: a,
+        rhs: b,
+    });
+    buffer.append(TraceOp::Return { value: prod });
 
     let trace_fn = state
         .jit_compile_buffer_for_fn(7, buffer)
@@ -396,10 +404,14 @@ fn pipeline_chained_trace_buffer_install_invoke() {
     let a = buffer.fresh_ssa();
     let b = buffer.fresh_ssa();
     let diff = buffer.fresh_ssa();
-    buffer.append(TraceOp::ConstI64(a, 50));
-    buffer.append(TraceOp::ConstI64(b, 8));
-    buffer.append(TraceOp::Sub(diff, a, b));
-    buffer.append(TraceOp::Return(diff));
+    buffer.append(TraceOp::ConstI64 { dst: a, value: 50 });
+    buffer.append(TraceOp::ConstI64 { dst: b, value: 8 });
+    buffer.append(TraceOp::Sub {
+        dst: diff,
+        lhs: a,
+        rhs: b,
+    });
+    buffer.append(TraceOp::Return { value: diff });
 
     let trace_fn = state
         .jit_compile_buffer_for_fn(13, buffer)
@@ -435,9 +447,16 @@ fn pipeline_load_store_trace_via_buffer() {
     let mut buffer = TraceBuffer::new();
     let base = buffer.fresh_ssa();
     let loaded = buffer.fresh_ssa();
-    buffer.append(TraceOp::ConstI64(base, backing.as_ptr() as i64));
-    buffer.append(TraceOp::Load(loaded, base, Offset(0)));
-    buffer.append(TraceOp::Return(loaded));
+    buffer.append(TraceOp::ConstI64 {
+        dst: base,
+        value: backing.as_ptr() as i64,
+    });
+    buffer.append(TraceOp::Load {
+        dst: loaded,
+        base,
+        offset: Offset(0),
+    });
+    buffer.append(TraceOp::Return { value: loaded });
 
     let trace_fn = state
         .jit_compile_buffer_for_fn(0, buffer)
@@ -591,8 +610,11 @@ fn invoke_with_fallback_returns_trace_result_on_success() {
     let state = TraceJitState::new();
     let mut buffer = TraceBuffer::new();
     let v = buffer.fresh_ssa();
-    buffer.append(TraceOp::ConstI64(v, 0x77));
-    buffer.append(TraceOp::Return(v));
+    buffer.append(TraceOp::ConstI64 {
+        dst: v,
+        value: 0x77,
+    });
+    buffer.append(TraceOp::Return { value: v });
     let trace_fn = state
         .jit_compile_buffer_for_fn(801, buffer)
         .expect("compile");
@@ -628,8 +650,8 @@ fn invalidate_trace_drops_the_install() {
     let state = TraceJitState::new();
     let mut buffer = TraceBuffer::new();
     let v = buffer.fresh_ssa();
-    buffer.append(TraceOp::ConstI64(v, 1));
-    buffer.append(TraceOp::Return(v));
+    buffer.append(TraceOp::ConstI64 { dst: v, value: 1 });
+    buffer.append(TraceOp::Return { value: v });
     let trace_fn = state
         .jit_compile_buffer_for_fn(803, buffer)
         .expect("compile");
@@ -659,7 +681,7 @@ fn default_host_hooks_populates_save_deopt_slot() {
 
 /// v6-δ M1 R1: a recording driver that hits `Op::LocalGet` followed
 /// by an arith op must install successfully. The recorder now emits
-/// `TraceOp::LocalGet(dst, slot_idx)` on first observation, and the
+/// `TraceOp::LocalGet { dst, slot_idx }` on first observation, and the
 /// emitter materialises the SSA from the entry-fn's `args_ptr` so
 /// `Add` no longer surfaces `EmitError::UnboundSsa`.
 #[test]

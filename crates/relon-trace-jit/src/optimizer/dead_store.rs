@@ -90,7 +90,11 @@ fn find_dead_stores(ops: &[TraceOp]) -> std::collections::HashSet<usize> {
 
     for (idx, op) in ops.iter().enumerate() {
         match op {
-            TraceOp::Store(base, Offset(off), _src) => {
+            TraceOp::Store {
+                base,
+                offset: Offset(off),
+                src: _,
+            } => {
                 let key = (*base, *off);
                 if let Some(prev) = latest.insert(key, idx) {
                     if is_block_free(&ops[prev + 1..idx]) {
@@ -98,13 +102,17 @@ fn find_dead_stores(ops: &[TraceOp]) -> std::collections::HashSet<usize> {
                     }
                 }
             }
-            TraceOp::Load(_, base, Offset(off)) => {
+            TraceOp::Load {
+                base,
+                offset: Offset(off),
+                ..
+            } => {
                 latest.remove(&(*base, *off));
             }
             // Calls / unrecoverable ops: clear knowledge globally to
             // be safe. We do not attempt alias reasoning.
-            TraceOp::Call(_, _, _, eff)
-                if !matches!(eff, EffectClass::Pure | EffectClass::ReadOnly) =>
+            TraceOp::Call { effect, .. }
+                if !matches!(effect, EffectClass::Pure | EffectClass::ReadOnly) =>
             {
                 latest.clear();
             }
@@ -122,8 +130,8 @@ fn is_block_free(ops: &[TraceOp]) -> bool {
         if op.is_guard() {
             return false;
         }
-        if let TraceOp::Call(_, _, _, eff) = op {
-            if !matches!(eff, EffectClass::Pure | EffectClass::ReadOnly) {
+        if let TraceOp::Call { effect, .. } = op {
+            if !matches!(effect, EffectClass::Pure | EffectClass::ReadOnly) {
                 return false;
             }
         }

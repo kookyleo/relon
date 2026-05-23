@@ -22,10 +22,16 @@ fn str_concat_emits_call() {
     // Both operands are i64-typed const pointers — a real recorder
     // would emit `LocalGet(_)` for each, but `ConstI64` is good
     // enough to exercise the lowering.
-    b.append(TraceOp::ConstI64(lhs, 0x1000));
-    b.append(TraceOp::ConstI64(rhs, 0x2000));
-    b.append(TraceOp::StrConcat(dst, lhs, rhs));
-    b.append(TraceOp::Return(dst));
+    b.append(TraceOp::ConstI64 {
+        dst: lhs,
+        value: 0x1000,
+    });
+    b.append(TraceOp::ConstI64 {
+        dst: rhs,
+        value: 0x2000,
+    });
+    b.append(TraceOp::StrConcat { dst, lhs, rhs });
+    b.append(TraceOp::Return { value: dst });
     let ctx = emit_and_verify(&b.into_optimized());
     let s = format!("{}", ctx.func);
     assert!(
@@ -47,10 +53,16 @@ fn str_glob_match_surfaces_missing_helper_error_under_default_hooks() {
     let s = b.fresh_ssa();
     let p = b.fresh_ssa();
     let dst = b.fresh_ssa();
-    b.append(TraceOp::ConstI64(s, 0x5000));
-    b.append(TraceOp::ConstI64(p, 0x6000));
-    b.append(TraceOp::StrGlobMatch(dst, s, p));
-    b.append(TraceOp::Return(dst));
+    b.append(TraceOp::ConstI64 {
+        dst: s,
+        value: 0x5000,
+    });
+    b.append(TraceOp::ConstI64 {
+        dst: p,
+        value: 0x6000,
+    });
+    b.append(TraceOp::StrGlobMatch { dst, s, pattern: p });
+    b.append(TraceOp::Return { value: dst });
     let mut ctx = cranelift_codegen::Context::new();
     let err = relon_trace_emitter::TraceEmitter::emit(&b.into_optimized(), &mut ctx)
         .expect_err("StrGlobMatch with default hooks must report missing helper");
@@ -68,10 +80,16 @@ fn str_glob_match_emits_call_when_helper_declared() {
     let s = b.fresh_ssa();
     let p = b.fresh_ssa();
     let dst = b.fresh_ssa();
-    b.append(TraceOp::ConstI64(s, 0x5000));
-    b.append(TraceOp::ConstI64(p, 0x6000));
-    b.append(TraceOp::StrGlobMatch(dst, s, p));
-    b.append(TraceOp::Return(dst));
+    b.append(TraceOp::ConstI64 {
+        dst: s,
+        value: 0x5000,
+    });
+    b.append(TraceOp::ConstI64 {
+        dst: p,
+        value: 0x6000,
+    });
+    b.append(TraceOp::StrGlobMatch { dst, s, pattern: p });
+    b.append(TraceOp::Return { value: dst });
 
     // Park the helper FuncId past every default slot so it doesn't
     // collide with another import. The emitter uses the integer as
@@ -106,10 +124,20 @@ fn str_contains_emits_call() {
     let h = b.fresh_ssa();
     let n = b.fresh_ssa();
     let dst = b.fresh_ssa();
-    b.append(TraceOp::ConstI64(h, 0x3000));
-    b.append(TraceOp::ConstI64(n, 0x4000));
-    b.append(TraceOp::StrContains(dst, h, n));
-    b.append(TraceOp::Return(dst));
+    b.append(TraceOp::ConstI64 {
+        dst: h,
+        value: 0x3000,
+    });
+    b.append(TraceOp::ConstI64 {
+        dst: n,
+        value: 0x4000,
+    });
+    b.append(TraceOp::StrContains {
+        dst,
+        haystack: h,
+        needle: n,
+    });
+    b.append(TraceOp::Return { value: dst });
     let ctx = emit_and_verify(&b.into_optimized());
     let s = format!("{}", ctx.func);
     // No const-byte side-table entry → fall back to the extern shim
@@ -130,11 +158,21 @@ fn emit_with_const_needle(needle: &[u8]) -> String {
     let h = b.fresh_ssa();
     let n = b.fresh_ssa();
     let dst = b.fresh_ssa();
-    b.append(TraceOp::ConstI64(h, 0x3000));
-    b.append(TraceOp::ConstI64(n, 0x4000));
+    b.append(TraceOp::ConstI64 {
+        dst: h,
+        value: 0x3000,
+    });
+    b.append(TraceOp::ConstI64 {
+        dst: n,
+        value: 0x4000,
+    });
     b.record_const_bytes(n, needle.to_vec());
-    b.append(TraceOp::StrContains(dst, h, n));
-    b.append(TraceOp::Return(dst));
+    b.append(TraceOp::StrContains {
+        dst,
+        haystack: h,
+        needle: n,
+    });
+    b.append(TraceOp::Return { value: dst });
     let ctx = emit_and_verify(&b.into_optimized());
     format!("{}", ctx.func)
 }
@@ -225,11 +263,17 @@ fn emit_concat_with_const_rhs(
     let lhs = b.fresh_ssa();
     let rhs = b.fresh_ssa();
     let dst = b.fresh_ssa();
-    b.append(TraceOp::ConstI64(lhs, 0x1000));
-    b.append(TraceOp::ConstI64(rhs, 0x2000));
+    b.append(TraceOp::ConstI64 {
+        dst: lhs,
+        value: 0x1000,
+    });
+    b.append(TraceOp::ConstI64 {
+        dst: rhs,
+        value: 0x2000,
+    });
     b.record_const_bytes(rhs, rhs_bytes.to_vec());
-    b.append(TraceOp::StrConcat(dst, lhs, rhs));
-    b.append(TraceOp::Return(dst));
+    b.append(TraceOp::StrConcat { dst, lhs, rhs });
+    b.append(TraceOp::Return { value: dst });
 
     let mut hooks = HostHookFuncIds::default();
     // `str_concat_alloc` is slotted after the historical 7-hook
@@ -339,16 +383,34 @@ fn emit_with_preloaded_haystack(needle: &[u8]) -> String {
     let len_ssa = b.fresh_ssa();
     let n = b.fresh_ssa();
     let dst = b.fresh_ssa();
-    b.append(TraceOp::ConstI64(h, 0x3000));
+    b.append(TraceOp::ConstI64 {
+        dst: h,
+        value: 0x3000,
+    });
     // Two real Loads upstream of the StrContains — mirrors what the
     // recorder's `inject_str_payload_loads` synthesises.
-    b.append(TraceOp::Load(ptr_ssa, h, Offset(0)));
-    b.append(TraceOp::Load(len_ssa, h, Offset(8)));
+    b.append(TraceOp::Load {
+        dst: ptr_ssa,
+        base: h,
+        offset: Offset(0),
+    });
+    b.append(TraceOp::Load {
+        dst: len_ssa,
+        base: h,
+        offset: Offset(8),
+    });
     b.record_str_payload(h, ptr_ssa, len_ssa);
-    b.append(TraceOp::ConstI64(n, 0x4000));
+    b.append(TraceOp::ConstI64 {
+        dst: n,
+        value: 0x4000,
+    });
     b.record_const_bytes(n, needle.to_vec());
-    b.append(TraceOp::StrContains(dst, h, n));
-    b.append(TraceOp::Return(dst));
+    b.append(TraceOp::StrContains {
+        dst,
+        haystack: h,
+        needle: n,
+    });
+    b.append(TraceOp::Return { value: dst });
     let ctx = emit_and_verify(&b.into_optimized());
     format!("{}", ctx.func)
 }
@@ -397,10 +459,20 @@ fn str_find_emits_call() {
     let h = b.fresh_ssa();
     let n = b.fresh_ssa();
     let dst = b.fresh_ssa();
-    b.append(TraceOp::ConstI64(h, 0x3000));
-    b.append(TraceOp::ConstI64(n, 0x4000));
-    b.append(TraceOp::StrFind(dst, h, n));
-    b.append(TraceOp::Return(dst));
+    b.append(TraceOp::ConstI64 {
+        dst: h,
+        value: 0x3000,
+    });
+    b.append(TraceOp::ConstI64 {
+        dst: n,
+        value: 0x4000,
+    });
+    b.append(TraceOp::StrFind {
+        dst,
+        haystack: h,
+        needle: n,
+    });
+    b.append(TraceOp::Return { value: dst });
     emit_and_verify(&b.into_optimized());
 }
 
@@ -411,11 +483,25 @@ fn str_substring_emits_call() {
     let start = b.fresh_ssa();
     let length = b.fresh_ssa();
     let dst = b.fresh_ssa();
-    b.append(TraceOp::ConstI64(s, 0x5000));
-    b.append(TraceOp::ConstI64(start, 0));
-    b.append(TraceOp::ConstI64(length, 4));
-    b.append(TraceOp::StrSubstring(dst, s, start, length));
-    b.append(TraceOp::Return(dst));
+    b.append(TraceOp::ConstI64 {
+        dst: s,
+        value: 0x5000,
+    });
+    b.append(TraceOp::ConstI64 {
+        dst: start,
+        value: 0,
+    });
+    b.append(TraceOp::ConstI64 {
+        dst: length,
+        value: 4,
+    });
+    b.append(TraceOp::StrSubstring {
+        dst,
+        s,
+        start,
+        length,
+    });
+    b.append(TraceOp::Return { value: dst });
     emit_and_verify(&b.into_optimized());
 }
 
@@ -434,12 +520,15 @@ fn emit_concat_n(n: usize, enable_helpers: bool) -> (String, String) {
     let mut ops: Vec<relon_trace_jit::SsaVar> = Vec::with_capacity(n);
     for i in 0..n {
         let v = b.fresh_ssa();
-        b.append(TraceOp::ConstI64(v, 0x1000 + i as i64));
+        b.append(TraceOp::ConstI64 {
+            dst: v,
+            value: 0x1000 + i as i64,
+        });
         ops.push(v);
     }
     let dst = b.fresh_ssa();
     b.append(TraceOp::StrConcatN { dst, operands: ops });
-    b.append(TraceOp::Return(dst));
+    b.append(TraceOp::Return { value: dst });
 
     let mut hooks = HostHookFuncIds::default();
     let alloc_id: u32 = 8;
@@ -514,15 +603,24 @@ fn str_concat_n_surfaces_missing_helper_error_under_default_hooks() {
     let a = b.fresh_ssa();
     let bb = b.fresh_ssa();
     let c = b.fresh_ssa();
-    b.append(TraceOp::ConstI64(a, 0x1000));
-    b.append(TraceOp::ConstI64(bb, 0x2000));
-    b.append(TraceOp::ConstI64(c, 0x3000));
+    b.append(TraceOp::ConstI64 {
+        dst: a,
+        value: 0x1000,
+    });
+    b.append(TraceOp::ConstI64 {
+        dst: bb,
+        value: 0x2000,
+    });
+    b.append(TraceOp::ConstI64 {
+        dst: c,
+        value: 0x3000,
+    });
     let dst = b.fresh_ssa();
     b.append(TraceOp::StrConcatN {
         dst,
         operands: vec![a, bb, c],
     });
-    b.append(TraceOp::Return(dst));
+    b.append(TraceOp::Return { value: dst });
 
     let mut ctx = Context::new();
     let err = TraceEmitter::emit(&b.into_optimized(), &mut ctx)

@@ -27,7 +27,7 @@ fn assert_guards_balanced(buf: &relon_trace_jit::TraceBuffer) {
         .ops
         .iter()
         .enumerate()
-        .filter(|(_, o)| matches!(o, TraceOp::Guard(_, _)))
+        .filter(|(_, o)| matches!(o, TraceOp::Guard { kind: _, check: _ }))
         .map(|(pc, _)| pc as u32)
         .collect();
     guard_pcs.sort_unstable();

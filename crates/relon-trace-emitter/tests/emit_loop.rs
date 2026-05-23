@@ -12,20 +12,24 @@ use relon_trace_jit::{CmpKind, GuardKind, GuardSite, LoopPhi, TraceBuffer, Trace
 fn simple_loop_lowers_to_jump() {
     let mut b = TraceBuffer::new();
     let acc = b.fresh_ssa();
-    b.append(TraceOp::ConstI64(acc, 0));
+    b.append(TraceOp::ConstI64 { dst: acc, value: 0 });
     b.append(TraceOp::MarkLoopHead {
         loop_id: 0,
         phis: vec![],
     });
     let one = b.fresh_ssa();
-    b.append(TraceOp::ConstI64(one, 1));
+    b.append(TraceOp::ConstI64 { dst: one, value: 1 });
     let next = b.fresh_ssa();
-    b.append(TraceOp::Add(next, acc, one));
+    b.append(TraceOp::Add {
+        dst: next,
+        lhs: acc,
+        rhs: one,
+    });
     b.append(TraceOp::MarkLoopBack {
         loop_id: 0,
         next_values: vec![],
     });
-    b.append(TraceOp::Return(next));
+    b.append(TraceOp::Return { value: next });
     let ctx = emit_and_verify(&b.into_optimized());
     let s = format!("{}", ctx.func);
     assert!(s.contains("jump"), "expected jump in:\n{s}");
@@ -35,23 +39,36 @@ fn simple_loop_lowers_to_jump() {
 fn nested_loops_lower_each_with_its_own_block() {
     let mut b = TraceBuffer::new();
     let outer = b.fresh_ssa();
-    b.append(TraceOp::ConstI64(outer, 0));
+    b.append(TraceOp::ConstI64 {
+        dst: outer,
+        value: 0,
+    });
     b.append(TraceOp::MarkLoopHead {
         loop_id: 0,
         phis: vec![],
     });
 
     let inner = b.fresh_ssa();
-    b.append(TraceOp::ConstI64(inner, 0));
+    b.append(TraceOp::ConstI64 {
+        dst: inner,
+        value: 0,
+    });
     b.append(TraceOp::MarkLoopHead {
         loop_id: 1,
         phis: vec![],
     });
 
     let step = b.fresh_ssa();
-    b.append(TraceOp::ConstI64(step, 1));
+    b.append(TraceOp::ConstI64 {
+        dst: step,
+        value: 1,
+    });
     let inner_next = b.fresh_ssa();
-    b.append(TraceOp::Add(inner_next, inner, step));
+    b.append(TraceOp::Add {
+        dst: inner_next,
+        lhs: inner,
+        rhs: step,
+    });
 
     b.append(TraceOp::MarkLoopBack {
         loop_id: 1,
@@ -61,7 +78,7 @@ fn nested_loops_lower_each_with_its_own_block() {
         loop_id: 0,
         next_values: vec![],
     });
-    b.append(TraceOp::Return(inner_next));
+    b.append(TraceOp::Return { value: inner_next });
     let ctx = emit_and_verify(&b.into_optimized());
     let s = format!("{}", ctx.func);
     // Two MarkLoopHead pairs → at least two `jump` ops.
@@ -72,12 +89,12 @@ fn nested_loops_lower_each_with_its_own_block() {
 fn unmatched_loop_back_surfaces_error() {
     let mut b = TraceBuffer::new();
     let v = b.fresh_ssa();
-    b.append(TraceOp::ConstI64(v, 0));
+    b.append(TraceOp::ConstI64 { dst: v, value: 0 });
     b.append(TraceOp::MarkLoopBack {
         loop_id: 9,
         next_values: vec![],
     });
-    b.append(TraceOp::Return(v));
+    b.append(TraceOp::Return { value: v });
     let trace = b.into_optimized();
     let mut ctx = Context::new();
     let err = TraceEmitter::emit(&trace, &mut ctx).unwrap_err();
@@ -95,11 +112,20 @@ fn phi_carried_loop_emits_block_params() {
     let mut b = TraceBuffer::new();
     // Pre-loop: n = LocalGet(0); acc_init = 0; i_init = 1.
     let n = b.fresh_ssa();
-    b.append(TraceOp::LocalGet(n, 0));
+    b.append(TraceOp::LocalGet {
+        dst: n,
+        slot_idx: 0,
+    });
     let acc_init = b.fresh_ssa();
-    b.append(TraceOp::ConstI64(acc_init, 0));
+    b.append(TraceOp::ConstI64 {
+        dst: acc_init,
+        value: 0,
+    });
     let i_init = b.fresh_ssa();
-    b.append(TraceOp::ConstI64(i_init, 1));
+    b.append(TraceOp::ConstI64 {
+        dst: i_init,
+        value: 1,
+    });
 
     // Phi SSAs for the loop body.
     let phi_acc = b.fresh_ssa();
@@ -111,25 +137,41 @@ fn phi_carried_loop_emits_block_params() {
 
     // Body: cmp = i <= n; guard(cmp); acc_next = acc + i; i_next = i + 1.
     let cmp = b.fresh_ssa();
-    b.append(TraceOp::Cmp(CmpKind::Le, cmp, phi_i, n));
-    let cmp_guard_pc = b.append(TraceOp::Guard(GuardKind::NotNull(cmp), cmp));
+    b.append(TraceOp::Cmp {
+        kind: CmpKind::Le,
+        dst: cmp,
+        lhs: phi_i,
+        rhs: n,
+    });
+    let cmp_guard_pc = b.append(TraceOp::Guard {
+        kind: GuardKind::NotNull(cmp),
+        check: cmp,
+    });
     b.record_guard(GuardSite::new(
         cmp_guard_pc,
         ExternalPc(1),
         GuardKind::NotNull(cmp),
     ));
     let acc_next = b.fresh_ssa();
-    b.append(TraceOp::Add(acc_next, phi_acc, phi_i));
+    b.append(TraceOp::Add {
+        dst: acc_next,
+        lhs: phi_acc,
+        rhs: phi_i,
+    });
     let one = b.fresh_ssa();
-    b.append(TraceOp::ConstI64(one, 1));
+    b.append(TraceOp::ConstI64 { dst: one, value: 1 });
     let i_next = b.fresh_ssa();
-    b.append(TraceOp::Add(i_next, phi_i, one));
+    b.append(TraceOp::Add {
+        dst: i_next,
+        lhs: phi_i,
+        rhs: one,
+    });
 
     b.append(TraceOp::MarkLoopBack {
         loop_id: 0,
         next_values: vec![acc_next, i_next],
     });
-    b.append(TraceOp::Return(phi_acc));
+    b.append(TraceOp::Return { value: phi_acc });
 
     let ctx = emit_and_verify(&b.into_optimized());
     let s = format!("{}", ctx.func);
@@ -147,7 +189,7 @@ fn loop_body_with_no_back_edge_still_verifies() {
     // creates. The verifier should accept the resulting linear flow.
     let mut b = TraceBuffer::new();
     let v = b.fresh_ssa();
-    b.append(TraceOp::ConstI64(v, 0));
+    b.append(TraceOp::ConstI64 { dst: v, value: 0 });
     b.append(TraceOp::MarkLoopHead {
         loop_id: 0,
         phis: vec![],
@@ -156,6 +198,6 @@ fn loop_body_with_no_back_edge_still_verifies() {
         loop_id: 0,
         next_values: vec![],
     });
-    b.append(TraceOp::Return(v));
+    b.append(TraceOp::Return { value: v });
     emit_and_verify(&b.into_optimized());
 }

@@ -214,7 +214,7 @@ fn is_loop_invariant(
         None => true,
         Some(op) => matches!(
             op,
-            TraceOp::LocalGet(_, _) | TraceOp::ConstI32(_, _) | TraceOp::ConstI64(_, _)
+            TraceOp::LocalGet { .. } | TraceOp::ConstI32 { .. } | TraceOp::ConstI64 { .. }
         ),
     }
 }
@@ -293,12 +293,18 @@ mod tests {
         let dict = b.fresh_ssa();
         let key = b.fresh_ssa();
         let val = b.fresh_ssa();
-        b.append(TraceOp::LocalGet(dict, 1));
+        b.append(TraceOp::LocalGet {
+            dst: dict,
+            slot_idx: 1,
+        });
         b.append(TraceOp::MarkLoopHead {
             loop_id: 0,
             phis: vec![],
         });
-        b.append(TraceOp::LocalGet(key, 2));
+        b.append(TraceOp::LocalGet {
+            dst: key,
+            slot_idx: 2,
+        });
         b.append(TraceOp::DictLookup {
             dst: val,
             dict_ptr: dict,
@@ -357,12 +363,18 @@ mod tests {
         let phi = b.fresh_ssa();
         let key = b.fresh_ssa();
         let val = b.fresh_ssa();
-        b.append(TraceOp::LocalGet(init, 0));
+        b.append(TraceOp::LocalGet {
+            dst: init,
+            slot_idx: 0,
+        });
         b.append(TraceOp::MarkLoopHead {
             loop_id: 0,
             phis: vec![LoopPhi::new(init, phi)],
         });
-        b.append(TraceOp::LocalGet(key, 1));
+        b.append(TraceOp::LocalGet {
+            dst: key,
+            slot_idx: 1,
+        });
         b.append(TraceOp::DictLookup {
             dst: val,
             dict_ptr: phi, // ← varies every iter (loop-carried)
@@ -401,8 +413,14 @@ mod tests {
             loop_id: 0,
             phis: vec![],
         });
-        b.append(TraceOp::LocalGet(dict, 1));
-        b.append(TraceOp::LocalGet(key, 2));
+        b.append(TraceOp::LocalGet {
+            dst: dict,
+            slot_idx: 1,
+        });
+        b.append(TraceOp::LocalGet {
+            dst: key,
+            slot_idx: 2,
+        });
         b.append(TraceOp::DictLookup {
             dst: val,
             dict_ptr: dict,
@@ -437,8 +455,14 @@ mod tests {
         let dict = b.fresh_ssa();
         let key = b.fresh_ssa();
         let val = b.fresh_ssa();
-        b.append(TraceOp::LocalGet(dict, 1));
-        b.append(TraceOp::LocalGet(key, 2));
+        b.append(TraceOp::LocalGet {
+            dst: dict,
+            slot_idx: 1,
+        });
+        b.append(TraceOp::LocalGet {
+            dst: key,
+            slot_idx: 2,
+        });
         b.append(TraceOp::DictLookup {
             dst: val,
             dict_ptr: dict,
@@ -465,19 +489,28 @@ mod tests {
         let key2 = b.fresh_ssa();
         let val1 = b.fresh_ssa();
         let val2 = b.fresh_ssa();
-        b.append(TraceOp::LocalGet(dict, 1));
+        b.append(TraceOp::LocalGet {
+            dst: dict,
+            slot_idx: 1,
+        });
         b.append(TraceOp::MarkLoopHead {
             loop_id: 0,
             phis: vec![],
         });
-        b.append(TraceOp::LocalGet(key1, 2));
+        b.append(TraceOp::LocalGet {
+            dst: key1,
+            slot_idx: 2,
+        });
         b.append(TraceOp::DictLookup {
             dst: val1,
             dict_ptr: dict,
             key_ptr: key1,
             shape_hash: 0xa,
         });
-        b.append(TraceOp::LocalGet(key2, 3));
+        b.append(TraceOp::LocalGet {
+            dst: key2,
+            slot_idx: 3,
+        });
         b.append(TraceOp::DictLookup {
             dst: val2,
             dict_ptr: dict,
@@ -565,8 +598,14 @@ mod tests {
             loop_id: 0,
             phis: vec![],
         });
-        b.append(TraceOp::LocalGet(dict, 1));
-        b.append(TraceOp::LocalGet(key, 2));
+        b.append(TraceOp::LocalGet {
+            dst: dict,
+            slot_idx: 1,
+        });
+        b.append(TraceOp::LocalGet {
+            dst: key,
+            slot_idx: 2,
+        });
         b.append(TraceOp::DictLookup {
             dst: val,
             dict_ptr: dict,
@@ -610,15 +649,26 @@ mod tests {
         let dict = b.fresh_ssa();
         let key = b.fresh_ssa();
         let val = b.fresh_ssa();
-        b.append(TraceOp::ConstI64(a, 1));
-        b.append(TraceOp::ConstI64(bv, 2));
-        b.append(TraceOp::Cmp(CmpKind::Eq, cmp_dst, a, bv));
-        b.append(TraceOp::LocalGet(dict, 1));
+        b.append(TraceOp::ConstI64 { dst: a, value: 1 });
+        b.append(TraceOp::ConstI64 { dst: bv, value: 2 });
+        b.append(TraceOp::Cmp {
+            kind: CmpKind::Eq,
+            dst: cmp_dst,
+            lhs: a,
+            rhs: bv,
+        });
+        b.append(TraceOp::LocalGet {
+            dst: dict,
+            slot_idx: 1,
+        });
         b.append(TraceOp::MarkLoopHead {
             loop_id: 0,
             phis: vec![],
         });
-        b.append(TraceOp::LocalGet(key, 2));
+        b.append(TraceOp::LocalGet {
+            dst: key,
+            slot_idx: 2,
+        });
         b.append(TraceOp::DictLookup {
             dst: val,
             dict_ptr: dict,
@@ -634,7 +684,12 @@ mod tests {
 
         // The Cmp op's operand SSAs should be unchanged.
         match b.ops[2] {
-            TraceOp::Cmp(kind, dst, x, y) => {
+            TraceOp::Cmp {
+                kind,
+                dst,
+                lhs: x,
+                rhs: y,
+            } => {
                 assert_eq!(kind, CmpKind::Eq);
                 assert_eq!(dst, cmp_dst);
                 assert_eq!(x, a);

@@ -33,7 +33,16 @@ fn add_op_carries_pure_effect_class() {
     let add = buf
         .ops
         .iter()
-        .find(|o| matches!(o, TraceOp::Add(_, _, _)))
+        .find(|o| {
+            matches!(
+                o,
+                TraceOp::Add {
+                    dst: _,
+                    lhs: _,
+                    rhs: _
+                }
+            )
+        })
         .expect("add present");
     assert_eq!(add.effect_class(), EffectClass::Pure);
 }
@@ -51,7 +60,20 @@ fn sub_then_mul_records_two_ops() {
     let arith = buf
         .ops
         .iter()
-        .filter(|o| matches!(o, TraceOp::Sub(_, _, _) | TraceOp::Mul(_, _, _)))
+        .filter(|o| {
+            matches!(
+                o,
+                TraceOp::Sub {
+                    dst: _,
+                    lhs: _,
+                    rhs: _
+                } | TraceOp::Mul {
+                    dst: _,
+                    lhs: _,
+                    rhs: _
+                }
+            )
+        })
         .count();
     assert_eq!(arith, 2);
 }
@@ -82,7 +104,16 @@ fn div_emits_recoverable_write_class() {
     let div = buf
         .ops
         .iter()
-        .find(|o| matches!(o, TraceOp::Div(_, _, _)))
+        .find(|o| {
+            matches!(
+                o,
+                TraceOp::Div {
+                    dst: _,
+                    lhs: _,
+                    rhs: _
+                }
+            )
+        })
         .expect("div present");
     assert_eq!(div.effect_class(), EffectClass::RecoverableWrite);
 }
@@ -97,7 +128,15 @@ fn arith_emits_overflow_guard() {
     let guard_count = buf
         .ops
         .iter()
-        .filter(|o| matches!(o, TraceOp::Guard(GuardKind::ArithOverflow(_), _)))
+        .filter(|o| {
+            matches!(
+                o,
+                TraceOp::Guard {
+                    kind: GuardKind::ArithOverflow(_),
+                    check: _
+                }
+            )
+        })
         .count();
     assert_eq!(guard_count, 1);
 }

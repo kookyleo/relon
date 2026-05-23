@@ -21,20 +21,25 @@ use relon_trace_jit::{
 fn type_spec_guard_before_call_lowers() {
     let mut b = TraceBuffer::new();
     let v = b.fresh_ssa();
-    b.append(TraceOp::ConstI64(v, 100));
+    b.append(TraceOp::ConstI64 { dst: v, value: 100 });
     b.record_type(v, ObservedType::I64);
-    let pc = b.append(TraceOp::Guard(
-        GuardKind::TypeCheck(v, ObservedType::I64),
-        SsaVar::NONE,
-    ));
+    let pc = b.append(TraceOp::Guard {
+        kind: GuardKind::TypeCheck(v, ObservedType::I64),
+        check: SsaVar::NONE,
+    });
     b.record_guard(GuardSite::new(
         pc,
         ExternalPc(0xfeed),
         GuardKind::TypeCheck(v, ObservedType::I64),
     ));
     let r = b.fresh_ssa();
-    b.append(TraceOp::Call(r, FuncId(11), vec![v], EffectClass::Pure));
-    b.append(TraceOp::Return(r));
+    b.append(TraceOp::Call {
+        dst: r,
+        func: FuncId(11),
+        args: vec![v],
+        effect: EffectClass::Pure,
+    });
+    b.append(TraceOp::Return { value: r });
     emit_and_verify(&b.into_optimized());
 }
 
@@ -46,18 +51,18 @@ fn type_mismatch_lowers_to_const_zero_predicate() {
     // function regardless.
     let mut b = TraceBuffer::new();
     let v = b.fresh_ssa();
-    b.append(TraceOp::ConstI64(v, 1));
+    b.append(TraceOp::ConstI64 { dst: v, value: 1 });
     b.record_type(v, ObservedType::I64);
-    let pc = b.append(TraceOp::Guard(
-        GuardKind::TypeCheck(v, ObservedType::Bool),
-        SsaVar::NONE,
-    ));
+    let pc = b.append(TraceOp::Guard {
+        kind: GuardKind::TypeCheck(v, ObservedType::Bool),
+        check: SsaVar::NONE,
+    });
     b.record_guard(GuardSite::new(
         pc,
         ExternalPc(0xcaca),
         GuardKind::TypeCheck(v, ObservedType::Bool),
     ));
-    b.append(TraceOp::Return(v));
+    b.append(TraceOp::Return { value: v });
     emit_and_verify(&b.into_optimized());
 }
 
@@ -70,8 +75,13 @@ fn ic_hook_is_declared_for_future_integration() {
     // declared but lazily linked.
     let mut b = TraceBuffer::new();
     let r = b.fresh_ssa();
-    b.append(TraceOp::Call(r, FuncId(0), vec![], EffectClass::Pure));
-    b.append(TraceOp::Return(r));
+    b.append(TraceOp::Call {
+        dst: r,
+        func: FuncId(0),
+        args: vec![],
+        effect: EffectClass::Pure,
+    });
+    b.append(TraceOp::Return { value: r });
     let ctx = emit_and_verify(&b.into_optimized());
     // 3 imported user functions => fn0..fn2 in the dump.
     let s = format!("{}", ctx.func);
@@ -84,24 +94,27 @@ fn ic_pattern_with_multiple_guards_verifies() {
     let mut b = TraceBuffer::new();
     let arg = b.fresh_ssa();
     let receiver = b.fresh_ssa();
-    b.append(TraceOp::ConstI64(arg, 7));
-    b.append(TraceOp::ConstI64(receiver, 0xbeef));
+    b.append(TraceOp::ConstI64 { dst: arg, value: 7 });
+    b.append(TraceOp::ConstI64 {
+        dst: receiver,
+        value: 0xbeef,
+    });
     b.record_type(arg, ObservedType::I64);
     b.record_type(receiver, ObservedType::Ptr);
 
-    let pc1 = b.append(TraceOp::Guard(
-        GuardKind::TypeCheck(arg, ObservedType::I64),
-        SsaVar::NONE,
-    ));
+    let pc1 = b.append(TraceOp::Guard {
+        kind: GuardKind::TypeCheck(arg, ObservedType::I64),
+        check: SsaVar::NONE,
+    });
     b.record_guard(GuardSite::new(
         pc1,
         ExternalPc(0x1),
         GuardKind::TypeCheck(arg, ObservedType::I64),
     ));
-    let pc2 = b.append(TraceOp::Guard(
-        GuardKind::TypeCheck(receiver, ObservedType::Ptr),
-        SsaVar::NONE,
-    ));
+    let pc2 = b.append(TraceOp::Guard {
+        kind: GuardKind::TypeCheck(receiver, ObservedType::Ptr),
+        check: SsaVar::NONE,
+    });
     b.record_guard(GuardSite::new(
         pc2,
         ExternalPc(0x2),
@@ -109,12 +122,12 @@ fn ic_pattern_with_multiple_guards_verifies() {
     ));
 
     let r = b.fresh_ssa();
-    b.append(TraceOp::Call(
-        r,
-        FuncId(33),
-        vec![receiver, arg],
-        EffectClass::ReadOnly,
-    ));
-    b.append(TraceOp::Return(r));
+    b.append(TraceOp::Call {
+        dst: r,
+        func: FuncId(33),
+        args: vec![receiver, arg],
+        effect: EffectClass::ReadOnly,
+    });
+    b.append(TraceOp::Return { value: r });
     emit_and_verify(&b.into_optimized());
 }

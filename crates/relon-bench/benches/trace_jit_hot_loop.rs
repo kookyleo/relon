@@ -813,10 +813,20 @@ fn install_explicit_conv_trace(call_conv: CallConv) -> (TraceJitState, u32) {
     let a = buffer.fresh_ssa();
     let b = buffer.fresh_ssa();
     let sum = buffer.fresh_ssa();
-    buffer.append(TraceOp::LocalGet(a, 0));
-    buffer.append(TraceOp::LocalGet(b, 1));
-    buffer.append(TraceOp::Add(sum, a, b));
-    buffer.append(TraceOp::Return(sum));
+    buffer.append(TraceOp::LocalGet {
+        dst: a,
+        slot_idx: 0,
+    });
+    buffer.append(TraceOp::LocalGet {
+        dst: b,
+        slot_idx: 1,
+    });
+    buffer.append(TraceOp::Add {
+        dst: sum,
+        lhs: a,
+        rhs: b,
+    });
+    buffer.append(TraceOp::Return { value: sum });
 
     let state = TraceJitState::new();
     let trace_fn = state
@@ -834,10 +844,20 @@ fn build_inline_step_host_fn() -> relon_codegen_native::InlineHostFn {
     let a = buffer.fresh_ssa();
     let b = buffer.fresh_ssa();
     let sum = buffer.fresh_ssa();
-    buffer.append(TraceOp::LocalGet(a, 0));
-    buffer.append(TraceOp::LocalGet(b, 1));
-    buffer.append(TraceOp::Add(sum, a, b));
-    buffer.append(TraceOp::Return(sum));
+    buffer.append(TraceOp::LocalGet {
+        dst: a,
+        slot_idx: 0,
+    });
+    buffer.append(TraceOp::LocalGet {
+        dst: b,
+        slot_idx: 1,
+    });
+    buffer.append(TraceOp::Add {
+        dst: sum,
+        lhs: a,
+        rhs: b,
+    });
+    buffer.append(TraceOp::Return { value: sum });
     let trace = Arc::new(buffer.into_optimized());
     compile_inline_host_fn(trace).expect("inline host-fn compile must succeed")
 }

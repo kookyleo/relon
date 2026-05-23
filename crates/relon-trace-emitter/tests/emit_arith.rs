@@ -15,10 +15,14 @@ fn add_const_constants_round_trip() {
     let a = b.fresh_ssa();
     let c = b.fresh_ssa();
     let r = b.fresh_ssa();
-    b.append(TraceOp::ConstI64(a, 10));
-    b.append(TraceOp::ConstI64(c, 20));
-    b.append(TraceOp::Add(r, a, c));
-    b.append(TraceOp::Return(r));
+    b.append(TraceOp::ConstI64 { dst: a, value: 10 });
+    b.append(TraceOp::ConstI64 { dst: c, value: 20 });
+    b.append(TraceOp::Add {
+        dst: r,
+        lhs: a,
+        rhs: c,
+    });
+    b.append(TraceOp::Return { value: r });
     emit_and_verify(&b.into_optimized());
 }
 
@@ -28,10 +32,14 @@ fn sub_emits_isub_instruction() {
     let a = b.fresh_ssa();
     let c = b.fresh_ssa();
     let r = b.fresh_ssa();
-    b.append(TraceOp::ConstI64(a, 7));
-    b.append(TraceOp::ConstI64(c, 3));
-    b.append(TraceOp::Sub(r, a, c));
-    b.append(TraceOp::Return(r));
+    b.append(TraceOp::ConstI64 { dst: a, value: 7 });
+    b.append(TraceOp::ConstI64 { dst: c, value: 3 });
+    b.append(TraceOp::Sub {
+        dst: r,
+        lhs: a,
+        rhs: c,
+    });
+    b.append(TraceOp::Return { value: r });
     emit_and_verify(&b.into_optimized());
 }
 
@@ -41,10 +49,14 @@ fn mul_emits_imul_instruction() {
     let a = b.fresh_ssa();
     let c = b.fresh_ssa();
     let r = b.fresh_ssa();
-    b.append(TraceOp::ConstI64(a, 6));
-    b.append(TraceOp::ConstI64(c, 7));
-    b.append(TraceOp::Mul(r, a, c));
-    b.append(TraceOp::Return(r));
+    b.append(TraceOp::ConstI64 { dst: a, value: 6 });
+    b.append(TraceOp::ConstI64 { dst: c, value: 7 });
+    b.append(TraceOp::Mul {
+        dst: r,
+        lhs: a,
+        rhs: c,
+    });
+    b.append(TraceOp::Return { value: r });
     emit_and_verify(&b.into_optimized());
 }
 
@@ -54,10 +66,14 @@ fn div_inserts_divisor_zero_check() {
     let a = b.fresh_ssa();
     let c = b.fresh_ssa();
     let r = b.fresh_ssa();
-    b.append(TraceOp::ConstI64(a, 84));
-    b.append(TraceOp::ConstI64(c, 2));
-    b.append(TraceOp::Div(r, a, c));
-    b.append(TraceOp::Return(r));
+    b.append(TraceOp::ConstI64 { dst: a, value: 84 });
+    b.append(TraceOp::ConstI64 { dst: c, value: 2 });
+    b.append(TraceOp::Div {
+        dst: r,
+        lhs: a,
+        rhs: c,
+    });
+    b.append(TraceOp::Return { value: r });
     emit_and_verify(&b.into_optimized());
 }
 
@@ -70,10 +86,14 @@ fn mod_emits_srem_with_divisor_zero_check() {
     let a = b.fresh_ssa();
     let c = b.fresh_ssa();
     let r = b.fresh_ssa();
-    b.append(TraceOp::ConstI64(a, 47));
-    b.append(TraceOp::ConstI64(c, 10));
-    b.append(TraceOp::Mod(r, a, c));
-    b.append(TraceOp::Return(r));
+    b.append(TraceOp::ConstI64 { dst: a, value: 47 });
+    b.append(TraceOp::ConstI64 { dst: c, value: 10 });
+    b.append(TraceOp::Mod {
+        dst: r,
+        lhs: a,
+        rhs: c,
+    });
+    b.append(TraceOp::Return { value: r });
     let ctx = emit_and_verify(&b.into_optimized());
     let printed = format!("{}", ctx.func);
     assert!(
@@ -92,10 +112,15 @@ fn cmp_lt_emits_widened_bool() {
     let a = b.fresh_ssa();
     let c = b.fresh_ssa();
     let r = b.fresh_ssa();
-    b.append(TraceOp::ConstI64(a, 1));
-    b.append(TraceOp::ConstI64(c, 2));
-    b.append(TraceOp::Cmp(CmpKind::Lt, r, a, c));
-    b.append(TraceOp::Return(r));
+    b.append(TraceOp::ConstI64 { dst: a, value: 1 });
+    b.append(TraceOp::ConstI64 { dst: c, value: 2 });
+    b.append(TraceOp::Cmp {
+        kind: CmpKind::Lt,
+        dst: r,
+        lhs: a,
+        rhs: c,
+    });
+    b.append(TraceOp::Return { value: r });
     let ctx = emit_and_verify(&b.into_optimized());
     let printed = format!("{}", ctx.func);
     assert!(
@@ -116,13 +141,25 @@ fn fused_arith_chain_is_well_typed() {
     let t1 = b.fresh_ssa();
     let t2 = b.fresh_ssa();
     let r = b.fresh_ssa();
-    b.append(TraceOp::ConstI64(va, 5));
-    b.append(TraceOp::ConstI64(vb, 7));
-    b.append(TraceOp::ConstI64(vc, 1));
-    b.append(TraceOp::ConstI64(vd, 4));
-    b.append(TraceOp::Add(t1, va, vb));
-    b.append(TraceOp::Sub(t2, t1, vc));
-    b.append(TraceOp::Mul(r, t2, vd));
-    b.append(TraceOp::Return(r));
+    b.append(TraceOp::ConstI64 { dst: va, value: 5 });
+    b.append(TraceOp::ConstI64 { dst: vb, value: 7 });
+    b.append(TraceOp::ConstI64 { dst: vc, value: 1 });
+    b.append(TraceOp::ConstI64 { dst: vd, value: 4 });
+    b.append(TraceOp::Add {
+        dst: t1,
+        lhs: va,
+        rhs: vb,
+    });
+    b.append(TraceOp::Sub {
+        dst: t2,
+        lhs: t1,
+        rhs: vc,
+    });
+    b.append(TraceOp::Mul {
+        dst: r,
+        lhs: t2,
+        rhs: vd,
+    });
+    b.append(TraceOp::Return { value: r });
     emit_and_verify(&b.into_optimized());
 }

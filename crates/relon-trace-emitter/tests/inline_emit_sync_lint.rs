@@ -288,8 +288,8 @@ fn collect_traceop_variants_strips_doc_lookalikes() {
     let sample = r#"
         // unrelated doc: TraceOp::Add appears here in a comment
         match op {
-            TraceOp::Add(_, _, _) => {},
-            TraceOp::Return(v) => {},
+            TraceOp::Add { dst: _, lhs: _, rhs: _ } => {},
+            TraceOp::Return { value: v } => {},
         }
     "#;
     let got = collect_traceop_variants(sample);

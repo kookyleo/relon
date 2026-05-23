@@ -539,7 +539,7 @@ struct TraceEmitterState<'a, 'b> {
     trace: &'a OptimizedTrace,
     trace_ctx_ptr: ir::Value,
     /// Packed `u64[]` arg pointer (2nd entry-fn ABI param). Each
-    /// `TraceOp::LocalGet(_, slot_idx)` lowers to a load at
+    /// `TraceOp::LocalGet { dst: _, slot_idx }` lowers to a load at
     /// `input_args_ptr + slot_idx * 8`.
     input_args_ptr: ir::Value,
     pointer_ty: ir::Type,
@@ -683,35 +683,56 @@ impl OpLowerer for TraceEmitterState<'_, '_> {
 impl<'a, 'b> TraceEmitterState<'a, 'b> {
     fn emit_op(&mut self, op: &TraceOp, guard_site: Option<&GuardSite>) -> Result<(), EmitError> {
         match op {
-            TraceOp::Add(dst, a, b) => lower_binop_i64(self, *dst, *a, *b, BinOp::Add),
-            TraceOp::Sub(dst, a, b) => lower_binop_i64(self, *dst, *a, *b, BinOp::Sub),
-            TraceOp::Mul(dst, a, b) => lower_binop_i64(self, *dst, *a, *b, BinOp::Mul),
-            TraceOp::Div(dst, a, b) => lower_div(self, *dst, *a, *b),
-            TraceOp::Mod(dst, a, b) => self.emit_mod(*dst, *a, *b),
-            TraceOp::Cmp(kind, dst, a, b) => lower_cmp(self, *kind, *dst, *a, *b),
-            TraceOp::Load(dst, base, off) => lower_load(self, *dst, *base, off.0),
-            TraceOp::Store(base, off, src) => lower_store(self, *base, off.0, *src),
-            TraceOp::ConstI32(dst, v) => lower_const_i32(self, *dst, *v),
-            TraceOp::ConstI64(dst, v) => lower_const_i64(self, *dst, *v),
-            TraceOp::LocalGet(dst, slot_idx) => lower_local_get(self, *dst, *slot_idx),
-            TraceOp::Guard(_, _) => self.emit_guard_op(guard_site),
-            TraceOp::Call(dst, func_id, args, effect) => {
-                self.emit_call(*dst, func_id.0, args, *effect)
-            }
-            TraceOp::Return(v) => self.emit_return(*v),
+            TraceOp::Add { dst, lhs, rhs } => lower_binop_i64(self, *dst, *lhs, *rhs, BinOp::Add),
+            TraceOp::Sub { dst, lhs, rhs } => lower_binop_i64(self, *dst, *lhs, *rhs, BinOp::Sub),
+            TraceOp::Mul { dst, lhs, rhs } => lower_binop_i64(self, *dst, *lhs, *rhs, BinOp::Mul),
+            TraceOp::Div { dst, lhs, rhs } => lower_div(self, *dst, *lhs, *rhs),
+            TraceOp::Mod { dst, lhs, rhs } => self.emit_mod(*dst, *lhs, *rhs),
+            TraceOp::Cmp {
+                kind,
+                dst,
+                lhs,
+                rhs,
+            } => lower_cmp(self, *kind, *dst, *lhs, *rhs),
+            TraceOp::Load { dst, base, offset } => lower_load(self, *dst, *base, offset.0),
+            TraceOp::Store { base, offset, src } => lower_store(self, *base, offset.0, *src),
+            TraceOp::ConstI32 { dst, value } => lower_const_i32(self, *dst, *value),
+            TraceOp::ConstI64 { dst, value } => lower_const_i64(self, *dst, *value),
+            TraceOp::LocalGet { dst, slot_idx } => lower_local_get(self, *dst, *slot_idx),
+            TraceOp::Guard { .. } => self.emit_guard_op(guard_site),
+            TraceOp::Call {
+                dst,
+                func,
+                args,
+                effect,
+            } => self.emit_call(*dst, func.0, args, *effect),
+            TraceOp::Return { value } => self.emit_return(*value),
             TraceOp::MarkLoopHead { loop_id, phis } => self.emit_loop_head(*loop_id, phis),
             TraceOp::MarkLoopBack {
                 loop_id,
                 next_values,
             } => self.emit_loop_back(*loop_id, next_values),
-            TraceOp::StrConcat(dst, a, b) => self.emit_str_concat(*dst, *a, *b),
+            TraceOp::StrConcat { dst, lhs, rhs } => self.emit_str_concat(*dst, *lhs, *rhs),
             TraceOp::StrConcatN { dst, operands } => self.emit_str_concat_n(*dst, operands),
-            TraceOp::StrContains(dst, a, b) => self.emit_str_contains(*dst, *a, *b),
-            TraceOp::StrFind(dst, a, b) => self.emit_str_find(*dst, *a, *b),
-            TraceOp::StrSubstring(dst, s, start, len) => {
-                self.emit_str_substring(*dst, *s, *start, *len)
+            TraceOp::StrContains {
+                dst,
+                haystack,
+                needle,
+            } => self.emit_str_contains(*dst, *haystack, *needle),
+            TraceOp::StrFind {
+                dst,
+                haystack,
+                needle,
+            } => self.emit_str_find(*dst, *haystack, *needle),
+            TraceOp::StrSubstring {
+                dst,
+                s,
+                start,
+                length,
+            } => self.emit_str_substring(*dst, *s, *start, *length),
+            TraceOp::StrGlobMatch { dst, s, pattern } => {
+                self.emit_str_glob_match(*dst, *s, *pattern)
             }
-            TraceOp::StrGlobMatch(dst, s, pattern) => self.emit_str_glob_match(*dst, *s, *pattern),
             // F-D8 -----------------------------------------------------
             TraceOp::ListGet { dst, list_ptr, idx } => self.emit_list_get(*dst, *list_ptr, *idx),
             TraceOp::DictLookup {
@@ -1325,7 +1346,7 @@ impl<'a, 'b> TraceEmitterState<'a, 'b> {
     /// optimiser pipeline does not (yet) attach explicit `GuardSite`s
     /// to the inline bounds check; if a future pass wants to deopt
     /// into a specific bytecode index it can do so by lifting this
-    /// inline guard into a `TraceOp::Guard(BoundsCheck, ...)` op the
+    /// inline guard into a `TraceOp::Guard { kind: BoundsCheck, check: ... }` op the
     /// recorder emits explicitly.
     fn emit_list_get(
         &mut self,
@@ -1704,7 +1725,7 @@ impl<'a, 'b> TraceEmitterState<'a, 'b> {
                     let len64 = self.builder.ins().uextend(I64, len32);
                     self.hoisted_list_len.insert(*list_ptr, len64);
                 }
-                TraceOp::Mod(_, _, b)
+                TraceOp::Mod { rhs: b, .. }
                     if !meta.inside_defs.contains(b)
                         && !self.hoisted_mod_nonzero_divisor.contains(b) =>
                 {
@@ -2138,8 +2159,8 @@ mod tests {
     fn return_emits_store_into_result_slot() {
         let mut b = TraceBuffer::new();
         let dst = b.fresh_ssa();
-        b.append(TraceOp::ConstI64(dst, 42));
-        b.append(TraceOp::Return(dst));
+        b.append(TraceOp::ConstI64 { dst, value: 42 });
+        b.append(TraceOp::Return { value: dst });
         let trace = b.into_optimized();
         let mut ctx = CodegenContext::new();
         TraceEmitter::emit(&trace, &mut ctx).expect("emit ok");
@@ -2150,7 +2171,7 @@ mod tests {
         // Ops without a preceding define should surface UnboundSsa.
         let mut b = TraceBuffer::new();
         let phantom = SsaVar(99);
-        b.append(TraceOp::Return(phantom));
+        b.append(TraceOp::Return { value: phantom });
         let trace = b.into_optimized();
         let mut ctx = CodegenContext::new();
         let err = TraceEmitter::emit(&trace, &mut ctx).unwrap_err();
@@ -2161,12 +2182,12 @@ mod tests {
     fn unrecoverable_call_rejected() {
         let mut b = TraceBuffer::new();
         let dst = b.fresh_ssa();
-        b.append(TraceOp::Call(
+        b.append(TraceOp::Call {
             dst,
-            relon_trace_jit::FuncId(7),
-            vec![],
-            EffectClass::Unrecoverable,
-        ));
+            func: relon_trace_jit::FuncId(7),
+            args: vec![],
+            effect: EffectClass::Unrecoverable,
+        });
         let trace = b.into_optimized();
         let mut ctx = CodegenContext::new();
         let err = TraceEmitter::emit(&trace, &mut ctx).unwrap_err();
@@ -2177,11 +2198,22 @@ mod tests {
     fn load_store_round_trip_lowers() {
         let mut b = TraceBuffer::new();
         let base = b.fresh_ssa();
-        b.append(TraceOp::ConstI64(base, 0x1000));
+        b.append(TraceOp::ConstI64 {
+            dst: base,
+            value: 0x1000,
+        });
         let loaded = b.fresh_ssa();
-        b.append(TraceOp::Load(loaded, base, Offset(8)));
-        b.append(TraceOp::Store(base, Offset(16), loaded));
-        b.append(TraceOp::Return(loaded));
+        b.append(TraceOp::Load {
+            dst: loaded,
+            base,
+            offset: Offset(8),
+        });
+        b.append(TraceOp::Store {
+            base,
+            offset: Offset(16),
+            src: loaded,
+        });
+        b.append(TraceOp::Return { value: loaded });
         let trace = b.into_optimized();
         let mut ctx = CodegenContext::new();
         TraceEmitter::emit(&trace, &mut ctx).expect("emit ok");
@@ -2195,14 +2227,17 @@ mod tests {
         let base = b.fresh_ssa();
         let idx = b.fresh_ssa();
         let dst = b.fresh_ssa();
-        b.append(TraceOp::ConstI64(base, 0x1000));
-        b.append(TraceOp::ConstI64(idx, 0));
+        b.append(TraceOp::ConstI64 {
+            dst: base,
+            value: 0x1000,
+        });
+        b.append(TraceOp::ConstI64 { dst: idx, value: 0 });
         b.append(TraceOp::ListGet {
             dst,
             list_ptr: base,
             idx,
         });
-        b.append(TraceOp::Return(dst));
+        b.append(TraceOp::Return { value: dst });
         let trace = b.into_optimized();
         let mut ctx = CodegenContext::new();
         let err = TraceEmitter::emit(&trace, &mut ctx).unwrap_err();
@@ -2218,15 +2253,21 @@ mod tests {
         let dict = b.fresh_ssa();
         let key = b.fresh_ssa();
         let dst = b.fresh_ssa();
-        b.append(TraceOp::ConstI64(dict, 0x2000));
-        b.append(TraceOp::ConstI64(key, 0x3000));
+        b.append(TraceOp::ConstI64 {
+            dst: dict,
+            value: 0x2000,
+        });
+        b.append(TraceOp::ConstI64 {
+            dst: key,
+            value: 0x3000,
+        });
         b.append(TraceOp::DictLookup {
             dst,
             dict_ptr: dict,
             key_ptr: key,
             shape_hash: 0xdeadbeef,
         });
-        b.append(TraceOp::Return(dst));
+        b.append(TraceOp::Return { value: dst });
         let trace = b.into_optimized();
         let mut ctx = CodegenContext::new();
         let err = TraceEmitter::emit(&trace, &mut ctx).unwrap_err();
@@ -2242,14 +2283,17 @@ mod tests {
         let base = b.fresh_ssa();
         let idx = b.fresh_ssa();
         let dst = b.fresh_ssa();
-        b.append(TraceOp::ConstI64(base, 0x1000));
-        b.append(TraceOp::ConstI64(idx, 0));
+        b.append(TraceOp::ConstI64 {
+            dst: base,
+            value: 0x1000,
+        });
+        b.append(TraceOp::ConstI64 { dst: idx, value: 0 });
         b.append(TraceOp::ListGet {
             dst,
             list_ptr: base,
             idx,
         });
-        b.append(TraceOp::Return(dst));
+        b.append(TraceOp::Return { value: dst });
         let trace = b.into_optimized();
         let mut ctx = CodegenContext::new();
         let hook_ids = HostHookFuncIds {
@@ -2271,8 +2315,14 @@ mod tests {
         let dict = b.fresh_ssa();
         let key = b.fresh_ssa();
         let dst = b.fresh_ssa();
-        b.append(TraceOp::ConstI64(dict, 0x2000));
-        b.append(TraceOp::ConstI64(key, 0x3000));
+        b.append(TraceOp::ConstI64 {
+            dst: dict,
+            value: 0x2000,
+        });
+        b.append(TraceOp::ConstI64 {
+            dst: key,
+            value: 0x3000,
+        });
         // Run the dict_ic_hoist pass shape by hand: emit a
         // DictShapeGuard upstream and the prechecked flavour as the
         // body op. The prechecked helper skips the repeated shape
@@ -2288,7 +2338,7 @@ mod tests {
             key_ptr: key,
         });
         b.record_dict_record_len_hint(dict, 128);
-        b.append(TraceOp::Return(dst));
+        b.append(TraceOp::Return { value: dst });
 
         let trace = b.into_optimized();
         let mut ctx = CodegenContext::new();
@@ -2329,8 +2379,14 @@ mod tests {
         let dict = b.fresh_ssa();
         let key = b.fresh_ssa();
         let dst = b.fresh_ssa();
-        b.append(TraceOp::ConstI64(dict, 0x2000));
-        b.append(TraceOp::ConstI64(key, 0x3000));
+        b.append(TraceOp::ConstI64 {
+            dst: dict,
+            value: 0x2000,
+        });
+        b.append(TraceOp::ConstI64 {
+            dst: key,
+            value: 0x3000,
+        });
         b.append(TraceOp::DictShapeGuard {
             dict_ptr: dict,
             shape_hash: 0xfeed_face_dead_beef,
@@ -2342,7 +2398,7 @@ mod tests {
         });
         // No record-length hint: the helper receives record_len = 0
         // and will deopt before reading the dict body at runtime.
-        b.append(TraceOp::Return(dst));
+        b.append(TraceOp::Return { value: dst });
 
         let trace = b.into_optimized();
         let mut ctx = CodegenContext::new();
@@ -2359,15 +2415,21 @@ mod tests {
         let dict = b.fresh_ssa();
         let key = b.fresh_ssa();
         let dst = b.fresh_ssa();
-        b.append(TraceOp::ConstI64(dict, 0x2000));
-        b.append(TraceOp::ConstI64(key, 0x3000));
+        b.append(TraceOp::ConstI64 {
+            dst: dict,
+            value: 0x2000,
+        });
+        b.append(TraceOp::ConstI64 {
+            dst: key,
+            value: 0x3000,
+        });
         b.append(TraceOp::DictLookup {
             dst,
             dict_ptr: dict,
             key_ptr: key,
             shape_hash: 0xfeed_face_dead_beef,
         });
-        b.append(TraceOp::Return(dst));
+        b.append(TraceOp::Return { value: dst });
         let trace = b.into_optimized();
         let mut ctx = CodegenContext::new();
         let hook_ids = HostHookFuncIds {
@@ -2387,14 +2449,20 @@ mod tests {
     fn compute_loop_meta_collects_body_pc_and_defs() {
         let mut b = TraceBuffer::new();
         let outer = b.fresh_ssa();
-        b.append(TraceOp::ConstI64(outer, 7));
+        b.append(TraceOp::ConstI64 {
+            dst: outer,
+            value: 7,
+        });
         let phi = b.fresh_ssa();
         b.append(TraceOp::MarkLoopHead {
             loop_id: 42,
             phis: vec![relon_trace_jit::LoopPhi::new(outer, phi)],
         });
         let inner = b.fresh_ssa();
-        b.append(TraceOp::ConstI64(inner, 9));
+        b.append(TraceOp::ConstI64 {
+            dst: inner,
+            value: 9,
+        });
         b.append(TraceOp::MarkLoopBack {
             loop_id: 42,
             next_values: vec![phi],
@@ -2418,7 +2486,7 @@ mod tests {
     fn compute_loop_meta_skips_unmatched_back() {
         let mut b = TraceBuffer::new();
         let v = b.fresh_ssa();
-        b.append(TraceOp::ConstI64(v, 0));
+        b.append(TraceOp::ConstI64 { dst: v, value: 0 });
         b.append(TraceOp::MarkLoopBack {
             loop_id: 9,
             next_values: vec![],
@@ -2445,10 +2513,19 @@ mod tests {
         let dict = b.fresh_ssa();
         let key = b.fresh_ssa();
         let idx = b.fresh_ssa();
-        b.append(TraceOp::LocalGet(list, 0));
-        b.append(TraceOp::LocalGet(dict, 1));
-        b.append(TraceOp::LocalGet(key, 2));
-        b.append(TraceOp::ConstI64(idx, 0));
+        b.append(TraceOp::LocalGet {
+            dst: list,
+            slot_idx: 0,
+        });
+        b.append(TraceOp::LocalGet {
+            dst: dict,
+            slot_idx: 1,
+        });
+        b.append(TraceOp::LocalGet {
+            dst: key,
+            slot_idx: 2,
+        });
+        b.append(TraceOp::ConstI64 { dst: idx, value: 0 });
         b.append(TraceOp::MarkLoopHead {
             loop_id: 0,
             phis: vec![],
@@ -2470,7 +2547,7 @@ mod tests {
             loop_id: 0,
             next_values: vec![],
         });
-        b.append(TraceOp::Return(dict_v));
+        b.append(TraceOp::Return { value: dict_v });
         let trace = b.into_optimized();
 
         let mut ctx = CodegenContext::new();
@@ -2499,11 +2576,20 @@ mod tests {
 
         let mut b = TraceBuffer::new();
         let n = b.fresh_ssa();
-        b.append(TraceOp::LocalGet(n, 0));
+        b.append(TraceOp::LocalGet {
+            dst: n,
+            slot_idx: 0,
+        });
         let divisor = b.fresh_ssa();
-        b.append(TraceOp::ConstI64(divisor, 10));
+        b.append(TraceOp::ConstI64 {
+            dst: divisor,
+            value: 10,
+        });
         let i_init = b.fresh_ssa();
-        b.append(TraceOp::ConstI64(i_init, 0));
+        b.append(TraceOp::ConstI64 {
+            dst: i_init,
+            value: 0,
+        });
 
         let phi_i = b.fresh_ssa();
         b.append(TraceOp::MarkLoopHead {
@@ -2511,16 +2597,24 @@ mod tests {
             phis: vec![relon_trace_jit::LoopPhi::new(i_init, phi_i)],
         });
         let mod_dst = b.fresh_ssa();
-        b.append(TraceOp::Mod(mod_dst, phi_i, divisor));
+        b.append(TraceOp::Mod {
+            dst: mod_dst,
+            lhs: phi_i,
+            rhs: divisor,
+        });
         let one = b.fresh_ssa();
-        b.append(TraceOp::ConstI64(one, 1));
+        b.append(TraceOp::ConstI64 { dst: one, value: 1 });
         let next_i = b.fresh_ssa();
-        b.append(TraceOp::Add(next_i, phi_i, one));
+        b.append(TraceOp::Add {
+            dst: next_i,
+            lhs: phi_i,
+            rhs: one,
+        });
         b.append(TraceOp::MarkLoopBack {
             loop_id: 0,
             next_values: vec![next_i],
         });
-        b.append(TraceOp::Return(mod_dst));
+        b.append(TraceOp::Return { value: mod_dst });
         let trace = b.into_optimized();
 
         let mut ctx = CodegenContext::new();
@@ -2651,12 +2745,22 @@ mod tests {
 
         let mut b = TraceBuffer::new();
         let a = b.fresh_ssa();
-        b.append(TraceOp::LocalGet(a, 0));
+        b.append(TraceOp::LocalGet {
+            dst: a,
+            slot_idx: 0,
+        });
         let divisor = b.fresh_ssa();
-        b.append(TraceOp::ConstI64(divisor, 10));
+        b.append(TraceOp::ConstI64 {
+            dst: divisor,
+            value: 10,
+        });
         let m = b.fresh_ssa();
-        b.append(TraceOp::Mod(m, a, divisor));
-        b.append(TraceOp::Return(m));
+        b.append(TraceOp::Mod {
+            dst: m,
+            lhs: a,
+            rhs: divisor,
+        });
+        b.append(TraceOp::Return { value: m });
         // Mirror the analyzer-side pipeline: const_fold seeds
         // `trace.consts` with `divisor → 10`, which is the
         // precondition the magic fast path tests against.
@@ -2694,11 +2798,20 @@ mod tests {
 
         let mut b = TraceBuffer::new();
         let n = b.fresh_ssa();
-        b.append(TraceOp::LocalGet(n, 0));
+        b.append(TraceOp::LocalGet {
+            dst: n,
+            slot_idx: 0,
+        });
         let divisor = b.fresh_ssa();
-        b.append(TraceOp::ConstI64(divisor, 10));
+        b.append(TraceOp::ConstI64 {
+            dst: divisor,
+            value: 10,
+        });
         let i_init = b.fresh_ssa();
-        b.append(TraceOp::ConstI64(i_init, 0));
+        b.append(TraceOp::ConstI64 {
+            dst: i_init,
+            value: 0,
+        });
 
         let phi_i = b.fresh_ssa();
         b.append(TraceOp::MarkLoopHead {
@@ -2706,16 +2819,24 @@ mod tests {
             phis: vec![relon_trace_jit::LoopPhi::new(i_init, phi_i)],
         });
         let mod_dst = b.fresh_ssa();
-        b.append(TraceOp::Mod(mod_dst, phi_i, divisor));
+        b.append(TraceOp::Mod {
+            dst: mod_dst,
+            lhs: phi_i,
+            rhs: divisor,
+        });
         let one = b.fresh_ssa();
-        b.append(TraceOp::ConstI64(one, 1));
+        b.append(TraceOp::ConstI64 { dst: one, value: 1 });
         let next_i = b.fresh_ssa();
-        b.append(TraceOp::Add(next_i, phi_i, one));
+        b.append(TraceOp::Add {
+            dst: next_i,
+            lhs: phi_i,
+            rhs: one,
+        });
         b.append(TraceOp::MarkLoopBack {
             loop_id: 0,
             next_values: vec![next_i],
         });
-        b.append(TraceOp::Return(mod_dst));
+        b.append(TraceOp::Return { value: mod_dst });
         relon_trace_jit::optimizer::OptimizerPass::run(
             &relon_trace_jit::optimizer::const_fold::ConstFold,
             &mut b,

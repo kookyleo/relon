@@ -49,7 +49,11 @@ impl OptimizerPass for NoopTypeCheckElim {
         let mut report = PassReport::default();
         let mut drop: HashSet<usize> = HashSet::new();
         for (pc, op) in trace.ops.iter().enumerate() {
-            if let TraceOp::Guard(GuardKind::TypeCheck(var, expected), _) = op {
+            if let TraceOp::Guard {
+                kind: GuardKind::TypeCheck(var, expected),
+                ..
+            } = op
+            {
                 if trace.type_info.get(var).copied() == Some(*expected) {
                     drop.insert(pc);
                 }
@@ -98,20 +102,26 @@ mod tests {
     fn drops_const_typecheck() {
         let mut b = TraceBuffer::new();
         let v = b.fresh_ssa();
-        b.append(TraceOp::ConstI64(v, 7));
+        b.append(TraceOp::ConstI64 { dst: v, value: 7 });
         b.record_type(v, ObservedType::I64);
-        b.append(TraceOp::Guard(
-            GuardKind::TypeCheck(v, ObservedType::I64),
-            v,
-        ));
-        b.append(TraceOp::Return(v));
+        b.append(TraceOp::Guard {
+            kind: GuardKind::TypeCheck(v, ObservedType::I64),
+            check: v,
+        });
+        b.append(TraceOp::Return { value: v });
         let n_before = b.ops.len();
         let report = NoopTypeCheckElim.run(&mut b);
         assert_eq!(report.ops_removed, 1);
         assert_eq!(b.ops.len(), n_before - 1);
         for op in &b.ops {
             assert!(
-                !matches!(op, TraceOp::Guard(GuardKind::TypeCheck(_, _), _)),
+                !matches!(
+                    op,
+                    TraceOp::Guard {
+                        kind: GuardKind::TypeCheck(_, _),
+                        ..
+                    }
+                ),
                 "no surviving TypeCheck guard"
             );
         }
@@ -121,14 +131,14 @@ mod tests {
     fn keeps_mismatched_typecheck() {
         let mut b = TraceBuffer::new();
         let v = b.fresh_ssa();
-        b.append(TraceOp::ConstI64(v, 7));
+        b.append(TraceOp::ConstI64 { dst: v, value: 7 });
         b.record_type(v, ObservedType::I64);
         // Guard expects F64 — would deopt at runtime.
-        b.append(TraceOp::Guard(
-            GuardKind::TypeCheck(v, ObservedType::F64),
-            v,
-        ));
-        b.append(TraceOp::Return(v));
+        b.append(TraceOp::Guard {
+            kind: GuardKind::TypeCheck(v, ObservedType::F64),
+            check: v,
+        });
+        b.append(TraceOp::Return { value: v });
         let n_before = b.ops.len();
         let report = NoopTypeCheckElim.run(&mut b);
         assert_eq!(report.ops_removed, 0);

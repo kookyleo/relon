@@ -203,7 +203,7 @@ fn hoist_one_loop(trace: &mut TraceBuffer, lp: &LoopRange, report: &mut PassRepo
     // round as the existing pure / ReadOnly hoists.
     let body_has_writes = (body_start..body_end).any(|i| {
         let op = &trace.ops[i];
-        matches!(op, TraceOp::Store(_, _, _))
+        matches!(op, TraceOp::Store { .. })
             || matches!(
                 op.effect_class(),
                 EffectClass::RecoverableWrite | EffectClass::Unrecoverable
@@ -298,13 +298,13 @@ fn is_hoistable(op: &TraceOp, body_has_writes: bool) -> bool {
     // `ArithOverflow` and `IsZero` are positional by construction —
     // they reference an SSA produced just upstream — and never get
     // a loop-invariant input under the current trace shapes.
-    if let TraceOp::Guard(kind, _) = op {
+    if let TraceOp::Guard { kind, .. } = op {
         return matches!(kind, GuardKind::BoundsCheck(_, _) | GuardKind::NotNull(_));
     }
     match op.effect_class() {
         EffectClass::Pure => {
             // Even pure: Return is not movable; it ends the trace.
-            !matches!(op, TraceOp::Return(_))
+            !matches!(op, TraceOp::Return { .. })
         }
         // F-D7-D: `TraceOp::LocalGet` reads an immutable arg slot.
         // The recorder may emit it inside the loop body when the
@@ -353,8 +353,11 @@ fn is_hoistable(op: &TraceOp, body_has_writes: bool) -> bool {
         // base is loop-carried (e.g. an accumulator phi in the W3
         // concat shape) stays inside the loop regardless.
         EffectClass::ReadOnly => match op {
-            TraceOp::LocalGet(_, _) | TraceOp::ListGet { .. } | TraceOp::DictLookup { .. } => true,
-            TraceOp::Load(_, _, Offset(off)) => !body_has_writes && (*off == 0 || *off == 8),
+            TraceOp::LocalGet { .. } | TraceOp::ListGet { .. } | TraceOp::DictLookup { .. } => true,
+            TraceOp::Load {
+                offset: Offset(off),
+                ..
+            } => !body_has_writes && (*off == 0 || *off == 8),
             _ => false,
         },
         EffectClass::RecoverableWrite | EffectClass::Unrecoverable => false,

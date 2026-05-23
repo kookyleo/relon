@@ -24,7 +24,16 @@ fn load_field_emits_load_op() {
     let load = buf
         .ops
         .iter()
-        .find(|o| matches!(o, TraceOp::Load(_, _, _)))
+        .find(|o| {
+            matches!(
+                o,
+                TraceOp::Load {
+                    dst: _,
+                    base: _,
+                    offset: _
+                }
+            )
+        })
         .expect("load present");
     assert_eq!(load.effect_class(), EffectClass::ReadOnly);
 }
@@ -49,7 +58,15 @@ fn load_emits_not_null_guard_before() {
     let not_null = buf
         .ops
         .iter()
-        .filter(|o| matches!(o, TraceOp::Guard(relon_trace_jit::GuardKind::NotNull(_), _)))
+        .filter(|o| {
+            matches!(
+                o,
+                TraceOp::Guard {
+                    kind: relon_trace_jit::GuardKind::NotNull(_),
+                    check: _
+                }
+            )
+        })
         .count();
     assert!(not_null >= 1, "expected at least one NotNull guard");
 }
@@ -77,7 +94,16 @@ fn store_field_marks_recoverable_write() {
     let store = buf
         .ops
         .iter()
-        .find(|o| matches!(o, TraceOp::Store(_, _, _)))
+        .find(|o| {
+            matches!(
+                o,
+                TraceOp::Store {
+                    base: _,
+                    offset: _,
+                    src: _
+                }
+            )
+        })
         .expect("store present");
     assert_eq!(store.effect_class(), EffectClass::RecoverableWrite);
 }
@@ -100,7 +126,15 @@ fn missing_base_uses_sentinel_and_skips_guard() {
     let not_null = buf
         .ops
         .iter()
-        .filter(|o| matches!(o, TraceOp::Guard(relon_trace_jit::GuardKind::NotNull(_), _)))
+        .filter(|o| {
+            matches!(
+                o,
+                TraceOp::Guard {
+                    kind: relon_trace_jit::GuardKind::NotNull(_),
+                    check: _
+                }
+            )
+        })
         .count();
     assert_eq!(not_null, 0);
 }
@@ -136,12 +170,30 @@ fn load_then_store_chains_two_memory_ops() {
     let loads = buf
         .ops
         .iter()
-        .filter(|o| matches!(o, TraceOp::Load(_, _, _)))
+        .filter(|o| {
+            matches!(
+                o,
+                TraceOp::Load {
+                    dst: _,
+                    base: _,
+                    offset: _
+                }
+            )
+        })
         .count();
     let stores = buf
         .ops
         .iter()
-        .filter(|o| matches!(o, TraceOp::Store(_, _, _)))
+        .filter(|o| {
+            matches!(
+                o,
+                TraceOp::Store {
+                    base: _,
+                    offset: _,
+                    src: _
+                }
+            )
+        })
         .count();
     assert_eq!(loads, 1);
     assert_eq!(stores, 1);

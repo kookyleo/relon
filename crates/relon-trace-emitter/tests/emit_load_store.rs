@@ -16,9 +16,16 @@ fn load_only_lowers_to_load_inst() {
     let mut b = TraceBuffer::new();
     let base = b.fresh_ssa();
     let dst = b.fresh_ssa();
-    b.append(TraceOp::ConstI64(base, 0x2000));
-    b.append(TraceOp::Load(dst, base, Offset(8)));
-    b.append(TraceOp::Return(dst));
+    b.append(TraceOp::ConstI64 {
+        dst: base,
+        value: 0x2000,
+    });
+    b.append(TraceOp::Load {
+        dst,
+        base,
+        offset: Offset(8),
+    });
+    b.append(TraceOp::Return { value: dst });
     let ctx = emit_and_verify(&b.into_optimized());
     let s = format!("{}", ctx.func);
     assert!(s.contains("load.i64"), "expected load.i64 in:\n{s}");
@@ -29,10 +36,20 @@ fn store_only_lowers_to_store_inst() {
     let mut b = TraceBuffer::new();
     let base = b.fresh_ssa();
     let val = b.fresh_ssa();
-    b.append(TraceOp::ConstI64(base, 0x3000));
-    b.append(TraceOp::ConstI64(val, 0xdead));
-    b.append(TraceOp::Store(base, Offset(0), val));
-    b.append(TraceOp::Return(val));
+    b.append(TraceOp::ConstI64 {
+        dst: base,
+        value: 0x3000,
+    });
+    b.append(TraceOp::ConstI64 {
+        dst: val,
+        value: 0xdead,
+    });
+    b.append(TraceOp::Store {
+        base,
+        offset: Offset(0),
+        src: val,
+    });
+    b.append(TraceOp::Return { value: val });
     let ctx = emit_and_verify(&b.into_optimized());
     let s = format!("{}", ctx.func);
     assert!(s.contains("store"), "expected store in:\n{s}");
@@ -48,20 +65,30 @@ fn bounds_guard_before_load_emits_brif() {
     let limit = b.fresh_ssa();
     let base = b.fresh_ssa();
     let dst = b.fresh_ssa();
-    b.append(TraceOp::ConstI64(idx, 3));
-    b.append(TraceOp::ConstI64(limit, 10));
-    let guard_pc = b.append(TraceOp::Guard(
-        GuardKind::BoundsCheck(idx, limit),
-        SsaVar::NONE,
-    ));
+    b.append(TraceOp::ConstI64 { dst: idx, value: 3 });
+    b.append(TraceOp::ConstI64 {
+        dst: limit,
+        value: 10,
+    });
+    let guard_pc = b.append(TraceOp::Guard {
+        kind: GuardKind::BoundsCheck(idx, limit),
+        check: SsaVar::NONE,
+    });
     b.record_guard(GuardSite::new(
         guard_pc,
         ExternalPc(0xabcd),
         GuardKind::BoundsCheck(idx, limit),
     ));
-    b.append(TraceOp::ConstI64(base, 0x4000));
-    b.append(TraceOp::Load(dst, base, Offset(0)));
-    b.append(TraceOp::Return(dst));
+    b.append(TraceOp::ConstI64 {
+        dst: base,
+        value: 0x4000,
+    });
+    b.append(TraceOp::Load {
+        dst,
+        base,
+        offset: Offset(0),
+    });
+    b.append(TraceOp::Return { value: dst });
     let ctx = emit_and_verify(&b.into_optimized());
     let s = format!("{}", ctx.func);
     assert!(s.contains("brif"), "expected brif from guard in:\n{s}");
@@ -71,14 +98,20 @@ fn bounds_guard_before_load_emits_brif() {
 fn not_null_guard_lowers_to_brif_pair() {
     let mut b = TraceBuffer::new();
     let p = b.fresh_ssa();
-    b.append(TraceOp::ConstI64(p, 0x5000));
-    let guard_pc = b.append(TraceOp::Guard(GuardKind::NotNull(p), SsaVar::NONE));
+    b.append(TraceOp::ConstI64 {
+        dst: p,
+        value: 0x5000,
+    });
+    let guard_pc = b.append(TraceOp::Guard {
+        kind: GuardKind::NotNull(p),
+        check: SsaVar::NONE,
+    });
     b.record_guard(GuardSite::new(
         guard_pc,
         ExternalPc(0xdeadbeef),
         GuardKind::NotNull(p),
     ));
-    b.append(TraceOp::Return(p));
+    b.append(TraceOp::Return { value: p });
     let ctx = emit_and_verify(&b.into_optimized());
     let s = format!("{}", ctx.func);
     assert!(s.contains("brif"), "expected brif in:\n{s}");
@@ -93,10 +126,24 @@ fn store_followed_by_load_round_trip() {
     let base = b.fresh_ssa();
     let v = b.fresh_ssa();
     let reloaded = b.fresh_ssa();
-    b.append(TraceOp::ConstI64(base, 0x6000));
-    b.append(TraceOp::ConstI64(v, 0x42));
-    b.append(TraceOp::Store(base, Offset(8), v));
-    b.append(TraceOp::Load(reloaded, base, Offset(8)));
-    b.append(TraceOp::Return(reloaded));
+    b.append(TraceOp::ConstI64 {
+        dst: base,
+        value: 0x6000,
+    });
+    b.append(TraceOp::ConstI64 {
+        dst: v,
+        value: 0x42,
+    });
+    b.append(TraceOp::Store {
+        base,
+        offset: Offset(8),
+        src: v,
+    });
+    b.append(TraceOp::Load {
+        dst: reloaded,
+        base,
+        offset: Offset(8),
+    });
+    b.append(TraceOp::Return { value: reloaded });
     emit_and_verify(&b.into_optimized());
 }

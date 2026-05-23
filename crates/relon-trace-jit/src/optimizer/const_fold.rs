@@ -57,25 +57,30 @@ impl OptimizerPass for ConstFold {
         for idx in 0..trace.ops.len() {
             let op = trace.ops[idx].clone();
             match op {
-                TraceOp::ConstI32(dst, v) => {
-                    known.insert(dst, TraceConst::I32(v));
+                TraceOp::ConstI32 { dst, value } => {
+                    known.insert(dst, TraceConst::I32(value));
                 }
-                TraceOp::ConstI64(dst, v) => {
-                    known.insert(dst, TraceConst::I64(v));
+                TraceOp::ConstI64 { dst, value } => {
+                    known.insert(dst, TraceConst::I64(value));
                 }
-                TraceOp::Add(dst, a, b)
-                | TraceOp::Sub(dst, a, b)
-                | TraceOp::Mul(dst, a, b)
-                | TraceOp::Mod(dst, a, b) => {
-                    if let (Some(ka), Some(kb)) = (known.get(&a), known.get(&b)) {
+                TraceOp::Add { dst, lhs, rhs }
+                | TraceOp::Sub { dst, lhs, rhs }
+                | TraceOp::Mul { dst, lhs, rhs }
+                | TraceOp::Mod { dst, lhs, rhs } => {
+                    if let (Some(ka), Some(kb)) = (known.get(&lhs), known.get(&rhs)) {
                         if let Some(folded) = fold_arith(&trace.ops[idx], *ka, *kb) {
                             apply_fold(trace, &mut known, idx, dst, folded);
                             report.ops_replaced += 1;
                         }
                     }
                 }
-                TraceOp::Cmp(kind, dst, a, b) => {
-                    if let (Some(ka), Some(kb)) = (known.get(&a), known.get(&b)) {
+                TraceOp::Cmp {
+                    kind,
+                    dst,
+                    lhs,
+                    rhs,
+                } => {
+                    if let (Some(ka), Some(kb)) = (known.get(&lhs), known.get(&rhs)) {
                         if let Some(result) = fold_cmp(kind, *ka, *kb) {
                             let folded = TraceConst::I32(if result { 1 } else { 0 });
                             apply_fold(trace, &mut known, idx, dst, folded);
@@ -98,22 +103,22 @@ fn fold_arith(op: &TraceOp, a: TraceConst, b: TraceConst) -> Option<TraceConst> 
     // folding is intentionally skipped -- the recorder is responsible
     // for emitting explicit widening ops, which we don't model yet.
     match (op, a, b) {
-        (TraceOp::Add(_, _, _), TraceConst::I32(x), TraceConst::I32(y)) => {
+        (TraceOp::Add { .. }, TraceConst::I32(x), TraceConst::I32(y)) => {
             Some(TraceConst::I32(x.wrapping_add(y)))
         }
-        (TraceOp::Sub(_, _, _), TraceConst::I32(x), TraceConst::I32(y)) => {
+        (TraceOp::Sub { .. }, TraceConst::I32(x), TraceConst::I32(y)) => {
             Some(TraceConst::I32(x.wrapping_sub(y)))
         }
-        (TraceOp::Mul(_, _, _), TraceConst::I32(x), TraceConst::I32(y)) => {
+        (TraceOp::Mul { .. }, TraceConst::I32(x), TraceConst::I32(y)) => {
             Some(TraceConst::I32(x.wrapping_mul(y)))
         }
-        (TraceOp::Add(_, _, _), TraceConst::I64(x), TraceConst::I64(y)) => {
+        (TraceOp::Add { .. }, TraceConst::I64(x), TraceConst::I64(y)) => {
             Some(TraceConst::I64(x.wrapping_add(y)))
         }
-        (TraceOp::Sub(_, _, _), TraceConst::I64(x), TraceConst::I64(y)) => {
+        (TraceOp::Sub { .. }, TraceConst::I64(x), TraceConst::I64(y)) => {
             Some(TraceConst::I64(x.wrapping_sub(y)))
         }
-        (TraceOp::Mul(_, _, _), TraceConst::I64(x), TraceConst::I64(y)) => {
+        (TraceOp::Mul { .. }, TraceConst::I64(x), TraceConst::I64(y)) => {
             Some(TraceConst::I64(x.wrapping_mul(y)))
         }
         // F-D8-E.1: fold `Mod` only when the divisor is safe. We
@@ -121,14 +126,14 @@ fn fold_arith(op: &TraceOp, a: TraceConst, b: TraceConst) -> Option<TraceConst> 
         // `MIN % -1` (the only overflow case for `srem`) so the
         // emitter's divisor-zero guard / overflow guard stay the
         // single source of truth for the trap behaviour.
-        (TraceOp::Mod(_, _, _), TraceConst::I32(x), TraceConst::I32(y)) => {
+        (TraceOp::Mod { .. }, TraceConst::I32(x), TraceConst::I32(y)) => {
             if y == 0 || (x == i32::MIN && y == -1) {
                 None
             } else {
                 Some(TraceConst::I32(x.wrapping_rem(y)))
             }
         }
-        (TraceOp::Mod(_, _, _), TraceConst::I64(x), TraceConst::I64(y)) => {
+        (TraceOp::Mod { .. }, TraceConst::I64(x), TraceConst::I64(y)) => {
             if y == 0 || (x == i64::MIN && y == -1) {
                 None
             } else {
@@ -156,9 +161,12 @@ fn apply_fold(
     folded: TraceConst,
 ) {
     trace.ops[idx] = match folded {
-        TraceConst::I32(v) => TraceOp::ConstI32(dst, v),
-        TraceConst::I64(v) => TraceOp::ConstI64(dst, v),
-        TraceConst::Bool(b) => TraceOp::ConstI32(dst, if b { 1 } else { 0 }),
+        TraceConst::I32(v) => TraceOp::ConstI32 { dst, value: v },
+        TraceConst::I64(v) => TraceOp::ConstI64 { dst, value: v },
+        TraceConst::Bool(b) => TraceOp::ConstI32 {
+            dst,
+            value: if b { 1 } else { 0 },
+        },
     };
     known.insert(dst, folded);
 }

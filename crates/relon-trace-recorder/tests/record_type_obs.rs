@@ -46,7 +46,15 @@ fn first_observation_no_guard() {
     let guards = buf
         .ops
         .iter()
-        .filter(|o| matches!(o, TraceOp::Guard(GuardKind::TypeCheck(_, _), _)))
+        .filter(|o| {
+            matches!(
+                o,
+                TraceOp::Guard {
+                    kind: GuardKind::TypeCheck(_, _),
+                    check: _
+                }
+            )
+        })
         .count();
     assert_eq!(guards, 0);
 }
@@ -160,7 +168,10 @@ fn duplicate_guard_is_deduped() {
         .filter(|o| {
             matches!(
                 o,
-                TraceOp::Guard(GuardKind::TypeCheck(_, ObservedType::I64), _)
+                TraceOp::Guard {
+                    kind: GuardKind::TypeCheck(_, ObservedType::I64),
+                    check: _
+                }
             )
         })
         .count();

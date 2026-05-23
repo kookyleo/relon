@@ -1,7 +1,7 @@
 //! Trace-JIT host helper backing `TraceOp::StrGlobMatch`.
 //!
 //! 2026-05-21 Tier-2: the trace emitter lowers
-//! `TraceOp::StrGlobMatch(dst, s, pattern)` to a direct
+//! `TraceOp::StrGlobMatch { dst, s, pattern }` to a direct
 //! `call __relon_str_glob_match(s, pattern) -> i32` against the
 //! host-provided FuncId. The helper body lives here (rather than in
 //! `relon-trace-jit::runtime`) because the matcher implementation

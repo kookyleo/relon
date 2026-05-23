@@ -33,7 +33,17 @@ fn pure_call_records_with_override() {
     let call = buf
         .ops
         .iter()
-        .find(|o| matches!(o, TraceOp::Call(_, FuncId(42), _, _)))
+        .find(|o| {
+            matches!(
+                o,
+                TraceOp::Call {
+                    dst: _,
+                    func: FuncId(42),
+                    args: _,
+                    effect: _
+                }
+            )
+        })
         .expect("call op");
     assert_eq!(call.effect_class(), EffectClass::Pure);
 }
@@ -46,7 +56,17 @@ fn read_only_call_records() {
     let call = buf
         .ops
         .iter()
-        .find(|o| matches!(o, TraceOp::Call(_, _, _, _)))
+        .find(|o| {
+            matches!(
+                o,
+                TraceOp::Call {
+                    dst: _,
+                    func: _,
+                    args: _,
+                    effect: _
+                }
+            )
+        })
         .unwrap();
     assert_eq!(call.effect_class(), EffectClass::ReadOnly);
 }
@@ -59,7 +79,17 @@ fn recoverable_write_call_records() {
     let call = buf
         .ops
         .iter()
-        .find(|o| matches!(o, TraceOp::Call(_, _, _, _)))
+        .find(|o| {
+            matches!(
+                o,
+                TraceOp::Call {
+                    dst: _,
+                    func: _,
+                    args: _,
+                    effect: _
+                }
+            )
+        })
         .unwrap();
     assert_eq!(call.effect_class(), EffectClass::RecoverableWrite);
 }

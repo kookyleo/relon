@@ -278,8 +278,8 @@ impl JITedTraceFn {
 
     fn return_observed_type(&self) -> Option<ObservedType> {
         self.inline_trace.ops.iter().rev().find_map(|op| {
-            if let TraceOp::Return(var) = op {
-                self.inline_trace.type_info.get(var).copied()
+            if let TraceOp::Return { value } = op {
+                self.inline_trace.type_info.get(value).copied()
             } else {
                 None
             }
@@ -1783,8 +1783,11 @@ mod tests {
         // materialiser copy the payload into a SmolStr.
         let mut buffer = relon_trace_jit::TraceBuffer::new();
         let v = buffer.fresh_ssa();
-        buffer.append(relon_trace_jit::TraceOp::LocalGet(v, 0));
-        buffer.append(relon_trace_jit::TraceOp::Return(v));
+        buffer.append(relon_trace_jit::TraceOp::LocalGet {
+            dst: v,
+            slot_idx: 0,
+        });
+        buffer.append(relon_trace_jit::TraceOp::Return { value: v });
         let state = TraceJitState::new();
         let trace_fn = state
             .jit_compile_buffer_for_fn(7, buffer)

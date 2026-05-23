@@ -414,7 +414,7 @@ impl<'a> TraceRecordingEvaluator<'a> {
             // Pops the base pointer SSA + concrete value, performs the
             // host-side load so the recording-time value tracks what
             // the installed trace will compute, and forwards the op so
-            // the recorder emits `TraceOp::Load(dst, base, offset)`.
+            // the recorder emits `TraceOp::Load { dst, base, offset }`.
             //
             // Used by F-D7-D bench fixtures to read
             // `StringRef::len` (offset 8) off the final accumulator
@@ -876,7 +876,7 @@ impl<'a> TraceRecordingEvaluator<'a> {
     /// performs the host-side load so the recording-time concrete
     /// value matches what the emitted `TraceOp::Load` will compute,
     /// and forwards the op to `record_op` so the recorder lowers it
-    /// into the matching `TraceOp::Load(dst, base, Offset(offset))`.
+    /// into the matching `TraceOp::Load { dst, base, offset: Offset(offset) }`.
     ///
     /// Only `IrType::I64` is wired today; the F-D7-D bench fixture
     /// uses this to read `StringRef::len`, a `usize == u64` value.

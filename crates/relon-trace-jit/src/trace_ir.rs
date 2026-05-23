@@ -97,19 +97,35 @@ pub enum TraceConst {
 #[derive(Debug, Clone)]
 pub enum TraceOp {
     // ---- Arithmetic / compare ----------------------------------------
-    /// `dst = a + b` (i64 wrap-around; overflow guarded externally).
-    Add(SsaVar, SsaVar, SsaVar),
-    /// `dst = a - b`.
-    Sub(SsaVar, SsaVar, SsaVar),
-    /// `dst = a * b`.
-    Mul(SsaVar, SsaVar, SsaVar),
-    /// `dst = a / b`. Treated as `RecoverableWrite` so the recorder
+    /// `dst = lhs + rhs` (i64 wrap-around; overflow guarded externally).
+    Add {
+        dst: SsaVar,
+        lhs: SsaVar,
+        rhs: SsaVar,
+    },
+    /// `dst = lhs - rhs`.
+    Sub {
+        dst: SsaVar,
+        lhs: SsaVar,
+        rhs: SsaVar,
+    },
+    /// `dst = lhs * rhs`.
+    Mul {
+        dst: SsaVar,
+        lhs: SsaVar,
+        rhs: SsaVar,
+    },
+    /// `dst = lhs / rhs`. Treated as `RecoverableWrite` so the recorder
     /// captures the divisor's pre-value for deopt rollback if the
     /// trace fuses around it.
-    Div(SsaVar, SsaVar, SsaVar),
-    /// `dst = a % b` (signed integer remainder; matches Rust's `%`
+    Div {
+        dst: SsaVar,
+        lhs: SsaVar,
+        rhs: SsaVar,
+    },
+    /// `dst = lhs % rhs` (signed integer remainder; matches Rust's `%`
     /// and cranelift's `srem`). Trap surface is identical to `Div`:
-    /// `b == 0` traps, and the `i64::MIN % -1` corner case is the
+    /// `rhs == 0` traps, and the `i64::MIN % -1` corner case is the
     /// only overflow scenario. Classed `RecoverableWrite` for the
     /// same divisor-zero deopt rationale as `Div`.
     ///
@@ -117,19 +133,42 @@ pub enum TraceOp {
     /// `i % 10` index hash) lower to a single SSA op instead of the
     /// `Div + Mul + Sub` triple the recorder had to emit while no
     /// matching trace op existed.
-    Mod(SsaVar, SsaVar, SsaVar),
-    /// `dst = cmp a b` (bool result via i64-typed slot).
-    Cmp(CmpKind, SsaVar, SsaVar, SsaVar),
+    Mod {
+        dst: SsaVar,
+        lhs: SsaVar,
+        rhs: SsaVar,
+    },
+    /// `dst = cmp lhs rhs` (bool result via i64-typed slot).
+    Cmp {
+        kind: CmpKind,
+        dst: SsaVar,
+        lhs: SsaVar,
+        rhs: SsaVar,
+    },
 
     // ---- Memory ------------------------------------------------------
     /// `dst = *(base + offset)`.
-    Load(SsaVar, SsaVar, Offset),
+    Load {
+        dst: SsaVar,
+        base: SsaVar,
+        offset: Offset,
+    },
     /// `*(base + offset) = src`.
-    Store(SsaVar, Offset, SsaVar),
+    Store {
+        base: SsaVar,
+        offset: Offset,
+        src: SsaVar,
+    },
 
     // ---- Constants ---------------------------------------------------
-    ConstI32(SsaVar, i32),
-    ConstI64(SsaVar, i64),
+    ConstI32 {
+        dst: SsaVar,
+        value: i32,
+    },
+    ConstI64 {
+        dst: SsaVar,
+        value: i64,
+    },
 
     // ---- Arg materialisation ----------------------------------------
     /// `dst = args_ptr[slot_idx]` — pulls a packed `u64` from the
@@ -144,16 +183,27 @@ pub enum TraceOp {
     /// `slot_idx` is the packed-array index (`0` for first arg, `1`
     /// for second, ...). The emitter computes the byte offset as
     /// `slot_idx * 8`.
-    LocalGet(SsaVar, u32),
+    LocalGet {
+        dst: SsaVar,
+        slot_idx: u32,
+    },
 
     // ---- Control / guard --------------------------------------------
     /// Inline guard. Failure deopts to the most recent enclosing
     /// [`crate::GuardSite`].
-    Guard(GuardKind, SsaVar),
+    Guard {
+        kind: GuardKind,
+        check: SsaVar,
+    },
 
     /// Callee referenced by id. Recorder is responsible for knowing
     /// (and asserting) the callee's effect class — opaque here.
-    Call(SsaVar, FuncId, Vec<SsaVar>, EffectClass),
+    Call {
+        dst: SsaVar,
+        func: FuncId,
+        args: Vec<SsaVar>,
+        effect: EffectClass,
+    },
 
     // ---- F-D7 string fast path --------------------------------------
     /// `dst = StrConcat(lhs, rhs)` — `lhs` and `rhs` are opaque
@@ -168,7 +218,11 @@ pub enum TraceOp {
     /// allocation tracking into the surrounding `TraceContext`
     /// memory budget so a runaway concat trace is bounded by the
     /// host's sandbox quota.
-    StrConcat(SsaVar, SsaVar, SsaVar),
+    StrConcat {
+        dst: SsaVar,
+        lhs: SsaVar,
+        rhs: SsaVar,
+    },
 
     /// `dst = StrConcatN(operands)` — N-operand single-allocation
     /// string concatenation. `operands` carry opaque i64 SSAs each
@@ -213,14 +267,22 @@ pub enum TraceOp {
     /// args (W4's pattern) skips the call entirely.
     ///
     /// Effect: `Pure`.
-    StrContains(SsaVar, SsaVar, SsaVar),
+    StrContains {
+        dst: SsaVar,
+        haystack: SsaVar,
+        needle: SsaVar,
+    },
 
     /// `dst = StrFind(haystack, needle) -> i64` returning the
     /// byte index of the first match, or `-1` on miss. Maps to
     /// `call __relon_str_find(haystack, needle)`.
     ///
     /// Effect: `Pure`.
-    StrFind(SsaVar, SsaVar, SsaVar),
+    StrFind {
+        dst: SsaVar,
+        haystack: SsaVar,
+        needle: SsaVar,
+    },
 
     /// `dst = StrSubstring(s, start, length)` — byte-indexed
     /// substring. Both `start` and `length` are i64 SSAs; the
@@ -232,7 +294,12 @@ pub enum TraceOp {
     /// to the shim's runtime clamp.
     ///
     /// Effect: `Pure`.
-    StrSubstring(SsaVar, SsaVar, SsaVar, SsaVar),
+    StrSubstring {
+        dst: SsaVar,
+        s: SsaVar,
+        start: SsaVar,
+        length: SsaVar,
+    },
 
     /// `dst = StrGlobMatch(s, pattern) -> i32 (0/1)` — typed as
     /// `i32` so callers can branch on the result with the existing
@@ -251,10 +318,16 @@ pub enum TraceOp {
     /// without the IR-inline complexity.
     ///
     /// Effect: `Pure`.
-    StrGlobMatch(SsaVar, SsaVar, SsaVar),
+    StrGlobMatch {
+        dst: SsaVar,
+        s: SsaVar,
+        pattern: SsaVar,
+    },
 
     /// Return from the trace.
-    Return(SsaVar),
+    Return {
+        value: SsaVar,
+    },
 
     // ---- Dict / list ops (F-D8) -------------------------------------
     /// `dst = list_get(list_ptr, idx)`.
@@ -450,14 +523,14 @@ impl TraceOp {
     /// passes if its class differs from existing ones.
     pub fn effect_class(&self) -> EffectClass {
         match self {
-            TraceOp::Add(_, _, _)
-            | TraceOp::Sub(_, _, _)
-            | TraceOp::Mul(_, _, _)
-            | TraceOp::Cmp(_, _, _, _)
-            | TraceOp::ConstI32(_, _)
-            | TraceOp::ConstI64(_, _)
-            | TraceOp::Guard(_, _)
-            | TraceOp::Return(_)
+            TraceOp::Add { .. }
+            | TraceOp::Sub { .. }
+            | TraceOp::Mul { .. }
+            | TraceOp::Cmp { .. }
+            | TraceOp::ConstI32 { .. }
+            | TraceOp::ConstI64 { .. }
+            | TraceOp::Guard { .. }
+            | TraceOp::Return { .. }
             | TraceOp::MarkLoopHead { .. }
             | TraceOp::MarkLoopBack { .. }
             // F-D7 string ops are referentially transparent: input
@@ -466,12 +539,12 @@ impl TraceOp {
             // Classifying as `Pure` lets the optimiser hoist a
             // `StrContains(s, "x")` out of an inner loop when `s` is
             // loop-invariant (W4's hot pattern).
-            | TraceOp::StrConcat(_, _, _)
+            | TraceOp::StrConcat { .. }
             | TraceOp::StrConcatN { .. }
-            | TraceOp::StrContains(_, _, _)
-            | TraceOp::StrFind(_, _, _)
-            | TraceOp::StrSubstring(_, _, _, _)
-            | TraceOp::StrGlobMatch(_, _, _)
+            | TraceOp::StrContains { .. }
+            | TraceOp::StrFind { .. }
+            | TraceOp::StrSubstring { .. }
+            | TraceOp::StrGlobMatch { .. }
             // F-D8-E.2: `DictShapeGuard` is a guard-like op — it
             // reads the dict header's first 8 bytes (immutable for
             // the trace's lifetime) and only deopts on mismatch. No
@@ -480,17 +553,17 @@ impl TraceOp {
             // of the loop body.
             | TraceOp::DictShapeGuard { .. } => EffectClass::Pure,
 
-            TraceOp::Load(_, _, _)
-            | TraceOp::LocalGet(_, _)
+            TraceOp::Load { .. }
+            | TraceOp::LocalGet { .. }
             | TraceOp::ListGet { .. }
             | TraceOp::DictLookup { .. }
             | TraceOp::DictLookupPrechecked { .. } => EffectClass::ReadOnly,
 
-            TraceOp::Div(_, _, _) | TraceOp::Mod(_, _, _) | TraceOp::Store(_, _, _) => {
+            TraceOp::Div { .. } | TraceOp::Mod { .. } | TraceOp::Store { .. } => {
                 EffectClass::RecoverableWrite
             }
 
-            TraceOp::Call(_, _, _, eff) => *eff,
+            TraceOp::Call { effect, .. } => *effect,
         }
     }
 
@@ -498,31 +571,30 @@ impl TraceOp {
     /// `Guard`, and the loop markers produce no SSA value.
     pub fn output(&self) -> Option<SsaVar> {
         match self {
-            TraceOp::Add(dst, _, _)
-            | TraceOp::Sub(dst, _, _)
-            | TraceOp::Mul(dst, _, _)
-            | TraceOp::Div(dst, _, _)
-            | TraceOp::Mod(dst, _, _)
-            | TraceOp::Cmp(_, dst, _, _)
-            | TraceOp::Load(dst, _, _)
-            | TraceOp::ConstI32(dst, _)
-            | TraceOp::ConstI64(dst, _)
-            | TraceOp::LocalGet(dst, _)
-            | TraceOp::Call(dst, _, _, _)
-            | TraceOp::StrConcat(dst, _, _)
-            | TraceOp::StrContains(dst, _, _)
-            | TraceOp::StrFind(dst, _, _)
-            | TraceOp::StrSubstring(dst, _, _, _)
-            | TraceOp::StrGlobMatch(dst, _, _) => Some(*dst),
-
-            TraceOp::ListGet { dst, .. }
+            TraceOp::Add { dst, .. }
+            | TraceOp::Sub { dst, .. }
+            | TraceOp::Mul { dst, .. }
+            | TraceOp::Div { dst, .. }
+            | TraceOp::Mod { dst, .. }
+            | TraceOp::Cmp { dst, .. }
+            | TraceOp::Load { dst, .. }
+            | TraceOp::ConstI32 { dst, .. }
+            | TraceOp::ConstI64 { dst, .. }
+            | TraceOp::LocalGet { dst, .. }
+            | TraceOp::Call { dst, .. }
+            | TraceOp::StrConcat { dst, .. }
+            | TraceOp::StrContains { dst, .. }
+            | TraceOp::StrFind { dst, .. }
+            | TraceOp::StrSubstring { dst, .. }
+            | TraceOp::StrGlobMatch { dst, .. }
+            | TraceOp::ListGet { dst, .. }
             | TraceOp::DictLookup { dst, .. }
             | TraceOp::DictLookupPrechecked { dst, .. }
             | TraceOp::StrConcatN { dst, .. } => Some(*dst),
 
-            TraceOp::Store(_, _, _)
-            | TraceOp::Guard(_, _)
-            | TraceOp::Return(_)
+            TraceOp::Store { .. }
+            | TraceOp::Guard { .. }
+            | TraceOp::Return { .. }
             | TraceOp::MarkLoopHead { .. }
             | TraceOp::MarkLoopBack { .. }
             | TraceOp::DictShapeGuard { .. } => None,
@@ -533,29 +605,37 @@ impl TraceOp {
     /// deterministic rewriting by optimizer passes.
     pub fn inputs(&self) -> Vec<SsaVar> {
         match self {
-            TraceOp::Add(_, a, b)
-            | TraceOp::Sub(_, a, b)
-            | TraceOp::Mul(_, a, b)
-            | TraceOp::Div(_, a, b)
-            | TraceOp::Mod(_, a, b) => vec![*a, *b],
-            TraceOp::Cmp(_, _, a, b) => vec![*a, *b],
-            TraceOp::Load(_, base, _) => vec![*base],
-            TraceOp::Store(base, _, src) => vec![*base, *src],
-            TraceOp::ConstI32(_, _) | TraceOp::ConstI64(_, _) | TraceOp::LocalGet(_, _) => vec![],
-            TraceOp::Guard(kind, _check) => match *kind {
+            TraceOp::Add { lhs, rhs, .. }
+            | TraceOp::Sub { lhs, rhs, .. }
+            | TraceOp::Mul { lhs, rhs, .. }
+            | TraceOp::Div { lhs, rhs, .. }
+            | TraceOp::Mod { lhs, rhs, .. } => vec![*lhs, *rhs],
+            TraceOp::Cmp { lhs, rhs, .. } => vec![*lhs, *rhs],
+            TraceOp::Load { base, .. } => vec![*base],
+            TraceOp::Store { base, src, .. } => vec![*base, *src],
+            TraceOp::ConstI32 { .. } | TraceOp::ConstI64 { .. } | TraceOp::LocalGet { .. } => {
+                vec![]
+            }
+            TraceOp::Guard { kind, .. } => match *kind {
                 GuardKind::TypeCheck(v, _) => vec![v],
                 GuardKind::NotNull(v) => vec![v],
                 GuardKind::BoundsCheck(v, limit) => vec![v, limit],
                 GuardKind::ArithOverflow(v) => vec![v],
                 GuardKind::IsZero(v) => vec![v],
             },
-            TraceOp::Call(_, _, args, _) => args.clone(),
-            TraceOp::StrConcat(_, a, b)
-            | TraceOp::StrContains(_, a, b)
-            | TraceOp::StrFind(_, a, b)
-            | TraceOp::StrGlobMatch(_, a, b) => vec![*a, *b],
+            TraceOp::Call { args, .. } => args.clone(),
+            TraceOp::StrConcat { lhs, rhs, .. } => vec![*lhs, *rhs],
+            TraceOp::StrContains {
+                haystack, needle, ..
+            }
+            | TraceOp::StrFind {
+                haystack, needle, ..
+            } => vec![*haystack, *needle],
+            TraceOp::StrGlobMatch { s, pattern, .. } => vec![*s, *pattern],
             TraceOp::StrConcatN { operands, .. } => operands.clone(),
-            TraceOp::StrSubstring(_, s, start, len) => vec![*s, *start, *len],
+            TraceOp::StrSubstring {
+                s, start, length, ..
+            } => vec![*s, *start, *length],
             TraceOp::ListGet { list_ptr, idx, .. } => vec![*list_ptr, *idx],
             TraceOp::DictLookup {
                 dict_ptr, key_ptr, ..
@@ -565,7 +645,7 @@ impl TraceOp {
             TraceOp::DictLookupPrechecked {
                 dict_ptr, key_ptr, ..
             } => vec![*dict_ptr, *key_ptr],
-            TraceOp::Return(v) => vec![*v],
+            TraceOp::Return { value } => vec![*value],
             // ε-M0: loop markers consume / produce φ pairs. The head
             // reads the `init` SSA (defined before the loop) for each
             // φ; the back reads the `next_values` SSA (defined inside
@@ -590,7 +670,7 @@ impl TraceOp {
 
     /// Is this op a guard?
     pub fn is_guard(&self) -> bool {
-        matches!(self, TraceOp::Guard(_, _))
+        matches!(self, TraceOp::Guard { .. })
     }
 
     /// Is this op a `MarkLoopHead` marker?
@@ -627,38 +707,70 @@ mod tests {
     #[test]
     fn effect_class_lookup() {
         assert_eq!(
-            TraceOp::Add(SsaVar(0), SsaVar(1), SsaVar(2)).effect_class(),
+            TraceOp::Add {
+                dst: SsaVar(0),
+                lhs: SsaVar(1),
+                rhs: SsaVar(2)
+            }
+            .effect_class(),
             EffectClass::Pure
         );
         assert_eq!(
-            TraceOp::Load(SsaVar(0), SsaVar(1), Offset(0)).effect_class(),
+            TraceOp::Load {
+                dst: SsaVar(0),
+                base: SsaVar(1),
+                offset: Offset(0)
+            }
+            .effect_class(),
             EffectClass::ReadOnly
         );
         assert_eq!(
-            TraceOp::Store(SsaVar(0), Offset(0), SsaVar(1)).effect_class(),
+            TraceOp::Store {
+                base: SsaVar(0),
+                offset: Offset(0),
+                src: SsaVar(1)
+            }
+            .effect_class(),
             EffectClass::RecoverableWrite
         );
         assert_eq!(
-            TraceOp::Call(SsaVar(0), FuncId(7), vec![], EffectClass::Unrecoverable).effect_class(),
+            TraceOp::Call {
+                dst: SsaVar(0),
+                func: FuncId(7),
+                args: vec![],
+                effect: EffectClass::Unrecoverable
+            }
+            .effect_class(),
             EffectClass::Unrecoverable
         );
     }
 
     #[test]
     fn output_and_inputs() {
-        let add = TraceOp::Add(SsaVar(3), SsaVar(1), SsaVar(2));
+        let add = TraceOp::Add {
+            dst: SsaVar(3),
+            lhs: SsaVar(1),
+            rhs: SsaVar(2),
+        };
         assert_eq!(add.output(), Some(SsaVar(3)));
         assert_eq!(add.inputs(), vec![SsaVar(1), SsaVar(2)]);
 
-        let ret = TraceOp::Return(SsaVar(9));
+        let ret = TraceOp::Return { value: SsaVar(9) };
         assert_eq!(ret.output(), None);
         assert_eq!(ret.inputs(), vec![SsaVar(9)]);
 
-        let store = TraceOp::Store(SsaVar(0), Offset(8), SsaVar(1));
+        let store = TraceOp::Store {
+            base: SsaVar(0),
+            offset: Offset(8),
+            src: SsaVar(1),
+        };
         assert_eq!(store.output(), None);
         assert_eq!(store.inputs(), vec![SsaVar(0), SsaVar(1)]);
 
-        let cst = TraceOp::ConstI64(SsaVar(0), 42);
+        let cst = TraceOp::ConstI64 {
+            dst: SsaVar(0),
+            value: 42,
+        };
         assert_eq!(cst.output(), Some(SsaVar(0)));
         assert!(cst.inputs().is_empty());
     }
@@ -670,7 +782,11 @@ mod tests {
     /// hoists across loop bodies.
     #[test]
     fn str_glob_match_is_pure_with_two_inputs() {
-        let op = TraceOp::StrGlobMatch(SsaVar(3), SsaVar(1), SsaVar(2));
+        let op = TraceOp::StrGlobMatch {
+            dst: SsaVar(3),
+            s: SsaVar(1),
+            pattern: SsaVar(2),
+        };
         assert_eq!(op.effect_class(), EffectClass::Pure);
         assert_eq!(op.output(), Some(SsaVar(3)));
         assert_eq!(op.inputs(), vec![SsaVar(1), SsaVar(2)]);
@@ -679,7 +795,11 @@ mod tests {
 
     #[test]
     fn mod_is_recoverable_write_with_io() {
-        let op = TraceOp::Mod(SsaVar(3), SsaVar(1), SsaVar(2));
+        let op = TraceOp::Mod {
+            dst: SsaVar(3),
+            lhs: SsaVar(1),
+            rhs: SsaVar(2),
+        };
         assert_eq!(op.effect_class(), EffectClass::RecoverableWrite);
         assert_eq!(op.output(), Some(SsaVar(3)));
         assert_eq!(op.inputs(), vec![SsaVar(1), SsaVar(2)]);
@@ -722,10 +842,10 @@ mod tests {
 
     #[test]
     fn guard_is_pure() {
-        let g = TraceOp::Guard(
-            GuardKind::TypeCheck(SsaVar(1), ObservedType::I64),
-            SsaVar(1),
-        );
+        let g = TraceOp::Guard {
+            kind: GuardKind::TypeCheck(SsaVar(1), ObservedType::I64),
+            check: SsaVar(1),
+        };
         assert!(g.is_guard());
         assert_eq!(g.effect_class(), EffectClass::Pure);
     }

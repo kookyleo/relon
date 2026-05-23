@@ -223,14 +223,20 @@ pub fn lower_op(op: &Op, cx: OpLoweringContext<'_>) -> LowerOutcome {
     match op {
         // ---- Const ops ---------------------------------------------------
         Op::ConstI32(v) => LowerOutcome::Emit {
-            op: TraceOp::ConstI32(cx.fresh_dst, *v),
+            op: TraceOp::ConstI32 {
+                dst: cx.fresh_dst,
+                value: *v,
+            },
             dst: Some(cx.fresh_dst),
             guards_before: guards![],
             guards_after: guards![],
             effect: TraceEffect::Pure,
         },
         Op::ConstI64(v) => LowerOutcome::Emit {
-            op: TraceOp::ConstI64(cx.fresh_dst, *v),
+            op: TraceOp::ConstI64 {
+                dst: cx.fresh_dst,
+                value: *v,
+            },
             dst: Some(cx.fresh_dst),
             guards_before: guards![],
             guards_after: guards![],
@@ -240,7 +246,10 @@ pub fn lower_op(op: &Op, cx: OpLoweringContext<'_>) -> LowerOutcome {
             // Booleans pack into the i32 slot at codegen time; mirror
             // that here so optimiser passes see a consistent
             // representation.
-            op: TraceOp::ConstI32(cx.fresh_dst, if *v { 1 } else { 0 }),
+            op: TraceOp::ConstI32 {
+                dst: cx.fresh_dst,
+                value: if *v { 1 } else { 0 },
+            },
             dst: Some(cx.fresh_dst),
             guards_before: guards![],
             guards_after: guards![],
@@ -383,7 +392,11 @@ pub fn lower_op(op: &Op, cx: OpLoweringContext<'_>) -> LowerOutcome {
                 // `$in_ptr` at emit time.
                 .unwrap_or(SsaVar::NONE);
             LowerOutcome::Emit {
-                op: TraceOp::Load(cx.fresh_dst, base, Offset(*offset as i32)),
+                op: TraceOp::Load {
+                    dst: cx.fresh_dst,
+                    base,
+                    offset: Offset(*offset as i32),
+                },
                 dst: Some(cx.fresh_dst),
                 // The offset is bounded by the schema layout at IR
                 // construction time; the only runtime check needed
@@ -397,7 +410,11 @@ pub fn lower_op(op: &Op, cx: OpLoweringContext<'_>) -> LowerOutcome {
             let value = cx.inputs.first().copied().unwrap_or(SsaVar::NONE);
             let base = cx.inputs.get(1).copied().unwrap_or(SsaVar::NONE);
             LowerOutcome::Emit {
-                op: TraceOp::Store(base, Offset(*offset as i32), value),
+                op: TraceOp::Store {
+                    base,
+                    offset: Offset(*offset as i32),
+                    src: value,
+                },
                 dst: None,
                 // Offset bounded at IR construction; only the
                 // non-null check matters at runtime.
@@ -419,7 +436,10 @@ pub fn lower_op(op: &Op, cx: OpLoweringContext<'_>) -> LowerOutcome {
                 // We model BrIf as an inline guard so the optimised
                 // trace deopts if a future execution would have taken
                 // the *other* arm.
-                op: TraceOp::Guard(GuardKind::NotNull(var), var),
+                op: TraceOp::Guard {
+                    kind: GuardKind::NotNull(var),
+                    check: var,
+                },
                 dst: None,
                 guards_before: guards![],
                 guards_after: guards![],
@@ -470,7 +490,12 @@ pub fn lower_op(op: &Op, cx: OpLoweringContext<'_>) -> LowerOutcome {
                 LowerOutcome::Abort(AbortReason::UnrecoverableEffect)
             } else {
                 LowerOutcome::Emit {
-                    op: TraceOp::Call(cx.fresh_dst, FuncId(*fn_index), cx.inputs.to_vec(), effect),
+                    op: TraceOp::Call {
+                        dst: cx.fresh_dst,
+                        func: FuncId(*fn_index),
+                        args: cx.inputs.to_vec(),
+                        effect,
+                    },
                     dst: Some(cx.fresh_dst),
                     guards_before: guards![],
                     guards_after: guards![],
@@ -485,7 +510,7 @@ pub fn lower_op(op: &Op, cx: OpLoweringContext<'_>) -> LowerOutcome {
         Op::Return => {
             let v = cx.inputs.first().copied().unwrap_or(SsaVar::NONE);
             LowerOutcome::Terminate {
-                op: TraceOp::Return(v),
+                op: TraceOp::Return { value: v },
             }
         }
         Op::Trap { .. } => LowerOutcome::Abort(AbortReason::UnsupportedOp("Trap")),
@@ -617,7 +642,11 @@ fn lower_string_call(fn_index: u32, cx: &OpLoweringContext<'_>) -> Option<LowerO
             let rhs = cx.inputs[0];
             let lhs = cx.inputs[1];
             Some(LowerOutcome::Emit {
-                op: TraceOp::StrConcat(cx.fresh_dst, lhs, rhs),
+                op: TraceOp::StrConcat {
+                    dst: cx.fresh_dst,
+                    lhs,
+                    rhs,
+                },
                 dst: Some(cx.fresh_dst),
                 // F-D7: emit a NotNull guard against both operands so
                 // the trace deopts cleanly instead of returning a
@@ -642,7 +671,12 @@ fn lower_string_call(fn_index: u32, cx: &OpLoweringContext<'_>) -> Option<LowerO
             let start = cx.inputs[1];
             let s = cx.inputs[2];
             Some(LowerOutcome::Emit {
-                op: TraceOp::StrSubstring(cx.fresh_dst, s, start, length),
+                op: TraceOp::StrSubstring {
+                    dst: cx.fresh_dst,
+                    s,
+                    start,
+                    length,
+                },
                 dst: Some(cx.fresh_dst),
                 // Bounds-style guard so the trace deopts when the
                 // recorder's observed `start <= len` invariant breaks
@@ -679,7 +713,11 @@ fn lower_string_call(fn_index: u32, cx: &OpLoweringContext<'_>) -> Option<LowerO
             let needle = cx.inputs[0];
             let haystack = cx.inputs[1];
             Some(LowerOutcome::Emit {
-                op: TraceOp::StrContains(cx.fresh_dst, haystack, needle),
+                op: TraceOp::StrContains {
+                    dst: cx.fresh_dst,
+                    haystack,
+                    needle,
+                },
                 dst: Some(cx.fresh_dst),
                 guards_before: guards![GuardKind::NotNull(haystack)],
                 guards_after: guards![],
@@ -701,7 +739,11 @@ fn lower_string_call(fn_index: u32, cx: &OpLoweringContext<'_>) -> Option<LowerO
             let pattern = cx.inputs[0];
             let s = cx.inputs[1];
             Some(LowerOutcome::Emit {
-                op: TraceOp::StrGlobMatch(cx.fresh_dst, s, pattern),
+                op: TraceOp::StrGlobMatch {
+                    dst: cx.fresh_dst,
+                    s,
+                    pattern,
+                },
                 dst: Some(cx.fresh_dst),
                 // Guard the haystack against null so the trace deopts
                 // cleanly rather than letting the helper return 0 on a
@@ -804,7 +846,11 @@ fn lower_str_add(cx: OpLoweringContext<'_>) -> LowerOutcome {
     let rhs = cx.inputs[0];
     let lhs = cx.inputs[1];
     LowerOutcome::Emit {
-        op: TraceOp::StrConcat(cx.fresh_dst, lhs, rhs),
+        op: TraceOp::StrConcat {
+            dst: cx.fresh_dst,
+            lhs,
+            rhs,
+        },
         dst: Some(cx.fresh_dst),
         guards_before: guards![GuardKind::NotNull(lhs), GuardKind::NotNull(rhs)],
         guards_after: guards![],
@@ -843,22 +889,38 @@ fn binary_arith(cx: OpLoweringContext<'_>, ty: IrType, kind: BinaryArith) -> Low
     let lhs = cx.inputs[1];
     let (op, effect, guard_after) = match kind {
         BinaryArith::Add => (
-            TraceOp::Add(cx.fresh_dst, lhs, rhs),
+            TraceOp::Add {
+                dst: cx.fresh_dst,
+                lhs,
+                rhs,
+            },
             TraceEffect::Pure,
             Some(GuardKind::ArithOverflow(cx.fresh_dst)),
         ),
         BinaryArith::Sub => (
-            TraceOp::Sub(cx.fresh_dst, lhs, rhs),
+            TraceOp::Sub {
+                dst: cx.fresh_dst,
+                lhs,
+                rhs,
+            },
             TraceEffect::Pure,
             Some(GuardKind::ArithOverflow(cx.fresh_dst)),
         ),
         BinaryArith::Mul => (
-            TraceOp::Mul(cx.fresh_dst, lhs, rhs),
+            TraceOp::Mul {
+                dst: cx.fresh_dst,
+                lhs,
+                rhs,
+            },
             TraceEffect::Pure,
             Some(GuardKind::ArithOverflow(cx.fresh_dst)),
         ),
         BinaryArith::Div => (
-            TraceOp::Div(cx.fresh_dst, lhs, rhs),
+            TraceOp::Div {
+                dst: cx.fresh_dst,
+                lhs,
+                rhs,
+            },
             // Div is RecoverableWrite at the trace-IR level — the
             // optimiser captures the dividend pre-value so a
             // div-by-zero deopt can re-execute the divisor.
@@ -866,7 +928,11 @@ fn binary_arith(cx: OpLoweringContext<'_>, ty: IrType, kind: BinaryArith) -> Low
             Some(GuardKind::ArithOverflow(cx.fresh_dst)),
         ),
         BinaryArith::Mod => (
-            TraceOp::Mod(cx.fresh_dst, lhs, rhs),
+            TraceOp::Mod {
+                dst: cx.fresh_dst,
+                lhs,
+                rhs,
+            },
             // F-D8-E.1: same RecoverableWrite rationale as Div —
             // `b == 0` traps, and the trace must be able to roll
             // back to the pre-modulo state on deopt. The same
@@ -893,7 +959,12 @@ fn binary_cmp(cx: OpLoweringContext<'_>, _ty: IrType, kind: CmpKind) -> LowerOut
     let rhs = cx.inputs[0];
     let lhs = cx.inputs[1];
     LowerOutcome::Emit {
-        op: TraceOp::Cmp(kind, cx.fresh_dst, lhs, rhs),
+        op: TraceOp::Cmp {
+            kind,
+            dst: cx.fresh_dst,
+            lhs,
+            rhs,
+        },
         dst: Some(cx.fresh_dst),
         guards_before: guards![],
         guards_after: guards![],
@@ -960,7 +1031,7 @@ mod tests {
                 op, dst: Some(d), ..
             } => {
                 assert_eq!(d, dst);
-                assert!(matches!(op, TraceOp::ConstI64(_, 42)));
+                assert!(matches!(op, TraceOp::ConstI64 { dst: _, value: 42 }));
             }
             other => panic!("unexpected: {:?}", other),
         }
@@ -973,7 +1044,7 @@ mod tests {
         else {
             panic!()
         };
-        assert!(matches!(op, TraceOp::ConstI32(_, 1)));
+        assert!(matches!(op, TraceOp::ConstI32 { dst: _, value: 1 }));
     }
 
     #[test]
@@ -997,7 +1068,14 @@ mod tests {
                 effect,
                 ..
             } => {
-                assert!(matches!(op, TraceOp::Add(_, _, _)));
+                assert!(matches!(
+                    op,
+                    TraceOp::Add {
+                        dst: _,
+                        lhs: _,
+                        rhs: _
+                    }
+                ));
                 assert_eq!(dst, Some(SsaVar(3)));
                 assert_eq!(effect, TraceEffect::Pure);
                 assert!(matches!(
@@ -1039,7 +1117,14 @@ mod tests {
                 effect,
             } => {
                 assert!(
-                    matches!(op, TraceOp::Mod(_, _, _)),
+                    matches!(
+                        op,
+                        TraceOp::Mod {
+                            dst: _,
+                            lhs: _,
+                            rhs: _
+                        }
+                    ),
                     "Op::Mod(I64) must lower to TraceOp::Mod, got {:?}",
                     op
                 );
@@ -1081,7 +1166,15 @@ mod tests {
         let outcome = lower_op(&Op::Lt(IrType::I64), cx_with(&inputs, SsaVar(3)));
         match outcome {
             LowerOutcome::Emit { op, .. } => {
-                assert!(matches!(op, TraceOp::Cmp(CmpKind::Lt, _, _, _)));
+                assert!(matches!(
+                    op,
+                    TraceOp::Cmp {
+                        kind: CmpKind::Lt,
+                        dst: _,
+                        lhs: _,
+                        rhs: _
+                    }
+                ));
             }
             other => panic!("unexpected: {:?}", other),
         }
@@ -1137,7 +1230,15 @@ mod tests {
         );
         match outcome {
             LowerOutcome::Emit { op, effect, .. } => {
-                assert!(matches!(op, TraceOp::Call(_, FuncId(5), _, _)));
+                assert!(matches!(
+                    op,
+                    TraceOp::Call {
+                        dst: _,
+                        func: FuncId(5),
+                        args: _,
+                        effect: _
+                    }
+                ));
                 assert_eq!(effect, TraceEffect::Pure);
             }
             other => panic!("unexpected: {:?}", other),
@@ -1202,7 +1303,11 @@ mod tests {
                 assert_eq!(d, SsaVar(99));
                 assert_eq!(effect, TraceEffect::Pure);
                 match op {
-                    TraceOp::StrConcat(_, l, r) => {
+                    TraceOp::StrConcat {
+                        dst: _,
+                        lhs: l,
+                        rhs: r,
+                    } => {
                         assert_eq!(l, SsaVar(10), "lhs must be the second-from-top input");
                         assert_eq!(r, SsaVar(20), "rhs must be the top-of-stack input");
                     }
@@ -1245,7 +1350,12 @@ mod tests {
                 assert_eq!(d, SsaVar(77));
                 assert_eq!(effect, TraceEffect::Pure);
                 match op {
-                    TraceOp::StrSubstring(_, s, start, length) => {
+                    TraceOp::StrSubstring {
+                        dst: _,
+                        s,
+                        start,
+                        length,
+                    } => {
                         assert_eq!(s, SsaVar(1));
                         assert_eq!(start, SsaVar(2));
                         assert_eq!(length, SsaVar(3));
@@ -1324,7 +1434,11 @@ mod tests {
                 assert_eq!(d, SsaVar(88));
                 assert_eq!(effect, TraceEffect::Pure);
                 match op {
-                    TraceOp::StrGlobMatch(_, s, pat) => {
+                    TraceOp::StrGlobMatch {
+                        dst: _,
+                        s,
+                        pattern: pat,
+                    } => {
                         assert_eq!(s, SsaVar(20));
                         assert_eq!(pat, SsaVar(30));
                     }
@@ -1379,7 +1493,15 @@ mod tests {
         match outcome {
             LowerOutcome::Emit { op, .. } => {
                 assert!(
-                    matches!(op, TraceOp::Call(_, _, _, _)),
+                    matches!(
+                        op,
+                        TraceOp::Call {
+                            dst: _,
+                            func: _,
+                            args: _,
+                            effect: _
+                        }
+                    ),
                     "expected generic Call, got {:?}",
                     op
                 );
@@ -1406,7 +1528,11 @@ mod tests {
                 assert_eq!(d, SsaVar(99));
                 assert_eq!(effect, TraceEffect::Pure);
                 match op {
-                    TraceOp::StrConcat(_, l, r) => {
+                    TraceOp::StrConcat {
+                        dst: _,
+                        lhs: l,
+                        rhs: r,
+                    } => {
                         assert_eq!(l, SsaVar(10), "lhs is the second-from-top input");
                         assert_eq!(r, SsaVar(20), "rhs is the top input");
                     }
@@ -1433,7 +1559,14 @@ mod tests {
         match outcome {
             LowerOutcome::Emit { op, .. } => {
                 assert!(
-                    matches!(op, TraceOp::Add(_, _, _)),
+                    matches!(
+                        op,
+                        TraceOp::Add {
+                            dst: _,
+                            lhs: _,
+                            rhs: _
+                        }
+                    ),
                     "expected integer Add, got {op:?}"
                 );
             }
@@ -1601,7 +1734,11 @@ mod tests {
                 assert_eq!(d, SsaVar(50));
                 assert_eq!(effect, TraceEffect::Pure);
                 match op {
-                    TraceOp::StrContains(_, h, n) => {
+                    TraceOp::StrContains {
+                        dst: _,
+                        haystack: h,
+                        needle: n,
+                    } => {
                         assert_eq!(h, SsaVar(3), "haystack is the second-from-top input");
                         assert_eq!(n, SsaVar(7), "needle is the top input");
                     }

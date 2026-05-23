@@ -26,13 +26,17 @@ fn simple_hoistable_add_lifts_out_of_loop() {
     let a = b.fresh_ssa();
     let bb = b.fresh_ssa();
     let c = b.fresh_ssa();
-    b.append(TraceOp::ConstI32(a, 3));
-    b.append(TraceOp::ConstI32(bb, 4));
+    b.append(TraceOp::ConstI32 { dst: a, value: 3 });
+    b.append(TraceOp::ConstI32 { dst: bb, value: 4 });
     b.append(TraceOp::MarkLoopHead {
         loop_id: 0,
         phis: vec![],
     });
-    b.append(TraceOp::Add(c, a, bb));
+    b.append(TraceOp::Add {
+        dst: c,
+        lhs: a,
+        rhs: bb,
+    });
     b.append(TraceOp::MarkLoopBack {
         loop_id: 0,
         next_values: vec![],
@@ -40,7 +44,17 @@ fn simple_hoistable_add_lifts_out_of_loop() {
 
     let r = LICM.run(&mut b);
     let head_idx = position(&b.ops, |o| o.is_loop_head()).expect("loop head missing");
-    let add_idx = position(&b.ops, |o| matches!(o, TraceOp::Add(_, _, _))).expect("add missing");
+    let add_idx = position(&b.ops, |o| {
+        matches!(
+            o,
+            TraceOp::Add {
+                dst: _,
+                lhs: _,
+                rhs: _
+            }
+        )
+    })
+    .expect("add missing");
     assert!(
         add_idx < head_idx,
         "Add must be hoisted before MarkLoopHead"
@@ -56,7 +70,10 @@ fn loop_variant_op_stays_inside() {
     let pre_c = b.fresh_ssa();
     let inside_load = b.fresh_ssa();
     let res = b.fresh_ssa();
-    b.append(TraceOp::ConstI32(pre_c, 5));
+    b.append(TraceOp::ConstI32 {
+        dst: pre_c,
+        value: 5,
+    });
     b.append(TraceOp::MarkLoopHead {
         loop_id: 0,
         phis: vec![],
@@ -64,8 +81,16 @@ fn loop_variant_op_stays_inside() {
     // Offset 24 sits outside F-D7-G's StringRef ptr/len hoist window,
     // so the Load stays inside the body and the Add that depends on
     // it must stay too.
-    b.append(TraceOp::Load(inside_load, base, Offset(24)));
-    b.append(TraceOp::Add(res, inside_load, pre_c));
+    b.append(TraceOp::Load {
+        dst: inside_load,
+        base,
+        offset: Offset(24),
+    });
+    b.append(TraceOp::Add {
+        dst: res,
+        lhs: inside_load,
+        rhs: pre_c,
+    });
     b.append(TraceOp::MarkLoopBack {
         loop_id: 0,
         next_values: vec![],
@@ -73,7 +98,17 @@ fn loop_variant_op_stays_inside() {
 
     LICM.run(&mut b);
     let head_idx = position(&b.ops, |o| o.is_loop_head()).unwrap();
-    let add_idx = position(&b.ops, |o| matches!(o, TraceOp::Add(_, _, _))).unwrap();
+    let add_idx = position(&b.ops, |o| {
+        matches!(
+            o,
+            TraceOp::Add {
+                dst: _,
+                lhs: _,
+                rhs: _
+            }
+        )
+    })
+    .unwrap();
     assert!(
         add_idx > head_idx,
         "Add depends on Load (loop-defined) and must stay inside the body"
@@ -86,12 +121,16 @@ fn recoverable_write_is_not_hoisted() {
     let mut b = TraceBuffer::new();
     let base = b.fresh_ssa();
     let val = b.fresh_ssa();
-    b.append(TraceOp::ConstI64(val, 1));
+    b.append(TraceOp::ConstI64 { dst: val, value: 1 });
     b.append(TraceOp::MarkLoopHead {
         loop_id: 0,
         phis: vec![],
     });
-    b.append(TraceOp::Store(base, Offset(0), val));
+    b.append(TraceOp::Store {
+        base,
+        offset: Offset(0),
+        src: val,
+    });
     b.append(TraceOp::MarkLoopBack {
         loop_id: 0,
         next_values: vec![],
@@ -99,7 +138,17 @@ fn recoverable_write_is_not_hoisted() {
 
     LICM.run(&mut b);
     let head_idx = position(&b.ops, |o| o.is_loop_head()).unwrap();
-    let store_idx = position(&b.ops, |o| matches!(o, TraceOp::Store(_, _, _))).unwrap();
+    let store_idx = position(&b.ops, |o| {
+        matches!(
+            o,
+            TraceOp::Store {
+                base: _,
+                offset: _,
+                src: _
+            }
+        )
+    })
+    .unwrap();
     assert!(
         store_idx > head_idx,
         "Store (RecoverableWrite) must not be hoisted"
@@ -112,15 +161,15 @@ fn guard_is_not_hoisted() {
     // operand is loop-invariant.
     let mut b = TraceBuffer::new();
     let v = b.fresh_ssa();
-    b.append(TraceOp::ConstI64(v, 7));
+    b.append(TraceOp::ConstI64 { dst: v, value: 7 });
     b.append(TraceOp::MarkLoopHead {
         loop_id: 0,
         phis: vec![],
     });
-    b.append(TraceOp::Guard(
-        GuardKind::TypeCheck(v, ObservedType::I64),
-        v,
-    ));
+    b.append(TraceOp::Guard {
+        kind: GuardKind::TypeCheck(v, ObservedType::I64),
+        check: v,
+    });
     b.append(TraceOp::MarkLoopBack {
         loop_id: 0,
         next_values: vec![],
@@ -148,7 +197,7 @@ fn nested_loops_lift_innermost_first() {
     let mut b = TraceBuffer::new();
     let a = b.fresh_ssa();
     let c = b.fresh_ssa();
-    b.append(TraceOp::ConstI32(a, 1));
+    b.append(TraceOp::ConstI32 { dst: a, value: 1 });
     b.append(TraceOp::MarkLoopHead {
         loop_id: 0,
         phis: vec![],
@@ -157,7 +206,11 @@ fn nested_loops_lift_innermost_first() {
         loop_id: 1,
         phis: vec![],
     });
-    b.append(TraceOp::Mul(c, a, a));
+    b.append(TraceOp::Mul {
+        dst: c,
+        lhs: a,
+        rhs: a,
+    });
     b.append(TraceOp::MarkLoopBack {
         loop_id: 1,
         next_values: vec![],
@@ -173,7 +226,17 @@ fn nested_loops_lift_innermost_first() {
         .iter()
         .position(|o| o.loop_head_id() == Some(0))
         .unwrap();
-    let mul_idx = position(&b.ops, |o| matches!(o, TraceOp::Mul(_, _, _))).unwrap();
+    let mul_idx = position(&b.ops, |o| {
+        matches!(
+            o,
+            TraceOp::Mul {
+                dst: _,
+                lhs: _,
+                rhs: _
+            }
+        )
+    })
+    .unwrap();
     assert!(
         mul_idx < outer_head,
         "Mul should bubble out past the outermost MarkLoopHead"
@@ -198,7 +261,7 @@ fn nested_loops_partial_invariant_hoists_to_inner_head_only() {
     let base = b.fresh_ssa();
     let bb = b.fresh_ssa();
     let c = b.fresh_ssa();
-    b.append(TraceOp::ConstI32(a, 1));
+    b.append(TraceOp::ConstI32 { dst: a, value: 1 });
     b.append(TraceOp::MarkLoopHead {
         loop_id: 0,
         phis: vec![],
@@ -206,12 +269,20 @@ fn nested_loops_partial_invariant_hoists_to_inner_head_only() {
     // Offset 24: see F-D7-G note in the sister tests above — keeps
     // `bb` loop-variant with respect to the outer loop so the Add
     // below cannot escape the outer body.
-    b.append(TraceOp::Load(bb, base, Offset(24)));
+    b.append(TraceOp::Load {
+        dst: bb,
+        base,
+        offset: Offset(24),
+    });
     b.append(TraceOp::MarkLoopHead {
         loop_id: 1,
         phis: vec![],
     });
-    b.append(TraceOp::Add(c, a, bb));
+    b.append(TraceOp::Add {
+        dst: c,
+        lhs: a,
+        rhs: bb,
+    });
     b.append(TraceOp::MarkLoopBack {
         loop_id: 1,
         next_values: vec![],
@@ -232,7 +303,17 @@ fn nested_loops_partial_invariant_hoists_to_inner_head_only() {
         .iter()
         .position(|o| o.loop_head_id() == Some(1))
         .unwrap();
-    let add_idx = position(&b.ops, |o| matches!(o, TraceOp::Add(_, _, _))).unwrap();
+    let add_idx = position(&b.ops, |o| {
+        matches!(
+            o,
+            TraceOp::Add {
+                dst: _,
+                lhs: _,
+                rhs: _
+            }
+        )
+    })
+    .unwrap();
     assert!(
         add_idx > outer_head,
         "Add depends on Load (outer-loop-defined), cannot leave outer loop"
@@ -257,7 +338,11 @@ fn load_with_non_string_offset_stays_inside_loop() {
         loop_id: 0,
         phis: vec![],
     });
-    b.append(TraceOp::Load(inside_load, base, Offset(16)));
+    b.append(TraceOp::Load {
+        dst: inside_load,
+        base,
+        offset: Offset(16),
+    });
     b.append(TraceOp::MarkLoopBack {
         loop_id: 0,
         next_values: vec![],
@@ -275,19 +360,35 @@ fn pure_call_with_external_args_is_hoistable() {
     let mut b = TraceBuffer::new();
     let arg = b.fresh_ssa();
     let ret = b.fresh_ssa();
-    b.append(TraceOp::ConstI32(arg, 5));
+    b.append(TraceOp::ConstI32 { dst: arg, value: 5 });
     b.append(TraceOp::MarkLoopHead {
         loop_id: 0,
         phis: vec![],
     });
-    b.append(TraceOp::Call(ret, FuncId(11), vec![arg], EffectClass::Pure));
+    b.append(TraceOp::Call {
+        dst: ret,
+        func: FuncId(11),
+        args: vec![arg],
+        effect: EffectClass::Pure,
+    });
     b.append(TraceOp::MarkLoopBack {
         loop_id: 0,
         next_values: vec![],
     });
     LICM.run(&mut b);
     let head_idx = position(&b.ops, |o| o.is_loop_head()).unwrap();
-    let call_idx = position(&b.ops, |o| matches!(o, TraceOp::Call(_, _, _, _))).unwrap();
+    let call_idx = position(&b.ops, |o| {
+        matches!(
+            o,
+            TraceOp::Call {
+                dst: _,
+                func: _,
+                args: _,
+                effect: _
+            }
+        )
+    })
+    .unwrap();
     assert!(call_idx < head_idx, "Pure Call should be hoistable");
 }
 
@@ -297,24 +398,35 @@ fn readonly_call_is_not_hoisted() {
     let mut b = TraceBuffer::new();
     let arg = b.fresh_ssa();
     let ret = b.fresh_ssa();
-    b.append(TraceOp::ConstI32(arg, 5));
+    b.append(TraceOp::ConstI32 { dst: arg, value: 5 });
     b.append(TraceOp::MarkLoopHead {
         loop_id: 0,
         phis: vec![],
     });
-    b.append(TraceOp::Call(
-        ret,
-        FuncId(11),
-        vec![arg],
-        EffectClass::ReadOnly,
-    ));
+    b.append(TraceOp::Call {
+        dst: ret,
+        func: FuncId(11),
+        args: vec![arg],
+        effect: EffectClass::ReadOnly,
+    });
     b.append(TraceOp::MarkLoopBack {
         loop_id: 0,
         next_values: vec![],
     });
     LICM.run(&mut b);
     let head_idx = position(&b.ops, |o| o.is_loop_head()).unwrap();
-    let call_idx = position(&b.ops, |o| matches!(o, TraceOp::Call(_, _, _, _))).unwrap();
+    let call_idx = position(&b.ops, |o| {
+        matches!(
+            o,
+            TraceOp::Call {
+                dst: _,
+                func: _,
+                args: _,
+                effect: _
+            }
+        )
+    })
+    .unwrap();
     assert!(call_idx > head_idx, "ReadOnly Call must not be hoisted");
 }
 
@@ -344,13 +456,19 @@ fn loop_invariant_list_get_lifts_out_of_loop() {
     let list_ptr = b.fresh_ssa();
     let idx = b.fresh_ssa();
     let dst = b.fresh_ssa();
-    b.append(TraceOp::ConstI64(list_ptr, 0x1000));
-    b.append(TraceOp::ConstI64(idx, 0));
+    b.append(TraceOp::ConstI64 {
+        dst: list_ptr,
+        value: 0x1000,
+    });
+    b.append(TraceOp::ConstI64 { dst: idx, value: 0 });
     b.append(TraceOp::MarkLoopHead {
         loop_id: 0,
         phis: vec![],
     });
-    b.append(TraceOp::Guard(GuardKind::BoundsCheck(idx, list_ptr), idx));
+    b.append(TraceOp::Guard {
+        kind: GuardKind::BoundsCheck(idx, list_ptr),
+        check: idx,
+    });
     b.append(TraceOp::ListGet { dst, list_ptr, idx });
     b.append(TraceOp::MarkLoopBack {
         loop_id: 0,
@@ -360,7 +478,13 @@ fn loop_invariant_list_get_lifts_out_of_loop() {
     let r = LICM.run(&mut b);
     let head_idx = position(&b.ops, |o| o.is_loop_head()).expect("head missing");
     let guard_pos = position(&b.ops, |o| {
-        matches!(o, TraceOp::Guard(GuardKind::BoundsCheck(_, _), _))
+        matches!(
+            o,
+            TraceOp::Guard {
+                kind: GuardKind::BoundsCheck(_, _),
+                check: _
+            }
+        )
     })
     .expect("BoundsCheck guard missing");
     let list_get_pos =
@@ -390,8 +514,14 @@ fn loop_variant_idx_keeps_list_get_inside() {
     let counter_base = b.fresh_ssa();
     let idx_inside = b.fresh_ssa();
     let dst = b.fresh_ssa();
-    b.append(TraceOp::ConstI64(list_ptr, 0x1000));
-    b.append(TraceOp::ConstI64(counter_base, 0));
+    b.append(TraceOp::ConstI64 {
+        dst: list_ptr,
+        value: 0x1000,
+    });
+    b.append(TraceOp::ConstI64 {
+        dst: counter_base,
+        value: 0,
+    });
     b.append(TraceOp::MarkLoopHead {
         loop_id: 0,
         phis: vec![],
@@ -400,11 +530,15 @@ fn loop_variant_idx_keeps_list_get_inside() {
     // SSA without dragging in MarkLoopHead φ wiring. Offset 24 sits
     // outside F-D7-G's StringRef ptr/len hoist window (0 / 8), so the
     // Load itself stays inside the body and feeds the BoundsCheck.
-    b.append(TraceOp::Load(idx_inside, counter_base, Offset(24)));
-    b.append(TraceOp::Guard(
-        GuardKind::BoundsCheck(idx_inside, list_ptr),
-        idx_inside,
-    ));
+    b.append(TraceOp::Load {
+        dst: idx_inside,
+        base: counter_base,
+        offset: Offset(24),
+    });
+    b.append(TraceOp::Guard {
+        kind: GuardKind::BoundsCheck(idx_inside, list_ptr),
+        check: idx_inside,
+    });
     b.append(TraceOp::ListGet {
         dst,
         list_ptr,
@@ -419,7 +553,13 @@ fn loop_variant_idx_keeps_list_get_inside() {
     let head_idx = position(&b.ops, |o| o.is_loop_head()).unwrap();
     let list_get_pos = position(&b.ops, |o| matches!(o, TraceOp::ListGet { .. })).unwrap();
     let guard_pos = position(&b.ops, |o| {
-        matches!(o, TraceOp::Guard(GuardKind::BoundsCheck(_, _), _))
+        matches!(
+            o,
+            TraceOp::Guard {
+                kind: GuardKind::BoundsCheck(_, _),
+                check: _
+            }
+        )
     })
     .unwrap();
     assert!(
@@ -444,8 +584,14 @@ fn loop_invariant_dict_lookup_lifts_out_of_loop() {
     let dict_ptr = b.fresh_ssa();
     let key_ptr = b.fresh_ssa();
     let dst = b.fresh_ssa();
-    b.append(TraceOp::ConstI64(dict_ptr, 0x2000));
-    b.append(TraceOp::ConstI64(key_ptr, 0x3000));
+    b.append(TraceOp::ConstI64 {
+        dst: dict_ptr,
+        value: 0x2000,
+    });
+    b.append(TraceOp::ConstI64 {
+        dst: key_ptr,
+        value: 0x3000,
+    });
     b.append(TraceOp::MarkLoopHead {
         loop_id: 0,
         phis: vec![],
@@ -481,8 +627,14 @@ fn loop_variant_key_keeps_dict_lookup_inside() {
     let key_base = b.fresh_ssa();
     let key_ptr_inside = b.fresh_ssa();
     let dst = b.fresh_ssa();
-    b.append(TraceOp::ConstI64(dict_ptr, 0x2000));
-    b.append(TraceOp::ConstI64(key_base, 0));
+    b.append(TraceOp::ConstI64 {
+        dst: dict_ptr,
+        value: 0x2000,
+    });
+    b.append(TraceOp::ConstI64 {
+        dst: key_base,
+        value: 0,
+    });
     b.append(TraceOp::MarkLoopHead {
         loop_id: 0,
         phis: vec![],
@@ -490,7 +642,11 @@ fn loop_variant_key_keeps_dict_lookup_inside() {
     // Offset 24 avoids F-D7-G's StringRef ptr/len hoist window so the
     // synthesised loop-variant Load stays inside the body and the
     // DictLookup's key_ptr input remains loop-carried.
-    b.append(TraceOp::Load(key_ptr_inside, key_base, Offset(24)));
+    b.append(TraceOp::Load {
+        dst: key_ptr_inside,
+        base: key_base,
+        offset: Offset(24),
+    });
     b.append(TraceOp::DictLookup {
         dst,
         dict_ptr,
@@ -520,8 +676,14 @@ fn loop_variant_bounds_check_stays_inside() {
     let list_ptr = b.fresh_ssa();
     let counter_base = b.fresh_ssa();
     let idx = b.fresh_ssa();
-    b.append(TraceOp::ConstI64(list_ptr, 0x1000));
-    b.append(TraceOp::ConstI64(counter_base, 0));
+    b.append(TraceOp::ConstI64 {
+        dst: list_ptr,
+        value: 0x1000,
+    });
+    b.append(TraceOp::ConstI64 {
+        dst: counter_base,
+        value: 0,
+    });
     b.append(TraceOp::MarkLoopHead {
         loop_id: 0,
         phis: vec![],
@@ -529,8 +691,15 @@ fn loop_variant_bounds_check_stays_inside() {
     // Offset 24: see F-D7-G note in the sister tests above — keeps the
     // Load loop-internal so the BoundsCheck sees a true loop-variant
     // `idx`.
-    b.append(TraceOp::Load(idx, counter_base, Offset(24)));
-    b.append(TraceOp::Guard(GuardKind::BoundsCheck(idx, list_ptr), idx));
+    b.append(TraceOp::Load {
+        dst: idx,
+        base: counter_base,
+        offset: Offset(24),
+    });
+    b.append(TraceOp::Guard {
+        kind: GuardKind::BoundsCheck(idx, list_ptr),
+        check: idx,
+    });
     b.append(TraceOp::MarkLoopBack {
         loop_id: 0,
         next_values: vec![],
@@ -539,7 +708,13 @@ fn loop_variant_bounds_check_stays_inside() {
     LICM.run(&mut b);
     let head_idx = position(&b.ops, |o| o.is_loop_head()).unwrap();
     let guard_pos = position(&b.ops, |o| {
-        matches!(o, TraceOp::Guard(GuardKind::BoundsCheck(_, _), _))
+        matches!(
+            o,
+            TraceOp::Guard {
+                kind: GuardKind::BoundsCheck(_, _),
+                check: _
+            }
+        )
     })
     .unwrap();
     assert!(
@@ -556,15 +731,15 @@ fn non_bounds_guards_remain_pinned_even_when_invariant() {
     // semantics for non-bounds guards.
     let mut b = TraceBuffer::new();
     let v = b.fresh_ssa();
-    b.append(TraceOp::ConstI64(v, 7));
+    b.append(TraceOp::ConstI64 { dst: v, value: 7 });
     b.append(TraceOp::MarkLoopHead {
         loop_id: 0,
         phis: vec![],
     });
-    b.append(TraceOp::Guard(
-        GuardKind::TypeCheck(v, ObservedType::I64),
-        v,
-    ));
+    b.append(TraceOp::Guard {
+        kind: GuardKind::TypeCheck(v, ObservedType::I64),
+        check: v,
+    });
     b.append(TraceOp::MarkLoopBack {
         loop_id: 0,
         next_values: vec![],
@@ -595,12 +770,19 @@ fn loop_invariant_string_payload_ptr_load_lifts_out_of_loop() {
     let str_ref = b.fresh_ssa();
     let ptr_dst = b.fresh_ssa();
     // String SSA defined OUTSIDE the loop — canonical invariant case.
-    b.append(TraceOp::ConstI64(str_ref, 0xdead_0000));
+    b.append(TraceOp::ConstI64 {
+        dst: str_ref,
+        value: 0xdead_0000,
+    });
     b.append(TraceOp::MarkLoopHead {
         loop_id: 0,
         phis: vec![],
     });
-    b.append(TraceOp::Load(ptr_dst, str_ref, Offset(0))); // StringRef::ptr
+    b.append(TraceOp::Load {
+        dst: ptr_dst,
+        base: str_ref,
+        offset: Offset(0),
+    }); // StringRef::ptr
     b.append(TraceOp::MarkLoopBack {
         loop_id: 0,
         next_values: vec![],
@@ -608,7 +790,17 @@ fn loop_invariant_string_payload_ptr_load_lifts_out_of_loop() {
 
     let r = LICM.run(&mut b);
     let head_idx = position(&b.ops, |o| o.is_loop_head()).expect("head missing");
-    let load_idx = position(&b.ops, |o| matches!(o, TraceOp::Load(_, _, _))).expect("load missing");
+    let load_idx = position(&b.ops, |o| {
+        matches!(
+            o,
+            TraceOp::Load {
+                dst: _,
+                base: _,
+                offset: _
+            }
+        )
+    })
+    .expect("load missing");
     assert!(
         load_idx < head_idx,
         "Load at offset 0 must hoist above MarkLoopHead, found at {load_idx} vs head {head_idx}"
@@ -621,12 +813,19 @@ fn loop_invariant_string_payload_len_load_lifts_out_of_loop() {
     let mut b = TraceBuffer::new();
     let str_ref = b.fresh_ssa();
     let len_dst = b.fresh_ssa();
-    b.append(TraceOp::ConstI64(str_ref, 0xbeef_0000));
+    b.append(TraceOp::ConstI64 {
+        dst: str_ref,
+        value: 0xbeef_0000,
+    });
     b.append(TraceOp::MarkLoopHead {
         loop_id: 0,
         phis: vec![],
     });
-    b.append(TraceOp::Load(len_dst, str_ref, Offset(8))); // StringRef::len
+    b.append(TraceOp::Load {
+        dst: len_dst,
+        base: str_ref,
+        offset: Offset(8),
+    }); // StringRef::len
     b.append(TraceOp::MarkLoopBack {
         loop_id: 0,
         next_values: vec![],
@@ -634,7 +833,17 @@ fn loop_invariant_string_payload_len_load_lifts_out_of_loop() {
 
     let r = LICM.run(&mut b);
     let head_idx = position(&b.ops, |o| o.is_loop_head()).unwrap();
-    let load_idx = position(&b.ops, |o| matches!(o, TraceOp::Load(_, _, _))).unwrap();
+    let load_idx = position(&b.ops, |o| {
+        matches!(
+            o,
+            TraceOp::Load {
+                dst: _,
+                base: _,
+                offset: _
+            }
+        )
+    })
+    .unwrap();
     assert!(
         load_idx < head_idx,
         "Load at offset 8 must hoist above MarkLoopHead"
@@ -654,12 +863,19 @@ fn loop_carried_base_keeps_string_payload_load_inside() {
     let init = b.fresh_ssa();
     let phi = b.fresh_ssa();
     let len_dst = b.fresh_ssa();
-    b.append(TraceOp::ConstI64(init, 0xcafe));
+    b.append(TraceOp::ConstI64 {
+        dst: init,
+        value: 0xcafe,
+    });
     b.append(TraceOp::MarkLoopHead {
         loop_id: 0,
         phis: vec![LoopPhi::new(init, phi)],
     });
-    b.append(TraceOp::Load(len_dst, phi, Offset(8))); // base = phi → variant
+    b.append(TraceOp::Load {
+        dst: len_dst,
+        base: phi,
+        offset: Offset(8),
+    }); // base = phi → variant
     b.append(TraceOp::MarkLoopBack {
         loop_id: 0,
         next_values: vec![phi],
@@ -667,7 +883,17 @@ fn loop_carried_base_keeps_string_payload_load_inside() {
 
     LICM.run(&mut b);
     let head_idx = position(&b.ops, |o| o.is_loop_head()).unwrap();
-    let load_idx = position(&b.ops, |o| matches!(o, TraceOp::Load(_, _, _))).unwrap();
+    let load_idx = position(&b.ops, |o| {
+        matches!(
+            o,
+            TraceOp::Load {
+                dst: _,
+                base: _,
+                offset: _
+            }
+        )
+    })
+    .unwrap();
     assert!(
         load_idx > head_idx,
         "Load against a loop-carried base must remain inside the loop body"
@@ -684,15 +910,32 @@ fn in_loop_store_blocks_string_payload_load_hoist() {
     let sink_base = b.fresh_ssa();
     let writes = b.fresh_ssa();
     let len_dst = b.fresh_ssa();
-    b.append(TraceOp::ConstI64(str_ref, 0xfeed_0000));
-    b.append(TraceOp::ConstI64(sink_base, 0x1));
-    b.append(TraceOp::ConstI64(writes, 7));
+    b.append(TraceOp::ConstI64 {
+        dst: str_ref,
+        value: 0xfeed_0000,
+    });
+    b.append(TraceOp::ConstI64 {
+        dst: sink_base,
+        value: 0x1,
+    });
+    b.append(TraceOp::ConstI64 {
+        dst: writes,
+        value: 7,
+    });
     b.append(TraceOp::MarkLoopHead {
         loop_id: 0,
         phis: vec![],
     });
-    b.append(TraceOp::Load(len_dst, str_ref, Offset(0)));
-    b.append(TraceOp::Store(sink_base, Offset(0), writes));
+    b.append(TraceOp::Load {
+        dst: len_dst,
+        base: str_ref,
+        offset: Offset(0),
+    });
+    b.append(TraceOp::Store {
+        base: sink_base,
+        offset: Offset(0),
+        src: writes,
+    });
     b.append(TraceOp::MarkLoopBack {
         loop_id: 0,
         next_values: vec![],
@@ -700,7 +943,17 @@ fn in_loop_store_blocks_string_payload_load_hoist() {
 
     LICM.run(&mut b);
     let head_idx = position(&b.ops, |o| o.is_loop_head()).unwrap();
-    let load_idx = position(&b.ops, |o| matches!(o, TraceOp::Load(_, _, _))).unwrap();
+    let load_idx = position(&b.ops, |o| {
+        matches!(
+            o,
+            TraceOp::Load {
+                dst: _,
+                base: _,
+                offset: _
+            }
+        )
+    })
+    .unwrap();
     assert!(
         load_idx > head_idx,
         "Load must NOT hoist when the loop body contains a Store — conservative alias model"
@@ -718,15 +971,26 @@ fn in_loop_recoverable_write_blocks_string_payload_load_hoist() {
     let bv = b.fresh_ssa();
     let q = b.fresh_ssa();
     let len_dst = b.fresh_ssa();
-    b.append(TraceOp::ConstI64(str_ref, 0xfeed_0000));
-    b.append(TraceOp::ConstI64(a, 100));
-    b.append(TraceOp::ConstI64(bv, 5));
+    b.append(TraceOp::ConstI64 {
+        dst: str_ref,
+        value: 0xfeed_0000,
+    });
+    b.append(TraceOp::ConstI64 { dst: a, value: 100 });
+    b.append(TraceOp::ConstI64 { dst: bv, value: 5 });
     b.append(TraceOp::MarkLoopHead {
         loop_id: 0,
         phis: vec![],
     });
-    b.append(TraceOp::Load(len_dst, str_ref, Offset(8)));
-    b.append(TraceOp::Div(q, a, bv));
+    b.append(TraceOp::Load {
+        dst: len_dst,
+        base: str_ref,
+        offset: Offset(8),
+    });
+    b.append(TraceOp::Div {
+        dst: q,
+        lhs: a,
+        rhs: bv,
+    });
     b.append(TraceOp::MarkLoopBack {
         loop_id: 0,
         next_values: vec![],
@@ -734,7 +998,17 @@ fn in_loop_recoverable_write_blocks_string_payload_load_hoist() {
 
     LICM.run(&mut b);
     let head_idx = position(&b.ops, |o| o.is_loop_head()).unwrap();
-    let load_idx = position(&b.ops, |o| matches!(o, TraceOp::Load(_, _, _))).unwrap();
+    let load_idx = position(&b.ops, |o| {
+        matches!(
+            o,
+            TraceOp::Load {
+                dst: _,
+                base: _,
+                offset: _
+            }
+        )
+    })
+    .unwrap();
     assert!(
         load_idx > head_idx,
         "Load must NOT hoist when the loop body contains a RecoverableWrite op"
@@ -761,9 +1035,20 @@ fn local_get_haystack_and_payload_load_hoist_together() {
     // a loop-invariant `s` arg: LocalGet first, then the two payload
     // loads, then the inline scan (omitted here — we only assert the
     // payload deref hoists).
-    b.append(TraceOp::LocalGet(haystack, 1));
-    b.append(TraceOp::Load(ptr, haystack, Offset(0)));
-    b.append(TraceOp::Load(len, haystack, Offset(8)));
+    b.append(TraceOp::LocalGet {
+        dst: haystack,
+        slot_idx: 1,
+    });
+    b.append(TraceOp::Load {
+        dst: ptr,
+        base: haystack,
+        offset: Offset(0),
+    });
+    b.append(TraceOp::Load {
+        dst: len,
+        base: haystack,
+        offset: Offset(8),
+    });
     b.append(TraceOp::MarkLoopBack {
         loop_id: 0,
         next_values: vec![],
@@ -771,12 +1056,31 @@ fn local_get_haystack_and_payload_load_hoist_together() {
 
     LICM.run(&mut b);
     let head_idx = position(&b.ops, |o| o.is_loop_head()).unwrap();
-    let lg_idx = position(&b.ops, |o| matches!(o, TraceOp::LocalGet(_, _))).unwrap();
+    let lg_idx = position(&b.ops, |o| {
+        matches!(
+            o,
+            TraceOp::LocalGet {
+                dst: _,
+                slot_idx: _
+            }
+        )
+    })
+    .unwrap();
     let loads: Vec<usize> = b
         .ops
         .iter()
         .enumerate()
-        .filter_map(|(i, o)| matches!(o, TraceOp::Load(_, _, _)).then_some(i))
+        .filter_map(|(i, o)| {
+            matches!(
+                o,
+                TraceOp::Load {
+                    dst: _,
+                    base: _,
+                    offset: _
+                }
+            )
+            .then_some(i)
+        })
         .collect();
     assert_eq!(loads.len(), 2, "both Load ops must still be present");
     assert!(
@@ -803,12 +1107,18 @@ fn loop_invariant_not_null_guard_lifts_out_of_loop() {
     let haystack = b.fresh_ssa();
     // Haystack SSA defined OUTSIDE the loop — canonical invariant
     // case (post-LICM-of-LocalGet shape).
-    b.append(TraceOp::ConstI64(haystack, 0xbeef_0000));
+    b.append(TraceOp::ConstI64 {
+        dst: haystack,
+        value: 0xbeef_0000,
+    });
     b.append(TraceOp::MarkLoopHead {
         loop_id: 0,
         phis: vec![],
     });
-    b.append(TraceOp::Guard(GuardKind::NotNull(haystack), haystack));
+    b.append(TraceOp::Guard {
+        kind: GuardKind::NotNull(haystack),
+        check: haystack,
+    });
     b.append(TraceOp::MarkLoopBack {
         loop_id: 0,
         next_values: vec![],
@@ -819,7 +1129,13 @@ fn loop_invariant_not_null_guard_lifts_out_of_loop() {
 
     let head_idx = position(&b.ops, |o| o.is_loop_head()).unwrap();
     let guard_idx = position(&b.ops, |o| {
-        matches!(o, TraceOp::Guard(GuardKind::NotNull(_), _))
+        matches!(
+            o,
+            TraceOp::Guard {
+                kind: GuardKind::NotNull(_),
+                check: _
+            }
+        )
     })
     .unwrap();
     assert!(
@@ -836,7 +1152,10 @@ fn loop_variant_not_null_guard_stays_inside() {
     let mut b = TraceBuffer::new();
     let base = b.fresh_ssa();
     let v = b.fresh_ssa();
-    b.append(TraceOp::ConstI64(base, 0x4000));
+    b.append(TraceOp::ConstI64 {
+        dst: base,
+        value: 0x4000,
+    });
     b.append(TraceOp::MarkLoopHead {
         loop_id: 0,
         phis: vec![],
@@ -844,8 +1163,15 @@ fn loop_variant_not_null_guard_stays_inside() {
     // Offset 24: avoids the F-D7-G allow-listed (0 / 8) offsets so the
     // Load stays inside the loop body — and the NotNull on its `dst`
     // is then loop-variant by construction.
-    b.append(TraceOp::Load(v, base, Offset(24)));
-    b.append(TraceOp::Guard(GuardKind::NotNull(v), v));
+    b.append(TraceOp::Load {
+        dst: v,
+        base,
+        offset: Offset(24),
+    });
+    b.append(TraceOp::Guard {
+        kind: GuardKind::NotNull(v),
+        check: v,
+    });
     b.append(TraceOp::MarkLoopBack {
         loop_id: 0,
         next_values: vec![],
@@ -854,7 +1180,13 @@ fn loop_variant_not_null_guard_stays_inside() {
     LICM.run(&mut b);
     let head_idx = position(&b.ops, |o| o.is_loop_head()).unwrap();
     let guard_idx = position(&b.ops, |o| {
-        matches!(o, TraceOp::Guard(GuardKind::NotNull(_), _))
+        matches!(
+            o,
+            TraceOp::Guard {
+                kind: GuardKind::NotNull(_),
+                check: _
+            }
+        )
     })
     .unwrap();
     assert!(

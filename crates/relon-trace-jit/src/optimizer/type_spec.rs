@@ -60,7 +60,9 @@ impl OptimizerPass for TypeSpec {
         while idx > 0 {
             idx -= 1;
             let needs_guard = match &trace.ops[idx] {
-                TraceOp::Call(_, _, args, eff) if !matches!(eff, EffectClass::Unrecoverable) => {
+                TraceOp::Call { args, effect, .. }
+                    if !matches!(effect, EffectClass::Unrecoverable) =>
+                {
                     args.first()
                         .copied()
                         .and_then(|arg| type_info.get(&arg).copied().map(|t| (arg, t)))
@@ -86,7 +88,7 @@ impl OptimizerPass for TypeSpec {
 
 fn insert_type_guard(trace: &mut TraceBuffer, call_idx: usize, var: SsaVar, ty: ObservedType) {
     let kind = GuardKind::TypeCheck(var, ty);
-    let guard_op = TraceOp::Guard(kind, var);
+    let guard_op = TraceOp::Guard { kind, check: var };
     trace.ops.insert(call_idx, guard_op);
     // Record the GuardSite. The placeholder `deopt_pc` is a sentinel
     // that the v6-gamma lowering must replace with a real PC into the

@@ -104,8 +104,8 @@ pub struct TraceBuffer {
     /// holds the deref'd `(StringRef::ptr, StringRef::len)` payload.
     ///
     /// Populated by the recorder when it emits a `TraceOp::StrContains`:
-    /// it appends `TraceOp::Load(ptr_ssa, haystack, Offset(0))` and
-    /// `TraceOp::Load(len_ssa, haystack, Offset(8))` BEFORE the
+    /// it appends `TraceOp::Load { dst: ptr_ssa, base: haystack, offset: Offset(0) }` and
+    /// `TraceOp::Load { dst: len_ssa, base: haystack, offset: Offset(8) }` BEFORE the
     /// `StrContains` op, then registers the pair here. The emitter's
     /// `emit_str_contains` lowering consults this map and — when the
     /// pair is present — calls the inline scan with
@@ -200,8 +200,8 @@ impl TraceBuffer {
         }
         let mut by_kind: FxHashMap<crate::trace_ir::GuardKind, Vec<usize>> = FxHashMap::default();
         for (pc, op) in self.ops.iter().enumerate() {
-            if let TraceOp::Guard(k, _) = op {
-                by_kind.entry(*k).or_default().push(pc);
+            if let TraceOp::Guard { kind, .. } = op {
+                by_kind.entry(*kind).or_default().push(pc);
             }
         }
         for site in &mut self.guards {
@@ -399,7 +399,7 @@ mod tests {
     fn append_returns_pc_and_grows() {
         let mut b = TraceBuffer::new();
         let dst = b.fresh_ssa();
-        let pc = b.append(TraceOp::ConstI64(dst, 100));
+        let pc = b.append(TraceOp::ConstI64 { dst, value: 100 });
         assert_eq!(pc, 0);
         assert_eq!(b.op_count(), 1);
     }
@@ -417,9 +417,13 @@ mod tests {
     fn into_optimized_freezes_buffer() {
         let mut b = TraceBuffer::new();
         let dst = b.fresh_ssa();
-        b.append(TraceOp::ConstI32(dst, 1));
+        b.append(TraceOp::ConstI32 { dst, value: 1 });
         let base = b.fresh_ssa();
-        b.append(TraceOp::Store(base, Offset(0), dst));
+        b.append(TraceOp::Store {
+            base,
+            offset: Offset(0),
+            src: dst,
+        });
         let t = b.into_optimized();
         assert_eq!(t.op_count(), 2);
         assert_eq!(t.guard_count(), 0);

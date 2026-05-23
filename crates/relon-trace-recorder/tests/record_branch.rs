@@ -16,7 +16,7 @@ fn br_if_emits_guard_op() {
     let guards = buf
         .ops
         .iter()
-        .filter(|o| matches!(o, TraceOp::Guard(_, _)))
+        .filter(|o| matches!(o, TraceOp::Guard { kind: _, check: _ }))
         .count();
     assert!(guards >= 1);
 }

@@ -481,7 +481,7 @@ impl RecorderState {
         Some(dst)
     }
 
-    /// F-D7-B: emit a `TraceOp::StrConcat(dst, lhs, rhs)` op into the
+    /// F-D7-B: emit a `TraceOp::StrConcat { dst, lhs, rhs }` op into the
     /// trace buffer.
     ///
     /// Used by an AST-level / IR-walking driver that has recognised the
@@ -493,7 +493,7 @@ impl RecorderState {
     /// Recorder state side-effects:
     /// - Appends two `NotNull` guards (one per operand) so the trace
     ///   deopts cleanly rather than returning a null `StringRef`.
-    /// - Appends `TraceOp::StrConcat(dst, lhs, rhs)` and rebinds the
+    /// - Appends `TraceOp::StrConcat { dst, lhs, rhs }` and rebinds the
     ///   operand-stack mirror (pops both operands, pushes the dst).
     /// - Records the dst's observed type as `ObservedType::Ptr`
     ///   (`StringRef *` carries through the trace as a pointer slot).
@@ -515,14 +515,14 @@ impl RecorderState {
         self.emit_guard(GuardKind::NotNull(lhs));
         self.emit_guard(GuardKind::NotNull(rhs));
         let dst = self.ssa.alloc();
-        self.buffer.append(TraceOp::StrConcat(dst, lhs, rhs));
+        self.buffer.append(TraceOp::StrConcat { dst, lhs, rhs });
         self.pop_inputs(&[rhs, lhs]);
         self.push_ssa(dst);
         self.buffer.record_type(dst, ObservedType::Ptr);
         Some(dst)
     }
 
-    /// F-D7-B: emit a `TraceOp::StrContains(dst, haystack, needle)` op
+    /// F-D7-B: emit a `TraceOp::StrContains { dst, haystack, needle }` op
     /// into the trace buffer, optionally pre-filling the needle's
     /// const-byte payload so the F-D7-C inline emit path can specialise
     /// the trace into a literal byte-scan instead of a
@@ -539,7 +539,7 @@ impl RecorderState {
     /// Recorder state side-effects:
     /// - Appends a `NotNull` guard on the haystack (mirror of the
     ///   `STDLIB_IDX_CONTAINS` lowering rule).
-    /// - Appends `TraceOp::StrContains(dst, haystack, needle)` and
+    /// - Appends `TraceOp::StrContains { dst, haystack, needle }` and
     ///   updates the operand-stack mirror (pops both operands, pushes
     ///   the dst).
     /// - Records the dst's observed type as `ObservedType::Bool`
@@ -576,8 +576,11 @@ impl RecorderState {
         // scan through `HaystackHandle::Preloaded` whenever the
         // `str_payload` side-table carries an entry for `haystack`.
         self.inject_str_payload_loads(haystack);
-        self.buffer
-            .append(TraceOp::StrContains(dst, haystack, needle));
+        self.buffer.append(TraceOp::StrContains {
+            dst,
+            haystack,
+            needle,
+        });
         self.pop_inputs(&[needle, haystack]);
         self.push_ssa(dst);
         self.buffer.record_type(dst, ObservedType::Bool);
@@ -816,7 +819,7 @@ impl RecorderState {
                     self.emit_guard(g);
                 }
                 // F-D7-H: when the recorder is about to emit a
-                // `TraceOp::StrContains(_, haystack, _)`, also emit
+                // `TraceOp::StrContains { dst: _, haystack, needle: _ }`, also emit
                 // two `TraceOp::Load` ops reading the StringRef
                 // `(ptr, len)` payload upstream — and register the
                 // resulting SSA pair in the buffer's `str_payload`
@@ -936,7 +939,7 @@ impl RecorderState {
                 // needed), so we only emit for `Local`.
                 if first_seen {
                     if let LookupKind::Local(slot_idx) = kind {
-                        self.buffer.append(TraceOp::LocalGet(var, slot_idx));
+                        self.buffer.append(TraceOp::LocalGet { dst: var, slot_idx });
                     }
                 }
                 if let Some(ty) = observed.or(Some(ty_hint)) {
@@ -1057,7 +1060,7 @@ impl RecorderState {
     /// sync.
     ///
     /// F-D7-H: pattern-match a freshly-built `TraceOp` and, when it is
-    /// a `TraceOp::StrContains(_, haystack, _)`, prepend two
+    /// a `TraceOp::StrContains { dst: _, haystack, needle: _ }`, prepend two
     /// `TraceOp::Load` ops reading the StringRef payload from
     /// `haystack` so the F-D7-G LICM pass can hoist them.
     ///
@@ -1068,7 +1071,7 @@ impl RecorderState {
     /// [`Self::inject_str_payload_loads`] explicitly so both call
     /// paths produce the same op stream.
     fn maybe_inject_str_contains_loads(&mut self, op: &TraceOp) {
-        if let TraceOp::StrContains(_, haystack, _) = *op {
+        if let TraceOp::StrContains { haystack, .. } = *op {
             self.inject_str_payload_loads(haystack);
         }
     }
@@ -1106,10 +1109,16 @@ impl RecorderState {
         }
         let ptr_ssa = self.ssa.alloc();
         let len_ssa = self.ssa.alloc();
-        self.buffer
-            .append(TraceOp::Load(ptr_ssa, haystack, Offset(0)));
-        self.buffer
-            .append(TraceOp::Load(len_ssa, haystack, Offset(8)));
+        self.buffer.append(TraceOp::Load {
+            dst: ptr_ssa,
+            base: haystack,
+            offset: Offset(0),
+        });
+        self.buffer.append(TraceOp::Load {
+            dst: len_ssa,
+            base: haystack,
+            offset: Offset(8),
+        });
         // Both reads return i64-typed values (host StringRef is
         // `{ ptr: *const u8, len: usize }`, both 8 bytes on x86_64 /
         // aarch64). Stamp the type into the buffer so any future
@@ -1191,7 +1200,7 @@ impl RecorderState {
         Some(kind)
     }
 
-    /// Append a `TraceOp::Guard(kind, payload)` to the buffer *and*
+    /// Append a `TraceOp::Guard { kind, check: payload }` to the buffer *and*
     /// record the matching [`GuardSite`] in the buffer's side-table.
     ///
     /// v6-γ M4 fix: previously only the linear op was appended; the
@@ -1205,7 +1214,10 @@ impl RecorderState {
     /// generic-frame slot mapping; the cranelift-generic backend
     /// fills it in via [`TraceBuffer::guards`] post-recording.
     fn append_guard_with_site(&mut self, kind: GuardKind, payload: SsaVar) {
-        let trace_pc = self.buffer.append(TraceOp::Guard(kind, payload));
+        let trace_pc = self.buffer.append(TraceOp::Guard {
+            kind,
+            check: payload,
+        });
         // v6-δ M2-B: the recorder bumps `next_external_pc` once per
         // `record_op` call (see the comment in `record_op`). The
         // current op's PC is therefore the current value — DO NOT
@@ -1735,7 +1747,11 @@ mod tests {
         let buf = r.buffer();
         let last = buf.ops.last().expect(">=1 op");
         match last {
-            TraceOp::StrConcat(d, l, rh) => {
+            TraceOp::StrConcat {
+                dst: d,
+                lhs: l,
+                rhs: rh,
+            } => {
                 assert_eq!(*d, dst);
                 assert_eq!(*l, lhs, "lhs must be second-from-top input");
                 assert_eq!(*rh, rhs, "rhs must be top input");
@@ -1789,10 +1805,10 @@ mod tests {
             .ops
             .iter()
             .rev()
-            .find(|op| !matches!(op, TraceOp::Guard(_, _)))
+            .find(|op| !matches!(op, TraceOp::Guard { .. }))
             .expect(">=1 non-guard op");
         assert!(
-            matches!(last_arith, TraceOp::Add(_, _, _)),
+            matches!(last_arith, TraceOp::Add { .. }),
             "expected integer Add, got {last_arith:?}"
         );
     }
@@ -1817,7 +1833,11 @@ mod tests {
         assert_eq!(r.ssa_stack_snapshot(), vec![dst]);
         let last = r.buffer().ops.last().expect(">=1 op");
         match last {
-            TraceOp::StrConcat(d, l, rh) => {
+            TraceOp::StrConcat {
+                dst: d,
+                lhs: l,
+                rhs: rh,
+            } => {
                 assert_eq!(*d, dst);
                 assert_eq!(*l, lhs);
                 assert_eq!(*rh, rhs);
@@ -1850,7 +1870,11 @@ mod tests {
         assert_eq!(r.ssa_stack_snapshot(), vec![dst]);
         let buf = r.buffer();
         match buf.ops.last().expect(">=1 op") {
-            TraceOp::StrContains(d, h, n) => {
+            TraceOp::StrContains {
+                dst: d,
+                haystack: h,
+                needle: n,
+            } => {
                 assert_eq!(*d, dst);
                 assert_eq!(*h, haystack);
                 assert_eq!(*n, needle);
@@ -1958,23 +1982,35 @@ mod tests {
         let load_ops: Vec<&TraceOp> = buf
             .ops
             .iter()
-            .filter(|op| matches!(op, TraceOp::Load(_, _, _)))
+            .filter(|op| matches!(op, TraceOp::Load { .. }))
             .collect();
         assert_eq!(load_ops.len(), 2, "expected two Load ops: {load_ops:?}");
         let load_ptr = load_ops[0];
         let load_len = load_ops[1];
         assert!(
-            matches!(load_ptr, TraceOp::Load(d, b, Offset(0)) if *d == ptr_ssa && *b == haystack),
+            matches!(
+                load_ptr,
+                TraceOp::Load { dst: d, base: b, offset: Offset(0) }
+                    if *d == ptr_ssa && *b == haystack
+            ),
             "first Load mismatch: {load_ptr:?}"
         );
         assert!(
-            matches!(load_len, TraceOp::Load(d, b, Offset(8)) if *d == len_ssa && *b == haystack),
+            matches!(
+                load_len,
+                TraceOp::Load { dst: d, base: b, offset: Offset(8) }
+                    if *d == len_ssa && *b == haystack
+            ),
             "second Load mismatch: {load_len:?}"
         );
         // The StrContains op still sits at the trace tail — the
         // Loads were prepended, not appended.
         match buf.ops.last().expect(">=1 op") {
-            TraceOp::StrContains(d, h, _) => {
+            TraceOp::StrContains {
+                dst: d,
+                haystack: h,
+                ..
+            } => {
                 assert_eq!(*d, dst);
                 assert_eq!(*h, haystack);
             }
@@ -2000,7 +2036,7 @@ mod tests {
             .buffer()
             .ops
             .iter()
-            .filter(|op| matches!(op, TraceOp::Load(_, _, _)))
+            .filter(|op| matches!(op, TraceOp::Load { .. }))
             .count();
         assert_eq!(first, 2);
         r.inject_str_payload_loads(haystack);
@@ -2008,7 +2044,7 @@ mod tests {
             .buffer()
             .ops
             .iter()
-            .filter(|op| matches!(op, TraceOp::Load(_, _, _)))
+            .filter(|op| matches!(op, TraceOp::Load { .. }))
             .count();
         assert_eq!(
             second, 2,

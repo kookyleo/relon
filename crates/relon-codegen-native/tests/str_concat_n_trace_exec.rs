@@ -27,12 +27,15 @@ fn build_concat_n_trace(n: u32) -> TraceBuffer {
     let mut operands = Vec::with_capacity(n as usize);
     for slot in 0..n {
         let v = b.fresh_ssa();
-        b.append(TraceOp::LocalGet(v, slot));
+        b.append(TraceOp::LocalGet {
+            dst: v,
+            slot_idx: slot,
+        });
         operands.push(v);
     }
     let dst = b.fresh_ssa();
     b.append(TraceOp::StrConcatN { dst, operands });
-    b.append(TraceOp::Return(dst));
+    b.append(TraceOp::Return { value: dst });
     b
 }
 

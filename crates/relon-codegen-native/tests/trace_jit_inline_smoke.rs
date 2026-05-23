@@ -38,8 +38,8 @@ use relon_trace_jit::{TraceBuffer, TraceOp};
 fn inline_const_trace(value: i64) -> relon_codegen_native::InlineHostFn {
     let mut buffer = TraceBuffer::new();
     let dst = buffer.fresh_ssa();
-    buffer.append(TraceOp::ConstI64(dst, value));
-    buffer.append(TraceOp::Return(dst));
+    buffer.append(TraceOp::ConstI64 { dst, value });
+    buffer.append(TraceOp::Return { value: dst });
     let trace = std::sync::Arc::new(buffer.into_optimized());
     compile_inline_host_fn(trace).expect("inline compile must succeed for trivial trace")
 }
@@ -65,10 +65,20 @@ fn inline_add_localget_matches_trampoline() {
     let a_i = buffer_inline.fresh_ssa();
     let b_i = buffer_inline.fresh_ssa();
     let sum_i = buffer_inline.fresh_ssa();
-    buffer_inline.append(TraceOp::LocalGet(a_i, 0));
-    buffer_inline.append(TraceOp::LocalGet(b_i, 1));
-    buffer_inline.append(TraceOp::Add(sum_i, a_i, b_i));
-    buffer_inline.append(TraceOp::Return(sum_i));
+    buffer_inline.append(TraceOp::LocalGet {
+        dst: a_i,
+        slot_idx: 0,
+    });
+    buffer_inline.append(TraceOp::LocalGet {
+        dst: b_i,
+        slot_idx: 1,
+    });
+    buffer_inline.append(TraceOp::Add {
+        dst: sum_i,
+        lhs: a_i,
+        rhs: b_i,
+    });
+    buffer_inline.append(TraceOp::Return { value: sum_i });
     let trace_inline = std::sync::Arc::new(buffer_inline.into_optimized());
     let inline_fn = compile_inline_host_fn(trace_inline).expect("inline compile");
 
@@ -77,10 +87,20 @@ fn inline_add_localget_matches_trampoline() {
     let a_t = buffer_tramp.fresh_ssa();
     let b_t = buffer_tramp.fresh_ssa();
     let sum_t = buffer_tramp.fresh_ssa();
-    buffer_tramp.append(TraceOp::LocalGet(a_t, 0));
-    buffer_tramp.append(TraceOp::LocalGet(b_t, 1));
-    buffer_tramp.append(TraceOp::Add(sum_t, a_t, b_t));
-    buffer_tramp.append(TraceOp::Return(sum_t));
+    buffer_tramp.append(TraceOp::LocalGet {
+        dst: a_t,
+        slot_idx: 0,
+    });
+    buffer_tramp.append(TraceOp::LocalGet {
+        dst: b_t,
+        slot_idx: 1,
+    });
+    buffer_tramp.append(TraceOp::Add {
+        dst: sum_t,
+        lhs: a_t,
+        rhs: b_t,
+    });
+    buffer_tramp.append(TraceOp::Return { value: sum_t });
     let tramp_state = TraceJitState::new();
     let tramp_fn = tramp_state
         .jit_compile_buffer_for_fn(0, buffer_tramp)
@@ -126,10 +146,23 @@ fn inline_guard_fire_routes_through_deopt_path() {
     let a = buffer.fresh_ssa();
     let b = buffer.fresh_ssa();
     let sum = buffer.fresh_ssa();
-    buffer.append(TraceOp::LocalGet(a, 0));
-    buffer.append(TraceOp::LocalGet(b, 1));
-    let add_pc = buffer.append(TraceOp::Add(sum, a, b));
-    let guard_pc = buffer.append(TraceOp::Guard(GuardKind::ArithOverflow(sum), SsaVar(0)));
+    buffer.append(TraceOp::LocalGet {
+        dst: a,
+        slot_idx: 0,
+    });
+    buffer.append(TraceOp::LocalGet {
+        dst: b,
+        slot_idx: 1,
+    });
+    let add_pc = buffer.append(TraceOp::Add {
+        dst: sum,
+        lhs: a,
+        rhs: b,
+    });
+    let guard_pc = buffer.append(TraceOp::Guard {
+        kind: GuardKind::ArithOverflow(sum),
+        check: SsaVar(0),
+    });
     buffer.record_guard(
         GuardSite::new(
             guard_pc,
@@ -138,7 +171,7 @@ fn inline_guard_fire_routes_through_deopt_path() {
         )
         .with_ssa_stack_snapshot(Box::new([a, b, sum])),
     );
-    buffer.append(TraceOp::Return(sum));
+    buffer.append(TraceOp::Return { value: sum });
 
     let trace = std::sync::Arc::new(buffer.into_optimized());
     let inline_fn = compile_inline_host_fn(trace).expect("inline compile");
@@ -167,12 +200,18 @@ fn inline_rejects_oversized_trace() {
     // surfaces TraceTooLarge without trying to emit.
     let mut buffer = TraceBuffer::new();
     let mut last = buffer.fresh_ssa();
-    buffer.append(TraceOp::ConstI64(last, 0));
+    buffer.append(TraceOp::ConstI64 {
+        dst: last,
+        value: 0,
+    });
     for _ in 0..(relon_trace_emitter::MAX_INLINE_OPS + 1) {
         last = buffer.fresh_ssa();
-        buffer.append(TraceOp::ConstI64(last, 0));
+        buffer.append(TraceOp::ConstI64 {
+            dst: last,
+            value: 0,
+        });
     }
-    buffer.append(TraceOp::Return(last));
+    buffer.append(TraceOp::Return { value: last });
     let trace = std::sync::Arc::new(buffer.into_optimized());
     match compile_inline_host_fn(trace) {
         Ok(_) => panic!("oversized trace must not compile inline"),
@@ -193,8 +232,11 @@ fn jited_trace_fn_exposes_inline_trace_for_re_emit() {
     // entry that returns the same value.
     let mut buffer = TraceBuffer::new();
     let dst = buffer.fresh_ssa();
-    buffer.append(TraceOp::ConstI64(dst, 0xc0ffee));
-    buffer.append(TraceOp::Return(dst));
+    buffer.append(TraceOp::ConstI64 {
+        dst,
+        value: 0xc0ffee,
+    });
+    buffer.append(TraceOp::Return { value: dst });
     let state = TraceJitState::new();
     let trace_fn = state
         .jit_compile_buffer_for_fn(42, buffer)

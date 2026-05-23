@@ -14,18 +14,18 @@ use relon_trace_jit::{
 fn single_type_check_guard_lowers() {
     let mut b = TraceBuffer::new();
     let v = b.fresh_ssa();
-    b.append(TraceOp::ConstI64(v, 99));
+    b.append(TraceOp::ConstI64 { dst: v, value: 99 });
     b.record_type(v, ObservedType::I64);
-    let pc = b.append(TraceOp::Guard(
-        GuardKind::TypeCheck(v, ObservedType::I64),
-        SsaVar::NONE,
-    ));
+    let pc = b.append(TraceOp::Guard {
+        kind: GuardKind::TypeCheck(v, ObservedType::I64),
+        check: SsaVar::NONE,
+    });
     b.record_guard(GuardSite::new(
         pc,
         ExternalPc(0x1),
         GuardKind::TypeCheck(v, ObservedType::I64),
     ));
-    b.append(TraceOp::Return(v));
+    b.append(TraceOp::Return { value: v });
     emit_and_verify(&b.into_optimized());
 }
 
@@ -34,32 +34,36 @@ fn two_guards_share_deopt_block() {
     let mut b = TraceBuffer::new();
     let a = b.fresh_ssa();
     let bv = b.fresh_ssa();
-    b.append(TraceOp::ConstI64(a, 1));
-    b.append(TraceOp::ConstI64(bv, 2));
+    b.append(TraceOp::ConstI64 { dst: a, value: 1 });
+    b.append(TraceOp::ConstI64 { dst: bv, value: 2 });
     b.record_type(a, ObservedType::I64);
     b.record_type(bv, ObservedType::I64);
 
-    let pc1 = b.append(TraceOp::Guard(
-        GuardKind::TypeCheck(a, ObservedType::I64),
-        SsaVar::NONE,
-    ));
+    let pc1 = b.append(TraceOp::Guard {
+        kind: GuardKind::TypeCheck(a, ObservedType::I64),
+        check: SsaVar::NONE,
+    });
     b.record_guard(GuardSite::new(
         pc1,
         ExternalPc(0x10),
         GuardKind::TypeCheck(a, ObservedType::I64),
     ));
-    let pc2 = b.append(TraceOp::Guard(
-        GuardKind::TypeCheck(bv, ObservedType::I64),
-        SsaVar::NONE,
-    ));
+    let pc2 = b.append(TraceOp::Guard {
+        kind: GuardKind::TypeCheck(bv, ObservedType::I64),
+        check: SsaVar::NONE,
+    });
     b.record_guard(GuardSite::new(
         pc2,
         ExternalPc(0x20),
         GuardKind::TypeCheck(bv, ObservedType::I64),
     ));
     let r = b.fresh_ssa();
-    b.append(TraceOp::Add(r, a, bv));
-    b.append(TraceOp::Return(r));
+    b.append(TraceOp::Add {
+        dst: r,
+        lhs: a,
+        rhs: bv,
+    });
+    b.append(TraceOp::Return { value: r });
     let ctx = emit_and_verify(&b.into_optimized());
     let s = format!("{}", ctx.func);
     // Two guard sites and one shared deopt block → at least two brif's.
@@ -70,15 +74,18 @@ fn two_guards_share_deopt_block() {
 fn guard_failure_path_calls_save_deopt() {
     let mut b = TraceBuffer::new();
     let v = b.fresh_ssa();
-    b.append(TraceOp::ConstI64(v, 0));
+    b.append(TraceOp::ConstI64 { dst: v, value: 0 });
     b.record_type(v, ObservedType::I64);
-    let pc = b.append(TraceOp::Guard(GuardKind::NotNull(v), SsaVar::NONE));
+    let pc = b.append(TraceOp::Guard {
+        kind: GuardKind::NotNull(v),
+        check: SsaVar::NONE,
+    });
     b.record_guard(GuardSite::new(
         pc,
         ExternalPc(0xdeadbeef),
         GuardKind::NotNull(v),
     ));
-    b.append(TraceOp::Return(v));
+    b.append(TraceOp::Return { value: v });
     let ctx = emit_and_verify(&b.into_optimized());
     let s = format!("{}", ctx.func);
     // The deopt block always emits a call into the host hook. The
@@ -93,15 +100,18 @@ fn guard_failure_path_calls_save_deopt() {
 fn arith_overflow_guard_lowers_predicate() {
     let mut b = TraceBuffer::new();
     let v = b.fresh_ssa();
-    b.append(TraceOp::ConstI64(v, 1));
+    b.append(TraceOp::ConstI64 { dst: v, value: 1 });
     b.record_type(v, ObservedType::I32);
-    let pc = b.append(TraceOp::Guard(GuardKind::ArithOverflow(v), SsaVar::NONE));
+    let pc = b.append(TraceOp::Guard {
+        kind: GuardKind::ArithOverflow(v),
+        check: SsaVar::NONE,
+    });
     b.record_guard(GuardSite::new(
         pc,
         ExternalPc(0xaa),
         GuardKind::ArithOverflow(v),
     ));
-    b.append(TraceOp::Return(v));
+    b.append(TraceOp::Return { value: v });
     emit_and_verify(&b.into_optimized());
 }
 
@@ -119,16 +129,23 @@ fn arith_overflow_guard_skips_icmp_with_captured_of_bit() {
     let a = b.fresh_ssa();
     let bv = b.fresh_ssa();
     let dst = b.fresh_ssa();
-    b.append(TraceOp::ConstI64(a, 1));
-    b.append(TraceOp::ConstI64(bv, 2));
-    b.append(TraceOp::Add(dst, a, bv));
-    let pc = b.append(TraceOp::Guard(GuardKind::ArithOverflow(dst), SsaVar::NONE));
+    b.append(TraceOp::ConstI64 { dst: a, value: 1 });
+    b.append(TraceOp::ConstI64 { dst: bv, value: 2 });
+    b.append(TraceOp::Add {
+        dst,
+        lhs: a,
+        rhs: bv,
+    });
+    let pc = b.append(TraceOp::Guard {
+        kind: GuardKind::ArithOverflow(dst),
+        check: SsaVar::NONE,
+    });
     b.record_guard(GuardSite::new(
         pc,
         ExternalPc(0xbb),
         GuardKind::ArithOverflow(dst),
     ));
-    b.append(TraceOp::Return(dst));
+    b.append(TraceOp::Return { value: dst });
 
     let ctx = emit_and_verify(&b.into_optimized());
     let s = format!("{}", ctx.func);
@@ -161,19 +178,29 @@ fn guard_then_load_chain_verifies() {
     let limit = b.fresh_ssa();
     let base = b.fresh_ssa();
     let dst = b.fresh_ssa();
-    b.append(TraceOp::ConstI64(idx, 2));
-    b.append(TraceOp::ConstI64(limit, 5));
-    let pc = b.append(TraceOp::Guard(
-        GuardKind::BoundsCheck(idx, limit),
-        SsaVar::NONE,
-    ));
+    b.append(TraceOp::ConstI64 { dst: idx, value: 2 });
+    b.append(TraceOp::ConstI64 {
+        dst: limit,
+        value: 5,
+    });
+    let pc = b.append(TraceOp::Guard {
+        kind: GuardKind::BoundsCheck(idx, limit),
+        check: SsaVar::NONE,
+    });
     b.record_guard(GuardSite::new(
         pc,
         ExternalPc(0xc0ffee),
         GuardKind::BoundsCheck(idx, limit),
     ));
-    b.append(TraceOp::ConstI64(base, 0x7000));
-    b.append(TraceOp::Load(dst, base, Offset(16)));
-    b.append(TraceOp::Return(dst));
+    b.append(TraceOp::ConstI64 {
+        dst: base,
+        value: 0x7000,
+    });
+    b.append(TraceOp::Load {
+        dst,
+        base,
+        offset: Offset(16),
+    });
+    b.append(TraceOp::Return { value: dst });
     emit_and_verify(&b.into_optimized());
 }
