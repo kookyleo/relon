@@ -1007,6 +1007,13 @@ impl RecorderState {
                     TraceOp::MarkLoopHead { phis, .. } => {
                         let id = self.next_loop_id;
                         self.next_loop_id += 1;
+                        // Push onto open_loops so a matching `end_loop`
+                        // call (or a future Op::EndLoop lowering) pops
+                        // the correct id — mirrors `begin_loop`'s
+                        // bookkeeping. The two MarkLoopHead-emitting
+                        // paths (this one and `begin_loop`) must agree
+                        // on the open-loop stack discipline.
+                        self.open_loops.push(id);
                         TraceOp::MarkLoopHead { loop_id: id, phis }
                     }
                     other => other,
