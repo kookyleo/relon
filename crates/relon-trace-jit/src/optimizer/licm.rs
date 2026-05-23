@@ -47,10 +47,10 @@
 //!    `(base, offset)` clobber set.
 //!
 //! Nested loops are supported via `loop_id`. An op may be hoisted
-//! out of the innermost loop containing it, and the next pass run
-//! can further hoist it out of an outer loop. We do the multi-level
-//! lifting in a single pass by walking loops outside-in and
-//! re-checking after each rewrite.
+//! out of the innermost loop containing it and, in the same pass
+//! run, further hoisted out of an enclosing loop -- we visit loops
+//! innermost-first so the inner-hoisted ops have already landed in
+//! the outer body by the time we examine the outer loop.
 //!
 //! ## Implementation outline
 //!
@@ -58,12 +58,21 @@
 //!    only consider well-formed pairs; an unmatched marker is a
 //!    recorder bug -- LICM logs nothing and leaves the trace alone
 //!    for that loop.
-//! 2. For each pair (innermost first), scan the loop body collecting
-//!    hoistable indices.
-//! 3. Splice the hoistable ops out of the loop and re-insert them
-//!    immediately before the `MarkLoopHead`. Order among the hoisted
-//!    ops is preserved.
-//! 4. After moving ops, rebuild the guard `trace_pc` table because
+//! 2. Sort the pairs deepest-first. Walk the list once: for each
+//!    loop, scan its body collecting hoistable indices and splice
+//!    them out in one shot.
+//! 3. No re-scan / restart is needed between loops. Each splice
+//!    rearranges ops only within `[head_pc, back_pc]`; the span's
+//!    length is preserved, so every other loop's `head_pc` /
+//!    `back_pc` (computed once up front) remains accurate. Outer
+//!    loops naturally see ops hoisted out of an inner loop as part
+//!    of their body when their turn comes, enabling multi-level
+//!    lifting in a single pass.
+//! 4. Within a single loop the scan is also single-pass: we shrink
+//!    the "defined inside" set as we mark ops for hoisting, so a
+//!    chain of dependent invariants (`LocalGet haystack` ->
+//!    `Load(haystack, 0)`) all promote together without restart.
+//! 5. After moving ops, rebuild the guard `trace_pc` table because
 //!    indices shifted.
 //!
 //! ## Ordering
@@ -94,25 +103,16 @@ impl OptimizerPass for LICM {
     fn run(&self, trace: &mut TraceBuffer) -> PassReport {
         let mut report = PassReport::default();
 
-        loop {
-            let loops = collect_loops(&trace.ops);
-            if loops.is_empty() {
-                break;
-            }
-            // Process innermost loops first so an op can subsequently
-            // bubble out further when the enclosing loop is visited
-            // in the next iteration.
-            let mut progressed = false;
-            for lp in &loops {
-                if hoist_one_loop(trace, lp, &mut report) {
-                    progressed = true;
-                    // Restart from a fresh scan -- indices changed.
-                    break;
-                }
-            }
-            if !progressed {
-                break;
-            }
+        // Single `collect_loops` snapshot. Each `hoist_one_loop`
+        // call preserves the [head_pc, back_pc] span length of the
+        // loop it operates on, so every still-pending loop's PCs
+        // remain valid (see module docs, step 3). Innermost-first
+        // order also means an outer loop sees the ops the inner
+        // loop just released as part of its own body, so multi-level
+        // lifting completes in this single forward sweep.
+        let loops = collect_loops(&trace.ops);
+        for lp in &loops {
+            hoist_one_loop(trace, lp, &mut report);
         }
 
         trace.rebind_guard_pcs();
@@ -179,6 +179,12 @@ fn hoist_one_loop(trace: &mut TraceBuffer, lp: &LoopRange, report: &mut PassRepo
     // they behave like loop-local definitions: their value changes
     // every iteration (driven by `MarkLoopBack::next_values`), so any
     // op consuming them must stay inside the loop body.
+    //
+    // We will shrink `inside_defs` as we mark ops for hoisting: once
+    // an op is promoted to the preheader its defs are effectively
+    // "outside" for downstream uses in the same body, which lets a
+    // chain of invariants (`LocalGet haystack` -> `Load(haystack, 0)`
+    // -> `Guard(NotNull(haystack))`) hoist together in one pass.
     let mut inside_defs: HashSet<SsaVar> = (body_start..body_end)
         .flat_map(|i| trace.ops[i].defs())
         .collect();
@@ -204,15 +210,23 @@ fn hoist_one_loop(trace: &mut TraceBuffer, lp: &LoopRange, report: &mut PassRepo
             )
     });
 
-    // Collect candidate indices in order.
+    // Single forward sweep: an op promotes if every input is already
+    // outside (or already promoted earlier in this same sweep). We
+    // strip promoted-op defs from `inside_defs` on the fly so that
+    // dependent invariants further down the body see their input as
+    // "outside" too. Body ops are emitted in def-order, so this never
+    // back-fills — every potential producer has been visited.
     let mut hoist_pcs: Vec<usize> = Vec::new();
     for pc in body_start..body_end {
-        if !is_hoistable(&trace.ops[pc], body_has_writes) {
+        let op = &trace.ops[pc];
+        if !is_hoistable(op, body_has_writes) {
             continue;
         }
-        let inputs = trace.ops[pc].inputs();
-        if inputs.iter().any(|v| inside_defs.contains(v)) {
+        if op.inputs().iter().any(|v| inside_defs.contains(v)) {
             continue;
+        }
+        for v in op.defs() {
+            inside_defs.remove(&v);
         }
         hoist_pcs.push(pc);
     }
@@ -220,33 +234,38 @@ fn hoist_one_loop(trace: &mut TraceBuffer, lp: &LoopRange, report: &mut PassRepo
         return false;
     }
 
-    // Extract the hoisted ops (cloning so we don't have to worry
-    // about index shifting during removal).
-    let hoisted: Vec<TraceOp> = hoist_pcs.iter().map(|&p| trace.ops[p].clone()).collect();
+    // Splice: ops between body_start..body_end at indices in
+    // `hoist_pcs` move to immediately before `head_pc`, preserving
+    // their relative order. The span [head_pc, back_pc] keeps the
+    // same length (K removed + K inserted), which is the invariant
+    // the outer `LICM::run` relies on for single-pass safety.
+    splice_hoists(trace, lp.head_pc, &hoist_pcs);
+    report.ops_replaced += hoist_pcs.len();
+    true
+}
 
-    // Remove from highest pc to lowest so earlier indices stay
-    // valid.
-    let mut hoist_set: HashSet<usize> = hoist_pcs.iter().copied().collect();
+/// Move the ops at `hoist_pcs` (sorted ascending, all in the loop
+/// body) to immediately before `head_pc`, preserving relative order.
+fn splice_hoists(trace: &mut TraceBuffer, head_pc: usize, hoist_pcs: &[usize]) {
+    debug_assert!(hoist_pcs.windows(2).all(|w| w[0] < w[1]));
+    debug_assert!(hoist_pcs.first().is_none_or(|&p| p > head_pc));
+
+    let hoisted: Vec<TraceOp> = hoist_pcs.iter().map(|&p| trace.ops[p].clone()).collect();
+    let mut next_skip = 0usize;
     let mut new_ops: Vec<TraceOp> = Vec::with_capacity(trace.ops.len());
-    let head_pc = lp.head_pc;
     for (pc, op) in trace.ops.drain(..).enumerate() {
         if pc == head_pc {
-            // Insert hoisted ops *before* the head marker.
-            for h in &hoisted {
-                new_ops.push(h.clone());
-            }
+            new_ops.extend(hoisted.iter().cloned());
             new_ops.push(op);
             continue;
         }
-        if hoist_set.remove(&pc) {
-            // Skip -- already prepended above.
+        if next_skip < hoist_pcs.len() && hoist_pcs[next_skip] == pc {
+            next_skip += 1;
             continue;
         }
         new_ops.push(op);
     }
     trace.ops = new_ops;
-    report.ops_replaced += hoisted.len();
-    true
 }
 
 fn is_hoistable(op: &TraceOp, body_has_writes: bool) -> bool {
