@@ -2209,39 +2209,17 @@ fn lower_dict_field(node: &SyntaxNode, source: &str) -> Option<DictFieldOut> {
     // ---- 1. Gather leading attributes + doc comment. -------------------
     let mut decorators_before: Vec<crate::Decorator> = Vec::new();
     let mut directives_before: Vec<crate::Directive> = Vec::new();
-    let mut doc_comment: Option<String> = None;
-    // Doc-comment: leading LINE_COMMENT / BLOCK_COMMENT trivia tokens
-    // *before* the first non-trivia child of DICT_FIELD. We assemble
-    // by reading the source slice from DICT_FIELD start to the start
-    // of the first non-trivia child, then running the legacy
-    // `parse_leading_comments` on it.
+    // Doc-comment: leading LINE_COMMENT / BLOCK_COMMENT trivia *before*
+    // the first non-trivia child of DICT_FIELD. Re-use the shared
+    // `first_non_trivia_offset` helper + `parse_leading_comments`
+    // rather than rolling a private trivia scanner here.
     let field_start: usize = node.text_range().start().into();
-    let mut first_non_trivia_offset: Option<usize> = None;
-    for el in node.children_with_tokens() {
-        match el {
-            rowan::NodeOrToken::Token(t) => {
-                if matches!(
-                    t.kind(),
-                    SyntaxKind::WHITESPACE | SyntaxKind::LINE_COMMENT | SyntaxKind::BLOCK_COMMENT
-                ) {
-                    continue;
-                }
-                first_non_trivia_offset = Some(t.text_range().start().into());
-                break;
-            }
-            rowan::NodeOrToken::Node(n) => {
-                first_non_trivia_offset = Some(n.text_range().start().into());
-                break;
-            }
-        }
-    }
-    if let Some(end_off) = first_non_trivia_offset {
-        if end_off > field_start {
+    let doc_comment: Option<String> = first_non_trivia_offset(node)
+        .filter(|end_off| *end_off > field_start)
+        .and_then(|end_off| {
             let leading_slice = &source[field_start..end_off];
-            let (text, _) = crate::parse_leading_comments(leading_slice);
-            doc_comment = text;
-        }
-    }
+            crate::parse_leading_comments(leading_slice).0
+        });
 
     // ---- 2. Walk children to identify the field shape. ----------------
     // Collect the children in order for dispatch.
@@ -2254,7 +2232,6 @@ fn lower_dict_field(node: &SyntaxNode, source: &str) -> Option<DictFieldOut> {
     let mut closure_node: Option<SyntaxNode> = None;
     let mut in_brack = false;
     let mut after_lt = false;
-    let mut saw_lbrack_already_consumed_type = false;
     // Track whether a top-level COLON has been seen in DICT_FIELD —
     // used to distinguish method-shorthand CLOSURE (COLON inside
     // CLOSURE) from a regular dict-field value that's a closure
@@ -2282,7 +2259,6 @@ fn lower_dict_field(node: &SyntaxNode, source: &str) -> Option<DictFieldOut> {
                 }
                 SyntaxKind::GT if in_brack => {
                     after_lt = false;
-                    saw_lbrack_already_consumed_type = true;
                 }
                 SyntaxKind::IDENT | SyntaxKind::STRING => {
                     if !in_brack && key_token.is_none() && value_expr_ast.is_none() {
@@ -2396,7 +2372,6 @@ fn lower_dict_field(node: &SyntaxNode, source: &str) -> Option<DictFieldOut> {
             },
         }
     }
-    let _ = saw_lbrack_already_consumed_type;
 
     // ---- 3. Spread shape. ---------------------------------------------
     if let Some(sn) = spread_node {
