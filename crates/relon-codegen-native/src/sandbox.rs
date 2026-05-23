@@ -50,11 +50,12 @@
 //! checks to emit; the runtime uses [`SandboxState`] to dispatch and
 //! capture trap reasons.
 
+use arc_swap::ArcSwap;
 use relon_eval_api::RuntimeError;
 use relon_parser::TokenRange;
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Compile-time sandbox configuration. Built once when a
@@ -466,10 +467,13 @@ pub(crate) struct SandboxShared {
     /// per-call state copies the freshest value at dispatch time.
     pub(crate) deadline_ns: AtomicI64,
     /// Active capability vtable. `install_capabilities_mut` swaps the
-    /// `Arc` wholesale; cheap clone-per-call (one atomic inc). The
-    /// mutex is taken only for the duration of the swap / snapshot,
-    /// never held across a JIT dispatch.
-    pub(crate) capabilities: Mutex<Arc<CapabilityVtable>>,
+    /// `Arc` wholesale; cheap clone-per-call (one atomic inc).
+    ///
+    /// Stored as `ArcSwap<CapabilityVtable>` so per-call snapshots are
+    /// a lock-free `arc_swap::Guard::load_full()` — no `Mutex::lock`
+    /// on the dispatch hot path. The wait-free swap path is also
+    /// safe to call from any thread.
+    pub(crate) capabilities: ArcSwap<CapabilityVtable>,
     /// Pointer to the closure-table the evaluator's `Box<[usize]>`
     /// allocation lives at. `0` when the module has no closures.
     /// Stored as raw `AtomicUsize` because the table allocation lives
@@ -489,31 +493,25 @@ impl SandboxShared {
     pub(crate) fn new(capabilities: Arc<CapabilityVtable>) -> Self {
         Self {
             deadline_ns: AtomicI64::new(i64::MAX),
-            capabilities: Mutex::new(capabilities),
+            capabilities: ArcSwap::new(capabilities),
             closure_table_base: std::sync::atomic::AtomicUsize::new(0),
             epoch: Instant::now(),
         }
     }
 
-    /// Snapshot the current capability vtable. The mutex is released
-    /// before the snapshot is returned; the JIT dispatch only ever
-    /// holds an `Arc<CapabilityVtable>` clone, never the lock.
+    /// Snapshot the current capability vtable. Lock-free: one acquire
+    /// load + one atomic refcount inc via `ArcSwap::load_full`. The
+    /// JIT dispatch only ever holds an `Arc<CapabilityVtable>` clone,
+    /// never any kind of lock.
     pub(crate) fn capabilities_snapshot(&self) -> Arc<CapabilityVtable> {
-        Arc::clone(
-            &self
-                .capabilities
-                .lock()
-                .expect("sandbox capabilities mutex poisoned"),
-        )
+        self.capabilities.load_full()
     }
 
     /// Swap the active capability vtable. Used by
-    /// `install_capabilities_mut` on the evaluator surface.
+    /// `install_capabilities_mut` on the evaluator surface. Wait-free
+    /// for the dispatch readers; only the writer pays the swap cost.
     pub(crate) fn set_capabilities(&self, vt: Arc<CapabilityVtable>) {
-        *self
-            .capabilities
-            .lock()
-            .expect("sandbox capabilities mutex poisoned") = vt;
+        self.capabilities.store(vt);
     }
 
     /// Update the closure-table base pointer. Called once after the
@@ -584,6 +582,39 @@ impl SandboxState {
             closure_table_base: UnsafeCell::new(closure_base),
             epoch: template.epoch,
             capabilities: template.capabilities_snapshot(),
+        }
+    }
+
+    /// Re-anchor a pooled (already-allocated) `SandboxState` against
+    /// `template`. Used by the thread-local pool in
+    /// `evaluator::run_main` to avoid the `Box::new` + drop pair per
+    /// dispatch — we keep the allocation around and refresh the
+    /// per-call fields (deadline / capabilities / closure-base / trap)
+    /// from the template. The `UnsafeCell` arena / scratch fields are
+    /// zeroed by `install_arena` immediately afterwards, so we don't
+    /// touch them here.
+    ///
+    /// The `&mut self` receiver matches the pool's exclusive ownership
+    /// of the boxed state for the dispatch's duration — no two threads
+    /// can ever see the same pooled `SandboxState` because the pool
+    /// itself is a per-thread `RefCell`.
+    pub(crate) fn refresh_from_template(&mut self, template: &SandboxShared) {
+        let deadline = template.deadline_ns.load(Ordering::Relaxed);
+        let closure_base = template
+            .closure_table_base
+            .load(std::sync::atomic::Ordering::Relaxed);
+        // The atomics are written non-atomically through `&mut self`
+        // (no concurrent reader: the pool holds the only reference).
+        self.deadline_ns.store(deadline, Ordering::Relaxed);
+        self.trap_code.store(0, Ordering::Relaxed);
+        // `epoch` is `Copy` (Instant); refresh it in case the caller
+        // swapped to a different evaluator with a different template.
+        self.epoch = template.epoch;
+        self.capabilities = template.capabilities_snapshot();
+        // SAFETY: pool ownership is exclusive (`&mut self`), so the
+        // `UnsafeCell` contents are unaliased here.
+        unsafe {
+            *self.closure_table_base.get() = closure_base;
         }
     }
 

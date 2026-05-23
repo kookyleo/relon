@@ -67,6 +67,76 @@ enum EntryPtr {
     Buffer(BufferEntryFn),
 }
 
+thread_local! {
+    /// Per-thread `Box<SandboxState>` slot reused across `run_main`
+    /// dispatches on this thread. The pool elides the per-call
+    /// `Box::new` (heap alloc ~30-50 ns on x86_64 glibc) by parking
+    /// the previous dispatch's allocation here on the way out and
+    /// fishing it back at the top of the next dispatch.
+    ///
+    /// Stored as `RefCell<Option<Box<_>>>` so a reentrant dispatch
+    /// (host helper calling back into `run_main` on the same thread)
+    /// sees an empty slot and falls back to a fresh `Box::new`. The
+    /// inner call then races to its own freshly-allocated state; the
+    /// outer call still owns the slot we tried to borrow. The
+    /// `RefCell` itself is never contended across threads because
+    /// `thread_local!` gives each thread its own copy.
+    static SANDBOX_STATE_POOL: std::cell::RefCell<Option<Box<SandboxState>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// RAII handle owning the dispatch-call's `SandboxState`. On drop,
+/// attempts to park the boxed state back into the thread-local pool
+/// so the next dispatch on this thread can skip the `Box::new`.
+///
+/// Reentrant dispatches on the same thread (host helper calling back
+/// into `run_main`) are naturally handled: the inner call observes
+/// an empty pool slot (because the outer call already took the box),
+/// allocates fresh, and parks on drop. The outer call's drop then
+/// sees the slot already filled by the inner call and silently lets
+/// its own box drop — net pool size stays at one box per thread.
+struct PooledSandboxState {
+    state: Option<Box<SandboxState>>,
+}
+
+impl PooledSandboxState {
+    /// Acquire a `SandboxState` configured against `template`. Prefers
+    /// the thread-local pool; falls back to a fresh `Box::new` when
+    /// the slot is empty (cold thread or reentrant call).
+    fn acquire(template: &SandboxShared) -> Self {
+        let taken =
+            SANDBOX_STATE_POOL.with(|slot| slot.try_borrow_mut().ok().and_then(|mut b| b.take()));
+        let boxed = match taken {
+            Some(mut existing) => {
+                existing.refresh_from_template(template);
+                existing
+            }
+            None => Box::new(SandboxState::from_template(template)),
+        };
+        Self { state: Some(boxed) }
+    }
+
+    fn state(&self) -> &SandboxState {
+        // Always populated until Drop runs.
+        self.state.as_deref().expect("sandbox state taken twice")
+    }
+}
+
+impl Drop for PooledSandboxState {
+    fn drop(&mut self) {
+        let Some(boxed) = self.state.take() else {
+            return;
+        };
+        SANDBOX_STATE_POOL.with(|slot| {
+            if let Ok(mut borrow) = slot.try_borrow_mut() {
+                if borrow.is_none() {
+                    *borrow = Some(boxed);
+                }
+            }
+        });
+    }
+}
+
 /// Optional schema metadata kept alive for buffer-protocol modules
 /// — populated from `lower_workspace_single` via [`Self::from_source`].
 #[derive(Clone)]
@@ -1161,11 +1231,14 @@ impl CraneliftAotEvaluator {
         // boxed state, so the in-place arena / trap_code writes that
         // used to race are now thread-local.
         //
-        // `Box::new` is ~30-50 ns on x86_64 glibc; an upcoming follow-
-        // up can pool these via thread_local!{} if profiling shows the
-        // overhead matters on the dispatch hot path.
-        let state = Box::new(SandboxState::from_template(&self.sandbox_shared));
-        let state_ptr: *const SandboxState = &*state;
+        // P2-10 follow-up: `PooledSandboxState::acquire` looks up the
+        // per-thread pool first and only falls back to `Box::new` on a
+        // cold thread / reentrant call. The boxed state is parked
+        // back into the pool on drop so the next dispatch on this
+        // thread skips the heap alloc (~30-50 ns on x86_64 glibc).
+        let pooled = PooledSandboxState::acquire(&self.sandbox_shared);
+        let state = pooled.state();
+        let state_ptr: *const SandboxState = state;
         // De-tagged inline-cached entry pointer (single field load)
         // beats matching on the `entry_fn` enum discriminant each
         // invoke.
@@ -1182,7 +1255,7 @@ impl CraneliftAotEvaluator {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
             entry(state_ptr, args[0], args[1], args[2], args[3])
         }));
-        self.dispatch_post(&state, result)
+        self.dispatch_post(state, result)
     }
 
     /// Same as [`Self::invoke_buffer_entry_with_scratch`] without an
@@ -1224,8 +1297,12 @@ impl CraneliftAotEvaluator {
         // `invoke_legacy_entry` for the rationale; the buffer entry
         // additionally writes the arena pointer / length / scratch
         // base, which previously raced on a shared Arc<SandboxState>.
-        let state = Box::new(SandboxState::from_template(&self.sandbox_shared));
-        let state_ptr: *const SandboxState = &*state;
+        //
+        // P2-10 follow-up: pooled via `PooledSandboxState` so the
+        // boxed state lives across dispatches on the same thread.
+        let pooled = PooledSandboxState::acquire(&self.sandbox_shared);
+        let state = pooled.state();
+        let state_ptr: *const SandboxState = state;
         // SAFETY: `arena` is borrowed mutably here and stays valid
         // through the JIT call's lifetime (`arena` outlives this
         // function). The per-call `state` is the unique owner of the
@@ -1262,7 +1339,7 @@ impl CraneliftAotEvaluator {
                 caps as i64,
             )
         }));
-        self.dispatch_post(&state, result)
+        self.dispatch_post(state, result)
     }
 
     /// Post-process a JIT-call result: surface typed traps recorded in
