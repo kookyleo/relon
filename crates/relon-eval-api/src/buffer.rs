@@ -1833,6 +1833,51 @@ mod tests {
         assert_eq!(reader.read_string("name").expect("read name"), "hello");
     }
 
+    /// F-5 wire-format smoke gate: pin the exact tail-record bytes a
+    /// `write_string` call emits. The buffer-protocol producer (this
+    /// fn) and every consumer (cranelift `emit_read_string_len`,
+    /// stdlib `string_*` bodies indexing payload at `s + 4`,
+    /// `decode_pointer_header` in `read_string`) all hard-code the
+    /// `[len:u32 LE][payload]` shape. Flipping to the 12-byte
+    /// `[len_with_ascii_flag:u32 LE][hash:u64 LE][payload]` planned
+    /// by `docs/internal/review-improvement-169-conststring-wire-full-2026-05-22.md`
+    /// must update producer + every consumer atomically; this test
+    /// fires the moment the producer side drifts so the migrant cannot
+    /// silently land a partial revision.
+    ///
+    /// See also `relon-codegen-native::codegen::const_pool::
+    /// opvisitor_emits_const_string_record_in_declaration_order` for
+    /// the matching pin on the cranelift const-pool producer.
+    #[test]
+    fn write_string_wire_format_smoke_gate() {
+        let schema = Schema {
+            name: "Greet".into(),
+            generics: vec![],
+            fields: vec![field("name", TypeRepr::String)],
+        };
+        let layout = SchemaLayout::offsets_for(&schema).expect("layout");
+        let mut builder = BufferBuilder::new(&layout, &schema.fields);
+        builder.write_string("name", "hello").expect("write name");
+        let bytes = builder.finish();
+
+        // Fixed-area: a 4-byte pointer slot at offset 0 carrying the
+        // tail-record absolute offset. The schema has no other fields,
+        // so root_size = 4, root_align = 4 -> tail starts at offset 4.
+        assert_eq!(bytes.len(), 4 + 4 + 5, "fixed-area + header + payload");
+        let ptr = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
+        assert_eq!(ptr, 4, "pointer slot must reference offset 4");
+
+        // Tail record at offset 4: `[len: u32 LE][payload]`. Migration
+        // to the 12-byte header changes this to
+        // `[len_with_ascii_flag: u32 LE][hash: u64 LE][payload]`.
+        assert_eq!(
+            &bytes[4..8],
+            &5u32.to_le_bytes(),
+            "tail record len prefix must be u32 LE of payload length"
+        );
+        assert_eq!(&bytes[8..13], b"hello", "payload follows the 4-byte header");
+    }
+
     #[test]
     fn empty_string_roundtrips() {
         // Zero-byte payload still gets a length prefix, so the reader

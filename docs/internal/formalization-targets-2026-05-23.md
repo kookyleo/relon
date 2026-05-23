@@ -28,7 +28,7 @@
 | F-2 | Kani bounded model check JIT str/dict layout arithmetic | 2-3d | 中-高 | trace-jit 加新 runtime helper / dict layout 改 |
 | F-3 | Capability/sandbox TLA+ spec | 1-2w | 中 | 加 NativeFnGate variant / cache 拓展 / multi-tenant 出 RFC |
 | F-4 | Trace JIT deopt invariant prop-test | 3-5d | 中-高 | 调 deopt site / guard kind 加 variant |
-| F-5 | wire-format smoke gate for ConstString migration | 1d | 中 | 想推 ConstString 4B→12B wire flip 之前 |
+| F-5 | wire-format smoke gate for ConstString migration | **DONE** | 中 | byte-pin tests + cross-link doc landed 2026-05-23 |
 
 ### F-1 Miri CI sweep — DONE 2026-05-23
 
@@ -112,15 +112,20 @@ cache_state: [path -> {Empty, Written(hmac_tag), Tampered}]
 
 **Win**：catches deopt regressions that current ratchet only flags as outcome diff (i.e. catches "answer correct but state corrupted" — silent UB precursor).
 
-### F-5 wire-format smoke gate
+### F-5 wire-format smoke gate — DONE 2026-05-23
 
-**Why**：`docs/internal/review-improvement-169-conststring-wire-full-2026-05-22.md` Plan C 文档化了 ConstString 4B→12B wire flip 的 5 个 blocker，第一个就是 "缺 wire_format_smoke test"。当前 corpus_differential 检查答案不查字节，所以 misclassification 可能携错字节但 MatchOk。
+**位置**：
+- `relon-eval-api::buffer::write_string_wire_format_smoke_gate` — buffer-protocol producer 侧 byte-pin
+- `relon-codegen-native::codegen::const_pool::opvisitor_emits_const_string_record_in_declaration_order` — cranelift const-pool producer 侧 byte-pin (扩了 doc 包含 migration trigger 描述)
 
-**Implementation**：for each backend pair (tree_walk × bytecode / cranelift / trace_jit)，对 fixed corpus 比对 emit output 的精确字节（schema header + payload bytes）。差一字节就 ratchet fail。
+两 test 互相 cross-link，doc 明确指向 `review-improvement-169-conststring-wire-full-2026-05-22.md` 的 5 个 blocker。任何修改任一 producer 的字节 layout 都会立即 fire 这两个 test，强制 migrant 在同一 commit 内更新所有 5 个 consumer (#164 silent-corruption regression 的根因被 ratchet 锁住)。
 
-**Cost**：1 天写 harness，之后维护成本 ≈ 0。
+**未做** (留 follow-up)：
+- consumer-side 配对 pin 在 `decode_pointer_header` / `emit_read_string_len` / `emit_tail_record_from_absolute` 各加一个 byte-shape test
+- bytecode VM `StrConst` arena 写法不是 wire format (走 arena handle)，无需 pin
 
-**Win**：解锁后续 wire 调整（ConstString 升 12B 头 / dict_v2 entry stride 调）的安全空间。
+**Cost**：实际 ~1h (两 test + 三段 cross-link doc)。
+**Win**：ConstString migration 现在有 byte-level guard rail，#164 silent-corruption 类的 regression 不可能再 silent 落地。
 
 ## 触发策略
 

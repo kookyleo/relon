@@ -699,10 +699,25 @@ mod tests {
         }
     }
 
-    /// Sanity: visit_const_string / visit_const_list_int / visit_const_list_bool
-    /// land in the pool in declaration order with the same `[len:u32 LE]`
-    /// prefix the legacy match emitted. Tests the OpVisitor dispatch end-
-    /// to-end through `from_module` (which calls `walk_body` internally).
+    /// F-5 wire-format smoke gate (cranelift const-pool side): pin the
+    /// exact `[len: u32 LE][payload]` shape of every const-string the
+    /// pool emits. `visit_const_string` plus the 5 stdlib bodies that
+    /// index payload at `s + 4` (see `crates/relon-ir/src/stdlib/`)
+    /// plus `emit_read_string_len` in `codegen/field.rs` plus
+    /// `emit_tail_record_from_absolute` in `codegen/record.rs` all
+    /// hard-code the 4-byte header. Migration to the 12-byte
+    /// `[len_with_ascii_flag][hash:u64][payload]` plan documented in
+    /// `docs/internal/review-improvement-169-conststring-wire-full-2026-05-22.md`
+    /// must flip every site atomically — this test fires the second
+    /// the producer drifts so the partial-coverage silent-corruption
+    /// regression (#164 baseline) cannot recur.
+    ///
+    /// Counterpart producer test:
+    /// `relon-eval-api::buffer::write_string_wire_format_smoke_gate`
+    /// pins the buffer-protocol writer's matching shape.
+    ///
+    /// Tests the OpVisitor dispatch end-to-end through `from_module`
+    /// (which calls `walk_body` internally).
     #[test]
     fn opvisitor_emits_const_string_record_in_declaration_order() {
         let module = synth_module(vec![
