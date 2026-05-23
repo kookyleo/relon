@@ -112,6 +112,7 @@ impl TreeWalkEvaluator {
             .get_or_init(|| {
                 Arc::new(EvaluatorCaps {
                     context: Arc::clone(&self.context),
+                    cached_evaluator: std::sync::OnceLock::new(),
                 })
             })
             .clone()
@@ -2545,10 +2546,18 @@ fn compute_module_digest(algo: relon_parser::HashAlgorithm, bytes: &[u8]) -> Str
 /// Caps handle handed to native functions so they can call back into Relon.
 ///
 /// Holds an `Arc<Context>` so the trait object is `'static` and the call-back
-/// path can run a fresh [`TreeWalkEvaluator`] over the same shared context.
+/// path can run a [`TreeWalkEvaluator`] over the same shared context.
 /// Cheap to keep around — every clone is just an Arc bump.
+///
+/// P2-3: the embedded `TreeWalkEvaluator` is built lazily on the first
+/// `call_relon` and then re-used for every subsequent callback. `xs.map(f)`
+/// /  `filter(p)` / `reduce(...)` on long lists used to construct a fresh
+/// evaluator per element — paying two `OnceLock` allocations + a
+/// `prepare_tree_walk_context` check every time. The cached instance shares
+/// the same `caps` / `empty_scope` `OnceLock`s across the whole list pass.
 struct EvaluatorCaps {
     context: Arc<Context>,
+    cached_evaluator: std::sync::OnceLock<TreeWalkEvaluator>,
 }
 
 impl NativeFnCaps for EvaluatorCaps {
@@ -2558,7 +2567,9 @@ impl NativeFnCaps for EvaluatorCaps {
         args: Vec<Value>,
         range: TokenRange,
     ) -> Result<Value, RuntimeError> {
-        let evaluator = TreeWalkEvaluator::new(Arc::clone(&self.context));
+        let evaluator = self
+            .cached_evaluator
+            .get_or_init(|| TreeWalkEvaluator::new(Arc::clone(&self.context)));
         let evaluated_args = args.into_iter().map(EvaluatedArg::positional).collect();
         let scope = Arc::clone(evaluator.empty_scope());
         evaluator.call_function_by_value(func.clone(), evaluated_args, &scope, range)
