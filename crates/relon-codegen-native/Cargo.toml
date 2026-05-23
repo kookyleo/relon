@@ -77,6 +77,9 @@ relon-object-link = { workspace = true }
 # why a fallback fired (ld missing, hmac key unreadable, blob
 # corrupt, etc.).
 tracing = "0.1"
+# P2-12: ArcSwap-backed trace registry → lock-free reads on the
+# trace dispatch hot path.
+arc-swap = { workspace = true }
 
 # Stage 5 Phase C.3: libc signal constants are used only to map
 # platform signal numbers to Relon trap kinds for diagnostics. Relon

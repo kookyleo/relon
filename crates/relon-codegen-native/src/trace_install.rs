@@ -50,7 +50,9 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, OnceLock};
+
+use arc_swap::ArcSwap;
 
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_codegen::Context as CodegenContext;
@@ -619,38 +621,47 @@ pub enum TraceJitError {
 /// path: every install holds the writer lock just long enough to
 /// insert the new fn, lookups take only a reader lock.
 pub struct TraceJitState {
-    trace_fns: RwLock<HashMap<u32, Arc<JITedTraceFn>>>,
+    /// P2-12: `ArcSwap<HashMap>` published view + `Mutex` write lock.
+    /// Reads via `lookup_trace` are wait-free — one atomic load per
+    /// trace dispatch instead of the prior `RwLock::read` CAS path.
+    /// Writers (`install_trace` / `invalidate_trace`) hold the mutex
+    /// across the load-clone-modify-store sequence so concurrent
+    /// installs serialise (RwLock-equivalent for writes) and a
+    /// concurrent reader can't see a torn intermediate.
+    trace_fns: ArcSwap<HashMap<u32, Arc<JITedTraceFn>>>,
+    write_lock: Mutex<()>,
 }
 
 impl TraceJitState {
     /// Construct an empty registry.
     pub fn new() -> Self {
         Self {
-            trace_fns: RwLock::new(HashMap::new()),
+            trace_fns: ArcSwap::from_pointee(HashMap::new()),
+            write_lock: Mutex::new(()),
         }
     }
 
     /// Look up the installed trace fn for `fn_id`, returning a cloned
     /// `Arc` so the caller can outlive the lock window.
     pub fn lookup_trace(&self, fn_id: u32) -> Option<Arc<JITedTraceFn>> {
-        let guard = self.trace_fns.read().expect("trace_fns lock poisoned");
-        guard.get(&fn_id).cloned()
+        let snap = self.trace_fns.load();
+        snap.get(&fn_id).cloned()
     }
 
     /// Number of installed traces (mainly for tests).
     pub fn installed_count(&self) -> usize {
-        self.trace_fns
-            .read()
-            .expect("trace_fns lock poisoned")
-            .len()
+        self.trace_fns.load().len()
     }
 
     /// Install a freshly-compiled trace. Returns the previous trace
     /// for the same `fn_id` if any (caller may keep the `Arc` alive
     /// to drain in-flight invocations).
     pub fn install_trace(&self, fn_id: u32, trace_fn: JITedTraceFn) -> Option<Arc<JITedTraceFn>> {
-        let mut guard = self.trace_fns.write().expect("trace_fns lock poisoned");
-        guard.insert(fn_id, Arc::new(trace_fn))
+        let _w = self.write_lock.lock().expect("trace_fns write lock poisoned");
+        let mut next = (**self.trace_fns.load()).clone();
+        let prev = next.insert(fn_id, Arc::new(trace_fn));
+        self.trace_fns.store(Arc::new(next));
+        prev
     }
 
     /// Drop the installed trace for `fn_id`, returning it if any. A
@@ -658,8 +669,11 @@ impl TraceJitState {
     /// unsalvageable (e.g. a type-check guard fired and the recorder's
     /// observed-type assumption is no longer valid).
     pub fn invalidate_trace(&self, fn_id: u32) -> Option<Arc<JITedTraceFn>> {
-        let mut guard = self.trace_fns.write().expect("trace_fns lock poisoned");
-        guard.remove(&fn_id)
+        let _w = self.write_lock.lock().expect("trace_fns write lock poisoned");
+        let mut next = (**self.trace_fns.load()).clone();
+        let prev = next.remove(&fn_id);
+        self.trace_fns.store(Arc::new(next));
+        prev
     }
 
     /// Invoke the installed trace for `fn_id` if any, falling back to
