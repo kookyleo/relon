@@ -19,7 +19,10 @@ fn parse_doc(source: &str) -> relon_parser::Node {
 fn parse_expr_test(source: &str) -> relon_parser::Node {
     let wrapped = format!("{{ x: {source} }}");
     let doc = parse_doc(&wrapped);
-    let Expr::Dict(pairs) = *doc.expr else {
+    // `doc.expr` is an `Arc<Expr>`; the parser tree is uniquely owned here
+    // so `try_unwrap` succeeds, but fall back to a clone defensively.
+    let expr = std::sync::Arc::try_unwrap(doc.expr).unwrap_or_else(|shared| (*shared).clone());
+    let Expr::Dict(pairs) = expr else {
         panic!("expected dict wrapper");
     };
     pairs.into_iter().next().expect("one pair").1

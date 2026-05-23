@@ -1322,7 +1322,7 @@ fn lower_directive_name_body(node: &SyntaxNode, source: &str) -> Option<crate::D
         };
         Box::new(crate::Node {
             id: crate::NodeId::alloc(),
-            expr: Box::new(crate::Expr::Dict(Vec::new())),
+            expr: std::sync::Arc::new(crate::Expr::Dict(Vec::new())),
             decorators: Vec::new(),
             directives: Vec::new(),
             type_hint: None,
@@ -2499,25 +2499,40 @@ fn lower_dict_field(node: &SyntaxNode, source: &str) -> Option<DictFieldOut> {
         if let Some(br) = body_range_opt {
             cls_node.range = br;
         }
-        if let Expr::Closure {
-            params,
-            return_type,
-            body,
-        } = *cls_node.expr
-        {
-            // Legacy applies `return_type: parsed_type_hint.clone()`
-            // — this REPLACES any existing return type. Match that.
-            let final_return = if type_hint.is_some() {
-                type_hint.clone()
-            } else {
-                return_type
-            };
-            cls_node.expr = Box::new(Expr::Closure {
+        // `lower_closure_v2` builds the `expr` `Arc` just above; it is not
+        // shared with any other clone yet, so `try_unwrap` lets us move the
+        // inner `Expr` out without copying the (potentially recursive)
+        // closure body. Falls back to a `clone` only if a future refactor
+        // shares the `Arc` earlier — defensive belt-and-braces.
+        let owned_expr = std::sync::Arc::try_unwrap(std::mem::replace(
+            &mut cls_node.expr,
+            std::sync::Arc::new(Expr::Null),
+        ))
+        .unwrap_or_else(|shared| (*shared).clone());
+        cls_node.expr = match owned_expr {
+            Expr::Closure {
                 params,
-                return_type: final_return,
+                return_type,
                 body,
-            });
-        }
+            } => {
+                // Legacy applies `return_type: parsed_type_hint.clone()`
+                // — this REPLACES any existing return type. Match that.
+                let final_return = if type_hint.is_some() {
+                    type_hint.clone()
+                } else {
+                    return_type
+                };
+                std::sync::Arc::new(Expr::Closure {
+                    params,
+                    return_type: final_return,
+                    body,
+                })
+            }
+            // Defensive: `lower_closure_v2` always yields `Closure` today,
+            // but restore the original expr if a future change ever breaks
+            // that invariant.
+            other => std::sync::Arc::new(other),
+        };
         cls_node
     } else {
         let value_ast = value_expr_ast?;
@@ -3416,7 +3431,10 @@ mod tests {
     #[allow(dead_code)]
     fn strip_node_ids(node: &mut crate::Node) {
         node.id = NodeId::SYNTHETIC;
-        match node.expr.as_mut() {
+        // `Arc::make_mut` clones the inner `Expr` only when the `Arc` is
+        // shared with another clone; in this test helper the parser tree
+        // is uniquely owned, so no clone occurs in practice.
+        match std::sync::Arc::make_mut(&mut node.expr) {
             Expr::Dict(pairs) => {
                 for (key, value) in pairs {
                     if let crate::TokenKey::Dynamic(inner, _) = key {

@@ -135,7 +135,7 @@ mod tests {
     fn dummy_node() -> Arc<Node> {
         Arc::new(Node {
             id: NodeId::SYNTHETIC,
-            expr: Box::new(Expr::Int(0)),
+            expr: Arc::new(Expr::Int(0)),
             decorators: vec![],
             directives: vec![],
             type_hint: None,

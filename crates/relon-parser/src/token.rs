@@ -1,6 +1,7 @@
 use ordered_float::OrderedFloat;
 use std::fmt::{Display, Formatter};
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 
 /// Stable identifier assigned to every `Node` at parse time.
 ///
@@ -363,7 +364,13 @@ pub struct Node {
     /// Stable identity assigned at construction. Analyzer side-tables key
     /// off this; not part of structural equality.
     pub id: NodeId,
-    pub expr: Box<Expr>,
+    /// `Arc` rather than `Box` so analyzer side-tables (`node_index`) and
+    /// every walker that snapshots a `Node` share the body via reference
+    /// counting instead of recursively deep-cloning the subtree. The AST
+    /// is effectively immutable after parsing; the lone in-place rewrite
+    /// (closure desugar in `lower.rs`) reassigns the field on a freshly
+    /// built node before any shared clones exist.
+    pub expr: Arc<Expr>,
     /// `@name(...)` decorators stacked above this node — value-transform
     /// hooks (host-registered + user-definable).
     pub decorators: Vec<Decorator>,
@@ -397,7 +404,7 @@ impl Node {
     pub fn new(expr: Expr, range: TokenRange) -> Self {
         Self {
             id: NodeId::alloc(),
-            expr: Box::new(expr),
+            expr: Arc::new(expr),
             decorators: Vec::new(),
             directives: Vec::new(),
             type_hint: None,
@@ -412,7 +419,7 @@ impl Node {
     pub fn with_id(id: NodeId, expr: Expr, range: TokenRange) -> Self {
         Self {
             id,
-            expr: Box::new(expr),
+            expr: Arc::new(expr),
             decorators: Vec::new(),
             directives: Vec::new(),
             type_hint: None,

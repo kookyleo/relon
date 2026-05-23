@@ -25,6 +25,8 @@
 //! to the slow path. We never want a fast-path success that disagrees
 //! with the slow path's analyzer-side judgement.
 
+use std::sync::Arc;
+
 use crate::lower::range_from_offsets;
 use crate::token::{
     Directive, DirectiveBody, DirectiveMainParam, Expr, Node, NodeId, Operator, TypeNode,
@@ -100,7 +102,7 @@ pub fn parse_document_fast(source: &str) -> Option<Node> {
     };
     Some(Node {
         id: NodeId::alloc(),
-        expr: Box::new(body_expr),
+        expr: Arc::new(body_expr),
         decorators: Vec::new(),
         directives: vec![directive],
         type_hint: None,
@@ -338,7 +340,7 @@ impl<'a> FastParser<'a> {
             Some(Expr::Ternary {
                 cond: Node {
                     id: NodeId::alloc(),
-                    expr: Box::new(cond_expr),
+                    expr: Arc::new(cond_expr),
                     decorators: Vec::new(),
                     directives: Vec::new(),
                     type_hint: None,
@@ -347,7 +349,7 @@ impl<'a> FastParser<'a> {
                 },
                 then: Node {
                     id: NodeId::alloc(),
-                    expr: Box::new(then_expr),
+                    expr: Arc::new(then_expr),
                     decorators: Vec::new(),
                     directives: Vec::new(),
                     type_hint: None,
@@ -356,7 +358,7 @@ impl<'a> FastParser<'a> {
                 },
                 els: Node {
                     id: NodeId::alloc(),
-                    expr: Box::new(els_expr),
+                    expr: Arc::new(els_expr),
                     decorators: Vec::new(),
                     directives: Vec::new(),
                     type_hint: None,
@@ -390,7 +392,7 @@ impl<'a> FastParser<'a> {
             let rhs_end = self.pos_after_last_token;
             let lhs_node = Node {
                 id: NodeId::alloc(),
-                expr: Box::new(lhs),
+                expr: Arc::new(lhs),
                 decorators: Vec::new(),
                 directives: Vec::new(),
                 type_hint: None,
@@ -399,7 +401,7 @@ impl<'a> FastParser<'a> {
             };
             let rhs_node = Node {
                 id: NodeId::alloc(),
-                expr: Box::new(rhs),
+                expr: Arc::new(rhs),
                 decorators: Vec::new(),
                 directives: Vec::new(),
                 type_hint: None,
@@ -432,7 +434,7 @@ impl<'a> FastParser<'a> {
                 Operator::Not,
                 Node {
                     id: NodeId::alloc(),
-                    expr: Box::new(inner),
+                    expr: Arc::new(inner),
                     decorators: Vec::new(),
                     directives: Vec::new(),
                     type_hint: None,

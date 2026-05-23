@@ -223,6 +223,11 @@ impl<'a> NodeIndexer<'a> {
             // Index by NodeId. We store an `Arc<Node>` snapshot so
             // consumers don't need to keep the parser tree alive (the
             // analyzer's outputs are routinely shared via `Arc`).
+            //
+            // `node.clone()` is now O(1) amortised because `Node::expr` is
+            // an `Arc<Expr>` — the clone bumps the refcount instead of
+            // recursively deep-copying the subtree. Total work across the
+            // walk drops from O(N^2) to O(N).
             self.tree
                 .node_index
                 .insert(node.id, std::sync::Arc::new(node.clone()));

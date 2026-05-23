@@ -178,7 +178,7 @@ pub fn parse_document_recovering(source: &str) -> ParsedDocument {
                 let end_offset = source.len();
                 nodes.push(Node {
                     id: NodeId::alloc(),
-                    expr: Box::new(Expr::Null),
+                    expr: std::sync::Arc::new(Expr::Null),
                     decorators: Vec::new(),
                     directives: Vec::new(),
                     type_hint: None,
@@ -201,7 +201,7 @@ pub fn parse_document_recovering(source: &str) -> ParsedDocument {
             let end_offset = source.len();
             nodes.push(Node {
                 id: NodeId::alloc(),
-                expr: Box::new(Expr::Null),
+                expr: std::sync::Arc::new(Expr::Null),
                 decorators: Vec::new(),
                 directives: Vec::new(),
                 type_hint: None,
@@ -439,7 +439,7 @@ mod tests {
         assert_eq!(node.range.end.line, 4);
         assert_eq!(node.range.end.column, 2);
 
-        if let Expr::Dict(pairs) = *node.expr {
+        if let Expr::Dict(pairs) = &*node.expr {
             let TokenKey::String(_, key_range, _) = &pairs[0].0 else {
                 panic!("Expected string key")
             };
@@ -455,14 +455,14 @@ mod tests {
     #[test]
     fn test_simple_root() {
         let node = parse_document(r#"{ "a": 1 }"#).unwrap();
-        if let Expr::Dict(pairs) = *node.expr {
+        if let Expr::Dict(pairs) = &*node.expr {
             assert_eq!(pairs.len(), 1);
         } else {
             panic!()
         }
 
         let node = parse_document("// comment \n {foo: 1, bar: 2,}").unwrap();
-        if let Expr::Dict(pairs) = *node.expr {
+        if let Expr::Dict(pairs) = &*node.expr {
             assert_eq!(pairs.len(), 2);
         } else {
             panic!()
@@ -472,7 +472,7 @@ mod tests {
     #[test]
     fn test_expr_integration() {
         let node = parse_document(r#"{ "a": 1 != 2 }"#).unwrap();
-        if let Expr::Dict(pairs) = *node.expr {
+        if let Expr::Dict(pairs) = &*node.expr {
             assert!(matches!(*pairs[0].1.expr, Expr::Binary(Operator::Ne, _, _)));
         } else {
             panic!()
@@ -495,7 +495,7 @@ mod tests {
     #[test]
     fn test_list_integration() {
         let node = parse_document(r#"[1, 2, 3]"#).unwrap();
-        if let Expr::List(elements) = *node.expr {
+        if let Expr::List(elements) = &*node.expr {
             assert_eq!(elements.len(), 3);
         } else {
             panic!()
@@ -505,7 +505,7 @@ mod tests {
     #[test]
     fn test_ref_dict() {
         let node = parse_document(r#"{ "a": &sibling.b, "b": 2 }"#).unwrap();
-        if let Expr::Dict(pairs) = *node.expr {
+        if let Expr::Dict(pairs) = &*node.expr {
             assert_eq!(pairs.len(), 2);
             assert!(matches!(
                 *pairs[0].1.expr,
@@ -522,7 +522,7 @@ mod tests {
     #[test]
     fn test_ref_list() {
         let node = parse_document(r#"[&sibling.b[1], 2]"#).unwrap();
-        if let Expr::List(elements) = *node.expr {
+        if let Expr::List(elements) = &*node.expr {
             assert_eq!(elements.len(), 2);
         } else {
             panic!()
@@ -532,7 +532,7 @@ mod tests {
     #[test]
     fn test_var_list() {
         let node = parse_document(r#"[a, 2]"#).unwrap();
-        if let Expr::List(elements) = *node.expr {
+        if let Expr::List(elements) = &*node.expr {
             assert!(matches!(*elements[0].expr, Expr::Variable(_)));
         } else {
             panic!()
@@ -542,7 +542,7 @@ mod tests {
     #[test]
     fn test_fn_call_list() {
         let node = parse_document(r#"[f({a: 1}), 2]"#).unwrap();
-        if let Expr::List(elements) = *node.expr {
+        if let Expr::List(elements) = &*node.expr {
             assert!(matches!(*elements[0].expr, Expr::FnCall { .. }));
         } else {
             panic!()
@@ -552,7 +552,7 @@ mod tests {
     #[test]
     fn test_fmt_string_list() {
         let node = parse_document(r#"[f"a ${ &sibling.b[1] }", "b"]"#).unwrap();
-        if let Expr::List(elements) = *node.expr {
+        if let Expr::List(elements) = &*node.expr {
             assert!(matches!(*elements[0].expr, Expr::FString(_)));
         } else {
             panic!()
@@ -574,7 +574,7 @@ mod tests {
             b: 2
         }"#;
         let node = parse_document(src).unwrap();
-        if let Expr::Dict(pairs) = *node.expr {
+        if let Expr::Dict(pairs) = &*node.expr {
             assert_eq!(pairs[0].1.doc_comment.as_deref(), Some("line 1\nline 2"));
             assert_eq!(pairs[1].1.doc_comment.as_deref(), Some("block"));
         } else {
