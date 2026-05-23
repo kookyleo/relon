@@ -33,12 +33,13 @@
 //! channel as the rest of Stage 4.
 
 use crate::cap::{Capabilities, NativeFnGate};
-use crate::const_fold;
+use crate::const_fold::{self, ConstValue};
 use crate::diagnostic::Diagnostic;
 use crate::workspace::WorkspaceTree;
 use miette::SourceSpan;
-use relon_parser::{child_nodes, Expr, Node, NodeId, TokenKey};
-use std::collections::{HashMap, HashSet};
+use relon_parser::{child_nodes, Expr, Node, NodeId, Operator, TokenKey};
+use rustc_hash::{FxHashMap, FxHashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Drive the reachability check over `workspace`. Reads every module's
@@ -62,12 +63,20 @@ pub(crate) fn run(workspace: &mut WorkspaceTree) {
         return;
     }
 
-    // v1.1 control-flow pruning: collect every node id that lives
-    // under a statically-dead branch (`false ? ... : 0` then-side,
-    // `false && ...` rhs, `true || ...` rhs, etc.) so the FnCall
-    // walk below skips them. Per-module: dead-branch ids never cross
-    // module boundaries, and `child_nodes` doesn't follow imports —
-    // so we collect against the same module we walk.
+    // v1.1 control-flow pruning + single-pass walk: collect every node
+    // id that lives under a statically-dead branch (`false ? ... : 0`
+    // then-side, `false && ...` rhs, `true || ...` rhs, etc.) and
+    // queue FnCall candidates in the *same* pass over `node_index`.
+    // Per-module: dead-branch ids never cross module boundaries, and
+    // `child_nodes` doesn't follow imports — so we collect against
+    // the same module we walk.
+    //
+    // Fold memoisation: `dead_branch_of` folds the condition of every
+    // Ternary / `&&` / `||` it sees. Callers can hit the same cond
+    // node twice when control-flow shapes nest (e.g. a Ternary whose
+    // `cond` is itself an `&&`). The `fold_cache` keyed on `NodeId`
+    // collapses those repeats to a single `try_fold`, trading a small
+    // map for skipping recursive descent through shared cond subtrees.
     //
     // Scope: capability_check only. The type-checker's walker still
     // visits dead branches so const-fold diagnostics (DivByZero,
@@ -75,13 +84,18 @@ pub(crate) fn run(workspace: &mut WorkspaceTree) {
     // continue to fire; pruning those is a v1.2+ decision (see #41).
     let mut diagnostics: Vec<Diagnostic> = Vec::new();
     for tree in workspace.modules.values() {
-        let mut dead_ids: HashSet<NodeId> = HashSet::new();
+        let mut dead_ids: FxHashSet<NodeId> = FxHashSet::default();
+        let mut fn_calls: Vec<&Node> = Vec::new();
+        let mut fold_cache: FxHashMap<NodeId, Option<ConstValue>> = FxHashMap::default();
         for node in tree.node_index.values() {
-            if let Some(dead) = const_fold::dead_branch_of(node) {
+            if matches!(node.expr.as_ref(), Expr::FnCall { .. }) {
+                fn_calls.push(node);
+            }
+            if let Some(dead) = dead_branch_of_cached(node, &mut fold_cache) {
                 collect_descendant_ids(dead, &mut dead_ids);
             }
         }
-        for node in tree.node_index.values() {
+        for node in fn_calls {
             if dead_ids.contains(&node.id) {
                 continue;
             }
@@ -152,10 +166,76 @@ fn check_node(
 /// and type hints are intentionally skipped because they're processed
 /// by separate walkers and their reachability isn't gated by the
 /// control-flow head sitting above this expression.
-fn collect_descendant_ids(node: &Node, out: &mut HashSet<NodeId>) {
+fn collect_descendant_ids(node: &Node, out: &mut FxHashSet<NodeId>) {
     out.insert(node.id);
     for child in child_nodes(node) {
         collect_descendant_ids(child, out);
+    }
+}
+
+/// Identify the dead branch of a control-flow node whose decision is
+/// statically known, memoising the underlying [`const_fold::try_fold`]
+/// call by cond [`NodeId`]. Returns the unreachable child when one
+/// exists, `None` when both branches stay live (cond non-constant or
+/// `node` isn't a control-flow shape).
+///
+/// Recognises:
+/// * `Expr::Ternary` — `true ? t : e` → dead is `e`; `false ? t : e`
+///   → dead is `t`.
+/// * `Expr::Binary(Operator::And, l, r)` — `false && r` → dead is `r`
+///   (short-circuit). `true && r` keeps `r` live (its value decides
+///   the whole expression).
+/// * `Expr::Binary(Operator::Or, l, r)` — `true || r` → dead is `r`.
+///   `false || r` keeps `r` live.
+///
+/// The cache keeps the `Ok(Some(_))` branch of [`const_fold::try_fold`]
+/// so a cond reached from multiple control-flow heads pays one
+/// recursive fold instead of one per visit; fold-time errors stay
+/// uncached because the type-checker's walker is the channel that
+/// surfaces them. Does *not* recurse — `run` walks the tree itself and
+/// calls this helper at each node it considers for pruning.
+fn dead_branch_of_cached<'a>(
+    node: &'a Node,
+    cache: &mut FxHashMap<NodeId, Option<ConstValue>>,
+) -> Option<&'a Node> {
+    match node.expr.as_ref() {
+        Expr::Ternary { cond, then, els } => match const_bool_cached(cond, cache)? {
+            true => Some(els),
+            false => Some(then),
+        },
+        Expr::Binary(Operator::And, l, r) => {
+            if const_bool_cached(l, cache) == Some(false) {
+                Some(r)
+            } else {
+                None
+            }
+        }
+        Expr::Binary(Operator::Or, l, r) => {
+            if const_bool_cached(l, cache) == Some(true) {
+                Some(r)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Resolve `cond` to a static bool, memoising the underlying
+/// [`const_fold::try_fold`] result by [`NodeId`]. Non-bool fold results
+/// and fold-time errors collapse to `None` so the dead-branch decision
+/// stays in lock-step with [`dead_branch_of_cached`]: only a literal
+/// `Bool` cond prunes; everything else keeps both branches live.
+fn const_bool_cached(
+    cond: &Node,
+    cache: &mut FxHashMap<NodeId, Option<ConstValue>>,
+) -> Option<bool> {
+    let entry = cache
+        .entry(cond.id)
+        .or_insert_with(|| const_fold::try_fold(cond).ok().flatten());
+    match entry {
+        Some(ConstValue::Bool(b)) => Some(*b),
+        _ => None,
     }
 }
 

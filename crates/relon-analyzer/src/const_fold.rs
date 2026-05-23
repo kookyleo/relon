@@ -103,67 +103,6 @@ pub(crate) fn try_fold(node: &Node) -> Result<Option<ConstValue>, FoldError> {
     }
 }
 
-/// `Some(b)` when `cond` folds to a known constant `Bool` (so its
-/// truthiness is statically decidable), `None` otherwise. Convenience
-/// over [`try_fold`] — strips the [`FoldError`] and non-bool fold
-/// results so callers asking *only* "is this branch reachable?" don't
-/// have to pattern-match the full result shape.
-///
-/// Used by reachability-aware passes (capability check) to skip dead
-/// branches of `cond ? a : b` and short-circuit `&&` / `||`. A
-/// fold-time error in `cond` (`1 / 0 ? a : b`) intentionally resolves
-/// to `None` here — the diagnostic already fires through `try_fold`
-/// from the type-checker's walker; this helper just declines to prune.
-pub(crate) fn const_bool_branch(cond: &Node) -> Option<bool> {
-    match try_fold(cond) {
-        Ok(Some(ConstValue::Bool(b))) => Some(b),
-        _ => None,
-    }
-}
-
-/// Identify the dead branch of a control-flow node whose decision is
-/// statically known. Returns the unreachable child when one exists,
-/// `None` when both branches stay live (cond non-constant, or `node`
-/// isn't a control-flow shape).
-///
-/// Recognises:
-/// * `Expr::Ternary` — `true ? t : e` → dead is `e`; `false ? t : e`
-///   → dead is `t`.
-/// * `Expr::Binary(Operator::And, l, r)` — `false && r` → dead is `r`
-///   (short-circuit). `true && r` keeps `r` live (its value decides
-///   the whole expression).
-/// * `Expr::Binary(Operator::Or, l, r)` — `true || r` → dead is `r`.
-///   `false || r` keeps `r` live.
-///
-/// Does *not* recurse — callers walk the tree themselves and call this
-/// helper at each node they consider for pruning. The returned
-/// reference borrows `node`; the caller compares descendant ids
-/// against it (or recurses with `child_nodes`) to mark unreachable
-/// sub-trees.
-pub(crate) fn dead_branch_of(node: &Node) -> Option<&Node> {
-    match node.expr.as_ref() {
-        Expr::Ternary { cond, then, els } => match const_bool_branch(cond)? {
-            true => Some(els),
-            false => Some(then),
-        },
-        Expr::Binary(Operator::And, _l, r) => {
-            if const_bool_branch(_l) == Some(false) {
-                Some(r)
-            } else {
-                None
-            }
-        }
-        Expr::Binary(Operator::Or, _l, r) => {
-            if const_bool_branch(_l) == Some(true) {
-                Some(r)
-            } else {
-                None
-            }
-        }
-        _ => None,
-    }
-}
-
 fn apply_binary(
     op: Operator,
     l: ConstValue,
