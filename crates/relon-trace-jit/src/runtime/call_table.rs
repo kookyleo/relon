@@ -243,6 +243,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "miri interprets, ns/lookup target meaningless")]
     fn resolve_is_fast_with_thousand_entries() {
         let mut table = ExternalCallTable::new();
         for i in 0..1_000u64 {

@@ -42,3 +42,49 @@ jobs:
         uses: Swatinem/rust-cache@v2
       - name: cargo build (workspace, all targets)
         run: cargo build --workspace --all-targets
+
+  miri:
+    # F-1 per docs/internal/formalization-targets-2026-05-23.md:
+    # run cargo miri on every crate whose unsafe surface lives in
+    # pure Rust (no cranelift / FFI / mmap). Catches UB regressions
+    # in the trace-jit runtime helpers, bytecode arena, SmolStr SSO,
+    # and recorder bookkeeping.
+    #
+    # NOT covered: relon-codegen-native (pulls cranelift / wasmtime
+    # whose generated nightly code currently uses unstable features
+    # the pinned miri rustc rejects) and relon-wasm (browser target).
+    # Those keep their stable-job coverage.
+    name: miri (unsafe modules)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install nightly + miri
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+      - name: miri setup
+        run: cargo +nightly miri setup
+      - name: miri test (relon-eval-api)
+        run: cargo +nightly miri test -p relon-eval-api
+        env:
+          MIRIFLAGS: -Zmiri-disable-isolation
+      - name: miri test (relon-trace-abi)
+        run: cargo +nightly miri test -p relon-trace-abi
+        env:
+          MIRIFLAGS: -Zmiri-disable-isolation
+      - name: miri test (relon-trace-jit lib)
+        run: cargo +nightly miri test -p relon-trace-jit --lib
+        env:
+          MIRIFLAGS: -Zmiri-disable-isolation
+      - name: miri test (relon-trace-recorder)
+        run: cargo +nightly miri test -p relon-trace-recorder
+        env:
+          MIRIFLAGS: -Zmiri-disable-isolation
+      - name: miri test (relon-bytecode lib)
+        run: cargo +nightly miri test -p relon-bytecode --lib
+        env:
+          MIRIFLAGS: -Zmiri-disable-isolation

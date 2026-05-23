@@ -24,23 +24,31 @@
 
 | ID | 项 | Cost | ROI | 触发 |
 |---|---|---|:---:|---|
-| F-1 | Miri CI sweep on unsafe modules | 1d | 高 | 任何新 unsafe block 落地前 |
+| F-1 | Miri CI sweep on unsafe modules | **DONE** | 高 | `.github/workflows/ci.yml::miri` job (2026-05-23) |
 | F-2 | Kani bounded model check JIT str/dict layout arithmetic | 2-3d | 中-高 | trace-jit 加新 runtime helper / dict layout 改 |
 | F-3 | Capability/sandbox TLA+ spec | 1-2w | 中 | 加 NativeFnGate variant / cache 拓展 / multi-tenant 出 RFC |
 | F-4 | Trace JIT deopt invariant prop-test | 3-5d | 中-高 | 调 deopt site / guard kind 加 variant |
 | F-5 | wire-format smoke gate for ConstString migration | 1d | 中 | 想推 ConstString 4B→12B wire flip 之前 |
 
-### F-1 Miri CI sweep
+### F-1 Miri CI sweep — DONE 2026-05-23
 
-**位置**：CI 配置 + 标 `#[cfg_attr(miri, ignore)]` for tests that hit FFI / mmap (cranelift JIT actual execution can't run under Miri — but the host-side helper logic + sandbox state ops can).
+**位置**：`.github/workflows/ci.yml::miri` job runs `cargo +nightly miri test` on:
+- `relon-eval-api` (SmolStr SSO + `from_utf8_unchecked` path)
+- `relon-trace-abi` (no unsafe but counts as bottom-of-stack sanity)
+- `relon-trace-jit --lib` (dict_list / str_ops / ic_lookup / deopt offset arithmetic + slice::from_raw_parts callers)
+- `relon-trace-recorder`
+- `relon-bytecode --lib` (arena handle slot math)
 
-**覆盖**：
-- `relon-codegen-native::sandbox` (TrapKind / capabilities snapshot / arena ops)
-- `relon-trace-jit::runtime::{dict_list, str_ops, ic_lookup, deopt}` (offset arithmetic, slice::from_raw_parts callers)
-- `relon-trace-recorder::recorder::SsaAllocator` (overflow path)
-- `relon-bytecode::arena` (handle slot math)
+**NOT covered**：`relon-codegen-native` pulls cranelift / wasmtime whose generated nightly code uses unstable `vec_into_raw_parts` etc.; the pinned miri rustc rejects it. `relon-wasm` (browser target). Both keep stable-job coverage.
 
-**预期 finding**：可能 0 (现有代码已严谨)；任何 fire 都是真问题，因为 Miri ≠ 模糊器。
+**已发现 + 修过**：
+- `relon-trace-jit::runtime::call_table::resolve_is_fast_with_thousand_entries` 是 perf-threshold test，miri 慢解释下不可能过。`#[cfg_attr(miri, ignore = "miri interprets, ns/lookup target meaningless")]` 标了。
+
+**UB findings**：0。当前 unsafe surface 在 miri 抽象语义下干净。
+
+**MIRIFLAGS**：`-Zmiri-disable-isolation` (允许 mmap-like syscalls; miri 默认 isolation 对 SmolStr Arc<str> + 一些 Vec ops 误报)。
+
+**预算**：每 PR 在 CI 上加 ~5-8 分钟 (miri 解释速度比 native 慢 100-1000x)。timeout-minutes: 30。
 
 ### F-2 Kani BMC
 
