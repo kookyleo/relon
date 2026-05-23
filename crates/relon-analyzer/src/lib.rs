@@ -328,14 +328,21 @@ pub fn analyze_with_options(root: &Node, options: &AnalyzeOptions) -> AnalyzedTr
     // imports just stays empty.
     modules::collect_imports(root, &mut tree);
     resolve::resolve_references(root, &mut tree);
-    typecheck::typecheck(root, &mut tree);
-    // Stage 1.7: pre-flight check the entry's `#main(...) -> Type`
-    // return annotation against the body's inferred type. Runs after
-    // `typecheck` so the schema_index it relies on is fully populated
-    // and any node-level `StaticTypeMismatch` already lives in
-    // `tree.diagnostics`.
-    main_return::check_main_return(root, &mut tree);
+    typecheck_and_main_return(root, &mut tree);
     tree
+}
+
+/// P1-3 dedup: run the static type-check pass and then the
+/// `#main(...) -> Type` annotation check. Single helper exists so
+/// the initial pass (here) and the cross-module rerun in
+/// [`workspace_build::recheck_cross_module_calls`] can't drift on
+/// the ordering invariant — `check_main_return` reads the
+/// schema_index `typecheck` populates and the
+/// `StaticTypeMismatch` rows it emits into `tree.diagnostics`, so
+/// the two must run in this order at every entry point.
+pub(crate) fn typecheck_and_main_return(root: &Node, tree: &mut AnalyzedTree) {
+    typecheck::typecheck(root, tree);
+    main_return::check_main_return(root, tree);
 }
 
 /// v6-fix-D2-H cold-start: short-circuited analyzer pipeline for

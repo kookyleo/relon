@@ -1060,13 +1060,13 @@ fn recheck_cross_module_calls(ws: &mut WorkspaceTree) {
         tree.closure_signatures.clear();
         tree.field_closure_index.clear();
         tree.workspace_import_index = Some(index);
-        crate::typecheck::typecheck(&arc_node, tree);
-        // v1.8e fix: re-evaluate `#main(...) -> Type` against the
-        // freshly re-inferred body type. Pre-fix the entry's body lift
-        // saw `Any` for `pkg.Schema` parameters during the first
-        // analyze pass, the mismatch check skipped on `Any`, and the
-        // rerun never touched it.
-        crate::main_return::check_main_return(&arc_node, tree);
+        // P1-3 dedup: shared post-typecheck epilogue (typecheck +
+        // main_return) so the entry-point and cross-module rerun
+        // can't drift on the ordering invariant. v1.8e fix: the
+        // freshly re-inferred body type must flow into the
+        // `#main(...) -> Type` check — pre-fix the rerun touched
+        // only typecheck and the mismatch stayed stale.
+        crate::typecheck_and_main_return(&arc_node, tree);
     }
 }
 
