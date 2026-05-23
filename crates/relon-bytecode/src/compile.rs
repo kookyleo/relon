@@ -133,6 +133,7 @@ pub fn compile_function_in_module(
         inline_depth: 0,
         current_pc: 0,
         string_pool: Vec::new(),
+        inline_frame: None,
     };
     state.compile_seq(&func.body, /*depth_base=*/ 0)?;
     state.emit_ret_if_missing();
@@ -239,6 +240,63 @@ const MAX_INLINE_OPS: usize = 64;
 /// deeper trips the same "too complex to inline" envelope reject.
 const MAX_INLINE_DEPTH: u32 = 3;
 
+/// Curated whitelist of IR ops the inline expander accepts in a
+/// callee body. The bytecode VM only models a scalar-shaped
+/// operand stack + virtual locals, so any op that touches dict /
+/// list / buffer / jump-table / closure surface is rejected so
+/// the four-way harness routes the callsite through cranelift or
+/// the tree-walker. `If` recurses into its arms so nested
+/// disallowed ops surface at the same boundary, matching the
+/// pre-P1-20 behaviour of the recursive `compile_inline_one`
+/// walker.
+fn validate_inline_op(op: &Op) -> Result<(), BcCompileError> {
+    match op {
+        Op::LocalGet(_)
+        | Op::ConstI64(_)
+        | Op::ConstI32(_)
+        | Op::ConstBool(_)
+        | Op::LetGet { .. }
+        | Op::LetSet { .. }
+        | Op::Add(_)
+        | Op::Sub(_)
+        | Op::Mul(_)
+        | Op::Div(_)
+        | Op::Mod(_)
+        | Op::Eq(_)
+        | Op::Ne(_)
+        | Op::Lt(_)
+        | Op::Le(_)
+        | Op::Gt(_)
+        | Op::Ge(_)
+        | Op::Return
+        | Op::Trap { .. }
+        | Op::Select { .. }
+        | Op::ConstString { .. }
+        | Op::ConstListInt { .. }
+        | Op::ConstListBool { .. }
+        | Op::ConstListFloat { .. }
+        | Op::ConstListString { .. }
+        | Op::ReadStringLen
+        | Op::Call { .. } => Ok(()),
+        Op::If {
+            then_body,
+            else_body,
+            ..
+        } => {
+            for t in then_body {
+                validate_inline_op(&t.op)?;
+            }
+            for t in else_body {
+                validate_inline_op(&t.op)?;
+            }
+            Ok(())
+        }
+        other => Err(BcCompileError::UnsupportedOp(format!(
+            "inline body op unsupported: {other:?}"
+        ))),
+    }
+}
+
 struct CompileState<'a> {
     ops: Vec<BcOp>,
     ir_pc_map: Vec<ExternalPc>,
@@ -296,6 +354,30 @@ struct CompileState<'a> {
     /// length-fold path keeps emitting `BcOp::ConstI64(len)` and never
     /// touches the pool, so existing callers don't observe a change.
     string_pool: Vec<String>,
+    /// P1-20: active inline-call frame, if we're walking a callee body.
+    /// When set, `visit_local_get` / `visit_let_get` / `visit_let_set`
+    /// rewrite indices through `local_base` / `let_base`, `visit_return`
+    /// becomes a no-op (the callee's `Return` is a fallthrough — the
+    /// caller drains the result off the operand stack), and
+    /// `self.current_pc` reflects the **caller's** call-site PC so
+    /// every emitted op stays attributed to the inline expansion site.
+    /// Restored to `None` after the inline body has been walked, so
+    /// sibling top-level ops resume normal slot resolution.
+    inline_frame: Option<InlineFrame>,
+}
+
+/// Active state while a callee body is being walked through the
+/// inliner. See `CompileState::inline_frame`.
+struct InlineFrame {
+    /// Caller-side virtual local slot that holds the callee's
+    /// `LocalGet(0)` (i.e. its first parameter). Subsequent params
+    /// are at `local_base + 1`, `local_base + 2`, ... .
+    local_base: u32,
+    /// Caller-side virtual local slot that holds the callee's
+    /// `LetGet(0)` / `LetSet(0)` (its first let-local). Disjoint
+    /// from `local_base` and from the caller's own let-locals so
+    /// nested inlining never aliases.
+    let_base: u32,
 }
 
 #[derive(Debug)]
@@ -594,26 +676,39 @@ impl<'a> CompileState<'a> {
         self.scratch_local_top += arg_count;
         self.inline_depth += 1;
 
-        // Walk the callee body. We need to rewrite LocalGet/LocalSet
-        // indices (which address the callee's local arr) to point
-        // into our scratch block. Callee's own LetGet/LetSet are
-        // index-disjoint by construction; we lift them too via a
-        // private inline-let base.
+        // Walk the callee body through the same `OpVisitor` dispatch
+        // the top-level lowering uses. The active `inline_frame`
+        // rewrites `LocalGet` / `LetGet` / `LetSet` against the
+        // caller-side bases and turns the callee's `Return` into a
+        // fallthrough; `current_pc` is pinned to `call_pc` so every
+        // emitted op stays attributed to the call site.
         let ops_before = self.ops.len();
         let inline_let_base = self.scratch_local_top;
-        // Reserve a generous slot count for callee let-locals.
-        // The compile pass tracks the actual max via `locals_used`
-        // post-walk; we widen `scratch_local_top` here only to keep
-        // numbering disjoint.
-        for tagged in &callee.body {
-            self.compile_inline_one(&tagged.op, scratch_base, inline_let_base, call_pc)?;
-            if self.ops.len() - ops_before > MAX_INLINE_OPS {
-                return Err(BcCompileError::UnsupportedOp(format!(
-                    "Call fn_index {fn_index}: inline expansion >{} ops",
-                    MAX_INLINE_OPS
-                )));
+        let prev_frame = self.inline_frame.take();
+        let prev_pc = self.current_pc;
+        self.inline_frame = Some(InlineFrame {
+            local_base: scratch_base,
+            let_base: inline_let_base,
+        });
+        self.current_pc = call_pc;
+
+        let walk_result = (|| -> Result<(), BcCompileError> {
+            for tagged in &callee.body {
+                validate_inline_op(&tagged.op)?;
+                relon_ir::walk_op(&tagged.op, self)?;
+                if self.ops.len() - ops_before > MAX_INLINE_OPS {
+                    return Err(BcCompileError::UnsupportedOp(format!(
+                        "Call fn_index {fn_index}: inline expansion >{} ops",
+                        MAX_INLINE_OPS
+                    )));
+                }
             }
-        }
+            Ok(())
+        })();
+
+        self.inline_frame = prev_frame;
+        self.current_pc = prev_pc;
+        walk_result?;
 
         self.inline_depth -= 1;
         // Restore scratch_local_top to its pre-call value so siblings
@@ -621,138 +716,6 @@ impl<'a> CompileState<'a> {
         // permanently reserved in the locals array (cheap — it's
         // just an integer max), but the bump pointer rolls back.
         self.scratch_local_top = scratch_base;
-        Ok(())
-    }
-
-    /// Walk a single op inside an inlined callee body. The
-    /// `local_base` is the scratch-block base the caller assigned to
-    /// the callee's parameter slots; `let_base` is the base for the
-    /// callee's let-locals (kept disjoint from caller let-locals so
-    /// nested inlining doesn't alias).
-    fn compile_inline_one(
-        &mut self,
-        op: &Op,
-        local_base: u32,
-        let_base: u32,
-        call_pc: ExternalPc,
-    ) -> Result<(), BcCompileError> {
-        match op {
-            Op::LocalGet(idx) => self.emit_with_effect(BcOp::LocalGet(local_base + *idx), call_pc),
-            Op::ConstI64(v) => self.emit_with_effect(BcOp::ConstI64(*v), call_pc),
-            Op::ConstI32(v) => self.emit_with_effect(BcOp::ConstI32(*v), call_pc),
-            Op::ConstBool(b) => {
-                self.emit_with_effect(BcOp::ConstI32(if *b { 1 } else { 0 }), call_pc)
-            }
-            Op::LetGet { idx, .. } => {
-                self.emit_with_effect(BcOp::LocalGet(let_base + *idx), call_pc)
-            }
-            Op::LetSet { idx, .. } => {
-                self.emit_with_effect(BcOp::LocalSet(let_base + *idx), call_pc)
-            }
-            Op::Add(ty) => self.emit_with_effect(arith_bcop_for(*ty, ArithKind::Add)?, call_pc),
-            Op::Sub(ty) => self.emit_with_effect(arith_bcop_for(*ty, ArithKind::Sub)?, call_pc),
-            Op::Mul(ty) => self.emit_with_effect(arith_bcop_for(*ty, ArithKind::Mul)?, call_pc),
-            Op::Div(ty) => self.emit_with_effect(arith_bcop_for(*ty, ArithKind::Div)?, call_pc),
-            Op::Mod(ty) => self.emit_with_effect(arith_bcop_for(*ty, ArithKind::Mod)?, call_pc),
-            Op::Eq(ty) => self.emit_with_effect(cmp_bcop_for(*ty, CmpKind::Eq)?, call_pc),
-            Op::Ne(ty) => self.emit_with_effect(cmp_bcop_for(*ty, CmpKind::Ne)?, call_pc),
-            Op::Lt(ty) => self.emit_with_effect(cmp_bcop_for(*ty, CmpKind::Lt)?, call_pc),
-            Op::Le(ty) => self.emit_with_effect(cmp_bcop_for(*ty, CmpKind::Le)?, call_pc),
-            Op::Gt(ty) => self.emit_with_effect(cmp_bcop_for(*ty, CmpKind::Gt)?, call_pc),
-            Op::Ge(ty) => self.emit_with_effect(cmp_bcop_for(*ty, CmpKind::Ge)?, call_pc),
-            // Callee's `Return` is a fallthrough in the inlining:
-            // the value left on the operand stack is the result of
-            // the call (popped by the surrounding caller, if any).
-            // Emitting an actual `Return` here would exit the
-            // **caller** which is wrong. Skip emission entirely; the
-            // callee is straight-line at this depth so dropping the
-            // terminator is safe.
-            Op::Return => {}
-            Op::Trap { kind, .. } => {
-                let bc_kind = match kind {
-                    relon_ir::ir::TrapKind::IndexOutOfBounds => BcTrapKind::IndexOutOfBounds,
-                    relon_ir::ir::TrapKind::EmptyList => BcTrapKind::EmptyList,
-                    relon_ir::ir::TrapKind::InvalidUtf8 => BcTrapKind::InvalidUtf8,
-                };
-                self.emit_with_effect(BcOp::Trap(bc_kind), call_pc);
-            }
-            Op::If {
-                then_body,
-                else_body,
-                ..
-            } => {
-                // Reuse the existing compile_if path but inline-aware.
-                if then_body.is_empty() && else_body.is_empty() {
-                    return Err(BcCompileError::EmptyArm { pc: call_pc });
-                }
-                let if_idx = self.current_idx();
-                self.emit(BcOp::JumpIfFalse(usize::MAX), call_pc);
-                self.current_stack.pop();
-                let branch_stack = self.current_stack.clone();
-
-                for t in then_body {
-                    self.compile_inline_one(&t.op, local_base, let_base, call_pc)?;
-                }
-                let after_then = self.current_idx();
-                self.emit(BcOp::Jump(usize::MAX), call_pc);
-                let post_then_stack = self.current_stack.clone();
-
-                let else_start = self.current_idx();
-                self.current_stack = branch_stack;
-                for t in else_body {
-                    self.compile_inline_one(&t.op, local_base, let_base, call_pc)?;
-                }
-                let join = self.current_idx();
-                match &mut self.ops[if_idx] {
-                    BcOp::JumpIfFalse(t) => *t = else_start,
-                    _ => unreachable!(),
-                }
-                match &mut self.ops[after_then] {
-                    BcOp::Jump(t) => *t = join,
-                    _ => unreachable!(),
-                }
-                let join_depth = post_then_stack.len().max(self.current_stack.len());
-                let mut joined = Vec::with_capacity(join_depth);
-                for _ in 0..join_depth {
-                    let s = self.next_snapshot_idx;
-                    self.next_snapshot_idx += 1;
-                    joined.push(StackOrigin::Snapshot(s));
-                }
-                self.current_stack = joined;
-            }
-            Op::Select { ty: _ } => self.compile_select(call_pc)?,
-            // `ConstString` / `ReadStringLen` lifted via the same
-            // M2-B constant-fold trick as the caller path.
-            Op::ConstString { idx: _, value } => {
-                let len = value.chars().count() as i64;
-                self.emit_with_effect(BcOp::ConstI64(len), call_pc);
-            }
-            Op::ConstListInt { idx: _, elements } => {
-                self.emit_with_effect(BcOp::ConstI64(elements.len() as i64), call_pc);
-            }
-            Op::ConstListBool { idx: _, elements } => {
-                self.emit_with_effect(BcOp::ConstI64(elements.len() as i64), call_pc);
-            }
-            Op::ConstListFloat { idx: _, elements } => {
-                self.emit_with_effect(BcOp::ConstI64(elements.len() as i64), call_pc);
-            }
-            Op::ConstListString { idx: _, elements } => {
-                self.emit_with_effect(BcOp::ConstI64(elements.len() as i64), call_pc);
-            }
-            Op::ReadStringLen => {}
-            // Nested call: recurse via the public path (bumps inline
-            // depth + reserves a fresh scratch block).
-            Op::Call {
-                fn_index,
-                arg_count,
-                ..
-            } => self.compile_inline_call(*fn_index, *arg_count, call_pc)?,
-            other => {
-                return Err(BcCompileError::UnsupportedOp(format!(
-                    "inline body op unsupported: {other:?}"
-                )));
-            }
-        }
         Ok(())
     }
 
@@ -1147,7 +1110,15 @@ impl<'a> OpVisitor for CompileState<'a> {
 
     fn visit_local_get(&mut self, idx: u32) -> Result<(), BcCompileError> {
         let pc = self.current_pc;
-        self.emit_with_effect(BcOp::LocalGet(idx), pc);
+        // P1-20: when walking an inline callee body, the callee's
+        // `LocalGet(idx)` addresses **its** local arr, which the
+        // inliner has parked starting at `local_base` in the
+        // caller's scratch space.
+        let slot = match &self.inline_frame {
+            Some(frame) => frame.local_base + idx,
+            None => idx,
+        };
+        self.emit_with_effect(BcOp::LocalGet(slot), pc);
         Ok(())
     }
 
@@ -1157,15 +1128,26 @@ impl<'a> OpVisitor for CompileState<'a> {
         // `main_schema.fields.len()` virtual slots for inputs and the
         // return-schema field slots after that; let locals come
         // **on top of** those reserved slots so they don't collide.
+        // P1-20: inside an inline callee body, `let_base` overrides
+        // the buffer-protocol calculation — the callee's let-locals
+        // are parked in a disjoint slot range right above the
+        // callee's param scratch block so nested inlining never
+        // aliases the caller's let-locals.
         let pc = self.current_pc;
-        let base = self.input_arg_count() + self.return_field_count();
+        let base = match &self.inline_frame {
+            Some(frame) => frame.let_base,
+            None => self.input_arg_count() + self.return_field_count(),
+        };
         self.emit_with_effect(BcOp::LocalGet(base + idx), pc);
         Ok(())
     }
 
     fn visit_let_set(&mut self, idx: u32, _ty: IrType) -> Result<(), BcCompileError> {
         let pc = self.current_pc;
-        let base = self.input_arg_count() + self.return_field_count();
+        let base = match &self.inline_frame {
+            Some(frame) => frame.let_base,
+            None => self.input_arg_count() + self.return_field_count(),
+        };
         self.emit_with_effect(BcOp::LocalSet(base + idx), pc);
         Ok(())
     }
@@ -1382,6 +1364,15 @@ impl<'a> OpVisitor for CompileState<'a> {
     }
 
     fn visit_return(&mut self) -> Result<(), BcCompileError> {
+        // P1-20: a callee's `Return` is a fallthrough in the inline
+        // expansion — the value left on the operand stack is the
+        // call's result, drained by the surrounding caller. Emitting
+        // `BcOp::Return` here would exit the **caller**, not the
+        // callee. Drop the terminator; the callee is straight-line
+        // at this depth so falling through is safe.
+        if self.inline_frame.is_some() {
+            return Ok(());
+        }
         let pc = self.current_pc;
         self.emit_with_effect(BcOp::Return, pc);
         Ok(())
