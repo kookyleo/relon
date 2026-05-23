@@ -189,6 +189,30 @@ impl TraceBuffer {
         self.guards.push(guard);
     }
 
+    /// Rebind every `GuardSite::trace_pc` to the current position of
+    /// its matching `TraceOp::Guard` op. Matches by `(GuardKind,
+    /// document-order occurrence index)` so duplicate kinds line up
+    /// positionally. Shared by every optimizer pass that inserts /
+    /// shuffles guards (`licm`, `type_spec`).
+    pub fn rebind_guard_pcs(&mut self) {
+        if self.guards.is_empty() {
+            return;
+        }
+        let mut by_kind: HashMap<crate::trace_ir::GuardKind, Vec<usize>> = HashMap::new();
+        for (pc, op) in self.ops.iter().enumerate() {
+            if let TraceOp::Guard(k, _) = op {
+                by_kind.entry(*k).or_default().push(pc);
+            }
+        }
+        for site in &mut self.guards {
+            if let Some(q) = by_kind.get_mut(&site.kind) {
+                if !q.is_empty() {
+                    site.trace_pc = q.remove(0) as u32;
+                }
+            }
+        }
+    }
+
     /// Register `var`'s observed concrete type. Drives
     /// [`crate::optimizer::type_spec`] guard insertion and
     /// [`crate::optimizer::noop_typecheck_elim`] folding. See the

@@ -79,7 +79,7 @@ impl OptimizerPass for TypeSpec {
         // from the op vector: a guard's pc is the position of its
         // corresponding `TraceOp::Guard`. We match by `kind` + arg
         // since `trace_pc` was the only previous link.
-        rebind_guard_pcs(trace);
+        trace.rebind_guard_pcs();
         report
     }
 }
@@ -93,24 +93,4 @@ fn insert_type_guard(trace: &mut TraceBuffer, call_idx: usize, var: SsaVar, ty: 
     // generic code.
     let site = GuardSite::new(call_idx as u32, ExternalPc(0), kind);
     trace.guards.push(site);
-}
-
-/// Rebind each `GuardSite::trace_pc` to its corresponding op's
-/// current position. Matches by `kind` -- guard kinds are unique per
-/// site in the trace IR we produce (the pass only inserts at call
-/// sites with distinct argument SSAs).
-fn rebind_guard_pcs(trace: &mut TraceBuffer) {
-    let mut used = vec![false; trace.ops.len()];
-    for site in &mut trace.guards {
-        if let Some(new_pc) = trace.ops.iter().enumerate().position(|(i, op)| {
-            !used[i]
-                && match op {
-                    TraceOp::Guard(k, _) => *k == site.kind,
-                    _ => false,
-                }
-        }) {
-            used[new_pc] = true;
-            site.trace_pc = new_pc as u32;
-        }
-    }
 }

@@ -75,7 +75,7 @@
 //! is already known gets folded away in the same pipeline round).
 //! See the [`super`] module docs for the full pipeline contract.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use crate::buffer::TraceBuffer;
 use crate::effect::EffectClass;
@@ -115,7 +115,7 @@ impl OptimizerPass for LICM {
             }
         }
 
-        rebind_guard_pcs(trace);
+        trace.rebind_guard_pcs();
         report
     }
 }
@@ -339,29 +339,5 @@ fn is_hoistable(op: &TraceOp, body_has_writes: bool) -> bool {
             _ => false,
         },
         EffectClass::RecoverableWrite | EffectClass::Unrecoverable => false,
-    }
-}
-
-/// Rebind every `GuardSite::trace_pc` to the current position of its
-/// guard op. Matches by `(GuardKind, occurrence index)` so duplicate
-/// kinds still line up positionally.
-fn rebind_guard_pcs(trace: &mut TraceBuffer) {
-    if trace.guards.is_empty() {
-        return;
-    }
-    // Build a queue of pcs for each kind in document order.
-    let mut by_kind: HashMap<crate::trace_ir::GuardKind, Vec<usize>> = HashMap::new();
-    for (pc, op) in trace.ops.iter().enumerate() {
-        if let TraceOp::Guard(k, _) = op {
-            by_kind.entry(*k).or_default().push(pc);
-        }
-    }
-    // Drain front-to-back so guard order is preserved.
-    for site in &mut trace.guards {
-        if let Some(q) = by_kind.get_mut(&site.kind) {
-            if !q.is_empty() {
-                site.trace_pc = q.remove(0) as u32;
-            }
-        }
     }
 }
