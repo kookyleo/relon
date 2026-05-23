@@ -514,20 +514,26 @@ impl TreeWalkEvaluator {
             Expr::String(s) => Ok(Value::String(s.as_str().into())),
 
             Expr::List(elements) => {
-                let mut thunks = Vec::new();
+                let mut thunks_vec = Vec::new();
                 for (i, el) in elements.iter().enumerate() {
                     let item_scope = current_scope.with_path(i.to_string());
-                    thunks.push(Arc::new(Thunk::new(
+                    thunks_vec.push(Arc::new(Thunk::new(
                         el.clone(),
                         item_scope,
                         Vec::new(),
                         String::new(),
                     )));
                 }
+                // P2-1: park the thunks slice behind an `Arc<[Arc<Thunk>]>`
+                // so the per-element `with_list_context` only bumps the
+                // Arc (O(1)) instead of cloning the whole `Vec<Arc<Thunk>>`
+                // (O(N²) over the full list).
+                let thunks: Arc<[Arc<Thunk>]> = Arc::from(thunks_vec.into_boxed_slice());
 
                 let mut values = Vec::new();
                 for (i, thunk) in thunks.iter().enumerate() {
-                    let item_scope = current_scope.with_list_context(i, thunks.clone());
+                    let item_scope =
+                        current_scope.with_list_context(i, Arc::clone(&thunks));
                     let element_val = self.force_thunk_with_scope(thunk, &item_scope)?;
 
                     if let Expr::Spread(_) = thunk.node.expr.as_ref() {
@@ -698,7 +704,7 @@ impl TreeWalkEvaluator {
                 // `&prev` / `&next` only fire inside list literals —
                 // so an empty `elements` vec is the cheapest stand-in
                 // and keeps the API uniform.
-                let outer_scope = current_scope.with_iter_loop(Vec::new());
+                let outer_scope = current_scope.with_iter_loop(Arc::from(Vec::<Arc<Thunk>>::new().into_boxed_slice()));
                 for (i, item) in items.iter().enumerate() {
                     outer_scope.set_iter_binding(Arc::clone(&id_arc), item.clone(), i);
 

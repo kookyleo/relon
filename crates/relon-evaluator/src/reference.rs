@@ -670,7 +670,8 @@ impl TreeWalkEvaluator {
                         ))
                     })
                     .collect();
-                let item_scope = scope.with_list_context(index, element_thunks);
+                let item_scope = scope
+                    .with_list_context(index, Arc::from(element_thunks.into_boxed_slice()));
                 let item = elements.get(index);
                 if let Some(it) = item {
                     self.eval_reference_path_from(
