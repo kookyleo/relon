@@ -1815,6 +1815,7 @@ name = "relon-trace-jit"
 version = "0.1.0"
 dependencies = [
  "bincode",
+ "proptest",
  "relon-trace-abi",
  "serde",
  "serde_json",

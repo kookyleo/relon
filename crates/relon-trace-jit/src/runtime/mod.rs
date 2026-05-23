@@ -59,6 +59,13 @@ pub mod str_ops;
 #[cfg(kani)]
 pub mod proofs;
 
+// F-4: minimal prop-test skeleton for the deopt-snapshot pc invariant.
+// Gated `#[cfg(test)]` so the proptest dep stays a dev-dep only.
+// Full tree-walker oracle deferred — see
+// `docs/internal/formalization-targets-2026-05-23.md` §F-4.
+#[cfg(test)]
+mod proptests;
+
 pub use call_table::{
     __relon_trace_resolve_call, register_external_call, resolve_external_call, with_call_table,
     ExternalCallTable,

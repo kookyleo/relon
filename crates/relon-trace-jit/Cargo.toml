@@ -30,6 +30,9 @@ bincode = "1.3"
 
 [dev-dependencies]
 serde_json = { workspace = true }
+# F-4 skeleton: prop-tests for deopt-snapshot invariants. See
+# `src/runtime/proptests.rs` and `docs/internal/formalization-targets-2026-05-23.md`.
+proptest = { workspace = true }
 
 [lints.rust]
 # F-2: the `proofs` module is gated on `--cfg kani` so the cargo
