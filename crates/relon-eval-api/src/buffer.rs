@@ -19,6 +19,7 @@
 
 use crate::layout::{FieldKind, ListElementKind, OffsetTable, SchemaLayout};
 use crate::schema_canonical::{Field, Schema, TypeRepr};
+use std::sync::Arc;
 use thiserror::Error;
 
 /// One row in the per-builder / per-reader field index. Carries the
@@ -33,6 +34,89 @@ struct FieldEntry {
     size: usize,
     kind: FieldKind,
     list_element: Option<ListElementKind>,
+}
+
+/// One slot in a [`RelocLayout`] — every entry maps 1:1 to a
+/// `PointerIndirect` field in the parent [`OffsetTable`]. Inline fields
+/// don't need relocation and are filtered out at build time so the
+/// relocation walker can skip them without a `matches!` check per slot.
+#[derive(Debug)]
+pub(crate) struct RelocSlot {
+    /// Byte offset of the pointer slot within the record's fixed area.
+    offset: usize,
+    /// Per-element layout for `List<T>` fields, mirroring
+    /// [`FieldOffset::list_element`]. Drives the dispatch between the
+    /// pointer-array relocator and the inline schema recursion.
+    list_element: Option<ListElementKind>,
+    /// Sub-layout for nested `Schema` / `List<Schema>` fields. Pre-computed
+    /// at builder construction so relocation never has to call
+    /// [`SchemaLayout::offsets_for`] on the hot path. `None` for
+    /// `String` / `List<scalar>` slots where the tail record carries no
+    /// further pointers.
+    nested: Option<Arc<RelocLayout>>,
+}
+
+/// Pre-computed relocation table for a [`BufferBuilder`]'s schema.
+///
+/// `relocate_pointers` walks pointer-indirect slots when a child buffer
+/// is pasted into a parent (see [`BufferBuilder::finish_sub_record`] and
+/// [`ListRecordWriter::finish_entry`]). Each nested `Schema` / `List<Schema>`
+/// slot needs its own [`OffsetTable`] to recurse through; computing it
+/// via [`SchemaLayout::offsets_for`] on every relocation made the
+/// `List<Schema>` / `Dict<_, Schema>` paths quadratic in nesting depth
+/// and quadratic in entry count. The cache shifts that work to a single
+/// up-front walk at [`BufferBuilder::new`] / [`ListRecordWriter`]
+/// construction.
+///
+/// Layout: `slots` mirrors the `PointerIndirect` fields in
+/// [`OffsetTable::fields`]; each [`RelocSlot::nested`] is `Some` exactly
+/// when the field's declared type is `Schema { .. }` or
+/// `List { element: Schema { .. } }`, and points at a sibling
+/// `RelocLayout` for the inner record. `Arc` lets identical sub-trees
+/// share a single allocation when the same nested schema appears at
+/// multiple sites (e.g. two `List<User>` fields sharing the inner
+/// `User` layout).
+#[derive(Debug)]
+pub(crate) struct RelocLayout {
+    slots: Vec<RelocSlot>,
+}
+
+impl RelocLayout {
+    /// Build the relocation cache for one schema layer.
+    ///
+    /// Walks `layout.fields` and for every `PointerIndirect` slot whose
+    /// declared type is `Schema` / `List<Schema>`, recursively computes
+    /// the nested layout via [`SchemaLayout::offsets_for`] **once**.
+    /// Subsequent relocations reuse the cached layouts via the returned
+    /// `Arc`. Inline slots (`Int`, `Bool`, ...) are skipped — they're
+    /// never touched by `relocate_pointers`.
+    fn build(layout: &OffsetTable, fields: &[Field]) -> Arc<Self> {
+        let mut slots: Vec<RelocSlot> = Vec::new();
+        for fo in &layout.fields {
+            if !matches!(fo.kind, FieldKind::PointerIndirect { .. }) {
+                continue;
+            }
+            let declared = fields.iter().find(|f| f.name == fo.name);
+            let nested = declared.and_then(|f| match &f.ty {
+                TypeRepr::Schema { schema } => SchemaLayout::offsets_for(schema)
+                    .ok()
+                    .map(|sub| RelocLayout::build(&sub, &schema.fields)),
+                TypeRepr::List { element } => match element.as_ref() {
+                    TypeRepr::Schema { schema } => SchemaLayout::offsets_for(schema)
+                        .ok()
+                        .map(|sub| RelocLayout::build(&sub, &schema.fields)),
+                    _ => None,
+                },
+                _ => None,
+            });
+            slots.push(RelocSlot {
+                offset: fo.offset,
+                list_element: fo.list_element,
+                nested,
+            });
+        }
+        Arc::new(Self { slots })
+    }
 }
 
 /// Failure modes when writing / reading typed fields against a buffer.
@@ -114,6 +198,12 @@ pub struct BufferBuilder<'a> {
     layout: &'a OffsetTable,
     field_index: Vec<FieldEntry>,
     bytes: Vec<u8>,
+    /// Pre-computed relocation cache for `relocate_pointers`. Built once
+    /// at `new` time so subsequent pastes into a parent buffer (via
+    /// `finish_sub_record` / `finish_entry`) never re-walk the nested
+    /// schemas. Shared via `Arc` so a `ListRecordWriter`'s entry builders
+    /// hand the same cache back to the parent without re-deriving it.
+    reloc_layout: Arc<RelocLayout>,
 }
 
 impl<'a> BufferBuilder<'a> {
@@ -142,10 +232,12 @@ impl<'a> BufferBuilder<'a> {
                     })
             })
             .collect();
+        let reloc_layout = RelocLayout::build(layout, fields);
         Self {
             layout,
             field_index,
             bytes,
+            reloc_layout,
         }
     }
 
@@ -550,6 +642,15 @@ impl<'a> BufferBuilder<'a> {
         self.bytes
     }
 
+    /// Internal sibling of [`Self::finish`] that surrenders the byte
+    /// buffer together with the pre-computed relocation cache.
+    /// `finish_sub_record` and `ListRecordWriter::finish_entry` use this
+    /// so the relocation walker can skip a fresh `OffsetTable` derivation
+    /// per paste — the cache was already built at `new` time.
+    pub(crate) fn into_parts(self) -> (Vec<u8>, Arc<RelocLayout>) {
+        (self.bytes, self.reloc_layout)
+    }
+
     /// Allocate a nested branded sub-record under `field_name` and
     /// return a detached child [`BufferBuilder`] sized to the sub
     /// schema's fixed area.
@@ -649,20 +750,8 @@ impl<'a> BufferBuilder<'a> {
         };
         let slot_offset = entry.offset;
         let child_align = child.layout.root_align.max(tail_alignment).max(1);
-        let child_layout = child.layout;
-        // Resolve the child's field type list from its own field_index
-        // so the relocation walker has the same canonical TypeRepr
-        // information the writer used at construction time.
-        let child_fields: Vec<Field> = child
-            .field_index
-            .iter()
-            .map(|e| Field {
-                name: e.name.clone(),
-                ty: e.ty.clone(),
-                default: None,
-            })
-            .collect();
-        let mut child_bytes = child.finish();
+        let (child_bytes, child_reloc) = child.into_parts();
+        let mut child_bytes = child_bytes;
         self.pad_to(child_align);
         let sub_base = self.bytes.len();
         let ptr = u32::try_from(sub_base).map_err(|_| BufferError::ValueTooLarge {
@@ -671,12 +760,12 @@ impl<'a> BufferBuilder<'a> {
         })?;
         // Rebase every pointer slot inside the child so it's
         // parent-relative once we paste the child bytes.
-        relocate_pointers(&mut child_bytes, child_layout, &child_fields, 0, ptr).map_err(
-            |reason| BufferError::MalformedPayload {
+        relocate_pointers(&mut child_bytes, &child_reloc, 0, ptr).map_err(|reason| {
+            BufferError::MalformedPayload {
                 name: field_name.to_string(),
                 reason,
-            },
-        )?;
+            }
+        })?;
         self.bytes.extend_from_slice(&child_bytes);
         self.bytes[slot_offset..slot_offset + 4].copy_from_slice(&ptr.to_le_bytes());
         Ok(())
@@ -847,23 +936,19 @@ impl<'b> ListRecordWriter<'b> {
                 len: self.entry_offsets.len() + 1,
             });
         }
-        let mut child_bytes = child.finish();
+        let (child_bytes, child_reloc) = child.into_parts();
+        let mut child_bytes = child_bytes;
         parent.pad_to(self.elem_align);
         let entry_offset = parent.bytes.len();
         let ptr = u32::try_from(entry_offset).map_err(|_| BufferError::ValueTooLarge {
             name: self.field_name.clone(),
             len: entry_offset,
         })?;
-        relocate_pointers(
-            &mut child_bytes,
-            self.elem_layout,
-            &self.elem_schema.fields,
-            0,
-            ptr,
-        )
-        .map_err(|reason| BufferError::MalformedPayload {
-            name: self.field_name.clone(),
-            reason,
+        relocate_pointers(&mut child_bytes, &child_reloc, 0, ptr).map_err(|reason| {
+            BufferError::MalformedPayload {
+                name: self.field_name.clone(),
+                reason,
+            }
         })?;
         parent.bytes.extend_from_slice(&child_bytes);
         self.entry_offsets.push(ptr);
@@ -885,17 +970,13 @@ impl<'b> ListRecordWriter<'b> {
 /// parent buffer's coordinate system.
 fn relocate_pointers(
     bytes: &mut [u8],
-    layout: &OffsetTable,
-    fields: &[Field],
+    reloc: &RelocLayout,
     record_base: usize,
     paste_base: u32,
 ) -> Result<(), &'static str> {
-    for fo in &layout.fields {
-        if !matches!(fo.kind, FieldKind::PointerIndirect { .. }) {
-            continue;
-        }
+    for slot in &reloc.slots {
         let slot_abs = record_base
-            .checked_add(fo.offset)
+            .checked_add(slot.offset)
             .ok_or("pointer slot offset overflows usize")?;
         if slot_abs
             .checked_add(4)
@@ -917,36 +998,25 @@ fn relocate_pointers(
         // rebased too — without recursion the wasm reader walking the
         // grand-child's String slot would fall off the parent buffer
         // by `paste_base` bytes.
-        if let Some(field) = fields.iter().find(|f| f.name == fo.name) {
-            match &field.ty {
-                TypeRepr::Schema { schema } => {
-                    let sub_layout = SchemaLayout::offsets_for(schema)
-                        .map_err(|_| "nested schema layout failed during relocation")?;
-                    relocate_pointers(
-                        bytes,
-                        &sub_layout,
-                        &schema.fields,
-                        original as usize,
-                        paste_base,
-                    )?;
+        match slot.list_element {
+            // Phase 10-c: `List<String>` / `List<Schema>` payloads are
+            // pointer arrays whose entries also reference tail-area
+            // records. Each entry needs `+ paste_base` so the reader can
+            // still resolve through them. `List<Int>` / `List<Float>` /
+            // `List<Bool>` are inline-fixed and need no per-element
+            // rebase.
+            Some(ListElementKind::PointerArray { .. }) => {
+                relocate_list_pointer_array(
+                    bytes,
+                    original as usize,
+                    slot.nested.as_deref(),
+                    paste_base,
+                )?;
+            }
+            Some(ListElementKind::InlineFixed { .. }) | None => {
+                if let Some(nested) = slot.nested.as_deref() {
+                    relocate_pointers(bytes, nested, original as usize, paste_base)?;
                 }
-                TypeRepr::List { element } => {
-                    // Phase 10-c: `List<String>` / `List<Schema>` payloads
-                    // are pointer arrays whose entries also reference
-                    // tail-area records. Each entry needs `+ paste_base`
-                    // so the reader can still resolve through them.
-                    // `List<Int>` / `List<Float>` / `List<Bool>` are
-                    // inline-fixed and need no per-element rebase.
-                    if let Some(ListElementKind::PointerArray { .. }) = fo.list_element {
-                        relocate_list_pointer_array(
-                            bytes,
-                            original as usize,
-                            element.as_ref(),
-                            paste_base,
-                        )?;
-                    }
-                }
-                _ => {}
             }
         }
     }
@@ -962,7 +1032,7 @@ fn relocate_pointers(
 fn relocate_list_pointer_array(
     bytes: &mut [u8],
     record_start: usize,
-    element: &TypeRepr,
+    element_reloc: Option<&RelocLayout>,
     paste_base: u32,
 ) -> Result<(), &'static str> {
     if record_start
@@ -976,14 +1046,6 @@ fn relocate_list_pointer_array(
     len_buf.copy_from_slice(&bytes[record_start..record_start + 4]);
     let count = u32::from_le_bytes(len_buf) as usize;
     let mut cursor = record_start + 4;
-    let sub_layout_cached = match element {
-        TypeRepr::Schema { schema } => Some((
-            SchemaLayout::offsets_for(schema)
-                .map_err(|_| "nested list schema layout failed during relocation")?,
-            schema.fields.clone(),
-        )),
-        _ => None,
-    };
     for _ in 0..count {
         if cursor
             .checked_add(4)
@@ -1000,9 +1062,11 @@ fn relocate_list_pointer_array(
             .ok_or("relocated list-entry pointer overflows u32")?;
         bytes[cursor..cursor + 4].copy_from_slice(&relocated.to_le_bytes());
         // Recurse into Schema entries so their own pointer-indirect
-        // slots (e.g. an inner String) get rebased.
-        if let Some((sub_layout, sub_fields)) = &sub_layout_cached {
-            relocate_pointers(bytes, sub_layout, sub_fields, original as usize, paste_base)?;
+        // slots (e.g. an inner String) get rebased. `element_reloc` is
+        // `None` for `List<String>` / `List<Int>` etc. where entries
+        // don't carry further pointers.
+        if let Some(element_reloc) = element_reloc {
+            relocate_pointers(bytes, element_reloc, original as usize, paste_base)?;
         }
         cursor += 4;
     }
