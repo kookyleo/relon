@@ -30,7 +30,7 @@ fn load_field_emits_load_op() {
 }
 
 #[test]
-fn load_emits_bounds_guard_before() {
+fn load_emits_not_null_guard_before() {
     let mut r = RecorderState::new();
     let base = match r.record_op(&Op::ConstI64(0x2000), &[], None) {
         RecordResult::Ok { value: Some(v) } => v,
@@ -45,17 +45,13 @@ fn load_emits_bounds_guard_before() {
         None,
     );
     let buf = r.finalize().unwrap();
-    let bounds = buf
+    // Schema-bounded offset → only a non-null base check at runtime.
+    let not_null = buf
         .ops
         .iter()
-        .filter(|o| {
-            matches!(
-                o,
-                TraceOp::Guard(relon_trace_jit::GuardKind::BoundsCheck(_, _), _)
-            )
-        })
+        .filter(|o| matches!(o, TraceOp::Guard(relon_trace_jit::GuardKind::NotNull(_), _)))
         .count();
-    assert!(bounds >= 1, "expected at least one BoundsCheck guard");
+    assert!(not_null >= 1, "expected at least one NotNull guard");
 }
 
 #[test]

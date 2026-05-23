@@ -356,7 +356,10 @@ pub fn lower_op(op: &Op, cx: OpLoweringContext<'_>) -> LowerOutcome {
             LowerOutcome::Emit {
                 op: TraceOp::Load(cx.fresh_dst, base, Offset(*offset as i32)),
                 dst: Some(cx.fresh_dst),
-                guards_before: vec![GuardKind::BoundsCheck(base, base)],
+                // The offset is bounded by the schema layout at IR
+                // construction time; the only runtime check needed
+                // is that `base` is non-null.
+                guards_before: vec![GuardKind::NotNull(base)],
                 guards_after: vec![GuardKind::TypeCheck(cx.fresh_dst, ty_to_observed(*ty))],
                 effect: TraceEffect::ReadOnly,
             }
@@ -367,7 +370,9 @@ pub fn lower_op(op: &Op, cx: OpLoweringContext<'_>) -> LowerOutcome {
             LowerOutcome::Emit {
                 op: TraceOp::Store(base, Offset(*offset as i32), value),
                 dst: None,
-                guards_before: vec![GuardKind::BoundsCheck(base, base)],
+                // Offset bounded at IR construction; only the
+                // non-null check matters at runtime.
+                guards_before: vec![GuardKind::NotNull(base)],
                 guards_after: vec![],
                 effect: TraceEffect::RecoverableWrite,
             }
