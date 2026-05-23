@@ -1400,39 +1400,7 @@ fn lower_schema_method(
     node: &SyntaxNode,
     source: &str,
 ) -> Option<(crate::SchemaMethod, Vec<String>)> {
-    // The legacy parser's `method_start` is the input position *after*
-    // consuming leading pragma directives AND the trivia between the
-    // last pragma and the method name. Concretely it lands on the
-    // method name IDENT — even when one or more `#derive` / `#native` /
-    // `#private` pragmas precede it. We replicate that by skipping
-    // every DIRECTIVE child (and surrounding trivia) and taking the
-    // first IDENT token we encounter.
-    let method_start: usize = {
-        let mut found: Option<usize> = None;
-        for el in node.children_with_tokens() {
-            match el {
-                rowan::NodeOrToken::Token(t) => match t.kind() {
-                    SyntaxKind::WHITESPACE
-                    | SyntaxKind::LINE_COMMENT
-                    | SyntaxKind::BLOCK_COMMENT => continue,
-                    SyntaxKind::IDENT => {
-                        found = Some(t.text_range().start().into());
-                        break;
-                    }
-                    _ => continue,
-                },
-                rowan::NodeOrToken::Node(n) => {
-                    if n.kind() == SyntaxKind::DIRECTIVE {
-                        continue;
-                    }
-                    // Non-DIRECTIVE node at the start would be unusual —
-                    // CST shape places the method-name IDENT first.
-                    break;
-                }
-            }
-        }
-        found.unwrap_or_else(|| node.text_range().start().into())
-    };
+    let method_start = method_name_offset(node);
     let method_end: usize = node.text_range().end().into();
 
     let mut derives: Vec<String> = Vec::new();
@@ -1446,7 +1414,6 @@ fn lower_schema_method(
     let mut body: Option<Box<crate::Node>> = None;
     let mut saw_arrow = false;
     let mut in_generics = false;
-    let mut after_name = false;
     let mut after_body_colon = false;
     let mut body_after_colon_ast: Option<ast::Expr> = None;
 
@@ -1465,13 +1432,11 @@ fn lower_schema_method(
                         let s: usize = tr.start().into();
                         let e: usize = tr.end().into();
                         name = Some((t.text().to_string(), range_from_offsets(source, s, e)));
-                        after_name = true;
                         continue;
                     }
                     if in_generics {
                         method_generics.push(t.text().to_string());
                     }
-                    let _ = after_name;
                 }
                 SyntaxKind::LT => in_generics = true,
                 SyntaxKind::GT => in_generics = false,
@@ -1553,6 +1518,35 @@ fn lower_schema_method(
         },
         schema_no_auto_derives,
     ))
+}
+
+/// Locate the byte offset of the method-name IDENT inside a
+/// SCHEMA_METHOD node. Mirrors the legacy parser's `method_start`:
+/// skip leading pragma directives (`#derive` / `#native` / `#private`)
+/// and their surrounding trivia, then return the first IDENT's start.
+/// Falls back to the SCHEMA_METHOD node's own start for shapes that
+/// don't carry an IDENT (parser-recovery cases).
+fn method_name_offset(node: &SyntaxNode) -> usize {
+    for el in node.children_with_tokens() {
+        match el {
+            rowan::NodeOrToken::Token(t) => match t.kind() {
+                SyntaxKind::WHITESPACE | SyntaxKind::LINE_COMMENT | SyntaxKind::BLOCK_COMMENT => {
+                    continue
+                }
+                SyntaxKind::IDENT => return t.text_range().start().into(),
+                _ => continue,
+            },
+            rowan::NodeOrToken::Node(n) => {
+                if n.kind() == SyntaxKind::DIRECTIVE {
+                    continue;
+                }
+                // Non-DIRECTIVE node at the start would be unusual — the
+                // CST shape places the method-name IDENT first.
+                break;
+            }
+        }
+    }
+    node.text_range().start().into()
 }
 
 /// One `name: Type` parameter inside a SCHEMA_METHOD's param list.
