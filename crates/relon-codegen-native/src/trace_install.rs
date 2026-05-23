@@ -657,7 +657,10 @@ impl TraceJitState {
     /// for the same `fn_id` if any (caller may keep the `Arc` alive
     /// to drain in-flight invocations).
     pub fn install_trace(&self, fn_id: u32, trace_fn: JITedTraceFn) -> Option<Arc<JITedTraceFn>> {
-        let _w = self.write_lock.lock().expect("trace_fns write lock poisoned");
+        let _w = self
+            .write_lock
+            .lock()
+            .expect("trace_fns write lock poisoned");
         let mut next = (**self.trace_fns.load()).clone();
         let prev = next.insert(fn_id, Arc::new(trace_fn));
         self.trace_fns.store(Arc::new(next));
@@ -669,7 +672,10 @@ impl TraceJitState {
     /// unsalvageable (e.g. a type-check guard fired and the recorder's
     /// observed-type assumption is no longer valid).
     pub fn invalidate_trace(&self, fn_id: u32) -> Option<Arc<JITedTraceFn>> {
-        let _w = self.write_lock.lock().expect("trace_fns write lock poisoned");
+        let _w = self
+            .write_lock
+            .lock()
+            .expect("trace_fns write lock poisoned");
         let mut next = (**self.trace_fns.load()).clone();
         let prev = next.remove(&fn_id);
         self.trace_fns.store(Arc::new(next));
