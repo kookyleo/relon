@@ -17,13 +17,27 @@
 //!
 //! ## Lookup performance
 //!
-//! Backed by a `HashMap` keyed on the raw `u64` of `ExternalAddr`.
-//! For trace-heavy workloads the table is small (each trace touches
-//! O(callees-in-trace) entries; bounded by trace length). The
-//! amortised O(1) hash lookup keeps the helper well under 100 ns on
-//! tables with thousands of entries — verified in tests.
+//! Backed by a `Vec<(u64, *const u8)>` kept sorted by raw key. Mutation
+//! (register / unregister) is O(log N) lookup + O(N) shift, which is
+//! cheap because:
+//!
+//! 1. Mutations happen at trace-install time, far from the steady-state
+//!    hot path.
+//! 2. Per-trace tables are small (bounded by callees in the trace),
+//!    typically <32 entries — well inside the regime where a
+//!    branch-predicted binary search on a contiguous array beats a
+//!    hashed lookup with its load-factor probing and pointer chase.
+//!
+//! Resolution uses `slice::binary_search_by_key`, cache-friendly and
+//! branch-predictable for repeated lookups on the same key (which is
+//! the common pattern when a trace re-executes its call sites).
+//!
+//! P2-11 chose this "freeze-on-install" sorted-array form over a more
+//! invasive IR-immediate patch (option B) because it preserves the
+//! existing host ABI and the hot-swap contract while still removing
+//! the `FxHashMap` / `RefCell` book-keeping from the steady-state
+//! resolve path.
 
-use rustc_hash::FxHashMap;
 use std::cell::RefCell;
 
 use crate::runtime::deopt::TraceContext;
@@ -36,11 +50,17 @@ use crate::trace_ir::ExternalAddr;
 /// without recompiling installed traces.
 #[derive(Default)]
 pub struct ExternalCallTable {
-    /// raw_addr -> fn_ptr. Raw `u64` keys keep the lookup
-    /// representation-stable across `ExternalAddr` repacking
-    /// (e.g. when v6-gamma decides to fold a type tag into the high
-    /// bits — see `ExternalAddr` TODO in `trace_ir.rs`).
-    entries: FxHashMap<u64, *const u8>,
+    /// `(raw_addr, fn_ptr)` pairs kept sorted by `raw_addr`. Raw `u64`
+    /// keys keep the lookup representation-stable across
+    /// `ExternalAddr` repacking (e.g. when v6-gamma decides to fold a
+    /// type tag into the high bits — see `ExternalAddr` TODO in
+    /// `trace_ir.rs`).
+    ///
+    /// Sorted-array layout (rather than `FxHashMap`) keeps the
+    /// steady-state `resolve` cache-friendly: a single contiguous
+    /// allocation with binary search, instead of hash-probe + bucket
+    /// indirection.
+    entries: Vec<(u64, *const u8)>,
 }
 
 impl std::fmt::Debug for ExternalCallTable {
@@ -55,27 +75,52 @@ impl ExternalCallTable {
     /// New empty table.
     pub fn new() -> Self {
         Self {
-            entries: FxHashMap::default(),
+            entries: Vec::new(),
         }
     }
 
     /// Register (or replace) the function pointer for `external_addr`.
     /// The host calls this when installing a trace's call references.
+    ///
+    /// Insertion keeps `entries` sorted by raw key so that
+    /// [`Self::resolve`] can binary-search without re-sorting per
+    /// lookup. Cost is O(log N) for the position + O(N) for the shift,
+    /// paid once at install time.
     pub fn register(&mut self, external_addr: ExternalAddr, fn_ptr: *const u8) {
-        self.entries.insert(external_addr.0, fn_ptr);
+        let key = external_addr.0;
+        match self.entries.binary_search_by_key(&key, |&(k, _)| k) {
+            Ok(idx) => {
+                // Hot-swap: replace the fn ptr in place, preserving
+                // the design-doc §1.4 contract that installed trace
+                // code never re-resolves to a stale pointer.
+                self.entries[idx].1 = fn_ptr;
+            }
+            Err(idx) => {
+                self.entries.insert(idx, (key, fn_ptr));
+            }
+        }
     }
 
     /// Look up the function pointer for `external_addr`. Returns
     /// `None` if unregistered — callers map that to a null pointer
     /// before returning to the cranelift trace, which then deopts.
+    #[inline]
     pub fn resolve(&self, external_addr: ExternalAddr) -> Option<*const u8> {
-        self.entries.get(&external_addr.0).copied()
+        let key = external_addr.0;
+        match self.entries.binary_search_by_key(&key, |&(k, _)| k) {
+            Ok(idx) => Some(self.entries[idx].1),
+            Err(_) => None,
+        }
     }
 
     /// Drop the registration for `external_addr`. Returns the prior
     /// pointer if any, mirroring `HashMap::remove`.
     pub fn unregister(&mut self, external_addr: ExternalAddr) -> Option<*const u8> {
-        self.entries.remove(&external_addr.0)
+        let key = external_addr.0;
+        match self.entries.binary_search_by_key(&key, |&(k, _)| k) {
+            Ok(idx) => Some(self.entries.remove(idx).1),
+            Err(_) => None,
+        }
     }
 
     /// Number of installed entries; exposed for diagnostics + tests.
@@ -282,6 +327,41 @@ mod tests {
         // Sanity: sink read non-null pointers so the loop didn't get
         // optimised away.
         assert_ne!(sink, 0);
+    }
+
+    #[test]
+    fn register_replaces_existing_entry_in_place() {
+        // Hot-swap: re-registering the same addr must replace the
+        // pointer without growing the table or breaking ordering.
+        let mut table = ExternalCallTable::new();
+        let addr = ExternalAddr(0x99);
+        table.register(addr, fake_fn_ptr(1));
+        table.register(addr, fake_fn_ptr(2));
+        assert_eq!(table.len(), 1);
+        assert_eq!(table.resolve(addr), Some(fake_fn_ptr(2)));
+    }
+
+    #[test]
+    fn entries_stay_sorted_after_mixed_insertions() {
+        // Sorted-array invariant is what makes binary_search correct;
+        // exercise out-of-order inserts and an unregister to confirm
+        // the order is preserved.
+        let mut table = ExternalCallTable::new();
+        let keys: [u64; 5] = [42, 7, 999, 100, 3];
+        for (i, k) in keys.iter().enumerate() {
+            table.register(ExternalAddr(*k), fake_fn_ptr(i));
+        }
+        // Drop one mid-table entry, then look up the rest.
+        assert!(table.unregister(ExternalAddr(100)).is_some());
+        let expected = [(3u64, 4usize), (7, 1), (42, 0), (999, 2)];
+        for (k, id) in expected {
+            assert_eq!(
+                table.resolve(ExternalAddr(k)),
+                Some(fake_fn_ptr(id)),
+                "missing or wrong entry for key={k}"
+            );
+        }
+        assert_eq!(table.len(), 4);
     }
 
     #[test]
