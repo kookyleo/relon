@@ -149,6 +149,20 @@ pub fn register_to(ctx: &mut Context) {
     ctx.register_pure_fn("to_json", Arc::clone(&to_json));
     ctx.register_pure_fn("from_json", Arc::clone(&from_json));
 
+    // Stdlib JSON Schema parity wave — batch 2: numeric helpers.
+    let in_range: Arc<dyn RelonFunction> = Arc::new(InRange);
+    let math_round: Arc<dyn RelonFunction> = Arc::new(MathRound);
+    let math_floor: Arc<dyn RelonFunction> = Arc::new(MathFloor);
+    let math_ceil: Arc<dyn RelonFunction> = Arc::new(MathCeil);
+    let math_sqrt: Arc<dyn RelonFunction> = Arc::new(MathSqrt);
+    let math_pow: Arc<dyn RelonFunction> = Arc::new(MathPow);
+    ctx.register_pure_fn("in_range", Arc::clone(&in_range));
+    ctx.register_pure_fn("round", Arc::clone(&math_round));
+    ctx.register_pure_fn("floor", Arc::clone(&math_floor));
+    ctx.register_pure_fn("ceil", Arc::clone(&math_ceil));
+    ctx.register_pure_fn("sqrt", Arc::clone(&math_sqrt));
+    ctx.register_pure_fn("pow", Arc::clone(&math_pow));
+
     // Phase D 收尾: schema-rooted method aliases for the same Rust
     // intrinsics. Decision 14 (`schema-rooted-model-2026-05-11.md`):
     // `method` is the model's center; free-fn forms above remain for
@@ -2733,6 +2747,128 @@ fn json_to_value(json: serde_json::Value) -> Value {
         serde_json::Value::Object(o) => {
             Value::dict(o.into_iter().map(|(k, v)| (k, json_to_value(v))))
         }
+    }
+}
+
+// ============================================================
+// Stdlib JSON Schema parity wave — batch 2: numeric helpers
+// ============================================================
+
+/// `in_range(n, lo, hi) -> Bool` — inclusive range check. Accepts
+/// any mix of Int / Float. JSON Schema `minimum` + `maximum`
+/// covered.
+struct InRange;
+impl RelonFunction for InRange {
+    fn call(
+        &self,
+        args: NativeArgs,
+        range: relon_parser::TokenRange,
+    ) -> Result<Value, RuntimeError> {
+        let args = args.into_positional();
+        expect_arg_count(&args, 3, range)?;
+        let n = to_f64_val(&args[0]);
+        let lo = to_f64_val(&args[1]);
+        let hi = to_f64_val(&args[2]);
+        Ok(Value::Bool(n >= lo && n <= hi))
+    }
+}
+
+/// `round(n) -> Int` — banker's rounding (round-half-to-even via
+/// f64's `round_ties_even` since 1.77). Int input returns
+/// unchanged.
+struct MathRound;
+impl RelonFunction for MathRound {
+    fn call(
+        &self,
+        args: NativeArgs,
+        range: relon_parser::TokenRange,
+    ) -> Result<Value, RuntimeError> {
+        let args = args.into_positional();
+        expect_arg_count(&args, 1, range)?;
+        match &args[0] {
+            Value::Int(n) => Ok(Value::Int(*n)),
+            Value::Float(f) => Ok(Value::Int(f.into_inner().round_ties_even() as i64)),
+            other => Err(RuntimeError::TypeMismatch {
+                expected: "Number".to_string(),
+                found: other.type_name().to_string(),
+                range,
+            }),
+        }
+    }
+}
+
+/// `floor(n) -> Int`
+struct MathFloor;
+impl RelonFunction for MathFloor {
+    fn call(
+        &self,
+        args: NativeArgs,
+        range: relon_parser::TokenRange,
+    ) -> Result<Value, RuntimeError> {
+        let args = args.into_positional();
+        expect_arg_count(&args, 1, range)?;
+        match &args[0] {
+            Value::Int(n) => Ok(Value::Int(*n)),
+            Value::Float(f) => Ok(Value::Int(f.into_inner().floor() as i64)),
+            other => Err(RuntimeError::TypeMismatch {
+                expected: "Number".to_string(),
+                found: other.type_name().to_string(),
+                range,
+            }),
+        }
+    }
+}
+
+/// `ceil(n) -> Int`
+struct MathCeil;
+impl RelonFunction for MathCeil {
+    fn call(
+        &self,
+        args: NativeArgs,
+        range: relon_parser::TokenRange,
+    ) -> Result<Value, RuntimeError> {
+        let args = args.into_positional();
+        expect_arg_count(&args, 1, range)?;
+        match &args[0] {
+            Value::Int(n) => Ok(Value::Int(*n)),
+            Value::Float(f) => Ok(Value::Int(f.into_inner().ceil() as i64)),
+            other => Err(RuntimeError::TypeMismatch {
+                expected: "Number".to_string(),
+                found: other.type_name().to_string(),
+                range,
+            }),
+        }
+    }
+}
+
+/// `sqrt(n) -> Float` — IEEE-754 sqrt; negative input returns
+/// `NaN` per f64 semantics rather than erroring.
+struct MathSqrt;
+impl RelonFunction for MathSqrt {
+    fn call(
+        &self,
+        args: NativeArgs,
+        range: relon_parser::TokenRange,
+    ) -> Result<Value, RuntimeError> {
+        let args = args.into_positional();
+        expect_arg_count(&args, 1, range)?;
+        Ok(Value::Float(to_f64_val(&args[0]).sqrt().into()))
+    }
+}
+
+/// `pow(base, exp) -> Float` — IEEE-754 powf.
+struct MathPow;
+impl RelonFunction for MathPow {
+    fn call(
+        &self,
+        args: NativeArgs,
+        range: relon_parser::TokenRange,
+    ) -> Result<Value, RuntimeError> {
+        let args = args.into_positional();
+        expect_arg_count(&args, 2, range)?;
+        Ok(Value::Float(
+            to_f64_val(&args[0]).powf(to_f64_val(&args[1])).into(),
+        ))
     }
 }
 
