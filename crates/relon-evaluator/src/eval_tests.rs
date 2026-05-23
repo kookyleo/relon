@@ -1539,7 +1539,7 @@ fn test_brand_decorator_at_document_root() {
     });
     // Synthesize a `Weather` schema and seed it into the surrounding
     // scope so the root-level `#brand` can resolve it.
-    let weather_schema = Value::Schema(Box::new(crate::value::SchemaData {
+    let weather_schema = Value::Schema(std::sync::Arc::new(crate::value::SchemaData {
         generics: Vec::new(),
         fields: {
             let mut fields = HashMap::new();

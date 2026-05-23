@@ -97,20 +97,24 @@ pub struct ClosureData {
     pub captured_env: Arc<Scope>,
 }
 
-/// Inline payload for `Value::Schema`, boxed for the same reason as
-/// [`ClosureData`]: the inner `HashMap<String, SchemaField>` keeps a
-/// raw-table header that pushes the enum width into the >100-byte
-/// range when stored inline.
+/// Inline payload for `Value::Schema`, refcounted out of the enum for
+/// the same width rationale as [`ClosureData`]: the inner
+/// `HashMap<String, SchemaField>` keeps a raw-table header that pushes
+/// the enum width into the >100-byte range when stored inline. The
+/// payload rides an `Arc` (P2-5) so cloning a `Value::Schema` — which
+/// `check_type` does on every typed-field access — only bumps a
+/// refcount instead of deep-cloning the field map.
 #[derive(Debug, Clone)]
 pub struct SchemaData {
     pub generics: Vec<String>,
     pub fields: std::collections::HashMap<String, SchemaField>,
 }
 
-/// Inline payload for `Value::EnumSchema`, boxed for the same reason:
-/// the nested `HashMap<String, HashMap<String, SchemaField>>` is the
-/// largest variant we hold today, and box-indirection collapses it to
-/// a single pointer in the enum layout.
+/// Inline payload for `Value::EnumSchema`, refcounted for the same
+/// reason: the nested `HashMap<String, HashMap<String, SchemaField>>`
+/// is the largest variant we hold today, and `Arc` indirection
+/// collapses it to a single pointer in the enum layout while keeping
+/// clones O(1).
 #[derive(Debug, Clone)]
 pub struct EnumSchemaData {
     pub name: String,
@@ -129,12 +133,14 @@ pub struct EnumSchemaData {
 /// `path_cache`/`module_cache` maps; without `Arc`-sharing every cache hit
 /// would deep-clone the cached structure.
 ///
-/// The "heavy" variants (`Closure`, `Schema`, `EnumSchema`) are boxed so
-/// the enum stays narrow: the comprehension hot loop stores `Value`s in
-/// per-iteration scope HashMaps, and the bucket size scales with the enum
-/// width. Boxing trades one allocation at construction (already a cold
-/// path: closures / schemas materialise once and are reused) for a much
-/// cheaper hash table grow path on every iteration.
+/// The "heavy" variants (`Closure`, `Schema`, `EnumSchema`) live behind
+/// pointers so the enum stays narrow: the comprehension hot loop stores
+/// `Value`s in per-iteration scope HashMaps, and the bucket size scales
+/// with the enum width. `Schema` / `EnumSchema` use `Arc` (P2-5) — the
+/// `check_type` path clones the schema value out of the type table per
+/// typed-field validation, and a deep field-map clone there was a
+/// measurable cost; refcount-clone collapses it to a single atomic bump
+/// while keeping immutable-snapshot semantics.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum Value {
@@ -152,15 +158,15 @@ pub enum Value {
     /// Payload is boxed; see [`ClosureData`].
     #[serde(skip)]
     Closure(Box<ClosureData>),
-    /// A user-defined type schema. Payload is boxed; see [`SchemaData`].
+    /// A user-defined type schema. Payload is refcounted; see [`SchemaData`].
     #[serde(skip)]
-    Schema(Box<SchemaData>),
+    Schema(Arc<SchemaData>),
     /// A tagged-enum (sum-type) schema: variants by name, each with its
     /// own field set. Built from `#schema Name: Enum<Var1 { ... }, ...>`.
     /// Construction with `Name.Var1 { ... }` is dispatched via this value.
-    /// Payload is boxed; see [`EnumSchemaData`].
+    /// Payload is refcounted; see [`EnumSchemaData`].
     #[serde(skip)]
-    EnumSchema(Box<EnumSchemaData>),
+    EnumSchema(Arc<EnumSchemaData>),
     /// A single type description. The payload (`TypeNode`) carries a
     /// `TokenRange` plus a `Vec<TypeNode>` of generics that together push
     /// the inline size past 100 bytes; boxing keeps the enum compact
@@ -301,6 +307,12 @@ impl Value {
                 }
             }
             (Value::Schema(base), Value::Schema(patch)) => {
+                // P2-5: `base` is now `Arc<SchemaData>`. Materialise a
+                // unique handle via `Arc::make_mut` so we only deep-copy
+                // when another holder still aliases this schema; the
+                // typical post-eval merge path holds the only refcount
+                // and stays clone-free.
+                let base = Arc::make_mut(base);
                 let base_fields = &mut base.fields;
                 let patch_fields = &patch.fields;
                 for (k, v) in patch_fields {
@@ -325,6 +337,7 @@ impl Value {
                 }
             }
             (Value::Schema(base), Value::Dict(patch_data)) => {
+                let base = Arc::make_mut(base);
                 let base_fields = &mut base.fields;
                 for (k, v) in &patch_data.map {
                     if let Some(base_field) = base_fields.get_mut(k) {

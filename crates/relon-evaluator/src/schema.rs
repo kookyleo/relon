@@ -182,8 +182,13 @@ impl TreeWalkEvaluator {
         }
 
         match schema_val {
-            Value::Schema(schema_box) => {
-                let crate::value::SchemaData { generics, fields } = *schema_box;
+            Value::Schema(schema_arc) => {
+                // P2-5: unwrap the `Arc` in-place when we hold the
+                // sole refcount (e.g. a freshly-cloned schema lookup
+                // whose original handle has already been dropped);
+                // fall back to a deep clone otherwise.
+                let crate::value::SchemaData { generics, fields } =
+                    Arc::try_unwrap(schema_arc).unwrap_or_else(|arc| (*arc).clone());
                 let mut subst_map = HashMap::new();
                 for (i, gname) in generics.iter().enumerate() {
                     if let Some(gtype) = type_hint.generics.get(i) {
@@ -218,10 +223,13 @@ impl TreeWalkEvaluator {
                 }
                 Ok(())
             }
-            Value::EnumSchema(enum_box) => {
+            Value::EnumSchema(enum_arc) => {
+                // P2-5: same `Arc::try_unwrap` shape as the
+                // `Value::Schema` arm above — cheap when uniquely
+                // owned, one deep clone otherwise.
                 let crate::value::EnumSchemaData {
                     generics, variants, ..
-                } = *enum_box;
+                } = Arc::try_unwrap(enum_arc).unwrap_or_else(|arc| (*arc).clone());
                 let variant_name = match value {
                     Value::Dict(d) => d.brand.clone(),
                     _ => {
@@ -514,7 +522,14 @@ impl TreeWalkEvaluator {
                     range: base.node.range,
                 });
             };
-            merge_schema_fields(&mut fields, base_schema.fields);
+            // P2-5: extract the field map out of the `Arc` payload —
+            // unique handle gives us the map for free, shared handle
+            // (e.g. a prelude/registered schema reused elsewhere)
+            // falls back to a deep clone of just the field set.
+            let base_fields = Arc::try_unwrap(base_schema)
+                .map(|d| d.fields)
+                .unwrap_or_else(|arc| arc.fields.clone());
+            merge_schema_fields(&mut fields, base_fields);
         }
         for field_def in &def.fields {
             self.apply_field_def(field_def, &mut fields, scope)?;

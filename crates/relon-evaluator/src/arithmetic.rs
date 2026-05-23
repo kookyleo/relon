@@ -77,10 +77,16 @@ impl TreeWalkEvaluator {
                 Expr::Dict(_) | Expr::Binary(Operator::Add, _, _)
             )
         {
-            let Value::Schema(base_box) = l else {
+            let Value::Schema(base_arc) = l else {
                 unreachable!()
             };
-            let base_fields = base_box.fields;
+            // P2-5: payload now rides an `Arc`. Take ownership in-place
+            // when we hold the only refcount (the typical case here,
+            // since `l` was just produced by `self.eval`), otherwise
+            // fall back to a one-time deep clone.
+            let base_fields = Arc::try_unwrap(base_arc)
+                .map(|d| d.fields)
+                .unwrap_or_else(|arc| arc.fields.clone());
             let merged_fields = match right.expr.as_ref() {
                 Expr::Dict(pairs) => {
                     self.merge_schema_with_dict_pairs(base_fields, pairs, scope)?
@@ -105,7 +111,7 @@ impl TreeWalkEvaluator {
                     merged
                 }
             };
-            return Ok(Value::Schema(Box::new(crate::value::SchemaData {
+            return Ok(Value::Schema(Arc::new(crate::value::SchemaData {
                 generics: Vec::new(),
                 fields: merged_fields,
             })));

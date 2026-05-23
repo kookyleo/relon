@@ -381,7 +381,7 @@ impl TreeWalkEvaluator {
             // Same trick `prepare_dict_scope` uses for the field-form.
             scope.locals_for_write().insert(
                 Arc::from(decl.name.as_str()),
-                Value::Schema(Box::new(crate::value::SchemaData {
+                Value::Schema(Arc::new(crate::value::SchemaData {
                     // v1.8+ fix (issue 4): the placeholder uses the
                     // real generic param names so a recursive body
                     // referring to `Box<T>` already sees the right
@@ -414,7 +414,7 @@ impl TreeWalkEvaluator {
                 self.build_root_enum_schema(&def)
             } else {
                 let fields = self.build_schema_from_def(&def, scope)?;
-                Value::Schema(Box::new(crate::value::SchemaData {
+                Value::Schema(Arc::new(crate::value::SchemaData {
                     generics: def.generics.clone(),
                     fields,
                 }))
@@ -456,7 +456,7 @@ impl TreeWalkEvaluator {
             }
             variants.insert(variant.name.clone(), fields);
         }
-        Value::EnumSchema(Box::new(crate::value::EnumSchemaData {
+        Value::EnumSchema(Arc::new(crate::value::EnumSchemaData {
             name: def.name.clone().unwrap_or_default(),
             generics: def.generics.clone(),
             variants,
@@ -994,7 +994,7 @@ impl TreeWalkEvaluator {
                     return Ok(self.build_root_enum_schema(def));
                 }
                 let fields = self.build_schema_from_def(def, scope)?;
-                return Ok(Value::Schema(Box::new(crate::value::SchemaData {
+                return Ok(Value::Schema(Arc::new(crate::value::SchemaData {
                     generics: def.generics.clone(),
                     fields,
                 })));
@@ -1013,7 +1013,7 @@ impl TreeWalkEvaluator {
             return Ok(self.build_root_enum_schema(&def));
         }
         let fields = self.build_schema_from_def(&def, scope)?;
-        Ok(Value::Schema(Box::new(crate::value::SchemaData {
+        Ok(Value::Schema(Arc::new(crate::value::SchemaData {
             generics: def.generics.clone(),
             fields,
         })))
@@ -1083,7 +1083,7 @@ impl TreeWalkEvaluator {
                                 return Ok(Some(self.build_root_enum_schema(def)));
                             }
                             let fields = self.build_schema_from_def(def, current_scope)?;
-                            return Ok(Some(Value::Schema(Box::new(crate::value::SchemaData {
+                            return Ok(Some(Value::Schema(Arc::new(crate::value::SchemaData {
                                 generics: def.generics.clone(),
                                 fields,
                             }))));
@@ -1096,7 +1096,7 @@ impl TreeWalkEvaluator {
                             return Ok(Some(self.build_root_enum_schema(&def)));
                         }
                         let fields = self.build_schema_from_def(&def, current_scope)?;
-                        return Ok(Some(Value::Schema(Box::new(crate::value::SchemaData {
+                        return Ok(Some(Value::Schema(Arc::new(crate::value::SchemaData {
                             generics: def.generics.clone(),
                             fields,
                         }))));
@@ -1405,7 +1405,7 @@ impl TreeWalkEvaluator {
                                 self.build_root_enum_schema(&def)
                             } else {
                                 let fields = self.build_schema_from_def(&def, &module_scope)?;
-                                Value::Schema(Box::new(crate::value::SchemaData {
+                                Value::Schema(Arc::new(crate::value::SchemaData {
                                     generics: def.generics.clone(),
                                     fields,
                                 }))
@@ -1460,18 +1460,22 @@ impl TreeWalkEvaluator {
             }
         }
         let enum_name = enum_path.join(".");
-        let Value::EnumSchema(enum_box) = current else {
+        let Value::EnumSchema(enum_arc) = current else {
             return Err(RuntimeError::TypeMismatch {
                 expected: format!("EnumSchema `{enum_name}`"),
                 found: current.type_name().to_string(),
                 range,
             });
         };
+        // P2-5: payload now lives behind `Arc`. Take ownership when
+        // uniquely held (common: `current` was just resolved off the
+        // scope's local copy) and fall back to a deep clone of the
+        // variants table when shared.
         let crate::value::EnumSchemaData {
             name,
             generics,
             variants,
-        } = *enum_box;
+        } = Arc::try_unwrap(enum_arc).unwrap_or_else(|arc| (*arc).clone());
         let name = if name.is_empty() {
             enum_name.clone()
         } else {
@@ -2271,7 +2275,7 @@ impl TreeWalkEvaluator {
                     }
                     locals.insert(
                         Arc::from(name.as_str()),
-                        Value::Schema(Box::new(crate::value::SchemaData {
+                        Value::Schema(Arc::new(crate::value::SchemaData {
                             generics: generics.clone(),
                             fields: HashMap::new(),
                         })),
@@ -2348,7 +2352,7 @@ impl TreeWalkEvaluator {
                         }
                         scope.locals_for_write().insert(
                             Arc::from(key_str.as_str()),
-                            Value::Schema(Box::new(crate::value::SchemaData {
+                            Value::Schema(Arc::new(crate::value::SchemaData {
                                 generics,
                                 fields: HashMap::new(),
                             })),
