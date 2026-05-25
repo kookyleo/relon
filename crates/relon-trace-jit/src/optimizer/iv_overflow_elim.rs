@@ -267,8 +267,14 @@ fn analyse_loop(trace: &TraceBuffer, lp: &LoopRange) -> Option<LoopRewrite> {
     let body_defs = index_body_defs(&trace.ops, body_start, body_end);
 
     // Find every Add { phi_k, step_k } in the body keyed by phi_k →
-    // the producing op. We require each phi to have exactly one such
-    // matching Add whose `dst` is the phi's `next_values[k]`.
+    // the producing op. Per-phi: if any single phi fails its proof,
+    // skip JUST that phi (don't taint the others — each proof is
+    // independent given the shared entry guard `n <= MAX_SAFE`). 2026-
+    // 05-25 refactor: previous behaviour returned None on first
+    // failure, which prevented W5's counter `i + 1` overflow guard
+    // from being stripped because the accumulator `count + dict_value`
+    // failed its bound check. The bound-check failure is irrelevant to
+    // the counter's safety.
     let mut dead_pcs: Vec<usize> = Vec::new();
     for (k, p) in phis.iter().enumerate() {
         let next = next_values[k];
@@ -276,14 +282,14 @@ fn analyse_loop(trace: &TraceBuffer, lp: &LoopRange) -> Option<LoopRewrite> {
         // must read this phi.
         let inc_pc = match body_defs.get(&next) {
             Some(&pc) => pc,
-            None => return None,
+            None => continue,
         };
         let (inc_lhs, inc_rhs) = match &trace.ops[inc_pc] {
             TraceOp::Add { dst, lhs, rhs } => {
                 debug_assert_eq!(*dst, next);
                 (*lhs, *rhs)
             }
-            _ => return None,
+            _ => continue,
         };
         // `phi` must be one of the operands; the other is the step.
         let step = if inc_lhs == p.phi {
@@ -291,13 +297,16 @@ fn analyse_loop(trace: &TraceBuffer, lp: &LoopRange) -> Option<LoopRewrite> {
         } else if inc_rhs == p.phi {
             inc_lhs
         } else {
-            return None;
+            continue;
         };
 
         // 4a. init must be a known constant in [0, MAX_SAFE_LOOP_BOUND].
-        let init_c = const_i64_of(&trace.ops, p.init, body_start)?;
+        let init_c = match const_i64_of(&trace.ops, p.init, body_start) {
+            Some(c) => c,
+            None => continue,
+        };
         if !(0..=MAX_SAFE_LOOP_BOUND).contains(&init_c) {
-            return None;
+            continue;
         }
 
         // 4b. step must be a non-negative bounded constant OR a
@@ -313,7 +322,7 @@ fn analyse_loop(trace: &TraceBuffer, lp: &LoopRange) -> Option<LoopRewrite> {
             }
         };
         if !step_ok {
-            return None;
+            continue;
         }
 
         // 4c. For non-exit phis, also confirm there's no per-iter
@@ -340,7 +349,7 @@ fn analyse_loop(trace: &TraceBuffer, lp: &LoopRange) -> Option<LoopRewrite> {
             let is_unit_const =
                 matches!(const_i64_anywhere(trace, step), Some(c) if (0..=1).contains(&c));
             if !is_bool_step && !is_unit_const {
-                return None;
+                continue;
             }
         }
 
