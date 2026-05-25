@@ -67,4 +67,11 @@ Bytecode subagent **完工** + 5 commits 已 cherry-pick：
 
 下次 fire 跑 release bench 回归验证 + 看 deopt panel 数字是否在 panel 里。
 
-<!-- 后续 iteration 追加 -->
+### Iteration 18 (2026-05-26 ~01:53, Phase C 完工)
+
+Panel 完工。10/10 trace-jit-applicable < 1.0× LuaJIT (W5 0.93× lucky cluster), 全无回归。B-4 deopt panel 19,000× 加速（在 jit_failure_modes.rs）。B-2/B-3 partial 但 IR lowering scope-out 文档化。
+
+完工报告: `docs/internal/bytecode-coverage-completion.md`
+任务 #262 → completed。Cron `82195b35` deleted。
+
+三个监控阶段 (#260/#261/#262) 全部 completed。
