@@ -166,9 +166,7 @@ fn w4_loop_drops_arith_overflow_guards_after_pipeline() {
 
     dump_ops("W4 post-pipeline", &buf_after.ops);
     println!("pipeline reports: {reports:#?}");
-    println!(
-        "ArithOverflow guards: before={arith_overflow_before} after={arith_overflow_after}"
-    );
+    println!("ArithOverflow guards: before={arith_overflow_before} after={arith_overflow_after}");
 
     assert!(
         arith_overflow_before >= 2,

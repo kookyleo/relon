@@ -226,10 +226,11 @@ fn analyse_loop(trace: &TraceBuffer, lp: &LoopRange) -> Option<LoopRewrite> {
     // 2. Snapshot the loop head's phis and the matching back's
     //    next_values. Bail if the marker pair is malformed.
     let (phis, next_values) = match (&trace.ops[lp.head_pc], &trace.ops[lp.back_pc]) {
-        (
-            TraceOp::MarkLoopHead { phis, .. },
-            TraceOp::MarkLoopBack { next_values, .. },
-        ) if phis.len() == next_values.len() => (phis.clone(), next_values.clone()),
+        (TraceOp::MarkLoopHead { phis, .. }, TraceOp::MarkLoopBack { next_values, .. })
+            if phis.len() == next_values.len() =>
+        {
+            (phis.clone(), next_values.clone())
+        }
         _ => return None,
     };
     if phis.is_empty() {
@@ -336,7 +337,8 @@ fn analyse_loop(trace: &TraceBuffer, lp: &LoopRange) -> Option<LoopRewrite> {
                 trace.type_info.get(&step).copied(),
                 Some(ObservedType::Bool)
             );
-            let is_unit_const = matches!(const_i64_anywhere(trace, step), Some(c) if (0..=1).contains(&c));
+            let is_unit_const =
+                matches!(const_i64_anywhere(trace, step), Some(c) if (0..=1).contains(&c));
             if !is_bool_step && !is_unit_const {
                 return None;
             }
@@ -367,10 +369,7 @@ fn analyse_loop(trace: &TraceBuffer, lp: &LoopRange) -> Option<LoopRewrite> {
     dead_pcs.sort_unstable();
     dead_pcs.dedup();
 
-    Some(LoopRewrite {
-        bound,
-        dead_pcs,
-    })
+    Some(LoopRewrite { bound, dead_pcs })
 }
 
 /// Returns `Some(c)` if `var` is defined by a `ConstI64 { dst: var, value: c }`
@@ -427,11 +426,7 @@ fn is_defined_outside_body(
     true
 }
 
-fn index_body_defs(
-    ops: &[TraceOp],
-    body_start: usize,
-    body_end: usize,
-) -> HashMap<SsaVar, usize> {
+fn index_body_defs(ops: &[TraceOp], body_start: usize, body_end: usize) -> HashMap<SsaVar, usize> {
     let mut out = HashMap::new();
     for (pc, op) in ops.iter().enumerate().take(body_end).skip(body_start) {
         for d in op.defs() {
@@ -453,10 +448,13 @@ fn rebuild_with_entry_guards(
     let old_ops = std::mem::take(&mut trace.ops);
     let mut entries_at: HashMap<usize, Vec<EntryGuardInsertion>> = HashMap::new();
     for e in entries {
-        entries_at.entry(e.before_pc).or_default().push(EntryGuardInsertion {
-            before_pc: e.before_pc,
-            n: e.n,
-        });
+        entries_at
+            .entry(e.before_pc)
+            .or_default()
+            .push(EntryGuardInsertion {
+                before_pc: e.before_pc,
+                n: e.n,
+            });
     }
     let mut new_ops: Vec<TraceOp> = Vec::with_capacity(old_ops.len() + entries.len() * 3);
     // Track the old→new pc map so we can rebind surviving guards.
@@ -611,7 +609,11 @@ mod tests {
             check: cmp_dst,
         };
         let isz_pc = b.append(isz);
-        b.record_guard(GuardSite::new(isz_pc, ExternalPc(11), GuardKind::IsZero(cmp_dst)));
+        b.record_guard(GuardSite::new(
+            isz_pc,
+            ExternalPc(11),
+            GuardKind::IsZero(cmp_dst),
+        ));
         let count_next = b.fresh_ssa();
         b.append(TraceOp::Add {
             dst: count_next,
@@ -734,10 +736,7 @@ mod tests {
         // Surviving guards' trace_pc must point at a real Guard op.
         for g in &b.guards {
             assert!(
-                matches!(
-                    b.ops.get(g.trace_pc as usize),
-                    Some(TraceOp::Guard { .. })
-                ),
+                matches!(b.ops.get(g.trace_pc as usize), Some(TraceOp::Guard { .. })),
                 "guard site trace_pc {} must point at a Guard op, got {:?}",
                 g.trace_pc,
                 b.ops.get(g.trace_pc as usize)
@@ -798,7 +797,11 @@ mod tests {
             kind: GuardKind::IsZero(cmp),
             check: cmp,
         });
-        b.record_guard(GuardSite::new(isz_pc, ExternalPc(7), GuardKind::IsZero(cmp)));
+        b.record_guard(GuardSite::new(
+            isz_pc,
+            ExternalPc(7),
+            GuardKind::IsZero(cmp),
+        ));
         let i_next = b.fresh_ssa();
         b.append(TraceOp::Add {
             dst: i_next,
@@ -881,7 +884,11 @@ mod tests {
             kind: GuardKind::IsZero(cmp),
             check: cmp,
         });
-        b.record_guard(GuardSite::new(isz_pc, ExternalPc(7), GuardKind::IsZero(cmp)));
+        b.record_guard(GuardSite::new(
+            isz_pc,
+            ExternalPc(7),
+            GuardKind::IsZero(cmp),
+        ));
         let i_next = b.fresh_ssa();
         b.append(TraceOp::Add {
             dst: i_next,
