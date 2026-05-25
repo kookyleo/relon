@@ -55,9 +55,17 @@ const FN_ID_BYPASS: u32 = 93;
 const FN_ID_REPEAT: u32 = 94;
 
 fn build_add_body() -> Vec<TaggedOp> {
+    // Padded past `TINY_TRACE_OP_THRESHOLD` (via `+ 0` tails so
+    // the trace stays semantically `x + y`) so the runtime gate
+    // doesn't route the call past the trace before the
+    // dispatch-switch assertion can observe a Success outcome.
     vec![
         t(Op::LocalGet(0)),
         t(Op::LocalGet(1)),
+        t(Op::Add(IrType::I64)),
+        t(Op::ConstI64(0)),
+        t(Op::Add(IrType::I64)),
+        t(Op::ConstI64(0)),
         t(Op::Add(IrType::I64)),
         t(Op::Return),
     ]

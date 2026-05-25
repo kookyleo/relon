@@ -61,12 +61,21 @@ fn bytecode_resume_from_trace_jit_deopt_overflow() {
     let source = "#main(Int x, Int y) -> Int\nx + y";
     let ev = BytecodeEvaluator::from_source(source).expect("bytecode compile");
 
+    // Body padded past `TINY_TRACE_OP_THRESHOLD` so the runtime
+    // gate doesn't skip the trace before its `Add` overflow guard
+    // can fire. Padding with `+ 0` preserves the `x + y` value
+    // semantics so the bytecode resume path's `Value::Int` check
+    // still matches.
     register_recording(
         FN_ID,
         RecordingRegistration {
             body: vec![
                 t(Op::LocalGet(0)),
                 t(Op::LocalGet(1)),
+                t(Op::Add(IrType::I64)),
+                t(Op::ConstI64(0)),
+                t(Op::Add(IrType::I64)),
+                t(Op::ConstI64(0)),
                 t(Op::Add(IrType::I64)),
                 t(Op::Return),
             ],

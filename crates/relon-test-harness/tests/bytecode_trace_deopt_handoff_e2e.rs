@@ -43,9 +43,19 @@ const FN_ID_HANDOFF: u32 = 95;
 const FN_ID_HANDOFF_WARM: u32 = 96;
 
 fn build_add_body() -> Vec<TaggedOp> {
+    // Padded past `TINY_TRACE_OP_THRESHOLD` so the runtime gate
+    // doesn't route the call straight to the fallback before the
+    // overflow guard on the first `Add` can fire. Padding uses
+    // `+ 0` so the trace stays semantically `x + y` — the success
+    // path's `Value::Int(30)` assertion still matches the
+    // bytecode evaluator's `x + y` result.
     vec![
         t(Op::LocalGet(0)),
         t(Op::LocalGet(1)),
+        t(Op::Add(IrType::I64)),
+        t(Op::ConstI64(0)),
+        t(Op::Add(IrType::I64)),
+        t(Op::ConstI64(0)),
         t(Op::Add(IrType::I64)),
         t(Op::Return),
     ]

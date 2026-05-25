@@ -619,10 +619,11 @@ fn invoke_with_fallback_returns_trace_result_on_success() {
     let a = buffer.fresh_ssa();
     let b = buffer.fresh_ssa();
     let c = buffer.fresh_ssa();
-    let v = buffer.fresh_ssa();
+    let d = buffer.fresh_ssa();
+    let e = buffer.fresh_ssa();
     buffer.append(TraceOp::ConstI64 {
         dst: zero,
-        value: 0x77 - 3,
+        value: 0x77 - 5,
     });
     buffer.append(TraceOp::ConstI64 { dst: one, value: 1 });
     buffer.append(TraceOp::Add {
@@ -640,9 +641,17 @@ fn invoke_with_fallback_returns_trace_result_on_success() {
         lhs: b,
         rhs: one,
     });
-    buffer.append(TraceOp::ConstI64 { dst: v, value: 0 });
-    let _ = v; // intentionally unused to keep SSA monotonic
-    buffer.append(TraceOp::Return { value: c });
+    buffer.append(TraceOp::Add {
+        dst: d,
+        lhs: c,
+        rhs: one,
+    });
+    buffer.append(TraceOp::Add {
+        dst: e,
+        lhs: d,
+        rhs: one,
+    });
+    buffer.append(TraceOp::Return { value: e });
     let trace_fn = state
         .jit_compile_buffer_for_fn(801, buffer)
         .expect("compile");
@@ -894,6 +903,10 @@ fn invoke_with_resume_exposes_deopt_snapshot_to_fallback() {
     let _ = clear_recording(fn_id);
     let state = global_trace_jit_state();
     let _ = state.invalidate_trace(fn_id);
+    // Body padded past `TINY_TRACE_OP_THRESHOLD` (uses `+ 0`
+    // tails so the trace stays semantically `x + y`) so the
+    // runtime gate doesn't skip the trace before its overflow
+    // guard can fire.
     register_recording(
         fn_id,
         RecordingRegistration {
@@ -904,6 +917,22 @@ fn invoke_with_resume_exposes_deopt_snapshot_to_fallback() {
                 },
                 TaggedOp {
                     op: Op::LocalGet(1),
+                    range: TokenRange::default(),
+                },
+                TaggedOp {
+                    op: Op::Add(IrType::I64),
+                    range: TokenRange::default(),
+                },
+                TaggedOp {
+                    op: Op::ConstI64(0),
+                    range: TokenRange::default(),
+                },
+                TaggedOp {
+                    op: Op::Add(IrType::I64),
+                    range: TokenRange::default(),
+                },
+                TaggedOp {
+                    op: Op::ConstI64(0),
                     range: TokenRange::default(),
                 },
                 TaggedOp {

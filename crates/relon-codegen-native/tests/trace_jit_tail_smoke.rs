@@ -131,9 +131,10 @@ fn tail_conv_guard_failure_unwinds_through_deopt_block() {
     // global state another test in the suite might be using.
     let fn_id = TAIL_SMOKE_FN_ID_BASE + 2;
 
-    // Build the same `LocalGet+LocalGet+Add+Return` body the bench
-    // uses, but force the trace install to go through the Tail conv
-    // path by driving the recorder ourselves.
+    // Body sized past `TINY_TRACE_OP_THRESHOLD` so the runtime
+    // gate doesn't route around the trace before the per-`Add`
+    // overflow guard can fire. Padding with `+ 0` keeps the trace
+    // semantically equivalent to "x + y".
     let body = vec![
         TaggedOp {
             op: Op::LocalGet(0),
@@ -141,6 +142,22 @@ fn tail_conv_guard_failure_unwinds_through_deopt_block() {
         },
         TaggedOp {
             op: Op::LocalGet(1),
+            range: TokenRange::default(),
+        },
+        TaggedOp {
+            op: Op::Add(IrType::I64),
+            range: TokenRange::default(),
+        },
+        TaggedOp {
+            op: Op::ConstI64(0),
+            range: TokenRange::default(),
+        },
+        TaggedOp {
+            op: Op::Add(IrType::I64),
+            range: TokenRange::default(),
+        },
+        TaggedOp {
+            op: Op::ConstI64(0),
             range: TokenRange::default(),
         },
         TaggedOp {

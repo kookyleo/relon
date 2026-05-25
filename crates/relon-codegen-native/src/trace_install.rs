@@ -144,13 +144,16 @@ pub const RELON_HOT_THRESHOLD: u32 = 10;
 /// without invalidating or never-installing the trace (the
 /// inline-emit path still benefits from it).
 ///
-/// `5` is picked so the gate triggers on W12's recorded body (4
-/// ops, plus the unconditional `Return`) and a typical 1-stmt
-/// function `(LocalGet + Add + Return = 3)`, but skips real loop
-/// bodies (W2 / W5 / W6 / W10 all clear 10 ops with room to
-/// spare). Lower values miss the gate; higher values risk gating
-/// out genuinely hot paths.
-pub const TINY_TRACE_OP_THRESHOLD: usize = 5;
+/// Empirically calibrated against the cmp_lua corpus on 2026-05-25
+/// (RELON_TRACE_GATE_DEBUG instrumentation): W12's optimised trace
+/// lands at exactly 5 ops, so the original `< 5` threshold missed
+/// it. The next-smallest production trace observed (W3 string
+/// concat) sits at 17 ops; bumping the threshold to 8 leaves a
+/// 9-op safety margin against accidentally gating any real loop
+/// body while comfortably capturing W12's 5-op body plus any
+/// 6-7-op "single expression" recordings the recorder may emit
+/// once the closure-call lowering work lands.
+pub const TINY_TRACE_OP_THRESHOLD: usize = 8;
 
 /// Symbol the cranelift codegen would use if it imported the counters
 /// table by name. v6-γ M2 inlines the table base as an `iconst.i64`
