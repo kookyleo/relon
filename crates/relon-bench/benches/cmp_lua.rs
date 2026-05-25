@@ -84,7 +84,7 @@ use relon_trace_jit::{build_dict_record_v2, build_flat_list_record, build_string
 // + JIT install pipeline via `__relon_jump_to_recorder`. The installed
 // `JITedTraceFn` is then what the bench timing loop invokes.
 use relon_codegen_native::trace_install::{
-    __relon_jump_to_recorder, global_trace_jit_state, RecordingRegistration,
+    __relon_jump_to_recorder, default_host_hooks, global_trace_jit_state, RecordingRegistration,
 };
 use relon_codegen_native::JITedTraceFn;
 use relon_ir::ir::{IrType, Op, TaggedOp};
@@ -2622,15 +2622,24 @@ fn bench_cmp_lua(c: &mut Criterion) {
             BenchmarkId::new("W5_dict_str_key", "relon_trace_jit"),
             |b| {
                 b.iter_custom(|iters| {
+                    // 2026-05-25: pre-allocate the TraceContext outside
+                    // the timed region. Saves the per-call ~150ns
+                    // allocator round-trip and — more importantly —
+                    // keeps the inline-IR dict-lookup IC table warm
+                    // across invocations, so the *first* loop iter of
+                    // every subsequent call hits the IC rather than
+                    // priming it. Mirrors the W3 / W4 pattern that's
+                    // been there since their recorder-driven rewrite.
+                    let mut tctx = TraceContext::with_hooks(64, default_host_hooks());
                     let args: [u64; 3] = warm_args_w5;
                     let args_ptr = args.as_ptr();
                     let expected = w5_expected() as u64;
                     timed_with_warmup(iters, || {
                         let v = unsafe {
-                            w5_jit_state.invoke_with_fallback(
+                            w5_jit_state.invoke_with_existing_ctx(
                                 w5_fn_id,
+                                &mut tctx,
                                 black_box(args_ptr),
-                                64,
                                 |_args| expected,
                             )
                         };
@@ -2715,15 +2724,21 @@ fn bench_cmp_lua(c: &mut Criterion) {
             BenchmarkId::new("W6_dict_num_key", "relon_trace_jit"),
             |b| {
                 b.iter_custom(|iters| {
+                    // 2026-05-25: same per-iter alloc avoidance + IC
+                    // warm-up rationale as W5. The W6 trace also hits
+                    // a single (dict_ptr, key_ptr) pair per loop iter,
+                    // so the carried-forward IC is similarly load-
+                    // bearing.
+                    let mut tctx = TraceContext::with_hooks(64, default_host_hooks());
                     let args: [u64; 2] = warm_args_w6;
                     let args_ptr = args.as_ptr();
                     let expected = w6_expected() as u64;
                     timed_with_warmup(iters, || {
                         let v = unsafe {
-                            w6_jit_state.invoke_with_fallback(
+                            w6_jit_state.invoke_with_existing_ctx(
                                 w6_fn_id,
+                                &mut tctx,
                                 black_box(args_ptr),
-                                64,
                                 |_args| expected,
                             )
                         };

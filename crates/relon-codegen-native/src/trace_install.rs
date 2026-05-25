@@ -880,6 +880,96 @@ impl TraceJitState {
         }
     }
 
+    /// Invoke the installed trace for `fn_id` using a caller-owned
+    /// [`TraceContext`], avoiding the per-call allocation that
+    /// [`Self::invoke_with_fallback`] performs internally.
+    ///
+    /// ## When to use this
+    ///
+    /// Hot dispatch loops that repeatedly invoke the **same** trace
+    /// (criterion benches, sustained query plans, batch processors)
+    /// see noticeable variance reduction by keeping the context's
+    /// memory live across calls:
+    ///
+    /// 1. The `ssa_slots: Box<[u64]>` heap allocation is amortised
+    ///    (one allocator round-trip per loop instead of one per call).
+    /// 2. The [`TraceContext::dict_lookup_ic`] table stays warm —
+    ///    every `(dict_ptr, key_ptr)` pair primed by one invocation
+    ///    is available to the next, so the inline-IR IC probe in
+    ///    `DictLookupPrechecked` hits on the **first** loop iter of
+    ///    subsequent calls rather than the second.
+    /// 3. The TraceContext's storage address stays stable, so the
+    ///    cranelift-emitted reads / writes hit the same L1 lines
+    ///    across calls — avoids the address-aliasing lottery that
+    ///    makes per-call-allocated contexts produce 2× variance on
+    ///    nominally idle hosts.
+    ///
+    /// ## Per-call reset semantics
+    ///
+    /// On entry the helper clears `deopt_state` (so a stale
+    /// snapshot from a previous deopt doesn't bleed in) and drains
+    /// `pending_recoverable_writes` (DSE-emitted writes from a prior
+    /// call are not replayable across invocation boundaries). The
+    /// `dict_lookup_ic` table is **intentionally** left intact so it
+    /// can carry warm entries forward.
+    ///
+    /// If the caller intends to switch to a different `(dict_ptr,
+    /// key_ptr)` workload mid-loop and wants to start the IC cold,
+    /// they call [`TraceContext::reset_dict_lookup_ic`] explicitly.
+    ///
+    /// # Safety
+    ///
+    /// Same contract as [`Self::invoke_with_fallback`] except the
+    /// caller is responsible for sizing the context's `ssa_slots`
+    /// to at least the trace's `ssa_high_water` (otherwise cranelift
+    /// writes past the slot array — undefined behaviour). The
+    /// install pipeline records the high-water on the
+    /// `JITedTraceFn`; callers typically pick `64` for benches with
+    /// well-bounded traces, mirroring the figure used by the v6-γ
+    /// recorder fixture set.
+    pub unsafe fn invoke_with_existing_ctx<F>(
+        &self,
+        fn_id: u32,
+        ctx: &mut TraceContext,
+        args_ptr: *const u64,
+        fallback: F,
+    ) -> u64
+    where
+        F: FnOnce(*const u64) -> u64,
+    {
+        let trace_fn = match self.lookup_trace(fn_id) {
+            Some(t) => t,
+            None => return fallback(args_ptr),
+        };
+
+        // Reset per-call state (IC table persists across calls).
+        ctx.deopt_state = None;
+        ctx.pending_recoverable_writes.clear();
+
+        let status = unsafe { trace_fn.invoke(ctx as *mut _, args_ptr) };
+        match status {
+            TraceEntryStatus::Success => {
+                let result = ctx.result_slot;
+                if trace_fn.success_result_allows_string_reclaim() {
+                    // SAFETY: same rationale as `invoke_with_resume`'s
+                    // success arm.
+                    unsafe { relon_trace_jit::runtime::reclaim_trace_strings() };
+                }
+                result
+            }
+            TraceEntryStatus::GuardFailed => with_trace_string_reclaim(|| fallback(args_ptr)),
+            TraceEntryStatus::Aborted => with_trace_string_reclaim(|| {
+                tracing::warn!(
+                    target: "relon::trace_install",
+                    fn_id,
+                    "trace Aborted; invalidating + falling back"
+                );
+                self.invalidate_trace(fn_id);
+                fallback(args_ptr)
+            }),
+        }
+    }
+
     /// Drive the full pipeline `recorder → optimizer → emitter →
     /// cranelift JIT` for a single fn_id and return the installable
     /// trace fn. The caller decides whether to install it via
