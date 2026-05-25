@@ -64,7 +64,7 @@ fn unpack_sandbox(bits: u32) -> SandboxConfig {
 }
 
 /// Container holding the bits a `from_cache` constructor needs to
-/// reconstruct a `CraneliftAotEvaluator` without re-running parse /
+/// reconstruct a `AotEvaluator` without re-running parse /
 /// analyze / lower.
 #[derive(Debug)]
 pub struct CacheEntry {

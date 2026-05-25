@@ -477,7 +477,7 @@ fn loop_trace_runs_n_iters_before_deopt() {
 /// Expected value for `sum 1..=1_000_000 = 500_000_500_000`.
 #[test]
 fn loop_trace_full_pipeline_returns_correct_sum() {
-    use relon_codegen_native::{CraneliftAotEvaluator, SandboxConfig};
+    use relon_codegen_native::{AotEvaluator, SandboxConfig};
     use relon_eval_api::{Evaluator, Value};
     use relon_ir::ir::{Func, Module as IrModule};
 
@@ -518,7 +518,7 @@ fn loop_trace_full_pipeline_returns_correct_sum() {
         entry_func_index: Some(0),
         closure_table: vec![],
     };
-    let aot = CraneliftAotEvaluator::from_ir_direct(
+    let aot = AotEvaluator::from_ir_direct(
         aot_module,
         SandboxConfig::default(),
         vec!["n".to_string()],

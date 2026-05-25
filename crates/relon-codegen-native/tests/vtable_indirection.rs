@@ -12,7 +12,7 @@
 use std::collections::HashMap;
 
 use relon_codegen_native::vtable::{populate_vtable, VtableSlot, VTABLE_BYTES, VTABLE_SYMBOL};
-use relon_codegen_native::CraneliftAotEvaluator;
+use relon_codegen_native::AotEvaluator;
 use relon_eval_api::{Evaluator, Value};
 use tempfile::tempdir;
 
@@ -54,7 +54,7 @@ fn cached_cold_start_dispatches_now_helper_through_vtable() {
     let cache = tempdir().expect("tempdir");
     let src = "#main(Int x, Int y) -> Int\nx + y";
 
-    let warm = CraneliftAotEvaluator::from_source_with_cache(src, cache.path())
+    let warm = AotEvaluator::from_source_with_cache(src, cache.path())
         .expect("from_source_with_cache");
     // Sanity: the warm evaluator answers correctly.
     let mut args = HashMap::new();
@@ -66,7 +66,7 @@ fn cached_cold_start_dispatches_now_helper_through_vtable() {
 
     // Cache hit -> dlopen-exec path.
     let opt =
-        CraneliftAotEvaluator::from_cache_dir(src, cache.path()).expect("from_cache_dir result");
+        AotEvaluator::from_cache_dir(src, cache.path()).expect("from_cache_dir result");
     let cached = opt.expect("cache hit");
     let cached_out = cached.run_main(args).expect("cached run_main");
     assert_eq!(cached_out, Value::Int(12));
@@ -79,10 +79,10 @@ fn cached_cold_start_supports_subtraction() {
     let cache = tempdir().expect("tempdir");
     let src = "#main(Int a, Int b) -> Int\na - b";
 
-    let warm = CraneliftAotEvaluator::from_source_with_cache(src, cache.path()).expect("warm");
+    let warm = AotEvaluator::from_source_with_cache(src, cache.path()).expect("warm");
     drop(warm);
 
-    let cached = CraneliftAotEvaluator::from_cache_dir(src, cache.path())
+    let cached = AotEvaluator::from_cache_dir(src, cache.path())
         .expect("from_cache_dir")
         .expect("cache hit");
     let mut args = HashMap::new();
@@ -100,10 +100,10 @@ fn cached_cold_start_traps_on_division_by_zero() {
     let cache = tempdir().expect("tempdir");
     let src = "#main(Int n, Int d) -> Int\nn / d";
 
-    let warm = CraneliftAotEvaluator::from_source_with_cache(src, cache.path()).expect("warm");
+    let warm = AotEvaluator::from_source_with_cache(src, cache.path()).expect("warm");
     drop(warm);
 
-    let cached = CraneliftAotEvaluator::from_cache_dir(src, cache.path())
+    let cached = AotEvaluator::from_cache_dir(src, cache.path())
         .expect("from_cache_dir")
         .expect("cache hit");
     let mut args = HashMap::new();

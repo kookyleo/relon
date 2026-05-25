@@ -163,7 +163,7 @@ use cranelift_module::{Linkage, Module as _};
 use relon_bench::quiescence::verify_quiescence;
 use relon_codegen_native::{
     clear_recording, compile_inline_host_fn, global_trace_jit_state, register_recording,
-    register_trace_runtime_symbols, trace_install::TraceJitState, CraneliftAotEvaluator,
+    register_trace_runtime_symbols, trace_install::TraceJitState, AotEvaluator,
     RecordingRegistration, SandboxConfig, TraceIcSlot, MAX_FN_ID,
 };
 use relon_eval_api::{Evaluator, Value};
@@ -371,8 +371,8 @@ fn sum_loop_ir() -> IrModule {
 /// Pre-warmed cranelift-AOT evaluator for the `sum 1..=n` loop body
 /// built by [`sum_loop_ir`]. One Rust→JIT invoke runs all N iters
 /// inside cranelift's compiled loop.
-fn build_cranelift_aot_loop() -> CraneliftAotEvaluator {
-    CraneliftAotEvaluator::from_ir_direct(
+fn build_cranelift_aot_loop() -> AotEvaluator {
+    AotEvaluator::from_ir_direct(
         sum_loop_ir(),
         SandboxConfig::default(),
         vec!["n".to_string()],
@@ -659,8 +659,8 @@ fn step_ir() -> IrModule {
 /// Pre-warmed cranelift-AOT evaluator for the single-step body — used
 /// by the legacy "Rust-side loop drives N invokes" baseline, not by
 /// the new `cranelift_aot_loop` row.
-fn build_cranelift_step_evaluator() -> CraneliftAotEvaluator {
-    CraneliftAotEvaluator::from_ir_direct(
+fn build_cranelift_step_evaluator() -> AotEvaluator {
+    AotEvaluator::from_ir_direct(
         step_ir(),
         SandboxConfig::default(),
         vec!["arg0".to_string(), "arg1".to_string()],

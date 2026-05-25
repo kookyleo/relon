@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 
 use relon_codegen_native::{
-    deserialize_cache, serialize_cache, CacheEntry, CraneliftAotEvaluator, SandboxConfig,
+    deserialize_cache, serialize_cache, CacheEntry, AotEvaluator, SandboxConfig,
 };
 use relon_eval_api::{Evaluator, Value};
 use relon_ir::ir::{Func, IrType, Module as IrModule, Op, TaggedOp};
@@ -51,7 +51,7 @@ fn cache_round_trip_preserves_run_main_result() {
     let sandbox = SandboxConfig::default();
 
     // Fresh build for the baseline answer.
-    let fresh = CraneliftAotEvaluator::from_ir_direct(
+    let fresh = AotEvaluator::from_ir_direct(
         ir.clone(),
         sandbox.clone(),
         vec!["x".to_string(), "y".to_string()],
@@ -72,7 +72,7 @@ fn cache_round_trip_preserves_run_main_result() {
     let bytes = serialize_cache(&entry).expect("serialize");
     assert!(bytes.len() > 32, "cache blob should be non-trivial");
     let decoded = deserialize_cache(&bytes).expect("deserialize");
-    let cached = CraneliftAotEvaluator::from_cache(decoded).expect("from_cache");
+    let cached = AotEvaluator::from_cache(decoded).expect("from_cache");
 
     // The cache layer drops parameter names (they're presentation
     // metadata, not part of the IR); rebuild the arg map keyed by

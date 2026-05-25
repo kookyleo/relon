@@ -11,7 +11,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use relon_codegen_native::{CapabilityVtable, CraneliftAotEvaluator, HostFnPtr, SandboxConfig};
+use relon_codegen_native::{CapabilityVtable, AotEvaluator, HostFnPtr, SandboxConfig};
 use relon_eval_api::{Evaluator, RuntimeError, Value};
 use relon_ir::ir::{Func, IrType, Module as IrModule, Op, TaggedOp};
 use relon_parser::TokenRange;
@@ -59,7 +59,7 @@ fn build_gated_module(cap_bit: u32) -> IrModule {
 fn check_cap_traps_when_capability_unregistered() {
     let ir = build_gated_module(7);
     let evaluator =
-        CraneliftAotEvaluator::from_ir_direct(ir, SandboxConfig::default(), vec!["x".to_string()])
+        AotEvaluator::from_ir_direct(ir, SandboxConfig::default(), vec!["x".to_string()])
             .expect("compile");
 
     let mut args = HashMap::new();
@@ -75,7 +75,7 @@ fn check_cap_traps_when_capability_unregistered() {
 fn check_cap_succeeds_when_host_registers_fn_at_cap_bit() {
     let ir = build_gated_module(7);
     let mut evaluator =
-        CraneliftAotEvaluator::from_ir_direct(ir, SandboxConfig::default(), vec!["x".to_string()])
+        AotEvaluator::from_ir_direct(ir, SandboxConfig::default(), vec!["x".to_string()])
             .expect("compile");
 
     // Register the host fn at the matching cap_bit and re-install
@@ -98,7 +98,7 @@ fn no_cap_bit_marker_elides_the_gate() {
     // that path.
     let ir = build_gated_module(relon_ir::ir::NO_CAPABILITY_BIT);
     let evaluator =
-        CraneliftAotEvaluator::from_ir_direct(ir, SandboxConfig::default(), vec!["x".to_string()])
+        AotEvaluator::from_ir_direct(ir, SandboxConfig::default(), vec!["x".to_string()])
             .expect("compile");
 
     let mut args = HashMap::new();
@@ -111,7 +111,7 @@ fn no_cap_bit_marker_elides_the_gate() {
 fn unrelated_cap_bit_does_not_satisfy_a_different_gate() {
     let ir = build_gated_module(7);
     let mut evaluator =
-        CraneliftAotEvaluator::from_ir_direct(ir, SandboxConfig::default(), vec!["x".to_string()])
+        AotEvaluator::from_ir_direct(ir, SandboxConfig::default(), vec!["x".to_string()])
             .expect("compile");
 
     // Register the host fn at a *different* cap_bit; the gate must

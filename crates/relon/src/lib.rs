@@ -664,7 +664,7 @@ pub enum BackendError {
 /// does internally: workspace analysis runs first, the default
 /// sandboxed `Context` is assembled, and the resulting evaluator is
 /// boxed as `dyn Evaluator`. The cranelift-AOT variant lowers the
-/// source through `relon_codegen_native::CraneliftAotEvaluator::from_source`
+/// source through `relon_codegen_native::AotEvaluator::from_source`
 /// (requires the `cranelift-aot` cargo feature; default-on for
 /// native builds, off for `wasm32-unknown-unknown` because the
 /// cranelift JIT doesn't run there).
@@ -677,7 +677,7 @@ pub fn new_evaluator(
         Backend::TreeWalk => Ok(Box::new(build_tree_walk_evaluator(source)?)),
         #[cfg(feature = "cranelift-aot")]
         Backend::CraneliftAot => {
-            let aot = relon_codegen_native::CraneliftAotEvaluator::from_source(source)
+            let aot = relon_codegen_native::AotEvaluator::from_source(source)
                 .map_err(|e| BackendError::CraneliftAot(e.to_string()))?;
             Ok(Box::new(aot))
         }

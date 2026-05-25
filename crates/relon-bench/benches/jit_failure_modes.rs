@@ -26,10 +26,10 @@
 //! Per fixture, three rows:
 //!
 //! - `tree_walk` — `TreeWalkEvaluator::run_main` for ground truth.
-//! - `cranelift_aot` — `CraneliftAotEvaluator::run_main`. The honest
+//! - `cranelift_aot` — `AotEvaluator::run_main`. The honest
 //!   AOT baseline for the workload.
 //! - `trace_jit` — invokes through `TraceJitState::invoke_with_fallback`
-//!   where the fallback re-runs through the same `CraneliftAotEvaluator`.
+//!   where the fallback re-runs through the same `AotEvaluator`.
 //!   The expectation per fixture:
 //!
 //!   - Fixture A (abort): trace never installs, every call hits the
@@ -60,7 +60,7 @@ use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criteri
 
 use relon_bench::quiescence::verify_quiescence;
 use relon_codegen_native::{
-    clear_recording, global_trace_jit_state, register_recording, CraneliftAotEvaluator,
+    clear_recording, global_trace_jit_state, register_recording, AotEvaluator,
     RecordingRegistration, SandboxConfig, MAX_FN_ID,
 };
 use relon_eval_api::{Evaluator, Value};
@@ -293,7 +293,7 @@ fn bitand_loop_body() -> Vec<TaggedOp> {
 /// on the recorded path"). At runtime the bench passes a non-zero
 /// toggle so the guard predicate `(toggle == 0)` is false on the very
 /// first iteration — the trace entry returns `GuardFailed` and the
-/// host fallback runs the full loop through `CraneliftAotEvaluator`.
+/// host fallback runs the full loop through `AotEvaluator`.
 ///
 /// Cranelift-AOT lowers the same IR straightforwardly: the BrIf
 /// branches out of the loop on the first iteration (because toggle !=
@@ -392,7 +392,7 @@ fn toggle_loop_body() -> Vec<TaggedOp> {
 // =====  cranelift-AOT evaluator builders  ============================
 // =====================================================================
 
-fn build_aot_one_arg(body: Vec<TaggedOp>) -> CraneliftAotEvaluator {
+fn build_aot_one_arg(body: Vec<TaggedOp>) -> AotEvaluator {
     let ir = IrModule {
         imports: vec![],
         funcs: vec![Func {
@@ -405,11 +405,11 @@ fn build_aot_one_arg(body: Vec<TaggedOp>) -> CraneliftAotEvaluator {
         entry_func_index: Some(0),
         closure_table: vec![],
     };
-    CraneliftAotEvaluator::from_ir_direct(ir, SandboxConfig::default(), vec!["n".to_string()])
+    AotEvaluator::from_ir_direct(ir, SandboxConfig::default(), vec!["n".to_string()])
         .expect("cranelift AOT compile (1 arg)")
 }
 
-fn build_aot_two_args(body: Vec<TaggedOp>) -> CraneliftAotEvaluator {
+fn build_aot_two_args(body: Vec<TaggedOp>) -> AotEvaluator {
     let ir = IrModule {
         imports: vec![],
         funcs: vec![Func {
@@ -422,7 +422,7 @@ fn build_aot_two_args(body: Vec<TaggedOp>) -> CraneliftAotEvaluator {
         entry_func_index: Some(0),
         closure_table: vec![],
     };
-    CraneliftAotEvaluator::from_ir_direct(
+    AotEvaluator::from_ir_direct(
         ir,
         SandboxConfig::default(),
         vec!["n".to_string(), "toggle".to_string()],

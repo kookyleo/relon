@@ -22,7 +22,7 @@
 //!   returns an error; `eval` / `eval_root` / `force_thunk` /
 //!   `invoke_closure` keep working off the tree-walker.
 //! * **`Box<dyn Evaluator>`** is stored rather than the concrete
-//!   `CraneliftAotEvaluator` so future backends can swap in without
+//!   `AotEvaluator` so future backends can swap in without
 //!   changing this file's surface.
 //!
 //! v5-β-2 stage 4: wasm-AOT retired here. The fallback path that
@@ -189,7 +189,7 @@ impl AutoEvaluator {
         // half. Any soft miss (file absent, integrity failure,
         // metadata mismatch) surfaces as `Ok(None)`; only an
         // unexpected I/O failure escapes here.
-        match relon_codegen_native::CraneliftAotEvaluator::from_cache_dir(source, &cache_dir) {
+        match relon_codegen_native::AotEvaluator::from_cache_dir(source, &cache_dir) {
             Ok(Some(aot)) => return Ok(Box::new(aot) as Box<dyn Evaluator>),
             Ok(None) => {} // cache miss — proceed to source build
             Err(e) => {
@@ -206,7 +206,7 @@ impl AutoEvaluator {
 
         // 2. Cache-miss path: full pipeline, writes fresh cache pair
         // as a side-effect so the *next* cold start can hit.
-        relon_codegen_native::CraneliftAotEvaluator::from_source_with_cache(source, &cache_dir)
+        relon_codegen_native::AotEvaluator::from_source_with_cache(source, &cache_dir)
             .map(|aot| Box::new(aot) as Box<dyn Evaluator>)
             .map_err(|e| e.to_string())
     }

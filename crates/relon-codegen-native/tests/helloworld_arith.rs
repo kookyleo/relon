@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 
-use relon_codegen_native::{CraneliftAotEvaluator, SandboxConfig};
+use relon_codegen_native::{AotEvaluator, SandboxConfig};
 use relon_eval_api::{Evaluator, Value};
 use relon_ir::ir::{Func, IrType, Module as IrModule, Op, TaggedOp};
 use relon_parser::TokenRange;
@@ -49,8 +49,8 @@ fn build_arith_ir(op: Op) -> IrModule {
     }
 }
 
-fn build_evaluator(ir: IrModule) -> CraneliftAotEvaluator {
-    CraneliftAotEvaluator::from_ir_direct(
+fn build_evaluator(ir: IrModule) -> AotEvaluator {
+    AotEvaluator::from_ir_direct(
         ir,
         SandboxConfig::default(),
         vec!["x".to_string(), "y".to_string()],

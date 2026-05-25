@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 
-use relon_codegen_native::{CapabilityVtable, CraneliftAotEvaluator, HostFnPtr, SandboxConfig};
+use relon_codegen_native::{CapabilityVtable, AotEvaluator, HostFnPtr, SandboxConfig};
 use relon_eval_api::{Evaluator, RuntimeError, Value};
 use relon_ir::ir::{Func, IrType, Module as IrModule, NativeImport, Op, TaggedOp};
 use relon_parser::TokenRange;
@@ -85,7 +85,7 @@ fn call_native_nullary_returns_host_fn_result() {
         t(Op::Return),
     ];
     let ir = legacy_module(imports, body, vec![]);
-    let mut evaluator = CraneliftAotEvaluator::from_ir_direct(ir, SandboxConfig::default(), vec![])
+    let mut evaluator = AotEvaluator::from_ir_direct(ir, SandboxConfig::default(), vec![])
         .expect("compile");
     let mut vt = CapabilityVtable::with_capacity(64);
     // SAFETY: the lifetime-erased cast matches the actual host fn
@@ -118,7 +118,7 @@ fn call_native_with_one_arg_passes_arg_through_to_host() {
     ];
     let ir = legacy_module(imports, body, vec![IrType::I64]);
     let mut evaluator =
-        CraneliftAotEvaluator::from_ir_direct(ir, SandboxConfig::default(), vec!["x".to_string()])
+        AotEvaluator::from_ir_direct(ir, SandboxConfig::default(), vec!["x".to_string()])
             .expect("compile");
     let mut vt = CapabilityVtable::with_capacity(64);
     let ptr: HostFnPtr = unsafe { std::mem::transmute(add_one as *const ()) };
@@ -151,7 +151,7 @@ fn call_native_with_two_args_passes_both_args_in_declaration_order() {
         t(Op::Return),
     ];
     let ir = legacy_module(imports, body, vec![IrType::I64, IrType::I64]);
-    let mut evaluator = CraneliftAotEvaluator::from_ir_direct(
+    let mut evaluator = AotEvaluator::from_ir_direct(
         ir,
         SandboxConfig::default(),
         vec!["a".to_string(), "b".to_string()],
@@ -189,7 +189,7 @@ fn call_native_traps_when_capability_slot_is_empty() {
     ];
     let ir = legacy_module(imports, body, vec![IrType::I64]);
     let evaluator =
-        CraneliftAotEvaluator::from_ir_direct(ir, SandboxConfig::default(), vec!["x".to_string()])
+        AotEvaluator::from_ir_direct(ir, SandboxConfig::default(), vec!["x".to_string()])
             .expect("compile");
     // No vtable registration: slot 5 stays empty.
 
@@ -222,7 +222,7 @@ fn call_native_mutates_host_side_state_via_side_effect() {
     ];
     let ir = legacy_module(imports, body, vec![IrType::I64]);
     let mut evaluator =
-        CraneliftAotEvaluator::from_ir_direct(ir, SandboxConfig::default(), vec!["x".to_string()])
+        AotEvaluator::from_ir_direct(ir, SandboxConfig::default(), vec!["x".to_string()])
             .expect("compile");
     let mut vt = CapabilityVtable::with_capacity(64);
     let ptr: HostFnPtr = unsafe { std::mem::transmute(record_side_effect as *const ()) };
@@ -260,6 +260,6 @@ fn call_native_with_param_shape_mismatch_surfaces_codegen_error() {
     ];
     let ir = legacy_module(imports, body, vec![IrType::I64]);
     let result =
-        CraneliftAotEvaluator::from_ir_direct(ir, SandboxConfig::default(), vec!["x".to_string()]);
+        AotEvaluator::from_ir_direct(ir, SandboxConfig::default(), vec!["x".to_string()]);
     assert!(result.is_err(), "expected Codegen mismatch");
 }

@@ -1,6 +1,6 @@
 //! 2026-05-22 P0 fix: multi-thread `run_main` safety regression test.
 //!
-//! History: `CraneliftAotEvaluator` previously declared
+//! History: `AotEvaluator` previously declared
 //! `unsafe impl Sync`, but every invoke re-pointed the shared
 //! `Arc<SandboxState>`'s `arena_base` / `arena_len` / `tail_cursor` /
 //! `scratch_*` `UnsafeCell<_>` fields. Two threads calling
@@ -23,7 +23,7 @@
 use std::sync::Arc;
 use std::thread;
 
-use relon_codegen_native::CraneliftAotEvaluator;
+use relon_codegen_native::AotEvaluator;
 use relon_eval_api::{Evaluator, Value};
 
 /// Trivial `#main(Int a, Int b) -> Int` returning `a * 31 + b`. Each
@@ -35,7 +35,7 @@ const PROGRAM: &str = "#main(Int a, Int b) -> Int\na * 31 + b";
 #[test]
 fn run_main_does_not_race_across_threads_on_shared_evaluator() {
     let eval =
-        Arc::new(CraneliftAotEvaluator::from_source(PROGRAM).expect("compile #main(a, b) -> Int"));
+        Arc::new(AotEvaluator::from_source(PROGRAM).expect("compile #main(a, b) -> Int"));
 
     // Four threads, each running 256 dispatches. Thread count exceeds
     // the typical hyper-thread multiplier so any data race surfaces
@@ -88,7 +88,7 @@ fn run_main_does_not_race_across_threads_on_shared_evaluator() {
 fn run_main_single_arg_no_race_under_contention() {
     const PROGRAM: &str = "#main(Int x) -> Int\nx * 2 + 7";
     let eval =
-        Arc::new(CraneliftAotEvaluator::from_source(PROGRAM).expect("compile #main(x) -> Int"));
+        Arc::new(AotEvaluator::from_source(PROGRAM).expect("compile #main(x) -> Int"));
 
     const THREADS: usize = 4;
     const ITERS_PER_THREAD: usize = 256;

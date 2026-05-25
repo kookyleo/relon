@@ -21,7 +21,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use relon_codegen_native::{CraneliftAotEvaluator, SandboxConfig, SandboxState, TrapKind};
+use relon_codegen_native::{AotEvaluator, SandboxConfig, SandboxState, TrapKind};
 use relon_eval_api::{Evaluator, RuntimeError, Value};
 use relon_ir::ir::{Func, IrType, Module as IrModule, Op, TaggedOp};
 use relon_parser::TokenRange;
@@ -100,7 +100,7 @@ fn deadline_guard_proves_cond_trap_plumbing_works_end_to_end() {
     // the cranelift-emitted branch -> trap-block -> raise_trap ->
     // typed RuntimeError pipeline is healthy.
     let ir = build_loop_module();
-    let evaluator = CraneliftAotEvaluator::from_ir_direct(
+    let evaluator = AotEvaluator::from_ir_direct(
         ir,
         SandboxConfig::default(),
         vec!["x".to_string(), "y".to_string()],
@@ -130,7 +130,7 @@ fn deadline_guard_does_not_fire_on_normal_timing() {
     // Sanity: with the default deadline (i64::MAX nanos), the guard
     // must let the body run to completion.
     let ir = build_loop_module();
-    let evaluator = CraneliftAotEvaluator::from_ir_direct(
+    let evaluator = AotEvaluator::from_ir_direct(
         ir,
         SandboxConfig::default(),
         vec!["x".to_string(), "y".to_string()],

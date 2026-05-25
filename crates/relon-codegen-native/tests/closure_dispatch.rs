@@ -12,7 +12,7 @@
 
 use std::collections::HashMap;
 
-use relon_codegen_native::{CraneliftAotEvaluator, SandboxConfig};
+use relon_codegen_native::{AotEvaluator, SandboxConfig};
 use relon_eval_api::Value;
 use relon_ir::ir::{ClosureCapture, Func, IrType, Module as IrModule, Op, TaggedOp};
 use relon_parser::TokenRange;
@@ -61,7 +61,7 @@ fn no_capture_closure_returns_constant() {
         closure_table: vec![1], // lambda is at funcs[1]
     };
     let evaluator =
-        CraneliftAotEvaluator::from_ir_direct(ir, SandboxConfig::default(), vec!["x".to_string()])
+        AotEvaluator::from_ir_direct(ir, SandboxConfig::default(), vec!["x".to_string()])
             .expect("compile");
 
     // The buffer-protocol path needs an arena even for legacy shape
@@ -129,7 +129,7 @@ fn closure_module_compiles_without_codegen_error() {
         closure_table: vec![1],
     };
     let result =
-        CraneliftAotEvaluator::from_ir_direct(ir, SandboxConfig::default(), vec!["x".to_string()]);
+        AotEvaluator::from_ir_direct(ir, SandboxConfig::default(), vec!["x".to_string()]);
     assert!(result.is_ok(), "compile failed: {:?}", result.err());
 }
 
@@ -189,7 +189,7 @@ fn closure_with_capture_compiles_cleanly() {
         closure_table: vec![1],
     };
     let result =
-        CraneliftAotEvaluator::from_ir_direct(ir, SandboxConfig::default(), vec!["x".to_string()]);
+        AotEvaluator::from_ir_direct(ir, SandboxConfig::default(), vec!["x".to_string()]);
     assert!(result.is_ok(), "compile failed: {:?}", result.err());
 }
 
@@ -235,7 +235,7 @@ fn closure_call_with_two_args_compiles() {
         closure_table: vec![1],
     };
     let result =
-        CraneliftAotEvaluator::from_ir_direct(ir, SandboxConfig::default(), vec!["x".to_string()]);
+        AotEvaluator::from_ir_direct(ir, SandboxConfig::default(), vec!["x".to_string()]);
     assert!(result.is_ok(), "compile failed: {:?}", result.err());
 }
 
@@ -291,6 +291,6 @@ fn multiple_lambdas_compile_into_distinct_closure_table_slots() {
         closure_table: vec![1, 2],
     };
     let result =
-        CraneliftAotEvaluator::from_ir_direct(ir, SandboxConfig::default(), vec!["x".to_string()]);
+        AotEvaluator::from_ir_direct(ir, SandboxConfig::default(), vec!["x".to_string()]);
     assert!(result.is_ok(), "compile failed: {:?}", result.err());
 }

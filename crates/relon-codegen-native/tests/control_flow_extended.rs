@@ -11,7 +11,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use relon_codegen_native::{CraneliftAotEvaluator, SandboxConfig};
+use relon_codegen_native::{AotEvaluator, SandboxConfig};
 use relon_eval_api::{Evaluator, RuntimeError, Value};
 use relon_ir::ir::{Func, IrType, Module as IrModule, Op, TaggedOp};
 use relon_parser::TokenRange;
@@ -145,7 +145,7 @@ fn yielding_loop_returns_accumulated_int() {
     ];
     let ir = legacy_module(body, vec![IrType::I64]);
     let evaluator =
-        CraneliftAotEvaluator::from_ir_direct(ir, SandboxConfig::default(), vec!["n".to_string()])
+        AotEvaluator::from_ir_direct(ir, SandboxConfig::default(), vec!["n".to_string()])
             .expect("compile");
 
     let mut args = HashMap::new();
@@ -313,7 +313,7 @@ fn br_table_default_arm_is_taken_when_index_out_of_range() {
     ];
     let ir = legacy_module(body_simple, vec![IrType::I64]);
     let evaluator =
-        CraneliftAotEvaluator::from_ir_direct(ir, SandboxConfig::default(), vec!["x".to_string()])
+        AotEvaluator::from_ir_direct(ir, SandboxConfig::default(), vec!["x".to_string()])
             .expect("compile");
     let mut args = HashMap::new();
     args.insert("x".to_string(), Value::Int(0));
@@ -351,7 +351,7 @@ fn br_table_case_0_taken_for_index_zero() {
     ];
     let ir = legacy_module(body, vec![IrType::I64]);
     let evaluator =
-        CraneliftAotEvaluator::from_ir_direct(ir, SandboxConfig::default(), vec!["x".to_string()])
+        AotEvaluator::from_ir_direct(ir, SandboxConfig::default(), vec!["x".to_string()])
             .expect("compile");
     let mut args = HashMap::new();
     args.insert("x".to_string(), Value::Int(0));
@@ -391,7 +391,7 @@ fn br_table_case_1_taken_for_index_one() {
     ];
     let ir = legacy_module(body, vec![IrType::I64]);
     let evaluator =
-        CraneliftAotEvaluator::from_ir_direct(ir, SandboxConfig::default(), vec!["x".to_string()])
+        AotEvaluator::from_ir_direct(ir, SandboxConfig::default(), vec!["x".to_string()])
             .expect("compile");
     let mut args = HashMap::new();
     args.insert("x".to_string(), Value::Int(0));
@@ -454,7 +454,7 @@ fn loop_one_hundred_thousand_iters_does_not_trap_under_normal_deadline() {
         t(Op::Return),
     ];
     let ir = legacy_module(body, vec![IrType::I64]);
-    let evaluator = CraneliftAotEvaluator::from_ir_direct(
+    let evaluator = AotEvaluator::from_ir_direct(
         ir,
         SandboxConfig::default(),
         vec!["unused".to_string()],
@@ -516,7 +516,7 @@ fn loop_traps_when_deadline_elapses_during_iteration() {
         t(Op::Return),
     ];
     let ir = legacy_module(body, vec![IrType::I64]);
-    let evaluator = CraneliftAotEvaluator::from_ir_direct(
+    let evaluator = AotEvaluator::from_ir_direct(
         ir,
         SandboxConfig::default(),
         vec!["unused".to_string()],

@@ -11,7 +11,7 @@ use std::time::Instant;
 
 use relon_codegen_native::object_cache_integration as cache_int;
 use relon_codegen_native::vtable::{populate_vtable, VTABLE_SYMBOL};
-use relon_codegen_native::CraneliftAotEvaluator;
+use relon_codegen_native::AotEvaluator;
 use tempfile::tempdir;
 
 #[test]
@@ -20,7 +20,7 @@ fn cached_cold_start_phase_breakdown_prints() {
     let src = "#main(Int x, Int y) -> Int\nx + y";
 
     // Pre-warm. Not timed.
-    let warm = CraneliftAotEvaluator::from_source_with_cache(src, cache.path())
+    let warm = AotEvaluator::from_source_with_cache(src, cache.path())
         .expect("from_source_with_cache");
     drop(warm);
 

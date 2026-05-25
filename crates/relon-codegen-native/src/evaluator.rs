@@ -1,4 +1,4 @@
-//! `CraneliftAotEvaluator` — the runtime façade for the cranelift
+//! `AotEvaluator` — the runtime façade for the cranelift
 //! AOT backend.
 //!
 //! Construction does parse + analyze + lower (or pulls the IR out of
@@ -173,7 +173,7 @@ unsafe impl Sync for EntryBacking {}
 
 /// AOT evaluator backed by a cranelift JIT module or a dlopen'd
 /// cached object (v5-γ stage 2).
-pub struct CraneliftAotEvaluator {
+pub struct AotEvaluator {
     /// Backing storage for the entry's machine code (JIT module or
     /// dlopen'd cache object). Kept alive for the evaluator's
     /// lifetime so the function pointers in `entry_fn` /
@@ -246,10 +246,10 @@ pub struct CraneliftAotEvaluator {
 // is freshly boxed inside `run_main`, so the unsafe shared-state
 // path the original `unsafe impl Sync for SandboxState` papered over
 // (see 2026-05-22 P0 fix) is gone.
-unsafe impl Send for CraneliftAotEvaluator {}
-unsafe impl Sync for CraneliftAotEvaluator {}
+unsafe impl Send for AotEvaluator {}
+unsafe impl Sync for AotEvaluator {}
 
-impl CraneliftAotEvaluator {
+impl AotEvaluator {
     /// Drive the full pipeline: parse + analyze + lower + cranelift
     /// codegen + JIT finalize.
     ///
@@ -530,7 +530,7 @@ impl CraneliftAotEvaluator {
         ));
     }
 
-    /// v5-γ stage 2: build a `CraneliftAotEvaluator` whose entry
+    /// v5-γ stage 2: build a `AotEvaluator` whose entry
     /// function lives inside a dlopen'd ET_DYN (rather than a live
     /// JIT module). The caller has already resolved the entry +
     /// vtable + closure-table addresses via `dlsym`; we just wire
@@ -1625,7 +1625,7 @@ fn sandbox_matches(a: &SandboxConfig, b: &SandboxConfig) -> bool {
         && a.div_check == b.div_check
 }
 
-impl Evaluator for CraneliftAotEvaluator {
+impl Evaluator for AotEvaluator {
     fn eval(&self, _node: &Node, _scope: &Arc<Scope>) -> Result<Value, RuntimeError> {
         Err(RuntimeError::Unsupported {
             reason: "cranelift-native AOT backend: `eval` requires AST access; use the tree-walking backend instead".to_string(),
@@ -1872,7 +1872,7 @@ mod tests {
     #[test]
     fn cranelift_evaluator_is_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
-        assert_send_sync::<CraneliftAotEvaluator>();
+        assert_send_sync::<AotEvaluator>();
     }
 
     /// 2026-05-21 dispatch-boundary lever (a) smoke: the SmallMap entry
@@ -1915,7 +1915,7 @@ mod tests {
             closure_table: vec![],
         };
 
-        let eval = CraneliftAotEvaluator::from_ir_direct(
+        let eval = AotEvaluator::from_ir_direct(
             ir,
             SandboxConfig::default(),
             vec!["arg0".to_string(), "arg1".to_string()],

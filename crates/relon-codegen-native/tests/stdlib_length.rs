@@ -12,7 +12,7 @@
 
 use std::collections::HashMap;
 
-use relon_codegen_native::{CraneliftAotEvaluator, SandboxConfig};
+use relon_codegen_native::{AotEvaluator, SandboxConfig};
 use relon_eval_api::{Evaluator, Value};
 use relon_ir::ir::{Func, IrType, Module as IrModule, Op, TaggedOp};
 use relon_parser::TokenRange;
@@ -88,7 +88,7 @@ fn build_abs_module() -> IrModule {
 fn abs_returns_positive_for_negative_input() {
     let ir = build_abs_module();
     let evaluator =
-        CraneliftAotEvaluator::from_ir_direct(ir, SandboxConfig::default(), vec!["x".to_string()])
+        AotEvaluator::from_ir_direct(ir, SandboxConfig::default(), vec!["x".to_string()])
             .expect("compile");
 
     let mut args = HashMap::new();
@@ -101,7 +101,7 @@ fn abs_returns_positive_for_negative_input() {
 fn abs_returns_input_unchanged_for_positive() {
     let ir = build_abs_module();
     let evaluator =
-        CraneliftAotEvaluator::from_ir_direct(ir, SandboxConfig::default(), vec!["x".to_string()])
+        AotEvaluator::from_ir_direct(ir, SandboxConfig::default(), vec!["x".to_string()])
             .expect("compile");
 
     let mut args = HashMap::new();
@@ -114,7 +114,7 @@ fn abs_returns_input_unchanged_for_positive() {
 fn abs_handles_zero_correctly() {
     let ir = build_abs_module();
     let evaluator =
-        CraneliftAotEvaluator::from_ir_direct(ir, SandboxConfig::default(), vec!["x".to_string()])
+        AotEvaluator::from_ir_direct(ir, SandboxConfig::default(), vec!["x".to_string()])
             .expect("compile");
 
     let mut args = HashMap::new();

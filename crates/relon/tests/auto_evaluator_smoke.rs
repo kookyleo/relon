@@ -228,7 +228,7 @@ fn concurrent_run_main_only_builds_aot_once() {
     //
     // The cranelift-AOT backend itself is `&self` but installs the
     // per-call arena pointer onto a shared `SandboxState`; the
-    // v5-beta-1 contract documented in `CraneliftAotEvaluator`
+    // v5-beta-1 contract documented in `AotEvaluator`
     // requires the host to serialise concurrent `run_main` calls
     // via `Mutex<...>`. We do that here so the test reflects the
     // supported usage pattern — the OnceLock invariant is still

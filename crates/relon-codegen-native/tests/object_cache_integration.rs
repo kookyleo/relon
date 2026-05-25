@@ -17,7 +17,7 @@
 use std::collections::HashMap;
 
 use relon_codegen_native::{
-    compute_source_hash, ir_cache_path_for, CraneliftAotEvaluator, SandboxConfig,
+    compute_source_hash, ir_cache_path_for, AotEvaluator, SandboxConfig,
 };
 use relon_eval_api::{Evaluator, Value};
 
@@ -50,7 +50,7 @@ fn from_source_with_cache_writes_pair_on_first_call() {
         "object-cache should be absent initially"
     );
 
-    let aot = CraneliftAotEvaluator::from_source_with_cache(src, dir.path())
+    let aot = AotEvaluator::from_source_with_cache(src, dir.path())
         .expect("from_source_with_cache");
     // Live invocation works.
     let r = aot.run_main(args(40, 2)).expect("run_main");
@@ -67,7 +67,7 @@ fn from_cache_dir_returns_none_on_miss() {
     let dir = tempfile::tempdir().expect("tempdir");
     let src = corpus_add_source();
 
-    let opt = CraneliftAotEvaluator::from_cache_dir(src, dir.path()).expect("from_cache_dir");
+    let opt = AotEvaluator::from_cache_dir(src, dir.path()).expect("from_cache_dir");
     assert!(opt.is_none(), "fresh directory should miss");
 }
 
@@ -77,7 +77,7 @@ fn from_cache_dir_hits_after_from_source_with_cache() {
     let src = corpus_add_source();
 
     // First call: populate cache.
-    let _ = CraneliftAotEvaluator::from_source_with_cache(src, dir.path())
+    let _ = AotEvaluator::from_source_with_cache(src, dir.path())
         .expect("from_source_with_cache");
 
     // Second call: from_cache_dir should restore from the IR-cache
@@ -95,7 +95,7 @@ fn from_cache_dir_hits_after_from_source_with_cache() {
         return;
     }
 
-    let aot = match CraneliftAotEvaluator::from_cache_dir(src, dir.path())
+    let aot = match AotEvaluator::from_cache_dir(src, dir.path())
         .expect("from_cache_dir result")
     {
         Some(c) => c,
@@ -118,7 +118,7 @@ fn cache_hit_produces_same_result_as_fresh_build() {
 
     // Fresh build via from_source_with_cache (cache miss path).
     let fresh =
-        CraneliftAotEvaluator::from_source_with_cache(src, dir.path()).expect("fresh build");
+        AotEvaluator::from_source_with_cache(src, dir.path()).expect("fresh build");
     let fresh_result = fresh.run_main(args(100, 23)).expect("fresh run_main");
     drop(fresh);
 
@@ -130,7 +130,7 @@ fn cache_hit_produces_same_result_as_fresh_build() {
     }
 
     let cached =
-        match CraneliftAotEvaluator::from_cache_dir(src, dir.path()).expect("from_cache_dir") {
+        match AotEvaluator::from_cache_dir(src, dir.path()).expect("from_cache_dir") {
             Some(c) => c,
             None => {
                 eprintln!(
@@ -153,7 +153,7 @@ fn corrupted_object_cache_invalidates_pair() {
     let dir = tempfile::tempdir().expect("tempdir");
     let src = corpus_add_source();
 
-    let _ = CraneliftAotEvaluator::from_source_with_cache(src, dir.path())
+    let _ = AotEvaluator::from_source_with_cache(src, dir.path())
         .expect("from_source_with_cache");
     let hash = compute_source_hash(src, &SandboxConfig::default());
     let obj_path = relon_object_cache::storage::cache_path_for(dir.path(), hash);
@@ -171,7 +171,7 @@ fn corrupted_object_cache_invalidates_pair() {
     buf[mid] ^= 0xFF;
     std::fs::write(&obj_path, &buf).expect("rewrite");
 
-    let opt = CraneliftAotEvaluator::from_cache_dir(src, dir.path()).expect("from_cache_dir");
+    let opt = AotEvaluator::from_cache_dir(src, dir.path()).expect("from_cache_dir");
     assert!(opt.is_none(), "tampered cache should be invalidated");
     assert!(
         !obj_path.exists(),
@@ -184,7 +184,7 @@ fn corrupted_ir_cache_invalidates_pair() {
     let dir = tempfile::tempdir().expect("tempdir");
     let src = corpus_add_source();
 
-    let _ = CraneliftAotEvaluator::from_source_with_cache(src, dir.path())
+    let _ = AotEvaluator::from_source_with_cache(src, dir.path())
         .expect("from_source_with_cache");
     let hash = compute_source_hash(src, &SandboxConfig::default());
     let ir_path = ir_cache_path_for(dir.path(), hash);
@@ -202,7 +202,7 @@ fn corrupted_ir_cache_invalidates_pair() {
     buf[last] ^= 0xFF;
     std::fs::write(&ir_path, &buf).expect("rewrite");
 
-    let opt = CraneliftAotEvaluator::from_cache_dir(src, dir.path()).expect("from_cache_dir");
+    let opt = AotEvaluator::from_cache_dir(src, dir.path()).expect("from_cache_dir");
     // Without an object-cache file, the IR-cache corruption alone
     // is enough to trip the pair invalidation since from_cache_dir
     // requires both halves to be present and consistent.
@@ -214,7 +214,7 @@ fn missing_ir_cache_invalidates_pair() {
     let dir = tempfile::tempdir().expect("tempdir");
     let src = corpus_add_source();
 
-    let _ = CraneliftAotEvaluator::from_source_with_cache(src, dir.path())
+    let _ = AotEvaluator::from_source_with_cache(src, dir.path())
         .expect("from_source_with_cache");
     let hash = compute_source_hash(src, &SandboxConfig::default());
     let ir_path = ir_cache_path_for(dir.path(), hash);
@@ -228,7 +228,7 @@ fn missing_ir_cache_invalidates_pair() {
     // as a miss and clean up the object-cache half too.
     std::fs::remove_file(&ir_path).expect("remove ir cache");
 
-    let opt = CraneliftAotEvaluator::from_cache_dir(src, dir.path()).expect("from_cache_dir");
+    let opt = AotEvaluator::from_cache_dir(src, dir.path()).expect("from_cache_dir");
     assert!(opt.is_none(), "missing ir-cache should yield miss");
     // The companion object-cache file should be cleaned up so the
     // next from_source_with_cache call writes a consistent pair.
@@ -244,10 +244,10 @@ fn different_source_does_not_hit_existing_cache() {
     let src_a = corpus_add_source();
     let src_b = "#main(Int x, Int y) -> Int\nx * y"; // different body
 
-    let _ = CraneliftAotEvaluator::from_source_with_cache(src_a, dir.path())
+    let _ = AotEvaluator::from_source_with_cache(src_a, dir.path())
         .expect("from_source_with_cache a");
 
-    let opt_b = CraneliftAotEvaluator::from_cache_dir(src_b, dir.path()).expect("from_cache_dir b");
+    let opt_b = AotEvaluator::from_cache_dir(src_b, dir.path()).expect("from_cache_dir b");
     assert!(opt_b.is_none(), "different source should miss the cache");
 }
 
@@ -259,7 +259,7 @@ fn cache_hits_are_concurrency_safe() {
     let src = corpus_add_source();
 
     // Populate cache once on the main thread.
-    let _ = CraneliftAotEvaluator::from_source_with_cache(src, dir.path())
+    let _ = AotEvaluator::from_source_with_cache(src, dir.path())
         .expect("from_source_with_cache");
 
     let hash = compute_source_hash(src, &SandboxConfig::default());
@@ -275,7 +275,7 @@ fn cache_hits_are_concurrency_safe() {
     // skip the concurrency assertion rather than panic in a worker
     // thread.
     let probe =
-        CraneliftAotEvaluator::from_cache_dir(src, dir.path()).expect("from_cache_dir probe");
+        AotEvaluator::from_cache_dir(src, dir.path()).expect("from_cache_dir probe");
     if probe.is_none() {
         eprintln!(
             "skipping cache-hit concurrency assertion: from_cache_dir returned None \
@@ -294,7 +294,7 @@ fn cache_hits_are_concurrency_safe() {
         let src_owned = src.to_string();
         handles.push(thread::spawn(move || {
             let opt =
-                CraneliftAotEvaluator::from_cache_dir(&src_owned, &path).expect("from_cache_dir");
+                AotEvaluator::from_cache_dir(&src_owned, &path).expect("from_cache_dir");
             let aot = opt.expect("cache hit");
             aot.run_main(args(7, 8)).expect("run_main")
         }));
@@ -315,7 +315,7 @@ fn tampered_schema_sidecar_invalidates_triple() {
     let dir = tempfile::tempdir().expect("tempdir");
     let src = corpus_add_source();
 
-    let _ = CraneliftAotEvaluator::from_source_with_cache(src, dir.path())
+    let _ = AotEvaluator::from_source_with_cache(src, dir.path())
         .expect("from_source_with_cache");
     let hash = compute_source_hash(src, &SandboxConfig::default());
     let schema_path = relon_codegen_native::schema_cache::schema_cache_path_for(dir.path(), hash);
@@ -336,7 +336,7 @@ fn tampered_schema_sidecar_invalidates_triple() {
     buf[mid] ^= 0x01;
     std::fs::write(&schema_path, &buf).expect("rewrite schema");
 
-    let opt = CraneliftAotEvaluator::from_cache_dir(src, dir.path()).expect("from_cache_dir");
+    let opt = AotEvaluator::from_cache_dir(src, dir.path()).expect("from_cache_dir");
     assert!(opt.is_none(), "tampered schema sidecar must invalidate");
     assert!(
         !schema_path.exists(),

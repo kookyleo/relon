@@ -1,6 +1,6 @@
 //! Public façade implementing [`relon_eval_api::Evaluator`].
 //!
-//! Construction mirrors `relon_codegen_native::CraneliftAotEvaluator::from_source`:
+//! Construction mirrors `relon_codegen_native::AotEvaluator::from_source`:
 //! parse → analyze → `lower_workspace_single` → bytecode compile.
 //! `run_main` packs the args into virtual local slots, runs the VM,
 //! and unpacks the return slots back into a `Value`. The arena

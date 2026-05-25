@@ -65,7 +65,7 @@ pub const SCHEMA_CACHE_VERSION: u32 = 2;
 pub const SCHEMA_CACHE_FILE_SUFFIX: &str = ".relon-schema-v1";
 
 /// Side-table mirror of the bits a `from_cache_dir` constructor needs
-/// to rebuild a `CraneliftAotEvaluator` against a dlopen'd ET_DYN.
+/// to rebuild a `AotEvaluator` against a dlopen'd ET_DYN.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SchemaCacheEntry {
     /// Canonical schema of the `#main` arguments. The buffer-protocol
@@ -75,7 +75,7 @@ pub struct SchemaCacheEntry {
     /// Canonical schema of the `#main` return record.
     pub return_schema: Schema,
     /// Parameter names in declaration order. Surfaced through
-    /// `CraneliftAotEvaluator::param_names()`.
+    /// `AotEvaluator::param_names()`.
     pub param_names: Vec<String>,
     /// Const-data bytes referenced by `Op::ConstString` /
     /// `Op::ConstList*` in the cached object. The trampoline copies

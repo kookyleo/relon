@@ -59,7 +59,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Compile-time sandbox configuration. Built once when a
-/// `CraneliftAotEvaluator` is constructed and consulted by both the
+/// `AotEvaluator` is constructed and consulted by both the
 /// codegen lowering and the runtime dispatcher.
 ///
 /// The four bools are independent; turning any of them off elides the

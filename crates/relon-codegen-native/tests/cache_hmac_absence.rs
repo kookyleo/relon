@@ -20,7 +20,7 @@
 use std::os::unix::fs::PermissionsExt;
 
 use relon_codegen_native::{
-    object_cache_integration as cache_int, CraneliftAotEvaluator, SandboxConfig,
+    object_cache_integration as cache_int, AotEvaluator, SandboxConfig,
 };
 
 fn corpus_source() -> &'static str {
@@ -50,7 +50,7 @@ fn cache_writes_are_refused_when_hmac_key_unavailable() {
     // 2. `from_source_with_cache` runs codegen + best-effort cache.
     // It should succeed (live JIT still works) but write nothing
     // into `cache_dir` because `ensure_key()` fails.
-    let aot = CraneliftAotEvaluator::from_source_with_cache(corpus_source(), cache_dir.path())
+    let aot = AotEvaluator::from_source_with_cache(corpus_source(), cache_dir.path())
         .expect("from_source_with_cache");
     // Sanity check the live invocation still answers.
     use relon_eval_api::{Evaluator, Value};
@@ -79,7 +79,7 @@ fn cache_writes_are_refused_when_hmac_key_unavailable() {
 
     // 3. `from_cache_dir` must also refuse rather than fall back to
     // an unauthenticated read.
-    let opt = CraneliftAotEvaluator::from_cache_dir(corpus_source(), cache_dir.path())
+    let opt = AotEvaluator::from_cache_dir(corpus_source(), cache_dir.path())
         .expect("from_cache_dir result");
     assert!(
         opt.is_none(),

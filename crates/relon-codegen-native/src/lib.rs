@@ -11,7 +11,7 @@
 //!
 //! ## Architecture
 //!
-//! 1. [`CraneliftAotEvaluator::from_source`] runs the full pipeline:
+//! 1. [`AotEvaluator::from_source`] runs the full pipeline:
 //!    parse + analyze + lower (via the shared `relon-ir` crate) +
 //!    cranelift codegen + JIT finalize.
 //! 2. The lowering pass emits cranelift IR with explicit
@@ -90,7 +90,17 @@ pub mod vtable;
 pub use bytecode_bridge::{CraneliftHotTrigger, CraneliftTraceLookup};
 pub use cache::{deserialize as deserialize_cache, serialize as serialize_cache, CacheEntry};
 pub use error::CraneliftError;
-pub use evaluator::CraneliftAotEvaluator;
+pub use evaluator::AotEvaluator;
+
+/// Deprecated alias kept so downstream hosts that pinned the old
+/// `CraneliftAotEvaluator` name during the Dart-style rename still
+/// compile. New code should use `AotEvaluator`. Slated for removal
+/// after 1-2 seasons (tracked in the naming-alignment design note).
+#[deprecated(
+    since = "0.3.0",
+    note = "renamed to `AotEvaluator`; the `Cranelift` implementation-detail prefix was dropped as part of the Dart-style JIT/AOT split"
+)]
+pub use evaluator::AotEvaluator as CraneliftAotEvaluator;
 pub use object_cache_integration::{
     compute_source_hash, default_cache_dir, emit_module_object_bytes, host_target_triple,
     ir_cache_path_for, LoadedCache, GENERATOR_VERSION,

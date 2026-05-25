@@ -4,7 +4,7 @@
 //!
 //! Each scenario probes two points along the cost curve:
 //!
-//! * `cranelift_cold` — `CraneliftAotEvaluator::from_ir_direct` from
+//! * `cranelift_cold` — `AotEvaluator::from_ir_direct` from
 //!   synthetic IR. Cranelift JIT compile + finalize. The cost we'd
 //!   pay on first call before any caching.
 //! * `cranelift_warm` — preassembled cranelift evaluator, time only
@@ -29,7 +29,7 @@ use std::time::Duration;
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 
-use relon_codegen_native::{CraneliftAotEvaluator, SandboxConfig};
+use relon_codegen_native::{AotEvaluator, SandboxConfig};
 use relon_eval_api::{Evaluator, Value};
 use relon_evaluator::{Context, Scope, TreeWalkEvaluator};
 use relon_ir::ir::{Func, IrType, Module as IrModule, Op, TaggedOp};
@@ -107,7 +107,7 @@ fn bench_arithmetic(c: &mut Criterion) {
     group.bench_function(BenchmarkId::new("cranelift", "cold"), |b| {
         b.iter(|| {
             let ir = synth_add_ir();
-            let aot = CraneliftAotEvaluator::from_ir_direct(
+            let aot = AotEvaluator::from_ir_direct(
                 ir,
                 SandboxConfig::default(),
                 vec!["arg0".to_string(), "arg1".to_string()],
@@ -120,7 +120,7 @@ fn bench_arithmetic(c: &mut Criterion) {
     // Cranelift warm invoke: reuse one preassembled evaluator across
     // every iter — the target "trace tier" probe.
     let cranelift = Arc::new(
-        CraneliftAotEvaluator::from_ir_direct(
+        AotEvaluator::from_ir_direct(
             synth_add_ir(),
             SandboxConfig::default(),
             vec!["arg0".to_string(), "arg1".to_string()],
@@ -190,12 +190,12 @@ fn bench_cached_cold_start(c: &mut Criterion) {
     // the cache pair. The first call's time is *not* measured —
     // this bench is about the *cached* cold-start path.
     let warm =
-        CraneliftAotEvaluator::from_source_with_cache(src, cache_root.path()).expect("pre-warm");
+        AotEvaluator::from_source_with_cache(src, cache_root.path()).expect("pre-warm");
     drop(warm);
 
     group.bench_function(BenchmarkId::new("cranelift_cached", "cold"), |b| {
         b.iter(|| {
-            let opt = CraneliftAotEvaluator::from_cache_dir(src, cache_root.path())
+            let opt = AotEvaluator::from_cache_dir(src, cache_root.path())
                 .expect("from_cache_dir");
             // Force evaluator materialisation so the bench measures
             // dlopen + dlsym + vtable populate, not just the option-
@@ -219,12 +219,12 @@ fn bench_cached_cold_start_full(c: &mut Criterion) {
     let src = tree_walk_src();
 
     let warm =
-        CraneliftAotEvaluator::from_source_with_cache(src, cache_root.path()).expect("pre-warm");
+        AotEvaluator::from_source_with_cache(src, cache_root.path()).expect("pre-warm");
     drop(warm);
 
     group.bench_function(BenchmarkId::new("cranelift_cached", "cold_full"), |b| {
         b.iter(|| {
-            let opt = CraneliftAotEvaluator::from_cache_dir(src, cache_root.path())
+            let opt = AotEvaluator::from_cache_dir(src, cache_root.path())
                 .expect("from_cache_dir");
             let ev = opt.expect("cache hit");
             let out = ev.run_main(args_with(3, 4)).expect("run_main");

@@ -41,7 +41,7 @@ use std::collections::HashMap;
 
 use relon_codegen_native::{
     global_trace_jit_state, hot_counter_peek, hot_counter_reset, jump_helper_call_count,
-    reset_jump_helper_call_count, CraneliftAotEvaluator, SandboxConfig, TraceJitError,
+    reset_jump_helper_call_count, AotEvaluator, SandboxConfig, TraceJitError,
     TraceJitState, MAX_FN_ID, RELON_HOT_THRESHOLD,
 };
 use relon_eval_api::{Evaluator, Value};
@@ -89,14 +89,14 @@ fn build_arith_ir(op: Op) -> IrModule {
 /// Build a cranelift evaluator with the HotCounter prologue enabled
 /// at slot `fn_id`. Counter slot is reset before each test so
 /// sequential runs don't bleed state.
-fn build_traced_evaluator(ir: IrModule, fn_id: u32) -> CraneliftAotEvaluator {
+fn build_traced_evaluator(ir: IrModule, fn_id: u32) -> AotEvaluator {
     hot_counter_reset(fn_id);
     reset_jump_helper_call_count();
     let cfg = SandboxConfig {
         trace_jit_fn_id: Some(fn_id),
         ..SandboxConfig::default()
     };
-    CraneliftAotEvaluator::from_ir_direct(ir, cfg, vec!["x".to_string(), "y".to_string()])
+    AotEvaluator::from_ir_direct(ir, cfg, vec!["x".to_string(), "y".to_string()])
         .expect("compile")
 }
 
@@ -206,7 +206,7 @@ fn no_trace_jit_no_helper_calls() {
     // touched.
     let cfg = SandboxConfig::default();
     assert!(cfg.trace_jit_fn_id.is_none());
-    let ev = CraneliftAotEvaluator::from_ir_direct(
+    let ev = AotEvaluator::from_ir_direct(
         build_arith_ir(Op::Add(IrType::I64)),
         cfg,
         vec!["x".to_string(), "y".to_string()],

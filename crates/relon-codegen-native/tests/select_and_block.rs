@@ -16,7 +16,7 @@
 
 use std::collections::HashMap;
 
-use relon_codegen_native::{CraneliftAotEvaluator, SandboxConfig};
+use relon_codegen_native::{AotEvaluator, SandboxConfig};
 use relon_eval_api::{Evaluator, Value};
 use relon_ir::ir::{Func, IrType, Module as IrModule, Op, TaggedOp};
 use relon_parser::TokenRange;
@@ -38,7 +38,7 @@ fn build_module(params: Vec<IrType>, body: Vec<TaggedOp>) -> IrModule {
 }
 
 fn run(ir: IrModule, params: &[&str], args: &[(&str, i64)]) -> Result<i64, String> {
-    let evaluator = CraneliftAotEvaluator::from_ir_direct(
+    let evaluator = AotEvaluator::from_ir_direct(
         ir,
         SandboxConfig::default(),
         params.iter().map(|s| s.to_string()).collect(),
@@ -219,7 +219,7 @@ fn i32_arith_round_trips_through_widening() {
     // Compile must succeed (Return only consumes one value off the
     // stack; the leftover i32 stays).
     let result =
-        CraneliftAotEvaluator::from_ir_direct(ir, SandboxConfig::default(), vec!["x".to_string()]);
+        AotEvaluator::from_ir_direct(ir, SandboxConfig::default(), vec!["x".to_string()]);
     // Cranelift verifier may reject the leftover; we just assert
     // the codegen-pass surface accepts the new ops.
     let _ = result;

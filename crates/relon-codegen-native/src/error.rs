@@ -7,7 +7,7 @@
 
 use thiserror::Error;
 
-/// Errors produced while building / running a [`crate::CraneliftAotEvaluator`].
+/// Errors produced while building / running a [`crate::AotEvaluator`].
 #[derive(Debug, Error)]
 pub enum CraneliftError {
     /// Parser rejected the source. Mirrors `relon::Error::Parse`'s

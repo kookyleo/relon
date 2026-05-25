@@ -16,7 +16,7 @@ use relon_analyzer::{
     analyze_entry_with_options, analyze_with_options, AnalyzeOptions, WorkspaceDiagnostic,
     WorkspaceTree,
 };
-use relon_codegen_native::CraneliftAotEvaluator;
+use relon_codegen_native::AotEvaluator;
 use relon_evaluator::module::FilesystemModuleResolver;
 use relon_evaluator::{Capabilities, Context, TreeWalkEvaluator};
 use relon_parser::{parse_document, ParseDocumentError};
@@ -771,7 +771,7 @@ fn cmd_run(
                     // a hard I/O failure surfaces as a
                     // logged warning and we fall back to
                     // the source path.
-                    let aot_opt = match CraneliftAotEvaluator::from_cache_dir(&content, &cache_dir)
+                    let aot_opt = match AotEvaluator::from_cache_dir(&content, &cache_dir)
                     {
                         Ok(opt) => opt,
                         Err(e) => {
@@ -796,7 +796,7 @@ fn cmd_run(
                     phase("default_cache_probe");
                     let aot = match aot_opt {
                         Some(a) => a,
-                        None => CraneliftAotEvaluator::from_source_with_cache(&content, &cache_dir)
+                        None => AotEvaluator::from_source_with_cache(&content, &cache_dir)
                             .map_err(|e| {
                                 miette::miette!("auto backend setup: {e}").with_source_code(
                                     NamedSource::new(file.to_string_lossy(), content.clone()),
@@ -835,7 +835,7 @@ fn cmd_run(
                 } else {
                     relon_eval_api::Capabilities::default()
                 };
-                let aot = CraneliftAotEvaluator::from_source(&content).map_err(|e| {
+                let aot = AotEvaluator::from_source(&content).map_err(|e| {
                     miette::miette!("cranelift-aot backend setup: {e}")
                         .with_source_code(NamedSource::new(file.to_string_lossy(), content.clone()))
                 })?;
