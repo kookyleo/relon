@@ -96,8 +96,8 @@ fn default_pipeline_runs_all_passes_clean_buffer() {
     let reports = p.run(&mut b);
     // const_fold + load_forward + dead_store + type_spec +
     // dict_ic_hoist (F-D8-E.2) + licm + noop_typecheck_elim (ε-M0) +
-    // dead_store = 8
-    assert_eq!(reports.len(), 8);
+    // iv_overflow_elim (W4) + dead_store = 9
+    assert_eq!(reports.len(), 9);
     // Nothing to fold / spec / DSE in this trivial trace.
     for (_, r) in reports {
         assert!(!r.touched());

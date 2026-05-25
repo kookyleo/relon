@@ -6,7 +6,7 @@
 //!
 //! ## Pass ordering invariants
 //!
-//! The default pipeline runs eight passes in a fixed order. Each
+//! The default pipeline runs nine passes in a fixed order. Each
 //! ordering choice has a load-bearing reason; before reordering or
 //! inserting a new pass, read the dependency it would cross.
 //!
@@ -46,7 +46,15 @@
 //!    LICM hoisted out of the loop body — and that now sits in a
 //!    region where the observed type is statically known — also
 //!    gets eliminated in the same pass.
-//! 8. [`dead_store::DeadStoreElim`] (round 2) -- pick up any stores
+//! 8. [`iv_overflow_elim::IvOverflowElim`] -- prove that the in-loop
+//!    `Guard(ArithOverflow(_))` guards a bounded induction variable
+//!    never fires, and splice a single entry guard `n <= MAX_SAFE`
+//!    into the preheader so a runtime that violates the bound deopts
+//!    safely. MUST run after `LICM` (so the loop-bound `n` lives
+//!    above the head as a `LocalGet`) and before the round-2
+//!    `DeadStoreElim` (which folds the `of_bit` chain cranelift's
+//!    DCE leaves behind once the guard disappears).
+//! 9. [`dead_store::DeadStoreElim`] (round 2) -- pick up any stores
 //!    that became dead after type specialisation / LICM moved
 //!    guards around. Cheap when nothing changed; preserved so the
 //!    pipeline doesn't need a third round for rare interactions.
@@ -62,6 +70,7 @@
 pub mod const_fold;
 pub mod dead_store;
 pub mod dict_ic_hoist;
+pub mod iv_overflow_elim;
 pub mod licm;
 pub mod load_forward;
 pub mod noop_typecheck_elim;
@@ -114,6 +123,11 @@ impl OptimizerPipeline {
                 // licm so any hoisted no-op TypeCheck above the loop
                 // also gets removed in the same pass.
                 Box::new(noop_typecheck_elim::NoopTypeCheckElim),
+                // W4 IV-overflow elim: drop Guard(ArithOverflow(...))
+                // ops on bounded induction variables. Runs after LICM
+                // (which hoists the bound `n` to the preheader) and
+                // before the round-2 dead-store pass.
+                Box::new(iv_overflow_elim::IvOverflowElim),
                 Box::new(dead_store::DeadStoreElim),
             ],
         }
@@ -149,12 +163,14 @@ mod tests {
     }
 
     #[test]
-    fn default_pipeline_has_eight_passes() {
+    fn default_pipeline_has_nine_passes() {
         // ε-M0 added `noop_typecheck_elim` between LICM and the
         // second dead-store round; F-D8-E.2 added `dict_ic_hoist`
-        // immediately before LICM.
+        // immediately before LICM. The W4 IV-overflow-elim pass slots
+        // in between `noop_typecheck_elim` and the round-2
+        // dead-store pass.
         let p = OptimizerPipeline::default_pipeline();
-        assert_eq!(p.passes.len(), 8);
+        assert_eq!(p.passes.len(), 9);
     }
 
     #[test]
