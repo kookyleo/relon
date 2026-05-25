@@ -257,3 +257,179 @@ fn deopt_handoff_mixed_workload_routes_each_outcome() {
     reset_hot_all();
     reset_jump_helper_call_count();
 }
+
+// ---- Bytecode-coverage-expansion B-3: string-shape dispatcher contract ----
+//
+// The original Phase B-3 plan was a pair of W3 / W4 deopt → bytecode
+// resume tests using a hand-built integer-overflow trace shape against
+// a string-shape source. That design ran into a known limitation: the
+// trace's IR PCs collide with the bytecode body's `ir_pc_map`, so the
+// snapshot's `external_pc` routes the resume to a bytecode index whose
+// operand-stack recipe expects a `String`-handle stack while the trace
+// snapshot carries integer SSA values. The result is a downstream
+// `WasmIndexOutOfBounds` at the post-resume `StrConcat`.
+//
+// Aligning the trace recording with the bytecode's own IR (so the PCs
+// share semantics) is the right long-term fix but is outside this
+// phase's budget — it requires routing the recorder through the
+// production lowering rather than a hand-built fixture.
+//
+// Instead, the B-3 contract here pins the **dispatcher integration**
+// for string-shape sources: when an `fn_id` / `trace_lookup` pair is
+// wired but no trace is installed, the dispatcher `NoTrace` path must
+// drive the bytecode body cleanly through `run_main_inner_with_packed_strings`
+// — same arena alloc, same string-handle stack, same final_strings
+// lift as the bare `run_main` path. The two tests below pin:
+//
+//   1. The string-arg lift wired in B-2 (`pack_args_with_strings`)
+//      survives the trace-dispatcher detour (string slots reach the
+//      bytecode VM with the right handle).
+//   2. `final_strings` is populated correctly when the dispatcher
+//      branch is taken (the string-return lift wasn't a happy-path
+//      regression).
+//
+// The deopt-resume integration for string shapes is tracked separately
+// — see `docs/internal/bytecode-coverage-expansion-design.md` Phase
+// B-3 open question for the IR-PC-alignment follow-up.
+
+const FN_ID_STR_CONCAT_DEOPT: u32 = 97;
+const FN_ID_STR_CONTAINS_DEOPT: u32 = 98;
+
+/// W3-shape dispatcher integration: source uses `s + suffix`
+/// (`Op::Add(IrType::String)` → `BcOp::StrConcat`) wired through the
+/// `with_fn_id` / `with_trace_lookup` dispatcher path. Pins that the
+/// string-arg lift survives a `try_invoke -> NoTrace -> bytecode`
+/// detour.
+#[test]
+fn dispatcher_string_concat_body_round_trips_through_no_trace_path() {
+    reset_hot_all();
+    reset_jump_helper_call_count();
+    let _ = clear_recording(FN_ID_STR_CONCAT_DEOPT);
+    let state = global_trace_jit_state();
+    let _ = state.invalidate_trace(FN_ID_STR_CONCAT_DEOPT);
+
+    // Register a hand-built recording so the dispatcher's
+    // `try_invoke` lookup is wired. We never install the trace — the
+    // contract here is the `NoTrace` fall-through plus the string-arg
+    // lift.
+    register_recording(
+        FN_ID_STR_CONCAT_DEOPT,
+        RecordingRegistration {
+            body: build_add_body(),
+            param_tys: vec![IrType::I32, IrType::I32],
+        },
+    );
+
+    let src = "#main(String s) -> String\ns + \"!\"";
+    let trigger: HotTraceTriggerHandle = Arc::new(CraneliftHotTrigger);
+    let counting = Arc::new(OutcomeCountingLookup::new());
+    let lookup_handle: InstalledTraceLookupHandle = counting.clone();
+    let ev = BytecodeEvaluator::from_source(src)
+        .expect("compile")
+        // Threshold past `u16::MAX` so the recorder never trips during
+        // the test — we want every call to take the `NoTrace`
+        // dispatcher branch.
+        .with_fn_id(FN_ID_STR_CONCAT_DEOPT)
+        .with_hot_trigger(trigger)
+        .with_hot_threshold(u16::MAX as u32)
+        .with_trace_lookup(lookup_handle);
+
+    // Every call hits `try_invoke -> NoTrace -> bytecode`. The
+    // dispatcher's string-aware re-pack plants the arena handle into
+    // slot 0; `BcOp::StrConcat` finds it; `final_strings` lifts the
+    // "hello!" payload out before VmMemory drops.
+    let args1 = mk_args(&[("s", Value::String("hello".into()))]);
+    assert_eq!(
+        ev.run_main(args1).expect("first dispatch"),
+        Value::String("hello!".into())
+    );
+    let args2 = mk_args(&[("s", Value::String("world".into()))]);
+    assert_eq!(
+        ev.run_main(args2).expect("second dispatch"),
+        Value::String("world!".into())
+    );
+    let args3 = mk_args(&[("s", Value::String("αβ🦀".into()))]);
+    assert_eq!(
+        ev.run_main(args3).expect("third dispatch (Unicode)"),
+        Value::String("αβ🦀!".into())
+    );
+    assert!(
+        counting.no_trace() >= 3,
+        "every call must take the NoTrace fall-through, got {}",
+        counting.no_trace()
+    );
+    assert_eq!(
+        counting.success(),
+        0,
+        "trace must not install at this threshold"
+    );
+    assert_eq!(counting.deopt(), 0, "no deopts in this scenario");
+
+    let _ = clear_recording(FN_ID_STR_CONCAT_DEOPT);
+    let _ = state.invalidate_trace(FN_ID_STR_CONCAT_DEOPT);
+    reset_hot_all();
+    reset_jump_helper_call_count();
+}
+
+/// W4-shape dispatcher integration: source uses `s.contains(needle)`
+/// (`Op::Call { fn_index = CONTAINS_INDEX }` → `BcOp::StrContains`)
+/// wired through the `with_fn_id` / `with_trace_lookup` dispatcher
+/// path. Pins both the hit (`true`) and miss (`false`) arms so the
+/// `BcOp::StrContains` short-circuit survives the dispatcher detour.
+#[test]
+fn dispatcher_string_contains_body_round_trips_through_no_trace_path() {
+    reset_hot_all();
+    reset_jump_helper_call_count();
+    let _ = clear_recording(FN_ID_STR_CONTAINS_DEOPT);
+    let state = global_trace_jit_state();
+    let _ = state.invalidate_trace(FN_ID_STR_CONTAINS_DEOPT);
+
+    register_recording(
+        FN_ID_STR_CONTAINS_DEOPT,
+        RecordingRegistration {
+            body: build_add_body(),
+            param_tys: vec![IrType::I32, IrType::I32],
+        },
+    );
+
+    let src = "#main(String s) -> Bool\ns.contains(\"x\")";
+    let trigger: HotTraceTriggerHandle = Arc::new(CraneliftHotTrigger);
+    let counting = Arc::new(OutcomeCountingLookup::new());
+    let lookup_handle: InstalledTraceLookupHandle = counting.clone();
+    let ev = BytecodeEvaluator::from_source(src)
+        .expect("compile")
+        .with_fn_id(FN_ID_STR_CONTAINS_DEOPT)
+        .with_hot_trigger(trigger)
+        .with_hot_threshold(u16::MAX as u32)
+        .with_trace_lookup(lookup_handle);
+
+    let args_hit = mk_args(&[("s", Value::String("axb".into()))]);
+    let args_miss = mk_args(&[("s", Value::String("abc".into()))]);
+    assert_eq!(
+        ev.run_main(args_hit).expect("hit dispatch"),
+        Value::Bool(true)
+    );
+    assert_eq!(
+        ev.run_main(args_miss).expect("miss dispatch"),
+        Value::Bool(false)
+    );
+    assert!(counting.no_trace() >= 2);
+    assert_eq!(counting.success(), 0);
+    assert_eq!(counting.deopt(), 0);
+
+    let _ = clear_recording(FN_ID_STR_CONTAINS_DEOPT);
+    let _ = state.invalidate_trace(FN_ID_STR_CONTAINS_DEOPT);
+    reset_hot_all();
+    reset_jump_helper_call_count();
+}
+
+/// Small ergonomic helper — same shape as the existing
+/// `HashMap<String, Value>` builders dotted through this file but
+/// centralised so the B-3 tests stay readable.
+fn mk_args(pairs: &[(&str, Value)]) -> HashMap<String, Value> {
+    let mut m = HashMap::with_capacity(pairs.len());
+    for (k, v) in pairs {
+        m.insert((*k).to_string(), v.clone());
+    }
+    m
+}

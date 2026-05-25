@@ -816,12 +816,34 @@ impl Evaluator for BytecodeEvaluator {
         if let (Some(fn_id), Some(lookup)) =
             (self.func.fn_id, self.default_config.trace_lookup.as_ref())
         {
-            let packed = self.pack_args(&args)?;
+            // Bytecode-coverage-expansion B-2: pack via the string-
+            // aware path so any `String`-typed arg slot is observed
+            // by `try_invoke` (the recorder uses the packed slot to
+            // route the call). The placeholder `0` for string slots
+            // is overwritten by the VM's prologue if `run_main_inner`
+            // is taken; the trace's snapshot copy on the Deopt path
+            // sees `0` for the string slot (recorders that observe
+            // string args must drive through the dedicated string
+            // entry — outside this scaffold's scope) but the resume
+            // path always re-runs through `run_main_inner` which
+            // re-packs cleanly.
+            let (packed, string_args) = self.pack_args_with_strings(&args)?;
+            let string_arg_refs: Vec<(usize, &str)> = string_args
+                .iter()
+                .map(|(slot, payload)| (*slot, payload.as_str()))
+                .collect();
             match lookup.try_invoke(fn_id, &packed) {
                 crate::trace_dispatch::TraceInvokeOutcome::NoTrace => {
-                    // Re-use the pre-packed args via the
-                    // packed-args variant so we don't double-pack.
-                    return self.run_main_inner_with_packed(&packed, 0, &[], &[]);
+                    // Re-use the pre-packed args via the string-aware
+                    // packed-args variant so the string slot picks up
+                    // its arena handle on the VM side.
+                    return self.run_main_inner_with_packed_strings(
+                        &packed,
+                        &string_arg_refs,
+                        0,
+                        &[],
+                        &[],
+                    );
                 }
                 crate::trace_dispatch::TraceInvokeOutcome::Success { result } => {
                     return Ok(self.pack_trace_result(result));
@@ -927,10 +949,26 @@ impl Evaluator for BytecodeEvaluator {
             } else {
                 (&[][..], local_snapshot)
             };
-        let packed = self.pack_args(&args)?;
+        // Bytecode-coverage-expansion B-2: pack via the string-aware
+        // path so string args picked up by the VM's prologue at slot
+        // overwrite time. Without this, the resume-from-deopt path
+        // sees `0` in every `String`-typed slot and downstream
+        // `BcOp::StrConcat` / `StrContains` / `StrSubstring` operate
+        // on the wrong handle.
+        let (packed, string_args) = self.pack_args_with_strings(&args)?;
+        let string_arg_refs: Vec<(usize, &str)> = string_args
+            .iter()
+            .map(|(slot, payload)| (*slot, payload.as_str()))
+            .collect();
         let initial_stack =
             self.materialise_stack(start_bc_idx, &packed, extra_locals, value_stack_copy);
-        self.run_main_inner_with_packed(&packed, start_bc_idx, extra_locals, &initial_stack)
+        self.run_main_inner_with_packed_strings(
+            &packed,
+            &string_arg_refs,
+            start_bc_idx,
+            extra_locals,
+            &initial_stack,
+        )
     }
 }
 
@@ -1067,26 +1105,37 @@ impl BytecodeEvaluator {
     /// args. The resume path goes through here because it already
     /// packed the args while materialising the stack recipe; using
     /// this method avoids re-packing.
-    fn run_main_inner_with_packed(
+    /// Bytecode-coverage-expansion B-2: packed-args entry that
+    /// accepts a pre-resolved `(slot_idx, &str)` list for string args
+    /// and lifts the matching `String`-typed return slots out of the
+    /// per-invoke `StringArena`. Used by the trace-dispatcher branch
+    /// on the `NoTrace` path and by the resume-from-deopt path so the
+    /// bytecode body sees the same handle `pack_args_with_strings`
+    /// would have planted.
+    fn run_main_inner_with_packed_strings(
         &self,
         packed: &[VmValue],
+        string_args: &[(usize, &str)],
         start_bc_idx: usize,
         extra_locals: &[VmValue],
         initial_stack: &[VmValue],
     ) -> Result<Value, RuntimeError> {
+        let string_return_slots = self.string_return_slots();
         let vm = BytecodeVm::new(self.default_config.clone());
-        let outcome = vm.invoke_from_with_stack(
+        let outcome = vm.invoke_from_with_string_io(
             &self.func,
             packed,
             start_bc_idx,
             extra_locals,
             self.cached_return_slot_count(),
             initial_stack,
+            string_args,
+            &string_return_slots,
         );
         if let Some(err) = outcome.error {
             return Err(err.into_runtime_error(self.entry_range));
         }
-        Ok(self.unpack_return_slots(&outcome.final_locals))
+        Ok(self.unpack_return_slots_with_strings(&outcome.final_locals, &outcome.final_strings))
     }
 
     /// Deopt-driver-facing API: rehydrate from an explicit
