@@ -225,8 +225,18 @@ impl BytecodeEvaluator {
 
     /// Construct from a pre-lowered IR module + manual param info.
     /// Used by direct-IR tests / differential harnesses that bypass
-    /// the parse + analyze stages. The field-offset maps are
-    /// empty — the IR must use `LocalGet(idx)` directly.
+    /// the parse + analyze stages.
+    ///
+    /// Bytecode-coverage-expansion B-4: the `field_offset_to_local`
+    /// map is seeded with `params.len()` synthetic slots — one for
+    /// each declared parameter — so the compile pass's
+    /// `input_arg_count()` returns the right value. Without this seed,
+    /// the let-local base would calculate to `0` and let-bound slots
+    /// would collide with the arg slots the VM populates from
+    /// `pack_args`. The seed offsets use placeholder values
+    /// (`0, 1, 2, ...`) — they're only consulted by
+    /// `visit_load_field` / `visit_store_field` which the legacy
+    /// callers never emit (they go through `LocalGet` / `LocalSet`).
     pub fn from_ir_legacy(
         module: IrModule,
         param_names: Vec<String>,
@@ -235,8 +245,14 @@ impl BytecodeEvaluator {
         let func = &module.funcs[entry_idx];
         let entry_range = func.range;
         let param_tys = func.params.clone();
+        // Seed the input-offset map with one entry per declared param
+        // so `compile_function`'s let-local base resolves past the
+        // arg slots. The offset key is synthetic — the legacy IR
+        // never emits `LoadField` / `StoreField` against these slots.
+        let in_map: std::collections::BTreeMap<u32, u32> =
+            (0..func.params.len() as u32).map(|i| (i, i)).collect();
         let empty = std::collections::BTreeMap::new();
-        let compiled = compile_function(func, &empty, &empty)?;
+        let compiled = compile_function(func, &in_map, &empty)?;
         let cached_param_count = param_names.len();
         Ok(Self {
             func: compiled,
@@ -509,23 +525,42 @@ impl BytecodeEvaluator {
     fn unpack_return_slots(&self, locals: &[VmValue]) -> Value {
         // Backward-compatible scalar-only variant. String-return
         // shapes ride through `unpack_return_slots_with_strings`.
-        self.unpack_return_slots_with_strings(locals, &Default::default())
+        self.unpack_return_slots_with_strings(locals, &Default::default(), None)
     }
 
     /// Bytecode-coverage-expansion B-2: same as
     /// [`Self::unpack_return_slots`] but consumes the
-    /// `BcRunOutcome::final_strings` map for string-return shapes.
+    /// `BcRunOutcome::final_strings` map for string-return shapes and
+    /// the popped-stack `BcRunOutcome::value` for the legacy-i64
+    /// shape (where the result lives on the operand stack instead of
+    /// a virtual return slot).
     fn unpack_return_slots_with_strings(
         &self,
         locals: &[VmValue],
         final_strings: &std::collections::HashMap<usize, String>,
+        return_value: Option<VmValue>,
     ) -> Value {
         // M2-C lever 5: branch on the cached `ReturnShape` so the hot
         // single-scalar epilogue avoids the `Option<&Schema>` +
         // schema-fields walk it previously paid every invoke.
         let slot = self.return_field_base as usize;
         match self.return_shape {
-            ReturnShape::LegacyI64 => Value::Int(locals.first().copied().unwrap_or(0) as i64),
+            ReturnShape::LegacyI64 => {
+                // Bytecode-coverage-expansion B-4: the legacy direct-IR
+                // shape (`from_ir_legacy`) ends `run_main` with the
+                // result on the operand stack and a bare `Op::Return`,
+                // so the canonical answer is `outcome.value`. The
+                // pre-B-4 read of `locals[0]` only happened to work
+                // for single-arg IR where the body's `Return` value
+                // was the arg slot itself — multi-arg IR (toggle_loop
+                // shape: `(n, toggle) -> Int`) returned `locals[0]`
+                // = `n` and produced the wrong answer.
+                Value::Int(
+                    return_value
+                        .or_else(|| locals.first().copied())
+                        .unwrap_or(0) as i64,
+                )
+            }
             ReturnShape::SingleScalarInt => {
                 Value::Int(locals.get(slot).copied().unwrap_or(0) as i64)
             }
@@ -611,7 +646,13 @@ impl BytecodeEvaluator {
         // bytes_written placeholder (not used by the bytecode VM);
         // the actual return data lives in the virtual return slots
         // — plus `final_strings` for any String-typed return field.
-        Ok(self.unpack_return_slots_with_strings(&outcome.final_locals, &outcome.final_strings))
+        // For the legacy direct-IR shape the popped stack value is
+        // the canonical return — see `ReturnShape::LegacyI64`.
+        Ok(self.unpack_return_slots_with_strings(
+            &outcome.final_locals,
+            &outcome.final_strings,
+            outcome.value,
+        ))
     }
 
     /// Rebuild the operand stack at `bc_idx` from the compile-time
@@ -1135,7 +1176,11 @@ impl BytecodeEvaluator {
         if let Some(err) = outcome.error {
             return Err(err.into_runtime_error(self.entry_range));
         }
-        Ok(self.unpack_return_slots_with_strings(&outcome.final_locals, &outcome.final_strings))
+        Ok(self.unpack_return_slots_with_strings(
+            &outcome.final_locals,
+            &outcome.final_strings,
+            outcome.value,
+        ))
     }
 
     /// Deopt-driver-facing API: rehydrate from an explicit

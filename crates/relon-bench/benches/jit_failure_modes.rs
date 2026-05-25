@@ -431,6 +431,39 @@ fn build_aot_two_args(body: Vec<TaggedOp>) -> AotEvaluator {
 }
 
 // =====================================================================
+// =====  bytecode-VM evaluator builders (B-4 deopt-recovery row)  =====
+// =====================================================================
+//
+// Bytecode-coverage-expansion B-4: the deopt-recovery panel needs a
+// `relon_deopt_to_bytecode` row that mirrors the existing
+// `relon_deopt_to_tree_walk` baseline. Build the same IR shape the
+// AOT helpers use so the trace's `IsZero(toggle)` guard fires
+// identically on cold input, then route the fallback through the
+// bytecode VM instead of the tree-walker. The expected steady-state
+// ratio: bytecode resume should land at least an order of magnitude
+// below the tree-walker fallback — the design target is ≥ 5×.
+
+fn build_bytecode_two_args(body: Vec<TaggedOp>) -> relon_bytecode::BytecodeEvaluator {
+    let ir = IrModule {
+        imports: vec![],
+        funcs: vec![Func {
+            name: "run_main".to_string(),
+            params: vec![IrType::I64, IrType::I64],
+            ret: IrType::I64,
+            body,
+            range: TokenRange::default(),
+        }],
+        entry_func_index: Some(0),
+        closure_table: vec![],
+    };
+    relon_bytecode::BytecodeEvaluator::from_ir_legacy(
+        ir,
+        vec!["n".to_string(), "toggle".to_string()],
+    )
+    .expect("bytecode VM compile (2 args)")
+}
+
+// =====================================================================
 // =====  tree-walker evaluator builder  ===============================
 // =====================================================================
 //
@@ -744,6 +777,107 @@ fn bench_jit_failure_modes(c: &mut Criterion) {
             })
         });
     });
+
+    // =================================================================
+    // Bytecode-coverage-expansion B-4: deopt-recovery panel
+    // =================================================================
+    //
+    // The two rows below are the deliverable for Phase B-4: side-by-
+    // side timing of trace_jit deopt → bytecode_VM resume vs trace_jit
+    // deopt → tree_walker resume. Both rows reuse Fixture B's setup
+    // (the trace installs with toggle=0 / IsZero(toggle) guard; the
+    // cold path passes toggle=1 so the guard fires on entry every
+    // call). The only thing that differs is the fallback closure
+    // handed to `state_b.invoke_with_fallback`.
+    //
+    // Acceptance gate from the design doc: bytecode resume should be
+    // ≥ 5× faster than the tree-walker resume on the same workload.
+    // Both rows share `HOT_LOOP_N` throughput so the per-element-cost
+    // surfaces directly in the criterion report.
+    let bc_b = build_bytecode_two_args(toggle_loop_body());
+    // Sanity: bytecode result matches AOT (acc = 0 when toggle = 1).
+    {
+        let v = bc_b
+            .run_main(args_n_toggle(HOT_LOOP_N as i64, toggle_runtime))
+            .expect("Fixture B bytecode row sanity");
+        if let Value::Int(got) = v {
+            assert_eq!(got, 0, "Fixture B bytecode expected acc = 0 at toggle != 0");
+        }
+    }
+    group.throughput(Throughput::Elements(HOT_LOOP_N));
+    group.bench_function(
+        BenchmarkId::new("fixture_b_deopt", "relon_deopt_to_bytecode"),
+        |b| {
+            b.iter_custom(|iters| {
+                let n_in = black_box(HOT_LOOP_N as i64);
+                let toggle_in = black_box(toggle_runtime);
+                let args: [u64; 2] = [n_in as u64, toggle_in as u64];
+                timed_with_warmup(iters, || {
+                    let v = unsafe {
+                        state_b.invoke_with_fallback(
+                            FIX_B_FN_ID,
+                            black_box(args.as_ptr()),
+                            64,
+                            |_args| {
+                                let v = bc_b
+                                    .run_main(args_n_toggle(n_in, toggle_in))
+                                    .expect("Fixture B bytecode fallback");
+                                match v {
+                                    Value::Int(x) => x as u64,
+                                    _ => 0,
+                                }
+                            },
+                        )
+                    };
+                    black_box(v);
+                })
+            });
+        },
+    );
+
+    group.bench_function(
+        BenchmarkId::new("fixture_b_deopt", "relon_deopt_to_tree_walk"),
+        |b| {
+            // Tree-walker fallback runs the sum-loop source (the only
+            // shape the walker speaks); it stands in for "the
+            // walker's per-call cost on a body of comparable
+            // arithmetic depth". The walker can't see the `toggle`
+            // knob (no surface syntax), so the result diverges from
+            // the trace's `acc = 0`; that's intentional — the row
+            // measures fallback overhead, not result correctness.
+            b.iter_custom(|iters| {
+                let n_in = black_box(HOT_LOOP_N as i64);
+                let toggle_in = black_box(toggle_runtime);
+                let args: [u64; 2] = [n_in as u64, toggle_in as u64];
+                // Drop to TREE_WALK_LOOP_N for the tree-walker
+                // workload so the µs / iter class fallback doesn't
+                // blow the warmup wall-clock cap; throughput is
+                // adjusted accordingly via the per-bench `throughput`
+                // setting (kept at HOT_LOOP_N so the per-element-cost
+                // matches the bytecode row).
+                let tw_n = TREE_WALK_LOOP_N as i64;
+                timed_with_warmup(iters, || {
+                    let v = unsafe {
+                        state_b.invoke_with_fallback(
+                            FIX_B_FN_ID,
+                            black_box(args.as_ptr()),
+                            64,
+                            |_args| {
+                                let v = walker
+                                    .run_main(&scope, args_n_arg(tw_n))
+                                    .expect("Fixture B tree-walk fallback");
+                                match v {
+                                    Value::Int(x) => x as u64,
+                                    _ => 0,
+                                }
+                            },
+                        )
+                    };
+                    black_box(v);
+                })
+            });
+        },
+    );
 
     // =================================================================
     // Fixture C: cold workload (n = 50 per call)
