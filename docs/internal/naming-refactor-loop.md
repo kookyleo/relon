@@ -1,10 +1,12 @@
-# Naming Refactor Monitoring Loop
+# Naming Refactor + Bytecode Coverage Monitoring Loop
 
-**目标**：Dart-style 二分法命名落地 + bench panel 新增 `relon_jit` / `relon_aot` row。
-**Loop 周期**：10 min (cron `bb9157dd`，:03/:13/:23/:33/:43/:53)。
-**Subagent**：`ae8a91962d73213ca` worktree-isolated。
+**Phase A**：Dart-style 二分法命名 (refactor subagent `ae8a91962d73213ca`)
+**Phase B/C**：Bytecode 覆盖扩张 (refactor 完工后 spawn 新 subagent + 监控)
+**Cron 周期**：10 min (cron `82195b35`，:03/:13/:23/:33/:43/:53)
 **起点 commit**：`3aae373` (full supersession 完工报告 push)
 **Refactor design**：`docs/internal/bytecode-coverage-expansion-design.md` "Naming alignment" 章节
+**Bytecode design**：同上 Phase B-1..B-4
+**任务追踪**：#261 (refactor) + #262 (bytecode)
 
 ## 当前状态
 
