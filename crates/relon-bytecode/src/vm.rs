@@ -626,7 +626,7 @@ impl BcVmError {
 /// trap. The `last_bc_idx` field tells the partial-resume path which
 /// bytecode op tripped the trap so it can re-derive the matching IR
 /// PC for diagnostics.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct BcRunOutcome {
     /// Successful return value, when the run completed via `Return`.
     /// For buffer-protocol entries this is the IR-level `bytes_written`
@@ -644,6 +644,18 @@ pub struct BcRunOutcome {
     /// unpacks return-field values from this; the legacy-i64 path
     /// ignores it.
     pub final_locals: Vec<VmValue>,
+    /// Bytecode-coverage-expansion B-2: copy-out of string-arena
+    /// payloads for slots the caller wants to recover after the per-
+    /// invoke `StringArena` drops. Indexed `local_slot_idx ->
+    /// String_payload`. Empty when the caller didn't request any
+    /// string slot lift-outs — preserves the previous outcome
+    /// posture for the scalar-only paths.
+    ///
+    /// Populated by [`BytecodeVm::invoke_from_with_string_args`] when
+    /// `string_return_slots` is non-empty: each `local_slot_idx` is
+    /// looked up in the just-exited arena and the payload is cloned
+    /// into a fresh `String` that survives `VmMemory` drop.
+    pub final_strings: std::collections::HashMap<usize, String>,
 }
 
 /// Stack-based VM. Stateful across calls (counters reset per
@@ -894,6 +906,87 @@ impl BytecodeVm {
         return_slot_count: u32,
         initial_stack: &[VmValue],
     ) -> BcRunOutcome {
+        // Bytecode-coverage-expansion B-2: thin wrapper for callers
+        // that don't need to lift host-supplied `Value::String` args
+        // into the VM's per-invoke `StringArena`. See
+        // [`Self::invoke_from_with_string_args`] for the lift-aware
+        // entry point.
+        self.invoke_from_with_string_args(
+            func,
+            args,
+            start_bc_idx,
+            extra_locals,
+            return_slot_count,
+            initial_stack,
+            /*string_arg_slots=*/ &[],
+        )
+    }
+
+    /// Bytecode-coverage-expansion B-2: invocation entry that lifts
+    /// host-supplied `Value::String` args into the VM's per-invoke
+    /// `StringArena` so the dispatch loop's string-shaped ops
+    /// (`StrConcat` / `StrContains` / `StrSubstring` / …) can resolve
+    /// the slot handles. Each entry in `string_arg_slots` is
+    /// `(local_idx, string_payload)`: the helper allocates the payload
+    /// in `memory.strings` after `memory` is constructed, then
+    /// overwrites `locals[local_idx]` with the resulting handle.
+    ///
+    /// `string_return_slots` flips the lift direction: each listed
+    /// local slot holds a string handle the host wants back; the
+    /// helper reads the payload through the arena before drop and
+    /// stores it in [`BcRunOutcome::final_strings`].
+    ///
+    /// Pre-condition: `local_idx` must be one of the args / let /
+    /// return slots the dispatch loop reads; callers using
+    /// `pack_args` already match this. Strings travel through the
+    /// same u64 lane as the rest of the dispatch loop — the handle
+    /// is the arena's 32-bit slot index zero-extended into the slot,
+    /// identical to what `BcOp::StrConst` would push for an inline
+    /// literal.
+    #[allow(clippy::too_many_arguments)]
+    pub fn invoke_from_with_string_args(
+        &self,
+        func: &BcFunction,
+        args: &[VmValue],
+        start_bc_idx: usize,
+        extra_locals: &[VmValue],
+        return_slot_count: u32,
+        initial_stack: &[VmValue],
+        string_arg_slots: &[(usize, &str)],
+    ) -> BcRunOutcome {
+        // Forward to the broader entry; the broader entry handles
+        // both string args (in) and string return slots (out). Use
+        // the empty-out variant here so the existing test surface
+        // doesn't change behaviour.
+        self.invoke_from_with_string_io(
+            func,
+            args,
+            start_bc_idx,
+            extra_locals,
+            return_slot_count,
+            initial_stack,
+            string_arg_slots,
+            /*string_return_slots=*/ &[],
+        )
+    }
+
+    /// Bytecode-coverage-expansion B-2: full string-aware invocation
+    /// entry. See [`Self::invoke_from_with_string_args`] for the args
+    /// lift; this entry adds `string_return_slots` for lifting string
+    /// payloads back out of the per-invoke `StringArena` before it
+    /// drops.
+    #[allow(clippy::too_many_arguments)]
+    pub fn invoke_from_with_string_io(
+        &self,
+        func: &BcFunction,
+        args: &[VmValue],
+        start_bc_idx: usize,
+        extra_locals: &[VmValue],
+        return_slot_count: u32,
+        initial_stack: &[VmValue],
+        string_arg_slots: &[(usize, &str)],
+        string_return_slots: &[usize],
+    ) -> BcRunOutcome {
         // M2-C lever 2: reset the inline cache at the top of every
         // outer invocation so a previously-resolved host fn from an
         // earlier call can't shadow a `register_host_fn` swap that
@@ -927,21 +1020,54 @@ impl BytecodeVm {
         // `&BytecodeVm` is shared across calls and the arenas must not
         // leak between them.
         let mut memory = VmMemory::default();
+        // Bytecode-coverage-expansion B-2: lift host-supplied string
+        // args into the fresh `StringArena` and stash the resulting
+        // handles into the matching local slots. Has to happen here
+        // (not in `pack_args`) because the arena is per-invoke and
+        // wouldn't survive across calls. Slots outside `locals` are
+        // silently dropped — same defensive posture as the `args` /
+        // `extra_locals` overlays above.
+        for (slot_idx, payload) in string_arg_slots {
+            if *slot_idx < locals.len() {
+                let handle = memory.strings.alloc(*payload);
+                locals[*slot_idx] = handle as u64;
+            }
+        }
         let mut pc = start_bc_idx;
         let mut steps: u64 = 0;
         let mut last_bc_idx = pc;
+        // Bytecode-coverage-expansion B-2: capture the return-slot
+        // string list before the closure takes ownership so each
+        // `exit(...)` call can lift the live arena payload into the
+        // outcome before `memory` drops.
+        let want_return_strings: Vec<usize> = string_return_slots.to_vec();
         let exit = |value: Option<VmValue>,
                     error: Option<BcVmError>,
                     last_bc_idx: usize,
                     steps: u64,
-                    locals: Vec<VmValue>|
+                    locals: Vec<VmValue>,
+                    memory: &VmMemory|
          -> BcRunOutcome {
+            // Lift requested return-slot strings into a host-owned
+            // map before the arena drops. Slots out of range or
+            // pointing at an invalid handle are skipped silently so a
+            // mis-pred return slot doesn't crash the dispatch loop.
+            let mut final_strings = std::collections::HashMap::new();
+            for slot in &want_return_strings {
+                if let Some(handle_u64) = locals.get(*slot) {
+                    let handle = *handle_u64 as u32;
+                    if let Ok(arc_s) = memory.strings.get(handle) {
+                        final_strings.insert(*slot, arc_s.as_ref().to_string());
+                    }
+                }
+            }
             BcRunOutcome {
                 value,
                 error,
                 last_bc_idx,
                 steps,
                 final_locals: locals,
+                final_strings,
             }
         };
         // M2-B phase 2 dispatch-time pre-check: if a `CapabilityGate`
@@ -968,7 +1094,7 @@ impl BytecodeVm {
         // sweep — #166 M2-B from_source full cap-gate activation)
         // can't drift between this entry and `invoke_pooled_typed_i64`.
         if let Err(err) = self.precheck_capabilities(func) {
-            return exit(None, Some(err), last_bc_idx, steps, locals);
+            return exit(None, Some(err), last_bc_idx, steps, locals, &memory);
         }
         // M2-B phase 4c: hot-counter prologue. Mirrors the cranelift
         // entry-fn prologue (`crates/relon-codegen-native/src/codegen/hot_counter.rs`)
@@ -999,6 +1125,7 @@ impl BytecodeVm {
                             last_bc_idx,
                             steps,
                             locals,
+                            &memory,
                         );
                     }
                 }
@@ -1010,6 +1137,7 @@ impl BytecodeVm {
                             last_bc_idx,
                             steps,
                             locals,
+                            &memory,
                         );
                     }
                 }
@@ -1024,6 +1152,7 @@ impl BytecodeVm {
                     last_bc_idx,
                     steps,
                     locals,
+                    &memory,
                 );
             }
             last_bc_idx = pc;
@@ -1048,15 +1177,16 @@ impl BytecodeVm {
                             last_bc_idx,
                             steps,
                             locals,
+                            &memory,
                         );
                     }
                     pc = target;
                 }
                 Ok(StepOutcome::Return(v)) => {
-                    return exit(Some(v), None, last_bc_idx, steps, locals);
+                    return exit(Some(v), None, last_bc_idx, steps, locals, &memory);
                 }
                 Err(e) => {
-                    return exit(None, Some(e), last_bc_idx, steps, locals);
+                    return exit(None, Some(e), last_bc_idx, steps, locals, &memory);
                 }
             }
         }

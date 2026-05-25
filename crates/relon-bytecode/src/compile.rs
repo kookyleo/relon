@@ -647,6 +647,30 @@ impl<'a> CompileState<'a> {
             self.emit_with_effect(BcOp::StrSubstring, call_pc);
             return Ok(());
         }
+        // Bytecode-coverage-expansion B-2: route the String-arity
+        // `length()` slot onto `BcOp::StrLen` instead of inlining the
+        // body. The body uses `Op::ReadStringLen` which the bytecode
+        // VM keeps as a no-op for the list-int integer-length scaffold
+        // — see `visit_read_string_len` for the full rationale. Routing
+        // here keeps the integer-length list path intact while the new
+        // real-handle string path gets a working `.length()`.
+        if fn_index == relon_ir::LENGTH_INDEX && arg_count == 1 {
+            self.emit_with_effect(BcOp::StrLen, call_pc);
+            return Ok(());
+        }
+        // Bytecode-coverage-expansion B-2: same `ReadStringLen` no-op
+        // rationale as `LENGTH_INDEX` — the `is_empty(String)` body
+        // walks `LocalGet + ReadStringLen + ConstI64(0) + Eq(I64)`,
+        // and leaving the no-op `ReadStringLen` in place would compare
+        // the arena handle against 0 instead of the byte length.
+        // Short-circuit onto an equivalent three-op sequence so the
+        // answer stays correct.
+        if fn_index == relon_ir::IS_EMPTY_INDEX && arg_count == 1 {
+            self.emit_with_effect(BcOp::StrLen, call_pc);
+            self.emit_with_effect(BcOp::ConstI64(0), call_pc);
+            self.emit_with_effect(BcOp::EqI64, call_pc);
+            return Ok(());
+        }
         if self.inline_depth >= MAX_INLINE_DEPTH {
             return Err(BcCompileError::UnsupportedOp(format!(
                 "inline depth exceeded {} for fn_index {}",
@@ -1087,18 +1111,32 @@ impl<'a> OpVisitor for CompileState<'a> {
         unsupported("ConstF64")
     }
 
-    // v6-δ M2-B widening: `ConstString` / `ConstListInt` /
-    // `ConstListBool` / `ConstListFloat` / `ConstListString` emit a
-    // record pointer in cranelift / wasm. The bytecode VM has no
-    // record memory model, so we encode them as "the length as i64"
-    // — adequate for the corpus's `"...".length()` /
-    // `[...].length()` / `is_empty()` patterns. The companion
-    // `ReadStringLen` then becomes a no-op because the length is
-    // already on the stack.
+    // Bytecode-coverage-expansion B-2: real-handle `ConstString`
+    // lowering. The earlier M2-B scaffold collapsed
+    // `Op::ConstString` into `BcOp::ConstI64(len)` so the bare
+    // `"foo".length()` pattern produced the right answer without
+    // touching the `StringArena`. That fold blocks any string-shape
+    // op consumer (`s + "x"`, `s.contains("x")`, …) because the
+    // consumer expects a real arena handle on the stack.
+    //
+    // The new path registers the literal in the per-function
+    // `string_pool` and emits `BcOp::StrConst { idx }`. The VM
+    // resolves the slot on first dispatch via the arena's
+    // `StringArena::alloc` so handles minted from constants and
+    // host-supplied string args sit in the same arena — which is
+    // what the downstream `BcOp::StrConcat` / `StrContains` /
+    // `StrSubstring` / `StrGlobMatch` ops require to find the
+    // payload.
+    //
+    // The companion `visit_read_string_len` now emits `BcOp::StrLen`
+    // (was a no-op when the stack held an `i64` length stand-in) so
+    // the `"foo".length()` corpus pattern keeps producing the right
+    // answer in the new handle world.
     fn visit_const_string(&mut self, _idx: u32, value: &str) -> Result<(), BcCompileError> {
         let pc = self.current_pc;
-        let len = value.chars().count() as i64;
-        self.emit_with_effect(BcOp::ConstI64(len), pc);
+        let pool_idx = self.string_pool.len() as u32;
+        self.string_pool.push(value.to_string());
+        self.emit_with_effect(BcOp::StrConst { idx: pool_idx }, pc);
         Ok(())
     }
 
@@ -1238,18 +1276,19 @@ impl<'a> OpVisitor for CompileState<'a> {
         Ok(())
     }
 
-    // F-D7-D: `Op::Add(IrType::String)` (source-side `s + t` lowering)
-    // needs a record-aware concat — outside the bytecode VM's M2-A
-    // scalar envelope. Bounce so the four-way harness routes the
-    // source through `BytecodeUnsupported`. Sub / Mul / etc. with
-    // String never escape the analyzer; the explicit check here is
-    // belt-and-braces.
+    // Bytecode-coverage-expansion B-2: `Op::Add(IrType::String)` is
+    // the source-side `s + t` lowering for two-operand string concat
+    // (chains of 3+ go through `Op::StrConcatN`). The widened
+    // bytecode envelope handles `String` args / returns end-to-end
+    // through the `StringArena`, so routing this op onto
+    // `BcOp::StrConcat` keeps two-operand source-level concats inside
+    // the VM. Sub / Mul / etc. with String never escape the analyzer;
+    // the original belt-and-braces shape stays here.
     fn visit_add(&mut self, ty: IrType) -> Result<(), BcCompileError> {
         if ty == IrType::String {
-            return Err(BcCompileError::UnsupportedOp(
-                "Op::Add(IrType::String) — string concat is outside the bytecode VM's scalar envelope"
-                    .to_string(),
-            ));
+            let pc = self.current_pc;
+            self.emit_with_effect(BcOp::StrConcat, pc);
+            return Ok(());
         }
         let pc = self.current_pc;
         let bc = arith_bcop_for(ty, ArithKind::Add)?;
@@ -1427,8 +1466,33 @@ impl<'a> OpVisitor for CompileState<'a> {
         Ok(())
     }
 
-    fn visit_load_string_ptr(&mut self, _offset: u32) -> Result<(), BcCompileError> {
-        unsupported("LoadStringPtr")
+    fn visit_load_string_ptr(&mut self, offset: u32) -> Result<(), BcCompileError> {
+        // Bytecode-coverage-expansion B-2: a `String`-typed arg / let
+        // slot rides the same u64 lane as the rest of the dispatch
+        // loop — the slot holds a `StringArena` handle (set up by
+        // `BytecodeVm::invoke_from_with_string_args` at the top of
+        // the invoke). `LoadStringPtr { offset }` from the IR shape
+        // wants the handle pushed onto the operand stack — the bytecode
+        // VM's `BcOp::LocalGet(slot)` does exactly that against the
+        // schema-driven offset → local table the same way
+        // `visit_load_field` works for the scalar `Int / Bool / Float`
+        // slots.
+        //
+        // Note the IR uses 4-byte offsets for `LoadStringPtr` (the
+        // wasm layout reserves a `u32` slot for the StringRef pointer
+        // alongside the inline `u32` len header). The
+        // `field_offset_to_local` table is built from
+        // `SchemaLayout::offsets_for` which already accounts for the
+        // 4-byte vs 8-byte stride per field type, so the offset → slot
+        // lookup stays one map probe.
+        let pc = self.current_pc;
+        let slot = self
+            .field_offset_to_local
+            .get(&offset)
+            .copied()
+            .ok_or(BcCompileError::UnknownFieldOffset { offset })?;
+        self.emit_with_effect(BcOp::LocalGet(slot), pc);
+        Ok(())
     }
 
     fn visit_load_list_int_ptr(&mut self, _offset: u32) -> Result<(), BcCompileError> {
@@ -1464,10 +1528,22 @@ impl<'a> OpVisitor for CompileState<'a> {
     }
 
     fn visit_read_string_len(&mut self) -> Result<(), BcCompileError> {
-        // No-op — see the `visit_const_string` comment: the
-        // M2-B widening replaces the record pointer with its
-        // pre-computed length, so the companion `ReadStringLen` has
-        // nothing to do.
+        // Stays a no-op for the same reason as the M2-A scaffold:
+        // `ReadStringLen` appears INSIDE inlined stdlib bodies
+        // (`length` / `list_int_length` / …) where the producer of the
+        // operand isn't necessarily a `StringArena` handle. The
+        // `list_int_length` body, for example, runs after the M2-A
+        // widening lifted `Op::ConstListInt` to `ConstI64(len)` — the
+        // operand is already the integer length and emitting
+        // `BcOp::StrLen` here would re-read the integer as a handle
+        // and trap.
+        //
+        // The `String`-typed call site is handled by the
+        // `LENGTH_INDEX` short-circuit in `compile_inline_call`
+        // instead: it emits `BcOp::StrLen` directly so the real-handle
+        // string path produced by `visit_const_string` /
+        // `visit_load_string_ptr` works without dragging the integer-
+        // length list path along.
         Ok(())
     }
 

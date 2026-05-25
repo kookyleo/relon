@@ -139,6 +139,12 @@ enum ReturnShape {
     SingleScalarBool,
     /// Single-field return slot of type `Null`.
     SingleScalarNull,
+    /// Bytecode-coverage-expansion B-2: single-field return whose
+    /// type is `String`. The slot at `return_field_base` holds a
+    /// `StringArena` handle; the dispatch epilogue lifts the payload
+    /// through [`BcRunOutcome::final_strings`] before the arena
+    /// drops.
+    SingleScalarString,
     /// Multi-field return record — falls back to the
     /// `unpack_return_slots` branded-dict reconstruction.
     BrandedDict,
@@ -394,7 +400,26 @@ impl BytecodeEvaluator {
     }
 
     fn pack_args(&self, args: &HashMap<String, Value>) -> Result<Vec<VmValue>, RuntimeError> {
+        // Backward-compatible scalar-only packer. Callers that need
+        // string lift go through `pack_args_with_strings` directly.
+        let (packed, _) = self.pack_args_with_strings(args)?;
+        Ok(packed)
+    }
+
+    /// Bytecode-coverage-expansion B-2: returns the per-slot packed
+    /// `u64` array alongside the `(slot_idx, payload)` list the VM
+    /// needs to intern host-supplied strings into the per-invoke
+    /// `StringArena`. The packed slot for a string arg holds a `0`
+    /// placeholder; the VM overwrites it with the arena handle as
+    /// part of its prologue (see
+    /// [`BytecodeVm::invoke_from_with_string_args`]).
+    #[allow(clippy::type_complexity)]
+    fn pack_args_with_strings(
+        &self,
+        args: &HashMap<String, Value>,
+    ) -> Result<(Vec<VmValue>, Vec<(usize, String)>), RuntimeError> {
         let mut packed = Vec::with_capacity(self.param_names.len());
+        let mut string_args: Vec<(usize, String)> = Vec::new();
         for (i, name) in self.param_names.iter().enumerate() {
             let value = args.get(name).or_else(|| args.get(&format!("arg{i}")));
             let value = value.ok_or_else(|| RuntimeError::MissingMainArg {
@@ -402,9 +427,44 @@ impl BytecodeEvaluator {
                 range: self.entry_range,
             })?;
             let ty = self.param_tys.get(i).copied().unwrap_or(IrType::I64);
-            packed.push(value_to_vm(value, ty, name, self.entry_range)?);
+            match (value, ty) {
+                (Value::String(s), IrType::String) => {
+                    // Placeholder slot — VM rewrites to handle after
+                    // arena alloc.
+                    packed.push(0u64);
+                    string_args.push((i, s.as_str().to_string()));
+                }
+                (other, _) => {
+                    packed.push(value_to_vm(other, ty, name, self.entry_range)?);
+                }
+            }
         }
-        Ok(packed)
+        Ok((packed, string_args))
+    }
+
+    /// Bytecode-coverage-expansion B-2: list of local slots whose
+    /// return-schema type is `String`. The VM lifts each slot's arena
+    /// payload into [`BcRunOutcome::final_strings`] before drop so
+    /// `unpack_return_slots_with_strings` can rebuild the
+    /// `Value::String` without retaining the dead arena.
+    fn string_return_slots(&self) -> Vec<usize> {
+        let Some(schema) = self.return_schema.as_ref() else {
+            return Vec::new();
+        };
+        use relon_eval_api::schema_canonical::TypeRepr;
+        let base = self.return_field_base as usize;
+        schema
+            .fields
+            .iter()
+            .enumerate()
+            .filter_map(|(i, f)| {
+                if matches!(f.ty, TypeRepr::String) {
+                    Some(base + i)
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 
     /// M2-B phase 4c-cont: lift the trace's `result_slot` value into
@@ -447,6 +507,19 @@ impl BytecodeEvaluator {
     }
 
     fn unpack_return_slots(&self, locals: &[VmValue]) -> Value {
+        // Backward-compatible scalar-only variant. String-return
+        // shapes ride through `unpack_return_slots_with_strings`.
+        self.unpack_return_slots_with_strings(locals, &Default::default())
+    }
+
+    /// Bytecode-coverage-expansion B-2: same as
+    /// [`Self::unpack_return_slots`] but consumes the
+    /// `BcRunOutcome::final_strings` map for string-return shapes.
+    fn unpack_return_slots_with_strings(
+        &self,
+        locals: &[VmValue],
+        final_strings: &std::collections::HashMap<usize, String>,
+    ) -> Value {
         // M2-C lever 5: branch on the cached `ReturnShape` so the hot
         // single-scalar epilogue avoids the `Option<&Schema>` +
         // schema-fields walk it previously paid every invoke.
@@ -465,6 +538,14 @@ impl BytecodeEvaluator {
                 let bits = locals.get(slot).copied().unwrap_or(0);
                 Value::Float(OrderedFloat(f64::from_bits(bits)))
             }
+            ReturnShape::SingleScalarString => {
+                // Bytecode-coverage-expansion B-2: the VM lifted the
+                // arena payload into `final_strings` before drop. An
+                // absent entry (e.g. an early trap path) falls back
+                // to an empty string so the type still matches.
+                let payload = final_strings.get(&slot).cloned().unwrap_or_default();
+                Value::String(SmolStr::from(payload.as_str()))
+            }
             ReturnShape::BrandedDict => {
                 // Multi-field return record. The schema must be
                 // present — `BrandedDict` is set by
@@ -473,14 +554,18 @@ impl BytecodeEvaluator {
                     .return_schema
                     .as_ref()
                     .expect("BrandedDict implies Some(return_schema)");
+                use relon_eval_api::schema_canonical::TypeRepr;
                 let mut map: std::collections::BTreeMap<SmolStr, Value> =
                     std::collections::BTreeMap::new();
                 for (i, f) in schema.fields.iter().enumerate() {
                     let s = self.return_field_base as usize + i;
-                    map.insert(
-                        SmolStr::from(f.name.as_str()),
-                        decode_field(&f.ty, locals.get(s).copied().unwrap_or(0)),
-                    );
+                    let v = if matches!(f.ty, TypeRepr::String) {
+                        let payload = final_strings.get(&s).cloned().unwrap_or_default();
+                        Value::String(SmolStr::from(payload.as_str()))
+                    } else {
+                        decode_field(&f.ty, locals.get(s).copied().unwrap_or(0))
+                    };
+                    map.insert(SmolStr::from(f.name.as_str()), v);
                 }
                 Value::branded_dict(map, Some(schema.name.clone()))
             }
@@ -496,9 +581,19 @@ impl BytecodeEvaluator {
         extra_locals: &[VmValue],
         initial_stack: &[VmValue],
     ) -> Result<Value, RuntimeError> {
-        let packed = self.pack_args(args)?;
+        // Bytecode-coverage-expansion B-2: pack args via the string-
+        // aware path and forward the lift sides through the VM. The
+        // refactored entry stays scalar-equivalent for non-string
+        // signatures (`string_args` empty + `string_return_slots`
+        // empty → identical dispatch to the previous code path).
+        let (packed, string_args) = self.pack_args_with_strings(args)?;
+        let string_arg_refs: Vec<(usize, &str)> = string_args
+            .iter()
+            .map(|(slot, payload)| (*slot, payload.as_str()))
+            .collect();
+        let string_return_slots = self.string_return_slots();
         let vm = BytecodeVm::new(self.default_config.clone());
-        let outcome = vm.invoke_from_with_stack(
+        let outcome = vm.invoke_from_with_string_io(
             &self.func,
             &packed,
             start_bc_idx,
@@ -506,14 +601,17 @@ impl BytecodeEvaluator {
             /*return_slot_count=*/
             self.cached_return_slot_count(),
             initial_stack,
+            &string_arg_refs,
+            &string_return_slots,
         );
         if let Some(err) = outcome.error {
             return Err(err.into_runtime_error(self.entry_range));
         }
         // Buffer-protocol path: the VM's `Return` value is the
         // bytes_written placeholder (not used by the bytecode VM);
-        // the actual return data lives in the virtual return slots.
-        Ok(self.unpack_return_slots(&outcome.final_locals))
+        // the actual return data lives in the virtual return slots
+        // — plus `final_strings` for any String-typed return field.
+        Ok(self.unpack_return_slots_with_strings(&outcome.final_locals, &outcome.final_strings))
     }
 
     /// Rebuild the operand stack at `bc_idx` from the compile-time
@@ -585,6 +683,7 @@ fn classify_return_shape(schema: &Schema) -> ReturnShape {
             TypeRepr::Float => ReturnShape::SingleScalarFloat,
             TypeRepr::Bool => ReturnShape::SingleScalarBool,
             TypeRepr::Null => ReturnShape::SingleScalarNull,
+            TypeRepr::String => ReturnShape::SingleScalarString,
             _ => ReturnShape::BrandedDict,
         };
     }
@@ -594,9 +693,16 @@ fn classify_return_shape(schema: &Schema) -> ReturnShape {
 /// Decide whether a schema field type is in the M2-A scalar envelope.
 fn is_scalar_field(ty: &relon_eval_api::schema_canonical::TypeRepr) -> bool {
     use relon_eval_api::schema_canonical::TypeRepr;
+    // Bytecode-coverage-expansion B-2: `String` is included in the
+    // scalar envelope because the IR-lift path lowers `String` args /
+    // returns to the same u64-shaped record slot the dispatch loop
+    // already uses for handles. The actual payload lives in the
+    // VM's per-invoke `StringArena`; the slot itself holds the
+    // arena handle. Lift in/out happens through
+    // `BytecodeVm::invoke_from_with_string_io`.
     matches!(
         ty,
-        TypeRepr::Int | TypeRepr::Float | TypeRepr::Bool | TypeRepr::Null
+        TypeRepr::Int | TypeRepr::Float | TypeRepr::Bool | TypeRepr::Null | TypeRepr::String
     )
 }
 
@@ -607,6 +713,7 @@ fn ir_type_for_field(ty: &relon_eval_api::schema_canonical::TypeRepr) -> IrType 
         TypeRepr::Float => IrType::F64,
         TypeRepr::Bool => IrType::Bool,
         TypeRepr::Null => IrType::Null,
+        TypeRepr::String => IrType::String,
         _ => IrType::I64,
     }
 }
@@ -619,6 +726,13 @@ fn decode_field(ty: &relon_eval_api::schema_canonical::TypeRepr, raw: u64) -> Va
         TypeRepr::Float => Value::Float(OrderedFloat(f64::from_bits(raw))),
         TypeRepr::Bool => Value::Bool((raw as u32) != 0),
         TypeRepr::Null => Value::Null,
+        // Bytecode-coverage-expansion B-2: `String`-typed return slots
+        // are recovered through the `BcRunOutcome::final_strings` lift
+        // (the VM reads the arena before drop). The fallback here is
+        // an empty string for the rare path where a caller invokes
+        // `decode_field` without going through the lift-aware
+        // `unpack_return_slots_v2` — keeps behaviour defined.
+        TypeRepr::String => Value::String(relon_eval_api::SmolStr::default()),
         _ => Value::Int(raw as i64),
     }
 }

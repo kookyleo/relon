@@ -99,7 +99,8 @@ pub use index::{
 };
 pub use registry::builtin_stdlib;
 pub use signatures::{
-    StdlibFunction, CONCAT_INDEX, CONTAINS_INDEX, GLOB_MATCH_INDEX, SUBSTRING_INDEX,
+    StdlibFunction, CONCAT_INDEX, CONTAINS_INDEX, GLOB_MATCH_INDEX, IS_EMPTY_INDEX, LENGTH_INDEX,
+    SUBSTRING_INDEX,
 };
 
 #[cfg(test)]
@@ -329,7 +330,19 @@ mod glob_match_index_tests {
 #[cfg(test)]
 mod str_stdlib_index_consistency_tests {
     use super::*;
-    use signatures::{CONCAT_INDEX, CONTAINS_INDEX, SUBSTRING_INDEX};
+    use signatures::{CONCAT_INDEX, CONTAINS_INDEX, IS_EMPTY_INDEX, LENGTH_INDEX, SUBSTRING_INDEX};
+
+    #[test]
+    fn length_index_matches_registry() {
+        assert_eq!(stdlib_function_index("length"), Some(LENGTH_INDEX));
+        assert_eq!(LENGTH_INDEX, 0);
+    }
+
+    #[test]
+    fn is_empty_index_matches_registry() {
+        assert_eq!(stdlib_function_index("is_empty"), Some(IS_EMPTY_INDEX));
+        assert_eq!(IS_EMPTY_INDEX, 5);
+    }
 
     #[test]
     fn concat_index_matches_registry() {

@@ -95,6 +95,24 @@ pub(crate) const FULL_CASEFOLD_LOOKUP_INDEX: u32 = 34;
 /// the trace recorder gains its own constant.
 pub const GLOB_MATCH_INDEX: u32 = 37;
 
+/// Stable slot of `length(String) -> Int`. Bytecode-coverage-
+/// expansion B-2 routes this slot onto `BcOp::StrLen` so the
+/// real-handle `visit_const_string` / `visit_load_string_ptr` path
+/// can answer `"foo".length()` without the integer-length stand-in
+/// the `list_int_length` / `Op::ReadStringLen` scaffold relies on.
+pub const LENGTH_INDEX: u32 = 0;
+
+/// Stable slot of `is_empty(String) -> Bool`. Bytecode-coverage-
+/// expansion B-2 short-circuits this slot the same way `LENGTH_INDEX`
+/// is short-circuited — its body walks `LocalGet + ReadStringLen +
+/// ConstI64(0) + Eq(I64)` and the `ReadStringLen` no-op in the new
+/// real-handle path leaves the handle (not the length) on the stack,
+/// which compares wrong against `0`. The short-circuit emits the
+/// equivalent `BcOp::StrLen + BcOp::ConstI64(0) + BcOp::EqI64`
+/// sequence so the answer stays correct for both empty and non-empty
+/// strings.
+pub const IS_EMPTY_INDEX: u32 = 5;
+
 /// Stable slot of `concat(String, String) -> String`. Mirrors
 /// [`relon_trace_recorder::lowering::STDLIB_IDX_CONCAT`] (drift
 /// guard cross-checked by `stdlib_index_consistency`).

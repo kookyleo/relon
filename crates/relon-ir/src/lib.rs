@@ -63,5 +63,5 @@ pub use op_visitor::{walk_body, walk_op, OpVisitor};
 pub use stdlib::{
     builtin_stdlib, stdlib_closure_arg_signature, stdlib_function_count, stdlib_function_index,
     stdlib_method_index, StdlibFunction, CONCAT_INDEX, CONTAINS_INDEX, GLOB_MATCH_INDEX,
-    SUBSTRING_INDEX,
+    IS_EMPTY_INDEX, LENGTH_INDEX, SUBSTRING_INDEX,
 };

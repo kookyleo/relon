@@ -90,21 +90,78 @@ fn run_main_let_then_add() {
 
 #[test]
 fn unsupported_source_returns_error() {
-    // v6-δ M2-B widened the bytecode envelope to inline simple
-    // stdlib bodies + length-style queries on constant strings /
-    // lists. Pick a construct the M2-B envelope still bounces — a
-    // String return type can't survive the scalar-only schema
-    // check in `from_source` (no String marshalling), so
-    // `concat`-shaped sources fail at entry validation.
-    let err =
-        BytecodeEvaluator::from_source("#main() -> String\n\"foo\".concat(\"bar\")").unwrap_err();
+    // Bytecode-coverage-expansion B-2 widened the scalar envelope to
+    // also accept `String` args / returns. Pick a construct the
+    // envelope still bounces — `List` return types stay outside the
+    // scaffold because list ↔ host-`Value::List` marshalling is not
+    // yet wired through `pack_args` / `unpack_return_slots`.
+    let err = BytecodeEvaluator::from_source(
+        "#import list from \"std/list\"\n#main(Int n) -> List<Int>\nrange(n)",
+    )
+    .unwrap_err();
     assert!(
         matches!(
             err,
-            BytecodeError::Compile(_) | BytecodeError::UnsupportedEntry { .. }
+            BytecodeError::Compile(_)
+                | BytecodeError::UnsupportedEntry { .. }
+                | BytecodeError::Analyze(_)
+                | BytecodeError::Lowering(_)
         ),
         "{err:?}"
     );
+}
+
+/// Bytecode-coverage-expansion B-2: confirm the widened envelope
+/// accepts `String` args / returns end-to-end through the production
+/// `from_source` pipeline — the same shape the deopt-landing path
+/// (Phase B-3) uses to drive trace-jit recovery into the bytecode VM.
+#[test]
+fn string_arg_and_return_round_trip() {
+    let ev = BytecodeEvaluator::from_source("#main(String s) -> String\ns + \" world\"")
+        .expect("compile");
+    let mut m = HashMap::new();
+    m.insert(
+        "s".to_string(),
+        Value::String(relon_eval_api::SmolStr::from("hello")),
+    );
+    let v = ev.run_main(m).unwrap();
+    match v {
+        Value::String(s) => assert_eq!(s.as_str(), "hello world"),
+        other => panic!("expected Value::String, got {other:?}"),
+    }
+}
+
+#[test]
+fn string_contains_call_round_trip() {
+    let ev = BytecodeEvaluator::from_source("#main(String s) -> Bool\ns.contains(\"x\")")
+        .expect("compile");
+    let mut m_hit = HashMap::new();
+    m_hit.insert(
+        "s".to_string(),
+        Value::String(relon_eval_api::SmolStr::from("axb")),
+    );
+    assert_eq!(ev.run_main(m_hit).unwrap(), Value::Bool(true));
+    let mut m_miss = HashMap::new();
+    m_miss.insert(
+        "s".to_string(),
+        Value::String(relon_eval_api::SmolStr::from("abc")),
+    );
+    assert_eq!(ev.run_main(m_miss).unwrap(), Value::Bool(false));
+}
+
+#[test]
+fn string_substring_call_round_trip() {
+    let ev = BytecodeEvaluator::from_source("#main(String s) -> String\ns.substring(1, 3)")
+        .expect("compile");
+    let mut m = HashMap::new();
+    m.insert(
+        "s".to_string(),
+        Value::String(relon_eval_api::SmolStr::from("hello")),
+    );
+    match ev.run_main(m).unwrap() {
+        Value::String(s) => assert_eq!(s.as_str(), "ell"),
+        other => panic!("expected Value::String(\"ell\"), got {other:?}"),
+    }
 }
 
 #[test]
